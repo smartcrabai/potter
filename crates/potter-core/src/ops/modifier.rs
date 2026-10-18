@@ -1131,6 +1131,13 @@ fn evaluate_modifier_output(
                     .params
                     .get("mask_tex_map_object")
                     .is_some_and(Value::is_string),
+                "mask" => {
+                    modifier.params.get("mode").and_then(Value::as_str) == Some("ARMATURE")
+                        && modifier
+                            .params
+                            .get("armature")
+                            .is_some_and(Value::is_string)
+                }
                 "screw" => modifier.params.get("object").is_some_and(Value::is_string),
                 "array" => {
                     (modifier.params.get("fit_type").and_then(Value::as_str) == Some("FIT_CURVE")
@@ -1273,6 +1280,16 @@ fn evaluate_modifier_output(
                     "modifier subject transform is unavailable",
                 )
             })?;
+            let scene = engine.doc.scenes.get(&engine.doc.active_scene);
+            let attribute_bone_matrices = crate::eval::evaluate_attribute_bone_matrices(
+                engine.doc,
+                modifier_stack,
+                frame,
+                &world_matrices,
+                engine.asset_root,
+                scene.map_or(24, |scene| scene.fps),
+                scene.map_or(1.0, |scene| scene.fps_base),
+            )?;
             let evaluation = crate::geom::modifiers::evaluate_modifiers_with_scene_context(
                 source.clone(),
                 modifier_stack,
@@ -1355,14 +1372,15 @@ fn evaluate_modifier_output(
                     | "normal_edit"
                     | "uv_project"
                     | "uv_warp"
-                    | "data_transfer" => crate::eval::apply_scene_attribute_modifier(
+                    | "data_transfer"
+                    | "mask" => crate::eval::apply_scene_attribute_modifier(
                         mesh,
                         modifier,
                         target,
                         engine.doc,
                         &world_matrices,
                         evaluated_operand_meshes,
-                        engine.asset_root,
+                        &attribute_bone_matrices,
                     ),
                     _ => Err(PotError::new(
                         ErrorCode::InternalError,

@@ -4,9 +4,7 @@ use glam::DVec3;
 use potter_core::{
     eval::{EvaluationContext, Snapshot},
     geom::{Mesh, modifiers::evaluate_modifiers},
-    model::{
-        ArmatureData, Bone, DataBlock, Id, Modifier, ModifierRuntime, Node, SceneDoc,
-    },
+    model::{ArmatureData, Bone, DataBlock, Id, Modifier, ModifierRuntime, Node, SceneDoc},
 };
 use serde_json::{Value, json};
 use tempfile::tempdir;
@@ -126,7 +124,10 @@ fn mask_modifier(params: Value) -> Result<Modifier, Box<dyn Error>> {
         modifier_type: "mask".to_owned(),
         name: "Mask".to_owned(),
         enabled: true,
-        params: params.as_object().ok_or("mask params must be an object")?.clone(),
+        params: params
+            .as_object()
+            .ok_or("mask params must be an object")?
+            .clone(),
         binding_data: None,
         runtime: ModifierRuntime::default(),
     })
@@ -138,7 +139,12 @@ fn weighted_grid(with_group: bool) -> Result<Mesh, Box<dyn Error>> {
         .collect();
     let mut mesh = Mesh::from_positions_and_faces(
         positions,
-        vec![vec![0,1,4,3],vec![1,2,5,4],vec![3,4,7,6],vec![4,5,8,7]],
+        vec![
+            vec![0, 1, 4, 3],
+            vec![1, 2, 5, 4],
+            vec![3, 4, 7, 6],
+            vec![4, 5, 8, 7],
+        ],
     )?;
     if with_group {
         mesh.attributes.insert("vertex_groups".to_owned(), json!({
@@ -153,44 +159,114 @@ fn weighted_grid(with_group: bool) -> Result<Mesh, Box<dyn Error>> {
 fn read_expected(blender: &std::path::Path) -> Result<Value, Box<dyn Error>> {
     let directory = tempdir()?;
     let root = fs::canonicalize(directory.path())?;
-    run_blender_script(blender, "mask_oracle.py", BLENDER_MASK_ORACLE, &root, "Blender mask oracle failed")?;
-    Ok(serde_json::from_slice(&fs::read(root.join("expected_mask.json"))?)?)
+    run_blender_script(
+        blender,
+        "mask_oracle.py",
+        BLENDER_MASK_ORACLE,
+        &root,
+        "Blender mask oracle failed",
+    )?;
+    Ok(serde_json::from_slice(&fs::read(
+        root.join("expected_mask.json"),
+    )?)?)
 }
 
 fn vector(value: &Value) -> Result<DVec3, Box<dyn Error>> {
-    let values = value.as_array().ok_or("expected position is not an array")?;
+    let values = value
+        .as_array()
+        .ok_or("expected position is not an array")?;
     Ok(DVec3::new(
-        values.first().and_then(Value::as_f64).ok_or("position x missing")?,
-        values.get(1).and_then(Value::as_f64).ok_or("position y missing")?,
-        values.get(2).and_then(Value::as_f64).ok_or("position z missing")?,
+        values
+            .first()
+            .and_then(Value::as_f64)
+            .ok_or("position x missing")?,
+        values
+            .get(1)
+            .and_then(Value::as_f64)
+            .ok_or("position y missing")?,
+        values
+            .get(2)
+            .and_then(Value::as_f64)
+            .ok_or("position z missing")?,
     ))
 }
 
-fn assert_geometry_parity(name: &str, actual: &Mesh, expected: &Value) -> Result<(), Box<dyn Error>> {
-    let expected_vertices = expected["vertices"].as_array().ok_or("Blender vertices missing")?.iter().map(vector).collect::<Result<Vec<_>,_>>()?;
-    assert_eq!(actual.vertices.len(), expected_vertices.len(), "{name}: vertex count differs");
-    let mut actual_vertices = actual.vertices.iter().map(|vertex| vertex.co).collect::<Vec<_>>();
+fn assert_geometry_parity(
+    name: &str,
+    actual: &Mesh,
+    expected: &Value,
+) -> Result<(), Box<dyn Error>> {
+    let expected_vertices = expected["vertices"]
+        .as_array()
+        .ok_or("Blender vertices missing")?
+        .iter()
+        .map(vector)
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(
+        actual.vertices.len(),
+        expected_vertices.len(),
+        "{name}: vertex count differs"
+    );
+    let mut actual_vertices = actual
+        .vertices
+        .iter()
+        .map(|vertex| vertex.co)
+        .collect::<Vec<_>>();
     let mut expected_vertices = expected_vertices;
-    let sort_points = |points: &mut Vec<DVec3>| points.sort_by(|a,b| {
-        a.x.total_cmp(&b.x).then_with(||a.y.total_cmp(&b.y)).then_with(||a.z.total_cmp(&b.z))
-    });
-    sort_points(&mut actual_vertices); sort_points(&mut expected_vertices);
+    let sort_points = |points: &mut Vec<DVec3>| {
+        points.sort_by(|a, b| {
+            a.x.total_cmp(&b.x)
+                .then_with(|| a.y.total_cmp(&b.y))
+                .then_with(|| a.z.total_cmp(&b.z))
+        })
+    };
+    sort_points(&mut actual_vertices);
+    sort_points(&mut expected_vertices);
     for (actual, expected) in actual_vertices.iter().zip(&expected_vertices) {
-        assert!((*actual - *expected).length() <= 2.0e-5, "{name}: vertex {actual:?} differs from {expected:?}");
+        assert!(
+            (*actual - *expected).length() <= 2.0e-5,
+            "{name}: vertex {actual:?} differs from {expected:?}"
+        );
     }
-    let expected_faces = expected["faces"].as_array().ok_or("Blender faces missing")?;
-    assert_eq!(actual.faces.len(), expected_faces.len(), "{name}: face count differs");
-    let positions = actual.vertices.iter().map(|vertex| (vertex.id, vertex.co)).collect::<BTreeMap<_,_>>();
-    let mut actual_faces = actual.faces.iter().map(|face| {
-        let mut points = face.vertices.iter().filter_map(|id| positions.get(id).copied()).collect::<Vec<_>>();
-        sort_points(&mut points);
-        points
-    }).collect::<Vec<_>>();
-    let mut expected_faces = expected_faces.iter().map(|face| {
-        let mut points = face.as_array().into_iter().flatten().map(vector).collect::<Result<Vec<_>,_>>()?;
-        sort_points(&mut points);
-        Ok::<_,Box<dyn Error>>(points)
-    }).collect::<Result<Vec<_>,_>>()?;
+    let expected_faces = expected["faces"]
+        .as_array()
+        .ok_or("Blender faces missing")?;
+    assert_eq!(
+        actual.faces.len(),
+        expected_faces.len(),
+        "{name}: face count differs"
+    );
+    let positions = actual
+        .vertices
+        .iter()
+        .map(|vertex| (vertex.id, vertex.co))
+        .collect::<BTreeMap<_, _>>();
+    let mut actual_faces = actual
+        .faces
+        .iter()
+        .map(|face| {
+            let mut points = face
+                .vertices
+                .iter()
+                .filter_map(|id| positions.get(id).copied())
+                .collect::<Vec<_>>();
+            sort_points(&mut points);
+            points
+        })
+        .collect::<Vec<_>>();
+    let mut expected_faces = expected_faces
+        .iter()
+        .map(|face| {
+            let mut points = face
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(vector)
+                .collect::<Result<Vec<_>, _>>()?;
+            sort_points(&mut points);
+            Ok::<_, Box<dyn Error>>(points)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let sort_faces = |faces: &mut Vec<Vec<DVec3>>| {
         faces.sort_by(|a, b| {
             a.len().cmp(&b.len()).then_with(|| {
@@ -208,11 +284,19 @@ fn assert_geometry_parity(name: &str, actual: &Mesh, expected: &Value) -> Result
             })
         });
     };
-    sort_faces(&mut actual_faces); sort_faces(&mut expected_faces);
+    sort_faces(&mut actual_faces);
+    sort_faces(&mut expected_faces);
     for (actual_face, expected_face) in actual_faces.iter().zip(&expected_faces) {
-        assert_eq!(actual_face.len(), expected_face.len(), "{name}: polygon corner count differs");
+        assert_eq!(
+            actual_face.len(),
+            expected_face.len(),
+            "{name}: polygon corner count differs"
+        );
         for (actual, expected) in actual_face.iter().zip(expected_face) {
-            assert!((*actual - *expected).length() <= 2.0e-5, "{name}: face corner {actual:?} differs from {expected:?}");
+            assert!(
+                (*actual - *expected).length() <= 2.0e-5,
+                "{name}: face corner {actual:?} differs from {expected:?}"
+            );
         }
     }
     Ok(())
@@ -239,16 +323,21 @@ fn armature_scene(
         "invert_vertex_group":invert,
         "use_smooth":false
     });
-    let mut mesh_node = Node { name:"MaskSubject".to_owned(), kind:"mesh".to_owned(), data:Some(mesh_data_id), ..Node::default() };
+    let mut mesh_node = Node {
+        name: "MaskSubject".to_owned(),
+        kind: "mesh".to_owned(),
+        data: Some(mesh_data_id),
+        ..Node::default()
+    };
     mesh_node.modifiers.push(mask_modifier(params)?);
     doc.nodes.insert(mesh_id.clone(), mesh_node);
     if has_armature {
         let mut armature = ArmatureData::default();
-        for (name, bone_id) in [("B1","mask_bone_b1"),("B2","mask_bone_b2")] {
+        for (name, bone_id) in [("B1", "mask_bone_b1"), ("B2", "mask_bone_b2")] {
             let mut bone = Bone::default();
             bone.name = name.to_owned();
-            bone.head = [0.0,0.0,0.0];
-            bone.tail = [0.0,0.5,0.0];
+            bone.head = [0.0, 0.0, 0.0];
+            bone.tail = [0.0, 0.5, 0.0];
             bone.select = selected_bones.contains(&name);
             armature.bones.insert(Id::new(bone_id)?, bone);
         }
@@ -256,13 +345,24 @@ fn armature_scene(
         armature_data.data_type = "armature".to_owned();
         armature_data.mesh = None;
         armature_data.armature = Some(armature);
-        doc.data_blocks.insert(armature_data_id.clone(), armature_data);
-        doc.nodes.insert(armature_id.clone(), Node {
-            name:"MaskArmature".to_owned(), kind:"armature".to_owned(), data:Some(armature_data_id), ..Node::default()
-        });
+        doc.data_blocks
+            .insert(armature_data_id.clone(), armature_data);
+        doc.nodes.insert(
+            armature_id.clone(),
+            Node {
+                name: "MaskArmature".to_owned(),
+                kind: "armature".to_owned(),
+                data: Some(armature_data_id),
+                ..Node::default()
+            },
+        );
     }
     let root = Id::new("collection_root")?;
-    let objects = &mut doc.collections.get_mut(&root).ok_or("root collection missing")?.objects;
+    let objects = &mut doc
+        .collections
+        .get_mut(&root)
+        .ok_or("root collection missing")?
+        .objects;
     objects.push(mesh_id);
     if has_armature {
         objects.push(armature_id);
@@ -271,20 +371,49 @@ fn armature_scene(
 }
 
 #[test]
-fn mask_vertex_group_and_armature_modes_match_blender_threshold_invert_and_smooth() -> Result<(), Box<dyn Error>> {
+fn mask_vertex_group_and_armature_modes_match_blender_threshold_invert_and_smooth()
+-> Result<(), Box<dyn Error>> {
     let Some(blender) = blender_executable() else {
         eprintln!("skipping mask Blender parity test: Blender is unavailable");
         return Ok(());
     };
     let expected = read_expected(&blender)?;
     let cases = [
-        ("vg_threshold", json!({"mode":"VERTEX_GROUP","vertex_group":"G","threshold":0.5,"invert_vertex_group":false,"use_smooth":false}), true),
-        ("vg_inverted", json!({"mode":"VERTEX_GROUP","vertex_group":"G","threshold":0.5,"invert_vertex_group":true,"use_smooth":false}), true),
-        ("vg_smooth", json!({"mode":"VERTEX_GROUP","vertex_group":"G","threshold":0.5,"invert_vertex_group":false,"use_smooth":true}), true),
-        ("vg_smooth_inverted", json!({"mode":"VERTEX_GROUP","vertex_group":"G","threshold":0.5,"invert_vertex_group":true,"use_smooth":true}), true),
-        ("vg_threshold_other", json!({"mode":"VERTEX_GROUP","vertex_group":"G","threshold":0.4,"invert_vertex_group":false,"use_smooth":false}), true),
-        ("missing_group", json!({"mode":"VERTEX_GROUP","vertex_group":"MISSING","threshold":0.5}), true),
-        ("missing_group_inverted", json!({"mode":"VERTEX_GROUP","vertex_group":"MISSING","threshold":0.5,"invert_vertex_group":true}), true),
+        (
+            "vg_threshold",
+            json!({"mode":"VERTEX_GROUP","vertex_group":"G","threshold":0.5,"invert_vertex_group":false,"use_smooth":false}),
+            true,
+        ),
+        (
+            "vg_inverted",
+            json!({"mode":"VERTEX_GROUP","vertex_group":"G","threshold":0.5,"invert_vertex_group":true,"use_smooth":false}),
+            true,
+        ),
+        (
+            "vg_smooth",
+            json!({"mode":"VERTEX_GROUP","vertex_group":"G","threshold":0.5,"invert_vertex_group":false,"use_smooth":true}),
+            true,
+        ),
+        (
+            "vg_smooth_inverted",
+            json!({"mode":"VERTEX_GROUP","vertex_group":"G","threshold":0.5,"invert_vertex_group":true,"use_smooth":true}),
+            true,
+        ),
+        (
+            "vg_threshold_other",
+            json!({"mode":"VERTEX_GROUP","vertex_group":"G","threshold":0.4,"invert_vertex_group":false,"use_smooth":false}),
+            true,
+        ),
+        (
+            "missing_group",
+            json!({"mode":"VERTEX_GROUP","vertex_group":"MISSING","threshold":0.5}),
+            true,
+        ),
+        (
+            "missing_group_inverted",
+            json!({"mode":"VERTEX_GROUP","vertex_group":"MISSING","threshold":0.5,"invert_vertex_group":true}),
+            true,
+        ),
     ];
     for (name, params, with_group) in cases {
         let mesh = weighted_grid(with_group)?;
@@ -293,27 +422,50 @@ fn mask_vertex_group_and_armature_modes_match_blender_threshold_invert_and_smoot
     }
     let empty_group_mesh = {
         let mut mesh = weighted_grid(false)?;
-        mesh.attributes.insert("vertex_groups".to_owned(), json!({"G":{},"Other":{"v0":1.0}}));
+        mesh.attributes.insert(
+            "vertex_groups".to_owned(),
+            json!({"G":{},"Other":{"v0":1.0}}),
+        );
         mesh
     };
-    for (name, invert) in [("empty_group",false),("empty_group_inverted",true),("no_weights",false),("no_weights_inverted",true)] {
-        let mesh = if name.starts_with("empty_group") { empty_group_mesh.clone() } else { weighted_grid(false)? };
-        let actual = evaluate_modifiers(&mesh, &[mask_modifier(json!({"mode":"VERTEX_GROUP","vertex_group":"G","threshold":0.5,"invert_vertex_group":invert}))?], "TestObject")?;
+    for (name, invert) in [
+        ("empty_group", false),
+        ("empty_group_inverted", true),
+        ("no_weights", false),
+        ("no_weights_inverted", true),
+    ] {
+        let mesh = if name.starts_with("empty_group") {
+            empty_group_mesh.clone()
+        } else {
+            weighted_grid(false)?
+        };
+        let actual = evaluate_modifiers(
+            &mesh,
+            &[mask_modifier(
+                json!({"mode":"VERTEX_GROUP","vertex_group":"G","threshold":0.5,"invert_vertex_group":invert}),
+            )?],
+            "TestObject",
+        )?;
         assert_geometry_parity(name, &actual, &expected[name])?;
     }
     let empty_unrelated_mesh = {
         let mut mesh = weighted_grid(false)?;
-        mesh.attributes.insert("vertex_groups".to_owned(), json!({"Other":{}}));
+        mesh.attributes
+            .insert("vertex_groups".to_owned(), json!({"Other":{}}));
         mesh
     };
     for (name, invert) in [
         ("empty_unrelated_missing_group", false),
         ("empty_unrelated_missing_group_inverted", true),
     ] {
-        let actual = evaluate_modifiers(&empty_unrelated_mesh, &[mask_modifier(json!({
-            "mode":"VERTEX_GROUP","vertex_group":"MISSING","threshold":0.5,
-            "invert_vertex_group":invert
-        }))?], "TestObject")?;
+        let actual = evaluate_modifiers(
+            &empty_unrelated_mesh,
+            &[mask_modifier(json!({
+                "mode":"VERTEX_GROUP","vertex_group":"MISSING","threshold":0.5,
+                "invert_vertex_group":invert
+            }))?],
+            "TestObject",
+        )?;
         assert_geometry_parity(name, &actual, &expected[name])?;
     }
     for (name, selected, invert) in [
@@ -338,7 +490,11 @@ fn mask_vertex_group_and_armature_modes_match_blender_threshold_invert_and_smoot
         .meshes
         .get(&Id::new("mask_subject")?)
         .ok_or("evaluated mask mesh missing")?;
-    assert_geometry_parity("armature_missing_object", actual, &expected["armature_missing_object"])?;
+    assert_geometry_parity(
+        "armature_missing_object",
+        actual,
+        &expected["armature_missing_object"],
+    )?;
     Ok(())
 }
 #[test]
@@ -385,7 +541,11 @@ fn cli_armature_mask_and_blend_roundtrip_preserve_selected_bone() -> Result<(), 
         .arg(&operations_file)
         .arg("--json")
         .output()?;
-    assert!(applied.status.success(), "{}", String::from_utf8_lossy(&applied.stdout));
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stdout)
+    );
     let inspected = Command::new(env!("CARGO_BIN_EXE_pot"))
         .args(["inspect"])
         .arg(&scene)
@@ -411,7 +571,11 @@ fn cli_armature_mask_and_blend_roundtrip_preserve_selected_bone() -> Result<(), 
         .arg(&blender)
         .arg("--json")
         .output()?;
-    assert!(exported.status.success(), "{}", String::from_utf8_lossy(&exported.stdout));
+    assert!(
+        exported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&exported.stdout)
+    );
     let blender_probe = Command::new(&blender)
         .args(["--background", "--disable-autoexec", "--python-exit-code", "1", "--python-expr"])
         .arg("import bpy; bone=bpy.data.objects['Rig'].data.bones['MaskBone']; assert bone.select; print('selected mask bone roundtrip OK')")
@@ -438,7 +602,11 @@ fn cli_armature_mask_and_blend_roundtrip_preserve_selected_bone() -> Result<(), 
         .arg(&blender)
         .arg("--json")
         .output()?;
-    assert!(imported.status.success(), "{}", String::from_utf8_lossy(&imported.stdout));
+    assert!(
+        imported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&imported.stdout)
+    );
     let document: Value = serde_json::from_slice(&fs::read(scene.join("scene.json"))?)?;
     let rig_data = document["nodes"]["rig"]["data"]
         .as_str()

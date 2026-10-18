@@ -5,6 +5,10 @@ use serde_json::{Map, Value};
 
 use super::{Id, Registry};
 
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArmatureData {
@@ -58,6 +62,8 @@ pub struct Bone {
     pub head_radius: f64,
     #[serde(default = "default_envelope_radius")]
     pub tail_radius: f64,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub select: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub bbone_settings: BTreeMap<String, Value>,
 }

@@ -1,6 +1,7 @@
 //! Vertex-weight edit/mix/proximity and their image/bone mask coordinates.
 
 use super::*;
+use crate::blender_rng::BlenderRng;
 
 pub(super) fn texture_mask_weights(
     mesh: &Mesh,
@@ -12,7 +13,10 @@ pub(super) fn texture_mask_weights(
 ) -> Result<Option<BTreeMap<u32, f64>>> {
     if modifier.modifier_type == "vertex_weight_proximity"
         && (optional_string(modifier, "target")?.is_none()
-            || operands.get("target").and_then(|objects| objects.first()).is_none())
+            || operands
+                .get("target")
+                .and_then(|objects| objects.first())
+                .is_none())
     {
         return Ok(None);
     }
@@ -80,6 +84,8 @@ pub(super) fn texture_mask_weights(
 
 /// The mask object's Blender-order f32 subject-to-object matrix. Only OBJECT mapping with a
 /// mapping object uses it; other mappings and an unset object yield `None` (LOCAL coordinates).
+/// A set `mask_tex_map_bone` selects the bone-relative matrix; a bone the operand could not
+/// resolve is an error, not a silent object-matrix fallback.
 fn texture_object_matrix(
     modifier: &Modifier,
     operands: &BTreeMap<String, Vec<SceneOperand>>,
@@ -88,18 +94,24 @@ fn texture_object_matrix(
     if mapping != "OBJECT" || optional_string(modifier, "mask_tex_map_object")?.is_none() {
         return Ok(None);
     }
+    let bone = optional_string(modifier, "mask_tex_map_bone")?.filter(|name| !name.is_empty());
     operands
         .get("mask_tex_map_object")
         .and_then(|objects| objects.first())
         .and_then(|object| object.blender_matrices_f32)
         .and_then(|matrices| matrices.subject_to_local)
         .map(Some)
-        .ok_or_else(|| {
-            PotError::with_details(
+        .ok_or_else(|| match bone {
+            Some(bone) => PotError::with_details(
+                ErrorCode::DependencyMissing,
+                "weight texture bone coordinates were not resolved",
+                json!({"modifier_id":modifier.id,"parameter":"mask_tex_map_bone","bone":bone}),
+            ),
+            None => PotError::with_details(
                 ErrorCode::DependencyMissing,
                 "weight texture object coordinates were not resolved",
                 json!({"modifier_id":modifier.id,"parameter":"mask_tex_map_object"}),
-            )
+            ),
         })
 }
 
@@ -117,8 +129,9 @@ fn texture_coordinates(
         .map(|vertex| match mapping {
             "LOCAL" => vertex.co,
             "GLOBAL" => transform_point_f32(&subject_world, vertex.co),
-            "OBJECT" => object_matrix
-                .map_or(vertex.co, |matrix| transform_point_f32(matrix, vertex.co)),
+            "OBJECT" => {
+                object_matrix.map_or(vertex.co, |matrix| transform_point_f32(matrix, vertex.co))
+            }
             "UV" => uv_coordinates
                 .and_then(|coordinates| coordinates.get(&vertex.id).copied())
                 .map_or(vertex.co, |uv| {
@@ -165,7 +178,11 @@ fn vertex_uv_coordinates(
     for (face_index, face) in mesh.faces.iter().enumerate() {
         for (corner, vertex_id) in face.vertices.iter().enumerate() {
             if !coordinates.contains_key(vertex_id) {
-                return Err(invalid(modifier, "mask_tex_uv_layer", "a mesh with valid face vertices"));
+                return Err(invalid(
+                    modifier,
+                    "mask_tex_uv_layer",
+                    "a mesh with valid face vertices",
+                ));
             }
             if !assigned.insert(*vertex_id) {
                 continue;
@@ -240,16 +257,11 @@ pub(super) fn vertex_weight_edit(
         .transpose()?
         .flatten();
     let curve = curve_points(modifier)?;
-    let mut random = BlenderRandom::for_object(subject_name);
+    let mut random = BlenderRng::seed_random(object_name_hash(subject_name));
     let mut values = Vec::with_capacity(mesh.vertices.len());
     for vertex in &mesh.vertices {
         let original = existing.get(&vertex.id).copied().unwrap_or(default);
-        let mut mapped = apply_falloff(
-            original,
-            falloff,
-            curve.as_deref(),
-            &mut random,
-        );
+        let mut mapped = apply_falloff(original, falloff, curve.as_deref(), &mut random);
         if invert_falloff {
             mapped = 1.0 - mapped;
         }
@@ -462,7 +474,11 @@ pub(super) fn vertex_weight_proximity(
             subject_world_f32[14],
         );
         let target_origin = glam::Vec3::new(target_world[12], target_world[13], target_world[14]);
-        Some((subject_world_f32, target_origin, f64::from((subject_origin - target_origin).length())))
+        Some((
+            subject_world_f32,
+            target_origin,
+            f64::from((subject_origin - target_origin).length()),
+        ))
     } else {
         None
     };
@@ -487,14 +503,13 @@ pub(super) fn vertex_weight_proximity(
             .mesh
             .triangulate()
             .map_err(|error| {
-                PotError::invalid_argument(format!("invalid proximity target triangulation: {error}"))
+                PotError::invalid_argument(format!(
+                    "invalid proximity target triangulation: {error}"
+                ))
             })?
             .into_iter()
             .filter_map(|triangle| {
-                Some([
-                    *positions.get(&triangle[0])?,
-                    *positions.get(&triangle[1])?,
-                ])
+                Some([*positions.get(&triangle[0])?, *positions.get(&triangle[1])?])
             })
             .collect::<Vec<_>>()
     } else {
@@ -512,12 +527,26 @@ pub(super) fn vertex_weight_proximity(
         .iter()
         .filter_map(|edge| {
             Some([
-                target.mesh.vertices.iter().find(|vertex| vertex.id == edge.vertices[0])?.co.as_vec3().as_dvec3(),
-                target.mesh.vertices.iter().find(|vertex| vertex.id == edge.vertices[1])?.co.as_vec3().as_dvec3(),
+                target
+                    .mesh
+                    .vertices
+                    .iter()
+                    .find(|vertex| vertex.id == edge.vertices[0])?
+                    .co
+                    .as_vec3()
+                    .as_dvec3(),
+                target
+                    .mesh
+                    .vertices
+                    .iter()
+                    .find(|vertex| vertex.id == edge.vertices[1])?
+                    .co
+                    .as_vec3()
+                    .as_dvec3(),
             ])
         })
         .collect::<Vec<_>>();
-    let mut random = BlenderRandom::for_object(subject_name);
+    let mut random = BlenderRng::seed_random(object_name_hash(subject_name));
     let mut updated = existing.clone();
     let mut selected_ids = Vec::with_capacity(existing.len());
     let mut selected_values = Vec::with_capacity(existing.len());
@@ -529,11 +558,20 @@ pub(super) fn vertex_weight_proximity(
             "OBJECT" => origin_distance
                 .as_ref()
                 .map(|(_, _, distance)| *distance)
-                .ok_or_else(|| PotError::new(ErrorCode::EvaluationFailed, "proximity object world matrices are missing"))?,
+                .ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::EvaluationFailed,
+                        "proximity object world matrices are missing",
+                    )
+                })?,
             "GEOMETRY" if geometry.is_empty() => {
-                let (subject_world_f32, target_origin, _) = origin_distance
-                    .as_ref()
-                    .ok_or_else(|| PotError::new(ErrorCode::EvaluationFailed, "proximity origin world matrices are missing"))?;
+                let (subject_world_f32, target_origin, _) =
+                    origin_distance.as_ref().ok_or_else(|| {
+                        PotError::new(
+                            ErrorCode::EvaluationFailed,
+                            "proximity origin world matrices are missing",
+                        )
+                    })?;
                 f64::from(
                     crate::geom::blender_matrix::blender_transform_point_f32(
                         subject_world_f32,
@@ -685,9 +723,9 @@ fn write_group_weights_preserving_zero(
         .attributes
         .entry("vertex_groups".to_owned())
         .or_insert_with(|| Value::Object(Map::new()));
-    let groups = groups
-        .as_object_mut()
-        .ok_or_else(|| PotError::invalid_argument("vertex_groups mesh attribute must be an object"))?;
+    let groups = groups.as_object_mut().ok_or_else(|| {
+        PotError::invalid_argument("vertex_groups mesh attribute must be an object")
+    })?;
     let mut values = Map::new();
     for (id, weight) in weights {
         values.insert(format!("v{id}"), json!(weight));
@@ -747,63 +785,20 @@ fn clamp_weights(weights: &mut [f64]) {
     }
 }
 
-// Weight falloff RANDOM's per-object stream (distinct from the shared texture `BlenderRng`).
-struct BlenderRandom {
-    state: u64,
+/// Blender's `BLI_ghashutil_strhash` (djb2 over signed bytes) of an object name. RANDOM falloff
+/// seeds its per-object stream from this hash of the subject name.
+fn object_name_hash(name: &str) -> u32 {
+    name.bytes().fold(5381_u32, |hash, byte| {
+        hash.wrapping_mul(33).wrapping_add(byte as i8 as i32 as u32)
+    })
 }
 
-impl BlenderRandom {
-    const NOISE_HASH: [u8; 256] = [
-        0xA2, 0xA0, 0x19, 0x3B, 0xF8, 0xEB, 0xAA, 0xEE, 0xF3, 0x1C, 0x67, 0x28, 0x1D, 0xED, 0x00,
-        0xDE, 0x95, 0x2E, 0xDC, 0x3F, 0x3A, 0x82, 0x35, 0x4D, 0x6C, 0xBA, 0x36, 0xD0, 0xF6, 0x0C,
-        0x79, 0x32, 0xD1, 0x59, 0xF4, 0x08, 0x8B, 0x63, 0x89, 0x2F, 0xB8, 0xB4, 0x97, 0x83, 0xF2,
-        0x8F, 0x18, 0xC7, 0x51, 0x14, 0x65, 0x87, 0x48, 0x20, 0x42, 0xA8, 0x80, 0xB5, 0x40, 0x13,
-        0xB2, 0x22, 0x7E, 0x57, 0xBC, 0x7F, 0x6B, 0x9D, 0x86, 0x4C, 0xC8, 0xDB, 0x7C, 0xD5, 0x25,
-        0x4E, 0x5A, 0x55, 0x74, 0x50, 0xCD, 0xB3, 0x7A, 0xBB, 0xC3, 0xCB, 0xB6, 0xE2, 0xE4, 0xEC,
-        0xFD, 0x98, 0x0B, 0x96, 0xD3, 0x9E, 0x5C, 0xA1, 0x64, 0xF1, 0x81, 0x61, 0xE1, 0xC4, 0x24,
-        0x72, 0x49, 0x8C, 0x90, 0x4B, 0x84, 0x34, 0x38, 0xAB, 0x78, 0xCA, 0x1F, 0x01, 0xD7, 0x93,
-        0x11, 0xC1, 0x58, 0xA9, 0x31, 0xF9, 0x44, 0x6D, 0xBF, 0x33, 0x9C, 0x5F, 0x09, 0x94, 0xA3,
-        0x85, 0x06, 0xC6, 0x9A, 0x1E, 0x7B, 0x46, 0x15, 0x30, 0x27, 0x2B, 0x1B, 0x71, 0x3C, 0x5B,
-        0xD6, 0x6F, 0x62, 0xAC, 0x4F, 0xC2, 0xC0, 0x0E, 0xB1, 0x23, 0xA7, 0xDF, 0x47, 0xB0, 0x77,
-        0x69, 0x05, 0xE9, 0xE6, 0xE7, 0x76, 0x73, 0x0F, 0xFE, 0x6E, 0x9B, 0x56, 0xEF, 0x12, 0xA5,
-        0x37, 0xFC, 0xAE, 0xD9, 0x03, 0x8E, 0xDD, 0x10, 0xB9, 0xCE, 0xC9, 0x8D, 0xDA, 0x2A, 0xBD,
-        0x68, 0x17, 0x9F, 0xBE, 0xD4, 0x0A, 0xCC, 0xD2, 0xE8, 0x43, 0x3D, 0x70, 0xB7, 0x02, 0x7D,
-        0x99, 0xD8, 0x0D, 0x60, 0x8A, 0x04, 0x2C, 0x3E, 0x92, 0xE5, 0xAF, 0x53, 0x07, 0xE0, 0x29,
-        0xA6, 0xC5, 0xE3, 0xF5, 0xF7, 0x4A, 0x41, 0x26, 0x6A, 0x16, 0x5E, 0x52, 0x2D, 0x21, 0xAD,
-        0xF0, 0x91, 0xFF, 0xEA, 0x54, 0xFA, 0x66, 0x1A, 0x45, 0x39, 0xCF, 0x75, 0xA4, 0x88, 0xFB,
-        0x5D,
-    ];
-
-    fn for_object(name: &str) -> Self {
-        let hash = name.bytes().fold(5381_u32, |hash, byte| {
-            let byte = (byte as i8 as i32) as u32;
-            hash.wrapping_mul(33).wrapping_add(byte)
-        });
-        let seed = |seed: u32| (u64::from(seed) << 16) | 0x330e;
-        let mut state = seed(hash.wrapping_add(u32::from(Self::NOISE_HASH[(hash & 255) as usize])));
-        let mut value = Self::next_uint(state);
-        state = seed(value.wrapping_add(u32::from(Self::NOISE_HASH[(value & 255) as usize])));
-        value = Self::next_uint(state);
-        state = seed(value.wrapping_add(u32::from(Self::NOISE_HASH[(value & 255) as usize])));
-        Self { state }
-    }
-
-    fn next_uint(state: u64) -> u32 {
-        let state = state.wrapping_mul(0x5deece66d).wrapping_add(0xb) & 0x0000_ffff_ffff_ffff;
-        (state >> 17) as u32
-    }
-
-    fn next_float(&mut self) -> f64 {
-        self.state = self
-            .state
-            .wrapping_mul(0x5deece66d)
-            .wrapping_add(0xb)
-            & 0x0000_ffff_ffff_ffff;
-        ((self.state >> 17) as f32 / 2_147_483_648.0_f32) as f64
-    }
-}
-
-fn apply_falloff(value: f64, falloff: &str, curve: Option<&[DVec2]>, random: &mut BlenderRandom) -> f64 {
+fn apply_falloff(
+    value: f64,
+    falloff: &str,
+    curve: Option<&[DVec2]>,
+    random: &mut BlenderRng,
+) -> f64 {
     let value = value.clamp(0.0, 1.0);
     match falloff {
         "CURVE" => curve.map_or(value, |points| curve_mapping_value(points, value)),
@@ -811,7 +806,7 @@ fn apply_falloff(value: f64, falloff: &str, curve: Option<&[DVec2]>, random: &mu
         "SMOOTH" => value * value * (3.0 - 2.0 * value),
         "ROOT" => value.sqrt(),
         "ICON_SPHERECURVE" => (2.0 * value - value * value).sqrt(),
-        "RANDOM" => value * random.next_float(),
+        "RANDOM" => value * f64::from(random.get_float()),
         "STEP" => f64::from(value >= 0.5),
         _ => value,
     }
@@ -943,5 +938,3 @@ fn curve_mapping_value(points: &[DVec2], value: f64) -> f64 {
 fn weight_matrix_f32(matrix: DMat4) -> [f32; 16] {
     matrix.to_cols_array().map(|value| value as f32)
 }
-
-

@@ -1,12 +1,16 @@
-use std::{collections::{BTreeMap, BTreeSet}, error::Error, fs, process::Command};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fs,
+    process::Command,
+};
 
 use glam::{DMat4, DVec3, Mat4};
 use potter_core::{
     geom::{
         Mesh,
         modifiers::attributes::{
-            AttributeLayerSelection, SceneOperand, SceneOperandMatricesF32,
-            evaluate_with_context,
+            AttributeLayerSelection, SceneOperand, SceneOperandMatricesF32, evaluate_with_context,
         },
     },
     model::{CameraData, Modifier, ModifierRuntime},
@@ -27,7 +31,10 @@ fn modifier(modifier_type: &str, params: Value) -> Result<Modifier, Box<dyn Erro
         enabled: true,
         show_viewport: true,
         show_render: true,
-        params: params.as_object().ok_or("modifier params must be an object")?.clone(),
+        params: params
+            .as_object()
+            .ok_or("modifier params must be an object")?
+            .clone(),
         binding_data: None,
         runtime: ModifierRuntime::default(),
     })
@@ -41,7 +48,12 @@ fn layer_selection(groups: &[&str], active_group: Option<usize>) -> AttributeLay
     }
 }
 
-fn operand(mesh: Mesh, _local_to_subject: DMat4, groups: &[&str], active: Option<usize>) -> SceneOperand {
+fn operand(
+    mesh: Mesh,
+    _local_to_subject: DMat4,
+    groups: &[&str],
+    active: Option<usize>,
+) -> SceneOperand {
     let identity = Mat4::IDENTITY.to_cols_array();
     SceneOperand {
         mesh,
@@ -83,11 +95,7 @@ fn group_weights(mesh: &Mesh, name: &str) -> Vec<f64> {
         .collect()
 }
 
-fn set_uv_layers(
-    mesh: &mut Mesh,
-    layers: &[(&str, Vec<Vec<[f64; 2]>>)],
-    active: &str,
-) {
+fn set_uv_layers(mesh: &mut Mesh, layers: &[(&str, Vec<Vec<[f64; 2]>>)], active: &str) {
     let layers = layers
         .iter()
         .map(|(name, faces)| {
@@ -178,9 +186,8 @@ fn set_smooth_faces(mesh: &mut Mesh) {
     );
 }
 fn set_edge_flags(mesh: &mut Mesh, name: &str, marked_vertices: Option<(usize, usize)>) {
-    let marked_ids = marked_vertices.map(|(first, second)| {
-        (mesh.vertices[first].id, mesh.vertices[second].id)
-    });
+    let marked_ids =
+        marked_vertices.map(|(first, second)| (mesh.vertices[first].id, mesh.vertices[second].id));
     let values = mesh
         .edges
         .iter()
@@ -217,7 +224,9 @@ fn set_domain_attribute(
     data_type: &str,
     values: Value,
 ) -> Result<(), Box<dyn Error>> {
-    let items = values.as_array().ok_or("domain attribute values must be an array")?;
+    let items = values
+        .as_array()
+        .ok_or("domain attribute values must be an array")?;
     let expected_len = match domain {
         "point" => mesh.vertices.len(),
         "edge" => mesh.edges.len(),
@@ -254,20 +263,46 @@ fn set_domain_attribute(
 }
 
 fn domain_attribute_values(mesh: &Mesh, name: &str) -> Value {
-    let Some(attribute) = mesh.attributes.get(name) else { return json!([]); };
-    let Some(values) = attribute.get("values").and_then(Value::as_object) else { return json!([]); };
+    let Some(attribute) = mesh.attributes.get(name) else {
+        return json!([]);
+    };
+    let Some(values) = attribute.get("values").and_then(Value::as_object) else {
+        return json!([]);
+    };
     let keys = match attribute.get("domain").and_then(Value::as_str) {
-        Some("point") => mesh.vertices.iter().map(|item| format!("v{}", item.id)).collect::<Vec<_>>(),
-        Some("edge") => mesh.edges.iter().map(|item| format!("e{}", item.id)).collect::<Vec<_>>(),
-        Some("face") => mesh.faces.iter().map(|item| format!("f{}", item.id)).collect::<Vec<_>>(),
+        Some("point") => mesh
+            .vertices
+            .iter()
+            .map(|item| format!("v{}", item.id))
+            .collect::<Vec<_>>(),
+        Some("edge") => mesh
+            .edges
+            .iter()
+            .map(|item| format!("e{}", item.id))
+            .collect::<Vec<_>>(),
+        Some("face") => mesh
+            .faces
+            .iter()
+            .map(|item| format!("f{}", item.id))
+            .collect::<Vec<_>>(),
         _ => return json!([]),
     };
-    Value::Array(keys.iter().filter_map(|key| values.get(key).cloned()).collect())
+    Value::Array(
+        keys.iter()
+            .filter_map(|key| values.get(key).cloned())
+            .collect(),
+    )
 }
 
 fn set_custom_normal_codes(mesh: &mut Mesh, raw_codes: &Value) -> Result<(), Box<dyn Error>> {
-    let codes = raw_codes.as_array().ok_or("Blender custom-normal codes must be an array")?;
-    let corner_count = mesh.faces.iter().map(|face| face.vertices.len()).sum::<usize>();
+    let codes = raw_codes
+        .as_array()
+        .ok_or("Blender custom-normal codes must be an array")?;
+    let corner_count = mesh
+        .faces
+        .iter()
+        .map(|face| face.vertices.len())
+        .sum::<usize>();
     if codes.len() != corner_count {
         return Err("custom-normal code count does not match mesh corners".into());
     }
@@ -275,7 +310,9 @@ fn set_custom_normal_codes(mesh: &mut Mesh, raw_codes: &Value) -> Result<(), Box
     let mut values = serde_json::Map::new();
     for face in &mesh.faces {
         let end = cursor + face.vertices.len();
-        let row = codes.get(cursor..end).ok_or("custom-normal face row is out of range")?;
+        let row = codes
+            .get(cursor..end)
+            .ok_or("custom-normal face row is out of range")?;
         values.insert(format!("f{}", face.id), Value::Array(row.to_vec()));
         cursor = end;
     }
@@ -288,9 +325,9 @@ fn set_custom_normal_codes(mesh: &mut Mesh, raw_codes: &Value) -> Result<(), Box
 
 fn max_error(actual: &Value, expected: &Value) -> Result<f64, Box<dyn Error>> {
     match (actual, expected) {
-        (Value::Number(a), Value::Number(b)) => Ok((a.as_f64().ok_or("non-f64 actual")?
-            - b.as_f64().ok_or("non-f64 expected")?)
-            .abs()),
+        (Value::Number(a), Value::Number(b)) => {
+            Ok((a.as_f64().ok_or("non-f64 actual")? - b.as_f64().ok_or("non-f64 expected")?).abs())
+        }
         (Value::Array(a), Value::Array(b)) if a.len() == b.len() => {
             let mut error = 0.0_f64;
             for (a, b) in a.iter().zip(b) {
@@ -365,7 +402,8 @@ with open(os.path.join(root, 'vertex-mapping-oracle.json'), 'w') as f: json.dump
 "#;
 
 #[test]
-fn vertex_mapping_families_match_blender_with_asymmetric_transforms() -> Result<(), Box<dyn Error>> {
+fn vertex_mapping_families_match_blender_with_asymmetric_transforms() -> Result<(), Box<dyn Error>>
+{
     let Some(blender) = blender_file::blender_executable() else {
         eprintln!("skipping data-transfer Blender parity test: Blender is unavailable");
         return Ok(());
@@ -379,90 +417,187 @@ fn vertex_mapping_families_match_blender_with_asymmetric_transforms() -> Result<
         root,
         "Blender data-transfer vertex mapping oracle failed",
     )?;
-    let expected: Value = serde_json::from_slice(&fs::read(root.join("vertex-mapping-oracle.json"))?)?;
+    let expected: Value =
+        serde_json::from_slice(&fs::read(root.join("vertex-mapping-oracle.json"))?)?;
     let source = Mesh::from_positions_and_faces(
-        vec![DVec3::new(0.0,0.0,0.0),DVec3::new(2.0,0.0,0.0),DVec3::new(2.0,1.0,0.0),DVec3::new(0.0,1.0,0.0)],
-        vec![vec![0,1,2,3]],
+        vec![
+            DVec3::new(0.0, 0.0, 0.0),
+            DVec3::new(2.0, 0.0, 0.0),
+            DVec3::new(2.0, 1.0, 0.0),
+            DVec3::new(0.0, 1.0, 0.0),
+        ],
+        vec![vec![0, 1, 2, 3]],
     )?;
     let mut source = source;
-    set_group(&mut source, "A", &[0.05,0.35,0.8,0.95]);
+    set_group(&mut source, "A", &[0.05, 0.35, 0.8, 0.95]);
     let source_world = DMat4::from_scale_rotation_translation(
-        DVec3::new(1.2,0.8,1.1), glam::DQuat::IDENTITY, DVec3::new(0.2,-0.1,0.0));
+        DVec3::new(1.2, 0.8, 1.1),
+        glam::DQuat::IDENTITY,
+        DVec3::new(0.2, -0.1, 0.0),
+    );
     let destination_world = DMat4::from_scale_rotation_translation(
-        DVec3::new(0.9,1.1,1.0), glam::DQuat::IDENTITY, DVec3::new(-0.1,0.15,0.0));
+        DVec3::new(0.9, 1.1, 1.0),
+        glam::DQuat::IDENTITY,
+        DVec3::new(-0.1, 0.15, 0.0),
+    );
     let source_to_destination = destination_world.inverse() * source_world;
     let local_to_subject_f32 = [
-        1.3333335,0.0,0.0,0.0,0.0,0.7272727,0.0,0.0,0.0,0.0,1.1,0.0,
-        0.33333337,-0.22727272,0.0,1.0,
+        1.3333335,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.7272727,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.1,
+        0.0,
+        0.33333337,
+        -0.22727272,
+        0.0,
+        1.0,
     ];
     let subject_to_local_f32 = [
-        0.74999994,0.0,0.0,0.0,0.0,1.3750001,0.0,0.0,0.0,0.0,0.90909094,0.0,
-        -0.25,0.31250003,0.0,1.0,
+        0.74999994, 0.0, 0.0, 0.0, 0.0, 1.3750001, 0.0, 0.0, 0.0, 0.0, 0.90909094, 0.0, -0.25,
+        0.31250003, 0.0, 1.0,
     ];
-    let mut source_operand=operand(source.clone(),source_to_destination,&["A"],Some(0));
-    source_operand.blender_matrices_f32=Some(SceneOperandMatricesF32 {
-        world:None,
-        local_to_subject:Some(local_to_subject_f32),
-        subject_to_local:Some(subject_to_local_f32),
+    let mut source_operand = operand(source.clone(), source_to_destination, &["A"], Some(0));
+    source_operand.blender_matrices_f32 = Some(SceneOperandMatricesF32 {
+        world: None,
+        local_to_subject: Some(local_to_subject_f32),
+        subject_to_local: Some(subject_to_local_f32),
     });
     let mut source_operands = BTreeMap::new();
     source_operands.insert("object".to_owned(), vec![source_operand]);
-    let mappings = ["NEAREST","EDGE_NEAREST","EDGEINTERP_NEAREST","POLY_NEAREST","POLYINTERP_NEAREST","POLYINTERP_VNORPROJ"];
+    let mappings = [
+        "NEAREST",
+        "EDGE_NEAREST",
+        "EDGEINTERP_NEAREST",
+        "POLY_NEAREST",
+        "POLYINTERP_NEAREST",
+        "POLYINTERP_VNORPROJ",
+    ];
     let destination_positions = [
-        DVec3::new(0.15,0.12,0.18), DVec3::new(1.45,0.18,0.15), DVec3::new(0.85,0.86,0.21),
+        DVec3::new(0.15, 0.12, 0.18),
+        DVec3::new(1.45, 0.18, 0.15),
+        DVec3::new(0.85, 0.86, 0.21),
     ];
     for mapping in mappings {
-        let mut destination = Mesh::from_positions_and_faces(destination_positions.to_vec(), vec![vec![0,1,2]])?;
-        set_group(&mut destination, "A", &[0.2,0.3,0.4]);
-        let modifier = modifier("data_transfer", json!({
-            "object":"source","use_object_transform":true,"use_vert_data":true,
-            "data_types_verts":["VGROUP_WEIGHTS"],"vert_mapping":mapping,
-            "mix_mode":"REPLACE","mix_factor":1.0,"use_max_distance":true,
-            "max_distance":10.0,"ray_radius":0.01
-        }))?;
-        let actual = evaluate_with_context(&destination, &modifier, &source_operands, None, DMat4::IDENTITY, "destination", &AttributeLayerSelection::default())?;
+        let mut destination =
+            Mesh::from_positions_and_faces(destination_positions.to_vec(), vec![vec![0, 1, 2]])?;
+        set_group(&mut destination, "A", &[0.2, 0.3, 0.4]);
+        let modifier = modifier(
+            "data_transfer",
+            json!({
+                "object":"source","use_object_transform":true,"use_vert_data":true,
+                "data_types_verts":["VGROUP_WEIGHTS"],"vert_mapping":mapping,
+                "mix_mode":"REPLACE","mix_factor":1.0,"use_max_distance":true,
+                "max_distance":10.0,"ray_radius":0.01
+            }),
+        )?;
+        let actual = evaluate_with_context(
+            &destination,
+            &modifier,
+            &source_operands,
+            None,
+            DMat4::IDENTITY,
+            "destination",
+            &AttributeLayerSelection::default(),
+        )?;
         let error = max_error(&json!(group_weights(&actual, "A")), &expected[mapping])?;
         assert!(error < 2.0e-4, "{mapping} max error {error}");
     }
-    let mut no_transform_destination=Mesh::from_positions_and_faces(
-        destination_positions.to_vec(),vec![vec![0,1,2]])?;
-    set_group(&mut no_transform_destination,"A",&[0.2,0.3,0.4]);
-    let no_transform_modifier=modifier("data_transfer",json!({
-        "object":"source","use_object_transform":false,"use_vert_data":true,
-        "data_types_verts":["VGROUP_WEIGHTS"],"vert_mapping":"NEAREST",
-        "mix_mode":"REPLACE","mix_factor":1.0,"use_max_distance":true,"max_distance":10.0,
-    }))?;
-    let no_transform_actual=evaluate_with_context(&no_transform_destination, &no_transform_modifier, &source_operands, None, DMat4::IDENTITY, "destination", &AttributeLayerSelection::default())?;
-    let no_transform_error=max_error(
-        &json!(group_weights(&no_transform_actual,"A")),
+    let mut no_transform_destination =
+        Mesh::from_positions_and_faces(destination_positions.to_vec(), vec![vec![0, 1, 2]])?;
+    set_group(&mut no_transform_destination, "A", &[0.2, 0.3, 0.4]);
+    let no_transform_modifier = modifier(
+        "data_transfer",
+        json!({
+            "object":"source","use_object_transform":false,"use_vert_data":true,
+            "data_types_verts":["VGROUP_WEIGHTS"],"vert_mapping":"NEAREST",
+            "mix_mode":"REPLACE","mix_factor":1.0,"use_max_distance":true,"max_distance":10.0,
+        }),
+    )?;
+    let no_transform_actual = evaluate_with_context(
+        &no_transform_destination,
+        &no_transform_modifier,
+        &source_operands,
+        None,
+        DMat4::IDENTITY,
+        "destination",
+        &AttributeLayerSelection::default(),
+    )?;
+    let no_transform_error = max_error(
+        &json!(group_weights(&no_transform_actual, "A")),
         &expected["NO_OBJECT_TRANSFORM"],
     )?;
-    assert!(no_transform_error<2.0e-4,
-        "use_object_transform=false max error {no_transform_error}");
+    assert!(
+        no_transform_error < 2.0e-4,
+        "use_object_transform=false max error {no_transform_error}"
+    );
     let mut cutoff = Mesh::from_positions_and_faces(
-        vec![DVec3::new(20.0,20.0,20.0),DVec3::new(21.0,20.0,20.0),DVec3::new(20.0,21.0,20.0)],
-        vec![vec![0,1,2]],
+        vec![
+            DVec3::new(20.0, 20.0, 20.0),
+            DVec3::new(21.0, 20.0, 20.0),
+            DVec3::new(20.0, 21.0, 20.0),
+        ],
+        vec![vec![0, 1, 2]],
     )?;
-    set_group(&mut cutoff,"A",&[0.2,0.3,0.4]);
-    let cutoff_modifier=modifier("data_transfer",json!({
-        "object":"source","use_object_transform":true,"use_vert_data":true,"data_types_verts":["VGROUP_WEIGHTS"],
-        "vert_mapping":"NEAREST","mix_mode":"REPLACE","mix_factor":1.0,"use_max_distance":true,"max_distance":0.1
-    }))?;
-    let cutoff_actual=evaluate_with_context(&cutoff, &cutoff_modifier, &source_operands, None, DMat4::IDENTITY, "destination", &AttributeLayerSelection::default())?;
-    let cutoff_error=max_error(&json!(group_weights(&cutoff_actual,"A")),&expected["DISTANCE_CUTOFF"])?;
-    assert!(cutoff_error<1.0e-6,"max-distance cutoff error {cutoff_error}");
+    set_group(&mut cutoff, "A", &[0.2, 0.3, 0.4]);
+    let cutoff_modifier = modifier(
+        "data_transfer",
+        json!({
+            "object":"source","use_object_transform":true,"use_vert_data":true,"data_types_verts":["VGROUP_WEIGHTS"],
+            "vert_mapping":"NEAREST","mix_mode":"REPLACE","mix_factor":1.0,"use_max_distance":true,"max_distance":0.1
+        }),
+    )?;
+    let cutoff_actual = evaluate_with_context(
+        &cutoff,
+        &cutoff_modifier,
+        &source_operands,
+        None,
+        DMat4::IDENTITY,
+        "destination",
+        &AttributeLayerSelection::default(),
+    )?;
+    let cutoff_error = max_error(
+        &json!(group_weights(&cutoff_actual, "A")),
+        &expected["DISTANCE_CUTOFF"],
+    )?;
+    assert!(
+        cutoff_error < 1.0e-6,
+        "max-distance cutoff error {cutoff_error}"
+    );
     let topology = Mesh::from_positions_and_faces(
-        vec![DVec3::ZERO,DVec3::new(2.0,0.0,0.0),DVec3::new(2.0,1.0,0.0),DVec3::new(0.0,1.0,0.0)],
-        vec![vec![0,1,2,3]],
+        vec![
+            DVec3::ZERO,
+            DVec3::new(2.0, 0.0, 0.0),
+            DVec3::new(2.0, 1.0, 0.0),
+            DVec3::new(0.0, 1.0, 0.0),
+        ],
+        vec![vec![0, 1, 2, 3]],
     )?;
     let mut topology = topology;
-    set_group(&mut topology, "A", &[0.2,0.3,0.4,0.5]);
-    let modifier = modifier("data_transfer", json!({
-        "object":"source","use_object_transform":true,"use_vert_data":true,
-        "data_types_verts":["VGROUP_WEIGHTS"],"vert_mapping":"TOPOLOGY",
-        "mix_mode":"REPLACE","mix_factor":1.0
-    }))?;
-    let actual = evaluate_with_context(&topology, &modifier, &source_operands, None, DMat4::IDENTITY, "destination", &AttributeLayerSelection::default())?;
+    set_group(&mut topology, "A", &[0.2, 0.3, 0.4, 0.5]);
+    let modifier = modifier(
+        "data_transfer",
+        json!({
+            "object":"source","use_object_transform":true,"use_vert_data":true,
+            "data_types_verts":["VGROUP_WEIGHTS"],"vert_mapping":"TOPOLOGY",
+            "mix_mode":"REPLACE","mix_factor":1.0
+        }),
+    )?;
+    let actual = evaluate_with_context(
+        &topology,
+        &modifier,
+        &source_operands,
+        None,
+        DMat4::IDENTITY,
+        "destination",
+        &AttributeLayerSelection::default(),
+    )?;
     let error = max_error(&json!(group_weights(&actual, "A")), &expected["TOPOLOGY"])?;
     assert!(error < 1.0e-6, "TOPOLOGY max error {error}");
     Ok(())
@@ -514,103 +649,231 @@ fn vgroup_active_index_mix_and_mask_match_blender() -> Result<(), Box<dyn Error>
     };
     let directory = tempdir()?;
     let root = directory.path();
-    blender_script::run_blender_script(&blender,"mix.py",BLENDER_MIX_SCRIPT,root,"Blender data-transfer mix oracle failed")?;
+    blender_script::run_blender_script(
+        &blender,
+        "mix.py",
+        BLENDER_MIX_SCRIPT,
+        root,
+        "Blender data-transfer mix oracle failed",
+    )?;
     let expected: Value = serde_json::from_slice(&fs::read(root.join("mix-oracle.json"))?)?;
-    let quad = || Mesh::from_positions_and_faces(vec![DVec3::ZERO,DVec3::X,DVec3::ONE,DVec3::Y],vec![vec![0,1,2,3]]);
+    let quad = || {
+        Mesh::from_positions_and_faces(
+            vec![DVec3::ZERO, DVec3::X, DVec3::ONE, DVec3::Y],
+            vec![vec![0, 1, 2, 3]],
+        )
+    };
     let mut source = quad()?;
-    set_group(&mut source,"B",&[0.8,0.3,0.1,0.6]); set_group(&mut source,"A",&[0.1,0.6,0.9,0.2]);
-    let source_operand = operand(source.clone(),DMat4::IDENTITY,&["B","A"],Some(1));
-    let mut operands = BTreeMap::new(); operands.insert("object".to_owned(),vec![source_operand]);
-    for mode in ["REPLACE","ABOVE_THRESHOLD","BELOW_THRESHOLD","MIX","ADD","SUB","MUL"] {
-        let mut destination=quad()?;
-        set_group(&mut destination,"D0",&[0.2,0.4,0.6,0.8]); set_group(&mut destination,"D1",&[0.7,0.5,0.3,0.1]); set_group(&mut destination,"Mask",&[0.25,0.75,0.5,1.0]);
-        let modifier=modifier("data_transfer",json!({"object":"source","use_vert_data":true,"data_types_verts":["VGROUP_WEIGHTS"],"vert_mapping":"TOPOLOGY","layers_vgroup_select_src":"ALL","layers_vgroup_select_dst":"INDEX","mix_mode":mode,"mix_factor":0.4,"vertex_group":"Mask"}))?;
-        let actual=evaluate_with_context(&destination, &modifier, &operands, None, DMat4::IDENTITY, "destination", &layer_selection(&["D0","D1","Mask"],Some(1)))?;
-        for name in ["D0","D1"] {
-            let error=max_error(&json!(group_weights(&actual,name)),&expected[mode][name])?;
-            assert!(error<2.0e-6,"{mode}/{name} max error {error}");
+    set_group(&mut source, "B", &[0.8, 0.3, 0.1, 0.6]);
+    set_group(&mut source, "A", &[0.1, 0.6, 0.9, 0.2]);
+    let source_operand = operand(source.clone(), DMat4::IDENTITY, &["B", "A"], Some(1));
+    let mut operands = BTreeMap::new();
+    operands.insert("object".to_owned(), vec![source_operand]);
+    for mode in [
+        "REPLACE",
+        "ABOVE_THRESHOLD",
+        "BELOW_THRESHOLD",
+        "MIX",
+        "ADD",
+        "SUB",
+        "MUL",
+    ] {
+        let mut destination = quad()?;
+        set_group(&mut destination, "D0", &[0.2, 0.4, 0.6, 0.8]);
+        set_group(&mut destination, "D1", &[0.7, 0.5, 0.3, 0.1]);
+        set_group(&mut destination, "Mask", &[0.25, 0.75, 0.5, 1.0]);
+        let modifier = modifier(
+            "data_transfer",
+            json!({"object":"source","use_vert_data":true,"data_types_verts":["VGROUP_WEIGHTS"],"vert_mapping":"TOPOLOGY","layers_vgroup_select_src":"ALL","layers_vgroup_select_dst":"INDEX","mix_mode":mode,"mix_factor":0.4,"vertex_group":"Mask"}),
+        )?;
+        let actual = evaluate_with_context(
+            &destination,
+            &modifier,
+            &operands,
+            None,
+            DMat4::IDENTITY,
+            "destination",
+            &layer_selection(&["D0", "D1", "Mask"], Some(1)),
+        )?;
+        for name in ["D0", "D1"] {
+            let error = max_error(&json!(group_weights(&actual, name)), &expected[mode][name])?;
+            assert!(error < 2.0e-6, "{mode}/{name} max error {error}");
         }
     }
-    let mut inverted_destination=quad()?;
-    set_group(&mut inverted_destination,"D0",&[0.2,0.4,0.6,0.8]);
-    set_group(&mut inverted_destination,"D1",&[0.7,0.5,0.3,0.1]);
-    set_group(&mut inverted_destination,"Mask",&[0.25,0.75,0.5,1.0]);
-    let inverted_modifier=modifier("data_transfer",json!({"object":"source","use_vert_data":true,"data_types_verts":["VGROUP_WEIGHTS"],"vert_mapping":"TOPOLOGY","layers_vgroup_select_src":"ALL","layers_vgroup_select_dst":"INDEX","mix_mode":"REPLACE","mix_factor":0.4,"vertex_group":"Mask","invert_vertex_group":true}))?;
-    let inverted_actual=evaluate_with_context(&inverted_destination, &inverted_modifier, &operands, None, DMat4::IDENTITY, "destination", &layer_selection(&["D0","D1","Mask"],Some(1)))?;
-    for name in ["D0","D1"] {
-        let error=max_error(&json!(group_weights(&inverted_actual,name)),&expected["INVERT_MASK"][name])?;
-        assert!(error<2.0e-6,"inverted mask/{name} max error {error}");
+    let mut inverted_destination = quad()?;
+    set_group(&mut inverted_destination, "D0", &[0.2, 0.4, 0.6, 0.8]);
+    set_group(&mut inverted_destination, "D1", &[0.7, 0.5, 0.3, 0.1]);
+    set_group(&mut inverted_destination, "Mask", &[0.25, 0.75, 0.5, 1.0]);
+    let inverted_modifier = modifier(
+        "data_transfer",
+        json!({"object":"source","use_vert_data":true,"data_types_verts":["VGROUP_WEIGHTS"],"vert_mapping":"TOPOLOGY","layers_vgroup_select_src":"ALL","layers_vgroup_select_dst":"INDEX","mix_mode":"REPLACE","mix_factor":0.4,"vertex_group":"Mask","invert_vertex_group":true}),
+    )?;
+    let inverted_actual = evaluate_with_context(
+        &inverted_destination,
+        &inverted_modifier,
+        &operands,
+        None,
+        DMat4::IDENTITY,
+        "destination",
+        &layer_selection(&["D0", "D1", "Mask"], Some(1)),
+    )?;
+    for name in ["D0", "D1"] {
+        let error = max_error(
+            &json!(group_weights(&inverted_actual, name)),
+            &expected["INVERT_MASK"][name],
+        )?;
+        assert!(error < 2.0e-6, "inverted mask/{name} max error {error}");
     }
-    let mut destination=quad()?; set_group(&mut destination,"D0",&[0.2;4]); set_group(&mut destination,"D1",&[0.3;4]);
-    let modifier=modifier("data_transfer",json!({"object":"source","use_vert_data":true,"data_types_verts":["VGROUP_WEIGHTS"],"vert_mapping":"TOPOLOGY","layers_vgroup_select_src":"ACTIVE","layers_vgroup_select_dst":"ACTIVE","mix_mode":"REPLACE","mix_factor":1.0}))?;
-    let actual=evaluate_with_context(&destination, &modifier, &operands, None, DMat4::IDENTITY, "destination", &layer_selection(&["D0","D1"],Some(1)))?;
-    for name in ["D0","D1"] {
-        let error=max_error(&json!(group_weights(&actual,name)),&expected["ACTIVE"][name])?;
-        assert!(error<1.0e-6,"ACTIVE/{name} max error {error}");
+    let mut destination = quad()?;
+    set_group(&mut destination, "D0", &[0.2; 4]);
+    set_group(&mut destination, "D1", &[0.3; 4]);
+    let modifier = modifier(
+        "data_transfer",
+        json!({"object":"source","use_vert_data":true,"data_types_verts":["VGROUP_WEIGHTS"],"vert_mapping":"TOPOLOGY","layers_vgroup_select_src":"ACTIVE","layers_vgroup_select_dst":"ACTIVE","mix_mode":"REPLACE","mix_factor":1.0}),
+    )?;
+    let actual = evaluate_with_context(
+        &destination,
+        &modifier,
+        &operands,
+        None,
+        DMat4::IDENTITY,
+        "destination",
+        &layer_selection(&["D0", "D1"], Some(1)),
+    )?;
+    for name in ["D0", "D1"] {
+        let error = max_error(
+            &json!(group_weights(&actual, name)),
+            &expected["ACTIVE"][name],
+        )?;
+        assert!(error < 1.0e-6, "ACTIVE/{name} max error {error}");
     }
-    let named_modifier=modifier("data_transfer",json!({
-        "object":"source","use_vert_data":true,"data_types_verts":["VGROUP_WEIGHTS"],
-        "vert_mapping":"TOPOLOGY","layers_vgroup_select_src":"A",
-        "layers_vgroup_select_dst":"D1","mix_mode":"REPLACE","mix_factor":1.0
-    }))?;
-    let named_actual=evaluate_with_context(&destination, &named_modifier, &operands, None, DMat4::IDENTITY, "destination", &layer_selection(&["D0","D1"],Some(1)))?;
-    assert_eq!(group_weights(&named_actual,"D1"),group_weights(&actual,"D1"));
-    let missing_source=modifier("data_transfer",json!({
-        "object":"source","use_vert_data":true,"data_types_verts":["VGROUP_WEIGHTS"],
-        "vert_mapping":"TOPOLOGY","layers_vgroup_select_src":"MissingGroup",
-        "layers_vgroup_select_dst":"D1"
-    }))?;
-    assert!(evaluate_with_context(
-        &destination,&missing_source,&operands,None,DMat4::IDENTITY,"destination",
-        &layer_selection(&["D0","D1"],Some(1))).is_err());
-    let missing_destination=modifier("data_transfer",json!({
-        "object":"source","use_vert_data":true,"data_types_verts":["VGROUP_WEIGHTS"],
-        "vert_mapping":"TOPOLOGY","layers_vgroup_select_src":"A",
-        "layers_vgroup_select_dst":"MissingGroup"
-    }))?;
-    assert!(evaluate_with_context(
-        &destination,&missing_destination,&operands,None,DMat4::IDENTITY,"destination",
-        &layer_selection(&["D0","D1"],Some(1))).is_err());
+    let named_modifier = modifier(
+        "data_transfer",
+        json!({
+            "object":"source","use_vert_data":true,"data_types_verts":["VGROUP_WEIGHTS"],
+            "vert_mapping":"TOPOLOGY","layers_vgroup_select_src":"A",
+            "layers_vgroup_select_dst":"D1","mix_mode":"REPLACE","mix_factor":1.0
+        }),
+    )?;
+    let named_actual = evaluate_with_context(
+        &destination,
+        &named_modifier,
+        &operands,
+        None,
+        DMat4::IDENTITY,
+        "destination",
+        &layer_selection(&["D0", "D1"], Some(1)),
+    )?;
+    assert_eq!(
+        group_weights(&named_actual, "D1"),
+        group_weights(&actual, "D1")
+    );
+    let missing_source = modifier(
+        "data_transfer",
+        json!({
+            "object":"source","use_vert_data":true,"data_types_verts":["VGROUP_WEIGHTS"],
+            "vert_mapping":"TOPOLOGY","layers_vgroup_select_src":"MissingGroup",
+            "layers_vgroup_select_dst":"D1"
+        }),
+    )?;
+    assert!(
+        evaluate_with_context(
+            &destination,
+            &missing_source,
+            &operands,
+            None,
+            DMat4::IDENTITY,
+            "destination",
+            &layer_selection(&["D0", "D1"], Some(1))
+        )
+        .is_err()
+    );
+    let missing_destination = modifier(
+        "data_transfer",
+        json!({
+            "object":"source","use_vert_data":true,"data_types_verts":["VGROUP_WEIGHTS"],
+            "vert_mapping":"TOPOLOGY","layers_vgroup_select_src":"A",
+            "layers_vgroup_select_dst":"MissingGroup"
+        }),
+    )?;
+    assert!(
+        evaluate_with_context(
+            &destination,
+            &missing_destination,
+            &operands,
+            None,
+            DMat4::IDENTITY,
+            "destination",
+            &layer_selection(&["D0", "D1"], Some(1))
+        )
+        .is_err()
+    );
     Ok(())
 }
 
 #[test]
 fn vertex_group_bone_selectors_filter_source_layers() -> Result<(), Box<dyn Error>> {
-    let positions=vec![DVec3::ZERO,DVec3::X,DVec3::Y];
-    let make_mesh=|| Mesh::from_positions_and_faces(positions.clone(),vec![vec![0,1,2]]);
-    let mut source=make_mesh()?;
-    let source_weights=[
-        ("BoneA",vec![0.1,0.2,0.3]),
-        ("BoneB",vec![0.4,0.5,0.6]),
-        ("Ordinary",vec![0.7,0.8,0.9]),
+    let positions = vec![DVec3::ZERO, DVec3::X, DVec3::Y];
+    let make_mesh = || Mesh::from_positions_and_faces(positions.clone(), vec![vec![0, 1, 2]]);
+    let mut source = make_mesh()?;
+    let source_weights = [
+        ("BoneA", vec![0.1, 0.2, 0.3]),
+        ("BoneB", vec![0.4, 0.5, 0.6]),
+        ("Ordinary", vec![0.7, 0.8, 0.9]),
     ];
-    for (name,weights) in &source_weights { set_group(&mut source,name,weights); }
-    let mut source_operand=operand(
-        source,DMat4::IDENTITY,&["BoneA","BoneB","Ordinary"],None);
-    source_operand.selected_bones=BTreeSet::from(["BoneB".to_owned()]);
-    source_operand.deforming_bones=BTreeSet::from(["BoneA".to_owned()]);
-    let operands=BTreeMap::from([("source".to_owned(),vec![source_operand])]);
-    let original=[
-        ("D0",vec![0.2,0.2,0.2]),
-        ("D1",vec![0.3,0.3,0.3]),
-        ("D2",vec![0.4,0.4,0.4]),
+    for (name, weights) in &source_weights {
+        set_group(&mut source, name, weights);
+    }
+    let mut source_operand = operand(
+        source,
+        DMat4::IDENTITY,
+        &["BoneA", "BoneB", "Ordinary"],
+        None,
+    );
+    source_operand.selected_bones = BTreeSet::from(["BoneB".to_owned()]);
+    source_operand.deforming_bones = BTreeSet::from(["BoneA".to_owned()]);
+    let operands = BTreeMap::from([("source".to_owned(), vec![source_operand])]);
+    let original = [
+        ("D0", vec![0.2, 0.2, 0.2]),
+        ("D1", vec![0.3, 0.3, 0.3]),
+        ("D2", vec![0.4, 0.4, 0.4]),
     ];
-    for (selection,target,source_index) in [
-        ("BONE_SELECT","D1",1),
-        ("BONE_DEFORM","D0",0),
-    ] {
-        let mut destination=make_mesh()?;
-        for (name,weights) in &original { set_group(&mut destination,name,weights); }
-        let transfer=modifier("data_transfer",json!({
-            "object":"source","use_vert_data":true,"data_types_verts":["VGROUP_WEIGHTS"],
-            "vert_mapping":"TOPOLOGY","layers_vgroup_select_src":selection,
-            "layers_vgroup_select_dst":"INDEX","mix_mode":"REPLACE","mix_factor":1.0,
-        }))?;
-        let actual=evaluate_with_context(&destination, &transfer, &operands, None, DMat4::IDENTITY, "destination", &layer_selection(&["D0","D1","D2"],None))?;
-        for (index,(name,prior)) in original.iter().enumerate() {
-            let expected=if *name==target { &source_weights[source_index].1 } else { prior };
-            assert_eq!(group_weights(&actual,name),*expected,"{selection} should filter source group layers");
-            if index == source_index { assert_eq!(*name,target); }
+    for (selection, target, source_index) in [("BONE_SELECT", "D1", 1), ("BONE_DEFORM", "D0", 0)] {
+        let mut destination = make_mesh()?;
+        for (name, weights) in &original {
+            set_group(&mut destination, name, weights);
+        }
+        let transfer = modifier(
+            "data_transfer",
+            json!({
+                "object":"source","use_vert_data":true,"data_types_verts":["VGROUP_WEIGHTS"],
+                "vert_mapping":"TOPOLOGY","layers_vgroup_select_src":selection,
+                "layers_vgroup_select_dst":"INDEX","mix_mode":"REPLACE","mix_factor":1.0,
+            }),
+        )?;
+        let actual = evaluate_with_context(
+            &destination,
+            &transfer,
+            &operands,
+            None,
+            DMat4::IDENTITY,
+            "destination",
+            &layer_selection(&["D0", "D1", "D2"], None),
+        )?;
+        for (index, (name, prior)) in original.iter().enumerate() {
+            let expected = if *name == target {
+                &source_weights[source_index].1
+            } else {
+                prior
+            };
+            assert_eq!(
+                group_weights(&actual, name),
+                *expected,
+                "{selection} should filter source group layers"
+            );
+            if index == source_index {
+                assert_eq!(*name, target);
+            }
         }
     }
     Ok(())
@@ -618,104 +881,220 @@ fn vertex_group_bone_selectors_filter_source_layers() -> Result<(), Box<dyn Erro
 
 #[test]
 fn absent_transfer_source_is_an_input_mesh_noop() -> Result<(), Box<dyn Error>> {
-    let destination=Mesh::from_positions_and_faces(
-        vec![DVec3::ZERO,DVec3::X,DVec3::Y],
-        vec![vec![0,1,2]],
+    let destination =
+        Mesh::from_positions_and_faces(vec![DVec3::ZERO, DVec3::X, DVec3::Y], vec![vec![0, 1, 2]])?;
+    let transfer = modifier("data_transfer", json!({"object":null}))?;
+    let actual = evaluate_with_context(
+        &destination,
+        &transfer,
+        &BTreeMap::new(),
+        None,
+        DMat4::IDENTITY,
+        "destination",
+        &AttributeLayerSelection::default(),
     )?;
-    let transfer=modifier("data_transfer",json!({"object":null}))?;
-    let actual=evaluate_with_context(&destination, &transfer, &BTreeMap::new(), None, DMat4::IDENTITY, "destination", &AttributeLayerSelection::default())?;
-    assert_eq!(actual.attributes,destination.attributes);
+    assert_eq!(actual.attributes, destination.attributes);
     assert_eq!(
-        actual.vertices.iter().map(|vertex|vertex.co).collect::<Vec<_>>(),
-        destination.vertices.iter().map(|vertex|vertex.co).collect::<Vec<_>>(),
+        actual
+            .vertices
+            .iter()
+            .map(|vertex| vertex.co)
+            .collect::<Vec<_>>(),
+        destination
+            .vertices
+            .iter()
+            .map(|vertex| vertex.co)
+            .collect::<Vec<_>>(),
     );
     assert_eq!(
-        actual.edges.iter().map(|edge|edge.vertices).collect::<Vec<_>>(),
-        destination.edges.iter().map(|edge|edge.vertices).collect::<Vec<_>>(),
+        actual
+            .edges
+            .iter()
+            .map(|edge| edge.vertices)
+            .collect::<Vec<_>>(),
+        destination
+            .edges
+            .iter()
+            .map(|edge| edge.vertices)
+            .collect::<Vec<_>>(),
     );
     Ok(())
 }
 
 #[test]
 fn cli_applies_and_inspects_data_transfer_modifier() -> Result<(), Box<dyn Error>> {
-    let directory=tempdir()?; let root=directory.path(); let scene=root.join("scene"); let operations=root.join("transfer.json");
-    let init=Command::new(env!("CARGO_BIN_EXE_pot")).args(["init"]).arg(&scene).args(["--json"]).output()?;
-    assert!(init.status.success(),"{}",String::from_utf8_lossy(&init.stdout));
-    let mut ops=vec![
+    let directory = tempdir()?;
+    let root = directory.path();
+    let scene = root.join("scene");
+    let operations = root.join("transfer.json");
+    let init = Command::new(env!("CARGO_BIN_EXE_pot"))
+        .args(["init"])
+        .arg(&scene)
+        .args(["--json"])
+        .output()?;
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stdout)
+    );
+    let mut ops = vec![
         json!({"op":"node.create","id":"source","kind":"box","params":{"size":1.0}}),
         json!({"op":"node.create","id":"destination","kind":"box","params":{"size":1.0}}),
         json!({"op":"vertex_group.create","target":{"id":"source"},"id":"source_group","name":"A"}),
         json!({"op":"vertex_group.create","target":{"id":"destination"},"id":"destination_group","name":"A"}),
     ];
-    let weights=(0..8).map(|vertex_id|json!({"vertex_id":vertex_id,"weight":0.1+vertex_id as f64*0.1})).collect::<Vec<_>>();
+    let weights = (0..8)
+        .map(|vertex_id| json!({"vertex_id":vertex_id,"weight":0.1+vertex_id as f64*0.1}))
+        .collect::<Vec<_>>();
     ops.push(json!({"op":"vertex_group.assign","target":{"id":"source"},"group_id":"source_group","weights":weights}));
     ops.push(json!({"op":"vertex_group.assign","target":{"id":"destination"},"group_id":"destination_group","weights":[{"vertex_id":0,"weight":0.25}]}));
     ops.push(json!({"op":"modifier.create","target":{"id":"destination"},"id":"transfer","type":"data_transfer","params":{"object":"source","use_object_transform":true,"use_vert_data":true,"data_types_verts":["VGROUP_WEIGHTS"],"vert_mapping":"TOPOLOGY","mix_mode":"REPLACE","mix_factor":1.0}}));
     ops.push(json!({"op":"modifier.apply","target":{"id":"destination"},"modifier_id":"transfer"}));
-    fs::write(&operations,serde_json::to_vec(&json!({"schema_version":1,"base_revision":0,"operations":ops}))?)?;
-    let applied=Command::new(env!("CARGO_BIN_EXE_pot")).args(["apply"]).arg(&scene).args(["--file"]).arg(&operations).args(["--json"]).output()?;
-    fs::write(root.join("apply-output.json"),&applied.stdout)?;
-    assert!(applied.status.success(),"{}",String::from_utf8_lossy(&applied.stdout));
-    let inspected=Command::new(env!("CARGO_BIN_EXE_pot")).args(["inspect"]).arg(&scene).args(["--id","destination","--json"]).output()?;
-    fs::write(root.join("inspect-output.json"),&inspected.stdout)?;
-    assert!(inspected.status.success(),"{}",String::from_utf8_lossy(&inspected.stdout));
-    let document:Value=serde_json::from_slice(&inspected.stdout)?;
-    assert!(document["result"]["items"].as_array().is_some_and(|items|!items.is_empty()));
+    fs::write(
+        &operations,
+        serde_json::to_vec(&json!({"schema_version":1,"base_revision":0,"operations":ops}))?,
+    )?;
+    let applied = Command::new(env!("CARGO_BIN_EXE_pot"))
+        .args(["apply"])
+        .arg(&scene)
+        .args(["--file"])
+        .arg(&operations)
+        .args(["--json"])
+        .output()?;
+    fs::write(root.join("apply-output.json"), &applied.stdout)?;
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stdout)
+    );
+    let inspected = Command::new(env!("CARGO_BIN_EXE_pot"))
+        .args(["inspect"])
+        .arg(&scene)
+        .args(["--id", "destination", "--json"])
+        .output()?;
+    fs::write(root.join("inspect-output.json"), &inspected.stdout)?;
+    assert!(
+        inspected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inspected.stdout)
+    );
+    let document: Value = serde_json::from_slice(&inspected.stdout)?;
+    assert!(
+        document["result"]["items"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty())
+    );
     Ok(())
 }
 
 #[test]
-fn cli_applies_null_source_transfer_without_changing_persisted_mesh() -> Result<(), Box<dyn Error>> {
-    let directory=tempdir()?;
-    let root=directory.path();
-    let scene=root.join("scene");
-    let init=Command::new(env!("CARGO_BIN_EXE_pot"))
-        .args(["init"]).arg(&scene).args(["--json"]).output()?;
-    assert!(init.status.success(),"{}",String::from_utf8_lossy(&init.stdout));
-    let create_file=root.join("create.json");
-    fs::write(&create_file,serde_json::to_vec(&json!({
-        "schema_version":1,"base_revision":0,
-        "operations":[{"op":"node.create","id":"destination","kind":"box","params":{"size":1.0}}],
-    }))?)?;
-    let created=Command::new(env!("CARGO_BIN_EXE_pot"))
-        .args(["apply"]).arg(&scene).args(["--file"]).arg(&create_file).args(["--json"]).output()?;
-    fs::write(root.join("create-output.json"),&created.stdout)?;
-    assert!(created.status.success(),"{}",String::from_utf8_lossy(&created.stdout));
-    let before_output=Command::new(env!("CARGO_BIN_EXE_pot"))
-        .args(["inspect"]).arg(&scene).args(["--id","destination","--json"]).output()?;
-    fs::write(root.join("before-inspect-output.json"),&before_output.stdout)?;
-    assert!(before_output.status.success(),"{}",String::from_utf8_lossy(&before_output.stdout));
-    let before:Value=serde_json::from_slice(&before_output.stdout)?;
-    let geometry_before=before["result"]["items"].get(0)
-        .and_then(|item|item.get("evaluated_geometry"))
+fn cli_applies_null_source_transfer_without_changing_persisted_mesh() -> Result<(), Box<dyn Error>>
+{
+    let directory = tempdir()?;
+    let root = directory.path();
+    let scene = root.join("scene");
+    let init = Command::new(env!("CARGO_BIN_EXE_pot"))
+        .args(["init"])
+        .arg(&scene)
+        .args(["--json"])
+        .output()?;
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stdout)
+    );
+    let create_file = root.join("create.json");
+    fs::write(
+        &create_file,
+        serde_json::to_vec(&json!({
+            "schema_version":1,"base_revision":0,
+            "operations":[{"op":"node.create","id":"destination","kind":"box","params":{"size":1.0}}],
+        }))?,
+    )?;
+    let created = Command::new(env!("CARGO_BIN_EXE_pot"))
+        .args(["apply"])
+        .arg(&scene)
+        .args(["--file"])
+        .arg(&create_file)
+        .args(["--json"])
+        .output()?;
+    fs::write(root.join("create-output.json"), &created.stdout)?;
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stdout)
+    );
+    let before_output = Command::new(env!("CARGO_BIN_EXE_pot"))
+        .args(["inspect"])
+        .arg(&scene)
+        .args(["--id", "destination", "--json"])
+        .output()?;
+    fs::write(
+        root.join("before-inspect-output.json"),
+        &before_output.stdout,
+    )?;
+    assert!(
+        before_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&before_output.stdout)
+    );
+    let before: Value = serde_json::from_slice(&before_output.stdout)?;
+    let geometry_before = before["result"]["items"]
+        .get(0)
+        .and_then(|item| item.get("evaluated_geometry"))
         .ok_or("pre-transfer mesh geometry is missing")?
         .clone();
-    let base_revision=before["scene"]["revision"].as_u64().ok_or("scene revision is missing")?;
-    let transfer_file=root.join("null-source.json");
-    fs::write(&transfer_file,serde_json::to_vec(&json!({
-        "schema_version":1,"base_revision":base_revision,
-        "operations":[
-            {"op":"modifier.create","target":{"id":"destination"},"id":"null_transfer",
-             "type":"data_transfer","params":{
-                "object":null,"use_vert_data":true,"data_types_verts":["VGROUP_WEIGHTS"],
-                "vert_mapping":"TOPOLOGY","mix_mode":"REPLACE","mix_factor":1.0,
-             }},
-            {"op":"modifier.apply","target":{"id":"destination"},"modifier_id":"null_transfer"},
-        ],
-    }))?)?;
-    let applied=Command::new(env!("CARGO_BIN_EXE_pot"))
-        .args(["apply"]).arg(&scene).args(["--file"]).arg(&transfer_file).args(["--json"]).output()?;
-    fs::write(root.join("null-apply-output.json"),&applied.stdout)?;
-    assert!(applied.status.success(),"{}",String::from_utf8_lossy(&applied.stdout));
-    let after_output=Command::new(env!("CARGO_BIN_EXE_pot"))
-        .args(["inspect"]).arg(&scene).args(["--id","destination","--json"]).output()?;
-    fs::write(root.join("null-inspect-output.json"),&after_output.stdout)?;
-    assert!(after_output.status.success(),"{}",String::from_utf8_lossy(&after_output.stdout));
-    let after:Value=serde_json::from_slice(&after_output.stdout)?;
-    let geometry_after=after["result"]["items"].get(0)
-        .and_then(|item|item.get("evaluated_geometry"))
+    let base_revision = before["scene"]["revision"]
+        .as_u64()
+        .ok_or("scene revision is missing")?;
+    let transfer_file = root.join("null-source.json");
+    fs::write(
+        &transfer_file,
+        serde_json::to_vec(&json!({
+            "schema_version":1,"base_revision":base_revision,
+            "operations":[
+                {"op":"modifier.create","target":{"id":"destination"},"id":"null_transfer",
+                 "type":"data_transfer","params":{
+                    "object":null,"use_vert_data":true,"data_types_verts":["VGROUP_WEIGHTS"],
+                    "vert_mapping":"TOPOLOGY","mix_mode":"REPLACE","mix_factor":1.0,
+                 }},
+                {"op":"modifier.apply","target":{"id":"destination"},"modifier_id":"null_transfer"},
+            ],
+        }))?,
+    )?;
+    let applied = Command::new(env!("CARGO_BIN_EXE_pot"))
+        .args(["apply"])
+        .arg(&scene)
+        .args(["--file"])
+        .arg(&transfer_file)
+        .args(["--json"])
+        .output()?;
+    fs::write(root.join("null-apply-output.json"), &applied.stdout)?;
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stdout)
+    );
+    let after_output = Command::new(env!("CARGO_BIN_EXE_pot"))
+        .args(["inspect"])
+        .arg(&scene)
+        .args(["--id", "destination", "--json"])
+        .output()?;
+    fs::write(root.join("null-inspect-output.json"), &after_output.stdout)?;
+    assert!(
+        after_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&after_output.stdout)
+    );
+    let after: Value = serde_json::from_slice(&after_output.stdout)?;
+    let geometry_after = after["result"]["items"]
+        .get(0)
+        .and_then(|item| item.get("evaluated_geometry"))
         .ok_or("post-transfer mesh geometry is missing")?;
-    assert_eq!(geometry_after,&geometry_before,"null-source DataTransfer must preserve the evaluated mesh");
+    assert_eq!(
+        geometry_after, &geometry_before,
+        "null-source DataTransfer must preserve the evaluated mesh"
+    );
     Ok(())
 }
 
@@ -776,127 +1155,370 @@ with open(os.path.join(root,'uv-layers-oracle.json'),'w') as f: json.dump(result
 
 #[test]
 fn uv_layer_index_mapping_keeps_full_loop_order_and_replace_factor() -> Result<(), Box<dyn Error>> {
-    let Some(blender)=blender_file::blender_executable() else {
+    let Some(blender) = blender_file::blender_executable() else {
         eprintln!("skipping data-transfer UV Blender parity test: Blender is unavailable");
         return Ok(());
     };
-    let directory=tempdir()?; let root=directory.path();
-    blender_script::run_blender_script(&blender,"uv-layers.py",BLENDER_UV_LAYER_SCRIPT,root,"Blender data-transfer UV oracle failed")?;
-    let mut expected:Value=serde_json::from_slice(&fs::read(root.join("uv-layers-oracle.json"))?)?;
+    let directory = tempdir()?;
+    let root = directory.path();
+    blender_script::run_blender_script(
+        &blender,
+        "uv-layers.py",
+        BLENDER_UV_LAYER_SCRIPT,
+        root,
+        "Blender data-transfer UV oracle failed",
+    )?;
+    let mut expected: Value =
+        serde_json::from_slice(&fs::read(root.join("uv-layers-oracle.json"))?)?;
     flip_blender_uv_to_potter(&mut expected);
-    let mut source=Mesh::from_positions_and_faces(vec![DVec3::ZERO,DVec3::X,DVec3::ONE,DVec3::Y],vec![vec![0,1,2,3]])?;
-    set_uv_layers(&mut source,&[
-        ("Source0",vec![vec![[0.2,0.1],[1.2,0.1],[1.2,1.1],[0.2,1.1]]]),
-        ("Source1",vec![vec![[0.7,0.35],[1.7,0.35],[1.7,1.35],[0.7,1.35]]]),
-    ],"Source1");
-    let mut destination=Mesh::from_positions_and_faces(vec![DVec3::ZERO,DVec3::X,DVec3::ONE,DVec3::Y],vec![vec![0,1,2,3]])?;
-    set_uv_layers(&mut destination,&[
-        ("Destination0",vec![vec![[-0.2,-0.1],[0.8,-0.1],[0.8,0.9],[-0.2,0.9]]]),
-        ("Destination1",vec![vec![[-0.6,-0.3],[0.4,-0.3],[0.4,0.7],[-0.6,0.7]]]),
-    ],"Destination0");
-    set_color_layer(&mut source,"Color0","point","FLOAT_COLOR",vec![[0.1,0.35,0.3,1.0],[0.2,0.35,0.3,1.0],[0.3,0.35,0.3,1.0],[0.4,0.35,0.3,1.0]])?;
-    set_color_layer(&mut source,"Color1","point","FLOAT_COLOR",vec![[0.5,0.75,-0.1,1.0],[0.6,0.75,-0.1,1.0],[0.7,0.75,-0.1,1.0],[0.8,0.75,-0.1,1.0]])?;
-    set_color_layer(&mut source,"Corner0","corner","FLOAT_COLOR",vec![[0.15,0.4,0.25,1.0],[0.25,0.4,0.25,1.0],[0.35,0.4,0.25,1.0],[0.45,0.4,0.25,1.0]])?;
-    set_color_layer(&mut source,"Corner1","corner","FLOAT_COLOR",vec![[0.55,0.8,-0.15,1.0],[0.65,0.8,-0.15,1.0],[0.75,0.8,-0.15,1.0],[0.85,0.8,-0.15,1.0]])?;
-    let mut source_operand=operand(source.clone(),DMat4::IDENTITY,&[],None);
-    operands.insert("object".to_owned(),vec![source_operand]);
-    let transfer=modifier("data_transfer",json!({
-        "object":"source","use_object_transform":true,"use_loop_data":true,"data_types_loops":["UV"],
-        "loop_mapping":"TOPOLOGY","layers_uv_select_src":"ALL","layers_uv_select_dst":"INDEX",
-        "mix_mode":"ADD","mix_factor":0.25
-    }))?;
-    let actual=evaluate_with_context(&destination, &transfer, &operands, None, DMat4::IDENTITY, "destination", &AttributeLayerSelection::default())?;
-    let uv_values=|mesh:&Mesh,name:&str| -> Value { uv_layer_values(mesh,name) };
-    for name in ["Destination0","Destination1"] {
-        let error=max_error(&uv_values(&actual,name),&expected[name])?;
-        assert!(error<1.0e-6,"UV layer {name} max error {error}");
+    let mut source = Mesh::from_positions_and_faces(
+        vec![DVec3::ZERO, DVec3::X, DVec3::ONE, DVec3::Y],
+        vec![vec![0, 1, 2, 3]],
+    )?;
+    set_uv_layers(
+        &mut source,
+        &[
+            (
+                "Source0",
+                vec![vec![[0.2, 0.1], [1.2, 0.1], [1.2, 1.1], [0.2, 1.1]]],
+            ),
+            (
+                "Source1",
+                vec![vec![[0.7, 0.35], [1.7, 0.35], [1.7, 1.35], [0.7, 1.35]]],
+            ),
+        ],
+        "Source1",
+    );
+    let mut destination = Mesh::from_positions_and_faces(
+        vec![DVec3::ZERO, DVec3::X, DVec3::ONE, DVec3::Y],
+        vec![vec![0, 1, 2, 3]],
+    )?;
+    set_uv_layers(
+        &mut destination,
+        &[
+            (
+                "Destination0",
+                vec![vec![[-0.2, -0.1], [0.8, -0.1], [0.8, 0.9], [-0.2, 0.9]]],
+            ),
+            (
+                "Destination1",
+                vec![vec![[-0.6, -0.3], [0.4, -0.3], [0.4, 0.7], [-0.6, 0.7]]],
+            ),
+        ],
+        "Destination0",
+    );
+    set_color_layer(
+        &mut source,
+        "Color0",
+        "point",
+        "FLOAT_COLOR",
+        vec![
+            [0.1, 0.35, 0.3, 1.0],
+            [0.2, 0.35, 0.3, 1.0],
+            [0.3, 0.35, 0.3, 1.0],
+            [0.4, 0.35, 0.3, 1.0],
+        ],
+    )?;
+    set_color_layer(
+        &mut source,
+        "Color1",
+        "point",
+        "FLOAT_COLOR",
+        vec![
+            [0.5, 0.75, -0.1, 1.0],
+            [0.6, 0.75, -0.1, 1.0],
+            [0.7, 0.75, -0.1, 1.0],
+            [0.8, 0.75, -0.1, 1.0],
+        ],
+    )?;
+    set_color_layer(
+        &mut source,
+        "Corner0",
+        "corner",
+        "FLOAT_COLOR",
+        vec![
+            [0.15, 0.4, 0.25, 1.0],
+            [0.25, 0.4, 0.25, 1.0],
+            [0.35, 0.4, 0.25, 1.0],
+            [0.45, 0.4, 0.25, 1.0],
+        ],
+    )?;
+    set_color_layer(
+        &mut source,
+        "Corner1",
+        "corner",
+        "FLOAT_COLOR",
+        vec![
+            [0.55, 0.8, -0.15, 1.0],
+            [0.65, 0.8, -0.15, 1.0],
+            [0.75, 0.8, -0.15, 1.0],
+            [0.85, 0.8, -0.15, 1.0],
+        ],
+    )?;
+    let mut source_operand = operand(source.clone(), DMat4::IDENTITY, &[], None);
+    operands.insert("object".to_owned(), vec![source_operand]);
+    let transfer = modifier(
+        "data_transfer",
+        json!({
+            "object":"source","use_object_transform":true,"use_loop_data":true,"data_types_loops":["UV"],
+            "loop_mapping":"TOPOLOGY","layers_uv_select_src":"ALL","layers_uv_select_dst":"INDEX",
+            "mix_mode":"ADD","mix_factor":0.25
+        }),
+    )?;
+    let actual = evaluate_with_context(
+        &destination,
+        &transfer,
+        &operands,
+        None,
+        DMat4::IDENTITY,
+        "destination",
+        &AttributeLayerSelection::default(),
+    )?;
+    let uv_values = |mesh: &Mesh, name: &str| -> Value { uv_layer_values(mesh, name) };
+    for name in ["Destination0", "Destination1"] {
+        let error = max_error(&uv_values(&actual, name), &expected[name])?;
+        assert!(error < 1.0e-6, "UV layer {name} max error {error}");
     }
-    let mut active_destination=destination.clone();
-    active_destination.attributes["uv_layers"]["active"]=json!("Destination1");
-    let active_transfer=modifier("data_transfer",json!({
-        "object":"source","use_object_transform":true,"use_loop_data":true,"data_types_loops":["UV"],
-        "loop_mapping":"TOPOLOGY","layers_uv_select_src":"ACTIVE","layers_uv_select_dst":"ACTIVE",
-        "mix_mode":"REPLACE","mix_factor":1.0
-    }))?;
-    let active_actual=evaluate_with_context(&active_destination, &active_transfer, &operands, None, DMat4::IDENTITY, "destination", &AttributeLayerSelection::default())?;
-    for name in ["Destination0","Destination1"] {
-        let error=max_error(&uv_values(&active_actual,name),&expected["ACTIVE"][name])?;
-        assert!(error<1.0e-6,"ACTIVE UV layer {name} max error {error}");
+    let mut active_destination = destination.clone();
+    active_destination.attributes["uv_layers"]["active"] = json!("Destination1");
+    let active_transfer = modifier(
+        "data_transfer",
+        json!({
+            "object":"source","use_object_transform":true,"use_loop_data":true,"data_types_loops":["UV"],
+            "loop_mapping":"TOPOLOGY","layers_uv_select_src":"ACTIVE","layers_uv_select_dst":"ACTIVE",
+            "mix_mode":"REPLACE","mix_factor":1.0
+        }),
+    )?;
+    let active_actual = evaluate_with_context(
+        &active_destination,
+        &active_transfer,
+        &operands,
+        None,
+        DMat4::IDENTITY,
+        "destination",
+        &AttributeLayerSelection::default(),
+    )?;
+    for name in ["Destination0", "Destination1"] {
+        let error = max_error(&uv_values(&active_actual, name), &expected["ACTIVE"][name])?;
+        assert!(error < 1.0e-6, "ACTIVE UV layer {name} max error {error}");
     }
-    let mut no_active_destination=active_destination.clone();
-    no_active_destination.attributes["uv_layers"]["active"]=Value::Null;
-    let no_active_destination_actual=evaluate_with_context(&no_active_destination, &active_transfer, &operands, None, DMat4::IDENTITY, "destination", &AttributeLayerSelection::default())?;
-    assert_eq!(uv_values(&no_active_destination_actual,"Destination1"),
-        uv_values(&no_active_destination,"Destination1"),
-        "ACTIVE UV destination selection must no-op without an active layer");
-    let mut no_active_source=source.clone();
-    no_active_source.attributes["uv_layers"]["active"]=Value::Null;
-    let no_active_source_operands=BTreeMap::from([(
-        "object".to_owned(),vec![operand(no_active_source,DMat4::IDENTITY,&[],None)],
+    let mut no_active_destination = active_destination.clone();
+    no_active_destination.attributes["uv_layers"]["active"] = Value::Null;
+    let no_active_destination_actual = evaluate_with_context(
+        &no_active_destination,
+        &active_transfer,
+        &operands,
+        None,
+        DMat4::IDENTITY,
+        "destination",
+        &AttributeLayerSelection::default(),
+    )?;
+    assert_eq!(
+        uv_values(&no_active_destination_actual, "Destination1"),
+        uv_values(&no_active_destination, "Destination1"),
+        "ACTIVE UV destination selection must no-op without an active layer"
+    );
+    let mut no_active_source = source.clone();
+    no_active_source.attributes["uv_layers"]["active"] = Value::Null;
+    let no_active_source_operands = BTreeMap::from([(
+        "object".to_owned(),
+        vec![operand(no_active_source, DMat4::IDENTITY, &[], None)],
     )]);
-    let no_active_source_actual=evaluate_with_context(&active_destination, &active_transfer, &no_active_source_operands, None, DMat4::IDENTITY, "destination", &AttributeLayerSelection::default())?;
-    assert_eq!(uv_values(&no_active_source_actual,"Destination1"),
-        uv_values(&active_destination,"Destination1"),
-        "ACTIVE UV source selection must no-op without an active layer");
-    let named_transfer=modifier("data_transfer",json!({
-        "object":"source","use_object_transform":true,"use_loop_data":true,"data_types_loops":["UV"],
-        "loop_mapping":"TOPOLOGY","layers_uv_select_src":"Source1",
-        "layers_uv_select_dst":"Destination1","mix_mode":"REPLACE","mix_factor":1.0
-    }))?;
-    let named_actual=evaluate_with_context(&active_destination, &named_transfer, &operands, None, DMat4::IDENTITY, "destination", &AttributeLayerSelection::default())?;
-    for name in ["Destination0","Destination1"] {
-        assert_eq!(uv_values(&named_actual,name),expected["ACTIVE"][name]);
+    let no_active_source_actual = evaluate_with_context(
+        &active_destination,
+        &active_transfer,
+        &no_active_source_operands,
+        None,
+        DMat4::IDENTITY,
+        "destination",
+        &AttributeLayerSelection::default(),
+    )?;
+    assert_eq!(
+        uv_values(&no_active_source_actual, "Destination1"),
+        uv_values(&active_destination, "Destination1"),
+        "ACTIVE UV source selection must no-op without an active layer"
+    );
+    let named_transfer = modifier(
+        "data_transfer",
+        json!({
+            "object":"source","use_object_transform":true,"use_loop_data":true,"data_types_loops":["UV"],
+            "loop_mapping":"TOPOLOGY","layers_uv_select_src":"Source1",
+            "layers_uv_select_dst":"Destination1","mix_mode":"REPLACE","mix_factor":1.0
+        }),
+    )?;
+    let named_actual = evaluate_with_context(
+        &active_destination,
+        &named_transfer,
+        &operands,
+        None,
+        DMat4::IDENTITY,
+        "destination",
+        &AttributeLayerSelection::default(),
+    )?;
+    for name in ["Destination0", "Destination1"] {
+        assert_eq!(uv_values(&named_actual, name), expected["ACTIVE"][name]);
     }
-    let missing_uv_source=modifier("data_transfer",json!({
-        "object":"source","use_loop_data":true,"data_types_loops":["UV"],
-        "loop_mapping":"TOPOLOGY","layers_uv_select_src":"MissingUV",
-        "layers_uv_select_dst":"NAME"
-    }))?;
-    assert!(evaluate_with_context(
-        &active_destination,&missing_uv_source,&operands,None,DMat4::IDENTITY,"destination",
-        &AttributeLayerSelection::default()).is_err());
-    let missing_uv_destination=modifier("data_transfer",json!({
-        "object":"source","use_loop_data":true,"data_types_loops":["UV"],
-        "loop_mapping":"TOPOLOGY","layers_uv_select_src":"Source1",
-        "layers_uv_select_dst":"MissingUV"
-    }))?;
-    assert!(evaluate_with_context(
-        &active_destination,&missing_uv_destination,&operands,None,DMat4::IDENTITY,"destination",
-        &AttributeLayerSelection::default()).is_err());
-    let color_values=|mesh:&Mesh,name:&str| -> Value {
-        let Some(attribute)=mesh.attributes.get(name) else { return json!([]); };
-        let Some(values)=attribute.get("values").and_then(Value::as_object) else { return json!([]); };
-        if attribute.get("domain").and_then(Value::as_str)==Some("point") {
-            Value::Array(mesh.vertices.iter().filter_map(|vertex|values.get(&format!("v{}",vertex.id)).cloned()).collect())
+    let missing_uv_source = modifier(
+        "data_transfer",
+        json!({
+            "object":"source","use_loop_data":true,"data_types_loops":["UV"],
+            "loop_mapping":"TOPOLOGY","layers_uv_select_src":"MissingUV",
+            "layers_uv_select_dst":"NAME"
+        }),
+    )?;
+    assert!(
+        evaluate_with_context(
+            &active_destination,
+            &missing_uv_source,
+            &operands,
+            None,
+            DMat4::IDENTITY,
+            "destination",
+            &AttributeLayerSelection::default()
+        )
+        .is_err()
+    );
+    let missing_uv_destination = modifier(
+        "data_transfer",
+        json!({
+            "object":"source","use_loop_data":true,"data_types_loops":["UV"],
+            "loop_mapping":"TOPOLOGY","layers_uv_select_src":"Source1",
+            "layers_uv_select_dst":"MissingUV"
+        }),
+    )?;
+    assert!(
+        evaluate_with_context(
+            &active_destination,
+            &missing_uv_destination,
+            &operands,
+            None,
+            DMat4::IDENTITY,
+            "destination",
+            &AttributeLayerSelection::default()
+        )
+        .is_err()
+    );
+    let color_values = |mesh: &Mesh, name: &str| -> Value {
+        let Some(attribute) = mesh.attributes.get(name) else {
+            return json!([]);
+        };
+        let Some(values) = attribute.get("values").and_then(Value::as_object) else {
+            return json!([]);
+        };
+        if attribute.get("domain").and_then(Value::as_str) == Some("point") {
+            Value::Array(
+                mesh.vertices
+                    .iter()
+                    .filter_map(|vertex| values.get(&format!("v{}", vertex.id)).cloned())
+                    .collect(),
+            )
         } else {
-            let mut colors=Vec::new();
+            let mut colors = Vec::new();
             for face in &mesh.faces {
-                if let Some(row)=values.get(&format!("f{}",face.id)).and_then(Value::as_array) {
+                if let Some(row) = values
+                    .get(&format!("f{}", face.id))
+                    .and_then(Value::as_array)
+                {
                     colors.extend(row.iter().cloned());
                 }
             }
             Value::Array(colors)
         }
     };
-    let mut point_destination=destination.clone();
-    set_color_layer(&mut point_destination,"Dest0","point","FLOAT_COLOR",vec![[-0.1,0.15,0.5,1.0],[0.0,0.15,0.5,1.0],[0.1,0.15,0.5,1.0],[0.2,0.15,0.5,1.0]])?;
-    set_color_layer(&mut point_destination,"Dest1","point","FLOAT_COLOR",vec![[-0.4,-0.15,0.8,1.0],[-0.3,-0.15,0.8,1.0],[-0.2,-0.15,0.8,1.0],[-0.1,-0.15,0.8,1.0]])?;
-    let point_transfer=modifier("data_transfer",json!({"object":"source","use_vert_data":true,"data_types_verts":["COLOR_VERTEX"],"vert_mapping":"TOPOLOGY","layers_vcol_vert_select_src":"ALL","layers_vcol_vert_select_dst":"INDEX","mix_mode":"REPLACE","mix_factor":1.0}))?;
-    let mut point_selection=layer_selection(&[],None);
-    let point_actual=evaluate_with_context(&point_destination, &point_transfer, &operands, None, DMat4::IDENTITY, "destination", &point_selection)?;
-    for name in ["Dest0","Dest1"] {
-        let error=max_error(&color_values(&point_actual,name),&expected["POINT_COLOR"][name])?;
-        assert!(error<1.0e-6,"point color layer {name} max error {error}");
+    let mut point_destination = destination.clone();
+    set_color_layer(
+        &mut point_destination,
+        "Dest0",
+        "point",
+        "FLOAT_COLOR",
+        vec![
+            [-0.1, 0.15, 0.5, 1.0],
+            [0.0, 0.15, 0.5, 1.0],
+            [0.1, 0.15, 0.5, 1.0],
+            [0.2, 0.15, 0.5, 1.0],
+        ],
+    )?;
+    set_color_layer(
+        &mut point_destination,
+        "Dest1",
+        "point",
+        "FLOAT_COLOR",
+        vec![
+            [-0.4, -0.15, 0.8, 1.0],
+            [-0.3, -0.15, 0.8, 1.0],
+            [-0.2, -0.15, 0.8, 1.0],
+            [-0.1, -0.15, 0.8, 1.0],
+        ],
+    )?;
+    let point_transfer = modifier(
+        "data_transfer",
+        json!({"object":"source","use_vert_data":true,"data_types_verts":["COLOR_VERTEX"],"vert_mapping":"TOPOLOGY","layers_vcol_vert_select_src":"ALL","layers_vcol_vert_select_dst":"INDEX","mix_mode":"REPLACE","mix_factor":1.0}),
+    )?;
+    let mut point_selection = layer_selection(&[], None);
+    let point_actual = evaluate_with_context(
+        &point_destination,
+        &point_transfer,
+        &operands,
+        None,
+        DMat4::IDENTITY,
+        "destination",
+        &point_selection,
+    )?;
+    for name in ["Dest0", "Dest1"] {
+        let error = max_error(
+            &color_values(&point_actual, name),
+            &expected["POINT_COLOR"][name],
+        )?;
+        assert!(error < 1.0e-6, "point color layer {name} max error {error}");
     }
-    let mut corner_destination=destination.clone();
-    set_color_layer(&mut corner_destination,"Dest0","corner","FLOAT_COLOR",vec![[-0.1,0.15,0.5,1.0],[0.0,0.15,0.5,1.0],[0.1,0.15,0.5,1.0],[0.2,0.15,0.5,1.0]])?;
-    set_color_layer(&mut corner_destination,"Dest1","corner","FLOAT_COLOR",vec![[-0.4,-0.15,0.8,1.0],[-0.3,-0.15,0.8,1.0],[-0.2,-0.15,0.8,1.0],[-0.1,-0.15,0.8,1.0]])?;
-    let corner_transfer=modifier("data_transfer",json!({"object":"source","use_loop_data":true,"data_types_loops":["COLOR_CORNER"],"loop_mapping":"TOPOLOGY","layers_vcol_loop_select_src":"ALL","layers_vcol_loop_select_dst":"INDEX","mix_mode":"REPLACE","mix_factor":1.0}))?;
-    let mut corner_selection=layer_selection(&[],None);
-    let corner_actual=evaluate_with_context(&corner_destination, &corner_transfer, &operands, None, DMat4::IDENTITY, "destination", &corner_selection)?;
-    for name in ["Dest0","Dest1"] {
-        let error=max_error(&color_values(&corner_actual,name),&expected["CORNER_COLOR"][name])?;
-        assert!(error<1.0e-6,"corner color layer {name} max error {error}");
+    let mut corner_destination = destination.clone();
+    set_color_layer(
+        &mut corner_destination,
+        "Dest0",
+        "corner",
+        "FLOAT_COLOR",
+        vec![
+            [-0.1, 0.15, 0.5, 1.0],
+            [0.0, 0.15, 0.5, 1.0],
+            [0.1, 0.15, 0.5, 1.0],
+            [0.2, 0.15, 0.5, 1.0],
+        ],
+    )?;
+    set_color_layer(
+        &mut corner_destination,
+        "Dest1",
+        "corner",
+        "FLOAT_COLOR",
+        vec![
+            [-0.4, -0.15, 0.8, 1.0],
+            [-0.3, -0.15, 0.8, 1.0],
+            [-0.2, -0.15, 0.8, 1.0],
+            [-0.1, -0.15, 0.8, 1.0],
+        ],
+    )?;
+    let corner_transfer = modifier(
+        "data_transfer",
+        json!({"object":"source","use_loop_data":true,"data_types_loops":["COLOR_CORNER"],"loop_mapping":"TOPOLOGY","layers_vcol_loop_select_src":"ALL","layers_vcol_loop_select_dst":"INDEX","mix_mode":"REPLACE","mix_factor":1.0}),
+    )?;
+    let mut corner_selection = layer_selection(&[], None);
+    let corner_actual = evaluate_with_context(
+        &corner_destination,
+        &corner_transfer,
+        &operands,
+        None,
+        DMat4::IDENTITY,
+        "destination",
+        &corner_selection,
+    )?;
+    for name in ["Dest0", "Dest1"] {
+        let error = max_error(
+            &color_values(&corner_actual, name),
+            &expected["CORNER_COLOR"][name],
+        )?;
+        assert!(
+            error < 1.0e-6,
+            "corner color layer {name} max error {error}"
+        );
     }
     Ok(())
 }
@@ -933,11 +1555,14 @@ evaluated.to_mesh_clear()
 
 #[test]
 fn custom_normal_transfer_keeps_typed_codes_and_corner_order() -> Result<(), Box<dyn Error>> {
-    let Some(blender)=blender_file::blender_executable() else {
-        eprintln!("skipping data-transfer custom-normal Blender parity test: Blender is unavailable");
+    let Some(blender) = blender_file::blender_executable() else {
+        eprintln!(
+            "skipping data-transfer custom-normal Blender parity test: Blender is unavailable"
+        );
         return Ok(());
     };
-    let directory=tempdir()?; let root=directory.path();
+    let directory = tempdir()?;
+    let root = directory.path();
     blender_script::run_blender_script(
         &blender,
         "custom-normal-transfer.py",
@@ -945,32 +1570,49 @@ fn custom_normal_transfer_keeps_typed_codes_and_corner_order() -> Result<(), Box
         root,
         "Blender data-transfer custom-normal oracle failed",
     )?;
-    let expected:Value=serde_json::from_slice(&fs::read(root.join("custom-normal-oracle.json"))?)?;
-    let positions=vec![
-        DVec3::new(0.0,0.0,0.0),DVec3::new(1.0,0.0,0.0),
-        DVec3::new(1.0,1.0,0.0),DVec3::new(0.0,-1.0,1.0),
+    let expected: Value =
+        serde_json::from_slice(&fs::read(root.join("custom-normal-oracle.json"))?)?;
+    let positions = vec![
+        DVec3::new(0.0, 0.0, 0.0),
+        DVec3::new(1.0, 0.0, 0.0),
+        DVec3::new(1.0, 1.0, 0.0),
+        DVec3::new(0.0, -1.0, 1.0),
     ];
-    let faces=vec![vec![0,1,2],vec![1,0,3]];
-    let mut source=Mesh::from_positions_and_faces(positions.clone(),faces.clone())?;
-    let mut destination=Mesh::from_positions_and_faces(positions.clone(),faces)?;
+    let faces = vec![vec![0, 1, 2], vec![1, 0, 3]];
+    let mut source = Mesh::from_positions_and_faces(positions.clone(), faces.clone())?;
+    let mut destination = Mesh::from_positions_and_faces(positions.clone(), faces)?;
     set_smooth_faces(&mut source);
     set_smooth_faces(&mut destination);
-    set_custom_normal_codes(&mut source,&expected["source_codes"])?;
-    set_custom_normal_codes(&mut destination,&expected["destination_codes"])?;
-    let operands=BTreeMap::from([(
+    set_custom_normal_codes(&mut source, &expected["source_codes"])?;
+    set_custom_normal_codes(&mut destination, &expected["destination_codes"])?;
+    let operands = BTreeMap::from([(
         "object".to_owned(),
-        vec![operand(source,DMat4::IDENTITY,&[],None)],
+        vec![operand(source, DMat4::IDENTITY, &[], None)],
     )]);
-    let transfer=modifier("data_transfer",json!({
-        "object":"source","use_loop_data":true,"data_types_loops":["CUSTOM_NORMAL"],
-        "loop_mapping":"TOPOLOGY","mix_mode":"MIX","mix_factor":0.35
-    }))?;
-    let actual=evaluate_with_context(&destination, &transfer, &operands, None, DMat4::IDENTITY, "destination", &AttributeLayerSelection::default())?;
-    let actual_normals=potter_core::geom::corner_normal_vectors(&actual)?;
-    let actual_values=actual_normals.iter().map(|normal|normal.to_array()).collect::<Vec<_>>();
-    let error=max_error(&json!(actual_values),&expected["output_normals"])?;
-    assert!(error<2.0e-4,"CUSTOM_NORMAL max error {error}");
-    assert_eq!(actual.attributes["custom_normal"]["type"],"normal_code");
+    let transfer = modifier(
+        "data_transfer",
+        json!({
+            "object":"source","use_loop_data":true,"data_types_loops":["CUSTOM_NORMAL"],
+            "loop_mapping":"TOPOLOGY","mix_mode":"MIX","mix_factor":0.35
+        }),
+    )?;
+    let actual = evaluate_with_context(
+        &destination,
+        &transfer,
+        &operands,
+        None,
+        DMat4::IDENTITY,
+        "destination",
+        &AttributeLayerSelection::default(),
+    )?;
+    let actual_normals = potter_core::geom::corner_normal_vectors(&actual)?;
+    let actual_values = actual_normals
+        .iter()
+        .map(|normal| normal.to_array())
+        .collect::<Vec<_>>();
+    let error = max_error(&json!(actual_values), &expected["output_normals"])?;
+    assert!(error < 2.0e-4, "CUSTOM_NORMAL max error {error}");
+    assert_eq!(actual.attributes["custom_normal"]["type"], "normal_code");
     Ok(())
 }
 
@@ -1013,11 +1655,12 @@ with open(os.path.join(root,'color-mix-oracle.json'),'w') as f:
 
 #[test]
 fn float_and_byte_color_mix_modes_match_blender() -> Result<(), Box<dyn Error>> {
-    let Some(blender)=blender_file::blender_executable() else {
+    let Some(blender) = blender_file::blender_executable() else {
         eprintln!("skipping data-transfer color Blender parity test: Blender is unavailable");
         return Ok(());
     };
-    let directory=tempdir()?; let root=directory.path();
+    let directory = tempdir()?;
+    let root = directory.path();
     blender_script::run_blender_script(
         &blender,
         "color-mix.py",
@@ -1025,32 +1668,66 @@ fn float_and_byte_color_mix_modes_match_blender() -> Result<(), Box<dyn Error>> 
         root,
         "Blender data-transfer color mix oracle failed",
     )?;
-    let expected:Value=serde_json::from_slice(&fs::read(root.join("color-mix-oracle.json"))?)?;
-    let colors=rgba_values;
-    let positions=vec![DVec3::ZERO,DVec3::X,DVec3::ONE,DVec3::Y];
-    let mut source=Mesh::from_positions_and_faces(positions.clone(),vec![vec![0,1,2,3]])?;
-    for (name,data_type) in [("FloatColor","FLOAT_COLOR"),("ByteColor","BYTE_COLOR")] {
-        set_color_layer(&mut source,name,"point",data_type,colors(&expected["source"][name])?)?;
+    let expected: Value = serde_json::from_slice(&fs::read(root.join("color-mix-oracle.json"))?)?;
+    let colors = rgba_values;
+    let positions = vec![DVec3::ZERO, DVec3::X, DVec3::ONE, DVec3::Y];
+    let mut source = Mesh::from_positions_and_faces(positions.clone(), vec![vec![0, 1, 2, 3]])?;
+    for (name, data_type) in [("FloatColor", "FLOAT_COLOR"), ("ByteColor", "BYTE_COLOR")] {
+        set_color_layer(
+            &mut source,
+            name,
+            "point",
+            data_type,
+            colors(&expected["source"][name])?,
+        )?;
     }
-    let operands=BTreeMap::from([(
+    let operands = BTreeMap::from([(
         "object".to_owned(),
-        vec![operand(source,DMat4::IDENTITY,&[],None)],
+        vec![operand(source, DMat4::IDENTITY, &[], None)],
     )]);
-    for mode in ["REPLACE","ABOVE_THRESHOLD","BELOW_THRESHOLD","MIX","ADD","SUB","MUL"] {
-        let mut destination=Mesh::from_positions_and_faces(positions.clone(),vec![vec![0,1,2,3]])?;
-        for (name,data_type) in [("FloatColor","FLOAT_COLOR"),("ByteColor","BYTE_COLOR")] {
+    for mode in [
+        "REPLACE",
+        "ABOVE_THRESHOLD",
+        "BELOW_THRESHOLD",
+        "MIX",
+        "ADD",
+        "SUB",
+        "MUL",
+    ] {
+        let mut destination =
+            Mesh::from_positions_and_faces(positions.clone(), vec![vec![0, 1, 2, 3]])?;
+        for (name, data_type) in [("FloatColor", "FLOAT_COLOR"), ("ByteColor", "BYTE_COLOR")] {
             set_color_layer(
-                &mut destination,name,"point",data_type,colors(&expected["destination"][name])?)?;
+                &mut destination,
+                name,
+                "point",
+                data_type,
+                colors(&expected["destination"][name])?,
+            )?;
         }
-        let transfer=modifier("data_transfer",json!({
-            "object":"source","use_vert_data":true,"data_types_verts":["COLOR_VERTEX"],
-            "vert_mapping":"TOPOLOGY","layers_vcol_vert_select_src":"ALL",
-            "layers_vcol_vert_select_dst":"NAME","mix_mode":mode,"mix_factor":0.4
-        }))?;
-        let actual=evaluate_with_context(&destination, &transfer, &operands, None, DMat4::IDENTITY, "destination", &AttributeLayerSelection::default())?;
-        for name in ["FloatColor","ByteColor"] {
-            let error=max_error(&color_values(&actual,name),&expected["outputs"][mode][name])?;
-            assert!(error<1.0e-6,"{name} {mode} max error {error}");
+        let transfer = modifier(
+            "data_transfer",
+            json!({
+                "object":"source","use_vert_data":true,"data_types_verts":["COLOR_VERTEX"],
+                "vert_mapping":"TOPOLOGY","layers_vcol_vert_select_src":"ALL",
+                "layers_vcol_vert_select_dst":"NAME","mix_mode":mode,"mix_factor":0.4
+            }),
+        )?;
+        let actual = evaluate_with_context(
+            &destination,
+            &transfer,
+            &operands,
+            None,
+            DMat4::IDENTITY,
+            "destination",
+            &AttributeLayerSelection::default(),
+        )?;
+        for name in ["FloatColor", "ByteColor"] {
+            let error = max_error(
+                &color_values(&actual, name),
+                &expected["outputs"][mode][name],
+            )?;
+            assert!(error < 1.0e-6, "{name} {mode} max error {error}");
         }
     }
     Ok(())
@@ -1083,11 +1760,14 @@ evaluated.to_mesh_clear()
 
 #[test]
 fn active_color_store_selectors_match_blender_all_name_path() -> Result<(), Box<dyn Error>> {
-    let Some(blender)=blender_file::blender_executable() else {
-        eprintln!("skipping data-transfer active color Blender parity test: Blender is unavailable");
+    let Some(blender) = blender_file::blender_executable() else {
+        eprintln!(
+            "skipping data-transfer active color Blender parity test: Blender is unavailable"
+        );
         return Ok(());
     };
-    let directory=tempdir()?; let root=directory.path();
+    let directory = tempdir()?;
+    let root = directory.path();
     blender_script::run_blender_script(
         &blender,
         "active-color.py",
@@ -1095,55 +1775,133 @@ fn active_color_store_selectors_match_blender_all_name_path() -> Result<(), Box<
         root,
         "Blender active-color transfer oracle failed",
     )?;
-    let expected:Value=serde_json::from_slice(&fs::read(root.join("active-color-oracle.json"))?)?;
-    let positions=vec![DVec3::ZERO,DVec3::X,DVec3::ONE,DVec3::Y];
-    let mut source=Mesh::from_positions_and_faces(positions.clone(),vec![vec![0,1,2,3]])?;
-    let mut destination=Mesh::from_positions_and_faces(positions,vec![vec![0,1,2,3]])?;
-    let colors=rgba_values;
-    let inactive_source=vec![[0.91,0.02,0.11,0.7],[0.81,0.12,0.21,0.8],
-                             [0.71,0.22,0.31,0.9],[0.61,0.32,0.41,1.0]];
-    let inactive_destination=vec![[0.51,0.42,0.33,0.4],[0.41,0.32,0.23,0.5],
-                                  [0.31,0.22,0.13,0.6],[0.21,0.12,0.03,0.7]];
-    set_color_layer(&mut source,"InactiveColor","point","FLOAT_COLOR",inactive_source)?;
-    set_color_layer(&mut source,"ActiveColor","point","FLOAT_COLOR",colors(&expected["source"])?)?;
-    source.attributes.get_mut("color_layers").ok_or("source ColorStore missing")?["active"]=json!("ActiveColor");
-    set_color_layer(&mut destination,"InactiveColor","point","FLOAT_COLOR",inactive_destination.clone())?;
-    set_color_layer(&mut destination,"ActiveColor","point","FLOAT_COLOR",colors(&expected["destination"])?)?;
-    destination.attributes.get_mut("color_layers").ok_or("destination ColorStore missing")?["active"]=json!("ActiveColor");
-    let operands=BTreeMap::from([(
+    let expected: Value =
+        serde_json::from_slice(&fs::read(root.join("active-color-oracle.json"))?)?;
+    let positions = vec![DVec3::ZERO, DVec3::X, DVec3::ONE, DVec3::Y];
+    let mut source = Mesh::from_positions_and_faces(positions.clone(), vec![vec![0, 1, 2, 3]])?;
+    let mut destination = Mesh::from_positions_and_faces(positions, vec![vec![0, 1, 2, 3]])?;
+    let colors = rgba_values;
+    let inactive_source = vec![
+        [0.91, 0.02, 0.11, 0.7],
+        [0.81, 0.12, 0.21, 0.8],
+        [0.71, 0.22, 0.31, 0.9],
+        [0.61, 0.32, 0.41, 1.0],
+    ];
+    let inactive_destination = vec![
+        [0.51, 0.42, 0.33, 0.4],
+        [0.41, 0.32, 0.23, 0.5],
+        [0.31, 0.22, 0.13, 0.6],
+        [0.21, 0.12, 0.03, 0.7],
+    ];
+    set_color_layer(
+        &mut source,
+        "InactiveColor",
+        "point",
+        "FLOAT_COLOR",
+        inactive_source,
+    )?;
+    set_color_layer(
+        &mut source,
+        "ActiveColor",
+        "point",
+        "FLOAT_COLOR",
+        colors(&expected["source"])?,
+    )?;
+    source
+        .attributes
+        .get_mut("color_layers")
+        .ok_or("source ColorStore missing")?["active"] = json!("ActiveColor");
+    set_color_layer(
+        &mut destination,
+        "InactiveColor",
+        "point",
+        "FLOAT_COLOR",
+        inactive_destination.clone(),
+    )?;
+    set_color_layer(
+        &mut destination,
+        "ActiveColor",
+        "point",
+        "FLOAT_COLOR",
+        colors(&expected["destination"])?,
+    )?;
+    destination
+        .attributes
+        .get_mut("color_layers")
+        .ok_or("destination ColorStore missing")?["active"] = json!("ActiveColor");
+    let operands = BTreeMap::from([(
         "object".to_owned(),
-        vec![operand(source.clone(),DMat4::IDENTITY,&[],None)],
+        vec![operand(source.clone(), DMat4::IDENTITY, &[], None)],
     )]);
-    let transfer=modifier("data_transfer",json!({
-        "object":"source","use_vert_data":true,"data_types_verts":["COLOR_VERTEX"],
-        "vert_mapping":"TOPOLOGY","layers_vcol_vert_select_src":"ACTIVE",
-        "layers_vcol_vert_select_dst":"ACTIVE","mix_mode":"REPLACE","mix_factor":1.0
-    }))?;
-    let actual=evaluate_with_context(&destination, &transfer, &operands, None, DMat4::IDENTITY, "destination", &AttributeLayerSelection::default())?;
-    let error=max_error(
-        &domain_attribute_values(&actual,"ActiveColor"),
+    let transfer = modifier(
+        "data_transfer",
+        json!({
+            "object":"source","use_vert_data":true,"data_types_verts":["COLOR_VERTEX"],
+            "vert_mapping":"TOPOLOGY","layers_vcol_vert_select_src":"ACTIVE",
+            "layers_vcol_vert_select_dst":"ACTIVE","mix_mode":"REPLACE","mix_factor":1.0
+        }),
+    )?;
+    let actual = evaluate_with_context(
+        &destination,
+        &transfer,
+        &operands,
+        None,
+        DMat4::IDENTITY,
+        "destination",
+        &AttributeLayerSelection::default(),
+    )?;
+    let error = max_error(
+        &domain_attribute_values(&actual, "ActiveColor"),
         &expected["output"],
     )?;
-    assert!(error<1.0e-6,"ACTIVE color store selectors max error {error}");
-    assert_eq!(domain_attribute_values(&actual,"InactiveColor"),json!(inactive_destination),
-        "ACTIVE selection must leave the first, inactive color layer untouched");
-    let mut no_active_destination=destination.clone();
-    no_active_destination.attributes.get_mut("color_layers").ok_or("destination ColorStore missing")?["active"]=Value::Null;
-    let no_active_actual=evaluate_with_context(&no_active_destination, &transfer, &operands, None, DMat4::IDENTITY, "destination", &AttributeLayerSelection::default())?;
+    assert!(
+        error < 1.0e-6,
+        "ACTIVE color store selectors max error {error}"
+    );
     assert_eq!(
-        domain_attribute_values(&no_active_actual,"ActiveColor"),
+        domain_attribute_values(&actual, "InactiveColor"),
+        json!(inactive_destination),
+        "ACTIVE selection must leave the first, inactive color layer untouched"
+    );
+    let mut no_active_destination = destination.clone();
+    no_active_destination
+        .attributes
+        .get_mut("color_layers")
+        .ok_or("destination ColorStore missing")?["active"] = Value::Null;
+    let no_active_actual = evaluate_with_context(
+        &no_active_destination,
+        &transfer,
+        &operands,
+        None,
+        DMat4::IDENTITY,
+        "destination",
+        &AttributeLayerSelection::default(),
+    )?;
+    assert_eq!(
+        domain_attribute_values(&no_active_actual, "ActiveColor"),
         json!(colors(&expected["destination"])),
         "ACTIVE destination selection must no-op when the ColorStore has no active layer",
     );
-    let mut no_active_source=source.clone();
-    no_active_source.attributes.get_mut("color_layers").ok_or("source ColorStore missing")?["active"]=Value::Null;
-    let no_active_source_operands=BTreeMap::from([(
+    let mut no_active_source = source.clone();
+    no_active_source
+        .attributes
+        .get_mut("color_layers")
+        .ok_or("source ColorStore missing")?["active"] = Value::Null;
+    let no_active_source_operands = BTreeMap::from([(
         "object".to_owned(),
-        vec![operand(no_active_source,DMat4::IDENTITY,&[],None)],
+        vec![operand(no_active_source, DMat4::IDENTITY, &[], None)],
     )]);
-    let no_active_source_actual=evaluate_with_context(&destination, &transfer, &no_active_source_operands, None, DMat4::IDENTITY, "destination", &AttributeLayerSelection::default())?;
+    let no_active_source_actual = evaluate_with_context(
+        &destination,
+        &transfer,
+        &no_active_source_operands,
+        None,
+        DMat4::IDENTITY,
+        "destination",
+        &AttributeLayerSelection::default(),
+    )?;
     assert_eq!(
-        domain_attribute_values(&no_active_source_actual,"ActiveColor"),
+        domain_attribute_values(&no_active_source_actual, "ActiveColor"),
         json!(colors(&expected["destination"])),
         "ACTIVE source selection must no-op when the ColorStore has no active layer",
     );
@@ -1183,11 +1941,12 @@ with open(os.path.join(root,'uv-island-oracle.json'),'w') as f: json.dump(result
 
 #[test]
 fn uv_island_selection_and_precision_match_blender() -> Result<(), Box<dyn Error>> {
-    let Some(blender)=blender_file::blender_executable() else {
+    let Some(blender) = blender_file::blender_executable() else {
         eprintln!("skipping data-transfer UV island Blender parity test: Blender is unavailable");
         return Ok(());
     };
-    let directory=tempdir()?; let root=directory.path();
+    let directory = tempdir()?;
+    let root = directory.path();
     blender_script::run_blender_script(
         &blender,
         "uv-island.py",
@@ -1195,54 +1954,108 @@ fn uv_island_selection_and_precision_match_blender() -> Result<(), Box<dyn Error
         root,
         "Blender data-transfer UV island oracle failed",
     )?;
-    let mut expected:Value=serde_json::from_slice(&fs::read(root.join("uv-island-oracle.json"))?)?;
+    let mut expected: Value =
+        serde_json::from_slice(&fs::read(root.join("uv-island-oracle.json"))?)?;
     flip_blender_uv_to_potter(&mut expected);
-    let positions=vec![
-        DVec3::new(0.0,0.0,0.0),DVec3::new(1.0,0.0,0.0),DVec3::new(1.0,1.0,0.0),DVec3::new(0.0,1.0,0.0),
-        DVec3::new(0.0,0.0,1.0),DVec3::new(1.0,0.0,1.0),DVec3::new(1.0,1.0,1.0),DVec3::new(0.0,1.0,1.0),
+    let positions = vec![
+        DVec3::new(0.0, 0.0, 0.0),
+        DVec3::new(1.0, 0.0, 0.0),
+        DVec3::new(1.0, 1.0, 0.0),
+        DVec3::new(0.0, 1.0, 0.0),
+        DVec3::new(0.0, 0.0, 1.0),
+        DVec3::new(1.0, 0.0, 1.0),
+        DVec3::new(1.0, 1.0, 1.0),
+        DVec3::new(0.0, 1.0, 1.0),
     ];
-    let faces=vec![vec![0,1,5,4],vec![1,2,6,5],vec![2,3,7,6],vec![3,0,4,7]];
-    let mut source=Mesh::from_positions_and_faces(positions.clone(),faces)?;
-    let mut source_uvs=Vec::new();
-    let mut loop_index=0;
-    for (face_index,face) in source.faces.iter().enumerate() {
-        let mut row=Vec::new();
+    let faces = vec![
+        vec![0, 1, 5, 4],
+        vec![1, 2, 6, 5],
+        vec![2, 3, 7, 6],
+        vec![3, 0, 4, 7],
+    ];
+    let mut source = Mesh::from_positions_and_faces(positions.clone(), faces)?;
+    let mut source_uvs = Vec::new();
+    let mut loop_index = 0;
+    for (face_index, face) in source.faces.iter().enumerate() {
+        let mut row = Vec::new();
         for _ in 0..face.vertices.len() {
-            row.push([10.0*face_index as f64+loop_index as f64*0.1,3.0*face_index as f64+loop_index as f64*0.03]);
-            loop_index+=1;
+            row.push([
+                10.0 * face_index as f64 + loop_index as f64 * 0.1,
+                3.0 * face_index as f64 + loop_index as f64 * 0.03,
+            ]);
+            loop_index += 1;
         }
         source_uvs.push(row);
     }
-    set_uv_layers(&mut source,&[("UVMap",source_uvs)],"UVMap");
-    let seam_start=source.vertices[0].id;
-    let seam_end=source.vertices[4].id;
-    let seam=source.edges.iter().find(|edge|edge.vertices.contains(&seam_start)&&edge.vertices.contains(&seam_end)).ok_or("UV seam edge missing")?;
-    source.attributes.insert("seam".to_owned(),json!({
-        "domain":"edge","type":"bool","values":{format!("e{}",seam.id):true}
-    }));
-    let mut operands=BTreeMap::new();
-    operands.insert("object".to_owned(),vec![operand(source,DMat4::IDENTITY,&[],None)]);
-    let destination_positions=vec![
-        DVec3::new(0.0,0.2,0.3),DVec3::new(0.2,0.0,0.3),DVec3::new(0.2,0.0,0.8),DVec3::new(0.0,0.2,0.8),
+    set_uv_layers(&mut source, &[("UVMap", source_uvs)], "UVMap");
+    let seam_start = source.vertices[0].id;
+    let seam_end = source.vertices[4].id;
+    let seam = source
+        .edges
+        .iter()
+        .find(|edge| edge.vertices.contains(&seam_start) && edge.vertices.contains(&seam_end))
+        .ok_or("UV seam edge missing")?;
+    source.attributes.insert(
+        "seam".to_owned(),
+        json!({
+            "domain":"edge","type":"bool","values":{format!("e{}",seam.id):true}
+        }),
+    );
+    let mut operands = BTreeMap::new();
+    operands.insert(
+        "object".to_owned(),
+        vec![operand(source, DMat4::IDENTITY, &[], None)],
+    );
+    let destination_positions = vec![
+        DVec3::new(0.0, 0.2, 0.3),
+        DVec3::new(0.2, 0.0, 0.3),
+        DVec3::new(0.2, 0.0, 0.8),
+        DVec3::new(0.0, 0.2, 0.8),
     ];
-    let mut expected_precision_zero:Option<Value>=None;
-    for precision in [0.0,1.0] {
-        let mut destination=Mesh::from_positions_and_faces(destination_positions.clone(),vec![vec![0,1,2,3]])?;
-        set_uv_layers(&mut destination,&[
-            ("UVMap",vec![vec![[-1.0,0.5],[-1.1,0.55],[-1.2,0.6],[-1.3,0.65]]])
-        ],"UVMap");
-        let modifier=modifier("data_transfer",json!({
-            "object":"source","use_object_transform":true,"use_loop_data":true,"data_types_loops":["UV"],
-            "loop_mapping":"NEAREST_POLY","layers_uv_select_src":"ALL","layers_uv_select_dst":"NAME",
-            "mix_mode":"REPLACE","mix_factor":1.0,"islands_precision":precision
-        }))?;
-        let actual=evaluate_with_context(&destination, &modifier, &operands, None, DMat4::IDENTITY, "destination", &AttributeLayerSelection::default())?;
-        let values=uv_layer_values(&actual,"UVMap");
-        let error=max_error(&values,&expected[key])?;
-        assert!(error<2.0e-4,"islands_precision={precision} max error {error}");
-        if precision==0.0 { expected_precision_zero=Some(values); }
+    let mut expected_precision_zero: Option<Value> = None;
+    for precision in [0.0, 1.0] {
+        let mut destination =
+            Mesh::from_positions_and_faces(destination_positions.clone(), vec![vec![0, 1, 2, 3]])?;
+        set_uv_layers(
+            &mut destination,
+            &[(
+                "UVMap",
+                vec![vec![[-1.0, 0.5], [-1.1, 0.55], [-1.2, 0.6], [-1.3, 0.65]]],
+            )],
+            "UVMap",
+        );
+        let modifier = modifier(
+            "data_transfer",
+            json!({
+                "object":"source","use_object_transform":true,"use_loop_data":true,"data_types_loops":["UV"],
+                "loop_mapping":"NEAREST_POLY","layers_uv_select_src":"ALL","layers_uv_select_dst":"NAME",
+                "mix_mode":"REPLACE","mix_factor":1.0,"islands_precision":precision
+            }),
+        )?;
+        let actual = evaluate_with_context(
+            &destination,
+            &modifier,
+            &operands,
+            None,
+            DMat4::IDENTITY,
+            "destination",
+            &AttributeLayerSelection::default(),
+        )?;
+        let values = uv_layer_values(&actual, "UVMap");
+        let error = max_error(&values, &expected[key])?;
+        assert!(
+            error < 2.0e-4,
+            "islands_precision={precision} max error {error}"
+        );
+        if precision == 0.0 {
+            expected_precision_zero = Some(values);
+        }
     }
-    assert_ne!(expected_precision_zero.as_ref(),Some(&expected["1"]),"the seam path case must exercise A-star correction");
+    assert_ne!(
+        expected_precision_zero.as_ref(),
+        Some(&expected["1"]),
+        "the seam path case must exercise A-star correction"
+    );
     Ok(())
 }
 
@@ -1277,37 +2090,87 @@ with open(os.path.join(root,'loop-mapping-oracle.json'),'w') as f: json.dump(res
 
 #[test]
 fn loop_mapping_families_match_blender_with_corner_association() -> Result<(), Box<dyn Error>> {
-    let Some(blender)=blender_file::blender_executable() else {
+    let Some(blender) = blender_file::blender_executable() else {
         eprintln!("skipping data-transfer loop Blender parity test: Blender is unavailable");
         return Ok(());
     };
-    let directory=tempdir()?; let root=directory.path();
-    blender_script::run_blender_script(&blender,"loop-mappings.py",BLENDER_LOOP_MAPPING_SCRIPT,root,"Blender data-transfer loop oracle failed")?;
-    let mut expected:Value=serde_json::from_slice(&fs::read(root.join("loop-mapping-oracle.json"))?)?;
+    let directory = tempdir()?;
+    let root = directory.path();
+    blender_script::run_blender_script(
+        &blender,
+        "loop-mappings.py",
+        BLENDER_LOOP_MAPPING_SCRIPT,
+        root,
+        "Blender data-transfer loop oracle failed",
+    )?;
+    let mut expected: Value =
+        serde_json::from_slice(&fs::read(root.join("loop-mapping-oracle.json"))?)?;
     flip_blender_uv_to_potter(&mut expected);
-    let mut source=Mesh::from_positions_and_faces(
-        vec![DVec3::new(0.0,0.0,0.0),DVec3::new(2.0,0.0,0.0),DVec3::new(2.0,2.0,0.0),DVec3::new(0.0,2.0,0.0)],
-        vec![vec![0,1,2,3]])?;
-    set_uv_layers(&mut source,&[
-        ("UVMap",vec![vec![[0.2,0.3],[1.21,0.32],[1.22,1.14],[0.23,1.16]]])
-    ],"UVMap");
-    let vertices=vec![DVec3::new(0.3,0.2,0.1),DVec3::new(1.2,0.2,0.1),DVec3::new(1.5,1.5,0.1),DVec3::new(0.2,1.5,0.1)];
-    let mut operands=BTreeMap::new();
-    operands.insert("object".to_owned(),vec![operand(source,DMat4::IDENTITY,&[],None)]);
-    for mapping in ["NEAREST_NORMAL","NEAREST_POLYNOR","NEAREST_POLY","POLYINTERP_NEAREST","POLYINTERP_LNORPROJ"] {
-        let mut destination=Mesh::from_positions_and_faces(vertices.clone(),vec![vec![0,1,2],vec![0,2,3]])?;
-        set_uv_layers(&mut destination,&[
-            ("UVMap",vec![vec![[0.0,0.0];3],vec![[0.0,0.0];3]])
-        ],"UVMap");
-        let transfer=modifier("data_transfer",json!({
-            "object":"source","use_object_transform":true,"use_loop_data":true,"data_types_loops":["UV"],
-            "loop_mapping":mapping,"layers_uv_select_src":"ALL","layers_uv_select_dst":"NAME",
-            "mix_mode":"REPLACE","mix_factor":1.0,"use_max_distance":true,"max_distance":5.0
-        }))?;
-        let actual=evaluate_with_context(&destination, &transfer, &operands, None, DMat4::IDENTITY, "destination", &AttributeLayerSelection::default())?;
-        let values=uv_layer_values(&actual,"UVMap");
-        let error=max_error(&values,&expected[mapping])?;
-        assert!(error<2.0e-4,"{mapping} loop max error {error}; values={values}");
+    let mut source = Mesh::from_positions_and_faces(
+        vec![
+            DVec3::new(0.0, 0.0, 0.0),
+            DVec3::new(2.0, 0.0, 0.0),
+            DVec3::new(2.0, 2.0, 0.0),
+            DVec3::new(0.0, 2.0, 0.0),
+        ],
+        vec![vec![0, 1, 2, 3]],
+    )?;
+    set_uv_layers(
+        &mut source,
+        &[(
+            "UVMap",
+            vec![vec![[0.2, 0.3], [1.21, 0.32], [1.22, 1.14], [0.23, 1.16]]],
+        )],
+        "UVMap",
+    );
+    let vertices = vec![
+        DVec3::new(0.3, 0.2, 0.1),
+        DVec3::new(1.2, 0.2, 0.1),
+        DVec3::new(1.5, 1.5, 0.1),
+        DVec3::new(0.2, 1.5, 0.1),
+    ];
+    let mut operands = BTreeMap::new();
+    operands.insert(
+        "object".to_owned(),
+        vec![operand(source, DMat4::IDENTITY, &[], None)],
+    );
+    for mapping in [
+        "NEAREST_NORMAL",
+        "NEAREST_POLYNOR",
+        "NEAREST_POLY",
+        "POLYINTERP_NEAREST",
+        "POLYINTERP_LNORPROJ",
+    ] {
+        let mut destination =
+            Mesh::from_positions_and_faces(vertices.clone(), vec![vec![0, 1, 2], vec![0, 2, 3]])?;
+        set_uv_layers(
+            &mut destination,
+            &[("UVMap", vec![vec![[0.0, 0.0]; 3], vec![[0.0, 0.0]; 3]])],
+            "UVMap",
+        );
+        let transfer = modifier(
+            "data_transfer",
+            json!({
+                "object":"source","use_object_transform":true,"use_loop_data":true,"data_types_loops":["UV"],
+                "loop_mapping":mapping,"layers_uv_select_src":"ALL","layers_uv_select_dst":"NAME",
+                "mix_mode":"REPLACE","mix_factor":1.0,"use_max_distance":true,"max_distance":5.0
+            }),
+        )?;
+        let actual = evaluate_with_context(
+            &destination,
+            &transfer,
+            &operands,
+            None,
+            DMat4::IDENTITY,
+            "destination",
+            &AttributeLayerSelection::default(),
+        )?;
+        let values = uv_layer_values(&actual, "UVMap");
+        let error = max_error(&values, &expected[mapping])?;
+        assert!(
+            error < 2.0e-4,
+            "{mapping} loop max error {error}; values={values}"
+        );
     }
     Ok(())
 }
@@ -1391,10 +2254,16 @@ fn set_blender_attribute(
     data_type: &str,
     values: Value,
 ) -> Result<(), Box<dyn Error>> {
-    let attributes=mesh.attributes.entry("blender_attributes".to_owned()).or_insert_with(||json!([]));
-    attributes.as_array_mut().ok_or("Blender attributes fixture must be an array")?.push(json!({
-        "name":name,"domain":domain,"data_type":data_type,"values":values
-    }));
+    let attributes = mesh
+        .attributes
+        .entry("blender_attributes".to_owned())
+        .or_insert_with(|| json!([]));
+    attributes
+        .as_array_mut()
+        .ok_or("Blender attributes fixture must be an array")?
+        .push(json!({
+            "name":name,"domain":domain,"data_type":data_type,"values":values
+        }));
     Ok(())
 }
 
@@ -1424,7 +2293,9 @@ fn set_color_layer(
             let mut cursor = 0;
             for face in &mesh.faces {
                 let end = cursor + face.vertices.len();
-                let row = colors.get(cursor..end).ok_or("corner color face row is out of range")?;
+                let row = colors
+                    .get(cursor..end)
+                    .ok_or("corner color face row is out of range")?;
                 values.insert(format!("f{}", face.id), json!(row));
                 cursor = end;
             }
@@ -1439,7 +2310,9 @@ fn set_color_layer(
         .attributes
         .entry("color_layers".to_owned())
         .or_insert_with(|| json!({"layers":[],"active":null,"render":null}));
-    let layers = store.get_mut("layers").and_then(Value::as_array_mut)
+    let layers = store
+        .get_mut("layers")
+        .and_then(Value::as_array_mut)
         .ok_or("color layer registry must be an array")?;
     if !layers.iter().any(|layer| layer.as_str() == Some(name)) {
         layers.push(json!(name));
@@ -1468,118 +2341,292 @@ fn set_color_layer(
 
 #[test]
 fn edge_and_polygon_mapping_families_match_blender() -> Result<(), Box<dyn Error>> {
-    let Some(blender)=blender_file::blender_executable() else {
+    let Some(blender) = blender_file::blender_executable() else {
         eprintln!("skipping data-transfer edge/face Blender parity test: Blender is unavailable");
         return Ok(());
     };
-    let directory=tempdir()?; let root=directory.path();
-    blender_script::run_blender_script(&blender,"domain-mappings.py",BLENDER_DOMAIN_MAPPING_SCRIPT,root,"Blender data-transfer edge/face oracle failed")?;
-    let expected:Value=serde_json::from_slice(&fs::read(root.join("domain-mapping-oracle.json"))?)?;
-    let mut source=Mesh::from_positions_and_faces(
-        vec![DVec3::new(0.0,0.0,0.0),DVec3::new(2.0,0.0,0.0),DVec3::new(2.0,2.0,0.0),DVec3::new(0.0,2.0,0.0)],
-        vec![vec![0,1,2,3]])?;
-    set_blender_attribute(&mut source,"crease_edge","EDGE","FLOAT",json!([0.1,0.3,0.5,0.7]))?;
-    let mut operands=BTreeMap::new();
-    operands.insert("object".to_owned(),vec![operand(source,DMat4::IDENTITY,&[],None)]);
-    let destination_vertices=vec![DVec3::new(0.2,0.0,0.1),DVec3::new(1.4,0.0,0.1),DVec3::new(0.9,1.5,0.1)];
-    for mapping in ["NEAREST","VERT_NEAREST","POLY_NEAREST","EDGEINTERP_VNORPROJ"] {
-        let mut destination=Mesh::from_positions_and_faces(destination_vertices.clone(),vec![vec![0,1,2]])?;
-        set_blender_attribute(&mut destination,"crease_edge","EDGE","FLOAT",json!([0.0,0.0,0.0]))?;
-        let transfer=modifier("data_transfer",json!({
-            "object":"source","use_object_transform":true,"use_edge_data":true,"data_types_edges":["CREASE"],
-            "edge_mapping":mapping,"mix_mode":"REPLACE","mix_factor":1.0,
-            "use_max_distance":true,"max_distance":5.0,"ray_radius":0.15
-        }))?;
-        let actual=evaluate_with_context(&destination, &transfer, &operands, None, DMat4::IDENTITY, "destination", &AttributeLayerSelection::default())?;
-        let values=actual.attributes["blender_attributes"][0]["values"].clone();
-        let error=max_error(&values,&expected["edge"][mapping])?;
-        assert!(error<3.0e-4,"edge {mapping} max error {error}");
+    let directory = tempdir()?;
+    let root = directory.path();
+    blender_script::run_blender_script(
+        &blender,
+        "domain-mappings.py",
+        BLENDER_DOMAIN_MAPPING_SCRIPT,
+        root,
+        "Blender data-transfer edge/face oracle failed",
+    )?;
+    let expected: Value =
+        serde_json::from_slice(&fs::read(root.join("domain-mapping-oracle.json"))?)?;
+    let mut source = Mesh::from_positions_and_faces(
+        vec![
+            DVec3::new(0.0, 0.0, 0.0),
+            DVec3::new(2.0, 0.0, 0.0),
+            DVec3::new(2.0, 2.0, 0.0),
+            DVec3::new(0.0, 2.0, 0.0),
+        ],
+        vec![vec![0, 1, 2, 3]],
+    )?;
+    set_blender_attribute(
+        &mut source,
+        "crease_edge",
+        "EDGE",
+        "FLOAT",
+        json!([0.1, 0.3, 0.5, 0.7]),
+    )?;
+    let mut operands = BTreeMap::new();
+    operands.insert(
+        "object".to_owned(),
+        vec![operand(source, DMat4::IDENTITY, &[], None)],
+    );
+    let destination_vertices = vec![
+        DVec3::new(0.2, 0.0, 0.1),
+        DVec3::new(1.4, 0.0, 0.1),
+        DVec3::new(0.9, 1.5, 0.1),
+    ];
+    for mapping in [
+        "NEAREST",
+        "VERT_NEAREST",
+        "POLY_NEAREST",
+        "EDGEINTERP_VNORPROJ",
+    ] {
+        let mut destination =
+            Mesh::from_positions_and_faces(destination_vertices.clone(), vec![vec![0, 1, 2]])?;
+        set_blender_attribute(
+            &mut destination,
+            "crease_edge",
+            "EDGE",
+            "FLOAT",
+            json!([0.0, 0.0, 0.0]),
+        )?;
+        let transfer = modifier(
+            "data_transfer",
+            json!({
+                "object":"source","use_object_transform":true,"use_edge_data":true,"data_types_edges":["CREASE"],
+                "edge_mapping":mapping,"mix_mode":"REPLACE","mix_factor":1.0,
+                "use_max_distance":true,"max_distance":5.0,"ray_radius":0.15
+            }),
+        )?;
+        let actual = evaluate_with_context(
+            &destination,
+            &transfer,
+            &operands,
+            None,
+            DMat4::IDENTITY,
+            "destination",
+            &AttributeLayerSelection::default(),
+        )?;
+        let values = actual.attributes["blender_attributes"][0]["values"].clone();
+        let error = max_error(&values, &expected["edge"][mapping])?;
+        assert!(error < 3.0e-4, "edge {mapping} max error {error}");
     }
-    let mut radius_zero_destination=Mesh::from_positions_and_faces(
-        destination_vertices.clone(),vec![vec![0,1,2]])?;
-    set_blender_attribute(&mut radius_zero_destination,"crease_edge","EDGE","FLOAT",json!([0.0,0.0,0.0]))?;
-    let radius_zero_transfer=modifier("data_transfer",json!({
-        "object":"source","use_object_transform":true,"use_edge_data":true,"data_types_edges":["CREASE"],
-        "edge_mapping":"EDGEINTERP_VNORPROJ","mix_mode":"REPLACE","mix_factor":1.0,
-        "use_max_distance":true,"max_distance":5.0,"ray_radius":0.0
-    }))?;
-    let radius_zero_actual=evaluate_with_context(&radius_zero_destination, &radius_zero_transfer, &operands, None, DMat4::IDENTITY, "destination", &AttributeLayerSelection::default())?;
-    let radius_zero_values=radius_zero_actual.attributes["blender_attributes"][0]["values"].clone();
-    let radius_zero_error=max_error(&radius_zero_values,&expected["edge"]["EDGEINTERP_VNORPROJ_R0"])?;
-    assert!(radius_zero_error<3.0e-4,
-        "EDGEINTERP_VNORPROJ radius=0 max error {radius_zero_error}");
-    let mut topology_destination=Mesh::from_positions_and_faces(
-        vec![DVec3::new(0.0,0.0,0.1),DVec3::new(2.0,0.0,0.1),DVec3::new(2.0,2.0,0.1),DVec3::new(0.0,2.0,0.1)],
-        vec![vec![0,1,2,3]])?;
-    set_blender_attribute(&mut topology_destination,"crease_edge","EDGE","FLOAT",json!([0.0,0.0,0.0,0.0]))?;
-    let transfer=modifier("data_transfer",json!({
-        "object":"source","use_object_transform":true,"use_edge_data":true,"data_types_edges":["CREASE"],
-        "edge_mapping":"TOPOLOGY","mix_mode":"REPLACE","mix_factor":1.0
-    }))?;
-    let actual=evaluate_with_context(&topology_destination, &transfer, &operands, None, DMat4::IDENTITY, "destination", &AttributeLayerSelection::default())?;
-    let values=actual.attributes["blender_attributes"][0]["values"].clone();
-    let error=max_error(&values,&expected["edge"]["TOPOLOGY"])?;
-    assert!(error<1.0e-6,"edge TOPOLOGY max error {error}");
-    let mut face_source=Mesh::from_positions_and_faces(
-        vec![DVec3::new(0.0,0.0,0.0),DVec3::new(1.0,0.0,0.0),DVec3::new(0.0,1.0,0.0),DVec3::new(3.0,0.0,0.0),DVec3::new(4.0,0.0,0.0),DVec3::new(3.0,1.0,0.0)],
-        vec![vec![0,1,2],vec![3,4,5]])?;
-    set_blender_attribute(&mut face_source,"freestyle_face","FACE","BOOLEAN",json!([false,true]))?;
-    let mut face_operands=BTreeMap::new();
-    face_operands.insert("object".to_owned(),vec![operand(face_source,DMat4::IDENTITY,&[],None)]);
-    for mapping in ["TOPOLOGY","NEAREST","NORMAL","POLYINTERP_PNORPROJ"] {
-        let mut destination=Mesh::from_positions_and_faces(
-            vec![DVec3::new(0.0,0.0,0.1),DVec3::new(1.0,0.0,0.1),DVec3::new(0.0,1.0,0.1),DVec3::new(3.0,0.0,0.1),DVec3::new(4.0,0.0,0.1),DVec3::new(3.0,1.0,0.1)],
-            vec![vec![0,1,2],vec![3,4,5]])?;
-        set_blender_attribute(&mut destination,"freestyle_face","FACE","BOOLEAN",json!([false,false]))?;
-        let transfer=modifier("data_transfer",json!({
-            "object":"source","use_object_transform":true,"use_poly_data":true,"data_types_polys":["FREESTYLE_FACE"],
-            "poly_mapping":mapping,"mix_mode":"REPLACE","mix_factor":1.0,
-            "use_max_distance":true,"max_distance":5.0,"ray_radius":0.01
-        }))?;
-        let actual=evaluate_with_context(&destination, &transfer, &face_operands, None, DMat4::IDENTITY, "destination", &AttributeLayerSelection::default())?;
-        let values=actual.attributes["blender_attributes"][0]["values"].clone();
+    let mut radius_zero_destination =
+        Mesh::from_positions_and_faces(destination_vertices.clone(), vec![vec![0, 1, 2]])?;
+    set_blender_attribute(
+        &mut radius_zero_destination,
+        "crease_edge",
+        "EDGE",
+        "FLOAT",
+        json!([0.0, 0.0, 0.0]),
+    )?;
+    let radius_zero_transfer = modifier(
+        "data_transfer",
+        json!({
+            "object":"source","use_object_transform":true,"use_edge_data":true,"data_types_edges":["CREASE"],
+            "edge_mapping":"EDGEINTERP_VNORPROJ","mix_mode":"REPLACE","mix_factor":1.0,
+            "use_max_distance":true,"max_distance":5.0,"ray_radius":0.0
+        }),
+    )?;
+    let radius_zero_actual = evaluate_with_context(
+        &radius_zero_destination,
+        &radius_zero_transfer,
+        &operands,
+        None,
+        DMat4::IDENTITY,
+        "destination",
+        &AttributeLayerSelection::default(),
+    )?;
+    let radius_zero_values =
+        radius_zero_actual.attributes["blender_attributes"][0]["values"].clone();
+    let radius_zero_error = max_error(
+        &radius_zero_values,
+        &expected["edge"]["EDGEINTERP_VNORPROJ_R0"],
+    )?;
+    assert!(
+        radius_zero_error < 3.0e-4,
+        "EDGEINTERP_VNORPROJ radius=0 max error {radius_zero_error}"
+    );
+    let mut topology_destination = Mesh::from_positions_and_faces(
+        vec![
+            DVec3::new(0.0, 0.0, 0.1),
+            DVec3::new(2.0, 0.0, 0.1),
+            DVec3::new(2.0, 2.0, 0.1),
+            DVec3::new(0.0, 2.0, 0.1),
+        ],
+        vec![vec![0, 1, 2, 3]],
+    )?;
+    set_blender_attribute(
+        &mut topology_destination,
+        "crease_edge",
+        "EDGE",
+        "FLOAT",
+        json!([0.0, 0.0, 0.0, 0.0]),
+    )?;
+    let transfer = modifier(
+        "data_transfer",
+        json!({
+            "object":"source","use_object_transform":true,"use_edge_data":true,"data_types_edges":["CREASE"],
+            "edge_mapping":"TOPOLOGY","mix_mode":"REPLACE","mix_factor":1.0
+        }),
+    )?;
+    let actual = evaluate_with_context(
+        &topology_destination,
+        &transfer,
+        &operands,
+        None,
+        DMat4::IDENTITY,
+        "destination",
+        &AttributeLayerSelection::default(),
+    )?;
+    let values = actual.attributes["blender_attributes"][0]["values"].clone();
+    let error = max_error(&values, &expected["edge"]["TOPOLOGY"])?;
+    assert!(error < 1.0e-6, "edge TOPOLOGY max error {error}");
+    let mut face_source = Mesh::from_positions_and_faces(
+        vec![
+            DVec3::new(0.0, 0.0, 0.0),
+            DVec3::new(1.0, 0.0, 0.0),
+            DVec3::new(0.0, 1.0, 0.0),
+            DVec3::new(3.0, 0.0, 0.0),
+            DVec3::new(4.0, 0.0, 0.0),
+            DVec3::new(3.0, 1.0, 0.0),
+        ],
+        vec![vec![0, 1, 2], vec![3, 4, 5]],
+    )?;
+    set_blender_attribute(
+        &mut face_source,
+        "freestyle_face",
+        "FACE",
+        "BOOLEAN",
+        json!([false, true]),
+    )?;
+    let mut face_operands = BTreeMap::new();
+    face_operands.insert(
+        "object".to_owned(),
+        vec![operand(face_source, DMat4::IDENTITY, &[], None)],
+    );
+    for mapping in ["TOPOLOGY", "NEAREST", "NORMAL", "POLYINTERP_PNORPROJ"] {
+        let mut destination = Mesh::from_positions_and_faces(
+            vec![
+                DVec3::new(0.0, 0.0, 0.1),
+                DVec3::new(1.0, 0.0, 0.1),
+                DVec3::new(0.0, 1.0, 0.1),
+                DVec3::new(3.0, 0.0, 0.1),
+                DVec3::new(4.0, 0.0, 0.1),
+                DVec3::new(3.0, 1.0, 0.1),
+            ],
+            vec![vec![0, 1, 2], vec![3, 4, 5]],
+        )?;
+        set_blender_attribute(
+            &mut destination,
+            "freestyle_face",
+            "FACE",
+            "BOOLEAN",
+            json!([false, false]),
+        )?;
+        let transfer = modifier(
+            "data_transfer",
+            json!({
+                "object":"source","use_object_transform":true,"use_poly_data":true,"data_types_polys":["FREESTYLE_FACE"],
+                "poly_mapping":mapping,"mix_mode":"REPLACE","mix_factor":1.0,
+                "use_max_distance":true,"max_distance":5.0,"ray_radius":0.01
+            }),
+        )?;
+        let actual = evaluate_with_context(
+            &destination,
+            &transfer,
+            &face_operands,
+            None,
+            DMat4::IDENTITY,
+            "destination",
+            &AttributeLayerSelection::default(),
+        )?;
+        let values = actual.attributes["blender_attributes"][0]["values"].clone();
         assert_eq!(values, expected["face"][mapping], "face {mapping} flags");
     }
-    let grid_size=8usize;
-    let coordinates=(0..=grid_size)
-        .map(|index|-1.0+2.0*index as f64/grid_size as f64)
+    let grid_size = 8usize;
+    let coordinates = (0..=grid_size)
+        .map(|index| -1.0 + 2.0 * index as f64 / grid_size as f64)
         .collect::<Vec<_>>();
-    let oblique_positions=coordinates.iter().flat_map(|z|
-        coordinates.iter().map(move |y|DVec3::new(0.0,*y,*z))).collect::<Vec<_>>();
-    let mut oblique_faces=Vec::new();
+    let oblique_positions = coordinates
+        .iter()
+        .flat_map(|z| coordinates.iter().map(move |y| DVec3::new(0.0, *y, *z)))
+        .collect::<Vec<_>>();
+    let mut oblique_faces = Vec::new();
     for z in 0..grid_size {
         for y in 0..grid_size {
-            let a=z*(grid_size+1)+y;
-            let b=a+1;
-            let d=(z+1)*(grid_size+1)+y;
-            let c=d+1;
-            oblique_faces.push(vec![a,b,c,d]);
+            let a = z * (grid_size + 1) + y;
+            let b = a + 1;
+            let d = (z + 1) * (grid_size + 1) + y;
+            let c = d + 1;
+            oblique_faces.push(vec![a, b, c, d]);
         }
     }
-    let oblique_destination_positions=vec![
-        DVec3::new(0.1,-0.8,-0.7),DVec3::new(0.1,0.9,-0.6),
-        DVec3::new(0.1,0.65,0.8),DVec3::new(0.1,-0.7,0.9),
+    let oblique_destination_positions = vec![
+        DVec3::new(0.1, -0.8, -0.7),
+        DVec3::new(0.1, 0.9, -0.6),
+        DVec3::new(0.1, 0.65, 0.8),
+        DVec3::new(0.1, -0.7, 0.9),
     ];
-    for (label,selected) in [("PNORPROJ_OBLIQUE_HIT",19usize),("PNORPROJ_OBLIQUE_MISS",0)] {
-        let mut oblique_source=Mesh::from_positions_and_faces(
-            oblique_positions.clone(),oblique_faces.clone())?;
-        let face_flags=(0..grid_size*grid_size).map(|index|index==selected).collect::<Vec<_>>();
-        set_blender_attribute(&mut oblique_source,"freestyle_face","FACE","BOOLEAN",json!(face_flags))?;
-        let mut oblique_operands=BTreeMap::new();
-        oblique_operands.insert("object".to_owned(),vec![
-            operand(oblique_source,DMat4::IDENTITY,&[],None)]);
-        let mut oblique_destination=Mesh::from_positions_and_faces(
-            oblique_destination_positions.clone(),vec![vec![0,1,2,3]])?;
-        set_blender_attribute(&mut oblique_destination,"freestyle_face","FACE","BOOLEAN",json!([false]))?;
-        let oblique_transfer=modifier("data_transfer",json!({
-            "object":"source","use_object_transform":true,"use_poly_data":true,
-            "data_types_polys":["FREESTYLE_FACE"],"poly_mapping":"POLYINTERP_PNORPROJ",
-            "mix_mode":"REPLACE","mix_factor":1.0,"use_max_distance":true,
-            "max_distance":5.0,"ray_radius":0.5
-        }))?;
-        let oblique_actual=evaluate_with_context(&oblique_destination, &oblique_transfer, &oblique_operands, None, DMat4::IDENTITY, "destination", &AttributeLayerSelection::default())?;
-        let values=oblique_actual.attributes["blender_attributes"][0]["values"].clone();
-        assert_eq!(values,expected["face"][label],"oblique {label} flags");
+    for (label, selected) in [
+        ("PNORPROJ_OBLIQUE_HIT", 19usize),
+        ("PNORPROJ_OBLIQUE_MISS", 0),
+    ] {
+        let mut oblique_source =
+            Mesh::from_positions_and_faces(oblique_positions.clone(), oblique_faces.clone())?;
+        let face_flags = (0..grid_size * grid_size)
+            .map(|index| index == selected)
+            .collect::<Vec<_>>();
+        set_blender_attribute(
+            &mut oblique_source,
+            "freestyle_face",
+            "FACE",
+            "BOOLEAN",
+            json!(face_flags),
+        )?;
+        let mut oblique_operands = BTreeMap::new();
+        oblique_operands.insert(
+            "object".to_owned(),
+            vec![operand(oblique_source, DMat4::IDENTITY, &[], None)],
+        );
+        let mut oblique_destination = Mesh::from_positions_and_faces(
+            oblique_destination_positions.clone(),
+            vec![vec![0, 1, 2, 3]],
+        )?;
+        set_blender_attribute(
+            &mut oblique_destination,
+            "freestyle_face",
+            "FACE",
+            "BOOLEAN",
+            json!([false]),
+        )?;
+        let oblique_transfer = modifier(
+            "data_transfer",
+            json!({
+                "object":"source","use_object_transform":true,"use_poly_data":true,
+                "data_types_polys":["FREESTYLE_FACE"],"poly_mapping":"POLYINTERP_PNORPROJ",
+                "mix_mode":"REPLACE","mix_factor":1.0,"use_max_distance":true,
+                "max_distance":5.0,"ray_radius":0.5
+            }),
+        )?;
+        let oblique_actual = evaluate_with_context(
+            &oblique_destination,
+            &oblique_transfer,
+            &oblique_operands,
+            None,
+            DMat4::IDENTITY,
+            "destination",
+            &AttributeLayerSelection::default(),
+        )?;
+        let values = oblique_actual.attributes["blender_attributes"][0]["values"].clone();
+        assert_eq!(values, expected["face"][label], "oblique {label} flags");
     }
     Ok(())
 }
@@ -1643,11 +2690,14 @@ with open(os.path.join(root,'attribute-domains-oracle.json'),'w') as f: json.dum
 
 #[test]
 fn every_data_transfer_attribute_domain_matches_blender() -> Result<(), Box<dyn Error>> {
-    let Some(blender)=blender_file::blender_executable() else {
-        eprintln!("skipping data-transfer attribute-domain Blender parity test: Blender is unavailable");
+    let Some(blender) = blender_file::blender_executable() else {
+        eprintln!(
+            "skipping data-transfer attribute-domain Blender parity test: Blender is unavailable"
+        );
         return Ok(());
     };
-    let directory=tempdir()?; let root=directory.path();
+    let directory = tempdir()?;
+    let root = directory.path();
     blender_script::run_blender_script(
         &blender,
         "attribute-domains.py",
@@ -1655,59 +2705,142 @@ fn every_data_transfer_attribute_domain_matches_blender() -> Result<(), Box<dyn 
         root,
         "Blender data-transfer attribute-domain oracle failed",
     )?;
-    let expected:Value=serde_json::from_slice(&fs::read(root.join("attribute-domains-oracle.json"))?)?;
-    let positions=vec![DVec3::ZERO,DVec3::X,DVec3::ONE,DVec3::Y];
-    let make_mesh=|| Mesh::from_positions_and_faces(positions.clone(),vec![vec![0,1,2,3]]);
-    let mut source=make_mesh()?;
-    set_domain_attribute(&mut source,"bevel_weight_vert","point","float",json!([0.1,0.3,0.5,0.7]))?;
-    set_domain_attribute(&mut source,"crease_edge","edge","float",json!([0.1,0.3,0.5,0.7]))?;
-    set_domain_attribute(&mut source,"bevel_weight_edge","edge","float",json!([0.2,0.4,0.6,0.8]))?;
-    set_domain_attribute(&mut source,"freestyle_edge","edge","bool",json!([false,true,false,true]))?;
-    set_domain_attribute(&mut source,"freestyle_face","face","bool",json!([true]))?;
-    set_edge_flags(&mut source,"sharp",Some((0,1)));
-    set_edge_flags(&mut source,"seam",Some((1,2)));
-    set_face_flags(&mut source,"shade_smooth",&[true]);
-    let operands=BTreeMap::from([(
+    let expected: Value =
+        serde_json::from_slice(&fs::read(root.join("attribute-domains-oracle.json"))?)?;
+    let positions = vec![DVec3::ZERO, DVec3::X, DVec3::ONE, DVec3::Y];
+    let make_mesh = || Mesh::from_positions_and_faces(positions.clone(), vec![vec![0, 1, 2, 3]]);
+    let mut source = make_mesh()?;
+    set_domain_attribute(
+        &mut source,
+        "bevel_weight_vert",
+        "point",
+        "float",
+        json!([0.1, 0.3, 0.5, 0.7]),
+    )?;
+    set_domain_attribute(
+        &mut source,
+        "crease_edge",
+        "edge",
+        "float",
+        json!([0.1, 0.3, 0.5, 0.7]),
+    )?;
+    set_domain_attribute(
+        &mut source,
+        "bevel_weight_edge",
+        "edge",
+        "float",
+        json!([0.2, 0.4, 0.6, 0.8]),
+    )?;
+    set_domain_attribute(
+        &mut source,
+        "freestyle_edge",
+        "edge",
+        "bool",
+        json!([false, true, false, true]),
+    )?;
+    set_domain_attribute(&mut source, "freestyle_face", "face", "bool", json!([true]))?;
+    set_edge_flags(&mut source, "sharp", Some((0, 1)));
+    set_edge_flags(&mut source, "seam", Some((1, 2)));
+    set_face_flags(&mut source, "shade_smooth", &[true]);
+    let operands = BTreeMap::from([(
         "object".to_owned(),
-        vec![operand(source,DMat4::IDENTITY,&[],None)],
+        vec![operand(source, DMat4::IDENTITY, &[], None)],
     )]);
-    for data_type in ["BEVEL_WEIGHT_VERT","SHARP_EDGE","SEAM","CREASE","BEVEL_WEIGHT_EDGE","FREESTYLE_EDGE","SMOOTH","FREESTYLE_FACE"] {
-        let mut destination=make_mesh()?;
-        set_domain_attribute(&mut destination,"bevel_weight_vert","point","float",json!([0.8,0.6,0.4,0.2]))?;
-        set_domain_attribute(&mut destination,"crease_edge","edge","float",json!([0.0;4]))?;
-        set_domain_attribute(&mut destination,"bevel_weight_edge","edge","float",json!([0.0;4]))?;
-        set_domain_attribute(&mut destination,"freestyle_edge","edge","bool",json!([false;4]))?;
-        set_domain_attribute(&mut destination,"freestyle_face","face","bool",json!([false]))?;
-        set_edge_flags(&mut destination,"sharp",None);
-        set_edge_flags(&mut destination,"seam",None);
-        set_face_flags(&mut destination,"shade_smooth",&[false]);
-        let fields=match data_type {
-            "BEVEL_WEIGHT_VERT" => json!({"use_vert_data":true,"data_types_verts":[data_type],"vert_mapping":"TOPOLOGY"}),
-            "SHARP_EDGE"|"SEAM"|"CREASE"|"BEVEL_WEIGHT_EDGE"|"FREESTYLE_EDGE" =>
-                json!({"use_edge_data":true,"data_types_edges":[data_type],"edge_mapping":"TOPOLOGY"}),
-            _ => json!({"use_poly_data":true,"data_types_polys":[data_type],"poly_mapping":"TOPOLOGY"}),
+    for data_type in [
+        "BEVEL_WEIGHT_VERT",
+        "SHARP_EDGE",
+        "SEAM",
+        "CREASE",
+        "BEVEL_WEIGHT_EDGE",
+        "FREESTYLE_EDGE",
+        "SMOOTH",
+        "FREESTYLE_FACE",
+    ] {
+        let mut destination = make_mesh()?;
+        set_domain_attribute(
+            &mut destination,
+            "bevel_weight_vert",
+            "point",
+            "float",
+            json!([0.8, 0.6, 0.4, 0.2]),
+        )?;
+        set_domain_attribute(
+            &mut destination,
+            "crease_edge",
+            "edge",
+            "float",
+            json!([0.0; 4]),
+        )?;
+        set_domain_attribute(
+            &mut destination,
+            "bevel_weight_edge",
+            "edge",
+            "float",
+            json!([0.0; 4]),
+        )?;
+        set_domain_attribute(
+            &mut destination,
+            "freestyle_edge",
+            "edge",
+            "bool",
+            json!([false; 4]),
+        )?;
+        set_domain_attribute(
+            &mut destination,
+            "freestyle_face",
+            "face",
+            "bool",
+            json!([false]),
+        )?;
+        set_edge_flags(&mut destination, "sharp", None);
+        set_edge_flags(&mut destination, "seam", None);
+        set_face_flags(&mut destination, "shade_smooth", &[false]);
+        let fields = match data_type {
+            "BEVEL_WEIGHT_VERT" => {
+                json!({"use_vert_data":true,"data_types_verts":[data_type],"vert_mapping":"TOPOLOGY"})
+            }
+            "SHARP_EDGE" | "SEAM" | "CREASE" | "BEVEL_WEIGHT_EDGE" | "FREESTYLE_EDGE" => {
+                json!({"use_edge_data":true,"data_types_edges":[data_type],"edge_mapping":"TOPOLOGY"})
+            }
+            _ => {
+                json!({"use_poly_data":true,"data_types_polys":[data_type],"poly_mapping":"TOPOLOGY"})
+            }
         };
-        let mut params=fields.as_object().ok_or("domain fields must be an object")?.clone();
-        params.insert("object".to_owned(),json!("source"));
-        params.insert("mix_mode".to_owned(),json!("REPLACE"));
-        params.insert("mix_factor".to_owned(),json!(1.0));
-        let transfer=modifier("data_transfer",Value::Object(params))?;
-        let actual=evaluate_with_context(&destination, &transfer, &operands, None, DMat4::IDENTITY, "destination", &AttributeLayerSelection::default())?;
-        let actual_values=match data_type {
-            "SHARP_EDGE" => edge_flag_values(&actual,"sharp"),
-            "SEAM" => edge_flag_values(&actual,"seam"),
-            "SMOOTH" => face_flag_values(&actual,"shade_smooth"),
-            "BEVEL_WEIGHT_VERT" => domain_attribute_values(&actual,"bevel_weight_vert"),
-            "CREASE" => domain_attribute_values(&actual,"crease_edge"),
-            "BEVEL_WEIGHT_EDGE" => domain_attribute_values(&actual,"bevel_weight_edge"),
-            "FREESTYLE_EDGE" => domain_attribute_values(&actual,"freestyle_edge"),
-            _ => domain_attribute_values(&actual,"freestyle_face"),
+        let mut params = fields
+            .as_object()
+            .ok_or("domain fields must be an object")?
+            .clone();
+        params.insert("object".to_owned(), json!("source"));
+        params.insert("mix_mode".to_owned(), json!("REPLACE"));
+        params.insert("mix_factor".to_owned(), json!(1.0));
+        let transfer = modifier("data_transfer", Value::Object(params))?;
+        let actual = evaluate_with_context(
+            &destination,
+            &transfer,
+            &operands,
+            None,
+            DMat4::IDENTITY,
+            "destination",
+            &AttributeLayerSelection::default(),
+        )?;
+        let actual_values = match data_type {
+            "SHARP_EDGE" => edge_flag_values(&actual, "sharp"),
+            "SEAM" => edge_flag_values(&actual, "seam"),
+            "SMOOTH" => face_flag_values(&actual, "shade_smooth"),
+            "BEVEL_WEIGHT_VERT" => domain_attribute_values(&actual, "bevel_weight_vert"),
+            "CREASE" => domain_attribute_values(&actual, "crease_edge"),
+            "BEVEL_WEIGHT_EDGE" => domain_attribute_values(&actual, "bevel_weight_edge"),
+            "FREESTYLE_EDGE" => domain_attribute_values(&actual, "freestyle_edge"),
+            _ => domain_attribute_values(&actual, "freestyle_face"),
         };
-        if matches!(data_type,"BEVEL_WEIGHT_VERT"|"CREASE"|"BEVEL_WEIGHT_EDGE") {
-            let error=max_error(&actual_values,&expected[data_type])?;
-            assert!(error<1.0e-6,"{data_type} max error {error}");
+        if matches!(
+            data_type,
+            "BEVEL_WEIGHT_VERT" | "CREASE" | "BEVEL_WEIGHT_EDGE"
+        ) {
+            let error = max_error(&actual_values, &expected[data_type])?;
+            assert!(error < 1.0e-6, "{data_type} max error {error}");
         } else {
-            assert_eq!(actual_values,expected[data_type],"{data_type}");
+            assert_eq!(actual_values, expected[data_type], "{data_type}");
         }
     }
     Ok(())
@@ -1741,11 +2874,14 @@ evaluated.to_mesh_clear()
 
 #[test]
 fn transferred_sharp_edge_separates_derived_corner_normals() -> Result<(), Box<dyn Error>> {
-    let Some(blender)=blender_file::blender_executable() else {
-        eprintln!("skipping transferred-sharp corner-normal Blender parity test: Blender is unavailable");
+    let Some(blender) = blender_file::blender_executable() else {
+        eprintln!(
+            "skipping transferred-sharp corner-normal Blender parity test: Blender is unavailable"
+        );
         return Ok(());
     };
-    let directory=tempdir()?; let root=directory.path();
+    let directory = tempdir()?;
+    let root = directory.path();
     blender_script::run_blender_script(
         &blender,
         "sharp-normal-transfer.py",
@@ -1753,51 +2889,88 @@ fn transferred_sharp_edge_separates_derived_corner_normals() -> Result<(), Box<d
         root,
         "Blender sharp-edge corner-normal oracle failed",
     )?;
-    let expected:Value=serde_json::from_slice(&fs::read(root.join("sharp-normal-oracle.json"))?)?;
-    let positions=vec![DVec3::ZERO,DVec3::X,DVec3::Y,DVec3::Z];
-    let faces=vec![vec![0,1,2],vec![1,0,3]];
-    let mut source=Mesh::from_positions_and_faces(positions.clone(),faces.clone())?;
-    set_edge_flags(&mut source,"sharp",Some((0,1)));
-    set_face_flags(&mut source,"shade_smooth",&[true,true]);
-    let operands=BTreeMap::from([(
+    let expected: Value =
+        serde_json::from_slice(&fs::read(root.join("sharp-normal-oracle.json"))?)?;
+    let positions = vec![DVec3::ZERO, DVec3::X, DVec3::Y, DVec3::Z];
+    let faces = vec![vec![0, 1, 2], vec![1, 0, 3]];
+    let mut source = Mesh::from_positions_and_faces(positions.clone(), faces.clone())?;
+    set_edge_flags(&mut source, "sharp", Some((0, 1)));
+    set_face_flags(&mut source, "shade_smooth", &[true, true]);
+    let operands = BTreeMap::from([(
         "source".to_owned(),
-        vec![operand(source,DMat4::IDENTITY,&[],None)],
+        vec![operand(source, DMat4::IDENTITY, &[], None)],
     )]);
-    let mut destination=Mesh::from_positions_and_faces(positions.clone(),faces)?;
-    set_edge_flags(&mut destination,"sharp",None);
-    set_face_flags(&mut destination,"shade_smooth",&[true,true]);
-    let transfer=modifier(
+    let mut destination = Mesh::from_positions_and_faces(positions.clone(), faces)?;
+    set_edge_flags(&mut destination, "sharp", None);
+    set_face_flags(&mut destination, "shade_smooth", &[true, true]);
+    let transfer = modifier(
         "data_transfer",
         json!({
             "object":"source","use_edge_data":true,"data_types_edges":["SHARP_EDGE"],
             "edge_mapping":"TOPOLOGY","mix_mode":"REPLACE","mix_factor":1.0,
         }),
     )?;
-    let actual=evaluate_with_context(&destination, &transfer, &operands, None, DMat4::IDENTITY, "destination", &AttributeLayerSelection::default())?;
-    let actual_normals=potter_core::geom::corner_normal_vectors(&actual)?;
-    let actual_values=json!(actual_normals.iter().map(|normal| [normal.x,normal.y,normal.z]).collect::<Vec<_>>());
-    let error=max_error(&actual_values,&expected["corner_normals"])?;
-    assert!(error<2.0e-4,"sharp-transfer derived corner-normal max error {error}");
-    let shared_edge=actual.edges.iter().find(|edge|
-        edge.vertices.contains(&actual.vertices[0].id)
-            && edge.vertices.contains(&actual.vertices[1].id))
+    let actual = evaluate_with_context(
+        &destination,
+        &transfer,
+        &operands,
+        None,
+        DMat4::IDENTITY,
+        "destination",
+        &AttributeLayerSelection::default(),
+    )?;
+    let actual_normals = potter_core::geom::corner_normal_vectors(&actual)?;
+    let actual_values = json!(
+        actual_normals
+            .iter()
+            .map(|normal| [normal.x, normal.y, normal.z])
+            .collect::<Vec<_>>()
+    );
+    let error = max_error(&actual_values, &expected["corner_normals"])?;
+    assert!(
+        error < 2.0e-4,
+        "sharp-transfer derived corner-normal max error {error}"
+    );
+    let shared_edge = actual
+        .edges
+        .iter()
+        .find(|edge| {
+            edge.vertices.contains(&actual.vertices[0].id)
+                && edge.vertices.contains(&actual.vertices[1].id)
+        })
         .ok_or("native output has no shared edge")?;
-    let transferred_sharp=actual.attributes.get("sharp")
+    let transferred_sharp = actual
+        .attributes
+        .get("sharp")
         .and_then(|attribute| attribute.get("values"))
         .and_then(Value::as_object)
-        .and_then(|values| values.get(&format!("e{}",shared_edge.id)))
+        .and_then(|values| values.get(&format!("e{}", shared_edge.id)))
         .and_then(Value::as_bool);
-    assert_eq!(transferred_sharp,Some(true),"shared edge should receive transferred sharp state");
-    let normals=expected["corner_normals"].as_array().ok_or("oracle corner normals are missing")?;
-    let normal_at=|index:usize| -> Result<DVec3,Box<dyn Error>> {
-        let row=normals[index].as_array().ok_or("oracle corner normal is not an array")?;
-        Ok(DVec3::new(row[0].as_f64().ok_or("normal x missing")?,
-                      row[1].as_f64().ok_or("normal y missing")?,
-                      row[2].as_f64().ok_or("normal z missing")?))
+    assert_eq!(
+        transferred_sharp,
+        Some(true),
+        "shared edge should receive transferred sharp state"
+    );
+    let normals = expected["corner_normals"]
+        .as_array()
+        .ok_or("oracle corner normals are missing")?;
+    let normal_at = |index: usize| -> Result<DVec3, Box<dyn Error>> {
+        let row = normals[index]
+            .as_array()
+            .ok_or("oracle corner normal is not an array")?;
+        Ok(DVec3::new(
+            row[0].as_f64().ok_or("normal x missing")?,
+            row[1].as_f64().ok_or("normal y missing")?,
+            row[2].as_f64().ok_or("normal z missing")?,
+        ))
     };
-    assert!(normal_at(0)?.dot(normal_at(4)?)<0.99,
-        "the transferred sharp edge must split normals at shared vertex 0");
-    assert!(normal_at(1)?.dot(normal_at(3)?)<0.99,
-        "the transferred sharp edge must split normals at shared vertex 1");
+    assert!(
+        normal_at(0)?.dot(normal_at(4)?) < 0.99,
+        "the transferred sharp edge must split normals at shared vertex 0"
+    );
+    assert!(
+        normal_at(1)?.dot(normal_at(3)?) < 0.99,
+        "the transferred sharp edge must split normals at shared vertex 1"
+    );
     Ok(())
 }

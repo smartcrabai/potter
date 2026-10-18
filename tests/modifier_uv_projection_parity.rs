@@ -5,7 +5,9 @@ use potter_core::{
     error::ErrorCode,
     geom::{
         Mesh,
-        modifiers::attributes::{AttributeLayerSelection, SceneOperand, SceneOperandMatricesF32, evaluate_with_context},
+        modifiers::attributes::{
+            AttributeLayerSelection, SceneOperand, SceneOperandMatricesF32, evaluate_with_context,
+        },
     },
     model::{CameraData, CameraProjection, Id, Modifier, ModifierRuntime},
 };
@@ -289,18 +291,16 @@ fn test_modifier(modifier_type: &str, params: Value) -> Result<Modifier, Box<dyn
         modifier_type: modifier_type.to_owned(),
         name: modifier_type.to_owned(),
         enabled: true,
-        params: params.as_object().ok_or("modifier parameters must be an object")?.clone(),
+        params: params
+            .as_object()
+            .ok_or("modifier parameters must be an object")?
+            .clone(),
         binding_data: None,
         runtime: ModifierRuntime::default(),
     })
 }
 
-fn set_uv_layers(
-    mesh: &mut Mesh,
-    layers: &[(&str, Vec<[f64; 2]>)],
-    active: &str,
-    render: &str,
-) {
+fn set_uv_layers(mesh: &mut Mesh, layers: &[(&str, Vec<[f64; 2]>)], active: &str, render: &str) {
     let stored = layers
         .iter()
         .map(|(name, blender_values)| {
@@ -328,7 +328,6 @@ fn set_uv_layers(
     );
 }
 
-
 fn test_mesh() -> Result<Mesh, Box<dyn Error>> {
     let vertices = vec![
         DVec3::new(0.0, 0.0, 0.0),
@@ -340,14 +339,21 @@ fn test_mesh() -> Result<Mesh, Box<dyn Error>> {
         DVec3::new(3.0, 2.0, 1.0),
         DVec3::new(3.0, 0.0, 1.0),
     ];
-    let mut mesh = Mesh::from_positions_and_faces(vertices, vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7]])?;
+    let mut mesh =
+        Mesh::from_positions_and_faces(vertices, vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7]])?;
     set_uv_layers(
         &mut mesh,
         &[(
             "UVMap",
             vec![
-                [0.1,0.2],[0.8,0.15],[0.9,0.7],[0.25,0.85],
-                [0.5,0.6],[0.2,0.3],[0.4,0.9],[0.7,0.4],
+                [0.1, 0.2],
+                [0.8, 0.15],
+                [0.9, 0.7],
+                [0.25, 0.85],
+                [0.5, 0.6],
+                [0.2, 0.3],
+                [0.4, 0.9],
+                [0.7, 0.4],
             ],
         )],
         "UVMap",
@@ -402,7 +408,9 @@ fn matrix_from_oracle(value: &Value) -> Result<DMat4, Box<dyn Error>> {
     Ok(DMat4::from_cols_array(&columns))
 }
 fn runtime_uv_warp_matrix(value: &Value) -> Result<[[f32; 4]; 4], Box<dyn Error>> {
-    let values = value.as_array().ok_or("Blender UV Warp matrix is not an array")?;
+    let values = value
+        .as_array()
+        .ok_or("Blender UV Warp matrix is not an array")?;
     let flat = values
         .iter()
         .map(|value| {
@@ -437,10 +445,23 @@ fn evaluate_project_case(
         operands.into_iter().map(|(_, value)| value).collect(),
     );
     let modifier = test_modifier("uv_project", params)?;
-    Ok(evaluate_with_context(mesh, &modifier, &map, None, subject_world, "TestObject", &AttributeLayerSelection::default())?)
+    Ok(evaluate_with_context(
+        mesh,
+        &modifier,
+        &map,
+        None,
+        subject_world,
+        "TestObject",
+        &AttributeLayerSelection::default(),
+    )?)
 }
 
-fn assert_uv_parity(name: &str, actual_mesh: &Mesh, expected: &Value, layer_name: &str) -> Result<f64, Box<dyn Error>> {
+fn assert_uv_parity(
+    name: &str,
+    actual_mesh: &Mesh,
+    expected: &Value,
+    layer_name: &str,
+) -> Result<f64, Box<dyn Error>> {
     let layer = actual_mesh
         .attributes
         .get("uv_layers")
@@ -466,12 +487,20 @@ fn assert_uv_parity(name: &str, actual_mesh: &Mesh, expected: &Value, layer_name
             .get("uv")
             .and_then(Value::as_array)
             .ok_or("native canonical UV row missing")?;
-        assert_eq!(values.len(), face.vertices.len(), "{name}: native UV corner count differs");
+        assert_eq!(
+            values.len(),
+            face.vertices.len(),
+            "{name}: native UV corner count differs"
+        );
         for pair in values {
             let pair = pair.as_array().ok_or("native UV pair missing")?;
             actual.push([
-                pair.first().and_then(Value::as_f64).ok_or("native U missing")?,
-                pair.get(1).and_then(Value::as_f64).ok_or("native V missing")?,
+                pair.first()
+                    .and_then(Value::as_f64)
+                    .ok_or("native U missing")?,
+                pair.get(1)
+                    .and_then(Value::as_f64)
+                    .ok_or("native V missing")?,
             ]);
         }
     }
@@ -482,30 +511,53 @@ fn assert_uv_parity(name: &str, actual_mesh: &Mesh, expected: &Value, layer_name
         .map(|pair| {
             let pair = pair.as_array().ok_or("Blender UV pair missing")?;
             Ok::<_, Box<dyn Error>>([
-                pair.first().and_then(Value::as_f64).ok_or("Blender U missing")?,
-                1.0 - pair.get(1).and_then(Value::as_f64).ok_or("Blender V missing")?,
+                pair.first()
+                    .and_then(Value::as_f64)
+                    .ok_or("Blender U missing")?,
+                1.0 - pair
+                    .get(1)
+                    .and_then(Value::as_f64)
+                    .ok_or("Blender V missing")?,
             ])
         })
         .collect::<Result<Vec<_>, _>>()?;
-    assert_eq!(actual.len(), expected.len(), "{name}: per-loop count differs");
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "{name}: per-loop count differs"
+    );
     let max_error = actual
         .iter()
         .zip(&expected)
         .flat_map(|(a, b)| [(a[0] - b[0]).abs(), (a[1] - b[1]).abs()])
         .fold(0.0_f64, f64::max);
-    assert!(max_error <= 3.0e-5, "{name}: max per-loop UV error {max_error}");
+    assert!(
+        max_error <= 3.0e-5,
+        "{name}: max per-loop UV error {max_error}"
+    );
     Ok(max_error)
 }
 
-fn read_oracle(blender: &std::path::Path, script: &str, filename: &str) -> Result<Value, Box<dyn Error>> {
+fn read_oracle(
+    blender: &std::path::Path,
+    script: &str,
+    filename: &str,
+) -> Result<Value, Box<dyn Error>> {
     let directory = tempdir()?;
     let root = fs::canonicalize(directory.path())?;
-    run_blender_script(blender, "modifier_uv_oracle.py", script, &root, "Blender UV oracle failed")?;
+    run_blender_script(
+        blender,
+        "modifier_uv_oracle.py",
+        script,
+        &root,
+        "Blender UV oracle failed",
+    )?;
     Ok(serde_json::from_slice(&fs::read(root.join(filename))?)?)
 }
 
 #[test]
-fn uv_project_matches_blender_camera_modes_aspect_scale_and_projector_list() -> Result<(), Box<dyn Error>> {
+fn uv_project_matches_blender_camera_modes_aspect_scale_and_projector_list()
+-> Result<(), Box<dyn Error>> {
     let Some(blender) = blender_executable() else {
         eprintln!("skipping UV modifier Blender parity test: Blender is unavailable");
         return Ok(());
@@ -520,26 +572,66 @@ fn uv_project_matches_blender_camera_modes_aspect_scale_and_projector_list() -> 
     let cases = [
         (
             "perspective",
-            vec![("persp", persp_world, Some(camera_data(CameraProjection::Perspective,"AUTO",4.1,42.0,[0.12,-0.08])))],
+            vec![(
+                "persp",
+                persp_world,
+                Some(camera_data(
+                    CameraProjection::Perspective,
+                    "AUTO",
+                    4.1,
+                    42.0,
+                    [0.12, -0.08],
+                )),
+            )],
             json!({"projectors":["persp"],"uv_layer":"UVMap","aspect_x":1.7,"aspect_y":1.2,"scale_x":0.8,"scale_y":1.3}),
             "UVMap",
         ),
         (
             "orthographic",
-            vec![("ortho", ortho_world, Some(camera_data(CameraProjection::Orthographic,"VERTICAL",4.1,42.0,[-0.07,0.11])))],
+            vec![(
+                "ortho",
+                ortho_world,
+                Some(camera_data(
+                    CameraProjection::Orthographic,
+                    "VERTICAL",
+                    4.1,
+                    42.0,
+                    [-0.07, 0.11],
+                )),
+            )],
             json!({"projectors":["ortho"],"uv_layer":"UVMap","aspect_x":1.2,"aspect_y":2.0,"scale_x":0.7,"scale_y":1.4}),
             "UVMap",
         ),
         (
             "panorama",
-            vec![("pano", pano_world, Some(camera_data(CameraProjection::Panorama,"AUTO",5.5,42.0,[0.06,-0.09])))],
+            vec![(
+                "pano",
+                pano_world,
+                Some(camera_data(
+                    CameraProjection::Panorama,
+                    "AUTO",
+                    5.5,
+                    42.0,
+                    [0.06, -0.09],
+                )),
+            )],
             json!({"projectors":["pano"],"uv_layer":"UVMap","aspect_x":2.1,"aspect_y":1.2,"scale_x":1.3,"scale_y":0.7}),
             "UVMap",
         ),
         (
             "projector_count_with_null_slot",
             vec![
-                ("pano", pano_world, Some(camera_data(CameraProjection::Panorama,"AUTO",5.5,42.0,[0.06,-0.09]))),
+                (
+                    "pano",
+                    pano_world,
+                    Some(camera_data(
+                        CameraProjection::Panorama,
+                        "AUTO",
+                        5.5,
+                        42.0,
+                        [0.06, -0.09],
+                    )),
+                ),
                 ("plain", plain_world, None),
             ],
             json!({"projectors":["pano",null,"plain"],"projector_count":3,"uv_layer":"UVMap","aspect_x":1.0,"aspect_y":1.0,"scale_x":1.0,"scale_y":1.0}),
@@ -547,7 +639,17 @@ fn uv_project_matches_blender_camera_modes_aspect_scale_and_projector_list() -> 
         ),
         (
             "created_layer",
-            vec![("persp", persp_world, Some(camera_data(CameraProjection::Perspective,"AUTO",4.1,42.0,[0.12,-0.08])))],
+            vec![(
+                "persp",
+                persp_world,
+                Some(camera_data(
+                    CameraProjection::Perspective,
+                    "AUTO",
+                    4.1,
+                    42.0,
+                    [0.12, -0.08],
+                )),
+            )],
             json!({"projectors":["persp"],"uv_layer":"CreatedUV","aspect_x":1.0,"aspect_y":1.0,"scale_x":1.0,"scale_y":1.0}),
             "CreatedUV",
         ),
@@ -596,17 +698,15 @@ fn uv_project_matches_blender_camera_modes_aspect_scale_and_projector_list() -> 
     let angle = 75.0_f64.to_radians();
     let tangent = DVec3::new(angle.cos(), 0.0, -angle.sin());
     let mut scaled_normal_mesh = Mesh::from_positions_and_faces(
-        vec![
-            DVec3::ZERO,
-            tangent,
-            tangent + DVec3::Y,
-            DVec3::Y,
-        ],
+        vec![DVec3::ZERO, tangent, tangent + DVec3::Y, DVec3::Y],
         vec![vec![0, 1, 2, 3]],
     )?;
     set_uv_layers(
         &mut scaled_normal_mesh,
-        &[("UVMap", vec![[0.1,0.2],[0.8,0.15],[0.9,0.7],[0.25,0.85]])],
+        &[(
+            "UVMap",
+            vec![[0.1, 0.2], [0.8, 0.15], [0.9, 0.7], [0.25, 0.85]],
+        )],
         "UVMap",
         "UVMap",
     );
@@ -631,7 +731,8 @@ fn uv_project_matches_blender_camera_modes_aspect_scale_and_projector_list() -> 
 }
 
 #[test]
-fn uv_warp_matches_blender_object_bone_group_and_axis_cases_per_loop() -> Result<(), Box<dyn Error>> {
+fn uv_warp_matches_blender_object_bone_group_and_axis_cases_per_loop() -> Result<(), Box<dyn Error>>
+{
     let Some(blender) = blender_executable() else {
         eprintln!("skipping UV modifier Blender parity test: Blender is unavailable");
         return Ok(());
@@ -643,37 +744,76 @@ fn uv_warp_matches_blender_object_bone_group_and_axis_cases_per_loop() -> Result
     let arm_world = matrix_from_oracle(&expected["matrices"]["armature"])?;
     let mesh = {
         let mut mesh = Mesh::from_positions_and_faces(
-            vec![DVec3::ZERO,DVec3::new(2.0,0.0,0.0),DVec3::new(2.0,1.0,0.5),DVec3::new(0.0,1.0,0.0),DVec3::new(1.0,2.0,-0.3)],
-            vec![vec![0,1,2,3],vec![0,3,4]],
+            vec![
+                DVec3::ZERO,
+                DVec3::new(2.0, 0.0, 0.0),
+                DVec3::new(2.0, 1.0, 0.5),
+                DVec3::new(0.0, 1.0, 0.0),
+                DVec3::new(1.0, 2.0, -0.3),
+            ],
+            vec![vec![0, 1, 2, 3], vec![0, 3, 4]],
         )?;
         set_uv_layers(
             &mut mesh,
-            &[("UVMap", vec![
-                [0.1,0.2],[0.8,0.15],[0.9,0.7],[0.25,0.85],
-                [0.5,0.6],[0.2,0.3],[0.4,0.9],
-            ])],
+            &[(
+                "UVMap",
+                vec![
+                    [0.1, 0.2],
+                    [0.8, 0.15],
+                    [0.9, 0.7],
+                    [0.25, 0.85],
+                    [0.5, 0.6],
+                    [0.2, 0.3],
+                    [0.4, 0.9],
+                ],
+            )],
             "UVMap",
             "UVMap",
         );
-        mesh.attributes.insert("vertex_groups".to_owned(), json!({"W":{"v0":0.0,"v1":0.25,"v2":0.5,"v3":0.75,"v4":1.0}}));
+        mesh.attributes.insert(
+            "vertex_groups".to_owned(),
+            json!({"W":{"v0":0.0,"v1":0.25,"v2":0.5,"v3":0.75,"v4":1.0}}),
+        );
         mesh
     };
     let base_params = json!({"center":[0.3,-0.2],"offset":[0.1,0.4],"scale":[1.5,0.7],"rotation":0.6,"axis_u":"X","axis_v":"Y","uv_layer":"UVMap"});
     let mut cases = Vec::new();
-    cases.push(("transform_only", base_params.clone(), BTreeMap::new(), None, None));
+    cases.push((
+        "transform_only",
+        base_params.clone(),
+        BTreeMap::new(),
+        None,
+        None,
+    ));
     for (name, vgroup, invert, expected_key) in [
-        ("object_pair",None,false,"object_pair"),
-        ("object_group",Some("W"),false,"object_group"),
-        ("object_group_inverted",Some("W"),true,"object_group_inverted"),
+        ("object_pair", None, false, "object_pair"),
+        ("object_group", Some("W"), false, "object_group"),
+        (
+            "object_group_inverted",
+            Some("W"),
+            true,
+            "object_group_inverted",
+        ),
     ] {
-        let mut params = base_params.as_object().ok_or("base UV Warp parameters are invalid")?.clone();
+        let mut params = base_params
+            .as_object()
+            .ok_or("base UV Warp parameters are invalid")?
+            .clone();
         params.insert("object_from".to_owned(), json!("source"));
         params.insert("object_to".to_owned(), json!("destination"));
-        if let Some(group) = vgroup { params.insert("vertex_group".to_owned(), json!(group)); }
+        if let Some(group) = vgroup {
+            params.insert("vertex_group".to_owned(), json!(group));
+        }
         params.insert("invert_vertex_group".to_owned(), json!(invert));
         let mut operands = BTreeMap::new();
-        operands.insert("object_from".to_owned(), vec![operand(source_world, None, false)]);
-        operands.insert("object_to".to_owned(), vec![operand(dest_world, None, false)]);
+        operands.insert(
+            "object_from".to_owned(),
+            vec![operand(source_world, None, false)],
+        );
+        operands.insert(
+            "object_to".to_owned(),
+            vec![operand(dest_world, None, false)],
+        );
         cases.push((expected_key, Value::Object(params), operands, None, None));
         let _ = name;
     }
@@ -691,7 +831,10 @@ fn uv_warp_matches_blender_object_bone_group_and_axis_cases_per_loop() -> Result
         vec![operand(dest_world, None, false)],
     );
     for (name, invert) in [("empty_group", false), ("empty_group_inverted", true)] {
-        let mut params = base_params.as_object().ok_or("base UV Warp parameters are invalid")?.clone();
+        let mut params = base_params
+            .as_object()
+            .ok_or("base UV Warp parameters are invalid")?
+            .clone();
         params.insert("object_from".to_owned(), json!("source"));
         params.insert("object_to".to_owned(), json!("destination"));
         params.insert("vertex_group".to_owned(), json!("W"));
@@ -709,38 +852,90 @@ fn uv_warp_matches_blender_object_bone_group_and_axis_cases_per_loop() -> Result
     set_uv_layers(
         &mut alt_mesh,
         &[
-            ("UVMap", vec![
-                [0.1,0.2],[0.8,0.15],[0.9,0.7],[0.25,0.85],
-                [0.5,0.6],[0.2,0.3],[0.4,0.9],
-            ]),
-            ("Secondary", vec![
-                [0.13,-0.06],[0.34,-0.095],[0.37,0.29],[0.175,0.395],
-                [0.25,0.22],[0.16,0.01],[0.22,0.43],
-            ]),
+            (
+                "UVMap",
+                vec![
+                    [0.1, 0.2],
+                    [0.8, 0.15],
+                    [0.9, 0.7],
+                    [0.25, 0.85],
+                    [0.5, 0.6],
+                    [0.2, 0.3],
+                    [0.4, 0.9],
+                ],
+            ),
+            (
+                "Secondary",
+                vec![
+                    [0.13, -0.06],
+                    [0.34, -0.095],
+                    [0.37, 0.29],
+                    [0.175, 0.395],
+                    [0.25, 0.22],
+                    [0.16, 0.01],
+                    [0.22, 0.43],
+                ],
+            ),
         ],
         "UVMap",
         "UVMap",
     );
     let mut alt_operands = BTreeMap::new();
-    alt_operands.insert("object_from".to_owned(), vec![operand(source_world, None, false)]);
-    alt_operands.insert("object_to".to_owned(), vec![operand(dest_world, None, false)]);
-    cases.push(("axes_and_named_layer", alt_params, alt_operands, Some(alt_mesh), Some("Secondary")));
+    alt_operands.insert(
+        "object_from".to_owned(),
+        vec![operand(source_world, None, false)],
+    );
+    alt_operands.insert(
+        "object_to".to_owned(),
+        vec![operand(dest_world, None, false)],
+    );
+    cases.push((
+        "axes_and_named_layer",
+        alt_params,
+        alt_operands,
+        Some(alt_mesh),
+        Some("Secondary"),
+    ));
     let mut active_layer_mesh = mesh.clone();
     set_uv_layers(
         &mut active_layer_mesh,
         &[
-            ("UVMap", vec![
-                [0.1,0.2],[0.8,0.15],[0.9,0.7],[0.25,0.85],
-                [0.5,0.6],[0.2,0.3],[0.4,0.9],
-            ]),
-            ("Secondary", vec![
-                [0.13,-0.06],[0.34,-0.095],[0.37,0.29],[0.175,0.395],
-                [0.25,0.22],[0.16,0.01],[0.22,0.43],
-            ]),
-            ("RenderOnly", vec![
-                [0.91,0.02],[0.82,0.04],[0.73,0.06],[0.64,0.08],
-                [0.55,0.10],[0.46,0.12],[0.37,0.14],
-            ]),
+            (
+                "UVMap",
+                vec![
+                    [0.1, 0.2],
+                    [0.8, 0.15],
+                    [0.9, 0.7],
+                    [0.25, 0.85],
+                    [0.5, 0.6],
+                    [0.2, 0.3],
+                    [0.4, 0.9],
+                ],
+            ),
+            (
+                "Secondary",
+                vec![
+                    [0.13, -0.06],
+                    [0.34, -0.095],
+                    [0.37, 0.29],
+                    [0.175, 0.395],
+                    [0.25, 0.22],
+                    [0.16, 0.01],
+                    [0.22, 0.43],
+                ],
+            ),
+            (
+                "RenderOnly",
+                vec![
+                    [0.91, 0.02],
+                    [0.82, 0.04],
+                    [0.73, 0.06],
+                    [0.64, 0.08],
+                    [0.55, 0.10],
+                    [0.46, 0.12],
+                    [0.37, 0.14],
+                ],
+            ),
         ],
         "Secondary",
         "RenderOnly",
@@ -749,69 +944,151 @@ fn uv_warp_matches_blender_object_bone_group_and_axis_cases_per_loop() -> Result
         ("active_layer_empty_selector", ""),
         ("active_layer_missing_selector", "Missing"),
     ] {
-        let mut params = base_params.as_object().ok_or("base UV Warp parameters are invalid")?.clone();
+        let mut params = base_params
+            .as_object()
+            .ok_or("base UV Warp parameters are invalid")?
+            .clone();
         params.insert("uv_layer".to_owned(), json!(selector));
         let mut modifier = test_modifier("uv_warp", Value::Object(params))?;
-        modifier.runtime.uv_warp_matrix = Some(runtime_uv_warp_matrix(
-            &expected["warp_matrices"][name],
-        )?);
-        let result = evaluate_with_context(&active_layer_mesh, &modifier, &BTreeMap::new(), None, subject_world, "TestObject", &AttributeLayerSelection::default())?;
+        modifier.runtime.uv_warp_matrix =
+            Some(runtime_uv_warp_matrix(&expected["warp_matrices"][name])?);
+        let result = evaluate_with_context(
+            &active_layer_mesh,
+            &modifier,
+            &BTreeMap::new(),
+            None,
+            subject_world,
+            "TestObject",
+            &AttributeLayerSelection::default(),
+        )?;
         for layer in ["UVMap", "Secondary", "RenderOnly"] {
             assert_uv_parity(name, &result, &expected[name][layer], layer)?;
         }
     }
 
     let mut bone_operands = BTreeMap::new();
-    bone_operands.insert("object_from".to_owned(), vec![operand(arm_world, None, true)]);
+    bone_operands.insert(
+        "object_from".to_owned(),
+        vec![operand(arm_world, None, true)],
+    );
     bone_operands.insert("object_to".to_owned(), vec![operand(arm_world, None, true)]);
-    let mut bone_params = base_params.as_object().ok_or("base UV Warp parameters are invalid")?.clone();
+    let mut bone_params = base_params
+        .as_object()
+        .ok_or("base UV Warp parameters are invalid")?
+        .clone();
     bone_params.insert("object_from".to_owned(), json!("armature"));
     bone_params.insert("object_to".to_owned(), json!("armature"));
     bone_params.insert("bone_from".to_owned(), json!("BoneA"));
     bone_params.insert("bone_to".to_owned(), json!("BoneB"));
-    cases.push(("bone_pair", Value::Object(bone_params), bone_operands.clone(), None, None));
-    let mut missing_from_params = base_params.as_object().ok_or("base UV Warp parameters are invalid")?.clone();
+    cases.push((
+        "bone_pair",
+        Value::Object(bone_params),
+        bone_operands.clone(),
+        None,
+        None,
+    ));
+    let mut missing_from_params = base_params
+        .as_object()
+        .ok_or("base UV Warp parameters are invalid")?
+        .clone();
     missing_from_params.insert("object_from".to_owned(), json!("armature"));
     missing_from_params.insert("object_to".to_owned(), json!("destination"));
     missing_from_params.insert("bone_from".to_owned(), json!("Missing"));
     let mut missing_from_operands = BTreeMap::new();
-    missing_from_operands.insert("object_from".to_owned(), vec![operand(arm_world, None, true)]);
-    missing_from_operands.insert("object_to".to_owned(), vec![operand(dest_world, None, false)]);
-    cases.push(("bone_from_missing", Value::Object(missing_from_params), missing_from_operands.clone(), None, None));
+    missing_from_operands.insert(
+        "object_from".to_owned(),
+        vec![operand(arm_world, None, true)],
+    );
+    missing_from_operands.insert(
+        "object_to".to_owned(),
+        vec![operand(dest_world, None, false)],
+    );
+    cases.push((
+        "bone_from_missing",
+        Value::Object(missing_from_params),
+        missing_from_operands.clone(),
+        None,
+        None,
+    ));
 
-    let mut missing_to_params = base_params.as_object().ok_or("base UV Warp parameters are invalid")?.clone();
+    let mut missing_to_params = base_params
+        .as_object()
+        .ok_or("base UV Warp parameters are invalid")?
+        .clone();
     missing_to_params.insert("object_from".to_owned(), json!("source"));
     missing_to_params.insert("object_to".to_owned(), json!("armature"));
     missing_to_params.insert("bone_to".to_owned(), json!("Missing"));
     let mut missing_to_operands = BTreeMap::new();
-    missing_to_operands.insert("object_from".to_owned(), vec![operand(source_world, None, false)]);
+    missing_to_operands.insert(
+        "object_from".to_owned(),
+        vec![operand(source_world, None, false)],
+    );
     missing_to_operands.insert("object_to".to_owned(), vec![operand(arm_world, None, true)]);
-    cases.push(("bone_to_missing", Value::Object(missing_to_params), missing_to_operands, None, None));
+    cases.push((
+        "bone_to_missing",
+        Value::Object(missing_to_params),
+        missing_to_operands,
+        None,
+        None,
+    ));
 
-    let mut empty_bone_params = base_params.as_object().ok_or("base UV Warp parameters are invalid")?.clone();
+    let mut empty_bone_params = base_params
+        .as_object()
+        .ok_or("base UV Warp parameters are invalid")?
+        .clone();
     empty_bone_params.insert("object_from".to_owned(), json!("armature"));
     empty_bone_params.insert("object_to".to_owned(), json!("destination"));
     empty_bone_params.insert("bone_from".to_owned(), json!(""));
-    cases.push(("bone_from_empty", Value::Object(empty_bone_params), missing_from_operands.clone(), None, None));
+    cases.push((
+        "bone_from_empty",
+        Value::Object(empty_bone_params),
+        missing_from_operands.clone(),
+        None,
+        None,
+    ));
     let mut bone_alt_params = json!({"center":[0.1,0.25],"offset":[-0.2,0.15],"scale":[0.6,1.4],"rotation":-0.8,"axis_u":"Y","axis_v":"Z","uv_layer":"UVMap","object_from":"armature","object_to":"armature","bone_from":"BoneA","bone_to":"BoneB"});
-    cases.push(("bone_pair_axes", bone_alt_params.take(), bone_operands.clone(), None, None));
+    cases.push((
+        "bone_pair_axes",
+        bone_alt_params.take(),
+        bone_operands.clone(),
+        None,
+        None,
+    ));
 
     for (name, params, operands, test_mesh_override, layer_override) in cases {
         let subject_mesh = test_mesh_override.as_ref().unwrap_or(&mesh);
         let layer = layer_override.unwrap_or("UVMap");
         let mut modifier = test_modifier("uv_warp", params)?;
-        modifier.runtime.uv_warp_matrix = Some(runtime_uv_warp_matrix(
-            &expected["warp_matrices"][name],
-        )?);
-        let result = evaluate_with_context(subject_mesh, &modifier, &operands, None, subject_world, "TestObject", &AttributeLayerSelection::default())?;
+        modifier.runtime.uv_warp_matrix =
+            Some(runtime_uv_warp_matrix(&expected["warp_matrices"][name])?);
+        let result = evaluate_with_context(
+            subject_mesh,
+            &modifier,
+            &operands,
+            None,
+            subject_world,
+            "TestObject",
+            &AttributeLayerSelection::default(),
+        )?;
         assert_uv_parity(name, &result, &expected[name], layer)?;
     }
-    let mut missing_runtime_params = base_params.as_object().ok_or("base UV Warp parameters are invalid")?.clone();
+    let mut missing_runtime_params = base_params
+        .as_object()
+        .ok_or("base UV Warp parameters are invalid")?
+        .clone();
     missing_runtime_params.insert("object_from".to_owned(), json!("armature"));
     missing_runtime_params.insert("object_to".to_owned(), json!("armature"));
     missing_runtime_params.insert("bone_from".to_owned(), json!("BoneA"));
     missing_runtime_params.insert("bone_to".to_owned(), json!("BoneB"));
-    let error = evaluate_with_context(&mesh, &test_modifier("uv_warp", Value::Object(missing_runtime_params))?, &bone_operands, None, subject_world, "TestObject", &AttributeLayerSelection::default())
+    let error = evaluate_with_context(
+        &mesh,
+        &test_modifier("uv_warp", Value::Object(missing_runtime_params))?,
+        &bone_operands,
+        None,
+        subject_world,
+        "TestObject",
+        &AttributeLayerSelection::default(),
+    )
     .err()
     .ok_or("UV Warp accepted missing resolved bone matrices")?;
     assert_eq!(error.code, ErrorCode::EvaluationFailed);
@@ -828,7 +1105,11 @@ fn cli_apply_inspect_runs_uv_project_uv_warp_and_mask() -> Result<(), Box<dyn Er
         .arg(&scene)
         .arg("--json")
         .output()?;
-    assert!(init.status.success(), "{}", String::from_utf8_lossy(&init.stdout));
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stdout)
+    );
     let operations = json!({
         "schema_version":1,
         "base_revision":0,
@@ -863,13 +1144,21 @@ fn cli_apply_inspect_runs_uv_project_uv_warp_and_mask() -> Result<(), Box<dyn Er
         .arg(&batch)
         .arg("--json")
         .output()?;
-    assert!(applied.status.success(), "{}", String::from_utf8_lossy(&applied.stdout));
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stdout)
+    );
     let inspected = Command::new(env!("CARGO_BIN_EXE_pot"))
         .args(["inspect"])
         .arg(&scene)
-        .args(["--id","body","--json"])
+        .args(["--id", "body", "--json"])
         .output()?;
-    assert!(inspected.status.success(), "{}", String::from_utf8_lossy(&inspected.stdout));
+    assert!(
+        inspected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inspected.stdout)
+    );
     let envelope: Value = serde_json::from_slice(&inspected.stdout)?;
     let geometry = &envelope["result"]["items"][0]["evaluated_geometry"];
     assert_eq!(geometry["vertex_count"], 3);

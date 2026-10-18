@@ -1659,22 +1659,18 @@ pub(super) fn mask(
         .get("vertex_groups")
         .and_then(Value::as_object);
     let has_deform_weights = groups.is_some_and(|groups| {
-        groups
-            .values()
-            .any(|weights| weights.as_object().is_some_and(|weights| !weights.is_empty()))
+        groups.values().any(|weights| {
+            weights
+                .as_object()
+                .is_some_and(|weights| !weights.is_empty())
+        })
     });
     let invert = bool_param(modifier, "invert_vertex_group")?;
     let Some(groups) = groups.filter(|_| has_deform_weights) else {
         return if invert {
             Ok(mesh.clone())
         } else {
-            build_mesh(
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                &Origin::default(),
-                mesh,
-            )
+            build_mesh(Vec::new(), Vec::new(), Vec::new(), &Origin::default(), mesh)
         };
     };
 
@@ -1702,9 +1698,7 @@ pub(super) fn mask(
                 .iter()
                 .filter(|(name, _)| armature.selected_bones.contains(*name))
                 .filter_map(|(name, value)| {
-                    value
-                        .as_object()
-                        .map(|weights| (name.as_str(), weights))
+                    value.as_object().map(|weights| (name.as_str(), weights))
                 })
                 .collect()
         }
@@ -1802,7 +1796,10 @@ pub(super) fn mask(
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let face_selected = indices.iter().map(|index| selected[*index]).collect::<Vec<_>>();
+        let face_selected = indices
+            .iter()
+            .map(|index| selected[*index])
+            .collect::<Vec<_>>();
         if face_selected.iter().all(|value| *value) {
             let output = indices.iter().map(|index| vertex_map[*index]).collect();
             polygons.push((output, face.material_index));
@@ -1816,10 +1813,13 @@ pub(super) fn mask(
             continue;
         }
 
-        let start = face_selected
-            .iter()
-            .position(|value| !*value)
-            .expect("a partially selected face has an unselected corner");
+        let Some(start) = face_selected.iter().position(|value| !*value) else {
+            return Err(invalid_parameter(
+                modifier,
+                "mesh",
+                "faces referencing existing vertices",
+            ));
+        };
         let mut fragment = Vec::<(usize, Vec<(usize, f64)>)>::new();
         for step in 1..=indices.len() {
             let previous = (start + step - 1) % indices.len();

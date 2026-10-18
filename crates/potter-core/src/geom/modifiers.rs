@@ -83,8 +83,8 @@ pub struct ModifierEvaluation {
 ///
 /// Returns `UNSUPPORTED_FEATURE` for an unsupported modifier type, or `INVALID_ARGUMENT`
 /// when a supported modifier has invalid parameters or input.
-pub fn evaluate_modifiers(mesh: &Mesh, modifiers: &[Modifier]) -> Result<Mesh> {
-    Ok(evaluate_modifiers_with_groups(mesh, modifiers, &BTreeMap::new())?.mesh)
+pub fn evaluate_modifiers(mesh: &Mesh, modifiers: &[Modifier], subject_name: &str) -> Result<Mesh> {
+    Ok(evaluate_modifiers_with_groups(mesh, modifiers, &BTreeMap::new(), subject_name)?.mesh)
 }
 
 /// Evaluate modifiers with scene geometry-node groups and ordered custom callbacks.
@@ -101,6 +101,7 @@ pub fn evaluate_modifiers_with_groups_and_custom(
     evaluated: Mesh,
     modifiers: &[Modifier],
     node_groups: &Registry<NodeGroup>,
+    subject_name: &str,
     custom_modifier: impl FnMut(&mut Mesh, &Modifier, &mut Vec<PotError>) -> Result<()>,
 ) -> Result<ModifierEvaluation> {
     evaluate_modifiers_with_groups_and_custom_at_frame(
@@ -108,6 +109,7 @@ pub fn evaluate_modifiers_with_groups_and_custom(
         modifiers,
         node_groups,
         1.0,
+        subject_name,
         custom_modifier,
     )
 }
@@ -123,6 +125,7 @@ pub fn evaluate_modifiers_with_groups_and_custom_at_frame(
     modifiers: &[Modifier],
     node_groups: &Registry<NodeGroup>,
     frame: f64,
+    subject_name: &str,
     custom_modifier: impl FnMut(&mut Mesh, &Modifier, &mut Vec<PotError>) -> Result<()>,
 ) -> Result<ModifierEvaluation> {
     evaluate_modifiers_with_scene_context(
@@ -130,6 +133,7 @@ pub fn evaluate_modifiers_with_groups_and_custom_at_frame(
         modifiers,
         node_groups,
         frame,
+        subject_name,
         DMat4::IDENTITY,
         &BTreeMap::new(),
         &BTreeMap::new(),
@@ -146,6 +150,7 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
     modifiers: &[Modifier],
     node_groups: &Registry<NodeGroup>,
     frame: f64,
+    subject_name: &str,
     owner_world_matrix: DMat4,
     object_world_matrices: &BTreeMap<Id, DMat4>,
     object_meshes: &BTreeMap<Id, &Mesh>,
@@ -155,6 +160,11 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
     is_active: impl Fn(usize, &Modifier) -> bool,
     mut custom_modifier: impl FnMut(&mut Mesh, &Modifier, &mut Vec<PotError>) -> Result<()>,
 ) -> Result<ModifierEvaluation> {
+    if subject_name.is_empty() {
+        return Err(PotError::invalid_argument(
+            "modifier evaluation requires a subject name",
+        ));
+    }
     if !frame.is_finite() {
         return Err(PotError::invalid_argument(
             "modifier evaluation frame must be finite",
@@ -201,7 +211,13 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
             ) && modifier
                 .params
                 .get("mask_texture")
-                .is_some_and(|value| !value.is_null()));
+                .is_some_and(|value| !value.is_null()))
+            || (modifier.modifier_type == "mask"
+                && modifier.params.get("mode").and_then(Value::as_str) == Some("ARMATURE")
+                && modifier
+                    .params
+                    .get("armature")
+                    .is_some_and(Value::is_string));
         if modifier.modifier_type == "armature"
             || modifier.modifier_type == "lattice"
             || matches!(
@@ -314,13 +330,13 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
             | "normal_edit"
             | "uv_project"
             | "uv_warp"
-            | "data_transfer" => attributes::evaluate(&evaluated, modifier)?,
+            | "data_transfer"
+            | "mask" => attributes::evaluate(&evaluated, modifier, subject_name)?,
             "laplacian_smooth" => advanced::laplacian_smooth(&evaluated, modifier)?,
             "laplacian_deform" => deform::laplacian_deform(&evaluated, modifier)?,
             "corrective_smooth" => advanced::corrective_smooth(&evaluated, modifier)?,
             "build" => advanced::build(&evaluated, modifier, frame)?,
             "edge_split" => advanced::edge_split(&evaluated, modifier)?,
-            "mask" => advanced::mask(&evaluated, modifier)?,
             "wireframe" => advanced::wireframe(&evaluated, modifier)?,
             "boolean" => boolean_modifier(&evaluated, modifier)?,
             "mesh_deform" => deform::mesh_deform(&evaluated, modifier)?,
@@ -352,8 +368,9 @@ pub fn evaluate_modifiers_with_groups(
     mesh: &Mesh,
     modifiers: &[Modifier],
     node_groups: &Registry<NodeGroup>,
+    subject_name: &str,
 ) -> Result<ModifierEvaluation> {
-    evaluate_modifiers_with_groups_at_frame(mesh, modifiers, node_groups, 1.0)
+    evaluate_modifiers_with_groups_at_frame(mesh, modifiers, node_groups, 1.0, subject_name)
 }
 
 /// Evaluate the enabled modifier stack using the requested scene frame.
@@ -367,12 +384,14 @@ pub fn evaluate_modifiers_with_groups_at_frame(
     modifiers: &[Modifier],
     node_groups: &Registry<NodeGroup>,
     frame: f64,
+    subject_name: &str,
 ) -> Result<ModifierEvaluation> {
     evaluate_modifiers_with_groups_and_custom_at_frame(
         mesh.clone(),
         modifiers,
         node_groups,
         frame,
+        subject_name,
         |_, modifier, _warnings| Err(unsupported_modifier(modifier)),
     )
 }
@@ -5443,14 +5462,14 @@ mod tests {
             size: DVec3::splat(2.0),
         })
         .unwrap();
-        let evaluated = evaluate_modifiers(&mesh, &[modifier(false, "unknown")]).unwrap();
+        let evaluated = evaluate_modifiers(&mesh, &[modifier(false, "unknown")], "Cube").unwrap();
         assert_eq!(evaluated, mesh);
     }
 
     #[test]
     fn unknown_enabled_modifiers_report_the_feature_id() {
         let mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
-        let error = evaluate_modifiers(&mesh, &[modifier(true, "unknown")]).unwrap_err();
+        let error = evaluate_modifiers(&mesh, &[modifier(true, "unknown")], "Cube").unwrap_err();
         assert_eq!(error.code, ErrorCode::UnsupportedFeature);
         assert_eq!(error.details["feature_id"], "modifier.unknown");
     }
@@ -5465,7 +5484,7 @@ mod tests {
             "array",
             json!({"count": 3, "use_relative_offset": true, "relative_offset_displace": [1.0, 0.0, 0.0], "use_constant_offset": true, "constant_offset_displace": [0.0, 1.0, 0.0]}),
         );
-        let result = evaluate_modifiers(&mesh, &[modifier]).unwrap();
+        let result = evaluate_modifiers(&mesh, &[modifier], "Cube").unwrap();
         assert_eq!(result.vertices.len(), 24);
         let bounds = result.bounds().unwrap();
         assert_eq!(bounds.min, DVec3::new(-1.0, -2.0, -3.0));
@@ -5497,7 +5516,7 @@ mod tests {
             }),
         );
 
-        let result = evaluate_modifiers(&mesh, &[modifier]).unwrap();
+        let result = evaluate_modifiers(&mesh, &[modifier], "Cube").unwrap();
 
         let layers = uv_layers::read_layers(&result);
         assert_eq!(layers.len(), 1);
@@ -5546,7 +5565,7 @@ mod tests {
             "mirror",
             json!({"use_axis": [true, false, false], "use_mirror_merge": false}),
         );
-        let out = evaluate_modifiers(&mesh, &[warp, mirror]).unwrap();
+        let out = evaluate_modifiers(&mesh, &[warp, mirror], "Cube").unwrap();
         let warped: [[f64; 2]; 4] = [[0.6, 0.2], [0.8, 0.2], [0.8, 0.4], [0.6, 0.4]];
         let is_warped = |uv: &[f64; 2]| {
             warped
@@ -5597,6 +5616,7 @@ mod tests {
                 "mirror",
                 json!({"use_axis": [true, false, false], "use_mirror_merge": true}),
             )],
+            "Cube",
         )
         .unwrap();
         assert_eq!(result.vertices.len(), 8);
@@ -5614,6 +5634,7 @@ mod tests {
                 "mirror",
                 json!({"use_axis": [true, false, false], "use_mirror_merge": true}),
             )],
+            "Cube",
         )
         .unwrap();
         assert_eq!(mirrored.vertices.len(), 3);
@@ -5682,7 +5703,8 @@ mod tests {
         )
         .unwrap();
 
-        let result = evaluate_modifiers(&mesh, &[with_params("triangulate", json!({}))]).unwrap();
+        let result =
+            evaluate_modifiers(&mesh, &[with_params("triangulate", json!({}))], "Cube").unwrap();
         let points = positions_by_id(&result);
         let sharp = crate::geom::normals::sharp_edge_flags(&result).unwrap();
         let bottom_edges = result
@@ -5788,6 +5810,7 @@ mod tests {
                 "mirror",
                 json!({"use_axis": [true, false, false], "use_mirror_merge": false}),
             )],
+            "Cube",
         )
         .unwrap();
         let result_points = positions_by_id(&result);
@@ -5849,6 +5872,7 @@ mod tests {
                 "triangulate",
                 json!({"keep_custom_normals": true}),
             )],
+            "Cube",
         )
         .unwrap();
         assert!(result.attributes.contains_key("custom_normal"));
@@ -5858,6 +5882,7 @@ mod tests {
                 "triangulate",
                 json!({"keep_custom_normals": false}),
             )],
+            "Cube",
         )
         .unwrap();
         assert!(!without.attributes.contains_key("custom_normal"));
@@ -5897,7 +5922,8 @@ mod tests {
         };
         // Three steps close the full turn into three distinct rings.
         let plain = normals_by_corners(
-            &evaluate_modifiers(&mesh, &[with_params("screw", json!({"steps": 3}))]).unwrap(),
+            &evaluate_modifiers(&mesh, &[with_params("screw", json!({"steps": 3}))], "Cube")
+                .unwrap(),
         );
         let flipped = normals_by_corners(
             &evaluate_modifiers(
@@ -5906,6 +5932,7 @@ mod tests {
                     "screw",
                     json!({"steps": 3, "use_normal_flip": true}),
                 )],
+                "Cube",
             )
             .unwrap(),
         );
@@ -5942,6 +5969,7 @@ mod tests {
                 "mirror",
                 json!({"use_axis": [true, false, false], "use_bisect_axis": [true, false, false]}),
             )],
+            "Cube",
         )
         .unwrap_err();
         assert_eq!(refused_feature(&error), Some("modifier.mirror.bisect"));
@@ -5951,6 +5979,7 @@ mod tests {
                 "mirror",
                 json!({"use_axis": [true, false, false], "use_bisect_axis": [false, true, false]}),
             )],
+            "Cube",
         )
         .unwrap();
 
@@ -5968,6 +5997,7 @@ mod tests {
                 "bevel",
                 json!({"width": 0.1, "mark_seam": true}),
             )],
+            "Cube",
         )
         .unwrap_err();
         assert_eq!(refused_feature(&error), Some("modifier.bevel.mark_seam"));
@@ -5977,6 +6007,7 @@ mod tests {
                 "bevel",
                 json!({"width": 0.1, "mark_seam": true}),
             )],
+            "Cube",
         )
         .unwrap();
 
@@ -5986,6 +6017,7 @@ mod tests {
                 "bevel",
                 json!({"width": 0.1, "segments": 2, "harden_normals": true}),
             )],
+            "Cube",
         )
         .unwrap_err();
         assert_eq!(
@@ -5998,6 +6030,7 @@ mod tests {
                 "bevel",
                 json!({"width": 0.1, "segments": 2, "mark_sharp": true}),
             )],
+            "Cube",
         )
         .unwrap();
 
@@ -6013,6 +6046,7 @@ mod tests {
                 "bevel",
                 json!({"width": 0.1, "segments": 2, "mark_sharp": true}),
             )],
+            "Cube",
         )
         .unwrap_err();
         assert_eq!(
@@ -6024,8 +6058,12 @@ mod tests {
     #[test]
     fn bevel_creates_inset_faces_and_valid_chamfer_topology() {
         let mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
-        let result =
-            evaluate_modifiers(&mesh, &[with_params("bevel", json!({"width": 0.1}))]).unwrap();
+        let result = evaluate_modifiers(
+            &mesh,
+            &[with_params("bevel", json!({"width": 0.1}))],
+            "Cube",
+        )
+        .unwrap();
         assert_eq!(result.faces.len(), 26);
         assert_eq!(result.vertices.len(), 24);
         assert!(result.validate().is_ok());
@@ -6074,16 +6112,24 @@ mod tests {
             })
             .collect();
         uv_layers::write_layers(&mut mesh, &layers);
-        let error = evaluate_modifiers(&mesh, &[with_params("subdivision", json!({"levels": 5}))])
-            .unwrap_err();
+        let error = evaluate_modifiers(
+            &mesh,
+            &[with_params("subdivision", json!({"levels": 5}))],
+            "Cube",
+        )
+        .unwrap_err();
         assert_eq!(error.code, ErrorCode::LimitExceeded);
     }
 
     #[test]
     fn subdivision_refines_topology_with_catmull_clark_quads() {
         let mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
-        let result =
-            evaluate_modifiers(&mesh, &[with_params("subdivision", json!({"levels": 1}))]).unwrap();
+        let result = evaluate_modifiers(
+            &mesh,
+            &[with_params("subdivision", json!({"levels": 1}))],
+            "Cube",
+        )
+        .unwrap();
         assert_eq!(result.vertices.len(), 26);
         assert_eq!(result.faces.len(), 24);
         assert!(result.faces.iter().all(|face| face.vertices.len() == 4));
@@ -6114,8 +6160,8 @@ mod tests {
                 json!({"use_axis":[true,false,false],"use_mirror_merge":false}),
             )
         };
-        let array_then_mirror = evaluate_modifiers(&mesh, &[array(), mirror()]).unwrap();
-        let mirror_then_array = evaluate_modifiers(&mesh, &[mirror(), array()]).unwrap();
+        let array_then_mirror = evaluate_modifiers(&mesh, &[array(), mirror()], "Cube").unwrap();
+        let mirror_then_array = evaluate_modifiers(&mesh, &[mirror(), array()], "Cube").unwrap();
 
         assert_eq!(array_then_mirror.vertices.len(), 12);
         assert_eq!(array_then_mirror.faces.len(), 4);
@@ -6135,6 +6181,7 @@ mod tests {
             let result = evaluate_modifiers(
                 &mesh,
                 &[with_params("mirror", json!({"use_axis": [true, false, false], "use_mirror_merge": false}))],
+                "Cube",
             ).unwrap();
             prop_assert_eq!(result.vertices.len(), mesh.vertices.len() * 2);
             prop_assert!(result.validate().is_ok());
@@ -6152,6 +6199,7 @@ mod tests {
             let result = evaluate_modifiers(
                 &mesh,
                 &[with_params("mirror", json!({"use_axis": [true, false, false], "use_mirror_merge": true, "merge_threshold": 0.0}))],
+                "Cube",
             ).unwrap();
             prop_assert_eq!(result.vertices.len(), mesh.vertices.len());
             prop_assert_eq!(result.faces.len(), mesh.faces.len());
@@ -6178,6 +6226,7 @@ mod tests {
                         "constant_offset_displace": [constant_x, 0.0, 0.0],
                     }),
                 )],
+                "Cube",
             ).unwrap();
             let travel = (size * relative_x + constant_x) * f64::from(count - 1);
             let expected_min_x = -size * 0.5 + travel.min(0.0);

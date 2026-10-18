@@ -199,6 +199,20 @@ impl SceneDoc {
             }
         }
         for (node_id, node) in &self.nodes {
+            if let Some(index) = node.active_vertex_group_index {
+                let valid = node
+                    .data
+                    .as_ref()
+                    .and_then(|data_id| self.data_blocks.get(data_id))
+                    .is_some_and(|data| index < data.vertex_groups.len());
+                if !valid {
+                    return Err(PotError::with_details(
+                        ErrorCode::SceneInvalid,
+                        "active vertex-group index is out of range",
+                        json!({"node_id":node_id,"active_vertex_group_index":index}),
+                    ));
+                }
+            }
             if let Some(body) = &node.rigid_body
                 && (!body.mass.is_finite()
                     || body.mass < 0.0
@@ -1485,6 +1499,9 @@ pub struct ModifierRuntime {
     pub boolean_operands: Vec<crate::geom::boolean::BooleanOperand>,
     pub warp_from: Option<[f64; 3]>,
     pub warp_to: Option<[f64; 3]>,
+    #[doc(hidden)]
+    /// Complete Blender f32 UV Warp matrix in column-major order.
+    pub uv_warp_matrix: Option<[[f32; 4]; 4]>,
     pub hook_target_position: Option<[f64; 3]>,
 }
 
@@ -1564,6 +1581,9 @@ pub struct Node {
     pub transform: Transform,
     #[serde(default)]
     pub data: Option<Id>,
+    /// Blender's active vertex-group index; must name one of the data block's vertex groups.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_vertex_group_index: Option<usize>,
     /// Material slots in slot order; OBJECT-linked entries are overrides of the data material.
     /// `null` is an empty slot: a face index on it has no material, as Blender's empty material
     /// slot does. Old files holding only ids still load unchanged.
@@ -1613,6 +1633,7 @@ impl Default for Node {
             parent_inverse: None,
             transform: Transform::default(),
             data: None,
+            active_vertex_group_index: None,
             materials: Vec::new(),
             material_links: Vec::new(),
             modifiers: Vec::new(),
