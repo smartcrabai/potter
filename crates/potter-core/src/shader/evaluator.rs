@@ -6,7 +6,7 @@ use serde_json::{Value as JsonValue, json};
 use crate::{
     error::{ErrorCode, PotError, Result},
     graph::{GraphKind, GraphNode, NodeGroup},
-    image::{ImageData, ImageExtension, ImageInterpolation, sample_with_extension},
+    image::{ImageData, ImageExtension, ImageInterpolation, sample_with_extension_alpha},
     model::{Id, Material, Registry, TextureRef},
 };
 
@@ -2444,7 +2444,7 @@ mod tests {
         let images = BTreeMap::from([(
             "image".to_owned(),
             ImageData {
-                storage: Default::default(),
+                storage: crate::image::ImageStorage::default(),
                 width: 8,
                 height: 8,
                 pixels,
@@ -2490,12 +2490,13 @@ mod tests {
         let images = BTreeMap::from([(
             "image".to_owned(),
             ImageData {
-                storage: Default::default(),
+                storage: crate::image::ImageStorage::default(),
                 width: 8,
                 height: 8,
                 pixels,
                 tiles: BTreeMap::new(),
                 interpolation: ImageInterpolation::Closest,
+                srgb: false,
             },
         )]);
         let context = context.with_images(&images);
