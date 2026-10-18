@@ -243,7 +243,12 @@ pub struct BakeArgs {
     pub pack: bool,
     #[arg(long, help = "Unpack a packed node bake cache to disk.")]
     pub unpack: bool,
-    #[arg(long, value_enum, requires = "unpack", help = "Unpack method: use-local, write-local, use-original, or write-original.")]
+    #[arg(
+        long,
+        value_enum,
+        requires = "unpack",
+        help = "Unpack method: use-local, write-local, use-original, or write-original."
+    )]
     pub unpack_method: Option<NodeBakeUnpackMethod>,
     #[arg(long, help = "Delete a node bake and resume live evaluation.")]
     pub delete: bool,

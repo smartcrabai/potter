@@ -559,7 +559,9 @@ impl Evaluator<'_> {
                 let Some(NodeBakeValue::Geometry { mesh, .. }) =
                     values.get_mut(&geometry_identifier)
                 else {
-                    return Err(evaluation("Bake node geometry item did not evaluate to geometry"));
+                    return Err(evaluation(
+                        "Bake node geometry item did not evaluate to geometry",
+                    ));
                 };
                 for (name, domain, data) in captured_attributes {
                     mesh.attributes
@@ -3288,9 +3290,7 @@ impl NodeBakeValue {
                 instance_paths,
             }),
             Self::Scalar { value } => EvalValue::Scalar(value),
-            Self::Field { attribute_name } => {
-                EvalValue::Field(Field::Attribute(attribute_name))
-            }
+            Self::Field { attribute_name } => EvalValue::Field(Field::Attribute(attribute_name)),
         }
     }
 }
@@ -3407,7 +3407,9 @@ fn mix_mesh_attributes(first: &mut Mesh, second: &Mesh, factor: f64) {
             continue;
         }
         if let (Some(first_data), Some(second_data)) = (
-            first_attribute.get_mut("data").and_then(Value::as_array_mut),
+            first_attribute
+                .get_mut("data")
+                .and_then(Value::as_array_mut),
             second_attribute.get("data").and_then(Value::as_array),
         ) {
             if first_data.len() == second_data.len() {

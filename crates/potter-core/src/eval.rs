@@ -2029,29 +2029,29 @@ fn prepare_node_bake_modifiers<'a>(
                             "packed resource is not a node-bake resource",
                         ));
                     }
-                    let record = serde_json::from_value::<crate::graph::NodeBakeRecord>(
-                        resource.clone(),
-                    )
-                    .map_err(|error| {
-                        PotError::with_details(
-                            ErrorCode::SceneInvalid,
-                            "packed node-bake resource is invalid",
-                            json!({"resource_id":resource_id,"cause":error.to_string()}),
-                        )
-                    })?;
+                    let record =
+                        serde_json::from_value::<crate::graph::NodeBakeRecord>(resource.clone())
+                            .map_err(|error| {
+                                PotError::with_details(
+                                    ErrorCode::SceneInvalid,
+                                    "packed node-bake resource is invalid",
+                                    json!({"resource_id":resource_id,"cause":error.to_string()}),
+                                )
+                            })?;
                     crate::graph::validate_node_bake_record(&record)?;
                     Some(record)
                 }
                 "disk" => {
-                    let frame_entries = config
-                        .get("frames")
-                        .and_then(Value::as_array)
-                        .ok_or_else(|| {
-                            PotError::new(
-                                ErrorCode::SceneInvalid,
-                                "disk node-bake frame manifest is missing",
-                            )
-                        })?;
+                    let frame_entries =
+                        config
+                            .get("frames")
+                            .and_then(Value::as_array)
+                            .ok_or_else(|| {
+                                PotError::new(
+                                    ErrorCode::SceneInvalid,
+                                    "disk node-bake frame manifest is missing",
+                                )
+                            })?;
                     if frame_entries.is_empty()
                         || frame_entries.len() > crate::graph::MAX_NODE_BAKE_FRAME_COUNT
                     {
@@ -2115,10 +2115,10 @@ fn prepare_node_bake_modifiers<'a>(
                                     "disk node-bake digest is missing",
                                 )
                             })?;
-                        let remaining = crate::graph::MAX_NODE_BAKE_PACKED_BYTES
-                            .saturating_sub(retained_bytes);
-                        let read_limit = remaining
-                            / (crate::graph::NODE_BAKE_JSON_MEMORY_MULTIPLIER + 1);
+                        let remaining =
+                            crate::graph::MAX_NODE_BAKE_PACKED_BYTES.saturating_sub(retained_bytes);
+                        let read_limit =
+                            remaining / (crate::graph::NODE_BAKE_JSON_MEMORY_MULTIPLIER + 1);
                         let Some(bytes) = crate::graph::read_node_bake_payload_limited(
                             project_root,
                             bake_directory,
