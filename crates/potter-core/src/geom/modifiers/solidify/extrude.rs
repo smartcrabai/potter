@@ -326,13 +326,14 @@ pub(super) fn solidify_extrude(mesh: &Mesh, _modifier: &Modifier, params: &Param
     let rim_count = layout.rim.verts.len();
 
     // Blender applies material offsets only when an evaluated object has at least two slots.
-    let (max_material, mat_ofs, mat_ofs_rim) = match params.material_slot_count {
-        Some(count) if count > 1 => (
-            i64::try_from(count - 1).unwrap_or(i64::MAX),
+    let (max_material, mat_ofs, mat_ofs_rim) = if params.material_slot_count > 1 {
+        (
+            i64::try_from(params.material_slot_count - 1).unwrap_or(i64::MAX),
             params.material_offset,
             params.material_offset_rim,
-        ),
-        _ => (0, 0, 0),
+        )
+    } else {
+        (0, 0, 0)
     };
 
     let thickness = params.thickness as f32;

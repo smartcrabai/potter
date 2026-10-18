@@ -1851,10 +1851,9 @@ pub(super) fn solidify_nonmanifold(
         }
     }
 
-    let material_slots = params.material_slot_count;
-    let mat_nrs = material_slots.unwrap_or(1).max(1) as i64;
+    let mat_nrs = i64::try_from(params.material_slot_count.max(1)).unwrap_or(i64::MAX);
     let mat_nr_max = mat_nrs - 1;
-    let use_material_offsets = material_slots.is_some_and(|count| count > 1);
+    let use_material_offsets = params.material_slot_count > 1;
     let mat_ofs = if use_material_offsets {
         clamp_i16(params.material_offset)
     } else {

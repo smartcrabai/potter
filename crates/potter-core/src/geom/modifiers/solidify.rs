@@ -93,8 +93,9 @@ pub(super) struct Params {
     /// Output group names `shell_vertex_group` and `rim_vertex_group`; empty means unnamed.
     pub(super) shell_group: String,
     pub(super) rim_group: String,
-    /// Evaluated object material slot count (`ctx->object->totcol`), absent without scene context.
-    pub(super) material_slot_count: Option<usize>,
+    /// Material slots of the evaluated object (`ctx->object->totcol`): the scene count when the node is
+    /// evaluated, else the mesh's own face-addressed count.
+    pub(super) material_slot_count: usize,
 }
 
 pub(super) fn solidify(
@@ -103,15 +104,32 @@ pub(super) fn solidify(
     context: ModifierEvaluationContext<'_>,
 ) -> Result<Mesh> {
     validated(mesh)?;
-    let params = Params::parse(mesh, modifier, context.material_slot_count)?;
+    let material_slot_count = context
+        .material_slot_count
+        .unwrap_or_else(|| face_slot_count(mesh));
+    let params = Params::parse(mesh, modifier, material_slot_count)?;
     match params.mode {
         Mode::Extrude => extrude::solidify_extrude(mesh, modifier, &params),
         Mode::NonManifold => nonmanifold::solidify_nonmanifold(mesh, modifier, &params),
     }
 }
 
+/// Material slots the mesh's faces address: one more than the largest `material_index`, or zero for a
+/// mesh without faces. Used when no scene object supplies the count.
+fn face_slot_count(mesh: &Mesh) -> usize {
+    mesh.faces
+        .iter()
+        .map(|face| {
+            usize::try_from(face.material_index)
+                .unwrap_or(usize::MAX)
+                .saturating_add(1)
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 impl Params {
-    fn parse(mesh: &Mesh, modifier: &Modifier, material_slot_count: Option<usize>) -> Result<Self> {
+    fn parse(mesh: &Mesh, modifier: &Modifier, material_slot_count: usize) -> Result<Self> {
         let mode = match string_param(modifier, "solidify_mode")? {
             "EXTRUDE" => Mode::Extrude,
             "NON_MANIFOLD" => Mode::NonManifold,
