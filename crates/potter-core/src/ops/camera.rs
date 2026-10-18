@@ -280,6 +280,7 @@ fn create_light(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resu
             "color",
             "energy",
             "radius",
+            "soft_falloff",
             "spot_size",
             "spot_blend",
         ],
@@ -297,6 +298,7 @@ fn create_light(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resu
             "color",
             "energy",
             "radius",
+            "soft_falloff",
             "spot_size",
             "spot_blend",
         ],
@@ -361,6 +363,7 @@ fn apply_light_values(
             "color",
             "energy",
             "radius",
+            "soft_falloff",
             "spot_size",
             "spot_blend",
         ],
@@ -396,6 +399,15 @@ fn apply_light_values(
     }
     if let Some(value) = values.get("radius") {
         light.radius = nonnegative_number(engine, value, &format!("{prefix}radius"))?;
+    }
+    if let Some(value) = values.get("soft_falloff") {
+        light.soft_falloff = value.as_bool().ok_or_else(|| {
+            engine.error(
+                ErrorCode::InvalidOperation,
+                "soft_falloff must be true or false",
+                &operation_pointer(engine.operation_index, &format!("{prefix}soft_falloff")),
+            )
+        })?;
     }
     if let Some(value) = values.get("spot_size") {
         light.spot_size = super::finite_number(
