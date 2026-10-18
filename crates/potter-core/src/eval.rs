@@ -4294,25 +4294,80 @@ pub(crate) fn apply_volume_to_mesh_modifier(
                 "volume data block has no volume payload",
             )
         })?;
-    let threshold = match modifier.params.get("threshold").or_else(|| {
-        crate::params::default_value(
-            crate::params::ParameterFamily::Modifier,
-            "volume_to_mesh",
-            "threshold",
-        )
-    }) {
-        None => 0.1,
-        Some(value) => value
-            .as_f64()
-            .filter(|value| value.is_finite())
-            .ok_or_else(|| {
+    let parameter_number = |name: &str| -> Result<f64> {
+        match modifier.params.get(name).or_else(|| {
+            crate::params::default_value(
+                crate::params::ParameterFamily::Modifier,
+                "volume_to_mesh",
+                name,
+            )
+        }) {
+            None => Err(PotError::new(
+                ErrorCode::InternalError,
+                format!("volume_to_mesh has no schema default for `{name}`"),
+            )),
+            Some(value) => value.as_f64().filter(|number| number.is_finite()).ok_or_else(|| {
                 PotError::with_details(
                     ErrorCode::InvalidArgument,
-                    "volume_to_mesh threshold must be finite",
-                    json!({"modifier_id":modifier.id,"parameter":"threshold"}),
+                    format!("volume_to_mesh `{name}` must be finite"),
+                    json!({"modifier_id":modifier.id,"parameter":name}),
                 )
-            })?,
+            }),
+        }
     };
+    let threshold = parameter_number("threshold")? as f32 as f64;
+    if threshold < 0.0 {
+        return Err(PotError::with_details(
+            ErrorCode::InvalidArgument,
+            "volume_to_mesh threshold must be non-negative",
+            json!({"modifier_id":modifier.id,"parameter":"threshold"}),
+        ));
+    }
+    let adaptivity = parameter_number("adaptivity")?;
+    if !(0.0..=1.0).contains(&adaptivity) {
+        return Err(PotError::with_details(
+            ErrorCode::InvalidArgument,
+            "volume_to_mesh adaptivity must be between 0 and 1",
+            json!({"modifier_id":modifier.id,"parameter":"adaptivity"}),
+        ));
+    }
+    let adaptivity = adaptivity as f32 as f64;
+    let grid_name = modifier
+        .params
+        .get("grid_name")
+        .or_else(|| {
+            crate::params::default_value(
+                crate::params::ParameterFamily::Modifier,
+                "volume_to_mesh",
+                "grid_name",
+            )
+        })
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::InvalidArgument,
+                "volume_to_mesh grid_name must be a string",
+                json!({"modifier_id":modifier.id,"parameter":"grid_name"}),
+            )
+        })?;
+    let use_smooth_shade = modifier
+        .params
+        .get("use_smooth_shade")
+        .or_else(|| {
+            crate::params::default_value(
+                crate::params::ParameterFamily::Modifier,
+                "volume_to_mesh",
+                "use_smooth_shade",
+            )
+        })
+        .and_then(Value::as_bool)
+        .ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::InvalidArgument,
+                "volume_to_mesh use_smooth_shade must be a boolean",
+                json!({"modifier_id":modifier.id,"parameter":"use_smooth_shade"}),
+            )
+        })?;
     let source_world = matrices.get(source_node_id).copied().ok_or_else(|| {
         PotError::new(
             ErrorCode::InternalError,
@@ -4330,7 +4385,15 @@ pub(crate) fn apply_volume_to_mesh_modifier(
         ));
     }
     let volume_to_mesh = source_inverse * volume_world;
-    let mut extracted = crate::geom::volume::volume_to_mesh(volume, threshold)?;
+    let mut extracted = crate::geom::volume::volume_to_mesh_named_adaptive(
+        volume,
+        threshold,
+        grid_name,
+        adaptivity,
+    )?;
+    if use_smooth_shade {
+        crate::geom::normals::shade_faces_smooth(&mut extracted);
+    }
     for vertex in &mut extracted.vertices {
         vertex.co = volume_to_mesh.transform_point3(vertex.co);
         if !vertex.co.is_finite() {
