@@ -5,7 +5,8 @@ exactly (34 faces, 39 vertices, 69 edges). A full batch run aborted with a segfa
 final_skin after zero_radius_root, so run cases singly when regenerating.
 
 Each case: vertices, edges, per-vertex skin (radius, root), skin modifier params. Dumps the
-evaluated mesh (vertices, faces, smooth flags) to <outdir>/<case>.json.
+evaluated mesh (vertices, faces, smooth flags, and edge vertex pairs as sorted indices into the
+dumped vertex list) to <outdir>/<case>.json.
 """
 import bpy
 import bmesh
@@ -368,6 +369,7 @@ def dump(name, case):
         "params": case["params"],
         "vertices": [[round(c, 9) for c in v.co] for v in out.vertices],
         "edges": len(out.edges),
+        "edge_pairs": sorted(sorted(edge.vertices) for edge in out.edges),
         "faces": [list(p.vertices) for p in out.polygons],
         "face_smooth": [bool(p.use_smooth) for p in out.polygons],
         "face_normals": [[round(c, 9) for c in p.normal] for p in out.polygons],

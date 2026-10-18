@@ -263,13 +263,11 @@ fn cycle_from_lowest(face: &[usize]) -> Vec<usize> {
         .collect()
 }
 
-/// Every expected Blender vertex must have an evaluated vertex at the same position, and the faces
-/// must match as vertex cycles over those vertices (winding included).
-fn assert_blender_geometry<F: AsRef<[usize]>>(result: &Mesh, vertices: &[[f64; 3]], faces: &[F]) {
-    assert_eq!(result.vertices.len(), vertices.len());
-    assert_eq!(result.faces.len(), faces.len());
+/// Maps every evaluated vertex ID to its index in the Blender oracle's vertex list. Each Blender
+/// vertex must have exactly one evaluated vertex at the same position.
+fn blender_index_by_id(result: &Mesh, vertices: &[[f64; 3]]) -> HashMap<u32, usize> {
     let mut matched = vec![false; result.vertices.len()];
-    let mut expected_index = HashMap::with_capacity(vertices.len());
+    let mut index_by_id = HashMap::with_capacity(vertices.len());
     for (index, position) in vertices.iter().enumerate() {
         let position = DVec3::from_array(*position);
         let storage = result
@@ -281,23 +279,22 @@ fn assert_blender_geometry<F: AsRef<[usize]>>(result: &Mesh, vertices: &[[f64; 3
             })
             .expect("Blender Skin vertex is present");
         matched[storage] = true;
-        expected_index.insert(storage, index);
+        index_by_id.insert(result.vertices[storage].id, index);
     }
-    let storage_of_id: HashMap<u32, usize> = result
-        .vertices
-        .iter()
-        .enumerate()
-        .map(|(storage, vertex)| (vertex.id, storage))
-        .collect();
+    index_by_id
+}
+
+/// Every expected Blender vertex must have an evaluated vertex at the same position, and the faces
+/// must match as vertex cycles over those vertices (winding included).
+fn assert_blender_geometry<F: AsRef<[usize]>>(result: &Mesh, vertices: &[[f64; 3]], faces: &[F]) {
+    assert_eq!(result.vertices.len(), vertices.len());
+    assert_eq!(result.faces.len(), faces.len());
+    let index_by_id = blender_index_by_id(result, vertices);
     let mut actual: Vec<Vec<usize>> = result
         .faces
         .iter()
         .map(|face| {
-            let cycle: Vec<usize> = face
-                .vertices
-                .iter()
-                .map(|id| expected_index[&storage_of_id[id]])
-                .collect();
+            let cycle: Vec<usize> = face.vertices.iter().map(|id| index_by_id[id]).collect();
             cycle_from_lowest(&cycle)
         })
         .collect();
@@ -307,6 +304,28 @@ fn assert_blender_geometry<F: AsRef<[usize]>>(result: &Mesh, vertices: &[[f64; 3
         .map(|face| cycle_from_lowest(face.as_ref()))
         .collect();
     expected.sort();
+    assert_eq!(actual, expected);
+}
+
+/// The evaluated edges, as sorted pairs of Blender oracle vertex indices, must equal the Blender
+/// oracle's edge set exactly: same pairs, no extras, no duplicates.
+fn assert_blender_edges(result: &Mesh, vertices: &[[f64; 3]], pairs: &[[usize; 2]]) {
+    let index_by_id = blender_index_by_id(result, vertices);
+    let mut actual: Vec<[usize; 2]> = result
+        .edges
+        .iter()
+        .map(|edge| {
+            let mut pair = edge.vertices.map(|id| index_by_id[&id]);
+            pair.sort_unstable();
+            pair
+        })
+        .collect();
+    actual.sort_unstable();
+    let mut expected = pairs.to_vec();
+    for pair in &mut expected {
+        pair.sort_unstable();
+    }
+    expected.sort_unstable();
     assert_eq!(actual, expected);
 }
 
@@ -347,10 +366,13 @@ fn assert_skin_oracle(result: &Mesh, oracle: &str) {
         serde_json::from_value(expected["face_smooth"].clone()).expect("Skin oracle shading");
     assert_blender_geometry(result, &vertices, &faces);
     assert!(result.faces.iter().all(|face| face.material_index == 0));
+    let edge_pairs: Vec<[usize; 2]> =
+        serde_json::from_value(expected["edge_pairs"].clone()).expect("Skin oracle edge pairs");
     assert_eq!(
-        result.edges.len(),
+        edge_pairs.len(),
         expected["edges"].as_u64().expect("Skin oracle edge count") as usize
     );
+    assert_blender_edges(result, &vertices, &edge_pairs);
     assert_eq!(
         smooth_face_count(result),
         smooth.iter().filter(|value| **value).count()
