@@ -274,14 +274,6 @@ pub fn sample_density(position: DVec3, volume: &VolumeData) -> f64 {
 /// Returns `UnsupportedFeature` for preserve-only file inputs and `InvalidArgument`
 /// for malformed grids or sample positions.
 pub fn sample_density_checked(position: DVec3, volume: &VolumeData) -> Result<f64> {
-    sample_density_checked_with_inverse(position, volume, None)
-}
-
-pub(crate) fn sample_density_checked_with_inverse(
-    position: DVec3,
-    volume: &VolumeData,
-    local_to_index: Option<DMat4>,
-) -> Result<f64> {
     ensure_evaluable_source(volume)?;
     if !position.is_finite() {
         return Err(invalid_volume("sample position must be finite"));
@@ -297,18 +289,12 @@ pub(crate) fn sample_density_checked_with_inverse(
         return Ok(grid.sample_world(position));
     }
     let grid = first_grid(volume)?;
-    let values = if grid.index_to_local.is_some() && local_to_index.is_some() {
-        validate_grid_samples(grid)?
-    } else {
-        validate_grid(grid)?
-    };
+    let values = validate_grid(grid)?;
 
     let coordinate = if grid.index_to_local.is_some() {
-        let local_to_index = match local_to_index {
-            Some(matrix) => matrix,
-            None => grid.checked_index_to_local_matrix()?.inverse(),
-        };
-        local_to_index.transform_point3(position)
+        grid.checked_index_to_local_matrix()?
+            .inverse()
+            .transform_point3(position)
     } else {
         (position - grid.origin) / grid.voxel_size
     };

@@ -620,7 +620,6 @@ fn prepare_blend_export_resources(
     let sidecar = parent.join(format!("{stem}_assets"));
     let mut sidecar_created = false;
     let mut files = Vec::new();
-    let mut sequence_updates = Vec::new();
     let library_base = library_layout_base(&document);
     for id in resource_ids {
         let resource = document
@@ -628,92 +627,6 @@ fn prepare_blend_export_resources(
             .and_then(Value::as_object)
             .and_then(|resources| resources.get(&id))
             .ok_or_else(|| PotError::new(ErrorCode::InternalError, "resource disappeared"))?;
-        if let Some(sequence_frames) = resource.get("sequence_frames").and_then(Value::as_object) {
-            let mut output_frames = Map::new();
-            let sequence_dir = sidecar.join(format!("sequence_{id}"));
-            let mut wrote_frame = false;
-            for (frame, frame_record) in sequence_frames {
-                let mut frame_record = frame_record.clone();
-                let frame_resource_id = format!("{id}:{frame}");
-                let (bytes, digest) = match crate::cache_sequence::read_cache_resource_record(
-                    &frame_record,
-                    &frame_resource_id,
-                    Some(project.path()),
-                ) {
-                    Ok(value) => value,
-                    Err(error)
-                        if error.code == ErrorCode::DependencyMissing
-                            && error.message.starts_with("Alembic cache file is missing:") =>
-                    {
-                        output_frames.insert(frame.clone(), frame_record);
-                        continue;
-                    }
-                    Err(error) => return Err(error),
-                };
-                let filename = frame_record
-                    .get("uri")
-                    .and_then(Value::as_str)
-                    .and_then(|uri| Path::new(uri).file_name())
-                    .and_then(|name| name.to_str())
-                    .filter(|name| {
-                        Path::new(name).file_name().and_then(|part| part.to_str()) == Some(*name)
-                    })
-                    .map(str::to_owned)
-                    .ok_or_else(|| {
-                        PotError::with_details(
-                            ErrorCode::SceneInvalid,
-                            "Alembic sequence frame has no safe filename",
-                            json!({"resource_id":id,"frame":frame}),
-                        )
-                    })?;
-                let destination = sequence_dir.join(filename);
-                if destination.exists() {
-                    let existing = fs::read(&destination).map_err(|error| PotError::io(&error))?;
-                    if crate::hash::sha256(&existing) != digest {
-                        return Err(PotError::with_details(
-                            ErrorCode::ExportFailed,
-                            "Alembic sequence sidecar filename collides with different content",
-                            json!({"resource_id":id,"frame":frame,"path":destination}),
-                        ));
-                    }
-                } else {
-                    write_asset_sidecar(&destination, &bytes)?;
-                }
-                if let Some(object) = frame_record.as_object_mut() {
-                    object.insert(
-                        "export_path".to_owned(),
-                        json!(
-                            fs::canonicalize(&destination).map_err(|error| PotError::io(&error))?
-                        ),
-                    );
-                }
-                if !files.contains(&destination) {
-                    files.push(destination);
-                }
-                wrote_frame = true;
-                output_frames.insert(frame.clone(), frame_record);
-            }
-            if wrote_frame && !sidecar_created {
-                sidecar_created = true;
-            }
-            let pattern_name = resource
-                .get("filename")
-                .and_then(Value::as_str)
-                .filter(|name| {
-                    Path::new(name).file_name().and_then(|part| part.to_str()) == Some(*name)
-                })
-                .or_else(|| {
-                    resource
-                        .get("uri")
-                        .and_then(Value::as_str)
-                        .and_then(|uri| Path::new(uri).file_name())
-                        .and_then(|name| name.to_str())
-                })
-                .unwrap_or("sequence.####.abc");
-            let pattern_path = sequence_dir.join(pattern_name);
-            sequence_updates.push((id.clone(), pattern_path, output_frames));
-            continue;
-        }
         let uri = resource
             .get("uri")
             .and_then(Value::as_str)
@@ -827,15 +740,6 @@ fn prepare_blend_export_resources(
         if !files.contains(&destination) {
             files.push(destination);
         }
-    }
-    for (id, pattern_path, output_frames) in sequence_updates {
-        let resource = document
-            .get_mut("resources")
-            .and_then(Value::as_object_mut)
-            .and_then(|resources| resources.get_mut(&id))
-            .ok_or_else(|| PotError::new(ErrorCode::InternalError, "resource disappeared"))?;
-        resource["export_path"] = json!(pattern_path.to_string_lossy());
-        resource["sequence_frames"] = Value::Object(output_frames);
     }
     add_blender_image_pixels(&mut document, project)?;
     Ok((document, files))
@@ -2861,10 +2765,6 @@ fn build_imported_graph(
             transform,
             data: data_id,
             materials: material_slots,
-            active_vertex_group_index: item
-                .get("active_vertex_group_index")
-                .and_then(Value::as_u64)
-                .and_then(|index| usize::try_from(index).ok()),
             material_links,
             modifiers,
             visible: !item
@@ -4486,8 +4386,8 @@ fn import_blender_resources(
     let mut assets = Vec::new();
     let mut used_ids = BTreeSet::new();
     for source in optional_array(raw, "resources")? {
-        let inline_kind = crate::model::migrate::inline_resource_kind(source)?;
-        if let Some(kind) = inline_kind {
+        if crate::model::migrate::inline_resource_kind(source)? == Some("legacy_texture") {
+            let kind = "legacy_texture";
             let owner = source.get("owner").and_then(Value::as_str).unwrap_or(kind);
             let seed = format!(
                 "resource_{}",
@@ -4510,21 +4410,10 @@ fn import_blender_resources(
             .get("packed_data")
             .and_then(Value::as_str)
             .filter(|data| !data.is_empty());
+        if source_path.is_none() && packed_data.is_none() {
+            continue;
+        }
         let resolved_path = source_path.map(|path| resolve_blend_resource_path(path, blend_file));
-        let is_sequence = source
-            .get("cache_file")
-            .and_then(|settings| settings.get("is_sequence"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let sequence_manifest = if is_sequence {
-            resolved_path
-                .as_deref()
-                .map(|path| crate::cache_sequence::cache_sequence_manifest(path, None))
-                .transpose()?
-                .unwrap_or_default()
-        } else {
-            crate::cache_sequence::CacheSequenceManifest::default()
-        };
         let packed_bytes = packed_data.map(decode_resource_base64).transpose()?;
         let bytes = if let Some(bytes) = packed_bytes {
             Some(bytes)
@@ -4573,69 +4462,24 @@ fn import_blender_resources(
             .as_ref()
             .map_or_else(String::new, |path| path.to_string_lossy().into_owned());
         let original_path = (!uri.is_empty()).then(|| uri.clone());
-        let mut sequence_frames = Map::new();
-        if is_sequence {
-            for (frame, path) in &sequence_manifest.files {
-                let frame_key = frame.to_string();
-                let expected = sequence_manifest.hashes.get(&frame_key).ok_or_else(|| {
-                    invalid_intermediate("cache sequence manifest is inconsistent")
-                })?;
-                let bytes = match fs::read(path) {
-                    Ok(bytes) => bytes,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(error) => return Err(PotError::io(&error)),
-                };
-                let actual = crate::hash::sha256(&bytes);
-                if &actual != expected {
-                    return Err(PotError::with_details(
-                        ErrorCode::AssetChanged,
-                        "Alembic sequence frame changed while importing the Blender asset",
-                        json!({"frame":frame,"expected_hash":expected,"actual_hash":actual}),
-                    ));
-                }
-                assets.push((actual.clone(), bytes));
-                let path_uri = path.to_string_lossy();
-                sequence_frames.insert(
-                    frame_key,
-                    crate::cache_sequence::cache_sequence_resource_record(
-                        &path_uri, kind, &actual, None,
-                    ),
-                );
-            }
-        }
-        let status = if bytes.is_some() || !sequence_frames.is_empty() {
+        let status = if bytes.is_some() {
             "available"
         } else {
             "missing"
         };
-        let mut resource = if is_sequence {
-            json!({
-                "uri":uri,
-                "original_path":original_path,
-                "kind":kind,
-                "owner":owner,
-                "filename":filename,
-                "packed":false,
-                "status":status,
-            })
-        } else {
-            let hash = digest.as_deref().map_or(Value::Null, |value| json!(value));
-            json!({
-                "uri":uri,
-                "original_path":original_path,
-                "hash":hash.clone(),
-                "expected_hash":hash,
-                "kind":kind,
-                "owner":owner,
-                "filename":filename,
-                "packed":false,
-                "source_packed":source_packed,
-                "status":status,
-            })
-        };
-        if let Some(cache_file) = source.get("cache_file") {
-            resource["cache_file"] = cache_file.clone();
-        }
+        let hash = digest.as_deref().map_or(Value::Null, |value| json!(value));
+        let resource = json!({
+            "uri": uri,
+            "original_path": original_path,
+            "hash": hash.clone(),
+            "expected_hash": hash,
+            "kind": kind,
+            "owner": owner,
+            "filename": filename,
+            "packed": false,
+            "source_packed": source_packed,
+            "status": status,
+        });
         doc.resources.insert(id.clone(), resource);
         let identity_key = |path: &str| format!("{path}\0{owner}");
         if let Some(path) = source_path {
@@ -6256,45 +6100,28 @@ fn parse_mesh_sequence_cache_params(
     properties: &Map<String, Value>,
     resource_ids: &BTreeMap<String, String>,
 ) -> Result<Map<String, Value>> {
-    let path = match properties.get("cache_filepath") {
-        Some(Value::String(path)) if !path.is_empty() => Some(path.as_str()),
-        None | Some(Value::Null | Value::String(_)) => None,
-        Some(_) => {
-            return Err(invalid_intermediate(
-                "Mesh Sequence Cache cache filepath must be a string",
-            ));
-        }
-    };
-    let resource = path
-        .map(|path| {
-            resource_ids
-                .get(path)
-                .ok_or_else(|| invalid_intermediate("Mesh Sequence Cache filepath has no resource"))
-        })
-        .transpose()?;
+    let path = properties
+        .get("cache_filepath")
+        .and_then(Value::as_str)
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| invalid_intermediate("Mesh Sequence Cache has no cache filepath"))?;
+    let resource = resource_ids
+        .get(path)
+        .ok_or_else(|| invalid_intermediate("Mesh Sequence Cache filepath has no resource"))?;
     let cache_settings = properties
         .get("cache_file_settings")
         .and_then(Value::as_object);
-    let object_path = match properties.get("object_path") {
-        Some(Value::String(path)) => path.as_str(),
-        None => "",
-        Some(_) => {
-            return Err(invalid_intermediate(
-                "Mesh Sequence Cache object path must be a string",
-            ));
-        }
-    };
+    let object_path = properties
+        .get("object_path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_intermediate("Mesh Sequence Cache has no object path"))?;
     let mut params = properties.clone();
     params.remove("cache_file");
     params.remove("cache_filepath");
     params.remove("cache_file_settings");
-    if let Some(resource) = resource {
-        params.insert("resource".to_owned(), json!(resource));
-    } else {
-        params.remove("resource");
-    }
+    params.insert("resource".to_owned(), json!(resource));
     params.insert("object_path".to_owned(), json!(object_path));
-    insert_mesh_sequence_cache_settings_params(&mut params, cache_settings);
+    insert_cache_settings_params(&mut params, cache_settings);
     Ok(params)
 }
 
@@ -6320,77 +6147,20 @@ fn insert_cache_settings_params(
                 .unwrap_or(1.0)
         ),
     );
-    let override_frame = settings
-        .and_then(|settings| settings.get("override_frame"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let frame = settings
-        .and_then(|settings| settings.get("frame"))
-        .and_then(Value::as_f64)
-        .unwrap_or(0.0);
     params.insert(
         "override_frame".to_owned(),
-        if override_frame {
-            json!(frame)
+        if settings
+            .and_then(|settings| settings.get("override_frame"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            settings
+                .and_then(|settings| settings.get("frame"))
+                .cloned()
+                .unwrap_or(Value::Null)
         } else {
             Value::Null
         },
-    );
-}
-
-fn insert_mesh_sequence_cache_settings_params(
-    params: &mut Map<String, Value>,
-    settings: Option<&Map<String, Value>>,
-) {
-    insert_cache_settings_params(params, settings);
-    let override_frame = settings
-        .and_then(|settings| settings.get("override_frame"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let frame = settings
-        .and_then(|settings| settings.get("frame"))
-        .and_then(Value::as_f64)
-        .unwrap_or(0.0);
-    params.insert(
-        "cache_frame".to_owned(),
-        json!(if override_frame { 0.0 } else { frame }),
-    );
-    params.insert(
-        "is_sequence".to_owned(),
-        json!(
-            settings
-                .and_then(|settings| settings.get("is_sequence"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-        ),
-    );
-    params.insert(
-        "velocity_name".to_owned(),
-        settings
-            .and_then(|settings| settings.get("velocity_name"))
-            .cloned()
-            .unwrap_or_else(|| json!(".velocities")),
-    );
-    params.insert(
-        "velocity_unit".to_owned(),
-        settings
-            .and_then(|settings| settings.get("velocity_unit"))
-            .cloned()
-            .unwrap_or_else(|| json!("SECOND")),
-    );
-    params.insert(
-        "forward_axis".to_owned(),
-        settings
-            .and_then(|settings| settings.get("forward_axis"))
-            .cloned()
-            .unwrap_or_else(|| json!("POS_X")),
-    );
-    params.insert(
-        "up_axis".to_owned(),
-        settings
-            .and_then(|settings| settings.get("up_axis"))
-            .cloned()
-            .unwrap_or_else(|| json!("POS_X")),
     );
 }
 
@@ -8315,45 +8085,6 @@ mod tests {
             assert!(known_modifier(blender), "{blender}");
             assert!(known_modifier(&potter.to_ascii_uppercase()), "{potter}");
         }
-    }
-
-    #[test]
-    fn mesh_sequence_cache_import_allows_disabled_file_and_object_paths() -> Result<()> {
-        let resource_ids = BTreeMap::from([("/cache.abc".to_owned(), "cache_resource".to_owned())]);
-        for properties in [
-            json!({}),
-            json!({"cache_filepath": null}),
-            json!({"cache_filepath": ""}),
-        ] {
-            let params = parse_mesh_sequence_cache_params(
-                properties
-                    .as_object()
-                    .ok_or_else(|| invalid_intermediate("test properties are not an object"))?,
-                &resource_ids,
-            )?;
-            assert!(!params.contains_key("resource"));
-            assert_eq!(params["object_path"], "");
-        }
-
-        let empty_object_path = parse_mesh_sequence_cache_params(
-            json!({"cache_filepath": "/cache.abc", "object_path": ""})
-                .as_object()
-                .ok_or_else(|| invalid_intermediate("test properties are not an object"))?,
-            &resource_ids,
-        )?;
-        assert_eq!(empty_object_path["resource"], "cache_resource");
-        assert_eq!(empty_object_path["object_path"], "");
-
-        assert!(
-            parse_mesh_sequence_cache_params(
-                json!({"cache_filepath": "/missing.abc"})
-                    .as_object()
-                    .ok_or_else(|| invalid_intermediate("test properties are not an object"))?,
-                &resource_ids,
-            )
-            .is_err()
-        );
-        Ok(())
     }
 
     #[test]

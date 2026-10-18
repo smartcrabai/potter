@@ -214,20 +214,6 @@ impl SceneDoc {
             }
         }
         for (node_id, node) in &self.nodes {
-            if let Some(index) = node.active_vertex_group_index {
-                let valid = node
-                    .data
-                    .as_ref()
-                    .and_then(|data_id| self.data_blocks.get(data_id))
-                    .is_some_and(|data| index < data.vertex_groups.len());
-                if !valid {
-                    return Err(PotError::with_details(
-                        ErrorCode::SceneInvalid,
-                        "active vertex-group index is out of range",
-                        json!({"node_id":node_id,"active_vertex_group_index":index}),
-                    ));
-                }
-            }
             if let Some(body) = &node.rigid_body
                 && (!body.mass.is_finite()
                     || body.mass < 0.0
@@ -1530,17 +1516,6 @@ pub struct ModifierRuntime {
     /// Raw subject-to-world and optional world-to-mapping matrices for ordered f32 texture mapping.
     #[doc(hidden)]
     pub texture_mapping: Option<TextureCoordinateMapping>,
-    #[doc(hidden)]
-    // Preserve Blender's original f32 local-to-target matrix instead of re-inverting its inverse.
-    pub shrinkwrap_subject_to_target: Option<[f32; 16]>,
-    pub shrinkwrap_target_mesh: Option<Mesh>,
-    #[doc(hidden)]
-    pub auxiliary_target_to_subject: Option<[f64; 16]>,
-    #[doc(hidden)]
-    pub shrinkwrap_auxiliary_target_mesh: Option<Mesh>,
-    #[doc(hidden)]
-    /// Complete Blender f32 UV Warp matrix in column-major order.
-    pub uv_warp_matrix: Option<[[f32; 4]; 4]>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1627,8 +1602,6 @@ pub struct Node {
     /// Per-slot source; missing entries use legacy `OBJECT` for existing node slots.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub material_links: Vec<MaterialLink>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active_vertex_group_index: Option<usize>,
     #[serde(default)]
     pub modifiers: Vec<Modifier>,
     #[serde(default = "default_true")]
@@ -1672,7 +1645,6 @@ impl Default for Node {
             data: None,
             materials: Vec::new(),
             material_links: Vec::new(),
-            active_vertex_group_index: None,
             modifiers: Vec::new(),
             visible: true,
             render_visible: true,

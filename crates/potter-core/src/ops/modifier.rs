@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::{
     error::{ErrorCode, PotError, Result},
     eval::EvaluationPurpose,
-    geom::modifiers::{evaluate_modifiers_with_groups_at_frame, is_only_deform},
+    geom::modifiers::evaluate_modifiers_with_groups_at_frame,
     model::{Id, Modifier, ShapeKey, ShapeKeyData},
     params::{self, ParameterFamily},
 };
@@ -713,6 +713,34 @@ fn reorder(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bo
     Ok(changed)
 }
 
+/// Blender's `ModifierTypeType::OnlyDeform` for each Potter modifier type.
+fn only_deform(modifier_type: &str) -> bool {
+    matches!(
+        modifier_type,
+        "armature"
+            | "cast"
+            | "cloth"
+            | "collision"
+            | "corrective_smooth"
+            | "curve"
+            | "displace"
+            | "hook"
+            | "laplacian_deform"
+            | "laplacian_smooth"
+            | "lattice"
+            | "mesh_cache"
+            | "mesh_deform"
+            | "particle_system"
+            | "shrinkwrap"
+            | "simple_deform"
+            | "smooth"
+            | "soft_body"
+            | "surface_deform"
+            | "warp"
+            | "wave"
+    )
+}
+
 /// Blender's `eModifierTypeFlag_RequiresOriginalData` modifier types.
 fn requires_original_data(modifier_type: &str) -> bool {
     matches!(modifier_type, "multires" | "soft_body")
@@ -735,7 +763,7 @@ fn is_pinned(modifier: &Modifier) -> bool {
 pub(crate) fn insertion_index(stack: &[Modifier], modifier_type: &str) -> usize {
     if modifier_type == "hook" || requires_original_data(modifier_type) {
         let mut index = 0;
-        while index < stack.len() && is_only_deform(&stack[index].modifier_type) {
+        while index < stack.len() && only_deform(&stack[index].modifier_type) {
             if stack.get(index + 1).is_some_and(is_pinned) {
                 break;
             }
@@ -754,7 +782,7 @@ pub(crate) fn insertion_index(stack: &[Modifier], modifier_type: &str) -> usize 
 fn may_move_before(modifier: &Modifier, previous: &Modifier) -> bool {
     let unpins_past_pinned = is_pinned(modifier) && !is_pinned(previous);
     let past_original_data =
-        requires_original_data(&previous.modifier_type) && !is_only_deform(&modifier.modifier_type);
+        requires_original_data(&previous.modifier_type) && !only_deform(&modifier.modifier_type);
     !unpins_past_pinned && !past_original_data
 }
 
@@ -762,7 +790,7 @@ fn may_move_before(modifier: &Modifier, previous: &Modifier) -> bool {
 fn may_move_after(modifier: &Modifier, next: &Modifier) -> bool {
     let unpins_before_pinned = is_pinned(next) && !is_pinned(modifier);
     let past_non_deform =
-        requires_original_data(&modifier.modifier_type) && !is_only_deform(&next.modifier_type);
+        requires_original_data(&modifier.modifier_type) && !only_deform(&next.modifier_type);
     !unpins_before_pinned && !past_non_deform
 }
 
@@ -1075,9 +1103,11 @@ fn evaluate_modifier_output(
         let uses_lattice = modifier_stack
             .iter()
             .any(|modifier| modifier.enabled && modifier.modifier_type == "lattice");
-        let uses_volume_node = modifier_stack
-            .iter()
-            .any(|modifier| modifier.enabled && modifier.modifier_type == "volume_to_mesh");
+        let uses_volume_node = modifier_stack.iter().any(|modifier| {
+            modifier.enabled
+                && modifier.modifier_type == "volume_to_mesh"
+                && modifier.params.get("volume").is_some_and(Value::is_string)
+        });
         let uses_scene_context = modifier_stack.iter().any(|modifier| {
             if !modifier.enabled {
                 return false;
@@ -1111,13 +1141,9 @@ fn evaluate_modifier_output(
                 "uv_warp" => ["object_from", "object_to"]
                     .iter()
                     .any(|key| modifier.params.get(*key).is_some_and(Value::is_string)),
-                "mask" => {
-                    modifier.params.get("mode").and_then(Value::as_str) == Some("ARMATURE")
-                        && modifier
-                            .params
-                            .get("armature")
-                            .is_some_and(Value::is_string)
-                }
+                "armature" => true,
+                "cast" => modifier.params.get("object").is_some_and(Value::is_string),
+                "simple_deform" => modifier.params.get("origin").is_some_and(Value::is_string),
                 "displace" | "wave" | "warp" => true,
                 "vertex_weight_edit" | "vertex_weight_mix" => modifier
                     .params
@@ -1177,36 +1203,61 @@ fn evaluate_modifier_output(
         } else {
             let frame = engine.evaluation_frame;
             let driver_values = crate::eval::rig::evaluate_drivers(engine.doc, frame)?;
-            let operand_snapshot = crate::eval::Snapshot::evaluate_modifier_operands_with_cache(
-                engine.doc,
-                &crate::eval::EvaluationContext {
-                    frame: Some(frame),
-                    ..crate::eval::EvaluationContext::default()
-                },
-                engine.asset_root,
-                engine.cache_directory,
-                target,
-                modifier_id,
-                &driver_values,
-            )?;
-            let evaluated_operand_meshes = &operand_snapshot.meshes;
-            let evaluated_operand_nodes = &operand_snapshot.nodes;
-            let mut world_matrices = operand_snapshot
-                .nodes
-                .iter()
-                .map(|(node_id, node)| {
-                    (
-                        node_id.clone(),
-                        glam::DMat4::from_cols_array(&node.world_matrix),
-                    )
-                })
-                .collect::<BTreeMap<_, _>>();
-            world_matrices.extend(
-                operand_snapshot
-                    .transform_world_matrices
+            let operand_snapshot = if uses_scene_context {
+                Some(
+                    crate::eval::Snapshot::evaluate_modifier_operands_with_cache(
+                        engine.doc,
+                        &crate::eval::EvaluationContext {
+                            frame: Some(frame),
+                            ..crate::eval::EvaluationContext::default()
+                        },
+                        engine.asset_root,
+                        engine.cache_directory,
+                        target,
+                        modifier_id,
+                        &driver_values,
+                    )?,
+                )
+            } else {
+                None
+            };
+            let empty_meshes = BTreeMap::new();
+            let evaluated_operand_meshes = operand_snapshot
+                .as_ref()
+                .map_or(&empty_meshes, |snapshot| &snapshot.meshes);
+            let empty_nodes = BTreeMap::new();
+            let evaluated_operand_nodes = operand_snapshot
+                .as_ref()
+                .map_or(&empty_nodes, |snapshot| &snapshot.nodes);
+            let world_matrices = if let Some(snapshot) = &operand_snapshot {
+                let mut matrices = snapshot
+                    .nodes
                     .iter()
-                    .map(|(id, matrix)| (id.clone(), *matrix)),
-            );
+                    .map(|(node_id, node)| {
+                        (
+                            node_id.clone(),
+                            glam::DMat4::from_cols_array(&node.world_matrix),
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                matrices.extend(
+                    snapshot
+                        .transform_world_matrices
+                        .iter()
+                        .map(|(id, matrix)| (id.clone(), *matrix)),
+                );
+                matrices
+            } else {
+                let scene = engine.doc.scenes.get(&engine.doc.active_scene);
+                crate::eval::rig::evaluate_world_matrices_with_resources(
+                    engine.doc,
+                    frame,
+                    &driver_values,
+                    engine.asset_root,
+                    scene.map_or(24, |scene| scene.fps),
+                    scene.map_or(1.0, |scene| scene.fps_base),
+                )?
+            };
             let curve_path_lengths = crate::eval::evaluated_array_curve_path_length(
                 engine.doc,
                 target_modifier,
@@ -1238,10 +1289,18 @@ fn evaluate_modifier_output(
                     "modifier subject transform is unavailable",
                 )
             })?;
+            let empty_bone_matrices = BTreeMap::new();
+            let empty_bone_pose_matrices = BTreeMap::new();
             let references = crate::eval::SceneReferences {
                 world_matrices: &world_matrices,
-                bone_matrices: &operand_snapshot.bone_matrices,
-                bone_pose_matrices: &operand_snapshot.bone_pose_matrices,
+                bone_matrices: operand_snapshot
+                    .as_ref()
+                    .map_or(&empty_bone_matrices, |snapshot| &snapshot.bone_matrices),
+                bone_pose_matrices: operand_snapshot
+                    .as_ref()
+                    .map_or(&empty_bone_pose_matrices, |snapshot| {
+                        &snapshot.bone_pose_matrices
+                    }),
                 evaluated_meshes: evaluated_operand_meshes,
                 project_root: engine.asset_root,
             };
@@ -1346,8 +1405,9 @@ fn evaluate_modifier_output(
                         modifier,
                         target,
                         engine.doc,
-                        &references,
-                        texture_rng,
+                        &world_matrices,
+                        evaluated_operand_meshes,
+                        engine.asset_root,
                     ),
                     _ => Err(PotError::new(
                         ErrorCode::InternalError,
@@ -1640,9 +1700,6 @@ fn validate_parameter_map(
     })?;
     let settings_parameter = match (family, kind) {
         (ParameterFamily::Modifier, "hook" | "warp") => Some("falloff_curve_settings"),
-        (ParameterFamily::Modifier, "vertex_weight_edit" | "vertex_weight_proximity") => {
-            Some("map_curve_settings")
-        }
         _ => None,
     };
     if let Some(field) = settings_parameter
@@ -1738,28 +1795,11 @@ fn validate_modifier_resource(
     params: &Map<String, Value>,
     base_pointer: &str,
 ) -> Result<()> {
-    let is_disabled = match modifier_type {
-        "mesh_cache" => params
-            .get("factor")
-            .and_then(Value::as_f64)
-            .is_some_and(|factor| factor <= 0.0),
-        "mesh_sequence_cache" => params
-            .get("object_path")
-            .and_then(Value::as_str)
-            .is_none_or(str::is_empty),
-        _ => false,
-    };
-    if is_disabled {
-        return Ok(());
-    }
     let has_resource_parameter = params::type_spec(ParameterFamily::Modifier, modifier_type)
         .and_then(|specification| specification.get("properties"))
         .and_then(Value::as_object)
         .is_some_and(|properties| properties.contains_key("resource"));
-    if !has_resource_parameter
-        || ((modifier_type == "mesh_cache" || modifier_type == "mesh_sequence_cache")
-            && !params.contains_key("resource"))
-    {
+    if !has_resource_parameter {
         return Ok(());
     }
     let resource_pointer = operation_pointer(
@@ -1776,9 +1816,6 @@ fn validate_modifier_resource(
                 &resource_pointer,
             )
         })?;
-    if modifier_type == "mesh_sequence_cache" && resource_text.is_empty() {
-        return Ok(());
-    }
     let resource_id = Id::new(resource_text.to_owned()).map_err(|_| {
         engine.error(
             ErrorCode::InvalidArgument,
@@ -1797,14 +1834,13 @@ fn validate_modifier_resource(
         let valid_path = params
             .get("object_path")
             .and_then(Value::as_str)
-            .is_none_or(|path| {
-                path.is_empty()
-                    || path.strip_prefix('/').is_some_and(|tail| {
-                        !tail.is_empty()
-                            && tail.split('/').all(|segment| {
-                                !segment.is_empty() && segment != "." && segment != ".."
-                            })
-                    })
+            .is_some_and(|path| {
+                path.strip_prefix('/').is_some_and(|tail| {
+                    !tail.is_empty()
+                        && tail
+                            .split('/')
+                            .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
+                })
             });
         if !valid_path {
             return Err(engine.error(
@@ -1954,37 +1990,26 @@ fn validate_attribute_modifier_params_inner(
                 &[
                     "TOPOLOGY",
                     "NEAREST",
-                    "EDGE_NEAREST",
-                    "EDGEINTERP_NEAREST",
-                    "POLY_NEAREST",
                     "POLYINTERP_NEAREST",
                     "POLYINTERP_VNORPROJ",
                 ],
             ),
             (
                 "edge_mapping",
-                &[
-                    "TOPOLOGY",
-                    "VERT_NEAREST",
-                    "NEAREST",
-                    "POLY_NEAREST",
-                    "EDGEINTERP_VNORPROJ",
-                ],
+                &["TOPOLOGY", "NEAREST", "VERT_NEAREST", "POLY_NEAREST"],
             ),
             (
                 "loop_mapping",
                 &[
                     "TOPOLOGY",
-                    "NEAREST_NORMAL",
                     "NEAREST_POLYNOR",
-                    "NEAREST_POLY",
                     "POLYINTERP_NEAREST",
                     "POLYINTERP_LNORPROJ",
                 ],
             ),
             (
                 "poly_mapping",
-                &["TOPOLOGY", "NEAREST", "NORMAL", "POLYINTERP_PNORPROJ"],
+                &["TOPOLOGY", "NEAREST", "POLYINTERP_PNORPROJ"],
             ),
             (
                 "mix_mode",
@@ -1999,42 +2024,18 @@ fn validate_attribute_modifier_params_inner(
                 ],
             ),
             (
-                "layers_vgroup_select_src",
-                &["ACTIVE", "ALL", "BONE_SELECT", "BONE_DEFORM"],
-            ),
-            (
-                "layers_vcol_vert_select_src",
-                &["ACTIVE", "ALL", "BONE_SELECT", "BONE_DEFORM"],
-            ),
-            (
-                "layers_vcol_loop_select_src",
-                &["ACTIVE", "ALL", "BONE_SELECT", "BONE_DEFORM"],
-            ),
-            (
                 "layers_uv_select_src",
                 &["ACTIVE", "ALL", "BONE_SELECT", "BONE_DEFORM"],
             ),
-            ("layers_vgroup_select_dst", &["ACTIVE", "NAME", "INDEX"]),
-            ("layers_vcol_vert_select_dst", &["ACTIVE", "NAME", "INDEX"]),
-            ("layers_vcol_loop_select_dst", &["ACTIVE", "NAME", "INDEX"]),
             ("layers_uv_select_dst", &["ACTIVE", "NAME", "INDEX"]),
         ],
         _ => &[],
     };
     for (field, values) in enum_fields {
-        let allows_dynamic_layer_name = modifier_type == "data_transfer"
-            && matches!(
-                *field,
-                "layers_vgroup_select_src"
-                    | "layers_uv_select_src"
-                    | "layers_vgroup_select_dst"
-                    | "layers_uv_select_dst"
-            );
         if params.get(*field).is_some_and(|value| {
-            !value.as_str().is_some_and(|identifier| {
-                !identifier.is_empty()
-                    && (allows_dynamic_layer_name || values.contains(&identifier))
-            })
+            !value
+                .as_str()
+                .is_some_and(|identifier| values.contains(&identifier))
         }) {
             return Err(unsupported_attribute_modifier_value(modifier_type, field));
         }
@@ -2223,15 +2224,32 @@ fn validate_attribute_modifier_params_inner(
             })?;
         }
     }
-    if params
-        .get("map_curve")
-        .is_some_and(|value| !valid_curve_mapping_points(value))
-    {
-        return Err(invalid_attribute_modifier_parameter(
-            modifier_type,
-            "map_curve",
-            "at least two finite float32 [x, y] points with an optional AUTO, AUTO_CLAMPED, or VECTOR handle",
-        ));
+    if let Some(value) = params.get("map_curve") {
+        let points = value.as_array().ok_or_else(|| {
+            invalid_attribute_modifier_parameter(
+                modifier_type,
+                "map_curve",
+                "an array of [x,y] points",
+            )
+        })?;
+        if points.len() < 2
+            || points.iter().any(|point| {
+                point.as_array().is_none_or(|pair| {
+                    pair.len() != 2
+                        || pair.iter().any(|value| {
+                            !value.as_f64().is_some_and(|value| {
+                                value.is_finite() && (0.0..=1.0).contains(&value)
+                            })
+                        })
+                })
+            })
+        {
+            return Err(invalid_attribute_modifier_parameter(
+                modifier_type,
+                "map_curve",
+                "at least two [x,y] points in the unit square",
+            ));
+        }
     }
     Ok(())
 }
@@ -2555,74 +2573,4 @@ fn unsupported(_engine: &Engine<'_>, modifier_type: &str) -> PotError {
         format!("modifier `{modifier_type}` is not supported"),
         json!({"feature_id":format!("modifier.{modifier_type}")}),
     )
-}
-#[cfg(test)]
-mod tests {
-    #![expect(clippy::unwrap_used, reason = "operation-validation regression")]
-
-    use crate::ops::apply_batch;
-    use crate::{error::ErrorCode, model::SceneDoc};
-    use serde_json::json;
-
-    #[test]
-    fn data_transfer_dynamic_layer_names_pass_modifier_operation_validation() {
-        let doc = SceneDoc::new("scene-test".to_owned());
-        let operations = json!([
-            {"op":"node.create","id":"target","kind":"box","params":{"size":2.0}},
-            {
-                "op":"modifier.create",
-                "target":{"id":"target"},
-                "id":"transfer",
-                "type":"data_transfer",
-                "params":{
-                    "layers_vgroup_select_src":"Group / hand.L",
-                    "layers_uv_select_src":"UV set.with punctuation / 02",
-                    "layers_vgroup_select_dst":"Target Group (copy)",
-                    "layers_uv_select_dst":"UV/target layer [new]"
-                }
-            }
-        ]);
-        let outcome = apply_batch(
-            &doc,
-            &json!({"schema_version":1,"base_revision":0,"operations":operations}),
-        )
-        .unwrap();
-        let target = &outcome.doc.nodes[&crate::model::Id::new("target").unwrap()];
-        let params = &target.modifiers[0].params;
-        assert_eq!(
-            params["layers_uv_select_src"],
-            json!("UV set.with punctuation / 02")
-        );
-        assert_eq!(
-            params["layers_uv_select_dst"],
-            json!("UV/target layer [new]")
-        );
-
-        let invalid_type = json!({
-            "schema_version":1,
-            "base_revision":0,
-            "operations":[
-                {"op":"node.create","id":"target","kind":"box","params":{"size":2.0}},
-                {
-                    "op":"modifier.create",
-                    "target":{"id":"target"},
-                    "id":"transfer",
-                    "type":"data_transfer",
-                    "params":{"layers_uv_select_src":7}
-                }
-            ]
-        });
-        let error = apply_batch(&doc, &invalid_type).unwrap_err();
-        assert_eq!(error.code, ErrorCode::InvalidOperation);
-        assert_eq!(
-            error.details["pointer"],
-            json!("/operations/1/params/layers_uv_select_src")
-        );
-        let mut empty_name = invalid_type;
-        empty_name["operations"][1]["params"]["layers_uv_select_src"] = json!("");
-        assert_eq!(
-            apply_batch(&doc, &empty_name).unwrap_err().code,
-            ErrorCode::InvalidOperation
-        );
-    }
 }

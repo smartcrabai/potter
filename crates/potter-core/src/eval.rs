@@ -120,8 +120,9 @@ pub struct EvaluatedNode {
     /// World-space bounds size, or null for geometry-free nodes.
     pub dimensions: Option<[f64; 3]>,
     /// Effective material slots after the node's modifier stack: each slot resolved under its OBJECT
-    /// or DATA link, or replaced by a Boolean TRANSFER pool. This is the only evaluated slot table;
-    /// face material indices refer to it. Null entries are empty slots. Not serialized.
+    /// or DATA link, or replaced by a Boolean TRANSFER pool. Face material indices refer to it;
+    /// out-of-range indices clamp to its last entry (`BKE_object_material_get_eval`). Null entries are
+    /// empty slots. Not serialized.
     #[serde(skip)]
     pub materials: Vec<Option<Id>>,
 }
@@ -378,7 +379,6 @@ impl Snapshot {
             cache_directory,
         };
         let suppressed = BTreeSet::new();
-        let suppressed_instances = BTreeSet::new();
         let mut world_matrix_ids = BTreeSet::from([target_id.clone()]);
         let mesh_dependencies = object_mesh_dependencies(
             doc,
@@ -440,7 +440,6 @@ impl Snapshot {
             Some(driver_values),
             Some(&selected_nodes),
             &suppressed,
-            &suppressed_instances,
             &mesh_dependencies,
             None,
             Some(&world_matrix_ids),
@@ -464,7 +463,6 @@ impl Snapshot {
         crate::library::validate_linked_assets(doc, modifier_context.project_root)?;
         let scene_hash = source_scene_hash(doc)?;
         let mut suppressed = BTreeSet::new();
-        let mut suppressed_instances = BTreeSet::new();
         let mesh_dependencies = object_mesh_dependencies(
             doc,
             ModifierGate {
@@ -484,8 +482,6 @@ impl Snapshot {
                 modifier_context,
                 None,
                 None,
-                &suppressed,
-                &suppressed_instances,
                 &mesh_dependencies,
                 None,
                 None,
@@ -529,11 +525,8 @@ impl Snapshot {
                             "unsupported feature owner disappeared during evaluation",
                         )
                     })?;
-                    let instance = instance_collection_target(owner)?.is_some();
-                    if instance && error.details.get(INSTANCE_JOIN_FAILURE).is_some() {
-                        suppressed_instances.insert(node_id.clone());
-                    }
-                    if !instance
+                    let is_instance = instance_collection_target(owner)?.is_some();
+                    if !is_instance
                         && owner
                             .modifiers
                             .iter()
@@ -563,11 +556,6 @@ impl Snapshot {
                                 || node_errors.contains_key(dependent_id)
                             {
                                 continue;
-                            }
-                            if let Some(dependent) = doc.nodes.get(dependent_id)
-                                && instance_collection_target(dependent)?.is_some()
-                            {
-                                suppressed_instances.insert(dependent_id.clone());
                             }
                             suppressed.insert(dependent_id.clone());
                             let mut details = error.details.clone();
@@ -623,7 +611,6 @@ impl Snapshot {
             scene_hash.clone()
         };
         let suppressed = BTreeSet::new();
-        let suppressed_instances = BTreeSet::new();
         let mesh_dependencies = object_mesh_dependencies(
             source,
             ModifierGate {
@@ -642,7 +629,6 @@ impl Snapshot {
             None,
             selected_nodes,
             &suppressed,
-            &suppressed_instances,
             &mesh_dependencies,
             modifier_prefix,
             None,
@@ -650,8 +636,8 @@ impl Snapshot {
         )
     }
 
-    /// Evaluates `doc` with suppressed modifiers inactive and failed instance joins omitted.
-    /// `scene_hash` addresses the authored source, not the document itself.
+    /// Evaluates `doc` with the `suppressed` nodes' modifiers inactive. `scene_hash` addresses
+    /// the authored source, not the document itself.
     fn evaluate_gated(
         doc: &SceneDoc,
         scene_hash: &str,
@@ -661,7 +647,6 @@ impl Snapshot {
         driver_values: Option<&BTreeMap<(Id, String, u32), f64>>,
         selected_nodes: Option<&BTreeSet<Id>>,
         suppressed: &BTreeSet<Id>,
-        suppressed_instances: &BTreeSet<Id>,
         mesh_dependencies: &ObjectMeshDependencies,
         modifier_prefix: Option<ModifierPrefix<'_>>,
         world_matrix_ids: Option<&BTreeSet<Id>>,
@@ -740,10 +725,15 @@ impl Snapshot {
             let Some(owner) = doc.nodes.get(owner_id) else {
                 continue;
             };
-            for (index, modifier) in owner.modifiers.iter().enumerate() {
-                if !gate.is_active_at(owner_id, index, modifier) {
-                    continue;
-                }
+            for modifier in owner.modifiers.iter().filter(|modifier| {
+                gate.is_active(owner_id, modifier)
+                    && modifier.modifier_type == "array"
+                    && modifier
+                        .params
+                        .get("fit_type")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("FIT_CURVE")
+            }) {
                 if let Some((curve_id, length)) =
                     evaluated_array_curve_path_length(doc, modifier, &matrices)?
                 {
@@ -963,8 +953,8 @@ impl Snapshot {
                             &values,
                         )?;
                     }
-                    if !has_stack_modifier(gate, id, node, "cloth")
-                        && !has_stack_modifier(gate, id, node, "soft_body")
+                    if !has_stack_modifier(node, "cloth")
+                        && !has_stack_modifier(node, "soft_body")
                         && let Some(positions) = deformed_vertices.get(id)
                     {
                         if positions.len() != rigged_source.vertices.len() {
@@ -978,7 +968,7 @@ impl Snapshot {
                             vertex.co = DVec3::from_array(*position);
                         }
                     }
-                    if !has_stack_modifier(gate, id, node, "dynamic_paint")
+                    if !has_stack_modifier(node, "dynamic_paint")
                         && let Some(colors) = paint_colors.get(id)
                     {
                         if colors.len() != rigged_source.vertices.len() {
@@ -990,7 +980,7 @@ impl Snapshot {
                         }
                         inject_dynamic_paint_colors(&mut rigged_source, colors);
                     }
-                    if !has_stack_modifier(gate, id, node, "dynamic_paint")
+                    if !has_stack_modifier(node, "dynamic_paint")
                         && let Some(weights) = paint_weights.get(id)
                     {
                         if weights.len() != rigged_source.vertices.len()
@@ -1090,14 +1080,14 @@ impl Snapshot {
                             | "normal_edit"
                             | "uv_project"
                             | "uv_warp"
-                            | "data_transfer"
-                            | "mask" => apply_scene_attribute_modifier(
+                            | "data_transfer" => apply_scene_attribute_modifier(
                                 mesh,
                                 modifier,
                                 id,
                                 doc,
-                                &references,
-                                texture_rng,
+                                &matrices,
+                                &meshes,
+                                modifier_context.project_root,
                             ),
                             "surface_deform" | "mesh_deform" => apply_scene_deform_modifier(
                                 mesh,
@@ -1111,13 +1101,12 @@ impl Snapshot {
                                 mesh,
                                 modifier,
                                 doc,
-                                id,
                                 modifier_context.project_root,
                                 frame,
                                 scene.fps,
                                 scene.fps_base,
-                                modifier_warnings,
-                            ),
+                            )
+                            .map(|warnings| modifier_warnings.extend(warnings)),
                             "mesh_cache" => apply_mesh_cache_modifier(
                                 mesh,
                                 modifier,
@@ -1174,7 +1163,7 @@ impl Snapshot {
                             .into_iter()
                             .map(|warning| attach_node_owner(warning, id)),
                     );
-                    let evaluated_mesh = if has_stack_modifier(gate, id, node, "fluid") {
+                    let evaluated_mesh = if has_stack_modifier(node, "fluid") {
                         evaluated.mesh
                     } else {
                         fluid_surfaces.get(id).cloned().unwrap_or(evaluated.mesh)
@@ -1398,8 +1387,9 @@ impl Snapshot {
                                 modifier,
                                 id,
                                 doc,
-                                &references,
-                                texture_rng,
+                                &matrices,
+                                &meshes,
+                                modifier_context.project_root,
                             ),
                             "surface_deform" | "mesh_deform" => apply_scene_deform_modifier(
                                 mesh,
@@ -1413,13 +1403,12 @@ impl Snapshot {
                                 mesh,
                                 modifier,
                                 doc,
-                                id,
                                 modifier_context.project_root,
                                 frame,
                                 scene.fps,
                                 scene.fps_base,
-                                modifier_warnings,
-                            ),
+                            )
+                            .map(|warnings| modifier_warnings.extend(warnings)),
                             "mesh_cache" => apply_mesh_cache_modifier(
                                 mesh,
                                 modifier,
@@ -1785,7 +1774,7 @@ impl Snapshot {
         )?;
         for (id, node) in &doc.nodes {
             if !nodes.contains_key(id)
-                || suppressed_instances.contains(id)
+                || gate.suppressed.contains(id)
                 || instance_collection_target(node)?.is_none()
             {
                 continue;
@@ -1807,7 +1796,6 @@ impl Snapshot {
                 &matrices,
                 &meshes,
                 &nodes,
-                suppressed_instances,
                 &mut BTreeSet::new(),
             )?;
             let bounds = mesh_bounds(&mesh, matrix)?;
@@ -1899,20 +1887,13 @@ fn modifier_transform_references(modifier: &Modifier) -> BTreeSet<Id> {
     }
 
     let parameters: &[&str] = match modifier.modifier_type.as_str() {
-        "armature" | "lattice" | "volume_to_mesh" | "hook" | "cast" => &["object"],
+        "armature" | "lattice" | "hook" | "cast" => &["object"],
         "simple_deform" => &["origin"],
         "uv_project" => &["projectors"],
         "uv_warp" => &["object_from", "object_to"],
         "displace" => &["texture_coords_object"],
         "wave" => &["texture_coords_object", "start_position_object"],
         "warp" => &["object_from", "object_to", "texture_coords_object"],
-        "shrinkwrap" => &["target", "auxiliary_target"],
-        "normal_edit" => &["target"],
-        "vertex_weight_proximity" => &["target", "mask_tex_map_object"],
-        "vertex_weight_edit" | "vertex_weight_mix" => &["mask_tex_map_object"],
-        "mask" if modifier.params.get("mode").and_then(Value::as_str) == Some("ARMATURE") => {
-            &["armature"]
-        }
         "volume_displace" => &["texture_map_object"],
         _ => &[],
     };
@@ -1960,7 +1941,6 @@ fn source_scene_hash(doc: &SceneDoc) -> Result<String> {
     let scene_value = serde_json::to_value(doc).map_err(PotError::internal_json)?;
     Ok(hash::sha256(&hash::canonicalize(&scene_value)?))
 }
-
 /// Curve-path length comes from the Curve Data-Block and world transform, not its modifier stack.
 pub(crate) fn evaluated_array_curve_path_length(
     doc: &SceneDoc,
@@ -2027,15 +2007,6 @@ pub(crate) struct ModifierGate<'a> {
 }
 
 impl ModifierGate<'_> {
-    fn stack_modifiers<'m>(&self, node_id: &Id, modifiers: &'m [Modifier]) -> &'m [Modifier] {
-        match self.modifier_prefix {
-            Some(prefix) if prefix.node_id == node_id => {
-                &modifiers[..prefix.keep.min(modifiers.len())]
-            }
-            _ => modifiers,
-        }
-    }
-
     /// Whether `modifier` on `node_id` takes part in this evaluation.
     pub(crate) fn is_active(&self, node_id: &Id, modifier: &Modifier) -> bool {
         let in_prefix = match self.modifier_prefix {
@@ -2112,7 +2083,94 @@ pub(crate) fn read_cache_resource(
             json!({"resource_id":resource_id}),
         )
     })?;
-    crate::cache_sequence::read_cache_resource_record(resource, resource_id.as_str(), project_root)
+    let expected_hash = resource
+        .get("hash")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "Alembic cache resource has no expected content hash",
+                json!({"resource_id":resource_id}),
+            )
+        })?;
+    let bytes = if resource.get("packed").and_then(serde_json::Value::as_bool) == Some(true) {
+        let values = resource
+            .get("bytes")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| {
+                PotError::with_details(
+                    ErrorCode::SceneInvalid,
+                    "packed Alembic cache resource has no byte payload",
+                    json!({"resource_id":resource_id}),
+                )
+            })?;
+        values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                value
+                    .as_u64()
+                    .and_then(|byte| u8::try_from(byte).ok())
+                    .ok_or_else(|| {
+                        PotError::with_details(
+                            ErrorCode::SceneInvalid,
+                            "packed Alembic cache byte is outside 0..255",
+                            json!({"resource_id":resource_id,"index":index}),
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        let uri = resource
+            .get("uri")
+            .or_else(|| resource.get("path"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                PotError::with_details(
+                    ErrorCode::DependencyMissing,
+                    "Alembic cache resource has no file URI",
+                    json!({"resource_id":resource_id}),
+                )
+            })?;
+        let path_text = uri.strip_prefix("file://").unwrap_or(uri);
+        let path = Path::new(path_text);
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else if let Some(root) = project_root {
+            root.join(path)
+        } else {
+            return Err(PotError::with_details(
+                ErrorCode::DependencyMissing,
+                "relative Alembic cache resource cannot be resolved without a project root",
+                json!({"resource_id":resource_id,"uri":uri}),
+            ));
+        };
+        fs::read(&path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                PotError::with_details(
+                    ErrorCode::DependencyMissing,
+                    format!("Alembic cache file is missing: {}", path.display()),
+                    json!({"resource_id":resource_id,"uri":uri}),
+                )
+            } else {
+                PotError::io(&error)
+            }
+        })?
+    };
+    let actual_hash = hash::sha256(&bytes);
+    if actual_hash != expected_hash {
+        return Err(PotError::with_details(
+            ErrorCode::AssetChanged,
+            format!("Alembic cache resource `{resource_id}` changed after registration"),
+            json!({
+                "resource_id":resource_id,
+                "uri":resource.get("uri").and_then(serde_json::Value::as_str),
+                "expected_hash":expected_hash,
+                "actual_hash":actual_hash,
+            }),
+        ));
+    }
+    Ok((bytes, actual_hash))
 }
 
 pub(crate) fn load_vdb_volume_data(
@@ -2344,34 +2402,27 @@ fn object_mesh_dependencies(
             }
             let parameters: &[&str] = match modifier.modifier_type.as_str() {
                 "data_transfer" | "mesh_deform" | "curve" | "mesh_to_volume" => &["object"],
-                "shrinkwrap" => &["target", "auxiliary_target"],
-                "surface_deform" | "normal_edit" => &["target"],
-                "vertex_weight_proximity" if proximity_uses_geometry_mesh(modifier) => &["target"],
+                "shrinkwrap" => {
+                    if modifier
+                        .params
+                        .get("target")
+                        .is_some_and(|value| !value.is_null())
+                    {
+                        &["target"]
+                    } else {
+                        &["object"]
+                    }
+                }
+                "surface_deform" | "vertex_weight_proximity" | "normal_edit" => &["target"],
                 "array" => &["start_cap", "end_cap"],
                 _ => &[],
             };
             for parameter in parameters {
-                let value = modifier.params.get(*parameter);
-                if modifier.modifier_type == "shrinkwrap"
-                    && value.and_then(Value::as_str) == Some(owner_id.as_str())
-                {
-                    continue;
-                }
-                add_mesh_operand_dependency(&mut dependencies.modifiers, owner_id, value);
-            }
-            if modifier.modifier_type == "mask"
-                && modifier.params.get("mode").and_then(Value::as_str) == Some("ARMATURE")
-            {
                 add_mesh_operand_dependency(
-                    &mut dependencies.other,
+                    &mut dependencies.modifiers,
                     owner_id,
-                    modifier.params.get("armature"),
+                    modifier.params.get(*parameter),
                 );
-            }
-            if modifier.modifier_type == "uv_warp"
-                && let Some(owner_dependencies) = dependencies.other.get_mut(owner_id)
-            {
-                add_modifier_pose_armature_references(doc, modifier, owner_dependencies);
             }
         }
         if let Some(collection_id) = instance_collection_target(node)? {
@@ -2499,9 +2550,8 @@ fn object_mesh_evaluation_order(
                     "physics_particle_emitter",
                     "particle_system",
                 ))
-                || node.modifiers.iter().enumerate().any(|(index, modifier)| {
-                    gate.is_active_at(id, index, modifier)
-                        && modifier.modifier_type == "particle_system"
+                || node.modifiers.iter().any(|modifier| {
+                    gate.is_active(id, modifier) && modifier.modifier_type == "particle_system"
                 });
             if has_particle_system == particle_system_first {
                 visit(
@@ -2702,13 +2752,18 @@ fn add_modifier_pose_armature_references(
     modifier: &Modifier,
     result: &mut BTreeSet<Id>,
 ) {
-    for (object_parameter, bone_parameter) in [
-        ("object_from", "bone_from"),
-        ("object_to", "bone_to"),
-        ("texture_coords_object", "texture_coords_bone"),
-        ("mask_tex_map_object", "mask_tex_map_bone"),
-        ("texture_map_object", "texture_map_bone"),
-    ] {
+    let pose_reference_parameters: &[(&str, &str)] = match modifier.modifier_type.as_str() {
+        "hook" => &[("object", "subtarget")],
+        "warp" => &[
+            ("object_from", "bone_from"),
+            ("object_to", "bone_to"),
+            ("texture_coords_object", "texture_coords_bone"),
+        ],
+        "displace" | "wave" => &[("texture_coords_object", "texture_coords_bone")],
+        "volume_displace" => &[("texture_map_object", "texture_map_bone")],
+        _ => &[],
+    };
+    for (object_parameter, bone_parameter) in pose_reference_parameters {
         let Some(object_text) = modifier
             .params
             .get(object_parameter)
@@ -2779,44 +2834,10 @@ fn modifier_pose_armatures(
     result
 }
 
-fn proximity_mode_is_geometry(modifier: &Modifier) -> bool {
-    modifier
-        .params
-        .get("proximity_mode")
-        .or_else(|| {
-            crate::params::default_value(
-                crate::params::ParameterFamily::Modifier,
-                "vertex_weight_proximity",
-                "proximity_mode",
-            )
-        })
-        .and_then(Value::as_str)
-        == Some("GEOMETRY")
-}
-
-fn proximity_geometry_is_empty(modifier: &Modifier) -> bool {
-    modifier
-        .params
-        .get("proximity_geometry")
-        .or_else(|| {
-            crate::params::default_value(
-                crate::params::ParameterFamily::Modifier,
-                "vertex_weight_proximity",
-                "proximity_geometry",
-            )
-        })
-        .and_then(Value::as_array)
-        .is_none_or(Vec::is_empty)
-}
-
-fn proximity_uses_geometry_mesh(modifier: &Modifier) -> bool {
-    proximity_mode_is_geometry(modifier) && !proximity_geometry_is_empty(modifier)
-}
-
 /// Resolve the object-reference parameters for a scene-bound modifier through one shared path.
 ///
-/// Only geometry-consuming modifiers retain operand meshes; transform-only references reuse the
-/// scene's existing world-matrix context.
+/// Each operand retains its object-local mesh and carries the matrix from that object into
+/// the modifier subject's local space. Camera data is preserved for projector modifiers.
 pub(crate) fn resolve_modifier_object_operands(
     modifier: &Modifier,
     subject_id: &Id,
@@ -2827,50 +2848,26 @@ pub(crate) fn resolve_modifier_object_operands(
     let reference_parameters: &[&str] = match modifier.modifier_type.as_str() {
         "boolean" | "curve" | "hook" | "data_transfer" | "mesh_deform" => &["object"],
         "uv_project" => &["projectors"],
-        "warp" => &["object_from", "object_to"],
-        "shrinkwrap" => &["target", "auxiliary_target"],
-        "normal_edit" | "surface_deform" | "vertex_weight_proximity" => &["target"],
-        "mask" if modifier.params.get("mode").and_then(Value::as_str) == Some("ARMATURE") => {
-            &["armature"]
-        }
+        "uv_warp" | "warp" => &["object_from", "object_to"],
+        "shrinkwrap" => &["target", "object"],
+        "vertex_weight_edit" | "vertex_weight_mix" => &["mask_tex_map_object"],
+        "vertex_weight_proximity" => &["target", "mask_tex_map_object"],
+        "normal_edit" | "surface_deform" => &["target"],
+        "volume_displace" => &["texture_map_object"],
         _ => &[],
     };
-    let has_references = reference_parameters.iter().any(|parameter| {
-        modifier
-            .params
-            .get(*parameter)
-            .is_some_and(|value| match value {
-                Value::String(text) => !text.is_empty(),
-                Value::Array(values) if *parameter == "projectors" => {
-                    values.iter().any(|value| !value.is_null())
-                }
-                value => !value.is_null(),
-            })
-    });
-    if !has_references {
-        return Ok(BTreeMap::new());
-    }
     let subject_world = world_matrices.get(subject_id).copied().ok_or_else(|| {
         PotError::new(
             ErrorCode::InternalError,
             "modifier subject world matrix is missing",
         )
     })?;
-    let needs_dmat_transform = matches!(
-        modifier.modifier_type.as_str(),
-        "boolean" | "curve" | "hook" | "warp" | "shrinkwrap" | "surface_deform" | "mesh_deform"
-    );
-    let subject_inverse = if needs_dmat_transform {
-        let inverse = subject_world.inverse();
-        if !inverse.is_finite() {
-            return Err(PotError::invalid_argument(
-                "modifier subject transform must be invertible",
-            ));
-        }
-        Some(inverse)
-    } else {
-        None
-    };
+    let subject_inverse = subject_world.inverse();
+    if !subject_inverse.is_finite() {
+        return Err(PotError::invalid_argument(
+            "modifier subject transform must be invertible",
+        ));
+    }
     let mut resolved = BTreeMap::new();
     for parameter in reference_parameters {
         let Some(value) = modifier.params.get(*parameter) else {
@@ -2880,10 +2877,9 @@ pub(crate) fn resolve_modifier_object_operands(
             continue;
         }
         let object_texts = match value {
-            serde_json::Value::String(text) => vec![text.as_str()],
-            serde_json::Value::Array(values) if *parameter == "projectors" => values
+            Value::String(text) => vec![text.as_str()],
+            Value::Array(values) if *parameter == "projectors" => values
                 .iter()
-                .filter(|value| !value.is_null())
                 .map(|value| {
                     value.as_str().ok_or_else(|| {
                         PotError::invalid_argument("uv_project projectors must contain object IDs")
@@ -2913,28 +2909,11 @@ pub(crate) fn resolve_modifier_object_operands(
                     json!({"modifier_id":modifier.id,"parameter":parameter,"object":object_id}),
                 )
             })?;
-            if modifier.modifier_type == "shrinkwrap" && object_id == *subject_id {
-                continue;
-            }
             let data_block = object
                 .data
                 .as_ref()
                 .and_then(|data_id| doc.data_blocks.get(data_id));
-            if modifier.modifier_type == "data_transfer"
-                && data_block.is_none_or(|data| data.data_type != "mesh")
-            {
-                operands.clear();
-                break;
-            }
-            let needs_operand_mesh = match modifier.modifier_type.as_str() {
-                "normal_edit" | "uv_project" | "vertex_weight_edit" | "vertex_weight_mix"
-                | "mask" => false,
-                "vertex_weight_proximity" => proximity_uses_geometry_mesh(modifier),
-                _ => true,
-            };
-            let operand_mesh = if !needs_operand_mesh {
-                Mesh::default()
-            } else if let Some(evaluated_mesh) = evaluated_meshes.get(&object_id) {
+            let operand_mesh = if let Some(evaluated_mesh) = evaluated_meshes.get(&object_id) {
                 evaluated_mesh.clone()
             } else {
                 let mut base_mesh = match data_block {
@@ -2977,106 +2956,12 @@ pub(crate) fn resolve_modifier_object_operands(
                     json!({"modifier_id":modifier.id,"object":object_id}),
                 )
             })?;
-            let use_transfer_transform = modifier.modifier_type == "data_transfer"
-                && modifier
-                    .params
-                    .get("use_object_transform")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(true);
-            let is_normal_edit = modifier.modifier_type == "normal_edit";
-            let is_geometry_proximity = modifier.modifier_type == "vertex_weight_proximity"
-                && proximity_mode_is_geometry(modifier);
-            let proximity_geometry_empty =
-                is_geometry_proximity && proximity_geometry_is_empty(modifier);
-            let needs_world_matrix = modifier.modifier_type == "uv_project"
-                || (modifier.modifier_type == "vertex_weight_proximity"
-                    && (!is_geometry_proximity || proximity_geometry_empty));
-            let needs_matrix_data = use_transfer_transform
-                || is_normal_edit
-                || (is_geometry_proximity && !proximity_geometry_empty)
-                || needs_world_matrix;
-            let blender_matrices_f32 = needs_matrix_data.then(|| {
-                let (world, local_to_subject, subject_to_local) = if use_transfer_transform {
-                    let (forward, inverse) = crate::geom::modifiers::blender_space_transform_f32(
-                        object_world,
-                        subject_world,
-                    );
-                    (None, Some(forward), Some(inverse))
-                } else if is_normal_edit {
-                    let subject_world_f32 = subject_world.to_cols_array().map(|value| value as f32);
-                    let inverse_subject =
-                        crate::geom::modifiers::blender_inverse_m4(subject_world_f32);
-                    let object_world_f32 = object_world.to_cols_array().map(|value| value as f32);
-                    (
-                        None,
-                        Some(crate::geom::modifiers::blender_multiply_m4(
-                            inverse_subject,
-                            object_world_f32,
-                        )),
-                        None,
-                    )
-                } else if is_geometry_proximity && !proximity_geometry_empty {
-                    let subject_world_f32 = subject_world.to_cols_array().map(|value| value as f32);
-                    let object_world_f32 = object_world.to_cols_array().map(|value| value as f32);
-                    let inverse_target =
-                        crate::geom::modifiers::blender_inverse_m4(object_world_f32);
-                    (
-                        None,
-                        None,
-                        Some(crate::geom::modifiers::blender_multiply_m4(
-                            inverse_target,
-                            subject_world_f32,
-                        )),
-                    )
-                } else {
-                    (
-                        needs_world_matrix
-                            .then(|| object_world.to_cols_array().map(|value| value as f32)),
-                        None,
-                        None,
-                    )
-                };
-                crate::geom::modifiers::attributes::SceneOperandMatricesF32 {
-                    world,
-                    local_to_subject,
-                    subject_to_local,
-                }
-            });
-            let armature = armature_data_for_modifier_operand(object, doc);
-            let layer_selection = crate::geom::modifiers::attributes::AttributeLayerSelection {
-                vertex_group_names: data_block.map_or_else(Vec::new, |data| {
-                    data.vertex_groups
-                        .iter()
-                        .map(|group| group.name.clone())
-                        .collect()
-                }),
-                active_vertex_group_index: object.active_vertex_group_index,
-            };
             operands.push(crate::geom::modifiers::attributes::SceneOperand {
                 mesh: operand_mesh,
-                local_to_subject: subject_inverse.map(|inverse| inverse * object_world),
-                blender_matrices_f32,
+                local_to_subject: subject_inverse * object_world,
                 camera: data_block.and_then(|data| data.camera.clone()),
                 armature: object.kind == "armature"
                     || data_block.is_some_and(|data| data.data_type == "armature"),
-                object_scale: DVec3::from_array(object.transform.scale),
-                selected_bones: armature.map_or_else(BTreeSet::new, |armature| {
-                    armature
-                        .bones
-                        .values()
-                        .filter(|bone| bone.select)
-                        .map(|bone| bone.name.clone())
-                        .collect()
-                }),
-                deforming_bones: armature.map_or_else(BTreeSet::new, |armature| {
-                    armature
-                        .bones
-                        .values()
-                        .filter(|bone| bone.deform)
-                        .map(|bone| bone.name.clone())
-                        .collect()
-                }),
-                layer_selection,
             });
         }
         resolved.insert((*parameter).to_owned(), operands);
@@ -3099,199 +2984,79 @@ fn reference_object_or_bone_world_f32(
     )
 }
 
-fn resolve_uv_warp_reference_world_f32(
-    modifier: &Modifier,
-    object_parameter: &str,
-    bone_parameter: &str,
-    doc: &SceneDoc,
-    world_matrices: &BTreeMap<Id, DMat4>,
-    bone_pose_matrices: &BTreeMap<Id, BTreeMap<Id, [f64; 16]>>,
-) -> Result<Option<[f32; 16]>> {
-    let Some(value) = modifier.params.get(object_parameter) else {
-        return Ok(None);
-    };
-    let Some(object_text) = value.as_str().filter(|text| !text.is_empty()) else {
-        if value.is_null() || value.as_str().is_some_and(str::is_empty) {
-            return Ok(None);
-        }
-        return Err(PotError::invalid_argument(format!(
-            "UV Warp `{object_parameter}` must be an object ID or null"
-        )));
-    };
-    let object_id = Id::new(object_text.to_owned()).map_err(|error| {
-        PotError::with_details(
-            ErrorCode::InvalidArgument,
-            error.message,
-            json!({"modifier_id":modifier.id,"parameter":object_parameter,"object":object_text}),
-        )
-    })?;
-    let object = doc.nodes.get(&object_id).ok_or_else(|| {
-        PotError::with_details(
-            ErrorCode::TargetNotFound,
-            format!("UV Warp operand object `{object_id}` was not found"),
-            json!({"modifier_id":modifier.id,"parameter":object_parameter,"object":object_id}),
-        )
-    })?;
-    let object_world = world_matrices.get(&object_id).copied().ok_or_else(|| {
-        PotError::with_details(
-            ErrorCode::EvaluationFailed,
-            "UV Warp operand world matrix is missing",
-            json!({"modifier_id":modifier.id,"parameter":object_parameter,"object":object_id}),
-        )
-    })?;
-    let Some(bone_name) = modifier
-        .params
-        .get(bone_parameter)
-        .and_then(Value::as_str)
-        .filter(|name| !name.is_empty())
-    else {
-        return Ok(Some(reference_object_or_bone_world_f32(object_world, None)));
-    };
-    if object.kind != "armature" {
-        return Ok(Some(reference_object_or_bone_world_f32(object_world, None)));
-    }
-    let armature = object
-        .data
-        .as_ref()
-        .and_then(|data_id| doc.data_blocks.get(data_id))
-        .and_then(|data| data.armature.as_ref());
-    let Some(armature) = armature else {
-        return Ok(Some(reference_object_or_bone_world_f32(object_world, None)));
-    };
-    let Some((bone_id, _)) = armature
-        .bones
-        .iter()
-        .find(|(_, bone)| bone.name == bone_name)
-    else {
-        return Ok(Some(reference_object_or_bone_world_f32(object_world, None)));
-    };
-    let pose_matrix = bone_pose_matrices
-        .get(&object_id)
-        .and_then(|bones| bones.get(bone_id))
-        .ok_or_else(|| {
-            PotError::with_details(
-                ErrorCode::EvaluationFailed,
-                "UV Warp pose-bone matrix is missing",
-                json!({"modifier_id":modifier.id,"parameter":bone_parameter,"object":object_id,"bone":bone_name}),
-            )
-        })?;
-    Ok(Some(reference_object_or_bone_world_f32(
-        object_world,
-        Some(pose_matrix),
-    )))
-}
-
-fn matrix_f32_columns(matrix: [f32; 16]) -> [[f32; 4]; 4] {
-    let mut columns = [[0.0; 4]; 4];
-    for column in 0..4 {
-        columns[column].copy_from_slice(&matrix[column * 4..column * 4 + 4]);
-    }
-    columns
-}
-
 pub(crate) fn apply_scene_attribute_modifier(
     mesh: &mut Mesh,
     modifier: &Modifier,
     subject_id: &Id,
     doc: &SceneDoc,
-    references: &SceneReferences<'_>,
-    texture_rng: &mut crate::blender_rng::BlenderRng,
+    world_matrices: &BTreeMap<Id, DMat4>,
+    evaluated_meshes: &BTreeMap<Id, Mesh>,
+    project_root: Option<&Path>,
 ) -> Result<()> {
-    if modifier.modifier_type == "vertex_weight_proximity"
-        && modifier.params.get("target").is_none_or(Value::is_null)
-    {
-        return Ok(());
-    }
-    let mut uv_warp_modifier = None;
-    if modifier.modifier_type == "uv_warp" {
-        let source_world = resolve_uv_warp_reference_world_f32(
-            modifier,
-            "object_from",
-            "bone_from",
-            doc,
-            references.world_matrices,
-            references.bone_pose_matrices,
-        )?;
-        let destination_world = resolve_uv_warp_reference_world_f32(
-            modifier,
-            "object_to",
-            "bone_to",
-            doc,
-            references.world_matrices,
-            references.bone_pose_matrices,
-        )?;
-        let matrix = crate::geom::modifiers::attributes::build_uv_warp_matrix_f32(
-            source_world,
-            destination_world,
-            modifier,
-        )?;
-        let mut resolved = modifier.clone();
-        resolved.runtime.uv_warp_matrix = Some(matrix_f32_columns(matrix));
-        uv_warp_modifier = Some(resolved);
-    }
-    let modifier = uv_warp_modifier
-        .as_ref()
-        .map_or(modifier, |resolved| resolved);
     let operands = resolve_modifier_object_operands(
         modifier,
         subject_id,
         doc,
-        references.world_matrices,
-        references.evaluated_meshes,
+        world_matrices,
+        evaluated_meshes,
     )?;
-    let texture = crate::geom::modifiers::load_modifier_texture(
-        modifier,
-        "mask_texture",
-        doc,
-        references.project_root,
-    )?;
-    let subject_world = subject_world_matrix(modifier, subject_id, references)?;
-    let subject = doc.nodes.get(subject_id).ok_or_else(|| {
-        PotError::with_details(
-            ErrorCode::TargetNotFound,
-            "modifier subject object is missing",
-            json!({"modifier_id": modifier.id, "subject": subject_id}),
+    let texture = load_weight_modifier_texture(modifier, doc, project_root)?;
+    let subject_world = world_matrices.get(subject_id).copied().ok_or_else(|| {
+        PotError::new(
+            ErrorCode::InternalError,
+            "modifier subject world matrix is missing",
         )
     })?;
-    let subject_data = subject
-        .data
-        .as_ref()
-        .and_then(|data_id| doc.data_blocks.get(data_id));
-    let subject_layer_selection = crate::geom::modifiers::attributes::AttributeLayerSelection {
-        vertex_group_names: subject_data.map_or_else(Vec::new, |data| {
-            data.vertex_groups
-                .iter()
-                .map(|group| group.name.clone())
-                .collect()
-        }),
-        active_vertex_group_index: subject.active_vertex_group_index,
-    };
-    let mut resolved = modifier.clone();
-    if texture.is_some() {
-        resolved.runtime.texture_mapping = texture_coordinate_mapping_with_parameters(
-            modifier,
-            subject_world,
-            doc,
-            references.world_matrices,
-            references.bone_pose_matrices,
-            "mask_tex_mapping",
-            "mask_tex_map_object",
-            "mask_tex_map_bone",
-        )?;
-    }
-    *mesh = crate::geom::modifiers::attributes::evaluate_with_texture_context(
+    *mesh = crate::geom::modifiers::attributes::evaluate_with_context(
         mesh,
-        &resolved,
+        modifier,
         &operands,
-        texture
-            .as_ref()
-            .map(crate::geom::legacy_texture::ResolvedTexture::source),
+        texture.as_ref(),
         subject_world,
-        &subject.name,
-        &subject_layer_selection,
-        texture_rng,
     )?;
     Ok(())
+}
+
+fn load_weight_modifier_texture(
+    modifier: &Modifier,
+    doc: &SceneDoc,
+    project_root: Option<&Path>,
+) -> Result<Option<crate::image::ImageData>> {
+    let Some(value) = modifier.params.get("mask_texture") else {
+        return Ok(None);
+    };
+    let Some(image_text) = value.as_str().filter(|value| !value.is_empty()) else {
+        if value.is_null() {
+            return Ok(None);
+        }
+        return Err(PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            "weight modifier texture is not an image texture",
+            json!({"feature_id":format!("modifier.{}.texture_type",modifier.modifier_type),"modifier_id":modifier.id}),
+        ));
+    };
+    let image_id = Id::new(image_text.to_owned()).map_err(|error| {
+        PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            "weight modifier texture is not an image texture",
+            json!({"feature_id":format!("modifier.{}.texture_type",modifier.modifier_type),"modifier_id":modifier.id,"cause":error.message}),
+        )
+    })?;
+    let image = doc.images.get(&image_id).ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            "procedural Blender texture masks are not modeled",
+            json!({"feature_id":format!("modifier.{}.texture_type",modifier.modifier_type),"modifier_id":modifier.id,"texture":image_text}),
+        )
+    })?;
+    let root = project_root.ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::DependencyMissing,
+            "image texture mask requires a project root",
+            json!({"feature_id":format!("modifier.{}.image_texture",modifier.modifier_type),"image":image_id}),
+        )
+    })?;
+    crate::image::load_image_data(image, root, crate::image::ImageInterpolation::Linear).map(Some)
 }
 
 fn scene_subject_name<'a>(doc: &'a SceneDoc, subject_id: &Id) -> Result<&'a str> {
@@ -3336,12 +3101,7 @@ pub(crate) fn apply_scene_deform_modifier(
                 modifier.modifier_type
             ))
         })?;
-    let local_to_subject = operand.local_to_subject.ok_or_else(|| {
-        PotError::new(
-            ErrorCode::EvaluationFailed,
-            "scene deform operand DVec3 transform is missing",
-        )
-    })?;
+    let local_to_subject = operand.local_to_subject;
     let mut target_mesh = operand.mesh.clone();
     for vertex in &mut target_mesh.vertices {
         vertex.co = local_to_subject.transform_point3(vertex.co);
@@ -3403,37 +3163,22 @@ fn apply_mesh_sequence_cache_modifier(
     mesh: &mut Mesh,
     modifier: &Modifier,
     doc: &SceneDoc,
-    node_id: &Id,
     project_root: Option<&Path>,
     frame: f64,
     fps: u32,
     fps_base: f64,
-    warnings: &mut Vec<PotError>,
-) -> Result<()> {
-    match modifier.params.get("object_path") {
-        None | Some(Value::Null) => return Ok(()),
-        Some(Value::String(object_path)) if object_path.is_empty() => return Ok(()),
-        Some(Value::String(_)) => {}
-        Some(_) => {
-            return Err(PotError::with_details(
-                ErrorCode::InvalidArgument,
-                "Mesh Sequence Cache object_path must be a string",
-                json!({"modifier_id":modifier.id,"parameter":"object_path"}),
-            ));
-        }
-    }
-    let resource_text = match modifier.params.get("resource") {
-        None | Some(Value::Null) => return Ok(()),
-        Some(Value::String(resource)) if resource.is_empty() => return Ok(()),
-        Some(Value::String(resource)) => resource.as_str(),
-        Some(_) => {
-            return Err(PotError::with_details(
+) -> Result<Vec<PotError>> {
+    let resource_text = modifier
+        .params
+        .get("resource")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            PotError::with_details(
                 ErrorCode::InvalidArgument,
                 "Mesh Sequence Cache resource must be a resource ID",
                 json!({"modifier_id":modifier.id,"parameter":"resource"}),
-            ));
-        }
-    };
+            )
+        })?;
     let resource_id = Id::new(resource_text).map_err(|error| {
         PotError::with_details(
             ErrorCode::InvalidArgument,
@@ -3441,47 +3186,15 @@ fn apply_mesh_sequence_cache_modifier(
             json!({"modifier_id":modifier.id,"resource":resource_text}),
         )
     })?;
-    let sequence = modifier
-        .params
-        .get("is_sequence")
+    let (bytes, actual_hash) = read_cache_resource(doc, project_root, &resource_id)?;
+    let is_sequence = doc
+        .resources
+        .get(&resource_id)
+        .and_then(|resource| resource.get("cache_file"))
+        .and_then(|settings| settings.get("is_sequence"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let (bytes, actual_hash) = if sequence {
-        let resource = doc.resources.get(&resource_id).ok_or_else(|| {
-            PotError::with_details(
-                ErrorCode::DependencyMissing,
-                format!("Alembic cache resource `{resource_id}` is not registered"),
-                json!({"resource_id":resource_id}),
-            )
-        })?;
-        let requested_frame = match modifier.params.get("override_frame") {
-            None | Some(Value::Null) => frame,
-            Some(value) => value
-                .as_f64()
-                .filter(|value| value.is_finite())
-                .ok_or_else(|| {
-                    PotError::with_details(
-                        ErrorCode::InvalidArgument,
-                        "Mesh Sequence Cache override_frame must be finite or null",
-                        json!({"modifier_id":modifier.id,"parameter":"override_frame"}),
-                    )
-                })?,
-        };
-        match read_cache_sequence_resource(resource, project_root, requested_frame)? {
-            CacheSequenceRead::Available(bytes, digest) => (bytes, digest),
-            CacheSequenceRead::Missing { frame, reason } => {
-                warnings.push(PotError::with_details(
-                    ErrorCode::DependencyMissing,
-                    "Alembic sequence frame is unavailable; Mesh Sequence Cache was skipped",
-                    json!({"modifier_id":modifier.id,"node_id":node_id,"resource_id":resource_id,"frame":frame,"reason":reason}),
-                ));
-                return Ok(());
-            }
-        }
-    } else {
-        read_cache_resource(doc, project_root, &resource_id)?
-    };
-    let cache_warnings = crate::geom::mesh_cache::evaluate(
+    crate::geom::mesh_cache::evaluate(
         mesh,
         modifier,
         frame,
@@ -3489,248 +3202,8 @@ fn apply_mesh_sequence_cache_modifier(
         fps_base,
         &actual_hash,
         &bytes,
-    )?;
-    warnings.extend(
-        cache_warnings
-            .into_iter()
-            .map(|warning| attach_node_owner(warning, node_id)),
-    );
-    Ok(())
-}
-
-enum CacheSequenceRead {
-    Available(Vec<u8>, String),
-    Missing { frame: i32, reason: &'static str },
-}
-
-fn read_cache_sequence_resource(
-    resource: &Value,
-    project_root: Option<&Path>,
-    requested_frame: f64,
-) -> Result<CacheSequenceRead> {
-    if !requested_frame.is_finite()
-        || requested_frame.trunc() < f64::from(i32::MIN)
-        || requested_frame.trunc() > f64::from(i32::MAX)
-    {
-        return Err(PotError::with_details(
-            ErrorCode::InvalidArgument,
-            "Mesh Sequence Cache frame is outside int32 sequence range",
-            json!({"frame":requested_frame}),
-        ));
-    }
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "the finite frame has been checked against the int32 range"
-    )]
-    let frame = requested_frame.trunc() as i32;
-    let uri = resource
-        .get("uri")
-        .and_then(Value::as_str)
-        .filter(|uri| !uri.trim().is_empty())
-        .ok_or_else(|| {
-            PotError::with_details(
-                ErrorCode::SceneInvalid,
-                "Alembic sequence resource has no URI",
-                json!({"frame":frame}),
-            )
-        })?;
-    let kind = resource
-        .get("kind")
-        .and_then(Value::as_str)
-        .filter(|kind| !kind.trim().is_empty())
-        .ok_or_else(|| {
-            PotError::with_details(
-                ErrorCode::SceneInvalid,
-                "Alembic sequence resource has no kind",
-                json!({"frame":frame}),
-            )
-        })?;
-    if !matches!(kind, "alembic" | "alembic_cache") {
-        return Err(PotError::with_details(
-            ErrorCode::SceneInvalid,
-            "Mesh Sequence Cache resource is not Alembic",
-            json!({"kind":kind,"frame":frame}),
-        ));
-    }
-    let packed_sequence = resource
-        .get("packed")
-        .and_then(Value::as_bool)
-        .ok_or_else(|| {
-            PotError::with_details(
-                ErrorCode::SceneInvalid,
-                "Alembic sequence resource has no packed state",
-                json!({"frame":frame}),
-            )
-        })?;
-    let frame_records = match resource.get("sequence_frames") {
-        Some(Value::Object(records)) => records,
-        None | Some(Value::Null) if !packed_sequence => {
-            return Ok(CacheSequenceRead::Missing {
-                frame,
-                reason: "sequence manifest does not contain file frames",
-            });
-        }
-        _ => {
-            return Err(PotError::with_details(
-                ErrorCode::SceneInvalid,
-                "Alembic sequence has invalid frame records",
-                json!({"frame":frame}),
-            ));
-        }
-    };
-    if packed_sequence {
-        let start = resource
-            .get("sequence_start")
-            .and_then(Value::as_i64)
-            .and_then(|value| i32::try_from(value).ok());
-        let end = resource
-            .get("sequence_end")
-            .and_then(Value::as_i64)
-            .and_then(|value| i32::try_from(value).ok());
-        let (Some(start), Some(end)) = (start, end) else {
-            return Err(PotError::with_details(
-                ErrorCode::SceneInvalid,
-                "packed Alembic sequence has no inclusive int32 frame range",
-                json!({"frame":frame}),
-            ));
-        };
-        if end < start {
-            return Err(PotError::with_details(
-                ErrorCode::SceneInvalid,
-                "packed Alembic sequence frame range is not ascending",
-                json!({"start":start,"end":end}),
-            ));
-        }
-        if frame < start || frame > end {
-            return Ok(CacheSequenceRead::Missing {
-                frame,
-                reason: "frame is outside the packed source range",
-            });
-        }
-    }
-    let Some(frame_record) = frame_records.get(&frame.to_string()) else {
-        if packed_sequence {
-            return Err(PotError::with_details(
-                ErrorCode::SceneInvalid,
-                "packed Alembic sequence is missing a selected frame record",
-                json!({"frame":frame}),
-            ));
-        }
-        return Ok(CacheSequenceRead::Missing {
-            frame,
-            reason: "frame is outside the registered source sequence",
-        });
-    };
-    let frame_kind = frame_record
-        .get("kind")
-        .and_then(Value::as_str)
-        .filter(|kind| !kind.trim().is_empty());
-    let Some(frame_uri) = frame_record
-        .get("uri")
-        .and_then(Value::as_str)
-        .filter(|uri| !uri.trim().is_empty())
-    else {
-        return Err(PotError::with_details(
-            ErrorCode::SceneInvalid,
-            "Alembic sequence frame is not a standard resource record",
-            json!({"frame":frame,"kind":frame_kind,"packed":frame_record.get("packed")}),
-        ));
-    };
-    let packed_frame = frame_record.get("packed").and_then(Value::as_bool);
-    if frame_kind != Some(kind) || packed_frame != Some(packed_sequence) {
-        return Err(PotError::with_details(
-            ErrorCode::SceneInvalid,
-            "Alembic sequence frame is not a standard resource record",
-            json!({"frame":frame,"kind":frame_kind,"uri":frame_uri,"packed":packed_frame}),
-        ));
-    }
-    if !packed_sequence {
-        let frame_path_text = frame_uri.strip_prefix("file://").unwrap_or(frame_uri);
-        let frame_path = Path::new(frame_path_text);
-        let asset_prefix = Path::new("assets/sha256");
-        let is_content_addressed = frame_path.starts_with(asset_prefix)
-            || project_root.is_some_and(|root| {
-                frame_path
-                    .strip_prefix(root)
-                    .is_ok_and(|relative| relative.starts_with(asset_prefix))
-            });
-        if !is_content_addressed {
-            let sequence_path_text = uri.strip_prefix("file://").unwrap_or(uri);
-            let sequence_path = Path::new(sequence_path_text);
-            let sequence_path = if sequence_path.is_absolute() {
-                sequence_path.to_path_buf()
-            } else if let Some(root) = project_root {
-                root.join(sequence_path)
-            } else {
-                return Err(PotError::with_details(
-                    ErrorCode::DependencyMissing,
-                    "relative Alembic cache sequence cannot be resolved without a project root",
-                    json!({"uri":uri,"frame":frame}),
-                ));
-            };
-            let Some(expected_path) =
-                crate::cache_sequence::cache_sequence_frame_path(&sequence_path, frame)?
-            else {
-                return Ok(CacheSequenceRead::Missing {
-                    frame,
-                    reason: "linked source sequence frame is missing",
-                });
-            };
-            let frame_path = if frame_path.is_absolute() {
-                frame_path.to_path_buf()
-            } else if let Some(root) = project_root {
-                root.join(frame_path)
-            } else {
-                return Err(PotError::with_details(
-                    ErrorCode::DependencyMissing,
-                    "relative Alembic cache frame cannot be resolved without a project root",
-                    json!({"uri":frame_uri,"frame":frame}),
-                ));
-            };
-            let actual_path = match fs::canonicalize(&frame_path) {
-                Ok(path) => path,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    return Err(PotError::with_details(
-                        ErrorCode::SceneInvalid,
-                        "registered Alembic sequence frame URI does not name its source frame",
-                        json!({"uri":uri,"frame_uri":frame_uri,"frame":frame}),
-                    ));
-                }
-                Err(error) => return Err(PotError::io(&error)),
-            };
-            if actual_path != expected_path {
-                return Err(PotError::with_details(
-                    ErrorCode::SceneInvalid,
-                    "registered Alembic sequence frame URI does not match its source pattern",
-                    json!({
-                        "uri":uri,
-                        "frame_uri":frame_uri,
-                        "expected_path":expected_path,
-                        "actual_path":actual_path,
-                        "frame":frame,
-                    }),
-                ));
-            }
-        }
-    }
-    match crate::cache_sequence::read_cache_resource_record(
-        frame_record,
-        &format!("{uri}:{frame}"),
-        project_root,
-    ) {
-        Ok((bytes, digest)) => Ok(CacheSequenceRead::Available(bytes, digest)),
-        Err(error)
-            if !packed_sequence
-                && error.code == ErrorCode::DependencyMissing
-                && error.message.starts_with("Alembic cache file is missing:") =>
-        {
-            Ok(CacheSequenceRead::Missing {
-                frame,
-                reason: "linked source sequence frame is missing",
-            })
-        }
-        Err(error) => Err(error),
-    }
+        is_sequence,
+    )
 }
 
 const MAX_RENDERED_PARTICLES: usize = 100_000;
@@ -3749,9 +3222,8 @@ fn render_simulated_particles(
             continue;
         }
         if doc.nodes.get(emitter_id).is_some_and(|node| {
-            node.modifiers.iter().enumerate().any(|(index, modifier)| {
-                gate.is_active_at(emitter_id, index, modifier)
-                    && modifier.modifier_type == "explode"
+            node.modifiers.iter().any(|modifier| {
+                gate.is_active(emitter_id, modifier) && modifier.modifier_type == "explode"
             })
         }) {
             continue;
@@ -3826,7 +3298,7 @@ fn render_simulated_particles(
                     .is_some()
             });
             let settings = (if has_stack_system {
-                particle_system_for_index(doc, emitter_id, system_index, gate)?.1
+                particle_system_for_index(doc, emitter_id, system_index)?.1
             } else {
                 node.properties
                     .get("physics_particle_emitter")
@@ -4041,13 +3513,8 @@ fn render_simulated_particles(
     Ok(())
 }
 
-fn has_stack_modifier(
-    gate: ModifierGate<'_>,
-    node_id: &Id,
-    node: &Node,
-    modifier_type: &str,
-) -> bool {
-    gate.stack_modifiers(node_id, &node.modifiers)
+fn has_stack_modifier(node: &Node, modifier_type: &str) -> bool {
+    node.modifiers
         .iter()
         .any(|modifier| modifier.modifier_type == modifier_type)
 }
@@ -4080,7 +3547,7 @@ fn apply_stack_physics_modifier(
             .nodes
             .get(node_id)
             .into_iter()
-            .flat_map(|node| gate.stack_modifiers(node_id, &node.modifiers).iter())
+            .flat_map(|node| node.modifiers.iter())
             .filter(|candidate| candidate.modifier_type == "particle_system")
             .position(|candidate| candidate.id == modifier.id)
             .and_then(|index| u32::try_from(index).ok())
@@ -4126,7 +3593,7 @@ fn apply_particle_instance_modifier(
         )
     })?;
     let index = particle_system_index(modifier)?;
-    let (system_modifier, _) = particle_system_for_index(doc, &object_id, index, gate)?;
+    let (system_modifier, _) = particle_system_for_index(doc, &object_id, index)?;
     let particle_states = if gate.is_active(&object_id, system_modifier) {
         select_particle_states(particles.get(&object_id), index)
     } else {
@@ -4169,7 +3636,7 @@ fn apply_explode_modifier(
     particles: &BTreeMap<Id, Vec<crate::sim::ParticleState>>,
 ) -> Result<()> {
     let index = particle_system_index(modifier)?;
-    let (system_modifier, _) = particle_system_for_index(doc, node_id, index, gate)?;
+    let (system_modifier, _) = particle_system_for_index(doc, node_id, index)?;
     let particle_states = if gate.is_active(node_id, system_modifier) {
         select_particle_states(particles.get(node_id), index)
     } else {
@@ -4214,7 +3681,6 @@ fn particle_system_for_index<'a>(
     doc: &'a SceneDoc,
     node_id: &Id,
     index: u32,
-    gate: ModifierGate<'_>,
 ) -> Result<(&'a Modifier, &'a serde_json::Value)> {
     let node = doc.nodes.get(node_id).ok_or_else(|| {
         PotError::new(
@@ -4222,8 +3688,8 @@ fn particle_system_for_index<'a>(
             format!("particle system object `{node_id}` was not found"),
         )
     })?;
-    let system_modifier = gate
-        .stack_modifiers(node_id, &node.modifiers)
+    let system_modifier = node
+        .modifiers
         .iter()
         .filter(|modifier| modifier.modifier_type == "particle_system")
         .nth(
@@ -4341,142 +3807,6 @@ fn apply_volume_displace_modifier(
     )
 }
 
-fn apply_scene_shrinkwrap_modifier(
-    mesh: &mut Mesh,
-    modifier: &Modifier,
-    subject_id: &Id,
-    doc: &SceneDoc,
-    world_matrices: &BTreeMap<Id, DMat4>,
-    evaluated_meshes: &BTreeMap<Id, Mesh>,
-) -> Result<()> {
-    let Some(target_text) = modifier
-        .params
-        .get("target")
-        .and_then(serde_json::Value::as_str)
-    else {
-        return Ok(());
-    };
-    let target_id = Id::new(target_text.to_owned()).map_err(|error| {
-        PotError::with_details(
-            ErrorCode::InvalidArgument,
-            error.message,
-            json!({"modifier_id":modifier.id,"parameter":"target","object":target_text}),
-        )
-    })?;
-    if target_id == *subject_id {
-        return Ok(());
-    }
-    let is_mesh_object = |object_id: &Id| -> Result<bool> {
-        let object = doc.nodes.get(object_id).ok_or_else(|| {
-            PotError::with_details(
-                ErrorCode::TargetNotFound,
-                format!("modifier operand object `{object_id}` was not found"),
-                json!({"modifier_id":modifier.id,"object":object_id}),
-            )
-        })?;
-        let data_block = object
-            .data
-            .as_ref()
-            .and_then(|data_id| doc.data_blocks.get(data_id));
-        Ok(object.kind == "mesh" && data_block.is_some_and(|data| data.data_type == "mesh"))
-    };
-    if !is_mesh_object(&target_id)? {
-        return Ok(());
-    }
-    if let Some(auxiliary_text) = modifier
-        .params
-        .get("auxiliary_target")
-        .and_then(serde_json::Value::as_str)
-        && let Ok(auxiliary_id) = Id::new(auxiliary_text.to_owned())
-        && auxiliary_id != *subject_id
-        && !is_mesh_object(&auxiliary_id)?
-    {
-        return Ok(());
-    }
-
-    let mut operands = resolve_modifier_object_operands(
-        modifier,
-        subject_id,
-        doc,
-        world_matrices,
-        evaluated_meshes,
-    )?;
-    let target = operands
-        .remove("target")
-        .and_then(|mut operands| operands.pop())
-        .ok_or_else(|| {
-            PotError::with_details(
-                ErrorCode::EvaluationFailed,
-                "shrinkwrap target mesh was not resolved",
-                json!({"modifier_id":modifier.id,"target":target_id}),
-            )
-        })?;
-    let mut resolved = modifier.clone();
-    resolved.params.remove("target");
-    resolved.params.remove("auxiliary_target");
-    // Blender's nearest-vertex path keeps both f32 SpaceTransform directions.
-    let (target_to_subject, subject_to_target) = if modifier
-        .params
-        .get("wrap_method")
-        .and_then(Value::as_str)
-        .is_some_and(|method| method.eq_ignore_ascii_case("NEAREST_VERTEX"))
-    {
-        let subject_world = world_matrices.get(subject_id).copied().ok_or_else(|| {
-            PotError::new(
-                ErrorCode::EvaluationFailed,
-                "Shrinkwrap subject world matrix is missing",
-            )
-        })?;
-        let target_world = world_matrices.get(&target_id).copied().ok_or_else(|| {
-            PotError::new(
-                ErrorCode::EvaluationFailed,
-                "Shrinkwrap target world matrix is missing",
-            )
-        })?;
-        let (subject_to_target, target_to_subject) =
-            crate::geom::modifiers::blender_space_transform_f32(subject_world, target_world);
-        (
-            DMat4::from_cols_array(&target_to_subject.map(f64::from)),
-            Some(subject_to_target),
-        )
-    } else {
-        (
-            target.local_to_subject.ok_or_else(|| {
-                PotError::new(
-                    ErrorCode::EvaluationFailed,
-                    "shrinkwrap target DVec3 transform is missing",
-                )
-            })?,
-            None,
-        )
-    };
-    resolved.runtime.target_to_subject = Some(target_to_subject.to_cols_array());
-    resolved.runtime.shrinkwrap_subject_to_target = subject_to_target;
-    resolved.runtime.shrinkwrap_target_mesh = Some(target.mesh);
-    if let Some(auxiliary) = operands
-        .remove("auxiliary_target")
-        .and_then(|mut operands| operands.pop())
-    {
-        let auxiliary_local_to_subject = auxiliary.local_to_subject.ok_or_else(|| {
-            PotError::new(
-                ErrorCode::EvaluationFailed,
-                "shrinkwrap auxiliary target DVec3 transform is missing",
-            )
-        })?;
-        resolved.runtime.auxiliary_target_to_subject =
-            Some(auxiliary_local_to_subject.to_cols_array());
-        resolved.runtime.shrinkwrap_auxiliary_target_mesh = Some(auxiliary.mesh);
-    } else {
-        resolved.runtime.auxiliary_target_to_subject = None;
-        resolved.runtime.shrinkwrap_auxiliary_target_mesh = None;
-    }
-    *mesh = crate::geom::modifiers::evaluate_modifiers(
-        mesh,
-        &[resolved],
-        scene_subject_name(doc, subject_id)?,
-    )?;
-    Ok(())
-}
 fn apply_generic_scene_mesh_operand_modifier(
     mesh: &mut Mesh,
     modifier: &Modifier,
@@ -4492,15 +3822,15 @@ fn apply_generic_scene_mesh_operand_modifier(
         world_matrices,
         evaluated_meshes,
     )?;
-    let object_parameter = "object";
+    let object_parameter =
+        if modifier.modifier_type == "shrinkwrap" && modifier.params.contains_key("target") {
+            "target"
+        } else {
+            "object"
+        };
     let mut combined = None;
     for operand in operands.get(object_parameter).into_iter().flatten() {
-        let local_to_subject = operand.local_to_subject.ok_or_else(|| {
-            PotError::new(
-                ErrorCode::EvaluationFailed,
-                "scene mesh operand DVec3 transform is missing",
-            )
-        })?;
+        let local_to_subject = operand.local_to_subject;
         let mut transformed = operand.mesh.clone();
         for vertex in &mut transformed.vertices {
             vertex.co = local_to_subject.transform_point3(vertex.co);
@@ -4513,7 +3843,7 @@ fn apply_generic_scene_mesh_operand_modifier(
         });
     }
     let mut resolved = modifier.clone();
-    for parameter in ["object", "collection"] {
+    for parameter in ["object", "target", "collection"] {
         resolved.params.remove(parameter);
     }
     let operand = combined.ok_or_else(|| {
@@ -4522,18 +3852,10 @@ fn apply_generic_scene_mesh_operand_modifier(
             modifier.modifier_type
         ))
     })?;
-    if modifier.modifier_type == "curve" {
+    if matches!(modifier.modifier_type.as_str(), "shrinkwrap" | "curve") {
         resolved.runtime.target_mesh = Some(operand);
     } else {
         resolved.runtime.operand_mesh = Some(operand);
-    }
-    if modifier.modifier_type == "curve" {
-        // Blender deforms a Curve in its own local space, so it also needs the object transform.
-        resolved.runtime.object_matrix = operands
-            .get(object_parameter)
-            .and_then(|items| items.first())
-            .and_then(|operand| operand.local_to_subject)
-            .map(|matrix| matrix.to_cols_array());
     }
     *mesh = crate::geom::modifiers::evaluate_modifiers(
         mesh,
@@ -4564,16 +3886,6 @@ pub(crate) fn apply_scene_operand_modifier(
                 mesh, modifier, subject_id, doc, references, "origin", None,
             );
         }
-        "shrinkwrap" => {
-            return apply_scene_shrinkwrap_modifier(
-                mesh,
-                modifier,
-                subject_id,
-                doc,
-                references.world_matrices,
-                references.evaluated_meshes,
-            );
-        }
         _ => {}
     }
     let world_matrices = references.world_matrices;
@@ -4600,7 +3912,11 @@ pub(crate) fn apply_scene_operand_modifier(
     {
         return Ok(());
     }
-    if matches!(modifier.modifier_type.as_str(), "boolean" | "curve") {
+    if matches!(
+        modifier.modifier_type.as_str(),
+        "boolean" | "shrinkwrap" | "curve"
+    ) && !modifier.params.contains_key("collection")
+    {
         return apply_generic_scene_mesh_operand_modifier(
             mesh,
             modifier,
@@ -4612,7 +3928,11 @@ pub(crate) fn apply_scene_operand_modifier(
     }
     let mut object_ids = BTreeSet::new();
     let mut collection_id = None;
-    let object_parameter = "object";
+    let object_parameter = if modifier.modifier_type == "shrinkwrap" {
+        "target"
+    } else {
+        "object"
+    };
     if let Some(value) = modifier.params.get(object_parameter) {
         let text = value.as_str().ok_or_else(|| {
             PotError::invalid_argument(format!(
@@ -4627,6 +3947,15 @@ pub(crate) fn apply_scene_operand_modifier(
             ))
         })?;
         object_ids.insert(object_id);
+    } else if modifier.modifier_type == "shrinkwrap"
+        && let Some(value) = modifier.params.get("object")
+    {
+        let text = value.as_str().ok_or_else(|| {
+            PotError::invalid_argument("shrinkwrap `object` must be an object ID")
+        })?;
+        object_ids.insert(Id::new(text).map_err(|_| {
+            PotError::invalid_argument("shrinkwrap `object` must be a valid object ID")
+        })?);
     }
     if let Some(value) = modifier.params.get("collection") {
         let text = value.as_str().ok_or_else(|| {
@@ -5459,36 +4788,44 @@ fn volume_bounds(volume: &crate::geom::volume::VolumeData, matrix: DMat4) -> Res
             crate::geom::volume::VolumeSource::Generated(source)
                 if source.algorithm == "mesh_to_volume_fog" =>
             {
-                0.5
+                DVec3::splat(grid.voxel_size * 0.5)
             }
-            _ => 0.0,
+            _ => DVec3::ZERO,
         };
-        let minimum_index = DVec3::splat(-half_voxel);
-        let maximum_index = DVec3::new(
-            f64::from(grid.dims[0] - 1),
-            f64::from(grid.dims[1] - 1),
-            f64::from(grid.dims[2] - 1),
-        ) + DVec3::splat(half_voxel);
-        let volume_to_world = matrix * grid.checked_index_to_local_matrix()?;
+        let local_min = grid.origin - half_voxel;
+        let local_max = grid.origin
+            + grid.voxel_size
+                * DVec3::new(
+                    f64::from(grid.dims[0] - 1),
+                    f64::from(grid.dims[1] - 1),
+                    f64::from(grid.dims[2] - 1),
+                )
+            + half_voxel;
+        if !local_min.is_finite() || !local_max.is_finite() {
+            return Err(PotError::new(
+                ErrorCode::SceneInvalid,
+                "volume grid bounds are not finite",
+            ));
+        }
         for corner in 0..8 {
-            let index = DVec3::new(
+            let local = DVec3::new(
                 if corner & 1 == 0 {
-                    minimum_index.x
+                    local_min.x
                 } else {
-                    maximum_index.x
+                    local_max.x
                 },
                 if corner & 2 == 0 {
-                    minimum_index.y
+                    local_min.y
                 } else {
-                    maximum_index.y
+                    local_max.y
                 },
                 if corner & 4 == 0 {
-                    minimum_index.z
+                    local_min.z
                 } else {
-                    maximum_index.z
+                    local_max.z
                 },
             );
-            let world = volume_to_world.transform_point3(index);
+            let world = matrix.transform_point3(local);
             if !world.is_finite() {
                 return Err(PotError::new(
                     ErrorCode::SceneInvalid,
@@ -6002,7 +5339,6 @@ fn evaluate_collection_instance(
     matrices: &BTreeMap<Id, DMat4>,
     meshes: &BTreeMap<Id, Mesh>,
     nodes: &BTreeMap<Id, EvaluatedNode>,
-    suppressed_instances: &BTreeSet<Id>,
     active_instances: &mut BTreeSet<Id>,
 ) -> Result<CollectionEvaluation> {
     let instance_node = doc.nodes.get(instance_id).ok_or_else(|| {
@@ -6033,7 +5369,6 @@ fn evaluate_collection_instance(
         matrices,
         meshes,
         nodes,
-        suppressed_instances,
         active_instances,
         &mut BTreeSet::new(),
         &mut BTreeSet::new(),
@@ -6154,7 +5489,6 @@ fn append_collection_geometry<'a>(
     matrices: &BTreeMap<Id, DMat4>,
     meshes: &'a BTreeMap<Id, Mesh>,
     nodes: &BTreeMap<Id, EvaluatedNode>,
-    suppressed_instances: &BTreeSet<Id>,
     active_instances: &mut BTreeSet<Id>,
     visited_collections: &mut BTreeSet<Id>,
     collection_stack: &mut BTreeSet<Id>,
@@ -6190,16 +5524,13 @@ fn append_collection_geometry<'a>(
         if !source_node.visible || !source_node.render_visible {
             continue;
         }
-        let member = if suppressed_instances.contains(object_id) {
-            None
-        } else if instance_collection_target(source_node)?.is_some() {
+        let member = if instance_collection_target(source_node)?.is_some() {
             let nested = evaluate_collection_instance(
                 doc,
                 object_id,
                 matrices,
                 meshes,
                 nodes,
-                suppressed_instances,
                 active_instances,
             )?;
             let uv_names = uv_layers::read_layers(&nested.mesh)
@@ -6284,7 +5615,6 @@ fn append_collection_geometry<'a>(
             matrices,
             meshes,
             nodes,
-            suppressed_instances,
             active_instances,
             visited_collections,
             collection_stack,
@@ -6790,7 +6120,8 @@ mod tests {
     }
 
     #[test]
-    fn particle_render_limit_counts_all_systems_for_each_emitter() {
+    fn particle_render_limit_counts_all_systems_for_each_emitter()
+    -> std::result::Result<(), &'static str> {
         let emitter_id = Id::new("emitter").unwrap();
         let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
         doc.nodes.insert(
@@ -6831,10 +6162,11 @@ mod tests {
             &mut std::collections::BTreeMap::new(),
             &evaluated_nodes,
         ) else {
-            panic!("combined visible systems must exceed the per-emitter limit");
+            return Err("combined visible systems must exceed the per-emitter limit");
         };
         assert_eq!(error.code, crate::error::ErrorCode::LimitExceeded);
         assert_eq!(error.details["count"], serde_json::json!(120_002));
+        Ok(())
     }
     fn grease_pencil_scene(data: GreasePencilData, transform: Transform) -> (SceneDoc, Id) {
         let data_id = Id::new("grease_pencil_data").unwrap();
@@ -7397,7 +6729,6 @@ mod tests {
             &matrices,
             &meshes,
             &BTreeMap::new(),
-            &BTreeSet::new(),
             &mut BTreeSet::new(),
         )
         .unwrap();

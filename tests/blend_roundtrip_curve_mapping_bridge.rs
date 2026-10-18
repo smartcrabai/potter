@@ -27,9 +27,7 @@ const HOOK_NAME: &str = "HookCurveMapping";
 const WARP_NAME: &str = "WarpCurveMapping";
 const HANDLE_HOOK_NAME: &str = "HandleHookCurveMapping";
 const HANDLE_WARP_NAME: &str = "HandleWarpCurveMapping";
-const HANDLE_VWE_NAME: &str = "HandleVertexWeightEditCurveMapping";
 const RAW_HOOK_NAME: &str = "RawHookCurveMapping";
-const RAW_VWE_NAME: &str = "RawVertexWeightEditCurveMapping";
 const HOOK_POINTS: [[f64; 2]; 4] = [[0.0, 0.125], [0.25, 0.875], [0.625, 0.375], [1.0, 0.75]];
 const WARP_POINTS: [[f64; 2]; 4] = [[0.0, 0.25], [0.375, 0.875], [0.75, 0.125], [1.0, 0.5]];
 const RAW_CURVE_POINTS: [[f64; 2]; 4] = [[0.0, 0.125], [1.5, 0.75], [-0.25, 0.875], [0.5, -0.25]];
@@ -52,25 +50,12 @@ fn warp_handle_points() -> Value {
     ])
 }
 
-fn vwe_handle_points() -> Value {
-    json!([
-        [0.0, 0.125],
-        [0.25, 0.875, "VECTOR"],
-        [0.625, 0.375, "AUTO_CLAMPED"],
-        [1.0, 0.75]
-    ])
-}
-
 fn hook_handle_settings() -> Value {
     json!({"use_clip":false,"clip_bounds":[-0.25,-0.5,1.25,1.5],"extend":"HORIZONTAL"})
 }
 
 fn warp_handle_settings() -> Value {
     json!({"use_clip":true,"clip_bounds":[-0.25,-0.5,1.25,1.25],"extend":"HORIZONTAL"})
-}
-
-fn vwe_handle_settings() -> Value {
-    json!({"use_clip":false,"clip_bounds":[-0.125,0.0,1.125,1.0],"extend":"HORIZONTAL"})
 }
 
 const BLENDER_FIXTURE: &str = r#"
@@ -171,29 +156,11 @@ set_curve_settings(handle_warp.falloff_curve, {
     "use_clip":True,"clip_bounds":[-0.25,-0.5,1.25,1.25],"extend":"HORIZONTAL"
 })
 
-handle_weight_group = subject.vertex_groups.new(name="HandleCurveWeights")
-handle_weight_group.add(list(range(len(mesh.vertices))), 1.0, "REPLACE")
-handle_vwe = subject.modifiers.new("HandleVertexWeightEditCurveMapping", "VERTEX_WEIGHT_EDIT")
-handle_vwe.vertex_group = handle_weight_group.name
-handle_vwe.falloff_type = "CURVE"
-set_curve_mapping(handle_vwe.map_curve, [(0.0, 0.125), (0.25, 0.875, "VECTOR"),
-                                         (0.625, 0.375, "AUTO_CLAMPED"), (1.0, 0.75)])
-set_curve_settings(handle_vwe.map_curve, {
-    "use_clip":False,"clip_bounds":[-0.125,0.0,1.125,1.0],"extend":"HORIZONTAL"
-})
-
 raw_hook = subject.modifiers.new("RawHookCurveMapping", "HOOK")
 raw_hook.object = hook_target
 raw_hook.vertex_indices_set([0, 1, 2, 3])
 raw_hook.falloff_type = "CURVE"
 set_raw_curve(raw_hook.falloff_curve, raw_points)
-
-raw_weight_group = subject.vertex_groups.new(name="RawCurveWeights")
-raw_weight_group.add(list(range(len(mesh.vertices))), 1.0, "REPLACE")
-raw_vwe = subject.modifiers.new("RawVertexWeightEditCurveMapping", "VERTEX_WEIGHT_EDIT")
-raw_vwe.vertex_group = raw_weight_group.name
-raw_vwe.falloff_type = "CURVE"
-set_raw_curve(raw_vwe.map_curve, raw_points)
 
 
 def control_points(curve):
@@ -237,9 +204,7 @@ with open(os.path.join(root, "source_controls.json"), "w", encoding="utf-8") as 
             "WarpCurveMapping": modifier_record(warp, "falloff_curve"),
             "HandleHookCurveMapping": modifier_record(handle_hook, "falloff_curve"),
             "HandleWarpCurveMapping": modifier_record(handle_warp, "falloff_curve"),
-            "HandleVertexWeightEditCurveMapping": modifier_record(handle_vwe, "map_curve"),
             "RawHookCurveMapping": modifier_record(raw_hook, "falloff_curve"),
-            "RawVertexWeightEditCurveMapping": modifier_record(raw_vwe, "map_curve"),
         },
         handle,
     )
@@ -295,9 +260,7 @@ with open(output_path, "w", encoding="utf-8") as handle:
             "WarpCurveMapping": modifier_record("WarpCurveMapping", "falloff_curve"),
             "HandleHookCurveMapping": modifier_record("HandleHookCurveMapping", "falloff_curve"),
             "HandleWarpCurveMapping": modifier_record("HandleWarpCurveMapping", "falloff_curve"),
-            "HandleVertexWeightEditCurveMapping": modifier_record("HandleVertexWeightEditCurveMapping", "map_curve"),
             "RawHookCurveMapping": modifier_record("RawHookCurveMapping", "falloff_curve"),
-            "RawVertexWeightEditCurveMapping": modifier_record("RawVertexWeightEditCurveMapping", "map_curve"),
         },
         handle,
     )
@@ -436,7 +399,7 @@ fn assert_scene_curve_settings(scene: &SceneDoc, name: &str, settings_key: &str,
 #[test]
 fn blender_curve_mapping_controls_round_trip_exactly() -> Result<(), Box<dyn Error>> {
     let Some(blender) = blender_executable() else {
-        eprintln!("skipping Hook/Warp/VWE CurveMapping round-trip: Blender is unavailable");
+        eprintln!("skipping Hook/Warp CurveMapping round-trip: Blender is unavailable");
         return Ok(());
     };
 
@@ -469,13 +432,6 @@ fn blender_curve_mapping_controls_round_trip_exactly() -> Result<(), Box<dyn Err
         "falloff_curve",
         &warp_handle_points(),
     );
-    assert_blender_curve_value(
-        &source,
-        HANDLE_VWE_NAME,
-        "VERTEX_WEIGHT_EDIT",
-        "map_curve",
-        &vwe_handle_points(),
-    );
     assert_blender_curve_settings(
         &source,
         HANDLE_HOOK_NAME,
@@ -488,24 +444,11 @@ fn blender_curve_mapping_controls_round_trip_exactly() -> Result<(), Box<dyn Err
         "falloff_curve_settings",
         &warp_handle_settings(),
     );
-    assert_blender_curve_settings(
-        &source,
-        HANDLE_VWE_NAME,
-        "map_curve_settings",
-        &vwe_handle_settings(),
-    );
     assert_blender_curve(
         &source,
         RAW_HOOK_NAME,
         "HOOK",
         "falloff_curve",
-        &RAW_CURVE_POINTS,
-    );
-    assert_blender_curve(
-        &source,
-        RAW_VWE_NAME,
-        "VERTEX_WEIGHT_EDIT",
-        "map_curve",
         &RAW_CURVE_POINTS,
     );
 
@@ -548,13 +491,6 @@ fn blender_curve_mapping_controls_round_trip_exactly() -> Result<(), Box<dyn Err
         "falloff_curve",
         &warp_handle_points(),
     );
-    assert_scene_curve_value(
-        &scene,
-        HANDLE_VWE_NAME,
-        "vertex_weight_edit",
-        "map_curve",
-        &vwe_handle_points(),
-    );
     assert_scene_curve_settings(
         &scene,
         HANDLE_HOOK_NAME,
@@ -567,24 +503,11 @@ fn blender_curve_mapping_controls_round_trip_exactly() -> Result<(), Box<dyn Err
         "falloff_curve_settings",
         &warp_handle_settings(),
     );
-    assert_scene_curve_settings(
-        &scene,
-        HANDLE_VWE_NAME,
-        "map_curve_settings",
-        &vwe_handle_settings(),
-    );
     assert_scene_curve(
         &scene,
         RAW_HOOK_NAME,
         "hook",
         "falloff_curve",
-        &RAW_CURVE_POINTS,
-    );
-    assert_scene_curve(
-        &scene,
-        RAW_VWE_NAME,
-        "vertex_weight_edit",
-        "map_curve",
         &RAW_CURVE_POINTS,
     );
 
@@ -634,13 +557,6 @@ fn blender_curve_mapping_controls_round_trip_exactly() -> Result<(), Box<dyn Err
         "falloff_curve",
         &warp_handle_points(),
     );
-    assert_blender_curve_value(
-        &reopened,
-        HANDLE_VWE_NAME,
-        "VERTEX_WEIGHT_EDIT",
-        "map_curve",
-        &vwe_handle_points(),
-    );
     assert_blender_curve_settings(
         &reopened,
         HANDLE_HOOK_NAME,
@@ -653,25 +569,12 @@ fn blender_curve_mapping_controls_round_trip_exactly() -> Result<(), Box<dyn Err
         "falloff_curve_settings",
         &warp_handle_settings(),
     );
-    assert_blender_curve_settings(
-        &reopened,
-        HANDLE_VWE_NAME,
-        "map_curve_settings",
-        &vwe_handle_settings(),
-    );
     assert_blender_curve(&reopened, WARP_NAME, "WARP", "falloff_curve", &WARP_POINTS);
     assert_blender_curve(
         &reopened,
         RAW_HOOK_NAME,
         "HOOK",
         "falloff_curve",
-        &RAW_CURVE_POINTS,
-    );
-    assert_blender_curve(
-        &reopened,
-        RAW_VWE_NAME,
-        "VERTEX_WEIGHT_EDIT",
-        "map_curve",
         &RAW_CURVE_POINTS,
     );
 

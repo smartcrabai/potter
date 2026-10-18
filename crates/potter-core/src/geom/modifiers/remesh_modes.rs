@@ -9,7 +9,7 @@ use serde_json::json;
 
 use crate::{
     error::{ErrorCode, PotError, Result},
-    geom::{Mesh, clear_origindex},
+    geom::Mesh,
     model::Modifier,
 };
 
@@ -119,7 +119,6 @@ fn octree_remesh(mesh: &Mesh, modifier: &Modifier, mode: &str) -> Result<Mesh> {
         flood_fill: remove_disconnected,
     };
     let mut result = dual_contour::remesh(mesh, &settings)?;
-    clear_origindex(&mut result);
     finish_remesh(&mut result, smooth_shade)?;
     Ok(result)
 }
@@ -134,7 +133,7 @@ fn finish_remesh(mesh: &mut Mesh, smooth_shade: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use crate::{
-        geom::{BoxParams, Mesh, ORIGINDEX_NONE, origindex_values, set_origindex},
+        geom::{BoxParams, Mesh},
         model::{Id, Modifier},
     };
     use serde_json::{Map, json};
@@ -160,32 +159,6 @@ mod tests {
         let result = remesh_modifier(&source, &modifier)?;
         assert!(result.validate().is_ok());
         assert!(!result.faces.is_empty(), "remesh produced no faces");
-        assert_eq!(
-            origindex_values(&result),
-            Some(vec![ORIGINDEX_NONE; result.vertices.len()])
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn empty_voxel_remesh_preserves_input_origindex() -> Result<(), Box<dyn std::error::Error>> {
-        let mut source = Mesh::new();
-        set_origindex(&mut source, &[]);
-        let modifier = Modifier {
-            id: Id::new("empty_voxel_remesh")?,
-            modifier_type: "remesh".to_owned(),
-            name: "Remesh".to_owned(),
-            enabled: true,
-            show_viewport: true,
-            show_render: true,
-            params: serde_json::from_value::<Map<String, serde_json::Value>>(json!({
-                "mode":"VOXEL", "voxel_size":0.5, "adaptivity":0.0
-            }))?,
-            binding_data: None,
-            runtime: crate::model::ModifierRuntime::default(),
-        };
-        let result = remesh_modifier(&source, &modifier)?;
-        assert_eq!(origindex_values(&result), origindex_values(&source));
         Ok(())
     }
 }

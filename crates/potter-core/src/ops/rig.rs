@@ -2001,19 +2001,11 @@ fn vertex_group_create(engine: &mut Engine<'_>, operation: &Map<String, Value>) 
             &pointer(engine, "id"),
         ));
     }
-    let active_index = data.vertex_groups.len();
     let data =
         engine.doc.data_blocks.get_mut(&data_id).ok_or_else(|| {
             PotError::new(ErrorCode::InternalError, "mesh data block disappeared")
         })?;
     data.vertex_groups.push(VertexGroup { id, name });
-    engine
-        .doc
-        .nodes
-        .get_mut(&node_id)
-        .ok_or_else(|| PotError::new(ErrorCode::InternalError, "mesh node disappeared"))?
-        .active_vertex_group_index = Some(active_index);
-    engine.mark("nodes", &node_id, ChangeKind::Updated);
     engine.mark("data_blocks", &data_id, ChangeKind::Updated);
     Ok(true)
 }

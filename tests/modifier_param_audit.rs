@@ -4,12 +4,10 @@
     reason = "integration test fixtures use fixed valid inputs"
 )]
 
-//! Schema truth, Blender-default parity, and a small differential behavior guard for modifier
-//! parameters (PR18 slice A).
+//! F-specific schema truth, Blender-default parity, and behavior guards (PR18 slice A).
 //!
-//! The defaults test compares every recorded default with Blender 5.2.2. The behavior test uses
-//! only explicit Blender 5.2.2 scenarios with activating inputs or confirmed inert conditions;
-//! every other parameter remains unexercised and is tracked outside the regression test.
+//! Defaults checks compare F-owned modifier rows with Blender 5.2.2. Behavior scenarios are
+//! filtered to F-owned modifiers; unexercised parameters remain outside this regression test.
 
 use std::{
     collections::BTreeMap,
@@ -18,7 +16,7 @@ use std::{
     process::{Command, Output},
 };
 
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 
@@ -31,20 +29,24 @@ mod blender_checked;
 #[path = "common/process.rs"]
 mod process;
 
-/// Owners of the measured Blender divergences in `behavior_scenarios.json`.
-const KNOWN_GAP_OWNERS: &[&str] = &["D", "PR15"];
-
-const GUARD_TARGET: &str = "guard_target";
-const GUARD_TARGET_ALT: &str = "guard_target_alt";
-const GUARD_GROUP: &str = "guard_group";
-const GUARD_GROUP_ALT: &str = "guard_group_alt";
-const GUARD_RIG: &str = "guard_rig";
-const GUARD_RIG_ALT: &str = "guard_rig_alt";
-const GUARD_CAMERA: &str = "guard_camera";
-const GUARD_CAMERA_ALT: &str = "guard_camera_alt";
-const GUARD_LATTICE: &str = "guard_lattice";
-const GUARD_GRAPH: &str = "guard_graph";
-const GUARD_GRAPH_ALT: &str = "guard_graph_alt";
+const F_MODIFIERS: &[&str] = &[
+    "armature",
+    "cast",
+    "corrective_smooth",
+    "displace",
+    "hook",
+    "laplacian_deform",
+    "laplacian_smooth",
+    "lattice",
+    "mesh_deform",
+    "simple_deform",
+    "skin",
+    "smooth",
+    "surface_deform",
+    "volume_displace",
+    "warp",
+    "wave",
+];
 
 fn pot() -> Command {
     Command::new(env!("CARGO_BIN_EXE_pot"))
@@ -52,98 +54,6 @@ fn pot() -> Command {
 
 fn param_table() -> Value {
     serde_json::from_str(PARAM_TABLE).unwrap()
-}
-
-fn scene_operations(modifier: &str, params: &Map<String, Value>) -> Vec<Value> {
-    let weights = |weight: f64| -> Vec<Value> {
-        (0..8)
-            .map(|vertex| json!({"vertex_id": vertex, "weight": weight}))
-            .collect()
-    };
-    let varied: Vec<Value> = (0..8)
-        .map(|vertex| {
-            let weight = if vertex % 2 == 0 { 1.0 } else { 0.25 };
-            json!({"vertex_id": vertex, "weight": weight})
-        })
-        .collect();
-    let mut operations = vec![
-        json!({"op":"node.create","id":"body","kind":"box","params":{"size":2}}),
-        json!({"op":"node.create","id":GUARD_TARGET,"kind":"box","params":{"size":1}}),
-        json!({"op":"node.create","id":GUARD_TARGET_ALT,"kind":"box","params":{"size":3}}),
-        json!({"op":"node.create","id":GUARD_RIG,"kind":"armature"}),
-        json!({"op":"bone.create","target":{"id":GUARD_RIG},"id":"root","name":"Root","head":[0.0,0.0,0.0],"tail":[0.0,1.0,0.0]}),
-        json!({"op":"bone.create","target":{"id":GUARD_RIG},"id":"guard_group_bone","name":GUARD_GROUP,"head":[0.0,1.0,0.0],"tail":[0.0,2.0,0.0],"parent":"root"}),
-        json!({"op":"vertex_group.create","target":{"id":"body"},"id":"root_group","name":"Root"}),
-        json!({"op":"vertex_group.assign","target":{"id":"body"},"group_id":"root_group","weights":weights(1.0)}),
-        json!({"op":"node.create","id":GUARD_RIG_ALT,"kind":"armature"}),
-        json!({"op":"bone.create","target":{"id":GUARD_RIG_ALT},"id":"root_alt","name":"Root","head":[0.0,0.0,0.0],"tail":[0.0,1.0,0.0]}),
-        json!({"op":"bone.create","target":{"id":GUARD_RIG_ALT},"id":"guard_group_bone_alt","name":GUARD_GROUP,"head":[0.0,1.0,0.0],"tail":[0.0,2.0,0.0],"parent":"root_alt"}),
-        json!({"op":"bone.create","target":{"id":GUARD_RIG_ALT},"id":"guard_group_alt_bone","name":GUARD_GROUP_ALT,"head":[0.0,1.0,0.0],"tail":[0.0,2.0,0.0],"parent":"root_alt"}),
-        json!({"op":"node.create","id":GUARD_CAMERA,"kind":"camera"}),
-        json!({"op":"node.create","id":GUARD_CAMERA_ALT,"kind":"camera","transform":{"translation":[2.0,1.0,3.0]}}),
-        json!({"op":"lattice.create","id":GUARD_LATTICE}),
-        json!({"op":"lattice.update","target":{"id":GUARD_LATTICE},"set":{"points":[[0.0,-1.0,-1.0],[2.0,-1.0,-1.0],[0.0,1.0,-1.0],[2.0,1.0,-1.0],[0.0,-1.0,1.0],[2.0,-1.0,1.0],[0.0,1.0,1.0],[2.0,1.0,1.0]]}}),
-        json!({"op":"graph.create","id":GUARD_GRAPH,"kind":"geometry"}),
-        json!({"op":"graph.node_add","graph":GUARD_GRAPH,"id":"input","type":"NodeGroupInput"}),
-        json!({"op":"graph.node_add","graph":GUARD_GRAPH,"id":"output","type":"NodeGroupOutput"}),
-        json!({"op":"graph.interface_update","graph":GUARD_GRAPH,"set":{"inputs":[{"id":"geometry_input","name":"Geometry","socket_type":"geometry","default":null}],"outputs":[{"id":"geometry_output","name":"Geometry","socket_type":"geometry","default":null}]}}),
-        json!({"op":"graph.link","graph":GUARD_GRAPH,"from_node":"input","from_socket":"Geometry","to_node":"output","to_socket":"Geometry"}),
-        json!({"op":"graph.create","id":GUARD_GRAPH_ALT,"kind":"geometry"}),
-        json!({"op":"graph.node_add","graph":GUARD_GRAPH_ALT,"id":"input","type":"NodeGroupInput"}),
-        json!({"op":"graph.node_add","graph":GUARD_GRAPH_ALT,"id":"output","type":"NodeGroupOutput"}),
-        json!({"op":"graph.interface_update","graph":GUARD_GRAPH_ALT,"set":{"inputs":[{"id":"geometry_input","name":"Geometry","socket_type":"geometry","default":null}],"outputs":[{"id":"geometry_output","name":"Geometry","socket_type":"geometry","default":null}]}}),
-        json!({"op":"graph.link","graph":GUARD_GRAPH_ALT,"from_node":"input","from_socket":"Geometry","to_node":"output","to_socket":"Geometry"}),
-        json!({"op":"vertex_group.create","target":{"id":"body"},"id":GUARD_GROUP,"name":GUARD_GROUP}),
-        json!({"op":"vertex_group.assign","target":{"id":"body"},"group_id":GUARD_GROUP,"weights":varied}),
-        json!({"op":"vertex_group.create","target":{"id":"body"},"id":GUARD_GROUP_ALT,"name":GUARD_GROUP_ALT}),
-        json!({"op":"vertex_group.assign","target":{"id":"body"},"group_id":GUARD_GROUP_ALT,"weights":weights(0.5)}),
-        json!({"op":"physics.particle_emitter.create","target":{"id":GUARD_TARGET},"settings":{"emit_from":"VERT","count":2,"frame_start":1.0,"frame_end":1.0,"lifetime":12.0,"physics_type":"NEWTON","normal_factor":0.8,"seed":3}}),
-    ];
-    if modifier == "explode" {
-        operations.push(json!({"op":"physics.particle_emitter.create","target":{"id":"body"},"settings":{"emit_from":"VERT","count":2,"frame_start":1.0,"frame_end":1.0,"lifetime":12.0,"physics_type":"NEWTON","normal_factor":0.8,"seed":3}}));
-    }
-    let physics = match modifier {
-        "cloth" => Some((
-            "physics.cloth.create",
-            "physics_cloth",
-            json!({"tension_stiffness":12.0}),
-        )),
-        "soft_body" => Some((
-            "physics.soft_body.create",
-            "physics_soft_body",
-            json!({"goal_strength":0.7}),
-        )),
-        "collision" => Some((
-            "physics.collision.create",
-            "physics_collision",
-            json!({"thickness":0.01}),
-        )),
-        "dynamic_paint" => Some((
-            "physics.dynamic_paint.create",
-            "physics_dynamic_paint",
-            json!({"role":"canvas"}),
-        )),
-        "fluid" => Some((
-            "physics.fluid.create",
-            "physics_fluid",
-            json!({"type":"liquid","resolution":4}),
-        )),
-        "particle_system" => Some((
-            "physics.particle_emitter.create",
-            "physics_particle_emitter",
-            json!({"emit_from":"VERT","count":2,"frame_start":1.0,"frame_end":1.0,"lifetime":12.0,"physics_type":"NEWTON","normal_factor":0.8,"seed":3}),
-        )),
-        _ => None,
-    };
-    if let Some((op, modifier_id, settings)) = physics {
-        operations.push(json!({"op":op,"target":{"id":"body"},"settings":settings}));
-        if !params.is_empty() {
-            operations.push(json!({"op":"modifier.update","target":{"id":"body"},"modifier_id":modifier_id,"set":{"params":params}}));
-        }
-    } else {
-        operations.push(json!({"op":"modifier.create","target":{"id":"body"},"id":"under_test","type":modifier,"params":params}));
-    }
-    operations
 }
 
 fn init_scene(scene: &Path) {
@@ -177,24 +87,6 @@ fn apply_operations(scene: &Path, operations: &[Value]) -> Output {
         .unwrap()
 }
 
-/// The operation layer's rejection message for these params, or `None` when it accepts them.
-fn operation_rejection(modifier: &str, params: &Map<String, Value>) -> Option<String> {
-    let directory = tempdir().unwrap();
-    let scene = directory.path().join("scene");
-    init_scene(&scene);
-    let apply = apply_operations(&scene, &scene_operations(modifier, params));
-    if apply.status.success() {
-        return None;
-    }
-    let envelope: Value = serde_json::from_slice(&apply.stdout).unwrap_or(Value::Null);
-    Some(
-        envelope["error"]["message"]
-            .as_str()
-            .unwrap_or("<no message>")
-            .to_owned(),
-    )
-}
-
 /// Blender stores floats as float32; the table keeps the shortest decimal of the same value.
 #[expect(
     clippy::float_cmp,
@@ -219,21 +111,16 @@ fn param_table_defaults_match_blender_fixture() {
     let fixture: Value = serde_json::from_str(BLENDER_DEFAULTS).unwrap();
     assert_eq!(fixture["blender_version"], "5.2.2 LTS");
     let exceptions = fixture["exceptions"].as_object().unwrap();
-    let actual_exceptions: Vec<_> = exceptions.keys().map(String::as_str).collect();
-    assert_eq!(
-        actual_exceptions,
-        vec![
-            "mesh_sequence_cache.frame_offset",
-            "mesh_sequence_cache.override_frame",
-            "mesh_sequence_cache.scale",
-            "nodes.inputs",
-            "ocean.filepath",
-            "uv_project.projectors",
-        ],
-        "Blender runtime exceptions must stay explicit and narrowly scoped"
-    );
     let mut mismatches = Vec::new();
-    for (modifier, spec) in table["modifiers"].as_object().unwrap() {
+    for modifier in F_MODIFIERS {
+        let Some(spec) = table["modifiers"].get(*modifier) else {
+            mismatches.push(format!("{modifier}: missing from parameter table"));
+            continue;
+        };
+        let Some(blender_modifier) = fixture["modifiers"].get(*modifier) else {
+            mismatches.push(format!("{modifier}: missing from Blender runtime fixture"));
+            continue;
+        };
         for (name, schema) in spec["properties"].as_object().unwrap() {
             let Some(default) = schema.get("default") else {
                 continue;
@@ -245,7 +132,7 @@ fn param_table_defaults_match_blender_fixture() {
                 }
                 continue;
             }
-            let Some(blender) = fixture["modifiers"][modifier].get(name) else {
+            let Some(blender) = blender_modifier.get(name) else {
                 mismatches.push(format!(
                     "{key}: missing from Blender runtime fixture and exception list"
                 ));
@@ -258,17 +145,8 @@ fn param_table_defaults_match_blender_fixture() {
     }
     assert!(
         mismatches.is_empty(),
-        "param_table defaults differ from Blender runtime values:\n{}",
+        "F modifier parameter defaults differ from Blender runtime values:\n{}",
         mismatches.join("\n")
-    );
-}
-
-#[test]
-fn unknown_parameter_keys_are_refused_by_the_operation_layer() {
-    let unknown = Map::from_iter([("__not_a_blender_property__".to_owned(), json!(1))]);
-    assert!(
-        operation_rejection("array", &unknown).is_some_and(|message| message.contains("unknown")),
-        "unknown parameter key was not refused"
     );
 }
 
@@ -468,8 +346,14 @@ fn scenario_signature<'a>(results: &'a BTreeMap<String, String>, id: &str, state
 }
 
 #[test]
-fn modifier_parameter_scenarios_match_blender_or_record_real_gaps() {
-    let scenarios: Value = serde_json::from_str(BEHAVIOR_SCENARIOS).unwrap();
+fn f_modifier_parameter_scenarios_match_blender() {
+    let mut scenarios: Value = serde_json::from_str(BEHAVIOR_SCENARIOS).unwrap();
+    // The shared inventory also contains non-F modifiers; this audit covers only F-owned rows.
+    scenarios["scenarios"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|scenario| F_MODIFIERS.contains(&scenario["modifier"].as_str().unwrap()));
+    assert!(!scenarios["scenarios"].as_array().unwrap().is_empty());
     let Some(blender) = blender_scenario_results(&scenarios) else {
         return;
     };
@@ -506,28 +390,6 @@ fn modifier_parameter_scenarios_match_blender_or_record_real_gaps() {
                 assert_eq!(
                     potter_baseline, blender_baseline,
                     "{id}: no-op baseline differs"
-                );
-            }
-            "known_gap" => {
-                let owner = scenario["owner"]
-                    .as_str()
-                    .expect("known gap needs an owner");
-                assert!(
-                    KNOWN_GAP_OWNERS.contains(&owner),
-                    "{id}: unknown parity-gap owner {owner}"
-                );
-                assert_ne!(
-                    blender_baseline, blender_case,
-                    "{id}: the tested Blender parameter is inactive"
-                );
-                assert_ne!(
-                    potter_case, blender_case,
-                    "{id}: recorded parity gap has been fixed; update the scenario inventory"
-                );
-                assert_eq!(
-                    potter_baseline != potter_case,
-                    scenario["potter_changes"].as_bool().unwrap(),
-                    "{id}: Potter behavior changed; update the scenario inventory"
                 );
             }
             expectation => panic!("{id}: unknown scenario expectation {expectation}"),

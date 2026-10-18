@@ -1784,20 +1784,6 @@ fn operation_contract(name: &str) -> OperationContract {
             "none",
             json!({}),
         ),
-        "resource.pack" => (
-            vec!["id", "uri", "kind"],
-            vec!["op", "id", "uri"],
-            "binary resource",
-            "none",
-            json!({"kind":"binary"}),
-        ),
-        "resource.unpack" => (
-            vec!["id", "path"],
-            vec!["op", "id"],
-            "binary resource",
-            "none",
-            json!({}),
-        ),
         "avatar.clear" => (vec![], vec!["op"], "avatar settings", "none", json!({})),
         "avatar.update" => (
             vec!["set"],
@@ -1836,19 +1822,6 @@ fn field_schema(operation: &str, field: &str) -> Value {
             ]}),
             "image" => json!({"oneOf":[id_schema(),{"type":"null"}]}),
             "settings" => json!({"type":"object"}),
-            _ => common_field_schema(field),
-        };
-    }
-    if operation == "resource.pack" {
-        return match field {
-            "uri" => json!({"type":"string"}),
-            "kind" => json!({"type":"string","minLength":1,"default":"binary"}),
-            _ => common_field_schema(field),
-        };
-    }
-    if operation == "resource.unpack" {
-        return match field {
-            "path" => json!({"type":"string"}),
             _ => common_field_schema(field),
         };
     }

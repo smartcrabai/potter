@@ -3,7 +3,7 @@
 // Portions derived from Blender (https://www.blender.org):
 //   source/blender/modifiers/intern/MOD_build.cc, source/blender/modifiers/intern/MOD_laplaciansmooth.cc, SPDX-FileCopyrightText: 2005 Blender Authors, GPL-2.0-or-later.
 //   source/blender/modifiers/intern/MOD_wireframe.cc, source/blender/modifiers/intern/MOD_skin.cc, source/blender/modifiers/intern/MOD_warp.cc, source/blender/blenkernel/intern/mesh_remap.cc, source/blender/modifiers/intern/MOD_mesh_to_volume.cc, source/blender/bmesh/tools/bmesh_wireframe.cc, SPDX-FileCopyrightText: 2023 Blender Authors, GPL-2.0-or-later.
-//   source/blender/modifiers/intern/MOD_simpledeform.cc, MOD_cast.cc, MOD_hook.cc, MOD_curve.cc, source/blender/blenkernel/intern/curve_deform.cc, anim_path.cc, colortools.cc, curve.cc, SPDX-FileCopyrightText: 2005 Blender Authors, GPL-2.0-or-later.
+//   source/blender/modifiers/intern/MOD_simpledeform.cc, MOD_cast.cc, MOD_hook.cc, colortools.cc, curve.cc, SPDX-FileCopyrightText: 2005 Blender Authors, GPL-2.0-or-later.
 
 use std::collections::{HashMap, HashSet};
 
@@ -18,7 +18,7 @@ use super::{
     validated, vec3_param,
 };
 use crate::{
-    error::{ErrorCode, PotError, Result},
+    error::{PotError, Result},
     geom::{
         Mesh,
         clnor::{self, NormalCodeOptions},
@@ -1082,260 +1082,111 @@ fn project_surface(
         })
 }
 
-pub(super) fn mask(
-    mesh: &Mesh,
-    modifier: &Modifier,
-    operands: &std::collections::BTreeMap<String, Vec<super::attributes::SceneOperand>>,
-) -> Result<Mesh> {
-    let groups = mesh
+pub(super) fn mask(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
+    let group_name = string_param(modifier, "vertex_group")?;
+    if group_name.is_empty() {
+        return Err(invalid_parameter(
+            modifier,
+            "vertex_group",
+            "a vertex-group name",
+        ));
+    }
+    let weights = mesh
         .attributes
         .get("vertex_groups")
-        .and_then(Value::as_object);
-    let has_deform_weights = groups.is_some_and(|groups| {
-        groups.values().any(|weights| {
-            weights
-                .as_object()
-                .is_some_and(|weights| !weights.is_empty())
-        })
-    });
-    let invert = bool_param(modifier, "invert_vertex_group")?;
-    let Some(groups) = groups.filter(|_| has_deform_weights) else {
-        return if invert {
-            Ok(mesh.clone())
-        } else {
-            build_mesh(
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                &Origin {
-                    ..Origin::default()
-                },
-                mesh,
+        .and_then(Value::as_object)
+        .and_then(|groups| groups.get(group_name))
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            invalid_parameter(
+                modifier,
+                "vertex_group",
+                "a group present in mesh vertex_groups attributes",
             )
-        };
-    };
-
-    let mode = string_param(modifier, "mode")?;
-    let group_name = string_param(modifier, "vertex_group")?;
-    let threshold = number_param(modifier, "threshold")?.clamp(0.0, 1.0);
-    let use_smooth = mode == "VERTEX_GROUP" && bool_param(modifier, "use_smooth")?;
-    let weights_by_group = match mode {
-        "VERTEX_GROUP" => {
-            let Some(weights) = groups.get(group_name).and_then(Value::as_object) else {
-                // Blender leaves the mesh untouched when the requested group is absent.
-                return Ok(mesh.clone());
-            };
-            vec![(group_name, weights)]
-        }
-        "ARMATURE" => {
-            let Some(armature) = operands
-                .get("armature")
-                .and_then(|items| items.first())
-                .filter(|operand| operand.armature)
-            else {
-                return Ok(mesh.clone());
-            };
-            groups
-                .iter()
-                .filter(|(name, _)| armature.selected_bones.contains(*name))
-                .filter_map(|(name, value)| {
-                    value.as_object().map(|weights| (name.as_str(), weights))
-                })
-                .collect()
-        }
-        _ => return Ok(mesh.clone()),
-    };
-
-    let mut selected = Vec::with_capacity(mesh.vertices.len());
+        })?;
+    let threshold = number_param(modifier, "threshold")?;
+    let invert = bool_param(modifier, "invert_vertex_group")?;
+    let mut selected = HashSet::new();
     for vertex in &mesh.vertices {
-        let mut is_selected = false;
-        for (_, weights) in &weights_by_group {
-            let weight = weights
-                .get(&format!("v{}", vertex.id))
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0);
-            if !weight.is_finite() || !(0.0..=1.0).contains(&weight) {
-                return Err(invalid_parameter(
-                    modifier,
-                    "vertex_group",
-                    "finite weights in [0, 1]",
-                ));
-            }
-            if weight > threshold {
-                is_selected = true;
-                break;
-            }
+        let weight = weights
+            .get(&format!("v{}", vertex.id))
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        if !weight.is_finite() || !(0.0..=1.0).contains(&weight) {
+            return Err(invalid_parameter(
+                modifier,
+                "vertex_group",
+                "finite weights in [0, 1]",
+            ));
         }
-        selected.push(if invert { !is_selected } else { is_selected });
+        if if invert {
+            1.0 - weight > threshold
+        } else {
+            weight > threshold
+        } {
+            selected.insert(vertex.id);
+        }
     }
-
     let source_positions = positions(mesh);
     let source_indices = id_indices(mesh);
-    let mut vertex_map = vec![usize::MAX; source_positions.len()];
-    let mut points = Vec::with_capacity(source_positions.len());
-    let mut vertex_origins = Vec::with_capacity(source_positions.len());
-    for (source, is_selected) in selected.iter().copied().enumerate() {
-        if is_selected {
-            vertex_map[source] = points.len();
-            points.push(source_positions[source]);
-            vertex_origins.push(vec![(source, 1.0)]);
-        }
-    }
-    let mut polygons = Vec::new();
-    let mut face_origins = Vec::new();
-    let mut corner_origins = Vec::new();
-    let mut corner_offsets = Vec::with_capacity(mesh.faces.len());
-    let mut corner_offset = 0_usize;
-    for face in &mesh.faces {
-        corner_offsets.push(corner_offset);
-        corner_offset = corner_offset
-            .checked_add(face.vertices.len())
-            .ok_or_else(|| invalid_parameter(modifier, "mesh", "a valid loop count"))?;
-    }
-    let group_weights = if mode == "VERTEX_GROUP" {
-        weights_by_group.first().map(|(_, weights)| *weights)
-    } else {
-        None
-    };
-    let weight_for_index = |index: usize| {
-        let vertex_id = mesh.vertices[index].id;
-        group_weights
-            .and_then(|weights| {
-                weights
-                    .get(&format!("v{vertex_id}"))
-                    .and_then(Value::as_f64)
-            })
-            .unwrap_or(0.0)
-    };
-    let mut boundary_vertices = HashMap::<(usize, usize), usize>::new();
-    let mut boundary_vertex = |first: usize, second: usize| {
-        let key = if first < second {
-            (first, second)
-        } else {
-            (second, first)
-        };
-        if let Some(index) = boundary_vertices.get(&key) {
-            return *index;
-        }
-        let first_weight = weight_for_index(key.0);
-        let second_weight = weight_for_index(key.1);
-        let factor = (threshold - first_weight) / (second_weight - first_weight);
-        let index = points.len();
-        points.push(source_positions[key.0].lerp(source_positions[key.1], factor));
-        vertex_origins.push(vec![(key.0, 1.0 - factor), (key.1, factor)]);
-        boundary_vertices.insert(key, index);
-        index
-    };
-
+    let mut keep = HashSet::new();
+    let mut retained_faces = Vec::new();
+    let mut retained_sources = Vec::new();
     for (face_index, face) in mesh.faces.iter().enumerate() {
-        let indices = face
-            .vertices
-            .iter()
-            .map(|id| {
-                source_indices.get(id).copied().ok_or_else(|| {
-                    invalid_parameter(modifier, "mesh", "faces referencing existing vertices")
+        if face.vertices.iter().all(|id| selected.contains(id)) {
+            let indices = face
+                .vertices
+                .iter()
+                .map(|id| {
+                    let index = source_indices.get(id).copied().ok_or_else(|| {
+                        invalid_parameter(modifier, "mesh", "faces referencing existing vertices")
+                    })?;
+                    keep.insert(index);
+                    Ok(index)
                 })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let face_selected = indices
-            .iter()
-            .map(|index| selected[*index])
-            .collect::<Vec<_>>();
-        if face_selected.iter().all(|value| *value) {
-            let output = indices.iter().map(|index| vertex_map[*index]).collect();
-            polygons.push((output, face.material_index));
-            face_origins.push(Some(face_index));
-            corner_origins.extend(
-                (0..indices.len()).map(|corner| vec![(corner_offsets[face_index] + corner, 1.0)]),
-            );
-            continue;
-        }
-        if !use_smooth || face_selected.iter().all(|value| !*value) {
-            continue;
-        }
-
-        let Some(start) = face_selected.iter().position(|value| !value) else {
-            continue;
-        };
-        let mut fragment = Vec::<(usize, Vec<(usize, f64)>)>::new();
-        for step in 1..=indices.len() {
-            let previous = (start + step - 1) % indices.len();
-            let current = (start + step) % indices.len();
-            let was_selected = face_selected[previous];
-            let is_selected = face_selected[current];
-            if !was_selected && is_selected {
-                let previous_index = indices[previous];
-                let current_index = indices[current];
-                let boundary = boundary_vertex(previous_index, current_index);
-                let previous_weight = weight_for_index(previous_index);
-                let current_weight = weight_for_index(current_index);
-                let factor = (threshold - previous_weight) / (current_weight - previous_weight);
-                fragment.push((
-                    boundary,
-                    vec![
-                        (corner_offsets[face_index] + previous, 1.0 - factor),
-                        (corner_offsets[face_index] + current, factor),
-                    ],
-                ));
-                fragment.push((
-                    vertex_map[current_index],
-                    vec![(corner_offsets[face_index] + current, 1.0)],
-                ));
-            } else if was_selected && is_selected {
-                fragment.push((
-                    vertex_map[indices[current]],
-                    vec![(corner_offsets[face_index] + current, 1.0)],
-                ));
-            } else if was_selected && !is_selected {
-                let previous_index = indices[previous];
-                let current_index = indices[current];
-                let boundary = boundary_vertex(previous_index, current_index);
-                let previous_weight = weight_for_index(previous_index);
-                let current_weight = weight_for_index(current_index);
-                let factor = (threshold - previous_weight) / (current_weight - previous_weight);
-                fragment.push((
-                    boundary,
-                    vec![
-                        (corner_offsets[face_index] + previous, 1.0 - factor),
-                        (corner_offsets[face_index] + current, factor),
-                    ],
-                ));
-                if fragment.len() >= 3 {
-                    polygons.push((
-                        fragment.iter().map(|(index, _)| *index).collect(),
-                        face.material_index,
-                    ));
-                    face_origins.push(Some(face_index));
-                    corner_origins.extend(fragment.drain(..).map(|(_, origin)| origin));
-                } else {
-                    fragment.clear();
-                }
-            }
+                .collect::<Result<Vec<_>>>()?;
+            retained_faces.push((indices, face.material_index));
+            retained_sources.push(Some(face_index));
         }
     }
-
     let source_loose_edges = loose_edges(mesh)?;
-    let mut edges = Vec::new();
-    for [first, second] in source_loose_edges {
-        match (selected[first], selected[second], use_smooth) {
-            (true, true, _) => edges.push([vertex_map[first], vertex_map[second]]),
-            (true, false, true) => {
-                let boundary = boundary_vertex(first, second);
-                edges.push([vertex_map[first], boundary]);
-            }
-            (false, true, true) => {
-                let boundary = boundary_vertex(first, second);
-                edges.push([boundary, vertex_map[second]]);
-            }
-            _ => {}
+    for [first, second] in &source_loose_edges {
+        if selected.contains(&mesh.vertices[*first].id)
+            && selected.contains(&mesh.vertices[*second].id)
+        {
+            keep.insert(*first);
+            keep.insert(*second);
         }
     }
-    let origin = Origin {
-        vertices: vertex_origins,
-        faces: face_origins,
-        corners: Some(corner_origins),
-    };
-    build_mesh(points, polygons, edges, &origin, mesh)
+    let mut remap = vec![usize::MAX; source_positions.len()];
+    let sources: Vec<usize> = (0..source_positions.len())
+        .filter(|index| keep.contains(index))
+        .collect();
+    for (output, &source) in sources.iter().enumerate() {
+        remap[source] = output;
+    }
+    let points: Vec<DVec3> = sources
+        .iter()
+        .map(|&index| source_positions[index])
+        .collect();
+    let faces = retained_faces
+        .into_iter()
+        .map(|(face, material)| {
+            (
+                face.into_iter().map(|index| remap[index]).collect(),
+                material,
+            )
+        })
+        .collect();
+    let edges = source_loose_edges
+        .into_iter()
+        .filter_map(|[first, second]| {
+            (remap[first] != usize::MAX && remap[second] != usize::MAX)
+                .then_some([remap[first], remap[second]])
+        })
+        .collect();
+    let origin = Origin::copies(sources.into_iter().map(Some), retained_sources, false);
+    build_mesh(points, faces, edges, &origin, mesh)
 }
 
 #[expect(
@@ -1838,227 +1689,94 @@ pub(super) fn wireframe(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     Ok(result)
 }
 
-/// Blender `MOD_curve.cc` with `BKE_curve_deform_coords` (bounds off, no stretch): the deform axis is the
-/// unbounded arc length along the path, and the other two coordinates place the vertex in the path frame.
 pub(super) fn curve(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
-    let Some(target) = modifier.runtime.target_mesh.as_ref() else {
-        // Blender disables the modifier without a curve object.
+    let target =
+        modifier.runtime.target_mesh.as_ref().ok_or_else(|| {
+            invalid_parameter(modifier, "object", "a curve or mesh object operand")
+        })?;
+    let axis = curve_axis_param(modifier, "deform_axis")?;
+    let mut cumulative = Vec::with_capacity(target.vertices.len());
+    cumulative.push(0.0);
+    for pair in target.vertices.windows(2) {
+        let length = pair[0].co.distance(pair[1].co);
+        if length <= f64::EPSILON {
+            return Err(invalid_parameter(
+                modifier,
+                "object",
+                "a curve without zero-length segments",
+            ));
+        }
+        cumulative.push(cumulative.last().copied().unwrap_or(0.0) + length);
+    }
+    let total_length = cumulative.last().copied().unwrap_or(0.0);
+    if target.vertices.len() < 2 || total_length <= f64::EPSILON {
+        return Err(invalid_parameter(
+            modifier,
+            "object",
+            "a curve with at least two distinct points",
+        ));
+    }
+    let source_positions = positions(mesh);
+    let mut minimum = f64::INFINITY;
+    let mut maximum = f64::NEG_INFINITY;
+    for point in &source_positions {
+        let along = point.dot(axis);
+        minimum = minimum.min(along);
+        maximum = maximum.max(along);
+    }
+    let extent = maximum - minimum;
+    if extent <= f64::EPSILON {
         return Ok(mesh.clone());
+    }
+    let reference = if axis.abs().dot(DVec3::Z) > 0.9 {
+        DVec3::Y
+    } else {
+        DVec3::Z
     };
-    let (axis, negative) = curve_deform_axis(modifier)?;
-    let object = reference_matrix(modifier).ok_or_else(|| {
-        PotError::new(
-            ErrorCode::DependencyMissing,
-            "curve modifier object transform is missing",
-        )
-    })?;
-    // The path and the vertices are measured in curve-local space, where the deform axis is defined.
-    let to_curve = object.inverse();
-    let path: Vec<DVec3> = target
-        .vertices
-        .iter()
-        .map(|vertex| to_curve.transform_point3(vertex.co))
-        .collect();
-    let arc_at_point = curve_arc_lengths(modifier, &path)?;
-    let frames = bevel_frames(&path);
-    let weights = deform_group_weights(mesh, modifier)?;
+    let source_side = axis.cross(reference).normalize_or_zero();
+    let source_up = axis.cross(source_side).normalize_or_zero();
     let mut result = mesh.clone();
     for (index, vertex) in result.vertices.iter_mut().enumerate() {
-        let weight = group_weight(weights.as_deref(), index);
-        if weight <= 0.0 {
-            continue;
-        }
-        let local = to_curve.transform_point3(vertex.co);
-        let (arc, cross) = if negative {
-            (
-                -local[axis],
-                DVec3::new(-local[(axis + 2) % 3], -local[(axis + 1) % 3], 0.0),
-            )
+        let along = (source_positions[index].dot(axis) - minimum).clamp(0.0, total_length);
+        let segment = cumulative
+            .windows(2)
+            .position(|range| along <= range[1])
+            .unwrap_or(cumulative.len() - 2);
+        let first = target.vertices[segment].co;
+        let second = target.vertices[segment + 1].co;
+        let tangent = (second - first).normalize_or_zero();
+        let reference = if tangent.abs().dot(DVec3::Z) > 0.9 {
+            DVec3::Y
         } else {
-            (
-                local[axis],
-                DVec3::new(local[(axis + 1) % 3], local[(axis + 2) % 3], 0.0),
-            )
+            DVec3::Z
         };
-        let (position, rotation) = path_frame_at(&path, &frames, &arc_at_point, arc)?;
-        let deformed = position + rotation * cross;
-        vertex.co = object.transform_point3(local.lerp(deformed, weight));
+        let side = tangent.cross(reference).normalize_or_zero();
+        let up = tangent.cross(side).normalize_or_zero();
+        let fraction =
+            (along - cumulative[segment]) / (cumulative[segment + 1] - cumulative[segment]);
+        let centerline = first.lerp(second, fraction);
+        let perpendicular = source_positions[index] - axis * source_positions[index].dot(axis);
+        vertex.co =
+            centerline + side * perpendicular.dot(source_side) + up * perpendicular.dot(source_up);
     }
-
     validated(&result)?;
     Ok(result)
 }
 
-/// The deform axis index and whether the axis is negative (Blender `POS_X`..`NEG_Z`).
-fn curve_deform_axis(modifier: &Modifier) -> Result<(usize, bool)> {
-    let axis = string_param(modifier, "deform_axis")?.to_ascii_uppercase();
+fn curve_axis_param(modifier: &Modifier, name: &str) -> Result<DVec3> {
+    let axis = string_param(modifier, name)?.to_ascii_uppercase();
     match axis.as_str() {
-        "POS_X" => Ok((0, false)),
-        "NEG_X" => Ok((0, true)),
-        "POS_Y" => Ok((1, false)),
-        "NEG_Y" => Ok((1, true)),
-        "POS_Z" => Ok((2, false)),
-        "NEG_Z" => Ok((2, true)),
+        "POS_X" => Ok(DVec3::X),
+        "NEG_X" => Ok(-DVec3::X),
+        "POS_Y" => Ok(DVec3::Y),
+        "NEG_Y" => Ok(-DVec3::Y),
+        "POS_Z" => Ok(DVec3::Z),
+        "NEG_Z" => Ok(-DVec3::Z),
         _ => Err(invalid_parameter(
             modifier,
-            "deform_axis",
+            name,
             "POS_X, NEG_X, POS_Y, NEG_Y, POS_Z, or NEG_Z",
         )),
-    }
-}
-
-/// Cumulative arc length at every path point (Blender `BKE_anim_path_calc_data`).
-fn curve_arc_lengths(modifier: &Modifier, path: &[DVec3]) -> Result<Vec<f64>> {
-    let invalid = || {
-        invalid_parameter(
-            modifier,
-            "object",
-            "a curve with at least two distinct points",
-        )
-    };
-    if path.len() < 2 {
-        return Err(invalid());
-    }
-    let mut arc = Vec::with_capacity(path.len());
-    arc.push(0.0);
-    let mut total = 0.0;
-    for pair in path.windows(2) {
-        if let [from, to] = pair {
-            let length = from.distance(*to);
-            if length <= f64::EPSILON {
-                return Err(invalid());
-            }
-            total += length;
-            arc.push(total);
-        }
-    }
-    Ok(arc)
-}
-
-/// Blender `BKE_where_on_path` for poly paths: the path position and frame at arc length `arc`,
-/// interpolated linearly (position) and by slerp (frame), extended past both ends.
-fn path_frame_at(
-    path: &[DVec3],
-    frames: &[DQuat],
-    arc_at_point: &[f64],
-    arc: f64,
-) -> Result<(DVec3, DQuat)> {
-    let total = arc_at_point.last().copied().unwrap_or(0.0);
-    let segment_count = arc_at_point.len().saturating_sub(1);
-    let index = if arc <= 0.0 {
-        0
-    } else if arc >= total {
-        segment_count.saturating_sub(1)
-    } else {
-        arc_at_point
-            .partition_point(|&length| length <= arc)
-            .saturating_sub(1)
-    };
-    let (
-        Some(&start_arc),
-        Some(&end_arc),
-        Some(&from),
-        Some(&to),
-        Some(&from_frame),
-        Some(&to_frame),
-    ) = (
-        arc_at_point.get(index),
-        arc_at_point.get(index + 1),
-        path.get(index),
-        path.get(index + 1),
-        frames.get(index),
-        frames.get(index + 1),
-    )
-    else {
-        return Err(PotError::new(
-            ErrorCode::InternalError,
-            "curve path lookup is out of range",
-        ));
-    };
-    let fraction = (arc - start_arc) / (end_arc - start_arc);
-    let position = from.lerp(to, fraction);
-    let rotation = if fraction <= 0.0 {
-        from_frame
-    } else if fraction >= 1.0 {
-        to_frame
-    } else {
-        let end_frame = if from_frame.dot(to_frame) < 0.0 {
-            -to_frame
-        } else {
-            to_frame
-        };
-        from_frame.slerp(end_frame, fraction)
-    };
-    Ok((position, rotation))
-}
-
-/// Blender's bevel frames for a 3D poly path with minimum twist: bisected tangents, end frames from the
-/// tangent alone, and interior frames carried along by the minimal rotation between tangents.
-fn bevel_frames(path: &[DVec3]) -> Vec<DQuat> {
-    let segments: Vec<DVec3> = path
-        .windows(2)
-        .filter_map(|pair| match pair {
-            [from, to] => Some((*to - *from).normalize_or_zero()),
-            _ => None,
-        })
-        .collect();
-    let mut tangents = Vec::with_capacity(path.len());
-    tangents.extend(segments.first().copied());
-    tangents.extend(
-        segments
-            .iter()
-            .zip(segments.iter().skip(1))
-            .map(|(before, after)| (*before + *after).normalize_or_zero()),
-    );
-    tangents.extend(segments.last().copied());
-    let count = tangents.len();
-    let mut frames = Vec::with_capacity(count);
-    let mut previous: Option<(DVec3, DQuat)> = None;
-    for (index, tangent) in tangents.into_iter().enumerate() {
-        let frame = match previous {
-            Some((prior_tangent, prior_frame)) if index + 1 < count => {
-                transport_frame(prior_frame, prior_tangent, tangent)
-            }
-            _ => track_frame(tangent),
-        };
-        frames.push(frame);
-        previous = Some((tangent, frame));
-    }
-    frames
-}
-
-/// Blender's `vec_to_quat(tangent, -Z, Y)`: local Z follows the tangent, local X and Y are the normal and binormal.
-fn track_frame(tangent: DVec3) -> DQuat {
-    let tangent = tangent.normalize_or_zero();
-    if tangent == DVec3::ZERO {
-        return DQuat::IDENTITY;
-    }
-    let mut axis = DVec3::new(-tangent.y, tangent.x, 0.0);
-    if axis.length_squared() <= 1.0e-12 {
-        axis = DVec3::X;
-    }
-    let align = DQuat::from_axis_angle(axis.normalize(), tangent.z.clamp(-1.0, 1.0).acos());
-    let roll_angle = if tangent.x.abs() < 1.0e-12 && tangent.y.abs() < 1.0e-12 {
-        // Vertical tangents use Blender's fixed roll for either direction.
-        if tangent.z > 0.0 {
-            std::f64::consts::PI
-        } else {
-            0.0
-        }
-    } else {
-        -(-tangent.x).atan2(-tangent.y)
-    };
-    (DQuat::from_axis_angle(tangent, roll_angle) * align).normalize()
-}
-
-/// Blender's minimal-twist step: rotate the frame from one tangent onto the next.
-fn transport_frame(frame: DQuat, from: DVec3, to: DVec3) -> DQuat {
-    let angle = from.dot(to).clamp(-1.0, 1.0).acos();
-    let axis = from.cross(to).normalize_or_zero();
-    if angle > 0.0 && axis != DVec3::ZERO {
-        DQuat::from_axis_angle(axis, angle) * frame
-    } else {
-        frame
     }
 }
 
@@ -2798,9 +2516,7 @@ mod tests {
         let start = curve_mesh.insert_vertex(glam::DVec3::ZERO).unwrap();
         let end = curve_mesh.insert_vertex(glam::DVec3::Z * 2.0).unwrap();
         curve_mesh.insert_edge([start, end]).unwrap();
-        let mut modifier =
-            modifier_with_target("curve", json!({"deform_axis":"POS_X"}), curve_mesh);
-        modifier.runtime.object_matrix = Some(glam::DMat4::IDENTITY.to_cols_array());
+        let modifier = modifier_with_target("curve", json!({"deform_axis":"POS_X"}), curve_mesh);
         let result = curve(&source, &modifier).unwrap();
         assert!(result.vertex(first).unwrap().co.distance(glam::DVec3::ZERO) < 1.0e-12);
         assert!(result.vertex(second).unwrap().co.distance(glam::DVec3::Z) < 1.0e-12);
@@ -2887,6 +2603,10 @@ mod tests {
         )
         .unwrap();
         set_origindex(&mut source, &[0, 1, 2]);
+        source.attributes.insert(
+            "vertex_groups".to_owned(),
+            json!({"Empty": {"v0": 0.0, "v1": 0.0, "v2": 0.0}}),
+        );
         let modifier = crate::model::Modifier {
             id: crate::model::Id::new("empty_mask").unwrap(),
             modifier_type: "mask".to_owned(),
@@ -2894,11 +2614,16 @@ mod tests {
             enabled: true,
             show_viewport: true,
             show_render: true,
-            params: serde_json::from_value(json!({"invert_vertex_group": false})).unwrap(),
+            params: serde_json::from_value(json!({
+                "vertex_group": "Empty",
+                "threshold": 0.5,
+                "invert_vertex_group": false
+            }))
+            .unwrap(),
             binding_data: None,
             runtime: crate::model::ModifierRuntime::default(),
         };
-        let result = mask(&source, &modifier, &std::collections::BTreeMap::new()).unwrap();
+        let result = mask(&source, &modifier).unwrap();
         assert_eq!(result.vertices.len(), 0);
         assert_eq!(origindex_values(&result), Some(Vec::new()));
     }

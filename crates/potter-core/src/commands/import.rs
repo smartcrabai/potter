@@ -71,42 +71,8 @@ pub fn run(args: &ImportArgs) -> Result<(Option<SceneInfo>, Value)> {
         return Err(lossy_error(format, &imported.losses));
     }
     let mut packed_resource_hashes = std::collections::BTreeSet::new();
-    for (resource_id, resource) in &imported.doc.resources {
+    for resource in imported.doc.resources.values() {
         if inline_resource_kind(resource)?.is_some() {
-            continue;
-        }
-        if is_sequence_resource(resource) {
-            if resource.get("kind").and_then(Value::as_str) != Some("alembic") {
-                return Err(PotError::with_details(
-                    ErrorCode::SceneInvalid,
-                    "cache sequence container kind must be `alembic`",
-                    json!({"resource_id":resource_id}),
-                ));
-            }
-            let frames = resource
-                .get("sequence_frames")
-                .and_then(Value::as_object)
-                .ok_or_else(|| {
-                    PotError::with_details(
-                        ErrorCode::SceneInvalid,
-                        "cache sequence resource has no frame manifest",
-                        json!({"resource_id":resource_id}),
-                    )
-                })?;
-            for leaf in frames.values() {
-                if inline_resource_kind(leaf)?.is_some() {
-                    return Err(PotError::with_details(
-                        ErrorCode::SceneInvalid,
-                        "cache sequence frame must be a binary resource leaf",
-                        json!({"resource_id":resource_id}),
-                    ));
-                }
-                if leaf["packed"] == true
-                    && let Some(digest) = leaf["hash"].as_str()
-                {
-                    packed_resource_hashes.insert(digest.to_owned());
-                }
-            }
             continue;
         }
         if resource["source_packed"] == true
@@ -313,16 +279,6 @@ fn asset_record(digest: &str) -> Value {
     json!({ "name": "blob", "hash": digest, "path": format!("assets/sha256/{hex}/blob") })
 }
 
-fn is_sequence_resource(value: &Value) -> bool {
-    value.get("sequence_frames").is_some()
-        || value.get("sequence_start").is_some()
-        || value.get("sequence_end").is_some()
-}
-
-#[expect(
-    clippy::too_many_lines,
-    reason = "one pass configures the imported Blender asset set and reference rewrites"
-)]
 fn configure_blender_resources(
     doc: &mut SceneDoc,
     staged_assets: &BTreeMap<String, Vec<u8>>,
@@ -338,19 +294,6 @@ fn configure_blender_resources(
     let mut warnings = Vec::new();
     for (id, source) in sources {
         if inline_resource_kind(&source)?.is_some() {
-            continue;
-        }
-        if is_sequence_resource(&source) {
-            configure_blender_sequence(
-                doc,
-                &id,
-                source,
-                staged_assets,
-                policy,
-                &mut reference_uris,
-                &mut result,
-                &mut warnings,
-            )?;
             continue;
         }
         let original_path = source
@@ -430,168 +373,6 @@ fn configure_blender_resources(
         }
     }
     Ok((result, warnings))
-}
-
-#[expect(
-    clippy::too_many_lines,
-    reason = "one sequence conversion keeps per-frame paths, hashes, and warnings together"
-)]
-fn configure_blender_sequence(
-    doc: &mut SceneDoc,
-    id: &Id,
-    mut source: Value,
-    staged_assets: &BTreeMap<String, Vec<u8>>,
-    policy: AssetPolicy,
-    reference_uris: &mut BTreeMap<String, String>,
-    result: &mut Vec<Value>,
-    warnings: &mut Vec<Value>,
-) -> Result<()> {
-    let invalid = || {
-        PotError::with_details(
-            ErrorCode::SceneInvalid,
-            "Blender cache sequence resource is malformed or incomplete",
-            json!({"resource_id":id}),
-        )
-    };
-    if source.get("kind").and_then(Value::as_str) != Some("alembic") {
-        return Err(invalid());
-    }
-    let packed = source
-        .get("packed")
-        .and_then(Value::as_bool)
-        .ok_or_else(invalid)?;
-    let start = source
-        .get("sequence_start")
-        .and_then(Value::as_i64)
-        .and_then(|frame| i32::try_from(frame).ok())
-        .ok_or_else(invalid)?;
-    let end = source
-        .get("sequence_end")
-        .and_then(Value::as_i64)
-        .and_then(|frame| i32::try_from(frame).ok())
-        .filter(|end| *end >= start)
-        .ok_or_else(invalid)?;
-    let source_frames = source
-        .get("sequence_frames")
-        .and_then(Value::as_object)
-        .ok_or_else(invalid)?;
-    let expected_count = i64::from(end) - i64::from(start) + 1;
-    if packed && i64::try_from(source_frames.len()).ok() != Some(expected_count) {
-        return Err(invalid());
-    }
-    let frames = source
-        .get_mut("sequence_frames")
-        .and_then(Value::as_object_mut)
-        .ok_or_else(invalid)?;
-    let mut frame_numbers = Vec::with_capacity(frames.len());
-    for (frame_key, leaf) in frames {
-        let frame = frame_key
-            .parse::<i32>()
-            .ok()
-            .filter(|frame| (*frame >= start) && (*frame <= end))
-            .ok_or_else(invalid)?;
-        if inline_resource_kind(leaf)?.is_some() {
-            return Err(invalid());
-        }
-        frame_numbers.push(frame);
-        let uri = leaf
-            .get("uri")
-            .and_then(Value::as_str)
-            .filter(|uri| !uri.is_empty())
-            .ok_or_else(invalid)?
-            .to_owned();
-        let kind = leaf
-            .get("kind")
-            .and_then(Value::as_str)
-            .filter(|kind| !kind.is_empty())
-            .ok_or_else(invalid)?
-            .to_owned();
-        let digest = leaf
-            .get("hash")
-            .and_then(Value::as_str)
-            .filter(|hash| !hash.is_empty())
-            .ok_or_else(invalid)?
-            .to_owned();
-        let leaf_packed = leaf
-            .get("packed")
-            .and_then(Value::as_bool)
-            .ok_or_else(invalid)?;
-        if (leaf_packed && leaf.get("bytes").and_then(Value::as_array).is_none())
-            || (packed && !leaf_packed)
-        {
-            return Err(invalid());
-        }
-        let filename = Path::new(&uri)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .filter(|name| !name.is_empty())
-            .unwrap_or("resource");
-        let copy = policy == AssetPolicy::Copy || leaf_packed;
-        let available = staged_assets.contains_key(&digest);
-        if leaf_packed && !available {
-            return Err(PotError::with_details(
-                ErrorCode::SceneInvalid,
-                "packed Blender cache sequence frame has no verified payload",
-                json!({"resource_id":id,"frame":frame,"hash":digest}),
-            ));
-        }
-        let destination = if copy && available {
-            let hex = digest.strip_prefix("sha256:").unwrap_or_default();
-            format!("assets/sha256/{hex}/{filename}")
-        } else {
-            uri.clone()
-        };
-        let source_path = uri.strip_prefix("file://").unwrap_or(&uri);
-        let missing = if copy {
-            !available
-        } else {
-            !Path::new(source_path).is_file()
-        };
-        let status = if missing { "missing" } else { "available" };
-        if missing {
-            warnings.push(json!({
-                "code": "ASSET_MISSING",
-                "resource_id": id,
-                "frame": frame,
-                "uri": destination,
-                "message": "referenced Blender cache frame was not found; import preserved the missing link"
-            }));
-        }
-        reference_uris.insert(uri.clone(), destination.clone());
-        let mut leaf_record = crate::cache_sequence::cache_sequence_resource_record(
-            &destination,
-            &kind,
-            &digest,
-            None,
-        );
-        let leaf_object = leaf_record.as_object_mut().ok_or_else(invalid)?;
-        leaf_object.insert("original_path".to_owned(), json!(uri));
-        leaf_object.insert("status".to_owned(), json!(status));
-        *leaf = leaf_record;
-        result.push(json!({
-            "id": id,
-            "sequence_frame": frame,
-            "uri": destination,
-            "original_path": uri,
-            "hash": digest,
-            "kind": kind,
-            "status": status,
-            "packed": false,
-        }));
-    }
-    frame_numbers.sort_unstable();
-    if frame_numbers
-        .windows(2)
-        .any(|window| window[0] == window[1])
-    {
-        return Err(invalid());
-    }
-    source["packed"] = json!(false);
-    if let Some(container) = source.as_object_mut() {
-        container.remove("export_path");
-    }
-    doc.resources.insert(id.clone(), source);
-    Ok(())
 }
 
 fn append_graph(
@@ -1047,8 +828,8 @@ mod tests {
     }
 
     #[test]
-    fn blender_import_preserves_inline_resources_and_sequence_leaf_kinds() -> Result<()> {
-        let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+    fn blender_import_preserves_inline_resources() -> Result<()> {
+        let mut doc = SceneDoc::new("inline_import_test".to_owned());
         let inline_id = Id::new("inline_texture")?;
         let inline = json!({
             "storage":"inline",
@@ -1058,83 +839,12 @@ mod tests {
         });
         doc.resources.insert(inline_id.clone(), inline.clone());
 
-        let id = Id::new("cache_sequence")?;
-        let bytes = b"sequence frame".to_vec();
-        let digest = hash::sha256(&bytes);
-        doc.resources.insert(
-            id.clone(),
-            json!({
-                "uri":"master.abc",
-                "export_path":"transient-master.abc",
-                "kind":"alembic",
-                "packed":true,
-                "sequence_start":5,
-                "sequence_end":5,
-                "sequence_frames":{
-                    "5":{
-                        "uri":"frame.abc",
-                        "kind":"alembic_cache",
-                        "hash":digest.clone(),
-                        "packed":true,
-                        "bytes":bytes.clone()
-                    }
-                }
-            }),
-        );
-        let staged = BTreeMap::from([(digest.clone(), bytes)]);
         let (external, warnings) =
-            configure_blender_resources(&mut doc, &staged, AssetPolicy::Link)?;
+            configure_blender_resources(&mut doc, &BTreeMap::new(), AssetPolicy::Link)?;
 
-        let (_, hex) = digest
-            .split_once(':')
-            .ok_or_else(|| PotError::new(ErrorCode::InternalError, "test hash is not prefixed"))?;
-        let frame = &doc.resources[&id]["sequence_frames"]["5"];
         assert_eq!(doc.resources[&inline_id], inline);
-        assert_eq!(doc.resources[&id]["packed"], false);
-        assert_eq!(doc.resources[&id]["uri"], "master.abc");
-        assert!(doc.resources[&id].get("export_path").is_none());
-        assert_eq!(frame["uri"], format!("assets/sha256/{hex}/frame.abc"));
-        assert_eq!(frame["kind"], "alembic_cache");
-        assert_eq!(frame["hash"], digest);
-        assert_eq!(frame["packed"], false);
-        assert!(frame.get("bytes").is_none());
-        assert_eq!(external.len(), 1);
-        assert_eq!(external[0]["kind"], "alembic_cache");
+        assert!(external.is_empty());
         assert_eq!(warnings, Vec::<serde_json::Value>::new());
-        Ok(())
-    }
-
-    #[test]
-    fn blender_import_rejects_incomplete_packed_sequence() -> Result<()> {
-        let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
-        let id = Id::new("cache_sequence")?;
-        let record = json!({
-            "uri":"master.abc",
-            "kind":"alembic",
-            "packed":true,
-            "sequence_start":1,
-            "sequence_end":2,
-            "sequence_frames":{
-                "1":{
-                    "uri":"frame.abc",
-                    "kind":"alembic",
-                    "hash":"sha256:frame",
-                    "packed":true,
-                    "bytes":[1]
-                }
-            }
-        });
-        doc.resources.insert(id.clone(), record.clone());
-        let error = configure_blender_resources(&mut doc, &BTreeMap::new(), AssetPolicy::Copy)
-            .err()
-            .ok_or_else(|| {
-                PotError::new(
-                    ErrorCode::InternalError,
-                    "incomplete packed sequences must fail",
-                )
-            })?;
-        assert_eq!(error.code, ErrorCode::SceneInvalid);
-        assert_eq!(doc.resources[&id], record);
         Ok(())
     }
 }

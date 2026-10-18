@@ -377,13 +377,7 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
             ) && modifier
                 .params
                 .get("mask_texture")
-                .is_some_and(|value| !value.is_null()))
-            || (modifier.modifier_type == "mask"
-                && modifier.params.get("mode").and_then(Value::as_str) == Some("ARMATURE")
-                && modifier
-                    .params
-                    .get("armature")
-                    .is_some_and(Value::is_string));
+                .is_some_and(|value| !value.is_null()));
         if modifier.modifier_type == "armature"
             || modifier.modifier_type == "lattice"
             || matches!(
@@ -504,8 +498,8 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
             | "normal_edit"
             | "uv_project"
             | "uv_warp"
-            | "data_transfer"
-            | "mask" => attributes::evaluate(&evaluated, modifier, subject_name)?,
+            | "data_transfer" => attributes::evaluate(&evaluated, modifier)?,
+            "mask" => advanced::mask(&evaluated, modifier)?,
             "laplacian_smooth" => smoothing::laplacian_smooth(&evaluated, modifier)?,
             "laplacian_deform" => deform::laplacian_deform(&evaluated, modifier)?,
             "corrective_smooth" => smoothing::corrective_smooth(
@@ -4639,7 +4633,6 @@ fn bevel(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         shade_sources,
         false,
     );
-    origin.source_vertices = Some(point_vertices.iter().copied().map(Some).collect());
     origin.corners = Some(corners);
     let source_count = source_polygons.len();
     let kinds: Vec<bevel_shading::Kind> = (0..output_polygons.len())
@@ -4769,7 +4762,6 @@ fn bevel_vertices(
     let mut point_origins: Vec<Vec<(usize, f64)>> = (0..source_points.len())
         .map(|vertex| vec![(vertex, 1.0)])
         .collect();
-    let mut source_vertices: Vec<Option<usize>> = (0..source_points.len()).map(Some).collect();
     let mut edge_points = HashMap::new();
     let mut patch_graph = vec![HashMap::<usize, Vec<usize>>::new(); source_points.len()];
     let mut corner_sectors = vec![Vec::new(); source_points.len()];
@@ -4802,7 +4794,6 @@ fn bevel_vertices(
                     );
                     let index = points.len();
                     points.push(point);
-                    source_vertices.push(Some(vertex));
                     let bounded = fraction.clamp(0.0, 1.0);
                     point_origins.push(blend_weights([
                         (vertex, 1.0 - bounded),
@@ -4839,7 +4830,6 @@ fn bevel_vertices(
                 };
                 let index = points.len();
                 points.push(arc_center + direction * radius);
-                source_vertices.push(Some(vertex));
                 let origin = blend_weights(
                     point_origins[incoming]
                         .iter()
@@ -4933,7 +4923,6 @@ fn bevel_vertices(
         let center = source_points[vertex] - normal_sum * (amount * fullness * 0.301_073_345);
         let center_index = points.len();
         points.push(center);
-        source_vertices.push(Some(vertex));
         point_origins.push(vec![(vertex, 1.0)]);
         for (incoming, arc_points, outgoing, material, source) in &corner_sectors[vertex] {
             if segments == 2 {
@@ -4994,12 +4983,6 @@ fn bevel_vertices(
         }
         query_polygons.push(ids);
     }
-    let mut index = 0;
-    source_vertices.retain(|_| {
-        let keep = used.get(index).copied().unwrap_or(false);
-        index += 1;
-        keep
-    });
     let mut remap = vec![0; points.len()];
     let mut compact_points = Vec::with_capacity(points.len());
     let mut compact_origins = Vec::with_capacity(points.len());
@@ -5038,7 +5021,7 @@ fn bevel_vertices(
     );
     let origin = Origin {
         vertices: compact_origins,
-        source_vertices: Some(source_vertices),
+        source_vertices: None,
         faces: face_sources,
         corners: Some(corners),
     };

@@ -507,9 +507,9 @@ def modifier_params(modifier):
     params = rna_props(modifier, omitted)
     if modifier.type in ("VERTEX_WEIGHT_EDIT", "VERTEX_WEIGHT_PROXIMITY"):
         params["map_curve"] = _curve_mapping_points(modifier.map_curve)
-        params["map_curve_settings"] = _curve_mapping_settings(modifier.map_curve)
     if modifier.type in ("HOOK", "WARP"):
-        params["falloff_curve"] = _curve_mapping_points(modifier.falloff_curve)
+        params["falloff_curve"] = _curve_mapping_points(
+            modifier.falloff_curve, include_handle_types=True)
         params["falloff_curve_settings"] = _curve_mapping_settings(modifier.falloff_curve)
     bound_property = "is_bound" if hasattr(modifier, "is_bound") else "is_bind"
     if hasattr(modifier, bound_property):
@@ -528,16 +528,17 @@ def modifier_params(modifier):
         else:
             params["texture"] = {"id_type": "Texture", "name": texture.name_full}
     return params
-def _curve_mapping_points(mapping):
+def _curve_mapping_points(mapping, include_handle_types=False):
     if mapping is None or not mapping.curves:
         return []
     points = []
     for point in mapping.curves[0].points:
         value = [float(point.location[0]), float(point.location[1])]
-        if point.handle_type != "AUTO":
+        if include_handle_types and point.handle_type != "AUTO":
             value.append(point.handle_type)
         points.append(value)
     return points
+
 
 def _curve_mapping_settings(mapping):
     if mapping is None:
@@ -552,7 +553,21 @@ def _curve_mapping_settings(mapping):
     }
 
 
-def _set_curve_mapping(mapping, values, owner, settings=None):
+def _set_curve_mapping(modifier, values):
+    mapping = getattr(modifier, "map_curve", None)
+    if mapping is None or not mapping.curves or len(values) < 2:
+        raise ValueError("modifier map_curve needs at least two control points")
+    curve = mapping.curves[0]
+    for point in list(curve.points)[1:-1]:
+        curve.points.remove(point)
+    points = [(float(point[0]), float(point[1])) for point in values]
+    curve.points[0].location = points[0]
+    curve.points[-1].location = points[-1]
+    for x, y in points[1:-1]:
+        curve.points.new(x, y)
+    mapping.update()
+
+def _set_falloff_curve_mapping(mapping, values, owner, settings=None):
     if mapping is None or not mapping.curves or len(values) < 2:
         raise ValueError("%s needs at least two control points" % owner)
     points = [
@@ -1775,8 +1790,6 @@ def object_dump(obj):
             "constraints": constraints, "drivers": drivers, "nla_tracks": nla_tracks,
             "action": action, "action_slot": action_slot, "pose": _pose_dump(obj),
             "vertex_groups": _vertex_groups_dump(obj), "rigid_body": _rigid_body_dump(obj),
-            "active_vertex_group_index": int(obj.vertex_groups.active_index)
-            if len(obj.vertex_groups) else None,
             "force_field": _force_field_dump(obj), "custom_properties": custom_props(obj),
             "volume_bounds": volume_bounds,
             "rna_properties": rna_props(obj, ("data", "parent", "children", "users_collection", "modifiers", "constraints", "animation_data", "material_slots"))}
@@ -2325,8 +2338,8 @@ def set_props(block, values):
             continue
         try:
             block[key] = value
-        except Exception as error:
-            raise ValueError("cannot set custom property %s" % key) from error
+        except Exception:
+            pass
 
 
 def _blender_id_pointer_type(block, key, current):
@@ -2912,16 +2925,16 @@ def set_modifier_params(modifier, item, id_lookup, texture_lookup, doc, target, 
         dynamic_paint_temporary_link = _ensure_dynamic_paint_role(
             modifier, obj, settings["role"])
     rna_params = dict(params)
-    for parameter in ("projectors", "resource", "is_bound", "cache_filepath",
-                      "map_curve", "falloff_curve", "map_curve_settings",
-                      "falloff_curve_settings"):
+    for parameter in (
+        "projectors",
+        "resource",
+        "is_bound",
+        "cache_filepath",
+        "map_curve",
+        "falloff_curve",
+        "falloff_curve_settings",
+    ):
         rna_params.pop(parameter, None)
-    if kind == "mesh_sequence_cache":
-        for parameter in (
-            "cache_frame", "frame_offset", "override_frame", "scale", "is_sequence",
-            "velocity_name", "velocity_unit", "forward_axis", "up_axis",
-        ):
-            rna_params.pop(parameter, None)
     texture_id = params.get("texture")
     texture_record = doc.get("resources", {}).get(texture_id, {})
     if (texture_record.get("storage") == "inline"
@@ -2932,11 +2945,9 @@ def set_modifier_params(modifier, item, id_lookup, texture_lookup, doc, target, 
     set_rna(modifier, rna_params, id_lookup)
     _restore_modifier_id_references(modifier, rna_params, id_lookup, texture_lookup)
     if kind in ("vertex_weight_edit", "vertex_weight_proximity") and "map_curve" in params:
-        _set_curve_mapping(
-            modifier.map_curve, params["map_curve"], "modifier map_curve",
-            params.get("map_curve_settings"))
+        _set_curve_mapping(modifier, params["map_curve"])
     if kind in ("hook", "warp") and "falloff_curve" in params:
-        _set_curve_mapping(
+        _set_falloff_curve_mapping(
             modifier.falloff_curve, params["falloff_curve"], "modifier falloff_curve",
             params.get("falloff_curve_settings"))
     if kind == "mesh_cache" and params.get("resource"):
@@ -4218,7 +4229,7 @@ def _restore_shape_keys(obj, mesh_source):
         raise ValueError("cannot restore shape keys on %s" % obj.name) from error
 
 
-def _restore_vertex_groups(obj, groups, active_index=None):
+def _restore_vertex_groups(obj, groups):
     group_ids = {}
     for source in groups:
         group = obj.vertex_groups.new(name=source["name"])
@@ -4232,11 +4243,6 @@ def _restore_vertex_groups(obj, groups, active_index=None):
                 group.add([index], float(item["weight"]), "REPLACE")
             except Exception as error:
                 raise ValueError("cannot restore weight for vertex group %s" % group.name) from error
-    if active_index is not None:
-        active_index = int(active_index)
-        if active_index < 0 or active_index >= len(obj.vertex_groups):
-            raise ValueError("active vertex-group index is out of range")
-        obj.vertex_groups.active_index = active_index
     if group_ids:
         obj["potter.vertex_group_ids_json"] = json.dumps(group_ids, sort_keys=True)
 
@@ -4988,15 +4994,15 @@ def _cache_file_for_resource(doc, reference, target, params=None):
             cache_file.name = identity
         set_rna(cache_file, resource.get("cache_file", {}), {}, strict=True,
                 owner="Alembic CacheFile")
-    for key in ("frame_offset", "scale", "is_sequence", "velocity_name",
-                "velocity_unit", "forward_axis", "up_axis"):
-        if key in params:
-            setattr(cache_file, key, params[key])
+    if "frame_offset" in params:
+        cache_file.frame_offset = float(params["frame_offset"])
+    if "scale" in params:
+        cache_file.scale = float(params["scale"])
     override_frame = params.get("override_frame")
     cache_file.override_frame = override_frame is not None
-    cache_file.frame = float(
-        override_frame if override_frame is not None
-        else params.get("cache_frame", cache_file.frame))
+    if override_frame is not None:
+        cache_file.frame = float(override_frame)
+    CACHE_FILES_BY_IDENTITY[cache_key] = cache_file
     return cache_file
 def _movie_clip_camera_values(clip, camera_source):
     property_names = {
@@ -6336,7 +6342,6 @@ def export_doc(doc, target, pack, scene_hash, context):
         image["potter.image_json"] = json.dumps(image_metadata, sort_keys=True)
         image_map[image_id] = image
         image.use_fake_user = True
-        image_map[image_id] = image
     data_raw = doc.get("data_blocks", {})
     linked_data_blocks = linked_maps["data_blocks"]
     mesh_map = {identifier: block for identifier, block in linked_data_blocks.items()
@@ -6691,7 +6696,7 @@ def export_doc(doc, target, pack, scene_hash, context):
             groups = _vertex_groups_from_model(doc, data_id)
             if not groups:
                 groups = source_object.get("vertex_groups", [])
-            _restore_vertex_groups(obj, groups, item.get("active_vertex_group_index"))
+            _restore_vertex_groups(obj, groups)
             mesh_source = compatibility_block(doc, "meshes", "Mesh", data_id)
             if data_id not in shape_key_meshes:
                 model_shape_keys = _shape_keys_from_model(doc, data_id)
@@ -6728,8 +6733,6 @@ def export_doc(doc, target, pack, scene_hash, context):
     id_lookup.update({image.name_full: image for image in image_map.values()})
     id_lookup.update(image_map)
     id_lookup.update({image.name_full: image for image in linked_maps["resources"].values()})
-    id_lookup.update(image_map)
-    id_lookup.update({image.name_full: image for image in image_map.values()})
     texture_map = _legacy_textures_from_doc(doc, image_map)
     socket_maps = _populate_geometry_groups(group_map, group_sources, id_lookup)
     for material_id, item in doc.get("materials", {}).items():
@@ -6827,14 +6830,6 @@ def export_doc(doc, target, pack, scene_hash, context):
                     key: value for key, value in params.items() if key != "use_pin_to_last"})
                 set_modifier_params(
                     modifier, rna_item, id_lookup, texture_map, doc, target, node_id, obj)
-                if modifier_item.get("type") == "mesh_sequence_cache":
-                    resource_id = params.get("resource")
-                    cache_file = (
-                        _cache_file_for_resource(doc, resource_id, target, params)
-                        if resource_id else None
-                    )
-                    modifier.cache_file = cache_file
-                    modifier.object_path = params.get("object_path", "")
                 source_modifier = (
                     source_modifiers.get(modifier_item.get("id"))
                     or source_modifiers_by_rna_name.get(modifier_item.get("name"))

@@ -44,7 +44,6 @@ pub mod pointcloud;
 pub(crate) mod provenance;
 pub mod remesh;
 pub mod sculpt;
-pub(crate) mod spatial;
 pub mod text;
 pub(crate) mod triangulate;
 pub(crate) mod uv_layers;
