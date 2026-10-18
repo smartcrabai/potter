@@ -963,8 +963,11 @@ fn compare_storage_order(actual: &Shape, expected: &Shape) -> Result<(), String>
     Ok(())
 }
 
-/// Compares Blender's generic POINT/EDGE/FACE/CORNER values, in storage order, with the values of the
-/// native keyed store of `mesh`. Every element must carry a value: none is defaulted.
+/// Compares Blender's generic POINT/EDGE/FACE/CORNER values, in storage order, with the native keyed
+/// store of `mesh`. Provenance leaves an element without a source out of the store, and readers take
+/// the type's default (`provenance.rs` remap docs). Blender's `subdiv_copy_edge_data` (subdiv_mesh.cc
+/// L1199-1222) gives inner edges that default too, so an absent entry is accepted only where Blender's
+/// value is 0.0, the FLOAT default. Any other absent element fails. Present values compare exactly.
 fn compare_ordered_attributes(mesh: &Mesh, expected: &Value) -> TestResult<()> {
     let expected = expected
         .as_array()
@@ -989,28 +992,23 @@ fn compare_ordered_attributes(mesh: &Mesh, expected: &Value) -> TestResult<()> {
                 format!("generic attribute {name} is not on the {native_domain} domain").into(),
             );
         }
-        let stored = |key: String| -> TestResult<f64> {
-            values
-                .get(&key)
-                .ok_or_else(|| format!("generic attribute {name} has no value for {key}").into())
-                .and_then(number)
-        };
-        let actual: Vec<f64> = match domain {
+        let stored = |key: String| -> Option<f64> { values.get(&key).and_then(Value::as_f64) };
+        let actual: Vec<Option<f64>> = match domain {
             "POINT" => mesh
                 .vertices
                 .iter()
                 .map(|vertex| stored(format!("v{}", vertex.id)))
-                .collect::<TestResult<_>>()?,
+                .collect(),
             "EDGE" => mesh
                 .edges
                 .iter()
                 .map(|edge| stored(format!("e{}", edge.id)))
-                .collect::<TestResult<_>>()?,
+                .collect(),
             "FACE" => mesh
                 .faces
                 .iter()
                 .map(|face| stored(format!("f{}", face.id)))
-                .collect::<TestResult<_>>()?,
+                .collect(),
             "CORNER" => {
                 let mut corners = Vec::new();
                 for face in &mesh.faces {
@@ -1025,7 +1023,7 @@ fn compare_ordered_attributes(mesh: &Mesh, expected: &Value) -> TestResult<()> {
                         .into());
                     }
                     for value in row {
-                        corners.push(number(value)?);
+                        corners.push(Some(number(value)?));
                     }
                 }
                 corners
@@ -1045,11 +1043,24 @@ fn compare_ordered_attributes(mesh: &Mesh, expected: &Value) -> TestResult<()> {
         }
         for (index, (actual, expected)) in actual.iter().zip(expected_values).enumerate() {
             let expected = number(expected)?;
-            if (actual - expected).abs() > GENERIC_ATTRIBUTE_TOLERANCE * expected.abs().max(1.0) {
-                return Err(format!(
-                    "generic attribute {name} {domain} element {index} is {actual}, Blender has {expected}"
-                )
-                .into());
+            match actual {
+                Some(actual) => {
+                    if (actual - expected).abs()
+                        > GENERIC_ATTRIBUTE_TOLERANCE * expected.abs().max(1.0)
+                    {
+                        return Err(format!(
+                            "generic attribute {name} {domain} element {index} is {actual}, Blender has {expected}"
+                        )
+                        .into());
+                    }
+                }
+                None if expected == 0.0 => {}
+                None => {
+                    return Err(format!(
+                        "generic attribute {name} {domain} element {index} is absent, Blender has {expected}"
+                    )
+                    .into());
+                }
             }
         }
     }
