@@ -40,7 +40,7 @@ static FILMIC_DESAT_33: LazyLock<Result<Lut3d, String>> =
 static FILMIC_TO_0_70: LazyLock<Result<Lut1d, String>> =
     LazyLock::new(|| parse_spi1d(FILMIC_TO_0_70_SPI1D));
 
-/// `lg2` allocation window of the AgX views (`AgX Base Rec.1886`, `AgX False Color Rec.709`).
+/// `lg2` allocation window of the `AgX` views (`AgX Base Rec.1886`, `AgX False Color Rec.709`).
 const AGX_LOG2_MIN: f64 = -12.473_93;
 const AGX_LOG2_MAX: f64 = 12.526_068_811_7;
 /// `lg2` allocation window of the Filmic view (`Filmic sRGB`).

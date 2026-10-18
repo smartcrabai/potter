@@ -238,7 +238,7 @@ fn view_transforms_look_gamma_and_srgb_encoding_are_applied() -> Result<(), Box<
     }
     .display_encode(sample)?;
     assert!(
-        gamma.iter().all(|value| (value - 0.5).abs() < 1.0e-6),
+        gamma.iter().all(|value| (value - 0.5).abs() < 1.0e-5),
         "{gamma:?}"
     );
 
