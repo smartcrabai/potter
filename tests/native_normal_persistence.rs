@@ -30,7 +30,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use blender_code_tolerance::code_within_step;
+use blender_code_tolerance::code_within_beta_step;
 use native_oracle::{
     BYTE_TOLERANCE, FLOAT_TOLERANCE, NORMAL_TOLERANCE, StoredCorner, TestResult, apply_operations,
     assert_close, assert_floats, attribute, build_oracle, code_pair, dump_blend, dumped_object,
@@ -997,13 +997,13 @@ fn nonmanifold_subdivision_auto_codes_match_blenders_evaluated_fan() -> TestResu
             let actual = &actual_rows[face_index][corner_index];
             let within = match (actual, &expected_code) {
                 (StoredCorner::Code(a), StoredCorner::Code(e)) => {
-                    code_within_step(Some(*a), Some(*e))
+                    code_within_beta_step(Some(*a), Some(*e))
                 }
                 (a, e) => a == e,
             };
             assert!(
                 within,
-                "Subsurf loop {source_loop} code is not within one step of Blender's: actual {actual:?}, expected {expected_code:?}"
+                "Subsurf loop {source_loop} code is outside Blender's platform variance (alpha exact, beta ±1): actual {actual:?}, expected {expected_code:?}"
             );
         }
     }
