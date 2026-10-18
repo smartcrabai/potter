@@ -1560,14 +1560,23 @@ fn sample_light(light: &PointLight, point: DVec3, rng: &mut Pcg32) -> Option<Lig
     };
     let offset_to_centre = light.position - point;
     let distance_squared = offset_to_centre.length_squared();
-    if !distance_squared.is_finite() || distance_squared <= f64::EPSILON {
+    if !distance_squared.is_finite() {
+        return None;
+    }
+    let radius = light.radius;
+    let is_sphere = radius > 0.0 && !light.soft_falloff;
+    let inside_sphere = is_sphere && distance_squared <= radius * radius;
+    if distance_squared <= f64::EPSILON && !inside_sphere {
         return None;
     }
     let distance_to_centre = distance_squared.sqrt();
     // Unit vectors from the receiver to the light centre, and from the light centre to the receiver.
-    let toward_centre = offset_to_centre / distance_to_centre;
+    let toward_centre = if distance_to_centre > 0.0 {
+        offset_to_centre / distance_to_centre
+    } else {
+        DVec3::Z
+    };
     let from_centre = -toward_centre;
-    let radius = light.radius;
     if radius <= 0.0 {
         // A zero-radius point: radiant intensity P / (4π), i.e. `eval_fac = 1 / (4π)`.
         let direction = toward_centre;
@@ -1609,7 +1618,8 @@ fn sample_light(light: &PointLight, point: DVec3, rng: &mut Pcg32) -> Option<Lig
     if distance_squared > radius * radius {
         // Uniform cone over the visible cap, pdf `1 / (2π (1 − cos θ_max))`.
         let sin_squared = radius * radius / distance_squared;
-        let one_minus_cos = 1.0 - (1.0 - sin_squared).max(0.0).sqrt();
+        // Stable `sin_sqr_to_one_minus_cos` form; `1 - sqrt(1 - x)` cancels for tiny x.
+        let one_minus_cos = sin_squared / (1.0 + (1.0 - sin_squared).clamp(0.0, 1.0).sqrt());
         let cosine = 1.0 - one_minus_cos * rng.next_f64();
         let sine = (1.0 - cosine * cosine).max(0.0).sqrt();
         let phi = std::f64::consts::TAU * rng.next_f64();
@@ -2463,6 +2473,10 @@ fn mix64(mut value: u64) -> u64 {
 }
 #[cfg(test)]
 mod volume_extinction_tests {
+    #![expect(
+        clippy::expect_used,
+        reason = "sphere-light regression samples must exist"
+    )]
     use super::*;
     use crate::geom::volume::{VolumeData, VolumeGrid};
 
@@ -2612,6 +2626,54 @@ mod volume_extinction_tests {
         for _ in 0..SAMPLE_COUNT {
             assert!(sample_area_light(&light, behind, &mut rng).is_none());
         }
+    }
+
+    #[test]
+    fn distant_tiny_sphere_converges_to_point_intensity() {
+        let light = PointLight {
+            position: DVec3::ZERO,
+            direction: DVec3::Z,
+            kind: LightType::Point,
+            color: DVec3::ONE,
+            energy: 4.0 * std::f64::consts::PI,
+            radius: 1.0e-6,
+            soft_falloff: false,
+            spot_size: std::f64::consts::FRAC_PI_4,
+            spot_blend: 0.15,
+            area: None,
+        };
+        let distance = 1_000.0;
+        let mut rng = Pcg32::for_sample(0x51e, 0, 0, 0);
+        let sample = sample_light(&light, DVec3::new(0.0, 0.0, distance), &mut rng)
+            .expect("a distant sphere remains visible");
+        let expected = 1.0 / (distance * distance);
+        assert!(sample.radiance.x > 0.0, "tiny sphere radiance is not zero");
+        assert!(
+            (sample.radiance.x - expected).abs() <= 1.0e-8 * expected,
+            "tiny sphere radiance {} should approach point intensity {expected}",
+            sample.radiance.x
+        );
+    }
+
+    #[test]
+    fn sphere_sample_near_its_centre_has_a_finite_exit_distance() {
+        let light = PointLight {
+            position: DVec3::ZERO,
+            direction: DVec3::Z,
+            kind: LightType::Point,
+            color: DVec3::ONE,
+            energy: 100.0,
+            radius: 1.0,
+            soft_falloff: false,
+            spot_size: std::f64::consts::FRAC_PI_4,
+            spot_blend: 0.15,
+            area: None,
+        };
+        let mut rng = Pcg32::for_sample(0x51e, 0, 0, 0);
+        let sample = sample_light(&light, DVec3::new(1.0e-9, 0.0, 0.0), &mut rng)
+            .expect("a point inside a sphere is lit");
+        assert!(sample.distance.is_finite() && (0.0..=2.0).contains(&sample.distance));
+        assert!(sample.radiance.is_finite() && sample.radiance.x > 0.0);
     }
 
     fn hg_cdf(cosine: f64, anisotropy: f64) -> f64 {

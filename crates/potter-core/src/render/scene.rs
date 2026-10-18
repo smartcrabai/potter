@@ -27,7 +27,8 @@ use crate::{
 use super::{
     bvh::Bvh,
     light_model::{
-        area_irradiance_per_radiance, area_radiance, area_shape, point_intensity, spot_attenuation,
+        area_irradiance_per_radiance, area_radiance, area_shape, area_visibility_samples,
+        point_intensity, spot_attenuation,
     },
     path::object_for_index,
     raster::{
@@ -2120,25 +2121,32 @@ fn light_contribution(
             if irradiance <= 0.0 {
                 return DVec3::ZERO;
             }
-            // Five shadow rays: the centre and the four edge midpoints, averaged.
-            let mut visibility = 0.0;
-            for (along_u, along_v) in [(0.0, 0.0), (1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)]
-            {
-                let sample_position = position
-                    + shape.axis_u * (shape.half_u * along_u)
-                    + shape.axis_v * (shape.half_v * along_v);
-                let delta = sample_position - point;
-                visibility += visibility_for_light(
+            let (samples, count) =
+                area_visibility_samples(&shape, position, light_direction, point, normal);
+            let mut total_weight = 0.0;
+            let mut visible_weight = 0.0;
+            let mut visible_fresnel = DVec3::ZERO;
+            for sample in &samples[..count] {
+                total_weight += sample.weight;
+                let visibility = visibility_for_light(
                     shadow,
                     point_shadow,
                     shadow_point,
                     geometric,
-                    delta.normalize_or_zero(),
-                    delta.length(),
+                    sample.direction,
+                    sample.distance,
                 );
+                let weight = sample.weight * visibility;
+                visible_weight += weight;
+                visible_fresnel +=
+                    fresnel_at_direction(albedo, metallic, specular_f0, normal, sample.direction)
+                        * weight;
             }
-            // The representative direction is the emitter centre: the diffuse term is exact for
-            // the whole emitter, and the specular lobe is evaluated along that direction.
+            if total_weight <= 0.0 || visible_weight <= 0.0 {
+                return DVec3::ZERO;
+            }
+            // Integrated Lambert irradiance is exact for rectangles. The diffuse Fresnel and
+            // visibility use only contributing directions; the specular lobe uses the centre.
             let toward_centre = (position - point).normalize_or_zero();
             direct_irradiance(
                 albedo,
@@ -2150,7 +2158,8 @@ fn light_contribution(
                 normal,
                 color,
                 irradiance,
-            ) * (visibility / 5.0)
+                visible_fresnel / visible_weight,
+            ) * (visible_weight / total_weight)
         }
     }
 }
@@ -2243,6 +2252,19 @@ fn shadow_visibility(
     visible / 9.0
 }
 
+fn fresnel_at_direction(
+    albedo: DVec3,
+    metallic: f64,
+    specular_f0: f64,
+    view_dir: DVec3,
+    light_dir: DVec3,
+) -> DVec3 {
+    let half_vector = (light_dir + view_dir).normalize_or_zero();
+    let view_half_cosine = view_dir.dot(half_vector).max(0.0);
+    let reflectance_at_normal = DVec3::splat(specular_f0) * (1.0 - metallic) + albedo * metallic;
+    reflectance_at_normal + (DVec3::ONE - reflectance_at_normal) * (1.0 - view_half_cosine).powi(5)
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "Cook-Torrance evaluation consumes explicit BRDF and light inputs"
@@ -2262,6 +2284,7 @@ fn direct_brdf(
     if normal_light_cosine <= 0.0 {
         return DVec3::ZERO;
     }
+    let diffuse_fresnel = fresnel_at_direction(albedo, metallic, specular_f0, view_dir, light_dir);
     direct_irradiance(
         albedo,
         metallic,
@@ -2272,12 +2295,13 @@ fn direct_brdf(
         view_dir,
         light_color,
         intensity * normal_light_cosine,
+        diffuse_fresnel,
     )
 }
 
-/// Reflected radiance for an incident `irradiance` (W/m², already weighted by the receiver's cosine)
-/// arriving from `light_dir`. The diffuse term is exact for any irradiance. The specular lobe is
-/// evaluated along `light_dir`, and is zero where `light_dir` is below the surface.
+/// Reflected radiance for incident `irradiance` (W/m², already weighted by the receiver cosine).
+/// `diffuse_fresnel` is averaged over the contributing directions for an integrated area light;
+/// the specular lobe remains evaluated along `light_dir`.
 #[expect(
     clippy::too_many_arguments,
     reason = "Cook-Torrance evaluation consumes explicit BRDF and light inputs"
@@ -2292,6 +2316,7 @@ fn direct_irradiance(
     view_dir: DVec3,
     light_color: DVec3,
     irradiance: f64,
+    diffuse_fresnel: DVec3,
 ) -> DVec3 {
     let normal_light_cosine = normal.dot(light_dir).max(0.0);
     let normal_view_cosine = normal.dot(view_dir).max(0.0);
@@ -2299,11 +2324,9 @@ fn direct_irradiance(
         return DVec3::ZERO;
     }
     let half_vector = (light_dir + view_dir).normalize_or_zero();
-    let view_half_cosine = view_dir.dot(half_vector).max(0.0);
-    let reflectance_at_normal = DVec3::splat(specular_f0) * (1.0 - metallic) + albedo * metallic;
-    let fresnel = reflectance_at_normal
-        + (DVec3::ONE - reflectance_at_normal) * (1.0 - view_half_cosine).powi(5);
-    let diffuse = (DVec3::ONE - fresnel) * albedo * ((1.0 - metallic) / std::f64::consts::PI);
+    let specular_fresnel = fresnel_at_direction(albedo, metallic, specular_f0, view_dir, light_dir);
+    let diffuse =
+        (DVec3::ONE - diffuse_fresnel) * albedo * ((1.0 - metallic) / std::f64::consts::PI);
     let specular = if normal_light_cosine > 0.0 {
         let normal_half_cosine = normal.dot(half_vector).max(0.0);
         let alpha = roughness.max(0.04).powi(2);
@@ -2315,7 +2338,7 @@ fn direct_irradiance(
         let smith_k = (roughness + 1.0).powi(2) / 8.0;
         let geometry = |cosine: f64| cosine / (cosine * (1.0 - smith_k) + smith_k).max(1.0e-9);
         let geometry_term = geometry(normal_light_cosine) * geometry(normal_view_cosine);
-        fresnel
+        specular_fresnel
             * (distribution * geometry_term
                 / (4.0 * normal_view_cosine * normal_light_cosine).max(1.0e-9))
     } else {
@@ -2337,8 +2360,9 @@ mod shading_normal_tests {
 
     use super::{
         ColorSlotReferences, carried_color_layers, color_layer_references, corner_values,
-        extract_geometry, source_has_color_layer, subdivide_displaced, surface_shader,
-        triangle_corners, triangle_layer_colors, triangle_layer_uvs, world_face_normals,
+        direct_irradiance, extract_geometry, fresnel_at_direction, source_has_color_layer,
+        subdivide_displaced, surface_shader, triangle_corners, triangle_layer_colors,
+        triangle_layer_uvs, world_face_normals,
     };
     use crate::{
         eval::{EvaluationContext, Snapshot},
@@ -2350,7 +2374,12 @@ mod shading_normal_tests {
         graph::{GraphKind, GraphNode, NodeGroup},
         image::{ImageData, ImageInterpolation},
         model::{Id, Material, MaterialLink, SceneDoc},
-        render::raster::{AlphaMode, Mode, SurfaceHit, Triangle},
+        render::{
+            light_model::{
+                AreaShape, area_irradiance_per_radiance, area_radiance, area_visibility_samples,
+            },
+            raster::{AlphaMode, Mode, SurfaceHit, Triangle},
+        },
     };
 
     fn node_id() -> Id {
@@ -2886,5 +2915,78 @@ mod shading_normal_tests {
             ]
         );
         Ok(())
+    }
+
+    #[test]
+    fn horizon_crossing_area_uses_contributing_directions_for_diffuse_fresnel() {
+        let axis_v = DVec3::new(
+            0.0,
+            std::f64::consts::FRAC_1_SQRT_2,
+            std::f64::consts::FRAC_1_SQRT_2,
+        );
+        let light_direction = DVec3::X.cross(axis_v);
+        let shape = AreaShape {
+            axis_u: DVec3::X,
+            axis_v,
+            half_u: 1.0,
+            half_v: 2.0,
+            ellipse: false,
+            area: 8.0,
+        };
+        let point = DVec3::ZERO;
+        let normal = DVec3::Z;
+        let centre = DVec3::new(0.0, 0.0, -1.0);
+        let irradiance =
+            area_irradiance_per_radiance(&shape, centre, light_direction, point, normal)
+                * area_radiance(1.0, shape.area);
+        assert!(irradiance > 0.0);
+        let (samples, count) =
+            area_visibility_samples(&shape, centre, light_direction, point, normal);
+        assert_eq!(
+            count, 1,
+            "the four below-horizon samples must not contribute"
+        );
+        assert!(
+            samples[..count]
+                .iter()
+                .all(|sample| sample.weight > 0.0 && sample.direction.z > 0.0)
+        );
+
+        let albedo = DVec3::splat(0.8);
+        let sample = samples[0];
+        let diffuse_fresnel = fresnel_at_direction(albedo, 0.0, 0.04, normal, sample.direction);
+        let centre_direction = (centre - point).normalize_or_zero();
+        assert!(centre_direction.dot(normal) < 0.0);
+        let centre_fresnel = fresnel_at_direction(albedo, 0.0, 0.04, normal, centre_direction);
+        assert!((centre_fresnel - DVec3::ONE).length() < 1.0e-12);
+        let output = direct_irradiance(
+            albedo,
+            0.0,
+            0.5,
+            0.04,
+            normal,
+            centre_direction,
+            normal,
+            DVec3::ONE,
+            irradiance,
+            diffuse_fresnel,
+        );
+        assert!(
+            output.x > 0.0,
+            "visible upper strip must retain diffuse light: {output:?}"
+        );
+        let old_centre_fresnel_output = direct_irradiance(
+            albedo,
+            0.0,
+            0.5,
+            0.04,
+            normal,
+            centre_direction,
+            normal,
+            DVec3::ONE,
+            irradiance,
+            centre_fresnel,
+        );
+        assert_eq!(old_centre_fresnel_output, DVec3::ZERO);
     }
 }

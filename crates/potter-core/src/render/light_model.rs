@@ -166,6 +166,89 @@ fn clip_to_receiver(
     count
 }
 
+#[derive(Clone, Copy, Default)]
+pub(crate) struct AreaVisibilitySample {
+    pub(crate) direction: DVec3,
+    pub(crate) distance: f64,
+    /// Receiver cosine × emitter cosine / distance²; zero-contribution directions are excluded.
+    pub(crate) weight: f64,
+}
+
+/// Deterministic points for area visibility and diffuse Fresnel weighting. The centre and four
+/// cross points are retained when they contribute; if all miss a positive horizon-clipped region,
+/// its centroid supplies one contributing direction.
+pub(crate) fn area_visibility_samples(
+    shape: &AreaShape,
+    centre: DVec3,
+    light_direction: DVec3,
+    point: DVec3,
+    normal: DVec3,
+) -> ([AreaVisibilitySample; 6], usize) {
+    let mut outline = [DVec3::ZERO; OUTLINE_CAPACITY];
+    let outline_count = emitter_outline(shape, centre, light_direction, &mut outline);
+    let mut clipped = [DVec3::ZERO; OUTLINE_CAPACITY];
+    let clipped_count = clip_to_receiver(&outline[..outline_count], point, normal, &mut clipped);
+    if clipped_count < 3 {
+        return ([AreaVisibilitySample::default(); 6], 0);
+    }
+
+    let cross_scale = if shape.ellipse { 0.5 } else { 1.0 };
+    let offsets = [
+        (0.0, 0.0),
+        (cross_scale, 0.0),
+        (-cross_scale, 0.0),
+        (0.0, cross_scale),
+        (0.0, -cross_scale),
+    ];
+    let mut samples = [AreaVisibilitySample::default(); 6];
+    let mut count = 0;
+    for (u, v) in offsets {
+        let sample_point =
+            centre + shape.axis_u * (shape.half_u * u) + shape.axis_v * (shape.half_v * v);
+        let delta = sample_point - point;
+        let distance_squared = delta.length_squared();
+        if distance_squared <= f64::EPSILON {
+            continue;
+        }
+        let distance = distance_squared.sqrt();
+        let direction = delta / distance;
+        let weight = normal.dot(direction).max(0.0) * light_direction.dot(-direction).max(0.0)
+            / distance_squared;
+        if weight > 0.0 {
+            samples[count] = AreaVisibilitySample {
+                direction,
+                distance,
+                weight,
+            };
+            count += 1;
+        }
+    }
+    if count == 0 {
+        let centroid = clipped[..clipped_count]
+            .iter()
+            .copied()
+            .fold(DVec3::ZERO, |sum, vertex| sum + vertex)
+            / clipped_count as f64;
+        let delta = centroid - point;
+        let distance_squared = delta.length_squared();
+        if distance_squared > f64::EPSILON {
+            let distance = distance_squared.sqrt();
+            let direction = delta / distance;
+            let weight = normal.dot(direction).max(0.0) * light_direction.dot(-direction).max(0.0)
+                / distance_squared;
+            if weight > 0.0 {
+                samples[0] = AreaVisibilitySample {
+                    direction,
+                    distance,
+                    weight,
+                };
+                count = 1;
+            }
+        }
+    }
+    (samples, count)
+}
+
 /// Lambert irradiance (W/m²) at `point` with receiver normal `normal`, per unit radiance of the
 /// area light `shape` centred at `centre` and emitting along `light_direction`. The receiver's
 /// cosine is included; the emitter is one-sided.
@@ -285,6 +368,64 @@ mod tests {
             (irradiance - 0.752_276).abs() < 1.0e-4,
             "irradiance {irradiance}"
         );
+    }
+
+    fn tilted_horizon_crossing_shape(ellipse: bool) -> (AreaShape, DVec3, DVec3) {
+        let axis_v = DVec3::new(
+            0.0,
+            std::f64::consts::FRAC_1_SQRT_2,
+            std::f64::consts::FRAC_1_SQRT_2,
+        );
+        let light_direction = DVec3::X.cross(axis_v);
+        (
+            AreaShape {
+                axis_u: DVec3::X,
+                axis_v,
+                half_u: 1.0,
+                half_v: 2.0,
+                ellipse,
+                area: if ellipse { 2.0 * PI } else { 8.0 },
+            },
+            DVec3::new(0.0, 0.0, -1.0),
+            light_direction,
+        )
+    }
+
+    #[test]
+    fn horizon_crossing_area_keeps_irradiance_and_excludes_below_horizon_samples() {
+        let (shape, centre, light_direction) = tilted_horizon_crossing_shape(false);
+        let irradiance =
+            area_irradiance_per_radiance(&shape, centre, light_direction, DVec3::ZERO, DVec3::Z);
+        assert!(
+            irradiance > 0.0,
+            "the upper strip must illuminate the receiver"
+        );
+        let (samples, count) =
+            area_visibility_samples(&shape, centre, light_direction, DVec3::ZERO, DVec3::Z);
+        assert!(count > 0);
+        assert!(
+            samples[..count]
+                .iter()
+                .all(|sample| sample.weight > 0.0 && sample.direction.z > 0.0)
+        );
+    }
+
+    #[test]
+    fn clipped_area_centroid_samples_a_visible_ellipse_strip_when_cross_points_miss() {
+        let (shape, centre, light_direction) = tilted_horizon_crossing_shape(true);
+        let irradiance =
+            area_irradiance_per_radiance(&shape, centre, light_direction, DVec3::ZERO, DVec3::Z);
+        assert!(
+            irradiance > 0.0,
+            "the upper ellipse strip must illuminate the receiver"
+        );
+        let (samples, count) =
+            area_visibility_samples(&shape, centre, light_direction, DVec3::ZERO, DVec3::Z);
+        assert_eq!(
+            count, 1,
+            "all five fixed ellipse samples miss; use the clipped centroid"
+        );
+        assert!(samples[0].weight > 0.0 && samples[0].direction.z > 0.0);
     }
 
     #[test]
