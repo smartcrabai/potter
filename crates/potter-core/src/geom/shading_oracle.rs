@@ -9,13 +9,14 @@
 
 use std::{collections::HashMap, error::Error, fs, path::Path};
 
-use glam::DVec3;
+use glam::{DQuat, DVec3, EulerRot};
 use serde_json::{Map, Value, json};
 
 use super::{
     Mesh,
     clnor::{self, NormalCodeOptions, SetterInput},
     normals::{corner_normals, sharp_edge_flags, smooth_face_flags},
+    uv_layers::{self, UvLayer},
 };
 use crate::{
     eval::{EvaluationContext, Snapshot},
@@ -31,9 +32,6 @@ const NORMAL_TOLERANCE: f64 = 1.0e-5;
 /// Corner normal tolerance with custom normals: Blender stores them as 16-bit components
 /// (`normals_split_custom_set`), so a copied or interpolated value can differ by about 1e-4.
 const QUANTIZED_NORMAL_TOLERANCE: f64 = 2.0e-4;
-
-/// Fixtures whose stack Potter refuses with a typed feature, as `(fixture, feature_id)`.
-const REFUSED: &[(&str, &str)] = &[("mirror_cube_bisect_flip", "modifier.mirror.bisect")];
 
 /// Fixtures whose flags match Blender exactly and whose corner normals are within tolerance.
 const EXACT: &[&str] = &[
@@ -52,6 +50,7 @@ const EXACT: &[&str] = &[
     "edge_split_sharp_only",
     "mask_grid",
     "mirror_cube",
+    "mirror_cube_bisect_flip",
     "mirror_cube_nocustom",
     "mirror_cube_nomerge",
     "mirror_grid",
@@ -116,7 +115,7 @@ fn fixture_names() -> TestResult<Vec<String>> {
     Ok(names)
 }
 
-fn point(value: &Value) -> TestResult<DVec3> {
+pub(super) fn point(value: &Value) -> TestResult<DVec3> {
     let [x, y, z] = value.as_array().ok_or("point must be an array")?.as_slice() else {
         return Err("point must have three coordinates".into());
     };
@@ -144,7 +143,10 @@ fn input_mesh(input: &Value) -> TestResult<Mesh> {
         .as_array()
         .ok_or("vertices")?
         .iter()
-        .map(point)
+        // Blender stores vertex positions as float32; the fixtures' decimal inputs are rounded the same way.
+        .map(|value| {
+            point(value).map(|p| DVec3::from_array(p.to_array().map(|c| f64::from(c as f32))))
+        })
         .collect::<TestResult<Vec<_>>>()?;
     let faces = input["faces"]
         .as_array()
@@ -228,6 +230,67 @@ fn input_mesh(input: &Value) -> TestResult<Mesh> {
         "shade_smooth".to_owned(),
         json!({"domain":"face","type":"bool","values":smooth_values}),
     );
+    if let Some(seams) = input["seam_edges"].as_array() {
+        let seam_pairs: Vec<(u32, u32)> = seams
+            .iter()
+            .map(|pair| {
+                let [a, b] = indices(pair)?[..] else {
+                    return Err("seam edge needs two vertices".into());
+                };
+                let (a, b) = (u32::try_from(a)?, u32::try_from(b)?);
+                Ok((a.min(b), a.max(b)))
+            })
+            .collect::<TestResult<_>>()?;
+        let values: Map<String, Value> = mesh
+            .edges
+            .iter()
+            .map(|edge| {
+                let [a, b] = edge.vertices;
+                let key = (a.min(b), a.max(b));
+                (format!("e{}", edge.id), json!(seam_pairs.contains(&key)))
+            })
+            .collect();
+        mesh.attributes.insert(
+            "seam".to_owned(),
+            json!({"domain":"edge","type":"bool","values":values}),
+        );
+    }
+    if let Some(materials) = input["face_material_index"].as_array() {
+        for (face, material) in mesh.faces.iter_mut().zip(materials) {
+            face.material_index = u32::try_from(material.as_u64().ok_or("material index")?)?;
+        }
+    }
+    if let Some(layers) = input["uv_layers"].as_object() {
+        let layers: Vec<UvLayer> = layers
+            .iter()
+            .map(|(name, faces)| {
+                let faces = faces
+                    .as_array()
+                    .ok_or("UV faces must be an array")?
+                    .iter()
+                    .map(|face| {
+                        let values = face
+                            .as_array()
+                            .ok_or("UV corners must be an array")?
+                            .iter()
+                            .map(|uv| {
+                                let uv = uv
+                                    .as_array()
+                                    .filter(|uv| uv.len() == 2)
+                                    .ok_or("UV corner must have two components")?;
+                                let u = uv[0].as_f64().ok_or("UV U must be numeric")?;
+                                let v = uv[1].as_f64().ok_or("UV V must be numeric")?;
+                                Ok([u, 1.0 - v])
+                            })
+                            .collect::<TestResult<Vec<_>>>()?;
+                        Ok(Some(values))
+                    })
+                    .collect::<TestResult<Vec<_>>>()?;
+                Ok(UvLayer::new(name.clone(), faces))
+            })
+            .collect::<TestResult<_>>()?;
+        uv_layers::write_layers(&mut mesh, &layers);
+    }
     if let Some(custom) = input["custom_normals"].as_array() {
         // Fixture rows are vectors or null per corner. The shared setter stores them as codes.
         let mut vectors: Vec<Option<DVec3>> = Vec::new();
@@ -310,8 +373,39 @@ fn modifiers(stack: &Value, objects: &Map<String, Value>) -> TestResult<Vec<Modi
         .collect()
 }
 
+/// Transform of a fixture object or subject: `location`, `rotation_euler` (radians, Blender XYZ),
+/// `scale`; a `translation` key is accepted as an alias of `location`.
+fn transform_of(value: &Value) -> TestResult<Transform> {
+    let vector = |key: &str, default: [f64; 3]| -> TestResult<[f64; 3]> {
+        let Some(values) = value.get(key).and_then(Value::as_array) else {
+            return Ok(default);
+        };
+        let [x, y, z] = values.as_slice() else {
+            return Err(format!("{key} must have three components").into());
+        };
+        Ok([
+            x.as_f64().ok_or(key)?,
+            y.as_f64().ok_or(key)?,
+            z.as_f64().ok_or(key)?,
+        ])
+    };
+    let location = match value.get("translation") {
+        Some(_) => vector("translation", [0.0; 3])?,
+        None => vector("location", [0.0; 3])?,
+    };
+    let euler = vector("rotation_euler", [0.0; 3])?;
+    // Blender's XYZ Euler is the matrix Rz * Ry * Rx, glam's ZYX intrinsic order.
+    let rotation = DQuat::from_euler(EulerRot::ZYX, euler[2], euler[1], euler[0]).to_array();
+    Ok(Transform {
+        translation: location,
+        rotation,
+        scale: vector("scale", [1.0; 3])?,
+        ..Transform::default()
+    })
+}
+
 /// Scene with the fixture's subject (carrying the stack) and its referenced objects as nodes.
-fn scene(fixture: &Value) -> TestResult<SceneDoc> {
+pub(super) fn scene(fixture: &Value) -> TestResult<SceneDoc> {
     let mut doc = SceneDoc::new(SCENE_ID.to_owned());
     let root = Id::new("collection_root")?;
     let empty = Map::new();
@@ -319,27 +413,19 @@ fn scene(fixture: &Value) -> TestResult<SceneDoc> {
     let mut nodes = vec![(
         "subject".to_owned(),
         input_mesh(&fixture["input"])?,
-        [0.0; 3],
+        transform_of(&fixture["subject_transform"])?,
         modifiers(&fixture["stack"], objects)?,
     )];
     for (name, object) in objects {
-        let translation = object["translation"]
-            .as_array()
-            .map(|values| -> TestResult<[f64; 3]> {
-                let [x, y, z] = values.as_slice() else {
-                    return Err("translation".into());
-                };
-                Ok([
-                    x.as_f64().ok_or("translation")?,
-                    y.as_f64().ok_or("translation")?,
-                    z.as_f64().ok_or("translation")?,
-                ])
-            })
-            .transpose()?
-            .unwrap_or([0.0; 3]);
-        nodes.push((slug(name), input_mesh(object)?, translation, Vec::new()));
+        // Helper objects without geometry (mirror empties) evaluate to an empty mesh.
+        let mesh = if object.get("vertices").is_some() {
+            input_mesh(object)?
+        } else {
+            Mesh::new()
+        };
+        nodes.push((slug(name), mesh, transform_of(object)?, Vec::new()));
     }
-    for (name, mesh, translation, modifiers) in nodes {
+    for (name, mesh, transform, modifiers) in nodes {
         let node_id = Id::new(&name)?;
         let data_id = Id::new(format!("data_{name}"))?;
         doc.data_blocks.insert(
@@ -355,10 +441,7 @@ fn scene(fixture: &Value) -> TestResult<SceneDoc> {
             Node {
                 name,
                 kind: "mesh".to_owned(),
-                transform: Transform {
-                    translation,
-                    ..Transform::default()
-                },
+                transform,
                 modifiers,
                 data: Some(data_id),
                 ..Node::default()
@@ -449,7 +532,7 @@ fn same_corners(potter: &[DVec3], blender: &[DVec3]) -> bool {
 
 /// Comparison result of one fixture.
 #[derive(Debug, Default)]
-struct Report {
+pub(super) struct Report {
     faces: usize,
     unmatched_faces: usize,
     unused_oracle_faces: usize,
@@ -469,7 +552,7 @@ struct Report {
 }
 
 impl Report {
-    fn exact(&self) -> bool {
+    pub(super) fn exact(&self) -> bool {
         self.unmatched_faces == 0
             && self.unused_oracle_faces == 0
             && self.smooth_mismatches == 0
@@ -480,7 +563,7 @@ impl Report {
     }
 }
 
-fn compare(fixture: &Value, mesh: &Mesh) -> TestResult<Report> {
+pub(super) fn compare(fixture: &Value, mesh: &Mesh) -> TestResult<Report> {
     let positions: Vec<DVec3> = mesh.vertices.iter().map(|vertex| vertex.co).collect();
     let vertex_index: HashMap<u32, usize> = mesh
         .vertices
@@ -631,7 +714,7 @@ fn report_all_shading_fixtures() -> TestResult {
 }
 
 #[test]
-fn exact_shading_fixtures_match_blender() -> TestResult {
+fn exact_shading_fixtures_match_blender() {
     let mut failures = Vec::new();
     for name in EXACT {
         match evaluate_fixture(name) {
@@ -642,17 +725,4 @@ fn exact_shading_fixtures_match_blender() -> TestResult {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
-    // Blender's output for these stacks is evaluated by no modifier yet, so Potter refuses them with
-    // the feature that names the gap instead of a silent difference.
-    for (name, feature) in REFUSED {
-        let Err(error) = evaluate_fixture(name) else {
-            return Err(format!("{name} must be refused").into());
-        };
-        let feature_id = error
-            .downcast_ref::<crate::error::PotError>()
-            .and_then(|error| error.details.get("feature_id"))
-            .and_then(serde_json::Value::as_str);
-        assert_eq!(feature_id, Some(*feature), "{name}");
-    }
-    Ok(())
 }
