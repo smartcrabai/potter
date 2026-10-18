@@ -251,6 +251,10 @@ fn flags3(modifier: &Modifier, name: &str) -> Result<[bool; 3]> {
     Ok(flags)
 }
 
+/// Corner codes and stored loop order of one pass's source, borrowed or rebuilt by the bisect.
+type PassCodes<'a> = Option<Cow<'a, [CornerNormalCode]>>;
+type PassOrder<'a> = Option<Cow<'a, [usize]>>;
+type PassResult = (Mesh, Option<Vec<CornerNormalCode>>, Option<Vec<usize>>);
 /// One mirror pass: optional bisect, copy and merge, then rebuilt provenance and the copy-side
 /// attributes (vertex groups, custom normals, UVs).
 fn mirror_axis(
@@ -259,16 +263,12 @@ fn mirror_axis(
     input_order: Option<&[usize]>,
     axis: usize,
     settings: &Settings,
-) -> Result<(Mesh, Option<Vec<CornerNormalCode>>, Option<Vec<usize>>)> {
+) -> Result<PassResult> {
     let plane = settings.plane(axis);
     let needs_order = input_codes.is_some() || input_order.is_some();
     let bisected;
-    let (source, source_codes, source_order): (
-        &Mesh,
-        Option<Cow<[CornerNormalCode]>>,
-        Option<Cow<[usize]>>,
-    ) = match plane.bisect {
-        Some((origin, normal)) => {
+    let (source, source_codes, source_order): (&Mesh, PassCodes<'_>, PassOrder<'_>) =
+        if let Some((origin, normal)) = plane.bisect {
             let (cut, corners) =
                 bisect(mesh, origin, normal, settings.bisect_threshold, input_order)?;
             bisected = cut;
@@ -282,16 +282,14 @@ fn mirror_axis(
             });
             let order = needs_order.then(|| Cow::Owned(stored_corner_order(&bisected)));
             (&bisected, codes, order)
-        }
-        None => {
+        } else {
             let order = match (needs_order, input_order) {
                 (false, _) => None,
                 (true, Some(order)) => Some(Cow::Borrowed(order)),
                 (true, None) => Some(Cow::Owned(stored_corner_order(mesh))),
             };
             (mesh, input_codes.map(Cow::Borrowed), order)
-        }
-    };
+        };
     let count = source.vertices.len();
 
     // The doubled mesh before the merge: the originals, then the copies at their mirror images.
@@ -697,7 +695,7 @@ fn bisect(
 }
 
 /// Returns faces in the order `BM_mesh_bisect_plane` pops them: the mesh-edge traversal first pushes
-/// each incident face once, then the BMesh face stack reverses that insertion order.
+/// each incident face once, then the `BMesh` face stack reverses that insertion order.
 fn bisect_face_pop_order(
     edges: &[[usize; 2]],
     polygons: &[(Vec<usize>, u32)],
@@ -913,7 +911,7 @@ fn split_face(
 }
 
 /// Splits a polygon along a chord as `BM_face_split` does. The old face follows `first` to `second`
-/// in loop order; the new face follows the complement. Each face starts at the loop BMesh keeps as
+/// in loop order; the new face follows the complement. Each face starts at the loop `BMesh` keeps as
 /// its `l_first`, which is significant for closed custom-normal fans.
 fn split_cycle(cycle: &[usize], first: usize, second: usize) -> Option<(Vec<usize>, Vec<usize>)> {
     let a = cycle.iter().position(|&vertex| vertex == first)?;
@@ -1151,18 +1149,21 @@ fn flip_side_name(name: &str) -> String {
     let mut suffix = String::new();
     let mut replace: Option<&str> = None;
 
-    if len > 1 && is_sep(body_bytes[len - 2]) {
-        if let Some(replacement) = side(body_bytes[len - 1]) {
-            prefix = body[..len - 1].to_owned();
-            replace = Some(replacement);
-        }
+    if len > 1
+        && is_sep(body_bytes[len - 2])
+        && let Some(replacement) = side(body_bytes[len - 1])
+    {
+        body[..len - 1].clone_into(&mut prefix);
+        replace = Some(replacement);
     }
-    if replace.is_none() && len > 1 && is_sep(body_bytes[1]) {
-        if let Some(replacement) = side(body_bytes[0]) {
-            suffix = body[1..].to_owned();
-            prefix.clear();
-            replace = Some(replacement);
-        }
+    if replace.is_none()
+        && len > 1
+        && is_sep(body_bytes[1])
+        && let Some(replacement) = side(body_bytes[0])
+    {
+        body[1..].clone_into(&mut suffix);
+        prefix.clear();
+        replace = Some(replacement);
     }
     if replace.is_none() && len > 5 {
         let lower = body.to_ascii_lowercase();
@@ -1177,8 +1178,8 @@ fn flip_side_name(name: &str) -> String {
             } else {
                 "Left"
             };
-            suffix = body[index + 5..].to_owned();
-            prefix = body[..index].to_owned();
+            body[index + 5..].clone_into(&mut suffix);
+            body[..index].clone_into(&mut prefix);
             replace = Some(replacement);
         } else if let Some(index) = found_left.filter(|&index| index == 0 || index == len - 4) {
             let marker = &body[index..index + 4];
@@ -1189,8 +1190,8 @@ fn flip_side_name(name: &str) -> String {
             } else {
                 "Right"
             };
-            suffix = body[index + 4..].to_owned();
-            prefix = body[..index].to_owned();
+            body[index + 4..].clone_into(&mut suffix);
+            body[..index].clone_into(&mut prefix);
             replace = Some(replacement);
         }
     }
@@ -1319,6 +1320,7 @@ pub(super) fn mirror_uv_pass(
 
 #[cfg(test)]
 mod tests {
+    #![expect(clippy::unwrap_used, reason = "tests")]
 
     use super::{flip_side_name, mirror_uv_pass, split_cycle};
 
@@ -1361,7 +1363,7 @@ mod tests {
 
         use crate::{
             geom::Mesh,
-            model::{Id, Modifier},
+            model::{Id, Modifier, ModifierRuntime},
         };
 
         let mesh = Mesh::from_positions_and_faces(
@@ -1381,7 +1383,7 @@ mod tests {
                 .unwrap()
                 .clone(),
             binding_data: None,
-            runtime: Default::default(),
+            runtime: ModifierRuntime::default(),
         };
         let result = super::mirror(&mesh, &modifier, DMat4::IDENTITY, &BTreeMap::new()).unwrap();
         assert_eq!(result.faces.len(), 4);
@@ -1401,7 +1403,7 @@ mod tests {
                     NormalCodeOptions, SetterInput, corner_codes, corner_order, encode_vectors,
                 },
             },
-            model::{Id, Modifier},
+            model::{Id, Modifier, ModifierRuntime},
         };
 
         let mut mesh = Mesh::from_positions_and_faces(
@@ -1459,7 +1461,7 @@ mod tests {
             .unwrap()
             .clone(),
             binding_data: None,
-            runtime: Default::default(),
+            runtime: ModifierRuntime::default(),
         };
         let result = super::mirror(&mesh, &modifier, DMat4::IDENTITY, &BTreeMap::new()).unwrap();
         let result_codes = corner_codes(&result).unwrap().unwrap();
@@ -1484,7 +1486,7 @@ mod tests {
                 Mesh,
                 clnor::{CornerNormalCode, NormalCodeOptions, corner_codes, write_codes},
             },
-            model::{Id, Modifier},
+            model::{Id, Modifier, ModifierRuntime},
         };
 
         let mut mesh = Mesh::from_positions_and_faces(
@@ -1510,7 +1512,7 @@ mod tests {
                 .unwrap()
                 .clone(),
             binding_data: None,
-            runtime: Default::default(),
+            runtime: ModifierRuntime::default(),
         };
         let result = super::mirror(&mesh, &modifier, DMat4::IDENTITY, &BTreeMap::new()).unwrap();
         assert_eq!(

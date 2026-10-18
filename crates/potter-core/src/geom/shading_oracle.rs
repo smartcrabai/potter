@@ -714,7 +714,7 @@ fn report_all_shading_fixtures() -> TestResult {
 }
 
 #[test]
-fn exact_shading_fixtures_match_blender() -> TestResult {
+fn exact_shading_fixtures_match_blender() {
     let mut failures = Vec::new();
     for name in EXACT {
         match evaluate_fixture(name) {
@@ -725,5 +725,4 @@ fn exact_shading_fixtures_match_blender() -> TestResult {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
-    Ok(())
 }
