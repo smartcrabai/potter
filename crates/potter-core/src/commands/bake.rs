@@ -9,13 +9,16 @@ use std::{
 use glam::DMat4;
 use serde_json::{Value, json};
 
-use super::util::{parse_id, with_load_warnings};
+use super::util::parse_id;
 use crate::{
-    cli::{BakeArgs, BakeKind, NodeBakeMode},
+    cli::{BakeArgs, BakeKind, NodeBakeMode, NodeBakeUnpackMethod},
     error::{ErrorCode, PotError, Result},
-    eval::{EvaluationContext, EvaluationPurpose, Snapshot},
+    eval::{
+        EvaluationContext, EvaluationPurpose, EvaluationSceneContext, ModifierEvaluationContext,
+        Snapshot,
+    },
     geom::Mesh,
-    graph::{NodeBakeFrame, NodeBakeRecord},
+    graph::{NodeBakeFrame, NodeBakePayloadTransaction, NodeBakeRecord},
     model::{Id, SceneDoc},
     response::SceneInfo,
     store::Project,
@@ -32,9 +35,16 @@ pub fn run(args: BakeArgs) -> Result<(Option<SceneInfo>, Value)> {
         }
         BakeKind::NodeBake => return run_node_bake(args),
     }
-    if args.modifier.is_some() || args.node.is_some() || args.mode.is_some() || args.delete {
+    if args.modifier.is_some()
+        || args.node.is_some()
+        || args.mode.is_some()
+        || args.delete
+        || args.pack
+        || args.unpack
+        || args.unpack_method.is_some()
+    {
         return Err(PotError::invalid_argument(
-            "--modifier, --node, --mode, and --delete require --kind node-bake",
+            "--modifier, --node, --mode, --delete, --pack, and --unpack require --kind node-bake",
         ));
     }
     let output = args.out.as_deref().ok_or_else(|| {
@@ -244,10 +254,9 @@ pub fn run(args: BakeArgs) -> Result<(Option<SceneInfo>, Value)> {
     files.push("manifest.json".to_owned());
     stage.publish(output, args.overwrite)?;
     let scene = project.info()?;
-    let warnings = with_load_warnings(&[], &project)?;
     Ok((
         Some(scene),
-        json!({"kind":bake_kind_name(args.kind),"path":output,"files":files,"frame_count":baked_frames.len(),"cache_keys":cache_keys,"scene_modified":false,"warnings":warnings}),
+        json!({"kind":bake_kind_name(args.kind),"path":output,"files":files,"frame_count":baked_frames.len(),"cache_keys":cache_keys,"scene_modified":false}),
     ))
 }
 fn bake_kind_name(kind: BakeKind) -> &'static str {
@@ -280,9 +289,20 @@ fn run_node_bake(args: BakeArgs) -> Result<(Option<SceneInfo>, Value)> {
             .ok_or_else(|| PotError::invalid_argument("--node is required for a node bake"))?
             .to_owned(),
     )?;
-    if args.delete && (args.mode.is_some() || args.frames.is_some()) {
+    if args.unpack_method.is_some() && !args.unpack {
         return Err(PotError::invalid_argument(
-            "--mode and --frames cannot be combined with --delete",
+            "--unpack-method requires --unpack",
+        ));
+    }
+    let bake_action_count = u8::from(args.delete) + u8::from(args.pack) + u8::from(args.unpack);
+    if bake_action_count > 1 {
+        return Err(PotError::invalid_argument(
+            "--delete, --pack, and --unpack are mutually exclusive",
+        ));
+    }
+    if bake_action_count != 0 && (args.mode.is_some() || args.frames.is_some()) {
+        return Err(PotError::invalid_argument(
+            "--mode and --frames cannot be combined with --delete, --pack, or --unpack",
         ));
     }
 
@@ -363,6 +383,45 @@ fn run_node_bake(args: BakeArgs) -> Result<(Option<SceneInfo>, Value)> {
             "--node must identify a GeometryNodeBake node",
         ));
     }
+    let mut bake_settings = old_config
+        .as_ref()
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    for key in [
+        "bake_mode",
+        "bake_target",
+        "use_custom_simulation_frame_range",
+        "frame_start",
+        "frame_end",
+        "use_custom_path",
+        "directory",
+    ] {
+        if let Some(value) = bake_node.properties.get(key) {
+            bake_settings.insert(key.to_owned(), value.clone());
+        }
+    }
+    let bake_settings = Value::Object(bake_settings);
+    crate::graph::validate_node_bake_settings(&bake_settings)?;
+    if args.pack {
+        return pack_node_bake(
+            &mut project,
+            &target,
+            &modifier_id,
+            &node_id,
+            &bake_settings,
+        );
+    }
+    if args.unpack {
+        return unpack_node_bake(
+            &mut project,
+            &target,
+            &modifier_id,
+            &node_id,
+            &bake_settings,
+            args.unpack_method.unwrap_or(NodeBakeUnpackMethod::UseLocal),
+        );
+    }
 
     let selected_scene_id = args
         .context
@@ -384,39 +443,41 @@ fn run_node_bake(args: BakeArgs) -> Result<(Option<SceneInfo>, Value)> {
     }
     let mode = match args.mode {
         Some(mode) => mode,
-        None => node_bake_mode(old_config.as_ref())?,
+        None => node_bake_mode(Some(&bake_settings))?,
     };
     let frames = node_bake_frames(
         args.frames.as_deref(),
         mode,
         scene,
         current_frame,
-        old_config.as_ref(),
+        Some(&bake_settings),
     )?;
-    let bake_target = effective_node_bake_target(modifier, old_config.as_ref())?;
-    let bake_directory = effective_node_bake_directory(modifier, old_config.as_ref())?;
-    let context = EvaluationContext {
-        scene_id: Some(selected_scene_id),
-        view_layer: args
-            .context
-            .view_layer
-            .as_deref()
-            .map(parse_id)
-            .transpose()?,
-        frame: None,
-        purpose: EvaluationPurpose::Bake,
-    };
-    let project_root = project.path().to_path_buf();
+    let bake_target = effective_node_bake_target(modifier, Some(&bake_settings))?;
+    let bake_directory = effective_node_bake_directory(modifier, Some(&bake_settings))?;
+    let selected_view_layer = args
+        .context
+        .view_layer
+        .as_deref()
+        .map(parse_id)
+        .transpose()?;
+    let project_root = project.path();
     let cache_directory = project.cache_directory();
+    let modifier_context = ModifierEvaluationContext {
+        purpose: EvaluationPurpose::Bake,
+        project_root: Some(project_root),
+        cache_directory: Some(cache_directory),
+    };
     let mut captured_frames = Vec::with_capacity(frames.len());
     for frame in &frames {
-        let mut frame_context = context.clone();
-        frame_context.frame = Some(*frame);
+        let scene_context = EvaluationSceneContext {
+            scene_id: Some(&selected_scene_id),
+            view_layer: selected_view_layer.as_ref(),
+            frame: Some(*frame),
+        };
         let snapshot = Snapshot::evaluate_with_node_bake_capture(
             doc,
-            &frame_context,
-            Some(&project_root),
-            Some(cache_directory),
+            &scene_context,
+            modifier_context,
             &target,
             &modifier_id,
             node_id.as_str(),
@@ -440,9 +501,6 @@ fn run_node_bake(args: BakeArgs) -> Result<(Option<SceneInfo>, Value)> {
         version: 1,
         frames: captured_frames,
     };
-    let record_value = serde_json::to_value(&record).map_err(PotError::internal_json)?;
-    crate::graph::validate_node_bake_resource(&record_value)?;
-
     let resource_id = if bake_target == "PACKED" {
         Some(node_bake_resource_id(
             doc,
@@ -454,20 +512,43 @@ fn run_node_bake(args: BakeArgs) -> Result<(Option<SceneInfo>, Value)> {
     } else {
         None
     };
+    crate::graph::validate_node_bake_record(&record)?;
+    let record_value = if resource_id.is_some() {
+        Some(serde_json::to_value(&record).map_err(PotError::internal_json)?)
+    } else {
+        None
+    };
+    let mut transaction = NodeBakePayloadTransaction::new(project_root)?;
+    let mut retained_payload_bytes = 0_usize;
     let disk_frames = if bake_target == "DISK" {
         let mut entries = Vec::with_capacity(record.frames.len());
         for frame in &record.frames {
-            let bytes = serde_json::to_vec(frame).map_err(PotError::internal_json)?;
+            let bytes = match serde_json::to_vec(frame) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return abort_node_bake_transaction(
+                        transaction,
+                        PotError::internal_json(error),
+                    );
+                }
+            };
+            if let Err(error) = account_node_bake_payload_bytes(&mut retained_payload_bytes, &bytes)
+            {
+                return abort_node_bake_transaction(transaction, error);
+            }
             let digest = crate::hash::sha256(&bytes);
-            crate::graph::write_node_bake_payload(
-                &project_root,
+            if let Err(error) = transaction.stage_write(
                 &bake_directory,
                 &target,
                 &modifier_id,
                 node_id.as_str(),
                 &digest,
                 &bytes,
-            )?;
+                frame.frame,
+                false,
+            ) {
+                return abort_node_bake_transaction(transaction, error);
+            }
             entries.push(json!({"frame":frame.frame,"digest":digest}));
         }
         Some(entries)
@@ -475,59 +556,501 @@ fn run_node_bake(args: BakeArgs) -> Result<(Option<SceneInfo>, Value)> {
         None
     };
 
-    let mut config = old_config
-        .as_ref()
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    if bake_target == "DISK" {
-        config.insert("cache_directory".to_owned(), json!(bake_directory));
-    } else {
-        config.remove("cache_directory");
-    }
-    config.insert(
-        "storage".to_owned(),
-        json!(bake_target.to_ascii_lowercase()),
-    );
-    config.insert("bake_mode".to_owned(), json!(node_bake_mode_name(mode)));
-    config
-        .entry("bake_target".to_owned())
-        .or_insert_with(|| json!("INHERIT"));
-    if mode == NodeBakeMode::Animation && args.frames.is_some() {
-        config.insert("use_custom_simulation_frame_range".to_owned(), json!(true));
-        config.insert("frame_start".to_owned(), json!(frames[0]));
-        config.insert("frame_end".to_owned(), json!(frames[frames.len() - 1]));
-    } else if mode == NodeBakeMode::Animation {
+    let candidate_result: Result<(SceneDoc, Value)> = (|| {
+        let mut config = bake_settings.as_object().cloned().unwrap_or_default();
+        if bake_target == "DISK" {
+            config.insert("cache_directory".to_owned(), json!(bake_directory));
+        } else {
+            config.remove("cache_directory");
+        }
+        config.insert(
+            "storage".to_owned(),
+            json!(bake_target.to_ascii_lowercase()),
+        );
+        config.insert("bake_mode".to_owned(), json!(node_bake_mode_name(mode)));
         config
-            .entry("use_custom_simulation_frame_range".to_owned())
-            .or_insert_with(|| json!(false));
+            .entry("bake_target".to_owned())
+            .or_insert_with(|| json!("INHERIT"));
+        if mode == NodeBakeMode::Animation && args.frames.is_some() {
+            config.insert("use_custom_simulation_frame_range".to_owned(), json!(true));
+            config.insert("frame_start".to_owned(), json!(frames[0]));
+            config.insert("frame_end".to_owned(), json!(frames[frames.len() - 1]));
+        } else if mode == NodeBakeMode::Animation {
+            config
+                .entry("use_custom_simulation_frame_range".to_owned())
+                .or_insert_with(|| json!(false));
+        }
+        if let Some(resource_id) = &resource_id {
+            config.insert("resource_id".to_owned(), json!(resource_id));
+            config.remove("frames");
+        } else {
+            config.remove("resource_id");
+            config.insert("frames".to_owned(), json!(disk_frames));
+        }
+        let config = Value::Object(config);
+        let cleanup_config = config.clone();
+        crate::graph::validate_node_bake_config(&config)?;
+
+        let mut candidate = doc.clone();
+        if let Some(resource_id) = &resource_id {
+            candidate.resources.insert(
+                resource_id.clone(),
+                record_value.ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::InternalError,
+                        "packed node-bake resource value is missing",
+                    )
+                })?,
+            );
+        }
+        {
+            let modifier = candidate
+                .nodes
+                .get_mut(&target)
+                .and_then(|object| {
+                    object
+                        .modifiers
+                        .iter_mut()
+                        .find(|modifier| modifier.id == modifier_id)
+                })
+                .ok_or_else(|| {
+                    PotError::new(ErrorCode::InternalError, "node-bake modifier disappeared")
+                })?;
+            let bakes = modifier
+                .params
+                .entry("bakes".to_owned())
+                .or_insert_with(|| json!({}));
+            let bakes = bakes.as_object_mut().ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::SceneInvalid,
+                    "node-bake settings must be an object",
+                )
+            })?;
+            bakes.insert(node_id.to_string(), config);
+        }
+        remove_unreferenced_node_bake_resource(&mut candidate, old_config.as_ref());
+        candidate.validate()?;
+        Ok((candidate, cleanup_config))
+    })();
+    let (candidate, cleanup_config) = match candidate_result {
+        Ok(candidate) => candidate,
+        Err(error) => return abort_node_bake_transaction(transaction, error),
+    };
+    if let Err(error) = stage_delete_node_bake_payloads(
+        &mut transaction,
+        &project,
+        &target,
+        &modifier_id,
+        &node_id,
+        old_config.as_ref(),
+        Some(&cleanup_config),
+    ) {
+        return abort_node_bake_transaction(transaction, error);
     }
-    if let Some(resource_id) = &resource_id {
-        config.insert("resource_id".to_owned(), json!(resource_id));
-        config.remove("frames");
-    } else {
-        config.remove("resource_id");
-        config.insert("frames".to_owned(), json!(disk_frames));
+    if let Err(error) = transaction.publish() {
+        return abort_node_bake_transaction(transaction, error);
     }
-    let config = Value::Object(config);
-    let cleanup_config = config.clone();
+    let scene = match project.restore(
+        candidate,
+        "bake",
+        format!("{target}:{modifier_id}:{node_id}"),
+        json!({"op":"geometry_node.bake","action":"bake","target":target,"modifier":modifier_id,"node":node_id,"storage":bake_target,"frames":frames}),
+        json!({"nodes":[target],"resources":resource_id}),
+    ) {
+        Ok(scene) => scene,
+        Err(error) => return abort_node_bake_transaction(transaction, error),
+    };
+    transaction.commit()?;
+    Ok((
+        Some(scene),
+        json!({"kind":"node-bake","action":"bake","target":target,"modifier":modifier_id,"node":node_id,"storage":bake_target.to_ascii_lowercase(),"resource_id":resource_id,"frames":frames,"scene_modified":true}),
+    ))
+}
+
+fn pack_node_bake(
+    project: &mut Project,
+    target: &Id,
+    modifier_id: &Id,
+    node_id: &Id,
+    bake_settings: &Value,
+) -> Result<(Option<SceneInfo>, Value)> {
+    let doc = project.doc();
+    let modifier = doc
+        .nodes
+        .get(target)
+        .and_then(|object| {
+            object
+                .modifiers
+                .iter()
+                .find(|modifier| modifier.id == *modifier_id)
+        })
+        .ok_or_else(|| {
+            PotError::new(
+                ErrorCode::TargetNotFound,
+                "node-bake modifier was not found",
+            )
+        })?;
+    let config = node_bake_config(modifier, node_id)?
+        .cloned()
+        .ok_or_else(|| {
+            PotError::new(
+                ErrorCode::InvalidOperation,
+                "Bake node has no disk cache to pack",
+            )
+        })?;
     crate::graph::validate_node_bake_config(&config)?;
+    if config.get("storage").and_then(Value::as_str) != Some("disk")
+        || effective_node_bake_target(modifier, Some(bake_settings))? != "DISK"
+    {
+        return Err(PotError::new(
+            ErrorCode::InvalidOperation,
+            "only a disk Bake-node cache can be packed",
+        ));
+    }
+    let bake_directory = effective_node_bake_directory(modifier, Some(bake_settings))?;
+    let frame_entries = config
+        .get("frames")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            PotError::new(
+                ErrorCode::SceneInvalid,
+                "disk node-bake frame manifest is missing",
+            )
+        })?;
+    let mut frames = Vec::with_capacity(frame_entries.len());
+    let mut retained_frame_memory = 0_usize;
+    let mut retained_payload_bytes = 0_usize;
+    for entry in frame_entries {
+        let expected_frame = entry
+            .get("frame")
+            .and_then(Value::as_f64)
+            .filter(|frame| frame.is_finite())
+            .ok_or_else(|| {
+                PotError::new(ErrorCode::SceneInvalid, "disk node-bake frame is invalid")
+            })?;
+        let digest = entry.get("digest").and_then(Value::as_str).ok_or_else(|| {
+            PotError::new(ErrorCode::SceneInvalid, "disk node-bake digest is missing")
+        })?;
+        let remaining_payload_bytes = crate::graph::MAX_NODE_BAKE_PACKED_BYTES
+            .checked_sub(retained_payload_bytes)
+            .ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::LimitExceeded,
+                    "packed node-bake payloads exceed the byte limit",
+                )
+            })?;
+        let remaining_frame_memory = crate::graph::MAX_NODE_BAKE_PACKED_BYTES
+            .checked_sub(retained_frame_memory)
+            .ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::LimitExceeded,
+                    "packed node-bake frames exceed the memory limit",
+                )
+            })?;
+        let bounded_read_bytes = remaining_payload_bytes
+            .min(remaining_frame_memory / (crate::graph::NODE_BAKE_JSON_MEMORY_MULTIPLIER + 1));
+        let bytes = crate::graph::read_node_bake_payload_limited(
+            project.path(),
+            &bake_directory,
+            target,
+            modifier_id,
+            node_id.as_str(),
+            digest,
+            bounded_read_bytes,
+        )?
+        .ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::DependencyMissing,
+                "disk node-bake payload is missing",
+                json!({"node_id":node_id,"frame":expected_frame,"digest":digest}),
+            )
+        })?;
+        account_node_bake_payload_bytes(&mut retained_payload_bytes, &bytes)?;
+        let frame = serde_json::from_slice::<NodeBakeFrame>(&bytes).map_err(|error| {
+            PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "disk node-bake payload is invalid",
+                json!({"cause":error.to_string(),"digest":digest}),
+            )
+        })?;
+        if frame.frame != expected_frame {
+            return Err(PotError::new(
+                ErrorCode::SceneInvalid,
+                "disk node-bake frame does not match its manifest",
+            ));
+        }
+        retained_frame_memory = retained_frame_memory
+            .checked_add(crate::graph::node_bake_frame_memory_bytes(&frame))
+            .filter(|bytes| *bytes <= crate::graph::MAX_NODE_BAKE_PACKED_BYTES)
+            .ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::LimitExceeded,
+                    "packed node-bake frames exceed the memory limit",
+                )
+            })?;
+        frames.push(frame);
+    }
+    let record = NodeBakeRecord {
+        storage: "inline".to_owned(),
+        kind: "node_bake".to_owned(),
+        version: 1,
+        frames,
+    };
+    crate::graph::validate_node_bake_record(&record)?;
+    let resource_id = node_bake_resource_id(doc, target, modifier_id, node_id, Some(&config))?;
+    let resource = serde_json::to_value(&record).map_err(PotError::internal_json)?;
+
+    let mut next_config = bake_settings.as_object().cloned().ok_or_else(|| {
+        PotError::new(
+            ErrorCode::SceneInvalid,
+            "node-bake settings must be an object",
+        )
+    })?;
+    next_config.insert("storage".to_owned(), json!("packed"));
+    next_config.insert("resource_id".to_owned(), json!(resource_id.as_str()));
+    next_config.insert("bake_target".to_owned(), json!("PACKED"));
+    next_config.remove("frames");
+    next_config.remove("cache_directory");
+    let next_config = Value::Object(next_config);
+    crate::graph::validate_node_bake_config(&next_config)?;
 
     let mut candidate = doc.clone();
-    if let Some(resource_id) = &resource_id {
-        candidate
-            .resources
-            .insert(resource_id.clone(), record_value);
-    }
+    candidate.resources.insert(resource_id.clone(), resource);
+    update_node_bake_state(
+        &mut candidate,
+        target,
+        modifier_id,
+        node_id,
+        next_config,
+        "PACKED",
+    )?;
+    candidate.validate()?;
+    let scene = project.restore(
+        candidate,
+        "bake",
+        format!("{target}:{modifier_id}:{node_id}"),
+        json!({"op":"geometry_node.bake","action":"pack","target":target,"modifier":modifier_id,"node":node_id}),
+        json!({"nodes":[target],"resources":resource_id.as_str()}),
+    )?;
+    Ok((
+        Some(scene),
+        json!({"kind":"node-bake","action":"pack","target":target,"modifier":modifier_id,"node":node_id,"storage":"packed","resource_id":resource_id.as_str(),"frame_count":record.frames.len(),"scene_modified":true}),
+    ))
+}
+
+fn unpack_node_bake(
+    project: &mut Project,
+    target: &Id,
+    modifier_id: &Id,
+    node_id: &Id,
+    bake_settings: &Value,
+    method: NodeBakeUnpackMethod,
+) -> Result<(Option<SceneInfo>, Value)> {
+    let doc = project.doc();
+    let modifier = doc
+        .nodes
+        .get(target)
+        .and_then(|object| {
+            object
+                .modifiers
+                .iter()
+                .find(|modifier| modifier.id == *modifier_id)
+        })
+        .ok_or_else(|| {
+            PotError::new(
+                ErrorCode::TargetNotFound,
+                "node-bake modifier was not found",
+            )
+        })?;
+    let config = node_bake_config(modifier, node_id)?
+        .cloned()
+        .ok_or_else(|| {
+            PotError::new(
+                ErrorCode::InvalidOperation,
+                "Bake node has no packed cache to unpack",
+            )
+        })?;
+    crate::graph::validate_node_bake_config(&config)?;
+    if config.get("storage").and_then(Value::as_str) != Some("packed")
+        || effective_node_bake_target(modifier, Some(bake_settings))? != "PACKED"
     {
-        let modifier = candidate
+        return Err(PotError::new(
+            ErrorCode::InvalidOperation,
+            "only a packed Bake-node cache can be unpacked",
+        ));
+    }
+    let resource_id = config
+        .get("resource_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            PotError::new(
+                ErrorCode::SceneInvalid,
+                "packed node-bake resource ID is missing",
+            )
+        })?;
+    let resource_id = Id::new(resource_id.to_owned()).map_err(|_| {
+        PotError::new(
+            ErrorCode::SceneInvalid,
+            "packed node-bake resource ID is invalid",
+        )
+    })?;
+    let resource = doc.resources.get(&resource_id).ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::DependencyMissing,
+            format!("node-bake resource `{resource_id}` is missing"),
+            json!({"resource_id":resource_id}),
+        )
+    })?;
+    if crate::model::migrate::inline_resource_kind(resource)? != Some("node_bake") {
+        return Err(PotError::new(
+            ErrorCode::SceneInvalid,
+            "packed resource is not a node-bake resource",
+        ));
+    }
+    let record = serde_json::from_value::<NodeBakeRecord>(resource.clone()).map_err(|error| {
+        PotError::with_details(
+            ErrorCode::SceneInvalid,
+            "packed node-bake resource is invalid",
+            json!({"cause":error.to_string()}),
+        )
+    })?;
+    crate::graph::validate_node_bake_record(&record)?;
+    let (bake_directory, use_custom_path, custom_directory) =
+        node_bake_unpack_directory(method, modifier, bake_settings);
+    let mut transaction = NodeBakePayloadTransaction::new(project.path())?;
+    let replace_existing = matches!(
+        method,
+        NodeBakeUnpackMethod::WriteLocal | NodeBakeUnpackMethod::WriteOriginal
+    );
+    let mut retained_payload_bytes = 0_usize;
+    let mut disk_frames = Vec::with_capacity(record.frames.len());
+    for frame in &record.frames {
+        let bytes = match serde_json::to_vec(frame) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return abort_node_bake_transaction(transaction, PotError::internal_json(error));
+            }
+        };
+        if let Err(error) = account_node_bake_payload_bytes(&mut retained_payload_bytes, &bytes) {
+            return abort_node_bake_transaction(transaction, error);
+        }
+        let digest = crate::hash::sha256(&bytes);
+        if let Err(error) = transaction.stage_write(
+            &bake_directory,
+            target,
+            modifier_id,
+            node_id.as_str(),
+            &digest,
+            &bytes,
+            frame.frame,
+            replace_existing,
+        ) {
+            return abort_node_bake_transaction(transaction, error);
+        }
+        disk_frames.push(json!({"frame":frame.frame,"digest":digest}));
+    }
+
+    let candidate_result: Result<SceneDoc> = (|| {
+        let mut next_config = bake_settings.as_object().cloned().ok_or_else(|| {
+            PotError::new(
+                ErrorCode::SceneInvalid,
+                "node-bake settings must be an object",
+            )
+        })?;
+        next_config.insert("storage".to_owned(), json!("disk"));
+        next_config.insert("frames".to_owned(), json!(disk_frames));
+        next_config.insert("cache_directory".to_owned(), json!(bake_directory));
+        next_config.insert("use_custom_path".to_owned(), json!(use_custom_path));
+        if let Some(directory) = custom_directory {
+            next_config.insert("directory".to_owned(), json!(directory));
+        }
+        next_config.insert("bake_target".to_owned(), json!("DISK"));
+        next_config.remove("resource_id");
+        let next_config = Value::Object(next_config);
+        crate::graph::validate_node_bake_config(&next_config)?;
+
+        let mut candidate = doc.clone();
+        update_node_bake_state(
+            &mut candidate,
+            target,
+            modifier_id,
+            node_id,
+            next_config,
+            "DISK",
+        )?;
+        remove_unreferenced_node_bake_resource(&mut candidate, Some(&config));
+        candidate.validate()?;
+        Ok(candidate)
+    })();
+    let candidate = match candidate_result {
+        Ok(candidate) => candidate,
+        Err(error) => return abort_node_bake_transaction(transaction, error),
+    };
+    if let Err(error) = transaction.publish() {
+        return abort_node_bake_transaction(transaction, error);
+    }
+    let scene = match project.restore(
+        candidate,
+        "bake",
+        format!("{target}:{modifier_id}:{node_id}"),
+        json!({"op":"geometry_node.bake","action":"unpack","target":target,"modifier":modifier_id,"node":node_id,"storage":"disk","method":node_bake_unpack_method_name(method)}),
+        json!({"nodes":[target],"resources":resource_id.as_str()}),
+    ) {
+        Ok(scene) => scene,
+        Err(error) => return abort_node_bake_transaction(transaction, error),
+    };
+    transaction.commit()?;
+    Ok((
+        Some(scene),
+        json!({"kind":"node-bake","action":"unpack","target":target,"modifier":modifier_id,"node":node_id,"storage":"disk","method":node_bake_unpack_method_name(method),"frame_count":record.frames.len(),"scene_modified":true}),
+    ))
+}
+
+fn update_node_bake_state(
+    doc: &mut SceneDoc,
+    target: &Id,
+    modifier_id: &Id,
+    node_id: &Id,
+    config: Value,
+    bake_target: &str,
+) -> Result<()> {
+    let mut node_properties = ["use_custom_path", "directory"]
+        .into_iter()
+        .filter_map(|key| {
+            config
+                .get(key)
+                .cloned()
+                .map(|value| (key.to_owned(), value))
+        })
+        .collect::<Vec<_>>();
+    node_properties.push(("bake_target".to_owned(), json!(bake_target)));
+    let node_group_id = doc
+        .nodes
+        .get(target)
+        .and_then(|object| {
+            object
+                .modifiers
+                .iter()
+                .find(|modifier| modifier.id == *modifier_id)
+        })
+        .and_then(|modifier| modifier.params.get("node_group"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| PotError::new(ErrorCode::InternalError, "node-bake group disappeared"))?;
+    let node_group_id = Id::new(node_group_id.to_owned()).map_err(|_| {
+        PotError::new(
+            ErrorCode::InternalError,
+            "node-bake group ID became invalid",
+        )
+    })?;
+    {
+        let modifier = doc
             .nodes
-            .get_mut(&target)
+            .get_mut(target)
             .and_then(|object| {
                 object
                     .modifiers
                     .iter_mut()
-                    .find(|modifier| modifier.id == modifier_id)
+                    .find(|modifier| modifier.id == *modifier_id)
             })
             .ok_or_else(|| {
                 PotError::new(ErrorCode::InternalError, "node-bake modifier disappeared")
@@ -544,27 +1067,15 @@ fn run_node_bake(args: BakeArgs) -> Result<(Option<SceneInfo>, Value)> {
         })?;
         bakes.insert(node_id.to_string(), config);
     }
-    remove_unreferenced_node_bake_resource(&mut candidate, old_config.as_ref());
-
-    let scene = project.restore(
-        candidate,
-        "bake",
-        format!("{target}:{modifier_id}:{node_id}"),
-        json!({"op":"geometry_node.bake","action":"bake","target":target,"modifier":modifier_id,"node":node_id,"storage":bake_target,"frames":frames}),
-        json!({"nodes":[target],"resources":resource_id}),
-    )?;
-    delete_disk_node_bake_payloads(
-        &project,
-        &target,
-        &modifier_id,
-        &node_id,
-        old_config.as_ref(),
-        Some(&cleanup_config),
-    )?;
-    Ok((
-        Some(scene),
-        json!({"kind":"node-bake","action":"bake","target":target,"modifier":modifier_id,"node":node_id,"storage":bake_target.to_ascii_lowercase(),"resource_id":resource_id,"frames":frames,"scene_modified":true}),
-    ))
+    let bake_node = doc
+        .node_groups
+        .get_mut(&node_group_id)
+        .and_then(|group| group.nodes.get_mut(node_id))
+        .ok_or_else(|| PotError::new(ErrorCode::InternalError, "Bake node disappeared"))?;
+    for (key, value) in node_properties {
+        bake_node.properties.insert(key, value);
+    }
+    Ok(())
 }
 
 fn node_bake_config<'a>(
@@ -673,7 +1184,8 @@ fn effective_node_bake_target(
         }
     };
     match target {
-        "PACKED" | "DISK" => Ok(target),
+        "PACKED" => Ok("PACKED"),
+        "DISK" => Ok("DISK"),
         _ => Err(PotError::new(
             ErrorCode::SceneInvalid,
             "modifier bake_target must be PACKED or DISK",
@@ -709,6 +1221,56 @@ fn effective_node_bake_directory(
         .unwrap_or_default()
         .to_owned())
 }
+fn node_bake_unpack_directory(
+    method: NodeBakeUnpackMethod,
+    modifier: &crate::model::Modifier,
+    config: &Value,
+) -> (String, bool, Option<String>) {
+    const LOCAL_DIRECTORY: &str = "//.potter/bakes";
+    let local = || {
+        (
+            LOCAL_DIRECTORY.to_owned(),
+            true,
+            Some(LOCAL_DIRECTORY.to_owned()),
+        )
+    };
+    match method {
+        NodeBakeUnpackMethod::UseLocal | NodeBakeUnpackMethod::WriteLocal => local(),
+        NodeBakeUnpackMethod::UseOriginal | NodeBakeUnpackMethod::WriteOriginal => {
+            if config
+                .get("use_custom_path")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                if let Some(directory) = config
+                    .get("directory")
+                    .and_then(Value::as_str)
+                    .filter(|directory| !directory.is_empty())
+                {
+                    return (directory.to_owned(), true, Some(directory.to_owned()));
+                }
+                return local();
+            }
+            if let Some(directory) = modifier
+                .params
+                .get("bake_directory")
+                .and_then(Value::as_str)
+                .filter(|directory| !directory.is_empty())
+            {
+                return (directory.to_owned(), false, None);
+            }
+            local()
+        }
+    }
+}
+fn node_bake_unpack_method_name(method: NodeBakeUnpackMethod) -> &'static str {
+    match method {
+        NodeBakeUnpackMethod::UseLocal => "USE_LOCAL",
+        NodeBakeUnpackMethod::WriteLocal => "WRITE_LOCAL",
+        NodeBakeUnpackMethod::UseOriginal => "USE_ORIGINAL",
+        NodeBakeUnpackMethod::WriteOriginal => "WRITE_ORIGINAL",
+    }
+}
 
 fn node_bake_resource_id(
     doc: &SceneDoc,
@@ -722,10 +1284,9 @@ fn node_bake_resource_id(
         .and_then(|config| config.get("resource_id"))
         .and_then(Value::as_str)
         && let Ok(resource_id) = Id::new(resource_id.to_owned())
-        && doc.resources.get(&resource_id).is_some_and(|resource| {
-            resource.get("storage").and_then(Value::as_str) == Some("inline")
-                && resource.get("kind").and_then(Value::as_str) == Some("node_bake")
-        })
+        && let Some(resource) = doc.resources.get(&resource_id)
+        && crate::model::migrate::inline_resource_kind(resource)? == Some("node_bake")
+        && !node_bake_resource_referenced_elsewhere(doc, &resource_id, target, modifier_id, node_id)
     {
         return Ok(resource_id);
     }
@@ -751,6 +1312,33 @@ fn node_bake_resource_id(
         ErrorCode::LimitExceeded,
         "node-bake resource IDs are exhausted",
     ))
+}
+fn node_bake_resource_referenced_elsewhere(
+    doc: &SceneDoc,
+    resource_id: &Id,
+    target: &Id,
+    modifier_id: &Id,
+    node_id: &Id,
+) -> bool {
+    doc.nodes.iter().any(|(owner_id, object)| {
+        object.modifiers.iter().any(|modifier| {
+            modifier.params.get("resource").and_then(Value::as_str) == Some(resource_id.as_str())
+                || modifier
+                    .params
+                    .get("bakes")
+                    .and_then(Value::as_object)
+                    .is_some_and(|bakes| {
+                        bakes.iter().any(|(other_node_id, config)| {
+                            let same_bake = owner_id == target
+                                && modifier.id.as_str() == modifier_id.as_str()
+                                && other_node_id.as_str() == node_id.as_str();
+                            !same_bake
+                                && config.get("resource_id").and_then(Value::as_str)
+                                    == Some(resource_id.as_str())
+                        })
+                    })
+        })
+    })
 }
 
 fn remove_unreferenced_node_bake_resource(doc: &mut SceneDoc, config: Option<&Value>) {
@@ -782,8 +1370,10 @@ fn remove_unreferenced_node_bake_resource(doc: &mut SceneDoc, config: Option<&Va
     });
     if !referenced
         && doc.resources.get(&resource_id).is_some_and(|resource| {
-            resource.get("storage").and_then(Value::as_str) == Some("inline")
-                && resource.get("kind").and_then(Value::as_str) == Some("node_bake")
+            matches!(
+                crate::model::migrate::inline_resource_kind(resource),
+                Ok(Some("node_bake"))
+            )
         })
     {
         doc.resources.remove(&resource_id);
@@ -841,27 +1431,63 @@ fn delete_node_bake(
         modifier.params.remove("bakes");
     }
     remove_unreferenced_node_bake_resource(&mut candidate, removed.as_ref());
-    let scene = project.restore(
-        candidate,
-        "bake",
-        format!("{target}:{modifier_id}:{node_id}"),
-        json!({"op":"geometry_node.bake","action":"delete","target":target,"modifier":modifier_id,"node":node_id}),
-        json!({"nodes":[target]}),
-    )?;
-    delete_disk_node_bake_payloads(
+    candidate.validate()?;
+
+    let mut transaction = NodeBakePayloadTransaction::new(project.path())?;
+    if let Err(error) = stage_delete_node_bake_payloads(
+        &mut transaction,
         project,
         target,
         modifier_id,
         node_id,
         removed.as_ref(),
         None,
-    )?;
+    ) {
+        return abort_node_bake_transaction(transaction, error);
+    }
+    if let Err(error) = transaction.publish() {
+        return abort_node_bake_transaction(transaction, error);
+    }
+    let scene = match project.restore(
+        candidate,
+        "bake",
+        format!("{target}:{modifier_id}:{node_id}"),
+        json!({"op":"geometry_node.bake","action":"delete","target":target,"modifier":modifier_id,"node":node_id}),
+        json!({"nodes":[target]}),
+    ) {
+        Ok(scene) => scene,
+        Err(error) => return abort_node_bake_transaction(transaction, error),
+    };
+    transaction.commit()?;
     Ok((
         Some(scene),
         json!({"kind":"node-bake","action":"delete","target":target,"modifier":modifier_id,"node":node_id,"scene_modified":true}),
     ))
 }
-fn delete_disk_node_bake_payloads(
+
+fn abort_node_bake_transaction<T>(
+    transaction: NodeBakePayloadTransaction,
+    error: PotError,
+) -> Result<T> {
+    transaction.rollback()?;
+    Err(error)
+}
+fn account_node_bake_payload_bytes(retained: &mut usize, bytes: &[u8]) -> Result<()> {
+    let Some(total) = retained
+        .checked_add(bytes.len())
+        .filter(|total| *total <= crate::graph::MAX_NODE_BAKE_PACKED_BYTES)
+    else {
+        return Err(PotError::new(
+            ErrorCode::LimitExceeded,
+            "node-bake payloads exceed the aggregate byte limit",
+        ));
+    };
+    *retained = total;
+    Ok(())
+}
+
+fn stage_delete_node_bake_payloads(
+    transaction: &mut NodeBakePayloadTransaction,
     project: &Project,
     target: &Id,
     modifier_id: &Id,
@@ -869,78 +1495,217 @@ fn delete_disk_node_bake_payloads(
     config: Option<&Value>,
     keep_config: Option<&Value>,
 ) -> Result<()> {
-    let Some(config) =
-        config.filter(|config| config.get("storage").and_then(Value::as_str) == Some("disk"))
-    else {
+    let Some(config) = config else {
         return Ok(());
     };
-    let Some(frames) = config.get("frames").and_then(Value::as_array) else {
+    crate::graph::validate_node_bake_config(config)?;
+    let storage = config
+        .get("storage")
+        .and_then(Value::as_str)
+        .ok_or_else(|| PotError::new(ErrorCode::SceneInvalid, "node-bake storage is missing"))?;
+    if !matches!(storage, "disk" | "packed") {
         return Ok(());
+    }
+    let directory = node_bake_payload_directory(project, target, modifier_id, config)?;
+    let keep_config =
+        keep_config.filter(|config| config.get("storage").and_then(Value::as_str) == Some("disk"));
+    let keep_frames = if let Some(keep_config) = keep_config {
+        crate::graph::validate_node_bake_config(keep_config)?;
+        Some(
+            keep_config
+                .get("frames")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::SceneInvalid,
+                        "disk node-bake frame manifest is missing",
+                    )
+                })?,
+        )
+    } else {
+        None
     };
-    let use_custom_path = config
+    let keep_same_directory = if let Some(keep_config) = keep_config {
+        let keep_directory =
+            node_bake_payload_directory(project, target, modifier_id, keep_config)?;
+        node_bake_directory_key(&directory) == node_bake_directory_key(&keep_directory)
+    } else {
+        false
+    };
+
+    match storage {
+        "disk" => {
+            let frames = config
+                .get("frames")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::SceneInvalid,
+                        "disk node-bake frame manifest is missing",
+                    )
+                })?;
+            for frame in frames {
+                let expected_frame = frame
+                    .get("frame")
+                    .and_then(Value::as_f64)
+                    .filter(|frame| frame.is_finite())
+                    .ok_or_else(|| {
+                        PotError::new(ErrorCode::SceneInvalid, "disk node-bake frame is invalid")
+                    })?;
+                let digest = frame.get("digest").and_then(Value::as_str).ok_or_else(|| {
+                    PotError::new(ErrorCode::SceneInvalid, "disk node-bake digest is missing")
+                })?;
+                if !node_bake_payload_is_kept(
+                    keep_same_directory,
+                    keep_frames,
+                    expected_frame,
+                    digest,
+                ) {
+                    transaction.stage_delete(
+                        &directory,
+                        target,
+                        modifier_id,
+                        node_id.as_str(),
+                        digest,
+                        expected_frame,
+                    )?;
+                }
+            }
+        }
+        "packed" => {
+            let record = node_bake_packed_record(project, config)?;
+            for frame in &record.frames {
+                let bytes = serde_json::to_vec(frame).map_err(PotError::internal_json)?;
+                let digest = crate::hash::sha256(&bytes);
+                if !node_bake_payload_is_kept(
+                    keep_same_directory,
+                    keep_frames,
+                    frame.frame,
+                    &digest,
+                ) {
+                    transaction.stage_delete(
+                        &directory,
+                        target,
+                        modifier_id,
+                        node_id.as_str(),
+                        &digest,
+                        frame.frame,
+                    )?;
+                }
+            }
+        }
+        _ => unreachable!("node-bake storage was validated"),
+    }
+    Ok(())
+}
+
+fn node_bake_payload_is_kept(
+    same_directory: bool,
+    keep_frames: Option<&[Value]>,
+    expected_frame: f64,
+    digest: &str,
+) -> bool {
+    same_directory
+        && keep_frames.is_some_and(|frames| {
+            frames.iter().any(|frame| {
+                frame.get("frame").and_then(Value::as_f64) == Some(expected_frame)
+                    && frame.get("digest").and_then(Value::as_str) == Some(digest)
+            })
+        })
+}
+
+fn node_bake_packed_record(project: &Project, config: &Value) -> Result<NodeBakeRecord> {
+    let resource_id = config
+        .get("resource_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            PotError::new(
+                ErrorCode::SceneInvalid,
+                "packed node-bake resource ID is missing",
+            )
+        })?;
+    let resource_id = Id::new(resource_id.to_owned()).map_err(|_| {
+        PotError::new(
+            ErrorCode::SceneInvalid,
+            "packed node-bake resource ID is invalid",
+        )
+    })?;
+    let resource = project.doc().resources.get(&resource_id).ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::DependencyMissing,
+            format!("node-bake resource `{resource_id}` is missing"),
+            json!({"resource_id":resource_id}),
+        )
+    })?;
+    if crate::model::migrate::inline_resource_kind(resource)? != Some("node_bake") {
+        return Err(PotError::new(
+            ErrorCode::SceneInvalid,
+            "packed resource is not a node-bake resource",
+        ));
+    }
+    let record = serde_json::from_value::<NodeBakeRecord>(resource.clone()).map_err(|error| {
+        PotError::with_details(
+            ErrorCode::SceneInvalid,
+            "packed node-bake resource is invalid",
+            json!({"cause":error.to_string()}),
+        )
+    })?;
+    crate::graph::validate_node_bake_record(&record)?;
+    Ok(record)
+}
+
+fn node_bake_payload_directory(
+    project: &Project,
+    target: &Id,
+    modifier_id: &Id,
+    config: &Value,
+) -> Result<String> {
+    if config
         .get("use_custom_path")
         .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let directory = if use_custom_path {
-        config
+        .unwrap_or(false)
+    {
+        return config
             .get("directory")
             .and_then(Value::as_str)
             .filter(|directory| !directory.is_empty())
-    } else {
-        config
-            .get("cache_directory")
-            .and_then(Value::as_str)
-            .or_else(|| {
-                project
-                    .doc()
-                    .nodes
-                    .get(target)
-                    .and_then(|object| {
-                        object
-                            .modifiers
-                            .iter()
-                            .find(|modifier| modifier.id == *modifier_id)
-                    })
-                    .and_then(|modifier| modifier.params.get("bake_directory"))
-                    .and_then(Value::as_str)
-            })
-    };
-    let Some(directory) = directory else {
-        return Ok(());
-    };
-    for frame in frames {
-        let Some(digest) = frame.get("digest").and_then(Value::as_str) else {
-            continue;
-        };
-        if !digest.starts_with("sha256:")
-            || digest.len() != "sha256:".len() + 64
-            || !digest["sha256:".len()..]
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-        {
-            continue;
-        }
-        if keep_config
-            .and_then(|config| config.get("frames"))
-            .and_then(Value::as_array)
-            .is_some_and(|frames| {
-                frames
-                    .iter()
-                    .any(|frame| frame.get("digest").and_then(Value::as_str) == Some(digest))
-            })
-        {
-            continue;
-        }
-        crate::graph::delete_node_bake_payload(
-            project.path(),
-            directory,
-            target,
-            modifier_id,
-            node_id.as_str(),
-            digest,
-        )?;
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::SceneInvalid,
+                    "custom node-bake directory is missing",
+                )
+            });
     }
-    Ok(())
+    Ok(config
+        .get("cache_directory")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            project
+                .doc()
+                .nodes
+                .get(target)
+                .and_then(|object| {
+                    object
+                        .modifiers
+                        .iter()
+                        .find(|modifier| modifier.id == *modifier_id)
+                })
+                .and_then(|modifier| modifier.params.get("bake_directory"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or_default()
+        .to_owned())
+}
+
+fn node_bake_directory_key(directory: &str) -> PathBuf {
+    let directory = if directory.is_empty() {
+        ".potter/bakes"
+    } else {
+        directory.strip_prefix("//").unwrap_or(directory)
+    };
+    PathBuf::from(directory)
 }
 
 fn unsupported(feature_id: &str, message: &str) -> PotError {
