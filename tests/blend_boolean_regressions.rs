@@ -264,7 +264,10 @@ fn exact_boolean_regressions_match_blender() -> TestResult {
             // Blender's `slot.material` is the effective material: a DATA-linked slot shows the mesh's
             // material, so read through the node's slot resolution, not its object-level list.
             let node = &document.nodes[&node_id];
-            let data = node.data.as_ref().and_then(|id| document.data_blocks.get(id));
+            let data = node
+                .data
+                .as_ref()
+                .and_then(|id| document.data_blocks.get(id));
             let effective: Vec<Option<Id>> = (0..node.material_slot_count(data))
                 .map(|slot| node.material_slot(data, slot).cloned())
                 .collect();

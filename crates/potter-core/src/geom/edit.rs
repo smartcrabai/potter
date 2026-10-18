@@ -3014,6 +3014,10 @@ fn interpolate_uv_layers(source: &Mesh, target: &mut Mesh) -> Result<()> {
 
 fn interpolate_attributes(source: &Mesh, target: &mut Mesh) -> Result<()> {
     for (name, source_attribute) in &source.attributes {
+        // `custom_normal` is a `normal_code` store; `carry_custom_normals` rebuilds it from vectors.
+        if name.as_str() == "custom_normal" {
+            continue;
+        }
         let Some(source_fields) = source_attribute.as_object() else {
             continue;
         };
@@ -3212,11 +3216,51 @@ fn interpolate_attributes(source: &Mesh, target: &mut Mesh) -> Result<()> {
 
 fn has_interpolatable_attributes(mesh: &Mesh) -> bool {
     mesh.attributes.contains_key(uv_layers::ATTRIBUTE)
-        || mesh.attributes.values().any(|attribute| {
-            attribute.as_object().is_some_and(|fields| {
-                fields.contains_key("domain") && fields.contains_key("values")
-            })
+        || mesh.attributes.iter().any(|(name, attribute)| {
+            name.as_str() != "custom_normal"
+                && attribute.as_object().is_some_and(|fields| {
+                    fields.contains_key("domain") && fields.contains_key("values")
+                })
         })
+}
+
+/// Carries `custom_normal` across an edit that changes faces. Codes are relative to their fan, so
+/// the source's evaluated corner vectors are decoded before the edit, keyed by face ID, and encoded
+/// again on the edited mesh. A face that keeps its ID and corner count keeps its vectors; new or
+/// resized faces are automatic. The edited mesh takes its storage order as its loop basis.
+fn carry_custom_normals(source: &Mesh, target: &mut Mesh) -> Result<()> {
+    // Remesh replaces the mesh without a custom-normal layer, and that absence is kept.
+    if !target.attributes.contains_key("custom_normal") {
+        return Ok(());
+    }
+    let positions: Vec<DVec3> = source.vertices.iter().map(|vertex| vertex.co).collect();
+    let vectors = clnor::corner_custom_normals(source, &positions, NormalCodeOptions::default())?;
+    // The stale layer goes first: its rows are keyed by faces the edit may have removed, and the
+    // setter reads it.
+    target.attributes.remove("custom_normal");
+    let Some(vectors) = vectors else {
+        return Ok(());
+    };
+    let mut source_corners = HashMap::with_capacity(source.faces.len());
+    let mut start = 0;
+    for face in &source.faces {
+        let end = start + face.vertices.len();
+        source_corners.insert(face.id, &vectors[start..end]);
+        start = end;
+    }
+    let carried: Vec<Option<DVec3>> = target
+        .faces
+        .iter()
+        .flat_map(|face| match source_corners.get(&face.id) {
+            Some(corners) if corners.len() == face.vertices.len() => corners.to_vec(),
+            _ => vec![None; face.vertices.len()],
+        })
+        .collect();
+    clnor::encode_vectors(
+        target,
+        Some(carried.as_slice()),
+        NormalCodeOptions::default(),
+    )
 }
 
 fn is_topology_operation(operation: &str, args: &Map<String, Value>) -> bool {
@@ -4590,9 +4634,12 @@ pub fn apply(mesh: &mut Mesh, operation: &str, args: &Value) -> Result<Value> {
         }
     };
     reject_unknown_fields(args, allowed_fields, "operation")?;
-    let attribute_source = (is_topology_operation(operation, args)
-        && has_interpolatable_attributes(mesh))
-    .then(|| mesh.clone());
+    let topology = is_topology_operation(operation, args);
+    // Deleting faces also invalidates custom normals, so they are rebuilt as for topology edits.
+    let changes_faces = topology || operation == "delete";
+    let attribute_source = (topology && has_interpolatable_attributes(mesh)).then(|| mesh.clone());
+    let normal_source =
+        (changes_faces && mesh.attributes.contains_key("custom_normal")).then(|| mesh.clone());
     let changes = match operation {
         "transform_elements" => apply_transform(mesh, args)?,
         "extrude" => apply_extrude(mesh, args)?,
@@ -4663,6 +4710,9 @@ pub fn apply(mesh: &mut Mesh, operation: &str, args: &Value) -> Result<Value> {
     };
     if let Some(source) = attribute_source {
         interpolate_attributes(&source, mesh)?;
+    }
+    if let Some(source) = normal_source {
+        carry_custom_normals(&source, mesh)?;
     }
     mesh.validate().map_err(|error| mesh_error(&error))?;
     Ok(json!({

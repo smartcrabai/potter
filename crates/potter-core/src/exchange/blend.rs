@@ -815,12 +815,7 @@ fn eight_bit_png_bytes(image: &Image, project: &Project) -> Result<Option<Vec<u8
 /// therefore re-encoded to sRGB (HDR values stay unclamped), and every row order is reversed.
 fn blender_image_pixels(image: &Image, width: u32, pixels: &[[f64; 4]]) -> Vec<[f64; 4]> {
     let row_width = usize::try_from(width).unwrap_or(1).max(1);
-    let mut rows: Vec<[f64; 4]> = pixels
-        .chunks(row_width)
-        .rev()
-        .flatten()
-        .copied()
-        .collect();
+    let mut rows: Vec<[f64; 4]> = pixels.chunks(row_width).rev().flatten().copied().collect();
     if image.colorspace == ImageColorspace::Srgb {
         for pixel in &mut rows {
             for channel in &mut pixel[..3] {
@@ -1927,7 +1922,7 @@ fn build_imported_graph(
                 emission_color: vec3_field(item, "emission_color", [0.0; 3]),
                 emission_strength: number_field(item, "emission_strength", 0.0),
                 transmission: number_field(item, "transmission", 0.0),
-                ior: number_field(item, "ior", 1.45),
+                ior: number_field(item, "ior", 1.5),
                 double_sided: item
                     .get("double_sided")
                     .and_then(Value::as_bool)
@@ -2962,19 +2957,23 @@ fn imported_image_from_resource(
         .get("potter_image")
         .and_then(|image| image.get("colorspace"))
         .and_then(|value| serde_json::from_value::<ImageColorspace>(value.clone()).ok());
-    let colorspace = record_colorspace.or_else(|| match item
-        .get("colorspace")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(str::to_ascii_lowercase)
-    {
-        Some(name) if name.contains("non-color") || name.contains("non_color") || name == "raw" => {
-            Some(ImageColorspace::NonColor)
+    let colorspace = record_colorspace.or_else(|| {
+        match item
+            .get("colorspace")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_ascii_lowercase)
+        {
+            Some(name)
+                if name.contains("non-color") || name.contains("non_color") || name == "raw" =>
+            {
+                Some(ImageColorspace::NonColor)
+            }
+            Some(name) if name.contains("linear") => Some(ImageColorspace::Linear),
+            Some(_) => Some(ImageColorspace::Srgb),
+            None => None,
         }
-        Some(name) if name.contains("linear") => Some(ImageColorspace::Linear),
-        Some(_) => Some(ImageColorspace::Srgb),
-        None => None,
     });
     let (colorspace, width, height, _) =
         crate::image::storage::decode_pixels_with_default_colorspace(bytes, colorspace)?;
@@ -5116,44 +5115,6 @@ fn convert_mesh(item: &Value) -> Result<Mesh> {
         );
     }
     uv_layers::write(&mut mesh, &uv);
-    if normal_codes.is_none()
-        && let Some(raw) = item.get("corner_normals").filter(|value| !value.is_null())
-    {
-        let normals = raw
-            .as_array()
-            .ok_or_else(|| invalid_intermediate("mesh corner normals are invalid"))?
-            .iter()
-            .map(|normal| {
-                parse_vec3_value(normal)
-                    .map(glam::DVec3::from_array)
-                    .ok_or_else(|| invalid_intermediate("mesh corner normal is invalid"))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        if normals.len() != loop_count {
-            return Err(invalid_intermediate(
-                "imported normals do not match the mesh corner count",
-            ));
-        }
-        let mut sharp_edges = Vec::new();
-        for (edge, is_sharp) in mesh.edges.iter().zip(&sharp) {
-            if *is_sharp {
-                let vertex_index = |id: u32| {
-                    id.checked_sub(1)
-                        .and_then(|index| usize::try_from(index).ok())
-                        .ok_or_else(|| invalid_intermediate("mesh sharp edge endpoint is invalid"))
-                };
-                sharp_edges.push([
-                    vertex_index(edge.vertices[0])?,
-                    vertex_index(edge.vertices[1])?,
-                ]);
-            }
-        }
-        let exact = super::shading::ExactShading {
-            smooth: smooth.clone(),
-            sharp: sharp_edges,
-        };
-        super::shading::import_shading_flags(&mut mesh, &normals, Some(&exact))?;
-    }
     mesh.validate()
         .map_err(|error| invalid_intermediate(&format!("invalid mesh data: {error}")))?;
     Ok(mesh)
@@ -9002,8 +8963,8 @@ mod tests {
         Ok(())
     }
 
-    fn quad_import_item(corner_normals: &Value) -> Value {
-        json!({
+    fn quad_import_item(custom_normal_codes: Option<Value>) -> Value {
+        let mut item = json!({
             "name": "Quad",
             "potter_id": null,
             "vertices": [{"co": [0.0, 0.0, 0.0]}, {"co": [1.0, 0.0, 0.0]}, {"co": [1.0, 1.0, 0.0]}, {"co": [0.0, 1.0, 0.0]}],
@@ -9012,23 +8973,39 @@ mod tests {
             "polygons": [{"v": [0, 1, 2, 3], "material_index": 0, "smooth": true}],
             "uv_layers": [],
             "attributes": [raw_custom_normal_entry(4)],
-            "corner_normals": corner_normals,
             "custom_properties": {},
             "fake_user": false,
             "users": 1,
             "rna_properties": {}
-        })
+        });
+        if let Some(codes) = custom_normal_codes {
+            item["custom_normal_codes"] = codes;
+        }
+        item
     }
 
     #[test]
     fn imported_custom_normals_decode_loop_normals_with_polygon_smooth() -> Result<()> {
-        let tilted = json!([
-            [0.0, 0.6, 0.8],
-            [0.0, 0.6, 0.8],
-            [0.0, 0.6, 0.8],
-            [0.0, 0.6, 0.8]
-        ]);
-        let mesh = convert_mesh(&quad_import_item(&tilted))?;
+        let vectors = vec![Some(DVec3::new(0.0, 0.6, 0.8)); 4];
+        // Encode the authored normals with the codec the import decodes, then import the codes Blender stores.
+        let mut encoded = convert_mesh(&quad_import_item(None))?;
+        clnor::encode_vectors(
+            &mut encoded,
+            Some(&vectors),
+            clnor::NormalCodeOptions::default(),
+        )?;
+        let codes = clnor::corner_codes(&encoded)?
+            .ok_or_else(|| invalid_intermediate("encoded custom normals are missing"))?
+            .into_iter()
+            .map(|code| match code {
+                clnor::CornerNormalCode::Auto => Some(json!([0, 0])),
+                clnor::CornerNormalCode::Authored(pair) => Some(json!(pair)),
+                clnor::CornerNormalCode::ExplicitZero => None,
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(Value::Array)
+            .ok_or_else(|| invalid_intermediate("encoded custom normal has no Blender code"))?;
+        let mesh = convert_mesh(&quad_import_item(Some(codes)))?;
         // Element IDs are 1-based (`checked_element_id`), so the first face is `f1`.
         let key = format!("f{}", mesh.faces[0].id);
         let native = |name: &str| {
@@ -9175,7 +9152,7 @@ mod tests {
                 emission_color: [0.0; 3],
                 emission_strength: 0.0,
                 transmission: 0.0,
-                ior: 1.45,
+                ior: 1.5,
                 double_sided: false,
                 ..Material::default()
             },
@@ -10191,10 +10168,7 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
             imported_mesh.attributes["user:blender_metadata"]["type"],
             "float3"
         );
-        assert_eq!(
-            imported_mesh.attributes["skin_tone"]["domain"],
-            "corner"
-        );
+        assert_eq!(imported_mesh.attributes["skin_tone"]["domain"], "corner");
         assert_eq!(imported_mesh.attributes["skin_tone"]["type"], "float");
         assert!(
             clnor::corner_codes(imported_mesh)?.is_some(),

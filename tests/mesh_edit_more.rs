@@ -277,7 +277,9 @@ fn individual_extrusion_and_face_corner_shading_attributes_are_persisted() {
     let tolerance = exchange_normals::normal_tolerance(true);
     for corner in &decoded[f6_corners] {
         assert!(
-            corner.x.abs() < tolerance && corner.y.abs() < tolerance && (corner.z - 1.0).abs() < tolerance,
+            corner.x.abs() < tolerance
+                && corner.y.abs() < tolerance
+                && (corner.z - 1.0).abs() < tolerance,
             "{corner:?}"
         );
     }

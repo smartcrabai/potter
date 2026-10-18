@@ -7,8 +7,8 @@ use crate::{
     error::{ErrorCode, Result},
     geom::{self, Mesh as GeomMesh},
     model::{
-        ArmatureData, CameraData, DataBlock, GreasePencilData, Id, LightData, Node, ParentType,
-        PrimitiveDescriptor, Transform, canonicalize_quaternion, normalize_rotation,
+        ArmatureData, CameraData, DataBlock, GreasePencilData, Id, LightData, MaterialLink, Node,
+        ParentType, PrimitiveDescriptor, Transform, canonicalize_quaternion, normalize_rotation,
     },
 };
 
@@ -749,15 +749,26 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             if let Some(transform) = &transform_update {
                 item_changed |= apply_transform_update(&mut node.transform, transform);
             }
-            if let Some(materials) = &materials {
-                if node.materials.as_slice() != materials.as_slice() {
-                    node.materials.clone_from(materials);
-                    item_changed = true;
+            if let Some(materials) = &materials
+                && node.materials.as_slice() != materials.as_slice()
+            {
+                // Untouched slots keep their link; a slot newly given a material is OBJECT-linked.
+                let mut links: Vec<MaterialLink> = (0..node.materials.len().max(materials.len()))
+                    .map(|slot| node.material_link(slot))
+                    .collect();
+                for (slot, material) in materials.iter().enumerate() {
+                    if material.is_some() && node.materials.get(slot) != Some(material) {
+                        links[slot] = MaterialLink::Object;
+                    }
                 }
-                if !node.material_links.is_empty() {
-                    node.material_links.clear();
-                    item_changed = true;
-                }
+                links.truncate(materials.len());
+                node.material_links = if links.iter().all(|link| *link == MaterialLink::Object) {
+                    Vec::new()
+                } else {
+                    links
+                };
+                node.materials.clone_from(materials);
+                item_changed = true;
             }
             for (field, value) in [
                 ("visible", visible),

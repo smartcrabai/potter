@@ -14,14 +14,14 @@ use tempfile::tempdir;
 mod blender_checked;
 #[path = "common/blender_script_guarded.rs"]
 mod blender_script_guarded;
-#[path = "common/process.rs"]
-mod process;
 #[path = "common/exchange_normals.rs"]
 #[expect(
     dead_code,
     reason = "this test binary uses only the quantized normal tolerance from the shared helper"
 )]
 mod exchange_normals;
+#[path = "common/process.rs"]
+mod process;
 
 use blender_checked::blender_executable;
 use blender_script_guarded::run_blender_script;

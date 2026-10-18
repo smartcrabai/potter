@@ -17,14 +17,17 @@ use crate::{
 /// "Specular IOR Level", 0.5f)` in `intern/cycles/scene/shader_nodes.cpp`, `PrincipledBsdfNode`.
 pub(crate) const DEFAULT_SPECULAR_IOR_LEVEL: f64 = 0.5;
 
-/// Dielectric reflectance at normal incidence for Blender's Principled specular layer:
-/// `0.08 × IOR level`, so the default 0.5 (IOR 1.5, F0 = ((1.5 − 1)/(1.5 + 1))² = 0.04) applies.
-/// The Blender manual defines the level as "0.5 means no adjustment … 1 doubles them at normal
-/// incidence" (`docs.blender.org/manual/en/5.2/render/shader_nodes/shader/principled.html`).
+/// Dielectric reflectance at normal incidence for Blender's Principled specular layer: the Fresnel
+/// `F0` of the material IOR, scaled by `2 × IOR level` (Cycles `svm_node_closure_bsdf`, Principled
+/// branch, `intern/cycles/kernel/svm/closure.h`). The default level 0.5 leaves the IOR's own
+/// reflectance, so IOR 1.5 gives F0 = ((1.5 − 1)/(1.5 + 1))² = 0.04. The Blender manual defines
+/// the level as "0.5 means no adjustment … 1 doubles them at normal incidence"
+/// (`docs.blender.org/manual/en/5.2/render/shader_nodes/shader/principled.html`).
 /// Every Principled evaluation (path tracer, shaded hits, the world term) uses this function.
 #[must_use]
-pub(crate) fn dielectric_f0(specular_ior_level: f64) -> f64 {
-    0.08 * specular_ior_level.clamp(0.0, 2.0)
+pub(crate) fn dielectric_f0(ior: f64, level: f64) -> f64 {
+    let fresnel = ((ior - 1.0) / (ior + 1.0)).powi(2);
+    (fresnel * 2.0 * level.max(0.0)).min(1.0)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -397,23 +400,15 @@ pub fn fill_color_layers<'a, 'n>(
     table: &'a mut [(&'n str, [f64; 4])],
     layers: impl IntoIterator<Item = (&'n str, [f64; 4])>,
 ) -> Result<&'a [(&'n str, [f64; 4])]> {
-    fill_named(table, layers)
-}
-
-/// Writes named values into `table` in order and returns the filled prefix.
-fn fill_named<'a, 'n, T>(
-    table: &'a mut [(&'n str, T)],
-    entries: impl IntoIterator<Item = (&'n str, T)>,
-) -> Result<&'a [(&'n str, T)]> {
     let mut count = 0;
-    for entry in entries {
+    for layer in layers {
         let slot = table.get_mut(count).ok_or_else(|| {
             PotError::new(
                 ErrorCode::LimitExceeded,
                 "mesh has more layers than one hit can carry",
             )
         })?;
-        *slot = entry;
+        *slot = layer;
         count += 1;
     }
     Ok(&table[..count])
@@ -771,16 +766,6 @@ pub struct EvaluatorWorkspace {
     active: Vec<ActiveSocket>,
 }
 
-impl EvaluatorWorkspace {
-    /// Creates workspace with capacity for at least `max_active_sockets` recursive node outputs.
-    #[must_use]
-    pub fn with_capacity(max_active_sockets: usize) -> Self {
-        Self {
-            active: Vec::with_capacity(max_active_sockets),
-        }
-    }
-}
-
 struct Evaluator<'graph, 'material, 'registry, 'workspace> {
     group: &'graph NodeGroup,
     material: &'material Material,
@@ -1074,7 +1059,7 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_> {
     fn glass(&mut self, id: &Id) -> Result<BsdfParams> {
         let mut params = self.diffuse(id)?;
         params.transmission = 1.0;
-        params.ior = self.scalar_input(id, &["IOR"], 1.45)?;
+        params.ior = self.scalar_input(id, &["IOR"], 1.5)?;
         params.roughness = self.scalar_input(id, &["Roughness"], 0.0)?;
         Ok(params)
     }

@@ -767,7 +767,9 @@ mod tests {
         let mut imported = SceneDoc::new("imported".to_owned());
         let world = Id::new("world_source").unwrap();
         let camera = Id::new("node_camera").unwrap();
-        imported.worlds.insert(world.clone(), crate::model::World::default());
+        imported
+            .worlds
+            .insert(world.clone(), crate::model::World::default());
         imported.nodes.insert(
             camera.clone(),
             crate::model::Node {
@@ -781,8 +783,18 @@ mod tests {
         source.camera = Some(camera);
         append_graph(&mut imported, &base, Path::new("source.blend"), false).unwrap();
         let scene = imported.scenes.get(&base.active_scene).unwrap();
-        assert!(scene.world.as_ref().is_some_and(|id| imported.worlds.contains_key(id)));
-        assert!(scene.camera.as_ref().is_some_and(|id| imported.nodes.contains_key(id)));
+        assert!(
+            scene
+                .world
+                .as_ref()
+                .is_some_and(|id| imported.worlds.contains_key(id))
+        );
+        assert!(
+            scene
+                .camera
+                .as_ref()
+                .is_some_and(|id| imported.nodes.contains_key(id))
+        );
     }
 
     #[test]
@@ -796,7 +808,9 @@ mod tests {
         base_scene.camera = Some(base_camera.clone());
         let mut imported = SceneDoc::new("imported".to_owned());
         let world = Id::new("world_source").unwrap();
-        imported.worlds.insert(world.clone(), crate::model::World::default());
+        imported
+            .worlds
+            .insert(world.clone(), crate::model::World::default());
         let active = imported.active_scene.clone();
         imported.scenes.get_mut(&active).unwrap().world = Some(world);
         append_graph(&mut imported, &base, Path::new("source.blend"), false).unwrap();

@@ -845,7 +845,10 @@ fn export_reference(
     reference: &TextureRef,
     losses: &mut Vec<Loss>,
 ) -> TextureRef {
-    let requested = reference.uv_layer.as_deref().filter(|name| !name.is_empty());
+    let requested = reference
+        .uv_layer
+        .as_deref()
+        .filter(|name| !name.is_empty());
     let mut resolved = BTreeSet::<Option<String>>::new();
     let mut missing = false;
     for store in stores {

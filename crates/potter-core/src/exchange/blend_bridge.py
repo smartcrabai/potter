@@ -1314,7 +1314,6 @@ def mesh_dump(mesh):
     normal_layer = mesh.attributes.get("custom_normal")
     has_normal_codes = (normal_layer is not None and normal_layer.domain == "CORNER"
                         and normal_layer.data_type == "INT16_2D")
-    corner_normals = [plain(normal.vector) for normal in mesh.corner_normals] if has_normal_codes else None
     # Raw per-element values stay visible unless this is Blender's compressed normal-code layer.
     for attr in mesh.attributes:
         if (attr.name == "custom_normal" and attr.domain == "CORNER"
@@ -1336,7 +1335,6 @@ def mesh_dump(mesh):
             "uv_render": uv_render, "materials": _material_names(mesh), "attributes": attrs,
             "color_active": _color_attribute_name(mesh, color_attributes.active_color_index),
             "color_render": _color_attribute_name(mesh, color_attributes.render_color_index),
-            "corner_normals": corner_normals,
             "skin_vertices": skin_vertices,
             "shape_keys": _mesh_shape_keys(mesh),
             "descriptor": json.loads(mesh.get("potter.descriptor_json", "null")),
@@ -2011,7 +2009,7 @@ def material_dump(material):
     emission_color = [0.0, 0.0, 0.0]
     emission_strength = 0.0
     transmission = 0.0
-    ior = 1.45
+    ior = 1.5
     if material.use_nodes and material.node_tree:
         shader = next((node for node in material.node_tree.nodes if node.type == "BSDF_PRINCIPLED"), None)
         if shader:
@@ -3257,7 +3255,18 @@ def _apply_native_attributes(mesh, attributes, names, vertex_items, edge_items, 
                 _set_attribute_item(attribute.data[index], data_type, value)
 
 
-def _apply_blender_attributes(mesh, attributes, layer_names, layout):
+def _blender_edge_values(name, values, edge_of):
+    """Stored-order EDGE values re-indexed to Blender's edge order, as `_apply_native_attributes` maps them."""
+    per_edge = [None] * len(values)
+    for index, value in enumerate(values):
+        target = edge_of[index]
+        if target is None:
+            raise ValueError("blender attribute %s has no Blender edge for element %d" % (name, index))
+        per_edge[target] = value
+    return per_edge
+
+
+def _apply_blender_attributes(mesh, attributes, layer_names, layout, edge_of):
     for source in attributes.get("blender_attributes", []):
         name = source.get("name")
         if not name or name in MESH_RESTORE_SKIP:
@@ -3271,11 +3280,14 @@ def _apply_blender_attributes(mesh, attributes, layer_names, layout):
         if len(values) != len(attribute.data):
             raise ValueError("blender attribute %s has %d values for %d elements"
                              % (name, len(values), len(attribute.data)))
-        # Retained raw values are in stored order: FACE and CORNER entries take the same mapping as the native ones.
+        # Retained raw values are in stored order: FACE and CORNER entries take the same mapping as the native ones,
+        # and EDGE entries land on the Blender edges that `_apply_native_attributes` maps them to.
         if source.get("domain") == "CORNER":
             values = layout.loops(values, "blender attribute %s" % name)
         elif source.get("domain") == "FACE":
             values = layout.polygons(values)
+        elif source.get("domain") == "EDGE":
+            values = _blender_edge_values(name, values, edge_of)
         for index, value in enumerate(values):
             if value is None:
                 raise ValueError("blender attribute %s has no value for element %d" % (name, index))
@@ -3358,7 +3370,7 @@ def mesh_create(name, raw, block_id):
     _apply_native_crease(mesh, attributes, edge_items, edge_of)
     _apply_native_attributes(mesh, attributes, names, vertex_items, edge_items, face_items, edge_of, layout,
                              layer_names)
-    _apply_blender_attributes(mesh, attributes, layer_names, layout)
+    _apply_blender_attributes(mesh, attributes, layer_names, layout, edge_of)
     _apply_color_designation(mesh, attributes)
     metadata = attributes.get("blender_metadata", {})
     set_props(mesh, metadata.get("custom_properties", {}))
@@ -5486,7 +5498,7 @@ def _set_principled_values(material, item):
         transmission_socket.default_value = item.get("transmission", 0.0)
     ior_socket = shader.inputs.get("IOR")
     if ior_socket is not None:
-        ior_socket.default_value = item.get("ior", 1.45)
+        ior_socket.default_value = item.get("ior", 1.5)
 
 
 def _material_output(tree):

@@ -878,10 +878,16 @@ fn camera_frame(camera: &Camera, width: u32, height: u32) -> Result<CameraFrame>
             // the aspect, so a landscape frame spans `scale` horizontally and a portrait frame
             // spans `scale` vertically.
             let half_scale = view_height * 0.5;
-            let (half_width, half_height) = if width >= height {
-                (half_scale, half_scale * (f64::from(height) / f64::from(width)))
+            let (half_width, half_height) = if view_width >= height {
+                (
+                    half_scale,
+                    half_scale * (f64::from(height) / f64::from(view_width)),
+                )
             } else {
-                (half_scale * (f64::from(view_width) / f64::from(height)), half_scale)
+                (
+                    half_scale * (f64::from(view_width) / f64::from(height)),
+                    half_scale,
+                )
             };
             if !half_height.is_finite() || !half_width.is_finite() || half_width <= 0.0 {
                 return Err(PotError::invalid_argument(

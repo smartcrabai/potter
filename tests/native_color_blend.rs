@@ -21,7 +21,7 @@ mod process;
 
 use native_oracle::{
     BYTE_TOLERANCE, FLOAT_TOLERANCE, TestResult, apply_operations, assert_close, assert_floats,
-    assert_rgba, attribute, blender, build_oracle, dump_blend, dumped_object, export, export_raw,
+    assert_rgba, attribute, build_oracle, dump_blend, dumped_object, export, export_raw,
     face_loop_starts, floats, import_blend, loss_features, losses, mesh_of_node, node_id, number,
     oracle_section, pot, read_scene, run_blender_arguments, value_at, vec3, vec4, write_script,
 };
@@ -353,7 +353,7 @@ fn check_groups(scene: &Value) -> TestResult {
 
 #[test]
 fn import_stores_shading_colors_generics_uv_and_groups_natively() -> TestResult {
-    let Some(blender) = blender() else {
+    let Some(blender) = blender_checked::blender_executable() else {
         return Ok(());
     };
     let root = tempdir()?;
@@ -388,7 +388,7 @@ fn import_stores_shading_colors_generics_uv_and_groups_natively() -> TestResult 
 
 #[test]
 fn glb_hdr_color_layers_export_raw_and_restore_from_extras() -> TestResult {
-    let Some(blender) = blender() else {
+    let Some(blender) = blender_checked::blender_executable() else {
         return Ok(());
     };
     let root = tempdir()?;
@@ -451,12 +451,15 @@ fn glb_hdr_color_layers_export_raw_and_restore_from_extras() -> TestResult {
         String::from_utf8_lossy(&allowed.stdout)
     );
     let allowed_report: Value = serde_json::from_slice(&allowed.stdout)?;
-    assert!(!losses(&allowed_report).iter().any(|loss| {
-        loss["feature_id"] == "mesh.color_attribute"
-            && loss["reason"]
-                .as_str()
-                .is_some_and(|reason| reason.contains(&hdr_name))
-    }), "COLOR_1 is unconstrained by glTF; {hdr_name} must not be a color loss");
+    assert!(
+        !losses(&allowed_report).iter().any(|loss| {
+            loss["feature_id"] == "mesh.color_attribute"
+                && loss["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains(&hdr_name))
+        }),
+        "COLOR_1 is unconstrained by glTF; {hdr_name} must not be a color loss"
+    );
     let bytes = fs::read(&glb)?;
     assert!(bytes.len() >= 20, "GLB container is too short");
     assert_eq!(&bytes[0..4], b"glTF");
@@ -768,7 +771,7 @@ fn check_groups_dumped(object: &Value, oracle: &Value) -> TestResult {
 
 #[test]
 fn blend_export_gives_blender_the_same_flags_colors_generics_uv_and_groups() -> TestResult {
-    let Some(blender) = blender() else {
+    let Some(blender) = blender_checked::blender_executable() else {
         return Ok(());
     };
     let root = tempdir()?;
@@ -868,7 +871,7 @@ fn render_center_pixel(project: &Path, image_id: &str) -> TestResult<[f64; 4]> {
 
 #[test]
 fn imported_emitter_color_renders_like_blender_after_blend_roundtrip() -> TestResult {
-    let Some(blender) = blender() else {
+    let Some(blender) = blender_checked::blender_executable() else {
         return Ok(());
     };
     let root = tempdir()?;

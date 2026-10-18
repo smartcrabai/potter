@@ -339,9 +339,7 @@ fn normal_edit_writes_target_radial_split_normals() -> Result<(), Box<dyn Error>
     )?;
     let result = evaluate_with_context(&mesh, &edit, &operands, None, DMat4::IDENTITY)?;
     let evaluated = evaluated_face_normals(&result, "f0")?;
-    let normal = evaluated[0]
-        .as_array()
-        .ok_or("custom normal missing")?;
+    let normal = evaluated[0].as_array().ok_or("custom normal missing")?;
     let tolerance = exchange_normals::normal_tolerance(true);
     assert!((normal[0].as_f64().ok_or("normal x missing")? + 1.0).abs() < tolerance);
     assert!(normal[1].as_f64().ok_or("normal y missing")?.abs() < tolerance);
@@ -2819,7 +2817,10 @@ fn uv_project_mesh_for_parity() -> Result<Mesh, Box<dyn Error>> {
 fn corner_normal_vectors_json(mesh: &Mesh) -> Result<Value, Box<dyn Error>> {
     let normals = potter_core::geom::corner_normal_vectors(mesh)?;
     Ok(Value::Array(
-        normals.iter().map(|normal| json!(normal.to_array())).collect(),
+        normals
+            .iter()
+            .map(|normal| json!(normal.to_array()))
+            .collect(),
     ))
 }
 

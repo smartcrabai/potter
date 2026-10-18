@@ -199,7 +199,9 @@ fn instanced_custom_normals_rotate_with_the_instance_transform() {
     let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default()).unwrap();
     let mesh = &snapshot.meshes[&"instance".parse::<Id>().unwrap()];
     // The stored custom normals are Blender code pairs: `null` is Auto, so only a non-null entry is authored.
-    let codes = mesh.attributes["custom_normal"]["values"].as_object().unwrap();
+    let codes = mesh.attributes["custom_normal"]["values"]
+        .as_object()
+        .unwrap();
     let normals = potter_core::geom::corner_normal_vectors(mesh).unwrap();
     let mut authored_faces = Vec::new();
     let mut corner_base = 0;
@@ -221,7 +223,9 @@ fn instanced_custom_normals_rotate_with_the_instance_transform() {
     let (_, base) = authored_faces[0];
     for corner in &normals[base..base + 4] {
         assert!(
-            corner.x.abs() < tolerance && (corner.y - 1.0).abs() < tolerance && corner.z.abs() < tolerance,
+            corner.x.abs() < tolerance
+                && (corner.y - 1.0).abs() < tolerance
+                && corner.z.abs() < tolerance,
             "{corner:?}"
         );
     }

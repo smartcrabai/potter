@@ -18,7 +18,7 @@ mod process;
 use std::{error::Error, fs, path::Path};
 
 use native_oracle::{
-    FLOAT_TOLERANCE, TestResult, apply_operations, assert_close, blender, build_oracle, export,
+    FLOAT_TOLERANCE, TestResult, apply_operations, assert_close, build_oracle, export,
     import_blend, losses, node_id, number, pot, read_scene, run_blender, write_script,
 };
 use potter_core::image::{ImageInterpolation, load_image_data, sample};
@@ -88,7 +88,7 @@ fn center_pixel(project: &Path, image_id: &str) -> Result<[f64; 4], Box<dyn Erro
     reason = "one end-to-end oracle covers Potter rendering and the .blend field round trip"
 )]
 fn field_image_alpha_times_base_alpha_renders_and_round_trips_through_blend() -> TestResult {
-    let Some(blender) = blender() else {
+    let Some(blender) = blender_checked::blender_executable() else {
         eprintln!("skipping texture alpha render oracle: Blender is unavailable");
         return Ok(());
     };
@@ -329,7 +329,13 @@ fn image_texture<'a>(graph: &'a Value, image: &str) -> TestResult<(&'a str, &'a 
 
 /// Whether `source`'s `source_socket` feeds `target`'s `target_socket`, following links upstream
 /// through any intermediate nodes.
-fn feeds(graph: &Value, source: &str, source_socket: &str, target: &str, target_socket: &str) -> bool {
+fn feeds(
+    graph: &Value,
+    source: &str,
+    source_socket: &str,
+    target: &str,
+    target_socket: &str,
+) -> bool {
     let links = graph["links"].as_array().map_or(&[][..], Vec::as_slice);
     let mut pending = vec![(target.to_owned(), Some(target_socket.to_owned()))];
     let mut visited: Vec<String> = Vec::new();
@@ -342,7 +348,9 @@ fn feeds(graph: &Value, source: &str, source_socket: &str, target: &str, target_
         }
         for link in links.iter().filter(|link| {
             link["to_node"] == node.as_str()
-                && socket.as_deref().is_none_or(|name| link["to_socket"] == name)
+                && socket
+                    .as_deref()
+                    .is_none_or(|name| link["to_socket"] == name)
         }) {
             let from = link["from_node"].as_str().unwrap_or_default();
             let from_socket = link["from_socket"].as_str().unwrap_or_default();

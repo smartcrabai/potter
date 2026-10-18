@@ -2,10 +2,6 @@
 //! against Blender's reference corner normals.
 
 #[path = "common/exchange_normals.rs"]
-#[expect(
-    dead_code,
-    reason = "each test binary uses a subset of the shared fixture helpers"
-)]
 mod exchange_normals;
 
 use std::{

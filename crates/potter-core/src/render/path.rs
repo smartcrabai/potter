@@ -366,15 +366,7 @@ pub(super) fn render(
             DVec3::from_array(world.color) * world.strength
         });
     let bvh = Bvh::build(&geometry.triangles)?;
-    let evaluator_capacity = geometry
-        .materials
-        .iter()
-        .filter_map(|material| material.node_tree.as_ref())
-        .filter_map(|graph| doc.node_groups.get(graph))
-        .map(|graph| graph.links.len())
-        .max()
-        .unwrap_or(0);
-    let mut evaluator_workspace = EvaluatorWorkspace::with_capacity(evaluator_capacity);
+    let mut evaluator_workspace = EvaluatorWorkspace::default();
     let lights = collect_lights(doc, snapshot);
     let volumes = collect_volumes(
         doc,
@@ -1676,7 +1668,8 @@ fn sample_bsdf(params: &BsdfParams, view: DVec3, rng: &mut Pcg32) -> (DVec3, DVe
     let diffuse_weight = ((1.0 - params.metallic) * (1.0 - params.transmission)).max(0.0);
     let transmission_weight = params.transmission.clamp(0.0, 1.0);
     let specular_weight = (params.metallic.clamp(0.0, 1.0)
-        + dielectric_f0(params.specular_ior_level) * (1.0 - params.metallic.clamp(0.0, 1.0)))
+        + dielectric_f0(params.ior, params.specular_ior_level)
+            * (1.0 - params.metallic.clamp(0.0, 1.0)))
     .max(1.0e-4);
     let total = diffuse_weight + transmission_weight + specular_weight;
     let p_diffuse = diffuse_weight / total;
@@ -1735,7 +1728,7 @@ fn evaluate_bsdf(params: &BsdfParams, normal: DVec3, view: DVec3, light: DVec3) 
     )
     .max(DVec3::ZERO);
     // The dielectric reflectance is the shared Principled rule (`shader::dielectric_f0`).
-    let f0 = DVec3::splat(dielectric_f0(params.specular_ior_level))
+    let f0 = DVec3::splat(dielectric_f0(params.ior, params.specular_ior_level))
         .lerp(albedo, params.metallic.clamp(0.0, 1.0));
     let fresnel = f0 + (DVec3::ONE - f0) * (1.0 - v_dot_h).powi(5);
     let alpha = params.roughness.clamp(0.02, 1.0).powi(2);
@@ -2552,6 +2545,50 @@ mod volume_extinction_tests {
         let single_scatter = environment * (1.0 - transmittance);
         let outgoing = environment * transmittance + single_scatter;
         assert!((outgoing - environment).length() <= 1.0e-12);
+    }
+
+    #[test]
+    fn area_light_estimator_matches_power_over_pi_distance_squared_and_faces_one_way() {
+        const SAMPLE_COUNT: usize = 10_000;
+        let power = 1_000.0;
+        let distance = 10.0;
+        // A unit square at distance 10 subtends 0.25% less than 1 / d², within the 1% tolerance.
+        // Sampling noise at this sample count is far smaller.
+        let light = PointLight {
+            position: DVec3::ZERO,
+            direction: DVec3::Z,
+            kind: LightType::Area,
+            color: DVec3::ONE,
+            energy: power,
+            radius: 0.0,
+            spot_size: 0.0,
+            spot_blend: 0.0,
+            area: Some(AreaShape {
+                axis_u: DVec3::X,
+                axis_v: DVec3::Y,
+                half_u: 0.5,
+                half_v: 0.5,
+                ellipse: false,
+                area: 1.0,
+            }),
+        };
+        let mut rng = Pcg32::for_sample(0x5eed, 0, 0, 0);
+        let front = DVec3::new(0.0, 0.0, distance);
+        let mut sum = 0.0;
+        for _ in 0..SAMPLE_COUNT {
+            sum +=
+                sample_area_light(&light, front, &mut rng).map_or(0.0, |sample| sample.radiance.x);
+        }
+        let mean = sum / SAMPLE_COUNT as f64;
+        let expected = power / (std::f64::consts::PI * distance * distance);
+        assert!(
+            (mean - expected).abs() <= 0.01 * expected,
+            "area light mean {mean:.6} should match P/(pi*d^2) = {expected:.6} within 1%"
+        );
+        let behind = DVec3::new(0.0, 0.0, -distance);
+        for _ in 0..SAMPLE_COUNT {
+            assert!(sample_area_light(&light, behind, &mut rng).is_none());
+        }
     }
 
     fn hg_cdf(cosine: f64, anisotropy: f64) -> f64 {

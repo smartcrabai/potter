@@ -3033,7 +3033,7 @@ fn parse_material(node: &FbxNode, numeric_id: i64) -> Result<ImportedMaterial> {
         emission_color: read_vec3_property(properties, "potter:emission_color", [0.0; 3])?,
         emission_strength: read_scalar_property(properties, "potter:emission_strength", 0.0)?,
         transmission: read_scalar_property(properties, "potter:transmission", 0.0)?.clamp(0.0, 1.0),
-        ior: read_scalar_property(properties, "potter:ior", 1.45)?,
+        ior: read_scalar_property(properties, "potter:ior", 1.5)?,
     })
 }
 

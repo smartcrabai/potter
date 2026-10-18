@@ -21,8 +21,8 @@ mod process;
 use std::{collections::BTreeSet, fs};
 
 use native_oracle::{
-    TestResult, attribute, blender, build_oracle, export_raw, import_blend, loss_features,
-    mesh_of_node, pot, read_scene, value_at, vec3, vec4,
+    TestResult, attribute, build_oracle, export_raw, import_blend, loss_features, mesh_of_node,
+    pot, read_scene, value_at, vec3, vec4,
 };
 use serde_json::Value;
 use tempfile::tempdir;
@@ -218,7 +218,7 @@ fn color_columns(mesh: &Value) -> TestResult<Vec<String>> {
 #[test]
 fn glb_color_accessors_hold_stored_linear_values_and_strict_export_reports_generics() -> TestResult
 {
-    let Some(blender) = blender() else {
+    let Some(blender) = blender_checked::blender_executable() else {
         return Ok(());
     };
     let root = tempdir()?;
@@ -300,7 +300,7 @@ fn glb_color_accessors_hold_stored_linear_values_and_strict_export_reports_gener
 
 #[test]
 fn glb_colors_import_back_into_color_layers_per_corner() -> TestResult {
-    let Some(blender) = blender() else {
+    let Some(blender) = blender_checked::blender_executable() else {
         return Ok(());
     };
     let root = tempdir()?;

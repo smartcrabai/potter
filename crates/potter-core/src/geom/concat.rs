@@ -302,7 +302,12 @@ fn member_smooth_flags(source: &Mesh) -> Result<Vec<bool>> {
             .get("blender_polygon_smooth")
             .and_then(Value::as_array)
             .filter(|flags| flags.len() == source.faces.len())
-            .and_then(|flags| flags.iter().map(Value::as_bool).collect::<Option<Vec<bool>>>())
+            .and_then(|flags| {
+                flags
+                    .iter()
+                    .map(Value::as_bool)
+                    .collect::<Option<Vec<bool>>>()
+            })
     {
         return Ok(flags);
     }

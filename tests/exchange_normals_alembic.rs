@@ -11,7 +11,7 @@ use std::{
 };
 
 use exchange_normals::{
-    TestResult, assert_matches_reference, corner_normal_tolerance, export, export_strict, pot,
+    NORMAL_TOLERANCE, TestResult, assert_matches_reference, export, export_strict, pot,
     usd_world_corners, write_fixture_scene,
 };
 use serde_json::{Value, json};
@@ -227,7 +227,7 @@ fn alembic_animated_mesh_writes_each_frame_normals() -> TestResult {
                 .map(|axis| (normal[axis] - world.normal[axis]).abs())
                 .fold(0.0_f64, f64::max);
             assert!(
-                error <= corner_normal_tolerance(corner),
+                error <= NORMAL_TOLERANCE,
                 "frame {frame} corner {corner}: stored {normal:?} differs from {:?} (error {error})",
                 world.normal
             );

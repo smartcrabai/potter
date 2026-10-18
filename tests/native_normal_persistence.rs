@@ -30,9 +30,10 @@ use std::{
 
 use native_oracle::{
     BYTE_TOLERANCE, FLOAT_TOLERANCE, NORMAL_TOLERANCE, StoredCorner, TestResult, apply_operations,
-    assert_close, assert_floats, attribute, blender, build_oracle, code_pair, code_within_one_unit,
-    dump_blend, dumped_object, export, floats, import_blend, mesh_of_node, node_id, normal_code_rows,
-    number, read_scene, run_blender, run_blender_arguments, vec3, vectors_close, write_script,
+    assert_close, assert_floats, attribute, build_oracle, code_pair, code_within_one_unit,
+    dump_blend, dumped_object, export, floats, import_blend, mesh_of_node, node_id,
+    normal_code_rows, number, read_scene, run_blender, run_blender_arguments, vec3, vectors_close,
+    write_script,
 };
 use serde_json::{Map, Value, json};
 use tempfile::tempdir;
@@ -616,7 +617,7 @@ fn authoring_reference(blender: &Path, root: &Path, blend: &Path) -> TestResult<
 
 #[test]
 fn subdivision_codes_and_corner_data_follow_one_loop_basis_through_blend() -> TestResult {
-    let Some(blender) = blender() else {
+    let Some(blender) = blender_checked::blender_executable() else {
         return Ok(());
     };
     let root = tempdir()?;
@@ -712,7 +713,7 @@ fn subdivision_codes_and_corner_data_follow_one_loop_basis_through_blend() -> Te
 #[test]
 fn subdivision_without_custom_normals_keeps_loop_basis_and_later_authoring_allocates_the_layer()
 -> TestResult {
-    let Some(blender) = blender() else {
+    let Some(blender) = blender_checked::blender_executable() else {
         return Ok(());
     };
     let root = tempdir()?;
@@ -929,7 +930,7 @@ evaluated.to_mesh_clear()
 
 #[test]
 fn nonmanifold_subdivision_auto_codes_match_blenders_evaluated_fan() -> TestResult {
-    let Some(blender) = blender() else {
+    let Some(blender) = blender_checked::blender_executable() else {
         return Ok(());
     };
     let root = tempdir()?;

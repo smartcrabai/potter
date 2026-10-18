@@ -21,7 +21,7 @@ mod process;
 use std::{error::Error, fs, path::Path};
 
 use native_oracle::{
-    TestResult, apply_operations, blender, build_oracle, import_blend, pot, read_scene, vec4,
+    TestResult, apply_operations, build_oracle, import_blend, pot, read_scene, vec4,
 };
 use potter_core::image::{ImageInterpolation, load_image_data, sample};
 use potter_core::model::Image;
@@ -41,7 +41,7 @@ fn pixel_at_center(project: &Path, image_id: &str) -> Result<[f64; 4], Box<dyn E
 
 #[test]
 fn emitter_centre_pixel_equals_its_stored_vertex_color_layer() -> TestResult {
-    let Some(blender) = blender() else {
+    let Some(blender) = blender_checked::blender_executable() else {
         return Ok(());
     };
     let root = tempdir()?;

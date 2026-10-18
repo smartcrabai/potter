@@ -23,9 +23,9 @@ mod native_oracle;
 mod process;
 
 use native_oracle::{
-    FLOAT_TOLERANCE, TestResult, apply_operations, assert_close, assert_floats, blender,
-    build_oracle, dump_blend, dumped_object, export, f32_ulp_tolerance, import_blend, losses,
-    node_id, number, read_scene, render_texture, run_blender, vec3, write_script,
+    FLOAT_TOLERANCE, TestResult, apply_operations, assert_close, assert_floats, build_oracle,
+    dump_blend, dumped_object, export, f32_ulp_tolerance, import_blend, losses, node_id, number,
+    read_scene, render_texture, run_blender, vec3, write_script,
 };
 use serde_json::{Value, json};
 use std::{fs, path::Path};
@@ -247,7 +247,10 @@ fn check_material_links(object: &Value) -> TestResult {
         rough_split["name"].as_str().unwrap_or_default(),
         "Color",
     )?;
-    assert_eq!(rough["type"], "ShaderNodeTexImage", "roughness is a texture");
+    assert_eq!(
+        rough["type"], "ShaderNodeTexImage",
+        "roughness is a texture"
+    );
     let rough_uv = feeding(
         material,
         rough["name"].as_str().unwrap_or_default(),
@@ -262,7 +265,7 @@ fn check_material_links(object: &Value) -> TestResult {
 
 #[test]
 fn textured_plane_renders_the_base_layer_with_its_file_orientation() -> TestResult {
-    let Some(blender) = blender() else {
+    let Some(blender) = blender_checked::blender_executable() else {
         return Ok(());
     };
     let root = tempdir()?;
@@ -340,7 +343,7 @@ fn potter_material<'a>(scene: &'a Value, name: &str) -> TestResult<&'a Value> {
 
 #[test]
 fn alpha_mode_and_threshold_survive_authoring_through_blend() -> TestResult {
-    let Some(blender) = blender() else {
+    let Some(blender) = blender_checked::blender_executable() else {
         return Ok(());
     };
     let root = tempdir()?;
@@ -476,7 +479,7 @@ fn alpha_mode_and_threshold_survive_authoring_through_blend() -> TestResult {
 
 #[test]
 fn blender_authored_materials_infer_alpha_mode_from_render_state() -> TestResult {
-    let Some(blender) = blender() else {
+    let Some(blender) = blender_checked::blender_executable() else {
         return Ok(());
     };
     let root = tempdir()?;

@@ -141,11 +141,12 @@ impl CornerNormalCode {
 /// Which Blender custom-normal setter boundary supplied a vector buffer.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum SetterInput {
-    /// `mesh.set_custom_normals`: input vectors are normalized first.
+    /// `mesh.set_custom_normals`: input vectors are normalized first. A zero vector takes the computed
+    /// corner normal and codes as `ExplicitZero`.
     #[default]
     NormalizeInput,
-    /// Subdivision's setter: input vectors are already unit length. A zero vector contributes to the
-    /// fan average but stores Auto for that corner.
+    /// Subdivision's setter: input vectors are already unit length. A zero vector takes the computed
+    /// corner normal, as with `NormalizeInput`, and codes with its fan.
     AlreadyNormalized,
 }
 
@@ -1129,15 +1130,16 @@ fn set_fan_codes(
                 if !vector.is_finite() {
                     return Err(normal_state_error("custom normal vectors must be finite"));
                 }
-                // Blender replaces already-normalized zero inputs before edge splitting and fan encoding.
-                if *vector == DVec3::ZERO && setter_input == SetterInput::AlreadyNormalized {
+                let vector = match setter_input {
+                    SetterInput::NormalizeInput => normalize(vector.as_vec3()),
+                    SetterInput::AlreadyNormalized => vector.as_vec3(),
+                };
+                // Blender's `mesh_normals_corner_custom_set` replaces zero vectors with the computed corner
+                // normal before edge splitting and fan averaging.
+                if vector == Vec3::ZERO {
                     base.as_vec3()
                 } else {
-                    let vector = vector.as_vec3();
-                    match setter_input {
-                        SetterInput::NormalizeInput => normalize(vector),
-                        SetterInput::AlreadyNormalized => vector,
-                    }
+                    vector
                 }
             }
             None => base.as_vec3(),

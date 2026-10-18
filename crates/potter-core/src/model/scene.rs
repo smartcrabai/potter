@@ -1564,10 +1564,10 @@ pub struct Node {
     pub transform: Transform,
     #[serde(default)]
     pub data: Option<Id>,
-    /// Material slots in slot order. `null` is an empty slot: a face index on it has no material,
-    /// as Blender's empty material slot does. Old files holding only ids still load unchanged.
+    /// Material slots in slot order; OBJECT-linked entries are overrides of the data material.
+    /// `null` is an empty slot: a face index on it has no material, as Blender's empty material
+    /// slot does. Old files holding only ids still load unchanged.
     #[serde(default)]
-    /// Ordered OBJECT-linked material overrides; `None` preserves a raw empty override.
     pub materials: Vec<Option<Id>>,
     /// Per-slot source; missing entries use legacy `OBJECT` for existing node slots.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2184,7 +2184,7 @@ fn default_roughness() -> f64 {
     0.8
 }
 fn default_ior() -> f64 {
-    1.45
+    1.5
 }
 
 fn default_displacement_method() -> String {

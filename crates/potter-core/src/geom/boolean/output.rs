@@ -52,7 +52,9 @@ use serde_json::{Map, Value, json};
 
 use crate::error::{PotError, Result};
 use crate::geom::{
-    Edge, Face, IdCounters, Mesh, Vertex, clnor::{self, NormalCodeOptions}, edge_key,
+    Edge, Face, IdCounters, Mesh, Vertex,
+    clnor::{self, NormalCodeOptions},
+    color_layers, edge_key,
     normals::{face_normal, normal_matrix, vector3},
     provenance::{Origin, default_value, mean_value_corners, remap_attributes},
     uv_layers,
@@ -551,6 +553,7 @@ fn is_structured_key(key: &str) -> bool {
         key,
         "vertex_groups"
             | uv_layers::ATTRIBUTE
+            | color_layers::ATTRIBUTE
             | "blender_attributes"
             | "skin_radii"
             | "skin_roots"
@@ -652,13 +655,20 @@ fn join_attributes(
         "blender_attributes",
         joined_blender_attributes(operands),
     );
+    insert_if(
+        &mut attributes,
+        color_layers::ATTRIBUTE,
+        joined_color_layers(operands),
+    );
     Ok(attributes)
 }
 
 /// A native generic attribute store: `{"domain","type","values"}` keyed by element ID.
 fn is_native_store(value: &Value) -> bool {
-    matches!(text_field(value, "domain"), "point" | "edge" | "face" | "corner")
-        && value.get("values").is_some_and(Value::is_object)
+    matches!(
+        text_field(value, "domain"),
+        "point" | "edge" | "face" | "corner"
+    ) && value.get("values").is_some_and(Value::is_object)
 }
 
 /// The element ID in a store key such as `f12` for prefix `f`, or `None` for another key.
@@ -864,6 +874,26 @@ fn joined_uv_store(operands: &[Operand<'_>]) -> uv_layers::UvStore {
         active: subject.and_then(|store| store.active.clone()),
         render: subject.and_then(|store| store.render.clone()),
     }
+}
+
+/// The joined `color_layers` list: every operand's color layers in first-seen order, with the
+/// subject's active and render names. The remap writes the store from these names and the joined
+/// color stores, as it does for the subject's own layers. A name missing from the union falls back
+/// to the first layer in `color_layers::write`, as `concat::merge_color_layers` does for members.
+fn joined_color_layers(operands: &[Operand<'_>]) -> Option<Value> {
+    let stores: Vec<color_layers::ColorStore> = operands
+        .iter()
+        .map(|operand| color_layers::read(operand.mesh))
+        .collect();
+    let mut names: Vec<&str> = Vec::new();
+    for layer in stores.iter().flat_map(|store| &store.layers) {
+        if !names.contains(&layer.name.as_str()) {
+            names.push(layer.name.as_str());
+        }
+    }
+    let subject = stores.first()?;
+    (!names.is_empty())
+        .then(|| json!({"layers": names, "active": subject.active, "render": subject.render}))
 }
 
 /// The `blender_attributes` entries of `J`: POINT, FACE, and CORNER entries joined per element,
@@ -1095,7 +1125,12 @@ impl NormalTransform {
 fn joined_custom_normals(operands: &[Operand<'_>], layout: &Layout) -> Result<Option<Value>> {
     let mut decoded = Vec::with_capacity(operands.len());
     for operand in operands {
-        let positions: Vec<DVec3> = operand.mesh.vertices.iter().map(|vertex| vertex.co).collect();
+        let positions: Vec<DVec3> = operand
+            .mesh
+            .vertices
+            .iter()
+            .map(|vertex| vertex.co)
+            .collect();
         decoded.push(clnor::corner_custom_normals(
             operand.mesh,
             &positions,
@@ -1155,7 +1190,9 @@ fn encode_joined_custom_normals(mesh: &mut Mesh) -> Result<()> {
     let values = attribute
         .get("values")
         .and_then(Value::as_object)
-        .ok_or_else(|| PotError::invalid_argument("boolean output custom normals have no values"))?;
+        .ok_or_else(|| {
+            PotError::invalid_argument("boolean output custom normals have no values")
+        })?;
     let mut vectors = Vec::new();
     for face in &mesh.faces {
         let rows = values
@@ -1356,7 +1393,11 @@ mod tests {
         imesh::{Arena, NO_INDEX},
         input::Operand,
     };
-    use crate::geom::{Mesh, uv_layers};
+    use crate::geom::{
+        Mesh,
+        color_layers::{self, ColorDomain, ColorLayer, ColorStore},
+        uv_layers,
+    };
 
     type TestResult = Result<(), String>;
 
@@ -1529,6 +1570,47 @@ mod tests {
             .map(|face| values[format!("f{}", face.id)].clone())
             .collect();
         assert_eq!(fids, vec![json!(100), json!(101), json!(200), json!(201)]);
+        Ok(())
+    }
+
+    #[test]
+    fn color_layers_list_every_operands_layers() -> TestResult {
+        let mut a = quad(0.0)?;
+        let mut b = quad(5.0)?;
+        let body = ColorStore {
+            layers: vec![ColorLayer {
+                name: "Body".to_owned(),
+                domain: ColorDomain::Point,
+                values: vec![[1.0, 0.0, 0.0, 1.0]; 4],
+            }],
+            active: Some("Body".to_owned()),
+            render: Some("Body".to_owned()),
+        };
+        color_layers::write(&mut a, &body);
+        let paint = ColorStore {
+            layers: vec![ColorLayer {
+                name: "Paint".to_owned(),
+                domain: ColorDomain::Corner,
+                values: vec![[0.0, 1.0, 0.0, 1.0]; 6],
+            }],
+            active: None,
+            render: Some("Paint".to_owned()),
+        };
+        color_layers::write(&mut b, &paint);
+        let operands = [operand(&a), operand(&b)];
+        let mut arena = Arena::new();
+        let polys = quad_polys(&mut arena, &a, &b)?;
+        let mesh = build(&polys, &arena, &operands, &[])?;
+        let store = color_layers::read(&mesh);
+        let names: Vec<&str> = store
+            .layers
+            .iter()
+            .map(|layer| layer.name.as_str())
+            .collect();
+        assert_eq!(names, ["Body", "Paint"]);
+        assert_eq!(store.active.as_deref(), Some("Body"));
+        assert_eq!(store.render.as_deref(), Some("Body"));
+        color_layers::validate(&mesh).map_err(|error| format!("{error:?}"))?;
         Ok(())
     }
 

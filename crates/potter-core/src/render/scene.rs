@@ -163,19 +163,12 @@ pub(super) fn extract_geometry(
     let mut bounds: Option<(DVec3, DVec3)> = None;
     let mut warnings = Vec::new();
     let shader_warnings: RefCell<Vec<serde_json::Value>> = RefCell::new(Vec::new());
-    let evaluator_capacity = doc
-        .materials
-        .values()
-        .filter_map(|material| material.node_tree.as_ref())
-        .filter_map(|graph| doc.node_groups.get(graph))
-        .map(|graph| graph.links.len())
-        .max()
-        .unwrap_or(0);
-    let mut evaluator_workspace = EvaluatorWorkspace::with_capacity(evaluator_capacity);
+    let mut evaluator_workspace = EvaluatorWorkspace::default();
     for (node_id, node) in &doc.nodes {
         if !visible_nodes.contains(node_id)
             || !node.visible
-            || (snapshot.purpose == EvaluationPurpose::Render && !node.render_visible)
+            || ((snapshot.purpose == EvaluationPurpose::Render || matches!(mode, Mode::Beauty))
+                && !node.render_visible)
         {
             continue;
         }
@@ -536,7 +529,7 @@ pub(super) fn extract_geometry(
                             material.map_or(0.0, |value| value.metallic),
                             material.map_or(0.8, |value| value.roughness),
                             1.0,
-                            dielectric_f0(DEFAULT_SPECULAR_IOR_LEVEL),
+                            dielectric_f0(material_ior(material), DEFAULT_SPECULAR_IOR_LEVEL),
                             mode,
                             None,
                             images,
@@ -891,7 +884,7 @@ pub(super) fn extract_geometry(
                 material.metallic,
                 material.roughness,
                 1.0,
-                dielectric_f0(DEFAULT_SPECULAR_IOR_LEVEL),
+                dielectric_f0(material.ior, DEFAULT_SPECULAR_IOR_LEVEL),
                 mode,
                 Some((&bvh, &geometry.triangles, &shadow_maps)),
                 images,
@@ -1251,10 +1244,6 @@ struct DisplacementSample {
     uv: [f64; 2],
     /// Barycentric weights of the sample over the triangle's corners.
     barycentric: [f64; 3],
-    /// Each UV layer's value at this sample, in layer order.
-    layer_uvs: Vec<[f64; 2]>,
-    /// Each color layer's value at this sample, in layer order.
-    layer_colors: Vec<[f64; 4]>,
     /// Blended corner normal the sample moves along, or the face normal on flat triangles.
     normal: DVec3,
 }
@@ -1310,27 +1299,17 @@ fn subdivide_displaced(
             object,
             uv,
             barycentric: weights,
-            layer_uvs: triangle
-                .layer_uvs
-                .iter()
-                .map(|corners| blend_uv(corners, weights))
-                .collect(),
-            layer_colors: triangle
-                .layer_colors
-                .iter()
-                .map(|corners| blend_color(corners, weights))
-                .collect(),
             normal: sample_normal,
         };
         let displacement = displacement(&sample)?;
         positions[index] = point + sample_normal * displacement;
         sample_normals[index] = sample_normal;
         uvs[index] = uv;
-        for (table, layer_uv) in layer_samples.iter_mut().zip(&sample.layer_uvs) {
-            table[index] = *layer_uv;
+        for (table, corners) in layer_samples.iter_mut().zip(&triangle.layer_uvs) {
+            table[index] = blend_uv(corners, weights);
         }
-        for (table, layer_color) in color_samples.iter_mut().zip(&sample.layer_colors) {
-            table[index] = *layer_color;
+        for (table, corners) in color_samples.iter_mut().zip(&triangle.layer_colors) {
+            table[index] = blend_color(corners, weights);
         }
     }
     let indices: [[usize; 3]; 4] = [[0, 1, 2], [1, 3, 4], [2, 4, 5], [1, 4, 2]];
@@ -1432,6 +1411,11 @@ fn world_face_normals(
     faces
 }
 
+/// The material's index of refraction. An unmapped slot takes the default material's.
+fn material_ior(material: Option<&Material>) -> f64 {
+    material.map_or_else(|| Material::default().ior, |material| material.ior)
+}
+
 /// Per-pixel lighting for smooth triangles in raster Solid and realtime Beauty output. Flat
 /// triangles keep the lighting baked into `Triangle::color`, which equals per-pixel lighting
 /// for a constant normal.
@@ -1457,31 +1441,20 @@ pub(super) fn surface_shader<'a>(
         Mode::Beauty if geometry.shadows.is_some() => {}
         _ => return None,
     }
-    let evaluator_capacity = geometry
-        .materials
-        .iter()
-        .filter_map(|material| material.node_tree.as_ref())
-        .filter_map(|graph| doc.node_groups.get(graph))
-        .map(|graph| graph.links.len())
-        .max()
-        .unwrap_or(0);
     Some(Box::new(SceneShader {
         doc,
         snapshot,
         images,
         geometry,
         mode,
-        evaluator_workspace: RefCell::new(EvaluatorWorkspace::with_capacity(evaluator_capacity)),
+        evaluator_workspace: RefCell::new(EvaluatorWorkspace::default()),
     }))
 }
 
 impl SurfaceShader for SceneShader<'_> {
     fn shade(&self, triangle: &Triangle, hit: &SurfaceHit) -> Result<[f64; 4]> {
         let material = self.geometry.materials.get(triangle.material_index);
-        let params = if triangle.lit_per_pixel
-            || (triangle.normals.is_some()
-                && material.is_some_and(|material| material.node_tree.is_some()))
-        {
+        let params = if triangle.lit_per_pixel {
             material
                 .map(|material| self.graph_params(triangle, material, hit))
                 .transpose()?
@@ -1517,6 +1490,10 @@ impl SurfaceShader for SceneShader<'_> {
                 &shadows.point_maps,
             )
         });
+        let (ior, specular_ior_level) = params.map_or_else(
+            || (material_ior(material), DEFAULT_SPECULAR_IOR_LEVEL),
+            |params| (params.ior, params.specular_ior_level),
+        );
         let mut color = shade(
             self.doc,
             self.snapshot,
@@ -1528,9 +1505,7 @@ impl SurfaceShader for SceneShader<'_> {
             metallic,
             roughness,
             reflectance,
-            dielectric_f0(params.map_or(DEFAULT_SPECULAR_IOR_LEVEL, |params| {
-                params.specular_ior_level
-            })),
+            dielectric_f0(ior, specular_ior_level),
             self.mode,
             shadow,
             self.images,

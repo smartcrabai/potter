@@ -119,13 +119,7 @@ pub fn run(args: &ExportArgs) -> Result<(Option<SceneInfo>, Value)> {
         let mut losses = export_losses(&doc, format, Some(&snapshot));
         losses.extend(exchange::shading::shading_losses(format, &meshes));
         losses.extend(exchange::uv_layer_losses(format, &meshes));
-        if matches!(
-            format,
-            "fbx" | "fbx-binary" | "alembic" | "obj" | "ply" | "stl"
-        ) || matches!(format, "usda" | "usdc" | "usd" | "usdz")
-        {
-            losses.extend(exchange::attribute_losses(format, &doc, &snapshot)?);
-        }
+        losses.extend(mesh_data_losses(&doc, format, &snapshot)?);
         let vrm = match (format, doc.avatar.as_ref()) {
             ("vrm", Some(avatar)) => Some((avatar, AvatarVersion::V1)),
             ("vrm0", Some(avatar)) => Some((avatar, AvatarVersion::V0)),
@@ -136,7 +130,6 @@ pub fn run(args: &ExportArgs) -> Result<(Option<SceneInfo>, Value)> {
                 exchange::gltf::uv_layer_diagnostics(&doc, &snapshot, vrm)?;
             losses.extend(uv_losses);
             warnings.extend(uv_warnings);
-            losses.extend(exchange::gltf::mesh_export_losses(&doc, &snapshot)?);
         }
         if matches!(format, "fbx" | "fbx-binary") {
             losses.extend(exchange::fbx::uv_texture_losses(&doc, &snapshot));
@@ -555,31 +548,6 @@ pub(crate) fn export_losses(
                 ),
             });
         }
-        if matches!(format, "alembic" | "fbx" | "fbx-binary")
-            && let Some(mesh) = data.mesh.as_ref()
-        {
-            for attribute in mesh.attributes.keys() {
-                let supported = if format == "alembic" {
-                    matches!(
-                        attribute.as_str(),
-                        "uv_layers" | "shade_smooth" | "sharp" | "custom_normal"
-                    )
-                } else {
-                    attribute == "uv_layers"
-                        || crate::geom::normals::SHADING_ATTRIBUTES.contains(&attribute.as_str())
-                };
-                // Alembic's existing loss below describes this imported attribute.
-                if supported || (format == "alembic" && attribute == "alembic_normals") {
-                    continue;
-                }
-                losses.push(Loss {
-                    feature_id: "mesh.attribute".to_owned(),
-                    data_id: Some(id.to_string()),
-                    reason: format!("{format} drops unsupported mesh attribute `{attribute}`"),
-                    suggestion: Some("export as blend to preserve mesh attributes".to_owned()),
-                });
-            }
-        }
         if !data_supported {
             losses.push(Loss {
                 feature_id: format!("data.{}", data.data_type),
@@ -596,12 +564,32 @@ pub(crate) fn export_losses(
         && let Some(snapshot) = snapshot
     {
         losses.extend(exchange::fbx::material_slot_losses(doc, snapshot));
-        losses.extend(exchange::fbx::uv_texture_losses(doc, snapshot));
     }
     if let Some(loss) = avatar_settings_loss(doc, format) {
         losses.push(loss);
     }
     losses
+}
+
+/// Mesh-data losses of a strict export of `format`, read from the evaluated meshes: generic
+/// attributes the format's writer drops, and glTF-family mesh data glTF cannot write losslessly.
+/// `run` and `validate` both report this set.
+pub(crate) fn mesh_data_losses(
+    doc: &SceneDoc,
+    format: &str,
+    snapshot: &Snapshot,
+) -> Result<Vec<Loss>> {
+    let mut losses = Vec::new();
+    if matches!(
+        format,
+        "fbx" | "fbx-binary" | "alembic" | "obj" | "ply" | "stl" | "usda" | "usdc" | "usd" | "usdz"
+    ) {
+        losses.extend(exchange::attribute_losses(format, doc, snapshot)?);
+    }
+    if matches!(format, "glb" | "gltf" | "vrm" | "vrm0") {
+        losses.extend(exchange::gltf::mesh_export_losses(doc, snapshot)?);
+    }
+    Ok(losses)
 }
 
 /// Material losses for glTF-family output: graph parts the resolver cannot represent. Texture

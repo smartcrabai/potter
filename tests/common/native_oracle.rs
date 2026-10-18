@@ -15,8 +15,6 @@ use std::{
 
 use serde_json::Value;
 
-use super::blender_checked::blender_executable;
-
 pub type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 /// Float32 storage in Blender and Potter's f64 store: values agree to this bound.
@@ -24,16 +22,13 @@ pub const FLOAT_TOLERANCE: f64 = 1.0e-6;
 /// `BYTE_COLOR` layers: Blender stores bytes, so one step is the bound.
 pub const BYTE_TOLERANCE: f64 = 1.0 / 255.0;
 /// Blender quantizes custom normals to 16-bit codes; the oracle's own check uses 1e-3.
+/// Same value as `exchange_normals::BLENDER_NORMAL_TOLERANCE`; the native and exchange test roots
+/// share no module, so the number is repeated here.
 pub const NORMAL_TOLERANCE: f64 = 2.0e-4;
 
 const BUILD_SCRIPT: &str = include_str!("../fixtures/native_oracle/build_oracle.py");
 const DUMP_SCRIPT: &str = include_str!("../fixtures/native_oracle/dump_blend.py");
 const RENDER_SCRIPT: &str = include_str!("../fixtures/native_oracle/render_texture.py");
-
-/// Returns the Blender executable, or `None` (skip) when Blender is absent and not required.
-pub fn blender() -> Option<PathBuf> {
-    blender_executable()
-}
 
 pub fn pot() -> Command {
     Command::new(env!("CARGO_BIN_EXE_pot"))

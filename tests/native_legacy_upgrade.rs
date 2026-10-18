@@ -27,7 +27,7 @@ use std::{
 };
 
 use native_oracle::{
-    FLOAT_TOLERANCE, StoredCorner, TestResult, apply_operations, attribute, blender, build_oracle,
+    FLOAT_TOLERANCE, StoredCorner, TestResult, apply_operations, attribute, build_oracle,
     import_blend, mesh_of_node, node_id, normal_code_rows, pot, pot_json, read_scene, value_at,
 };
 use serde_json::{Map, Value, json};
@@ -121,7 +121,10 @@ fn fan_roots(expected: &Value) -> TestResult<Vec<usize>> {
     let faces = oracle["faces"].as_array().ok_or("faces are missing")?;
     let mut sharp = BTreeMap::new();
     for edge in oracle["edges"].as_array().ok_or("edges are missing")? {
-        sharp.insert(vertex_pair(&edge["v"])?, edge["sharp"].as_bool() == Some(true));
+        sharp.insert(
+            vertex_pair(&edge["v"])?,
+            edge["sharp"].as_bool() == Some(true),
+        );
     }
     let mut starts = Vec::with_capacity(faces.len());
     let mut total = 0;
@@ -618,7 +621,7 @@ fn stored_oracle(project: &Path) -> TestResult<Value> {
 
 #[test]
 fn schema_v2_scene_keeps_native_semantics_through_apply_undo_and_redo() -> TestResult {
-    let Some(blender) = blender() else {
+    let Some(blender) = blender_checked::blender_executable() else {
         return Ok(());
     };
     let root = TempDir::new()?;
@@ -672,7 +675,7 @@ fn schema_v2_scene_keeps_native_semantics_through_apply_undo_and_redo() -> TestR
 
 #[test]
 fn schema_v2_history_record_is_verified_before_it_is_upgraded() -> TestResult {
-    let Some(blender) = blender() else {
+    let Some(blender) = blender_checked::blender_executable() else {
         return Ok(());
     };
     let root = TempDir::new()?;

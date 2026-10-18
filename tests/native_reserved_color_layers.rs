@@ -20,8 +20,8 @@ use std::{
 
 use native_oracle::{
     FLOAT_TOLERANCE, TestResult, apply_operations, assert_close, assert_floats, assert_rgba,
-    blender, checked, dump_blend, dumped_object, export, export_raw, floats, import_blend,
-    loss_features, losses, mesh_of_node, node_id, number, pot, read_scene, vec4, write_script,
+    checked, dump_blend, dumped_object, export, export_raw, floats, import_blend, loss_features,
+    losses, mesh_of_node, node_id, number, pot, read_scene, vec4, write_script,
 };
 use potter_core::image::{ImageInterpolation, load_image_data, sample};
 use potter_core::model::Image;
@@ -539,7 +539,7 @@ fn check_glb_material(glb: &Glb, expected: &Value) -> TestResult {
 
 #[test]
 fn reserved_color_layer_names_coexist_with_weights_material_render_and_exports() -> TestResult {
-    let Some(blender) = blender() else {
+    let Some(blender) = blender_checked::blender_executable() else {
         return Ok(());
     };
     let root = tempdir()?;

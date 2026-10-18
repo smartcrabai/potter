@@ -9,7 +9,9 @@ use crate::{
         Edge, Face, Mesh, Vertex,
         uv_layers::{self, UvLayer},
     },
-    model::{DataBlock, Id, MaterialLink, Node, ShapeKey, ShapeKeyData, VertexGroup},
+    model::{
+        DataBlock, Id, MaterialLink, Node, ShapeKey, ShapeKeyData, VertexGroup, material_link_at,
+    },
 };
 
 use super::{ChangeKind, Engine, check_fields, operation_pointer, parse_id, resolve_node_targets};
@@ -31,14 +33,7 @@ struct SlotSources<'a> {
 
 impl SlotSources<'_> {
     fn link(&self, slot: usize) -> MaterialLink {
-        self.links
-            .get(slot)
-            .copied()
-            .unwrap_or(if slot < self.object.len() {
-                MaterialLink::Object
-            } else {
-                MaterialLink::Data
-            })
+        material_link_at(self.object.len(), self.links, slot)
     }
 }
 
