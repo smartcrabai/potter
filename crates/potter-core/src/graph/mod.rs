@@ -1,8 +1,14 @@
+mod bake;
 mod evaluator;
 mod model;
 mod sockets;
 
-pub use evaluator::{GraphEvaluation, evaluate, evaluate_at_frame};
+pub use bake::{NodeBakeFrame, NodeBakeRecord, NodeBakeValue};
+pub(crate) use bake::{
+    delete_node_bake_payload, read_node_bake_payload, validate_node_bake_config,
+    validate_node_bake_resource, write_node_bake_payload,
+};
+pub use evaluator::{GraphEvaluation, evaluate, evaluate_at_frame, evaluate_at_frame_with_bakes};
 pub use model::{GraphInterface, GraphKind, GraphLink, GraphNode, GraphSocket, NodeGroup};
 pub use sockets::validate_link;
 

@@ -67,11 +67,13 @@ impl MergedGeometry {
 const MAX_SUBDIVISION_TRIANGLES: u128 = 100_000_000;
 const MAX_SUBDIVISION_MEMORY_BYTES: u128 = 8 * 1024 * 1024 * 1024;
 
-/// Result of evaluating a modifier stack, including realized graph instance paths.
+/// Result of evaluating a modifier stack, including realized graph instance paths and bake captures.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModifierEvaluation {
     pub mesh: Mesh,
     pub instance_paths: Vec<Vec<Id>>,
+    pub bake_captures: BTreeMap<(Id, String), graph::NodeBakeFrame>,
+    pub bake_material_refs: BTreeMap<(Id, String), Vec<Id>>,
     pub warnings: Vec<PotError>,
 }
 
@@ -161,6 +163,8 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
         ));
     }
     let mut instance_paths = Vec::new();
+    let mut bake_captures = BTreeMap::new();
+    let mut bake_material_refs = BTreeMap::new();
     let mut warnings = Vec::new();
     for (modifier_index, modifier) in modifiers
         .iter()
@@ -251,10 +255,28 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
                     ));
                 }
             };
-            let graph_result =
-                graph::evaluate_at_frame(group, Some(&evaluated), &overrides, frame)?;
+            let graph_result = graph::evaluate_at_frame_with_bakes(
+                group,
+                Some(&evaluated),
+                &overrides,
+                frame,
+                &modifier.runtime.node_bakes,
+                &modifier.runtime.capture_node_bakes,
+            )?;
             evaluated = graph_result.mesh;
             instance_paths.extend(graph_result.instance_paths);
+            bake_captures.extend(
+                graph_result
+                    .bake_captures
+                    .into_iter()
+                    .map(|(node_id, frame)| ((modifier.id.clone(), node_id), frame)),
+            );
+            bake_material_refs.extend(
+                graph_result
+                    .bake_material_refs
+                    .into_iter()
+                    .map(|(node_id, materials)| ((modifier.id.clone(), node_id), materials)),
+            );
             continue;
         }
         if modifier.modifier_type == "mesh_to_volume" {
@@ -339,6 +361,8 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
     Ok(ModifierEvaluation {
         mesh: evaluated,
         instance_paths,
+        bake_captures,
+        bake_material_refs,
         warnings,
     })
 }

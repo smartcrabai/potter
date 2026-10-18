@@ -2041,6 +2041,118 @@
           ],
           "default": "PACKED"
         },
+        "bakes": {
+          "type": "object",
+          "propertyNames": {
+            "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+          },
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "storage": {
+                "enum": [
+                  "packed",
+                  "disk"
+                ]
+              },
+              "resource_id": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+              },
+              "frames": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "frame": {
+                      "type": "number"
+                    },
+                    "digest": {
+                      "type": "string",
+                      "pattern": "^sha256:[0-9a-f]{64}$"
+                    }
+                  },
+                  "required": [
+                    "frame",
+                    "digest"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "bake_mode": {
+                "enum": [
+                  "STILL",
+                  "ANIMATION"
+                ]
+              },
+              "bake_target": {
+                "enum": [
+                  "INHERIT",
+                  "PACKED",
+                  "DISK"
+                ]
+              },
+              "use_custom_simulation_frame_range": {
+                "type": "boolean"
+              },
+              "frame_start": {
+                "type": "number"
+              },
+              "frame_end": {
+                "type": "number"
+              },
+              "use_custom_path": {
+                "type": "boolean"
+              },
+              "directory": {
+                "type": "string"
+              },
+              "cache_directory": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "storage"
+            ],
+            "oneOf": [
+              {
+                "properties": {
+                  "storage": {
+                    "const": "packed"
+                  }
+                },
+                "required": [
+                  "storage",
+                  "resource_id"
+                ],
+                "not": {
+                  "required": [
+                    "frames"
+                  ]
+                }
+              },
+              {
+                "properties": {
+                  "storage": {
+                    "const": "disk"
+                  }
+                },
+                "required": [
+                  "storage",
+                  "frames"
+                ],
+                "not": {
+                  "required": [
+                    "resource_id"
+                  ]
+                }
+              }
+            ],
+            "additionalProperties": false
+          },
+          "default": {}
+        },
         "show_group_selector": {
           "type": "boolean",
           "default": true

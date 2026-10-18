@@ -445,6 +445,23 @@ def tree_dump(tree):
         node_id = custom_properties.pop("potter.id", None)
         simple_material = custom_properties.pop("potter_simple_material", False)
         properties = rna_props(node, ("inputs", "outputs", "internal_links", "parent", "select", "location", "dimensions"))
+        if node.bl_idname == "GeometryNodeBake":
+            bake_items = []
+            for index, item in enumerate(getattr(node, "bake_items", ())):
+                bake_type = getattr(item, "socket_type", "")
+                socket_key = {"INT": "integer", "BOOLEAN": "boolean", "RGBA": "color"}.get(
+                    bake_type, bake_type.lower())
+                socket_type = POTTER_TO_BLENDER_NODE_SOCKET_TYPE.get(
+                    socket_key, getattr(item, "bl_socket_idname", "") or
+                    (bake_type if bake_type.startswith("NodeSocket") else ""))
+                entry = {"id": "Item_%d" % index,
+                         "name": item.name, "socket_type": socket_type}
+                if hasattr(item, "is_attribute"):
+                    entry["is_attribute"] = bool(item.is_attribute)
+                if hasattr(item, "attribute_domain"):
+                    entry["attribute_domain"] = str(item.attribute_domain)
+                bake_items.append(entry)
+            properties["bake_items"] = bake_items
         if node.bl_idname == "GeometryNodeMeshCube":
             properties = {}
         if simple_material is True and not _matches_blender_defaults(node):

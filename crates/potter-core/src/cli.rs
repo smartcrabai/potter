@@ -233,10 +233,18 @@ pub struct BakeArgs {
     pub kind: BakeKind,
     #[arg(long, help = "Target entity ID, when required by the bake kind.")]
     pub target: Option<String>,
+    #[arg(long, help = "Modifier ID for a node bake.")]
+    pub modifier: Option<String>,
+    #[arg(long, help = "Bake node ID for a node bake.")]
+    pub node: Option<String>,
+    #[arg(long, value_enum, help = "Node bake mode: still or animation.")]
+    pub mode: Option<NodeBakeMode>,
+    #[arg(long, help = "Delete a node bake and resume live evaluation.")]
+    pub delete: bool,
     #[arg(long, help = "Frame range as start:end[:step].")]
     pub frames: Option<String>,
-    #[arg(long, required = true, help = "Output directory.")]
-    pub out: PathBuf,
+    #[arg(long, help = "Output directory for non-node bake kinds.")]
+    pub out: Option<PathBuf>,
     #[arg(long, help = "Replace existing output files.")]
     pub overwrite: bool,
     #[command(flatten)]
@@ -348,6 +356,13 @@ pub enum BakeKind {
     Simulation,
     Texture,
     Geometry,
+    Animation,
+    #[value(name = "node-bake")]
+    NodeBake,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum NodeBakeMode {
+    Still,
     Animation,
 }
 

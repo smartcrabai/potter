@@ -1461,6 +1461,7 @@ impl Modifier {
             && match purpose {
                 crate::eval::EvaluationPurpose::Preview => self.show_viewport,
                 crate::eval::EvaluationPurpose::Render => self.show_render,
+                crate::eval::EvaluationPurpose::Bake => self.show_viewport,
             }
     }
 
@@ -1486,6 +1487,8 @@ pub struct ModifierRuntime {
     pub warp_from: Option<[f64; 3]>,
     pub warp_to: Option<[f64; 3]>,
     pub hook_target_position: Option<[f64; 3]>,
+    pub node_bakes: BTreeMap<String, crate::graph::NodeBakeRecord>,
+    pub capture_node_bakes: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

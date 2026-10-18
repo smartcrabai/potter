@@ -552,7 +552,7 @@ fn linear_to_byte(value: f64) -> u8 {
 /// Manifest `visibility` naming the modifier stack a render or preview evaluated.
 pub(crate) fn visibility_name(purpose: EvaluationPurpose) -> &'static str {
     match purpose {
-        EvaluationPurpose::Preview => "viewport",
+        EvaluationPurpose::Preview | EvaluationPurpose::Bake => "viewport",
         EvaluationPurpose::Render => "render",
     }
 }
