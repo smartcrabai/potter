@@ -3,7 +3,7 @@
 //! Blender 5.2.2 does not store the same codes on every platform. Its linux-x64 and macOS arm64
 //! builds differ by exactly one step in the second (beta) component of 11 of the 2,656 loop codes
 //! in the custom-normal subdivision cases, and never in the first (alpha) component. Potter's
-//! output differs from each platform's codes in the same way. OpenSubdiv is built on arm64 with
+//! output differs from each platform's codes in the same way. `OpenSubdiv` is built on arm64 with
 //! clang's default `-ffp-contract=on` (`build_files/build_environment/cmake/options.cmake` passes no
 //! `-ffp-contract=off` to the deps), while the x86-64 baseline has no FMA to contract, so the
 //! float rounding of the beta computation depends on the platform.
