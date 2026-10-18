@@ -18,6 +18,7 @@ use crate::{
 
 use super::{
     Mesh,
+    clnor::{self, NormalCodeOptions, SetterInput},
     color_layers::{self, ColorDomain, ColorLayer},
     uv_layers::{self, UvLayer},
 };
@@ -62,6 +63,32 @@ pub(crate) fn evaluate(
         ),
     };
     let interpolate = bool_param(modifier, "use_vertex_interpolation")?;
+    let velocity_name = modifier
+        .params
+        .get("velocity_name")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            params::default_value(
+                ParameterFamily::Modifier,
+                &modifier.modifier_type,
+                "velocity_name",
+            )
+            .and_then(Value::as_str)
+        })
+        .ok_or_else(|| invalid_parameter(modifier, "velocity_name", "a string"))?;
+    let velocity_unit = modifier
+        .params
+        .get("velocity_unit")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            params::default_value(
+                ParameterFamily::Modifier,
+                &modifier.modifier_type,
+                "velocity_unit",
+            )
+            .and_then(Value::as_str)
+        })
+        .unwrap_or("SECOND");
     let mut read = read_params(modifier)?;
     let rate = f64::from(fps) / fps_base;
     if !rate.is_finite() || rate <= 0.0 {
@@ -81,13 +108,25 @@ pub(crate) fn evaluate(
         ));
     }
 
+    let velocity_factor = if velocity_unit == "FRAME" {
+        velocity_scale * rate
+    } else if velocity_unit == "SECOND" {
+        velocity_scale
+    } else {
+        return Err(invalid_parameter(
+            modifier,
+            "velocity_unit",
+            "FRAME or SECOND",
+        ));
+    };
     let mut samples = cached_mesh_cache_samples(
         archive_bytes,
         resource_hash,
         resource,
         object_path,
         read,
-        velocity_scale != 0.0,
+        velocity_name,
+        velocity_factor != 0.0,
         modifier,
     )?;
     if samples.is_empty() {
@@ -126,7 +165,8 @@ pub(crate) fn evaluate(
             resource,
             object_path,
             read,
-            velocity_scale != 0.0,
+            velocity_name,
+            velocity_factor != 0.0,
             modifier,
         )?;
         if samples.is_empty() {
@@ -165,7 +205,7 @@ pub(crate) fn evaluate(
             &mut evaluated,
             sample.sample,
             read,
-            velocity_scale,
+            velocity_factor,
             modifier,
             &mut warnings,
         )?;
@@ -191,7 +231,7 @@ pub(crate) fn evaluate(
             mesh,
             sample.sample,
             read,
-            velocity_scale,
+            velocity_factor,
             modifier,
             &mut warnings,
         )?;
@@ -218,7 +258,7 @@ pub(crate) fn evaluate(
         &mut evaluated,
         sample.sample,
         read,
-        velocity_scale,
+        velocity_factor,
         modifier,
         &mut warnings,
     )?;
@@ -265,12 +305,14 @@ fn cached_mesh_cache_samples(
     resource: &str,
     object_path: &str,
     read: ReadAttributes,
+    velocity_name: &str,
     read_velocity: bool,
     modifier: &Modifier,
 ) -> Result<Arc<Vec<MeshCacheSample>>> {
+    let velocity_name = if read_velocity { velocity_name } else { "" };
     let key = format!(
-        "{resource_hash}\0{object_path}\0{}\0{}\0{}",
-        read.uv, read.color, read_velocity
+        "{resource_hash}\0{object_path}\0{}\0{}\0{}\0{}",
+        read.uv, read.color, read_velocity, velocity_name
     );
     let mut parsed = CACHE_SAMPLES.lock().map_err(|_| {
         PotError::new(
@@ -286,7 +328,8 @@ fn cached_mesh_cache_samples(
         object_path,
         read.uv,
         read.color,
-        read_velocity,
+        read.polygons,
+        velocity_name,
     )?);
     if samples.windows(2).any(|pair| {
         pair.first()
@@ -306,7 +349,7 @@ fn apply_cache_attributes(
     mesh: &mut Mesh,
     sample: &MeshCacheSample,
     read: ReadAttributes,
-    velocity_scale: f64,
+    velocity_factor: f64,
     modifier: &Modifier,
     warnings: &mut Vec<PotError>,
 ) -> Result<()> {
@@ -324,7 +367,37 @@ fn apply_cache_attributes(
         let (domain, values) = cache_colors(mesh, scope, colors, modifier)?;
         write_cache_colors(mesh, domain, values);
     }
-    if velocity_scale != 0.0
+    if read.polygons
+        && let Some(normals) = &sample.normals
+    {
+        if normals.len()
+            != mesh
+                .faces
+                .iter()
+                .map(|face| face.vertices.len())
+                .sum::<usize>()
+        {
+            return Err(PotError::with_details(
+                ErrorCode::EvaluationFailed,
+                "Alembic corner normal count does not match the selected mesh topology",
+                json!({"modifier_id":modifier.id,"normal_count":normals.len()}),
+            ));
+        }
+        // Cache normals are authored per corner, so every corner takes its vector.
+        let vectors = normals
+            .iter()
+            .map(|normal| Some(DVec3::from_array(*normal)))
+            .collect::<Vec<_>>();
+        clnor::encode_vectors(
+            mesh,
+            Some(&vectors),
+            NormalCodeOptions {
+                corner_order: None,
+                setter_input: SetterInput::NormalizeInput,
+            },
+        )?;
+    }
+    if velocity_factor != 0.0
         && let Some((scope, velocities)) = &sample.velocities
     {
         let scaled = velocities
@@ -332,7 +405,7 @@ fn apply_cache_attributes(
             .map(|velocity| {
                 velocity
                     .iter()
-                    .map(|component| component * velocity_scale)
+                    .map(|component| component * velocity_factor)
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
@@ -340,7 +413,7 @@ fn apply_cache_attributes(
             return Err(PotError::with_details(
                 ErrorCode::EvaluationFailed,
                 "Alembic velocity scaling produced a non-finite value",
-                json!({"modifier_id":modifier.id,"velocity_scale":velocity_scale}),
+                json!({"modifier_id":modifier.id,"velocity_factor":velocity_factor}),
             ));
         }
         mesh.attributes.insert(

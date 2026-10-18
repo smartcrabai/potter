@@ -2576,6 +2576,8 @@ pub(crate) struct MeshCacheSample {
     pub uv_layers: Option<Vec<ExchangeUvLayer>>,
     pub colors: Option<(String, Vec<Vec<f64>>)>,
     pub velocities: Option<(String, Vec<Vec<f64>>)>,
+    /// Per-corner normals in Potter's winding, when the cache stores normals.
+    pub normals: Option<Vec<[f64; 3]>>,
 }
 
 /// Read a `PolyMesh`'s evaluated attributes and time samples from an Ogawa archive.
@@ -2602,7 +2604,8 @@ pub(crate) fn read_mesh_cache(
     object_path: &str,
     read_uv: bool,
     read_color: bool,
-    read_velocity: bool,
+    read_normals: bool,
+    velocity_name: &str,
 ) -> Result<Vec<MeshCacheSample>> {
     let archive = parse_archive(bytes)?;
     let object = alembic_object_at_path(&archive.objects, object_path)?;
@@ -2650,10 +2653,14 @@ pub(crate) fn read_mesh_cache(
     let color = read_color
         .then(|| property(&geom.children, "color").or_else(|| property(&geom.children, "Cs")))
         .flatten();
-    let velocity = read_velocity
-        .then(|| property(&geom.children, "velocities").or_else(|| property(&geom.children, "v")))
-        .flatten()
-        .filter(|parameter| matches!(parameter.property_type, 0 | 2));
+    let velocity = if velocity_name.is_empty() {
+        None
+    } else {
+        find_named_array_property(&object.properties, velocity_name)
+    };
+    let normals = read_normals
+        .then(|| property(&geom.children, "N"))
+        .flatten();
     let mut sample_count = positions
         .sample_count
         .max(counts.sample_count)
@@ -2662,7 +2669,13 @@ pub(crate) fn read_mesh_cache(
         .into_iter()
         .max_by_key(|parameter| parameter.sample_count)
         .ok_or_else(|| import_error("Alembic PolyMesh has no time-sampled properties"))?;
-    for parameter in uv.iter().copied().chain(color).chain(velocity) {
+    for parameter in uv
+        .iter()
+        .copied()
+        .chain(color)
+        .chain(normals)
+        .chain(velocity)
+    {
         let values = geomparam_values_property(parameter)?;
         sample_count = sample_count.max(values.sample_count);
         if values.sample_count != 1 && values.sample_count != sample_count {
@@ -2780,6 +2793,33 @@ pub(crate) fn read_mesh_cache(
                 Ok((scope, tuples))
             })
             .transpose()?;
+        let cache_normals = normals
+            .map(|parameter| {
+                let values = geomparam_values_property(parameter)?;
+                validate_cache_parameter_samples(values, sample_count)?;
+                let extent = usize::from(values.extent);
+                if extent != 3 {
+                    return Err(unsupported(
+                        "alembic.normal_extent",
+                        format!("Alembic normal extent {extent} is unsupported"),
+                    ));
+                }
+                let (scope, tuples) = geomparam_values(
+                    bytes,
+                    parameter,
+                    &geometry_sample,
+                    extent,
+                    sample_slot(values, sample_index),
+                )?;
+                let corners = normal_corners(&file_faces, &scope, &tuples)?;
+                reverse_corner_runs(&file_faces, corners).map(|corners| {
+                    corners
+                        .into_iter()
+                        .map(|normal| potter_vector(normal.to_array()))
+                        .collect::<Vec<[f64; 3]>>()
+                })
+            })
+            .transpose()?;
         let sample_time = sample_seconds(
             time_property,
             sample_slot(time_property, sample_index),
@@ -2793,6 +2833,7 @@ pub(crate) fn read_mesh_cache(
             uv_layers,
             colors,
             velocities,
+            normals: cache_normals,
         });
     }
     Ok(result)
@@ -3021,6 +3062,19 @@ fn validate_cache_parameter_samples(property: &ParsedProperty, sample_count: usi
         ));
     }
     Ok(())
+}
+
+fn find_named_array_property<'a>(
+    properties: &'a [ParsedProperty],
+    name: &str,
+) -> Option<&'a ParsedProperty> {
+    properties.iter().find_map(|property| {
+        if property.name == name && property.property_type == 2 {
+            Some(property)
+        } else {
+            find_named_array_property(&property.children, name)
+        }
+    })
 }
 
 /// Per-corner normals from an Alembic normal parameter, in `faces` order.
@@ -4467,6 +4521,7 @@ mod tests {
             true,
             false,
             false,
+            "",
         )?;
         assert!(
             samples.len() > 1,
@@ -4499,7 +4554,8 @@ mod tests {
             assert!(property.constant);
             assert_eq!(sample_storage_count(property), 1);
         }
-        let static_samples = read_mesh_cache(&static_bytes, "/Plane/Plane", true, false, false)?;
+        let static_samples =
+            read_mesh_cache(&static_bytes, "/Plane/Plane", true, false, false, "")?;
         assert_eq!(static_samples.len(), 1);
         assert!(
             static_samples
