@@ -14842,22 +14842,27 @@ mod tests {
                 {"op":"material.create","id":"shared","base_color_texture":{"image":"paint"},"normal_texture":{"image":"bump"}},
                 {"op":"material.create","id":"tinted","base_color_texture":{"image":"tint"}},
                 {"op":"node.create","id":"sheet","kind":"plane","params":{"size":1.0},"material":"shared"},
-                {"op":"node.create","id":"other","kind":"plane","params":{"size":1.0},"material":"tinted"}
+                {"op":"uv.unwrap","target":{"id":"sheet"},"method":"box"},
+                {"op":"node.create","id":"other","kind":"plane","params":{"size":1.0},"material":"tinted"},
+                {"op":"uv.unwrap","target":{"id":"other"},"method":"box"}
             ]),
         )?;
-        let imported = import_edited(&doc, |root, _| {
-            // Point the shared material's metallic-roughness at the same texture as its base color.
-            let materials = root["materials"]
-                .as_array_mut()
-                .ok_or("glTF materials are missing")?;
-            let shared = materials
-                .iter_mut()
-                .find(|material| material["extras"]["potter"]["id"] == "shared")
-                .ok_or("the shared material is missing")?;
+        let (mut document, binary) = export_root_and_binary_at_root(&doc, root.path())?;
+        // The exporter writes one glTF material per mesh variant, so the shared material appears more than
+        // once and the primitives reference the copies. Link each copy's metallic-roughness to its base color.
+        for shared in document["materials"]
+            .as_array_mut()
+            .ok_or("glTF materials are missing")?
+            .iter_mut()
+            .filter(|material| material["extras"]["potter"]["id"] == "shared")
+        {
             let base = shared["pbrMetallicRoughness"]["baseColorTexture"].clone();
             shared["pbrMetallicRoughness"]["metallicRoughnessTexture"] = base;
-            Ok(())
-        })??;
+        }
+        std::fs::write(root.path().join("scene.bin"), &binary)?;
+        let path = root.path().join("data.gltf");
+        std::fs::write(&path, serde_json::to_vec(&document)?)?;
+        let imported = import(&path, uuid::Uuid::new_v4().to_string())?;
         let colorspace = |name: &str| -> TestResult<crate::model::ImageColorspace> {
             Ok(imported
                 .doc
