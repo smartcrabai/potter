@@ -35,6 +35,9 @@ const PIXEL_TOLERANCE: f64 = 0.01;
 
 /// Blender 5.2.2 script for the `AgX` end-to-end check (see `agx_emitter_preview.py`).
 const AGX_SCRIPT: &str = include_str!("fixtures/native_oracle/agx_emitter_preview.py");
+/// Blender 5.2.2 oracle for compositor exposure followed by scene exposure and `AgX`.
+const COMPOSITOR_EXPOSURE_SCRIPT: &str =
+    include_str!("fixtures/native_oracle/compositor_exposure_emitter.py");
 
 /// Centre RGB of the 8-bit PNG at `path`.
 fn png_centre_rgb(path: &Path) -> Result<[u8; 3], Box<dyn Error>> {
@@ -135,6 +138,55 @@ fn agx_beauty_preview_centre_pixel_matches_blender_render_within_one_byte() -> T
         assert!(
             potter[channel].abs_diff(blender_rgb[channel]) <= 1,
             "channel {channel}: Potter AgX preview {potter:?} differs from Blender AgX render {blender_rgb:?} by more than one 8-bit step"
+        );
+    }
+    Ok(())
+}
+
+/// Pins the compositor -> scene exposure -> `AgX` -> PNG order against Blender's final render.
+/// The Blender oracle is an emission-only `Emitter` from `build_oracle`, so no light-unit or
+/// material-BRDF behavior enters this comparison.
+#[test]
+fn compositor_and_scene_exposure_with_agx_match_blender_final_png() -> TestResult {
+    let Some(blender) = blender_checked::blender_executable() else {
+        return Ok(());
+    };
+    let root = tempdir()?;
+    let (oracle, _) = build_oracle(&blender, root.path())?;
+    let agx_blend = root.path().join("compositor_agx.blend");
+    let blender_png = root.path().join("blender_compositor_agx.png");
+    let script = write_script(
+        root.path(),
+        "compositor_exposure_emitter.py",
+        COMPOSITOR_EXPOSURE_SCRIPT,
+    )?;
+    run_blender_arguments(
+        &blender,
+        &script,
+        Some(oracle.as_path()),
+        &[agx_blend.as_path(), blender_png.as_path()],
+    )?;
+
+    let (project, _) = import_blend(&blender, root.path(), "compositor_project", &agx_blend)?;
+    let rendered = pot()
+        .arg("render")
+        .arg(&project)
+        .args(["--format", "png", "--out"])
+        .arg(root.path().join("frames"))
+        .arg("--json")
+        .output()?;
+    assert!(
+        rendered.status.success(),
+        "pot render failed: {}",
+        String::from_utf8_lossy(&rendered.stdout)
+    );
+    let potter_png = root.path().join("frames/frame_0001.png");
+    let potter_rgb = png_centre_rgb(&potter_png)?;
+    let blender_rgb = png_centre_rgb(&blender_png)?;
+    for (channel, (potter, blender)) in potter_rgb.iter().zip(blender_rgb).enumerate() {
+        assert!(
+            potter.abs_diff(blender) <= 1,
+            "channel {channel}: Potter compositor/AgX PNG {potter_rgb:?} differs from Blender {blender_rgb:?}"
         );
     }
     Ok(())
