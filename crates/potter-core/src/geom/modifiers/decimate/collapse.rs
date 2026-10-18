@@ -861,6 +861,101 @@ impl BMesh {
         }
         join
     }
+
+    /// `BM_faces_join` of the two faces across `e` (`do_del` false), then `BM_edge_kill` of `e` once no
+    /// face uses it. The joined ring starts at the first boundary loop of `faces[0]` (the radial head of
+    /// `e`), which is `BM_faces_join`'s `v1`; each new corner copies UVs from the boundary loop on its edge.
+    /// shortcut: `BM_face_find_double` (#159549) is not ported, so a join that duplicates an existing face keeps both; upgrade when input meshes can hold duplicate faces.
+    /// shortcut: a boundary vertex with several open boundary edges takes the first in discovery order, Blender takes disk order; only non-manifold boundaries differ.
+    fn join_across(&mut self, e: usize) {
+        let Some((la, lb)) = self.edge_loop_pair(e) else {
+            return;
+        };
+        let faces = [self.loops[la].f, self.loops[lb].f];
+        if faces[0] == faces[1] {
+            return;
+        }
+        let mut boundary = Vec::new();
+        let mut loops = Vec::new();
+        for &f in &faces {
+            self.face_loops(f, &mut loops);
+            for &l in &loops {
+                match self.radial_count_in(self.loops[l].e, faces) {
+                    1 => boundary.push(l),
+                    2 => {}
+                    _ => return,
+                }
+            }
+        }
+        let Some(&first) = boundary.first() else {
+            return;
+        };
+        // Walks the boundary edge by edge from `first`, as `bm_edges_sort_winding` does.
+        let v1 = self.loops[first].v;
+        let mut open: Vec<usize> = boundary.iter().map(|&l| self.loops[l].e).collect();
+        let mut verts = vec![v1];
+        let mut edges = Vec::with_capacity(boundary.len());
+        let mut edge = self.loops[first].e;
+        let mut v = v1;
+        loop {
+            let Some(pos) = open.iter().position(|&x| x == edge) else {
+                return;
+            };
+            open.swap_remove(pos);
+            edges.push(edge);
+            v = self.edge_other_vert(edge, v);
+            if edges.len() == boundary.len() {
+                if v != v1 {
+                    return;
+                }
+                break;
+            }
+            verts.push(v);
+            let Some(&next) = open.iter().find(|&&x| self.vert_in_edge(x, v)) else {
+                return;
+            };
+            edge = next;
+        }
+        let mut sources = Vec::with_capacity(verts.len());
+        for (&edge_k, &vert_k) in edges.iter().zip(&verts) {
+            let Some(&source) = boundary.iter().find(|&&l| self.loops[l].e == edge_k) else {
+                return;
+            };
+            sources.push(if self.loops[source].v == vert_k {
+                source
+            } else {
+                self.loops[source].next
+            });
+        }
+        let joined = self.face_create(&verts, &edges, faces[0]);
+        let first_new = self.faces[joined].first;
+        for (k, &source) in sources.iter().enumerate() {
+            for layer in 0..self.uv_stride {
+                self.uv[(first_new + k) * self.uv_stride + layer] =
+                    self.uv[source * self.uv_stride + layer];
+            }
+        }
+        self.face_kill(faces[0]);
+        self.face_kill(faces[1]);
+        if self.edges[e].l == NONE {
+            self.edge_kill(e);
+        }
+    }
+
+    /// Loops of `e`'s radial cycle that belong to one of `faces` (`bm_loop_systag_count_radial`).
+    fn radial_count_in(&self, e: usize, faces: [usize; 2]) -> usize {
+        let start = self.edges[e].l;
+        let mut count = 0;
+        let mut l = start;
+        loop {
+            count += usize::from(faces.contains(&self.loops[l].f));
+            l = self.loops[l].radial_next;
+            if l == start {
+                break;
+            }
+        }
+        count
+    }
 }
 
 fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
@@ -1233,15 +1328,6 @@ fn byte_color_linear(bytes: [f32; 4]) -> Value {
             })
             .collect(),
     )
-}
-
-/// Root of `parent`'s set, with path halving.
-fn root(parent: &mut [usize], mut f: usize) -> usize {
-    while parent[f] != f {
-        parent[f] = parent[parent[f]];
-        f = parent[f];
-    }
-    f
 }
 
 /// Builds the `BMesh` of `mesh` as `BKE_mesh_to_bmesh_ex` does for decimation: vertices, then edges in
@@ -1987,14 +2073,15 @@ impl Decimator {
         a == c || a == d || b == c || b == d
     }
 
-    /// Output polygons, provenance and corner UVs of the decimated mesh, with joined triangles merged.
-    fn output(&self, join: bool, layer_count: usize) -> Output {
-        let joins = if join {
-            self.bm.join_edges()
-        } else {
-            Vec::new()
-        };
-        let join_set: std::collections::HashSet<usize> = joins.iter().copied().collect();
+    /// Output polygons, provenance and corner UVs of the decimated mesh. With `join`, the triangles are
+    /// joined back first (`bm_decim_triangulate_end`); every live face is then emitted from its own ring
+    /// start, as `BM_mesh_bm_to_me` does.
+    fn output(&mut self, join: bool, layer_count: usize) -> Output {
+        if join {
+            for e in self.bm.join_edges() {
+                self.bm.join_across(e);
+            }
+        }
         let mut out_vertex = vec![NONE; self.bm.verts.len()];
         let mut points = Vec::new();
         let mut origins = Vec::new();
@@ -2013,42 +2100,21 @@ impl Decimator {
                 }
             }
         }
-        // Union-find over triangles joined across `joins`.
-        let mut parent: Vec<usize> = (0..self.bm.faces.len()).collect();
-        for &e in &joins {
-            if let Some((la, lb)) = self.bm.edge_loop_pair(e) {
-                let (a, b) = (
-                    root(&mut parent, self.bm.loops[la].f),
-                    root(&mut parent, self.bm.loops[lb].f),
-                );
-                parent[b] = a;
-            }
-        }
-        let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-        for f in 0..self.bm.faces.len() {
-            if self.bm.faces[f].alive {
-                let r = root(&mut parent, f);
-                groups.entry(r).or_default().push(f);
-            }
-        }
         let mut polygons: Vec<Polygon> = Vec::new();
         let mut faces_origin = Vec::new();
         let mut corner_uv: Vec<CornerUv> = Vec::new();
-        for members in groups.values() {
-            let first_face = members[0];
-            let ring = if members.len() == 1 {
-                let mut loops = Vec::new();
-                self.bm.face_loops(first_face, &mut loops);
-                loops
-            } else {
-                self.merged_ring(members, &join_set)
-            };
+        let mut ring = Vec::new();
+        for f in 0..self.bm.faces.len() {
+            if !self.bm.faces[f].alive {
+                continue;
+            }
+            self.bm.face_loops(f, &mut ring);
             let verts = ring
                 .iter()
                 .map(|&l| out_vertex[self.bm.loops[l].v])
                 .collect();
-            polygons.push((verts, self.bm.faces[first_face].mat));
-            faces_origin.push(Some(self.bm.faces[first_face].origin));
+            polygons.push((verts, self.bm.faces[f].mat));
+            faces_origin.push(Some(self.bm.faces[f].origin));
             for &l in &ring {
                 corner_uv.push(
                     (0..layer_count)
@@ -2073,9 +2139,8 @@ impl Decimator {
             self.bm
                 .edges
                 .iter()
-                .enumerate()
-                .filter(|(index, edge)| edge.alive && !join_set.contains(index))
-                .map(|(_, edge)| {
+                .filter(|edge| edge.alive)
+                .map(|edge| {
                     let [first, second] = edge.v.map(|vertex| out_vertex[vertex]);
                     (
                         [first.min(second), first.max(second)],
@@ -2088,9 +2153,8 @@ impl Decimator {
             self.bm
                 .edges
                 .iter()
-                .enumerate()
-                .filter(|(index, edge)| edge.alive && !join_set.contains(index))
-                .map(|(_, edge)| {
+                .filter(|edge| edge.alive)
+                .map(|edge| {
                     let [first, second] = edge.v.map(|vertex| out_vertex[vertex]);
                     ([first.min(second), first.max(second)], edge.flags)
                 })
@@ -2109,42 +2173,6 @@ impl Decimator {
             edge_attributes,
             edge_flags,
         }
-    }
-
-    /// Boundary loops of a joined group, chained into one ring.
-    fn merged_ring(
-        &self,
-        members: &[usize],
-        join_set: &std::collections::HashSet<usize>,
-    ) -> Vec<usize> {
-        let mut boundary = Vec::new();
-        let mut loops = Vec::new();
-        for &f in members {
-            self.bm.face_loops(f, &mut loops);
-            for &l in &loops {
-                if !join_set.contains(&self.bm.loops[l].e) {
-                    boundary.push(l);
-                }
-            }
-        }
-        let mut by_start = HashMap::with_capacity(boundary.len());
-        for &l in &boundary {
-            by_start.entry(self.bm.loops[l].v).or_insert(l);
-        }
-        let mut ring = Vec::with_capacity(boundary.len());
-        let Some(&start) = boundary.first() else {
-            return ring;
-        };
-        let mut l = start;
-        loop {
-            ring.push(l);
-            let end = self.bm.loops[self.bm.loops[l].next].v;
-            match by_start.get(&end) {
-                Some(&next) if next != start && ring.len() < boundary.len() => l = next,
-                _ => break,
-            }
-        }
-        ring
     }
 }
 
