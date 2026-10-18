@@ -590,8 +590,8 @@ pub(crate) fn export_losses(
 }
 
 /// Mesh-data losses of a strict export of `format`, read from the evaluated meshes: generic
-/// attributes the format's writer drops, and glTF-family mesh data glTF cannot write losslessly.
-/// `run` and `validate` both report this set.
+/// attributes and vertex groups the format's Blender writer drops, plus glTF-family mesh data
+/// glTF cannot write losslessly. `run` and `validate` both report this set.
 pub(crate) fn mesh_data_losses(
     doc: &SceneDoc,
     format: &str,
@@ -603,6 +603,9 @@ pub(crate) fn mesh_data_losses(
         "fbx" | "fbx-binary" | "alembic" | "obj" | "ply" | "stl" | "usda" | "usdc" | "usd" | "usdz"
     ) {
         losses.extend(exchange::attribute_losses(format, doc, snapshot)?);
+    }
+    if matches!(format, "fbx" | "fbx-binary") {
+        losses.extend(exchange::fbx::vertex_group_losses(doc, snapshot)?);
     }
     if matches!(format, "glb" | "gltf" | "vrm" | "vrm0") {
         losses.extend(exchange::gltf::mesh_export_losses(doc, snapshot)?);

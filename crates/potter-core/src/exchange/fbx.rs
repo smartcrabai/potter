@@ -1079,6 +1079,85 @@ pub(crate) fn material_slot_losses(doc: &SceneDoc, snapshot: &Snapshot) -> Vec<L
     losses
 }
 
+/// Blender's FBX add-on stores vertex groups only as skin clusters bound to deform bones. Groups
+/// without a matching bone/positive-weight cluster survive Potter's metadata but are not imported
+/// by Blender, so report them for strict export and validation.
+pub(crate) fn vertex_group_losses(doc: &SceneDoc, snapshot: &Snapshot) -> Result<Vec<Loss>> {
+    let visible_nodes = super::render_visible_nodes(doc, snapshot)?;
+    let mut losses = Vec::new();
+    for (node_id, node) in &doc.nodes {
+        if !node.visible || !node.render_visible || !visible_nodes.contains(node_id) {
+            continue;
+        }
+        let Some(data_id) = node.data.as_ref() else {
+            continue;
+        };
+        let Some(data) = doc
+            .data_blocks
+            .get(data_id)
+            .filter(|data| data.data_type == "mesh")
+        else {
+            continue;
+        };
+        if data.vertex_groups.is_empty() || !snapshot.meshes.contains_key(node_id) {
+            continue;
+        }
+        let enabled = node
+            .modifiers
+            .iter()
+            .filter(|modifier| modifier.is_active(snapshot.purpose))
+            .collect::<Vec<_>>();
+        let skin_modifiers = enabled
+            .iter()
+            .filter(|modifier| modifier.modifier_type == "armature")
+            .copied()
+            .collect::<Vec<_>>();
+        let mut deform_bones = BTreeSet::<String>::new();
+        if skin_modifiers.len() == 1 && enabled.len() == 1 {
+            let armature_id = skin_modifiers[0]
+                .params
+                .get("object")
+                .and_then(Value::as_str)
+                .and_then(|raw| Id::new(raw).ok());
+            let armature = armature_id
+                .as_ref()
+                .and_then(|id| doc.nodes.get(id))
+                .and_then(|node| node.data.as_ref())
+                .and_then(|id| doc.data_blocks.get(id))
+                .and_then(|data| data.armature.as_ref());
+            if let Some(armature) = armature {
+                for (_, bone) in &armature.bones {
+                    if bone.deform {
+                        deform_bones.insert(bone.name.clone());
+                    }
+                }
+            }
+        }
+        for group in &data.vertex_groups {
+            let has_positive_weight = data.vertex_weights.values().any(|weights| {
+                weights
+                    .get(&group.id)
+                    .is_some_and(|weight| weight.is_finite() && *weight > 0.0)
+            });
+            if deform_bones.contains(&group.name) && has_positive_weight {
+                continue;
+            }
+            losses.push(Loss {
+                feature_id: "mesh.vertex_group".to_owned(),
+                data_id: Some(node_id.to_string()),
+                reason: format!(
+                    "FBX cannot write vertex group `{}` as a Blender skin cluster without a matching deform bone and positive weights",
+                    group.name
+                ),
+                suggestion: Some(
+                    "bind the group to a deform bone or export as .blend or usda".to_owned(),
+                ),
+            });
+        }
+    }
+    Ok(losses)
+}
+
 /// Warnings for explicit texture UV names that fall back to an evaluated mesh's render layer.
 pub(crate) fn uv_texture_warnings(doc: &SceneDoc, snapshot: &Snapshot) -> Vec<PotError> {
     missing_texture_uv_layers(doc, snapshot)
@@ -1900,8 +1979,9 @@ fn fbx_decode_color(value: [f64; 4]) -> [f64; 4] {
     std::array::from_fn(|channel| decode_byte_color(value[channel], channel == 3))
 }
 /// Writes FBX BYTE_COLOR values: RGB is sRGB encoded, alpha is linear, and all channels are
-/// nearest-byte quantized. POINT colors use Blender's `ByVertice`/`Direct` mapping; CORNER colors
-/// use `ByPolygonVertex`/`IndexToDirect`.
+/// nearest-byte quantized. Blender imports all color layers into CORNER (`import_fbx.py`:
+/// `blen_read_geom_layer_color`); `ByVertice`/`Direct` expands point values onto loops. POINT
+/// domain loss is reported by `element_data_losses`. CORNER colors use ByPolygonVertex/IndexToDirect.
 fn write_color_layers(output: &mut String, mesh: &Mesh, store: &ColorStore) -> Result<()> {
     for (layer_index, layer) in store.layers.iter().enumerate() {
         let expected = match layer.domain {
@@ -4082,8 +4162,8 @@ mod tests {
     use super::{
         export_with_root, export_with_root_allow_lossy, import_bytes, lex, material_slot_losses,
         numeric_array, parse_color_layers, parse_geometry, parse_nodes, parse_uv_layers,
-        resolve_material_slot, uv_texture_losses, uv_texture_warnings, write_color_layers,
-        write_geometry, write_uv_layers,
+        resolve_material_slot, uv_texture_losses, uv_texture_warnings, vertex_group_losses,
+        write_color_layers, write_geometry, write_uv_layers,
     };
     use crate::{
         error::{ErrorCode, PotError, Result},
@@ -4097,7 +4177,7 @@ mod tests {
         image::ImageInterpolation,
         model::{
             DataBlock, Id, Image, ImageColorspace, ImageSource, Material, Node, SceneDoc,
-            TextureRef,
+            TextureRef, VertexGroup,
         },
     };
     use glam::DVec3;
@@ -4179,6 +4259,49 @@ mod tests {
         let colors = parse_color_layers(geometry, 3, &[vec![0, 1, 2]], 1, None, &mut losses)?;
         assert!((colors.layers[0].values[0][0] - 0.5028864580325687).abs() < 1.0e-9);
         assert!((colors.layers[0].values[0][3] - 128.0 / 255.0).abs() < 1.0e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn unbound_vertex_groups_report_their_blender_fbx_loss() -> TestResult<()> {
+        use std::collections::BTreeMap;
+
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        let group_id = Id::new("top_group")?;
+        let data_id = Id::new("weighted_mesh")?;
+        let node_id = Id::new("weighted_node")?;
+        doc.data_blocks.insert(
+            data_id.clone(),
+            DataBlock {
+                data_type: "mesh".to_owned(),
+                mesh: Some(triangle()?),
+                vertex_groups: vec![VertexGroup {
+                    id: group_id.clone(),
+                    name: "Top".to_owned(),
+                }],
+                vertex_weights: BTreeMap::from([(0, BTreeMap::from([(group_id, 0.5)]))]),
+                ..DataBlock::default()
+            },
+        );
+        doc.nodes.insert(
+            node_id.clone(),
+            Node {
+                name: "Weighted".to_owned(),
+                kind: "mesh".to_owned(),
+                data: Some(data_id),
+                ..Node::default()
+            },
+        );
+        doc.collections
+            .get_mut(&Id::from_static("collection_root"))
+            .ok_or("FBX test root collection is missing")?
+            .objects
+            .push(node_id);
+        let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
+        let losses = vertex_group_losses(&doc, &snapshot)?;
+        assert_eq!(losses.len(), 1);
+        assert_eq!(losses[0].feature_id, "mesh.vertex_group");
+        assert!(losses[0].reason.contains("`Top`"));
         Ok(())
     }
 

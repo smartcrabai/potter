@@ -508,15 +508,15 @@ pub(crate) fn mesh_attribute_losses(format: &str, mesh_id: &str, mesh: &Mesh) ->
     let color = color_layers::read(mesh);
     let mut losses = Vec::new();
     for key in mesh.attributes.keys() {
-        // Potter's shading, UV, color, and Blender bookkeeping stores have their own losses or
-        // writers. Any other internal store (`seam`, `vertex_groups`, ...) is data no exchange
-        // writer carries, so it is reported under its key.
+        // Potter's shading, UV, color, vertex-group, and Blender bookkeeping stores have their own
+        // losses or writers. Other internal stores are not exchange data and are reported by key.
         let name = match attribute_keys::user_name(key) {
             Some(name) => name,
             None if matches!(
                 key.as_str(),
                 uv_layers::ATTRIBUTE
                     | color_layers::ATTRIBUTE
+                    | "vertex_groups"
                     | "blender_attributes"
                     | "blender_metadata"
                     | "custom_normal"
@@ -716,15 +716,20 @@ pub(crate) fn element_data_losses(format: &str, meshes: &[ExchangeMesh]) -> Vec<
                         "export as usda or usdc to preserve HDR and out-of-range values",
                     ));
                 }
-                if format == "alembic" && layer.domain == color_layers::ColorDomain::Point {
+                if layer.domain == color_layers::ColorDomain::Point {
+                    let source_format = if format == "alembic" {
+                        "Alembic"
+                    } else {
+                        "FBX"
+                    };
                     losses.push(element_loss(
                         mesh,
                         "mesh.color_attribute",
                         format!(
-                            "Blender imports Alembic POINT color layer `{}` as CORNER data",
+                            "Blender imports {source_format} POINT color layer `{}` as CORNER data",
                             layer.name
                         ),
-                        "export as blend, usda, usdc, or fbx to preserve the point domain",
+                        "export as blend, usda, or usdc to preserve the point domain",
                     ));
                 }
             }
@@ -1453,7 +1458,7 @@ mod tests {
     }
 
     #[test]
-    fn shading_and_uv_keys_are_not_attribute_losses() -> crate::error::Result<()> {
+    fn shading_uv_and_vertex_group_mirrors_are_not_attribute_losses() -> crate::error::Result<()> {
         let mut mesh = triangle_with_attributes()?;
         mesh.attributes.insert(
             "shade_smooth".to_owned(),
@@ -1462,6 +1467,11 @@ mod tests {
         mesh.attributes.insert(
             "sharp".to_owned(),
             serde_json::json!({"domain": "edge", "type": "bool", "values": {}}),
+        );
+
+        mesh.attributes.insert(
+            "vertex_groups".to_owned(),
+            serde_json::json!({"Top": {"v0": 0.5}}),
         );
         let losses = mesh_attribute_losses("obj", "triangle", &mesh);
         assert!(
@@ -1479,6 +1489,11 @@ mod tests {
             losses
                 .iter()
                 .all(|loss| !loss.reason.contains("`color_layers`"))
+        );
+        assert!(
+            losses
+                .iter()
+                .all(|loss| !loss.reason.contains("`vertex_groups`"))
         );
         Ok(())
     }
@@ -1682,7 +1697,7 @@ mod tests {
     }
 
     #[test]
-    fn byte_color_formats_report_quantization_clipping_and_alembic_domain_loss()
+    fn byte_color_formats_report_quantization_clipping_and_point_to_corner_losses()
     -> crate::error::Result<()> {
         use crate::geom::color_layers::{ColorDomain, ColorLayer, ColorStore};
 
@@ -1699,6 +1714,7 @@ mod tests {
         let fbx = element_data_losses("fbx", &[mesh.clone()]);
         assert!(fbx.iter().any(|loss| loss.reason.contains("quantized")));
         assert!(fbx.iter().any(|loss| loss.reason.contains("clips")));
+        assert!(fbx.iter().any(|loss| loss.reason.contains("as CORNER")));
         let alembic = element_data_losses("alembic", &[mesh]);
         assert!(alembic.iter().any(|loss| loss.reason.contains("as CORNER")));
         assert!(alembic.iter().any(|loss| loss.reason.contains("quantized")));
