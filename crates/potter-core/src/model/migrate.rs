@@ -252,8 +252,13 @@ fn upgrade_color_curve(color: &mut Value) -> Result<()> {
     let Some(curve) = color.get_mut("curve") else {
         return Ok(());
     };
+    if curve.is_null() {
+        return Ok(());
+    }
     let Value::Array(points) = curve else {
-        return Err(invalid("color curve must be an array of [x, y] points"));
+        return Err(invalid(
+            "color curve must be an array of [x, y] points or null",
+        ));
     };
     let mut points = points
         .iter()
@@ -1155,7 +1160,7 @@ mod tests {
             }}}
         });
         upgrade_scene(&mut scene).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(3));
+        assert_eq!(scene["schema_version"], json!(4));
         let material = &scene["materials"]["m1"];
         assert_eq!(material["base_color_texture"]["uv_layer"], Value::Null);
         assert!(material["base_color_texture"].get("uv_map").is_none());
@@ -1256,7 +1261,7 @@ mod tests {
         });
 
         let migrated = parse_scene(&serde_json::to_vec(&source)?)?.doc;
-        assert_eq!(migrated.schema_version, 3);
+        assert_eq!(migrated.schema_version, 4);
         let mesh = migrated.data_blocks[&data_id]
             .mesh
             .as_ref()
@@ -1760,7 +1765,7 @@ mod tests {
         let (record, history_warnings) =
             parse_history_record(&serde_json::to_vec(&history_record(&source))?)?;
         assert!(history_warnings.is_empty(), "{history_warnings:?}");
-        assert_eq!(record.snapshot.schema_version, 3);
+        assert_eq!(record.snapshot.schema_version, 4);
         let history_mesh = record
             .snapshot
             .data_blocks
@@ -1827,7 +1832,7 @@ mod tests {
         let (record, history_warnings) =
             parse_history_record(&serde_json::to_vec(&history_record(&source))?)?;
         assert!(history_warnings.is_empty(), "{history_warnings:?}");
-        assert_eq!(record.snapshot.schema_version, 3);
+        assert_eq!(record.snapshot.schema_version, 4);
         let history_mesh = record
             .snapshot
             .data_blocks

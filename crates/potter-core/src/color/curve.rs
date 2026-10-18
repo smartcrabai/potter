@@ -482,10 +482,6 @@ fn is_auto(handle: HandleType) -> bool {
 
 /// `calchandle_curvemap`: the left and right handle of one point, from its neighbours' positions.
 /// `prev` and `next` are `None` at the curve ends, where the missing neighbour is mirrored.
-#[expect(
-    clippy::float_cmp,
-    reason = "Blender tests handle lengths against exact zero"
-)]
 fn calc_handle(
     p2: [f32; 2],
     prev: Option<[f32; 2]>,
@@ -601,10 +597,6 @@ fn forward_diff(q0: f32, q1: f32, q2: f32, q3: f32) -> [f32; CM_RESOL] {
 }
 
 /// `curvemap_calc_extend`: the value beyond `first` (left of it) or `last` (right of it).
-#[expect(
-    clippy::float_cmp,
-    reason = "Blender tests the extension slope against exact zero"
-)]
 fn calc_extend(
     extrapolate: bool,
     ext_in: [f32; 2],
@@ -912,11 +904,11 @@ mod tests {
         assert_close(prepared.evaluate(3, -0.5), -10000.0);
         assert_close(prepared.evaluate(3, -0.25), -10000.0);
         assert_close(prepared.evaluate(3, 0.0), 0.0);
-        assert_close(prepared.evaluate(3, 0.25), 0.373_742_252_588_272_1);
-        assert_close(prepared.evaluate(3, 0.5), 0.393_788_039_684_295_7);
-        assert_close(prepared.evaluate(3, 0.75), 0.893_045_663_833_618_3);
-        assert_close(prepared.evaluate(3, 1.5), 1.143_543_601_036_036);
-        assert_close(prepared.evaluate(3, 2.0), 1.287_087_082_862_854);
+        assert_close(prepared.evaluate(3, 0.25), 0.373_742_25);
+        assert_close(prepared.evaluate(3, 0.5), 0.393_788_04);
+        assert_close(prepared.evaluate(3, 0.75), 0.893_045_66);
+        assert_close(prepared.evaluate(3, 1.5), 1.143_543_6);
+        assert_close(prepared.evaluate(3, 2.0), 1.287_087_1);
     }
 
     #[test]
@@ -927,10 +919,10 @@ mod tests {
             .map(|(x, y, _)| (x, y, CLAMPED))
             .collect();
         let prepared = combined(&points).prepare();
-        assert_close(prepared.evaluate(3, -0.5), -1.333_333_253_860_473_6);
-        assert_close(prepared.evaluate(3, 0.25), 0.365_444_809_199_178_3);
-        assert_close(prepared.evaluate(3, 0.5), 0.368_053_138_256_073);
-        assert_close(prepared.evaluate(3, 1.5), 1.249_999_761_581_421);
+        assert_close(prepared.evaluate(3, -0.5), -1.333_333_3);
+        assert_close(prepared.evaluate(3, 0.25), 0.365_444_8);
+        assert_close(prepared.evaluate(3, 0.5), 0.368_053_14);
+        assert_close(prepared.evaluate(3, 1.5), 1.249_999_8);
     }
 
     #[test]
@@ -945,9 +937,9 @@ mod tests {
         ])
         .prepare();
         assert_close(prepared.evaluate(3, 0.25), 0.5);
-        assert_close(prepared.evaluate(3, 0.5), 0.300_000_011_920_928_96);
-        assert_close(prepared.evaluate(3, 0.75), 0.800_000_011_920_929);
-        assert_close(prepared.evaluate(3, 1.5), 1.299_841_165_542_602_5);
+        assert_close(prepared.evaluate(3, 0.5), 0.3);
+        assert_close(prepared.evaluate(3, 0.75), 0.8);
+        assert_close(prepared.evaluate(3, 1.5), 1.299_841_2);
     }
 
     #[test]
@@ -957,8 +949,8 @@ mod tests {
         mapping.extend_extrapolate = false;
         let prepared = mapping.prepare();
         assert_close(prepared.evaluate(3, -0.5), 0.0);
-        assert_close(prepared.evaluate(3, 0.5), 0.393_788_039_684_295_7);
-        assert_close(prepared.evaluate(3, 1.5), 1.000_000_119_207_9);
+        assert_close(prepared.evaluate(3, 0.5), 0.393_788_04);
+        assert_close(prepared.evaluate(3, 1.5), 1.000_000_1);
     }
 
     #[test]
@@ -969,8 +961,8 @@ mod tests {
         let prepared = mapping.prepare();
         assert_close(prepared.evaluate(3, -0.5), -10000.0);
         assert_close(prepared.evaluate(3, -0.25), -10000.0);
-        assert_close(prepared.evaluate(3, 0.25), 0.373_683_810_234_069_8);
-        assert_close(prepared.evaluate(3, 1.5), 1.143_543_601_036_036);
+        assert_close(prepared.evaluate(3, 0.25), 0.373_683_8);
+        assert_close(prepared.evaluate(3, 1.5), 1.143_543_6);
     }
 
     #[test]
@@ -980,8 +972,8 @@ mod tests {
         let mut mapping = combined(&auto5());
         mapping.clip = [0.1, 0.0, 0.9, 1.0];
         let prepared = mapping.prepare();
-        assert_close(prepared.evaluate(3, 0.25), 0.373_742_252_588_272_1);
-        assert_close(prepared.evaluate(3, 0.5), 0.393_788_039_684_295_7);
+        assert_close(prepared.evaluate(3, 0.25), 0.373_742_25);
+        assert_close(prepared.evaluate(3, 0.5), 0.393_788_04);
     }
 
     #[test]
@@ -989,7 +981,7 @@ mod tests {
         // Probe case `n_noclip`: the display path never clips.
         let mut mapping = combined(&auto5());
         mapping.use_clip = false;
-        assert_close(mapping.prepare().evaluate(3, 0.25), 0.373_742_252_588_272_1);
+        assert_close(mapping.prepare().evaluate(3, 0.25), 0.373_742_25);
     }
 
     #[test]
@@ -999,13 +991,13 @@ mod tests {
         mapping.curves[0] = curve_of(&[(0.0, 0.0, AUTO), (0.5, 0.7, AUTO), (1.0, 1.0, AUTO)]);
         mapping.curves[1] = curve_of(&[(0.0, 0.1, AUTO), (1.0, 0.8, AUTO)]);
         let prepared = mapping.prepare();
-        assert_close(prepared.evaluate(0, -0.5), -0.932_312_011_718_75);
-        assert_close(prepared.evaluate(0, 0.25), 0.422_546_207_904_815_7);
-        assert_close(prepared.evaluate(0, 0.5), 0.699_999_988_079_071);
-        assert_close(prepared.evaluate(0, 1.5), 1.218_764_901_161_193_8);
-        assert_close(prepared.evaluate(1, -0.5), -0.250_000_029_802_322_4);
-        assert_close(prepared.evaluate(1, 0.5), 0.450_000_047_683_715_2);
-        assert_close(prepared.evaluate(1, 1.5), 1.150_000_095_367_431_6);
+        assert_close(prepared.evaluate(0, -0.5), -0.932_312);
+        assert_close(prepared.evaluate(0, 0.25), 0.422_546_2);
+        assert_close(prepared.evaluate(0, 0.5), 0.7);
+        assert_close(prepared.evaluate(0, 1.5), 1.218_764_9);
+        assert_close(prepared.evaluate(1, -0.5), -0.250_000_03);
+        assert_close(prepared.evaluate(1, 0.5), 0.450_000_05);
+        assert_close(prepared.evaluate(1, 1.5), 1.150_000_1);
     }
 
     #[test]
@@ -1018,13 +1010,13 @@ mod tests {
         ]);
         mapping.curves[0] = curve_of(&[(0.0, 0.2, AUTO), (0.5, 1.0, AUTO), (1.0, 0.1, AUTO)]);
         let prepared = mapping.prepare();
-        assert_close(prepared.evaluate(3, -1.0), -1.399_999_976_158_142);
-        assert_close(prepared.evaluate(3, 0.25), 0.830_868_840_217_590_3);
+        assert_close(prepared.evaluate(3, -1.0), -1.4);
+        assert_close(prepared.evaluate(3, 0.25), 0.830_868_84);
         assert_close(prepared.evaluate(3, 0.5), 1.0);
-        assert_close(prepared.evaluate(3, 0.75), 0.818_523_526_191_711_4);
-        assert_close(prepared.evaluate(3, 1.5), -0.799_999_952_316_284_2);
-        assert_close(prepared.evaluate(0, 0.25), 0.908_760_547_637_939_5);
-        assert_close(prepared.evaluate(0, 0.75), 0.903_418_123_722_076_4);
+        assert_close(prepared.evaluate(3, 0.75), 0.818_523_5);
+        assert_close(prepared.evaluate(3, 1.5), -0.799_999_95);
+        assert_close(prepared.evaluate(0, 0.25), 0.908_760_55);
+        assert_close(prepared.evaluate(0, 0.75), 0.903_418_1);
     }
 
     #[test]
@@ -1032,9 +1024,9 @@ mod tests {
         // Probe case `k_update_clamp`: Blender's `update()` clamped the selected point's y from 1.3
         // to the clip maximum 1.0. The port starts from the stored points.
         let prepared = combined(&[(0.0, 0.0, AUTO), (0.5, 1.0, AUTO), (1.0, 1.0, AUTO)]).prepare();
-        assert_close(prepared.evaluate(3, 0.25), 0.775_167_107_582_092_0);
-        assert_close(prepared.evaluate(3, 0.5), 0.999_999_880_790_790_7);
-        assert_close(prepared.evaluate(3, 1.5), 0.846_344_649_791_790_7);
+        assert_close(prepared.evaluate(3, 0.25), 0.775_167_1);
+        assert_close(prepared.evaluate(3, 0.5), 0.999_999_9);
+        assert_close(prepared.evaluate(3, 1.5), 0.846_344_65);
     }
 
     #[test]
@@ -1043,8 +1035,8 @@ mod tests {
         let mut mapping = combined(&auto5());
         mapping.tone = CurveTone::FilmLike;
         let prepared = mapping.prepare();
-        assert_close(prepared.evaluate(3, 0.25), 0.373_742_252_588_272_1);
-        assert_close(prepared.evaluate(3, 0.5), 0.393_788_039_684_295_7);
+        assert_close(prepared.evaluate(3, 0.25), 0.373_742_25);
+        assert_close(prepared.evaluate(3, 0.5), 0.393_788_04);
     }
 
     #[test]
@@ -1081,8 +1073,10 @@ mod tests {
         let unsorted = combined(&[(0.5, 0.5, AUTO), (0.25, 0.2, AUTO)]);
         assert!(unsorted.validate().is_err());
 
-        let mut inverted_clip = CurveMapping::default();
-        inverted_clip.clip = [1.0, 0.0, 0.0, 1.0];
+        let inverted_clip = CurveMapping {
+            clip: [1.0, 0.0, 0.0, 1.0],
+            ..CurveMapping::default()
+        };
         assert!(inverted_clip.validate().is_err());
 
         let non_finite = combined(&[(0.0, f32::INFINITY, AUTO), (1.0, 1.0, AUTO)]);

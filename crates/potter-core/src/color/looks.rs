@@ -259,8 +259,9 @@ mod tests {
     fn every_token_parses_to_a_distinct_look() {
         let looks: Vec<Look> = ALL_TOKENS
             .iter()
-            .map(|token| Look::parse(token).expect("token parses"))
+            .filter_map(|token| Look::parse(token))
             .collect();
+        assert_eq!(looks.len(), ALL_TOKENS.len());
         for (index, look) in looks.iter().enumerate() {
             assert!(!looks[..index].contains(look), "duplicate look {look:?}");
         }

@@ -6,6 +6,8 @@ use std::{error::Error, fs};
 mod blender_checked;
 #[path = "common/blender_script.rs"]
 mod blender_script;
+#[path = "common/process.rs"]
+mod process;
 
 use blender_checked::blender_executable;
 use blender_script::run_blender_script;
@@ -72,7 +74,7 @@ with (root / "view_curve_readback.json").open("w", encoding="utf-8") as stream:
         "white": white,
         "curves": curves,
         "sample_x": samples,
-        "sample_values": [float(mapping.evaluate(3, x)) for x in samples],
+        "sample_values": [float(mapping.evaluate(mapping.curves[3], x)) for x in samples],
     }, stream)
 "#;
 
@@ -87,9 +89,11 @@ fn view_curve_round_trips_through_blend_and_matches_blender() -> TestResult {
     let root = directory.path();
     let project = Project::init(root.join("project"))?;
     let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
-    let mut expected_curve = CurveMapping::default();
-    expected_curve.extend_extrapolate = false;
-    expected_curve.clip = [2.0, 0.0, 3.0, 1.0];
+    let mut expected_curve = CurveMapping {
+        extend_extrapolate: false,
+        clip: [2.0, 0.0, 3.0, 1.0],
+        ..CurveMapping::default()
+    };
     expected_curve.curves[3].points = vec![
         CurvePoint {
             location: [2.0, 0.125],

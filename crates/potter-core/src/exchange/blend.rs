@@ -7903,8 +7903,10 @@ mod tests {
             .scenes
             .get_mut(&scene_id)
             .ok_or_else(|| PotError::new(ErrorCode::SceneInvalid, "active scene missing"))?;
-        let mut curve = CurveMapping::default();
-        curve.clip = [0.0, 0.0, 101.0, 1.0];
+        let curve = CurveMapping {
+            clip: [0.0, 0.0, 101.0, 1.0],
+            ..CurveMapping::default()
+        };
         scene.color_management.curve = Some(curve);
 
         let losses = export_losses(&doc);

@@ -511,8 +511,10 @@ mod tests {
     fn curve_is_applied_before_exposure() -> Result<(), Box<dyn Error>> {
         // The curve maps (0, 0.5, 1) to (0, 0.1, 1). Exposure -1 halves values. Curve first gives
         // curve(1.0) * 0.5 = 0.5; exposure first would give curve(0.5) = 0.1.
-        let mut view_curve = curve::CurveMapping::default();
-        view_curve.extend_extrapolate = false;
+        let mut view_curve = curve::CurveMapping {
+            extend_extrapolate: false,
+            ..curve::CurveMapping::default()
+        };
         view_curve.curves[3].points = [(0.0_f32, 0.0_f32), (0.5, 0.1), (1.0, 1.0)]
             .map(|(x, y)| curve::CurvePoint {
                 location: [x, y],
@@ -541,9 +543,8 @@ mod tests {
         }]);
         let settings: ColorManagement = serde_json::from_value(value)?;
 
-        let error = match settings.display_encoder() {
-            Ok(_) => return Err("invalid curve was accepted".into()),
-            Err(error) => error,
+        let Err(error) = settings.display_encoder() else {
+            return Err("invalid curve was accepted".into());
         };
         assert_eq!(error.code, crate::error::ErrorCode::InvalidArgument);
         assert!(error.message.contains("curve 0 needs at least two points"));

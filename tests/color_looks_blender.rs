@@ -73,13 +73,13 @@ const AGX_SUFFIXES: [(&str, &str); 9] = [
 ];
 
 /// Float bounds are twice the largest per-pixel Blender 5.2.2 output difference measured on macOS arm64
-/// versus the official Linux x86_64 build for the same 88 look/view/settings cases and 132 inputs,
+/// versus the official Linux `x86_64` build for the same 88 look/view/settings cases and 132 inputs,
 /// after clamping both outputs to `[0, 1]`; the one-byte assertion remains an additional check. Measured
-/// maxima: AgX looks 1.0223e-5 (`AgX - Punchy`, gamma 2), AgX without a look 7.7487e-7, False Color
+/// maxima: `AgX` looks 1.0223e-5 (`AgX - Punchy`, gamma 2), `AgX` without a look 7.7487e-7, False Color
 /// looks 1.7028e-3, Filmic looks 3.5763e-7, Standard looks 4.7684e-7, and Raw looks 3.5763e-7. Bounds
-/// are rounded up, with a 1e-6 floor for Standard, Filmic, and Raw. The AgX Punchy look-stage output
+/// are rounded up, with a 1e-6 floor for Standard, Filmic, and Raw. The `AgX` Punchy look-stage output
 /// differs from the Rust emulation by at most 2.4e-7 on the same inputs (ULP-level, confined to the
-/// GradingTone shadow zone); after the view and gamma its largest macOS residual is 9.3e-6. Both are
+/// `GradingTone` shadow zone); after the view and gamma its largest macOS residual is 9.3e-6. Both are
 /// inside the independently measured Blender cross-platform allowance.
 fn float_tolerance(view: ViewTransform, has_look: bool) -> f64 {
     match view {

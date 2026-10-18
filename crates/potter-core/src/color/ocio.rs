@@ -82,13 +82,21 @@ const FILMIC_UNIFORM_MAX: f64 = 0.66;
 const FALSE_COLOR_EXPONENT: f64 = 2.5;
 
 /// Rec.709 linear to `FilmLight` E-Gamut linear, `E * inverse(Rec.709)` in the XYZ D65 frame.
+#[expect(
+    clippy::unreadable_literal,
+    reason = "matrix coefficients are preserved from the OCIO double-precision composition"
+)]
 const REC709_TO_E_GAMUT: [[f64; 3]; 3] = [
     [0.5593711333100773, 0.30478334662300893, 0.13584556048047705],
     [0.07622070548350629, 0.7879717701028465, 0.13580746617472153],
     [0.06552671177877019, 0.16454675460372414, 0.7699265016503745],
 ];
 
-/// Rec.2020 (`lum-comp` output) to the AgX inset, `MI * R2020 * E^-1`: the forward `AgX Log` tail.
+/// Rec.2020 (`lum-comp` output) to the `AgX` inset, `MI * R2020 * E^-1`: the forward `AgX Log` tail.
+#[expect(
+    clippy::unreadable_literal,
+    reason = "matrix coefficients are preserved from the OCIO double-precision composition"
+)]
 const AGX_LOG_TAIL: [[f64; 3]; 3] = [
     [
         0.9679715035369568,
@@ -107,7 +115,11 @@ const AGX_LOG_TAIL: [[f64; 3]; 3] = [
     ],
 ];
 
-/// The AgX inset inverse and `E * R2020^-1` of the `AgX` view: `DisplayViewTransform` to scene light.
+/// The `AgX` inset inverse and `E * R2020^-1` of the `AgX` view: `DisplayViewTransform` to scene light.
+#[expect(
+    clippy::unreadable_literal,
+    reason = "matrix coefficients are preserved from the OCIO double-precision composition"
+)]
 const AGX_VIEW_FROM_LOG: [[f64; 3]; 3] = [
     [
         1.0473107847120087,
@@ -123,6 +135,10 @@ const AGX_VIEW_FROM_LOG: [[f64; 3]; 3] = [
 ];
 
 /// `AgX_Log_TAIL` followed by `AGX_VIEW_FROM_LOG` (identity to within rounding): `Base Contrast`.
+#[expect(
+    clippy::unreadable_literal,
+    reason = "matrix coefficients are preserved from the OCIO double-precision composition"
+)]
 const AGX_BASE_LOOK: [[f64; 3]; 3] = [
     [
         1.0000000000000002,
@@ -142,6 +158,10 @@ const AGX_BASE_LOOK: [[f64; 3]; 3] = [
 ];
 
 /// `Greyscale`: the luma matrix between the two `AgX` stages, with the stages' matrices folded in.
+#[expect(
+    clippy::unreadable_literal,
+    reason = "matrix coefficients are preserved from the OCIO double-precision composition"
+)]
 const AGX_GREYSCALE_LOOK: [[f64; 3]; 3] = [
     [0.3372217961815739, 0.5914124854316711, 0.07136567858584152],
     [0.3372218225129597, 0.591412531611101, 0.07136568415830817],
@@ -407,12 +427,11 @@ fn filmic_look_view(
                 _ => Ok(inverse_exp2(looked, FILMIC_LOG2_MIN, FILMIC_TO_SCENE_MAX)),
             }
         }
-        None => match view {
-            ViewTransform::Filmic => {
+        None => {
+            if view == ViewTransform::Filmic {
                 let boundary = (view_scale * (to_scene_scale * uniform)) as f32;
                 filmic_view_tail(d.map(|value| value * boundary))
-            }
-            _ => {
+            } else {
                 let slope = (to_scene_scale * uniform) as f32;
                 let offset = window(FILMIC_LOG2_MIN) as f32;
                 let linear = d.map(|value| fast_exp2(value.mul_add(slope, offset)));
@@ -422,7 +441,7 @@ fn filmic_look_view(
                     linear
                 })
             }
-        },
+        }
     }
 }
 
@@ -557,29 +576,26 @@ fn agx_look_view(view: ViewTransform, op: AgxOp, scale: f64, rgb: [f32; 3]) -> R
 
 /// The `AgX` or `False Color` view from its `lg2` position (the view's from-scene ends here).
 fn agx_view_from_position(view: ViewTransform, position: [f32; 3]) -> Result<[f32; 3]> {
-    match view {
-        ViewTransform::AgX => {
-            let lut = loaded(LazyLock::force(&AGX_BASE_SRGB))?;
-            let decoded = lut
-                .sample(position)
-                .map(|value| fast_pow(value, DECODE_EXPONENT));
-            Ok(srgb_encode(decoded))
-        }
-        _ => {
-            let rec2020 = loaded(LazyLock::force(&AGX_BASE_REC2020))?;
-            let palette = loaded(LazyLock::force(&AGX_FALSE_COLOR))?;
-            let linear = rec2020
-                .sample(position)
-                .map(|value| fast_pow(value, DECODE_EXPONENT));
-            let weight = FALSE_COLOR_LUMA.map(|value| value as f32);
-            let luma = mat3(linear, &[weight, weight, weight])[0];
-            let palette_position = fast_pow(luma, (1.0 / FALSE_COLOR_EXPONENT) as f32);
-            let colour =
-                std::array::from_fn(|channel| palette.sample_channel(palette_position, channel));
-            Ok(srgb_encode(
-                colour.map(|value| fast_pow(value, DECODE_EXPONENT)),
-            ))
-        }
+    if view == ViewTransform::AgX {
+        let lut = loaded(LazyLock::force(&AGX_BASE_SRGB))?;
+        let decoded = lut
+            .sample(position)
+            .map(|value| fast_pow(value, DECODE_EXPONENT));
+        Ok(srgb_encode(decoded))
+    } else {
+        let rec2020 = loaded(LazyLock::force(&AGX_BASE_REC2020))?;
+        let palette = loaded(LazyLock::force(&AGX_FALSE_COLOR))?;
+        let linear = rec2020
+            .sample(position)
+            .map(|value| fast_pow(value, DECODE_EXPONENT));
+        let weight = FALSE_COLOR_LUMA.map(|value| value as f32);
+        let luma = mat3(linear, &[weight, weight, weight])[0];
+        let palette_position = fast_pow(luma, (1.0 / FALSE_COLOR_EXPONENT) as f32);
+        let colour =
+            std::array::from_fn(|channel| palette.sample_channel(palette_position, channel));
+        Ok(srgb_encode(
+            colour.map(|value| fast_pow(value, DECODE_EXPONENT)),
+        ))
     }
 }
 
@@ -882,18 +898,21 @@ mod tests {
         [0.02, 0.5, 4.0],
     ];
 
-    /// Float bound per view, from the fused-versus-unfused spread and the Blender residual of the
-    /// emulation (see `color/looks.rs`): Filmic 1e-6, AgX 2e-5, False Color 4e-3 (palette steps).
+    /// Blender cross-platform output differences: `AgX` 2.1e-5, False Color 3.5e-3. Base views use 1e-6.
     fn probed_tolerance(view: ViewTransform) -> f64 {
         match view {
-            ViewTransform::FalseColor => 4.0e-3,
-            ViewTransform::AgX => 2.0e-5,
+            ViewTransform::FalseColor => 3.5e-3,
+            ViewTransform::AgX => 2.1e-5,
             ViewTransform::Standard | ViewTransform::Filmic | ViewTransform::Raw => 1.0e-6,
         }
     }
 
     /// Blender 5.2.2 probe values (OCIO 2.5.0, default CPU processor, per pixel) for every primary-view
     /// look at both settings, clamped to `[0, 1]`.
+    #[expect(
+        clippy::unreadable_literal,
+        reason = "the Blender-probed outputs are recorded as exact float data"
+    )]
     const PROBED: &[Probed] = &[
         probed(
             ViewTransform::Filmic,
@@ -1603,11 +1622,11 @@ mod tests {
             let tolerance = probed_tolerance(row.view);
             for (sample, expected) in SAMPLES.iter().zip(row.expected) {
                 let encoded = display_view(row.view, look, row.exposure, *sample)?;
-                let graded = if row.gamma != 1.0 {
+                let graded = if row.gamma == 1.0 {
+                    encoded
+                } else {
                     let exponent = (1.0 / row.gamma) as f32;
                     encoded.map(|value| fast_pow(value, exponent))
-                } else {
-                    encoded
                 };
                 for channel in 0..3 {
                     let value = f64::from(graded[channel].clamp(0.0, 1.0));
