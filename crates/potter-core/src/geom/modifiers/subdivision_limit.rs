@@ -106,14 +106,19 @@ fn base_level(polygons: &[Polygon], points: &[DVec3], sharpness: &BaseSharpness)
                 level.edge_sharpness[edge] = edges.get(&(a, b)).copied().unwrap_or(0.0);
             }
             level.vertex_sharpness.clone_from_slice(vertices);
-            // A vertex with two edges is as sharp as the smaller of their creases, read before
-            // `derive_base_tags` sharpens the boundary edges infinitely.
+            // Blender's `assignComponentTags` (intern/opensubdiv/internal/topology/
+            // topology_refiner_factory.cc:238-244): a vertex with two edges adds the smaller of their
+            // sharpnesses to its own (`crease_vert`), clamped to 10. It reads the edge sharpness set
+            // from `crease_edge` before `derive_base_tags` makes boundary edges infinite.
             for (vertex, edges_at) in level.vertex_edges.iter().enumerate() {
                 if let &[a, b] = edges_at.as_slice() {
                     let crease = level.edge_sharpness[a].min(level.edge_sharpness[b]);
-                    level.vertex_sharpness[vertex] = level.vertex_sharpness[vertex].max(crease);
+                    level.vertex_sharpness[vertex] =
+                        (level.vertex_sharpness[vertex] + crease).min(SHARPNESS_INFINITE);
                 }
             }
+            // Endpoints of loose edges are infinitely sharp (subdiv_converter_mesh.cc:346-353 sets
+            // `infinite_sharp_vertices_map`; topology_refiner_factory.cc:221-225 applies it).
             for &[a, b] in *loose_edges {
                 level.vertex_sharpness[a] = SHARPNESS_INFINITE;
                 level.vertex_sharpness[b] = SHARPNESS_INFINITE;

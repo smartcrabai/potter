@@ -211,6 +211,12 @@ def fixture_set():
                                           [(a, b, 0.2) for a, b in all_edges(cube_faces)])
     meshes["quad_all_crease"] = make_mesh(quad_vertices, [[0, 1, 2, 3]], [(0, 1), (2, 3)],
                                           [(a, b, 1.0) for a, b in all_edges([[0, 1, 2, 3]])])
+    # Vertex 0 has two creased edges (0.8 each) and its own vertex crease (0.5). Blender adds the
+    # smaller edge sharpness to the vertex's own sharpness, clamped to 10 (topology_refiner_factory.cc
+    # 238-244): 2.5 + 6.4 = 8.9. Taking only the larger value would give 6.4.
+    meshes["quad_vertex_corner"] = make_mesh(quad_vertices, [[0, 1, 2, 3]], [],
+                                             [(0, 1, 0.8), (0, 3, 0.8)],
+                                             vertex_creases=[(0, 0.5)])
     meshes["loose_corner"] = make_mesh(quad_vertices + [[2.0, 0.2, 0.3]], [[0, 1, 2, 3]],
                                        [(0, 1), (2, 3)], loose_edges=[(2, 4)])
     meshes["cube_rotated_storage"] = make_mesh(cube_vertices, cube_faces, cube_seams,
@@ -380,6 +386,11 @@ def build_cases():
     for level in (1, 2):
         add(f"plane_border_crease_l{level}", "plane_border_crease", levels=level, use_creases=True)
         add(f"quad_all_crease_l{level}", "quad_all_crease", levels=level, use_creases=True)
+    # A vertex crease combined with two creased edges at the same corner: the vertex takes its own
+    # sharpness plus the smaller edge sharpness (Blender topology_refiner_factory.cc 238-244).
+    for level, limit in ((1, True), (2, True), (1, False)):
+        add(f"quad_vertex_corner_l{level}{'' if limit else '_nolimit'}", "quad_vertex_corner",
+            levels=level, use_creases=True, use_limit_surface=limit)
     # A loose edge touching face corner 2 makes that corner infinitely sharp.
     add("loose_corner_l1_q2", "loose_corner", levels=1, quality=2, use_creases=True)
     add("loose_corner_l2_q4", "loose_corner", levels=2, quality=4, use_creases=True)

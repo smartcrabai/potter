@@ -6104,11 +6104,12 @@ mod tests {
 
     #[test]
     fn subdivision_budget_counts_uv_layers() {
-        // A 50x50 quad grid at level 5: 10_000 corners, about 2.82e9 bytes without UVs and 2.66e9 per
-        // UV layer. Two layers still fit the 8 GiB budget; four do not.
-        assert!(check_subdivision_budget(10_000, 2_601, 5_100, 5, 0).is_ok());
-        assert!(check_subdivision_budget(10_000, 2_601, 5_100, 5, 2).is_ok());
-        let error = check_subdivision_budget(10_000, 2_601, 5_100, 5, 4).unwrap_err();
+        // A 50x50 quad grid at level 4: 2.56M output corners, about 0.70e9 bytes without UVs and
+        // 2.62e9 per UV layer at 1,024 bytes per corner. Two layers still fit the 8 GiB budget; four
+        // do not.
+        assert!(check_subdivision_budget(10_000, 2_601, 5_100, 4, 0).is_ok());
+        assert!(check_subdivision_budget(10_000, 2_601, 5_100, 4, 2).is_ok());
+        let error = check_subdivision_budget(10_000, 2_601, 5_100, 4, 4).unwrap_err();
         assert_eq!(error.code, ErrorCode::LimitExceeded);
     }
 
