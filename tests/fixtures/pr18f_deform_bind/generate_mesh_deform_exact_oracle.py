@@ -72,10 +72,10 @@ def subject_grid(name):
 
 
 def cage_box(name, corners, transform=True):
-    # Winding is reversed so the face normals point outward. Mesh Deform's inside test needs outward
-    # normals: with the opposite winding, Blender classifies every subject vertex as outside and the
-    # bound subject never moves. Vertex indices are unchanged, so the Rust cage moves still apply.
-    faces = [(3, 2, 1, 0), (5, 6, 7, 4), (1, 5, 4, 0), (2, 6, 5, 1), (3, 7, 6, 2), (0, 4, 7, 3)]
+    # The face list is Potter's `Mesh::box_mesh` list exactly, including each polygon's starting corner:
+    # Blender's corner-triangle diagonal depends on it. Its winding is outward (normals point away from the
+    # box), which Mesh Deform's inside test requires.
+    faces = [(0, 3, 2, 1), (4, 5, 6, 7), (0, 1, 5, 4), (1, 2, 6, 5), (2, 3, 7, 6), (3, 0, 4, 7)]
     mesh = bpy.data.meshes.new(name + "Mesh")
     mesh.from_pydata(list(corners), [], faces)
     obj = bpy.data.objects.new(name, mesh)
