@@ -5245,8 +5245,10 @@ mod tests {
             )],
         )
         .unwrap();
-        assert_eq!(result.vertices.len(), 8);
-        assert_eq!(result.faces.len(), 6);
+        // Blender merges each copy only into its own original, so the mirrored box keeps both
+        // copies of its coincident corners and faces (Blender fixture cube2_x: 16 vertices, 12 faces).
+        assert_eq!(result.vertices.len(), 16);
+        assert_eq!(result.faces.len(), 12);
         assert!(result.validate().is_ok());
 
         let plane_mesh = Mesh::from_positions_and_faces(
@@ -5789,7 +5791,7 @@ mod tests {
             ).unwrap();
             let result = evaluate_modifiers(
                 &mesh,
-                &[with_params("mirror", json!({"use_axis": [true, false, false], "use_mirror_merge": true, "merge_threshold": 0.0}))],
+                &[with_params("mirror", json!({"use_axis": [true, false, false], "use_mirror_merge": true, "merge_threshold": 0.001}))],
             ).unwrap();
             prop_assert_eq!(result.vertices.len(), mesh.vertices.len());
             prop_assert_eq!(result.faces.len(), mesh.faces.len());
