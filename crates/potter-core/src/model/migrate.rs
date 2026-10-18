@@ -243,10 +243,10 @@ fn upgrade_v3(value: &mut Value, root: &Path) -> Result<()> {
     if let Some(images) = value.get_mut("images").and_then(Value::as_object_mut) {
         for image in images.values_mut() {
             // A missing alpha mode deserialises to straight, so it is straight here too.
-            if !image
+            if image
                 .get("alpha_mode")
                 .and_then(Value::as_str)
-                .is_none_or(|mode| mode == "straight")
+                .is_some_and(|mode| mode != "straight")
             {
                 continue;
             }

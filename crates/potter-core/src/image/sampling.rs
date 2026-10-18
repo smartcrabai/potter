@@ -654,7 +654,9 @@ fn finish(mixed: [f64; 4], texels: Texels) -> [f64; 4] {
     // Alpha ignored (`IMA_ALPHA_IGNORE`): the loader made alpha 1, so every read returns 1 (`image_metadata.cpp`).
     let alpha = if texels.ignore_alpha { 1.0 } else { mixed[3] };
     let mut rgb = [mixed[0], mixed[1], mixed[2]];
-    if texels.unassociate && alpha != 0.0 && alpha != 1.0 {
+    // Cycles unassociates for any alpha but 0 and 1 (`alpha != 1.0f && alpha != 0.0f`): outside [0, 1], or strictly inside.
+    let unassociates = alpha < 0.0 || alpha > 1.0 || (alpha > 0.0 && alpha < 1.0);
+    if texels.unassociate && unassociates {
         rgb = rgb.map(|value| value / alpha);
     }
     if texels.transfer == Transfer::SrgbDecoded {
@@ -1001,12 +1003,14 @@ mod tests {
         );
     }
 
-    /// Round to half: a value of 1.0 is exact, and anything at or above 65520 overflows to infinity.
+    /// Round to half: a value of 1.0 is exact, and a magnitude above the largest half (65504) clamps to it, as Cycles'
+    /// `float_to_half_image` does.
     #[test]
-    fn round_to_half_is_ties_to_even_and_overflows_to_infinity() {
+    fn round_to_half_is_ties_to_even_and_clamps_to_the_largest_half() {
         assert!((round_to_half(1.0) - 1.0).abs() < 1.0e-15);
-        assert!(round_to_half(65_520.0).is_infinite());
-        assert!(round_to_half(65_504.0).is_finite());
+        assert!((round_to_half(65_520.0) - 65_504.0).abs() < 1.0e-9);
+        assert!((round_to_half(-1.0e6) + 65_504.0).abs() < 1.0e-9);
+        assert!((round_to_half(65_504.0) - 65_504.0).abs() < 1.0e-9);
     }
 
     /// A Non-Color image is read as stored, with neither a premultiply nor an unassociate, whichever Alpha link.
@@ -1445,7 +1449,9 @@ mod tests {
                 return Err(format!("unclassified texel family in {stem}").into());
             };
             let pixels: Vec<[f64; 4]> = file
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|texel| {
                     let colour = |value: f64| {
                         if srgb {

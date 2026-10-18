@@ -586,7 +586,7 @@ fn schema_v1_fixture_upgrades_on_apply_without_retired_keys() -> TestResult {
     assert_eq!(applied["ok"], true, "{applied}");
     let document = read_json(&scene.join("scene.json"))?;
     assert_eq!(
-        document["schema_version"], 3,
+        document["schema_version"], 4,
         "apply writes the current schema"
     );
     let mesh = stored_oracle_or_cube(&document)?;

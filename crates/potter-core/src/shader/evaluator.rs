@@ -887,7 +887,7 @@ struct Evaluator<'graph, 'material, 'registry, 'workspace, 'prepared> {
     alpha_linked_images: &'prepared BTreeSet<Id>,
 }
 
-impl<'graph, 'registry> Evaluator<'graph, '_, 'registry, '_, '_> {
+impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
     fn input(&mut self, node_id: &Id, socket: &str, kind: ValueKind) -> Result<Value> {
         let node = self.node(node_id)?;
         let incoming =
