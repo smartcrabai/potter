@@ -56,7 +56,7 @@ const VIEWS: [(ViewTransform, &str, &str); 5] = [
 /// Float bound for display values in `[0, 1]`, per view. Each bound is about 2.5 times the largest
 /// fused-versus-unfused difference measured over these samples and settings, or at least `1e-6`.
 /// The 3e-3 `FalseColor` bound covers the palette step, where the lerp slope is about 2000 per unit.
-/// Linux x86_64 may round the scalar paths differently from macOS arm64; CI decides whether the bound
+/// Linux `x86_64` may round the scalar paths differently from macOS arm64; CI decides whether the bound
 /// holds there, and the one-byte check is kept as well.
 fn float_tolerance(view: ViewTransform) -> f64 {
     match view {
