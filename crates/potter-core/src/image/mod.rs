@@ -8,6 +8,6 @@ pub use storage::{
 };
 
 pub use sampling::{
-    ImageData, ImageExtension, ImageInterpolation, ImageTileData, sample, sample_encoded,
-    sample_with_extension, sample_with_interpolation,
+    ImageData, ImageExtension, ImageInterpolation, ImageStorage, ImageTileData, Precision, sample,
+    sample_encoded, sample_with_extension, sample_with_extension_alpha, sample_with_interpolation,
 };

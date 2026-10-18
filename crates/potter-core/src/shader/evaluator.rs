@@ -624,8 +624,16 @@ fn apply_material_textures(
     if !has_textures {
         return Ok(());
     }
+    // Blender's exporter links a base texture's Alpha only for a non-opaque material, and wires roughness, metallic,
+    // and normal from the texture's Color with Alpha unlinked. Cycles' colour read depends on that link.
     if let Some(texture) = &material.base_color_texture {
-        let pixel = sample_material_texture(texture, hit_ctx, texture_layer(hit_ctx, texture))?;
+        let alpha_linked = material.alpha_mode != "opaque";
+        let pixel = sample_material_texture(
+            texture,
+            hit_ctx,
+            texture_layer(hit_ctx, texture),
+            alpha_linked,
+        )?;
         for (channel, texel) in params.base_color[..3].iter_mut().zip(pixel) {
             *channel *= texel;
         }
@@ -633,15 +641,15 @@ fn apply_material_textures(
     }
     if let Some(texture) = &material.roughness_texture {
         let layer = texture_layer(hit_ctx, texture);
-        params.roughness *= sample_material_texture(texture, hit_ctx, layer)?[0];
+        params.roughness *= sample_material_texture(texture, hit_ctx, layer, false)?[0];
     }
     if let Some(texture) = &material.metallic_texture {
         let layer = texture_layer(hit_ctx, texture);
-        params.metallic *= sample_material_texture(texture, hit_ctx, layer)?[0];
+        params.metallic *= sample_material_texture(texture, hit_ctx, layer, false)?[0];
     }
     if let Some(texture) = &material.normal_texture {
         let layer = texture_layer(hit_ctx, texture);
-        let pixel = sample_material_texture(texture, hit_ctx, layer)?;
+        let pixel = sample_material_texture(texture, hit_ctx, layer, false)?;
         let tangent_normal = normalize_or(
             DVec3::new(
                 pixel[0] * 2.0 - 1.0,
@@ -666,13 +674,15 @@ fn apply_material_textures(
 
 /// Samples an image as Blender's Image Texture node does. `blender_uv` is the V-up coordinate of Blender's
 /// `Vector`: a UDIM tile is routed from it, and the pixel lookup flips it into Potter's V-down storage. Native
-/// material fields and Image Texture nodes both sample through here, so they agree at every edge.
+/// material fields and Image Texture nodes both sample through here, so they agree at every edge. `alpha_linked` is
+/// whether the node's Alpha output is linked, which decides whether Cycles unassociates the colour.
 fn sample_image_texel(
     image: &ImageData,
     blender_uv: [f64; 2],
     tile: u32,
     interpolation: ImageInterpolation,
     extension: ImageExtension,
+    alpha_linked: bool,
 ) -> [f64; 4] {
     let pixel_uv = if tile == 0 {
         [blender_uv[0], 1.0 - blender_uv[1]]
@@ -682,13 +692,22 @@ fn sample_image_texel(
             1.0 - blender_uv[1].rem_euclid(1.0),
         ]
     };
-    sample_with_extension(image, blender_uv, pixel_uv, tile, interpolation, extension)
+    sample_with_extension_alpha(
+        image,
+        blender_uv,
+        pixel_uv,
+        tile,
+        interpolation,
+        extension,
+        alpha_linked,
+    )
 }
 
 fn sample_material_texture(
     texture: &TextureRef,
     hit_ctx: &HitContext<'_>,
     layer: Option<usize>,
+    alpha_linked: bool,
 ) -> Result<[f64; 4]> {
     let image_id = texture.image.as_str();
     let images = hit_ctx.image_data.ok_or_else(|| {
@@ -714,6 +733,7 @@ fn sample_material_texture(
         tile,
         texture.interpolation,
         texture.extension,
+        alpha_linked,
     );
     if pixel.iter().any(|component| !component.is_finite()) {
         return Err(eval_error(format!(
@@ -1193,7 +1213,21 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_> {
                 ));
             }
         };
-        let pixel = sample_image_texel(image, [uv.x, uv.y], tile, interpolation, extension);
+        // Cycles unassociates an Image Texture's colour only when its Alpha output feeds something
+        // (`NODE_IMAGE_ALPHA_UNASSOCIATE`, set in `shader_nodes.cpp`), so the colour read depends on that link.
+        let alpha_linked = self
+            .group
+            .links
+            .iter()
+            .any(|link| link.from_node == *id && link.from_socket == "Alpha");
+        let pixel = sample_image_texel(
+            image,
+            [uv.x, uv.y],
+            tile,
+            interpolation,
+            extension,
+            alpha_linked,
+        );
         if pixel.iter().any(|component| !component.is_finite()) {
             return Err(eval_error(format!(
                 "Image Texture node `{id}` sampled non-finite pixels"
@@ -2410,6 +2444,7 @@ mod tests {
         let images = BTreeMap::from([(
             "image".to_owned(),
             ImageData {
+                storage: Default::default(),
                 width: 8,
                 height: 8,
                 pixels,
@@ -2455,6 +2490,7 @@ mod tests {
         let images = BTreeMap::from([(
             "image".to_owned(),
             ImageData {
+                storage: Default::default(),
                 width: 8,
                 height: 8,
                 pixels,

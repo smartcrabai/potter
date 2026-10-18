@@ -171,6 +171,7 @@ fn texture_material(uv_layer: Option<&str>) -> (Material, BTreeMap<String, Image
         ..Material::default()
     };
     let image = ImageData {
+        storage: Default::default(),
         width: 1,
         height: 1,
         pixels: vec![TEXEL],

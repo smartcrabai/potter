@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     error::{ErrorCode, PotError, Result},
     hash,
-    image::{ImageData, ImageInterpolation, ImageTileData},
-    model::{Image, ImageColorspace},
+    image::{ImageData, ImageInterpolation, ImageStorage, ImageTileData, Precision},
+    model::{Image, ImageAlphaMode, ImageColorspace},
 };
 
 const PIXEL_FORMAT: &str = "potter.rgba_f64.v1";
@@ -102,6 +102,7 @@ pub fn load_image_data_with_staged(
         tiles,
         interpolation,
         srgb,
+        storage: image_storage(image, &base_bytes),
     })
 }
 
@@ -111,6 +112,31 @@ pub fn load_image_data_with_staged(
 /// encode an sRGB-labelled image before Blender reads it.
 pub(crate) fn decodes_srgb(colorspace: ImageColorspace) -> bool {
     colorspace == ImageColorspace::Srgb
+}
+
+/// How Blender stores a loaded image for Image Texture colour reads: a non-colour image is read as stored, and
+/// straight alpha is premultiplied at load for any other colour space (Cycles' image manager).
+fn image_storage(image: &Image, bytes: &[u8]) -> ImageStorage {
+    ImageStorage {
+        data: image.colorspace == ImageColorspace::NonColor,
+        straight_alpha: image.alpha_mode == ImageAlphaMode::Straight,
+        precision: source_precision(bytes),
+    }
+}
+
+/// The precision a stored image is quantised to, which sets the precision of Blender's premultiply at load. A 16-bit
+/// PNG is 16-bit; EXR, Radiance HDR, and Potter's stored pixel format are float; other encodings are 8-bit.
+fn source_precision(bytes: &[u8]) -> Precision {
+    if bytes.first() == Some(&b'{')
+        || bytes.starts_with(&[0x76, 0x2f, 0x31, 0x01])
+        || bytes.starts_with(b"#?")
+    {
+        return Precision::Float;
+    }
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") && bytes.get(24) == Some(&16) {
+        return Precision::Short;
+    }
+    Precision::Byte
 }
 
 /// Decodes supported image encodings into linear RGBA pixels.

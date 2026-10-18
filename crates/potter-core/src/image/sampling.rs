@@ -51,6 +51,32 @@ pub struct ImageData {
     /// and decodes the result, as Cycles does for images it compresses as sRGB (`svm_image_texture` with
     /// `NODE_IMAGE_COMPRESS_AS_SRGB`, set from `ImageMetaData::is_compressible_as_srgb`).
     pub srgb: bool,
+    /// How Blender stores the image's values for Image Texture colour reads.
+    pub storage: ImageStorage,
+}
+
+/// The precision a stored image was quantised to. Blender premultiplies straight alpha at load in the precision of the
+/// buffer it loads: bytes for 8-bit files, 16-bit integers, or floats.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Precision {
+    Byte,
+    Short,
+    #[default]
+    Float,
+}
+
+/// How Blender stores an image for Image Texture colour reads, from its colour space, alpha mode, and bit depth.
+/// Cycles' image manager premultiplies straight alpha for a non-data image when it loads it, so a colour read whose
+/// Alpha output is unlinked returns premultiplied values. Verified against Blender 5.2.2 renders of straight-alpha
+/// 8-bit sRGB and Non-Color images (`tests/fixtures/alpha_texture`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ImageStorage {
+    /// A non-colour (data) image: values are read as stored, with no premultiply and no unassociate.
+    pub data: bool,
+    /// Straight alpha, which Blender premultiplies at load for a non-data image.
+    pub straight_alpha: bool,
+    /// The precision the premultiply rounds to.
+    pub precision: Precision,
 }
 
 const TRANSPARENT_BLACK: [f64; 4] = [0.0; 4];
@@ -67,27 +93,76 @@ enum Transfer {
     SrgbEncoded,
 }
 
+/// Which read of the stored image a sample makes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Read {
+    /// A modifier mask (`BKE_texture_get_value`): straight values, decoded to linear light for colour channels.
+    Decoded,
+    /// The mask's intensity channel: straight encoded values, not decoded.
+    Encoded,
+    /// An Image Texture colour output (`svm_image_texture`). `alpha_linked` is whether the node's Alpha output is linked,
+    /// which is when Cycles unassociates the colour.
+    Colour { alpha_linked: bool },
+}
+
+/// How one sample premultiplies, mixes, and finishes its texels for a [`Read`] of an image.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Texels {
+    transfer: Transfer,
+    /// The stored colour is premultiplied by alpha, rounded to this precision, before mixing.
+    premultiply: Option<Precision>,
+    /// The mixed colour is divided by the mixed alpha, as Cycles unassociates a linked Alpha output.
+    unassociate: bool,
+}
+
+impl Texels {
+    fn new(srgb: bool, storage: ImageStorage, read: Read) -> Self {
+        let transfer = match read {
+            Read::Encoded if srgb => Transfer::SrgbEncoded,
+            Read::Decoded | Read::Colour { .. } if srgb => Transfer::SrgbDecoded,
+            _ => Transfer::Linear,
+        };
+        let colour = matches!(read, Read::Colour { .. });
+        // Blender keeps 8-bit and 16-bit sRGB buffers at their precision; other colour spaces load as half float, which
+        // this model does not round to (the oracle set covers sRGB and Non-Color only).
+        let precision = if srgb {
+            storage.precision
+        } else {
+            Precision::Float
+        };
+        let premultiply = (colour && storage.straight_alpha && !storage.data).then_some(precision);
+        let unassociate = matches!(read, Read::Colour { alpha_linked: true }) && !storage.data;
+        Self {
+            transfer,
+            premultiply,
+            unassociate,
+        }
+    }
+}
+
 /// Samples an image at a normalized UV coordinate, with the colour rule of Blender's texture modifiers: an sRGB
 /// image's encoded texels are mixed, and the result is decoded to linear light. Blender's `BKE_texture_get_value`
-/// reads the encoded bytes (`ibuf_get_color`), mixes them in `boxsample` (a one-texel box, which is the bilinear
-/// weighting), and then converts the colour channels with `IMB_colormanagement_colorspace_to_scene_linear_v3`.
+/// reads the straight encoded bytes (`ibuf_get_color`), mixes them in `boxsample` (a one-texel box, which is the
+/// bilinear weighting), and then converts the colour channels with `IMB_colormanagement_colorspace_to_scene_linear_v3`.
+/// The modifier reader does not premultiply.
 ///
 /// Tile zero samples the base image directly. Positive tiles are treated as UDIM
 /// base tiles, with integer UV offsets selecting neighboring tiles.
 #[must_use]
 pub fn sample(data: &ImageData, uv: [f64; 2], tile: u32) -> [f64; 4] {
-    sample_image(data, uv, tile, data.interpolation, Transfer::SrgbDecoded)
+    sample_image(data, uv, tile, data.interpolation, Read::Decoded)
 }
 
-/// Samples an image's stored values as Blender's intensity channel reads them: an sRGB image's encoded texels are
-/// mixed and returned encoded, with no decode. Other images return the same values as [`sample`].
+/// Samples an image's straight stored values as Blender's intensity channel reads them: an sRGB image's encoded texels
+/// are mixed and returned encoded, with no decode. Other images return the same values as [`sample`].
 #[must_use]
 pub fn sample_encoded(data: &ImageData, uv: [f64; 2], tile: u32) -> [f64; 4] {
-    sample_image(data, uv, tile, data.interpolation, Transfer::SrgbEncoded)
+    sample_image(data, uv, tile, data.interpolation, Read::Encoded)
 }
 
-/// Samples an image with an explicit interpolation mode, as a Cycles image texture does: an sRGB image's encoded texels
-/// are interpolated and the result is decoded (`svm_image_texture`), without copying the image data.
+/// Samples an image's colour as an Image Texture node does, with its Alpha output unlinked: the stored values are
+/// premultiplied (for a straight-alpha non-data image) and mixed encoded, then decoded for sRGB. Used by the world
+/// environment, whose Alpha output is not wired.
 #[must_use]
 pub fn sample_with_interpolation(
     data: &ImageData,
@@ -95,7 +170,15 @@ pub fn sample_with_interpolation(
     tile: u32,
     interpolation: ImageInterpolation,
 ) -> [f64; 4] {
-    sample_image(data, uv, tile, interpolation, Transfer::SrgbDecoded)
+    sample_image(
+        data,
+        uv,
+        tile,
+        interpolation,
+        Read::Colour {
+            alpha_linked: false,
+        },
+    )
 }
 
 fn sample_image(
@@ -103,7 +186,7 @@ fn sample_image(
     uv: [f64; 2],
     tile: u32,
     interpolation: ImageInterpolation,
-    transfer: Transfer,
+    read: Read,
 ) -> [f64; 4] {
     if !uv[0].is_finite() || !uv[1].is_finite() {
         return TRANSPARENT_BLACK;
@@ -123,22 +206,15 @@ fn sample_image(
     let u = local_uv[0].clamp(0.0, 1.0);
     let v = local_uv[1].clamp(0.0, 1.0);
 
-    // Only sRGB-encoded images have a transfer; the others are mixed as stored.
-    let transfer = if image.srgb {
-        transfer
-    } else {
-        Transfer::Linear
-    };
+    let texels = Texels::new(image.srgb, image.storage, read);
     match interpolation {
-        ImageInterpolation::Linear => sample_linear(image.pixels, width, height, u, v, transfer),
-        ImageInterpolation::Closest => sample_closest(image.pixels, width, height, u, v, transfer),
+        ImageInterpolation::Linear => sample_linear(image.pixels, width, height, u, v, texels),
+        ImageInterpolation::Closest => sample_closest(image.pixels, width, height, u, v, texels),
     }
 }
 
-/// Samples an image using separate UVs for UDIM routing and pixel lookup.
-///
-/// `routing_uv` selects the UDIM tile. `pixel_uv` is the full-image UV for tile zero and the
-/// tile-local V-down UV for positive base tiles.
+/// Samples an image as an Image Texture node reads it, with the node's Alpha output unlinked. See
+/// [`sample_with_extension_alpha`].
 #[must_use]
 pub fn sample_with_extension(
     data: &ImageData,
@@ -147,6 +223,32 @@ pub fn sample_with_extension(
     tile: u32,
     interpolation: ImageInterpolation,
     extension: ImageExtension,
+) -> [f64; 4] {
+    sample_with_extension_alpha(
+        data,
+        routing_uv,
+        pixel_uv,
+        tile,
+        interpolation,
+        extension,
+        false,
+    )
+}
+
+/// Samples an image using separate UVs for UDIM routing and pixel lookup, as an Image Texture node reads it.
+///
+/// `routing_uv` selects the UDIM tile. `pixel_uv` is the full-image UV for tile zero and the
+/// tile-local V-down UV for positive base tiles. `alpha_linked` is whether the node's Alpha output is linked, which
+/// is when Cycles unassociates the colour (see [`ImageStorage`]).
+#[must_use]
+pub fn sample_with_extension_alpha(
+    data: &ImageData,
+    routing_uv: [f64; 2],
+    pixel_uv: [f64; 2],
+    tile: u32,
+    interpolation: ImageInterpolation,
+    extension: ImageExtension,
+    alpha_linked: bool,
 ) -> [f64; 4] {
     if !pixel_uv[0].is_finite()
         || !pixel_uv[1].is_finite()
@@ -174,12 +276,7 @@ pub fn sample_with_extension(
         ImageExtension::Mirror => [pixel_uv[0].rem_euclid(2.0), pixel_uv[1].rem_euclid(2.0)],
     };
 
-    // Image Texture nodes decode sRGB after mixing the encoded texels (`svm_image_texture`).
-    let transfer = if image.srgb {
-        Transfer::SrgbDecoded
-    } else {
-        Transfer::Linear
-    };
+    let texels = Texels::new(image.srgb, image.storage, Read::Colour { alpha_linked });
     match interpolation {
         ImageInterpolation::Linear => sample_linear_with_extension(
             image.pixels,
@@ -188,7 +285,7 @@ pub fn sample_with_extension(
             local_uv[0],
             local_uv[1],
             extension,
-            transfer,
+            texels,
         ),
         ImageInterpolation::Closest => sample_closest_with_extension(
             image.pixels,
@@ -197,7 +294,7 @@ pub fn sample_with_extension(
             local_uv[0],
             local_uv[1],
             extension,
-            transfer,
+            texels,
         ),
     }
 }
@@ -209,6 +306,7 @@ fn image_for_uv(data: &ImageData, uv: [f64; 2], tile: u32) -> Option<ImageTileDa
             height: data.height,
             pixels: &data.pixels,
             srgb: data.srgb,
+            storage: data.storage,
         })
     } else {
         let actual_tile = udim_tile(tile, uv)?;
@@ -220,6 +318,7 @@ fn image_for_uv(data: &ImageData, uv: [f64; 2], tile: u32) -> Option<ImageTileDa
                         height: data.height,
                         pixels: &data.pixels,
                         srgb: data.srgb,
+                        storage: data.storage,
                     }
                 } else {
                     ImageTileDataRef {
@@ -227,6 +326,7 @@ fn image_for_uv(data: &ImageData, uv: [f64; 2], tile: u32) -> Option<ImageTileDa
                         height: 0,
                         pixels: &[],
                         srgb: false,
+                        storage: ImageStorage::default(),
                     }
                 }
             },
@@ -235,6 +335,7 @@ fn image_for_uv(data: &ImageData, uv: [f64; 2], tile: u32) -> Option<ImageTileDa
                 height: image.height,
                 pixels: &image.pixels,
                 srgb: image.srgb,
+                storage: data.storage,
             },
         );
         Some(image)
@@ -246,6 +347,7 @@ struct ImageTileDataRef<'a> {
     height: u32,
     pixels: &'a [[f64; 4]],
     srgb: bool,
+    storage: ImageStorage,
 }
 
 impl ImageTileDataRef<'_> {
@@ -295,11 +397,11 @@ fn sample_closest(
     height: usize,
     u: f64,
     v: f64,
-    transfer: Transfer,
+    texels: Texels,
 ) -> [f64; 4] {
     let x = ((u * width as f64).floor() as usize).min(width - 1);
     let y = ((v * height as f64).floor() as usize).min(height - 1);
-    closest_texel(pixel(pixels, width, x, y), transfer)
+    finish(stored_texel(pixel(pixels, width, x, y), texels), texels)
 }
 
 #[expect(
@@ -313,7 +415,7 @@ fn sample_linear(
     height: usize,
     u: f64,
     v: f64,
-    transfer: Transfer,
+    texels: Texels,
 ) -> [f64; 4] {
     let x = (u * width as f64 - 0.5).clamp(0.0, (width - 1) as f64);
     let y = (v * height as f64 - 0.5).clamp(0.0, (height - 1) as f64);
@@ -324,10 +426,10 @@ fn sample_linear(
     let tx = x - x0 as f64;
     let ty = y - y0 as f64;
 
-    let texel = |x: usize, y: usize| interpolated_texel(pixel(pixels, width, x, y), transfer);
+    let texel = |x: usize, y: usize| stored_texel(pixel(pixels, width, x, y), texels);
     let top = mix(texel(x0, y0), texel(x1, y0), tx);
     let bottom = mix(texel(x0, y1), texel(x1, y1), tx);
-    decode_interpolated(mix(top, bottom, ty), transfer)
+    finish(mix(top, bottom, ty), texels)
 }
 
 #[expect(
@@ -341,7 +443,7 @@ fn sample_closest_with_extension(
     u: f64,
     v: f64,
     extension: ImageExtension,
-    transfer: Transfer,
+    texels: Texels,
 ) -> [f64; 4] {
     let Some(mut x) = floor_to_i64(u * width as f64) else {
         return TRANSPARENT_BLACK;
@@ -356,9 +458,12 @@ fn sample_closest_with_extension(
         x = x.min(width - 1);
         y = y.min(height - 1);
     }
-    closest_texel(
-        pixel_with_extension(pixels, width, height, x, y, extension),
-        transfer,
+    finish(
+        stored_texel(
+            pixel_with_extension(pixels, width, height, x, y, extension),
+            texels,
+        ),
+        texels,
     )
 }
 
@@ -373,7 +478,7 @@ fn sample_linear_with_extension(
     u: f64,
     v: f64,
     extension: ImageExtension,
-    transfer: Transfer,
+    texels: Texels,
 ) -> [f64; 4] {
     let x = u * width as f64 - 0.5;
     let y = v * height as f64 - 0.5;
@@ -389,51 +494,57 @@ fn sample_linear_with_extension(
     let ty = y - y0 as f64;
 
     let texel = |x: i64, y: i64| {
-        interpolated_texel(
+        stored_texel(
             pixel_with_extension(pixels, width, height, x, y, extension),
-            transfer,
+            texels,
         )
     };
     let top = mix(texel(x0, y0), texel(x1, y0), tx);
     let bottom = mix(texel(x0, y1), texel(x1, y1), tx);
-    decode_interpolated(mix(top, bottom, ty), transfer)
+    finish(mix(top, bottom, ty), texels)
 }
 
-/// The value an interpolated lookup mixes for one texel. An sRGB image mixes its encoded texel, which is the value
-/// Cycles stores and interpolates (`svm_image_texture`). The encode is the exact inverse of the load decode, so a
-/// texel round-trips to its stored value.
-fn interpolated_texel(linear: [f64; 4], transfer: Transfer) -> [f64; 4] {
-    if transfer == Transfer::Linear {
-        return linear;
+/// One texel as Blender's stored buffer holds it, before mixing. An sRGB image's texel is encoded, which is the value
+/// Cycles interpolates (`svm_image_texture`). Straight alpha is premultiplied when the image loaded, rounded to the
+/// precision of its buffer. The encode is the exact inverse of the load decode, so an unpremultiplied texel round-trips.
+fn stored_texel(linear: [f64; 4], texels: Texels) -> [f64; 4] {
+    let mut rgb = [linear[0], linear[1], linear[2]];
+    if texels.transfer != Transfer::Linear {
+        rgb = rgb.map(linear_to_srgb_unclamped);
     }
-    [
-        linear_to_srgb_unclamped(linear[0]),
-        linear_to_srgb_unclamped(linear[1]),
-        linear_to_srgb_unclamped(linear[2]),
-        linear[3],
-    ]
-}
-
-/// The colour a lookup returns from a mixed value: an sRGB image decoded to linear light, as Cycles does after
-/// interpolating (`color_srgb_to_linear_v4`), or left encoded for the intensity reading. Alpha is unchanged.
-fn decode_interpolated(encoded: [f64; 4], transfer: Transfer) -> [f64; 4] {
-    if transfer != Transfer::SrgbDecoded {
-        return encoded;
+    if let Some(precision) = texels.premultiply {
+        let alpha = linear[3];
+        rgb = rgb.map(|value| quantize(value * alpha, precision));
     }
-    [
-        decode_component(encoded[0]),
-        decode_component(encoded[1]),
-        decode_component(encoded[2]),
-        encoded[3],
-    ]
+    [rgb[0], rgb[1], rgb[2], linear[3]]
 }
 
-/// A closest lookup returns one texel, which Cycles reads through the same encode and decode as a mixed value.
-fn closest_texel(texel: [f64; 4], transfer: Transfer) -> [f64; 4] {
-    decode_interpolated(interpolated_texel(texel, transfer), transfer)
+/// Rounds a premultiplied value to the precision of the buffer it is stored in. Blender's byte buffers premultiply
+/// `c * a / 255` in integers, which is the same as rounding `value * 255` for `value = encoded * alpha`.
+fn quantize(value: f64, precision: Precision) -> f64 {
+    match precision {
+        Precision::Byte => (value * 255.0).round() / 255.0,
+        Precision::Short => (value * 65535.0).round() / 65535.0,
+        Precision::Float => value,
+    }
 }
 
-/// Cycles' f32 sRGB decode of one encoded component, the `color_srgb_to_linear_sse2` path of its kernels.
+/// The colour a lookup returns from a mixed stored value. Cycles unassociates the colour when the Alpha output is
+/// linked (`svm_image_texture`, `NODE_IMAGE_ALPHA_UNASSOCIATE`, only for alpha strictly between 0 and 1), and then
+/// decodes an sRGB image to linear light (`color_srgb_to_linear_v4`). Alpha is unchanged.
+fn finish(mixed: [f64; 4], texels: Texels) -> [f64; 4] {
+    let alpha = mixed[3];
+    let mut rgb = [mixed[0], mixed[1], mixed[2]];
+    if texels.unassociate && alpha > 0.0 && alpha < 1.0 {
+        rgb = rgb.map(|value| value / alpha);
+    }
+    if texels.transfer == Transfer::SrgbDecoded {
+        rgb = rgb.map(decode_component);
+    }
+    [rgb[0], rgb[1], rgb[2], alpha]
+}
+
+/// Cycles' f32 sRGB decode of one component, the `color_srgb_to_linear_sse2` path of its kernels.
 #[expect(
     clippy::cast_possible_truncation,
     reason = "Cycles decodes the interpolated value in f32, so the value is narrowed on purpose"
@@ -503,8 +614,9 @@ fn mix(a: [f64; 4], b: [f64; 4], t: f64) -> [f64; 4] {
 #[cfg(test)]
 mod tests {
     use super::{
-        ImageData, ImageExtension, ImageInterpolation, ImageTileData, sample, sample_encoded,
-        sample_with_extension, sample_with_interpolation,
+        ImageData, ImageExtension, ImageInterpolation, ImageStorage, ImageTileData, Precision,
+        sample, sample_encoded, sample_with_extension, sample_with_extension_alpha,
+        sample_with_interpolation,
     };
     use std::collections::BTreeMap;
 
@@ -521,6 +633,7 @@ mod tests {
             tiles: BTreeMap::new(),
             interpolation,
             srgb: false,
+            storage: ImageStorage::default(),
         }
     }
 
@@ -539,12 +652,130 @@ mod tests {
             tiles: BTreeMap::new(),
             interpolation: ImageInterpolation::Linear,
             srgb: true,
+            storage: ImageStorage::default(),
         }
     }
 
     /// Cycles' f32 decode of an encoded value, the expectation for an sRGB lookup.
     fn cycles_decode(encoded: f32) -> f64 {
         f64::from(crate::color::cycles_srgb_to_linear(encoded))
+    }
+
+    /// The two-texel 8-bit sRGB image of the blend round-trip test: pixel 0 is `[128, 40, 0, 128]` with straight alpha,
+    /// pixel 1 is `[64, 0, 255, 255]`. `storage` says how the loader stored it.
+    fn alpha_texels(srgb: bool, storage: ImageStorage) -> ImageData {
+        let decode = |byte: f64| crate::color::srgb_to_linear(byte / 255.0);
+        let pixels = if srgb {
+            vec![
+                [decode(128.0), decode(40.0), 0.0, 128.0 / 255.0],
+                [decode(64.0), 0.0, 1.0, 1.0],
+            ]
+        } else {
+            vec![
+                [128.0 / 255.0, 40.0 / 255.0, 0.0, 128.0 / 255.0],
+                [64.0 / 255.0, 0.0, 1.0, 1.0],
+            ]
+        };
+        ImageData {
+            width: 2,
+            height: 1,
+            pixels,
+            tiles: BTreeMap::new(),
+            interpolation: ImageInterpolation::Linear,
+            srgb,
+            storage,
+        }
+    }
+
+    /// Blender 5.2.2 renders of this texel (`tests/fixtures/alpha_texture`, sRGB, Closest, Repeat, texel 0): the stored
+    /// value is premultiplied at load, so an unlinked Alpha reads `decode(round(enc * alpha))`, and a linked Alpha
+    /// unassociates it first. The oracle residual of this model is 6e-7 over its ramp.
+    #[test]
+    fn straight_alpha_srgb_texel_is_premultiplied_unless_its_alpha_is_linked() {
+        let image = alpha_texels(
+            true,
+            ImageStorage {
+                data: false,
+                straight_alpha: true,
+                precision: Precision::Byte,
+            },
+        );
+        let unlinked = sample_with_extension_alpha(
+            &image,
+            [0.1, 0.5],
+            [0.1, 0.5],
+            0,
+            ImageInterpolation::Closest,
+            ImageExtension::Repeat,
+            false,
+        );
+        assert!(
+            (unlinked[0] - 0.051_269).abs() < 1.0e-5,
+            "unlinked red is {}",
+            unlinked[0]
+        );
+        assert!(
+            (unlinked[1] - 0.006_995).abs() < 1.0e-5,
+            "unlinked green is {}",
+            unlinked[1]
+        );
+        assert!(
+            (unlinked[3] - 128.0 / 255.0).abs() < 1.0e-12,
+            "alpha is not premultiplied"
+        );
+        let linked = sample_with_extension_alpha(
+            &image,
+            [0.1, 0.5],
+            [0.1, 0.5],
+            0,
+            ImageInterpolation::Closest,
+            ImageExtension::Repeat,
+            true,
+        );
+        assert!(
+            (linked[0] - 0.214_041).abs() < 1.0e-5,
+            "linked red is {}",
+            linked[0]
+        );
+        assert!(
+            (linked[1] - 0.021_072).abs() < 1.0e-5,
+            "linked green is {}",
+            linked[1]
+        );
+    }
+
+    /// A Non-Color image is read as stored, with neither a premultiply nor an unassociate, whichever Alpha link.
+    #[test]
+    fn non_colour_texels_are_read_as_stored_whatever_the_alpha_link() {
+        let image = alpha_texels(
+            false,
+            ImageStorage {
+                data: true,
+                straight_alpha: true,
+                precision: Precision::Byte,
+            },
+        );
+        for linked in [false, true] {
+            let sampled = sample_with_extension_alpha(
+                &image,
+                [0.1, 0.5],
+                [0.1, 0.5],
+                0,
+                ImageInterpolation::Closest,
+                ImageExtension::Repeat,
+                linked,
+            );
+            assert!(
+                (sampled[0] - 128.0 / 255.0).abs() < 1.0e-12,
+                "linked {linked}: red is {}",
+                sampled[0]
+            );
+            assert!(
+                (sampled[1] - 40.0 / 255.0).abs() < 1.0e-12,
+                "linked {linked}: green is {}",
+                sampled[1]
+            );
+        }
     }
 
     #[test]

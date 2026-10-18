@@ -38,6 +38,7 @@ fn link(group: &mut NodeGroup, from: &str, from_socket: &str, to: &str, to_socke
 
 fn image_data(width: u32, height: u32, pixels: Vec<[f64; 4]>) -> ImageData {
     ImageData {
+        storage: Default::default(),
         width,
         height,
         pixels,
@@ -297,6 +298,7 @@ fn image_texture_samples_resolved_pixels_using_hit_uvs() {
     let image_data = BTreeMap::from([(
         "test_image".to_owned(),
         ImageData {
+            storage: Default::default(),
             width: 2,
             height: 1,
             pixels: vec![[1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0]],
@@ -331,6 +333,7 @@ fn image_texture_routes_blender_v_up_udims_and_flips_local_v() {
     let images = BTreeMap::from([(
         "test_image".to_owned(),
         ImageData {
+            storage: Default::default(),
             width: 1,
             height: 1,
             pixels: vec![[0.25, 0.25, 0.25, 1.0]],

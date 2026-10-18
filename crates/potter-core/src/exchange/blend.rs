@@ -10648,6 +10648,7 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
             (
                 normal_image_id.as_str().to_owned(),
                 crate::image::ImageData {
+                    storage: Default::default(),
                     width: 1,
                     height: 1,
                     pixels: vec![[128.0 / 255.0, 192.0 / 255.0, 230.0 / 255.0, 1.0]],
@@ -10659,6 +10660,7 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
             (
                 emissive_image_id.as_str().to_owned(),
                 crate::image::ImageData {
+                    storage: Default::default(),
                     width: 1,
                     height: 1,
                     pixels: vec![[64.0 / 255.0, 128.0 / 255.0, 1.0, 1.0]],
@@ -11173,13 +11175,6 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
             imported.losses
         );
 
-        let srgb = |value: f64| {
-            if value <= 0.04045 {
-                value / 12.92
-            } else {
-                ((value + 0.055) / 1.055).powf(2.4)
-            }
-        };
         let mut reopened_image_data = BTreeMap::new();
         for (image_id, reopened_image) in &imported.doc.images {
             let source_image = doc
@@ -11287,46 +11282,49 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
             [LIGHTMAP[0], LIGHTMAP[1], LIGHTMAP[2]],
         ];
         let close = |left: f64, right: f64| (left - right).abs() < 1.0e-3;
-        // Per pixel, as the evaluator decodes it: sRGB red, green and blue for the shared image; raw for the others.
-        let shared_rgb = [
-            [srgb(128.0 / 255.0), srgb(40.0 / 255.0), 0.0],
-            [srgb(64.0 / 255.0), 0.0, 1.0],
-        ];
-        let shared_alpha = [128.0 / 255.0, 1.0];
-        let metal_red = [128.0 / 255.0, 200.0 / 255.0];
-        // Hit 2 extrapolates the Lightmap u to 1.06. It clamps to the edge pixel 1, where a repeat would read pixel 0.
+        // Blender 5.2.2 expectations, derived from the alpha oracle set (tests/fixtures/alpha_texture): the Image Texture
+        // colour model that reproduces the oracle to 6e-7, evaluated at each hit's Lightmap UV. Each hit blends the
+        // Lightmap corners with `barycentrics`, giving u = 0.1, 0.9, and 1.06. The field's extension is Repeat, so at
+        // u = 1.06 Closest reads texel 0 and Linear mixes texels 0 and 1. Pixel 0 has alpha 128, which Blender
+        // premultiplies at load. A colour read whose Alpha output is linked is unassociated, and an unlinked one keeps
+        // the premultiplied value. The field's base has its Alpha linked (non-opaque); its roughness and metallic, and
+        // the simple and authored textures, are unlinked. Metallic is Non-Color, so it is read as stored.
         let barycentrics = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [-0.2, 1.2, 0.0]];
-        let pixel_of_hit = [0_usize, 1, 1];
-        let hits = [0_usize, 1, 2];
-        let texel = |hit: usize| shared_rgb[pixel_of_hit[hit]];
-        let metal = |hit: usize| metal_red[pixel_of_hit[hit]];
-        let alpha = |hit: usize| shared_alpha[pixel_of_hit[hit]];
         // (label, material, base, roughness, metallic, alpha), each per hit.
         let cases = [
             (
                 "field",
                 &field_id,
-                hits.map(texel),
-                hits.map(|hit| 0.5 * texel(hit)[0]),
-                hits.map(|hit| 0.75 * metal(hit)),
-                hits.map(|hit| 0.5 * alpha(hit)),
+                [
+                    [0.214041, 0.021072, 0.0],
+                    [0.051269, 0.0, 1.0],
+                    [0.214041, 0.021072, 0.0],
+                ],
+                [0.025635; 3],
+                [0.376471, 0.588235, 0.376471],
+                [0.250980, 0.5, 0.250980],
             ),
             (
                 "simple",
                 &simple_id,
-                hits.map(|hit| texel(hit).map(|value| 0.6 * value)),
-                hits.map(|hit| 0.75 * texel(hit)[0]),
+                [
+                    [0.030762, 0.004197, 0.0],
+                    [0.030762, 0.0, 0.6],
+                    [0.030762, 0.004197, 0.0],
+                ],
+                [0.038452; 3],
                 [0.25; 3],
                 [1.0; 3],
             ),
             (
                 "authored",
                 &authored_id,
-                hits.map(|hit| {
-                    let rgb = texel(hit);
-                    [0.5 * rgb[0], 0.25 * rgb[1], 0.125 * rgb[2]]
-                }),
-                hits.map(|hit| 0.25 * texel(hit)[0]),
+                [
+                    [0.025635, 0.001749, 0.0],
+                    [0.025635, 0.0, 0.125],
+                    [0.025635, 0.001749, 0.0],
+                ],
+                [0.012817; 3],
                 [0.0; 3],
                 [1.0; 3],
             ),
