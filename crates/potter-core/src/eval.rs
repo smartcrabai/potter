@@ -731,11 +731,9 @@ impl Snapshot {
                 .data
                 .as_ref()
                 .and_then(|data_id| doc.data_blocks.get(data_id));
-            // The mesh's own material array (`me->mat`), padded to the evaluated count. Modifiers replace
-            // it (the Boolean TRANSFER pool); the effective table is resolved from it once the stack has run.
-            let mut node_materials = node_data.map_or_else(Vec::new, |data| {
-                crate::model::mesh_slot_array(node.materials.len(), &data.materials)
-            });
+            // The mesh's own material array (DATA). Modifiers replace it (the Boolean TRANSFER pool);
+            // the evaluated table is resolved from it once the stack has run.
+            let mut node_materials = node_data.map_or_else(Vec::new, |data| data.materials.clone());
             let matrix = matrices.get(id).copied().ok_or_else(|| {
                 PotError::new(
                     ErrorCode::InternalError,
