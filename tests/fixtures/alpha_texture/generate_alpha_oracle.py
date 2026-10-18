@@ -102,9 +102,12 @@ def write_png(path, width, height, values, depth):
         )
 
 
-def write_tiff_rgba8(path, width, height, values):
-    """A little-endian baseline TIFF: one uncompressed strip of 8-bit RGBA with straight alpha (ExtraSamples = 2)."""
-    data = bytes(values[: width * height * 4])
+def write_tiff_rgba(path, width, height, values, depth=8):
+    """A little-endian baseline TIFF: one uncompressed strip of RGBA with straight alpha (ExtraSamples = 2), 8-bit or 16-bit."""
+    if depth == 16:
+        data = b"".join(struct.pack("<H", value) for value in values[: width * height * 4])
+    else:
+        data = bytes(values[: width * height * 4])
     strip_offset = 8
     bits_offset = strip_offset + len(data)
     ifd_offset = bits_offset + 8
@@ -129,7 +132,7 @@ def write_tiff_rgba8(path, width, height, values):
         ifd += struct.pack("<HHI", tag, kind, count) + field.ljust(4, b"\x00")
     ifd += struct.pack("<I", 0)
     header = b"II" + struct.pack("<HI", 42, ifd_offset)
-    bits = struct.pack("<HHHH", 8, 8, 8, 8)
+    bits = struct.pack("<HHHH", depth, depth, depth, depth)
     with open(path, "wb") as handle:
         handle.write(header + data + bits + ifd)
 
@@ -151,7 +154,14 @@ elif container == "tiff":
     # file holds exactly these texels and Blender's colour-managed TIFF save is not involved.
     samples = INTEGER_TEXELS[("floor", 8)] if texel_set == "floor" else INTEGER_TEXELS[("base", 8)]
     source_path = os.path.join(work, "alpha_oracle_%s.tif" % tag)
-    write_tiff_rgba8(source_path, 2, 1, samples)
+    write_tiff_rgba(source_path, 2, 1, samples, 8)
+    image = bpy.data.images.load(source_path, check_existing=False)
+elif container == "tiff16":
+    # A 16-bit RGBA TIFF written byte for byte with the 16-bit floor texels: Blender loads it as a ushort buffer, so the
+    # premultiply is the integer floor(c * a / 65535), as for the 16-bit PNG.
+    samples = INTEGER_TEXELS[("floor", 16)]
+    source_path = os.path.join(work, "alpha_oracle_%s.tif" % tag)
+    write_tiff_rgba(source_path, 2, 1, samples, 16)
     image = bpy.data.images.load(source_path, check_existing=False)
 elif container == "exr":
     # Blender writes a 16-bit half EXR from the float texels, rounding each to half precision.
