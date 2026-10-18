@@ -11,20 +11,18 @@
 //! does. Intersection defects on coincident and touching geometry are part of this solver's
 //! behavior; this is not an exact-predicate fallback.
 
-use std::collections::{HashMap, HashSet, VecDeque};
 use std::borrow::Cow;
+use std::collections::{HashMap, HashSet, VecDeque};
 
+use crate::error::{PotError, Result};
 use glam::{DMat4, DVec3, Mat3, Mat4};
 use serde_json::{Value, json};
-use crate::error::{PotError, Result};
 
 use crate::geom::{
-    edge_key,
-    Mesh,
-    attribute_keys,
-    clnor,
+    Mesh, attribute_keys, clnor,
     color_layers::{self, ColorDomain},
     concat::{self, Part},
+    edge_key,
     provenance::{Origin, default_value, remap_attributes},
     triangulate::{BeautyScratch, beautify_with_scratch},
     uv_layers,
@@ -151,8 +149,11 @@ fn float_pair(
         reverse_mesh_faces(&mut operand_frame);
         reverse_corner_attributes(&mut operand_frame);
     }
-    let operand_local_positions: Vec<P3> =
-        operand_frame.vertices.iter().map(|vertex| to_f32(vertex.co)).collect();
+    let operand_local_positions: Vec<P3> = operand_frame
+        .vertices
+        .iter()
+        .map(|vertex| to_f32(vertex.co))
+        .collect();
     for (index, vertex) in operand_frame.vertices.iter_mut().enumerate() {
         let co = to_f32(vertex.co);
         let transformed = transform_point(transform, co);
@@ -168,7 +169,8 @@ fn float_pair(
     let mut subject_frame = Cow::Borrowed(subject);
     if empty_operand_faces {
         for face in &mut subject_frame.to_mut().faces {
-            face.material_index = remap_material_index(&operand.material_remap, face.material_index);
+            face.material_index =
+                remap_material_index(&operand.material_remap, face.material_index);
         }
     }
     for face in &mut operand_frame.faces {
@@ -177,7 +179,12 @@ fn float_pair(
     reduce_operand_metadata(&mut operand_frame);
     reduce_operand_boolean_attributes(&mut operand_frame);
 
-    let mut state = build_state(subject_frame.as_ref(), &operand_frame, &operand_frame, &operand_local_positions)?;
+    let mut state = build_state(
+        subject_frame.as_ref(),
+        &operand_frame,
+        &operand_frame,
+        &operand_local_positions,
+    )?;
     if empty_operand_faces {
         if operand_frame.vertices.is_empty() {
             for (index, vertex) in state.verts.iter_mut().enumerate() {
@@ -189,7 +196,9 @@ fn float_pair(
                 }
                 vertex.co = transformed;
             }
-            for (vertex, state_vertex) in subject_frame.to_mut().vertices.iter_mut().zip(&state.verts) {
+            for (vertex, state_vertex) in
+                subject_frame.to_mut().vertices.iter_mut().zip(&state.verts)
+            {
                 vertex.co = to_dvec3(state_vertex.co);
             }
         }
@@ -206,7 +215,8 @@ fn float_pair(
     classify_faces(&mut state, operation, &bvh_a, &bvh_b);
     dissolve_intersection_vertices(&mut state);
 
-    let has_normal_codes = normal_codes_present(&subject_frame) || normal_codes_present(&operand_frame);
+    let has_normal_codes =
+        normal_codes_present(&subject_frame) || normal_codes_present(&operand_frame);
     let mut source = joined_boolean_source(&subject_frame, &operand_frame)?;
     source.attributes.remove("custom_normal");
     let FloatOutput {
@@ -223,13 +233,7 @@ fn float_pair(
         &polygons,
         &mesh,
     )?;
-    let origin = float_output_origin(
-        &source,
-        &state,
-        &state_vertex_ids,
-        &polygons,
-        &transfers,
-    )?;
+    let origin = float_output_origin(&source, &state, &state_vertex_ids, &polygons, &transfers)?;
     remap_attributes(&source, &mut mesh, &origin)?;
     transfer_float_point_defaults(&source, &mut mesh, &origin.vertices);
     transfer_float_edge_attributes(&source, &mut mesh, &edge_sources);
@@ -262,7 +266,11 @@ fn build_float_output(subject: &Mesh, operand: &Mesh, state: &State) -> Result<F
             .enumerate()
             .map(|(corner, &a)| {
                 let b = face.verts[(corner + 1) % face.verts.len()];
-                state.edge_orig.get(&edge_key_usize(a, b)).copied().unwrap_or(NO_INDEX)
+                state
+                    .edge_orig
+                    .get(&edge_key_usize(a, b))
+                    .copied()
+                    .unwrap_or(NO_INDEX)
             })
             .collect();
         polygons.push(Poly {
@@ -270,8 +278,9 @@ fn build_float_output(subject: &Mesh, operand: &Mesh, state: &State) -> Result<F
                 .verts
                 .iter()
                 .map(|&vertex| {
-                    u32::try_from(vertex)
-                        .map_err(|_| PotError::invalid_argument("Boolean output vertex index overflow"))
+                    u32::try_from(vertex).map_err(|_| {
+                        PotError::invalid_argument("Boolean output vertex index overflow")
+                    })
                 })
                 .collect::<Result<Vec<_>>>()?,
             orig: face.source_face,
@@ -287,7 +296,9 @@ fn build_float_output(subject: &Mesh, operand: &Mesh, state: &State) -> Result<F
             if state_vertex_ids[index].is_none() {
                 let id = mesh
                     .insert_vertex(to_dvec3(state.verts[index].co))
-                    .map_err(|error| PotError::invalid_argument(format!("Boolean output vertex failed: {error}")))?;
+                    .map_err(|error| {
+                        PotError::invalid_argument(format!("Boolean output vertex failed: {error}"))
+                    })?;
                 state_vertex_ids[index] = Some(id);
             }
         }
@@ -308,15 +319,18 @@ fn build_float_output(subject: &Mesh, operand: &Mesh, state: &State) -> Result<F
         let ring = polygon
             .verts
             .iter()
-            .map(|&vertex| state_vertex_ids[vertex as usize].ok_or_else(|| {
-                PotError::invalid_argument("Boolean output face vertex is missing")
-            }))
+            .map(|&vertex| {
+                state_vertex_ids[vertex as usize].ok_or_else(|| {
+                    PotError::invalid_argument("Boolean output face vertex is missing")
+                })
+            })
             .collect::<Result<Vec<_>>>()?;
         face_specs.push((ring, material));
     }
-    mesh.insert_faces(face_specs.into_iter().map(Ok)).map_err(|error| {
-        PotError::invalid_argument(format!("Boolean output faces failed: {error}"))
-    })?;
+    mesh.insert_faces(face_specs.into_iter().map(Ok))
+        .map_err(|error| {
+            PotError::invalid_argument(format!("Boolean output faces failed: {error}"))
+        })?;
 
     let mut face_edges = HashSet::new();
     let mut edge_source_by_output: HashMap<(u32, u32), usize> = HashMap::new();
@@ -366,7 +380,9 @@ fn build_float_output(subject: &Mesh, operand: &Mesh, state: &State) -> Result<F
         if face_edges.contains(&edge) {
             continue;
         }
-        let Some(&source) = state.edge_orig.get(&edge) else { continue };
+        let Some(&source) = state.edge_orig.get(&edge) else {
+            continue;
+        };
         if state.input_loose_edge_sources.contains(&source) {
             loose_edges.push((edge, usize::try_from(source).ok()));
         }
@@ -391,7 +407,9 @@ fn build_float_output(subject: &Mesh, operand: &Mesh, state: &State) -> Result<F
         if loose_vertices.contains(&state_index) && state_vertex_ids[state_index].is_none() {
             let id = mesh
                 .insert_vertex(to_dvec3(state.verts[state_index].co))
-                .map_err(|error| PotError::invalid_argument(format!("Boolean loose vertex failed: {error}")))?;
+                .map_err(|error| {
+                    PotError::invalid_argument(format!("Boolean loose vertex failed: {error}"))
+                })?;
             state_vertex_ids[state_index] = Some(id);
         }
     }
@@ -491,7 +509,6 @@ fn reduce_operand_boolean_attributes(mesh: &mut Mesh) {
     });
 }
 
-
 fn joined_boolean_source(subject: &Mesh, operand: &Mesh) -> Result<Mesh> {
     let mut source = concat::concatenate(vec![
         Part {
@@ -536,7 +553,12 @@ fn transfer_float_joined_defaults(subject: &Mesh, operand: &Mesh, source: &mut M
                 "FLOAT_COLOR" | "BYTE_COLOR" => json!([1.0, 1.0, 1.0, 1.0]),
                 "INT16_2D" => json!([0, 0]),
                 "FLOAT4" => json!([0.0, 0.0, 0.0, 0.0]),
-                "FLOAT4X4" => json!([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]),
+                "FLOAT4X4" => json!([
+                    [1.0, 0.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0, 0.0],
+                    [0.0, 0.0, 1.0, 0.0],
+                    [0.0, 0.0, 0.0, 1.0]
+                ]),
                 "STRING" => json!(""),
                 _ => return None,
             };
@@ -544,20 +566,20 @@ fn transfer_float_joined_defaults(subject: &Mesh, operand: &Mesh, source: &mut M
             ["point", "edge", "face", "corner"]
                 .into_iter()
                 .any(|candidate| domain.eq_ignore_ascii_case(candidate))
-                .then(|| (key.clone(), domain.to_owned(), data_type.to_owned(), default))
+                .then(|| {
+                    (
+                        key.clone(),
+                        domain.to_owned(),
+                        data_type.to_owned(),
+                        default,
+                    )
+                })
         })
         .collect();
     for (key, domain, data_type, default) in named {
         for slot in 0..2 {
             fill_float_named_attribute_default(
-                source,
-                subject,
-                operand,
-                slot,
-                &key,
-                &domain,
-                &data_type,
-                &default,
+                source, subject, operand, slot, &key, &domain, &data_type, &default,
             );
         }
     }
@@ -566,8 +588,16 @@ fn transfer_float_joined_defaults(subject: &Mesh, operand: &Mesh, source: &mut M
     let edge_counts = [subject.edges.len(), operand.edges.len()];
     let face_counts = [subject.faces.len(), operand.faces.len()];
     let corner_counts = [
-        subject.faces.iter().map(|face| face.vertices.len()).sum::<usize>(),
-        operand.faces.iter().map(|face| face.vertices.len()).sum::<usize>(),
+        subject
+            .faces
+            .iter()
+            .map(|face| face.vertices.len())
+            .sum::<usize>(),
+        operand
+            .faces
+            .iter()
+            .map(|face| face.vertices.len())
+            .sum::<usize>(),
     ];
     let Some(Value::Array(entries)) = source.attributes.get_mut("blender_attributes") else {
         return;
@@ -576,7 +606,11 @@ fn transfer_float_joined_defaults(subject: &Mesh, operand: &Mesh, source: &mut M
         let Some(name) = entry.get("name").and_then(Value::as_str).map(str::to_owned) else {
             continue;
         };
-        let Some(domain) = entry.get("domain").and_then(Value::as_str).map(str::to_owned) else {
+        let Some(domain) = entry
+            .get("domain")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
             continue;
         };
         let Some(data_type) = entry
@@ -590,7 +624,12 @@ fn transfer_float_joined_defaults(subject: &Mesh, operand: &Mesh, source: &mut M
             "FLOAT_COLOR" | "BYTE_COLOR" => json!([1.0, 1.0, 1.0, 1.0]),
             "FLOAT4" => json!([0.0, 0.0, 0.0, 0.0]),
             "INT16_2D" => json!([0, 0]),
-            "FLOAT4X4" => json!([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]),
+            "FLOAT4X4" => json!([
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0]
+            ]),
             "STRING" => json!(""),
             _ => continue,
         };
@@ -671,8 +710,7 @@ fn fill_float_named_attribute_default(
             input_type == data_type
         }) && (input_domain.eq_ignore_ascii_case(domain)
             || (color
-                && (domain.eq_ignore_ascii_case("point")
-                    || domain.eq_ignore_ascii_case("corner"))
+                && (domain.eq_ignore_ascii_case("point") || domain.eq_ignore_ascii_case("corner"))
                 && (input_domain.eq_ignore_ascii_case("point")
                     || input_domain.eq_ignore_ascii_case("corner"))))
     });
@@ -680,7 +718,13 @@ fn fill_float_named_attribute_default(
         .then(|| input_attribute.and_then(|attribute| attribute.get("values")))
         .flatten()
         .and_then(Value::as_object);
-    let Mesh { vertices, edges, faces, attributes, .. } = source;
+    let Mesh {
+        vertices,
+        edges,
+        faces,
+        attributes,
+        ..
+    } = source;
     let Some(output_values) = attributes
         .get_mut(key)
         .and_then(|attribute| attribute.get_mut("values"))
@@ -808,11 +852,7 @@ fn float_output_origin(
     })
 }
 
-fn transfer_float_point_defaults(
-    source: &Mesh,
-    output: &mut Mesh,
-    origins: &[Vec<(usize, f64)>],
-) {
+fn transfer_float_point_defaults(source: &Mesh, output: &mut Mesh, origins: &[Vec<(usize, f64)>]) {
     let source_index = |origin: &[(usize, f64)]| match origin {
         [(index, weight)] if *weight == 1.0 => Some(*index),
         _ => None,
@@ -853,7 +893,11 @@ fn transfer_float_point_defaults(
                 .unwrap_or_else(|| bmesh_default_value(&data_type));
             values.insert(format!("v{}", vertex.id), value);
         }
-        if let Some(attribute) = output.attributes.get_mut(&key).and_then(Value::as_object_mut) {
+        if let Some(attribute) = output
+            .attributes
+            .get_mut(&key)
+            .and_then(Value::as_object_mut)
+        {
             attribute.insert("values".to_owned(), Value::Object(values));
         }
     }
@@ -916,7 +960,10 @@ fn transfer_float_point_defaults(
         if layer.domain != ColorDomain::Point {
             continue;
         }
-        let source_layer = source_colors.layers.iter().find(|source| source.name == layer.name);
+        let source_layer = source_colors
+            .layers
+            .iter()
+            .find(|source| source.name == layer.name);
         for (index, origin) in origins.iter().enumerate() {
             layer.values[index] = source_index(origin)
                 .and_then(|source| source_layer.and_then(|layer| layer.values.get(source)))
@@ -939,7 +986,9 @@ fn transfer_float_edge_attributes(source: &Mesh, output: &mut Mesh, origins: &[O
         })
         .collect();
     for key in named {
-        let Some(template) = source.attributes.get(&key) else { continue };
+        let Some(template) = source.attributes.get(&key) else {
+            continue;
+        };
         let data_type = template
             .get("type")
             .and_then(Value::as_str)
@@ -955,7 +1004,11 @@ fn transfer_float_edge_attributes(source: &Mesh, output: &mut Mesh, origins: &[O
                 .unwrap_or_else(|| bmesh_default_value(data_type));
             values.insert(format!("e{}", edge.id), value);
         }
-        if let Some(attribute) = output.attributes.get_mut(&key).and_then(Value::as_object_mut) {
+        if let Some(attribute) = output
+            .attributes
+            .get_mut(&key)
+            .and_then(Value::as_object_mut)
+        {
             attribute.insert("values".to_owned(), Value::Object(values));
         }
     }
@@ -995,9 +1048,12 @@ fn transfer_float_edge_attributes(source: &Mesh, output: &mut Mesh, origins: &[O
                 .map(blender_mixer_type)
                 .unwrap_or("FLOAT");
             let source_values = source_entries
-                .and_then(|entries| entries.iter().find(|entry|
-                    entry.get("name").and_then(Value::as_str) == Some(name)
-                        && entry.get("domain").and_then(Value::as_str) == Some("EDGE")))
+                .and_then(|entries| {
+                    entries.iter().find(|entry| {
+                        entry.get("name").and_then(Value::as_str) == Some(name)
+                            && entry.get("domain").and_then(Value::as_str) == Some("EDGE")
+                    })
+                })
                 .and_then(|entry| entry.get("values"))
                 .and_then(Value::as_array);
             let values = origins
@@ -1038,11 +1094,23 @@ fn float_face_transfers(
     polys: &[Poly],
     output_mesh: &Mesh,
 ) -> Result<Vec<FloatFaceTransfer>> {
-    let subject_vertices: HashMap<u32, usize> = subject.vertices.iter().enumerate()
-        .map(|(index, vertex)| (vertex.id, index)).collect();
-    let operand_vertices: HashMap<u32, usize> = operand.vertices.iter().enumerate()
-        .map(|(index, vertex)| (vertex.id, index)).collect();
-    let output_points: Vec<P3> = output_mesh.vertices.iter().map(|vertex| to_f32(vertex.co)).collect();
+    let subject_vertices: HashMap<u32, usize> = subject
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(index, vertex)| (vertex.id, index))
+        .collect();
+    let operand_vertices: HashMap<u32, usize> = operand
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(index, vertex)| (vertex.id, index))
+        .collect();
+    let output_points: Vec<P3> = output_mesh
+        .vertices
+        .iter()
+        .map(|vertex| to_f32(vertex.co))
+        .collect();
     let mut transfers = Vec::with_capacity(polys.len());
     for poly in polys {
         let source_face = usize::try_from(poly.orig)
@@ -1062,21 +1130,32 @@ fn float_face_transfers(
         let face = source_mesh.faces.get(local_face).ok_or_else(|| {
             PotError::invalid_argument("Boolean corner face references a missing source")
         })?;
-        let source_points: Vec<P3> = face.vertices.iter().map(|id| {
-            vertex_index.get(id).map(|&index| to_f32(source_mesh.vertices[index].co))
-                .ok_or_else(|| PotError::invalid_argument("Boolean corner source vertex is missing"))
-        }).collect::<Result<_>>()?;
+        let source_points: Vec<P3> = face
+            .vertices
+            .iter()
+            .map(|id| {
+                vertex_index
+                    .get(id)
+                    .map(|&index| to_f32(source_mesh.vertices[index].co))
+                    .ok_or_else(|| {
+                        PotError::invalid_argument("Boolean corner source vertex is missing")
+                    })
+            })
+            .collect::<Result<_>>()?;
         let interpolator = FloatPolyInterpolator::new(&source_points);
         let mut copied = Vec::with_capacity(poly.verts.len());
         let mut edge_copied = Vec::with_capacity(poly.verts.len());
         let mut weights = Vec::with_capacity(poly.verts.len());
         for (corner_index, &state_vertex) in poly.verts.iter().enumerate() {
-            let state_index = usize::try_from(state_vertex)
-                .map_err(|_| PotError::invalid_argument("Boolean corner vertex index is invalid"))?;
+            let state_index = usize::try_from(state_vertex).map_err(|_| {
+                PotError::invalid_argument("Boolean corner vertex index is invalid")
+            })?;
             let output_vertex = state_output_ids
                 .get(state_index)
                 .and_then(|id| *id)
-                .ok_or_else(|| PotError::invalid_argument("Boolean corner output vertex is missing"))?;
+                .ok_or_else(|| {
+                    PotError::invalid_argument("Boolean corner output vertex is missing")
+                })?;
             let output_index = output_vertex as usize;
             let values = interpolator.weights(output_points[output_index]);
             let point_origin = state.verts[state_index].source;
@@ -1099,12 +1178,15 @@ fn float_face_transfers(
                         .and_then(|source| source.checked_sub(edge_base))
                         .and_then(|source| source_mesh.edges.get(source))
                         .and_then(|edge| {
-                            face.vertices.iter().enumerate().find_map(|(corner, &vertex)| {
-                                let next = face.vertices[(corner + 1) % face.vertices.len()];
-                                ((vertex == edge.vertices[0] && next == edge.vertices[1])
-                                    || (vertex == edge.vertices[1] && next == edge.vertices[0]))
-                                    .then_some(corner)
-                            })
+                            face.vertices
+                                .iter()
+                                .enumerate()
+                                .find_map(|(corner, &vertex)| {
+                                    let next = face.vertices[(corner + 1) % face.vertices.len()];
+                                    ((vertex == edge.vertices[0] && next == edge.vertices[1])
+                                        || (vertex == edge.vertices[1] && next == edge.vertices[0]))
+                                        .then_some(corner)
+                                })
                         })
                 })
             } else {
@@ -1114,7 +1196,12 @@ fn float_face_transfers(
             edge_copied.push(edge_corner);
             weights.push(values);
         }
-        transfers.push(FloatFaceTransfer { source_face, copied, edge_copied, weights });
+        transfers.push(FloatFaceTransfer {
+            source_face,
+            copied,
+            edge_copied,
+            weights,
+        });
     }
     Ok(transfers)
 }
@@ -1203,32 +1290,38 @@ fn transfer_float_uv_layers(
     for layer in &mut output.layers {
         for (output_face, transfer) in transfers.iter().enumerate() {
             let (slot, local_face, _) = select_source_face(subject, operand, transfer.source_face);
-            let Some(source_layer) = inputs[slot].layers.iter().find(|source| source.name == layer.name) else {
+            let Some(source_layer) = inputs[slot]
+                .layers
+                .iter()
+                .find(|source| source.name == layer.name)
+            else {
                 layer.faces[output_face] = Some(vec![[0.0, 1.0]; transfer.weights.len()]);
                 layer.pinned[output_face] = None;
                 continue;
             };
-            let row = source_layer
-                .faces
-                .get(local_face)
-                .and_then(Option::as_ref);
+            let row = source_layer.faces.get(local_face).and_then(Option::as_ref);
             let values = row.map_or_else(
                 || vec![[0.0, 1.0]; transfer.weights.len()],
                 |values| {
-                    transfer.weights.iter().enumerate().map(|(output_corner, weights)| {
-                        if let Some(source_corner) = transfer.copied[output_corner] {
-                            return values.get(source_corner).copied().unwrap_or([0.0, 1.0]);
-                        }
-                        // Canonical UVs are V-down; Blender interpolates them in V-up.
-                        let mut result = [0.0_f32; 2];
-                        for (corner, &weight) in weights.iter().enumerate() {
-                            if let Some(value) = values.get(corner) {
-                                result[0] += value[0] as f32 * weight;
-                                result[1] += (1.0_f32 - value[1] as f32) * weight;
+                    transfer
+                        .weights
+                        .iter()
+                        .enumerate()
+                        .map(|(output_corner, weights)| {
+                            if let Some(source_corner) = transfer.copied[output_corner] {
+                                return values.get(source_corner).copied().unwrap_or([0.0, 1.0]);
                             }
-                        }
-                        [f64::from(result[0]), f64::from(1.0_f32 - result[1])]
-                    }).collect()
+                            // Canonical UVs are V-down; Blender interpolates them in V-up.
+                            let mut result = [0.0_f32; 2];
+                            for (corner, &weight) in weights.iter().enumerate() {
+                                if let Some(value) = values.get(corner) {
+                                    result[0] += value[0] as f32 * weight;
+                                    result[1] += (1.0_f32 - value[1] as f32) * weight;
+                                }
+                            }
+                            [f64::from(result[0]), f64::from(1.0_f32 - result[1])]
+                        })
+                        .collect()
                 },
             );
             layer.faces[output_face] = Some(values);
@@ -1237,15 +1330,20 @@ fn transfer_float_uv_layers(
                 .get(local_face)
                 .and_then(Option::as_ref)
                 .map(|pinned| {
-                    transfer.weights.iter().enumerate().map(|(output_corner, weights)| {
-                        if let Some(source_corner) = transfer.copied[output_corner] {
-                            pinned.get(source_corner).copied().unwrap_or(false)
-                        } else {
-                            weights.iter().enumerate().any(|(corner, &weight)| {
-                                pinned.get(corner).copied().unwrap_or(false) && weight > 0.0
-                            })
-                        }
-                    }).collect()
+                    transfer
+                        .weights
+                        .iter()
+                        .enumerate()
+                        .map(|(output_corner, weights)| {
+                            if let Some(source_corner) = transfer.copied[output_corner] {
+                                pinned.get(source_corner).copied().unwrap_or(false)
+                            } else {
+                                weights.iter().enumerate().any(|(corner, &weight)| {
+                                    pinned.get(corner).copied().unwrap_or(false) && weight > 0.0
+                                })
+                            }
+                        })
+                        .collect()
                 });
         }
     }
@@ -1258,10 +1356,18 @@ fn transfer_float_color_layers(
     transfers: &[FloatFaceTransfer],
     output_mesh: &mut Mesh,
 ) {
-    let subject_vertex_index: HashMap<u32, usize> = subject.vertices.iter().enumerate()
-        .map(|(index, vertex)| (vertex.id, index)).collect();
-    let operand_vertex_index: HashMap<u32, usize> = operand.vertices.iter().enumerate()
-        .map(|(index, vertex)| (vertex.id, index)).collect();
+    let subject_vertex_index: HashMap<u32, usize> = subject
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(index, vertex)| (vertex.id, index))
+        .collect();
+    let operand_vertex_index: HashMap<u32, usize> = operand
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(index, vertex)| (vertex.id, index))
+        .collect();
     let vertex_indices = [&subject_vertex_index, &operand_vertex_index];
     let corner_starts = [corner_offsets(subject), corner_offsets(operand)];
     let stores = [color_layers::read(subject), color_layers::read(operand)];
@@ -1324,28 +1430,42 @@ fn transfer_float_blender_uv_layers(
     transfers: &[FloatFaceTransfer],
     output_mesh: &mut Mesh,
 ) {
-    let Some(Value::Array(output_layers)) = output_mesh.attributes.get_mut("blender_uv_layers") else {
+    let Some(Value::Array(output_layers)) = output_mesh.attributes.get_mut("blender_uv_layers")
+    else {
         return;
     };
     let corner_starts = [corner_offsets(subject), corner_offsets(operand)];
     for output_layer in output_layers {
-        let Some(name) = output_layer.get("name").and_then(Value::as_str).map(str::to_owned) else {
+        let Some(name) = output_layer
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
             continue;
         };
         let mut values = Vec::new();
         for transfer in transfers {
-            let (slot, local_face, source_mesh) = select_source_face(subject, operand, transfer.source_face);
+            let (slot, local_face, source_mesh) =
+                select_source_face(subject, operand, transfer.source_face);
             let source_layer = source_mesh
                 .attributes
                 .get("blender_uv_layers")
                 .and_then(Value::as_array)
-                .and_then(|layers| layers.iter().find(|layer| layer.get("name").and_then(Value::as_str) == Some(&name)));
+                .and_then(|layers| {
+                    layers
+                        .iter()
+                        .find(|layer| layer.get("name").and_then(Value::as_str) == Some(&name))
+                });
             let row = source_layer
                 .and_then(|layer| layer.get("values"))
                 .and_then(Value::as_array);
             let corner_start = corner_starts[slot][local_face];
             let source_values: Vec<Value> = (0..source_mesh.faces[local_face].vertices.len())
-                .map(|corner| row.and_then(|row| row.get(corner)).cloned().unwrap_or_else(|| json!([0.0, 0.0])))
+                .map(|corner| {
+                    row.and_then(|row| row.get(corner))
+                        .cloned()
+                        .unwrap_or_else(|| json!([0.0, 0.0]))
+                })
                 .collect();
             for weights in &transfer.weights {
                 values.push(mix_json_values(&source_values, weights, "FLOAT2"));
@@ -1379,30 +1499,45 @@ fn transfer_float_uv_map(
             .and_then(Value::as_u64)
             .and_then(|id| u32::try_from(id).ok())
             .and_then(|id| output_face_indices.get(&id).copied());
-        let Some(output_face) = output_face else { continue };
-        let Some(transfer) = transfer_by_output.get(output_face) else { continue };
+        let Some(output_face) = output_face else {
+            continue;
+        };
+        let Some(transfer) = transfer_by_output.get(output_face) else {
+            continue;
+        };
         let (source_mesh, local_face) = if transfer.source_face < subject.faces.len() {
             (subject, transfer.source_face)
         } else {
             (operand, transfer.source_face - subject.faces.len())
         };
-        let Some(source_face) = source_mesh.faces.get(local_face) else { continue };
+        let Some(source_face) = source_mesh.faces.get(local_face) else {
+            continue;
+        };
         let layer = entry.get("layer").and_then(Value::as_str);
         let source_entry = source_mesh
             .attributes
             .get("uv_map")
             .and_then(Value::as_array)
-            .and_then(|entries| entries.iter().find(|source| {
-                source.get("face_id").and_then(Value::as_u64) == Some(u64::from(source_face.id))
-                    && source.get("layer").and_then(Value::as_str) == layer
-            }));
+            .and_then(|entries| {
+                entries.iter().find(|source| {
+                    source.get("face_id").and_then(Value::as_u64) == Some(u64::from(source_face.id))
+                        && source.get("layer").and_then(Value::as_str) == layer
+                })
+            });
         let source_uv = source_entry
             .and_then(|source| source.get("uv"))
             .and_then(Value::as_array);
         let source_uv_values: Vec<Value> = (0..source_face.vertices.len())
-            .map(|corner| source_uv.and_then(|uv| uv.get(corner)).cloned().unwrap_or_else(|| json!([0.0, 1.0])))
+            .map(|corner| {
+                source_uv
+                    .and_then(|uv| uv.get(corner))
+                    .cloned()
+                    .unwrap_or_else(|| json!([0.0, 1.0]))
+            })
             .collect();
-        let row: Vec<Value> = transfer.weights.iter()
+        let row: Vec<Value> = transfer
+            .weights
+            .iter()
             .map(|weights| mix_json_values(&source_uv_values, weights, "FLOAT2"))
             .collect();
         let source_pins = source_entry
@@ -1411,17 +1546,22 @@ fn transfer_float_uv_map(
         if let Some(object) = entry.as_object_mut() {
             object.insert("uv".to_owned(), Value::Array(row));
             if let Some(source_pins) = source_pins {
-                let pins: Vec<Value> = transfer.weights.iter().enumerate().map(|(output_corner, weights)| {
-                    let pinned = if let Some(source_corner) = transfer.copied[output_corner] {
-                        source_pins.get(source_corner).and_then(Value::as_bool) == Some(true)
-                    } else {
-                        weights.iter().enumerate().any(|(corner, &weight)| {
-                            source_pins.get(corner).and_then(Value::as_bool) == Some(true)
-                                && weight > 0.0
-                        })
-                    };
-                    json!(pinned)
-                }).collect();
+                let pins: Vec<Value> = transfer
+                    .weights
+                    .iter()
+                    .enumerate()
+                    .map(|(output_corner, weights)| {
+                        let pinned = if let Some(source_corner) = transfer.copied[output_corner] {
+                            source_pins.get(source_corner).and_then(Value::as_bool) == Some(true)
+                        } else {
+                            weights.iter().enumerate().any(|(corner, &weight)| {
+                                source_pins.get(corner).and_then(Value::as_bool) == Some(true)
+                                    && weight > 0.0
+                            })
+                        };
+                        json!(pinned)
+                    })
+                    .collect();
                 object.insert("pinned".to_owned(), Value::Array(pins));
             }
         }
@@ -1437,10 +1577,16 @@ fn mix_float_corner_attribute(
 ) -> Value {
     let data_type = blender_mixer_type(data_type);
     if let Some(corner) = copied {
-        return values.get(corner).cloned().unwrap_or_else(|| bmesh_default_value(data_type));
+        return values
+            .get(corner)
+            .cloned()
+            .unwrap_or_else(|| bmesh_default_value(data_type));
     }
     // CustomData_bmesh_interp skips these types, so the destination keeps its edge copy/default.
-    if matches!(data_type, "INT8" | "INT16_2D" | "INT32_2D" | "FLOAT4X4" | "STRING") {
+    if matches!(
+        data_type,
+        "INT8" | "INT16_2D" | "INT32_2D" | "FLOAT4X4" | "STRING"
+    ) {
         return edge_copied
             .and_then(|corner| values.get(corner).cloned())
             .unwrap_or_else(|| bmesh_default_value(data_type));
@@ -1453,7 +1599,8 @@ fn transfer_float_attribute_entries(
     transfers: &[FloatFaceTransfer],
     output_mesh: &mut Mesh,
 ) {
-    let Some(Value::Array(output_entries)) = output_mesh.attributes.get_mut("blender_attributes") else {
+    let Some(Value::Array(output_entries)) = output_mesh.attributes.get_mut("blender_attributes")
+    else {
         return;
     };
     let corner_starts = [corner_offsets(subject), corner_offsets(operand)];
@@ -1461,7 +1608,11 @@ fn transfer_float_attribute_entries(
         if output_entry.get("domain").and_then(Value::as_str) != Some("CORNER") {
             continue;
         }
-        let Some(name) = output_entry.get("name").and_then(Value::as_str).map(str::to_owned) else {
+        let Some(name) = output_entry
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
             continue;
         };
         let data_type = output_entry
@@ -1472,32 +1623,45 @@ fn transfer_float_attribute_entries(
             .to_owned();
         let mut values = Vec::new();
         for transfer in transfers {
-            let (slot, local_face, source_mesh) = select_source_face(subject, operand, transfer.source_face);
+            let (slot, local_face, source_mesh) =
+                select_source_face(subject, operand, transfer.source_face);
             let row = source_mesh
                 .attributes
                 .get("blender_attributes")
                 .and_then(Value::as_array)
-                .and_then(|entries| entries.iter().find(|entry|
-                    entry.get("name").and_then(Value::as_str) == Some(&name)
-                    && entry.get("domain").and_then(Value::as_str) == Some("CORNER")
-                ))
+                .and_then(|entries| {
+                    entries.iter().find(|entry| {
+                        entry.get("name").and_then(Value::as_str) == Some(&name)
+                            && entry.get("domain").and_then(Value::as_str) == Some("CORNER")
+                    })
+                })
                 .and_then(|entry| entry.get("values"))
                 .and_then(Value::as_array);
             let corner_start = corner_starts[slot][local_face];
             let face_len = source_mesh.faces[local_face].vertices.len();
             let source_values: Vec<Value> = (0..face_len)
-                .map(|corner| row.and_then(|row| row.get(corner_start + corner)).cloned().unwrap_or_else(|| bmesh_default_value(&data_type)))
+                .map(|corner| {
+                    row.and_then(|row| row.get(corner_start + corner))
+                        .cloned()
+                        .unwrap_or_else(|| bmesh_default_value(&data_type))
+                })
                 .collect();
-            values.extend(transfer.weights.iter().zip(&transfer.copied).zip(&transfer.edge_copied)
-                .map(|((weights, copied), edge_copied)| {
-                    mix_float_corner_attribute(
-                        &source_values,
-                        weights,
-                        *copied,
-                        *edge_copied,
-                        &data_type,
-                    )
-                }));
+            values.extend(
+                transfer
+                    .weights
+                    .iter()
+                    .zip(&transfer.copied)
+                    .zip(&transfer.edge_copied)
+                    .map(|((weights, copied), edge_copied)| {
+                        mix_float_corner_attribute(
+                            &source_values,
+                            weights,
+                            *copied,
+                            *edge_copied,
+                            &data_type,
+                        )
+                    }),
+            );
         }
         if let Some(object) = output_entry.as_object_mut() {
             object.insert("values".to_owned(), Value::Array(values));
@@ -1527,24 +1691,38 @@ fn transfer_float_named_corner_attributes(
         })
         .collect();
     for key in keys {
-        let stored_type = output_mesh.attributes.get(&key)
+        let stored_type = output_mesh
+            .attributes
+            .get(&key)
             .and_then(|value| value.get("type"))
             .and_then(Value::as_str)
             .unwrap_or("FLOAT");
         let data_type = blender_mixer_type(stored_type).to_owned();
         let mut values = serde_json::Map::new();
         for (output_face, transfer) in transfers.iter().enumerate() {
-            let (_, local_face, source_mesh) = select_source_face(subject, operand, transfer.source_face);
+            let (_, local_face, source_mesh) =
+                select_source_face(subject, operand, transfer.source_face);
             let source_face = &source_mesh.faces[local_face];
-            let source_row = source_mesh.attributes.get(&key)
+            let source_row = source_mesh
+                .attributes
+                .get(&key)
                 .and_then(|attribute| attribute.get("values"))
                 .and_then(Value::as_object)
                 .and_then(|rows| rows.get(&format!("f{}", source_face.id)))
                 .and_then(Value::as_array);
             let inputs: Vec<Value> = (0..source_face.vertices.len())
-                .map(|corner| source_row.and_then(|row| row.get(corner)).cloned().unwrap_or_else(|| bmesh_default_value(&data_type)))
+                .map(|corner| {
+                    source_row
+                        .and_then(|row| row.get(corner))
+                        .cloned()
+                        .unwrap_or_else(|| bmesh_default_value(&data_type))
+                })
                 .collect();
-            let row: Vec<Value> = transfer.weights.iter().zip(&transfer.copied).zip(&transfer.edge_copied)
+            let row: Vec<Value> = transfer
+                .weights
+                .iter()
+                .zip(&transfer.copied)
+                .zip(&transfer.edge_copied)
                 .map(|((weights, copied), edge_copied)| {
                     mix_float_corner_attribute(&inputs, weights, *copied, *edge_copied, &data_type)
                 })
@@ -1553,13 +1731,21 @@ fn transfer_float_named_corner_attributes(
                 values.insert(format!("f{}", face.id), Value::Array(row));
             }
         }
-        if let Some(attribute) = output_mesh.attributes.get_mut(&key).and_then(Value::as_object_mut) {
+        if let Some(attribute) = output_mesh
+            .attributes
+            .get_mut(&key)
+            .and_then(Value::as_object_mut)
+        {
             attribute.insert("values".to_owned(), Value::Object(values));
         }
     }
 }
 
-fn select_source_face<'a>(subject: &'a Mesh, operand: &'a Mesh, joined_face: usize) -> (usize, usize, &'a Mesh) {
+fn select_source_face<'a>(
+    subject: &'a Mesh,
+    operand: &'a Mesh,
+    joined_face: usize,
+) -> (usize, usize, &'a Mesh) {
     if joined_face < subject.faces.len() {
         (0, joined_face, subject)
     } else {
@@ -1632,7 +1818,12 @@ fn bmesh_default_value(data_type: &str) -> Value {
         "FLOAT_COLOR" | "BYTE_COLOR" => json!([1.0, 1.0, 1.0, 1.0]),
         "INT16_2D" => json!([0, 0]),
         "FLOAT4" => json!([0.0, 0.0, 0.0, 0.0]),
-        "FLOAT4X4" => json!([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]),
+        "FLOAT4X4" => json!([
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0]
+        ]),
         "STRING" => json!(""),
         _ => default_value(data_type),
     }
@@ -1640,23 +1831,34 @@ fn bmesh_default_value(data_type: &str) -> Value {
 
 fn mix_json_values(values: &[Value], weights: &[f32], data_type: &str) -> Value {
     if let Some(index) = weights.iter().position(|&weight| weight == 1.0)
-        && weights.iter().enumerate().all(|(i, &weight)| i == index || weight == 0.0)
+        && weights
+            .iter()
+            .enumerate()
+            .all(|(i, &weight)| i == index || weight == 0.0)
     {
-        return values.get(index).cloned().unwrap_or_else(|| bmesh_default_value(data_type));
+        return values
+            .get(index)
+            .cloned()
+            .unwrap_or_else(|| bmesh_default_value(data_type));
     }
     mix_json_values_interpolated(values, weights, data_type)
 }
 
 fn mix_json_values_interpolated(values: &[Value], weights: &[f32], data_type: &str) -> Value {
     match data_type {
-        "BOOLEAN" | "BOOL" => json!(values
-            .iter()
-            .zip(weights)
-            .any(|(value, weight)| value.as_bool().unwrap_or(false) && *weight > 0.0)),
+        "BOOLEAN" | "BOOL" => json!(
+            values
+                .iter()
+                .zip(weights)
+                .any(|(value, weight)| value.as_bool().unwrap_or(false) && *weight > 0.0)
+        ),
         "INT" => {
-            let sum = values.iter().zip(weights).fold(0.0_f32, |sum, (value, weight)| {
-                sum + value.as_f64().unwrap_or(0.0) as f32 * *weight
-            });
+            let sum = values
+                .iter()
+                .zip(weights)
+                .fold(0.0_f32, |sum, (value, weight)| {
+                    sum + value.as_f64().unwrap_or(0.0) as f32 * *weight
+                });
             json!(sum.round() as i32)
         }
         "INT8" | "INT16_2D" | "INT32_2D" | "FLOAT4X4" | "STRING" => bmesh_default_value(data_type),
@@ -1669,7 +1871,9 @@ fn mix_quaternion(values: &[Value], weights: &[f32]) -> Value {
     let mut expmap = [0.0_f32; 3];
     let mut total = 0.0_f32;
     for (value, &weight) in values.iter().zip(weights) {
-        let Some(row) = value.as_array() else { continue };
+        let Some(row) = value.as_array() else {
+            continue;
+        };
         let x = row.first().and_then(Value::as_f64).unwrap_or(0.0) as f32;
         let y = row.get(1).and_then(Value::as_f64).unwrap_or(0.0) as f32;
         let z = row.get(2).and_then(Value::as_f64).unwrap_or(0.0) as f32;
@@ -1694,8 +1898,7 @@ fn mix_quaternion(values: &[Value], weights: &[f32]) -> Value {
     expmap[0] *= inverse;
     expmap[1] *= inverse;
     expmap[2] *= inverse;
-    let length_squared =
-        (expmap[0] * expmap[0] + expmap[1] * expmap[1]) + expmap[2] * expmap[2];
+    let length_squared = (expmap[0] * expmap[0] + expmap[1] * expmap[1]) + expmap[2] * expmap[2];
     if !(length_squared > 1.0e-35) {
         return default_value("QUATERNION");
     }
@@ -1723,27 +1926,31 @@ fn mix_json_array(values: &[Value], weights: &[f32], data_type: &str) -> Value {
         return bmesh_default_value(data_type);
     }
     let Some(first) = values.iter().find_map(Value::as_array) else {
-        let sum = values.iter().zip(weights).fold(0.0_f32, |sum, (value, weight)| {
-            sum + value.as_f64().unwrap_or(0.0) as f32 * *weight
-        });
+        let sum = values
+            .iter()
+            .zip(weights)
+            .fold(0.0_f32, |sum, (value, weight)| {
+                sum + value.as_f64().unwrap_or(0.0) as f32 * *weight
+            });
         return json!(sum);
     };
     let mut result = Vec::with_capacity(first.len());
     for component in 0..first.len() {
-        let sum = values.iter().zip(weights).fold(0.0_f32, |sum, (value, weight)| {
-            let x = value
-                .as_array()
-                .and_then(|values| values.get(component))
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0) as f32;
-            sum + x * *weight
-        });
+        let sum = values
+            .iter()
+            .zip(weights)
+            .fold(0.0_f32, |sum, (value, weight)| {
+                let x = value
+                    .as_array()
+                    .and_then(|values| values.get(component))
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0) as f32;
+                sum + x * *weight
+            });
         result.push(json!(sum));
     }
     Value::Array(result)
 }
-
-
 
 struct FloatPolyInterpolator {
     vertices: Vec<[f32; 2]>,
@@ -1852,9 +2059,11 @@ impl FloatPolyInterpolator {
     }
 }
 
-
 fn double2_len(a: [f32; 2], b: [f32; 2]) -> ([f64; 2], f64) {
-    let dir = [f64::from(a[0]) - f64::from(b[0]), f64::from(a[1]) - f64::from(b[1])];
+    let dir = [
+        f64::from(a[0]) - f64::from(b[0]),
+        f64::from(a[1]) - f64::from(b[1]),
+    ];
     let len = (dir[0] * dir[0] + dir[1] * dir[1]).sqrt();
     (dir, len)
 }
@@ -1922,8 +2131,13 @@ fn build_state(
                 .map_err(|_| PotError::invalid_argument("Boolean input exceeds index range"))?,
         );
     }
-    let max_face_len = operand_local.faces.iter().chain(&subject.faces)
-        .map(|face| face.vertices.len()).max().unwrap_or(0);
+    let max_face_len = operand_local
+        .faces
+        .iter()
+        .chain(&subject.faces)
+        .map(|face| face.vertices.len())
+        .max()
+        .unwrap_or(0);
     let mut local_positions = Vec::with_capacity(max_face_len);
     let mut triangulation_coordinates = Vec::with_capacity(max_face_len);
     let mut face_triangles = Vec::with_capacity(max_face_len.saturating_sub(2));
@@ -1967,12 +2181,9 @@ fn build_state(
             .vertices
             .iter()
             .map(|id| {
-                operand_vertex
-                    .get(id)
-                    .copied()
-                    .ok_or_else(|| {
-                        PotError::invalid_argument("Boolean face references a missing vertex")
-                    })
+                operand_vertex.get(id).copied().ok_or_else(|| {
+                    PotError::invalid_argument("Boolean face references a missing vertex")
+                })
             })
             .collect::<Result<Vec<_>>>()?;
         let source_face = i32::try_from(subject.faces.len() + fi)
@@ -2059,7 +2270,6 @@ fn build_state(
     Ok(state)
 }
 
-
 fn beauty_quad_tris(ring: &[usize], positions: &[P3]) -> [[usize; 3]; 2] {
     let points = [positions[0], positions[1], positions[2], positions[3]];
     if quad_rotate_score(points) < 0.0 {
@@ -2080,10 +2290,12 @@ fn quad_rotate_score(p: [P3; 4]) -> f32 {
     let area134 = cross2(a, c, d);
     let area234 = cross2(b, c, d);
     let area241 = cross2(b, d, a);
-    if (area123 >= 0.0) != (area134 >= 0.0) || area123.abs() <= 1.0e-12 || area134.abs() <= 1.0e-12 {
+    if (area123 >= 0.0) != (area134 >= 0.0) || area123.abs() <= 1.0e-12 || area134.abs() <= 1.0e-12
+    {
         return f32::MAX;
     }
-    if (area234 >= 0.0) != (area241 >= 0.0) || area234.abs() <= 1.0e-12 || area241.abs() <= 1.0e-12 {
+    if (area234 >= 0.0) != (area241 >= 0.0) || area234.abs() <= 1.0e-12 || area241.abs() <= 1.0e-12
+    {
         return -f32::MAX;
     }
     let length = |a: [f32; 2], b: [f32; 2]| ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt();
@@ -2149,7 +2361,13 @@ fn corner_sign(coordinates: &[[f32; 2]], previous: usize, current: usize, next: 
     let d2 = sub2(coordinates[current], coordinates[next]);
     let d3 = sub2(coordinates[previous], coordinates[next]);
     let area = d2[0] * d3[1] - d3[0] * d2[1];
-    if area > 0.0 { EAR_CONVEX } else if area >= 0.0 { EAR_TANGENTIAL } else { EAR_CONCAVE }
+    if area > 0.0 {
+        EAR_CONVEX
+    } else if area >= 0.0 {
+        EAR_TANGENTIAL
+    } else {
+        EAR_CONCAVE
+    }
 }
 
 fn float_polyfill_with_scratch(
@@ -2168,7 +2386,10 @@ fn float_polyfill_with_scratch(
         let c = corners[i];
         corners[i].sign = corner_sign(coordinates, c.previous, i, c.next);
     }
-    let concave = corners.iter().filter(|corner| corner.sign != EAR_CONVEX).count();
+    let concave = corners
+        .iter()
+        .filter(|corner| corner.sign != EAR_CONVEX)
+        .count();
     triangles.clear();
     let mut clipper = EarClipper {
         coordinates,
@@ -2213,7 +2434,11 @@ impl EarClipper<'_> {
     }
 
     fn step(&self, index: usize, reverse: bool) -> usize {
-        if reverse { self.corners[index].previous } else { self.corners[index].next }
+        if reverse {
+            self.corners[index].previous
+        } else {
+            self.corners[index].next
+        }
     }
 
     fn find_ear(&self, init: usize, reverse: bool) -> usize {
@@ -2255,12 +2480,8 @@ impl EarClipper<'_> {
             for neighbor in [corner.previous, corner.next] {
                 if self.corners[neighbor].sign != EAR_CONVEX {
                     let c = self.corners[neighbor];
-                    self.corners[neighbor].sign = corner_sign(
-                        self.coordinates,
-                        c.previous,
-                        neighbor,
-                        c.next,
-                    );
+                    self.corners[neighbor].sign =
+                        corner_sign(self.coordinates, c.previous, neighbor, c.next);
                     if self.corners[neighbor].sign == EAR_CONVEX {
                         self.concave -= 1;
                     }
@@ -2284,7 +2505,6 @@ impl EarClipper<'_> {
     }
 }
 
-
 fn float_face_tris_into(
     ring: &[usize],
     points: &[P3],
@@ -2300,14 +2520,17 @@ fn float_face_tris_into(
     let normal = normal_poly(points);
     let (basis_x, basis_y) = orthogonal_basis(scale(normal, -1.0));
     coordinates.clear();
-    coordinates.extend(points.iter().map(|&point| [dot(basis_x, point), dot(basis_y, point)]));
+    coordinates.extend(
+        points
+            .iter()
+            .map(|&point| [dot(basis_x, point), dot(basis_y, point)]),
+    );
     float_polyfill_with_scratch(coordinates, corners, triangles);
     for triangle in triangles {
         for corner in triangle {
             *corner = ring[*corner];
         }
     }
-
 }
 fn beauty_ngon_tris_into(
     ring: &[usize],
@@ -2328,7 +2551,11 @@ fn beauty_ngon_tris_into(
     let normal = normal_poly(points);
     let (basis_x, basis_y) = orthogonal_basis(scale(normal, -1.0));
     coordinates.clear();
-    coordinates.extend(points.iter().map(|&point| [dot(basis_x, point), dot(basis_y, point)]));
+    coordinates.extend(
+        points
+            .iter()
+            .map(|&point| [dot(basis_x, point), dot(basis_y, point)]),
+    );
     float_polyfill_with_scratch(coordinates, corners, triangles);
     beautify_with_scratch(coordinates, triangles, beauty_scratch);
     for triangle in triangles.iter_mut() {
@@ -2380,7 +2607,6 @@ impl TriangleIntersectScratch {
         self.seen_b.clear();
     }
 }
-
 
 fn intersect_triangles(state: &mut State, eps: f32) -> (Bvh, Bvh) {
     let eps2x = eps * 2.0;
@@ -2519,8 +2745,16 @@ fn intersect_tri_pair(
         return;
     }
 
-    let na = normal_tri(state.verts[a[0]].co, state.verts[a[1]].co, state.verts[a[2]].co);
-    let nb = normal_tri(state.verts[b[0]].co, state.verts[b[1]].co, state.verts[b[2]].co);
+    let na = normal_tri(
+        state.verts[a[0]].co,
+        state.verts[a[1]].co,
+        state.verts[a[2]].co,
+    );
+    let nb = normal_tri(
+        state.verts[b[0]].co,
+        state.verts[b[1]].co,
+        state.verts[b[2]].co,
+    );
     for i in 0..3 {
         let e0 = a[i];
         let e1 = a[(i + 1) % 3];
@@ -2540,7 +2774,11 @@ fn intersect_tri_pair(
             push_unique(verts_a, seen_a, v);
             push_unique(verts_b, seen_b, v);
             if state.edge_orig.contains_key(&edge_key_usize(e0, e1)) {
-                state.edge_splits.entry(edge_key_usize(e0, e1)).or_default().push(v);
+                state
+                    .edge_splits
+                    .entry(edge_key_usize(e0, e1))
+                    .or_default()
+                    .push(v);
             }
         }
     }
@@ -2563,7 +2801,11 @@ fn intersect_tri_pair(
             push_unique(verts_a, seen_a, v);
             push_unique(verts_b, seen_b, v);
             if state.edge_orig.contains_key(&edge_key_usize(e0, e1)) {
-                state.edge_splits.entry(edge_key_usize(e0, e1)).or_default().push(v);
+                state
+                    .edge_splits
+                    .entry(edge_key_usize(e0, e1))
+                    .or_default()
+                    .push(v);
             }
         }
     }
@@ -2614,7 +2856,10 @@ fn cached_edge_tri_vertex(
         }
         keys[i + 1] = key;
     }
-    let id = if let Some(id) = keys.iter().find_map(|key| state.edge_tri_cache.get(key).copied()) {
+    let id = if let Some(id) = keys
+        .iter()
+        .find_map(|key| state.edge_tri_cache.get(key).copied())
+    {
         id
     } else {
         let id = state.add_vertex(co, NO_INDEX);
@@ -2631,7 +2876,6 @@ fn cached_edge_tri_vertex(
     }
     id
 }
-
 
 fn split_input_edges(state: &mut State) {
     let mut edge_splits = std::mem::take(&mut state.edge_splits);
@@ -2685,9 +2929,11 @@ fn split_input_edges(state: &mut State) {
                     if edge_key_usize(a, b) == key {
                         let insert_at = i + 1;
                         if a == start {
-                            face.verts.splice(insert_at..insert_at, points.iter().copied());
+                            face.verts
+                                .splice(insert_at..insert_at, points.iter().copied());
                         } else {
-                            face.verts.splice(insert_at..insert_at, points.iter().rev().copied());
+                            face.verts
+                                .splice(insert_at..insert_at, points.iter().rev().copied());
                         }
                         break;
                     }
@@ -2769,7 +3015,9 @@ fn connect_isolated_cut_islands(
             ordered.sort_by(|&a, &b| {
                 let pa = project(sub(state.verts[a].co, reference), axis_x, axis_y);
                 let pb = project(sub(state.verts[b].co, reference), axis_x, axis_y);
-                pa[0].total_cmp(&pb[0]).then_with(|| pa[1].total_cmp(&pb[1]))
+                pa[0]
+                    .total_cmp(&pb[0])
+                    .then_with(|| pa[1].total_cmp(&pb[1]))
             });
             let minimum = ordered[0];
             let maximum = *ordered.last().unwrap_or(&minimum);
@@ -2829,7 +3077,7 @@ fn connect_isolated_cut_islands(
                     ordered_edges.push(connection);
                     added_edges.push(connection);
                 }
-        }
+            }
         }
         let origin = groups[group_index].maximum;
         if let Some(target) = find_island_connection(
@@ -2942,14 +3190,20 @@ impl FloatEdgeBvh {
             children: None,
         });
         if end - start > 8 {
-            let axis = if max[1] - min[1] > max[0] - min[0] { 1 } else { 0 };
+            let axis = if max[1] - min[1] > max[0] - min[0] {
+                1
+            } else {
+                0
+            };
             let segments = &self.segments;
             self.order[start..end].sort_unstable_by(|&left, &right| {
                 let a = segments[left];
                 let b = segments[right];
                 let center_a = a.min[axis] + a.max[axis];
                 let center_b = b.min[axis] + b.max[axis];
-                center_a.total_cmp(&center_b).then_with(|| a.key.cmp(&b.key))
+                center_a
+                    .total_cmp(&center_b)
+                    .then_with(|| a.key.cmp(&b.key))
             });
             let middle = start + (end - start) / 2;
             let left = self.build_node(start, middle);
@@ -3042,7 +3296,8 @@ fn find_island_connection(
     let mut hit: Option<(f32, EdgeKey)> = None;
     for &index in ray_candidates.iter() {
         let edge = edge_bvh.segments[index];
-        if edge.key.0 == origin || edge.key.1 == origin
+        if edge.key.0 == origin
+            || edge.key.1 == origin
             || vertex_group.get(&edge.key.0) == Some(&origin_group)
         {
             continue;
@@ -3053,7 +3308,9 @@ fn find_island_connection(
             hit = Some((distance, edge.key));
         }
     }
-    let Some((mut hit_distance, mut hit_edge)) = hit else { return None };
+    let Some((mut hit_distance, mut hit_edge)) = hit else {
+        return None;
+    };
     for &edge in added_edges {
         if edge.0 == origin || edge.1 == origin {
             continue;
@@ -3116,7 +3373,11 @@ fn find_island_connection(
             break;
         }
     }
-    let result = if blocker.is_none() { candidate } else { fallback };
+    let result = if blocker.is_none() {
+        candidate
+    } else {
+        fallback
+    };
     for &vertex in vertex_blacklist.iter() {
         vertex_visited[vertex] = false;
     }
@@ -3182,7 +3443,11 @@ fn island_vertex_blocker(
     let mut best_factor = 1.0_f32;
     for &index in candidates.iter() {
         let edge = edge_bvh.segments[index];
-        if edge.key.0 == origin || edge.key.1 == origin || edge.key.0 == target || edge.key.1 == target {
+        if edge.key.0 == origin
+            || edge.key.1 == origin
+            || edge.key.0 == target
+            || edge.key.1 == target
+        {
             continue;
         }
         if vertex_group.get(&edge.key.0) == Some(&origin_group) {
@@ -3232,7 +3497,8 @@ fn island_segment_intersection_factor(a: P2, b: P2, c: P2, d: P2) -> Option<f32>
     if denominator != 0.0 {
         let factor = cross(s30, s32) / denominator;
         let mut edge_factor = cross(s10, s30) / denominator;
-        if factor >= endpoint_min && factor <= endpoint_max
+        if factor >= endpoint_min
+            && factor <= endpoint_max
             && edge_factor >= endpoint_min
             && edge_factor <= endpoint_max
         {
@@ -3270,8 +3536,11 @@ fn island_segment_intersection_factor(a: P2, b: P2, c: P2, d: P2) -> Option<f32>
     if factor_a > endpoint_max || factor_b < endpoint_min {
         return None;
     }
-    (factor_a.max(0.0) == factor_b.min(1.0))
-        .then_some(if a_degenerate { 0.0 } else { factor_a.max(0.0) })
+    (factor_a.max(0.0) == factor_b.min(1.0)).then_some(if a_degenerate {
+        0.0
+    } else {
+        factor_a.max(0.0)
+    })
 }
 
 fn edge_components(edges: &HashSet<EdgeKey>, ordered_edges: &[EdgeKey]) -> Vec<HashSet<EdgeKey>> {
@@ -3310,7 +3579,11 @@ fn edge_components(edges: &HashSet<EdgeKey>, ordered_edges: &[EdgeKey]) -> Vec<H
     components
 }
 
-fn planar_cycles(boundary: &[usize], edges: &HashSet<EdgeKey>, verts: &[Vertex]) -> Vec<Vec<usize>> {
+fn planar_cycles(
+    boundary: &[usize],
+    edges: &HashSet<EdgeKey>,
+    verts: &[Vertex],
+) -> Vec<Vec<usize>> {
     if edges.is_empty() {
         return Vec::new();
     }
@@ -3352,8 +3625,12 @@ fn planar_cycles(boundary: &[usize], edges: &HashSet<EdgeKey>, verts: &[Vertex])
                     break;
                 }
                 ring.push(from);
-                let Some(neighbors) = adjacent.get(&to) else { break };
-                let Some(index) = neighbors.iter().position(|&v| v == from) else { break };
+                let Some(neighbors) = adjacent.get(&to) else {
+                    break;
+                };
+                let Some(index) = neighbors.iter().position(|&v| v == from) else {
+                    break;
+                };
                 let next = neighbors[(index + neighbors.len() - 1) % neighbors.len()];
                 from = to;
                 to = next;
@@ -3443,7 +3720,15 @@ fn classify_faces(state: &mut State, operation: Operation, bvh_a: &Bvh, bvh_b: &
         let face = &state.faces[face_index];
         let point = point_in_face(face, &state.verts, &mut face_scratch);
         let other_bvh = if face.side == 0 { bvh_b } else { bvh_a };
-        let hits = ray_hits(point, other_bvh, &state.tris, &state.verts, &mut ray_candidates, &mut ray_depths, &mut ray_stack);
+        let hits = ray_hits(
+            point,
+            other_bvh,
+            &state.tris,
+            &state.verts,
+            &mut ray_candidates,
+            &mut ray_depths,
+            &mut ray_stack,
+        );
         let odd = hits & 1 == 1;
         let (do_remove, do_flip) = match operation {
             Operation::Intersect => (!odd, false),
@@ -3527,7 +3812,12 @@ fn dissolve_intersection_vertices(state: &mut State) {
                 continue;
             }
             old_keys.insert(canonical_face_key(&face.verts));
-            let ring: Vec<usize> = face.verts.iter().copied().filter(|&v| v != vertex).collect();
+            let ring: Vec<usize> = face
+                .verts
+                .iter()
+                .copied()
+                .filter(|&v| v != vertex)
+                .collect();
             if ring.len() >= 3 {
                 reduced.push((face_index, ring));
             }
@@ -3633,14 +3923,20 @@ fn ray_triangle(origin: P3, tri: [P3; 3]) -> Option<f32> {
     let e2 = sub(tri[2], tri[0]);
     let p = cross(direction, e2);
     let a = dot(e1, p);
-    if a == 0.0 { return None; }
+    if a == 0.0 {
+        return None;
+    }
     let f = 1.0 / a;
     let s = sub(origin, tri[0]);
     let u = f * dot(s, p);
-    if u < -FLT_EPSILON || u > 1.0 + FLT_EPSILON { return None; }
+    if u < -FLT_EPSILON || u > 1.0 + FLT_EPSILON {
+        return None;
+    }
     let q = cross(s, e1);
     let v = f * dot(direction, q);
-    if v < -FLT_EPSILON || u + v > 1.0 + FLT_EPSILON { return None; }
+    if v < -FLT_EPSILON || u + v > 1.0 + FLT_EPSILON {
+        return None;
+    }
     let t = f * dot(e2, q);
     (t >= 0.0).then_some(t)
 }
@@ -3660,12 +3956,7 @@ struct Bvh {
 }
 
 impl Bvh {
-    fn from_triangles(
-        tris: &[Triangle],
-        verts: &[Vertex],
-        side: u8,
-        pad: f32,
-    ) -> Self {
+    fn from_triangles(tris: &[Triangle], verts: &[Vertex], side: u8, pad: f32) -> Self {
         let mut entries: Vec<usize> = tris
             .iter()
             .enumerate()
@@ -3820,7 +4111,9 @@ struct FacePointScratch {
 
 fn point_in_face(face: &Face, verts: &[Vertex], scratch: &mut FacePointScratch) -> P3 {
     scratch.points.clear();
-    scratch.points.extend(face.verts.iter().map(|&vertex| verts[vertex].co));
+    scratch
+        .points
+        .extend(face.verts.iter().map(|&vertex| verts[vertex].co));
     scratch.ring.clear();
     scratch.ring.extend(0..scratch.points.len());
     float_face_tris_into(
@@ -3848,7 +4141,6 @@ fn point_in_face(face: &Face, verts: &[Vertex], scratch: &mut FacePointScratch) 
     ]
 }
 
-
 fn canonical_face_key(ring: &[usize]) -> Vec<usize> {
     if ring.is_empty() {
         return Vec::new();
@@ -3875,9 +4167,8 @@ fn canonical_face_key(ring: &[usize]) -> Vec<usize> {
 }
 
 fn face_has_edge(face: &Face, edge: EdgeKey) -> bool {
-    (0..face.verts.len()).any(|i| {
-        edge_key_usize(face.verts[i], face.verts[(i + 1) % face.verts.len()]) == edge
-    })
+    (0..face.verts.len())
+        .any(|i| edge_key_usize(face.verts[i], face.verts[(i + 1) % face.verts.len()]) == edge)
 }
 
 fn edge_key_usize(a: usize, b: usize) -> EdgeKey {
@@ -3909,18 +4200,14 @@ fn to_dvec3(value: P3) -> DVec3 {
 fn transform_point(matrix: Mat4, point: P3) -> P3 {
     let columns = matrix.to_cols_array_2d();
     [
-        ((columns[0][0] * point[0] + columns[1][0] * point[1])
-            + columns[2][0] * point[2])
+        ((columns[0][0] * point[0] + columns[1][0] * point[1]) + columns[2][0] * point[2])
             + columns[3][0],
-        ((columns[0][1] * point[0] + columns[1][1] * point[1])
-            + columns[2][1] * point[2])
+        ((columns[0][1] * point[0] + columns[1][1] * point[1]) + columns[2][1] * point[2])
             + columns[3][1],
-        ((columns[0][2] * point[0] + columns[1][2] * point[1])
-            + columns[2][2] * point[2])
+        ((columns[0][2] * point[0] + columns[1][2] * point[1]) + columns[2][2] * point[2])
             + columns[3][2],
     ]
 }
-
 
 fn add(a: P3, b: P3) -> P3 {
     [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
@@ -4170,7 +4457,6 @@ fn intersect_line_triangle(
     None
 }
 
-
 fn reverse_mesh_faces(mesh: &mut Mesh) {
     for face in &mut mesh.faces {
         if face.vertices.len() > 2 {
@@ -4292,4 +4578,3 @@ fn reverse_segments(
         }
     }
 }
-

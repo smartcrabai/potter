@@ -1790,10 +1790,7 @@ impl Node {
     }
 }
 
-fn update_matrix_basis_transform(
-    hasher: &mut sha2::Sha256,
-    transform: &Transform,
-) -> Result<()> {
+fn update_matrix_basis_transform(hasher: &mut sha2::Sha256, transform: &Transform) -> Result<()> {
     use sha2::Digest as _;
 
     for value in &transform.translation {
@@ -2554,9 +2551,8 @@ mod tests {
         node.action = Some(super::Id::from_static("action"));
         assert_eq!(node.captured_matrix_basis(&effective).unwrap(), None);
         node.action = None;
-        node.nla_tracks = vec![
-            serde_json::from_value(serde_json::json!({"id":"track","name":"Track"})).unwrap(),
-        ];
+        node.nla_tracks =
+            vec![serde_json::from_value(serde_json::json!({"id":"track","name":"Track"})).unwrap()];
         assert_eq!(node.captured_matrix_basis(&effective).unwrap(), None);
         node.nla_tracks.clear();
         node.drivers = vec![

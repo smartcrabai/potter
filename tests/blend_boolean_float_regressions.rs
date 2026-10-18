@@ -630,11 +630,13 @@ fn boolean_float_boundaries_match_blender() -> TestResult {
     let directory = tempdir()?;
     let root = fs::canonicalize(directory.path())?;
     let script = root.join("generate_float_boolean.py");
-    let generator =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/boolean_parity/generate_blender_expectations.py");
+    let generator = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/boolean_parity/generate_blender_expectations.py");
     let fixture = FLOAT_FIXTURE.replace(
         "__GENERATOR_PATH__",
-        generator.to_str().ok_or("Boolean generator path is not UTF-8")?,
+        generator
+            .to_str()
+            .ok_or("Boolean generator path is not UTF-8")?,
     );
     fs::write(&script, fixture)?;
     run_generator(&blender, &script, &root)?;
@@ -681,13 +683,11 @@ fn boolean_float_boundaries_match_blender() -> TestResult {
                         .all(|(point, expected)| {
                             point.as_array().is_some_and(|coordinates| {
                                 coordinates.len() == 3
-                                    && coordinates.iter().zip(expected).all(
-                                        |(actual, expected)| {
-                                            actual.as_f64().is_some_and(|actual| {
-                                                (actual - expected).abs() <= 1.0e-6
-                                            })
-                                        },
-                                    )
+                                    && coordinates.iter().zip(expected).all(|(actual, expected)| {
+                                        actual.as_f64().is_some_and(|actual| {
+                                            (actual - expected).abs() <= 1.0e-6
+                                        })
+                                    })
                             })
                         })
             })
@@ -719,7 +719,9 @@ fn boolean_float_boundaries_match_blender() -> TestResult {
                         .map(|difference| format!("{case} Blender error must leave the subject unchanged: {difference}")),
                 );
             }
-            Err(error) => failures.push(format!("{case}: could not evaluate unmodified subject: {error}")),
+            Err(error) => failures.push(format!(
+                "{case}: could not evaluate unmodified subject: {error}"
+            )),
         }
         let expected_error = if case == "collection_intersect_error" {
             "intersect only available using exact solver"
@@ -739,18 +741,25 @@ fn boolean_float_boundaries_match_blender() -> TestResult {
                     && error.message.to_ascii_lowercase().contains(expected_error) => {}
             Err(error) => failures.push(format!(
                 "{case}: expected INVALID_OPERATION containing `{expected_error}`, got {:?}: {}",
-                error.code,
-                error.message,
+                error.code, error.message,
             )),
         }
     }
 
     let mut low_threshold = expected["threshold_default"].clone();
     let mut high_threshold = expected["threshold_high"].clone();
-    low_threshold.as_object_mut().ok_or("threshold expectation is not an object")?.remove("case");
-    high_threshold.as_object_mut().ok_or("threshold expectation is not an object")?.remove("case");
+    low_threshold
+        .as_object_mut()
+        .ok_or("threshold expectation is not an object")?
+        .remove("case");
+    high_threshold
+        .as_object_mut()
+        .ok_or("threshold expectation is not an object")?
+        .remove("case");
     if low_threshold != high_threshold {
-        failures.push("Blender FLOAT threshold probe unexpectedly changed the near-gap union".to_owned());
+        failures.push(
+            "Blender FLOAT threshold probe unexpectedly changed the near-gap union".to_owned(),
+        );
     }
     for operation in ["difference", "union", "intersect"] {
         let mut without_self = expected[&format!("self_{operation}_false")].clone();
@@ -772,7 +781,9 @@ fn boolean_float_boundaries_match_blender() -> TestResult {
             .ok_or("self-overlap expectation is not an object")?
             .remove("use_self");
         if without_self != with_self {
-            failures.push(format!("Blender FLOAT use_self changed the {operation} self-overlap result"));
+            failures.push(format!(
+                "Blender FLOAT use_self changed the {operation} self-overlap result"
+            ));
         }
     }
     let mut open_default = expected["open_difference"].clone();

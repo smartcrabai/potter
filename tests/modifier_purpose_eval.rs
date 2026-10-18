@@ -382,7 +382,11 @@ fn boolean_results_feed_dependent_modifiers_for_both_purposes() -> TestResult {
         let (snapshot, node_errors) =
             Snapshot::evaluate_available_with_cache(&doc, &purpose_context(purpose), None, None)?;
         ensure_eq(&node_errors.is_empty(), &true, "no node evaluation errors")?;
-        for (id, name) in [(&host, "host"), (&follower, "follower"), (&cutter, "cutter")] {
+        for (id, name) in [
+            (&host, "host"),
+            (&follower, "follower"),
+            (&cutter, "cutter"),
+        ] {
             ensure_eq(&snapshot.meshes.contains_key(id), &true, name)?;
         }
     }

@@ -2924,10 +2924,8 @@ fn evaluate_world_matrices_with_meshes(
                     &blender_matrix_from_f64(parent_space),
                     &blender_matrix_from_f64(parent_inverse),
                 );
-                let world = blender_mul_m4(
-                    &parent_space_and_inverse,
-                    &blender_matrix_from_f64(local),
-                );
+                let world =
+                    blender_mul_m4(&parent_space_and_inverse, &blender_matrix_from_f64(local));
                 dmat4_from_blender(&world)
             } else {
                 parent_space * parent_inverse * local

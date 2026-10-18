@@ -313,7 +313,11 @@ fn assert_float_operand_group_remap(document: &SceneDoc, expected: &Value) -> Te
         .get("vertex_groups")
         .and_then(Value::as_object)
         .ok_or("FLOAT group Boolean output lost vertex groups")?;
-    assert_eq!(actual_groups.len(), 1, "operand-only groups must be ignored");
+    assert_eq!(
+        actual_groups.len(),
+        1,
+        "operand-only groups must be ignored"
+    );
     let actual_host_weights = actual_groups["Host"]
         .as_object()
         .ok_or("FLOAT group output did not map Cutter onto Host")?;
@@ -344,7 +348,10 @@ fn assert_float_operand_group_remap(document: &SceneDoc, expected: &Value) -> Te
                 .and_then(Value::as_f64)
                 .is_some_and(|actual| (actual - weight).abs() <= WEIGHT_TOLERANCE)
         });
-        assert!(mapped, "Blender Cutter weight did not land on Potter Host at {position:?}");
+        assert!(
+            mapped,
+            "Blender Cutter weight did not land on Potter Host at {position:?}"
+        );
         matched_operand_weight = true;
     }
     assert!(
@@ -363,7 +370,6 @@ fn disable_other_modifier_stacks(document: &mut SceneDoc, enabled_node: &Id) {
         }
     }
 }
-
 
 #[test]
 fn boolean_decimate_solidify_stack_matches_blender_for_exact_and_float() -> TestResult<()> {
@@ -544,8 +550,7 @@ fn boolean_decimate_solidify_stack_matches_blender_for_exact_and_float() -> Test
             .all(|modifier| modifier.modifier_type != "boolean"),
         "applying the FLOAT Boolean must preserve the downstream stack"
     );
-    let applied_float_snapshot =
-        Snapshot::evaluate(&applied_float, &EvaluationContext::default())?;
+    let applied_float_snapshot = Snapshot::evaluate(&applied_float, &EvaluationContext::default())?;
     let applied_float_mesh = applied_float_snapshot
         .meshes
         .get(&float_node_id)

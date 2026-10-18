@@ -114,7 +114,6 @@ struct UvLayerMetadata {
     render: Option<String>,
 }
 
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NormalCode {
     Auto,
@@ -135,7 +134,6 @@ struct FacePayload {
     corner_attributes: Option<BTreeMap<String, Vec<Value>>>,
     custom_normal_codes: Option<Vec<NormalCode>>,
 }
-
 
 /// One Boolean result in canonical form. `faces` is `None` when the expectation records counts,
 /// face sizes, and volume only.
@@ -295,13 +293,20 @@ fn bools_from_json(value: &Value) -> TestResult<Vec<bool>> {
         .as_array()
         .ok_or("UV pins must be an array")?
         .iter()
-        .map(|value| value.as_bool().ok_or_else(|| "UV pin must be a boolean".into()))
+        .map(|value| {
+            value
+                .as_bool()
+                .ok_or_else(|| "UV pin must be a boolean".into())
+        })
         .collect()
 }
 
 fn expected_uv_layers(value: &Value, ring_len: usize) -> TestResult<BTreeMap<String, UvLayerFace>> {
     let mut layers = BTreeMap::new();
-    for (name, layer) in value.as_object().ok_or("Blender UV layers must be an object")? {
+    for (name, layer) in value
+        .as_object()
+        .ok_or("Blender UV layers must be an object")?
+    {
         let uv = uv_pairs(layer.get("uv").ok_or("Blender UV layer has no UV values")?)?;
         let pins = bools_from_json(layer.get("pins").ok_or("Blender UV layer has no pins")?)?;
         if uv.len() != ring_len || pins.len() != ring_len {
@@ -324,7 +329,6 @@ fn count(value: &Value, name: &str) -> TestResult<usize> {
     Ok(usize::try_from(count)?)
 }
 
-
 fn attribute_default(attribute: &Value) -> Value {
     match attribute.get("type").and_then(Value::as_str) {
         Some("bool") => Value::Bool(false),
@@ -342,11 +346,13 @@ fn user_attribute_name(storage_name: &str) -> &str {
 }
 
 fn color_attribute(mesh: &Mesh, name: &str) -> Option<&Value> {
-    mesh.attributes.iter().find_map(|(storage_name, attribute)| {
-        (user_attribute_name(storage_name) == name
-            && attribute.get("type").and_then(Value::as_str) == Some("color"))
-        .then_some(attribute)
-    })
+    mesh.attributes
+        .iter()
+        .find_map(|(storage_name, attribute)| {
+            (user_attribute_name(storage_name) == name
+                && attribute.get("type").and_then(Value::as_str) == Some("color"))
+            .then_some(attribute)
+        })
 }
 
 /// Values for one Blender mesh domain, in vertex/edge/face/corner order.
@@ -526,7 +532,11 @@ fn uv_map_faces(mesh: &Mesh) -> TestResult<(Vec<Option<Vec<[f64; 2]>>>, Vec<Opti
             .into());
         }
         if faces[index].is_some() {
-            return Err(format!("Potter UVMap has duplicate rows for face {}", mesh.faces[index].id).into());
+            return Err(format!(
+                "Potter UVMap has duplicate rows for face {}",
+                mesh.faces[index].id
+            )
+            .into());
         }
         let pin_row = if let Some(value) = entry.get("pinned").filter(|value| !value.is_null()) {
             let row = bools_from_json(value)?;
@@ -800,9 +810,8 @@ fn potter_canonical(
                     .ok_or("Potter face references a missing vertex")
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let mut face_attribute_values = face_attribute_rows
-            .as_ref()
-            .map(|rows| rows[index].clone());
+        let mut face_attribute_values =
+            face_attribute_rows.as_ref().map(|rows| rows[index].clone());
         let fid = face_attribute_values
             .as_mut()
             .and_then(|attributes| attributes.remove("fid"))
@@ -849,12 +858,7 @@ fn potter_canonical(
             None
         };
         let custom_normals = normals
-            .map(|values| {
-                values
-                    .into_iter()
-                    .map(glam::DVec3::to_array)
-                    .collect()
-            })
+            .map(|values| values.into_iter().map(glam::DVec3::to_array).collect())
             .or_else(|| {
                 derived_normal_rows.as_ref().map(|values| {
                     values[corner_offset..corner_offset + corner_count]
@@ -1032,12 +1036,8 @@ fn expected_faces(value: &Value) -> TestResult<Vec<CanonicalFace>> {
                 uv_pins,
                 uv_layers,
                 point_attributes,
-                custom_normals: normals.map(|values| {
-                    values
-                        .into_iter()
-                        .map(glam::DVec3::to_array)
-                        .collect()
-                }),
+                custom_normals: normals
+                    .map(|values| values.into_iter().map(glam::DVec3::to_array).collect()),
                 face_attributes,
                 corner_attributes,
                 custom_normal_codes,
@@ -1276,7 +1276,6 @@ fn potter_uv_layer_metadata(mesh: &Mesh) -> TestResult<UvLayerMetadata> {
     })
 }
 
-
 fn potter_color_layers(mesh: &Mesh) -> TestResult<Option<ColorLayers>> {
     let Some(store) = mesh.attributes.get("color_layers") else {
         return Ok(None);
@@ -1294,12 +1293,14 @@ fn potter_color_layers(mesh: &Mesh) -> TestResult<Option<ColorLayers>> {
         .iter()
         .map(|name| -> TestResult<_> {
             let name = name.as_str().ok_or("Potter color-layer name is invalid")?;
-            let attribute = color_attribute(mesh, name)
-                .ok_or("Potter color-layer values are missing")?;
+            let attribute =
+                color_attribute(mesh, name).ok_or("Potter color-layer values are missing")?;
             let domain = match attribute.get("domain").and_then(Value::as_str) {
                 Some("point") => "POINT",
                 Some("corner") => "CORNER",
-                _ => return Err(format!("Potter color layer `{name}` has an invalid domain").into()),
+                _ => {
+                    return Err(format!("Potter color layer `{name}` has an invalid domain").into());
+                }
             };
             let data_type = data_types
                 .and_then(|types| types.get(name))
@@ -1469,15 +1470,25 @@ fn uv_layers_match_rotation(
                 && actual_layer.pins.len() == ring_len
                 && expected_layer.uv.len() == ring_len
                 && expected_layer.pins.len() == ring_len
-                && expected_layer.uv.iter().enumerate().all(|(corner, expected_uv)| {
-                    actual_layer.uv[(rotation + corner) % ring_len]
-                        .into_iter()
-                        .zip(*expected_uv)
-                        .all(|(actual, expected)| value_matches(actual, expected, FLOAT_TOLERANCE))
-                })
-                && expected_layer.pins.iter().enumerate().all(|(corner, expected_pin)| {
-                    actual_layer.pins[(rotation + corner) % ring_len] == *expected_pin
-                })
+                && expected_layer
+                    .uv
+                    .iter()
+                    .enumerate()
+                    .all(|(corner, expected_uv)| {
+                        actual_layer.uv[(rotation + corner) % ring_len]
+                            .into_iter()
+                            .zip(*expected_uv)
+                            .all(|(actual, expected)| {
+                                value_matches(actual, expected, FLOAT_TOLERANCE)
+                            })
+                    })
+                && expected_layer
+                    .pins
+                    .iter()
+                    .enumerate()
+                    .all(|(corner, expected_pin)| {
+                        actual_layer.pins[(rotation + corner) % ring_len] == *expected_pin
+                    })
         })
 }
 
@@ -1491,12 +1502,15 @@ fn face_signature_matches_rotation(
         Some(expected_rows) => actual.point_attributes.as_ref().is_some_and(|actual_rows| {
             expected_rows.len() == actual.ring.len()
                 && actual_rows.len() == actual.ring.len()
-                && expected_rows.iter().enumerate().all(|(corner, expected_values)| {
-                    attribute_values_match(
-                        &actual_rows[(rotation + corner) % actual.ring.len()],
-                        expected_values,
-                    )
-                })
+                && expected_rows
+                    .iter()
+                    .enumerate()
+                    .all(|(corner, expected_values)| {
+                        attribute_values_match(
+                            &actual_rows[(rotation + corner) % actual.ring.len()],
+                            expected_values,
+                        )
+                    })
         }),
     };
     let uv_layers_match = match &expected.uv_layers {
@@ -1510,9 +1524,12 @@ fn face_signature_matches_rotation(
         Some(expected_pins) => actual.uv_pins.as_ref().is_some_and(|actual_pins| {
             expected_pins.len() == actual.ring.len()
                 && actual_pins.len() == actual.ring.len()
-                && expected_pins.iter().enumerate().all(|(corner, expected_pin)| {
-                    actual_pins[(rotation + corner) % actual.ring.len()] == *expected_pin
-                })
+                && expected_pins
+                    .iter()
+                    .enumerate()
+                    .all(|(corner, expected_pin)| {
+                        actual_pins[(rotation + corner) % actual.ring.len()] == *expected_pin
+                    })
         }),
     };
     point_attributes_match && uv_pins_match && uv_layers_match
@@ -1591,7 +1608,9 @@ fn compare_face_attribute_map(
     match (actual, expected) {
         (Some(actual), Some(expected)) if attribute_values_match(actual, expected) => Vec::new(),
         (Some(actual), Some(expected)) => {
-            vec![format!("{context}: {name} {actual:?} differs from Blender {expected:?}")]
+            vec![format!(
+                "{context}: {name} {actual:?} differs from Blender {expected:?}"
+            )]
         }
         (Some(actual), None) => vec![format!("{context}: unexpected {name} {actual:?}")],
         (None, Some(expected)) => {
@@ -1646,10 +1665,14 @@ fn compare_corner_attributes(
             }
         }
         (Some(actual), None) => {
-            differences.push(format!("{context}: unexpected corner attributes {actual:?}"));
+            differences.push(format!(
+                "{context}: unexpected corner attributes {actual:?}"
+            ));
         }
         (None, Some(expected)) => {
-            differences.push(format!("{context}: missing Blender corner attributes {expected:?}"));
+            differences.push(format!(
+                "{context}: missing Blender corner attributes {expected:?}"
+            ));
         }
         (None, None) => {}
     }
@@ -1729,9 +1752,9 @@ fn compare_uv_pins(
                 }
             }
         }
-        (None, Some(expected)) => differences.push(format!(
-            "{context}: missing Blender UV pins {expected:?}"
-        )),
+        (None, Some(expected)) => {
+            differences.push(format!("{context}: missing Blender UV pins {expected:?}"))
+        }
     }
     differences
 }
@@ -1836,7 +1859,6 @@ fn compare_uv_layers(
     differences
 }
 
-
 fn compare_custom_normal_codes(
     actual: &Option<Vec<NormalCode>>,
     expected: &Option<Vec<NormalCode>>,
@@ -1870,7 +1892,9 @@ fn compare_custom_normal_codes(
             }
         }
         (Some(actual), None) => {
-            differences.push(format!("{context}: unexpected custom-normal codes {actual:?}"));
+            differences.push(format!(
+                "{context}: unexpected custom-normal codes {actual:?}"
+            ));
         }
         (None, Some(expected)) => {
             differences.push(format!(
@@ -2133,9 +2157,10 @@ fn compare_edges(actual: &[[[f64; 3]; 2]], expected: &[[[f64; 3]; 2]]) -> Vec<St
     }
     let mut used = vec![false; actual.len()];
     for (expected_index, expected_edge) in expected.iter().enumerate() {
-        let matched = actual.iter().enumerate().find(|(index, edge)| {
-            !used[*index] && same_edge(**edge, *expected_edge)
-        });
+        let matched = actual
+            .iter()
+            .enumerate()
+            .find(|(index, edge)| !used[*index] && same_edge(**edge, *expected_edge));
         if let Some((actual_index, _)) = matched {
             used[actual_index] = true;
         } else {
@@ -2152,10 +2177,7 @@ fn compare_edges(actual: &[[[f64; 3]; 2]], expected: &[[[f64; 3]; 2]]) -> Vec<St
     differences
 }
 
-fn edge_point_endpoint_matches(
-    actual: &EdgePointEndpoint,
-    expected: &EdgePointEndpoint,
-) -> bool {
+fn edge_point_endpoint_matches(actual: &EdgePointEndpoint, expected: &EdgePointEndpoint) -> bool {
     point_matches(actual.co, expected.co)
         && match (&actual.values, &expected.values) {
             (Some(actual), Some(expected)) => attribute_values_match(actual, expected),
@@ -2452,7 +2474,9 @@ pub fn mismatches(actual: &Canonical, expected: &Canonical) -> Vec<String> {
         (Some(actual), Some(expected)) => differences.push(format!(
             "color layers {actual:?} differ from Blender {expected:?}"
         )),
-        (Some(actual), None) => differences.push(format!("unexpected Potter color layers {actual:?}")),
+        (Some(actual), None) => {
+            differences.push(format!("unexpected Potter color layers {actual:?}"))
+        }
         (None, Some(expected)) => {
             differences.push(format!("missing Blender color layers {expected:?}"))
         }
@@ -2775,14 +2799,18 @@ mod edge_topology_tests {
         assert!(compare_edges(&[edge, edge], &[edge, edge]).is_empty());
 
         let missing_duplicate = compare_edges(&[edge], &[edge, edge]);
-        assert!(missing_duplicate
-            .iter()
-            .any(|difference| difference.contains("no matching Potter edge")));
+        assert!(
+            missing_duplicate
+                .iter()
+                .any(|difference| difference.contains("no matching Potter edge"))
+        );
 
         let extra_duplicate = compare_edges(&[edge, edge], &[edge]);
-        assert!(extra_duplicate
-            .iter()
-            .any(|difference| difference.contains("unexpected Potter edge")));
+        assert!(
+            extra_duplicate
+                .iter()
+                .any(|difference| difference.contains("unexpected Potter edge"))
+        );
     }
 
     #[test]
@@ -2798,15 +2826,11 @@ mod edge_topology_tests {
                 values: values("second"),
             },
         ];
-        let expected_attributes = vec![
-            actual_attributes[1].clone(),
-            actual_attributes[0].clone(),
-        ];
-        assert!(compare_edge_attributes(
-            &Some(actual_attributes),
-            &Some(expected_attributes)
-        )
-        .is_empty());
+        let expected_attributes = vec![actual_attributes[1].clone(), actual_attributes[0].clone()];
+        assert!(
+            compare_edge_attributes(&Some(actual_attributes), &Some(expected_attributes))
+                .is_empty()
+        );
 
         let actual_points = vec![
             edge_point(edge, "left", "right"),
@@ -2827,7 +2851,8 @@ mod edge_topology_tests {
             edge_point(edge, "up", "down"),
         ];
         assert!(
-            !compare_edge_points(&Some(misassociated_points), &Some(expected_associations)).is_empty()
+            !compare_edge_points(&Some(misassociated_points), &Some(expected_associations))
+                .is_empty()
         );
     }
 }

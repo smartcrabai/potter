@@ -1886,7 +1886,11 @@ mod tests {
             layers: vec![ColorLayer {
                 name: "Body".to_owned(),
                 domain: ColorDomain::Point,
-                values: vec![[1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]],
+                values: vec![
+                    [1.0, 0.0, 0.0, 1.0],
+                    [0.0, 1.0, 0.0, 1.0],
+                    [0.0, 0.0, 1.0, 1.0],
+                ],
             }],
             active: None,
             render: None,

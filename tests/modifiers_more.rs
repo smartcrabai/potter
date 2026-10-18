@@ -200,7 +200,11 @@ fn boolean_float_empty_material_remap_preserves_source_indices() {
     let result = float_boolean(&subject, &[operand], "UNION");
 
     assert_eq!(
-        result.faces.iter().filter(|face| face.material_index == 1).count(),
+        result
+            .faces
+            .iter()
+            .filter(|face| face.material_index == 1)
+            .count(),
         operand_faces
     );
 }

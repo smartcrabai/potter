@@ -282,7 +282,8 @@ fn quick_mesh_triangle() -> Result<Mesh, String> {
 fn quick_mesh_wire() -> Result<Mesh, String> {
     let mut mesh = Mesh::from_positions_and_faces(vec![DVec3::ZERO, DVec3::X, DVec3::Y], vec![])
         .map_err(|error| format!("{error:?}"))?;
-    mesh.insert_edge([0, 1]).map_err(|error| format!("{error:?}"))?;
+    mesh.insert_edge([0, 1])
+        .map_err(|error| format!("{error:?}"))?;
     Ok(mesh)
 }
 

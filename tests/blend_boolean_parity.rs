@@ -89,7 +89,9 @@ fn boolean_matches_blender_parity_corpus() -> TestResult {
             .as_str()
             .ok_or("Boolean case solver is missing")?;
         if solver != "EXACT" && solver != "FLOAT" {
-            return Err(format!("unexpected Boolean solver `{solver}` in {}", path.display()).into());
+            return Err(
+                format!("unexpected Boolean solver `{solver}` in {}", path.display()).into(),
+            );
         }
         let case = expected_json["case"]
             .as_str()

@@ -174,15 +174,11 @@ pub(crate) fn float_object_quick_mesh(
             let transform = operand.to_subject.to_cols_array().map(|value| value as f32);
             let mut mesh = operand.mesh.clone();
             for vertex in &mut mesh.vertices {
-                let point = glam::Vec3::new(
-                    vertex.co.x as f32,
-                    vertex.co.y as f32,
-                    vertex.co.z as f32,
-                );
-                vertex.co = crate::geom::blender_matrix::blender_transform_point_f32(
-                    &transform, point,
-                )
-                .as_dvec3();
+                let point =
+                    glam::Vec3::new(vertex.co.x as f32, vertex.co.y as f32, vertex.co.z as f32);
+                vertex.co =
+                    crate::geom::blender_matrix::blender_transform_point_f32(&transform, point)
+                        .as_dvec3();
             }
             FloatObjectQuickMesh::Operand(mesh)
         }

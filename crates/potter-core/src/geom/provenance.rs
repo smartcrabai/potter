@@ -1185,7 +1185,9 @@ fn is_integer(data_type: &str) -> bool {
 
 /// The RGBA components of a color value, when it has exactly four numbers.
 fn rgba_value(value: &Value) -> Option<[f64; 4]> {
-    let components = value.as_array().filter(|components| components.len() == 4)?;
+    let components = value
+        .as_array()
+        .filter(|components| components.len() == 4)?;
     Some([
         components[0].as_f64()?,
         components[1].as_f64()?,
@@ -1653,8 +1655,8 @@ mod tests {
         assert_eq!(byte_half, json!(expected_byte_color([127.0; 4])));
 
         let halfway = json!([0.5, 0.5, 0.5, 0.5]);
-        let rounded = blend([(&halfway, 1.0)].into_iter(), "BYTE_COLOR")
-            .expect("single byte color");
+        let rounded =
+            blend([(&halfway, 1.0)].into_iter(), "BYTE_COLOR").expect("single byte color");
         assert_eq!(
             rounded,
             json!(expected_byte_color([188.0, 188.0, 188.0, 128.0]))

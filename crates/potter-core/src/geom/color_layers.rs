@@ -131,11 +131,7 @@ pub(crate) fn byte_color_encoded_components(linear: [f64; 4]) -> [f32; 4] {
 // Blender's fastpow approximation affects which byte an encoded channel rounds to.
 fn blender_linear_to_srgb_f32(value: f32) -> f32 {
     if value < 0.003_130_8 {
-        if value < 0.0 {
-            0.0
-        } else {
-            value * 12.92
-        }
+        if value < 0.0 { 0.0 } else { value * 12.92 }
     } else {
         1.055 * blender_fastpow512(value) - 0.055
     }
@@ -155,27 +151,21 @@ fn blender_fastpow512(arg: f32) -> f32 {
 
     #[cfg(target_arch = "aarch64")]
     fn rsqrt(value: f32) -> f32 {
-        use std::arch::aarch64::{
-            vdup_n_f32, vget_lane_f32, vmul_f32, vrsqrte_f32, vrsqrts_f32,
-        };
+        use std::arch::aarch64::{vdup_n_f32, vget_lane_f32, vmul_f32, vrsqrte_f32, vrsqrts_f32};
 
         // SAFETY: this fast-power path calls rsqrt only with positive finite scalars.
         unsafe {
             let input = vdup_n_f32(value);
             let mut estimate = vrsqrte_f32(input);
-            estimate =
-                vmul_f32(estimate, vrsqrts_f32(vmul_f32(input, estimate), estimate));
-            estimate =
-                vmul_f32(estimate, vrsqrts_f32(vmul_f32(input, estimate), estimate));
+            estimate = vmul_f32(estimate, vrsqrts_f32(vmul_f32(input, estimate), estimate));
+            estimate = vmul_f32(estimate, vrsqrts_f32(vmul_f32(input, estimate), estimate));
             vget_lane_f32::<0>(estimate)
         }
     }
 
     #[cfg(target_arch = "x86_64")]
     fn rsqrt(value: f32) -> f32 {
-        use std::arch::x86_64::{
-            _mm_add_ps, _mm_cvtss_f32, _mm_mul_ps, _mm_rsqrt_ps, _mm_set1_ps,
-        };
+        use std::arch::x86_64::{_mm_add_ps, _mm_cvtss_f32, _mm_mul_ps, _mm_rsqrt_ps, _mm_set1_ps};
 
         // SAFETY: this fast-power path calls rsqrt only with positive finite scalars.
         unsafe {
@@ -202,8 +192,7 @@ fn blender_fastpow512(arg: f32) -> f32 {
     let xfm1 = rsqrt(xf);
     let x2 = arg * arg;
     let xunder = x2 * xfm1;
-    let mut xavg =
-        (1.0 / (3.0 * 0.629_960_524_947_437) * 0.999_852) * (xover + xunder);
+    let mut xavg = (1.0 / (3.0 * 0.629_960_524_947_437) * 0.999_852) * (xover + xunder);
     xavg *= rsqrt(xavg);
     xavg *= rsqrt(xavg);
     xavg

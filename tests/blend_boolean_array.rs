@@ -257,7 +257,10 @@ fn assert_vertices(actual: &[DVec3], expected: &[DVec3], context: &str) {
         };
         unmatched.swap_remove(index);
     }
-    assert!(unmatched.is_empty(), "{context}: Blender has unmatched vertices");
+    assert!(
+        unmatched.is_empty(),
+        "{context}: Blender has unmatched vertices"
+    );
 }
 
 fn same_edge(actual: [DVec3; 2], expected: [DVec3; 2]) -> bool {
@@ -277,22 +280,28 @@ fn assert_edges(actual: &[[DVec3; 2]], expected: &[[DVec3; 2]], context: &str) {
         };
         unmatched.swap_remove(index);
     }
-    assert!(unmatched.is_empty(), "{context}: Blender has unmatched edges");
+    assert!(
+        unmatched.is_empty(),
+        "{context}: Blender has unmatched edges"
+    );
 }
 
 fn same_oriented_ring(actual: &[DVec3], expected: &[DVec3]) -> bool {
     actual.len() == expected.len()
         && (0..actual.len()).any(|start| {
-            (0..actual.len()).all(|index| {
-                same_point(actual[index], expected[(start + index) % expected.len()])
-            })
+            (0..actual.len())
+                .all(|index| same_point(actual[index], expected[(start + index) % expected.len()]))
         })
 }
 
 fn assert_boolean_geometry(actual: &Surface, expected: &Surface, context: &str) {
     assert_vertices(&actual.vertices, &expected.vertices, context);
     assert_edges(&actual.edges, &expected.edges, context);
-    assert_eq!(actual.faces.len(), expected.faces.len(), "{context}: face count");
+    assert_eq!(
+        actual.faces.len(),
+        expected.faces.len(),
+        "{context}: face count"
+    );
 
     let mut unmatched = expected.faces.clone();
     for face in &actual.faces {
@@ -304,7 +313,10 @@ fn assert_boolean_geometry(actual: &Surface, expected: &Surface, context: &str) 
         };
         unmatched.swap_remove(index);
     }
-    assert!(unmatched.is_empty(), "{context}: Blender has unmatched faces");
+    assert!(
+        unmatched.is_empty(),
+        "{context}: Blender has unmatched faces"
+    );
 
     let volume_error = (actual.signed_volume - expected.signed_volume).abs();
     let volume_tolerance = if expected.signed_volume.abs() <= 1.0e-9 {
@@ -480,7 +492,10 @@ fn boolean_array_box_cutter_layouts_match_blender_for_exact_and_float() -> TestR
         "--out",
         preview_path,
     ])?;
-    assert!(preview.join("top.png").is_file(), "preview image was not written");
+    assert!(
+        preview.join("top.png").is_file(),
+        "preview image was not written"
+    );
 
     let render_dir = root.join("render");
     let render_path = render_dir.to_str().ok_or("Render path is not UTF-8")?;
@@ -500,9 +515,7 @@ fn boolean_array_box_cutter_layouts_match_blender_for_exact_and_float() -> TestR
     assert!(std::path::Path::new(frame_path).is_file());
 
     let exported_blend = root.join("applied_float.blend");
-    let exported_blend_path = exported_blend
-        .to_str()
-        .ok_or("Export path is not UTF-8")?;
+    let exported_blend_path = exported_blend.to_str().ok_or("Export path is not UTF-8")?;
     run_pot(&[
         "export",
         project_path,
@@ -556,6 +569,10 @@ fn boolean_array_box_cutter_layouts_match_blender_for_exact_and_float() -> TestR
             .ok_or("reopened FLOAT host has no evaluated mesh")?,
         reopened_world,
     )?;
-    assert_boolean_geometry(&reopened_surface, &expected_surface, "reopened FLOAT export");
+    assert_boolean_geometry(
+        &reopened_surface,
+        &expected_surface,
+        "reopened FLOAT export",
+    );
     Ok(())
 }

@@ -233,8 +233,7 @@ fn assert_rotated_matrix_capture(document: &SceneDoc) -> TestResult {
     let decomposed_matrix = changed_node.transform.matrix().to_cols_array();
     let changed_snapshot = Snapshot::evaluate(&changed_document, &EvaluationContext::default())?;
     assert_eq!(
-        changed_snapshot.nodes[&changed_id].world_matrix,
-        decomposed_matrix,
+        changed_snapshot.nodes[&changed_id].world_matrix, decomposed_matrix,
         "an invalidated matrix_basis must fall back to the changed decomposed transform"
     );
     Ok(())
@@ -310,7 +309,10 @@ fn exact_boolean_regressions_match_blender() -> TestResult {
                 .nodes
                 .get(&node_id)
                 .ok_or("applied Boolean node disappeared")?;
-            let data_id = node.data.as_ref().ok_or("applied Boolean data is missing")?;
+            let data_id = node
+                .data
+                .as_ref()
+                .ok_or("applied Boolean data is missing")?;
             let data = document
                 .data_blocks
                 .get(data_id)

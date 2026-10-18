@@ -365,7 +365,10 @@ fn blender_open_save_replace_preserves_all_represented_ids() -> Result<(), Box<d
         .args(["--file"])
         .arg(&apply_operations)
         .arg("--json");
-    run_ok(&mut apply_modifier, "applying a modifier with nullable slots")?;
+    run_ok(
+        &mut apply_modifier,
+        "applying a modifier with nullable slots",
+    )?;
     let applied_scene: SceneDoc = serde_json::from_slice(&fs::read(scene.join("scene.json"))?)?;
     assert_nullable_material_slots(&applied_scene)?;
     let source_light_id = source_document["nodes"]["light_node"]["data"]
@@ -419,18 +422,17 @@ fn glb_json(path: &Path) -> Result<Value, Box<dyn Error>> {
 fn blender_source_empty_slot_survives_import_apply_render_and_export() -> Result<(), Box<dyn Error>>
 {
     let Some(blender) = blender_executable() else {
-        eprintln!("skipping Blender source material-slot regression; no executable Blender was found");
+        eprintln!(
+            "skipping Blender source material-slot regression; no executable Blender was found"
+        );
         return Ok(());
     };
 
     let directory = tempdir()?;
     let root = directory.path();
     let source = root.join("material-slots.blend");
-    let source_path = serde_json::to_string(
-        source
-            .to_str()
-            .ok_or("source Blender path is not UTF-8")?,
-    )?;
+    let source_path =
+        serde_json::to_string(source.to_str().ok_or("source Blender path is not UTF-8")?)?;
     let script = r#"
 import bpy
 from mathutils import Vector
@@ -505,7 +507,10 @@ bpy.ops.wm.save_as_mainfile(filepath=__OUTPUT__)
             "--python-expr",
         ])
         .arg(script);
-    run_ok(&mut create_source, "creating a Blender source scene with an empty slot")?;
+    run_ok(
+        &mut create_source,
+        "creating a Blender source scene with an empty slot",
+    )?;
 
     let project = root.join("project");
     let mut init = pot();
@@ -540,7 +545,10 @@ bpy.ops.wm.save_as_mainfile(filepath=__OUTPUT__)
         .ok_or("imported material-slot object is missing")?;
     let material_slots = &scene.nodes[&node_id].materials;
     assert_eq!(material_slots.len(), 3);
-    assert!(material_slots[1].is_none(), "middle Blender slot stays empty");
+    assert!(
+        material_slots[1].is_none(),
+        "middle Blender slot stays empty"
+    );
     let material_zero = material_slots[0]
         .clone()
         .ok_or("first Blender material slot is empty")?;
@@ -556,7 +564,10 @@ bpy.ops.wm.save_as_mainfile(filepath=__OUTPUT__)
     assert_eq!(materials[0].as_ref(), Some(&material_zero));
     assert_eq!(materials[1], None);
     assert_eq!(materials[2].as_ref(), Some(&material_two));
-    assert_eq!(materials.last().and_then(Option::as_ref), Some(&material_two));
+    assert_eq!(
+        materials.last().and_then(Option::as_ref),
+        Some(&material_two)
+    );
     let modifier_id = owner
         .modifiers
         .iter()
@@ -583,7 +594,10 @@ bpy.ops.wm.save_as_mainfile(filepath=__OUTPUT__)
         .args(["--file"])
         .arg(&apply_operations)
         .arg("--json");
-    run_ok(&mut apply_modifier, "applying the imported Triangulate modifier")?;
+    run_ok(
+        &mut apply_modifier,
+        "applying the imported Triangulate modifier",
+    )?;
     scene = serde_json::from_slice(&fs::read(&scene_path)?)?;
     let owner = &scene.nodes[&node_id];
     assert_eq!(owner.materials.len(), 3);
