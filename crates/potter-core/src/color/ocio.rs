@@ -12,9 +12,8 @@
 //! - `AgX_Base_sRGB.cube`, `AgX_Base_Rec2020.cube`, `AgX_False_Color.spi1d`: AgX by Troy Sobotka and EaryChow.
 //! - `filmic_desat_33.cube`, `filmic_to_0-70_1-03.spi1d`: Filmic by Troy Sobotka.
 //!
-//! Licence caveat: the Blender OCIO config header says "See ocio-license.txt", but that file is not
-//! present in the Blender 5.2.2 bundle datafiles, so the terms for redistributing these LUTs are
-//! unverified here. Confirm them before shipping the LUT files outside this repository.
+//! Attribution, file checksums, and licence status are in `color/luts/NOTICE`. The LUT terms the
+//! upstream AgX authors attached are unverified there; Blender's own distribution is GPL-3.0-or-later.
 
 use std::sync::LazyLock;
 
