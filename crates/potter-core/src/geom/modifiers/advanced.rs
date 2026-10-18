@@ -2128,6 +2128,10 @@ pub(super) fn hook(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     } else if let Some(original) = origindex_values(mesh) {
         // Blender `MOD_hook.cc` ORIGINDEX branch: a vertex is hooked when its original index is
         // listed. Generated vertices carry `ORIGINDEX_NONE`, which no listed index matches.
+        // Discrepancy: the fetched source (v5.2.2 `hook_index_array_to_bitmap`) sets bit `i` (the
+        // list position), not bit `j` (the listed index), so it would hook the origin indices
+        // 0..count. The Blender 5.2.2 binary hooks by listed membership (probed: listed [5] moves the
+        // copies of vertex 5). This follows the binary, the observed ground truth.
         let listed_originals: HashSet<usize> = indices.iter().copied().collect();
         for index in 0..vertex_count {
             let source = original
