@@ -1834,30 +1834,20 @@ fn write_geometry(
     output.push_str("\n\t\t}\n");
     write_normal_layer(output, mesh)?;
     write_uv_layers(output, mesh)?;
-    if material_slot_count > 0
-        && let Some(face) = mesh.faces.iter().find(|face| {
-            usize::try_from(face.material_index).map_or(true, |slot| slot >= material_slot_count)
-        })
-    {
-        return Err(PotError::with_details(
-            ErrorCode::SceneInvalid,
-            "mesh face material slot is outside the evaluated material slot list",
-            json!({"face_id":face.id,"slot":face.material_index,"material_count":material_slot_count}),
-        ));
-    }
+    // Blender's FBX exporter sends a face index at or past the slot count to the first exported
+    // material (`export_fbx_bin.py`, `def_me_blmaterial_idx`). `.get` returns `None` for such an index
+    // and the fallback below is that first exported slot.
     if has_material_layer {
         write!(output, "\t\tLayerElementMaterial: 0 {{\n\t\t\tVersion: 101\n\t\t\tName: \"\"\n\t\t\tMappingInformationType: \"ByPolygon\"\n\t\t\tReferenceInformationType: \"IndexToDirect\"\n\t\t\tMaterials: *{} {{\n\t\t\t\ta: ", mesh.faces.len()).map_err(write_error)?;
         for (index, face) in mesh.faces.iter().enumerate() {
             if index != 0 {
                 output.push(',');
             }
-            let slot = usize::try_from(face.material_index).map_err(|_| {
-                PotError::new(
-                    ErrorCode::LimitExceeded,
-                    "FBX face material slot exceeds usize",
-                )
-            })?;
-            let output_slot = material_slot_indices[slot]
+            let slot = usize::try_from(face.material_index).unwrap_or(usize::MAX);
+            let output_slot = material_slot_indices
+                .get(slot)
+                .copied()
+                .flatten()
                 .or(fallback_material_index)
                 .ok_or_else(|| {
                     PotError::new(
@@ -4189,6 +4179,62 @@ mod tests {
         let repeat = textured_triangle_fbx(ImageExtension::Repeat, root.path())?;
         let imported = import_bytes(&repeat, scene_id)?;
         assert_eq!(textured_extension(&imported.doc)?, ImageExtension::Repeat);
+        Ok(())
+    }
+
+    #[test]
+    fn out_of_range_face_material_exports_as_the_first_exported_slot() -> TestResult<()> {
+        // Blender's FBX exporter sends an index past the slot count to the first exported material
+        // (`export_fbx_bin.py`, `def_me_blmaterial_idx`), and validation keeps such a face legal.
+        let first_material = Id::new("first_material")?;
+        let second_material = Id::new("second_material")?;
+        let data_id = Id::new("mesh_data")?;
+        let node_id = Id::new("sheet")?;
+        let mut mesh = triangle()?;
+        mesh.faces[0].material_index = 5;
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        doc.materials
+            .insert(first_material.clone(), Material::default());
+        doc.materials
+            .insert(second_material.clone(), Material::default());
+        doc.data_blocks.insert(
+            data_id.clone(),
+            DataBlock {
+                data_type: "mesh".to_owned(),
+                mesh: Some(mesh),
+                materials: vec![Some(first_material), Some(second_material)],
+                ..DataBlock::default()
+            },
+        );
+        doc.nodes.insert(
+            node_id.clone(),
+            Node {
+                name: "Sheet".to_owned(),
+                kind: "mesh".to_owned(),
+                data: Some(data_id),
+                ..Node::default()
+            },
+        );
+        doc.collections
+            .get_mut(&Id::from_static("collection_root"))
+            .ok_or("FBX test root collection is missing")?
+            .objects
+            .push(node_id);
+
+        let report = crate::validate::validate(&doc, Some("fbx"))?;
+        assert!(!report.has_errors, "{}", report.value);
+        let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
+        let exported = String::from_utf8(export_with_root_allow_lossy(
+            &doc,
+            &snapshot,
+            Path::new("."),
+            false,
+        )?)?;
+        // Slot 0 is FBX material index 0, and the out-of-range face takes it.
+        assert!(
+            exported.contains("Materials: *1 {\n\t\t\t\ta: 0"),
+            "{exported}"
+        );
         Ok(())
     }
 

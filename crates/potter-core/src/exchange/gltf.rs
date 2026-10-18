@@ -7182,7 +7182,7 @@ pub(crate) fn import_indexed(
         let mut polygons = Vec::<Vec<usize>>::new();
         let mut face_material_indices = Vec::<u32>::new();
         let mut face_uvs = Vec::<Vec<CornerUvs>>::new();
-        let mut slots = Vec::<(Id, Option<String>)>::new();
+        let mut slots = Vec::<(Option<Id>, Option<String>)>::new();
         let mut morph_target_count = None;
         let mut morph_deltas = Vec::<Vec<[f64; 3]>>::new();
         let mut joint_data = Vec::<Option<SkinVertexWeights>>::new();
@@ -7192,6 +7192,13 @@ pub(crate) fn import_indexed(
         let mut morph_normals_missing = false;
         let mut primitive_starts = Vec::<usize>::new();
         let mut vertex_bases = BTreeMap::<VertexPayload, usize>::new();
+        // Pinned Blender `has_materials`: a primitive with a material, material variants, or COLOR_0.
+        // Without it the mesh has no material slots and its primitives keep no binding.
+        let has_material_slots = primitives.iter().any(|primitive| {
+            primitive["material"].is_u64()
+                || primitive["attributes"]["COLOR_0"].is_u64()
+                || primitive["extensions"]["KHR_materials_variants"].is_object()
+        });
         // Color layers: one per `COLOR_n` set the primitives use.
         let color_set_numbers = primitives
             .iter()
@@ -7381,15 +7388,24 @@ pub(crate) fn import_indexed(
                     .unwrap_or("Col")
                     .to_owned()
             });
+            // Blender `mesh.py` `has_variant`: the KHR_materials_variants extension has a `mappings` key.
+            let has_variant_mappings = primitive["extensions"]["KHR_materials_variants"]
+                .as_object()
+                .is_some_and(|extension| extension.contains_key("mappings"));
+            // A materialless primitive keeps an empty slot unless it has COLOR_0, which takes the
+            // vertex-colour default material.
             let source_material_id = if let Some(index) = primitive["material"].as_u64() {
                 let material_index = usize::try_from(index)
                     .map_err(|_| import_error("glTF material index exceeds platform range"))?;
-                material_ids
+                let id = material_ids
                     .get(material_index)
                     .cloned()
-                    .ok_or_else(|| import_error("glTF primitive references a missing material"))?
+                    .ok_or_else(|| import_error("glTF primitive references a missing material"))?;
+                Some(id)
+            } else if color_layer.is_none() {
+                None
             } else if let Some(id) = &gltf_default_material {
-                id.clone()
+                Some(id.clone())
             } else {
                 let id = unique_import_id(
                     "gltf_default_material",
@@ -7398,25 +7414,36 @@ pub(crate) fn import_indexed(
                     &mut used_material_ids,
                 )?;
                 let material = Material {
-                    name: "glTF Default".to_owned(),
+                    name: "DefaultMaterial".to_owned(),
                     base_color: [1.0; 4],
                     alpha_mode: "opaque".to_owned(),
                     ..Material::default()
                 };
                 doc.materials.insert(id.clone(), material);
                 gltf_default_material = Some(id.clone());
-                id
+                Some(id)
             };
-            let binding = (source_material_id, color_layer);
-            let material_slot =
-                if let Some(slot) = slots.iter().position(|candidate| candidate == &binding) {
+            // Without material slots every face takes index 0 and the mesh stores no slot table.
+            let material_slot = if has_material_slots {
+                let binding = (source_material_id, color_layer);
+                // Blender `mesh.py` (`not has_variant`): a primitive whose KHR_materials_variants
+                // extension has `mappings` never shares a slot with another primitive.
+                let shared = if has_variant_mappings {
+                    None
+                } else {
+                    slots.iter().position(|candidate| candidate == &binding)
+                };
+                if let Some(slot) = shared {
                     u32::try_from(slot).map_err(|_| import_error("too many glTF material slots"))?
                 } else {
                     let slot = u32::try_from(slots.len())
                         .map_err(|_| import_error("too many glTF material slots"))?;
                     slots.push(binding);
                     slot
-                };
+                }
+            } else {
+                0
+            };
             let face_start = polygons.len();
             primitive_starts.push(face_start);
             append_triangles(
@@ -7712,8 +7739,11 @@ pub(crate) fn import_indexed(
         let data_materials = slots
             .into_iter()
             .map(|(source_material, source_layer)| {
+                let Some(source_material) = source_material else {
+                    return Ok(None);
+                };
                 let Some(source_layer) = source_layer else {
-                    return Ok(source_material);
+                    return Ok(Some(source_material));
                 };
                 let layer = if color_store.index_of(&source_layer).is_some() {
                     source_layer
@@ -7732,6 +7762,7 @@ pub(crate) fn import_indexed(
                     &mut used_material_ids,
                     &mut used_graph_ids,
                 )
+                .map(Some)
             })
             .collect::<Result<Vec<_>>>()?;
         doc.data_blocks.insert(
@@ -7740,7 +7771,7 @@ pub(crate) fn import_indexed(
                 data_type: "mesh".to_owned(),
                 descriptor: None,
                 mesh: Some(mesh),
-                materials: data_materials.into_iter().map(Some).collect(),
+                materials: data_materials,
                 shape_keys,
                 vertex_groups,
                 vertex_weights,
@@ -7752,6 +7783,11 @@ pub(crate) fn import_indexed(
         mesh_skin_weights.push(imported_joint_data);
         mesh_ids_stale.push(ids_stale);
         mesh_shape_key_ids.push(morph_key_ids);
+    }
+    // The template is only the clone source of COLOR_0 slots; once every mesh has bound its slots no
+    // slot names it, so it must not stay as an extra material.
+    if let Some(template) = &gltf_default_material {
+        doc.materials.remove(template);
     }
 
     let camera_ids = import_cameras(&root, &mut doc, &mut used_data_ids)?;
@@ -12098,6 +12134,197 @@ mod tests {
         assert_eq!(restored.layers[1].name, "Second");
         assert_eq!(restored.layers[0].values, vec![[0.1, 0.2, 0.3, 1.0]; 4]);
         assert_eq!(restored.layers[1].values, vec![[0.7, 0.8, 0.9, 1.0]; 4]);
+        Ok(())
+    }
+
+    #[test]
+    fn materialless_primitives_without_colors_or_variants_have_no_slots() -> TestResult {
+        let doc = scene(&json!([
+            {"op":"node.create","id":"box","kind":"box","params":{"size":2.0}}
+        ]))?;
+        let imported = import_edited(&doc, |_, _| Ok(()))??;
+        let data = imported
+            .doc
+            .data_blocks
+            .values()
+            .find(|block| block.mesh.is_some())
+            .ok_or("mesh data is missing")?;
+        assert!(data.materials.is_empty(), "{:?}", data.materials);
+        Ok(())
+    }
+
+    #[test]
+    fn material_variant_only_primitive_retains_nullable_slot() -> TestResult {
+        let mut doc = scene(&json!([
+            {"op":"node.create","id":"box","kind":"box","params":{"size":2.0}}
+        ]))?;
+        let node_id = crate::model::Id::new("box")?;
+        let data_id = doc.nodes[&node_id]
+            .data
+            .clone()
+            .ok_or("box mesh data is missing")?;
+        doc.data_blocks
+            .get_mut(&data_id)
+            .ok_or("box mesh data block is missing")?
+            .materials = vec![None];
+        let imported = import_edited(&doc, |root, _| {
+            root["meshes"][0]["primitives"][0]["extensions"]["KHR_materials_variants"] =
+                json!({"mappings": []});
+            Ok(())
+        })??;
+        let data = imported
+            .doc
+            .data_blocks
+            .values()
+            .find(|block| block.mesh.is_some())
+            .ok_or("mesh data is missing")?;
+        assert_eq!(data.materials, vec![None], "{:?}", data.materials);
+        Ok(())
+    }
+
+    #[test]
+    fn primitives_bind_material_none_and_color0_slots_in_blenders_order() -> TestResult {
+        // Blender `mesh.py`: a material primitive binds its material, a primitive with neither binds an
+        // empty slot, and a COLOR_0 primitive without material binds the vertex-colour default.
+        let root = tempfile::tempdir()?;
+        let mut doc = scene_with_asset_root(
+            root.path(),
+            &json!([
+                {"op":"material.create","id":"paint"},
+                {"op":"node.create","id":"sheet","kind":"plane","params":{"size":2.0},"material":"paint"}
+            ]),
+        )?;
+        let mesh = doc
+            .data_blocks
+            .values_mut()
+            .find_map(|block| block.mesh.as_mut())
+            .ok_or("mesh is missing")?;
+        *mesh = two_triangles()?;
+        crate::geom::color_layers::write(
+            mesh,
+            &crate::geom::color_layers::ColorStore {
+                layers: vec![crate::geom::color_layers::ColorLayer {
+                    name: "Paint".to_owned(),
+                    domain: crate::geom::color_layers::ColorDomain::Point,
+                    values: vec![
+                        [0.125, 0.5, 0.875, 0.35],
+                        [0.25, 0.75, 0.125, 1.0],
+                        [0.875, 0.0625, 0.5, 1.0],
+                        [0.5, 0.25, 0.75, 1.0],
+                    ],
+                }],
+                active: Some("Paint".to_owned()),
+                render: Some("Paint".to_owned()),
+            },
+        );
+        read_vertex_color(&mut doc, "paint", "Paint")?;
+        let imported = import_edited(&doc, |root, _| {
+            let base = root["meshes"][0]["primitives"][0].clone();
+            let mut material_only = base.clone();
+            material_only["attributes"]
+                .as_object_mut()
+                .ok_or("primitive attributes are missing")?
+                .remove("COLOR_0");
+            let mut empty = material_only.clone();
+            empty
+                .as_object_mut()
+                .ok_or("primitive is missing")?
+                .remove("material");
+            let mut color_only = base;
+            color_only
+                .as_object_mut()
+                .ok_or("primitive is missing")?
+                .remove("material");
+            root["meshes"][0]["primitives"] = json!([material_only, empty, color_only]);
+            let primitives = root["meshes"][0]["primitives"]
+                .as_array_mut()
+                .ok_or("mesh primitives are missing")?;
+            for primitive in primitives.iter_mut() {
+                if let Some(extras) = primitive["extras"]["potter"].as_object_mut() {
+                    extras.remove("color_layer");
+                }
+            }
+            let potter = root["meshes"][0]["extras"]["potter"]
+                .as_object_mut()
+                .ok_or("Potter mesh extras are missing")?;
+            potter.remove("vertex_ids");
+            potter.remove("polygons");
+            potter.remove("color_attributes");
+            Ok(())
+        })??;
+        let node = &imported.doc.nodes[&crate::model::Id::new("sheet")?];
+        let data = imported
+            .doc
+            .data_blocks
+            .get(node.data.as_ref().ok_or("mesh data is missing")?)
+            .ok_or("mesh data is missing")?;
+        assert_eq!(data.materials.len(), 3, "{:?}", data.materials);
+        assert!(data.materials[0].is_some(), "{:?}", data.materials);
+        assert_eq!(data.materials[1], None, "{:?}", data.materials);
+        let default_id = data.materials[2]
+            .as_ref()
+            .ok_or("the COLOR_0 primitive binds a slot")?;
+        assert_eq!(imported.doc.materials[default_id].name, "DefaultMaterial");
+        let faces = data
+            .mesh
+            .as_ref()
+            .ok_or("mesh is missing")?
+            .faces
+            .iter()
+            .map(|face| face.material_index)
+            .collect::<Vec<_>>();
+        assert_eq!(faces, vec![0, 0, 1, 1, 2, 2]);
+        Ok(())
+    }
+
+    #[test]
+    fn variant_mapped_primitive_does_not_share_a_slot_with_an_identical_primitive() -> TestResult {
+        // Blender `mesh.py` (`not has_variant`): a primitive with variant mappings gets its own slot
+        // even when another primitive binds the same material.
+        let root = tempfile::tempdir()?;
+        let doc = scene_with_asset_root(
+            root.path(),
+            &json!([
+                {"op":"material.create","id":"paint"},
+                {"op":"node.create","id":"sheet","kind":"plane","params":{"size":2.0},"material":"paint"}
+            ]),
+        )?;
+        let imported = import_edited(&doc, |root, _| {
+            let plain = root["meshes"][0]["primitives"][0].clone();
+            let mut variant = plain.clone();
+            variant["extensions"] = json!({"KHR_materials_variants": {"mappings": []}});
+            root["meshes"][0]["primitives"] = json!([plain, variant]);
+            let potter = root["meshes"][0]["extras"]["potter"]
+                .as_object_mut()
+                .ok_or("Potter mesh extras are missing")?;
+            potter.remove("vertex_ids");
+            potter.remove("polygons");
+            potter.remove("color_attributes");
+            Ok(())
+        })??;
+        let node = &imported.doc.nodes[&crate::model::Id::new("sheet")?];
+        let data = imported
+            .doc
+            .data_blocks
+            .get(node.data.as_ref().ok_or("mesh data is missing")?)
+            .ok_or("mesh data is missing")?;
+        assert_eq!(data.materials.len(), 2, "{:?}", data.materials);
+        assert!(
+            data.materials.iter().all(Option::is_some),
+            "{:?}",
+            data.materials
+        );
+        let faces = data
+            .mesh
+            .as_ref()
+            .ok_or("mesh is missing")?
+            .faces
+            .iter()
+            .map(|face| face.material_index)
+            .collect::<Vec<_>>();
+        let half = faces.len() / 2;
+        assert!(faces[..half].iter().all(|index| *index == 0), "{faces:?}");
+        assert!(faces[half..].iter().all(|index| *index == 1), "{faces:?}");
         Ok(())
     }
 
