@@ -229,8 +229,8 @@ pub(crate) fn mix_byte_color(values: &[[f64; 4]], sources: &[(usize, f64)]) -> [
             continue;
         };
         found = true;
-        let channels = byte_color_encoded_components(*color)
-            .map(|channel| channel.round().clamp(0.0, 255.0));
+        let channels =
+            byte_color_encoded_components(*color).map(|channel| channel.round().clamp(0.0, 255.0));
         let weight = *weight as f32;
         total += weight;
         for (sum, channel) in sums.iter_mut().zip(channels) {

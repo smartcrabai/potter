@@ -86,7 +86,9 @@ pub(crate) fn remap_attributes_skipping(
     origin: &Origin,
     skipped: &[&str],
 ) -> Result<()> {
-    remap_attributes_skipping_with_weighted_corner_boolean_mixer(source, output, origin, skipped, false)
+    remap_attributes_skipping_with_weighted_corner_boolean_mixer(
+        source, output, origin, skipped, false,
+    )
 }
 
 /// Interpolated corner booleans use Blender's weighted `DefaultMixer<bool>`; ordinary topology group
@@ -97,7 +99,9 @@ pub(crate) fn remap_interpolated_corners_skipping(
     origin: &Origin,
     skipped: &[&str],
 ) -> Result<()> {
-    remap_attributes_skipping_with_weighted_corner_boolean_mixer(source, output, origin, skipped, true)
+    remap_attributes_skipping_with_weighted_corner_boolean_mixer(
+        source, output, origin, skipped, true,
+    )
 }
 
 fn remap_attributes_skipping_with_weighted_corner_boolean_mixer(
@@ -1481,8 +1485,11 @@ fn blend_with_boolean_mixer<'a>(
         let mut sum = 0.0_f32;
         let mut total = 0.0_f32;
         for (value, weight) in &items {
-            sum += (if value.as_bool() == Some(true) { 1.0 } else { 0.0 })
-                * (*weight as f32);
+            sum += (if value.as_bool() == Some(true) {
+                1.0
+            } else {
+                0.0
+            }) * (*weight as f32);
             total += *weight as f32;
         }
         return Some(json!(total > 0.0 && sum * (1.0 / total) >= 0.5));
@@ -2070,19 +2077,11 @@ mod tests {
             Some(json!(false))
         );
         assert_eq!(
-            blend_with_boolean_mixer(
-                [(&on, 0.49), (&off, 0.51)].into_iter(),
-                "BOOLEAN",
-                true,
-            ),
+            blend_with_boolean_mixer([(&on, 0.49), (&off, 0.51)].into_iter(), "BOOLEAN", true,),
             Some(json!(false))
         );
         assert_eq!(
-            blend_with_boolean_mixer(
-                [(&on, 0.5), (&off, 0.5)].into_iter(),
-                "BOOLEAN",
-                true,
-            ),
+            blend_with_boolean_mixer([(&on, 0.5), (&off, 0.5)].into_iter(), "BOOLEAN", true,),
             Some(json!(true))
         );
     }
@@ -2110,7 +2109,11 @@ mod tests {
         let origin = Origin {
             vertices: vec![vec![(0, 1.0)], vec![(1, 1.0)], vec![(2, 1.0)]],
             faces: vec![Some(0)],
-            corners: Some(vec![vec![(0, 0.49), (1, 0.51)], vec![(1, 1.0)], vec![(2, 1.0)]]),
+            corners: Some(vec![
+                vec![(0, 0.49), (1, 0.51)],
+                vec![(1, 1.0)],
+                vec![(2, 1.0)],
+            ]),
         };
         let face_key = format!("f{face}");
         let mut boolean_output = triangle();
