@@ -70,6 +70,8 @@ pub(crate) struct ModifierEvaluationContext<'a> {
     pub(crate) purpose: EvaluationPurpose,
     pub(crate) project_root: Option<&'a Path>,
     pub(crate) cache_directory: Option<&'a Path>,
+    /// Current evaluated material-table size in the owning modifier stack, if available.
+    pub(crate) material_slot_count: Option<usize>,
 }
 
 /// Evaluated node state for the selected scene and frame.
@@ -289,6 +291,7 @@ impl Snapshot {
             purpose: context.purpose,
             project_root,
             cache_directory,
+            material_slot_count: None,
         };
         let suppressed = BTreeSet::new();
         let mut world_matrix_ids = BTreeSet::from([target_id.clone()]);
@@ -363,6 +366,7 @@ impl Snapshot {
             purpose: context.purpose,
             project_root,
             cache_directory,
+            material_slot_count: None,
         };
         crate::library::validate_linked_assets(doc, modifier_context.project_root)?;
         let scene_hash = source_scene_hash(doc)?;
@@ -495,6 +499,7 @@ impl Snapshot {
             purpose: context.purpose,
             project_root,
             cache_directory,
+            material_slot_count: None,
         };
         crate::library::validate_linked_assets(source, modifier_context.project_root)?;
         let scene_hash = source_scene_hash(source)?;
@@ -826,6 +831,11 @@ impl Snapshot {
                         );
                     }
                     attach_vertex_group_weights(&mut rigged_source, data_block);
+                    let mut stack_context = gate.context;
+                    stack_context.material_slot_count = Some(crate::model::material_slot_count(
+                        node.materials.len(),
+                        node_materials.len(),
+                    ));
                     let evaluated = crate::geom::modifiers::evaluate_modifiers_with_scene_context(
                         rigged_source,
                         &node.modifiers,
@@ -836,127 +846,135 @@ impl Snapshot {
                         &object_meshes,
                         &meshes,
                         &curve_path_lengths,
-                        gate.context,
+                        stack_context,
                         |_, modifier| gate.is_active(id, modifier),
-                        |mesh, modifier, modifier_warnings| match modifier.modifier_type.as_str() {
-                            "armature" => rig::apply_armature_modifier_with_drivers(
-                                mesh,
-                                data_block,
-                                modifier,
-                                matrix,
-                                doc,
-                                frame,
-                                &matrices,
-                                &driver_values,
-                                modifier_context.project_root,
-                                scene.fps,
-                                scene.fps_base,
-                                &meshes,
-                            ),
-                            "lattice" => apply_lattice_modifier(
-                                mesh, modifier, id, data_block, doc, &matrices,
-                            ),
-                            "volume_to_mesh" => apply_volume_to_mesh_modifier(
-                                mesh,
-                                modifier,
-                                id,
-                                doc,
-                                &matrices,
-                                &volume_data,
-                            ),
-                            "boolean" | "shrinkwrap" | "curve" | "hook" | "warp" => {
-                                apply_scene_operand_modifier(
+                        |mesh, modifier, modifier_warnings| {
+                            let result = match modifier.modifier_type.as_str() {
+                                "armature" => rig::apply_armature_modifier_with_drivers(
+                                    mesh,
+                                    data_block,
+                                    modifier,
+                                    matrix,
+                                    doc,
+                                    frame,
+                                    &matrices,
+                                    &driver_values,
+                                    modifier_context.project_root,
+                                    scene.fps,
+                                    scene.fps_base,
+                                    &meshes,
+                                ),
+                                "lattice" => apply_lattice_modifier(
+                                    mesh, modifier, id, data_block, doc, &matrices,
+                                ),
+                                "volume_to_mesh" => apply_volume_to_mesh_modifier(
+                                    mesh,
+                                    modifier,
+                                    id,
+                                    doc,
+                                    &matrices,
+                                    &volume_data,
+                                ),
+                                "boolean" | "shrinkwrap" | "curve" | "hook" | "warp" => {
+                                    apply_scene_operand_modifier(
+                                        mesh,
+                                        modifier,
+                                        id,
+                                        doc,
+                                        &matrices,
+                                        &meshes,
+                                        &nodes,
+                                        &mut node_materials,
+                                    )
+                                }
+                                "vertex_weight_edit"
+                                | "vertex_weight_mix"
+                                | "vertex_weight_proximity"
+                                | "normal_edit"
+                                | "uv_project"
+                                | "uv_warp"
+                                | "data_transfer" => apply_scene_attribute_modifier(
                                     mesh,
                                     modifier,
                                     id,
                                     doc,
                                     &matrices,
                                     &meshes,
-                                    &nodes,
-                                    &mut node_materials,
+                                    modifier_context.project_root,
+                                ),
+                                "surface_deform" | "mesh_deform" => apply_scene_deform_modifier(
+                                    mesh,
+                                    modifier,
+                                    id,
+                                    doc,
+                                    &matrices,
+                                    &meshes,
+                                    modifier_warnings,
+                                ),
+                                "mesh_sequence_cache" => apply_mesh_sequence_cache_modifier(
+                                    mesh,
+                                    modifier,
+                                    doc,
+                                    modifier_context.project_root,
+                                    frame,
+                                    scene.fps,
+                                    scene.fps_base,
                                 )
-                            }
-                            "vertex_weight_edit"
-                            | "vertex_weight_mix"
-                            | "vertex_weight_proximity"
-                            | "normal_edit"
-                            | "uv_project"
-                            | "uv_warp"
-                            | "data_transfer" => apply_scene_attribute_modifier(
-                                mesh,
-                                modifier,
-                                id,
-                                doc,
-                                &matrices,
-                                &meshes,
-                                modifier_context.project_root,
-                            ),
-                            "surface_deform" | "mesh_deform" => apply_scene_deform_modifier(
-                                mesh,
-                                modifier,
-                                id,
-                                doc,
-                                &matrices,
-                                &meshes,
-                                modifier_warnings,
-                            ),
-                            "mesh_sequence_cache" => apply_mesh_sequence_cache_modifier(
-                                mesh,
-                                modifier,
-                                doc,
-                                modifier_context.project_root,
-                                frame,
-                                scene.fps,
-                                scene.fps_base,
-                            )
-                            .map(|warnings| modifier_warnings.extend(warnings)),
-                            "mesh_cache" => apply_mesh_cache_modifier(
-                                mesh,
-                                modifier,
-                                doc,
-                                modifier_context.project_root,
-                                frame,
-                                scene.fps,
-                                scene.fps_base,
-                            ),
-                            "cloth" | "soft_body" | "collision" | "dynamic_paint" | "fluid"
-                            | "particle_system" => apply_stack_physics_modifier(
-                                mesh,
-                                modifier,
-                                id,
-                                doc,
-                                scene_hash,
-                                gate,
-                                &scene_id,
-                                frame,
-                                &matrices,
-                                &mut simulated_particles,
-                            ),
-                            "particle_instance" => apply_particle_instance_modifier(
-                                mesh,
-                                modifier,
-                                id,
-                                doc,
-                                gate,
-                                frame,
-                                f64::from(scene.fps) / scene.fps_base,
-                                &matrices,
-                                &simulated_particles,
-                            ),
-                            "explode" => apply_explode_modifier(
-                                mesh,
-                                modifier,
-                                id,
-                                doc,
-                                gate,
-                                frame,
-                                &matrices,
-                                &simulated_particles,
-                            ),
-                            _ => Err(PotError::new(
-                                ErrorCode::InternalError,
-                                "unexpected custom modifier callback",
-                            )),
+                                .map(|warnings| modifier_warnings.extend(warnings)),
+                                "mesh_cache" => apply_mesh_cache_modifier(
+                                    mesh,
+                                    modifier,
+                                    doc,
+                                    modifier_context.project_root,
+                                    frame,
+                                    scene.fps,
+                                    scene.fps_base,
+                                ),
+                                "cloth" | "soft_body" | "collision" | "dynamic_paint" | "fluid"
+                                | "particle_system" => apply_stack_physics_modifier(
+                                    mesh,
+                                    modifier,
+                                    id,
+                                    doc,
+                                    scene_hash,
+                                    gate,
+                                    &scene_id,
+                                    frame,
+                                    &matrices,
+                                    &mut simulated_particles,
+                                ),
+                                "particle_instance" => apply_particle_instance_modifier(
+                                    mesh,
+                                    modifier,
+                                    id,
+                                    doc,
+                                    gate,
+                                    frame,
+                                    f64::from(scene.fps) / scene.fps_base,
+                                    &matrices,
+                                    &simulated_particles,
+                                ),
+                                "explode" => apply_explode_modifier(
+                                    mesh,
+                                    modifier,
+                                    id,
+                                    doc,
+                                    gate,
+                                    frame,
+                                    &matrices,
+                                    &simulated_particles,
+                                ),
+                                _ => Err(PotError::new(
+                                    ErrorCode::InternalError,
+                                    "unexpected custom modifier callback",
+                                )),
+                            };
+                            result.map(|()| {
+                                Some(crate::model::material_slot_count(
+                                    node.materials.len(),
+                                    node_materials.len(),
+                                ))
+                            })
                         },
                     )
                     .map_err(|error| attach_node_owner(error, id))?;
@@ -1109,6 +1127,11 @@ impl Snapshot {
                         }
                     };
                     attach_vertex_group_weights(&mut source_mesh, data_block);
+                    let mut stack_context = gate.context;
+                    stack_context.material_slot_count = Some(crate::model::material_slot_count(
+                        node.materials.len(),
+                        node_materials.len(),
+                    ));
                     let evaluated = crate::geom::modifiers::evaluate_modifiers_with_scene_context(
                         source_mesh,
                         &node.modifiers,
@@ -1119,127 +1142,135 @@ impl Snapshot {
                         &object_meshes,
                         &meshes,
                         &curve_path_lengths,
-                        gate.context,
+                        stack_context,
                         |_, modifier| gate.is_active(id, modifier),
-                        |mesh, modifier, modifier_warnings| match modifier.modifier_type.as_str() {
-                            "armature" => rig::apply_armature_modifier_with_drivers(
-                                mesh,
-                                data_block,
-                                modifier,
-                                matrix,
-                                doc,
-                                frame,
-                                &matrices,
-                                &driver_values,
-                                modifier_context.project_root,
-                                scene.fps,
-                                scene.fps_base,
-                                &meshes,
-                            ),
-                            "lattice" => apply_lattice_modifier(
-                                mesh, modifier, id, data_block, doc, &matrices,
-                            ),
-                            "volume_to_mesh" => apply_volume_to_mesh_modifier(
-                                mesh,
-                                modifier,
-                                id,
-                                doc,
-                                &matrices,
-                                &volume_data,
-                            ),
-                            "boolean" | "shrinkwrap" | "curve" | "hook" | "warp" => {
-                                apply_scene_operand_modifier(
+                        |mesh, modifier, modifier_warnings| {
+                            let result = match modifier.modifier_type.as_str() {
+                                "armature" => rig::apply_armature_modifier_with_drivers(
+                                    mesh,
+                                    data_block,
+                                    modifier,
+                                    matrix,
+                                    doc,
+                                    frame,
+                                    &matrices,
+                                    &driver_values,
+                                    modifier_context.project_root,
+                                    scene.fps,
+                                    scene.fps_base,
+                                    &meshes,
+                                ),
+                                "lattice" => apply_lattice_modifier(
+                                    mesh, modifier, id, data_block, doc, &matrices,
+                                ),
+                                "volume_to_mesh" => apply_volume_to_mesh_modifier(
+                                    mesh,
+                                    modifier,
+                                    id,
+                                    doc,
+                                    &matrices,
+                                    &volume_data,
+                                ),
+                                "boolean" | "shrinkwrap" | "curve" | "hook" | "warp" => {
+                                    apply_scene_operand_modifier(
+                                        mesh,
+                                        modifier,
+                                        id,
+                                        doc,
+                                        &matrices,
+                                        &meshes,
+                                        &nodes,
+                                        &mut node_materials,
+                                    )
+                                }
+                                "vertex_weight_edit"
+                                | "vertex_weight_mix"
+                                | "vertex_weight_proximity"
+                                | "normal_edit"
+                                | "uv_project"
+                                | "uv_warp"
+                                | "data_transfer" => apply_scene_attribute_modifier(
                                     mesh,
                                     modifier,
                                     id,
                                     doc,
                                     &matrices,
                                     &meshes,
-                                    &nodes,
-                                    &mut node_materials,
+                                    modifier_context.project_root,
+                                ),
+                                "surface_deform" | "mesh_deform" => apply_scene_deform_modifier(
+                                    mesh,
+                                    modifier,
+                                    id,
+                                    doc,
+                                    &matrices,
+                                    &meshes,
+                                    modifier_warnings,
+                                ),
+                                "mesh_sequence_cache" => apply_mesh_sequence_cache_modifier(
+                                    mesh,
+                                    modifier,
+                                    doc,
+                                    modifier_context.project_root,
+                                    frame,
+                                    scene.fps,
+                                    scene.fps_base,
                                 )
-                            }
-                            "vertex_weight_edit"
-                            | "vertex_weight_mix"
-                            | "vertex_weight_proximity"
-                            | "normal_edit"
-                            | "uv_project"
-                            | "uv_warp"
-                            | "data_transfer" => apply_scene_attribute_modifier(
-                                mesh,
-                                modifier,
-                                id,
-                                doc,
-                                &matrices,
-                                &meshes,
-                                modifier_context.project_root,
-                            ),
-                            "surface_deform" | "mesh_deform" => apply_scene_deform_modifier(
-                                mesh,
-                                modifier,
-                                id,
-                                doc,
-                                &matrices,
-                                &meshes,
-                                modifier_warnings,
-                            ),
-                            "mesh_sequence_cache" => apply_mesh_sequence_cache_modifier(
-                                mesh,
-                                modifier,
-                                doc,
-                                modifier_context.project_root,
-                                frame,
-                                scene.fps,
-                                scene.fps_base,
-                            )
-                            .map(|warnings| modifier_warnings.extend(warnings)),
-                            "mesh_cache" => apply_mesh_cache_modifier(
-                                mesh,
-                                modifier,
-                                doc,
-                                modifier_context.project_root,
-                                frame,
-                                scene.fps,
-                                scene.fps_base,
-                            ),
-                            "cloth" | "soft_body" | "collision" | "dynamic_paint" | "fluid"
-                            | "particle_system" => apply_stack_physics_modifier(
-                                mesh,
-                                modifier,
-                                id,
-                                doc,
-                                scene_hash,
-                                gate,
-                                &scene_id,
-                                frame,
-                                &matrices,
-                                &mut simulated_particles,
-                            ),
-                            "particle_instance" => apply_particle_instance_modifier(
-                                mesh,
-                                modifier,
-                                id,
-                                doc,
-                                gate,
-                                frame,
-                                f64::from(scene.fps) / scene.fps_base,
-                                &matrices,
-                                &simulated_particles,
-                            ),
-                            "explode" => apply_explode_modifier(
-                                mesh,
-                                modifier,
-                                id,
-                                doc,
-                                gate,
-                                frame,
-                                &matrices,
-                                &simulated_particles,
-                            ),
-                            _ => Err(PotError::new(
-                                ErrorCode::InternalError,
-                                "unexpected custom modifier callback",
-                            )),
+                                .map(|warnings| modifier_warnings.extend(warnings)),
+                                "mesh_cache" => apply_mesh_cache_modifier(
+                                    mesh,
+                                    modifier,
+                                    doc,
+                                    modifier_context.project_root,
+                                    frame,
+                                    scene.fps,
+                                    scene.fps_base,
+                                ),
+                                "cloth" | "soft_body" | "collision" | "dynamic_paint" | "fluid"
+                                | "particle_system" => apply_stack_physics_modifier(
+                                    mesh,
+                                    modifier,
+                                    id,
+                                    doc,
+                                    scene_hash,
+                                    gate,
+                                    &scene_id,
+                                    frame,
+                                    &matrices,
+                                    &mut simulated_particles,
+                                ),
+                                "particle_instance" => apply_particle_instance_modifier(
+                                    mesh,
+                                    modifier,
+                                    id,
+                                    doc,
+                                    gate,
+                                    frame,
+                                    f64::from(scene.fps) / scene.fps_base,
+                                    &matrices,
+                                    &simulated_particles,
+                                ),
+                                "explode" => apply_explode_modifier(
+                                    mesh,
+                                    modifier,
+                                    id,
+                                    doc,
+                                    gate,
+                                    frame,
+                                    &matrices,
+                                    &simulated_particles,
+                                ),
+                                _ => Err(PotError::new(
+                                    ErrorCode::InternalError,
+                                    "unexpected custom modifier callback",
+                                )),
+                            };
+                            result.map(|()| {
+                                Some(crate::model::material_slot_count(
+                                    node.materials.len(),
+                                    node_materials.len(),
+                                ))
+                            })
                         },
                     )
                     .map_err(|error| attach_node_owner(error, id))?;
@@ -5229,6 +5260,7 @@ mod tests {
                 purpose: super::EvaluationPurpose::Preview,
                 project_root: None,
                 cache_directory: None,
+                material_slot_count: None,
             },
             suppressed: &suppressed,
         };

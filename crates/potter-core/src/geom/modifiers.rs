@@ -126,7 +126,7 @@ pub fn evaluate_modifiers_with_groups_and_custom_at_frame(
     modifiers: &[Modifier],
     node_groups: &Registry<NodeGroup>,
     frame: f64,
-    custom_modifier: impl FnMut(&mut Mesh, &Modifier, &mut Vec<PotError>) -> Result<()>,
+    mut custom_modifier: impl FnMut(&mut Mesh, &Modifier, &mut Vec<PotError>) -> Result<()>,
 ) -> Result<ModifierEvaluation> {
     evaluate_modifiers_with_scene_context(
         evaluated,
@@ -140,7 +140,10 @@ pub fn evaluate_modifiers_with_groups_and_custom_at_frame(
         &BTreeMap::new(),
         ModifierEvaluationContext::default(),
         |_, modifier| modifier.enabled,
-        custom_modifier,
+        |mesh, modifier, warnings| {
+            custom_modifier(mesh, modifier, warnings)?;
+            Ok(None)
+        },
     )
 }
 
@@ -156,13 +159,14 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
     curve_path_lengths: &BTreeMap<Id, f64>,
     context: ModifierEvaluationContext<'_>,
     is_active: impl Fn(usize, &Modifier) -> bool,
-    mut custom_modifier: impl FnMut(&mut Mesh, &Modifier, &mut Vec<PotError>) -> Result<()>,
+    mut custom_modifier: impl FnMut(&mut Mesh, &Modifier, &mut Vec<PotError>) -> Result<Option<usize>>,
 ) -> Result<ModifierEvaluation> {
     if !frame.is_finite() {
         return Err(PotError::invalid_argument(
             "modifier evaluation frame must be finite",
         ));
     }
+    let mut context = context;
     let mut instance_paths = Vec::new();
     let mut warnings = Vec::new();
     for (modifier_index, modifier) in modifiers
@@ -224,7 +228,12 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
                 && modifier.params.get("object").is_some_and(Value::is_string))
             || scene_operand_modifier
         {
-            custom_modifier(&mut evaluated, modifier, &mut warnings)?;
+            // Scene callbacks may replace the Boolean TRANSFER pool used by later modifiers.
+            if let Some(material_slot_count) =
+                custom_modifier(&mut evaluated, modifier, &mut warnings)?
+            {
+                context.material_slot_count = Some(material_slot_count);
+            }
             continue;
         }
         if modifier.modifier_type == "nodes" {
@@ -626,6 +635,15 @@ fn mesh_error(error: &MeshError) -> PotError {
 
 fn validated(mesh: &Mesh) -> Result<()> {
     mesh.validate().map_err(|error| mesh_error(&error))
+}
+
+/// Best material-table size available to direct, contextless mesh modifier evaluation.
+pub(crate) fn contextless_material_slot_count(mesh: &Mesh) -> usize {
+    mesh.faces
+        .iter()
+        .map(|face| usize::try_from(face.material_index).unwrap_or(usize::MAX))
+        .max()
+        .map_or(0, |index| index.saturating_add(1))
 }
 
 fn parameter_value<'a>(modifier: &'a Modifier, name: &str) -> Option<&'a Value> {
