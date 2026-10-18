@@ -229,7 +229,7 @@ mod tests {
 
     #[test]
     fn spot_attenuation_has_a_hard_edge_at_zero_blend_and_a_full_smoothstep_at_unit_blend() {
-        let half = 0.5;
+        let half: f64 = 0.5;
         // blend 0: a hard edge at the half angle.
         assert_eq!(spot_attenuation(half.cos() + 1.0e-6, 2.0 * half, 0.0), 1.0);
         assert_eq!(spot_attenuation(half.cos() - 1.0e-6, 2.0 * half, 0.0), 0.0);
@@ -253,13 +253,8 @@ mod tests {
         // A uniform disk of radius R and radiance 1 at height h gives E = π R² / (R² + h²).
         let shape = disk_of_radius_one_at_height_two();
         let centre = DVec3::new(0.0, 0.0, 2.0);
-        let irradiance = area_irradiance_per_radiance(
-            &shape,
-            centre,
-            DVec3::NEG_Z,
-            DVec3::ZERO,
-            DVec3::Z,
-        );
+        let irradiance =
+            area_irradiance_per_radiance(&shape, centre, DVec3::NEG_Z, DVec3::ZERO, DVec3::Z);
         let exact = PI / 5.0;
         assert!(
             (irradiance - exact).abs() <= 0.002 * exact,
@@ -286,7 +281,10 @@ mod tests {
             DVec3::ZERO,
             DVec3::Z,
         );
-        assert!((irradiance - 0.752_276).abs() < 1.0e-4, "irradiance {irradiance}");
+        assert!(
+            (irradiance - 0.752_276).abs() < 1.0e-4,
+            "irradiance {irradiance}"
+        );
     }
 
     #[test]

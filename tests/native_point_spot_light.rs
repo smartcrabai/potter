@@ -17,7 +17,7 @@ mod native_oracle;
 #[path = "common/process.rs"]
 mod process;
 
-use std::{path::Path, fs};
+use std::{fs, path::Path};
 
 use native_oracle::{
     TestResult, apply_operations, import_blend, pot, read_scene, run_blender_arguments,
@@ -109,7 +109,9 @@ fn check_scenario(kind: &str) -> TestResult {
     }
     let count = (PATCH.len() * PATCH.len()) as f64;
     for (channel, (actual, wanted)) in total.iter().map(|sum| sum / count).zip(wanted).enumerate() {
-        let wanted = wanted.as_f64().ok_or("the Blender patch mean is not a number")?;
+        let wanted = wanted
+            .as_f64()
+            .ok_or("the Blender patch mean is not a number")?;
         assert!(
             (actual - wanted).abs() <= PIXEL_TOLERANCE,
             "{kind} channel {channel}: Potter {actual} differs from Cycles {wanted}"

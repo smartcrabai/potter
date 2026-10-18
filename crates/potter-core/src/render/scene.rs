@@ -2114,19 +2114,16 @@ fn light_contribution(
                 return DVec3::ZERO;
             }
             let light_direction = matrix.transform_vector3(-DVec3::Z).normalize_or_zero();
-            let irradiance = area_irradiance_per_radiance(
-                &shape,
-                position,
-                light_direction,
-                point,
-                normal,
-            ) * area_radiance(energy, shape.area);
+            let irradiance =
+                area_irradiance_per_radiance(&shape, position, light_direction, point, normal)
+                    * area_radiance(energy, shape.area);
             if irradiance <= 0.0 {
                 return DVec3::ZERO;
             }
             // Five shadow rays: the centre and the four edge midpoints, averaged.
             let mut visibility = 0.0;
-            for (along_u, along_v) in [(0.0, 0.0), (1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
+            for (along_u, along_v) in [(0.0, 0.0), (1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)]
+            {
                 let sample_position = position
                     + shape.axis_u * (shape.half_u * along_u)
                     + shape.axis_v * (shape.half_v * along_v);

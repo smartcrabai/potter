@@ -1575,8 +1575,7 @@ fn sample_light(light: &PointLight, point: DVec3, rng: &mut Pcg32) -> Option<Lig
         return Some(LightSample {
             direction,
             distance: distance_to_centre,
-            radiance: light.color
-                * (intensity / distance_squared * attenuation(-direction)),
+            radiance: light.color * (intensity / distance_squared * attenuation(-direction)),
         });
     }
     let emitter = emitter_radiance(light.energy, radius);
@@ -1586,8 +1585,8 @@ fn sample_light(light: &PointLight, point: DVec3, rng: &mut Pcg32) -> Option<Lig
         let (tangent, bitangent) = basis(from_centre);
         let disk_radius = radius * rng.next_f64().sqrt();
         let phi = std::f64::consts::TAU * rng.next_f64();
-        let sample_point = light.position
-            + (tangent * phi.cos() + bitangent * phi.sin()) * disk_radius;
+        let sample_point =
+            light.position + (tangent * phi.cos() + bitangent * phi.sin()) * disk_radius;
         let offset = sample_point - point;
         let distance = offset.length();
         if !distance.is_finite() || distance <= f64::EPSILON {
@@ -1598,8 +1597,8 @@ fn sample_light(light: &PointLight, point: DVec3, rng: &mut Pcg32) -> Option<Lig
         if cos_light <= 0.0 {
             return None;
         }
-        let weight = emitter * std::f64::consts::PI * radius * radius * cos_light
-            / (distance * distance);
+        let weight =
+            emitter * std::f64::consts::PI * radius * radius * cos_light / (distance * distance);
         return Some(LightSample {
             direction,
             distance,
@@ -1615,12 +1614,11 @@ fn sample_light(light: &PointLight, point: DVec3, rng: &mut Pcg32) -> Option<Lig
         let sine = (1.0 - cosine * cosine).max(0.0).sqrt();
         let phi = std::f64::consts::TAU * rng.next_f64();
         let (tangent, bitangent) = basis(toward_centre);
-        let direction = toward_centre * cosine
-            + (tangent * phi.cos() + bitangent * phi.sin()) * sine;
+        let direction =
+            toward_centre * cosine + (tangent * phi.cos() + bitangent * phi.sin()) * sine;
         // Law of cosines: the first hit with the sphere along `direction`.
         let distance = distance_to_centre * cosine
-            - (radius * radius - distance_squared
-                + distance_squared * cosine * cosine)
+            - (radius * radius - distance_squared + distance_squared * cosine * cosine)
                 .max(0.0)
                 .sqrt();
         let solid_angle = 2.0 * std::f64::consts::PI * one_minus_cos;
@@ -2585,6 +2583,7 @@ mod volume_extinction_tests {
             color: DVec3::ONE,
             energy: power,
             radius: 0.0,
+            soft_falloff: false,
             spot_size: 0.0,
             spot_blend: 0.0,
             area: Some(AreaShape {
