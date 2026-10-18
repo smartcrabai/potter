@@ -912,13 +912,17 @@ impl Snapshot {
                             .map(|warnings| modifier_warnings.extend(warnings)),
                             "mesh_cache" => apply_mesh_cache_modifier(
                                 mesh,
+                                node_data.and_then(|data| {
+                                    data.mesh.as_ref().filter(|_| data.data_type == "mesh")
+                                }),
                                 modifier,
                                 doc,
                                 modifier_context.project_root,
                                 frame,
                                 scene.fps,
                                 scene.fps_base,
-                            ),
+                            )
+                            .map(|warnings| modifier_warnings.extend(warnings)),
                             "cloth" | "soft_body" | "collision" | "dynamic_paint" | "fluid"
                             | "particle_system" => apply_stack_physics_modifier(
                                 mesh,
@@ -1195,13 +1199,17 @@ impl Snapshot {
                             .map(|warnings| modifier_warnings.extend(warnings)),
                             "mesh_cache" => apply_mesh_cache_modifier(
                                 mesh,
+                                node_data.and_then(|data| {
+                                    data.mesh.as_ref().filter(|_| data.data_type == "mesh")
+                                }),
                                 modifier,
                                 doc,
                                 modifier_context.project_root,
                                 frame,
                                 scene.fps,
                                 scene.fps_base,
-                            ),
+                            )
+                            .map(|warnings| modifier_warnings.extend(warnings)),
                             "cloth" | "soft_body" | "collision" | "dynamic_paint" | "fluid"
                             | "particle_system" => apply_stack_physics_modifier(
                                 mesh,
@@ -2449,15 +2457,16 @@ pub(crate) fn apply_scene_deform_modifier(
 
 fn apply_mesh_cache_modifier(
     mesh: &mut Mesh,
+    source_mesh: Option<&Mesh>,
     modifier: &Modifier,
     doc: &SceneDoc,
     project_root: Option<&Path>,
     frame: f64,
     fps: u32,
     fps_base: f64,
-) -> Result<()> {
+) -> Result<Vec<PotError>> {
     if crate::geom::modifiers::attributes::mesh_cache_is_disabled(modifier) {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let resource_text = modifier
         .params
@@ -2477,9 +2486,24 @@ fn apply_mesh_cache_modifier(
             json!({"modifier_id":modifier.id,"resource":resource_text}),
         )
     })?;
+    // A registered resource with an empty URI is Blender's empty filepath, so the modifier is a no-op.
+    if doc.resources.get(&resource_id).is_some_and(|resource| {
+        resource
+            .get("uri")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|uri| uri.trim().is_empty())
+    }) {
+        return Ok(Vec::new());
+    }
     let (bytes, _) = read_cache_resource(doc, project_root, &resource_id)?;
     crate::geom::modifiers::attributes::evaluate_mesh_cache(
-        mesh, modifier, frame, fps, fps_base, &bytes,
+        mesh,
+        source_mesh,
+        modifier,
+        frame,
+        fps,
+        fps_base,
+        &bytes,
     )
 }
 
@@ -2492,17 +2516,31 @@ fn apply_mesh_sequence_cache_modifier(
     fps: u32,
     fps_base: f64,
 ) -> Result<Vec<PotError>> {
-    let resource_text = modifier
-        .params
-        .get("resource")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            PotError::with_details(
+    // Blender's MeshSequenceCache is disabled without an object path or a cache resource.
+    match modifier.params.get("object_path") {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::String(object_path)) if object_path.is_empty() => return Ok(Vec::new()),
+        Some(Value::String(_)) => {}
+        Some(_) => {
+            return Err(PotError::with_details(
+                ErrorCode::InvalidArgument,
+                "Mesh Sequence Cache object_path must be a string",
+                json!({"modifier_id":modifier.id,"parameter":"object_path"}),
+            ));
+        }
+    }
+    let resource_text = match modifier.params.get("resource") {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::String(resource)) if resource.is_empty() => return Ok(Vec::new()),
+        Some(Value::String(resource)) => resource.as_str(),
+        Some(_) => {
+            return Err(PotError::with_details(
                 ErrorCode::InvalidArgument,
                 "Mesh Sequence Cache resource must be a resource ID",
                 json!({"modifier_id":modifier.id,"parameter":"resource"}),
-            )
-        })?;
+            ));
+        }
+    };
     let resource_id = Id::new(resource_text).map_err(|error| {
         PotError::with_details(
             ErrorCode::InvalidArgument,

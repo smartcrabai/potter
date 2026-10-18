@@ -448,8 +448,529 @@ fn mesh_cache_mdd_interpolates_resource_frames() -> Result<(), Box<dyn Error>> {
             "factor":1.0
         }),
     )?;
-    evaluate_mesh_cache(&mut mesh, &cache, 1.0, 24, 1.0, &bytes)?;
+    evaluate_mesh_cache(&mut mesh, None, &cache, 1.0, 24, 1.0, &bytes)?;
     assert!((mesh.vertices[0].co.x - 1.0).abs() < 1.0e-12);
+    Ok(())
+}
+
+#[test]
+fn mesh_cache_frame_mode_uses_positional_indices_and_linear_snap() -> Result<(), Box<dyn Error>> {
+    let samples = [[DVec3::ZERO; 4], [DVec3::new(2.0, 0.0, 0.0); 4]];
+    let mut bytes = pc2_cache(&samples);
+    bytes[20..24].copy_from_slice(&100.0_f32.to_le_bytes());
+    bytes[12..16].copy_from_slice(&7_i32.to_le_bytes());
+    let scene_modifier = modifier(
+        "mesh_cache",
+        json!({
+            "resource":"cache","cache_format":"PC2","play_mode":"SCENE",
+            "time_mode":"FRAME","frame_start":0.25,"frame_scale":1.5,
+            "interpolation":"LINEAR","deform_mode":"OVERWRITE","factor":1.0,
+            "forward_axis":"POS_Y","up_axis":"POS_Z"
+        }),
+    )?;
+    let mut scene_mesh = Mesh::from_positions_and_faces(vec![DVec3::ZERO; 4], vec![])?;
+    evaluate_mesh_cache(&mut scene_mesh, None, &scene_modifier, 0.5, 24, 1.0, &bytes)?;
+    assert!((scene_mesh.vertices[0].co.x - 1.0).abs() < 1.0e-12);
+
+    let nearest_modifier = modifier(
+        "mesh_cache",
+        json!({
+            "resource":"cache","cache_format":"PC2","play_mode":"CUSTOM",
+            "time_mode":"FRAME","eval_frame":0.75,"interpolation":"NONE",
+            "deform_mode":"OVERWRITE","factor":1.0,
+            "forward_axis":"POS_Y","up_axis":"POS_Z"
+        }),
+    )?;
+    let mut nearest_mesh = Mesh::from_positions_and_faces(vec![DVec3::ZERO; 4], vec![])?;
+    evaluate_mesh_cache(
+        &mut nearest_mesh,
+        None,
+        &nearest_modifier,
+        0.0,
+        24,
+        1.0,
+        &bytes,
+    )?;
+    assert!((nearest_mesh.vertices[0].co.x - 2.0).abs() < 1.0e-12);
+
+    let snap_modifier = modifier(
+        "mesh_cache",
+        json!({
+            "resource":"cache","cache_format":"PC2","play_mode":"CUSTOM",
+            "time_mode":"FRAME","eval_frame":0.000_100_000_000_001,"interpolation":"LINEAR",
+            "deform_mode":"OVERWRITE","factor":1.0,
+            "forward_axis":"POS_Y","up_axis":"POS_Z"
+        }),
+    )?;
+    let mut snap_mesh = Mesh::from_positions_and_faces(vec![DVec3::ZERO; 4], vec![])?;
+    evaluate_mesh_cache(&mut snap_mesh, None, &snap_modifier, 0.0, 24, 1.0, &bytes)?;
+    assert_eq!(snap_mesh.vertices[0].co, DVec3::ZERO);
+    Ok(())
+}
+
+#[test]
+fn mesh_cache_mdd_time_interpolates_nonuniform_timestamps() -> Result<(), Box<dyn Error>> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&3_i32.to_be_bytes());
+    bytes.extend_from_slice(&1_i32.to_be_bytes());
+    for time in [0.0_f32, 1.0, 4.0] {
+        bytes.extend_from_slice(&time.to_be_bytes());
+    }
+    for x in [0.0_f32, 10.0, 40.0] {
+        bytes.extend_from_slice(&x.to_be_bytes());
+        bytes.extend_from_slice(&0.0_f32.to_be_bytes());
+        bytes.extend_from_slice(&0.0_f32.to_be_bytes());
+    }
+    let cache = modifier(
+        "mesh_cache",
+        json!({
+            "resource":"cache","cache_format":"MDD","play_mode":"CUSTOM",
+            "time_mode":"TIME","eval_time":2.5,"interpolation":"LINEAR",
+            "deform_mode":"OVERWRITE","factor":1.0,
+            "forward_axis":"POS_Y","up_axis":"POS_Z"
+        }),
+    )?;
+    let mut mesh = Mesh::from_positions_and_faces(vec![DVec3::ZERO], vec![])?;
+    evaluate_mesh_cache(&mut mesh, None, &cache, 0.0, 24, 1.0, &bytes)?;
+    assert!((mesh.vertices[0].co.x - 25.0).abs() < 1.0e-12);
+    Ok(())
+}
+
+#[test]
+fn mesh_cache_mdd_time_snaps_terminal_duplicates_and_small_intervals() -> Result<(), Box<dyn Error>>
+{
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&4_i32.to_be_bytes());
+    bytes.extend_from_slice(&1_i32.to_be_bytes());
+    for time in [0.0_f32, 1.0, 2.0, 2.0] {
+        bytes.extend_from_slice(&time.to_be_bytes());
+    }
+    for x in [0.0_f32, 10.0, 20.0, 30.0] {
+        bytes.extend_from_slice(&x.to_be_bytes());
+        bytes.extend_from_slice(&0.0_f32.to_be_bytes());
+        bytes.extend_from_slice(&0.0_f32.to_be_bytes());
+    }
+    let terminal_cache = modifier(
+        "mesh_cache",
+        json!({
+            "resource":"cache","cache_format":"MDD","play_mode":"CUSTOM",
+            "time_mode":"TIME","eval_time":2.0,"interpolation":"LINEAR",
+            "deform_mode":"OVERWRITE","factor":1.0,
+            "forward_axis":"POS_Y","up_axis":"POS_Z"
+        }),
+    )?;
+    let mut terminal_mesh = Mesh::from_positions_and_faces(vec![DVec3::ZERO], vec![])?;
+    evaluate_mesh_cache(
+        &mut terminal_mesh,
+        None,
+        &terminal_cache,
+        0.0,
+        24,
+        1.0,
+        &bytes,
+    )?;
+    assert_eq!(terminal_mesh.vertices[0].co.x, 20.0);
+
+    let mut narrow_interval = bytes;
+    narrow_interval[16..20].copy_from_slice(&1.00005_f32.to_be_bytes());
+    narrow_interval[20..24].copy_from_slice(&4.0_f32.to_be_bytes());
+    let narrow_cache = modifier(
+        "mesh_cache",
+        json!({
+            "resource":"cache","cache_format":"MDD","play_mode":"CUSTOM",
+            "time_mode":"TIME","eval_time":1.000_025,"interpolation":"LINEAR",
+            "deform_mode":"OVERWRITE","factor":1.0,
+            "forward_axis":"POS_Y","up_axis":"POS_Z"
+        }),
+    )?;
+    let mut narrow_mesh = Mesh::from_positions_and_faces(vec![DVec3::ZERO], vec![])?;
+    evaluate_mesh_cache(
+        &mut narrow_mesh,
+        None,
+        &narrow_cache,
+        0.0,
+        24,
+        1.0,
+        &narrow_interval,
+    )?;
+    assert_eq!(narrow_mesh.vertices[0].co.x, 20.0);
+    Ok(())
+}
+
+#[test]
+fn mesh_cache_mdd_accepts_empty_mesh_with_empty_sample_payload() -> Result<(), Box<dyn Error>> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&2_i32.to_be_bytes());
+    bytes.extend_from_slice(&0_i32.to_be_bytes());
+    bytes.extend_from_slice(&0.0_f32.to_be_bytes());
+    bytes.extend_from_slice(&1.0_f32.to_be_bytes());
+    let cache = modifier(
+        "mesh_cache",
+        json!({
+            "resource":"cache","cache_format":"MDD","play_mode":"CUSTOM",
+            "time_mode":"FRAME","eval_frame":0.0,"interpolation":"NONE",
+            "deform_mode":"OVERWRITE","factor":1.0
+        }),
+    )?;
+    let mut mesh = Mesh::from_positions_and_faces(vec![], vec![])?;
+    let warnings = evaluate_mesh_cache(&mut mesh, None, &cache, 0.0, 24, 1.0, &bytes)?;
+    assert_eq!(warnings, [] as [potter_core::error::PotError; 0]);
+    assert_eq!(mesh.vertices, [] as [potter_core::geom::Vertex; 0]);
+    Ok(())
+}
+
+#[test]
+fn mesh_cache_linear_interpolation_uses_blender_f32_order() -> Result<(), Box<dyn Error>> {
+    let samples = [[DVec3::X; 4], [DVec3::new(2.0, 0.0, 0.0); 4]];
+    let expected_x = f64::from(f32::from_bits(0x3f99_999a));
+    for (format, bytes) in [("PC2", pc2_cache(&samples)), ("MDD", mdd_cache(&samples))] {
+        let cache = modifier(
+            "mesh_cache",
+            json!({
+                "resource":"cache","cache_format":format,"play_mode":"CUSTOM",
+                "time_mode":"FRAME","eval_frame":0.2,"interpolation":"LINEAR",
+                "deform_mode":"OVERWRITE","factor":1.0,
+                "forward_axis":"POS_Y","up_axis":"POS_Z"
+            }),
+        )?;
+        let mut mesh = Mesh::from_positions_and_faces(vec![DVec3::ZERO; 4], vec![])?;
+        evaluate_mesh_cache(&mut mesh, None, &cache, 0.0, 24, 1.0, &bytes)?;
+        assert_eq!(mesh.vertices[0].co.x, expected_x, "{format}");
+        assert_ne!(mesh.vertices[0].co.x, 1.2_f64, "{format}");
+    }
+    Ok(())
+}
+
+#[test]
+fn mesh_cache_factor_and_inverted_group_use_blender_f32_blends() -> Result<(), Box<dyn Error>> {
+    let samples = [[DVec3::new(2.0, 0.0, 0.0); 4]; 2];
+    let bytes = pc2_cache(&samples);
+    let factor_cache = modifier(
+        "mesh_cache",
+        json!({
+            "resource":"cache","cache_format":"PC2","play_mode":"CUSTOM",
+            "time_mode":"FRAME","eval_frame":0.0,"interpolation":"NONE",
+            "deform_mode":"OVERWRITE","factor":0.2,
+            "forward_axis":"POS_Y","up_axis":"POS_Z"
+        }),
+    )?;
+    let mut factor_mesh = Mesh::from_positions_and_faces(vec![DVec3::X; 4], vec![])?;
+    evaluate_mesh_cache(&mut factor_mesh, None, &factor_cache, 0.0, 24, 1.0, &bytes)?;
+    let expected_factor_x = f64::from(f32::from_bits(0x3f99_999a));
+    assert_eq!(factor_mesh.vertices[0].co.x, expected_factor_x);
+    assert_ne!(factor_mesh.vertices[0].co.x, 1.2_f64);
+
+    let group_cache = modifier(
+        "mesh_cache",
+        json!({
+            "resource":"cache","cache_format":"PC2","play_mode":"CUSTOM",
+            "time_mode":"FRAME","eval_frame":0.0,"interpolation":"NONE",
+            "deform_mode":"OVERWRITE","vertex_group":"A",
+            "invert_vertex_group":true,"factor":0.8,
+            "forward_axis":"POS_Y","up_axis":"POS_Z"
+        }),
+    )?;
+    let mut group_mesh = Mesh::from_positions_and_faces(vec![DVec3::ZERO; 4], vec![])?;
+    group_mesh
+        .attributes
+        .insert("vertex_groups".to_owned(), json!({"A":{"v0":0.1}}));
+    evaluate_mesh_cache(&mut group_mesh, None, &group_cache, 0.0, 24, 1.0, &bytes)?;
+    let expected_inverted_x = f64::from(f32::from_bits(0x3f38_51ec));
+    assert_eq!(group_mesh.vertices[0].co.x, expected_inverted_x);
+    assert_ne!(group_mesh.vertices[0].co.x, 0.72_f64);
+    assert_ne!(
+        group_mesh.vertices[0].co.x,
+        f64::from(f32::from_bits(0x3f38_51eb))
+    );
+    Ok(())
+}
+
+#[test]
+fn mesh_cache_mdd_reads_only_selected_point_frames() -> Result<(), Box<dyn Error>> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&3_i32.to_be_bytes());
+    bytes.extend_from_slice(&1_i32.to_be_bytes());
+    for time in [0.0_f32, 1.0, 4.0] {
+        bytes.extend_from_slice(&time.to_be_bytes());
+    }
+    for x in [f32::NAN, 10.0, 40.0] {
+        bytes.extend_from_slice(&x.to_be_bytes());
+        bytes.extend_from_slice(&0.0_f32.to_be_bytes());
+        bytes.extend_from_slice(&0.0_f32.to_be_bytes());
+    }
+    let cache = modifier(
+        "mesh_cache",
+        json!({
+            "resource":"cache","cache_format":"MDD","play_mode":"CUSTOM",
+            "time_mode":"TIME","eval_time":2.5,"interpolation":"LINEAR",
+            "deform_mode":"OVERWRITE","factor":1.0,
+            "forward_axis":"POS_Y","up_axis":"POS_Z"
+        }),
+    )?;
+    let mut mesh = Mesh::from_positions_and_faces(vec![DVec3::ZERO], vec![])?;
+    evaluate_mesh_cache(&mut mesh, None, &cache, 0.0, 24, 1.0, &bytes)?;
+    assert!((mesh.vertices[0].co.x - 25.0).abs() < 1.0e-12);
+
+    let mut selected_bad_bytes = bytes;
+    selected_bad_bytes[32..36].copy_from_slice(&f32::NAN.to_be_bytes());
+    let mut malformed_mesh = Mesh::from_positions_and_faces(vec![DVec3::ZERO], vec![])?;
+    assert!(
+        evaluate_mesh_cache(
+            &mut malformed_mesh,
+            None,
+            &cache,
+            0.0,
+            24,
+            1.0,
+            &selected_bad_bytes,
+        )
+        .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn mesh_cache_integrate_uses_original_mesh_and_current_positions() -> Result<(), Box<dyn Error>> {
+    let source = Mesh::from_positions_and_faces(
+        vec![DVec3::ZERO, DVec3::X, DVec3::new(1.0, 1.0, 0.0), DVec3::Y],
+        vec![vec![0, 1, 2, 3]],
+    )?;
+    let samples = [[
+        DVec3::new(0.0, 0.0, 1.0),
+        DVec3::new(1.0, 0.0, 1.0),
+        DVec3::new(1.0, 1.0, 1.0),
+        DVec3::new(0.0, 1.0, 1.0),
+    ]; 2];
+    let bytes = pc2_cache(&samples);
+    let cache = modifier(
+        "mesh_cache",
+        json!({
+            "resource":"cache","cache_format":"PC2","play_mode":"CUSTOM",
+            "time_mode":"FRAME","eval_frame":0.0,"interpolation":"NONE",
+            "deform_mode":"INTEGRATE","factor":1.0,
+            "forward_axis":"POS_Y","up_axis":"POS_Z"
+        }),
+    )?;
+    let mut current = source.clone();
+    current.vertices[0].co.z = 2.0;
+    evaluate_mesh_cache(&mut current, Some(&source), &cache, 0.0, 24, 1.0, &bytes)?;
+    assert!((current.vertices[0].co.z - 3.0).abs() < 1.0e-12);
+    assert!((current.vertices[1].co.z - 1.0).abs() < 1.0e-12);
+
+    let scaled_sample = [
+        DVec3::new(0.0, 0.0, 1.0),
+        DVec3::new(2.0, 0.0, 1.0),
+        DVec3::new(2.0, 2.0, 1.0),
+        DVec3::new(0.0, 2.0, 1.0),
+    ];
+    let scaled_bytes = pc2_cache(&[scaled_sample; 2]);
+    let mut shaped = source.clone();
+    shaped.vertices[0].co = DVec3::new(0.25, 0.25, 2.0);
+    evaluate_mesh_cache(
+        &mut shaped,
+        Some(&source),
+        &cache,
+        0.0,
+        24,
+        1.0,
+        &scaled_bytes,
+    )?;
+    assert!((shaped.vertices[0].co.x - 0.5).abs() < 1.0e-12);
+    assert!((shaped.vertices[0].co.y - 0.5).abs() < 1.0e-12);
+    assert!((shaped.vertices[0].co.z - 5.0).abs() < 1.0e-12);
+
+    let mut non_mesh = source.clone();
+    non_mesh.vertices[0].co.z = 2.0;
+    let warnings = evaluate_mesh_cache(&mut non_mesh, None, &cache, 0.0, 24, 1.0, &bytes)?;
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(
+        warnings[0].message,
+        "'Integrate' only valid for Mesh objects"
+    );
+    assert!((non_mesh.vertices[0].co.z - 1.0).abs() < 1.0e-12);
+
+    let no_faces = Mesh::from_positions_and_faces(
+        source.vertices.iter().map(|vertex| vertex.co).collect(),
+        vec![],
+    )?;
+    let mut skipped = source.clone();
+    skipped.vertices[0].co.z = 2.0;
+    let warnings =
+        evaluate_mesh_cache(&mut skipped, Some(&no_faces), &cache, 0.0, 24, 1.0, &bytes)?;
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0].message, "'Integrate' requires faces");
+    assert!((skipped.vertices[0].co.z - 1.0).abs() < 1.0e-12);
+
+    let mismatched_source =
+        Mesh::from_positions_and_faces(vec![DVec3::ZERO, DVec3::X, DVec3::Y], vec![vec![0, 1, 2]])?;
+    let mut mismatched = source.clone();
+    mismatched.vertices[0].co.z = 2.0;
+    let warnings = evaluate_mesh_cache(
+        &mut mismatched,
+        Some(&mismatched_source),
+        &cache,
+        0.0,
+        24,
+        1.0,
+        &bytes,
+    )?;
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(
+        warnings[0].message,
+        "'Integrate' original mesh vertex mismatch"
+    );
+    assert!((mismatched.vertices[0].co.z - 1.0).abs() < 1.0e-12);
+    Ok(())
+}
+
+#[test]
+fn mesh_cache_integrate_uses_blender_small_normal_threshold() -> Result<(), Box<dyn Error>> {
+    let side = 1.0e-10;
+    let source = Mesh::from_positions_and_faces(
+        vec![
+            DVec3::ZERO,
+            DVec3::new(side, 0.0, 0.0),
+            DVec3::new(0.0, side, 0.0),
+            DVec3::ZERO,
+        ],
+        vec![vec![0, 1, 2]],
+    )?;
+    let samples = [
+        DVec3::new(2.0, 3.0, 4.0),
+        DVec3::new(3.0, 3.0, 4.0),
+        DVec3::new(2.0, 4.0, 4.0),
+        DVec3::new(5.0, 6.0, 7.0),
+    ];
+    let bytes = pc2_cache(&[samples; 2]);
+    let cache = modifier(
+        "mesh_cache",
+        json!({
+            "resource":"cache","cache_format":"PC2","play_mode":"CUSTOM",
+            "time_mode":"FRAME","eval_frame":0.0,"interpolation":"NONE",
+            "deform_mode":"INTEGRATE","factor":1.0,
+            "forward_axis":"POS_Y","up_axis":"POS_Z"
+        }),
+    )?;
+    let mut current = source.clone();
+    current.vertices[0].co.z = side;
+    evaluate_mesh_cache(&mut current, Some(&source), &cache, 0.0, 24, 1.0, &bytes)?;
+    assert_eq!(current.vertices[0].co, samples[0]);
+    Ok(())
+}
+
+#[test]
+fn mesh_cache_integrate_processes_one_corner_faces() -> Result<(), Box<dyn Error>> {
+    let mut source = Mesh::from_positions_and_faces(vec![DVec3::ZERO; 4], vec![])?;
+    // Short faces cannot be constructed through the validated mesh constructor.
+    source.faces.push(potter_core::geom::Face {
+        id: 0,
+        vertices: vec![0],
+        material_index: 0,
+    });
+    let bytes = pc2_cache(&[[DVec3::ZERO; 4]; 2]);
+    let cache = modifier(
+        "mesh_cache",
+        json!({
+            "resource":"cache","cache_format":"PC2","play_mode":"CUSTOM",
+            "time_mode":"FRAME","eval_frame":0.0,"interpolation":"NONE",
+            "deform_mode":"INTEGRATE","factor":1.0,
+            "forward_axis":"POS_Y","up_axis":"POS_Z"
+        }),
+    )?;
+    let mut current = source.clone();
+    evaluate_mesh_cache(&mut current, Some(&source), &cache, 0.0, 24, 1.0, &bytes)?;
+    assert!(
+        current.vertices[0]
+            .co
+            .to_array()
+            .into_iter()
+            .any(f64::is_nan)
+    );
+    assert_eq!(current.vertices[1].co, DVec3::ZERO);
+    Ok(())
+}
+
+#[test]
+fn mesh_cache_group_fallback_and_degenerate_axis_conversion_match_blender()
+-> Result<(), Box<dyn Error>> {
+    let sample = DVec3::new(1.0, 2.0, 3.0);
+    let bytes = pc2_cache(&[[sample; 4]; 2]);
+    let no_weights = modifier(
+        "mesh_cache",
+        json!({
+            "resource":"cache","cache_format":"PC2","play_mode":"CUSTOM",
+            "time_mode":"FRAME","eval_frame":0.0,"interpolation":"NONE",
+            "deform_mode":"OVERWRITE","vertex_group":"A",
+            "invert_vertex_group":true,"factor":1.0,
+            "forward_axis":"POS_Y","up_axis":"POS_Z"
+        }),
+    )?;
+    let mut unchanged = Mesh::from_positions_and_faces(vec![DVec3::ZERO; 4], vec![])?;
+    unchanged
+        .attributes
+        .insert("vertex_groups".to_owned(), json!({"A":{}}));
+    evaluate_mesh_cache(&mut unchanged, None, &no_weights, 0.0, 24, 1.0, &bytes)?;
+    assert!(
+        unchanged
+            .vertices
+            .iter()
+            .all(|vertex| vertex.co == DVec3::ZERO)
+    );
+    let mut empty_group_with_deform_data =
+        Mesh::from_positions_and_faces(vec![DVec3::ZERO; 4], vec![])?;
+    empty_group_with_deform_data
+        .attributes
+        .insert("vertex_groups".to_owned(), json!({"A":{},"B":{"v0":0.25}}));
+    evaluate_mesh_cache(
+        &mut empty_group_with_deform_data,
+        None,
+        &no_weights,
+        0.0,
+        24,
+        1.0,
+        &bytes,
+    )?;
+    assert!(
+        empty_group_with_deform_data
+            .vertices
+            .iter()
+            .all(|vertex| vertex.co == sample)
+    );
+
+    let unknown_group = modifier(
+        "mesh_cache",
+        json!({
+            "resource":"cache","cache_format":"PC2","play_mode":"CUSTOM",
+            "time_mode":"FRAME","eval_frame":0.0,"interpolation":"NONE",
+            "deform_mode":"OVERWRITE","vertex_group":"missing","factor":0.5,
+            "forward_axis":"POS_Y","up_axis":"POS_Z"
+        }),
+    )?;
+    let mut global_factor = Mesh::from_positions_and_faces(vec![DVec3::ZERO; 4], vec![])?;
+    evaluate_mesh_cache(
+        &mut global_factor,
+        None,
+        &unknown_group,
+        0.0,
+        24,
+        1.0,
+        &bytes,
+    )?;
+    assert_eq!(global_factor.vertices[0].co, sample * 0.5);
+
+    let degenerate_axes = modifier(
+        "mesh_cache",
+        json!({
+            "resource":"cache","cache_format":"PC2","play_mode":"CUSTOM",
+            "time_mode":"FRAME","eval_frame":0.0,"interpolation":"NONE",
+            "deform_mode":"OVERWRITE","factor":1.0,
+            "forward_axis":"POS_X","up_axis":"NEG_X",
+            "flip_axis":[true,false,false]
+        }),
+    )?;
+    let mut flipped = Mesh::from_positions_and_faces(vec![DVec3::ZERO; 4], vec![])?;
+    evaluate_mesh_cache(&mut flipped, None, &degenerate_axes, 0.0, 24, 1.0, &bytes)?;
+    assert_eq!(flipped.vertices[0].co, DVec3::new(-1.0, 2.0, 3.0));
     Ok(())
 }
 
@@ -573,8 +1094,21 @@ fn cli_applies_resource_backed_mesh_cache_and_inspects_interpolated_positions()
                 {"op":"modifier.create","target":{"id":"body"},"id":"cache_modifier","type":"mesh_cache","params":{
                     "resource":"plane_cache","cache_format":"PC2","play_mode":"SCENE",
                     "time_mode":"FRAME","frame_start":0.0,"frame_scale":1.0,
-                    "interpolation":"LINEAR","deform_mode":"OVERWRITE","factor":1.0
-                }}
+                    "interpolation":"LINEAR","deform_mode":"INTEGRATE","factor":1.0
+                }},
+                {"op":"modifier.create","target":{"id":"body"},"id":"empty_cache","type":"mesh_cache","params":{
+                    "cache_format":"PC2","play_mode":"SCENE","time_mode":"FRAME",
+                    "frame_start":0.0,"frame_scale":1.0,"interpolation":"LINEAR",
+                    "deform_mode":"OVERWRITE","factor":1.0
+                }},
+                {"op":"modifier.create","target":{"id":"body"},"id":"disabled_cache","type":"mesh_cache","params":{
+                    "resource":"missing_cache","cache_format":"PC2","play_mode":"SCENE",
+                    "time_mode":"FRAME","frame_start":0.0,"frame_scale":1.0,
+                    "interpolation":"LINEAR","deform_mode":"OVERWRITE","factor":0.0
+                }},
+                {"op":"modifier.create","target":{"id":"body"},"id":"empty_sequence","type":"mesh_sequence_cache","params":{
+                    "resource":"missing_sequence","object_path":""
+                }},
             ]
         }))?,
     )?;
@@ -621,6 +1155,40 @@ fn cli_applies_resource_backed_mesh_cache_and_inspects_interpolated_positions()
             assert!((actual - expected).abs() < 1.0e-5);
         }
     }
+    let mut unknown_resource: Value = serde_json::from_slice(&fs::read(scene.join("scene.json"))?)?;
+    unknown_resource["nodes"]["body"]["modifiers"][2]["params"]["factor"] = json!(1.0);
+    let unknown_resource: SceneDoc = serde_json::from_value(unknown_resource)?;
+    let error = Snapshot::evaluate_with_cache(
+        &unknown_resource,
+        &EvaluationContext::default(),
+        Some(&scene),
+        None,
+    )
+    .err()
+    .ok_or("enabled unknown Mesh Cache resource unexpectedly resolved")?;
+    assert_eq!(error.code, potter_core::error::ErrorCode::DependencyMissing);
+    let mut empty_uri: Value = serde_json::from_slice(&fs::read(scene.join("scene.json"))?)?;
+    empty_uri["resources"]["plane_cache"]["uri"] = json!("");
+    let empty_uri: SceneDoc = serde_json::from_value(empty_uri)?;
+    let snapshot = Snapshot::evaluate_with_cache(
+        &empty_uri,
+        &EvaluationContext::default(),
+        Some(&scene),
+        None,
+    )?;
+    let actual = json!(
+        snapshot.meshes[&potter_core::model::Id::new("body")?]
+            .vertices
+            .iter()
+            .map(|vertex| vertex.co.to_array())
+            .collect::<Vec<_>>()
+    );
+    assert_parity(
+        "empty Mesh Cache URI",
+        &actual,
+        &Value::Array(positions.clone()),
+        1.0e-12,
+    )?;
     Ok(())
 }
 #[test]
@@ -2557,6 +3125,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         )?;
         evaluate_mesh_cache(
             &mut pc2_mesh,
+            None,
             &pc2_modifier,
             evaluation_frame,
             24,
@@ -2608,7 +3177,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
                 "factor":1.0
             }),
         )?;
-        evaluate_mesh_cache(&mut mdd_mesh, &mdd_modifier, 1.0, 24, 1.0, &mdd)?;
+        evaluate_mesh_cache(&mut mdd_mesh, None, &mdd_modifier, 1.0, 24, 1.0, &mdd)?;
         let key = format!("{evaluation_time:.2}");
         let expected_positions = expected["mesh_cache_mdd"]
             .get(&key)
@@ -2665,7 +3234,15 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
                 "up_axis":"POS_Z"
             }),
         )?;
-        evaluate_mesh_cache(&mut integrated_mesh, &cache_modifier, 1.0, 24, 1.0, bytes)?;
+        evaluate_mesh_cache(
+            &mut integrated_mesh,
+            Some(&quad),
+            &cache_modifier,
+            1.0,
+            24,
+            1.0,
+            bytes,
+        )?;
         let actual = json!(
             integrated_mesh
                 .vertices

@@ -398,6 +398,103 @@ fn attribute_modifier_boundary_parameters_are_accepted() {
 }
 
 #[test]
+fn mesh_cache_disabled_state_skips_unknown_ids_but_active_state_rejects_them() {
+    let (_directory, scene) =
+        setup_scene(&json!([{"op":"node.create","id":"body","kind":"box","params":{"size":1.0}}]));
+    let disabled = json!([{"op":"modifier.create","target":{"id":"body"},"id":"cache","type":"mesh_cache","params":{}}]);
+    let output = apply(&scene, 1, &disabled);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let document: SceneDoc =
+        serde_json::from_slice(&fs::read(scene.join("scene.json")).unwrap()).unwrap();
+    let modifier = &document.nodes[&Id::new("body").unwrap()].modifiers[0];
+    assert!(!modifier.params.contains_key("resource"));
+
+    let disabled_unknown_resource = apply(
+        &scene,
+        2,
+        &json!([{"op":"modifier.create","target":{"id":"body"},"id":"disabled_unknown_cache","type":"mesh_cache","params":{"resource":"missing_cache","factor":0}}]),
+    );
+    assert!(
+        disabled_unknown_resource.status.success(),
+        "{}",
+        String::from_utf8_lossy(&disabled_unknown_resource.stdout)
+    );
+
+    let unknown_resource = apply(
+        &scene,
+        3,
+        &json!([{"op":"modifier.create","target":{"id":"body"},"id":"unknown_cache","type":"mesh_cache","params":{"resource":"missing_cache"}}]),
+    );
+    assert_invalid(
+        &unknown_resource,
+        "unknown Mesh Cache resource",
+        "TARGET_NOT_FOUND",
+        Some("/operations/0/params/resource"),
+        None,
+    );
+}
+
+#[test]
+fn mesh_sequence_cache_disabled_states_skip_unknown_ids_but_active_state_rejects_them() {
+    let (_directory, scene) =
+        setup_scene(&json!([{"op":"node.create","id":"body","kind":"box","params":{"size":1.0}}]));
+    let disabled = apply(
+        &scene,
+        1,
+        &json!([{"op":"modifier.create","target":{"id":"body"},"id":"disabled_cache","type":"mesh_sequence_cache","params":{"object_path":""}}]),
+    );
+    assert!(
+        disabled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&disabled.stdout)
+    );
+    let document: SceneDoc =
+        serde_json::from_slice(&fs::read(scene.join("scene.json")).unwrap()).unwrap();
+    let modifier = &document.nodes[&Id::new("body").unwrap()].modifiers[0];
+    assert!(!modifier.params.contains_key("resource"));
+    assert_eq!(modifier.params["object_path"], "");
+
+    let empty_resource = apply(
+        &scene,
+        2,
+        &json!([{"op":"modifier.create","target":{"id":"body"},"id":"empty_resource_cache","type":"mesh_sequence_cache","params":{"resource":"","object_path":""}}]),
+    );
+    assert!(
+        empty_resource.status.success(),
+        "{}",
+        String::from_utf8_lossy(&empty_resource.stdout)
+    );
+
+    let disabled_unknown_resource = apply(
+        &scene,
+        3,
+        &json!([{"op":"modifier.create","target":{"id":"body"},"id":"disabled_unknown_sequence","type":"mesh_sequence_cache","params":{"resource":"missing_sequence","object_path":""}}]),
+    );
+    assert!(
+        disabled_unknown_resource.status.success(),
+        "{}",
+        String::from_utf8_lossy(&disabled_unknown_resource.stdout)
+    );
+
+    let unknown_resource = apply(
+        &scene,
+        4,
+        &json!([{"op":"modifier.create","target":{"id":"body"},"id":"unknown_sequence_cache","type":"mesh_sequence_cache","params":{"resource":"missing_cache","object_path":"/mesh"}}]),
+    );
+    assert_invalid(
+        &unknown_resource,
+        "unknown Mesh Sequence Cache resource",
+        "TARGET_NOT_FOUND",
+        Some("/operations/0/params/resource"),
+        None,
+    );
+}
+
+#[test]
 fn null_required_references_are_refused_with_pointers() {
     let setup = json!([
         {"op":"node.create","id":"body","kind":"box","params":{"size":1.0}},
