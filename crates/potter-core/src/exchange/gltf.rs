@@ -5807,12 +5807,54 @@ fn read_buffer_view_bytes(root: &Value, buffers: &[Vec<u8>], view_index: usize) 
         .ok_or_else(|| import_error("glTF image buffer data is truncated"))
 }
 
+/// The glTF image indices used as data: the metallic-roughness, normal and occlusion textures of every
+/// material a primitive references. Blender's importer creates a material only for a primitive that uses
+/// it, and sets `is_data` on the image of each data texture (`io_scene_gltf2` `blender/imp/texture.py`).
+/// Blender's image is shared by its colour uses too, and nothing resets `is_data`, so one data use makes
+/// the image Non-Color for every use.
+fn data_image_indices(root: &Value) -> BTreeSet<usize> {
+    let used_materials = root["meshes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|mesh| mesh["primitives"].as_array().into_iter().flatten())
+        .filter_map(|primitive| primitive["material"].as_u64())
+        .collect::<BTreeSet<u64>>();
+    let mut images = BTreeSet::new();
+    for material_index in used_materials {
+        let Some(material) = usize::try_from(material_index)
+            .ok()
+            .and_then(|index| root["materials"].get(index))
+        else {
+            continue;
+        };
+        let data_slots = [
+            &material["pbrMetallicRoughness"]["metallicRoughnessTexture"],
+            &material["normalTexture"],
+            &material["occlusionTexture"],
+        ];
+        for info in data_slots {
+            let source = info["index"]
+                .as_u64()
+                .and_then(|index| usize::try_from(index).ok())
+                .and_then(|index| root["textures"].get(index))
+                .and_then(|texture| texture["source"].as_u64())
+                .and_then(|source| usize::try_from(source).ok());
+            if let Some(source) = source {
+                images.insert(source);
+            }
+        }
+    }
+    images
+}
+
 fn import_images(
     root: &Value,
     buffers: &[Vec<u8>],
     source_path: &Path,
     doc: &mut SceneDoc,
     assets: &mut Vec<(String, Vec<u8>)>,
+    data_images: &BTreeSet<usize>,
 ) -> Result<Vec<Id>> {
     let image_values = root["images"].as_array().map_or(&[][..], Vec::as_slice);
     let mut image_ids = Vec::with_capacity(image_values.len());
@@ -5898,7 +5940,11 @@ fn import_images(
             Image {
                 name,
                 source: ImageSource::Packed,
-                colorspace: ImageColorspace::Srgb,
+                colorspace: if data_images.contains(&index) {
+                    ImageColorspace::NonColor
+                } else {
+                    ImageColorspace::Srgb
+                },
                 width,
                 height,
                 tiles: Vec::new(),
@@ -6664,17 +6710,25 @@ pub(crate) struct GltfIndex {
     pub(crate) mesh_shape_key_ids: Vec<Vec<Id>>,
     /// glTF joint node index to (armature node, bone) for every skinned joint.
     pub(crate) joint_bones: BTreeMap<usize, (Id, Id)>,
+    /// Materials whose base color texture took the VRM 0.x main texture transform at import.
+    pub(crate) main_texture_transforms: BTreeSet<Id>,
+    /// Materials whose base color texture had its own non-identity `KHR_texture_transform`, which the
+    /// main texture transform replaced. The file's transform is lost, so it is reported.
+    pub(crate) discarded_base_transforms: BTreeSet<Id>,
 }
 
 pub(crate) fn import(path: &Path, scene_id: String) -> Result<crate::exchange::ImportedGraph> {
-    import_indexed(path, scene_id, POT_TO_GLTF).map(|(graph, _)| graph)
+    import_indexed(path, scene_id, POT_TO_GLTF, |_, _| None).map(|(graph, _)| graph)
 }
 
 /// Imports glTF or GLB with Potter axes mapped through `basis` (VRM 0.x adds a Ry(180) turn).
+/// `base_color_transform` gives a material's transform for its base color texture (VRM 0.x `MToon` main
+/// texture). It replaces the texture's own `KHR_texture_transform`, which is then reported as discarded.
 pub(crate) fn import_indexed(
     path: &Path,
     scene_id: String,
     basis: DMat4,
+    base_color_transform: impl Fn(&Value, usize) -> Option<super::material_surface::TextureTransform>,
 ) -> Result<(crate::exchange::ImportedGraph, GltfIndex)> {
     fn import_shape_keys(
         mesh_value: &Value,
@@ -6896,7 +6950,8 @@ pub(crate) fn import_indexed(
     }
 
     let mut doc = SceneDoc::new(scene_id);
-    let image_ids = import_images(&root, &binaries, path, &mut doc, &mut assets)?;
+    let data_images = data_image_indices(&root);
+    let image_ids = import_images(&root, &binaries, path, &mut doc, &mut assets, &data_images)?;
     if let Some(scene) = doc.scenes.get_mut(&doc.active_scene) {
         if let Some(fps) = root["extras"]["potter"]["fps"].as_u64() {
             scene.fps = u32::try_from(fps)
@@ -6913,6 +6968,8 @@ pub(crate) fn import_indexed(
     let mut material_ids = Vec::with_capacity(material_values.len());
     let mut used_material_ids = BTreeSet::new();
     let mut graph_materials = Vec::<(Id, material_graph::GraphTextures)>::new();
+    let mut main_texture_transforms = BTreeSet::<Id>::new();
+    let mut discarded_base_transforms = BTreeSet::<Id>::new();
     for (index, material) in material_values.iter().enumerate() {
         let suggested = material["extras"]["potter"]["id"]
             .as_str()
@@ -6955,9 +7012,26 @@ pub(crate) fn import_indexed(
                 *component *= peak / emission_strength;
             }
         }
-        let textures = material_textures(material, &root, &image_ids)?;
-        // A texture a Potter texture field cannot hold (transform, emissive, occlusion, normal scale)
-        // moves into the material graph, as Blender's importer builds one; the fields stay empty.
+        let mut textures = material_textures(material, &root, &image_ids)?;
+        // A VRM 0.x MToon main texture transform replaces the base color texture's own transform, as the VRM
+        // add-on writes it. A replaced transform that differs from it is data the file loses, so it is recorded.
+        if let Some(slot) = textures.base_color.as_mut()
+            && let Some(transform) = base_color_transform(&root, index)
+        {
+            let close = |a: &[f64], b: &[f64]| a.iter().zip(b).all(|(a, b)| (a - b).abs() <= 1e-9);
+            let loses_own = slot.transform.as_ref().is_some_and(|own| {
+                !(close(&own.offset, &transform.offset)
+                    && close(&own.scale, &transform.scale)
+                    && (own.rotation - transform.rotation).abs() <= 1e-9)
+            });
+            if loses_own {
+                discarded_base_transforms.insert(id.clone());
+            }
+            slot.transform = (!transform.is_identity()).then_some(transform);
+            main_texture_transforms.insert(id.clone());
+        }
+        // A texture a Potter texture field cannot hold (transform, packed metallic-roughness, emissive,
+        // occlusion, normal scale) moves into the material graph, as Blender's importer builds one.
         let graph_needed = textures.needs_graph();
         let field = |slot: &Option<material_graph::SlotTexture>| {
             (!graph_needed)
@@ -6965,7 +7039,6 @@ pub(crate) fn import_indexed(
                 .flatten()
         };
         let base_color_texture = field(&textures.base_color);
-        let metallic_roughness_texture = field(&textures.metallic_roughness);
         let normal_texture = field(&textures.normal);
         let alpha_mode = match material["alphaMode"].as_str() {
             None | Some("OPAQUE") => "opaque",
@@ -6983,7 +7056,7 @@ pub(crate) fn import_indexed(
             double_sided: material["doubleSided"].as_bool().unwrap_or(false),
             metallic: material["pbrMetallicRoughness"]["metallicFactor"]
                 .as_f64()
-                .unwrap_or(0.0),
+                .unwrap_or(1.0),
             roughness: material["pbrMetallicRoughness"]["roughnessFactor"]
                 .as_f64()
                 .unwrap_or(1.0),
@@ -6999,8 +7072,6 @@ pub(crate) fn import_indexed(
                 .unwrap_or(1.5),
             normal_texture,
             base_color_texture,
-            metallic_texture: metallic_roughness_texture.clone(),
-            roughness_texture: metallic_roughness_texture,
             ..Material::default()
         };
         if graph_needed {
@@ -7978,6 +8049,8 @@ pub(crate) fn import_indexed(
         image_ids,
         mesh_shape_key_ids,
         joint_bones,
+        main_texture_transforms,
+        discarded_base_transforms,
     };
     let graph = crate::exchange::ImportedGraph {
         doc,
@@ -8496,7 +8569,12 @@ fn imported_color_material(
         doc.node_groups.insert(graph_id.clone(), graph);
         graph_id
     } else {
-        let textures = material_graph::GraphTextures::from_fields(&material, None);
+        let textures = material_graph::GraphTextures::from_field_refs(
+            material.base_color_texture.clone(),
+            material.roughness_texture.clone(),
+            material.metallic_texture.clone(),
+            material.normal_texture.clone(),
+        );
         doc.materials.insert(variant_id.clone(), material.clone());
         material_graph::move_textures_to_graph(doc, &variant_id, &textures)?;
         let graph_id = doc
@@ -14521,6 +14599,391 @@ mod tests {
         assert_eq!(
             normal_map.properties["potter_gltf_imported_normal_map"],
             json!(true)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn packed_metallic_roughness_imports_green_as_roughness_and_blue_as_metallic() -> TestResult {
+        let root = tempfile::tempdir()?;
+        let doc = scene_with_asset_root(
+            root.path(),
+            &json!([
+                {"op":"image.create","id":"rough","width":1,"height":1,"colorspace":"linear","fill_color":[0.25,0.25,0.25,1.0]},
+                {"op":"image.create","id":"metal","width":1,"height":1,"colorspace":"linear","fill_color":[0.75,0.75,0.75,1.0]},
+                {"op":"material.create","id":"mr_mat","metallic":1.0,"roughness":1.0,"roughness_texture":{"image":"rough"},"metallic_texture":{"image":"metal"}},
+                {"op":"node.create","id":"surface","kind":"plane","params":{"size":1.0},"material":"mr_mat"}
+            ]),
+        )?;
+        let (document, binary) = export_root_and_binary_at_root(&doc, root.path())?;
+        // Potter exports the two fields as one packed texture: Green holds roughness, Blue metallic.
+        let packed = &document["materials"][0]["pbrMetallicRoughness"]["metallicRoughnessTexture"];
+        let texture = usize::try_from(
+            packed["index"]
+                .as_u64()
+                .ok_or("packed texture index is missing")?,
+        )?;
+        let image = usize::try_from(
+            document["textures"][texture]["source"]
+                .as_u64()
+                .ok_or("packed texture source is missing")?,
+        )?;
+        let view = usize::try_from(
+            document["images"][image]["bufferView"]
+                .as_u64()
+                .ok_or("packed image view is missing")?,
+        )?;
+        let offset = usize::try_from(
+            document["bufferViews"][view]["byteOffset"]
+                .as_u64()
+                .unwrap_or(0),
+        )?;
+        let length = usize::try_from(
+            document["bufferViews"][view]["byteLength"]
+                .as_u64()
+                .ok_or("packed image length is missing")?,
+        )?;
+        let pixel = ::image::load_from_memory(&binary[offset..offset + length])?
+            .to_rgba8()
+            .get_pixel(0, 0)
+            .0;
+        assert!(
+            pixel[1].abs_diff(64) <= 2 && pixel[2].abs_diff(191) <= 2,
+            "exported packed texture is not Green roughness 0.25 and Blue metallic 0.75: {pixel:?}"
+        );
+
+        let path = root.path().join("packed.gltf");
+        std::fs::write(root.path().join("scene.bin"), &binary)?;
+        std::fs::write(&path, serde_json::to_vec(&document)?)?;
+        let imported = import(&path, uuid::Uuid::new_v4().to_string())?;
+        let material_id = crate::model::Id::new("mr_mat")?;
+        let material = imported
+            .doc
+            .materials
+            .get(&material_id)
+            .ok_or("packed metallic-roughness material is missing")?;
+        assert!(
+            material.metallic_texture.is_none() && material.roughness_texture.is_none(),
+            "packed texture fields would both read the Red channel"
+        );
+        let graph_id = material
+            .node_tree
+            .as_ref()
+            .ok_or("packed metallic-roughness graph is missing")?;
+        let graph = imported
+            .doc
+            .node_groups
+            .get(graph_id)
+            .ok_or("packed metallic-roughness graph group is missing")?;
+        let image_id = graph
+            .nodes
+            .values()
+            .find(|node| node.node_type == "ShaderNodeTexImage")
+            .and_then(|node| node.properties.get("image"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or("packed texture node is missing")?
+            .to_owned();
+        // Two texels with distinct Red, Green and Blue values: a wrong channel gives a different value.
+        let images = BTreeMap::from([(
+            image_id,
+            crate::image::ImageData {
+                width: 2,
+                height: 1,
+                pixels: vec![[0.5, 0.25, 0.75, 1.0], [0.5, 0.9, 0.1, 1.0]],
+                tiles: BTreeMap::new(),
+                interpolation: crate::image::ImageInterpolation::Closest,
+            },
+        )]);
+        let names = ["UVMap".to_owned()];
+        let sample = |u: f64| -> TestResult<(f64, f64)> {
+            let corners = [[[u, 0.25]; 3]];
+            let layers = crate::shader::HitUvLayers {
+                names: &names,
+                corners: &corners,
+                positions: [DVec3::ZERO; 3],
+                barycentric: [1.0 / 3.0; 3],
+                render: Some(0),
+                available_mask: None,
+            };
+            let mut context = crate::shader::HitContext::new(&imported.doc.node_groups)
+                .with_images(&images)
+                .with_uv_layers(layers);
+            // A texture on the render layer reads `TexCoord.UV`, which is the hit's render `uv`. The renderer
+            // sets it; without it the texture samples the (0, 0) default across the REPEAT seam.
+            context.uv = [u, 0.25];
+            let params = crate::shader::evaluate_surface(material, &context)?;
+            Ok((params.roughness, params.metallic))
+        };
+        let close = |actual: f64, expected: f64| (actual - expected).abs() < 1e-6;
+        let (left_roughness, left_metallic) = sample(0.25)?;
+        assert!(
+            close(left_roughness, 0.25) && close(left_metallic, 0.75),
+            "texel 0: roughness {left_roughness}, metallic {left_metallic}"
+        );
+        let (right_roughness, right_metallic) = sample(0.75)?;
+        assert!(
+            close(right_roughness, 0.9) && close(right_metallic, 0.1),
+            "texel 1: roughness {right_roughness}, metallic {right_metallic}"
+        );
+        let (reexport, _) = export_imported_again(&imported, root.path())?;
+        let packed_count = reexport["materials"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|material| {
+                material["pbrMetallicRoughness"]["metallicRoughnessTexture"].is_object()
+            })
+            .count();
+        assert_eq!(
+            packed_count, 1,
+            "the re-export writes one metallicRoughnessTexture"
+        );
+        let pbr = packed_pbr(&reexport)?;
+        assert_eq!(pbr["metallicFactor"].as_f64().unwrap_or(1.0), 1.0);
+        assert_eq!(pbr["roughnessFactor"].as_f64().unwrap_or(1.0), 1.0);
+        Ok(())
+    }
+
+    /// Exports an imported document again, with its imported image blobs in the project's asset store.
+    fn export_imported_again(
+        imported: &ImportedGraph,
+        root: &std::path::Path,
+    ) -> TestResult<(Value, Vec<u8>)> {
+        for (digest, bytes) in &imported.assets {
+            let hex = digest
+                .strip_prefix("sha256:")
+                .ok_or("image blob digest is malformed")?;
+            let blob = root.join("assets").join("sha256").join(hex).join("blob");
+            std::fs::create_dir_all(blob.parent().ok_or("image blob parent path is missing")?)?;
+            std::fs::write(blob, bytes)?;
+        }
+        export_root_and_binary_at_root(&imported.doc, root)
+    }
+
+    /// The `pbrMetallicRoughness` object of the first exported material with a metallic-roughness texture.
+    fn packed_pbr(document: &Value) -> TestResult<&Value> {
+        document["materials"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|material| &material["pbrMetallicRoughness"])
+            .find(|pbr| pbr["metallicRoughnessTexture"].is_object())
+            .ok_or_else(|| "no exported material has a metallicRoughnessTexture".into())
+    }
+
+    #[test]
+    fn packed_metallic_roughness_reexports_a_roughness_factor_of_one_half() -> TestResult {
+        let root = tempfile::tempdir()?;
+        let doc = scene_with_asset_root(
+            root.path(),
+            &json!([
+                {"op":"image.create","id":"rough","width":1,"height":1,"colorspace":"linear","fill_color":[0.25,0.25,0.25,1.0]},
+                {"op":"image.create","id":"metal","width":1,"height":1,"colorspace":"linear","fill_color":[0.75,0.75,0.75,1.0]},
+                {"op":"material.create","id":"mr_mat","metallic":1.0,"roughness":1.0,"roughness_texture":{"image":"rough"},"metallic_texture":{"image":"metal"}},
+                {"op":"node.create","id":"surface","kind":"plane","params":{"size":1.0},"material":"mr_mat"}
+            ]),
+        )?;
+        let (mut document, binary) = export_root_and_binary_at_root(&doc, root.path())?;
+        // The input file's roughnessFactor is 0.5: the import multiplies the Green channel by it.
+        document["materials"][0]["pbrMetallicRoughness"]["roughnessFactor"] = json!(0.5);
+        std::fs::write(root.path().join("scene.bin"), &binary)?;
+        let path = root.path().join("half.gltf");
+        std::fs::write(&path, serde_json::to_vec(&document)?)?;
+        let imported = import(&path, uuid::Uuid::new_v4().to_string())?;
+        let (reexport, _) = export_imported_again(&imported, root.path())?;
+        let pbr = packed_pbr(&reexport)?;
+        assert_eq!(
+            pbr["roughnessFactor"].as_f64(),
+            Some(0.5),
+            "roughnessFactor did not come back as 0.5"
+        );
+        assert_eq!(pbr["metallicFactor"].as_f64().unwrap_or(1.0), 1.0);
+        Ok(())
+    }
+
+    #[test]
+    fn gltf_material_factors_missing_from_the_file_import_as_the_spec_defaults() -> TestResult {
+        // glTF gives metallicFactor, roughnessFactor and baseColorFactor the defaults 1.0, 1.0 and [1, 1, 1, 1].
+        let root = tempfile::tempdir()?;
+        let doc = scene_with_asset_root(
+            root.path(),
+            &json!([
+                {"op":"material.create","id":"plain","metallic":0.25,"roughness":0.25,"base_color":[0.2,0.4,0.6,1.0]},
+                {"op":"node.create","id":"sheet","kind":"plane","params":{"size":1.0},"material":"plain"}
+            ]),
+        )?;
+        let imported = import_edited(&doc, |root, _| {
+            let pbr = root["materials"][0]["pbrMetallicRoughness"]
+                .as_object_mut()
+                .ok_or("material PBR is missing")?;
+            for key in ["metallicFactor", "roughnessFactor", "baseColorFactor"] {
+                pbr.remove(key);
+            }
+            Ok(())
+        })??;
+        let material = imported
+            .doc
+            .materials
+            .get(&crate::model::Id::new("plain")?)
+            .ok_or("the imported material is missing")?;
+        assert_eq!(material.metallic, 1.0);
+        assert_eq!(material.roughness, 1.0);
+        assert_eq!(material.base_color, [1.0; 4]);
+        Ok(())
+    }
+
+    #[test]
+    fn data_images_import_non_color_and_a_shared_image_follows_its_data_use() -> TestResult {
+        // Blender's importer sets `is_data` on the image of each data texture, and nothing resets it, so an
+        // image used as both base color and metallic-roughness is Non-Color everywhere. A colour-only image
+        // stays sRGB and a normal-map image is Non-Color.
+        let root = tempfile::tempdir()?;
+        let doc = scene_with_asset_root(
+            root.path(),
+            &json!([
+                {"op":"image.create","id":"paint","width":1,"height":1,"colorspace":"srgb","fill_color":[0.5,0.25,0.75,1.0]},
+                {"op":"image.create","id":"tint","width":1,"height":1,"colorspace":"srgb","fill_color":[0.9,0.6,0.3,1.0]},
+                {"op":"image.create","id":"bump","width":1,"height":1,"colorspace":"linear","fill_color":[0.5,0.5,1.0,1.0]},
+                {"op":"material.create","id":"shared","base_color_texture":{"image":"paint"},"normal_texture":{"image":"bump"}},
+                {"op":"material.create","id":"tinted","base_color_texture":{"image":"tint"}},
+                {"op":"node.create","id":"sheet","kind":"plane","params":{"size":1.0},"material":"shared"},
+                {"op":"uv.unwrap","target":{"id":"sheet"},"method":"box"},
+                {"op":"node.create","id":"other","kind":"plane","params":{"size":1.0},"material":"tinted"},
+                {"op":"uv.unwrap","target":{"id":"other"},"method":"box"}
+            ]),
+        )?;
+        let (mut document, binary) = export_root_and_binary_at_root(&doc, root.path())?;
+        // The exporter writes one glTF material per mesh variant, so the shared material appears more than
+        // once and the primitives reference the copies. Link each copy's metallic-roughness to its base color.
+        for shared in document["materials"]
+            .as_array_mut()
+            .ok_or("glTF materials are missing")?
+            .iter_mut()
+            .filter(|material| material["extras"]["potter"]["id"] == "shared")
+        {
+            let base = shared["pbrMetallicRoughness"]["baseColorTexture"].clone();
+            shared["pbrMetallicRoughness"]["metallicRoughnessTexture"] = base;
+        }
+        std::fs::write(root.path().join("scene.bin"), &binary)?;
+        let path = root.path().join("data.gltf");
+        std::fs::write(&path, serde_json::to_vec(&document)?)?;
+        let imported = import(&path, uuid::Uuid::new_v4().to_string())?;
+        let colorspace = |name: &str| -> TestResult<crate::model::ImageColorspace> {
+            Ok(imported
+                .doc
+                .images
+                .get(&crate::model::Id::new(name)?)
+                .ok_or("the imported image is missing")?
+                .colorspace)
+        };
+        assert_eq!(
+            colorspace("paint")?,
+            crate::model::ImageColorspace::NonColor,
+            "an image also used as metallic-roughness data is Non-Color"
+        );
+        assert_eq!(
+            colorspace("bump")?,
+            crate::model::ImageColorspace::NonColor,
+            "a normal-map image is Non-Color"
+        );
+        assert_eq!(
+            colorspace("tint")?,
+            crate::model::ImageColorspace::Srgb,
+            "a colour-only image stays sRGB"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn main_texture_transform_reaches_the_colour_variant_graph() -> TestResult {
+        // The base color texture carries a VRM 0.x MToon main texture transform, set as the glTF import
+        // sets it. Its graph is built with the same `move_textures_to_graph` call the import makes.
+        let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+        let source = crate::model::Id::new("paint")?;
+        doc.materials.insert(
+            source.clone(),
+            crate::model::Material {
+                name: "paint".to_owned(),
+                ..crate::model::Material::default()
+            },
+        );
+        let textures = super::material_graph::GraphTextures {
+            base_color: Some(super::material_graph::SlotTexture {
+                texture: crate::model::TextureRef {
+                    image: crate::model::Id::new("paint_img")?,
+                    uv_layer: None,
+                    interpolation: crate::image::ImageInterpolation::Linear,
+                },
+                transform: Some(crate::exchange::material_surface::TextureTransform {
+                    offset: [0.25, -2.1],
+                    rotation: 0.0,
+                    scale: [2.0, 3.0],
+                }),
+            }),
+            metallic_roughness: None,
+            roughness: None,
+            metallic: None,
+            normal: None,
+            normal_scale: 1.0,
+            emissive: None,
+            occlusion: None,
+        };
+        super::material_graph::move_textures_to_graph(&mut doc, &source, &textures)?;
+        // A primitive with COLOR_0 reading layer "Paint" builds the colour variant from that source.
+        let mut variants = BTreeMap::new();
+        let mut used_material_ids = BTreeSet::from([source.clone()]);
+        let mut used_graph_ids = doc.node_groups.keys().cloned().collect::<BTreeSet<_>>();
+        let variant = super::imported_color_material(
+            &mut doc,
+            &source,
+            "Paint",
+            &mut variants,
+            &mut used_material_ids,
+            &mut used_graph_ids,
+        )?;
+        assert_ne!(variant, source, "the colour variant is a separate material");
+        let variant_graph_id = doc.materials[&variant]
+            .node_tree
+            .clone()
+            .ok_or("the colour variant has no shader graph")?;
+        let graph = &doc.node_groups[&variant_graph_id];
+        let (mapping_name, mapping) = graph
+            .nodes
+            .iter()
+            .find(|(_, node)| node.node_type == "ShaderNodeMapping")
+            .ok_or("the colour variant graph has no Mapping node")?;
+        assert_eq!(mapping.inputs["Scale"], json!([2.0, 3.0, 1.0]));
+        let location = mapping
+            .inputs
+            .get("Location")
+            .and_then(Value::as_array)
+            .ok_or("the Mapping node has no Location")?
+            .iter()
+            .filter_map(Value::as_f64)
+            .collect::<Vec<_>>();
+        assert!(
+            location.len() == 3
+                && (location[0] - 0.25).abs() < 1e-9
+                && (location[1] - 0.1).abs() < 1e-9,
+            "the colour variant's Mapping location is {location:?}"
+        );
+        assert!(
+            graph.links.iter().any(|link| {
+                &link.from_node == mapping_name
+                    && link.to_socket == "Vector"
+                    && graph
+                        .nodes
+                        .get(&link.to_node)
+                        .is_some_and(|node| node.node_type == "ShaderNodeTexImage")
+            }),
+            "the colour variant's Mapping node does not feed its image Vector"
+        );
+        assert!(
+            graph.nodes.values().any(|node| {
+                node.node_type == "ShaderNodeVertexColor"
+                    && node.properties.get("layer_name") == Some(&json!("Paint"))
+            }),
+            "the colour variant does not read its colour layer"
         );
         Ok(())
     }
