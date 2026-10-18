@@ -153,6 +153,7 @@ impl Default for VolumeGrid {
     fn default() -> Self {
         Self {
             dims: [1, 1, 1],
+            origin: DVec3::ZERO,
             voxel_size: 1.0,
             index_to_local: None,
             values: Some(vec![0.0]),
