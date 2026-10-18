@@ -1638,6 +1638,15 @@ pub(crate) fn material_slot_count(object_count: usize, data_count: usize) -> usi
     object_count.max(data_count)
 }
 
+/// Blender's mesh material array as the modifier stack receives it (`BKE_object_material_count_eval`
+/// sizes the evaluated mesh): the DATA slots, padded with empty slots to the evaluated count. Blender
+/// writes this array back to DATA on apply (`BKE_object_material_from_eval_data`).
+pub(crate) fn mesh_slot_array(object_count: usize, data_materials: &[Option<Id>]) -> Vec<Option<Id>> {
+    let mut slots = data_materials.to_vec();
+    slots.resize(material_slot_count(object_count, data_materials.len()), None);
+    slots
+}
+
 /// Link state at one slot; legacy absent entries preserve old node-local object slots.
 pub(crate) fn material_link_at(
     object_count: usize,
@@ -2218,6 +2227,17 @@ mod tests {
         SceneDoc, revision_in_range,
     };
 
+    /// Blender 5.2.2 oracle (probe `P17-bpy` case 1): a mesh with one DATA slot under an object with
+    /// three slots (two OBJECT-linked) gets a three-entry mesh array after a Boolean FLOAT apply, with
+    /// the object-only positions empty. The stack input is padded the same way before any modifier.
+    #[test]
+    fn mesh_slot_array_pads_data_to_the_evaluated_count() {
+        let a = Id::new("mat_a").unwrap();
+        let padded = super::mesh_slot_array(3, std::slice::from_ref(&Some(a.clone())));
+        assert_eq!(padded, vec![Some(a.clone()), None, None]);
+        assert_eq!(super::mesh_slot_array(0, &[Some(a.clone())]), vec![Some(a.clone())]);
+        assert!(super::mesh_slot_array(0, &[]).is_empty());
+    }
     #[test]
     fn default_scene_has_contract_initial_state_and_empty_registries() {
         let doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());

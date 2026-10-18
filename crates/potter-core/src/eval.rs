@@ -83,8 +83,9 @@ pub struct EvaluatedNode {
     /// World-space bounds size, or null for geometry-free nodes.
     pub dimensions: Option<[f64; 3]>,
     /// Effective material slots after the node's modifier stack: each slot resolved under its OBJECT
-    /// or DATA link, or replaced by a Boolean TRANSFER pool. This is the only evaluated slot table;
-    /// face material indices refer to it. Null entries are empty slots. Not serialized.
+    /// or DATA link, or replaced by a Boolean TRANSFER pool. Face material indices refer to it;
+    /// out-of-range indices clamp to its last entry (`BKE_object_material_get_eval`). Null entries are
+    /// empty slots. Not serialized.
     #[serde(skip)]
     pub materials: Vec<Option<Id>>,
 }
@@ -730,9 +731,11 @@ impl Snapshot {
                 .data
                 .as_ref()
                 .and_then(|data_id| doc.data_blocks.get(data_id));
-            // The mesh's own material array (DATA). Modifiers replace it (the Boolean TRANSFER pool);
-            // the evaluated table is resolved from it once the stack has run.
-            let mut node_materials = node_data.map_or_else(Vec::new, |data| data.materials.clone());
+            // The mesh's own material array (`me->mat`), padded to the evaluated count. Modifiers replace
+            // it (the Boolean TRANSFER pool); the effective table is resolved from it once the stack has run.
+            let mut node_materials = node_data.map_or_else(Vec::new, |data| {
+                crate::model::mesh_slot_array(node.materials.len(), &data.materials)
+            });
             let matrix = matrices.get(id).copied().ok_or_else(|| {
                 PotError::new(
                     ErrorCode::InternalError,

@@ -1062,11 +1062,19 @@ fn evaluate_modifier_output(
 ) -> Result<(crate::geom::Mesh, Vec<Option<Id>>)> {
     let modifier_id = &target_modifier.id;
     let modifier_stack = std::slice::from_ref(target_modifier);
+    // The same mesh material array evaluation starts from (`me->mat` padded to the evaluated count).
+    let object_count = engine
+        .doc
+        .nodes
+        .get(target)
+        .map_or(0, |node| node.materials.len());
     let mut material_slots = engine
         .doc
         .data_blocks
         .get(data_id)
-        .map_or_else(Vec::new, |data| data.materials.clone());
+        .map_or_else(Vec::new, |data| {
+            crate::model::mesh_slot_array(object_count, &data.materials)
+        });
     let evaluated = {
         let data_block = engine.doc.data_blocks.get(data_id).ok_or_else(|| {
             PotError::new(

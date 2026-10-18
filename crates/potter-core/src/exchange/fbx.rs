@@ -1779,30 +1779,21 @@ fn write_geometry(
     output.push_str("\n\t\t}\n");
     write_normal_layer(output, mesh)?;
     write_uv_layers(output, mesh)?;
-    if material_slot_count > 0
-        && let Some(face) = mesh.faces.iter().find(|face| {
-            usize::try_from(face.material_index).map_or(true, |slot| slot >= material_slot_count)
-        })
-    {
-        return Err(PotError::with_details(
-            ErrorCode::SceneInvalid,
-            "mesh face material slot is outside the evaluated material slot list",
-            json!({"face_id":face.id,"slot":face.material_index,"material_count":material_slot_count}),
-        ));
-    }
+    // Blender keeps out-of-range face indices and resolves them to the last slot
+    // (`BKE_object_material_get_eval`), so the writer clamps them below rather than refusing the mesh.
     if has_material_layer {
         write!(output, "\t\tLayerElementMaterial: 0 {{\n\t\t\tVersion: 101\n\t\t\tName: \"\"\n\t\t\tMappingInformationType: \"ByPolygon\"\n\t\t\tReferenceInformationType: \"IndexToDirect\"\n\t\t\tMaterials: *{} {{\n\t\t\t\ta: ", mesh.faces.len()).map_err(write_error)?;
         for (index, face) in mesh.faces.iter().enumerate() {
             if index != 0 {
                 output.push(',');
             }
-            let slot = usize::try_from(face.material_index).map_err(|_| {
-                PotError::new(
-                    ErrorCode::LimitExceeded,
-                    "FBX face material slot exceeds usize",
-                )
-            })?;
-            let output_slot = material_slot_indices[slot]
+            let slot = usize::try_from(face.material_index)
+                .unwrap_or(usize::MAX)
+                .min(material_slot_count.saturating_sub(1));
+            let output_slot = material_slot_indices
+                .get(slot)
+                .copied()
+                .flatten()
                 .or(fallback_material_index)
                 .ok_or_else(|| {
                     PotError::new(
