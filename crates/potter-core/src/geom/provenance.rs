@@ -20,6 +20,7 @@ use crate::error::{ErrorCode, PotError, Result};
 use super::attribute_keys;
 use super::clnor::{self, NormalCodeOptions};
 use super::color_layers::{self, ColorDomain, ColorLayer};
+use super::interpolation::interp_weights_poly_v2;
 use super::uv_layers::{self, UvLayer};
 use super::{Mesh, edge_key};
 
@@ -472,21 +473,27 @@ pub(crate) fn mean_value_corners<'a>(
             })
             .collect();
         let projected = polygon.as_deref().and_then(project_polygon);
+        // One weight buffer per source face, reused for each of its output vertices.
+        let mut weights = projected
+            .as_ref()
+            .map_or_else(Vec::new, |(polygon, _)| vec![0.0_f32; polygon.len()]);
         for &vertex in vertices {
-            let weights = match (projected.as_ref(), points.get(vertex)) {
+            let interpolated = match (projected.as_ref(), points.get(vertex)) {
                 (Some((polygon, axes)), Some(point)) => {
-                    mean_value_weights(polygon, project_point(*point, *axes)).unwrap_or_default()
+                    interp_weights_poly_v2(&mut weights, polygon, project_point(*point, *axes))
                 }
-                _ => Vec::new(),
+                _ => false,
             };
-            corners.push(
+            corners.push(if interpolated {
                 weights
-                    .into_iter()
+                    .iter()
                     .enumerate()
-                    .filter(|(_, weight)| *weight != 0.0)
-                    .map(|(corner, weight)| (offsets[index] + corner, weight))
-                    .collect(),
-            );
+                    .filter(|(_, weight)| **weight != 0.0)
+                    .map(|(corner, weight)| (offsets[index] + corner, f64::from(*weight)))
+                    .collect()
+            } else {
+                Vec::new()
+            });
         }
     }
     corners
@@ -581,125 +588,6 @@ fn dot3_f32(first: [f32; 3], second: [f32; 3]) -> f32 {
     first[0] * second[0] + first[1] * second[1] + first[2] * second[2]
 }
 
-fn direction_to_point(vertex: [f32; 2], point: [f32; 2]) -> ([f64; 2], f64) {
-    let direction = [
-        f64::from(vertex[0]) - f64::from(point[0]),
-        f64::from(vertex[1]) - f64::from(point[1]),
-    ];
-    let length = (direction[0] * direction[0] + direction[1] * direction[1]).sqrt();
-    (direction, length)
-}
-
-fn half_tangent(current: ([f64; 2], f64), next: ([f64; 2], f64)) -> f64 {
-    let area = current.0[0] * next.0[1] - current.0[1] * next.0[0];
-    if area == 0.0 {
-        return 0.0;
-    }
-    let dot = current.0[0] * next.0[0] + current.0[1] * next.0[1];
-    let result = (current.1 * next.1 - dot) / area;
-    if result.is_finite() { result } else { 0.0 }
-}
-
-fn line_segment_distance_squared(point: [f32; 2], first: [f32; 2], second: [f32; 2]) -> f32 {
-    let direction = [second[0] - first[0], second[1] - first[1]];
-    let offset = [point[0] - first[0], point[1] - first[1]];
-    let denominator = direction[0] * direction[0] + direction[1] * direction[1];
-    let factor = if denominator == 0.0 {
-        0.0
-    } else {
-        (direction[0] * offset[0] + direction[1] * offset[1]) / denominator
-    };
-    let closest = if factor <= 0.0 {
-        first
-    } else if factor >= 1.0 {
-        second
-    } else {
-        [
-            first[0] + direction[0] * factor,
-            first[1] + direction[1] * factor,
-        ]
-    };
-    let difference = [closest[0] - point[0], closest[1] - point[1]];
-    difference[0] * difference[0] + difference[1] * difference[1]
-}
-
-fn line_point_factor(point: [f32; 2], first: [f32; 2], second: [f32; 2]) -> f32 {
-    let direction = [second[0] - first[0], second[1] - first[1]];
-    let offset = [point[0] - first[0], point[1] - first[1]];
-    let denominator = direction[0] * direction[0] + direction[1] * direction[1];
-    if denominator == 0.0 {
-        0.0
-    } else {
-        (direction[0] * offset[0] + direction[1] * offset[1]) / denominator
-    }
-}
-
-/// Blender's `interp_weights_poly_v2`: f32 projected coordinates, 16*`FLT_EPSILON` scale-aware snapping,
-/// and double half-tangent math for the interior mean-value weights.
-fn mean_value_weights(polygon: &[[f32; 2]], point: [f32; 2]) -> Option<Vec<f64>> {
-    let count = polygon.len();
-    if count < 3 {
-        return None;
-    }
-    let mut max_value = 0.0_f32;
-    for vertex in polygon {
-        max_value = max_value.max((vertex[0] - point[0]).abs());
-        max_value = max_value.max((vertex[1] - point[1]).abs());
-    }
-    let epsilon = 16.0 * f32::EPSILON * max_value;
-    let epsilon_squared = epsilon * epsilon;
-    let mut weights = vec![0.0_f32; count];
-    let mut total_weight = 0.0_f32;
-    let mut current_index = count - 1;
-    let mut next_index = 0;
-    let mut current = polygon[current_index];
-    let mut next = polygon[next_index];
-    let mut current_direction = direction_to_point(polygon[count - 2], point);
-    let mut next_direction = direction_to_point(current, point);
-    let mut previous_half_tangent = half_tangent(current_direction, next_direction);
-    let mut snap = 0_u8;
-    while next_index < count {
-        if next_direction.1 < f64::from(epsilon) {
-            snap = 1;
-            break;
-        }
-        if line_segment_distance_squared(point, current, next) < epsilon_squared {
-            snap = 2;
-            break;
-        }
-        current_direction = next_direction;
-        next_direction = direction_to_point(next, point);
-        let tangent = half_tangent(current_direction, next_direction);
-        weights[current_index] = if current_direction.1 == 0.0 {
-            0.0
-        } else {
-            ((previous_half_tangent + tangent) / current_direction.1) as f32
-        };
-        total_weight += weights[current_index];
-        current_index = next_index;
-        next_index += 1;
-        current = next;
-        if next_index < count {
-            next = polygon[next_index];
-        }
-        previous_half_tangent = tangent;
-    }
-    if snap != 0 {
-        weights.fill(0.0);
-    }
-    if snap == 1 {
-        weights[current_index] = 1.0;
-    } else if snap == 2 {
-        let factor = line_point_factor(point, current, next).clamp(0.0, 1.0);
-        weights[current_index] = 1.0 - factor;
-        weights[next_index] = factor;
-    } else if total_weight != 0.0 {
-        for weight in &mut weights {
-            *weight /= total_weight;
-        }
-    }
-    Some(weights.into_iter().map(f64::from).collect())
-}
 
 #[expect(
     clippy::cast_precision_loss,
