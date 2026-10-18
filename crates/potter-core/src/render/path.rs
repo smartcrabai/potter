@@ -7,7 +7,7 @@ use crate::{
     eval::Snapshot,
     geom::volume::{VolumeData, sample_density, sample_density_checked},
     image::{ImageData, ImageInterpolation},
-    model::{Id, LightData, LightType, SceneDoc},
+    model::{Id, LightType, SceneDoc},
     shader::{
         BsdfParams, EvaluatorWorkspace, HitContext, HitUvLayers, dielectric_f0,
         evaluate_surface_with_workspace, height_gradient,
@@ -16,6 +16,9 @@ use crate::{
 
 use super::{
     bvh::{Bvh, BvhHit},
+    light_model::{
+        AreaShape, area_radiance, area_shape, emitter_radiance, point_intensity, spot_attenuation,
+    },
     raster::{
         Camera, Mode, RasterOutput, StereoMode, blend_corner_normals, camera_eye,
         rasterize_with_lines, ray_for_sample, smooth_shadow_origin,
@@ -37,22 +40,11 @@ struct PointLight {
     color: DVec3,
     energy: f64,
     radius: f64,
+    soft_falloff: bool,
     spot_size: f64,
     spot_blend: f64,
     /// The emitting shape of an area light; `None` for every other light type.
     area: Option<AreaShape>,
-}
-
-/// A Blender area light's emitting shape in world space: unit axes, half extents with the
-/// object scale applied, whether it is an ellipse, and its area.
-#[derive(Clone, Copy)]
-struct AreaShape {
-    axis_u: DVec3,
-    axis_v: DVec3,
-    half_u: f64,
-    half_v: f64,
-    ellipse: bool,
-    area: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -1552,40 +1544,104 @@ fn sample_light(light: &PointLight, point: DVec3, rng: &mut Pcg32) -> Option<Lig
     if light.kind == LightType::Area {
         return sample_area_light(light, point, rng);
     }
-    let target = if light.kind == LightType::Point && light.radius > 0.0 {
-        let z = 1.0 - 2.0 * rng.next_f64();
-        let angle = rng.next_f64() * std::f64::consts::TAU;
-        let radial = (1.0 - z * z).max(0.0).sqrt();
-        light.position + DVec3::new(radial * angle.cos(), radial * angle.sin(), z) * light.radius
-    } else {
-        light.position
+    // Point and spot lights, as `point_light_sample` and `spot_light_sample` in
+    // `intern/cycles/kernel/light/`. Each returned `radiance` is the sample's weight: the emitter
+    // radiance times the sampling Jacobian (solid-angle pdf inverse), so no extra pdf is applied.
+    let attenuation = |to_point: DVec3| -> f64 {
+        if light.kind == LightType::Spot {
+            spot_attenuation(
+                light.direction.dot(to_point),
+                light.spot_size,
+                light.spot_blend,
+            )
+        } else {
+            1.0
+        }
     };
-    let offset = target - point;
-    let distance_squared = offset.length_squared();
-    if distance_squared <= f64::EPSILON || !distance_squared.is_finite() {
+    let offset_to_centre = light.position - point;
+    let distance_squared = offset_to_centre.length_squared();
+    if !distance_squared.is_finite() || distance_squared <= f64::EPSILON {
         return None;
     }
-    let distance = distance_squared.sqrt();
-    let direction = offset / distance;
-    let mut attenuation = 1.0 / distance_squared;
-    if light.kind == LightType::Spot {
-        let cosine = light.direction.normalize_or_zero().dot(-direction);
-        let outer = (light.spot_size.clamp(0.0, std::f64::consts::TAU) * 0.5).cos();
-        let blend = light.spot_blend.clamp(0.0, 1.0) * (1.0 - outer);
-        let inner = (outer + blend).min(1.0);
-        if cosine <= outer {
+    let distance_to_centre = distance_squared.sqrt();
+    // Unit vectors from the receiver to the light centre, and from the light centre to the receiver.
+    let toward_centre = offset_to_centre / distance_to_centre;
+    let from_centre = -toward_centre;
+    let radius = light.radius;
+    if radius <= 0.0 {
+        // A zero-radius point: radiant intensity P / (4π), i.e. `eval_fac = 1 / (4π)`.
+        let direction = toward_centre;
+        let intensity = point_intensity(light.energy);
+        return Some(LightSample {
+            direction,
+            distance: distance_to_centre,
+            radiance: light.color
+                * (intensity / distance_squared * attenuation(-direction)),
+        });
+    }
+    let emitter = emitter_radiance(light.energy, radius);
+    if light.soft_falloff {
+        // Disk of radius `r` facing the receiver (`is_sphere = false`): a uniform disk point with
+        // area pdf `1 / (π r²)`, so the weight is `eval_fac · π r² · cos θ_light / t²`.
+        let (tangent, bitangent) = basis(from_centre);
+        let disk_radius = radius * rng.next_f64().sqrt();
+        let phi = std::f64::consts::TAU * rng.next_f64();
+        let sample_point = light.position
+            + (tangent * phi.cos() + bitangent * phi.sin()) * disk_radius;
+        let offset = sample_point - point;
+        let distance = offset.length();
+        if !distance.is_finite() || distance <= f64::EPSILON {
             return None;
         }
-        attenuation *= if inner <= outer {
-            1.0
-        } else {
-            ((cosine - outer) / (inner - outer)).clamp(0.0, 1.0)
-        };
+        let direction = offset / distance;
+        let cos_light = from_centre.dot(-direction);
+        if cos_light <= 0.0 {
+            return None;
+        }
+        let weight = emitter * std::f64::consts::PI * radius * radius * cos_light
+            / (distance * distance);
+        return Some(LightSample {
+            direction,
+            distance,
+            radiance: light.color * (weight * attenuation(-direction)),
+        });
     }
+    // Sphere (`is_sphere = true`).
+    if distance_squared > radius * radius {
+        // Uniform cone over the visible cap, pdf `1 / (2π (1 − cos θ_max))`.
+        let sin_squared = radius * radius / distance_squared;
+        let one_minus_cos = 1.0 - (1.0 - sin_squared).max(0.0).sqrt();
+        let cosine = 1.0 - one_minus_cos * rng.next_f64();
+        let sine = (1.0 - cosine * cosine).max(0.0).sqrt();
+        let phi = std::f64::consts::TAU * rng.next_f64();
+        let (tangent, bitangent) = basis(toward_centre);
+        let direction = toward_centre * cosine
+            + (tangent * phi.cos() + bitangent * phi.sin()) * sine;
+        // Law of cosines: the first hit with the sphere along `direction`.
+        let distance = distance_to_centre * cosine
+            - (radius * radius - distance_squared
+                + distance_squared * cosine * cosine)
+                .max(0.0)
+                .sqrt();
+        let solid_angle = 2.0 * std::f64::consts::PI * one_minus_cos;
+        return Some(LightSample {
+            direction,
+            distance,
+            radiance: light.color * (emitter * solid_angle * attenuation(-direction)),
+        });
+    }
+    // Receiver inside the sphere: uniform directions (pdf `1 / 4π`), and the spot cone does not
+    // attenuate, as in `spot_light_sample`'s inside branch.
+    let (direction, _) = sample_uniform_sphere(rng);
+    let cosine = direction.dot(toward_centre);
+    let distance = distance_to_centre * cosine
+        + (radius * radius - distance_squared + distance_squared * cosine * cosine)
+            .max(0.0)
+            .sqrt();
     Some(LightSample {
         direction,
         distance,
-        radiance: light.color * (light.energy * attenuation),
+        radiance: light.color * (emitter * 4.0 * std::f64::consts::PI),
     })
 }
 
@@ -1623,45 +1679,12 @@ fn sample_area_light(light: &PointLight, point: DVec3, rng: &mut Pcg32) -> Optio
     if cos_light <= 0.0 {
         return None;
     }
-    let emitted = light.color * (light.energy / (std::f64::consts::PI * shape.area));
+    let emitted = light.color * area_radiance(light.energy, shape.area);
     Some(LightSample {
         direction,
         distance,
         radiance: emitted * (shape.area * cos_light / distance_squared),
     })
-}
-
-/// The shape of a Blender area light in world space (`intern/cycles/blender/light.cpp`,
-/// `BlenderSync::sync_light`, and `intern/cycles/scene/light.cpp`, `AreaLight::copy_to_kernel`).
-///
-/// Both sides take `area_size`, except that RECTANGLE and ELLIPSE take `area_size_y` for the
-/// second. DISK and ELLIPSE are ellipses, whose area is `π/4` of the bounding rectangle
-/// (`AreaLight::area`). The object transform scales the extents.
-fn area_shape(data: &LightData, matrix: &DMat4) -> AreaShape {
-    let square_or_disk = matches!(data.area_shape.as_str(), "SQUARE" | "DISK");
-    let size_v = if square_or_disk {
-        data.area_size
-    } else {
-        data.area_size_y
-    };
-    let extent_u = matrix.transform_vector3(DVec3::X) * data.area_size;
-    let extent_v = matrix.transform_vector3(DVec3::Y) * size_v;
-    let half_u = extent_u.length() * 0.5;
-    let half_v = extent_v.length() * 0.5;
-    let ellipse = matches!(data.area_shape.as_str(), "DISK" | "ELLIPSE");
-    let rectangle_area = 4.0 * half_u * half_v;
-    AreaShape {
-        axis_u: extent_u.normalize_or_zero(),
-        axis_v: extent_v.normalize_or_zero(),
-        half_u,
-        half_v,
-        ellipse,
-        area: if ellipse {
-            rectangle_area * std::f64::consts::FRAC_PI_4
-        } else {
-            rectangle_area
-        },
-    }
 }
 
 fn sample_bsdf(params: &BsdfParams, view: DVec3, rng: &mut Pcg32) -> (DVec3, DVec3, bool) {
@@ -1822,6 +1845,7 @@ fn collect_lights(doc: &SceneDoc, snapshot: &Snapshot) -> Vec<PointLight> {
                 color: DVec3::from_array(data.color).max(DVec3::ZERO),
                 energy: data.energy.max(0.0),
                 radius: data.radius.max(0.0),
+                soft_falloff: data.soft_falloff,
                 spot_size: data.spot_size,
                 spot_blend: data.spot_blend,
                 area: (data.light_type == LightType::Area).then(|| area_shape(data, &matrix)),

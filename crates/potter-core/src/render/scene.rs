@@ -26,6 +26,9 @@ use crate::{
 
 use super::{
     bvh::Bvh,
+    light_model::{
+        area_irradiance_per_radiance, area_radiance, area_shape, point_intensity, spot_attenuation,
+    },
     path::object_for_index,
     raster::{
         AlphaMode, Line, Mode, SurfaceHit, SurfaceShader, Triangle, blend_color,
@@ -2066,7 +2069,7 @@ fn light_contribution(
                 toward_light,
                 normal,
                 color,
-                energy / distance_squared,
+                point_intensity(energy) / distance_squared,
             ) * visibility_for_light(
                 shadow,
                 point_shadow,
@@ -2082,19 +2085,10 @@ fn light_contribution(
             let toward_light = delta.normalize_or_zero();
             let direction = matrix.transform_vector3(-DVec3::Z).normalize_or_zero();
             let cosine = direction.dot(-toward_light).clamp(-1.0, 1.0);
-            let outer_cosine = (light.spot_size.clamp(0.0, std::f64::consts::PI) * 0.5).cos();
-            if cosine <= outer_cosine {
+            let falloff = spot_attenuation(cosine, light.spot_size, light.spot_blend);
+            if falloff <= 0.0 {
                 return DVec3::ZERO;
             }
-            let inner_angle = light.spot_size.clamp(0.0, std::f64::consts::PI)
-                * (1.0 - light.spot_blend.clamp(0.0, 1.0))
-                * 0.5;
-            let inner_cosine = inner_angle.cos();
-            let falloff = if inner_cosine <= outer_cosine + f64::EPSILON {
-                1.0
-            } else {
-                ((cosine - outer_cosine) / (inner_cosine - outer_cosine)).clamp(0.0, 1.0)
-            };
             direct_brdf(
                 albedo,
                 metallic,
@@ -2104,7 +2098,7 @@ fn light_contribution(
                 toward_light,
                 normal,
                 color,
-                (energy / distance_squared) * falloff,
+                (point_intensity(energy) / distance_squared) * falloff,
             ) * visibility_for_light(
                 shadow,
                 point_shadow,
@@ -2115,40 +2109,51 @@ fn light_contribution(
             )
         }
         crate::model::LightType::Area => {
-            let radius = light.radius.max(0.0);
-            let offsets = [
-                DVec3::ZERO,
-                DVec3::new(radius, 0.0, 0.0),
-                DVec3::new(-radius, 0.0, 0.0),
-                DVec3::new(0.0, radius, 0.0),
-                DVec3::new(0.0, -radius, 0.0),
-            ];
-            let mut sum = DVec3::ZERO;
-            for offset in offsets {
-                let sample_position = position + matrix.transform_vector3(offset);
+            let shape = area_shape(light, &matrix);
+            if shape.area <= 0.0 {
+                return DVec3::ZERO;
+            }
+            let light_direction = matrix.transform_vector3(-DVec3::Z).normalize_or_zero();
+            let irradiance = area_irradiance_per_radiance(
+                &shape,
+                position,
+                light_direction,
+                point,
+                normal,
+            ) * area_radiance(energy, shape.area);
+            if irradiance <= 0.0 {
+                return DVec3::ZERO;
+            }
+            // Five shadow rays: the centre and the four edge midpoints, averaged.
+            let mut visibility = 0.0;
+            for (along_u, along_v) in [(0.0, 0.0), (1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
+                let sample_position = position
+                    + shape.axis_u * (shape.half_u * along_u)
+                    + shape.axis_v * (shape.half_v * along_v);
                 let delta = sample_position - point;
-                let distance_squared = delta.length_squared().max(1.0e-6);
-                let toward_light = delta.normalize_or_zero();
-                sum += direct_brdf(
-                    albedo,
-                    metallic,
-                    roughness,
-                    specular_f0,
-                    normal,
-                    toward_light,
-                    normal,
-                    color,
-                    energy / distance_squared,
-                ) * visibility_for_light(
+                visibility += visibility_for_light(
                     shadow,
                     point_shadow,
                     shadow_point,
                     geometric,
-                    toward_light,
-                    distance_squared.sqrt(),
+                    delta.normalize_or_zero(),
+                    delta.length(),
                 );
             }
-            sum / 5.0
+            // The representative direction is the emitter centre: the diffuse term is exact for
+            // the whole emitter, and the specular lobe is evaluated along that direction.
+            let toward_centre = (position - point).normalize_or_zero();
+            direct_irradiance(
+                albedo,
+                metallic,
+                roughness,
+                specular_f0,
+                normal,
+                toward_centre,
+                normal,
+                color,
+                irradiance,
+            ) * (visibility / 5.0)
         }
     }
 }
@@ -2257,30 +2262,69 @@ fn direct_brdf(
     intensity: f64,
 ) -> DVec3 {
     let normal_light_cosine = normal.dot(light_dir).max(0.0);
+    if normal_light_cosine <= 0.0 {
+        return DVec3::ZERO;
+    }
+    direct_irradiance(
+        albedo,
+        metallic,
+        roughness,
+        specular_f0,
+        normal,
+        light_dir,
+        view_dir,
+        light_color,
+        intensity * normal_light_cosine,
+    )
+}
+
+/// Reflected radiance for an incident `irradiance` (W/m², already weighted by the receiver's cosine)
+/// arriving from `light_dir`. The diffuse term is exact for any irradiance. The specular lobe is
+/// evaluated along `light_dir`, and is zero where `light_dir` is below the surface.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Cook-Torrance evaluation consumes explicit BRDF and light inputs"
+)]
+fn direct_irradiance(
+    albedo: DVec3,
+    metallic: f64,
+    roughness: f64,
+    specular_f0: f64,
+    normal: DVec3,
+    light_dir: DVec3,
+    view_dir: DVec3,
+    light_color: DVec3,
+    irradiance: f64,
+) -> DVec3 {
+    let normal_light_cosine = normal.dot(light_dir).max(0.0);
     let normal_view_cosine = normal.dot(view_dir).max(0.0);
-    if normal_light_cosine <= 0.0 || normal_view_cosine <= 0.0 {
+    if normal_view_cosine <= 0.0 {
         return DVec3::ZERO;
     }
     let half_vector = (light_dir + view_dir).normalize_or_zero();
-    let normal_half_cosine = normal.dot(half_vector).max(0.0);
     let view_half_cosine = view_dir.dot(half_vector).max(0.0);
-    let alpha = roughness.max(0.04).powi(2);
-    let alpha_squared = alpha * alpha;
-    let distribution_denominator =
-        (normal_half_cosine * normal_half_cosine * (alpha_squared - 1.0) + 1.0).powi(2)
-            * std::f64::consts::PI;
-    let distribution = alpha_squared / distribution_denominator.max(1.0e-9);
-    let smith_k = (roughness + 1.0).powi(2) / 8.0;
-    let geometry = |cosine: f64| cosine / (cosine * (1.0 - smith_k) + smith_k).max(1.0e-9);
-    let geometry_term = geometry(normal_light_cosine) * geometry(normal_view_cosine);
     let reflectance_at_normal = DVec3::splat(specular_f0) * (1.0 - metallic) + albedo * metallic;
     let fresnel = reflectance_at_normal
         + (DVec3::ONE - reflectance_at_normal) * (1.0 - view_half_cosine).powi(5);
-    let specular = fresnel
-        * (distribution * geometry_term
-            / (4.0 * normal_view_cosine * normal_light_cosine).max(1.0e-9));
     let diffuse = (DVec3::ONE - fresnel) * albedo * ((1.0 - metallic) / std::f64::consts::PI);
-    (diffuse + specular) * light_color * (intensity * normal_light_cosine)
+    let specular = if normal_light_cosine > 0.0 {
+        let normal_half_cosine = normal.dot(half_vector).max(0.0);
+        let alpha = roughness.max(0.04).powi(2);
+        let alpha_squared = alpha * alpha;
+        let distribution_denominator =
+            (normal_half_cosine * normal_half_cosine * (alpha_squared - 1.0) + 1.0).powi(2)
+                * std::f64::consts::PI;
+        let distribution = alpha_squared / distribution_denominator.max(1.0e-9);
+        let smith_k = (roughness + 1.0).powi(2) / 8.0;
+        let geometry = |cosine: f64| cosine / (cosine * (1.0 - smith_k) + smith_k).max(1.0e-9);
+        let geometry_term = geometry(normal_light_cosine) * geometry(normal_view_cosine);
+        fresnel
+            * (distribution * geometry_term
+                / (4.0 * normal_view_cosine * normal_light_cosine).max(1.0e-9))
+    } else {
+        DVec3::ZERO
+    };
+    (diffuse + specular) * light_color * irradiance
 }
 
 #[cfg(test)]
