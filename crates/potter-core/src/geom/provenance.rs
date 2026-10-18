@@ -59,6 +59,64 @@ impl Origin {
     }
 }
 
+/// One Blender mixing stage of a face-sampled element: `sources` mixed into one value, then weighted by
+/// `weight` in the element's outer mix. Blender converts each stage to the attribute type before the outer
+/// mix (`vert_interpolation_from_corner`, `subdiv_mesh.cc:498`; `subdiv_vert_data_interpolate`, `subdiv_mesh.cc:971`).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Stage {
+    pub weight: f64,
+    pub sources: Vec<(usize, f64)>,
+}
+
+/// Staged mixes of a subdivided mesh, indexed like the flat [`Origin`] lists. A vertex without stages
+/// (`None`) is a coarse copy or a loose-edge mix, whose flat sources are already Blender's single mix.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct Staged {
+    pub vertices: Vec<Option<Vec<Stage>>>,
+    /// `None` when the output carries no corner data, as for [`Origin::corners`].
+    pub corners: Option<Vec<Vec<Stage>>>,
+}
+
+impl Staged {
+    /// Flat sources of the stages, one `(source, weight)` per source, merged by source.
+    pub(crate) fn flatten(stages: &[Stage]) -> Vec<(usize, f64)> {
+        let mut pairs: Vec<(usize, f64)> = stages
+            .iter()
+            .flat_map(|stage| {
+                stage
+                    .sources
+                    .iter()
+                    .map(move |&(source, weight)| (source, weight * stage.weight))
+            })
+            .collect();
+        pairs.sort_by_key(|&(source, _)| source);
+        let mut merged: Vec<(usize, f64)> = Vec::with_capacity(pairs.len());
+        for (source, weight) in pairs {
+            match merged.last_mut() {
+                Some((last, total)) if *last == source => *total += weight,
+                _ => merged.push((source, weight)),
+            }
+        }
+        merged.retain(|(_, weight)| *weight > 0.0);
+        merged
+    }
+}
+
+/// How one output element mixes its sources: flat weighted sources, or Blender's staged slots.
+#[derive(Clone, Copy)]
+pub(crate) enum Mix<'a> {
+    Flat(&'a [(usize, f64)]),
+    Staged(&'a [Stage]),
+}
+
+/// [`Mix::Staged`] when `stages` is present, otherwise the flat `sources`.
+pub(crate) fn mix_of<'a>(stages: Option<&'a [Stage]>, sources: &'a [(usize, f64)]) -> Mix<'a> {
+    match stages {
+        Some(stages) => Mix::Staged(stages),
+        None => Mix::Flat(sources),
+    }
+}
+
 /// Rewrite the ID-keyed attributes of `output` (rebuilt from `source`) through `origin`.
 ///
 /// `vertex_groups`, `crease_edge`, skin vertex keys, every `uv_layers` layer, every canonical color
@@ -90,6 +148,35 @@ pub(crate) fn remap_attributes_skipping(
     origin: &Origin,
     skipped: &[&str],
 ) -> Result<()> {
+    remap_attributes_staged(source, output, origin, None, skipped)
+}
+
+/// [`remap_attributes_skipping`] for a subdivided mesh whose face-sampled elements mix in Blender's
+/// stages. Integer, quaternion, and byte data mix stage by stage through `staged`; other data uses `origin`.
+///
+/// # Errors
+///
+/// Returns `INTERNAL_ERROR` when `origin` or `staged` does not describe `output`.
+pub(crate) fn remap_attributes_staged(
+    source: &Mesh,
+    output: &mut Mesh,
+    origin: &Origin,
+    staged: Option<&Staged>,
+    skipped: &[&str],
+) -> Result<()> {
+    let corner_count: usize = output.faces.iter().map(|face| face.vertices.len()).sum();
+    if staged.is_some_and(|staged| {
+        staged.vertices.len() != output.vertices.len()
+            || staged
+                .corners
+                .as_ref()
+                .is_some_and(|corners| corners.len() != corner_count)
+    }) {
+        return Err(PotError::new(
+            ErrorCode::InternalError,
+            "staged modifier provenance does not describe the rebuilt mesh",
+        ));
+    }
     if origin.vertices.len() != output.vertices.len() || origin.faces.len() != output.faces.len() {
         return Err(PotError::new(
             ErrorCode::InternalError,
@@ -130,18 +217,7 @@ pub(crate) fn remap_attributes_skipping(
             .iter()
             .filter(|(key, _)| kept(key.as_str()))
             .any(|(_, value)| named_domain(value).as_deref() == Some("edge"));
-    let needs_corners = has(uv_layers::ATTRIBUTE)
-        || has("blender_uv_layers")
-        || has("uv_map")
-        || has("custom_normal")
-        || entries
-            .iter()
-            .any(|entry| text(entry, "domain") == "CORNER")
-        || source
-            .attributes
-            .iter()
-            .filter(|(key, _)| kept(key.as_str()))
-            .any(|(_, value)| named_domain(value).as_deref() == Some("corner"));
+    let needs_corners = needs_corner_sources(source, skipped);
     let output_vertex_index: HashMap<u32, usize> = if needs_edges || needs_corners {
         output
             .vertices
@@ -170,6 +246,7 @@ pub(crate) fn remap_attributes_skipping(
         source,
         output,
         origin,
+        staged,
         edge_origin: &edge_origin,
         corner_origin,
     };
@@ -576,11 +653,28 @@ struct Sources<'a> {
     source: &'a Mesh,
     output: &'a Mesh,
     origin: &'a Origin,
+    staged: Option<&'a Staged>,
     edge_origin: &'a [Vec<(usize, f64)>],
     corner_origin: &'a [Vec<(usize, f64)>],
 }
 
 impl Sources<'_> {
+    /// How output vertex `index` mixes: its stages when it has them, otherwise its flat sources.
+    fn vertex_mix(&self, index: usize) -> Mix<'_> {
+        let stages = self
+            .staged
+            .and_then(|staged| staged.vertices.get(index)?.as_deref());
+        mix_of(stages, &self.origin.vertices[index])
+    }
+
+    /// How output corner `index` (in output corner order) mixes.
+    fn corner_mix(&self, index: usize) -> Mix<'_> {
+        let stages = self
+            .staged
+            .and_then(|staged| staged.corners.as_ref()?.get(index).map(Vec::as_slice));
+        mix_of(stages, &self.corner_origin[index])
+    }
+
     /// Interpolated vertex-group weights keyed `v{output id}` under each group name.
     fn vertex_groups(&self, groups: &Map<String, Value>) -> Map<String, Value> {
         groups
@@ -747,12 +841,13 @@ impl Sources<'_> {
                     .iter()
                     .map(|vertex| values.get(&format!("v{}", vertex.id)))
                     .collect();
+                let lookup = |source: usize| stored.get(source).copied().flatten();
                 self.output
                     .vertices
                     .iter()
-                    .zip(&self.origin.vertices)
-                    .filter_map(|(vertex, sources)| {
-                        let value = blend_sources(&stored, sources, data_type)?;
+                    .enumerate()
+                    .filter_map(|(index, vertex)| {
+                        let value = blend_mix(lookup, self.vertex_mix(index), data_type)?;
                         Some((format!("v{}", vertex.id), value))
                     })
                     .collect()
@@ -809,15 +904,14 @@ impl Sources<'_> {
                 }
                 let offsets =
                     corner_offsets(self.output.faces.iter().map(|face| face.vertices.len()));
+                let lookup = |source: usize| stored.get(source).copied().flatten();
                 self.output
                     .faces
                     .iter()
                     .zip(offsets)
                     .filter_map(|(face, offset)| {
-                        let sources = &self.corner_origin[offset..][..face.vertices.len()];
-                        let blended: Vec<Option<Value>> = sources
-                            .iter()
-                            .map(|sources| blend_sources(&stored, sources, data_type))
+                        let blended: Vec<Option<Value>> = (offset..offset + face.vertices.len())
+                            .map(|corner| blend_mix(lookup, self.corner_mix(corner), data_type))
                             .collect();
                         if blended.iter().all(Option::is_none) {
                             return None;
@@ -842,10 +936,15 @@ impl Sources<'_> {
         data_type: &str,
         default: impl Fn() -> Value,
     ) -> Vec<Value> {
-        self.origin
-            .vertices
-            .iter()
-            .map(|sources| blend_indexed(values, sources, data_type).unwrap_or_else(&default))
+        (0..self.origin.vertices.len())
+            .map(|index| {
+                blend_mix(
+                    |source| values.get(source),
+                    self.vertex_mix(index),
+                    data_type,
+                )
+                .unwrap_or_else(&default)
+            })
             .collect()
     }
 
@@ -889,10 +988,15 @@ impl Sources<'_> {
                         .unwrap_or_else(default)
                 })
                 .collect(),
-            "CORNER" => self
-                .corner_origin
-                .iter()
-                .map(|sources| blend_indexed(values, sources, data_type).unwrap_or_else(&default))
+            "CORNER" => (0..self.corner_origin.len())
+                .map(|corner| {
+                    blend_mix(
+                        |source| values.get(source),
+                        self.corner_mix(corner),
+                        data_type,
+                    )
+                    .unwrap_or_else(&default)
+                })
                 .collect(),
             _ => return entry.clone(),
         };
@@ -1006,15 +1110,12 @@ impl Sources<'_> {
         match domain.as_str() {
             "point" => {
                 let by_id: HashMap<u32, &Value> = keyed_values(values, "v");
-                for (vertex, sources) in self.output.vertices.iter().zip(&self.origin.vertices) {
-                    let blended = blend(
-                        sources.iter().filter_map(|(index, weight)| {
-                            let id = self.source.vertices.get(*index)?.id;
-                            by_id.get(&id).map(|value| (*value, *weight))
-                        }),
-                        &kind,
-                    );
-                    if let Some(value) = blended {
+                for (index, vertex) in self.output.vertices.iter().enumerate() {
+                    let lookup = |source: usize| {
+                        let id = self.source.vertices.get(source)?.id;
+                        by_id.get(&id).copied()
+                    };
+                    if let Some(value) = blend_mix(lookup, self.vertex_mix(index), &kind) {
                         output.insert(format!("v{}", vertex.id), value);
                     }
                 }
@@ -1068,22 +1169,10 @@ impl Sources<'_> {
                 let output_offsets =
                     corner_offsets(self.output.faces.iter().map(|face| face.vertices.len()));
                 for (face_index, face) in self.output.faces.iter().enumerate() {
-                    let corners =
-                        &self.corner_origin[output_offsets[face_index]..][..face.vertices.len()];
-                    let row: Vec<Option<Value>> = corners
-                        .iter()
-                        .map(|sources| {
-                            blend(
-                                sources.iter().filter_map(|(source, weight)| {
-                                    authored
-                                        .get(*source)
-                                        .copied()
-                                        .flatten()
-                                        .map(|value| (value, *weight))
-                                }),
-                                &kind,
-                            )
-                        })
+                    let first = output_offsets[face_index];
+                    let lookup = |source: usize| authored.get(source).copied().flatten();
+                    let row: Vec<Option<Value>> = (first..first + face.vertices.len())
+                        .map(|corner| blend_mix(lookup, self.corner_mix(corner), &kind))
                         .collect();
                     if row.iter().all(Option::is_none) {
                         continue;
@@ -1111,12 +1200,121 @@ fn heaviest_source(sources: &[(usize, f64)]) -> Option<usize> {
 
 /// [`blend`] over `values` at the `(index, weight)` sources; indices past the end are skipped.
 fn blend_indexed(values: &[Value], sources: &[(usize, f64)], data_type: &str) -> Option<Value> {
-    blend(
-        sources
-            .iter()
-            .filter_map(|(index, weight)| values.get(*index).map(|value| (value, *weight))),
-        data_type,
-    )
+    blend_mix(|index| values.get(index), Mix::Flat(sources), data_type)
+}
+
+/// [`blend`] of an element's mix. Flat sources blend once. Staged sources blend each stage first, then the
+/// stage values by the stage weights, as Blender's `mix_attrs` does for face-sampled elements. A stage whose
+/// sources have no values is skipped, as flat sources without values are.
+fn blend_mix<'a>(
+    value: impl Fn(usize) -> Option<&'a Value>,
+    mix: Mix<'_>,
+    data_type: &str,
+) -> Option<Value> {
+    match mix {
+        Mix::Flat(sources) => blend(
+            sources
+                .iter()
+                .filter_map(|&(index, weight)| Some((value(index)?, weight))),
+            data_type,
+        ),
+        Mix::Staged(stages) => {
+            let mixed: Vec<(Value, f64)> = stages
+                .iter()
+                .filter_map(|stage| {
+                    let inner = blend(
+                        stage
+                            .sources
+                            .iter()
+                            .filter_map(|&(index, weight)| Some((value(index)?, weight))),
+                        data_type,
+                    )?;
+                    Some((inner, stage.weight))
+                })
+                .collect();
+            blend_outer(&mixed, data_type)
+        }
+    }
+}
+
+/// The outer mix of staged values. Blender always mixes a face-sampled element's slots (`mix4`), even a
+/// single full-weight slot, so quaternions take the exponential-map mix here, unlike a copied element.
+fn blend_outer(items: &[(Value, f64)], data_type: &str) -> Option<Value> {
+    if items.is_empty() {
+        return None;
+    }
+    let borrowed: Vec<(&Value, f64)> = items
+        .iter()
+        .map(|(value, weight)| (value, *weight))
+        .collect();
+    if data_type == "QUATERNION" && borrowed.iter().all(|(value, _)| is_quaternion(value)) {
+        return Some(mix_quaternions(&borrowed));
+    }
+    blend(borrowed.into_iter(), data_type)
+}
+
+fn is_quaternion(value: &Value) -> bool {
+    value
+        .as_array()
+        .is_some_and(|array| array.len() == 4 && array.iter().all(Value::is_number))
+}
+
+/// The `[w, x, y, z]` components of a quaternion value.
+fn quaternion_components(value: &Value) -> [f64; 4] {
+    let mut components = [0.0; 4];
+    for (slot, component) in components
+        .iter_mut()
+        .zip(value.as_array().into_iter().flatten())
+    {
+        *slot = component.as_f64().unwrap_or_default();
+    }
+    components
+}
+
+/// Blender's quaternion mix (`mix_indices` with `quat_to_expmap` and `expmap_to_quat`,
+/// `BKE_attribute_math.hh:431`): the weight-normalised mean of the exponential maps, mapped back.
+fn mix_quaternions(items: &[(&Value, f64)]) -> Value {
+    let mut sum = [0.0_f64; 3];
+    let mut total = 0.0_f64;
+    for &(value, weight) in items {
+        let map = quaternion_expmap(quaternion_components(value));
+        for (accum, component) in sum.iter_mut().zip(map) {
+            *accum += weight * component;
+        }
+        total += weight;
+    }
+    let mean = if total > 0.0 {
+        sum.map(|component| component / total)
+    } else {
+        [0.0; 3]
+    };
+    json!(expmap_quaternion(mean))
+}
+
+/// Blender's `QuaternionBase::expmap()` (`BLI_math_quaternion.hh:698`): the rotation axis times its angle,
+/// `2 * atan2(|xyz|, w)`. A rotation of about zero angle maps to the zero vector.
+fn quaternion_expmap([w, x, y, z]: [f64; 4]) -> [f64; 3] {
+    let sin_half = (x * x + y * y + z * z).sqrt();
+    if sin_half < 0.0005 {
+        return [0.0; 3];
+    }
+    let angle = 2.0 * sin_half.atan2(w);
+    [x, y, z].map(|component| component / sin_half * angle)
+}
+
+/// Blender's `QuaternionBase::expmap(VecBase)` (`BLI_math_quaternion.hh:686`): the rotation about the
+/// vector's direction by its length, wrapped into [-pi, pi). A zero vector is the identity.
+fn expmap_quaternion(map: [f64; 3]) -> [f64; 4] {
+    let length_squared: f64 = map.iter().map(|component| component * component).sum();
+    if length_squared <= 1.0e-70 {
+        return [1.0, 0.0, 0.0, 0.0];
+    }
+    let length = length_squared.sqrt();
+    let tau = 2.0 * std::f64::consts::PI;
+    let angle = (length + std::f64::consts::PI).rem_euclid(tau) - std::f64::consts::PI;
+    let half = angle / 2.0;
+    let scale = half.sin() / length;
+    [half.cos(), map[0] * scale, map[1] * scale, map[2] * scale]
 }
 
 /// The weighted sum of the UVs at `sources`. Indices past the end of `uvs` are skipped, so a corner
@@ -1171,6 +1369,15 @@ fn blend<'a>(items: impl Iterator<Item = (&'a Value, f64)>, data_type: &str) -> 
         } else {
             json!(sum)
         });
+    }
+    if data_type == "QUATERNION" && items.iter().all(|(value, _)| is_quaternion(value)) {
+        // A lone full-weight source is copied, as Blender copies a coarse element without mixing it.
+        if let [(value, weight)] = items.as_slice()
+            && *weight == 1.0
+        {
+            return Some((*value).clone());
+        }
+        return Some(mix_quaternions(&items));
     }
     if let Some(length) = first.as_array().map(Vec::len)
         && items.iter().all(|(value, _)| {
@@ -1242,12 +1449,42 @@ fn blend_sources(
     sources: &[(usize, f64)],
     data_type: &str,
 ) -> Option<Value> {
-    blend(
-        sources
-            .iter()
-            .filter_map(|(index, weight)| Some(((*stored.get(*index)?)?, *weight))),
+    blend_mix(
+        |index| stored.get(index).copied().flatten(),
+        Mix::Flat(sources),
         data_type,
     )
+}
+
+/// Whether remapping `source` under `skipped` reads per-corner source weights: a kept corner-domain generic
+/// attribute, a kept corner-domain colour layer, or kept corner-domain UV, custom-normal, or legacy corner
+/// data. Otherwise the remap never reads corner sources, so the caller may leave them empty.
+pub(crate) fn needs_corner_sources(source: &Mesh, skipped: &[&str]) -> bool {
+    let kept = |key: &str| !skipped.contains(&key);
+    let has = |key: &str| kept(key) && source.attributes.contains_key(key);
+    let entries = source
+        .attributes
+        .get("blender_attributes")
+        .and_then(Value::as_array)
+        .filter(|_| kept("blender_attributes"))
+        .map_or(&[][..], Vec::as_slice);
+    has(uv_layers::ATTRIBUTE)
+        || has("blender_uv_layers")
+        || has("uv_map")
+        || has("custom_normal")
+        || entries
+            .iter()
+            .any(|entry| text(entry, "domain") == "CORNER")
+        || source
+            .attributes
+            .iter()
+            .filter(|(key, _)| kept(key.as_str()))
+            .any(|(_, value)| named_domain(value).as_deref() == Some("corner"))
+        || (has(color_layers::ATTRIBUTE)
+            && color_layers::read(source)
+                .layers
+                .iter()
+                .any(|layer| matches!(layer.domain, ColorDomain::Corner)))
 }
 
 /// The element domain of a native attribute (`point`, `edge`, `face`, or `corner`). Other mesh keys, such

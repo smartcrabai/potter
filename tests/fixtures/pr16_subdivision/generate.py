@@ -239,16 +239,22 @@ def fixture_set():
     meshes["mixed_rotated_storage"] = make_mesh(mixed["vertices"], mixed["faces"],
                                                 [(0, 1), (3, 0), (6, 7)], [(1, 2, 0.5)],
                                                 rotated_storage=True)
-    # Generic attributes whose values identify each element, so the oracle pins inner face vertices
-    # (quad grids and n-gon patches) and edge vertices at every level, as Blender interpolates them.
-    order_attributes = [
-        {"name": "OrderPoint", "domain": "POINT"},
-        {"name": "OrderEdge", "domain": "EDGE"},
-        {"name": "OrderFace", "domain": "FACE"},
-        {"name": "OrderCorner", "domain": "CORNER"},
+    # Each generic value identifies its element: POINT by vertex index, EDGE by edge index, FACE by face
+    # index, and CORNER by Blender loop index, so a wrong slot or corner frame changes a value. The n-gon
+    # also carries integer and quaternion data, which Blender mixes per ptex slot.
+    float_orders = [
+        {"name": "OrderPoint", "domain": "POINT", "type": "FLOAT"},
+        {"name": "OrderEdge", "domain": "EDGE", "type": "FLOAT"},
+        {"name": "OrderFace", "domain": "FACE", "type": "FLOAT"},
+        {"name": "OrderCorner", "domain": "CORNER", "type": "FLOAT"},
     ]
-    for name in ("quad", "ngon", "curved_grid", "mixed_rotated_storage"):
-        meshes[name]["order_attributes"] = order_attributes
+    for name in ("quad", "curved_grid", "mixed_rotated_storage"):
+        meshes[name]["order_attributes"] = float_orders
+    meshes["ngon"]["order_attributes"] = float_orders + [
+        {"name": "OrderInt", "domain": "POINT", "type": "INT"},
+        {"name": "OrderIntCorner", "domain": "CORNER", "type": "INT"},
+        {"name": "OrderQuaternion", "domain": "POINT", "type": "QUATERNION"},
+    ]
     meshes["vertex_crease_grid"] = make_mesh(grid_vertices, grid_faces, grid_seams,
                                              vertex_creases=[(5, 1.0), (6, 0.5), (1, 0.3)])
     meshes["vertex_crease_cube"] = make_mesh(cube_vertices, cube_faces, cube_seams,
@@ -504,14 +510,51 @@ def output_mesh(obj, params):
         for attribute in mesh.attributes:
             if attribute.name.startswith("Order"):
                 ordered_attributes.append({
-                    "name": attribute.name, "domain": attribute.domain, "data_type": "FLOAT",
-                    "values": [float(item.value) for item in attribute.data],
+                    "name": attribute.name, "domain": attribute.domain,
+                    "data_type": attribute.data_type,
+                    "values": [attribute_value(item.value) for item in attribute.data],
                 })
         return {"input_edges": coarse_edges, "vertices": [list(vertex.co) for vertex in mesh.vertices], "edges": edges,
                 "faces": faces, "vertex_groups": group_weights, "ordered_attributes": ordered_attributes,
                 "has_custom_normals": bool(mesh.has_custom_normals)}
     finally:
         evaluated.to_mesh_clear()
+
+
+def quaternion_for(index):
+    """A unit quaternion (w, x, y, z); for some vertices the angle exceeds pi, so w is negative."""
+    angle = 0.3 + 0.37 * index
+    axis = (1.0, 0.5 * (index % 3), 0.25 * (index % 5) + 0.1)
+    length = math.sqrt(sum(component * component for component in axis))
+    scale = math.sin(angle / 2) / length
+    return (math.cos(angle / 2), axis[0] * scale, axis[1] * scale, axis[2] * scale)
+
+
+def order_values(mesh, domain, data_type):
+    """Blender values of an order test attribute. POINT, EDGE and FACE index their element; CORNER uses
+    the Blender loop index, so every loop carries a value of its own."""
+    if domain == "POINT" and data_type == "FLOAT":
+        return [index + 0.25 for index in range(len(mesh.vertices))]
+    if domain == "POINT" and data_type == "INT":
+        return [(index * 3) % 7 for index in range(len(mesh.vertices))]
+    if domain == "POINT" and data_type == "QUATERNION":
+        return [quaternion_for(index) for index in range(len(mesh.vertices))]
+    if domain == "EDGE" and data_type == "FLOAT":
+        return [100.25 + index for index in range(len(mesh.edges))]
+    if domain == "FACE" and data_type == "FLOAT":
+        return [200.25 + index for index in range(len(mesh.polygons))]
+    if domain == "CORNER" and data_type == "FLOAT":
+        return [300.25 + loop.index for loop in mesh.loops]
+    if domain == "CORNER" and data_type == "INT":
+        return [(loop.index * 5) % 13 for loop in mesh.loops]
+    raise RuntimeError(f"unsupported order test attribute {data_type} on {domain}")
+
+
+def attribute_value(value):
+    if hasattr(value, "__len__"):
+        return [float(component) for component in value]
+    return value if isinstance(value, int) else float(value)
+
 
 
 def make_object(name, spec):
@@ -537,19 +580,10 @@ def make_object(name, spec):
             vertex_crease.data[vertex.index].value = vertex_crease_values.get(vertex.index, 0.0)
     for definition in spec.get("order_attributes", []):
         domain = definition["domain"]
-        attribute = mesh.attributes.new(name=definition["name"], type="FLOAT", domain=domain)
-        if domain == "POINT":
-            values = [index + 0.25 for index in range(len(mesh.vertices))]
-        elif domain == "EDGE":
-            values = [100.25 + index for index in range(len(mesh.edges))]
-        elif domain == "FACE":
-            values = [200.25 + index for index in range(len(mesh.polygons))]
-        elif domain == "CORNER":
-            values = [300.25 + face.index for face in mesh.polygons for _ in face.loop_indices]
-        else:
-            raise RuntimeError(f"unknown order test attribute domain {domain}")
-        for item, value in zip(attribute.data, values):
-            item.value = float(value)
+        data_type = definition["type"]
+        attribute = mesh.attributes.new(name=definition["name"], type=data_type, domain=domain)
+        for item, value in zip(attribute.data, order_values(mesh, domain, data_type)):
+            item.value = value
     for spec_layer in spec["uv_layers"]:
         layer = mesh.uv_layers.new(name=spec_layer["name"])
         for index, value in enumerate(spec_layer["values"]):

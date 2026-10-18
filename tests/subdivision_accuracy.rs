@@ -754,7 +754,18 @@ fn input_mesh(spec: &Value, blender_input_edges: &Value) -> TestResult<Mesh> {
             json!({"domain": "point", "type": "float", "values": values}),
         );
     }
-    // Generic attributes live in the native keyed store under their own names, keyed by element ID.
+    // Generic attributes live in the native keyed store under their own names, keyed by element ID. Values
+    // mirror `order_values` in generate.py: POINT, EDGE, and FACE index their element, and CORNER indexes
+    // Blender's loop. Storage corner `c` of face `f` is logical corner `(c + shift) mod n`, and the logical
+    // loops of face `f` start after the earlier faces' corners.
+    let loop_offsets: Vec<usize> = logical_faces
+        .iter()
+        .scan(0, |total, face| {
+            let start = *total;
+            *total += face.len();
+            Some(start)
+        })
+        .collect();
     for definition in spec["order_attributes"]
         .as_array()
         .ok_or("order attribute definitions missing")?
@@ -765,52 +776,105 @@ fn input_mesh(spec: &Value, blender_input_edges: &Value) -> TestResult<Mesh> {
         let domain = definition["domain"]
             .as_str()
             .ok_or("order attribute domain missing")?;
-        let (native_domain, values) = match domain {
-            "POINT" => (
-                "point",
-                mesh.vertices
-                    .iter()
-                    .enumerate()
-                    .map(|(index, vertex)| (format!("v{}", vertex.id), json!(index as f64 + 0.25)))
-                    .collect::<Map<_, _>>(),
-            ),
-            "EDGE" => (
-                "edge",
-                mesh.edges
-                    .iter()
-                    .enumerate()
-                    .map(|(index, edge)| (format!("e{}", edge.id), json!(100.25 + index as f64)))
-                    .collect::<Map<_, _>>(),
-            ),
-            "FACE" => (
-                "face",
-                mesh.faces
-                    .iter()
-                    .enumerate()
-                    .map(|(index, face)| (format!("f{}", face.id), json!(200.25 + index as f64)))
-                    .collect::<Map<_, _>>(),
-            ),
-            "CORNER" => (
-                "corner",
-                mesh.faces
-                    .iter()
-                    .enumerate()
-                    .map(|(index, face)| {
-                        (
-                            format!("f{}", face.id),
-                            Value::Array(vec![json!(300.25 + index as f64); face.vertices.len()]),
-                        )
-                    })
-                    .collect::<Map<_, _>>(),
-            ),
+        let data_type = definition["type"]
+            .as_str()
+            .ok_or("order attribute type missing")?;
+        let mut values = Map::new();
+        match domain {
+            "POINT" => {
+                for (index, vertex) in mesh.vertices.iter().enumerate() {
+                    values.insert(
+                        format!("v{}", vertex.id),
+                        order_value(domain, data_type, index, 0)?,
+                    );
+                }
+            }
+            "EDGE" => {
+                for (index, edge) in mesh.edges.iter().enumerate() {
+                    values.insert(
+                        format!("e{}", edge.id),
+                        order_value(domain, data_type, index, 0)?,
+                    );
+                }
+            }
+            "FACE" => {
+                for (index, face) in mesh.faces.iter().enumerate() {
+                    values.insert(
+                        format!("f{}", face.id),
+                        order_value(domain, data_type, index, 0)?,
+                    );
+                }
+            }
+            "CORNER" => {
+                for (index, face) in mesh.faces.iter().enumerate() {
+                    let size = face.vertices.len();
+                    let row = (0..size)
+                        .map(|corner| {
+                            let logical = (corner + shifts[index]) % size;
+                            order_value(domain, data_type, index, loop_offsets[index] + logical)
+                        })
+                        .collect::<TestResult<Vec<_>>>()?;
+                    values.insert(format!("f{}", face.id), Value::Array(row));
+                }
+            }
             _ => return Err(format!("unknown order attribute domain {domain}").into()),
+        }
+        let native_domain = domain.to_ascii_lowercase();
+        let native_type = match data_type {
+            "FLOAT" => "float",
+            "INT" => "int",
+            "QUATERNION" => "quaternion",
+            _ => return Err(format!("unknown order attribute type {data_type}").into()),
         };
         mesh.attributes.insert(
             name.to_owned(),
-            json!({"domain": native_domain, "type": "float", "values": values}),
+            json!({"domain": native_domain, "type": native_type, "values": values}),
         );
     }
     Ok(mesh)
+}
+
+/// Blender's value of one order-attribute element, as `order_values` in generate.py computes it. `element`
+/// is the POINT, EDGE, or FACE index; `loop_index` is the Blender loop of a CORNER element.
+fn order_value(
+    domain: &str,
+    data_type: &str,
+    element: usize,
+    loop_index: usize,
+) -> TestResult<Value> {
+    Ok(match (domain, data_type) {
+        ("POINT", "FLOAT") => json!(element as f64 + 0.25),
+        ("POINT", "INT") => json!((element * 3) % 7),
+        ("POINT", "QUATERNION") => json!(order_quaternion(element)),
+        ("EDGE", "FLOAT") => json!(100.25 + element as f64),
+        ("FACE", "FLOAT") => json!(200.25 + element as f64),
+        ("CORNER", "FLOAT") => json!(300.25 + loop_index as f64),
+        ("CORNER", "INT") => json!((loop_index * 5) % 13),
+        _ => return Err(format!("unsupported order attribute {data_type} on {domain}").into()),
+    })
+}
+
+/// The unit quaternion `[w, x, y, z]` of vertex `index` in the ordered-attribute fixtures (`quaternion_for`
+/// in generate.py). For some vertices the angle exceeds pi, so w is negative.
+fn order_quaternion(index: usize) -> [f64; 4] {
+    let angle = 0.3 + 0.37 * index as f64;
+    let axis = [
+        1.0,
+        0.5 * (index % 3) as f64,
+        0.25 * (index % 5) as f64 + 0.1,
+    ];
+    let length = axis
+        .iter()
+        .map(|component| component * component)
+        .sum::<f64>()
+        .sqrt();
+    let scale = (angle / 2.0).sin() / length;
+    [
+        (angle / 2.0).cos(),
+        axis[0] * scale,
+        axis[1] * scale,
+        axis[2] * scale,
+    ]
 }
 
 /// Groups vertices whose positions coincide. Returns each vertex's cluster, each cluster's
@@ -963,11 +1027,12 @@ fn compare_storage_order(actual: &Shape, expected: &Shape) -> Result<(), String>
     Ok(())
 }
 
-/// Compares Blender's generic POINT/EDGE/FACE/CORNER values, in storage order, with the native keyed
-/// store of `mesh`. Provenance leaves an element without a source out of the store, and readers take
-/// the type's default (`provenance.rs` remap docs). Blender's `subdiv_copy_edge_data` (subdiv_mesh.cc
-/// L1199-1222) gives inner edges that default too, so an absent entry is accepted only where Blender's
-/// value is 0.0, the FLOAT default. Any other absent element fails. Present values compare exactly.
+/// Compares Blender's generic POINT/EDGE/FACE/CORNER values, in storage order, with the native keyed store of
+/// `mesh`, componentwise for quaternion arrays. Provenance leaves an element without a source out of the store,
+/// and readers take the type's default (`provenance.rs` remap docs). Blender's `subdiv_copy_edge_data`
+/// (subdiv_mesh.cc L1199-1222) gives inner edges that default too, so an absent entry is accepted only where
+/// Blender's value is 0.0. Any other absent element fails. Present values must match within
+/// `GENERIC_ATTRIBUTE_TOLERANCE`, relative to magnitude, and quaternion signs must match exactly.
 fn compare_ordered_attributes(mesh: &Mesh, expected: &Value) -> TestResult<()> {
     let expected = expected
         .as_array()
@@ -983,31 +1048,30 @@ fn compare_ordered_attributes(mesh: &Mesh, expected: &Value) -> TestResult<()> {
             .attributes
             .get(name)
             .ok_or_else(|| format!("generic attribute {name} is missing"))?;
-        let values = attribute["values"]
-            .as_object()
-            .ok_or_else(|| format!("generic attribute {name} has no values"))?;
         let native_domain = domain.to_ascii_lowercase();
         if attribute["domain"] != native_domain.as_str() {
             return Err(
                 format!("generic attribute {name} is not on the {native_domain} domain").into(),
             );
         }
-        let stored = |key: String| -> Option<f64> { values.get(&key).and_then(Value::as_f64) };
-        let actual: Vec<Option<f64>> = match domain {
+        let values = attribute["values"]
+            .as_object()
+            .ok_or_else(|| format!("generic attribute {name} has no values"))?;
+        let actual: Vec<Option<&Value>> = match domain {
             "POINT" => mesh
                 .vertices
                 .iter()
-                .map(|vertex| stored(format!("v{}", vertex.id)))
+                .map(|vertex| values.get(&format!("v{}", vertex.id)))
                 .collect(),
             "EDGE" => mesh
                 .edges
                 .iter()
-                .map(|edge| stored(format!("e{}", edge.id)))
+                .map(|edge| values.get(&format!("e{}", edge.id)))
                 .collect(),
             "FACE" => mesh
                 .faces
                 .iter()
-                .map(|face| stored(format!("f{}", face.id)))
+                .map(|face| values.get(&format!("f{}", face.id)))
                 .collect(),
             "CORNER" => {
                 let mut corners = Vec::new();
@@ -1022,9 +1086,7 @@ fn compare_ordered_attributes(mesh: &Mesh, expected: &Value) -> TestResult<()> {
                         )
                         .into());
                     }
-                    for value in row {
-                        corners.push(Some(number(value)?));
-                    }
+                    corners.extend(row.iter().map(Some));
                 }
                 corners
             }
@@ -1041,23 +1103,13 @@ fn compare_ordered_attributes(mesh: &Mesh, expected: &Value) -> TestResult<()> {
             )
             .into());
         }
-        for (index, (actual, expected)) in actual.iter().zip(expected_values).enumerate() {
-            let expected = number(expected)?;
+        for (index, (actual, expected)) in actual.into_iter().zip(expected_values).enumerate() {
             match actual {
-                Some(actual) => {
-                    if (actual - expected).abs()
-                        > GENERIC_ATTRIBUTE_TOLERANCE * expected.abs().max(1.0)
-                    {
-                        return Err(format!(
-                            "generic attribute {name} {domain} element {index} is {actual}, Blender has {expected}"
-                        )
-                        .into());
-                    }
-                }
-                None if expected == 0.0 => {}
-                None => {
+                Some(actual) if generic_close(actual, expected) => {}
+                None if expected.as_f64() == Some(0.0) => {}
+                _ => {
                     return Err(format!(
-                        "generic attribute {name} {domain} element {index} is absent, Blender has {expected}"
+                        "generic attribute {name} {domain} element {index} is {actual:?}, Blender has {expected}"
                     )
                     .into());
                 }
@@ -1065,6 +1117,27 @@ fn compare_ordered_attributes(mesh: &Mesh, expected: &Value) -> TestResult<()> {
         }
     }
     Ok(())
+}
+
+/// Whether a stored value matches Blender's: numbers within tolerance relative to magnitude, arrays
+/// componentwise, and nothing else.
+fn generic_close(actual: &Value, expected: &Value) -> bool {
+    match (actual.as_array(), expected.as_array()) {
+        (Some(actual), Some(expected)) => {
+            actual.len() == expected.len()
+                && actual
+                    .iter()
+                    .zip(expected)
+                    .all(|(actual, expected)| generic_close(actual, expected))
+        }
+        (None, None) => match (actual.as_f64(), expected.as_f64()) {
+            (Some(actual), Some(expected)) => {
+                (actual - expected).abs() <= GENERIC_ATTRIBUTE_TOLERANCE * expected.abs().max(1.0)
+            }
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 /// Compares two shapes by position. Faces match by their canonical position-cluster cycle, edges

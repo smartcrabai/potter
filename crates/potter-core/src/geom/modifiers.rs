@@ -25,7 +25,7 @@ use super::{
     Edge, Face, Mesh, MeshError, Vertex, edge_key,
     normals::{corner_normals, face_normal, safe_acos_approx, sharp_edge_flags},
     provenance::{
-        Origin, edge_flags, mean_value_corners, remap_attributes, remap_attributes_skipping,
+        Origin, edge_flags, mean_value_corners, remap_attributes, remap_attributes_staged,
     },
     uv_layers,
 };
@@ -2443,8 +2443,10 @@ fn subdivision(
     let sizes: Vec<usize> = mesh.faces.iter().map(|face| face.vertices.len()).collect();
     let loop_order = clnor::corner_order(mesh)?.unwrap_or_else(|| clnor::stored_corner_order(mesh));
     let loop_starts = first_loop_starts(&sizes, &loop_order);
-    // With levels, the output custom normals are re-encoded from the subdivided loop normals below.
+    // With levels, the output custom normals are re-encoded from the subdivided loop normals below. The level
+    // loop reads only the crease and UV stores, so the other attributes are remapped once, after the loop.
     result.attributes.remove("custom_normal");
+    subdivision_origin::retain_written(&mut result);
     let base_polygons = polygons(&result)?;
     let mut source_polygons = base_polygons.clone();
     let base_edges = edge_pairs(mesh)?;
@@ -2529,7 +2531,7 @@ fn subdivision(
     );
     let resolution = (1_usize << (levels as u32)) + 1;
     let loose_targets = loose.blender_indices(mesh.vertices.len(), resolution);
-    let order = subdivision_order::build(
+    let mut order = subdivision_order::build(
         &base_polygons,
         &base_edges,
         mesh.vertices.len(),
@@ -2548,44 +2550,31 @@ fn subdivision(
     })?;
     // Attributes move by Blender's interpolation rules while the output is still in pre-permutation
     // storage, the storage that `samples` and `loose` describe.
-    let origin = subdivision_origin::build(
+    let (origin, staged) = subdivision_origin::build(
         mesh,
         &base_polygons,
-        &order.edge_sources,
+        std::mem::take(&mut order.edge_sources),
         &loop_starts,
         &samples,
         &loose,
         &result,
     )?;
     let written = subdivision_origin::take_written(&mut result);
-    remap_attributes_skipping(
+    remap_attributes_staged(
         mesh,
         &mut result,
         &origin,
+        Some(&staged),
         &subdivision_origin::WRITTEN_KEYS,
     )?;
     subdivision_origin::restore_written(&mut result, written);
-    subdivision_uv::encode_byte_colors(mesh, &origin, &mut result);
+    subdivision_uv::encode_byte_colors(mesh, &origin, Some(&staged), &mut result);
     for (face, &start) in result.faces.iter_mut().zip(&order.face_starts) {
         face.vertices.rotate_left(start);
     }
     rotate_corner_attributes(&mut result, &order.face_starts, &order.corners);
-    subdivision_order::reorder_blender_attributes(
-        &mut result,
-        &order.vertices,
-        &order.edges,
-        &order.faces,
-    );
-    subdivision_origin::reorder_legacy(&mut result, &order.vertices, &order.edges, &order.faces);
-    let mut old_faces: Vec<Option<Face>> = std::mem::take(&mut result.faces)
-        .into_iter()
-        .map(Some)
-        .collect();
-    result.faces = order
-        .faces
-        .iter()
-        .filter_map(|&index| old_faces[index].take())
-        .collect();
+    subdivision_order::reorder_positional_attributes(&mut result, &order);
+    result.faces = subdivision_order::permute(std::mem::take(&mut result.faces), &order.faces);
     let limit_samples = (simple || use_limit_surface).then_some(&samples);
     if simple || use_limit_surface || !uv_maps.is_empty() {
         let base = polygons(mesh)?;
@@ -2634,7 +2623,7 @@ fn subdivision(
         if !uv_maps.is_empty() {
             let loops: Vec<_> = uv_maps
                 .into_iter()
-                .map(|layer| {
+                .map(|mut layer| {
                     let values = match limit_samples {
                         Some(samples) => limit.face_varying_loops(
                             linear,
@@ -2649,13 +2638,12 @@ fn subdivision(
                             levels as usize,
                         ),
                     };
-                    let values: Vec<_> =
-                        order.corners.iter().map(|&corner| values[corner]).collect();
+                    let values = subdivision_order::permute(values, &order.corners);
                     let pins: Vec<Option<Vec<bool>>> = order
                         .faces
                         .iter()
                         .map(|&face| {
-                            layer.pins[face].clone().map(|mut flags| {
+                            std::mem::take(&mut layer.pins[face]).map(|mut flags| {
                                 flags.rotate_left(order.face_starts[face]);
                                 flags
                             })
@@ -2672,30 +2660,16 @@ fn subdivision(
     for (vertex, position) in loose.positions(&positions(mesh), simple) {
         result.vertices[vertex].co = position;
     }
-    let mut old_vertices: Vec<Option<Vertex>> = std::mem::take(&mut result.vertices)
-        .into_iter()
-        .map(Some)
-        .collect();
-    result.vertices = order
-        .vertices
-        .iter()
-        .filter_map(|&index| old_vertices[index].take())
-        .collect();
-    let mut old_edges: Vec<Option<Edge>> = std::mem::take(&mut result.edges)
-        .into_iter()
-        .map(Some)
-        .collect();
-    result.edges = order
-        .edges
-        .iter()
-        .enumerate()
-        .filter_map(|(new, &old)| {
-            let mut edge = old_edges[old].take()?;
-            let [first, second] = order.edge_vertices[new];
-            edge.vertices = [result.vertices[first].id, result.vertices[second].id];
-            Some(edge)
-        })
-        .collect();
+    result.vertices =
+        subdivision_order::permute(std::mem::take(&mut result.vertices), &order.vertices);
+    let mut edges = subdivision_order::permute(std::mem::take(&mut result.edges), &order.edges);
+    for (edge, endpoints) in edges.iter_mut().zip(&order.edge_vertices) {
+        edge.vertices = [
+            result.vertices[endpoints[0]].id,
+            result.vertices[endpoints[1]].id,
+        ];
+    }
+    result.edges = edges;
     // Loop normals follow the final positions: Blender's fan spaces are measured on them. Output
     // storage is already Blender's loop order, so the loop basis is the identity and is not stored.
     match input_normals {
@@ -2745,10 +2719,7 @@ fn rotate_corner_attributes(mesh: &mut Mesh, face_starts: &[usize], corner_perm:
                     continue;
                 };
                 if is_corner && values.len() == corner_perm.len() {
-                    *values = corner_perm
-                        .iter()
-                        .map(|&corner| values[corner].clone())
-                        .collect();
+                    *values = subdivision_order::permute(std::mem::take(values), corner_perm);
                 }
             }
             continue;

@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use glam::DVec3;
 
+use super::subdivision_order::edge_vertex;
 use crate::geom::edge_key;
 
 /// A subdivided loose vertex: its base edge (an index into `LooseEdges::edges`) and `u` along it.
@@ -138,13 +139,14 @@ impl LooseEdges {
                 let placement = (*placement)?;
                 let [first, second] = self.edges[placement.edge];
                 let segment = (placement.u * (resolution - 1) as f64).round() as usize;
-                Some(if segment == 0 {
-                    first
-                } else if segment == resolution - 1 {
-                    second
-                } else {
-                    base_vertex_count + placement.edge * (resolution - 2) + segment - 1
-                })
+                Some(edge_vertex(
+                    first,
+                    second,
+                    placement.edge,
+                    segment,
+                    resolution,
+                    base_vertex_count,
+                ))
             })
             .collect()
     }

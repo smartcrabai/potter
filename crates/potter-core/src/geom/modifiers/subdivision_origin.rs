@@ -4,35 +4,42 @@
 
 //! Element origins of a subdivided mesh under Blender's interpolation rules, for the attribute remap.
 //!
-//! Every output element has a ptex sample of its base face (`Samples`). Blender mixes its data from the
-//! coarse corners of that face with the same four ptex slots that place its position.
-//! `quad_weights_from_uv` (`subdiv_mesh.cc:966`) weights the slots at ptex corners (0,0), (1,0), (1,1),
-//! and (0,1). A quad's slots are its corners (`vert_interpolation_from_face`, `subdiv_mesh.cc:452`). An
-//! n-gon's slots for ptex face `p` are corner `p`, the midpoints of `(p, p+1)` and `(p-1, p)`, and the face
-//! centre, which mixes all corners with equal weight (`vert_interpolation_from_corner`, `subdiv_mesh.cc:498`;
-//! `loop_interpolation_from_corner`, `subdiv_mesh.cc:657`; centre in `vert_interpolation_from_face`,
-//! `subdiv_mesh.cc:452`, and `loop_interpolation_from_face`, `subdiv_mesh.cc:611`). Vertices and corners
-//! use these slots alike, so both are weights over the base face's storage vertices and corners.
+//! A face-sampled element mixes its data from the coarse corners of its base face through Blender's four ptex
+//! slots, which also place its position. `quad_weights_from_uv` (`subdiv_mesh.cc:966`) weights the slots at ptex
+//! corners (0,0), (1,0), (1,1), and (0,1). A quad's slots are its corners. An n-gon's slots for ptex face `p` are
+//! corner `p`, the midpoints of `(p, p+1)` and `(p-1, p)`, and the face centre, which mixes all corners with equal
+//! weight (`vert_interpolation_from_corner`, `subdiv_mesh.cc:498`; `loop_interpolation_from_corner`,
+//! `subdiv_mesh.cc:657`). Each slot is a stage: Blender converts it to the attribute type before the outer mix, so
+//! integer, quaternion, and byte data round or average per slot (`provenance::Stage`).
+//!
+//! A coarse corner copies its vertex (`vert_corner`, `subdiv_mesh.cc:1093`), so it has no stages. A loose-edge
+//! vertex is one mix of its edge's ends (`subdiv_mesh_vert_of_loose_edge_interpolate`, `subdiv_mesh.cc:1434`),
+//! and a loose end point copies its vertex (`subdiv_mesh_vert_loose`, `subdiv_mesh.cc:1357`). Both stay flat.
 //!
 //! Edges follow `subdiv_mesh_edge` (`subdiv_mesh.cc:1226`): a subedge copies its coarse edge's data, and an
 //! internal edge has none (`subdiv_copy_edge_data`, `subdiv_mesh.cc:1199`). Each subdivided face copies its
-//! coarse face (`subdiv_mesh_face`, `subdiv_mesh.cc:1331`). A loose-edge vertex mixes its coarse edge's
-//! stored ends by `(1 - u, u)` (`subdiv_mesh_vert_of_loose_edge_interpolate`, `subdiv_mesh.cc:1434`), and a
-//! loose end point copies its vertex (`subdiv_mesh_vert_loose`, `subdiv_mesh.cc:1357`).
+//! coarse face (`subdiv_mesh_face`, `subdiv_mesh.cc:1331`).
 
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 use super::subdivision_limit::{Sample, Samples};
 use super::subdivision_loose::LooseEdges;
-use super::{Polygon, blend_weights, usize_as_f64};
+use super::{Polygon, usize_as_f64};
 use crate::error::{ErrorCode, PotError, Result};
-use crate::geom::provenance::Origin;
+use crate::geom::provenance::{Origin, Stage, Staged, needs_corner_sources};
 use crate::geom::{Mesh, uv_layers};
 
 /// Keys subdivision writes itself, so the remap skips them and their output entries are kept.
 /// `crease_edge` holds the subdivided creases (`subdivision_uv::subdivided_mesh`), `uv_layers` the limit
 /// UVs (`write_loop_uvs`), and `custom_normal` is re-encoded from the subdivided loops.
 pub(super) const WRITTEN_KEYS: [&str; 3] = ["crease_edge", uv_layers::ATTRIBUTE, "custom_normal"];
+
+/// Keeps only the [`WRITTEN_KEYS`] attributes. The level loop reads nothing else, so every other store is
+/// remapped once from the input after the last level.
+pub(super) fn retain_written(mesh: &mut Mesh) {
+    mesh.attributes
+        .retain(|key, _| WRITTEN_KEYS.contains(&key.as_str()));
+}
 
 /// Removes the [`WRITTEN_KEYS`] entries from `mesh`, returning them for [`restore_written`].
 pub(super) fn take_written(mesh: &mut Mesh) -> Vec<(&'static str, Value)> {
@@ -49,18 +56,19 @@ pub(super) fn restore_written(mesh: &mut Mesh, written: Vec<(&'static str, Value
     }
 }
 
-/// The origin of every element of `output`, the subdivided mesh before its storage is permuted into
-/// Blender's order. `polygons` and `loop_starts` describe `mesh` as subdivision read it; `edge_sources`
-/// is the order builder's coarse-edge map, and `samples` and `loose` place each output element on it.
+/// The origin and staged mixes of every element of `output`, the subdivided mesh before its storage is
+/// permuted into Blender's order. `polygons` and `loop_starts` describe `mesh` as subdivision read it;
+/// `edge_sources` is the order builder's coarse-edge map; `samples` and `loose` place each output element on
+/// `mesh`. Corner sources are built only when the remap reads them.
 pub(super) fn build(
     mesh: &Mesh,
     polygons: &[Polygon],
-    edge_sources: &[Option<usize>],
+    edge_sources: Vec<Option<usize>>,
     loop_starts: &[usize],
     samples: &Samples,
     loose: &LooseEdges,
     output: &Mesh,
-) -> Result<Origin> {
+) -> Result<(Origin, Staged)> {
     let consistent = samples.vertices.len() == output.vertices.len()
         && samples.corners.len() == output.faces.len()
         && samples
@@ -74,45 +82,58 @@ pub(super) fn build(
             "subdivision samples do not describe the subdivided mesh",
         ));
     }
-    let offsets: Vec<usize> = polygons
-        .iter()
-        .scan(0, |total, (vertices, _)| {
-            let start = *total;
-            *total += vertices.len();
-            Some(start)
-        })
-        .collect();
-    let vertex_sources: Vec<Vec<(usize, f64)>> = samples
-        .vertices
-        .iter()
-        .enumerate()
-        .map(|(vertex, sample)| match sample {
-            Some(sample) => blend_weights(
-                slots(*sample, polygons, loop_starts)
-                    .into_iter()
-                    .map(|(corner, weight)| (polygons[sample.face].0[corner], weight)),
-            ),
-            None => match loose.sources(vertex) {
-                Some(sources) => sources,
-                // A base vertex on no face and no loose edge is copied by `subdiv_mesh_vert_loose`.
-                None if vertex < mesh.vertices.len() => vec![(vertex, 1.0)],
-                None => Vec::new(),
-            },
-        })
-        .collect();
-    let corner_sources: Vec<Vec<(usize, f64)>> = samples
-        .corners
-        .iter()
-        .flatten()
-        .map(|sample| {
-            blend_weights(
-                slots(*sample, polygons, loop_starts)
-                    .into_iter()
-                    .map(|(corner, weight)| (offsets[sample.face] + corner, weight)),
-            )
-        })
-        .collect();
-    Ok(Origin {
+    let mut vertex_stages: Vec<Option<Vec<Stage>>> = Vec::with_capacity(samples.vertices.len());
+    let mut vertex_sources: Vec<Vec<(usize, f64)>> = Vec::with_capacity(samples.vertices.len());
+    for (vertex, sample) in samples.vertices.iter().enumerate() {
+        match sample {
+            Some(sample) => {
+                let face = &polygons[sample.face].0;
+                let mixed =
+                    remap_sources(slots(*sample, polygons, loop_starts), |corner| face[corner]);
+                vertex_sources.push(Staged::flatten(&mixed));
+                vertex_stages.push((!is_copy(&mixed)).then_some(mixed));
+            }
+            None => {
+                vertex_sources.push(match loose.sources(vertex) {
+                    Some(sources) => sources,
+                    // A base vertex on no face and no loose edge is copied by `subdiv_mesh_vert_loose`.
+                    None if vertex < mesh.vertices.len() => vec![(vertex, 1.0)],
+                    None => Vec::new(),
+                });
+                vertex_stages.push(None);
+            }
+        }
+    }
+    let corners_needed = needs_corner_sources(mesh, &WRITTEN_KEYS);
+    let (corner_sources, corner_stages): (Vec<Vec<(usize, f64)>>, Option<Vec<Vec<Stage>>>) =
+        if corners_needed {
+            let offsets: Vec<usize> = polygons
+                .iter()
+                .scan(0, |total, (vertices, _)| {
+                    let start = *total;
+                    *total += vertices.len();
+                    Some(start)
+                })
+                .collect();
+            let stages: Vec<Vec<Stage>> = samples
+                .corners
+                .iter()
+                .flatten()
+                .map(|sample| {
+                    remap_sources(slots(*sample, polygons, loop_starts), |corner| {
+                        offsets[sample.face] + corner
+                    })
+                })
+                .collect();
+            let flat = stages
+                .iter()
+                .map(|stages| Staged::flatten(stages))
+                .collect();
+            (flat, Some(stages))
+        } else {
+            (Vec::new(), None)
+        };
+    let origin = Origin {
         vertices: vertex_sources,
         faces: samples
             .corners
@@ -120,90 +141,80 @@ pub(super) fn build(
             .map(|corners| corners.first().map(|sample| sample.face))
             .collect(),
         corners: Some(corner_sources),
-        edges: Some(edge_sources.to_vec()),
-    })
+        edges: Some(edge_sources),
+    };
+    let staged = Staged {
+        vertices: vertex_stages,
+        corners: corner_stages,
+    };
+    Ok((origin, staged))
 }
 
-/// The storage corners of a base face whose data a sample mixes, with Blender's slot weights. The
-/// sample is taken in Blender's loop frame, where loop `j` is storage corner `(start + j) mod size`.
-fn slots(sample: Sample, polygons: &[Polygon], loop_starts: &[usize]) -> Vec<(usize, f64)> {
+/// Maps the storage corners of a stage list to other indices (base vertices or flat output corners).
+fn remap_sources(stages: Vec<Stage>, index: impl Fn(usize) -> usize) -> Vec<Stage> {
+    stages
+        .into_iter()
+        .map(|stage| Stage {
+            weight: stage.weight,
+            sources: stage
+                .sources
+                .into_iter()
+                .map(|(corner, weight)| (index(corner), weight))
+                .collect(),
+        })
+        .collect()
+}
+
+/// A sample on a coarse corner: one full-weight source. Blender copies such a vertex (`vert_corner`), so
+/// it is not staged.
+fn is_copy(stages: &[Stage]) -> bool {
+    matches!(stages, [stage] if stage.weight > 1.0 - 1.0e-9 && stage.sources.len() == 1)
+}
+
+/// Blender's mixing slots of a face-sampled element, in the sample's loop frame (loop `j` is storage corner
+/// `(start + j) mod size`), as stages over the face's storage corners. Zero-weight stages are dropped.
+fn slots(sample: Sample, polygons: &[Polygon], loop_starts: &[usize]) -> Vec<Stage> {
     let size = polygons[sample.face].0.len();
     let start = loop_starts[sample.face];
     let local = sample.in_loop_frame(start, size);
     let (u, v) = (local.u, local.v);
     let weights = [(1.0 - u) * (1.0 - v), u * (1.0 - v), u * v, (1.0 - u) * v];
     let corner = |loop_index: usize| (start + loop_index) % size;
-    if size == 4 {
-        return weights
+    let mut stages: Vec<Stage> = if size == 4 {
+        weights
             .into_iter()
             .enumerate()
-            .map(|(loop_index, weight)| (corner(loop_index), weight))
-            .collect();
-    }
-    let ptex = local.ptex;
-    let next = (ptex + 1) % size;
-    let previous = (ptex + size - 1) % size;
-    let centre = weights[2] / usize_as_f64(size);
-    let mut mixed = vec![
-        (corner(ptex), weights[0]),
-        (corner(ptex), 0.5 * weights[1]),
-        (corner(next), 0.5 * weights[1]),
-        (corner(previous), 0.5 * weights[3]),
-        (corner(ptex), 0.5 * weights[3]),
-    ];
-    mixed.extend((0..size).map(|loop_index| (corner(loop_index), centre)));
-    mixed
-}
-
-/// Moves the positional legacy arrays that `remap_attributes` wrote in pre-permutation order into
-/// Blender's order: `blender_edge_flags` by edge, `blender_polygon_smooth` by face, and
-/// `blender_skin_vertices` plus the vertex-keyed `skin_radii` and `skin_roots` by vertex. Each `order`
-/// maps a Blender index to its pre-permutation index. `blender_attributes` is reordered by
-/// `subdivision_order::reorder_blender_attributes`.
-pub(super) fn reorder_legacy(
-    mesh: &mut Mesh,
-    vertices: &[usize],
-    edges: &[usize],
-    faces: &[usize],
-) {
-    for (key, order) in [
-        ("blender_edge_flags", edges),
-        ("blender_polygon_smooth", faces),
-        ("blender_skin_vertices", vertices),
-    ] {
-        if let Some(items) = mesh.attributes.get_mut(key).and_then(Value::as_array_mut) {
-            permute_list(items, order);
-        }
-    }
-    let mut position = vec![0; vertices.len()];
-    for (new, &old) in vertices.iter().enumerate() {
-        position[old] = new;
-    }
-    for key in ["skin_radii", "skin_roots"] {
-        if let Some(object) = mesh.attributes.get_mut(key).and_then(Value::as_object_mut) {
-            rekey(object, &position);
-        }
-    }
-}
-
-fn permute_list(items: &mut Vec<Value>, order: &[usize]) {
-    if items.len() == order.len() {
-        *items = order.iter().map(|&index| items[index].clone()).collect();
-    }
-}
-
-/// Re-keys a `"{index}"`-keyed object from pre-permutation to Blender vertex indices.
-fn rekey(object: &mut Map<String, Value>, position: &[usize]) {
-    let rekeyed: Map<String, Value> = object
-        .iter()
-        .map(|(key, value)| {
-            let key = key
-                .parse::<usize>()
-                .ok()
-                .and_then(|old| position.get(old))
-                .map_or_else(|| key.clone(), |&new| new.to_string());
-            (key, value.clone())
-        })
-        .collect();
-    *object = rekeyed;
+            .map(|(loop_index, weight)| Stage {
+                weight,
+                sources: vec![(corner(loop_index), 1.0)],
+            })
+            .collect()
+    } else {
+        let ptex = local.ptex;
+        let next = (ptex + 1) % size;
+        let previous = (ptex + size - 1) % size;
+        let centre = 1.0 / usize_as_f64(size);
+        vec![
+            Stage {
+                weight: weights[0],
+                sources: vec![(corner(ptex), 1.0)],
+            },
+            Stage {
+                weight: weights[1],
+                sources: vec![(corner(ptex), 0.5), (corner(next), 0.5)],
+            },
+            Stage {
+                weight: weights[2],
+                sources: (0..size)
+                    .map(|loop_index| (corner(loop_index), centre))
+                    .collect(),
+            },
+            Stage {
+                weight: weights[3],
+                sources: vec![(corner(ptex), 0.5), (corner(previous), 0.5)],
+            },
+        ]
+    };
+    stages.retain(|stage| stage.weight > 0.0);
+    stages
 }

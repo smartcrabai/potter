@@ -148,23 +148,6 @@ pub(super) fn build(
             ]);
         }
     }
-    let mut internal_edge_count = 0;
-    for (face, _) in base_faces {
-        let n = face.len();
-        let patch_resolution = if n == 4 {
-            resolution
-        } else {
-            (resolution >> 1) + 1
-        };
-        let count = if n == 4 {
-            2 * (resolution - 3) * (resolution - 2) + 4 * (resolution - 2)
-        } else {
-            let patch_inner = patch_resolution - 2;
-            n * (inner_edges_per_patch(patch_resolution - 1) + patch_inner + (resolution - 2))
-                + if patch_resolution >= 3 { n } else { 0 }
-        };
-        internal_edge_count += count;
-    }
     for (face_index, (face, _)) in base_faces.iter().enumerate() {
         let start = loop_starts[face_index];
         let vertices = rotate(face, start);
@@ -198,9 +181,6 @@ pub(super) fn build(
                 resolution,
             );
         }
-    }
-    if edge_endpoints.len() != boundary_edge_count + internal_edge_count {
-        return Err("Blender internal-edge count formula mismatch");
     }
     if edge_endpoints.len() != output.edges.len() {
         return Err("Blender edge order does not match the output edge count");
@@ -267,10 +247,40 @@ fn put(values: &mut [usize], index: usize, value: usize) -> Result<(), &'static 
     Ok(())
 }
 
+/// `items` in the order `order` lists their indices. `order` is a permutation of `0..items.len()` (checked by
+/// [`build`]), so each item moves once and nothing is cloned.
+pub(super) fn permute<T>(items: Vec<T>, order: &[usize]) -> Vec<T> {
+    let mut slots: Vec<Option<T>> = items.into_iter().map(Some).collect();
+    order
+        .iter()
+        .filter_map(|&index| slots.get_mut(index)?.take())
+        .collect()
+}
+
 fn rotate(values: &[usize], start: usize) -> Vec<usize> {
     (0..values.len())
         .map(|index| values[(index + start) % values.len()])
         .collect()
+}
+
+/// A base face read from its first loop: `Rotated[k]` is the vertex of loop `k`, without copying the face.
+struct Rotated<'a> {
+    face: &'a [usize],
+    start: usize,
+}
+
+impl Rotated<'_> {
+    fn len(&self) -> usize {
+        self.face.len()
+    }
+}
+
+impl std::ops::Index<usize> for Rotated<'_> {
+    type Output = usize;
+
+    fn index(&self, index: usize) -> &usize {
+        &self.face[(index + self.start) % self.face.len()]
+    }
 }
 
 fn sample_vertex(
@@ -285,7 +295,10 @@ fn sample_vertex(
     face_vertex_starts: &[usize],
 ) -> Result<usize, &'static str> {
     let (face, _) = &faces[sample.face];
-    let vertices = rotate(face, loop_starts[sample.face]);
+    let vertices = Rotated {
+        face: face.as_slice(),
+        start: loop_starts[sample.face],
+    };
     // Blender's ptex indices count from the face's first loop, so quads and n-gons both read the loop frame.
     let sample = sample.in_loop_frame(loop_starts[sample.face], vertices.len());
     if vertices.len() == 4 {
@@ -324,7 +337,6 @@ fn sample_vertex(
                 edges,
                 edge_index,
                 base_vertex_count,
-                edge_points_per_edge,
                 resolution,
             );
         }
@@ -349,7 +361,6 @@ fn sample_vertex(
             edges,
             edge_index,
             base_vertex_count,
-            edge_points_per_edge,
             resolution,
         );
     }
@@ -361,7 +372,6 @@ fn sample_vertex(
             edges,
             edge_index,
             base_vertex_count,
-            edge_points_per_edge,
             resolution,
         );
     }
@@ -387,7 +397,6 @@ fn edge_sample(
     edges: &[[usize; 2]],
     edge_index: &HashMap<(usize, usize), usize>,
     base_vertex_count: usize,
-    edge_points_per_edge: usize,
     resolution: usize,
 ) -> Result<usize, &'static str> {
     let edge = *edge_index
@@ -400,16 +409,19 @@ fn edge_sample(
         1.0 - t
     };
     let segment = (t * (resolution - 1) as f64).round() as usize;
-    if segment == 0 {
-        Ok(edge_first)
-    } else if segment == resolution - 1 {
-        Ok(edge_second)
-    } else {
-        Ok(base_vertex_count + edge * edge_points_per_edge + segment - 1)
-    }
+    Ok(edge_vertex(
+        edge_first,
+        edge_second,
+        edge,
+        segment,
+        resolution,
+        base_vertex_count,
+    ))
 }
 
-fn edge_vertex(
+/// The output vertex at `segment` of base edge `edge` (`first` to `second`), where segment 0 and the last
+/// segment are the edge's endpoints and the rest are the edge's `resolution - 2` interior points.
+pub(super) fn edge_vertex(
     first: usize,
     second: usize,
     edge: usize,
@@ -547,45 +559,83 @@ fn append_ngon_edges(
     }
 }
 
-pub(super) fn reorder_blender_attributes(
-    mesh: &mut Mesh,
-    vertices: &[usize],
-    edges: &[usize],
-    faces: &[usize],
-) {
-    let Some(entries) = mesh
+/// Moves every positional array that `remap_attributes` wrote in pre-permutation storage into Blender's order:
+/// `blender_attributes` entries by their domain, `blender_edge_flags` by edge, `blender_polygon_smooth` by face,
+/// and `blender_skin_vertices` by vertex. The vertex-keyed `skin_radii` and `skin_roots` are re-keyed to the
+/// new vertex indices.
+pub(super) fn reorder_positional_attributes(mesh: &mut Mesh, order: &OutputOrder) {
+    for (key, permutation) in [
+        ("blender_edge_flags", &order.edges),
+        ("blender_polygon_smooth", &order.faces),
+        ("blender_skin_vertices", &order.vertices),
+    ] {
+        if let Some(items) = mesh
+            .attributes
+            .get_mut(key)
+            .and_then(serde_json::Value::as_array_mut)
+            && items.len() == permutation.len()
+        {
+            *items = permute(std::mem::take(items), permutation);
+        }
+    }
+    if let Some(entries) = mesh
         .attributes
         .get_mut("blender_attributes")
         .and_then(serde_json::Value::as_array_mut)
-    else {
-        return;
-    };
-    for entry in entries {
-        let domain = entry.get("domain").and_then(serde_json::Value::as_str);
-        let order = match domain {
-            Some("POINT") => Some(vertices),
-            Some("EDGE") => Some(edges),
-            Some("FACE") => Some(faces),
-            _ => None,
-        };
-        let Some(order) = order else { continue };
-        let Some(values) = entry
-            .get_mut("values")
-            .and_then(serde_json::Value::as_array_mut)
-        else {
-            continue;
-        };
-        if values.len() == order.len() {
-            *values = order.iter().map(|&index| values[index].clone()).collect();
+    {
+        for entry in entries {
+            let permutation = match entry.get("domain").and_then(serde_json::Value::as_str) {
+                Some("POINT") => &order.vertices,
+                Some("EDGE") => &order.edges,
+                Some("FACE") => &order.faces,
+                _ => continue,
+            };
+            let Some(values) = entry
+                .get_mut("values")
+                .and_then(serde_json::Value::as_array_mut)
+            else {
+                continue;
+            };
+            if values.len() == permutation.len() {
+                *values = permute(std::mem::take(values), permutation);
+            }
         }
     }
+    let mut position = vec![0; order.vertices.len()];
+    for (new, &old) in order.vertices.iter().enumerate() {
+        position[old] = new;
+    }
+    for key in ["skin_radii", "skin_roots"] {
+        if let Some(object) = mesh
+            .attributes
+            .get_mut(key)
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            rekey(object, &position);
+        }
+    }
+}
+
+/// Re-keys a `"{index}"`-keyed object from pre-permutation to Blender vertex indices.
+fn rekey(object: &mut serde_json::Map<String, serde_json::Value>, position: &[usize]) {
+    *object = std::mem::take(object)
+        .into_iter()
+        .map(|(key, value)| {
+            let key = key
+                .parse::<usize>()
+                .ok()
+                .and_then(|old| position.get(old))
+                .map_or(key, |&new| new.to_string());
+            (key, value)
+        })
+        .collect();
 }
 
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
-    use super::reorder_blender_attributes;
+    use super::{OutputOrder, permute, reorder_positional_attributes};
     use crate::geom::Mesh;
 
     #[test]
@@ -601,7 +651,16 @@ mod tests {
                 {"name": "short", "domain": "POINT", "data_type": "FLOAT", "values": [7.0]}
             ]),
         );
-        reorder_blender_attributes(&mut mesh, &[2, 0, 1], &[1, 0], &[0]);
+        let order = OutputOrder {
+            vertices: vec![2, 0, 1],
+            edges: vec![1, 0],
+            edge_vertices: Vec::new(),
+            faces: vec![0],
+            corners: Vec::new(),
+            face_starts: Vec::new(),
+            edge_sources: Vec::new(),
+        };
+        reorder_positional_attributes(&mut mesh, &order);
         let entries = mesh.attributes["blender_attributes"]
             .as_array()
             .expect("entries stay an array");
@@ -612,5 +671,13 @@ mod tests {
         assert_eq!(entries[3]["values"], json!([30.0, 31.0, 32.0, 33.0]));
         // A length that matches no element domain is left as stored.
         assert_eq!(entries[4]["values"], json!([7.0]));
+    }
+
+    #[test]
+    fn permute_moves_items_by_index() {
+        assert_eq!(
+            permute(vec!["a", "b", "c"], &[2, 0, 1]),
+            vec!["c", "a", "b"]
+        );
     }
 }
