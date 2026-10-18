@@ -3277,6 +3277,60 @@ fn classify_faces(state: &mut State, operation: Operation, bvh_a: &Bvh, bvh_b: &
     state.faces = output;
 }
 
+/// Blender `BM_vert_collapse_check_double_face` (`bmesh_core.cc:2290`) for a collapse at `vertex` that
+/// joins `a` and `b`. Faces at `vertex` with more than three corners are tested against the faces on
+/// the existing edge `a`-`b`; a same-size pair whose corner runs match would become a double face.
+/// Returns false when no face loops the edge `a`-`b`, as Blender does for an absent or wire edge.
+fn collapse_double_face(state: &State, vertex: usize, a: usize, b: usize) -> bool {
+    let mut exists = Vec::new();
+    for (face, data) in state.faces.iter().enumerate() {
+        let len = data.verts.len();
+        for pos in 0..len {
+            let (x, y) = (data.verts[pos], data.verts[(pos + 1) % len]);
+            if (x == a && y == b) || (x == b && y == a) {
+                exists.push(Corner { face, pos });
+            }
+        }
+    }
+    if exists.is_empty() {
+        return false;
+    }
+    for collapse in vertex_corners(state, vertex) {
+        let collapse_len = state.faces[collapse.face].verts.len();
+        if collapse_len <= 3 {
+            continue;
+        }
+        let beg = collapse.next(state);
+        let end = collapse.prev(state);
+        for &exists_loop in &exists {
+            if collapse_len - 1 != state.faces[exists_loop.face].verts.len() {
+                continue;
+            }
+            let overlap = if beg.vert(state) == exists_loop.vert(state) {
+                corner_run_matches(
+                    state,
+                    beg.next(state),
+                    end.prev(state),
+                    exists_loop.prev(state),
+                    true,
+                )
+            } else {
+                corner_run_matches(
+                    state,
+                    beg.next(state),
+                    end.prev(state),
+                    exists_loop.next(state),
+                    false,
+                )
+            };
+            if overlap {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn dissolve_intersection_vertices(state: &mut State) {
     let mut candidates = state.dissolve_verts.clone();
     candidates.sort_unstable();
@@ -3285,9 +3339,7 @@ fn dissolve_intersection_vertices(state: &mut State) {
     let mut faces_at_vertex = vec![Vec::new(); state.verts.len()];
     let mut edges_at_vertex: Vec<HashSet<EdgeKey>> =
         (0..state.verts.len()).map(|_| HashSet::new()).collect();
-    let mut face_keys = HashSet::with_capacity(state.faces.len());
     for (face_index, face) in state.faces.iter().enumerate() {
-        face_keys.insert(canonical_face_key(&face.verts));
         for i in 0..face.verts.len() {
             let a = face.verts[i];
             let b = face.verts[(i + 1) % face.verts.len()];
@@ -3324,18 +3376,20 @@ fn dissolve_intersection_vertices(state: &mut State) {
         }
         let (a, b) = (neighbors[0], neighbors[1]);
         let new_edge = edge_key_usize(a, b);
-        if edges_at_vertex[a].contains(&new_edge) || edges_at_vertex[b].contains(&new_edge) {
+        // Blender: a collapse onto an existing edge is refused only when it would make a double face
+        // (`BM_vert_collapse_check_double_face`, bmesh_core.cc:2290); an absent edge never does.
+        if (edges_at_vertex[a].contains(&new_edge) || edges_at_vertex[b].contains(&new_edge))
+            && collapse_double_face(state, vertex, a, b)
+        {
             continue;
         }
 
         let mut reduced = Vec::new();
-        let mut old_keys = HashSet::new();
         for &face_index in &face_indices {
             let face = &state.faces[face_index];
             if face.verts.len() < 3 || !face.verts.contains(&vertex) {
                 continue;
             }
-            old_keys.insert(canonical_face_key(&face.verts));
             let ring: Vec<usize> = face
                 .verts
                 .iter()
@@ -3345,18 +3399,6 @@ fn dissolve_intersection_vertices(state: &mut State) {
             if ring.len() >= 3 {
                 reduced.push((face_index, ring));
             }
-        }
-        let mut new_keys = HashSet::new();
-        let mut duplicate = false;
-        for (_, ring) in &reduced {
-            let key = canonical_face_key(ring);
-            if (face_keys.contains(&key) && !old_keys.contains(&key)) || !new_keys.insert(key) {
-                duplicate = true;
-                break;
-            }
-        }
-        if duplicate {
-            continue;
         }
 
         let source = state
@@ -3371,10 +3413,8 @@ fn dissolve_intersection_vertices(state: &mut State) {
             if old.is_empty() {
                 continue;
             }
-            face_keys.remove(&canonical_face_key(&old));
             let ring: Vec<usize> = old.iter().copied().filter(|&v| v != vertex).collect();
             if ring.len() >= 3 {
-                face_keys.insert(canonical_face_key(&ring));
                 state.faces[face_index].verts = ring;
             } else {
                 for old_vertex in old {
@@ -3403,6 +3443,11 @@ fn dissolve_intersection_vertices(state: &mut State) {
         state.wire_edges.remove(&edge_b);
         if wire {
             state.wire_edges.insert(new_edge);
+        }
+        let dangling_a = state.dangling_edges.remove(&edge_a);
+        let dangling_b = state.dangling_edges.remove(&edge_b);
+        if dangling_a || dangling_b {
+            state.dangling_edges.insert(new_edge);
         }
     }
     state.faces.retain(|face| face.verts.len() >= 3);
@@ -3671,31 +3716,6 @@ fn point_in_face(face: &Face, verts: &[Vertex], scratch: &mut FacePointScratch) 
         (p[0][1] + p[1][1] + p[2][1]) / 3.0,
         (p[0][2] + p[1][2] + p[2][2]) / 3.0,
     ]
-}
-
-fn canonical_face_key(ring: &[usize]) -> Vec<usize> {
-    if ring.is_empty() {
-        return Vec::new();
-    }
-    let mut best = None::<Vec<usize>>;
-    for start in 0..ring.len() {
-        for reverse in [false, true] {
-            let candidate: Vec<usize> = (0..ring.len())
-                .map(|offset| {
-                    let index = if reverse {
-                        (start + ring.len() - (offset % ring.len())) % ring.len()
-                    } else {
-                        (start + offset) % ring.len()
-                    };
-                    ring[index]
-                })
-                .collect();
-            if best.as_ref().is_none_or(|current| candidate < *current) {
-                best = Some(candidate);
-            }
-        }
-    }
-    best.unwrap_or_default()
 }
 
 fn face_has_edge(face: &Face, edge: EdgeKey) -> bool {
