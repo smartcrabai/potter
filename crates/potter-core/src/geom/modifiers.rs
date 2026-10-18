@@ -3325,7 +3325,7 @@ fn subdivide_once(mesh: &Mesh, options: SubdivisionOptions) -> Result<Mesh> {
         updated_points.push(point);
     }
     updated_points.extend(face_points);
-    subdivision_uv::subdivided_mesh(
+    let mut subdivided = subdivision_uv::subdivided_mesh(
         mesh,
         updated_points,
         &source_polygons,
@@ -3333,7 +3333,11 @@ fn subdivide_once(mesh: &Mesh, options: SubdivisionOptions) -> Result<Mesh> {
         &edge_point_indices,
         &edge_creases,
         options.use_creases,
-    )
+    )?;
+    // Blender 5.2.2 Catmull-Clark output carries no source indices: a listed Hook after it moves no
+    // vertex (fixtures/pr18f_hook/subdivision_origin_oracle.json). SIMPLE keeps them.
+    crate::geom::clear_origindex(&mut subdivided);
+    Ok(subdivided)
 }
 
 fn triangulate_quad_method(modifier: &Modifier) -> Result<QuadMethod> {
