@@ -6,8 +6,9 @@
 //!
 //! Blender builds the output attributes by gathering from the joined mesh through one index map
 //! per domain. This module builds the same joined mesh `J` (the analogue of Blender's
-//! `joined_mesh`) and the same index maps, then hands `J` to [`remap_attributes`], which owns the
-//! value rules of the ID-keyed stores:
+//! `joined_mesh`) and the same index maps, then hands `J` to [`remap_interpolated_corners_skipping`],
+//! which owns the value rules of the ID-keyed stores and applies Blender's weighted bool mixer to
+//! interpolated CORNER booleans:
 //!
 //! - POINT: an output vertex whose arena origin is `k` takes joined vertex `k`. Blender stores the
 //!   LOCAL vertex index as the origin, so operand B's vertex `k` reads the joined element `k`, which
@@ -20,7 +21,7 @@
 //!
 //! Edge stores are gathered here instead: `crease_edge`, `sharp`, `blender_edge_flags`, and EDGE
 //! entries of `blender_attributes` take the global edge index of each output edge (`Poly::edge_orig`,
-//! last writer wins, as in Blender's `dst_to_src_edge`). `remap_attributes` would derive edges from
+//! last writer wins, as in Blender's `dst_to_src_edge`). The generic remap would derive edges from
 //! the vertex origins, and the POINT origin above is not an edge origin. FACE stores
 //! (`blender_polygon_smooth`, `shade_smooth`) are joined into `J` and gathered by the remap.
 //!
@@ -58,7 +59,7 @@ use crate::geom::{
     Edge, Face, IdCounters, Mesh, Vertex,
     clnor::{self, NormalCodeOptions},
     color_layers, edge_key,
-    provenance::{Origin, default_value, mean_value_corners, remap_attributes},
+    provenance::{Origin, default_value, mean_value_corners, remap_interpolated_corners_skipping},
     uv_layers,
 };
 
@@ -137,7 +138,7 @@ pub(crate) fn polys_to_mesh(
         faces: planned.iter().map(|face| Some(face.joined_face)).collect(),
         corners: Some(corner_sources(&joined, &planned, &positions)),
     };
-    remap_attributes(&joined.mesh, &mut mesh, &origin)?;
+    remap_interpolated_corners_skipping(&joined.mesh, &mut mesh, &origin, &["custom_normal"])?;
     mix_custom_normals(
         &joined.mesh,
         &mut mesh,
@@ -514,7 +515,7 @@ fn edge_sources(
     sources
 }
 
-/// Joined attributes that `remap_attributes` rewrites, or that this module gathers itself. Other
+/// Joined attributes that the generic remap rewrites, or that this module gathers itself. Other
 /// keys are shading and metadata, copied from operand A.
 fn is_structured_key(key: &str) -> bool {
     matches!(
@@ -535,7 +536,7 @@ fn is_structured_key(key: &str) -> bool {
     )
 }
 
-/// The attribute store `J` carries into `remap_attributes`. EDGE entries and the edge stores
+/// The attribute store `J` carries into the generic remap. EDGE entries and the edge stores
 /// gathered here are left out and written after the remap.
 fn join_attributes(
     operands: &[Operand<'_>],
@@ -1020,7 +1021,7 @@ fn concat_elements(
     joined
 }
 
-/// Merges the joined `blender_attributes` entries of `remap_attributes` with the EDGE entries,
+/// Merges the joined `blender_attributes` entries from the generic remap with the EDGE entries,
 /// in the order of the first operand that declares each entry.
 fn merge_blender_attributes(
     mesh: &mut Mesh,

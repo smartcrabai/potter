@@ -22,7 +22,7 @@ use tempfile::tempdir;
 
 const BLENDER_REQUIRED: &str = "Blender is required for Boolean FLOAT boundary parity: install Blender 5.2, or set POTTER_BLENDER to its executable";
 
-const FLOAT_CASES: [&str; 32] = [
+const FLOAT_CASES: [&str; 33] = [
     "self_difference_false",
     "self_difference_true",
     "self_union_false",
@@ -39,6 +39,7 @@ const FLOAT_CASES: [&str; 32] = [
     "collection_empty_mesh_union",
     "threshold_default",
     "threshold_high",
+    "tiny_normal_cutoff_difference",
     "collection_wire_member_union",
     "transformed_operand_difference",
     "singular_transform_flip_union",
@@ -302,6 +303,28 @@ for operation in ("DIFFERENCE", "UNION", "INTERSECT"):
         suffix = "true" if use_self else "false"
         add_case(f"self_{operation.lower()}_{suffix}", operation, big_host,
                  [self_operand], use_self=use_self)
+
+# Both face normals fall below Blender's 1e-35 squared-length cutoff, so no interior cut is built.
+tiny_scale = 2.0 ** -30
+tiny_subject = part((
+    [(0.0, 0.0, 0.0), (tiny_scale, 0.0, 0.0), (0.0, tiny_scale, 0.0)],
+    [(0, 1, 2)],
+))
+tiny_operand = part((
+    [
+        (tiny_scale / 4, tiny_scale / 4, -tiny_scale),
+        (tiny_scale / 4, tiny_scale / 4, tiny_scale),
+        (tiny_scale / 2, tiny_scale / 4, tiny_scale),
+    ],
+    [(0, 1, 2)],
+))
+add_case(
+    "tiny_normal_cutoff_difference",
+    "DIFFERENCE",
+    tiny_subject,
+    [tiny_operand],
+    threshold=2.0 ** -40,
+)
 
 open_offset = part(remove_face(box(0.5, 2.5, -0.5, 1.5, 0, 2), 1))
 for operation in ("DIFFERENCE", "UNION", "INTERSECT"):

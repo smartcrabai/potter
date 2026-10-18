@@ -4242,11 +4242,12 @@ fn dist_sq(a: P3, b: P3) -> f32 {
 }
 
 fn normalize(vector: P3) -> P3 {
-    let length = len_sq(vector).sqrt();
-    if length == 0.0 {
-        [0.0; 3]
+    let length_squared = len_sq(vector);
+    // Blender's normalize_v3_v3_length returns zero unless the squared length exceeds this cutoff.
+    if length_squared > 1.0e-35 {
+        scale(vector, 1.0 / length_squared.sqrt())
     } else {
-        scale(vector, 1.0 / length)
+        [0.0; 3]
     }
 }
 
