@@ -10,7 +10,7 @@ use crate::{
     model::{Id, LightType, SceneDoc},
     shader::{
         BsdfParams, EvaluatorWorkspace, HitContext, HitUvLayers, PreparedMaterial, dielectric_f0,
-        evaluate_surface_with_workspace, height_gradient,
+        equirectangular_uv, evaluate_surface_with_workspace, height_gradient,
     },
 };
 
@@ -255,7 +255,8 @@ impl WorldImportanceSampler {
             / f64::from(self.width);
         let v = (f64::from(u32::try_from(row).unwrap_or(u32::MAX)) + rng.next_f64())
             / f64::from(self.height);
-        let longitude = (u - 0.5) * std::f64::consts::TAU;
+        // Cycles' longitude: u = 0.5 - atan2(y, x) / 2π, so the column u gives longitude (0.5 - u)·2π.
+        let longitude = (0.5 - u) * std::f64::consts::TAU;
         let latitude = v * std::f64::consts::PI;
         let direction = DVec3::new(
             latitude.sin() * longitude.cos(),
@@ -275,8 +276,7 @@ impl WorldImportanceSampler {
         if direction == DVec3::ZERO {
             return 0.0;
         }
-        let u = (direction.y.atan2(direction.x) / std::f64::consts::TAU + 0.5).rem_euclid(1.0);
-        let v = direction.z.clamp(-1.0, 1.0).acos() / std::f64::consts::PI;
+        let [u, v] = equirectangular_uv(direction);
         let column = (u * f64::from(self.width)).floor() as usize;
         let row = (v * f64::from(self.height)).floor() as usize;
         let pixel_index = row

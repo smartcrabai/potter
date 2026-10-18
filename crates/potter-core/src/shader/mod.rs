@@ -9,3 +9,4 @@ pub use evaluator::{
 };
 pub(crate) use evaluator::{DEFAULT_SPECULAR_IOR_LEVEL, dielectric_f0};
 pub use world::evaluate_world;
+pub(crate) use world::{environment_colour, equirectangular_uv};

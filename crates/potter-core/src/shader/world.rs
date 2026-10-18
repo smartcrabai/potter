@@ -195,16 +195,7 @@ impl WorldEvaluator<'_> {
                         json!({"node_id": id, "image_id": image_id}),
                     )
                 })?;
-                let uv = [
-                    direction.y.atan2(direction.x) / std::f64::consts::TAU + 0.5,
-                    direction.z.clamp(-1.0, 1.0).acos() / std::f64::consts::PI,
-                ];
-                Ok(WorldValue::Color(sample_with_interpolation(
-                    image,
-                    // Potter's equirectangular v runs top-down, from the zenith; the sampler takes Blender's V-up coordinate.
-                    [uv[0], 1.0 - uv[1]],
-                    image.interpolation,
-                )))
+                Ok(WorldValue::Color(environment_colour(image, direction)))
             }
             "ShaderNodeTexCoord" => match socket {
                 "Normal" | "Generated" | "Object" | "Window" | "Camera" | "Incoming" => {
@@ -404,10 +395,103 @@ fn world_error(id: &Id, message: &str) -> PotError {
     PotError::with_details(ErrorCode::InvalidOperation, message, json!({"node_id": id}))
 }
 
+/// The equirectangular coordinate of a world ray direction, as Cycles' `direction_to_equirectangular` gives it
+/// (`intern/cycles/kernel/camera/projection.h`, range (-2π, π, -π, π)): u = 0.5 − atan2(y, x) / 2π, and v = 1 − acos(z) / π
+/// in Blender's V-up convention. The result is Potter's top-down storage coordinate, so v = 0 is the zenith row.
+pub(crate) fn equirectangular_uv(direction: DVec3) -> [f64; 2] {
+    let u = (0.5 - direction.y.atan2(direction.x) / std::f64::consts::TAU).rem_euclid(1.0);
+    let v = direction.z.clamp(-1.0, 1.0).acos() / std::f64::consts::PI;
+    [u, v]
+}
+
+/// The environment colour of a ray direction: Cycles' environment texture (`EnvironmentTextureNode::image_params`), with
+/// the Image Texture rule (REPEAT, no Alpha link). The sampler takes Blender's V-up coordinate, so v is flipped here.
+pub(crate) fn environment_colour(image: &ImageData, direction: DVec3) -> [f64; 4] {
+    let [u, v_down] = equirectangular_uv(direction);
+    sample_with_interpolation(image, [u, 1.0 - v_down], image.interpolation)
+}
+
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::graph::{GraphKind, GraphLink};
+
+    /// Blender 5.2.2's environment colours (`tests/fixtures/repeat_edge/generate_world_env_oracle.py`): 256 ray directions
+    /// around the u = 0 seam and up to the zenith, each with the colour of a 4 x 2 equirectangular texture, Closest and
+    /// Linear. The fixture rounds colours to six decimals, so the tolerance is 1e-6.
+    #[test]
+    fn environment_samples_match_blenders_render() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::image::{ColourCache, ImageInterpolation, ImageStorage, Precision};
+        use std::collections::BTreeMap;
+
+        const TOLERANCE: f64 = 1.0e-6;
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/repeat_edge");
+        for (file, interpolation) in [
+            (
+                "blender_world_env_closest.json",
+                ImageInterpolation::Closest,
+            ),
+            ("blender_world_env_linear.json", ImageInterpolation::Linear),
+        ] {
+            let document: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(directory.join(file))?)?;
+            let width = usize::try_from(document["width"].as_u64().ok_or("width is missing")?)?;
+            let height = usize::try_from(document["height"].as_u64().ok_or("height is missing")?)?;
+            let blender = document["texels_blender_rows"]
+                .as_array()
+                .ok_or("texels are missing")?
+                .iter()
+                .map(|texel| -> Result<[f64; 4], Box<dyn std::error::Error>> {
+                    let channel =
+                        |index: usize| texel[index].as_f64().ok_or("texel is not a number");
+                    Ok([channel(0)?, channel(1)?, channel(2)?, channel(3)?])
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            // Blender's rows run bottom-up; the stored rows run top-down.
+            let mut pixels = vec![[0.0; 4]; width * height];
+            for row in 0..height {
+                for x in 0..width {
+                    pixels[row * width + x] = blender[(height - 1 - row) * width + x];
+                }
+            }
+            let image = ImageData {
+                width: u32::try_from(width)?,
+                height: u32::try_from(height)?,
+                pixels,
+                tiles: BTreeMap::new(),
+                interpolation,
+                srgb: false,
+                storage: ImageStorage {
+                    data: true,
+                    straight_alpha: false,
+                    ignore_alpha: false,
+                    precision: Precision::Float,
+                },
+                colour: ColourCache::default(),
+            };
+            let mut worst = 0.0_f64;
+            for record in document["records"]
+                .as_array()
+                .ok_or("records are missing")?
+            {
+                let value =
+                    |index: usize| record[index].as_f64().ok_or("record value is not a number");
+                let direction = DVec3::new(value(0)?, value(1)?, value(2)?);
+                let expected = [value(3)?, value(4)?, value(5)?];
+                let actual = environment_colour(&image, direction);
+                for channel in 0..3 {
+                    worst = worst.max((actual[channel] - expected[channel]).abs());
+                }
+            }
+            assert!(
+                worst <= TOLERANCE,
+                "{file}: worst residual {worst:e} exceeds {TOLERANCE:e}"
+            );
+        }
+        Ok(())
+    }
 
     fn evaluate_mix_graph(mix: GraphNode) -> Result<DVec3> {
         let mix_output = if mix.node_type == "ShaderNodeMixRGB" {
