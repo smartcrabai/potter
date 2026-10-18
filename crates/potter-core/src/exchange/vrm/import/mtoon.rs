@@ -1,22 +1,21 @@
 //! `MToon` import: inverts the `MToon` exporter in `exchange/vrm/mtoon.rs`. VRM 1.0 reads
 //! `VRMC_materials_mtoon` (`mtoon::v1`); VRM 0.x reads the `VRM/MToon` entries of `materialProperties` (`mtoon::v0`).
 
-use std::{collections::BTreeMap, collections::BTreeSet, f64::consts::TAU};
+use std::{collections::BTreeMap, f64::consts::TAU};
 
 use serde_json::Value;
 
 use crate::{
     error::Result,
     exchange::{
-        gltf::{GltfIndex, imported_uv_layer, texture_info_set},
-        material_graph::{GraphTextures, move_textures_to_graph},
+        gltf::{imported_uv_layer, texture_info_set},
         material_surface::TextureTransform,
     },
     float::equal_f64,
     image::ImageInterpolation,
     model::{
         AvatarMtoon, AvatarMtoonShadingShiftTexture, AvatarOutlineWidthMode,
-        AvatarTextureTransform, AvatarVersion, Id, SceneDoc, TextureRef,
+        AvatarTextureTransform, AvatarVersion, Id, TextureRef,
     },
 };
 
@@ -907,71 +906,18 @@ fn boolean(object: &Value, key: &str, default: bool) -> Result<bool> {
     }
 }
 
-/// Moves the base color texture of each VRM 0.x `MToon` material with a non-identity main texture
-/// transform into a material graph. Returns the materials that moved; the others keep the texture and
-/// report the transform as a loss. `_MainTex` is preferred over `_MainTex_ST`.
-pub(super) fn move_main_texture_transforms(
-    doc: &mut SceneDoc,
-    index: &GltfIndex,
-    extension: &Value,
-) -> Result<BTreeSet<Id>> {
-    let mut moved = BTreeSet::new();
-    let properties = extension["materialProperties"]
-        .as_array()
-        .map_or(&[][..], Vec::as_slice);
-    for (material_index, property) in properties.iter().enumerate() {
-        if property["shader"].as_str() != Some("VRM/MToon") {
-            continue;
-        }
-        let Some(transform) = main_texture_transform(&property["vectorProperties"]) else {
-            continue;
-        };
-        let Some(material_id) = index.material_ids.get(material_index) else {
-            continue;
-        };
-        let textures = match doc.materials.get(material_id) {
-            Some(material)
-                if material.node_tree.is_none() && material.base_color_texture.is_some() =>
-            {
-                GraphTextures::from_fields(material, Some(transform))
-            }
-            _ => continue,
-        };
-        move_textures_to_graph(doc, material_id, &textures)?;
-        if let Some(variants) = index.color_material_variants.get(material_id) {
-            let source_graph_id = doc
-                .materials
-                .get(material_id)
-                .and_then(|material| material.node_tree.as_ref())
-                .cloned()
-                .ok_or_else(|| import_error("VRM 0.x main texture graph is missing"))?;
-            let source_graph = doc
-                .node_groups
-                .get(&source_graph_id)
-                .cloned()
-                .ok_or_else(|| import_error("VRM 0.x main texture shader graph is missing"))?;
-            for (layer, variant_id) in variants {
-                let variant_material = doc
-                    .materials
-                    .get(variant_id)
-                    .cloned()
-                    .ok_or_else(|| import_error("glTF color material variant is missing"))?;
-                let variant_graph_id = variant_material
-                    .node_tree
-                    .clone()
-                    .ok_or_else(|| import_error("glTF color material graph is missing"))?;
-                let mut graph = source_graph.clone();
-                crate::exchange::gltf::bind_imported_vertex_color(
-                    &mut graph,
-                    layer,
-                    &variant_material,
-                )?;
-                doc.node_groups.insert(variant_graph_id, graph);
-            }
-        }
-        moved.insert(material_id.clone());
+/// The VRM 0.x `MToon` main texture transform of glTF material `material_index`, if it is not identity.
+/// The glTF import applies it to the base color texture, so the texture and the transform go into the
+/// material graph together, whatever other textures also need one. `_MainTex` is preferred over `_MainTex_ST`.
+pub(super) fn v0_main_texture_transform(
+    root: &Value,
+    material_index: usize,
+) -> Option<TextureTransform> {
+    let property = &root["extensions"]["VRM"]["materialProperties"][material_index];
+    if property["shader"].as_str() != Some("VRM/MToon") {
+        return None;
     }
-    Ok(moved)
+    main_texture_transform(&property["vectorProperties"])
 }
 
 /// The non-identity main texture transform of a VRM 0.x material. The VRM Add-on writes `_MainTex` as

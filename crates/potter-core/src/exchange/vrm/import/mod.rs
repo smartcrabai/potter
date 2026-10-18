@@ -47,7 +47,15 @@ const GLTF_SUPPORTED_EXTENSIONS: &[&str] = &[
 
 /// Imports a `.vrm` file as the given VRM version into a new scene graph.
 pub fn import(path: &Path, scene_id: String, version: AvatarVersion) -> Result<ImportedGraph> {
-    let (mut graph, index) = gltf::import_indexed(path, scene_id, gltf::avatar_basis(version))?;
+    let (mut graph, index) = gltf::import_indexed(
+        path,
+        scene_id,
+        gltf::avatar_basis(version),
+        |root, material_index| match version {
+            AvatarVersion::V0 => mtoon::v0_main_texture_transform(root, material_index),
+            AvatarVersion::V1 => None,
+        },
+    )?;
     let extension_name = match version {
         AvatarVersion::V1 => "VRMC_vrm",
         AvatarVersion::V0 => "VRM",
@@ -68,12 +76,8 @@ pub fn import(path: &Path, scene_id: String, version: AvatarVersion) -> Result<I
         .collect::<Vec<_>>();
     losses.extend(unsupported_extension_losses(&index.root, version));
     apply_material_render_state(&mut graph.doc, &index);
-    // VRM 0.x main texture transforms move the base color texture into a material graph.
-    let moved_main_textures = if version == AvatarVersion::V0 {
-        mtoon::move_main_texture_transforms(&mut graph.doc, &index, &extension)?
-    } else {
-        BTreeSet::new()
-    };
+    // VRM 0.x main texture transforms were applied to base color textures during the glTF import.
+    let moved_main_textures = index.main_texture_transforms.clone();
 
     let snapshot = Snapshot::evaluate(&graph.doc, &EvaluationContext::default())?;
     let mut decoder = Decoder::new(version, &index, &graph.doc, &snapshot, &extension);
@@ -665,11 +669,7 @@ fn required_feature(error: &PotError) -> String {
 mod tests {
     use serde_json::json;
 
-    use crate::{
-        graph::{GraphKind, GraphNode, NodeGroup},
-        image::ImageInterpolation,
-        model::{Material, TextureRef},
-    };
+    use crate::model::Material;
 
     use super::*;
 
@@ -830,65 +830,6 @@ mod tests {
                 .collect::<BTreeSet<_>>(),
             BTreeSet::from([source, variant])
         );
-        Ok(())
-    }
-
-    #[test]
-    fn vrm_v0_main_texture_transform_rebuilds_variant_graph() -> Result<()> {
-        let root = shared_material_root(&json!({}));
-        let (mut doc, index, source, variant) = shared_material_fixture(root)?;
-        let image = Id::new("image")?;
-        doc.materials
-            .get_mut(&source)
-            .ok_or_else(|| import_error("source material fixture is missing"))?
-            .base_color_texture = Some(TextureRef {
-            image,
-            uv_layer: None,
-            interpolation: ImageInterpolation::Linear,
-        });
-        let variant_graph_id = Id::new("variant_graph")?;
-        let mut variant_graph = NodeGroup::new("variant", GraphKind::Shader);
-        variant_graph
-            .nodes
-            .insert(Id::new("bsdf")?, GraphNode::new("ShaderNodeBsdfPrincipled"));
-        doc.node_groups
-            .insert(variant_graph_id.clone(), variant_graph);
-        doc.materials
-            .get_mut(&variant)
-            .ok_or_else(|| import_error("color variant fixture is missing"))?
-            .node_tree = Some(variant_graph_id.clone());
-        let extension = json!({
-            "materialProperties": [{
-                "shader": "VRM/MToon",
-                "vectorProperties": {"_MainTex": [0.25, 0.5, 2.0, 3.0]}
-            }]
-        });
-        let moved = mtoon::move_main_texture_transforms(&mut doc, &index, &extension)?;
-        assert!(moved.contains(&source));
-        let source_graph_id = doc.materials[&source]
-            .node_tree
-            .as_ref()
-            .ok_or_else(|| import_error("source graph fixture is missing"))?;
-        let source_graph = &doc.node_groups[source_graph_id];
-        let variant_graph = &doc.node_groups[&variant_graph_id];
-        let source_mapping = source_graph
-            .nodes
-            .values()
-            .find(|node| node.node_type == "ShaderNodeMapping")
-            .ok_or_else(|| import_error("transformed source graph has no Mapping node"))?;
-        let variant_mapping = variant_graph
-            .nodes
-            .values()
-            .find(|node| node.node_type == "ShaderNodeMapping")
-            .ok_or_else(|| import_error("variant graph did not receive the Mapping node"))?;
-        assert_eq!(source_mapping.inputs, variant_mapping.inputs);
-        let color_nodes = variant_graph
-            .nodes
-            .values()
-            .filter(|node| node.node_type == "ShaderNodeVertexColor")
-            .collect::<Vec<_>>();
-        assert_eq!(color_nodes.len(), 1);
-        assert_eq!(color_nodes[0].properties["layer_name"], json!("Paint"));
         Ok(())
     }
 }

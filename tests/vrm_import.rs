@@ -1216,14 +1216,29 @@ fn vrm0_main_texture_transform_moves_the_base_color_texture_into_a_graph() -> Te
     export(&source, "vrm0", &vrm)?;
     // The VRM Add-on writes `_MainTex` as (offset x, stored offset y, scale x, scale y).
     edit_glb(&vrm, |document| {
-        for material in document["extensions"]["VRM"]["materialProperties"]
+        let mtoon = document["extensions"]["VRM"]["materialProperties"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .filter(|(_, property)| property["shader"] == "VRM/MToon")
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        for property in document["extensions"]["VRM"]["materialProperties"]
             .as_array_mut()
             .into_iter()
             .flatten()
         {
-            if material["shader"] == "VRM/MToon" {
-                material["vectorProperties"]["_MainTex"] = json!([0.25, 0.1, 2.0, 3.0]);
+            if property["shader"] == "VRM/MToon" {
+                property["vectorProperties"]["_MainTex"] = json!([0.25, 0.1, 2.0, 3.0]);
             }
+        }
+        // Each MToon material also carries a packed metallic-roughness texture (the base texture's image
+        // again), which needs a graph too. The main texture transform must still reach its base texture.
+        for index in mtoon {
+            let pbr = &mut document["materials"][index]["pbrMetallicRoughness"];
+            let base = pbr["baseColorTexture"].clone();
+            pbr["metallicRoughnessTexture"] = base;
         }
         Ok(())
     })?;
@@ -1235,10 +1250,67 @@ fn vrm0_main_texture_transform_moves_the_base_color_texture_into_a_graph() -> Te
         .into_iter()
         .flat_map(|materials| materials.values())
         .filter(|material| !material["node_tree"].is_null())
-        .count();
+        .collect::<Vec<_>>();
     assert_eq!(
-        graph_materials, 1,
+        graph_materials.len(),
+        1,
         "the MToon base texture moved into one shader graph"
+    );
+    let graph_id = graph_materials[0]["node_tree"]
+        .as_str()
+        .ok_or("the shader graph material has no node tree")?;
+    let group = &scene["node_groups"][graph_id];
+    let nodes = group["nodes"]
+        .as_object()
+        .ok_or("the shader graph has no nodes")?;
+    let links = group["links"]
+        .as_array()
+        .ok_or("the shader graph has no links")?;
+    // The main texture transform reaches the base color Image Texture through a Mapping node.
+    let (mapping_name, mapping) = nodes
+        .iter()
+        .find(|(_, node)| node["type"] == "ShaderNodeMapping")
+        .ok_or("the transformed base color texture has no Mapping node")?;
+    assert_vec3_close(
+        &mapping["inputs"]["Location"],
+        [0.25, 0.1, 0.0],
+        "main texture location",
+    );
+    assert_vec3_close(
+        &mapping["inputs"]["Rotation"],
+        [0.0, 0.0, 0.0],
+        "main texture rotation",
+    );
+    assert_vec3_close(
+        &mapping["inputs"]["Scale"],
+        [2.0, 3.0, 1.0],
+        "main texture scale",
+    );
+    assert!(
+        links.iter().any(|link| {
+            link["from_node"].as_str() == Some(mapping_name.as_str())
+                && link["to_socket"] == "Vector"
+        }),
+        "the Mapping node does not feed an Image Texture"
+    );
+    // The packed metallic-roughness texture is split as glTF packs it: Blue is metallic, Green roughness.
+    assert!(
+        nodes
+            .get("metal_split")
+            .is_some_and(|node| node["type"] == "ShaderNodeSeparateColor"),
+        "the packed metallic-roughness texture is not split"
+    );
+    assert!(
+        links
+            .iter()
+            .any(|link| link["from_node"] == "metal_split" && link["from_socket"] == "Blue"),
+        "the split does not read Blue for metallic"
+    );
+    assert!(
+        links
+            .iter()
+            .any(|link| link["from_node"] == "metal_split" && link["from_socket"] == "Green"),
+        "the split does not read Green for roughness"
     );
     Ok(())
 }

@@ -6663,17 +6663,22 @@ pub(crate) struct GltfIndex {
     pub(crate) mesh_shape_key_ids: Vec<Vec<Id>>,
     /// glTF joint node index to (armature node, bone) for every skinned joint.
     pub(crate) joint_bones: BTreeMap<usize, (Id, Id)>,
+    /// Materials whose base color texture took the `base_color_transform` at import.
+    pub(crate) main_texture_transforms: BTreeSet<Id>,
 }
 
 pub(crate) fn import(path: &Path, scene_id: String) -> Result<crate::exchange::ImportedGraph> {
-    import_indexed(path, scene_id, POT_TO_GLTF).map(|(graph, _)| graph)
+    import_indexed(path, scene_id, POT_TO_GLTF, |_, _| None).map(|(graph, _)| graph)
 }
 
 /// Imports glTF or GLB with Potter axes mapped through `basis` (VRM 0.x adds a Ry(180) turn).
+/// `base_color_transform` gives a material's transform for its base color texture (VRM 0.x MToon main
+/// texture); it applies only where that texture has no transform of its own.
 pub(crate) fn import_indexed(
     path: &Path,
     scene_id: String,
     basis: DMat4,
+    base_color_transform: impl Fn(&Value, usize) -> Option<super::material_surface::TextureTransform>,
 ) -> Result<(crate::exchange::ImportedGraph, GltfIndex)> {
     fn import_shape_keys(
         mesh_value: &Value,
@@ -6912,6 +6917,7 @@ pub(crate) fn import_indexed(
     let mut material_ids = Vec::with_capacity(material_values.len());
     let mut used_material_ids = BTreeSet::new();
     let mut graph_materials = Vec::<(Id, material_graph::GraphTextures)>::new();
+    let mut main_texture_transforms = BTreeSet::<Id>::new();
     for (index, material) in material_values.iter().enumerate() {
         let suggested = material["extras"]["potter"]["id"]
             .as_str()
@@ -6954,7 +6960,15 @@ pub(crate) fn import_indexed(
                 *component *= peak / emission_strength;
             }
         }
-        let textures = material_textures(material, &root, &image_ids)?;
+        let mut textures = material_textures(material, &root, &image_ids)?;
+        // A VRM 0.x MToon main texture transform applies to a base color texture with no transform of its own.
+        if let Some(slot) = textures.base_color.as_mut()
+            && slot.transform.is_none()
+            && let Some(transform) = base_color_transform(&root, index)
+        {
+            slot.transform = Some(transform);
+            main_texture_transforms.insert(id.clone());
+        }
         // A texture a Potter texture field cannot hold (transform, packed metallic-roughness, emissive,
         // occlusion, normal scale) moves into the material graph, as Blender's importer builds one;
         // the fields stay empty. A field would read the packed texture's Red channel for both values.
@@ -7974,6 +7988,7 @@ pub(crate) fn import_indexed(
         image_ids,
         mesh_shape_key_ids,
         joint_bones,
+        main_texture_transforms,
     };
     let graph = crate::exchange::ImportedGraph {
         doc,
