@@ -11,7 +11,8 @@ graph for a mixed wrap. The base colour Image Texture is set to Non-Color and wi
 interpolates raw texel values exactly as Potter does. Potter's sRGB decode order is a separate question, so the image is
 not decoded on either side. A quad spans Blender UVs -0.5..1.5, covering integer boundaries and half-texel edge bands.
 The Raw view transform and a near-zero box filter give each pixel centre's exact value. Each record is
-[u, v, r, g, b] with the Blender UV (V-up) at the pixel centre; values are rounded to six decimals.
+[u, v, r, g, b, sample_u, sample_v]: the assumed pixel-centre UV (V-up), the rendered colour, and the UV the UV Map node
+supplies to the wrap graph, read from a second render. Values are rounded to six decimals, and the sample UV to seven.
 """
 
 import json
@@ -40,10 +41,13 @@ image_node.image.colorspace_settings.name = "Non-Color"
 output = next(n for n in nt.nodes if n.type == "OUTPUT_MATERIAL")
 
 uv_name = "UVMap"
+uv_node = None
 for node in nt.nodes:
     if node.type == "UVMAP" and node.uv_map:
         uv_name = node.uv_map
+        uv_node = node
         break
+assert uv_node is not None, "the imported graph has no UV Map node"
 
 emission = nt.nodes.new("ShaderNodeEmission")
 emission.inputs["Strength"].default_value = 1.0
@@ -112,6 +116,19 @@ width, height = loaded.size
 assert (width, height) == (size, size), (width, height)
 pixels = list(loaded.pixels)
 
+# Second render: emit the UV that the UV Map node supplies to the wrap graph at each pixel. That is the ray UV before
+# Blender's per-axis wrap, the value Potter's graph receives at the same point.
+for link in list(emission.inputs["Color"].links):
+    nt.links.remove(link)
+nt.links.new(uv_node.outputs["UV"], emission.inputs["Color"])
+uv_path = exr_path + ".uv.exr"
+render.filepath = uv_path
+bpy.ops.render.render(write_still=True)
+uv_loaded = bpy.data.images.load(uv_path, check_existing=False)
+uv_loaded.reload()
+assert tuple(uv_loaded.size) == (size, size), uv_loaded.size
+uv_pixels = list(uv_loaded.pixels)
+
 records = []
 for y in range(height):
     v = -0.5 + 2.0 * (y + 0.5) / height
@@ -121,6 +138,7 @@ for y in range(height):
         records.append(
             [round(u, 6), round(v, 6)]
             + [round(pixels[offset + channel], 6) for channel in range(3)]
+            + [round(uv_pixels[offset], 7), round(uv_pixels[offset + 1], 7)]
         )
 
 with open(out_path, "w") as handle:
@@ -129,4 +147,5 @@ with open(out_path, "w") as handle:
         handle,
     )
 os.remove(exr_path)
+os.remove(uv_path)
 print("ORACLE_OK", os.path.basename(gltf_path), width, height, uv_name, len(records))

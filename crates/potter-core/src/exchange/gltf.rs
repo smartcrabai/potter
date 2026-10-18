@@ -15546,8 +15546,11 @@ mod tests {
     }
 
     /// Mixed-wrap glTF textures sample as Blender 5.2.2 renders them. Each fixture's per-axis UV graph is rendered over
-    /// a UV ramp from -0.5 to 1.5 (`tests/fixtures/texture_wrap/generate_wrap_oracle.py`). Both sides interpolate raw
-    /// values, so this isolates wrap semantics from the sRGB decode order.
+    /// a UV ramp from -0.5 to 1.5 (`tests/fixtures/texture_wrap/generate_wrap_oracle.py`). Each record is evaluated at
+    /// the ray UV that Blender's UV Map node supplies to the wrap graph. Both sides interpolate raw values, so this
+    /// isolates wrap semantics from the sRGB decode order. The bound is the oracle's six-decimal colour rounding: an f64
+    /// emulation of the graph at those UVs leaves a worst residual of 5.3e-7 on the three oracles, so 1e-6 is about
+    /// twice that.
     #[test]
     fn mixed_wrap_samples_match_blenders_render() -> TestResult {
         let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -15559,7 +15562,7 @@ mod tests {
                 true,
             )?;
             assert!(
-                worst <= 1e-4,
+                worst <= 1e-6,
                 "{pair}: Potter differs from Blender's render by {worst} at Blender uv {worst_at:?}"
             );
         }
