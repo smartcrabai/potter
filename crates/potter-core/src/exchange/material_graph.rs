@@ -63,35 +63,6 @@ pub(crate) struct GraphTextures {
 }
 
 impl GraphTextures {
-    /// The textures of a material whose fields hold them, with `base_transform` on the base color.
-    pub(crate) fn from_fields(
-        material: &Material,
-        base_transform: Option<TextureTransform>,
-    ) -> Self {
-        let plain = |texture: &Option<TextureRef>| {
-            texture.clone().map(|texture| SlotTexture {
-                texture,
-                transform: None,
-            })
-        };
-        Self {
-            base_color: material
-                .base_color_texture
-                .clone()
-                .map(|texture| SlotTexture {
-                    texture,
-                    transform: base_transform,
-                }),
-            metallic_roughness: plain(&material.metallic_texture),
-            roughness: None,
-            metallic: None,
-            normal: plain(&material.normal_texture),
-            normal_scale: 1.0,
-            emissive: None,
-            occlusion: None,
-        }
-    }
-
     /// The native texture fields of a Potter material, each read through its Red channel as the field is, including when two fields reference one image.
     pub(crate) fn from_field_refs(
         base_color: Option<TextureRef>,

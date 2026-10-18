@@ -1315,6 +1315,127 @@ fn vrm0_main_texture_transform_moves_the_base_color_texture_into_a_graph() -> Te
     Ok(())
 }
 
+/// The Mapping node of the one shader graph a VRM 0.x import makes for the base color texture.
+fn base_color_mapping(project: &Path) -> TestResult<Value> {
+    let scene: Value = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
+    let graph_id = scene["materials"]
+        .as_object()
+        .into_iter()
+        .flat_map(|materials| materials.values())
+        .find_map(|material| material["node_tree"].as_str().map(str::to_owned))
+        .ok_or("the import made no shader graph")?;
+    let nodes = scene["node_groups"][graph_id.as_str()]["nodes"]
+        .as_object()
+        .ok_or("the shader graph has no nodes")?;
+    let mapping = nodes
+        .values()
+        .find(|node| node["type"] == "ShaderNodeMapping")
+        .cloned()
+        .ok_or("the base color texture has no Mapping node")?;
+    Ok(mapping)
+}
+
+#[test]
+fn vrm0_main_texture_transform_replaces_the_base_khr_transform_with_a_loss() -> TestResult {
+    let (directory, source) = new_fixture()?;
+    let vrm = directory.path().join("v0.vrm");
+    export(&source, "vrm0", &vrm)?;
+    // The VRM Add-on's `_MainTex` replaces the base color texture's own KHR transform, so the file's
+    // transform is dropped and reported.
+    edit_glb(&vrm, |document| {
+        let mtoon = document["extensions"]["VRM"]["materialProperties"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .filter(|(_, property)| property["shader"] == "VRM/MToon")
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        for property in document["extensions"]["VRM"]["materialProperties"]
+            .as_array_mut()
+            .into_iter()
+            .flatten()
+        {
+            if property["shader"] == "VRM/MToon" {
+                property["vectorProperties"]["_MainTex"] = json!([0.25, 0.1, 2.0, 3.0]);
+            }
+        }
+        for index in mtoon {
+            let base =
+                &mut document["materials"][index]["pbrMetallicRoughness"]["baseColorTexture"];
+            if base.is_object() {
+                base["extensions"] = json!({
+                    "KHR_texture_transform": {"offset": [0.5, 0.5], "rotation": 0.0, "scale": [1.5, 1.5]}
+                });
+            }
+        }
+        let used = document["extensionsUsed"]
+            .as_array_mut()
+            .ok_or("no extensionsUsed")?;
+        if !used.iter().any(|name| name == "KHR_texture_transform") {
+            used.push(json!("KHR_texture_transform"));
+        }
+        Ok(())
+    })?;
+    let (_fresh_directory, project) = init_project()?;
+    assert_eq!(
+        import_losses(&project, &vrm, "vrm0")?,
+        loss_ids(&["vrm.mtoon._MainTex"])
+    );
+    let mapping = base_color_mapping(&project)?;
+    assert_vec3_close(
+        &mapping["inputs"]["Location"],
+        [0.25, 0.1, 0.0],
+        "main texture location",
+    );
+    assert_vec3_close(
+        &mapping["inputs"]["Rotation"],
+        [0.0, 0.0, 0.0],
+        "main texture rotation",
+    );
+    assert_vec3_close(
+        &mapping["inputs"]["Scale"],
+        [2.0, 3.0, 1.0],
+        "main texture scale",
+    );
+    Ok(())
+}
+
+#[test]
+fn vrm0_main_texture_scale_near_zero_is_one_as_the_add_on_does() -> TestResult {
+    let (directory, source) = new_fixture()?;
+    let vrm = directory.path().join("v0.vrm");
+    export(&source, "vrm0", &vrm)?;
+    // The VRM Add-on treats a scale whose magnitude is below float_info.epsilon as 1. Here the x scale is 0
+    // and the y scale is 1e-17, so both become 1, and the stored offset y is `1 - 0.1 - 1`.
+    edit_glb(&vrm, |document| {
+        for property in document["extensions"]["VRM"]["materialProperties"]
+            .as_array_mut()
+            .into_iter()
+            .flatten()
+        {
+            if property["shader"] == "VRM/MToon" {
+                property["vectorProperties"]["_MainTex"] = json!([0.25, 0.1, 0.0, 1e-17]);
+            }
+        }
+        Ok(())
+    })?;
+    let (_fresh_directory, project) = init_project()?;
+    assert_eq!(import_losses(&project, &vrm, "vrm0")?, loss_ids(&[]));
+    let mapping = base_color_mapping(&project)?;
+    assert_vec3_close(
+        &mapping["inputs"]["Location"],
+        [0.25, 0.1, 0.0],
+        "main texture location",
+    );
+    assert_vec3_close(
+        &mapping["inputs"]["Scale"],
+        [1.0, 1.0, 1.0],
+        "main texture scale",
+    );
+    Ok(())
+}
+
 #[test]
 fn vrm1_base_color_texture_transform_round_trips_through_vrm_export() -> TestResult {
     let (directory, source) = new_fixture()?;

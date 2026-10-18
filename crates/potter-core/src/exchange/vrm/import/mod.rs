@@ -76,12 +76,8 @@ pub fn import(path: &Path, scene_id: String, version: AvatarVersion) -> Result<I
         .collect::<Vec<_>>();
     losses.extend(unsupported_extension_losses(&index.root, version));
     apply_material_render_state(&mut graph.doc, &index);
-    // VRM 0.x main texture transforms were applied to base color textures during the glTF import.
-    let moved_main_textures = index.main_texture_transforms.clone();
-
     let snapshot = Snapshot::evaluate(&graph.doc, &EvaluationContext::default())?;
     let mut decoder = Decoder::new(version, &index, &graph.doc, &snapshot, &extension);
-    decoder.moved_main_textures = moved_main_textures;
     let avatar = decode_avatar(&mut decoder)?;
     losses.append(&mut decoder.losses);
     if let Some(avatar) = avatar {
@@ -238,8 +234,6 @@ pub(super) struct Decoder<'a> {
     potter_node_index: BTreeMap<Id, usize>,
     /// (armature node, bone) to the glTF joint index.
     joint_index: BTreeMap<(Id, Id), usize>,
-    /// Materials whose VRM 0.x main texture transform moved into a graph (see `mtoon`).
-    pub(super) moved_main_textures: BTreeSet<Id>,
 }
 
 impl<'a> Decoder<'a> {
@@ -272,7 +266,6 @@ impl<'a> Decoder<'a> {
             losses: Vec::new(),
             potter_node_index,
             joint_index,
-            moved_main_textures: BTreeSet::new(),
         }
     }
 
