@@ -173,7 +173,7 @@ fn blender_mul_m3(a: &BlenderMat3, b: &BlenderMat3) -> BlenderMat3 {
 /// `b[j][2] * a[2][k]` and `b[j][3] * a[3][k]`. The four products are summed in pairs,
 /// `(p0 + p1) + (p2 + p3)`: the association the Blender arm64 build produces, checked bit for bit
 /// against the parent-inverse products of `BKE_object_where_is_calc`.
-fn blender_mul_m4(a: &BlenderMat4, b: &BlenderMat4) -> BlenderMat4 {
+pub(crate) fn blender_mul_m4(a: &BlenderMat4, b: &BlenderMat4) -> BlenderMat4 {
     let mut result = [[0.0_f32; 4]; 4];
     for (j, column) in result.iter_mut().enumerate() {
         for (k, value) in column.iter_mut().enumerate() {
@@ -423,12 +423,12 @@ fn blender_invert_m4(matrix: &BlenderMat4) -> Option<BlenderMat4> {
 }
 
 /// Quantizes an f64 matrix to Blender's f32 `float[4][4]`.
-fn blender_matrix_from_f64(matrix: DMat4) -> BlenderMat4 {
+pub(crate) fn blender_matrix_from_f64(matrix: DMat4) -> BlenderMat4 {
     std::array::from_fn(|column| std::array::from_fn(|row| matrix.col(column)[row] as f32))
 }
 
 /// Blender's f32 matrix as an f64 matrix; every entry is exact.
-fn dmat4_from_blender(matrix: &BlenderMat4) -> DMat4 {
+pub(crate) fn dmat4_from_blender(matrix: &BlenderMat4) -> DMat4 {
     let columns: [f64; 16] = std::array::from_fn(|index| f64::from(matrix[index / 4][index % 4]));
     DMat4::from_cols_array(&columns)
 }

@@ -88,6 +88,11 @@ pub struct EvaluatedNode {
     /// empty slots. Not serialized.
     #[serde(skip)]
     pub materials: Vec<Option<Id>>,
+    /// Blender `me->mat` after the modifier stack: the evaluated mesh's own material array, padded to
+    /// the evaluated count. Apply writes it back to DATA, and a quick Boolean operand hands it to its
+    /// subject. Not serialized.
+    #[serde(skip)]
+    pub(crate) mesh_materials: Vec<Option<Id>>,
 }
 
 /// Evaluated world-space Grease Pencil stroke used by vector exporters and preview.
@@ -1430,6 +1435,7 @@ impl Snapshot {
                     bounds,
                     dimensions,
                     materials: effective_material_slots(node, &node_materials),
+                    mesh_materials: node_materials,
                 },
             );
         }
@@ -3704,8 +3710,8 @@ fn world_matrix_f32(matrix: DMat4) -> glam::Mat4 {
 
 /// One Boolean operand object: its mesh (the evaluated mesh when present, else the data mesh with
 /// its vertex groups) and its transform into the subject's space: Blender's f32 product from
-/// `geom::blender_matrix` when it applies, else the f64 fallback. Also returns its effective
-/// material slots, which its face material indices refer to, and its DATA vertex groups.
+/// `geom::blender_matrix` when it applies, else the f64 fallback. Also returns its effective and
+/// mesh-level material slots, and its DATA vertex groups.
 fn boolean_operand<'d>(
     modifier: &Modifier,
     doc: &'d SceneDoc,
@@ -3718,6 +3724,7 @@ fn boolean_operand<'d>(
     evaluated_nodes: &BTreeMap<Id, EvaluatedNode>,
 ) -> Result<(
     crate::geom::boolean::BooleanOperand,
+    Vec<Option<Id>>,
     Vec<Option<Id>>,
     &'d [VertexGroup],
 )> {
@@ -3787,16 +3794,20 @@ fn boolean_operand<'d>(
         ),
         material_remap: Vec::new(),
     };
-    // An evaluated operand contributes its evaluated table (after its own modifiers, e.g. a TRANSFER
-    // pool); an operand without one contributes its effective authoring slots.
-    let slots = match evaluated_meshes.get(object_id) {
-        Some(_) => evaluated_nodes.get(object_id).map_or_else(
-            || effective_material_slots(object, &data.materials),
-            |node| node.materials.clone(),
+    // An evaluated operand contributes its evaluated tables (after its own modifiers, e.g. a TRANSFER
+    // pool). `slots` are effective, which its face material indices resolve through (remap); `mesh_slots`
+    // is its mesh array, which a quick UNION copies. An operand without an evaluated mesh contributes
+    // its authoring tables.
+    let (slots, mesh_slots) = match evaluated_nodes.get(object_id) {
+        Some(node) if evaluated_meshes.contains_key(object_id) => {
+            (node.materials.clone(), node.mesh_materials.clone())
+        }
+        _ => (
+            effective_material_slots(object, &data.materials),
+            data.materials.clone(),
         ),
-        None => effective_material_slots(object, &data.materials),
     };
-    Ok((operand, slots, data.vertex_groups.as_slice()))
+    Ok((operand, slots, mesh_slots, data.vertex_groups.as_slice()))
 }
 
 /// Re-keys an operand's vertex-group weights from the operand's group names to the subject's, by
@@ -3885,11 +3896,12 @@ fn apply_boolean_operands_modifier(
         .map_or(&[][..], |data| data.vertex_groups.as_slice());
     let mut operands = Vec::new();
     let mut operand_slots = Vec::new();
+    let mut operand_mesh_slots = Vec::new();
     for object_id in object_ids
         .iter()
         .filter(|object_id| *object_id != subject_id)
     {
-        let (mut operand, slots, operand_groups) = boolean_operand(
+        let (mut operand, slots, mesh_slots, operand_groups) = boolean_operand(
             modifier,
             doc,
             object_id,
@@ -3905,6 +3917,7 @@ fn apply_boolean_operands_modifier(
         }
         operands.push(operand);
         operand_slots.push(slots);
+        operand_mesh_slots.push(mesh_slots);
     }
     // FLOAT leaves the mesh unchanged when the subject is the only member of a collection.
     if float && settings.operand_type == BooleanOperandType::Collection && operands.is_empty() {
@@ -3924,7 +3937,9 @@ fn apply_boolean_operands_modifier(
             }
             crate::geom::boolean::FloatObjectQuickMesh::Operand(result) => {
                 *mesh = result;
-                operand_slots.first().cloned().unwrap_or_default()
+                // Blender copies the operand's mesh, so its own material array (not its effective
+                // OBJECT-resolved table) becomes the result's.
+                operand_mesh_slots.first().cloned().unwrap_or_default()
             }
         });
     }

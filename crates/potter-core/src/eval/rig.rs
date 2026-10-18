@@ -15,7 +15,11 @@ use serde_json::{Value, json};
 use crate::{
     error::{ErrorCode, PotError, Result},
     eval::animation::animated_transform,
-    geom::{Mesh, modifiers::blender_multiply_m4, uv_layers},
+    geom::{
+        Mesh,
+        blender_matrix::{blender_matrix_from_f64, blender_mul_m4, dmat4_from_blender},
+        uv_layers,
+    },
     model::{
         ArmatureData, Constraint, ConstraintType, DataBlock, Driver, DriverType, DriverVariable,
         DriverVariableType, Id, Modifier, Node, ParentType, PoseBone, SceneDoc, ShapeKeyData,
@@ -2916,15 +2920,15 @@ fn evaluate_world_matrices_with_meshes(
                 parent_world
             };
             if captured_matrix_basis.is_some() {
-                let parent_space_and_inverse = blender_multiply_m4(
-                    parent_space.to_cols_array().map(|value| value as f32),
-                    parent_inverse.to_cols_array().map(|value| value as f32),
+                let parent_space_and_inverse = blender_mul_m4(
+                    &blender_matrix_from_f64(parent_space),
+                    &blender_matrix_from_f64(parent_inverse),
                 );
-                let world = blender_multiply_m4(
-                    parent_space_and_inverse,
-                    local.to_cols_array().map(|value| value as f32),
+                let world = blender_mul_m4(
+                    &parent_space_and_inverse,
+                    &blender_matrix_from_f64(local),
                 );
-                DMat4::from_cols_array(&world.map(f64::from))
+                dmat4_from_blender(&world)
             } else {
                 parent_space * parent_inverse * local
             }

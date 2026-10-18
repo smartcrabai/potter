@@ -67,21 +67,6 @@ impl MergedGeometry {
 const MAX_SUBDIVISION_TRIANGLES: u128 = 100_000_000;
 const MAX_SUBDIVISION_MEMORY_BYTES: u128 = 8 * 1024 * 1024 * 1024;
 
-/// Blender `mul_m4_m4m4` on column-major f32 matrices: `left * right`. Each element sums its four
-/// products in pairs, `(p0 + p1) + (p2 + p3)`, the association `blender_matrix` verifies against
-/// the arm64 Blender build.
-pub(crate) fn blender_multiply_m4(left: [f32; 16], right: [f32; 16]) -> [f32; 16] {
-    let mut result = [0.0; 16];
-    for row in 0..4 {
-        for column in 0..4 {
-            result[column * 4 + row] = (right[column * 4] * left[row]
-                + right[column * 4 + 1] * left[4 + row])
-                + (right[column * 4 + 2] * left[8 + row] + right[column * 4 + 3] * left[12 + row]);
-        }
-    }
-    result
-}
-
 /// Result of evaluating a modifier stack, including realized graph instance paths.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModifierEvaluation {
