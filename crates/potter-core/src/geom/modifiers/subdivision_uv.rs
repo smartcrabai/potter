@@ -273,7 +273,8 @@ fn corner_uvs(position: &Position, layer: &UvLayer) -> Vec<DVec2> {
         if let Some(values) = values {
             let start = position.starts[face];
             for (corner, uv) in values.iter().enumerate() {
-                uvs[start + corner] = DVec2::new(uv[0], uv[1]);
+                // The mesh UV store is glTF V-down; Blender's face-varying math is V-up.
+                uvs[start + corner] = DVec2::new(uv[0], 1.0 - uv[1]);
             }
         }
     }
@@ -344,7 +345,7 @@ pub(super) fn write_loop_uvs(
             .map(|face| {
                 let (own, tail) = rest.split_at(face.vertices.len());
                 rest = tail;
-                Some(own.iter().map(|uv| [uv.x, uv.y]).collect())
+                Some(own.iter().map(|uv| [uv.x, 1.0 - uv.y]).collect())
             })
             .collect();
         let mut layer = UvLayer::new(name, faces);
