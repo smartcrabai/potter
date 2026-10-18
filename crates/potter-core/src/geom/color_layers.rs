@@ -30,8 +30,8 @@ use std::collections::{HashMap, HashSet};
 use serde_json::{Map, Value, json};
 
 use super::{Mesh, attribute_keys};
-use crate::error::{ErrorCode, PotError, Result};
 use crate::color::{linear_to_srgb, srgb_to_linear};
+use crate::error::{ErrorCode, PotError, Result};
 
 /// Attribute name of the color layer store.
 pub(crate) const ATTRIBUTE: &str = "color_layers";

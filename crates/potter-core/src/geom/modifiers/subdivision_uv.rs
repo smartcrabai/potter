@@ -1604,7 +1604,6 @@ fn encode_byte_colors(source: &Mesh, origin: &Origin, output: &mut Mesh) {
     color_layers::write(output, &store);
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

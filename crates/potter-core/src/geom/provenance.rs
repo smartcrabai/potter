@@ -438,7 +438,11 @@ pub(crate) fn mean_value_corners<'a>(
         let polygon: Option<Vec<DVec3>> = source.faces[index]
             .vertices
             .iter()
-            .map(|id| source_index.get(id).map(|position| source.vertices[*position].co))
+            .map(|id| {
+                source_index
+                    .get(id)
+                    .map(|position| source.vertices[*position].co)
+            })
             .collect();
         let projected = polygon.as_deref().and_then(project_polygon);
         for &vertex in vertices {
@@ -464,7 +468,11 @@ pub(crate) fn mean_value_corners<'a>(
 type ProjectionAxes = ([f32; 3], [f32; 3]);
 
 fn sub3_f32(first: [f32; 3], second: [f32; 3]) -> [f32; 3] {
-    [first[0] - second[0], first[1] - second[1], first[2] - second[2]]
+    [
+        first[0] - second[0],
+        first[1] - second[1],
+        first[2] - second[2],
+    ]
 }
 
 fn cross3_f32(first: [f32; 3], second: [f32; 3]) -> [f32; 3] {
@@ -484,9 +492,7 @@ fn project_polygon(polygon: &[DVec3]) -> Option<(Vec<[f32; 2]>, ProjectionAxes)>
         .map(|point| [point.x as f32, point.y as f32, point.z as f32])
         .collect();
     let mut normal = match points.as_slice() {
-        [first, second, third] => {
-            cross3_f32(sub3_f32(*first, *second), sub3_f32(*second, *third))
-        }
+        [first, second, third] => cross3_f32(sub3_f32(*first, *second), sub3_f32(*second, *third)),
         [first, second, third, fourth] => {
             cross3_f32(sub3_f32(*first, *third), sub3_f32(*second, *fourth))
         }
@@ -581,7 +587,10 @@ fn line_segment_distance_squared(point: [f32; 2], first: [f32; 2], second: [f32;
     } else if factor >= 1.0 {
         second
     } else {
-        [first[0] + direction[0] * factor, first[1] + direction[1] * factor]
+        [
+            first[0] + direction[0] * factor,
+            first[1] + direction[1] * factor,
+        ]
     };
     let difference = [closest[0] - point[0], closest[1] - point[1]];
     difference[0] * difference[0] + difference[1] * difference[1]
@@ -1051,8 +1060,17 @@ impl Sources<'_> {
             }
         };
         let values = match layer.domain {
-            ColorDomain::Point => self.origin.vertices.iter().map(|sources| mix(sources)).collect(),
-            ColorDomain::Corner => self.corner_origin.iter().map(|sources| mix(sources)).collect(),
+            ColorDomain::Point => self
+                .origin
+                .vertices
+                .iter()
+                .map(|sources| mix(sources))
+                .collect(),
+            ColorDomain::Corner => self
+                .corner_origin
+                .iter()
+                .map(|sources| mix(sources))
+                .collect(),
         };
         ColorLayer {
             name: layer.name.clone(),
@@ -1388,7 +1406,11 @@ fn blend<'a>(items: impl Iterator<Item = (&'a Value, f64)>, data_type: &str) -> 
         let mut sum = 0.0_f32;
         let mut total = 0.0_f32;
         for (value, weight) in &items {
-            sum += (if value.as_bool() == Some(true) { 1.0 } else { 0.0 }) * (*weight as f32);
+            sum += (if value.as_bool() == Some(true) {
+                1.0
+            } else {
+                0.0
+            }) * (*weight as f32);
             total += *weight as f32;
         }
         return Some(json!(total > 0.0 && sum * (1.0 / total) >= 0.5));
