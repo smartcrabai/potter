@@ -90,7 +90,7 @@ pub(crate) fn remap_attributes_skipping(
 }
 
 /// Interpolated corner booleans use Blender's weighted `DefaultMixer<bool>`; ordinary topology group
-/// merges continue to use the unweighted boolean propagation mixer.
+/// merges continue to OR only positive-weight sources.
 pub(crate) fn remap_interpolated_corners_skipping(
     source: &Mesh,
     output: &mut Mesh,
@@ -1416,7 +1416,7 @@ fn blend_color(items: &[(&Value, f64)], data_type: &str) -> Option<Value> {
 }
 
 /// Blend values by source: numbers and equal-length number arrays interpolate componentwise (rounded for
-/// integer types), booleans propagate with an unweighted OR, and other values use the heaviest source.
+/// integer types), booleans OR positive-weight sources, and other values use the heaviest source.
 /// Boolean corner interpolation uses [`blend_with_boolean_mixer`] for Blender's weighted threshold.
 /// `None` when there are no sources.
 fn blend<'a>(items: impl Iterator<Item = (&'a Value, f64)>, data_type: &str) -> Option<Value> {
@@ -1474,8 +1474,8 @@ fn blend_with_boolean_mixer<'a>(
     }
     if items.iter().all(|(value, _)| value.is_boolean()) {
         if !weighted_booleans {
-            return Some(json!(items.iter().any(|(value, _)| {
-                value.as_bool() == Some(true)
+            return Some(json!(items.iter().any(|(value, weight)| {
+                *weight > 0.0 && value.as_bool() == Some(true)
             })));
         }
         let mut sum = 0.0_f32;
@@ -2064,6 +2064,10 @@ mod tests {
         assert_eq!(
             blend([(&on, 1.0 / 3.0), (&off, 2.0 / 3.0)].into_iter(), "BOOLEAN"),
             Some(json!(true))
+        );
+        assert_eq!(
+            blend([(&on, 0.0), (&off, 1.0)].into_iter(), "BOOLEAN"),
+            Some(json!(false))
         );
         assert_eq!(
             blend_with_boolean_mixer(
