@@ -1810,11 +1810,7 @@ fn build_imported_graph(
             &mut mappings,
             "Camera",
         )?;
-        let projection = if item.get("type").and_then(Value::as_str) == Some("ORTHO") {
-            CameraProjection::Orthographic
-        } else {
-            CameraProjection::Perspective
-        };
+        let (projection, panorama_type) = imported_camera_projection(item);
         doc.data_blocks.insert(
             id,
             DataBlock {
@@ -1838,6 +1834,7 @@ fn build_imported_graph(
                         number_field(item, "shift_x", 0.0),
                         number_field(item, "shift_y", 0.0),
                     ],
+                    panorama_type: panorama_type.unwrap_or_else(|| "equirectangular".to_owned()),
                     ..CameraData::default()
                 }),
                 grease_pencil: None,
@@ -6668,8 +6665,78 @@ fn object_properties(item: &Value) -> Map<String, Value> {
     props
 }
 
+/// The Potter projection of a Blender camera, and the Potter panorama type when it is a panorama. Blender's equirectangular
+/// and equidistant fisheye panoramas import as Potter's panoramas. Other Blender panorama types have no Potter projection
+/// and import as a perspective camera, which `import_losses` reports.
+fn imported_camera_projection(item: &Value) -> (CameraProjection, Option<String>) {
+    match item.get("type").and_then(Value::as_str) {
+        Some("ORTHO") => (CameraProjection::Orthographic, None),
+        Some("PANO") => match item.get("panorama_type").and_then(Value::as_str) {
+            None | Some("EQUIRECTANGULAR") => (
+                CameraProjection::Panorama,
+                Some("equirectangular".to_owned()),
+            ),
+            Some("FISHEYE_EQUIDISTANT") => (
+                CameraProjection::Panorama,
+                Some("fisheye_equidistant".to_owned()),
+            ),
+            Some(_) => (CameraProjection::Perspective, None),
+        },
+        _ => (CameraProjection::Perspective, None),
+    }
+}
+
 fn import_losses(raw: &Value) -> Vec<Loss> {
     let mut losses = Vec::new();
+    // Blender panorama settings that Potter cannot represent are reported, so the import never changes a camera silently.
+    for camera in raw
+        .get("cameras")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|camera| camera.get("type").and_then(Value::as_str) == Some("PANO"))
+    {
+        let name = camera.get("name").and_then(Value::as_str);
+        match camera
+            .get("panorama_type")
+            .and_then(Value::as_str)
+            .unwrap_or("EQUIRECTANGULAR")
+        {
+            "EQUIRECTANGULAR" => {
+                let full_sphere = [
+                    ("longitude_min", -std::f64::consts::PI),
+                    ("longitude_max", std::f64::consts::PI),
+                    ("latitude_min", -std::f64::consts::FRAC_PI_2),
+                    ("latitude_max", std::f64::consts::FRAC_PI_2),
+                ];
+                let ranged = full_sphere.iter().any(|(key, expected)| {
+                    camera
+                        .get(*key)
+                        .and_then(Value::as_f64)
+                        .is_none_or(|actual| (actual - expected).abs() > 1.0e-6)
+                });
+                if ranged {
+                    losses.push(loss(
+                        "blender.camera.panorama_range",
+                        name,
+                        "Blender's equirectangular longitude and latitude limits are not imported; Potter's panorama camera covers the full sphere",
+                    ));
+                }
+            }
+            "FISHEYE_EQUIDISTANT" => losses.push(loss(
+                "blender.camera.fisheye_fov",
+                name,
+                "Blender's fisheye field of view is not imported; Potter's fisheye camera has no field-of-view setting, and its mapping is not oracled against Blender",
+            )),
+            other => losses.push(loss(
+                "blender.camera.panorama_type",
+                name,
+                &format!(
+                    "Blender's {other} panorama has no Potter projection; the camera imports as a perspective camera"
+                ),
+            )),
+        }
+    }
     for material in raw
         .get("materials")
         .and_then(Value::as_array)
@@ -15087,5 +15154,74 @@ print("UNSUPPORTED_POSE " + json.dumps({
             "a stored-nothing Density must read as Blender's default of 1.0"
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod camera_import_tests {
+    use super::*;
+    use std::f64::consts::{FRAC_PI_2, PI};
+
+    fn panorama(panorama_type: &str, longitude: (f64, f64), latitude: (f64, f64)) -> Value {
+        json!({"name": "pano", "type": "PANO", "panorama_type": panorama_type,
+               "longitude_min": longitude.0, "longitude_max": longitude.1,
+               "latitude_min": latitude.0, "latitude_max": latitude.1,
+               "fisheye_fov": 3.0, "fisheye_lens": 10.5})
+    }
+
+    fn features(camera: &Value) -> Vec<String> {
+        import_losses(&json!({"cameras": [camera]}))
+            .into_iter()
+            .map(|loss| loss.feature_id)
+            .collect()
+    }
+
+    #[test]
+    fn equirectangular_panoramas_import_as_panoramas_without_losses() {
+        let camera = panorama("EQUIRECTANGULAR", (-PI, PI), (-FRAC_PI_2, FRAC_PI_2));
+        assert_eq!(
+            imported_camera_projection(&camera),
+            (
+                CameraProjection::Panorama,
+                Some("equirectangular".to_owned())
+            )
+        );
+        assert!(features(&camera).is_empty());
+    }
+
+    #[test]
+    fn ranged_equirectangular_panoramas_report_their_limits() {
+        let camera = panorama("EQUIRECTANGULAR", (-1.2, 2.0), (-0.7, 1.1));
+        assert_eq!(features(&camera), ["blender.camera.panorama_range"]);
+    }
+
+    #[test]
+    fn fisheye_and_other_panoramas_report_what_potter_lacks() {
+        let fisheye = panorama("FISHEYE_EQUIDISTANT", (-PI, PI), (-FRAC_PI_2, FRAC_PI_2));
+        assert_eq!(
+            imported_camera_projection(&fisheye),
+            (
+                CameraProjection::Panorama,
+                Some("fisheye_equidistant".to_owned())
+            )
+        );
+        assert_eq!(features(&fisheye), ["blender.camera.fisheye_fov"]);
+
+        let equisolid = panorama("FISHEYE_EQUISOLID", (-PI, PI), (-FRAC_PI_2, FRAC_PI_2));
+        assert_eq!(
+            imported_camera_projection(&equisolid),
+            (CameraProjection::Perspective, None)
+        );
+        assert_eq!(features(&equisolid), ["blender.camera.panorama_type"]);
+    }
+
+    #[test]
+    fn orthographic_cameras_are_not_panoramas() {
+        let camera = json!({"name": "ortho", "type": "ORTHO"});
+        assert_eq!(
+            imported_camera_projection(&camera),
+            (CameraProjection::Orthographic, None)
+        );
+        assert!(features(&camera).is_empty());
     }
 }
