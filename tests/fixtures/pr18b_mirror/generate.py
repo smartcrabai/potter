@@ -190,6 +190,13 @@ def comb_spec(transpose=False, corner=False):
     pts = [(y, x) if transpose else (x, y) for x, y in COMB]
     return mesh_spec([(x, y, 0.0) for x, y in pts], [tuple(range(len(pts)))], [F], corner_custom=corner)
 
+def disconnected_comb_spec():
+    verts = [(x, y + offset, 0.0) for offset in (-5.0, 5.0) for x, y in COMB]
+    faces = [tuple(range(8)), tuple(range(8, 16))]
+    edges = [(8 + i, 8 + (i + 1) % 8) for i in range(8)]
+    edges.extend((i, (i + 1) % 8) for i in range(8))
+    return mesh_spec(verts, faces, [F, F], edges=edges)
+
 
 def mesh_spec(verts, faces, smooth, sharp=(), seam=(), material=None, region=None, uv=False, groups=False,
               edges=(), vertex_custom=False, corner_custom=False):
@@ -210,6 +217,8 @@ BASES = {
     "half_box": lambda: mesh_spec(half_box_verts(), CUBE_F, [F] * 6),
     "edges_half": lambda: mesh_spec(half_box_verts(), CUBE_F, [F] * 6, sharp=[[0, 1]], seam=HALF_SEAM),
     "plane_x0": lambda: mesh_spec([(0, -1, -1), (0, 1, -1), (0, 1, 1), (0, -1, 1)], [(0, 1, 2, 3)], [F]),
+    "duplicate_opposite_triangles": lambda: mesh_spec(
+        [(0, 0, 0), (1, 0, 0), (1, 1, 0)], [(0, 1, 2), (2, 1, 0)], [F, F]),
     "thr_grid": thr_grid,
     "half_y_grid": half_y_grid,
     "rotated_grid": rotated_grid,
@@ -227,6 +236,7 @@ BASES = {
     "concave_comb": lambda: comb_spec(),
     "concave_comb_y": lambda: comb_spec(transpose=True),
     "concave_comb_corner": lambda: comb_spec(corner=True),
+    "disconnected_comb_order": disconnected_comb_spec,
 }
 
 
@@ -520,6 +530,8 @@ VARIANTS = [
     V("M15", "thr_grid_x_t0", "thr_grid", [MIRROR([T, F, F], merge_threshold=0.0)]),
     V("M16", "thr_grid_x_t2e3", "thr_grid", [MIRROR([T, F, F], merge_threshold=0.002)]),
     V("M17", "half_box_x_t0", "half_box", [MIRROR([T, F, F], merge_threshold=0.0)]),
+    V("M18", "weld_context_duplicate_opposite_triangles_x", "duplicate_opposite_triangles",
+      [MIRROR([T, F, F])]),
     V("TH1", "cube2_xyz_t0", "cube2", [MIRROR([T, T, T], merge_threshold=0.0)]),
     # bisect / flip
     V("B1", "half_box_bisect_x", "half_box", [MIRROR([T, F, F], bisect=[T, F, F])]),
@@ -619,6 +631,8 @@ VARIANTS = [
     V("K3", "concave_comb_bisect_y", "concave_comb_y", [MIRROR([F, T, F], bisect=[F, T, F])]),
     V("K4", "concave_comb_bisect_y_flip", "concave_comb_y", [MIRROR([F, T, F], bisect=[F, T, F], flip=[F, T, F])]),
     V("K5", "concave_comb_bisect_x_corner_custom", "concave_comb_corner", [MIRROR([T, F, F], bisect=[T, F, F])]),
+    V("K6", "concave_comb_disconnected_bisect_x_flip_order", "disconnected_comb_order",
+      [MIRROR([T, F, F], bisect=[T, F, F], flip=[T, F, F])]),
     # crosschain: multi-modifier stacks across axes
     V("X1", "crosschain_x_bisect_then_z", "cube_offcenter",
       [MIRROR([T, F, F], bisect=[T, F, F]), MIRROR([F, F, T])]),

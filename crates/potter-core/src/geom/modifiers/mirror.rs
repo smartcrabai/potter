@@ -368,9 +368,9 @@ fn mirror_axis(
         }
     }
 
-    // Copies whose every vertex merged coincide with their original and are dropped. Everything else keeps
-    // its order and duplicates, as Blender's merge does. `corner_map` names the doubled corner of each
-    // output corner.
+    // Blender's weld context removes duplicate affected faces by their mapped edge sets; untouched
+    // faces stay outside it (`weld_poly_find_doubles` in `mesh_merge_verts.cc`).
+    let mut touched_face_edge_sets = HashSet::<Vec<(usize, usize)>>::new();
     let mut out_faces: Vec<(Vec<usize>, u32, usize)> = Vec::with_capacity(doubled.len());
     let mut out_copy: Vec<bool> = Vec::with_capacity(doubled.len());
     let mut corner_map: Vec<usize> = Vec::with_capacity(2 * corner_total);
@@ -390,6 +390,26 @@ fn mirror_axis(
                 ErrorCode::InternalError,
                 "mirror face lost a corner while merging",
             ));
+        }
+        let touches_weld = settings.merge.is_some()
+            && face.iter().any(|&vertex| {
+                let source_vertex = if vertex < count {
+                    vertex
+                } else {
+                    vertex - count
+                };
+                target[count + source_vertex] != count + source_vertex
+            });
+        if touches_weld {
+            let mut edge_set: Vec<_> = clean
+                .iter()
+                .zip(clean.iter().cycle().skip(1))
+                .map(|(&first, &second)| edge_key(first, second))
+                .collect();
+            edge_set.sort_unstable();
+            if !touched_face_edge_sets.insert(edge_set) {
+                continue;
+            }
         }
         corner_map.extend(base..base + face.len());
         out_faces.push((clean, material, source_face));
@@ -576,12 +596,13 @@ fn bisect(
     if input_order.is_some() {
         face_order.sort_by_key(|&face| first_loops[face]);
     }
+    let stack_pop_order = bisect_face_pop_order(&edges, &source_polygons, &directions, count)?;
 
     let mut chords = Vec::new();
     // Blender keeps a split face's first piece in its slot; the other pieces are created after the
     // original faces (see below).
     let mut slots = Vec::with_capacity(mesh.faces.len());
-    let mut added_by_face = Vec::with_capacity(mesh.faces.len());
+    let mut added_by_face = vec![Vec::new(); source_polygons.len()];
     for face in face_order {
         let (mut vertices, material) = std::mem::take(&mut source_polygons[face]);
         let offset = source_offsets[face];
@@ -615,11 +636,14 @@ fn bisect(
                 created.push(entry);
             }
         }
-        added_by_face.push(created);
+        added_by_face[face] = created;
     }
-    // Blender pops faces from a work stack, so the pieces split off each face follow every original
-    // face, last face first. A face's own pieces keep their creation order.
-    let added: Vec<_> = added_by_face.into_iter().rev().flatten().collect();
+    // Blender appends created faces in the LIFO bisect stack's pop order; the kept pieces above
+    // remain in their original face slots.
+    let mut added = Vec::new();
+    for face in stack_pop_order {
+        added.extend(std::mem::take(&mut added_by_face[face]));
+    }
 
     // Vertices beyond the threshold go, and every polygon, edge, or chord that uses them with them.
     let killed: Vec<bool> = (0..points.len())
@@ -670,6 +694,105 @@ fn bisect(
         .collect();
     let result = assemble(mesh, out_points, out_origin, out_faces, out_edges)?;
     Ok((result, out_sources))
+}
+
+/// Returns faces in the order `BM_mesh_bisect_plane` pops them: the mesh-edge traversal first pushes
+/// each incident face once, then the BMesh face stack reverses that insertion order.
+fn bisect_face_pop_order(
+    edges: &[[usize; 2]],
+    polygons: &[(Vec<usize>, u32)],
+    directions: &[i8],
+    vertex_count: usize,
+) -> Result<Vec<usize>> {
+    let edge_index: HashMap<_, _> = edges
+        .iter()
+        .enumerate()
+        .map(|(index, &[first, second])| (edge_key(first, second), index))
+        .collect();
+    let mut edge_face_counts = vec![0; edges.len()];
+    let mut vertex_edge_counts = vec![0; vertex_count];
+    for &[first, second] in edges {
+        vertex_edge_counts[first] += 1;
+        vertex_edge_counts[second] += 1;
+    }
+    for (vertices, _) in polygons {
+        for (&first, &second) in vertices.iter().zip(vertices.iter().cycle().skip(1)) {
+            let edge = *edge_index.get(&edge_key(first, second)).ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::InvalidArgument,
+                    "mirror face references a missing edge",
+                )
+            })?;
+            edge_face_counts[edge] += 1;
+        }
+    }
+
+    let mut edge_face_offsets = Vec::with_capacity(edges.len() + 1);
+    let mut edge_face_total = 0;
+    edge_face_offsets.push(edge_face_total);
+    for count in edge_face_counts {
+        edge_face_total += count;
+        edge_face_offsets.push(edge_face_total);
+    }
+    let mut vertex_edge_offsets = Vec::with_capacity(vertex_count + 1);
+    let mut vertex_edge_total = 0;
+    vertex_edge_offsets.push(vertex_edge_total);
+    for count in vertex_edge_counts {
+        vertex_edge_total += count;
+        vertex_edge_offsets.push(vertex_edge_total);
+    }
+
+    let mut edge_face_cursors = edge_face_offsets[..edges.len()].to_vec();
+    let mut vertex_edge_cursors = vertex_edge_offsets[..vertex_count].to_vec();
+    let mut edge_faces = vec![0; edge_face_offsets[edges.len()]];
+    let mut vertex_edges = vec![0; vertex_edge_offsets[vertex_count]];
+    // BMesh radial iteration starts at the most recently appended face loop and walks backward.
+    for (face, (vertices, _)) in polygons.iter().enumerate().rev() {
+        for (&first, &second) in vertices.iter().zip(vertices.iter().cycle().skip(1)) {
+            let edge = edge_index[&edge_key(first, second)];
+            edge_faces[edge_face_cursors[edge]] = face;
+            edge_face_cursors[edge] += 1;
+        }
+    }
+    for (edge, &[first, second]) in edges.iter().enumerate() {
+        vertex_edges[vertex_edge_cursors[first]] = edge;
+        vertex_edge_cursors[first] += 1;
+        vertex_edges[vertex_edge_cursors[second]] = edge;
+        vertex_edge_cursors[second] += 1;
+    }
+
+    let mut face_stacked = vec![false; polygons.len()];
+    let mut center_processed = vec![false; vertex_count];
+    let mut stack = Vec::with_capacity(polygons.len());
+    for (edge, &[first, second]) in edges.iter().enumerate() {
+        if directions[first] * directions[second] == -1 {
+            for &face in &edge_faces[edge_face_offsets[edge]..edge_face_offsets[edge + 1]] {
+                if !face_stacked[face] {
+                    face_stacked[face] = true;
+                    stack.push(face);
+                }
+            }
+        } else {
+            for vertex in [first, second] {
+                if directions[vertex] != 0 || center_processed[vertex] {
+                    continue;
+                }
+                center_processed[vertex] = true;
+                for &edge in
+                    &vertex_edges[vertex_edge_offsets[vertex]..vertex_edge_offsets[vertex + 1]]
+                {
+                    for &face in &edge_faces[edge_face_offsets[edge]..edge_face_offsets[edge + 1]] {
+                        if !face_stacked[face] {
+                            face_stacked[face] = true;
+                            stack.push(face);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    stack.reverse();
+    Ok(stack)
 }
 
 /// Splits a face at the plane. `cycle` holds the face's vertices in order, with the cut vertices on
