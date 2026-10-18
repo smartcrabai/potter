@@ -82,7 +82,7 @@ image_texture.extension = "CLIP"
 image_texture.use_color_ramp = True
 image_texture.image_user.frame_offset = 3
 for key, value in {
-        "use_clamp": False, "brightness": 1.2, "saturation": 0.8,
+        "use_clamp": False, "saturation": 0.8,
         "factor_red": 0.7, "factor_green": 0.8, "factor_blue": 0.9,
         "intensity": 1.1,
 }.items():
@@ -129,7 +129,7 @@ settings = {
     "MUSGRAVE": ("musgrave_type", "dimension_max", "lacunarity", "offset", "gain",
                  "noise_intensity", "noise_scale", "noise_basis"),
     "IMAGE": ("extension", "use_interpolation", "use_color_ramp", "use_clamp",
-              "brightness", "contrast", "saturation", "factor_red", "factor_green",
+              "contrast", "saturation", "factor_red", "factor_green",
               "factor_blue", "intensity"),
 }
 def texture_state(texture):
@@ -196,7 +196,7 @@ settings = {
     "MUSGRAVE": ("musgrave_type", "dimension_max", "lacunarity", "offset", "gain",
                  "noise_intensity", "noise_scale", "noise_basis"),
     "IMAGE": ("extension", "use_interpolation", "use_color_ramp", "use_clamp",
-              "brightness", "contrast", "saturation", "factor_red", "factor_green",
+              "contrast", "saturation", "factor_red", "factor_green",
               "factor_blue", "intensity"),
 }
 def texture_state(texture):
@@ -313,6 +313,18 @@ def write_case(subjects):
 
 const MULTILAYER_CASE_SCRIPT: &str = r#"
 exr = load_image(os.path.join(root, "multilayer.exr"), "Multilayer Image")
+import ctypes
+# ImageUser.layer/pass/view are DNA shorts that RNA exposes read-only (rna_image.cc:877-890).
+# Offsets: Blender 5.2.2 source/blender/makesdna/DNA_image_types.h, struct ImageUser
+# (sizeof 40 on 64-bit): pass at 26, view at 34, layer at 36.
+IMAGE_USER_DNA_OFFSETS = {"multilayer_pass": 26, "multilayer_view": 34, "multilayer_layer": 36}
+
+def write_image_user_dna(image_user, key, value):
+    address = image_user.as_pointer() + IMAGE_USER_DNA_OFFSETS[key]
+    ctypes.c_short.from_address(address).value = value
+    if getattr(image_user, key) != value:
+        raise RuntimeError("%s read back %r after DNA write of %r"
+                           % (key, getattr(image_user, key), value))
 cases = [
     ("Multilayer Default", 0, 0, 0),
     ("Multilayer Layer 1 Pass 1 View 0", 1, 1, 0),
@@ -324,9 +336,14 @@ for name, layer, pass_index, view in cases:
     texture = bpy.data.textures.new(name + " Legacy", type="IMAGE")
     texture.image = exr
     texture.use_interpolation = False
-    texture.image_user.multilayer_layer = layer
-    texture.image_user.multilayer_pass = pass_index
-    texture.image_user.multilayer_view = view
+    write_image_user_dna(texture.image_user, "multilayer_layer", layer)
+    write_image_user_dna(texture.image_user, "multilayer_pass", pass_index)
+    write_image_user_dna(texture.image_user, "multilayer_view", view)
+    selected = (texture.image_user.multilayer_layer, texture.image_user.multilayer_pass,
+                texture.image_user.multilayer_view)
+    if selected != (layer, pass_index, view):
+        raise RuntimeError("%s read back %r, expected %r"
+                           % (name, selected, (layer, pass_index, view)))
     obj = grid_object(name, [0.2, 0.5, 0.8])
     add_displace(obj, texture)
     subjects.append(obj)

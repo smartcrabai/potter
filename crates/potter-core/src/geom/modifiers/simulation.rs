@@ -1300,11 +1300,14 @@ mod tests {
         );
 
         let image = crate::image::ImageData {
+            colour: crate::image::ColourCache::default(),
+            storage: crate::image::ImageStorage::default(),
             width: 1,
             height: 1,
             pixels: vec![[1.0, 0.5, 0.5, 1.0]],
             tiles: std::collections::BTreeMap::new(),
             interpolation: crate::image::ImageInterpolation::Linear,
+            srgb: false,
         };
         let displaced = displace_volume(
             &volume,
@@ -1338,11 +1341,14 @@ mod tests {
             ..VolumeData::default()
         };
         let image = crate::image::ImageData {
+            colour: crate::image::ColourCache::default(),
+            storage: crate::image::ImageStorage::default(),
             width: 1,
             height: 1,
             pixels: vec![[1.0, 0.5, 0.5, 1.0]],
             tiles: std::collections::BTreeMap::new(),
             interpolation: crate::image::ImageInterpolation::Linear,
+            srgb: false,
         };
         let mut rng = crate::blender_rng::BlenderRng::seed(0);
         let settings = |mode| {

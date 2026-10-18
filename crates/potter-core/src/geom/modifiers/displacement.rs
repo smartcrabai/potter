@@ -237,7 +237,7 @@ fn uv_texture_coordinates(mesh: &Mesh, modifier: &Modifier) -> Result<Option<Vec
 /// position, as `normals_calc_verts` does.
 fn true_vertex_normals(mesh: &Mesh, positions: &[DVec3]) -> Result<Vec<DVec3>> {
     let faces = polygons(mesh)?;
-    let mut normals = vertex_normals(positions, &faces, false);
+    let mut normals = vertex_normals(positions, &faces);
     let mut used = vec![false; positions.len()];
     for (vertices, _) in &faces {
         for &vertex in vertices {

@@ -490,10 +490,16 @@ pub(super) fn subdivided_mesh(
     let mut vertex_origins: Vec<Vec<(usize, f64)>> = (0..mesh.vertices.len())
         .map(|vertex| vec![(vertex, 1.0)])
         .collect();
+    // Origins follow point order: edge points are numbered in Blender's edge order, not key order.
+    let mut edges_by_point: Vec<(usize, (usize, usize))> = edge_points
+        .iter()
+        .map(|(&edge, &point)| (point, edge))
+        .collect();
+    edges_by_point.sort_unstable();
     vertex_origins.extend(
-        edge_points
-            .keys()
-            .map(|edge| vec![(edge.0, 0.5), (edge.1, 0.5)]),
+        edges_by_point
+            .into_iter()
+            .map(|(_, edge)| vec![(edge.0, 0.5), (edge.1, 0.5)]),
     );
     vertex_origins.extend(source_polygons.iter().map(|(face, _)| {
         let share = 1.0 / usize_as_f64(face.len());

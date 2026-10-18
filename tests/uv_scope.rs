@@ -123,6 +123,7 @@ fn textured_material(doc: &mut SceneDoc, material: &str, layer: &str) {
         image: Id::new("paint").unwrap(),
         uv_layer: Some(layer.to_owned()),
         interpolation: ImageInterpolation::Linear,
+        extension: potter_core::image::ImageExtension::Repeat,
     });
 }
 

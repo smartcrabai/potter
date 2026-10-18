@@ -1245,7 +1245,7 @@ fn export_corrective_bind(
     label: &str,
     moved: &[Value],
 ) -> Result<(), Box<dyn Error>> {
-    let exported = root.join(format!("corrective_bind_{label}.blend"));
+    let exported = root.join(format!("corrective_bind_export_{label}.blend"));
     pot_json(&[
         "export",
         project.to_str().unwrap(),

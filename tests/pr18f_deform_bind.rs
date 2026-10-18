@@ -1271,7 +1271,7 @@ fn legacy_mesh_deform_bind_is_cleared_on_load_and_rebinds() -> TestResult {
     fs::write(&scene_file, &legacy_bytes)?;
 
     // Loading clears the bind, names the modifier, and says that a rebind is required.
-    let parsed = potter_core::model::migrate::parse_scene(&fs::read(&scene_file)?)?;
+    let parsed = potter_core::model::migrate::parse_scene(&fs::read(&scene_file)?, &scene)?;
     let warning = parsed
         .warnings
         .iter()

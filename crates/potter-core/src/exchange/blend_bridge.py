@@ -7,6 +7,7 @@ file bytes as an immutable compatibility blob.
 """
 import base64
 import bpy
+import ctypes
 import json
 import math
 import os
@@ -34,7 +35,14 @@ LEGACY_TEXTURE_SETTINGS = {
                 "distance_metric", "color_mode", "noise_intensity", "noise_scale"),
     "MUSGRAVE": ("musgrave_type", "dimension_max", "lacunarity", "offset", "gain",
                  "noise_intensity", "noise_scale", "noise_basis"),
-    "IMAGE": (),
+    "IMAGE": (
+        "use_interpolation", "filter_size", "use_flip_axis", "use_alpha",
+        "use_calculate_alpha", "invert_alpha", "extension", "repeat_x", "repeat_y",
+        "use_mirror_x", "use_mirror_y", "use_checker_odd", "use_checker_even",
+        "checker_distance", "crop_min_x", "crop_min_y", "crop_max_x", "crop_max_y",
+        "use_normal_map", "use_clamp", "use_color_ramp", "intensity", "contrast",
+        "saturation", "factor_red", "factor_green", "factor_blue", "use_preview_alpha",
+    ),
 }
 POTTER_TO_BLENDER_ANIMATION_PATH = {
     "transform.translation": "location",
@@ -388,18 +396,6 @@ def _physics_modifier_settings(obj, modifier):
     if point_cache is not None:
         result["point_cache"] = point_cache
     return result
-def _rna_property_is_default(block, key):
-    property_definition = block.bl_rna.properties.get(key)
-    if property_definition is None:
-        return False
-    try:
-        default = (property_definition.default_array
-                   if property_definition.is_array else property_definition.default)
-    except Exception:
-        return False
-    return plain(getattr(block, key)) == plain(default)
-
-
 def _color_ramp_settings(ramp):
     return {
         "color_mode": ramp.color_mode,
@@ -432,16 +428,19 @@ def _restore_color_ramp(ramp, values, owner):
         element.color = source["color"]
 
 
-def _color_ramp_is_default(ramp):
-    return _color_ramp_settings(ramp) == {
-        "color_mode": "RGB",
-        "hue_interpolation": "NEAR",
-        "interpolation": "LINEAR",
-        "elements": [
-            {"position": 0.0, "color": [0.0, 0.0, 0.0, 1.0]},
-            {"position": 1.0, "color": [1.0, 1.0, 1.0, 1.0]},
-        ],
-    }
+# Settings of a freshly created Image Texture. Blender's DNA values need not equal the RNA
+# declared defaults (ImageUser frame values, for one), so "default" is measured against a probe.
+IMAGE_TEXTURE_DEFAULTS = {}
+
+
+def _image_texture_defaults():
+    if not IMAGE_TEXTURE_DEFAULTS:
+        probe = bpy.data.textures.new("potter.image_texture_defaults", type="IMAGE")
+        try:
+            IMAGE_TEXTURE_DEFAULTS.update(_legacy_texture_settings(probe))
+        finally:
+            bpy.data.textures.remove(probe)
+    return IMAGE_TEXTURE_DEFAULTS
 
 
 def _image_texture_uses_image_fastpath(texture):
@@ -450,13 +449,14 @@ def _image_texture_uses_image_fastpath(texture):
             item.type == "IMAGE" and item.image == image
             for item in getattr(bpy.data, "textures", ())) != 1:
         return False
+    defaults = _image_texture_defaults()
     settings = _legacy_texture_settings(texture)
     image_user_settings = settings.pop("image_user", {})
     color_ramp = settings.pop("color_ramp", None)
-    return (all(_rna_property_is_default(texture, key) for key in settings)
-            and all(_rna_property_is_default(texture.image_user, key)
+    return (all(settings[key] == defaults[key] for key in settings)
+            and all(image_user_settings[key] == defaults["image_user"][key]
                     for key in image_user_settings)
-            and (color_ramp is None or _color_ramp_is_default(texture.color_ramp)))
+            and (color_ramp is None or color_ramp == defaults["color_ramp"]))
 
 
 def _rna_scalar_settings(block, omit=()):
@@ -468,6 +468,15 @@ def _rna_scalar_settings(block, omit=()):
     }
 
 
+# ImageUser.layer/pass/view are read-only in RNA, so the generic walk skips them. RNA reads
+# still return the DNA values, so export reads them directly.
+IMAGE_USER_MULTILAYER_KEYS = ("multilayer_layer", "multilayer_pass", "multilayer_view")
+
+
+def _image_user_multilayer_settings(image_user):
+    return {key: plain(getattr(image_user, key)) for key in IMAGE_USER_MULTILAYER_KEYS}
+
+
 def _legacy_texture_settings(texture):
     settings_keys = LEGACY_TEXTURE_SETTINGS.get(texture.type)
     if settings_keys is None:
@@ -475,12 +484,12 @@ def _legacy_texture_settings(texture):
     if texture.type == "IMAGE":
         if texture.use_nodes and texture.node_tree:
             raise ValueError("node-based image Texture %s cannot be exported" % texture.name_full)
-        settings = _rna_scalar_settings(
-            texture, omit=("name", "name_full", "type", "image", "image_user",
-                           "color_ramp", "use_nodes", "node_tree"))
+        settings = {key: plain(getattr(texture, key))
+                    for key in settings_keys if hasattr(texture, key)}
         if texture.color_ramp is not None:
             settings["color_ramp"] = _color_ramp_settings(texture.color_ramp)
         settings["image_user"] = _rna_scalar_settings(texture.image_user)
+        settings["image_user"].update(_image_user_multilayer_settings(texture.image_user))
         return settings
     return {key: plain(getattr(texture, key))
             for key in settings_keys if hasattr(texture, key)}
@@ -684,6 +693,15 @@ def _id_map(block, property_name):
     return value if isinstance(value, dict) else {}
 
 
+def _image_alpha_mode(image):
+    # Blender's alpha mode under the names the .blend importer reads. CHANNEL_PACKED holds straight colour.
+    if image.alpha_mode == "PREMUL":
+        return "premultiplied"
+    if image.alpha_mode == "NONE":
+        return "none"
+    return "straight"
+
+
 def images_dump():
     result = []
     for image in bpy.data.images:
@@ -704,6 +722,7 @@ def images_dump():
         result.append({"name": image.name_full, "potter_id": image.get("potter.id"),
                        "library": library_reference(image), "filepath": filepath,
                        "source": image.source, "colorspace": colorspace,
+                       "alpha_mode": _image_alpha_mode(image),
                        "potter_image": image_model})
     return result
 
@@ -2263,6 +2282,8 @@ def material_dump(material):
 
 
 def dump_all():
+    # The probe texture is created and removed here, before any loop iterates bpy.data.textures.
+    _image_texture_defaults()
     for volume in getattr(bpy.data, "volumes", ()):
         try:
             volume.grids.load()
@@ -2466,6 +2487,34 @@ def _restore_modifier_id_references(modifier, params, id_lookup, texture_lookup)
         setattr(modifier, key, candidate)
 
 
+# ImageUser.layer/pass/view are DNA shorts that RNA exposes read-only (rna_image.cc:877-890),
+# so RNA writes are refused. Blender 5.2.2 source/blender/makesdna/DNA_image_types.h, struct
+# ImageUser (sizeof 40 on 64-bit): scene 0, framenr 8, frames 12, offset 16, sfra 20, cycl 24,
+# multiview_eye 25, pass 26, tile 28, multi_index 32, view 34, layer 36, flag 38.
+IMAGE_USER_MULTILAYER_DNA_OFFSETS = {
+    "multilayer_pass": 26,
+    "multilayer_view": 34,
+    "multilayer_layer": 36,
+}
+
+
+def _restore_image_user_multilayer(image_user, values, owner):
+    if not values:
+        return
+    if bpy.app.version[:2] != (5, 2):
+        raise ValueError("%s cannot restore multilayer selection on Blender %s; "
+                         "the ImageUser DNA offsets are pinned to 5.2"
+                         % (owner, bpy.app.version_string))
+    address = image_user.as_pointer()
+    for key, value in values.items():
+        if not isinstance(value, int) or not 0 <= value <= 32767:
+            raise ValueError("%s has invalid %s" % (owner, key))
+        offset = address + IMAGE_USER_MULTILAYER_DNA_OFFSETS[key]
+        ctypes.c_short.from_address(offset).value = value
+        if getattr(image_user, key) != value:
+            raise ValueError("%s cannot restore %s" % (owner, key))
+
+
 def _legacy_textures_from_doc(doc, image_map):
     textures = {}
     adapter = doc.get("compatibility", {}).get("blender_adapter", {})
@@ -2493,8 +2542,16 @@ def _legacy_textures_from_doc(doc, image_map):
                     raise ValueError("legacy Image Texture references unavailable Image %s"
                                      % image_id)
                 texture.image = image
-            set_rna(texture.image_user, image_user_settings, strict=True,
-                    owner="legacy Image Texture %s image_user" % texture_id)
+            image_user_owner = "legacy Image Texture %s image_user" % texture_id
+            multilayer_settings = {key: image_user_settings[key]
+                                   for key in IMAGE_USER_MULTILAYER_KEYS
+                                   if key in image_user_settings}
+            set_rna(texture.image_user,
+                    {key: value for key, value in image_user_settings.items()
+                     if key not in IMAGE_USER_MULTILAYER_KEYS},
+                    strict=True, owner=image_user_owner)
+            _restore_image_user_multilayer(texture.image_user, multilayer_settings,
+                                           image_user_owner)
         elif image_user_settings:
             raise ValueError("non-IMAGE legacy Texture has image_user settings")
         if color_ramp_settings is not None:
@@ -6407,6 +6464,9 @@ def export_doc(doc, target, pack, scene_hash, context):
             image.colorspace_settings.name = colorspace
         pixels = item.get("pixels")
         if sidecar is None and png_bytes is None and pixels is not None:
+            image.alpha_mode = {"straight": "STRAIGHT", "premultiplied": "PREMUL", "none": "NONE"}[
+                item.get("alpha_mode", "straight")
+            ]
             _pack_image(image, [channel for pixel in pixels for channel in pixel])
         if item.get("source") == "packed" and image.packed_file is None:
             image.pack()

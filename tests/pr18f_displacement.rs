@@ -528,10 +528,11 @@ fn smooth_then_wave_matches_blender() {
     assert_points("smooth then wave", &mesh, &CHAIN_SMOOTH_THEN_WAVE);
 }
 
-/// Blender's 4x3 test texture: `pixels[y * 4 + x]` with row 0 at the bottom, values k/255.
+/// Blender's 4x3 test texture, values k/255 at Blender's `(x, y)`, listed top row first. Potter stores
+/// rows top-down (`set_pixels` row 0 is the top), while Blender's flat buffer has row 0 at the bottom.
 fn texture_pixels() -> Value {
     let mut pixels = Vec::new();
-    for y in 0..3_u32 {
+    for y in (0..3_u32).rev() {
         for x in 0..4_u32 {
             pixels.push(json!([
                 f64::from((x * 37 + y * 11) % 256) / 255.0,
@@ -756,14 +757,15 @@ fn displace_texture_uses_named_native_uv_layer() -> Result<(), Box<dyn std::erro
     ];
     let mesh = scene_subject(&operations, None)?;
     // Blender 5.2.2 output of tests/fixtures/pr18f_displacement/generate_named_uv_exact_oracle.py
-    // (box-projected corner UVs, V flipped to Blender's V-up; primitive UV layer removed first).
+    // (uv.cube_project corner UVs with the uv.transform applied to Potter's stored UVs; primitive UV
+    // layer removed first).
     // Blender's primitive plane orders its corners (-1,-1), (1,-1), (-1,1), (1,1); Potter orders them
     // (-1,-1), (1,-1), (1,1), (-1,1). The Blender values below are reindexed to Potter's order by rest
     // position (Blender vertices 2 and 3 swap), so each position's displacement is unchanged.
     let expected = [
-        [-0.5, -1.0, 0.0],
-        [1.0, -1.0, 0.0],
-        [0.5, 1.0, 0.0],
+        [-1.25, -1.0, 0.0],
+        [0.5, -1.0, 0.0],
+        [0.75, 1.0, 0.0],
         [-1.0, 1.0, 0.0],
     ];
     assert_plane("displace texture named UV layer", &mesh, &expected);

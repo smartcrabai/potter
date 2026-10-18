@@ -21,7 +21,7 @@ use serde_json::{Map, Value, json};
 use crate::{
     error::{ErrorCode, PotError, Result},
     image::{
-        ImageData, ImageInterpolation,
+        ColourCache, ImageData, ImageInterpolation, ImageStorage,
         storage::{ImageUserSelection, load_image_data_for_legacy_texture},
     },
     model::{Id, Image, ImageAlphaMode, ImageColorspace, SceneDoc, migrate},
@@ -238,7 +238,7 @@ pub(crate) struct ImageSamplerSettings {
     pub(crate) use_alpha: bool,
     pub(crate) calculate_alpha: bool,
     pub(crate) invert_alpha: bool,
-    pub(crate) brightness: f32,
+    pub(crate) intensity: f32,
     pub(crate) contrast: f32,
     pub(crate) saturation: f32,
     pub(crate) factor_red: f32,
@@ -270,7 +270,7 @@ pub(crate) const DEFAULT_IMAGE_SETTINGS: ImageSamplerSettings = ImageSamplerSett
     use_alpha: true,
     calculate_alpha: false,
     invert_alpha: false,
-    brightness: 1.0,
+    intensity: 1.0,
     contrast: 1.0,
     saturation: 1.0,
     factor_red: 1.0,
@@ -470,14 +470,16 @@ fn texture_settings_keys(texture_type: &str) -> &'static [&'static str] {
             "crop_min_y",
             "crop_max_x",
             "crop_max_y",
-            "brightness",
+            "intensity",
             "contrast",
             "saturation",
             "factor_red",
             "factor_green",
             "factor_blue",
+            "use_normal_map",
             "use_clamp",
             "use_color_ramp",
+            "use_preview_alpha",
             "color_ramp",
             "image_user",
         ],
@@ -623,6 +625,8 @@ fn validate_image_settings(id: &str, settings: &Map<String, Value>) -> Result<()
             | "use_checker_odd"
             | "use_checker_even"
             | "use_clamp"
+            | "use_normal_map"
+            | "use_preview_alpha"
             | "use_color_ramp" => value.is_boolean(),
             "extension" => enum_values(key)
                 .is_some_and(|values| value.as_str().is_some_and(|value| values.contains(&value))),
@@ -634,7 +638,7 @@ fn validate_image_settings(id: &str, settings: &Map<String, Value>) -> Result<()
             "crop_min_x" | "crop_min_y" | "crop_max_x" | "crop_max_y" => {
                 image_number_in_range(value, -10.0, 10.0)
             }
-            "brightness" | "saturation" | "factor_red" | "factor_green" | "factor_blue" => {
+            "intensity" | "saturation" | "factor_red" | "factor_green" | "factor_blue" => {
                 image_number_in_range(value, 0.0, 2.0)
             }
             "contrast" => image_number_in_range(value, 0.0, 5.0),
@@ -837,7 +841,7 @@ fn parse_image_settings(settings: &Map<String, Value>) -> Result<ImageSamplerSet
         .get("invert_alpha")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    parsed.brightness = setting_f32(settings, "brightness", 1.0);
+    parsed.intensity = setting_f32(settings, "intensity", 1.0);
     parsed.contrast = setting_f32(settings, "contrast", 1.0);
     parsed.saturation = setting_f32(settings, "saturation", 1.0);
     parsed.factor_red = setting_f32(settings, "factor_red", 1.0);
@@ -1112,7 +1116,7 @@ fn default_settings(texture_type: &str) -> Map<String, Value> {
             "use_calculate_alpha":false,"invert_alpha":false,"extension":"REPEAT","repeat_x":1,
             "repeat_y":1,"use_mirror_x":false,"use_mirror_y":false,"use_checker_odd":true,
             "use_checker_even":false,"checker_distance":0.0,"crop_min_x":0.0,"crop_min_y":0.0,
-            "crop_max_x":1.0,"crop_max_y":1.0,"brightness":1.0,"contrast":1.0,"saturation":1.0,
+            "crop_max_x":1.0,"crop_max_y":1.0,"intensity":1.0,"contrast":1.0,"saturation":1.0,
             "factor_red":1.0,"factor_green":1.0,"factor_blue":1.0,"use_clamp":false,
             "use_color_ramp":false,
             "color_ramp":{
@@ -1314,6 +1318,9 @@ pub fn resolve_texture(
                             pixels: Vec::new(),
                             tiles: BTreeMap::default(),
                             interpolation: ImageInterpolation::Linear,
+                            srgb: false,
+                            storage: ImageStorage::default(),
+                            colour: ColourCache::default(),
                         },
                         settings: sampler,
                     },
@@ -2068,11 +2075,10 @@ fn sample_image(
     if !settings.calculate_alpha && alpha != 1.0 && alpha > 1e-4 {
         rgb = rgb.map(|value| value / alpha);
     }
-    rgb[0] = settings.factor_red * ((rgb[0] - 0.5) * settings.contrast + settings.brightness - 0.5);
+    rgb[0] = settings.factor_red * ((rgb[0] - 0.5) * settings.contrast + settings.intensity - 0.5);
     rgb[1] =
-        settings.factor_green * ((rgb[1] - 0.5) * settings.contrast + settings.brightness - 0.5);
-    rgb[2] =
-        settings.factor_blue * ((rgb[2] - 0.5) * settings.contrast + settings.brightness - 0.5);
+        settings.factor_green * ((rgb[1] - 0.5) * settings.contrast + settings.intensity - 0.5);
+    rgb[2] = settings.factor_blue * ((rgb[2] - 0.5) * settings.contrast + settings.intensity - 0.5);
     if settings.use_clamp {
         rgb = rgb.map(|value| value.max(0.0));
     }
@@ -3633,9 +3639,11 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        BlenderRng, DEFAULT_IMAGE_SETTINGS, ImageData, ImageInterpolation, LegacyTexture,
-        ResolvedTexture, TextureSource, cell_noise_v3, parse_record, record_value, sample,
+        BlenderRng, ColourCache, DEFAULT_IMAGE_SETTINGS, ImageData, ImageInterpolation,
+        ImageStorage, LegacyTexture, ResolvedTexture, TextureSource, cell_noise_v3, parse_record,
+        record_value, sample,
     };
+    use crate::image::Precision;
     use crate::{
         hash,
         image::ImageTileData,
@@ -3666,6 +3674,9 @@ mod tests {
             pixels: vec![[0.2, 0.4, 0.6, 1.0], [0.8, 0.7, 0.1, 1.0]],
             tiles: BTreeMap::default(),
             interpolation: ImageInterpolation::Linear,
+            srgb: false,
+            storage: ImageStorage::default(),
+            colour: ColourCache::default(),
         }
     }
 
@@ -4024,9 +4035,14 @@ mod tests {
                     width: 1,
                     height: 1,
                     pixels: vec![[0.7, 0.2, 0.1, 1.0]],
+                    precision: Precision::Float,
+                    colour: ColourCache::default(),
                 },
             )]),
             interpolation: ImageInterpolation::Linear,
+            srgb: false,
+            storage: ImageStorage::default(),
+            colour: ColourCache::default(),
         };
         for tile in [1001, 1002] {
             let texture = parse_record(
@@ -4131,6 +4147,9 @@ mod tests {
             pixels: vec![[0.2, 0.4, 0.6, 0.5]],
             tiles: BTreeMap::default(),
             interpolation: ImageInterpolation::Linear,
+            srgb: false,
+            storage: ImageStorage::default(),
+            colour: ColourCache::default(),
         };
         let LegacyTexture::ImageRecord { sampler, .. } = texture else {
             panic!("IMAGE record");
@@ -4178,6 +4197,9 @@ mod tests {
             pixels: Vec::new(),
             tiles: BTreeMap::default(),
             interpolation: ImageInterpolation::Linear,
+            srgb: false,
+            storage: ImageStorage::default(),
+            colour: ColourCache::default(),
         };
         let mut rng = BlenderRng::seed(0);
         let result = sample(
@@ -4226,6 +4248,9 @@ mod tests {
             pixels: vec![[1.0, 0.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]],
             tiles: BTreeMap::default(),
             interpolation: ImageInterpolation::Linear,
+            srgb: false,
+            storage: ImageStorage::default(),
+            colour: ColourCache::default(),
         };
         let mut settings = DEFAULT_IMAGE_SETTINGS;
         settings.interpolation = false;
@@ -4302,6 +4327,9 @@ mod tests {
             ]],
             tiles: BTreeMap::default(),
             interpolation: ImageInterpolation::Linear,
+            srgb: false,
+            storage: ImageStorage::default(),
+            colour: ColourCache::default(),
         };
         let mut settings = DEFAULT_IMAGE_SETTINGS;
         settings.interpolation = false;
@@ -4336,6 +4364,9 @@ mod tests {
             pixels: vec![[0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]],
             tiles: BTreeMap::default(),
             interpolation: ImageInterpolation::Linear,
+            srgb: false,
+            storage: ImageStorage::default(),
+            colour: ColourCache::default(),
         };
         let mut settings = DEFAULT_IMAGE_SETTINGS;
         settings.filter_size = 5.0;

@@ -89,7 +89,7 @@ fn scene_schema() -> Value {
     let mut root = base("Potter scene document");
     root["required"] = json!(["schema_version", "scene_id", "revision", "active_scene"]);
     root["properties"] = json!({
-        "schema_version":{"const":3},
+        "schema_version":{"const":4},
         "scene_id":{"type":"string","format":"uuid"},
         "revision":{"type":"integer","minimum":0,"maximum":9_007_199_254_740_991_u64},
         "active_scene":{"$ref":"#/$defs/id"},
@@ -109,6 +109,9 @@ fn scene_schema() -> Value {
         "history":{"$ref":"#/$defs/history"}
     });
     root["additionalProperties"] = json!(false);
+    // The scene document requires `interpolation`; the operation schema defaults it to linear.
+    let mut texture_ref = texture_ref_schema();
+    texture_ref["required"] = json!(["image", "interpolation"]);
     root["$defs"] = json!({
         "legacy_texture_resource":{"type":"object","required":["storage","kind","texture_type"],"properties":{"storage":{"const":"inline"},"kind":{"const":"legacy_texture"},"texture_type":{"enum":["CLOUDS","MARBLE","WOOD","MAGIC","BLEND","STUCCI","NOISE","DISTORTED_NOISE","VORONOI","MUSGRAVE","IMAGE"]},"settings":{"type":"object","properties":{"noise_scale":{"type":"number"},"noise_depth":{"type":"integer"},"noise_basis":{"type":"string"},"noise_type":{"type":"string"},"noise_basis_2":{"type":"string"},"turbulence":{"type":"number"},"cloud_type":{"type":"string"},"wood_type":{"type":"string"},"marble_type":{"type":"string"},"stucci_type":{"type":"string"},"distortion":{"type":"number"},"musgrave_type":{"type":"string"},"dimension_max":{"type":"number"},"lacunarity":{"type":"number"},"offset":{"type":"number"},"gain":{"type":"number"},"noise_intensity":{"type":"number"},"weight_1":{"type":"number"},"weight_2":{"type":"number"},"weight_3":{"type":"number"},"weight_4":{"type":"number"},"minkovsky_exponent":{"type":"number"},"distance_metric":{"type":"string"},"color_mode":{"type":"string"},"noise_distortion":{"type":"string"},"progression":{"enum":["LINEAR","QUADRATIC","EASING","DIAGONAL","SPHERICAL","QUADRATIC_SPHERE","RADIAL"]},"use_flip_axis":{"enum":["HORIZONTAL","VERTICAL"]}},"additionalProperties":false}},"additionalProperties":false},
         "id":id_schema(),
@@ -138,7 +141,7 @@ fn scene_schema() -> Value {
         "camera":{"type":"object","required":["projection","lens_mm","sensor_width_mm","ortho_scale","clip_start","clip_end","shift"],"properties":{"projection":{"enum":["perspective","orthographic"]},"lens_mm":{"type":"number"},"sensor_width_mm":{"type":"number"},"ortho_scale":{"type":"number"},"clip_start":{"type":"number"},"clip_end":{"type":"number"},"shift":{"$ref":"#/$defs/vec2"}},"additionalProperties":false},
         "light":{"type":"object","required":["light_type","color","energy","radius","spot_size","spot_blend"],"properties":{"light_type":{"enum":["point","sun","spot","area"]},"color":{"$ref":"#/$defs/vec3"},"energy":{"type":"number"},"radius":{"type":"number"},"soft_falloff":{"type":"boolean"},"spot_size":{"type":"number"},"spot_blend":{"type":"number"}},"additionalProperties":false},
         "material":{"type":"object","required":["name","base_color","metallic","roughness","emission_color","emission_strength","transmission","ior","double_sided","node_tree","base_color_texture","roughness_texture","metallic_texture","normal_texture"],"properties":{"name":{"type":"string"},"base_color":{"type":"array","items":{"type":"number","minimum":0,"maximum":1},"minItems":4,"maxItems":4},"metallic":{"type":"number","minimum":0,"maximum":1},"roughness":{"type":"number","minimum":0,"maximum":1},"emission_color":{"$ref":"#/$defs/vec3"},"emission_strength":{"type":"number","minimum":0},"transmission":{"type":"number","minimum":0,"maximum":1},"ior":{"type":"number","exclusiveMinimum":0},"double_sided":{"type":"boolean"},"node_tree":{"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]},"base_color_texture":{"oneOf":[{"$ref":"#/$defs/texture_ref"},{"type":"null"}]},"roughness_texture":{"oneOf":[{"$ref":"#/$defs/texture_ref"},{"type":"null"}]},"metallic_texture":{"oneOf":[{"$ref":"#/$defs/texture_ref"},{"type":"null"}]},"normal_texture":{"oneOf":[{"$ref":"#/$defs/texture_ref"},{"type":"null"}]}},"additionalProperties":false},
-        "texture_ref":{"type":"object","required":["image","interpolation"],"properties":{"image":{"$ref":"#/$defs/id"},"uv_layer":{"type":["string","null"],"minLength":1,"default":null},"interpolation":{"enum":["linear","closest"]}},"additionalProperties":false},
+        "texture_ref":texture_ref,
         "world":{"type":"object","required":["color","strength"],"properties":{"color":{"$ref":"#/$defs/vec3"},"strength":{"type":"number","minimum":0}},"additionalProperties":false},
         "keyframe":keyframe_schema(),
         "fcurve":fcurve_schema(),
@@ -357,7 +360,7 @@ fn complete_data_block_schemas(defs: &mut Value) {
 /// A texture reference: an image, an optional UV layer name (`null` is the render layer), and the
 /// sampler interpolation.
 fn texture_ref_schema() -> Value {
-    json!({"type":"object","required":["image"],"properties":{"image":id_schema(),"uv_layer":{"type":["string","null"],"minLength":1,"default":null},"interpolation":{"enum":["linear","closest"],"default":"linear"}},"additionalProperties":false})
+    json!({"type":"object","required":["image"],"properties":{"image":id_schema(),"uv_layer":{"type":["string","null"],"minLength":1,"default":null},"interpolation":{"enum":["linear","closest"],"default":"linear"},"extension":{"enum":["repeat","extend","clip","mirror"],"default":"repeat"}},"additionalProperties":false})
 }
 
 fn nullable_texture_ref_schema() -> Value {
@@ -661,13 +664,15 @@ fn image_texture_settings_schema() -> Value {
             "crop_min_y":{"type":"number","minimum":-10.0,"maximum":10.0},
             "crop_max_x":{"type":"number","minimum":-10.0,"maximum":10.0},
             "crop_max_y":{"type":"number","minimum":-10.0,"maximum":10.0},
-            "brightness":{"type":"number","minimum":0.0,"maximum":2.0},
+            "intensity":{"type":"number","minimum":0.0,"maximum":2.0},
             "contrast":{"type":"number","minimum":0.0,"maximum":5.0},
             "saturation":{"type":"number","minimum":0.0,"maximum":2.0},
             "factor_red":{"type":"number","minimum":0.0,"maximum":2.0},
             "factor_green":{"type":"number","minimum":0.0,"maximum":2.0},
             "factor_blue":{"type":"number","minimum":0.0,"maximum":2.0},
             "use_clamp":{"type":"boolean"},
+            "use_normal_map":{"type":"boolean"},
+            "use_preview_alpha":{"type":"boolean"},
             "use_color_ramp":{"type":"boolean"},
             "color_ramp":{"type":"object"},
             "image_user":{"type":"object"}
@@ -2669,7 +2674,6 @@ mod tests {
         );
         Ok(())
     }
-
     #[test]
     fn modifier_and_constraint_schemas_use_rna_parameter_tables() -> crate::error::Result<()> {
         let modifier_create = schema("operations", Some("modifier.create"))?;

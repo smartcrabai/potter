@@ -32,9 +32,7 @@
         "thickness": 0.2,
         "solidify_mode": "NON_MANIFOLD"
       },
-      "expectation": "known_gap",
-      "owner": "D",
-      "potter_changes": false
+      "expectation": "equal_active"
     },
     {
       "id": "decimate_half",
