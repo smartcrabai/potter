@@ -427,7 +427,7 @@ pub(super) fn mesh_deform(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
 }
 
 /// The `Bind data required` error of a Mesh Deform modifier without bind data, as Blender reports it
-/// (MOD_meshdeform.cc). The modifier leaves the mesh unchanged; the warning names the modifier.
+/// (`MOD_meshdeform.cc`). The modifier leaves the mesh unchanged; the warning names the modifier.
 pub(super) fn mesh_deform_unbound_warning(modifier: &Modifier) -> PotError {
     PotError::with_details(
         ErrorCode::EvaluationFailed,

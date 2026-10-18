@@ -1343,7 +1343,7 @@ fn skin_float_widen(point: [f32; 3]) -> DVec3 {
 
 /// Blender's `half_v2`: the seam and solitary-box offset, `(r0 + r1) * 0.5` in `f32`.
 fn skin_half_radius_sum(radius: [f64; 2]) -> f32 {
-    (radius[0] as f32 + radius[1] as f32) * 0.5
+    f32::midpoint(radius[0] as f32, radius[1] as f32)
 }
 
 fn skin_float_length(vector: [f32; 3]) -> f32 {

@@ -2007,7 +2007,9 @@ impl<'a> BlendFile<'a> {
             .ok_or_else(|| "Blender DNA schema does not contain float".to_owned())?;
         let values = self.read_scalar_array(pointer, float_count, float_type)?;
         let coords = values
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|xyz| Value::Array(xyz.to_vec()))
             .collect();
         let mut binding = Map::new();

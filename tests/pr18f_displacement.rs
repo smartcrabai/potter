@@ -1510,6 +1510,12 @@ fn legacy_noise_intensity(draw: u32) -> f32 {
 #[test]
 fn legacy_noise_texture_follows_the_documented_modifier_stream()
 -> Result<(), Box<dyn std::error::Error>> {
+    const PLANE_CORNERS: [[f64; 3]; 4] = [
+        [-1.0, -1.0, 0.0],
+        [1.0, -1.0, 0.0],
+        [1.0, 1.0, 0.0],
+        [-1.0, 1.0, 0.0],
+    ];
     let operations = [
         json!({"op":"node.create","id":"subject","kind":"plane","params":{"size":2.0}}),
         json!({"op":"texture.create","id":"noise_tex","texture_type":"NOISE"}),
@@ -1518,12 +1524,6 @@ fn legacy_noise_texture_follows_the_documented_modifier_stream()
     // Preview uses base seed 0. Each vertex consumes one draw, in vertex order, from the stream of
     // the `deform` modifier on `subject`; the displacement is `(intensity - mid_level) * strength`
     // along X, with strength 1 and mid_level 0.5.
-    const PLANE_CORNERS: [[f64; 3]; 4] = [
-        [-1.0, -1.0, 0.0],
-        [1.0, -1.0, 0.0],
-        [1.0, 1.0, 0.0],
-        [-1.0, 1.0, 0.0],
-    ];
     let mut stream = documented_modifier_stream(0, "subject", 0);
     let expected = PLANE_CORNERS.map(|[x, y, z]| {
         let intensity = f64::from(legacy_noise_intensity(stream.next_u32()));

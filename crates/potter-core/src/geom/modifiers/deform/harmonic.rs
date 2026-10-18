@@ -800,7 +800,7 @@ impl HarmonicFactor {
                 system.rows.as_ptr(),
                 system.cols.as_ptr(),
                 system.values.as_ptr(),
-                &mut handle,
+                &raw mut handle,
             )
         };
         if status != 0 {

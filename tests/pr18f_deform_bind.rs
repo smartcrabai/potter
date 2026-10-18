@@ -1450,8 +1450,8 @@ fn laplacian_deform_inverted_group_anchors_interior_vertices() -> TestResult {
 }
 
 /// Analytic: the bind stores the rest coordinates of the source grid. No Blender corrective bind oracle covers
-/// this 5x5 grid; the Blender corrective cases in tests/fixtures/pr18f_smoothing/blender_oracle.json use a 4x6
-/// tube.
+/// this 5x5 grid; the Blender corrective cases in `tests/fixtures/pr18f_smoothing/blender_oracle.json`
+/// use a 4x6 tube.
 #[test]
 fn corrective_smooth_bind_stores_rest_coordinates() -> TestResult {
     let directory = tempdir()?;
