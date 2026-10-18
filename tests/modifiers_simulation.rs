@@ -1974,10 +1974,7 @@ with open(os.path.join(root, 'particle_cli_expected.json'), 'w', encoding='utf-8
     let instancer_id = node_id_by_name("ParticleInstancer")?;
     let emitter_id = node_id_by_name("ParticleEmitter")?;
     let instancer_node = &document["nodes"][instancer_id.as_str()];
-    assert_eq!(
-        instancer_node["properties"]["blender_object_metadata"]["rna_properties"]["track_axis"],
-        "POS_Z",
-    );
+    assert_eq!(instancer_node["track_axis"], "POS_Z",);
     let emitter_node = &document["nodes"][emitter_id.as_str()];
     let particle_settings = emitter_node["properties"]["physics_particle_systems"]
         .as_object()
@@ -2062,8 +2059,7 @@ with open(os.path.join(root, 'particle_cli_expected.json'), 'w', encoding='utf-8
         "applied particle corner data",
     )?;
     assert_eq!(
-        applied_document["nodes"][instancer_id.as_str()]["properties"]["blender_object_metadata"]["rna_properties"]
-            ["track_axis"],
+        applied_document["nodes"][instancer_id.as_str()]["track_axis"],
         "POS_Z",
     );
     assert!(
@@ -2168,8 +2164,7 @@ with open(output, 'w', encoding='utf-8') as handle:
         })
         .ok_or("reimported ParticleInstancer is missing")?;
     assert_eq!(
-        reimported_document["nodes"][reimported_instancer_id.as_str()]["properties"]["blender_object_metadata"]
-            ["rna_properties"]["track_axis"],
+        reimported_document["nodes"][reimported_instancer_id.as_str()]["track_axis"],
         "POS_Z",
     );
     assert!(
@@ -3770,10 +3765,7 @@ with open(output, 'w', encoding='utf-8') as handle:
         })
         .ok_or("reimported Hair path instancer is missing")?;
     let reimported_instancer = &reimported_document["nodes"][reimported_instancer_id.as_str()];
-    assert_eq!(
-        reimported_instancer["properties"]["blender_object_metadata"]["rna_properties"]["track_axis"],
-        "POS_Z",
-    );
+    assert_eq!(reimported_instancer["track_axis"], "POS_Z",);
     assert!(
         reimported_instancer["modifiers"]
             .as_array()

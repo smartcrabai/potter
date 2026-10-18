@@ -19,7 +19,7 @@ use crate::{
         uv_layers::{self, UvLayer},
     },
     hash,
-    model::{ConstraintType, DataBlock, Id, Modifier, Node, SceneDoc, VertexGroup},
+    model::{ConstraintType, DataBlock, Id, Modifier, Node, SceneDoc, TrackAxis, VertexGroup},
     params::{self, ParameterFamily},
 };
 
@@ -3074,25 +3074,15 @@ fn particle_system_seed(settings: &serde_json::Value) -> Result<u32> {
     })
 }
 
-/// Maps Blender `Object.track_axis` enum values to the `trackflag` byte used by the modifier.
+/// Blender `Object.track_axis` (`trackflag`) as the modifier's track byte; the `NEG_*` axes add 3.
 fn object_track_flag(node: &Node) -> u32 {
-    let Some(track_axis) = node
-        .properties
-        .get("blender_object_metadata")
-        .and_then(|metadata| metadata.get("rna_properties"))
-        .and_then(|properties| properties.get("track_axis"))
-        .and_then(serde_json::Value::as_str)
-    else {
-        return 1; // Blender initializes new Objects with `OB_POSY`.
-    };
-    match track_axis {
-        "POS_X" => 0,
-        "POS_Y" => 1,
-        "POS_Z" => 2,
-        "NEG_X" => 3,
-        "NEG_Y" => 4,
-        "NEG_Z" => 5,
-        _ => 0,
+    match node.track_axis {
+        TrackAxis::PosX => 0,
+        TrackAxis::PosY => 1,
+        TrackAxis::PosZ => 2,
+        TrackAxis::NegX => 3,
+        TrackAxis::NegY => 4,
+        TrackAxis::NegZ => 5,
     }
 }
 

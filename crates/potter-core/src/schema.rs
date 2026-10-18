@@ -175,6 +175,9 @@ fn scene_schema() -> Value {
         "type":"array",
         "items":{"enum":["data","object"]}
     });
+    root["$defs"]["node"]["properties"]["track_axis"] =
+        json!({"enum":["POS_X","POS_Y","POS_Z","NEG_X","NEG_Y","NEG_Z"]});
+    root["$defs"]["node"]["properties"]["up_axis"] = json!({"enum":["X","Y","Z"]});
     root["$defs"]["data_block"]["properties"]["materials"] = nullable_id_array_schema();
     complete_scene_schema(&mut root);
     root

@@ -1823,6 +1823,7 @@ def object_dump(obj):
             "library": library_reference(obj), "override_library": _override_dump(obj),
             "data_name": data.name_full if data else None, "parent": obj.parent.name_full if obj.parent else None,
             "parent_type": obj.parent_type, "parent_bone": obj.parent_bone,
+            "track_axis": obj.track_axis, "up_axis": obj.up_axis,
             "instance_collection": obj.instance_collection.name_full
             if getattr(obj, "instance_collection", None) else None,
             "matrix_parent_inverse": matrix_rows(obj.matrix_parent_inverse),
@@ -1845,7 +1846,7 @@ def object_dump(obj):
             "vertex_groups": _vertex_groups_dump(obj), "rigid_body": _rigid_body_dump(obj),
             "force_field": _force_field_dump(obj), "custom_properties": custom_props(obj),
             "volume_bounds": volume_bounds,
-            "rna_properties": rna_props(obj, ("data", "parent", "children", "users_collection", "modifiers", "constraints", "animation_data", "material_slots"))}
+            "rna_properties": rna_props(obj, ("data", "parent", "children", "users_collection", "modifiers", "constraints", "animation_data", "material_slots", "track_axis", "up_axis"))}
 
 
 def action_dump(action):
@@ -6699,10 +6700,12 @@ def export_doc(doc, target, pack, scene_hash, context):
         obj.hide_viewport = not item.get("visible", True)
         obj.hide_render = not item.get("render_visible", True)
         obj.hide_select = not item.get("selectable", True)
+        obj.track_axis = item.get("track_axis", "POS_Y")
+        obj.up_axis = item.get("up_axis", "Z")
         set_props(obj, item.get("properties", {}))
         visibility_rna = {
             key: value for key, value in (metadata.get("rna_properties") or {}).items()
-            if key == "track_axis" or key.startswith("visible_")
+            if key.startswith("visible_")
             or (key.startswith("hide_")
                 and key not in ("hide_viewport", "hide_render", "hide_select"))
         }

@@ -31,8 +31,8 @@ use crate::{
         Material, MaterialLink, Modifier, MovieClip, MovieTracking, NlaBlendType, NlaExtrapolation,
         NlaStrip, NlaTrack, Node, ParentType, Profile, Registry, RenderSettings, RigidBody,
         RigidBodyShape, RigidBodyType, RigidBodyWorld, Scene, SceneDoc, ShapeKey, ShapeKeyData,
-        SurfaceData, SurfacePoint, TextObjectData, TimelineMarker, Transform, UnitSettings,
-        VertexGroup, ViewLayer, World,
+        SurfaceData, SurfacePoint, TextObjectData, TimelineMarker, TrackAxis, Transform,
+        UnitSettings, UpAxis, VertexGroup, ViewLayer, World,
     },
     sequencer::{
         EffectType as SequenceEffectType, RetimingKey, Strip as SequenceStrip, StripBlendType,
@@ -2681,6 +2681,8 @@ fn build_imported_graph(
             },
             parent_bone,
             parent_inverse,
+            track_axis: object_axis(item, "track_axis")?,
+            up_axis: object_axis(item, "up_axis")?,
             transform,
             data: data_id,
             materials: material_slots,
@@ -3378,6 +3380,15 @@ fn optional_array<'a>(raw: &'a Value, key: &str) -> Result<&'a [Value]> {
         None => Ok(&[]),
         Some(Value::Array(values)) => Ok(values),
         Some(_) => Err(invalid_intermediate(&format!("invalid `{key}` array"))),
+    }
+}
+/// Reads an optional Blender axis enum through its typed `Node` representation; absent keys take
+/// Blender's new-object default.
+fn object_axis<T: serde::de::DeserializeOwned + Default>(raw: &Value, key: &str) -> Result<T> {
+    match raw.get(key) {
+        None => Ok(T::default()),
+        Some(value) => serde_json::from_value(value.clone())
+            .map_err(|_| invalid_intermediate(&format!("invalid `{key}` axis"))),
     }
 }
 fn parse_rigid_body_world(value: &Value) -> Result<RigidBodyWorld> {
