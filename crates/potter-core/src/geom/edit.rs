@@ -7063,7 +7063,10 @@ fn apply_inner(
     reject_unknown_fields(args, allowed_fields, "operation")?;
     let topology = is_topology_operation(operation, args);
     let multires_edit = topology || operation == "flip_normals";
-    let attribute_source_needed = topology && has_interpolatable_attributes(mesh);
+    // Blender's delete (bmesh_delete.cc) removes elements and keeps the survivors' own values, so
+    // it does not interpolate attributes; only the other topology edits do.
+    let attribute_source_needed =
+        topology && operation != "delete" && has_interpolatable_attributes(mesh);
     // Deleting faces also invalidates custom normals, so they are rebuilt as for topology edits.
     let normal_source_needed = topology && mesh.attributes.contains_key("custom_normal");
     let multires_source_needed = multires_edit

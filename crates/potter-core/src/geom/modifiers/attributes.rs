@@ -2270,9 +2270,9 @@ fn transfer_edge_attribute(
     Ok(())
 }
 
-/// UV Data Transfer. Blender transfers UVs by replacement only: `mix_mode` does not apply to a UV
-/// layer, since Blender's RNA offers REPLACE alone for UV and still replaces the UVs when other types
-/// are selected. Each corner moves toward its source by `factor * mask`. A corner the destination
+/// UV Data Transfer. Blender's float2 copy callback (`layerCopyValue_propfloat2`, customdata.cc,
+/// 5.2.2) interpolates by the factor for every mix mode except NOMIX, so `mix_mode` has no effect on
+/// UV layers. Each corner moves toward its source by `factor * mask`. A corner the destination
 /// layer lacks starts at Blender's generated `[0, 0]` (V-up), which is `[0, 1]` in the V-down store.
 fn transfer_uv(
     destination: &mut Mesh,
