@@ -2511,7 +2511,7 @@ fn subdivision(
         let ordinals =
             subdivision_normals::corner_numbering(&samples.corners, &sizes, levels as u32);
         let mut offset = 0;
-        for face in result.faces.iter_mut() {
+        for face in &mut result.faces {
             let count = face.vertices.len();
             let start = (0..count)
                 .min_by_key(|&corner| ordinals[offset + corner])
@@ -2666,7 +2666,7 @@ fn rotate_corner_attributes(mesh: &mut Mesh, face_starts: &[usize], corner_perm:
         .zip(face_starts)
         .map(|(face, &start)| (format!("f{}", face.id), start))
         .collect();
-    for (key, attribute) in mesh.attributes.iter_mut() {
+    for (key, attribute) in &mut mesh.attributes {
         if key == "uv_layers" {
             continue;
         }
