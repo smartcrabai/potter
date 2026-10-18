@@ -71,6 +71,13 @@ fn apply_stroke(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resu
                     "/target",
                 )
             })?;
+        if dyntopo_edge_length.is_some() && has_multires_detail(engine, &node_id, &before) {
+            return Err(engine.error(
+                ErrorCode::InvalidOperation,
+                "dynamic topology is unavailable on a mesh with Multires detail",
+                "/dyntopo",
+            ));
+        }
         let multires_modifier = engine
             .doc
             .nodes
@@ -105,18 +112,7 @@ fn apply_stroke(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resu
             }
             (world_mesh, mesh_changed)
         };
-        if mesh_changed && dyntopo_edge_length.is_some() {
-            let original = engine
-                .doc
-                .data_blocks
-                .get(&data_id)
-                .and_then(|data| data.mesh.as_ref());
-            if let Some(original) = original
-                && !same_mesh_topology(original, &sculpted_mesh)
-            {
-                sculpted_mesh.attributes.remove("multires_displacement");
-            }
-        }
+
         if mesh_changed {
             let block = engine.doc.data_blocks.get_mut(&data_id).ok_or_else(|| {
                 PotError::new(ErrorCode::TargetNotFound, "mesh data block disappeared")
@@ -129,6 +125,17 @@ fn apply_stroke(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resu
         }
     }
     Ok(changed)
+}
+
+/// Whether the node carries Multires detail: a Multires modifier or stored `multires_displacement`.
+/// Dynamic topology would change the corner count those rows are keyed to, so it is refused.
+fn has_multires_detail(engine: &Engine<'_>, node_id: &Id, mesh: &Mesh) -> bool {
+    mesh.attributes.contains_key("multires_displacement")
+        || engine.doc.nodes.get(node_id).is_some_and(|node| {
+            node.modifiers
+                .iter()
+                .any(|modifier| modifier.modifier_type == "multires")
+        })
 }
 
 fn active_multires_modifier(
@@ -172,32 +179,6 @@ fn same_mesh_topology(left: &Mesh, right: &Mesh) -> bool {
             .eq(right.faces.iter().map(|face| (face.id, &face.vertices)))
 }
 
-// Match Blender 5.2.2's `ModifierTypeType::OnlyDeform` classification before Multires.
-fn is_only_deform_modifier(modifier_type: &str) -> bool {
-    matches!(
-        modifier_type,
-        "armature"
-            | "cast"
-            | "corrective_smooth"
-            | "curve"
-            | "displace"
-            | "hook"
-            | "lattice"
-            | "laplacian_deform"
-            | "laplacian_smooth"
-            | "mesh_cache"
-            | "mesh_deform"
-            | "shrinkwrap"
-            | "simple_deform"
-            | "smooth"
-            | "soft_body"
-            | "surface"
-            | "surface_deform"
-            | "warp"
-            | "wave"
-    )
-}
-
 fn multires_deformed_base(
     engine: &Engine<'_>,
     node_id: &Id,
@@ -220,7 +201,7 @@ fn multires_deformed_base(
         .enumerate()
         .find(|(_, modifier)| {
             modifier.is_active(crate::eval::EvaluationPurpose::Preview)
-                && !is_only_deform_modifier(&modifier.modifier_type)
+                && !super::modifier::only_deform(&modifier.modifier_type)
         })
         .map_or(preceding.len(), |(index, _)| index);
     if !preceding[..keep]
@@ -326,6 +307,13 @@ fn apply_dyntopo(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Res
                     "/target",
                 )
             })?;
+        if has_multires_detail(engine, &node_id, &before) {
+            return Err(engine.error(
+                ErrorCode::InvalidOperation,
+                "dynamic topology is unavailable on a mesh with Multires detail",
+                "/dyntopo",
+            ));
+        }
         let mut world_mesh = before;
         for vertex in &mut world_mesh.vertices {
             vertex.co = world.transform_point3(vertex.co);
@@ -574,7 +562,6 @@ fn apply_multires(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Re
             "/render_levels",
         ));
     }
-    let render_levels = render_levels.min(levels);
     let mut changed = false;
     for node_id in targets {
         if engine.doc.nodes.get(&node_id).is_some_and(|node| {
@@ -622,7 +609,7 @@ fn apply_multires(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Re
             engine.mark("data_blocks", data_id, ChangeKind::Updated);
         }
         let levels = levels.min(total_levels);
-        let render_levels = render_levels.min(levels);
+        let render_levels = render_levels.min(total_levels);
         let node = engine
             .doc
             .nodes
