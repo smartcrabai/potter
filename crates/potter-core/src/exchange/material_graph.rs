@@ -1,12 +1,14 @@
 //! Material node graphs for glTF textures and Potter texture fields that the graph must hold, including the texture fields written to .blend.
 //!
-//! Blender's glTF importer builds a node graph for every material with a transformed texture, an
-//! emissive texture, an occlusion texture, or a normal map scale. This module builds the same shapes:
+//! Blender's glTF importer builds a node graph for every material with a transformed texture, a
+//! packed metallic-roughness texture, an emissive texture, an occlusion texture, or a normal map
+//! scale. This module builds the same shapes:
 //!
 //! - an Image Texture whose `Vector` comes from a Mapping node (POINT) fed by Texture Coordinate `UV`
 //!   when the slot has a `KHR_texture_transform`, with Blender's Location, Rotation and Scale;
 //! - the base color, metallic-roughness and emissive colors into the Principled BSDF, multiplied by
-//!   their factors as Blender does;
+//!   their factors as Blender does; metallic-roughness is split as glTF packs it (Blue is metallic,
+//!   Green is roughness);
 //! - the normal map through a Normal Map node whose Strength is the `normalTexture.scale` and whose
 //!   UV Map is the normal texture's layer (the render layer when it names none);
 //! - occlusion through a Separate Color (Red) into the `glTF Material Output` group, which PR10's
@@ -115,13 +117,14 @@ impl GraphTextures {
         }
     }
 
-    /// Whether any slot needs a graph: a transform, an emissive or occlusion texture, or a normal
-    /// scale that a Potter texture field cannot hold.
+    /// Whether any slot needs a graph: a transform, a packed metallic-roughness, emissive or occlusion
+    /// texture, or a normal scale that a Potter texture field cannot hold. A Potter field reads the
+    /// Red channel, while glTF packs roughness in Green and metallic in Blue.
     pub(crate) fn needs_graph(&self) -> bool {
         let transformed =
             |slot: &Option<SlotTexture>| slot.as_ref().is_some_and(|slot| slot.transform.is_some());
         transformed(&self.base_color)
-            || transformed(&self.metallic_roughness)
+            || self.metallic_roughness.is_some()
             || transformed(&self.normal)
             || transformed(&self.emissive)
             || transformed(&self.occlusion)

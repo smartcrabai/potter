@@ -6955,8 +6955,9 @@ pub(crate) fn import_indexed(
             }
         }
         let textures = material_textures(material, &root, &image_ids)?;
-        // A texture a Potter texture field cannot hold (transform, emissive, occlusion, normal scale)
-        // moves into the material graph, as Blender's importer builds one; the fields stay empty.
+        // A texture a Potter texture field cannot hold (transform, packed metallic-roughness, emissive,
+        // occlusion, normal scale) moves into the material graph, as Blender's importer builds one;
+        // the fields stay empty. A field would read the packed texture's Red channel for both values.
         let graph_needed = textures.needs_graph();
         let field = |slot: &Option<material_graph::SlotTexture>| {
             (!graph_needed)
@@ -14516,6 +14517,128 @@ mod tests {
         assert_eq!(
             normal_map.properties["potter_gltf_imported_normal_map"],
             json!(true)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn packed_metallic_roughness_imports_green_as_roughness_and_blue_as_metallic() -> TestResult {
+        let root = tempfile::tempdir()?;
+        let doc = scene_with_asset_root(
+            root.path(),
+            &json!([
+                {"op":"image.create","id":"rough","width":1,"height":1,"colorspace":"linear","fill_color":[0.25,0.25,0.25,1.0]},
+                {"op":"image.create","id":"metal","width":1,"height":1,"colorspace":"linear","fill_color":[0.75,0.75,0.75,1.0]},
+                {"op":"material.create","id":"mr_mat","metallic":1.0,"roughness":1.0,"roughness_texture":{"image":"rough"},"metallic_texture":{"image":"metal"}},
+                {"op":"node.create","id":"surface","kind":"plane","params":{"size":1.0},"material":"mr_mat"}
+            ]),
+        )?;
+        let (document, binary) = export_root_and_binary_at_root(&doc, root.path())?;
+        // Potter exports the two fields as one packed texture: Green holds roughness, Blue metallic.
+        let packed = &document["materials"][0]["pbrMetallicRoughness"]["metallicRoughnessTexture"];
+        let texture = usize::try_from(
+            packed["index"]
+                .as_u64()
+                .ok_or("packed texture index is missing")?,
+        )?;
+        let image = usize::try_from(
+            document["textures"][texture]["source"]
+                .as_u64()
+                .ok_or("packed texture source is missing")?,
+        )?;
+        let view = usize::try_from(
+            document["images"][image]["bufferView"]
+                .as_u64()
+                .ok_or("packed image view is missing")?,
+        )?;
+        let offset = usize::try_from(
+            document["bufferViews"][view]["byteOffset"]
+                .as_u64()
+                .unwrap_or(0),
+        )?;
+        let length = usize::try_from(
+            document["bufferViews"][view]["byteLength"]
+                .as_u64()
+                .ok_or("packed image length is missing")?,
+        )?;
+        let pixel = ::image::load_from_memory(&binary[offset..offset + length])?
+            .to_rgba8()
+            .get_pixel(0, 0)
+            .0;
+        assert!(
+            pixel[1].abs_diff(64) <= 2 && pixel[2].abs_diff(191) <= 2,
+            "exported packed texture is not Green roughness 0.25 and Blue metallic 0.75: {pixel:?}"
+        );
+
+        let path = root.path().join("packed.gltf");
+        std::fs::write(root.path().join("scene.bin"), &binary)?;
+        std::fs::write(&path, serde_json::to_vec(&document)?)?;
+        let imported = import(&path, uuid::Uuid::new_v4().to_string())?;
+        let material_id = crate::model::Id::new("mr_mat")?;
+        let material = imported
+            .doc
+            .materials
+            .get(&material_id)
+            .ok_or("packed metallic-roughness material is missing")?;
+        assert!(
+            material.metallic_texture.is_none() && material.roughness_texture.is_none(),
+            "packed texture fields would both read the Red channel"
+        );
+        let graph_id = material
+            .node_tree
+            .as_ref()
+            .ok_or("packed metallic-roughness graph is missing")?;
+        let graph = imported
+            .doc
+            .node_groups
+            .get(graph_id)
+            .ok_or("packed metallic-roughness graph group is missing")?;
+        let image_id = graph
+            .nodes
+            .values()
+            .find(|node| node.node_type == "ShaderNodeTexImage")
+            .and_then(|node| node.properties.get("image"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or("packed texture node is missing")?
+            .to_owned();
+        // Two texels with distinct Red, Green and Blue values: a wrong channel gives a different value.
+        let images = BTreeMap::from([(
+            image_id,
+            crate::image::ImageData {
+                width: 2,
+                height: 1,
+                pixels: vec![[0.5, 0.25, 0.75, 1.0], [0.5, 0.9, 0.1, 1.0]],
+                tiles: BTreeMap::new(),
+                interpolation: crate::image::ImageInterpolation::Closest,
+            },
+        )]);
+        let names = ["UVMap".to_owned()];
+        let sample = |u: f64| -> TestResult<(f64, f64)> {
+            let corners = [[[u, 0.25]; 3]];
+            let layers = crate::shader::HitUvLayers {
+                names: &names,
+                corners: &corners,
+                positions: [DVec3::ZERO; 3],
+                barycentric: [1.0 / 3.0; 3],
+                render: Some(0),
+                available_mask: None,
+            };
+            let context = crate::shader::HitContext::new(&imported.doc.node_groups)
+                .with_images(&images)
+                .with_uv_layers(layers);
+            let params = crate::shader::evaluate_surface(material, &context)?;
+            Ok((params.roughness, params.metallic))
+        };
+        let close = |actual: f64, expected: f64| (actual - expected).abs() < 1e-6;
+        let (left_roughness, left_metallic) = sample(0.25)?;
+        assert!(
+            close(left_roughness, 0.25) && close(left_metallic, 0.75),
+            "texel 0: roughness {left_roughness}, metallic {left_metallic}"
+        );
+        let (right_roughness, right_metallic) = sample(0.75)?;
+        assert!(
+            close(right_roughness, 0.9) && close(right_metallic, 0.1),
+            "texel 1: roughness {right_roughness}, metallic {right_metallic}"
         );
         Ok(())
     }
