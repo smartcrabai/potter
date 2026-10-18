@@ -337,6 +337,28 @@ pub(crate) fn triangulate_ngon(corners: &[[f32; 3]], method: NgonMethod) -> Vec<
     triangles
 }
 
+/// Blender's `Mesh::loop_triangles` tessellation: f32 quad flip predicate and f32 `Clip` polyfill.
+/// `corners` are face-local positions rounded to Blender's float vertex storage; each result triple
+/// indexes the input corner array in Blender's loop-triangle order.
+pub(crate) fn loop_triangles(corners: &[[f32; 3]]) -> Vec<[usize; 3]> {
+    match corners {
+        [_, _, _] => vec![[0, 1, 2]],
+        [v1, v2, v3, v4] => {
+            let d12 = sub3(*v2, *v1);
+            let d13 = sub3(*v3, *v1);
+            let d14 = sub3(*v4, *v1);
+            let cross_a = cross3(d12, d13);
+            let cross_b = cross3(d14, d13);
+            if dot3(cross_a, cross_b) > 0.0 {
+                vec![[0, 1, 3], [1, 2, 3]]
+            } else {
+                vec![[0, 1, 2], [0, 2, 3]]
+            }
+        }
+        _ => triangulate_ngon(corners, NgonMethod::Clip),
+    }
+}
+
 const CONCAVE: i8 = -1;
 const TANGENTIAL: i8 = 0;
 const CONVEX: i8 = 1;

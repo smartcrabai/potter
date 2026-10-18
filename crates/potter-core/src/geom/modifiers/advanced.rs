@@ -998,7 +998,7 @@ fn target_triangles(mesh: &Mesh) -> Result<Vec<[DVec3; 3]>> {
         .iter()
         .map(|vertex| (vertex.id, vertex.co))
         .collect();
-    mesh.triangulate()
+    mesh.tessellate()
         .map_err(|error| {
             PotError::invalid_argument(format!("invalid target triangulation: {error}"))
         })?

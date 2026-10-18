@@ -779,6 +779,21 @@ impl Mesh {
     ///
     /// Returns an error for invalid mesh topology, degenerate polygons, or ID exhaustion.
     pub fn triangulate(&self) -> Result<Vec<[u32; 3]>, MeshError> {
+        self.triangulate_with(false)
+    }
+
+    /// Triangulate as Blender's tessellation does (`mesh_tessellate.cc`): a quad splits along its
+    /// 0-2 diagonal from its first corner, flipped to 1-3 when that split folds. Use this where
+    /// Blender's looptris define the surface, such as a Shrinkwrap target.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Mesh::triangulate`].
+    pub fn tessellate(&self) -> Result<Vec<[u32; 3]>, MeshError> {
+        self.triangulate_with(true)
+    }
+
+    fn triangulate_with(&self, blender_quads: bool) -> Result<Vec<[u32; 3]>, MeshError> {
         self.validate()?;
         let capacity = self.faces.iter().try_fold(0_usize, |capacity, face| {
             capacity
@@ -792,7 +807,7 @@ impl Mesh {
             .collect();
         let mut result = Vec::with_capacity(capacity);
         for face in &self.faces {
-            result.extend(triangulate_face(face, &positions)?);
+            result.extend(triangulate_face(face, &positions, blender_quads)?);
         }
         Ok(result)
     }
@@ -1660,6 +1675,7 @@ fn normalize_sphere_point(mut point: [f32; 3], radius: f32) -> [f32; 3] {
 fn triangulate_face(
     face: &Face,
     vertex_positions: &HashMap<u32, DVec3>,
+    blender_quads: bool,
 ) -> Result<Vec<[u32; 3]>, MeshError> {
     let points: Vec<DVec3> = face
         .vertices
@@ -1673,6 +1689,16 @@ fn triangulate_face(
                 ))
         })
         .collect::<Result<_, _>>()?;
+    if blender_quads {
+        let corners: Vec<[f32; 3]> = points
+            .iter()
+            .map(|point| [point.x as f32, point.y as f32, point.z as f32])
+            .collect();
+        return Ok(triangulate::loop_triangles(&corners)
+            .into_iter()
+            .map(|[a, b, c]| [face.vertices[a], face.vertices[b], face.vertices[c]])
+            .collect());
+    }
     let normal = points
         .iter()
         .zip(points.iter().cycle().skip(1))
