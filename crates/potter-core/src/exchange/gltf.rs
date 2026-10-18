@@ -430,7 +430,10 @@ fn pack_channels(
     Ok(PackedImage {
         name,
         pixels: ImageData {
-            storage: crate::image::ImageStorage::default(),
+            storage: crate::image::ImageStorage {
+                straight_alpha: true,
+                ..crate::image::ImageStorage::default()
+            },
             width,
             height,
             pixels,
