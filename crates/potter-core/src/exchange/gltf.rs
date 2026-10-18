@@ -15455,6 +15455,92 @@ mod tests {
         Ok(())
     }
 
+    /// Mixed-wrap glTF textures sample as Blender 5.2.2 renders them. Each fixture's per-axis UV graph is rendered over
+    /// a UV ramp from -0.5 to 1.5 (`tests/fixtures/texture_wrap/generate_wrap_oracle.py`), covering integer boundaries
+    /// and half-texel bands. Potter's sampler must match every pixel centre to float precision. Both sides interpolate
+    /// raw values, so this isolates wrap semantics from the sRGB decode order.
+    #[test]
+    fn mixed_wrap_samples_match_blenders_render() -> TestResult {
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/texture_wrap");
+        let names = ["UVMap".to_owned()];
+        for pair in ["clamp_repeat", "mirror_clamp", "repeat_mirror"] {
+            let oracle: Value = serde_json::from_slice(&std::fs::read(
+                fixtures.join(format!("blender_{pair}.json")),
+            )?)?;
+            let gltf_path = fixtures.join(format!("wrap_{pair}.gltf"));
+            let imported = import(&gltf_path, uuid::Uuid::new_v4().to_string())?;
+            let assets = tempfile::tempdir()?;
+            for (digest, bytes) in &imported.assets {
+                let hex = digest
+                    .strip_prefix("sha256:")
+                    .ok_or("image blob digest is malformed")?;
+                let blob = assets
+                    .path()
+                    .join("assets")
+                    .join("sha256")
+                    .join(hex)
+                    .join("blob");
+                std::fs::create_dir_all(blob.parent().ok_or("image blob parent path is missing")?)?;
+                std::fs::write(blob, bytes)?;
+            }
+            let mut images = BTreeMap::new();
+            for (id, image) in &imported.doc.images {
+                let mut raw = image.clone();
+                raw.colorspace = crate::model::ImageColorspace::NonColor;
+                images.insert(
+                    id.as_str().to_owned(),
+                    crate::image::load_image_data(
+                        &raw,
+                        assets.path(),
+                        crate::image::ImageInterpolation::Linear,
+                    )?,
+                );
+            }
+            let material = imported
+                .doc
+                .materials
+                .values()
+                .next()
+                .ok_or("the glTF imported no material")?;
+            let mut worst = 0.0_f64;
+            let mut worst_at = (0.0, 0.0);
+            for record in oracle["records"].as_array().ok_or("records missing")? {
+                let r = record.as_array().ok_or("record is not an array")?;
+                let (u, v) = (r[0].as_f64().ok_or("u")?, r[1].as_f64().ok_or("v")?);
+                // The oracle is in Blender's V-up UV; Potter's storage UV is glTF's V-down.
+                let storage = [u, 1.0 - v];
+                let corners = [[storage; 3]];
+                let layers = crate::shader::HitUvLayers {
+                    names: &names,
+                    corners: &corners,
+                    positions: [DVec3::ZERO; 3],
+                    barycentric: [1.0 / 3.0; 3],
+                    render: Some(0),
+                    available_mask: None,
+                };
+                let mut context = crate::shader::HitContext::new(&imported.doc.node_groups)
+                    .with_images(&images)
+                    .with_uv_layers(layers);
+                context.uv = storage;
+                let actual = crate::shader::evaluate_surface(material, &context)?.base_color;
+                for channel in 0..3 {
+                    let expected = r[2 + channel].as_f64().ok_or("colour is not a number")?;
+                    let diff = (actual[channel] - expected).abs();
+                    if diff > worst {
+                        worst = diff;
+                        worst_at = (u, v);
+                    }
+                }
+            }
+            assert!(
+                worst <= 1e-4,
+                "{pair}: Potter differs from Blender's render by {worst} at Blender uv {worst_at:?}"
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn mixed_wrap_round_trips_through_the_exporters_per_axis_pattern() -> TestResult {
         // A sampler whose axes wrap differently imports as Blender's per-axis UV graph. The exporter recognises that
