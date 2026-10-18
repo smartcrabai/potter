@@ -138,6 +138,36 @@ impl CornerNormalCode {
     }
 }
 
+/// Blender's `DefaultMixer<short2>` over raw fan codes (`BKE_attribute_math`'s
+/// `SimpleMixerWithAccumulationType<short2, float2>` with `short2_to_float2` and `float2_to_short2`).
+/// Each sample's pair is weighted in `f32` and summed; the sum is scaled by the reciprocal of the
+/// total weight and rounded per component to `i16`. Automatic and explicit-zero codes hold the raw
+/// `(0, 0)` pair, and a total weight that is not positive gives the default value, `Auto`.
+pub(crate) fn mix_codes(
+    samples: impl IntoIterator<Item = (CornerNormalCode, f32)>,
+) -> CornerNormalCode {
+    let mut sum = [0.0_f32; 2];
+    let mut total = 0.0_f32;
+    for (code, weight) in samples {
+        let pair = match code {
+            CornerNormalCode::Authored(pair) => pair,
+            CornerNormalCode::Auto | CornerNormalCode::ExplicitZero => [0, 0],
+        };
+        sum[0] += f32::from(pair[0]) * weight;
+        sum[1] += f32::from(pair[1]) * weight;
+        total += weight;
+    }
+    if !(total > 0.0) {
+        return CornerNormalCode::Auto;
+    }
+    let weight_inv = 1.0_f32 / total;
+    // `as i16` saturates at the i16 bounds, which is the clamp.
+    CornerNormalCode::from_pair([
+        (sum[0] * weight_inv).round() as i16,
+        (sum[1] * weight_inv).round() as i16,
+    ])
+}
+
 /// Which Blender custom-normal setter boundary supplied a vector buffer.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum SetterInput {
@@ -1377,6 +1407,19 @@ mod tests {
 
     /// Authored vectors round-trip through 16-bit codes, so they match to this measured precision.
     const CODEC_TOLERANCE: f64 = 1.0e-3;
+
+    /// Blender 5.2.2 oracle (EXACT probe `exact_clnor4`, subject cube with authored normals cut by a
+    /// cutter). The output corner at (-0.3, 1, 1) lies on the edge of source face 1 between corners
+    /// (-1, 1, 1) and (1, 1, 1), so its weights are 0.65 and 0.35 (Blender's edge rule). Its stored
+    /// code is the rounded weighted average of the two raw source codes.
+    #[test]
+    fn mix_codes_reproduces_the_blender_exact_edge_corner() {
+        let mixed = super::mix_codes([
+            (CornerNormalCode::Authored([27803, -12626]), 0.65_f32),
+            (CornerNormalCode::Authored([28178, -18621]), 0.35_f32),
+        ]);
+        assert_eq!(mixed, CornerNormalCode::Authored([27934, -14724]));
+    }
 
     fn smooth_cube() -> Mesh {
         let mut mesh = Mesh::box_mesh(BoxParams::default()).expect("cube");

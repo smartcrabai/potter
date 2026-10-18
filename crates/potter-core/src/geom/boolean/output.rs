@@ -24,9 +24,13 @@
 //! the vertex origins, and the POINT origin above is not an edge origin. FACE stores
 //! (`blender_polygon_smooth`, `shade_smooth`) are joined into `J` and gathered by the remap.
 //!
-//! `custom_normal` is a CORNER store. Blender realizes each operand's custom normals through its
-//! transform, so [`joined_custom_normals`] builds them per joined corner. The remap interpolates
-//! them without normalising, and [`negate_flipped_custom_normals`] negates the flipped faces.
+//! `custom_normal` is a CORNER store of raw fan codes. [`joined_custom_normals`] builds each
+//! operand's authored normals per joined corner, which [`encode_joined_custom_normals`] stores as
+//! codes; [`mix_custom_normals`] then mixes every output corner from its weighted source corners
+//! with Blender's `DefaultMixer<short2>` (`clnor::mix_codes`).
+//! A copied corner keeps its code, and a flipped face keeps its codes: Blender does not negate
+//! them, and the flip shows only when the codes decode on the flipped face's fan (probe
+//! `flip.json`).
 //!
 //! Native generic attributes (`{"domain","type","values"}` stores keyed by element ID) join every
 //! operand's values per element, as Blender's `join_meshes` concatenates each domain. Other stores
@@ -126,7 +130,6 @@ pub(crate) fn polys_to_mesh(
     )
     .map_err(|error| PotError::invalid_argument(format!("boolean output face failed: {error}")))?;
 
-    let flipped = flipped_faces(&joined, &planned, &positions);
     let origin = Origin {
         vertices: arena_ids
             .iter()
@@ -136,7 +139,11 @@ pub(crate) fn polys_to_mesh(
         corners: Some(corner_sources(&joined, &planned, &positions)),
     };
     remap_attributes(&joined.mesh, &mut mesh, &origin)?;
-    negate_flipped_custom_normals(&mut mesh, &flipped)?;
+    mix_custom_normals(
+        &joined.mesh,
+        &mut mesh,
+        origin.corners.as_deref().unwrap_or(&[]),
+    )?;
 
     let sources = edge_sources(&mesh, polys, &planned, &vertex_ids);
     let crease = keyed_edge_attribute(operands, &layout, &mesh, &sources, "crease_edge");
@@ -454,62 +461,25 @@ fn unchanged_corners(
     })
 }
 
-/// Blender's flip test in `copy_or_interp_loop_attributes`: an output face is flipped when its
-/// normal points against the normal of its source face in the joined mesh.
-fn flipped_faces(joined: &Joined, planned: &[PlannedFace], positions: &[DVec3]) -> Vec<bool> {
-    planned
-        .iter()
-        .map(|face| {
-            let source: Vec<DVec3> = joined.rings[face.joined_face]
-                .iter()
-                .map(|&vertex| joined.mesh.vertices[vertex].co)
-                .collect();
-            let output: Vec<DVec3> = face.ring.iter().map(|&vertex| positions[vertex]).collect();
-            ring_normal(&source).dot(ring_normal(&output)) < 0.0
-        })
-        .collect()
-}
-
-/// Newell's normal of a ring, not normalised, as Blender's `face_normal_calc` sums it. A degenerate
-/// ring has a zero normal, so it is never flipped.
-fn ring_normal(points: &[DVec3]) -> DVec3 {
-    points
-        .iter()
-        .zip(points.iter().cycle().skip(1))
-        .take(points.len())
-        .fold(DVec3::ZERO, |sum, (current, next)| {
-            sum + DVec3::new(
-                (current.y - next.y) * (current.z + next.z),
-                (current.z - next.z) * (current.x + next.x),
-                (current.x - next.x) * (current.y + next.y),
-            )
-        })
-}
-
-/// Blender negates the interpolated `custom_normal` corners of flipped faces. A flipped face never
-/// copies its source corners (its ring runs the other way), so every authored corner of one is
-/// negated. The output's codes decode to vectors on its own fans, negate, and re-encode. Auto
-/// corners stay Auto.
-pub(super) fn negate_flipped_custom_normals(mesh: &mut Mesh, flipped: &[bool]) -> Result<()> {
-    if !flipped.iter().any(|&flip| flip) {
-        return Ok(());
-    }
-    let positions: Vec<DVec3> = mesh.vertices.iter().map(|vertex| vertex.co).collect();
-    let Some(mut vectors) =
-        clnor::corner_custom_normals(mesh, &positions, NormalCodeOptions::default())?
-    else {
+/// Blender `interpolate_corner_attributes` for `custom_normal` (`geometry_mesh_boolean.cc`): each
+/// output corner mixes the raw codes of its weighted source corners with `DefaultMixer<short2>`
+/// (`clnor::mix_codes`). A copied corner has one source at weight 1, so it keeps its code. Blender
+/// does not negate the codes of a flipped face (probe `flip.json`: an unchanged code decodes to the
+/// flipped direction on the flipped fan), so no negation is applied here.
+fn mix_custom_normals(joined: &Mesh, mesh: &mut Mesh, sources: &[Vec<(usize, f64)>]) -> Result<()> {
+    let Some(codes) = clnor::corner_codes(joined)? else {
         return Ok(());
     };
-    let mut corner = 0;
-    for (face, &flip) in mesh.faces.iter().zip(flipped) {
-        for _ in 0..face.vertices.len() {
-            if flip && let Some(normal) = vectors[corner] {
-                vectors[corner] = Some(-normal);
-            }
-            corner += 1;
-        }
-    }
-    clnor::encode_vectors(mesh, Some(&vectors), NormalCodeOptions::default())
+    let mixed: Vec<clnor::CornerNormalCode> =
+        sources
+            .iter()
+            .map(|corner| {
+                clnor::mix_codes(corner.iter().filter_map(|&(index, weight)| {
+                    codes.get(index).map(|&code| (code, weight as f32))
+                }))
+            })
+            .collect();
+    clnor::write_codes(mesh, Some(mixed.as_slice()), NormalCodeOptions::default())
 }
 
 /// Global edge index each output edge takes its attributes from (Blender `dst_to_src_edge`). The
@@ -1918,7 +1888,7 @@ mod tests {
     }
 
     #[test]
-    fn custom_normals_of_flipped_faces_are_negated() -> TestResult {
+    fn custom_normals_of_flipped_faces_keep_their_codes_and_decode_flipped() -> TestResult {
         let mut a = mesh_from(
             vec![
                 DVec3::new(0.0, 0.0, 0.0),
@@ -1939,7 +1909,8 @@ mod tests {
         ];
         let mesh = build(&polys, &arena, &[operand(&a)], &[])?;
         let normals = authored_normals(&mesh)?;
-        // The kept face copies its source; the reversed face is flipped, so its normals negate.
+        // The kept face copies its codes. The reversed face keeps its codes too; they decode on its
+        // flipped fan to the flipped direction (Blender does not negate them).
         for normal in &normals[..3] {
             assert_near(*normal, DVec3::Z)?;
         }
