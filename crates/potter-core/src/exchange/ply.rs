@@ -4,7 +4,6 @@ use glam::DVec3;
 
 use super::{
     ExchangeMesh, ExchangeUvLayer, ply_byte_to_color, ply_color_to_byte, shading, single_uv_set,
-
 };
 use crate::{
     error::{ErrorCode, PotError, Result},

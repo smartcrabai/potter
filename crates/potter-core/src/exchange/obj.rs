@@ -331,7 +331,8 @@ impl MtlWriter<'_> {
             options.push_str(&format!(" -bm {strength:.6}"));
         }
         let file = format!("{}_{}.png", self.name, key.trim_start_matches("map_"));
-        let packed = gltf::pack_channels(&channels, texture.interpolation, self.doc, self.root_path)?;
+        let packed =
+            gltf::pack_channels(&channels, texture.interpolation, self.doc, self.root_path)?;
         let bytes = gltf::encode_png_with_colorspace(ImageColorspace::Linear, &packed.pixels)?;
         self.textures.push((file.clone(), bytes));
         Ok(format!("{key}{options} {file}\n"))
@@ -353,15 +354,15 @@ impl MtlWriter<'_> {
         let illum = illum_mode(level, metallic, alpha != 1.0);
 
         let kd_map = match &surface.base_color.texture {
-            Some(texture) => Some(self.map(
-                "map_Kd",
-                texture,
-                rgb_channels(&texture.channels),
-                None,
-            )?),
+            Some(texture) => {
+                Some(self.map("map_Kd", texture, rgb_channels(&texture.channels), None)?)
+            }
             None => None,
         };
-        let ks_map = match surface.specular.as_ref().and_then(|specular| specular.texture.as_ref())
+        let ks_map = match surface
+            .specular
+            .as_ref()
+            .and_then(|specular| specular.texture.as_ref())
         {
             Some(texture) if texture.channels[3].is_some() => Some(self.map(
                 "map_Ks",
@@ -394,12 +395,9 @@ impl MtlWriter<'_> {
             // Blender skips map_Ke when Emission Strength is zero.
             // shortcut: Potter keeps only the emitted factor (colour times strength), so a textured
             // emission with black colour and nonzero strength is not written, unlike Blender.
-            Some(texture) if surface.emissive.factor != [0.0; 3] => Some(self.map(
-                "map_Ke",
-                texture,
-                rgb_channels(&texture.channels),
-                None,
-            )?),
+            Some(texture) if surface.emissive.factor != [0.0; 3] => {
+                Some(self.map("map_Ke", texture, rgb_channels(&texture.channels), None)?)
+            }
             _ => None,
         };
         let d_map = match &surface.base_color.texture {
@@ -992,8 +990,10 @@ fn import(path: &Path) -> Result<ObjImport> {
 }
 
 fn file_stem(path: &Path) -> String {
-    path.file_stem()
-        .map_or_else(|| "Object".to_owned(), |stem| stem.to_string_lossy().into_owned())
+    path.file_stem().map_or_else(
+        || "Object".to_owned(),
+        |stem| stem.to_string_lossy().into_owned(),
+    )
 }
 
 /// Resolves an OBJ index. Positive values count from 1; negative values count back from the end
@@ -1720,7 +1720,9 @@ fn potter_material(
                     losses,
                     id,
                     "material.normal_strength",
-                    format!("MTL bump strength {strength} is not Potter's normal scale of 1; it is imported as 1"),
+                    format!(
+                        "MTL bump strength {strength} is not Potter's normal scale of 1; it is imported as 1"
+                    ),
                     None,
                 );
             }
@@ -1795,10 +1797,7 @@ fn resolve_map(map: Option<&MtlMap>, id: &Id, losses: &mut Vec<Loss>) -> Option<
         map.dir.join(written.replace('_', " ")),
         map.dir.join(basename),
     ];
-    match candidates
-        .into_iter()
-        .find(|candidate| candidate.is_file())
-    {
+    match candidates.into_iter().find(|candidate| candidate.is_file()) {
         Some(found) => Some(fs::canonicalize(&found).unwrap_or(found)),
         None => {
             losses.push(Loss {
@@ -1937,7 +1936,10 @@ fn bind_slots(doc: &mut SceneDoc, bindings: Vec<(Vec<Option<Id>>, Vec<u32>)>) ->
             .get(node_id)
             .and_then(|node| node.data.clone())
             .ok_or_else(|| {
-                PotError::new(ErrorCode::InternalError, "imported object has no data block")
+                PotError::new(
+                    ErrorCode::InternalError,
+                    "imported object has no data block",
+                )
             })?;
         let data = doc.data_blocks.get_mut(&data_id).ok_or_else(|| {
             PotError::new(ErrorCode::InternalError, "imported data block is missing")
@@ -1960,7 +1962,12 @@ pub(crate) fn imported_graph(path: &Path, scene_id: String) -> Result<ImportedGr
     } = import(path)?;
     let bindings = meshes
         .iter()
-        .map(|mesh| (mesh.material_slots.clone(), mesh.face_material_indices.clone()))
+        .map(|mesh| {
+            (
+                mesh.material_slots.clone(),
+                mesh.face_material_indices.clone(),
+            )
+        })
         .collect::<Vec<_>>();
     let slot_ids = meshes
         .iter()
@@ -1971,13 +1978,7 @@ pub(crate) fn imported_graph(path: &Path, scene_id: String) -> Result<ImportedGr
     for id in &slot_ids {
         // A usemtl name with no MTL entry gets the default material, as Blender creates one.
         let mtl = library.get(id.as_str()).cloned().unwrap_or_default();
-        let material = potter_material(
-            &mtl,
-            id,
-            &mut graph.doc,
-            &mut images,
-            &mut graph.losses,
-        )?;
+        let material = potter_material(&mtl, id, &mut graph.doc, &mut images, &mut graph.losses)?;
         graph.doc.materials.insert(id.clone(), material);
     }
     bind_slots(&mut graph.doc, bindings)?;
@@ -2123,9 +2124,8 @@ mod tests {
             ..Material::default()
         })?;
         let exported = export(&doc, Path::new(""), &[mesh])?;
-        let mtl = String::from_utf8(exported.material).map_err(|error| {
-            PotError::new(ErrorCode::InternalError, error.to_string())
-        })?;
+        let mtl = String::from_utf8(exported.material)
+            .map_err(|error| PotError::new(ErrorCode::InternalError, error.to_string()))?;
         // Ns = (1 - roughness)^2 * 1000 with roughness 0.2; Ka = 1 without metal; illum 2 for a
         // specular dielectric that is opaque.
         assert_eq!(
@@ -2158,9 +2158,8 @@ mod tests {
             ..Material::default()
         })?;
         let exported = export(&doc, Path::new(""), &[mesh])?;
-        let mtl = String::from_utf8(exported.material).map_err(|error| {
-            PotError::new(ErrorCode::InternalError, error.to_string())
-        })?;
+        let mtl = String::from_utf8(exported.material)
+            .map_err(|error| PotError::new(ErrorCode::InternalError, error.to_string()))?;
         // Ke is emission colour times strength, unnormalised; Ka is the metallic value.
         assert_eq!(
             mtl_block(&mtl, "shiny"),
@@ -2220,7 +2219,11 @@ mod tests {
         assert_eq!(material.emission_color, [1.0, 0.5, 0.25]);
         assert!((material.emission_strength - 4.0).abs() < 1.0e-9);
         // Ks is absent, so Blender's specular is zero here, which Potter cannot hold.
-        assert!(losses.iter().any(|loss| loss.feature_id == "material.specular"));
+        assert!(
+            losses
+                .iter()
+                .any(|loss| loss.feature_id == "material.specular")
+        );
         Ok(())
     }
 
@@ -2246,7 +2249,11 @@ mod tests {
         assert!(doc.images.contains_key(&reference.image));
         assert_eq!(material.base_color, [1.0, 1.0, 1.0, 1.0]);
         assert_eq!(material.alpha_mode, "blend");
-        assert!(!losses.iter().any(|loss| loss.feature_id == "material.alpha_texture"));
+        assert!(
+            !losses
+                .iter()
+                .any(|loss| loss.feature_id == "material.alpha_texture")
+        );
         Ok(())
     }
 
@@ -2264,11 +2271,10 @@ mod tests {
         io(fs::write(dir.path().join("scene.obj"), &exported.object))?;
         io(fs::write(dir.path().join("scene.mtl"), &exported.material))?;
         let graph = imported_graph(&dir.path().join("scene.obj"), SCENE_ID.to_owned())?;
-        let material = graph
-            .doc
-            .materials
-            .get(&Id::new("shiny")?)
-            .ok_or_else(|| PotError::new(ErrorCode::InternalError, "imported material missing"))?;
+        let material =
+            graph.doc.materials.get(&Id::new("shiny")?).ok_or_else(|| {
+                PotError::new(ErrorCode::InternalError, "imported material missing")
+            })?;
         // Ns is written with six decimals, so the roughness comes back within 1e-5.
         assert!((material.roughness - 0.2).abs() < 1.0e-5);
         assert!((material.metallic - 0.5).abs() < 1.0e-6);

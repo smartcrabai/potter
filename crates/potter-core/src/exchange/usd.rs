@@ -4,11 +4,11 @@ use std::{
     path::Path,
 };
 
+use super::material_graph::{GraphTextures, move_textures_to_graph};
 use super::{
     ExchangeMesh, ExchangeUvLayer, ImportedGraph, Loss, evaluated_meshes, import_error,
     import_uv_layers, shading, srgb_decode,
 };
-use super::material_graph::{GraphTextures, move_textures_to_graph};
 use crate::{
     error::{ErrorCode, PotError, Result},
     eval::{Snapshot, animation::animated_transform},
@@ -4448,11 +4448,10 @@ def Material "M"
 
     /// The single material of `doc` and its shader graph.
     fn only_material(doc: &SceneDoc) -> Result<(&Material, &NodeGroup)> {
-        let material = doc
-            .materials
-            .values()
-            .next()
-            .ok_or_else(|| PotError::new(ErrorCode::ImportFailed, "fixture material is missing"))?;
+        let material =
+            doc.materials.values().next().ok_or_else(|| {
+                PotError::new(ErrorCode::ImportFailed, "fixture material is missing")
+            })?;
         let graph = material
             .node_tree
             .as_ref()
@@ -4499,7 +4498,11 @@ def Material "M"
         assert_eq!(layer.domain, ColorDomain::Point);
         assert_eq!(
             layer.values,
-            [[1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]]
+            [
+                [1.0, 0.0, 0.0, 1.0],
+                [0.0, 1.0, 0.0, 1.0],
+                [0.0, 0.0, 1.0, 1.0]
+            ]
         );
         assert_eq!(store.render.as_deref(), Some("displayColor"));
         assert_eq!(store.active.as_deref(), Some("displayColor"));
@@ -4556,7 +4559,11 @@ def Material "M"
         assert_eq!(layer.domain, ColorDomain::Corner);
         assert_eq!(
             layer.values,
-            [[0.1, 0.2, 0.3, 0.5], [0.4, 0.5, 0.6, 0.25], [0.7, 0.8, 0.9, 1.0]]
+            [
+                [0.1, 0.2, 0.3, 0.5],
+                [0.4, 0.5, 0.6, 0.25],
+                [0.7, 0.8, 0.9, 1.0]
+            ]
         );
         Ok(())
     }
@@ -4573,7 +4580,11 @@ def Material "M"
         let (store, _) = import_colors(&text)?;
         assert_eq!(
             store.layers[0].values,
-            [[1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]]
+            [
+                [1.0, 0.0, 0.0, 1.0],
+                [0.0, 1.0, 0.0, 1.0],
+                [0.0, 0.0, 1.0, 1.0]
+            ]
         );
         Ok(())
     }
@@ -4601,7 +4612,11 @@ def Material "M"
             r##"    color3f[] primvars:displayColor = [(1, 0, 0), (0, 1, 0), (0, 0, 1)] (interpolation = "vertex", colorSpace = "ACEScg")"##,
         ))?;
         assert!(store.layers.is_empty());
-        assert!(losses.iter().any(|feature| feature == "mesh.color_attribute"));
+        assert!(
+            losses
+                .iter()
+                .any(|feature| feature == "mesh.color_attribute")
+        );
         Ok(())
     }
 
@@ -4676,7 +4691,11 @@ def Material "M"
         let (doc, losses) = parse_usda(&text, "scene".to_owned())?;
         let material = doc.materials.values().next();
         assert!(material.is_some_and(|material| material.node_tree.is_none()));
-        assert!(losses.iter().any(|feature| feature == "material.usd_shader_network"));
+        assert!(
+            losses
+                .iter()
+                .any(|feature| feature == "material.usd_shader_network")
+        );
         Ok(())
     }
 

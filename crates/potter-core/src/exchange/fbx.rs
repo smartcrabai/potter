@@ -2785,20 +2785,42 @@ fn parse_geometry(
             .child("MappingInformationType")
             .and_then(FbxNode::first_arg)
             .unwrap_or("");
-        if mapping != "ByPolygon" {
-            return Err(PotError::with_details(
-                ErrorCode::UnsupportedFeature,
-                "FBX material mapping is unsupported",
-                json!({"feature_id":"format.fbx.material_mapping","mapping":mapping}),
-            ));
-        }
-        if let Some(values) = layer.child("Materials") {
-            material_indices = integer_array(values)?;
-        }
-        if !material_indices.is_empty() && material_indices.len() != faces.len() {
-            return Err(import_error(
-                "FBX material index count does not match polygon count",
-            ));
+        let reference = layer
+            .child("ReferenceInformationType")
+            .and_then(FbxNode::first_arg)
+            .unwrap_or("");
+        match (mapping, reference) {
+            ("ByPolygon", _) => {
+                if let Some(values) = layer.child("Materials") {
+                    material_indices = integer_array(values)?;
+                }
+                if !material_indices.is_empty() && material_indices.len() != faces.len() {
+                    return Err(import_error(
+                        "FBX material index count does not match polygon count",
+                    ));
+                }
+            }
+            // Blender's `blen_read_geom_array_mapped_polygon` reads `Materials[0]` for every polygon
+            // of an `AllSame` layer, and only with `IndexToDirect`. Blender writes this layer when
+            // one material is exported (`export_fbx_bin.py`, `LayerElementMaterial` block).
+            ("AllSame", "IndexToDirect") => {
+                let first = layer
+                    .child("Materials")
+                    .map(integer_array)
+                    .transpose()?
+                    .and_then(|values| values.first().copied())
+                    .ok_or_else(|| {
+                        import_error("FBX AllSame material layer has no material index")
+                    })?;
+                material_indices = vec![first; faces.len()];
+            }
+            _ => {
+                return Err(PotError::with_details(
+                    ErrorCode::UnsupportedFeature,
+                    "FBX material mapping is unsupported",
+                    json!({"feature_id":"format.fbx.material_mapping","mapping":mapping}),
+                ));
+            }
         }
     }
     let deformation = read_string_property(node.child("Properties70"), "potter:deformation")
@@ -4338,6 +4360,40 @@ mod tests {
     }
 
     #[test]
+    fn blender_written_all_same_material_layer_applies_to_every_face() -> TestResult<()> {
+        // Blender writes `AllSame` / `IndexToDirect` with one `Materials` entry when one material
+        // is exported (`export_fbx_bin.py`, `LayerElementMaterial` block, `all_same_idx`), and
+        // `import_fbx.py` `blen_read_geom_array_foreach_set_allsame` broadcasts that entry to every
+        // polygon. Same quad as the `ByPolygon` test above.
+        let text = r#"Geometry: 1, "Geometry::Plane", "Mesh" {
+    Vertices: *12 {
+        a: 0,0,0,1,0,0,0,1,0,1,1,0
+    }
+    PolygonVertexIndex: *6 {
+        a: 0,1,-3,1,3,-3
+    }
+    LayerElementMaterial: 0 {
+        Version: 101
+        Name: ""
+        MappingInformationType: "AllSame"
+        ReferenceInformationType: "IndexToDirect"
+        Materials: *1 {
+            a: 0
+        }
+    }
+}
+"#;
+        let nodes = parse_nodes(&lex(text)?)?;
+        let geometry = nodes.first().ok_or("FBX test has no geometry")?;
+        let mut losses = Vec::<Loss>::new();
+        let imported = parse_geometry(geometry, 1, &mut losses)?;
+        assert!(losses.is_empty());
+        assert_eq!(imported.faces, vec![vec![0, 1, 2], vec![1, 3, 2]]);
+        assert_eq!(imported.material_indices, vec![0, 0]);
+        Ok(())
+    }
+
+    #[test]
     fn imported_invalid_face_material_index_resolves_to_the_first_material() -> TestResult<()> {
         let first_material = Id::new("first_material")?;
         let second_material = Id::new("second_material")?;
@@ -4418,6 +4474,106 @@ mod tests {
                 "{invalid}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn missing_material_link_creates_no_slot_and_faces_resolve_to_connected_materials()
+    -> TestResult<()> {
+        // Blender's `connection_filter_reverse` (`import_fbx.py`) keeps only Model connections whose
+        // target exists and is a `Material`, in file order, and `mats_to_append` builds the mesh's
+        // material list from those alone. A dropped link therefore leaves no placeholder slot, and
+        // `validate_material_indices` resets an index past the connected list to 0.
+        let first_material = Id::new("first_material")?;
+        let second_material = Id::new("second_material")?;
+        let data_id = Id::new("mesh_data")?;
+        let node_id = Id::new("sheet")?;
+        let mut mesh = triangle()?;
+        mesh.faces[0].material_index = 1;
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        doc.materials
+            .insert(first_material.clone(), Material::default());
+        doc.materials
+            .insert(second_material.clone(), Material::default());
+        doc.data_blocks.insert(
+            data_id.clone(),
+            DataBlock {
+                data_type: "mesh".to_owned(),
+                mesh: Some(mesh),
+                ..DataBlock::default()
+            },
+        );
+        doc.nodes.insert(
+            node_id.clone(),
+            Node {
+                name: "Sheet".to_owned(),
+                kind: "mesh".to_owned(),
+                data: Some(data_id),
+                materials: vec![Some(first_material.clone()), Some(second_material.clone())],
+                ..Node::default()
+            },
+        );
+        doc.collections
+            .get_mut(&Id::from_static("collection_root"))
+            .ok_or("FBX test root collection is missing")?
+            .objects
+            .push(node_id);
+        let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
+        let exported = String::from_utf8(export_with_root_allow_lossy(
+            &doc,
+            &snapshot,
+            Path::new("."),
+            false,
+        )?)?;
+
+        // Find the FBX object id of the second material from its `potter:id` property.
+        let mut current_object = None::<&str>;
+        let mut second_object = None::<&str>;
+        for line in exported.lines() {
+            if let Some(rest) = line.strip_prefix("\tMaterial: ") {
+                current_object = rest.split(',').next();
+            } else if line.ends_with("\"second_material\"") && line.contains("\"potter:id\"") {
+                second_object = current_object;
+            }
+        }
+        let second_object = second_object.ok_or("FBX export has no second material object")?;
+
+        // Drop the second material's Model connection, leaving its Material object in the file.
+        let link = format!("\tC: \"OO\",{second_object},");
+        let before = exported
+            .lines()
+            .filter(|line| line.starts_with(&link))
+            .count();
+        assert_eq!(before, 1, "{exported}");
+        let mut text = exported
+            .lines()
+            .filter(|line| !line.starts_with(&link))
+            .collect::<Vec<_>>()
+            .join("\n");
+        text.push('\n');
+
+        let imported = import_bytes(
+            text.as_bytes(),
+            "00000000-0000-4000-8000-000000000001".to_owned(),
+        )?;
+        // Face 0 pointed at FBX slot 1 (second material). With only the first material connected,
+        // the index is past the list and resolves to the first connected material.
+        assert_eq!(imported_face_slots(&imported.doc)?, vec![0]);
+        assert_eq!(
+            resolved_material_id(&imported.doc, "Sheet", 0)?,
+            first_material
+        );
+        let sheet = imported
+            .doc
+            .nodes
+            .values()
+            .find(|node| node.name == "Sheet")
+            .ok_or("imported FBX has no Sheet node")?;
+        assert_eq!(
+            sheet.materials.len(),
+            1,
+            "a dropped link must not create an empty slot"
+        );
         Ok(())
     }
 

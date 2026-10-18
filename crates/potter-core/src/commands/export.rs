@@ -243,7 +243,10 @@ pub fn run(args: &ExportArgs) -> Result<(Option<SceneInfo>, Value)> {
                     .map_err(|error| PotError::new(ErrorCode::InternalError, error.to_string()))?
                     .replace("scene.mtl", mtl_name)
                     .into_bytes();
-                let mut files = vec![(sidecar.clone(), exported.material), (args.out.clone(), object)];
+                let mut files = vec![
+                    (sidecar.clone(), exported.material),
+                    (args.out.clone(), object),
+                ];
                 files.extend(
                     exported
                         .textures

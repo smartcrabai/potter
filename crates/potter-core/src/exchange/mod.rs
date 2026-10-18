@@ -134,7 +134,12 @@ fn uv_pins(layer: &UvLayer, faces: &[crate::geom::Face]) -> Vec<Vec<bool>> {
         .map(|(index, face)| {
             let entry = layer.pinned.get(index).and_then(Option::as_ref);
             (0..face.vertices.len())
-                .map(|corner| entry.and_then(|flags| flags.get(corner)).copied().unwrap_or(false))
+                .map(|corner| {
+                    entry
+                        .and_then(|flags| flags.get(corner))
+                        .copied()
+                        .unwrap_or(false)
+                })
                 .collect()
         })
         .collect()
@@ -203,10 +208,7 @@ pub(super) fn uv_import_loss(data_id: &str, reason: impl Into<String>) -> Loss {
 pub(super) fn single_uv_set(
     corners: Vec<Vec<[f64; 2]>>,
 ) -> (Vec<ExchangeUvLayer>, Option<usize>, Option<usize>) {
-    let pinned = corners
-        .iter()
-        .map(|face| vec![false; face.len()])
-        .collect();
+    let pinned = corners.iter().map(|face| vec![false; face.len()]).collect();
     (
         vec![ExchangeUvLayer {
             name: "UVMap".to_owned(),
