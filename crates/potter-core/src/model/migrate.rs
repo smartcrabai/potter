@@ -5,7 +5,8 @@
 //! then deserializes. Version 2 replaced the mesh attributes `uv_map` and `blender_uv_layers` with
 //! `uv_layers`, and the texture reference field `uv_map` with `uv_layer`. Version 3 converted
 //! Blender-keyed shading (including compressed custom normals), color, and generic element data to
-//! native keys, and user attributes to their storage keys (see [`upgrade_mesh_v2`]).
+//! native keys, and user attributes to their storage keys (see [`upgrade_mesh_v2`]). Version 4
+//! adds optional captured Blender authoring matrices and changes no existing data.
 use std::collections::BTreeSet;
 
 use serde_json::{Map, Value, json};
@@ -96,7 +97,8 @@ fn json_error(error: &serde_json::Error) -> PotError {
     )
 }
 
-/// Upgrades a scene document in place through schema version 3.
+/// Upgrades a scene document in place through schema version 4. Other versions are left for
+/// `SceneDoc::validate` to accept or reject.
 pub fn upgrade_scene(value: &mut Value) -> Result<Vec<Value>> {
     let warnings = if value.get("schema_version").and_then(Value::as_u64) == Some(1) {
         upgrade_v1(value)?
@@ -105,6 +107,9 @@ pub fn upgrade_scene(value: &mut Value) -> Result<Vec<Value>> {
     };
     if value.get("schema_version").and_then(Value::as_u64) == Some(2) {
         upgrade_v2(value)?;
+    }
+    if value.get("schema_version").and_then(Value::as_u64) == Some(3) {
+        upgrade_v3(value)?;
     }
     Ok(warnings)
 }
@@ -223,6 +228,12 @@ fn upgrade_v2(value: &mut Value) -> Result<()> {
         }
     }
     value["schema_version"] = json!(3);
+    Ok(())
+}
+
+/// Upgrades a schema-version-3 scene document to version 4 without changing its data.
+fn upgrade_v3(value: &mut Value) -> Result<()> {
+    value["schema_version"] = json!(4);
     Ok(())
 }
 
@@ -1065,7 +1076,7 @@ mod tests {
             }}}
         });
         upgrade_scene(&mut scene).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(3));
+        assert_eq!(scene["schema_version"], json!(4));
         let material = &scene["materials"]["m1"];
         assert_eq!(material["base_color_texture"]["uv_layer"], Value::Null);
         assert!(material["base_color_texture"].get("uv_map").is_none());
@@ -1080,14 +1091,43 @@ mod tests {
     }
 
     #[test]
-    fn current_scenes_pass_through_untouched() {
+    fn current_schema_four_scenes_pass_through_untouched() {
         let mut scene = json!({
-            "schema_version": 3,
+            "schema_version": 4,
             "materials": {"m1": {"base_color_texture": {"image": "img", "uv_layer": "Light"}}}
         });
         let before = scene.clone();
         upgrade_scene(&mut scene).expect("no-op");
         assert_eq!(scene, before);
+    }
+
+    #[test]
+    fn version_three_scenes_migrate_without_data_loss() {
+        let mut scene = json!({
+            "schema_version": 3,
+            "materials": {"m1": {"base_color_texture": {"image": "img", "uv_layer": "Light"}}}
+        });
+        let mut expected = scene.clone();
+        expected["schema_version"] = json!(4);
+        upgrade_scene(&mut scene).expect("upgrade");
+        assert_eq!(scene, expected);
+    }
+
+    #[test]
+    fn parsing_version_three_scene_migrates_and_validates() -> TestResult {
+        let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+        doc.nodes.insert(
+            crate::model::Id::new("node")?,
+            super::super::Node::default(),
+        );
+        doc.schema_version = 3;
+        let mut expected = serde_json::to_value(&doc)?;
+        let parsed = parse_scene(&serde_json::to_vec(&expected)?)?;
+        parsed.doc.validate()?;
+        let migrated = serde_json::to_value(parsed.doc)?;
+        expected["schema_version"] = json!(4);
+        assert_eq!(migrated, expected);
+        Ok(())
     }
 
     #[test]
@@ -1123,7 +1163,7 @@ mod tests {
         });
 
         let migrated = parse_scene(&serde_json::to_vec(&source)?)?.doc;
-        assert_eq!(migrated.schema_version, 3);
+        assert_eq!(migrated.schema_version, 4);
         let mesh = migrated.data_blocks[&data_id]
             .mesh
             .as_ref()
@@ -1627,7 +1667,7 @@ mod tests {
         let (record, history_warnings) =
             parse_history_record(&serde_json::to_vec(&history_record(&source))?)?;
         assert!(history_warnings.is_empty(), "{history_warnings:?}");
-        assert_eq!(record.snapshot.schema_version, 3);
+        assert_eq!(record.snapshot.schema_version, 4);
         let history_mesh = record
             .snapshot
             .data_blocks
@@ -1694,7 +1734,7 @@ mod tests {
         let (record, history_warnings) =
             parse_history_record(&serde_json::to_vec(&history_record(&source))?)?;
         assert!(history_warnings.is_empty(), "{history_warnings:?}");
-        assert_eq!(record.snapshot.schema_version, 3);
+        assert_eq!(record.snapshot.schema_version, 4);
         let history_mesh = record
             .snapshot
             .data_blocks

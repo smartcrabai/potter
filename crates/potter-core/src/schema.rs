@@ -89,7 +89,7 @@ fn scene_schema() -> Value {
     let mut root = base("Potter scene document");
     root["required"] = json!(["schema_version", "scene_id", "revision", "active_scene"]);
     root["properties"] = json!({
-        "schema_version":{"const":3},
+        "schema_version":{"const":4},
         "scene_id":{"type":"string","format":"uuid"},
         "revision":{"type":"integer","minimum":0,"maximum":9_007_199_254_740_991_u64},
         "active_scene":{"$ref":"#/$defs/id"},
@@ -175,6 +175,17 @@ fn scene_schema() -> Value {
         "type":"array",
         "items":{"enum":["data","object"]}
     });
+    root["$defs"]["captured_matrix_basis"] = json!({
+        "type":"object",
+        "required":["matrix_basis","fingerprint"],
+        "properties":{
+            "matrix_basis":{"type":"array","items":{"type":"number"},"minItems":16,"maxItems":16},
+            "fingerprint":{"type":"string"}
+        },
+        "additionalProperties":false
+    });
+    root["$defs"]["node"]["properties"]["blender_matrix_basis"] =
+        json!({"oneOf":[{"$ref":"#/$defs/captured_matrix_basis"},{"type":"null"}]});
     root["$defs"]["data_block"]["properties"]["materials"] = nullable_id_array_schema();
     complete_scene_schema(&mut root);
     root

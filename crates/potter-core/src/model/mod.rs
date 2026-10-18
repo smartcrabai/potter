@@ -31,8 +31,9 @@ pub use rig::{
     DriverVariable, DriverVariableType, ParentType, PoseBone, ShapeKey, ShapeKeyData, VertexGroup,
 };
 pub use scene::{
-    Action, ActionSlot, CameraData, CameraIntrinsics, CameraProjection, Collection, CurveData,
-    CurveDimensions, CurveFillMode, CurveHandleType, CurvePoint, CurveSpline, CurveSplineType,
+    Action, ActionSlot, CameraData, CameraIntrinsics, CameraProjection, CapturedMatrixBasis,
+    Collection, CurveData, CurveDimensions, CurveFillMode, CurveHandleType, CurvePoint, CurveSpline,
+    CurveSplineType,
     DataBlock, Extrapolation, FCurve, ForceField, ForceFieldType, GreasePencilData,
     GreasePencilFrame, GreasePencilLayer, GreasePencilPoint, GreasePencilStroke, HairCurve,
     HairCurvesData, HistoryState, Image, ImageAlphaMode, ImageColorspace, ImageSource, ImageTile,

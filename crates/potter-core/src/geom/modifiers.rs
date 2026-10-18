@@ -67,6 +67,21 @@ impl MergedGeometry {
 const MAX_SUBDIVISION_TRIANGLES: u128 = 100_000_000;
 const MAX_SUBDIVISION_MEMORY_BYTES: u128 = 8 * 1024 * 1024 * 1024;
 
+/// Blender `mul_m4_m4m4` on column-major f32 matrices: `left * right`. Each element sums its four
+/// products in pairs, `(p0 + p1) + (p2 + p3)`, the association `blender_matrix` verifies against
+/// the arm64 Blender build.
+pub(crate) fn blender_multiply_m4(left: [f32; 16], right: [f32; 16]) -> [f32; 16] {
+    let mut result = [0.0; 16];
+    for row in 0..4 {
+        for column in 0..4 {
+            result[column * 4 + row] = (right[column * 4] * left[row]
+                + right[column * 4 + 1] * left[4 + row])
+                + (right[column * 4 + 2] * left[8 + row] + right[column * 4 + 3] * left[12 + row]);
+        }
+    }
+    result
+}
+
 /// Result of evaluating a modifier stack, including realized graph instance paths.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModifierEvaluation {
@@ -167,7 +182,6 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
         .enumerate()
         .filter(|&(modifier_index, modifier)| is_active(modifier_index, modifier))
     {
-        validate_boolean_topology_suffix(modifiers, modifier_index, &is_active)?;
         let scene_operand_modifier = (matches!(
             modifier.modifier_type.as_str(),
             "boolean" | "shrinkwrap" | "surface_deform" | "mesh_deform"
@@ -441,63 +455,6 @@ fn unsupported_modifier(modifier: &Modifier) -> PotError {
         json!({"feature_id":feature_id}),
     )
 }
-fn modifier_depends_on_topology(modifier: &Modifier) -> bool {
-    matches!(
-        modifier.modifier_type.as_str(),
-        "array"
-            | "bevel"
-            | "boolean"
-            | "build"
-            | "decimate"
-            | "edge_split"
-            | "mask"
-            | "mirror"
-            | "multires"
-            | "remesh"
-            | "screw"
-            | "skin"
-            | "smooth"
-            | "solidify"
-            | "subdivision"
-            | "triangulate"
-            | "weld"
-            | "wireframe"
-    )
-}
-pub(crate) fn validate_boolean_topology_suffix(
-    modifiers: &[Modifier],
-    modifier_index: usize,
-    is_active: &impl Fn(usize, &Modifier) -> bool,
-) -> Result<()> {
-    let Some(boolean_modifier) = modifiers.get(modifier_index) else {
-        return Ok(());
-    };
-    if !is_active(modifier_index, boolean_modifier) || boolean_modifier.modifier_type != "boolean" {
-        return Ok(());
-    }
-    let Some(downstream) = modifiers
-        .iter()
-        .enumerate()
-        .skip(modifier_index + 1)
-        .find(|(index, candidate)| {
-            is_active(*index, candidate) && modifier_depends_on_topology(candidate)
-        })
-        .map(|(_, modifier)| modifier)
-    else {
-        return Ok(());
-    };
-    Err(PotError::with_details(
-        ErrorCode::UnsupportedFeature,
-        "Boolean output topology is not Blender-compatible for a downstream topology-dependent modifier",
-        json!({
-            "feature_id":"modifier.boolean.downstream_topology",
-            "modifier_id":boolean_modifier.id,
-            "solver":boolean_modifier.params.get("solver").and_then(Value::as_str),
-            "downstream_modifier_id":downstream.id,
-            "downstream_modifier_type":downstream.modifier_type
-        }),
-    ))
-}
 
 fn invalid_parameter(modifier: &Modifier, parameter: &str, expected: &str) -> PotError {
     let (name, pointer) = match parameter {
@@ -523,7 +480,7 @@ fn invalid_parameter(modifier: &Modifier, parameter: &str, expected: &str) -> Po
 pub(crate) enum BooleanSolver {
     /// Mesh Arrangements (`geom::boolean`).
     Exact,
-    /// Blender's FLOAT solver. Potter uses the BSP shortcut until `PR17b` ports Blender's float path.
+    /// Blender's FLOAT solver (BMesh intersection, ported in `geom::boolean::float`).
     Float,
     /// Blender's MANIFOLD solver, which Potter does not implement.
     Manifold,
@@ -537,7 +494,7 @@ pub(crate) enum BooleanOperandType {
 }
 
 /// Validated Boolean modifier parameters.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct BooleanSettings {
     pub solver: BooleanSolver,
     pub operation: super::boolean::Operation,
@@ -545,6 +502,7 @@ pub(crate) struct BooleanSettings {
     pub use_self: bool,
     pub hole_tolerant: bool,
     pub material_mode: super::boolean::MaterialMode,
+    pub double_threshold: Option<f32>,
 }
 
 impl BooleanSettings {
@@ -597,6 +555,11 @@ impl BooleanSettings {
             use_self: boolean_flag(modifier, "use_self")?,
             hole_tolerant: boolean_flag(modifier, "use_hole_tolerant")?,
             material_mode,
+            double_threshold: if solver == BooleanSolver::Float {
+                Some(boolean_double_threshold(modifier)?)
+            } else {
+                None
+            },
         })
     }
 }
@@ -623,6 +586,48 @@ fn boolean_flag(modifier: &Modifier, parameter: &str) -> Result<bool> {
             .as_bool()
             .ok_or_else(|| invalid_parameter(modifier, parameter, "true or false")),
     }
+}
+
+/// Blender's FLOAT collection rules: INTERSECT and an empty collection are refused.
+pub(crate) fn validate_boolean_float_collection(
+    modifier: &Modifier,
+    settings: BooleanSettings,
+    collection_is_empty: bool,
+) -> Result<()> {
+    if settings.solver != BooleanSolver::Float
+        || settings.operand_type != BooleanOperandType::Collection
+    {
+        return Ok(());
+    }
+    let message = if settings.operation == super::boolean::Operation::Intersect {
+        "Cannot execute, intersect only available using exact solver"
+    } else if collection_is_empty {
+        "Cannot execute, non-exact solver and empty collection"
+    } else {
+        return Ok(());
+    };
+    Err(PotError::with_details(
+        ErrorCode::InvalidOperation,
+        message,
+        json!({
+            "modifier_id": modifier.id,
+            "solver": "FLOAT",
+            "operand_type": "COLLECTION",
+        }),
+    ))
+}
+
+/// The FLOAT `double_threshold`, a number in `[0, 1]`.
+fn boolean_double_threshold(modifier: &Modifier) -> Result<f32> {
+    let threshold = number_param(modifier, "double_threshold")?;
+    if !(0.0..=1.0).contains(&threshold) {
+        return Err(invalid_parameter(
+            modifier,
+            "double_threshold",
+            "a finite number between 0 and 1",
+        ));
+    }
+    Ok(threshold as f32)
 }
 
 fn boolean_modifier(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
@@ -653,15 +658,43 @@ fn boolean_modifier(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
                 "solver": "MANIFOLD",
             }),
         )),
-        // shortcut: FLOAT is the pre-PR17 BSP until PR17b ports Blender's float path.
         BooleanSolver::Float => {
-            let operand =
-                modifier.runtime.operand_mesh.clone().ok_or_else(|| {
-                    invalid_parameter(modifier, "object", "a mesh object operand")
-                })?;
-            let operand: Mesh = serde_json::from_value(operand)
-                .map_err(|_| invalid_parameter(modifier, "object", "a mesh object operand"))?;
-            super::boolean::boolean_mesh_op(mesh, &operand, settings.operation)
+            let operands = &modifier.runtime.boolean_operands;
+            if settings.operand_type == BooleanOperandType::Collection
+                && operands.is_empty()
+                && optional_string_param(modifier, "collection")?.is_none()
+            {
+                return Ok(mesh.clone());
+            }
+            validate_boolean_float_collection(modifier, settings, operands.is_empty())?;
+            if settings.operand_type == BooleanOperandType::Object && operands.is_empty() {
+                if optional_string_param(modifier, "object")?.is_none() {
+                    return Ok(mesh.clone());
+                }
+                return Err(invalid_parameter(
+                    modifier,
+                    "object",
+                    "a resolved mesh object operand",
+                ));
+            }
+            if settings.operand_type == BooleanOperandType::Object
+                && let [operand] = operands.as_slice()
+                && let Some(result) =
+                    super::boolean::float_object_quick_mesh(mesh, operand, settings.operation)
+            {
+                return Ok(match result {
+                    super::boolean::FloatObjectQuickMesh::Subject => mesh.clone(),
+                    super::boolean::FloatObjectQuickMesh::Empty => Mesh::new(),
+                    super::boolean::FloatObjectQuickMesh::Operand(result) => result,
+                });
+            }
+            let double_threshold = settings.double_threshold.ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::InternalError,
+                    "FLOAT Boolean is missing its validated double_threshold",
+                )
+            })?;
+            super::boolean::float_boolean(mesh, operands, settings.operation, double_threshold)
         }
     }
 }

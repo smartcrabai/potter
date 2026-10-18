@@ -3262,9 +3262,7 @@ fn apply_generic_scene_mesh_operand_modifier(
         }
         combined = Some(match combined {
             None => transformed,
-            Some(existing) => {
-                combine_scene_operand_meshes(&existing, &transformed, &modifier.modifier_type)?
-            }
+            Some(existing) => combine_scene_operand_meshes(&existing, &transformed)?,
         });
     }
     let mut resolved = modifier.clone();
@@ -3280,11 +3278,7 @@ fn apply_generic_scene_mesh_operand_modifier(
     let operand = serde_json::to_value(operand).map_err(|error| {
         PotError::invalid_argument(format!("modifier operand serialization failed: {error}"))
     })?;
-    if matches!(modifier.modifier_type.as_str(), "shrinkwrap" | "curve") {
-        resolved.runtime.target_mesh = Some(operand);
-    } else {
-        resolved.runtime.operand_mesh = Some(operand);
-    }
+    resolved.runtime.target_mesh = Some(operand);
     *mesh = crate::geom::modifiers::evaluate_modifiers(mesh, &[resolved])?;
     Ok(())
 }
@@ -3305,10 +3299,7 @@ pub(crate) fn apply_scene_operand_modifier(
     if modifier.modifier_type == "hook" {
         return apply_scene_hook_modifier(mesh, modifier, subject_id, doc, world_matrices);
     }
-    if modifier.modifier_type == "boolean"
-        && crate::geom::modifiers::BooleanSettings::parse(modifier)?.solver
-            != crate::geom::modifiers::BooleanSolver::Float
-    {
+    if modifier.modifier_type == "boolean" {
         *material_slots = apply_boolean_operands_modifier(
             mesh,
             modifier,
@@ -3321,16 +3312,8 @@ pub(crate) fn apply_scene_operand_modifier(
         )?;
         return Ok(());
     }
-    // Blender's FLOAT Boolean never takes its own object as an operand: a self operand leaves the subject as it is.
-    if modifier.modifier_type == "boolean"
-        && modifier.params.get("object").and_then(Value::as_str) == Some(subject_id.as_str())
-    {
-        return Ok(());
-    }
-    if matches!(
-        modifier.modifier_type.as_str(),
-        "boolean" | "shrinkwrap" | "curve"
-    ) && !modifier.params.contains_key("collection")
+    if matches!(modifier.modifier_type.as_str(), "shrinkwrap" | "curve")
+        && !modifier.params.contains_key("collection")
     {
         return apply_generic_scene_mesh_operand_modifier(
             mesh,
@@ -3392,10 +3375,6 @@ pub(crate) fn apply_scene_operand_modifier(
             &mut BTreeSet::new(),
             &mut object_ids,
         )?;
-    }
-    if modifier.modifier_type == "boolean" && object_ids.remove(subject_id) && object_ids.is_empty()
-    {
-        return Ok(());
     }
     if object_ids.is_empty() {
         return Err(PotError::with_details(
@@ -3490,9 +3469,7 @@ pub(crate) fn apply_scene_operand_modifier(
         }
         combined = Some(match combined {
             None => operand,
-            Some(existing) => {
-                combine_scene_operand_meshes(&existing, &operand, &modifier.modifier_type)?
-            }
+            Some(existing) => combine_scene_operand_meshes(&existing, &operand)?,
         });
     }
     let mut resolved = modifier.clone();
@@ -3504,11 +3481,7 @@ pub(crate) fn apply_scene_operand_modifier(
     let operand = serde_json::to_value(operand).map_err(|error| {
         PotError::invalid_argument(format!("modifier operand serialization failed: {error}"))
     })?;
-    if matches!(modifier.modifier_type.as_str(), "shrinkwrap" | "curve") {
-        resolved.runtime.target_mesh = Some(operand);
-    } else {
-        resolved.runtime.operand_mesh = Some(operand);
-    }
+    resolved.runtime.target_mesh = Some(operand);
     *mesh = crate::geom::modifiers::evaluate_modifiers(mesh, &[resolved])?;
     Ok(())
 }
@@ -3731,17 +3704,23 @@ fn world_matrix_f32(matrix: DMat4) -> glam::Mat4 {
 
 /// One Boolean operand object: its mesh (the evaluated mesh when present, else the data mesh with
 /// its vertex groups) and its transform into the subject's space: Blender's f32 product from
-/// `geom::blender_matrix` when it applies, else the f64 fallback. Also returns its material slots.
-fn boolean_operand(
+/// `geom::blender_matrix` when it applies, else the f64 fallback. Also returns its effective
+/// material slots, which its face material indices refer to, and its DATA vertex groups.
+fn boolean_operand<'d>(
     modifier: &Modifier,
-    doc: &SceneDoc,
+    doc: &'d SceneDoc,
     object_id: &Id,
     subject_inverse: glam::Mat4,
     subject_id: &Id,
+    subject_negative: bool,
     world_matrices: &BTreeMap<Id, DMat4>,
     evaluated_meshes: &BTreeMap<Id, Mesh>,
     evaluated_nodes: &BTreeMap<Id, EvaluatedNode>,
-) -> Result<(crate::geom::boolean::BooleanOperand, Vec<Option<Id>>)> {
+) -> Result<(
+    crate::geom::boolean::BooleanOperand,
+    Vec<Option<Id>>,
+    &'d [VertexGroup],
+)> {
     let object = doc.nodes.get(object_id).ok_or_else(|| {
         PotError::with_details(
             ErrorCode::TargetNotFound,
@@ -3803,6 +3782,9 @@ fn boolean_operand(
     let operand = crate::geom::boolean::BooleanOperand {
         mesh,
         to_subject,
+        float_flip: Some(
+            subject_negative != crate::geom::blender_matrix::is_negative_m4(object_world),
+        ),
         material_remap: Vec::new(),
     };
     // An evaluated operand contributes its evaluated table (after its own modifiers, e.g. a TRANSFER
@@ -3814,13 +3796,45 @@ fn boolean_operand(
         ),
         None => effective_material_slots(object, &data.materials),
     };
-    Ok((operand, slots))
+    Ok((operand, slots, data.vertex_groups.as_slice()))
 }
 
-/// The Boolean operands of an EXACT (or MANIFOLD, refused by the modifier) solver. The subject is
-/// operand 0 and is not listed; each operand object keeps its own mesh and transform, and the
-/// modifier combines them in one N-ary call, so a collection is never folded pairwise. Returns the
-/// output material slots: the subject's own slots for INDEX, or the pool for TRANSFER.
+/// Re-keys an operand's vertex-group weights from the operand's group names to the subject's, by
+/// group position. Operand groups without a subject counterpart are dropped.
+fn remap_float_operand_vertex_groups(
+    mesh: &mut Mesh,
+    operand_groups: &[VertexGroup],
+    subject_groups: &[VertexGroup],
+) {
+    let Some(by_name) = mesh
+        .attributes
+        .get_mut("vertex_groups")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    let mut source = std::mem::take(by_name);
+    let mut remapped = Map::new();
+    for (index, operand_group) in operand_groups.iter().enumerate() {
+        let Some(subject_group) = subject_groups.get(index) else {
+            break;
+        };
+        if let Some(weights) = source.remove(&operand_group.name) {
+            remapped.insert(subject_group.name.clone(), weights);
+        }
+    }
+    *by_name = remapped;
+}
+
+/// The Boolean operands of one modifier in Blender's order. The subject is operand 0 and is not
+/// listed; each operand object keeps its own mesh and transform, and the modifier combines them in
+/// one N-ary call, so a collection is never folded pairwise. Returns the output material slots.
+///
+/// EXACT returns the subject's DATA slots for INDEX, or the TRANSFER pool. FLOAT always remaps by
+/// INDEX against the subject's effective (OBJECT-resolved) slots, and returns the subject's DATA
+/// slots unchanged: the effective table of the result is the one it remapped against. A FLOAT
+/// object shortcut that adopts the operand's mesh returns the operand's effective slots, which its
+/// face indices refer to.
 fn apply_boolean_operands_modifier(
     mesh: &mut Mesh,
     modifier: &Modifier,
@@ -3831,13 +3845,20 @@ fn apply_boolean_operands_modifier(
     evaluated_nodes: &BTreeMap<Id, EvaluatedNode>,
     subject_slots: &[Option<Id>],
 ) -> Result<Vec<Option<Id>>> {
+    use crate::geom::modifiers::{BooleanOperandType, BooleanSolver};
+
     let settings = crate::geom::modifiers::BooleanSettings::parse(modifier)?;
+    let float = settings.solver == BooleanSolver::Float;
+    crate::geom::modifiers::validate_boolean_float_collection(modifier, settings, false)?;
     let object_ids = boolean_operand_object_ids(modifier, doc, settings.operand_type)?;
+    crate::geom::modifiers::validate_boolean_float_collection(
+        modifier,
+        settings,
+        object_ids.is_empty(),
+    )?;
     // Blender `non_float_boolean_mesh` returns the mesh unchanged for an OBJECT operand that is
     // unset (MOD_boolean.cc:406), so neither geometry nor material slots change.
-    if settings.operand_type == crate::geom::modifiers::BooleanOperandType::Object
-        && object_ids.is_empty()
-    {
+    if settings.operand_type == BooleanOperandType::Object && object_ids.is_empty() {
         return Ok(subject_slots.to_vec());
     }
     let subject_world = world_matrices.get(subject_id).copied().ok_or_else(|| {
@@ -3853,37 +3874,84 @@ fn apply_boolean_operands_modifier(
             "modifier subject transform must be invertible",
         ));
     }
+    let subject_node = doc.nodes.get(subject_id).ok_or_else(|| {
+        PotError::new(ErrorCode::InternalError, "modifier subject node is missing")
+    })?;
+    let subject_negative = crate::geom::blender_matrix::is_negative_m4(subject_world);
+    let subject_groups = subject_node
+        .data
+        .as_ref()
+        .and_then(|data_id| doc.data_blocks.get(data_id))
+        .map_or(&[][..], |data| data.vertex_groups.as_slice());
     let mut operands = Vec::new();
     let mut operand_slots = Vec::new();
     for object_id in object_ids
         .iter()
         .filter(|object_id| *object_id != subject_id)
     {
-        let (operand, slots) = boolean_operand(
+        let (mut operand, slots, operand_groups) = boolean_operand(
             modifier,
             doc,
             object_id,
             subject_inverse,
             subject_id,
+            subject_negative,
             world_matrices,
             evaluated_meshes,
             evaluated_nodes,
         )?;
+        if float {
+            remap_float_operand_vertex_groups(&mut operand.mesh, operand_groups, subject_groups);
+        }
         operands.push(operand);
         operand_slots.push(slots);
     }
+    // FLOAT leaves the mesh unchanged when the subject is the only member of a collection.
+    if float && settings.operand_type == BooleanOperandType::Collection && operands.is_empty() {
+        return Ok(subject_slots.to_vec());
+    }
+    if float
+        && settings.operand_type == BooleanOperandType::Object
+        && let [operand] = operands.as_slice()
+        && let Some(quick) =
+            crate::geom::boolean::float_object_quick_mesh(mesh, operand, settings.operation)
+    {
+        return Ok(match quick {
+            crate::geom::boolean::FloatObjectQuickMesh::Subject => subject_slots.to_vec(),
+            crate::geom::boolean::FloatObjectQuickMesh::Empty => {
+                *mesh = Mesh::new();
+                Vec::new()
+            }
+            crate::geom::boolean::FloatObjectQuickMesh::Operand(result) => {
+                *mesh = result;
+                operand_slots.first().cloned().unwrap_or_default()
+            }
+        });
+    }
+    let material_mode = if float {
+        crate::geom::boolean::MaterialMode::Index
+    } else {
+        settings.material_mode
+    };
+    let effective_subject;
+    let subject_table = if float {
+        effective_subject = effective_material_slots(subject_node, subject_slots);
+        effective_subject.as_slice()
+    } else {
+        subject_slots
+    };
     // Blender `non_float_boolean_mesh` (source/blender/modifiers/intern/MOD_boolean.cc, v5.2.2):
     // the TRANSFER pool starts from the subject mesh's own material array (`mesh->mat`, the DATA
     // slots, here `subject_slots`), and each operand's slots come from `get_material_remap_transfer`,
     // which reads `BKE_object_material_get_eval` (blenkernel/intern/material.cc:772), i.e. the
     // effective slots `operand_slots` holds. The subject keeps its own indices in both modes.
-    let subject_refs: Vec<Option<&Id>> = subject_slots.iter().map(Option::as_ref).collect();
+    let subject_refs: Vec<Option<&Id>> = subject_table.iter().map(Option::as_ref).collect();
     let operand_refs: Vec<Vec<Option<&Id>>> = operand_slots
         .iter()
         .map(|slots| slots.iter().map(Option::as_ref).collect())
         .collect();
     let (remaps, pool) =
-        crate::geom::boolean::material_remaps(settings.material_mode, &subject_refs, &operand_refs);
+        crate::geom::boolean::material_remaps(material_mode, &subject_refs, &operand_refs);
     for (operand, remap) in operands.iter_mut().zip(remaps.into_iter().skip(1)) {
         operand.material_remap = remap;
     }
@@ -3893,14 +3961,10 @@ fn apply_boolean_operands_modifier(
     }
     resolved.runtime.boolean_operands = operands;
     *mesh = crate::geom::modifiers::evaluate_modifiers(mesh, &[resolved])?;
-    Ok(pool)
+    Ok(if float { subject_slots.to_vec() } else { pool })
 }
 
-fn combine_scene_operand_meshes(first: &Mesh, second: &Mesh, modifier_type: &str) -> Result<Mesh> {
-    // shortcut: FLOAT folds collection members pairwise until PR17b; EXACT never reaches here.
-    if modifier_type == "boolean" {
-        return crate::geom::boolean::boolean_mesh(first, second, "UNION");
-    }
+fn combine_scene_operand_meshes(first: &Mesh, second: &Mesh) -> Result<Mesh> {
     let mut result = Mesh::new();
     for source in [first, second] {
         let mut vertex_ids = std::collections::HashMap::with_capacity(source.vertices.len());

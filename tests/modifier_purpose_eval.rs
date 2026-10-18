@@ -6,7 +6,7 @@
 //! `show_render=False` the render export gives the base 8 vertices; with `show_viewport=False` the
 //! viewport gives 8 and the render gives 98.
 
-use std::{collections::BTreeMap, error::Error, fmt::Debug};
+use std::{error::Error, fmt::Debug};
 
 use glam::DVec3;
 use potter_core::{
@@ -343,9 +343,8 @@ fn hidden_physics_sources_respect_purpose_and_legacy_properties() -> TestResult 
 }
 
 #[test]
-fn failing_node_and_dependents_are_reported_for_both_purposes() -> TestResult {
-    // `host` gets Boolean followed by Decimate, which is refused as an unsupported topology
-    // combination. `follower` uses `host` as its Boolean operand, so it depends on the failure.
+fn boolean_results_feed_dependent_modifiers_for_both_purposes() -> TestResult {
+    // `host` runs Boolean then Decimate; `follower` consumes its evaluated output.
     let doc = apply(
         &SceneDoc::new(SCENE_ID.to_owned()),
         &[
@@ -380,51 +379,12 @@ fn failing_node_and_dependents_are_reported_for_both_purposes() -> TestResult {
     let cutter = Id::new("cutter")?;
 
     for purpose in [EvaluationPurpose::Preview, EvaluationPurpose::Render] {
-        let (snapshot, node_errors): (Snapshot, BTreeMap<Id, PotError>) =
+        let (snapshot, node_errors) =
             Snapshot::evaluate_available_with_cache(&doc, &purpose_context(purpose), None, None)?;
-        ensure_eq(&node_errors.len(), &2, "failing and dependent node count")?;
-
-        let host_error = node_errors.get(&host).ok_or("host error is missing")?;
-        ensure_eq(
-            &host_error.code,
-            &ErrorCode::UnsupportedFeature,
-            "host error code",
-        )?;
-        ensure_eq(
-            &host_error.details["feature_id"],
-            &json!("modifier.boolean.downstream_topology"),
-            "host feature id",
-        )?;
-
-        let follower_error = node_errors
-            .get(&follower)
-            .ok_or("follower error is missing")?;
-        ensure_eq(
-            &follower_error.code,
-            &ErrorCode::UnsupportedFeature,
-            "follower error code",
-        )?;
-        ensure_eq(
-            &follower_error.details["dependency_node_id"],
-            &json!("host"),
-            "follower dependency",
-        )?;
-
-        ensure_eq(
-            &snapshot.meshes.contains_key(&host),
-            &false,
-            "failed host mesh is withheld",
-        )?;
-        ensure_eq(
-            &snapshot.meshes.contains_key(&follower),
-            &false,
-            "dependent mesh is withheld",
-        )?;
-        ensure_eq(
-            &snapshot.meshes.contains_key(&cutter),
-            &true,
-            "independent mesh is kept",
-        )?;
+        ensure_eq(&node_errors.is_empty(), &true, "no node evaluation errors")?;
+        for (id, name) in [(&host, "host"), (&follower, "follower"), (&cutter, "cutter")] {
+            ensure_eq(&snapshot.meshes.contains_key(id), &true, name)?;
+        }
     }
     Ok(())
 }

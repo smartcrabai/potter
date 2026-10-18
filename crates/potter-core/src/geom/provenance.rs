@@ -237,7 +237,7 @@ pub(crate) fn remap_attributes_skipping(
                 .as_array()
                 .map(|flags| Value::Array(sources.polygon_smooth(flags))),
             _ => native_domain(value)
-                .map(|_| sources.native_attribute(value))
+                .map(|_| sources.native_attribute(key, value))
                 .or_else(|| sources.named_attribute(value)),
         };
         attributes.insert(key.clone(), remapped.unwrap_or_else(|| value.clone()));
@@ -706,17 +706,41 @@ impl Sources<'_> {
             .collect()
     }
 
+    /// Blender's color data type of the color attribute `name`: the `blender_metadata` entry written
+    /// with it, or FLOAT_COLOR when there is none.
+    fn color_data_type(&self, name: &str) -> &'static str {
+        let stored = self
+            .source
+            .attributes
+            .get("blender_metadata")
+            .and_then(|metadata| metadata.get("color_data_types"))
+            .and_then(Value::as_object)
+            .and_then(|types| types.get(name))
+            .and_then(Value::as_str);
+        if stored == Some("BYTE_COLOR") {
+            "BYTE_COLOR"
+        } else {
+            "FLOAT_COLOR"
+        }
+    }
+
     /// A native element attribute (`{"domain", "type", "values"}`) moved to the output elements of its
     /// domain. Point, edge, and corner values blend over their origins by weight, and a face value copies
     /// its source face's value. An output element with no source value gets no entry, so a reader takes
     /// its type's default for the missing key and no default is ever written. A corner row is written
     /// only when one of its corners blends a value; its other corners take the type's default. Booleans
-    /// blend as OR over the positive-weight sources, and colors blend channel by channel.
-    fn native_attribute(&self, attribute: &Value) -> Value {
+    /// blend as OR over the positive-weight sources, and colors use Blender's FLOAT_COLOR or BYTE_COLOR
+    /// mixer, with the color type from `blender_metadata` for color attributes.
+    fn native_attribute(&self, key: &str, attribute: &Value) -> Value {
         let Some(values) = attribute.get("values").and_then(Value::as_object) else {
             return attribute.clone();
         };
-        let data_type = blend_type(text(attribute, "type"));
+        let kind = text(attribute, "type");
+        let data_type = if kind == "color" {
+            attribute_keys::user_name(key).map_or("FLOAT_COLOR", |name| self.color_data_type(name))
+        } else {
+            blend_type(kind)
+        };
         let default = || default_value(data_type);
         let remapped: Map<String, Value> = match text(attribute, "domain") {
             "point" => {
@@ -879,17 +903,27 @@ impl Sources<'_> {
     }
     /// One canonical color layer rebuilt in storage order and keyed by `color_layers::write`.
     fn color_layer(&self, layer: &ColorLayer) -> ColorLayer {
+        let data_type = self.color_data_type(&layer.name);
+        let blend_layer = |sources: &[(usize, f64)]| {
+            blend_rgba(
+                sources
+                    .iter()
+                    .filter_map(|(index, weight)| Some((*layer.values.get(*index)?, *weight))),
+                data_type,
+            )
+            .unwrap_or([0.0, 0.0, 0.0, 1.0])
+        };
         let values = match layer.domain {
             ColorDomain::Point => self
                 .origin
                 .vertices
                 .iter()
-                .map(|sources| blend_color(&layer.values, sources))
+                .map(|sources| blend_layer(sources.as_slice()))
                 .collect(),
             ColorDomain::Corner => self
                 .corner_origin
                 .iter()
-                .map(|sources| blend_color(&layer.values, sources))
+                .map(|sources| blend_layer(sources.as_slice()))
                 .collect(),
         };
         ColorLayer {
@@ -1113,19 +1147,35 @@ fn blend_uv(uvs: &[[f64; 2]], sources: &[(usize, f64)]) -> [f64; 2] {
     if found { uv } else { [0.0, 1.0] }
 }
 
-/// Blend canonical RGBA colors; an output without source values takes the opaque-black default.
-fn blend_color(values: &[[f64; 4]], sources: &[(usize, f64)]) -> [f64; 4] {
-    let mut color = [0.0; 4];
-    let mut found = false;
-    for (index, weight) in sources {
-        if let Some(source) = values.get(*index) {
-            found = true;
-            for (channel, value) in color.iter_mut().zip(source) {
-                *channel += weight * value;
-            }
+/// Blend canonical RGBA colors of `data_type` by source weight, with Blender's FLOAT_COLOR and
+/// BYTE_COLOR mixers. `None` when no source has a weight.
+fn blend_rgba(colors: impl Iterator<Item = ([f64; 4], f64)>, data_type: &str) -> Option<[f64; 4]> {
+    let byte_color = data_type == "BYTE_COLOR";
+    let mut sums = [0.0_f32; 4];
+    let mut total = 0.0_f32;
+    for (color, weight) in colors {
+        let channels = if byte_color {
+            color_layers::byte_color_encoded_components(color)
+                .map(|channel| channel.round().clamp(0.0, 255.0))
+        } else {
+            color.map(|channel| channel as f32)
+        };
+        let weight = weight as f32;
+        total += weight;
+        for (sum, channel) in sums.iter_mut().zip(channels) {
+            *sum += channel * weight;
         }
     }
-    if found { color } else { [0.0, 0.0, 0.0, 1.0] }
+    if total == 0.0 {
+        return None;
+    }
+    let weight_inv = 1.0_f32 / total;
+    Some(if byte_color {
+        let bytes = sums.map(|sum| (sum * weight_inv).trunc() as u8 as f32);
+        color_layers::byte_color_decoded_components(bytes)
+    } else {
+        sums.map(|sum| f64::from(sum * weight_inv))
+    })
 }
 
 /// Blender data types stored as integers; blended results round to the nearest integer.
@@ -1133,13 +1183,40 @@ fn is_integer(data_type: &str) -> bool {
     matches!(data_type, "INT" | "INT8")
 }
 
-/// Blend values by weight: numbers and equal-length number arrays interpolate componentwise
-/// (rounded for integer types); booleans OR over the positive-weight sources; anything else takes
-/// the value of the heaviest source.
+/// The RGBA components of a color value, when it has exactly four numbers.
+fn rgba_value(value: &Value) -> Option<[f64; 4]> {
+    let components = value.as_array().filter(|components| components.len() == 4)?;
+    Some([
+        components[0].as_f64()?,
+        components[1].as_f64()?,
+        components[2].as_f64()?,
+        components[3].as_f64()?,
+    ])
+}
+
+/// Blend color values by weight with [`blend_rgba`]. `None` when a value is not RGBA or no source
+/// has a weight.
+fn blend_color(items: &[(&Value, f64)], data_type: &str) -> Option<Value> {
+    let colors = items
+        .iter()
+        .map(|(value, weight)| Some((rgba_value(value)?, *weight)))
+        .collect::<Option<Vec<_>>>()?;
+    blend_rgba(colors.into_iter(), data_type)
+        .map(|color| Value::Array(color.map(|channel| json!(channel)).into()))
+}
+
+/// Blend values by weight: colors use Blender's FLOAT_COLOR/BYTE_COLOR mixers; numbers and equal-length
+/// number arrays interpolate componentwise (rounded for integer types); booleans OR over the
+/// positive-weight sources; anything else takes the value of the heaviest source.
 /// `None` when there are no sources.
 fn blend<'a>(items: impl Iterator<Item = (&'a Value, f64)>, data_type: &str) -> Option<Value> {
     let items: Vec<(&Value, f64)> = items.collect();
     let first = items.first()?.0;
+    if matches!(data_type, "FLOAT_COLOR" | "BYTE_COLOR")
+        && let Some(color) = blend_color(&items, data_type)
+    {
+        return Some(color);
+    }
     if items.iter().all(|(value, _)| value.is_number()) {
         let sum: f64 = items
             .iter()
@@ -1276,6 +1353,23 @@ mod tests {
             vec![vec![0, 1, 2]],
         )
         .expect("triangle")
+    }
+
+    fn expected_byte_color(bytes: [f32; 4]) -> [f64; 4] {
+        const BYTE_TO_UNIT: f32 = 1.0 / 255.0;
+        std::array::from_fn(|index| {
+            let encoded = bytes[index] * BYTE_TO_UNIT;
+            let decoded = if index < 3 {
+                if encoded <= 0.04045 {
+                    encoded * (1.0 / 12.92)
+                } else {
+                    ((encoded + 0.055) * (1.0 / 1.055)).powf(2.4)
+                }
+            } else {
+                encoded
+            };
+            f64::from(decoded)
+        })
     }
 
     #[test]
@@ -1534,6 +1628,115 @@ mod tests {
         );
         assert_eq!(store.active.as_deref(), Some("Paint"));
         assert_eq!(store.render.as_deref(), Some("color_layers"));
+    }
+
+    #[test]
+    fn color_mixers_preserve_float32_and_byte_color_quantization() {
+        let black = json!([0.0, 0.0, 0.0, 0.0]);
+        let white = json!([1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(
+            blend([(&black, 0.5), (&white, 0.5)].into_iter(), "FLOAT_COLOR"),
+            Some(json!([0.5, 0.5, 0.5, 0.5]))
+        );
+        assert_eq!(
+            blend([(&black, 1.0), (&white, 3.0)].into_iter(), "FLOAT_COLOR"),
+            Some(json!([0.75, 0.75, 0.75, 0.75]))
+        );
+        let large = json!([16_777_216.0, 0.0, 0.0, 1.0]);
+        let small = json!([1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(
+            blend([(&large, 0.5), (&small, 0.5)].into_iter(), "FLOAT_COLOR"),
+            Some(json!([8_388_608.0, 0.0, 0.0, 0.5]))
+        );
+        let byte_half = blend([(&black, 0.5), (&white, 0.5)].into_iter(), "BYTE_COLOR")
+            .expect("byte color blend");
+        assert_eq!(byte_half, json!(expected_byte_color([127.0; 4])));
+
+        let halfway = json!([0.5, 0.5, 0.5, 0.5]);
+        let rounded = blend([(&halfway, 1.0)].into_iter(), "BYTE_COLOR")
+            .expect("single byte color");
+        assert_eq!(
+            rounded,
+            json!(expected_byte_color([188.0, 188.0, 188.0, 128.0]))
+        );
+    }
+
+    #[test]
+    fn color_encoding_comes_from_native_metadata_and_generic_data_type() {
+        let mut source = triangle();
+        let vertices: Vec<u32> = source.vertices.iter().map(|vertex| vertex.id).collect();
+        let black = json!([0.0, 0.0, 0.0, 0.0]);
+        let white = json!([1.0, 1.0, 1.0, 1.0]);
+        let values = vec![black.clone(), white.clone(), white.clone()];
+        let native_values = keyed(vec![
+            (format!("v{}", vertices[0]), black.clone()),
+            (format!("v{}", vertices[1]), white.clone()),
+            (format!("v{}", vertices[2]), white.clone()),
+        ]);
+        let escaped_name = attribute_keys::storage_key("color_layers").into_owned();
+        source.attributes.insert(
+            escaped_name.clone(),
+            json!({"domain": "point", "type": "color", "values": native_values.clone()}),
+        );
+        source.attributes.insert(
+            "Fallback".to_owned(),
+            json!({"domain": "point", "type": "color", "values": native_values.clone()}),
+        );
+        source.attributes.insert(
+            "FloatByMetadata".to_owned(),
+            json!({"domain": "point", "type": "color", "values": native_values}),
+        );
+        source.attributes.insert(
+            "blender_metadata".to_owned(),
+            json!({"color_data_types": {
+                "color_layers": "BYTE_COLOR",
+                "FloatByMetadata": "FLOAT_COLOR"
+            }}),
+        );
+        source.attributes.insert(
+            "blender_attributes".to_owned(),
+            json!([
+                {"name": "Byte", "domain": "POINT", "data_type": "BYTE_COLOR", "values": values},
+                {
+                    "name": "Float",
+                    "domain": "POINT",
+                    "data_type": "FLOAT_COLOR",
+                    "values": [black.clone(), white.clone(), white.clone()]
+                }
+            ]),
+        );
+        let mut output = triangle();
+        let origin = Origin {
+            vertices: vec![vec![(0, 1.0)], vec![(1, 1.0)], vec![(0, 0.5), (1, 0.5)]],
+            faces: vec![Some(0)],
+            corners: None,
+        };
+
+        remap_attributes(&source, &mut output, &origin).expect("remap");
+
+        let output_vertex = format!("v{}", output.vertices[2].id);
+        let expected_byte = json!(expected_byte_color([127.0; 4]));
+        let expected_float = json!([0.5, 0.5, 0.5, 0.5]);
+        assert_eq!(
+            output.attributes[&escaped_name]["values"][output_vertex.as_str()],
+            expected_byte
+        );
+        assert_eq!(
+            output.attributes["Fallback"]["values"][output_vertex.as_str()],
+            expected_float
+        );
+        assert_eq!(
+            output.attributes["FloatByMetadata"]["values"][output_vertex.as_str()],
+            expected_float
+        );
+        assert_eq!(
+            output.attributes["blender_attributes"][0]["values"][2],
+            expected_byte
+        );
+        assert_eq!(
+            output.attributes["blender_attributes"][1]["values"][2],
+            expected_float
+        );
     }
 
     #[test]

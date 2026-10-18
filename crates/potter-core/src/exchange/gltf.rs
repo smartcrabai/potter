@@ -2803,7 +2803,7 @@ pub(crate) fn resolve_material_surfaces(doc: &SceneDoc) -> Result<BTreeMap<Id, R
     resolve_material_surfaces_using(doc, |id| material_is_used(doc, id))
 }
 
-fn resolve_material_surfaces_with_snapshot(
+pub(crate) fn resolve_material_surfaces_with_snapshot(
     doc: &SceneDoc,
     snapshot: &Snapshot,
 ) -> Result<BTreeMap<Id, ResolvedSurface>> {

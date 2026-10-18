@@ -6,7 +6,7 @@
 //! - b: an unset OBJECT Boolean leaves closed monkey and cube meshes unchanged.
 //! - c: an empty COLLECTION operand self-cleans a self-overlapping subject without error.
 //! - d: the subject is a member of its own operand collection; no cycle, and the subject is skipped.
-//! - e: INDEX remap of operand slots onto the subject's slots (one slot, same material, last match).
+//! - e: INDEX remap prefers a same-index slot, then the first subject slot with the same material.
 //! - f: TRANSFER into a subject without material slots; `modifier.apply` persists the pool with the
 //!   empty slot as `null`, and the cutter materials after it.
 //! - g: touching cubes rotated about Z, in world space (the rot.py reviewer probe).
@@ -41,7 +41,10 @@ use std::{
 };
 
 use glam::DVec3;
-use potter_core::model::{Id, SceneDoc};
+use potter_core::{
+    eval::{EvaluationContext, Snapshot},
+    model::{Id, MaterialLink, SceneDoc},
+};
 use serde_json::{Value, json};
 use tempfile::tempdir;
 
@@ -57,7 +60,7 @@ const REGRESSION_CASES: [&str; 23] = [
     "subject_in_collection_union",
     "index_remap_one_slot",
     "index_remap_same_material_keeps_slot",
-    "index_remap_last_matching_slot",
+    "index_remap_first_matching_slot",
     "transfer_empty_subject",
     "rotated_touch_10",
     "rotated_touch_17",
@@ -196,6 +199,47 @@ fn expected_material_names(expected: &Value) -> TestResult<Vec<Option<String>>> 
     Ok(names)
 }
 
+/// The rotated fixtures carry Blender's local matrix_basis through import; as roots, it is their
+/// evaluated world matrix too.
+fn assert_rotated_matrix_capture(document: &SceneDoc) -> TestResult {
+    let snapshot = Snapshot::evaluate(document, &EvaluationContext::default())?;
+    for degrees in [10, 37, 53] {
+        let host_name = format!("rotated_touch_{degrees}");
+        for name in [host_name.clone(), format!("{host_name}.cutter")] {
+            let id = find_node(document, &name)?;
+            let node = &document.nodes[&id];
+            let captured = node
+                .captured_matrix_basis(&node.transform)?
+                .ok_or_else(|| format!("{name} has no valid imported matrix_basis"))?;
+            assert_eq!(
+                snapshot.nodes[&id].world_matrix, captured,
+                "{name}: evaluated world matrix must preserve imported matrix_basis"
+            );
+        }
+    }
+
+    let mut changed_document = document.clone();
+    let changed_id = find_node(&changed_document, "rotated_touch_10")?;
+    let changed_node = changed_document
+        .nodes
+        .get_mut(&changed_id)
+        .ok_or("rotated_touch_10 disappeared from the cloned scene")?;
+    changed_node.transform.translation[0] += 0.25;
+    assert_eq!(
+        changed_node.captured_matrix_basis(&changed_node.transform)?,
+        None,
+        "changing the transform must invalidate the captured matrix_basis"
+    );
+    let decomposed_matrix = changed_node.transform.matrix().to_cols_array();
+    let changed_snapshot = Snapshot::evaluate(&changed_document, &EvaluationContext::default())?;
+    assert_eq!(
+        changed_snapshot.nodes[&changed_id].world_matrix,
+        decomposed_matrix,
+        "an invalidated matrix_basis must fall back to the changed decomposed transform"
+    );
+    Ok(())
+}
+
 #[test]
 fn exact_boolean_regressions_match_blender() -> TestResult {
     let blender = blender_executable().ok_or(BLENDER_REQUIRED)?;
@@ -210,6 +254,7 @@ fn exact_boolean_regressions_match_blender() -> TestResult {
     )?;
     let project = root.join("project");
     let mut document = import_blend_scene(&blender, &root.join("scene.blend"), &project)?;
+    assert_rotated_matrix_capture(&document)?;
 
     let expectations = read_expectations(&fixture.join("expected"))?;
     assert_eq!(
@@ -261,21 +306,57 @@ fn exact_boolean_regressions_match_blender() -> TestResult {
     for (case, expected_json) in &expectations {
         let node_id = find_node(&document, case)?;
         if expected_json["kind"] == "applied" {
+            let node = document
+                .nodes
+                .get(&node_id)
+                .ok_or("applied Boolean node disappeared")?;
+            let data_id = node.data.as_ref().ok_or("applied Boolean data is missing")?;
+            let data = document
+                .data_blocks
+                .get(data_id)
+                .ok_or("applied Boolean DataBlock is missing")?;
+            let expected_slots = expected_material_names(expected_json)?;
             // Blender's `slot.material` is the effective material: a DATA-linked slot shows the mesh's
             // material, so read through the node's slot resolution, not its object-level list.
-            let node = &document.nodes[&node_id];
-            let data = node
-                .data
-                .as_ref()
-                .and_then(|id| document.data_blocks.get(id));
-            let effective: Vec<Option<Id>> = (0..node.material_slot_count(data))
-                .map(|slot| node.material_slot(data, slot).cloned())
-                .collect();
-            let actual_slots = material_names(&document, &effective)?;
-            let expected_slots = expected_material_names(expected_json)?;
+            let slot_count = node.material_slot_count(Some(data));
+            let actual_slots = (0..slot_count)
+                .map(|slot| -> TestResult<Option<String>> {
+                    match node.material_slot(Some(data), slot) {
+                        Some(material_id) => Ok(Some(
+                            document
+                                .materials
+                                .get(material_id)
+                                .ok_or_else(|| format!("material `{material_id}` is missing"))?
+                                .name
+                                .clone(),
+                        )),
+                        None => Ok(None),
+                    }
+                })
+                .collect::<TestResult<Vec<_>>>()?;
             if actual_slots != expected_slots {
                 failures.push(format!(
-                    "{case}: applied material slots {actual_slots:?} differ from Blender {expected_slots:?}"
+                    "{case}: effective material slots {actual_slots:?} differ from Blender {expected_slots:?}"
+                ));
+            }
+            let object_slots = material_names(&document, &node.materials)?;
+            let expected_object_slots = vec![None; expected_slots.len()];
+            if object_slots != expected_object_slots {
+                failures.push(format!(
+                    "{case}: raw OBJECT slots {object_slots:?} differ from {expected_object_slots:?}"
+                ));
+            }
+            let data_slots = material_names(&document, &data.materials)?;
+            if data_slots != expected_slots {
+                failures.push(format!(
+                    "{case}: raw DATA slots {data_slots:?} differ from Blender {expected_slots:?}"
+                ));
+            }
+            let expected_links = vec![MaterialLink::Data; expected_slots.len()];
+            if node.material_links != expected_links {
+                failures.push(format!(
+                    "{case}: slot links {:?} differ from expected DATA links {expected_links:?}",
+                    node.material_links
                 ));
             }
         }

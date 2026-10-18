@@ -1,4 +1,4 @@
-//! Cross-slice tests of the exact intersection stage against Blender 5.2.2 output.
+//! Cross-slice tests of Boolean kernels and Blender 5.2.2 behavior.
 //!
 //! Expected coordinates come from Blender's EXACT DIFFERENCE result for an offset cube
 //! (research-pr17-boolean.md §3.1, probe `probe_boolean.py`): the vertices of that result that are
@@ -11,8 +11,9 @@ use glam::{DMat4, DVec3};
 use num_traits::Zero;
 
 use super::{
-    MaterialMode,
+    BooleanOperand, FloatObjectQuickMesh, MaterialMode, Operation,
     exact::{Rat, Rat3, add3, cross3, rat_from_f64, sub3},
+    float_object_quick_mesh,
     imesh::{Arena, Tri},
     input::{Operand, meshes_to_tris},
     intersect::trimesh_nary_intersect,
@@ -264,4 +265,125 @@ fn run_remaps(
     let operand_refs: Vec<Vec<Option<&Id>>> =
         operand_slots.iter().map(|slots| borrowed(slots)).collect();
     material_remaps(mode, &subject_refs, &operand_refs)
+}
+
+fn quick_mesh_triangle() -> Result<Mesh, String> {
+    Mesh::from_positions_and_faces(
+        vec![
+            DVec3::new(1.0, 2.0, 3.0),
+            DVec3::new(-1.0, 0.5, 2.0),
+            DVec3::new(0.0, -2.0, 1.0),
+        ],
+        vec![vec![0, 1, 2]],
+    )
+    .map_err(|error| format!("{error:?}"))
+}
+
+fn quick_mesh_wire() -> Result<Mesh, String> {
+    let mut mesh = Mesh::from_positions_and_faces(vec![DVec3::ZERO, DVec3::X, DVec3::Y], vec![])
+        .map_err(|error| format!("{error:?}"))?;
+    mesh.insert_edge([0, 1]).map_err(|error| format!("{error:?}"))?;
+    Ok(mesh)
+}
+
+fn quick_mesh_operand(mesh: Mesh, to_subject: DMat4) -> BooleanOperand {
+    BooleanOperand {
+        mesh,
+        to_subject,
+        float_flip: None,
+        material_remap: vec![],
+    }
+}
+
+#[test]
+fn float_object_quick_mesh_returns_none_when_both_meshes_have_faces() -> TestResult {
+    let subject = quick_mesh_triangle()?;
+    let operand = quick_mesh_operand(quick_mesh_triangle()?, DMat4::IDENTITY);
+
+    assert!(float_object_quick_mesh(&subject, &operand, Operation::Union).is_none());
+    Ok(())
+}
+
+#[test]
+fn float_object_quick_mesh_matches_blender_faceless_object_results() -> TestResult {
+    // Blender 5.2.2 MOD_boolean.cc:get_quick_mesh returns an empty mesh for INTERSECT and
+    // the subject for DIFFERENCE; UNION keeps the subject if it has faces, else copies operand.
+    let subject = quick_mesh_triangle()?;
+    let empty_operand = quick_mesh_operand(quick_mesh_wire()?, DMat4::IDENTITY);
+    assert!(matches!(
+        float_object_quick_mesh(&subject, &empty_operand, Operation::Intersect),
+        Some(FloatObjectQuickMesh::Empty)
+    ));
+    assert!(matches!(
+        float_object_quick_mesh(&subject, &empty_operand, Operation::Union),
+        Some(FloatObjectQuickMesh::Subject)
+    ));
+    assert!(matches!(
+        float_object_quick_mesh(&subject, &empty_operand, Operation::Difference),
+        Some(FloatObjectQuickMesh::Subject)
+    ));
+
+    let empty_subject = quick_mesh_wire()?;
+    let operand = quick_mesh_operand(quick_mesh_triangle()?, DMat4::IDENTITY);
+    assert!(matches!(
+        float_object_quick_mesh(&empty_subject, &operand, Operation::Intersect),
+        Some(FloatObjectQuickMesh::Empty)
+    ));
+    assert!(matches!(
+        float_object_quick_mesh(&empty_subject, &operand, Operation::Union),
+        Some(FloatObjectQuickMesh::Operand(_))
+    ));
+    assert!(matches!(
+        float_object_quick_mesh(&empty_subject, &operand, Operation::Difference),
+        Some(FloatObjectQuickMesh::Subject)
+    ));
+    assert!(matches!(
+        float_object_quick_mesh(&empty_subject, &empty_operand, Operation::Intersect),
+        Some(FloatObjectQuickMesh::Empty)
+    ));
+    assert!(matches!(
+        float_object_quick_mesh(&empty_subject, &empty_operand, Operation::Union),
+        Some(FloatObjectQuickMesh::Operand(_))
+    ));
+    assert!(matches!(
+        float_object_quick_mesh(&empty_subject, &empty_operand, Operation::Difference),
+        Some(FloatObjectQuickMesh::Subject)
+    ));
+    Ok(())
+}
+
+#[test]
+fn float_object_quick_mesh_union_preserves_and_transforms_operand() -> TestResult {
+    let subject = quick_mesh_wire()?;
+    let mut operand_mesh = quick_mesh_triangle()?;
+    operand_mesh.faces[0].material_index = 2;
+    operand_mesh.attributes.insert(
+        "source_marker".to_owned(),
+        serde_json::json!({"domain":"point","type":"float","values":{"v0":1.25}}),
+    );
+    let transform = DMat4::from_scale_rotation_translation(
+        DVec3::new(2.0, 3.0, 0.5),
+        glam::DQuat::IDENTITY,
+        DVec3::new(10.0, -4.0, 2.0),
+    );
+    let operand = quick_mesh_operand(operand_mesh.clone(), transform);
+
+    let Some(FloatObjectQuickMesh::Operand(result)) =
+        float_object_quick_mesh(&subject, &operand, Operation::Union)
+    else {
+        return Err("a faceless subject unions to a transformed operand copy".to_owned());
+    };
+
+    // Blender's quick path transforms vertex coordinates but retains the copied mesh data.
+    let transformed_positions = [
+        DVec3::new(12.0, 2.0, 3.5),
+        DVec3::new(8.0, -2.5, 3.0),
+        DVec3::new(10.0, -10.0, 2.5),
+    ];
+    let mut expected = operand_mesh;
+    for (vertex, position) in expected.vertices.iter_mut().zip(transformed_positions) {
+        vertex.co = position;
+    }
+    assert_eq!(result, expected);
+    Ok(())
 }

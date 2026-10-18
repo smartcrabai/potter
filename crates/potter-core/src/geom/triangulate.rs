@@ -675,24 +675,50 @@ fn is_boundary_edge(a: usize, b: usize, coord_last: usize) -> bool {
     a + 1 == b || (a == 0 && b == coord_last)
 }
 
+/// Reusable storage for [`beautify_with_scratch`], so repeated triangulations keep their buffers.
+#[derive(Default)]
+pub(super) struct BeautyScratch {
+    half: Vec<HalfEdge>,
+    order: Vec<([usize; 2], usize)>,
+    eheap_table: Vec<Option<usize>>,
+    heap: Heap,
+}
+
 /// `BLI_polyfill_beautify`: flips internal diagonals while that improves the triangulation.
-fn beautify(coords: &[Vec2], tris: &mut [[usize; 3]]) {
+pub(super) fn beautify(coords: &[[f32; 2]], tris: &mut [[usize; 3]]) {
+    beautify_with_scratch(coords, tris, &mut BeautyScratch::default());
+}
+
+/// [`beautify`] with caller-owned storage.
+pub(super) fn beautify_with_scratch(
+    coords: &[[f32; 2]],
+    tris: &mut [[usize; 3]],
+    scratch: &mut BeautyScratch,
+) {
+    let BeautyScratch {
+        half,
+        order,
+        eheap_table,
+        heap,
+    } = scratch;
     let coords_num = coords.len();
     let coord_last = coords_num - 1;
     let tris_len = coords_num - 2;
     let edges_len = tris_len - 1;
     let half_len = 3 * tris_len;
 
-    let mut half = vec![
+    half.clear();
+    half.resize(
+        half_len,
         HalfEdge {
             v: NONE,
             e_next: NONE,
             e_radial: NONE,
             base: NONE,
-        };
-        half_len
-    ];
-    let mut order: Vec<([usize; 2], usize)> = Vec::with_capacity(2 * edges_len);
+        },
+    );
+    order.clear();
+    order.reserve(2 * edges_len);
     for (i, tri) in tris.iter().enumerate() {
         for (j_curr, j_prev) in [(0, 2), (1, 0), (2, 1)] {
             let e_prev = 3 * i + j_prev;
@@ -711,7 +737,8 @@ fn beautify(coords: &[Vec2], tris: &mut [[usize; 3]]) {
     }
     order.sort_unstable();
 
-    let mut eheap_table: Vec<Option<usize>> = vec![None; edges_len];
+    eheap_table.clear();
+    eheap_table.resize(edges_len, None);
     for (base, pair) in order.as_chunks::<2>().0.iter().enumerate() {
         let [(_, a), (_, b)] = pair;
         half[*a].e_radial = *b;
@@ -720,10 +747,11 @@ fn beautify(coords: &[Vec2], tris: &mut [[usize; 3]]) {
         half[*b].base = base;
     }
 
-    let mut heap = Heap::default();
+    heap.nodes.clear();
+    heap.tree.clear();
     for i in 0..half_len {
         if half[i].e_radial < i {
-            let (cost, _) = rotate_cost(coords, &half, i);
+            let (cost, _) = rotate_cost(coords, half, i);
             eheap_table[half[i].base] = if cost < 0.0 {
                 Some(heap.insert(cost, i))
             } else {
@@ -735,7 +763,7 @@ fn beautify(coords: &[Vec2], tris: &mut [[usize; 3]]) {
     while !heap.is_empty() {
         let e = heap.pop_min();
         eheap_table[half[e].base] = None;
-        rotate_edge(&mut half, e);
+        rotate_edge(half, e);
         let e_next = half[e].e_next;
         let e_next_next = half[e_next].e_next;
         let radial = half[e].e_radial;
@@ -744,7 +772,7 @@ fn beautify(coords: &[Vec2], tris: &mut [[usize; 3]]) {
         for idx in [e_next, e_next_next, radial_next, radial_next_next] {
             if half[idx].base != NONE {
                 let base = half[idx].base;
-                let (cost, area) = rotate_cost(coords, &half, idx);
+                let (cost, area) = rotate_cost(coords, half, idx);
                 if cost < -1e-6 * area.max(1.0) {
                     heap.insert_or_update(&mut eheap_table[base], cost, idx);
                 } else if let Some(node) = eheap_table[base].take() {

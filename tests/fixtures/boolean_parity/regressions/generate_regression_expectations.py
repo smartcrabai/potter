@@ -307,9 +307,9 @@ def build_scene(scene):
         indexed_pair("index_remap_same_material_keeps_slot",
                      [prefix + ".A", prefix + ".B", prefix + ".C"],
                      [prefix + ".X", prefix + ".B"]))
-    prefix = "regress.index_last"
-    add("index_remap_last_matching_slot", "e",
-        indexed_pair("index_remap_last_matching_slot",
+    prefix = "regress.index_first"
+    add("index_remap_first_matching_slot", "e",
+        indexed_pair("index_remap_first_matching_slot",
                      [prefix + ".A", prefix + ".B", prefix + ".A", prefix + ".D"],
                      [prefix + ".B", prefix + ".A", prefix + ".C", prefix + ".E"]))
 

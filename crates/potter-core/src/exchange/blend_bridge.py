@@ -6557,6 +6557,7 @@ def export_doc(doc, target, pack, scene_hash, context):
         obj = object_map[node_id]
         is_linked = node_id in linked_maps["nodes"]
         root_parent_inverse = None
+        has_captured_basis = False
         if not is_linked:
             parent = object_map.get(item.get("parent"))
             if parent:
@@ -6585,6 +6586,12 @@ def export_doc(doc, target, pack, scene_hash, context):
                 rows = [[values[column * 4 + row] for column in range(4)]
                         for row in range(4)]
                 root_parent_inverse = Matrix(rows)
+            basis = item.get("matrix_basis")
+            if isinstance(basis, (list, tuple)) and len(basis) == 16:
+                rows = [[basis[column * 4 + row] for column in range(4)]
+                        for row in range(4)]
+                obj.matrix_basis = Matrix(rows)
+                has_captured_basis = True
         memberships = 0
         for collection_id, collection_item in collections_raw.items():
             if node_id not in collection_item.get("objects", []):
@@ -6606,16 +6613,19 @@ def export_doc(doc, target, pack, scene_hash, context):
                           if obj.name_full in candidate.objects), bpy.context.scene)
             _restore_object_material_slots(obj, item, material_map, scene)
         if root_parent_inverse is not None and root_parent_inverse != Matrix.Identity(4):
-            combined = root_parent_inverse @ obj.matrix_basis.copy()
-            # Without a parent Blender ignores matrix_parent_inverse. Bake its
-            # offset into the linked root's basis and world matrix instead.
-            obj.matrix_basis = combined
-            obj.matrix_world = combined
-            obj["potter.root_matrix_json"] = json.dumps({
-                "parent_inverse": values,
-                "transform": item["transform"],
-                "baked_basis": matrix_rows(obj.matrix_basis),
-            }, sort_keys=True)
+            if has_captured_basis:
+                obj.matrix_parent_inverse = root_parent_inverse
+            else:
+                combined = root_parent_inverse @ obj.matrix_basis.copy()
+                # Without a parent Blender ignores matrix_parent_inverse. Bake its
+                # offset into the linked root's basis and world matrix instead.
+                obj.matrix_basis = combined
+                obj.matrix_world = combined
+                obj["potter.root_matrix_json"] = json.dumps({
+                    "parent_inverse": values,
+                    "transform": item["transform"],
+                    "baked_basis": matrix_rows(obj.matrix_basis),
+                }, sort_keys=True)
         if obj.type == "MESH":
             mesh_source = compatibility_block(doc, "meshes", "Mesh", item.get("data"))
             _restore_skin_vertices(obj, mesh_source.get("skin_vertices", []))

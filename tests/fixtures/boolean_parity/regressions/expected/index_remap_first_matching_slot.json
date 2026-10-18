@@ -1,5 +1,5 @@
 {
- "case": "index_remap_last_matching_slot",
+ "case": "index_remap_first_matching_slot",
  "regression": "e",
  "counts": {
   "vertices": 20,

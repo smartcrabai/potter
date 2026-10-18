@@ -30,8 +30,7 @@
 //!
 //! Native generic attributes (`{"domain","type","values"}` stores keyed by element ID) join every
 //! operand's values per element, as Blender's `join_meshes` concatenates each domain. Other stores
-//! that are neither gathered nor structured (shading and metadata keys) are copied from operand A,
-//! as the BSP path does.
+//! that are neither gathered nor structured (shading and metadata keys) are copied from operand A.
 //!
 //! # Deviations
 //!
@@ -155,7 +154,7 @@ pub(crate) fn polys_to_mesh(
 }
 
 /// Joined index ranges of the operands (Blender `MeshOffsets`).
-struct Layout {
+pub(super) struct Layout {
     vertices: Vec<Range<usize>>,
     edges: Vec<Range<usize>>,
     faces: Vec<Range<usize>>,
@@ -491,7 +490,7 @@ fn ring_normal(points: &[DVec3]) -> DVec3 {
 /// copies its source corners (its ring runs the other way), so every authored corner of one is
 /// negated. The output's codes decode to vectors on its own fans, negate, and re-encode. Auto
 /// corners stay Auto.
-fn negate_flipped_custom_normals(mesh: &mut Mesh, flipped: &[bool]) -> Result<()> {
+pub(super) fn negate_flipped_custom_normals(mesh: &mut Mesh, flipped: &[bool]) -> Result<()> {
     if !flipped.iter().any(|&flip| flip) {
         return Ok(());
     }
@@ -660,6 +659,22 @@ fn join_attributes(
         color_layers::ATTRIBUTE,
         joined_color_layers(operands),
     );
+    let color_types = joined_color_data_types(operands);
+    if let Some(metadata) = attributes.get_mut("blender_metadata") {
+        let metadata = metadata.as_object_mut().ok_or_else(|| {
+            PotError::invalid_argument("Boolean blender_metadata must be an object")
+        })?;
+        if color_types.is_empty() {
+            metadata.remove("color_data_types");
+        } else {
+            metadata.insert("color_data_types".to_owned(), Value::Object(color_types));
+        }
+    } else if !color_types.is_empty() {
+        attributes.insert(
+            "blender_metadata".to_owned(),
+            json!({"color_data_types": color_types}),
+        );
+    }
     Ok(attributes)
 }
 
@@ -691,19 +706,51 @@ fn joined_native_attribute(
         .iter()
         .map(|edge| (edge_key(edge.vertices[0], edge.vertices[1]), edge.id))
         .collect();
-    let domain = text_field(template, "domain");
+    let promote = text_field(template, "type") == "color"
+        && operands.iter().any(|operand| {
+            operand
+                .mesh
+                .attributes
+                .get(key)
+                .filter(|value| is_native_store(value))
+                .is_some_and(|value| text_field(value, "domain") == "corner")
+        });
+    let domain = if promote {
+        "corner"
+    } else {
+        text_field(template, "domain")
+    };
     let mut values = Map::new();
     for (index, operand) in operands.iter().enumerate() {
-        let Some(entries) = operand
+        let Some(store) = operand
             .mesh
             .attributes
             .get(key)
             .filter(|value| is_native_store(value))
-            .and_then(|value| value.get("values"))
-            .and_then(Value::as_object)
         else {
             continue;
         };
+        let Some(entries) = store.get("values").and_then(Value::as_object) else {
+            continue;
+        };
+        if domain == "corner" && text_field(store, "domain") == "point" {
+            // A promoted point layer gives every corner its vertex's value. A face with a missing
+            // vertex value has no row, so its corners take the default.
+            for (local, face) in operand.mesh.faces.iter().enumerate() {
+                let row: Option<Vec<Value>> = face
+                    .vertices
+                    .iter()
+                    .map(|id| entries.get(&format!("v{id}")).cloned())
+                    .collect();
+                if let Some(row) = row {
+                    values.insert(
+                        format!("f{}", layout.faces[index].start + local),
+                        Value::Array(row),
+                    );
+                }
+            }
+            continue;
+        }
         let vertices = local_index(operand.mesh.vertices.iter().map(|vertex| vertex.id));
         let faces = local_index(operand.mesh.faces.iter().map(|face| face.id));
         match domain {
@@ -747,7 +794,9 @@ fn joined_native_attribute(
             _ => {}
         }
     }
-    with_values(template, Value::Object(values))
+    let mut output = with_values(template, Value::Object(values));
+    output["domain"] = json!(domain);
+    output
 }
 
 fn insert_if(attributes: &mut Map<String, Value>, key: &str, value: Option<Value>) {
@@ -894,6 +943,38 @@ fn joined_color_layers(operands: &[Operand<'_>]) -> Option<Value> {
     let subject = stores.first()?;
     (!names.is_empty())
         .then(|| json!({"layers": names, "active": subject.active, "render": subject.render}))
+}
+
+/// The joined `blender_metadata.color_data_types`: each colour layer's encoding over the operands that
+/// hold it. A layer stays `BYTE_COLOR` only when every such operand stores `BYTE_COLOR`. A layer with
+/// no entry is `FLOAT_COLOR`, so a mix of encodings joins as float, as Blender's `join_meshes` does.
+fn joined_color_data_types(operands: &[Operand<'_>]) -> Map<String, Value> {
+    let mut types = Map::new();
+    for operand in operands {
+        let layers = color_layers::read(operand.mesh).layers;
+        if layers.is_empty() {
+            continue;
+        }
+        let stored = operand
+            .mesh
+            .attributes
+            .get("blender_metadata")
+            .and_then(|metadata| metadata.get("color_data_types"))
+            .and_then(Value::as_object);
+        for layer in layers {
+            let byte = stored
+                .and_then(|stored| stored.get(&layer.name))
+                .and_then(Value::as_str)
+                == Some("BYTE_COLOR");
+            let encoding = types
+                .entry(layer.name)
+                .or_insert_with(|| json!("BYTE_COLOR"));
+            if !byte {
+                *encoding = json!("FLOAT_COLOR");
+            }
+        }
+    }
+    types
 }
 
 /// The `blender_attributes` entries of `J`: POINT, FACE, and CORNER entries joined per element,
@@ -1122,7 +1203,10 @@ impl NormalTransform {
 /// ([`NormalTransform`]). A corner without an authored value takes its face's flat normal, passed
 /// through the same transform. `None` when no operand holds custom-normal values.
 /// [`encode_joined_custom_normals`] stores the rows as codes once the output mesh exists.
-fn joined_custom_normals(operands: &[Operand<'_>], layout: &Layout) -> Result<Option<Value>> {
+pub(super) fn joined_custom_normals(
+    operands: &[Operand<'_>],
+    layout: &Layout,
+) -> Result<Option<Value>> {
     let mut decoded = Vec::with_capacity(operands.len());
     for operand in operands {
         let positions: Vec<DVec3> = operand
@@ -1183,7 +1267,7 @@ fn joined_custom_normals(operands: &[Operand<'_>], layout: &Layout) -> Result<Op
 /// Encodes the joined vector rows as the joined mesh's native normal codes, on its own fans. The
 /// remap then rebuilds the output codes from these source codes (`rebuild_custom_normals`), so no
 /// float3 store reaches `clnor::corner_codes`. A `null` row stays Auto.
-fn encode_joined_custom_normals(mesh: &mut Mesh) -> Result<()> {
+pub(super) fn encode_joined_custom_normals(mesh: &mut Mesh) -> Result<()> {
     let Some(attribute) = mesh.attributes.remove("custom_normal") else {
         return Ok(());
     };
@@ -1781,6 +1865,51 @@ mod tests {
                 {"sharp": false, "seam": false}
             ])
         );
+        Ok(())
+    }
+
+    #[test]
+    fn boolean_joins_color_encodings_and_promotes_point_layers() -> TestResult {
+        let mut a = triangle(0.0)?;
+        let mut b = triangle(5.0)?;
+        let corner = ColorStore {
+            layers: vec![ColorLayer {
+                name: "Body".to_owned(),
+                domain: ColorDomain::Corner,
+                values: vec![[0.1, 0.2, 0.3, 0.4]; 3],
+            }],
+            active: Some("Body".to_owned()),
+            render: Some("Body".to_owned()),
+        };
+        color_layers::write(&mut a, &corner);
+        let point = ColorStore {
+            layers: vec![ColorLayer {
+                name: "Body".to_owned(),
+                domain: ColorDomain::Point,
+                values: vec![[1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]],
+            }],
+            active: None,
+            render: None,
+        };
+        color_layers::write(&mut b, &point);
+        a.attributes.insert(
+            "blender_metadata".to_owned(),
+            json!({"color_data_types": {"Body": "BYTE_COLOR"}}),
+        );
+        let mut arena = Arena::new();
+        let a_ids = arena_vertices(&mut arena, &a)?;
+        let b_ids = arena_vertices(&mut arena, &b)?;
+        let polys = [poly(a_ids, 0), poly(b_ids, 1)];
+        let mesh = build(&polys, &arena, &[operand(&a), operand(&b)], &[])?;
+
+        // One operand is FLOAT_COLOR (no entry), so the joined layer is float.
+        assert_eq!(
+            mesh.attributes["blender_metadata"]["color_data_types"]["Body"],
+            json!("FLOAT_COLOR")
+        );
+        let store = color_layers::read(&mesh);
+        assert_eq!(store.layers.len(), 1);
+        assert_eq!(store.layers[0].domain, ColorDomain::Corner);
         Ok(())
     }
 

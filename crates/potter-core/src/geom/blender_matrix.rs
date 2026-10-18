@@ -457,3 +457,22 @@ pub(crate) fn operand_to_subject(
     let object = object_to_world(doc, object_id, world_matrices, 0)?;
     Some(dmat4_from_blender(&blender_mul_m4(&inverse, &object)))
 }
+
+/// Blender `is_negative_m4`: sign of the upper 3x3 determinant after the f32 matrix boundary.
+pub(crate) fn is_negative_m4(matrix: DMat4) -> bool {
+    let matrix = matrix.to_cols_array().map(|value| value as f32);
+    let determinant = matrix[0] * (matrix[5] * matrix[10] - matrix[6] * matrix[9])
+        - matrix[4] * (matrix[1] * matrix[10] - matrix[2] * matrix[9])
+        + matrix[8] * (matrix[1] * matrix[6] - matrix[2] * matrix[5]);
+    determinant < 0.0
+}
+
+/// Blender `mul_m4_v3` on an f32 `float[4][4]` stored column-major: transforms `point` as a
+/// position, with the translation in the fourth column.
+pub(crate) fn blender_transform_point_f32(transform: &[f32; 16], point: glam::Vec3) -> glam::Vec3 {
+    glam::Vec3::new(
+        point.x * transform[0] + point.y * transform[4] + transform[8] * point.z + transform[12],
+        point.x * transform[1] + point.y * transform[5] + transform[9] * point.z + transform[13],
+        point.x * transform[2] + point.y * transform[6] + transform[10] * point.z + transform[14],
+    )
+}
