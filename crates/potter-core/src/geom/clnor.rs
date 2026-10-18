@@ -315,6 +315,14 @@ struct FanCorner {
     edge_next: usize,
 }
 
+/// Vertex positions as Blender's `float3` storage holds them: rounded to f32. Every custom-normal
+/// fan frame (face normals, edge directions, fan spaces) is computed from these, so `fans()` is the
+/// one place that frames are built. The f64 auto normal in `fans()` keeps the unrounded positions,
+/// so Auto corners equal `normals::shade`.
+fn frame_positions(points: &[DVec3]) -> Vec<Vec3> {
+    points.iter().map(|point| point.as_vec3()).collect()
+}
+
 /// Fans and spaces of a mesh. Spaces use Blender's single-precision normal math and loop numbering;
 /// `auto` is each fan's normal in double precision, computed with the `normals` face math.
 pub(crate) fn fans(
@@ -340,7 +348,7 @@ pub(crate) fn fans(
             (0..face.len()).map(|corner| super::normals::corner_angle(&face_points, corner)),
         );
     }
-    let points: Vec<Vec3> = points.iter().map(|point| point.as_vec3()).collect();
+    let points = frame_positions(points);
     let face_normals: Vec<Vec3> = faces
         .iter()
         .map(|face| face_normal(&points, face))

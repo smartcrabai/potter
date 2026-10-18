@@ -62,14 +62,13 @@ fn assert_grid(actual: &Value, wanted: &Value, tolerance: f64, label: &str) -> T
     Ok(())
 }
 
-/// Stored f32 pixels that Potter's encoded export must match, in f32 ulps of each expected value.
+/// Stored f32 pixels that Potter's export must match, in f32 ulps of each expected value.
 ///
-/// The bound covers the chain, not the observed error. The expected value is f32(200/255), off by
-/// at most half an ulp. Potter's linear value is stored as f32 (half an ulp at 0.58 is about 3e-8)
-/// and the sRGB encode has slope about 0.6 there, so the encoded value moves by about 0.3 ulp at 0.78.
-/// Together that is at most about one ulp, so 2 leaves margin for one more rounding. The current
-/// export differs by about 20 ulps (1.2e-6 at 0.78). That is outside this bound and must not be
-/// absorbed by raising it: the excess is unexplained and is a product or store issue.
+/// The chain is: decode the 8-bit byte to linear in f64 (`color::srgb_to_linear`), re-encode in f64
+/// (`linear_to_srgb_unclamped`, `exchange/blend.rs`), store as f32 in Blender's float buffer. The f64
+/// round trip is exact to about 1e-8, and the f32 store adds at most half an ulp, so the stored value
+/// is within one ulp of f32(200/255). Two ulps leaves margin for one more rounding. A larger
+/// difference is a product or store defect, not a tolerance to widen.
 const STORED_PIXEL_ULPS: f64 = 2.0;
 
 /// Compares each channel of `actual` with `wanted` within `ulps` f32 ulps of the wanted value.
@@ -103,8 +102,9 @@ fn grid_distance(a: &Grid, b: &Grid) -> f64 {
 }
 
 /// Encodes a grid of Potter's linear values with Potter's own sRGB transfer (`potter_core::color`
-/// `linear_to_srgb`), the stored value an sRGB-declared image holds. Potter writes its linear pixels
-/// into the Blender image unchanged, so Blender reads them back as stored values.
+/// `linear_to_srgb`). Potter's export reads back as linear (`image.pixels` of the exported float
+/// buffer), while the oracle's `blender_pixels_bottom_up` holds the encoded byte values of the
+/// sRGB-declared PNG, so the export is encoded before comparison.
 fn encode_linear_rows(value: &Value) -> TestResult<Value> {
     let encoded: Grid = rows(value)?
         .into_iter()
@@ -117,9 +117,10 @@ fn encode_linear_rows(value: &Value) -> TestResult<Value> {
     Ok(json!(encoded))
 }
 
-/// Checks one Blender render of the texture plane (`render_texture.py` output). `potter_linear`
-/// marks Potter's export, whose image pixels are linear values written as stored values.
-fn check_render(result: &Value, expected: &Value, label: &str, potter_linear: bool) -> TestResult {
+/// Checks one Blender render of the texture plane (`render_texture.py` output). `potter_export`
+/// marks Potter's export: its linear image pixels are encoded, then compared within f32 ulps
+/// (`STORED_PIXEL_ULPS`). The Blender reference is compared raw at `FLOAT_TOLERANCE`.
+fn check_render(result: &Value, expected: &Value, label: &str, potter_export: bool) -> TestResult {
     let texture = &expected["texture"];
     assert_eq!(
         result["image_size"],
@@ -132,21 +133,16 @@ fn check_render(result: &Value, expected: &Value, label: &str, potter_linear: bo
         "{label}: texture must sample the Base layer"
     );
     // The file's PNG, read by Blender (`image.pixels`, bottom row first): no flip anywhere.
-    let stored = if potter_linear {
-        encode_linear_rows(&result["image_pixels_bottom_up"])?
-    } else {
-        result["image_pixels_bottom_up"].clone()
-    };
-    if potter_linear {
+    if potter_export {
         assert_stored_grid(
-            &stored,
+            &encode_linear_rows(&result["image_pixels_bottom_up"])?,
             &texture["blender_pixels_bottom_up"],
             STORED_PIXEL_ULPS,
             &format!("{label} image pixels"),
         )?;
     } else {
         assert_grid(
-            &stored,
+            &result["image_pixels_bottom_up"],
             &texture["blender_pixels_bottom_up"],
             FLOAT_TOLERANCE,
             &format!("{label} image pixels"),

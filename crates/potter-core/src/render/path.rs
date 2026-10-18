@@ -9,8 +9,8 @@ use crate::{
     image::{ImageData, ImageInterpolation},
     model::{Id, LightData, LightType, SceneDoc},
     shader::{
-        BsdfParams, EvaluatorWorkspace, HitContext, HitUvLayers, evaluate_surface_with_workspace,
-        height_gradient,
+        BsdfParams, EvaluatorWorkspace, HitContext, HitUvLayers, dielectric_f0,
+        evaluate_surface_with_workspace, height_gradient,
     },
 };
 
@@ -1676,7 +1676,7 @@ fn sample_bsdf(params: &BsdfParams, view: DVec3, rng: &mut Pcg32) -> (DVec3, DVe
     let diffuse_weight = ((1.0 - params.metallic) * (1.0 - params.transmission)).max(0.0);
     let transmission_weight = params.transmission.clamp(0.0, 1.0);
     let specular_weight = (params.metallic.clamp(0.0, 1.0)
-        + 0.04 * (1.0 - params.metallic.clamp(0.0, 1.0)))
+        + dielectric_f0(params.specular_ior_level) * (1.0 - params.metallic.clamp(0.0, 1.0)))
     .max(1.0e-4);
     let total = diffuse_weight + transmission_weight + specular_weight;
     let p_diffuse = diffuse_weight / total;
@@ -1734,11 +1734,8 @@ fn evaluate_bsdf(params: &BsdfParams, normal: DVec3, view: DVec3, light: DVec3) 
         params.base_color[2],
     )
     .max(DVec3::ZERO);
-    // Blender's "IOR Level" scales reflectance so that 0.5 is IOR 1.5 (F0 = 0.04) and 1 doubles it
-    // at normal incidence (F0 = 0.08 × level); the Principled BSDF defaults to 0.5
-    // (intern/cycles/scene/shader_nodes.cpp, `PrincipledBsdfNode`, `specular_ior_level` 0.5f).
-    // Manual: https://docs.blender.org/manual/en/5.2/render/shader_nodes/shader/principled.html
-    let f0 = DVec3::splat(0.08 * params.specular_ior_level.clamp(0.0, 2.0))
+    // The dielectric reflectance is the shared Principled rule (`shader::dielectric_f0`).
+    let f0 = DVec3::splat(dielectric_f0(params.specular_ior_level))
         .lerp(albedo, params.metallic.clamp(0.0, 1.0));
     let fresnel = f0 + (DVec3::ONE - f0) * (1.0 - v_dot_h).powi(5);
     let alpha = params.roughness.clamp(0.02, 1.0).powi(2);

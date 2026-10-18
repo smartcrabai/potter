@@ -2,6 +2,7 @@ mod world;
 
 mod evaluator;
 
+pub(crate) use evaluator::{DEFAULT_SPECULAR_IOR_LEVEL, dielectric_f0};
 pub use evaluator::{
     BsdfParams, EvaluatorWorkspace, HitContext, HitUvLayers, evaluate_displacement,
     evaluate_displacement_with_workspace, evaluate_surface, evaluate_surface_with_workspace,

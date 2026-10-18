@@ -5992,12 +5992,17 @@ def export_doc(doc, target, pack, scene_hash, context):
         if colorspace is not None:
             image.colorspace_settings.name = colorspace
         pixels = item.get("pixels")
-        if sidecar is None and pixels is not None:
+        png_bytes = item.get("png_bytes")
+        if sidecar is None and png_bytes is not None:
+            # An 8-bit PNG packs as its own file bytes: no float save touches the values.
+            data = bytes(png_bytes)
+            image.pack(data=data, data_len=len(data))
+        elif sidecar is None and pixels is not None:
             _pack_image(image, [channel for pixel in pixels for channel in pixel])
         if item.get("source") == "packed" and image.packed_file is None:
             image.pack()
         set_id(image, image_id)
-        image_metadata = {key: value for key, value in item.items() if key != "pixels"}
+        image_metadata = {key: value for key, value in item.items() if key not in ("pixels", "png_bytes")}
         image["potter.image_json"] = json.dumps(image_metadata, sort_keys=True)
         image_map[image_id] = image
         image.use_fake_user = True

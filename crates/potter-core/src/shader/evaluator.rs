@@ -13,6 +13,20 @@ use crate::{
     model::{Id, Material, Registry, TextureRef},
 };
 
+/// Blender's Principled "Specular IOR Level" default: `SOCKET_IN_FLOAT(specular_ior_level,
+/// "Specular IOR Level", 0.5f)` in `intern/cycles/scene/shader_nodes.cpp`, `PrincipledBsdfNode`.
+pub(crate) const DEFAULT_SPECULAR_IOR_LEVEL: f64 = 0.5;
+
+/// Dielectric reflectance at normal incidence for Blender's Principled specular layer:
+/// `0.08 × IOR level`, so the default 0.5 (IOR 1.5, F0 = ((1.5 − 1)/(1.5 + 1))² = 0.04) applies.
+/// The Blender manual defines the level as "0.5 means no adjustment … 1 doubles them at normal
+/// incidence" (`docs.blender.org/manual/en/5.2/render/shader_nodes/shader/principled.html`).
+/// Every Principled evaluation (path tracer, shaded hits, the world term) uses this function.
+#[must_use]
+pub(crate) fn dielectric_f0(specular_ior_level: f64) -> f64 {
+    0.08 * specular_ior_level.clamp(0.0, 2.0)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BsdfParams {
     pub base_color: [f64; 4],
@@ -73,7 +87,7 @@ impl BsdfParams {
             sheen_weight: 0.0,
             sheen_roughness: 0.3,
             sheen_tint: [1.0; 3],
-            specular_ior_level: 0.5,
+            specular_ior_level: DEFAULT_SPECULAR_IOR_LEVEL,
             specular_tint: [1.0; 3],
             anisotropic_ior: 0.0,
             anisotropic_rotation: 0.0,
@@ -964,8 +978,11 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_> {
         params.sheen_tint = self.color_input(id, &["Sheen Tint"], [1.0, 1.0, 1.0, 1.0])?[..3]
             .try_into()
             .map_err(|_| invalid("invalid sheen tint"))?;
-        params.specular_ior_level =
-            self.scalar_input(id, &["Specular IOR Level", "Specular"], 0.5)?;
+        params.specular_ior_level = self.scalar_input(
+            id,
+            &["Specular IOR Level", "Specular"],
+            DEFAULT_SPECULAR_IOR_LEVEL,
+        )?;
         params.specular_tint = self.color_input(id, &["Specular Tint"], [1.0, 1.0, 1.0, 1.0])?[..3]
             .try_into()
             .map_err(|_| invalid("invalid specular tint"))?;

@@ -18,8 +18,9 @@ use crate::{
     image::ImageData,
     model::{Id, Material, SceneDoc},
     shader::{
-        BsdfParams, EvaluatorWorkspace, HitContext, HitUvLayers,
-        evaluate_displacement_with_workspace, evaluate_surface_with_workspace, fill_color_layers,
+        BsdfParams, DEFAULT_SPECULAR_IOR_LEVEL, EvaluatorWorkspace, HitContext, HitUvLayers,
+        dielectric_f0, evaluate_displacement_with_workspace, evaluate_surface_with_workspace,
+        fill_color_layers,
     },
 };
 
@@ -535,6 +536,7 @@ pub(super) fn extract_geometry(
                             material.map_or(0.0, |value| value.metallic),
                             material.map_or(0.8, |value| value.roughness),
                             1.0,
+                            dielectric_f0(DEFAULT_SPECULAR_IOR_LEVEL),
                             mode,
                             None,
                             images,
@@ -889,6 +891,7 @@ pub(super) fn extract_geometry(
                 material.metallic,
                 material.roughness,
                 1.0,
+                dielectric_f0(DEFAULT_SPECULAR_IOR_LEVEL),
                 mode,
                 Some((&bvh, &geometry.triangles, &shadow_maps)),
                 images,
@@ -1525,6 +1528,9 @@ impl SurfaceShader for SceneShader<'_> {
             metallic,
             roughness,
             reflectance,
+            dielectric_f0(params.map_or(DEFAULT_SPECULAR_IOR_LEVEL, |params| {
+                params.specular_ior_level
+            })),
             self.mode,
             shadow,
             self.images,
@@ -1882,6 +1888,7 @@ fn shade(
     metallic: f64,
     roughness: f64,
     reflectance: f64,
+    specular_f0: f64,
     mode: Mode,
     shadow: ShadowContext<'_>,
     images: &BTreeMap<String, ImageData>,
@@ -1907,7 +1914,15 @@ fn shade(
             ),
         ] {
             result += direct_brdf(
-                albedo, metallic, roughness, normal, -direction, normal, color, intensity,
+                albedo,
+                metallic,
+                roughness,
+                specular_f0,
+                normal,
+                -direction,
+                normal,
+                color,
+                intensity,
             );
         }
     } else {
@@ -1942,7 +1957,7 @@ fn shade(
                 (-view_direction + normal * (2.0 * normal.dot(view_direction))).normalize_or_zero();
             let specular_environment =
                 prefiltered_world(world, &doc.node_groups, images, reflection, roughness)?;
-            let f0 = albedo * metallic + DVec3::splat(0.04 * (1.0 - metallic));
+            let f0 = albedo * metallic + DVec3::splat(specular_f0 * (1.0 - metallic));
             result += specular_environment * f0 * (1.0 - roughness).powi(2);
         } else if !has_lights {
             result += albedo * 0.08;
@@ -1971,6 +1986,7 @@ fn shade(
                 albedo,
                 metallic,
                 roughness,
+                specular_f0,
                 shadow,
                 point_shadow,
             );
@@ -2033,6 +2049,7 @@ fn light_contribution(
     albedo: DVec3,
     metallic: f64,
     roughness: f64,
+    specular_f0: f64,
     shadow: ShadowContext<'_>,
     point_shadow: Option<&PointShadowMap>,
 ) -> DVec3 {
@@ -2046,6 +2063,7 @@ fn light_contribution(
                 albedo,
                 metallic,
                 roughness,
+                specular_f0,
                 normal,
                 toward_light,
                 normal,
@@ -2068,6 +2086,7 @@ fn light_contribution(
                 albedo,
                 metallic,
                 roughness,
+                specular_f0,
                 normal,
                 toward_light,
                 normal,
@@ -2105,6 +2124,7 @@ fn light_contribution(
                 albedo,
                 metallic,
                 roughness,
+                specular_f0,
                 normal,
                 toward_light,
                 normal,
@@ -2138,6 +2158,7 @@ fn light_contribution(
                     albedo,
                     metallic,
                     roughness,
+                    specular_f0,
                     normal,
                     toward_light,
                     normal,
@@ -2253,6 +2274,7 @@ fn direct_brdf(
     albedo: DVec3,
     metallic: f64,
     roughness: f64,
+    specular_f0: f64,
     normal: DVec3,
     light_dir: DVec3,
     view_dir: DVec3,
@@ -2276,7 +2298,7 @@ fn direct_brdf(
     let smith_k = (roughness + 1.0).powi(2) / 8.0;
     let geometry = |cosine: f64| cosine / (cosine * (1.0 - smith_k) + smith_k).max(1.0e-9);
     let geometry_term = geometry(normal_light_cosine) * geometry(normal_view_cosine);
-    let reflectance_at_normal = DVec3::splat(0.04) * (1.0 - metallic) + albedo * metallic;
+    let reflectance_at_normal = DVec3::splat(specular_f0) * (1.0 - metallic) + albedo * metallic;
     let fresnel = reflectance_at_normal
         + (DVec3::ONE - reflectance_at_normal) * (1.0 - view_half_cosine).powi(5);
     let specular = fresnel

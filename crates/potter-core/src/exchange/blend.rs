@@ -781,8 +781,33 @@ fn add_blender_image_pixels(document: &mut Value, project: &Project) -> Result<(
             crate::image::ImageInterpolation::Linear,
         )?;
         image_json["pixels"] = json!(blender_image_pixels(&image, data.width, &data.pixels));
+        if let Some(png) = eight_bit_png_bytes(&image, project)? {
+            image_json["png_bytes"] = json!(png);
+        }
     }
     Ok(())
+}
+
+/// The file bytes of an image whose blob is an 8-bit PNG, or `None` for any other image. Blender packs these bytes
+/// unchanged, so the reopened values are the file's own 8-bit values; a float save would convert them. Only the
+/// PNG signature and the IHDR bit depth (byte 24, after 8 signature, 4 length, 4 type, 8 size bytes) decide.
+fn eight_bit_png_bytes(image: &Image, project: &Project) -> Result<Option<Vec<u8>>> {
+    let Some(hex) = image
+        .blob
+        .as_deref()
+        .and_then(|blob| blob.strip_prefix("sha256:"))
+    else {
+        return Ok(None);
+    };
+    let path = project
+        .path()
+        .join("assets")
+        .join("sha256")
+        .join(hex)
+        .join("blob");
+    let bytes = fs::read(&path).map_err(|error| PotError::io(&error))?;
+    let is_png = bytes.starts_with(b"\x89PNG\r\n\x1a\n");
+    Ok((is_png && bytes.get(24) == Some(&8)).then_some(bytes))
 }
 
 /// Potter's decoded pixels in Blender's image layout. Potter stores rows top-down and scene-linear values; Blender's
