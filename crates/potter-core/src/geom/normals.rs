@@ -707,6 +707,19 @@ mod tests {
         assert_vec_eq(normals[4], FACE_B_NORMAL);
     }
 
+    #[test]
+    fn geometric_vertex_normals_ignore_custom_normals() {
+        let mut mesh = fold();
+        set_custom_vectors(&mut mesh, &[Some(-DVec3::Z); 8]);
+        let points = positions(&mesh);
+        let geometric = geometric_vertex_normals(&mesh, &points).expect("normals");
+        // Vertex 0 belongs only to face 0, so its geometric normal is that face's normal.
+        assert_vec_eq(geometric[0], FACE_A_NORMAL);
+        // Authored custom normals change the shading output but not Blender's vert_normals.
+        let shaded = export_normals(&mesh, &points).expect("normals").vertices;
+        assert_vec_eq(shaded[0], -DVec3::Z);
+    }
+
     /// Stores one vector per corner as the custom-normal layer (`None` is automatic). Authored
     /// vectors go through the shared setter, so the layer holds codes, not vectors.
     fn set_custom_vectors(mesh: &mut Mesh, vectors: &[Option<DVec3>]) {
