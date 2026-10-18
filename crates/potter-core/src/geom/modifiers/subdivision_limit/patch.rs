@@ -242,8 +242,7 @@ pub(super) fn gregory_weights(s: f64, t: f64) -> [f64; 20] {
         w[GREGORY_BOUNDARY_INDEX[i]] = bs[GREGORY_BOUNDARY_S[i]] * bt[GREGORY_BOUNDARY_T[i]];
     }
     for i in 0..8 {
-        w[GREGORY_INTERIOR_INDEX[i]] =
-            bs[GREGORY_INTERIOR_S[i]] * bt[GREGORY_INTERIOR_T[i]] * g[i];
+        w[GREGORY_INTERIOR_INDEX[i]] = bs[GREGORY_INTERIOR_S[i]] * bt[GREGORY_INTERIOR_T[i]] * g[i];
     }
     w
 }

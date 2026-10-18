@@ -99,7 +99,9 @@ fn grid_paint_mask_value(
         return Ok(0.0);
     }
     if sculpt_level == 0 {
-        return Err(invalid("sculpt level must be positive for paint-mask sampling"));
+        return Err(invalid(
+            "sculpt level must be positive for paint-mask sampling",
+        ));
     }
     let side = grid_side(level)?;
     let sculpt_side = grid_side(sculpt_level)?;

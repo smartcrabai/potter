@@ -1311,10 +1311,7 @@ fn blender_mesh_name(doc: &Value, data_id: &str) -> String {
         .unwrap_or_else(|| data_id.to_owned())
 }
 
-fn patch_exported_multires(
-    input: &Path,
-    blend_file: &Path,
-) -> Result<()> {
+fn patch_exported_multires(input: &Path, blend_file: &Path) -> Result<()> {
     let payload: Value =
         serde_json::from_reader(fs::File::open(input).map_err(|error| PotError::io(&error))?)
             .map_err(PotError::internal_json)?;
@@ -1875,8 +1872,10 @@ fn load_external_multires(
             .iter()
             .map(|&level| crate::geom::multires_external::grid_vector_count(level))
             .collect::<Result<Vec<_>>>()?;
-        let expected_file_size =
-            crate::geom::multires_external::expected_external_file_size(total_levels, corner_count)?;
+        let expected_file_size = crate::geom::multires_external::expected_external_file_size(
+            total_levels,
+            corner_count,
+        )?;
         let source_bytes = fs::metadata(blend_file)
             .map_err(|error| PotError::io(&error))?
             .len();
@@ -1928,8 +1927,11 @@ fn load_external_multires(
                 "Blender multires external grid file changed size while reading",
             ));
         }
-        let grids =
-            crate::geom::multires_external::read_external_grids(&bytes, total_levels, corner_count)?;
+        let grids = crate::geom::multires_external::read_external_grids(
+            &bytes,
+            total_levels,
+            corner_count,
+        )?;
         let mut values = Map::new();
         let mut first_corner = 0_usize;
         for (face_index, face_corner_count) in face_corner_counts.into_iter().enumerate() {
@@ -2259,8 +2261,10 @@ fn check_multires_export_memory(doc: &SceneDoc, additional_output_bytes: u64) ->
                 "multires JSON output size overflows",
             )
         })?;
-        let sidecar_bytes =
-            crate::geom::multires_external::expected_external_file_size(total_levels, corner_count)?;
+        let sidecar_bytes = crate::geom::multires_external::expected_external_file_size(
+            total_levels,
+            corner_count,
+        )?;
         let auxiliary_bytes = multires_auxiliary_memory_bytes(record)?;
         additional_bytes = additional_bytes
             .checked_add(u128::from(sidecar_bytes))
@@ -15799,7 +15803,12 @@ print("UNSUPPORTED_POSE " + json.dumps({
         .expect_err("mixed corner levels cannot be stored in an external sidecar");
         assert_eq!(error.code, ErrorCode::UnrepresentableFeature);
         assert!(error.message.contains("corner 1 is at level 1"));
-        assert!(fs::read_dir(&sidecar).map_err(|error| PotError::io(&error))?.next().is_none());
+        assert!(
+            fs::read_dir(&sidecar)
+                .map_err(|error| PotError::io(&error))?
+                .next()
+                .is_none()
+        );
         Ok(())
     }
 

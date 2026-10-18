@@ -101,8 +101,8 @@ pub(crate) fn read_external_grids(
     total_levels: u32,
     corner_count: usize,
 ) -> Result<Vec<Vec<[f32; 3]>>> {
-    let (expected_data_size, expected_file_size) = expected_external_sizes(total_levels, corner_count)
-        .map_err(|error| {
+    let (expected_data_size, expected_file_size) =
+        expected_external_sizes(total_levels, corner_count).map_err(|error| {
             import_error(format!(
                 "invalid Blender multires external grid size: {}",
                 error.message
@@ -330,7 +330,10 @@ mod tests {
             expected_external_file_size(2, 24).unwrap()
         );
         let grids = read_external_grids(BLENDER_UNIFORM_LEVEL2, 2, 24).unwrap();
-        assert_eq!(write_external_grids(&grids, 2).unwrap(), BLENDER_UNIFORM_LEVEL2);
+        assert_eq!(
+            write_external_grids(&grids, 2).unwrap(),
+            BLENDER_UNIFORM_LEVEL2
+        );
         // Blender reads corner i at DATA_OFFSET + 108 * i, i.e. 12 * 9 bytes per corner.
         assert_eq!(DATA_OFFSET + 108 * 23, 2596);
     }
@@ -397,7 +400,9 @@ mod tests {
 
     #[test]
     fn mixed_corner_levels_are_refused_before_any_bytes_are_written() {
-        assert!(require_top_level_corners(&[2, 2, 2], 2, ErrorCode::UnrepresentableFeature).is_ok());
+        assert!(
+            require_top_level_corners(&[2, 2, 2], 2, ErrorCode::UnrepresentableFeature).is_ok()
+        );
         let error = require_top_level_corners(&[2, 1, 2], 2, ErrorCode::UnrepresentableFeature)
             .unwrap_err();
         assert_eq!(error.code, ErrorCode::UnrepresentableFeature);

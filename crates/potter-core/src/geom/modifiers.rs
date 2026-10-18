@@ -4046,7 +4046,12 @@ fn apply_multires_displacements(
         for (&vertex_id, sample) in face.vertices.iter().zip(face_samples) {
             // The limit point and displacement depend only on the sample, so output corners that share
             // a sample reuse one evaluation and accumulate the same value in the same order.
-            let key = (sample.face, sample.ptex, sample.u.to_bits(), sample.v.to_bits());
+            let key = (
+                sample.face,
+                sample.ptex,
+                sample.u.to_bits(),
+                sample.v.to_bits(),
+            );
             let value = match evaluated.get(&key) {
                 Some(value) => *value,
                 None => {
