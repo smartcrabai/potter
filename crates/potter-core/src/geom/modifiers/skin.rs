@@ -462,6 +462,7 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         .collect();
     branch_faces = merge_triangle_faces(&points, branch_faces, symmetry_axes);
     let mut welded = Vec::new();
+    let mut stale_edges = Vec::new();
     repair_detached_branch_frames(
         &mut points,
         &mut origins,
@@ -469,6 +470,7 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         &mut branch_faces,
         &detached_frames,
         &mut welded,
+        &mut stale_edges,
     )?;
     smooth_branch_hull_points(
         &mut points,
@@ -535,8 +537,12 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         }
     }
     let polygons: Vec<Vec<usize>> = faces.into_iter().map(|(face, _)| face).collect();
+    // Blender's final hull_merge_triangles deletes every edge still tagged BM_ELEM_TAG, which
+    // removes all faces around it (MOD_skin.cc:1632). The tags come from the triangle split in
+    // skin_fix_hole_no_good_verts.
     let faces: Vec<Polygon> = merge_triangle_faces(&points, polygons, symmetry_axes)
         .into_iter()
+        .filter(|face| !stale_edges.iter().any(|&edge| face_has_edge(face, edge)))
         .map(|face| (face, 0))
         .collect();
     let (points, origins, faces) = drop_welded_points(points, origins, faces, &welded);
@@ -753,6 +759,7 @@ fn repair_detached_branch_frames(
     faces: &mut Vec<Vec<usize>>,
     detached_frames: &[(usize, [bool; 4])],
     welded: &mut Vec<usize>,
+    stale_edges: &mut Vec<(usize, usize)>,
 ) -> Result<()> {
     for &(frame_index, inside) in detached_frames {
         let frame = frame_vertex_ids.get(frame_index).copied().ok_or_else(|| {
@@ -787,6 +794,7 @@ fn repair_detached_branch_frames(
                 target,
                 frame_vertex_ids[frame_index],
                 welded,
+                stale_edges,
             )?
         {
             continue;
@@ -801,7 +809,7 @@ fn subdivide_skin_target_face(
     origins: &mut Vec<Vec<(usize, f64)>>,
     faces: &mut [Vec<usize>],
     target: usize,
-) -> Result<()> {
+) -> Result<(usize, usize, usize)> {
     let face = faces.get(target).ok_or_else(|| {
         PotError::new(
             ErrorCode::InternalError,
@@ -865,7 +873,7 @@ fn subdivide_skin_target_face(
             "Skin target face subdivision edge disappeared",
         ));
     }
-    Ok(())
+    Ok((first, midpoint_index, second))
 }
 
 /// Blender's `skin_fix_hole_no_good_verts`: `target` is extruded, which deletes it and leaves a copy
@@ -879,6 +887,7 @@ fn skin_fix_hole_no_good_verts(
     target: usize,
     frame: [usize; 4],
     welded: &mut Vec<usize>,
+    stale_edges: &mut Vec<(usize, usize)>,
 ) -> Result<bool> {
     let ring = faces.get(target).cloned().ok_or_else(|| {
         PotError::new(
@@ -899,8 +908,12 @@ fn skin_fix_hole_no_good_verts(
         faces.push(vec![ring[next], copy[next], copy[corner], vertex]);
     }
     faces[target] = copy;
+    let mut split = None;
     if faces[target].len() == 3 {
-        subdivide_skin_target_face(points, origins, faces, target)?;
+        // Blender's triangle branch clears every edge tag before tagging the split edge
+        // (MOD_skin.cc:1389-1390).
+        stale_edges.clear();
+        split = Some(subdivide_skin_target_face(points, origins, faces, target)?);
     }
     if faces[target].len() > 4 {
         collapse_skin_face_corners(points, faces, target, welded);
@@ -918,6 +931,22 @@ fn skin_fix_hole_no_good_verts(
     welded.extend(quad);
     faces.remove(target);
     weld_skin_vertices(faces, &mapping);
+    if let Some((first, midpoint, second)) = split {
+        // Blender's BM_edge_split copies BM_ELEM_TAG to both halves (bmesh_construct.cc
+        // BM_elem_attrs_copy keeps non-select header flags), so both survive the weld tagged.
+        let mapped = |vertex: usize| {
+            mapping
+                .iter()
+                .find(|&&(from, _)| from == vertex)
+                .map_or(vertex, |&(_, to)| to)
+        };
+        for (a, b) in [(first, midpoint), (midpoint, second)] {
+            let (a, b) = (mapped(a), mapped(b));
+            if a != b {
+                stale_edges.push(ordered_edge(a, b));
+            }
+        }
+    }
     Ok(true)
 }
 
