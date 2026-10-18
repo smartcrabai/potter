@@ -121,6 +121,7 @@ pub(crate) fn srgb_to_linear(value: f64) -> f64 {
 /// it for image textures, so the image sampler uses this decode. `mul_add` is the fused `madd` of the arm64 build
 /// (NEON `vfmaq_f32`), which Blender's arm64 and this crate share; the x86 SSE2 build rounds the multiply and the
 /// add separately.
+#[must_use]
 pub fn cycles_srgb_to_linear(encoded: f32) -> f32 {
     if encoded < 0.04045_f32 {
         (encoded * (1.0_f32 / 12.92_f32)).max(0.0)
