@@ -26,7 +26,7 @@ use super::{
     scene::{Geometry, HitPose, LayerTables, ObjectRecord, layered_context, object_space},
 };
 use super::principled_bsdf::{
-    continuous_density, evaluate as evaluate_bsdf, lobe_probabilities, record_unevaluated_inputs,
+    continuous_density, evaluate as evaluate_bsdf, lobe_probabilities,
 };
 
 const RAY_EPSILON: f64 = 1.0e-5;
@@ -1269,7 +1269,6 @@ fn make_surface(
     if params.normal.dot(-direction) < 0.0 {
         params.normal = -params.normal;
     }
-    record_unevaluated_inputs(&params, &geometry.shader_warnings);
     Ok(Surface {
         point,
         normal: params.normal,

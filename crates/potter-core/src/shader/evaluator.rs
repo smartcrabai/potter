@@ -30,6 +30,33 @@ pub(crate) fn dielectric_f0(ior: f64, level: f64) -> f64 {
     (fresnel * 2.0 * level.max(0.0)).min(1.0)
 }
 
+/// Principled inputs that change Cycles' result but that Potter's lobe model does not evaluate, as
+/// `(feature_id, Blender input)` pairs.
+pub(crate) fn unevaluated_principled_inputs(
+    params: &BsdfParams,
+) -> Vec<(&'static str, &'static str)> {
+    let mut inputs = Vec::new();
+    if params.coat_weight > 0.0 {
+        inputs.push(("shader.principled.coat", "Coat Weight"));
+    }
+    if params.sheen_weight > 0.0 {
+        inputs.push(("shader.principled.sheen", "Sheen Weight"));
+    }
+    if params.subsurface_weight > 0.0 {
+        inputs.push(("shader.principled.subsurface", "Subsurface Weight"));
+    }
+    if params.anisotropic_ior > 0.0 {
+        inputs.push(("shader.principled.anisotropic", "Anisotropic"));
+    }
+    if params.thin_film_thickness > 0.0 {
+        inputs.push(("shader.principled.thin_film", "Thin Film Thickness"));
+    }
+    if params.transmission > 0.0 && params.roughness > 0.0 {
+        inputs.push(("shader.principled.transmission_ggx", "Transmission Weight"));
+    }
+    inputs
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BsdfParams {
     pub base_color: [f64; 4],
@@ -927,6 +954,34 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_> {
         }
     }
 
+    /// Reports each Principled input this lobe model does not evaluate, naming the material and
+    /// node. Deduped per (material, input) in the warnings sink the render output reports.
+    fn record_unevaluated_inputs(&self, id: &Id, params: &BsdfParams) {
+        let Some(warnings) = self.hit_ctx.warnings else {
+            return;
+        };
+        let material = self.material.name.as_str();
+        for (feature_id, input) in unevaluated_principled_inputs(params) {
+            let mut recorded = warnings.borrow_mut();
+            let duplicate = recorded.iter().any(|warning| {
+                warning["material"].as_str() == Some(material)
+                    && warning["input"].as_str() == Some(input)
+            });
+            if !duplicate {
+                recorded.push(json!({
+                    "code": "UNSUPPORTED_FEATURE",
+                    "feature_id": feature_id,
+                    "material": material,
+                    "node_id": id.to_string(),
+                    "input": input,
+                    "message": format!(
+                        "Principled input '{input}' of material '{material}' (node '{id}') is not evaluated by Potter's lobe model; its Cycles contribution is omitted or approximated"
+                    ),
+                }));
+            }
+        }
+    }
+
     fn principled(&mut self, id: &Id) -> Result<BsdfParams> {
         let node = self.node(id)?;
         if node
@@ -935,10 +990,9 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_> {
             .and_then(JsonValue::as_bool)
             == Some(true)
         {
-            return Ok(BsdfParams::from_material(
-                self.material,
-                self.hit_ctx.normal,
-            ));
+            let params = BsdfParams::from_material(self.material, self.hit_ctx.normal);
+            self.record_unevaluated_inputs(id, &params);
+            return Ok(params);
         }
         let mut params = BsdfParams::from_material(self.material, self.hit_ctx.normal);
         params.base_color = self.color_input(id, &["Base Color"], [0.8, 0.8, 0.8, 1.0])?;
@@ -985,6 +1039,7 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_> {
             self.vector_input(id, &["Normal"], self.hit_ctx.normal)?,
             self.hit_ctx.normal,
         );
+        self.record_unevaluated_inputs(id, &params);
         Ok(params)
     }
 

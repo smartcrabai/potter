@@ -30,7 +30,7 @@ use super::{
         point_intensity, spot_attenuation,
     },
     path::object_for_index,
-    principled_bsdf::{diffuse_coefficient, record_unevaluated_inputs, specular_coefficient},
+    principled_bsdf::{diffuse_coefficient, specular_coefficient},
     raster::{
         AlphaMode, Line, Mode, SurfaceHit, SurfaceShader, Triangle, blend_color,
         blend_corner_normals, blend_uv,
@@ -523,7 +523,6 @@ pub(super) fn extract_geometry(
                         base_color
                     } else {
                         let params = shading_params(material, base_color, normal);
-                        record_unevaluated_inputs(&params, &shader_warnings);
                         shade(
                             doc, snapshot, center, center, normal, normal, &params, mode, None,
                             images,
@@ -868,7 +867,6 @@ pub(super) fn extract_geometry(
             let center =
                 (triangle.positions[0] + triangle.positions[1] + triangle.positions[2]) / 3.0;
             let params = shading_params(Some(material), material.base_color, normal);
-            record_unevaluated_inputs(&params, &shader_warnings);
             let color = shade(
                 doc,
                 snapshot,
@@ -1471,7 +1469,6 @@ impl SurfaceShader for SceneShader<'_> {
             ];
             shading_params(material, base, hit.normal)
         });
-        record_unevaluated_inputs(&params, &self.geometry.shader_warnings);
         let shadow = self.geometry.shadows.as_ref().map(|shadows| {
             (
                 &shadows.bvh,

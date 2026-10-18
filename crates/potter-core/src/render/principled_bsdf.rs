@@ -192,55 +192,6 @@ fn base_color(params: &BsdfParams) -> DVec3 {
     .clamp(DVec3::ZERO, DVec3::ONE)
 }
 
-/// Principled inputs that change Cycles' result but that this lobe model does not evaluate, as
-/// `(feature_id, Blender input)` pairs. Renders report each one as an `UNSUPPORTED_FEATURE`
-/// warning, so no contribution is dropped silently.
-pub(crate) fn unevaluated_inputs(params: &BsdfParams) -> Vec<(&'static str, &'static str)> {
-    let mut inputs = Vec::new();
-    if params.coat_weight > 0.0 {
-        inputs.push(("shader.principled.coat", "Coat Weight"));
-    }
-    if params.sheen_weight > 0.0 {
-        inputs.push(("shader.principled.sheen", "Sheen Weight"));
-    }
-    if params.subsurface_weight > 0.0 {
-        inputs.push(("shader.principled.subsurface", "Subsurface Weight"));
-    }
-    if params.anisotropic_ior > 0.0 {
-        inputs.push(("shader.principled.anisotropic", "Anisotropic"));
-    }
-    if params.thin_film_thickness > 0.0 {
-        inputs.push(("shader.principled.thin_film", "Thin Film Thickness"));
-    }
-    if params.transmission > 0.0 && params.roughness > 0.0 {
-        inputs.push(("shader.principled.transmission_ggx", "Transmission Weight"));
-    }
-    inputs
-}
-
-/// Records `UNSUPPORTED_FEATURE` for each Principled input the lobe model does not evaluate, once
-/// per distinct warning, in the list the render output reports. Shared by the path tracer and the
-/// raster preview.
-pub(crate) fn record_unevaluated_inputs(
-    params: &BsdfParams,
-    warnings: &std::cell::RefCell<Vec<serde_json::Value>>,
-) {
-    for (feature_id, input) in unevaluated_inputs(params) {
-        let warning = serde_json::json!({
-            "code": "UNSUPPORTED_FEATURE",
-            "feature_id": feature_id,
-            "input": input,
-            "message": format!(
-                "Principled input '{input}' is not evaluated by Potter's lobe model; its Cycles contribution is omitted or approximated"
-            ),
-        });
-        let mut recorded = warnings.borrow_mut();
-        if !recorded.contains(&warning) {
-            recorded.push(warning);
-        }
-    }
-}
-
 /// `closure_layering_weight(layer_albedo, weight)` for a scalar weight and a per-channel albedo:
 /// `weight * saturate(1 - max(albedo / weight))`, i.e. `max(0, weight - max(albedo))`.
 fn closure_layering_weight(max_layer_albedo: f64, weight: f64) -> f64 {
