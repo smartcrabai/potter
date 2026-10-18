@@ -30,6 +30,25 @@ fn main() -> io::Result<()> {
     let target =
         env::var("TARGET").map_err(|error| io::Error::new(io::ErrorKind::NotFound, error))?;
     hash_field(&mut hasher, "metadata/TARGET", target.as_bytes());
+    for name in [
+        "PROFILE",
+        "OPT_LEVEL",
+        "DEBUG",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "CARGO_CFG_TARGET_FEATURE",
+    ] {
+        println!("cargo:rerun-if-env-changed={name}");
+        let value = match env::var_os(name) {
+            Some(value) => value.into_string().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Cargo build metadata {name} is not UTF-8"),
+                )
+            })?,
+            None => String::new(),
+        };
+        hash_field(&mut hasher, &format!("metadata/{name}"), value.as_bytes());
+    }
 
     let mut features = Vec::new();
     for (name, value) in env::vars_os() {
