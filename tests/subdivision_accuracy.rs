@@ -804,7 +804,8 @@ fn compare_shapes(actual: &Shape, expected: &Shape) -> Result<Errors, String> {
                     "vertex group {name} multiplicity differs at position {target}"
                 ));
             }
-            for (actual_weight, expected_weight) in actual_values.iter().zip(expected_values.iter()) {
+            for (actual_weight, expected_weight) in actual_values.iter().zip(expected_values.iter())
+            {
                 if (actual_weight - expected_weight).abs() > 1.0e-6 {
                     return Err(format!(
                         "vertex group {name} weight {actual_weight:.9} != Blender {expected_weight:.9}"
