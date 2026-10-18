@@ -351,12 +351,11 @@ fn compare_output(mesh: &Mesh, expected: &Value, variant: &str, case: &Value) {
                 .into_iter()
                 .flatten(),
         )
-        .filter_map(|(edge, flags)| {
-            (flags.get("sharp").and_then(Value::as_bool) == Some(true)).then(|| {
-                let mut pair = [indices[&edge.vertices[0]], indices[&edge.vertices[1]]];
-                pair.sort_unstable();
-                pair
-            })
+        .filter(|(_, flags)| flags.get("sharp").and_then(Value::as_bool) == Some(true))
+        .map(|(edge, _)| {
+            let mut pair = [indices[&edge.vertices[0]], indices[&edge.vertices[1]]];
+            pair.sort_unstable();
+            pair
         })
         .collect();
     actual_sharp_edges.sort_unstable();

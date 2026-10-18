@@ -21,14 +21,9 @@ fn init(scene: &Path) -> TestResult {
 
 fn apply_response(scene: &Path, base_revision: u64, operations: Value) -> TestResult<Value> {
     let batch_path = scene.join("operations.json");
-    fs::write(
-        &batch_path,
-        serde_json::to_vec(&json!({
-            "schema_version": 1,
-            "base_revision": base_revision,
-            "operations": operations,
-        }))?,
-    )?;
+    let mut batch = json!({"schema_version": 1, "base_revision": base_revision});
+    batch["operations"] = operations;
+    fs::write(&batch_path, serde_json::to_vec(&batch)?)?;
     let output = pot()
         .arg("apply")
         .arg(scene)
@@ -79,13 +74,13 @@ fn modifier_apply_forwards_array_fallback_warnings_and_keeps_fallback_geometry()
             "fixed_count_plain",
             "modifier.array.count_too_high",
             false,
-            json!({"fit_type":"FIXED_COUNT","count":2147483647}),
+            json!({"fit_type":"FIXED_COUNT","count":2_147_483_647}),
         ),
         (
             "fixed_count_scene_context",
             "modifier.array.count_too_high",
             true,
-            json!({"fit_type":"FIXED_COUNT","count":2147483647}),
+            json!({"fit_type":"FIXED_COUNT","count":2_147_483_647}),
         ),
         (
             "tiny_offset_plain",
@@ -96,7 +91,7 @@ fn modifier_apply_forwards_array_fallback_warnings_and_keeps_fallback_geometry()
                 "fit_length":4.0,
                 "use_relative_offset":false,
                 "use_constant_offset":true,
-                "constant_offset_displace":[0.0000001,0.0,0.0]
+                "constant_offset_displace":[0.000_000_1,0.0,0.0]
             }),
         ),
         (
@@ -108,7 +103,7 @@ fn modifier_apply_forwards_array_fallback_warnings_and_keeps_fallback_geometry()
                 "fit_length":4.0,
                 "use_relative_offset":false,
                 "use_constant_offset":true,
-                "constant_offset_displace":[0.0000001,0.0,0.0]
+                "constant_offset_displace":[0.000_000_1,0.0,0.0]
             }),
         ),
     ];
@@ -204,7 +199,7 @@ fn screw_apply_uses_axis_transform_without_evaluating_unselected_downstream_modi
     assert_eq!(response["ok"], true, "{response}");
     let positions = mesh_positions(&mesh(&scene, "subject")?)?;
     // The middle ring rotates the box corner (1, 1, 1) by half of the 1-radian turn around Z.
-    let expected_mid_ring_vertex = [0.398157, 1.3570081, 1.0];
+    let expected_mid_ring_vertex = [0.398_157, 1.357_008_1, 1.0];
     assert!(
         positions.iter().any(|position| {
             position.as_array().is_some_and(|coordinates| {

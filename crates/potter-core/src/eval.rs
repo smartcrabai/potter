@@ -1652,8 +1652,7 @@ fn modifier_transform_references(modifier: &Modifier) -> BTreeSet<Id> {
     }
 
     let parameters: &[&str] = match modifier.modifier_type.as_str() {
-        "hook" => &["object"],
-        "screw" => &["object"],
+        "hook" | "screw" => &["object"],
         "mirror" => &["mirror_object"],
         "uv_project" => &["projectors"],
         "uv_warp" | "warp" => &["object_from", "object_to"],

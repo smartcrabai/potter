@@ -1814,11 +1814,11 @@ fn array_chunk_elements(vertices: usize, edges: &[[usize; 2]], polygons: &[Polyg
     [vertices, edges.len(), polygons.len(), corners].map(|count| count as u128)
 }
 
-/// The FIT_CURVE length of the `curve` object. Blender's MOD_array.cc starts from
-/// `length = amd->length` (the fit_length parameter) and replaces it only in the block
-/// `fit_type == MOD_ARR_FITCURVE && curve_ob != nullptr` with the curve's animation-path length, and
-/// only when that path exists. So a null curve, or an object with no curve path, keeps `fit_length`
-/// (`None`). A curve ID that names no object is a dangling reference and is an error.
+/// The `FIT_CURVE` length of the `curve` object. Blender's `MOD_array.cc` starts from
+/// `length = amd->length` (the `fit_length` parameter) and replaces it only in the block
+/// `fit_type == MOD_ARR_FITCURVE && curve_ob != nullptr` with the curve's animation-path length,
+/// and only when that path exists. So a null curve, or an object with no curve path, keeps
+/// `fit_length` (`None`). A curve ID that names no object is a dangling reference and is an error.
 fn array_curve_length(
     modifier: &Modifier,
     curve_path_lengths: &BTreeMap<Id, f64>,
@@ -1904,13 +1904,13 @@ fn array_empty_source_transform(step: Mat4, count: usize) -> Mat4 {
     if step.x_axis == Vec3::X.extend(0.0)
         && step.y_axis == Vec3::Y.extend(0.0)
         && step.z_axis == Vec3::Z.extend(0.0)
-        && step.w_axis.w == 1.0
+        && step.w_axis.w.to_bits() == 1.0_f32.to_bits()
     {
         let repeated = |increment: f32| {
             let mut value = 0.0_f32;
             for _ in 0..count {
                 let next = value + increment;
-                if next == value {
+                if next.to_bits() == value.to_bits() {
                     break;
                 }
                 value = next;
@@ -5590,10 +5590,10 @@ fn connected_clusters(
         return Ok(None);
     }
     let mut dest = vec![None; points.len()];
-    for index in 0..points.len() {
+    for (index, slot) in dest.iter_mut().enumerate() {
         let root = find(&mut parent, index);
         if merged_vertices[root] > 0 {
-            dest[index] = Some(root);
+            *slot = Some(root);
         }
     }
     Ok(Some(dest))
@@ -5800,7 +5800,6 @@ struct WeldKdNode {
 
 #[expect(
     clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
     reason = "Blender stores Weld coordinates and merge distance as float32"
 )]
 fn all_weld_dest_map(
@@ -5854,7 +5853,6 @@ fn all_weld_dest_map(
 }
 
 #[expect(
-    clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     reason = "Blender's median partition uses signed indices for decrementing"
 )]
@@ -6705,7 +6703,7 @@ mod tests {
                     .as_array()
                     .unwrap()
                     .iter()
-                    .map(|normal| vector(normal))
+                    .map(vector)
             })
             .collect();
         let actual =
@@ -6736,7 +6734,7 @@ mod tests {
         let profile_edges = input["edges"].as_array().unwrap();
         let loose_edges = profile_edges
             .iter()
-            .map(|edge| indices(edge))
+            .map(indices)
             .filter(|pair| !face_edges.contains(&[pair[0].min(pair[1]), pair[0].max(pair[1])]))
             .count();
         let faces_per_edge = output.faces.len() / profile_edges.len();

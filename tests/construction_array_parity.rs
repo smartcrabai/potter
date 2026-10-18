@@ -230,15 +230,13 @@ fn vertex_group_data(
     group_order: Option<&Value>,
 ) -> (Vec<Value>, Value) {
     let groups = spec["groups"].as_object().unwrap();
-    let names: Vec<String> = group_order
-        .and_then(Value::as_array)
-        .map(|order| {
-            order
-                .iter()
-                .map(|name| name.as_str().unwrap().to_owned())
-                .collect()
-        })
-        .unwrap_or_else(|| groups.keys().cloned().collect());
+    let names: Vec<String> = match group_order.and_then(Value::as_array) {
+        Some(order) => order
+            .iter()
+            .map(|name| name.as_str().unwrap().to_owned())
+            .collect(),
+        None => groups.keys().cloned().collect(),
+    };
     let mut group_ids = BTreeMap::new();
     let metadata: Vec<Value> = names
         .iter()
@@ -846,7 +844,7 @@ fn array_merge_split_faces_keep_blender_smooth_default() {
         .unwrap()
         .iter()
         .find(|case| case["name"] == "merge_split_faces_keep_smooth_default")
-        .expect("Array split-face smoothing oracle case");
+        .unwrap_or_else(|| panic!("missing Array split-face smoothing oracle case"));
     let faces = case["expected"]["faces"].as_array().unwrap();
     assert_eq!(
         faces.len(),

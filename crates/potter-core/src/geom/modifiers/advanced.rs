@@ -205,7 +205,7 @@ fn simple_deform_bend(coordinates: [f64; 3], cut: [f64; 3], axis: usize, factor:
     }
 }
 
-/// Blender's Screw modifier (MOD_screw.cc): the profile edges sweep around the axis through the
+/// Blender's Screw modifier (`MOD_screw.cc`): the profile edges sweep around the axis through the
 /// pivot, one ring per step, and the screw offset rises along the axis.
 pub(super) fn screw(
     mesh: &Mesh,
@@ -801,7 +801,7 @@ fn screw_float(modifier: &Modifier, name: &str) -> Result<f32> {
     }
 }
 
-/// One profile vertex's neighbours in the screw's edge chain (`ScrewConnection` in MOD_screw.cc).
+/// One profile vertex's neighbours in the screw's edge chain (`ScrewConnection` in `MOD_screw.cc`).
 /// A vertex with more than two profile edges is invalid and breaks its chain.
 #[derive(Clone, Copy, Default)]
 struct ScrewConnection {

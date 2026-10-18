@@ -761,10 +761,10 @@ fn screw_matches_blender_522_construction_corpus() {
         "iterations": 1,
         "steps": 16,
         "render_steps": 16,
-        "angle": 6.2831854820251465,
+        "angle": f64::from(std::f32::consts::TAU),
         "axis": "Z",
         "screw_offset": 0.0,
-        "merge_threshold": 0.009999999776482582,
+        "merge_threshold": f64::from(0.01_f32),
         "use_merge_vertices": false,
         "use_normal_calculate": false,
         "use_normal_flip": false,
@@ -812,7 +812,7 @@ fn screw_preserves_first_ring_source_float32_with_large_axis_pivot() {
 
 #[test]
 fn screw_large_radius_single_axis_rotation_matches_blender_matrix_source_formula() {
-    let angle = 1.5707963705062866_f32;
+    let angle = std::f32::consts::FRAC_PI_2;
     let case = json!({
         "input": {
             "vertices": [[10_000.0, 0.0, 0.0], [10_000.0, 0.0, 1.0]],

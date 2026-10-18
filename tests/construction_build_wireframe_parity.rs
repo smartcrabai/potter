@@ -471,8 +471,7 @@ fn compare_output(mesh: &Mesh, expected: &Value, group_names: &[String], label: 
             .map(|vertex| {
                 values
                     .and_then(|weights| weights.get(&format!("v{}", vertex.id)))
-                    .map(number)
-                    .unwrap_or(0.0)
+                    .map_or(0.0, number)
             })
             .collect();
         assert_eq!(actual_weights, expected_weights, "{label}: {name} weights");
