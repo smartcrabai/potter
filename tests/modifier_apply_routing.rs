@@ -191,7 +191,7 @@ fn screw_apply_uses_axis_transform_without_evaluating_unselected_downstream_modi
         json!([
             {"op":"node.create","id":"subject","kind":"box","params":{"size":2.0}},
             {"op":"node.create","id":"axis","kind":"box","params":{"size":1.0}},
-            {"op":"modifier.create","target":{"id":"subject"},"id":"screw","type":"screw","params":{"axis":"Z","steps":2,"object":"axis"}},
+            {"op":"modifier.create","target":{"id":"subject"},"id":"screw","type":"screw","params":{"axis":"Z","steps":2,"angle":1.0,"object":"axis","use_object_screw_offset":false}},
             {"op":"modifier.create","target":{"id":"subject"},"id":"unselected_unsupported_bevel","type":"bevel","params":{"width":0.1,"segments":2,"harden_normals":true}}
         ]),
     )?;
@@ -202,6 +202,24 @@ fn screw_apply_uses_axis_transform_without_evaluating_unselected_downstream_modi
         json!([{"op":"modifier.apply","target":{"id":"subject"},"modifier_id":"screw"}]),
     )?;
     assert_eq!(response["ok"], true, "{response}");
+    let positions = mesh_positions(&mesh(&scene, "subject")?)?;
+    // The middle ring rotates the box corner (1, 1, 1) by half of the 1-radian turn around Z.
+    let expected_mid_ring_vertex = [0.398157, 1.3570081, 1.0];
+    assert!(
+        positions.iter().any(|position| {
+            position.as_array().is_some_and(|coordinates| {
+                coordinates
+                    .iter()
+                    .zip(expected_mid_ring_vertex)
+                    .all(|(actual, expected)| {
+                        actual
+                            .as_f64()
+                            .is_some_and(|actual| (actual - expected).abs() <= 1.0e-5)
+                    })
+            })
+        }),
+        "expected the rotated box corner in applied geometry, got {positions:?}"
+    );
 
     let document: Value = serde_json::from_slice(&fs::read(scene.join("scene.json"))?)?;
     let modifiers = document["nodes"]["subject"]["modifiers"]

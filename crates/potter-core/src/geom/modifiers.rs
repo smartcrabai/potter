@@ -973,6 +973,13 @@ fn build_mesh_with_corner_order(
     result
         .insert_faces(faces)
         .map_err(|error| mesh_error(&error))?;
+    let mut edge_keys = HashSet::with_capacity(result.edges.len() + loose_edges.len());
+    edge_keys.extend(
+        result
+            .edges
+            .iter()
+            .map(|edge| edge_key(edge.vertices[0], edge.vertices[1])),
+    );
     for [first, second] in loose_edges {
         let Some(first_id) = result.vertices.get(first).map(|vertex| vertex.id) else {
             return Err(PotError::new(
@@ -986,11 +993,7 @@ fn build_mesh_with_corner_order(
                 "generated edge index is out of range",
             ));
         };
-        if first_id != second_id
-            && !result.edges.iter().any(|edge| {
-                edge_key(edge.vertices[0], edge.vertices[1]) == edge_key(first_id, second_id)
-            })
-        {
+        if first_id != second_id && edge_keys.insert(edge_key(first_id, second_id)) {
             result
                 .insert_edge([first_id, second_id])
                 .map_err(|error| mesh_error(&error))?;
@@ -999,6 +1002,34 @@ fn build_mesh_with_corner_order(
     remap_attributes_with_basis(source, &mut result, origin, &[], corner_order)?;
     validated(&result)?;
     Ok(result)
+}
+fn mark_generated_faces_smooth(mesh: &mut Mesh, generated: &[usize]) {
+    if generated.is_empty() {
+        return;
+    }
+    if let Some(values) = mesh
+        .attributes
+        .get_mut("shade_smooth")
+        .and_then(|attribute| attribute.get_mut("values"))
+        .and_then(Value::as_object_mut)
+    {
+        for &index in generated {
+            if let Some(face) = mesh.faces.get(index) {
+                values.insert(format!("f{}", face.id), json!(true));
+            }
+        }
+    }
+    if let Some(flags) = mesh
+        .attributes
+        .get_mut("blender_polygon_smooth")
+        .and_then(Value::as_array_mut)
+    {
+        for &index in generated {
+            if let Some(flag) = flags.get_mut(index) {
+                *flag = json!(true);
+            }
+        }
+    }
 }
 
 /// Labels of the element-keyed data a modifier must carry through a rebuild: each top-level
@@ -1728,15 +1759,13 @@ fn array(
     // Blender's 2^26-vertex limit has applied above. This budget bounds the memory the copies
     // need, estimated from the output element counts before any of it is allocated.
     let copy_count = count_usize as u128;
-    let source_elements = array_chunk_elements(
-        source_points.len(),
-        source_edges.len() + source_loose_edges.len(),
-        &source_polygons,
-    );
+    let source_elements =
+        array_chunk_elements(source_points.len(), &source_edges, &source_polygons);
     let mut output_elements = source_elements.map(|element| element * copy_count);
-    for (points, polygons, loose_edges, edges) in start_cap_parts.iter().chain(end_cap_parts.iter())
+    for (points, polygons, _loose_edges, edges) in
+        start_cap_parts.iter().chain(end_cap_parts.iter())
     {
-        let cap = array_chunk_elements(points.len(), edges.len() + loose_edges.len(), polygons);
+        let cap = array_chunk_elements(points.len(), edges, polygons);
         for (total, element) in output_elements.iter_mut().zip(cap) {
             *total += element;
         }
@@ -2060,6 +2089,11 @@ fn array(
         polygon_sources,
         generated_polygons,
     } = merged;
+    let generated_face_indices = generated_polygons
+        .iter()
+        .enumerate()
+        .filter_map(|(index, &generated)| generated.then_some(index))
+        .collect::<Vec<_>>();
     let origin = Origin {
         vertices: point_members
             .iter()
@@ -2103,6 +2137,7 @@ fn array(
         provenance_source,
         corner_order.as_deref(),
     )?;
+    mark_generated_faces_smooth(&mut result, &generated_face_indices);
     if let Some(first) = &first_sources {
         let edge_count = mesh.edges.len();
         let copy_edges = count_usize * edge_count;
@@ -2151,10 +2186,10 @@ fn array_cap_mesh<'a>(
 }
 
 /// Output elements (vertices, edges, faces, corners) of one array chunk, a copy of the source or a
-/// cap. Copies keep every edge and loose edge; merging only removes elements, so this bounds them.
-fn array_chunk_elements(vertices: usize, edges: usize, polygons: &[Polygon]) -> [u128; 4] {
+/// cap. Each input edge is counted once; merging only removes elements, so these are upper bounds.
+fn array_chunk_elements(vertices: usize, edges: &[[usize; 2]], polygons: &[Polygon]) -> [u128; 4] {
     let corners: usize = polygons.iter().map(|(face, _)| face.len()).sum();
-    [vertices, edges, polygons.len(), corners].map(|count| count as u128)
+    [vertices, edges.len(), polygons.len(), corners].map(|count| count as u128)
 }
 
 /// The FIT_CURVE length of the `curve` object. Blender's MOD_array.cc starts from
@@ -5591,31 +5626,7 @@ fn weld(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         corners: Some(corner_origins),
     };
     let mut result = build_mesh(merged.points, merged.polygons, merged.edges, &origin, mesh)?;
-    let generated_face_ids: Vec<u32> = generated_face_indices
-        .iter()
-        .filter_map(|&index| result.faces.get(index).map(|face| face.id))
-        .collect();
-    if let Some(values) = result
-        .attributes
-        .get_mut("shade_smooth")
-        .and_then(|attribute| attribute.get_mut("values"))
-        .and_then(Value::as_object_mut)
-    {
-        for id in &generated_face_ids {
-            values.insert(format!("f{id}"), json!(true));
-        }
-    }
-    if let Some(flags) = result
-        .attributes
-        .get_mut("blender_polygon_smooth")
-        .and_then(Value::as_array_mut)
-    {
-        for &index in &generated_face_indices {
-            if let Some(flag) = flags.get_mut(index) {
-                *flag = json!(true);
-            }
-        }
-    }
+    mark_generated_faces_smooth(&mut result, &generated_face_indices);
     clnor::transfer_custom_normals(mesh, &mut result, &sources, NormalCodeOptions::default())?;
     Ok(result)
 }
@@ -6426,8 +6437,9 @@ mod tests {
     };
 
     use super::{
-        check_subdivision_budget, contextless_material_slot_count, evaluate_modifiers,
-        evaluated_curve_path_length,
+        array_chunk_elements, check_evaluation_memory_budget, check_subdivision_budget,
+        contextless_material_slot_count, edge_pairs, evaluate_modifiers,
+        evaluated_curve_path_length, loose_edges,
     };
 
     fn modifier(enabled: bool, modifier_type: &str) -> Modifier {
@@ -6643,6 +6655,34 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.code, ErrorCode::TargetNotFound);
+    }
+
+    #[test]
+    fn array_memory_budget_counts_a_loose_edge_once() {
+        let mut mesh = Mesh::new();
+        let first = mesh.insert_vertex(DVec3::ZERO).unwrap();
+        let second = mesh.insert_vertex(DVec3::X).unwrap();
+        mesh.insert_edge([first, second]).unwrap();
+        let edges = edge_pairs(&mesh).unwrap();
+        assert_eq!(loose_edges(&mesh).unwrap().len(), 1);
+        let [vertices, edges, faces, corners] =
+            array_chunk_elements(mesh.vertices.len(), &edges, &[]);
+        assert_eq!([vertices, edges, faces, corners], [2, 1, 0, 0]);
+
+        // Twenty-five million copies occupy 6.4 GB at one edge per copy; counting loose edges again
+        // would inflate this to 9.6 GB and incorrectly reject it against the 8-GiB budget.
+        let copies = 25_000_000_u128;
+        assert!(
+            check_evaluation_memory_budget(
+                "array",
+                vertices * copies,
+                edges * copies,
+                faces * copies,
+                corners * copies,
+                0,
+            )
+            .is_ok()
+        );
     }
 
     #[test]

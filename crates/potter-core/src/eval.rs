@@ -1631,6 +1631,7 @@ fn modifier_transform_references(modifier: &Modifier) -> BTreeSet<Id> {
 
     let parameters: &[&str] = match modifier.modifier_type.as_str() {
         "hook" => &["object"],
+        "screw" => &["object"],
         "uv_project" => &["projectors"],
         "uv_warp" | "warp" => &["object_from", "object_to"],
         "vertex_weight_edit" | "vertex_weight_mix" | "vertex_weight_proximity" => {
@@ -1666,14 +1667,6 @@ fn modifier_transform_references(modifier: &Modifier) -> BTreeSet<Id> {
         {
             add_reference(&mut references, modifier.params.get("offset_object"));
         }
-    } else if modifier.modifier_type == "screw"
-        && modifier
-            .params
-            .get("use_object_screw_offset")
-            .and_then(Value::as_bool)
-            == Some(true)
-    {
-        add_reference(&mut references, modifier.params.get("object"));
     }
     references
 }

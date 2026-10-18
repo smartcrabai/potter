@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use glam::{DMat4, DQuat, DVec3, Mat4, Quat, Vec3};
+use glam::{DMat4, DQuat, DVec3, Mat4, Vec3};
 use serde_json::Value;
 
 use crate::model::{Id, Modifier};
@@ -428,14 +428,61 @@ pub(super) fn screw(
         };
     points.extend(source_positions.iter().map(|point| point.as_dvec3()));
     for step in 1..ring_count {
-        let rotation = Quat::from_axis_angle(axis, step_angle * step as f32);
+        let rotation_angle = step_angle * step as f32;
+        let angle_cos = rotation_angle.cos();
+        let angle_sin = rotation_angle.sin();
+        let rotation = if axis_object.is_some() {
+            let ico = 1.0_f32 - angle_cos;
+            let [axis_x, axis_y, axis_z] = axis.to_array();
+            let nsi = [axis_x * angle_sin, axis_y * angle_sin, axis_z * angle_sin];
+            let n_00 = (axis_x * axis_x) * ico;
+            let n_01 = (axis_x * axis_y) * ico;
+            let n_11 = (axis_y * axis_y) * ico;
+            let n_02 = (axis_x * axis_z) * ico;
+            let n_12 = (axis_y * axis_z) * ico;
+            let n_22 = (axis_z * axis_z) * ico;
+            [
+                [n_00 + angle_cos, n_01 + nsi[2], n_02 - nsi[1]],
+                [n_01 - nsi[2], n_11 + angle_cos, n_12 + nsi[0]],
+                [n_02 + nsi[1], n_12 - nsi[0], n_22 + angle_cos],
+            ]
+        } else {
+            match axis_index {
+                0 => [
+                    [1.0, 0.0, 0.0],
+                    [0.0, angle_cos, angle_sin],
+                    [0.0, -angle_sin, angle_cos],
+                ],
+                1 => [
+                    [angle_cos, 0.0, -angle_sin],
+                    [0.0, 1.0, 0.0],
+                    [angle_sin, 0.0, angle_cos],
+                ],
+                _ => [
+                    [angle_cos, angle_sin, 0.0],
+                    [-angle_sin, angle_cos, 0.0],
+                    [0.0, 0.0, 1.0],
+                ],
+            }
+        };
         let offset = if closed {
             0.0
         } else {
             screw_offset * step as f32 / (ring_count - 1) as f32
         };
         for &point in &source_positions {
-            let rotated = rotation * (point - pivot);
+            let relative = point - pivot;
+            let rotated = Vec3::new(
+                relative.x * rotation[0][0]
+                    + relative.y * rotation[1][0]
+                    + rotation[2][0] * relative.z,
+                relative.x * rotation[0][1]
+                    + relative.y * rotation[1][1]
+                    + rotation[2][1] * relative.z,
+                relative.x * rotation[0][2]
+                    + relative.y * rotation[1][2]
+                    + rotation[2][2] * relative.z,
+            );
             points.push((pivot + rotated + axis * offset).as_dvec3());
         }
     }

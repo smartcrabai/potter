@@ -810,6 +810,47 @@ fn screw_preserves_first_ring_source_float32_with_large_axis_pivot() {
 }
 
 #[test]
+fn screw_large_radius_single_axis_rotation_matches_blender_matrix_source_formula() {
+    let angle = 1.5707963705062866_f32;
+    let case = json!({
+        "input": {
+            "vertices": [[10_000.0, 0.0, 0.0], [10_000.0, 0.0, 1.0]],
+            "edges": [[0, 1]],
+            "faces": [],
+            "sharp_edges": [],
+            "uv_layers": [],
+            "colors": [],
+            "groups": {},
+            "material_slots": 0,
+            "custom_normals": []
+        },
+        "owner_transform": {
+            "translation": [0.0, 0.0, 0.0],
+            "rotation": [0.0, 0.0, 0.0, 1.0],
+            "scale": [1.0, 1.0, 1.0]
+        },
+        "modifier": {
+            "params": {
+                "axis": "Z",
+                "angle": f64::from(angle),
+                "steps": 1,
+                "render_steps": 1,
+                "iterations": 1,
+                "screw_offset": 0.0
+            }
+        }
+    });
+    let (doc, owner_id) = scene_for_case(&case);
+    let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default()).unwrap();
+    let mesh = &snapshot.meshes[&owner_id];
+
+    // Source-derived from Blender 5.2.2 axis_angle_to_mat3_single and mul_m4_v3, not a Blender-run oracle.
+    let source_formula_x = 10_000.0_f32 * angle.cos();
+    assert_ne!(source_formula_x, 0.0);
+    assert_eq!(mesh.vertices[2].co.x as f32, source_formula_x);
+}
+
+#[test]
 fn screw_normal_calculation_matches_blender_for_asymmetric_radial_neighbors() {
     let fixture: Value = serde_json::from_str(SCREW_FIXTURES).unwrap();
     let case = fixture["cases"]

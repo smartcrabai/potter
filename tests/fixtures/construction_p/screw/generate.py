@@ -283,6 +283,7 @@ CASES = [
     {"name": "two_face_uv_normals_render", "spec": MIXED, "params": {"axis": "X", "angle": 1.5, "screw_offset": 0.25, "steps": 2, "render_steps": 5, "iterations": 3, "use_stretch_u": True, "use_stretch_v": True, "use_normal_calculate": True, "use_normal_flip": False, "use_smooth_shade": False}, "render": True},
     {"name": "normal_calculate_asymmetric_radial_neighbors", "spec": {"vertices": [[2.0, 0.0, 0.0], [1.9, 0.0, 1.0], [0.0, 0.0, 2.0]], "edges": [[0, 1], [0, 2]], "faces": []}, "params": {"axis": "Z", "angle": 1.0, "screw_offset": 0.0, "steps": 2, "render_steps": 2, "iterations": 1, "use_normal_calculate": True, "use_normal_flip": False, "use_smooth_shade": True}},
     {"name": "large_pivot_preserves_first_ring_f32", "spec": {"vertices": [[0.0001, 0.0, 0.0], [0.0001, 0.0, 1.0]], "edges": [[0, 1]], "faces": []}, "params": {"axis": "Z", "object": "screw_axis", "angle": 1.0, "screw_offset": 0.0, "steps": 2, "render_steps": 2, "iterations": 1}, "axis_transform": {"translation": [10000, 0, 0], "rotation_deg": [0, 0, 0], "scale": [1, 1, 1]}},
+    {"name": "large_radius_single_axis_matrix_f32", "spec": {"vertices": [[10_000.0, 0.0, 0.0], [10_000.0, 0.0, 1.0]], "edges": [[0, 1]], "faces": []}, "params": {"axis": "Z", "angle": 1.5707963705062866, "screw_offset": 0.0, "steps": 1, "render_steps": 1, "iterations": 1, "use_normal_calculate": False, "use_normal_flip": False, "use_smooth_shade": True}},
 ]
 
 

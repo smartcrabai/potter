@@ -839,6 +839,30 @@ fn empty_source_array_object_offsets_preserve_caps() {
 }
 
 #[test]
+fn array_merge_split_faces_keep_blender_smooth_default() {
+    let fixture = fixture();
+    let case = fixture["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|case| case["name"] == "merge_split_faces_keep_smooth_default")
+        .expect("Array split-face smoothing oracle case");
+    let faces = case["expected"]["faces"].as_array().unwrap();
+    assert_eq!(
+        faces.len(),
+        3,
+        "the second copy splits at merged corners 0 and 3"
+    );
+    assert!(
+        faces
+            .iter()
+            .all(|face| face["smooth"].as_bool() == Some(true)),
+        "Blender defaults every generated Array split face to smooth"
+    );
+    assert_case(case);
+}
+
+#[test]
 fn array_matches_blender_522_parity_fixtures() {
     let fixture = fixture();
     assert_eq!(fixture["blender_version"], "5.2.2 LTS");

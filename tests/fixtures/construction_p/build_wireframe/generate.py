@@ -87,6 +87,8 @@ def make_object(spec, groups, slot_count):
     mesh = bpy.data.meshes.new("InputMesh")
     mesh.from_pydata(spec["vertices"], spec["edges"], spec["faces"])
     mesh.update()
+    for index in range(slot_count):
+        mesh.materials.append(bpy.data.materials.new(name=f"WireframeSlot{index}"))
     sharp_lookup = {tuple(sorted(edge.vertices)): edge.index for edge in mesh.edges}
     for pair in spec.get("sharp_edges", []):
         mesh.edges[sharp_lookup[tuple(sorted(pair))]].use_edge_sharp = True

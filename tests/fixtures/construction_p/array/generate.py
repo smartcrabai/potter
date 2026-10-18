@@ -66,6 +66,15 @@ BOUNDARY = {
     "uv_layers": [{"name": "UVMap", "values": [[0, 0], [0.125, 0], [0.25, 0.25], [0.375, 0.5]]}],
     "groups": {"Root": [1.0, 0.25, 0.5, None]},
 }
+SMOOTH_SPLIT = {
+    "vertices": [[0, 0, 0], [-1, 1, 0], [-2, 0, 0], [0, 0, 0], [1, -1, 0], [2, 0, 0]],
+    "faces": [[0, 1, 2, 3, 4, 5]],
+    "materials": [0],
+    "uv_layers": [],
+    "groups": {},
+    "face_smooth": [True],
+}
+
 
 EMPTY = {"vertices": [], "faces": [], "materials": [], "uv_layers": [], "groups": {}}
 EMPTY_CAP = {
@@ -448,6 +457,10 @@ CASES = [
      "params": {"count": 2, "use_relative_offset": False, "use_constant_offset": True,
                  "constant_offset_displace": [1.0, 0.0, 0.0], "use_merge_vertices": True,
                  "merge_threshold": 0.125 - 2.0 ** -20}},
+    {"name": "merge_split_faces_keep_smooth_default", "input": SMOOTH_SPLIT,
+     "params": {"count": 2, "use_relative_offset": False, "use_constant_offset": True,
+                 "constant_offset_displace": [0.0, 0.0, 0.0], "use_merge_vertices": True,
+                 "merge_threshold": 0.0}},
     {"name": "merge_threshold_at_boundary", "input": BOUNDARY,
      "params": {"count": 2, "use_relative_offset": False, "use_constant_offset": True,
                  "constant_offset_displace": [1.0, 0.0, 0.0], "use_merge_vertices": True,
