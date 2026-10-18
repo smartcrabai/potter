@@ -2091,9 +2091,10 @@ impl ModifierGate<'_> {
                         == Some(modifier.id.as_str())
             })
         };
-        linked_modifier.map_or(true, |modifier| self.is_active(node_id, modifier))
+        linked_modifier.is_none_or(|modifier| self.is_active(node_id, modifier))
     }
 }
+
 /// Read and verify a cache resource from the scene's asset registry.
 ///
 /// # Errors
@@ -3020,7 +3021,7 @@ fn render_simulated_particles(
             ));
         }
         for (system_index, visible_states) in visible_states_by_system {
-            let has_stack_system = usize::try_from(system_index).ok().is_some_and(|index| {
+            let has_stack_system = usize::try_from(system_index).is_ok_and(|index| {
                 gate.stack_modifiers(emitter_id, &node.modifiers)
                     .iter()
                     .filter(|modifier| modifier.modifier_type == "particle_system")
@@ -5558,7 +5559,8 @@ mod tests {
     };
 
     #[test]
-    fn particle_render_limit_counts_all_systems_for_each_emitter() {
+    fn particle_render_limit_counts_all_systems_for_each_emitter()
+    -> std::result::Result<(), &'static str> {
         let emitter_id = Id::new("emitter").unwrap();
         let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
         doc.nodes.insert(
@@ -5590,7 +5592,7 @@ mod tests {
             modifier_prefix: None,
         };
         let evaluated_nodes = std::collections::BTreeSet::from([emitter_id.clone()]);
-        let error = super::render_simulated_particles(
+        let Err(error) = super::render_simulated_particles(
             &doc,
             gate,
             &particles,
@@ -5599,10 +5601,12 @@ mod tests {
             &mut std::collections::BTreeMap::new(),
             &evaluated_nodes,
             &mut std::collections::BTreeMap::new(),
-        )
-        .expect_err("combined visible systems must exceed the per-emitter limit");
+        ) else {
+            return Err("combined visible systems must exceed the per-emitter limit");
+        };
         assert_eq!(error.code, crate::error::ErrorCode::LimitExceeded);
         assert_eq!(error.details["count"], serde_json::json!(120_002));
+        Ok(())
     }
     fn grease_pencil_scene(data: GreasePencilData, transform: Transform) -> (SceneDoc, Id) {
         let data_id = Id::new("grease_pencil_data").unwrap();

@@ -2674,9 +2674,15 @@ fn subdivision_with_samples(
     } else {
         "levels"
     };
-    // Subsurf is schema-bounded to 11 and the capacity policy below limits the actual allocation.
-    // Multires levels are dynamically bounded by its stored top level, as in Blender's RNA range.
+    // Subsurf is capped at Blender's 5 levels; multires is bounded by its stored top level.
     let requested_levels = uint_param(modifier, level_name)?;
+    if modifier.modifier_type != "multires" && requested_levels > 5 {
+        return Err(invalid_parameter(
+            modifier,
+            level_name,
+            "an integer between 0 and 5",
+        ));
+    }
     let levels = if let Some(data) = &multires_data {
         requested_levels.min(u64::from(data.total_levels))
     } else if modifier.modifier_type == "multires" && modifier.params.contains_key("total_levels") {

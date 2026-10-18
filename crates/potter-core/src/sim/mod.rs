@@ -929,8 +929,7 @@ fn evaluate_physics(
                 .properties
                 .get("physics_particle_emitter_modifier_id")
                 .and_then(Value::as_str)
-                .map(|modifier_id| particle_system_index(node, modifier_id))
-                .unwrap_or(0);
+                .map_or(0, |modifier_id| particle_system_index(node, modifier_id));
             result.particles.insert(
                 id.clone(),
                 particles

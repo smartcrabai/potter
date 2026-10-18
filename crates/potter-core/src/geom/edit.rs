@@ -2739,9 +2739,9 @@ fn apply_dissolve(mesh: &mut Mesh, selected: &Selection) -> Result<IdChanges> {
             return Err(invalid("adjacent faces have incompatible edge winding"));
         }
         let mut first_path = boundary_path(first, first_direction.1, first_direction.0)
-            .ok_or_else(|| invalid("cannot build the first dissolve boundary"))?;
+            .ok_or_else(|| invalid("could not trace the first face boundary"))?;
         let second_path = boundary_path(second, second_direction.1, second_direction.0)
-            .ok_or_else(|| invalid("cannot build the second dissolve boundary"))?;
+            .ok_or_else(|| invalid("could not trace the second face boundary"))?;
         let mut seed_sources = first_path
             .iter()
             .map(|vertex| {
@@ -3312,7 +3312,7 @@ fn apply_bisect(
         })
         .cloned()
         .collect();
-    if snap_center {
+    if snap_center && multires_data.is_some() {
         let selected_vertices = selected_faces
             .iter()
             .flat_map(|face| face.vertices.iter().copied())
@@ -6577,7 +6577,7 @@ fn apply_symmetrize(
     let mut changes = IdChanges::default();
     if selected_ids.is_none() {
         let mut plane_normal = DVec3::ZERO;
-        plane_normal[axis] = if positive_source { 1.0 } else { -1.0 };
+        plane_normal[axis] = 1.0;
         let face_ids: HashSet<_> = mesh.faces.iter().map(|face| face.id).collect();
         let crossing = crossing_edge_ids(mesh, origin, plane_normal, threshold, Some(&face_ids))?;
         let all_crossing = crossing_edge_ids(mesh, origin, plane_normal, threshold, None)?;

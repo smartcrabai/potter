@@ -2785,7 +2785,7 @@ fn ordinary_textured_relative_shape_key_exports_in_both_vrm_versions() -> TestRe
 
 #[test]
 fn vrm_output_preflight_matches_emitter_for_ordinary_materials_and_shape_keys() -> TestResult<()> {
-    let (_directory, project) = new_fixture(FixtureOptions::default())?;
+    let (directory, project) = new_fixture(FixtureOptions::default())?;
     apply_success(
         &project,
         1,
@@ -2832,7 +2832,7 @@ fn vrm_output_preflight_matches_emitter_for_ordinary_materials_and_shape_keys() 
             .is_some_and(|attributes| !attributes.keys().any(|name| name.starts_with("TEXCOORD_")))
     );
 
-    let (_directory, project) = new_fixture(FixtureOptions::default())?;
+    let (directory, project) = new_fixture(FixtureOptions::default())?;
     apply_success(
         &project,
         1,

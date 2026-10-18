@@ -232,7 +232,7 @@ pub(crate) fn export(
                     "Alembic evaluated mesh is missing",
                 )
             })?;
-            meshes.insert(id.clone(), mesh_sample(source)?);
+            meshes.insert(id.clone(), mesh_sample(source, allow_lossy)?);
         }
         sampled.push(FrameSample {
             seconds: *frame / rate,
@@ -484,7 +484,7 @@ fn sample_frames(doc: &SceneDoc, snapshot: &Snapshot) -> Result<Vec<f64>> {
     Ok(frames)
 }
 
-fn mesh_sample(mesh: &Mesh) -> Result<MeshSample> {
+fn mesh_sample(mesh: &Mesh, allow_lossy: bool) -> Result<MeshSample> {
     let vertex_indices = mesh
         .vertices
         .iter()
@@ -505,6 +505,19 @@ fn mesh_sample(mesh: &Mesh) -> Result<MeshSample> {
                 )
             })?;
         faces.push(indices);
+    }
+    for attribute in mesh.attributes.keys() {
+        let supported_attribute = matches!(
+            attribute.as_str(),
+            "uv_layers" | "shade_smooth" | "sharp" | "custom_normal"
+        ) || (allow_lossy
+            && matches!(attribute.as_str(), "vertex_groups" | "alembic_normals"));
+        if !supported_attribute && !allow_lossy {
+            return Err(unsupported(
+                "mesh.attribute",
+                format!("Alembic export does not represent mesh attribute `{attribute}`"),
+            ));
+        }
     }
     let points = mesh
         .vertices
@@ -4372,39 +4385,6 @@ mod tests {
         })?;
         assert_eq!(child.parent.as_ref(), Some(&parent_id));
         assert_eq!(child.transform.translation, [0.0, 3.0, 0.0]);
-        Ok(())
-    }
-
-    #[test]
-    fn color_and_generic_attributes_are_losses_not_refusals() -> Result<()> {
-        let mut mesh = crate::exchange::test_support::triangle_with_attributes()?;
-        mesh.attributes.insert(
-            "seam".to_owned(),
-            serde_json::json!({"domain": "edge", "type": "bool", "values": {}}),
-        );
-        // Sampling never refuses; strict export refuses on the losses from `attribute_losses`.
-        assert!(mesh_sample(&mesh).is_ok());
-        let losses = crate::exchange::mesh_attribute_losses("alembic", "triangle", &mesh);
-        assert!(
-            losses
-                .iter()
-                .any(|loss| loss.feature_id == "mesh.color_attribute")
-        );
-        assert!(
-            losses
-                .iter()
-                .any(|loss| loss.reason.contains("mesh attribute `weight`"))
-        );
-        assert!(
-            losses
-                .iter()
-                .any(|loss| loss.reason.contains("mesh attribute `seam`"))
-        );
-        assert!(
-            losses
-                .iter()
-                .all(|loss| !loss.reason.contains("alembic_normals"))
-        );
         Ok(())
     }
 

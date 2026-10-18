@@ -4337,7 +4337,6 @@ pub(crate) fn validate_vrm_mesh_references(
 ) -> Result<()> {
     validate_vrm_texture_images(doc, avatar)?;
     let visible = super::render_visible_nodes(doc, snapshot)?;
-    let surfaces = resolve_material_surfaces(doc)?;
     let mut rest_world_cache = BTreeMap::<Id, BTreeMap<Id, DMat4>>::new();
     let mut data_skin_bindings = BTreeMap::<Id, SkinBinding>::new();
     for (node_id, node) in &doc.nodes {
@@ -7504,10 +7503,6 @@ pub(crate) fn import_indexed(
             }
         }
         primitive_starts.push(polygons.len());
-        // Every color set spans all copies of the mesh's vertices, as positions do.
-        for sets in color_sets.values_mut() {
-            sets.resize(positions.len(), None);
-        }
         // Copies of one Potter vertex, split per UV and normal, rejoin here; corners keep their own normals.
         // Potter's vertex IDs must describe these vertices. Another tool may have changed them (the
         // VRM Add-on keeps mesh extras but drops root ones), so stale IDs are ignored and reported.

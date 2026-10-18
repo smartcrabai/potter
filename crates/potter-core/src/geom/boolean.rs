@@ -787,8 +787,7 @@ fn clear_element_keyed_attributes(mesh: &mut Mesh) {
     for key in [
         "vertex_groups",
         "crease_edge",
-        "sharp",
-        "seam",
+        "blender_edge_flags",
         "skin_radii",
         "skin_roots",
         "blender_skin_vertices",

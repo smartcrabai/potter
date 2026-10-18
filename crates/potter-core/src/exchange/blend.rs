@@ -10472,7 +10472,10 @@ mod tests {
                 "{normal:?}"
             );
         }
-        assert_eq!(mesh.attributes["shade_smooth"]["values"]["f1"], json!(true));
+        assert_eq!(
+            native("shade_smooth").and_then(|value| value.as_bool()),
+            Some(true)
+        );
         assert!(mesh_attribute_losses(mesh)?.is_empty());
         Ok(())
     }

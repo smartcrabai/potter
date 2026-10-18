@@ -5995,20 +5995,6 @@ def _set_alpha_mode(material, item):
     material.alpha_threshold = float(item.get("alpha_threshold", 0.5))
     material[ALPHA_MODE_PROPERTY] = mode
 
-
-def _set_alpha_mode(material, item):
-    """Surface render method, alpha threshold, and the authored mode marker of a Potter material.
-
-    Runs after `set_props`, so the marker written here replaces any stale source marker.
-    """
-    mode = item.get("alpha_mode", "opaque")
-    if mode not in ALPHA_MODES:
-        raise ValueError("material %s has unknown alpha_mode %s" % (item.get("name", ""), mode))
-    material.surface_render_method = "BLENDED" if mode == "blend" else "DITHERED"
-    material.alpha_threshold = float(item.get("alpha_threshold", 0.5))
-    material[ALPHA_MODE_PROPERTY] = mode
-
-
 def _text_from_string(name, body):
     text = bpy.data.texts.new(name)
     text.from_string(body)
@@ -6109,6 +6095,7 @@ def export_doc(doc, target, pack, scene_hash, context):
     RESTORED_MDISPS_MESHES.clear()
     MULTIRES_MASK_LEVEL_BY_MESH.clear()
     MULTIRES_HIDDEN_MESHES.clear()
+    # Factory startup is already clean, but remove all scene objects to make this robust
     # when invoked by Blender builds that ignore the startup flag.
     for scene in bpy.data.scenes:
         scene.camera = None

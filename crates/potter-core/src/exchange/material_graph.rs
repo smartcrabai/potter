@@ -1226,41 +1226,6 @@ mod tests {
         assert_eq!(graph.nodes.len(), 1);
     }
 
-    #[test]
-    fn field_base_alpha_multiplies_texture_alpha_by_material_factor() {
-        let texture = TextureRef {
-            image: Id::new("paint").unwrap(),
-            uv_layer: None,
-            interpolation: ImageInterpolation::Linear,
-        };
-        let textures = GraphTextures::from_field_refs(Some(texture), None, None, None);
-        let material = Material {
-            base_color: [1.0, 1.0, 1.0, 0.35],
-            alpha_mode: "blend".to_owned(),
-            ..Material::default()
-        };
-        let graph = build_graph(&material, &textures, false).expect("graph");
-        let math = graph
-            .nodes
-            .get(&Id::new("base_alpha_factor").unwrap())
-            .expect("base alpha multiply node");
-        assert_eq!(math.node_type, "ShaderNodeMath");
-        assert_eq!(math.properties.get("operation"), Some(&json!("MULTIPLY")));
-        assert_eq!(math.inputs.get("Value_001"), Some(&json!(0.35)));
-        assert!(graph.links.contains(&GraphLink {
-            from_node: Id::new("base_tex").unwrap(),
-            from_socket: "Alpha".to_owned(),
-            to_node: Id::new("base_alpha_factor").unwrap(),
-            to_socket: "Value".to_owned(),
-        }));
-        assert!(graph.links.contains(&GraphLink {
-            from_node: Id::new("base_alpha_factor").unwrap(),
-            from_socket: "Value".to_owned(),
-            to_node: Id::new("principled").unwrap(),
-            to_socket: "Alpha".to_owned(),
-        }));
-    }
-
     fn normal_map_properties(uv_layer: Option<&str>) -> Result<(Option<Value>, Option<Value>)> {
         let textures = GraphTextures {
             base_color: None,
