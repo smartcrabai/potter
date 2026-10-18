@@ -44,7 +44,9 @@ fn apply(scene: &std::path::Path, operations: &Value) -> Result<(), Box<dyn Erro
 }
 
 fn scene_document(scene: &std::path::Path) -> Result<Value, Box<dyn Error>> {
-    Ok(serde_json::from_slice(&fs::read(scene.join("scene.json"))?)?)
+    Ok(serde_json::from_slice(&fs::read(
+        scene.join("scene.json"),
+    )?)?)
 }
 
 /// The record's `total_levels` is canonical. A multires modifier created later at a lower
@@ -65,7 +67,11 @@ fn new_multires_modifier_writes_the_stored_total_levels() -> Result<(), Box<dyn 
     let body = &document["nodes"]["body"];
     let modifier = body["modifiers"]
         .as_array()
-        .and_then(|modifiers| modifiers.iter().find(|modifier| modifier["id"] == "multi_low"))
+        .and_then(|modifiers| {
+            modifiers
+                .iter()
+                .find(|modifier| modifier["id"] == "multi_low")
+        })
         .ok_or("multi_low modifier was not created")?;
     assert_eq!(
         modifier["params"]["total_levels"],
@@ -75,8 +81,7 @@ fn new_multires_modifier_writes_the_stored_total_levels() -> Result<(), Box<dyn 
     assert_eq!(modifier["params"]["levels"], json!(1));
     let data_id = body["data"].as_str().ok_or("body has no mesh data")?;
     assert_eq!(
-        document["data_blocks"][data_id]["mesh"]["attributes"]["multires_displacement"]
-            ["total_levels"],
+        document["data_blocks"][data_id]["mesh"]["attributes"]["multires_displacement"]["total_levels"],
         json!(3),
         "the mesh record keeps its stored total"
     );

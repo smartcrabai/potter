@@ -141,7 +141,8 @@ pub fn apply_stroke_with_dyntopo(
             if distance > sample_radius {
                 continue;
             }
-            let amount = stroke.falloff.weight(distance / sample_radius) * pressure * sample_strength;
+            let amount =
+                stroke.falloff.weight(distance / sample_radius) * pressure * sample_strength;
             if amount > influence {
                 influence = amount;
                 center = closest;

@@ -268,7 +268,11 @@ fn multires_sculpt_uses_driven_armature_and_shrinkwrap_prefix_for_brush_base()
         .ok_or("oracle has no contract_attempt")?;
     let contract = oracle["attempts"]
         .as_array()
-        .and_then(|attempts| attempts.iter().find(|attempt| attempt["name"] == contract_name))
+        .and_then(|attempts| {
+            attempts
+                .iter()
+                .find(|attempt| attempt["name"] == contract_name)
+        })
         .ok_or("oracle contract attempt is missing")?;
     let oracle_before: Vec<[f64; 3]> = serde_json::from_value(contract["before_local"].clone())?;
     let oracle_after: Vec<[f64; 3]> = serde_json::from_value(contract["after_local"].clone())?;

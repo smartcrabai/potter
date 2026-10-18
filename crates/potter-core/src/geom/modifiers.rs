@@ -4057,7 +4057,8 @@ fn apply_multires_displacements(
             let value = match evaluated.get(&key) {
                 Some(value) => *value,
                 None => {
-                    let value = multires_sample_position(source, data, limit, &mut patches, *sample)?;
+                    let value =
+                        multires_sample_position(source, data, limit, &mut patches, *sample)?;
                     evaluated.insert(key, value);
                     value
                 }
