@@ -736,6 +736,21 @@ impl Mesh {
     ///
     /// Returns an error for invalid mesh topology, degenerate polygons, or ID exhaustion.
     pub fn triangulate(&self) -> Result<Vec<[u32; 3]>, MeshError> {
+        self.triangulate_with(false)
+    }
+
+    /// Triangulate as Blender's tessellation does (`mesh_tessellate.cc`): a quad splits along its
+    /// 0-2 diagonal from its first corner, flipped to 1-3 when that split folds. Use this where
+    /// Blender's looptris define the surface, such as a Shrinkwrap target.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Mesh::triangulate`].
+    pub fn tessellate(&self) -> Result<Vec<[u32; 3]>, MeshError> {
+        self.triangulate_with(true)
+    }
+
+    fn triangulate_with(&self, blender_quads: bool) -> Result<Vec<[u32; 3]>, MeshError> {
         self.validate()?;
         let capacity = self.faces.iter().try_fold(0_usize, |capacity, face| {
             capacity
@@ -749,7 +764,7 @@ impl Mesh {
             .collect();
         let mut result = Vec::with_capacity(capacity);
         for face in &self.faces {
-            result.extend(triangulate_face(face, &positions)?);
+            result.extend(triangulate_face(face, &positions, blender_quads)?);
         }
         Ok(result)
     }
@@ -1617,6 +1632,7 @@ fn normalize_sphere_point(mut point: [f32; 3], radius: f32) -> [f32; 3] {
 fn triangulate_face(
     face: &Face,
     vertex_positions: &HashMap<u32, DVec3>,
+    blender_quads: bool,
 ) -> Result<Vec<[u32; 3]>, MeshError> {
     let points: Vec<DVec3> = face
         .vertices
@@ -1670,7 +1686,7 @@ fn triangulate_face(
     if !twice_area.is_finite() || twice_area.abs() <= epsilon {
         return Err(MeshError::TriangulationFailed(face.id));
     }
-    if let [first, second, third, fourth] = face.vertices[..] {
+    if blender_quads && let [first, second, third, fourth] = face.vertices[..] {
         // Blender's quad tessellation: the 0-2 diagonal from the face's first corner, flipped to the
         // 1-3 diagonal when `is_quad_flip_v3_first_third_fast` says the 0-2 split folds over.
         let flip = quad_flip_first_third(points[0], points[1], points[2], points[3]);
