@@ -1215,101 +1215,164 @@ fn skin_float_normalize(vector: [f32; 3]) -> [f32; 3] {
     }
 }
 
-fn triangle_normal(points: &[DVec3], triangle: [usize; 3]) -> DVec3 {
-    (points[triangle[1]] - points[triangle[0]])
-        .cross(points[triangle[2]] - points[triangle[0]])
-        .normalize_or_zero()
+/// Blender's `BLI_heapsimple` (`BLI_heap_simple.cc`): a binary min-heap. Insertion sifts up while the parent is
+/// larger; removal takes the root and sifts the last node down from the root. Equal keys therefore pop in
+/// the order these sift rules give, as in Blender.
+struct HeapSimple<T: Copy> {
+    tree: Vec<(f32, T)>,
 }
 
-fn triangle_area(points: &[DVec3], triangle: [usize; 3]) -> f64 {
+impl<T: Copy> HeapSimple<T> {
+    /// `BLI_heapsimple_insert` (`heapsimple_up`).
+    fn insert(&mut self, value: f32, payload: T) {
+        let mut index = self.tree.len();
+        self.tree.push((value, payload));
+        while index > 0 {
+            let parent = (index - 1) >> 1;
+            if value >= self.tree[parent].0 {
+                break;
+            }
+            self.tree[index] = self.tree[parent];
+            index = parent;
+        }
+        self.tree[index] = (value, payload);
+    }
+
+    /// `BLI_heapsimple_pop_min`: the root is returned and the last node is sifted down from the root.
+    fn pop_min(&mut self) -> Option<T> {
+        let (_, payload) = *self.tree.first()?;
+        let last = self.tree.pop()?;
+        if !self.tree.is_empty() {
+            self.sift_down(last);
+        }
+        Some(payload)
+    }
+
+    /// `heapsimple_down` from the root, placing `init` (`BLI_heap_simple.cc`).
+    fn sift_down(&mut self, init: (f32, T)) {
+        let size = self.tree.len();
+        let active_value = init.0;
+        let mut index = 0;
+        self.tree[index].0 = active_value;
+        loop {
+            let left = 2 * index + 1;
+            let right = left + 1;
+            let mut smallest = index;
+            if left < size && self.tree[left].0 < active_value {
+                smallest = left;
+            }
+            if right < size && self.tree[right].0 < self.tree[smallest].0 {
+                smallest = right;
+            }
+            if smallest == index {
+                break;
+            }
+            self.tree[index] = self.tree[smallest];
+            index = smallest;
+            self.tree[index].0 = active_value;
+        }
+        self.tree[index].1 = init.1;
+    }
+}
+
+/// Triangle area in `f32`, as `BM_face_calc_area` (half the magnitude of the cross product).
+fn triangle_area32(points: &[glam::Vec3], triangle: [usize; 3]) -> f32 {
     (points[triangle[1]] - points[triangle[0]])
         .cross(points[triangle[2]] - points[triangle[0]])
         .length()
         * 0.5
 }
 
-/// Blender's `hull_merge_triangles`: an edge used by exactly two triangles offers a quad, and quads
-/// are taken greedily by score. A candidate is skipped when its edge no longer has exactly two faces
-/// (`BM_edge_face_pair`) or when its triangles share a neighbouring face. The mesh seen by those
-/// checks keeps merged triangles and earlier quads, as Blender's `BMesh` does until the final delete.
+/// Triangle normal in `f32`, normalized (`BM_face_normal_update`). The sign convention differs from Blender's
+/// `normal_tri_v3` by a global flip, which leaves the dot product of two normals unchanged.
+fn triangle_normal32(points: &[glam::Vec3], triangle: [usize; 3]) -> glam::Vec3 {
+    (points[triangle[1]] - points[triangle[0]])
+        .cross(points[triangle[2]] - points[triangle[0]])
+        .normalize_or_zero()
+}
+
+/// The three corners of a triangular face.
+fn triangle_of(face: &[usize]) -> [usize; 3] {
+    [face[0], face[1], face[2]]
+}
+
+/// Blender's `hull_merge_triangles` (MOD_skin.cc:1557-1632). Each edge used by two triangles offers a quad.
+/// Candidates are scored in `f32` at build time and kept in a `BLI_heapsimple`; the heap pops the best first.
+/// A pop takes its quad only when both triangles are still free and they share no neighbouring face
+/// (`BM_face_share_face_check`). Edges are visited in first-appearance order over the faces, which stands in
+/// for the BMesh edge order.
 fn merge_triangle_faces(
     points: &[DVec3],
     faces: Vec<Vec<usize>>,
     symmetry_axes: [bool; 3],
 ) -> Vec<Vec<usize>> {
+    let points32: Vec<glam::Vec3> = points.iter().map(|point| point.as_vec3()).collect();
     let mut edge_faces: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
+    let mut edge_order: Vec<(usize, usize)> = Vec::new();
     for (face_index, face) in faces.iter().enumerate() {
         for edge in face_edges(face) {
-            edge_faces.entry(edge).or_default().push(face_index);
+            let adjacent = edge_faces.entry(edge).or_default();
+            if adjacent.is_empty() {
+                edge_order.push(edge);
+            }
+            adjacent.push(face_index);
         }
     }
-    let mut triangle_faces = Vec::new();
-    let mut triangles = Vec::new();
-    for (face_index, face) in faces.iter().enumerate() {
-        if face.len() == 3 {
-            triangle_faces.push(face_index);
-            triangles.push([face[0], face[1], face[2]]);
+    let mut heap = HeapSimple { tree: Vec::new() };
+    for (edge_position, &edge) in edge_order.iter().enumerate() {
+        let adjacent = &edge_faces[&edge];
+        if adjacent.len() != 2 {
+            continue;
         }
-    }
-    let mut candidates = Vec::<(f64, usize, usize, [usize; 4], (usize, usize))>::new();
-    for first in 0..triangles.len() {
-        for second in first + 1..triangles.len() {
-            let shared: Vec<usize> = triangles[first]
-                .iter()
-                .copied()
-                .filter(|vertex| triangles[second].contains(vertex))
-                .collect();
-            if shared.len() != 2 {
+        let (first, second) = (adjacent[0], adjacent[1]);
+        if faces[first].len() != 3 || faces[second].len() != 3 {
+            continue;
+        }
+        let (first_tri, second_tri) = (triangle_of(&faces[first]), triangle_of(&faces[second]));
+        let Some(quad) = quad_from_triangles(first_tri, second_tri, [edge.0, edge.1]) else {
+            continue;
+        };
+        let mut score = (triangle_area32(&points32, first_tri)
+            + triangle_area32(&points32, second_tri))
+            * triangle_normal32(&points32, first_tri).dot(triangle_normal32(&points32, second_tri));
+        if quad_crosses_symmetry_plane(points, quad, symmetry_axes) {
+            if quad_is_symmetric(points, quad, symmetry_axes) {
+                score *= 10.0;
+            } else {
                 continue;
-            }
-            let shared_edge = ordered_edge(shared[0], shared[1]);
-            if edge_faces.get(&shared_edge).map_or(0, Vec::len) != 2 {
-                continue;
-            }
-            let Some(quad) =
-                quad_from_triangles(triangles[first], triangles[second], [shared[0], shared[1]])
-            else {
-                continue;
-            };
-            let mut score = (triangle_area(points, triangles[first])
-                + triangle_area(points, triangles[second]))
-                * triangle_normal(points, triangles[first])
-                    .dot(triangle_normal(points, triangles[second]));
-            if quad_crosses_symmetry_plane(points, quad, symmetry_axes) {
-                if quad_is_symmetric(points, quad, symmetry_axes) {
-                    score *= 10.0;
-                } else {
-                    continue;
-                }
-            }
-            if quad_is_convex(points, quad) {
-                candidates.push((
-                    score,
-                    triangle_faces[first],
-                    triangle_faces[second],
-                    quad,
-                    shared_edge,
-                ));
             }
         }
+        if !quad_is_convex(points, quad) {
+            continue;
+        }
+        heap.insert(-score, edge_position);
     }
-    candidates.sort_by(|first, second| second.0.total_cmp(&first.0));
+
     let mut all_faces = faces;
     let mut consumed = vec![false; all_faces.len()];
-    for (_, first, second, quad, shared_edge) in candidates {
+    while let Some(edge_position) = heap.pop_min() {
+        let edge = edge_order[edge_position];
+        let adjacent = edge_faces[&edge].clone();
+        if adjacent.len() != 2 {
+            continue;
+        }
+        let (first, second) = (adjacent[0], adjacent[1]);
         if consumed[first] || consumed[second] {
             continue;
         }
-        if edge_faces.get(&shared_edge).map_or(0, Vec::len) != 2
-            || share_neighbouring_face(&all_faces, &edge_faces, first, second)
-        {
+        if share_neighbouring_face(&all_faces, &edge_faces, first, second) {
             continue;
         }
+        let first_tri = triangle_of(&all_faces[first]);
+        let second_tri = triangle_of(&all_faces[second]);
+        let Some(quad) = quad_from_triangles(first_tri, second_tri, [edge.0, edge.1]) else {
+            continue;
+        };
         consumed[first] = true;
         consumed[second] = true;
         let quad_face = all_faces.len();
-        for edge in face_edges(&quad) {
-            edge_faces.entry(edge).or_default().push(quad_face);
+        for quad_edge in face_edges(&quad) {
+            edge_faces.entry(quad_edge).or_default().push(quad_face);
         }
         all_faces.push(quad.to_vec());
         consumed.push(false);
