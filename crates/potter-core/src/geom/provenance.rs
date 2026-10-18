@@ -86,21 +86,21 @@ pub(crate) fn remap_attributes_skipping(
     origin: &Origin,
     skipped: &[&str],
 ) -> Result<()> {
-    remap_attributes_skipping_with_corner_boolean_mixer(source, output, origin, skipped, false)
+    remap_attributes_skipping_with_weighted_corner_boolean_mixer(source, output, origin, skipped, false)
 }
 
-/// Boolean corner values use Blender's weighted `DefaultMixer<bool>`; ordinary topology group
+/// Interpolated corner booleans use Blender's weighted `DefaultMixer<bool>`; ordinary topology group
 /// merges continue to use the unweighted boolean propagation mixer.
-pub(crate) fn remap_boolean_attributes_skipping(
+pub(crate) fn remap_interpolated_corners_skipping(
     source: &Mesh,
     output: &mut Mesh,
     origin: &Origin,
     skipped: &[&str],
 ) -> Result<()> {
-    remap_attributes_skipping_with_corner_boolean_mixer(source, output, origin, skipped, true)
+    remap_attributes_skipping_with_weighted_corner_boolean_mixer(source, output, origin, skipped, true)
 }
 
-fn remap_attributes_skipping_with_corner_boolean_mixer(
+fn remap_attributes_skipping_with_weighted_corner_boolean_mixer(
     source: &Mesh,
     output: &mut Mesh,
     origin: &Origin,
@@ -2084,7 +2084,7 @@ mod tests {
     }
 
     #[test]
-    fn boolean_corner_boolean_uses_weighted_mixer_without_changing_group_merge_or() {
+    fn interpolated_corner_booleans_use_weighted_mixer_without_changing_group_merge_or() {
         let mut source = triangle();
         let face = source.faces[0].id;
         source.attributes.insert(
@@ -2110,7 +2110,7 @@ mod tests {
         };
         let face_key = format!("f{face}");
         let mut boolean_output = triangle();
-        remap_boolean_attributes_skipping(&source, &mut boolean_output, &origin, &[])
+        remap_interpolated_corners_skipping(&source, &mut boolean_output, &origin, &[])
             .expect("Boolean attribute remap");
         assert_eq!(
             boolean_output.attributes["corner_mask"]["values"][face_key.as_str()][0],
