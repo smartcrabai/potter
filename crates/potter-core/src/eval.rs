@@ -840,6 +840,7 @@ impl Snapshot {
                         &node.modifiers,
                         &doc.node_groups,
                         frame,
+                        &node.name,
                         matrix,
                         &matrices,
                         &object_meshes,
@@ -1124,6 +1125,7 @@ impl Snapshot {
                         &node.modifiers,
                         &doc.node_groups,
                         frame,
+                        &node.name,
                         matrix,
                         &matrices,
                         &object_meshes,
@@ -2809,6 +2811,20 @@ fn matrix_f32_columns(matrix: [f32; 16]) -> [[f32; 4]; 4] {
     std::array::from_fn(|column| std::array::from_fn(|row| matrix[column * 4 + row]))
 }
 
+/// The subject node's name, which attribute and modifier evaluation uses as the subject identity.
+fn scene_subject_name<'a>(doc: &'a SceneDoc, subject_id: &Id) -> Result<&'a str> {
+    doc.nodes
+        .get(subject_id)
+        .map(|node| node.name.as_str())
+        .ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::TargetNotFound,
+                "modifier subject object is missing",
+                json!({"subject_id": subject_id}),
+            )
+        })
+}
+
 /// Evaluate an attribute modifier against its resolved scene operands. `bone_matrices` supplies
 /// the pose-bone world matrices that `uv_warp` bone references and `mask_tex_map_bone` read.
 pub(crate) fn apply_scene_attribute_modifier(
@@ -2952,6 +2968,7 @@ pub(crate) fn apply_scene_deform_modifier(
         mesh,
         &[resolved],
         &doc.node_groups,
+        scene_subject_name(doc, subject_id)?,
     )?;
     *mesh = evaluation.mesh;
     warnings.extend(
@@ -3715,7 +3732,11 @@ fn apply_generic_scene_mesh_operand_modifier(
     } else {
         resolved.runtime.operand_mesh = Some(operand);
     }
-    *mesh = crate::geom::modifiers::evaluate_modifiers(mesh, &[resolved])?;
+    *mesh = crate::geom::modifiers::evaluate_modifiers(
+        mesh,
+        &[resolved],
+        scene_subject_name(doc, subject_id)?,
+    )?;
     Ok(())
 }
 
@@ -3939,7 +3960,11 @@ pub(crate) fn apply_scene_operand_modifier(
     } else {
         resolved.runtime.operand_mesh = Some(operand);
     }
-    *mesh = crate::geom::modifiers::evaluate_modifiers(mesh, &[resolved])?;
+    *mesh = crate::geom::modifiers::evaluate_modifiers(
+        mesh,
+        &[resolved],
+        scene_subject_name(doc, subject_id)?,
+    )?;
     Ok(())
 }
 fn apply_scene_warp_modifier(
@@ -4008,7 +4033,11 @@ fn apply_scene_warp_modifier(
             resolved.runtime.warp_to = Some(point.to_array());
         }
     }
-    *mesh = crate::geom::modifiers::evaluate_modifiers(mesh, &[resolved])?;
+    *mesh = crate::geom::modifiers::evaluate_modifiers(
+        mesh,
+        &[resolved],
+        scene_subject_name(doc, subject_id)?,
+    )?;
     Ok(())
 }
 
@@ -4061,7 +4090,11 @@ fn apply_scene_hook_modifier(
     let mut resolved = modifier.clone();
     resolved.params.remove("object");
     resolved.runtime.hook_target_position = Some(position.to_array());
-    *mesh = crate::geom::modifiers::evaluate_modifiers(mesh, &[resolved])?;
+    *mesh = crate::geom::modifiers::evaluate_modifiers(
+        mesh,
+        &[resolved],
+        scene_subject_name(doc, subject_id)?,
+    )?;
     Ok(())
 }
 /// Object IDs that a Boolean modifier takes as operands for `operand_type`: the `object` parameter,
@@ -4322,7 +4355,11 @@ fn apply_boolean_operands_modifier(
         resolved.params.remove(parameter);
     }
     resolved.runtime.boolean_operands = operands;
-    *mesh = crate::geom::modifiers::evaluate_modifiers(mesh, &[resolved])?;
+    *mesh = crate::geom::modifiers::evaluate_modifiers(
+        mesh,
+        &[resolved],
+        scene_subject_name(doc, subject_id)?,
+    )?;
     Ok(pool)
 }
 

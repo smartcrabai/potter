@@ -892,6 +892,7 @@ fn append_human_bone(
         custom_shape: None,
         envelope_distance: 0.25,
         envelope_weight: 1.0,
+        select: false,
         head_radius: 0.1,
         tail_radius: 0.1,
         bbone_settings: BTreeMap::new(),

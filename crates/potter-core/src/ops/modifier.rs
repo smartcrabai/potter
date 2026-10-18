@@ -1062,6 +1062,17 @@ fn evaluate_modifier_output(
 ) -> Result<(crate::geom::Mesh, Vec<Option<Id>>)> {
     let modifier_id = &target_modifier.id;
     let modifier_stack = std::slice::from_ref(target_modifier);
+    let subject_name = engine
+        .doc
+        .nodes
+        .get(target)
+        .map(|node| node.name.clone())
+        .ok_or_else(|| {
+            PotError::new(
+                ErrorCode::TargetNotFound,
+                "modifier subject object is missing",
+            )
+        })?;
     let mut material_slots = engine
         .doc
         .data_blocks
@@ -1179,6 +1190,7 @@ fn evaluate_modifier_output(
                 modifier_stack,
                 &engine.doc.node_groups,
                 engine.evaluation_frame,
+                &subject_name,
             )?;
             engine.warnings.extend(
                 evaluation
@@ -1295,6 +1307,7 @@ fn evaluate_modifier_output(
                 modifier_stack,
                 &engine.doc.node_groups,
                 frame,
+                &subject_name,
                 object_world,
                 &world_matrices,
                 &base_object_meshes,
