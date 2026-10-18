@@ -33,6 +33,7 @@ pub(crate) mod concat;
 pub mod curve;
 pub mod edit;
 pub(crate) mod heap_simple;
+pub(crate) mod interpolation;
 pub mod lattice;
 pub(crate) mod legacy_texture;
 pub use legacy_texture::{ResolvedTexture, resolve_texture};
