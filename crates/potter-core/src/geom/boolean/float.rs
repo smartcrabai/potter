@@ -256,6 +256,37 @@ struct FloatOutput {
     edge_sources: Vec<Option<usize>>,
 }
 
+/// Blender writes each output edge from its `BMEdge` `v1`. An input edge keeps its first vertex through
+/// `BM_edge_split`, and the state's `edge_start` records it. `insert_face` instead orients an edge
+/// from the first face that uses it, and the next Boolean fold then splits the edge from the wrong
+/// end (`edge_verts_sort` runs from `v1`). Each output edge with a recorded start takes that direction.
+fn orient_output_edges(mesh: &mut Mesh, state: &State, state_vertex_ids: &[Option<u32>]) {
+    let index: HashMap<(u32, u32), usize> = mesh
+        .edges
+        .iter()
+        .enumerate()
+        .map(|(position, edge)| (edge_key(edge.vertices[0], edge.vertices[1]), position))
+        .collect();
+    for (&(a, b), &start) in &state.edge_start {
+        let (Some(id_a), Some(id_b)) = (
+            state_vertex_ids.get(a).copied().flatten(),
+            state_vertex_ids.get(b).copied().flatten(),
+        ) else {
+            continue;
+        };
+        let Some(&position) = index.get(&edge_key(id_a, id_b)) else {
+            continue;
+        };
+        mesh.edges[position].vertices = if start == a {
+            [id_a, id_b]
+        } else if start == b {
+            [id_b, id_a]
+        } else {
+            continue;
+        };
+    }
+}
+
 fn build_float_output(subject: &Mesh, operand: &Mesh, state: &State) -> Result<FloatOutput> {
     let mut polygons = Vec::with_capacity(state.faces.len());
     for face in &state.faces {
@@ -455,6 +486,7 @@ fn build_float_output(subject: &Mesh, operand: &Mesh, state: &State) -> Result<F
             edge_source_by_output.insert(output_edge, source);
         }
     }
+    orient_output_edges(&mut mesh, state, &state_vertex_ids);
     let edge_sources = mesh
         .edges
         .iter()
