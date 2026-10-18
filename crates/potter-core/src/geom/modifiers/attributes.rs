@@ -21,6 +21,17 @@ use super::{
     bool_param as boolean, closest_point_triangle, invalid_parameter as invalid,
     number_param as number, schema_value, string_param as string,
 };
+
+mod normals;
+use normals::{normal_edit, weighted_normal};
+
+#[derive(Clone, Copy, Debug)]
+/// Original Blender f32 matrices for a Normal Edit or other f32-parity operand.
+pub struct SceneOperandMatricesF32 {
+    /// Blender-order object-local to subject-local matrix.
+    pub local_to_subject: Option<[f32; 16]>,
+}
+
 #[derive(Clone, Debug)]
 /// A resolved scene-object operand for native modifier evaluation.
 pub struct SceneOperand {
@@ -32,6 +43,10 @@ pub struct SceneOperand {
     pub camera: Option<CameraData>,
     /// Whether this operand has armature data for UV Warp bone references.
     pub armature: bool,
+    /// Exact f32 matrices, resolved only for modifiers that consume them.
+    pub blender_matrices_f32: Option<SceneOperandMatricesF32>,
+    /// The object's own scale property, used by radial Normal Edit.
+    pub object_scale: DVec3,
 }
 
 /// Evaluate a modifier that does not need a scene object operand.
@@ -1029,278 +1044,6 @@ fn point_segment_distance(point: DVec3, first: DVec3, second: DVec3) -> f64 {
         0.0
     };
     point.distance(first + segment * factor)
-}
-
-fn weighted_normal(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
-    let mode = string(modifier, "mode")?;
-    if !matches!(mode, "FACE_AREA" | "CORNER_ANGLE" | "FACE_AREA_WITH_ANGLE") {
-        return Err(invalid(
-            modifier,
-            "mode",
-            "FACE_AREA, CORNER_ANGLE, or FACE_AREA_WITH_ANGLE",
-        ));
-    }
-    let power = number(modifier, "weight")?.clamp(1.0, 100.0) / 50.0;
-    let threshold = number(modifier, "thresh")?.max(0.0);
-    let group = optional_string(modifier, "vertex_group")?;
-    let group_weights = group
-        .map(|name| get_group_weights(mesh, name))
-        .transpose()?;
-    let invert_group = boolean(modifier, "invert_vertex_group")?;
-    let keep_sharp = boolean(modifier, "keep_sharp")?;
-    let use_face_influence = boolean(modifier, "use_face_influence")?;
-    let sharp_edges = mesh
-        .attributes
-        .get("sharp_edges")
-        .and_then(Value::as_array)
-        .map(|edges| {
-            edges
-                .iter()
-                .filter_map(Value::as_u64)
-                .filter_map(|value| u32::try_from(value).ok())
-                .collect::<std::collections::BTreeSet<_>>()
-        })
-        .unwrap_or_default();
-    let mut normals = Vec::with_capacity(mesh.faces.len());
-    let mut areas = Vec::with_capacity(mesh.faces.len());
-    for face in &mesh.faces {
-        let points = face_points(mesh, face.vertices.as_slice())?;
-        let normal = polygon_normal(&points);
-        normals.push(normal);
-        areas.push(polygon_area(&points));
-    }
-    let face_strengths = mesh
-        .attributes
-        .get("__mod_weightednormals_faceweight")
-        .and_then(|attribute| attribute.get("values"))
-        .and_then(Value::as_object);
-    let mut incident = HashMap::<u32, Vec<usize>>::new();
-    for (face_index, face) in mesh.faces.iter().enumerate() {
-        for vertex_id in &face.vertices {
-            incident.entry(*vertex_id).or_default().push(face_index);
-        }
-    }
-    let mut vectors: Vec<Option<DVec3>> = Vec::new();
-    for (face_index, face) in mesh.faces.iter().enumerate() {
-        for vertex_id in &face.vertices {
-            let current = normals[face_index];
-            let incident_faces = incident.get(vertex_id).map_or(&[][..], Vec::as_slice);
-            let fan = if keep_sharp {
-                smooth_fan_faces(mesh, *vertex_id, face_index, incident_faces, &sharp_edges)
-            } else {
-                Vec::new()
-            };
-            let adjacent = if keep_sharp {
-                fan.as_slice()
-            } else {
-                incident_faces
-            };
-            let maximum_strength = use_face_influence.then(|| {
-                adjacent
-                    .iter()
-                    .map(|index| {
-                        face_strengths
-                            .and_then(|values| values.get(&format!("f{}", mesh.faces[*index].id)))
-                            .and_then(Value::as_i64)
-                            .unwrap_or(0)
-                    })
-                    .max()
-                    .unwrap_or(0)
-            });
-            let mut sum = DVec3::ZERO;
-            for adjacent_index in adjacent {
-                if maximum_strength.is_some_and(|maximum| {
-                    face_strengths
-                        .and_then(|values| {
-                            values.get(&format!("f{}", mesh.faces[*adjacent_index].id))
-                        })
-                        .and_then(Value::as_i64)
-                        .unwrap_or(0)
-                        != maximum
-                }) {
-                    continue;
-                }
-                let adjacent_face = &mesh.faces[*adjacent_index];
-                let angle = corner_angle(mesh, adjacent_face, *vertex_id)?;
-                let weight = match mode {
-                    "FACE_AREA" => areas[*adjacent_index],
-                    "CORNER_ANGLE" => angle,
-                    _ => areas[*adjacent_index] * angle,
-                }
-                .max(0.0)
-                .powf(power);
-                if weight <= threshold {
-                    continue;
-                }
-                sum += normals[*adjacent_index] * weight;
-            }
-            let mut normal = if sum.length_squared() <= f64::EPSILON {
-                current
-            } else {
-                sum.normalize()
-            };
-            if let Some(weights) = &group_weights {
-                let mut factor = weights
-                    .get(vertex_id)
-                    .copied()
-                    .unwrap_or(0.0)
-                    .clamp(0.0, 1.0);
-                if invert_group {
-                    factor = 1.0 - factor;
-                }
-                normal = current.lerp(normal, factor).normalize_or_zero();
-            }
-            vectors.push(Some(normal));
-        }
-    }
-    let mut result = mesh.clone();
-    clnor::encode_vectors(
-        &mut result,
-        Some(&vectors),
-        NormalCodeOptions {
-            corner_order: None,
-            setter_input: SetterInput::NormalizeInput,
-        },
-    )?;
-    Ok(result)
-}
-
-fn edge_is_sharp(
-    mesh: &Mesh,
-    first: u32,
-    second: u32,
-    sharp_edges: &std::collections::BTreeSet<u32>,
-) -> bool {
-    mesh.edges.iter().any(|edge| {
-        ((edge.vertices[0] == first && edge.vertices[1] == second)
-            || (edge.vertices[0] == second && edge.vertices[1] == first))
-            && sharp_edges.contains(&edge.id)
-    })
-}
-
-fn faces_share_smooth_edge_at_vertex(
-    mesh: &Mesh,
-    first: &Face,
-    second: &Face,
-    vertex_id: u32,
-    sharp_edges: &std::collections::BTreeSet<u32>,
-) -> bool {
-    let Some(index) = first.vertices.iter().position(|id| *id == vertex_id) else {
-        return false;
-    };
-    let neighbors = [
-        first.vertices[(index + first.vertices.len() - 1) % first.vertices.len()],
-        first.vertices[(index + 1) % first.vertices.len()],
-    ];
-    neighbors.into_iter().any(|neighbor| {
-        !edge_is_sharp(mesh, vertex_id, neighbor, sharp_edges)
-            && (0..second.vertices.len()).any(|corner| {
-                let current = second.vertices[corner];
-                let next = second.vertices[(corner + 1) % second.vertices.len()];
-                (current == vertex_id && next == neighbor)
-                    || (current == neighbor && next == vertex_id)
-            })
-    })
-}
-
-fn smooth_fan_faces(
-    mesh: &Mesh,
-    vertex_id: u32,
-    start: usize,
-    incident: &[usize],
-    sharp_edges: &std::collections::BTreeSet<u32>,
-) -> Vec<usize> {
-    let mut fan = vec![start];
-    let mut cursor = 0;
-    while cursor < fan.len() {
-        let current = &mesh.faces[fan[cursor]];
-        for candidate in incident {
-            if !fan.contains(candidate)
-                && faces_share_smooth_edge_at_vertex(
-                    mesh,
-                    current,
-                    &mesh.faces[*candidate],
-                    vertex_id,
-                    sharp_edges,
-                )
-            {
-                fan.push(*candidate);
-            }
-        }
-        cursor += 1;
-    }
-    fan
-}
-
-fn normal_edit(
-    mesh: &Mesh,
-    modifier: &Modifier,
-    operands: &BTreeMap<String, Vec<SceneOperand>>,
-) -> Result<Mesh> {
-    let target = one_operand(operands, "target", modifier)?;
-    let mode = string(modifier, "mode")?;
-    if !matches!(mode, "RADIAL" | "DIRECTIONAL") {
-        return Err(invalid(modifier, "mode", "RADIAL or DIRECTIONAL"));
-    }
-    let offset = vector3(modifier, "offset")?;
-    let mix_mode = string(modifier, "mix_mode")?;
-    let factor = number(modifier, "mix_factor")?.clamp(0.0, 1.0);
-    let limit = number(modifier, "mix_limit")?;
-    let parallel = boolean(modifier, "use_direction_parallel")?;
-    let group = optional_string(modifier, "vertex_group")?;
-    let group_weights = group
-        .map(|name| get_group_weights(mesh, name))
-        .transpose()?;
-    let invert_group = boolean(modifier, "invert_vertex_group")?;
-    let target_origin = target.local_to_subject.transform_point3(DVec3::ZERO);
-    let target_direction = (target_origin - offset).normalize_or_zero();
-    let mut vectors: Vec<Option<DVec3>> = Vec::new();
-    for face in &mesh.faces {
-        let base = face_normal(mesh, face)?;
-        for vertex_id in &face.vertices {
-            let vertex = mesh
-                .vertices
-                .iter()
-                .find(|vertex| vertex.id == *vertex_id)
-                .ok_or_else(|| invalid(modifier, "target", "a mesh with valid face vertices"))?;
-            let destination = if mode == "RADIAL" || !parallel {
-                (vertex.co - target_origin).normalize_or_zero()
-            } else {
-                target_direction
-            };
-            let mut blend_factor = factor;
-            let mixed = match mix_mode {
-                "COPY" => destination,
-                "ADD" => base + destination,
-                "SUB" => base - destination,
-                "MUL" => base * destination,
-                _ => return Err(invalid(modifier, "mix_mode", "COPY, ADD, SUB, or MUL")),
-            }
-            .normalize_or_zero();
-            if let Some(weights) = &group_weights {
-                let weight = weights.get(vertex_id).copied().unwrap_or(0.0);
-                blend_factor *= if invert_group { 1.0 - weight } else { weight };
-            }
-            if limit < std::f64::consts::PI {
-                let angle = base.angle_between(mixed);
-                if angle > f64::EPSILON {
-                    blend_factor = blend_factor.min(limit / angle);
-                }
-            }
-            let normal = base.slerp(mixed, blend_factor).normalize_or_zero();
-            vectors.push(Some(normal));
-        }
-    }
-    let mut result = mesh.clone();
-    clnor::encode_vectors(
-        &mut result,
-        Some(&vectors),
-        NormalCodeOptions {
-            corner_order: None,
-            setter_input: SetterInput::NormalizeInput,
-        },
-    )?;
-    Ok(result)
 }
 
 fn uv_project(
@@ -3034,34 +2777,6 @@ fn polygon_normal(points: &[DVec3]) -> DVec3 {
         normal.z += (current.x - next.x) * (current.y + next.y);
     }
     normal.normalize_or_zero()
-}
-
-fn polygon_area(points: &[DVec3]) -> f64 {
-    if points.len() < 3 {
-        return 0.0;
-    }
-    let origin = points[0];
-    (1..points.len() - 1)
-        .map(|index| {
-            (points[index] - origin)
-                .cross(points[index + 1] - origin)
-                .length()
-                * 0.5
-        })
-        .sum()
-}
-
-fn corner_angle(mesh: &Mesh, face: &Face, vertex_id: u32) -> Result<f64> {
-    let index = face
-        .vertices
-        .iter()
-        .position(|id| *id == vertex_id)
-        .ok_or_else(|| PotError::invalid_argument("face corner vertex was not found"))?;
-    let points = face_points(mesh, &face.vertices)?;
-    let center = points[index];
-    let previous = (points[(index + points.len() - 1) % points.len()] - center).normalize_or_zero();
-    let next = (points[(index + 1) % points.len()] - center).normalize_or_zero();
-    Ok(previous.angle_between(next))
 }
 
 fn normalize_group(mesh: &mut Mesh, group: &str) -> Result<()> {

@@ -2391,9 +2391,23 @@ pub(crate) fn resolve_modifier_object_operands(
                     json!({"modifier_id":modifier.id,"object":object_id}),
                 )
             })?;
+            let blender_matrices_f32 = (modifier.modifier_type == "normal_edit").then(|| {
+                let subject_world_f32 = subject_world.to_cols_array().map(|value| value as f32);
+                let inverse_subject =
+                    crate::geom::blender_matrix::blender_inverse_m4(subject_world_f32);
+                let object_world_f32 = object_world.to_cols_array().map(|value| value as f32);
+                crate::geom::modifiers::attributes::SceneOperandMatricesF32 {
+                    local_to_subject: Some(crate::geom::blender_matrix::blender_multiply_m4(
+                        inverse_subject,
+                        object_world_f32,
+                    )),
+                }
+            });
             operands.push(crate::geom::modifiers::attributes::SceneOperand {
                 mesh: operand_mesh,
                 local_to_subject: subject_inverse * object_world,
+                blender_matrices_f32,
+                object_scale: DVec3::from_array(object.transform.scale),
                 camera: data_block.and_then(|data| data.camera.clone()),
                 armature: object.kind == "armature"
                     || data_block.is_some_and(|data| data.data_type == "armature"),

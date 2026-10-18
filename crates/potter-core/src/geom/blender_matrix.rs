@@ -457,3 +457,43 @@ pub(crate) fn operand_to_subject(
     let object = object_to_world(doc, object_id, world_matrices, 0)?;
     Some(dmat4_from_blender(&blender_mul_m4(&inverse, &object)))
 }
+
+/// Blender `mul_m4_v3` on a column-major f32 matrix: transforms `point` as a position.
+pub(crate) fn blender_transform_point_f32(matrix: &[f32; 16], point: glam::Vec3) -> glam::Vec3 {
+    glam::Vec3::new(
+        point.x * matrix[0] + point.y * matrix[4] + matrix[8] * point.z + matrix[12],
+        point.x * matrix[1] + point.y * matrix[5] + matrix[9] * point.z + matrix[13],
+        point.x * matrix[2] + point.y * matrix[6] + matrix[10] * point.z + matrix[14],
+    )
+}
+
+/// Blender `mul_m4_m4m4` on column-major f32 matrices: `left * right` in Blender's operand order,
+/// with SIMD grouping on x86_64/ARM64 and scalar elsewhere.
+pub(crate) fn blender_multiply_m4(left: [f32; 16], right: [f32; 16]) -> [f32; 16] {
+    let mut result = [0.0; 16];
+    for row in 0..4 {
+        for column in 0..4 {
+            let term0 = right[column * 4] * left[row];
+            let term1 = right[column * 4 + 1] * left[4 + row];
+            let term2 = right[column * 4 + 2] * left[8 + row];
+            let term3 = right[column * 4 + 3] * left[12 + row];
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            let value = (term0 + term1) + (term2 + term3);
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+            let value = term0 + term1 + term2 + term3;
+            result[column * 4 + row] = value;
+        }
+    }
+    result
+}
+
+/// Blender `invert_m4_m4` on a column-major f32 matrix. A singular matrix inverts to zero, as
+/// Blender writes it.
+pub(crate) fn blender_inverse_m4(matrix: [f32; 16]) -> [f32; 16] {
+    let columns: BlenderMat4 =
+        std::array::from_fn(|column| std::array::from_fn(|row| matrix[column * 4 + row]));
+    let Some(inverse) = blender_invert_m4(&columns) else {
+        return [0.0; 16];
+    };
+    std::array::from_fn(|index| inverse[index / 4][index % 4])
+}

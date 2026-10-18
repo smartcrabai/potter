@@ -73,6 +73,8 @@ fn scene_operand(mesh: Mesh, local_to_subject: DMat4, camera: Option<CameraData>
         local_to_subject,
         camera,
         armature: false,
+        blender_matrices_f32: None,
+        object_scale: glam::DVec3::ONE,
     }
 }
 
