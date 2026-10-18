@@ -301,7 +301,7 @@ impl TreeBuilder<'_> {
     /// `partition_nth_element`.
     fn partition_nth(&mut self, mut begin: i64, mut end: i64, nth: i64, axis: usize) {
         while end - begin > 3 {
-            let pivot = self.median_of_3(begin, (begin + end) / 2, end - 1, axis);
+            let pivot = self.median_of_3(begin, begin + (end - begin) / 2, end - 1, axis);
             let cut = self.partition(begin, end, pivot, axis);
             if cut <= nth {
                 begin = cut;
@@ -357,12 +357,10 @@ impl TreeBuilder<'_> {
             let child_level = child_index - first_next;
             let child_begin = self.helper.leafs_index(depth + 1, child_level);
             let child_end = self.helper.leafs_index(depth + 1, child_level + 1);
-            let child = if child_end - child_begin > 1 {
-                NodeRef::Branch(child_index as usize)
-            } else if child_end - child_begin == 1 {
-                NodeRef::Leaf(self.leafs[child_begin as usize])
-            } else {
-                break;
+            let child = match child_end - child_begin {
+                count if count > 1 => NodeRef::Branch(child_index as usize),
+                1 => NodeRef::Leaf(self.leafs[child_begin as usize]),
+                _ => break,
             };
             self.branches[j].children[k] = Some(child);
             node_num = k + 1;
@@ -412,7 +410,7 @@ fn build_branches(leaf_bv: &[[f32; 6]]) -> Vec<Branch> {
 struct Ray {
     origin: Vec3,
     dir: Vec3,
-    ray_dot_axis: [f32; 3],
+    dot_axis: [f32; 3],
     idot_axis: [f32; 3],
     index: [usize; 6],
     kx: usize,
@@ -427,17 +425,17 @@ impl Ray {
     /// `BLI_bvhtree_ray_cast_ex` precalc (`bvhtree_ray_cast_data_precalc`) and
     /// `isect_ray_tri_watertight_v3_precalc` (`math_geom.cc`).
     fn new(origin: Vec3, dir: Vec3) -> Self {
-        let mut ray_dot_axis = [0.0_f32; 3];
+        let mut dot_axis = [0.0_f32; 3];
         let mut idot_axis = [0.0_f32; 3];
         let mut index = [0_usize; 6];
         for axis in 0..3 {
-            ray_dot_axis[axis] = dot(dir, AXES[axis]);
-            if ray_dot_axis[axis].abs() < f32::EPSILON {
-                ray_dot_axis[axis] = 0.0;
+            dot_axis[axis] = dot(dir, AXES[axis]);
+            if dot_axis[axis].abs() < f32::EPSILON {
+                dot_axis[axis] = 0.0;
                 // Blender keeps the sign out of this case: the index is adjusted below anyway.
                 idot_axis[axis] = f32::MAX;
             } else {
-                idot_axis[axis] = 1.0 / ray_dot_axis[axis];
+                idot_axis[axis] = 1.0 / dot_axis[axis];
             }
             let low = usize::from(idot_axis[axis] < 0.0);
             index[2 * axis] = low + 2 * axis;
@@ -445,8 +443,9 @@ impl Ray {
         }
 
         let kz = axis_dominant(dir);
-        let mut kx = if kz != 2 { kz + 1 } else { 0 };
-        let mut ky = if kx != 2 { kx + 1 } else { 0 };
+        // Blender: kx = (kz != 2) ? kz + 1 : 0, ky likewise from kx; both are (k + 1) mod 3.
+        let mut kx = (kz + 1) % 3;
+        let mut ky = (kx + 1) % 3;
         // Swap kx and ky to keep the triangle winding when the ray points along -kz.
         if dir[kz] < 0.0 {
             std::mem::swap(&mut kx, &mut ky);
@@ -455,7 +454,7 @@ impl Ray {
         Self {
             origin,
             dir,
-            ray_dot_axis,
+            dot_axis,
             idot_axis,
             index,
             kx,
@@ -597,7 +596,7 @@ impl CageRayCache {
     }
 
     /// `dfs_raycast`: prune by the node box, visit leaves through the callback, and descend branches in the
-    /// order `ray_dot_axis[main_axis]` gives.
+    /// order `dot_axis[main_axis]` gives.
     fn dfs<F>(&self, ray: &Ray, node: NodeRef, hit: &mut BvhHit, callback: &mut F)
     where
         F: FnMut(usize, &Ray, &mut BvhHit),
@@ -620,7 +619,7 @@ impl CageRayCache {
                     .take(branch.node_num)
                     .flatten()
                     .copied();
-                if ray.ray_dot_axis[branch.main_axis] > 0.0 {
+                if ray.dot_axis[branch.main_axis] > 0.0 {
                     for child in children {
                         self.dfs(ray, child, hit, callback);
                     }
@@ -665,7 +664,7 @@ impl CageRayCache {
                 }
             },
         );
-        (index != -1).then(|| CageHit {
+        (index != -1).then_some(CageHit {
             triangle: index as usize,
             lambda,
             facing,
@@ -690,6 +689,8 @@ impl CageRayCache {
 
 #[cfg(test)]
 mod tests {
+    #![expect(clippy::expect_used, reason = "small cage fixtures")]
+
     use super::*;
 
     /// The p2 cage at its asymmetric bind positions, in `Mesh::box_mesh` vertex order.
@@ -713,11 +714,11 @@ mod tests {
         [3, 0, 4, 7],
     ];
     /// The padded grid of that bind in Blender 5.2.2 (precision 2, size 6).
-    const GRID_MIN: Vec3 = [-6.974_999_905, -6.974_999_905, -6.925_000_191];
-    const GRID_MAX: Vec3 = [6.974_999_905, 6.974_999_905, 7.024_999_619];
+    const GRID_MIN: Vec3 = [-6.975, -6.975, -6.925];
+    const GRID_MAX: Vec3 = [6.975, 6.975, 7.024_999_6];
     /// Source vertex 0 and vertex 1 in cage space (Blender 5.2.2 bind), `f32`.
-    const VERTEX0: Vec3 = [0.348_456_949, -2.196_758_747, 0.636_363_626];
-    const VERTEX1: Vec3 = [0.652_235_508, -1.927_081_943, 0.636_363_626];
+    const VERTEX0: Vec3 = [0.348_456_95, -2.196_758_7, 0.636_363_6];
+    const VERTEX1: Vec3 = [0.652_235_5, -1.927_082, 0.636_363_6];
 
     fn cage() -> CageRayCache {
         let faces: Vec<Vec<usize>> = BOX_FACES.iter().map(|face| face.to_vec()).collect();

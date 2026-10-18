@@ -1300,7 +1300,7 @@ fn triangle_of(face: &[usize]) -> [usize; 3] {
 /// Candidates are scored in `f32` at build time and kept in a `BLI_heapsimple`; the heap pops the best first.
 /// A pop takes its quad only when both triangles are still free and they share no neighbouring face
 /// (`BM_face_share_face_check`). Edges are visited in first-appearance order over the faces, which stands in
-/// for the BMesh edge order.
+/// for the `BMesh` edge order.
 fn merge_triangle_faces(
     points: &[DVec3],
     faces: Vec<Vec<usize>>,
