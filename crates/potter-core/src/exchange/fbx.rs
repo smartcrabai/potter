@@ -3003,7 +3003,12 @@ fn parse_uv_layers(
             start += face.len();
         }
         let name = unique_uv_name(raw_name, &layers);
-        layers.push(ExchangeUvLayer { name, corners });
+        let pinned = corners.iter().map(|face| vec![false; face.len()]).collect();
+        layers.push(ExchangeUvLayer {
+            name,
+            corners,
+            pinned,
+        });
     }
     Ok(layers)
 }

@@ -103,6 +103,8 @@ pub(crate) struct ExchangeUvLayer {
     /// Per face, the corner `[u, v]` values in `faces` order, in Potter's storage convention (v
     /// down). A face without an entry holds `[0, 0]` per corner.
     pub corners: Vec<Vec<[f64; 2]>>,
+    /// Per-corner pin flags in the same face/corner order. Blender's exporters write none.
+    pub pinned: Vec<Vec<bool>>,
 }
 
 /// Corner values of `layer` for each face of `faces`, in storage convention.
@@ -119,6 +121,20 @@ fn uv_corners(layer: &UvLayer, faces: &[crate::geom::Face]) -> Vec<Vec<[f64; 2]>
                         .copied()
                         .unwrap_or([0.0, 0.0])
                 })
+                .collect()
+        })
+        .collect()
+}
+
+/// Per-corner pin flags of `layer` for each face of `faces`, in the same order as `uv_corners`.
+fn uv_pins(layer: &UvLayer, faces: &[crate::geom::Face]) -> Vec<Vec<bool>> {
+    faces
+        .iter()
+        .enumerate()
+        .map(|(index, face)| {
+            let entry = layer.pinned.get(index).and_then(Option::as_ref);
+            (0..face.vertices.len())
+                .map(|corner| entry.and_then(|flags| flags.get(corner)).copied().unwrap_or(false))
                 .collect()
         })
         .collect()
@@ -187,10 +203,15 @@ pub(super) fn uv_import_loss(data_id: &str, reason: impl Into<String>) -> Loss {
 pub(super) fn single_uv_set(
     corners: Vec<Vec<[f64; 2]>>,
 ) -> (Vec<ExchangeUvLayer>, Option<usize>, Option<usize>) {
+    let pinned = corners
+        .iter()
+        .map(|face| vec![false; face.len()])
+        .collect();
     (
         vec![ExchangeUvLayer {
             name: "UVMap".to_owned(),
             corners,
+            pinned,
         }],
         Some(0),
         Some(0),
@@ -203,6 +224,21 @@ pub(super) fn single_uv_set(
 pub(crate) fn uv_layer_losses(format: &str, meshes: &[ExchangeMesh]) -> Vec<Loss> {
     let mut losses = Vec::new();
     for mesh in meshes {
+        // Blender's OBJ, PLY, USD, FBX and Alembic exporters write no UV pin flags (its io sources
+        // never read `pin_uv`), so a pinned layer loses them in every non-.blend format.
+        for layer in &mesh.uv_layers {
+            if layer.pinned.iter().flatten().any(|pinned| *pinned) {
+                losses.push(Loss {
+                    feature_id: "mesh.uv_layer".to_owned(),
+                    data_id: Some(mesh.id.clone()),
+                    reason: format!(
+                        "{format} does not preserve per-corner UV pin flags for layer {}",
+                        layer.name
+                    ),
+                    suggestion: Some("export as blend to keep UV pin flags".to_owned()),
+                });
+            }
+        }
         for (index, layer) in mesh.uv_layers.iter().enumerate() {
             let (reason, suggestion) = match format {
                 "obj" | "ply" if mesh.uv_active != Some(index) => (
@@ -300,6 +336,7 @@ pub(crate) fn evaluated_meshes(
             .map(|layer| ExchangeUvLayer {
                 name: layer.name.clone(),
                 corners: uv_corners(layer, &source.faces),
+                pinned: uv_pins(layer, &source.faces),
             })
             .collect::<Vec<_>>();
         let uv_active = uv.active.as_deref().and_then(|name| uv.index_of(name));
@@ -491,10 +528,17 @@ pub(crate) fn element_data_losses(format: &str, meshes: &[ExchangeMesh]) -> Vec<
                     losses.push(element_loss(
                         mesh,
                         "mesh.color_attribute",
-                        format!(
-                            "{format} stores point colors; CORNER layer `{}` becomes point data",
-                            layer.name
-                        ),
+                        if format == "ply" {
+                            format!(
+                                "PLY's exporter reads only point-domain colors; CORNER layer `{}` is written as zeros",
+                                layer.name
+                            )
+                        } else {
+                            format!(
+                                "{format} stores point colors; CORNER layer `{}` becomes point data",
+                                layer.name
+                            )
+                        },
                         "export as usda, usdc, fbx, or alembic to preserve the color domain",
                     ));
                 }
@@ -1015,10 +1059,12 @@ pub(crate) mod test_support {
                 ExchangeUvLayer {
                     name: "UVMap".to_owned(),
                     corners: vec![vec![[0.1, 0.25], [0.5, 0.75], [0.9, 0.0]]],
+                    pinned: vec![vec![false; 3]],
                 },
                 ExchangeUvLayer {
                     name: "Lightmap".to_owned(),
                     corners: vec![vec![[0.2, 0.1], [0.6, 0.3], [0.4, 0.0]]],
+                    pinned: vec![vec![false; 3]],
                 },
             ],
             uv_active: Some(1),

@@ -2691,6 +2691,7 @@ fn import_polymesh(
         layers.push(ExchangeUvLayer {
             name,
             corners: first.clone(),
+            pinned: first.iter().map(|face| vec![false; face.len()]).collect(),
         });
     }
     import_uv_layers(&mut mesh, &layers, Some(0), Some(0));
@@ -2882,9 +2883,11 @@ pub(crate) fn read_mesh_cache(
                             .into_iter()
                             .map(uv_to_storage)
                             .collect();
+                        let pinned = corners.iter().map(|face| vec![false; face.len()]).collect();
                         Ok(ExchangeUvLayer {
                             name: name.clone(),
                             corners,
+                            pinned,
                         })
                     })
                     .collect::<Result<Vec<_>>>()
@@ -3333,6 +3336,7 @@ fn uv_layer_names(parameters: &[&ParsedProperty]) -> Vec<String> {
         layers.push(ExchangeUvLayer {
             name,
             corners: Vec::new(),
+            pinned: Vec::new(),
         });
     }
     layers.into_iter().map(|layer| layer.name).collect()

@@ -3,8 +3,8 @@ use std::{collections::HashMap, fs, path::Path};
 use glam::DVec3;
 
 use super::{
-    ExchangeMesh, ExchangeUvLayer, obj::active_vertex_colors, ply_byte_to_color, ply_color_to_byte,
-    shading, single_uv_set,
+    ExchangeMesh, ExchangeUvLayer, ply_byte_to_color, ply_color_to_byte, shading, single_uv_set,
+
 };
 use crate::{
     error::{ErrorCode, PotError, Result},
@@ -46,7 +46,7 @@ pub(crate) fn export(meshes: &[ExchangeMesh]) -> Result<Vec<u8>> {
         } else {
             Vec::new()
         };
-        let colors = active_vertex_colors(mesh)?
+        let colors = ply_vertex_colors(mesh)
             .map(|colors| colors.into_iter().map(ply_rgba).collect::<Vec<_>>());
         for &(position, uv) in &split.vertices {
             for value in mesh.positions[position] {
@@ -99,6 +99,18 @@ pub(crate) fn export(meshes: &[ExchangeMesh]) -> Result<Vec<u8>> {
 /// The active UV layer of `mesh`, the one PLY writes.
 fn active_layer(mesh: &ExchangeMesh) -> Option<&ExchangeUvLayer> {
     mesh.uv_active.and_then(|index| mesh.uv_layers.get(index))
+}
+
+/// The active color layer as one value per vertex. Blender's PLY exporter reads colours only from
+/// the point domain (`lookup_or_default` on `AttrDomain::Point`, default zero), so a corner layer
+/// is written as zeros; `element_data_losses` reports that.
+fn ply_vertex_colors(mesh: &ExchangeMesh) -> Option<Vec<[f64; 4]>> {
+    let name = mesh.colors.active.as_deref()?;
+    let layer = mesh.colors.layers.iter().find(|layer| layer.name == name)?;
+    Some(match layer.domain {
+        ColorDomain::Point => layer.values.clone(),
+        ColorDomain::Corner => vec![[0.0; 4]; mesh.positions.len()],
+    })
 }
 
 /// One mesh as PLY stores it. Without a UV layer the vertices are the positions. With the active
@@ -699,6 +711,7 @@ mod tests {
                     vec![[0.0, 0.0], [0.5, 0.0], [0.0, 0.5]],
                     vec![[0.5, 0.0], [1.0, 0.5], [0.5, 0.5]],
                 ],
+                pinned: vec![vec![false; 3], vec![false; 3]],
             }],
             uv_active: Some(0),
             uv_render: Some(0),
