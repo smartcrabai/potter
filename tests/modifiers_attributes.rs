@@ -10,7 +10,7 @@ use glam::{DMat4, DQuat, DVec3};
 use potter_core::{
     eval::{EvaluationContext, Snapshot},
     geom::{
-        Mesh, edit,
+        Mesh, ResolvedTexture, edit,
         modifiers::{
             attributes::{
                 AttributeLayerSelection, SceneOperand, evaluate_mesh_cache, evaluate_with_context,
@@ -18,6 +18,7 @@ use potter_core::{
             evaluate_modifiers,
         },
     },
+    image::{ImageData, ImageInterpolation},
     model::{CameraData, Modifier, SceneDoc},
 };
 use serde_json::{Value, json};
@@ -3876,8 +3877,16 @@ fn vertex_weight_mix_uv_mask_samples_blender_v_up_rows() -> Result<(), Box<dyn E
             "mask_tex_uv_layer": "UVMap"
         }),
     )?;
-    let result =
-        evaluate_with_context(&mesh, &mix, &BTreeMap::new(), Some(&image), DMat4::IDENTITY)?;
+    let texture = ResolvedTexture::from_image(image);
+    let result = evaluate_with_context(
+        &mesh,
+        &mix,
+        &BTreeMap::new(),
+        Some(&texture),
+        DMat4::IDENTITY,
+        "WeightedMesh",
+        &AttributeLayerSelection::default(),
+    )?;
     let weights = vertex_weights(&result, "A")?;
     assert_eq!(weights.len(), 4);
     for (weight, expected) in weights.iter().zip([0.1, 0.3, 0.6, 0.9]) {

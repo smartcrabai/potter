@@ -5359,7 +5359,11 @@ fn apply_boolean_operands_modifier(
         resolved.params.remove(parameter);
     }
     resolved.runtime.boolean_operands = operands;
-    *mesh = crate::geom::modifiers::evaluate_modifiers(mesh, &[resolved])?;
+    *mesh = crate::geom::modifiers::evaluate_modifiers(
+        mesh,
+        &[resolved],
+        scene_subject_name(doc, subject_id)?,
+    )?;
     Ok(pool)
 }
 

@@ -2126,26 +2126,15 @@ pub(super) fn hook(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             hook_index(&mut result, index);
         }
     } else if let Some(original) = origindex_values(mesh) {
-        // Blender `MOD_hook.cc` ORIGINDEX branch: the selection bitmap is filled by list position,
-        // then each vertex is tested by its original index. The bitmap spans the highest original
-        // index the mesh carries, so a listed value beyond that range matches no vertex.
-        let source_count = original
-            .iter()
-            .filter_map(|&index| usize::try_from(index).ok())
-            .max()
-            .map_or(0, |max| max + 1);
-        let mut selected = vec![false; source_count];
-        for (position, &index) in indices.iter().enumerate() {
-            if index < source_count && position < selected.len() {
-                selected[position] = true;
-            }
-        }
+        // Blender `MOD_hook.cc` ORIGINDEX branch: a vertex is hooked when its original index is
+        // listed. Generated vertices carry `ORIGINDEX_NONE`, which no listed index matches.
+        let listed_originals: HashSet<usize> = indices.iter().copied().collect();
         for index in 0..vertex_count {
             let source = original
                 .get(index)
                 .copied()
                 .and_then(|source| usize::try_from(source).ok());
-            if source.is_some_and(|source| selected.get(source) == Some(&true)) {
+            if source.is_some_and(|source| listed_originals.contains(&source)) {
                 hook_index(&mut result, index);
             }
         }

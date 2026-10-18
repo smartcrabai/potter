@@ -24,7 +24,7 @@ use super::attribute_keys;
 use super::clnor::{self, CornerNormalCode, NormalCodeOptions, settle_custom_normals};
 use super::triangulate::{NgonMethod, QuadMethod, triangulate_mesh};
 use super::{
-    Edge, Face, Mesh, MeshError, ORIGINDEX_ATTRIBUTE, Vertex, edge_key,
+    Edge, Face, Mesh, MeshError, ORIGINDEX_ATTRIBUTE, Vertex, clear_origindex, edge_key,
     normals::{corner_normals, face_normal, safe_acos_approx, sharp_edge_flags},
     origindex_values,
     provenance::{Origin, edge_flags, mean_value_corners, remap_attributes},
@@ -1602,6 +1602,13 @@ fn mirror(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             .iter()
             .map(|members| mean_origin(members.iter().map(|&point| Some(point % vertex_count))))
             .collect(),
+        source_vertices: Some(
+            merged
+                .point_members
+                .iter()
+                .map(|members| members.first().map(|&point| point % vertex_count))
+                .collect(),
+        ),
         faces: merged
             .polygon_sources
             .iter()
@@ -3652,7 +3659,17 @@ fn solidify(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             Some([duplicate_indices[*first]?, duplicate_indices[*second]?])
         }));
     }
-    let origin = Origin::copies(point_sources.into_iter().map(Some), face_sources, true);
+    // Blender's offset vertices are new: only the original vertices carry an index, while the
+    // offset copies keep their source's vertex data.
+    let source_count = source_points.len();
+    let origin = Origin {
+        source_vertices: Some(
+            (0..points.len())
+                .map(|index| (index < source_count).then_some(index))
+                .collect(),
+        ),
+        ..Origin::copies(point_sources.into_iter().map(Some), face_sources, false)
+    };
     let mut result = build_mesh(points, output_polygons, output_loose_edges, &origin, mesh)?;
     clnor::transfer_custom_normals(
         mesh,
@@ -4633,6 +4650,7 @@ fn bevel(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         })
         .collect();
     let mut result = build_mesh(points, output_polygons, loose_edges(mesh)?, &origin, mesh)?;
+    clear_origindex(&mut result);
     bevel_shading::shade_output(
         &mut result,
         &kinds,
@@ -5020,13 +5038,15 @@ fn bevel_vertices(
         faces: face_sources,
         corners: Some(corners),
     };
-    build_mesh(
+    let mut result = build_mesh(
         compact_points,
         output_polygons,
         compact_loose,
         &origin,
         mesh,
-    )
+    )?;
+    clear_origindex(&mut result);
+    Ok(result)
 }
 
 fn decimate(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {

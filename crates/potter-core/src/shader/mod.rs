@@ -2,7 +2,6 @@ mod world;
 
 mod evaluator;
 
-pub(crate) use evaluator::displacement_uses_view_direction;
 pub use evaluator::{
     BsdfParams, EvaluatorWorkspace, HitContext, HitUvLayers, evaluate_displacement,
     evaluate_displacement_with_workspace, evaluate_surface, evaluate_surface_with_workspace,

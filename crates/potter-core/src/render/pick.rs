@@ -248,16 +248,9 @@ pub fn pick(
             "element mapping belongs to a different object",
         ));
     }
-    let camera = camera_from_manifest(&manifest.camera)?;
-    let geometry = extract_geometry(
-        doc,
-        &snapshot,
-        Mode::Solid,
-        false,
-        &BTreeMap::new(),
-        &camera,
-    )?;
+    let geometry = extract_geometry(doc, &snapshot, Mode::Solid, false, &BTreeMap::new())?;
     verify_mapping_matches_geometry(&manifest, &geometry)?;
+    let camera = camera_from_manifest(&manifest.camera)?;
     let (ray_origin, ray_direction) =
         ray_for_pixel(&camera, buffers.width, buffers.height, pixel.0, pixel.1)?;
     let element_domain = element.map(|record| record.domain.as_str());

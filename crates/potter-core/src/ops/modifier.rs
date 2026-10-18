@@ -1226,7 +1226,11 @@ fn evaluate_modifier_output(
                         .flatten()
                 })
                 .collect();
-            let volume_data = &operand_snapshot.volume_data;
+            let volume_data = if uses_volume_node {
+                crate::eval::load_vdb_volume_data(engine.doc, engine.asset_root)?
+            } else {
+                BTreeMap::new()
+            };
             let source = prepared_output.as_ref().unwrap_or(output);
             let object_world = world_matrices.get(target).copied().ok_or_else(|| {
                 PotError::new(
@@ -1301,7 +1305,7 @@ fn evaluate_modifier_output(
                         target,
                         engine.doc,
                         &world_matrices,
-                        volume_data,
+                        &volume_data,
                     ),
                     "surface_deform" | "mesh_deform" => crate::eval::apply_scene_deform_modifier(
                         mesh,

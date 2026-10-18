@@ -22,10 +22,10 @@
 use glam::DVec3;
 
 use super::super::id_indices;
-use super::cage_bvh::{CageRayCache, Vec3};
+use super::cage_bvh::CageRayCache;
 use crate::{
     error::{ErrorCode, PotError, Result},
-    geom::Mesh,
+    geom::{Mesh, bvh::Vec3},
 };
 
 /// `MESHDEFORM_MIN_INFLUENCE` (meshlaplacian.cc:850).

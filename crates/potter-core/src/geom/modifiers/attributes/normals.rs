@@ -531,7 +531,7 @@ fn write_custom_normals(mesh: &mut Mesh, normals: &[DVec3]) -> Result<()> {
 }
 
 fn evaluated_corner_normals(mesh: &Mesh, positions: &[DVec3]) -> Result<Vec<DVec3>> {
-    let computed = crate::geom::normals::plain_corner_normals(mesh, positions)?;
+    let computed = crate::geom::normals::setter_corner_normals(mesh, positions)?;
     let Some(custom) = crate::geom::clnor::corner_custom_normals(
         mesh,
         positions,

@@ -5,7 +5,7 @@ use glam::{DMat4, DVec3};
 use crate::{
     error::{ErrorCode, PotError, Result},
     eval::Snapshot,
-    geom::volume::{VolumeData, sample_density_checked_with_inverse},
+    geom::volume::{VolumeData, sample_density, sample_density_checked},
     image::{ImageData, ImageInterpolation},
     model::{Id, LightData, LightType, SceneDoc},
     shader::{
@@ -62,7 +62,6 @@ struct VolumeInstance<'a> {
     bounds_min: DVec3,
     bounds_max: DVec3,
     voxel_size: f64,
-    local_to_index: Option<DMat4>,
     meters_per_unit: f64,
     density_range: Option<(f64, f64)>,
     density_scale: f64,
@@ -668,7 +667,8 @@ fn realtime_volume_integral(
         ) {
             entry = entry.min(volume_entry);
             exit = exit.max(volume_exit);
-            minimum_step = minimum_step.min(volume_sampling_step(instance, local_direction));
+            minimum_step = minimum_step
+                .min(instance.voxel_size / local_direction.length().max(f64::MIN_POSITIVE) * 0.5);
         }
     }
     if !entry.is_finite() || exit <= entry {
@@ -1860,7 +1860,7 @@ fn collect_volumes<'a>(
             continue;
         };
         let matrix = DMat4::from_cols_array(&evaluated.world_matrix);
-        let (bounds_min, bounds_max, voxel_size, density_range, local_to_index) =
+        let (bounds_min, bounds_max, voxel_size, density_range) =
             if let Some(decoded) = volume.decoded_vdb.as_ref() {
                 let Some(grid) = decoded.density_grid() else {
                     continue;
@@ -1873,27 +1873,15 @@ fn collect_volumes<'a>(
                     bounds_max,
                     grid.voxel_size().min_element(),
                     None,
-                    None,
                 )
             } else {
                 let Some(grid) = volume.grids.first() else {
                     continue;
                 };
-                let maximum_index = DVec3::from_array(
+                let bounds_max = DVec3::from_array(
                     grid.dims
-                        .map(|dimension| f64::from(dimension.saturating_sub(1))),
-                );
-                let (bounds_min, bounds_max, local_to_index) = if grid.index_to_local.is_some() {
-                    let (bounds_min, bounds_max) = grid.local_bounds(DVec3::ZERO, maximum_index)?;
-                    let local_to_index = grid.checked_index_to_local_matrix()?.inverse();
-                    (bounds_min, bounds_max, Some(local_to_index))
-                } else {
-                    let bounds_max =
-                        DVec3::from_array(grid.dims.map(|dimension| {
-                            f64::from(dimension.saturating_sub(1)) * grid.voxel_size
-                        })) + grid.origin;
-                    (grid.origin, bounds_max, None)
-                };
+                        .map(|dimension| f64::from(dimension.saturating_sub(1)) * grid.voxel_size),
+                ) + grid.origin;
                 let density_range = grid.values.as_ref().and_then(|values| {
                     let mut values = values.iter().copied();
                     let first = values.next()?;
@@ -1911,13 +1899,7 @@ fn collect_volumes<'a>(
                     }
                     Some((f64::from(minimum), f64::from(maximum)))
                 });
-                (
-                    bounds_min,
-                    bounds_max,
-                    grid.voxel_size,
-                    density_range,
-                    local_to_index,
-                )
+                (grid.origin, bounds_max, grid.voxel_size, density_range)
             };
         let material = snapshot
             .slot_material(node_id, node, Some(data_block), 0)
@@ -1991,7 +1973,6 @@ fn collect_volumes<'a>(
             bounds_min,
             bounds_max,
             voxel_size,
-            local_to_index,
             meters_per_unit,
             density_range,
             density_scale,
@@ -2057,7 +2038,8 @@ fn trace_volume_segment(
         ) {
             entry = entry.min(volume_entry);
             exit = exit.max(volume_exit);
-            minimum_step = minimum_step.min(volume_sampling_step(instance, local_direction));
+            let local_speed = local_direction.length().max(f64::MIN_POSITIVE);
+            minimum_step = minimum_step.min(instance.voxel_size / local_speed * 0.5);
             stochastic |= instance.scattering
                 && instance.albedo.max_element() > 0.0
                 && instance.density_scale > 0.0;
@@ -2156,40 +2138,17 @@ fn trace_volume_segment(
     })
 }
 
-fn sample_volume_density_local(
-    instance: &VolumeInstance<'_>,
-    local_position: DVec3,
-) -> Result<f64> {
-    let density = sample_density_checked_with_inverse(
-        local_position,
-        instance.volume,
-        instance.local_to_index,
-    )?;
+fn volume_density_at(instance: &VolumeInstance<'_>, world_position: DVec3) -> Result<f64> {
+    let local_position = instance.world_to_local.transform_point3(world_position);
+    let density = sample_density(local_position, instance.volume);
     if !density.is_finite() {
+        sample_density_checked(local_position, instance.volume)?;
         return Err(PotError::new(
             ErrorCode::EvaluationFailed,
             "volume density is not finite",
         ));
     }
-    Ok(density)
-}
-
-fn volume_density_at(instance: &VolumeInstance<'_>, world_position: DVec3) -> Result<f64> {
-    let local_position = instance.world_to_local.transform_point3(world_position);
-    Ok(sample_volume_density_local(instance, local_position)?.max(0.0))
-}
-
-fn volume_sampling_step(instance: &VolumeInstance<'_>, local_direction: DVec3) -> f64 {
-    if let Some(local_to_index) = instance.local_to_index {
-        let index_speed = local_to_index
-            .transform_vector3(local_direction)
-            .abs()
-            .max_element()
-            .max(f64::MIN_POSITIVE);
-        0.5 / index_speed
-    } else {
-        instance.voxel_size / local_direction.length().max(f64::MIN_POSITIVE) * 0.5
-    }
+    Ok(density.max(0.0))
 }
 
 fn march_volumes(
@@ -2262,7 +2221,14 @@ fn march_volumes_with_budget(
                         break;
                     }
                     let local_position = local_origin + local_direction * distance;
-                    let density = sample_volume_density_local(instance, local_position)?;
+                    let density = sample_density(local_position, instance.volume);
+                    if !density.is_finite() {
+                        sample_density_checked(local_position, instance.volume)?;
+                        return Err(PotError::new(
+                            ErrorCode::EvaluationFailed,
+                            "volume density is not finite",
+                        ));
+                    }
                     transmittance *=
                         1.0 - volume_extinction_density(instance, density).min(majorant) / majorant;
                     if transmittance <= 1.0e-6 {
@@ -2277,8 +2243,9 @@ fn march_volumes_with_budget(
             }
             continue;
         }
-        let step_world = volume_sampling_step(instance, local_direction)
-            .max(segment_length / step_budget as f64);
+        let local_speed = local_direction.length().max(f64::MIN_POSITIVE);
+        let step_world =
+            (instance.voxel_size / local_speed * 0.5).max(segment_length / step_budget as f64);
         let steps = (segment_length / step_world)
             .ceil()
             .clamp(1.0, step_budget as f64) as usize;
@@ -2286,7 +2253,14 @@ fn march_volumes_with_budget(
         for sample_index in 0..steps {
             let distance = entry + (sample_index as f64 + 0.5) * step;
             let local_position = local_origin + local_direction * distance;
-            let density = sample_volume_density_local(instance, local_position)?;
+            let density = sample_density(local_position, instance.volume);
+            if !density.is_finite() {
+                sample_density_checked(local_position, instance.volume)?;
+                return Err(PotError::new(
+                    ErrorCode::EvaluationFailed,
+                    "volume density is not finite",
+                ));
+            }
             let attenuation =
                 (-volume_extinction_density(instance, density) * step * instance.meters_per_unit)
                     .exp();
@@ -2487,7 +2461,6 @@ mod volume_extinction_tests {
             bounds_min: DVec3::ZERO,
             bounds_max: DVec3::splat(2.0),
             voxel_size: 1.0,
-            local_to_index: None,
             meters_per_unit: 0.5,
             density_range: Some((1.0, 1.0)),
             density_scale: 1.0,

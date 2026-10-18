@@ -15,7 +15,7 @@ use serde_json::{Map, json};
 use crate::{
     error::{ErrorCode, PotError, Result},
     eval::ModifierEvaluationContext,
-    geom::{GridParams, Mesh},
+    geom::{GridParams, Mesh, clear_origindex},
     model::Modifier,
 };
 
@@ -235,7 +235,7 @@ pub(super) fn ocean(
         };
         let x_subdivisions = subdivisions(repeat_x)?;
         let y_subdivisions = subdivisions(repeat_y)?;
-        Mesh::grid(GridParams {
+        let mut grid = Mesh::grid(GridParams {
             size_x: extent_x,
             size_y: extent_y,
             x_subdivisions,
@@ -243,7 +243,10 @@ pub(super) fn ocean(
         })
         .map_err(|error| {
             PotError::invalid_argument(format!("ocean grid construction failed: {error}"))
-        })?
+        })?;
+        // The generated grid has no point CD_ORIGINDEX map, so every vertex is new.
+        clear_origindex(&mut grid);
+        grid
     } else {
         mesh.clone()
     };

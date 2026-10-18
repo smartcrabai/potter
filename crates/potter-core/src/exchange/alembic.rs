@@ -4806,6 +4806,7 @@ mod tests {
             true,
             false,
             false,
+            "",
         )?;
         assert!(
             samples.len() > 1,
@@ -4838,7 +4839,8 @@ mod tests {
             assert!(property.constant);
             assert_eq!(sample_storage_count(property), 1);
         }
-        let static_samples = read_mesh_cache(&static_bytes, "/Plane/Plane", true, false, false)?;
+        let static_samples =
+            read_mesh_cache(&static_bytes, "/Plane/Plane", true, false, false, "")?;
         assert_eq!(static_samples.len(), 1);
         assert!(
             static_samples

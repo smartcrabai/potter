@@ -1,6 +1,5 @@
 use std::{
     borrow::Cow,
-    cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     fmt::Write as _,
     fs,
@@ -1709,11 +1708,12 @@ fn valid_vertex_groups_attribute(attribute: &Value, data_block: &DataBlock) -> b
     })
 }
 
-/// Blender per-element attributes that carry no exported data: editor selection, cached topology,
-/// vertex positions, face material slots, and shading, edge flags, and custom normals already kept
-/// in Potter's mesh fields and stores. Blender 5.2 attributes the writer skips. Each one's data is
-/// carried elsewhere, is editor state, or is topology kept in the mesh; hidden geometry is written,
-/// as Blender's exporter writes it (`primitive_extract.py` reads no hide flags).
+/// Blender per-element attributes that carry no exported data: editor selection, cached
+/// topology, the vertex positions, and the shading flag already kept in `blender_polygon_smooth`.
+/// Blender 5.2 attributes the writer skips. Each one's data is carried elsewhere (face slots in
+/// `Face.material_index`, edge flags in `blender_edge_flags`, custom normals in the decoded
+/// `custom_normal` attribute), is editor state, or is topology kept in the mesh; hidden geometry is
+/// written, as Blender's exporter writes it (`primitive_extract.py` reads no hide flags).
 const BLENDER_BOOKKEEPING_ATTRIBUTES: [&str; 18] = [
     "material_index",
     "sharp_edge",
@@ -6475,7 +6475,6 @@ fn import_skins(
                         envelope_weight: 1.0,
                         head_radius: 0.1,
                         tail_radius: 0.1,
-                        select: false,
                         bbone_settings: BTreeMap::new(),
                     },
                 );
@@ -7409,10 +7408,6 @@ pub(crate) fn import_indexed(
             }
         }
         primitive_starts.push(polygons.len());
-        // Every color set spans all copies of the mesh's vertices, as positions do.
-        for sets in color_sets.values_mut() {
-            sets.resize(positions.len(), None);
-        }
         // Copies of one Potter vertex, split per UV and normal, rejoin here; corners keep their own normals.
         // Potter's vertex IDs must describe these vertices. Another tool may have changed them (the
         // VRM Add-on keeps mesh extras but drops root ones), so stale IDs are ignored and reported.

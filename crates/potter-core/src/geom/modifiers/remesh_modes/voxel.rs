@@ -16,7 +16,7 @@ use serde_json::json;
 
 use crate::{
     error::{ErrorCode, PotError, Result},
-    geom::Mesh,
+    geom::{Mesh, clear_origindex},
 };
 #[path = "voxel_adaptive.rs"]
 mod adaptive;
@@ -275,7 +275,15 @@ pub(super) fn remesh(
     } else {
         volume_to_mesh(&distance, dimensions, min_coord, voxel_size, smooth_shade)?
     };
-    Ok(output.unwrap_or_else(|| mesh.clone()))
+    // Blender's remesh output is a new mesh with no point CD_ORIGINDEX map, so every vertex is new.
+    // A surface-less result keeps the input mesh, index map included.
+    Ok(match output {
+        Some(mut output) => {
+            clear_origindex(&mut output);
+            output
+        }
+        None => mesh.clone(),
+    })
 }
 
 /// Blender's `remesh_voxel_volume_to_mesh` corner order: quads `[q0, q3, q2, q1]`, triangles

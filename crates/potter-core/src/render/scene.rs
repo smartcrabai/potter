@@ -28,7 +28,7 @@ use super::{
     bvh::Bvh,
     path::object_for_index,
     raster::{
-        AlphaMode, Camera, Line, Mode, SurfaceHit, SurfaceShader, Triangle, blend_color,
+        AlphaMode, Line, Mode, SurfaceHit, SurfaceShader, Triangle, blend_color,
         blend_corner_normals, blend_uv,
     },
 };
@@ -82,6 +82,7 @@ pub(super) struct Geometry {
     pub materials: Vec<Material>,
     pub objects: Vec<ObjectRecord>,
     pub elements: Vec<ElementRecord>,
+    pub bounds: Option<(DVec3, DVec3)>,
     pub warnings: Vec<serde_json::Value>,
     /// Warnings recorded while shading hits, such as `uv.layer_missing`.
     pub shader_warnings: RefCell<Vec<serde_json::Value>>,
@@ -124,8 +125,13 @@ struct PointShadowMap {
 }
 
 type ShadowContext<'a> = Option<(&'a Bvh, &'a [Triangle], &'a BTreeMap<Id, PointShadowMap>)>;
-
-fn visible_scene_node_ids(doc: &SceneDoc, snapshot: &Snapshot) -> Result<HashSet<Id>> {
+pub(super) fn extract_geometry(
+    doc: &SceneDoc,
+    snapshot: &Snapshot,
+    mode: Mode,
+    path_traced: bool,
+    images: &BTreeMap<String, ImageData>,
+) -> Result<Geometry> {
     let scene = doc
         .scenes
         .get(&snapshot.scene_id)
@@ -146,70 +152,7 @@ fn visible_scene_node_ids(doc: &SceneDoc, snapshot: &Snapshot) -> Result<HashSet
         &mut visited,
         &mut visible_nodes,
     );
-    Ok(visible_nodes)
-}
 
-pub(super) fn preview_geometry_parameters(
-    doc: &SceneDoc,
-    snapshot: &Snapshot,
-) -> Result<(Option<(DVec3, DVec3)>, bool)> {
-    let visible_nodes = visible_scene_node_ids(doc, snapshot)?;
-    let mut bounds: Option<(DVec3, DVec3)> = None;
-    let mut view_dependent = false;
-    let mut checked_materials = HashSet::new();
-    for node_id in visible_nodes {
-        let Some(node) = doc.nodes.get(&node_id) else {
-            continue;
-        };
-        if !node.visible || (snapshot.purpose == EvaluationPurpose::Render && !node.render_visible)
-        {
-            continue;
-        }
-        let data_block = node
-            .data
-            .as_ref()
-            .and_then(|data_id| doc.data_blocks.get(data_id));
-        if !view_dependent && let Some(mesh) = snapshot.meshes.get(&node_id) {
-            for face in &mesh.faces {
-                let Ok(slot) = usize::try_from(face.material_index) else {
-                    continue;
-                };
-                let Some(material_id) = snapshot.slot_material(&node_id, node, data_block, slot)
-                else {
-                    continue;
-                };
-                if !checked_materials.insert(material_id.clone()) {
-                    continue;
-                }
-                let Some(material) = doc.materials.get(material_id) else {
-                    continue;
-                };
-                if material.displacement_method == "displacement"
-                    && crate::shader::displacement_uses_view_direction(material, &doc.node_groups)
-                {
-                    view_dependent = true;
-                    break;
-                }
-            }
-        }
-        if let Some(node_bounds) = snapshot.nodes.get(&node_id).and_then(|node| node.bounds) {
-            bounds = Some(match bounds {
-                Some((min, max)) => (min.min(node_bounds.min), max.max(node_bounds.max)),
-                None => (node_bounds.min, node_bounds.max),
-            });
-        }
-    }
-    Ok((bounds, view_dependent))
-}
-pub(super) fn extract_geometry(
-    doc: &SceneDoc,
-    snapshot: &Snapshot,
-    mode: Mode,
-    path_traced: bool,
-    images: &BTreeMap<String, ImageData>,
-    camera: &Camera,
-) -> Result<Geometry> {
-    let visible_nodes = visible_scene_node_ids(doc, snapshot)?;
     let mut materials = vec![Material::default()];
     let mut material_indices =
         std::collections::BTreeMap::<(Id, Option<usize>, Option<Arc<[u64]>>), usize>::new();
@@ -217,6 +160,7 @@ pub(super) fn extract_geometry(
     let mut lines = Vec::new();
     let mut objects = Vec::new();
     let mut elements = Vec::new();
+    let mut bounds: Option<(DVec3, DVec3)> = None;
     let mut warnings = Vec::new();
     let shader_warnings: RefCell<Vec<serde_json::Value>> = RefCell::new(Vec::new());
     let mut evaluator_workspace = EvaluatorWorkspace::default();
@@ -295,6 +239,17 @@ pub(super) fn extract_geometry(
             )
         })?;
         let matrix = DMat4::from_cols_array(&evaluated.world_matrix);
+        if volume.is_some()
+            && let Some(volume_bounds) = evaluated.bounds
+        {
+            bounds = Some(match bounds {
+                Some((current_min, current_max)) => (
+                    current_min.min(volume_bounds.min),
+                    current_max.max(volume_bounds.max),
+                ),
+                None => (volume_bounds.min, volume_bounds.max),
+            });
+        }
         let object_index = u32::try_from(objects.len() + 1).map_err(|_| {
             PotError::new(
                 ErrorCode::LimitExceeded,
@@ -391,6 +346,18 @@ pub(super) fn extract_geometry(
         if let Some(mesh) = mesh
             && !mesh.vertices.is_empty()
         {
+            let mut min = DVec3::splat(f64::INFINITY);
+            let mut max = DVec3::splat(f64::NEG_INFINITY);
+            for vertex in &mesh.vertices {
+                let point = matrix.transform_point3(vertex.co);
+                min = min.min(point);
+                max = max.max(point);
+            }
+            bounds = Some(match bounds {
+                Some((current_min, current_max)) => (current_min.min(min), current_max.max(max)),
+                None => (min, max),
+            });
+
             let vertex_positions: std::collections::BTreeMap<u32, DVec3> = mesh
                 .vertices
                 .iter()
@@ -613,7 +580,6 @@ pub(super) fn extract_geometry(
                             object,
                             layers,
                             &shader_warnings,
-                            camera,
                             &mut evaluator_workspace,
                         )?);
                     } else {
@@ -680,6 +646,14 @@ pub(super) fn extract_geometry(
                     .and_then(|colors| colors.get(slot))
                     .copied()
                     .unwrap_or(default_point_color);
+                let extent = DVec3::splat(radius);
+                bounds = Some(match bounds {
+                    Some((current_min, current_max)) => (
+                        current_min.min(position - extent),
+                        current_max.max(position + extent),
+                    ),
+                    None => (position - extent, position + extent),
+                });
                 lines.push(Line {
                     start: position,
                     end: position,
@@ -738,6 +712,14 @@ pub(super) fn extract_geometry(
                         element_id: format!("p{stroke_number}_{point_number}"),
                         uv_render: None,
                         uv_available_mask: None,
+                    });
+                    let extent = DVec3::splat(radius);
+                    bounds = Some(match bounds {
+                        Some((current_min, current_max)) => (
+                            current_min.min(position - extent),
+                            current_max.max(position + extent),
+                        ),
+                        None => (position - extent, position + extent),
                     });
                     lines.push(Line {
                         start: position,
@@ -829,6 +811,17 @@ pub(super) fn extract_geometry(
                     uv_available_mask: None,
                 });
                 let radius = curve.radius * radius_scale;
+                for point in &curve.points {
+                    let position = matrix.transform_point3(DVec3::from_array(*point));
+                    let extent = DVec3::splat(radius);
+                    bounds = Some(match bounds {
+                        Some((current_min, current_max)) => (
+                            current_min.min(position - extent),
+                            current_max.max(position + extent),
+                        ),
+                        None => (position - extent, position + extent),
+                    });
+                }
                 let segment_count = curve.points.len().saturating_sub(1).max(1);
                 for segment in 0..segment_count {
                     let start = matrix.transform_point3(DVec3::from_array(curve.points[segment]));
@@ -856,6 +849,7 @@ pub(super) fn extract_geometry(
         materials,
         objects,
         elements,
+        bounds,
         warnings,
         shader_warnings,
         shadows: None,
@@ -1215,7 +1209,6 @@ fn subdivide_displaced_triangle(
     object: &ObjectRecord,
     layers: HitUvLayers<'_>,
     warnings: &RefCell<Vec<serde_json::Value>>,
-    camera: &Camera,
     evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<[Triangle; 4]> {
     subdivide_displaced(triangle, object_to_world, |sample| {
@@ -1230,7 +1223,7 @@ fn subdivide_displaced_triangle(
                 point: sample.point,
                 object: sample.object,
                 normal: sample.normal,
-                view: camera.view_direction_from(sample.point),
+                view: DVec3::Z,
                 barycentric: sample.barycentric,
             },
             Some(sample.uv),
@@ -2316,26 +2309,11 @@ mod shading_normal_tests {
         graph::{GraphKind, GraphNode, NodeGroup},
         image::{ImageData, ImageInterpolation},
         model::{Id, Material, MaterialLink, SceneDoc},
-        render::raster::{AlphaMode, Camera, Mode, Projection, StereoMode, SurfaceHit, Triangle},
+        render::raster::{AlphaMode, Mode, SurfaceHit, Triangle},
     };
 
     fn node_id() -> Id {
         Id::new("node").expect("valid id")
-    }
-
-    fn test_camera() -> Camera {
-        Camera {
-            position: DVec3::new(0.0, 0.0, 5.0),
-            target: DVec3::ZERO,
-            up: DVec3::Y,
-            near: 0.1,
-            far: 100.0,
-            projection: Projection::Orthographic { height: 2.0 },
-            shift: [0.0; 2],
-            depth_of_field: None,
-            stereo_mode: StereoMode::None,
-            interocular_distance: 0.065,
-        }
     }
 
     #[test]
@@ -2634,14 +2612,7 @@ mod shading_normal_tests {
                 interpolation: ImageInterpolation::Closest,
             },
         )]);
-        let geometry = extract_geometry(
-            &doc,
-            &snapshot,
-            Mode::Beauty,
-            false,
-            &images,
-            &test_camera(),
-        )?;
+        let geometry = extract_geometry(&doc, &snapshot, Mode::Beauty, false, &images)?;
         let triangle = geometry.triangles.first().ok_or_else(|| {
             PotError::new(ErrorCode::InternalError, "flat texture triangle is missing")
         })?;
@@ -2841,14 +2812,7 @@ mod shading_normal_tests {
         ];
 
         let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
-        let geometry = extract_geometry(
-            &doc,
-            &snapshot,
-            Mode::Solid,
-            false,
-            &BTreeMap::new(),
-            &test_camera(),
-        )?;
+        let geometry = extract_geometry(&doc, &snapshot, Mode::Solid, false, &BTreeMap::new())?;
         let colors_for = |node_id: &Id| {
             let object = geometry
                 .objects

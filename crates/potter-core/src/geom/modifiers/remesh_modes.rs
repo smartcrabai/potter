@@ -9,7 +9,7 @@ use serde_json::json;
 
 use crate::{
     error::{ErrorCode, PotError, Result},
-    geom::Mesh,
+    geom::{Mesh, clear_origindex},
     model::Modifier,
 };
 
@@ -119,6 +119,7 @@ fn octree_remesh(mesh: &Mesh, modifier: &Modifier, mode: &str) -> Result<Mesh> {
         flood_fill: remove_disconnected,
     };
     let mut result = dual_contour::remesh(mesh, &settings)?;
+    clear_origindex(&mut result);
     finish_remesh(&mut result, smooth_shade)?;
     Ok(result)
 }
@@ -133,7 +134,7 @@ fn finish_remesh(mesh: &mut Mesh, smooth_shade: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use crate::{
-        geom::{BoxParams, Mesh, origindex_values, set_origindex},
+        geom::{BoxParams, Mesh, ORIGINDEX_NONE, origindex_values, set_origindex},
         model::{Id, Modifier},
     };
     use serde_json::{Map, json};
@@ -159,7 +160,10 @@ mod tests {
         let result = remesh_modifier(&source, &modifier)?;
         assert!(result.validate().is_ok());
         assert!(!result.faces.is_empty(), "remesh produced no faces");
-        assert!(origindex_values(&result).is_none());
+        assert_eq!(
+            origindex_values(&result),
+            Some(vec![ORIGINDEX_NONE; result.vertices.len()])
+        );
         Ok(())
     }
 

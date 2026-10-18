@@ -26,11 +26,13 @@ use serde_json::{Map, Value};
 pub(crate) mod attribute_keys;
 pub(crate) mod blender_matrix;
 pub mod boolean;
+pub(crate) mod bvh;
 pub(crate) mod clnor;
 pub(crate) mod color_layers;
 pub(crate) mod concat;
 pub mod curve;
 pub mod edit;
+pub(crate) mod heap_simple;
 pub mod lattice;
 pub(crate) mod legacy_texture;
 pub use legacy_texture::{ResolvedTexture, resolve_texture};
@@ -142,6 +144,12 @@ pub(crate) fn set_origindex(mesh: &mut Mesh, values: &[i32]) {
         ORIGINDEX_ATTRIBUTE.to_owned(),
         Value::Array(values.iter().map(|&index| Value::from(index)).collect()),
     );
+}
+
+/// Marks every vertex of `mesh` as generated: its carrier holds `ORIGINDEX_NONE` throughout.
+pub(crate) fn clear_origindex(mesh: &mut Mesh) {
+    let none = vec![ORIGINDEX_NONE; mesh.vertices.len()];
+    set_origindex(mesh, &none);
 }
 
 /// Polygon mesh whose topology and element identities survive index changes.

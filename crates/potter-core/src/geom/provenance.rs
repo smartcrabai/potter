@@ -29,9 +29,9 @@ pub(crate) struct Origin {
     /// Per output vertex: input vertex storage indices with weights summing to one.
     /// An empty list marks a new vertex without input data.
     pub vertices: Vec<Vec<(usize, f64)>>,
-    /// Per output vertex: exact input storage index or `None` for Blender `ORIGINDEX_NONE`.
-    /// The outer `None` means the output has no point ORIGINDEX layer.
-    /// It is independent of weighted attribute provenance.
+    /// Per output vertex: the input storage index whose `blender_origindex` value it takes, or
+    /// `None` for Blender `ORIGINDEX_NONE`. When `Some`, it overrides the weight-one rule of
+    /// [`carrier_source`]; weighted attribute provenance is unaffected.
     pub source_vertices: Option<Vec<Option<usize>>>,
     /// Per output polygon, in the order passed to `build_mesh`: the input polygon storage index,
     /// or `None` for a generated polygon.
@@ -72,6 +72,18 @@ impl Origin {
             faces,
             corners: None,
         }
+    }
+}
+
+/// The input storage index whose `blender_origindex` value output vertex `vertex` takes, or `None`
+/// for `ORIGINDEX_NONE`. An exact source wins; else a single weight-one source is used.
+fn carrier_source(origin: &Origin, vertex: usize) -> Option<usize> {
+    if let Some(exact) = &origin.source_vertices {
+        return exact[vertex];
+    }
+    match origin.vertices[vertex].as_slice() {
+        [(index, weight)] if *weight == 1.0 => Some(*index),
+        _ => None,
     }
 }
 
@@ -262,15 +274,11 @@ pub(crate) fn remap_attributes_skipping(
             }),
             ORIGINDEX_ATTRIBUTE => value.as_array().map(|indices| {
                 Value::Array(
-                    origin
-                        .vertices
-                        .iter()
-                        .map(|sources| match sources.as_slice() {
-                            [(index, weight)] if *weight == 1.0 => indices
-                                .get(*index)
-                                .cloned()
-                                .unwrap_or_else(|| json!(ORIGINDEX_NONE)),
-                            _ => json!(ORIGINDEX_NONE),
+                    (0..origin.vertices.len())
+                        .map(|vertex| {
+                            carrier_source(origin, vertex)
+                                .and_then(|source| indices.get(source).cloned())
+                                .unwrap_or_else(|| json!(ORIGINDEX_NONE))
                         })
                         .collect(),
                 )

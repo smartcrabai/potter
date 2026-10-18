@@ -12,6 +12,8 @@ use super::{
 
 use std::ptr::NonNull;
 
+use crate::geom::heap_simple::HeapSimple;
+
 #[repr(C)]
 struct PotterSkinHull {
     _private: [u8; 0],
@@ -569,17 +571,11 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         crate::geom::normals::shade_faces_smooth(&mut result);
     }
     // Blender's Skin output has no UV layers, so UV data is dropped (reported as attribute loss).
-    let uv_names: Vec<String> = result
-        .attributes
-        .get("blender_uv_layers")
-        .and_then(serde_json::Value::as_array)
+    let uv_names: Vec<String> = crate::geom::uv_layers::read_layers(&result)
         .into_iter()
-        .flatten()
-        .filter_map(|layer| layer.get("name").and_then(serde_json::Value::as_str))
-        .map(str::to_owned)
+        .map(|layer| layer.name)
         .collect();
-    result.attributes.remove("blender_uv_layers");
-    result.attributes.remove("uv_map");
+    result.attributes.remove(crate::geom::uv_layers::ATTRIBUTE);
     if let Some(entries) = result
         .attributes
         .get_mut("blender_attributes")
@@ -1322,66 +1318,6 @@ fn skin_float_normalize(vector: [f32; 3]) -> [f32; 3] {
     }
 }
 
-/// Blender's `BLI_heapsimple` (`BLI_heap_simple.cc`): a binary min-heap. Insertion sifts up while the parent is
-/// larger; removal takes the root and sifts the last node down from the root. Equal keys therefore pop in
-/// the order these sift rules give, as in Blender.
-struct HeapSimple<T: Copy> {
-    tree: Vec<(f32, T)>,
-}
-
-impl<T: Copy> HeapSimple<T> {
-    /// `BLI_heapsimple_insert` (`heapsimple_up`).
-    fn insert(&mut self, value: f32, payload: T) {
-        let mut index = self.tree.len();
-        self.tree.push((value, payload));
-        while index > 0 {
-            let parent = (index - 1) >> 1;
-            if value >= self.tree[parent].0 {
-                break;
-            }
-            self.tree[index] = self.tree[parent];
-            index = parent;
-        }
-        self.tree[index] = (value, payload);
-    }
-
-    /// `BLI_heapsimple_pop_min`: the root is returned and the last node is sifted down from the root.
-    fn pop_min(&mut self) -> Option<T> {
-        let (_, payload) = *self.tree.first()?;
-        let last = self.tree.pop()?;
-        if !self.tree.is_empty() {
-            self.sift_down(last);
-        }
-        Some(payload)
-    }
-
-    /// `heapsimple_down` from the root, placing `init` (`BLI_heap_simple.cc`).
-    fn sift_down(&mut self, init: (f32, T)) {
-        let size = self.tree.len();
-        let active_value = init.0;
-        let mut index = 0;
-        self.tree[index].0 = active_value;
-        loop {
-            let left = 2 * index + 1;
-            let right = left + 1;
-            let mut smallest = index;
-            if left < size && self.tree[left].0 < active_value {
-                smallest = left;
-            }
-            if right < size && self.tree[right].0 < self.tree[smallest].0 {
-                smallest = right;
-            }
-            if smallest == index {
-                break;
-            }
-            self.tree[index] = self.tree[smallest];
-            index = smallest;
-            self.tree[index].0 = active_value;
-        }
-        self.tree[index].1 = init.1;
-    }
-}
-
 /// Triangle area in `f32`, as `BM_face_calc_area` (half the magnitude of the cross product).
 fn triangle_area32(points: &[glam::Vec3], triangle: [usize; 3]) -> f32 {
     (points[triangle[1]] - points[triangle[0]])
@@ -1425,7 +1361,7 @@ fn merge_triangle_faces(
             adjacent.push(face_index);
         }
     }
-    let mut heap = HeapSimple { tree: Vec::new() };
+    let mut heap = HeapSimple::new();
     for (edge_position, &edge) in edge_order.iter().enumerate() {
         let adjacent = &edge_faces[&edge];
         if adjacent.len() != 2 {

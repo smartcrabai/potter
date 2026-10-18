@@ -147,6 +147,7 @@ fn blender_st(uv: [f64; 2]) -> Result<[f32; 2]> {
     }
     Ok(st)
 }
+
 pub(crate) fn import(path: &Path) -> Result<Vec<ExchangeMesh>> {
     let bytes = fs::read(path).map_err(|error| PotError::io(&error))?;
     let marker = b"end_header";
