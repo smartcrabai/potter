@@ -1077,6 +1077,10 @@ mod tests {
         "../../../../../tests/fixtures/boolean_parity/connect_islands/coplanar_float.json"
     );
 
+    const TIE_FIXTURE: &str = include_str!(
+        "../../../../../tests/fixtures/boolean_parity/connect_islands/bvh_tie_float.json"
+    );
+
     fn index(value: &Value) -> usize {
         value.as_u64().map_or(usize::MAX, |v| v as usize)
     }
@@ -1095,9 +1099,11 @@ mod tests {
         [bits(0), bits(1), bits(2)].map(f32::from_bits)
     }
 
-    #[test]
-    fn connect_islands_matches_blender_records_exactly() {
-        let Ok(root) = serde_json::from_str::<Value>(FIXTURE) else {
+    /// Checks every `ok` record of a connect fixture: `connect_islands` must return the recorded connect
+    /// pairs, compared unordered (Blender returns pre-existing edges in their stored orientation).
+    /// Returns the number of records checked and how many of them connected.
+    fn check_connect_fixture(fixture: &str) -> (usize, usize) {
+        let Ok(root) = serde_json::from_str::<Value>(fixture) else {
             panic!("connect_islands fixture is valid JSON");
         };
         let Some(cases) = root["cases"].as_object() else {
@@ -1134,8 +1140,24 @@ mod tests {
                 connected += usize::from(!expected.is_empty());
             }
         }
+        (checked, connected)
+    }
+
+    #[test]
+    fn connect_islands_matches_blender_records_exactly() {
+        let (checked, connected) = check_connect_fixture(FIXTURE);
         assert_eq!(checked, 24, "fixture holds 24 ok records");
         assert!(connected > 0, "fixture exercises at least one connection");
+    }
+
+    /// The Blender record in `bvh_tie_float.json`: the top face of a union, where the connect origin's
+    /// +x ray first meets a notch tip shared by two edges at exactly the same distance (0.75). Blender
+    /// keeps the edge its BVH traversal reaches first, and the port must do the same.
+    #[test]
+    fn connect_bvh_tie_blender_record_matches() {
+        let (checked, connected) = check_connect_fixture(TIE_FIXTURE);
+        assert_eq!(checked, 1, "tie fixture holds one ok record");
+        assert!(connected > 0, "tie fixture exercises a connection");
     }
 
     #[test]
