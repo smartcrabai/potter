@@ -1,13 +1,13 @@
 """PR9 persistence reference (Blender 5.2.2, background).
 
 Usage:
-  Blender --factory-startup -b oracle.blend --python authoring_reference.py -- OUT.json
+  Blender --factory-startup -b oracle.blend --python authoring_reference.py -- OUT.json LEVELS
 
-Evaluates the oracle's `Regress` object through a Subdivision (levels 1, Use Custom Normals off),
-so the result has no custom-normal layer. Then authors custom normals on that evaluated topology
-with Blender's own setter, using the fan rules of build_oracle.py: a fan whose first loop index is
-not a multiple of 3 is authored with authored_vector(first loop); every other fan is automatic
-(code pair (0, 0)).
+Evaluates the oracle's `Regress` object through a Subdivision (levels LEVELS, the second argument;
+Use Custom Normals off), so the result has no custom-normal layer. Then authors custom normals on that
+evaluated topology with Blender's own setter, using the fan rules of build_oracle.py: a fan whose first
+loop index is not a multiple of 3 is authored with authored_vector(first loop); every other fan is
+automatic (code pair (0, 0)).
 
 Writes one entry per loop of that result, in Blender's own loop order:
   co, center  the loop's vertex position and its face center, as Blender reports them
@@ -22,7 +22,8 @@ import sys
 
 import bpy
 
-OUT = sys.argv[sys.argv.index("--") + 1]
+ARGS = sys.argv[sys.argv.index("--") + 1:]
+OUT, LEVELS = ARGS[0], int(ARGS[1])
 
 
 def unit(vector):
@@ -73,8 +74,8 @@ def corner_fans(mesh):
 regress = bpy.data.objects["Regress"]
 regress.modifiers.clear()
 subdivision = regress.modifiers.new("Subdivision", "SUBSURF")
-subdivision.levels = 1
-subdivision.render_levels = 1
+subdivision.levels = LEVELS
+subdivision.render_levels = LEVELS
 subdivision.use_custom_normals = False
 depsgraph = bpy.context.evaluated_depsgraph_get()
 evaluated = regress.evaluated_get(depsgraph).to_mesh()
