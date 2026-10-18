@@ -193,6 +193,49 @@ const NO_DISK: DiskLink = DiskLink {
     prev: NONE,
 };
 
+/// Blender's `BLI_mempool` slot order for one element type. `BLI_mempool_alloc` takes the head of the
+/// free list, the most recently freed slot, and then never-used slots in order. Blender emits elements
+/// in pool order (`BM_mesh_bm_to_me`), so an element's slot is its output position.
+#[derive(Default)]
+struct PoolSlots {
+    fresh: usize,
+    freed: Vec<usize>,
+}
+
+impl PoolSlots {
+    fn alloc(&mut self) -> usize {
+        if let Some(slot) = self.freed.pop() {
+            return slot;
+        }
+        self.fresh += 1;
+        self.fresh - 1
+    }
+
+    fn release(&mut self, slot: usize) {
+        self.freed.push(slot);
+    }
+}
+
+/// Puts `mesh`'s edges in `pool_order`: the live edges as output-vertex pairs in Blender's edge pool
+/// order. Mesh vertex `k` is output vertex `k`.
+fn order_mesh_edges(mesh: &mut Mesh, pool_order: &[[usize; 2]]) {
+    let index_of: HashMap<u32, usize> = mesh
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(index, vertex)| (vertex.id, index))
+        .collect();
+    let rank: HashMap<[usize; 2], usize> = pool_order
+        .iter()
+        .enumerate()
+        .map(|(rank, pair)| (*pair, rank))
+        .collect();
+    mesh.edges.sort_by_key(|edge| {
+        let [a, b] = edge.vertices.map(|id| index_of[&id]);
+        rank[&[a.min(b), a.max(b)]]
+    });
+}
+
 struct BVert {
     co: [f32; 3],
     /// First edge of the disk cycle, or `NONE`.
@@ -215,6 +258,8 @@ struct BEdge {
     /// `BM_ELEM_TAG`: set on the edges that were already wire before dissolving.
     tag: bool,
     jf: bool,
+    /// `BLI_mempool` slot of this edge (see [`PoolSlots`]).
+    slot: usize,
 }
 
 #[derive(Clone)]
@@ -243,6 +288,8 @@ struct BFace {
     origin: Option<usize>,
     alive: bool,
     jf: bool,
+    /// `BLI_mempool` slot of this face (see [`PoolSlots`]).
+    slot: usize,
 }
 
 /// The `delimit` modes of the DISSOLVE decimator.
@@ -274,6 +321,9 @@ struct BMesh {
     faces: Vec<BFace>,
     /// Loop slots of killed faces, available to `loop_alloc`.
     free_loops: Vec<usize>,
+    /// `BLI_mempool` slots of the edges and faces: the output order of the live elements.
+    edge_slots: PoolSlots,
+    face_slots: PoolSlots,
     /// Scratch membership of `sort_winding`: an edge (vertex) is in the set when its mark equals
     /// `mark_stamp`, so starting a new set costs nothing.
     edge_mark: Vec<usize>,
@@ -506,6 +556,7 @@ impl BMesh {
             return e;
         }
         let e = self.edges.len();
+        let slot = self.edge_slots.alloc();
         self.edges.push(BEdge {
             v: [v1, v2],
             disk: [NO_DISK; 2],
@@ -515,6 +566,7 @@ impl BMesh {
             seam: false,
             tag: false,
             jf: false,
+            slot,
         });
         self.disk_edge_append(e, v1);
         self.disk_edge_append(e, v2);
@@ -607,6 +659,7 @@ impl BMesh {
         }
         self.loops[prev].next = first;
         self.loops[first].prev = prev;
+        let slot = self.face_slots.alloc();
         let source = &self.faces[example];
         let face = BFace {
             first,
@@ -616,6 +669,7 @@ impl BMesh {
             origin: source.origin,
             alive: true,
             jf: false,
+            slot,
         };
         self.faces.push(face);
         f
@@ -637,6 +691,7 @@ impl BMesh {
             }
         }
         self.faces[f].alive = false;
+        self.face_slots.release(self.faces[f].slot);
     }
 
     /// `BM_edge_kill`: kills the faces around `e`, then `e`.
@@ -649,6 +704,7 @@ impl BMesh {
         self.disk_edge_remove(e, v1);
         self.disk_edge_remove(e, v2);
         self.edges[e].alive = false;
+        self.edge_slots.release(self.edges[e].slot);
     }
 
     /// `BM_vert_kill`: kills the edges around `v`, then `v`.
@@ -1287,6 +1343,7 @@ impl BMesh {
         let e = self.edge_create(v1, v2, no_double);
         let source = self.faces[f].clone();
         let f2 = self.faces.len();
+        let slot = self.face_slots.alloc();
         self.faces.push(BFace {
             first: NONE,
             len: 0,
@@ -1295,6 +1352,7 @@ impl BMesh {
             origin: source.origin,
             alive: true,
             jf: false,
+            slot,
         });
         let l_f1 = self.loop_create(v2, e, f, l_v2);
         let l_f2 = self.loop_create(v1, e, f2, l_v1);
@@ -1411,6 +1469,7 @@ impl BMesh {
             }
         }
         self.edges[e_kill].alive = false;
+        self.edge_slots.release(self.edges[e_kill].slot);
         self.verts[v_kill].alive = false;
         if let Some(e_splice) = e_splice {
             self.edge_splice(e_old, e_splice);
@@ -2315,6 +2374,8 @@ impl BMesh {
             loops: Vec::new(),
             faces: Vec::with_capacity(mesh.faces.len()),
             free_loops: Vec::new(),
+            edge_slots: PoolSlots::default(),
+            face_slots: PoolSlots::default(),
             edge_mark: Vec::new(),
             vert_mark: Vec::new(),
             mark_stamp: 0,
@@ -2379,6 +2440,7 @@ impl BMesh {
                 bm.radial_append(edges[k], first + k);
             }
             let cos: Vec<[f32; 3]> = indices.iter().map(|&v| bm.verts[v].co).collect();
+            let slot = bm.face_slots.alloc();
             bm.faces.push(BFace {
                 first,
                 len: n,
@@ -2387,6 +2449,7 @@ impl BMesh {
                 origin: Some(face_index),
                 alive: true,
                 jf: false,
+                slot,
             });
             corner += n;
         }
@@ -2396,13 +2459,15 @@ impl BMesh {
     /// `BKE_mesh_from_bmesh`: the live faces with each corner's source corner, the edges that belong to
     /// no face, and every input vertex (unused ones are dropped by `decimate_compact`).
     fn to_mesh(&self, points: Vec<DVec3>, source: &Mesh) -> Result<Mesh> {
+        let mut live_faces: Vec<usize> = (0..self.faces.len())
+            .filter(|&f| self.faces[f].alive)
+            .collect();
+        live_faces.sort_by_key(|&f| self.faces[f].slot);
         let mut polygons: Vec<Polygon> = Vec::new();
         let mut face_origins = Vec::new();
         let mut corners = Vec::new();
-        for (f, face) in self.faces.iter().enumerate() {
-            if !face.alive {
-                continue;
-            }
+        for f in live_faces {
+            let face = &self.faces[f];
             let loops = self.face_loops(f);
             polygons.push((loops.iter().map(|&l| self.loops[l].v).collect(), face.mat));
             face_origins.push(face.origin);
@@ -2424,20 +2489,45 @@ impl BMesh {
         let mut origin = Origin::copies((0..points.len()).map(Some), face_origins);
         origin.corners = Some(corners);
         let keep_vertices: Vec<bool> = self.verts.iter().map(|vert| vert.alive).collect();
-        decimate_compact(points, polygons, loose, origin, source, &keep_vertices)
+        let mut result = decimate_compact(points, polygons, loose, origin, source, &keep_vertices)?;
+        order_mesh_edges(&mut result, &self.pool_edge_pairs());
+        Ok(result)
     }
 
-    /// `(seam, sharp)` of each live edge keyed by its output vertex pair. `to_mesh` keeps the live
-    /// vertices in index order, so output vertex `k` is the `k`-th live `BMesh` vertex.
-    fn output_edge_flags(&self) -> Vec<([usize; 2], (bool, bool))> {
-        let mut output_index = vec![NONE; self.verts.len()];
+    /// The live edges as sorted output-vertex pairs, in pool order.
+    fn pool_edge_pairs(&self) -> Vec<[usize; 2]> {
+        let output_index = self.live_vertex_index();
+        let mut live: Vec<usize> = (0..self.edges.len())
+            .filter(|&e| self.edges[e].alive)
+            .collect();
+        live.sort_by_key(|&e| self.edges[e].slot);
+        live.into_iter()
+            .map(|e| {
+                let [a, b] = self.edges[e].v.map(|v| output_index[v]);
+                [a.min(b), a.max(b)]
+            })
+            .collect()
+    }
+
+    /// Output vertex of each live vertex: `to_mesh` keeps the live vertices in index order.
+    fn live_vertex_index(&self) -> Vec<usize> {
         let mut next = 0;
-        for (v, vert) in self.verts.iter().enumerate() {
-            if vert.alive {
-                output_index[v] = next;
-                next += 1;
-            }
-        }
+        self.verts
+            .iter()
+            .map(|vert| {
+                if vert.alive {
+                    next += 1;
+                    next - 1
+                } else {
+                    NONE
+                }
+            })
+            .collect()
+    }
+
+    /// `(seam, sharp)` of each live edge keyed by its output vertex pair.
+    fn output_edge_flags(&self) -> Vec<([usize; 2], (bool, bool))> {
+        let output_index = self.live_vertex_index();
         self.edges
             .iter()
             .filter(|edge| edge.alive)

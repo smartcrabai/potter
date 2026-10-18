@@ -459,27 +459,23 @@ fn compare(case: &Value) -> TestResult<Report> {
         .enumerate()
         .map(|(index, v)| (v.id, index))
         .collect();
-    // Vertices are checked in pool order for every mode. Edges and faces are checked in pool order for
-    // COLLAPSE only: DISSOLVE and UNSUBDIV do not replay Blender's pool slot reuse yet.
-    let exact_order = case["spec"]["modifier"]["decimate_type"] == "COLLAPSE";
+    // Vertices, edges and faces are checked in Blender's pool order, which every mode replays.
     report.vertex_order_mismatches = (0..matched.len())
         .filter(|&index| matched[index] != Some(index))
         .count();
-    if exact_order {
-        let blender_edges = blender["edges"].as_array().ok_or("edges missing")?;
-        report.edge_order_mismatches = blender_edges.len().abs_diff(output.edges.len());
-        for (index, edge) in output.edges.iter().enumerate() {
-            let ends = edge.vertices.map(|id| matched[potter_index[&id]]);
-            let same = match (ends, blender_edges.get(index)) {
-                ([Some(a), Some(b)], Some(pair)) => {
-                    let [x, y] = edge_pair(pair)?;
-                    edge_key(a, b) == edge_key(x, y)
-                }
-                _ => false,
-            };
-            if !same {
-                report.edge_order_mismatches += 1;
+    let blender_edges = blender["edges"].as_array().ok_or("edges missing")?;
+    report.edge_order_mismatches = blender_edges.len().abs_diff(output.edges.len());
+    for (index, edge) in output.edges.iter().enumerate() {
+        let ends = edge.vertices.map(|id| matched[potter_index[&id]]);
+        let same = match (ends, blender_edges.get(index)) {
+            ([Some(a), Some(b)], Some(pair)) => {
+                let [x, y] = edge_pair(pair)?;
+                edge_key(a, b) == edge_key(x, y)
             }
+            _ => false,
+        };
+        if !same {
+            report.edge_order_mismatches += 1;
         }
     }
 
@@ -544,7 +540,7 @@ fn compare(case: &Value) -> TestResult<Report> {
             continue;
         }
         matched_faces[blender_face] = true;
-        if exact_order && blender_face != face_index {
+        if blender_face != face_index {
             report.face_order_mismatches += 1;
             if report.problems.len() < 10 {
                 report.problems.push(format!(
