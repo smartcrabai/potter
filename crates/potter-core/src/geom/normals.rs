@@ -758,6 +758,15 @@ mod tests {
         );
     }
 
+    /// Compares a Blender float normal at f32 epsilon; `expected` is the nearest f32 value.
+    fn assert_f32_vec_eq(actual: DVec3, expected: glam::Vec3) {
+        let actual = actual.as_vec3();
+        assert!(
+            (actual - expected).abs().max_element() <= f32::EPSILON,
+            "expected {expected:?}, got {actual:?}"
+        );
+    }
+
     const FACE_A_NORMAL: DVec3 = DVec3::Z;
     const FACE_B_NORMAL: DVec3 = DVec3::NEG_X;
 
@@ -791,7 +800,9 @@ mod tests {
             for id in &face.vertices {
                 let corner = corners.next().expect("one normal per corner");
                 let vertex = mesh.vertex(*id).expect("vertex exists").co;
-                assert_vec_eq(*corner, vertex.normalize());
+                // Blender computes POINT vertex normals in float: the expected corner is the f32
+                // nearest to the exact diagonal (0.57735026 for a unit cube corner).
+                assert_f32_vec_eq(*corner, vertex.normalize().as_vec3());
             }
         }
         assert!(corners.next().is_none());
