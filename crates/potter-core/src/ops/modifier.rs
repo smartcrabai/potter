@@ -1277,61 +1277,37 @@ fn evaluate_modifier_output(
         } else {
             let frame = engine.evaluation_frame;
             let driver_values = crate::eval::rig::evaluate_drivers(engine.doc, frame)?;
-            let operand_snapshot = if uses_scene_context {
-                Some(
-                    crate::eval::Snapshot::evaluate_modifier_operands_with_cache(
-                        engine.doc,
-                        &crate::eval::EvaluationContext {
-                            frame: Some(frame),
-                            ..crate::eval::EvaluationContext::default()
-                        },
-                        engine.asset_root,
-                        engine.cache_directory,
-                        target,
-                        modifier_id,
-                        &driver_values,
-                    )?,
-                )
-            } else {
-                None
-            };
-            let empty_meshes = BTreeMap::new();
-            let evaluated_operand_meshes = operand_snapshot
-                .as_ref()
-                .map_or(&empty_meshes, |snapshot| &snapshot.meshes);
-            let empty_nodes = BTreeMap::new();
-            let evaluated_operand_nodes = operand_snapshot
-                .as_ref()
-                .map_or(&empty_nodes, |snapshot| &snapshot.nodes);
-            let world_matrices = if let Some(snapshot) = &operand_snapshot {
-                let mut matrices = snapshot
-                    .nodes
+            let operand_snapshot = crate::eval::Snapshot::evaluate_modifier_operands_with_cache(
+                engine.doc,
+                &crate::eval::EvaluationContext {
+                    frame: Some(frame),
+                    ..crate::eval::EvaluationContext::default()
+                },
+                engine.asset_root,
+                engine.cache_directory,
+                target,
+                modifier_id,
+                &driver_values,
+            )?;
+            let evaluated_operand_meshes = &operand_snapshot.meshes;
+            let evaluated_operand_nodes = &operand_snapshot.nodes;
+            // Simulated rigid-body transforms are captured only in `transform_world_matrices`.
+            let mut world_matrices = operand_snapshot
+                .nodes
+                .iter()
+                .map(|(node_id, node)| {
+                    (
+                        node_id.clone(),
+                        glam::DMat4::from_cols_array(&node.world_matrix),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            world_matrices.extend(
+                operand_snapshot
+                    .transform_world_matrices
                     .iter()
-                    .map(|(node_id, node)| {
-                        (
-                            node_id.clone(),
-                            glam::DMat4::from_cols_array(&node.world_matrix),
-                        )
-                    })
-                    .collect::<BTreeMap<_, _>>();
-                matrices.extend(
-                    snapshot
-                        .transform_world_matrices
-                        .iter()
-                        .map(|(id, matrix)| (id.clone(), *matrix)),
-                );
-                matrices
-            } else {
-                let scene = engine.doc.scenes.get(&engine.doc.active_scene);
-                crate::eval::rig::evaluate_world_matrices_with_resources(
-                    engine.doc,
-                    frame,
-                    &driver_values,
-                    engine.asset_root,
-                    scene.map_or(24, |scene| scene.fps),
-                    scene.map_or(1.0, |scene| scene.fps_base),
-                )?
-            };
+                    .map(|(id, matrix)| (id.clone(), *matrix)),
+            );
             let curve_path_lengths = crate::eval::evaluated_array_curve_path_length(
                 engine.doc,
                 target_modifier,
@@ -1363,18 +1339,10 @@ fn evaluate_modifier_output(
                     "modifier subject transform is unavailable",
                 )
             })?;
-            let empty_bone_matrices = BTreeMap::new();
-            let empty_bone_pose_matrices = BTreeMap::new();
             let references = crate::eval::SceneReferences {
                 world_matrices: &world_matrices,
-                bone_matrices: operand_snapshot
-                    .as_ref()
-                    .map_or(&empty_bone_matrices, |snapshot| &snapshot.bone_matrices),
-                bone_pose_matrices: operand_snapshot
-                    .as_ref()
-                    .map_or(&empty_bone_pose_matrices, |snapshot| {
-                        &snapshot.bone_pose_matrices
-                    }),
+                bone_matrices: &operand_snapshot.bone_matrices,
+                bone_pose_matrices: &operand_snapshot.bone_pose_matrices,
                 evaluated_meshes: evaluated_operand_meshes,
                 project_root: engine.asset_root,
             };

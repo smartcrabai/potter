@@ -143,17 +143,16 @@ impl Position {
                 edge_sharp.push(sharpness.get(&key).copied().unwrap_or(0.0));
             }
         };
-        for (poly, _) in polys {
-            for corner in 0..poly.len() {
-                add_edge(edge_key(poly[corner], poly[(corner + 1) % poly.len()]));
-            }
+        // Blender numbers edge points in the order its mesh stores the edges, which
+        // `blender_edge_order` reproduces for polygon edges; loose edges follow.
+        for key in super::bevel_shading::blender_edge_order(polys) {
+            add_edge(key);
         }
         for &[first, second] in loose_edges {
             add_edge(edge_key(first, second));
         }
         let (vertex_starts, vertex_corners) = group(&corner_vertex, vertex_count);
-        let mut edge_order: Vec<usize> = (0..edge_ends.len()).collect();
-        edge_order.sort_unstable_by_key(|edge| edge_ends[*edge]);
+        let edge_order: Vec<usize> = (0..edge_ends.len()).collect();
 
         Self {
             starts,
@@ -447,7 +446,8 @@ pub(super) fn subdivide_simple_once(
 }
 
 /// One subdivision level's mesh from refined points, shared by SIMPLE and Catmull-Clark. `points` holds
-/// the refined vertices, then one point per edge in `edge_points` key order, then one per source face.
+/// the refined vertices, then one point per edge in `Position::edge_order` (Blender's edge order),
+/// then one per source face.
 /// Every source corner becomes one quad `[corner, next edge point, face point, previous edge point]`,
 /// faces in source order. Loose edges split at their edge point, and each output vertex records its
 /// source origin. `output_creases` maps output edge endpoints to Blender's canonical crease value.
