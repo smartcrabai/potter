@@ -11,7 +11,7 @@ use glam::{DMat4, DQuat, DVec3, EulerRot};
 use serde_json::{Map, Value, json};
 
 use crate::{
-    color::{ColorManagement, ViewTransform},
+    color::{ColorManagement, ViewTransform, curve::CurveMapping},
     error::{ErrorCode, PotError, Result},
     float::{equal_f64, equal_f64_array},
     geom::{
@@ -3620,34 +3620,13 @@ fn parse_color_management(value: Option<&Value>) -> Result<ColorManagement> {
             )));
         }
     };
-    let curve = value
-        .get("curve")
-        .map(|curve| {
-            curve
-                .as_array()
-                .ok_or_else(|| invalid_intermediate("color curve must be an array"))?
-                .iter()
-                .map(|pair| {
-                    let values = pair
-                        .as_array()
-                        .filter(|values| values.len() == 2)
-                        .ok_or_else(|| {
-                            invalid_intermediate("color curve point must have two values")
-                        })?;
-                    let x = values[0]
-                        .as_f64()
-                        .filter(|number| number.is_finite())
-                        .ok_or_else(|| invalid_intermediate("color curve input is invalid"))?;
-                    let y = values[1]
-                        .as_f64()
-                        .filter(|number| number.is_finite())
-                        .ok_or_else(|| invalid_intermediate("color curve output is invalid"))?;
-                    Ok([x, y])
-                })
-                .collect::<Result<Vec<_>>>()
-        })
-        .transpose()?
-        .unwrap_or_default();
+    let curve = match value.get("curve") {
+        None | Some(Value::Null) => None,
+        Some(curve) => Some(
+            CurveMapping::from_json(curve)
+                .map_err(|message| invalid_intermediate(&format!("color curve {message}")))?,
+        ),
+    };
     Ok(ColorManagement {
         display_device: value
             .get("display_device")
