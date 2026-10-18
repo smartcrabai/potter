@@ -86,6 +86,27 @@ pub(crate) fn remap_attributes_skipping(
     origin: &Origin,
     skipped: &[&str],
 ) -> Result<()> {
+    remap_attributes_skipping_with_corner_boolean_mixer(source, output, origin, skipped, false)
+}
+
+/// Boolean corner values use Blender's weighted `DefaultMixer<bool>`; ordinary topology group
+/// merges continue to use the unweighted boolean propagation mixer.
+pub(crate) fn remap_boolean_attributes_skipping(
+    source: &Mesh,
+    output: &mut Mesh,
+    origin: &Origin,
+    skipped: &[&str],
+) -> Result<()> {
+    remap_attributes_skipping_with_corner_boolean_mixer(source, output, origin, skipped, true)
+}
+
+fn remap_attributes_skipping_with_corner_boolean_mixer(
+    source: &Mesh,
+    output: &mut Mesh,
+    origin: &Origin,
+    skipped: &[&str],
+    weighted_corner_booleans: bool,
+) -> Result<()> {
     if origin.vertices.len() != output.vertices.len() || origin.faces.len() != output.faces.len() {
         return Err(PotError::new(
             ErrorCode::InternalError,
@@ -158,6 +179,7 @@ pub(crate) fn remap_attributes_skipping(
         origin,
         edge_origin: &edge_origin,
         corner_origin,
+        weighted_corner_booleans,
     };
     let color_store = has(color_layers::ATTRIBUTE).then(|| {
         let mut store = color_layers::read(source);
@@ -233,6 +255,7 @@ pub(crate) fn remap_attributes_skipping(
             }),
             "shade_smooth" => Some(sources.shade_smooth(value)),
             "sharp" => Some(sources.sharp(value)),
+            "seam" => Some(sources.seam(value)),
             "blender_polygon_smooth" => value
                 .as_array()
                 .map(|flags| Value::Array(sources.polygon_smooth(flags))),
@@ -702,6 +725,7 @@ struct Sources<'a> {
     origin: &'a Origin,
     edge_origin: &'a [Vec<(usize, f64)>],
     corner_origin: &'a [Vec<(usize, f64)>],
+    weighted_corner_booleans: bool,
 }
 
 impl Sources<'_> {
@@ -816,22 +840,31 @@ impl Sources<'_> {
         with_values(attribute, Value::Object(remapped))
     }
 
-    /// Canonical sharp flags OR-ed over every source edge of each output edge.
+    /// Canonical sharp flags OR-ed over source edges, as Blender's edge-merge path does.
     fn sharp(&self, attribute: &Value) -> Value {
+        self.edge_boolean_attribute(attribute, "sharp")
+    }
+
+    /// Native seam flags use the same edge-merge propagation as sharp flags.
+    fn seam(&self, attribute: &Value) -> Value {
+        self.edge_boolean_attribute(attribute, "seam")
+    }
+
+    fn edge_boolean_attribute(&self, attribute: &Value, name: &str) -> Value {
         if attribute.get("values").and_then(Value::as_object).is_none() {
             return attribute.clone();
         }
-        let source_flags = edge_flags(self.source, "sharp");
+        let source_flags = edge_flags(self.source, name);
         let remapped: Map<String, Value> = self
             .output
             .edges
             .iter()
             .zip(self.edge_origin)
             .map(|(edge, sources)| {
-                let sharp = sources.iter().any(|(index, weight)| {
+                let value = sources.iter().any(|(index, weight)| {
                     *weight > 0.0 && source_flags.get(*index) == Some(&true)
                 });
-                (format!("e{}", edge.id), json!(sharp))
+                (format!("e{}", edge.id), json!(value))
             })
             .collect();
         with_values(attribute, Value::Object(remapped))
@@ -965,7 +998,14 @@ impl Sources<'_> {
                         let sources = &self.corner_origin[offset..][..face.vertices.len()];
                         let blended: Vec<Option<Value>> = sources
                             .iter()
-                            .map(|sources| blend_sources(&stored, sources, data_type))
+                            .map(|sources| {
+                                blend_sources_with_boolean_mixer(
+                                    &stored,
+                                    sources,
+                                    data_type,
+                                    self.weighted_corner_booleans,
+                                )
+                            })
                             .collect();
                         if blended.iter().all(Option::is_none) {
                             return None;
@@ -1040,7 +1080,15 @@ impl Sources<'_> {
             "CORNER" => self
                 .corner_origin
                 .iter()
-                .map(|sources| blend_indexed(values, sources, data_type).unwrap_or_else(&default))
+                .map(|sources| {
+                    blend_indexed_with_boolean_mixer(
+                        values,
+                        sources,
+                        data_type,
+                        self.weighted_corner_booleans,
+                    )
+                    .unwrap_or_else(&default)
+                })
                 .collect(),
             _ => return entry.clone(),
         };
@@ -1235,7 +1283,7 @@ impl Sources<'_> {
                     let row: Vec<Option<Value>> = corners
                         .iter()
                         .map(|sources| {
-                            blend(
+                            blend_with_boolean_mixer(
                                 sources.iter().filter_map(|(source, weight)| {
                                     authored
                                         .get(*source)
@@ -1244,6 +1292,7 @@ impl Sources<'_> {
                                         .map(|value| (value, *weight))
                                 }),
                                 &kind,
+                                self.weighted_corner_booleans,
                             )
                         })
                         .collect();
@@ -1273,11 +1322,21 @@ fn heaviest_source(sources: &[(usize, f64)]) -> Option<usize> {
 
 /// [`blend`] over `values` at the `(index, weight)` sources; indices past the end are skipped.
 fn blend_indexed(values: &[Value], sources: &[(usize, f64)], data_type: &str) -> Option<Value> {
-    blend(
+    blend_indexed_with_boolean_mixer(values, sources, data_type, false)
+}
+
+fn blend_indexed_with_boolean_mixer(
+    values: &[Value],
+    sources: &[(usize, f64)],
+    data_type: &str,
+    weighted_booleans: bool,
+) -> Option<Value> {
+    blend_with_boolean_mixer(
         sources
             .iter()
             .filter_map(|(index, weight)| values.get(*index).map(|value| (value, *weight))),
         data_type,
+        weighted_booleans,
     )
 }
 
@@ -1356,11 +1415,19 @@ fn blend_color(items: &[(&Value, f64)], data_type: &str) -> Option<Value> {
         .map(|color| Value::Array(color.map(|channel| json!(channel)).into()))
 }
 
-/// Blend values by weight: colors use Blender's FLOAT_COLOR/BYTE_COLOR mixers; numbers and equal-length
-/// number arrays interpolate componentwise (rounded for integer types); booleans use
-/// `DefaultMixer<bool>`'s weighted threshold; anything else takes the value of the heaviest source.
+/// Blend values by source: numbers and equal-length number arrays interpolate componentwise (rounded for
+/// integer types), booleans propagate with an unweighted OR, and other values use the heaviest source.
+/// Boolean corner interpolation uses [`blend_with_boolean_mixer`] for Blender's weighted threshold.
 /// `None` when there are no sources.
 fn blend<'a>(items: impl Iterator<Item = (&'a Value, f64)>, data_type: &str) -> Option<Value> {
+    blend_with_boolean_mixer(items, data_type, false)
+}
+
+fn blend_with_boolean_mixer<'a>(
+    items: impl Iterator<Item = (&'a Value, f64)>,
+    data_type: &str,
+    weighted_booleans: bool,
+) -> Option<Value> {
     let items: Vec<(&Value, f64)> = items.collect();
     let first = items.first()?.0;
     if matches!(data_type, "FLOAT_COLOR" | "BYTE_COLOR")
@@ -1406,14 +1473,16 @@ fn blend<'a>(items: impl Iterator<Item = (&'a Value, f64)>, data_type: &str) -> 
         ));
     }
     if items.iter().all(|(value, _)| value.is_boolean()) {
+        if !weighted_booleans {
+            return Some(json!(items.iter().any(|(value, _)| {
+                value.as_bool() == Some(true)
+            })));
+        }
         let mut sum = 0.0_f32;
         let mut total = 0.0_f32;
         for (value, weight) in &items {
-            sum += (if value.as_bool() == Some(true) {
-                1.0
-            } else {
-                0.0
-            }) * (*weight as f32);
+            sum += (if value.as_bool() == Some(true) { 1.0 } else { 0.0 })
+                * (*weight as f32);
             total += *weight as f32;
         }
         return Some(json!(total > 0.0 && sum * (1.0 / total) >= 0.5));
@@ -1457,11 +1526,21 @@ fn blend_sources(
     sources: &[(usize, f64)],
     data_type: &str,
 ) -> Option<Value> {
-    blend(
+    blend_sources_with_boolean_mixer(stored, sources, data_type, false)
+}
+
+fn blend_sources_with_boolean_mixer(
+    stored: &[Option<&Value>],
+    sources: &[(usize, f64)],
+    data_type: &str,
+    weighted_booleans: bool,
+) -> Option<Value> {
+    blend_with_boolean_mixer(
         sources
             .iter()
             .filter_map(|(index, weight)| Some(((*stored.get(*index)?)?, *weight))),
         data_type,
+        weighted_booleans,
     )
 }
 
@@ -1632,44 +1711,69 @@ mod tests {
         }
     }
 
-    /// Two coincident source edges, one sharp and one seam, merge into one output edge whose
-    /// flags OR over both sources.
+    /// Weld merges three coincident edges/vertices. Group propagation is unweighted OR for seam,
+    /// sharp, and generic POINT/EDGE booleans, even when only one of three sources is true.
     #[test]
-    fn merged_edge_flags_or_over_coincident_source_edges() {
+    fn welded_boolean_group_attributes_keep_unweighted_or() {
         let mut source = Mesh::new();
-        let first = source.insert_vertex(DVec3::ZERO).expect("vertex");
-        let second = source.insert_vertex(DVec3::X).expect("vertex");
-        let third = source.insert_vertex(DVec3::ZERO).expect("vertex");
-        let fourth = source.insert_vertex(DVec3::X).expect("vertex");
-        source.insert_edge([first, second]).expect("edge");
-        source.insert_edge([third, fourth]).expect("edge");
-        let (sharp_edge, seam_edge) = (source.edges[0].id, source.edges[1].id);
+        let vertices = [
+            source.insert_vertex(DVec3::ZERO).expect("vertex"),
+            source.insert_vertex(DVec3::X).expect("vertex"),
+            source.insert_vertex(DVec3::ZERO).expect("vertex"),
+            source.insert_vertex(DVec3::X).expect("vertex"),
+            source.insert_vertex(DVec3::ZERO).expect("vertex"),
+            source.insert_vertex(DVec3::X).expect("vertex"),
+        ];
+        for pair in vertices.chunks_exact(2) {
+            source.insert_edge([pair[0], pair[1]]).expect("source edge");
+        }
+        let edge_ids: Vec<u32> = source.edges.iter().map(|edge| edge.id).collect();
+        let vertex_values = keyed(vec![
+            (format!("v{}", vertices[0]), json!(true)),
+            (format!("v{}", vertices[1]), json!(false)),
+            (format!("v{}", vertices[2]), json!(false)),
+            (format!("v{}", vertices[3]), json!(false)),
+            (format!("v{}", vertices[4]), json!(false)),
+            (format!("v{}", vertices[5]), json!(false)),
+        ]);
+        let edge_values = keyed(vec![
+            (format!("e{}", edge_ids[0]), json!(true)),
+            (format!("e{}", edge_ids[1]), json!(false)),
+            (format!("e{}", edge_ids[2]), json!(false)),
+        ]);
+        for name in ["sharp", "seam", "edge_mask"] {
+            source.attributes.insert(
+                name.to_owned(),
+                json!({"domain":"edge", "type":"bool", "values":edge_values.clone()}),
+            );
+        }
         source.attributes.insert(
-            "sharp".to_owned(),
-            json!({"domain": "edge", "type": "bool", "values": keyed(vec![
-                (format!("e{sharp_edge}"), json!(true)),
-                (format!("e{seam_edge}"), json!(false)),
-            ])}),
-        );
-        source.attributes.insert(
-            "seam".to_owned(),
-            json!({"domain": "edge", "type": "bool", "values": keyed(vec![
-                (format!("e{sharp_edge}"), json!(false)),
-                (format!("e{seam_edge}"), json!(true)),
-            ])}),
+            "point_mask".to_owned(),
+            json!({"domain":"point", "type":"bool", "values":vertex_values}),
         );
         let mut output = Mesh::new();
         let near = output.insert_vertex(DVec3::ZERO).expect("vertex");
         let far = output.insert_vertex(DVec3::X).expect("vertex");
-        output.insert_edge([near, far]).expect("edge");
+        output.insert_edge([near, far]).expect("output edge");
         let origin = Origin {
-            vertices: vec![vec![(0, 0.5), (2, 0.5)], vec![(1, 0.5), (3, 0.5)]],
+            vertices: vec![
+                vec![(0, 1.0 / 3.0), (2, 1.0 / 3.0), (4, 1.0 / 3.0)],
+                vec![(1, 1.0 / 3.0), (3, 1.0 / 3.0), (5, 1.0 / 3.0)],
+            ],
             faces: Vec::new(),
             corners: None,
         };
-        remap_attributes(&source, &mut output, &origin).expect("remap");
+        remap_attributes(&source, &mut output, &origin).expect("Weld attribute remap");
         assert_eq!(edge_flags(&output, "sharp"), vec![true]);
         assert_eq!(edge_flags(&output, "seam"), vec![true]);
+        assert_eq!(
+            output.attributes["edge_mask"]["values"][format!("e{}", output.edges[0].id)],
+            json!(true)
+        );
+        assert_eq!(
+            output.attributes["point_mask"]["values"][format!("v{}", output.vertices[0].id)],
+            json!(true)
+        );
     }
 
     /// Native element attributes follow their origins: a point color blends the two sources of a merged
@@ -1954,20 +2058,86 @@ mod tests {
     }
 
     #[test]
-    fn generic_boolean_uses_blenders_weighted_mixer_threshold() {
+    fn group_boolean_mixer_ors_while_weighted_corner_mixer_uses_threshold() {
         let on = json!(true);
         let off = json!(false);
         assert_eq!(
-            blend([(&on, 0.49), (&off, 0.51)].into_iter(), "BOOLEAN"),
-            Some(json!(false))
-        );
-        assert_eq!(
-            blend([(&on, 0.5), (&off, 0.5)].into_iter(), "BOOLEAN"),
+            blend([(&on, 1.0 / 3.0), (&off, 2.0 / 3.0)].into_iter(), "BOOLEAN"),
             Some(json!(true))
         );
         assert_eq!(
-            blend([(&off, 0.51), (&on, 0.49)].into_iter(), "BOOLEAN"),
+            blend_with_boolean_mixer(
+                [(&on, 0.49), (&off, 0.51)].into_iter(),
+                "BOOLEAN",
+                true,
+            ),
             Some(json!(false))
+        );
+        assert_eq!(
+            blend_with_boolean_mixer(
+                [(&on, 0.5), (&off, 0.5)].into_iter(),
+                "BOOLEAN",
+                true,
+            ),
+            Some(json!(true))
+        );
+    }
+
+    #[test]
+    fn boolean_corner_boolean_uses_weighted_mixer_without_changing_group_merge_or() {
+        let mut source = triangle();
+        let face = source.faces[0].id;
+        source.attributes.insert(
+            "corner_mask".to_owned(),
+            json!({"domain":"corner", "type":"bool", "values":keyed(vec![(
+                format!("f{face}"), json!([true, false, false]),
+            )])}),
+        );
+        source.attributes.insert(
+            "blender_attributes".to_owned(),
+            json!([{"name":"corner mask", "domain":"CORNER", "data_type":"BOOLEAN", "values":[true, false, false]}]),
+        );
+        source.attributes.insert(
+            "named_corner_mask".to_owned(),
+            json!({"domain":"CORNER", "type":"bool", "values":keyed(vec![(
+                format!("f{face}"), json!([true, false, false]),
+            )])}),
+        );
+        let origin = Origin {
+            vertices: vec![vec![(0, 1.0)], vec![(1, 1.0)], vec![(2, 1.0)]],
+            faces: vec![Some(0)],
+            corners: Some(vec![vec![(0, 0.49), (1, 0.51)], vec![(1, 1.0)], vec![(2, 1.0)]]),
+        };
+        let face_key = format!("f{face}");
+        let mut boolean_output = triangle();
+        remap_boolean_attributes_skipping(&source, &mut boolean_output, &origin, &[])
+            .expect("Boolean attribute remap");
+        assert_eq!(
+            boolean_output.attributes["corner_mask"]["values"][face_key.as_str()][0],
+            json!(false)
+        );
+        assert_eq!(
+            boolean_output.attributes["blender_attributes"][0]["values"][0],
+            json!(false)
+        );
+        assert_eq!(
+            boolean_output.attributes["named_corner_mask"]["values"][face_key.as_str()][0],
+            json!(false)
+        );
+
+        let mut group_output = triangle();
+        remap_attributes(&source, &mut group_output, &origin).expect("group attribute remap");
+        assert_eq!(
+            group_output.attributes["corner_mask"]["values"][face_key.as_str()][0],
+            json!(true)
+        );
+        assert_eq!(
+            group_output.attributes["blender_attributes"][0]["values"][0],
+            json!(true)
+        );
+        assert_eq!(
+            group_output.attributes["named_corner_mask"]["values"][face_key.as_str()][0],
+            json!(true)
         );
     }
 
