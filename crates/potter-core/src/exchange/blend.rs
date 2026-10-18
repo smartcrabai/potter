@@ -28,11 +28,11 @@ use crate::{
         GreasePencilFrame, GreasePencilLayer, GreasePencilPoint, GreasePencilStroke, Id, Image,
         ImageAlphaMode, ImageColorspace, ImageSource, Interpolation, Keyframe, Library,
         LibraryKind, LibraryOverride, LibraryOverrideProperty, LibraryStatus, LightData, LightType,
-        Material, MaterialLink, Modifier, MovieClip, MovieTracking, NlaBlendType, NlaExtrapolation,
-        NlaStrip, NlaTrack, Node, ParentType, Profile, Registry, RenderSettings, RigidBody,
-        RigidBodyShape, RigidBodyType, RigidBodyWorld, Scene, SceneDoc, ShapeKey, ShapeKeyData,
-        SurfaceData, SurfacePoint, TextObjectData, TimelineMarker, Transform, UnitSettings,
-        VertexGroup, ViewLayer, World,
+        Material, MaterialLink, Modifier, ModifierParameterBinding, MovieClip, MovieTracking,
+        NlaBlendType, NlaExtrapolation, NlaStrip, NlaTrack, Node, ParentType, Profile, Registry,
+        RenderSettings, RigidBody, RigidBodyShape, RigidBodyType, RigidBodyWorld, Scene, SceneDoc,
+        ShapeKey, ShapeKeyData, SurfaceData, SurfacePoint, TextObjectData, TimelineMarker,
+        Transform, UnitSettings, VertexGroup, ViewLayer, World,
     },
     sequencer::{
         EffectType as SequenceEffectType, RetimingKey, Strip as SequenceStrip, StripBlendType,
@@ -2100,6 +2100,7 @@ fn build_imported_graph(
     let mut action_ids = BTreeMap::new();
     let mut action_by_name = BTreeMap::new();
     let mut raw_action_slots = BTreeMap::<String, Vec<Value>>::new();
+    let mut action_slot_ids = BTreeMap::<(String, String), Id>::new();
     for item in actions {
         let name = string_field(item, "name")?;
         raw_action_slots.insert(name.to_owned(), optional_array(item, "slots")?.to_vec());
@@ -2125,6 +2126,8 @@ fn build_imported_graph(
                 name: name.to_owned(),
                 fcurves,
                 slots: Vec::new(),
+                active_slots: BTreeMap::new(),
+                modifier_bindings: BTreeMap::new(),
             },
         );
         action_by_name.insert(name.to_owned(), id);
@@ -2174,21 +2177,43 @@ fn build_imported_graph(
                     .and_then(Value::as_str)
                     .or_else(|| source.get("identifier").and_then(Value::as_str))
                     .unwrap_or("Action Slot");
+                let slot_identifier = source.get("identifier").and_then(Value::as_str);
+                let source_slot_name = source.get("name").and_then(Value::as_str);
+                let slot_matches = |reference: &Value| {
+                    slot_identifier.is_some_and(|identifier| {
+                        reference.get("identifier").and_then(Value::as_str) == Some(identifier)
+                    }) || source_slot_name.is_some_and(|slot_name| {
+                        reference.get("name").and_then(Value::as_str) == Some(slot_name)
+                    })
+                };
                 let node_name = source
                     .get("node")
                     .and_then(Value::as_str)
                     .or_else(|| {
                         objects.iter().find_map(|object| {
-                            let same_action =
+                            let active_action_matches =
                                 object.get("action").and_then(Value::as_str) == Some(action_name);
-                            let reference = object.get("action_slot");
-                            let same_slot = reference.is_some_and(|reference| {
-                                reference.get("identifier").and_then(Value::as_str)
-                                    == source.get("identifier").and_then(Value::as_str)
-                                    || reference.get("name").and_then(Value::as_str)
-                                        == source.get("name").and_then(Value::as_str)
-                            });
-                            (same_action && same_slot)
+                            let active_slot_matches =
+                                object.get("action_slot").is_some_and(slot_matches);
+                            let nla_slot_matches = object
+                                .get("nla_tracks")
+                                .and_then(Value::as_array)
+                                .is_some_and(|tracks| {
+                                    tracks.iter().any(|track| {
+                                        track.get("strips").and_then(Value::as_array).is_some_and(
+                                            |strips| {
+                                                strips.iter().any(|strip| {
+                                                    strip.get("action").and_then(Value::as_str)
+                                                        == Some(action_name)
+                                                        && strip
+                                                            .get("action_slot")
+                                                            .is_some_and(slot_matches)
+                                                })
+                                            },
+                                        )
+                                    })
+                                });
+                            ((active_action_matches && active_slot_matches) || nla_slot_matches)
                                 .then(|| object.get("name").and_then(Value::as_str))
                                 .flatten()
                         })
@@ -2231,14 +2256,37 @@ fn build_imported_graph(
                     &mut mappings,
                     &format!("ActionSlot:{action_id}"),
                 )?;
+                if let Some(identifier) = slot_identifier {
+                    action_slot_ids.insert(
+                        (action_name.clone(), identifier.to_owned()),
+                        slot_id.clone(),
+                    );
+                }
+                if let Some(name) = source.get("name").and_then(Value::as_str) {
+                    action_slot_ids.insert((action_name.clone(), name.to_owned()), slot_id.clone());
+                }
                 slots.push(ActionSlot {
                     id: slot_id,
                     node: node.clone(),
+                    blender_identifier: slot_identifier.map(str::to_owned),
                 });
             }
         }
+        let active_slots: BTreeMap<Id, Id> = objects
+            .iter()
+            .filter(|object| object.get("action").and_then(Value::as_str) == Some(action_name))
+            .filter_map(|object| {
+                let node_id = object_ids.get(object.get("name").and_then(Value::as_str)?)?;
+                // A slot the importer did not create (no bound Object) gets no active entry.
+                let slot_id =
+                    action_slot_id(action_name, object.get("action_slot"), &action_slot_ids)
+                        .ok()??;
+                Some((node_id.clone(), slot_id))
+            })
+            .collect();
         if let Some(action) = doc.actions.get_mut(action_id) {
             action.slots = slots;
+            action.active_slots = active_slots;
         }
     }
     let mut modifier_ids_by_object = BTreeMap::<String, Vec<String>>::new();
@@ -2502,6 +2550,7 @@ fn build_imported_graph(
                     binding_data: native_bindings
                         .get(&(name.to_owned(), blender_name.to_owned()))
                         .cloned(),
+                    baked_ocean_cache: None,
                     runtime: crate::model::ModifierRuntime::default(),
                 })
             })
@@ -2619,7 +2668,8 @@ fn build_imported_graph(
             }
         }
         let drivers = parse_drivers(item, &id, &object_ids, &mut mappings)?;
-        let nla_tracks = parse_nla_tracks(item, &id, &action_by_name, &mut mappings)?;
+        let nla_tracks =
+            parse_nla_tracks(item, &id, &action_by_name, &action_slot_ids, &mut mappings)?;
         let rigid_body = item
             .get("rigid_body")
             .filter(|value| !value.is_null())
@@ -2768,6 +2818,69 @@ fn build_imported_graph(
                     }
                 }
             }
+        }
+    }
+    for action_item in actions {
+        let action_name = string_field(action_item, "name")?;
+        let action_id = action_by_name.get(action_name).ok_or_else(|| {
+            invalid_intermediate("modifier animation references an unknown action")
+        })?;
+        for (curve_position, curve_item) in
+            optional_array(action_item, "fcurves")?.iter().enumerate()
+        {
+            let raw_bindings = optional_array(curve_item, "modifier_bindings")?;
+            if raw_bindings.is_empty() {
+                continue;
+            }
+            let curve_index = u32::try_from(curve_position).map_err(|_| {
+                PotError::new(
+                    ErrorCode::LimitExceeded,
+                    "Blender Action has too many F-Curves",
+                )
+            })?;
+            let mut bindings = Vec::with_capacity(raw_bindings.len());
+            for raw_binding in raw_bindings {
+                let node_name = string_field(raw_binding, "node")?;
+                let modifier_name = string_field(raw_binding, "modifier")?;
+                let parameter = string_field(raw_binding, "parameter")?;
+                let node_id = object_ids.get(node_name).ok_or_else(|| {
+                    invalid_intermediate("modifier animation binding references an unknown Object")
+                })?;
+                let modifier = doc
+                    .nodes
+                    .get(node_id)
+                    .and_then(|node| {
+                        node.modifiers
+                            .iter()
+                            .find(|modifier| modifier.name == modifier_name)
+                    })
+                    .ok_or_else(|| {
+                        invalid_intermediate(
+                            "modifier animation binding references an unknown Modifier",
+                        )
+                    })?;
+                if modifier.modifier_type != "ocean" || parameter != "time" {
+                    return Err(PotError::with_details(
+                        ErrorCode::UnsupportedFeature,
+                        "modifier animation binding is not an Ocean time parameter",
+                        json!({"action": action_name, "node": node_id, "modifier": modifier.id, "parameter": parameter}),
+                    ));
+                }
+                bindings.push(ModifierParameterBinding {
+                    node: node_id.clone(),
+                    modifier: modifier.id.clone(),
+                    parameter: parameter.to_owned(),
+                    action_slot: action_slot_id(
+                        action_name,
+                        raw_binding.get("action_slot"),
+                        &action_slot_ids,
+                    )?,
+                });
+            }
+            let action = doc.actions.get_mut(action_id).ok_or_else(|| {
+                invalid_intermediate("modifier animation Action disappeared during import")
+            })?;
+            action.modifier_bindings.insert(curve_index, bindings);
         }
     }
     for item in collections {
@@ -6416,10 +6529,35 @@ fn parse_drivers(
         .collect()
 }
 
+/// Resolves a Blender Action slot reference (an identifier, or an object with `identifier` or
+/// `name`) to the stable ID of the slot it names. `None` means the curve or strip has no slot.
+fn action_slot_id(
+    action_name: &str,
+    reference: Option<&Value>,
+    action_slot_ids: &BTreeMap<(String, String), Id>,
+) -> Result<Option<Id>> {
+    let identifier = match reference {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::String(identifier)) => identifier.as_str(),
+        Some(Value::Object(slot)) => slot
+            .get("identifier")
+            .and_then(Value::as_str)
+            .or_else(|| slot.get("name").and_then(Value::as_str))
+            .ok_or_else(|| invalid_intermediate("Action slot reference has no identifier"))?,
+        Some(_) => return Err(invalid_intermediate("Action slot reference is invalid")),
+    };
+    action_slot_ids
+        .get(&(action_name.to_owned(), identifier.to_owned()))
+        .cloned()
+        .map(Some)
+        .ok_or_else(|| invalid_intermediate("Action slot reference is unknown"))
+}
+
 fn parse_nla_tracks(
     value: &Value,
     owner: &Id,
     action_by_name: &BTreeMap<String, Id>,
+    action_slot_ids: &BTreeMap<(String, String), Id>,
     mappings: &mut BTreeMap<String, String>,
 ) -> Result<Vec<NlaTrack>> {
     let mut track_ids = BTreeMap::new();
@@ -6463,6 +6601,8 @@ fn parse_nla_tracks(
                     let action = action_by_name.get(action_name).cloned().ok_or_else(|| {
                         invalid_intermediate("NLA strip references an unknown action")
                     })?;
+                    let action_slot =
+                        action_slot_id(action_name, strip.get("action_slot"), action_slot_ids)?;
                     let properties = strip.get("properties").unwrap_or(&Value::Null);
                     let blend_type = match properties
                         .get("blend_type")
@@ -6485,6 +6625,7 @@ fn parse_nla_tracks(
                     Ok(NlaStrip {
                         id: strip_id,
                         action,
+                        action_slot,
                         frame_start: number_field(properties, "frame_start", 1.0),
                         frame_end: number_field(properties, "frame_end", 1.0),
                         action_frame_start: number_field(properties, "action_frame_start", 1.0),
@@ -6752,7 +6893,7 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
             losses.push(loss(
                 "blender.animation.action_slot",
                 action_name,
-                "action slots are flattened into a single F-Curve list",
+                "non-modifier F-Curve slot ownership is flattened; supported Ocean.time bindings retain their Action slot",
             ));
         }
         for curve in action
@@ -6761,6 +6902,22 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
             .into_iter()
             .flatten()
         {
+            let path = curve
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if path.starts_with("modifiers[")
+                && !curve
+                    .get("modifier_bindings")
+                    .and_then(Value::as_array)
+                    .is_some_and(|bindings| !bindings.is_empty())
+            {
+                losses.push(loss(
+                    "blender.animation.modifier_parameter",
+                    action_name,
+                    "modifier F-Curve is preserved in compatibility data but lacks a supported stable-ID parameter binding; only Ocean.time is evaluated",
+                ));
+            }
             if curve
                 .get("modifiers")
                 .and_then(Value::as_array)
@@ -9181,6 +9338,8 @@ mod tests {
                     extrapolation: Extrapolation::Constant,
                 }],
                 slots: Vec::new(),
+                active_slots: BTreeMap::new(),
+                modifier_bindings: BTreeMap::new(),
             },
         );
         doc.nodes.insert(
@@ -13336,6 +13495,8 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
                     extrapolation: Extrapolation::Constant,
                 }],
                 slots: Vec::new(),
+                active_slots: BTreeMap::new(),
+                modifier_bindings: BTreeMap::new(),
             },
         );
         doc.materials.insert(

@@ -38,12 +38,12 @@ pub use scene::{
     HairCurvesData, HistoryState, Image, ImageAlphaMode, ImageColorspace, ImageSource, ImageTile,
     Interpolation, Keyframe, Library, LibraryKind, LibraryOverride, LibraryOverrideProperty,
     LibraryStatus, LightData, LightType, MAX_REVISION, Material, MaterialLink, Modifier,
-    ModifierRuntime, MovieClip, MovieTracking, NlaBlendType, NlaExtrapolation, NlaStrip, NlaTrack,
-    Node, PlaneHomography, PlaneTrack, PrimitiveDescriptor, Profile, ReconstructedPoint,
-    Reconstruction, RenderSettings, RigidBody, RigidBodyShape, RigidBodyType, RigidBodyWorld,
-    Scene, SceneDoc, SolvedCamera, SurfaceData, SurfacePoint, TextObjectData, TextureRef,
-    TimelineMarker, TrackingMarker, TrackingObject, TrackingObjectPose, TrackingTrack,
-    UnitSettings, ViewLayer, World,
+    ModifierParameterBinding, ModifierRuntime, MovieClip, MovieTracking, NlaBlendType,
+    NlaExtrapolation, NlaStrip, NlaTrack, Node, OceanBakeCache, PlaneHomography, PlaneTrack,
+    PrimitiveDescriptor, Profile, ReconstructedPoint, Reconstruction, RenderSettings, RigidBody,
+    RigidBodyShape, RigidBodyType, RigidBodyWorld, Scene, SceneDoc, SolvedCamera, SurfaceData,
+    SurfacePoint, TextObjectData, TextureRef, TimelineMarker, TrackingMarker, TrackingObject,
+    TrackingObjectPose, TrackingTrack, UnitSettings, ViewLayer, World,
 };
 pub(crate) use scene::{material_link_at, material_slot_count, resolve_material_slot};
 pub use transform::{Transform, canonicalize_quaternion, normalize_rotation};

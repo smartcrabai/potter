@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::{
     error::{ErrorCode, PotError, Result},
     eval::EvaluationPurpose,
-    geom::modifiers::evaluate_modifiers_with_groups_at_frame,
+    geom::modifiers::evaluate_modifiers_with_groups_and_parameter_evaluator_at_frame,
     model::{DataBlock, Id, Modifier, SceneDoc, ShapeKey, ShapeKeyData},
     params::{self, ParameterFamily},
 };
@@ -390,6 +390,7 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                 show_viewport,
                 show_render,
                 params: modifier_params,
+                baked_ocean_cache: None,
                 binding_data: None,
                 runtime: crate::model::ModifierRuntime::default(),
             },
@@ -512,6 +513,11 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
         } else {
             None
         };
+        let clear_ocean_cache = existing.modifier_type == "ocean"
+            && (modifier_type != "ocean"
+                || modifier_params
+                    .as_ref()
+                    .is_some_and(|params| ocean_cache_invalidated(&existing.params, params)));
         let node = engine.doc.nodes.get_mut(&target).ok_or_else(|| {
             PotError::new(
                 ErrorCode::TargetNotFound,
@@ -529,6 +535,9 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                 )
             })?;
         let before = modifier.clone();
+        if clear_ocean_cache {
+            modifier.baked_ocean_cache = None;
+        }
         if let Some(value) = set.get("name") {
             value
                 .as_str()
@@ -587,6 +596,61 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
         }
     }
     Ok(changed)
+}
+
+fn ocean_cache_invalidated(previous: &Map<String, Value>, next: &Map<String, Value>) -> bool {
+    // Blender 5.2.2 marks exactly these Ocean properties with `rna_OceanModifier_init_update`.
+    const INIT_UPDATE_FIELDS: &[&str] = &[
+        "use_normals",
+        "use_foam",
+        "use_spray",
+        "invert_spray",
+        "spray_layer_name",
+        "resolution",
+        "viewport_resolution",
+        "spatial_size",
+        "wind_velocity",
+        "damping",
+        "wave_scale_min",
+        "wave_alignment",
+        "wave_direction",
+        "depth",
+        "spectrum",
+        "fetch_jonswap",
+        "sharpen_peak_jonswap",
+        "random_seed",
+        "frame_start",
+        "frame_end",
+    ];
+    if INIT_UPDATE_FIELDS.iter().any(|field| {
+        let default = params::default_value(ParameterFamily::Modifier, "ocean", field);
+        let old_value = previous.get(*field).or(default);
+        let new_value = next.get(*field).or(default);
+        match (
+            old_value.and_then(Value::as_f64),
+            new_value.and_then(Value::as_f64),
+        ) {
+            (Some(old), Some(new)) => old != new,
+            _ => old_value != new_value,
+        }
+    }) {
+        return true;
+    }
+
+    let default_choppiness =
+        params::default_value(ParameterFamily::Modifier, "ocean", "choppiness")
+            .and_then(Value::as_f64)
+            .unwrap_or(1.0);
+    let old_choppiness = previous
+        .get("choppiness")
+        .and_then(Value::as_f64)
+        .unwrap_or(default_choppiness);
+    let new_choppiness = next
+        .get("choppiness")
+        .and_then(Value::as_f64)
+        .unwrap_or(default_choppiness);
+    (old_choppiness == 0.0 && new_choppiness > 0.0)
+        || (old_choppiness > 0.0 && new_choppiness == 0.0)
 }
 
 fn delete(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bool> {
@@ -1165,13 +1229,38 @@ fn evaluate_modifier_output(
                 json!({"feature_id":"modifier.apply.shape_key_guard","modifier_id":modifier_id}),
             ));
         }
+        // Ocean's animated `time` is sampled from the subject object's F-Curves at this frame.
+        let animated_parameter = |modifier: &Modifier, parameter: &str, base: f64| {
+            let node = engine.doc.nodes.get(target).ok_or_else(|| {
+                PotError::with_details(
+                    ErrorCode::TargetNotFound,
+                    "modifier subject Object was not found",
+                    json!({"target":target}),
+                )
+            })?;
+            crate::eval::animation::animated_modifier_scalar(
+                target,
+                node,
+                engine.doc,
+                &modifier.id,
+                parameter,
+                base,
+                engine.evaluation_frame,
+            )
+        };
         if !uses_armature && !uses_lattice && !uses_volume_node && !uses_scene_context {
             let source = prepared_output.as_ref().unwrap_or(output);
-            let evaluation = evaluate_modifiers_with_groups_at_frame(
+            let evaluation = evaluate_modifiers_with_groups_and_parameter_evaluator_at_frame(
                 source,
                 modifier_stack,
                 &engine.doc.node_groups,
                 engine.evaluation_frame,
+                crate::eval::ModifierEvaluationContext {
+                    purpose: crate::eval::EvaluationPurpose::Preview,
+                    project_root: engine.asset_root,
+                    cache_directory: engine.cache_directory,
+                },
+                animated_parameter,
             )?;
             engine.warnings.extend(
                 evaluation
@@ -1369,6 +1458,7 @@ fn evaluate_modifier_output(
                         "custom modifier callback received an unexpected type",
                     )),
                 },
+                animated_parameter,
             )?;
             let (dropped, blocking): (Vec<PotError>, Vec<PotError>) = evaluation
                 .warnings

@@ -304,6 +304,7 @@ fn modifiers(stack: &Value, objects: &Map<String, Value>) -> TestResult<Vec<Modi
                 show_render: true,
                 params,
                 binding_data: None,
+                baked_ocean_cache: None,
                 runtime: ModifierRuntime::default(),
             })
         })

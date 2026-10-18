@@ -36,7 +36,7 @@ fn mesh_to_volume_default(parameter: &str) -> Result<&'static Value> {
 pub mod animation;
 mod ik_solver;
 pub mod rig;
-const EVALUATION_ENGINE: &str = "potter-eval-4";
+const EVALUATION_ENGINE: &str = "potter-eval-5";
 
 /// Which stack an evaluation serves, following Blender's depsgraph modes: viewport previews use
 /// `show_viewport`, and saved renders use `show_render`. Each export format chooses its purpose
@@ -958,6 +958,17 @@ impl Snapshot {
                                 "unexpected custom modifier callback",
                             )),
                         },
+                        |modifier, parameter, base| {
+                            crate::eval::animation::animated_modifier_scalar(
+                                id,
+                                node,
+                                doc,
+                                &modifier.id,
+                                parameter,
+                                base,
+                                frame,
+                            )
+                        },
                     )
                     .map_err(|error| attach_node_owner(error, id))?;
                     modifier_warnings.extend(
@@ -1240,6 +1251,17 @@ impl Snapshot {
                                 ErrorCode::InternalError,
                                 "unexpected custom modifier callback",
                             )),
+                        },
+                        |modifier, parameter, base| {
+                            crate::eval::animation::animated_modifier_scalar(
+                                id,
+                                node,
+                                doc,
+                                &modifier.id,
+                                parameter,
+                                base,
+                                frame,
+                            )
                         },
                     )
                     .map_err(|error| attach_node_owner(error, id))?;

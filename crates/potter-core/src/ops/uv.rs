@@ -2907,6 +2907,7 @@ mod tests {
                 show_render: true,
                 params: serde_json::Map::from_iter([("uv_layer".to_owned(), json!("Mid"))]),
                 binding_data: None,
+                baked_ocean_cache: None,
                 runtime: crate::model::ModifierRuntime::default(),
             });
         run_uv(

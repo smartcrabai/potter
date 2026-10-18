@@ -402,6 +402,17 @@ fn encoding_error(code: ErrorCode, format: &str, variant: &str, message: &str) -
 }
 
 fn decode_exr(bytes: &[u8]) -> Result<(u32, u32, Vec<[f64; 4]>)> {
+    decode_exr_with_finite_validation(bytes, true)
+}
+
+pub(crate) fn decode_ocean_cache_exr(bytes: &[u8]) -> Result<(u32, u32, Vec<[f64; 4]>)> {
+    decode_exr_with_finite_validation(bytes, false)
+}
+
+fn decode_exr_with_finite_validation(
+    bytes: &[u8],
+    validate_finite: bool,
+) -> Result<(u32, u32, Vec<[f64; 4]>)> {
     use exr::image::{AnyChannels, FlatSamples, Layer};
     use exr::prelude::ReadChannels;
     use exr::prelude::ReadLayers;
@@ -548,7 +559,9 @@ fn decode_exr(bytes: &[u8]) -> Result<(u32, u32, Vec<[f64; 4]>)> {
         }
         pixels.push(pixel);
     }
-    validate_pixels(width, height, &pixels)?;
+    if validate_finite {
+        validate_pixels(width, height, &pixels)?;
+    }
     Ok((width, height, pixels))
 }
 

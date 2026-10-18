@@ -2366,6 +2366,7 @@ mod tests {
             show_render: true,
             params: Map::new(),
             binding_data: Some(binding_data),
+            baked_ocean_cache: None,
             runtime: ModifierRuntime::default(),
         })
     }

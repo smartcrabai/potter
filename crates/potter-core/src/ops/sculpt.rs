@@ -435,6 +435,7 @@ fn apply_multires(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Re
                     ("render_levels".to_owned(), json!(render_levels)),
                 ]),
                 binding_data: None,
+                baked_ocean_cache: None,
                 runtime: crate::model::ModifierRuntime::default(),
             },
         );

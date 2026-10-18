@@ -15,6 +15,7 @@ const TRACK_SET_FIELDS: &[&str] = &["name", "mute", "solo"];
 const STRIP_FIELDS: &[&str] = &[
     "id",
     "action",
+    "action_slot",
     "frame_start",
     "frame_end",
     "action_frame_start",
@@ -209,6 +210,7 @@ fn create_strip(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resu
             "track",
             "id",
             "action",
+            "action_slot",
             "frame_start",
             "frame_end",
             "action_frame_start",
@@ -243,6 +245,16 @@ fn create_strip(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resu
     let track_index = track_index(engine, &node_id, &track_id)?;
     let action_id = read_id(engine, operation, "action")?;
     require_action(engine, &action_id, "action")?;
+    let requested_slot = if operation
+        .get("action_slot")
+        .is_some_and(|value| !value.is_null())
+    {
+        Some(read_id(engine, operation, "action_slot")?)
+    } else {
+        None
+    };
+    let action_slot =
+        action_slot_for_node(engine, &action_id, &node_id, requested_slot, "action_slot")?;
     let id = match operation.get("id") {
         Some(_) => read_id(engine, operation, "id")?,
         None => unique_local_id(&format!("{track_id}_strip"), |candidate| {
@@ -270,6 +282,7 @@ fn create_strip(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resu
     let mut strip = NlaStrip {
         id,
         action: action_id,
+        action_slot,
         frame_start: number_value(
             engine,
             required_value(engine, operation, "frame_start")?,
@@ -467,9 +480,11 @@ fn push_down(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<
                 .any(|track| track.strips.iter().any(|strip| &strip.id == candidate))
         })
     })?;
+    let action_slot = action_slot_for_node(engine, &action_id, &node_id, None, "target")?;
     let strip = NlaStrip {
         id: strip_id,
         action: action_id,
+        action_slot,
         frame_start: start,
         frame_end: end,
         action_frame_start: start,
@@ -536,9 +551,11 @@ fn create_action_slot(engine: &mut Engine<'_>, operation: &Map<String, Value>) -
         crate::error::PotError::new(ErrorCode::InternalError, "action disappeared")
     })?;
     action.slots.push(ActionSlot {
-        id: slot_id,
-        node: node_id,
+        id: slot_id.clone(),
+        node: node_id.clone(),
+        blender_identifier: None,
     });
+    action.active_slots.insert(node_id, slot_id);
     engine.mark("actions", &action_id, ChangeKind::Updated);
     Ok(true)
 }
@@ -731,6 +748,51 @@ fn require_action(engine: &Engine<'_>, action_id: &Id, field: &str) -> Result<()
     Ok(())
 }
 
+fn action_slot_for_node(
+    engine: &Engine<'_>,
+    action_id: &Id,
+    node_id: &Id,
+    requested: Option<Id>,
+    field: &str,
+) -> Result<Option<Id>> {
+    let action = engine.doc.actions.get(action_id).ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::TargetNotFound,
+            "NLA strip Action was not found",
+            json!({"action":action_id}),
+        )
+    })?;
+    if let Some(slot_id) = requested {
+        if action.slots.iter().any(|slot| slot.id == slot_id) {
+            return Ok(Some(slot_id));
+        }
+        return Err(engine.error(
+            ErrorCode::TargetNotFound,
+            format!("Action slot `{slot_id}` was not found on action `{action_id}`"),
+            &operation_pointer(engine.operation_index, field),
+        ));
+    }
+    if let Some(slot_id) = action.active_slots.get(node_id) {
+        if action.slots.iter().any(|slot| &slot.id == slot_id) {
+            return Ok(Some(slot_id.clone()));
+        }
+        return Err(PotError::with_details(
+            ErrorCode::SceneInvalid,
+            "Action active-slot assignment references a missing slot",
+            json!({"action":action_id,"node":node_id,"action_slot":slot_id}),
+        ));
+    }
+    match action.slots.as_slice() {
+        [] => Ok(None),
+        [slot] => Ok(Some(slot.id.clone())),
+        _ => Err(engine.error(
+            ErrorCode::InvalidOperation,
+            "action_slot is required when the Action has multiple slots and no Node slot assignment",
+            &operation_pointer(engine.operation_index, field),
+        )),
+    }
+}
+
 fn set_object<'a>(
     engine: &Engine<'_>,
     operation: &'a Map<String, Value>,
@@ -841,6 +903,19 @@ fn apply_strip_values(
         )?;
         require_action(engine, &strip.action, &name)?;
     }
+    if let Some(value) = values.get("action_slot") {
+        let name = field("action_slot");
+        strip.action_slot = if value.is_null() {
+            None
+        } else {
+            let text = string_value(engine, value, &name)?;
+            Some(parse_id(
+                engine,
+                &text,
+                &operation_pointer(engine.operation_index, &name),
+            )?)
+        };
+    }
     for name in [
         "frame_start",
         "frame_end",
@@ -904,6 +979,22 @@ fn apply_strip_values(
 
 fn validate_strip(engine: &Engine<'_>, strip: &NlaStrip, prefix: &str) -> Result<()> {
     require_action(engine, &strip.action, &format!("{prefix}action"))?;
+    if let Some(slot_id) = &strip.action_slot
+        && !engine
+            .doc
+            .actions
+            .get(&strip.action)
+            .is_some_and(|action| action.slots.iter().any(|slot| &slot.id == slot_id))
+    {
+        return Err(engine.error(
+            ErrorCode::TargetNotFound,
+            format!(
+                "Action slot `{slot_id}` was not found on action `{}`",
+                strip.action
+            ),
+            &operation_pointer(engine.operation_index, &format!("{prefix}action_slot")),
+        ));
+    }
     let duration = strip.frame_end - strip.frame_start;
     let action_duration = strip.action_frame_end - strip.action_frame_start;
     if !duration.is_finite() || duration <= 0.0 {

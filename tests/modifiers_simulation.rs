@@ -1743,6 +1743,7 @@ with open(os.path.join(root, 'subdivision_expected.json'), 'w', encoding='utf-8'
             show_render: true,
             params,
             binding_data: None,
+            baked_ocean_cache: None,
             runtime: potter_core::model::ModifierRuntime::default(),
         };
         let mut doc =

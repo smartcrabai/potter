@@ -35,6 +35,7 @@ mod bevel_vmesh;
 mod decimate;
 pub(crate) mod deform;
 mod ocean;
+pub(crate) use ocean::{OceanBakeImage, OceanBakeSequence};
 mod remesh_modes;
 pub mod simulation;
 mod subdivision_uv;
@@ -138,6 +139,7 @@ pub fn evaluate_modifiers_with_groups_and_custom_at_frame(
         ModifierEvaluationContext::default(),
         |_, modifier| modifier.enabled,
         custom_modifier,
+        |_, _, _| Ok(None),
     )
 }
 
@@ -154,6 +156,7 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
     context: ModifierEvaluationContext<'_>,
     is_active: impl Fn(usize, &Modifier) -> bool,
     mut custom_modifier: impl FnMut(&mut Mesh, &Modifier, &mut Vec<PotError>) -> Result<()>,
+    mut modifier_parameter: impl FnMut(&Modifier, &str, f64) -> Result<Option<f64>>,
 ) -> Result<ModifierEvaluation> {
     if !frame.is_finite() {
         return Err(PotError::invalid_argument(
@@ -325,7 +328,13 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
             "boolean" => boolean_modifier(&evaluated, modifier)?,
             "mesh_deform" => deform::mesh_deform(&evaluated, modifier)?,
             "remesh" => remesh_modes::remesh_modifier(&evaluated, modifier)?,
-            "ocean" => ocean::ocean(&evaluated, modifier, frame, context)?,
+            "ocean" => ocean::ocean_with_parameter_evaluator(
+                &evaluated,
+                modifier,
+                frame,
+                context,
+                |parameter, base| modifier_parameter(modifier, parameter, base),
+            )?,
             _ => return Err(unsupported_modifier(modifier)),
         };
         let dropped: Vec<String> = attributes_before
@@ -368,12 +377,44 @@ pub fn evaluate_modifiers_with_groups_at_frame(
     node_groups: &Registry<NodeGroup>,
     frame: f64,
 ) -> Result<ModifierEvaluation> {
-    evaluate_modifiers_with_groups_and_custom_at_frame(
+    evaluate_modifiers_with_groups_and_parameter_evaluator_at_frame(
+        mesh,
+        modifiers,
+        node_groups,
+        frame,
+        ModifierEvaluationContext::default(),
+        |_, _, _| Ok(None),
+    )
+}
+
+/// Evaluate the modifier stack with the Ocean modifier-parameter resolver and render context.
+///
+/// # Errors
+///
+/// Returns the same errors as [`evaluate_modifiers_with_groups_at_frame`] and any error from
+/// `modifier_parameter`.
+pub(crate) fn evaluate_modifiers_with_groups_and_parameter_evaluator_at_frame(
+    mesh: &Mesh,
+    modifiers: &[Modifier],
+    node_groups: &Registry<NodeGroup>,
+    frame: f64,
+    context: ModifierEvaluationContext<'_>,
+    modifier_parameter: impl FnMut(&Modifier, &str, f64) -> Result<Option<f64>>,
+) -> Result<ModifierEvaluation> {
+    evaluate_modifiers_with_scene_context(
         mesh.clone(),
         modifiers,
         node_groups,
         frame,
+        DMat4::IDENTITY,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        context,
+        |_, modifier| modifier.enabled,
         |_, modifier, _warnings| Err(unsupported_modifier(modifier)),
+        modifier_parameter,
     )
 }
 
@@ -5426,6 +5467,7 @@ mod tests {
             show_viewport: true,
             show_render: true,
             params: serde_json::Map::new(),
+            baked_ocean_cache: None,
             binding_data: None,
             runtime: crate::model::ModifierRuntime::default(),
         }

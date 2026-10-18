@@ -561,6 +561,17 @@ fn append_graph(
                 slot.node.clone_from(mapped);
             }
         }
+        action.active_slots = std::mem::take(&mut action.active_slots)
+            .into_iter()
+            .map(|(node, slot)| (node_map.get(&node).cloned().unwrap_or(node), slot))
+            .collect();
+        for bindings in action.modifier_bindings.values_mut() {
+            for binding in bindings {
+                if let Some(mapped) = node_map.get(&binding.node) {
+                    binding.node.clone_from(mapped);
+                }
+            }
+        }
     }
     let merged_actions = merge_registry(incoming_actions, &base.actions, &action_map)?;
     for group in imported.node_groups.values_mut() {

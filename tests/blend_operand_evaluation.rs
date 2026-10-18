@@ -644,6 +644,7 @@ fn blender_object_mesh_operands_use_same_frame_evaluated_geometry() -> TestResul
             .cloned()
             .ok_or("Boolean cycle operand parameters are invalid")?,
         binding_data: None,
+        baked_ocean_cache: None,
         runtime: potter_core::model::ModifierRuntime::default(),
     });
     let cycle_error = Snapshot::evaluate(
