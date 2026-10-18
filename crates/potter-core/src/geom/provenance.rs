@@ -86,6 +86,23 @@ pub(crate) fn remap_attributes_skipping(
     origin: &Origin,
     skipped: &[&str],
 ) -> Result<()> {
+    remap_attributes_with_basis(source, output, origin, skipped, None)
+}
+
+/// [`remap_attributes_skipping`] whose custom-normal loop basis is `corner_order` (a Blender loop
+/// ordinal per output corner) when given. A modifier that renumbers loops itself, such as Array's
+/// copies, passes its numbering here; `None` keeps the basis the source implies.
+///
+/// # Errors
+///
+/// Returns `INTERNAL_ERROR` when `origin` does not describe `output`'s vertices and polygons.
+pub(crate) fn remap_attributes_with_basis(
+    source: &Mesh,
+    output: &mut Mesh,
+    origin: &Origin,
+    skipped: &[&str],
+    corner_order: Option<&[usize]>,
+) -> Result<()> {
     if origin.vertices.len() != output.vertices.len() || origin.faces.len() != output.faces.len() {
         return Err(PotError::new(
             ErrorCode::InternalError,
@@ -250,7 +267,15 @@ pub(crate) fn remap_attributes_skipping(
         uv_layers::write(output, &store);
     }
     if let Some(sources) = code_sources {
-        clnor::transfer_custom_normals(source, output, &sources, NormalCodeOptions::default())?;
+        clnor::transfer_custom_normals(
+            source,
+            output,
+            &sources,
+            NormalCodeOptions {
+                corner_order,
+                ..NormalCodeOptions::default()
+            },
+        )?;
     }
     Ok(())
 }

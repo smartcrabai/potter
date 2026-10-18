@@ -70,6 +70,8 @@ pub(crate) struct ModifierEvaluationContext<'a> {
     pub(crate) purpose: EvaluationPurpose,
     pub(crate) project_root: Option<&'a Path>,
     pub(crate) cache_directory: Option<&'a Path>,
+    /// The owning object's material slot count (Blender `totcol`); mesh-only evaluation passes 0.
+    pub(crate) object_material_slots: usize,
 }
 
 /// Evaluated node state for the selected scene and frame.
@@ -289,6 +291,7 @@ impl Snapshot {
             purpose: context.purpose,
             project_root,
             cache_directory,
+            object_material_slots: 0,
         };
         let suppressed = BTreeSet::new();
         let mut world_matrix_ids = BTreeSet::from([target_id.clone()]);
@@ -363,6 +366,7 @@ impl Snapshot {
             purpose: context.purpose,
             project_root,
             cache_directory,
+            object_material_slots: 0,
         };
         crate::library::validate_linked_assets(doc, modifier_context.project_root)?;
         let scene_hash = source_scene_hash(doc)?;
@@ -495,6 +499,7 @@ impl Snapshot {
             purpose: context.purpose,
             project_root,
             cache_directory,
+            object_material_slots: 0,
         };
         crate::library::validate_linked_assets(source, modifier_context.project_root)?;
         let scene_hash = source_scene_hash(source)?;
@@ -836,7 +841,10 @@ impl Snapshot {
                         &object_meshes,
                         &meshes,
                         &curve_path_lengths,
-                        gate.context,
+                        ModifierEvaluationContext {
+                            object_material_slots: node.material_slot_count(node_data),
+                            ..gate.context
+                        },
                         |_, modifier| gate.is_active(id, modifier),
                         |mesh, modifier, modifier_warnings| match modifier.modifier_type.as_str() {
                             "armature" => rig::apply_armature_modifier_with_drivers(
@@ -1119,7 +1127,10 @@ impl Snapshot {
                         &object_meshes,
                         &meshes,
                         &curve_path_lengths,
-                        gate.context,
+                        ModifierEvaluationContext {
+                            object_material_slots: node.material_slot_count(node_data),
+                            ..gate.context
+                        },
                         |_, modifier| gate.is_active(id, modifier),
                         |mesh, modifier, modifier_warnings| match modifier.modifier_type.as_str() {
                             "armature" => rig::apply_armature_modifier_with_drivers(
@@ -5229,6 +5240,7 @@ mod tests {
                 purpose: super::EvaluationPurpose::Preview,
                 project_root: None,
                 cache_directory: None,
+                object_material_slots: 0,
             },
             suppressed: &suppressed,
         };
