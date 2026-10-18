@@ -878,20 +878,19 @@ fn zero_skin_radii_are_accepted() {
 }
 
 #[test]
-fn negative_skin_radii_are_accepted() {
+fn negative_skin_radii_with_negative_subdivision_count_are_rejected() {
     let skin = [
         ([-0.25, -0.25], true),
         ([-0.25, -0.25], false),
         ([-0.25, -0.25], false),
     ];
-    let result = evaluate_modifiers(
+    let error = evaluate_modifiers(
         &skeleton(&LINE_INPUT_VERTICES, &LINE_EDGES, Some(&skin)),
         &[skin_modifier(json!({}))],
         SUBJECT_NAME,
     )
-    .unwrap();
-    assert_eq!(result.vertices.len(), 12);
-    assert_eq!(result.faces.len(), 10);
+    .unwrap_err();
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
 }
 
 #[test]

@@ -319,7 +319,14 @@ fn proximity_modifier_uses_target_object_distance_and_assigns_vertex_weights()
             "normalize":false
         }),
     )?;
-    let result = evaluate_with_context(&mesh, &proximity, &operands, None, DMat4::IDENTITY)?;
+    let result = evaluate_with_context(
+        &mesh,
+        &proximity,
+        "AttributeTest",
+        &operands,
+        None,
+        DMat4::IDENTITY,
+    )?;
     assert_eq!(weights(&result, "A")?, [0.5, 0.5]);
     Ok(())
 }
@@ -347,7 +354,14 @@ fn normal_edit_writes_target_radial_split_normals() -> Result<(), Box<dyn Error>
             "mix_limit":std::f64::consts::PI
         }),
     )?;
-    let result = evaluate_with_context(&mesh, &edit, &operands, None, DMat4::IDENTITY)?;
+    let result = evaluate_with_context(
+        &mesh,
+        &edit,
+        "AttributeTest",
+        &operands,
+        None,
+        DMat4::IDENTITY,
+    )?;
     let evaluated = evaluated_face_normals(&result, "f0")?;
     let normal = evaluated[0].as_array().ok_or("custom normal missing")?;
     let tolerance = exchange_normals::normal_tolerance(true);
@@ -391,7 +405,14 @@ fn uv_project_uses_camera_projection_and_writes_corner_uvs() -> Result<(), Box<d
             "uv_layer":"UVMap"
         }),
     )?;
-    let result = evaluate_with_context(&mesh, &projection, &operands, None, DMat4::IDENTITY)?;
+    let result = evaluate_with_context(
+        &mesh,
+        &projection,
+        "AttributeTest",
+        &operands,
+        None,
+        DMat4::IDENTITY,
+    )?;
     let uv = result.attributes["uv_layers"]["layers"][0]["faces"][0]["uv"][0]
         .as_array()
         .ok_or("projected UV missing")?;
@@ -425,7 +446,14 @@ fn data_transfer_topology_replaces_vertex_group_weights() -> Result<(), Box<dyn 
             "mix_factor":1.0
         }),
     )?;
-    let result = evaluate_with_context(&destination, &transfer, &operands, None, DMat4::IDENTITY)?;
+    let result = evaluate_with_context(
+        &destination,
+        &transfer,
+        "AttributeTest",
+        &operands,
+        None,
+        DMat4::IDENTITY,
+    )?;
     let transferred = weights(&result, "A")?;
     assert!((transferred[0] - 0.9).abs() < 1.0e-12);
     assert!((transferred[1] - 0.1).abs() < 1.0e-12);
@@ -487,6 +515,7 @@ fn vertex_weight_edit_blends_with_image_mask_channel() -> Result<(), Box<dyn Err
     let result = evaluate_with_context(
         &source,
         &edit,
+        "AttributeTest",
         &BTreeMap::new(),
         Some(&image),
         DMat4::IDENTITY,
@@ -1023,7 +1052,7 @@ falloff_vertices = [(0, 0, 0), (1, 0, 0), (2, 0.5, 0), (3, 1, 0)]
 falloff_weights = [0.12, 0.31, 0.64, 0.87]
 result["baseline_vertex_weight_edit_falloffs"] = {}
 result["vertex_weight_edit_falloffs"] = {}
-for falloff in ("LINEAR", "SMOOTH", "ROOT", "ICON_SPHERECURVE", "STEP", "SHARP"):
+for falloff in ("LINEAR", "SMOOTH", "ROOT", "ICON_SPHERECURVE", "STEP", "SHARP", "RANDOM"):
     falloff_obj = make_object("EditFalloff" + falloff, falloff_vertices, [])
     add_group(falloff_obj, "A", falloff_weights)
     result["baseline_vertex_weight_edit_falloffs"][falloff] = read_weights(falloff_obj, "A")
@@ -1032,6 +1061,29 @@ for falloff in ("LINEAR", "SMOOTH", "ROOT", "ICON_SPHERECURVE", "STEP", "SHARP")
     falloff_modifier.falloff_type = falloff
     falloff_modifier.normalize = False
     result["vertex_weight_edit_falloffs"][falloff] = read_weights(falloff_obj, "A")
+
+threshold_vertices = [(0, 0, 0), (1, 0, 0), (2, 0.5, 0), (3, 1, 0), (4, 1.5, 0), (5, 2, 0)]
+def threshold_edit(name, key, falloff, use_remove, add_threshold):
+    obj = make_object(name, threshold_vertices, [])
+    add_group(obj, "A", [0.5, 0.5, 0.5, 0.0, 0.0, 0.0])
+    add_group(obj, "M", [1.0, 0.0, 0.5, 1.0, 0.5, 0.0])
+    result["baseline_" + key] = read_weights(obj, "A")
+    threshold_modifier = obj.modifiers.new(name, "VERTEX_WEIGHT_EDIT")
+    threshold_modifier.vertex_group = "A"
+    threshold_modifier.falloff_type = falloff
+    threshold_modifier.default_weight = 0.5
+    threshold_modifier.use_add = True
+    threshold_modifier.add_threshold = add_threshold
+    threshold_modifier.use_remove = use_remove
+    threshold_modifier.remove_threshold = 0.25
+    threshold_modifier.mask_vertex_group = "M"
+    threshold_modifier.mask_constant = 1.0
+    threshold_modifier.invert_mask_vertex_group = False
+    threshold_modifier.normalize = False
+    result[key] = read_weights(obj, "A")
+
+threshold_edit("EditThresholds", "vertex_weight_edit_thresholds", "SHARP", True, 0.25)
+threshold_edit("EditRandomThresholds", "vertex_weight_edit_random_thresholds", "RANDOM", False, 0.0)
 
 mix = make_object("Mix", line_vertices, [])
 add_group(mix, "A", [0.25, 0.75])
@@ -1107,7 +1159,7 @@ proximity_surface = make_object(
 result["baseline_vertex_weight_proximity_geometry_falloffs"] = {}
 result["vertex_weight_proximity_geometry_falloffs"] = {}
 for geometry in ("EDGE", "FACE"):
-    for falloff in ("LINEAR", "SMOOTH", "ROOT", "ICON_SPHERECURVE", "STEP", "SHARP"):
+    for falloff in ("LINEAR", "SMOOTH", "ROOT", "ICON_SPHERECURVE", "STEP", "SHARP", "RANDOM"):
         geometry_obj = make_object(
             "Proximity" + geometry + falloff,
             proximity_subject_vertices,
@@ -1508,6 +1560,80 @@ for cache_format, time_mode, evaluation, filename, result_key in (
         modifier.eval_factor = evaluation
     result[result_key] = read_positions(cache_obj)
 
+# Weight Edit and Proximity mask precedence. A texture replaces the group mask, and a mask group
+# that does not exist falls back to the constant. Vertices 1 and 3 are unassigned, so default_weight
+# applies to them.
+precedence_vertices = [(0, 0, 0), (1, 0, 0), (2, 0, 0), (3, 0, 0)]
+precedence_image = bpy.data.images.new(
+    "WeightEditMaskImage", width=1, height=1, alpha=True, float_buffer=True
+)
+precedence_image.colorspace_settings.name = "Non-Color"
+precedence_image.pixels = [0.3, 0.3, 0.3, 1.0]
+precedence_image.update()
+precedence_texture = bpy.data.textures.new("WeightEditMaskTexture", type="IMAGE")
+precedence_texture.image = precedence_image
+precedence_texture.use_interpolation = False
+
+def precedence_object(name, members):
+    obj = make_object(name, precedence_vertices, [])
+    group = obj.vertex_groups.new(name="A")
+    for index, weight in members:
+        group.add([index], float(weight), "REPLACE")
+    add_group(obj, "M", [0.9, 0.1, 0.5, 0.7])
+    return obj
+
+precedence = precedence_object("WeightEditMaskPrecedence", [(0, 0.2), (2, 0.8)])
+result["baseline_vertex_weight_edit_mask_precedence"] = read_weights(precedence, "A")
+precedence_edit = precedence.modifiers.new("Edit", "VERTEX_WEIGHT_EDIT")
+precedence_edit.vertex_group = "A"
+precedence_edit.falloff_type = "SHARP"
+precedence_edit.default_weight = 0.6
+precedence_edit.use_add = True
+precedence_edit.add_threshold = 0.5
+precedence_edit.use_remove = True
+precedence_edit.remove_threshold = 0.1
+precedence_edit.mask_texture = precedence_texture
+precedence_edit.mask_tex_use_channel = "RED"
+precedence_edit.mask_tex_mapping = "LOCAL"
+precedence_edit.mask_vertex_group = "M"
+precedence_edit.invert_mask_vertex_group = True
+precedence_edit.mask_constant = 1.0
+precedence_edit.normalize = True
+result["vertex_weight_edit_mask_precedence"] = read_weights(precedence, "A")
+
+missing_mask = precedence_object("WeightEditMissingMask", [(0, 0.2), (2, 0.8)])
+result["baseline_vertex_weight_edit_missing_mask"] = read_weights(missing_mask, "A")
+missing_edit = missing_mask.modifiers.new("Edit", "VERTEX_WEIGHT_EDIT")
+missing_edit.vertex_group = "A"
+missing_edit.falloff_type = "SHARP"
+missing_edit.default_weight = 0.6
+missing_edit.use_add = False
+missing_edit.use_remove = False
+missing_edit.mask_vertex_group = "Missing"
+missing_edit.mask_constant = 0.5
+missing_edit.normalize = False
+result["vertex_weight_edit_missing_mask"] = read_weights(missing_mask, "A")
+
+precedence_proximity = precedence_object("ProximityMaskPrecedence", [(0, 0.3), (1, 0.6), (3, 0.9)])
+precedence_target = make_object("ProximityMaskTarget", [(0, 0, 0)], [])
+result["baseline_vertex_weight_proximity_mask_precedence"] = read_weights(precedence_proximity, "A")
+precedence_prox = precedence_proximity.modifiers.new("Proximity", "VERTEX_WEIGHT_PROXIMITY")
+precedence_prox.target = precedence_target
+precedence_prox.vertex_group = "A"
+precedence_prox.proximity_mode = "GEOMETRY"
+precedence_prox.proximity_geometry = {"VERTEX"}
+precedence_prox.min_dist = 0.0
+precedence_prox.max_dist = 2.0
+precedence_prox.falloff_type = "LINEAR"
+precedence_prox.mask_texture = precedence_texture
+precedence_prox.mask_tex_use_channel = "RED"
+precedence_prox.mask_tex_mapping = "LOCAL"
+precedence_prox.mask_vertex_group = "M"
+precedence_prox.invert_mask_vertex_group = True
+precedence_prox.mask_constant = 1.0
+precedence_prox.normalize = True
+result["vertex_weight_proximity_mask_precedence"] = read_weights(precedence_proximity, "A")
+
 with open(os.path.join(root, "expected.json"), "w", encoding="utf-8") as stream:
     json.dump(result, stream)
 "#;
@@ -1737,6 +1863,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         "ICON_SPHERECURVE",
         "STEP",
         "SHARP",
+        "RANDOM",
     ] {
         let falloff_result = evaluate_modifiers(
             &falloff_mesh,
@@ -1744,7 +1871,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
                 "vertex_weight_edit",
                 json!({"vertex_group":"A","falloff_type":falloff,"normalize":false}),
             )?],
-            "AttributeTest",
+            &format!("EditFalloff{falloff}"),
         )?;
         let actual = json!(vertex_weights(&falloff_result, "A")?);
         if falloff != "LINEAR" {
@@ -1762,6 +1889,181 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
             1.0e-5,
         )?;
     }
+
+    let threshold_mesh = weight_threshold_mesh()?;
+    let thresholded = evaluate_modifiers(
+        &threshold_mesh,
+        &[modifier(
+            "vertex_weight_edit",
+            json!({
+                "vertex_group":"A","falloff_type":"SHARP","default_weight":0.5,
+                "use_add":true,"add_threshold":0.25,
+                "use_remove":true,"remove_threshold":0.25,
+                "mask_vertex_group":"M","mask_constant":1.0,"normalize":false
+            }),
+        )?],
+        "EditThresholds",
+    )?;
+    assert_material_change(
+        "vertex_weight_edit thresholds",
+        &expected["baseline_vertex_weight_edit_thresholds"],
+        &expected["vertex_weight_edit_thresholds"],
+        1.0e-5,
+    )?;
+    assert_parity(
+        "vertex_weight_edit thresholds",
+        &json!(vertex_weights(&thresholded, "A")?),
+        &expected["vertex_weight_edit_thresholds"],
+        1.0e-5,
+    )?;
+    let random_thresholded = evaluate_modifiers(
+        &threshold_mesh,
+        &[modifier(
+            "vertex_weight_edit",
+            json!({
+                "vertex_group":"A","falloff_type":"RANDOM","default_weight":0.5,
+                "use_add":true,"add_threshold":0.0,"use_remove":false,
+                "mask_vertex_group":"M","mask_constant":1.0,"normalize":false
+            }),
+        )?],
+        "EditRandomThresholds",
+    )?;
+    assert_material_change(
+        "vertex_weight_edit random thresholds",
+        &expected["baseline_vertex_weight_edit_random_thresholds"],
+        &expected["vertex_weight_edit_random_thresholds"],
+        1.0e-5,
+    )?;
+    assert_parity(
+        "vertex_weight_edit random thresholds",
+        &json!(vertex_weights(&random_thresholded, "A")?),
+        &expected["vertex_weight_edit_random_thresholds"],
+        1.0e-5,
+    )?;
+
+    // Weight Edit and Proximity mask precedence. The texture replaces the group mask, and a mask
+    // group that does not exist falls back to the constant. Vertices 1 and 3 start unassigned.
+    let precedence_positions = vec![
+        DVec3::ZERO,
+        DVec3::X,
+        DVec3::new(2.0, 0.0, 0.0),
+        DVec3::new(3.0, 0.0, 0.0),
+    ];
+    let mut precedence_mesh = Mesh::from_positions_and_faces(precedence_positions.clone(), vec![])?;
+    precedence_mesh.attributes.insert(
+        "vertex_groups".to_owned(),
+        json!({"A":{"v0":0.2,"v2":0.8},"M":{"v0":0.9,"v1":0.1,"v2":0.5,"v3":0.7}}),
+    );
+    let precedence_image = ImageData {
+        width: 1,
+        height: 1,
+        pixels: vec![[0.3, 0.3, 0.3, 1.0]],
+        tiles: BTreeMap::new(),
+        interpolation: ImageInterpolation::Closest,
+    };
+    let precedence_edit = evaluate_with_context(
+        &precedence_mesh,
+        &modifier(
+            "vertex_weight_edit",
+            json!({
+                "vertex_group":"A","falloff_type":"SHARP","default_weight":0.6,
+                "use_add":true,"add_threshold":0.5,"use_remove":true,"remove_threshold":0.1,
+                "mask_texture":"weight_edit_mask","mask_tex_use_channel":"RED",
+                "mask_tex_mapping":"LOCAL","mask_vertex_group":"M",
+                "invert_mask_vertex_group":true,"mask_constant":1.0,"normalize":true
+            }),
+        )?,
+        "AttributeTest",
+        &BTreeMap::new(),
+        Some(&precedence_image),
+        DMat4::IDENTITY,
+    )?;
+    assert_material_change(
+        "vertex_weight_edit mask precedence",
+        &expected["baseline_vertex_weight_edit_mask_precedence"],
+        &expected["vertex_weight_edit_mask_precedence"],
+        1.0e-5,
+    )?;
+    assert_parity(
+        "vertex_weight_edit mask precedence",
+        &json!(vertex_weights(&precedence_edit, "A")?),
+        &expected["vertex_weight_edit_mask_precedence"],
+        1.0e-5,
+    )?;
+
+    let missing_mask_edit = evaluate_with_context(
+        &precedence_mesh,
+        &modifier(
+            "vertex_weight_edit",
+            json!({
+                "vertex_group":"A","falloff_type":"SHARP","default_weight":0.6,
+                "use_add":false,"use_remove":false,
+                "mask_vertex_group":"Missing","mask_constant":0.5,"normalize":false
+            }),
+        )?,
+        "AttributeTest",
+        &BTreeMap::new(),
+        None,
+        DMat4::IDENTITY,
+    )?;
+    assert_material_change(
+        "vertex_weight_edit missing mask group",
+        &expected["baseline_vertex_weight_edit_missing_mask"],
+        &expected["vertex_weight_edit_missing_mask"],
+        1.0e-5,
+    )?;
+    assert_parity(
+        "vertex_weight_edit missing mask group",
+        &json!(vertex_weights(&missing_mask_edit, "A")?),
+        &expected["vertex_weight_edit_missing_mask"],
+        1.0e-5,
+    )?;
+
+    let mut precedence_proximity_mesh =
+        Mesh::from_positions_and_faces(precedence_positions, vec![])?;
+    precedence_proximity_mesh.attributes.insert(
+        "vertex_groups".to_owned(),
+        json!({"A":{"v0":0.3,"v1":0.6,"v3":0.9},"M":{"v0":0.9,"v1":0.1,"v2":0.5,"v3":0.7}}),
+    );
+    let mut precedence_operands = BTreeMap::new();
+    precedence_operands.insert(
+        "target".to_owned(),
+        vec![scene_operand(
+            Mesh::from_positions_and_faces(vec![DVec3::ZERO], vec![])?,
+            DMat4::IDENTITY,
+            None,
+        )],
+    );
+    let precedence_proximity = evaluate_with_context(
+        &precedence_proximity_mesh,
+        &modifier(
+            "vertex_weight_proximity",
+            json!({
+                "target":"target","vertex_group":"A","proximity_mode":"GEOMETRY",
+                "proximity_geometry":["VERTEX"],"min_dist":0.0,"max_dist":2.0,
+                "falloff_type":"LINEAR","mask_texture":"weight_edit_mask",
+                "mask_tex_use_channel":"RED","mask_tex_mapping":"LOCAL",
+                "mask_vertex_group":"M","invert_mask_vertex_group":true,
+                "mask_constant":1.0,"normalize":true
+            }),
+        )?,
+        "AttributeTest",
+        &precedence_operands,
+        Some(&precedence_image),
+        DMat4::IDENTITY,
+    )?;
+    assert_material_change(
+        "vertex_weight_proximity mask precedence",
+        &expected["baseline_vertex_weight_proximity_mask_precedence"],
+        &expected["vertex_weight_proximity_mask_precedence"],
+        1.0e-5,
+    )?;
+    assert_parity(
+        "vertex_weight_proximity mask precedence",
+        &json!(vertex_weights(&precedence_proximity, "A")?),
+        &expected["vertex_weight_proximity_mask_precedence"],
+        1.0e-5,
+    )?;
 
     let mix_modes_mesh = weight_mix_modes_mesh()?;
     for mix_mode in [
@@ -1815,6 +2117,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
     let proximity_result = evaluate_with_context(
         &line,
         &proximity,
+        "AttributeTest",
         &proximity_operands,
         None,
         proximity_subject_world,
@@ -1854,6 +2157,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
     let geometry_result = evaluate_with_context(
         &line,
         &geometry_modifier,
+        "AttributeTest",
         &geometry_operands,
         None,
         DMat4::IDENTITY,
@@ -1905,6 +2209,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
             "ICON_SPHERECURVE",
             "STEP",
             "SHARP",
+            "RANDOM",
         ] {
             let result_mesh = evaluate_with_context(
                 &proximity_geometry_subject,
@@ -1917,6 +2222,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
                         "normalize":false
                     }),
                 )?,
+                &format!("Proximity{geometry}{falloff}"),
                 &proximity_surface_operands,
                 None,
                 DMat4::IDENTITY,
@@ -2037,8 +2343,14 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         "normal_edit",
         json!({"mode":"RADIAL","target":"target","mix_mode":"COPY","mix_factor":1.0,"mix_limit":std::f64::consts::PI,"use_direction_parallel":false}),
     )?;
-    let normals =
-        evaluate_with_context(&quad, &normal_edit, &normal_operands, None, DMat4::IDENTITY)?;
+    let normals = evaluate_with_context(
+        &quad,
+        &normal_edit,
+        "AttributeTest",
+        &normal_operands,
+        None,
+        DMat4::IDENTITY,
+    )?;
     assert_normal_stimulus(
         "normal_edit RADIAL/COPY",
         &expected["baseline_normal_edit"],
@@ -2065,6 +2377,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
     let directional_result = evaluate_with_context(
         &quad,
         &directional,
+        "AttributeTest",
         &directional_operands,
         None,
         DMat4::IDENTITY,
@@ -2110,6 +2423,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
             "uv_project",
             json!({"projectors":["camera_z","camera_x"],"uv_layer":"UVMap","aspect_x":1.0,"aspect_y":1.0,"scale_x":1.0,"scale_y":1.0}),
         )?,
+        "AttributeTest",
         &projectors,
         None,
         DMat4::IDENTITY,
@@ -2148,6 +2462,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
                 "scale_x":0.8,"scale_y":1.3
             }),
         )?,
+        "AttributeTest",
         &BTreeMap::from([(
             "projectors".to_owned(),
             vec![scene_operand(
@@ -2191,6 +2506,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
                 "scale_x":0.8,"scale_y":1.3
             }),
         )?,
+        "AttributeTest",
         &BTreeMap::from([(
             "projectors".to_owned(),
             vec![scene_operand(
@@ -2278,6 +2594,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
                 "center":[0.5,0.5],"axis_u":"X","axis_v":"Y","uv_layer":"UVMap"
             }),
         )?,
+        "AttributeTest",
         &warp_operands,
         None,
         DMat4::IDENTITY,
@@ -2316,6 +2633,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
             "data_transfer",
             json!({"object":"source","use_object_transform":true,"use_vert_data":true,"data_types_verts":["VGROUP_WEIGHTS"],"vert_mapping":"TOPOLOGY","mix_mode":"REPLACE","mix_factor":1.0}),
         )?,
+        "AttributeTest",
         &source_operands,
         None,
         DMat4::IDENTITY,
@@ -2373,6 +2691,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
                     "vert_mapping":mapping,"mix_mode":"REPLACE","mix_factor":1.0
                 }),
             )?,
+            "AttributeTest",
             &point_operands,
             None,
             DMat4::IDENTITY,
@@ -2454,6 +2773,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
     let domains = evaluate_with_context(
         &domain_destination,
         &domain_transfer,
+        "AttributeTest",
         &domain_operands,
         None,
         DMat4::IDENTITY,
@@ -2534,6 +2854,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         let masked = evaluate_with_context(
             &mask_mesh,
             &mask_modifier,
+            "AttributeTest",
             &operands,
             Some(&image),
             subject_world,
@@ -2733,6 +3054,29 @@ fn weight_falloff_mesh() -> Result<Mesh, Box<dyn Error>> {
     mesh.attributes.insert(
         "vertex_groups".to_owned(),
         json!({"A":{"v0":0.12,"v1":0.31,"v2":0.64,"v3":0.87}}),
+    );
+    Ok(mesh)
+}
+
+/// Six vertices: `A` holds v0..v2 at 0.5 and `M` masks v0, v2, v3, v4 (v1 and v5 are unmasked).
+fn weight_threshold_mesh() -> Result<Mesh, Box<dyn Error>> {
+    let mut mesh = Mesh::from_positions_and_faces(
+        vec![
+            DVec3::ZERO,
+            DVec3::X,
+            DVec3::new(2.0, 0.5, 0.0),
+            DVec3::new(3.0, 1.0, 0.0),
+            DVec3::new(4.0, 1.5, 0.0),
+            DVec3::new(5.0, 2.0, 0.0),
+        ],
+        vec![],
+    )?;
+    mesh.attributes.insert(
+        "vertex_groups".to_owned(),
+        json!({
+            "A": {"v0": 0.5, "v1": 0.5, "v2": 0.5},
+            "M": {"v0": 1.0, "v2": 0.5, "v3": 1.0, "v4": 0.5}
+        }),
     );
     Ok(mesh)
 }
@@ -3144,6 +3488,7 @@ fn run_uv_transfer(
     Ok(evaluate_with_context(
         destination,
         &transfer,
+        "AttributeTest",
         &operands,
         None,
         DMat4::IDENTITY,
@@ -3233,8 +3578,14 @@ fn vertex_weight_mix_uv_mask_samples_blender_v_up_rows() -> Result<(), Box<dyn E
             "mask_tex_uv_layer": "UVMap"
         }),
     )?;
-    let result =
-        evaluate_with_context(&mesh, &mix, &BTreeMap::new(), Some(&image), DMat4::IDENTITY)?;
+    let result = evaluate_with_context(
+        &mesh,
+        &mix,
+        "AttributeTest",
+        &BTreeMap::new(),
+        Some(&image),
+        DMat4::IDENTITY,
+    )?;
     let weights = vertex_weights(&result, "A")?;
     assert_eq!(weights.len(), 4);
     for (weight, expected) in weights.iter().zip([0.1, 0.3, 0.6, 0.9]) {

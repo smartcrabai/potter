@@ -4,6 +4,7 @@
 )]
 
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     process::{Command, Output},
@@ -867,6 +868,23 @@ fn modifier_apply_reports_shape_key_failures() {
 }
 
 #[test]
+fn modifier_apply_reports_shape_key_and_unsupported_failures() {
+    let cases = [invalid_case(
+        "shape keys guard modifier application",
+        json!([
+            {"op":"node.create","id":"subject","kind":"plane","params":{"size":2.0}},
+            {"op":"shape_key.create","target":{"id":"subject"},"id":"smile","name":"Smile","positions":{"0":[1.0,-1.0,0.25]}},
+            {"op":"modifier.create","target":{"id":"subject"},"id":"wave","type":"wave","params":{"height":0.5}}
+        ]),
+        json!({"op":"modifier.apply","target":{"id":"subject"},"modifier_id":"wave"}),
+        "UNSUPPORTED_FEATURE",
+        None,
+        Some("modifier.apply.shape_key_guard"),
+    )];
+    run_invalid_cases(&cases);
+}
+
+#[test]
 fn modifier_apply_commits_topology_changes_and_removes_the_applied_modifier() {
     let (_directory, scene) = setup_scene(&json!([
         {"op":"node.create","id":"body","kind":"plane","params":{"size":2.0}},
@@ -892,6 +910,194 @@ fn modifier_apply_commits_topology_changes_and_removes_the_applied_modifier() {
     assert!(mesh.faces.iter().all(|face| face.vertices.len() == 3));
 }
 
+const CUBE_BRANCH_VERTICES: [[f64; 3]; 56] = [
+    [-0.208333313, -0.208333343, -0.75],
+    [-0.166666642, -0.75, -0.75],
+    [-0.208333313, -0.75, -0.208333313],
+    [-0.229166657, -0.229166672, -0.208333313],
+    [0.208333343, -0.208333313, -0.75],
+    [0.166666687, -0.75, -0.75],
+    [0.208333343, -0.75, -0.208333313],
+    [0.229166672, -0.229166657, -0.208333313],
+    [0.75, -0.166666642, -0.75],
+    [0.75, -0.208333313, -0.208333313],
+    [0.75, 0.166666687, -0.75],
+    [0.208333313, 0.208333343, -0.75],
+    [0.229166657, 0.229166672, -0.208333313],
+    [0.75, 0.208333343, -0.208333313],
+    [0.166666642, 0.75, -0.75],
+    [0.208333313, 0.75, -0.208333313],
+    [-0.208333343, 0.208333313, -0.75],
+    [-0.166666687, 0.75, -0.75],
+    [-0.208333343, 0.75, -0.208333313],
+    [-0.229166672, 0.229166657, -0.208333313],
+    [-0.75, 0.166666642, -0.75],
+    [-0.75, 0.208333313, -0.208333313],
+    [-0.75, -0.166666687, -0.75],
+    [-0.75, -0.208333343, -0.208333313],
+    [-0.208333313, -0.75, 0.208333343],
+    [-0.229166657, -0.229166672, 0.208333343],
+    [-0.208333313, -0.208333343, 0.75],
+    [-0.166666642, -0.75, 0.75],
+    [0.208333343, -0.75, 0.208333343],
+    [0.229166672, -0.229166657, 0.208333343],
+    [0.208333343, -0.208333313, 0.75],
+    [0.166666687, -0.75, 0.75],
+    [0.75, -0.208333313, 0.208333343],
+    [0.75, -0.166666642, 0.75],
+    [0.229166657, 0.229166672, 0.208333343],
+    [0.75, 0.208333343, 0.208333343],
+    [0.75, 0.166666687, 0.75],
+    [0.208333313, 0.208333343, 0.75],
+    [0.208333313, 0.75, 0.208333343],
+    [0.166666642, 0.75, 0.75],
+    [-0.229166672, 0.229166657, 0.208333343],
+    [-0.208333343, 0.75, 0.208333343],
+    [-0.166666687, 0.75, 0.75],
+    [-0.208333343, 0.208333313, 0.75],
+    [-0.75, 0.208333313, 0.208333343],
+    [-0.75, 0.166666642, 0.75],
+    [-0.75, -0.208333343, 0.208333343],
+    [-0.75, -0.166666687, 0.75],
+    [-0.75, -0.75, -0.166666642],
+    [-0.75, -0.75, 0.166666687],
+    [0.75, -0.75, -0.166666642],
+    [0.75, -0.75, 0.166666687],
+    [0.75, 0.75, -0.166666642],
+    [0.75, 0.75, 0.166666687],
+    [-0.75, 0.75, -0.166666642],
+    [-0.75, 0.75, 0.166666687],
+];
+const CUBE_BRANCH_FACES: &[&[usize]] = &[
+    &[41, 55, 45, 42],
+    &[10, 11, 14],
+    &[0, 1, 22],
+    &[3, 0, 16, 19],
+    &[23, 3, 19, 21],
+    &[8, 9, 50],
+    &[22, 23, 21, 20],
+    &[6, 5, 50],
+    &[0, 22, 20, 16],
+    &[2, 48, 1],
+    &[19, 16, 11, 12],
+    &[18, 17, 54],
+    &[18, 19, 12, 15],
+    &[17, 18, 15, 14],
+    &[27, 26, 47],
+    &[20, 21, 54],
+    &[16, 17, 14, 11],
+    &[13, 10, 52],
+    &[9, 8, 10, 13],
+    &[7, 9, 13, 12],
+    &[46, 49, 47],
+    &[36, 35, 53],
+    &[4, 7, 12, 11],
+    &[33, 30, 31],
+    &[8, 4, 11, 10],
+    &[7, 4, 0, 3],
+    &[6, 7, 3, 2],
+    &[32, 33, 51],
+    &[55, 44, 45],
+    &[5, 6, 2, 1],
+    &[43, 42, 45],
+    &[28, 51, 33, 31],
+    &[52, 10, 14, 15],
+    &[37, 36, 39],
+    &[16, 20, 54, 17],
+    &[48, 23, 22, 1],
+    &[4, 8, 50, 5],
+    &[4, 5, 1, 0],
+    &[39, 36, 53, 38],
+    &[24, 27, 47, 49],
+    &[24, 25, 29, 28],
+    &[25, 26, 30, 29],
+    &[26, 27, 31, 30],
+    &[27, 24, 28, 31],
+    &[34, 35, 32, 29],
+    &[35, 36, 33, 32],
+    &[36, 37, 30, 33],
+    &[37, 34, 29, 30],
+    &[40, 41, 38, 34],
+    &[41, 42, 39, 38],
+    &[42, 43, 37, 39],
+    &[43, 40, 34, 37],
+    &[44, 40, 25, 46],
+    &[40, 43, 26, 25],
+    &[43, 45, 47, 26],
+    &[45, 44, 46, 47],
+    &[24, 49, 48, 2],
+    &[49, 46, 23, 48],
+    &[46, 25, 3, 23],
+    &[25, 24, 2, 3],
+    &[51, 28, 6, 50],
+    &[28, 29, 7, 6],
+    &[29, 32, 9, 7],
+    &[32, 51, 50, 9],
+    &[35, 34, 12, 13],
+    &[34, 38, 15, 12],
+    &[38, 53, 52, 15],
+    &[53, 35, 13, 52],
+    &[40, 44, 21, 19],
+    &[44, 55, 54, 21],
+    &[55, 41, 18, 54],
+    &[41, 40, 19, 18],
+];
+
+/// Rotates a vertex cycle so it starts at its lowest index, keeping its winding.
+fn cycle_from_lowest(face: &[usize]) -> Vec<usize> {
+    let start = face
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, index)| **index)
+        .map_or(0, |(position, _)| position);
+    face.iter()
+        .cycle()
+        .skip(start)
+        .take(face.len())
+        .copied()
+        .collect()
+}
+
+/// Blender 5.2.2 `cube_branch_centered` oracle (`tests/fixtures/pr18f_skin/generate_skin_oracle.py`):
+/// the centred unit cube skinned with the default layer (radius 0.25, root on vertex 0). Each oracle
+/// vertex must have exactly one evaluated vertex at the same position, and the faces must match as
+/// vertex cycles over those vertices, winding included.
+fn assert_blender_cube_branch(mesh: &potter_core::geom::Mesh) {
+    assert_eq!(mesh.vertices.len(), CUBE_BRANCH_VERTICES.len());
+    assert_eq!(mesh.edges.len(), 136);
+    assert_eq!(mesh.faces.len(), CUBE_BRANCH_FACES.len());
+    let mut matched = vec![false; mesh.vertices.len()];
+    let mut index_by_id = HashMap::new();
+    for (index, position) in CUBE_BRANCH_VERTICES.iter().enumerate() {
+        let position = DVec3::from_array(*position);
+        let storage = mesh
+            .vertices
+            .iter()
+            .enumerate()
+            .find_map(|(storage, vertex)| {
+                (!matched[storage] && vertex.co.distance(position) < 1.0e-6).then_some(storage)
+            })
+            .expect("Blender cube branch vertex is present");
+        matched[storage] = true;
+        index_by_id.insert(mesh.vertices[storage].id, index);
+    }
+    let mut actual: Vec<Vec<usize>> = mesh
+        .faces
+        .iter()
+        .map(|face| {
+            let cycle: Vec<usize> = face.vertices.iter().map(|id| index_by_id[id]).collect();
+            cycle_from_lowest(&cycle)
+        })
+        .collect();
+    actual.sort();
+    let mut expected: Vec<Vec<usize>> = CUBE_BRANCH_FACES
+        .iter()
+        .map(|face| cycle_from_lowest(face))
+        .collect();
+    expected.sort();
+    assert_eq!(actual, expected);
+}
+
 #[test]
 fn modifier_apply_evaluates_adjacent_skin_branch_hulls() {
     let (_directory, scene) = setup_scene(&json!([
@@ -915,4 +1121,5 @@ fn modifier_apply_evaluates_adjacent_skin_branch_hulls() {
     let data_id = node.data.as_ref().unwrap();
     let mesh = document.data_blocks[data_id].mesh.as_ref().unwrap();
     assert_ne!(mesh.faces, [] as [potter_core::geom::Face; 0]);
+    assert_blender_cube_branch(mesh);
 }

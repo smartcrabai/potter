@@ -6,7 +6,7 @@
 //! Subjects are a size-1 box (corners at +-0.5) with non-uniform, rotated transforms and
 //! reference objects (hook, cast, origin, warp, wave start, lattice) that are also transformed.
 
-use glam::DVec3;
+use glam::{DMat4, DVec3};
 use potter_core::{
     eval::{EvaluationContext, Snapshot},
     geom::Mesh,
@@ -753,4 +753,85 @@ fn array_fit_curve_evaluates_the_curve_path_in_preview() {
     );
     let applied = vertex_positions(source_mesh(&applied_doc, "subj"));
     assert_same_positions(&preview, &applied);
+}
+
+/// A nested scene Hook must retain the carrier across the first Hook, and the internal key must not
+/// overwrite a legacy canonical user attribute named `blender_origindex`.
+#[test]
+fn nested_listed_hooks_after_array_preserve_origindex_and_user_attribute() {
+    let mut doc = apply(
+        &base_scene(),
+        &json!([
+            {"op":"node.create","id":"subj","kind":"box","params":{"size":1.0}},
+            {"op":"node.create","id":"hook_x","kind":"empty","transform":{"translation":[1.0,0.0,0.0]}},
+            {"op":"node.create","id":"hook_y","kind":"empty","transform":{"translation":[0.0,1.0,0.0]}},
+            {"op":"mesh.attribute_create","target":{"id":"subj"},"name":"blender_origindex","domain":"point","type":"int"},
+            {"op":"modifier.create","target":{"id":"subj"},"id":"array","type":"array","params":{"count":2,"use_relative_offset":true,"relative_offset_displace":[1.0,0.0,0.0],"use_constant_offset":false}},
+            {"op":"modifier.create","target":{"id":"subj"},"id":"hook_x_mod","type":"hook","params":{"object":"hook_x","vertex_indices":[0],"falloff_type":"NONE","falloff_radius":0.0,"strength":1.0,"center":[0.0,0.0,0.0],"use_falloff_uniform":false,"matrix_inverse":DMat4::IDENTITY.to_cols_array()}},
+            {"op":"modifier.create","target":{"id":"subj"},"id":"hook_y_mod","type":"hook","params":{"object":"hook_y","vertex_indices":[0],"falloff_type":"NONE","falloff_radius":0.0,"strength":1.0,"center":[0.0,0.0,0.0],"use_falloff_uniform":false,"matrix_inverse":DMat4::IDENTITY.to_cols_array()}}
+        ]),
+    );
+    let data_id = doc.nodes[&Id::new("subj").unwrap()].data.clone().unwrap();
+    let source_mesh = doc
+        .data_blocks
+        .get_mut(&data_id)
+        .unwrap()
+        .mesh
+        .as_mut()
+        .unwrap();
+    let user_values = source_mesh.attributes.get_mut("blender_origindex").unwrap()["values"]
+        .as_object_mut()
+        .unwrap();
+    for (index, vertex) in source_mesh.vertices.iter().enumerate() {
+        user_values.insert(format!("v{}", vertex.id), json!(73 + index as i64));
+    }
+    let hash = |doc: &SceneDoc| {
+        potter_core::hash::sha256(
+            &potter_core::hash::canonicalize(&serde_json::to_value(doc).unwrap()).unwrap(),
+        )
+    };
+    let before_hash = hash(&doc);
+    let mut array_only = doc.clone();
+    array_only
+        .nodes
+        .get_mut(&Id::new("subj").unwrap())
+        .unwrap()
+        .modifiers
+        .retain(|modifier| modifier.id == Id::new("array").unwrap());
+    let before = evaluated_mesh(&array_only, "subj", None);
+    let after = evaluated_mesh(&doc, "subj", None);
+    assert_eq!(
+        hash(&doc),
+        before_hash,
+        "evaluation must not mutate source history"
+    );
+    assert_eq!(before.vertices.len(), 16);
+    assert_eq!(after.vertices.len(), before.vertices.len());
+    let moved: Vec<usize> = before
+        .vertices
+        .iter()
+        .zip(&after.vertices)
+        .enumerate()
+        .filter_map(|(index, (before, after))| {
+            ((after.co - before.co).length() > TOLERANCE).then_some(index)
+        })
+        .collect();
+    assert_eq!(moved, vec![0, 8]);
+    for index in moved {
+        assert!(
+            (after.vertices[index].co - before.vertices[index].co)
+                .distance(DVec3::new(1.0, 1.0, 0.0))
+                < TOLERANCE
+        );
+    }
+    assert_eq!(
+        after.attributes.get("blender_origindex"),
+        before.attributes.get("blender_origindex"),
+        "the carrier must not overwrite or strip the user's canonical attribute"
+    );
+    let user_attribute = &after.attributes["blender_origindex"]["values"];
+    assert_eq!(
+        user_attribute.as_object().unwrap().len(),
+        after.vertices.len()
+    );
 }

@@ -277,149 +277,22 @@ fn object_to_world(
     }
 }
 
-/// The lanes of one Eigen `Packet4f`.
-type Lanes = [f32; 4];
-
-fn lanes_add(a: Lanes, b: Lanes) -> Lanes {
-    std::array::from_fn(|lane| a[lane] + b[lane])
-}
-
-fn lanes_sub(a: Lanes, b: Lanes) -> Lanes {
-    std::array::from_fn(|lane| a[lane] - b[lane])
-}
-
-fn lanes_mul(a: Lanes, b: Lanes) -> Lanes {
-    std::array::from_fn(|lane| a[lane] * b[lane])
-}
-
-/// Eigen's `vec4f_swizzle2`: lanes `p` and `q` of `a`, then lanes `r` and `s` of `b`.
-fn swizzle(a: Lanes, b: Lanes, p: usize, q: usize, r: usize, s: usize) -> Lanes {
-    [a[p], a[q], b[r], b[s]]
-}
-
-/// Eigen's `vec4f_movelh`: the low halves of `a` and `b`.
-fn movelh(a: Lanes, b: Lanes) -> Lanes {
-    [a[0], a[1], b[0], b[1]]
-}
-
-/// Eigen's `vec4f_movehl`: the high half of `b`, then the high half of `a`.
-fn movehl(a: Lanes, b: Lanes) -> Lanes {
-    [b[2], b[3], a[2], a[3]]
-}
-
-/// Eigen's `vec4f_duplane`: lane `lane` broadcast to every lane.
-fn broadcast(a: Lanes, lane: usize) -> Lanes {
-    [a[lane]; 4]
-}
-
-/// ARM `FRECPE` (`RecipEstimate`) for a normal `value`: the reciprocal estimate that Eigen's NEON
-/// `preciprocal` starts from. The fraction in `[0.5, 1)` is indexed by its nine leading bits `x`,
-/// and the estimate is `(r + 1) / 2` with `r = 2^19 / (2x + 1)`.
-fn arm_reciprocal_estimate(value: f32) -> f32 {
-    let bits = value.to_bits();
-    let exponent = ((bits >> 23) & 0xff) as i32 - 126;
-    let fraction = f32::from_bits((bits & 0x007f_ffff) | 0x3f00_0000);
-    let index = (fraction * 512.0) as u32;
-    let r = (1_u32 << 19) / (2 * index + 1);
-    let estimate = r.div_ceil(2) as f32 / 256.0;
-    let magnitude = estimate * 2.0_f32.powi(-exponent);
-    if value.is_sign_negative() {
-        -magnitude
-    } else {
-        magnitude
-    }
-}
-
-/// Eigen 5.0.0's NEON `preciprocal` (`Eigen/src/Core/arch/NEON/PacketMath.h:4548`): the `FRECPE`
-/// estimate, then two Newton steps `t = (2 - value * t) * t`, where `FRECPS` rounds
-/// `2 - value * t` once.
-fn eigen_preciprocal(value: f32) -> f32 {
-    let mut estimate = arm_reciprocal_estimate(value);
-    for _ in 0..2 {
-        let step = (2.0_f64 - f64::from(value) * f64::from(estimate)) as f32;
-        estimate *= step;
-    }
-    estimate
+unsafe extern "C" {
+    /// Writes `inverse` and returns `true` when `matrix` is invertible; returns `false` otherwise.
+    fn potter_blender_inverse_m4(matrix: *const f32, inverse: *mut f32) -> bool;
 }
 
 /// Blender `invert_m4_m4` (`math_matrix_c.cc:1150`) through `EIG_invert_m4_m4`
-/// (`intern/eigen/intern/matrix.cc:29`) on the arm64 build: Eigen 5.0.0's
-/// `Matrix4f::computeInverseWithCheck`, whose float kernel is `Eigen/src/LU/arch/InverseSize4.h`
-/// with NEON packets. `None` when the determinant is zero or not normal, where Blender returns a
-/// zero matrix. The x86 Blender build uses Eigen's SSE packets, whose reciprocal is not replicated.
-pub(crate) fn blender_invert_m4(matrix: &BlenderMat4) -> Option<BlenderMat4> {
-    // Eigen's columns are Blender's `matrix[c]`; the 2x2 blocks are `[A B; C D]`.
-    let a = movelh(matrix[0], matrix[1]);
-    let b = movehl(matrix[1], matrix[0]);
-    let c = movelh(matrix[2], matrix[3]);
-    let d = movehl(matrix[3], matrix[2]);
-    let ab = lanes_sub(
-        lanes_mul(swizzle(a, a, 3, 3, 0, 0), b),
-        lanes_mul(swizzle(a, a, 1, 1, 2, 2), swizzle(b, b, 2, 3, 0, 1)),
-    );
-    let dc = lanes_sub(
-        lanes_mul(swizzle(d, d, 3, 3, 0, 0), c),
-        lanes_mul(swizzle(d, d, 1, 1, 2, 2), swizzle(c, c, 2, 3, 0, 1)),
-    );
-    let block_determinant = |block: Lanes| {
-        let product = lanes_mul(swizzle(block, block, 3, 3, 1, 1), block);
-        lanes_sub(product, movehl(product, product))
-    };
-    let det_a = block_determinant(a);
-    let det_b = block_determinant(b);
-    let det_c = block_determinant(c);
-    let det_d = block_determinant(d);
-    let mut trace = lanes_mul(swizzle(dc, dc, 0, 2, 1, 3), ab);
-    trace = lanes_add(trace, movehl(trace, trace));
-    trace = lanes_add(trace, swizzle(trace, trace, 1, 0, 0, 0));
-    let determinant = lanes_sub(
-        lanes_add(lanes_mul(det_a, det_d), lanes_mul(det_b, det_c)),
-        trace,
-    )[0];
-    if !determinant.is_normal() {
-        return None;
-    }
-    let reciprocal = eigen_preciprocal(determinant);
-    // `pxor` with the sign mask `{0, -0, -0, 0}`.
-    let rd: Lanes = [reciprocal, -reciprocal, -reciprocal, reciprocal];
-    let i_d = lanes_sub(
-        lanes_mul(d, broadcast(det_a, 0)),
-        lanes_add(
-            lanes_mul(swizzle(c, c, 0, 0, 2, 2), movelh(ab, ab)),
-            lanes_mul(swizzle(c, c, 1, 1, 3, 3), movehl(ab, ab)),
-        ),
-    );
-    let i_a = lanes_sub(
-        lanes_mul(a, broadcast(det_d, 0)),
-        lanes_add(
-            lanes_mul(swizzle(b, b, 0, 0, 2, 2), movelh(dc, dc)),
-            lanes_mul(swizzle(b, b, 1, 1, 3, 3), movehl(dc, dc)),
-        ),
-    );
-    let i_b = lanes_sub(
-        lanes_mul(c, broadcast(det_b, 0)),
-        lanes_sub(
-            lanes_mul(d, swizzle(ab, ab, 3, 0, 3, 0)),
-            lanes_mul(swizzle(d, d, 1, 0, 3, 2), swizzle(ab, ab, 2, 1, 2, 1)),
-        ),
-    );
-    let i_c = lanes_sub(
-        lanes_mul(b, broadcast(det_c, 0)),
-        lanes_sub(
-            lanes_mul(a, swizzle(dc, dc, 3, 0, 3, 0)),
-            lanes_mul(swizzle(a, a, 1, 0, 3, 2), swizzle(dc, dc, 2, 1, 2, 1)),
-        ),
-    );
-    let i_a = lanes_mul(i_a, rd);
-    let i_b = lanes_mul(i_b, rd);
-    let i_c = lanes_mul(i_c, rd);
-    let i_d = lanes_mul(i_d, rd);
-    Some([
-        swizzle(i_a, i_b, 3, 1, 3, 1),
-        swizzle(i_a, i_b, 2, 0, 2, 0),
-        swizzle(i_c, i_d, 3, 1, 3, 1),
-        swizzle(i_c, i_d, 2, 0, 2, 0),
-    ])
+/// (`intern/eigen/intern/matrix.cc:29`): the native Eigen `Matrix4f` inverse of
+/// `native/blender_inverse_m4.cc`, built for the target so its packets match Blender's build on that
+/// target. `None` when the determinant is zero or not normal.
+pub(crate) fn blender_invert_m4(matrix: &[[f32; 4]; 4]) -> Option<[[f32; 4]; 4]> {
+    let mut inverse = [[0.0; 4]; 4];
+    // SAFETY: both pointers address 16 contiguous `f32`s in column-major order, the layout of
+    // Eigen's `Matrix4f`. The native call writes `inverse` only when it returns `true`.
+    let invertible =
+        unsafe { potter_blender_inverse_m4(matrix.as_ptr().cast(), inverse.as_mut_ptr().cast()) };
+    invertible.then_some(inverse)
 }
 
 /// Quantizes an f64 matrix to Blender's f32 `float[4][4]`.

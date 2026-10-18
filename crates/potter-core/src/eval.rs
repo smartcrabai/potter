@@ -895,13 +895,6 @@ impl Snapshot {
         let mut slot_bindings = BTreeMap::new();
         let mut strokes = BTreeMap::new();
         let mut modifier_warnings = Vec::new();
-        let mut texture_rng = crate::blender_rng::BlenderRng::seed_random(
-            if modifier_context.purpose == EvaluationPurpose::Render {
-                scene.render.seed
-            } else {
-                0
-            },
-        );
         for id in &mesh_evaluation_order {
             let node = doc.nodes.get(id).ok_or_else(|| {
                 PotError::new(ErrorCode::InternalError, "mesh evaluation node is missing")
@@ -919,6 +912,11 @@ impl Snapshot {
                     "evaluated world matrix is missing",
                 )
             })?;
+            let texture_seed = crate::geom::modifiers::TextureSeed::new(
+                modifier_context.purpose,
+                scene.render.seed,
+                id.as_str(),
+            );
             let bounds = if instance_collection_target(node)?.is_some() {
                 None
             } else if let Some(data_id) = &node.data {
@@ -1025,7 +1023,7 @@ impl Snapshot {
                         &curve_path_lengths,
                         gate.context,
                         |index, modifier| gate.is_active_at(id, index, modifier),
-                        &mut texture_rng,
+                        texture_seed,
                         |mesh, modifier, modifier_warnings, multi_input, texture_rng| match modifier
                             .modifier_type
                             .as_str()
@@ -1327,7 +1325,7 @@ impl Snapshot {
                         &curve_path_lengths,
                         gate.context,
                         |index, modifier| gate.is_active_at(id, index, modifier),
-                        &mut texture_rng,
+                        texture_seed,
                         |mesh, modifier, modifier_warnings, multi_input, texture_rng| match modifier
                             .modifier_type
                             .as_str()
@@ -1608,14 +1606,14 @@ impl Snapshot {
                     }
                     let base_volume = volume_data.get(data_id).unwrap_or(volume);
                     let mut displaced = None;
-                    for modifier in
+                    for (stack_index, modifier) in
                         node.modifiers
                             .iter()
                             .enumerate()
                             .filter_map(|(index, modifier)| {
                                 (gate.is_active_at(id, index, modifier)
                                     && modifier.modifier_type == "volume_displace")
-                                    .then_some(modifier)
+                                    .then_some((index, modifier))
                             })
                     {
                         let current = displaced.take().unwrap_or_else(|| base_volume.clone());
@@ -1624,7 +1622,7 @@ impl Snapshot {
                             modifier,
                             doc,
                             gate,
-                            &mut texture_rng,
+                            &mut texture_seed.rng_for(stack_index),
                             &matrices,
                             &bone_pose_matrices,
                             id,
@@ -3008,9 +3006,17 @@ pub(crate) fn apply_scene_attribute_modifier(
             "modifier subject world matrix is missing",
         )
     })?;
+    let subject_name = doc
+        .nodes
+        .get(subject_id)
+        .map(|node| node.name.as_str())
+        .ok_or_else(|| {
+            PotError::new(ErrorCode::InternalError, "modifier subject node is missing")
+        })?;
     *mesh = crate::geom::modifiers::attributes::evaluate_with_context(
         mesh,
         modifier,
+        subject_name,
         &operands,
         texture.as_ref(),
         subject_world,
@@ -4336,15 +4342,16 @@ pub(crate) fn texture_coordinate_mapping_with_parameters(
                     world_matrices,
                     bone_pose_matrices,
                 )?;
-                let world_to_mapping_f32 =
-                    crate::geom::modifiers::blender_inverse_m4(mapping_world);
-                if !world_to_mapping_f32.iter().all(|value| value.is_finite())
-                    || world_to_mapping_f32.iter().all(|value| *value == 0.0)
-                {
+                let world_to_mapping_f32 = crate::geom::blender_matrix::blender_invert_m4(
+                    &glam::Mat4::from_cols_array(&mapping_world).to_cols_array_2d(),
+                )
+                .map(|inverse| glam::Mat4::from_cols_array_2d(&inverse).to_cols_array())
+                .filter(|inverse| inverse.iter().all(|value| value.is_finite()));
+                let Some(world_to_mapping_f32) = world_to_mapping_f32 else {
                     return Err(PotError::invalid_argument(
                         "texture coordinate mapping transform must be invertible",
                     ));
-                }
+                };
                 mapping.world_to_mapping_f32 = Some(world_to_mapping_f32);
             }
             Ok(Some(mapping))
@@ -4962,7 +4969,8 @@ pub(crate) fn apply_lattice_modifier(
 }
 
 /// Blender's modifier vertex group: a missing group, or a group absent from the mesh, leaves
-/// every vertex at full weight; `invert_vertex_group` maps each weight `w` to `1 - w`.
+/// every vertex at full weight, as does a group without any stored weight (Blender's null `dvert`).
+/// `invert_vertex_group` maps each weight `w` to `1 - w`.
 fn lattice_vertex_group_weights(
     mesh: &Mesh,
     modifier: &Modifier,
@@ -4987,6 +4995,9 @@ fn lattice_vertex_group_weights(
     };
     let invert = modifier_bool_param(modifier, "invert_vertex_group")?;
     let weights_by_vertex = mesh_vertex_weights(mesh, &source_data.vertex_groups);
+    if weights_by_vertex.values().all(BTreeMap::is_empty) {
+        return Ok(None);
+    }
     Ok(Some(
         mesh.vertices
             .iter()
@@ -5964,7 +5975,8 @@ mod tests {
     use crate::{
         geom::{
             BoxParams, Mesh,
-            modifiers::{blender_inverse_m4, blender_transform_point_f32},
+            blender_matrix::blender_invert_m4,
+            modifiers::blender_transform_point_f32,
             uv_layers::{self, UvLayer, UvStore},
         },
         model::{
@@ -6125,8 +6137,12 @@ mod tests {
         .unwrap();
 
         let subject_to_world_f32 = subject_world.to_cols_array().map(|value| value as f32);
+        let mapping_columns =
+            glam::Mat4::from_cols_array(&mapping_world.to_cols_array().map(|value| value as f32))
+                .to_cols_array_2d();
         let world_to_mapping_f32 =
-            blender_inverse_m4(mapping_world.to_cols_array().map(|value| value as f32));
+            glam::Mat4::from_cols_array_2d(&blender_invert_m4(&mapping_columns).unwrap())
+                .to_cols_array();
         let world_point = blender_transform_point_f32(&subject_to_world_f32, point.as_vec3());
         let expected = blender_transform_point_f32(&world_to_mapping_f32, world_point);
         assert_eq!(mapping.object_coordinate(point).as_vec3(), expected);

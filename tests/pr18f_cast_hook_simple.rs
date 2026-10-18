@@ -1212,6 +1212,30 @@ fn weighted_subject() -> Mesh {
     mesh
 }
 
+/// The subject with a named group that stores no weights: Blender's null `dvert`.
+fn subject_with_empty_group() -> Mesh {
+    let mut mesh = subject();
+    mesh.attributes
+        .insert("vertex_groups".to_owned(), json!({ "Empty": {} }));
+    mesh
+}
+
+/// Largest per-vertex distance between two evaluated meshes with the same vertex order.
+fn max_distance(result: &Mesh, expected: &Mesh) -> f64 {
+    result
+        .vertices
+        .iter()
+        .zip(&expected.vertices)
+        .map(|(vertex, want)| vertex.co.distance(want.co))
+        .fold(0.0, f64::max)
+}
+
+fn assert_same_positions(result: &Mesh, expected: &Mesh) {
+    assert_eq!(result.vertices.len(), expected.vertices.len());
+    let error = max_distance(result, expected);
+    assert!(error < 1.0e-12, "meshes differ by {error}");
+}
+
 /// A modifier as the scene hands it over: its reference is already resolved into `object_matrix`.
 fn modifier(modifier_type: &str, params: Value, object_matrix: Option<[f64; 16]>) -> Modifier {
     Modifier {
@@ -2321,6 +2345,163 @@ fn hook_missing_group_without_listed_vertices_is_a_no_op() {
                 "strength": 0.8,
                 "center": [0.2, -0.3, 0.4],
                 "vertex_group": "missing",
+                "matrix_inverse": HOOK_MISSING_PARENTINV,
+            }),
+            Some(HOOK_MISSING_OBJECT),
+        )],
+        SUBJECT_NAME,
+    )
+    .unwrap();
+    assert_positions(&result, &SUBJECT);
+}
+
+/// A named group without stored weights is Blender's null `dvert`: Cast keeps full influence.
+#[test]
+fn cast_named_unweighted_group_applies_full_influence() {
+    let params = json!({
+        "cast_type": "SPHERE",
+        "factor": 0.5,
+        "radius": 0.0,
+        "size": 0.0,
+        "use_radius_as_size": true,
+        "use_x": true,
+        "use_y": true,
+        "use_z": true,
+        "use_transform": false,
+    });
+    let full = evaluate_modifiers(
+        &subject(),
+        &[modifier("cast", params.clone(), None)],
+        SUBJECT_NAME,
+    )
+    .unwrap();
+    assert!(
+        max_distance(&full, &subject()) > 1.0e-3,
+        "cast must move the subject"
+    );
+    for invert in [false, true] {
+        let mut grouped = params.clone();
+        grouped["vertex_group"] = json!("Empty");
+        grouped["invert_vertex_group"] = json!(invert);
+        let result = evaluate_modifiers(
+            &subject_with_empty_group(),
+            &[modifier("cast", grouped, None)],
+            SUBJECT_NAME,
+        )
+        .unwrap();
+        assert_same_positions(&result, &full);
+    }
+}
+
+/// Listed Hook vertices under a named group without stored weights keep full influence.
+#[test]
+fn hook_listed_unweighted_group_applies_full_influence() {
+    let params = json!({
+        "falloff_type": "SMOOTH",
+        "falloff_radius": 1.5,
+        "strength": 0.8,
+        "center": [0.2, -0.3, 0.4],
+        "use_falloff_uniform": false,
+        "vertex_indices": [0, 1, 2, 3, 4, 5, 6, 7],
+        "matrix_inverse": HOOK_MISSING_PARENTINV,
+    });
+    let full = evaluate_modifiers(
+        &subject(),
+        &[modifier("hook", params.clone(), Some(HOOK_MISSING_OBJECT))],
+        SUBJECT_NAME,
+    )
+    .unwrap();
+    assert!(
+        max_distance(&full, &subject()) > 1.0e-3,
+        "hook must move the subject"
+    );
+    for invert in [false, true] {
+        let mut grouped = params.clone();
+        grouped["vertex_group"] = json!("Empty");
+        grouped["invert_vertex_group"] = json!(invert);
+        let result = evaluate_modifiers(
+            &subject_with_empty_group(),
+            &[modifier("hook", grouped, Some(HOOK_MISSING_OBJECT))],
+            SUBJECT_NAME,
+        )
+        .unwrap();
+        assert_same_positions(&result, &full);
+    }
+}
+
+/// `translated_index_hook` restricted to a vertex group.
+fn translated_index_hook_in_group(indices: &[usize], group: &str) -> Modifier {
+    modifier(
+        "hook",
+        json!({
+            "falloff_type": "NONE",
+            "falloff_radius": 0.0,
+            "strength": 1.0,
+            "center": [0.0, 0.0, 0.0],
+            "use_falloff_uniform": false,
+            "vertex_indices": indices,
+            "vertex_group": group,
+            "matrix_inverse": DMat4::IDENTITY.to_cols_array(),
+        }),
+        Some(DMat4::from_translation(DVec3::X).to_cols_array()),
+    )
+}
+
+/// Array copies keep the origin carrier, so a listed source vertex hooks every copy even when the
+/// hook's named group stores no weights.
+#[test]
+fn hook_array_unweighted_group_selects_all_original_copies() {
+    let array = || {
+        modifier(
+            "array",
+            json!({
+                "count": 2,
+                "fit_type": "FIXED_COUNT",
+                "use_relative_offset": true,
+                "relative_offset_displace": [1.0, 0.0, 0.0],
+                "use_constant_offset": false,
+                "use_object_offset": false,
+                "use_merge_vertices": false,
+            }),
+            None,
+        )
+    };
+    let array_only = evaluate_modifiers(&subject(), &[array()], SUBJECT_NAME).unwrap();
+    let plain = evaluate_modifiers(
+        &subject(),
+        &[array(), translated_index_hook(&[0])],
+        SUBJECT_NAME,
+    )
+    .unwrap();
+    let grouped = evaluate_modifiers(
+        &subject_with_empty_group(),
+        &[array(), translated_index_hook_in_group(&[0], "Empty")],
+        SUBJECT_NAME,
+    )
+    .unwrap();
+    assert!(
+        max_distance(&plain, &array_only) > 1.0e-3,
+        "hook must move the copies"
+    );
+    assert_same_positions(&grouped, &plain);
+}
+
+/// Without listed vertices, a named group that stores no weights selects nothing: a no-op, as Blender
+/// has no `dvert` to select by.
+#[test]
+fn hook_unlisted_unweighted_group_is_a_no_op() {
+    let result = evaluate_modifiers(
+        &subject_with_empty_group(),
+        &[modifier(
+            "hook",
+            json!({
+                "falloff_type": "SMOOTH",
+                "falloff_radius": 1.5,
+                "strength": 0.8,
+                "center": [0.2, -0.3, 0.4],
+                "use_falloff_uniform": false,
+                "vertex_group": "Empty",
+                "invert_vertex_group": true,
                 "matrix_inverse": HOOK_MISSING_PARENTINV,
             }),
             Some(HOOK_MISSING_OBJECT),

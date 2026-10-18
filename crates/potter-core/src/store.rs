@@ -44,10 +44,9 @@ pub struct Project {
     doc: SceneDoc,
     /// Diagnostics from upgrading the loaded scene document.
     load_warnings: Vec<Value>,
-    /// Digest of the schema-1 `scene.json` this project opened. Its bytes are kept before the first
-    /// schema-2 write replaces them.
+    /// Digest of the original scene bytes that load-time migration must preserve before the first write.
     legacy_digest: Option<String>,
-    /// Hash reported for the untouched schema-1 scene before migration changes its schema version.
+    /// Canonical hash of the original scene before load-time migration.
     legacy_hash: Option<String>,
 }
 
@@ -126,7 +125,7 @@ impl Project {
     }
 
     /// Reads and upgrades `scene.json`. The diagnostics name the original bytes they describe. The
-    /// digest and compatibility hash are returned only for schema version 1.
+    /// digest and compatibility hash are returned when load-time migration changes the document.
     fn read_snapshot(path: &Path) -> Result<SnapshotRead> {
         let bytes = fs::read(path.join("scene.json")).map_err(|error| PotError::io(&error))?;
         let parsed = crate::model::migrate::parse_scene_with_original_hash(&bytes)?;
@@ -142,7 +141,7 @@ impl Project {
         Ok((parsed.doc, warnings, legacy_digest, parsed.legacy_hash))
     }
 
-    /// Keeps the bytes of a schema-1 `scene.json` before a schema-2 write replaces them, under the
+    /// Keeps the original `scene.json` bytes before load-time migration is written back, under the
     /// content-addressed path that the diagnostics name. The file must still hold the bytes this
     /// project opened.
     fn preserve_legacy_scene(&self) -> Result<()> {

@@ -24,7 +24,7 @@ use crate::{
         ImageData, ImageInterpolation,
         storage::{ImageUserSelection, load_image_data_for_legacy_texture},
     },
-    model::{Id, ImageAlphaMode, ImageColorspace, SceneDoc, migrate},
+    model::{Id, Image, ImageAlphaMode, ImageColorspace, SceneDoc, migrate},
 };
 
 fn image_user_index(id: &str, settings: &Map<String, Value>, key: &str) -> Result<u16> {
@@ -583,11 +583,31 @@ fn validate_legacy_settings(
             if key == "minkovsky_exponent" && number <= 0.0 {
                 return Err(record_error(id, "`minkovsky_exponent` must be positive"));
             }
+            if texture_type == "MUSGRAVE"
+                && let Some((minimum, maximum)) = musgrave_range(key)
+                && !(minimum..=maximum).contains(&number)
+            {
+                return Err(record_error(
+                    id,
+                    format!("`{key}` must be in [{minimum}, {maximum}]"),
+                ));
+            }
         } else {
             return Err(record_error(id, format!("`{key}` must be a finite number")));
         }
     }
     Ok(())
+}
+
+/// Blender's RNA ranges for the float settings of a Musgrave texture.
+fn musgrave_range(key: &str) -> Option<(f64, f64)> {
+    match key {
+        "octaves" => Some((0.0, 8.0)),
+        "lacunarity" | "offset" | "gain" => Some((0.0, 6.0)),
+        "dimension_max" => Some((0.0001, 2.0)),
+        "noise_intensity" => Some((0.0, 10.0)),
+        _ => None,
+    }
 }
 
 fn validate_image_settings(id: &str, settings: &Map<String, Value>) -> Result<()> {
@@ -1213,6 +1233,27 @@ pub(crate) fn merged_record(
     Ok(record_value(&texture))
 }
 
+/// Loads a legacy Image Texture's pixels for `image_user` and records the sampler facts that depend
+/// on the file: alpha availability, source channel count, and sRGB encoding of colour passes.
+fn load_legacy_image(
+    image: &Image,
+    root: &Path,
+    image_user: ImageUserSelection,
+    sampler: &mut ImageSamplerSettings,
+) -> Result<ImageData> {
+    sampler.use_alpha &= image.alpha_mode != ImageAlphaMode::None;
+    let interpolation = if sampler.interpolation {
+        ImageInterpolation::Linear
+    } else {
+        ImageInterpolation::Closest
+    };
+    let (data, color_pass, source_channels) =
+        load_image_data_for_legacy_texture(image, root, interpolation, image_user)?;
+    sampler.source_channels = source_channels;
+    sampler.source_srgb_encoded = color_pass && image.colorspace == ImageColorspace::Srgb;
+    Ok(data)
+}
+
 /// Resolves a texture ID: an image in `doc.images`, else an inline legacy texture record.
 ///
 /// # Errors
@@ -1233,15 +1274,7 @@ pub fn resolve_texture(
             )
         })?;
         let mut settings = DEFAULT_IMAGE_SETTINGS;
-        settings.use_alpha &= image.alpha_mode != ImageAlphaMode::None;
-        let (data, color_pass, source_channels) = load_image_data_for_legacy_texture(
-            image,
-            root,
-            ImageInterpolation::Linear,
-            ImageUserSelection::default(),
-        )?;
-        settings.source_channels = source_channels;
-        settings.source_srgb_encoded = color_pass && image.colorspace == ImageColorspace::Srgb;
+        let data = load_legacy_image(image, root, ImageUserSelection::default(), &mut settings)?;
         let resolved = if settings == DEFAULT_IMAGE_SETTINGS {
             ResolvedTextureKind::Image(data)
         } else {
@@ -1305,15 +1338,7 @@ pub fn resolve_texture(
                 .map(|settings| parse_image_user_selection(&texture_id.to_string(), settings))
                 .transpose()?
                 .unwrap_or_default();
-            sampler.use_alpha &= image.alpha_mode != ImageAlphaMode::None;
-            let (data, color_pass, source_channels) = load_image_data_for_legacy_texture(
-                image,
-                root,
-                ImageInterpolation::Linear,
-                image_user,
-            )?;
-            sampler.source_channels = source_channels;
-            sampler.source_srgb_encoded = color_pass && image.colorspace == ImageColorspace::Srgb;
+            let data = load_legacy_image(image, root, image_user, &mut sampler)?;
             ResolvedTextureKind::ImageWithSettings {
                 image: data,
                 settings: sampler,
@@ -1327,9 +1352,12 @@ pub fn resolve_texture(
 /// Samples a texture at a texture-space point (`BKE_texture_get_value`).
 ///
 /// Coordinates are already mapped by the caller. Blender's legacy Noise type is stateful; its RNG
-/// algorithm is `BLI_rng_thread_rand` but Blender seeds worker streams from `clock()`. Potter uses
-/// the deterministic per-evaluation `BlenderRng` seeded from the render seed (or zero in Preview),
-/// so Noise's bit extraction and call-order semantics match while cross-process clock noise does not.
+/// algorithm is `BLI_rng_thread_rand`, but Blender seeds worker streams from `clock()`. Potter draws
+/// from deterministic per-modifier `BlenderRng` streams (`geom::modifiers::TextureSeed::rng_for`):
+/// the base seed is the scene `render.seed` for Render and `0` for Preview, and the stream is keyed
+/// by the subject node ID and modifier stack index. Within one modifier, samples consume the stream
+/// in call order, so Noise's sample order still matters. RNG bit extraction matches Blender, but
+/// cross-process clock randomness does not.
 ///
 /// # Errors
 ///
@@ -1538,12 +1566,17 @@ fn srgb_encoded_channel(linear: f32) -> f32 {
 fn image_pixel(
     pixels: &[[f64; 4]],
     width: usize,
+    height: i64,
     row: i64,
     column: i64,
     settings: &ImageSamplerSettings,
 ) -> Result<[f32; 4]> {
-    let row =
-        usize::try_from(row).map_err(|_| invalid_image_sample("image texture row is invalid"))?;
+    // Blender's legacy sampler reads rows bottom-up, while Potter stores rows top-down.
+    let row = height
+        .checked_sub(1)
+        .and_then(|last| last.checked_sub(row))
+        .and_then(|flipped| usize::try_from(flipped).ok())
+        .ok_or_else(|| invalid_image_sample("image texture row is invalid"))?;
     let column = usize::try_from(column)
         .map_err(|_| invalid_image_sample("image texture column is invalid"))?;
     let index = row
@@ -1565,6 +1598,15 @@ fn image_pixel(
         texel[2] = srgb_encoded_channel(texel[2]);
     }
     Ok(texel)
+}
+
+/// Blender premultiplies every texel before filtering, whatever the source format.
+fn premultiplied(texel: [f32; 4]) -> [f32; 3] {
+    [
+        texel[0] * texel[3],
+        texel[1] * texel[3],
+        texel[2] * texel[3],
+    ]
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1712,7 +1754,6 @@ fn sample_filter_rect(
     height_px: u32,
     rect: ImageFilterRect,
     settings: &ImageSamplerSettings,
-    alpha_weighted: bool,
 ) -> Result<([f32; 3], f32)> {
     let width_i = i64::from(width_px);
     let height_i = i64::from(height_px);
@@ -1732,17 +1773,8 @@ fn sample_filter_rect(
         return Ok(([0.0; 3], 0.0));
     }
     if start_x == end_x && start_y == end_y {
-        let texel = image_pixel(pixels, width, start_y, start_x, settings)?;
-        let rgb = if alpha_weighted {
-            [
-                texel[0] * texel[3],
-                texel[1] * texel[3],
-                texel[2] * texel[3],
-            ]
-        } else {
-            [texel[0], texel[1], texel[2]]
-        };
-        return Ok((rgb, texel[3]));
+        let texel = image_pixel(pixels, width, height_i, start_y, start_x, settings)?;
+        return Ok((premultiplied(texel), texel[3]));
     }
     let mut rgb_sum = [0.0_f32; 3];
     let mut alpha_sum = 0.0_f32;
@@ -1760,22 +1792,12 @@ fn sample_filter_rect(
             }
         }
         if start_x == end_x {
-            let texel = image_pixel(pixels, width, row, start_x, settings)?;
-            let rgb = if alpha_weighted {
-                [
-                    texel[0] * texel[3],
-                    texel[1] * texel[3],
-                    texel[2] * texel[3],
-                ]
-            } else {
-                [texel[0], texel[1], texel[2]]
-            };
+            let texel = image_pixel(pixels, width, height_i, row, start_x, settings)?;
+            let rgb = premultiplied(texel);
             for channel in 0..3 {
                 rgb_sum[channel] += row_weight * rgb[channel];
             }
-            if alpha_weighted {
-                alpha_sum += row_weight * texel[3];
-            }
+            alpha_sum += row_weight * texel[3];
             total_weight += row_weight;
         } else {
             let mut column = start_x;
@@ -1789,18 +1811,12 @@ fn sample_filter_rect(
                     weight *= rect.max_x - column_float;
                 }
                 if weight > 0.0 {
-                    let texel = image_pixel(pixels, width, row, column, settings)?;
+                    let texel = image_pixel(pixels, width, height_i, row, column, settings)?;
+                    let rgb = premultiplied(texel);
                     for channel in 0..3 {
-                        let value = if alpha_weighted {
-                            texel[channel] * texel[3]
-                        } else {
-                            texel[channel]
-                        };
-                        rgb_sum[channel] += weight * value;
+                        rgb_sum[channel] += weight * rgb[channel];
                     }
-                    if alpha_weighted {
-                        alpha_sum += weight * texel[3];
-                    }
+                    alpha_sum += weight * texel[3];
                     total_weight += weight;
                 }
                 if column == end_x {
@@ -1819,11 +1835,7 @@ fn sample_filter_rect(
     }
     Ok((
         rgb_sum.map(|value| value / total_weight),
-        if alpha_weighted {
-            alpha_sum / total_weight
-        } else {
-            1.0
-        },
+        alpha_sum / total_weight,
     ))
 }
 
@@ -1874,51 +1886,29 @@ fn filtered_image_pixels(
             }
         }
     }
-    let alpha_weighted = settings.use_alpha && !settings.calculate_alpha;
     if count == 1 {
-        let (rgb, alpha) = sample_filter_rect(
-            pixels,
-            width,
-            width_px,
-            height_px,
-            rects[0],
-            settings,
-            alpha_weighted,
-        )?;
+        let (rgb, alpha) =
+            sample_filter_rect(pixels, width, width_px, height_px, rects[0], settings)?;
         return Ok((rgb, alpha, alpha_clip));
     }
     let mut rgb_sum = [0.0_f32; 3];
     let mut alpha_sum = 0.0_f32;
     let mut total_area = 0.0_f32;
     for rect in rects.into_iter().take(count) {
-        let (rgb, alpha) = sample_filter_rect(
-            pixels,
-            width,
-            width_px,
-            height_px,
-            rect,
-            settings,
-            alpha_weighted,
-        )?;
+        let (rgb, alpha) = sample_filter_rect(pixels, width, width_px, height_px, rect, settings)?;
         let area = (rect.max_x - rect.min_x) * (rect.max_y - rect.min_y);
         total_area += area;
         for channel in 0..3 {
             rgb_sum[channel] += area * rgb[channel];
         }
-        if alpha_weighted {
-            alpha_sum += area * alpha;
-        }
+        alpha_sum += area * alpha;
     }
     if total_area == 0.0 {
         return Ok(([0.0; 3], 0.0, alpha_clip));
     }
     Ok((
         rgb_sum.map(|value| value / total_area),
-        if alpha_weighted {
-            alpha_sum / total_area
-        } else {
-            1.0
-        },
+        alpha_sum / total_area,
         alpha_clip,
     ))
 }
@@ -1960,7 +1950,15 @@ fn sample_image(
     let mut width_px = image.width;
     let mut height_px = image.height;
     let mut pixels = image.pixels.as_slice();
-    // Blender selects a tiled image's buffer from the input UV before applying extension modes.
+    if settings.extension == ImageExtension::Repeat {
+        fx = repeated_coordinate(fx, settings.repeat_x, settings.mirror_x)
+            .ok_or_else(|| invalid_image_sample("image repeat X coordinate is out of range"))?;
+        fy = repeated_coordinate(fy, settings.repeat_y, settings.mirror_y)
+            .ok_or_else(|| invalid_image_sample("image repeat Y coordinate is out of range"))?;
+    }
+    fx = settings.crop_min_x + fx * (settings.crop_max_x - settings.crop_min_x);
+    fy = settings.crop_min_y + fy * (settings.crop_max_y - settings.crop_min_y);
+    // Blender selects a tiled image's buffer from the UV after repeat, mirror, and crop.
     if !image.tiles.is_empty() {
         let u = floor_to_texture_i64(fx)
             .ok_or_else(|| invalid_image_sample("UDIM U coordinate is out of range"))?;
@@ -1985,14 +1983,6 @@ fn sample_image(
             }
         }
     }
-    if settings.extension == ImageExtension::Repeat {
-        fx = repeated_coordinate(fx, settings.repeat_x, settings.mirror_x)
-            .ok_or_else(|| invalid_image_sample("image repeat X coordinate is out of range"))?;
-        fy = repeated_coordinate(fy, settings.repeat_y, settings.mirror_y)
-            .ok_or_else(|| invalid_image_sample("image repeat Y coordinate is out of range"))?;
-    }
-    fx = settings.crop_min_x + fx * (settings.crop_max_x - settings.crop_min_x);
-    fy = settings.crop_min_y + fy * (settings.crop_max_y - settings.crop_min_y);
 
     if settings.flip_axis {
         std::mem::swap(&mut fx, &mut fy);
@@ -2059,17 +2049,8 @@ fn sample_image(
             pixels, width, width_px, height_px, adjusted_x, adjusted_y, settings,
         )?
     } else {
-        let texel = image_pixel(pixels, width, y, x, settings)?;
-        let rgb = if alpha_active {
-            [
-                texel[0] * texel[3],
-                texel[1] * texel[3],
-                texel[2] * texel[3],
-            ]
-        } else {
-            [texel[0], texel[1], texel[2]]
-        };
-        (rgb, texel[3], 1.0)
+        let texel = image_pixel(pixels, width, height_i, y, x, settings)?;
+        (premultiplied(texel), texel[3], 1.0)
     };
     rgb = rgb.map(|value| value * coverage);
     let tint = if alpha_active {
@@ -2084,7 +2065,7 @@ fn sample_image(
     } else {
         tint
     };
-    if alpha_active && alpha != 1.0 && alpha > 1e-4 {
+    if !settings.calculate_alpha && alpha != 1.0 && alpha > 1e-4 {
         rgb = rgb.map(|value| value / alpha);
     }
     rgb[0] = settings.factor_red * ((rgb[0] - 0.5) * settings.contrast + settings.brightness - 0.5);
@@ -2739,12 +2720,12 @@ fn org_blender_noise(x: f32, y: f32, z: f32) -> f32 {
     cn[4] = 1.0 - 3.0 * cn[4] - 2.0 * cn[4] * jy;
     cn[5] = 1.0 - 3.0 * cn[5] - 2.0 * cn[5] * jz;
     let b00 = hash_value(hash_value((ix & 255) as usize).wrapping_add((iy & 255) as usize));
-    let b10 = hash_value(hash_value(((ix + 1) & 255) as usize).wrapping_add((iy & 255) as usize));
-    let b01 = hash_value(hash_value((ix & 255) as usize).wrapping_add(((iy + 1) & 255) as usize));
-    let b11 =
-        hash_value(hash_value(((ix + 1) & 255) as usize).wrapping_add(((iy + 1) & 255) as usize));
+    let (ix1, iy1, iz1) = (ix.wrapping_add(1), iy.wrapping_add(1), iz.wrapping_add(1));
+    let b10 = hash_value(hash_value((ix1 & 255) as usize).wrapping_add((iy & 255) as usize));
+    let b01 = hash_value(hash_value((ix & 255) as usize).wrapping_add((iy1 & 255) as usize));
+    let b11 = hash_value(hash_value((ix1 & 255) as usize).wrapping_add((iy1 & 255) as usize));
     let b20 = (iz & 255) as usize;
-    let b21 = ((iz + 1) & 255) as usize;
+    let b21 = (iz1 & 255) as usize;
     let mut value = 0.5_f32;
     for (cx, cy, cz, xx, yy, zz, bz, bb) in [
         (0, 1, 2, ox, oy, oz, b20, b00),
@@ -3946,9 +3927,9 @@ mod tests {
             }),
             coords,
         )?;
-        assert_rgb_close(depth_without_alpha.rgb, [0.75; 3]);
+        assert_rgb_close(depth_without_alpha.rgb, [0.5625; 3]);
         assert_eq!(depth_without_alpha.alpha, 1.0);
-        assert_eq!(depth_without_alpha.intensity, 0.75);
+        assert_eq!(depth_without_alpha.intensity, 0.5625);
 
         let missing_pass = sample_scene_image_record(
             &mut doc,
@@ -4230,6 +4211,54 @@ mod tests {
         sample(TextureSource::Legacy(&noise), DVec3::ZERO, &mut actual).expect("noise sample");
         let _ = expected.get_int32();
         assert_eq!(actual.get_int32(), expected.get_int32());
+    }
+
+    #[test]
+    #[expect(
+        clippy::expect_used,
+        reason = "test fixture records and samples are valid"
+    )]
+    fn nearest_image_rows_are_sampled_bottom_up() {
+        // Storage row 0 is the top row; Blender's V=0 is the bottom, so the bottom sample reads row 1.
+        let image = ImageData {
+            width: 1,
+            height: 2,
+            pixels: vec![[1.0, 0.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]],
+            tiles: BTreeMap::default(),
+            interpolation: ImageInterpolation::Linear,
+        };
+        let mut settings = DEFAULT_IMAGE_SETTINGS;
+        settings.interpolation = false;
+        let mut rng = BlenderRng::seed(0);
+        let bottom = sample(
+            TextureSource::ImageWithSettings(&image, &settings),
+            DVec3::new(0.0, -0.75, 0.0),
+            &mut rng,
+        )
+        .expect("bottom row sample");
+        assert_rgb_close(bottom.rgb, [0.0, 0.0, 1.0]);
+        let top = sample(
+            TextureSource::ImageWithSettings(&image, &settings),
+            DVec3::new(0.0, 0.75, 0.0),
+            &mut rng,
+        )
+        .expect("top row sample");
+        assert_rgb_close(top.rgb, [1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn musgrave_octaves_follow_blender_rna_range() {
+        let record = |octaves: f64| {
+            json!({
+                "storage": "inline",
+                "kind": "legacy_texture",
+                "texture_type": "MUSGRAVE",
+                "settings": {"octaves": octaves}
+            })
+        };
+        assert!(parse_record("musgrave_max", &record(8.0)).is_ok());
+        assert!(parse_record("musgrave_over", &record(8.5)).is_err());
+        assert!(parse_record("musgrave_under", &record(-0.5)).is_err());
     }
 
     #[test]

@@ -12,12 +12,14 @@
 //! - bind store: `harmonic_coordinates_bind` (lines 1573-1741) and the static weights (1514-1523).
 //!
 //! Blender solves the system with Eigen `SparseLU` (`linear_solver.cc` 293-328). This port assembles the
-//! same matrix as triplets and factors it with the same solver through the native shim
-//! `native/meshdeform_harmonic_solve.cc`, one factorization for all cage vertices' right-hand sides.
+//! same matrix as triplets, factors it once with the same solver through the native shim
+//! `native/meshdeform_harmonic_solve.cc`, then solves one cage vertex's right-hand side at a time.
 //!
 //! The cage ray tests (`cage_bvh`) run in `f32` as Blender does, including the tree traversal, so culling
 //! matches. Elsewhere arithmetic is `f64` where Blender uses `f32`. Comparisons, branch structure, and
 //! accumulation order follow the source.
+
+use std::{ffi::c_void, ptr::NonNull};
 
 use glam::DVec3;
 
@@ -161,28 +163,30 @@ pub(super) fn bind_harmonic_grid(
         .iter()
         .map(|&point| inside_cage(&geometry, &grid, point))
         .collect();
-    let cells = CellBind::new(&geometry, grid, cell_count);
-    let variables = Variables::new(&cells.tags);
-    let mut lists: Vec<Vec<(usize, f64)>> = vec![Vec::new(); if dynamic { cell_count } else { 0 }];
+    let cells = CellBind::new(&geometry, grid, cell_count)?;
+    let variables = Variables::new(&cells.tags)?;
+    let mut lists: Vec<Vec<(usize, f64)>> =
+        try_vec_with(if dynamic { cell_count } else { 0 }, Vec::new)?;
     let mut static_rows: Vec<Vec<(usize, f64)>> =
-        vec![Vec::new(); if dynamic { 0 } else { source_cage_space.len() }];
+        try_vec_with(if dynamic { 0 } else { source_cage_space.len() }, Vec::new)?;
     if variables.count > 0 {
-        let cage_count = geometry.points.len();
-        let system = cells.assemble(&variables);
-        // One right-hand side column per cage vertex, solved against a single factorization.
-        let block_len = variables
-            .count
-            .checked_mul(cage_count)
-            .ok_or_else(limit_error)?;
-        let mut block = vec![0.0; block_len];
-        for (cage_vertex, rhs) in block.chunks_exact_mut(variables.count).enumerate() {
-            cells.fill_rhs(&variables, cage_vertex, rhs);
-        }
-        solve_system(&system, cage_count, &mut block)?;
-        for (cage_vertex, solution) in block.chunks_exact(variables.count).enumerate() {
-            let phi = cells.finish_phi(&variables, solution, cage_vertex);
+        let system = cells.assemble(&variables)?;
+        let factor = HarmonicFactor::factorize(&system)?;
+        // The triplets are only needed by the factorization.
+        drop(system);
+        // One right-hand side per cage vertex (meshlaplacian.cc:1657-1683), solved against the single
+        // factorization. Each solution is expanded to cell values and recorded before the next column, so
+        // only one column of unknowns and one of cells is held at a time.
+        let mut rhs = try_vec_with(variables.count, || 0.0)?;
+        let mut solution = try_vec_with(variables.count, || 0.0)?;
+        let mut phi = try_vec_with(cell_count, || 0.0)?;
+        for cage_vertex in 0..geometry.points.len() {
+            rhs.fill(0.0);
+            cells.fill_rhs(&variables, cage_vertex, &mut rhs);
+            factor.solve_column(&rhs, &mut solution)?;
+            cells.finish_phi(&variables, &solution, cage_vertex, &mut phi);
             if dynamic {
-                push_dynamic(&mut lists, &phi, cage_vertex);
+                push_dynamic(&mut lists, &phi, cage_vertex)?;
             } else {
                 push_static(
                     &mut static_rows,
@@ -191,7 +195,7 @@ pub(super) fn bind_harmonic_grid(
                     &grid,
                     &phi,
                     cage_vertex,
-                );
+                )?;
             }
         }
     }
@@ -263,6 +267,21 @@ fn limit_error() -> PotError {
         ErrorCode::LimitExceeded,
         "Mesh Deform harmonic bind is too large to represent; lower the precision",
     )
+}
+
+/// Builds a vector of `len` values, failing with a limit error instead of aborting when memory is short.
+fn try_vec_with<T>(len: usize, mut make: impl FnMut() -> T) -> Result<Vec<T>> {
+    let mut values = Vec::new();
+    values.try_reserve_exact(len).map_err(|_| limit_error())?;
+    values.extend((0..len).map(|_| make()));
+    Ok(values)
+}
+
+/// Appends to `values`, failing with a limit error instead of aborting when memory is short.
+fn try_push<T>(values: &mut Vec<T>, value: T) -> Result<()> {
+    values.try_reserve(1).map_err(|_| limit_error())?;
+    values.push(value);
+    Ok(())
 }
 
 /// Cell count for `size` cells per axis. Only arithmetic overflow is rejected.
@@ -490,18 +509,18 @@ fn mean_value_weights(points: &[DVec3], point: DVec3) -> Vec<f64> {
 
 /// Cell classification and the per-cage-vertex solve (`harmonic_coordinates_bind`, 1657-1683).
 impl<'a> CellBind<'a> {
-    fn new(geometry: &'a CageGeometry, grid: Grid, cell_count: usize) -> Self {
+    fn new(geometry: &'a CageGeometry, grid: Grid, cell_count: usize) -> Result<Self> {
         let mut cells = Self {
             geometry,
             grid,
-            tags: vec![Tag::Untyped; cell_count],
-            boundary: (0..cell_count).map(|_| Default::default()).collect(),
-            semibound: vec![false; cell_count],
+            tags: try_vec_with(cell_count, || Tag::Untyped)?,
+            boundary: try_vec_with(cell_count, Default::default)?,
+            semibound: try_vec_with(cell_count, || false)?,
         };
         cells.tag_boundaries();
         cells.flood_fill();
         cells.mark_semibound();
-        cells
+        Ok(cells)
     }
 
     /// `meshdeform_add_intersections` over every cell (meshlaplacian.cc:1663-1669, 1119-1142).
@@ -596,7 +615,7 @@ impl<'a> CellBind<'a> {
     }
 
     /// Builds the system matrix in triplet form (`meshdeform_matrix_add_cell`, meshlaplacian.cc:1334-1361).
-    fn assemble(&self, variables: &Variables) -> SparseSystem {
+    fn assemble(&self, variables: &Variables) -> Result<SparseSystem> {
         let mut system = SparseSystem {
             size: variables.count,
             rows: Vec::new(),
@@ -607,7 +626,7 @@ impl<'a> CellBind<'a> {
             let Some(row) = *slot else {
                 continue;
             };
-            system.push(row, row, 1.0);
+            system.push(row, row, 1.0)?;
             let total = self.total_weight(cell);
             for dir in 1..=6 {
                 let Some(next) = self.coupling(cell, dir) else {
@@ -617,10 +636,10 @@ impl<'a> CellBind<'a> {
                     continue;
                 };
                 let weight = (1.0 / self.grid.width.x) / total;
-                system.push(row, col, -weight);
+                system.push(row, col, -weight)?;
             }
         }
-        system
+        Ok(system)
     }
 
     /// Right-hand side for one cage vertex (`meshdeform_matrix_add_rhs`, meshlaplacian.cc:1363-1390),
@@ -643,10 +662,17 @@ impl<'a> CellBind<'a> {
         }
     }
 
-    /// Cell values for one cage vertex from its solved unknowns (`solution`, one per unknown). Adds the
-    /// semibound cells (meshlaplacian.cc:1392-1416) and the exterior cells next to them (1418-1443).
-    fn finish_phi(&self, variables: &Variables, solution: &[f64], cage_vertex: usize) -> Vec<f64> {
-        let mut phi = vec![0.0; self.tags.len()];
+    /// Cell values for one cage vertex from its solved unknowns (`solution`, one per unknown), written into
+    /// `phi`. Adds the semibound cells (meshlaplacian.cc:1392-1416) and the exterior cells next to them
+    /// (1418-1443).
+    fn finish_phi(
+        &self,
+        variables: &Variables,
+        solution: &[f64],
+        cage_vertex: usize,
+        phi: &mut [f64],
+    ) {
+        phi.fill(0.0);
         for (cell, slot) in variables.index.iter().enumerate() {
             if let Some(row) = *slot {
                 phi[cell] = solution[row];
@@ -683,7 +709,6 @@ impl<'a> CellBind<'a> {
                 phi[cell] = sum / count;
             }
         }
-        phi
     }
 }
 
@@ -698,93 +723,139 @@ struct CellBind<'a> {
 
 impl Variables {
     /// `mdb->varidx` (meshlaplacian.cc:1453-1456): exterior cells carry no unknown.
-    fn new(tags: &[Tag]) -> Self {
+    fn new(tags: &[Tag]) -> Result<Self> {
+        let mut index: Vec<Option<usize>> = Vec::new();
+        index
+            .try_reserve_exact(tags.len())
+            .map_err(|_| limit_error())?;
         let mut count = 0;
-        let index: Vec<Option<usize>> = tags
-            .iter()
-            .map(|&tag| {
-                if tag == Tag::Exterior {
-                    None
-                } else {
-                    count += 1;
-                    Some(count - 1)
-                }
-            })
-            .collect();
-        Self { index, count }
+        for &tag in tags {
+            if tag == Tag::Exterior {
+                index.push(None);
+            } else {
+                index.push(Some(count));
+                count += 1;
+            }
+        }
+        Ok(Self { index, count })
     }
 }
 
 impl SparseSystem {
-    fn push(&mut self, row: usize, col: usize, value: f64) {
-        self.rows.push(row);
-        self.cols.push(col);
-        self.values.push(value);
+    fn push(&mut self, row: usize, col: usize, value: f64) -> Result<()> {
+        try_push(&mut self.rows, row)?;
+        try_push(&mut self.cols, col)?;
+        try_push(&mut self.values, value)
     }
 }
 
 unsafe extern "C" {
-    fn potter_meshdeform_harmonic_solve(
+    fn potter_meshdeform_harmonic_factor(
         size: usize,
         entry_count: usize,
         rows: *const usize,
         cols: *const usize,
         values: *const f64,
-        column_count: usize,
-        columns: *mut f64,
+        factor: *mut *mut c_void,
     ) -> i32;
+    fn potter_meshdeform_harmonic_solve_column(
+        factor: *const c_void,
+        rhs: *const f64,
+        solution: *mut f64,
+    ) -> i32;
+    fn potter_meshdeform_harmonic_free(factor: *mut c_void);
 }
 
-/// Solves `A X = B` in place with Eigen `SparseLU` (`EIG_linear_solver_solve`, `linear_solver.cc` 293-328).
-/// `block` holds `column_count` right-hand sides of `system.size` values each, one per cage vertex; on
-/// success it holds the solutions.
-fn solve_system(system: &SparseSystem, column_count: usize, block: &mut [f64]) -> Result<()> {
-    let size = system.size;
-    let entry_count = system.values.len();
-    if system.rows.len() != entry_count
-        || system.cols.len() != entry_count
-        || size.checked_mul(column_count) != Some(block.len())
-    {
-        return Err(PotError::new(
-            ErrorCode::InternalError,
-            "Mesh Deform harmonic bind system and right-hand sides disagree in size",
-        ));
+/// Eigen `SparseLU` factorization of the bind system (`EIG_linear_solver_solve`, `linear_solver.cc`
+/// 293-328), held by the native shim. Every cage vertex's right-hand side is solved against this one
+/// factorization, one column at a time.
+struct HarmonicFactor {
+    handle: NonNull<c_void>,
+    size: usize,
+}
+
+impl HarmonicFactor {
+    /// Factors `system` once. Eigen stores matrix indices as 32-bit integers, so larger systems are
+    /// rejected.
+    fn factorize(system: &SparseSystem) -> Result<Self> {
+        let size = system.size;
+        let entry_count = system.values.len();
+        if system.rows.len() != entry_count || system.cols.len() != entry_count {
+            return Err(PotError::new(
+                ErrorCode::InternalError,
+                "Mesh Deform harmonic bind system entries disagree in length",
+            ));
+        }
+        if i32::try_from(size).is_err() || i32::try_from(entry_count).is_err() {
+            return Err(limit_error());
+        }
+        let mut handle: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `rows`, `cols`, and `values` each hold `entry_count` initialized elements (checked above).
+        // The native side copies the triplets before returning and keeps no pointer to them; `handle` is
+        // written only on success.
+        let status = unsafe {
+            potter_meshdeform_harmonic_factor(
+                size,
+                entry_count,
+                system.rows.as_ptr(),
+                system.cols.as_ptr(),
+                system.values.as_ptr(),
+                &mut handle,
+            )
+        };
+        if status != 0 {
+            return Err(solver_error(status));
+        }
+        let handle = NonNull::new(handle).ok_or_else(|| solver_error(status))?;
+        Ok(Self { handle, size })
     }
-    // Eigen stores matrix indices as 32-bit integers, so larger systems cannot be represented.
-    if i32::try_from(size).is_err() || i32::try_from(entry_count).is_err() {
-        return Err(limit_error());
+
+    /// Solves one right-hand side (`size` values) into `solution` (`size` values).
+    fn solve_column(&self, rhs: &[f64], solution: &mut [f64]) -> Result<()> {
+        if rhs.len() != self.size || solution.len() != self.size {
+            return Err(PotError::new(
+                ErrorCode::InternalError,
+                "Mesh Deform harmonic bind right-hand side disagrees with its factorization",
+            ));
+        }
+        // SAFETY: `handle` is live until `Drop`, and both slices hold `size` initialized values.
+        let status = unsafe {
+            potter_meshdeform_harmonic_solve_column(
+                self.handle.as_ptr(),
+                rhs.as_ptr(),
+                solution.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(solver_error(status));
+        }
+        Ok(())
     }
-    // SAFETY: `rows`, `cols`, and `values` each hold `entry_count` initialized elements, and `block`
-    // holds `size * column_count` initialized values (checked above). The native solver reads the
-    // triplets, overwrites `block` with the solutions, and keeps no pointer after it returns.
-    let status = unsafe {
-        potter_meshdeform_harmonic_solve(
-            size,
-            entry_count,
-            system.rows.as_ptr(),
-            system.cols.as_ptr(),
-            system.values.as_ptr(),
-            column_count,
-            block.as_mut_ptr(),
-        )
-    };
-    if status != 0 {
-        return Err(PotError::invalid_operation(format!(
-            "Failed to find Mesh Deform harmonic bind solution (native status {status}; increase precision?)"
-        )));
+}
+
+impl Drop for HarmonicFactor {
+    fn drop(&mut self) {
+        // SAFETY: `handle` came from `potter_meshdeform_harmonic_factor` and is released exactly once.
+        unsafe { potter_meshdeform_harmonic_free(self.handle.as_ptr()) };
     }
-    Ok(())
+}
+
+fn solver_error(status: i32) -> PotError {
+    PotError::invalid_operation(format!(
+        "Failed to find Mesh Deform harmonic bind solution (native status {status}; increase precision?)"
+    ))
 }
 
 /// Dynamic bind: records the cage vertex's influence on each cell (`meshdeform_matrix_solve`,
 /// meshlaplacian.cc:1525-1539 dynamic branch). Pushing in cage order and reversing afterwards gives
 /// Blender's head-inserted linked-list order.
-fn push_dynamic(lists: &mut [Vec<(usize, f64)>], phi: &[f64], cage_vertex: usize) {
+fn push_dynamic(lists: &mut [Vec<(usize, f64)>], phi: &[f64], cage_vertex: usize) -> Result<()> {
     for (list, &value) in lists.iter_mut().zip(phi) {
         if value >= MIN_INFLUENCE {
-            list.push((cage_vertex, value));
+            try_push(list, (cage_vertex, value))?;
         }
     }
+    Ok(())
 }
 
 /// Static bind: interpolates `phi` at each inside source vertex (meshlaplacian.cc:1512-1523 with
@@ -796,7 +867,7 @@ fn push_static(
     grid: &Grid,
     phi: &[f64],
     cage_vertex: usize,
-) {
+) -> Result<()> {
     for ((row, &point), &is_inside) in rows.iter_mut().zip(source).zip(inside) {
         if !is_inside {
             continue;
@@ -804,9 +875,10 @@ fn push_static(
         let gridvec = (point - grid.min - grid.halfwidth) / grid.width;
         let weight = interpolate_phi(grid.size, phi, gridvec);
         if weight != 0.0 {
-            row.push((cage_vertex, weight));
+            try_push(row, (cage_vertex, weight))?;
         }
     }
+    Ok(())
 }
 
 /// `meshdeform_interp_w` (meshlaplacian.cc:1228-1287): trilinear interpolation with clamped corners.

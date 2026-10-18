@@ -449,6 +449,7 @@ def _image_texture_uses_image_fastpath(texture):
     if image is None or sum(
             item.type == "IMAGE" and item.image == image
             for item in getattr(bpy.data, "textures", ())) != 1:
+        return False
     settings = _legacy_texture_settings(texture)
     image_user_settings = settings.pop("image_user", {})
     color_ramp = settings.pop("color_ramp", None)
@@ -472,6 +473,8 @@ def _legacy_texture_settings(texture):
     if settings_keys is None:
         raise ValueError("unsupported legacy Texture type %s" % texture.type)
     if texture.type == "IMAGE":
+        if texture.use_nodes and texture.node_tree:
+            raise ValueError("node-based image Texture %s cannot be exported" % texture.name_full)
         settings = _rna_scalar_settings(
             texture, omit=("name", "name_full", "type", "image", "image_user",
                            "color_ramp", "use_nodes", "node_tree"))
@@ -3073,6 +3076,13 @@ def _same_mesh_topology(left, right):
     )
 
 
+# Bind formats whose bound modifiers a source .blend can reproduce natively, keyed by bind format.
+NATIVE_BIND_KINDS = {
+    "blender_native_bind_v1": ("surface_deform", "mesh_deform", "laplacian_deform"),
+    "blender_corrective_bind_v1": ("corrective_smooth",),
+}
+
+
 def _source_modifier_object_copies(doc, mesh_map):
     source_path = doc.get("blender_original_blend_path")
     if not source_path or not os.path.isfile(source_path):
@@ -3080,10 +3090,8 @@ def _source_modifier_object_copies(doc, mesh_map):
     source_names = set()
     for node_id, node in doc.get("nodes", {}).items():
         if not any(
-            ((modifier.get("binding_data") or {}).get("format")
-             == "blender_native_bind_v1"
-             and modifier.get("type") in (
-                 "surface_deform", "mesh_deform", "laplacian_deform"))
+            modifier.get("type") in NATIVE_BIND_KINDS.get(
+                (modifier.get("binding_data") or {}).get("format"), ())
             or modifier.get("type") in ("boolean", "decimate", "solidify")
             for modifier in node.get("modifiers", [])
         ):
@@ -3132,8 +3140,7 @@ def _source_modifier_object_copies(doc, mesh_map):
             if not source_topology_matches:
                 continue
             kind = item.get("type")
-            if (binding_data.get("format") != "blender_native_bind_v1"
-                    or kind not in ("surface_deform", "mesh_deform", "laplacian_deform")):
+            if kind not in NATIVE_BIND_KINDS.get(binding_data.get("format"), ()):
                 continue
             native = source_obj.modifiers.get(item.get("name"))
             if (native is None or native.type != blender_modifier_type(kind)
@@ -3165,7 +3172,7 @@ def _source_modifier_object_copies(doc, mesh_map):
             copied.vertex_groups.remove(group)
         for modifier in list(copied.modifiers):
             if (modifier.type in (
-                    "SURFACE_DEFORM", "MESH_DEFORM", "LAPLACIANDEFORM")
+                    "SURFACE_DEFORM", "MESH_DEFORM", "LAPLACIANDEFORM", "CORRECTIVE_SMOOTH")
                     and modifier.name not in native_names):
                 copied.modifiers.remove(modifier)
         copies[node_id] = copied
@@ -3192,11 +3199,72 @@ def _source_modifier_object_copies(doc, mesh_map):
     return copies, preserved
 
 
+def _bind_corrective_smooth(obj, modifier, binding_data, operator):
+    """Bind a Corrective Smooth modifier to its serialized bind-input coordinates.
+
+    Blender captures the bind from the modifier input: the evaluated stack before the modifier.
+    The bind is reproduced on a copy of that evaluated input, with the serialized coordinates as
+    its vertex positions, so a geometry-changing prefix such as Subdivision binds correctly.
+    Preceding modifiers stay hidden only while the operator runs, so their output is not applied to
+    the coordinates a second time. Every visibility flag and the object's mesh are restored on error.
+    """
+    if binding_data.get("format") != "blender_corrective_bind_v1":
+        raise ValueError("corrective smooth %s has an unsupported bind format" % modifier.name)
+    coords = binding_data.get("coords")
+    if not isinstance(coords, list) or any(
+            not isinstance(coord, (list, tuple)) or len(coord) != 3 for coord in coords):
+        raise ValueError("corrective smooth %s has malformed bind coordinates" % modifier.name)
+    view_layer = bpy.context.view_layer
+    stack = list(obj.modifiers)
+    index = [item.name for item in stack].index(modifier.name)
+    visibility = [(item, item.show_viewport, item.show_render) for item in stack]
+
+    def restore_visibility():
+        for item, show_viewport, show_render in visibility:
+            item.show_viewport = show_viewport
+            item.show_render = show_render
+
+    original_mesh = obj.data
+    bind_mesh = None
+    try:
+        # Capture the bind input with this modifier and every later one hidden.
+        for item in stack[index:]:
+            item.show_viewport = False
+        view_layer.update()
+        evaluated = obj.evaluated_get(bpy.context.evaluated_depsgraph_get())
+        input_mesh = evaluated.to_mesh(preserve_all_data_layers=True)
+        try:
+            if len(input_mesh.vertices) != len(coords):
+                raise ValueError(
+                    "corrective smooth %s on %s has %d input vertices but %d bind coordinates"
+                    % (modifier.name, obj.name, len(input_mesh.vertices), len(coords)))
+            bind_mesh = input_mesh.copy()
+        finally:
+            evaluated.to_mesh_clear()
+        restore_visibility()
+        for item in stack[:index]:
+            item.show_viewport = False
+            item.show_render = False
+        obj.data = bind_mesh
+        _set_mesh_coordinates(obj, coords)
+        view_layer.update()
+        result = operator(modifier=modifier.name)
+        if "FINISHED" not in result:
+            raise ValueError("Blender did not bind modifier %s" % modifier.name)
+    finally:
+        restore_visibility()
+        obj.data = original_mesh
+        view_layer.update()
+        if bind_mesh is not None:
+            bpy.data.meshes.remove(bind_mesh)
+
+
 def _bind_blender_modifiers(doc, object_map, preserved_native_binds):
     operators = {
         "surface_deform": bpy.ops.object.surfacedeform_bind,
         "mesh_deform": bpy.ops.object.meshdeform_bind,
         "laplacian_deform": bpy.ops.object.laplaciandeform_bind,
+        "corrective_smooth": bpy.ops.object.correctivesmooth_bind,
     }
     view_layer = bpy.context.view_layer
     for node_id, node in doc.get("nodes", {}).items():
@@ -3230,6 +3298,9 @@ def _bind_blender_modifiers(doc, object_map, preserved_native_binds):
                     bpy.ops.object.mode_set(mode="OBJECT")
                 obj.select_set(True)
                 view_layer.objects.active = obj
+                if item.get("type") == "corrective_smooth":
+                    _bind_corrective_smooth(obj, modifier, binding_data, operator)
+                    continue
                 seen_meshes = set()
                 for bind_node_id, bind_obj in bind_objects:
                     if bind_obj.type != "MESH":

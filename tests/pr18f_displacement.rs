@@ -15,7 +15,12 @@
 #[path = "common/blender_file.rs"]
 mod blender_file;
 
-use std::{collections::BTreeMap, env, path::PathBuf, process::Command};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    env,
+    path::PathBuf,
+    process::Command,
+};
 
 use glam::DVec3;
 use potter_core::{
@@ -24,10 +29,11 @@ use potter_core::{
         Mesh,
         modifiers::{evaluate_modifiers, evaluate_modifiers_with_groups_at_frame},
     },
-    model::{Id, Modifier, ModifierRuntime, SceneDoc, VertexGroup},
+    model::{Id, Modifier, ModifierRuntime, SceneDoc},
     ops::apply_batch,
 };
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 
 /// Blender's float32 rounding; the implementation computes in f64 with the same algorithm.
 const TOLERANCE: f64 = 2.0e-5;
@@ -1415,34 +1421,131 @@ fn native_value_noise_record_preserves_old_volume_noise_color()
     Ok(())
 }
 
+/// Blender's `BLI_noise_hash_uchar_512` first period (`intern/noise_c.cc`); the table repeats.
+const BLI_HASH_UCHAR_256: [u8; 256] = [
+    0xA2, 0xA0, 0x19, 0x3B, 0xF8, 0xEB, 0xAA, 0xEE, 0xF3, 0x1C, 0x67, 0x28, 0x1D, 0xED, 0x0, 0xDE,
+    0x95, 0x2E, 0xDC, 0x3F, 0x3A, 0x82, 0x35, 0x4D, 0x6C, 0xBA, 0x36, 0xD0, 0xF6, 0xC, 0x79, 0x32,
+    0xD1, 0x59, 0xF4, 0x8, 0x8B, 0x63, 0x89, 0x2F, 0xB8, 0xB4, 0x97, 0x83, 0xF2, 0x8F, 0x18, 0xC7,
+    0x51, 0x14, 0x65, 0x87, 0x48, 0x20, 0x42, 0xA8, 0x80, 0xB5, 0x40, 0x13, 0xB2, 0x22, 0x7E, 0x57,
+    0xBC, 0x7F, 0x6B, 0x9D, 0x86, 0x4C, 0xC8, 0xDB, 0x7C, 0xD5, 0x25, 0x4E, 0x5A, 0x55, 0x74, 0x50,
+    0xCD, 0xB3, 0x7A, 0xBB, 0xC3, 0xCB, 0xB6, 0xE2, 0xE4, 0xEC, 0xFD, 0x98, 0xB, 0x96, 0xD3, 0x9E,
+    0x5C, 0xA1, 0x64, 0xF1, 0x81, 0x61, 0xE1, 0xC4, 0x24, 0x72, 0x49, 0x8C, 0x90, 0x4B, 0x84, 0x34,
+    0x38, 0xAB, 0x78, 0xCA, 0x1F, 0x1, 0xD7, 0x93, 0x11, 0xC1, 0x58, 0xA9, 0x31, 0xF9, 0x44, 0x6D,
+    0xBF, 0x33, 0x9C, 0x5F, 0x9, 0x94, 0xA3, 0x85, 0x6, 0xC6, 0x9A, 0x1E, 0x7B, 0x46, 0x15, 0x30,
+    0x27, 0x2B, 0x1B, 0x71, 0x3C, 0x5B, 0xD6, 0x6F, 0x62, 0xAC, 0x4F, 0xC2, 0xC0, 0xE, 0xB1, 0x23,
+    0xA7, 0xDF, 0x47, 0xB0, 0x77, 0x69, 0x5, 0xE9, 0xE6, 0xE7, 0x76, 0x73, 0xF, 0xFE, 0x6E, 0x9B,
+    0x56, 0xEF, 0x12, 0xA5, 0x37, 0xFC, 0xAE, 0xD9, 0x3, 0x8E, 0xDD, 0x10, 0xB9, 0xCE, 0xC9, 0x8D,
+    0xDA, 0x2A, 0xBD, 0x68, 0x17, 0x9F, 0xBE, 0xD4, 0xA, 0xCC, 0xD2, 0xE8, 0x43, 0x3D, 0x70, 0xB7,
+    0x2, 0x7D, 0x99, 0xD8, 0xD, 0x60, 0x8A, 0x4, 0x2C, 0x3E, 0x92, 0xE5, 0xAF, 0x53, 0x7, 0xE0,
+    0x29, 0xA6, 0xC5, 0xE3, 0xF5, 0xF7, 0x4A, 0x41, 0x26, 0x6A, 0x16, 0x5E, 0x52, 0x2D, 0x21, 0xAD,
+    0xF0, 0x91, 0xFF, 0xEA, 0x54, 0xFA, 0x66, 0x1A, 0x45, 0x39, 0xCF, 0x75, 0xA4, 0x88, 0xFB, 0x5D,
+];
+
+/// The 48-bit LCG of `BLI_rng` (`RandomNumberGenerator`); each output is `state >> 17`.
+struct BliRng {
+    state: u64,
+}
+
+impl BliRng {
+    fn seed(seed: u32) -> Self {
+        Self {
+            state: (u64::from(seed) << 16) | 0x330E,
+        }
+    }
+
+    /// `BLI_rng_srandom`: hashed seeding, three rounds through the hash table.
+    fn seed_random(seed: u32) -> Self {
+        let hash = |value: u32| u32::from(BLI_HASH_UCHAR_256[(value & 0xFF) as usize]);
+        let mut rng = Self::seed(seed.wrapping_add(hash(seed)));
+        let mut value = rng.next_u32();
+        rng = Self::seed(value.wrapping_add(hash(value)));
+        value = rng.next_u32();
+        Self::seed(value.wrapping_add(hash(value)))
+    }
+
+    fn next_u32(&mut self) -> u32 {
+        self.state =
+            0x5_DEEC_E66D_u64.wrapping_mul(self.state).wrapping_add(0xB) & 0x0000_FFFF_FFFF_FFFF;
+        (self.state >> 17) as u32
+    }
+}
+
+/// The stream the documented policy gives one modifier: SHA-256 over the domain tag, the base seed
+/// (`render.seed` for Render, 0 for Preview), the length-prefixed subject node ID, and the big-endian
+/// modifier stack index. The first four digest bytes, big-endian, seed `BLI_rng_srandom`.
+fn documented_modifier_stream(base: u32, subject: &str, stack_index: usize) -> BliRng {
+    let mut key = b"potter.modifier-texture-stream.v2\0".to_vec();
+    key.extend_from_slice(&base.to_be_bytes());
+    key.extend_from_slice(&(subject.len() as u64).to_be_bytes());
+    key.extend_from_slice(subject.as_bytes());
+    key.extend_from_slice(&(stack_index as u64).to_be_bytes());
+    let digest = Sha256::digest(&key);
+    BliRng::seed_random(u32::from_be_bytes([
+        digest[0], digest[1], digest[2], digest[3],
+    ]))
+}
+
+/// Legacy Noise intensity for one 32-bit draw at the sampler's default `noise_depth` of 2 (NOISE
+/// has no settings): the base-3 digits of the draw, divided by `3^(depth + 1)`.
+fn legacy_noise_intensity(draw: u32) -> f32 {
+    const DEPTH: u32 = 2;
+    let mut value = (draw >> 29) & 3;
+    let mut shift = 29_u32;
+    let mut divisor = 3.0_f32;
+    for _ in 0..DEPTH {
+        shift -= 2;
+        value = value.wrapping_mul((draw >> shift) & 3);
+        divisor *= 3.0;
+    }
+    value as f32 / divisor
+}
+
 #[test]
-fn legacy_noise_texture_consumes_one_seeded_rng_value_per_vertex()
+fn legacy_noise_texture_follows_the_documented_modifier_stream()
 -> Result<(), Box<dyn std::error::Error>> {
     let operations = [
         json!({"op":"node.create","id":"subject","kind":"plane","params":{"size":2.0}}),
         json!({"op":"texture.create","id":"noise_tex","texture_type":"NOISE"}),
         json!({"op":"modifier.create","target":{"id":"subject"},"id":"deform","type":"displace","params":{"direction":"X","strength":1.0,"mid_level":0.5,"texture":"noise_tex","texture_coords":"LOCAL"}}),
     ];
-    let mesh = scene_subject(&operations, None)?;
-    let expected = [
-        [-1.5, -1.0, 0.0],
-        [0.5, -1.0, 0.0],
-        [0.537_037_037, 1.0, 0.0],
-        [-1.055_555_556, 1.0, 0.0],
+    // Preview uses base seed 0. Each vertex consumes one draw, in vertex order, from the stream of
+    // the `deform` modifier on `subject`; the displacement is `(intensity - mid_level) * strength`
+    // along X, with strength 1 and mid_level 0.5.
+    const PLANE_CORNERS: [[f64; 3]; 4] = [
+        [-1.0, -1.0, 0.0],
+        [1.0, -1.0, 0.0],
+        [1.0, 1.0, 0.0],
+        [-1.0, 1.0, 0.0],
     ];
-    assert_plane("legacy Noise seed 0 sequence", &mesh, &expected);
+    let mut stream = documented_modifier_stream(0, "subject", 0);
+    let expected = PLANE_CORNERS.map(|[x, y, z]| {
+        let intensity = f64::from(legacy_noise_intensity(stream.next_u32()));
+        [x + intensity - 0.5, y, z]
+    });
+    let mesh = scene_subject(&operations, None)?;
+    assert_plane("legacy Noise per-modifier stream", &mesh, &expected);
     Ok(())
 }
 
-fn snapshot_noise_doc(render_seed: u32) -> SceneDoc {
-    let operations = vec![
-        json!({"op":"texture.create","id":"noise_tex","texture_type":"NOISE"}),
-        json!({"op":"node.create","id":"a_noise","kind":"plane","params":{"size":2.0}}),
-        json!({"op":"node.create","id":"b_subject","kind":"plane","params":{"size":2.0}}),
-        json!({"op":"modifier.create","target":{"id":"a_noise"},"id":"a_displace","type":"displace","params":{"direction":"X","strength":0.8,"mid_level":0.5,"texture":"noise_tex","texture_coords":"LOCAL"}}),
-        json!({"op":"modifier.create","target":{"id":"b_subject"},"id":"b_first","type":"displace","params":{"direction":"X","strength":0.7,"mid_level":0.5,"texture":"noise_tex","texture_coords":"LOCAL","vertex_group":"rng_first_vertex"}}),
-        json!({"op":"modifier.create","target":{"id":"b_subject"},"id":"b_second","type":"displace","params":{"direction":"X","strength":0.9,"mid_level":0.5,"texture":"noise_tex","texture_coords":"LOCAL"}}),
-    ];
+/// Noise displacements on `b_subject` (two modifiers), plus one unrelated plane with its own Noise
+/// displacement for each name in `unrelated`, created in that order.
+fn noise_scene(render_seed: u32, unrelated: &[&str]) -> SceneDoc {
+    let mut operations =
+        vec![json!({"op":"texture.create","id":"noise_tex","texture_type":"NOISE"})];
+    for name in unrelated {
+        operations.push(json!({"op":"node.create","id":name,"kind":"plane","params":{"size":2.0}}));
+        operations.push(json!({
+            "op":"modifier.create",
+            "target":{"id":name},
+            "id":format!("{name}_displace"),
+            "type":"displace",
+            "params":{"direction":"X","strength":0.8,"mid_level":0.5,"texture":"noise_tex","texture_coords":"LOCAL"},
+        }));
+    }
+    operations
+        .push(json!({"op":"node.create","id":"b_subject","kind":"plane","params":{"size":2.0}}));
+    operations.push(json!({"op":"modifier.create","target":{"id":"b_subject"},"id":"b_first","type":"displace","params":{"direction":"X","strength":0.7,"mid_level":0.5,"texture":"noise_tex","texture_coords":"LOCAL"}}));
+    operations.push(json!({"op":"modifier.create","target":{"id":"b_subject"},"id":"b_second","type":"displace","params":{"direction":"X","strength":0.9,"mid_level":0.5,"texture":"noise_tex","texture_coords":"LOCAL"}}));
     let mut doc = apply_batch(
         &SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned()),
         &json!({"schema_version":1,"base_revision":0,"operations":operations}),
@@ -1450,32 +1553,6 @@ fn snapshot_noise_doc(render_seed: u32) -> SceneDoc {
     .unwrap()
     .doc;
     doc.scenes.get_mut(&doc.active_scene).unwrap().render.seed = render_seed;
-    let subject_id = Id::new("b_subject").unwrap();
-    let data_id = doc.nodes[&subject_id].data.as_ref().unwrap().clone();
-    let data = doc.data_blocks.get_mut(&data_id).unwrap();
-    let group_id = Id::new("rng_first_vertex").unwrap();
-    data.vertex_groups.push(VertexGroup {
-        id: group_id.clone(),
-        name: "rng_first_vertex".to_owned(),
-    });
-    let vertex_ids: Vec<u32> = data
-        .mesh
-        .as_ref()
-        .unwrap()
-        .vertices
-        .iter()
-        .map(|vertex| vertex.id)
-        .collect();
-    let first_vertex = vertex_ids[0];
-    for vertex_id in vertex_ids {
-        data.vertex_weights.insert(
-            vertex_id,
-            BTreeMap::from([(
-                group_id.clone(),
-                if vertex_id == first_vertex { 1.0 } else { 0.0 },
-            )]),
-        );
-    }
     doc
 }
 
@@ -1495,64 +1572,70 @@ fn snapshot_positions(doc: &SceneDoc, purpose: EvaluationPurpose, node: &str) ->
         .collect()
 }
 
+/// The same node's positions from a subset evaluation that selects only that node.
+fn subset_positions(doc: &SceneDoc, purpose: EvaluationPurpose, node: &str) -> Vec<DVec3> {
+    let id = Id::new(node.to_owned()).unwrap();
+    let snapshot = Snapshot::evaluate_nodes_with_cache(
+        doc,
+        &EvaluationContext {
+            purpose,
+            ..EvaluationContext::default()
+        },
+        None,
+        None,
+        &BTreeSet::from([id.clone()]),
+    )
+    .unwrap();
+    snapshot.meshes[&id]
+        .vertices
+        .iter()
+        .map(|vertex| vertex.co)
+        .collect()
+}
+
 #[test]
-fn snapshot_noise_rng_uses_purpose_seed_and_one_shared_stream() {
-    let render_seed_zero = snapshot_noise_doc(0);
-    let render_seed_nonzero = snapshot_noise_doc(73);
+fn unrelated_objects_do_not_change_a_modifiers_noise_stream() {
+    for purpose in [EvaluationPurpose::Preview, EvaluationPurpose::Render] {
+        let alone = snapshot_positions(&noise_scene(73, &[]), purpose, "b_subject");
+        assert!(
+            alone
+                .iter()
+                .any(|point| (point.x - alone[0].x).abs() > TOLERANCE),
+            "{purpose:?}: Noise must move the subject for the comparison to be meaningful",
+        );
+        for unrelated in [
+            &["a_noise"][..],
+            &["c_noise"][..],
+            &["a_noise", "c_noise"][..],
+            &["c_noise", "a_noise"][..],
+        ] {
+            let doc = noise_scene(73, unrelated);
+            assert_eq!(
+                snapshot_positions(&doc, purpose, "b_subject"),
+                alone,
+                "{purpose:?}: full evaluation changed b_subject with unrelated {unrelated:?}",
+            );
+            assert_eq!(
+                subset_positions(&doc, purpose, "b_subject"),
+                alone,
+                "{purpose:?}: subset evaluation changed b_subject with unrelated {unrelated:?}",
+            );
+        }
+    }
+}
 
+#[test]
+fn modifier_noise_streams_follow_the_purpose_seed_policy() {
+    let zero = noise_scene(0, &[]);
+    let seventy_three = noise_scene(73, &[]);
     assert_eq!(
-        snapshot_positions(&render_seed_zero, EvaluationPurpose::Preview, "b_subject"),
-        snapshot_positions(
-            &render_seed_nonzero,
-            EvaluationPurpose::Preview,
-            "b_subject"
-        ),
-        "Preview must use seed 0 instead of the scene render seed",
+        snapshot_positions(&zero, EvaluationPurpose::Preview, "b_subject"),
+        snapshot_positions(&seventy_three, EvaluationPurpose::Preview, "b_subject"),
+        "Preview derives every stream from base seed 0, not the scene render seed",
     );
-    let render_positions =
-        snapshot_positions(&render_seed_nonzero, EvaluationPurpose::Render, "b_subject");
     assert_ne!(
-        snapshot_positions(&render_seed_zero, EvaluationPurpose::Render, "b_subject"),
-        render_positions,
-        "Render must use the scene render seed",
-    );
-    assert_eq!(
-        render_positions,
-        snapshot_positions(&render_seed_nonzero, EvaluationPurpose::Render, "b_subject"),
-        "same-context Snapshot evaluation must be deterministic",
-    );
-
-    let mut without_preceding_object = render_seed_nonzero.clone();
-    without_preceding_object
-        .nodes
-        .get_mut(&Id::new("a_noise").unwrap())
-        .unwrap()
-        .modifiers[0]
-        .enabled = false;
-    assert_ne!(
-        render_positions,
-        snapshot_positions(
-            &without_preceding_object,
-            EvaluationPurpose::Render,
-            "b_subject"
-        ),
-        "a preceding object's Noise samples must advance the Snapshot stream",
-    );
-
-    let mut without_first_modifier = render_seed_nonzero;
-    without_first_modifier
-        .nodes
-        .get_mut(&Id::new("b_subject").unwrap())
-        .unwrap()
-        .modifiers
-        .remove(0);
-    let without_first_positions = snapshot_positions(
-        &without_first_modifier,
-        EvaluationPurpose::Render,
-        "b_subject",
-    );
-    assert!(
-        (render_positions[1] - without_first_positions[1]).length() > TOLERANCE,
-        "the first modifier's Noise sample must advance the stream for the next modifier",
+        snapshot_positions(&zero, EvaluationPurpose::Render, "b_subject"),
+        snapshot_positions(&seventy_three, EvaluationPurpose::Render, "b_subject"),
+        "Render derives every stream from the scene render seed",
     );
 }

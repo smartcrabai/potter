@@ -41,6 +41,8 @@ const CLOTH_RMS_TOLERANCE: f64 = 0.30;
 // A 0.05 m order response is 2.5% of the fixture span and must appear in Blender and Potter.
 const CLOTH_CENTROID_TOLERANCE: f64 = 0.30;
 const CLOTH_BOUNDS_TOLERANCE: f64 = 0.30;
+const DENSITY_SAMPLE_TOLERANCE: f64 = 0.0001;
+const MINIMUM_SURFACE_DISPLACEMENT: f64 = 1.0;
 fn pot() -> Command {
     Command::new(env!("CARGO_BIN_EXE_pot"))
 }
@@ -2261,6 +2263,314 @@ fn volume_displace_resamples_inline_density_with_object_texture_mapping()
         .and_then(|grid| grid.values.as_deref())
         .ok_or("displaced volume samples are missing")?;
     assert_eq!(values, [0.0_f32, 0.75, 0.0]);
+    Ok(())
+}
+
+#[test]
+fn volume_displace_resamples_decoded_vdb_density() -> Result<(), Box<dyn Error>> {
+    let Some(blender) = blender_executable() else {
+        eprintln!("skipping VDB Volume Displace test; Blender is unavailable");
+        return Ok(());
+    };
+    let directory = tempdir()?;
+    let root = directory.path();
+    let script = root.join("create_density.py");
+    let vdb_path = root.join("density.vdb");
+    let blender_expected_path = root.join("blender_expected.json");
+    fs::write(
+        &script,
+        r"
+import bpy, openvdb, json, os, sys, math
+from mathutils import Vector
+root = os.path.realpath(sys.argv[sys.argv.index('--') + 1])
+grid = openvdb.FloatGrid()
+grid.name = 'density'
+accessor = grid.getAccessor()
+for z in range(3):
+    for y in range(3):
+        for x in range(4):
+            density = 0.15 + 0.16*x + 0.09*y + 0.07*z + 0.045*x*y - 0.025*x*z
+            accessor.setValueOn((x,y,z), density)
+vdb_path = os.path.join(root, 'density.vdb')
+openvdb.write(vdb_path, grids=[grid])
+bpy.ops.object.volume_import(filepath=vdb_path)
+volume = bpy.context.object
+image = bpy.data.images.new('Displacement', width=4, height=3, alpha=True, float_buffer=True)
+pixels = []
+for y in range(3):
+    for x in range(4):
+        pixels.extend([x/3, y/2, ((2*x+y) % 4)/3, 1.0])
+image.pixels[:] = pixels
+texture = bpy.data.textures.new('Displacement', type='IMAGE')
+texture.image = image
+mapping_mesh = bpy.data.meshes.new('mapping_object_mesh')
+mapping_object = bpy.data.objects.new('mapping_object', mapping_mesh)
+bpy.context.scene.collection.objects.link(mapping_object)
+mapping_object.location = (-0.25, 0.2, -0.1)
+mapping_object.rotation_euler = (0.2, 0.35, -0.15)
+mapping_object.scale = (1.3, 0.8, 1.1)
+displace = volume.modifiers.new('Volume Displace', 'VOLUME_DISPLACE')
+displace.texture = texture
+displace.texture_map_mode = 'OBJECT'
+displace.texture_map_object = mapping_object
+displace.strength = 3.0
+displace.texture_mid_level = (0.5, 0.5, 0.5)
+displace.texture_sample_radius = 1.0
+baseline_volume = bpy.data.objects.new('BaselineVolume', volume.data)
+bpy.context.scene.collection.objects.link(baseline_volume)
+
+def make_surface(name, source_volume):
+    surface = bpy.data.objects.new(name, bpy.data.meshes.new(name + 'Mesh'))
+    bpy.context.scene.collection.objects.link(surface)
+    to_mesh = surface.modifiers.new('Volume to Mesh', 'VOLUME_TO_MESH')
+    to_mesh.object = source_volume
+    to_mesh.threshold = 0.25
+    to_mesh.resolution_mode = 'GRID'
+    return surface
+
+surface = make_surface('DisplacedSurface', volume)
+baseline_surface = make_surface('BaselineSurface', baseline_volume)
+bpy.context.view_layer.update()
+depsgraph = bpy.context.evaluated_depsgraph_get()
+depsgraph.update()
+evaluated = surface.evaluated_get(depsgraph)
+evaluated_mesh = evaluated.to_mesh()
+points = [evaluated.matrix_world @ vertex.co for vertex in evaluated_mesh.vertices]
+baseline_evaluated = baseline_surface.evaluated_get(depsgraph)
+baseline_mesh = baseline_evaluated.to_mesh()
+baseline_points = [
+    baseline_evaluated.matrix_world @ vertex.co for vertex in baseline_mesh.vertices
+]
+mapping_world = [
+    mapping_object.matrix_world[row][column]
+    for column in range(4)
+    for row in range(4)
+]
+def sample_density(coordinate):
+    lower = [math.floor(value) for value in coordinate]
+    fraction = [coordinate[axis] - lower[axis] for axis in range(3)]
+    value = 0.0
+    for z_offset in range(2):
+        for y_offset in range(2):
+            for x_offset in range(2):
+                weight = (
+                    (fraction[0] if x_offset else 1.0-fraction[0]) *
+                    (fraction[1] if y_offset else 1.0-fraction[1]) *
+                    (fraction[2] if z_offset else 1.0-fraction[2])
+                )
+                value += accessor.getValue((
+                    lower[0] + x_offset,
+                    lower[1] + y_offset,
+                    lower[2] + z_offset,
+                )) * weight
+    return value
+
+mapping_world_to_local = mapping_object.matrix_world.inverted()
+volume_to_world = volume.matrix_world
+blender_samples = []
+for z in range(-2,5):
+    for y in range(-2,5):
+        for x in range(-2,6):
+            index = Vector((x,y,z))
+            texture_position = mapping_world_to_local @ (volume_to_world @ index)
+            color = texture.evaluate(texture_position)
+            displacement = Vector((
+                (color[0]-0.5)*3.0,
+                (color[1]-0.5)*3.0,
+                (color[2]-0.5)*3.0,
+            ))
+            source = index-displacement
+            sample = sample_density(source)
+            blender_samples.append(sample)
+evaluated_volume = volume.evaluated_get(depsgraph)
+evaluated_grid_names = [grid.name for grid in evaluated_volume.data.grids]
+expected = {
+    'points':[list(point) for point in points],
+    'baseline_points':[list(point) for point in baseline_points],
+    'mapping_world':mapping_world,
+    'vdb_samples':blender_samples,
+    'evaluated_grid_names':evaluated_grid_names,
+}
+with open(os.path.join(root, 'blender_expected.json'), 'w', encoding='utf-8') as output:
+    json.dump(expected, output)
+evaluated.to_mesh_clear()
+baseline_evaluated.to_mesh_clear()
+        ",
+    )?;
+    run(
+        Command::new(&blender)
+            .args(["--background", "--factory-startup", "--python"])
+            .arg(&script)
+            .arg("--")
+            .arg(root),
+        "VDB density fixture generation",
+    )?;
+    let blender_expected: Value = serde_json::from_slice(&fs::read(&blender_expected_path)?)?;
+    let expected_samples: Vec<f64> =
+        serde_json::from_value(blender_expected["vdb_samples"].clone())?;
+    let evaluated_grid_names: Vec<String> =
+        serde_json::from_value(blender_expected["evaluated_grid_names"].clone())?;
+    assert_eq!(evaluated_grid_names, ["density"]);
+    let compare_density_samples = |name: &str, actual: &[f32]| {
+        assert_eq!(
+            actual.len(),
+            expected_samples.len(),
+            "{name} and Blender voxel sample counts differ",
+        );
+        let mut maximum_error = 0.0_f64;
+        let mut maximum_index = 0;
+        let mut maximum_actual = 0.0_f32;
+        let mut maximum_expected = 0.0_f64;
+        for (index, (actual, expected)) in actual.iter().zip(&expected_samples).enumerate() {
+            let error = (f64::from(*actual) - expected).abs();
+            if error > maximum_error {
+                maximum_error = error;
+                maximum_index = index;
+                maximum_actual = *actual;
+                maximum_expected = *expected;
+            }
+        }
+        assert!(
+            maximum_error <= DENSITY_SAMPLE_TOLERANCE,
+            "{name} per-voxel density error {maximum_error} at sample {maximum_index} (Potter={maximum_actual}, Blender={maximum_expected}) exceeds {DENSITY_SAMPLE_TOLERANCE}",
+        );
+    };
+
+    // The Potter side enters through the scene path: the VDB is packed as a resource, the volume
+    // references it as File source, and the displacement modifier resolves the image texture and
+    // object mapping from the scene. The mapping object uses Blender's XYZ Euler transform.
+    let scene = root.join("volume-displacement-vdb");
+    let batch = root.join("operations.json");
+    initialize(&scene)?;
+    let texture_pixels = (0_u32..3)
+        .flat_map(|y| {
+            (0_u32..4).map(move |x| {
+                [
+                    f64::from(x) / 3.0,
+                    f64::from(y) / 2.0,
+                    f64::from((2 * x + y) % 4) / 3.0,
+                    1.0,
+                ]
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut inline_values = Vec::with_capacity(36);
+    for z in 0_u8..3 {
+        for y in 0_u8..3 {
+            for x in 0_u8..4 {
+                let x = f32::from(x);
+                let y = f32::from(y);
+                let z = f32::from(z);
+                inline_values.push(
+                    0.15_f32 + 0.16_f32 * x + 0.09_f32 * y + 0.07_f32 * z + 0.045_f32 * x * y
+                        - 0.025_f32 * x * z,
+                );
+            }
+        }
+    }
+    let vdb_file_source = json!({
+        "kind":"file",
+        "metadata":{
+            "format":"vdb",
+            "content_ref":"asset://density_vdb",
+            "grid_names":["density"],
+        },
+    });
+    let displacement_params = json!({
+        "texture":"displace_texture",
+        "texture_map_mode":"OBJECT",
+        "texture_map_object":"mapping_object",
+        "strength":3.0,
+        "texture_mid_level":[0.5,0.5,0.5],
+        "texture_sample_radius":1.0,
+    });
+    apply(
+        &scene,
+        &batch,
+        &json!([
+            {"op":"resource.pack","id":"density_vdb","uri":vdb_path.to_string_lossy(),"kind":"vdb"},
+            {"op":"image.create","id":"displace_texture","name":"Displacement","width":4,"height":3,"colorspace":"linear","fill_color":[0.0,0.0,0.0,1.0]},
+            {"op":"image.set_pixels","id":"displace_texture","x":0,"y":0,"width":4,"height":3,"pixels":texture_pixels},
+            {"op":"node.create","id":"mapping_object","kind":"plane","params":{},"transform":{"translation":[-0.25,0.2,-0.1],"rotation_deg":[0.2_f64.to_degrees(),0.35_f64.to_degrees(),(-0.15_f64).to_degrees()],"scale":[1.3,0.8,1.1]}},
+            {"op":"volume.create","id":"density","source":vdb_file_source},
+            {"op":"volume.create","id":"baseline_volume","source":vdb_file_source},
+            {"op":"volume.create","id":"inline_density","grids":[{"dims":[4,3,3],"voxel_size":1.0,"origin":[0.0,0.0,0.0],"values":inline_values}]},
+            {"op":"modifier.create","target":{"id":"density"},"id":"displace","type":"volume_displace","params":displacement_params},
+            {"op":"modifier.create","target":{"id":"inline_density"},"id":"displace","type":"volume_displace","params":displacement_params}
+        ]),
+        0,
+    )?;
+    let document: potter_core::model::SceneDoc =
+        serde_json::from_slice(&fs::read(scene.join("scene.json"))?)?;
+    let snapshot = potter_core::eval::Snapshot::evaluate_with_cache(
+        &document,
+        &potter_core::eval::EvaluationContext::default(),
+        Some(&scene),
+        Some(&scene.join(".potter/cache")),
+    )?;
+    let displaced = evaluated_volume(&document, &snapshot, "density")?;
+    let baseline = evaluated_volume(&document, &snapshot, "baseline_volume")?;
+    let inline_displaced = evaluated_volume(&document, &snapshot, "inline_density")?;
+    assert_eq!(
+        displaced.source,
+        potter_core::geom::volume::VolumeSource::Generated(
+            potter_core::geom::volume::VolumeGeneratedSource {
+                algorithm: "volume_displace_vdb".to_owned(),
+            },
+        )
+    );
+    let vdb_grid = displaced
+        .grids
+        .first()
+        .ok_or("displaced VDB grid is missing")?;
+    assert_eq!(vdb_grid.dims, [8, 7, 7]);
+    compare_density_samples(
+        "decoded VDB",
+        vdb_grid
+            .values
+            .as_deref()
+            .ok_or("displaced VDB samples are missing")?,
+    );
+    let inline_grid = inline_displaced
+        .grids
+        .first()
+        .ok_or("displaced inline grid is missing")?;
+    assert_eq!(inline_grid.dims, [8, 7, 7]);
+    compare_density_samples(
+        "inline grid",
+        inline_grid
+            .values
+            .as_deref()
+            .ok_or("displaced inline samples are missing")?,
+    );
+    let potter_mesh = potter_core::geom::volume::volume_to_mesh(displaced, 0.25)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let baseline_mesh = potter_core::geom::volume::volume_to_mesh(baseline, 0.25)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let potter_points = potter_mesh
+        .vertices
+        .iter()
+        .map(|vertex| vertex.co)
+        .collect::<Vec<_>>();
+    let potter_baseline_points = baseline_mesh
+        .vertices
+        .iter()
+        .map(|vertex| vertex.co)
+        .collect::<Vec<_>>();
+    let blender_surface_points = blender_points(&blender_expected["points"])?;
+    let blender_baseline = blender_points(&blender_expected["baseline_points"])?;
+    let displaced_surface_distance =
+        max_surface_correspondence_error(&blender_surface_points, &blender_baseline)?;
+    assert!(
+        displaced_surface_distance > MINIMUM_SURFACE_DISPLACEMENT,
+        "spatially varying texture must materially displace the Blender surface by more than one voxel, observed {displaced_surface_distance}",
+    );
+    let potter_displacement =
+        max_surface_correspondence_error(&potter_points, &potter_baseline_points)?;
+    assert!(
+        potter_displacement > MINIMUM_SURFACE_DISPLACEMENT,
+        "Potter VDB surface must differ from its unmodified baseline by more than one voxel, observed {potter_displacement}",
+    );
     Ok(())
 }
 

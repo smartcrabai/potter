@@ -15,7 +15,7 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
-    geom::Mesh,
+    geom::{Mesh, interpolation::interp_weights_poly_v2},
     model::Modifier,
 };
 
@@ -69,6 +69,15 @@ fn is_mesh_deform_bind(bind_data: &Value) -> bool {
             Some("blender_native_bind_v1" | MESH_DEFORM_BIND_FORMAT)
         ) && object.get("type").and_then(Value::as_str) == Some("mesh_deform")
     })
+}
+
+/// Whether `bind_data` is a Laplacian Deform bind: Potter's `blender_laplacian_bind_v1`, or a native bind
+/// written by the `.blend` importer.
+fn is_laplacian_bind(bind_data: &Value) -> bool {
+    bind_data.as_object().is_some_and(|object| {
+        object.get("format").and_then(Value::as_str) == Some(LAPLACIAN_BIND_FORMAT)
+            && object.get("type").and_then(Value::as_str) == Some("laplacian_deform")
+    }) || is_native_bind(bind_data, "laplacian_deform")
 }
 
 fn native_surface_target_warning(
@@ -417,6 +426,23 @@ pub(super) fn mesh_deform(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     native_mesh_deform(mesh, modifier, bind_data)
 }
 
+/// The `Bind data required` error of a Mesh Deform modifier without bind data, as Blender reports it
+/// (MOD_meshdeform.cc). The modifier leaves the mesh unchanged; the warning names the modifier.
+pub(super) fn mesh_deform_unbound_warning(modifier: &Modifier) -> PotError {
+    PotError::with_details(
+        ErrorCode::EvaluationFailed,
+        format!(
+            "Bind data required: Mesh Deform modifier `{}` has no bind; rebind required",
+            modifier.id
+        ),
+        json!({
+            "modifier_id": modifier.id,
+            "modifier_warning": true,
+            "feature_id": "modifier.mesh_deform.bind_data_required",
+        }),
+    )
+}
+
 fn native_mesh_deform(mesh: &Mesh, modifier: &Modifier, bind_data: &Value) -> Result<Mesh> {
     let data = bind_data
         .as_object()
@@ -609,6 +635,88 @@ fn native_mesh_deform_static(
     Ok(())
 }
 
+/// Dynamic bind cell storage, one layout for every origin: `dynamic_cell_offsets` has one entry per grid cell
+/// plus a terminal offset, indexing the parallel `dynamic_influence_vertices` and `dynamic_influence_weights`.
+struct DynamicCells<'a> {
+    offsets: &'a [Value],
+    vertices: &'a [Value],
+    weights: &'a [Value],
+}
+
+impl DynamicCells<'_> {
+    /// Influence indices of grid cell `cell` (flat index `x + y*size + z*size*size`).
+    fn cell_range(&self, cell: usize, modifier: &Modifier) -> Result<std::ops::Range<usize>> {
+        let start = flat_offset(self.offsets, cell, modifier)?;
+        let end = flat_offset(self.offsets, cell + 1, modifier)?;
+        if end < start || end > self.vertices.len() {
+            return Err(invalid_parameter(
+                modifier,
+                "binding_data",
+                "ordered native dynamic cell offsets",
+            ));
+        }
+        Ok(start..end)
+    }
+
+    /// Cage vertex and weight of influence `index`.
+    fn influence(
+        &self,
+        index: usize,
+        cage_count: usize,
+        modifier: &Modifier,
+    ) -> Result<(usize, f64)> {
+        let vertex = self
+            .vertices
+            .get(index)
+            .and_then(Value::as_i64)
+            .and_then(|index| usize::try_from(index).ok())
+            .filter(|index| *index < cage_count)
+            .ok_or_else(|| {
+                invalid_parameter(modifier, "binding_data", "valid native cage indices")
+            })?;
+        let weight = self.weights.get(index).ok_or_else(|| {
+            invalid_parameter(modifier, "binding_data", "native dynamic influence")
+        })?;
+        Ok((vertex, finite_number(weight, modifier, "binding_data")?))
+    }
+}
+
+fn flat_offset(offsets: &[Value], index: usize, modifier: &Modifier) -> Result<usize> {
+    offsets
+        .get(index)
+        .and_then(Value::as_u64)
+        .and_then(|offset| usize::try_from(offset).ok())
+        .ok_or_else(|| {
+            invalid_parameter(
+                modifier,
+                "binding_data",
+                "valid native dynamic cell offsets",
+            )
+        })
+}
+
+fn dynamic_cells<'a>(
+    data: &'a Map<String, Value>,
+    cell_count: usize,
+    modifier: &Modifier,
+) -> Result<DynamicCells<'a>> {
+    let offsets = native_array(data, &["dynamic_cell_offsets"], modifier)?;
+    let vertices = native_array(data, &["dynamic_influence_vertices"], modifier)?;
+    let weights = native_array(data, &["dynamic_influence_weights"], modifier)?;
+    if offsets.len().checked_sub(1) != Some(cell_count) || vertices.len() != weights.len() {
+        return Err(invalid_parameter(
+            modifier,
+            "binding_data",
+            "flat dynamic grid offsets matching the grid and its influences",
+        ));
+    }
+    Ok(DynamicCells {
+        offsets,
+        vertices,
+        weights,
+    })
+}
+
 fn native_mesh_deform_dynamic(
     mesh: &mut Mesh,
     modifier: &Modifier,
@@ -619,11 +727,10 @@ fn native_mesh_deform_dynamic(
     group: Option<&[f64]>,
     invert: bool,
 ) -> Result<()> {
-    let size = native_count(data, &["dynamic_grid_size", "dyngridsize"], modifier)?;
-    let cell_min = native_vec3(data, &["dynamic_cell_min", "dyncellmin"], modifier)?;
+    let size = native_count(data, &["dynamic_grid_size"], modifier)?;
+    let cell_min = native_vec3(data, &["dynamic_cell_min"], modifier)?;
     let cell_width = data
         .get("dynamic_cell_width")
-        .or_else(|| data.get("dyncellwidth"))
         .ok_or_else(|| invalid_parameter(modifier, "binding_data", "native dynamic cell width"))?;
     let cell_width = finite_number(cell_width, modifier, "binding_data")?;
     if size == 0 || !cell_width.is_finite() || cell_width <= 0.0 {
@@ -639,10 +746,9 @@ fn native_mesh_deform_dynamic(
         .ok_or_else(|| {
             invalid_parameter(modifier, "binding_data", "a bounded native dynamic grid")
         })?;
-    let cells = native_array(data, &["dynamic_grid", "dyngrid"], modifier)?;
-    let influences = native_array(data, &["dynamic_influences", "dyninfluences"], modifier)?;
-    let dynamic_vertices = native_array(data, &["dynamic_vertices", "dynverts"], modifier)?;
-    if cells.len() != cell_count || dynamic_vertices.len() != mesh.vertices.len() {
+    let cells = dynamic_cells(data, cell_count, modifier)?;
+    let dynamic_vertices = native_array(data, &["dynamic_vertices"], modifier)?;
+    if dynamic_vertices.len() != mesh.vertices.len() {
         return Err(invalid_parameter(
             modifier,
             "binding_data",
@@ -695,39 +801,10 @@ fn native_mesh_deform_dynamic(
             }
             let flat_cell =
                 cell_coordinate[0] + cell_coordinate[1] * size + cell_coordinate[2] * size * size;
-            let cell = &cells[flat_cell];
-            let start = cell
-                .get("offset")
-                .and_then(Value::as_u64)
-                .and_then(|value| usize::try_from(value).ok())
-                .ok_or_else(|| {
-                    invalid_parameter(modifier, "binding_data", "native dynamic cell offset")
-                })?;
-            let count = cell
-                .get("influences_num")
-                .and_then(Value::as_u64)
-                .and_then(|value| usize::try_from(value).ok())
-                .filter(|count| {
-                    start
-                        .checked_add(*count)
-                        .is_some_and(|end| end <= influences.len())
-                })
-                .ok_or_else(|| {
-                    invalid_parameter(modifier, "binding_data", "native dynamic cell influences")
-                })?;
-            for influence in &influences[start..start + count] {
-                let cage_vertex = influence
-                    .get("vertex")
-                    .and_then(Value::as_i64)
-                    .and_then(|index| usize::try_from(index).ok())
-                    .filter(|index| *index < cage_displacements.len())
-                    .ok_or_else(|| {
-                        invalid_parameter(modifier, "binding_data", "valid native cage indices")
-                    })?;
-                let weight = influence.get("weight").ok_or_else(|| {
-                    invalid_parameter(modifier, "binding_data", "native dynamic influence")
-                })?;
-                let weight = finite_number(weight, modifier, "binding_data")? * cell_weight;
+            for index in cells.cell_range(flat_cell, modifier)? {
+                let (cage_vertex, weight) =
+                    cells.influence(index, cage_displacements.len(), modifier)?;
+                let weight = weight * cell_weight;
                 displacement += cage_displacements[cage_vertex] * weight;
                 total_weight += weight;
             }
@@ -774,9 +851,7 @@ fn mesh_deform_bind_error(modifier: &Modifier, error: &PotError) -> PotError {
 
 /// Whether stored Mesh Deform data uses the dynamic grid layout rather than static bind offsets.
 fn bind_has_dynamic_layout(data: &Map<String, Value>) -> bool {
-    ["dynamic_grid", "dyngrid"]
-        .iter()
-        .any(|key| data.contains_key(*key))
+    data.contains_key("dynamic_cell_offsets")
 }
 
 fn native_count(
@@ -888,63 +963,33 @@ pub(super) fn laplacian_deform(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh>
     let Some(bind_data) = modifier.binding_data.as_ref() else {
         return Ok(mesh.clone());
     };
-    let rest = if is_native_bind(bind_data, "laplacian_deform") {
-        let data = bind_data.as_object().ok_or_else(|| {
-            invalid_parameter(modifier, "binding_data", "native Laplacian Deform data")
-        })?;
-        let count = native_count(data, &["verts_num", "source_vertex_count"], modifier)?;
-        let coordinates = native_array(data, &["vertex_coordinates", "vertexco"], modifier)?;
-        if count != mesh.vertices.len()
-            || coordinates.len()
-                != count.checked_mul(3).ok_or_else(|| {
-                    invalid_parameter(modifier, "binding_data", "native bind coordinate count")
-                })?
-        {
-            return Err(invalid_parameter(
-                modifier,
-                "binding_data",
-                "one native bind position per source vertex",
-            ));
-        }
-        (0..count)
-            .map(|index| native_flat_position(coordinates, index, modifier))
-            .collect::<Result<Vec<_>>>()?
-    } else {
-        let rows = bind_data.as_array().ok_or_else(|| {
-            invalid_parameter(modifier, "binding_data", "stored Laplacian bind positions")
-        })?;
-        if rows.len() != mesh.vertices.len() {
-            return Err(invalid_parameter(
-                modifier,
-                "bind_data",
-                "one bind position per source vertex",
-            ));
-        }
-        rows.iter()
-            .map(|record| {
-                let values = record
-                    .as_array()
-                    .filter(|values| values.len() == 3)
-                    .ok_or_else(|| {
-                        invalid_parameter(modifier, "bind_data", "three-dimensional bind positions")
-                    })?;
-                let point = DVec3::new(
-                    finite_number(&values[0], modifier, "bind_data")?,
-                    finite_number(&values[1], modifier, "bind_data")?,
-                    finite_number(&values[2], modifier, "bind_data")?,
-                );
-                if point.is_finite() {
-                    Ok(point)
-                } else {
-                    Err(invalid_parameter(
-                        modifier,
-                        "bind_data",
-                        "finite bind positions",
-                    ))
-                }
-            })
-            .collect::<Result<Vec<_>>>()?
-    };
+    if !is_laplacian_bind(bind_data) {
+        return Err(invalid_parameter(
+            modifier,
+            "binding_data",
+            "a Laplacian Deform bind",
+        ));
+    }
+    let data = bind_data
+        .as_object()
+        .ok_or_else(|| invalid_parameter(modifier, "binding_data", "Laplacian Deform bind data"))?;
+    let count = native_count(data, &["verts_num", "source_vertex_count"], modifier)?;
+    let coordinates = native_array(data, &["vertex_coordinates", "vertexco"], modifier)?;
+    if count != mesh.vertices.len()
+        || coordinates.len()
+            != count.checked_mul(3).ok_or_else(|| {
+                invalid_parameter(modifier, "binding_data", "native bind coordinate count")
+            })?
+    {
+        return Err(invalid_parameter(
+            modifier,
+            "binding_data",
+            "one native bind position per source vertex",
+        ));
+    }
+    let rest = (0..count)
+        .map(|index| native_flat_position(coordinates, index, modifier))
+        .collect::<Result<Vec<_>>>()?;
     let iterations = usize::try_from(uint_param(modifier, "iterations")?)
         .map_err(|_| invalid_parameter(modifier, "iterations", "a non-negative integer"))?;
     let group = group_weights(mesh, modifier)?.ok_or_else(|| {
@@ -1838,7 +1883,7 @@ impl SurfaceBindTarget {
 
     /// Blender's `MOD_SDEF_MODE_NGONS` term for a point inside its polygon.
     fn ngon_bind(polygon: &SurfaceBindPolygon, point: DVec3) -> Result<SurfaceBind> {
-        let weights = mean_value_weights(polygon.point_v2, &polygon.coords_v2)
+        let weights = polygon_interp_weights(polygon.point_v2, &polygon.coords_v2)
             .ok_or_else(invalid_polygons)?;
         let projected = polygon
             .coords
@@ -2238,29 +2283,33 @@ pub(crate) fn bind_mesh(
     Ok(Value::Object(binding))
 }
 
-/// Blender's `harmonic_coordinates_bind` storage: sparse per-vertex cage weights for a static
-/// bind, or the normalized per-cell influence grid plus per-vertex inside flags for a dynamic
-/// bind. Field names match the native Mesh Deform layout read by `native_mesh_deform`.
+/// Blender's `harmonic_coordinates_bind` storage. A static bind stores sparse per-vertex cage weights as
+/// `bind_offsets` and `bind_influences`. A dynamic bind stores the normalized per-cell influence grid in
+/// flat arrays: `dynamic_cell_offsets` (one offset per cell plus a terminal offset) indexing
+/// `dynamic_influence_vertices` and `dynamic_influence_weights`, plus per-vertex inside flags.
 fn mesh_deform_grid_layout(
     grid: &harmonic::HarmonicBindGrid,
     dynamic: bool,
 ) -> Vec<(&'static str, Value)> {
     if dynamic {
-        let mut cells = Vec::with_capacity(grid.cells.len());
-        let mut influences = Vec::new();
+        let mut offsets = Vec::with_capacity(grid.cells.len() + 1);
+        let mut vertices = Vec::new();
+        let mut weights = Vec::new();
+        offsets.push(json!(0));
         for cell in &grid.cells {
-            cells.push(json!({"offset": influences.len(), "influences_num": cell.len()}));
-            influences.extend(
-                cell.iter()
-                    .map(|&(vertex, weight)| json!({"vertex": vertex, "weight": weight})),
-            );
+            for &(vertex, weight) in cell {
+                vertices.push(json!(vertex));
+                weights.push(json!(weight));
+            }
+            offsets.push(json!(vertices.len()));
         }
         vec![
             ("dynamic_grid_size", json!(grid.size)),
             ("dynamic_cell_min", json!(grid.cell_min.to_array())),
             ("dynamic_cell_width", json!(grid.cell_width)),
-            ("dynamic_grid", Value::Array(cells)),
-            ("dynamic_influences", Value::Array(influences)),
+            ("dynamic_cell_offsets", Value::Array(offsets)),
+            ("dynamic_influence_vertices", Value::Array(vertices)),
+            ("dynamic_influence_weights", Value::Array(weights)),
             (
                 "dynamic_vertices",
                 Value::Array(
@@ -2312,14 +2361,23 @@ fn compact_influences(rows: &[Vec<(usize, f64)>]) -> Vec<Vec<(usize, f64)>> {
         .collect()
 }
 
+/// Format tag for Laplacian Deform binds: the source coordinates at bind time, one flat `[x, y, z]` run per
+/// source vertex in `vertex_coordinates`.
+pub(crate) const LAPLACIAN_BIND_FORMAT: &str = "blender_laplacian_bind_v1";
+
 /// Stores source coordinates for a Laplacian Deform bind.
 pub(crate) fn bind_laplacian(mesh: &Mesh) -> Value {
-    Value::Array(
-        mesh.vertices
-            .iter()
-            .map(|vertex| json!(vertex.co.to_array()))
-            .collect(),
-    )
+    let coordinates: Vec<f64> = mesh
+        .vertices
+        .iter()
+        .flat_map(|vertex| vertex.co.to_array())
+        .collect();
+    json!({
+        "format": LAPLACIAN_BIND_FORMAT,
+        "type": "laplacian_deform",
+        "verts_num": mesh.vertices.len(),
+        "vertex_coordinates": coordinates,
+    })
 }
 
 pub(super) fn closest_triangle_point(point: DVec3, triangle: [DVec3; 3]) -> (DVec3, [f64; 3]) {
@@ -2376,70 +2434,18 @@ fn polygon_normal(points: &[DVec3]) -> Option<DVec3> {
     normal.try_normalize()
 }
 
-fn mean_value_weights(point: DVec2, vertices: &[DVec2]) -> Option<Vec<f64>> {
-    if vertices.len() < 3 {
-        return None;
-    }
-    let mut winding: f64 = 0.0;
-    for index in 0..vertices.len() {
-        let first = vertices[index];
-        let second = vertices[(index + 1) % vertices.len()];
-        let third = vertices[(index + 2) % vertices.len()];
-        let left = second - first;
-        let right = third - second;
-        let cross = left.x * right.y - left.y * right.x;
-        if cross.abs() > 1.0e-12 {
-            if winding.abs() <= f64::EPSILON {
-                winding = cross.signum();
-            } else if cross.signum() * winding < 0.0 {
-                return None;
-            }
-        }
-    }
-    if winding.abs() <= f64::EPSILON {
-        return None;
-    }
-    let vectors = vertices
+/// Blender's `interp_weights_poly_v2` on the bind plane. Corners and query are rounded to f32 as
+/// Blender's float plane is; the weights widen to f64 only for the bind records.
+fn polygon_interp_weights(point: DVec2, vertices: &[DVec2]) -> Option<Vec<f64>> {
+    let polygon = vertices
         .iter()
-        .map(|vertex| *vertex - point)
+        .map(|vertex| [vertex.x as f32, vertex.y as f32])
         .collect::<Vec<_>>();
-    let distances = vectors
-        .iter()
-        .map(|vector| vector.length())
-        .collect::<Vec<_>>();
-    for (index, distance) in distances.iter().enumerate() {
-        if *distance <= 1.0e-12 {
-            let mut weights = vec![0.0; vertices.len()];
-            weights[index] = 1.0;
-            return Some(weights);
-        }
-    }
-    let mut half_angle_tangents = Vec::with_capacity(vertices.len());
-    for index in 0..vertices.len() {
-        let next = (index + 1) % vertices.len();
-        let left = vectors[index];
-        let right = vectors[next];
-        let denominator = distances[index] * distances[next] + left.dot(right);
-        if denominator.abs() <= 1.0e-12 {
-            return None;
-        }
-        let cross = left.x * right.y - left.y * right.x;
-        half_angle_tangents.push(cross / denominator);
-    }
-    let mut weights = Vec::with_capacity(vertices.len());
-    for index in 0..vertices.len() {
-        let previous = (index + vertices.len() - 1) % vertices.len();
-        weights
-            .push((half_angle_tangents[previous] + half_angle_tangents[index]) / distances[index]);
-    }
-    let total = weights.iter().sum::<f64>();
-    if !total.is_finite() || total.abs() <= 1.0e-12 {
+    let mut weights = vec![0.0_f32; vertices.len()];
+    if !interp_weights_poly_v2(&mut weights, &polygon, [point.x as f32, point.y as f32]) {
         return None;
     }
-    for weight in &mut weights {
-        *weight /= total;
-    }
-    Some(weights)
+    Some(weights.into_iter().map(f64::from).collect())
 }
 
 fn finite_number(value: &Value, modifier: &Modifier, name: &str) -> Result<f64> {
@@ -2488,8 +2494,8 @@ fn group_weights(mesh: &Mesh, modifier: &Modifier) -> Result<Option<Vec<f64>>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        closest_triangle_point, laplacian_deform, mean_value_weights, mesh_deform, mesh_triangles,
-        surface_deform,
+        bind_surface, closest_triangle_point, laplacian_deform, mesh_deform, mesh_triangles,
+        polygon_interp_weights, surface_deform,
     };
     use crate::geom::triangulate::{NgonMethod, triangulate_ngon};
     use crate::{
@@ -2750,8 +2756,9 @@ mod tests {
             "dynamic_grid_size": 1,
             "dynamic_cell_min": [-1.0, -1.0, -1.0],
             "dynamic_cell_width": 2.0,
-            "dynamic_grid": [{"offset": 0, "influences_num": 1}],
-            "dynamic_influences": [{"vertex": 0, "weight": 1.0}],
+            "dynamic_cell_offsets": [0, 1],
+            "dynamic_influence_vertices": [0],
+            "dynamic_influence_weights": [1.0],
             "dynamic_vertices": [1]
         });
         let mut modifier = native_modifier("mesh_deform", binding)?;
@@ -2813,16 +2820,170 @@ mod tests {
             DVec2::new(1.0, 1.0),
             DVec2::new(-1.0, 1.0),
         ];
-        let weights = mean_value_weights(DVec2::new(0.25, -0.5), &polygon)
+        let weights = polygon_interp_weights(DVec2::new(0.25, -0.5), &polygon)
             .ok_or_else(|| std::io::Error::other("mean-value coordinate bind failed"))?;
         assert_eq!(weights.len(), polygon.len());
-        assert!((weights.iter().sum::<f64>() - 1.0).abs() < 1.0e-12);
+        // Blender's bind weights are f32, so the partition-of-unity check holds to f32 precision.
+        assert!((weights.iter().sum::<f64>() - 1.0).abs() < 1.0e-6);
         let reconstructed = polygon
             .iter()
             .zip(&weights)
             .map(|(point, weight)| *point * *weight)
             .sum::<DVec2>();
-        assert!(reconstructed.distance(DVec2::new(0.25, -0.5)) < 1.0e-12);
+        assert!(reconstructed.distance(DVec2::new(0.25, -0.5)) < 1.0e-6);
+        Ok(())
+    }
+
+    /// Two flat quads sharing the edge (1,0,0)-(1,1,0); vertices 1 and 2 are that shared edge.
+    fn two_quad_mesh() -> Mesh {
+        Mesh {
+            vertices: vec![
+                Vertex {
+                    id: 0,
+                    co: DVec3::new(0.0, 0.0, 0.0),
+                },
+                Vertex {
+                    id: 1,
+                    co: DVec3::new(1.0, 0.0, 0.0),
+                },
+                Vertex {
+                    id: 2,
+                    co: DVec3::new(1.0, 1.0, 0.0),
+                },
+                Vertex {
+                    id: 3,
+                    co: DVec3::new(0.0, 1.0, 0.0),
+                },
+                Vertex {
+                    id: 4,
+                    co: DVec3::new(2.0, 0.0, 0.0),
+                },
+                Vertex {
+                    id: 5,
+                    co: DVec3::new(2.0, 1.0, 0.0),
+                },
+            ],
+            edges: vec![
+                Edge {
+                    id: 0,
+                    vertices: [0, 1],
+                },
+                Edge {
+                    id: 1,
+                    vertices: [1, 2],
+                },
+                Edge {
+                    id: 2,
+                    vertices: [2, 3],
+                },
+                Edge {
+                    id: 3,
+                    vertices: [3, 0],
+                },
+                Edge {
+                    id: 4,
+                    vertices: [1, 4],
+                },
+                Edge {
+                    id: 5,
+                    vertices: [4, 5],
+                },
+                Edge {
+                    id: 6,
+                    vertices: [5, 2],
+                },
+            ],
+            faces: vec![
+                Face {
+                    id: 0,
+                    vertices: vec![0, 1, 2, 3],
+                    material_index: 0,
+                },
+                Face {
+                    id: 1,
+                    vertices: vec![1, 4, 5, 2],
+                    material_index: 0,
+                },
+            ],
+            next_id: crate::geom::IdCounters {
+                vertex: 6,
+                edge: 7,
+                face: 2,
+            },
+            ..Mesh::default()
+        }
+    }
+
+    fn surface_test_modifier(
+        binding_data: Option<Value>,
+    ) -> Result<Modifier, Box<dyn std::error::Error>> {
+        Ok(Modifier {
+            id: Id::new("surface_edge_test")?,
+            modifier_type: "surface_deform".to_owned(),
+            name: "Surface Edge Test".to_owned(),
+            enabled: true,
+            show_viewport: true,
+            show_render: true,
+            params: serde_json::from_value(json!({
+                "falloff": 4.0,
+                "strength": 1.0,
+                "use_sparse_bind": false,
+                "invert_vertex_group": false,
+                "vertex_group": ""
+            }))?,
+            binding_data,
+            runtime: ModifierRuntime::default(),
+        })
+    }
+
+    #[test]
+    fn surface_bind_point_on_shared_edge_uses_edge_weights()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let target = two_quad_mesh();
+        let source = single_vertex_mesh(DVec3::new(1.0, 0.5, 0.0));
+        let bind = bind_surface(
+            &source,
+            &target,
+            DMat4::IDENTITY,
+            &surface_test_modifier(None)?,
+        )?;
+        let records = bind["bind_verts"][0]["binds"]
+            .as_array()
+            .ok_or_else(|| std::io::Error::other("surface bind records are missing"))?;
+        let ngons = records
+            .iter()
+            .filter(|record| record["mode"].as_i64() == Some(1))
+            .collect::<Vec<_>>();
+        // The shared-edge point is inside exactly one of the two quads, so one ngon record exists.
+        let [ngon] = ngons.as_slice() else {
+            return Err(std::io::Error::other("expected exactly one ngon bind").into());
+        };
+        let corners = ngon["vert_inds"]
+            .as_array()
+            .ok_or_else(|| std::io::Error::other("ngon corners are missing"))?;
+        let weights = ngon["vert_weights"]
+            .as_array()
+            .ok_or_else(|| std::io::Error::other("ngon weights are missing"))?;
+        assert_eq!(corners.len(), weights.len());
+        for (corner, weight) in corners.iter().zip(weights) {
+            // Blender snaps to the shared edge: only its vertices 1 and 2 carry weight.
+            let expected = if matches!(corner.as_u64(), Some(1 | 2)) {
+                0.5
+            } else {
+                0.0
+            };
+            let actual = weight
+                .as_f64()
+                .ok_or_else(|| std::io::Error::other("ngon weight is not a number"))?;
+            assert!(
+                (actual - expected).abs() < 1.0e-6,
+                "corner {corner}: weight {actual}"
+            );
+        }
+        let mut modifier = surface_test_modifier(Some(bind))?;
+        modifier.runtime.target_mesh = Some(target);
+        let deformed = surface_deform(&source, &modifier)?;
+        assert!((deformed.vertices[0].co - DVec3::new(1.0, 0.5, 0.0)).length() < 1.0e-6);
         Ok(())
     }
 }

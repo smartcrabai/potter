@@ -50,7 +50,12 @@ fn polygon_normal(corners: &[Vec3]) -> Vec3 {
             normal
         }
     };
-    normalize(normal).0
+    let (normal, length) = normalize(normal);
+    if length <= 0.0 {
+        [0.0, 0.0, 1.0]
+    } else {
+        normal
+    }
 }
 
 /// The first cage triangle a segment meets (`MeshDeformIsect`).

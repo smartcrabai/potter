@@ -4,7 +4,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::{
     error::{ErrorCode, PotError, Result},
     eval::EvaluationPurpose,
-    geom::modifiers::evaluate_modifiers_with_groups_at_frame,
     model::{Id, Modifier, ShapeKey, ShapeKeyData},
     params::{self, ParameterFamily},
 };
@@ -414,6 +413,47 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
     Ok(changed)
 }
 
+/// Mesh Deform settings that Blender reads at bind time. A bound modifier rejects a change to any of them, so
+/// they change only after an unbind.
+const MESH_DEFORM_BIND_SETTINGS: [&str; 3] = ["use_dynamic_bind", "precision", "object"];
+
+/// Rejects a change to a Mesh Deform bind setting while the modifier is bound. A setting keeps its value when
+/// it is equal, or when a null `object` replaces an absent one.
+fn check_bound_mesh_deform_params(
+    engine: &Engine<'_>,
+    existing: &Modifier,
+    modifier_type: &str,
+    params: &Map<String, Value>,
+) -> Result<()> {
+    if existing.binding_data.is_none()
+        || existing.modifier_type != "mesh_deform"
+        || modifier_type != "mesh_deform"
+    {
+        return Ok(());
+    }
+    for key in MESH_DEFORM_BIND_SETTINGS {
+        let before = existing.params.get(key).filter(|value| !value.is_null());
+        let after = params.get(key).filter(|value| !value.is_null());
+        let unchanged = match (before, after) {
+            (Some(before), Some(after)) => {
+                before == after || (before.is_number() && before.as_f64() == after.as_f64())
+            }
+            (None, None) => true,
+            _ => false,
+        };
+        if !unchanged {
+            return Err(engine.error(
+                ErrorCode::InvalidOperation,
+                format!(
+                    "Mesh Deform `{key}` cannot change while the modifier is bound; unbind the modifier first"
+                ),
+                &format!("/set/params/{key}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bool> {
     check_fields(
         engine,
@@ -498,6 +538,9 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                 })
             })
             .transpose()?;
+        if let Some(params) = &params {
+            check_bound_mesh_deform_params(engine, &existing, modifier_type, params)?;
+        }
         let modifier_params = if let Some(params) = params {
             validate_parameter_map(
                 engine,
@@ -954,12 +997,14 @@ fn apply_modifier(
         if edited_data.contains(&data_id) {
             continue;
         }
-        let target_modifier = modifier_to_apply(engine, &target, &modifier_id)?;
+        let (target_modifier, target_modifier_index) =
+            modifier_to_apply(engine, &target, &modifier_id)?;
         let (evaluated, material_slots) = evaluate_modifier_output(
             engine,
             &target,
             &data_id,
             &target_modifier,
+            target_modifier_index,
             allow_shape_keys,
         )?;
         // The evaluated `vertex_groups` attribute is a view of DataBlock weights keyed by this mesh's
@@ -1032,7 +1077,11 @@ fn apply_modifier(
     }
     Ok(changed)
 }
-fn modifier_to_apply(engine: &Engine<'_>, target: &Id, modifier_id: &Id) -> Result<Modifier> {
+fn modifier_to_apply(
+    engine: &Engine<'_>,
+    target: &Id,
+    modifier_id: &Id,
+) -> Result<(Modifier, usize)> {
     let stack = engine
         .doc
         .nodes
@@ -1061,7 +1110,7 @@ fn modifier_to_apply(engine: &Engine<'_>, target: &Id, modifier_id: &Id) -> Resu
             },
         )?;
     }
-    Ok(stack[index].clone())
+    Ok((stack[index].clone(), index))
 }
 
 fn evaluate_modifier_output(
@@ -1069,6 +1118,7 @@ fn evaluate_modifier_output(
     target: &Id,
     data_id: &Id,
     target_modifier: &Modifier,
+    target_modifier_index: usize,
     allow_shape_keys: bool,
 ) -> Result<(crate::geom::Mesh, Vec<Option<Id>>)> {
     let subject_name = engine
@@ -1183,12 +1233,19 @@ fn evaluate_modifier_output(
         }
         if !uses_armature && !uses_lattice && !uses_volume_node && !uses_scene_context {
             let source = prepared_output.as_ref().unwrap_or(output);
-            let evaluation = evaluate_modifiers_with_groups_at_frame(
-                source,
+            let texture_seed = crate::geom::modifiers::TextureSeed::new(
+                crate::eval::EvaluationPurpose::Preview,
+                0,
+                target.as_str(),
+            )
+            .with_stack_offset(target_modifier_index);
+            let evaluation = crate::geom::modifiers::evaluate_modifiers_with_texture_seed_at_frame(
+                source.clone(),
                 modifier_stack,
                 &engine.doc.node_groups,
                 engine.evaluation_frame,
                 subject_name,
+                texture_seed,
             )?;
             engine.warnings.extend(
                 evaluation
@@ -1302,7 +1359,12 @@ fn evaluate_modifier_output(
                 evaluated_meshes: evaluated_operand_meshes,
                 project_root: engine.asset_root,
             };
-            let mut texture_rng = crate::blender_rng::BlenderRng::seed_random(0);
+            let texture_seed = crate::geom::modifiers::TextureSeed::new(
+                crate::eval::EvaluationPurpose::Preview,
+                0,
+                target.as_str(),
+            )
+            .with_stack_offset(target_modifier_index);
             let evaluation = crate::geom::modifiers::evaluate_modifiers_with_scene_context(
                 source.clone(),
                 modifier_stack,
@@ -1320,7 +1382,7 @@ fn evaluate_modifier_output(
                     cache_directory: engine.cache_directory,
                 },
                 |_, modifier| modifier.enabled,
-                &mut texture_rng,
+                texture_seed,
                 |mesh, modifier, modifier_warnings, multi_input, texture_rng| match modifier
                     .modifier_type
                     .as_str()
@@ -1520,12 +1582,14 @@ fn apply_modifier_as_shape_key(
             if cache_shared && let Some(evaluated) = evaluated_by_data.get(&original_data_id) {
                 evaluated.clone()
             } else {
-                let target_modifier = modifier_to_apply(engine, &target, &modifier_id)?;
+                let (target_modifier, target_modifier_index) =
+                    modifier_to_apply(engine, &target, &modifier_id)?;
                 let (evaluated, _) = evaluate_modifier_output(
                     engine,
                     &target,
                     &original_data_id,
                     &target_modifier,
+                    target_modifier_index,
                     true,
                 )?;
                 if cache_shared {

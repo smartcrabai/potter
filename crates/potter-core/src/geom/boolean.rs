@@ -1063,7 +1063,7 @@ fn polygons_to_mesh(polygons: Vec<Polygon>, template: &Mesh, epsilon: f64) -> Re
     );
     let origin = Origin {
         corners: Some(corners),
-        ..Origin::copies(compact_vertex_origins, output_face_origins, false)
+        ..Origin::copies(compact_vertex_origins, output_face_origins)
     };
     remap_attributes(template, &mut mesh, &origin)?;
     mesh.validate().map_err(|error| {

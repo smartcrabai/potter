@@ -11,6 +11,7 @@ const MAX_ARRAY_ELEMENTS: usize = 1_000_000;
 const MAX_MODIFIERS_PER_OBJECT: usize = 100_000;
 const MAX_BOUND_MODIFIERS: usize = 100_000;
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+const CORRECTIVE_BIND_FORMAT: &str = "blender_corrective_bind_v1";
 
 /// Read native bound-data fields from Blender's serialized modifier structs.
 ///
@@ -1173,12 +1174,17 @@ impl<'a> BlendFile<'a> {
                     let type_name = self.schema.type_names
                         [self.schema.structs[modifier_struct].type_index]
                         .as_str();
-                    if let Some((_, kind)) = modifier_structs
+                    let payload = if type_name == "CorrectiveSmoothModifierData" {
+                        self.read_corrective_payload(modifier_struct, modifier_offset)?
+                    } else if let Some((_, kind)) = modifier_structs
                         .iter()
                         .find(|(candidate, _)| *candidate == type_name)
-                        && let Some(value) =
-                            self.read_modifier_payload(modifier_struct, modifier_offset, *kind)?
                     {
+                        self.read_modifier_payload(modifier_struct, modifier_offset, *kind)?
+                    } else {
+                        None
+                    };
+                    if let Some(value) = payload {
                         let key = (object_name.clone(), modifier_name);
                         if output.contains_key(&key) {
                             return Err("duplicate bound Blender modifier key".into());
@@ -1815,12 +1821,57 @@ impl<'a> BlendFile<'a> {
                     .position(|name| name == "int")
                     .ok_or_else(|| "Blender DNA schema does not contain int".to_owned())?,
             )?;
-            set_object_member(&mut modifier, "dyngrid", Value::Array(cells))?;
-            set_object_member(&mut modifier, "dyninfluences", Value::Array(influences))?;
-            set_object_member(&mut modifier, "dynverts", Value::Array(dynverts))?;
-            rename_object_member(&mut modifier, "dyngrid", "dynamic_grid")?;
-            rename_object_member(&mut modifier, "dyninfluences", "dynamic_influences")?;
-            rename_object_member(&mut modifier, "dynverts", "dynamic_vertices")?;
+            // The one dynamic bind layout: each cell's influences are copied in cell order, and the offsets index
+            // the flat arrays. The cell ranges were checked above.
+            let mut cell_offsets = Vec::with_capacity(cells.len() + 1);
+            let mut influence_vertices = Vec::with_capacity(influences.len());
+            let mut influence_weights = Vec::with_capacity(influences.len());
+            cell_offsets.push(Value::from(0_usize));
+            for cell in &cells {
+                let start = cell
+                    .get("offset")
+                    .and_then(Value::as_i64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or_else(|| "Mesh Deform dynamic cell has an invalid offset".to_owned())?;
+                let count = cell
+                    .get("influences_num")
+                    .and_then(Value::as_i64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or_else(|| {
+                        "Mesh Deform dynamic cell has an invalid influence count".to_owned()
+                    })?;
+                let end = start
+                    .checked_add(count)
+                    .ok_or_else(|| "Mesh Deform dynamic cell range overflow".to_owned())?;
+                let range = influences.get(start..end).ok_or_else(|| {
+                    "Mesh Deform dynamic cell references invalid influences".to_owned()
+                })?;
+                for influence in range {
+                    influence_vertices.push(influence.get("vertex").cloned().ok_or_else(|| {
+                        "Mesh Deform dynamic influence has an invalid vertex".to_owned()
+                    })?);
+                    influence_weights.push(influence.get("weight").cloned().ok_or_else(|| {
+                        "Mesh Deform dynamic influence has an invalid weight".to_owned()
+                    })?);
+                }
+                cell_offsets.push(Value::from(influence_vertices.len()));
+            }
+            set_object_member(
+                &mut modifier,
+                "dynamic_cell_offsets",
+                Value::Array(cell_offsets),
+            )?;
+            set_object_member(
+                &mut modifier,
+                "dynamic_influence_vertices",
+                Value::Array(influence_vertices),
+            )?;
+            set_object_member(
+                &mut modifier,
+                "dynamic_influence_weights",
+                Value::Array(influence_weights),
+            )?;
+            set_object_member(&mut modifier, "dynamic_vertices", Value::Array(dynverts))?;
             payload_found |= grid_count > 0 || influences_num > 0 || verts_num > 0;
         }
         if payload_found {
@@ -1911,6 +1962,61 @@ impl<'a> BlendFile<'a> {
         }
         set_bind_discriminator(&mut modifier, "laplacian_deform")?;
         Ok(Some(modifier))
+    }
+
+    /// Reads Corrective Smooth bind coordinates. Blender sets `bind_coords` only while the modifier is
+    /// bound, so a null pointer is the unbound state; a count without an array is malformed.
+    fn read_corrective_payload(
+        &self,
+        struct_index: usize,
+        base_offset: usize,
+    ) -> Result<Option<Value>, String> {
+        let pointer = self.schema.pointer_at_path(
+            self.bytes,
+            struct_index,
+            base_offset,
+            &["bind_coords"],
+            self.header.endian,
+            self.header.pointer_size,
+        )?;
+        let count = self
+            .schema
+            .integer_at_path(
+                self.bytes,
+                struct_index,
+                base_offset,
+                &["bind_coords_num"],
+                self.header.endian,
+            )?
+            .unwrap_or(0);
+        let count = checked_count(count, "Corrective Smooth bind coordinate")?;
+        if pointer == 0 {
+            if count == 0 {
+                return Ok(None);
+            }
+            return Err("bound Corrective Smooth has a count but no bind array".into());
+        }
+        let float_count = count
+            .checked_mul(3)
+            .ok_or_else(|| "Corrective Smooth bind coordinate count overflow".to_owned())?;
+        let float_type = self
+            .schema
+            .type_names
+            .iter()
+            .position(|name| name == "float")
+            .ok_or_else(|| "Blender DNA schema does not contain float".to_owned())?;
+        let values = self.read_scalar_array(pointer, float_count, float_type)?;
+        let coords = values
+            .chunks_exact(3)
+            .map(|xyz| Value::Array(xyz.to_vec()))
+            .collect();
+        let mut binding = Map::new();
+        binding.insert(
+            "format".to_owned(),
+            Value::String(CORRECTIVE_BIND_FORMAT.to_owned()),
+        );
+        binding.insert("coords".to_owned(), Value::Array(coords));
+        Ok(Some(Value::Object(binding)))
     }
 
     fn resolve(&self, address: u64, length: usize) -> Result<(&Block, usize), String> {

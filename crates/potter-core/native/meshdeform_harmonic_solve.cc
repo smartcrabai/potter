@@ -10,6 +10,7 @@
 
 #include <cstddef>
 #include <limits>
+#include <memory>
 #include <vector>
 
 namespace {
@@ -17,34 +18,44 @@ namespace {
 using SparseMatrix = Eigen::SparseMatrix<double, Eigen::ColMajor>;
 using Triplet = Eigen::Triplet<double>;
 
-// Status codes returned to Rust. Zero is success; every other value leaves `columns` unspecified.
+// Status codes returned to Rust. Zero is success; every other value leaves the outputs unspecified.
 constexpr int kStatusOk = 0;
 constexpr int kStatusInvalidArgument = 1;
 constexpr int kStatusFactorizationFailed = 2;
 constexpr int kStatusSolveFailed = 3;
 constexpr int kStatusException = 4;
 
+// The factorization of one bind system. Rust owns it through an opaque pointer.
+struct HarmonicFactor {
+  Eigen::Index size = 0;
+  Eigen::SparseLU<SparseMatrix> solver;
+};
+
 }  // namespace
 
-// Factors the `size` x `size` system given as triplets (`rows[i]`, `cols[i]`, `values[i]`) and solves it
-// for `column_count` right-hand sides. `columns` holds the right-hand sides as contiguous column-major
-// columns of length `size` (one column per cage vertex) and is overwritten with the solutions.
+// Factors the `size` x `size` system given as triplets (`rows[i]`, `cols[i]`, `values[i]`) and returns
+// the factorization in `*factor`. Rust releases it with potter_meshdeform_harmonic_free.
 //
-// The caller guarantees that `rows`, `cols`, and `values` hold `entry_count` elements each and that
-// `columns` holds `size * column_count` elements. Indices are checked here; sizes that Eigen cannot
-// represent are rejected before any allocation.
-extern "C" int potter_meshdeform_harmonic_solve(
+// The caller guarantees that `rows`, `cols`, and `values` hold `entry_count` elements each. Indices are
+// checked here; sizes that Eigen cannot represent are rejected before any allocation. The triplets are
+// copied into the factorization, so the caller's arrays need not outlive this call.
+extern "C" int potter_meshdeform_harmonic_factor(
     std::size_t size,
     std::size_t entry_count,
     const std::size_t *rows,
     const std::size_t *cols,
     const double *values,
-    std::size_t column_count,
-    double *columns)
+    void **factor)
 {
+  if (factor == nullptr) {
+    return kStatusInvalidArgument;
+  }
+  *factor = nullptr;
   if (size == 0 || size > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
-      entry_count > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
-      column_count > static_cast<std::size_t>(std::numeric_limits<Eigen::Index>::max()) / size) {
+      entry_count > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+    return kStatusInvalidArgument;
+  }
+  if (entry_count > 0 && (rows == nullptr || cols == nullptr || values == nullptr)) {
     return kStatusInvalidArgument;
   }
 
@@ -64,26 +75,47 @@ extern "C" int potter_meshdeform_harmonic_solve(
     matrix.setFromTriplets(triplets.begin(), triplets.end());
     matrix.makeCompressed();
 
+    std::unique_ptr<HarmonicFactor> owned(new HarmonicFactor);
+    owned->size = static_cast<Eigen::Index>(size);
     // Blender: sparseLU->compute(M); result = (info() == Success).
-    Eigen::SparseLU<SparseMatrix> solver;
-    solver.compute(matrix);
-    if (solver.info() != Eigen::Success) {
+    owned->solver.compute(matrix);
+    if (owned->solver.info() != Eigen::Success) {
       return kStatusFactorizationFailed;
     }
-
-    // Blender solves each right-hand side against the same factorization. A block solve applies the
-    // same triangular solves column by column, so each column matches the per-column result.
-    Eigen::Map<Eigen::MatrixXd> block(columns,
-                                      static_cast<Eigen::Index>(size),
-                                      static_cast<Eigen::Index>(column_count));
-    const Eigen::MatrixXd solution = solver.solve(block);
-    if (solver.info() != Eigen::Success) {
-      return kStatusSolveFailed;
-    }
-    block = solution;
+    *factor = owned.release();
     return kStatusOk;
   } catch (...) {
     // Allocation failure inside Eigen must not unwind across the C ABI.
     return kStatusException;
   }
+}
+
+// Solves one right-hand side against a factorization from potter_meshdeform_harmonic_factor. `rhs` and
+// `solution` each hold the factorization's `size` values. Blender solves each cage vertex's right-hand
+// side against the same factorization, so solving column by column matches its per-column result.
+extern "C" int potter_meshdeform_harmonic_solve_column(const void *factor,
+                                                       const double *rhs,
+                                                       double *solution)
+{
+  if (factor == nullptr || rhs == nullptr || solution == nullptr) {
+    return kStatusInvalidArgument;
+  }
+  const auto *harmonic = static_cast<const HarmonicFactor *>(factor);
+  try {
+    const Eigen::Map<const Eigen::VectorXd> right(rhs, harmonic->size);
+    const Eigen::VectorXd answer = harmonic->solver.solve(right);
+    if (harmonic->solver.info() != Eigen::Success) {
+      return kStatusSolveFailed;
+    }
+    Eigen::Map<Eigen::VectorXd>(solution, harmonic->size) = answer;
+    return kStatusOk;
+  } catch (...) {
+    return kStatusException;
+  }
+}
+
+// Releases a factorization returned by potter_meshdeform_harmonic_factor. Null is ignored.
+extern "C" void potter_meshdeform_harmonic_free(void *factor)
+{
+  delete static_cast<HarmonicFactor *>(factor);
 }

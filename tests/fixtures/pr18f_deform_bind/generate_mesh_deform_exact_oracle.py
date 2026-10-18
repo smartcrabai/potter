@@ -8,7 +8,18 @@ Rebuilds the exact Rust scenes:
   cage of size 6 (cage transform set), bind at precision 3, then all eight cage vertices translated
   by CAGE_TRANSLATION after bind (case `mesh_nonuniform_translation`).
 
-Writes the evaluated subject positions for every case to OUT.json.
+Subdivision cases: `mesh_asymmetric_subdiv_p3` is the `mesh_asymmetric_*` scene with a Subdivision level-1 modifier
+before the Mesh Deform bind. `cor_grid_bind` and `cor_grid_subdiv_bind` bind a Corrective Smooth modifier (factor 0.5,
+5 iterations, scale 1, SIMPLE, rest source BIND) on the flat grid, or after the same Subdivision level-1 modifier,
+and then move four base vertices (`CORRECTIVE_MOVES`).
+
+Writes the evaluated subject positions for every case to OUT.json. The committed copy is
+tests/fixtures/pr18f_deform_bind/mesh_deform_blender_oracle.json, read by tests/pr18f_deform_bind.rs.
+
+Rows that are analytic, not Blender-measured, are not generated here. The tests compute them directly:
+uniform cage translation, the inverted and dynamic group scalings, the missing vertex group, the ignored
+cage and owner motion, and the nonuniform translation constant (its Blender value is the
+`mesh_nonuniform_translation` case above).
 
 Usage:
   Blender -b --factory-startup --python generate_mesh_deform_exact_oracle.py -- OUT.json
@@ -39,6 +50,8 @@ CAGE_TRANSLATION = (-0.4, 0.3, -0.2)
 CAGE_ROTATION = (0.0, 0.0, -0.09983341664682815, 0.9950041652780258)  # x, y, z, w
 CAGE_SCALE = (1.3, 0.8, 1.1)
 POST_BIND_MOVES = {0: (0.0, 0.0, 0.12), 2: (0.1, -0.03, 0.0), 6: (-0.04, 0.08, -0.06)}
+# Base-vertex moves after the Corrective Smooth bind (`run_corrective`).
+CORRECTIVE_MOVES = {0: (0.0, 0.0, 0.12), 6: (-0.04, 0.08, -0.06), 12: (0.0, 0.0, 0.25), 18: (0.1, -0.03, 0.0)}
 
 # Rust `CAGE_TRANSLATION` used by the nonuniform translation test (cage-local, all eight vertices).
 TRANSLATION_CAGE_MOVE = (0.3, -0.2, 0.5)
@@ -52,7 +65,7 @@ def set_transform(obj, translation, rotation_xyzw, scale):
     obj.scale = Vector(scale)
 
 
-def subject_grid(name):
+def subject_grid(name, transform=True):
     # Rust `grid` size 2.0 with 4x4 subdivisions: a 5x5 vertex grid spanning [-1, 1] in x and y.
     n = 5
     coords, faces = [], []
@@ -67,7 +80,8 @@ def subject_grid(name):
     mesh.from_pydata(coords, [], faces)
     obj = bpy.data.objects.new(name, mesh)
     bpy.context.scene.collection.objects.link(obj)
-    set_transform(obj, SUBJECT_TRANSLATION, SUBJECT_ROTATION, SUBJECT_SCALE)
+    if transform:
+        set_transform(obj, SUBJECT_TRANSLATION, SUBJECT_ROTATION, SUBJECT_SCALE)
     return obj
 
 
@@ -101,7 +115,13 @@ def evaluated_positions(obj):
     return result
 
 
-def bind_and_read(label, source, cage, precision, dynamic, invert, moves, group_weights):
+def bind_and_read(label, source, cage, precision, dynamic, invert, moves, group_weights,
+                  subdivide=False):
+    if subdivide:
+        # Blender binds on the mesh evaluated before the bound modifier, so this level-1 subdivision is part of
+        # the bind input.
+        subdivision = source.modifiers.new("Subdivision", "SUBSURF")
+        subdivision.levels = 1
     md = source.modifiers.new("MeshDeform", "MESH_DEFORM")
     md.object = cage
     md.precision = precision
@@ -121,11 +141,35 @@ def bind_and_read(label, source, cage, precision, dynamic, invert, moves, group_
     return {"bound": bool(md.is_bound), "positions": evaluated_positions(source)}
 
 
-def run_asymmetric(label, precision, dynamic, invert):
+def run_asymmetric(label, precision, dynamic, invert, subdivide=False):
     source = subject_grid("Subject_" + label)
     cage = cage_box("Cage_" + label, ASYMMETRIC)
     weights = [0.15 + 0.2 * (i % 5) for i in range(25)]
-    return bind_and_read(label, source, cage, precision, dynamic, invert, POST_BIND_MOVES, weights)
+    return bind_and_read(
+        label, source, cage, precision, dynamic, invert, POST_BIND_MOVES, weights,
+        subdivide=subdivide)
+
+
+def run_corrective(label, subdivide):
+    # Rust: grid size 2.0 with 4x4 subdivisions and no object transform. The modifier is bound on the flat
+    # grid, or after a Subdivision level-1 modifier when `subdivide`; then four base vertices move.
+    source = subject_grid(label, transform=False)
+    if subdivide:
+        subdivision = source.modifiers.new("Subdivision", "SUBSURF")
+        subdivision.levels = 1
+    smooth = source.modifiers.new("Smooth", "CORRECTIVE_SMOOTH")
+    smooth.factor = 0.5
+    smooth.iterations = 5
+    smooth.scale = 1.0
+    smooth.smooth_type = 'SIMPLE'
+    smooth.rest_source = 'BIND'
+    activate(source)
+    bpy.ops.object.correctivesmooth_bind(modifier=smooth.name)
+    bpy.context.view_layer.update()
+    for index, delta in CORRECTIVE_MOVES.items():
+        source.data.vertices[index].co += Vector(delta)
+    source.data.update()
+    return {"bound": bool(smooth.is_bind), "positions": evaluated_positions(source)}
 
 
 def run_nonuniform_translation(label):
@@ -150,6 +194,13 @@ results["mesh_asymmetric_dynamic_p3_invert"] = run_asymmetric(
     "mesh_asymmetric_dynamic_p3_invert", 3, True, True)
 reset()
 results["mesh_nonuniform_translation"] = run_nonuniform_translation("mesh_nonuniform_translation")
+reset()
+results["cor_grid_bind"] = run_corrective("cor_grid_bind", False)
+reset()
+results["cor_grid_subdiv_bind"] = run_corrective("cor_grid_subdiv_bind", True)
+reset()
+results["mesh_asymmetric_subdiv_p3"] = run_asymmetric(
+    "mesh_asymmetric_subdiv_p3", 3, False, False, subdivide=True)
 
 with open(out_path(), "w") as handle:
     json.dump(results, handle, indent=1, sort_keys=True)

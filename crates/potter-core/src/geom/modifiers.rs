@@ -10,11 +10,12 @@ use std::rc::Rc;
 
 use glam::{DMat4, DVec3};
 use serde_json::{Map, Value, json};
+use sha2::Digest as _;
 
 use crate::blender_rng::BlenderRng;
 use crate::{
     error::{ErrorCode, PotError, Result},
-    eval::ModifierEvaluationContext,
+    eval::{EvaluationPurpose, ModifierEvaluationContext},
     graph::{self, NodeGroup},
     model::{Id, Modifier, Registry},
     params::{self, ParameterFamily},
@@ -80,20 +81,6 @@ impl MergedGeometry {
 const MAX_SUBDIVISION_TRIANGLES: u128 = 100_000_000;
 const MAX_SUBDIVISION_MEMORY_BYTES: u128 = 8 * 1024 * 1024 * 1024;
 
-/// Build Blender's `SpaceTransform` pair from original world matrices in f32 operation order.
-#[expect(
-    dead_code,
-    reason = "shared f32 SpaceTransform helper is consumed by PR18-I after F"
-)]
-pub(crate) fn blender_space_transform_f32(local: DMat4, target: DMat4) -> ([f32; 16], [f32; 16]) {
-    let local = local.to_cols_array().map(|value| value as f32);
-    let target = target.to_cols_array().map(|value| value as f32);
-    let inverse_target = blender_inverse_m4(target);
-    let local_to_target = blender_multiply_m4(inverse_target, local);
-    let target_to_local = blender_inverse_m4(local_to_target);
-    (local_to_target, target_to_local)
-}
-
 /// Apply Blender's column-major C transform expression to an f32 point.
 pub(crate) fn blender_transform_point_f32(matrix: &[f32; 16], point: glam::Vec3) -> glam::Vec3 {
     glam::Vec3::new(
@@ -122,18 +109,6 @@ pub(crate) fn blender_multiply_m4(left: [f32; 16], right: [f32; 16]) -> [f32; 16
     result
 }
 
-unsafe extern "C" {
-    fn potter_blender_inverse_m4(matrix: *const f32, inverse: *mut f32);
-}
-
-pub(crate) fn blender_inverse_m4(matrix: [f32; 16]) -> [f32; 16] {
-    let mut result = [0.0; 16];
-    unsafe {
-        potter_blender_inverse_m4(matrix.as_ptr(), result.as_mut_ptr());
-    }
-    result
-}
-
 /// Result of evaluating a modifier stack, including realized graph instance paths.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModifierEvaluation {
@@ -155,27 +130,20 @@ pub fn evaluate_modifiers(mesh: &Mesh, modifiers: &[Modifier], subject_name: &st
     Ok(evaluate_modifiers_with_groups(mesh, modifiers, &BTreeMap::new(), subject_name)?.mesh)
 }
 
-/// Evaluate modifiers with node groups and a scene frame.
+/// Evaluate modifiers with node groups and a scene frame, keying texture streams by `texture_seed`.
 ///
 /// # Errors
 ///
 /// Returns an error for invalid frames, unsupported modifiers, invalid parameters,
-/// missing groups, graph evaluation failures, or custom modifier failures.
-pub(crate) fn evaluate_modifiers_with_groups_and_custom_at_frame(
+/// missing groups, or graph evaluation failures.
+pub(crate) fn evaluate_modifiers_with_texture_seed_at_frame(
     evaluated: Mesh,
     modifiers: &[Modifier],
     node_groups: &Registry<NodeGroup>,
     frame: f64,
     subject_name: &str,
-    custom_modifier: impl FnMut(
-        &mut Mesh,
-        &Modifier,
-        &mut Vec<PotError>,
-        Option<&[DVec3]>,
-        &mut BlenderRng,
-    ) -> Result<()>,
+    texture_seed: TextureSeed<'_>,
 ) -> Result<ModifierEvaluation> {
-    let mut texture_rng = BlenderRng::seed_random(0);
     evaluate_modifiers_with_scene_context(
         evaluated,
         modifiers,
@@ -189,8 +157,8 @@ pub(crate) fn evaluate_modifiers_with_groups_and_custom_at_frame(
         &BTreeMap::new(),
         ModifierEvaluationContext::default(),
         |_, modifier| modifier.enabled,
-        &mut texture_rng,
-        custom_modifier,
+        texture_seed,
+        |_, modifier, _warnings, _, _texture_rng| Err(unsupported_modifier(modifier)),
     )
 }
 
@@ -223,6 +191,80 @@ pub(crate) fn is_only_deform(modifier_type: &str) -> bool {
     )
 }
 
+/// One subject's texture-noise seed scope for an evaluation.
+///
+/// Each modifier draws from its own stream, derived from the subject node and the modifier's
+/// position in its stack (counted over the whole stack, before active filtering), so the samples a
+/// modifier receives do not depend on which other objects are evaluated, their order, whether they
+/// are evaluated at all, or which other modifiers are active.
+///
+/// Seed policy, all deterministic:
+/// - `base`: the scene's `render.seed` for `EvaluationPurpose::Render`, and `0` for Preview.
+/// - `subject`: the node ID for scene evaluations. Standalone modifier evaluation has no node ID,
+///   so it keys on the subject name.
+///
+/// Blender's legacy Noise draws from worker streams that, per the note on
+/// `legacy_texture::sample`, Blender seeds from `clock()`; that sequence is not reproducible across
+/// runs. Potter does not imitate it: the same document always yields the same noise.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TextureSeed<'a> {
+    base: u32,
+    subject: &'a str,
+    stack_offset: usize,
+}
+
+impl<'a> TextureSeed<'a> {
+    /// Seed scope for `subject` at `purpose`; `render_seed` is the scene's `render.seed`.
+    ///
+    /// The evaluated modifiers start at stack index 0 until `with_stack_offset` places them.
+    #[must_use]
+    pub(crate) fn new(purpose: EvaluationPurpose, render_seed: u32, subject: &'a str) -> Self {
+        let base = if purpose == EvaluationPurpose::Render {
+            render_seed
+        } else {
+            0
+        };
+        Self {
+            base,
+            subject,
+            stack_offset: 0,
+        }
+    }
+
+    /// Places the first evaluated modifier at `stack_offset` in the subject's full stack.
+    ///
+    /// Only texture RNG keying uses this offset. Topology, provenance, and boolean suffix checks
+    /// keep the slice-local index.
+    #[must_use]
+    pub(crate) fn with_stack_offset(self, stack_offset: usize) -> Self {
+        Self {
+            stack_offset,
+            ..self
+        }
+    }
+
+    /// The stream for the evaluated modifier at `modifier_index`, starting at the beginning of its
+    /// sequence. The key uses the modifier's full stack index, `stack_offset + modifier_index`.
+    ///
+    /// The seed is the first four bytes, big-endian, of SHA-256 over a domain tag, the base seed,
+    /// the length-prefixed subject key, and the big-endian stack index; it is passed to
+    /// `BLI_rng_srandom`.
+    #[must_use]
+    pub(crate) fn rng_for(self, modifier_index: usize) -> BlenderRng {
+        let stack_index = self.stack_offset + modifier_index;
+        let mut key = Vec::new();
+        key.extend_from_slice(b"potter.modifier-texture-stream.v2\0");
+        key.extend_from_slice(&self.base.to_be_bytes());
+        key.extend_from_slice(&(self.subject.len() as u64).to_be_bytes());
+        key.extend_from_slice(self.subject.as_bytes());
+        key.extend_from_slice(&(stack_index as u64).to_be_bytes());
+        let digest = sha2::Sha256::digest(&key);
+        BlenderRng::seed_random(u32::from_be_bytes([
+            digest[0], digest[1], digest[2], digest[3],
+        ]))
+    }
+}
+
 pub(crate) fn evaluate_modifiers_with_scene_context(
     mut evaluated: Mesh,
     modifiers: &[Modifier],
@@ -236,7 +278,7 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
     curve_path_lengths: &BTreeMap<Id, f64>,
     context: ModifierEvaluationContext<'_>,
     is_active: impl Fn(usize, &Modifier) -> bool,
-    texture_rng: &mut BlenderRng,
+    texture_seed: TextureSeed<'_>,
     mut custom_modifier: impl FnMut(
         &mut Mesh,
         &Modifier,
@@ -245,6 +287,7 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
         &mut BlenderRng,
     ) -> Result<()>,
 ) -> Result<ModifierEvaluation> {
+    let had_origindex = origindex_values(&evaluated).is_some();
     if subject_name.is_empty() {
         return Err(PotError::invalid_argument(
             "modifier evaluation requires a subject name",
@@ -266,10 +309,10 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
     let mut warnings = Vec::new();
     // Blender's `vert_coords_prev`: positions before a deform that a following multi-input armature reads.
     let mut run_input: Option<Rc<Vec<DVec3>>> = None;
-    // Blender's `mesh_calc_modifiers` creates CD_ORIGINDEX as an identity map only when the first
-    // non-OnlyDeform modifier is about to run and a later listed Hook reads it (`MOD_hook.cc`
-    // `required_data_mask`). A listed Hook before that point hooks by listed value; one after it
-    // hooks by list position. The map travels with the mesh as the `blender_origindex` carrier.
+    // Blender's `mesh_calc_modifiers` creates `CD_ORIGINDEX` as an identity map before the first
+    // non-OnlyDeform modifier when a later listed Hook needs it (`MOD_hook.cc` required_data_mask).
+    // Before then, Hook falls back to direct indices on the current mesh; after it, Hook matches
+    // each output vertex's listed original index. The map travels as the `blender_origindex` carrier.
     let is_listed_hook = |modifier: &Modifier| {
         modifier.modifier_type == "hook"
             && modifier
@@ -296,6 +339,7 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
         .filter(|&(modifier_index, modifier)| is_active(modifier_index, modifier))
     {
         validate_boolean_topology_suffix(modifiers, modifier_index, &is_active)?;
+        let mut texture_rng = texture_seed.rng_for(modifier_index);
         if origindex_at == Some(modifier_index) && origindex_values(&evaluated).is_none() {
             let identity = (0..evaluated.vertices.len())
                 .map(|index| {
@@ -410,7 +454,7 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
                 modifier,
                 &mut warnings,
                 incoming.as_deref().map(Vec::as_slice),
-                texture_rng,
+                &mut texture_rng,
             )?;
             continue;
         }
@@ -450,6 +494,11 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
         if modifier.modifier_type == "mesh_to_volume" {
             continue;
         }
+        if modifier.modifier_type == "mesh_deform" && modifier.binding_data.is_none() {
+            // Blender leaves the mesh unchanged and reports `Bind data required` (MOD_meshdeform.cc).
+            warnings.push(deform::mesh_deform_unbound_warning(modifier));
+            continue;
+        }
         if modifier.modifier_type == "surface_deform" {
             match deform::surface_deform(&evaluated, modifier) {
                 Ok(deformed) => evaluated = deformed,
@@ -486,9 +535,13 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
             "bevel" => bevel(&evaluated, modifier)?,
             "decimate" => without_custom_normals(decimate(&evaluated, modifier)?),
             "weld" => weld(&evaluated, modifier)?,
-            "displace" => {
-                displace_textured(&evaluated, modifier, owner_world_matrix, None, texture_rng)?
-            }
+            "displace" => displace_textured(
+                &evaluated,
+                modifier,
+                owner_world_matrix,
+                None,
+                &mut texture_rng,
+            )?,
             "smooth" => smooth(&evaluated, modifier)?,
             "simple_deform" => advanced::simple_deform(&evaluated, modifier)?,
             "screw" => advanced::screw(&evaluated, modifier, context)?,
@@ -497,8 +550,8 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
             "hook" => advanced::hook(&evaluated, modifier)?,
             "skin" => skin::skin_with_warnings(&evaluated, modifier, &mut warnings)?,
             "cast" => advanced::cast(&evaluated, modifier)?,
-            "wave" => wave_textured(&evaluated, modifier, frame, None, texture_rng)?,
-            "warp" => warp_textured(&evaluated, modifier, None, texture_rng)?,
+            "wave" => wave_textured(&evaluated, modifier, frame, None, &mut texture_rng)?,
+            "warp" => warp_textured(&evaluated, modifier, None, &mut texture_rng)?,
             "vertex_weight_edit"
             | "vertex_weight_mix"
             | "vertex_weight_proximity"
@@ -506,7 +559,7 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
             | "normal_edit"
             | "uv_project"
             | "uv_warp"
-            | "data_transfer" => attributes::evaluate(&evaluated, modifier)?,
+            | "data_transfer" => attributes::evaluate(&evaluated, modifier, subject_name)?,
             "mask" => advanced::mask(&evaluated, modifier)?,
             "laplacian_smooth" => smoothing::laplacian_smooth(&evaluated, modifier)?,
             "laplacian_deform" => deform::laplacian_deform(&evaluated, modifier)?,
@@ -532,7 +585,9 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
             warnings.push(attribute_dropped_warning(modifier, &dropped));
         }
     }
-    evaluated.attributes.remove(ORIGINDEX_ATTRIBUTE);
+    if !had_origindex {
+        evaluated.attributes.remove(ORIGINDEX_ATTRIBUTE);
+    }
     Ok(ModifierEvaluation {
         mesh: evaluated,
         instance_paths,
@@ -556,6 +611,9 @@ pub fn evaluate_modifiers_with_groups(
 
 /// Evaluate the enabled modifier stack using the requested scene frame.
 ///
+/// Texture streams are keyed by `subject_name` at stack index 0 of `modifiers`: this entry point
+/// has no node ID. Scene and apply callers use `evaluate_modifiers_with_texture_seed_at_frame`.
+///
 /// # Errors
 ///
 /// Returns an error for unsupported modifiers, invalid parameters, invalid input,
@@ -567,13 +625,13 @@ pub fn evaluate_modifiers_with_groups_at_frame(
     frame: f64,
     subject_name: &str,
 ) -> Result<ModifierEvaluation> {
-    evaluate_modifiers_with_groups_and_custom_at_frame(
+    evaluate_modifiers_with_texture_seed_at_frame(
         mesh.clone(),
         modifiers,
         node_groups,
         frame,
         subject_name,
-        |_, modifier, _warnings, _, _texture_rng| Err(unsupported_modifier(modifier)),
+        TextureSeed::new(EvaluationPurpose::Preview, 0, subject_name),
     )
 }
 
@@ -3508,7 +3566,6 @@ fn triangulate(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             .iter()
             .map(|triangle| Some(triangle.face))
             .collect(),
-        true,
     );
     let mut result = build_mesh(
         positions(mesh),
@@ -3745,7 +3802,7 @@ fn solidify(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
                 .map(|index| (index < source_count).then_some(index))
                 .collect(),
         ),
-        ..Origin::copies(point_sources.into_iter().map(Some), face_sources, false)
+        ..Origin::copies(point_sources.into_iter().map(Some), face_sources)
     };
     let mut result = build_mesh(points, output_polygons, output_loose_edges, &origin, mesh)?;
     clnor::transfer_custom_normals(
@@ -4707,11 +4764,7 @@ fn bevel(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             .zip(&uv_sources)
             .map(|(ids, source)| (ids.as_slice(), *source)),
     );
-    let mut origin = Origin::copies(
-        point_vertices.iter().copied().map(Some),
-        shade_sources,
-        false,
-    );
+    let mut origin = Origin::copies(point_vertices.iter().copied().map(Some), shade_sources);
     origin.corners = Some(corners);
     let source_count = source_polygons.len();
     let kinds: Vec<bevel_shading::Kind> = (0..output_polygons.len())

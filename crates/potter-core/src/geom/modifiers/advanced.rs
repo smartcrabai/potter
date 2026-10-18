@@ -12,6 +12,7 @@ use serde_json::Value;
 
 use crate::model::Modifier;
 
+use super::displacement::{VertexGroup, vertex_group};
 use super::{
     bool_param, build_mesh, closest_point_triangle, id_indices, invalid_parameter, loose_edges,
     number_param, polygons, positions, schema_value, string_param, uint_param, usize_as_f64,
@@ -382,7 +383,6 @@ pub(super) fn screw(
         ..Origin::copies(
             (0..ring_count * vertex_count).map(|index| Some(index % vertex_count)),
             vec![None; faces.len()],
-            false,
         )
     };
     // Each corner's U advances by the rings between its face's step and its vertex's ring: one share
@@ -566,6 +566,22 @@ fn group_weight(weights: Option<&[f64]>, index: usize) -> f64 {
     weights.map_or(1.0, |weights| weights.get(index).copied().unwrap_or(0.0))
 }
 
+/// Cast and Hook per-vertex weights (`MOD_cast.cc`, `MOD_hook.cc`); `None` when every vertex has full influence.
+/// A named group without stored weights is Blender's null `dvert`, which both modifiers skip, so every vertex
+/// keeps full influence, as with an absent group. Simple Deform and Curve keep `deform_group_weights`.
+fn cast_hook_weights(mesh: &Mesh, modifier: &Modifier) -> Result<Option<Vec<f64>>> {
+    let group = vertex_group(mesh, modifier)?;
+    if !matches!(group, VertexGroup::Weighted(_)) {
+        return Ok(None);
+    }
+    let invert = bool_param(modifier, "invert_vertex_group")?;
+    Ok(Some(
+        (0..mesh.vertices.len())
+            .map(|index| group.weight(index, invert))
+            .collect(),
+    ))
+}
+
 /// Blender's automatic cuboid half-extent per axis: the larger of the absolute extremes of the points.
 /// Blender `cuboid_do` takes the points as the centre plus the local coordinates relative to it.
 fn cast_auto_half_extent(points: impl Iterator<Item = DVec3>) -> DVec3 {
@@ -621,7 +637,7 @@ pub(super) fn cast(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         ),
         None => (DMat4::IDENTITY, DMat4::IDENTITY),
     };
-    let weights = deform_group_weights(mesh, modifier)?;
+    let weights = cast_hook_weights(mesh, modifier)?;
     let has_radius = radius > f64::from(f32::EPSILON);
     let mut result = mesh.clone();
     if cast_type == "CUBOID" {
@@ -812,7 +828,7 @@ pub(super) fn build(mesh: &Mesh, modifier: &Modifier, frame: f64) -> Result<Mesh
         .iter()
         .map(|&index| source_positions[index])
         .collect();
-    let origin = Origin::copies(sources.into_iter().map(Some), face_sources, false);
+    let origin = Origin::copies(sources.into_iter().map(Some), face_sources);
     let result = build_mesh(points, result_faces, result_edges, &origin, mesh)?;
     if !result.vertices.is_empty() {
         validated(&result)?;
@@ -971,7 +987,6 @@ pub(super) fn edge_split(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     let origin = Origin::copies(
         sources.into_iter().map(Some),
         (0..mesh.faces.len()).map(Some).collect(),
-        false,
     );
     build_mesh(points, out_faces, loose_edges(mesh)?, &origin, mesh)
 }
@@ -1185,7 +1200,7 @@ pub(super) fn mask(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
                 .then_some([remap[first], remap[second]])
         })
         .collect();
-    let origin = Origin::copies(sources.into_iter().map(Some), retained_sources, false);
+    let origin = Origin::copies(sources.into_iter().map(Some), retained_sources);
     build_mesh(points, faces, edges, &origin, mesh)
 }
 
@@ -1599,7 +1614,6 @@ pub(super) fn wireframe(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     let origin = Origin::copies(
         sources.into_iter().map(Some),
         face_sources.into_iter().map(Some).collect(),
-        false,
     );
     let mut result = build_mesh(coords, faces, Vec::new(), &origin, mesh)?;
     // BMesh gives new edges the SMOOTH flag (bmesh_core.cc), so only source edges between kept
@@ -1935,7 +1949,7 @@ pub(super) fn hook(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     } else {
         None
     };
-    let weights = deform_group_weights(mesh, modifier)?;
+    let weights = cast_hook_weights(mesh, modifier)?;
     // Blender hooks only listed vertices; without a list, a vertex group selects them.
     let listed = !indices.is_empty();
     if !listed && weights.is_none() {

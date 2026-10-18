@@ -218,13 +218,14 @@ fn uv_texture_coordinates(mesh: &Mesh, modifier: &Modifier) -> Result<Option<Vec
             if assigned[index] {
                 continue;
             }
+            // A missing corner takes the canonical V-down (0, 1), which is Blender's V=0 corner.
             let uv = layer
                 .faces
                 .get(face_index)
                 .and_then(Option::as_ref)
                 .and_then(|values| values.get(corner))
                 .copied()
-                .unwrap_or([0.0, 0.0]);
+                .unwrap_or([0.0, 1.0]);
             coords[index] = DVec3::new(uv[0] * 2.0 - 1.0, (1.0 - uv[1]) * 2.0 - 1.0, 0.0);
             assigned[index] = true;
         }
@@ -906,6 +907,29 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert!((coords[0] - expected).length() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn missing_uv_corner_maps_to_blenders_zero_corner() {
+        let mut mesh = Mesh::box_mesh(BoxParams {
+            size: DVec3::splat(2.0),
+        })
+        .unwrap();
+        let face_count = mesh.faces.len();
+        uv_layers::write(
+            &mut mesh,
+            &UvStore {
+                layers: vec![UvLayer::new("Map", vec![None; face_count])],
+                active: Some("Map".to_owned()),
+                render: Some("Map".to_owned()),
+            },
+        );
+        let coords = uv_texture_coordinates(&mesh, &modifier(""))
+            .unwrap()
+            .unwrap();
+        for coord in coords {
+            assert!((coord - DVec3::new(-1.0, -1.0, 0.0)).length() < 1e-12);
         }
     }
 }

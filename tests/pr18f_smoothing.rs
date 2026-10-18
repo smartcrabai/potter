@@ -350,3 +350,83 @@ fn corrective_only_smooth_does_not_need_bind_data() {
         &expected(&oracle, "cor_f_only_smooth"),
     );
 }
+
+/// The bent tube with a named group that stores no weights: Blender's null `dvert`.
+fn with_empty_group(mut mesh: Mesh) -> Mesh {
+    mesh.attributes
+        .insert("vertex_groups".to_owned(), json!({ "Empty": {} }));
+    mesh
+}
+
+/// Whether any vertex moved by more than `1e-3` from `input`.
+fn moved(result: &Mesh, input: &Mesh) -> bool {
+    result
+        .vertices
+        .iter()
+        .zip(&input.vertices)
+        .any(|(after, before)| after.co.distance(before.co) > 1.0e-3)
+}
+
+fn assert_same_mesh(label: &str, actual: &Mesh, expected: &Mesh) {
+    assert_eq!(
+        actual.vertices.len(),
+        expected.vertices.len(),
+        "{label}: vertex count"
+    );
+    for (index, (vertex, want)) in actual.vertices.iter().zip(&expected.vertices).enumerate() {
+        let error = vertex.co.distance(want.co);
+        assert!(
+            error < 1.0e-12,
+            "{label}: vertex {index} differs by {error}"
+        );
+    }
+}
+
+/// A named group without stored weights is Blender's null `dvert`: full smoothing, as with no group.
+#[test]
+fn laplacian_smooth_named_unweighted_group_matches_no_group() {
+    let oracle = oracle();
+    let base = oracle["cases"]["lap_a_plain_iter3"]["params"].clone();
+    let input = tube(&oracle, &oracle["bent"], false);
+    let full = evaluate(&input, &[modifier("laplacian_smooth", base.clone())]);
+    assert!(moved(&full, &input), "laplacian smooth must move the tube");
+    for invert in [false, true] {
+        let mut params = base.clone();
+        params["vertex_group"] = json!("Empty");
+        params["invert_vertex_group"] = json!(invert);
+        let mesh = with_empty_group(tube(&oracle, &oracle["bent"], false));
+        let result = evaluate(&mesh, &[modifier("laplacian_smooth", params)]);
+        assert_same_mesh(&format!("laplacian invert={invert}"), &result, &full);
+    }
+}
+
+/// A named group without stored weights is Blender's null `dvert`: full correction, as with no group.
+#[test]
+fn corrective_smooth_named_unweighted_group_matches_no_group() {
+    let oracle = oracle();
+    let mut base = oracle["cases"]["cor_a_simple_bind"]["params"].clone();
+    base["rest_source"] = json!("BIND");
+    let input = tube(&oracle, &oracle["bent"], false);
+    let full = evaluate(
+        &input,
+        &[bound(
+            modifier("corrective_smooth", base.clone()),
+            &oracle["flat"],
+        )],
+    );
+    assert!(moved(&full, &input), "corrective smooth must move the tube");
+    for invert in [false, true] {
+        let mut params = base.clone();
+        params["vertex_group"] = json!("Empty");
+        params["invert_vertex_group"] = json!(invert);
+        let mesh = with_empty_group(tube(&oracle, &oracle["bent"], false));
+        let result = evaluate(
+            &mesh,
+            &[bound(
+                modifier("corrective_smooth", params),
+                &oracle["flat"],
+            )],
+        );
+        assert_same_mesh(&format!("corrective invert={invert}"), &result, &full);
+    }
+}

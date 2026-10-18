@@ -1,17 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Blender's random-number generators, ported from `BLI_rand.hh`, `rand.cc`, `BLI_noise` and
-//! `BKE_particle.h` (`psys_frand`). Particle modifiers depend on these exact sequences.
-
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Particle and Ocean consumers use these shared RNG APIs when their slices rebase onto F"
-    )
-)]
-
-use std::sync::OnceLock;
+//! Blender's random-number generators, ported from `BLI_rand.hh`, `rand.cc` and `BLI_noise`.
+//! Texture and Ocean consumers depend on these exact sequences.
 
 /// Blender's `BLI_noise_hash_uchar_512` table (`intern/noise_c.cc`).
 const HASH_UCHAR_512: [u8; 512] = [
@@ -110,49 +100,9 @@ impl BlenderRng {
     }
 }
 
-/// `BLI_hash_frand`: a float hash of one integer.
-pub(crate) fn hash_frand(seed: u32) -> f32 {
-    BlenderRng::seed_random(seed).get_float()
-}
-
-/// Particle-system random table from `BKE_particle_init_rng` (`PSYS_FRAND_COUNT` = 1024).
-struct PsysFrandTable {
-    base: [f32; PSYS_FRAND_COUNT],
-    offset: [u32; PSYS_FRAND_COUNT],
-    multiplier: [u32; PSYS_FRAND_COUNT],
-}
-
-const PSYS_FRAND_COUNT: usize = 1024;
-
-fn psys_frand_table() -> &'static PsysFrandTable {
-    static TABLE: OnceLock<PsysFrandTable> = OnceLock::new();
-    TABLE.get_or_init(|| {
-        let mut rng = BlenderRng::seed_random(5831);
-        let mut table = PsysFrandTable {
-            base: [0.0; PSYS_FRAND_COUNT],
-            offset: [0; PSYS_FRAND_COUNT],
-            multiplier: [0; PSYS_FRAND_COUNT],
-        };
-        for index in 0..PSYS_FRAND_COUNT {
-            table.base[index] = rng.get_float();
-            table.offset[index] = rng.get_int32() as u32;
-            table.multiplier[index] = rng.get_int32() as u32;
-        }
-        table
-    })
-}
-
-/// `psys_frand(psys, seed)` for a particle system whose `ParticleSystem.seed` is `system_seed`.
-pub(crate) fn psys_frand(system_seed: u32, seed: u32) -> f32 {
-    let table = psys_frand_table();
-    let slot = usize::try_from(system_seed % PSYS_FRAND_COUNT as u32).unwrap_or(0);
-    let index = table.offset[slot].wrapping_add(seed.wrapping_mul(table.multiplier[slot]));
-    table.base[(index % PSYS_FRAND_COUNT as u32) as usize]
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{BlenderRng, hash_frand, psys_frand};
+    use super::BlenderRng;
 
     #[test]
     fn direct_seed_matches_blender_rng_sequence() {
@@ -170,16 +120,5 @@ mod tests {
         let mut rng = BlenderRng::seed(1);
         assert!((rng.gaussian() - 0.570_007_74).abs() < 1.0e-6);
         assert!((rng.gaussian() + 0.973_007_74).abs() < 1.0e-6);
-    }
-
-    #[test]
-    fn psys_frand_matches_blender_particle_instance_oracle() {
-        assert_eq!(psys_frand(7, 3578), 0.226_094_66);
-        assert_eq!(psys_frand(7, 3579), 0.494_628_64);
-        assert_eq!(psys_frand(7, 3580), 0.585_033_4);
-        assert_eq!(psys_frand(7, 77374), 0.802_313_7);
-        assert_eq!(psys_frand(7, 77657), 0.544_631_6);
-        assert_ne!(psys_frand(7, 3578), psys_frand(8, 3578));
-        assert!((0.0..1.0).contains(&hash_frand(77091)));
     }
 }

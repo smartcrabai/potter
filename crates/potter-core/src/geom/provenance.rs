@@ -44,31 +44,18 @@ pub(crate) struct Origin {
 
 impl Origin {
     /// Origin where each output vertex copies one input vertex, or is new when `None`.
-    /// Selectors are retained only when `track_original_indices` is true.
+    /// `source_vertices` is `None`; [`carrier_source`] then uses the weight-one rule.
     pub(crate) fn copies(
         vertices: impl IntoIterator<Item = Option<usize>>,
         faces: Vec<Option<usize>>,
-        track_original_indices: bool,
     ) -> Self {
-        let vertices = vertices.into_iter();
-        let (vertices, source_vertices) = if track_original_indices {
-            let mut source_vertices = Vec::with_capacity(vertices.size_hint().0);
-            let vertices = vertices
-                .map(|source| {
-                    source_vertices.push(source);
-                    source.map(|index| vec![(index, 1.0)]).unwrap_or_default()
-                })
-                .collect();
-            (vertices, Some(source_vertices))
-        } else {
-            let vertices = vertices
-                .map(|source| source.map(|index| vec![(index, 1.0)]).unwrap_or_default())
-                .collect();
-            (vertices, None)
-        };
+        let vertices = vertices
+            .into_iter()
+            .map(|source| source.map(|index| vec![(index, 1.0)]).unwrap_or_default())
+            .collect();
         Self {
             vertices,
-            source_vertices,
+            source_vertices: None,
             faces,
             corners: None,
         }
@@ -1369,7 +1356,7 @@ mod tests {
         crate::geom::set_origindex(&mut source, &[1, ORIGINDEX_NONE, 2]);
 
         let mut output = triangle();
-        let copied = Origin::copies([Some(2), None, Some(0)], vec![Some(0)], false);
+        let copied = Origin::copies([Some(2), None, Some(0)], vec![Some(0)]);
         remap_attributes(&source, &mut output, &copied).expect("remap copied indices");
         assert_eq!(
             crate::geom::origindex_values(&output),

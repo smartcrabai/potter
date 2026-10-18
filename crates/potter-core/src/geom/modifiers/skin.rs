@@ -3,8 +3,6 @@
 // Portions derived from Blender (https://www.blender.org):
 //   source/blender/modifiers/intern/MOD_skin.cc, SPDX-FileCopyrightText: 2023 Blender Authors, GPL-2.0-or-later.
 
-use glam::DQuat;
-
 use super::{
     DVec3, ErrorCode, HashMap, HashSet, Mesh, Modifier, Origin, Polygon, PotError, Result, Value,
     bool_param, build_mesh, id_indices, invalid_parameter, number_param, positions, validated,
@@ -191,7 +189,6 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     }
     let mut degrees = vec![0_usize; mesh.vertices.len()];
     let mut edge_endpoints = Vec::with_capacity(mesh.edges.len());
-    let mut edge_lengths = Vec::with_capacity(mesh.edges.len());
     for edge in &mesh.edges {
         let first = *source_indices.get(&edge.vertices[0]).ok_or_else(|| {
             invalid_parameter(modifier, "mesh", "edges referencing existing vertices")
@@ -210,14 +207,15 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         degrees[first] += 1;
         degrees[second] += 1;
         edge_endpoints.push([first, second]);
-        edge_lengths.push(length);
     }
     let mut edge_chains = Vec::with_capacity(mesh.edges.len());
     for (edge_index, [first, second]) in edge_endpoints.iter().copied().enumerate() {
         let first_radius = node_radii[first];
         let second_radius = node_radii[second];
+        // Blender's `calc_edge_subdivisions`: `half_v2` of each end, summed, over the f32 length.
         let average_radius =
-            (first_radius[0] + first_radius[1] + second_radius[0] + second_radius[1]) * 0.5;
+            skin_half_radius_sum(first_radius) + skin_half_radius_sum(second_radius);
+        let edge_length = skin_float_distance(source_positions[first], source_positions[second]);
         let first_is_branch = degrees[first] > 2;
         let second_is_branch = degrees[second] > 2;
         let loose_branch =
@@ -229,35 +227,45 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
                 0
             }
         } else if average_radius > 0.0 {
-            (edge_lengths[edge_index] / average_radius).min(128.0) as usize
+            (edge_length / average_radius).min(128.0) as usize
+        } else if average_radius < 0.0 && edge_length / average_radius <= -1.0 {
+            // Blender's subdivision count truncates to -1 or below here, which its output vertex
+            // count assertion forbids.
+            return Err(invalid_parameter(
+                modifier,
+                "skin_radii",
+                "edge radii whose average keeps the subdivision count non-negative",
+            ));
         } else {
-            // Blender crashes on a negative subdivision count; keep the finite radii accepted.
+            // A zero average and a ratio in (-1, 0) both give no subdivisions.
             0
         };
         if first_is_branch && second_is_branch && subdivisions < 2 {
             subdivisions = 2;
         }
-        let first_half = (first_radius[0] + first_radius[1]) * 0.5;
-        let second_half = (second_radius[0] + second_radius[1]) * 0.5;
         // Blender: radrat = half(r1) / half(r0), then (radrat + 1) / 2 when finite, else 1.
-        let ratio = second_half / first_half;
+        let ratio = skin_half_radius_sum(second_radius) / skin_half_radius_sum(first_radius);
         let radius_ratio = if ratio.is_finite() {
-            (ratio + 1.0) * 0.5
+            (ratio + 1.0) / 2.0
         } else {
             1.0
         };
+        let first_position = skin_float_point(source_positions[first]);
+        let second_position = skin_float_point(source_positions[second]);
+        let first_radius32 = first_radius.map(|component| component as f32);
+        let second_radius32 = second_radius.map(|component| component as f32);
         let mut chain = Vec::with_capacity(subdivisions + 2);
         chain.push(first);
         for subdivision in 0..subdivisions {
-            let ratio = (subdivision + 1) as f64 / (subdivisions + 1) as f64;
-            let fraction = ratio.powf(radius_ratio);
+            // Blender's `r = (j + 1) / float(edge_subd + 1)` and `t = powf(r, radrat)`, in f32.
+            let r = (subdivision + 1) as f32 / (subdivisions + 1) as f32;
+            let t = r.powf(radius_ratio);
             let index = node_positions.len();
-            node_positions.push(source_positions[first].lerp(source_positions[second], fraction));
-            node_origins.push(vec![(first, 1.0 - fraction), (second, fraction)]);
-            node_radii.push([
-                first_radius[0] + (second_radius[0] - first_radius[0]) * fraction,
-                first_radius[1] + (second_radius[1] - first_radius[1]) * fraction,
-            ]);
+            let position = skin_float_interp(first_position, second_position, t);
+            node_positions.push(skin_float_widen(position));
+            node_origins.push(vec![(first, f64::from(1.0 - t)), (second, f64::from(t))]);
+            let radius = skin_float_interp(first_radius32, second_radius32, t);
+            node_radii.push(radius.map(f64::from));
             chain.push(index);
         }
         chain.push(second);
@@ -291,14 +299,14 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         match incident.as_slice() {
             [] => {
                 // Blender's solitary-node box uses frames offset along +Z and -Z.
-                let offset = (radius[0] + radius[1]) * 0.5;
+                let offset = skin_half_radius_sum(radius);
                 let first = frames.len();
                 frames.push(frame_corners(
                     center,
                     radius,
                     DVec3::X,
                     DVec3::Y,
-                    DVec3::Z * offset,
+                    skin_float_scale(DVec3::Z, offset),
                 ));
                 frame_nodes.push(vertex);
                 let second = frames.len();
@@ -307,7 +315,7 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
                     radius,
                     DVec3::X,
                     DVec3::Y,
-                    DVec3::Z * -offset,
+                    skin_float_scale(DVec3::Z, -offset),
                 ));
                 frame_nodes.push(vertex);
                 box_frames[vertex] = Some([first, second]);
@@ -315,12 +323,12 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             [(edge_index, _)] => {
                 let [_, y_axis, z_axis] = edge_mats[*edge_index].1;
                 node_frame[vertex] = frames.len();
-                frames.push(frame_corners(center, radius, y_axis, z_axis, DVec3::ZERO));
+                frames.push(frame_corners(center, radius, y_axis, z_axis, [0.0; 3]));
                 frame_nodes.push(vertex);
             }
             [(first_edge, _), (second_edge, _)] => {
                 if (edge_mats[*first_edge].0 == vertex) == (edge_mats[*second_edge].0 == vertex) {
-                    let offset = (radius[0] + radius[1]) * 0.5;
+                    let offset = skin_half_radius_sum(radius);
                     let mut ids = [0_usize; 2];
                     for (slot, edge_index) in [*first_edge, *second_edge].into_iter().enumerate() {
                         let (origin, [x_axis, y_axis, z_axis]) = edge_mats[edge_index];
@@ -331,7 +339,7 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
                             radius,
                             y_axis,
                             z_axis,
-                            direction * offset,
+                            skin_float_scale(direction, offset),
                         ));
                         frame_nodes.push(vertex);
                     }
@@ -345,7 +353,7 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
                     let [y_axis, z_axis] =
                         bisector_yz(edge_mats[incoming].1, edge_mats[outgoing].1[0]);
                     node_frame[vertex] = frames.len();
-                    frames.push(frame_corners(center, radius, y_axis, z_axis, DVec3::ZERO));
+                    frames.push(frame_corners(center, radius, y_axis, z_axis, [0.0; 3]));
                     frame_nodes.push(vertex);
                 }
             }
@@ -367,7 +375,7 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
                 node_radii[index],
                 y_axis,
                 z_axis,
-                DVec3::ZERO,
+                [0.0; 3],
             ));
             frame_nodes.push(index);
         }
@@ -406,7 +414,14 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
                     "skin branch has no neighboring frame",
                 )
             })?;
-            rings.push(frame_at(neighbor, edge_index));
+            // Blender's collect_hull_frames: a seam neighbour contributes its first frame.
+            rings.push(
+                seam_frames
+                    .get(neighbor)
+                    .copied()
+                    .flatten()
+                    .map_or(node_frame[neighbor], |frames| frames[0]),
+            );
         }
         branch_rings.push(rings);
     }
@@ -616,12 +631,15 @@ fn merge_branch_frame_corners(
                         {
                             continue;
                         }
-                        let distance = frames[first_frame][first_corner]
-                            .distance(frames[second_frame][second_corner]);
+                        let distance = skin_float_distance(
+                            frames[first_frame][first_corner],
+                            frames[second_frame][second_corner],
+                        );
                         if distance < threshold {
-                            let midpoint = (frames[first_frame][first_corner]
-                                + frames[second_frame][second_corner])
-                                * 0.5;
+                            let midpoint = skin_float_midpoint(
+                                frames[first_frame][first_corner],
+                                frames[second_frame][second_corner],
+                            );
                             frames[first_frame][first_corner] = midpoint;
                             frames[second_frame][second_corner] = midpoint;
                             merges[second_frame][second_corner] = Some((first_frame, first_corner));
@@ -640,8 +658,8 @@ fn merge_branch_frame_corners(
     clippy::manual_midpoint,
     reason = "matches Blender's float evaluation order for parity"
 )]
-fn frame_side_length(frame: [DVec3; 4]) -> f64 {
-    (frame[0].distance(frame[1]) + frame[1].distance(frame[2])) * 0.5
+fn frame_side_length(frame: [DVec3; 4]) -> f32 {
+    (skin_float_distance(frame[0], frame[1]) + skin_float_distance(frame[1], frame[2])) * 0.5
 }
 
 fn branch_hull_faces(
@@ -955,7 +973,7 @@ fn collapse_skin_face_corners(
         for (corner, &first) in face.iter().enumerate() {
             let second = face[(corner + 1) % face.len()];
             let length = skin_float_distance_squared(points[first], points[second]);
-            if length < shortest_length {
+            if length <= shortest_length {
                 shortest_length = length;
                 shortest = corner;
             }
@@ -1305,6 +1323,28 @@ fn skin_float_distance_squared(first: DVec3, second: DVec3) -> f32 {
     skin_float_dot(difference, difference)
 }
 
+fn skin_float_distance(first: DVec3, second: DVec3) -> f32 {
+    skin_float_distance_squared(first, second).sqrt()
+}
+
+/// Blender's `mul_v3_v3fl`: `axis * scalar` in `f32`.
+fn skin_float_scale(axis: DVec3, scalar: f32) -> [f32; 3] {
+    skin_float_point(axis).map(|component| component * scalar)
+}
+
+fn skin_float_widen(point: [f32; 3]) -> DVec3 {
+    DVec3::new(
+        f64::from(point[0]),
+        f64::from(point[1]),
+        f64::from(point[2]),
+    )
+}
+
+/// Blender's `half_v2`: the seam and solitary-box offset, `(r0 + r1) * 0.5` in `f32`.
+fn skin_half_radius_sum(radius: [f64; 2]) -> f32 {
+    (radius[0] as f32 + radius[1] as f32) * 0.5
+}
+
 fn skin_float_length(vector: [f32; 3]) -> f32 {
     skin_float_dot(vector, vector).sqrt()
 }
@@ -1316,6 +1356,62 @@ fn skin_float_normalize(vector: [f32; 3]) -> [f32; 3] {
     } else {
         [vector[0] / length, vector[1] / length, vector[2] / length]
     }
+}
+
+/// Blender's `normalize_v3`: `vector * (1 / length)` in `f32`, zero when the squared length is at
+/// most `1e-35`. Edge frames use this; `skin_float_normalize` keeps its own hole-target behavior.
+fn skin_float_normalize_v3(vector: [f32; 3]) -> [f32; 3] {
+    let squared = skin_float_dot(vector, vector);
+    if squared > 1.0e-35 {
+        let scale = 1.0 / squared.sqrt();
+        vector.map(|component| component * scale)
+    } else {
+        [0.0; 3]
+    }
+}
+
+/// Blender's `normalize_v3(to - from)`: the unit direction from one vertex to another, in `f32`.
+fn skin_float_edge_direction(from: DVec3, to: DVec3) -> [f32; 3] {
+    skin_float_normalize_v3(skin_float_sub(skin_float_point(to), skin_float_point(from)))
+}
+
+/// Blender's `angle_normalized_v3v3`: the angle between two unit vectors, from their chord length.
+fn skin_float_angle(first: [f32; 3], second: [f32; 3]) -> f32 {
+    // Blender's `safe_asinf` of half the chord length.
+    let half_asin = |chord: f32| (chord / 2.0).clamp(-1.0, 1.0).asin();
+    if skin_float_dot(first, second) >= 0.0 {
+        2.0 * half_asin(skin_float_length(skin_float_sub(second, first)))
+    } else {
+        let negated = second.map(|component| -component);
+        std::f32::consts::PI - 2.0 * half_asin(skin_float_length(skin_float_sub(negated, first)))
+    }
+}
+
+/// Blender's `rotate_normalized_v3_v3v3fl`: `point` rotated by `angle` about the unit `axis`.
+fn skin_float_rotate(point: [f32; 3], axis: [f32; 3], angle: f32) -> [f32; 3] {
+    let costheta = angle.cos();
+    let sintheta = angle.sin();
+    let [ax, ay, az] = axis;
+    let [px, py, pz] = point;
+    let one_minus = 1.0 - costheta;
+    [
+        ((costheta + one_minus * ax * ax) * px)
+            + ((one_minus * ax * ay - az * sintheta) * py)
+            + ((one_minus * ax * az + ay * sintheta) * pz),
+        ((one_minus * ax * ay + az * sintheta) * px)
+            + ((costheta + one_minus * ay * ay) * py)
+            + ((one_minus * ay * az - ax * sintheta) * pz),
+        ((one_minus * ax * az - ay * sintheta) * px)
+            + ((one_minus * ay * az + ax * sintheta) * py)
+            + ((costheta + one_minus * az * az) * pz),
+    ]
+}
+
+/// Blender's `interp_v3_v3v3`: `(1 - t) * a + t * b` per component in `f32`. Positions use three
+/// components; radii use the two of `MVertSkin`.
+fn skin_float_interp<const N: usize>(first: [f32; N], second: [f32; N], t: f32) -> [f32; N] {
+    let s = 1.0 - t;
+    std::array::from_fn(|index| s * first[index] + t * second[index])
 }
 
 /// Triangle area in `f32`, as `BM_face_calc_area` (half the magnitude of the cross product).
@@ -1612,11 +1708,14 @@ fn edge_matrices(
         }
         let [first, second] = edge_endpoints[edge_index];
         let child = if first == parent { second } else { first };
-        let direction = (vertex_positions[child] - vertex_positions[parent]).normalize();
         let mat = if node_roots[parent] || degrees[parent] > 2 {
-            calc_edge_mat(direction)
+            calc_edge_mat(vertex_positions[parent], vertex_positions[child])
         } else {
-            propagate_frame(parent_mat, direction)
+            propagate_frame(
+                parent_mat,
+                vertex_positions[parent],
+                vertex_positions[child],
+            )
         };
         mats[edge_index] = Some((parent, mat));
         for &(next_edge, _) in &adjacency[child] {
@@ -1633,53 +1732,68 @@ fn edge_matrices(
 }
 
 /// Blender's `calc_edge_mat`: a root's frame, with world Z as the up reference; an edge along Z uses
-/// the fixed X/Y frame.
-fn calc_edge_mat(x_axis: DVec3) -> [DVec3; 3] {
-    let dot = x_axis.dot(DVec3::Z);
-    if (-1.0 + f64::EPSILON..1.0 - f64::EPSILON).contains(&dot) {
-        let y_axis = DVec3::Z.cross(x_axis).normalize_or_zero();
-        [x_axis, y_axis, x_axis.cross(y_axis).normalize_or_zero()]
+/// the fixed X/Y frame. Evaluated in `f32` in Blender's operation order, widened at the output.
+fn calc_edge_mat(from: DVec3, to: DVec3) -> [DVec3; 3] {
+    const Z_UP: [f32; 3] = [0.0, 0.0, 1.0];
+    let x_axis = skin_float_edge_direction(from, to);
+    let dot = skin_float_dot(x_axis, Z_UP);
+    // Blender's FLT_EPSILON pole tolerance, exclusive at both ends.
+    let mat = if dot > -1.0 + f32::EPSILON && dot < 1.0 - f32::EPSILON {
+        let y_axis = skin_float_normalize_v3(skin_float_cross(Z_UP, x_axis));
+        let z_axis = skin_float_normalize_v3(skin_float_cross(x_axis, y_axis));
+        [x_axis, y_axis, z_axis]
     } else {
-        [x_axis, DVec3::X, DVec3::Y]
-    }
+        [x_axis, [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+    };
+    mat.map(skin_float_widen)
 }
 
-/// Blender's `build_emats_stack`: an edge's frame is its parent edge's frame rotated onto its direction.
-fn propagate_frame(parent: [DVec3; 3], x_axis: DVec3) -> [DVec3; 3] {
-    let dot = parent[0].dot(x_axis).clamp(-1.0, 1.0);
-    let rotation = DQuat::from_axis_angle(parent[0].cross(x_axis).normalize_or_zero(), dot.acos());
+/// Blender's `build_emats_stack`: an edge's frame is its parent edge's frame rotated onto its
+/// direction, evaluated in `f32`. Like Blender, the rotated axes are not renormalized.
+fn propagate_frame(parent: [DVec3; 3], from: DVec3, to: DVec3) -> [DVec3; 3] {
+    let [parent_x, parent_y, parent_z] = parent.map(skin_float_point);
+    let x_axis = skin_float_edge_direction(from, to);
+    let angle = skin_float_angle(parent_x, x_axis);
+    let axis = skin_float_normalize_v3(skin_float_cross(parent_x, x_axis));
     [
-        x_axis,
-        (rotation * parent[1]).normalize_or_zero(),
-        (rotation * parent[2]).normalize_or_zero(),
+        skin_float_widen(x_axis),
+        skin_float_widen(skin_float_rotate(parent_y, axis, angle)),
+        skin_float_widen(skin_float_rotate(parent_z, axis, angle)),
     ]
 }
 
 /// Blender's `connection_node_mat`: the y and z axes halfway between a chain node's incoming frame
-/// and the outgoing edge direction.
+/// and the outgoing edge direction, evaluated in `f32`.
 fn bisector_yz(incoming: [DVec3; 3], outgoing_x: DVec3) -> [DVec3; 2] {
-    let angle = incoming[0].dot(outgoing_x).clamp(-1.0, 1.0).acos() / 2.0;
-    let rotation = DQuat::from_axis_angle(incoming[0].cross(outgoing_x).normalize_or_zero(), angle);
-    [rotation * incoming[1], rotation * incoming[2]]
+    let [incoming_x, incoming_y, incoming_z] = incoming.map(skin_float_point);
+    let outgoing_x = skin_float_point(outgoing_x);
+    let angle = skin_float_angle(incoming_x, outgoing_x) / 2.0;
+    let axis = skin_float_normalize_v3(skin_float_cross(incoming_x, outgoing_x));
+    [
+        skin_float_widen(skin_float_rotate(incoming_y, axis, angle)),
+        skin_float_widen(skin_float_rotate(incoming_z, axis, angle)),
+    ]
 }
 
 /// Blender's `create_frame`: the four corners of a cross-section, offset along the edge direction.
+/// Evaluated in `f32` in Blender's operation order; `offset` is the already-scaled edge offset.
 fn frame_corners(
     center: DVec3,
     radius: [f64; 2],
     y_axis: DVec3,
     z_axis: DVec3,
-    offset: DVec3,
+    offset: [f32; 3],
 ) -> [DVec3; 4] {
-    let y = y_axis * radius[0];
-    let z = z_axis * radius[1];
+    let co = skin_float_point(center);
+    let ry = skin_float_scale(y_axis, radius[0] as f32);
+    let rz = skin_float_scale(z_axis, radius[1] as f32);
     [
-        center + y - z,
-        center - y - z,
-        center - y + z,
-        center + y + z,
+        skin_float_sub(skin_float_add(co, ry), rz),
+        skin_float_sub(skin_float_sub(co, ry), rz),
+        skin_float_add(skin_float_sub(co, ry), rz),
+        skin_float_add(skin_float_add(co, ry), rz),
     ]
-    .map(|corner| corner + offset)
+    .map(|corner| skin_float_widen(skin_float_add(corner, offset)))
 }
 
 /// Blender's `skin_choose_quad_bridge_order`: the rotation or reversal of `second` whose corners lie

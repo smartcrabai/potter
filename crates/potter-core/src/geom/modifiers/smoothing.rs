@@ -3,6 +3,7 @@
 // Portions derived from Blender (https://www.blender.org):
 //   source/blender/modifiers/intern/MOD_laplaciansmooth.cc, source/blender/modifiers/intern/MOD_correctivesmooth.cc, SPDX-FileCopyrightText: 2005 Blender Authors, GPL-2.0-or-later.
 
+use super::displacement::{VertexGroup, vertex_group};
 use super::{
     DVec3, ErrorCode, HashMap, Mesh, Modifier, PotError, Result, Value, bool_param, id_indices,
     invalid_parameter, json, number_param, positions, safe_acos_approx, string_param_with_expected,
@@ -79,39 +80,17 @@ impl Topology {
 }
 
 /// Blender's per-vertex group factor: 1 without a usable group, otherwise the weight, inverted when
-/// requested. A group name that is not on the mesh is ignored, as `MOD_get_vgroup` does.
+/// requested. A group name that is not on the mesh is ignored, as `MOD_get_vgroup` does. A group without
+/// stored weights is Blender's null `dvert`, which leaves every vertex at full factor.
 fn vertex_group_factors(mesh: &Mesh, modifier: &Modifier) -> Result<Vec<f64>> {
-    let group_name = string_param_with_expected(modifier, "vertex_group", "a vertex-group name")?;
-    let weights = if group_name.is_empty() {
-        None
-    } else {
-        mesh.attributes
-            .get("vertex_groups")
-            .and_then(Value::as_object)
-            .and_then(|groups| groups.get(group_name))
-            .and_then(Value::as_object)
-    };
-    let Some(weights) = weights else {
+    let group = vertex_group(mesh, modifier)?;
+    if !matches!(group, VertexGroup::Weighted(_)) {
         return Ok(vec![1.0; mesh.vertices.len()]);
-    };
+    }
     let invert = bool_param(modifier, "invert_vertex_group")?;
-    mesh.vertices
-        .iter()
-        .map(|vertex| {
-            let weight = weights
-                .get(&format!("v{}", vertex.id))
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0);
-            if !(weight.is_finite() && (0.0..=1.0).contains(&weight)) {
-                return Err(invalid_parameter(
-                    modifier,
-                    "vertex_group",
-                    "finite weights in [0, 1]",
-                ));
-            }
-            Ok(if invert { 1.0 - weight } else { weight })
-        })
-        .collect()
+    Ok((0..mesh.vertices.len())
+        .map(|index| group.weight(index, invert))
+        .collect())
 }
 
 fn iteration_count(modifier: &Modifier) -> Result<usize> {

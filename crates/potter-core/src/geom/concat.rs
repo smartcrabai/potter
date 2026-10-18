@@ -180,7 +180,6 @@ fn place(part: &Part<'_>, first_ids: IdCounters) -> Result<Placed> {
     let origin = Origin::copies(
         (0..source.vertices.len()).map(Some),
         (0..source.faces.len()).map(Some).collect(),
-        false,
     );
     // UV stores are excluded from attribute remapping and rebuilt as one named union below.
     remap_attributes_skipping(

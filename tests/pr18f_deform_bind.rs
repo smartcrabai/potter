@@ -15,8 +15,9 @@ use std::{
 
 use glam::DVec3;
 use potter_core::{
-    eval::{EvaluationContext, Snapshot},
+    eval::{EvaluationContext, EvaluationPurpose, Snapshot},
     model::{Id, SceneDoc},
+    ops::apply_batch,
 };
 use serde_json::{Value, json};
 use tempfile::tempdir;
@@ -26,6 +27,10 @@ type TestResult = Result<(), Box<dyn Error>>;
 const SURFACE_TOLERANCE: f64 = 2.0e-5;
 const LAPLACIAN_TOLERANCE: f64 = 1.0e-4;
 const MESH_TOLERANCE: f64 = 1.0e-5;
+/// Blender 5.2.2 output of `tests/fixtures/pr18f_deform_bind/generate_mesh_deform_exact_oracle.py`, all 25
+/// vertices per case.
+const MESH_DEFORM_ORACLE: &str =
+    include_str!("fixtures/pr18f_deform_bind/mesh_deform_blender_oracle.json");
 
 const SUBJECT_LOCATION: [f64; 3] = [0.2, -0.1, 0.5];
 const SUBJECT_ROTATION: [f64; 4] = [
@@ -451,6 +456,30 @@ fn evaluated_laplacian_subject(scene: &Path) -> Result<Vec<DVec3>, Box<dyn Error
         .get(&subject_id)
         .ok_or("evaluated subject mesh is missing")?;
     Ok(mesh.vertices.iter().map(|vertex| vertex.co).collect())
+}
+
+/// Blender 5.2.2 evaluated positions of one `generate_mesh_deform_exact_oracle.py` case: all 25 subject vertices
+/// in mesh order, from `mesh_deform_blender_oracle.json`.
+fn mesh_deform_oracle(case: &str) -> Result<Vec<[f64; 3]>, Box<dyn Error>> {
+    let oracle: Value = serde_json::from_str(MESH_DEFORM_ORACLE)?;
+    let rows = oracle[case]["positions"]
+        .as_array()
+        .ok_or_else(|| format!("mesh deform oracle case `{case}` has no positions"))?;
+    let mut positions = Vec::with_capacity(rows.len());
+    for row in rows {
+        let values = row
+            .as_array()
+            .filter(|values| values.len() == 3)
+            .ok_or("mesh deform oracle row is not a coordinate triple")?;
+        let mut point = [0.0; 3];
+        for (slot, value) in point.iter_mut().zip(values) {
+            *slot = value
+                .as_f64()
+                .ok_or("mesh deform oracle coordinate is not a number")?;
+        }
+        positions.push(point);
+    }
+    Ok(positions)
 }
 
 fn assert_close(
@@ -948,91 +977,63 @@ fn mesh_deform_nonuniform_bind_transform_matches_blender_translation() -> TestRe
     });
     let (output, scene) = build_scene(directory.path(), "mesh_transformed", &operations)?;
     applied(&output)?;
+    // Analytic: a uniform cage translation moves every source vertex by inv(S_lin) * C_lin * T, so the expected
+    // positions are rest plus that constant. Blender 5.2.2 measured the same constant at vertex 12 (oracle case
+    // mesh_nonuniform_translation); the second assertion compares all 25 vertices to that measured case.
     let expected = (0..25)
         .map(|index| {
             let rest = flat_subject(index);
             [
-                // Blender 5.2.2 output of mesh_nonuniform_translation (generate_mesh_deform_exact_oracle.py),
-                // vertex 12 at rest (0, 0, 0). It agrees with inv(S_lin) * C_lin * T to about 1e-7.
                 rest[0] + 0.295_054_555,
                 rest[1] - 0.272_824_258,
                 rest[2] + 0.733_333_349,
             ]
         })
         .collect::<Vec<_>>();
+    let positions = evaluated_subject(&scene)?;
     assert_close(
-        &evaluated_subject(&scene)?,
+        &positions,
         &expected,
         MESH_TOLERANCE,
-        "mesh deform nonuniform bind transform",
+        "mesh deform nonuniform bind transform (analytic)",
+    )?;
+    assert_close(
+        &positions,
+        &mesh_deform_oracle("mesh_nonuniform_translation")?,
+        MESH_TOLERANCE,
+        "mesh deform nonuniform bind transform (Blender)",
     )
 }
 #[test]
 fn mesh_deform_precision_dynamic_weights_and_nonuniform_transforms_match_blender() -> TestResult {
     let cases = [
-        (
-            "mesh_asymmetric_static_p2",
-            2,
-            false,
-            false,
-            [
-                // Blender 5.2.2 output of tests/fixtures/pr18f_deform_bind/generate_mesh_deform_exact_oracle.py
-                // on the Rust `box_mesh` cage (polygon starts included).
-                [-0.999_769_688, -0.999_865_770, 0.003_038_097],
-                [-0.499_045_044, -0.499_446_064, 0.005_308_257],
-                [0.003_932_299, 0.002_456_886, 0.000_047_757],
-                [0.509_214_342, 0.505_858_660, -0.012_196_096],
-                [1.015_522_599, 1.009_907_603, -0.026_900_172],
-            ],
-        ),
-        (
-            "mesh_asymmetric_static_p3",
-            3,
-            false,
-            false,
-            [
-                [-1.0, -1.0, 0.0],
-                [-0.499_141_335, -0.499_453_783, 0.005_734_985],
-                [0.003_923_543, 0.002_484_298, 0.000_121_743],
-                [0.509_186_029, 0.505_920_291, -0.012_218_339],
-                [1.016_380_310, 1.010_796_309, -0.030_081_091],
-            ],
-        ),
-        (
-            "mesh_asymmetric_dynamic_p3_invert",
-            3,
-            true,
-            true,
-            [
-                [-1.0, -1.0, 0.0],
-                [-0.498_405_337, -0.498_985_618, 0.010_650_689],
-                [0.003_210_172, 0.002_032_608, 0.000_099_609],
-                [0.503_062_010, 0.501_973_450, -0.004_072_779],
-                [1.000_862_122, 1.000_568_271, -0.001_583_216],
-            ],
-        ),
+        ("mesh_asymmetric_static_p2", 2, false, false),
+        ("mesh_asymmetric_static_p3", 3, false, false),
+        ("mesh_asymmetric_dynamic_p3_invert", 3, true, true),
     ];
     let directory = tempdir()?;
-    let sample_indices = [0, 6, 12, 18, 24];
-    for (name, precision, dynamic, invert, expected) in cases {
+    let mut precision_two = None;
+    for (name, precision, dynamic, invert) in cases {
         let operations = asymmetric_mesh_operations(precision, dynamic, invert);
         let (output, scene) = build_scene(directory.path(), name, &operations)?;
         applied(&output)?;
         let positions = evaluated_subject(&scene)?;
-        let samples = sample_indices
-            .iter()
-            .map(|index| {
-                positions
-                    .get(*index)
-                    .copied()
-                    .ok_or_else(|| -> Box<dyn Error> {
-                        Box::new(std::io::Error::other(format!(
-                            "mesh deform sample vertex {index} is missing"
-                        )))
-                    })
-            })
-            .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
-        assert_close(&samples, &expected, 1.0e-3, name)?;
+        assert_close(&positions, &mesh_deform_oracle(name)?, MESH_TOLERANCE, name)?;
+        if name == "mesh_asymmetric_static_p2" {
+            precision_two = Some(positions);
+        }
+    }
+    // The precision-3 row must reject precision-2 output at the same tolerance.
+    let precision_two = precision_two.ok_or("precision-2 case was not evaluated")?;
+    if assert_close(
+        &precision_two,
+        &mesh_deform_oracle("mesh_asymmetric_static_p3")?,
+        MESH_TOLERANCE,
+        "precision 2 against the precision 3 row",
+    )
+    .is_ok()
+    {
+        return Err("precision-2 output passed the precision-3 oracle row".into());
     }
     Ok(())
 }
@@ -1166,6 +1167,182 @@ fn mesh_deform_ignores_cage_and_owner_object_motion_after_bind() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn mesh_deform_bound_settings_reject_edits_until_unbind() -> TestResult {
+    let directory = tempdir()?;
+    let locked = [
+        (
+            "precision",
+            json!({"object": "cage", "precision": 4, "use_dynamic_bind": false}),
+        ),
+        (
+            "use_dynamic_bind",
+            json!({"object": "cage", "precision": 3, "use_dynamic_bind": true}),
+        ),
+        (
+            "object",
+            json!({"object": null, "precision": 3, "use_dynamic_bind": false}),
+        ),
+    ];
+    for (label, params) in locked {
+        let mut operations = mesh_operations(None, 3, false, false, Vec::new());
+        operations
+            .as_array_mut()
+            .ok_or("operations must be an array")?
+            .push(json!({"op": "modifier.update", "target": {"id": "subject"},
+                "modifier_id": "deform", "set": {"params": params}}));
+        let (output, _scene) =
+            build_scene(directory.path(), &format!("bound_{label}"), &operations)?;
+        if output.status.success() {
+            return Err(format!("editing `{label}` while bound must fail").into());
+        }
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if !text.contains("unbind") {
+            return Err(
+                format!("`{label}` rejection does not tell the user to unbind: {text}").into(),
+            );
+        }
+    }
+    // A setting outside the bind (invert_vertex_group) keeps its edit path while the modifier is bound.
+    let mut operations = mesh_operations(None, 3, false, false, Vec::new());
+    operations
+        .as_array_mut()
+        .ok_or("operations must be an array")?
+        .push(json!({"op": "modifier.update", "target": {"id": "subject"},
+            "modifier_id": "deform", "set": {"params": {"object": "cage", "precision": 3,
+                "use_dynamic_bind": false, "invert_vertex_group": true}}}));
+    let (output, _scene) = build_scene(directory.path(), "bound_unlocked", &operations)?;
+    applied(&output)
+}
+
+/// A Mesh Deform bind in the pre-Blender `{weights, cage_mesh}` layout, as an older project stores it.
+fn legacy_mesh_deform_bind() -> Value {
+    json!({"weights": vec![vec![0.125_f64; 8]; 25], "cage_mesh": {}})
+}
+
+/// Applies `operations` at the scene's current revision, for a scene that an earlier step changed.
+fn apply_at_head(scene: &Path, operations: &Value) -> Result<Output, Box<dyn Error>> {
+    let head: Value = serde_json::from_slice(&fs::read(scene.join("scene.json"))?)?;
+    let base_revision = head["revision"]
+        .as_u64()
+        .ok_or("scene revision is missing")?;
+    let batch = scene.with_extension("operations.json");
+    fs::write(
+        &batch,
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "base_revision": base_revision,
+            "operations": operations,
+        }))?,
+    )?;
+    Ok(Command::new(env!("CARGO_BIN_EXE_pot"))
+        .arg("apply")
+        .arg(scene)
+        .arg("--file")
+        .arg(batch)
+        .arg("--json")
+        .output()?)
+}
+
+#[test]
+fn legacy_mesh_deform_bind_is_cleared_on_load_and_rebinds() -> TestResult {
+    let directory = tempdir()?;
+    // The cage moves after the bind, so a live bind would visibly deform the subject.
+    let operations = mesh_operations(None, 3, false, false, cage_translation_operations());
+    let (output, scene) = build_scene(directory.path(), "legacy_mesh_deform", &operations)?;
+    applied(&output)?;
+
+    // Store the head as an older project saved it: the bind in the `{weights, cage_mesh}` layout.
+    let scene_file = scene.join("scene.json");
+    let mut head: Value = serde_json::from_slice(&fs::read(&scene_file)?)?;
+    head["nodes"]["subject"]["modifiers"][0]["binding_data"] = legacy_mesh_deform_bind();
+    fs::write(&scene_file, serde_json::to_vec(&head)?)?;
+
+    // Loading clears the bind, names the modifier, and says that a rebind is required.
+    let parsed = potter_core::model::migrate::parse_scene(&fs::read(&scene_file)?)?;
+    let warning = parsed
+        .warnings
+        .iter()
+        .find(|warning| warning["code"] == "modifier.mesh_deform.legacy_bind_cleared")
+        .ok_or("the load did not report the cleared Mesh Deform bind")?;
+    let message = warning["message"].as_str().unwrap_or_default();
+    if warning["modifier"] != "deform" || !message.contains("rebind required") {
+        return Err(format!("unexpected cleared-bind warning: {warning}").into());
+    }
+    let subject = parsed
+        .doc
+        .nodes
+        .get(&Id::new("subject")?)
+        .ok_or("subject node is missing")?;
+    if subject.modifiers[0].binding_data.is_some() {
+        return Err("the legacy Mesh Deform bind was not cleared".into());
+    }
+    // The original bytes are flagged, so the store keeps the legacy head before its first write.
+    if !parsed.legacy {
+        return Err(
+            "the cleared legacy bind must flag the original scene bytes for preservation".into(),
+        );
+    }
+
+    // The unbound modifier passes the mesh through unchanged and reports Bind data required.
+    let rest = (0..25).map(flat_subject).collect::<Vec<_>>();
+    let snapshot = Snapshot::evaluate(&parsed.doc, &EvaluationContext::default())?;
+    let evaluated = snapshot
+        .meshes
+        .get(&Id::new("subject")?)
+        .ok_or("evaluated subject mesh is missing")?
+        .vertices
+        .iter()
+        .map(|vertex| vertex.co)
+        .collect::<Vec<_>>();
+    assert_close(
+        &evaluated,
+        &rest,
+        MESH_TOLERANCE,
+        "legacy Mesh Deform after load",
+    )?;
+    if !snapshot
+        .warnings
+        .iter()
+        .any(|warning| warning.message.contains("Bind data required"))
+    {
+        return Err("the unbound Mesh Deform did not report Bind data required".into());
+    }
+
+    // Rebinding at the cage's current pose is accepted, and later cage motion deforms the subject again.
+    applied(&apply_at_head(&scene, &Value::Array(vec![bind("deform")]))?)?;
+    assert_close(
+        &evaluated_subject(&scene)?,
+        &rest,
+        MESH_TOLERANCE,
+        "rebound Mesh Deform at the moved cage",
+    )?;
+    applied(&apply_at_head(
+        &scene,
+        &Value::Array(cage_translation_operations()),
+    )?)?;
+    let expected = (0..25)
+        .map(|index| {
+            let rest = flat_subject(index);
+            [
+                rest[0] + CAGE_TRANSLATION[0],
+                rest[1] + CAGE_TRANSLATION[1],
+                rest[2] + CAGE_TRANSLATION[2],
+            ]
+        })
+        .collect::<Vec<_>>();
+    assert_close(
+        &evaluated_subject(&scene)?,
+        &expected,
+        MESH_TOLERANCE,
+        "rebound Mesh Deform follows cage motion",
+    )
+}
+
 fn laplacian_operations(
     group_indices: &[usize],
     iterations: u64,
@@ -1260,6 +1437,9 @@ fn laplacian_deform_inverted_group_anchors_interior_vertices() -> TestResult {
     )
 }
 
+/// Analytic: the bind stores the rest coordinates of the source grid. No Blender corrective bind oracle covers
+/// this 5x5 grid; the Blender corrective cases in tests/fixtures/pr18f_smoothing/blender_oracle.json use a 4x6
+/// tube.
 #[test]
 fn corrective_smooth_bind_stores_rest_coordinates() -> TestResult {
     let directory = tempdir()?;
@@ -1319,5 +1499,172 @@ fn corrective_smooth_unbind_clears_bind_data() -> TestResult {
     if node.modifiers[0].binding_data.is_some() {
         return Err("unbind must clear corrective smooth bind data".into());
     }
+    Ok(())
+}
+
+/// Post-bind base-vertex moves of the corrective oracle cases (`CORRECTIVE_MOVES` in the generator).
+const CORRECTIVE_MOVES: [(usize, [f64; 3]); 4] = [
+    (0, [0.0, 0.0, 0.12]),
+    (6, [-0.04, 0.08, -0.06]),
+    (12, [0.0, 0.0, 0.25]),
+    (18, [0.1, -0.03, 0.0]),
+];
+
+/// A Subdivision level-1 modifier. A bind after it is evaluated through it.
+fn subdivision_operation() -> Value {
+    json!({"op": "modifier.create", "target": {"id": "subject"}, "id": "subdiv",
+        "type": "subdivision", "params": {"levels": 1}})
+}
+
+/// A flat grid without object transform, a Corrective Smooth bind (BIND rest source, factor 0.5, 5 iterations,
+/// scale 1, SIMPLE), bound after an optional subdivision, then four base vertices move.
+fn corrective_grid_operations(subdivide: bool) -> Value {
+    let mut operations = vec![json!({"op": "node.create", "id": "subject", "kind": "grid",
+        "params": {"size": 2.0, "x_subdivisions": 4, "y_subdivisions": 4}})];
+    if subdivide {
+        operations.push(subdivision_operation());
+    }
+    operations.push(
+        json!({"op": "modifier.create", "target": {"id": "subject"}, "id": "smooth",
+        "type": "corrective_smooth", "params": {"rest_source": "BIND", "factor": 0.5,
+            "iterations": 5, "scale": 1.0, "smooth_type": "SIMPLE"}}),
+    );
+    operations.push(bind("smooth"));
+    operations.extend(
+        CORRECTIVE_MOVES
+            .iter()
+            .map(|&(index, delta)| vertex_move("subject", index, delta)),
+    );
+    Value::Array(operations)
+}
+
+#[test]
+fn corrective_smooth_bind_on_grid_matches_blender() -> TestResult {
+    let directory = tempdir()?;
+    for (name, subdivide) in [("cor_grid_bind", false), ("cor_grid_subdiv_bind", true)] {
+        let operations = corrective_grid_operations(subdivide);
+        let (output, scene) = build_scene(directory.path(), name, &operations)?;
+        applied(&output)?;
+        assert_close(
+            &evaluated_subject(&scene)?,
+            &mesh_deform_oracle(name)?,
+            SURFACE_TOLERANCE,
+            name,
+        )?;
+    }
+    Ok(())
+}
+
+/// `asymmetric_mesh_operations` with a Subdivision level-1 modifier before the Mesh Deform bind.
+fn subdivided_asymmetric_mesh_operations(
+    precision: u64,
+    dynamic: bool,
+    invert: bool,
+) -> Result<Value, Box<dyn Error>> {
+    let mut operations = asymmetric_mesh_operations(precision, dynamic, invert);
+    let list = operations
+        .as_array_mut()
+        .ok_or("asymmetric operations must be an array")?;
+    let deform = list
+        .iter()
+        .position(|operation| operation["op"] == "modifier.create" && operation["id"] == "deform")
+        .ok_or("the Mesh Deform modifier.create operation is missing")?;
+    list.insert(deform, subdivision_operation());
+    Ok(operations)
+}
+
+#[test]
+fn mesh_deform_bind_after_subdivision_matches_blender() -> TestResult {
+    let directory = tempdir()?;
+    let operations = subdivided_asymmetric_mesh_operations(3, false, false)?;
+    let (output, scene) = build_scene(directory.path(), "mesh_subdiv", &operations)?;
+    applied(&output)?;
+    assert_close(
+        &evaluated_subject(&scene)?,
+        &mesh_deform_oracle("mesh_asymmetric_subdiv_p3")?,
+        MESH_TOLERANCE,
+        "mesh deform bound after subdivision",
+    )
+}
+
+/// Operations for subject `b_subject`, whose Noise displacement is its second modifier. The first
+/// modifier is disabled, so it changes no geometry but still occupies stack index 0. With `with_a`,
+/// an unrelated object `a_subject` carries its own Noise displacement first in creation order.
+fn noise_b_operations(with_a: bool) -> Vec<Value> {
+    let mut operations =
+        vec![json!({"op":"texture.create","id":"noise_tex","texture_type":"NOISE"})];
+    if with_a {
+        operations.push(
+            json!({"op":"node.create","id":"a_subject","kind":"plane","params":{"size":2.0}}),
+        );
+        operations.push(json!({"op":"modifier.create","target":{"id":"a_subject"},"id":"a_noise","type":"displace","params":{"direction":"X","strength":0.8,"mid_level":0.5,"texture":"noise_tex","texture_coords":"LOCAL"}}));
+    }
+    operations
+        .push(json!({"op":"node.create","id":"b_subject","kind":"plane","params":{"size":2.0}}));
+    operations.push(json!({"op":"modifier.create","target":{"id":"b_subject"},"id":"b_off","type":"subdivision","enabled":false}));
+    operations.push(json!({"op":"modifier.create","target":{"id":"b_subject"},"id":"b_noise","type":"displace","params":{"direction":"X","strength":0.7,"mid_level":0.5,"texture":"noise_tex","texture_coords":"LOCAL"}}));
+    operations
+}
+
+fn noise_b_doc(operations: &[Value]) -> Result<SceneDoc, Box<dyn Error>> {
+    Ok(apply_batch(
+        &SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned()),
+        &json!({"schema_version": 1, "base_revision": 0, "operations": operations}),
+    )
+    .map_err(|error| error.message)?
+    .doc)
+}
+
+/// `b_subject`'s evaluated positions at Preview.
+fn b_subject_positions(doc: &SceneDoc) -> Result<Vec<DVec3>, Box<dyn Error>> {
+    let snapshot = Snapshot::evaluate(
+        doc,
+        &EvaluationContext {
+            purpose: EvaluationPurpose::Preview,
+            ..EvaluationContext::default()
+        },
+    )?;
+    let mesh = snapshot
+        .meshes
+        .get(&Id::new("b_subject")?)
+        .ok_or("b_subject mesh is missing")?;
+    Ok(mesh.vertices.iter().map(|vertex| vertex.co).collect())
+}
+
+/// `b_subject`'s positions after applying its Noise modifier, the only change to the stack.
+fn applied_b_positions(operations: &[Value]) -> Result<Vec<DVec3>, Box<dyn Error>> {
+    let mut with_apply = operations.to_vec();
+    with_apply
+        .push(json!({"op":"modifier.apply","target":{"id":"b_subject"},"modifier_id":"b_noise"}));
+    b_subject_positions(&noise_b_doc(&with_apply)?)
+}
+
+#[test]
+fn noise_on_a_later_modifier_matches_across_objects_preview_and_apply() -> TestResult {
+    let alone_operations = noise_b_operations(false);
+    let alone = b_subject_positions(&noise_b_doc(&alone_operations)?)?;
+    assert!(
+        alone
+            .iter()
+            .any(|point| (point.x.abs() - 1.0).abs() > 1.0e-6),
+        "Noise must move b_subject for the comparison to be meaningful",
+    );
+
+    let with_a_operations = noise_b_operations(true);
+    assert_eq!(
+        b_subject_positions(&noise_b_doc(&with_a_operations)?)?,
+        alone,
+        "a_subject's Noise changed b_subject's preview",
+    );
+    assert_eq!(
+        applied_b_positions(&alone_operations)?,
+        alone,
+        "applying b_noise differs from its preview",
+    );
+    assert_eq!(
+        applied_b_positions(&with_a_operations)?,
+        alone,
+        "applying b_noise with a_subject present differs from its preview",
+    );
     Ok(())
 }

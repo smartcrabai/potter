@@ -6,16 +6,21 @@
 // Eigen is MPL-2.0; see vendor/eigen/COPYING.MPL2.
 #include <Eigen/LU>
 
+#include <cmath>
 #include <cstring>
 
-extern "C" void potter_blender_inverse_m4(const float matrix[16], float inverse[16])
+extern "C" bool potter_blender_inverse_m4(const float matrix[16], float inverse[16])
 {
   Eigen::Map<const Eigen::Matrix4f> input(matrix);
   Eigen::Matrix4f result;
+  float determinant = 0.0f;
   bool invertible = true;
-  input.computeInverseWithCheck(result, invertible, 0.0f);
-  if (!invertible) {
-    result.setZero();
+  // The kernel and invertibility test of `computeInverseWithCheck`, which also reports the
+  // determinant it tested. A non-normal determinant counts as singular.
+  input.computeInverseAndDetWithCheck(result, determinant, invertible, 0.0f);
+  invertible = invertible && std::isnormal(determinant);
+  if (invertible) {
+    std::memcpy(inverse, result.data(), sizeof(float) * 16);
   }
-  std::memcpy(inverse, result.data(), sizeof(float) * 16);
+  return invertible;
 }

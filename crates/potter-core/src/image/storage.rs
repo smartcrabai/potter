@@ -551,8 +551,7 @@ fn decode_exr_with_image_user(
     let image = read_exr_data(bytes)?;
     let multilayer = exr_is_multilayer(&image);
     if !multilayer {
-        let (width, height, mut pixels) = decode_exr_default(&image)?;
-        flip_exr_rows(&mut pixels, width, height)?;
+        let (width, height, pixels) = decode_exr_default(&image)?;
         return Ok((width, height, pixels, true, 4));
     }
 
@@ -578,10 +577,23 @@ fn decode_exr_with_image_user(
             "EXR height exceeds platform limits",
         )
     })?;
-    let pixel_count = checked_pixel_count(width, height)?;
     let Some(pass) = select_exr_render_pass(&layers, selection) else {
+        let pixel_count = checked_pixel_count(width, height)?;
         return Ok((width, height, vec![[0.0; 4]; pixel_count], false, 0));
     };
+    let width = u32::try_from(pass.width).map_err(|_| {
+        PotError::new(
+            ErrorCode::LimitExceeded,
+            "EXR width exceeds platform limits",
+        )
+    })?;
+    let height = u32::try_from(pass.height).map_err(|_| {
+        PotError::new(
+            ErrorCode::LimitExceeded,
+            "EXR height exceeds platform limits",
+        )
+    })?;
+    let pixel_count = checked_pixel_count(width, height)?;
 
     let (channel_slots, channel_ids) = exr_pass_channel_layout(pass);
     let channel_count = pass.channels.len();
@@ -611,61 +623,11 @@ fn decode_exr_with_image_user(
         }
         pixels.push(pixel);
     }
-    if !exr_has_legacy_flipped_rows(&image) {
-        flip_exr_rows(&mut pixels, width, height)?;
-    }
     validate_pixels(width, height, &pixels)?;
     Ok((width, height, pixels, color_pass, channel_count))
 }
 
-fn exr_has_legacy_flipped_rows(image: &ExrImageData) -> bool {
-    let is_legacy =
-        |attributes: &HashMap<exr::meta::attribute::Text, exr::meta::attribute::AttributeValue>| {
-            attributes.iter().any(|(name, value)| {
-                name == "BlenderMultiChannel"
-                    && matches!(
-                        value,
-                        exr::meta::attribute::AttributeValue::Text(version)
-                            if version.to_string().starts_with("Blender V2.43")
-                    )
-            })
-        };
-    is_legacy(&image.attributes.other)
-        || image
-            .layer_data
-            .iter()
-            .any(|layer| is_legacy(&layer.attributes.other))
-}
-
-fn flip_exr_rows(pixels: &mut [[f64; 4]], width: u32, height: u32) -> Result<()> {
-    let width = usize::try_from(width).map_err(|_| {
-        PotError::new(
-            ErrorCode::LimitExceeded,
-            "EXR width exceeds platform limits",
-        )
-    })?;
-    let height = usize::try_from(height).map_err(|_| {
-        PotError::new(
-            ErrorCode::LimitExceeded,
-            "EXR height exceeds platform limits",
-        )
-    })?;
-    if width.checked_mul(height) != Some(pixels.len()) {
-        return Err(PotError::new(
-            ErrorCode::SceneInvalid,
-            "EXR pixel dimensions do not match its samples",
-        ));
-    }
-    for row in 0..height / 2 {
-        let first = row * width;
-        let last = (height - 1 - row) * width;
-        for column in 0..width {
-            pixels.swap(first + column, last + column);
-        }
-    }
-    Ok(())
-}
-
+/// Decodes the first RGB layer, unpremultiplying RGB when alpha is nonzero.
 fn decode_exr_default(image: &ExrImageData) -> Result<(u32, u32, Vec<[f64; 4]>)> {
     let has_rgb = |layer: &&ExrLayerData| {
         exr_channel(layer, &["r", "red"]).is_some()
@@ -819,6 +781,8 @@ struct ExrSelectionPass<'a> {
     name: String,
     view: String,
     view_id: usize,
+    width: usize,
+    height: usize,
     channels: Vec<ExrSelectionChannel<'a>>,
 }
 
@@ -830,6 +794,8 @@ struct ExrRawChannel<'a> {
     channel: &'a ExrChannelData,
     name: String,
     view: String,
+    width: usize,
+    height: usize,
 }
 
 fn exr_is_multilayer(image: &ExrImageData) -> bool {
@@ -936,6 +902,8 @@ fn exr_render_layers<'a>(image: &'a ExrImageData, views: &[String]) -> Vec<ExrSe
                 channel,
                 name,
                 view,
+                width: layer.size.width(),
+                height: layer.size.height(),
             });
         }
     }
@@ -978,6 +946,8 @@ fn exr_render_layers<'a>(image: &'a ExrImageData, views: &[String]) -> Vec<ExrSe
                 name: pass_name,
                 view: channel.view,
                 view_id,
+                width: channel.width,
+                height: channel.height,
                 channels: vec![ExrSelectionChannel {
                     channel: channel.channel,
                     id,

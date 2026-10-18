@@ -204,6 +204,17 @@ fn complete_scene_schema(root: &mut Value) {
         json!({"type":"number"});
     defs["legacy_texture_resource"]["properties"]["settings"]["properties"]["color_mode"] =
         json!({"enum":["INTENSITY","POSITION","POSITION_OUTLINE","POSITION_OUTLINE_INTENSITY"]});
+    defs["legacy_texture_resource"]["allOf"] = json!([{
+        "if":{"properties":{"texture_type":{"const":"MUSGRAVE"}},"required":["texture_type"]},
+        "then":{"properties":{"settings":{"properties":{
+            "octaves":{"type":"number","minimum":0,"maximum":8},
+            "lacunarity":{"type":"number","minimum":0,"maximum":6},
+            "offset":{"type":"number","minimum":0,"maximum":6},
+            "gain":{"type":"number","minimum":0,"maximum":6},
+            "dimension_max":{"type":"number","minimum":0.0001,"maximum":2},
+            "noise_intensity":{"type":"number","minimum":0,"maximum":10}
+        }}}}
+    }]);
 
     defs["image_tile"] = json!({"type":"object","required":["number","width","height","blob"],"properties":{"number":{"type":"integer","minimum":1,"maximum":u32::MAX},"width":{"type":"integer","minimum":0,"maximum":u32::MAX},"height":{"type":"integer","minimum":0,"maximum":u32::MAX},"blob":{"type":"string"}},"additionalProperties":false});
     defs["image"] = json!({"type":"object","required":["name","source","colorspace","width","height","tiles","blob","source_path","source_hash","alpha_mode"],"properties":{"name":{"type":"string"},"source":{"enum":["generated","file","packed"]},"colorspace":{"enum":["srgb","linear","non_color"]},"width":{"type":"integer","minimum":0,"maximum":u32::MAX},"height":{"type":"integer","minimum":0,"maximum":u32::MAX},"tiles":{"type":"array","items":{"$ref":"#/$defs/image_tile"}},"blob":{"type":["string","null"]},"source_path":{"type":["string","null"]},"source_hash":{"type":["string","null"]},"alpha_mode":{"enum":["straight","premultiplied","none"]}},"additionalProperties":false});

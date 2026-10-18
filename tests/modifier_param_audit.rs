@@ -29,6 +29,9 @@ mod blender_checked;
 #[path = "common/process.rs"]
 mod process;
 
+/// Owners of the measured Blender divergences in `behavior_scenarios.json`.
+const KNOWN_GAP_OWNERS: &[&str] = &["D", "PR15"];
+
 const F_MODIFIERS: &[&str] = &[
     "armature",
     "cast",
@@ -393,6 +396,74 @@ fn f_modifier_parameter_scenarios_match_blender() {
                 assert_eq!(
                     potter_baseline, blender_baseline,
                     "{id}: no-op baseline differs"
+                );
+            }
+            expectation => panic!("{id}: unknown scenario expectation {expectation}"),
+        }
+    }
+}
+
+#[test]
+fn modifier_parameter_scenarios_match_blender_or_record_real_gaps() {
+    let scenarios: Value = serde_json::from_str(BEHAVIOR_SCENARIOS).unwrap();
+    let Some(blender) = blender_scenario_results(&scenarios) else {
+        return;
+    };
+    for scenario in scenarios["scenarios"].as_array().unwrap() {
+        let id = scenario["id"].as_str().unwrap();
+        let primitive = scenario["primitive"].as_str().unwrap();
+        let modifier = scenario["modifier"].as_str().unwrap();
+        let blender_baseline = scenario_signature(&blender, id, "baseline");
+        let blender_case = scenario_signature(&blender, id, "case");
+        let potter_baseline =
+            potter_scenario_geometry(primitive, modifier, &scenario["baseline_params"]);
+        let potter_case = potter_scenario_geometry(primitive, modifier, &scenario["case_params"]);
+        match scenario["expectation"].as_str().unwrap() {
+            "equal_active" => {
+                assert_ne!(
+                    blender_baseline, blender_case,
+                    "{id}: Blender fixture is inactive"
+                );
+                assert_ne!(
+                    potter_baseline, potter_case,
+                    "{id}: Potter fixture is inactive"
+                );
+                assert_eq!(
+                    potter_case, blender_case,
+                    "{id}: Potter differs from Blender"
+                );
+            }
+            "inert" => {
+                assert_eq!(
+                    blender_baseline, blender_case,
+                    "{id}: expected Blender no-op"
+                );
+                assert_eq!(potter_baseline, potter_case, "{id}: expected Potter no-op");
+                assert_eq!(
+                    potter_baseline, blender_baseline,
+                    "{id}: no-op baseline differs"
+                );
+            }
+            "known_gap" => {
+                let owner = scenario["owner"]
+                    .as_str()
+                    .expect("known gap needs an owner");
+                assert!(
+                    KNOWN_GAP_OWNERS.contains(&owner),
+                    "{id}: unknown parity-gap owner {owner}"
+                );
+                assert_ne!(
+                    blender_baseline, blender_case,
+                    "{id}: the tested Blender parameter is inactive"
+                );
+                assert_ne!(
+                    potter_case, blender_case,
+                    "{id}: recorded parity gap has been fixed; update the scenario inventory"
+                );
+                assert_eq!(
+                    potter_baseline != potter_case,
+                    scenario["potter_changes"].as_bool().unwrap(),
+                    "{id}: Potter behavior changed; update the scenario inventory"
                 );
             }
             expectation => panic!("{id}: unknown scenario expectation {expectation}"),

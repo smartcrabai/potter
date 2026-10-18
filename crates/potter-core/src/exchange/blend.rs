@@ -2949,7 +2949,7 @@ fn build_imported_graph(
         &mut doc,
         &mut mappings,
     )?;
-    validate_native_modifier_bindings(&mut doc)?;
+    validate_imported_modifier_bindings(&mut doc)?;
     doc.profile = Profile {
         blender: raw
             .get("blender_version")
@@ -4472,7 +4472,7 @@ fn import_blender_resources(
             "missing"
         };
         let hash = digest.as_deref().map_or(Value::Null, |value| json!(value));
-        let resource = json!({
+        let mut resource = json!({
             "uri": uri,
             "original_path": original_path,
             "hash": hash.clone(),
@@ -4484,6 +4484,9 @@ fn import_blender_resources(
             "source_packed": source_packed,
             "status": status,
         });
+        if let Some(cache_file) = source.get("cache_file") {
+            resource["cache_file"] = cache_file.clone();
+        }
         doc.resources.insert(id.clone(), resource);
         let identity_key = |path: &str| format!("{path}\0{owner}");
         if let Some(path) = source_path {
@@ -7978,7 +7981,7 @@ fn target_position_bucket(position: DVec3, tolerance: f64) -> [i64; 3] {
     ]
 }
 
-fn validate_native_modifier_bindings(doc: &mut SceneDoc) -> Result<()> {
+fn validate_imported_modifier_bindings(doc: &mut SceneDoc) -> Result<()> {
     for (node_id, node) in &mut doc.nodes {
         for modifier in &mut node.modifiers {
             let is_bound = modifier
@@ -7995,14 +7998,14 @@ fn validate_native_modifier_bindings(doc: &mut SceneDoc) -> Result<()> {
             if should_bind
                 && matches!(
                     modifier.modifier_type.as_str(),
-                    "surface_deform" | "mesh_deform" | "laplacian_deform"
+                    "surface_deform" | "mesh_deform" | "laplacian_deform" | "corrective_smooth"
                 )
                 && modifier.binding_data.is_none()
             {
                 return Err(PotError::with_details(
                     ErrorCode::ImportFailed,
                     format!(
-                        "bound {} modifier `{}` on `{}` has no native bind payload",
+                        "bound {} modifier `{}` on `{}` has no bind payload",
                         modifier.modifier_type, modifier.name, node.name
                     ),
                     json!({

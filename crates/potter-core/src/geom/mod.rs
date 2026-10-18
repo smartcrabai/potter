@@ -117,8 +117,9 @@ pub struct IdCounters {
 pub(crate) const ORIGINDEX_NONE: i32 = -1;
 
 /// Internal point attribute carrying each vertex's input storage index, `ORIGINDEX_NONE` for
-/// generated vertices. Evaluation-only: the modifier stack strips it from its output.
-pub(crate) const ORIGINDEX_ATTRIBUTE: &str = "blender_origindex";
+/// generated vertices. The `user:` prefix avoids colliding with canonical user attributes; this
+/// exact key is registered as internal. Evaluation-only: the modifier stack strips it from output.
+pub(crate) const ORIGINDEX_ATTRIBUTE: &str = "user:__potter_origindex";
 
 /// The evaluation-only index carrier as one entry per vertex, when present.
 pub(crate) fn origindex_values(mesh: &Mesh) -> Option<Vec<i32>> {

@@ -55,9 +55,10 @@ pub struct ParsedScene {
     pub doc: SceneDoc,
     /// Diagnostics for legacy data the upgrade skipped or dropped.
     pub warnings: Vec<Value>,
-    /// Whether the original bytes used schema version 1.
+    /// Whether the upgrade changed bytes the store must keep: the original was schema version 1, or it held a
+    /// legacy Mesh Deform bind that the upgrade cleared.
     pub legacy: bool,
-    /// Canonical hash of the original schema-1 scene, before migration changes its schema version.
+    /// Canonical hash of the original scene, before the upgrade changed it. Set with `legacy`.
     pub legacy_hash: Option<String>,
 }
 
@@ -74,7 +75,9 @@ pub(crate) fn parse_scene_with_original_hash(bytes: &[u8]) -> Result<ParsedScene
 
 fn parse_scene_inner(bytes: &[u8], retain_original_hash: bool) -> Result<ParsedScene> {
     let mut value = parse_value(bytes)?;
-    let legacy = value.get("schema_version").and_then(Value::as_u64) == Some(1);
+    // The upgrade clears a legacy Mesh Deform bind, so the original bytes are kept like a schema-1 scene's.
+    let legacy = value.get("schema_version").and_then(Value::as_u64) == Some(1)
+        || has_legacy_mesh_deform_bind(&value);
     let legacy_hash = if legacy && retain_original_hash {
         Some(crate::hash::sha256(&crate::hash::canonicalize(&value)?))
     } else {
@@ -116,9 +119,9 @@ fn json_error(error: &serde_json::Error) -> PotError {
     )
 }
 
-/// Upgrades a scene document in place through schema version 3.
+/// Upgrades a scene document in place through schema version 3, then converts superseded modifier binds.
 pub fn upgrade_scene(value: &mut Value) -> Result<Vec<Value>> {
-    let warnings = if value.get("schema_version").and_then(Value::as_u64) == Some(1) {
+    let mut warnings = if value.get("schema_version").and_then(Value::as_u64) == Some(1) {
         upgrade_v1(value)?
     } else {
         Vec::new()
@@ -126,6 +129,7 @@ pub fn upgrade_scene(value: &mut Value) -> Result<Vec<Value>> {
     if value.get("schema_version").and_then(Value::as_u64) == Some(2) {
         upgrade_v2(value)?;
     }
+    warnings.extend(upgrade_modifier_binds(value));
     Ok(warnings)
 }
 
@@ -244,6 +248,200 @@ fn upgrade_v2(value: &mut Value) -> Result<()> {
     }
     value["schema_version"] = json!(3);
     Ok(())
+}
+
+/// Converts modifier binds stored in superseded layouts to their current formats, on every load, and returns a
+/// warning for each bind it clears. A Laplacian Deform bind of flat source positions becomes
+/// `blender_laplacian_bind_v1`. A Surface Deform bind of per-vertex polygon records becomes
+/// `blender_surface_bind_v1`, with the influences the legacy evaluator computed. A Mesh Deform bind in the
+/// `{weights, cage_mesh}` layout cannot be converted exactly: its bind-time transforms were never stored, and
+/// its weights are absolute cage positions where the current layout stores displacements. It is cleared, so the
+/// modifier needs a rebind. The stored file is not rewritten by the load, so the bytes of the document and of
+/// its history records still hold the legacy bind. Any other bind that cannot be converted exactly is left as
+/// stored, so evaluation reports it. Converted binds have the current layout, so they are not converted again.
+fn upgrade_modifier_binds(value: &mut Value) -> Vec<Value> {
+    let mut warnings = Vec::new();
+    let Some(nodes) = value.get_mut("nodes").and_then(Value::as_object_mut) else {
+        return warnings;
+    };
+    for (node_id, node) in nodes.iter_mut() {
+        let Some(modifiers) = node.get_mut("modifiers").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for modifier in modifiers {
+            warnings.extend(upgrade_modifier_bind(node_id, modifier));
+        }
+    }
+    warnings
+}
+
+/// Converts one modifier's bind, if it has a superseded layout (see [`upgrade_modifier_binds`]). Returns the
+/// warning when the bind is cleared.
+fn upgrade_modifier_bind(node_id: &str, modifier: &mut Value) -> Option<Value> {
+    let modifier_type = modifier
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    // Surface Deform's `falloff` default when the parameter is absent (param table).
+    let falloff = modifier
+        .get("params")
+        .and_then(|params| params.get("falloff"))
+        .map_or(Some(4.0), Value::as_f64);
+    let binding = modifier.get_mut("binding_data")?;
+    let legacy_mesh = modifier_type == "mesh_deform"
+        && binding.as_object().is_some_and(is_legacy_mesh_deform_bind);
+    if !legacy_mesh {
+        let converted = match (modifier_type.as_str(), &*binding) {
+            ("laplacian_deform", Value::Array(rows)) => laplacian_bind(rows),
+            ("surface_deform", Value::Array(records)) => surface_bind(records, falloff),
+            _ => None,
+        };
+        if let Some(converted) = converted {
+            *binding = converted;
+        }
+        return None;
+    }
+    let modifier_id = modifier
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    modifier.as_object_mut()?.remove("binding_data");
+    Some(json!({
+        "code": "modifier.mesh_deform.legacy_bind_cleared",
+        "node": node_id,
+        "modifier": modifier_id,
+        "message": format!(
+            "Mesh Deform modifier `{modifier_id}` on `{node_id}` has a bind in the superseded weights and cage_mesh layout, which cannot be converted exactly; the bind was cleared and rebind required"
+        ),
+    }))
+}
+
+/// A Mesh Deform bind of the pre-Blender layout `{weights, cage_mesh}`, which has no `format` tag.
+fn is_legacy_mesh_deform_bind(bind: &Map<String, Value>) -> bool {
+    !bind.contains_key("format") && bind.contains_key("weights") && bind.contains_key("cage_mesh")
+}
+
+/// Whether a scene document holds a Mesh Deform bind in the superseded `{weights, cage_mesh}` layout, which the
+/// upgrade clears.
+fn has_legacy_mesh_deform_bind(value: &Value) -> bool {
+    value
+        .get("nodes")
+        .and_then(Value::as_object)
+        .is_some_and(|nodes| {
+            nodes.values().any(|node| {
+                node.get("modifiers")
+                    .and_then(Value::as_array)
+                    .is_some_and(|modifiers| {
+                        modifiers.iter().any(|modifier| {
+                            modifier.get("type").and_then(Value::as_str) == Some("mesh_deform")
+                                && modifier
+                                    .get("binding_data")
+                                    .and_then(Value::as_object)
+                                    .is_some_and(is_legacy_mesh_deform_bind)
+                        })
+                    })
+            })
+        })
+}
+
+/// Legacy Laplacian Deform bind: one `[x, y, z]` array per source vertex. Every coordinate is kept as stored.
+fn laplacian_bind(rows: &[Value]) -> Option<Value> {
+    let mut coordinates = Vec::with_capacity(rows.len().checked_mul(3)?);
+    for row in rows {
+        let values = row.as_array().filter(|values| values.len() == 3)?;
+        for value in values {
+            if !value.as_f64().is_some_and(f64::is_finite) {
+                return None;
+            }
+            coordinates.push(value.clone());
+        }
+    }
+    Some(json!({
+        "format": crate::geom::modifiers::deform::LAPLACIAN_BIND_FORMAT,
+        "type": "laplacian_deform",
+        "verts_num": rows.len(),
+        "vertex_coordinates": coordinates,
+    }))
+}
+
+/// Legacy Surface Deform bind: one `{"polygons": [...]}` record per source vertex, where each polygon holds its
+/// target `vertices`, mean-value `weights`, `normal_distance`, and `distance`. The legacy evaluator computed
+/// each polygon's influence from `distance` and `falloff` (normalized inverse power, or exact-hit selection).
+/// Blender bakes influences at bind time, so they are computed here with the same formula. The distances are
+/// kept beside them. The legacy evaluator applied no target transform, so no `mat` is written.
+fn surface_bind(records: &[Value], falloff: Option<f64>) -> Option<Value> {
+    let falloff = falloff.filter(|falloff| (2.0..=16.0).contains(falloff))?;
+    let mut bind_verts = Vec::with_capacity(records.len());
+    for (vertex_idx, record) in records.iter().enumerate() {
+        let polygons = record.get("polygons").and_then(Value::as_array)?;
+        let mut distances = Vec::with_capacity(polygons.len());
+        for polygon in polygons {
+            let distance = polygon
+                .get("distance")
+                .and_then(Value::as_f64)
+                .filter(|distance| distance.is_finite() && *distance >= 0.0)?;
+            distances.push(distance);
+        }
+        let exact = distances
+            .iter()
+            .filter(|distance| **distance <= f64::EPSILON)
+            .count();
+        let raw: Vec<f64> = distances
+            .iter()
+            .map(|&distance| {
+                if exact > 0 {
+                    if distance <= f64::EPSILON { 1.0 } else { 0.0 }
+                } else {
+                    distance.max(1.0e-12).powf(-falloff)
+                }
+            })
+            .collect();
+        let total: f64 = raw.iter().sum();
+        if !total.is_finite() || total <= f64::EPSILON {
+            return None;
+        }
+        let mut binds = Vec::with_capacity(polygons.len());
+        for ((polygon, distance), raw_weight) in polygons.iter().zip(&distances).zip(&raw) {
+            let indices = polygon
+                .get("vertices")
+                .and_then(Value::as_array)
+                .filter(|indices| indices.len() >= 3)?;
+            let weights = polygon
+                .get("weights")
+                .and_then(Value::as_array)
+                .filter(|weights| weights.len() == indices.len())?;
+            if !indices.iter().all(|index| index.as_u64().is_some())
+                || !weights
+                    .iter()
+                    .all(|weight| weight.as_f64().is_some_and(f64::is_finite))
+            {
+                return None;
+            }
+            let normal_distance = polygon
+                .get("normal_distance")
+                .and_then(Value::as_f64)
+                .filter(|normal_distance| normal_distance.is_finite())?;
+            binds.push(json!({
+                "influence": raw_weight / total,
+                "mode": 1,
+                "verts_num": indices.len(),
+                "vert_inds": indices,
+                "vert_weights": weights,
+                "normal_dist": normal_distance,
+                "distance": distance,
+            }));
+        }
+        bind_verts.push(json!({"vertex_idx": vertex_idx, "binds": binds}));
+    }
+    Some(json!({
+        "format": "blender_surface_bind_v1",
+        "type": "surface_deform",
+        "mesh_verts_num": records.len(),
+        "bind_verts_num": records.len(),
+        "bind_verts": bind_verts,
+    }))
 }
 
 /// Blender-owned mesh attributes are mirrors or topology rebuilt by Potter. Their exact signatures

@@ -6,6 +6,7 @@ use glam::{DMat3, DMat4, DVec2, DVec3};
 use serde_json::{Map, Value, json};
 
 use crate::{
+    blender_rng::BlenderRng,
     error::{ErrorCode, PotError, Result},
     geom::{
         Edge, Face, Mesh, Vertex, attribute_keys,
@@ -40,8 +41,15 @@ pub struct SceneOperand {
 ///
 /// Returns an invalid-parameter or evaluation error when a requested group, UV layer,
 /// or attribute is missing or malformed.
-pub(super) fn evaluate(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
-    evaluate_with_context(mesh, modifier, &BTreeMap::new(), None, DMat4::IDENTITY)
+pub(super) fn evaluate(mesh: &Mesh, modifier: &Modifier, subject_name: &str) -> Result<Mesh> {
+    evaluate_with_context(
+        mesh,
+        modifier,
+        subject_name,
+        &BTreeMap::new(),
+        None,
+        DMat4::IDENTITY,
+    )
 }
 
 /// Evaluate an attribute modifier with its resolved scene operands and optional image mask.
@@ -52,6 +60,7 @@ pub(super) fn evaluate(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
 pub fn evaluate_with_context(
     mesh: &Mesh,
     modifier: &Modifier,
+    subject_name: &str,
     operands: &BTreeMap<String, Vec<SceneOperand>>,
     mask_image: Option<&crate::image::ImageData>,
     subject_world: DMat4,
@@ -59,11 +68,14 @@ pub fn evaluate_with_context(
     let texture_weights =
         texture_mask_weights(mesh, modifier, operands, mask_image, subject_world)?;
     match modifier.modifier_type.as_str() {
-        "vertex_weight_edit" => vertex_weight_edit(mesh, modifier, texture_weights.as_ref()),
+        "vertex_weight_edit" => {
+            vertex_weight_edit(mesh, modifier, subject_name, texture_weights.as_ref())
+        }
         "vertex_weight_mix" => vertex_weight_mix(mesh, modifier, texture_weights.as_ref()),
         "vertex_weight_proximity" => vertex_weight_proximity(
             mesh,
             modifier,
+            subject_name,
             operands,
             texture_weights.as_ref(),
             subject_world,
@@ -693,6 +705,7 @@ fn apply_cache_axes(
 fn vertex_weight_edit(
     mesh: &Mesh,
     modifier: &Modifier,
+    subject_name: &str,
     texture_weights: Option<&BTreeMap<u32, f64>>,
 ) -> Result<Mesh> {
     let group = string(modifier, "vertex_group")?;
@@ -703,8 +716,8 @@ fn vertex_weight_edit(
     let invert_falloff = boolean(modifier, "invert_falloff")?;
     let use_add = boolean(modifier, "use_add")?;
     let use_remove = boolean(modifier, "use_remove")?;
-    let add_threshold = number(modifier, "add_threshold")?;
-    let remove_threshold = number(modifier, "remove_threshold")?;
+    let add_threshold = f64::from(to_f32(number(modifier, "add_threshold")?));
+    let remove_threshold = f64::from(to_f32(number(modifier, "remove_threshold")?));
     let default = number(modifier, "default_weight")?.clamp(0.0, 1.0);
     let normalize = boolean(modifier, "normalize")?;
     let mask_constant = number(modifier, "mask_constant")?.clamp(0.0, 1.0);
@@ -712,44 +725,43 @@ fn vertex_weight_edit(
     let mask_invert = boolean(modifier, "invert_mask_vertex_group")?;
     let curve = curve_points(modifier)?;
     let mut result = mesh.clone();
+    // Blender leaves the mesh unchanged when the modifier's own group is missing.
+    if !has_vertex_group(&result, group) {
+        return Ok(result);
+    }
     let existing = get_group_weights(&result, group)?;
-    let mask_weights = mask_group
-        .map(|name| get_group_weights(&result, name))
-        .transpose()?;
-    let mut updated = BTreeMap::new();
-    for vertex in &result.vertices {
-        let assigned = existing.get(&vertex.id).copied();
-        let (original, mut weight) = match assigned {
-            Some(weight) => (weight, weight),
-            None if use_add && default > add_threshold => (0.0, default),
-            None => continue,
-        };
-        weight = apply_falloff(weight, falloff, curve.as_deref(), u64::from(vertex.id));
+    let factors = mask_factors(&result, mask_group, mask_invert, texture_weights)?;
+    let mut random = random_falloff_stream(falloff, subject_name);
+    // Blender's `org_w` covers every vertex: the member's weight, or `default_weight` for a
+    // non-member. The falloff maps each one, then the single mask blends toward the mapped value.
+    let mut blended = Vec::with_capacity(result.vertices.len());
+    for (vertex, factor) in result.vertices.iter().zip(&factors) {
+        // Blender maps every vertex in order, member or not, so RANDOM draws once for each.
+        let draw = random
+            .as_mut()
+            .map_or(0.0, |stream| f64::from(stream.get_float()));
+        let original = existing.get(&vertex.id).copied().unwrap_or(default);
+        let mut mapped = apply_falloff(original, falloff, curve.as_deref(), draw);
         if invert_falloff {
-            weight = 1.0 - weight;
+            mapped = 1.0 - mapped;
         }
-        let mask = mask_weights.as_ref().map_or(1.0, |weights| {
-            let value = weights.get(&vertex.id).copied().unwrap_or(0.0);
-            if mask_invert { 1.0 - value } else { value }
-        });
-        let texture_mask = texture_weights.map_or(1.0, |weights| {
-            weights.get(&vertex.id).copied().unwrap_or(0.0)
-        });
-        let influence = (mask * mask_constant * texture_mask).clamp(0.0, 1.0);
-        let final_weight = if assigned.is_none() {
-            weight
+        blended.push(original + (mapped - original) * *factor * mask_constant);
+    }
+    let weights = normalized_weights(&blended, normalize);
+    let mut members = BTreeMap::new();
+    for (vertex, weight) in result.vertices.iter().zip(weights) {
+        // Blender removes a member at or below the remove threshold, and adds a non-member at or
+        // above the add threshold. Both compare the normalized, clamped weight.
+        let keep = if existing.contains_key(&vertex.id) {
+            !(use_remove && weight <= remove_threshold)
         } else {
-            original + (weight - original) * influence
+            use_add && weight >= add_threshold
         };
-        if use_remove && final_weight < remove_threshold {
-            continue;
+        if keep {
+            members.insert(vertex.id, weight);
         }
-        updated.insert(vertex.id, final_weight.clamp(0.0, 1.0));
     }
-    write_group_weights(&mut result, group, &updated)?;
-    if normalize {
-        normalize_group(&mut result, group)?;
-    }
+    write_group_members(&mut result, group, &members)?;
     Ok(result)
 }
 
@@ -842,6 +854,7 @@ fn mix_weights(a: f64, b: f64, mode: &str, modifier: &Modifier) -> Result<f64> {
 fn vertex_weight_proximity(
     mesh: &Mesh,
     modifier: &Modifier,
+    subject_name: &str,
     operands: &BTreeMap<String, Vec<SceneOperand>>,
     texture_weights: Option<&BTreeMap<u32, f64>>,
     subject_world: DMat4,
@@ -884,12 +897,14 @@ fn vertex_weight_proximity(
     let mask_constant = number(modifier, "mask_constant")?.clamp(0.0, 1.0);
     let mask_group = optional_string(modifier, "mask_vertex_group")?;
     let mask_invert = boolean(modifier, "invert_mask_vertex_group")?;
-    let mask_weights = mask_group
-        .map(|name| get_group_weights(mesh, name))
-        .transpose()?;
-    let existing = get_group_weights(mesh, group)?;
+    let normalize = boolean(modifier, "normalize")?;
     let mut result = mesh.clone();
-    let mut updated = BTreeMap::new();
+    // Blender leaves the mesh unchanged when the modifier's own group is missing.
+    if !has_vertex_group(&result, group) {
+        return Ok(result);
+    }
+    let existing = get_group_weights(&result, group)?;
+    let factors = mask_factors(&result, mask_group, mask_invert, texture_weights)?;
     let target_points = target
         .mesh
         .vertices
@@ -935,7 +950,13 @@ fn vertex_weight_proximity(
     let target_origin_world =
         subject_world.transform_point3(target.local_to_subject.transform_point3(DVec3::ZERO));
     let object_distance = subject_origin_world.distance(target_origin_world);
-    for vertex in &result.vertices {
+    let mut random = random_falloff_stream(falloff, subject_name);
+    // Blender maps only the group members, in vertex order, so RANDOM draws once for each.
+    let mut blended = Vec::with_capacity(existing.len());
+    for (vertex, factor) in result.vertices.iter().zip(&factors) {
+        let Some(&original) = existing.get(&vertex.id) else {
+            continue;
+        };
         let distance = if mode == "OBJECT" {
             object_distance
         } else {
@@ -952,29 +973,28 @@ fn vertex_weight_proximity(
         } else {
             ((distance - minimum) / (maximum - minimum)).clamp(0.0, 1.0)
         };
-        let mut weight =
-            apply_falloff(t, falloff, curve.as_deref(), u64::from(vertex.id)).clamp(0.0, 1.0);
+        let draw = random
+            .as_mut()
+            .map_or(0.0, |stream| f64::from(stream.get_float()));
+        let mut weight = apply_falloff(t, falloff, curve.as_deref(), draw);
         if invert_falloff {
             weight = 1.0 - weight;
         }
-        let mask = mask_weights.as_ref().map_or(1.0, |weights| {
-            let value = weights.get(&vertex.id).copied().unwrap_or(0.0);
-            if mask_invert { 1.0 - value } else { value }
-        });
-        let texture_mask = texture_weights.map_or(1.0, |weights| {
-            weights.get(&vertex.id).copied().unwrap_or(0.0)
-        });
-        let influence = (mask * mask_constant * texture_mask).clamp(0.0, 1.0);
-        let original = existing.get(&vertex.id).copied().unwrap_or(0.0);
-        updated.insert(
+        blended.push((
             vertex.id,
-            (original + (weight - original) * influence).clamp(0.0, 1.0),
-        );
+            original + (weight - original) * *factor * mask_constant,
+        ));
     }
-    write_group_weights(&mut result, group, &updated)?;
-    if boolean(modifier, "normalize")? {
-        normalize_group(&mut result, group)?;
-    }
+    let values = blended
+        .iter()
+        .map(|(_, weight)| *weight)
+        .collect::<Vec<_>>();
+    let members = blended
+        .iter()
+        .map(|(id, _)| *id)
+        .zip(normalized_weights(&values, normalize))
+        .collect::<BTreeMap<_, _>>();
+    write_group_members(&mut result, group, &members)?;
     Ok(result)
 }
 
@@ -3077,6 +3097,102 @@ fn normalize_group(mesh: &mut Mesh, group: &str) -> Result<()> {
     Ok(())
 }
 
+/// Blender's `weightvg_do_mask` picks exactly one mask source. A texture replaces the group and
+/// constant masks. Otherwise an existing group supplies the factor, inverted only on this path.
+/// Otherwise the constant mask applies, a factor of 1 before `mask_constant`.
+fn mask_factors(
+    mesh: &Mesh,
+    mask_group: Option<&str>,
+    invert: bool,
+    texture_weights: Option<&BTreeMap<u32, f64>>,
+) -> Result<Vec<f64>> {
+    if let Some(weights) = texture_weights {
+        return Ok(mesh
+            .vertices
+            .iter()
+            .map(|vertex| weights.get(&vertex.id).copied().unwrap_or(0.0))
+            .collect());
+    }
+    if let Some(name) = mask_group.filter(|name| has_vertex_group(mesh, name)) {
+        let weights = get_group_weights(mesh, name)?;
+        return Ok(mesh
+            .vertices
+            .iter()
+            .map(|vertex| {
+                let value = weights.get(&vertex.id).copied().unwrap_or(0.0);
+                if invert { 1.0 - value } else { value }
+            })
+            .collect());
+    }
+    Ok(vec![1.0; mesh.vertices.len()])
+}
+
+/// Narrows a model value to Blender's float32 precision, rounding to nearest.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "Blender holds weights and thresholds as float32"
+)]
+fn to_f32(value: f64) -> f32 {
+    value as f32
+}
+
+/// Blender's `weightvg_update_vg` normalization over one array in index order, in float32 as
+/// Blender's `float` arithmetic is. When `normalize` is set and max - min exceeds FLT_EPSILON, each
+/// weight becomes `(w - min) * (1 / range)`; otherwise the weights keep their values. Every result is
+/// clamped to [0, 1], widened once, and the thresholds compare these.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "Blender stores weights as float32; each value is narrowed once, before any arithmetic"
+)]
+fn normalized_weights(weights: &[f64], normalize: bool) -> Vec<f64> {
+    let values = weights
+        .iter()
+        .map(|&weight| weight as f32)
+        .collect::<Vec<_>>();
+    let mut offset = 0.0_f32;
+    let mut scale = 1.0_f32;
+    if let (true, Some(&first)) = (normalize, values.first()) {
+        let (low, high) = values.iter().fold((first, first), |(low, high), &weight| {
+            (low.min(weight), high.max(weight))
+        });
+        let range = high - low;
+        if range.abs() > f32::EPSILON {
+            offset = low;
+            scale = 1.0 / range;
+        }
+    }
+    values
+        .iter()
+        .map(|&weight| f64::from(((weight - offset) * scale).clamp(0.0, 1.0)))
+        .collect()
+}
+
+/// Whether the mesh's `vertex_groups` attribute names `group`, as `BKE_id_defgroup_name_index` does.
+fn has_vertex_group(mesh: &Mesh, group: &str) -> bool {
+    mesh.attributes
+        .get("vertex_groups")
+        .and_then(Value::as_object)
+        .is_some_and(|groups| groups.contains_key(group))
+}
+
+/// Replaces `group` with exactly `members`, keeping zero weights. Blender keeps a vertex that
+/// normalizes to 0 in the group, which `write_group_weights` would drop.
+fn write_group_members(mesh: &mut Mesh, group: &str, members: &BTreeMap<u32, f64>) -> Result<()> {
+    let groups = mesh
+        .attributes
+        .entry("vertex_groups".to_owned())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let groups = groups.as_object_mut().ok_or_else(|| {
+        PotError::invalid_argument("vertex_groups mesh attribute must be an object")
+    })?;
+    let values = members
+        .iter()
+        .map(|(id, weight)| (format!("v{id}"), json!(weight)))
+        .collect::<Map<String, Value>>();
+    groups.insert(group.to_owned(), Value::Object(values));
+    Ok(())
+}
+
 fn get_group_weights(mesh: &Mesh, group: &str) -> Result<BTreeMap<u32, f64>> {
     let groups = mesh
         .attributes
@@ -3204,7 +3320,11 @@ fn curve_points(modifier: &Modifier) -> Result<Option<Vec<DVec2>>> {
     Ok(Some(result))
 }
 
-fn apply_falloff(value: f64, falloff: &str, curve: Option<&[DVec2]>, seed: u64) -> f64 {
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "Blender multiplies the float32 draw by the float32 factor"
+)]
+fn apply_falloff(value: f64, falloff: &str, curve: Option<&[DVec2]>, random: f64) -> f64 {
     let value = value.clamp(0.0, 1.0);
     match falloff {
         "CURVE" => curve.map_or(value, |points| {
@@ -3219,17 +3339,27 @@ fn apply_falloff(value: f64, falloff: &str, curve: Option<&[DVec2]>, seed: u64) 
         "SMOOTH" => value * value * (3.0 - 2.0 * value),
         "ROOT" => value.sqrt(),
         "ICON_SPHERECURVE" => (1.0 - (1.0 - value).powi(2)).sqrt(),
-        "RANDOM" => stable_random(seed),
+        "RANDOM" => f64::from(random as f32 * value as f32),
         "STEP" => f64::from(value >= 0.5),
         _ => value,
     }
 }
 
-fn stable_random(seed: u64) -> f64 {
-    let mut value = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
-    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    ((value ^ (value >> 31)) >> 11) as f64 / ((1_u64 << 53) as f64)
+/// The RANDOM falloff stream of one modifier evaluation, or `None` for other falloffs.
+///
+/// Blender seeds it from the owning object's name, `BLI_rng_new_srandom(BLI_ghashutil_strhash(name))`,
+/// and `weightvg_do_map` draws one float per mapped vertex, in vertex order.
+fn random_falloff_stream(falloff: &str, subject_name: &str) -> Option<BlenderRng> {
+    (falloff == "RANDOM").then(|| BlenderRng::seed_random(blender_strhash(subject_name)))
+}
+
+/// `BLI_ghashutil_strhash_p`: djb2 over the name's bytes read as signed chars, in 32-bit unsigned
+/// arithmetic.
+fn blender_strhash(name: &str) -> u32 {
+    name.bytes().fold(5381_u32, |hash, byte| {
+        hash.wrapping_mul(33)
+            .wrapping_add(i32::from(byte as i8) as u32)
+    })
 }
 
 fn one_operand<'a>(
