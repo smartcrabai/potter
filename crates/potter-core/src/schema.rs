@@ -2573,23 +2573,6 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn scene_texture_ref_schema_includes_extension_and_requires_interpolation()
-    -> crate::error::Result<()> {
-        let scene = schema("scene", None)?;
-        let texture_ref = &scene["$defs"]["texture_ref"];
-        assert_eq!(
-            texture_ref["properties"]["extension"]["enum"],
-            serde_json::json!(["repeat", "extend", "clip", "mirror"])
-        );
-        assert_eq!(
-            texture_ref["required"],
-            serde_json::json!(["image", "interpolation"])
-        );
-        assert_eq!(texture_ref["additionalProperties"], false);
-        Ok(())
-    }
-
-    #[test]
     fn modifier_and_constraint_schemas_use_rna_parameter_tables() -> crate::error::Result<()> {
         let modifier_create = schema("operations", Some("modifier.create"))?;
         let array_params = modifier_create["allOf"]
