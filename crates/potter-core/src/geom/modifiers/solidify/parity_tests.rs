@@ -189,7 +189,7 @@ fn scene(input: &Value) -> TestResult<SceneDoc> {
         .push(subject);
     doc.schema_version = 1;
     let mut document = serde_json::to_value(doc)?;
-    crate::model::upgrade_scene(&mut document)?;
+    crate::model::upgrade_scene(&mut document, Path::new("no-assets"))?;
     let doc: SceneDoc = serde_json::from_value(document)?;
     doc.validate()?;
     Ok(doc)
