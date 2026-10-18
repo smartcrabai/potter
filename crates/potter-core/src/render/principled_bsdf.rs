@@ -208,6 +208,10 @@ struct SpecularLayer {
 
 /// Cycles' specular setup: `f0 = F0(ior) * 2 * level`, `eta = ior` at level 0.5, otherwise
 /// `eta = ior_from_F0(f0)` (inverted for ior < 1). No specular layer when `eta == 1`.
+#[expect(
+    clippy::float_cmp,
+    reason = "Cycles compares the specular IOR level with exactly 0.5 and eta with exactly 1"
+)]
 fn specular_layer(params: &BsdfParams) -> Option<SpecularLayer> {
     let level = params.specular_ior_level.max(0.0);
     let f0_scalar = f0_from_ior(params.ior) * 2.0 * level;
@@ -275,6 +279,10 @@ fn ior_from_f0(f0: f64) -> f64 {
 }
 
 /// Unpolarised dielectric Fresnel reflectance (`fresnel_dielectric`, average of s and p).
+#[expect(
+    clippy::manual_midpoint,
+    reason = "Cycles averages the s and p reflectances as 0.5 * (s + p), so the same expression is kept"
+)]
 fn fresnel_dielectric(cosine_incident: f64, eta: f64) -> f64 {
     let cos_i = cosine_incident.abs();
     let eta_cos_t_squared = eta * eta - (1.0 - cos_i * cos_i);
@@ -290,7 +298,7 @@ fn fresnel_dielectric(cosine_incident: f64, eta: f64) -> f64 {
 /// Kulla-Conty fit of the average single-scattering dielectric Fresnel (`fresnel_dielectric_Fss`).
 fn fresnel_dielectric_fss(eta: f64) -> f64 {
     if eta < 1.0 {
-        0.997118 + eta * (0.1014 - eta * (0.965241 + eta * 0.130607))
+        0.997_118 + eta * (0.1014 - eta * (0.965_241 + eta * 0.130_607))
     } else {
         (eta - 1.0) / (4.08567 + 1.00071 * eta)
     }

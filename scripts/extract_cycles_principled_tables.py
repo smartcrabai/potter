@@ -91,11 +91,24 @@ def wrap_values(values):
     return lines
 
 
+def group_fraction_digits(literal):
+    """Return a float literal with its fraction digits grouped in threes, e.g. 0.980405 -> 0.980_405.
+
+    The digits are unchanged, so the value is exactly the source value. clippy::unreadable_literal
+    (denied by the workspace's pedantic lints) requires the separators.
+    """
+    integer, dot, fraction = literal.partition(".")
+    if not dot or not fraction or "e" in literal or "E" in literal:
+        return literal
+    grouped = "_".join(fraction[i : i + 3] for i in range(0, len(fraction), 3))
+    return f"{integer}.{grouped}"
+
+
 def render_static(rust_name, values):
     lines = [
         "#[rustfmt::skip]",
         f"pub(crate) static {rust_name}: [f32; {len(values)}] = [",
-        *wrap_values(values),
+        *wrap_values([group_fraction_digits(value) for value in values]),
         "];",
     ]
     return "\n".join(lines)

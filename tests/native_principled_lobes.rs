@@ -53,7 +53,7 @@ const ORACLE: &str = include_str!("fixtures/native_oracle/principled/blender_var
 
 /// Blender scene author for one variant. It mirrors `make_scene()` in `blender_variants.py` and
 /// saves the `.blend` without rendering. The variant parameters arrive as a JSON file.
-const SCENE_SCRIPT: &str = r##"import json
+const SCENE_SCRIPT: &str = r"import json
 import sys
 
 import bpy
@@ -137,7 +137,7 @@ aim(camera, (0.0, 0.0, 0.0))
 scene.camera = camera
 
 bpy.ops.wm.save_as_mainfile(filepath=out_blend)
-"##;
+";
 
 /// Seeds rendered by both Blender and Potter: `0..SEEDS`.
 const SEEDS: u64 = 8;
