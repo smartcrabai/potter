@@ -261,32 +261,30 @@ fn object_to_world(
     };
     // A current captured `matrix_basis` is the local matrix the rig composes (`rig.rs`), in f32.
     // Without it the local matrix is the f64 TRS, compared at f64 precision.
-    let (expected, own, captured) = match node.captured_matrix_basis(&node.transform).ok()? {
-        Some(basis) => {
-            let local = blender_matrix_from_f64(DMat4::from_cols_array(&basis));
-            let composed = match parent_space {
-                Some(parent) => blender_mul_m4(
-                    &blender_mul_m4(
-                        &blender_matrix_from_f64(parent),
-                        &blender_matrix_from_f64(parent_inverse),
-                    ),
-                    &local,
+    let captured_basis = node.captured_matrix_basis(&node.transform).ok()?;
+    let (expected, own, captured) = if let Some(basis) = captured_basis {
+        let local = blender_matrix_from_f64(DMat4::from_cols_array(&basis));
+        let composed = match parent_space {
+            Some(parent) => blender_mul_m4(
+                &blender_mul_m4(
+                    &blender_matrix_from_f64(parent),
+                    &blender_matrix_from_f64(parent_inverse),
                 ),
-                None => local,
-            };
-            (dmat4_from_blender(&composed), local, true)
+                &local,
+            ),
+            None => local,
+        };
+        (dmat4_from_blender(&composed), local, true)
+    } else {
+        let local = node.transform.matrix();
+        let expected = match parent_space {
+            Some(parent) => parent * parent_inverse * local,
+            None => parent_inverse * local,
+        };
+        if !same_matrix(expected, world, 1e-9) {
+            return None;
         }
-        None => {
-            let local = node.transform.matrix();
-            let expected = match parent_space {
-                Some(parent) => parent * parent_inverse * local,
-                None => parent_inverse * local,
-            };
-            if !same_matrix(expected, world, 1e-9) {
-                return None;
-            }
-            (world, blender_transform_matrix(&node.transform)?, false)
-        }
+        (world, blender_transform_matrix(&node.transform)?, false)
     };
     // The captured composition is the rig's own f32 arithmetic on the same operands, so it must be
     // bit-identical to the evaluated world matrix; any constraint or animation breaks that.

@@ -198,7 +198,11 @@ mod tests {
     #[test]
     fn degenerate_inputs_are_refused() {
         let mut weights = [7.0_f32; 2];
-        assert!(!interp_weights_poly_v2(&mut weights, &SQUARE[..2], [0.5, 0.5]));
+        assert!(!interp_weights_poly_v2(
+            &mut weights,
+            &SQUARE[..2],
+            [0.5, 0.5]
+        ));
         assert_eq!(weights, [7.0, 7.0]);
         let mut short = [0.0_f32; 3];
         assert!(!interp_weights_poly_v2(&mut short, &SQUARE, [0.5, 0.5]));

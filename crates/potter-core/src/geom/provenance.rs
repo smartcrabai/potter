@@ -588,7 +588,6 @@ fn dot3_f32(first: [f32; 3], second: [f32; 3]) -> f32 {
     first[0] * second[0] + first[1] * second[1] + first[2] * second[2]
 }
 
-
 #[expect(
     clippy::cast_precision_loss,
     reason = "source element counts are far below 2^53"
