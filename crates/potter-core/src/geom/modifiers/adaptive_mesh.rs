@@ -274,7 +274,7 @@ mod tests {
 
     use glam::DVec3;
 
-    use super::super::subdivision_limit::{BaseSharpness, Samples};
+    use super::super::subdivision_limit::{BaseSharpness, PatchCache, Samples};
     use super::{DicedTopology, FvarLinear, LimitSurface, Mesh, Sample, assemble};
 
     #[test]
@@ -329,10 +329,13 @@ mod tests {
             .into_iter()
             .map(Option::unwrap)
             .collect();
+        let mut patches = PatchCache::default();
         let expected: Vec<DVec3> = samples
             .iter()
             .map(|sample| {
-                let (_, du, dv) = surface.point_and_derivatives(*sample).unwrap();
+                let (_, du, dv) = surface
+                    .point_and_derivatives_cached(*sample, &mut patches)
+                    .unwrap();
                 du.cross(dv).normalize_or_zero()
             })
             .collect();

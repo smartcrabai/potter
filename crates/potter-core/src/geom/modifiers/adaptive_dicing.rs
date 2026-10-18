@@ -15,7 +15,7 @@ use crate::{
     model::CameraProjection,
 };
 
-use super::subdivision_limit::{LimitSurface, Sample, Samples};
+use super::subdivision_limit::{LimitSurface, PatchCache, Sample, Samples};
 
 use super::{MAX_SUBDIVISION_MEMORY_BYTES, MAX_SUBDIVISION_TRIANGLES};
 
@@ -459,6 +459,8 @@ struct DicedBuilder {
     normals: Vec<DVec3>,
     shared_vertices: HashMap<DicedVertexKey, usize>,
     estimated_bytes: u128,
+    /// Leaf patches of the single `LimitSurface` this builder dices (one builder per `dice` call).
+    patches: PatchCache,
 }
 
 impl DicedBuilder {
@@ -473,6 +475,7 @@ impl DicedBuilder {
             normals: Vec::new(),
             shared_vertices: HashMap::new(),
             estimated_bytes: curve_bytes,
+            patches: PatchCache::default(),
         }
     }
 
@@ -554,7 +557,7 @@ impl DicedBuilder {
         surface: &LimitSurface,
     ) -> Result<usize> {
         self.check_capacity(1, 0, 0)?;
-        let (position, du, dv) = surface.point_and_derivatives(sample)?;
+        let (position, du, dv) = surface.point_and_derivatives_cached(sample, &mut self.patches)?;
         if !position.is_finite() {
             return Err(PotError::new(
                 ErrorCode::EvaluationFailed,

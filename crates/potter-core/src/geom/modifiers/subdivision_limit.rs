@@ -255,12 +255,8 @@ impl LimitSurface {
     }
 
     /// Evaluates the limit point and its object-space derivatives with respect to ptex-local `u` and `v`.
-    pub(super) fn point_and_derivatives(&self, sample: Sample) -> Result<(DVec3, DVec3, DVec3)> {
-        self.point_and_derivatives_cached(sample, &mut PatchCache::default())
-    }
-
-    /// `point_and_derivatives`, with each leaf's patch built once per `cache` and reused by every later
-    /// sample on that leaf. The patch and the arithmetic are those of a fresh build.
+    /// Each leaf's patch is built once per `cache` and reused by later samples on that leaf; the
+    /// patch and the arithmetic are those of a fresh build.
     pub(super) fn point_and_derivatives_cached(
         &self,
         sample: Sample,

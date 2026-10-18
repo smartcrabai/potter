@@ -3771,6 +3771,10 @@ fn apply_multires_sculpt_rebase(
     } else {
         (None, None)
     };
+    // One cache per surface: keys are (level, face), valid for one LimitSurface only.
+    let mut base_patches = subdivision_limit::PatchCache::default();
+    let mut old_patches = subdivision_limit::PatchCache::default();
+    let mut new_patches = subdivision_limit::PatchCache::default();
     let mut changed = false;
     for loop_index in 0..grid_count {
         let first_location = multires::grid_sample_location(source, displacement, loop_index, 0)?;
@@ -3809,7 +3813,8 @@ fn apply_multires_sculpt_rebase(
                 u: f64::from(location.u),
                 v: f64::from(location.v),
             };
-            let (base_point, base_du, base_dv) = base_limit.point_and_derivatives(base_sample)?;
+            let (base_point, base_du, base_dv) =
+                base_limit.point_and_derivatives_cached(base_sample, &mut base_patches)?;
             let old = multires::grid_sample_value(displacement, location)?;
             let old_final = base_point
                 + multires::tangent_to_object(base_du, base_dv, location.tangent_corner, old);
@@ -3828,8 +3833,10 @@ fn apply_multires_sculpt_rebase(
                 })?;
                 let sculpt_sample =
                     multires_sculpt_surface_sample(source, displacement, samples, cell, location)?;
-                let (old_point, old_du, old_dv) = old_limit.point_and_derivatives(sculpt_sample)?;
-                let (new_point, new_du, new_dv) = new_limit.point_and_derivatives(sculpt_sample)?;
+                let (old_point, old_du, old_dv) =
+                    old_limit.point_and_derivatives_cached(sculpt_sample, &mut old_patches)?;
+                let (new_point, new_du, new_dv) =
+                    new_limit.point_and_derivatives_cached(sculpt_sample, &mut new_patches)?;
                 if old_point == new_point && old_du == new_du && old_dv == new_dv {
                     continue;
                 }
