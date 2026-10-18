@@ -15,7 +15,8 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 type UvLayerRecord = (String, BTreeMap<u64, (Vec<[f64; 2]>, Vec<bool>)>);
 type EdgeRecords = BTreeMap<(usize, usize), Vec<(bool, bool, f64)>>;
 
-// Blender's custom-normal codes vary by one beta step across platforms (see the module doc).
+// Blender's custom-normal codes vary by one beta step across platforms; see
+// tests/common/blender_code_tolerance.rs.
 #[path = "common/blender_code_tolerance.rs"]
 mod blender_code_tolerance;
 use blender_code_tolerance::code_within_beta_step;
@@ -34,13 +35,13 @@ fn codes_within_beta_step(actual: &Value, expected: &Value) -> bool {
         Some([first.as_i64()?, second.as_i64()?])
     };
     match (pair(actual), pair(expected)) {
-        (Some(a), Some(e)) => code_within_beta_step(Some(a), Some(e)),
+        (Some(a), Some(e)) => code_within_beta_step(a, e),
         _ => false,
     }
 }
 
-// Blender f32 output is rounded to seven fixture decimals; generation measured a maximum
-// serialization error of 5.000000003e-8. These bounds cover f32/OpenSubdiv arithmetic only.
+// Fixture values are rounded to seven decimals, a serialization error of at most 5e-8. These
+// bounds cover f32/OpenSubdiv arithmetic only.
 const POSITION_TOLERANCE: f64 = 3.0e-6;
 const UV_TOLERANCE: f64 = 2.0e-6;
 const CREASE_TOLERANCE: f64 = 1.0e-6;
@@ -444,12 +445,33 @@ fn input_mesh(spec: &Value) -> TestResult<Mesh> {
         .iter()
         .map(point)
         .collect::<TestResult<Vec<_>>>()?;
-    let faces = spec["faces"]
+    let logical_faces: Vec<Vec<usize>> = spec["faces"]
         .as_array()
         .ok_or("mesh faces missing")?
         .iter()
         .map(indices)
-        .collect::<TestResult<Vec<_>>>()?;
+        .collect::<TestResult<_>>()?;
+    // A rotated-storage input stores face f's corners rotated by (f + 1) mod n and attaches
+    // Blender's loop order as corner_order. Blender's result for the unrotated mesh is the reference.
+    let rotated_storage = spec["rotated_storage"]
+        .as_bool()
+        .ok_or("mesh rotated_storage flag missing")?;
+    let shifts: Vec<usize> = logical_faces
+        .iter()
+        .enumerate()
+        .map(|(index, face)| {
+            if rotated_storage {
+                (index + 1) % face.len()
+            } else {
+                0
+            }
+        })
+        .collect();
+    let faces: Vec<Vec<usize>> = logical_faces
+        .iter()
+        .zip(&shifts)
+        .map(|(face, &shift)| rotated(face, shift))
+        .collect();
     let mut mesh = Mesh::from_positions_and_faces(vertices, faces)?;
     let material_values = spec["materials"]
         .as_array()
@@ -588,14 +610,14 @@ fn input_mesh(spec: &Value) -> TestResult<Mesh> {
         }
         let mut offset = 0;
         let mut layer_faces = Vec::with_capacity(mesh.faces.len());
-        for face in &mesh.faces {
+        for (face, &shift) in mesh.faces.iter().zip(&shifts) {
             let end = offset + face.vertices.len();
             if end > values.len() {
                 return Err(format!("UV layer {name} is shorter than input loops").into());
             }
-            let mut entry = json!({"face_id": face.id, "uv": values[offset..end]});
+            let mut entry = json!({"face_id": face.id, "uv": rotated(&values[offset..end], shift)});
             if let Some(pins) = &pins {
-                entry["pinned"] = json!(pins[offset..end]);
+                entry["pinned"] = json!(rotated(&pins[offset..end], shift));
             }
             layer_faces.push(entry);
             offset = end;
@@ -642,24 +664,61 @@ fn input_mesh(spec: &Value) -> TestResult<Mesh> {
         .ok_or("mesh custom normal codes missing")?;
     let mut corner = 0;
     let mut normal_values = Map::new();
-    for face in &mesh.faces {
-        let end = corner + face.vertices.len();
+    let mut corner_order = Map::new();
+    for (face, &shift) in mesh.faces.iter().zip(&shifts) {
+        let len = face.vertices.len();
+        let end = corner + len;
         if end > source_codes.len() {
             return Err("source custom normal codes do not cover every corner".into());
         }
         normal_values.insert(
             format!("f{}", face.id),
-            Value::Array(source_codes[corner..end].to_vec()),
+            Value::Array(rotated(&source_codes[corner..end], shift)),
+        );
+        corner_order.insert(
+            format!("f{}", face.id),
+            Value::Array(
+                (0..len)
+                    .map(|k| json!(corner + (k + shift) % len))
+                    .collect(),
+            ),
         );
         corner = end;
     }
     if corner != source_codes.len() {
         return Err("source custom normal codes contain extra corners".into());
     }
-    mesh.attributes.insert(
-        "custom_normal".to_owned(),
-        json!({"domain": "corner", "type": "normal_code", "values": normal_values}),
-    );
+    let mut layer = json!({"domain": "corner", "type": "normal_code", "values": normal_values});
+    if rotated_storage {
+        layer["corner_order"] = Value::Object(corner_order);
+    }
+    mesh.attributes.insert("custom_normal".to_owned(), layer);
+
+    let vertex_creases = spec["vertex_creases"]
+        .as_array()
+        .ok_or("mesh vertex creases missing")?
+        .iter()
+        .map(|item| -> TestResult<(usize, f64)> {
+            let values = item.as_array().ok_or("vertex crease must be an array")?;
+            if values.len() != 2 {
+                return Err("vertex crease must have a vertex and a value".into());
+            }
+            let vertex = usize::try_from(values[0].as_u64().ok_or("vertex crease index missing")?)?;
+            Ok((vertex, number(&values[1])?))
+        })
+        .collect::<TestResult<BTreeMap<_, _>>>()?;
+    if !vertex_creases.is_empty() {
+        let mut values = Map::new();
+        for (index, vertex) in mesh.vertices.iter().enumerate() {
+            if let Some(&value) = vertex_creases.get(&index) {
+                values.insert(format!("v{}", vertex.id), json!(value));
+            }
+        }
+        mesh.attributes.insert(
+            "crease_vert".to_owned(),
+            json!({"domain": "point", "type": "float", "values": values}),
+        );
+    }
     Ok(mesh)
 }
 
@@ -877,6 +936,14 @@ fn compare_shapes(actual: &Shape, expected: &Shape) -> Result<Errors, String> {
         for ((actual_face, actual_rotation), (expected_face, expected_rotation)) in
             actual_list.iter().zip(expected_list)
         {
+            // Both faces must start at the same corner, so their per-corner data lines up.
+            if to_expected[actual_clusters[actual_face.vertices[0]]]
+                != expected_clusters[expected_face.vertices[0]]
+            {
+                return Err(format!(
+                    "face {cycle:?} starts at a different corner than Blender's face"
+                ));
+            }
             if actual_face.smooth != expected_face.smooth {
                 return Err(format!("face {cycle:?} polygon interpolation flag differs"));
             }
@@ -919,9 +986,7 @@ fn compare_shapes(actual: &Shape, expected: &Shape) -> Result<Errors, String> {
                 (Some(actual_codes), Some(expected_codes)) => {
                     let actual_codes = rotated(actual_codes, *actual_rotation);
                     let expected_codes = rotated(expected_codes, *expected_rotation);
-                    // Blender 5.2.2 linux-x64 and macOS arm64 differ by one beta step at 11 of 2,656
-                    // loop codes, never in alpha; OpenSubdiv contracts FMA on arm64 (see
-                    // build_environment/cmake/options.cmake). Alpha must match, beta may differ by one.
+                    // Platform variance: see tests/common/blender_code_tolerance.rs.
                     let within_variance = actual_codes.len() == expected_codes.len()
                         && actual_codes
                             .iter()
@@ -1040,14 +1105,6 @@ fn subdivision_surface_matches_blender_522_across_the_modifier_matrix() -> TestR
     let oracle: Value = serde_json::from_str(ORACLE)?;
     assert_eq!(oracle["blender_version"], "5.2.2 LTS");
     assert_eq!(oracle["round_digits"], 7);
-    let max_serialization_error = oracle["max_serialization_rounding_error"]
-        .as_str()
-        .ok_or("fixture rounding metadata missing")?
-        .parse::<f64>()?;
-    assert!(
-        max_serialization_error <= 5.1e-8,
-        "fixture max serialization rounding error {max_serialization_error:.9e} exceeds the seven-decimal bound"
-    );
     let meshes = oracle["meshes"]
         .as_object()
         .ok_or("oracle mesh inputs missing")?;
@@ -1089,7 +1146,7 @@ fn subdivision_surface_matches_blender_522_across_the_modifier_matrix() -> TestR
         failures.join("\n")
     );
     eprintln!(
-        "subdivision corpus: {} cases; worst position {:.3e}, UV {:.3e}, crease {:.3e}; custom-normal code pairs exact",
+        "subdivision corpus: {} cases; worst position {:.3e}, UV {:.3e}, crease {:.3e}; custom-normal codes within alpha-exact, beta ±1",
         cases.len(),
         worst.position,
         worst.uv,
@@ -1103,7 +1160,7 @@ fn subdivision_surface_matches_blender_522_across_the_modifier_matrix() -> TestR
 fn assert_matrix_coverage(cases: &[Value], meshes: &Map<String, Value>) -> TestResult {
     assert_eq!(
         cases.len(),
-        147,
+        175,
         "the complete Blender oracle corpus is required"
     );
     let mut levels = BTreeSet::new();
@@ -1283,7 +1340,7 @@ fn assert_matrix_coverage(cases: &[Value], meshes: &Map<String, Value>) -> TestR
     );
     assert_eq!(
         crease_values,
-        BTreeSet::from([10, 25, 30, 50, 60, 75, 80, 90, 100]),
+        BTreeSet::from([10, 20, 25, 30, 50, 60, 75, 80, 90, 100]),
         "crease input values"
     );
     assert_eq!(
@@ -1384,9 +1441,40 @@ fn assert_matrix_coverage(cases: &[Value], meshes: &Map<String, Value>) -> TestR
         "dependent_uv_plus2",
         "loose",
         "curved_grid",
+        "l_sharp_plane",
+        "plane_crease",
+        "plane_border_crease",
+        "cube_crease_0_2",
+        "quad_all_crease",
+        "loose_corner",
+        "uv_group",
+        "cube_rotated_storage",
+        "ngon_rotated_storage",
+        "mixed_rotated_storage",
+        "vertex_crease_grid",
+        "vertex_crease_cube",
     ] {
         assert!(used_meshes.contains(mesh), "{mesh} must be in the corpus");
     }
+    for mesh in [
+        "cube_rotated_storage",
+        "ngon_rotated_storage",
+        "mixed_rotated_storage",
+    ] {
+        assert_eq!(
+            meshes[mesh]["rotated_storage"],
+            json!(true),
+            "{mesh} must store rotated corners"
+        );
+    }
+    let sharp_inputs = meshes["l_sharp_plane"]["sharp_edges"]
+        .as_array()
+        .ok_or("L-crease sharp edges missing")?;
+    assert_eq!(
+        sharp_inputs.len(),
+        2,
+        "the L-shaped crease needs two sharp edges"
+    );
     for mesh in ["curved_grid", "cube", "ngon", "nonmanifold", "mixed"] {
         let seams = meshes[mesh]["seams"]
             .as_array()

@@ -32,27 +32,31 @@ def rounded(value):
     raise TypeError(type(value).__name__)
 
 
-def max_rounding_error(value):
-    if isinstance(value, dict):
-        return max((max_rounding_error(item) for item in value.values()), default=0.0)
-    if isinstance(value, (list, tuple)):
-        return max((max_rounding_error(item) for item in value), default=0.0)
-    if isinstance(value, bool) or value is None or isinstance(value, str):
-        return 0.0
-    if isinstance(value, (int, float)):
-        return abs(float(value) - round(float(value), ROUND_DIGITS))
-    if hasattr(value, "to_tuple"):
-        return max_rounding_error(value.to_tuple())
-    raise TypeError(type(value).__name__)
-
-
 def edge_key(a, b):
     return tuple(sorted((int(a), int(b))))
 
 
-def make_mesh(vertices, faces, seams=(), creases=(), loose_edges=(), smooth=None, materials=None):
+def face_edge_counts(faces):
+    counts = {}
+    for face in faces:
+        for index, vertex in enumerate(face):
+            key = edge_key(vertex, face[(index + 1) % len(face)])
+            counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def all_edges(faces):
+    return sorted(face_edge_counts(faces))
+
+
+def border_edges(faces):
+    return [edge for edge, count in sorted(face_edge_counts(faces).items()) if count == 1]
+
+
+def make_mesh(vertices, faces, seams=(), creases=(), loose_edges=(), smooth=None, materials=None,
+              sharp_edges=(), vertex_creases=(), rotated_storage=False, custom_normals=None):
     uv_layers = [{"name": "UVMap", "values": []}, {"name": "Secondary", "values": []}]
-    custom_normals = []
+    generated_normals = []
     for face_index, face in enumerate(faces):
         shift = 0.37 if face_index % 2 else 0.0
         for corner, vertex_index in enumerate(face):
@@ -63,7 +67,7 @@ def make_mesh(vertices, faces, seams=(), creases=(), loose_edges=(), smooth=None
                       -0.11 + 0.015 * vertex_index,
                       1.0 + 0.03 * x - 0.02 * y + 0.01 * z)
             length = math.sqrt(sum(component * component for component in vector))
-            custom_normals.append([component / length for component in vector])
+            generated_normals.append([component / length for component in vector])
     return {
         "vertices": vertices,
         "faces": faces,
@@ -74,7 +78,10 @@ def make_mesh(vertices, faces, seams=(), creases=(), loose_edges=(), smooth=None
         "vertex_groups": {},
         "seams": [list(edge) for edge in sorted({edge_key(*edge) for edge in seams})],
         "creases": [[int(a), int(b), float(value)] for a, b, value in creases],
-        "custom_normals": custom_normals,
+        "sharp_edges": [list(edge) for edge in sorted({edge_key(*edge) for edge in sharp_edges})],
+        "vertex_creases": [[int(vertex), float(value)] for vertex, value in vertex_creases],
+        "rotated_storage": bool(rotated_storage),
+        "custom_normals": generated_normals if custom_normals is None else custom_normals,
     }
 
 
@@ -103,9 +110,9 @@ def grid_meshes():
 def fixture_set():
     grid_vertices, grid_faces, grid_seams = grid_meshes()
     grid = make_mesh(grid_vertices, grid_faces, grid_seams)
-    quad = make_mesh([[-1.0, -0.8, 0.12], [1.1, -0.8, -0.07],
-                      [1.0, 0.9, 0.21], [-0.9, 0.8, -0.16]],
-                     [[0, 1, 2, 3]], [(0, 1), (2, 3)])
+    quad_vertices = [[-1.0, -0.8, 0.12], [1.1, -0.8, -0.07],
+                     [1.0, 0.9, 0.21], [-0.9, 0.8, -0.16]]
+    quad = make_mesh(quad_vertices, [[0, 1, 2, 3]], [(0, 1), (2, 3)])
     quad["uv_layers"][0]["pinned"] = [True, False, False, False]
     quad["vertex_groups"] = {"Ramp": [0.1, 0.35, 0.65, 0.9]}
     cube_vertices = [[-1, -1, -1], [1, -1, -1], [1, 1, -1], [-1, 1, -1],
@@ -179,6 +186,44 @@ def fixture_set():
                    [2.2, 0.4], [2.03, 0.4], [2.2, 0.27], [2.37, 0.4]],
     }]
     meshes["dependent_uv_plus2"] = dependent_plus2
+    plane_vertices = [[x, y, 0.1 * x * x - 0.05 * y * y + 0.03 * x * y]
+                      for y in (-1.0, 0.0, 1.0) for x in (-1.0, 0.0, 1.0)]
+    # Vertex 4 is the interior vertex at the centre; faces are stored top row first.
+    plane_faces = [[3, 4, 7, 6], [4, 5, 8, 7], [0, 1, 4, 3], [1, 2, 5, 4]]
+    # Sharp edges 3-4 and 1-4 form an L at vertex 4, and both lie in face [0, 1, 4, 3].
+    # Uniform custom normals: the setter splits fans only where custom normals disagree, so the
+    # generator's varying normals would add sharp edges and erase the L.
+    meshes["l_sharp_plane"] = make_mesh(plane_vertices, plane_faces, sharp_edges=[(3, 4), (1, 4)],
+                                        custom_normals=[[0.0, 0.0, 1.0]] * 16)
+    meshes["plane_crease"] = make_mesh(plane_vertices, plane_faces,
+                                       creases=[(a, b, 0.2) for a, b in all_edges(plane_faces)])
+    meshes["plane_border_crease"] = make_mesh(
+        plane_vertices, plane_faces, creases=[(a, b, 1.0) for a, b in border_edges(plane_faces)])
+    # Corner UVs at vertex 4 in face order are a, c, b, then one distinct value. Blender groups
+    # a, b and c (a and b are 0.9e-4 apart, b and c 0.6e-4 apart), so the grouping order matters.
+    meshes["uv_group"] = make_mesh(plane_vertices, plane_faces)
+    uv_values = meshes["uv_group"]["uv_layers"][0]["values"]
+    uv_values[1] = [0.0, 0.0]
+    uv_values[4] = [1.5e-4, 0.0]
+    uv_values[10] = [0.9e-4, 0.0]
+    uv_values[15] = [0.5, 0.5]
+    meshes["cube_crease_0_2"] = make_mesh(cube_vertices, cube_faces, cube_seams,
+                                          [(a, b, 0.2) for a, b in all_edges(cube_faces)])
+    meshes["quad_all_crease"] = make_mesh(quad_vertices, [[0, 1, 2, 3]], [(0, 1), (2, 3)],
+                                          [(a, b, 1.0) for a, b in all_edges([[0, 1, 2, 3]])])
+    meshes["loose_corner"] = make_mesh(quad_vertices + [[2.0, 0.2, 0.3]], [[0, 1, 2, 3]],
+                                       [(0, 1), (2, 3)], loose_edges=[(2, 4)])
+    meshes["cube_rotated_storage"] = make_mesh(cube_vertices, cube_faces, cube_seams,
+                                               [(0, 1, 0.25), (2, 3, 0.75)], rotated_storage=True)
+    meshes["ngon_rotated_storage"] = make_mesh(ngon_vertices, [list(range(7))],
+                                               [(0, 1), (2, 3), (4, 5)], rotated_storage=True)
+    meshes["mixed_rotated_storage"] = make_mesh(mixed["vertices"], mixed["faces"],
+                                                [(0, 1), (3, 0), (6, 7)], [(1, 2, 0.5)],
+                                                rotated_storage=True)
+    meshes["vertex_crease_grid"] = make_mesh(grid_vertices, grid_faces, grid_seams,
+                                             vertex_creases=[(5, 1.0), (6, 0.5), (1, 0.3)])
+    meshes["vertex_crease_cube"] = make_mesh(cube_vertices, cube_faces, cube_seams,
+                                             vertex_creases=[(0, 1.0), (6, 0.5)])
     return meshes
 
 
@@ -304,6 +349,55 @@ def build_cases():
     add("loose_l2_q2", "loose", levels=2, quality=2, use_creases=True)
     add("loose_l1_q4", "loose", levels=1, quality=4, use_limit_surface=True)
     add("flat_cube_l2_q3", "cube_flat", levels=2, quality=3)
+    # L-shaped infinite crease, with and without the limit surface, levels 1 and 2. Level 2 keeps the
+    # two perpendicular sharp edges at interior vertex 4 sharing face [0, 1, 4, 3].
+    add("l_sharp_plane_l1", "l_sharp_plane", levels=1, use_creases=True,
+        uv_smooth="PRESERVE_CORNERS_AND_JUNCTIONS")
+    add("l_sharp_plane_l2", "l_sharp_plane", levels=2, use_creases=True,
+        uv_smooth="PRESERVE_CORNERS_AND_JUNCTIONS")
+    add("l_sharp_plane_l2_concave", "l_sharp_plane", levels=2, use_creases=True,
+        uv_smooth="PRESERVE_CORNERS_JUNCTIONS_AND_CONCAVE")
+    add("l_sharp_plane_l1_nolimit", "l_sharp_plane", levels=1, use_creases=True,
+        use_limit_surface=False, uv_smooth="PRESERVE_CORNERS_AND_JUNCTIONS")
+    add("l_sharp_plane_l2_nolimit", "l_sharp_plane", levels=2, use_creases=True,
+        use_limit_surface=False, uv_smooth="PRESERVE_CORNERS_AND_JUNCTIONS")
+    # Limit surface off with every edge creased at 0.2: uniform positions use the crease rules.
+    for level in (1, 2):
+        add(f"nolimit_cube_crease_0_2_l{level}", "cube_crease_0_2", levels=level,
+            use_creases=True, use_limit_surface=False)
+        add(f"nolimit_plane_crease_0_2_l{level}", "plane_crease", levels=level,
+            use_creases=True, use_limit_surface=False)
+    # Rotated storage: each face's stored corners are rotated by (face + 1) mod n, with the Blender
+    # loop order attached as corner_order. Blender's own result is the unrotated mesh's.
+    add("rotated_storage_cube_l2", "cube_rotated_storage", levels=2, use_creases=True)
+    add("rotated_storage_cube_custom_l2", "cube_rotated_storage", levels=2, use_custom_normals=True)
+    add("rotated_storage_ngon_custom_l2", "ngon_rotated_storage", levels=2, quality=3,
+        use_custom_normals=True)
+    add("rotated_storage_mixed_custom_l2", "mixed_rotated_storage", levels=2,
+        use_custom_normals=True, uv_smooth="PRESERVE_CORNERS_AND_JUNCTIONS")
+    # Creases of 1.0 on the border of a plane (corners have exactly two edges) and on every edge of
+    # a single quad, with boundary_smooth ALL.
+    for level in (1, 2):
+        add(f"plane_border_crease_l{level}", "plane_border_crease", levels=level, use_creases=True)
+        add(f"quad_all_crease_l{level}", "quad_all_crease", levels=level, use_creases=True)
+    # A loose edge touching face corner 2 makes that corner infinitely sharp.
+    add("loose_corner_l1_q2", "loose_corner", levels=1, quality=2, use_creases=True)
+    add("loose_corner_l2_q4", "loose_corner", levels=2, quality=4, use_creases=True)
+    # Depth-2 seams with creases: UV selection must follow the same topology as positions.
+    add("seams_uv_depth2_junctions", "grid_crease_0_5", levels=2, quality=4, use_creases=True,
+        uv_smooth="PRESERVE_CORNERS_AND_JUNCTIONS")
+    add("seams_uv_depth2_concave", "grid_crease_0_5", levels=2, quality=4, use_creases=True,
+        uv_smooth="PRESERVE_CORNERS_JUNCTIONS_AND_CONCAVE")
+    # Corner UV grouping at vertex 4 (see fixture_set).
+    add("uv_group_l1_smooth_all", "uv_group", levels=1, uv_smooth="SMOOTH_ALL")
+    add("uv_group_l2_preserve_corners", "uv_group", levels=2, uv_smooth="PRESERVE_CORNERS")
+    add("uv_group_l2_smooth_all", "uv_group", levels=2, uv_smooth="SMOOTH_ALL")
+    # Vertex creases (crease_vert), used when Use Creases is on.
+    add("vertex_crease_grid_l2", "vertex_crease_grid", levels=2, quality=4, use_creases=True)
+    add("vertex_crease_grid_l1_q1", "vertex_crease_grid", levels=1, quality=1, use_creases=True)
+    add("vertex_crease_grid_nolimit_l2", "vertex_crease_grid", levels=2, use_creases=True,
+        use_limit_surface=False)
+    add("vertex_crease_cube_l2", "vertex_crease_cube", levels=2, use_creases=True)
     return cases
 
 
@@ -346,8 +440,6 @@ def output_mesh(obj, params):
                 "smooth": bool(polygon.use_smooth),
                 "material": int(polygon.material_index),
             }
-            if mesh.has_custom_normals:
-                face["normals"] = [list(mesh.corner_normals[index].vector) for index in loops]
             normal_attribute = mesh.attributes.get("custom_normal")
             if normal_attribute is not None:
                 face["normal_codes"] = [
@@ -367,8 +459,7 @@ def output_mesh(obj, params):
                     group_weights[group_name][vertex.index] = float(membership.weight)
         return {"vertices": [list(vertex.co) for vertex in mesh.vertices], "edges": edges,
                 "faces": faces, "vertex_groups": group_weights,
-                "has_custom_normals": bool(mesh.has_custom_normals),
-                "normals_domain": str(mesh.normals_domain)}
+                "has_custom_normals": bool(mesh.has_custom_normals)}
     finally:
         evaluated.to_mesh_clear()
 
@@ -381,12 +472,19 @@ def make_object(name, spec):
     for material_index in range(max(material_indices, default=0) + 1):
         mesh.materials.append(bpy.data.materials.new(f"{name}Material{material_index}"))
     seam_set = {edge_key(*edge) for edge in spec["seams"]}
+    sharp_set = {edge_key(*edge) for edge in spec["sharp_edges"]}
     crease_values = {edge_key(*edge[:2]): float(edge[2]) for edge in spec["creases"]}
     crease = mesh.attributes.new(name="crease_edge", type="FLOAT", domain="EDGE")
     for edge in mesh.edges:
         key = edge_key(*edge.vertices)
         edge.use_seam = key in seam_set
+        edge.use_edge_sharp = key in sharp_set
         crease.data[edge.index].value = crease_values.get(key, 0.0)
+    vertex_crease_values = {int(vertex): float(value) for vertex, value in spec["vertex_creases"]}
+    if vertex_crease_values:
+        vertex_crease = mesh.attributes.new(name="crease_vert", type="FLOAT", domain="POINT")
+        for vertex in mesh.vertices:
+            vertex_crease.data[vertex.index].value = vertex_crease_values.get(vertex.index, 0.0)
     for spec_layer in spec["uv_layers"]:
         layer = mesh.uv_layers.new(name=spec_layer["name"])
         for index, value in enumerate(spec_layer["values"]):
@@ -442,9 +540,6 @@ def main():
     oracle = {"generator": "tests/fixtures/pr16_subdivision/generate.py",
               "blender_version": bpy.app.version_string, "round_digits": ROUND_DIGITS,
               "meshes": meshes, "cases": rounded(results)}
-    expected_results = [result["expected"] for result in results]
-    oracle["max_serialization_rounding_error"] = (
-        f"{max_rounding_error(expected_results):.12g}")
     with open(output_path, "w", encoding="utf-8", newline="\n") as output:
         json.dump(oracle, output, sort_keys=True, separators=(",", ":"))
         output.write("\n")
