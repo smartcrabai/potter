@@ -54,79 +54,7 @@ fn param_table() -> Value {
     serde_json::from_str(PARAM_TABLE).unwrap()
 }
 
-fn write_mesh_cache(directory: &Path, format: &str) -> std::path::PathBuf {
-    const POINTS: [[f32; 3]; 8] = [
-        [-1.0, -1.0, -1.0],
-        [1.0, -1.0, -1.0],
-        [1.0, 1.0, -1.0],
-        [-1.0, 1.0, -1.0],
-        [-1.0, -1.0, 1.0],
-        [1.0, -1.0, 1.0],
-        [1.0, 1.0, 1.0],
-        [-1.0, 1.0, 1.0],
-    ];
-    let (path, bytes) = if format == "PC2" {
-        let mut bytes = b"POINTCACHE2\0".to_vec();
-        bytes.extend_from_slice(&1_i32.to_le_bytes());
-        bytes.extend_from_slice(&8_i32.to_le_bytes());
-        bytes.extend_from_slice(&1.0_f32.to_le_bytes());
-        bytes.extend_from_slice(&1.0_f32.to_le_bytes());
-        bytes.extend_from_slice(&2_i32.to_le_bytes());
-        for offset in [0.0_f32, 2.0] {
-            for [x, y, z] in POINTS {
-                bytes.extend_from_slice(&(x + offset).to_le_bytes());
-                bytes.extend_from_slice(&y.to_le_bytes());
-                bytes.extend_from_slice(&z.to_le_bytes());
-            }
-        }
-        (directory.join("guard.pc2"), bytes)
-    } else {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&2_i32.to_be_bytes());
-        bytes.extend_from_slice(&8_i32.to_be_bytes());
-        bytes.extend_from_slice(&0.0_f32.to_be_bytes());
-        bytes.extend_from_slice(&1.0_f32.to_be_bytes());
-        for offset in [0.0_f32, 2.0] {
-            for [x, y, z] in POINTS {
-                bytes.extend_from_slice(&(x + offset).to_be_bytes());
-                bytes.extend_from_slice(&y.to_be_bytes());
-                bytes.extend_from_slice(&z.to_be_bytes());
-            }
-        }
-        (directory.join("guard.mdd"), bytes)
-    };
-    fs::write(&path, bytes).unwrap();
-    path
-}
-
-fn write_sequence_cache(directory: &Path) -> std::path::PathBuf {
-    let source = directory.join("sequence_source");
-    init_scene(&source);
-    let operations = [json!({"op":"node.create","id":"body","kind":"box","params":{"size":2}})];
-    let applied = apply_operations(&source, &operations);
-    assert!(
-        applied.status.success(),
-        "{}",
-        String::from_utf8_lossy(&applied.stdout)
-    );
-    let archive = directory.join("guard.abc");
-    let exported = pot()
-        .args(["export"])
-        .arg(&source)
-        .args(["--format", "alembic", "--allow-lossy", "--out"])
-        .arg(&archive)
-        .args(["--overwrite", "--json"])
-        .output()
-        .unwrap();
-    assert!(
-        exported.status.success(),
-        "{}",
-        String::from_utf8_lossy(&exported.stdout)
-    );
-    archive
-}
-
-fn scene_operations(modifier: &str, params: &Map<String, Value>, directory: &Path) -> Vec<Value> {
+fn scene_operations(modifier: &str, params: &Map<String, Value>) -> Vec<Value> {
     let weights = |weight: f64| -> Vec<Value> {
         (0..8)
             .map(|vertex| json!({"vertex_id": vertex, "weight": weight}))
@@ -171,17 +99,6 @@ fn scene_operations(modifier: &str, params: &Map<String, Value>, directory: &Pat
         json!({"op":"vertex_group.assign","target":{"id":"body"},"group_id":GUARD_GROUP_ALT,"weights":weights(0.5)}),
         json!({"op":"physics.particle_emitter.create","target":{"id":GUARD_TARGET},"settings":{"emit_from":"VERT","count":2,"frame_start":1.0,"frame_end":1.0,"lifetime":12.0,"physics_type":"NEWTON","normal_factor":0.8,"seed":3}}),
     ];
-    if modifier == "mesh_cache" {
-        let format = params
-            .get("cache_format")
-            .and_then(Value::as_str)
-            .unwrap_or("MDD");
-        let cache = write_mesh_cache(directory, format);
-        operations.push(json!({"op":"resource.pack","id":"guard_cache","uri":cache.to_string_lossy(),"kind":"mesh_cache"}));
-    } else if modifier == "mesh_sequence_cache" {
-        let archive = write_sequence_cache(directory);
-        operations.push(json!({"op":"resource.pack","id":"guard_sequence_cache","uri":archive.to_string_lossy(),"kind":"alembic"}));
-    }
     if modifier == "explode" {
         operations.push(json!({"op":"physics.particle_emitter.create","target":{"id":"body"},"settings":{"emit_from":"VERT","count":2,"frame_start":1.0,"frame_end":1.0,"lifetime":12.0,"physics_type":"NEWTON","normal_factor":0.8,"seed":3}}));
     }
@@ -265,10 +182,7 @@ fn operation_rejection(modifier: &str, params: &Map<String, Value>) -> Option<St
     let directory = tempdir().unwrap();
     let scene = directory.path().join("scene");
     init_scene(&scene);
-    let apply = apply_operations(
-        &scene,
-        &scene_operations(modifier, params, directory.path()),
-    );
+    let apply = apply_operations(&scene, &scene_operations(modifier, params));
     if apply.status.success() {
         return None;
     }

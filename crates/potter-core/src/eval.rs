@@ -1120,18 +1120,12 @@ impl Snapshot {
                             ),
                             "mesh_cache" => apply_mesh_cache_modifier(
                                 mesh,
-                                data_block
-                                    .mesh
-                                    .as_ref()
-                                    .filter(|_| data_block.data_type == "mesh"),
                                 modifier,
                                 doc,
-                                id,
                                 modifier_context.project_root,
                                 frame,
                                 scene.fps,
                                 scene.fps_base,
-                                modifier_warnings,
                             ),
                             "cloth" | "soft_body" | "collision" | "dynamic_paint" | "fluid"
                             | "particle_system" => apply_stack_physics_modifier(
@@ -1428,18 +1422,12 @@ impl Snapshot {
                             ),
                             "mesh_cache" => apply_mesh_cache_modifier(
                                 mesh,
-                                data_block
-                                    .mesh
-                                    .as_ref()
-                                    .filter(|_| data_block.data_type == "mesh"),
                                 modifier,
                                 doc,
-                                id,
                                 modifier_context.project_root,
                                 frame,
                                 scene.fps,
                                 scene.fps_base,
-                                modifier_warnings,
                             ),
                             "cloth" | "soft_body" | "collision" | "dynamic_paint" | "fluid"
                             | "particle_system" => apply_stack_physics_modifier(
@@ -3380,36 +3368,24 @@ pub(crate) fn apply_scene_deform_modifier(
 
 fn apply_mesh_cache_modifier(
     mesh: &mut Mesh,
-    source_mesh: Option<&Mesh>,
     modifier: &Modifier,
     doc: &SceneDoc,
-    node_id: &Id,
     project_root: Option<&Path>,
     frame: f64,
     fps: u32,
     fps_base: f64,
-    modifier_warnings: &mut Vec<PotError>,
 ) -> Result<()> {
-    if modifier
+    let resource_text = modifier
         .params
-        .get("factor")
-        .and_then(Value::as_f64)
-        .is_some_and(|factor| factor <= 0.0)
-    {
-        return Ok(());
-    }
-    let resource_text = match modifier.params.get("resource") {
-        None | Some(Value::Null) => return Ok(()),
-        Some(Value::String(resource)) if resource.is_empty() => return Ok(()),
-        Some(Value::String(resource)) => resource.as_str(),
-        Some(_) => {
-            return Err(PotError::with_details(
+        .get("resource")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            PotError::with_details(
                 ErrorCode::InvalidArgument,
                 "Mesh Cache resource must be a resource ID",
                 json!({"modifier_id":modifier.id,"parameter":"resource"}),
-            ));
-        }
-    };
+            )
+        })?;
     let resource_id = Id::new(resource_text.to_owned()).map_err(|error| {
         PotError::with_details(
             ErrorCode::InvalidArgument,
@@ -3417,30 +3393,10 @@ fn apply_mesh_cache_modifier(
             json!({"modifier_id":modifier.id,"resource":resource_text}),
         )
     })?;
-    if doc.resources.get(&resource_id).is_some_and(|resource| {
-        resource
-            .get("uri")
-            .and_then(Value::as_str)
-            .is_some_and(|uri| uri.trim().is_empty())
-    }) {
-        return Ok(());
-    }
     let (bytes, _) = read_cache_resource(doc, project_root, &resource_id)?;
-    let cache_warnings = crate::geom::modifiers::attributes::evaluate_mesh_cache(
-        mesh,
-        source_mesh,
-        modifier,
-        frame,
-        fps,
-        fps_base,
-        &bytes,
-    )?;
-    modifier_warnings.extend(
-        cache_warnings
-            .into_iter()
-            .map(|warning| attach_node_owner(warning, node_id)),
-    );
-    Ok(())
+    crate::geom::modifiers::attributes::evaluate_mesh_cache(
+        mesh, modifier, frame, fps, fps_base, &bytes,
+    )
 }
 
 fn apply_mesh_sequence_cache_modifier(
