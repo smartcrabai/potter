@@ -1260,7 +1260,15 @@ fn legacy_mesh_deform_bind_is_cleared_on_load_and_rebinds() -> TestResult {
     let scene_file = scene.join("scene.json");
     let mut head: Value = serde_json::from_slice(&fs::read(&scene_file)?)?;
     head["nodes"]["subject"]["modifiers"][0]["binding_data"] = legacy_mesh_deform_bind();
-    fs::write(&scene_file, serde_json::to_vec(&head)?)?;
+    let legacy_bytes = serde_json::to_vec(&head)?;
+    let legacy_hash = potter_core::hash::sha256(&legacy_bytes);
+    let legacy_hash = legacy_hash.strip_prefix("sha256:").unwrap_or(&legacy_hash);
+    let preserved_path = scene
+        .join("compat")
+        .join("sha256")
+        .join(legacy_hash)
+        .join("scene.json");
+    fs::write(&scene_file, &legacy_bytes)?;
 
     // Loading clears the bind, names the modifier, and says that a rebind is required.
     let parsed = potter_core::model::migrate::parse_scene(&fs::read(&scene_file)?)?;
@@ -1315,6 +1323,10 @@ fn legacy_mesh_deform_bind_is_cleared_on_load_and_rebinds() -> TestResult {
 
     // Rebinding at the cage's current pose is accepted, and later cage motion deforms the subject again.
     applied(&apply_at_head(&scene, &Value::Array(vec![bind("deform")]))?)?;
+    let preserved = fs::read(&preserved_path)?;
+    if preserved != legacy_bytes {
+        return Err("the original legacy Mesh Deform scene bytes were not preserved".into());
+    }
     assert_close(
         &evaluated_subject(&scene)?,
         &rest,
