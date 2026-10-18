@@ -235,10 +235,7 @@ pub(crate) struct CacheSequenceManifest {
 }
 
 /// Resolve one frame from a CacheFile sequence, rejecting a symlink outside its pattern directory.
-pub(crate) fn cache_sequence_frame_path(
-    path: &Path,
-    frame: i32,
-) -> Result<Option<PathBuf>> {
+pub(crate) fn cache_sequence_frame_path(path: &Path, frame: i32) -> Result<Option<PathBuf>> {
     let Some(pattern) = cache_sequence_pattern(path) else {
         return Ok(None);
     };
@@ -274,10 +271,7 @@ pub(crate) fn cache_sequence_frame_path(
 }
 
 /// Resolve an output filename from a numbered CacheFile path, rejecting symlink destinations.
-pub(crate) fn cache_sequence_output_path(
-    path: &Path,
-    frame: i32,
-) -> Result<Option<PathBuf>> {
+pub(crate) fn cache_sequence_output_path(path: &Path, frame: i32) -> Result<Option<PathBuf>> {
     let Some(pattern) = cache_sequence_pattern(path) else {
         return Ok(None);
     };
@@ -348,13 +342,16 @@ pub(crate) fn cache_sequence_manifest(
             ));
         }
         for frame in start..=end {
-            frames.insert(frame, pattern.path_for_frame(frame).ok_or_else(|| {
-                PotError::with_details(
-                    ErrorCode::InvalidArgument,
-                    "Alembic sequence path has no parent directory",
-                    json!({"path":path,"frame":frame}),
-                )
-            })?);
+            frames.insert(
+                frame,
+                pattern.path_for_frame(frame).ok_or_else(|| {
+                    PotError::with_details(
+                        ErrorCode::InvalidArgument,
+                        "Alembic sequence path has no parent directory",
+                        json!({"path":path,"frame":frame}),
+                    )
+                })?,
+            );
         }
     } else {
         for entry in fs::read_dir(&directory).map_err(|error| PotError::io(&error))? {
@@ -372,9 +369,7 @@ pub(crate) fn cache_sequence_manifest(
     for (frame, frame_path) in frames {
         let canonical = match fs::canonicalize(&frame_path) {
             Ok(canonical) => canonical,
-            Err(error) if frame_range.is_none()
-                && error.kind() == std::io::ErrorKind::NotFound =>
-            {
+            Err(error) if frame_range.is_none() && error.kind() == std::io::ErrorKind::NotFound => {
                 continue;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {

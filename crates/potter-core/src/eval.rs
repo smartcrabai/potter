@@ -1790,94 +1790,7 @@ pub(crate) fn read_cache_resource(
             json!({"resource_id":resource_id}),
         )
     })?;
-    let expected_hash = resource
-        .get("hash")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            PotError::with_details(
-                ErrorCode::SceneInvalid,
-                "Alembic cache resource has no expected content hash",
-                json!({"resource_id":resource_id}),
-            )
-        })?;
-    let bytes = if resource.get("packed").and_then(serde_json::Value::as_bool) == Some(true) {
-        let values = resource
-            .get("bytes")
-            .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| {
-                PotError::with_details(
-                    ErrorCode::SceneInvalid,
-                    "packed Alembic cache resource has no byte payload",
-                    json!({"resource_id":resource_id}),
-                )
-            })?;
-        values
-            .iter()
-            .enumerate()
-            .map(|(index, value)| {
-                value
-                    .as_u64()
-                    .and_then(|byte| u8::try_from(byte).ok())
-                    .ok_or_else(|| {
-                        PotError::with_details(
-                            ErrorCode::SceneInvalid,
-                            "packed Alembic cache byte is outside 0..255",
-                            json!({"resource_id":resource_id,"index":index}),
-                        )
-                    })
-            })
-            .collect::<Result<Vec<_>>>()?
-    } else {
-        let uri = resource
-            .get("uri")
-            .or_else(|| resource.get("path"))
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| {
-                PotError::with_details(
-                    ErrorCode::DependencyMissing,
-                    "Alembic cache resource has no file URI",
-                    json!({"resource_id":resource_id}),
-                )
-            })?;
-        let path_text = uri.strip_prefix("file://").unwrap_or(uri);
-        let path = Path::new(path_text);
-        let path = if path.is_absolute() {
-            path.to_path_buf()
-        } else if let Some(root) = project_root {
-            root.join(path)
-        } else {
-            return Err(PotError::with_details(
-                ErrorCode::DependencyMissing,
-                "relative Alembic cache resource cannot be resolved without a project root",
-                json!({"resource_id":resource_id,"uri":uri}),
-            ));
-        };
-        fs::read(&path).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                PotError::with_details(
-                    ErrorCode::DependencyMissing,
-                    format!("Alembic cache file is missing: {}", path.display()),
-                    json!({"resource_id":resource_id,"uri":uri}),
-                )
-            } else {
-                PotError::io(&error)
-            }
-        })?
-    };
-    let actual_hash = hash::sha256(&bytes);
-    if actual_hash != expected_hash {
-        return Err(PotError::with_details(
-            ErrorCode::AssetChanged,
-            format!("Alembic cache resource `{resource_id}` changed after registration"),
-            json!({
-                "resource_id":resource_id,
-                "uri":resource.get("uri").and_then(serde_json::Value::as_str),
-                "expected_hash":expected_hash,
-                "actual_hash":actual_hash,
-            }),
-        ));
-    }
-    Ok((bytes, actual_hash))
+    crate::cache_sequence::read_cache_resource_record(resource, resource_id.as_str(), project_root)
 }
 
 pub(crate) fn load_vdb_volume_data(
@@ -2597,14 +2510,45 @@ fn apply_mesh_sequence_cache_modifier(
             json!({"modifier_id":modifier.id,"resource":resource_text}),
         )
     })?;
-    let (bytes, actual_hash) = read_cache_resource(doc, project_root, &resource_id)?;
-    let is_sequence = doc
-        .resources
-        .get(&resource_id)
-        .and_then(|resource| resource.get("cache_file"))
-        .and_then(|settings| settings.get("is_sequence"))
+    let sequence = modifier
+        .params
+        .get("is_sequence")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let (bytes, actual_hash) = if sequence {
+        let resource = doc.resources.get(&resource_id).ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::DependencyMissing,
+                format!("Alembic cache resource `{resource_id}` is not registered"),
+                json!({"resource_id":resource_id}),
+            )
+        })?;
+        let requested_frame = match modifier.params.get("override_frame") {
+            None | Some(Value::Null) => frame,
+            Some(value) => value
+                .as_f64()
+                .filter(|value| value.is_finite())
+                .ok_or_else(|| {
+                    PotError::with_details(
+                        ErrorCode::InvalidArgument,
+                        "Mesh Sequence Cache override_frame must be finite or null",
+                        json!({"modifier_id":modifier.id,"parameter":"override_frame"}),
+                    )
+                })?,
+        };
+        match read_cache_sequence_resource(resource, project_root, requested_frame)? {
+            CacheSequenceRead::Available(bytes, digest) => (bytes, digest),
+            CacheSequenceRead::Missing { frame, reason } => {
+                return Ok(vec![PotError::with_details(
+                    ErrorCode::DependencyMissing,
+                    "Alembic sequence frame is unavailable; Mesh Sequence Cache was skipped",
+                    json!({"modifier_id":modifier.id,"resource_id":resource_id,"frame":frame,"reason":reason}),
+                )]);
+            }
+        }
+    } else {
+        read_cache_resource(doc, project_root, &resource_id)?
+    };
     crate::geom::mesh_cache::evaluate(
         mesh,
         modifier,
@@ -2613,8 +2557,243 @@ fn apply_mesh_sequence_cache_modifier(
         fps_base,
         &actual_hash,
         &bytes,
-        is_sequence,
+        sequence,
     )
+}
+
+enum CacheSequenceRead {
+    Available(Vec<u8>, String),
+    Missing { frame: i32, reason: &'static str },
+}
+
+fn read_cache_sequence_resource(
+    resource: &Value,
+    project_root: Option<&Path>,
+    requested_frame: f64,
+) -> Result<CacheSequenceRead> {
+    if !requested_frame.is_finite()
+        || requested_frame.trunc() < f64::from(i32::MIN)
+        || requested_frame.trunc() > f64::from(i32::MAX)
+    {
+        return Err(PotError::with_details(
+            ErrorCode::InvalidArgument,
+            "Mesh Sequence Cache frame is outside int32 sequence range",
+            json!({"frame":requested_frame}),
+        ));
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the finite frame has been checked against the int32 range"
+    )]
+    let frame = requested_frame.trunc() as i32;
+    let uri = resource
+        .get("uri")
+        .and_then(Value::as_str)
+        .filter(|uri| !uri.trim().is_empty())
+        .ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "Alembic sequence resource has no URI",
+                json!({"frame":frame}),
+            )
+        })?;
+    let kind = resource
+        .get("kind")
+        .and_then(Value::as_str)
+        .filter(|kind| !kind.trim().is_empty())
+        .ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "Alembic sequence resource has no kind",
+                json!({"frame":frame}),
+            )
+        })?;
+    if !matches!(kind, "alembic" | "alembic_cache") {
+        return Err(PotError::with_details(
+            ErrorCode::SceneInvalid,
+            "Mesh Sequence Cache resource is not Alembic",
+            json!({"kind":kind,"frame":frame}),
+        ));
+    }
+    let packed_sequence = resource
+        .get("packed")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "Alembic sequence resource has no packed state",
+                json!({"frame":frame}),
+            )
+        })?;
+    let frame_records = match resource.get("sequence_frames") {
+        Some(Value::Object(records)) => records,
+        None | Some(Value::Null) if !packed_sequence => {
+            return Ok(CacheSequenceRead::Missing {
+                frame,
+                reason: "sequence manifest does not contain file frames",
+            });
+        }
+        _ => {
+            return Err(PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "Alembic sequence has invalid frame records",
+                json!({"frame":frame}),
+            ));
+        }
+    };
+    if packed_sequence {
+        let start = resource
+            .get("sequence_start")
+            .and_then(Value::as_i64)
+            .and_then(|value| i32::try_from(value).ok());
+        let end = resource
+            .get("sequence_end")
+            .and_then(Value::as_i64)
+            .and_then(|value| i32::try_from(value).ok());
+        let (Some(start), Some(end)) = (start, end) else {
+            return Err(PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "packed Alembic sequence has no inclusive int32 frame range",
+                json!({"frame":frame}),
+            ));
+        };
+        if end < start {
+            return Err(PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "packed Alembic sequence frame range is not ascending",
+                json!({"start":start,"end":end}),
+            ));
+        }
+        if frame < start || frame > end {
+            return Ok(CacheSequenceRead::Missing {
+                frame,
+                reason: "frame is outside the packed source range",
+            });
+        }
+    }
+    let Some(frame_record) = frame_records.get(&frame.to_string()) else {
+        if packed_sequence {
+            return Err(PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "packed Alembic sequence is missing a selected frame record",
+                json!({"frame":frame}),
+            ));
+        }
+        return Ok(CacheSequenceRead::Missing {
+            frame,
+            reason: "frame is outside the registered source sequence",
+        });
+    };
+    let frame_kind = frame_record
+        .get("kind")
+        .and_then(Value::as_str)
+        .filter(|kind| !kind.trim().is_empty());
+    let Some(frame_uri) = frame_record
+        .get("uri")
+        .and_then(Value::as_str)
+        .filter(|uri| !uri.trim().is_empty())
+    else {
+        return Err(PotError::with_details(
+            ErrorCode::SceneInvalid,
+            "Alembic sequence frame is not a standard resource record",
+            json!({"frame":frame,"kind":frame_kind,"packed":frame_record.get("packed")}),
+        ));
+    };
+    let packed_frame = frame_record.get("packed").and_then(Value::as_bool);
+    if frame_kind != Some(kind) || packed_frame != Some(packed_sequence) {
+        return Err(PotError::with_details(
+            ErrorCode::SceneInvalid,
+            "Alembic sequence frame is not a standard resource record",
+            json!({"frame":frame,"kind":frame_kind,"uri":frame_uri,"packed":packed_frame}),
+        ));
+    }
+    if !packed_sequence {
+        let frame_path_text = frame_uri.strip_prefix("file://").unwrap_or(frame_uri);
+        let frame_path = Path::new(frame_path_text);
+        let asset_prefix = Path::new("assets/sha256");
+        let is_content_addressed = frame_path.starts_with(asset_prefix)
+            || project_root.is_some_and(|root| {
+                frame_path
+                    .strip_prefix(root)
+                    .is_ok_and(|relative| relative.starts_with(asset_prefix))
+            });
+        if !is_content_addressed {
+            let sequence_path_text = uri.strip_prefix("file://").unwrap_or(uri);
+            let sequence_path = Path::new(sequence_path_text);
+            let sequence_path = if sequence_path.is_absolute() {
+                sequence_path.to_path_buf()
+            } else if let Some(root) = project_root {
+                root.join(sequence_path)
+            } else {
+                return Err(PotError::with_details(
+                    ErrorCode::DependencyMissing,
+                    "relative Alembic cache sequence cannot be resolved without a project root",
+                    json!({"uri":uri,"frame":frame}),
+                ));
+            };
+            let Some(expected_path) =
+                crate::cache_sequence::cache_sequence_frame_path(&sequence_path, frame)?
+            else {
+                return Ok(CacheSequenceRead::Missing {
+                    frame,
+                    reason: "linked source sequence frame is missing",
+                });
+            };
+            let frame_path = if frame_path.is_absolute() {
+                frame_path.to_path_buf()
+            } else if let Some(root) = project_root {
+                root.join(frame_path)
+            } else {
+                return Err(PotError::with_details(
+                    ErrorCode::DependencyMissing,
+                    "relative Alembic cache frame cannot be resolved without a project root",
+                    json!({"uri":frame_uri,"frame":frame}),
+                ));
+            };
+            let actual_path = match fs::canonicalize(&frame_path) {
+                Ok(path) => path,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(PotError::with_details(
+                        ErrorCode::SceneInvalid,
+                        "registered Alembic sequence frame URI does not name its source frame",
+                        json!({"uri":uri,"frame_uri":frame_uri,"frame":frame}),
+                    ));
+                }
+                Err(error) => return Err(PotError::io(&error)),
+            };
+            if actual_path != expected_path {
+                return Err(PotError::with_details(
+                    ErrorCode::SceneInvalid,
+                    "registered Alembic sequence frame URI does not match its source pattern",
+                    json!({
+                        "uri":uri,
+                        "frame_uri":frame_uri,
+                        "expected_path":expected_path,
+                        "actual_path":actual_path,
+                        "frame":frame,
+                    }),
+                ));
+            }
+        }
+    }
+    match crate::cache_sequence::read_cache_resource_record(
+        frame_record,
+        &format!("{uri}:{frame}"),
+        project_root,
+    ) {
+        Ok((bytes, digest)) => Ok(CacheSequenceRead::Available(bytes, digest)),
+        Err(error)
+            if !packed_sequence
+                && error.code == ErrorCode::DependencyMissing
+                && error.message.starts_with("Alembic cache file is missing:") =>
+        {
+            Ok(CacheSequenceRead::Missing {
+                frame,
+                reason: "linked source sequence frame is missing",
+            })
+        }
+        Err(error) => Err(error),
+    }
 }
 
 const MAX_RENDERED_PARTICLES: usize = 100_000;
