@@ -396,7 +396,8 @@ fn mirror_axis(
         out_copy.push(copy);
     }
 
-    // Edges in Blender's pre-merge order: originals, then copies. A merged edge keeps the first.
+    // Blender `mesh_mirror.cc` copies each source edge's attributes onto its mirrored copy
+    // (`edge_interp.copy(0, src_edges_num, src_edges_num)`). Merged edges: first source wins here.
     let edges = edge_pairs(source)?;
     let mut edge_list = Vec::with_capacity(2 * edges.len());
     for offset in [0, count] {
@@ -647,7 +648,10 @@ fn bisect(
             out_sources.extend(sources);
         }
     }
-    // An original edge is cut into two spans that keep its source; chords have no source.
+    // Blender 5.2.2 `BM_edge_split` (bmesh/intern/bmesh_mods.cc) copies the split edge's hflag and
+    // CustomData onto the new half (`BM_elem_attrs_copy(bm, e, e_new)`), so both halves keep the
+    // source. A chord comes from `bm_face_bisect_verts` (bmesh/tools/bmesh_bisect_plane.cc) calling
+    // `BM_face_split(..., nullptr, true)`, a null example, so `BM_edge_create` sets defaults: no source.
     let mut edge_list = Vec::with_capacity(edges.len() + chords.len());
     for (edge, &[first, second]) in edges.iter().enumerate() {
         match cuts.get(&edge_key(first, second)) {
