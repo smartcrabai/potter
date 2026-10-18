@@ -18,14 +18,14 @@ pub(super) type Row = Vec<(usize, f64)>;
 pub(super) fn combine(terms: &[(f64, &Row)]) -> Row {
     let mut out: Row = Vec::new();
     for (weight, row) in terms {
-        for &(vertex, w) in row.iter() {
+        for &(vertex, w) in *row {
             out.push((vertex, w * weight));
         }
     }
     out
 }
 
-/// Cubic B-spline basis of a normalized parameter (OpenSubdiv `EvalBasisBSpline`).
+/// Cubic B-spline basis of a normalized parameter (`OpenSubdiv` `EvalBasisBSpline`).
 fn bspline_basis(t: f64) -> [f64; 4] {
     let t2 = t * t;
     let t3 = t2 * t;
@@ -37,14 +37,14 @@ fn bspline_basis(t: f64) -> [f64; 4] {
     ]
 }
 
-/// Cubic Bezier basis (OpenSubdiv `evalBezierCurve`).
+/// Cubic Bezier basis (`OpenSubdiv` `evalBezierCurve`).
 fn bezier_basis(t: f64) -> [f64; 4] {
     let it = 1.0 - t;
     [it * it * it, 3.0 * t * it * it, 3.0 * t * t * it, t * t * t]
 }
 
 /// Control-point indices of the 4x4 B-spline grid touched by each corner's ring
-/// (OpenSubdiv `getQuadRegularPatchPoints`); `k = 4 * row + col` with row along `t`, col along `s`.
+/// (`OpenSubdiv` `getQuadRegularPatchPoints`); `k = 4 * row + col` with row along `t`, col along `s`.
 const CORNER_POINTS: [[usize; 4]; 4] =
     [[5, 4, 0, 1], [6, 2, 3, 7], [10, 11, 15, 14], [9, 13, 12, 8]];
 
@@ -58,6 +58,10 @@ pub(super) fn boundary_mask(level: &Level, face: usize) -> u8 {
 
 /// Control points of a regular quad: the 4x4 grid, with the outer points taken from the opposite
 /// face around each corner (or the corner itself where a boundary removes them).
+#[expect(
+    clippy::expect_used,
+    reason = "a boundary-adjacent interior edge always has a neighbouring face on the manifold side"
+)]
 pub(super) fn regular_grid(level: &Level, face: usize, mask: u8) -> [Row; 16] {
     let corners = level.faces[face].clone();
     let boundary_point: Row = vec![(corners[0], 1.0)];
@@ -98,15 +102,15 @@ pub(super) fn regular_grid(level: &Level, face: usize, mask: u8) -> [Row; 16] {
         }
         let slots = CORNER_POINTS[c];
         grid[slots[0]] = vec![(vertex, 1.0)];
-        grid[slots[1]] = outer[0].clone();
-        grid[slots[2]] = outer[1].clone();
-        grid[slots[3]] = outer[2].clone();
+        grid[slots[1]].clone_from(&outer[0]);
+        grid[slots[2]].clone_from(&outer[1]);
+        grid[slots[3]].clone_from(&outer[2]);
     }
     grid
 }
 
 /// B-spline weights at `(s, t)` on the 16-point grid, with the boundary mask applied
-/// (OpenSubdiv `EvalBasisBSpline` and `adjustBSplineBoundaryWeights`).
+/// (`OpenSubdiv` `EvalBasisBSpline` and `adjustBSplineBoundaryWeights`).
 pub(super) fn bspline_weights(s: f64, t: f64, mask: u8) -> [f64; 16] {
     let bs = bspline_basis(s);
     let bt = bspline_basis(t);
@@ -147,7 +151,7 @@ pub(super) fn bspline_weights(s: f64, t: f64, mask: u8) -> [f64; 16] {
     w
 }
 
-/// Gregory basis of the 20 control points of a quad with an irregular corner (OpenSubdiv
+/// Gregory basis of the 20 control points of a quad with an irregular corner (`OpenSubdiv`
 /// `EvalBasisGregory`).
 pub(super) fn gregory_weights(s: f64, t: f64) -> [f64; 20] {
     let bs = bezier_basis(s);
@@ -179,39 +183,39 @@ pub(super) fn gregory_weights(s: f64, t: f64) -> [f64; 20] {
     w
 }
 
-/// Catmull-Clark tangent coefficient for valence `n` (OpenSubdiv `CatmarkLimits::computeCoefficient`).
+/// Catmull-Clark tangent coefficient for valence `n` (`OpenSubdiv` `CatmarkLimits::computeCoefficient`).
 pub(super) fn tangent_coefficient(n: usize) -> f64 {
     const TABLE: [f64; 30] = [
         0.0,
         0.0,
         0.0,
-        8.1281572906372312e-01,
+        8.128_157_290_637_231e-1,
         0.5,
-        3.6364406329142801e-01,
-        2.8751379706077085e-01,
-        2.3868786685851678e-01,
-        2.0454364190756097e-01,
-        1.7922903958061159e-01,
-        1.5965737079986253e-01,
-        1.4404233443011302e-01,
-        1.3127568415883017e-01,
-        1.2063172212675841e-01,
-        1.1161437506676930e-01,
-        1.0387245516114274e-01,
-        9.7150019090724835e-02,
-        9.1255917505950648e-02,
-        8.6044378511602668e-02,
-        8.1402211336798411e-02,
-        7.7240129516184072e-02,
-        7.3486719751997026e-02,
-        7.0084157479797987e-02,
-        6.6985104030725440e-02,
-        6.4150420569810074e-02,
-        6.1547457638637268e-02,
-        5.9148757447233989e-02,
-        5.6931056818776957e-02,
-        5.4874512279256417e-02,
-        5.2962091433796134e-02,
+        3.636_440_632_914_28e-1,
+        2.875_137_970_607_708_5e-01,
+        2.386_878_668_585_167_8e-01,
+        2.045_436_419_075_609_7e-01,
+        1.792_290_395_806_116e-1,
+        1.596_573_707_998_625_3e-01,
+        1.440_423_344_301_130_2e-01,
+        1.312_756_841_588_301_7e-01,
+        1.206_317_221_267_584e-1,
+        1.116_143_750_667_693e-1,
+        1.038_724_551_611_427_4e-01,
+        9.715_001_909_072_483e-2,
+        9.125_591_750_595_065e-2,
+        8.604_437_851_160_267e-2,
+        8.140_221_133_679_841e-2,
+        7.724_012_951_618_407e-2,
+        7.348_671_975_199_703e-2,
+        7.008_415_747_979_799e-2,
+        6.698_510_403_072_544e-2,
+        6.415_042_056_981_007e-2,
+        6.154_745_763_863_727e-2,
+        5.914_875_744_723_399e-2,
+        5.693_105_681_877_696e-2,
+        5.487_451_227_925_642e-2,
+        5.296_209_143_379_613_4e-02,
     ];
     if n < 30 {
         TABLE[n]
@@ -223,7 +227,7 @@ pub(super) fn tangent_coefficient(n: usize) -> f64 {
     }
 }
 
-/// Whether the leaf is evaluated by the B-spline (OpenSubdiv `IsPatchRegular`). `depth` is the
+/// Whether the leaf is evaluated by the B-spline (`OpenSubdiv` `IsPatchRegular`). `depth` is the
 /// leaf's level; `has_irregular_faces` is whether the base mesh has non-quad faces.
 pub(super) fn is_regular_leaf(
     level: &Level,

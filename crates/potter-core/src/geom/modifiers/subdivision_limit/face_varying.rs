@@ -4,9 +4,9 @@
 // (completeTopologyFromFaceValues, gatherValueSpans) and vtr/level.cpp (orderVertexFacesAndEdges),
 // Apache-2.0.
 
-//! Face-varying base level of a UV layer. A value is one face-varying vertex: OpenSubdiv's sibling
+//! Face-varying base level of a UV layer. A value is one face-varying vertex: `OpenSubdiv`'s sibling
 //! of a position vertex, which is one UV island around it. The base level's value sharpness follows
-//! OpenSubdiv's face-varying tags, and the later levels refine over the position refinement's quads
+//! `OpenSubdiv`'s face-varying tags, and the later levels refine over the position refinement's quads
 //! (`refine_values`), so values live on the same leaves as positions.
 
 use std::collections::HashMap;
@@ -48,7 +48,7 @@ impl FvarLinear {
     }
 }
 
-/// OpenSubdiv's FVar `ValueTag`, before it is combined with the value-level `VTag`.
+/// `OpenSubdiv`'s `FVar` `ValueTag`, before it is combined with the value-level `VTag`.
 #[derive(Clone, Copy, Default)]
 struct FVarTag {
     mismatch: bool,
@@ -92,6 +92,10 @@ impl FVarTag {
 /// The base level of a UV layer over the base faces. `geometry` is the base position level: its
 /// vertex and edge sharpness are the geometric ones, which a value inherits unless the channel's
 /// options sharpen it.
+#[expect(
+    clippy::expect_used,
+    reason = "every value edge is a position edge, since value edges are built from the position topology"
+)]
 pub(super) fn base(
     geometry: &Level,
     linear: FvarLinear,
@@ -143,7 +147,7 @@ pub(super) fn base(
     }
 }
 
-/// One position vertex's faces and edges in OpenSubdiv's fan order.
+/// One position vertex's faces and edges in `OpenSubdiv`'s fan order.
 struct Fan {
     /// Faces in fan order. For a boundary vertex the first face is the one with the forward boundary
     /// edge.
@@ -154,7 +158,7 @@ struct Fan {
     boundary: bool,
 }
 
-/// OpenSubdiv's `orderVertexFacesAndEdges`: walks the fan around `vertex` from its first face (an
+/// `OpenSubdiv`'s `orderVertexFacesAndEdges`: walks the fan around `vertex` from its first face (an
 /// interior vertex) or from its forward boundary edge. `None` when the fan cannot be ordered.
 fn fan(geometry: &Level, vertex: usize) -> Option<Fan> {
     let incident_faces = &geometry.vertex_faces[vertex];
@@ -221,7 +225,7 @@ fn fan(geometry: &Level, vertex: usize) -> Option<Fan> {
     })
 }
 
-/// A position vertex's faces with their values, as OpenSubdiv's sibling assignment sees them.
+/// A position vertex's faces with their values, as `OpenSubdiv`'s sibling assignment sees them.
 struct Vertex {
     fan: Fan,
     /// The vertex is non-manifold: its faces stay in face order and every value is a non-manifold
@@ -233,7 +237,7 @@ struct Vertex {
     siblings: Vec<usize>,
 }
 
-/// OpenSubdiv's sibling assignment over one vertex's faces. A value's siblings are numbered in order
+/// `OpenSubdiv`'s sibling assignment over one vertex's faces. A value's siblings are numbered in order
 /// of first appearance; after two distinct values are known, a different value is appended without
 /// checking the second one. That quirk makes a repeated second value a new sibling, so an alternating
 /// fan `A B A B` has siblings `0 1 0 2`.
@@ -257,7 +261,7 @@ fn assign_siblings(values: &[usize]) -> (Vec<usize>, Vec<usize>) {
     (unique, sibling)
 }
 
-/// Spans of one sibling around its vertex (OpenSubdiv's `ValueSpan`).
+/// Spans of one sibling around its vertex (`OpenSubdiv`'s `ValueSpan`).
 #[derive(Clone, Copy, Default)]
 struct Span {
     /// Faces carrying the value.
@@ -271,7 +275,7 @@ struct Span {
     semi: usize,
 }
 
-/// OpenSubdiv's `gatherValueSpans`, including the wrap-around bookkeeping for the first sibling.
+/// `OpenSubdiv`'s `gatherValueSpans`, including the wrap-around bookkeeping for the first sibling.
 fn value_spans(geometry: &Level, vertex: &Vertex, mismatch: &[bool], count: usize) -> Vec<Span> {
     let n = vertex.fan.faces.len();
     let sibling = &vertex.sibling;
@@ -373,6 +377,16 @@ fn span_semi_sharpness(
     found.then_some(sharpness)
 }
 
+/// Per-channel output of `values`: the fvar values, their sharpness, tags, and per-edge and per-vertex flags.
+type ValuesOutput = (
+    ValueMap,
+    Vec<f64>,
+    Vec<bool>,
+    Vec<FVarTag>,
+    Vec<Option<usize>>,
+    Vec<bool>,
+);
+
 /// Builds fvar values and their base tags. Position vertices whose values form one smooth UV island
 /// keep one value, with the geometric sharpness.
 fn values(
@@ -380,20 +394,17 @@ fn values(
     linear: FvarLinear,
     preserve_corners: bool,
     input: &ValueMap,
-) -> (
-    ValueMap,
-    Vec<f64>,
-    Vec<bool>,
-    Vec<FVarTag>,
-    Vec<Option<usize>>,
-    Vec<bool>,
-) {
+) -> ValuesOutput {
     let vertex_count = geometry.vertex_count();
     let make_smooth_corners_sharp = !preserve_corners && linear.corners_sharp();
     let mut mismatch = vec![false; geometry.edge_count()];
     let mut mismatched_vertex = vec![false; vertex_count];
     let mut linear_edges = vec![false; geometry.edge_count()];
     let mut vertices: Vec<Option<Vertex>> = (0..vertex_count).map(|_| None).collect();
+    #[expect(
+        clippy::needless_range_loop,
+        reason = "each position indexes several per-vertex arrays and the geometry at once"
+    )]
     for position in 0..vertex_count {
         if geometry.vertex_faces[position].is_empty() {
             continue;
@@ -452,6 +463,10 @@ fn values(
             siblings,
         });
     }
+    #[expect(
+        clippy::needless_range_loop,
+        reason = "each position indexes several per-vertex arrays and the geometry at once"
+    )]
     for position in 0..vertex_count {
         if mismatched_vertex[position] || !geometry.vtags[position].boundary {
             continue;
@@ -488,14 +503,7 @@ fn values(
         let boundary = vertex.fan.boundary;
         let processed = mismatched_vertex[position] || (vertex.non_manifold && count > 1);
         let first = map.uvs.len();
-        if !processed {
-            map.vertex.push(position);
-            map.uvs.push(input.uvs[vertex.siblings[0]]);
-            sharpness.push(geometry.vertex_sharpness[position]);
-            non_manifold_values.push(tag.non_manifold);
-            fvar_tags.push(FVarTag::default());
-            dependent_sources.push(None);
-        } else {
+        if processed {
             let spans = value_spans(geometry, vertex, &mismatch, count);
             let mut all_sharp = linear.linear_boundaries()
                 || is_infinite(geometry.vertex_sharpness[position])
@@ -520,7 +528,7 @@ fn values(
                     || span.inf > 0
                     || (span.size == 1 && linear.corners_sharp());
                 let dependent = has_dependent && span.semi == 0 && !sharp_value;
-                let source_sibling = if spans[0].semi > 0 { 0 } else { 1 };
+                let source_sibling = usize::from(spans[0].semi == 0);
                 let dependency_source = dependent.then_some(first + source_sibling);
                 let sharpness_value = if sharp_value {
                     SHARPNESS_INFINITE
@@ -575,6 +583,13 @@ fn values(
                 fvar_tags.push(fvar_tag);
                 dependent_sources.push(dependency_source);
             }
+        } else {
+            map.vertex.push(position);
+            map.uvs.push(input.uvs[vertex.siblings[0]]);
+            sharpness.push(geometry.vertex_sharpness[position]);
+            non_manifold_values.push(tag.non_manifold);
+            fvar_tags.push(FVarTag::default());
+            dependent_sources.push(None);
         }
         for (i, &face) in vertex.fan.faces.iter().enumerate() {
             let corner = geometry.corner_of(face, position);

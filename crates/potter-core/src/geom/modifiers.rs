@@ -2536,7 +2536,7 @@ fn subdivision(
         let limit = subdivision_limit::LimitSurface::build(
             &base_faces,
             &positions(mesh),
-            sharpness,
+            &sharpness,
             isolation,
         );
         if let Some(samples) = limit_samples {
@@ -2939,6 +2939,12 @@ fn edge_index(polygon: &[usize], edge: (usize, usize)) -> Option<usize> {
         .find(|&index| edge_key(polygon[index], polygon[(index + 1) % polygon.len()]) == edge)
 }
 
+type SubdivideOnce = (
+    Mesh,
+    BTreeMap<(usize, usize), usize>,
+    subdivision_uv::Creases,
+);
+
 fn subdivide_once(
     mesh: &Mesh,
     options: SubdivisionOptions,
@@ -2946,11 +2952,7 @@ fn subdivide_once(
     source_polygons: &[Polygon],
     source_edges: &[[usize; 2]],
     edge_creases: &subdivision_uv::Creases,
-) -> Result<(
-    Mesh,
-    BTreeMap<(usize, usize), usize>,
-    subdivision_uv::Creases,
-)> {
+) -> Result<SubdivideOnce> {
     let source_points = positions(mesh);
     let mut face_points = Vec::with_capacity(source_polygons.len());
     for (face, _) in source_polygons {

@@ -68,7 +68,7 @@ impl LimitSurface {
     pub(super) fn build(
         faces: &[Vec<usize>],
         points: &[DVec3],
-        sharpness: BaseSharpness,
+        sharpness: &BaseSharpness,
         isolation: usize,
     ) -> LimitSurface {
         let mut base = Level::from_faces(faces.to_vec(), points.len());
@@ -81,7 +81,7 @@ impl LimitSurface {
                 for (edge, [a, b]) in base.edges.clone().into_iter().enumerate() {
                     base.edge_sharpness[edge] = edges.get(&(a, b)).copied().unwrap_or(0.0);
                 }
-                (preserve_corners, non_manifold.to_vec())
+                (*preserve_corners, non_manifold.to_vec())
             }
             BaseSharpness::Simple => {
                 base.edge_sharpness.fill(SHARPNESS_INFINITE);
@@ -136,6 +136,10 @@ impl LimitSurface {
     /// The UV layer's value at every output loop, for the loops' `samples`, on this limit surface. The
     /// layer's values refine over the position levels and are evaluated on the same leaf, at the same
     /// local coordinates, as the position of each loop.
+    #[expect(
+        clippy::expect_used,
+        reason = "the base fvar level is built before the refinement pass reads it"
+    )]
     pub(super) fn face_varying_loops(
         &self,
         linear: FvarLinear,
@@ -254,6 +258,10 @@ impl LimitSurface {
 
     /// The leaf that holds `sample` (Blender's quadtree lookup): its level and face, and the sample's
     /// local coordinates within it.
+    #[expect(
+        clippy::expect_used,
+        reason = "a sampled n-gon sub-face is refined at the first level, and every selected leaf has child quads"
+    )]
     fn locate(&self, sample: Sample) -> (usize, usize, f64, f64) {
         let (mut level, mut face, mut s, mut t) = if self.ngon_root[sample.face] {
             let child = self.levels[1].face_children[sample.face][sample.ptex]
@@ -278,6 +286,10 @@ impl LimitSurface {
         (level, face, s, t)
     }
     /// The leaf holding a sample in a channel's fvar-specific isolation tree.
+    #[expect(
+        clippy::expect_used,
+        reason = "a selected fvar face always has all of its child quads"
+    )]
     fn locate_fvar(
         &self,
         sample: Sample,
@@ -343,7 +355,7 @@ fn leaf_point<T: Point>(
     }
 }
 
-/// Face-varying endcaps use OpenSubdiv's non-manifold span walk; position endcaps keep the
+/// Face-varying endcaps use `OpenSubdiv`'s non-manifold span walk; position endcaps keep the
 /// orientation-independent fan used by `leaf_point`.
 fn leaf_fvar_point<T: Point>(
     level: &Level,
@@ -367,7 +379,7 @@ fn leaf_fvar_point<T: Point>(
     }
 }
 
-/// OpenSubdiv's fvar `IsPatchRegular` adds a span test for non-manifold corners. The position
+/// `OpenSubdiv`'s fvar `IsPatchRegular` adds a span test for non-manifold corners. The position
 /// classifier remains unchanged; this channel-specific variant permits a regular endcap when the
 /// non-manifold value's face span is regular.
 fn is_regular_fvar_leaf(
@@ -563,8 +575,8 @@ fn midpoint(a: Sample, b: Sample) -> Sample {
     Sample {
         face: a.face,
         ptex: a.ptex,
-        u: 0.5 * (a.u + b.u),
-        v: 0.5 * (a.v + b.v),
+        u: f64::midpoint(a.u, b.u),
+        v: f64::midpoint(a.v, b.v),
     }
 }
 
@@ -602,7 +614,7 @@ fn weighted_rows<T: Point, const N: usize>(
     point
 }
 
-/// Bilinear value of a linear channel's leaf quad at local coordinates (OpenSubdiv's `QUADS` patches).
+/// Bilinear value of a linear channel's leaf quad at local coordinates (`OpenSubdiv`'s `QUADS` patches).
 fn bilinear(level: &Level, positions: &[DVec2], face: usize, s: f64, t: f64) -> DVec2 {
     let weights = [(1.0 - s) * (1.0 - t), s * (1.0 - t), s * t, (1.0 - s) * t];
     level.faces[face]

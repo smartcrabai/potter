@@ -31,7 +31,7 @@ pub(super) struct Refined<T> {
     pub(super) dependent_source: Vec<Option<usize>>,
 }
 
-/// Feature-based selection of parent faces (OpenSubdiv `FeatureMask` with Blender's options).
+/// Feature-based selection of parent faces (`OpenSubdiv` `FeatureMask` with Blender's options).
 pub(super) fn select_features(level: &Level, depth: usize) -> Vec<bool> {
     (0..level.faces.len())
         .map(|face| does_face_have_features(level, face, depth))
@@ -148,7 +148,7 @@ fn crease_vertex_mask(edges: usize, faces: usize, sharp: &[bool]) -> VertexMask 
         .enumerate()
         .filter(|(_, is_sharp_edge)| **is_sharp_edge)
         .map(|(index, _)| index);
-    if let (Some(first), Some(last)) = (ends.next(), ends.last()) {
+    if let (Some(first), Some(last)) = (ends.next(), ends.next_back()) {
         mask.edges[first] = 0.125;
         mask.edges[last] = 0.125;
     }
@@ -166,7 +166,7 @@ fn rule_mask(rule: u8, edges: usize, faces: usize, sharp: &[bool]) -> VertexMask
 }
 
 /// Fractional weight of the parent rule at a vertex whose rule changes between levels (uniform
-/// creasing; OpenSubdiv `Crease::ComputeFractionalWeightAtVertex`).
+/// creasing; `OpenSubdiv` `Crease::ComputeFractionalWeightAtVertex`).
 fn fractional_weight(parent_vertex: f64, child_vertex: f64, parent_edges: &[f64]) -> f64 {
     let mut count = 0.0;
     let mut sum = 0.0;
@@ -463,8 +463,8 @@ pub(super) fn refine_values<T: Point>(
     )
 }
 /// Refines a face-varying channel around its own features and the position surface's selected faces.
-/// This reproduces the combined feature mask OpenSubdiv uses when FVar channels are present.
-/// Position refinement remains unchanged; additional FVar features may add their own child quads.
+/// This reproduces the combined feature mask `OpenSubdiv` uses when `FVar` channels are present.
+/// Position refinement remains unchanged; additional `FVar` features may add their own child quads.
 pub(super) fn refine_values_adaptive<T: Point>(
     parent: &Level,
     positions: &[T],
@@ -582,6 +582,10 @@ fn value_keys(parent: &Level, quads: &[Vec<bool>]) -> Keys {
 
 /// Builds the child level of `parent` from its child quads: the child edges are the halves of parent
 /// edges, then the spokes, and the child positions and tags follow the parent's rules.
+#[expect(
+    clippy::expect_used,
+    reason = "child keys are created for every selected parent corner, edge, face and spoke before they are read back"
+)]
 fn assemble<T: Point>(
     parent: &Level,
     positions: &[T],
@@ -622,8 +626,16 @@ fn assemble<T: Point>(
         }
     }
     let mut spoke_index = vec![Vec::new(); parent.faces.len()];
+    #[expect(
+        clippy::needless_range_loop,
+        reason = "f indexes the spoke table, the key table and the parent face list at once"
+    )]
     for f in 0..parent.faces.len() {
         spoke_index[f] = vec![None; parent.faces[f].len()];
+        #[expect(
+            clippy::needless_range_loop,
+            reason = "k indexes the spoke table, the key table and the parent corner list of face f"
+        )]
         for k in 0..parent.faces[f].len() {
             if let Some(index) = keys.spoke[f][k] {
                 debug_assert_eq!(index, child_edges.len());

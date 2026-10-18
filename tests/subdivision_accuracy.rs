@@ -12,6 +12,9 @@ use serde_json::{Map, Value, json};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
+type UvLayerRecord = (String, BTreeMap<u64, (Vec<[f64; 2]>, Vec<bool>)>);
+type EdgeRecords = BTreeMap<(usize, usize), Vec<(bool, bool, f64)>>;
+
 const ORACLE: &str = include_str!("fixtures/pr16_subdivision/oracle.json");
 // Blender f32 output is rounded to seven fixture decimals; generation measured a maximum
 // serialization error of 5.000000003e-8. These bounds cover f32/OpenSubdiv arithmetic only.
@@ -153,7 +156,7 @@ fn oracle_shape(expected: &Value) -> TestResult<Shape> {
                     values
                         .as_array()
                         .ok_or("oracle custom normal codes missing")?
-                        .to_vec(),
+                        .clone(),
                 ),
                 None => None,
             };
@@ -265,41 +268,39 @@ fn potter_shape(mesh: &Mesh) -> TestResult<Shape> {
         .and_then(Value::as_array)
         .ok_or("output UV layers missing")?
         .iter()
-        .map(
-            |layer| -> TestResult<(String, BTreeMap<u64, (Vec<[f64; 2]>, Vec<bool>)>)> {
-                let name = layer["name"]
-                    .as_str()
-                    .ok_or("output UV layer name missing")?;
-                let mut faces = BTreeMap::new();
-                for face in layer["faces"].as_array().ok_or("output UV faces missing")? {
-                    let face_id = face["face_id"]
-                        .as_u64()
-                        .ok_or("output UV face ID missing")?;
-                    let values = face["uv"]
-                        .as_array()
-                        .ok_or("output UV corners missing")?
-                        .iter()
-                        .map(|value| -> TestResult<[f64; 2]> {
-                            let [u, v] = uv(value)?;
-                            Ok([u, 1.0 - v])
-                        })
-                        .collect::<TestResult<Vec<_>>>()?;
-                    let pins = face
-                        .get("pinned")
-                        .map(|pins| -> TestResult<Vec<bool>> {
-                            let mut flags = Vec::new();
-                            for value in pins.as_array().ok_or("output UV pin row missing")? {
-                                flags.push(value.as_bool().ok_or("output UV pin must be boolean")?);
-                            }
-                            Ok(flags)
-                        })
-                        .transpose()?
-                        .unwrap_or_else(|| vec![false; values.len()]);
-                    faces.insert(face_id, (values, pins));
-                }
-                Ok((name.to_owned(), faces))
-            },
-        )
+        .map(|layer| -> TestResult<UvLayerRecord> {
+            let name = layer["name"]
+                .as_str()
+                .ok_or("output UV layer name missing")?;
+            let mut faces = BTreeMap::new();
+            for face in layer["faces"].as_array().ok_or("output UV faces missing")? {
+                let face_id = face["face_id"]
+                    .as_u64()
+                    .ok_or("output UV face ID missing")?;
+                let values = face["uv"]
+                    .as_array()
+                    .ok_or("output UV corners missing")?
+                    .iter()
+                    .map(|value| -> TestResult<[f64; 2]> {
+                        let [u, v] = uv(value)?;
+                        Ok([u, 1.0 - v])
+                    })
+                    .collect::<TestResult<Vec<_>>>()?;
+                let pins = face
+                    .get("pinned")
+                    .map(|pins| -> TestResult<Vec<bool>> {
+                        let mut flags = Vec::new();
+                        for value in pins.as_array().ok_or("output UV pin row missing")? {
+                            flags.push(value.as_bool().ok_or("output UV pin must be boolean")?);
+                        }
+                        Ok(flags)
+                    })
+                    .transpose()?
+                    .unwrap_or_else(|| vec![false; values.len()]);
+                faces.insert(face_id, (values, pins));
+            }
+            Ok((name.to_owned(), faces))
+        })
         .collect::<TestResult<Vec<_>>>()?;
     let smooth = mesh
         .attributes
@@ -346,7 +347,7 @@ fn potter_shape(mesh: &Mesh) -> TestResult<Shape> {
                     .get(&format!("f{}", face.id))
                     .and_then(Value::as_array)
                     .ok_or("custom normal codes missing for output face")?
-                    .to_vec(),
+                    .clone(),
             ),
             None => None,
         };
@@ -670,18 +671,15 @@ fn cluster_positions(points: &[DVec3]) -> (Vec<usize>, Vec<DVec3>, Vec<usize>) {
                 }
             }
         }
-        let cluster = match found {
-            Some(cluster) => {
-                multiplicities[cluster] += 1;
-                cluster
-            }
-            None => {
-                representatives.push(*point);
-                multiplicities.push(1);
-                let cluster = representatives.len() - 1;
-                grid.entry((x, y, z)).or_default().push(cluster);
-                cluster
-            }
+        let cluster = if let Some(cluster) = found {
+            multiplicities[cluster] += 1;
+            cluster
+        } else {
+            representatives.push(*point);
+            multiplicities.push(1);
+            let cluster = representatives.len() - 1;
+            grid.entry((x, y, z)).or_default().push(cluster);
+            cluster
         };
         assignment.push(cluster);
     }
@@ -920,7 +918,7 @@ fn compare_shapes(actual: &Shape, expected: &Shape) -> Result<Errors, String> {
         ));
     }
 
-    let mut actual_edges: BTreeMap<(usize, usize), Vec<(bool, bool, f64)>> = BTreeMap::new();
+    let mut actual_edges: EdgeRecords = BTreeMap::new();
     for edge in &actual.edges {
         let first = to_expected[actual_clusters[edge.vertices[0]]];
         let second = to_expected[actual_clusters[edge.vertices[1]]];
@@ -929,7 +927,7 @@ fn compare_shapes(actual: &Shape, expected: &Shape) -> Result<Errors, String> {
             .or_default()
             .push((edge.seam, edge.sharp, edge.crease));
     }
-    let mut expected_edges: BTreeMap<(usize, usize), Vec<(bool, bool, f64)>> = BTreeMap::new();
+    let mut expected_edges: EdgeRecords = BTreeMap::new();
     for edge in &expected.edges {
         expected_edges
             .entry(edge_key(
@@ -1130,11 +1128,11 @@ fn assert_matrix_coverage(cases: &[Value], meshes: &Map<String, Value>) -> TestR
         levels.insert(level);
         qualities.insert(quality);
         uv_boundary_pairs.insert((uv.clone(), boundary.clone()));
-        if uv == "PRESERVE_CORNERS_AND_JUNCTIONS" || uv == "PRESERVE_CORNERS_JUNCTIONS_AND_CONCAVE"
+        if (uv == "PRESERVE_CORNERS_AND_JUNCTIONS"
+            || uv == "PRESERVE_CORNERS_JUNCTIONS_AND_CONCAVE")
+            && params["use_creases"].as_bool() == Some(true)
         {
-            if params["use_creases"].as_bool() == Some(true) {
-                crease_dependent_uv_modes.insert(uv.clone());
-            }
+            crease_dependent_uv_modes.insert(uv.clone());
         }
         if matches!(
             mesh,

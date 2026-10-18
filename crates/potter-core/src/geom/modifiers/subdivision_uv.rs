@@ -33,15 +33,15 @@ use crate::{
 pub(super) enum FvarLinear {
     /// `uv_smooth` NONE: every edge and value is linear, so the UVs interpolate bilinearly.
     All,
-    /// `uv_smooth` SMOOTH_ALL: smooth everywhere, UV boundaries included.
+    /// `uv_smooth` `SMOOTH_ALL`: smooth everywhere, UV boundaries included.
     SmoothAll,
-    /// `uv_smooth` PRESERVE_CORNERS: UV corners stay put.
+    /// `uv_smooth` `PRESERVE_CORNERS`: UV corners stay put.
     CornersOnly,
-    /// `uv_smooth` PRESERVE_CORNERS_AND_JUNCTIONS: corners and junctions stay put.
+    /// `uv_smooth` `PRESERVE_CORNERS_AND_JUNCTIONS`: corners and junctions stay put.
     CornersPlus1,
-    /// `uv_smooth` PRESERVE_CORNERS_JUNCTIONS_AND_CONCAVE: corners, junctions, and concave corners.
+    /// `uv_smooth` `PRESERVE_CORNERS_JUNCTIONS_AND_CONCAVE`: corners, junctions, and concave corners.
     CornersPlus2,
-    /// `uv_smooth` PRESERVE_BOUNDARIES (Blender's default): UV boundaries stay put.
+    /// `uv_smooth` `PRESERVE_BOUNDARIES` (Blender's default): UV boundaries stay put.
     Boundaries,
 }
 
@@ -325,11 +325,10 @@ pub(super) fn refine_pins(
     child
 }
 
+type UvLayerInput = (String, Vec<DVec2>, Vec<Option<Vec<bool>>>);
+
 /// Writes one UV layer per entry. UV values are loop-ordered; pin rows are face-ordered.
-pub(super) fn write_loop_uvs(
-    mesh: &mut Mesh,
-    layers: Vec<(String, Vec<DVec2>, Vec<Option<Vec<bool>>>)>,
-) -> Result<()> {
+pub(super) fn write_loop_uvs(mesh: &mut Mesh, layers: Vec<UvLayerInput>) -> Result<()> {
     let mut written_layers = Vec::with_capacity(layers.len());
     for (name, loops, pinned) in layers {
         if pinned.len() != mesh.faces.len() {
@@ -429,6 +428,8 @@ impl Creases {
     }
 }
 
+pub(super) type SimpleSubdivision = (Mesh, Creases, BTreeMap<(usize, usize), usize>);
+
 pub(super) fn subdivide_simple_once(
     mesh: &Mesh,
     position: &Position,
@@ -436,7 +437,7 @@ pub(super) fn subdivide_simple_once(
     source_edges: &[[usize; 2]],
     creases: &Creases,
     use_creases: bool,
-) -> Result<(Mesh, Creases, BTreeMap<(usize, usize), usize>)> {
+) -> Result<SimpleSubdivision> {
     let source_points = positions(mesh);
     let face_points: Vec<DVec3> = source_polygons
         .iter()
