@@ -538,8 +538,16 @@ fn apply_physics_system(
                 })
                 .transpose()?
                 .unwrap_or_default();
+            if canonical_system == "dynamic_paint" {
+                settings
+                    .entry("role".to_owned())
+                    .or_insert_with(|| Value::String("canvas".to_owned()));
+            }
             if let Some(seed) = operation.get("seed") {
                 settings.insert("seed".to_owned(), seed.clone());
+            }
+            if canonical_system == "fluid" {
+                validate_fluid_settings_role(engine, "DOMAIN", &settings)?;
             }
             validate_physics_settings(engine, canonical_system, &settings)?;
             validate_physics_references(engine, canonical_system, &target, &settings)?;
@@ -574,7 +582,15 @@ fn apply_physics_system(
                     "/target/id",
                 )
             })?;
+            if canonical_system == "dynamic_paint" {
+                settings
+                    .entry("role".to_owned())
+                    .or_insert_with(|| Value::String("canvas".to_owned()));
+            }
             settings.extend(updates.clone());
+            if canonical_system == "fluid" {
+                validate_fluid_settings_role(engine, fluid_modifier_role(&node), &settings)?;
+            }
             validate_physics_settings(engine, canonical_system, &settings)?;
             validate_physics_references(engine, canonical_system, &target, &settings)?;
             let mut changed = current != Some(&Value::Object(settings.clone()));
@@ -705,9 +721,34 @@ pub(super) fn create_linked_modifier_settings(
         ));
     }
     let mut modifier_flags = split_modifier_flags(modifier_type, &mut settings);
+    if system == "dynamic_paint" {
+        let ui_type = modifier_flags
+            .get("ui_type")
+            .and_then(Value::as_str)
+            .unwrap_or("CANVAS");
+        let role = if ui_type == "BRUSH" {
+            "brush"
+        } else {
+            "canvas"
+        };
+        settings.insert("role".to_owned(), Value::String(role.to_owned()));
+        modifier_flags.insert("ui_type".to_owned(), Value::String(ui_type.to_owned()));
+    }
+    if system == "fluid" {
+        modifier_flags
+            .entry("fluid_type".to_owned())
+            .or_insert_with(|| Value::String("NONE".to_owned()));
+    }
     let node = physics_node(engine, target, "modifier physics", "/target/id")?;
     validate_system_target(engine, target, &node)?;
     validate_physics_settings(engine, system, &settings)?;
+    if system == "fluid" {
+        let fluid_type = modifier_flags
+            .get("fluid_type")
+            .and_then(Value::as_str)
+            .unwrap_or("NONE");
+        validate_fluid_settings_role(engine, fluid_type, &settings)?;
+    }
     validate_physics_references(engine, system, target, &settings)?;
     let property = physics_property(system);
     let node = engine.doc.nodes.get_mut(target).ok_or_else(|| {
@@ -804,7 +845,61 @@ pub(super) fn update_linked_modifier_settings(
             "/modifier_id",
         ));
     }
+    let dynamic_role_only = system == "dynamic_paint" && settings.is_empty();
+    if system == "dynamic_paint" {
+        let current_role = node
+            .properties
+            .get(property)
+            .and_then(Value::as_object)
+            .and_then(|settings| settings.get("role"))
+            .and_then(Value::as_str);
+        let role = modifier_flags
+            .get("ui_type")
+            .and_then(Value::as_str)
+            .map(|ui_type| if ui_type == "BRUSH" { "brush" } else { "canvas" })
+            .or(current_role)
+            .unwrap_or("canvas");
+        settings.insert("role".to_owned(), Value::String(role.to_owned()));
+        modifier_flags.insert(
+            "ui_type".to_owned(),
+            Value::String(if role == "brush" { "BRUSH" } else { "CANVAS" }.to_owned()),
+        );
+    }
+    if system == "fluid" && !modifier_flags.contains_key("fluid_type") {
+        let fluid_type = node
+            .modifiers
+            .iter()
+            .find(|modifier| modifier.id == *modifier_id)
+            .and_then(|modifier| modifier.params.get("fluid_type"))
+            .cloned()
+            .unwrap_or_else(|| Value::String("DOMAIN".to_owned()));
+        modifier_flags.insert("fluid_type".to_owned(), fluid_type);
+    }
+    let fluid_role = modifier_flags
+        .get("fluid_type")
+        .and_then(Value::as_str)
+        .unwrap_or("DOMAIN");
+    let previous_fluid_role = node
+        .modifiers
+        .iter()
+        .find(|modifier| modifier.id == *modifier_id)
+        .and_then(|modifier| modifier.params.get("fluid_type"))
+        .and_then(Value::as_str)
+        .unwrap_or("DOMAIN");
+    let fluid_role_changed = system == "fluid" && fluid_role != previous_fluid_role;
+    if fluid_role_changed {
+        settings = node
+            .properties
+            .get(property)
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        retain_fluid_settings_for_role(&mut settings, fluid_role);
+    }
     validate_physics_settings(engine, system, &settings)?;
+    if system == "fluid" {
+        validate_fluid_settings_role(engine, fluid_role, &settings)?;
+    }
     validate_physics_references(engine, system, target, &settings)?;
     let node = engine.doc.nodes.get_mut(target).ok_or_else(|| {
         PotError::new(
@@ -812,8 +907,25 @@ pub(super) fn update_linked_modifier_settings(
             "modifier physics target disappeared",
         )
     })?;
-    // A flag-only update has no physics settings to write; the stored settings stay as they are.
-    if !settings.is_empty() {
+    // A role-only update changes the authority field without rewriting imported RNA settings.
+    if dynamic_role_only {
+        let role = settings
+            .get("role")
+            .cloned()
+            .unwrap_or_else(|| Value::String("canvas".to_owned()));
+        let current_settings = node
+            .properties
+            .get_mut(property)
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::SceneInvalid,
+                    "dynamic-paint settings must be an object",
+                )
+            })?;
+        current_settings.insert("role".to_owned(), role);
+        engine.mark("nodes", target, ChangeKind::Updated);
+    } else if fluid_role_changed || !settings.is_empty() {
         if is_particle_registry_entry {
             let registry = node
                 .properties
@@ -917,6 +1029,27 @@ fn ensure_physics_stack_modifier(
                 .insert("settings_id".to_owned(), Value::String(settings_id.clone()));
             changed = true;
         }
+        if system == "dynamic_paint" {
+            let role = node
+                .properties
+                .get("physics_dynamic_paint")
+                .and_then(|settings| settings.get("role"))
+                .and_then(Value::as_str)
+                .unwrap_or("canvas");
+            let ui_type = if role == "brush" { "BRUSH" } else { "CANVAS" };
+            if modifier.params.get("ui_type").and_then(Value::as_str) != Some(ui_type) {
+                modifier
+                    .params
+                    .insert("ui_type".to_owned(), Value::String(ui_type.to_owned()));
+                changed = true;
+            }
+        }
+        if system == "fluid" && !modifier.params.contains_key("fluid_type") {
+            modifier
+                .params
+                .insert("fluid_type".to_owned(), Value::String("DOMAIN".to_owned()));
+            changed = true;
+        }
         if system == "particle_emitter"
             && node.properties.contains_key("physics_particle_emitter")
             && node
@@ -958,6 +1091,21 @@ fn ensure_physics_stack_modifier(
     let mut params = Map::new();
     let settings_id = modifier_id.to_string();
     params.insert("settings_id".to_owned(), Value::String(settings_id.clone()));
+    if system == "dynamic_paint" {
+        let role = node
+            .properties
+            .get("physics_dynamic_paint")
+            .and_then(|settings| settings.get("role"))
+            .and_then(Value::as_str)
+            .unwrap_or("canvas");
+        params.insert(
+            "ui_type".to_owned(),
+            Value::String(if role == "brush" { "BRUSH" } else { "CANVAS" }.to_owned()),
+        );
+    }
+    if system == "fluid" {
+        params.insert("fluid_type".to_owned(), Value::String("DOMAIN".to_owned()));
+    }
     let index = super::modifier::insertion_index(&node.modifiers, modifier_type);
     node.modifiers.insert(
         index,
@@ -1117,6 +1265,60 @@ fn validate_physics_references(
         }
     }
     Ok(())
+}
+
+fn fluid_modifier_role(node: &Node) -> &str {
+    node.modifiers
+        .iter()
+        .find(|modifier| modifier.modifier_type == "fluid")
+        .and_then(|modifier| modifier.params.get("fluid_type"))
+        .and_then(Value::as_str)
+        .unwrap_or("DOMAIN")
+}
+
+fn fluid_settings_for_role(role: &str) -> Option<&'static [&'static str]> {
+    match role {
+        "DOMAIN" => Some(&[
+            "type",
+            "resolution",
+            "particle_radius",
+            "smoothing_length",
+            "pressure_stiffness",
+            "viscosity",
+            "seed",
+        ]),
+        "FLOW" => Some(&["type", "inflow_rate"]),
+        "NONE" | "EFFECTOR" => Some(&[]),
+        _ => None,
+    }
+}
+
+fn validate_fluid_settings_role(
+    engine: &Engine<'_>,
+    role: &str,
+    settings: &Map<String, Value>,
+) -> Result<()> {
+    let allowed = fluid_settings_for_role(role).ok_or_else(|| {
+        engine.error(
+            ErrorCode::InvalidOperation,
+            format!("invalid fluid_type `{role}`"),
+            "/settings",
+        )
+    })?;
+    if let Some(field) = settings.keys().find(|field| !allowed.contains(&field.as_str())) {
+        return Err(engine.error(
+            ErrorCode::InvalidOperation,
+            format!("fluid setting `{field}` is not applicable to fluid_type `{role}`"),
+            &format!("/settings/{field}"),
+        ));
+    }
+    Ok(())
+}
+
+fn retain_fluid_settings_for_role(settings: &mut Map<String, Value>, role: &str) {
+    if let Some(allowed) = fluid_settings_for_role(role) {
+        settings.retain(|field, _| allowed.contains(&field.as_str()));
+    }
 }
 
 fn validate_physics_settings(

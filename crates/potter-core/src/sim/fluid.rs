@@ -20,6 +20,20 @@ struct ColliderTriangle {
     normal: DVec3,
 }
 
+/// A scene flow object, expressed as world-space triangles.
+pub struct FlowSource {
+    pub triangles: Vec<[DVec3; 3]>,
+    pub inflow_rate: f64,
+}
+
+struct PreparedFlow<'a> {
+    triangles: &'a [[DVec3; 3]],
+    weighted_triangles: Vec<(f64, usize)>,
+    total_area: f64,
+    inflow_rate: f64,
+    count: usize,
+}
+
 #[derive(Clone, Copy)]
 struct Random(u64);
 
@@ -59,6 +73,31 @@ pub fn simulate(
     seed: u32,
     colliders: &[[DVec3; 3]],
 ) -> Result<Vec<DVec3>> {
+    simulate_with_sources(
+        domain,
+        settings,
+        world,
+        frame,
+        fps,
+        gravity,
+        seed,
+        colliders,
+        &[],
+    )
+}
+
+/// Simulate a domain using explicit scene flow sources and their own inflow rates.
+pub fn simulate_with_sources(
+    domain: &Mesh,
+    settings: &Value,
+    world: DMat4,
+    frame: f64,
+    fps: f64,
+    gravity: DVec3,
+    seed: u32,
+    colliders: &[[DVec3; 3]],
+    flows: &[FlowSource],
+) -> Result<Vec<DVec3>> {
     if !frame.is_finite() || frame < 0.0 {
         return Err(invalid("fluid frame must be finite and non-negative"));
     }
@@ -75,6 +114,9 @@ pub fn simulate(
         return Err(limit(
             "fluid simulation exceeds the 100000 collider-triangle limit",
         ));
+    }
+    if flows.len() > MAX_COLLIDERS {
+        return Err(limit("fluid simulation exceeds the 100000 flow-source limit"));
     }
     let mut world_colliders = Vec::with_capacity(colliders.len());
     for points in colliders {
@@ -145,8 +187,11 @@ pub fn simulate(
         .checked_mul(resolution)
         .and_then(|count| count.checked_mul(resolution))
         .ok_or_else(|| limit("fluid particle count exceeds limits"))?;
-    let inflow_rate =
-        super::setting_number(settings, "inflow_rate", 0.0, "fluid", "a finite number")?;
+    let inflow_rate = if flows.is_empty() {
+        super::setting_number(settings, "inflow_rate", 0.0, "fluid", "a finite number")?
+    } else {
+        0.0
+    };
     if inflow_rate < 0.0 {
         return Err(invalid("fluid inflow_rate must be non-negative"));
     }
@@ -155,8 +200,82 @@ pub fn simulate(
         return Err(limit("fluid inflow exceeds the particle limit"));
     }
     let inflow_count = inflow_count_float as usize;
+    let mut prepared_flows = Vec::with_capacity(flows.len());
+    let mut flow_triangle_count = 0_usize;
+    let mut flow_inflow_count = 0_usize;
+    for flow in flows {
+        if !flow.inflow_rate.is_finite() || flow.inflow_rate < 0.0 {
+            return Err(invalid("fluid flow inflow_rate must be finite and non-negative"));
+        }
+        flow_triangle_count = flow_triangle_count
+            .checked_add(flow.triangles.len())
+            .ok_or_else(|| limit("fluid flow mesh exceeds limits"))?;
+        if flow_triangle_count > MAX_COLLIDERS {
+            return Err(limit("fluid flow meshes exceed the 100000 triangle limit"));
+        }
+        if flow.triangles.is_empty() {
+            continue;
+        }
+        let mut source_min = DVec3::splat(f64::INFINITY);
+        let mut source_max = DVec3::splat(f64::NEG_INFINITY);
+        for triangle in &flow.triangles {
+            for point in triangle {
+                if !point.is_finite() {
+                    return Err(invalid("fluid flow triangles must be finite"));
+                }
+                source_min = source_min.min(*point);
+                source_max = source_max.max(*point);
+            }
+        }
+        if source_min.cmplt(minimum).any() || source_max.cmpgt(maximum).any() {
+            continue;
+        }
+        let flow_count_float = (flow.inflow_rate * frame).floor();
+        if !flow_count_float.is_finite() || flow_count_float > MAX_PARTICLES as f64 {
+            return Err(limit("fluid flow inflow exceeds the particle limit"));
+        }
+        let count = flow_count_float as usize;
+        if count == 0 {
+            continue;
+        }
+        let mut weighted_triangles = Vec::with_capacity(flow.triangles.len());
+        let mut total_area = 0.0;
+        for (index, triangle) in flow.triangles.iter().enumerate() {
+            let area = (triangle[1] - triangle[0])
+                .cross(triangle[2] - triangle[0])
+                .length()
+                * 0.5;
+            if !area.is_finite() {
+                return Err(invalid("fluid flow triangle has a non-finite area"));
+            }
+            if area > f64::EPSILON {
+                total_area += area;
+                if !total_area.is_finite() {
+                    return Err(limit("fluid flow surface area exceeds numeric limits"));
+                }
+                weighted_triangles.push((total_area, index));
+            }
+        }
+        if total_area == 0.0 {
+            continue;
+        }
+        flow_inflow_count = flow_inflow_count
+            .checked_add(count)
+            .ok_or_else(|| limit("fluid flow inflow exceeds the particle limit"))?;
+        prepared_flows.push(PreparedFlow {
+            triangles: &flow.triangles,
+            weighted_triangles,
+            total_area,
+            inflow_rate: flow.inflow_rate,
+            count,
+        });
+    }
+    if !flows.is_empty() && prepared_flows.is_empty() {
+        return Ok(Vec::new());
+    }
     let count = base_count
         .checked_add(inflow_count)
+        .and_then(|count| count.checked_add(flow_inflow_count))
         .ok_or_else(|| limit("fluid particle count exceeds limits"))?;
     if count > MAX_PARTICLES {
         return Err(limit("fluid output exceeds the 1024 particle limit"));
@@ -246,6 +365,24 @@ pub fn simulate(
         );
         positions.push(clamp_to_bounds(position, minimum, maximum, particle_radius));
         ages.push(age);
+    }
+    for flow in &prepared_flows {
+        for index in 0..flow.count {
+            let birth_frame = (index + 1) as f64 / flow.inflow_rate;
+            let age = (frame - birth_frame).max(0.0) / fps;
+            let sample = random.unit() * flow.total_area;
+            let weighted_index = flow
+                .weighted_triangles
+                .partition_point(|(area, _)| *area <= sample)
+                .min(flow.weighted_triangles.len() - 1);
+            let triangle_index = flow.weighted_triangles[weighted_index].1;
+            let [a, b, c] = flow.triangles[triangle_index];
+            let root = random.unit().sqrt();
+            let across = random.unit();
+            let position = a * (1.0 - root) + b * (root * (1.0 - across)) + c * (root * across);
+            positions.push(position);
+            ages.push(age);
+        }
     }
 
     for index in 0..positions.len() {
@@ -570,5 +707,85 @@ mod tests {
         .expect("simulation succeeds");
         assert_eq!(positions.len(), 1);
         assert!(positions[0].z >= z && positions[0].z <= 2.0);
+    }
+    #[test]
+    fn contained_flow_emits_from_its_surface_and_outside_flow_is_ignored() {
+        let domain = Mesh {
+            vertices: vec![
+                Vertex {
+                    id: 0,
+                    co: DVec3::splat(-1.0),
+                },
+                Vertex {
+                    id: 1,
+                    co: DVec3::splat(1.0),
+                },
+            ],
+            ..Mesh::default()
+        };
+        let source = FlowSource {
+            triangles: vec![
+                [
+                    DVec3::new(-0.5, -0.5, 0.5),
+                    DVec3::new(0.5, -0.5, 0.5),
+                    DVec3::new(0.5, 0.5, 0.5),
+                ],
+                [
+                    DVec3::new(-0.5, -0.5, 0.5),
+                    DVec3::new(0.5, 0.5, 0.5),
+                    DVec3::new(-0.5, 0.5, 0.5),
+                ],
+            ],
+            inflow_rate: 2.0,
+        };
+        let settings = json!({"resolution":1,"pressure_stiffness":0.0,"viscosity":0.0});
+        let emitted = simulate_with_sources(
+            &domain,
+            &settings,
+            DMat4::IDENTITY,
+            1.0,
+            24.0,
+            DVec3::ZERO,
+            7,
+            &[],
+            &[source],
+        )
+        .expect("contained flow succeeds");
+        assert_eq!(emitted.len(), 3);
+        assert!(emitted[1..].iter().all(|point| (point.z - 0.5).abs() < 1.0e-12));
+
+        let outside = FlowSource {
+            triangles: vec![[
+                DVec3::new(-0.5, -0.5, 0.5),
+                DVec3::new(0.5, -0.5, 0.5),
+                DVec3::new(0.0, 0.5, 1.5),
+            ]],
+            inflow_rate: 2.0,
+        };
+        let baseline = simulate(
+            &domain,
+            &settings,
+            DMat4::IDENTITY,
+            1.0,
+            24.0,
+            DVec3::ZERO,
+            7,
+            &[],
+        )
+        .expect("domain succeeds");
+        let ignored = simulate_with_sources(
+            &domain,
+            &settings,
+            DMat4::IDENTITY,
+            1.0,
+            24.0,
+            DVec3::ZERO,
+            7,
+            &[],
+            &[outside],
+        )
+        .expect("outside flow succeeds");
+        assert!(!baseline.is_empty());
+        assert!(ignored.is_empty());
     }
 }

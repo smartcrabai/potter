@@ -337,6 +337,21 @@ fn physics_system_operations_persist_update_and_delete_settings() {
         stored["nodes"]["body"]["properties"]["physics_dynamic_paint"]["role"],
         "canvas"
     );
+    let modifiers = stored["nodes"]["body"]["modifiers"].as_array().unwrap();
+    assert_eq!(
+        modifiers
+            .iter()
+            .find(|modifier| modifier["type"] == "fluid")
+            .unwrap()["params"]["fluid_type"],
+        "DOMAIN"
+    );
+    assert_eq!(
+        modifiers
+            .iter()
+            .find(|modifier| modifier["type"] == "dynamic_paint")
+            .unwrap()["params"]["ui_type"],
+        "CANVAS"
+    );
 
     apply(
         &scene,
@@ -373,6 +388,21 @@ fn physics_system_operations_persist_update_and_delete_settings() {
     assert_eq!(
         updated["nodes"]["body"]["properties"]["physics_dynamic_paint"]["strength"],
         0.5
+    );
+    let updated_modifiers = updated["nodes"]["body"]["modifiers"].as_array().unwrap();
+    assert_eq!(
+        updated_modifiers
+            .iter()
+            .find(|modifier| modifier["type"] == "dynamic_paint")
+            .unwrap()["params"]["ui_type"],
+        "CANVAS"
+    );
+    assert_eq!(
+        updated_modifiers
+            .iter()
+            .find(|modifier| modifier["type"] == "fluid")
+            .unwrap()["params"]["fluid_type"],
+        "DOMAIN"
     );
 
     apply(
@@ -707,16 +737,19 @@ fn simulation_bake_contains_deformed_meshes_particles_liquid_and_paint() {
                 {"op":"node.create","id":"cloth","kind":"grid","params":{"size":2.0,"x_subdivisions":2,"y_subdivisions":2}},
                 {"op":"node.create","id":"emitter","kind":"plane","params":{}},
                 {"op":"node.create","id":"domain","kind":"box","params":{"size":2.0}},
+                {"op":"node.create","id":"flow","kind":"box","params":{"size":0.25},"transform":{"translation":[0.0,0.0,0.5]}},
                 {"op":"node.create","id":"canvas","kind":"grid","params":{"size":2.0,"x_subdivisions":2,"y_subdivisions":2}},
                 {"op":"node.create","id":"weight_canvas","kind":"grid","params":{"size":2.0,"x_subdivisions":2,"y_subdivisions":2}},
                 {"op":"node.create","id":"brush","kind":"box","params":{"size":0.1}},
                 {"op":"physics.cloth.create","target":{"id":"cloth"}},
                 {"op":"physics.particle_emitter.create","target":{"id":"emitter"},"settings":{"rate":2,"lifetime":10,"speed":0.5},"seed":17},
                 {"op":"physics.fluid.create","target":{"id":"domain"},"settings":{"type":"liquid","resolution":4}},
+                {"op":"physics.fluid.create","target":{"id":"flow"},"settings":{"type":"liquid"}},
+                {"op":"modifier.update","target":{"id":"flow"},"modifier_id":"physics_fluid","set":{"params":{"fluid_type":"FLOW"}}},
+                {"op":"physics.fluid.update","target":{"id":"flow"},"set":{"inflow_rate":2.0}},
                 {"op":"physics.dynamic_paint.create","target":{"id":"brush"},"settings":{"role":"brush","radius":1.0,"color":[0.1,0.8,0.3,1.0]}},
                 {"op":"physics.dynamic_paint.create","target":{"id":"canvas"},"settings":{"role":"canvas","brushes":["brush"]}},
                 {"op":"physics.dynamic_paint.create","target":{"id":"weight_canvas"},"settings":{"role":"canvas","surface_format":"weight","brushes":["brush"]}}
-            ]
         }),
     );
     let (output, response) = bake(&scene, &out, "1:2");
@@ -738,7 +771,7 @@ fn simulation_bake_contains_deformed_meshes_particles_liquid_and_paint() {
     assert_eq!(frame["particles"]["emitter"].as_array().unwrap().len(), 2);
     assert_eq!(
         frame["fluid_particles"]["domain"].as_array().unwrap().len(),
-        64
+        66
     );
     assert!(
         !frame["deformed_meshes"]["domain"]["faces"]
@@ -746,6 +779,20 @@ fn simulation_bake_contains_deformed_meshes_particles_liquid_and_paint() {
             .unwrap()
             .is_empty(),
         "fluid conversion produced no faces"
+    );
+    assert_eq!(
+        frame["deformed_meshes"]["flow"]["vertices"]
+            .as_array()
+            .unwrap()
+            .len(),
+        8
+    );
+    assert_eq!(
+        frame["deformed_meshes"]["flow"]["faces"]
+            .as_array()
+            .unwrap()
+            .len(),
+        6
     );
     let colors = frame["paint_colors"]["canvas"].as_array().unwrap();
     assert!(colors.iter().any(|color| color[3].as_f64().unwrap() > 0.0));

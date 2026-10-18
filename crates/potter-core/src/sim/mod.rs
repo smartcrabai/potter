@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::geom::metaball::{MetaballData, MetaballElement};
+use crate::eval::ModifierGate;
 use crate::{
     error::{ErrorCode, PotError, Result},
     eval::ModifierGate,
@@ -238,6 +239,12 @@ pub(crate) fn evaluate_stack_modifier(
     gate: ModifierGate<'_>,
 ) -> Result<StackModifierResult> {
     let cache_directory = gate.context.cache_directory;
+    if !gate.is_active(node_id, modifier) {
+        return Ok(StackModifierResult {
+            mesh: input_mesh,
+            particles: None,
+        });
+    }
     let (property, system) =
         physics_stack_classification(&modifier.modifier_type).ok_or_else(|| {
             PotError::new(
@@ -459,23 +466,39 @@ pub(crate) fn evaluate_stack_modifier(
             particles = Some(states);
         }
         "fluid" => {
-            let seed = setting_u32(settings, "seed").unwrap_or_else(|| {
-                scene
-                    .rigid_body_world
-                    .as_ref()
-                    .map_or(0, |world| world.seed)
-            });
-            let colliders = collision_meshes
-                .iter()
-                .filter(|(collider_id, _)| collider_id != node_id)
-                .map(|(_, triangle)| *triangle)
-                .collect::<Vec<_>>();
-            let samples = fluid::simulate(
-                &mesh, settings, matrix, frame, fps, gravity, seed, &colliders,
-            )?;
-            mesh = fluid_surface(&samples, matrix, settings)?;
+            let fluid_type = fluid_modifier_role(modifier);
+            if !matches!(fluid_type, "NONE" | "DOMAIN" | "FLOW" | "EFFECTOR") {
+                return Err(PotError::with_details(
+                    ErrorCode::SceneInvalid,
+                    "fluid modifier type is invalid",
+                    json!({"node_id":node_id,"modifier_id":modifier.id,"fluid_type":fluid_type}),
+                ));
+            }
+            if fluid_type == "DOMAIN" {
+                let flows = fluid_flow_sources(doc, matrices, &members, gate)?;
+                if !flows.is_empty() {
+                    let seed = setting_u32(settings, "seed").unwrap_or_else(|| {
+                        scene
+                            .rigid_body_world
+                            .as_ref()
+                            .map_or(0, |world| world.seed)
+                    });
+                    let mut colliders = collision_meshes
+                        .iter()
+                        .filter(|(collider_id, _)| collider_id != node_id)
+                        .map(|(_, triangle)| *triangle)
+                        .collect::<Vec<_>>();
+                    colliders.extend(fluid_effector_triangles(doc, matrices, &members, gate)?);
+                    let samples = fluid::simulate_with_sources(
+                        &mesh, settings, matrix, frame, fps, gravity, seed, &colliders, &flows,
+                    )?;
+                    if !samples.is_empty() {
+                        mesh = fluid_surface(&samples, matrix, settings)?;
+                    }
+                }
+            }
         }
-        "dynamic_paint" => {
+        "dynamic_paint" if setting_string(settings, "role").unwrap_or("canvas") == "canvas" => {
             let brushes = dynamic_paint_brush_settings(doc, matrices, settings, &members, gate)?;
             let mut colors = vec![[0.0; 4]; mesh.vertices.len()];
             if brushes.is_empty() {
@@ -527,6 +550,7 @@ pub(crate) fn evaluate_stack_modifier(
                 );
             }
         }
+        "dynamic_paint" => {}
         "collision" => {}
         _ => {
             return Err(PotError::new(
@@ -953,40 +977,57 @@ fn evaluate_physics(
             );
         }
         if let Some(settings) = node.properties.get("physics_fluid")
-            && gate.is_property_active(id, node, "physics_fluid", "fluid")
+            && let Some(modifier) = active_modifier(id, node, "fluid", gate)
         {
-            let domain = mesh_for_node(doc, node, id)?;
-            let seed = setting_u32(settings, "seed").unwrap_or_else(|| {
-                scene
-                    .rigid_body_world
-                    .as_ref()
-                    .map_or(0, |world| world.seed)
-            });
-            let colliders = collision_meshes
-                .iter()
-                .filter(|(collider_id, _)| collider_id != id)
-                .map(|(_, triangle)| *triangle)
-                .collect::<Vec<_>>();
-            let particles = fluid::simulate(
-                domain, settings, matrix, frame, fps, gravity, seed, &colliders,
-            )?;
-            if particles.iter().any(|position| !position.is_finite()) {
-                return Err(PotError::new(
-                    ErrorCode::EvaluationFailed,
-                    format!("fluid state for `{id}` is not finite"),
+            let fluid_type = fluid_modifier_role(modifier);
+            if !matches!(fluid_type, "NONE" | "DOMAIN" | "FLOW" | "EFFECTOR") {
+                return Err(PotError::with_details(
+                    ErrorCode::SceneInvalid,
+                    "fluid modifier type is invalid",
+                    json!({"node_id":id,"modifier_id":modifier.id,"fluid_type":fluid_type}),
                 ));
             }
-            let local_surface = fluid_surface(&particles, matrix, settings)?;
-            result
-                .fluid_particles
-                .insert(id.clone(), particles.iter().map(DVec3::to_array).collect());
-            if !local_surface.vertices.is_empty() {
-                result.fluid_surfaces.insert(id.clone(), local_surface);
+            if fluid_type == "DOMAIN" {
+                let flows = fluid_flow_sources(doc, matrices, members, gate)?;
+                if !flows.is_empty() {
+                    let domain = mesh_for_node(doc, node, id)?;
+                    let seed = setting_u32(settings, "seed").unwrap_or_else(|| {
+                        scene
+                            .rigid_body_world
+                            .as_ref()
+                            .map_or(0, |world| world.seed)
+                    });
+                    let mut colliders = collision_meshes
+                        .iter()
+                        .filter(|(collider_id, _)| collider_id != id)
+                        .map(|(_, triangle)| *triangle)
+                        .collect::<Vec<_>>();
+                    colliders.extend(fluid_effector_triangles(doc, matrices, members, gate)?);
+                    let particles = fluid::simulate_with_sources(
+                        domain, settings, matrix, frame, fps, gravity, seed, &colliders, &flows,
+                    )?;
+                    if particles.iter().any(|position| !position.is_finite()) {
+                        return Err(PotError::new(
+                            ErrorCode::EvaluationFailed,
+                            format!("fluid state for `{id}` is not finite"),
+                        ));
+                    }
+                    if !particles.is_empty() {
+                        let local_surface = fluid_surface(&particles, matrix, settings)?;
+                        result
+                            .fluid_particles
+                            .insert(id.clone(), particles.iter().map(DVec3::to_array).collect());
+                        if !local_surface.vertices.is_empty() {
+                            result.fluid_surfaces.insert(id.clone(), local_surface);
+                        }
+                    }
+                }
             }
         }
         if let Some(settings) = node.properties.get("physics_dynamic_paint")
             && gate.is_property_active(id, node, "physics_dynamic_paint", "dynamic_paint")
             && setting_string(settings, "role").unwrap_or("canvas") == "canvas"
+            && active_modifier(id, node, "dynamic_paint", gate).is_some()
         {
             let canvas = mesh_for_node(doc, node, id)?;
             let brushes = dynamic_paint_brush_settings(doc, matrices, settings, members, gate)?;
@@ -1144,6 +1185,136 @@ fn collider_triangles(
     Ok(triangles)
 }
 
+fn active_modifier<'a>(
+    node_id: &Id,
+    node: &'a Node,
+    modifier_type: &str,
+    gate: ModifierGate<'_>,
+) -> Option<&'a Modifier> {
+    node.modifiers
+        .iter()
+        .find(|modifier| modifier.modifier_type == modifier_type && gate.is_active(node_id, modifier))
+}
+
+fn fluid_modifier_role(modifier: &Modifier) -> &str {
+    modifier
+        .params
+        .get("fluid_type")
+        .and_then(Value::as_str)
+        .unwrap_or("DOMAIN")
+}
+
+fn fluid_mesh_triangles(
+    doc: &SceneDoc,
+    matrices: &BTreeMap<Id, DMat4>,
+    node: &Node,
+    node_id: &Id,
+) -> Result<Vec<[DVec3; 3]>> {
+    let mesh = mesh_for_node(doc, node, node_id)?;
+    let matrix = matrices.get(node_id).copied().ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::EvaluationFailed,
+            "fluid object transform is missing",
+            json!({"node_id":node_id}),
+        )
+    })?;
+    let positions = mesh
+        .vertices
+        .iter()
+        .map(|vertex| (vertex.id, matrix.transform_point3(vertex.co)))
+        .collect::<BTreeMap<_, _>>();
+    let mesh_triangles = mesh.triangulate().map_err(|error| {
+        PotError::with_details(
+            ErrorCode::SceneInvalid,
+            format!("fluid mesh `{node_id}` is invalid: {error}"),
+            json!({"node_id":node_id}),
+        )
+    })?;
+    let mut triangles = Vec::with_capacity(mesh_triangles.len());
+    for triangle in mesh_triangles {
+        let points = triangle.map(|vertex_id| positions.get(&vertex_id).copied());
+        let [Some(a), Some(b), Some(c)] = points else {
+            return Err(PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "fluid triangle references a missing vertex",
+                json!({"node_id":node_id}),
+            ));
+        };
+        triangles.push([a, b, c]);
+    }
+    Ok(triangles)
+}
+
+fn fluid_flow_sources(
+    doc: &SceneDoc,
+    matrices: &BTreeMap<Id, DMat4>,
+    members: &BTreeSet<Id>,
+    gate: ModifierGate<'_>,
+) -> Result<Vec<fluid::FlowSource>> {
+    let mut flows = Vec::new();
+    for (node_id, node) in &doc.nodes {
+        if !members.contains(node_id) {
+            continue;
+        }
+        let Some(modifier) = active_modifier(node_id, node, "fluid", gate) else {
+            continue;
+        };
+        if fluid_modifier_role(modifier) != "FLOW" {
+            continue;
+        }
+        let settings = node
+            .properties
+            .get("physics_fluid")
+            .ok_or_else(|| {
+                PotError::with_details(
+                    ErrorCode::SceneInvalid,
+                    "fluid flow modifier has no linked settings",
+                    json!({"node_id":node_id}),
+                )
+            })?;
+        flows.push(fluid::FlowSource {
+            triangles: fluid_mesh_triangles(doc, matrices, node, node_id)?,
+            inflow_rate: setting_number(
+                settings,
+                "inflow_rate",
+                0.0,
+                "fluid",
+                "a finite number",
+            )?,
+        });
+    }
+    Ok(flows)
+}
+
+fn fluid_effector_triangles(
+    doc: &SceneDoc,
+    matrices: &BTreeMap<Id, DMat4>,
+    members: &BTreeSet<Id>,
+    gate: ModifierGate<'_>,
+) -> Result<Vec<[DVec3; 3]>> {
+    let mut triangles = Vec::new();
+    for (node_id, node) in &doc.nodes {
+        if !members.contains(node_id) {
+            continue;
+        }
+        let Some(modifier) = active_modifier(node_id, node, "fluid", gate) else {
+            continue;
+        };
+        if fluid_modifier_role(modifier) != "EFFECTOR" {
+            continue;
+        }
+        if !node.properties.contains_key("physics_fluid") {
+            return Err(PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "fluid effector modifier has no linked settings",
+                json!({"node_id":node_id}),
+            ));
+        }
+        triangles.extend(fluid_mesh_triangles(doc, matrices, node, node_id)?);
+    }
+    Ok(triangles)
+}
+
 fn local_collision_triangles(
     triangles: &[(Id, [DVec3; 3])],
     subject_id: &Id,
@@ -1239,6 +1410,7 @@ fn dynamic_paint_brush_settings(
                     .get("physics_dynamic_paint")
                     .and_then(|settings| setting_string(settings, "role"))
                     == Some("brush")
+                && active_modifier(id, node, "dynamic_paint", gate).is_some()
             {
                 brush_ids.insert(id.clone());
             }
@@ -1272,6 +1444,9 @@ fn dynamic_paint_brush_settings(
                 "dynamic-paint target is not configured as a brush",
                 json!({"brush_id":id}),
             ));
+        }
+        if active_modifier(&id, node, "dynamic_paint", gate).is_none() {
+            continue;
         }
         let matrix = matrices.get(&id).copied().ok_or_else(|| {
             PotError::with_details(
@@ -1396,3 +1571,4 @@ fn setting_color(settings: &Value) -> Option<[f64; 4]> {
     };
     Some([r.as_f64()?, g.as_f64()?, b.as_f64()?, a.as_f64()?])
 }
+

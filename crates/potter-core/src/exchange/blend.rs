@@ -2450,6 +2450,21 @@ fn build_imported_graph(
                         .get("physics_settings")
                         .cloned()
                         .unwrap_or_else(|| json!({}));
+                    if model_type == "fluid" {
+                        if let Some(settings) = settings.as_object_mut() {
+                            settings.remove("role");
+                        }
+                    } else if model_type == "dynamic_paint"
+                        && let Some(role) = settings
+                            .get("role")
+                            .and_then(Value::as_str)
+                            .filter(|role| matches!(*role, "brush" | "canvas"))
+                    {
+                        params.insert(
+                            "ui_type".to_owned(),
+                            json!(if role == "brush" { "BRUSH" } else { "CANVAS" }),
+                        );
+                    }
                     canonicalize_blender_id_references(
                         &mut settings,
                         &object_ids,

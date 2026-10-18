@@ -416,16 +416,16 @@ checks['soft_body'] = {'settings':fields(soft.settings, ['mass','friction','spee
 collision = bpy.data.objects['Collision'].modifiers['CollisionSettingsFixture']
 checks['collision'] = {'settings':fields(collision.settings, ['use','damping_factor','damping_random','friction_factor','friction_random','permeability','use_particle_kill','thickness_inner','thickness_outer','cloth_friction','absorption'])}
 brush_mod = bpy.data.objects['DynamicPaintBrush'].modifiers['BrushSettingsFixture']
-checks['dynamic_paint_brush'] = {'settings':fields(brush_mod.brush_settings, ['paint_color','paint_alpha','use_absolute_alpha','paint_wetness','use_paint_erase','wave_type','wave_factor','wave_clamp','use_smudge','smudge_strength','velocity_max','use_velocity_alpha']), 'canvas_surfaces':[], 'role':'brush'}
+checks['dynamic_paint_brush'] = {'settings':fields(brush_mod.brush_settings, ['paint_color','paint_alpha','use_absolute_alpha','paint_wetness','use_paint_erase','wave_type','wave_factor','wave_clamp','use_smudge','smudge_strength','velocity_max','use_velocity_alpha']), 'canvas_surfaces':[], 'role':'brush', 'ui_type':brush_mod.ui_type}
 canvas_mod = bpy.data.objects['DynamicPaintCanvas'].modifiers['CanvasSettingsFixture']
 canvas_surfaces = canvas_mod.canvas_settings.canvas_surfaces
-checks['dynamic_paint_canvas'] = {'settings':{}, 'canvas_surfaces':[fields(canvas_surfaces[0], ['surface_format','surface_type','is_active','use_dissolve','dissolve_speed','use_drying','dry_speed','frame_start','frame_end'])], 'role':'canvas'}
+checks['dynamic_paint_canvas'] = {'settings':{}, 'canvas_surfaces':[fields(canvas_surfaces[0], ['surface_format','surface_type','is_active','use_dissolve','dissolve_speed','use_drying','dry_speed','frame_start','frame_end'])], 'role':'canvas', 'ui_type':canvas_mod.ui_type}
 domain_mod = bpy.data.objects['FluidDomain'].modifiers['FluidDomainSettingsFixture']
-checks['fluid_domain'] = {'settings':fields(domain_mod.domain_settings, ['domain_type','resolution_max','use_adaptive_domain','cache_frame_start','cache_frame_end','cache_frame_offset','cache_data_format','cache_mesh_format','cache_directory','time_scale']), 'role':'DOMAIN', 'show_viewport':bool(domain_mod.show_viewport), 'show_render':bool(domain_mod.show_render)}
+checks['fluid_domain'] = {'settings':fields(domain_mod.domain_settings, ['domain_type','resolution_max','use_adaptive_domain','cache_frame_start','cache_frame_end','cache_frame_offset','cache_data_format','cache_mesh_format','cache_directory','time_scale']), 'role':'DOMAIN', 'fluid_type':domain_mod.fluid_type, 'show_viewport':bool(domain_mod.show_viewport), 'show_render':bool(domain_mod.show_render)}
 flow_mod = bpy.data.objects['FluidFlow'].modifiers['FluidFlowSettingsFixture']
-checks['fluid_flow'] = {'settings':fields(flow_mod.flow_settings, ['density','fuel_amount','temperature','flow_type','flow_behavior','flow_source','use_absolute','use_initial_velocity','velocity_coord','surface_distance']), 'role':'FLOW', 'show_viewport':bool(flow_mod.show_viewport), 'show_render':bool(flow_mod.show_render)}
+checks['fluid_flow'] = {'settings':fields(flow_mod.flow_settings, ['density','fuel_amount','temperature','flow_type','flow_behavior','flow_source','use_absolute','use_initial_velocity','velocity_coord','surface_distance']), 'role':'FLOW', 'fluid_type':flow_mod.fluid_type, 'show_viewport':bool(flow_mod.show_viewport), 'show_render':bool(flow_mod.show_render)}
 effector_mod = bpy.data.objects['FluidEffector'].modifiers['FluidEffectorSettingsFixture']
-checks['fluid_effector'] = {'settings':fields(effector_mod.effector_settings, ['effector_type','surface_distance','use_plane_init','velocity_factor','guide_mode','use_effector','subframes']), 'role':'EFFECTOR', 'show_viewport':bool(effector_mod.show_viewport), 'show_render':bool(effector_mod.show_render)}
+checks['fluid_effector'] = {'settings':fields(effector_mod.effector_settings, ['effector_type','surface_distance','use_plane_init','velocity_factor','guide_mode','use_effector','subframes']), 'role':'EFFECTOR', 'fluid_type':effector_mod.fluid_type, 'show_viewport':bool(effector_mod.show_viewport), 'show_render':bool(effector_mod.show_render)}
 emitter = bpy.data.objects['ParticleEmitter']
 particle_system = emitter.particle_systems[0]
 checks['particle_system'] = {'settings':fields(particle_system.settings, ['count','frame_start','frame_end','lifetime','lifetime_random','emit_from','physics_type','normal_factor','factor_random','particle_size','size_random','render_type','child_type']), 'point_cache':cache_values(particle_system), 'seed':int(particle_system.seed)}
@@ -677,7 +677,22 @@ fn simulation_modifiers_settings_caches_and_frame_ranges_round_trip() -> Result<
         } else {
             &scene["nodes"][node_id]["properties"][property_name]
         };
-        assert_physics_settings(settings, &expected["settings"][case_name], case_name);
+        let mut expected_settings = expected["settings"][case_name].clone();
+        if property_name == "physics_fluid" {
+            let role = expected_settings["role"].as_str().unwrap();
+            assert_eq!(imported_modifier["params"]["fluid_type"], role);
+            expected_settings
+                .as_object_mut()
+                .unwrap()
+                .remove("role");
+        } else if property_name == "physics_dynamic_paint" {
+            let role = expected_settings["role"].as_str().unwrap();
+            assert_eq!(
+                imported_modifier["params"]["ui_type"],
+                if role == "brush" { "BRUSH" } else { "CANVAS" }
+            );
+        }
+        assert_physics_settings(settings, &expected_settings, case_name);
         if let Some(show_viewport) = expected["settings"][case_name].get("show_viewport") {
             assert_eq!(imported_modifier["enabled"], true, "{case_name}.enabled");
             assert_eq!(
@@ -809,6 +824,21 @@ fn simulation_modifiers_settings_caches_and_frame_ranges_round_trip() -> Result<
             &expected["settings"][case_name],
             &format!("reopened.{case_name}"),
         );
+    }
+    assert_eq!(
+        after["settings"]["dynamic_paint_brush"]["ui_type"],
+        "BRUSH"
+    );
+    assert_eq!(
+        after["settings"]["dynamic_paint_canvas"]["ui_type"],
+        "CANVAS"
+    );
+    for (name, role) in [
+        ("fluid_domain", "DOMAIN"),
+        ("fluid_flow", "FLOW"),
+        ("fluid_effector", "EFFECTOR"),
+    ] {
+        assert_eq!(after["settings"][name]["fluid_type"], role);
     }
     assert_subset(
         &after["modifiers"]["ParticleInstance"],

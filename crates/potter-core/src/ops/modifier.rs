@@ -354,6 +354,7 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                 "/target",
             ));
         }
+        validate_volume_object_type(engine, &modifier_type, &target)?;
         if engine
             .doc
             .nodes
@@ -476,6 +477,9 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                 "physics modifier type cannot be changed; delete and recreate it",
             ));
         }
+        if modifier_type != existing.modifier_type {
+            validate_volume_object_type(engine, modifier_type, &target)?;
+        }
         let params = set
             .get("params")
             .map(|value| {
@@ -502,6 +506,7 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                 validate_attribute_modifier_params(engine, modifier_type, &params, "/set/params")?;
             }
             validate_particle_modifier_params(engine, modifier_type, &params)?;
+            validate_volume_object_type(engine, modifier_type, &target)?;
             Some(super::physics::update_linked_modifier_settings(
                 engine,
                 &target,
@@ -2262,6 +2267,27 @@ fn unsupported_attribute_modifier_value(modifier_type: &str, parameter: &str) ->
     )
 }
 
+fn validate_volume_object_type(engine: &Engine<'_>, modifier_type: &str, target: &Id) -> Result<()> {
+    let expected_kind = match modifier_type {
+        "mesh_to_volume" | "volume_displace" => "volume",
+        "volume_to_mesh" => "mesh",
+        _ => return Ok(()),
+    };
+    if engine
+        .doc
+        .nodes
+        .get(target)
+        .is_some_and(|node| node.kind == expected_kind)
+    {
+        return Ok(());
+    }
+    Err(engine.error(
+        ErrorCode::InvalidOperation,
+        format!("{modifier_type} modifiers require a {expected_kind} Object"),
+        "/target",
+    ))
+}
+
 fn is_physics_modifier(modifier_type: &str) -> bool {
     matches!(
         modifier_type,
@@ -2314,17 +2340,6 @@ fn validate_volume_displace_params(engine: &Engine<'_>, params: &Map<String, Val
             ErrorCode::InvalidOperation,
             "Volume Displace texture_map_mode must be LOCAL, GLOBAL, or OBJECT",
             "/params/texture_map_mode",
-        ));
-    }
-    let mapping_mode = params
-        .get("texture_map_mode")
-        .and_then(Value::as_str)
-        .unwrap_or("LOCAL");
-    if mapping_mode == "OBJECT" && params.get("texture_map_object").is_none_or(Value::is_null) {
-        return Err(engine.error(
-            ErrorCode::InvalidOperation,
-            "Volume Displace OBJECT mapping requires texture_map_object",
-            "/params/texture_map_object",
         ));
     }
     if let Some(object) = params

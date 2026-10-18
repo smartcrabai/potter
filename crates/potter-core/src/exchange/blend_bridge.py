@@ -2668,6 +2668,8 @@ def set_modifier_params(modifier, item, id_lookup, doc, target, node_id, obj):
         rna_params.pop(parameter, None)
     set_rna(modifier, rna_params, id_lookup)
     _restore_modifier_id_references(modifier, rna_params, id_lookup)
+    if kind == "dynamic_paint" and settings.get("role") in ("brush", "canvas"):
+        modifier.ui_type = settings["role"].upper()
     if kind in ("vertex_weight_edit", "vertex_weight_proximity") and "map_curve" in params:
         _set_curve_mapping(modifier, params["map_curve"])
     if kind == "mesh_cache" and params.get("resource"):
