@@ -17,7 +17,12 @@ use super::{
 use crate::{
     error::{ErrorCode, PotError, Result},
     eval::{EvaluationPurpose, SlotBinding, Snapshot},
-    geom::{Mesh, normals::corner_normals, uv_layers},
+    geom::{
+        Mesh, attribute_keys,
+        color_layers::{self, ColorDomain, ColorLayer, ColorStore},
+        normals::corner_normals,
+        uv_layers,
+    },
     model::{
         Action, ArmatureData, Bone, DataBlock, Extrapolation, FCurve, Id, Image, ImageAlphaMode,
         ImageColorspace, ImageSource, Interpolation, Keyframe, Material, Node, SceneDoc,
@@ -100,8 +105,8 @@ struct BoneExport {
     local: DMat4,
 }
 
-/// Export the evaluated mesh and scene transforms as ASCII FBX 7.4. Color layers and generic
-/// attributes are not written; `exchange::attribute_losses` reports them.
+/// Export the evaluated mesh and scene transforms as ASCII FBX 7.4. Color layers are written as
+/// `LayerElementColor`; generic attributes are not written.
 pub(crate) fn export(doc: &SceneDoc, snapshot: &Snapshot) -> Result<Vec<u8>> {
     export_with_root(doc, snapshot, Path::new("."))
 }
@@ -1623,11 +1628,17 @@ fn write_geometry(
     }
     let fallback_material_index = material_slot_indices.iter().copied().flatten().next();
     let has_material_layer = fallback_material_index.is_some();
-    // Shading attributes and UV layers have their own FBX layers. Unsupported attributes are
-    // skipped only for lossy export and are reported by `commands::export::export_losses`.
+    // Shading attributes, UV layers, and color layers have their own FBX layers. Unsupported
+    // attributes are skipped only for lossy export and are reported by `commands::export::export_losses`.
+    let colors = color_layers::read(mesh);
     if !allow_lossy
         && mesh.attributes.keys().any(|name| {
             name != uv_layers::ATTRIBUTE
+                && name != color_layers::ATTRIBUTE
+                && !colors
+                    .layers
+                    .iter()
+                    .any(|layer| attribute_keys::storage_key(&layer.name) == name.as_str())
                 && !crate::geom::normals::SHADING_ATTRIBUTES.contains(&name.as_str())
         })
     {
@@ -1669,6 +1680,7 @@ fn write_geometry(
             .is_some_and(|keys| !keys.keys.is_empty())
             || !data.vertex_groups.is_empty()
             || !data.vertex_weights.is_empty()
+            || !colors.layers.is_empty()
             || node
                 .modifiers
                 .iter()
@@ -1678,6 +1690,7 @@ fn write_geometry(
             "shape_keys": &data.shape_keys,
             "vertex_groups": &data.vertex_groups,
             "vertex_weights": &data.vertex_weights,
+            "color_roles": {"active": colors.active, "render": colors.render},
         }))
         .map_err(|error| {
             PotError::with_details(
@@ -1778,6 +1791,7 @@ fn write_geometry(
     }
     output.push_str("\n\t\t}\n");
     write_normal_layer(output, mesh)?;
+    write_color_layers(output, mesh, &colors)?;
     write_uv_layers(output, mesh)?;
     // Blender's FBX exporter sends a face index at or past the slot count to the first exported
     // material (`export_fbx_bin.py`, `def_me_blmaterial_idx`). `.get` returns `None` for such an index
@@ -1807,6 +1821,13 @@ fn write_geometry(
     output.push_str("\t\tLayer: 0 {\n\t\t\tVersion: 100\n\t\t\tLayerElement: {\n\t\t\t\tType: \"LayerElementNormal\"\n\t\t\t\tTypedIndex: 0\n\t\t\t}\n");
     if has_material_layer {
         output.push_str("\t\t\tLayerElement: {\n\t\t\t\tType: \"LayerElementMaterial\"\n\t\t\t\tTypedIndex: 0\n\t\t\t}\n");
+    }
+    for index in 0..colors.layers.len() {
+        writeln!(
+            output,
+            "\t\t\tLayerElement: {{\n\t\t\t\tType: \"LayerElementColor\"\n\t\t\t\tTypedIndex: {index}\n\t\t\t}}"
+        )
+        .map_err(write_error)?;
     }
     // Blender keeps the first UV layer in layer 0 and gives each further layer its own layer.
     let uv_count = uv_layers::layer_count(mesh);
@@ -1868,6 +1889,90 @@ fn write_normal_layer(output: &mut String, mesh: &Mesh) -> Result<()> {
     let encoded = indices.iter().map(usize::to_string).collect::<Vec<_>>();
     output.push_str(&encoded.join(","));
     output.push_str("\n\t\t\t}\n\t\t}\n");
+    Ok(())
+}
+
+/// Writes each color layer as a `LayerElementColor` in its own domain, with linear RGBA values.
+/// Point layers use `ByVertice`, FBX's control-point mapping; corner layers use `ByPolygonVertex`,
+/// which Blender reads as CORNER. Equal values share one `ColorIndex` entry.
+fn write_color_layers(output: &mut String, mesh: &Mesh, store: &ColorStore) -> Result<()> {
+    for (layer_index, layer) in store.layers.iter().enumerate() {
+        let expected = match layer.domain {
+            ColorDomain::Point => mesh.vertices.len(),
+            ColorDomain::Corner => mesh
+                .faces
+                .iter()
+                .try_fold(0_usize, |count, face| {
+                    count.checked_add(face.vertices.len())
+                })
+                .ok_or_else(|| {
+                    PotError::new(ErrorCode::LimitExceeded, "FBX color corner count overflow")
+                })?,
+        };
+        if layer.values.len() != expected
+            || layer
+                .values
+                .iter()
+                .flatten()
+                .any(|component| !component.is_finite())
+        {
+            return Err(PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "FBX color layer has invalid values for its mapping",
+                json!({"layer": layer.name, "expected": expected, "actual": layer.values.len()}),
+            ));
+        }
+        let mut unique = BTreeMap::<[u64; 4], usize>::new();
+        let mut values = Vec::<[f64; 4]>::new();
+        let mut indices = Vec::<usize>::with_capacity(layer.values.len());
+        for value in &layer.values {
+            // Adding 0.0 maps -0.0 onto 0.0, so the two share one entry.
+            let key = value.map(|component| (component + 0.0).to_bits());
+            let index = *unique.entry(key).or_insert_with(|| {
+                values.push(*value);
+                values.len() - 1
+            });
+            indices.push(index);
+        }
+        let mapping = match layer.domain {
+            ColorDomain::Point => "ByVertice",
+            ColorDomain::Corner => "ByPolygonVertex",
+        };
+        let component_count = values.len().checked_mul(4).ok_or_else(|| {
+            PotError::new(
+                ErrorCode::LimitExceeded,
+                "FBX color component count overflow",
+            )
+        })?;
+        write!(
+            output,
+            "\t\tLayerElementColor: {layer_index} {{\n\t\t\tVersion: 101\n\t\t\tName: \"{}\"\n\t\t\tMappingInformationType: \"{mapping}\"\n\t\t\tReferenceInformationType: \"IndexToDirect\"\n\t\t\tColors: *{component_count} {{\n\t\t\t\ta: ",
+            quote(&layer.name)
+        )
+        .map_err(write_error)?;
+        output.push_str(
+            &values
+                .iter()
+                .flatten()
+                .map(|value| fmt_num(*value))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        write!(
+            output,
+            "\n\t\t\t}}\n\t\t\tColorIndex: *{} {{\n\t\t\t\ta: ",
+            indices.len()
+        )
+        .map_err(write_error)?;
+        output.push_str(
+            &indices
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        output.push_str("\n\t\t\t}\n\t\t}\n");
+    }
     Ok(())
 }
 
@@ -2050,11 +2155,7 @@ fn import_bytes_with_base(
                     ));
                 }
                 let geometry = parse_geometry(object, id, &mut losses)?;
-                for attribute in [
-                    "LayerElementTangent",
-                    "LayerElementBinormal",
-                    "LayerElementColor",
-                ] {
+                for attribute in ["LayerElementTangent", "LayerElementBinormal"] {
                     if object.child(attribute).is_some() {
                         losses.push(Loss {
                             feature_id: format!(
@@ -2343,6 +2444,7 @@ fn import_bytes_with_base(
                 geometry.uv_active,
                 geometry.uv_render,
             );
+            color_layers::write(&mut mesh, &geometry.colors);
             for (face_index, face) in mesh.faces.iter_mut().enumerate() {
                 let slot = geometry
                     .material_indices
@@ -2467,6 +2569,8 @@ struct ImportedGeometry {
     uv_active: Option<usize>,
     /// Index of the render UV layer; `None` when the geometry has no UV layer.
     uv_render: Option<usize>,
+    /// Color layers in file order; empty when the geometry has none.
+    colors: ColorStore,
 }
 
 fn decode_deformation_field<T: DeserializeOwned>(
@@ -2734,6 +2838,14 @@ fn parse_geometry(
     };
     let uv_active = select("potter:uv_active");
     let uv_render = select("potter:uv_render");
+    let colors = parse_color_layers(
+        node,
+        positions.len(),
+        &faces,
+        geometry_id,
+        deformation.as_ref(),
+        losses,
+    )?;
     Ok(ImportedGeometry {
         positions,
         faces,
@@ -2743,6 +2855,7 @@ fn parse_geometry(
         uv_layers: layers,
         uv_active,
         uv_render,
+        colors,
     })
 }
 
@@ -2987,6 +3100,159 @@ fn parse_uv_values(
         );
     }
     Ok(Some(values))
+}
+
+/// Reads the `LayerElementColor` layers of a geometry as color layers, in file order. The active and
+/// render layers come from the `color_roles` that the export records in `potter:deformation`; without
+/// them, the first layer is both. A mapping or reference Potter cannot represent is reported as a loss.
+fn parse_color_layers(
+    node: &FbxNode,
+    point_count: usize,
+    faces: &[Vec<usize>],
+    geometry_id: i64,
+    deformation: Option<&Value>,
+    losses: &mut Vec<Loss>,
+) -> Result<ColorStore> {
+    let corner_count = faces.iter().map(Vec::len).sum::<usize>();
+    let mut layers = Vec::<ColorLayer>::new();
+    for layer in node
+        .children
+        .iter()
+        .filter(|child| child.name == "LayerElementColor")
+    {
+        let raw_name = layer
+            .child("Name")
+            .and_then(FbxNode::first_arg)
+            .unwrap_or("");
+        let mapping = layer
+            .child("MappingInformationType")
+            .and_then(FbxNode::first_arg)
+            .unwrap_or("");
+        let domain = match mapping {
+            "ByPolygonVertex" => ColorDomain::Corner,
+            "ByVertice" | "ByVertex" | "ByControlPoint" => ColorDomain::Point,
+            _ => {
+                losses.push(color_import_loss(
+                    geometry_id,
+                    format!("FBX color layer `{raw_name}` mapping `{mapping}` is not represented"),
+                ));
+                continue;
+            }
+        };
+        let reference = layer
+            .child("ReferenceInformationType")
+            .and_then(FbxNode::first_arg)
+            .unwrap_or("");
+        let indexed = match reference {
+            "Direct" => false,
+            "IndexToDirect" => true,
+            _ => {
+                losses.push(color_import_loss(
+                    geometry_id,
+                    format!(
+                        "FBX color layer `{raw_name}` reference `{reference}` is not represented"
+                    ),
+                ));
+                continue;
+            }
+        };
+        let raw_values = numeric_array(
+            layer
+                .child("Colors")
+                .ok_or_else(|| import_error("FBX LayerElementColor has no Colors array"))?,
+        )?;
+        if raw_values.len() % 4 != 0 || raw_values.iter().any(|value| !value.is_finite()) {
+            return Err(import_error(
+                "FBX Colors array must contain finite rgba tuples",
+            ));
+        }
+        let direct = raw_values.as_chunks::<4>().0.to_vec();
+        let indices = if indexed {
+            Some(integer_array(layer.child("ColorIndex").ok_or_else(
+                || import_error("FBX LayerElementColor has no ColorIndex array"),
+            )?)?)
+        } else {
+            None
+        };
+        let element_count = indices.as_ref().map_or(direct.len(), Vec::len);
+        let expected = match domain {
+            ColorDomain::Point => point_count,
+            ColorDomain::Corner => corner_count,
+        };
+        if element_count != expected {
+            return Err(import_error(
+                "FBX LayerElementColor count does not match its mapping",
+            ));
+        }
+        let mut values = Vec::with_capacity(expected);
+        for element in 0..expected {
+            let direct_index = match &indices {
+                Some(indices) => usize::try_from(indices[element])
+                    .map_err(|_| import_error("FBX LayerElementColor index is negative"))?,
+                None => element,
+            };
+            values.push(
+                *direct
+                    .get(direct_index)
+                    .ok_or_else(|| import_error("FBX LayerElementColor index is outside Colors"))?,
+            );
+        }
+        let raw_name = if raw_name.is_empty() {
+            "Color"
+        } else {
+            raw_name
+        };
+        let name = unique_color_name(raw_name, &layers);
+        layers.push(ColorLayer {
+            name,
+            domain,
+            values,
+        });
+    }
+    let first_name = layers.first().map(|layer| layer.name.clone());
+    let role = |key: &str| {
+        let Some(roles) = deformation.and_then(|value| value.get("color_roles")) else {
+            return first_name.clone();
+        };
+        match roles.get(key) {
+            Some(Value::Null) => None,
+            Some(Value::String(name)) if layers.iter().any(|layer| layer.name.as_str() == name) => {
+                Some(name.clone())
+            }
+            Some(_) | None => first_name.clone(),
+        }
+    };
+    Ok(ColorStore {
+        active: role("active"),
+        render: role("render"),
+        layers,
+    })
+}
+
+/// `name`, or `name.001`-style with the first suffix that no earlier layer uses.
+fn unique_color_name(name: &str, layers: &[ColorLayer]) -> String {
+    if !layers.iter().any(|layer| layer.name == name) {
+        return name.to_owned();
+    }
+    let mut suffix = 1_usize;
+    loop {
+        let candidate = format!("{name}.{suffix:03}");
+        if !layers.iter().any(|layer| layer.name == candidate) {
+            return candidate;
+        }
+        suffix += 1;
+    }
+}
+
+fn color_import_loss(geometry_id: i64, reason: String) -> Loss {
+    Loss {
+        feature_id: "mesh.color_attribute".to_owned(),
+        data_id: Some(geometry_id.to_string()),
+        reason,
+        suggestion: Some(
+            "use --allow-lossy to import the file without these color layers".to_owned(),
+        ),
+    }
 }
 
 fn normal_loss(geometry_id: i64, reason: impl Into<String>) -> Loss {

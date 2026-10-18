@@ -545,8 +545,8 @@ fn property_kind(node: &Node, index: usize, parent: Option<&str>) -> Result<char
 
 fn array_type(parent: &str) -> char {
     match parent {
-        "PolygonVertexIndex" | "NormalsIndex" | "UVIndex" | "Materials" | "Indexes"
-        | "KeyAttrFlags" | "KeyAttrRefCount" => 'i',
+        "PolygonVertexIndex" | "NormalsIndex" | "UVIndex" | "ColorIndex" | "Materials"
+        | "Indexes" | "KeyAttrFlags" | "KeyAttrRefCount" => 'i',
         "KeyTime" => 'l',
         "KeyValueFloat" | "KeyAttrDataFloat" => 'f',
         _ => 'd',

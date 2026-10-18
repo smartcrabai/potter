@@ -624,6 +624,7 @@ pub fn validate_with_context(
                             losses
                                 .extend(crate::exchange::shading::shading_losses(format, &meshes));
                             losses.extend(crate::exchange::uv_layer_losses(format, &meshes));
+                            losses.extend(crate::exchange::element_data_losses(format, &meshes));
                             match crate::commands::export::mesh_data_losses(doc, format, snapshot) {
                                 Ok(mesh_losses) => losses.extend(mesh_losses),
                                 Err(error) => issue(

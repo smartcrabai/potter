@@ -79,6 +79,21 @@ pub(crate) struct ExchangeMesh {
     pub uv_active: Option<usize>,
     /// Index into `uv_layers` of the render layer.
     pub uv_render: Option<usize>,
+    /// Canonical linear RGBA color layers, in source vertex/corner storage order.
+    pub colors: color_layers::ColorStore,
+    /// Sparse evaluated vertex-group assignments. A stored zero weight is an assignment.
+    pub vertex_groups: Vec<ExchangeVertexGroup>,
+    /// Resolved material slot ids from `Snapshot::slot_material`, one entry per slot.
+    pub material_slots: Vec<Option<Id>>,
+    /// Evaluated face slot indices, aligned with `faces`.
+    pub face_material_indices: Vec<u32>,
+}
+
+/// One named vertex group, represented by sparse `(source vertex index, weight)` assignments.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct ExchangeVertexGroup {
+    pub name: String,
+    pub weights: Vec<(usize, f64)>,
 }
 
 /// One UV layer of an exchange mesh.
@@ -289,6 +304,27 @@ pub(crate) fn evaluated_meshes(
             .collect::<Vec<_>>();
         let uv_active = uv.active.as_deref().and_then(|name| uv.index_of(name));
         let uv_render = uv.render_index();
+        let data = node.data.as_ref().and_then(|id| doc.data_blocks.get(id));
+        let vertex_groups = data.map_or_else(Vec::new, |data| {
+            data.vertex_groups
+                .iter()
+                .map(|group| ExchangeVertexGroup {
+                    name: group.name.clone(),
+                    weights: source
+                        .vertices
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, vertex)| {
+                            data.vertex_weights
+                                .get(&vertex.id)
+                                .and_then(|weights| weights.get(&group.id))
+                                .map(|weight| (index, *weight))
+                        })
+                        .collect(),
+                })
+                .collect()
+        });
+        let slot_count = snapshot.slot_count(node_id, node, data);
         output.push(ExchangeMesh {
             id: node_id.to_string(),
             name: node.name.clone(),
@@ -302,6 +338,16 @@ pub(crate) fn evaluated_meshes(
             uv_layers: uv_layer_list,
             uv_active,
             uv_render,
+            colors: color_layers::read(source),
+            vertex_groups,
+            material_slots: (0..slot_count)
+                .map(|slot| snapshot.slot_material(node_id, node, data, slot).cloned())
+                .collect(),
+            face_material_indices: source
+                .faces
+                .iter()
+                .map(|face| face.material_index)
+                .collect(),
         });
     }
     Ok(output)
@@ -340,14 +386,6 @@ pub(crate) fn attribute_losses(
 pub(crate) fn mesh_attribute_losses(format: &str, mesh_id: &str, mesh: &Mesh) -> Vec<Loss> {
     let color = color_layers::read(mesh);
     let mut losses = Vec::new();
-    for layer in &color.layers {
-        losses.push(Loss {
-            feature_id: "mesh.color_attribute".to_owned(),
-            data_id: Some(mesh_id.to_owned()),
-            reason: format!("{format} does not write color layer `{}`", layer.name),
-            suggestion: Some("export as blend to keep color layers".to_owned()),
-        });
-    }
     for key in mesh.attributes.keys() {
         // Potter's shading, UV, color, and Blender bookkeeping stores have their own losses or
         // writers. Any other internal store (`seam`, `vertex_groups`, ...) is data no exchange
@@ -402,6 +440,271 @@ pub(crate) fn mesh_attribute_losses(format: &str, mesh_id: &str, mesh: &Mesh) ->
         });
     }
     losses
+}
+
+/// Precise losses for canonical color layers, vertex-group assignments, and face-material
+/// bindings that `format` cannot write. Writers never receive these, so these losses are the only
+/// record: strict export refuses on them and `--allow-lossy` permits them.
+pub(crate) fn element_data_losses(format: &str, meshes: &[ExchangeMesh]) -> Vec<Loss> {
+    let mut losses = Vec::new();
+    for mesh in meshes {
+        let selected_color = mesh
+            .colors
+            .active
+            .as_deref()
+            .and_then(|name| mesh.colors.index_of(name));
+        for (index, layer) in mesh.colors.layers.iter().enumerate() {
+            if format == "stl" {
+                losses.push(element_loss(
+                    mesh,
+                    "mesh.color_attribute",
+                    format!(
+                        "stl has no color channel; color layer `{}` is lost",
+                        layer.name
+                    ),
+                    "export as obj, ply, usda, usdc, fbx, or alembic to preserve colors",
+                ));
+            } else if matches!(format, "obj" | "ply") && selected_color != Some(index) {
+                losses.push(element_loss(
+                    mesh,
+                    "mesh.color_attribute",
+                    format!(
+                        "{format} stores only the active color layer; color layer `{}` is lost",
+                        layer.name
+                    ),
+                    "export as usda, usdc, fbx, or alembic to preserve every color layer",
+                ));
+            } else if matches!(format, "obj" | "ply") {
+                let imported_name = if format == "obj" { "Color" } else { "Col" };
+                if layer.name != imported_name {
+                    losses.push(element_loss(
+                        mesh,
+                        "mesh.color_attribute",
+                        format!(
+                            "{format} imports the active color layer as `{imported_name}`; source layer `{}` is renamed",
+                            layer.name
+                        ),
+                        "export as usda, usdc, fbx, or alembic to preserve color-layer names",
+                    ));
+                }
+                if layer.domain == color_layers::ColorDomain::Corner {
+                    losses.push(element_loss(
+                        mesh,
+                        "mesh.color_attribute",
+                        format!(
+                            "{format} stores point colors; CORNER layer `{}` becomes point data",
+                            layer.name
+                        ),
+                        "export as usda, usdc, fbx, or alembic to preserve the color domain",
+                    ));
+                }
+                if mesh.colors.render.as_deref() != Some(layer.name.as_str()) {
+                    losses.push(element_loss(
+                        mesh,
+                        "mesh.color_attribute",
+                        format!(
+                            "{format} does not preserve separate active/render color-layer designations for `{}`",
+                            layer.name
+                        ),
+                        "export as usda, usdc, or fbx to preserve color-layer designations",
+                    ));
+                }
+            }
+            if format == "ply" && selected_color == Some(index) {
+                let rgb_loss = layer.values.iter().any(|rgba| {
+                    rgba[..3].iter().any(|value| {
+                        let decoded = ply_channel_roundtrip(*value, false);
+                        !decoded.is_finite() || (decoded - *value).abs() > 1.0e-6
+                    })
+                });
+                let rgb_clipped = layer
+                    .values
+                    .iter()
+                    .any(|rgba| rgba[..3].iter().any(|value| !(0.0..=1.0).contains(value)));
+                if rgb_loss {
+                    let reason = if rgb_clipped {
+                        format!(
+                            "PLY's active RGB properties clip values outside [0, 1] and quantize color layer `{}` to 8-bit sRGB",
+                            layer.name
+                        )
+                    } else {
+                        format!(
+                            "PLY's active RGB properties quantize color layer `{}` to 8-bit sRGB",
+                            layer.name
+                        )
+                    };
+                    losses.push(element_loss(
+                        mesh,
+                        "mesh.color_attribute",
+                        reason,
+                        "export as usda, usdc, or fbx to preserve float color precision and HDR",
+                    ));
+                }
+                let alpha_loss = layer.values.iter().any(|rgba| {
+                    let decoded = ply_channel_roundtrip(rgba[3], true);
+                    !decoded.is_finite() || (decoded - rgba[3]).abs() > 1.0e-6
+                });
+                if alpha_loss {
+                    losses.push(element_loss(
+                        mesh,
+                        "mesh.color_attribute",
+                        format!(
+                            "PLY's active alpha property clips or quantizes color layer `{}` to 8-bit",
+                            layer.name
+                        ),
+                        "export as usda, usdc, fbx, or alembic to preserve full-precision alpha",
+                    ));
+                }
+            }
+            if format == "obj"
+                && selected_color == Some(index)
+                && layer.values.iter().any(|value| value[3] != 1.0)
+            {
+                losses.push(element_loss(
+                    mesh,
+                    "mesh.color_attribute",
+                    format!(
+                        "OBJ xyzrgb stores RGB only; non-opaque alpha in color layer `{}` is lost",
+                        layer.name
+                    ),
+                    "export as ply, usda, usdc, fbx, or alembic to preserve alpha",
+                ));
+            }
+        }
+        if format == "alembic"
+            && let Some(first_name) = mesh.colors.layers.first().map(|layer| layer.name.as_str())
+            && (mesh.colors.active.as_deref() != Some(first_name)
+                || mesh.colors.render.as_deref() != Some(first_name))
+        {
+            losses.push(element_loss(
+                mesh,
+                "mesh.color_attribute",
+                format!(
+                    "Alembic preserves color-layer names and domains but imports active and render selections as the first layer `{first_name}`"
+                ),
+                "export as blend, usda, usdc, or fbx to preserve color-layer selections",
+            ));
+        }
+        if matches!(format, "alembic" | "ply" | "stl")
+            && !mesh.material_slots.is_empty()
+            && mesh.face_material_indices.iter().any(|face_slot| {
+                let slot = usize::try_from(*face_slot)
+                    .unwrap_or(usize::MAX)
+                    .min(mesh.material_slots.len() - 1);
+                mesh.material_slots[slot].is_some()
+            })
+        {
+            losses.push(element_loss(
+                mesh,
+                "material.binding",
+                format!("{format} does not preserve assigned face-material bindings"),
+                "export as glb, obj, fbx, usda, usdc, or blend to preserve face materials",
+            ));
+        }
+        for group in &mesh.vertex_groups {
+            let reason = match format {
+                "obj" if !obj_group_is_face_compatible(mesh, group) => Some(format!(
+                    "OBJ face groups cannot represent sparse or non-binary weights in vertex group `{}`",
+                    group.name
+                )),
+                "ply" | "stl" | "alembic" => Some(format!(
+                    "{format} has no Blender-readable vertex-weight channel for group `{}`",
+                    group.name
+                )),
+                _ => None,
+            };
+            if let Some(reason) = reason {
+                losses.push(element_loss(
+                    mesh,
+                    "mesh.vertex_group",
+                    reason,
+                    "export as usda or fbx to preserve vertex-group weights",
+                ));
+            }
+        }
+    }
+    losses
+}
+
+fn element_loss(mesh: &ExchangeMesh, feature_id: &str, reason: String, suggestion: &str) -> Loss {
+    Loss {
+        feature_id: feature_id.to_owned(),
+        data_id: Some(mesh.id.clone()),
+        reason,
+        suggestion: Some(suggestion.to_owned()),
+    }
+}
+
+/// Linear light to sRGB-encoded, unclamped (the OBJ and PLY colour encoders use it).
+pub(super) fn srgb_encode(value: f64) -> f64 {
+    crate::color::linear_to_srgb_unclamped(value)
+}
+
+/// sRGB-encoded to linear light, the inverse of [`srgb_encode`].
+pub(super) fn srgb_decode(value: f64) -> f64 {
+    crate::color::srgb_to_linear(value)
+}
+
+/// PLY stores colours as bytes: RGB is sRGB-encoded, alpha is linear. Clamps to `[0, 1]`.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "encoded channels are clamped to [0, 1] before scaling into the byte range"
+)]
+pub(super) fn ply_color_to_byte(value: f64, alpha: bool) -> u8 {
+    let encoded = if alpha { value } else { srgb_encode(value) };
+    (encoded.clamp(0.0, 1.0) * 255.0).floor() as u8
+}
+
+/// The linear value a PLY colour byte stands for, the inverse of [`ply_color_to_byte`].
+pub(super) fn ply_byte_to_color(value: u8, alpha: bool) -> f64 {
+    let encoded = f64::from(value) / 255.0;
+    if alpha { encoded } else { srgb_decode(encoded) }
+}
+
+fn ply_channel_roundtrip(value: f64, alpha: bool) -> f64 {
+    ply_byte_to_color(ply_color_to_byte(value, alpha), alpha)
+}
+
+/// Whether a vertex group is a face-compatible OBJ group: binary weights on whole faces only.
+pub(crate) fn obj_group_is_face_compatible(
+    mesh: &ExchangeMesh,
+    group: &ExchangeVertexGroup,
+) -> bool {
+    if group.weights.is_empty()
+        || group.name.chars().any(char::is_whitespace)
+        || group.name.contains('#')
+    {
+        return false;
+    }
+    let mut assigned = vec![false; mesh.positions.len()];
+    for (index, weight) in &group.weights {
+        let Some(value) = assigned.get_mut(*index) else {
+            return false;
+        };
+        if *weight != 1.0 || *value {
+            return false;
+        }
+        *value = true;
+    }
+    mesh.faces.iter().all(|face| {
+        let mut membership = None;
+        face.iter().all(|index| {
+            let Some(value) = assigned.get(*index) else {
+                return false;
+            };
+            match membership {
+                Some(expected) => *value == expected,
+                None => {
+                    membership = Some(*value);
+                    true
+                }
+            }
+        })
+    }) && group
+        .weights
+        .iter()
+        .all(|(index, _)| mesh.faces.iter().any(|face| face.contains(index)))
 }
 
 pub(crate) fn render_visible_nodes(
@@ -720,6 +1023,10 @@ pub(crate) mod test_support {
             ],
             uv_active: Some(1),
             uv_render: Some(0),
+            colors: Default::default(),
+            vertex_groups: Vec::new(),
+            material_slots: Vec::new(),
+            face_material_indices: vec![0],
         }
     }
 
@@ -841,14 +1148,12 @@ mod tests {
                 .filter(|loss| loss.feature_id == "mesh.attribute")
                 .map(|loss| loss.reason.as_str())
                 .collect::<Vec<_>>();
-            // Two native layers and one Blender color; `weight` and `Pinned`. `.select_vert` is
-            // selection state and is not reported.
-            assert_eq!(colors.len(), 3, "{format}: {colors:?}");
+            // The Blender color `Blender Col`, `weight`, and `Pinned`. Native color layers are
+            // reported by `element_data_losses` per format, and `.select_vert` is not reported.
+            assert_eq!(colors.len(), 1, "{format}: {colors:?}");
             assert_eq!(generic.len(), 2, "{format}: {generic:?}");
-            assert!(colors[0].contains(&format!("{format} does not write color layer `Col`")));
-            assert!(colors[1].contains("color layer `Corner`"), "{format}");
             assert!(
-                colors[2].contains("Blender color attribute `Blender Col`"),
+                colors[0].contains("Blender color attribute `Blender Col`"),
                 "{format}"
             );
             assert!(generic[0].contains("mesh attribute `weight`"), "{format}");

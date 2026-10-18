@@ -11,7 +11,11 @@ use super::{
 use crate::{
     error::{ErrorCode, PotError, Result},
     eval::{Snapshot, animation::animated_transform},
-    geom::{Mesh, uv_layers},
+    geom::{
+        Mesh,
+        color_layers::{self, ColorDomain, ColorLayer, ColorStore},
+        uv_layers,
+    },
     model::{
         Action, ArmatureData, CameraData, CameraProjection, DataBlock, FCurve, Id, Interpolation,
         Keyframe, LightData, LightType, Material, Modifier, Node, PoseBone, SceneDoc, ShapeKeyData,
@@ -652,6 +656,8 @@ fn write_mesh(
         ),
     );
     write_uv_primvars(output, exchange, d)?;
+    let color_names = color_primvar_names(exchange)?;
+    write_color_primvars(output, exchange, d, &color_names)?;
     line(
         output,
         &format!(
@@ -1952,6 +1958,7 @@ fn import_node_tree(
             )
         })?;
         import_uv_layers(&mut mesh, &uv_layers, uv_active, uv_render);
+        import_color_layers(mesh_prim, &mut mesh, losses)?;
         if let Some(normals) = normals {
             shading::import_shading(&mut mesh, &normals)?;
         }
@@ -2362,6 +2369,255 @@ fn uv_loss(reason: String) -> Loss {
         data_id: None,
         reason,
         suggestion: Some("use --allow-lossy to import the file without these UV layers".to_owned()),
+    }
+}
+
+/// A color layer that cannot be read. The layer is dropped, so the import needs `--allow-lossy`.
+fn color_loss(reason: String) -> Loss {
+    Loss {
+        feature_id: "mesh.color_attribute".to_owned(),
+        data_id: None,
+        reason,
+        suggestion: Some(
+            "use --allow-lossy to import the file without these color layers".to_owned(),
+        ),
+    }
+}
+
+/// Reads the color layers of a mesh prim in linear RGBA. A file Potter wrote names every layer's
+/// primvar, and its active and render layers, in `potter:colorLayers`. Without that metadata, each
+/// color primvar is a layer in file order, and the render layer is `displayColor` or the first layer.
+fn import_color_layers(prim: &Prim, mesh: &mut Mesh, losses: &mut Vec<Loss>) -> Result<()> {
+    let metadata = property_string(prim, "potter:colorLayers")
+        .map(|encoded| {
+            serde_json::from_str::<Value>(&encoded).map_err(|error| {
+                PotError::with_details(
+                    ErrorCode::ImportFailed,
+                    "USD color-layer metadata is invalid",
+                    json!({"reason": error.to_string()}),
+                )
+            })
+        })
+        .transpose()?;
+    let mut specs = Vec::<(String, String)>::new();
+    if let Some(metadata) = &metadata {
+        let layers = metadata["layers"]
+            .as_array()
+            .ok_or_else(|| import_error("USD color-layer metadata has no layer list"))?;
+        for layer in layers {
+            let name = layer["name"]
+                .as_str()
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| import_error("USD color-layer name is invalid"))?;
+            let primvar = layer["primvar"]
+                .as_str()
+                .filter(|primvar| primvar.starts_with("primvars:"))
+                .ok_or_else(|| import_error("USD color-layer primvar name is invalid"))?;
+            specs.push((name.to_owned(), primvar.to_owned()));
+        }
+    } else {
+        for declaration in &prim.declared {
+            let is_color = matches!(declaration.type_name.as_str(), "color3f" | "color4f");
+            if is_color && let Some(name) = declaration.name.strip_prefix("primvars:") {
+                specs.push((name.to_owned(), declaration.name.clone()));
+            }
+        }
+    }
+    let mut layers = Vec::<ColorLayer>::new();
+    for (name, primvar) in specs {
+        if layers.iter().any(|layer| layer.name == name) {
+            losses.push(color_loss(format!(
+                "USD color layer `{name}` on `{}` is listed more than once",
+                prim.name
+            )));
+            continue;
+        }
+        match read_color_layer(prim, &name, &primvar, mesh) {
+            Ok(layer) => layers.push(layer),
+            Err(reason) => losses.push(color_loss(format!(
+                "USD color primvar `{primvar}` on `{}` {reason}",
+                prim.name
+            ))),
+        }
+    }
+    let (active, render) = match &metadata {
+        Some(metadata) => (
+            metadata["active"].as_str().map(str::to_owned),
+            metadata["render"].as_str().map(str::to_owned),
+        ),
+        None => {
+            let render = layers
+                .iter()
+                .find(|layer| layer.name == "displayColor")
+                .or(layers.first())
+                .map(|layer| layer.name.clone());
+            (render.clone(), render)
+        }
+    };
+    if !layers.is_empty() {
+        color_layers::write(
+            mesh,
+            &ColorStore {
+                layers,
+                active,
+                render,
+            },
+        );
+    }
+    Ok(())
+}
+
+/// One color layer read from `primvar`, in Potter's storage order. RGB comes from the primvar. Alpha
+/// comes from its fourth component, or from `primvars:displayOpacity` for a `displayColor` primvar.
+/// The error completes "USD color primvar `…` on `…` ".
+fn read_color_layer(
+    prim: &Prim,
+    name: &str,
+    primvar: &str,
+    mesh: &Mesh,
+) -> std::result::Result<ColorLayer, String> {
+    let raw = prim
+        .properties
+        .get(primvar)
+        .ok_or_else(|| "has no values".to_owned())?;
+    let type_name = prim
+        .declared
+        .iter()
+        .find(|declaration| declaration.name == primvar)
+        .map_or("", |declaration| declaration.type_name.as_str());
+    let width = match type_name {
+        "color3f" => 3,
+        "color4f" => 4,
+        other => {
+            return Err(format!(
+                "has type `{other}`; only color3f and color4f primvars are imported"
+            ));
+        }
+    };
+    let (value_text, interpolation) = split_interpolation(raw);
+    let interpolation = interpolation.unwrap_or_else(|| "constant".to_owned());
+    let (domain, element_count, storage_elements) = color_element_layout(&interpolation, mesh)?;
+    let elements = read_primvar_elements(prim, primvar, value_text, width, element_count)?;
+    let mut alphas = vec![1.0; element_count];
+    if width == 3
+        && primvar == "primvars:displayColor"
+        && let Some(opacity_raw) = prim.properties.get("primvars:displayOpacity")
+    {
+        let (opacity_text, opacity_interpolation) = split_interpolation(opacity_raw);
+        if opacity_interpolation.unwrap_or_else(|| "constant".to_owned()) != interpolation {
+            return Err("has displayOpacity with a different interpolation".to_owned());
+        }
+        alphas = read_primvar_elements(
+            prim,
+            "primvars:displayOpacity",
+            opacity_text,
+            1,
+            element_count,
+        )?
+        .into_iter()
+        .map(|value| value[0])
+        .collect();
+    }
+    let values = storage_elements
+        .into_iter()
+        .map(|element| {
+            let value = &elements[element];
+            let alpha = if width == 4 {
+                value[3]
+            } else {
+                alphas[element]
+            };
+            [value[0], value[1], value[2], alpha]
+        })
+        .collect();
+    Ok(ColorLayer {
+        name: name.to_owned(),
+        domain,
+        values,
+    })
+}
+
+/// The `width`-component values of a primvar's `element_count` elements, applying its
+/// `primvars:<name>:indices` array when it has one. `value_text` is the primvar's value without
+/// metadata.
+fn read_primvar_elements(
+    prim: &Prim,
+    primvar: &str,
+    value_text: &str,
+    width: usize,
+    element_count: usize,
+) -> std::result::Result<Vec<Vec<f64>>, String> {
+    let numbers = scan_numbers(value_text).map_err(|_| "has malformed values".to_owned())?;
+    if numbers.len() % width != 0 {
+        return Err(format!("has values that are not {width}-component tuples"));
+    }
+    let values = numbers
+        .chunks_exact(width)
+        .map(<[f64]>::to_vec)
+        .collect::<Vec<_>>();
+    let Some(raw_indices) = prim.properties.get(&format!("{primvar}:indices")) else {
+        if values.len() != element_count {
+            return Err(format!(
+                "has {} values for {element_count} elements and no indices",
+                values.len()
+            ));
+        }
+        return Ok(values);
+    };
+    let indices = scan_numbers(raw_indices).map_err(|_| "has malformed indices".to_owned())?;
+    if indices.len() != element_count {
+        return Err(format!(
+            "has {} indices for {element_count} elements",
+            indices.len()
+        ));
+    }
+    indices
+        .iter()
+        .map(|index| {
+            (index.fract() == 0.0 && *index >= 0.0)
+                .then(|| values.get(*index as usize).cloned())
+                .flatten()
+                .ok_or_else(|| "has an index outside its values".to_owned())
+        })
+        .collect()
+}
+
+/// The domain of a color primvar with `interpolation`, its element count, and the element that each
+/// storage value reads. `constant` is one value for every point; `uniform` is one value per face.
+fn color_element_layout(
+    interpolation: &str,
+    mesh: &Mesh,
+) -> std::result::Result<(ColorDomain, usize, Vec<usize>), String> {
+    let vertex_count = mesh.vertices.len();
+    let corner_count = mesh
+        .faces
+        .iter()
+        .map(|face| face.vertices.len())
+        .sum::<usize>();
+    match interpolation {
+        "vertex" | "varying" => Ok((
+            ColorDomain::Point,
+            vertex_count,
+            (0..vertex_count).collect(),
+        )),
+        "constant" => Ok((ColorDomain::Point, 1, vec![0; vertex_count])),
+        "faceVarying" => Ok((
+            ColorDomain::Corner,
+            corner_count,
+            (0..corner_count).collect(),
+        )),
+        "uniform" => Ok((
+            ColorDomain::Corner,
+            mesh.faces.len(),
+            mesh.faces
+                .iter()
+                .enumerate()
+                .flat_map(|(face, corners)| std::iter::repeat_n(face, corners.vertices.len()))
+                .collect(),
+        )),
+        other => Err(format!(
+            "uses unsupported interpolation `{other}`; only constant, uniform, vertex, varying, and faceVarying color primvars are imported"
+        )),
     }
 }
 
@@ -3413,6 +3669,146 @@ fn write_uv_primvars(output: &mut String, exchange: &ExchangeMesh, depth: usize)
             ),
         );
     }
+    Ok(())
+}
+
+/// Primvar name of each color layer, in layer order. Names follow the UV convention and never repeat
+/// a UV primvar, a display primvar, or another color layer's name.
+fn color_primvar_names(exchange: &ExchangeMesh) -> Result<Vec<String>> {
+    let mut used = ["st", "normals", "displayColor", "displayOpacity"]
+        .map(str::to_owned)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    for (index, layer) in exchange.uv_layers.iter().enumerate() {
+        used.insert(if Some(index) == exchange.uv_render {
+            "st".to_owned()
+        } else {
+            prim_identifier(&layer.name)
+        });
+    }
+    exchange
+        .colors
+        .layers
+        .iter()
+        .map(|layer| unique_primvar_name(prim_identifier(&layer.name), &mut used))
+        .collect()
+}
+
+fn unique_primvar_name(base: String, used: &mut BTreeSet<String>) -> Result<String> {
+    if used.insert(base.clone()) {
+        return Ok(base);
+    }
+    (1_usize..)
+        .map(|suffix| format!("{base}_{suffix}"))
+        .find(|candidate| used.insert(candidate.clone()))
+        .ok_or_else(|| {
+            PotError::new(
+                ErrorCode::LimitExceeded,
+                "USD primvar namespace is exhausted",
+            )
+        })
+}
+
+/// Writes each color layer as a linear `color4f[]` primvar. `potter:colorLayers` names every layer,
+/// its primvar, and the active and render layers. The render layer also writes `displayColor` and
+/// `displayOpacity`, which other USD readers display.
+fn write_color_primvars(
+    output: &mut String,
+    exchange: &ExchangeMesh,
+    depth: usize,
+    primvar_names: &[String],
+) -> Result<()> {
+    let store = &exchange.colors;
+    if store.layers.is_empty() {
+        return Ok(());
+    }
+    let corner_count = exchange.faces.iter().map(Vec::len).sum::<usize>();
+    let mut metadata = Vec::with_capacity(store.layers.len());
+    for (layer, primvar_name) in store.layers.iter().zip(primvar_names) {
+        let (interpolation, expected) = match layer.domain {
+            ColorDomain::Point => ("vertex", exchange.positions.len()),
+            ColorDomain::Corner => ("faceVarying", corner_count),
+        };
+        if layer.values.len() != expected {
+            return Err(PotError::with_details(
+                ErrorCode::ExportFailed,
+                "USD color layer value count does not match its domain",
+                json!({"layer": layer.name, "domain": layer.domain.name()}),
+            ));
+        }
+        let primvar = format!("primvars:{primvar_name}");
+        let colors = layer
+            .values
+            .iter()
+            .map(|rgba| vector_format(rgba))
+            .collect::<Result<Vec<_>>>()?;
+        line(
+            output,
+            &format!(
+                "{}color4f[] {primvar} = [{}] (interpolation = \"{interpolation}\", colorSpace = \"lin_rec709_scene\")",
+                spaces(depth),
+                colors.join(", ")
+            ),
+        );
+        if store.render.as_deref() == Some(layer.name.as_str()) {
+            let display_colors = layer
+                .values
+                .iter()
+                .map(|rgba| vector_format(&rgba[..3]))
+                .collect::<Result<Vec<_>>>()?;
+            line(
+                output,
+                &format!(
+                    "{}color3f[] primvars:displayColor = [{}] (interpolation = \"{interpolation}\", colorSpace = \"lin_rec709_scene\")",
+                    spaces(depth),
+                    display_colors.join(", ")
+                ),
+            );
+            let opacities = layer
+                .values
+                .iter()
+                .map(|rgba| number(rgba[3]))
+                .collect::<Result<Vec<_>>>()?;
+            line(
+                output,
+                &format!(
+                    "{}float[] primvars:displayOpacity = [{}] (interpolation = \"{interpolation}\")",
+                    spaces(depth),
+                    opacities.join(", ")
+                ),
+            );
+        }
+        metadata.push(json!({
+            "name": layer.name,
+            "domain": layer.domain.name(),
+            "primvar": primvar,
+        }));
+    }
+    let designated = |name: &Option<String>| {
+        name.as_deref()
+            .filter(|name| store.index_of(name).is_some())
+            .map(str::to_owned)
+    };
+    let encoded = serde_json::to_string(&json!({
+        "layers": metadata,
+        "active": designated(&store.active),
+        "render": designated(&store.render),
+    }))
+    .map_err(|error| {
+        PotError::with_details(
+            ErrorCode::ExportFailed,
+            "could not encode USD color-layer metadata",
+            json!({"reason": error.to_string()}),
+        )
+    })?;
+    line(
+        output,
+        &format!(
+            "{}custom string potter:colorLayers = {}",
+            spaces(depth),
+            quote(&encoded)?
+        ),
+    );
     Ok(())
 }
 

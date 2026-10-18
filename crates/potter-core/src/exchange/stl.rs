@@ -144,6 +144,10 @@ pub(crate) fn import(path: &Path) -> Result<(Vec<ExchangeMesh>, Vec<Loss>)> {
             uv_layers: Vec::new(),
             uv_active: None,
             uv_render: None,
+            colors: Default::default(),
+            vertex_groups: Vec::new(),
+            material_slots: Vec::new(),
+            face_material_indices: Vec::new(),
         }],
         losses,
     ))
