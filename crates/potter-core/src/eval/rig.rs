@@ -7122,7 +7122,12 @@ fn animated_pose_channel(
         return Ok(None);
     }
     let pose = crate::eval::animation::animated_pose_bones(node, doc, frame)?;
-    Ok(pose_channel(&pose, path, index))
+    let armature = node
+        .data
+        .as_ref()
+        .and_then(|data_id| doc.data_blocks.get(data_id))
+        .and_then(|data| data.armature.as_ref());
+    Ok(pose_channel(&pose, armature, path, index))
 }
 
 fn apply_pose_drivers(
@@ -7138,7 +7143,7 @@ fn apply_pose_drivers(
         let Some((bone_key, channel)) = pose_channel_path(path) else {
             continue;
         };
-        let bone_id = pose_driver_bone_id(armature, &bone_key).ok_or_else(|| {
+        let bone_id = pose_driver_bone_id(armature, bone_key).ok_or_else(|| {
             evaluation_error_with(
                 "pose driver targets an unknown bone",
                 json!({ "node": node_id, "bone_id": bone_key }),
@@ -7164,21 +7169,33 @@ fn apply_pose_drivers(
     Ok(())
 }
 
-/// Resolves a pose driver's bone reference like a constraint subtarget: the bone ID first, then
-/// the bone name that Blender's `pose.bones["name"]` paths use.
-fn pose_driver_bone_id(armature: &ArmatureData, key: &Id) -> Option<Id> {
-    if armature.bones.contains_key(key) {
-        return Some(key.clone());
+/// Resolves a pose driver's bone reference like a constraint subtarget: the bone ID first, then the
+/// bone name that Blender's `pose.bones["name"]` paths use. Names such as `Arm.L` are not Potter IDs,
+/// so the raw key is matched directly.
+fn pose_driver_bone_id(armature: &ArmatureData, key: &str) -> Option<Id> {
+    if let Ok(id) = Id::new(key)
+        && armature.bones.contains_key(&id)
+    {
+        return Some(id);
     }
     armature
         .bones
         .iter()
-        .find(|(_, bone)| bone.name == key.as_str())
+        .find(|(_, bone)| bone.name == key)
         .map(|(bone_id, _)| bone_id.clone())
 }
 
-fn pose_channel(pose_bones: &BTreeMap<Id, PoseBone>, path: &str, index: u32) -> Option<f64> {
-    let (bone_id, channel) = pose_channel_path(path)?;
+fn pose_channel(
+    pose_bones: &BTreeMap<Id, PoseBone>,
+    armature: Option<&ArmatureData>,
+    path: &str,
+    index: u32,
+) -> Option<f64> {
+    let (bone_key, channel) = pose_channel_path(path)?;
+    let bone_id = match armature {
+        Some(armature) => pose_driver_bone_id(armature, bone_key)?,
+        None => Id::new(bone_key).ok()?,
+    };
     let pose = pose_bones.get(&bone_id)?;
     let values = match channel {
         "location" | "translation" => &pose.translation[..],
@@ -7189,19 +7206,18 @@ fn pose_channel(pose_bones: &BTreeMap<Id, PoseBone>, path: &str, index: u32) -> 
     values.get(usize::try_from(index).ok()?).copied()
 }
 
-fn pose_channel_path(path: &str) -> Option<(Id, &str)> {
-    let (bone_key, channel) = if let Some(start) = path.find("pose.bones[") {
+fn pose_channel_path(path: &str) -> Option<(&str, &str)> {
+    if let Some(start) = path.find("pose.bones[") {
         let start = start + "pose.bones[".len();
         let end = path[start..].find(']')? + start;
-        (
+        Some((
             path[start..end].trim_matches(['"', '\'']),
             path[end + 1..].trim_start_matches('.'),
-        )
+        ))
     } else {
         let rest = path.strip_prefix("pose.")?;
-        rest.split_once('.')?
-    };
-    Some((Id::new(bone_key).ok()?, channel))
+        rest.split_once('.')
+    }
 }
 
 fn shape_key_value_from_path(shape_keys: &ShapeKeyData, path: &str) -> Option<f64> {

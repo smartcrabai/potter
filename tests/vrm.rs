@@ -2832,7 +2832,7 @@ fn vrm_output_preflight_matches_emitter_for_ordinary_materials_and_shape_keys() 
             .is_some_and(|attributes| !attributes.keys().any(|name| name.starts_with("TEXCOORD_")))
     );
 
-    let (directory, project) = new_fixture(FixtureOptions::default())?;
+    let (_directory, project) = new_fixture(FixtureOptions::default())?;
     apply_success(
         &project,
         1,
