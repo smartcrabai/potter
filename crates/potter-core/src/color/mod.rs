@@ -114,6 +114,73 @@ pub(crate) fn srgb_to_linear(value: f64) -> f64 {
     }
 }
 
+/// Cycles' sRGB-to-linear decode for an image texel, in f32, as its SSE2 and NEON kernels compute it
+/// (`color_srgb_to_linear_sse2`, Cycles `util/color.h`).
+///
+/// The approximation differs from [`srgb_to_linear`] by at most about 5e-7 over [0, 1], and Cycles' kernels use
+/// it for image textures, so the image sampler uses this decode. `mul_add` is the fused `madd` of the arm64 build
+/// (NEON `vfmaq_f32`), which Blender's arm64 and this crate share; the x86 SSE2 build rounds the multiply and the
+/// add separately.
+pub(crate) fn cycles_srgb_to_linear(encoded: f32) -> f32 {
+    if encoded < 0.04045_f32 {
+        (encoded * (1.0_f32 / 12.92_f32)).max(0.0)
+    } else {
+        cycles_fastpow24((encoded + 0.055_f32) * (1.0_f32 / 1.055_f32))
+    }
+}
+
+/// Cycles' `fastpow24_sse2`: x^2.4 from a bit-pattern guess for x^(4/5), three Newton steps on the fifth root of
+/// x^4, then x^(12/5) = y · y · y.
+fn cycles_fastpow24(arg: f32) -> f32 {
+    // `fastpow_sse2<0x3F4CCCCD, 0x4F55A7FB>`: scale by 2^(127/(4/5) - 127) · 0.994^(5/4), reinterpret the bits as an
+    // integer, scale by 4/5, and round back to bits.
+    let scaled = arg * f32::from_bits(0x4F55_A7FB);
+    let scaled = int_bits_as_f32(scaled.to_bits());
+    let scaled = scaled * f32::from_bits(0x3F4C_CCCD);
+    let mut root = f32::from_bits(round_to_bits(scaled));
+    let arg2 = arg * arg;
+    let arg4 = arg2 * arg2;
+    root = improve_fifth_root(root, arg4);
+    root = improve_fifth_root(root, arg4);
+    root = improve_fifth_root(root, arg4);
+    root * (root * root)
+}
+
+/// One Newton step for the fifth root of `arg4` (Cycles' `improve_5throot_solution_sse2`).
+fn improve_fifth_root(old: f32, arg4: f32) -> f32 {
+    let approx2 = old * old;
+    let approx4 = approx2 * approx2;
+    let quotient = arg4 / approx4;
+    let sum = 4.0_f32.mul_add(old, quotient);
+    sum * (1.0_f32 / 5.0_f32)
+}
+
+/// `cast(make_float4(int4))`: the integer whose bits are `bits`, converted to float with rounding to nearest, as
+/// `_mm_cvtepi32_ps` does.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "the integer-to-float conversion rounds to nearest, as _mm_cvtepi32_ps does"
+)]
+fn int_bits_as_f32(bits: u32) -> f32 {
+    i32::from_ne_bytes(bits.to_ne_bytes()) as f32
+}
+
+/// `make_int4(float4)` (`_mm_cvtps_epi32`), returning the integer's bits: round to nearest, ties to even, and
+/// out-of-range values give `i32::MIN`, as the hardware does.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the rounded value is checked to lie inside the i32 range before the conversion"
+)]
+fn round_to_bits(value: f32) -> u32 {
+    let rounded = value.round_ties_even();
+    let integer = if (-2_147_483_648.0..2_147_483_648.0).contains(&rounded) {
+        rounded as i32
+    } else {
+        i32::MIN
+    };
+    u32::from_ne_bytes(integer.to_ne_bytes())
+}
+
 fn linear_to_srgb_impl(value: f64, clamp_high_branch: bool) -> f64 {
     if value <= 0.003_130_8 {
         12.92 * value

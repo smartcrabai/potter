@@ -15507,7 +15507,16 @@ mod tests {
         let mut worst_at = (0.0, 0.0);
         for record in oracle["records"].as_array().ok_or("records missing")? {
             let r = record.as_array().ok_or("record is not an array")?;
-            let (u, v) = (r[0].as_f64().ok_or("u")?, r[1].as_f64().ok_or("v")?);
+            // Blender read the texture at its sample UV (entries 5 and 6), which sits about 3e-5 from the grid
+            // position (entries 0 and 1) the ramp was built on. Potter is evaluated at the point Blender sampled.
+            let (u, v) = if r.len() >= 7 {
+                (
+                    r[5].as_f64().ok_or("sample u")?,
+                    r[6].as_f64().ok_or("sample v")?,
+                )
+            } else {
+                (r[0].as_f64().ok_or("u")?, r[1].as_f64().ok_or("v")?)
+            };
             // The oracle is in Blender's V-up UV; Potter's storage UV is glTF's V-down.
             let storage = [u, 1.0 - v];
             let corners = [[storage; 3]];
@@ -15557,11 +15566,12 @@ mod tests {
         Ok(())
     }
 
-    /// sRGB textures sample as Cycles' image texture does: Blender interpolates the encoded texels and decodes the
-    /// result, and Potter now does the same (`tests/fixtures/srgb_texture/generate_srgb_oracle.py`). The fixtures
-    /// are sRGB base colours with Linear or Closest filtering, and clamp or repeat wrapping. The tolerance covers
-    /// Blender's SSE2 sRGB decode (`color_srgb_to_linear_sse2`, a fast pow approximation), which differs from an exact
-    /// decode by up to 2.3e-4 on these oracles.
+    /// sRGB textures sample as Cycles' image texture does: Blender interpolates the encoded texels, decodes the result
+    /// with `color_srgb_to_linear_sse2`, and Potter does the same (`tests/fixtures/srgb_texture/generate_srgb_oracle.py`).
+    /// The fixtures are sRGB base colours with Linear or Closest filtering, and clamp or repeat wrapping. Each record is
+    /// evaluated at Blender's sample UV. The bound is f32 rounding: an f32 emulation of the Cycles path, run at those
+    /// sample UVs on the oracles, leaves a worst residual of 9.4e-7, and Potter's f64 mix adds a few ulps at most.
+    /// The 2e-6 bound is about 16 ulps of f32 at 1.0.
     #[test]
     fn srgb_texture_samples_match_blenders_render() -> TestResult {
         let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -15573,7 +15583,7 @@ mod tests {
                 false,
             )?;
             assert!(
-                worst <= 3e-4,
+                worst <= 2e-6,
                 "{pair}: Potter differs from Blender's render by {worst} at Blender uv {worst_at:?}"
             );
         }

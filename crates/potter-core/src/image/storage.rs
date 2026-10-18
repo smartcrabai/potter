@@ -64,7 +64,7 @@ pub fn load_image_data_with_staged(
     staged: &BTreeMap<String, Vec<u8>>,
 ) -> Result<ImageData> {
     let base_bytes = image_blob_bytes(image.blob.as_deref(), image, root, staged)?;
-    let srgb = decodes_srgb(&base_bytes, image.colorspace);
+    let srgb = decodes_srgb(image.colorspace);
     let (width, height, pixels) = decode_pixels(&base_bytes, image.colorspace)?;
     if width != image.width || height != image.height {
         return Err(PotError::with_details(
@@ -76,7 +76,7 @@ pub fn load_image_data_with_staged(
     let mut tiles = BTreeMap::new();
     for tile in &image.tiles {
         let bytes = blob_bytes(&tile.blob, root, staged)?;
-        let tile_srgb = decodes_srgb(&bytes, image.colorspace);
+        let tile_srgb = decodes_srgb(image.colorspace);
         let (tile_width, tile_height, tile_pixels) = decode_pixels(&bytes, image.colorspace)?;
         if tile_width != tile.width || tile_height != tile.height {
             return Err(PotError::with_details(
@@ -105,17 +105,12 @@ pub fn load_image_data_with_staged(
     })
 }
 
-/// Whether a decoded image came from sRGB-encoded storage: an sRGB colour space on an encoded file. Cycles keeps such an
-/// image encoded and decodes after it interpolates (`ImageMetaData::is_compressible_as_srgb`). Potter's own stored pixel
-/// format is already linear, so it never carries the marker.
-pub(crate) fn decodes_srgb(bytes: &[u8], colorspace: ImageColorspace) -> bool {
-    colorspace == ImageColorspace::Srgb && !is_stored_pixel_format(bytes)
-}
-
-fn is_stored_pixel_format(bytes: &[u8]) -> bool {
-    bytes.first() == Some(&b'{')
-        && serde_json::from_slice::<StoredPixels>(bytes)
-            .is_ok_and(|stored| stored.format == PIXEL_FORMAT)
+/// Whether an image's stored values are sRGB-encoded: an sRGB colour space on any source. Cycles keeps such an image
+/// encoded and decodes after it interpolates (`ImageMetaData::is_compressible_as_srgb`). Potter's stored pixel format
+/// returns its values as stored, so the label alone decides here, as it does for the `.blend` and glTF exports that
+/// encode an sRGB-labelled image before Blender reads it.
+pub(crate) fn decodes_srgb(colorspace: ImageColorspace) -> bool {
+    colorspace == ImageColorspace::Srgb
 }
 
 /// Decodes supported image encodings into linear RGBA pixels.

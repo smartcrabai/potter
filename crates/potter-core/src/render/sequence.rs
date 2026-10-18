@@ -1100,7 +1100,7 @@ fn load_strip_image(
     let data = ImageData {
         width: image_width,
         height: image_height,
-        srgb: storage::decodes_srgb(&bytes, ImageColorspace::Srgb),
+        srgb: storage::decodes_srgb(ImageColorspace::Srgb),
         pixels,
         tiles: std::collections::BTreeMap::new(),
         interpolation: ImageInterpolation::Linear,
