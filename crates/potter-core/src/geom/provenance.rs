@@ -657,6 +657,9 @@ fn mean_value_weights(polygon: &[[f32; 2]], point: [f32; 2]) -> Option<Vec<f64>>
         }
         previous_half_tangent = tangent;
     }
+    if snap != 0 {
+        weights.fill(0.0);
+    }
     if snap == 1 {
         weights[current_index] = 1.0;
     } else if snap == 2 {
@@ -1981,10 +1984,16 @@ mod tests {
             vec![vec![0, 1, 2, 3]],
         )
         .expect("source quad");
-        let query = [DVec3::new(scale * 0.5, 0.25, 0.0)];
         let output_corners = [0];
+        let weights_at =
+            |point| mean_value_corners(&source, &[point], [(output_corners.as_slice(), Some(0))]);
         assert_eq!(
-            mean_value_corners(&source, &query, [(output_corners.as_slice(), Some(0))]),
+            weights_at(DVec3::new(scale * 0.5, 0.0, 0.0)),
+            vec![vec![(0, 0.5), (1, 0.5)]],
+        );
+        assert_eq!(weights_at(DVec3::ZERO), vec![vec![(0, 1.0)]]);
+        assert_eq!(
+            weights_at(DVec3::new(scale * 0.5, 0.25, 0.0)),
             vec![vec![(0, 0.5), (1, 0.5)]],
         );
     }
