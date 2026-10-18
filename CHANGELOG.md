@@ -96,6 +96,9 @@
 - In DIFFERENCE, a cutter face reversed in the output negates its custom normal, as Blender does.
 - Operand-to-subject transforms are computed in f32 (the inverse subject matrix times the operand matrix, each product in f32), as Blender computes them, so operand vertices land on Blender's f32 positions.
 - Open operands and results that are not PWN after intersection use a BVH for the non-PWN ray tests instead of scanning every triangle.
+- Native Screw evaluation implements Blender 5.2.2 object-axis transforms and projected offsets, iteration scaling, render steps, on-axis merge thresholds, normal-calculated winding, smooth shading, and stretched U/V UVs; asymmetric Blender oracle cases are in `tests/fixtures/construction_p/screw/`.
+- Array follows Blender 5.2.2 float32 fit/count and object-offset transforms, merges copy/cap boundaries, and offsets each UV layer per copy. Build uses Blender's float32 frame fraction and seeded array shuffle; Weld applies vertex-group selection and inversion with ALL/CONNECTED merging; Wireframe applies group-weighted thickness and clamps material offsets to the owning object's slot count. Blender oracle cases are in `tests/fixtures/construction_p/{array,build_wireframe,weld}/`.
+- Modifier apply forwards explicitly marked modifier diagnostics (`modifier_warning`) as warnings alongside successful output.
 
 ## 0.2.0 - 2026-10-13
 - `pot workflow refine` now requires `-p/--provider <NAME>` and `-m/--model <ID>`, sent to jcode as `<NAME>:<ID>` (examples: `openai`, `openai-api`, `claude-oauth`, `copilot`, `openrouter`) for the modeler and every reviewer; agents no longer fall back to jcode's default model.
