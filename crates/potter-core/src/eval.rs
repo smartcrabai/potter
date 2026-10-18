@@ -3006,17 +3006,9 @@ pub(crate) fn apply_scene_attribute_modifier(
             "modifier subject world matrix is missing",
         )
     })?;
-    let subject_name = doc
-        .nodes
-        .get(subject_id)
-        .map(|node| node.name.as_str())
-        .ok_or_else(|| {
-            PotError::new(ErrorCode::InternalError, "modifier subject node is missing")
-        })?;
     *mesh = crate::geom::modifiers::attributes::evaluate_with_context(
         mesh,
         modifier,
-        subject_name,
         &operands,
         texture.as_ref(),
         subject_world,

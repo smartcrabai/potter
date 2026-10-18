@@ -252,13 +252,13 @@ impl<'a> TextureSeed<'a> {
     #[must_use]
     pub(crate) fn rng_for(self, modifier_index: usize) -> BlenderRng {
         let stack_index = self.stack_offset + modifier_index;
-        let mut key = Vec::new();
-        key.extend_from_slice(b"potter.modifier-texture-stream.v2\0");
-        key.extend_from_slice(&self.base.to_be_bytes());
-        key.extend_from_slice(&(self.subject.len() as u64).to_be_bytes());
-        key.extend_from_slice(self.subject.as_bytes());
-        key.extend_from_slice(&(stack_index as u64).to_be_bytes());
-        let digest = sha2::Sha256::digest(&key);
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(b"potter.modifier-texture-stream.v2\0");
+        hasher.update(self.base.to_be_bytes());
+        hasher.update((self.subject.len() as u64).to_be_bytes());
+        hasher.update(self.subject.as_bytes());
+        hasher.update((stack_index as u64).to_be_bytes());
+        let digest = hasher.finalize();
         BlenderRng::seed_random(u32::from_be_bytes([
             digest[0], digest[1], digest[2], digest[3],
         ]))
@@ -559,7 +559,7 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
             | "normal_edit"
             | "uv_project"
             | "uv_warp"
-            | "data_transfer" => attributes::evaluate(&evaluated, modifier, subject_name)?,
+            | "data_transfer" => attributes::evaluate(&evaluated, modifier)?,
             "mask" => advanced::mask(&evaluated, modifier)?,
             "laplacian_smooth" => smoothing::laplacian_smooth(&evaluated, modifier)?,
             "laplacian_deform" => deform::laplacian_deform(&evaluated, modifier)?,
