@@ -698,14 +698,14 @@ fn draw_respects_radius_and_mask_and_vertex_paint_updates_touched_corners()
             {"op":"node.create", "id":"body", "kind":"box", "params":{}},
             {"op":"paint.vertex", "target":{"id":"body"}, "scope":"shared",
              "samples":[{"position":[1.0,1.0,1.0],"pressure":1.0,"radius":0.25,"strength":1.0,"time":0.0}],
-             "falloff":"linear", "color":[0.1,0.2,0.3,1.0], "blend":"mix", "seed":7},
+             "falloff":"linear", "color":[0.1,0.2,0.3,1.0], "blend":"mix"},
             {"op":"paint.weight", "target":{"id":"body"}, "scope":"shared", "group":"skin", "weight":0.75,
              "samples":[{"position":[1.0,1.0,1.0],"pressure":1.0,"radius":0.25,"strength":1.0,"time":0.0}],
-             "falloff":"linear", "seed":7},
+             "falloff":"linear"},
             {"op":"vertex_group.create", "target":{"id":"body"}, "id":"bone", "name":"Bone"},
             {"op":"paint.weight", "target":{"id":"body"}, "scope":"shared", "group":"bone", "weight":0.25,
              "samples":[{"position":[1.0,1.0,1.0],"pressure":1.0,"radius":0.25,"strength":1.0,"time":0.0}],
-             "falloff":"linear", "seed":7}
+             "falloff":"linear"}
         ]),
     )?;
     let painted = stored_mesh(&paint_scene)?;

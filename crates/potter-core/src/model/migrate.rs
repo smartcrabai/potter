@@ -73,8 +73,8 @@ fn parse_scene_inner(bytes: &[u8], retain_original_hash: bool) -> Result<ParsedS
     })
 }
 
-/// Parses a history record, upgrading its snapshot's schema version and retiring the sculpt `seed`
-/// from its recorded operations.
+/// Parses a history record, upgrading its snapshot's schema version and retiring the removed operation
+/// `seed` fields from its recorded operations.
 pub(crate) fn parse_history_record(bytes: &[u8]) -> Result<(HistoryRecord, Vec<Value>)> {
     let mut value = parse_value(bytes)?;
     let mut warnings = match value.get_mut("snapshot") {
@@ -82,16 +82,17 @@ pub(crate) fn parse_history_record(bytes: &[u8]) -> Result<(HistoryRecord, Vec<V
         None => Vec::new(),
     };
     if let Some(operations) = value.get_mut("operations") {
-        warnings.extend(retire_sculpt_seed(operations));
+        warnings.extend(retire_operation_seed(operations));
     }
     let record = serde_json::from_value(value).map_err(|error| json_error(&error))?;
     Ok((record, warnings))
 }
 
-/// Drops the sculpt `seed` key from recorded `sculpt.stroke` and `sculpt.dyntopo` operations. The op
-/// schema no longer accepts it and the parser rejects unknown fields, so an old record would not
-/// replay. Each dropped seed is reported, because the Inflate, Clay Strips and Layer brushes read it.
-fn retire_sculpt_seed(operations: &mut Value) -> Vec<Value> {
+/// Drops the `seed` key from recorded operations whose schema no longer accepts it: `sculpt.stroke`,
+/// `sculpt.dyntopo`, `paint.vertex`, `paint.weight` and `paint.texture`. The parser rejects unknown
+/// fields, so an old record would not replay. Each dropped seed is reported. The sculpt brushes read
+/// the value in older builds, so a replay of such a record can differ from the one it was recorded with.
+fn retire_operation_seed(operations: &mut Value) -> Vec<Value> {
     let mut warnings = Vec::new();
     let Some(operations) = operations.as_array_mut() else {
         return warnings;
@@ -103,15 +104,24 @@ fn retire_sculpt_seed(operations: &mut Value) -> Vec<Value> {
         let Some(name) = fields
             .get("op")
             .and_then(Value::as_str)
-            .filter(|name| matches!(*name, "sculpt.stroke" | "sculpt.dyntopo"))
+            .filter(|name| {
+                matches!(
+                    *name,
+                    "sculpt.stroke"
+                        | "sculpt.dyntopo"
+                        | "paint.vertex"
+                        | "paint.weight"
+                        | "paint.texture"
+                )
+            })
             .map(str::to_owned)
         else {
             continue;
         };
         if let Some(seed) = fields.remove("seed") {
             warnings.push(json!({
-                "code": "sculpt.seed_retired",
-                "message": "sculpt seed is no longer an operation field and was dropped",
+                "code": "operation.seed_retired",
+                "message": "seed is no longer an operation field and was dropped",
                 "operation_index": index,
                 "op": name,
                 "seed": seed,
@@ -1888,7 +1898,7 @@ mod tests {
     }
 
     #[test]
-    fn history_sculpt_seed_is_dropped_at_load_and_the_record_replays() -> TestResult {
+    fn history_operation_seed_is_dropped_at_load_and_the_record_replays() -> TestResult {
         let snapshot = serde_json::to_value(SceneDoc::new(uuid::Uuid::new_v4().to_string()))?;
         let mut source = history_record(&snapshot);
         source["operations"] = json!([
@@ -1898,7 +1908,8 @@ mod tests {
              "falloff":"linear","seed":7},
             {"op":"sculpt.dyntopo","target":{"id":"body"},"scope":"shared",
              "samples":[{"position":[0.0,0.0,0.0],"pressure":1.0,"radius":10.0,"strength":1.0,"time":0.0}],
-             "falloff":"constant","edge_length":0.5,"seed":7}
+             "falloff":"constant","edge_length":0.5,"seed":7},
+            {"op":"paint.vertex","target":{"id":"body"},"scope":"shared","samples":[],"color":[1.0,0.0,0.0,1.0],"seed":7}
         ]);
         let (record, warnings) = parse_history_record(&serde_json::to_vec(&source)?)?;
         let operations = record
@@ -1908,12 +1919,15 @@ mod tests {
         assert_eq!(operations[0]["params"]["size"], 2.0);
         assert!(operations[1].get("seed").is_none());
         assert!(operations[2].get("seed").is_none());
-        assert_eq!(warnings.len(), 2, "{warnings:?}");
-        assert_eq!(warnings[0]["code"], "sculpt.seed_retired");
+        assert!(operations[3].get("seed").is_none());
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert_eq!(warnings[0]["code"], "operation.seed_retired");
         assert_eq!(warnings[0]["operation_index"], 1);
         assert_eq!(warnings[0]["op"], "sculpt.stroke");
         assert_eq!(warnings[0]["seed"], 7);
         assert_eq!(warnings[1]["op"], "sculpt.dyntopo");
+        assert_eq!(warnings[2]["code"], "operation.seed_retired");
+        assert_eq!(warnings[2]["op"], "paint.vertex");
 
         let replay = json!({
             "schema_version": 1,

@@ -268,8 +268,7 @@ fn texture_paint_maps_world_stroke_through_face_corner_uvs() -> Result<(), Box<d
             "samples":[{"position":[0.0,0.0,1.0],"radius":0.2,"pressure":1.0,"strength":1.0,"time":0.0}],
             "color":[1.0,0.0,0.0,1.0],
             "blend":"mix",
-            "falloff":"linear",
-            "seed":7
+            "falloff":"linear"
         }]),
     )?;
 

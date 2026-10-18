@@ -1311,8 +1311,8 @@ fn operation_contract(name: &str) -> OperationContract {
         ),
         "paint.texture" => (
             vec![
-                "target", "scope", "image", "uv_layer", "samples", "falloff", "symmetry", "seed",
-                "color", "blend",
+                "target", "scope", "image", "uv_layer", "samples", "falloff", "symmetry", "color",
+                "blend",
             ],
             vec!["op", "target", "image", "samples", "color"],
             "mesh object and UV corners",

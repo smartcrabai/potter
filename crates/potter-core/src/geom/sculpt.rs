@@ -239,9 +239,9 @@ fn deform_vertex(
             point + normal * (radius * strength * influence)
         }
         Brush::ClayStrips => {
-            // Blender 5.2.2 Clay Strips (mesh/brushes/clay_strips.cc:328): offset = plane_normal *
-            // bstrength * radius, applied with the falloff factors only (clay_strips.cc:190). No
-            // random factor. Potter's 0.75 is kept unchanged; Blender's offset has no such factor.
+            // Potter's current Clay Strips rule, pending the sculpt brush parity follow-up. Blender 5.2.2
+            // (clay_strips.cc:328) has offset = plane_normal * bstrength * radius with no 0.75 factor, so this
+            // rule is not derived from Blender.
             point + normal * (influence * 0.75)
         }
         Brush::Inflate => {
@@ -251,9 +251,9 @@ fn deform_vertex(
             point + normal * influence
         }
         Brush::Layer => {
-            // Blender 5.2.2 Layer (mesh/brushes/layer.cc:51): displacement += factor * strength *
-            // (1.05 - |displacement|); translation = normal * height * displacement * factor
-            // (layer.cc:101-103). No random factor.
+            // Potter's current Layer rule (a per-stroke offset along the normal), pending the sculpt brush parity
+            // follow-up. Blender 5.2.2 (layer.cc:51, :101-103) accumulates a persistent displacement factor, which
+            // this rule does not model.
             point + normal * influence
         }
         Brush::Grab => point + sample_delta * influence,
@@ -1213,17 +1213,11 @@ mod tests {
 
     #[test]
     fn clay_strips_inflate_and_layer_offsets_have_no_jitter() {
-        // Blender 5.2.2 applies no per-vertex random scale to these brushes:
-        // - Clay Strips: offset = plane_normal * bstrength * radius
-        //   (mesh/brushes/clay_strips.cc:328), applied with the falloff factors only
-        //   (clay_strips.cc:190).
-        // - Inflate: scale = cache.scale * radius * bstrength (mesh/brushes/inflate.cc:142),
-        //   applied as normal * scale * falloff factor (inflate.cc:72-73).
-        // - Layer: displacement += factor * strength * (1.05 - |displacement|)
-        //   (mesh/brushes/layer.cc:51), translation = normal * height * displacement * factor
-        //   (layer.cc:101-103).
-        // Potter's per-vertex amount is falloff weight * pressure * strength along +Z. Clay Strips
-        // keeps Potter's existing 0.75 factor, which Blender's offset does not contain.
+        // These pin Potter's current per-vertex rule for these brushes, pending the sculpt brush parity follow-up;
+        // the expected values are not derived from Blender. Blender 5.2.2 applies no per-vertex random scale to
+        // these brushes, and this test checks that Potter applies none either. Potter's per-vertex amount is falloff
+        // weight * pressure * strength along +Z. Clay Strips keeps Potter's 0.75 factor, which Blender's offset
+        // (clay_strips.cc:328) does not contain.
         let radius = 3.0;
         let strength = 0.5;
         let pressure = 1.0;
