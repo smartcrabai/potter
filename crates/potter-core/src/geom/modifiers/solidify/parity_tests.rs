@@ -3,7 +3,9 @@
 //! Each case has an input (`inputs/<case>.json`: a `Mesh` in serde shape, the complete Solidify
 //! parameter set, and the object's material slot count) and Blender's evaluated mesh for the same
 //! geometry (`expected/<case>.json`). Potter evaluates the input through `Snapshot::evaluate`, the
-//! scene path the CLI uses, where the node's material list sets the evaluated slot count.
+//! scene path the CLI uses, where the node's material list sets the evaluated slot count. Input
+//! edges are listed in Blender's own edge order, as a `.blend` import gives Potter, because the
+//! neighbour order around a vertex decides where a non-manifold edge group starts.
 //!
 //! Blender and Potter order vertices, edges, and faces differently, so elements are matched by
 //! position: vertices by position and vertex-group weights; edges by endpoint positions (either

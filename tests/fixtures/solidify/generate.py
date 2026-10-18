@@ -231,24 +231,28 @@ def uv_layer(verts, faces, offsets, layer):
                 values.append([0.3 * (loop % 5) + 0.05 * x, 0.9 - 0.11 * (loop % 7) + 0.02 * y])
     return values
 
+def blender_edge_order(verts, loose, faces):
+    """Edge keys in the order Blender's `from_pydata` gives the mesh's edges."""
+    probe = bpy.data.meshes.new("edge_order_probe")
+    probe.from_pydata(verts, loose, faces)
+    probe.update()
+    order = [edge_key(e.vertices[0], e.vertices[1]) for e in probe.edges]
+    bpy.data.meshes.remove(probe)
+    return order
+
+
 
 def decorate(base, smooth=False, sharp=(), seam=(), creases=(), materials=None, uv_layers=0,
              custom=False, groups=(), colors=False, bevel_edges=None, bevel_vertices=None):
     """Input attributes for a base mesh. Every value is deterministic and stored in both files."""
     verts, faces, loose = base["verts"], base["faces"], base["loose"]
-    edges = []
-    seen = set()
-    for face in faces:
-        for k in range(len(face)):
-            key = edge_key(face[k], face[(k + 1) % len(face)])
-            if key not in seen:
-                seen.add(key)
-                edges.append(key)
+    # Blender's edge order (the order `from_pydata` gives the mesh), not first-appearance order: Potter
+    # reads the input edges in this order, as it does for a mesh imported from `.blend`, and the
+    # neighbour order around a vertex decides which edge group a non-manifold run starts from.
+    edges = blender_edge_order(verts, loose, faces)
+    face_keys = {edge_key(face[k], face[(k + 1) % len(face)]) for face in faces for k in range(len(face))}
     for a, b in loose:
-        key = edge_key(a, b)
-        assert key not in seen, f"loose edge {key} duplicates a face edge"
-        seen.add(key)
-        edges.append(key)
+        assert edge_key(a, b) not in face_keys, f"loose edge {(a, b)} duplicates a face edge"
     edge_ids = {key: i for i, key in enumerate(edges)}
     offsets, total = [], 0
     for face in faces:

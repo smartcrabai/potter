@@ -141,28 +141,28 @@
     "id": 0,
     "v": [
      0,
-     1
+     4
     ]
    },
    {
     "id": 1,
+    "v": [
+     0,
+     1
+    ]
+   },
+   {
+    "id": 2,
     "v": [
      1,
      5
     ]
    },
    {
-    "id": 2,
+    "id": 3,
     "v": [
      4,
      5
-    ]
-   },
-   {
-    "id": 3,
-    "v": [
-     0,
-     4
     ]
    },
    {
@@ -210,22 +210,22 @@
    {
     "id": 10,
     "v": [
-     5,
-     9
+     4,
+     8
     ]
    },
    {
     "id": 11,
     "v": [
-     8,
+     5,
      9
     ]
    },
    {
     "id": 12,
     "v": [
-     4,
-     8
+     8,
+     9
     ]
    },
    {
@@ -337,8 +337,8 @@
     "type": "bool",
     "values": {
      "e0": false,
-     "e1": true,
-     "e2": false,
+     "e1": false,
+     "e2": true,
      "e3": false,
      "e4": false,
      "e5": false,
@@ -358,6 +358,10 @@
    "blender_edge_flags": [
     {
      "sharp": false,
+     "seam": true
+    },
+    {
+     "sharp": false,
      "seam": false
     },
     {
@@ -367,10 +371,6 @@
     {
      "sharp": false,
      "seam": false
-    },
-    {
-     "sharp": false,
-     "seam": true
     },
     {
      "sharp": false,
