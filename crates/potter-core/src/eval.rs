@@ -70,7 +70,8 @@ pub(crate) struct ModifierEvaluationContext<'a> {
     pub(crate) purpose: EvaluationPurpose,
     pub(crate) project_root: Option<&'a Path>,
     pub(crate) cache_directory: Option<&'a Path>,
-    /// Current evaluated material-table size in the owning modifier stack, if available.
+    /// The owning object's material slot count (`Node::material_slot_count`); `None` when there is
+    /// no scene object, in which case consumers fall back to the mesh's own face material indices.
     pub(crate) material_slot_count: Option<usize>,
 }
 
@@ -1651,7 +1652,7 @@ fn modifier_transform_references(modifier: &Modifier) -> BTreeSet<Id> {
     }
 
     let parameters: &[&str] = match modifier.modifier_type.as_str() {
-        "hook" => &["object"],
+        "hook" | "screw" => &["object"],
         "mirror" => &["mirror_object"],
         "uv_project" => &["projectors"],
         "uv_warp" | "warp" => &["object_from", "object_to"],
@@ -1688,14 +1689,6 @@ fn modifier_transform_references(modifier: &Modifier) -> BTreeSet<Id> {
         {
             add_reference(&mut references, modifier.params.get("offset_object"));
         }
-    } else if modifier.modifier_type == "screw"
-        && modifier
-            .params
-            .get("use_object_screw_offset")
-            .and_then(Value::as_bool)
-            == Some(true)
-    {
-        add_reference(&mut references, modifier.params.get("object"));
     }
     references
 }

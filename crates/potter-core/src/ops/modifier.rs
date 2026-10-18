@@ -824,10 +824,15 @@ fn settle_pin(stack: &mut Vec<Modifier>, index: usize) {
     }
 }
 
-/// `modifier.attribute_dropped` reports output that was applied with attributes lost, so it is
-/// surfaced as a warning on every apply path instead of failing the operation.
-fn is_attribute_dropped(warning: &PotError) -> bool {
+/// Attribute loss and explicitly marked modifier diagnostics accompany successfully applied output,
+/// so each is surfaced as a warning on every apply path instead of failing the operation.
+fn is_apply_warning(warning: &PotError) -> bool {
     warning.details.get("feature_id").and_then(Value::as_str) == Some("modifier.attribute_dropped")
+        || warning
+            .details
+            .get("modifier_warning")
+            .and_then(Value::as_bool)
+            == Some(true)
 }
 
 fn ensure_single_user_data(engine: &mut Engine<'_>, targets: &[Id]) -> Result<()> {
@@ -1072,6 +1077,10 @@ fn evaluate_modifier_output(
         .nodes
         .get(target)
         .map_or(0, |node| node.materials.len());
+    let material_slot_count = Some(crate::model::material_slot_count(
+        object_material_count,
+        material_slots.len(),
+    ));
     let evaluated = {
         let data_block = engine.doc.data_blocks.get(data_id).ok_or_else(|| {
             PotError::new(
@@ -1181,12 +1190,13 @@ fn evaluate_modifier_output(
                 modifier_stack,
                 &engine.doc.node_groups,
                 engine.evaluation_frame,
+                material_slot_count,
             )?;
             engine.warnings.extend(
                 evaluation
                     .warnings
                     .into_iter()
-                    .filter(is_attribute_dropped)
+                    .filter(is_apply_warning)
                     .map(|warning| crate::eval::attach_node_owner(warning, target)),
             );
             evaluation.mesh
@@ -1393,15 +1403,13 @@ fn evaluate_modifier_output(
                     })
                 },
             )?;
-            let (dropped, blocking): (Vec<PotError>, Vec<PotError>) = evaluation
-                .warnings
-                .into_iter()
-                .partition(is_attribute_dropped);
+            let (forwarded, blocking): (Vec<PotError>, Vec<PotError>) =
+                evaluation.warnings.into_iter().partition(is_apply_warning);
             if let Some(warning) = blocking.into_iter().next() {
                 return Err(warning);
             }
             engine.warnings.extend(
-                dropped
+                forwarded
                     .into_iter()
                     .map(|warning| crate::eval::attach_node_owner(warning, target)),
             );
