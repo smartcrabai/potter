@@ -4042,7 +4042,10 @@ fn volume_bounds(volume: &crate::geom::volume::VolumeData, matrix: DMat4) -> Res
         }
         let half_voxel = match &volume.source {
             crate::geom::volume::VolumeSource::Generated(source)
-                if source.algorithm == "mesh_to_volume_fog" => 0.5,
+                if source.algorithm == "mesh_to_volume_fog" =>
+            {
+                0.5
+            }
             _ => 0.0,
         };
         let minimum_index = DVec3::splat(-half_voxel);
@@ -4054,9 +4057,21 @@ fn volume_bounds(volume: &crate::geom::volume::VolumeData, matrix: DMat4) -> Res
         let volume_to_world = matrix * grid.checked_index_to_local_matrix()?;
         for corner in 0..8 {
             let index = DVec3::new(
-                if corner & 1 == 0 { minimum_index.x } else { maximum_index.x },
-                if corner & 2 == 0 { minimum_index.y } else { maximum_index.y },
-                if corner & 4 == 0 { minimum_index.z } else { maximum_index.z },
+                if corner & 1 == 0 {
+                    minimum_index.x
+                } else {
+                    maximum_index.x
+                },
+                if corner & 2 == 0 {
+                    minimum_index.y
+                } else {
+                    maximum_index.y
+                },
+                if corner & 4 == 0 {
+                    minimum_index.z
+                } else {
+                    maximum_index.z
+                },
             );
             let world = volume_to_world.transform_point3(index);
             if !world.is_finite() {
@@ -4295,13 +4310,16 @@ pub(crate) fn apply_volume_to_mesh_modifier(
                 ErrorCode::InternalError,
                 format!("volume_to_mesh has no schema default for `{name}`"),
             )),
-            Some(value) => value.as_f64().filter(|number| number.is_finite()).ok_or_else(|| {
-                PotError::with_details(
-                    ErrorCode::InvalidArgument,
-                    format!("volume_to_mesh `{name}` must be finite"),
-                    json!({"modifier_id":modifier.id,"parameter":name}),
-                )
-            }),
+            Some(value) => value
+                .as_f64()
+                .filter(|number| number.is_finite())
+                .ok_or_else(|| {
+                    PotError::with_details(
+                        ErrorCode::InvalidArgument,
+                        format!("volume_to_mesh `{name}` must be finite"),
+                        json!({"modifier_id":modifier.id,"parameter":name}),
+                    )
+                }),
         }
     };
     let threshold = parameter_number("threshold")? as f32 as f64;
@@ -4375,10 +4393,7 @@ pub(crate) fn apply_volume_to_mesh_modifier(
     }
     let volume_to_mesh = source_inverse * volume_world;
     let mut extracted = crate::geom::volume::volume_to_mesh_named_adaptive(
-        volume,
-        threshold,
-        grid_name,
-        adaptivity,
+        volume, threshold, grid_name, adaptivity,
     )?;
     if use_smooth_shade {
         crate::geom::normals::shade_faces_smooth(&mut extracted);

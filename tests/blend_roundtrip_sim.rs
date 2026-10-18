@@ -706,10 +706,7 @@ fn simulation_modifiers_settings_caches_and_frame_ranges_round_trip() -> Result<
         if property_name == "physics_fluid" {
             let role = expected_settings["role"].as_str().unwrap();
             assert_eq!(imported_modifier["params"]["fluid_type"], role);
-            expected_settings
-                .as_object_mut()
-                .unwrap()
-                .remove("role");
+            expected_settings.as_object_mut().unwrap().remove("role");
         } else if property_name == "physics_dynamic_paint" {
             let role = expected_settings["role"].as_str().unwrap();
             assert_eq!(
@@ -850,10 +847,7 @@ fn simulation_modifiers_settings_caches_and_frame_ranges_round_trip() -> Result<
             &format!("reopened.{case_name}"),
         );
     }
-    assert_eq!(
-        after["settings"]["dynamic_paint_brush"]["ui_type"],
-        "BRUSH"
-    );
+    assert_eq!(after["settings"]["dynamic_paint_brush"]["ui_type"], "BRUSH");
     assert_eq!(
         after["settings"]["dynamic_paint_canvas"]["ui_type"],
         "CANVAS"
@@ -890,8 +884,10 @@ fn simulation_modifiers_settings_caches_and_frame_ranges_round_trip() -> Result<
     let brush_modifier_id = modifier(&scene, brush_id, "BrushSettingsFixture")["id"]
         .as_str()
         .unwrap();
-    let imported_canvas_surfaces = scene["nodes"][canvas_id]["properties"]["physics_dynamic_paint"]["canvas_surfaces"].clone();
-    let imported_brush_color = scene["nodes"][brush_id]["properties"]["physics_dynamic_paint"]["paint_color"].clone();
+    let imported_canvas_surfaces =
+        scene["nodes"][canvas_id]["properties"]["physics_dynamic_paint"]["canvas_surfaces"].clone();
+    let imported_brush_color =
+        scene["nodes"][brush_id]["properties"]["physics_dynamic_paint"]["paint_color"].clone();
     let imported_compatibility = scene["compatibility"]["blender_adapter"]["intermediate"].clone();
     let imported_history_head = scene["history"]["head"].as_str().unwrap().to_owned();
     let history_hash = imported_history_head.strip_prefix("sha256:").unwrap();
@@ -920,8 +916,7 @@ fn simulation_modifiers_settings_caches_and_frame_ranges_round_trip() -> Result<
         "--file",
         same_role_path.to_str().unwrap(),
     ])?;
-    let same_role_scene: Value =
-        serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
+    let same_role_scene: Value = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
     assert_eq!(
         same_role_scene["nodes"][canvas_id]["properties"]["physics_dynamic_paint"]["canvas_surfaces"],
         imported_canvas_surfaces
@@ -934,10 +929,12 @@ fn simulation_modifiers_settings_caches_and_frame_ranges_round_trip() -> Result<
         same_role_scene["compatibility"]["blender_adapter"]["intermediate"],
         imported_compatibility
     );
-    assert!(same_role_scene["history"]["undo"]
-        .as_array()
-        .unwrap()
-        .contains(&json!(imported_history_head)));
+    assert!(
+        same_role_scene["history"]["undo"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(imported_history_head))
+    );
     assert_eq!(fs::read(&history_blob_path)?, imported_history_blob);
 
     let transition_batch = json!({
@@ -956,18 +953,25 @@ fn simulation_modifiers_settings_caches_and_frame_ranges_round_trip() -> Result<
         "--file",
         transition_path.to_str().unwrap(),
     ])?;
-    let transitioned_scene: Value =
-        serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
-    let canvas_settings = &transitioned_scene["nodes"][canvas_id]["properties"]["physics_dynamic_paint"];
-    let brush_settings = &transitioned_scene["nodes"][brush_id]["properties"]["physics_dynamic_paint"];
+    let transitioned_scene: Value = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
+    let canvas_settings =
+        &transitioned_scene["nodes"][canvas_id]["properties"]["physics_dynamic_paint"];
+    let brush_settings =
+        &transitioned_scene["nodes"][brush_id]["properties"]["physics_dynamic_paint"];
     assert_eq!(canvas_settings["role"], "brush");
     assert!(canvas_settings.get("canvas_surfaces").is_none());
     assert!(canvas_settings.get("surface_format").is_none());
-    assert_eq!(modifier(&transitioned_scene, canvas_id, "CanvasSettingsFixture")["params"]["ui_type"], "BRUSH");
+    assert_eq!(
+        modifier(&transitioned_scene, canvas_id, "CanvasSettingsFixture")["params"]["ui_type"],
+        "BRUSH"
+    );
     assert_eq!(brush_settings["role"], "canvas");
     assert!(brush_settings.get("paint_color").is_none());
     assert!(brush_settings.get("use_velocity_alpha").is_none());
-    assert_eq!(modifier(&transitioned_scene, brush_id, "BrushSettingsFixture")["params"]["ui_type"], "CANVAS");
+    assert_eq!(
+        modifier(&transitioned_scene, brush_id, "BrushSettingsFixture")["params"]["ui_type"],
+        "CANVAS"
+    );
 
     let transitioned_blend = root.join("dynamic_paint_role_transitions.blend");
     pot_json(&[
@@ -993,10 +997,26 @@ fn simulation_modifiers_settings_caches_and_frame_ranges_round_trip() -> Result<
     let transitioned_reopened: Value =
         serde_json::from_slice(&fs::read(transitioned_reopen_path)?)?;
     assert_eq!(transitioned_reopened["canvas_object"]["ui_type"], "BRUSH");
-    assert!(transitioned_reopened["canvas_object"]["has_brush_settings"].as_bool().unwrap());
-    assert!(!transitioned_reopened["canvas_object"]["has_canvas_settings"].as_bool().unwrap());
+    assert!(
+        transitioned_reopened["canvas_object"]["has_brush_settings"]
+            .as_bool()
+            .unwrap()
+    );
+    assert!(
+        !transitioned_reopened["canvas_object"]["has_canvas_settings"]
+            .as_bool()
+            .unwrap()
+    );
     assert_eq!(transitioned_reopened["brush_object"]["ui_type"], "CANVAS");
-    assert!(!transitioned_reopened["brush_object"]["has_brush_settings"].as_bool().unwrap());
-    assert!(transitioned_reopened["brush_object"]["has_canvas_settings"].as_bool().unwrap());
+    assert!(
+        !transitioned_reopened["brush_object"]["has_brush_settings"]
+            .as_bool()
+            .unwrap()
+    );
+    assert!(
+        transitioned_reopened["brush_object"]["has_canvas_settings"]
+            .as_bool()
+            .unwrap()
+    );
     Ok(())
 }

@@ -2267,7 +2267,11 @@ fn unsupported_attribute_modifier_value(modifier_type: &str, parameter: &str) ->
     )
 }
 
-fn validate_volume_object_type(engine: &Engine<'_>, modifier_type: &str, target: &Id) -> Result<()> {
+fn validate_volume_object_type(
+    engine: &Engine<'_>,
+    modifier_type: &str,
+    target: &Id,
+) -> Result<()> {
     let expected_kind = match modifier_type {
         "mesh_to_volume" | "volume_displace" => "volume",
         "volume_to_mesh" => "mesh",

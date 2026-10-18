@@ -750,6 +750,7 @@ fn simulation_bake_contains_deformed_meshes_particles_liquid_and_paint() {
                 {"op":"physics.dynamic_paint.create","target":{"id":"brush"},"settings":{"role":"brush","radius":1.0,"color":[0.1,0.8,0.3,1.0]}},
                 {"op":"physics.dynamic_paint.create","target":{"id":"canvas"},"settings":{"role":"canvas","brushes":["brush"]}},
                 {"op":"physics.dynamic_paint.create","target":{"id":"weight_canvas"},"settings":{"role":"canvas","surface_format":"weight","brushes":["brush"]}}
+            ]
         }),
     );
     let (output, response) = bake(&scene, &out, "1:2");

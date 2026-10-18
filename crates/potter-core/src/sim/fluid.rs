@@ -116,7 +116,9 @@ pub fn simulate_with_sources(
         ));
     }
     if flows.len() > MAX_COLLIDERS {
-        return Err(limit("fluid simulation exceeds the 100000 flow-source limit"));
+        return Err(limit(
+            "fluid simulation exceeds the 100000 flow-source limit",
+        ));
     }
     let mut world_colliders = Vec::with_capacity(colliders.len());
     for points in colliders {
@@ -205,7 +207,9 @@ pub fn simulate_with_sources(
     let mut flow_inflow_count = 0_usize;
     for flow in flows {
         if !flow.inflow_rate.is_finite() || flow.inflow_rate < 0.0 {
-            return Err(invalid("fluid flow inflow_rate must be finite and non-negative"));
+            return Err(invalid(
+                "fluid flow inflow_rate must be finite and non-negative",
+            ));
         }
         flow_triangle_count = flow_triangle_count
             .checked_add(flow.triangles.len())
@@ -752,7 +756,11 @@ mod tests {
         )
         .expect("contained flow succeeds");
         assert_eq!(emitted.len(), 3);
-        assert!(emitted[1..].iter().all(|point| (point.z - 0.5).abs() < 1.0e-12));
+        assert!(
+            emitted[1..]
+                .iter()
+                .all(|point| (point.z - 0.5).abs() < 1.0e-12)
+        );
 
         let outside = FlowSource {
             triangles: vec![[

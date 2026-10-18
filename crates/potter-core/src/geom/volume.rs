@@ -23,7 +23,6 @@ const MAX_INPUT_TRIANGLES: usize = 100_000;
 const MAX_GRID_COUNT: usize = 64;
 const MAX_OUTPUT_FACES: usize = 500_000;
 
-
 /// Provenance information for an in-memory generated volume.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -131,9 +130,21 @@ impl VolumeGrid {
         let mut maximum = DVec3::splat(f64::NEG_INFINITY);
         for corner in 0..8 {
             let index = DVec3::new(
-                if corner & 1 == 0 { minimum_index.x } else { maximum_index.x },
-                if corner & 2 == 0 { minimum_index.y } else { maximum_index.y },
-                if corner & 4 == 0 { minimum_index.z } else { maximum_index.z },
+                if corner & 1 == 0 {
+                    minimum_index.x
+                } else {
+                    maximum_index.x
+                },
+                if corner & 2 == 0 {
+                    minimum_index.y
+                } else {
+                    maximum_index.y
+                },
+                if corner & 4 == 0 {
+                    minimum_index.z
+                } else {
+                    maximum_index.z
+                },
             );
             let local = index_to_local.transform_point3(index);
             if !local.is_finite() {
@@ -147,7 +158,6 @@ impl VolumeGrid {
         Ok((minimum, maximum))
     }
 }
-
 
 impl Default for VolumeGrid {
     fn default() -> Self {
@@ -286,7 +296,9 @@ pub(crate) fn sample_density_checked_with_inverse(
             None => grid.checked_index_to_local_matrix()?.inverse(),
         };
         if !local_to_index.is_finite() {
-            return Err(invalid_volume("volume grid index transform is not invertible"));
+            return Err(invalid_volume(
+                "volume grid index transform is not invertible",
+            ));
         }
         local_to_index.transform_point3(position)
     } else {
@@ -391,11 +403,7 @@ pub fn volume_to_mesh_named_adaptive(
 ///
 /// Returns a typed error for a missing grid, unsupported source, invalid grid data or iso-level,
 /// resource-limit violations, and fields that do not cross the requested iso-level.
-pub fn volume_to_mesh_named(
-    volume: &VolumeData,
-    iso_level: f64,
-    grid_name: &str,
-) -> Result<Mesh> {
+pub fn volume_to_mesh_named(volume: &VolumeData, iso_level: f64, grid_name: &str) -> Result<Mesh> {
     volume_to_mesh_named_adaptive(volume, iso_level, grid_name, 0.0)
 }
 
@@ -410,7 +418,9 @@ fn volume_to_mesh_for_grid(
         return Err(invalid_volume("iso_level must be finite"));
     }
     if !adaptivity.is_finite() || !(0.0..=1.0).contains(&adaptivity) {
-        return Err(invalid_volume("adaptivity must be finite and between 0 and 1"));
+        return Err(invalid_volume(
+            "adaptivity must be finite and between 0 and 1",
+        ));
     }
     let adaptivity = adaptivity as f32;
     if matches!(&volume.source, VolumeSource::File(_)) {
@@ -430,7 +440,10 @@ fn volume_to_mesh_for_grid(
                 .ok_or_else(|| invalid_volume("VDB archive contains no density grid"))?
         };
         let inside_is_low = grid.class.as_deref().is_some_and(|class| {
-            matches!(class, "level set" | "Level Set" | "LevelSet" | "level_set" | "levelset")
+            matches!(
+                class,
+                "level set" | "Level Set" | "LevelSet" | "level_set" | "levelset"
+            )
         });
         return vdb_grid_to_mesh(grid, iso_level, inside_is_low, adaptivity);
     }
@@ -476,7 +489,9 @@ fn volume_to_mesh_for_grid(
         let index_to_local = grid.checked_index_to_local_matrix()?;
         let local_to_index = index_to_local.inverse();
         if !local_to_index.is_finite() {
-            return Err(invalid_volume("volume grid index transform is not invertible"));
+            return Err(invalid_volume(
+                "volume grid index transform is not invertible",
+            ));
         }
         grid.local_bounds(DVec3::ZERO, maximum_index)?;
         for vertex in &mut mesh.vertices {
@@ -505,34 +520,19 @@ fn grid_boundary_crosses(
             for x in 0..nx {
                 let first = grid_sample(values, x, y, z, nx, ny)? < iso_level;
                 if x + 1 < nx
-                    && (x == 0
-                        || x + 1 == nx - 1
-                        || y == 0
-                        || y == ny - 1
-                        || z == 0
-                        || z == nz - 1)
+                    && (x == 0 || x + 1 == nx - 1 || y == 0 || y == ny - 1 || z == 0 || z == nz - 1)
                     && first != (grid_sample(values, x + 1, y, z, nx, ny)? < iso_level)
                 {
                     return Ok(true);
                 }
                 if y + 1 < ny
-                    && (x == 0
-                        || x == nx - 1
-                        || y == 0
-                        || y + 1 == ny - 1
-                        || z == 0
-                        || z == nz - 1)
+                    && (x == 0 || x == nx - 1 || y == 0 || y + 1 == ny - 1 || z == 0 || z == nz - 1)
                     && first != (grid_sample(values, x, y + 1, z, nx, ny)? < iso_level)
                 {
                     return Ok(true);
                 }
                 if z + 1 < nz
-                    && (x == 0
-                        || x == nx - 1
-                        || y == 0
-                        || y == ny - 1
-                        || z == 0
-                        || z + 1 == nz - 1)
+                    && (x == 0 || x == nx - 1 || y == 0 || y == ny - 1 || z == 0 || z + 1 == nz - 1)
                     && first != (grid_sample(values, x, y, z + 1, nx, ny)? < iso_level)
                 {
                     return Ok(true);
@@ -653,7 +653,6 @@ const OPENVDB_ADAPTABLE: [u8; 256] = [
     1, 0, 0, 0, 1, 0, 1, 0, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0, 1, 1, 0, 1,
     1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 0, 0, 1, 0, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1,
 ];
-
 
 fn dual_contour_grid_to_mesh(
     grid: &VolumeGrid,
@@ -793,8 +792,7 @@ fn dual_contour_grid_to_mesh(
                     let vertex = positions.len();
                     positions.push(position);
                     for group_edge in 0..CUBE_EDGES.len() {
-                        if crossing[group_edge]
-                            && find_edge_group(&mut parent, group_edge) == group
+                        if crossing[group_edge] && find_edge_group(&mut parent, group_edge) == group
                         {
                             edge_vertices[group_edge] = vertex;
                         }
@@ -916,9 +914,7 @@ fn dual_contour_grid_to_mesh(
 
 fn round_mesh_positions_to_f32(mesh: &mut Mesh) {
     for vertex in &mut mesh.vertices {
-        vertex.co = vertex
-            .co
-            .map(|component| f64::from(component as f32));
+        vertex.co = vertex.co.map(|component| f64::from(component as f32));
     }
 }
 
@@ -943,7 +939,7 @@ fn grid_sample(
     z: usize,
     nx: usize,
     ny: usize,
- ) -> Result<f64> {
+) -> Result<f64> {
     let index = z
         .checked_mul(ny)
         .and_then(|row| row.checked_add(y))
@@ -1004,7 +1000,7 @@ fn global_grid_sample(
     origin: [i64; 3],
     coordinate: [i64; 3],
     outside_value: f64,
- ) -> f64 {
+) -> f64 {
     let local = [
         coordinate[0] - origin[0],
         coordinate[1] - origin[1],
@@ -1023,11 +1019,7 @@ fn global_grid_sample(
         .unwrap_or(outside_value)
 }
 
-fn global_cell_coordinates(
-    cell: usize,
-    cell_dims: [usize; 3],
-    grid_origin: [i64; 3],
-) -> [i64; 3] {
+fn global_cell_coordinates(cell: usize, cell_dims: [usize; 3], grid_origin: [i64; 3]) -> [i64; 3] {
     let x = cell % cell_dims[0];
     let y = (cell / cell_dims[0]) % cell_dims[1];
     let z = cell / (cell_dims[0] * cell_dims[1]);
@@ -1132,11 +1124,7 @@ fn region_is_non_manifold(
             return true;
         }
     }
-    let center = [
-        start[0] + half,
-        start[1] + half,
-        start[2] + half,
-    ];
+    let center = [start[0] + half, start[1] + half, start[2] + half];
     let center_inside =
         global_grid_sample(values, dims, grid_origin, center, outside_value) < iso_level;
     signs.iter().all(|inside| *inside != center_inside)
@@ -1217,13 +1205,8 @@ fn adaptive_region_vertices(
                     split_cell = true;
                 }
                 vertices.extend_from_slice(&cell_vertices[..vertex_count]);
-                let index_gradient = grid_gradient(
-                    values,
-                    sample_dims,
-                    grid_origin,
-                    global,
-                    outside_value,
-                );
+                let index_gradient =
+                    grid_gradient(values, sample_dims, grid_origin, global, outside_value);
                 let local_gradient = normal_to_local.transform_vector3(DVec3::new(
                     f64::from(index_gradient.x),
                     f64::from(index_gradient.y),
@@ -1315,16 +1298,17 @@ fn merge_adaptive_regions(
                             true
                         } else {
                             normals.iter().all(|first| {
-                                normals.iter().all(|second| {
-                                    1.0_f32 - first.dot(*second) <= adaptivity
-                                })
+                                normals
+                                    .iter()
+                                    .all(|second| 1.0_f32 - first.dot(*second) <= adaptivity)
                             })
                         };
                         if region_is_blocked || non_manifold || split_cell || !gradients_merge {
                             if dimension < 8 {
                                 let parent_dimension = dimension * 2;
-                                let parent_start = start
-                                    .map(|axis| axis.div_euclid(parent_dimension) * parent_dimension);
+                                let parent_start = start.map(|axis| {
+                                    axis.div_euclid(parent_dimension) * parent_dimension
+                                });
                                 blocked.insert((parent_start, parent_dimension));
                             }
                             continue;
@@ -1435,7 +1419,6 @@ fn append_dual_face(
     faces.push(face);
     Ok(())
 }
-
 
 fn vdb_grid_to_mesh(
     grid: &crate::geom::vdb::VdbGrid,
@@ -1785,10 +1768,7 @@ pub fn mesh_to_fog_volume(
             ..VolumeData::default()
         });
     }
-    if !voxel_size.is_finite()
-        || voxel_size <= 0.0
-        || f64::from(voxel_size).powi(3) < 3.0e-15
-    {
+    if !voxel_size.is_finite() || voxel_size <= 0.0 || f64::from(voxel_size).powi(3) < 3.0e-15 {
         return Ok(VolumeData {
             source: VolumeSource::Generated(VolumeGeneratedSource {
                 algorithm: "mesh_to_volume_fog".to_owned(),
@@ -1863,18 +1843,15 @@ pub fn mesh_to_fog_volume(
             }
         }
     }
-    renormalize_signed_distances(
-        &mut signed_distances,
-        dims,
-        voxel_size,
-        interior_distance,
-    );
+    renormalize_signed_distances(&mut signed_distances, dims, voxel_size, interior_distance);
     let minimum_distance = signed_distances
         .iter()
         .copied()
         .fold(f32::INFINITY, f32::min);
     if !minimum_distance.is_finite() {
-        return Err(invalid_volume("mesh-to-volume conversion produced no interior"));
+        return Err(invalid_volume(
+            "mesh-to-volume conversion produced no interior",
+        ));
     }
     if minimum_distance >= 0.0 {
         signed_distances.fill(0.0);
@@ -2112,16 +2089,14 @@ impl TriangleBvh {
         if let Some((left, right)) = node.children {
             let left_node = &self.nodes[left];
             let right_node = &self.nodes[right];
-            let (first, second) = if distance_to_bounds_squared(
-                point,
-                left_node.minimum,
-                left_node.maximum,
-            ) <= distance_to_bounds_squared(point, right_node.minimum, right_node.maximum)
-            {
-                (left, right)
-            } else {
-                (right, left)
-            };
+            let (first, second) =
+                if distance_to_bounds_squared(point, left_node.minimum, left_node.maximum)
+                    <= distance_to_bounds_squared(point, right_node.minimum, right_node.maximum)
+                {
+                    (left, right)
+                } else {
+                    (right, left)
+                };
             let best = self.nearest_squared_in_node(first, point, best);
             self.nearest_squared_in_node(second, point, best)
         } else {
@@ -2135,7 +2110,6 @@ impl TriangleBvh {
                 })
         }
     }
-
 
     fn signed_distance(&self, point: DVec3) -> f64 {
         let distance = self.nearest_squared(point).sqrt();
@@ -2162,11 +2136,7 @@ impl TriangleBvh {
             self.indices[node.start..node.end]
                 .iter()
                 .filter(|triangle| {
-                    ray_intersects_triangle(
-                        origin,
-                        direction,
-                        self.triangles[**triangle].points,
-                    )
+                    ray_intersects_triangle(origin, direction, self.triangles[**triangle].points)
                 })
                 .count()
         }
@@ -2218,7 +2188,9 @@ fn fog_mesh_geometry(mesh: &Mesh, voxel_size: f32) -> Result<(DVec3, DVec3, Tria
     let corner_count = mesh
         .faces
         .iter()
-        .try_fold(0_usize, |count, face| count.checked_add(face.vertices.len()))
+        .try_fold(0_usize, |count, face| {
+            count.checked_add(face.vertices.len())
+        })
         .ok_or_else(resource_error)?;
     if corner_count > MAX_INPUT_TRIANGLES * 3 {
         return Err(resource_error());
@@ -2261,7 +2233,6 @@ fn fog_mesh_geometry(mesh: &Mesh, voxel_size: f32) -> Result<(DVec3, DVec3, Tria
     let bounds_max = bounds.max.map(|component| f64::from(component as f32));
     Ok((bounds_min, bounds_max, TriangleBvh::new(surface)?))
 }
-
 
 fn ensure_evaluable_source(volume: &VolumeData) -> Result<()> {
     if let VolumeSource::File(source) = &volume.source {
@@ -2377,7 +2348,6 @@ fn validate_grid_samples(grid: &VolumeGrid) -> Result<GridSamples<'_>> {
     Ok(samples)
 }
 
-
 fn grid_axis(extent: f64, voxel_size: f64, padding: usize) -> Result<usize> {
     let axis = (extent / voxel_size).ceil() + 1.0 + 2.0 * padding as f64;
     if !axis.is_finite() || axis < 3.0 || axis > MAX_GRID_AXIS as f64 {
@@ -2385,7 +2355,6 @@ fn grid_axis(extent: f64, voxel_size: f64, padding: usize) -> Result<usize> {
     }
     Ok(axis as usize)
 }
-
 
 #[expect(
     clippy::many_single_char_names,
@@ -2513,16 +2482,9 @@ mod tests {
 
         let volume = mesh_to_fog_volume(&mesh, 1.0, 0.2, 1.0, true).unwrap();
         let grid = volume.grids.first().unwrap();
-        assert!(
-            grid.values
-                .as_ref()
-                .is_some_and(|values| {
-                    !values.is_empty()
-                        && values
-                            .iter()
-                            .all(|value| value.abs() <= f32::EPSILON)
-                })
-        );
+        assert!(grid.values.as_ref().is_some_and(|values| {
+            !values.is_empty() && values.iter().all(|value| value.abs() <= f32::EPSILON)
+        }));
     }
 
     #[test]
@@ -2548,10 +2510,7 @@ mod tests {
     #[test]
     fn affine_grid_density_sampling_maps_volume_local_to_index() {
         let index_to_local = DMat4::from_cols_array(&[
-            0.0, 2.0, 0.0, 0.0,
-            -3.0, 0.0, 0.0, 0.0,
-            0.5, 0.25, 1.0, 0.0,
-            2.0, -1.0, 0.25, 1.0,
+            0.0, 2.0, 0.0, 0.0, -3.0, 0.0, 0.0, 0.0, 0.5, 0.25, 1.0, 0.0, 2.0, -1.0, 0.25, 1.0,
         ]);
         let volume = VolumeData {
             grids: vec![VolumeGrid {
@@ -2569,7 +2528,6 @@ mod tests {
         let local = index_to_local.transform_point3(point);
         assert!((sample_density(local, &volume) - 3.5).abs() < 1.0e-12);
     }
-
 
     #[test]
     fn mesh_volume_mesh_preserves_bounds_within_one_voxel() {

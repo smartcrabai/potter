@@ -1190,9 +1190,9 @@ fn active_modifier<'a>(
     modifier_type: &str,
     gate: ModifierGate<'_>,
 ) -> Option<&'a Modifier> {
-    node.modifiers
-        .iter()
-        .find(|modifier| modifier.modifier_type == modifier_type && gate.is_active(node_id, modifier))
+    node.modifiers.iter().find(|modifier| {
+        modifier.modifier_type == modifier_type && gate.is_active(node_id, modifier)
+    })
 }
 
 fn fluid_modifier_role(modifier: &Modifier) -> &str {
@@ -1261,16 +1261,13 @@ fn fluid_flow_sources(
         if fluid_modifier_role(modifier) != "FLOW" {
             continue;
         }
-        let settings = node
-            .properties
-            .get("physics_fluid")
-            .ok_or_else(|| {
-                PotError::with_details(
-                    ErrorCode::SceneInvalid,
-                    "fluid flow modifier has no linked settings",
-                    json!({"node_id":node_id}),
-                )
-            })?;
+        let settings = node.properties.get("physics_fluid").ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "fluid flow modifier has no linked settings",
+                json!({"node_id":node_id}),
+            )
+        })?;
         // Native flow rates count particles per frame. Imported liquid INFLOW density supplies the
         // rate only when no native rate was authored.
         let imported_density = if settings.get("flow_type").is_some()
@@ -1627,4 +1624,3 @@ fn setting_color(settings: &Value) -> Option<[f64; 4]> {
     };
     Some([r.as_f64()?, g.as_f64()?, b.as_f64()?, a.as_f64()?])
 }
-

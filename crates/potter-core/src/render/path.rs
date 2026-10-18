@@ -1895,10 +1895,10 @@ fn collect_volumes<'a>(
                     }
                     (minimum, maximum, Some(local_to_index))
                 } else {
-                    let maximum = DVec3::from_array(
-                        grid.dims
-                            .map(|dimension| f64::from(dimension.saturating_sub(1)) * grid.voxel_size),
-                    ) + grid.origin;
+                    let maximum =
+                        DVec3::from_array(grid.dims.map(|dimension| {
+                            f64::from(dimension.saturating_sub(1)) * grid.voxel_size
+                        })) + grid.origin;
                     (grid.origin, maximum, None)
                 };
                 let density_range = grid.values.as_ref().and_then(|values| {

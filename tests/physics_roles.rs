@@ -34,7 +34,10 @@ fn apply(scene: &Path, base_revision: u64, operations: &Value) -> Output {
     });
     let schema = potter_core::schema::schema("operations", None).unwrap();
     let validator = jsonschema::validator_for(&schema).unwrap();
-    assert!(validator.is_valid(&batch), "invalid test operation batch: {batch}");
+    assert!(
+        validator.is_valid(&batch),
+        "invalid test operation batch: {batch}"
+    );
     let directory = tempdir().unwrap();
     let path = directory.path().join("operations.json");
     fs::write(&path, serde_json::to_vec(&batch).unwrap()).unwrap();
@@ -89,7 +92,10 @@ fn raw_mesh(document: &Value, node_id: &str) -> Value {
 }
 
 fn assert_mesh_matches(actual: &Value, expected: &Value, context: &str) {
-    assert_eq!(actual["vertices"], expected["vertices"], "{context} vertices");
+    assert_eq!(
+        actual["vertices"], expected["vertices"],
+        "{context} vertices"
+    );
     assert_eq!(actual["faces"], expected["faces"], "{context} faces");
 }
 
@@ -124,7 +130,10 @@ fn dynamic_paint_role_and_ui_type_stay_consistent_on_every_write_path() {
         ("direct", "brush", "BRUSH"),
     ] {
         let node = &document["nodes"][node_id];
-        assert_eq!(node["properties"]["physics_dynamic_paint"]["role"], expected_role);
+        assert_eq!(
+            node["properties"]["physics_dynamic_paint"]["role"],
+            expected_role
+        );
         let modifier = node["modifiers"].as_array().unwrap().first().unwrap();
         assert_eq!(modifier["params"]["ui_type"], expected_ui_type);
     }
@@ -139,8 +148,14 @@ fn dynamic_paint_role_and_ui_type_stay_consistent_on_every_write_path() {
         }]),
     );
     let document = scene_document(&scene);
-    assert_eq!(document["nodes"]["canvas"]["properties"]["physics_dynamic_paint"]["brushes"], json!(["brush"]));
-    assert_eq!(document["nodes"]["canvas"]["properties"]["physics_dynamic_paint"]["surface_format"], "weight");
+    assert_eq!(
+        document["nodes"]["canvas"]["properties"]["physics_dynamic_paint"]["brushes"],
+        json!(["brush"])
+    );
+    assert_eq!(
+        document["nodes"]["canvas"]["properties"]["physics_dynamic_paint"]["surface_format"],
+        "weight"
+    );
 
     apply_ok(
         &scene,
@@ -152,10 +167,24 @@ fn dynamic_paint_role_and_ui_type_stay_consistent_on_every_write_path() {
         }]),
     );
     let document = scene_document(&scene);
-    assert_eq!(document["nodes"]["canvas"]["properties"]["physics_dynamic_paint"]["role"], "brush");
-    assert!(document["nodes"]["canvas"]["properties"]["physics_dynamic_paint"].get("brushes").is_none());
-    assert!(document["nodes"]["canvas"]["properties"]["physics_dynamic_paint"].get("surface_format").is_none());
-    assert_eq!(document["nodes"]["canvas"]["modifiers"][0]["params"]["ui_type"], "BRUSH");
+    assert_eq!(
+        document["nodes"]["canvas"]["properties"]["physics_dynamic_paint"]["role"],
+        "brush"
+    );
+    assert!(
+        document["nodes"]["canvas"]["properties"]["physics_dynamic_paint"]
+            .get("brushes")
+            .is_none()
+    );
+    assert!(
+        document["nodes"]["canvas"]["properties"]["physics_dynamic_paint"]
+            .get("surface_format")
+            .is_none()
+    );
+    assert_eq!(
+        document["nodes"]["canvas"]["modifiers"][0]["params"]["ui_type"],
+        "BRUSH"
+    );
 
     apply_ok(
         &scene,
@@ -168,11 +197,24 @@ fn dynamic_paint_role_and_ui_type_stay_consistent_on_every_write_path() {
         }]),
     );
     let document = scene_document(&scene);
-    assert_eq!(document["nodes"]["canvas"]["properties"]["physics_dynamic_paint"]["role"], "canvas");
-    assert_eq!(document["nodes"]["canvas"]["modifiers"][0]["params"]["ui_type"], "CANVAS");
-    assert!(document["nodes"]["canvas"]["properties"]["physics_dynamic_paint"].get("brushes").is_none());
-    assert!(document["nodes"]["canvas"]["properties"]["physics_dynamic_paint"].get("surface_format").is_none());
-
+    assert_eq!(
+        document["nodes"]["canvas"]["properties"]["physics_dynamic_paint"]["role"],
+        "canvas"
+    );
+    assert_eq!(
+        document["nodes"]["canvas"]["modifiers"][0]["params"]["ui_type"],
+        "CANVAS"
+    );
+    assert!(
+        document["nodes"]["canvas"]["properties"]["physics_dynamic_paint"]
+            .get("brushes")
+            .is_none()
+    );
+    assert!(
+        document["nodes"]["canvas"]["properties"]["physics_dynamic_paint"]
+            .get("surface_format")
+            .is_none()
+    );
 }
 
 #[test]
@@ -215,10 +257,22 @@ fn legacy_dynamic_paint_ui_mismatch_evaluates_from_stored_role_without_rewriting
             .any(|color| color[3].as_f64().unwrap() > 0.0)
     );
     let after = scene_document(&scene);
-    assert_eq!(after["nodes"]["canvas"]["properties"]["physics_dynamic_paint"]["role"], "canvas");
-    assert_eq!(after["nodes"]["canvas"]["modifiers"][0]["params"]["ui_type"], "BRUSH");
-    assert_eq!(after["nodes"]["brush"]["properties"]["physics_dynamic_paint"]["role"], "brush");
-    assert_eq!(after["nodes"]["brush"]["modifiers"][0]["params"]["ui_type"], "CANVAS");
+    assert_eq!(
+        after["nodes"]["canvas"]["properties"]["physics_dynamic_paint"]["role"],
+        "canvas"
+    );
+    assert_eq!(
+        after["nodes"]["canvas"]["modifiers"][0]["params"]["ui_type"],
+        "BRUSH"
+    );
+    assert_eq!(
+        after["nodes"]["brush"]["properties"]["physics_dynamic_paint"]["role"],
+        "brush"
+    );
+    assert_eq!(
+        after["nodes"]["brush"]["modifiers"][0]["params"]["ui_type"],
+        "CANVAS"
+    );
 }
 
 #[test]
@@ -290,9 +344,12 @@ fn set_imported_flow_settings(scene: &Path, flow_type: &str, flow_behavior: &str
     settings.insert("flow_type".to_owned(), json!(flow_type));
     settings.insert("flow_behavior".to_owned(), json!(flow_behavior));
     settings.insert("density".to_owned(), json!(density));
-    fs::write(scene.join("scene.json"), serde_json::to_vec(&document).unwrap()).unwrap();
+    fs::write(
+        scene.join("scene.json"),
+        serde_json::to_vec(&document).unwrap(),
+    )
+    .unwrap();
 }
-
 
 #[test]
 fn flow_emits_into_domains_and_effectors_only_affect_domain_output() {
@@ -317,8 +374,16 @@ fn flow_emits_into_domains_and_effectors_only_affect_domain_output() {
     // Blender 5.2.2 gives the size-1 FLOW at z=1.5 a 432V/860F domain surface at frame 1;
     // the size-0.3 effector at z=0.95 changes that oracle to 434V/864F. Potter compares role
     // behavior and relative native output, not Mantaflow's tessellation.
-    assert!(!plain_frame["fluid_particles"]["domain"].as_array().unwrap().is_empty());
-    assert_ne!(mesh_counts(&plain_frame["deformed_meshes"]["domain"]), (8, 6));
+    assert!(
+        !plain_frame["fluid_particles"]["domain"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_ne!(
+        mesh_counts(&plain_frame["deformed_meshes"]["domain"]),
+        (8, 6)
+    );
     assert_mesh_matches(
         &plain_frame["deformed_meshes"]["flow"],
         &raw_mesh(&scene_document(&without_effector), "flow"),
@@ -361,7 +426,12 @@ fn imported_liquid_inflow_emits_without_native_rate_and_other_modes_stay_unsuppo
         "1:1",
         0,
     );
-    assert!(!frame["fluid_particles"]["domain"].as_array().unwrap().is_empty());
+    assert!(
+        !frame["fluid_particles"]["domain"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
 
     let native_override = directory.path().join("imported-flow-native-rate");
     setup_flow_scene(&native_override, false);
@@ -402,12 +472,19 @@ fn imported_liquid_inflow_emits_without_native_rate_and_other_modes_stay_unsuppo
             .arg("--frames")
             .arg("1:1")
             .arg("--out")
-            .arg(directory.path().join(format!("{flow_type}-{flow_behavior}-bake")))
+            .arg(
+                directory
+                    .path()
+                    .join(format!("{flow_type}-{flow_behavior}-bake")),
+            )
             .arg("--json")
             .output()
             .unwrap();
         assert!(!output.status.success());
-        assert_eq!(response(&output)["error"]["details"]["feature_id"], feature_id);
+        assert_eq!(
+            response(&output)["error"]["details"]["feature_id"],
+            feature_id
+        );
     }
 }
 
@@ -471,7 +548,6 @@ fn fluid_settings_follow_modifier_role_and_role_changes_drop_inapplicable_values
         "/operations/0/settings/inflow_rate",
     );
 }
-
 
 #[test]
 fn volume_modifier_object_types_reject_create_and_set_operations() {
@@ -628,7 +704,10 @@ fn legacy_mesh_volume_modifiers_fail_evaluation_with_object_type_errors() {
             .arg("--json")
             .output()
             .unwrap();
-        assert!(!output.status.success(), "{modifier_type} unexpectedly evaluated");
+        assert!(
+            !output.status.success(),
+            "{modifier_type} unexpectedly evaluated"
+        );
         let envelope = response(&output);
         assert_eq!(envelope["error"]["code"], "INVALID_OPERATION");
         assert_eq!(envelope["error"]["details"]["object_type"], "mesh");
