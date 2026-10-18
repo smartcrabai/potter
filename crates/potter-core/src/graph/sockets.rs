@@ -47,6 +47,7 @@ pub fn is_known_node_type(node_type: &str) -> bool {
             | "ShaderNodeVertexColor"
             | "ShaderNodeAttribute"
             | "ShaderNodeAddShader"
+            | "ShaderNodeMixShader"
             | "ShaderNodeBsdfPrincipled"
             | "ShaderNodeVolumePrincipled"
             | "ShaderNodeVolumeAbsorption"

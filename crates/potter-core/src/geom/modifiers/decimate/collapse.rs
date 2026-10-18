@@ -2083,7 +2083,7 @@ impl Decimator {
     }
 
     /// Output polygons, provenance and corner UVs of the decimated mesh, with joined triangles merged.
-    fn output(&self, join: bool, layer_count: usize, track_original_indices: bool) -> Output {
+    fn output(&self, join: bool, layer_count: usize) -> Output {
         let joins = if join {
             self.bm.join_edges()
         } else {
@@ -2093,7 +2093,6 @@ impl Decimator {
         let mut out_vertex = vec![NONE; self.bm.verts.len()];
         let mut points = Vec::new();
         let mut origins = Vec::new();
-        let mut source_vertices = track_original_indices.then(Vec::new);
         let mut point = Vec::new();
         for (index, vert) in self.bm.verts.iter().enumerate() {
             if vert.alive {
@@ -2104,9 +2103,6 @@ impl Decimator {
                     f64::from(vert.co[2]),
                 ));
                 origins.push(vert.origin.clone());
-                if let Some(source_vertices) = source_vertices.as_mut() {
-                    source_vertices.push(Some(index));
-                }
                 if !vert.point.is_empty() {
                     point.push(vert.point.clone());
                 }
@@ -2206,7 +2202,6 @@ impl Decimator {
             polygons,
             loose,
             origins,
-            source_vertices,
             point,
             faces: faces_origin,
             corner_uv,
@@ -2260,8 +2255,6 @@ struct Output {
     polygons: Vec<Polygon>,
     loose: Vec<[usize; 2]>,
     origins: Vec<Vec<(usize, f64)>>,
-    /// Exact input vertex that survived each output merge.
-    source_vertices: Option<Vec<Option<usize>>>,
     /// POINT attribute values per output vertex when present, in [`collect_point_attributes`] order.
     point: Vec<Vec<Value>>,
     faces: Vec<Option<usize>>,
@@ -2581,11 +2574,7 @@ pub(in crate::geom::modifiers) fn decimate_collapse(
     } else {
         dec.run(target);
     }
-    let output = dec.output(
-        !do_triangulate && has_cut,
-        layer_names.len(),
-        mesh.original_indices.is_some(),
-    );
+    let output = dec.output(!do_triangulate && has_cut, layer_names.len());
     let keep_vertices = vec![true; output.points.len()];
     let corners = output
         .corner_sources
@@ -2598,7 +2587,7 @@ pub(in crate::geom::modifiers) fn decimate_collapse(
         .collect();
     let origin = Origin {
         vertices: output.origins,
-        source_vertices: output.source_vertices,
+        source_vertices: None,
         faces: output.faces,
         corners: Some(corners),
     };

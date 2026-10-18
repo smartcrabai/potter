@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -13,10 +14,7 @@ use crate::{
     },
     error::{ErrorCode, PotError, Result},
     eval::{EvaluationContext, EvaluationPurpose, Snapshot},
-    exchange::{
-        self, ExportOptions, Loss,
-        material_surface::{material_is_used, resolve_surface},
-    },
+    exchange::{self, ExportOptions, Loss, material_surface::resolve_surface},
     hash,
     model::{AvatarVersion, LightType, SceneDoc},
     response::SceneInfo,
@@ -118,16 +116,10 @@ pub fn run(args: &ExportArgs) -> Result<(Option<SceneInfo>, Value)> {
         )?;
         let mut warnings = snapshot.warnings.clone();
         let meshes = exchange::evaluated_meshes(&doc, &snapshot)?;
-        let mut losses = export_losses(&doc, format);
+        let mut losses = export_losses(&doc, format, Some(&snapshot));
         losses.extend(exchange::shading::shading_losses(format, &meshes));
         losses.extend(exchange::uv_layer_losses(format, &meshes));
-        if matches!(
-            format,
-            "fbx" | "fbx-binary" | "alembic" | "obj" | "ply" | "stl"
-        ) || matches!(format, "usda" | "usdc" | "usd" | "usdz")
-        {
-            losses.extend(exchange::attribute_losses(format, &doc, &snapshot)?);
-        }
+        losses.extend(mesh_data_losses(&doc, format, &snapshot)?);
         let vrm = match (format, doc.avatar.as_ref()) {
             ("vrm", Some(avatar)) => Some((avatar, AvatarVersion::V1)),
             ("vrm0", Some(avatar)) => Some((avatar, AvatarVersion::V0)),
@@ -138,7 +130,10 @@ pub fn run(args: &ExportArgs) -> Result<(Option<SceneInfo>, Value)> {
                 exchange::gltf::uv_layer_diagnostics(&doc, &snapshot, vrm)?;
             losses.extend(uv_losses);
             warnings.extend(uv_warnings);
-            losses.extend(exchange::gltf::mesh_export_losses(&doc, &snapshot)?);
+        }
+        if matches!(format, "fbx" | "fbx-binary") {
+            losses.extend(exchange::fbx::uv_texture_losses(&doc, &snapshot));
+            warnings.extend(exchange::fbx::uv_texture_warnings(&doc, &snapshot));
         }
         if !losses.is_empty() && !args.allow_lossy {
             return Err(lossy_error(format, &losses));
@@ -211,7 +206,6 @@ pub fn run(args: &ExportArgs) -> Result<(Option<SceneInfo>, Value)> {
                 args.out.clone(),
                 exchange::fbx::export_allow_lossy(&doc, &snapshot, options.allow_lossy)?,
             )],
-
             "svg" => vec![(
                 args.out.clone(),
                 exchange::svg::export(&doc, &snapshot, view)?,
@@ -380,7 +374,11 @@ fn blend_export_context_json(doc: &SceneDoc, context: &EvaluationContext) -> Res
     }))
 }
 
-pub(crate) fn export_losses(doc: &SceneDoc, format: &str) -> Vec<Loss> {
+pub(crate) fn export_losses(
+    doc: &SceneDoc,
+    format: &str,
+    snapshot: Option<&Snapshot>,
+) -> Vec<Loss> {
     let supports_scene = matches!(
         format,
         "glb"
@@ -462,7 +460,21 @@ pub(crate) fn export_losses(doc: &SceneDoc, format: &str) -> Vec<Loss> {
                     suggestion: Some("export as blend to preserve node visibility".to_owned()),
                 });
             }
-            if !node.materials.is_empty() {
+            let data_block = node
+                .data
+                .as_ref()
+                .and_then(|data_id| doc.data_blocks.get(data_id));
+            let has_material_binding = snapshot.map_or_else(
+                || {
+                    (0..node.material_slot_count(data_block))
+                        .any(|slot| node.material_slot(data_block, slot).is_some())
+                },
+                |snapshot| {
+                    (0..snapshot.slot_count(id, node, data_block))
+                        .any(|slot| snapshot.slot_material(id, node, data_block, slot).is_some())
+                },
+            );
+            if has_material_binding {
                 losses.push(Loss {
                     feature_id: "material.binding".to_owned(),
                     data_id: Some(id.to_string()),
@@ -536,31 +548,6 @@ pub(crate) fn export_losses(doc: &SceneDoc, format: &str) -> Vec<Loss> {
                 ),
             });
         }
-        if matches!(format, "alembic" | "fbx" | "fbx-binary")
-            && let Some(mesh) = data.mesh.as_ref()
-        {
-            for attribute in mesh.attributes.keys() {
-                let supported = if format == "alembic" {
-                    matches!(
-                        attribute.as_str(),
-                        "uv_layers" | "shade_smooth" | "sharp" | "custom_normal"
-                    )
-                } else {
-                    attribute == "uv_layers"
-                        || crate::geom::normals::SHADING_ATTRIBUTES.contains(&attribute.as_str())
-                };
-                // Alembic's existing loss below describes this imported attribute.
-                if supported || (format == "alembic" && attribute == "alembic_normals") {
-                    continue;
-                }
-                losses.push(Loss {
-                    feature_id: "mesh.attribute".to_owned(),
-                    data_id: Some(id.to_string()),
-                    reason: format!("{format} drops unsupported mesh attribute `{attribute}`"),
-                    suggestion: Some("export as blend to preserve mesh attributes".to_owned()),
-                });
-            }
-        }
         if !data_supported {
             losses.push(Loss {
                 feature_id: format!("data.{}", data.data_type),
@@ -571,13 +558,12 @@ pub(crate) fn export_losses(doc: &SceneDoc, format: &str) -> Vec<Loss> {
         }
     }
     if matches!(format, "glb" | "gltf" | "vrm" | "vrm0") {
-        losses.extend(material_losses(doc));
+        losses.extend(material_losses(doc, snapshot));
     }
-    if matches!(format, "fbx" | "fbx-binary") {
-        losses.extend(exchange::fbx::uv_texture_losses(doc));
-    }
-    if matches!(format, "fbx" | "fbx-binary") {
-        losses.extend(exchange::fbx::uv_texture_losses(doc));
+    if matches!(format, "fbx" | "fbx-binary")
+        && let Some(snapshot) = snapshot
+    {
+        losses.extend(exchange::fbx::material_slot_losses(doc, snapshot));
     }
     if let Some(loss) = avatar_settings_loss(doc, format) {
         losses.push(loss);
@@ -585,12 +571,53 @@ pub(crate) fn export_losses(doc: &SceneDoc, format: &str) -> Vec<Loss> {
     losses
 }
 
+/// Mesh-data losses of a strict export of `format`, read from the evaluated meshes: generic
+/// attributes the format's writer drops, and glTF-family mesh data glTF cannot write losslessly.
+/// `run` and `validate` both report this set.
+pub(crate) fn mesh_data_losses(
+    doc: &SceneDoc,
+    format: &str,
+    snapshot: &Snapshot,
+) -> Result<Vec<Loss>> {
+    let mut losses = Vec::new();
+    if matches!(
+        format,
+        "fbx" | "fbx-binary" | "alembic" | "obj" | "ply" | "stl" | "usda" | "usdc" | "usd" | "usdz"
+    ) {
+        losses.extend(exchange::attribute_losses(format, doc, snapshot)?);
+    }
+    if matches!(format, "glb" | "gltf" | "vrm" | "vrm0") {
+        losses.extend(exchange::gltf::mesh_export_losses(doc, snapshot)?);
+    }
+    Ok(losses)
+}
+
 /// Material losses for glTF-family output: graph parts the resolver cannot represent. Texture
 /// samples on any UV layer export as their own `TEXCOORD_k`, so they need no loss here.
-fn material_losses(doc: &SceneDoc) -> Vec<Loss> {
+fn material_losses(doc: &SceneDoc, snapshot: Option<&Snapshot>) -> Vec<Loss> {
     let mut losses = Vec::new();
+    let used_materials = doc
+        .nodes
+        .iter()
+        .flat_map(|(node_id, node)| {
+            let data_block = node
+                .data
+                .as_ref()
+                .and_then(|data_id| doc.data_blocks.get(data_id));
+            let slot_count = snapshot.map_or_else(
+                || node.material_slot_count(data_block),
+                |snapshot| snapshot.slot_count(node_id, node, data_block),
+            );
+            (0..slot_count).filter_map(move |slot| {
+                snapshot.map_or_else(
+                    || node.material_slot(data_block, slot),
+                    |snapshot| snapshot.slot_material(node_id, node, data_block, slot),
+                )
+            })
+        })
+        .collect::<BTreeSet<_>>();
     for id in doc.materials.keys() {
-        if !material_is_used(doc, id) {
+        if !used_materials.contains(&id) {
             continue;
         }
         // An unresolvable graph is reported by the export itself, so it adds no loss here.

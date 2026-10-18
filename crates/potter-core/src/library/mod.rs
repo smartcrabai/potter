@@ -71,10 +71,9 @@ pub(crate) fn load_project(uri: &str) -> Result<(PathBuf, SceneDoc, String, Vec<
         ));
     }
     let bytes = fs::read(&scene_path).map_err(|error| PotError::io(&error))?;
-    let source_hash = hash::sha256(&bytes);
     let parsed = crate::model::parse_scene(&bytes)?;
     parsed.doc.validate()?;
-    Ok((project, parsed.doc, source_hash, parsed.warnings))
+    Ok((project, parsed.doc, hash::sha256(&bytes), parsed.warnings))
 }
 
 /// The outcome warnings for a linked project's version-1 data. The upgrade's own record, with its

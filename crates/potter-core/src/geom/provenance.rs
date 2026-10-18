@@ -7,7 +7,7 @@
 //! single place that rewrites ID-keyed attributes after a rebuild. Vertex origins are weighted
 //! so interpolated data (vertex groups, POINT attributes) blends like Blender's `CustomData`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::hash::Hash;
 use std::str::FromStr;
@@ -17,9 +17,11 @@ use serde_json::{Map, Value, json};
 
 use crate::error::{ErrorCode, PotError, Result};
 
+use super::attribute_keys;
 use super::clnor::{self, NormalCodeOptions};
+use super::color_layers::{self, ColorDomain, ColorLayer};
 use super::uv_layers::{self, UvLayer};
-use super::{Mesh, ORIGINDEX_NONE, OriginalIndices, edge_key};
+use super::{Mesh, ORIGINDEX_ATTRIBUTE, ORIGINDEX_NONE, edge_key};
 
 /// Where each element of a rebuilt mesh came from, indexed by output storage order.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -75,16 +77,14 @@ impl Origin {
 
 /// Rewrite the ID-keyed attributes of `output` (rebuilt from `source`) through `origin`.
 ///
-/// `vertex_groups`, `crease_edge`, skin vertex keys, every `uv_layers` layer, and every native element
-/// attribute (any `mesh.attributes` entry whose `domain` is point, edge, face, or corner) are remapped.
-/// That covers `shade_smooth`, `sharp`, `seam`, color layers, and generic attributes. Corner data blends
-/// over the source corners of each output corner (see [`corner_sources`]), so UVs follow the face corner
-/// they came from. A face copies its source face's value, and an edge blends its positive-weight source
-/// edges (booleans OR over them, so `sharp` and `seam` keep a mark from any source). Other values blend by
-/// weight. `custom_normal` is not interpolated: its codes follow
-/// [`crate::geom::clnor::transfer_custom_normals`]. `color_layers` names the same
-/// attributes in the same order, so it carries over unchanged. Elements without a source take the type's
-/// default, so no key refers to a stale element.
+/// `vertex_groups`, `crease_edge`, skin vertex keys, every `uv_layers` layer, every canonical color
+/// layer, and every element-domain `mesh.attributes` entry are remapped. Corner data blends over the
+/// source corners of each output corner (see [`corner_sources`]), so UVs follow the face corner they
+/// came from. Shading flags follow the same origins: `shade_smooth` and `blender_polygon_smooth` copy
+/// their source face's flag, and `sharp` and `seam` OR over source edges. Color layers are rebuilt by
+/// the canonical store, preserving order and active/render choices. `custom_normal` codes are never
+/// interpolated; [`crate::geom::clnor::transfer_custom_normals`] applies the shared code/basis rules.
+/// Elements without a source get no entry, so readers take their type's default; no key refers to a stale element.
 ///
 /// # Errors
 ///
@@ -121,24 +121,6 @@ pub(crate) fn remap_attributes_skipping(
             "modifier provenance does not describe the rebuilt mesh",
         ));
     }
-    output.original_indices = source
-        .original_indices
-        .as_ref()
-        .zip(origin.source_vertices.as_ref())
-        .map(|(indices, selectors)| OriginalIndices {
-            vertices: selectors
-                .iter()
-                .map(|source| match source {
-                    Some(index) => indices
-                        .vertices
-                        .get(*index)
-                        .copied()
-                        .unwrap_or(ORIGINDEX_NONE),
-                    None => ORIGINDEX_NONE,
-                })
-                .collect(),
-            source_vertex_count: indices.source_vertex_count,
-        });
     if source.attributes.is_empty() {
         output.attributes.clear();
         return Ok(());
@@ -154,14 +136,18 @@ pub(crate) fn remap_attributes_skipping(
     } else {
         &[][..]
     };
-    let needs_edges = has("blender_edge_flags")
+    let needs_edges = has("crease_edge")
+        || has("blender_edge_flags")
+        || has("sharp")
         || entries.iter().any(|entry| text(entry, "domain") == "EDGE")
         || source
             .attributes
             .iter()
             .filter(|(key, _)| kept(key.as_str()))
-            .any(|(_, value)| native_domain(value) == Some("edge"));
+            .any(|(_, value)| named_domain(value).as_deref() == Some("edge"));
     let needs_corners = has(uv_layers::ATTRIBUTE)
+        || has("blender_uv_layers")
+        || has("uv_map")
         || has("custom_normal")
         || entries
             .iter()
@@ -170,7 +156,7 @@ pub(crate) fn remap_attributes_skipping(
             .attributes
             .iter()
             .filter(|(key, _)| kept(key.as_str()))
-            .any(|(_, value)| native_domain(value) == Some("corner"));
+            .any(|(_, value)| named_domain(value).as_deref() == Some("corner"));
     let output_vertex_index: HashMap<u32, usize> = if needs_edges || needs_corners {
         output
             .vertices
@@ -202,6 +188,33 @@ pub(crate) fn remap_attributes_skipping(
         edge_origin: &edge_origin,
         corner_origin,
     };
+    let color_store = has(color_layers::ATTRIBUTE).then(|| {
+        let mut store = color_layers::read(source);
+        store
+            .layers
+            .retain(|layer| kept(attribute_keys::storage_key(&layer.name).as_ref()));
+        store.layers = store
+            .layers
+            .iter()
+            .map(|layer| sources.color_layer(layer))
+            .collect();
+        store
+    });
+    let color_layer_keys: HashSet<String> = color_store
+        .as_ref()
+        .into_iter()
+        .flat_map(|store| store.layers.iter())
+        .map(|layer| attribute_keys::storage_key(&layer.name).into_owned())
+        .collect();
+    // Rebuild code state from source corner identity, including a basis-only layer.
+    let has_custom_normal_state = kept("custom_normal")
+        && (clnor::corner_codes(source)?.is_some() || clnor::corner_order(source)?.is_some());
+    let code_sources: Option<Vec<Option<usize>>> = has_custom_normal_state.then(|| {
+        corner_origin
+            .iter()
+            .map(|sources| heaviest_source(sources))
+            .collect()
+    });
     // The store's layers are rebuilt per corner; their names and active/render choices carry over.
     let uv_store = has(uv_layers::ATTRIBUTE).then(|| {
         let mut store = uv_layers::read(source);
@@ -212,21 +225,9 @@ pub(crate) fn remap_attributes_skipping(
             .collect();
         store
     });
-    // Each output corner takes the code of its heaviest source corner: codes are never interpolated.
-    // The shared clnor rebuild then applies the output fan rules.
-    let code_sources: Option<Vec<Option<usize>>> = if has("custom_normal") {
-        clnor::corner_codes(source)?.map(|_| {
-            corner_origin
-                .iter()
-                .map(|sources| heaviest_source(sources))
-                .collect()
-        })
-    } else {
-        None
-    };
     let mut attributes = Map::new();
     for (key, value) in &source.attributes {
-        if !kept(key.as_str()) {
+        if !kept(key.as_str()) || color_layer_keys.contains(key) {
             continue;
         }
         if key == uv_layers::ATTRIBUTE {
@@ -241,7 +242,7 @@ pub(crate) fn remap_attributes_skipping(
             "vertex_groups" => value
                 .as_object()
                 .map(|groups| Value::Object(sources.vertex_groups(groups))),
-            "crease_edge" => Some(sources.native_attribute(value)),
+            "crease_edge" => Some(sources.keyed_edge_attribute(value)),
             "blender_edge_flags" => value
                 .as_array()
                 .map(|flags| Value::Array(sources.edge_flags(flags))),
@@ -259,11 +260,36 @@ pub(crate) fn remap_attributes_skipping(
             "blender_skin_vertices" => value.as_array().map(|vertices| {
                 Value::Array(sources.vertex_values(vertices, "FLOAT", || json!({})))
             }),
-            _ => native_domain(value).map(|_| sources.native_attribute(value)),
+            ORIGINDEX_ATTRIBUTE => value.as_array().map(|indices| {
+                Value::Array(
+                    origin
+                        .vertices
+                        .iter()
+                        .map(|sources| match sources.as_slice() {
+                            [(index, weight)] if *weight == 1.0 => indices
+                                .get(*index)
+                                .cloned()
+                                .unwrap_or_else(|| json!(ORIGINDEX_NONE)),
+                            _ => json!(ORIGINDEX_NONE),
+                        })
+                        .collect(),
+                )
+            }),
+            "shade_smooth" => Some(sources.shade_smooth(value)),
+            "sharp" => Some(sources.sharp(value)),
+            "blender_polygon_smooth" => value
+                .as_array()
+                .map(|flags| Value::Array(sources.polygon_smooth(flags))),
+            _ => native_domain(value)
+                .map(|_| sources.native_attribute(value))
+                .or_else(|| sources.named_attribute(value)),
         };
         attributes.insert(key.clone(), remapped.unwrap_or_else(|| value.clone()));
     }
     output.attributes = attributes;
+    if let Some(store) = color_store {
+        color_layers::write(output, &store);
+    }
     if let Some(store) = uv_store {
         uv_layers::write(output, &store);
     }
@@ -287,6 +313,12 @@ fn corner_offsets(face_sizes: impl Iterator<Item = usize>) -> Vec<usize> {
 /// The string field `key` of a JSON entry, or `""`.
 fn text<'a>(entry: &'a Value, key: &str) -> &'a str {
     entry.get(key).and_then(Value::as_str).unwrap_or_default()
+}
+
+/// The `domain` of a named element attribute (one with a `values` object), lowercased.
+fn named_domain(value: &Value) -> Option<String> {
+    value.get("values")?.as_object()?;
+    Some(text(value, "domain").to_ascii_lowercase())
 }
 
 /// `entry` with its `values` replaced; the old values array is not cloned.
@@ -379,7 +411,7 @@ fn edge_sources(
 /// `sf`) on output vertex `v` takes the input vertices of `v` that belong to `sf`, weighted by their
 /// origin weights renormalised over those vertices, each mapped to its corner in `sf`. A corner with
 /// no such vertex, or on a generated face, has no sources and takes the domain default.
-fn corner_sources(
+pub(crate) fn corner_sources(
     source: &Mesh,
     origin: &Origin,
     output: &Mesh,
@@ -604,6 +636,30 @@ impl Sources<'_> {
             .collect()
     }
 
+    /// An edge-domain float map (`{"domain","type","values":{"e{id}":v}}`) moved to output edge IDs,
+    /// each blended over its source edges (see [`blend`]).
+    fn keyed_edge_attribute(&self, attribute: &Value) -> Value {
+        let by_id: HashMap<u32, &Value> = attribute
+            .get("values")
+            .and_then(Value::as_object)
+            .map(|values| keyed_values(values, "e"))
+            .unwrap_or_default();
+        let mut output = Map::new();
+        for (edge, sources) in self.output.edges.iter().zip(self.edge_origin) {
+            let blended = blend(
+                sources.iter().filter_map(|(index, weight)| {
+                    let id = self.source.edges.get(*index)?.id;
+                    by_id.get(&id).map(|value| (*value, *weight))
+                }),
+                "FLOAT",
+            );
+            if let Some(value) = blended {
+                output.insert(format!("e{}", edge.id), value);
+            }
+        }
+        with_values(attribute, Value::Object(output))
+    }
+
     /// Edge values blended over each output edge's source edges (see [`blend`]).
     fn edge_values(
         &self,
@@ -617,35 +673,89 @@ impl Sources<'_> {
             .collect()
     }
 
-    /// Boolean Blender edge flags follow the same positive-weight source edges as native flags.
+    /// Legacy Blender edge flags combined from every source edge.
     fn edge_flags(&self, flags: &[Value]) -> Vec<Value> {
         self.edge_origin
             .iter()
             .map(|sources| {
-                let mut sharp = false;
-                let mut seam = false;
-                for (source, weight) in sources {
-                    if *weight <= 0.0 {
-                        continue;
-                    }
-                    let Some(source_flags) = flags.get(*source) else {
-                        continue;
-                    };
-                    sharp |= source_flags.get("sharp").and_then(Value::as_bool) == Some(true);
-                    seam |= source_flags.get("seam").and_then(Value::as_bool) == Some(true);
-                    if sharp && seam {
-                        break;
-                    }
-                }
-                json!({"sharp": sharp, "seam": seam})
+                let flag = |name: &str| {
+                    sources.iter().any(|(index, weight)| {
+                        *weight > 0.0
+                            && flags
+                                .get(*index)
+                                .and_then(|flags| flags.get(name))
+                                .and_then(Value::as_bool)
+                                == Some(true)
+                    })
+                };
+                json!({"sharp": flag("sharp"), "seam": flag("seam")})
+            })
+            .collect()
+    }
+
+    /// Canonical face smooth flags copied from each output face's source face.
+    fn shade_smooth(&self, attribute: &Value) -> Value {
+        let Some(values) = attribute.get("values").and_then(Value::as_object) else {
+            return attribute.clone();
+        };
+        let remapped: Map<String, Value> = self
+            .output
+            .faces
+            .iter()
+            .zip(&self.origin.faces)
+            .map(|(face, source)| {
+                let smooth = source
+                    .and_then(|index| self.source.faces.get(index))
+                    .and_then(|source_face| values.get(&format!("f{}", source_face.id)))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                (format!("f{}", face.id), json!(smooth))
+            })
+            .collect();
+        with_values(attribute, Value::Object(remapped))
+    }
+
+    /// Canonical sharp flags OR-ed over every source edge of each output edge.
+    fn sharp(&self, attribute: &Value) -> Value {
+        if attribute.get("values").and_then(Value::as_object).is_none() {
+            return attribute.clone();
+        }
+        let source_flags = edge_flags(self.source, "sharp");
+        let remapped: Map<String, Value> = self
+            .output
+            .edges
+            .iter()
+            .zip(self.edge_origin)
+            .map(|(edge, sources)| {
+                let sharp = sources.iter().any(|(index, weight)| {
+                    *weight > 0.0 && source_flags.get(*index) == Some(&true)
+                });
+                (format!("e{}", edge.id), json!(sharp))
+            })
+            .collect();
+        with_values(attribute, Value::Object(remapped))
+    }
+
+    /// Legacy polygon-smooth flags copied from each output face's source face.
+    fn polygon_smooth(&self, flags: &[Value]) -> Vec<Value> {
+        self.origin
+            .faces
+            .iter()
+            .map(|source| {
+                source
+                    .and_then(|index| flags.get(index))
+                    .cloned()
+                    .unwrap_or(json!(false))
             })
             .collect()
     }
 
     /// A native element attribute (`{"domain", "type", "values"}`) moved to the output elements of its
     /// domain. Point, edge, and corner values blend over their origins by weight, and a face value copies
-    /// its source face's value. Output elements without a source take the type's default. Booleans blend
-    /// as OR over the positive-weight sources, and colors blend channel by channel.
+    /// its source face's value. An output element with no source value gets no entry, so a reader takes
+    /// its type's default for the missing key and no default is ever written. A corner row is written
+    /// only when one of its corners blends a value; its other corners take the type's default. Booleans
+    /// blend as OR over the positive-weight sources, and colors blend channel by channel.
     fn native_attribute(&self, attribute: &Value) -> Value {
         let Some(values) = attribute.get("values").and_then(Value::as_object) else {
             return attribute.clone();
@@ -664,10 +774,9 @@ impl Sources<'_> {
                     .vertices
                     .iter()
                     .zip(&self.origin.vertices)
-                    .map(|(vertex, sources)| {
-                        let value =
-                            blend_sources(&stored, sources, data_type).unwrap_or_else(default);
-                        (format!("v{}", vertex.id), value)
+                    .filter_map(|(vertex, sources)| {
+                        let value = blend_sources(&stored, sources, data_type)?;
+                        Some((format!("v{}", vertex.id), value))
                     })
                     .collect()
             }
@@ -682,10 +791,9 @@ impl Sources<'_> {
                     .edges
                     .iter()
                     .zip(self.edge_origin)
-                    .map(|(edge, sources)| {
-                        let value =
-                            blend_sources(&stored, sources, data_type).unwrap_or_else(default);
-                        (format!("e{}", edge.id), value)
+                    .filter_map(|(edge, sources)| {
+                        let value = blend_sources(&stored, sources, data_type)?;
+                        Some((format!("e{}", edge.id), value))
                     })
                     .collect()
             }
@@ -694,13 +802,11 @@ impl Sources<'_> {
                 .faces
                 .iter()
                 .zip(&self.origin.faces)
-                .map(|(face, source)| {
+                .filter_map(|(face, source)| {
                     let value = source
                         .and_then(|index| self.source.faces.get(index))
-                        .and_then(|source_face| values.get(&format!("f{}", source_face.id)))
-                        .cloned()
-                        .unwrap_or_else(default);
-                    (format!("f{}", face.id), value)
+                        .and_then(|source_face| values.get(&format!("f{}", source_face.id)))?;
+                    Some((format!("f{}", face.id), value.clone()))
                 })
                 .collect(),
             "corner" => {
@@ -730,14 +836,20 @@ impl Sources<'_> {
                     .faces
                     .iter()
                     .zip(offsets)
-                    .map(|(face, offset)| {
-                        let row: Vec<Value> = self.corner_origin[offset..][..face.vertices.len()]
+                    .filter_map(|(face, offset)| {
+                        let sources = &self.corner_origin[offset..][..face.vertices.len()];
+                        let blended: Vec<Option<Value>> = sources
                             .iter()
-                            .map(|sources| {
-                                blend_sources(&stored, sources, data_type).unwrap_or_else(default)
-                            })
+                            .map(|sources| blend_sources(&stored, sources, data_type))
                             .collect();
-                        (format!("f{}", face.id), Value::Array(row))
+                        if blended.iter().all(Option::is_none) {
+                            return None;
+                        }
+                        let row = blended
+                            .into_iter()
+                            .map(|value| value.unwrap_or_else(default))
+                            .collect();
+                        Some((format!("f{}", face.id), Value::Array(row)))
                     })
                     .collect()
             }
@@ -809,14 +921,33 @@ impl Sources<'_> {
         };
         with_values(entry, Value::Array(remapped))
     }
-
+    /// One canonical color layer rebuilt in storage order and keyed by `color_layers::write`.
+    fn color_layer(&self, layer: &ColorLayer) -> ColorLayer {
+        let values = match layer.domain {
+            ColorDomain::Point => self
+                .origin
+                .vertices
+                .iter()
+                .map(|sources| blend_color(&layer.values, sources))
+                .collect(),
+            ColorDomain::Corner => self
+                .corner_origin
+                .iter()
+                .map(|sources| blend_color(&layer.values, sources))
+                .collect(),
+        };
+        ColorLayer {
+            name: layer.name.clone(),
+            domain: layer.domain,
+            values,
+        }
+    }
     /// One UV layer rebuilt for the output faces. Each output corner blends the UVs of its source
-    /// corners by weight. A source corner whose face has no entry reads as `[0, 0]` and keeps its
-    /// weight (no renormalisation: Blender layers are complete, so no oracle covers partial layers).
-    /// An output face gets an entry when any of its corners has a source with an entry, so a
-    /// modifier that leaves face sources empty (screw) keeps its UVs. A corner's pin is the pin of
-    /// its heaviest source corner (see [`heaviest_source`]); `pinned` is omitted when no
-    /// contributing source corner has pins.
+    /// corners by weight. A source corner whose face has no entry reads as `[0, 1]` and keeps its
+    /// weight (no renormalisation). An output face gets an entry when any of its corners has a source
+    /// with an entry, so a modifier that leaves face sources empty (screw) keeps its UVs. A corner's
+    /// pin is the pin of its heaviest source corner (see [`heaviest_source`]); `pinned` is omitted
+    /// when no contributing source corner has pins.
     fn uv_layer(&self, layer: &UvLayer) -> UvLayer {
         let source_offsets =
             corner_offsets(self.source.faces.iter().map(|face| face.vertices.len()));
@@ -828,7 +959,7 @@ impl Sources<'_> {
             .iter()
             .map(|face| face.vertices.len())
             .sum();
-        let mut flat = vec![[0.0, 0.0]; source_corners];
+        let mut flat = vec![[0.0, 1.0]; source_corners];
         // Pin per source corner; `None` where the source face has no `pinned` array.
         let mut flat_pinned: Vec<Option<bool>> = vec![None; source_corners];
         // Source corners whose face has an entry for this layer.
@@ -885,6 +1016,112 @@ impl Sources<'_> {
             pinned,
         }
     }
+
+    /// A named attribute keyed by element ID (`{"domain","type","values":{prefix+id: value}}`), moved to
+    /// the output's IDs. Point and edge values blend over their source elements, a face value copies its
+    /// source face's, and corner values (one array per face) blend over the source corners. Other domains
+    /// are copied unchanged by the caller.
+    fn named_attribute(&self, attribute: &Value) -> Option<Value> {
+        let domain = named_domain(attribute)?;
+        let kind = text(attribute, "type").to_ascii_uppercase();
+        let values = attribute.get("values").and_then(Value::as_object)?;
+        let mut output = Map::new();
+        match domain.as_str() {
+            "point" => {
+                let by_id: HashMap<u32, &Value> = keyed_values(values, "v");
+                for (vertex, sources) in self.output.vertices.iter().zip(&self.origin.vertices) {
+                    let blended = blend(
+                        sources.iter().filter_map(|(index, weight)| {
+                            let id = self.source.vertices.get(*index)?.id;
+                            by_id.get(&id).map(|value| (*value, *weight))
+                        }),
+                        &kind,
+                    );
+                    if let Some(value) = blended {
+                        output.insert(format!("v{}", vertex.id), value);
+                    }
+                }
+            }
+            "edge" => {
+                let by_id: HashMap<u32, &Value> = keyed_values(values, "e");
+                for (edge, sources) in self.output.edges.iter().zip(self.edge_origin) {
+                    let blended = blend(
+                        sources.iter().filter_map(|(index, weight)| {
+                            let id = self.source.edges.get(*index)?.id;
+                            by_id.get(&id).map(|value| (*value, *weight))
+                        }),
+                        &kind,
+                    );
+                    if let Some(value) = blended {
+                        output.insert(format!("e{}", edge.id), value);
+                    }
+                }
+            }
+            "face" => {
+                for (face, source) in self.output.faces.iter().zip(&self.origin.faces) {
+                    let value = source
+                        .and_then(|index| self.source.faces.get(index))
+                        .and_then(|source| values.get(&format!("f{}", source.id)));
+                    if let Some(value) = value {
+                        output.insert(format!("f{}", face.id), value.clone());
+                    }
+                }
+            }
+            "corner" => {
+                let source_offsets =
+                    corner_offsets(self.source.faces.iter().map(|face| face.vertices.len()));
+                let source_corners: usize = self
+                    .source
+                    .faces
+                    .iter()
+                    .map(|face| face.vertices.len())
+                    .sum();
+                let mut authored: Vec<Option<&Value>> = vec![None; source_corners];
+                for (index, face) in self.source.faces.iter().enumerate() {
+                    let Some(corners) = values
+                        .get(&format!("f{}", face.id))
+                        .and_then(Value::as_array)
+                    else {
+                        continue;
+                    };
+                    for (corner, value) in corners.iter().enumerate().take(face.vertices.len()) {
+                        authored[source_offsets[index] + corner] = Some(value);
+                    }
+                }
+                let output_offsets =
+                    corner_offsets(self.output.faces.iter().map(|face| face.vertices.len()));
+                for (face_index, face) in self.output.faces.iter().enumerate() {
+                    let corners =
+                        &self.corner_origin[output_offsets[face_index]..][..face.vertices.len()];
+                    let row: Vec<Option<Value>> = corners
+                        .iter()
+                        .map(|sources| {
+                            blend(
+                                sources.iter().filter_map(|(source, weight)| {
+                                    authored
+                                        .get(*source)
+                                        .copied()
+                                        .flatten()
+                                        .map(|value| (value, *weight))
+                                }),
+                                &kind,
+                            )
+                        })
+                        .collect();
+                    if row.iter().all(Option::is_none) {
+                        continue;
+                    }
+                    let row = row
+                        .into_iter()
+                        .map(|value| value.unwrap_or_else(|| default_value(&kind)))
+                        .collect();
+                    output.insert(format!("f{}", face.id), Value::Array(row));
+                }
+            }
+            _ => return None,
+        }
+        Some(with_values(attribute, Value::Object(output)))
+    }
 }
 
 /// Index of the heaviest `(index, weight)` source; ties go to the lowest index.
@@ -906,16 +1143,33 @@ fn blend_indexed(values: &[Value], sources: &[(usize, f64)], data_type: &str) ->
 }
 
 /// The weighted sum of the UVs at `sources`. Indices past the end of `uvs` are skipped, so a corner
-/// with no usable source is `[0, 0]`.
+/// with no usable source is `[0, 1]`.
 fn blend_uv(uvs: &[[f64; 2]], sources: &[(usize, f64)]) -> [f64; 2] {
     let mut uv = [0.0; 2];
+    let mut found = false;
     for (index, weight) in sources {
         if let Some([u, v]) = uvs.get(*index) {
+            found = true;
             uv[0] += weight * u;
             uv[1] += weight * v;
         }
     }
-    uv
+    if found { uv } else { [0.0, 1.0] }
+}
+
+/// Blend canonical RGBA colors; an output without source values takes the opaque-black default.
+fn blend_color(values: &[[f64; 4]], sources: &[(usize, f64)]) -> [f64; 4] {
+    let mut color = [0.0; 4];
+    let mut found = false;
+    for (index, weight) in sources {
+        if let Some(source) = values.get(*index) {
+            found = true;
+            for (channel, value) in color.iter_mut().zip(source) {
+                *channel += weight * value;
+            }
+        }
+    }
+    if found { color } else { [0.0, 0.0, 0.0, 1.0] }
 }
 
 /// Blender data types stored as integers; blended results round to the nearest integer.
@@ -1101,6 +1355,33 @@ mod tests {
         assert_eq!(groups[format!("v{}", out_ids[2])], json!(0.5));
     }
 
+    #[test]
+    fn origindex_carrier_follows_single_weight_one_sources() {
+        let mut source = triangle();
+        crate::geom::set_origindex(&mut source, &[1, ORIGINDEX_NONE, 2]);
+
+        let mut output = triangle();
+        let copied = Origin::copies([Some(2), None, Some(0)], vec![Some(0)], false);
+        remap_attributes(&source, &mut output, &copied).expect("remap copied indices");
+        assert_eq!(
+            crate::geom::origindex_values(&output),
+            Some(vec![2, ORIGINDEX_NONE, 1])
+        );
+
+        let mut output = triangle();
+        let blended = Origin {
+            vertices: vec![vec![(0, 1.0)], vec![(1, 1.0)], vec![(0, 0.5), (1, 0.5)]],
+            source_vertices: None,
+            faces: vec![Some(0)],
+            corners: None,
+        };
+        remap_attributes(&source, &mut output, &blended).expect("remap blended indices");
+        assert_eq!(
+            crate::geom::origindex_values(&output),
+            Some(vec![1, ORIGINDEX_NONE, ORIGINDEX_NONE])
+        );
+    }
+
     /// A JSON object of keyed entries, for attribute fixtures.
     fn keyed(entries: Vec<(String, Value)>) -> Value {
         Value::Object(entries.into_iter().collect())
@@ -1281,6 +1562,67 @@ mod tests {
     }
 
     #[test]
+    fn canonical_color_store_layers_follow_origins_and_keep_designations() {
+        let mut source = triangle();
+        let red = [1.0, 0.0, 0.0, 1.0];
+        let green = [0.0, 1.0, 0.0, 1.0];
+        let blue = [0.0, 0.0, 1.0, 1.0];
+        let store = color_layers::ColorStore {
+            layers: vec![
+                ColorLayer {
+                    name: "color_layers".to_owned(),
+                    domain: ColorDomain::Point,
+                    values: vec![red, green, blue],
+                },
+                ColorLayer {
+                    name: "Paint".to_owned(),
+                    domain: ColorDomain::Corner,
+                    values: vec![red, green, blue],
+                },
+            ],
+            active: Some("Paint".to_owned()),
+            render: Some("color_layers".to_owned()),
+        };
+        color_layers::write(&mut source, &store);
+        assert!(
+            source
+                .attributes
+                .contains_key(attribute_keys::storage_key("color_layers").as_ref())
+        );
+
+        let mut output = triangle();
+        let origin = Origin {
+            vertices: vec![vec![(0, 1.0)], vec![(1, 1.0)], vec![(0, 0.5), (1, 0.5)]],
+            source_vertices: None,
+            faces: vec![Some(0)],
+            corners: None,
+        };
+        remap_attributes(&source, &mut output, &origin).expect("remap");
+
+        let store = color_layers::read(&output);
+        assert_eq!(
+            store
+                .layers
+                .iter()
+                .map(|layer| layer.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["color_layers", "Paint"]
+        );
+        assert_eq!(store.layers[0].domain, ColorDomain::Point);
+        assert_eq!(
+            store.layers[0].values,
+            vec![red, green, [0.5, 0.5, 0.0, 1.0]]
+        );
+        assert_eq!(store.layers[1].domain, ColorDomain::Corner);
+        assert_eq!(
+            store.layers[1].values,
+            vec![red, green, [0.5, 0.5, 0.0, 1.0]]
+        );
+        assert_eq!(store.active.as_deref(), Some("Paint"));
+        assert_eq!(store.render.as_deref(), Some("color_layers"));
+    }
+
+    #[test]
     fn blend_ors_booleans_over_positive_weights() {
         let on = json!(true);
         let off = json!(false);
@@ -1328,26 +1670,62 @@ mod tests {
         assert_eq!(layers[0].pinned[0], Some(vec![false, true, false]));
     }
 
+    /// Screw can create a face with no source face while carrying corner provenance from a partial
+    /// UV layer; missing and source-less corners take `[0, 1]` without changing populated sums.
     #[test]
-    fn original_index_presence_and_values_follow_discrete_selectors() {
-        let mut source = triangle();
-        source.original_indices = Some(OriginalIndices {
-            vertices: vec![1, ORIGINDEX_NONE, 2],
-            source_vertex_count: 3,
-        });
+    fn screw_partial_uv_provenance_defaults_missing_corners_to_canonical_uv() {
+        let mut source = Mesh::from_positions_and_faces(
+            vec![
+                DVec3::ZERO,
+                DVec3::X,
+                DVec3::Y,
+                DVec3::new(2.0, 0.0, 0.0),
+                DVec3::new(3.0, 0.0, 0.0),
+                DVec3::new(2.0, 1.0, 0.0),
+            ],
+            vec![vec![0, 1, 2], vec![3, 4, 5]],
+        )
+        .expect("two source faces");
+        uv_layers::write_layers(
+            &mut source,
+            &[UvLayer {
+                name: "UVMap".to_owned(),
+                faces: vec![Some(vec![[2.0, 4.0], [4.0, 6.0], [6.0, 8.0]]), None],
+                pinned: vec![None, None],
+            }],
+        );
+        let mut output = Mesh::from_positions_and_faces(
+            vec![
+                DVec3::new(0.0, 0.0, 1.0),
+                DVec3::new(1.0, 0.0, 1.0),
+                DVec3::new(1.0, 1.0, 1.0),
+                DVec3::new(0.0, 1.0, 1.0),
+            ],
+            vec![vec![0, 1, 2, 3]],
+        )
+        .expect("generated face");
+        let origin = Origin {
+            vertices: vec![
+                vec![(0, 1.0)],
+                vec![(3, 1.0)],
+                vec![(1, 0.5), (3, 0.5)],
+                Vec::new(),
+            ],
+            source_vertices: None,
+            faces: vec![None],
+            corners: Some(vec![
+                vec![(0, 1.0)],
+                vec![(3, 1.0)],
+                vec![(1, 0.5), (3, 0.5)],
+                Vec::new(),
+            ]),
+        };
 
-        let mut output = triangle();
-        let untracked = Origin::copies([Some(0), Some(1), Some(2)], vec![Some(0)], false);
-        assert!(untracked.source_vertices.is_none());
-        remap_attributes(&source, &mut output, &untracked).expect("remap without output layer");
-        assert!(output.original_indices.is_none());
+        remap_attributes(&source, &mut output, &origin).expect("remap");
 
-        let mut output = triangle();
-        let tracked = Origin::copies([Some(2), None, Some(0)], vec![Some(0)], true);
-        remap_attributes(&source, &mut output, &tracked).expect("remap copied indices");
         assert_eq!(
-            output.original_indices.expect("tracked layer").vertices,
-            [2, ORIGINDEX_NONE, 1]
+            uv_layers::read_layers(&output)[0].faces[0],
+            Some(vec![[2.0, 4.0], [0.0, 1.0], [2.0, 3.5], [0.0, 1.0]])
         );
     }
 }

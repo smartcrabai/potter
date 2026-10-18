@@ -1,6 +1,7 @@
 use glam::DVec3;
 
 use crate::error::{ErrorCode, PotError, Result};
+use crate::float::equal_f64;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Projection {
@@ -142,10 +143,9 @@ pub(crate) struct SurfaceHit {
     pub(crate) view: DVec3,
 }
 
-/// Lighting for triangles lit per pixel, evaluated at each visible hit.
+/// Linear RGBA at `hit` on `triangle`.
 pub(crate) trait SurfaceShader {
-    /// Linear RGB at `hit` on `triangle`.
-    fn shade(&self, triangle: &Triangle, hit: &SurfaceHit) -> Result<[f64; 3]>;
+    fn shade(&self, triangle: &Triangle, hit: &SurfaceHit) -> Result<[f64; 4]>;
 }
 
 /// Shadow-ray origin for a hit on a smooth triangle, after Hanika's shadow-terminator offset
@@ -273,6 +273,13 @@ struct Hit {
     distance: f64,
     barycentric: [f64; 3],
     direction: DVec3,
+}
+
+#[derive(Clone, Copy)]
+struct VisibleHit {
+    triangle_index: usize,
+    hit: Hit,
+    color: [f64; 4],
 }
 
 pub(crate) fn ray_for_pixel(
@@ -442,7 +449,7 @@ pub(crate) fn rasterize_with_samples(
     for y in 0..height {
         for x in 0..width {
             let center_ray = ray_for_pixel_in_frame(&frame, camera.position, width, height, x, y)?;
-            let center_hit = nearest_visible_hit(&prepared, center_ray, &frame);
+            let center_hit = nearest_visible_hit(&prepared, center_ray, &frame, shader)?;
             let pixel_index = usize::try_from(y)
                 .ok()
                 .and_then(|row| row.checked_mul(width_usize))
@@ -453,8 +460,9 @@ pub(crate) fn rasterize_with_samples(
                         "pixel index exceeds platform limits",
                     )
                 })?;
-            if let Some((triangle_index, hit)) = center_hit {
-                let triangle = &prepared[triangle_index];
+            if let Some(visible_hit) = center_hit {
+                let triangle = &prepared[visible_hit.triangle_index];
+                let hit = visible_hit.hit;
                 ids[pixel_index] = triangle.source.object_index;
                 depths[pixel_index] = depth_to_f32(hit.depth);
                 elements[pixel_index] = triangle.source.element_index;
@@ -497,22 +505,21 @@ pub(crate) fn rasterize_with_samples(
                             sample_x,
                             sample_y,
                         )?;
-                        (ray, nearest_hit(&prepared, ray, &frame))
+                        (ray, nearest_visible_hit(&prepared, ray, &frame, shader)?)
                     };
                     let sample_color = if matches!(mode, Mode::Wire) {
-                        sample_hit.map_or(background_linear, |(triangle_index, hit)| {
-                            let triangle = &prepared[triangle_index];
-                            if is_wire_edge(triangle, hit, &frame, width, height) {
+                        sample_hit.map_or(background_linear, |visible_hit| {
+                            let triangle = &prepared[visible_hit.triangle_index];
+                            if is_wire_edge(triangle, visible_hit.hit, &frame, width, height) {
                                 triangle.source.color
                             } else {
                                 background_linear
                             }
                         })
-                    } else if let Some((triangle_index, hit)) = sample_hit {
-                        let triangle = &prepared[triangle_index];
-                        if triangle_opacity(&triangle.source) >= 1.0 {
-                            let [red, green, blue, _] =
-                                hit_color(triangle, hit, sample_ray, shader)?;
+                    } else if let Some(visible_hit) = sample_hit {
+                        let triangle = &prepared[visible_hit.triangle_index];
+                        if hit_opacity(&triangle.source, visible_hit.color) >= 1.0 {
+                            let [red, green, blue, _] = visible_hit.color;
                             [red, green, blue, 1.0]
                         } else {
                             composite_sample(
@@ -521,6 +528,7 @@ pub(crate) fn rasterize_with_samples(
                                 &frame,
                                 background_linear,
                                 shader,
+                                Some(visible_hit),
                             )?
                         }
                     } else {
@@ -548,8 +556,9 @@ pub(crate) fn rasterize_with_samples(
                 let color = color_to_srgba(average);
                 rgba[pixel_index * 4..pixel_index * 4 + 4].copy_from_slice(&color);
                 linear_rgba[pixel_index] = linear_color_to_f32(average);
-            } else if let Some((triangle_index, hit)) = center_hit {
-                let triangle = &prepared[triangle_index];
+            } else if let Some(visible_hit) = center_hit {
+                let triangle = &prepared[visible_hit.triangle_index];
+                let hit = visible_hit.hit;
                 let (color, linear_color) = match mode {
                     Mode::Normal => {
                         let color = normal_to_rgba(shading_normal(triangle, hit));
@@ -874,8 +883,23 @@ fn camera_frame(camera: &Camera, width: u32, height: u32) -> Result<CameraFrame>
         Projection::Orthographic {
             height: view_height,
         } if view_height.is_finite() && view_height > 0.0 => {
-            let half_height = view_height * 0.5;
-            let half_width = half_height * (f64::from(view_width) / f64::from(height));
+            // Blender's AUTO sensor fit (intern/camera.cc, `BKE_camera_sensor_fit`: HOR when the
+            // render is at least as wide as tall) applies the orthographic scale to the larger
+            // dimension. `BKE_camera_params_compute_viewplane` then scales the other dimension by
+            // the aspect, so a landscape frame spans `scale` horizontally and a portrait frame
+            // spans `scale` vertically.
+            let half_scale = view_height * 0.5;
+            let (half_width, half_height) = if view_width >= height {
+                (
+                    half_scale,
+                    half_scale * (f64::from(height) / f64::from(view_width)),
+                )
+            } else {
+                (
+                    half_scale * (f64::from(view_width) / f64::from(height)),
+                    half_scale,
+                )
+            };
             if !half_height.is_finite() || !half_width.is_finite() || half_width <= 0.0 {
                 return Err(PotError::invalid_argument(
                     "orthographic projection dimensions are out of range",
@@ -1140,45 +1164,12 @@ fn mix_sample_hash(mut value: u32) -> u32 {
     value ^ (value >> 16)
 }
 
-fn nearest_hit(
-    triangles: &[PreparedTriangle],
-    ray: Ray,
-    frame: &CameraFrame,
-) -> Option<(usize, Hit)> {
-    let mut nearest: Option<(usize, Hit)> = None;
-    for (triangle_index, triangle) in triangles.iter().enumerate() {
-        if let Some(hit) = intersect_triangle(triangle, ray, frame)
-            && nearest.is_none_or(|(_, closest)| hit.depth < closest.depth)
-        {
-            nearest = Some((triangle_index, hit));
-        }
-    }
-    nearest
-}
-
-fn nearest_visible_hit(
-    triangles: &[PreparedTriangle],
-    ray: Ray,
-    frame: &CameraFrame,
-) -> Option<(usize, Hit)> {
-    let mut nearest: Option<(usize, Hit)> = None;
-    for (triangle_index, triangle) in triangles.iter().enumerate() {
-        if triangle_opacity(&triangle.source) > 0.0
-            && let Some(hit) = intersect_triangle(triangle, ray, frame)
-            && nearest.is_none_or(|(_, closest)| hit.depth < closest.depth)
-        {
-            nearest = Some((triangle_index, hit));
-        }
-    }
-    nearest
-}
-
-fn triangle_opacity(triangle: &Triangle) -> f64 {
+fn hit_opacity(triangle: &Triangle, color: [f64; 4]) -> f64 {
     match triangle.alpha_mode {
         AlphaMode::Opaque => 1.0,
-        AlphaMode::Blend => triangle.color[3].clamp(0.0, 1.0),
+        AlphaMode::Blend => color[3].clamp(0.0, 1.0),
         AlphaMode::Clip => {
-            if triangle.color[3] >= triangle.alpha_threshold {
+            if color[3] >= triangle.alpha_threshold {
                 1.0
             } else {
                 0.0
@@ -1212,10 +1203,50 @@ fn hit_color(
                 barycentric: hit.barycentric,
                 view: -ray.direction,
             };
-            let [red, green, blue] = shader.shade(&triangle.source, &surface)?;
-            Ok([red, green, blue, triangle.source.color[3]])
+            shader.shade(&triangle.source, &surface)
         }
         _ => Ok(triangle.source.color),
+    }
+}
+
+fn nearest_visible_hit(
+    triangles: &[PreparedTriangle],
+    ray: Ray,
+    frame: &CameraFrame,
+    shader: Option<&dyn SurfaceShader>,
+) -> Result<Option<VisibleHit>> {
+    let mut cursor = None;
+    loop {
+        let mut nearest: Option<(usize, Hit)> = None;
+        for (triangle_index, triangle) in triangles.iter().enumerate() {
+            let Some(hit) = intersect_triangle(triangle, ray, frame) else {
+                continue;
+            };
+            if cursor.is_some_and(|(depth, index)| {
+                hit.depth < depth || (equal_f64(hit.depth, depth) && triangle_index <= index)
+            }) {
+                continue;
+            }
+            if nearest.is_none_or(|(closest_index, closest_hit)| {
+                hit.depth < closest_hit.depth
+                    || (equal_f64(hit.depth, closest_hit.depth) && triangle_index < closest_index)
+            }) {
+                nearest = Some((triangle_index, hit));
+            }
+        }
+        let Some((triangle_index, hit)) = nearest else {
+            return Ok(None);
+        };
+        let triangle = &triangles[triangle_index];
+        let color = hit_color(triangle, hit, ray, shader)?;
+        if hit_opacity(&triangle.source, color) > 0.0 {
+            return Ok(Some(VisibleHit {
+                triangle_index,
+                hit,
+                color,
+            }));
+        }
+        cursor = Some((hit.depth, triangle_index));
     }
 }
 
@@ -1225,20 +1256,34 @@ fn composite_sample(
     frame: &CameraFrame,
     background: [f64; 4],
     shader: Option<&dyn SurfaceShader>,
+    cached_hit: Option<VisibleHit>,
 ) -> Result<[f64; 4]> {
     const MAX_ALPHA_LAYERS: usize = 16;
-    let mut hits: [Option<(usize, Hit)>; MAX_ALPHA_LAYERS] = [None; MAX_ALPHA_LAYERS];
+    let mut hits: [Option<VisibleHit>; MAX_ALPHA_LAYERS] = [None; MAX_ALPHA_LAYERS];
     let mut hit_count = 0;
     for (triangle_index, triangle) in triangles.iter().enumerate() {
         let Some(hit) = intersect_triangle(triangle, ray, frame) else {
             continue;
         };
-        if triangle_opacity(&triangle.source) <= 0.0 {
+        let color = cached_hit
+            .filter(|cached| {
+                cached.triangle_index == triangle_index && equal_f64(cached.hit.depth, hit.depth)
+            })
+            .map_or_else(
+                || hit_color(triangle, hit, ray, shader),
+                |cached| Ok(cached.color),
+            )?;
+        if hit_opacity(&triangle.source, color) <= 0.0 {
             continue;
         }
+        let visible_hit = VisibleHit {
+            triangle_index,
+            hit,
+            color,
+        };
         let mut insert_at = hit_count;
         while insert_at > 0
-            && hits[insert_at - 1].is_some_and(|(_, previous)| previous.depth > hit.depth)
+            && hits[insert_at - 1].is_some_and(|previous| previous.hit.depth > hit.depth)
         {
             insert_at -= 1;
         }
@@ -1249,16 +1294,16 @@ fn composite_sample(
         for index in (insert_at + 1..next_count).rev() {
             hits[index] = hits[index - 1];
         }
-        hits[insert_at] = Some((triangle_index, hit));
+        hits[insert_at] = Some(visible_hit);
         hit_count = next_count;
     }
     let mut transmittance = 1.0;
     let mut alpha = 0.0;
     let mut premultiplied = DVec3::ZERO;
-    for (triangle_index, hit) in hits.iter().take(hit_count).flatten().copied() {
-        let triangle = &triangles[triangle_index];
-        let color = hit_color(triangle, hit, ray, shader)?;
-        let opacity = triangle_opacity(&triangle.source);
+    for visible_hit in hits.iter().take(hit_count).flatten().copied() {
+        let triangle = &triangles[visible_hit.triangle_index];
+        let color = visible_hit.color;
+        let opacity = hit_opacity(&triangle.source, color);
         let contribution = transmittance * opacity;
         premultiplied += DVec3::new(color[0], color[1], color[2]) * contribution;
         alpha += contribution;
@@ -1803,11 +1848,11 @@ mod smooth_shading_tests {
     }
 
     impl SurfaceShader for RecordingShader {
-        fn shade(&self, _triangle: &Triangle, hit: &SurfaceHit) -> Result<[f64; 3]> {
+        fn shade(&self, _triangle: &Triangle, hit: &SurfaceHit) -> Result<[f64; 4]> {
             self.calls
                 .borrow_mut()
                 .push((hit.point, hit.normal, hit.geometric));
-            Ok([0.25, 0.5, 0.75])
+            Ok([0.25, 0.5, 0.75, 1.0])
         }
     }
 
@@ -1865,6 +1910,30 @@ mod smooth_shading_tests {
             shader,
         )
         .expect("triangle rasterizes")
+    }
+
+    struct FrontShader {
+        rgba: [f64; 4],
+    }
+
+    impl SurfaceShader for FrontShader {
+        fn shade(&self, triangle: &Triangle, _hit: &SurfaceHit) -> Result<[f64; 4]> {
+            if triangle.object_index == 1 {
+                Ok(self.rgba)
+            } else {
+                Ok(triangle.color)
+            }
+        }
+    }
+
+    fn layered_triangles(alpha_mode: AlphaMode) -> [Triangle; 2] {
+        let mut front = triangle(Some([DVec3::Z; 3]));
+        front.alpha_mode = alpha_mode;
+        let mut back = triangle(None);
+        back.object_index = 2;
+        back.positions = back.positions.map(|position| position - DVec3::Z);
+        back.color = [0.0, 0.0, 1.0, 1.0];
+        [front, back]
     }
 
     /// Barycentric weights of the centre pixel's world point, in triangle corner order.
@@ -1941,6 +2010,81 @@ mod smooth_shading_tests {
         assert!(shader.calls.borrow().is_empty());
         let color = output.linear_rgba[CENTER];
         assert!((f64::from(color[0]) - 0.8).abs() < 1e-5, "color {color:?}");
+    }
+
+    #[test]
+    fn zero_shader_alpha_does_not_let_a_blend_hit_mask_geometry() {
+        let shader = FrontShader {
+            rgba: [1.0, 0.0, 0.0, 0.0],
+        };
+        let output = render(
+            &layered_triangles(AlphaMode::Blend),
+            Mode::Solid,
+            Some(&shader),
+        );
+        assert_eq!(output.ids[CENTER], 2);
+        let color = output.linear_rgba[CENTER];
+        for (actual, expected) in color.iter().zip([0.0, 0.0, 1.0, 1.0]) {
+            assert!(
+                (f64::from(*actual) - expected).abs() < 1e-5,
+                "color {color:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shader_alpha_controls_blend_compositing() {
+        let shader = FrontShader {
+            rgba: [1.0, 0.0, 0.0, 0.25],
+        };
+        let output = render(
+            &layered_triangles(AlphaMode::Blend),
+            Mode::Solid,
+            Some(&shader),
+        );
+        assert_eq!(output.ids[CENTER], 1);
+        let color = output.linear_rgba[CENTER];
+        for (actual, expected) in color.iter().zip([0.25, 0.0, 0.75, 1.0]) {
+            assert!(
+                (f64::from(*actual) - expected).abs() < 1e-5,
+                "color {color:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn clip_threshold_and_opaque_mode_use_shader_rgba_alpha() {
+        let below_threshold = FrontShader {
+            rgba: [1.0, 0.0, 0.0, 0.49],
+        };
+        let output = render(
+            &layered_triangles(AlphaMode::Clip),
+            Mode::Solid,
+            Some(&below_threshold),
+        );
+        assert_eq!(output.ids[CENTER], 2);
+
+        let at_threshold = FrontShader {
+            rgba: [1.0, 0.0, 0.0, 0.5],
+        };
+        let output = render(
+            &layered_triangles(AlphaMode::Clip),
+            Mode::Solid,
+            Some(&at_threshold),
+        );
+        assert_eq!(output.ids[CENTER], 1);
+        assert!((f64::from(output.linear_rgba[CENTER][3]) - 1.0).abs() < 1e-5);
+
+        let transparent_opaque = FrontShader {
+            rgba: [1.0, 0.0, 0.0, 0.0],
+        };
+        let output = render(
+            &layered_triangles(AlphaMode::Opaque),
+            Mode::Solid,
+            Some(&transparent_opaque),
+        );
+        assert_eq!(output.ids[CENTER], 1);
+        assert!((f64::from(output.linear_rgba[CENTER][3]) - 1.0).abs() < 1e-5);
     }
 
     #[test]

@@ -936,7 +936,7 @@ fn pixel_threshold(camera: &Camera, depth: f64, width: u32, height: u32) -> f64 
     let pixel_size = match camera.projection {
         Projection::Orthographic {
             height: world_height,
-        } => world_height / f64::from(height),
+        } => world_height / f64::from(width.max(height)),
         Projection::Perspective {
             lens_mm,
             sensor_width_mm,

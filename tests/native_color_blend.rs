@@ -20,12 +20,15 @@ mod native_oracle;
 mod process;
 
 use native_oracle::{
-    BYTE_TOLERANCE, FLOAT_TOLERANCE, TestResult, assert_close, assert_floats, assert_rgba,
-    attribute, blender, build_oracle, dump_blend, dumped_object, export, face_loop_starts, floats,
-    import_blend, loss_features, losses, mesh_of_node, node_id, number, oracle_section, read_scene,
-    value_at, vec3, vec4,
+    BYTE_TOLERANCE, FLOAT_TOLERANCE, TestResult, apply_operations, assert_close, assert_floats,
+    assert_rgba, attribute, build_oracle, dump_blend, dumped_object, export, export_raw,
+    face_loop_starts, floats, import_blend, loss_features, losses, mesh_of_node, node_id, number,
+    oracle_section, pot, read_scene, run_blender_arguments, value_at, vec3, vec4, write_script,
 };
-use serde_json::Value;
+use potter_core::image::{ImageInterpolation, load_image_data, sample};
+use potter_core::model::Image;
+use serde_json::{Value, json};
+use std::{fs, path::Path};
 use tempfile::tempdir;
 
 /// Features that a `.blend` import must never report as lost for the oracle.
@@ -105,7 +108,7 @@ fn check_shading(mesh: &Value, oracle: &Value) -> TestResult {
         .enumerate()
     {
         assert_eq!(
-            value_at(shade, &format!("f{index}"))?,
+            value_at(shade, &format!("f{}", index + 1))?,
             &face["smooth"],
             "face {index} shade_smooth"
         );
@@ -117,12 +120,12 @@ fn check_shading(mesh: &Value, oracle: &Value) -> TestResult {
         .enumerate()
     {
         assert_eq!(
-            value_at(sharp, &format!("e{index}"))?,
+            value_at(sharp, &format!("e{}", index + 1))?,
             &edge["sharp"],
             "edge {index} sharp"
         );
         assert_eq!(
-            value_at(seam, &format!("e{index}"))?,
+            value_at(seam, &format!("e{}", index + 1))?,
             &edge["seam"],
             "edge {index} seam"
         );
@@ -179,7 +182,7 @@ fn check_colors(mesh: &Value, oracle: &Value) -> TestResult {
                 assert_eq!(attr["domain"], "point", "{name} domain");
                 for (index, value) in values.iter().enumerate() {
                     assert_rgba(
-                        vec4(value_at(attr, &format!("v{index}"))?)?,
+                        vec4(value_at(attr, &format!("v{}", index + 1))?)?,
                         vec4(value)?,
                         tolerance,
                         &format!("{name} v{index}"),
@@ -189,7 +192,7 @@ fn check_colors(mesh: &Value, oracle: &Value) -> TestResult {
             Some("corner") => {
                 assert_eq!(attr["domain"], "corner", "{name} domain");
                 for (face, size) in sizes.iter().enumerate() {
-                    let row = value_at(attr, &format!("f{face}"))?
+                    let row = value_at(attr, &format!("f{}", face + 1))?
                         .as_array()
                         .ok_or("corner row is not an array")?;
                     assert_eq!(row.len(), *size, "{name} face {face} corner count");
@@ -245,7 +248,7 @@ fn check_generics(mesh: &Value, oracle: &Value) -> TestResult {
         match domain {
             "corner" => {
                 for (face, size) in sizes.iter().enumerate() {
-                    let row = value_at(attr, &format!("f{face}"))?
+                    let row = value_at(attr, &format!("f{}", face + 1))?
                         .as_array()
                         .ok_or("corner row is not an array")?;
                     assert_eq!(row.len(), *size, "{name} face {face} corner count");
@@ -267,7 +270,7 @@ fn check_generics(mesh: &Value, oracle: &Value) -> TestResult {
                 };
                 for (index, expected) in values.iter().enumerate() {
                     check_value(
-                        value_at(attr, &format!("{prefix}{index}"))?,
+                        value_at(attr, &format!("{prefix}{}", index + 1))?,
                         expected,
                         kind,
                         &format!("{name}[{index}]"),
@@ -293,6 +296,9 @@ fn check_uv(mesh: &Value, oracle: &Value) -> TestResult {
     assert_eq!(layer_names, names, "UV layer order");
     assert_eq!(store["active"], uv["active"], "UV active layer");
     assert_eq!(store["render"], uv["render"], "UV render layer");
+    let faces = mesh["faces"]
+        .as_array()
+        .ok_or("imported faces are missing")?;
     let starts = face_loop_starts(&face_sizes(oracle)?);
     for name in &names {
         let layer = store["layers"]
@@ -304,13 +310,16 @@ fn check_uv(mesh: &Value, oracle: &Value) -> TestResult {
         let expected = uv["values"][name]
             .as_array()
             .ok_or("expected UV values are missing")?;
-        for (face, start) in starts.iter().enumerate() {
+        for (face_index, start) in starts.iter().enumerate() {
+            let face_id = faces[face_index]["id"]
+                .as_u64()
+                .ok_or("imported face ID is missing")?;
             let entry = layer["faces"]
                 .as_array()
                 .ok_or("stored UV faces are missing")?
                 .iter()
-                .find(|entry| entry["face_id"].as_u64() == Some(face as u64))
-                .ok_or_else(|| format!("UV layer {name} has no face {face}"))?;
+                .find(|entry| entry["face_id"].as_u64() == Some(face_id))
+                .ok_or_else(|| format!("UV layer {name} has no face {face_id}"))?;
             let corners = entry["uv"]
                 .as_array()
                 .ok_or("stored UV corners are missing")?;
@@ -344,7 +353,7 @@ fn check_groups(scene: &Value) -> TestResult {
 
 #[test]
 fn import_stores_shading_colors_generics_uv_and_groups_natively() -> TestResult {
-    let Some(blender) = blender() else {
+    let Some(blender) = blender_checked::blender_executable() else {
         return Ok(());
     };
     let root = tempdir()?;
@@ -356,6 +365,15 @@ fn import_stores_shading_colors_generics_uv_and_groups_natively() -> TestResult 
             "import reported {feature} for representable oracle data"
         );
     }
+    let mut preview_command = pot();
+    preview_command
+        .arg("preview")
+        .arg(&project)
+        .args(["--views", "iso", "--size", "64", "--json"]);
+    let preview_output =
+        native_oracle::checked(&mut preview_command, "previewing imported mesh data")?;
+    let preview: Value = serde_json::from_slice(&preview_output.stdout)?;
+    assert_eq!(preview["ok"], true, "{preview}");
     let scene = read_scene(&project)?;
     let oracle = oracle_section(&expected);
     let mesh = mesh_of_node(&scene, "Oracle")?;
@@ -365,6 +383,202 @@ fn import_stores_shading_colors_generics_uv_and_groups_natively() -> TestResult 
     check_generics(mesh, oracle)?;
     check_uv(mesh, oracle)?;
     check_groups(&scene)?;
+    Ok(())
+}
+
+#[test]
+fn glb_hdr_color_layers_export_raw_and_restore_from_extras() -> TestResult {
+    let Some(blender) = blender_checked::blender_executable() else {
+        return Ok(());
+    };
+    let root = tempdir()?;
+    let (blend, expected) = build_oracle(&blender, root.path())?;
+    let (project, _) = import_blend(&blender, root.path(), "project", &blend)?;
+    let oracle = oracle_section(&expected);
+    let layers = oracle["color_layers"]["layers"]
+        .as_object()
+        .ok_or("oracle color layers are missing")?;
+    let (hdr_name, hdr_layer) = layers
+        .iter()
+        .find(|(_, layer)| {
+            layer["values"].as_array().is_some_and(|values| {
+                values.iter().any(|value| {
+                    value.as_array().is_some_and(|components| {
+                        components.iter().any(|component| {
+                            component
+                                .as_f64()
+                                .is_some_and(|component| !(0.0..=1.0).contains(&component))
+                        })
+                    })
+                })
+            })
+        })
+        .ok_or("oracle has no HDR color value")?;
+    assert_eq!(hdr_layer["domain"], "corner");
+    let hdr_name = hdr_name.clone();
+    let hdr_layer = hdr_layer.clone();
+    let hdr_values = hdr_layer["values"]
+        .as_array()
+        .ok_or("oracle HDR values are missing")?;
+    let sizes = face_sizes(oracle)?;
+    let starts = face_loop_starts(&sizes);
+
+    let strict_path = root.path().join("strict.glb");
+    let strict = export_raw(&blender, &project, "glb", &strict_path, false)?;
+    assert!(
+        !strict.status.success(),
+        "strict HDR export must be refused"
+    );
+    let strict_report: Value = serde_json::from_slice(&strict.stdout)?;
+    let strict_losses = strict_report["error"]["details"]["result"]["losses"]
+        .as_array()
+        .ok_or("strict GLB loss details are missing")?;
+    assert!(
+        !strict_losses.iter().any(|loss| {
+            loss["feature_id"] == "mesh.color_attribute"
+                && loss["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains(&hdr_name))
+        }),
+        "COLOR_1 is unconstrained by glTF; strict export must not name {hdr_name}: {strict_report}"
+    );
+
+    let glb = root.path().join("allow-lossy.glb");
+    let allowed = export_raw(&blender, &project, "glb", &glb, true)?;
+    assert!(
+        allowed.status.success(),
+        "allow-lossy GLB export failed: {}",
+        String::from_utf8_lossy(&allowed.stdout)
+    );
+    let allowed_report: Value = serde_json::from_slice(&allowed.stdout)?;
+    assert!(
+        !losses(&allowed_report).iter().any(|loss| {
+            loss["feature_id"] == "mesh.color_attribute"
+                && loss["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains(&hdr_name))
+        }),
+        "COLOR_1 is unconstrained by glTF; {hdr_name} must not be a color loss"
+    );
+    let bytes = fs::read(&glb)?;
+    assert!(bytes.len() >= 20, "GLB container is too short");
+    assert_eq!(&bytes[0..4], b"glTF");
+    let json_length = usize::try_from(u32::from_le_bytes(bytes[12..16].try_into()?))?;
+    assert_eq!(&bytes[16..20], b"JSON");
+    let json_end = 20_usize
+        .checked_add(json_length)
+        .filter(|end| *end <= bytes.len())
+        .ok_or("GLB JSON chunk is outside the file")?;
+    let document: Value = serde_json::from_slice(&bytes[20..json_end])?;
+    let mesh_values = document["meshes"]
+        .as_array()
+        .ok_or("GLB meshes are missing")?;
+    let color_mesh_index = mesh_values
+        .iter()
+        .position(|mesh| {
+            mesh["extras"]["potter"]["color_attributes"]["layers"]
+                .as_array()
+                .is_some_and(|layers| {
+                    layers
+                        .iter()
+                        .any(|layer| layer["name"].as_str() == Some(hdr_name.as_str()))
+                })
+                && mesh["primitives"].as_array().is_some_and(|primitives| {
+                    primitives
+                        .iter()
+                        .any(|primitive| primitive["attributes"]["COLOR_0"].is_u64())
+                })
+        })
+        .ok_or("GLB mesh with raw HDR color metadata is missing")?;
+    let color_mesh = &mesh_values[color_mesh_index];
+    let primitives = color_mesh["primitives"]
+        .as_array()
+        .ok_or("GLB primitives are missing")?;
+    let colored = primitives
+        .iter()
+        .find(|primitive| primitive["attributes"]["COLOR_0"].is_u64())
+        .ok_or("GLB has no selected COLOR_0")?;
+    for set in 0..4 {
+        assert!(colored["attributes"][format!("COLOR_{set}")].is_u64());
+    }
+    assert!(
+        colored["attributes"]["COLOR_4"].is_null(),
+        "COLOR_n accessors must be dense"
+    );
+    assert_eq!(colored["extras"]["potter"]["color_layer"], json!("Paint"));
+    let exported_hdr_layer = color_mesh["extras"]["potter"]["color_attributes"]["layers"]
+        .as_array()
+        .ok_or("raw Potter color metadata is missing")?
+        .iter()
+        .find(|layer| layer["name"].as_str() == Some(hdr_name.as_str()))
+        .ok_or("raw HDR layer is missing from Potter extras")?;
+    let exported_hdr_rows = exported_hdr_layer["values"]
+        .as_array()
+        .ok_or("raw HDR corner values are missing")?;
+    assert_eq!(exported_hdr_rows.len(), sizes.len());
+    for (face_index, row) in exported_hdr_rows.iter().enumerate() {
+        let row = row.as_array().ok_or("raw HDR face row is missing")?;
+        let expected_row = &hdr_values[starts[face_index]..starts[face_index] + sizes[face_index]];
+        assert_eq!(row.len(), expected_row.len());
+        for (corner, (actual, expected)) in row.iter().zip(expected_row).enumerate() {
+            assert_rgba(
+                vec4(actual)?,
+                vec4(expected)?,
+                FLOAT_TOLERANCE,
+                &format!("raw {hdr_name} face {face_index} corner {corner}"),
+            );
+        }
+    }
+
+    let imported_project = root.path().join("glb-import");
+    let mut init = pot();
+    init.arg("init").arg(&imported_project).arg("--json");
+    native_oracle::checked(&mut init, "initializing GLB import")?;
+    let mut import = pot();
+    import
+        .arg("import")
+        .arg(&imported_project)
+        .arg("--file")
+        .arg(&glb)
+        .args([
+            "--format",
+            "glb",
+            "--mode",
+            "replace",
+            "--base-revision",
+            "0",
+            "--allow-lossy",
+            "--json",
+        ]);
+    native_oracle::checked(&mut import, "importing lossy GLB")?;
+    let scene = read_scene(&imported_project)?;
+    let mesh = mesh_of_node(&scene, "Oracle")?;
+    let restored = attribute(mesh, &hdr_name)?;
+    assert_eq!(restored["domain"], hdr_layer["domain"]);
+    let registry = attribute(mesh, "color_layers")?;
+    assert_eq!(string_list(&registry["layers"])?, expected_names(oracle)?);
+    assert_eq!(registry["active"], "Glow");
+    assert_eq!(registry["render"], "Trim");
+    let faces = mesh["faces"]
+        .as_array()
+        .ok_or("imported faces are missing")?;
+    assert_eq!(faces.len(), sizes.len());
+    for (face_index, face) in faces.iter().enumerate() {
+        let face_id = face["id"].as_u64().ok_or("imported face ID is missing")?;
+        let actual = value_at(restored, &format!("f{face_id}"))?
+            .as_array()
+            .ok_or("restored HDR face values are missing")?;
+        let expected = &hdr_values[starts[face_index]..starts[face_index] + sizes[face_index]];
+        assert_eq!(actual.len(), expected.len());
+        for (corner, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert_rgba(
+                vec4(actual)?,
+                vec4(expected)?,
+                FLOAT_TOLERANCE,
+                &format!("{hdr_name} face {face_index} corner {corner}"),
+            );
+        }
+    }
     Ok(())
 }
 
@@ -495,8 +709,8 @@ fn check_generics_dumped(object: &Value, oracle: &Value) -> TestResult {
 
 fn check_uv_dumped(object: &Value, oracle: &Value) -> TestResult {
     let uv = &oracle["uv_layers"];
-    assert_eq!(object["uv_active"], 2, "Blender active UV index");
-    assert_eq!(object["uv_render"], 1, "Blender render UV index");
+    assert_eq!(object["uv_active"], uv["active"], "Blender active UV layer");
+    assert_eq!(object["uv_render"], uv["render"], "Blender render UV layer");
     let layers = object["uv_layers"]
         .as_array()
         .ok_or("Blender UV layers are missing")?;
@@ -557,7 +771,7 @@ fn check_groups_dumped(object: &Value, oracle: &Value) -> TestResult {
 
 #[test]
 fn blend_export_gives_blender_the_same_flags_colors_generics_uv_and_groups() -> TestResult {
-    let Some(blender) = blender() else {
+    let Some(blender) = blender_checked::blender_executable() else {
         return Ok(());
     };
     let root = tempdir()?;
@@ -577,5 +791,233 @@ fn blend_export_gives_blender_the_same_flags_colors_generics_uv_and_groups() -> 
     check_generics_dumped(object, oracle)?;
     check_uv_dumped(object, oracle)?;
     check_groups_dumped(object, oracle)?;
+    Ok(())
+}
+/// Blender renders the source `.blend` directly; only the named-color emitter remains visible.
+/// Its centre pixel is read from the linear `OpenEXR`, independently of Potter's project/image path.
+const EMITTER_SOURCE_RENDER: &str = r#"
+import json
+import sys
+
+import bpy
+
+out_json, out_exr = sys.argv[sys.argv.index("--") + 1 :]
+scene = bpy.context.scene
+emitter = bpy.data.objects.get("Emitter")
+if emitter is None:
+    raise SystemExit("source .blend has no Emitter")
+for obj in scene.objects:
+    obj.hide_render = obj is not emitter
+
+camera_data = bpy.data.cameras.new("EmitterOracleCamera")
+camera_data.type = "ORTHO"
+camera_data.ortho_scale = 4.0
+camera = bpy.data.objects.new("EmitterOracleCamera", camera_data)
+scene.collection.objects.link(camera)
+camera.location = (0.0, 0.0, 6.0)
+scene.camera = camera
+scene.world = None
+
+scene.render.engine = "CYCLES"
+scene.cycles.device = "CPU"
+scene.cycles.samples = 8
+scene.cycles.max_bounces = 0
+scene.cycles.use_denoising = False
+scene.cycles.pixel_filter_type = "BOX"
+scene.cycles.filter_width = 0.01
+scene.render.resolution_x = 16
+scene.render.resolution_y = 16
+scene.render.resolution_percentage = 100
+scene.view_settings.view_transform = "Standard"
+scene.render.image_settings.file_format = "OPEN_EXR"
+scene.render.image_settings.color_depth = "32"
+scene.render.image_settings.color_mode = "RGBA"
+scene.render.filepath = out_exr
+bpy.ops.render.render(write_still=True)
+
+image = bpy.data.images.load(out_exr, check_existing=False)
+if tuple(image.size) != (16, 16):
+    raise SystemExit("source render has unexpected dimensions: %r" % (tuple(image.size),))
+pixels = list(image.pixels)
+offset = ((16 // 2) * 16 + 16 // 2) * 4
+with open(out_json, "w", encoding="utf-8") as handle:
+    json.dump({"pixel": pixels[offset : offset + 4]}, handle)
+"#;
+
+fn blender_emitter_center_pixel(
+    blender: &Path,
+    root: &Path,
+    source_blend: &Path,
+) -> TestResult<[f64; 4]> {
+    let script = write_script(root, "render_emitter_source.py", EMITTER_SOURCE_RENDER)?;
+    let json_path = root.join("emitter_source_pixel.json");
+    let exr_path = root.join("emitter_source.exr");
+    run_blender_arguments(
+        blender,
+        &script,
+        Some(source_blend),
+        &[&json_path, &exr_path],
+    )?;
+    let render: Value = serde_json::from_slice(&fs::read(json_path)?)?;
+    vec4(&render["pixel"])
+}
+
+fn render_center_pixel(project: &Path, image_id: &str) -> TestResult<[f64; 4]> {
+    let scene = read_scene(project)?;
+    let image: Image = serde_json::from_value(scene["images"][image_id].clone())?;
+    let data = load_image_data(&image, project, ImageInterpolation::Closest)?;
+    Ok(sample(&data, [0.5, 0.5], 0))
+}
+
+#[test]
+fn imported_emitter_color_renders_like_blender_after_blend_roundtrip() -> TestResult {
+    let Some(blender) = blender_checked::blender_executable() else {
+        return Ok(());
+    };
+    let root = tempdir()?;
+    let (source_blend, expected) = build_oracle(&blender, root.path())?;
+
+    let expected_ink = vec4(&expected["emitter"]["value"])?;
+    assert_eq!(expected["emitter"]["layer"], "Ink");
+    assert_eq!(expected_ink, [0.0625, 0.25, 0.5, 1.0]);
+    assert_eq!(
+        expected["emitter"]["camera"],
+        json!({
+            "location": [0.0, 0.0, 6.0],
+            "projection": "orthographic",
+            "ortho_scale": 4.0
+        })
+    );
+    assert_eq!(expected["emitter"]["pixel"], json!([0.5, 0.5]));
+
+    let blender_pixel = blender_emitter_center_pixel(&blender, root.path(), &source_blend)?;
+    assert_rgba(
+        blender_pixel,
+        expected_ink,
+        FLOAT_TOLERANCE,
+        "Blender source-render Emitter centre",
+    );
+
+    let (project, import_report) = import_blend(&blender, root.path(), "project", &source_blend)?;
+    for feature in loss_features(&import_report) {
+        assert!(
+            !UNEXPECTED_IMPORT_LOSSES.contains(&feature.as_str()),
+            "native import lost representable data: {feature}"
+        );
+    }
+    let exported_blend = root.path().join("roundtrip.blend");
+    let export_report = export(&blender, &project, "blend", &exported_blend)?;
+    assert!(
+        losses(&export_report).is_empty(),
+        "blend export lost data before the native render: {export_report}"
+    );
+    let (roundtrip, reimport_report) =
+        import_blend(&blender, root.path(), "roundtrip", &exported_blend)?;
+    for feature in loss_features(&reimport_report) {
+        assert!(
+            !UNEXPECTED_IMPORT_LOSSES.contains(&feature.as_str()),
+            "roundtrip import lost representable data: {feature}"
+        );
+    }
+
+    // Confirm the re-imported native layer and named shader input feeding the actual CLI render.
+    let scene = read_scene(&roundtrip)?;
+    let emitter = mesh_of_node(&scene, "Emitter")?;
+    let ink = attribute(emitter, "Ink")?;
+    assert_eq!(ink["domain"], "corner");
+    assert_eq!(ink["type"], "color");
+    let face_id = emitter["faces"]
+        .as_array()
+        .and_then(|faces| faces.first())
+        .and_then(|face| face["id"].as_u64())
+        .ok_or("Emitter's first face has no id")?;
+    let corners = value_at(ink, &format!("f{face_id}"))?
+        .as_array()
+        .ok_or("Emitter Ink face values are not an array")?;
+    assert_eq!(corners.len(), 4);
+    for (index, corner) in corners.iter().enumerate() {
+        assert_rgba(
+            vec4(corner)?,
+            expected_ink,
+            FLOAT_TOLERANCE,
+            &format!("re-imported Ink corner {index}"),
+        );
+    }
+    let emitter_id = node_id(&scene, "Emitter")?;
+    let emitter = &scene["nodes"][&emitter_id];
+    // The emitter's material is linked to its mesh data (build_oracle.py), so its slot lives on the data-block.
+    let object_linked = emitter["material_links"][0].as_str() == Some("object");
+    let slots = if object_linked {
+        &emitter["materials"]
+    } else {
+        let data = emitter["data"].as_str().ok_or("Emitter data is missing")?;
+        &scene["data_blocks"][data]["materials"]
+    };
+    let material_id = slots[0]
+        .as_str()
+        .ok_or("Emitter has no material assignment")?;
+    let graph_id = scene["materials"][material_id]["node_tree"]
+        .as_str()
+        .ok_or("Emitter material has no node tree")?;
+    let graph_nodes = scene["node_groups"][graph_id]["nodes"]
+        .as_object()
+        .ok_or("Emitter material nodes are missing")?;
+    let vertex_color = graph_nodes
+        .values()
+        .find(|node| node["type"] == "ShaderNodeVertexColor")
+        .ok_or("Emitter material has no Vertex Color node")?;
+    assert_eq!(vertex_color["properties"]["layer_name"], "Ink");
+
+    let active_scene = scene["active_scene"]
+        .as_str()
+        .ok_or("active scene is missing")?
+        .to_owned();
+    let applied = apply_operations(
+        &roundtrip,
+        root.path(),
+        json!([
+            {"op":"camera.create","id":"emitter_camera","transform":{"translation":[0.0,0.0,6.0]},"projection":"orthographic","ortho_scale":4.0},
+            {"op":"scene.update","target":{"id":active_scene},"set":{"camera":"emitter_camera"}},
+            {"op":"render.update","target":{"id":active_scene},"set":{"resolution_x":16,"resolution_y":16,"samples":8,"seed":0,"max_bounces":0}}
+        ]),
+    )?;
+    assert_eq!(applied["ok"], true, "{applied}");
+
+    let frames = root.path().join("native-render");
+    let mut render = pot();
+    render
+        .arg("render")
+        .arg(&roundtrip)
+        .args(["--format", "exr", "--out"])
+        .arg(&frames)
+        .arg("--json");
+    let rendered = native_oracle::checked(&mut render, "rendering re-imported native Ink")?;
+    let stdout = String::from_utf8_lossy(&rendered.stdout);
+    assert!(
+        !stdout.contains("color_layer_missing"),
+        "the named Ink layer exists: {stdout}"
+    );
+    let exr = frames.join("frame_0001.exr");
+    assert!(fs::metadata(&exr)?.len() > 0, "native EXR render is empty");
+    let loaded = apply_operations(
+        &roundtrip,
+        root.path(),
+        json!([{"op":"image.load","id":"emitter_render","path":exr.to_string_lossy()}]),
+    )?;
+    assert_eq!(loaded["ok"], true, "{loaded}");
+
+    let potter_pixel = render_center_pixel(&roundtrip, "emitter_render")?;
+    assert_rgba(
+        potter_pixel,
+        blender_pixel,
+        FLOAT_TOLERANCE,
+        "Potter CLI render versus Blender source-render centre",
+    );
+    assert_rgba(
+        potter_pixel,
+        expected_ink,
+        FLOAT_TOLERANCE,
+        "Potter CLI render versus independently authored linear Ink",
+    );
     Ok(())
 }

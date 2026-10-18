@@ -5,7 +5,7 @@
 //! `schema_v1_project_layer_limit` hold legacy data the upgrade must skip or drop: a `uv_map` row for
 //! a deleted face, Blender layers left stale by an extrude, and nine candidate layers. Each case
 //! checks its warning codes and names, that reads leave every file unchanged, and that the original
-//! `scene.json` bytes stay recoverable under `compat/sha256/<hash>/scene.json` once a version-3 write
+//! `scene.json` bytes stay recoverable under `compat/sha256/<hash>/scene.json` once a schema-3 write
 //! happens.
 
 use std::{
@@ -105,7 +105,7 @@ fn mesh_attributes(scene: &Path) -> TestResult<Value> {
 }
 
 /// The first corner and pin flags of face 0 as stored on disk. Version 1 keeps them in `uv_map`
-/// (glTF convention); upgraded documents keep them in the first layer of `uv_layers`.
+/// (glTF convention); version 3 keeps them in the first layer of `uv_layers`.
 fn face_zero(scene: &Path) -> TestResult<(Value, Value)> {
     let attributes = mesh_attributes(scene)?;
     let entry = if document(scene)?["schema_version"] == 1 {
@@ -198,6 +198,96 @@ fn schema_v1_project_keeps_revisions_uv_state_and_hashes_through_edit_history_an
             .arg("--json"),
     )?;
     assert_eq!(exported["ok"], true, "{exported}");
+    Ok(())
+}
+
+#[test]
+fn schema_v1_active_blender_layer_survives_migration_and_omitted_selector_uv_transform()
+-> TestResult {
+    let directory = TempDir::new()?;
+    let scene = copy_fixture(directory.path())?;
+    let scene_file = scene.join("scene.json");
+    let mut legacy: Value = serde_json::from_slice(&fs::read(&scene_file)?)?;
+    legacy["data_blocks"]["cube_mesh"]["mesh"]["attributes"]["blender_uv_layers"] = json!([
+        {
+            "name": "Light",
+            "active": true,
+            "values": vec![json!([0.25, 0.5]); 24]
+        }
+    ]);
+    fs::write(&scene_file, serde_json::to_vec_pretty(&legacy)?)?;
+    let original = fs::read(&scene_file)?;
+    let expected = read_only_digests(&scene)?;
+    let head = document(&scene)?["history"]["head"]
+        .as_str()
+        .ok_or("the fixture has no history head")?
+        .to_owned();
+    let head_blob = scene.join(blob_path("history", "blob.json", &head));
+    let head_bytes = fs::read(&head_blob)?;
+
+    let inspected =
+        envelope(
+            pot()
+                .arg("inspect")
+                .arg(&scene)
+                .args(["--id", "cube_mesh", "--json"]),
+        )?;
+    assert_eq!(inspected["ok"], true, "{inspected}");
+    let uv_layers = inspected["result"]["items"][0]["uv_layers"]
+        .as_array()
+        .ok_or("mesh inspect omitted UV layers")?;
+    assert!(
+        uv_layers
+            .iter()
+            .any(|layer| layer["name"] == "Light" && layer["active"] == true),
+        "{inspected}"
+    );
+    assert!(
+        uv_layers.iter().any(|layer| {
+            layer["name"] == "UVMap" && layer["render"] == true && layer["active"] == false
+        }),
+        "{inspected}"
+    );
+    assert_eq!(
+        fs::read(&scene_file)?,
+        original,
+        "inspect rewrote the v1 project"
+    );
+    assert_eq!(
+        read_only_digests(&scene)?,
+        expected,
+        "inspect rewrote project files"
+    );
+    assert_eq!(
+        fs::read(&head_blob)?,
+        head_bytes,
+        "inspect rewrote the history head bytes"
+    );
+
+    let applied = apply(
+        &scene,
+        2,
+        &json!([{
+            "op": "uv.transform",
+            "target": {"id": "cube"},
+            "translation": [0.25, 0.0]
+        }]),
+    )?;
+    assert_eq!(applied["ok"], true, "{applied}");
+    assert_eq!(applied["scene"]["revision"], 3);
+    assert_eq!(document(&scene)?["schema_version"], 3);
+    let attributes = mesh_attributes(&scene)?;
+    assert_eq!(attributes["uv_layers"]["active"], "Light");
+    assert_eq!(attributes["uv_layers"]["render"], "UVMap");
+    assert_corner_close(stored_corner(&scene, "Light", 0)?, [0.5, 0.5]);
+    assert_corner_close(stored_corner(&scene, "UVMap", 0)?, [-0.9, -0.8]);
+    assert_original_kept(&scene, &original)?;
+    assert_history_kept(&scene, &expected)?;
+    assert_eq!(
+        fs::read(&head_blob)?,
+        head_bytes,
+        "apply rewrote the history head bytes"
+    );
     Ok(())
 }
 
@@ -346,7 +436,7 @@ fn fixture_corner(case: &str, face_id: u64) -> TestResult<[f64; 2]> {
     corner_value(&entry["uv"][0])
 }
 
-/// The named native UV layer of the project's mesh, as stored in `scene.json`.
+/// The schema-version-3 layer `name` of the project's mesh, as stored in `scene.json`.
 fn stored_layer(scene: &Path, name: &str) -> TestResult<Value> {
     let attributes = mesh_attributes(scene)?;
     attributes["uv_layers"]["layers"]
@@ -356,7 +446,7 @@ fn stored_layer(scene: &Path, name: &str) -> TestResult<Value> {
         .ok_or_else(|| format!("layer `{name}` is not stored").into())
 }
 
-/// The names of the native UV layers of the project's mesh, in stored order.
+/// The names of the schema-version-3 layers of the project's mesh, in stored order.
 fn stored_layer_names(scene: &Path) -> TestResult<Vec<String>> {
     let attributes = mesh_attributes(scene)?;
     Ok(attributes["uv_layers"]["layers"]
@@ -367,7 +457,7 @@ fn stored_layer_names(scene: &Path) -> TestResult<Vec<String>> {
         .collect())
 }
 
-/// The face IDs that the native layer `name` stores values for, in stored order.
+/// The face IDs that the schema-version-3 layer `name` stores values for, in stored order.
 fn stored_face_ids(scene: &Path, name: &str) -> TestResult<Vec<u64>> {
     let layer = stored_layer(scene, name)?;
     Ok(layer["faces"]
@@ -378,7 +468,7 @@ fn stored_face_ids(scene: &Path, name: &str) -> TestResult<Vec<u64>> {
         .collect())
 }
 
-/// Corner 0 of face `face_id` in the native layer `name`.
+/// Corner 0 of face `face_id` in the schema-version-3 layer `name`.
 fn stored_corner(scene: &Path, name: &str, face_id: u64) -> TestResult<[f64; 2]> {
     let layer = stored_layer(scene, name)?;
     let face = layer["faces"]

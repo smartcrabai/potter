@@ -11,6 +11,13 @@ use potter_core::{
     ops::apply_batch,
 };
 
+#[path = "common/exchange_normals.rs"]
+#[expect(
+    dead_code,
+    reason = "this test binary uses only the quantized normal tolerance from the shared helper"
+)]
+mod exchange_normals;
+
 fn apply(doc: &SceneDoc, operations: &Value) -> potter_core::error::Result<SceneDoc> {
     let batch = json!({
         "schema_version": 1,
@@ -191,19 +198,34 @@ fn instanced_custom_normals_rotate_with_the_instance_transform() {
     .unwrap();
     let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default()).unwrap();
     let mesh = &snapshot.meshes[&"instance".parse::<Id>().unwrap()];
-    let custom = mesh.attributes["custom_normal"]["values"]
+    // The stored custom normals are Blender code pairs: `null` is Auto, so only a non-null entry is authored.
+    let codes = mesh.attributes["custom_normal"]["values"]
         .as_object()
         .unwrap();
+    let normals = potter_core::geom::corner_normal_vectors(mesh).unwrap();
+    let mut authored_faces = Vec::new();
+    let mut corner_base = 0;
+    for face in &mesh.faces {
+        let count = face.vertices.len();
+        let row = codes[&format!("f{}", face.id)].as_array().unwrap();
+        if row.iter().any(|code| !code.is_null()) {
+            authored_faces.push((face.id, corner_base));
+        }
+        corner_base += count;
+    }
     assert_eq!(
-        custom.len(),
+        authored_faces.len(),
         1,
         "only the authored face carries a custom normal"
     );
     // A 90 degree turn about Z maps the authored +X normal to +Y.
-    for corner in custom.values().next().unwrap().as_array().unwrap() {
-        let [x, y, z] = [0, 1, 2].map(|axis| corner[axis].as_f64().unwrap());
+    let tolerance = exchange_normals::normal_tolerance(true);
+    let (_, base) = authored_faces[0];
+    for corner in &normals[base..base + 4] {
         assert!(
-            (x).abs() < 1.0e-12 && (y - 1.0).abs() < 1.0e-12 && z.abs() < 1.0e-12,
+            corner.x.abs() < tolerance
+                && (corner.y - 1.0).abs() < tolerance
+                && corner.z.abs() < tolerance,
             "{corner:?}"
         );
     }

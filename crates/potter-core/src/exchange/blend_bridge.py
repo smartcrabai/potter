@@ -12,6 +12,7 @@ import math
 import os
 import sys
 import traceback
+import tempfile
 from mathutils import Euler, Matrix, Quaternion
 DEFERRED_ID_ASSIGNMENTS = []
 CACHE_FILES_BY_IDENTITY = {}
@@ -237,6 +238,8 @@ def plain(value, depth=0):
         return matrix_rows(value)
     if all(hasattr(value, axis) for axis in ("r", "g", "b")):
         return [float(value.r), float(value.g), float(value.b)]
+    if isinstance(value, Euler):
+        return [float(value.x), float(value.y), float(value.z)]
     if hasattr(value, "w") and hasattr(value, "to_euler"):
         return [value.x, value.y, value.z, value.w]
     if hasattr(value, "to_list"):
@@ -612,6 +615,8 @@ def tree_dump(tree):
         properties = rna_props(node, ("inputs", "outputs", "internal_links", "parent", "select", "location", "dimensions"))
         if node.bl_idname == "GeometryNodeMeshCube":
             properties = {}
+        if simple_material is True and not _matches_blender_defaults(node):
+            simple_material = False
         if simple_material:
             properties = {"potter_simple_material": True}
             sockets = []
@@ -990,6 +995,7 @@ def volume_dump(volume):
         pass
     return {"name": volume.name_full, "potter_id": volume.get("potter.id"),
             "library": library_reference(volume),
+            "materials": _material_names(volume),
             "filepath": volume_filepath(volume),
             "grids": [grid.name for grid in volume.grids],
             "custom_properties": custom_props(volume),
@@ -1001,7 +1007,7 @@ def _mesh_shape_keys(mesh):
     key_data = getattr(mesh, "shape_keys", None)
     blocks = getattr(key_data, "key_blocks", ()) if key_data else ()
     if not blocks:
-        return {"absolute": False, "evaluation_time": 0.0, "basis": [], "keys": []}
+        return None
     basis = blocks[0]
     basis_data = [{"index": index, "co": plain(point.co)} for index, point in enumerate(basis.data)]
     key_ids = _id_map(key_data, "potter.shape_key_ids_json")
@@ -1127,6 +1133,9 @@ def _armature_dump(armature):
 
 
 
+def _material_names(data):
+    return [material.name_full if material else None for material in data.materials]
+
 def curve_dump(curve):
     if getattr(getattr(curve, "bl_rna", None), "identifier", "") == "TextCurve":
         font = curve.font
@@ -1134,6 +1143,7 @@ def curve_dump(curve):
         return {
             "name": curve.name_full,
             "potter_id": curve.get("potter.id"),
+            "materials": _material_names(curve),
             "library": library_reference(curve),
             "type": "FONT",
             "resolution_u": int(getattr(curve, "resolution_u", 12)),
@@ -1239,6 +1249,7 @@ def curve_dump(curve):
         "eval_time_action_slot_name": eval_time_action_slot_name,
         "name": curve.name_full,
         "potter_id": curve.get("potter.id"),
+        "materials": _material_names(curve),
         "library": library_reference(curve),
         "type": curve_type,
         "resolution_u": int(getattr(curve, "resolution_u", 12)),
@@ -1359,8 +1370,18 @@ def _grease_pencil_dump(data):
                 start, end = offsets[stroke_index], offsets[stroke_index + 1]
                 material_index = int(material_values[stroke_index])
                 material = data.materials[material_index] if 0 <= material_index < len(data.materials) else None
-                fill = bool(fill_values[stroke_index]) if fill_values and fill_values[stroke_index] is not None else bool(
-                    getattr(getattr(material, "grease_pencil", None), "show_fill", False))
+                fill_enabled = (
+                    bool(fill_values[stroke_index])
+                    if fill_values and fill_values[stroke_index] is not None
+                    else bool(getattr(getattr(material, "grease_pencil", None), "show_fill", False))
+                )
+                fill_color = None
+                if fill_enabled and material is not None:
+                    style = getattr(material, "grease_pencil", None)
+                    fill_color = getattr(style, "fill_color", None) if style is not None else None
+                    if fill_color is None:
+                        fill_color = material.diffuse_color
+                    fill_color = plain(fill_color)
                 points = []
                 for index in range(start, end):
                     points.append({"position": point_values["position"][index],
@@ -1369,12 +1390,13 @@ def _grease_pencil_dump(data):
                                    "opacity": point_values["opacity"][index],
                                    "time": point_values["time"][index]})
                 drawing_strokes.append({"points": points, "cyclic": bool(cyclic_values[stroke_index]),
-                                        "fill": fill, "material": material.name_full if material else None})
+                                        "fill": fill_color, "material": material.name_full if material else None})
             frames.append({"frame": int(frame.frame_number), "strokes": drawing_strokes})
         layers.append({"name": layer.name, "opacity": float(layer.opacity),
                        "visible": not bool(layer.hide), "frames": frames})
     return {"name": data.name_full, "potter_id": data.get("potter.id"),
             "library": library_reference(data), "layers": layers,
+            "materials": _material_names(data),
             "custom_properties": custom_props(data), "fake_user": bool(data.use_fake_user)}
 
 
@@ -1451,12 +1473,11 @@ def _color_attribute_name(mesh, index):
 
 
 def _custom_normal_codes(mesh):
-    """Loop-ordered raw custom-normal pairs; (0, 0) is Auto. Storage order is Blender loop order."""
+    """Loop-ordered raw INT16_2D custom-normal pairs; (0, 0) is Auto."""
     layer = mesh.attributes.get("custom_normal")
-    if layer is None:
-        raise ValueError("mesh %s has custom normals but no custom_normal layer" % mesh.name)
+    if layer is None or layer.domain != "CORNER" or layer.data_type != "INT16_2D":
+        raise ValueError("mesh %s has no custom_normal INT16_2D layer" % mesh.name)
     return [[int(a), int(b)] for a, b in (item.value for item in layer.data)]
-
 def mesh_dump(mesh):
     vertices = [{"co": plain(v.co)} for v in mesh.vertices]
     edges = [{"v": list(edge.vertices), "sharp": bool(getattr(edge, "use_edge_sharp", False)),
@@ -1469,11 +1490,17 @@ def mesh_dump(mesh):
                           "pins": [bool(item.pin_uv) for item in layer.data]})
     uv_active = _uv_layer_index(mesh.uv_layers, "active_index")
     uv_render = _uv_layer_index(mesh.uv_layers, "active_render_index")
-    custom_normals = any(attr.name == "custom_normal" for attr in mesh.attributes)
-    corner_normals = [plain(normal.vector) for normal in mesh.corner_normals] if custom_normals else None
-    attrs = [{"name": attr.name, "domain": attr.domain, "data_type": attr.data_type,
-              "values": [_attribute_item_value(item, attr.data_type) for item in attr.data]}
-             for attr in mesh.attributes if attr.name != "custom_normal"]
+    attrs = []
+    normal_layer = mesh.attributes.get("custom_normal")
+    has_normal_codes = (normal_layer is not None and normal_layer.domain == "CORNER"
+                        and normal_layer.data_type == "INT16_2D")
+    # Raw per-element values stay visible unless this is Blender's compressed normal-code layer.
+    for attr in mesh.attributes:
+        if (attr.name == "custom_normal" and attr.domain == "CORNER"
+                and attr.data_type == "INT16_2D"):
+            continue
+        attrs.append({"name": attr.name, "domain": attr.domain, "data_type": attr.data_type,
+                      "values": [_attribute_item_value(item, attr.data_type) for item in attr.data]})
     skin_vertices = []
     if len(mesh.skin_vertices):
         skin_vertices = [{"radius": plain(vertex.radius),
@@ -1481,14 +1508,13 @@ def mesh_dump(mesh):
                           "loose": bool(vertex.use_loose)}
                          for vertex in mesh.skin_vertices[0].data]
     color_attributes = mesh.color_attributes
-    codes = {"custom_normal_codes": _custom_normal_codes(mesh)} if mesh.has_custom_normals else {}
+    codes = {"custom_normal_codes": _custom_normal_codes(mesh)} if has_normal_codes else {}
     return {"name": mesh.name_full, "potter_id": mesh.get("potter.id"),
             "library": library_reference(mesh), "vertices": vertices,
             "edges": edges, "polygons": polygons, "uv_layers": uv_layers, "uv_active": uv_active,
-            "uv_render": uv_render, "attributes": attrs,
+            "uv_render": uv_render, "materials": _material_names(mesh), "attributes": attrs,
             "color_active": _color_attribute_name(mesh, color_attributes.active_color_index),
             "color_render": _color_attribute_name(mesh, color_attributes.render_color_index),
-            "corner_normals": corner_normals,
             "skin_vertices": skin_vertices,
             "shape_keys": _mesh_shape_keys(mesh),
             "descriptor": json.loads(mesh.get("potter.descriptor_json", "null")),
@@ -1640,8 +1666,11 @@ def object_dump(obj):
         except Exception:
             volume_bounds = None
     materials = []
+    material_links = []
     for slot in obj.material_slots:
-        materials.append(slot.material.name_full if slot.material else None)
+        material_links.append(slot.link.lower())
+        materials.append(slot.material.name_full
+                         if slot.link == "OBJECT" and slot.material else None)
     try:
         modifier_ids = json.loads(obj.get("potter.modifier_ids_json", "{}"))
     except Exception:
@@ -1741,7 +1770,8 @@ def object_dump(obj):
             "hide_viewport": hide_viewport, "hide_set": hide_set,
             "hide_set_by_view_layer": hide_set_by_view_layer,
             "hide_render": bool(obj.hide_render),
-            "hide_select": bool(obj.hide_select), "materials": materials, "modifiers": modifiers,
+            "hide_select": bool(obj.hide_select), "materials": materials,
+            "material_links": material_links, "modifiers": modifiers,
             "constraints": constraints, "drivers": drivers, "nla_tracks": nla_tracks,
             "action": action, "action_slot": action_slot, "pose": _pose_dump(obj),
             "vertex_groups": _vertex_groups_dump(obj), "rigid_body": _rigid_body_dump(obj),
@@ -1861,12 +1891,17 @@ def _color_management_dump(scene):
             "gamma": float(view.gamma), "curve": curve}
 
 
+# ViewLayer.use_pass_cryptomatte_accurate is an accuracy flag, not a pass (rna_scene.cc,
+# VIEW_LAYER_CRYPTOMATTE_ACCURATE), so it is carried as render.cryptomatte_accurate.
+CRYPTOMATTE_ACCURATE_PROP = "use_pass_cryptomatte_accurate"
+
+
 def _render_passes(scene):
     passes = set()
     for layer in scene.view_layers:
         for prop in layer.bl_rna.properties:
             name = prop.identifier
-            if not name.startswith("use_pass_"):
+            if not name.startswith("use_pass_") or name == CRYPTOMATTE_ACCURATE_PROP:
                 continue
             try:
                 if bool(getattr(layer, name)):
@@ -1874,6 +1909,10 @@ def _render_passes(scene):
             except Exception:
                 continue
     return sorted(passes)
+
+
+def _cryptomatte_accurate(scene):
+    return any(bool(getattr(layer, CRYPTOMATTE_ACCURATE_PROP, False)) for layer in scene.view_layers)
 
 
 def _scene_compositor(scene):
@@ -2081,6 +2120,7 @@ def dump_scene(scene):
                 "engine": "path" if render_engine == "CYCLES" else "realtime",
                 "engine_native": render_engine,
                 "passes": _render_passes(scene),
+                "cryptomatte_accurate": _cryptomatte_accurate(scene),
             },
             "use_compositing": bool(getattr(scene.render, "use_compositing", False)),
             "compositor": _scene_compositor(scene),
@@ -2105,7 +2145,7 @@ def _startup_metadata_datablock(collection_name, block):
 
 def other_datablocks_dump():
     known = {"actions", "armatures", "cache_files", "cameras", "collections", "curves", "fonts",
-             "grease_pencils_v3", "images", "libraries", "lights", "materials", "meshes",
+             "grease_pencils", "images", "libraries", "lights", "materials", "meshes",
              "movieclips", "node_groups", "objects", "scenes", "texts", "textures", "volumes",
              "worlds"}
     result = []
@@ -2162,7 +2202,7 @@ def material_dump(material):
     emission_color = [0.0, 0.0, 0.0]
     emission_strength = 0.0
     transmission = 0.0
-    ior = 1.45
+    ior = 1.5
     if material.use_nodes and material.node_tree:
         shader = next((node for node in material.node_tree.nodes if node.type == "BSDF_PRINCIPLED"), None)
         if shader:
@@ -2190,7 +2230,8 @@ def material_dump(material):
                 pass
     return {"name": material.name_full, "potter_id": material.get("potter.id"),
             "library": library_reference(material),
-            "base_color": base_color, "metallic": metallic, "roughness": roughness,
+            "base_color": base_color,
+            "metallic": metallic, "roughness": roughness,
             "emission_color": emission_color, "emission_strength": emission_strength,
             "transmission": transmission, "ior": ior,
             "double_sided": not bool(getattr(material, "use_backface_culling", False)),
@@ -2199,7 +2240,9 @@ def material_dump(material):
             "nodes": tree_dump(material.node_tree),
             "custom_properties": {key: value for key, value in custom_props(material).items()
                                   if key != ALPHA_MODE_PROPERTY},
-            "fake_user": bool(material.use_fake_user), "users": int(material.users)}
+            "fake_user": bool(material.use_fake_user), "users": int(material.users),
+            "field_graph_unchanged": _field_graph_verdict(material.node_tree),
+            **_material_field_values(material)}
 
 
 def dump_all():
@@ -2220,7 +2263,7 @@ def dump_all():
             "objects": [object_dump(item) for item in bpy.data.objects],
             "armatures": [_armature_dump(item) for item in bpy.data.armatures],
             "grease_pencil": [_grease_pencil_dump(item) for item in
-                              getattr(bpy.data, "grease_pencils_v3", ())],
+                              getattr(bpy.data, "grease_pencils", ())],
             "curves": [curve_dump(item) for item in bpy.data.curves],
             "volumes": [volume_dump(item) for item in getattr(bpy.data, "volumes", ())],
             "meshes": [mesh_dump(item) for item in bpy.data.meshes],
@@ -3040,7 +3083,7 @@ def _source_modifier_object_copies(doc, mesh_map):
 
     source_collections = (
         "actions", "armatures", "cameras", "collections", "curves",
-        "grease_pencils_v3", "images", "lights", "materials", "meshes",
+        "grease_pencils", "images", "lights", "materials", "meshes",
         "node_groups", "objects", "shape_keys", "volumes", "worlds",
     )
     before = {
@@ -3119,7 +3162,7 @@ def _source_modifier_object_copies(doc, mesh_map):
         bpy.data.objects.remove(source_obj, do_unlink=True)
     for collection_name in (
         "collections", "meshes", "curves", "armatures", "cameras", "lights",
-        "grease_pencils_v3", "volumes", "materials", "images", "node_groups",
+        "grease_pencils", "volumes", "materials", "images", "node_groups",
         "shape_keys", "actions", "worlds",
     ):
         collection = getattr(bpy.data, collection_name, None)
@@ -3209,9 +3252,7 @@ def _blender_edge_indexes(mesh, edges):
 
 def _native_values(attributes, name):
     spec = attributes.get(name)
-    if not isinstance(spec, dict) or not isinstance(spec.get("values"), dict):
-        return {}
-    return spec["values"]
+    return spec.get("values", {}) if spec else {}
 
 
 def _required(values, key, owner):
@@ -3250,6 +3291,9 @@ def _apply_native_shading(mesh, attributes, face_items, edge_items, edge_of):
     for polygon, face in zip(mesh.polygons, face_items):
         polygon.use_smooth = bool(smooth.get("f%d" % face["id"], False))
     for field, key in (("use_edge_sharp", "sharp"), ("use_seam", "seam")):
+        if attributes.get(key) is None:
+            # Setting a flag creates Blender's sharp_edge / uv_seam attribute, so an absent layer stays absent.
+            continue
         flags = _native_values(attributes, key)
         for index, edge in enumerate(edge_items):
             value = bool(flags.get("e%d" % edge["id"], False))
@@ -3297,10 +3341,19 @@ def _custom_normal_pair(entry):
     return (entry[0], entry[1])
 
 
-def _flatten_face_rows(rows, face_items, owner):
+def _attribute_default(data_type):
+    """Blender's value for an element Potter stores no entry for: zero, or opaque black for colours."""
+    if data_type in MESH_COLOR_TYPES:
+        return (0.0, 0.0, 0.0, 1.0)
+    return {"BOOLEAN": False, "INT": 0, "FLOAT": 0.0, "FLOAT2": (0.0, 0.0),
+            "FLOAT_VECTOR": (0.0, 0.0, 0.0), "QUATERNION": (0.0, 0.0, 0.0, 0.0)}[data_type]
+
+
+def _flatten_face_rows(rows, face_items, owner, default):
+    """Flattened corner values of `face_items`; a face without a row takes `default` on every corner."""
     flat = []
     for face in face_items:
-        row = _required(rows, "f%d" % face["id"], owner)
+        row = rows.get("f%d" % face["id"], [default] * len(face["v"]))
         if len(row) != len(face["v"]):
             raise ValueError("%s row f%d has %d corners, expected %d"
                              % (owner, face["id"], len(row), len(face["v"])))
@@ -3377,10 +3430,10 @@ def _loop_layout(face_items, corner_order):
 def _apply_native_custom_normals(mesh, attributes, vector_rows, face_items, layout):
     """Writes the custom-normal layer in Blender loop order from the persistent code state.
 
-    `custom_normal_vectors` (per flattened corner in storage order, null for Auto) initialize Blender's setter and
-    allocate the layer. With `values`, every loop then receives its exact stored pair: Auto and explicit zero (a
-    reported loss) write (0, 0). Without `values` (Rust dropped the codes for a non-realizable basis), Blender encodes
-    the status from the vectors alone, so Auto corners take their face normal. Without vectors nothing is created.
+    `custom_normal_vectors` (per flattened corner in storage order) initialize Blender's setter and allocate the
+    layer. With `values`, every loop then receives its exact stored pair: Auto and explicit zero (a reported loss)
+    write (0, 0). Without `values` (Rust dropped the codes for a non-realizable basis), Blender encodes the status
+    from the vectors alone. Without vectors nothing is created.
     """
     spec = _custom_normal_spec(attributes)
     has_codes = spec is not None and "values" in spec
@@ -3389,18 +3442,14 @@ def _apply_native_custom_normals(mesh, attributes, vector_rows, face_items, layo
             raise ValueError("custom_normal codes of mesh %s have no custom_normal_vectors" % mesh.name)
         return
     vectors = layout.loops(vector_rows, "custom_normal_vectors of mesh %s" % mesh.name)
-    setter_vectors = []
-    for polygon in mesh.polygons:
-        for loop in range(polygon.loop_start, polygon.loop_start + polygon.loop_total):
-            vector = vectors[loop]
-            setter_vectors.append(tuple(polygon.normal) if vector is None else tuple(vector))
+    setter_vectors = [tuple(vector) for vector in vectors]
     mesh.normals_split_custom_set(setter_vectors)
     layer = mesh.attributes.get("custom_normal")
     if layer is None or len(layer.data) != len(vectors):
         raise ValueError("Blender did not create a custom_normal layer of %d codes for mesh %s"
                          % (len(vectors), mesh.name))
     if has_codes:
-        entries = layout.loops(_flatten_face_rows(spec["values"], face_items, "custom_normal"),
+        entries = layout.loops(_flatten_face_rows(spec["values"], face_items, "custom_normal", None),
                                "custom_normal values of mesh %s" % mesh.name)
         for index, entry in enumerate(entries):
             pair = _custom_normal_pair(entry)
@@ -3426,10 +3475,11 @@ def _apply_native_colors(mesh, attributes, names, vertex_items, face_items, layo
         if domain == "point":
             layer = mesh.color_attributes.new(name=name, type=data_type, domain="POINT")
             for index, vertex in enumerate(vertex_items):
-                layer.data[index].color = _required(values, "v%d" % vertex["id"], name)
+                layer.data[index].color = values.get("v%d" % vertex["id"], _attribute_default(data_type))
         elif domain == "corner":
             layer = mesh.color_attributes.new(name=name, type=data_type, domain="CORNER")
-            colors = layout.loops(_flatten_face_rows(values, face_items, "color layer %s" % name),
+            colors = layout.loops(_flatten_face_rows(values, face_items, "color layer %s" % name,
+                                                     _attribute_default(data_type)),
                                   "color layer %s" % name)
             for index, color in enumerate(colors):
                 layer.data[index].color = color
@@ -3437,7 +3487,8 @@ def _apply_native_colors(mesh, attributes, names, vertex_items, face_items, layo
             raise ValueError("color layer %s has unsupported domain %s" % (name, domain))
 
 
-def _apply_native_attributes(mesh, attributes, names, vertex_items, edge_items, face_items, edge_of, layout):
+def _apply_native_attributes(mesh, attributes, names, vertex_items, edge_items, face_items, edge_of, layout,
+                             uv_layer_names):
     color_keys = {_storage_key(names, name) for name in attributes.get("color_layers", {}).get("layers", [])}
     for key, spec in attributes.items():
         if key in color_keys:
@@ -3446,31 +3497,45 @@ def _apply_native_attributes(mesh, attributes, names, vertex_items, edge_items, 
         if kind is None:
             continue
         name = _user_name(names, key)
+        if name in uv_layer_names:
+            continue
         domain, data_type = kind
         attribute = mesh.attributes.new(name=name, type=data_type, domain=domain)
         values = spec.get("values", {})
+        default = _attribute_default(data_type)
         if domain == "POINT":
             for index, vertex in enumerate(vertex_items):
                 _set_attribute_item(attribute.data[index], data_type,
-                                    _required(values, "v%d" % vertex["id"], name))
+                                    values.get("v%d" % vertex["id"], default))
         elif domain == "EDGE":
             for index, edge in enumerate(edge_items):
-                value = _required(values, "e%d" % edge["id"], name)
+                value = values.get("e%d" % edge["id"], default)
                 target = edge_of[index]
                 if target is None:
                     raise ValueError("mesh attribute %s has no Blender edge for e%d" % (name, edge["id"]))
                 _set_attribute_item(attribute.data[target], data_type, value)
         elif domain == "FACE":
-            per_face = [_required(values, "f%d" % face["id"], name) for face in face_items]
+            per_face = [values.get("f%d" % face["id"], default) for face in face_items]
             for index, value in enumerate(layout.polygons(per_face)):
                 _set_attribute_item(attribute.data[index], data_type, value)
         else:
-            per_corner = _flatten_face_rows(values, face_items, "mesh attribute %s" % name)
+            per_corner = _flatten_face_rows(values, face_items, "mesh attribute %s" % name, default)
             for index, value in enumerate(layout.loops(per_corner, "mesh attribute %s" % name)):
                 _set_attribute_item(attribute.data[index], data_type, value)
 
 
-def _apply_blender_attributes(mesh, attributes, layer_names, layout):
+def _blender_edge_values(name, values, edge_of):
+    """Stored-order EDGE values re-indexed to Blender's edge order, as `_apply_native_attributes` maps them."""
+    per_edge = [None] * len(values)
+    for index, value in enumerate(values):
+        target = edge_of[index]
+        if target is None:
+            raise ValueError("blender attribute %s has no Blender edge for element %d" % (name, index))
+        per_edge[target] = value
+    return per_edge
+
+
+def _apply_blender_attributes(mesh, attributes, layer_names, layout, edge_of):
     for source in attributes.get("blender_attributes", []):
         name = source.get("name")
         if not name or name in MESH_RESTORE_SKIP:
@@ -3484,11 +3549,14 @@ def _apply_blender_attributes(mesh, attributes, layer_names, layout):
         if len(values) != len(attribute.data):
             raise ValueError("blender attribute %s has %d values for %d elements"
                              % (name, len(values), len(attribute.data)))
-        # Retained raw values are in stored order: FACE and CORNER entries take the same mapping as the native ones.
+        # Retained raw values are in stored order: FACE and CORNER entries take the same mapping as the native ones,
+        # and EDGE entries land on the Blender edges that `_apply_native_attributes` maps them to.
         if source.get("domain") == "CORNER":
             values = layout.loops(values, "blender attribute %s" % name)
         elif source.get("domain") == "FACE":
             values = layout.polygons(values)
+        elif source.get("domain") == "EDGE":
+            values = _blender_edge_values(name, values, edge_of)
         for index, value in enumerate(values):
             if value is None:
                 raise ValueError("blender attribute %s has no value for element %d" % (name, index))
@@ -3496,21 +3564,21 @@ def _apply_blender_attributes(mesh, attributes, layer_names, layout):
 
 
 def _apply_color_designation(mesh, attributes):
-    """Active and render color layers, set after every color layer (native or Blender-only) exists.
-
-    Creating a color layer can move Blender's designation, so the registry names are applied last.
-    """
+    """Set Blender color designations after native and Blender-only attributes exist."""
     store = attributes.get("color_layers") or {}
+    metadata = attributes.get("blender_metadata") or {}
     layer_names = [layer.name for layer in mesh.color_attributes]
-    for field, key in (("active_color_index", "active"), ("render_color_index", "render")):
-        reference = store.get(key)
+    for field, key, metadata_key in (
+        ("active_color_index", "active", "color_active_blender"),
+        ("render_color_index", "render", "color_render_blender"),
+    ):
+        reference = metadata.get(metadata_key, store.get(key))
         if reference is None:
             continue
         if reference not in layer_names:
             raise ValueError("color layer %s is designated %s but mesh %s has no such layer"
                              % (reference, key, mesh.name))
         setattr(mesh.color_attributes, field, layer_names.index(reference))
-
 def mesh_create(name, raw, block_id):
     mesh = bpy.data.meshes.new(name)
     attributes = raw.get("attributes", {})
@@ -3524,7 +3592,11 @@ def mesh_create(name, raw, block_id):
     spec = _custom_normal_spec(attributes)
     corner_order = None
     if spec is not None and spec.get("corner_order") is not None:
-        corner_order = _flatten_face_rows(spec["corner_order"], face_items, "custom_normal corner_order")
+        rows = spec["corner_order"]
+        missing = [face["id"] for face in face_items if "f%d" % face["id"] not in rows]
+        if missing:
+            raise ValueError("custom_normal corner_order has no row for faces %s" % missing)
+        corner_order = _flatten_face_rows(rows, face_items, "custom_normal corner_order", None)
     # Polygons and loops are built in the stored corner basis; `layout` is the only native->Blender mapping.
     layout = _loop_layout(face_items, corner_order)
     faces = [[vertex_indexes[value] for value in polygon] for polygon in layout.polygon_vertices]
@@ -3564,8 +3636,9 @@ def mesh_create(name, raw, block_id):
         mesh.uv_layers.active_render_index = uv_render
     _apply_native_colors(mesh, attributes, names, vertex_items, face_items, layout)
     _apply_native_crease(mesh, attributes, edge_items, edge_of)
-    _apply_native_attributes(mesh, attributes, names, vertex_items, edge_items, face_items, edge_of, layout)
-    _apply_blender_attributes(mesh, attributes, layer_names, layout)
+    _apply_native_attributes(mesh, attributes, names, vertex_items, edge_items, face_items, edge_of, layout,
+                             layer_names)
+    _apply_blender_attributes(mesh, attributes, layer_names, layout, edge_of)
     _apply_color_designation(mesh, attributes)
     metadata = attributes.get("blender_metadata", {})
     set_props(mesh, metadata.get("custom_properties", {}))
@@ -3741,17 +3814,86 @@ def _restore_node_tree(tree, raw, id_lookup, owner):
     return socket_map
 
 
+def _encode_gltf_normal_map_handedness(nodes, links, normal_name):
+    # glTF/Potter tangent V points down; Blender's Normal Map node uses V-up, so G becomes 1-G.
+    color_links = [link for link in links
+                   if link.get("to_node") == normal_name
+                   and link.get("to_socket") == "Color"]
+    if len(color_links) != 1:
+        raise ValueError("imported glTF Normal Map must have one Color input")
+    source = color_links[0]
+    links.remove(source)
+    used_names = {node["name"] for node in nodes}
+
+    def unique_name(base):
+        name = base
+        index = 1
+        while name in used_names:
+            name = "%s_%d" % (base, index)
+            index += 1
+        used_names.add(name)
+        return name
+
+    multiply_name = unique_name("Potter GLTF Normal Green Multiply")
+    add_name = unique_name("Potter GLTF Normal Green Add")
+    normal_node = next(node for node in nodes if node["name"] == normal_name)
+    location = normal_node.get("location", [0.0, 0.0])
+    try:
+        x, y = float(location[0]), float(location[1])
+    except (IndexError, TypeError, ValueError):
+        x, y = 0.0, 0.0
+    nodes.extend([
+        {"name": multiply_name, "potter_id": None, "type": "ShaderNodeVectorMath",
+         "location": [x - 180.0, y], "properties": {"operation": "MULTIPLY"},
+         "custom_properties": {},
+         "inputs": [{"identifier": "Vector_001", "name": "Vector_001",
+                     "default": [1.0, -1.0, 1.0]}]},
+        {"name": add_name, "potter_id": None, "type": "ShaderNodeVectorMath",
+         "location": [x - 90.0, y], "properties": {"operation": "ADD"},
+         "custom_properties": {},
+         "inputs": [{"identifier": "Vector_001", "name": "Vector_001",
+                     "default": [0.0, 1.0, 0.0]}]},
+    ])
+    links.extend([
+        {"from_node": source["from_node"], "from_socket": source["from_socket"],
+         "to_node": multiply_name, "to_socket": "Vector"},
+        {"from_node": multiply_name, "from_socket": "Vector",
+         "to_node": add_name, "to_socket": "Vector"},
+        {"from_node": add_name, "from_socket": "Vector",
+         "to_node": normal_name, "to_socket": "Color"},
+    ])
+
+
 def _model_group_tree(group):
     tree_type = {"geometry": "GeometryNodeTree", "shader": "ShaderNodeTree",
                  "compositor": "CompositorNodeTree"}.get(group.get("kind"), "")
-    node_names = {identifier: node.get("name", identifier)
-                  for identifier, node in group.get("nodes", {}).items()}
-    nodes = []
+    node_names = {}
+    used_node_names = set()
     for identifier, node in group.get("nodes", {}).items():
+        name = node.get("name") or identifier
+        if name in used_node_names:
+            name = identifier
+            suffix = 1
+            while name in used_node_names:
+                name = "%s_%d" % (identifier, suffix)
+                suffix += 1
+        used_node_names.add(name)
+        node_names[identifier] = name
+    nodes = []
+    imported_normal_nodes = []
+    for identifier, node in group.get("nodes", {}).items():
+        display_name = node.get("name") or identifier
         properties = dict(node.get("properties", {}))
         custom_properties = properties.pop("_blender_custom_properties", {})
+        imported_normal_map = properties.pop("potter_gltf_imported_normal_map", False) is True
+        if imported_normal_map:
+            if node.get("type") != "ShaderNodeNormalMap":
+                raise ValueError("glTF normal-map metadata is on a non-Normal Map node")
+            imported_normal_nodes.append(node_names[identifier])
         nodes.append({
             "name": node_names[identifier],
+            "label": ("%s (%s)" % (display_name, identifier)
+                      if node_names[identifier] != display_name else node.get("label", "")),
             "potter_id": identifier,
             "type": blender_node_type(node.get("type", "Node"), tree_type),
             "location": node.get("location", [0.0, 0.0]),
@@ -3773,6 +3915,8 @@ def _model_group_tree(group):
             "to_node": to_node,
             "to_socket": link.get("to_socket", ""),
         })
+    for normal_name in imported_normal_nodes:
+        _encode_gltf_normal_map_handedness(nodes, links, normal_name)
     return {
         "name": group.get("name"),
         "type": tree_type,
@@ -3886,7 +4030,7 @@ def _load_blend_libraries(doc, target):
                         "camera": ("cameras", "Camera"),
                         "light": ("lights", "Light"),
                         "armature": ("armatures", "Armature"),
-                        "grease_pencil": ("grease_pencils_v3", "GreasePencil"),
+                        "grease_pencil": ("grease_pencils", "GreasePencil"),
                         "curve": ("curves", "Curve"),
                         "surface": ("curves", "Curve"),
                         "text": ("curves", "Curve"),
@@ -4138,10 +4282,29 @@ def _restore_grease_pencil(data, raw, materials):
                 material = materials.get(stroke.get("material"))
                 if stroke.get("material") is not None and material is None:
                     raise ValueError("Grease Pencil stroke references missing material %s" % stroke["material"])
-                if material is not None and material.name not in [slot.name for slot in data.materials]:
+                fill = stroke.get("fill")
+                if isinstance(fill, (list, tuple)):
+                    if len(fill) != 4:
+                        raise ValueError("Grease Pencil fill color needs four components")
+                    if material is not None:
+                        style = getattr(material, "grease_pencil", None)
+                        if style is None:
+                            bpy.data.materials.create_gpencil_data(material)
+                            style = getattr(material, "grease_pencil", None)
+                        if style is None or not hasattr(style, "fill_color"):
+                            raise ValueError("Grease Pencil material cannot store a fill color")
+                        style.fill_color = fill
+                        style.show_fill = True
+                    fill_enabled = True
+                else:
+                    fill_enabled = bool(fill)
+                material_index = next(
+                    (index for index, slot in enumerate(data.materials) if slot == material), None)
+                if material is not None and material_index is None:
                     data.materials.append(material)
-                material_index = next((index for index, slot in enumerate(data.materials)
-                                       if material is not None and slot == material), 0)
+                    material_index = len(data.materials) - 1
+                if material_index is None:
+                    material_index = 0
                 start, end = offsets[stroke_index], offsets[stroke_index + 1]
                 for local_index, point in enumerate(stroke.get("points", [])):
                     index = start + local_index
@@ -4156,7 +4319,7 @@ def _restore_grease_pencil(data, raw, materials):
                         else:
                             raise ValueError("Grease Pencil %s attribute is not writable" % name)
                 for name, value in (("cyclic", bool(stroke.get("cyclic", False))),
-                                    ("fill", bool(stroke.get("fill", False))),
+                                    ("fill", fill_enabled),
                                     ("material_index", int(material_index))):
                     item = attrs[name].data[stroke_index]
                     if not hasattr(item, "value"):
@@ -4790,6 +4953,12 @@ def _resource_path(doc, reference):
     path = path[7:] if path.startswith("file://") else path
     return os.path.abspath(path) if not path.startswith("//") else bpy.path.abspath(path)
 
+def _export_sidecar_path(doc, reference):
+    # The sidecar copy the export wrote for a linked image's source: the export_path of the resource `_resource_path` finds.
+    resource = _resource_record_for_reference(doc, reference)
+    path = resource.get("export_path") if resource else None
+    return os.path.abspath(path) if path else None
+
 
 def _relative_blend_path(path, target):
     relative = os.path.relpath(os.path.realpath(path),
@@ -5005,7 +5174,7 @@ def _cache_file_from_alembic(filepath, identity):
         return existing
     collection_names = (
         "objects", "collections", "actions", "armatures", "cameras", "curves",
-        "grease_pencils_v3", "lights", "materials", "meshes", "node_groups",
+        "grease_pencils", "lights", "materials", "meshes", "node_groups",
         "volumes", "worlds", "cache_files",
     )
     before = {
@@ -5637,7 +5806,240 @@ def _set_principled_values(material, item):
         transmission_socket.default_value = item.get("transmission", 0.0)
     ior_socket = shader.inputs.get("IOR")
     if ior_socket is not None:
-        ior_socket.default_value = item.get("ior", 1.45)
+        ior_socket.default_value = item.get("ior", 1.5)
+
+
+def _material_output(tree):
+    outputs = [node for node in tree.nodes if node.type == "OUTPUT_MATERIAL"]
+    if not outputs:
+        return None
+    return next((node for node in outputs if node.is_active_output), outputs[0])
+
+
+def _field_source(output, socket_name, node_type):
+    """The node of `node_type` that feeds `output`'s `socket_name`, or None."""
+    socket = output.inputs.get(socket_name)
+    if socket is None or not socket.is_linked:
+        return None
+    source = socket.links[0].from_node
+    return source if source.type == node_type else None
+
+
+def _unlinked_float(node, socket_name, fallback):
+    socket = node.inputs.get(socket_name)
+    if socket is None or socket.is_linked:
+        return fallback
+    return float(socket.default_value)
+
+
+def _material_field_values(material):
+    """Potter's displacement and volume fields, read from a Blender material and its output's nodes.
+
+    A field has no node when it is unconnected or absent; it then reads as the Potter default.
+    """
+    values = {
+        "displacement_method": {"DISPLACEMENT": "displacement", "BOTH": "both"}.get(
+            material.displacement_method, "bump"),
+        "displacement_scale": 1.0,
+        "displacement_midlevel": 0.5,
+        "volume_density": 0.0,
+        "volume_color": [0.5, 0.5, 0.5],
+        "volume_anisotropy": 0.0,
+    }
+    output = _material_output(material.node_tree) if material.node_tree is not None else None
+    if output is None:
+        return values
+    displacement = _field_source(output, "Displacement", "DISPLACEMENT")
+    if displacement is not None:
+        values["displacement_scale"] = _unlinked_float(displacement, "Scale", 1.0)
+        values["displacement_midlevel"] = _unlinked_float(displacement, "Midlevel", 0.5)
+    volume = _field_source(output, "Volume", "PRINCIPLED_VOLUME")
+    if volume is not None:
+        # Blender's Principled Volume Density defaults to 1.0 when the node stores none.
+        values["volume_density"] = _unlinked_float(volume, "Density", 1.0)
+        values["volume_anisotropy"] = _unlinked_float(volume, "Anisotropy", 0.0)
+        color = volume.inputs.get("Color")
+        if color is not None and not color.is_linked:
+            values["volume_color"] = [float(channel) for channel in plain(color.default_value)][:3]
+    return values
+
+
+def _owned_field_node(tree, output, socket_name, node_type, bl_idname, material, needed):
+    """The node that carries `socket_name` on a Potter-owned graph; created only when `needed`."""
+    socket = output.inputs[socket_name]
+    if socket.is_linked:
+        node = _field_source(output, socket_name, node_type)
+        if node is None:
+            raise ValueError("material %s feeds %s from a node that is not %s" %
+                             (material.name_full, socket_name, bl_idname))
+        return node
+    if not needed:
+        return None
+    node = tree.nodes.new(bl_idname)
+    node.location = (output.location[0] - 300.0, output.location[1] - 200.0)
+    tree.links.new(node.outputs[socket_name], socket)
+    return node
+
+
+# Inputs and properties that Potter's material fields set. A generated node must keep Blender's default for
+# every other input and property, or the graph holds an authored edit and stays a graph.
+_FIELD_MODELED_INPUTS = {
+    "ShaderNodeBsdfPrincipled": frozenset({
+        "Base Color", "Metallic", "Roughness", "Emission Color", "Emission", "Emission Strength",
+        "Transmission Weight", "Transmission", "IOR", "Alpha",
+    }),
+    "ShaderNodeDisplacement": frozenset({"Height", "Midlevel", "Scale"}),
+    "ShaderNodeVolumePrincipled": frozenset({"Density", "Color", "Anisotropy"}),
+    "ShaderNodeOutputMaterial": frozenset(),
+}
+_FIELD_RENDER_PROPERTIES = {
+    "ShaderNodeBsdfPrincipled": ("distribution", "subsurface_method"),
+    "ShaderNodeDisplacement": ("space",),
+    "ShaderNodeVolumePrincipled": (),
+    "ShaderNodeOutputMaterial": ("target",),
+}
+
+
+def _render_properties(bl_idname):
+    """Node properties that affect rendering, excluding layout and selection state."""
+    return ("mute",) + _FIELD_RENDER_PROPERTIES[bl_idname]
+
+
+def _baseline_snapshot(node):
+    """Defaults of unmodeled input sockets and render properties."""
+    modeled = _FIELD_MODELED_INPUTS[node.bl_idname]
+    sockets = {}
+    for socket in node.inputs:
+        if socket.name in modeled or not hasattr(socket, "default_value"):
+            continue
+        try:
+            value = plain(socket.default_value)
+        except Exception:
+            value = None
+        sockets[socket.identifier] = value
+    properties = {
+        name: plain(getattr(node, name))
+        for name in _render_properties(node.bl_idname)
+    }
+    return sockets, properties
+
+
+def _fresh_node(bl_idname):
+    """A default node of `bl_idname` in a disposable shader tree; the source tree is never touched.
+
+    The caller removes the returned tree.
+    """
+    scratch = bpy.data.node_groups.new("potter.baseline", "ShaderNodeTree")
+    return scratch, scratch.nodes.new(bl_idname)
+
+
+def _matches_blender_defaults(node):
+    """Whether `node` keeps Blender's default for every unmodeled input and render property Potter does not model."""
+    if node.bl_idname not in _FIELD_MODELED_INPUTS:
+        return False
+    # The generated output must stay the active output, which the restore leaves active.
+    if node.bl_idname == "ShaderNodeOutputMaterial" and not node.is_active_output:
+        return False
+    scratch, fresh = _fresh_node(node.bl_idname)
+    try:
+        return _baseline_snapshot(node) == _baseline_snapshot(fresh)
+    finally:
+        bpy.data.node_groups.remove(scratch)
+
+
+def _adopt_blender_defaults(node):
+    """Sets the unmodeled unlinked inputs and the render properties of a Potter-owned node to Blender's defaults."""
+    modeled = _FIELD_MODELED_INPUTS[node.bl_idname]
+    scratch, fresh = _fresh_node(node.bl_idname)
+    try:
+        for socket in node.inputs:
+            twin = fresh.inputs.get(socket.identifier)
+            if (socket.name in modeled or socket.is_linked or twin is None
+                    or not hasattr(socket, "default_value") or not hasattr(twin, "default_value")):
+                continue
+            socket.default_value = plain(twin.default_value)
+        for name in _render_properties(node.bl_idname):
+            setattr(node, name, getattr(fresh, name))
+    finally:
+        bpy.data.node_groups.remove(scratch)
+
+
+def _field_graph_unchanged(tree):
+    """Whether a generated field graph holds only Potter's modeled edits, so it collapses into fields on import.
+
+    Every node must keep Blender's defaults for what Potter does not model. A Displacement node's Height must
+    be unlinked and equal its Midlevel, the value the restore writes.
+    """
+    for node in tree.nodes:
+        if not _matches_blender_defaults(node):
+            return False
+        if node.bl_idname == "ShaderNodeDisplacement":
+            height = node.inputs["Height"]
+            if height.is_linked or float(height.default_value) != float(node.inputs["Midlevel"].default_value):
+                return False
+    return True
+
+
+def _field_graph_verdict(tree):
+    """`field_graph_unchanged` of a material's tree: None when the tree holds no generated field node."""
+    if tree is None or not any(node.get("potter_material_field") is not None for node in tree.nodes):
+        return None
+    return _field_graph_unchanged(tree)
+
+
+_GENERATED_FIELD_TREE_TYPES = ("BSDF_PRINCIPLED", "OUTPUT_MATERIAL", "DISPLACEMENT", "PRINCIPLED_VOLUME")
+
+
+def _mark_generated_field_graph(tree):
+    """Marks a tree that holds only Potter's default Principled BSDF, Material Output, and field nodes.
+
+    Import collapses a marked tree into Potter's fields. A tree with any other node is left unmarked and
+    kept as a graph.
+    """
+    if not all(node.type in _GENERATED_FIELD_TREE_TYPES for node in tree.nodes):
+        return
+    principled = next((node for node in tree.nodes if node.type == "BSDF_PRINCIPLED"), None)
+    if principled is not None:
+        principled["potter_simple_material"] = True
+
+
+def _restore_material_field_nodes(material, item):
+    """Writes the displacement and volume fields of a Potter-owned graph as native nodes.
+
+    Only a non-default field adds a node. A Displacement node's Height equals its Midlevel, so
+    (Height - Midlevel) * Scale is zero until a height is connected and the material renders as before.
+    A Principled Volume with zero density adds no volume. Custom graphs never reach this function.
+    """
+    output = _material_output(material.node_tree)
+    if output is None:
+        raise ValueError("material %s has no Material Output" % material.name_full)
+    midlevel = float(item.get("displacement_midlevel", 0.5))
+    scale = float(item.get("displacement_scale", 1.0))
+    displacement = _owned_field_node(material.node_tree, output, "Displacement", "DISPLACEMENT",
+                                     "ShaderNodeDisplacement", material,
+                                     needed=scale != 1.0 or midlevel != 0.5)
+    if displacement is not None:
+        displacement["potter_material_field"] = "displacement"
+        displacement.inputs["Height"].default_value = midlevel
+        displacement.inputs["Midlevel"].default_value = midlevel
+        displacement.inputs["Scale"].default_value = scale
+    density = float(item.get("volume_density", 0.0))
+    color = [float(channel) for channel in item.get("volume_color", [0.5, 0.5, 0.5])]
+    anisotropy = float(item.get("volume_anisotropy", 0.0))
+    volume = _owned_field_node(material.node_tree, output, "Volume", "PRINCIPLED_VOLUME",
+                               "ShaderNodeVolumePrincipled", material,
+                               needed=density != 0.0 or color != [0.5, 0.5, 0.5] or anisotropy != 0.0)
+    if volume is not None:
+        volume["potter_material_field"] = "volume"
+        volume.inputs["Density"].default_value = density
+        volume.inputs["Color"].default_value = (color[0], color[1], color[2], 1.0)
+        volume.inputs["Anisotropy"].default_value = anisotropy
+    if displacement is not None or volume is not None:
+        principled = next((node for node in material.node_tree.nodes
+                           if node.type == "BSDF_PRINCIPLED"), None)
+        if principled is not None:
+            _adopt_blender_defaults(principled)
+        _mark_generated_field_graph(material.node_tree)
 
 
 def _set_alpha_mode(material, item):
@@ -5659,6 +6061,93 @@ def _text_from_string(name, body):
     return text
 
 
+def _restore_data_materials(data_raw, data_blocks, material_map, linked_data_blocks):
+    for data_id, item in data_raw.items():
+        if data_id in linked_data_blocks:
+            continue
+        data = data_blocks.get(data_id)
+        if data is None:
+            continue
+        # Clearing the slots resets every polygon's material_index to 0, so the indices are kept and restored.
+        indices = ([polygon.material_index for polygon in data.polygons]
+                   if hasattr(data, "polygons") else None)
+        data.materials.clear()
+        for material_id in item.get("materials", []):
+            material = material_map.get(material_id) if material_id is not None else None
+            if material_id is not None and material is None:
+                raise ValueError("data block %s references missing material %s"
+                                 % (data_id, material_id))
+            data.materials.append(material)
+        # Zero is Blender's default, and assigning it creates a `material_index` attribute. Only the
+        # non-zero indices are written, so a mesh whose faces all use slot 0 keeps no such attribute.
+        if indices is not None:
+            for polygon, index in zip(data.polygons, indices):
+                if index:
+                    polygon.material_index = index
+
+
+def _restore_object_material_slots(obj, node, material_map, scene):
+    if obj.type not in ("MESH", "CURVE", "SURFACE", "FONT", "GREASEPENCIL", "VOLUME"):
+        return
+    object_materials = node.get("materials", []) or []
+    slot_count = node["material_slot_count"]
+    if len(obj.material_slots) < slot_count:
+        view_layer = scene.view_layers[0]
+        with bpy.context.temp_override(
+                scene=scene, view_layer=view_layer, object=obj, active_object=obj,
+                selected_objects=[obj], selected_editable_objects=[obj]):
+            for _ in range(slot_count - len(obj.material_slots)):
+                if "FINISHED" not in bpy.ops.object.material_slot_add():
+                    raise ValueError("Blender did not create material slots for %s" % obj.name)
+    links = node["material_links"]
+    for index in range(slot_count):
+        link = links[index]
+        slot = obj.material_slots[index]
+        if link in ("object", "OBJECT"):
+            slot.link = "OBJECT"
+            material_id = object_materials[index] if index < len(object_materials) else None
+            material = material_map.get(material_id) if material_id is not None else None
+            if material_id is not None and material is None:
+                raise ValueError("object %s references missing material %s"
+                                 % (obj.name, material_id))
+            slot.material = material
+        elif link in ("data", "DATA"):
+            slot.link = "DATA"
+        else:
+            raise ValueError("object %s has unknown material slot link %r" % (obj.name, link))
+
+
+def _pack_image(image, channels):
+    """Packs a float image's pixels into the .blend from the bytes of Blender's file writer.
+
+    Blender 5.2.2's packed-buffer path (`image.pack()` without data) leaves the OpenEXR line-offset table
+    empty, so the file writer produces the bytes. The file writer converts the buffer from its colour space
+    to the file colour space (blenkernel image_save.cc, IMB_colormanagement_imbuf_for_write), and that target
+    is sRGB here, so the buffer is tagged sRGB for the save: the packed values are the pixel values. Changing
+    the colour space drops the buffer, so the pixels are written again; the declared colour space is restored.
+    """
+    declared = image.colorspace_settings.name
+    descriptor, path = tempfile.mkstemp(suffix=".exr")
+    os.close(descriptor)
+    previous_path = image.filepath_raw
+    previous_format = image.file_format
+    try:
+        image.colorspace_settings.name = "sRGB"
+        image.pixels.foreach_set(channels)
+        image.update()
+        image.filepath_raw = path
+        image.file_format = "OPEN_EXR"
+        image.save()
+        with open(path, "rb") as handle:
+            data = handle.read()
+        image.pack(data=data, data_len=len(data))
+    finally:
+        image.filepath_raw = previous_path
+        image.file_format = previous_format
+        image.colorspace_settings.name = declared
+        os.remove(path)
+
+
 def export_doc(doc, target, pack, scene_hash, context):
     CACHE_FILES_BY_IDENTITY.clear()
     DEFERRED_ID_ASSIGNMENTS.clear()
@@ -5677,8 +6166,8 @@ def export_doc(doc, target, pack, scene_hash, context):
         if collection.users == 0:
             bpy.data.collections.remove(collection)
     for collection_name in (
-        "actions", "armatures", "cameras", "curves", "grease_pencils_v3",
-        "images", "lights", "materials", "meshes", "node_groups", "textures", "volumes",
+        "actions", "armatures", "cameras", "curves", "grease_pencils",
+        "images", "lights", "materials", "meshes", "node_groups", "textures", "volumes", "worlds",
     ):
         collection = getattr(bpy.data, collection_name, None)
         if collection is None:
@@ -5806,24 +6295,44 @@ def export_doc(doc, target, pack, scene_hash, context):
         scene["potter.view_layer_ids_json"] = json.dumps(view_layer_ids, sort_keys=True)
     image_map = {}
     for image_id, item in doc.get("images", {}).items():
-        image = bpy.data.images.new(item["name"], width=int(item["width"]),
-                                    height=int(item["height"]), alpha=True)
+        png_bytes = item.get("png_bytes")
+        sidecar = _export_sidecar_path(doc, item.get("source_path"))
         colorspace = {
             "srgb": "sRGB",
             "linear": "Linear Rec.709",
             "non_color": "Non-Color",
         }.get(item.get("colorspace"))
+        if sidecar is None and png_bytes is not None:
+            # An 8-bit PNG loads from its own file bytes, as the fixture's texture does: source FILE, packed PNG.
+            # The temp file is packed while it exists: Blender reads the source path when packing.
+            descriptor, png_path = tempfile.mkstemp(
+                suffix=".png", dir=os.path.dirname(os.path.abspath(target)))
+            try:
+                with os.fdopen(descriptor, "wb") as handle:
+                    handle.write(bytes(png_bytes))
+                image = bpy.data.images.load(png_path, check_existing=False)
+                image.pack()
+            finally:
+                os.remove(png_path)
+            image.name = item["name"]
+        else:
+            # Float buffers pack as OpenEXR and byte buffers as PNG (Blender image.cc), so pixels stay unquantised.
+            image = bpy.data.images.new(item["name"], width=int(item["width"]),
+                                        height=int(item["height"]), alpha=True, float_buffer=True)
+        if sidecar is not None:
+            # A linked image is a FILE image on the sidecar copy the export wrote, so the .blend carries its pixels.
+            image.source = "FILE"
+            image.filepath = _relative_blend_path(sidecar, target)
+            image.reload()
         if colorspace is not None:
             image.colorspace_settings.name = colorspace
         pixels = item.get("pixels")
-        if pixels is not None:
-            image.pixels.foreach_set(
-                [channel for pixel in pixels for channel in pixel])
-            image.update()
-        if item.get("source") == "packed":
+        if sidecar is None and png_bytes is None and pixels is not None:
+            _pack_image(image, [channel for pixel in pixels for channel in pixel])
+        if item.get("source") == "packed" and image.packed_file is None:
             image.pack()
         set_id(image, image_id)
-        image_metadata = {key: value for key, value in item.items() if key != "pixels"}
+        image_metadata = {key: value for key, value in item.items() if key not in ("pixels", "png_bytes")}
         image["potter.image_json"] = json.dumps(image_metadata, sort_keys=True)
         image_map[image_id] = image
         image.use_fake_user = True
@@ -5923,9 +6432,7 @@ def export_doc(doc, target, pack, scene_hash, context):
             armature_map[data_id] = armature
         elif item.get("type") in ("grease_pencil", "grease-pencil", "grease_pencils_v3"):
             source = compatibility_block(doc, "grease_pencil", "GreasePencil", data_id)
-            collection = getattr(bpy.data, "grease_pencils_v3", None)
-            if collection is None:
-                raise ValueError("Blender does not support Grease Pencil v3 data")
+            collection = bpy.data.grease_pencils
             grease = collection.new(compatibility_name(doc, "GreasePencil", data_id,
                                                         source.get("name", data_id)))
             set_id(grease, data_id)
@@ -6002,6 +6509,7 @@ def export_doc(doc, target, pack, scene_hash, context):
         set_id(mat.node_tree, item.get("node_tree"))
         _set_principled_values(mat, item)
         mat.use_backface_culling = not bool(item.get("double_sided", False))
+        mat.displacement_method = "DISPLACEMENT" if item.get("displacement_method") == "displacement" else "BUMP"
         set_id(mat, material_id)
         source = compatibility_block(doc, "materials", "Material", material_id)
         set_props(mat, source.get("custom_properties", {}))
@@ -6009,9 +6517,20 @@ def export_doc(doc, target, pack, scene_hash, context):
         if source.get("fake_user"):
             mat.use_fake_user = True
         material_map[material_id] = mat
+    data_blocks_by_id = {
+        **mesh_map, **curve_map, **grease_pencil_map, **volume_map
+    }
+    _restore_data_materials(data_raw, data_blocks_by_id, material_map, linked_data_blocks)
     materials_by_name = {material.name_full: material for material in material_map.values()}
     for data_id, source in grease_pencil_sources.items():
-        _restore_grease_pencil(grease_pencil_map[data_id], source, materials_by_name)
+        native = data_raw.get(data_id, {}).get("grease_pencil")
+        if isinstance(native, dict):
+            source = dict(source)
+            source["layers"] = native.get("layers", [])
+            source_materials = material_map
+        else:
+            source_materials = materials_by_name
+        _restore_grease_pencil(grease_pencil_map[data_id], source, source_materials)
     group_map, group_sources = _create_geometry_groups(
         doc, linked_maps["node_groups"])
     shape_key_meshes = set()
@@ -6167,11 +6686,7 @@ def export_doc(doc, target, pack, scene_hash, context):
         set_rna(obj, visibility_rna)
         if item.get("tags"):
             obj["potter.tags"] = item["tags"]
-        for material_id in item.get("materials", []):
-            material = material_map.get(material_id)
-            if material and obj.type in ("MESH", "CURVE", "SURFACE", "FONT", "GREASEPENCIL"):
-                if obj.data.materials.get(material.name_full) is None:
-                    obj.data.materials.append(material)
+
         if obj.type == "MESH":
             groups = _vertex_groups_from_model(doc, data_id)
             if not groups:
@@ -6238,6 +6753,8 @@ def export_doc(doc, target, pack, scene_hash, context):
                     or any(node.get("properties", {}).get("potter_simple_material") is True
                            for node in tree_source.get("nodes", []))):
                 _set_principled_values(material, item)
+        if item.get("owns_shader_graph") is True:
+            _restore_material_field_nodes(material, item)
     for world_id, item in doc.get("worlds", {}).items():
         world = world_map.get(world_id)
         if world is None or world.node_tree is None:
@@ -6269,6 +6786,9 @@ def export_doc(doc, target, pack, scene_hash, context):
         audio_codec = getattr(getattr(scene.render, "ffmpeg", None), "audio_codec", None)
         if audio_codec is not None:
             scene.render.ffmpeg.audio_codec = blender_audio_codec(render.get("audio_codec", "wav"))
+        for layer in scene.view_layers:
+            if hasattr(layer, CRYPTOMATTE_ACCURATE_PROP):
+                setattr(layer, CRYPTOMATTE_ACCURATE_PROP, bool(render.get("cryptomatte_accurate", False)))
         color = item.get("color_management", {})
         scene.display_settings.display_device = color.get("display_device", "sRGB")
         view = scene.view_settings
@@ -6396,6 +6916,10 @@ def export_doc(doc, target, pack, scene_hash, context):
             collection = collection_map[active_scene["root_collection"]]
             if obj.name not in collection.objects:
                 collection.objects.link(obj)
+        if not is_linked:
+            scene = next((candidate for candidate in scene_map.values()
+                          if obj.name_full in candidate.objects), bpy.context.scene)
+            _restore_object_material_slots(obj, item, material_map, scene)
         if root_parent_inverse is not None and root_parent_inverse != Matrix.Identity(4):
             combined = root_parent_inverse @ obj.matrix_basis.copy()
             # Without a parent Blender ignores matrix_parent_inverse. Bake its

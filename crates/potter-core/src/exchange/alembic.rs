@@ -79,6 +79,10 @@ pub(crate) fn export(
         ));
     }
     for (id, node) in &doc.nodes {
+        let data_block = node
+            .data
+            .as_ref()
+            .and_then(|data_id| doc.data_blocks.get(data_id));
         if node
             .parent
             .as_ref()
@@ -110,7 +114,10 @@ pub(crate) fn export(
                 format!("Alembic export does not represent visibility or selectability on `{id}`"),
             ));
         }
-        if !allow_lossy && !node.materials.is_empty() {
+        if !allow_lossy
+            && (0..snapshot.slot_count(id, node, data_block))
+                .any(|slot| snapshot.slot_material(id, node, data_block, slot).is_some())
+        {
             return Err(unsupported(
                 "material.binding",
                 format!("Alembic export does not represent material bindings on `{id}`"),
@@ -224,7 +231,7 @@ pub(crate) fn export(
                     "Alembic evaluated mesh is missing",
                 )
             })?;
-            meshes.insert(id.clone(), mesh_sample(source)?);
+            meshes.insert(id.clone(), mesh_sample(source, allow_lossy)?);
         }
         sampled.push(FrameSample {
             seconds: *frame / rate,
@@ -476,7 +483,7 @@ fn sample_frames(doc: &SceneDoc, snapshot: &Snapshot) -> Result<Vec<f64>> {
     Ok(frames)
 }
 
-fn mesh_sample(mesh: &Mesh) -> Result<MeshSample> {
+fn mesh_sample(mesh: &Mesh, allow_lossy: bool) -> Result<MeshSample> {
     let vertex_indices = mesh
         .vertices
         .iter()
@@ -497,6 +504,19 @@ fn mesh_sample(mesh: &Mesh) -> Result<MeshSample> {
                 )
             })?;
         faces.push(indices);
+    }
+    for attribute in mesh.attributes.keys() {
+        let supported_attribute = matches!(
+            attribute.as_str(),
+            "uv_layers" | "shade_smooth" | "sharp" | "custom_normal"
+        ) || (allow_lossy
+            && matches!(attribute.as_str(), "vertex_groups" | "alembic_normals"));
+        if !supported_attribute && !allow_lossy {
+            return Err(unsupported(
+                "mesh.attribute",
+                format!("Alembic export does not represent mesh attribute `{attribute}`"),
+            ));
+        }
     }
     let points = mesh
         .vertices
@@ -2573,7 +2593,8 @@ pub(crate) struct MeshCacheSample {
     pub time_seconds: f64,
     pub positions: Vec<[f64; 3]>,
     pub faces: Vec<Vec<usize>>,
-    /// Whether face counts or indices have multiple logical Alembic samples.
+    /// Whether face counts or indices have multiple logical Alembic samples. Constant values still
+    /// have multiple logical samples even though their stored payload is read from sample zero.
     pub has_multiple_topology_samples: bool,
     /// Named UV parameters in file order, with rows still in Alembic face winding.
     pub uv_layers: Option<Vec<ExchangeUvLayer>>,
@@ -2587,6 +2608,8 @@ pub(crate) struct MeshCacheSample {
 /// Read a `PolyMesh`'s evaluated attributes and time samples from an Ogawa archive.
 ///
 /// The object path is an Alembic path, including the archive's virtual `root` segment.
+/// `read_uv` and `read_color` avoid decoding unrequested geometric parameters.
+/// Each UV `GeomParam` becomes one layer, named by its `sourceName` or its own name.
 /// `read_polygons` controls topology-normal and canonical-UV values; UV-only reads stream the
 /// named custom UV parameters, leaving an existing canonical UV layer unchanged.
 ///
@@ -2594,7 +2617,9 @@ pub(crate) struct MeshCacheSample {
 ///
 /// Returns import errors for malformed archives or paths without a `PolyMesh`.
 fn cache_has_multiple_topology_samples(counts: &ParsedProperty, indices: &ParsedProperty) -> bool {
-    counts.sample_count > 1 || indices.sample_count > 1
+    [counts, indices]
+        .into_iter()
+        .any(|property| property.sample_count > 1)
 }
 
 #[expect(
@@ -4542,39 +4567,6 @@ mod tests {
     }
 
     #[test]
-    fn color_and_generic_attributes_are_losses_not_refusals() -> Result<()> {
-        let mut mesh = crate::exchange::test_support::triangle_with_attributes()?;
-        mesh.attributes.insert(
-            "seam".to_owned(),
-            serde_json::json!({"domain": "edge", "type": "bool", "values": {}}),
-        );
-        // Sampling never refuses; strict export refuses on the losses from `attribute_losses`.
-        assert!(mesh_sample(&mesh).is_ok());
-        let losses = crate::exchange::mesh_attribute_losses("alembic", "triangle", &mesh);
-        assert!(
-            losses
-                .iter()
-                .any(|loss| loss.feature_id == "mesh.color_attribute")
-        );
-        assert!(
-            losses
-                .iter()
-                .any(|loss| loss.reason.contains("mesh attribute `weight`"))
-        );
-        assert!(
-            losses
-                .iter()
-                .any(|loss| loss.reason.contains("mesh attribute `seam`"))
-        );
-        assert!(
-            losses
-                .iter()
-                .all(|loss| !loss.reason.contains("alembic_normals"))
-        );
-        Ok(())
-    }
-
-    #[test]
     fn logical_topology_sample_counts_control_connectivity_checks() {
         let property = |name: &str, sample_count: usize, constant: bool| ParsedProperty {
             name: name.to_owned(),
@@ -4732,5 +4724,127 @@ mod tests {
         let mut plain = geomparam("rgb", 10, 3);
         plain.metadata.remove("isGeomParam");
         assert!(!is_blender_color_geomparam(&plain));
+    }
+
+    #[test]
+    fn constant_topology_properties_keep_storage_but_require_multisample_checks() {
+        let property = |name: &str, sample_count, constant: bool| ParsedProperty {
+            name: name.to_owned(),
+            property_type: 2,
+            pod: 6,
+            extent: 1,
+            sample_count,
+            first_changed: usize::from(!constant),
+            last_changed: if constant {
+                0
+            } else {
+                sample_count.saturating_sub(1)
+            },
+            constant,
+            time_sampling_index: 0,
+            metadata: BTreeMap::new(),
+            children: Vec::new(),
+            samples: Vec::new(),
+        };
+        let one_sample_counts = property(".faceCounts", 1, true);
+        let one_sample_indices = property(".faceIndices", 1, true);
+        assert!(!cache_has_multiple_topology_samples(
+            &one_sample_counts,
+            &one_sample_indices
+        ));
+
+        let constant_counts = property(".faceCounts", 4, true);
+        let constant_indices = property(".faceIndices", 4, true);
+        assert!(cache_has_multiple_topology_samples(
+            &constant_counts,
+            &constant_indices
+        ));
+        assert_eq!(sample_storage_count(&constant_counts), 1);
+        assert_eq!(sample_storage_count(&constant_indices), 1);
+
+        let changing_indices = property(".faceIndices", 4, false);
+        assert!(cache_has_multiple_topology_samples(
+            &constant_counts,
+            &changing_indices
+        ));
+        let changing_counts = property(".faceCounts", 4, false);
+        assert!(cache_has_multiple_topology_samples(
+            &changing_counts,
+            &constant_indices
+        ));
+    }
+
+    #[test]
+    fn blender_constant_topology_fixture_retains_logical_sample_metadata() -> Result<()> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/mesh_cache_uv/constant_topology.abc");
+        let bytes = std::fs::read(path).map_err(|error| PotError::io(&error))?;
+        let archive = parse_archive(&bytes)?;
+        let object =
+            alembic_object_at_path(&archive.objects, "/ConstantTopology/ConstantTopology")?;
+        let geom = property(&object.properties, ".geom")
+            .ok_or_else(|| import_error("fixture PolyMesh .geom is missing"))?;
+        let face_counts = property(&geom.children, ".faceCounts")
+            .ok_or_else(|| import_error("fixture PolyMesh .faceCounts is missing"))?;
+        let face_indices = property(&geom.children, ".faceIndices")
+            .ok_or_else(|| import_error("fixture PolyMesh .faceIndices is missing"))?;
+        for property in [face_counts, face_indices] {
+            assert!(
+                property.constant,
+                "topology property should store one constant value"
+            );
+            assert!(
+                property.sample_count > 1,
+                "topology property needs multiple logical samples"
+            );
+            assert_eq!(sample_storage_count(property), 1);
+        }
+
+        let samples = read_mesh_cache(
+            &bytes,
+            "/ConstantTopology/ConstantTopology",
+            true,
+            false,
+            false,
+        )?;
+        assert!(
+            samples.len() > 1,
+            "animated points should have multiple cache samples"
+        );
+        assert!(
+            samples
+                .iter()
+                .all(|sample| sample.has_multiple_topology_samples)
+        );
+        let first = samples
+            .first()
+            .ok_or_else(|| import_error("cache sample is missing"))?;
+        let second = samples
+            .get(1)
+            .ok_or_else(|| import_error("second cache sample is missing"))?;
+        assert_eq!(first.faces, second.faces);
+        assert_ne!(first.positions, second.positions);
+        let static_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/mesh_cache_uv/two_layers.abc");
+        let static_bytes = std::fs::read(static_path).map_err(|error| PotError::io(&error))?;
+        let static_archive = parse_archive(&static_bytes)?;
+        let static_object = alembic_object_at_path(&static_archive.objects, "/Plane/Plane")?;
+        let static_geom = property(&static_object.properties, ".geom")
+            .ok_or_else(|| import_error("static fixture PolyMesh .geom is missing"))?;
+        for name in [".faceCounts", ".faceIndices"] {
+            let property = property(&static_geom.children, name)
+                .ok_or_else(|| import_error("static fixture topology property is missing"))?;
+            assert_eq!(property.sample_count, 1);
+            assert!(property.constant);
+            assert_eq!(sample_storage_count(property), 1);
+        }
+        let static_samples = read_mesh_cache(&static_bytes, "/Plane/Plane", true, false, false)?;
+        assert_eq!(static_samples.len(), 1);
+        assert!(
+            static_samples
+                .iter()
+                .all(|sample| !sample.has_multiple_topology_samples)
+        );
+        Ok(())
     }
 }

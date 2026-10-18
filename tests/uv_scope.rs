@@ -131,7 +131,7 @@ fn attach(doc: &mut SceneDoc, node: &str, material: &str) {
         .get_mut(&Id::new(node).unwrap())
         .unwrap()
         .materials
-        .push(Id::new(material).unwrap());
+        .push(Some(Id::new(material).unwrap()));
 }
 
 /// Two unit boxes `a` and `b`, each with a `Light` layer and a `uv_project` modifier naming it.
@@ -453,8 +453,9 @@ fn uv_schemas_do_not_publish_modifier_select_enums_as_layers() {
     }
 }
 
-/// A 16 by 16 canvas and a size-2 box. Its top-face `UVMap` spans [-.5,.5]² after scaling;
-/// `Paint` copies those UVs and translates that face to [0,1]².
+/// A 16 by 16 canvas and a size-2 box. Its top-face `UVMap` spans [0,.5]² after scaling (the box
+/// projection spans [0,1]²); `Paint` copies those UVs and doubles them back to [0,1]². The top face
+/// lies in the same UV square as before the box projection changed, with V flipped.
 fn paint_setup() -> Vec<Value> {
     vec![
         json!({"op":"image.create","id":"canvas","width":16,"height":16,"fill_color":[0.0,0.0,0.0,1.0]}),
@@ -462,7 +463,7 @@ fn paint_setup() -> Vec<Value> {
         json!({"op":"uv.unwrap","target":{"id":"body"},"method":"box"}),
         json!({"op":"uv.transform","target":{"id":"body"},"scale":[0.5,0.5]}),
         json!({"op":"uv.layer_create","target":{"id":"body"},"name":"Paint"}),
-        json!({"op":"uv.transform","target":{"id":"body"},"uv_layer":"Paint","translation":[0.5,0.5]}),
+        json!({"op":"uv.transform","target":{"id":"body"},"uv_layer":"Paint","scale":[2.0,2.0]}),
         json!({"op":"uv.layer_set_active","target":{"id":"body"},"name":"Paint"}),
     ]
 }

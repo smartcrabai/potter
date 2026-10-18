@@ -23,6 +23,7 @@ use crate::{
         Mesh,
         clnor::{self, NormalCodeOptions},
         normals::{corner_angle, corner_normals, face_normal, sharp_edge_flags},
+        origindex_values,
         provenance::Origin,
         uv_layers,
     },
@@ -381,7 +382,7 @@ pub(super) fn screw(
         ..Origin::copies(
             (0..ring_count * vertex_count).map(|index| Some(index % vertex_count)),
             vec![None; faces.len()],
-            mesh.original_indices.is_some(),
+            false,
         )
     };
     // Each corner's U advances by the rings between its face's step and its vertex's ring: one share
@@ -811,11 +812,7 @@ pub(super) fn build(mesh: &Mesh, modifier: &Modifier, frame: f64) -> Result<Mesh
         .iter()
         .map(|&index| source_positions[index])
         .collect();
-    let origin = Origin::copies(
-        sources.into_iter().map(Some),
-        face_sources,
-        mesh.original_indices.is_some(),
-    );
+    let origin = Origin::copies(sources.into_iter().map(Some), face_sources, false);
     let result = build_mesh(points, result_faces, result_edges, &origin, mesh)?;
     if !result.vertices.is_empty() {
         validated(&result)?;
@@ -974,7 +971,7 @@ pub(super) fn edge_split(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     let origin = Origin::copies(
         sources.into_iter().map(Some),
         (0..mesh.faces.len()).map(Some).collect(),
-        mesh.original_indices.is_some(),
+        false,
     );
     build_mesh(points, out_faces, loose_edges(mesh)?, &origin, mesh)
 }
@@ -1111,8 +1108,6 @@ pub(super) fn mask(
                 Vec::new(),
                 Vec::new(),
                 &Origin {
-                    // The empty template mesh retains an existing zero-element ORIGINDEX layer.
-                    source_vertices: mesh.original_indices.as_ref().map(|_| Vec::new()),
                     ..Origin::default()
                 },
                 mesh,
@@ -1179,18 +1174,11 @@ pub(super) fn mask(
     let mut vertex_map = vec![usize::MAX; source_positions.len()];
     let mut points = Vec::with_capacity(source_positions.len());
     let mut vertex_origins = Vec::with_capacity(source_positions.len());
-    let mut source_vertices = mesh
-        .original_indices
-        .as_ref()
-        .map(|_| Vec::with_capacity(source_positions.len()));
     for (source, is_selected) in selected.iter().copied().enumerate() {
         if is_selected {
             vertex_map[source] = points.len();
             points.push(source_positions[source]);
             vertex_origins.push(vec![(source, 1.0)]);
-            if let Some(source_vertices) = source_vertices.as_mut() {
-                source_vertices.push(Some(source));
-            }
         }
     }
     let mut polygons = Vec::new();
@@ -1235,9 +1223,6 @@ pub(super) fn mask(
         let index = points.len();
         points.push(source_positions[key.0].lerp(source_positions[key.1], factor));
         vertex_origins.push(vec![(key.0, 1.0 - factor), (key.1, factor)]);
-        if let Some(source_vertices) = source_vertices.as_mut() {
-            source_vertices.push(None);
-        }
         boundary_vertices.insert(key, index);
         index
     };
@@ -1347,7 +1332,6 @@ pub(super) fn mask(
     }
     let origin = Origin {
         vertices: vertex_origins,
-        source_vertices,
         faces: face_origins,
         corners: Some(corner_origins),
     };
@@ -1764,7 +1748,7 @@ pub(super) fn wireframe(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     let origin = Origin::copies(
         sources.into_iter().map(Some),
         face_sources.into_iter().map(Some).collect(),
-        mesh.original_indices.is_some(),
+        false,
     );
     let mut result = build_mesh(coords, faces, Vec::new(), &origin, mesh)?;
     // BMesh gives new edges the SMOOTH flag (bmesh_core.cc), so only source edges between kept
@@ -2141,18 +2125,23 @@ pub(super) fn hook(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         for index in 0..vertex_count {
             hook_index(&mut result, index);
         }
-    } else if let Some(original) = mesh.original_indices.as_ref() {
+    } else if let Some(original) = origindex_values(mesh) {
         // Blender `MOD_hook.cc` ORIGINDEX branch: the selection bitmap is filled by list position,
-        // then each vertex is tested by its original index.
-        let mut selected = vec![false; original.source_vertex_count];
+        // then each vertex is tested by its original index. The bitmap spans the highest original
+        // index the mesh carries, so a listed value beyond that range matches no vertex.
+        let source_count = original
+            .iter()
+            .filter_map(|&index| usize::try_from(index).ok())
+            .max()
+            .map_or(0, |max| max + 1);
+        let mut selected = vec![false; source_count];
         for (position, &index) in indices.iter().enumerate() {
-            if index < original.source_vertex_count && position < selected.len() {
+            if index < source_count && position < selected.len() {
                 selected[position] = true;
             }
         }
         for index in 0..vertex_count {
             let source = original
-                .vertices
                 .get(index)
                 .copied()
                 .and_then(|source| usize::try_from(source).ok());
@@ -2770,8 +2759,12 @@ fn curve_map_extend(
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "geometry modifier unit tests")]
 mod tests {
-    use super::{curve, mask, shrinkwrap};
-    use crate::geom::{Mesh, OriginalIndices, UvSphereParams};
+    use super::{build, curve, mask, shrinkwrap};
+    use crate::geom::{
+        BoxParams, Mesh, UvSphereParams,
+        clnor::{self, CornerNormalCode, NormalCodeOptions, SetterInput},
+        origindex_values, set_origindex,
+    };
     use serde_json::json;
 
     #[test]
@@ -2819,6 +2812,50 @@ mod tests {
         assert!(result.vertex(first).unwrap().co.distance(glam::DVec3::ZERO) < 1.0e-12);
         assert!(result.vertex(second).unwrap().co.distance(glam::DVec3::Z) < 1.0e-12);
     }
+    #[test]
+    fn build_subset_compacts_nonidentity_custom_normal_loop_order() {
+        let mut source = Mesh::box_mesh(BoxParams::default()).unwrap();
+        let corner_count: usize = source.faces.iter().map(|face| face.vertices.len()).sum();
+        let codes: Vec<CornerNormalCode> = (0..corner_count)
+            .map(|corner| CornerNormalCode::Authored([i16::try_from(corner + 1).unwrap(), -1_000]))
+            .collect();
+        let mut loop_order: Vec<usize> = (0..corner_count).collect();
+        loop_order[..4].rotate_left(1);
+        clnor::write_codes(
+            &mut source,
+            Some(&codes),
+            NormalCodeOptions {
+                corner_order: Some(&loop_order),
+                setter_input: SetterInput::AlreadyNormalized,
+            },
+        )
+        .unwrap();
+
+        let modifier = modifier_with_target(
+            "build",
+            json!({
+                "frame_start": 0.0,
+                "frame_duration": 2.0,
+                "use_reverse": false,
+                "use_random_order": false,
+                "seed": 0
+            }),
+            Mesh::new(),
+        );
+        let output = build(&source, &modifier, 0.5).unwrap();
+
+        assert_eq!(output.faces.len(), 1);
+        assert_eq!(
+            clnor::corner_order(&output).unwrap(),
+            Some(vec![1, 2, 3, 0]),
+            "the subset basis is compacted from its source loop order"
+        );
+        assert_eq!(
+            clnor::corner_codes(&output).unwrap(),
+            Some(codes[..4].to_vec()),
+            "the subset retains the source codes for its copied loops"
+        );
+    }
 
     #[test]
     fn shrinkwrap_offset_moves_each_projected_vertex_by_the_requested_distance() {
@@ -2850,16 +2887,13 @@ mod tests {
     }
 
     #[test]
-    fn empty_mask_retains_original_index_layer() {
+    fn empty_mask_retains_origindex_carrier() {
         let mut source = Mesh::from_positions_and_faces(
             vec![glam::DVec3::ZERO, glam::DVec3::X, glam::DVec3::Y],
             vec![vec![0, 1, 2]],
         )
         .unwrap();
-        source.original_indices = Some(OriginalIndices {
-            vertices: vec![0; source.vertices.len()],
-            source_vertex_count: source.vertices.len(),
-        });
+        set_origindex(&mut source, &[0, 1, 2]);
         let modifier = crate::model::Modifier {
             id: crate::model::Id::new("empty_mask").unwrap(),
             modifier_type: "mask".to_owned(),
@@ -2873,11 +2907,7 @@ mod tests {
         };
         let result = mask(&source, &modifier, &std::collections::BTreeMap::new()).unwrap();
         assert_eq!(result.vertices.len(), 0);
-        let Some(indices) = result.original_indices.as_ref() else {
-            panic!("empty layer remains present");
-        };
-        assert_eq!(indices.vertices.len(), 0);
-        assert_eq!(indices.source_vertex_count, 3);
+        assert_eq!(origindex_values(&result), Some(Vec::new()));
     }
 
     fn modifier_with_target(

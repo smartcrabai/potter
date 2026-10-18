@@ -286,7 +286,7 @@ pub fn validate_with_context(
                 json!({"target":data}),
             );
         }
-        for material in &node.materials {
+        for material in node.materials.iter().flatten() {
             if !doc.materials.contains_key(material) {
                 issue(
                     &mut issues,
@@ -298,6 +298,22 @@ pub fn validate_with_context(
                     json!({"target":material}),
                 );
             }
+        }
+        let data = node
+            .data
+            .as_ref()
+            .and_then(|data_id| doc.data_blocks.get(data_id));
+        let slot_count = node.material_slot_count(data);
+        if node.material_links.len() > slot_count {
+            issue(
+                &mut issues,
+                "error",
+                "INVALID_VALUE",
+                "Node material link table exceeds the material slot count.",
+                Some(id.to_string()),
+                Some(format!("/nodes/{id}/material_links")),
+                json!({"link_count":node.material_links.len(),"slot_count":slot_count}),
+            );
         }
         if let Some(action) = &node.action
             && !doc.actions.contains_key(action)
@@ -400,6 +416,20 @@ pub fn validate_with_context(
                 json!({"target":action}),
             );
         }
+        for material in data.materials.iter().flatten() {
+            if !doc.materials.contains_key(material) {
+                issue(
+                    &mut issues,
+                    "error",
+                    "MISSING_REFERENCE",
+                    "Data-Block material slot references a missing Material.",
+                    Some(data_id.to_string()),
+                    Some(format!("/data_blocks/{data_id}/materials")),
+                    json!({"target":material}),
+                );
+            }
+        }
+
         if let Some(mesh) = &data.mesh {
             inspect_mesh(mesh, data_id, &mut issues);
             for (node_id, node) in doc
@@ -407,21 +437,23 @@ pub fn validate_with_context(
                 .iter()
                 .filter(|(_, node)| node.data.as_ref() == Some(data_id))
             {
-                if !node.materials.is_empty() {
-                    for face in &mesh.faces {
-                        if usize::try_from(face.material_index)
-                            .map_or(true, |index| index >= node.materials.len())
-                        {
-                            issue(
-                                &mut issues,
-                                "error",
-                                "INVALID_INDEX",
-                                "Face material_index is outside the Object material slots.",
-                                Some(data_id.to_string()),
-                                Some(format!("/data_blocks/{data_id}/mesh/faces/{}", face.id)),
-                                json!({"node_id":node_id,"material_index":face.material_index,"slot_count":node.materials.len()}),
-                            );
-                        }
+                let slot_count = node.material_slot_count(Some(data));
+                if slot_count == 0 {
+                    continue;
+                }
+                for face in &mesh.faces {
+                    if usize::try_from(face.material_index)
+                        .map_or(true, |index| index >= slot_count)
+                    {
+                        issue(
+                            &mut issues,
+                            "error",
+                            "INVALID_INDEX",
+                            "Face material_index is outside the effective material slots.",
+                            Some(data_id.to_string()),
+                            Some(format!("/data_blocks/{data_id}/mesh/faces/{}", face.id)),
+                            json!({"node_id":node_id,"material_index":face.material_index,"slot_count":slot_count}),
+                        );
                     }
                 }
             }
@@ -608,7 +640,8 @@ pub fn validate_with_context(
                 losses.extend(crate::commands::export::avatar_settings_loss(doc, "blend"));
                 losses
             } else {
-                let mut losses = crate::commands::export::export_losses(doc, format);
+                let mut losses =
+                    crate::commands::export::export_losses(doc, format, evaluation.as_ref().ok());
                 // Shading losses need the same meshes export builds, so evaluation errors surface here too.
                 if let Ok(snapshot) = &evaluation {
                     match crate::exchange::evaluated_meshes(doc, snapshot) {
@@ -616,6 +649,18 @@ pub fn validate_with_context(
                             losses
                                 .extend(crate::exchange::shading::shading_losses(format, &meshes));
                             losses.extend(crate::exchange::uv_layer_losses(format, &meshes));
+                            match crate::commands::export::mesh_data_losses(doc, format, snapshot) {
+                                Ok(mesh_losses) => losses.extend(mesh_losses),
+                                Err(error) => issue(
+                                    &mut issues,
+                                    "error",
+                                    "EVALUATION_FAILED",
+                                    &error.message,
+                                    None,
+                                    None,
+                                    error.details,
+                                ),
+                            }
                             if matches!(format, "glb" | "gltf" | "vrm" | "vrm0") {
                                 let vrm = match (format, doc.avatar.as_ref()) {
                                     ("vrm", Some(avatar)) => {
@@ -663,6 +708,34 @@ pub fn validate_with_context(
                                         None,
                                         error.details,
                                     ),
+                                }
+                            }
+                            if matches!(format, "fbx" | "fbx-binary") {
+                                losses
+                                    .extend(crate::exchange::fbx::uv_texture_losses(doc, snapshot));
+                                for warning in
+                                    crate::exchange::fbx::uv_texture_warnings(doc, snapshot)
+                                {
+                                    let code = warning
+                                        .details
+                                        .get("feature_id")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("uv.layer_missing")
+                                        .to_owned();
+                                    let data_id = warning
+                                        .details
+                                        .get("material_id")
+                                        .and_then(Value::as_str)
+                                        .map(str::to_owned);
+                                    issue(
+                                        &mut issues,
+                                        "warning",
+                                        &code,
+                                        &warning.message,
+                                        data_id,
+                                        None,
+                                        warning.details,
+                                    );
                                 }
                             }
                         }

@@ -29,6 +29,7 @@ pub struct HistoryRecord {
 }
 /// History records returned together with any upgrade diagnostics from their snapshots.
 pub type HistoryRecordsAndWarnings = (Vec<(String, HistoryRecord)>, Vec<Value>);
+type SnapshotRead = (SceneDoc, Vec<Value>, Option<String>, Option<String>);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoryDirection {
@@ -43,9 +44,11 @@ pub struct Project {
     doc: SceneDoc,
     /// Diagnostics from upgrading the loaded scene document.
     load_warnings: Vec<Value>,
-    // Digest of the schema-1 `scene.json` this project opened. Its bytes are kept before the first
-    // schema-3 write replaces them.
+    /// Digest of the schema-1 `scene.json` this project opened. Its bytes are kept before the first
+    /// schema-2 write replaces them.
     legacy_digest: Option<String>,
+    /// Hash reported for the untouched schema-1 scene before migration changes its schema version.
+    legacy_hash: Option<String>,
 }
 
 impl Project {
@@ -77,6 +80,7 @@ impl Project {
             doc,
             load_warnings: Vec::new(),
             legacy_digest: None,
+            legacy_hash: None,
         };
         project.save_initial()?;
         Ok(project)
@@ -109,7 +113,7 @@ impl Project {
         } else {
             None
         };
-        let (doc, load_warnings, legacy_digest) = Self::read_snapshot(&canonical)?;
+        let (doc, load_warnings, legacy_digest, legacy_hash) = Self::read_snapshot(&canonical)?;
         Ok(Self {
             path: canonical,
             cache_directory,
@@ -117,14 +121,15 @@ impl Project {
             doc,
             load_warnings,
             legacy_digest,
+            legacy_hash,
         })
     }
 
     /// Reads and upgrades `scene.json`. The diagnostics name the original bytes they describe. The
-    /// digest is returned only for schema version 1.
-    fn read_snapshot(path: &Path) -> Result<(SceneDoc, Vec<Value>, Option<String>)> {
+    /// digest and compatibility hash are returned only for schema version 1.
+    fn read_snapshot(path: &Path) -> Result<SnapshotRead> {
         let bytes = fs::read(path.join("scene.json")).map_err(|error| PotError::io(&error))?;
-        let parsed = crate::model::migrate::parse_scene(&bytes)?;
+        let parsed = crate::model::migrate::parse_scene_with_original_hash(&bytes)?;
         parsed.doc.validate()?;
         let digest = hash::sha256(&bytes);
         let mut warnings = parsed.warnings;
@@ -134,10 +139,12 @@ impl Project {
             &digest,
         );
         let legacy_digest = parsed.legacy.then_some(digest);
-        Ok((parsed.doc, warnings, legacy_digest))
+        Ok((parsed.doc, warnings, legacy_digest, parsed.legacy_hash))
     }
 
-    /// Keeps the bytes of a schema-1 `scene.json` before a schema-3 write replaces them, under the
+    /// Keeps the bytes of a schema-1 `scene.json` before a schema-2 write replaces them, under the
+    /// content-addressed path that the diagnostics name. The file must still hold the bytes this
+    /// project opened.
     fn preserve_legacy_scene(&self) -> Result<()> {
         let Some(digest) = self.legacy_digest.as_deref() else {
             return Ok(());
@@ -219,12 +226,17 @@ impl Project {
     }
 
     pub fn info(&self) -> Result<SceneInfo> {
-        let value = serde_json::to_value(&self.doc).map_err(|error| internal_json(&error))?;
+        let scene_hash = if let Some(hash) = &self.legacy_hash {
+            hash.clone()
+        } else {
+            let value = serde_json::to_value(&self.doc).map_err(|error| internal_json(&error))?;
+            hash::sha256(&hash::canonicalize(&value)?)
+        };
         Ok(SceneInfo {
             id: self.doc.scene_id.clone(),
             path: self.path.to_string_lossy().into_owned(),
             revision: self.doc.revision,
-            hash: hash::sha256(&hash::canonicalize(&value)?),
+            hash: scene_hash,
         })
     }
 
@@ -430,6 +442,7 @@ impl Project {
         }
         write_scene_atomic(&self.path, &candidate)?;
         self.legacy_digest = None;
+        self.legacy_hash = None;
         self.doc = candidate;
         self.info()
     }
@@ -490,6 +503,7 @@ impl Project {
         candidate.validate()?;
         write_scene_atomic(&self.path, &candidate)?;
         self.legacy_digest = None;
+        self.legacy_hash = None;
         self.doc = candidate;
         self.info()
     }
@@ -497,9 +511,9 @@ impl Project {
     /// Reads every record from the head back to the first commit, with the diagnostics of their
     /// upgrades.
     pub fn history_records(&self) -> Result<HistoryRecordsAndWarnings> {
-        let mut records: Vec<(String, HistoryRecord)> = Vec::new();
+        let mut records = Vec::new();
         let mut warnings = Vec::new();
-        let mut next: Option<String> = self.doc.history.head.clone();
+        let mut next = self.doc.history.head.clone();
         while let Some(record_hash) = next.take() {
             let (record, record_warnings) = read_history_blob(&self.path, &record_hash)?;
             warnings.extend(record_warnings);
@@ -1007,6 +1021,52 @@ mod tests {
         let error = opened.history_records().unwrap_err();
 
         assert_eq!(error.code, ErrorCode::InternalError);
+    }
+
+    #[test]
+    fn history_blob_hashes_raw_legacy_bytes_before_snapshot_upgrade() {
+        let directory = tempdir().unwrap();
+        let snapshot =
+            serde_json::to_value(SceneDoc::new(uuid::Uuid::new_v4().to_string())).unwrap();
+        let mut record = json!({
+            "record_version": 1,
+            "parent": null,
+            "kind": "apply",
+            "revision": 0,
+            "scene_hash": "sha256:scene",
+            "operations": [],
+            "changes": {},
+            "target": null,
+            "snapshot": snapshot
+        });
+        record["snapshot"]["schema_version"] = json!(2);
+        let bytes = serde_json::to_vec(&record).unwrap();
+        let digest = crate::hash::sha256(&bytes);
+        let hex = digest.strip_prefix("sha256:").unwrap();
+        let path = directory
+            .path()
+            .join("history")
+            .join("sha256")
+            .join(hex)
+            .join("blob.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, &bytes).unwrap();
+
+        let (loaded, warnings) = super::read_history_blob(directory.path(), &digest).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(loaded.snapshot.schema_version, 3);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+
+        let mut corrupted = bytes;
+        corrupted.push(b'!');
+        fs::write(&path, &corrupted).unwrap();
+        let error = super::read_history_blob(directory.path(), &digest).unwrap_err();
+        assert_eq!(error.code, ErrorCode::InternalError);
+        assert_eq!(
+            error.message,
+            "history record does not match its content hash"
+        );
+        assert_eq!(fs::read(path).unwrap(), corrupted);
     }
 
     #[test]

@@ -133,7 +133,7 @@ fn finish_remesh(mesh: &mut Mesh, smooth_shade: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use crate::{
-        geom::{BoxParams, Mesh, OriginalIndices},
+        geom::{BoxParams, Mesh, origindex_values, set_origindex},
         model::{Id, Modifier},
     };
     use serde_json::{Map, json};
@@ -142,11 +142,7 @@ mod tests {
 
     #[test]
     fn octree_modes_map_depth_to_geometry_resolution() -> Result<(), Box<dyn std::error::Error>> {
-        let mut source = Mesh::box_mesh(BoxParams::default())?;
-        source.original_indices = Some(OriginalIndices {
-            vertices: vec![0; source.vertices.len()],
-            source_vertex_count: source.vertices.len(),
-        });
+        let source = Mesh::box_mesh(BoxParams::default())?;
         let modifier = Modifier {
             id: Id::new("remesh_test")?,
             modifier_type: "remesh".to_owned(),
@@ -163,17 +159,14 @@ mod tests {
         let result = remesh_modifier(&source, &modifier)?;
         assert!(result.validate().is_ok());
         assert!(!result.faces.is_empty(), "remesh produced no faces");
-        assert!(result.original_indices.is_none());
+        assert!(origindex_values(&result).is_none());
         Ok(())
     }
 
     #[test]
     fn empty_voxel_remesh_preserves_input_origindex() -> Result<(), Box<dyn std::error::Error>> {
         let mut source = Mesh::new();
-        source.original_indices = Some(OriginalIndices {
-            vertices: Vec::new(),
-            source_vertex_count: 0,
-        });
+        set_origindex(&mut source, &[]);
         let modifier = Modifier {
             id: Id::new("empty_voxel_remesh")?,
             modifier_type: "remesh".to_owned(),
@@ -188,7 +181,7 @@ mod tests {
             runtime: crate::model::ModifierRuntime::default(),
         };
         let result = remesh_modifier(&source, &modifier)?;
-        assert_eq!(result.original_indices, source.original_indices);
+        assert_eq!(origindex_values(&result), origindex_values(&source));
         Ok(())
     }
 }

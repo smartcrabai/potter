@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use glam::DVec3;
 use serde_json::{Map, Value, json};
@@ -22,6 +22,7 @@ const DEFAULT_LAYER_NAME: &str = "UVMap";
 /// Modifier params that name a UV layer. The layer-select params of the Blender modifiers are fixed
 /// enums (`ALL`, `ACTIVE`, `NAME`, `INDEX`), not layer names, so they are not listed.
 const MODIFIER_LAYER_PARAMS: [&str; 2] = ["uv_layer", "mask_tex_uv_layer"];
+
 pub(super) fn apply(
     engine: &mut Engine<'_>,
     name: &str,
@@ -71,18 +72,25 @@ fn unwrap(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             if matches!(method, "angle_based" | "conformal") {
                 unwrap_advanced(layer_mesh, &selected, uv_map, method)?;
             } else {
-                for face in layer_mesh
-                    .faces
-                    .iter()
-                    .filter(|face| selected.contains(&face.id))
-                {
-                    let corners = project_face(layer_mesh, face, method)?;
+                let projected = if matches!(method, "box" | "cube") {
+                    cube_project(layer_mesh, &selected)?
+                } else {
+                    layer_mesh
+                        .faces
+                        .iter()
+                        .filter(|face| selected.contains(&face.id))
+                        .map(|face| -> Result<(u32, Vec<[f64; 2]>)> {
+                            Ok((face.id, smart_project_face(layer_mesh, face)?))
+                        })
+                        .collect::<Result<BTreeMap<u32, Vec<[f64; 2]>>>>()?
+                };
+                for (face_id, corners) in projected {
                     let pinned = uv_map
-                        .get(&face.id)
+                        .get(&face_id)
                         .and_then(|face_uv| face_uv.pinned.clone())
                         .filter(|pinned| pinned.len() == corners.len());
                     uv_map.insert(
-                        face.id,
+                        face_id,
                         UvFace {
                             uv: corners,
                             pinned,
@@ -547,6 +555,7 @@ fn uv_layer_field(engine: &Engine<'_>, operation: &Map<String, Value>) -> Result
         )),
     }
 }
+
 fn selected_targets(
     engine: &Engine<'_>,
     operation: &Map<String, Value>,
@@ -724,7 +733,15 @@ fn reach<'a>(doc: &SceneDoc, nodes: impl IntoIterator<Item = &'a Id>) -> Reach {
     let mut pending: Vec<Id> = Vec::new();
     for node_id in nodes {
         if let Some(node) = doc.nodes.get(node_id) {
-            reached.materials.extend(node.materials.iter().cloned());
+            let data = node
+                .data
+                .as_ref()
+                .and_then(|data_id| doc.data_blocks.get(data_id));
+            for slot in 0..node.material_slot_count(data) {
+                if let Some(material) = node.material_slot(data, slot) {
+                    reached.materials.insert(material.clone());
+                }
+            }
             pending.extend(node.modifiers.iter().filter_map(modifier_node_group));
         }
     }
@@ -970,6 +987,7 @@ fn rename_layer_references(
                 changed = true;
             }
         }
+
         if changed {
             changes.node_groups.push(graph_id.clone());
         }
@@ -1955,16 +1973,22 @@ fn dot(left: &[f64], right: &[f64]) -> f64 {
         .map(|(left, right)| left * right)
         .sum()
 }
-fn project_face(mesh: &Mesh, face: &Face, method: &str) -> Result<Vec<[f64; 2]>> {
-    let points = face
-        .vertices
+/// The mesh-local positions of `face`'s corners, in face order.
+fn face_points(mesh: &Mesh, face: &Face) -> Result<Vec<DVec3>> {
+    face.vertices
         .iter()
         .map(|id| {
             mesh.vertex(*id).map(|vertex| vertex.co).ok_or_else(|| {
                 PotError::new(ErrorCode::SceneInvalid, "face references a missing vertex")
             })
         })
-        .collect::<Result<Vec<DVec3>>>()?;
+        .collect()
+}
+
+/// The corners of `face` for `smart`: the face projects onto the two axes its normal dominates, and
+/// its coordinates normalise to [0, 1].
+fn smart_project_face(mesh: &Mesh, face: &Face) -> Result<Vec<[f64; 2]>> {
+    let points = face_points(mesh, face)?;
     let normal = points
         .windows(3)
         .find_map(|pair| {
@@ -1987,10 +2011,81 @@ fn project_face(mesh: &Mesh, face: &Face, method: &str) -> Result<Vec<[f64; 2]>>
             _ => [point.x, point.y],
         })
         .collect::<Vec<_>>();
-    if method == "smart" {
-        normalize_uv(&mut projected);
-    }
+    normalize_uv(&mut projected);
     Ok(projected)
+}
+
+/// Blender's cube projection: `uvedit_unwrap_cube_project` in Blender 5.2.2's `uvedit_unwrap_ops.cc`,
+/// as `uv.cube_project` runs it with `cube_size` unset and the default options. The centre and the
+/// cube size come from the bounds of the selected faces, the cube size being the largest side (a
+/// zero side gives 1). Each face projects onto the two axes its normal dominates. Blender's V is up
+/// and Potter stores V down, so the stored V is `1 - v`.
+fn cube_project(mesh: &Mesh, selected: &[u32]) -> Result<BTreeMap<u32, Vec<[f64; 2]>>> {
+    let mut faces = Vec::new();
+    let mut min = DVec3::splat(f64::INFINITY);
+    let mut max = DVec3::splat(f64::NEG_INFINITY);
+    for face in mesh.faces.iter().filter(|face| selected.contains(&face.id)) {
+        let points = face_points(mesh, face)?;
+        for point in &points {
+            min = min.min(*point);
+            max = max.max(*point);
+        }
+        faces.push((face.id, points));
+    }
+    if faces.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let side = (max - min).max_element();
+    let cube_size = if crate::float::equal_f64(side, 0.0) {
+        1.0
+    } else {
+        side
+    };
+    let centre = (min + max) * 0.5;
+    Ok(faces
+        .into_iter()
+        .map(|(face_id, points)| {
+            let (axis_u, axis_v) = dominant_axes(blender_face_normal(&points));
+            let corners = points
+                .iter()
+                .map(|point| {
+                    let u = 0.5 + (point[axis_u] - centre[axis_u]) / cube_size;
+                    let v = 0.5 + (point[axis_v] - centre[axis_v]) / cube_size;
+                    [u, 1.0 - v]
+                })
+                .collect::<Vec<[f64; 2]>>();
+            (face_id, corners)
+        })
+        .collect())
+}
+
+/// The face normal used to pick the projection axes: Newell's method, unnormalised, for every face. A
+/// box's faces are planar, where it points the same way as Blender's face normal, and a degenerate face
+/// gives zero. Blender's triangle and quad normals are not reproduced, so a non-planar quad could tie
+/// differently.
+fn blender_face_normal(points: &[DVec3]) -> DVec3 {
+    let count = points.len();
+    let mut normal = DVec3::ZERO;
+    for (index, current) in points.iter().enumerate() {
+        let previous = points[(index + count - 1) % count];
+        normal.x += (previous.y - current.y) * (previous.z + current.z);
+        normal.y += (previous.z - current.z) * (previous.x + current.x);
+        normal.z += (previous.x - current.x) * (previous.y + current.y);
+    }
+    normal
+}
+
+/// The two axes (0 = X, 1 = Y, 2 = Z) a face projects onto: Blender's `axis_dominant_v3`, which
+/// checks Z first, then Y, then X.
+fn dominant_axes(normal: DVec3) -> (usize, usize) {
+    let (x, y, z) = (normal.x.abs(), normal.y.abs(), normal.z.abs());
+    if z >= x && z >= y {
+        (0, 1)
+    } else if y >= x && y >= z {
+        (0, 2)
+    } else {
+        (1, 2)
+    }
 }
 
 fn normalize_uv(coords: &mut [[f64; 2]]) {
@@ -2796,7 +2891,7 @@ mod tests {
             .get_mut(&Id::new("body").unwrap())
             .unwrap()
             .materials
-            .push(surface.clone());
+            .push(Some(surface.clone()));
         create_layer(&mut doc, Some("Mid")).unwrap();
         create_layer(&mut doc, Some("Top")).unwrap();
         doc.nodes

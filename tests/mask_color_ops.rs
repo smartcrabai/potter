@@ -138,8 +138,8 @@ fn color_operations_apply_transform_settings_and_validate_gamma_and_curve()
     );
     assert_eq!(scene.color_management.exposure, 1.0);
     assert_eq!(scene.color_management.gamma, 2.0);
-    let transformed = scene.color_management.transform_linear([0.25; 3]);
-    assert!((transformed[0] - 0.5_f64.sqrt()).abs() < 1.0e-12);
+    let transformed = scene.color_management.display_encode([0.25; 3])?;
+    assert!((f64::from(transformed[0]) - 0.5_f64.sqrt()).abs() < 1.0e-5);
 
     let invalid_gamma = apply_batch(
         &updated.doc,

@@ -1,4 +1,4 @@
 # Pin the toolchain so clippy lints do not change with the GitHub runner image's preinstalled Rust.
 [toolchain]
-channel = "1.99.0"
+channel = "1.99.1"
 components = ["clippy", "rustfmt"]

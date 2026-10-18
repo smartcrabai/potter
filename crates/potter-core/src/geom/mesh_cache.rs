@@ -17,7 +17,7 @@ use crate::{
 };
 
 use super::{
-    Mesh, ORIGINDEX_NONE, OriginalIndices,
+    Mesh,
     clnor::{self, NormalCodeOptions, SetterInput},
     color_layers::{self, ColorDomain, ColorLayer},
     uv_layers::{self, UvLayer},
@@ -45,6 +45,7 @@ pub(crate) fn evaluate(
     fps_base: f64,
     resource_hash: &str,
     archive_bytes: &[u8],
+    is_sequence: bool,
 ) -> Result<Vec<PotError>> {
     let resource = string_param(modifier, "resource")?;
     let object_path = string_param(modifier, "object_path")?;
@@ -76,11 +77,6 @@ pub(crate) fn evaluate(
             .and_then(Value::as_str)
         })
         .unwrap_or("SECOND");
-    let sequence = modifier
-        .params
-        .get("is_sequence")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
     let override_frame = match modifier.params.get("override_frame") {
         None | Some(Value::Null) => None,
         Some(value) => Some(
@@ -104,7 +100,7 @@ pub(crate) fn evaluate(
             json!({"modifier_id":modifier.id,"fps":fps,"fps_base":fps_base}),
         ));
     }
-    let time_seconds = if sequence {
+    let time_seconds = if is_sequence {
         requested
     } else {
         (requested - frame_offset) / rate
@@ -153,8 +149,10 @@ pub(crate) fn evaluate(
             )
         })?;
         !topology_dimensions_match(mesh, sample.sample.positions.len(), &sample.sample.faces)
-            || (requires_connectivity_check(sequence, sample.sample.has_multiple_topology_samples)
-                && !topology_matches(mesh, sample.sample.positions.len(), &sample.sample.faces))
+            || (requires_connectivity_check(
+                is_sequence,
+                sample.sample.has_multiple_topology_samples,
+            ) && !topology_matches(mesh, sample.sample.positions.len(), &sample.sample.faces))
     };
     if topology_changed {
         // Blender's file-sequence reader rereads all supported streams for changed connectivity.
@@ -200,13 +198,6 @@ pub(crate) fn evaluate(
                     json!({"modifier_id":modifier.id,"reason":error.to_string()}),
                 )
             })?;
-        evaluated.original_indices =
-            mesh.original_indices
-                .as_ref()
-                .map(|indices| OriginalIndices {
-                    vertices: vec![ORIGINDEX_NONE; evaluated.vertices.len()],
-                    source_vertex_count: indices.source_vertex_count,
-                });
         carry_uv_store(mesh, &mut evaluated);
         apply_cache_attributes(
             &mut evaluated,
@@ -393,7 +384,18 @@ fn apply_cache_attributes(
                 store.layers.push(layer);
             }
         }
-        if !sample.colors.is_empty() {
+        if let Some(first) = sample.colors.first() {
+            if store.render_index().is_none() {
+                store.render = Some(first.name.clone());
+            }
+            if store
+                .active
+                .as_deref()
+                .and_then(|active| store.index_of(active))
+                .is_none()
+            {
+                store.active = Some(first.name.clone());
+            }
             color_layers::write(mesh, &store);
             for color in &sample.colors {
                 set_cache_color_data_type(mesh, &color.name)?;
@@ -483,11 +485,10 @@ fn write_cache_uvs(
     if cached.is_empty() {
         return Ok(());
     }
-    let mut layers = uv_layers::read_layers(mesh);
+    let mut store = uv_layers::read(mesh);
+    let mut first_written = None;
     for cached_layer in cached {
-        let existing = layers
-            .iter()
-            .position(|layer| layer.name == cached_layer.name);
+        let existing = store.index_of(&cached_layer.name);
         // Blender streams arbitrary UV GeomParams with the UV flag; the canonical `.geom/uv`
         // layer is populated only by the POLY path. Preserve an existing canonical layer, or
         // materialize its zero row on a new mesh as Blender does.
@@ -499,19 +500,19 @@ fn write_cache_uvs(
         }
         let index = match existing {
             Some(index) => index,
-            None if layers.len() < uv_layers::MAX_LAYERS => {
-                layers.push(UvLayer::new(
+            None if store.layers.len() < uv_layers::MAX_LAYERS => {
+                store.layers.push(UvLayer::new(
                     cached_layer.name.clone(),
                     vec![None; mesh.faces.len()],
                 ));
-                layers.len() - 1
+                store.layers.len() - 1
             }
             None => {
                 warnings.push(layer_limit_warning(modifier, &cached_layer.name));
                 continue;
             }
         };
-        let layer = layers.get_mut(index).ok_or_else(|| {
+        let layer = store.layers.get_mut(index).ok_or_else(|| {
             PotError::new(ErrorCode::InternalError, "UV layer index is out of range")
         })?;
         layer.faces = cached_layer
@@ -519,8 +520,25 @@ fn write_cache_uvs(
             .iter()
             .map(|corners| Some(corners.iter().rev().copied().collect()))
             .collect();
+        if first_written.is_none() {
+            first_written = Some(cached_layer.name.clone());
+        }
     }
-    uv_layers::write_layers(mesh, &layers);
+    let active_exists = store
+        .active
+        .as_deref()
+        .is_some_and(|name| store.index_of(name).is_some());
+    if !active_exists {
+        store.active.clone_from(&first_written);
+    }
+    let render_exists = store
+        .render
+        .as_deref()
+        .is_some_and(|name| store.index_of(name).is_some());
+    if !render_exists {
+        store.render.clone_from(&first_written);
+    }
+    uv_layers::write(mesh, &store);
     Ok(())
 }
 
@@ -564,6 +582,7 @@ fn layer_limit_warning(modifier: &Modifier, layer: &str) -> PotError {
         }),
     )
 }
+
 fn validate_cache_output(mesh: &Mesh, modifier: &Modifier) -> Result<()> {
     mesh.validate().map_err(|error| {
         PotError::with_details(

@@ -15,19 +15,21 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use glam::{DVec2, DVec3, Vec3};
-use serde_json::{Map, json};
+use serde_json::{Map, Value, json};
 
 use super::{
     NonManifold, Polygon, build_mesh, edge_crease_weights, loose_edges, polygons, positions,
     usize_as_f64,
 };
 use crate::{
+    color::{linear_to_srgb, srgb_to_linear},
     error::{ErrorCode, PotError, Result},
     geom::{
         Mesh,
         clnor::{self, NormalCodeOptions, SetterInput},
+        color_layers::{self, ColorDomain},
         edge_key,
-        provenance::Origin,
+        provenance::{Origin, corner_sources},
         uv_layers::{self, UvLayer},
     },
 };
@@ -1183,8 +1185,8 @@ impl NormalSubdivision {
         }
     }
 
-    /// Blender face index and loop-start slot of each sample in the current ptex grid.
-    fn blender_faces(&self) -> Vec<(usize, usize)> {
+    /// Blender face index of each sample in the current ptex grid.
+    fn blender_faces(&self) -> Vec<usize> {
         let mut offsets = Vec::with_capacity(self.faces.len());
         let mut total = 0;
         for (index, face) in self.faces.iter().enumerate() {
@@ -1199,31 +1201,31 @@ impl NormalSubdivision {
                 let face = self.corner_face[sample.corner];
                 let side = self.side(face);
                 if self.faces[face].count == 4 {
-                    (
-                        offsets[face] + quad_index(sample.x, sample.y, side),
-                        boundary_run(sample.x, sample.y, side),
-                    )
+                    offsets[face] + quad_index(sample.x, sample.y, side)
                 } else {
-                    let (index, run) = ngon_square_order(
-                        self.corner_local[sample.corner],
-                        sample.x,
-                        sample.y,
-                        side,
-                        self.faces[face].count,
-                    );
-                    (offsets[face] + index, run)
+                    offsets[face]
+                        + ngon_square_order(
+                            self.corner_local[sample.corner],
+                            sample.x,
+                            sample.y,
+                            side,
+                            self.faces[face].count,
+                        )
                 }
             })
             .collect()
     }
 
-    /// Blender loop ordinal of each output corner, in Potter order.
+    /// Blender loop ordinal of each output corner, in Potter order. `subdiv_foreach.cc` numbers each
+    /// ptex square's loops from that square's own grid corners: `rotate_indices` by the emitting
+    /// block's rotation puts grid corner `m` at loop `m`. Output corner `k` of a sample in slot
+    /// `rotation` is therefore the grid corner `(rotation + k) % 4`.
     fn loop_order(&self) -> Vec<usize> {
         let faces = self.blender_faces();
         let mut order = Vec::with_capacity(self.samples.len() * 4);
-        for (sample, &(face, run)) in self.samples.iter().zip(&faces) {
+        for (sample, &face) in self.samples.iter().zip(&faces) {
             for corner in 0..4 {
-                order.push(4 * face + (sample.rotation + corner + 4 - run) % 4);
+                order.push(4 * face + (sample.rotation + corner) % 4);
             }
         }
         order
@@ -1360,14 +1362,8 @@ fn boundary_run(x: usize, y: usize, side: usize) -> usize {
 }
 
 /// Blender's special n-gon ptex traversal order: inner squares, patch connections, centre squares, then
-/// U and V boundary squares. Returns the face index within the parent polygon and loop-start slot.
-fn ngon_square_order(
-    corner: usize,
-    x: usize,
-    y: usize,
-    side: usize,
-    corners: usize,
-) -> (usize, usize) {
+/// U and V boundary squares. Returns the face index within the parent polygon.
+fn ngon_square_order(corner: usize, x: usize, y: usize, side: usize, corners: usize) -> usize {
     let inner = side.saturating_sub(1);
     let boundary = side.saturating_sub(2);
     let inner_per_corner = inner * boundary;
@@ -1377,23 +1373,20 @@ fn ngon_square_order(
     let centre_faces = corners * centre_per_corner;
 
     if side >= 2 && (1..side).contains(&x) && (1..side - 1).contains(&y) {
-        return (corner * inner_per_corner + (y - 1) * inner + (x - 1), 0);
+        return corner * inner_per_corner + (y - 1) * inner + (x - 1);
     }
     if side >= 3 && y == side - 1 && (1..side - 1).contains(&x) {
-        return (inner_faces + corner * boundary + x - 1, 1);
+        return inner_faces + corner * boundary + x - 1;
     }
     if side >= 2 && x == side - 1 && y == side - 1 {
-        return (inner_faces + connection_faces + corner, 2);
+        return inner_faces + connection_faces + corner;
     }
 
     let boundary_start = inner_faces + connection_faces + centre_faces;
     if y == 0 {
-        (boundary_start + corner * side + x, 0)
+        boundary_start + corner * side + x
     } else {
-        (
-            boundary_start + corners * side + corner * inner + (y - 1),
-            3,
-        )
+        boundary_start + corners * side + corner * inner + (y - 1)
     }
 }
 
@@ -1510,11 +1503,11 @@ pub(super) fn subdivided_mesh(
     }));
     let origin = Origin {
         vertices: vertex_origins,
-        source_vertices: mesh.original_indices.as_ref().map(|_| {
+        source_vertices: Some(
             (0..points.len())
                 .map(|index| (index < mesh.vertices.len()).then_some(index))
-                .collect()
-        }),
+                .collect(),
+        ),
         faces: source_polygons
             .iter()
             .enumerate()
@@ -1523,6 +1516,7 @@ pub(super) fn subdivided_mesh(
         corners: None,
     };
     let mut output = build_mesh(points, output_polygons, output_loose_edges, &origin, mesh)?;
+    encode_byte_colors(mesh, &origin, &mut output);
     if use_creases && mesh.attributes.contains_key("crease_edge") {
         let mut next_creases = BTreeMap::new();
         for (edge, sharpness) in edge_creases {
@@ -1563,6 +1557,94 @@ pub(super) fn subdivided_mesh(
     Ok(output)
 }
 
+/// Blender interpolates a `BYTE_COLOR` layer in its stored bytes: RGB holds sRGB-encoded bytes and alpha is
+/// linear. Each subdivided value mixes its sources' bytes and truncates the sum to a byte, so the result is
+/// not a linear mix. Potter's colour store is linear, so every byte-typed layer is re-blended here from the
+/// same origins the attribute remap used, and float layers keep the linear remap.
+fn encode_byte_colors(source: &Mesh, origin: &Origin, output: &mut Mesh) {
+    let Some(types) = source
+        .attributes
+        .get("blender_metadata")
+        .and_then(|metadata| metadata.get("color_data_types"))
+        .and_then(Value::as_object)
+    else {
+        return;
+    };
+    let byte_layers: BTreeSet<&str> = types
+        .iter()
+        .filter(|(_, data_type)| data_type.as_str() == Some("BYTE_COLOR"))
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if byte_layers.is_empty() {
+        return;
+    }
+    let source_store = color_layers::read(source);
+    let mut store = color_layers::read(output);
+    let output_vertex_index: HashMap<u32, usize> = output
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(index, vertex)| (vertex.id, index))
+        .collect();
+    let corners = corner_sources(source, origin, output, &output_vertex_index);
+    for layer in &mut store.layers {
+        if !byte_layers.contains(layer.name.as_str()) {
+            continue;
+        }
+        let Some(source_layer) = source_store
+            .layers
+            .iter()
+            .find(|candidate| candidate.name == layer.name)
+        else {
+            continue;
+        };
+        let sources = match layer.domain {
+            ColorDomain::Point => origin.vertices.as_slice(),
+            ColorDomain::Corner => corners.as_slice(),
+        };
+        layer.values = sources
+            .iter()
+            .map(|sources| mix_byte_color(&source_layer.values, sources))
+            .collect();
+    }
+    color_layers::write(output, &store);
+}
+
+/// One output value of a `BYTE_COLOR` layer: each source's stored byte times its origin weight, summed and
+/// truncated to a byte per channel, then decoded back to linear. A value with no source is opaque black, as
+/// the attribute remap's default.
+fn mix_byte_color(values: &[[f64; 4]], sources: &[(usize, f64)]) -> [f64; 4] {
+    let mut bytes = [0.0_f64; 4];
+    let mut found = false;
+    for (index, weight) in sources {
+        let Some(value) = values.get(*index) else {
+            continue;
+        };
+        found = true;
+        for (channel, component) in value.iter().enumerate() {
+            let encoded = if channel < 3 {
+                linear_to_srgb(*component)
+            } else {
+                *component
+            };
+            bytes[channel] += weight * (encoded * 255.0).round();
+        }
+    }
+    if !found {
+        return [0.0, 0.0, 0.0, 1.0];
+    }
+    let mut color = [0.0; 4];
+    for (channel, &byte) in bytes.iter().enumerate() {
+        let unit = (byte + 1.0e-9).floor().clamp(0.0, 255.0) / 255.0;
+        color[channel] = if channel < 3 {
+            srgb_to_linear(unit)
+        } else {
+            unit
+        };
+    }
+    color
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1595,10 +1677,18 @@ mod tests {
     }
 
     #[test]
-    fn loop_numbering_is_identity_on_level_one_and_a_permutation_on_level_two() {
+    fn loop_numbering_starts_each_square_at_its_own_corner_on_level_one() {
+        // Quad `f`'s corner `c` is ptex square `c`, numbered from its own grid corner: loop `c + k`.
         let mut state = quads(2);
         state.refine();
-        assert_eq!(state.loop_order(), (0..32).collect::<Vec<_>>());
+        let expected: Vec<usize> = (0..2)
+            .flat_map(|face| {
+                (0..4).flat_map(move |corner| {
+                    (0..4).map(move |k| 16 * face + 4 * corner + (corner + k) % 4)
+                })
+            })
+            .collect();
+        assert_eq!(state.loop_order(), expected);
         state.refine();
         let mut order = state.loop_order();
         order.sort_unstable();

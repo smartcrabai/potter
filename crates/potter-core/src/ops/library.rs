@@ -1055,6 +1055,13 @@ fn copy_items(
                     }
                 }
             }
+            "data_blocks" => {
+                if let Some(materials) = value.get("materials").and_then(Value::as_array) {
+                    for material in materials.iter().filter_map(Value::as_str) {
+                        queue.push(("materials".to_owned(), Id::new(material)?));
+                    }
+                }
+            }
             "collections" => {
                 for (field, registry_name) in [("children", "collections"), ("objects", "nodes")] {
                     if let Some(references) = value.get(field).and_then(Value::as_array) {
@@ -1459,5 +1466,65 @@ mod tests {
     fn namespace_never_exceeds_persistent_id_limit() {
         let id = Id::new("x".repeat(64)).unwrap();
         assert!(namespaced_id("library", &id).unwrap().as_str().len() <= 64);
+    }
+
+    #[test]
+    fn copying_data_blocks_copies_raw_material_references() {
+        let mut source = crate::model::SceneDoc::new("source-scene".to_owned());
+        let node_id = Id::new("mesh_node").unwrap();
+        let data_id = Id::new("mesh_data").unwrap();
+        let material_id = Id::new("data_material").unwrap();
+        source
+            .materials
+            .insert(material_id.clone(), Material::default());
+        source.data_blocks.insert(
+            data_id.clone(),
+            DataBlock {
+                materials: vec![Some(material_id.clone()), None],
+                ..DataBlock::default()
+            },
+        );
+        source.nodes.insert(
+            node_id.clone(),
+            Node {
+                kind: "mesh".to_owned(),
+                data: Some(data_id.clone()),
+                materials: vec![None, None],
+                ..Node::default()
+            },
+        );
+        let mut target = crate::model::SceneDoc::new("target-scene".to_owned());
+        let mut engine = Engine {
+            doc: &mut target,
+            changes: crate::ops::ChangeSet::default(),
+            id_mappings: Map::new(),
+            operation_index: 0,
+            evaluation_frame: 1.0,
+            asset_root: None,
+            cache_directory: None,
+            pending_assets: BTreeMap::default(),
+            warnings: Vec::new(),
+        };
+        let (mapping, copied) = copy_items(
+            &mut engine,
+            &source,
+            &[("nodes".to_owned(), node_id)],
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(mapping.contains_key(&("materials".to_owned(), "data_material".to_owned())));
+        assert!(
+            copied
+                .iter()
+                .any(|(registry, id, _)| { registry == "materials" && id == &material_id })
+        );
+        let copied_data = &copied
+            .iter()
+            .find(|(registry, _, _)| registry == "data_blocks")
+            .unwrap()
+            .2;
+        let mapped_material = &mapping[&("materials".to_owned(), "data_material".to_owned())];
+        assert_eq!(copied_data["materials"], json!([mapped_material, null]));
     }
 }

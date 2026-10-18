@@ -30,9 +30,10 @@ use std::{
 
 use native_oracle::{
     BYTE_TOLERANCE, FLOAT_TOLERANCE, NORMAL_TOLERANCE, StoredCorner, TestResult, apply_operations,
-    assert_close, assert_floats, attribute, blender, build_oracle, code_pair, dump_blend,
-    dumped_object, export, floats, import_blend, mesh_of_node, node_id, normal_code_rows, number,
-    read_scene, run_blender, vec3, vectors_close, write_script,
+    assert_close, assert_floats, attribute, build_oracle, code_pair, code_within_one_unit,
+    dump_blend, dumped_object, export, floats, import_blend, mesh_of_node, node_id,
+    normal_code_rows, number, read_scene, run_blender, run_blender_arguments, vec3, vectors_close,
+    write_script,
 };
 use serde_json::{Map, Value, json};
 use tempfile::tempdir;
@@ -43,7 +44,7 @@ const AUTHORING_REFERENCE_SCRIPT: &str =
 
 /// Attaches UV layers, two color layers, and generic corner/face attributes to `Regress`, keeping its
 /// custom normals. Values are written to the file and read back by Blender, never by Potter.
-const ATTACH_LAYERS_SCRIPT: &str = r#"""Attaches native corner and face data to the oracle's Regress object (Blender 5.2.2).
+const ATTACH_LAYERS_SCRIPT: &str = r#""""Attaches native corner and face data to the oracle's Regress object (Blender 5.2.2).
 
 Usage: Blender -b oracle.blend --python attach_layers.py -- OUT.blend
 """
@@ -74,8 +75,8 @@ for layer_index, name in enumerate(["Base", "Light", "Detail"]):
             round4(0.1 * (layer_index + 1) + 0.013 * loop_index),
             round4(0.9 - 0.007 * loop_index - 0.2 * layer_index),
         ]
-mesh.uv_layers.active_index = 2
-mesh.uv_layers.active_render_index = 1
+mesh.uv_layers.active = mesh.uv_layers["Detail"]
+mesh.uv_layers["Light"].active_render = True
 
 glow = mesh.color_attributes.new("Glow", "FLOAT_COLOR", "CORNER")
 for loop_index, item in enumerate(glow.data):
@@ -110,7 +111,7 @@ bpy.ops.wm.save_as_mainfile(filepath=OUT)
 
 /// Blender's own Subdivision (levels 1, Use Custom Normals on) evaluation of `Regress`, read back
 /// per corner and per face. Corner identity is the position plus the face center.
-const SUBDIVISION_DATA_REFERENCE_SCRIPT: &str = r#"""Blender's evaluated corner and face data of the Subdivision result of `Regress` (5.2.2).
+const SUBDIVISION_DATA_REFERENCE_SCRIPT: &str = r#""""Blender's evaluated corner and face data of the Subdivision result of `Regress` (5.2.2).
 
 Usage: Blender -b attached.blend --python subdivision_data_reference.py -- OUT.json
 
@@ -616,7 +617,7 @@ fn authoring_reference(blender: &Path, root: &Path, blend: &Path) -> TestResult<
 
 #[test]
 fn subdivision_codes_and_corner_data_follow_one_loop_basis_through_blend() -> TestResult {
-    let Some(blender) = blender() else {
+    let Some(blender) = blender_checked::blender_executable() else {
         return Ok(());
     };
     let root = tempdir()?;
@@ -712,7 +713,7 @@ fn subdivision_codes_and_corner_data_follow_one_loop_basis_through_blend() -> Te
 #[test]
 fn subdivision_without_custom_normals_keeps_loop_basis_and_later_authoring_allocates_the_layer()
 -> TestResult {
-    let Some(blender) = blender() else {
+    let Some(blender) = blender_checked::blender_executable() else {
         return Ok(());
     };
     let root = tempdir()?;
@@ -828,5 +829,190 @@ fn subdivision_without_custom_normals_keeps_loop_basis_and_later_authoring_alloc
             "Auto status of loop {loop_index} differs from Blender's reference"
         );
     }
+    Ok(())
+}
+const NONMANIFOLD_SUBDIVISION_ORACLE: &str = r#"
+import json
+import math
+import sys
+
+import bpy
+if bpy.app.version != (5, 2, 2):
+    raise SystemExit("this oracle requires Blender 5.2.2, got %r" % (bpy.app.version,))
+
+
+OUT_BLEND, OUT_JSON = sys.argv[sys.argv.index("--") + 1:]
+vertices = [
+    (0, 0, 0), (0, 0, 1), (1, 0, 0), (1, 1, 0),
+    (-1, 0, 0), (-1, -1, 0), (0, 1, 0), (0, 2, 1),
+]
+faces = [(0, 1, 2, 3), (1, 0, 4, 5), (0, 1, 6, 7)]
+mesh = bpy.data.meshes.new("NonmanifoldData")
+mesh.from_pydata(vertices, [], faces)
+mesh.update()
+obj = bpy.data.objects.new("Nonmanifold", mesh)
+bpy.context.scene.collection.objects.link(obj)
+for polygon in mesh.polygons:
+    polygon.use_smooth = True
+edge_map = {tuple(sorted(edge.vertices)): edge for edge in mesh.edges}
+for pair in ((0, 1), (2, 3), (4, 5), (6, 7)):
+    edge_map[tuple(sorted(pair))].use_seam = True
+crease = mesh.attributes.new(name="crease_edge", type="FLOAT", domain="EDGE")
+for item in crease.data:
+    item.value = 0.0
+
+vectors = []
+for polygon in mesh.polygons:
+    for corner in range(polygon.loop_total):
+        loop_index = polygon.loop_start + corner
+        vertex_index = mesh.loops[loop_index].vertex_index
+        x, y, z = mesh.vertices[vertex_index].co
+        vector = (
+            0.13 + 0.025 * polygon.index + 0.02 * corner,
+            -0.11 + 0.015 * vertex_index,
+            1.0 + 0.03 * x - 0.02 * y + 0.01 * z,
+        )
+        length = math.sqrt(sum(component * component for component in vector))
+        vectors.append(tuple(component / length for component in vector))
+mesh.normals_split_custom_set(vectors)
+mesh.update()
+bpy.ops.wm.save_as_mainfile(filepath=OUT_BLEND)
+
+modifier = obj.modifiers.new("Nonmanifold Subdivision", "SUBSURF")
+modifier.subdivision_type = "CATMULL_CLARK"
+modifier.levels = 2
+modifier.render_levels = 2
+modifier.quality = 3
+modifier.boundary_smooth = "ALL"
+modifier.uv_smooth = "PRESERVE_BOUNDARIES"
+modifier.use_creases = True
+modifier.use_custom_normals = True
+modifier.use_limit_surface = True
+bpy.context.view_layer.update()
+depsgraph = bpy.context.evaluated_depsgraph_get()
+evaluated = obj.evaluated_get(depsgraph)
+result = evaluated.to_mesh(preserve_all_data_layers=True, depsgraph=depsgraph)
+codes = result.attributes.get("custom_normal")
+if codes is None:
+    raise SystemExit("Blender Subdivision returned no custom_normal layer")
+raw_codes = [tuple(int(component) for component in item.value) for item in codes.data]
+loops = []
+for polygon in result.polygons:
+    center = [float(component) for component in polygon.center]
+    for corner in range(polygon.loop_total):
+        loop_index = polygon.loop_start + corner
+        vertex_index = result.loops[loop_index].vertex_index
+        code = raw_codes[loop_index]
+        loops.append({
+            "co": [float(component) for component in result.vertices[vertex_index].co],
+            "center": center,
+            "normal": [float(component) for component in result.corner_normals[loop_index].vector],
+            "code": None if code == (0, 0) else list(code),
+        })
+witness = next(
+    (polygon for polygon in result.polygons if list(polygon.vertices) == [0, 11, 56, 29]),
+    None,
+)
+if witness is None:
+    raise SystemExit("Blender nonmanifold Subdivision witness face is missing")
+witness_codes = [
+    None if raw_codes[index] == (0, 0) else list(raw_codes[index])
+    for index in range(witness.loop_start, witness.loop_start + witness.loop_total)
+]
+with open(OUT_JSON, "w", encoding="utf-8") as handle:
+    json.dump({
+        "blender": bpy.app.version_string,
+        "loops": loops,
+        "witness": {"vertices": list(witness.vertices), "codes": witness_codes},
+    }, handle)
+evaluated.to_mesh_clear()
+"#;
+
+#[test]
+fn nonmanifold_subdivision_auto_codes_match_blenders_evaluated_fan() -> TestResult {
+    let Some(blender) = blender_checked::blender_executable() else {
+        return Ok(());
+    };
+    let root = tempdir()?;
+    let script = write_script(
+        root.path(),
+        "nonmanifold_subdivision_oracle.py",
+        NONMANIFOLD_SUBDIVISION_ORACLE,
+    )?;
+    let source_blend = root.path().join("nonmanifold.blend");
+    let expected_path = root.path().join("nonmanifold.expected.json");
+    run_blender_arguments(&blender, &script, None, &[&source_blend, &expected_path])?;
+    let expected: Value = serde_json::from_slice(&fs::read(&expected_path)?)?;
+    let source_loops = expected["loops"]
+        .as_array()
+        .ok_or("Blender source Subdivision loops are missing")?;
+    let witness_codes = expected["witness"]["codes"]
+        .as_array()
+        .ok_or("Blender nonmanifold witness codes are missing")?;
+    assert_eq!(expected["witness"]["vertices"], json!([0, 11, 56, 29]));
+    assert_eq!(
+        witness_codes[0],
+        Value::Null,
+        "source witness loop zero is Auto"
+    );
+    assert_eq!(
+        witness_codes[1],
+        Value::Null,
+        "source witness loop one is Auto"
+    );
+
+    let (project, _) = import_blend(&blender, root.path(), "project", &source_blend)?;
+    let node = node_id(&read_scene(&project)?, "Nonmanifold")?;
+    let applied = apply_operations(
+        &project,
+        root.path(),
+        json!([
+            {
+                "op": "modifier.create",
+                "target": {"id": node},
+                "id": "subsurf",
+                "type": "subdivision",
+                "params": {
+                    "levels": 2,
+                    "subdivision_type": "CATMULL_CLARK",
+                    "quality": 3,
+                    "boundary_smooth": "ALL",
+                    "uv_smooth": "PRESERVE_BOUNDARIES",
+                    "use_creases": true,
+                    "use_custom_normals": true,
+                    "use_limit_surface": true
+                }
+            },
+            {"op": "modifier.apply", "target": {"id": node}, "modifier_id": "subsurf"}
+        ]),
+    )?;
+    assert_eq!(applied["ok"], true, "{applied}");
+    let scene = read_scene(&project)?;
+    let mesh = mesh_of_node(&scene, "Nonmanifold")?;
+    let actual_rows = normal_code_rows(mesh)?;
+    let faces = potter_faces(mesh)?;
+    let keys = reference_keys(source_loops)?;
+    let mut matched = BTreeSet::new();
+    for (face_index, face) in faces.iter().enumerate() {
+        for (corner_index, position) in face.corners.iter().enumerate() {
+            let source_loop = nearest_corner(&keys, *position, face.center)?;
+            assert!(
+                matched.insert(source_loop),
+                "source loop {source_loop} matched twice"
+            );
+            let raw = &source_loops[source_loop]["code"];
+            let expected_code = if raw.is_null() {
+                StoredCorner::Auto
+            } else {
+                StoredCorner::Code(code_pair(raw)?)
+            };
+            assert!(
+                code_within_one_unit(&actual_rows[face_index][corner_index], &expected_code),
+                "Subsurf loop {source_loop} code within one unit of Blender: actual {:?}, expected {expected_code:?}",
+                actual_rows[face_index][corner_index]
+            );
+        }
+    }
+    assert_eq!(matched.len(), source_loops.len());
     Ok(())
 }

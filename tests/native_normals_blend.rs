@@ -19,7 +19,7 @@ mod native_oracle;
 mod process;
 
 use native_oracle::{
-    NORMAL_TOLERANCE, StoredCorner, TestResult, apply_operations, blender, build_oracle, code_pair,
+    NORMAL_TOLERANCE, StoredCorner, TestResult, apply_operations, build_oracle, code_pair,
     dump_blend, dumped_object, export, has_normal_code_values, import_blend, mesh_of_node, node_id,
     normal_code_rows, read_scene, run_blender_arguments, vec3, vectors_close, write_script,
 };
@@ -83,7 +83,7 @@ fn check_stored_codes(
 
 #[test]
 fn import_stores_raw_blender_code_pairs_as_normal_code_state() -> TestResult {
-    let Some(blender) = blender() else {
+    let Some(blender) = blender_checked::blender_executable() else {
         return Ok(());
     };
     let root = tempdir()?;
@@ -176,7 +176,7 @@ fn dumped_corners(object: &Value) -> TestResult<Vec<DumpedCorner>> {
 
 #[test]
 fn subdivision_then_displace_keeps_every_corner_normal_as_blender_computes_it() -> TestResult {
-    let Some(blender) = blender() else {
+    let Some(blender) = blender_checked::blender_executable() else {
         return Ok(());
     };
     let root = tempdir()?;
@@ -296,7 +296,7 @@ with open(OUT, "w", encoding="utf-8") as handle:
 
 #[test]
 fn subdivision_without_use_custom_normals_drops_the_custom_normal_layer() -> TestResult {
-    let Some(blender) = blender() else {
+    let Some(blender) = blender_checked::blender_executable() else {
         return Ok(());
     };
     let root = tempdir()?;

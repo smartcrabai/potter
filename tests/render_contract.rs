@@ -526,7 +526,7 @@ fn material_emission_and_transmission_fields_create_update_and_validate()
     );
     assert_eq!(created["materials"]["plain"]["emission_strength"], 0.0);
     assert_eq!(created["materials"]["plain"]["transmission"], 0.0);
-    assert_eq!(created["materials"]["plain"]["ior"], 1.45);
+    assert_eq!(created["materials"]["plain"]["ior"], 1.5);
 
     let update = r#"{"schema_version":1,"base_revision":1,"operations":[{"op":"material.update","target":{"id":"glow"},"set":{"emission_strength":4.0,"transmission":0.2,"ior":1.5}}]}"#;
     assert_success(&apply_operations(&scene, update, &["--json"])?)?;
@@ -695,6 +695,55 @@ fn path_shadow_rays_darkening_blocked_surface() -> Result<(), Box<dyn Error>> {
     assert!(
         shadowed < lit,
         "a blocking object should darken the directly lit surface: {lit} vs {shadowed}"
+    );
+    Ok(())
+}
+
+fn preview_beauty_center(scene: &Path, out: &Path) -> Result<[u8; 4], Box<dyn Error>> {
+    let output = pot()
+        .arg("preview")
+        .arg(scene)
+        .args([
+            "--camera",
+            "camera_main",
+            "--mode",
+            "beauty",
+            "--size",
+            "64",
+            "--overwrite",
+            "--out",
+        ])
+        .arg(out)
+        .arg("--json")
+        .output()?;
+    assert_success(&output)?;
+    let (width, height, pixels) = decode_rgba(&fs::read(out.join("camera_main.png"))?)?;
+    let center =
+        (usize::try_from(height / 2)? * usize::try_from(width)? + usize::try_from(width / 2)?) * 4;
+    Ok([
+        pixels[center],
+        pixels[center + 1],
+        pixels[center + 2],
+        pixels[center + 3],
+    ])
+}
+
+#[test]
+fn beauty_preview_honours_render_visibility() -> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let scene = directory.path().join("scene");
+    init_scene(&scene)?;
+    let setup = r#"{"schema_version":1,"base_revision":0,"operations":[{"op":"material.create","id":"glow","base_color":[0.0,0.0,0.0,1.0],"emission_color":[1.0,0.5,0.0],"emission_strength":1.0},{"op":"node.create","id":"body","kind":"box","params":{"size":1.0},"transform":{"translation":[0,0,0.5]},"material":"glow"},{"op":"camera.create","id":"camera_main","transform":{"translation":[0,0,4]},"projection":"orthographic","ortho_scale":2.5},{"op":"scene.update","target":{"id":"scene_main"},"set":{"camera":"camera_main"}},{"op":"render.update","target":{"id":"scene_main"},"set":{"resolution_x":64,"resolution_y":64,"samples":1,"seed":0,"max_bounces":0}}]}"#;
+    assert_success(&apply_operations(&scene, setup, &["--json"])?)?;
+    let hide = r#"{"schema_version":1,"base_revision":1,"operations":[{"op":"node.update","target":{"id":"body"},"set":{"render_visible":false}}]}"#;
+    assert_success(&apply_operations(&scene, hide, &["--json"])?)?;
+    let hidden = preview_beauty_center(&scene, &directory.path().join("hidden.png"))?;
+    let show = r#"{"schema_version":1,"base_revision":2,"operations":[{"op":"node.update","target":{"id":"body"},"set":{"render_visible":true}}]}"#;
+    assert_success(&apply_operations(&scene, show, &["--json"])?)?;
+    let shown = preview_beauty_center(&scene, &directory.path().join("shown.png"))?;
+    assert!(
+        shown[0] > hidden[0] + 40,
+        "a box hidden from render must not appear in the beauty preview: hidden {hidden:?}, shown {shown:?}"
     );
     Ok(())
 }

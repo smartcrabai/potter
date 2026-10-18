@@ -48,6 +48,9 @@ fn base(title: &str) -> Value {
 fn id_schema() -> Value {
     json!({"type":"string","pattern":"^[a-z][a-z0-9_-]{0,63}$"})
 }
+fn nullable_id_array_schema() -> Value {
+    json!({"type":"array","items":{"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]}})
+}
 
 fn vec_schema(size: usize) -> Value {
     json!({"type":"array","items":{"type":"number"},"minItems":size,"maxItems":size})
@@ -115,7 +118,7 @@ fn scene_schema() -> Value {
         "unit":{"type":"object","required":["system","scale_length"],"properties":{"system":{"type":"string"},"scale_length":{"type":"number","exclusiveMinimum":0}},"additionalProperties":false},
         "view_layer":{"type":"object","required":["name","excluded_collections"],"properties":{"name":{"type":"string"},"excluded_collections":{"type":"array","items":{"$ref":"#/$defs/id"}}},"additionalProperties":false},
         "scene":{"type":"object","required":["name","root_collection","view_layers","frame_current","frame_start","frame_end","fps","fps_base","camera","world","unit","markers","render","rigid_body_world"],"properties":{"name":{"type":"string"},"root_collection":{"$ref":"#/$defs/id"},"view_layers":registry_schema("view_layer"),"frame_current":{"type":"number"},"frame_start":{"type":"integer"},"frame_end":{"type":"integer"},"fps":{"type":"integer","minimum":1},"fps_base":{"type":"number","exclusiveMinimum":0},"camera":{"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]},"world":{"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]},"unit":{"$ref":"#/$defs/unit"},"render":{"$ref":"#/$defs/render_settings"},"markers":{"type":"array","items":{"$ref":"#/$defs/marker"}},"rigid_body_world":{"oneOf":[{"$ref":"#/$defs/rigid_body_world"},{"type":"null"}]}},"additionalProperties":false},
-        "render_settings":{"type":"object","required":["resolution_x","resolution_y","resolution_percentage","samples","seed","max_bounces","film_transparent","engine","use_sequencer","audio_codec","passes"],"properties":{"resolution_x":{"type":"integer","minimum":1,"maximum":16384},"resolution_y":{"type":"integer","minimum":1,"maximum":16384},"resolution_percentage":{"type":"integer","minimum":1,"maximum":100},"samples":{"type":"integer","minimum":1,"maximum":1_000_000},"seed":{"type":"integer","minimum":0,"maximum":u32::MAX},"max_bounces":{"type":"integer","minimum":0,"maximum":1024},"film_transparent":{"type":"boolean"},"engine":{"enum":["path","realtime"]},"use_sequencer":{"type":"boolean"},"audio_codec":{"enum":["wav","flac"]},"passes":{"type":"array","items":{"type":"string"}}},"additionalProperties":false},
+        "render_settings":{"type":"object","required":["resolution_x","resolution_y","resolution_percentage","samples","seed","max_bounces","film_transparent","engine","use_sequencer","audio_codec","passes"],"properties":{"resolution_x":{"type":"integer","minimum":1,"maximum":16384},"resolution_y":{"type":"integer","minimum":1,"maximum":16384},"resolution_percentage":{"type":"integer","minimum":1,"maximum":100},"samples":{"type":"integer","minimum":1,"maximum":1_000_000},"seed":{"type":"integer","minimum":0,"maximum":u32::MAX},"max_bounces":{"type":"integer","minimum":0,"maximum":1024},"film_transparent":{"type":"boolean"},"engine":{"enum":["path","realtime"]},"use_sequencer":{"type":"boolean"},"audio_codec":{"enum":["wav","flac"]},"passes":{"type":"array","items":{"type":"string"}},"cryptomatte_accurate":{"type":"boolean"}},"additionalProperties":false},
         "marker":{"type":"object","required":["id","name","frame"],"properties":{"id":{"$ref":"#/$defs/id"},"name":{"type":"string"},"frame":{"type":"number"}},"additionalProperties":false},
         "rigid_body_world":{"type":"object","properties":{"enabled":{"type":"boolean"},"gravity":{"$ref":"#/$defs/vec3"},"substeps":{"type":"integer","minimum":1,"maximum":128},"solver_iterations":{"type":"integer","minimum":1,"maximum":128},"frame_start":{"type":"integer","minimum":i32::MIN,"maximum":i32::MAX},"frame_end":{"type":"integer","minimum":i32::MIN,"maximum":i32::MAX},"seed":{"type":"integer","minimum":0,"maximum":u32::MAX}},"additionalProperties":false},
         "rigid_body":{"type":"object","properties":{"type":{"enum":["active","passive"]},"mass":{"type":"number","minimum":0},"friction":{"type":"number","minimum":0},"restitution":{"type":"number","minimum":0,"maximum":1},"shape":{"enum":["box","sphere","convex_hull","mesh"]},"linear_damping":{"type":"number","minimum":0},"angular_damping":{"type":"number","minimum":0},"initial_velocity":{"$ref":"#/$defs/vec3"}},"additionalProperties":false},
@@ -126,7 +129,7 @@ fn scene_schema() -> Value {
         "library":{"type":"object","required":["name","kind","uri","resolved_path","resource","hash","status","linked_ids","overrides","items","source_project"],"properties":{"name":{"type":"string"},"kind":{"enum":["potter_project","blend"]},"uri":{"type":"string"},"resolved_path":{"type":"string"},"resource":{"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]},"hash":{"type":"string"},"status":{"enum":["ok","missing","changed"]},"linked_ids":{"type":"object","propertyNames":{"enum":["nodes","data_blocks","materials","collections","actions","node_groups","worlds","resources"]},"additionalProperties":{"type":"array","items":{"$ref":"#/$defs/id"}}},"overrides":{"type":"array","items":{"$ref":"#/$defs/library_override"}},"items":{"type":"object","additionalProperties":{"type":"string"}},"source_project":{"type":["string","null"]}},"additionalProperties":false},
         "library_override":{"type":"object","required":["registry","id","reference_id","properties"],"properties":{"registry":{"type":"string"},"id":{"$ref":"#/$defs/id"},"reference_id":{"$ref":"#/$defs/id"},"properties":{"type":"array","items":{"$ref":"#/$defs/library_override_property"}}},"additionalProperties":false},
         "library_override_property":{"type":"object","required":["path","operation","value"],"properties":{"path":{"type":"string"},"operation":{"enum":["replace","insert_after","delete"]},"value":{}},"additionalProperties":false},
-        "node":{"type":"object","required":["name","kind"],"properties":{"name":{"type":"string"},"kind":{"enum":["empty","mesh","camera","light"]},"primitive":{"type":["string","null"]},"tags":{"type":"array","items":{"$ref":"#/$defs/id"}},"parent":{"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]},"parent_inverse":{"oneOf":[{"type":"array","items":{"type":"number"},"minItems":16,"maxItems":16},{"type":"null"}]},"transform":{"$ref":"#/$defs/transform"},"data":{"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]},"materials":{"type":"array","items":{"$ref":"#/$defs/id"}},"modifiers":{"type":"array","items":{"$ref":"#/$defs/modifier"}},"visible":{"type":"boolean"},"render_visible":{"type":"boolean"},"selectable":{"type":"boolean"},"action":{"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]},"nla_tracks":{"type":"array","items":{"type":"object"}},"properties":{"type":"object"},"rigid_body":{"oneOf":[{"$ref":"#/$defs/rigid_body"},{"type":"null"}]},"force_field":{"oneOf":[{"$ref":"#/$defs/force_field"},{"type":"null"}]},"parent_type":{"enum":["object","bone"]},"parent_bone":{"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]},"pose":{"type":"object","additionalProperties":{"type":"object"}},"constraints":{"type":"array","items":{"type":"object"}},"drivers":{"type":"array","items":{"type":"object"}}},"additionalProperties":false},
+        "node":{"type":"object","required":["name","kind"],"properties":{"name":{"type":"string"},"kind":{"enum":["empty","mesh","camera","light"]},"primitive":{"type":["string","null"]},"tags":{"type":"array","items":{"$ref":"#/$defs/id"}},"parent":{"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]},"parent_inverse":{"oneOf":[{"type":"array","items":{"type":"number"},"minItems":16,"maxItems":16},{"type":"null"}]},"transform":{"$ref":"#/$defs/transform"},"data":{"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]},"materials":{"type":"array","items":{"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]}},"modifiers":{"type":"array","items":{"$ref":"#/$defs/modifier"}},"visible":{"type":"boolean"},"render_visible":{"type":"boolean"},"selectable":{"type":"boolean"},"action":{"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]},"nla_tracks":{"type":"array","items":{"type":"object"}},"properties":{"type":"object"},"rigid_body":{"oneOf":[{"$ref":"#/$defs/rigid_body"},{"type":"null"}]},"force_field":{"oneOf":[{"$ref":"#/$defs/force_field"},{"type":"null"}]},"parent_type":{"enum":["object","bone"]},"parent_bone":{"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]},"pose":{"type":"object","additionalProperties":{"type":"object"}},"constraints":{"type":"array","items":{"type":"object"}},"drivers":{"type":"array","items":{"type":"object"}}},"additionalProperties":false},
         "vertex":{"type":"object","required":["id","co"],"properties":{"id":{"type":"integer","minimum":0,"maximum":u32::MAX},"co":{"$ref":"#/$defs/vec3"}},"additionalProperties":false},
         "edge":{"type":"object","required":["id","v"],"properties":{"id":{"type":"integer","minimum":0,"maximum":u32::MAX},"v":{"type":"array","items":{"type":"integer","minimum":0,"maximum":u32::MAX},"minItems":2,"maxItems":2}},"additionalProperties":false},
         "face":{"type":"object","required":["id","v","material_index"],"properties":{"id":{"type":"integer","minimum":0,"maximum":u32::MAX},"v":{"type":"array","items":{"type":"integer","minimum":0,"maximum":u32::MAX},"minItems":3},"material_index":{"type":"integer","minimum":0,"maximum":u32::MAX}},"additionalProperties":false},
@@ -168,6 +171,12 @@ fn scene_schema() -> Value {
     });
     root["$defs"]["node"]["properties"]["constraints"]["items"] =
         json!({"$ref":"#/$defs/constraint"});
+    root["$defs"]["node"]["properties"]["materials"] = nullable_id_array_schema();
+    root["$defs"]["node"]["properties"]["material_links"] = json!({
+        "type":"array",
+        "items":{"enum":["data","object"]}
+    });
+    root["$defs"]["data_block"]["properties"]["materials"] = nullable_id_array_schema();
     complete_scene_schema(&mut root);
     root
 }
@@ -343,12 +352,10 @@ fn texture_ref_schema() -> Value {
 fn nullable_texture_ref_schema() -> Value {
     json!({"oneOf":[texture_ref_schema(),{"type":"null"}]})
 }
-
 /// A UV layer name: a non-empty string.
 fn layer_name_schema() -> Value {
     json!({"type":"string","minLength":1})
 }
-
 fn avatar_settings_schema() -> Value {
     let id = id_schema();
     let nullable_id = json!({"oneOf":[id.clone(),{"type":"null"}]});
@@ -2229,7 +2236,7 @@ fn field_schema(operation: &str, field: &str) -> Value {
         "params" | "properties" => json!({"type":"object"}),
         "positions" if operation == "shape_key.create" => json!({"type":"object"}),
         "head" | "tail" if operation.starts_with("bone.") => vec_schema(3),
-        "materials" => json!({"type":"array","items":id_schema()}),
+        "materials" => nullable_id_array_schema(),
         "base_color" => {
             json!({"type":"array","items":{"type":"number","minimum":0,"maximum":1},"minItems":4,"maxItems":4})
         }
@@ -2349,7 +2356,7 @@ fn elements_schema() -> Value {
 }
 
 fn set_schema(operation: &str) -> Value {
-    let properties = match operation {
+    let mut properties = match operation {
         "scene.update" => json!({
             "name":{"type":"string"},"frame_current":{"type":"number"},
             "frame_start":{"type":"integer"},"frame_end":{"type":"integer"},
@@ -2364,7 +2371,7 @@ fn set_schema(operation: &str) -> Value {
         "node.update" => json!({
             "name":{"type":"string"},"tags":{"type":"array","items":id_schema()},
             "transform":{"type":"object","properties":{"translation":vec_schema(3),"rotation_deg":vec_schema(3),"rotation":vec_schema(4),"scale":vec_schema(3)},"additionalProperties":false},
-            "params":{"type":"object"},"materials":{"type":"array","items":id_schema()},
+            "params":{"type":"object"},"materials":{"type":"array","items":{"oneOf":[id_schema(),{"type":"null"}]}},
             "visible":{"type":"boolean"},"render_visible":{"type":"boolean"},"selectable":{"type":"boolean"},
             "action":{"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]}
         }),
@@ -2435,6 +2442,10 @@ fn set_schema(operation: &str) -> Value {
         }),
         _ => json!({}),
     };
+    if operation == "node.update" {
+        properties["materials"] = nullable_id_array_schema();
+    }
+
     json!({"type":"object","properties":properties,"minProperties":1,"additionalProperties":false})
 }
 
@@ -2774,6 +2785,5 @@ mod tests {
         assert_eq!(update["properties"]["image"]["oneOf"][1]["type"], "null");
         Ok(())
     }
-
     use serde_json::Value;
 }

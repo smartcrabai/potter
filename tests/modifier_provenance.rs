@@ -357,7 +357,8 @@ fn provenance_remaps_blender_attributes_on_corners_and_faces() -> TestResult {
         "AttributeTriangle",
     )?;
     let values = blender_attribute_values(&mirrored, "Col", "CORNER")?;
-    assert_eq!(values, vec![10.0, 11.0, 12.0, 12.0, 11.0, 10.0]);
+    // Blender's mirror flip keeps each mirrored face's first corner and reverses the rest (mesh_flip_faces.cc, flip_corner_data, v5.2.2).
+    assert_eq!(values, vec![10.0, 11.0, 12.0, 10.0, 12.0, 11.0]);
     assert_eq!(
         sorted_corner_values_by_face(&mirrored, "Col")?,
         vec![vec![10.0, 11.0, 12.0], vec![10.0, 11.0, 12.0]]

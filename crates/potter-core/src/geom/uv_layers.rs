@@ -329,11 +329,12 @@ pub(crate) fn validate(mesh: &Mesh) -> Result<()> {
 ///   version-1 behaviour and is not reported.
 /// - Pins are kept when they are one boolean per corner. Otherwise the row keeps its UVs, its pins
 ///   are dropped, and a `uv.legacy_pins_dropped` warning is reported.
-/// - The first layer that `uv_map` names is the render and active layer. Without `uv_map`, the first
-///   layer is.
+/// - The first layer that `uv_map` names is the render layer; without `uv_map`, the first layer is.
+/// - A valid `blender_uv_layers[].active` flag selects the active layer independently; when none
+///   survives, the render layer is active.
 /// - At most [`MAX_LAYERS`] layers are kept. Priority: the render layer, then the layers
-///   `referenced` names, then the rest in order. Kept layers keep their original order. Each dropped
-///   layer is reported with a `uv.legacy_layer_dropped` warning.
+///   `referenced` names, then the valid legacy active layer, then the rest in order. Kept layers
+///   keep their original order. Each dropped layer is reported with a `uv.legacy_layer_dropped` warning.
 /// - `blender_attributes` entries that are FLOAT2 `CORNER` attributes named like a version-1 layer
 ///   are removed, because the store now holds those values.
 ///
@@ -397,6 +398,7 @@ pub(crate) fn upgrade_mesh_v1(
     // duplicates are removed below.
     let mut names = BTreeSet::new();
     let mut layers: Vec<UvLayer> = Vec::new();
+    let mut legacy_active = None;
     for (index, layer) in blender_layers.iter().enumerate() {
         let Some(name) = layer
             .get("name")
@@ -461,7 +463,12 @@ pub(crate) fn upgrade_mesh_v1(
             .iter()
             .map(|(_, count)| Some(flipped.by_ref().take(*count).collect()))
             .collect();
+        let is_active = layer.get("active").and_then(Value::as_bool) == Some(true);
+        let layer_index = layers.len();
         layers.push(UvLayer::new(name, rows));
+        if is_active && legacy_active.is_none() {
+            legacy_active = Some(layer_index);
+        }
     }
 
     let mut render: Option<String> = None;
@@ -603,13 +610,12 @@ pub(crate) fn upgrade_mesh_v1(
     }
 
     if !layers.is_empty() {
-        // Version 1 had no active-layer notion. The render layer, the one `uv_map` named, is the
-        // edit target; without `uv_map` the first layer is.
+        // The first `uv_map` layer is render; a surviving legacy active flag selects active.
         let render_index = render
             .as_deref()
             .and_then(|name| layers.iter().position(|layer| layer.name == name))
             .unwrap_or(0);
-        let kept = kept_layers(&layers, render_index, referenced);
+        let kept = kept_layers(&layers, render_index, legacy_active, referenced);
         for (index, layer) in layers.iter().enumerate() {
             if !kept.contains(&index) {
                 warnings.push(json!({
@@ -627,9 +633,12 @@ pub(crate) fn upgrade_mesh_v1(
             .map(|&index| layer_json(&layers[index], &faces))
             .collect();
         let render_name = layers[render_index].name.clone();
+        let active_name = legacy_active
+            .filter(|index| kept.contains(index))
+            .map_or_else(|| render_name.clone(), |index| layers[index].name.clone());
         attributes.insert(
             ATTRIBUTE.to_owned(),
-            json!({"layers": stored, "active": render_name, "render": render_name}),
+            json!({"layers": stored, "active": active_name, "render": render_name}),
         );
     }
     if let Some(entries) = attributes
@@ -683,13 +692,24 @@ fn skipped_row(
 }
 
 /// The layers the layer limit keeps, as indices in their original order. Priority: the render
-/// layer, then the layers `referenced` names, then the rest in order.
-fn kept_layers(layers: &[UvLayer], render: usize, referenced: &BTreeSet<String>) -> Vec<usize> {
+/// layer, then the layers `referenced` names, then the valid legacy active layer, then the rest.
+fn kept_layers(
+    layers: &[UvLayer],
+    render: usize,
+    legacy_active: Option<usize>,
+    referenced: &BTreeSet<String>,
+) -> Vec<usize> {
     let is_referenced = |index: &usize| referenced.contains(&layers[*index].name);
+    let is_active = |index: &usize| Some(*index) == legacy_active;
     let others = (0..layers.len()).filter(|index| *index != render);
     let mut order: Vec<usize> = std::iter::once(render)
         .chain(others.clone().filter(is_referenced))
-        .chain(others.filter(|index| !is_referenced(index)))
+        .chain(
+            others
+                .clone()
+                .filter(|index| is_active(index) && !is_referenced(index)),
+        )
+        .chain(others.filter(|index| !is_referenced(index) && !is_active(index)))
         .take(MAX_LAYERS)
         .collect();
     order.sort_unstable();
@@ -712,6 +732,7 @@ fn layer_json(layer: &UvLayer, faces: &[(u64, usize)]) -> Value {
         .collect();
     json!({"name": layer.name, "faces": entries})
 }
+
 #[cfg(test)]
 mod tests {
     #![expect(clippy::expect_used, reason = "UV migration unit fixtures")]
@@ -741,7 +762,7 @@ mod tests {
         let face_zero = mesh.faces[0].id;
         let mut value = serde_json::to_value(&mesh).expect("mesh json");
         value["attributes"] = json!({
-            "blender_uv_layers": [{"name": "Light", "values": [
+            "blender_uv_layers": [{"name": "Light", "active": true, "values": [
                 [0.0, 0.25], [1.0, 0.25], [1.0, 0.75],
                 [0.0, 0.75], [0.5, 0.0], [0.5, 1.0]
             ]}],
@@ -776,7 +797,7 @@ mod tests {
             .collect();
         assert_eq!(names, ["Light", "UVMap"]);
         assert_eq!(store.render.as_deref(), Some("UVMap"));
-        assert_eq!(store.active.as_deref(), Some("UVMap"));
+        assert_eq!(store.active.as_deref(), Some("Light"));
         // Blender rows are flipped into storage convention; `uv_map` rows are not.
         assert_eq!(
             store.layers[0].faces,
@@ -818,7 +839,7 @@ mod tests {
         let (first, second) = (mesh.faces[0].id, mesh.faces[1].id);
         let mut value = serde_json::to_value(&mesh).expect("mesh json");
         value["attributes"] = json!({
-            "blender_uv_layers": [{"name": "Light", "values": [
+            "blender_uv_layers": [{"name": "Light", "active": true, "values": [
                 [0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]
             ]}],
             "uv_map": [
@@ -841,6 +862,7 @@ mod tests {
         assert_eq!(warnings[2]["code"], "uv.legacy_row_skipped");
         assert_eq!(warnings[2]["face_id"], first);
         assert_eq!(warnings[2]["reason"], "uv_length");
+
         let upgraded: Mesh = serde_json::from_value(value).expect("upgraded mesh parses");
         validate(&upgraded).expect("upgraded store is valid");
         let store = read(&upgraded);
@@ -850,6 +872,7 @@ mod tests {
             .map(|layer| layer.name.as_str())
             .collect();
         assert_eq!(names, ["UVMap"]);
+        assert_eq!(store.active.as_deref(), Some("UVMap"));
         assert_eq!(
             store.layers[0].faces,
             vec![None, Some(vec![[0.5, 0.5], [0.6, 0.6], [0.7, 0.7]]),]
@@ -929,6 +952,44 @@ mod tests {
             .collect();
         assert_eq!(names, ["L0", "L1", "L2", "L3", "L4", "L5", "L6", "L8"]);
         assert_eq!(store.render.as_deref(), Some("L0"));
+    }
+
+    /// Eight Blender layers, with `L7` active, and a distinct `uv_map` render layer. The active
+    /// layer outranks ordinary source order under the layer limit; stored layers remain ordered.
+    #[test]
+    fn active_layer_outranks_original_order_under_the_limit() {
+        let mesh = two_triangles();
+        let face = mesh.faces[0].id;
+        let mut value = serde_json::to_value(&mesh).expect("mesh json");
+        let blender: Vec<Value> = (0..8)
+            .map(|index| {
+                json!({"name": format!("L{index}"), "active": index == 7, "values": [
+                    [0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 0.0], [0.5, 0.5], [0.25, 0.75]
+                ]})
+            })
+            .collect();
+        value["attributes"] = json!({
+            "blender_uv_layers": blender,
+            "uv_map": [{"face_id": face, "layer": "Render", "uv": [
+                [0.1, 0.1], [0.2, 0.2], [0.3, 0.3]
+            ]}]
+        });
+
+        let warnings = upgrade_mesh_v1(&mut value, "mesh", &BTreeSet::new());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(warnings[0]["code"], "uv.legacy_layer_dropped");
+        assert_eq!(warnings[0]["layer"], "L6");
+
+        let upgraded: Mesh = serde_json::from_value(value).expect("upgraded mesh parses");
+        let store = read(&upgraded);
+        let names: Vec<&str> = store
+            .layers
+            .iter()
+            .map(|layer| layer.name.as_str())
+            .collect();
+        assert_eq!(names, ["L0", "L1", "L2", "L3", "L4", "L5", "L7", "Render"]);
+        assert_eq!(store.active.as_deref(), Some("L7"));
+        assert_eq!(store.render.as_deref(), Some("Render"));
     }
 
     /// Pins of the wrong length are dropped while the row's UVs are kept, and a later row for the

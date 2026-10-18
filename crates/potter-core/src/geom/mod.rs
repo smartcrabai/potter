@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
 
 pub(crate) mod attribute_keys;
+pub(crate) mod blender_matrix;
 pub mod boolean;
 pub(crate) mod clnor;
 pub(crate) mod color_layers;
@@ -47,6 +48,19 @@ pub(crate) mod triangulate;
 pub(crate) mod uv_layers;
 pub mod vdb;
 pub mod volume;
+
+/// Evaluated per-corner normals of `mesh`, in flattened `mesh.faces` corner order. Authored
+/// custom-normal codes decode on their current fans; Auto corners and meshes without custom normals
+/// take the computed shading. This is the evaluator the renderer and exporters read, not a second
+/// implementation.
+///
+/// # Errors
+///
+/// Returns the errors of the shared corner-normal evaluator for malformed custom-normal state.
+pub fn corner_normal_vectors(mesh: &Mesh) -> crate::error::Result<Vec<DVec3>> {
+    let positions: Vec<DVec3> = mesh.vertices.iter().map(|vertex| vertex.co).collect();
+    normals::corner_normals(mesh, &positions)
+}
 
 #[cfg(test)]
 mod shading_oracle;
@@ -100,15 +114,38 @@ pub struct IdCounters {
 /// Blender's `ORIGINDEX_NONE` sentinel for generated or unmatched vertices.
 pub(crate) const ORIGINDEX_NONE: i32 = -1;
 
-/// Compact original storage indices carried only while evaluating a Hook index selection.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct OriginalIndices {
-    pub(crate) vertices: Vec<i32>,
-    pub(crate) source_vertex_count: usize,
+/// Internal point attribute carrying each vertex's input storage index, `ORIGINDEX_NONE` for
+/// generated vertices. Evaluation-only: the modifier stack strips it from its output.
+pub(crate) const ORIGINDEX_ATTRIBUTE: &str = "blender_origindex";
+
+/// The evaluation-only index carrier as one entry per vertex, when present.
+pub(crate) fn origindex_values(mesh: &Mesh) -> Option<Vec<i32>> {
+    mesh.attributes
+        .get(ORIGINDEX_ATTRIBUTE)?
+        .as_array()
+        .map(|values| {
+            values
+                .iter()
+                .map(|value| {
+                    value
+                        .as_i64()
+                        .and_then(|index| i32::try_from(index).ok())
+                        .unwrap_or(ORIGINDEX_NONE)
+                })
+                .collect()
+        })
+}
+
+/// Writes the evaluation-only index carrier, one entry per vertex.
+pub(crate) fn set_origindex(mesh: &mut Mesh, values: &[i32]) {
+    mesh.attributes.insert(
+        ORIGINDEX_ATTRIBUTE.to_owned(),
+        Value::Array(values.iter().map(|&index| Value::from(index)).collect()),
+    );
 }
 
 /// Polygon mesh whose topology and element identities survive index changes.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Mesh {
     /// Vertices in storage order (not ID order).
@@ -122,19 +159,6 @@ pub struct Mesh {
     pub attributes: Map<String, Value>,
     /// Independent persistent-ID allocation counters.
     pub next_id: IdCounters,
-    /// Transient point `CD_ORIGINDEX` layer; `None` means absent. Never serialized.
-    #[serde(skip)]
-    pub(crate) original_indices: Option<OriginalIndices>,
-}
-impl PartialEq for Mesh {
-    // ORIGINDEX is evaluation-only bookkeeping, not part of persistent mesh equality.
-    fn eq(&self, other: &Self) -> bool {
-        self.vertices == other.vertices
-            && self.edges == other.edges
-            && self.faces == other.faces
-            && self.attributes == other.attributes
-            && self.next_id == other.next_id
-    }
 }
 
 /// Axis-aligned bounds of mesh-local vertex positions.
@@ -721,18 +745,6 @@ impl Mesh {
                     return Err(MeshError::InvalidTopology("face boundary edge is missing"));
                 }
             }
-        }
-        if let Some(indices) = &self.original_indices
-            && (indices.vertices.len() != self.vertices.len()
-                || indices.vertices.iter().any(|&index| {
-                    index != ORIGINDEX_NONE
-                        && usize::try_from(index)
-                            .map_or(true, |source| source >= indices.source_vertex_count)
-                }))
-        {
-            return Err(MeshError::InvalidTopology(
-                "original-index sidecar is inconsistent with mesh storage",
-            ));
         }
         Ok(())
     }

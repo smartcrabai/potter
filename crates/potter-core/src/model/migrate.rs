@@ -15,6 +15,7 @@ use crate::{
     error::{ErrorCode, PotError, Result},
     store::HistoryRecord,
 };
+
 /// Returns the kind of an inline resource; non-inline binary resources return `None`.
 ///
 /// # Errors
@@ -48,20 +49,37 @@ const MTOON_TEXTURES: [&str; 5] = [
     "uv_animation_mask_texture",
 ];
 
-/// A scene document read from bytes, with what its upgrade produced.
+/// A scene document read from bytes, with diagnostics from its schema upgrade.
+#[derive(Debug)]
 pub struct ParsedScene {
     pub doc: SceneDoc,
-    /// Diagnostics for version-1 UV data skipped or dropped during migration.
+    /// Diagnostics for legacy data the upgrade skipped or dropped.
     pub warnings: Vec<Value>,
-    /// Whether the bytes were schema version 1. Their original bytes must be kept before the first
-    /// schema-version-3 write replaces them.
+    /// Whether the original bytes used schema version 1.
     pub legacy: bool,
+    /// Canonical hash of the original schema-1 scene, before migration changes its schema version.
+    pub legacy_hash: Option<String>,
 }
 
-/// Parses and upgrades a scene document, then migrates its loaded-only legacy resource sentinels.
+/// Parses a scene document, upgrading it through every schema version to the current one, then
+/// migrates its loaded-only legacy resource sentinels.
 pub fn parse_scene(bytes: &[u8]) -> Result<ParsedScene> {
+    parse_scene_inner(bytes, false)
+}
+
+/// Parses a project scene while retaining its pre-migration hash for project metadata.
+pub(crate) fn parse_scene_with_original_hash(bytes: &[u8]) -> Result<ParsedScene> {
+    parse_scene_inner(bytes, true)
+}
+
+fn parse_scene_inner(bytes: &[u8], retain_original_hash: bool) -> Result<ParsedScene> {
     let mut value = parse_value(bytes)?;
     let legacy = value.get("schema_version").and_then(Value::as_u64) == Some(1);
+    let legacy_hash = if legacy && retain_original_hash {
+        Some(crate::hash::sha256(&crate::hash::canonicalize(&value)?))
+    } else {
+        None
+    };
     let warnings = upgrade_scene(&mut value)?;
     let mut doc: SceneDoc = serde_json::from_value(value).map_err(|error| json_error(&error))?;
     crate::geom::legacy_texture::migrate_legacy_volume_noise_sentinel(&mut doc)?;
@@ -69,10 +87,11 @@ pub fn parse_scene(bytes: &[u8]) -> Result<ParsedScene> {
         doc,
         warnings,
         legacy,
+        legacy_hash,
     })
 }
 
-/// Parses a history record, upgrading its snapshot and migrating loaded-only texture sentinels.
+/// Parses a history record, upgrading its snapshot's schema version first.
 pub(crate) fn parse_history_record(bytes: &[u8]) -> Result<(HistoryRecord, Vec<Value>)> {
     let mut value = parse_value(bytes)?;
     let warnings = match value.get_mut("snapshot") {
@@ -97,12 +116,13 @@ fn json_error(error: &serde_json::Error) -> PotError {
     )
 }
 
-/// Upgrades a document from version 1 through 3, retaining diagnostics from legacy UV data.
+/// Upgrades a scene document in place through schema version 3.
 pub fn upgrade_scene(value: &mut Value) -> Result<Vec<Value>> {
-    let mut warnings = Vec::new();
-    if value.get("schema_version").and_then(Value::as_u64) == Some(1) {
-        warnings = upgrade_v1(value)?;
-    }
+    let warnings = if value.get("schema_version").and_then(Value::as_u64) == Some(1) {
+        upgrade_v1(value)?
+    } else {
+        Vec::new()
+    };
     if value.get("schema_version").and_then(Value::as_u64) == Some(2) {
         upgrade_v2(value)?;
     }
@@ -136,7 +156,7 @@ fn upgrade_v1(value: &mut Value) -> Result<Vec<Value>> {
     Ok(warnings)
 }
 
-/// Every material and `MToon` texture reference, for mutation.
+/// Every material and `MToon` texture reference, including the nested shading-shift texture.
 fn texture_refs(value: &mut Value) -> Vec<&mut Value> {
     let mut refs = Vec::new();
     let Some(object) = value.as_object_mut() else {
@@ -190,7 +210,7 @@ fn push_mtoon_refs<'a>(material: &'a mut Value, refs: &mut Vec<&'a mut Value>) {
     }
 }
 
-/// Converts one version-1 texture reference; empty and `uv_map` select the render layer.
+/// Converts one version-1 texture selector. The old default names the render layer.
 fn upgrade_texture_ref(texture: &mut Value) -> Result<()> {
     let Some(object) = texture.as_object_mut() else {
         return Ok(());
@@ -226,14 +246,18 @@ fn upgrade_v2(value: &mut Value) -> Result<()> {
     Ok(())
 }
 
-/// Blender attributes that mirror a native key or topology Potter recomputes. They are dropped.
-const MIRROR_ATTRIBUTES: [&str; 5] = [
-    "sharp_face",
-    "sharp_edge",
-    "uv_seam",
-    "material_index",
-    "position",
-];
+/// Blender-owned mesh attributes are mirrors or topology rebuilt by Potter. Their exact signatures
+/// match the `.blend` importer.
+fn is_blender_managed_attribute(name: &str, domain: &str, data_type: &str) -> bool {
+    matches!(
+        (name, domain, data_type),
+        ("position", "POINT", "FLOAT_VECTOR")
+            | ("sharp_face", "FACE", "BOOLEAN")
+            | ("sharp_edge" | "uv_seam", "EDGE", "BOOLEAN")
+            | ("material_index", "FACE", "INT")
+            | ("custom_normal", "CORNER", "INT16_2D")
+    )
+}
 
 /// Blender internal attributes that hold selection, visibility, or sculpt state. They stay in
 /// `blender_attributes`. Other dot-prefixed Blender attributes are topology or UV pins and are dropped.
@@ -317,7 +341,12 @@ fn blender_custom_normal_codes(
         return Ok(None);
     };
     let mut matches = entries.iter().filter(|entry| {
-        text(entry, "name") == "custom_normal" && text(entry, "data_type") == "INT16_2D"
+        text(entry, "name") == "custom_normal"
+            && is_blender_managed_attribute(
+                text(entry, "name"),
+                text(entry, "domain"),
+                text(entry, "data_type"),
+            )
     });
     let Some(entry) = matches.next() else {
         return Ok(None);
@@ -497,7 +526,8 @@ fn upgrade_mesh_v2(mesh: &mut Value) -> Result<()> {
             }),
         )
     };
-    let custom_normal_attribute = if let Some(codes) = custom_normal_codes {
+    let (custom_normal_attribute, legacy_sharp_attribute) = if let Some(codes) = custom_normal_codes
+    {
         let mut upgraded_mesh: crate::geom::Mesh =
             serde_json::from_value(Value::Object(object.clone())).map_err(|error| {
                 invalid(format!(
@@ -513,7 +543,7 @@ fn upgrade_mesh_v2(mesh: &mut Value) -> Result<()> {
                 setter_input: crate::geom::clnor::SetterInput::NormalizeInput,
             },
         )?;
-        upgraded_mesh.attributes.get("custom_normal").cloned()
+        (upgraded_mesh.attributes.get("custom_normal").cloned(), None)
     } else if legacy_custom_normal {
         let mut upgraded_mesh: crate::geom::Mesh =
             serde_json::from_value(Value::Object(object.clone())).map_err(|error| {
@@ -531,15 +561,21 @@ fn upgrade_mesh_v2(mesh: &mut Value) -> Result<()> {
                 setter_input: crate::geom::clnor::SetterInput::NormalizeInput,
             },
         )?;
-        upgraded_mesh.attributes.get("custom_normal").cloned()
+        (
+            upgraded_mesh.attributes.get("custom_normal").cloned(),
+            upgraded_mesh.attributes.get("sharp").cloned(),
+        )
     } else {
-        None
+        (None, None)
     };
     let Some(attributes) = object.get_mut("attributes").and_then(Value::as_object_mut) else {
         return Ok(());
     };
     if let Some(attribute) = custom_normal_attribute {
         attributes.insert("custom_normal".to_owned(), attribute);
+    }
+    if let Some(sharp) = legacy_sharp_attribute {
+        attributes.insert("sharp".to_owned(), sharp);
     }
     // Reserved-name user attributes were moved aside before native shading conversion.
     // The paint attribute is set aside so that a Blender layer of the same name keeps its name.
@@ -551,11 +587,6 @@ fn upgrade_mesh_v2(mesh: &mut Value) -> Result<()> {
     match attributes.remove("blender_attributes") {
         Some(Value::Array(entries)) => {
             for entry in entries {
-                if text(&entry, "name") == "custom_normal"
-                    && text(&entry, "data_type") == "INT16_2D"
-                {
-                    continue;
-                }
                 match classify(&entry, &elements, &uv_names, attributes) {
                     Entry::Dropped => {}
                     Entry::Kept => kept.push(entry),
@@ -666,7 +697,7 @@ fn classify(
     let name = text(entry, "name");
     let domain = text(entry, "domain");
     let data_type = text(entry, "data_type");
-    if dropped_name(name)
+    if dropped_name(name, domain, data_type)
         || (domain == "CORNER" && data_type == "FLOAT2" && uv_names.iter().any(|uv| uv == name))
     {
         return Entry::Dropped;
@@ -699,9 +730,9 @@ fn classify(
     Entry::Kept
 }
 
-/// Blender attribute names that are dropped: mirrors, and dot-prefixed attributes that are not state.
-fn dropped_name(name: &str) -> bool {
-    MIRROR_ATTRIBUTES.contains(&name)
+/// Blender-managed signatures and dot-prefixed attributes that are not state are dropped.
+fn dropped_name(name: &str, domain: &str, data_type: &str) -> bool {
+    is_blender_managed_attribute(name, domain, data_type)
         || (name.starts_with('.')
             && !BLENDER_STATE_PREFIXES
                 .iter()
@@ -1124,6 +1155,7 @@ mod tests {
         assert_native_value_noise(&record.snapshot);
         assert_eq!(record.snapshot.resources.len(), 1);
     }
+
     #[test]
     fn legacy_volume_noise_sentinel_respects_owned_ids() {
         let noise_id = crate::model::Id::new("noise").expect("noise ID");
@@ -1301,6 +1333,20 @@ mod tests {
         Ok(source)
     }
 
+    fn history_record(snapshot: &Value) -> Value {
+        json!({
+            "record_version": 1,
+            "parent": null,
+            "kind": "apply",
+            "revision": 0,
+            "scene_hash": "sha256:scene",
+            "operations": [],
+            "changes": {},
+            "target": null,
+            "snapshot": snapshot
+        })
+    }
+
     fn migrated_mesh(source: &Value) -> TestResult<crate::geom::Mesh> {
         let migrated = parse_scene(&serde_json::to_vec(source)?)?.doc;
         let mesh = migrated.data_blocks[&crate::model::Id::new("meshdata")?]
@@ -1309,6 +1355,30 @@ mod tests {
             .ok_or("migrated data block has no mesh")?;
         crate::geom::color_layers::validate(&mesh)?;
         Ok(mesh)
+    }
+
+    #[test]
+    fn version_two_user_attribute_with_managed_name_is_preserved() -> TestResult<()> {
+        let mesh = triangle_mesh()?;
+        let vertex = format!("v{}", mesh.vertices[0].id);
+        let source = version_two_document(
+            &mesh,
+            json!({
+                "blender_attributes": [
+                    {"name": "sharp_face", "domain": "POINT", "data_type": "FLOAT", "values": [0.25, 0.5, 0.75]},
+                    {"name": "sharp_face", "domain": "FACE", "data_type": "BOOLEAN", "values": [true]}
+                ]
+            }),
+        )?;
+        let migrated = migrated_mesh(&source)?;
+        let storage_key = user_key("sharp_face");
+        let user_attribute = &migrated.attributes[&storage_key];
+
+        assert_eq!(user_attribute["domain"], json!("point"));
+        assert_eq!(user_attribute["type"], json!("float"));
+        assert_eq!(user_attribute["values"][vertex], json!(0.25));
+        assert!(!migrated.attributes.contains_key("blender_attributes"));
+        Ok(())
     }
 
     #[test]
@@ -1531,6 +1601,49 @@ mod tests {
     }
 
     #[test]
+    fn version_two_legacy_custom_normals_keep_setter_sharp_edges() -> TestResult<()> {
+        use glam::DVec3;
+
+        let mesh = crate::geom::Mesh::from_positions_and_faces(
+            vec![DVec3::ZERO, DVec3::X, DVec3::Y, DVec3::Z],
+            vec![vec![0, 1, 2], vec![1, 0, 3]],
+        )?;
+        let mut smooth = Map::new();
+        let mut normals = Map::new();
+        for (index, face) in mesh.faces.iter().enumerate() {
+            let face_key = format!("f{}", face.id);
+            smooth.insert(face_key.clone(), json!(true));
+            let normal = if index == 0 {
+                [0.0, 0.0, 1.0]
+            } else {
+                [0.0, 1.0, 0.0]
+            };
+            normals.insert(face_key, json!([normal, normal, normal]));
+        }
+        let source = version_two_document(
+            &mesh,
+            json!({
+                "shade_smooth": {"domain":"face","type":"bool","values":smooth},
+                "custom_normal": {"domain":"corner","type":"float3","values":normals}
+            }),
+        )?;
+        let first = mesh.vertices[0].id;
+        let second = mesh.vertices[1].id;
+        let shared_edge = mesh
+            .edges
+            .iter()
+            .find(|edge| edge.vertices.contains(&first) && edge.vertices.contains(&second))
+            .ok_or("shared edge is missing")?;
+        let migrated = migrated_mesh(&source)?;
+        let edge_key = format!("e{}", shared_edge.id);
+        assert_eq!(
+            migrated.attributes["sharp"]["values"][edge_key.as_str()],
+            json!(true)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn malformed_version_two_custom_normal_codes_are_scene_invalid() -> TestResult {
         let mesh = triangle_mesh()?;
         for values in [json!([[0, 0], [32768, 0], [0, 0]]), json!([[0, 0], [0, 0]])] {
@@ -1545,9 +1658,8 @@ mod tests {
                     }]
                 }),
             )?;
-            let Err(error) = parse_scene(&serde_json::to_vec(&source)?) else {
-                panic!("malformed custom-normal codes must be rejected");
-            };
+            let error = parse_scene(&serde_json::to_vec(&source)?)
+                .expect_err("malformed custom-normal codes must be rejected");
             assert_eq!(error.code, ErrorCode::SceneInvalid);
         }
         Ok(())
@@ -1673,6 +1785,49 @@ mod tests {
         assert_eq!(names, ["Tint"]);
         assert_eq!(store.active.as_deref(), Some("Tint"));
         assert_eq!(store.render.as_deref(), Some("Tint"));
+        let (record, history_warnings) =
+            parse_history_record(&serde_json::to_vec(&history_record(&source))?)?;
+        assert!(history_warnings.is_empty(), "{history_warnings:?}");
+        assert_eq!(record.snapshot.schema_version, 3);
+        let history_mesh = record
+            .snapshot
+            .data_blocks
+            .values()
+            .next()
+            .and_then(|block| block.mesh.as_ref())
+            .ok_or("history snapshot has no mesh")?;
+        assert_eq!(&history_mesh.attributes, attributes);
+        let current = parse_scene(&serde_json::to_vec(&source)?)?.doc;
+        let current = parse_scene(&serde_json::to_vec(&current)?)?.doc;
+        let current_mesh = current
+            .data_blocks
+            .values()
+            .next()
+            .and_then(|block| block.mesh.as_ref())
+            .ok_or("current scene has no mesh")?;
+        assert_eq!(current_mesh.attributes, *attributes);
+
+        let mut selected = migrated.clone();
+        crate::geom::edit::apply(
+            &mut selected,
+            "attribute_update",
+            &json!({
+                "name": "color_layers",
+                "elements": {
+                    "domain": "point",
+                    "selector": {
+                        "type": "attribute",
+                        "name": "color_layers",
+                        "value": 0.25
+                    }
+                },
+                "value": 0.75
+            }),
+        )?;
+        assert_eq!(
+            selected.attributes["user:color_layers"]["values"][vertices[1].as_str()],
+            json!(0.75)
+        );
         Ok(())
     }
 
@@ -1695,8 +1850,41 @@ mod tests {
         );
         assert_eq!(
             crate::geom::color_layers::read(&migrated).layers,
-            Vec::<crate::geom::color_layers::ColorLayer>::new()
+            Vec::new()
         );
+        let (record, history_warnings) =
+            parse_history_record(&serde_json::to_vec(&history_record(&source))?)?;
+        assert!(history_warnings.is_empty(), "{history_warnings:?}");
+        assert_eq!(record.snapshot.schema_version, 3);
+        let history_mesh = record
+            .snapshot
+            .data_blocks
+            .values()
+            .next()
+            .and_then(|block| block.mesh.as_ref())
+            .ok_or("history snapshot has no mesh")?;
+        assert_eq!(
+            history_mesh.attributes["user:color_layers"]["values"][vertex.as_str()],
+            json!(0.25)
+        );
+        assert!(!history_mesh.attributes.contains_key("color_layers"));
+        assert_eq!(
+            crate::geom::color_layers::read(history_mesh).layers,
+            Vec::new()
+        );
+        let current = parse_scene(&serde_json::to_vec(&source)?)?.doc;
+        let current = parse_scene(&serde_json::to_vec(&current)?)?.doc;
+        let current_mesh = current
+            .data_blocks
+            .values()
+            .next()
+            .and_then(|block| block.mesh.as_ref())
+            .ok_or("current scene has no mesh")?;
+        assert_eq!(
+            current_mesh.attributes["user:color_layers"]["values"][vertex.as_str()],
+            json!(0.25)
+        );
+        assert!(!current_mesh.attributes.contains_key("color_layers"));
         Ok(())
     }
 
@@ -1754,6 +1942,72 @@ mod tests {
         );
         assert!(!migrated.attributes.contains_key("sharp"));
         assert!(!migrated.attributes.contains_key("seam"));
+        Ok(())
+    }
+
+    #[test]
+    fn empty_and_repeated_legacy_selectors_become_the_render_reference() {
+        let mut scene = json!({
+            "schema_version": 1,
+            "materials": {"m1": {
+                "base_color_texture": {"image": "img", "uv_map": "", "interpolation": "linear"},
+                "normal_texture": {"image": "img", "uv_map": "uv_map", "interpolation": "linear"}
+            }}
+        });
+        let warnings = upgrade_scene(&mut scene).expect("upgrade");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let material = &scene["materials"]["m1"];
+        assert_eq!(material["base_color_texture"]["uv_layer"], Value::Null);
+        assert_eq!(material["normal_texture"]["uv_layer"], Value::Null);
+    }
+
+    #[test]
+    fn non_string_legacy_selector_is_rejected() {
+        let mut scene = json!({
+            "schema_version": 1,
+            "materials": {"m1": {"base_color_texture": {"image": "img", "uv_map": 3}}}
+        });
+        assert!(upgrade_scene(&mut scene).is_err());
+    }
+
+    #[test]
+    fn parse_scene_reports_the_legacy_origin_and_skipped_layers() -> TestResult {
+        use glam::DVec3;
+
+        let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+        let mesh = crate::geom::Mesh::from_positions_and_faces(
+            vec![
+                DVec3::new(0.0, 0.0, 0.0),
+                DVec3::new(1.0, 0.0, 0.0),
+                DVec3::new(0.0, 1.0, 0.0),
+            ],
+            vec![vec![0, 1, 2]],
+        )?;
+        let data_id = crate::model::Id::new("meshdata")?;
+        doc.data_blocks.insert(
+            data_id,
+            crate::model::DataBlock {
+                mesh: Some(mesh),
+                ..crate::model::DataBlock::default()
+            },
+        );
+        let mut source = serde_json::to_value(doc)?;
+        source["schema_version"] = json!(1);
+        source["data_blocks"]["meshdata"]["mesh"]["attributes"] = json!({
+            "blender_uv_layers": [{"name": "Light", "values": [[0.0, 0.25], [0.5, 0.5]]}]
+        });
+
+        let parsed = parse_scene(&serde_json::to_vec(&source)?)?;
+        assert!(parsed.legacy);
+        assert_eq!(parsed.warnings.len(), 1, "{:?}", parsed.warnings);
+        assert_eq!(parsed.warnings[0]["code"], "uv.legacy_layer_skipped");
+        assert_eq!(parsed.warnings[0]["layer"], "Light");
+        assert_eq!(parsed.warnings[0]["mesh"], "meshdata");
+
+        let current = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+        let parsed = parse_scene(&serde_json::to_vec(&serde_json::to_value(current)?)?)?;
+        assert!(!parsed.legacy);
+        assert_eq!(parsed.warnings, Vec::<Value>::new());
         Ok(())
     }
 

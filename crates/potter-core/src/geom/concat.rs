@@ -21,10 +21,12 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use glam::{DMat3, DMat4, DVec3};
+use glam::DMat4;
 use serde_json::{Map, Value, json};
 
 use crate::error::{ErrorCode, PotError, Result};
+
+use super::clnor::{self, NormalCodeOptions, SetterInput};
 
 use super::normals::{normal_matrix, sharp_edge_flags, smooth_face_flags};
 use super::provenance::{Origin, default_value, remap_attributes_skipping};
@@ -55,6 +57,10 @@ struct Placed {
 struct Piece {
     attributes: Map<String, Value>,
     uv_layers: Vec<UvLayer>,
+    /// The member's `active` and `render` color layer names as it stated them. Placement writes a
+    /// null designation as the first layer, so the join reads these from the source mesh.
+    color_active: Option<String>,
+    color_render: Option<String>,
     vertex_base: usize,
     vertices: usize,
     edges: usize,
@@ -83,6 +89,8 @@ pub(crate) fn concatenate(parts: Vec<Part<'_>>) -> Result<Mesh> {
         pieces.push(Piece {
             attributes: std::mem::take(&mut mesh.attributes),
             uv_layers,
+            color_active: color_designation(&part.mesh, "active"),
+            color_render: color_designation(&part.mesh, "render"),
             vertex_base: output.vertices.len(),
             vertices: mesh.vertices.len(),
             edges: mesh.edges.len(),
@@ -183,22 +191,53 @@ fn place(part: &Part<'_>, first_ids: IdCounters) -> Result<Placed> {
     )?;
     canonical_shading(source, &mut mesh)?;
     let mut uv_layers = read_layers(source);
-    if part.matrix.determinant() < 0.0 {
-        mirror_corners(&mut mesh, &mut uv_layers);
+    // Transform the evaluated fan normal for Auto corners as well as authored codes.
+    let mut custom_normals = clnor::corner_codes(&mesh)?
+        .map(|codes| {
+            let source_positions = mesh
+                .vertices
+                .iter()
+                .map(|vertex| vertex.co)
+                .collect::<Vec<_>>();
+            clnor::evaluate_codes(
+                &mesh,
+                &codes,
+                &source_positions,
+                NormalCodeOptions::default(),
+            )
+            .map(|normals| normals.into_iter().map(Some).collect::<Vec<_>>())
+        })
+        .transpose()?;
+    let transform_normals = normal_matrix(part.matrix);
+    if let Some(normals) = &mut custom_normals {
+        for normal in normals.iter_mut().flatten() {
+            *normal = (transform_normals * *normal).normalize_or_zero();
+        }
     }
-    let normals = normal_matrix(part.matrix);
     for vertex in &mut mesh.vertices {
         vertex.co = part.matrix.transform_point3(vertex.co);
     }
-    if let Some(values) = mesh
-        .attributes
-        .get_mut("custom_normal")
-        .and_then(|attribute| attribute.get_mut("values"))
-        .and_then(Value::as_object_mut)
-    {
-        for corners in values.values_mut() {
-            *corners = rotate_corner_normals(corners, normals);
+    if part.matrix.determinant() < 0.0 {
+        let face_sizes = mesh
+            .faces
+            .iter()
+            .map(|face| face.vertices.len())
+            .collect::<Vec<_>>();
+        mirror_corners(&mut mesh, &mut uv_layers);
+        if let Some(normals) = &mut custom_normals {
+            reverse_face_segments(normals, &face_sizes);
         }
+    }
+    if let Some(normals) = custom_normals {
+        let corner_order = clnor::corner_order(&mesh)?;
+        clnor::encode_vectors(
+            &mut mesh,
+            Some(&normals),
+            NormalCodeOptions {
+                corner_order: corner_order.as_deref(),
+                setter_input: SetterInput::NormalizeInput,
+            },
+        )?;
     }
     Ok(Placed { mesh, uv_layers })
 }
@@ -223,7 +262,7 @@ fn canonical_shading(source: &Mesh, mesh: &mut Mesh) -> Result<()> {
         .iter()
         .any(|key| source.attributes.contains_key(*key))
     {
-        let flags = smooth_face_flags(source)?;
+        let flags = member_smooth_flags(source)?;
         let values: Map<String, Value> = mesh
             .faces
             .iter()
@@ -239,7 +278,7 @@ fn canonical_shading(source: &Mesh, mesh: &mut Mesh) -> Result<()> {
         .iter()
         .any(|key| source.attributes.contains_key(*key))
     {
-        let flags = sharp_edge_flags(source)?;
+        let flags = member_sharp_flags(source)?;
         let values: Map<String, Value> = mesh
             .edges
             .iter()
@@ -254,9 +293,50 @@ fn canonical_shading(source: &Mesh, mesh: &mut Mesh) -> Result<()> {
     Ok(())
 }
 
-/// Reverses a mirrored member's faces, with every corner-keyed value of each face: the corner order
-/// of each face, `custom_normal` and named `corner` rows, `CORNER` `blender_attributes` segments, UV
-/// rows, and UV pins. A corner keeps its vertex, UV, pin, and normal together.
+/// A member's smooth flag per face, read as stored. A member without a `shade_smooth` key may carry
+/// the legacy `blender_polygon_smooth` array (one bool per face) instead, which
+/// [`smooth_face_flags`] does not read.
+fn member_smooth_flags(source: &Mesh) -> Result<Vec<bool>> {
+    if !source.attributes.contains_key("shade_smooth")
+        && let Some(flags) = source
+            .attributes
+            .get("blender_polygon_smooth")
+            .and_then(Value::as_array)
+            .filter(|flags| flags.len() == source.faces.len())
+            .and_then(|flags| {
+                flags
+                    .iter()
+                    .map(Value::as_bool)
+                    .collect::<Option<Vec<bool>>>()
+            })
+    {
+        return Ok(flags);
+    }
+    smooth_face_flags(source)
+}
+
+/// A member's sharp flag per edge, read as stored. A member without a `sharp` key may carry the
+/// legacy `blender_edge_flags` array (one `{sharp, seam}` object per edge) instead, which
+/// [`sharp_edge_flags`] does not read.
+fn member_sharp_flags(source: &Mesh) -> Result<Vec<bool>> {
+    if !source.attributes.contains_key("sharp")
+        && let Some(edges) = source
+            .attributes
+            .get("blender_edge_flags")
+            .and_then(Value::as_array)
+            .filter(|edges| edges.len() == source.edges.len())
+    {
+        return Ok(edges
+            .iter()
+            .map(|edge| edge.get("sharp").and_then(Value::as_bool).unwrap_or(false))
+            .collect());
+    }
+    sharp_edge_flags(source)
+}
+
+/// Reverses a mirrored member's faces with every corner-keyed value: the corner order, `custom_normal`
+/// and named `corner` rows, `CORNER` `blender_attributes` segments, and UV rows and pin flags. A
+/// corner keeps its vertex, UV, pin flag, and normal together.
 fn mirror_corners(mesh: &mut Mesh, layers: &mut [UvLayer]) {
     let sizes: Vec<usize> = mesh.faces.iter().map(|face| face.vertices.len()).collect();
     for (key, attribute) in &mut mesh.attributes {
@@ -269,6 +349,16 @@ fn mirror_corners(mesh: &mut Mesh, layers: &mut [UvLayer]) {
             continue;
         }
         if let Some(rows) = attribute.get_mut("values").and_then(Value::as_object_mut) {
+            for row in rows.values_mut().filter_map(Value::as_array_mut) {
+                row.reverse();
+            }
+        }
+
+        if key == "custom_normal"
+            && let Some(rows) = attribute
+                .get_mut("corner_order")
+                .and_then(Value::as_object_mut)
+        {
             for row in rows.values_mut().filter_map(Value::as_array_mut) {
                 row.reverse();
             }
@@ -302,7 +392,7 @@ fn mirror_corners(mesh: &mut Mesh, layers: &mut [UvLayer]) {
 }
 
 /// Reverses each face's run of `values`, where face `f` owns `sizes[f]` consecutive entries.
-fn reverse_face_segments(values: &mut [Value], sizes: &[usize]) {
+fn reverse_face_segments<T>(values: &mut [T], sizes: &[usize]) {
     let mut start = 0;
     for size in sizes {
         let end = start + size;
@@ -311,31 +401,6 @@ fn reverse_face_segments(values: &mut [Value], sizes: &[usize]) {
         }
         start = end;
     }
-}
-
-/// Rotates `custom_normal` corner vectors into instance space. Malformed entries pass through
-/// unchanged so the normal computation rejects them.
-pub(crate) fn rotate_corner_normals(value: &Value, normal_matrix: DMat3) -> Value {
-    let Some(corners) = value.as_array() else {
-        return value.clone();
-    };
-    Value::Array(
-        corners
-            .iter()
-            .map(|corner| {
-                let vector = corner
-                    .as_array()
-                    .and_then(|components| match components.as_slice() {
-                        [x, y, z] => Some(DVec3::new(x.as_f64()?, y.as_f64()?, z.as_f64()?)),
-                        _ => None,
-                    });
-                match vector {
-                    Some(vector) => json!((normal_matrix * vector).normalize_or_zero().to_array()),
-                    None => corner.clone(),
-                }
-            })
-            .collect(),
-    )
 }
 
 /// Joins canonical UV layers by first-seen name, preserving rows and pins from matching members.
@@ -408,13 +473,22 @@ fn merge_attributes(pieces: &[Piece], mesh: &Mesh) -> Result<Map<String, Value>>
             .iter()
             .map(|piece| (piece.attributes.get(name), piece))
             .collect();
-        merged.insert(name.to_owned(), merge_attribute(name, &members, mesh)?);
+        let value = merge_attribute(name, &members, mesh)?;
+        if name == "custom_normal"
+            && value.get("values").is_none()
+            && value.get("corner_order").is_none()
+        {
+            continue;
+        }
+        merged.insert(name.to_owned(), value);
     }
     Ok(merged)
 }
 
 fn merge_attribute(name: &str, members: &[Member<'_>], mesh: &Mesh) -> Result<Value> {
+    let attribute_name = super::attribute_keys::user_name(name).unwrap_or(name);
     match name {
+        "custom_normal" => merge_custom_normal(members, mesh),
         "blender_attributes" => merge_blender_attributes(name, members),
         "color_layers" => merge_color_layers(name, members),
         "blender_edge_flags" => merge_positional(
@@ -434,9 +508,26 @@ fn merge_attribute(name: &str, members: &[Member<'_>], mesh: &Mesh) -> Result<Va
         "vertex_groups" => merge_vertex_groups(name, members),
         _ if members.iter().any(|(value, _)| {
             value.is_some_and(|value| value.get("type").and_then(Value::as_str) == Some("color"))
+        }) && members.iter().all(|(value, piece)| {
+            let Some(value) = value else { return true };
+            value.get("type").and_then(Value::as_str) == Some("color")
+                && matches!(
+                    value.get("domain").and_then(Value::as_str),
+                    Some("point" | "corner")
+                )
+                && piece
+                    .attributes
+                    .get("color_layers")
+                    .and_then(|layers| layers.get("layers"))
+                    .and_then(Value::as_array)
+                    .is_some_and(|layers| {
+                        layers
+                            .iter()
+                            .any(|layer| layer.as_str() == Some(attribute_name))
+                    })
         }) =>
         {
-            merge_color_attribute(name, members, mesh)
+            merge_color_attribute(attribute_name, members, mesh)
         }
         _ if members
             .iter()
@@ -446,6 +537,93 @@ fn merge_attribute(name: &str, members: &[Member<'_>], mesh: &Mesh) -> Result<Va
         }
         _ => merge_equal(name, members),
     }
+}
+
+/// Joins typed custom-normal codes and their member-local loop bases without decoding the codes.
+/// Missing code layers contribute Auto; a non-identity basis is offset into the joined loop order.
+fn merge_custom_normal(members: &[Member<'_>], mesh: &Mesh) -> Result<Value> {
+    let has_values = members
+        .iter()
+        .any(|(value, _)| value.is_some_and(|value| value.get("values").is_some()));
+    let has_order = members
+        .iter()
+        .any(|(value, _)| value.is_some_and(|value| value.get("corner_order").is_some()));
+    let mut values = has_values.then(Map::new);
+    let mut corner_order = has_order.then(Map::new);
+    let mut has_nonidentity_order = false;
+    let mut preceding_corners = 0;
+
+    for (attribute, piece) in members {
+        let attribute = *attribute;
+        let member_values = attribute
+            .and_then(|attribute| attribute.get("values"))
+            .map(|rows| rows.as_object().ok_or_else(|| shape_error("custom_normal")))
+            .transpose()?;
+        let member_order = attribute
+            .and_then(|attribute| attribute.get("corner_order"))
+            .map(|rows| rows.as_object().ok_or_else(|| shape_error("custom_normal")))
+            .transpose()?;
+        let mut member_corner = 0;
+        for face in &mesh.faces[piece.face_base..piece.face_base + piece.faces] {
+            let key = format!("f{}", face.id);
+            if let Some(values) = &mut values {
+                let row = if let Some(rows) = member_values {
+                    rows.get(&key)
+                        .and_then(Value::as_array)
+                        .filter(|row| row.len() == face.vertices.len())
+                        .cloned()
+                        .ok_or_else(|| shape_error("custom_normal"))?
+                } else {
+                    vec![Value::Null; face.vertices.len()]
+                };
+                values.insert(key.clone(), Value::Array(row));
+            }
+            if let Some(corner_order) = &mut corner_order {
+                let natural_start = preceding_corners + member_corner;
+                let row = if let Some(rows) = member_order {
+                    rows.get(&key)
+                        .and_then(Value::as_array)
+                        .filter(|row| row.len() == face.vertices.len())
+                        .ok_or_else(|| shape_error("custom_normal"))?
+                        .iter()
+                        .map(|value| {
+                            value
+                                .as_u64()
+                                .and_then(|ordinal| usize::try_from(ordinal).ok())
+                                .filter(|ordinal| *ordinal < piece.corners)
+                                .map(|ordinal| ordinal + preceding_corners)
+                                .ok_or_else(|| shape_error("custom_normal"))
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                } else {
+                    (0..face.vertices.len())
+                        .map(|corner| natural_start + corner)
+                        .collect()
+                };
+                has_nonidentity_order |= row
+                    .iter()
+                    .enumerate()
+                    .any(|(corner, ordinal)| *ordinal != natural_start + corner);
+                corner_order.insert(
+                    key,
+                    Value::Array(row.into_iter().map(Value::from).collect()),
+                );
+            }
+            member_corner += face.vertices.len();
+        }
+        preceding_corners += piece.corners;
+    }
+
+    let mut merged = Map::new();
+    merged.insert("domain".to_owned(), json!("corner"));
+    merged.insert("type".to_owned(), json!("normal_code"));
+    if let Some(values) = values {
+        merged.insert("values".to_owned(), Value::Object(values));
+    }
+    if let Some(corner_order) = corner_order.filter(|_| has_nonidentity_order) {
+        merged.insert("corner_order".to_owned(), Value::Object(corner_order));
+    }
+    Ok(Value::Object(merged))
 }
 
 fn shape_error(name: &str) -> PotError {
@@ -700,13 +878,24 @@ fn merge_named(name: &str, members: &[Member<'_>]) -> Result<Value> {
     merged.insert("values".to_owned(), Value::Object(values));
     Ok(Value::Object(merged))
 }
+
+/// A member's own `active` or `render` color layer name, read before placement rewrites it.
+fn color_designation(mesh: &Mesh, key: &str) -> Option<String> {
+    mesh.attributes
+        .get(super::color_layers::ATTRIBUTE)?
+        .get(key)?
+        .as_str()
+        .map(str::to_owned)
+}
+
 /// Joins canonical color layers in first-seen order. The first valid active/render designation is
-/// retained; when none survives, the first joined layer is used.
+/// retained; when none survives, the first joined layer is used. Each member's designation is the one
+/// it stated before placement, so a null designation never claims the first layer.
 fn merge_color_layers(name: &str, members: &[Member<'_>]) -> Result<Value> {
     let mut layers = Vec::<String>::new();
     let mut active = None;
     let mut render = None;
-    for (value, _) in members {
+    for (value, piece) in members {
         let Some(value) = value else { continue };
         let object = value.as_object().ok_or_else(|| shape_error(name))?;
         let names = object
@@ -720,16 +909,10 @@ fn merge_color_layers(name: &str, members: &[Member<'_>]) -> Result<Value> {
             }
         }
         if active.is_none() {
-            active = object
-                .get("active")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
+            active.clone_from(&piece.color_active);
         }
         if render.is_none() {
-            render = object
-                .get("render")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
+            render.clone_from(&piece.color_render);
         }
     }
     let fallback = layers.first().cloned();
@@ -909,24 +1092,13 @@ mod tests {
 
     use super::{Part, concatenate};
     use crate::geom::normals::smooth_face_flags;
-    use crate::geom::uv_layers::{self, UvLayer, UvStore};
     use crate::geom::{BoxParams, Mesh};
+
     fn cube() -> Mesh {
         Mesh::box_mesh(BoxParams {
             size: DVec3::splat(2.0),
         })
         .unwrap()
-    }
-
-    fn write_uv_layers(mesh: &mut Mesh, layers: Vec<UvLayer>) {
-        uv_layers::write(
-            mesh,
-            &UvStore {
-                layers,
-                active: None,
-                render: None,
-            },
-        );
     }
 
     /// A member borrowed from `mesh` with `slot_count` material slots.
@@ -939,9 +1111,9 @@ mod tests {
         }
     }
 
-    type UvLayerSpec<'a> = (&'a str, [f64; 2], Option<[bool; 4]>);
+    type UvLayerFixture<'a> = (&'a str, [f64; 2], Option<[bool; 4]>);
 
-    fn set_uv_layers(mesh: &mut Mesh, layers: &[UvLayerSpec<'_>]) {
+    fn set_uv_layers(mesh: &mut Mesh, layers: &[UvLayerFixture<'_>]) {
         let layers = layers
             .iter()
             .map(|(name, uv, pins)| {
@@ -1141,123 +1313,421 @@ mod tests {
     }
 
     #[test]
-    fn uv_layers_join_by_name_and_preserve_pins_and_coverage() {
-        let mut first = cube();
-        set_uv_layers(&mut first, &[("Map", [0.1, 0.2], None)]);
-        let mut second = cube();
-        set_uv_layers(
-            &mut second,
-            &[("UVMap", [0.0, 0.0], Some([true, false, true, false]))],
-        );
-        let third = cube();
-
-        let parts = vec![
-            member(&first, DMat4::IDENTITY, 0, 1),
-            member(&second, DMat4::IDENTITY, 0, 1),
-            member(&third, DMat4::IDENTITY, 0, 1),
-        ];
-        let joined = concatenate(parts).unwrap();
-        let store = uv_layers::read(&joined);
-        assert_eq!(
-            store
-                .layers
-                .iter()
-                .map(|layer| layer.name.as_str())
-                .collect::<Vec<_>>(),
-            ["Map", "UVMap"]
-        );
-        assert_eq!(store.layers[0].faces[0].as_ref().unwrap()[0], [0.1, 0.2]);
-        assert_eq!(store.layers[0].faces[6].as_ref().unwrap()[0], [0.0, 1.0]);
-        assert_eq!(store.layers[1].faces[0].as_ref().unwrap()[0], [0.0, 1.0]);
-        assert_eq!(store.layers[1].faces[6].as_ref().unwrap()[0], [0.0, 0.0]);
-        assert_eq!(
-            store.layers[1].pinned[6].as_deref().unwrap(),
-            &[true, false, true, false]
-        );
-        assert!(
-            store
-                .layers
-                .iter()
-                .all(|layer| layer.faces[12..].iter().all(Option::is_some))
-        );
-    }
-
-    #[test]
-    fn mirrored_members_reverse_each_face_with_its_corner_values() {
+    fn mirrored_members_reverse_each_face_with_uvs_pins_and_normal_codes() {
         let mut source = cube();
-        let mut layer = UvLayer::new(
-            "UVMap",
-            source
-                .faces
-                .iter()
-                .enumerate()
-                .map(|(index, face)| {
-                    Some(
-                        (0..face.vertices.len())
-                            .map(|corner| [index as f64, corner as f64])
-                            .collect(),
-                    )
-                })
-                .collect(),
-        );
-        layer.pinned = source
+        let smooth_values: Map<String, Value> = source
             .faces
             .iter()
-            .map(|face| {
-                Some(
-                    (0..face.vertices.len())
-                        .map(|corner| corner % 2 == 0)
-                        .collect(),
-                )
-            })
+            .map(|face| (format!("f{}", face.id), json!(true)))
             .collect();
-        let mut normals = Map::new();
-        for face in &source.faces {
-            let face_normals: Vec<Value> = (0..face.vertices.len())
-                .map(|corner| {
-                    if corner == 0 {
-                        json!([1.0, 0.0, 0.0])
-                    } else {
-                        json!([0.0, 0.0, 1.0])
-                    }
-                })
-                .collect();
-            normals.insert(format!("f{}", face.id), Value::Array(face_normals));
+        source.attributes.insert(
+            "shade_smooth".to_owned(),
+            json!({"domain": "face", "type": "bool", "values": smooth_values}),
+        );
+        let mut uv_faces = Vec::new();
+        let mut source_pins = Vec::new();
+        let mut corner_order = Map::new();
+        let mut corner_offset = 0_usize;
+        for (index, face) in source.faces.iter().enumerate() {
+            let corners = face.vertices.len();
+            uv_faces.push(Some(
+                (0..corners)
+                    .map(|corner| [index as f64, corner as f64])
+                    .collect(),
+            ));
+            let mut pins = vec![false; corners];
+            pins[index % corners] = true;
+            source_pins.push(pins);
+            let order = (0..corners)
+                .map(|corner| json!(corner_offset + (corner + 1) % corners))
+                .collect::<Vec<_>>();
+            corner_order.insert(format!("f{}", face.id), Value::Array(order));
+            corner_offset += corners;
         }
-        write_uv_layers(&mut source, vec![layer]);
+        let mut uv_layer = crate::geom::uv_layers::UvLayer::new("UVMap", uv_faces);
+        uv_layer.pinned = source_pins.iter().cloned().map(Some).collect();
+        crate::geom::uv_layers::write(
+            &mut source,
+            &crate::geom::uv_layers::UvStore {
+                layers: vec![uv_layer],
+                active: Some("UVMap".to_owned()),
+                render: Some("UVMap".to_owned()),
+            },
+        );
         source.attributes.insert(
             "custom_normal".to_owned(),
-            json!({"domain": "corner", "type": "FLOAT_VECTOR", "values": normals}),
+            json!({
+                "domain": "corner",
+                "type": "normal_code",
+                "corner_order": corner_order
+            }),
         );
+        let source_positions = source
+            .vertices
+            .iter()
+            .map(|vertex| vertex.co)
+            .collect::<Vec<_>>();
+        let source_order = super::clnor::corner_order(&source).unwrap().unwrap();
+        let fans = super::clnor::mesh_fans(&source, &source_positions, &source_order).unwrap();
+        assert!(fans.corners.iter().all(|fan| fan.len() > 1));
+        let mut code_values = vec![Value::Null; corner_offset];
+        for fan in &fans.corners {
+            for &corner in fan.iter().skip(1) {
+                code_values[corner] = json!([1000 + corner * 100, 300 + corner * 50]);
+            }
+        }
+        assert!(fans.corners.iter().all(|fan| {
+            fan.iter().any(|&corner| code_values[corner].is_null())
+                && fan.iter().any(|&corner| !code_values[corner].is_null())
+        }));
+        let mut normal_codes = Map::new();
+        let mut code_offset = 0_usize;
+        for face in &source.faces {
+            let end = code_offset + face.vertices.len();
+            normal_codes.insert(
+                format!("f{}", face.id),
+                Value::Array(code_values[code_offset..end].to_vec()),
+            );
+            code_offset = end;
+        }
+        source
+            .attributes
+            .get_mut("custom_normal")
+            .and_then(Value::as_object_mut)
+            .unwrap()
+            .insert("values".to_owned(), Value::Object(normal_codes));
+        let source_normals =
+            crate::geom::normals::corner_normals(&source, &source_positions).unwrap();
+        let source_codes = super::clnor::corner_codes(&source).unwrap().unwrap();
+        assert!(source_codes.contains(&super::clnor::CornerNormalCode::Auto));
+        assert!(
+            source_codes
+                .iter()
+                .any(|code| matches!(code, super::clnor::CornerNormalCode::Authored(_)))
+        );
+        assert!(
+            source_order
+                .iter()
+                .enumerate()
+                .any(|(index, ordinal)| index != *ordinal)
+        );
+
+        let identity = concatenate(vec![member(&source, DMat4::IDENTITY, 0, 1)]).unwrap();
+        let identity_positions = identity
+            .vertices
+            .iter()
+            .map(|vertex| vertex.co)
+            .collect::<Vec<_>>();
+        let identity_normals =
+            crate::geom::normals::corner_normals(&identity, &identity_positions).unwrap();
+        for (corner, (source, actual)) in source_normals.iter().zip(&identity_normals).enumerate() {
+            assert!(
+                actual.abs_diff_eq(*source, 2.0e-4),
+                "identity member changed mixed fan corner {corner}"
+            );
+        }
+
         let mirror = DMat4::from_scale(DVec3::new(-1.0, 1.0, 1.0));
         let joined = concatenate(vec![member(&source, mirror, 0, 1)]).unwrap();
         joined.validate().unwrap();
-
-        let uv = uv_layers::read(&joined);
-        let uv = &uv.layers[0];
-        let custom = joined.attributes["custom_normal"]["values"]
-            .as_object()
-            .unwrap();
+        let output_positions = joined
+            .vertices
+            .iter()
+            .map(|vertex| vertex.co)
+            .collect::<Vec<_>>();
+        let output_normals =
+            crate::geom::normals::corner_normals(&joined, &output_positions).unwrap();
+        let output_codes = super::clnor::corner_codes(&joined).unwrap().unwrap();
+        assert_eq!(output_codes.len(), source_codes.len());
+        let output_order = super::clnor::corner_order(&joined).unwrap().unwrap();
+        let transformed = crate::geom::normals::normal_matrix(mirror);
+        let uv_store = crate::geom::uv_layers::read(&joined);
+        let uv = &uv_store.layers[0];
+        let mut corner_base = 0;
         for (index, face) in joined.faces.iter().enumerate() {
             let source_face = &source.faces[index];
-            let rows = &custom[&format!("f{}", face.id)];
-            let uv_face = uv.faces[index].as_ref().unwrap();
-            let pinned = uv.pinned[index].as_ref().unwrap();
+            let uv_row = uv.faces[index].as_ref().unwrap();
+            let pin_row = uv.pinned[index].as_ref().unwrap();
+            let corners = face.vertices.len();
             for (corner, vertex) in face.vertices.iter().enumerate() {
-                let original = source_face.vertices.len() - 1 - corner;
+                let original = corners - 1 - corner;
+                let source_corner = corner_base + original;
+                let output_corner = corner_base + corner;
                 let expected = mirror
                     .transform_point3(source.vertex(source_face.vertices[original]).unwrap().co);
                 assert!((joined.vertex(*vertex).unwrap().co - expected).length() < 1e-9);
-                assert_eq!(uv_face[corner], [index as f64, original as f64]);
-                assert_eq!(pinned[corner], original.is_multiple_of(2));
-                let normal = if original == 0 {
-                    json!([-1.0, 0.0, 0.0])
-                } else {
-                    json!([0.0, 0.0, 1.0])
-                };
-                assert_eq!(rows[corner], normal);
+                assert!(
+                    (uv_row[corner][0] - index as f64).abs() <= 1.0e-12
+                        && (uv_row[corner][1] - original as f64).abs() <= 1.0e-12
+                );
+                assert_eq!(pin_row[corner], source_pins[index][original]);
+                assert_eq!(output_order[output_corner], source_order[source_corner]);
+                assert!(
+                    output_normals[output_corner].abs_diff_eq(
+                        (transformed * source_normals[source_corner]).normalize_or_zero(),
+                        2.0e-4,
+                    ),
+                    "source corner {source_corner} moved to output corner {output_corner}"
+                );
             }
+            corner_base += corners;
         }
+    }
+
+    #[test]
+    fn mirrored_member_keeps_basis_only_normal_state() {
+        let mut source = cube();
+        let mut corner_order = Map::new();
+        let mut corner_offset = 0_usize;
+        for face in &source.faces {
+            let corners = face.vertices.len();
+            corner_order.insert(
+                format!("f{}", face.id),
+                Value::Array(
+                    (0..corners)
+                        .map(|corner| json!(corner_offset + (corner + 1) % corners))
+                        .collect(),
+                ),
+            );
+            corner_offset += corners;
+        }
+        source.attributes.insert(
+            "custom_normal".to_owned(),
+            json!({
+                "domain": "corner",
+                "type": "normal_code",
+                "corner_order": corner_order
+            }),
+        );
+        let source_order = super::clnor::corner_order(&source).unwrap().unwrap();
+        assert!(super::clnor::corner_codes(&source).unwrap().is_none());
+
+        let mirror = DMat4::from_scale(DVec3::new(-1.0, 1.0, 1.0));
+        let joined = concatenate(vec![member(&source, mirror, 0, 1)]).unwrap();
+        joined.validate().unwrap();
+        assert!(joined.attributes["custom_normal"].get("values").is_none());
+        let output_order = super::clnor::corner_order(&joined).unwrap().unwrap();
+        let mut corner_base = 0;
+        for face in &source.faces {
+            for corner in 0..face.vertices.len() {
+                let source_corner = corner_base + face.vertices.len() - 1 - corner;
+                assert_eq!(
+                    output_order[corner_base + corner],
+                    source_order[source_corner]
+                );
+            }
+            corner_base += face.vertices.len();
+        }
+    }
+
+    #[test]
+    fn mirrored_member_preserves_explicit_zero_custom_normals() {
+        let mut source = cube();
+        let codes = vec![super::clnor::CornerNormalCode::ExplicitZero; corner_count(&source)];
+        super::clnor::write_codes(
+            &mut source,
+            Some(&codes),
+            super::clnor::NormalCodeOptions::default(),
+        )
+        .unwrap();
+        let mirror = DMat4::from_scale(DVec3::new(-1.0, 1.0, 1.0));
+        let joined = concatenate(vec![member(&source, mirror, 0, 1)]).unwrap();
+        joined.validate().unwrap();
+        let output_codes = super::clnor::corner_codes(&joined).unwrap().unwrap();
+        assert!(
+            output_codes
+                .iter()
+                .all(|code| *code == super::clnor::CornerNormalCode::ExplicitZero)
+        );
+        let positions = joined
+            .vertices
+            .iter()
+            .map(|vertex| vertex.co)
+            .collect::<Vec<_>>();
+        let normals = crate::geom::normals::corner_normals(&joined, &positions).unwrap();
+        assert!(normals.iter().all(|normal| *normal == DVec3::ZERO));
+    }
+
+    fn corner_count(mesh: &Mesh) -> usize {
+        mesh.faces.iter().map(|face| face.vertices.len()).sum()
+    }
+
+    fn shifted_corner_order(corners: usize, shift: usize) -> Vec<usize> {
+        (0..corners)
+            .map(|corner| (corner + shift) % corners)
+            .collect()
+    }
+
+    fn set_custom_normal(mesh: &mut Mesh, shift: usize, codes: Option<&[Value]>) {
+        let order = shifted_corner_order(corner_count(mesh), shift);
+        let mut corner_order = Map::new();
+        let mut values = Map::new();
+        let mut start = 0;
+        for face in &mesh.faces {
+            let end = start + face.vertices.len();
+            corner_order.insert(
+                format!("f{}", face.id),
+                Value::Array(order[start..end].iter().copied().map(Value::from).collect()),
+            );
+            if let Some(codes) = codes {
+                values.insert(
+                    format!("f{}", face.id),
+                    Value::Array(codes[start..end].to_vec()),
+                );
+            }
+            start = end;
+        }
+        let mut attribute = Map::new();
+        attribute.insert("domain".to_owned(), json!("corner"));
+        attribute.insert("type".to_owned(), json!("normal_code"));
+        attribute.insert("corner_order".to_owned(), Value::Object(corner_order));
+        if codes.is_some() {
+            attribute.insert("values".to_owned(), Value::Object(values));
+        }
+        mesh.attributes
+            .insert("custom_normal".to_owned(), Value::Object(attribute));
+    }
+
+    #[test]
+    fn basis_only_normal_state_joins_member_local_orders() {
+        let mut first = cube();
+        let mut second = cube();
+        set_custom_normal(&mut first, 1, None);
+        set_custom_normal(&mut second, 1, None);
+        let first_corners = corner_count(&first);
+        let second_corners = corner_count(&second);
+
+        let joined = concatenate(vec![
+            member(&first, DMat4::IDENTITY, 0, 1),
+            member(&second, DMat4::IDENTITY, 0, 1),
+        ])
+        .unwrap();
+        joined.validate().unwrap();
+        assert!(joined.attributes["custom_normal"].get("values").is_none());
+        let expected = shifted_corner_order(first_corners, 1)
+            .into_iter()
+            .chain(
+                shifted_corner_order(second_corners, 1)
+                    .into_iter()
+                    .map(|ordinal| first_corners + ordinal),
+            )
+            .collect::<Vec<_>>();
+        assert_eq!(super::clnor::corner_order(&joined).unwrap(), Some(expected));
+    }
+
+    #[test]
+    fn basis_only_normal_state_fills_natural_order_for_state_less_members() {
+        let mut first = cube();
+        let second = cube();
+        set_custom_normal(&mut first, 1, None);
+        let first_corners = corner_count(&first);
+        let second_corners = corner_count(&second);
+
+        let joined = concatenate(vec![
+            member(&first, DMat4::IDENTITY, 0, 1),
+            member(&second, DMat4::IDENTITY, 0, 1),
+        ])
+        .unwrap();
+        joined.validate().unwrap();
+        assert!(joined.attributes["custom_normal"].get("values").is_none());
+        let expected = shifted_corner_order(first_corners, 1)
+            .into_iter()
+            .chain(first_corners..first_corners + second_corners)
+            .collect::<Vec<_>>();
+        assert_eq!(super::clnor::corner_order(&joined).unwrap(), Some(expected));
+    }
+
+    #[test]
+    fn allocated_auto_normal_layer_survives_join_with_state_less_member() {
+        let mut first = cube();
+        let second = cube();
+        let first_corners = corner_count(&first);
+        let second_corners = corner_count(&second);
+        let auto_codes = vec![Value::Null; first_corners];
+        set_custom_normal(&mut first, 1, Some(&auto_codes));
+
+        let joined = concatenate(vec![
+            member(&first, DMat4::IDENTITY, 0, 1),
+            member(&second, DMat4::IDENTITY, 0, 1),
+        ])
+        .unwrap();
+        joined.validate().unwrap();
+        assert!(joined.attributes["custom_normal"].get("values").is_some());
+        let codes = super::clnor::corner_codes(&joined).unwrap().unwrap();
+        assert_eq!(codes.len(), first_corners + second_corners);
+        assert!(
+            codes
+                .iter()
+                .all(|code| *code == super::clnor::CornerNormalCode::Auto)
+        );
+        let expected = shifted_corner_order(first_corners, 1)
+            .into_iter()
+            .chain(first_corners..first_corners + second_corners)
+            .collect::<Vec<_>>();
+        assert_eq!(super::clnor::corner_order(&joined).unwrap(), Some(expected));
+    }
+
+    #[test]
+    fn allocated_normal_codes_keep_member_local_bases_and_rows() {
+        let mut first = cube();
+        let mut second = cube();
+        let first_corners = corner_count(&first);
+        let second_corners = corner_count(&second);
+        let first_codes = (0..first_corners)
+            .map(|corner| {
+                if corner % 4 == 0 {
+                    Value::Null
+                } else {
+                    json!([1000 + corner as i64, 300])
+                }
+            })
+            .collect::<Vec<_>>();
+        let second_codes = (0..second_corners)
+            .map(|corner| {
+                if corner % 4 == 1 {
+                    Value::Null
+                } else {
+                    json!([-1000 - corner as i64, 1500])
+                }
+            })
+            .collect::<Vec<_>>();
+        set_custom_normal(&mut first, 1, Some(&first_codes));
+        set_custom_normal(&mut second, 3, Some(&second_codes));
+
+        let first_placed = concatenate(vec![member(&first, DMat4::IDENTITY, 0, 1)]).unwrap();
+        let second_placed = concatenate(vec![member(&second, DMat4::IDENTITY, 0, 1)]).unwrap();
+        let expected_codes = super::clnor::corner_codes(&first_placed)
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .chain(super::clnor::corner_codes(&second_placed).unwrap().unwrap())
+            .collect::<Vec<_>>();
+        let joined = concatenate(vec![
+            member(&first, DMat4::IDENTITY, 0, 1),
+            member(&second, DMat4::IDENTITY, 0, 1),
+        ])
+        .unwrap();
+        joined.validate().unwrap();
+        let codes = super::clnor::corner_codes(&joined).unwrap().unwrap();
+        assert_eq!(codes, expected_codes);
+        assert!(codes.contains(&super::clnor::CornerNormalCode::Auto));
+        assert!(
+            codes
+                .iter()
+                .any(|code| matches!(code, super::clnor::CornerNormalCode::Authored(_)))
+        );
+        let expected_order = shifted_corner_order(first_corners, 1)
+            .into_iter()
+            .chain(
+                shifted_corner_order(second_corners, 3)
+                    .into_iter()
+                    .map(|ordinal| first_corners + ordinal),
+            )
+            .collect::<Vec<_>>();
+        assert_eq!(
+            super::clnor::corner_order(&joined).unwrap(),
+            Some(expected_order)
+        );
     }
 
     #[test]
@@ -1313,6 +1783,111 @@ mod tests {
         assert_eq!(corner_colors.len(), 48);
         assert_eq!(corner_colors[0], json!([1.0, 0.0, 0.0, 1.0]));
         assert_eq!(corner_colors[24], json!([0.0, 0.0, 1.0, 1.0]));
+    }
+
+    #[test]
+    fn generic_face_edge_and_sparse_corner_colors_use_named_merge() {
+        let mut first = cube();
+        let mut second = cube();
+        let first_face = first.faces[0].id;
+        let second_face = second.faces[0].id;
+        let first_edge = first.edges[0].id;
+        let second_edge = second.edges[0].id;
+        let first_face_color = json!([1.0, 0.0, 0.0, 1.0]);
+        let second_face_color = json!([0.0, 0.0, 1.0, 1.0]);
+        let first_edge_color = json!([0.0, 1.0, 0.0, 1.0]);
+        let second_edge_color = json!([1.0, 1.0, 0.0, 1.0]);
+        let first_corner_color = json!([0.25, 0.5, 0.75, 1.0]);
+        let second_corner_color = json!([0.75, 0.5, 0.25, 1.0]);
+
+        first.attributes.insert(
+            "generic_face_color".to_owned(),
+            json!({"domain":"face","type":"color","values":{format!("f{first_face}"):first_face_color}}),
+        );
+        second.attributes.insert(
+            "generic_face_color".to_owned(),
+            json!({"domain":"face","type":"color","values":{format!("f{second_face}"):second_face_color}}),
+        );
+        first.attributes.insert(
+            "generic_edge_color".to_owned(),
+            json!({"domain":"edge","type":"color","values":{format!("e{first_edge}"):first_edge_color}}),
+        );
+        second.attributes.insert(
+            "generic_edge_color".to_owned(),
+            json!({"domain":"edge","type":"color","values":{format!("e{second_edge}"):second_edge_color}}),
+        );
+        first.attributes.insert(
+            "sparse_corner_color".to_owned(),
+            json!({"domain":"corner","type":"color","values":{format!("f{first_face}"):vec![first_corner_color.clone(); first.faces[0].vertices.len()]}}),
+        );
+        second.attributes.insert(
+            "sparse_corner_color".to_owned(),
+            json!({"domain":"corner","type":"color","values":{format!("f{second_face}"):vec![second_corner_color.clone(); second.faces[0].vertices.len()]}}),
+        );
+
+        let joined = concatenate(vec![
+            member(&first, DMat4::IDENTITY, 0, 1),
+            member(&second, DMat4::IDENTITY, 0, 1),
+        ])
+        .unwrap();
+        let face_values = joined.attributes["generic_face_color"]["values"]
+            .as_object()
+            .unwrap();
+        assert_eq!(face_values.len(), 2);
+        assert!(face_values.values().any(|value| value == &first_face_color));
+        assert!(
+            face_values
+                .values()
+                .any(|value| value == &second_face_color)
+        );
+
+        let edge_values = joined.attributes["generic_edge_color"]["values"]
+            .as_object()
+            .unwrap();
+        assert_eq!(edge_values.len(), 2);
+        assert!(edge_values.values().any(|value| value == &first_edge_color));
+        assert!(
+            edge_values
+                .values()
+                .any(|value| value == &second_edge_color)
+        );
+
+        let corner_values = joined.attributes["sparse_corner_color"]["values"]
+            .as_object()
+            .unwrap();
+        assert_eq!(corner_values.len(), 2);
+        assert!(
+            corner_values
+                .values()
+                .any(|value| { value == &json!(vec![first_corner_color.clone(); 4]) })
+        );
+        assert!(
+            corner_values
+                .values()
+                .any(|value| { value == &json!(vec![second_corner_color.clone(); 4]) })
+        );
+    }
+
+    #[test]
+    fn generic_color_attributes_keep_named_conflict_errors() {
+        let mut first = cube();
+        let mut second = cube();
+        first.attributes.insert(
+            "generic_color".to_owned(),
+            json!({"domain":"face","type":"color","values":{}}),
+        );
+        second.attributes.insert(
+            "generic_color".to_owned(),
+            json!({"domain":"edge","type":"color","values":{}}),
+        );
+
+        let error = concatenate(vec![
+            member(&first, DMat4::IDENTITY, 0, 1),
+            member(&second, DMat4::IDENTITY, 0, 1),
+        ])
+        .unwrap_err();
+        assert_eq!(error.code, crate::error::ErrorCode::UnsupportedFeature);
+        assert_eq!(error.details["attribute"], json!("generic_color"));
     }
 
     #[test]
@@ -1405,6 +1980,64 @@ mod tests {
         assert_eq!(
             joined.attributes["blender_metadata"]["color_data_types"]["Body"],
             json!("FLOAT_COLOR")
+        );
+    }
+    #[test]
+    fn reserved_color_layer_name_joins_point_and_corner_domains() {
+        let key = crate::geom::attribute_keys::storage_key("color_layers").into_owned();
+        let mut point = cube();
+        let point_values: Map<String, Value> = point
+            .vertices
+            .iter()
+            .map(|vertex| (format!("v{}", vertex.id), json!([0.25, 0.0, 0.0, 1.0])))
+            .collect();
+        point.attributes.insert(
+            key.clone(),
+            json!({"domain":"point","type":"color","values":point_values}),
+        );
+        point.attributes.insert(
+            "color_layers".to_owned(),
+            json!({"layers":["color_layers"],"active":"color_layers","render":"color_layers"}),
+        );
+
+        let mut corner = cube();
+        let corner_values: Map<String, Value> = corner
+            .faces
+            .iter()
+            .map(|face| {
+                (
+                    format!("f{}", face.id),
+                    json!(vec![[0.0, 0.0, 0.75, 1.0]; face.vertices.len()]),
+                )
+            })
+            .collect();
+        corner.attributes.insert(
+            key.clone(),
+            json!({"domain":"corner","type":"color","values":corner_values}),
+        );
+        corner.attributes.insert(
+            "color_layers".to_owned(),
+            json!({"layers":["color_layers"],"active":"color_layers","render":"color_layers"}),
+        );
+
+        let joined = concatenate(vec![
+            member(&point, DMat4::IDENTITY, 0, 1),
+            member(&corner, DMat4::IDENTITY, 0, 1),
+        ])
+        .unwrap();
+        let layer = joined.attributes.get(&key).unwrap();
+        assert_eq!(
+            joined.attributes["color_layers"]["layers"],
+            json!(["color_layers"])
+        );
+        assert_eq!(layer["domain"], json!("corner"));
+        assert_eq!(
+            layer["values"][format!("f{}", joined.faces[0].id)][0],
+            json!([0.25, 0.0, 0.0, 1.0])
+        );
+        assert_eq!(
+            layer["values"][format!("f{}", joined.faces[6].id)][0],
+            json!([0.0, 0.0, 0.75, 1.0])
         );
     }
 

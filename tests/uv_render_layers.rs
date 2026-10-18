@@ -34,8 +34,6 @@ struct Layers {
     names: Vec<String>,
     corners: Vec<[[f64; 2]; 3]>,
     render: Option<usize>,
-    /// Bit `i` marks layer `i`; every layer of this mesh is available.
-    available_mask: Option<u8>,
 }
 
 impl Layers {
@@ -44,9 +42,6 @@ impl Layers {
             names: layers.iter().map(|(name, _)| (*name).to_owned()).collect(),
             corners: layers.iter().map(|(_, corners)| *corners).collect(),
             render: layers.iter().position(|(name, _)| *name == render),
-            available_mask: Some(
-                (0..layers.len()).fold(0_u8, |mask, index| mask | (1_u8 << index)),
-            ),
         }
     }
 
@@ -57,7 +52,7 @@ impl Layers {
             positions: POSITIONS,
             barycentric: CENTRE,
             render: self.render,
-            available_mask: self.available_mask,
+            available_mask: None,
         }
     }
 }
@@ -361,6 +356,71 @@ fn normal_map_node_frame_comes_from_its_uv_map_property() {
         }
     }
     assert!(warnings.borrow().is_empty());
+}
+
+#[test]
+fn imported_normal_map_matches_direct_texture_with_unrelated_graph_nodes() {
+    let layers = Layers::new(&[("UVMap", RENDER)], "UVMap");
+    let (direct_material, images) = texture_material(None);
+    let direct_groups = Registry::new();
+    let direct_context = HitContext::new(&direct_groups)
+        .with_images(&images)
+        .with_uv_layers(layers.hit());
+    let expected = evaluate_surface(&direct_material, &direct_context)
+        .unwrap()
+        .normal;
+
+    let image_properties = [
+        ("image", json!("normal_image")),
+        ("interpolation", json!("closest")),
+    ];
+    let (material, groups) = graph_material(
+        &[
+            (
+                "out",
+                node("OutputMaterial", &[("is_active_output", json!(true))], &[]),
+            ),
+            ("principled", node("ShaderNodeBsdfPrincipled", &[], &[])),
+            (
+                "normal",
+                node(
+                    "ShaderNodeNormalMap",
+                    &[("potter_gltf_imported_normal_map", json!(true))],
+                    &[],
+                ),
+            ),
+            (
+                "normal_image",
+                node("ShaderNodeTexImage", &image_properties, &[]),
+            ),
+            (
+                "emission_image",
+                node("ShaderNodeTexImage", &image_properties, &[]),
+            ),
+            (
+                "emission_mapping",
+                node(
+                    "ShaderNodeMapping",
+                    &[],
+                    &[("Vector", json!([0.25, 0.75, 0.0]))],
+                ),
+            ),
+        ],
+        &[
+            ("normal_image", "Color", "normal", "Color"),
+            ("normal", "Normal", "principled", "Normal"),
+            ("emission_mapping", "Vector", "emission_image", "Vector"),
+            ("emission_image", "Color", "principled", "Emission Color"),
+            ("principled", "BSDF", "out", "Surface"),
+        ],
+    );
+    let context = HitContext::new(&groups)
+        .with_images(&images)
+        .with_uv_layers(layers.hit());
+    assert_close(
+        evaluate_surface(&material, &context).unwrap().normal,
+        expected,
+    );
 }
 
 #[test]

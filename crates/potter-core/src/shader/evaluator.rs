@@ -16,6 +16,23 @@ use crate::{
     model::{Id, Material, Registry, TextureRef},
 };
 
+/// Blender's Principled "Specular IOR Level" default: `SOCKET_IN_FLOAT(specular_ior_level,
+/// "Specular IOR Level", 0.5f)` in `intern/cycles/scene/shader_nodes.cpp`, `PrincipledBsdfNode`.
+pub(crate) const DEFAULT_SPECULAR_IOR_LEVEL: f64 = 0.5;
+
+/// Dielectric reflectance at normal incidence for Blender's Principled specular layer: the Fresnel
+/// `F0` of the material IOR, scaled by `2 × IOR level` (Cycles `svm_node_closure_bsdf`, Principled
+/// branch, `intern/cycles/kernel/svm/closure.h`). The default level 0.5 leaves the IOR's own
+/// reflectance, so IOR 1.5 gives F0 = ((1.5 − 1)/(1.5 + 1))² = 0.04. The Blender manual defines
+/// the level as "0.5 means no adjustment … 1 doubles them at normal incidence"
+/// (`docs.blender.org/manual/en/5.2/render/shader_nodes/shader/principled.html`).
+/// Every Principled evaluation (path tracer, shaded hits, the world term) uses this function.
+#[must_use]
+pub(crate) fn dielectric_f0(ior: f64, level: f64) -> f64 {
+    let fresnel = ((ior - 1.0) / (ior + 1.0)).powi(2);
+    (fresnel * 2.0 * level.max(0.0)).min(1.0)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BsdfParams {
     pub base_color: [f64; 4],
@@ -26,6 +43,10 @@ pub struct BsdfParams {
     pub transmission: f64,
     pub ior: f64,
     pub alpha: f64,
+    /// Weight of the reflective closures (diffuse, specular, transmission, environment). Emission
+    /// contributes no reflection, so an Emission shader sets this to 0. Mix lerps it and Add sums
+    /// it, clamped to 1.
+    pub reflectance: f64,
     pub subsurface_weight: f64,
     pub subsurface_radius: [f64; 3],
     pub subsurface_scale: f64,
@@ -62,6 +83,7 @@ impl BsdfParams {
             transmission: material.transmission,
             ior: material.ior,
             alpha: material.base_color[3],
+            reflectance: 1.0,
             subsurface_weight: 0.0,
             subsurface_radius: [1.0; 3],
             subsurface_scale: 0.05,
@@ -71,7 +93,7 @@ impl BsdfParams {
             sheen_weight: 0.0,
             sheen_roughness: 0.3,
             sheen_tint: [1.0; 3],
-            specular_ior_level: 0.5,
+            specular_ior_level: DEFAULT_SPECULAR_IOR_LEVEL,
             specular_tint: [1.0; 3],
             anisotropic_ior: 0.0,
             anisotropic_rotation: 0.0,
@@ -113,6 +135,7 @@ impl BsdfParams {
             transmission: mix_scalar(first.transmission, second.transmission),
             ior: mix_scalar(first.ior, second.ior),
             alpha: mix_scalar(first.alpha, second.alpha),
+            reflectance: mix_scalar(first.reflectance, second.reflectance),
             subsurface_weight: mix_scalar(first.subsurface_weight, second.subsurface_weight),
             subsurface_radius: mix3(first.subsurface_radius, second.subsurface_radius),
             subsurface_scale: mix_scalar(first.subsurface_scale, second.subsurface_scale),
@@ -161,6 +184,7 @@ impl BsdfParams {
             transmission: first.transmission.max(second.transmission),
             ior: first.ior,
             alpha: first.alpha.max(second.alpha),
+            reflectance: (first.reflectance + second.reflectance).min(1.0),
             subsurface_weight: first.subsurface_weight.max(second.subsurface_weight),
             subsurface_radius: add3(first.subsurface_radius, second.subsurface_radius),
             subsurface_scale: first.subsurface_scale.max(second.subsurface_scale),
@@ -324,8 +348,9 @@ impl<'a> HitContext<'a> {
         self
     }
 
-    /// Provide the per-hit color of each color layer by name, plus the render layer's color.
-    /// Missing layers read opaque black and record a `mesh.color_layer_missing` warning.
+    /// Provide the per-hit color of each color layer by name, plus the render layer's color. Missing
+    /// layers use the node-specific Blender defaults: transparent black for Vertex Color and opaque
+    /// black for Attribute.
     #[must_use]
     pub const fn with_color_layers(
         mut self,
@@ -336,9 +361,8 @@ impl<'a> HitContext<'a> {
         self.color_render = color_render;
         self
     }
-
-    /// Collect `uv.layer_missing` warnings raised while evaluating this hit. Without a sink, the
-    /// render UV is still used but the warning is not recorded.
+    /// Collect `uv.layer_missing` warnings raised while evaluating this hit. Without a sink the
+    /// render UV is still used, but the warning is not recorded.
     #[must_use]
     pub const fn with_warnings(mut self, warnings: &'a RefCell<Vec<JsonValue>>) -> Self {
         self.warnings = Some(warnings);
@@ -379,23 +403,15 @@ pub fn fill_color_layers<'a, 'n>(
     table: &'a mut [(&'n str, [f64; 4])],
     layers: impl IntoIterator<Item = (&'n str, [f64; 4])>,
 ) -> Result<&'a [(&'n str, [f64; 4])]> {
-    fill_named(table, layers)
-}
-
-/// Writes named values into `table` in order and returns the filled prefix.
-fn fill_named<'a, 'n, T>(
-    table: &'a mut [(&'n str, T)],
-    entries: impl IntoIterator<Item = (&'n str, T)>,
-) -> Result<&'a [(&'n str, T)]> {
     let mut count = 0;
-    for entry in entries {
+    for layer in layers {
         let slot = table.get_mut(count).ok_or_else(|| {
             PotError::new(
                 ErrorCode::LimitExceeded,
                 "mesh has more layers than one hit can carry",
             )
         })?;
-        *slot = entry;
+        *slot = layer;
         count += 1;
     }
     Ok(&table[..count])
@@ -409,6 +425,27 @@ fn fill_named<'a, 'n, T>(
 /// `EVALUATION_FAILED` for a cycle or missing material output, and `UNSUPPORTED_FEATURE` for unsupported
 /// node behavior or unresolved image pixels in the hit context.
 pub fn evaluate_surface(material: &Material, hit_ctx: &HitContext<'_>) -> Result<BsdfParams> {
+    let mut workspace = EvaluatorWorkspace::default();
+    evaluate_surface_with_workspace(material, hit_ctx, &mut workspace)
+}
+
+/// Evaluates a material surface using caller-owned reusable graph scratch.
+pub fn evaluate_surface_with_workspace(
+    material: &Material,
+    hit_ctx: &HitContext<'_>,
+    workspace: &mut EvaluatorWorkspace,
+) -> Result<BsdfParams> {
+    workspace.active.clear();
+    let result = evaluate_surface_inner(material, hit_ctx, workspace);
+    workspace.active.clear();
+    result
+}
+
+fn evaluate_surface_inner(
+    material: &Material,
+    hit_ctx: &HitContext<'_>,
+    workspace: &mut EvaluatorWorkspace,
+) -> Result<BsdfParams> {
     let Some(graph_id) = &material.node_tree else {
         let mut params = BsdfParams::from_material(material, hit_ctx.normal);
         apply_material_textures(material, hit_ctx, &mut params)?;
@@ -427,6 +464,7 @@ pub fn evaluate_surface(material: &Material, hit_ctx: &HitContext<'_>) -> Result
             format!("material graph `{graph_id}` is not a shader graph"),
         ));
     }
+    workspace.active.reserve(group.links.len());
     let mut fallback_output = None;
     let mut active_output = None;
     for (id, node) in &group.nodes {
@@ -463,8 +501,8 @@ pub fn evaluate_surface(material: &Material, hit_ctx: &HitContext<'_>) -> Result
     let mut evaluator = Evaluator {
         group,
         material,
-        hit_ctx,
-        active: BTreeSet::new(),
+        hit_ctx: *hit_ctx,
+        workspace,
     };
     let Value::Shader(mut params) = evaluator.input(output, "Surface", ValueKind::Shader)? else {
         return Err(eval_error("material surface output is not a shader"));
@@ -492,11 +530,32 @@ pub fn evaluate_surface(material: &Material, hit_ctx: &HitContext<'_>) -> Result
             };
     }
     apply_material_textures(material, hit_ctx, &mut params)?;
-    Ok(*params)
+    Ok(params)
 }
 
 /// Evaluates the connected `OutputMaterial` displacement input without evaluating surface textures.
 pub fn evaluate_displacement(material: &Material, hit_ctx: &HitContext<'_>) -> Result<f64> {
+    let mut workspace = EvaluatorWorkspace::default();
+    evaluate_displacement_with_workspace(material, hit_ctx, &mut workspace)
+}
+
+/// Evaluates material displacement using caller-owned reusable graph scratch.
+pub fn evaluate_displacement_with_workspace(
+    material: &Material,
+    hit_ctx: &HitContext<'_>,
+    workspace: &mut EvaluatorWorkspace,
+) -> Result<f64> {
+    workspace.active.clear();
+    let result = evaluate_displacement_inner(material, hit_ctx, workspace);
+    workspace.active.clear();
+    result
+}
+
+fn evaluate_displacement_inner(
+    material: &Material,
+    hit_ctx: &HitContext<'_>,
+    workspace: &mut EvaluatorWorkspace,
+) -> Result<f64> {
     let Some(graph_id) = &material.node_tree else {
         return Ok(0.0);
     };
@@ -542,11 +601,12 @@ pub fn evaluate_displacement(material: &Material, hit_ctx: &HitContext<'_>) -> R
     {
         return Ok(0.0);
     }
+    workspace.active.reserve(group.links.len());
     let mut evaluator = Evaluator {
         group,
         material,
-        hit_ctx,
-        active: BTreeSet::new(),
+        hit_ctx: *hit_ctx,
+        workspace,
     };
     match evaluator.input(output, "Displacement", ValueKind::Vector)? {
         Value::Vector(displacement) => Ok(displacement.dot(hit_ctx.normal)),
@@ -707,12 +767,16 @@ fn sample_material_texture(
     Ok(pixel)
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Shader variant stays inline so Value remains Copy; boxing it would add a heap allocation per shader-node evaluation"
+)]
 enum Value {
     Scalar(f64),
     Vector(DVec3),
     Color([f64; 4]),
-    Shader(Box<BsdfParams>),
+    Shader(BsdfParams),
 }
 
 #[derive(Clone, Copy)]
@@ -722,24 +786,71 @@ enum ValueKind {
     Color,
     Shader,
 }
-
-struct Evaluator<'graph, 'material, 'context, 'registry> {
-    group: &'graph NodeGroup,
-    material: &'material Material,
-    hit_ctx: &'context HitContext<'registry>,
-    active: BTreeSet<(Id, String)>,
+#[derive(Clone, Copy)]
+enum NodeKind {
+    OutputMaterial,
+    Principled,
+    VolumePrincipled,
+    VolumeAbsorption,
+    VolumeScatter,
+    Displacement,
+    ImageTexture,
+    Emission,
+    Diffuse,
+    Glossy,
+    Glass,
+    Transparent,
+    MixShader,
+    AddShader,
+    Bump,
+    Checker,
+    Noise,
+    Voronoi,
+    Gradient,
+    ColorRamp,
+    MixRgb,
+    Math,
+    VectorMath,
+    Mapping,
+    SeparateColor,
+    TexCoord,
+    UvMap,
+    NormalMap,
+    Fresnel,
+    LayerWeight,
+    Attribute,
+    VertexColor,
 }
 
-impl Evaluator<'_, '_, '_, '_> {
+// Tokens identify a canonical node key and a source socket link without owning either string.
+#[derive(Clone, Copy)]
+struct ActiveSocket {
+    node: usize,
+    socket: usize,
+}
+
+/// Reusable scratch storage for evaluating shader graphs on render hits.
+#[derive(Default)]
+pub struct EvaluatorWorkspace {
+    active: Vec<ActiveSocket>,
+}
+
+struct Evaluator<'graph, 'material, 'registry, 'workspace> {
+    group: &'graph NodeGroup,
+    material: &'material Material,
+    hit_ctx: HitContext<'registry>,
+    workspace: &'workspace mut EvaluatorWorkspace,
+}
+
+impl<'registry> Evaluator<'_, '_, 'registry, '_> {
     fn input(&mut self, node_id: &Id, socket: &str, kind: ValueKind) -> Result<Value> {
         let node = self.node(node_id)?;
-        let incoming = self
-            .group
-            .links
-            .iter()
-            .find(|link| link.to_node == *node_id && socket_matches(&link.to_socket, socket));
-        if let Some(link) = incoming {
-            return self.output(&link.from_node, &link.from_socket);
+        let incoming =
+            self.group.links.iter().enumerate().find(|(_, link)| {
+                link.to_node == *node_id && socket_matches(&link.to_socket, socket)
+            });
+        if let Some((socket_index, link)) = incoming {
+            return self.output(&link.from_node, &link.from_socket, socket_index);
         }
         let raw = node
             .inputs
@@ -747,31 +858,96 @@ impl Evaluator<'_, '_, '_, '_> {
             .find(|(name, _)| socket_matches(name, socket))
             .map(|(_, value)| value)
             .filter(|value| !value.is_null());
-        let default = raw.map_or_else(|| socket_default(node, socket), Clone::clone);
+        let default = raw.or_else(|| socket_default(node, socket));
         match kind {
-            ValueKind::Scalar => Ok(Value::Scalar(number(&default, f64::NAN))),
-            ValueKind::Vector => Ok(Value::Vector(vector(&default, DVec3::splat(f64::NAN)))),
-            ValueKind::Color => Ok(Value::Color(color(&default, [f64::NAN; 4]))),
+            ValueKind::Scalar => Ok(Value::Scalar(
+                default.map_or(f64::NAN, |value| number(value, f64::NAN)),
+            )),
+            ValueKind::Vector => Ok(Value::Vector(
+                default.map_or(DVec3::splat(f64::NAN), |value| {
+                    vector(value, DVec3::splat(f64::NAN))
+                }),
+            )),
+            ValueKind::Color => {
+                Ok(Value::Color(default.map_or([f64::NAN; 4], |value| {
+                    color(value, [f64::NAN; 4])
+                })))
+            }
             ValueKind::Shader => match raw {
                 Some(_) => Err(invalid("a shader socket cannot use a literal value")),
-                None => Ok(Value::Shader(Box::new(BsdfParams::from_material(
+                None => Ok(Value::Shader(BsdfParams::from_material(
                     self.material,
                     self.hit_ctx.normal,
-                )))),
+                ))),
             },
         }
     }
 
-    fn output(&mut self, node_id: &Id, socket: &str) -> Result<Value> {
-        let key = (node_id.clone(), socket.to_owned());
-        if !self.active.insert(key.clone()) {
+    fn output(&mut self, node_id: &Id, socket: &str, socket_index: usize) -> Result<Value> {
+        let Some((node_key, node)) = self.group.nodes.get_key_value(node_id) else {
+            return Err(invalid(format!(
+                "shader graph references absent node `{node_id}`"
+            )));
+        };
+        let node_key = node_key.as_str().as_ptr() as usize;
+        if self.workspace.active.iter().any(|active| {
+            active.node == node_key
+                && self
+                    .group
+                    .links
+                    .get(active.socket)
+                    .is_some_and(|link| link.from_socket.as_str() == socket)
+        }) {
             return Err(eval_error(format!(
                 "shader graph cycle at node `{node_id}`"
             )));
         }
-        let node = self.node(node_id)?.clone();
-        let result = self.evaluate_node(node_id, &node, socket);
-        self.active.remove(&key);
+        self.workspace.active.push(ActiveSocket {
+            node: node_key,
+            socket: socket_index,
+        });
+        // Map the borrowed node type to a value before dispatch mutably through the evaluator.
+        let kind = match node.node_type.as_str() {
+            "OutputMaterial" | "ShaderNodeOutputMaterial" => Ok(NodeKind::OutputMaterial),
+            "ShaderNodeBsdfPrincipled" => Ok(NodeKind::Principled),
+            "ShaderNodeVolumePrincipled" => Ok(NodeKind::VolumePrincipled),
+            "ShaderNodeVolumeAbsorption" => Ok(NodeKind::VolumeAbsorption),
+            "ShaderNodeVolumeScatter" => Ok(NodeKind::VolumeScatter),
+            "ShaderNodeDisplacement" => Ok(NodeKind::Displacement),
+            "ShaderNodeTexImage" => Ok(NodeKind::ImageTexture),
+            "ShaderNodeEmission" => Ok(NodeKind::Emission),
+            "ShaderNodeBsdfDiffuse" => Ok(NodeKind::Diffuse),
+            "ShaderNodeBsdfGlossy" | "ShaderNodeBsdfAnisotropic" => Ok(NodeKind::Glossy),
+            "ShaderNodeBsdfGlass" => Ok(NodeKind::Glass),
+            "ShaderNodeBsdfTransparent" => Ok(NodeKind::Transparent),
+            "ShaderNodeMixShader" => Ok(NodeKind::MixShader),
+            "ShaderNodeAddShader" => Ok(NodeKind::AddShader),
+            "ShaderNodeBump" => Ok(NodeKind::Bump),
+            "ShaderNodeTexChecker" => Ok(NodeKind::Checker),
+            "ShaderNodeTexNoise" => Ok(NodeKind::Noise),
+            "ShaderNodeTexVoronoi" => Ok(NodeKind::Voronoi),
+            "ShaderNodeTexGradient" => Ok(NodeKind::Gradient),
+            "ShaderNodeValToRGB" => Ok(NodeKind::ColorRamp),
+            "ShaderNodeMixRGB" | "ShaderNodeMix" => Ok(NodeKind::MixRgb),
+            "ShaderNodeMath" => Ok(NodeKind::Math),
+            "ShaderNodeVectorMath" => Ok(NodeKind::VectorMath),
+            "ShaderNodeMapping" => Ok(NodeKind::Mapping),
+            "ShaderNodeSeparateColor" => Ok(NodeKind::SeparateColor),
+            "ShaderNodeTexCoord" => Ok(NodeKind::TexCoord),
+            "ShaderNodeUVMap" => Ok(NodeKind::UvMap),
+            "ShaderNodeNormalMap" => Ok(NodeKind::NormalMap),
+            "ShaderNodeFresnel" => Ok(NodeKind::Fresnel),
+            "ShaderNodeLayerWeight" => Ok(NodeKind::LayerWeight),
+            "ShaderNodeAttribute" => Ok(NodeKind::Attribute),
+            "ShaderNodeVertexColor" => Ok(NodeKind::VertexColor),
+            unknown => Err(PotError::with_details(
+                ErrorCode::UnsupportedFeature,
+                format!("shader node `{unknown}` is not supported by the native evaluator"),
+                json!({"feature_id":format!("shader.node.{unknown}"),"node_id":node_id}),
+            )),
+        };
+        let result = kind.and_then(|kind| self.evaluate_node(node_id, kind, socket));
+        self.workspace.active.pop();
         result
     }
 
@@ -782,66 +958,41 @@ impl Evaluator<'_, '_, '_, '_> {
             .ok_or_else(|| invalid(format!("shader graph references absent node `{node_id}`")))
     }
 
-    fn evaluate_node(&mut self, node_id: &Id, node: &GraphNode, socket: &str) -> Result<Value> {
-        match node.node_type.as_str() {
-            "OutputMaterial" | "ShaderNodeOutputMaterial" => {
-                Err(invalid("material output has no output sockets"))
+    fn evaluate_node(&mut self, node_id: &Id, kind: NodeKind, socket: &str) -> Result<Value> {
+        match kind {
+            NodeKind::OutputMaterial => Err(invalid("material output has no output sockets")),
+            NodeKind::Principled => Ok(Value::Shader(self.principled(node_id)?)),
+            NodeKind::VolumePrincipled | NodeKind::VolumeScatter => {
+                Ok(Value::Shader(self.volume(node_id, true)?))
             }
-            "ShaderNodeBsdfPrincipled" => Ok(Value::Shader(Box::new(self.principled(node_id)?))),
-            "ShaderNodeVolumePrincipled" => {
-                Ok(Value::Shader(Box::new(self.volume(node_id, true)?)))
-            }
-            "ShaderNodeVolumeAbsorption" => {
-                Ok(Value::Shader(Box::new(self.volume(node_id, false)?)))
-            }
-            "ShaderNodeVolumeScatter" => Ok(Value::Shader(Box::new(self.volume(node_id, true)?))),
-            "ShaderNodeDisplacement" => self.displacement(node_id, socket),
-            "ShaderNodeTexImage" => self.image_texture(node_id, socket),
-            "ShaderNodeEmission" => Ok(Value::Shader(Box::new(self.emission(node_id)?))),
-            "ShaderNodeBsdfDiffuse" => Ok(Value::Shader(Box::new(self.diffuse(node_id)?))),
-            "ShaderNodeBsdfGlossy" | "ShaderNodeBsdfAnisotropic" => {
-                Ok(Value::Shader(Box::new(self.glossy(node_id)?)))
-            }
-            "ShaderNodeBsdfGlass" => Ok(Value::Shader(Box::new(self.glass(node_id)?))),
-            "ShaderNodeBsdfTransparent" => Ok(Value::Shader(Box::new(self.transparent(node_id)?))),
-            "ShaderNodeMixShader" => Ok(Value::Shader(Box::new(self.mix_shader(node_id)?))),
-            "ShaderNodeAddShader" => Ok(Value::Shader(Box::new(self.add_shader(node_id)?))),
-            "ShaderNodeBump" => self.bump(node_id, socket),
-            "ShaderNodeTexChecker" => self.checker(node_id, socket),
-            "ShaderNodeTexNoise" => self.noise(node_id, socket),
-            "ShaderNodeTexVoronoi" => self.voronoi(node_id, socket),
-            "ShaderNodeTexGradient" => self.gradient(node_id, socket),
-            "ShaderNodeValToRGB" => self.color_ramp(node_id, socket),
-            "ShaderNodeMixRGB" | "ShaderNodeMix" => self.mix_rgb(node_id, socket),
-            "ShaderNodeMath" => self.math(node_id, socket),
-            "ShaderNodeVectorMath" => self.vector_math(node_id, socket),
-            "ShaderNodeMapping" => self.mapping(node_id, socket),
-            "ShaderNodeSeparateColor" => {
-                match node
-                    .properties
-                    .get("mode")
-                    .and_then(serde_json::Value::as_str)
-                {
-                    None | Some("RGB") => self.separate_color(node_id, socket),
-                    Some(mode) => Err(PotError::with_details(
-                        ErrorCode::UnsupportedFeature,
-                        format!("Separate Color mode `{mode}` is not implemented"),
-                        json!({"feature_id":format!("shader.node.SeparateColor.{mode}"),"node_id":node_id}),
-                    )),
-                }
-            }
-            "ShaderNodeTexCoord" => self.tex_coord(socket),
-            "ShaderNodeUVMap" => self.uv_map(node, socket),
-            "ShaderNodeNormalMap" => self.normal_map(node_id, socket),
-            "ShaderNodeFresnel" => self.fresnel(node_id, socket),
-            "ShaderNodeLayerWeight" => self.layer_weight(node_id, socket),
-            "ShaderNodeAttribute" => self.attribute(node, socket),
-            "ShaderNodeVertexColor" => self.vertex_color(node, socket),
-            unknown => Err(PotError::with_details(
-                ErrorCode::UnsupportedFeature,
-                format!("shader node `{unknown}` is not supported by the native evaluator"),
-                json!({"feature_id":format!("shader.node.{unknown}"),"node_id":node_id}),
-            )),
+            NodeKind::VolumeAbsorption => Ok(Value::Shader(self.volume(node_id, false)?)),
+            NodeKind::Displacement => self.displacement(node_id, socket),
+            NodeKind::ImageTexture => self.image_texture(node_id, socket),
+            NodeKind::Emission => Ok(Value::Shader(self.emission(node_id)?)),
+            NodeKind::Diffuse => Ok(Value::Shader(self.diffuse(node_id)?)),
+            NodeKind::Glossy => Ok(Value::Shader(self.glossy(node_id)?)),
+            NodeKind::Glass => Ok(Value::Shader(self.glass(node_id)?)),
+            NodeKind::Transparent => Ok(Value::Shader(self.transparent(node_id)?)),
+            NodeKind::MixShader => Ok(Value::Shader(self.mix_shader(node_id)?)),
+            NodeKind::AddShader => Ok(Value::Shader(self.add_shader(node_id)?)),
+            NodeKind::Bump => self.bump(node_id, socket),
+            NodeKind::Checker => self.checker(node_id, socket),
+            NodeKind::Noise => self.noise(node_id, socket),
+            NodeKind::Voronoi => self.voronoi(node_id, socket),
+            NodeKind::Gradient => self.gradient(node_id, socket),
+            NodeKind::ColorRamp => self.color_ramp(node_id, socket),
+            NodeKind::MixRgb => self.mix_rgb(node_id, socket),
+            NodeKind::Math => self.math(node_id, socket),
+            NodeKind::VectorMath => self.vector_math(node_id, socket),
+            NodeKind::Mapping => self.mapping(node_id, socket),
+            NodeKind::SeparateColor => self.separate_color(node_id, socket),
+            NodeKind::TexCoord => self.tex_coord(socket),
+            NodeKind::UvMap => self.uv_map(node_id, socket),
+            NodeKind::NormalMap => self.normal_map(node_id, socket),
+            NodeKind::Fresnel => self.fresnel(node_id, socket),
+            NodeKind::LayerWeight => self.layer_weight(node_id, socket),
+            NodeKind::Attribute => self.attribute(node_id, socket),
+            NodeKind::VertexColor => self.vertex_color(node_id, socket),
         }
     }
 
@@ -881,8 +1032,11 @@ impl Evaluator<'_, '_, '_, '_> {
         params.sheen_tint = self.color_input(id, &["Sheen Tint"], [1.0, 1.0, 1.0, 1.0])?[..3]
             .try_into()
             .map_err(|_| invalid("invalid sheen tint"))?;
-        params.specular_ior_level =
-            self.scalar_input(id, &["Specular IOR Level", "Specular"], 0.5)?;
+        params.specular_ior_level = self.scalar_input(
+            id,
+            &["Specular IOR Level", "Specular"],
+            DEFAULT_SPECULAR_IOR_LEVEL,
+        )?;
         params.specular_tint = self.color_input(id, &["Specular Tint"], [1.0, 1.0, 1.0, 1.0])?[..3]
             .try_into()
             .map_err(|_| invalid("invalid specular tint"))?;
@@ -946,6 +1100,10 @@ impl Evaluator<'_, '_, '_, '_> {
         params.base_color = color;
         params.emission_color = [color[0], color[1], color[2]];
         params.emission_strength = self.scalar_input(id, &["Strength"], 1.0)?;
+        // An emission closure alone adds radiance and no reflection: Cycles'
+        // `EmissionNode::compile` (intern/cycles/scene/shader_nodes.cpp:3071-3098) emits only
+        // `NODE_CLOSURE_EMISSION`.
+        params.reflectance = 0.0;
         Ok(params)
     }
 
@@ -970,7 +1128,7 @@ impl Evaluator<'_, '_, '_, '_> {
     fn glass(&mut self, id: &Id) -> Result<BsdfParams> {
         let mut params = self.diffuse(id)?;
         params.transmission = 1.0;
-        params.ior = self.scalar_input(id, &["IOR"], 1.45)?;
+        params.ior = self.scalar_input(id, &["IOR"], 1.5)?;
         params.roughness = self.scalar_input(id, &["Roughness"], 0.0)?;
         Ok(params)
     }
@@ -1002,7 +1160,7 @@ impl Evaluator<'_, '_, '_, '_> {
             names.first().copied().unwrap_or("Shader"),
             ValueKind::Shader,
         )? {
-            Value::Shader(value) => Ok(*value),
+            Value::Shader(value) => Ok(value),
             _ => Err(invalid("shader socket type mismatch")),
         }
     }
@@ -1073,8 +1231,14 @@ impl Evaluator<'_, '_, '_, '_> {
                 ));
             }
         };
+        let routing_uv = [uv.x, 1.0 - uv.y];
+        let pixel_uv = if tile == 0 {
+            [uv.x, 1.0 - uv.y]
+        } else {
+            [uv.x.rem_euclid(1.0), 1.0 - uv.y.rem_euclid(1.0)]
+        };
         let pixel =
-            sample_with_extension(image, [uv.x, 1.0 - uv.y], tile, interpolation, extension);
+            sample_with_extension(image, routing_uv, pixel_uv, tile, interpolation, extension);
         if pixel.iter().any(|component| !component.is_finite()) {
             return Err(eval_error(format!(
                 "Image Texture node `{id}` sampled non-finite pixels"
@@ -1100,8 +1264,8 @@ impl Evaluator<'_, '_, '_, '_> {
         if strength.abs() <= f64::EPSILON || distance.abs() <= f64::EPSILON {
             return Ok(Value::Vector(normal));
         }
-        let gradient =
-            height_gradient(self.hit_ctx, normal, |context| self.height_at(id, context))?;
+        let context = self.hit_ctx;
+        let gradient = height_gradient(&context, normal, |context| self.height_at(id, context))?;
         let invert = self
             .node(id)?
             .properties
@@ -1113,14 +1277,12 @@ impl Evaluator<'_, '_, '_, '_> {
         Ok(Value::Vector(normalize_or(perturbed, normal)))
     }
 
-    fn height_at(&self, id: &Id, context: &HitContext<'_>) -> Result<f64> {
-        let mut evaluator = Evaluator {
-            group: self.group,
-            material: self.material,
-            hit_ctx: context,
-            active: self.active.clone(),
-        };
-        evaluator.scalar_input(id, &["Height"], 0.5)
+    fn height_at(&mut self, id: &Id, context: &HitContext<'registry>) -> Result<f64> {
+        let previous = self.hit_ctx;
+        self.hit_ctx = *context;
+        let result = self.scalar_input(id, &["Height"], 0.5);
+        self.hit_ctx = previous;
+        result
     }
     fn checker(&mut self, id: &Id, socket: &str) -> Result<Value> {
         let vector = self.vector_input(
@@ -1306,43 +1468,72 @@ impl Evaluator<'_, '_, '_, '_> {
 
     /// `ShaderNodeMix` (RGBA, Blender 4.x and later) and the legacy `ShaderNodeMixRGB`.
     fn mix_rgb(&mut self, id: &Id, socket: &str) -> Result<Value> {
-        let node = self.node(id)?;
-        let generic = node.node_type == "ShaderNodeMix";
-        let blend = node
-            .properties
-            .get("blend_type")
-            .and_then(JsonValue::as_str)
-            .unwrap_or("MIX")
-            .to_owned();
-        // Blender's generic Mix defaults to FLOAT; only an explicit RGBA is supported, as in glTF.
-        let data_type = node
-            .properties
-            .get("data_type")
-            .and_then(JsonValue::as_str)
-            .unwrap_or(if generic { "FLOAT" } else { "RGBA" });
-        if data_type != "RGBA" {
-            return Err(unsupported_node(id, &format!("Mix:{data_type}")));
+        #[derive(Clone, Copy)]
+        enum Blend {
+            Mix,
+            Add,
+            Multiply,
+            Subtract,
+            Divide,
         }
+
+        enum BlendSelection {
+            Supported(Blend),
+            Unsupported(String),
+        }
+
+        let (generic, blend, label) = {
+            let node = self.node(id)?;
+            let generic = node.node_type == "ShaderNodeMix";
+            let label = if generic { "Mix" } else { "MixRGB" };
+            let data_type = node
+                .properties
+                .get("data_type")
+                .and_then(JsonValue::as_str)
+                .unwrap_or(if generic { "FLOAT" } else { "RGBA" });
+            if data_type != "RGBA" {
+                return Err(unsupported_node(id, &format!("Mix:{data_type}")));
+            }
+            let blend = match node
+                .properties
+                .get("blend_type")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("MIX")
+            {
+                "MIX" => BlendSelection::Supported(Blend::Mix),
+                "ADD" => BlendSelection::Supported(Blend::Add),
+                "MULTIPLY" => BlendSelection::Supported(Blend::Multiply),
+                "SUBTRACT" => BlendSelection::Supported(Blend::Subtract),
+                "DIVIDE" => BlendSelection::Supported(Blend::Divide),
+                other => BlendSelection::Unsupported(other.to_owned()),
+            };
+            (generic, blend, label)
+        };
         // The generic node names its sockets by type; the legacy node uses plain names.
-        let (factor_socket, first_socket, second_socket, result_socket, label) = if generic {
-            ("Factor_Float", "A_Color", "B_Color", "Result_Color", "Mix")
+        let (factor_socket, first_socket, second_socket, result_socket) = if generic {
+            ("Factor_Float", "A_Color", "B_Color", "Result_Color")
         } else {
-            ("Fac", "Color1", "Color2", "Color", "MixRGB")
+            ("Fac", "Color1", "Color2", "Color")
         };
         let factor = self
             .scalar_input(id, &[factor_socket], 0.5)?
             .clamp(0.0, 1.0);
         let first = self.color_input(id, &[first_socket], [0.5, 0.5, 0.5, 1.0])?;
         let second = self.color_input(id, &[second_socket], [0.5, 0.5, 0.5, 1.0])?;
-        let blended = match blend.as_str() {
-            "MIX" => second,
-            "ADD" => color_binary(first, second, |a, b| a + b),
-            "MULTIPLY" => color_binary(first, second, |a, b| a * b),
-            "SUBTRACT" => color_binary(first, second, |a, b| a - b),
-            "DIVIDE" => color_binary(first, second, |a, b| {
+        let blend = match blend {
+            BlendSelection::Supported(blend) => blend,
+            BlendSelection::Unsupported(other) => {
+                return Err(unsupported_node(id, &format!("{label}:{other}")));
+            }
+        };
+        let blended = match blend {
+            Blend::Mix => second,
+            Blend::Add => color_binary(first, second, |a, b| a + b),
+            Blend::Multiply => color_binary(first, second, |a, b| a * b),
+            Blend::Subtract => color_binary(first, second, |a, b| a - b),
+            Blend::Divide => color_binary(first, second, |a, b| {
                 if b.abs() <= f64::EPSILON { a } else { a / b }
             }),
-            other => return Err(unsupported_node(id, &format!("{label}:{other}"))),
         };
         let result = color_lerp(first, blended, factor);
         if socket == result_socket {
@@ -1483,6 +1674,19 @@ impl Evaluator<'_, '_, '_, '_> {
     }
     /// `ShaderNodeSeparateColor`: one channel of its color input as a scalar.
     fn separate_color(&mut self, id: &Id, socket: &str) -> Result<Value> {
+        if let Some(mode) = self
+            .node(id)?
+            .properties
+            .get("mode")
+            .and_then(JsonValue::as_str)
+            .filter(|mode| *mode != "RGB")
+        {
+            return Err(PotError::with_details(
+                ErrorCode::UnsupportedFeature,
+                format!("Separate Color mode `{mode}` is not implemented"),
+                json!({"feature_id":format!("shader.node.SeparateColor.{mode}"),"node_id":id}),
+            ));
+        }
         let color = self.color_input(id, &["Color"], [0.0; 4])?;
         let channel = match socket {
             "Red" => color[0],
@@ -1514,20 +1718,19 @@ impl Evaluator<'_, '_, '_, '_> {
         };
         Ok(Value::Vector(value))
     }
-
     /// `ShaderNodeUVMap`: the UV of the layer named by the node, or the render UV when it names none.
-    fn uv_map(&self, node: &GraphNode, socket: &str) -> Result<Value> {
+    fn uv_map(&self, id: &Id, socket: &str) -> Result<Value> {
         if socket != "UV" {
             return Err(invalid(format!("unknown UV Map output `{socket}`")));
         }
+        let node = self.node(id)?;
         let layer = layer_index(
-            self.hit_ctx,
+            &self.hit_ctx,
             node.properties.get("uv_map").and_then(JsonValue::as_str),
         );
-        let uv = storage_to_blender_uv(layer_uv(self.hit_ctx, layer));
+        let uv = storage_to_blender_uv(layer_uv(&self.hit_ctx, layer));
         Ok(Value::Vector(DVec3::new(uv[0], uv[1], 0.0)))
     }
-
     fn normal_map(&mut self, id: &Id, socket: &str) -> Result<Value> {
         if socket != "Normal" {
             return Err(invalid(format!("unknown Normal Map output `{socket}`")));
@@ -1541,6 +1744,12 @@ impl Evaluator<'_, '_, '_, '_> {
         if !matches!(space, "TANGENT_SPACE" | "TANGENT") {
             return Err(unsupported_node(id, &format!("NormalMap:{space}")));
         }
+        let imported_normal_map = self
+            .node(id)?
+            .properties
+            .get("potter_gltf_imported_normal_map")
+            .and_then(JsonValue::as_bool)
+            == Some(true);
         let color = self.color_input(id, &["Color"], [0.5, 0.5, 1.0, 1.0])?;
         let tangent_normal = DVec3::new(
             color[0] * 2.0 - 1.0,
@@ -1553,8 +1762,12 @@ impl Evaluator<'_, '_, '_, '_> {
             .properties
             .get("uv_map")
             .and_then(JsonValue::as_str);
-        let layer = layer_index(self.hit_ctx, uv_map);
-        let (tangent_u, tangent_v) = blender_layer_frame(self.hit_ctx, layer, base_normal);
+        let layer = layer_index(&self.hit_ctx, uv_map);
+        let (tangent_u, tangent_v) = if imported_normal_map {
+            layer_frame(&self.hit_ctx, layer, base_normal)
+        } else {
+            blender_layer_frame(&self.hit_ctx, layer, base_normal)
+        };
         let mapped_normal = normalize_or(
             tangent_u * tangent_normal.x
                 + tangent_v * tangent_normal.y
@@ -1596,24 +1809,41 @@ impl Evaluator<'_, '_, '_, '_> {
         }
     }
 
-    fn attribute(&self, node: &GraphNode, socket: &str) -> Result<Value> {
+    /// `ShaderNodeAttribute`. The `Color` output is RGB with alpha 1.0: EEVEE's `node_attribute`
+    /// sets `outcol = float4(attr.xyz, 1.0f)` (`gpu/shaders/material/gpu_shader_material_attribute.glsl`).
+    /// Cycles' Color is a float3 output (`intern/cycles/scene/shader_nodes.cpp`,
+    /// `AttributeNode::compile`, `NODE_ATTR_OUTPUT_FLOAT3`). The `Alpha` output carries the layer
+    /// alpha (EEVEE `outalpha = attr.w`; Cycles `NODE_ATTR_OUTPUT_FLOAT_ALPHA`). A missing layer
+    /// loads as opaque black.
+    fn attribute(&self, id: &Id, socket: &str) -> Result<Value> {
+        let node = self.node(id)?;
         let name = node
             .properties
             .get("attribute_name")
             .or_else(|| node.properties.get("name"))
             .and_then(JsonValue::as_str)
             .ok_or_else(|| invalid("Attribute node requires attribute_name"))?;
-        color_output(layer_color(self.hit_ctx, name), socket, "Attribute")
+        let [red, green, blue, alpha] =
+            layer_color(&self.hit_ctx, name, false, [0.0, 0.0, 0.0, 1.0]);
+        match socket {
+            "Color" => Ok(Value::Color([red, green, blue, 1.0])),
+            _ => color_output([red, green, blue, alpha], socket, "Attribute"),
+        }
     }
 
     /// `ShaderNodeVertexColor`: the named color layer, or the render layer when the name is empty.
-    fn vertex_color(&self, node: &GraphNode, socket: &str) -> Result<Value> {
+    fn vertex_color(&self, id: &Id, socket: &str) -> Result<Value> {
+        let node = self.node(id)?;
         let name = node
             .properties
             .get("layer_name")
             .and_then(JsonValue::as_str)
             .unwrap_or("");
-        color_output(layer_color(self.hit_ctx, name), socket, "Vertex Color")
+        color_output(
+            layer_color(&self.hit_ctx, name, name.is_empty(), [0.0, 0.0, 0.0, 0.0]),
+            socket,
+            "Vertex Color",
+        )
     }
 
     fn scalar_input(&mut self, id: &Id, names: &[&str], default: f64) -> Result<f64> {
@@ -1665,7 +1895,7 @@ impl Evaluator<'_, '_, '_, '_> {
     }
 }
 
-fn socket_default(node: &GraphNode, socket: &str) -> JsonValue {
+fn socket_default<'node>(node: &'node GraphNode, socket: &str) -> Option<&'node JsonValue> {
     let alias = match socket {
         "Base Color" => "Base Color",
         "Transmission Weight" => "Transmission",
@@ -1675,7 +1905,7 @@ fn socket_default(node: &GraphNode, socket: &str) -> JsonValue {
         "Shader" => "Shader",
         _ => socket,
     };
-    node.inputs.get(alias).cloned().unwrap_or(JsonValue::Null)
+    node.inputs.get(alias)
 }
 
 fn socket_matches(candidate: &str, requested: &str) -> bool {
@@ -2023,10 +2253,15 @@ fn eval_error(message: impl Into<String>) -> PotError {
     PotError::new(ErrorCode::EvaluationFailed, message)
 }
 
-/// Color of layer `name` at this hit; the empty name is the render layer. A layer the mesh does not
-/// carry reads as opaque black and records a `mesh.color_layer_missing` warning.
-fn layer_color(hit_ctx: &HitContext<'_>, name: &str) -> [f64; 4] {
-    let found = if name.is_empty() {
+/// Color of one named layer, or the render layer when `use_render` is true. Blender's two color
+/// nodes use different alpha defaults when a requested layer is unavailable.
+fn layer_color(
+    hit_ctx: &HitContext<'_>,
+    name: &str,
+    use_render: bool,
+    missing: [f64; 4],
+) -> [f64; 4] {
+    let found = if use_render {
         hit_ctx.color_render
     } else {
         hit_ctx
@@ -2038,10 +2273,15 @@ fn layer_color(hit_ctx: &HitContext<'_>, name: &str) -> [f64; 4] {
         return color;
     }
     if let Some(warnings) = hit_ctx.warnings {
-        let label = if name.is_empty() { "render" } else { name };
+        let label = if use_render { "render" } else { name };
+        let fallback = if missing[3] == 0.0 {
+            "transparent black"
+        } else {
+            "opaque black"
+        };
         let warning = json!({
             "code": "mesh.color_layer_missing",
-            "message": format!("color layer `{label}` is not on this mesh; opaque black was used"),
+            "message": format!("color layer `{label}` is not on this mesh; {fallback} was used"),
             "layer": name,
         });
         let mut recorded = warnings.borrow_mut();
@@ -2049,7 +2289,7 @@ fn layer_color(hit_ctx: &HitContext<'_>, name: &str) -> [f64; 4] {
             recorded.push(warning);
         }
     }
-    [0.0, 0.0, 0.0, 1.0]
+    missing
 }
 
 /// The `Color` or `Alpha` output of a node that reads one color.
@@ -2060,7 +2300,6 @@ fn color_output(color: [f64; 4], socket: &str, node: &str) -> Result<Value> {
         _ => Err(invalid(format!("unknown {node} output `{socket}`"))),
     }
 }
-
 fn unsupported_node(id: &Id, kind: &str) -> PotError {
     PotError::with_details(
         ErrorCode::UnsupportedFeature,
@@ -2382,7 +2621,43 @@ mod tests {
             );
         }
 
-        // A layer the mesh does not carry reads opaque black and records a warning.
+        // An explicitly missing Vertex Color layer is transparent black and records a warning.
+        let sink = RefCell::new(Vec::new());
+        let params = evaluate_surface(
+            &material,
+            &HitContext::new(&groups)
+                .with_color_layers(&[], Some([0.91, 0.37, 0.64, 0.22]))
+                .with_warnings(&sink),
+        )
+        .unwrap();
+        assert_eq!(params.base_color, [0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(sink.borrow()[0]["code"], json!("mesh.color_layer_missing"));
+        assert_eq!(sink.borrow()[0]["layer"], json!("Col"));
+    }
+
+    #[test]
+    fn default_vertex_color_reads_render_and_missing_render_is_transparent() {
+        let mut graph = NodeGroup::new("DefaultVertexColor", GraphKind::Shader);
+        insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
+        insert_node(&mut graph, "bsdf", "ShaderNodeBsdfPrincipled", json!({}));
+        insert_node(&mut graph, "vertex", "ShaderNodeVertexColor", json!({}));
+        link(&mut graph, "vertex", "Color", "bsdf", "Base Color");
+        link(&mut graph, "bsdf", "BSDF", "output", "Surface");
+        let graph_id = Id::new("default_vertex_color_shader").unwrap();
+        let mut groups = Registry::new();
+        groups.insert(graph_id.clone(), graph);
+        let material = Material {
+            node_tree: Some(graph_id),
+            ..Material::default()
+        };
+        let render = [0.2, 0.4, 0.8, 0.35];
+        let params = evaluate_surface(
+            &material,
+            &HitContext::new(&groups).with_color_layers(&[], Some(render)),
+        )
+        .unwrap();
+        assert_eq!(params.base_color, render);
+
         let sink = RefCell::new(Vec::new());
         let params = evaluate_surface(
             &material,
@@ -2391,9 +2666,45 @@ mod tests {
                 .with_warnings(&sink),
         )
         .unwrap();
+        assert_eq!(params.base_color, [0.0; 4]);
+        assert_eq!(sink.borrow()[0]["layer"], json!(""));
+    }
+
+    #[test]
+    fn missing_attribute_color_is_opaque_black() {
+        let mut graph = NodeGroup::new("MissingAttributeColor", GraphKind::Shader);
+        insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
+        insert_node(&mut graph, "bsdf", "ShaderNodeBsdfPrincipled", json!({}));
+        insert_node(&mut graph, "attribute", "ShaderNodeAttribute", json!({}));
+        set_properties(
+            &mut graph,
+            "attribute",
+            json!({"attribute_type":"GEOMETRY","attribute_name":"Ghost"}),
+        );
+        link(&mut graph, "attribute", "Color", "bsdf", "Base Color");
+        link(&mut graph, "bsdf", "BSDF", "output", "Surface");
+        let graph_id = Id::new("missing_attribute_color_shader").unwrap();
+        let mut groups = Registry::new();
+        groups.insert(graph_id.clone(), graph);
+        let material = Material {
+            node_tree: Some(graph_id),
+            ..Material::default()
+        };
+        let source = [0.23, 0.71, 0.42, 0.36];
+        let found = [("Ghost", source)];
+        let params = evaluate_surface(
+            &material,
+            &HitContext::new(&groups).with_color_layers(&found, None),
+        )
+        .unwrap();
+        assert_eq!(params.base_color, [source[0], source[1], source[2], 1.0]);
+
+        let params = evaluate_surface(
+            &material,
+            &HitContext::new(&groups).with_color_layers(&[], Some([0.87, 0.54, 0.19, 0.27])),
+        )
+        .unwrap();
         assert_eq!(params.base_color, [0.0, 0.0, 0.0, 1.0]);
-        assert_eq!(sink.borrow()[0]["code"], json!("mesh.color_layer_missing"));
-        assert_eq!(sink.borrow()[0]["layer"], json!("Col"));
     }
 
     #[test]

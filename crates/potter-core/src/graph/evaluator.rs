@@ -11,8 +11,8 @@ use serde_json::{Map, Value, json};
 use crate::{
     error::{ErrorCode, PotError, Result},
     geom::{
-        GridParams, IcosphereParams, Mesh, MeshError, ORIGINDEX_NONE, OriginalIndices,
-        modifiers::evaluate_modifiers,
+        GridParams, IcosphereParams, Mesh, MeshError, ORIGINDEX_NONE,
+        modifiers::evaluate_modifiers, origindex_values, set_origindex,
     },
     model::{Id, Modifier},
 };
@@ -176,11 +176,9 @@ pub fn evaluate_at_frame(
                 .and_then(|value| {
                     crate::hash::canonicalize(&value).map(|bytes| {
                         let mut signature = crate::hash::sha256(&bytes);
-                        if let Some(indices) = input.and_then(|mesh| mesh.original_indices.as_ref())
-                        {
+                        if let Some(indices) = input.and_then(origindex_values) {
                             let mut hasher = DefaultHasher::new();
-                            indices.vertices.hash(&mut hasher);
-                            indices.source_vertex_count.hash(&mut hasher);
+                            indices.hash(&mut hasher);
                             let _ = write!(signature, "-{:016x}", hasher.finish());
                         }
                         signature
@@ -362,13 +360,11 @@ impl Evaluator<'_> {
         self.active.remove(id);
         let mut value = result?;
         if let EvalValue::Geometry(geometry) = &mut value
-            && geometry.mesh.original_indices.is_none()
-            && let Some(indices) = self.input.and_then(|mesh| mesh.original_indices.as_ref())
+            && origindex_values(&geometry.mesh).is_none()
+            && self.input.and_then(origindex_values).is_some()
         {
-            geometry.mesh.original_indices = Some(OriginalIndices {
-                vertices: vec![ORIGINDEX_NONE; geometry.mesh.vertices.len()],
-                source_vertex_count: indices.source_vertex_count,
-            });
+            let vertex_count = geometry.mesh.vertices.len();
+            set_origindex(&mut geometry.mesh, &vec![ORIGINDEX_NONE; vertex_count]);
         }
         self.cache.insert(key, value.clone());
         Ok(value)
@@ -1270,7 +1266,8 @@ impl Evaluator<'_> {
             EvalValue::Scalar(json!(0.05)),
         )?);
         let mut points = Mesh::new();
-        let mut source_vertices = geometry.mesh.original_indices.as_ref().map(|_| Vec::new());
+        let source_indices = origindex_values(&geometry.mesh);
+        let mut source_vertices = source_indices.as_ref().map(|_| Vec::new());
         let corner_vertices = if domain == "CORNER" && source_vertices.is_some() {
             let vertex_index: HashMap<u32, usize> = geometry
                 .mesh
@@ -1314,15 +1311,7 @@ impl Evaluator<'_> {
                         _ => None,
                     };
                     let original_index = source_vertex
-                        .and_then(|source| {
-                            geometry
-                                .mesh
-                                .original_indices
-                                .as_ref()?
-                                .vertices
-                                .get(source)
-                                .copied()
-                        })
+                        .and_then(|source| source_indices.as_ref()?.get(source).copied())
                         .unwrap_or(ORIGINDEX_NONE);
                     source_vertices.push(original_index);
                 }
@@ -1331,13 +1320,8 @@ impl Evaluator<'_> {
         points
             .attributes
             .insert("radius".to_owned(), json!({"domain":"POINT","data":radii}));
-        if let (Some(indices), Some(vertices)) =
-            (geometry.mesh.original_indices.as_ref(), source_vertices)
-        {
-            points.original_indices = Some(OriginalIndices {
-                vertices,
-                source_vertex_count: indices.source_vertex_count,
-            });
+        if let Some(vertices) = source_vertices {
+            set_origindex(&mut points, &vertices);
         }
         Ok(EvalValue::Geometry(GeometryValue {
             mesh: points,
@@ -3129,31 +3113,16 @@ fn merge_meshes(meshes: &[Mesh]) -> Result<Mesh> {
             "joined geometry exceeds vertex ID range",
         ));
     }
-    let source_vertex_count = meshes.iter().find_map(|mesh| {
-        mesh.original_indices
-            .as_ref()
-            .map(|indices| indices.source_vertex_count)
-    });
-    if let Some(source_vertex_count) = source_vertex_count {
-        for mesh in meshes {
-            if let Some(indices) = &mesh.original_indices
-                && (indices.source_vertex_count != source_vertex_count
-                    || indices.vertices.len() != mesh.vertices.len())
-            {
-                return Err(evaluation(
-                    "joined geometry has incompatible original-index sidecars",
-                ));
-            }
-        }
-    }
-    let mut original_vertices = source_vertex_count.map(|_| Vec::with_capacity(vertex_count));
+    let tracks_origindex = meshes.iter().any(|mesh| origindex_values(mesh).is_some());
+    let mut original_vertices = tracks_origindex.then(|| Vec::with_capacity(vertex_count));
     let mut result = Mesh::new();
     for mesh in meshes {
         if let Some(output_indices) = &mut original_vertices {
-            if let Some(indices) = &mesh.original_indices {
-                output_indices.extend_from_slice(&indices.vertices);
-            } else {
-                output_indices.extend(std::iter::repeat_n(ORIGINDEX_NONE, mesh.vertices.len()));
+            match origindex_values(mesh) {
+                Some(indices) => output_indices.extend_from_slice(&indices),
+                None => {
+                    output_indices.extend(std::iter::repeat_n(ORIGINDEX_NONE, mesh.vertices.len()));
+                }
             }
         }
         let mut mapping = HashMap::with_capacity(mesh.vertices.len());
@@ -3197,13 +3166,9 @@ fn merge_meshes(meshes: &[Mesh]) -> Result<Mesh> {
             }
         }
     }
-    result.original_indices =
-        source_vertex_count
-            .zip(original_vertices)
-            .map(|(source_vertex_count, vertices)| OriginalIndices {
-                vertices,
-                source_vertex_count,
-            });
+    if let Some(vertices) = original_vertices {
+        set_origindex(&mut result, &vertices);
+    }
     Ok(result)
 }
 

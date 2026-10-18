@@ -57,12 +57,16 @@ pub fn sample_with_interpolation(
         return TRANSPARENT_BLACK;
     }
 
-    let Some((image, local_uv)) = image_for_uv(data, uv, tile) else {
+    let Some(image) = image_for_uv(data, uv, tile) else {
         return TRANSPARENT_BLACK;
     };
-
     let Some((width, height)) = image.valid_dimensions() else {
         return TRANSPARENT_BLACK;
+    };
+    let local_uv = if tile == 0 {
+        uv
+    } else {
+        [uv[0] - uv[0].floor(), uv[1] - uv[1].floor()]
     };
     let u = local_uv[0].clamp(0.0, 1.0);
     let v = local_uv[1].clamp(0.0, 1.0);
@@ -73,39 +77,43 @@ pub fn sample_with_interpolation(
     }
 }
 
-/// Samples an image using the requested extension mode without copying image data.
+/// Samples an image using separate UVs for UDIM routing and pixel lookup.
 ///
-/// UV coordinates use the POTTER storage convention (V-down). UDIM lookup selects a tile
-/// using the existing UV offset routing, then applies extension to that tile's local UVs.
+/// `routing_uv` selects the UDIM tile. `pixel_uv` is the full-image UV for tile zero and the
+/// tile-local V-down UV for positive base tiles.
 #[must_use]
 pub fn sample_with_extension(
     data: &ImageData,
-    uv: [f64; 2],
+    routing_uv: [f64; 2],
+    pixel_uv: [f64; 2],
     tile: u32,
     interpolation: ImageInterpolation,
     extension: ImageExtension,
 ) -> [f64; 4] {
-    if !uv[0].is_finite() || !uv[1].is_finite() {
+    if !pixel_uv[0].is_finite()
+        || !pixel_uv[1].is_finite()
+        || (tile != 0 && (!routing_uv[0].is_finite() || !routing_uv[1].is_finite()))
+    {
         return TRANSPARENT_BLACK;
     }
 
-    let Some((image, local_uv)) = image_for_uv(data, uv, tile) else {
+    let Some(image) = image_for_uv(data, routing_uv, tile) else {
         return TRANSPARENT_BLACK;
     };
     let Some((width, height)) = image.valid_dimensions() else {
         return TRANSPARENT_BLACK;
     };
     if extension == ImageExtension::Clip
-        && (local_uv[0] < 0.0 || local_uv[0] > 1.0 || local_uv[1] < 0.0 || local_uv[1] > 1.0)
+        && (pixel_uv[0] < 0.0 || pixel_uv[0] > 1.0 || pixel_uv[1] < 0.0 || pixel_uv[1] > 1.0)
     {
         return TRANSPARENT_BLACK;
     }
 
     let local_uv = match extension {
-        ImageExtension::Repeat => [local_uv[0].rem_euclid(1.0), local_uv[1].rem_euclid(1.0)],
-        ImageExtension::Extend => [local_uv[0].clamp(0.0, 1.0), local_uv[1].clamp(0.0, 1.0)],
-        ImageExtension::Clip => local_uv,
-        ImageExtension::Mirror => [local_uv[0].rem_euclid(2.0), local_uv[1].rem_euclid(2.0)],
+        ImageExtension::Repeat => [pixel_uv[0].rem_euclid(1.0), pixel_uv[1].rem_euclid(1.0)],
+        ImageExtension::Extend => [pixel_uv[0].clamp(0.0, 1.0), pixel_uv[1].clamp(0.0, 1.0)],
+        ImageExtension::Clip => pixel_uv,
+        ImageExtension::Mirror => [pixel_uv[0].rem_euclid(2.0), pixel_uv[1].rem_euclid(2.0)],
     };
 
     match interpolation {
@@ -128,20 +136,13 @@ pub fn sample_with_extension(
     }
 }
 
-fn image_for_uv(
-    data: &ImageData,
-    uv: [f64; 2],
-    tile: u32,
-) -> Option<(ImageTileDataRef<'_>, [f64; 2])> {
+fn image_for_uv(data: &ImageData, uv: [f64; 2], tile: u32) -> Option<ImageTileDataRef<'_>> {
     if tile == 0 {
-        Some((
-            ImageTileDataRef {
-                width: data.width,
-                height: data.height,
-                pixels: &data.pixels,
-            },
-            uv,
-        ))
+        Some(ImageTileDataRef {
+            width: data.width,
+            height: data.height,
+            pixels: &data.pixels,
+        })
     } else {
         let actual_tile = udim_tile(tile, uv)?;
         let image = data.tiles.get(&actual_tile).map_or_else(
@@ -166,7 +167,7 @@ fn image_for_uv(
                 pixels: &image.pixels,
             },
         );
-        Some((image, [uv[0] - uv[0].floor(), uv[1] - uv[1].floor()]))
+        Some(image)
     }
 }
 
@@ -463,6 +464,7 @@ mod tests {
             sample_with_extension(
                 &image,
                 [0.0, 0.5],
+                [0.0, 0.5],
                 0,
                 ImageInterpolation::Linear,
                 ImageExtension::Repeat,
@@ -472,6 +474,7 @@ mod tests {
         assert_eq!(
             sample_with_extension(
                 &image,
+                [0.0, 0.5],
                 [0.0, 0.5],
                 0,
                 ImageInterpolation::Linear,
@@ -494,6 +497,7 @@ mod tests {
             sample_with_extension(
                 &image,
                 [1.5, 0.5],
+                [1.5, 0.5],
                 0,
                 ImageInterpolation::Linear,
                 ImageExtension::Extend,
@@ -503,6 +507,7 @@ mod tests {
         assert_eq!(
             sample_with_extension(
                 &image,
+                [1.01, 0.5],
                 [1.01, 0.5],
                 0,
                 ImageInterpolation::Linear,
@@ -525,6 +530,7 @@ mod tests {
             sample_with_extension(
                 &image,
                 [0.0, 0.5],
+                [0.0, 0.5],
                 0,
                 ImageInterpolation::Linear,
                 ImageExtension::Clip,
@@ -545,6 +551,7 @@ mod tests {
         assert_eq!(
             sample_with_extension(
                 &image,
+                [1.0, 1.0],
                 [1.0, 1.0],
                 0,
                 ImageInterpolation::Closest,
@@ -593,6 +600,7 @@ mod tests {
             sample_with_extension(
                 &image,
                 [1.0, 1.5],
+                [0.0, 0.5],
                 1001,
                 ImageInterpolation::Linear,
                 ImageExtension::Repeat,

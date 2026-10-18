@@ -227,6 +227,9 @@ fn add_shader_combines_emission_and_surface_shaders() {
     assert_eq!(bsdf.base_color, [0.2, 0.3, 0.0, 1.0]);
     assert_eq!(bsdf.emission_color, [0.0, 0.3, 0.0]);
     assert_eq!(bsdf.emission_strength, 2.0);
+    // Principled reflects with weight 1 and Emission with 0 (Cycles `EmissionNode::compile`,
+    // intern/cycles/scene/shader_nodes.cpp:3071-3098); Add sums them, clamped to 1.
+    assert_eq!(bsdf.reflectance, 1.0);
 }
 #[test]
 fn material_create_accepts_inline_shader_node_tree() {
@@ -320,6 +323,85 @@ fn image_texture_samples_resolved_pixels_using_hit_uvs() {
 }
 
 #[test]
+fn image_texture_routes_blender_v_up_udims_and_flips_local_v() {
+    let images = BTreeMap::from([(
+        "test_image".to_owned(),
+        ImageData {
+            width: 1,
+            height: 1,
+            pixels: vec![[0.25, 0.25, 0.25, 1.0]],
+            tiles: BTreeMap::from([
+                (
+                    1002,
+                    ImageTileData {
+                        width: 1,
+                        height: 1,
+                        pixels: vec![[0.0, 1.0, 0.0, 1.0]],
+                    },
+                ),
+                (
+                    1011,
+                    ImageTileData {
+                        width: 1,
+                        height: 2,
+                        pixels: vec![[1.0, 0.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]],
+                    },
+                ),
+            ]),
+            interpolation: ImageInterpolation::Closest,
+        },
+    )]);
+    let make_material = |mapped: bool, vector: [f64; 3]| {
+        let mut graph = NodeGroup::new("UDIM Image", GraphKind::Shader);
+        add_node(&mut graph, "out", "OutputMaterial", &[]);
+        add_node(&mut graph, "principled", "ShaderNodeBsdfPrincipled", &[]);
+        if mapped {
+            add_node(
+                &mut graph,
+                "mapping",
+                "ShaderNodeMapping",
+                &[("Vector", json!(vector))],
+            );
+            add_node(&mut graph, "image", "ShaderNodeTexImage", &[]);
+            link(&mut graph, "mapping", "Vector", "image", "Vector");
+        } else {
+            add_node(
+                &mut graph,
+                "image",
+                "ShaderNodeTexImage",
+                &[("Vector", json!(vector))],
+            );
+        }
+        let image = graph.nodes.get_mut(&Id::new("image").unwrap()).unwrap();
+        image
+            .properties
+            .insert("image".to_owned(), json!("test_image"));
+        image
+            .properties
+            .insert("interpolation".to_owned(), json!("closest"));
+        link(&mut graph, "image", "Color", "principled", "Base Color");
+        link(&mut graph, "principled", "BSDF", "out", "Surface");
+        material_with_graph(graph)
+    };
+
+    let cases = [
+        ([0.25, 1.25, 0.0], [0.0, 0.0, 1.0, 1.0]),
+        ([1.25, 0.25, 0.0], [0.0, 1.0, 0.0, 1.0]),
+        ([0.25, 2.25, 0.0], [0.0; 4]),
+    ];
+    for mapped in [false, true] {
+        for (vector, expected) in cases {
+            let (material, groups) = make_material(mapped, vector);
+            let context = HitContext::new(&groups).with_images(&images);
+            assert_eq!(
+                evaluate_surface(&material, &context).unwrap().base_color,
+                expected,
+            );
+        }
+    }
+}
+
+#[test]
 fn image_texture_without_resolved_pixels_reports_unsupported_feature() {
     let mut graph = NodeGroup::new("Missing image", GraphKind::Shader);
     add_node(&mut graph, "out", "OutputMaterial", &[]);
@@ -394,7 +476,7 @@ fn material_texture_refs_sample_uv_and_override_pbr_fields_for_graphs() {
         positions: [DVec3::ZERO, DVec3::X, DVec3::Y],
         barycentric: [1.0 / 3.0; 3],
         render: Some(0),
-        available_mask: Some(0b1),
+        available_mask: None,
     };
     let mut context = HitContext::new(&groups)
         .with_images(&image_data)
@@ -462,7 +544,7 @@ fn uv_map_node_samples_its_named_layer_and_falls_back_with_a_warning() {
         positions: [DVec3::ZERO, DVec3::X, DVec3::Y],
         barycentric: [1.0 / 3.0; 3],
         render: Some(0),
-        available_mask: Some(0b11),
+        available_mask: None,
     };
 
     let (named_material, named_groups) = uv_map_material("Detail");

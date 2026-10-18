@@ -553,12 +553,13 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         drop_welded_points(points, origins, faces, &welded, loose_edges);
     let origin = Origin {
         vertices: origins,
-        // Skin's fresh BMesh has no point CD_ORIGINDEX layer.
         source_vertices: None,
         faces: vec![None; faces.len()],
         corners: None,
     };
     let mut result = build_mesh(points, faces, loose_edges, &origin, mesh)?;
+    // Skin's fresh BMesh has no point CD_ORIGINDEX layer, so the index carrier is dropped.
+    result.attributes.remove(crate::geom::ORIGINDEX_ATTRIBUTE);
     result.attributes.remove("blender_skin_vertices");
     result.attributes.remove("skin_radii");
     result.attributes.remove("skin_roots");

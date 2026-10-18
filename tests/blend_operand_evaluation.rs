@@ -22,6 +22,8 @@ use pot_json_helper::pot_json;
 
 type TestResult<T> = Result<T, Box<dyn Error>>;
 
+const BLENDER_REQUIRED: &str = "Blender is required for the object-mesh operand regressions: install Blender 5.2.2, or set POTTER_BLENDER to its executable";
+
 const FRAME: f64 = 5.0;
 const TOLERANCE: f64 = 1.0e-4;
 
@@ -551,10 +553,7 @@ fn assert_uv_parity(actual: &[[f64; 5]], expected: &[[f64; 5]]) {
 
 #[test]
 fn blender_object_mesh_operands_use_same_frame_evaluated_geometry() -> TestResult<()> {
-    let Some(blender) = blender_executable() else {
-        eprintln!("Skipping object-mesh operand regressions: no Blender executable was found");
-        return Ok(());
-    };
+    let blender = blender_executable().ok_or(BLENDER_REQUIRED)?;
     let directory = tempdir()?;
     let root = directory.path();
     run_blender(&blender, root)?;

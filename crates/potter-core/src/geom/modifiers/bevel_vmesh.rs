@@ -2516,18 +2516,9 @@ pub(super) fn finish(
         source_polygons,
         &source_uvs(mesh),
     );
-    let source_vertices = mesh.original_indices.as_ref().map(|_| {
-        let mut selectors = Vec::with_capacity(points.len());
-        for (index, &source) in emitted_origins.iter().enumerate() {
-            if used[index] {
-                selectors.push(Some(source));
-            }
-        }
-        selectors
-    });
     let origin = Origin {
         vertices: origins,
-        source_vertices,
+        source_vertices: None,
         faces,
         corners: Some(corners),
     };
