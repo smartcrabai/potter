@@ -400,6 +400,7 @@ impl Snapshot {
                     snapshot.scene_hash.clone_from(&scene_hash);
                     let evaluation_key = json!({
                         "engine": EVALUATION_ENGINE,
+                        "build_identity": crate::BUILD_IDENTITY,
                         "simulation_engine": crate::sim::SOLVER_VERSION,
                         "scene_hash": scene_hash,
                         "scene_id": snapshot.scene_id,
@@ -708,6 +709,7 @@ impl Snapshot {
         }
         let evaluation_key = json!({
             "engine": EVALUATION_ENGINE,
+            "build_identity": crate::BUILD_IDENTITY,
             "simulation_engine": crate::sim::SOLVER_VERSION,
             "scene_hash": scene_hash,
             "scene_id": scene_id,
@@ -1652,6 +1654,7 @@ fn modifier_transform_references(modifier: &Modifier) -> BTreeSet<Id> {
     let parameters: &[&str] = match modifier.modifier_type.as_str() {
         "hook" => &["object"],
         "screw" => &["object"],
+        "mirror" => &["mirror_object"],
         "uv_project" => &["projectors"],
         "uv_warp" | "warp" => &["object_from", "object_to"],
         "vertex_weight_edit" | "vertex_weight_mix" | "vertex_weight_proximity" => {

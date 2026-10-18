@@ -1,18 +1,25 @@
 //! PR9 normal-code persistence against Blender 5.2.2.
 //!
 //! * `subdivision_codes_and_corner_data_follow_one_loop_basis_through_blend`: a Subdivision with Use
-//!   Custom Normals stores its codes with a nonidentity `corner_order`. The same loop basis must
-//!   carry the UV, color, and generic face/corner data. The test exports `.blend`, reopens it in
-//!   Blender, reimports it into a second project, exports again, and then continues with Displace.
-//!   Every value is compared by corner identity (position and face center), never by raw index.
-//!   The expected values come from Blender's own Subdivision evaluation of the same file.
-//! * `subdivision_without_custom_normals_keeps_loop_basis_and_later_authoring_allocates_the_layer`:
-//!   a Subdivision without Use Custom Normals allocates no `values` layer but keeps its
-//!   `corner_order` basis. After save and reload, `mesh.set_custom_normals` allocates the layer
-//!   through that basis, and Blender's own reference confirms every normal and Auto status.
+//!   Custom Normals stores its codes in Blender's loop order (the identity basis). The same loop
+//!   order must carry the UV, color, and generic face/corner data. The test exports `.blend`,
+//!   reopens it in Blender, reimports it into a second project, exports again, and then continues
+//!   with Displace. Every value is compared by corner identity (position and face center), never by
+//!   raw index. The expected values come from Blender's own Subdivision evaluation of the same file.
+//! * `subdivision_without_custom_normals_writes_no_layer_and_later_authoring_allocates_it`: a
+//!   Subdivision at level 1 without Use Custom Normals writes no `custom_normal` layer, as Blender.
+//!   After save and reload, `mesh.set_custom_normals` allocates the layer in Blender's loop order,
+//!   and Blender's own reference confirms every normal and Auto status.
+//! * `subdivision_level_two_keeps_only_the_loop_basis_until_authoring`: at level 2 the loop basis
+//!   differs from storage, so the saved layer holds only `corner_order`; authoring keeps that basis.
+//! * `mirror_raw_codes_round_trip_before_bisect_and_wave`: Blender applies X Mirror, Potter exports
+//!   the raw codes and loop basis, and a second project reimports them before Y-bisect Mirror and
+//!   Wave. The final geometry and corner normals match Blender's own X, Y-bisect, Wave reference.
 
 #[path = "common/blender_checked.rs"]
 mod blender_checked;
+#[path = "common/blender_code_tolerance.rs"]
+mod blender_code_tolerance;
 #[path = "common/native_oracle.rs"]
 #[expect(
     dead_code,
@@ -28,10 +35,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use blender_code_tolerance::code_within_beta_step;
 use native_oracle::{
     BYTE_TOLERANCE, FLOAT_TOLERANCE, NORMAL_TOLERANCE, StoredCorner, TestResult, apply_operations,
-    assert_close, assert_floats, attribute, build_oracle, code_pair, code_within_one_unit,
-    dump_blend, dumped_object, export, floats, import_blend, mesh_of_node, node_id,
+    assert_close, assert_floats, attribute, build_oracle, code_pair, dump_blend, dumped_object,
+    export, floats, has_normal_code_values, import_blend, losses, mesh_of_node, node_id,
     normal_code_rows, number, read_scene, run_blender, run_blender_arguments, vec3, vectors_close,
     write_script,
 };
@@ -607,11 +615,22 @@ fn subdivision_data_reference(blender: &Path, root: &Path, blend: &Path) -> Test
     Ok(serde_json::from_slice(&fs::read(out)?)?)
 }
 
-/// Blender's no-layer authoring reference for the Subdivision topology of `Regress`.
-fn authoring_reference(blender: &Path, root: &Path, blend: &Path) -> TestResult<Value> {
+/// Blender's no-layer authoring reference for the Subdivision topology of `Regress` at `levels`.
+fn authoring_reference(
+    blender: &Path,
+    root: &Path,
+    blend: &Path,
+    levels: u32,
+) -> TestResult<Value> {
     let script = write_script(root, "authoring_reference.py", AUTHORING_REFERENCE_SCRIPT)?;
-    let out = root.join("authoring_reference.json");
-    run_blender(blender, &script, Some(blend), &out)?;
+    let out = root.join(format!("authoring_reference_{levels}.json"));
+    let levels = levels.to_string();
+    run_blender_arguments(
+        blender,
+        &script,
+        Some(blend),
+        &[out.as_path(), Path::new(&levels)],
+    )?;
     Ok(serde_json::from_slice(&fs::read(out)?)?)
 }
 
@@ -636,12 +655,12 @@ fn subdivision_codes_and_corner_data_follow_one_loop_basis_through_blend() -> Te
     )?;
     assert_eq!(applied["ok"], true, "{applied}");
 
-    // The Subdivision result stores its codes with a nonidentity loop basis.
+    // Blender's own Subdivision stores these codes in loop order, so the basis is the identity.
     let subdivided = read_scene(&project)?;
     let subdivided_mesh = mesh_of_node(&subdivided, "Regress")?;
     assert!(
-        !is_identity(&loop_ordinals(subdivided_mesh)?),
-        "the Subdivision result must store a nonidentity corner_order"
+        is_identity(&loop_ordinals(subdivided_mesh)?),
+        "the Subdivision result must store the identity corner order of Blender's loops"
     );
     let (authored, automatic) = stored_counts(subdivided_mesh)?;
     assert!(
@@ -710,54 +729,22 @@ fn subdivision_codes_and_corner_data_follow_one_loop_basis_through_blend() -> Te
     Ok(())
 }
 
-#[test]
-fn subdivision_without_custom_normals_keeps_loop_basis_and_later_authoring_allocates_the_layer()
--> TestResult {
-    let Some(blender) = blender_checked::blender_executable() else {
-        return Ok(());
-    };
-    let root = tempdir()?;
-    let (blend, _) = build_oracle(&blender, root.path())?;
-    let reference = authoring_reference(&blender, root.path(), &blend)?;
+/// Authors the subdivided `saved_mesh` of `node` from Blender's authoring reference (see
+/// `authoring_reference.py`): each Potter corner takes the input vector of the reference loop at the
+/// same position and face center, and automatic loops send null. Checks the stored counts, Blender's
+/// dump of the saved file, and every normal and Auto status against that reference. Returns the
+/// authored scene.
+fn author_and_check_subdivision(
+    blender: &Path,
+    root: &Path,
+    project: &Path,
+    node: &str,
+    saved_mesh: &Value,
+    reference: &Value,
+) -> TestResult<Value> {
     let reference_loops = reference["loops"]
         .as_array()
         .ok_or("authoring reference loops are missing")?;
-    let (project, _) = import_blend(&blender, root.path(), "project", &blend)?;
-    let node = node_id(&read_scene(&project)?, "Regress")?;
-    let applied = apply_operations(
-        &project,
-        root.path(),
-        json!([
-            {"op": "modifier.create", "target": {"id": node}, "id": "subdivide", "type": "subdivision", "params": {"levels": 1, "use_custom_normals": false}},
-            {"op": "modifier.apply", "target": {"id": node}, "modifier_id": "subdivide"}
-        ]),
-    )?;
-    assert_eq!(applied["ok"], true, "{applied}");
-
-    // The saved project, read back from disk: no value layer, but the nonidentity basis remains.
-    let saved = read_scene(&project)?;
-    let saved_mesh = mesh_of_node(&saved, "Regress")?;
-    let layer = attribute(saved_mesh, "custom_normal")?;
-    assert_eq!(layer["domain"], "corner");
-    assert_eq!(layer["type"], "normal_code");
-    assert!(
-        layer.get("values").is_none(),
-        "Subdivision without use_custom_normals must not allocate a value layer"
-    );
-    assert!(
-        layer.as_object().is_some_and(|fields| fields
-            .keys()
-            .all(|key| matches!(key.as_str(), "domain" | "type" | "corner_order"))),
-        "basis-only state holds only domain, type and corner_order"
-    );
-    let basis = loop_ordinals(saved_mesh)?;
-    assert!(
-        layer.get("corner_order").is_some() && !is_identity(&basis),
-        "the Subdivision result must store a nonidentity corner_order"
-    );
-
-    // Author normals through the saved basis. Each Potter corner takes Blender's input vector for
-    // the loop at the same position and face center; automatic loops send null.
     let keys = reference_keys(reference_loops)?;
     let mut normals = Map::new();
     let mut face_ids = Vec::new();
@@ -779,21 +766,16 @@ fn subdivision_without_custom_normals_keeps_loop_basis_and_later_authoring_alloc
         face_ids.push(format!("f{id}"));
     }
     let applied = apply_operations(
-        &project,
-        root.path(),
+        project,
+        root,
         json!([
             {"op": "mesh.set_custom_normals", "target": {"id": node}, "elements": {"domain": "face", "ids": face_ids}, "normals": normals}
         ]),
     )?;
     assert_eq!(applied["ok"], true, "{applied}");
 
-    let authored_state = read_scene(&project)?;
+    let authored_state = read_scene(project)?;
     let authored_mesh = mesh_of_node(&authored_state, "Regress")?;
-    assert_eq!(
-        loop_ordinals(authored_mesh)?,
-        basis,
-        "authoring must keep the stored loop basis"
-    );
     let (authored, automatic) = stored_counts(authored_mesh)?;
     assert_eq!(
         (authored as u64, automatic as u64),
@@ -808,9 +790,9 @@ fn subdivision_without_custom_normals_keeps_loop_basis_and_later_authoring_alloc
         "stored authored and automatic corners must match Blender's reference"
     );
 
-    let exported = root.path().join("authored.blend");
-    export(&blender, &project, "blend", &exported)?;
-    let dump = dump_blend(&blender, root.path(), &exported, "authored")?;
+    let exported = root.join("authored.blend");
+    export(blender, project, "blend", &exported)?;
+    let dump = dump_blend(blender, root, &exported, "authored")?;
     let object = dumped_object(&dump, "Regress")?;
     check_codes_against_blender(authored_mesh, object, "authored Subdivision")?;
 
@@ -829,8 +811,114 @@ fn subdivision_without_custom_normals_keeps_loop_basis_and_later_authoring_alloc
             "Auto status of loop {loop_index} differs from Blender's reference"
         );
     }
+    Ok(authored_state)
+}
+
+#[test]
+fn subdivision_without_custom_normals_writes_no_layer_and_later_authoring_allocates_it()
+-> TestResult {
+    let Some(blender) = blender_checked::blender_executable() else {
+        return Ok(());
+    };
+    let root = tempdir()?;
+    let (blend, _) = build_oracle(&blender, root.path())?;
+    let reference = authoring_reference(&blender, root.path(), &blend, 1)?;
+    let (project, _) = import_blend(&blender, root.path(), "project", &blend)?;
+    let node = node_id(&read_scene(&project)?, "Regress")?;
+    let applied = apply_operations(
+        &project,
+        root.path(),
+        json!([
+            {"op": "modifier.create", "target": {"id": node}, "id": "subdivide", "type": "subdivision", "params": {"levels": 1, "use_custom_normals": false}},
+            {"op": "modifier.apply", "target": {"id": node}, "modifier_id": "subdivide"}
+        ]),
+    )?;
+    assert_eq!(applied["ok"], true, "{applied}");
+
+    // Level 1 keeps the flattened loop order as its basis, so Subdivision writes no custom_normal
+    // layer, and the saved project reads back the same way.
+    let saved = read_scene(&project)?;
+    let saved_mesh = mesh_of_node(&saved, "Regress")?;
+    assert!(
+        saved_mesh["attributes"].get("custom_normal").is_none(),
+        "Subdivision without use_custom_normals must not store a custom_normal layer"
+    );
+
+    let authored = author_and_check_subdivision(
+        &blender,
+        root.path(),
+        &project,
+        &node,
+        saved_mesh,
+        &reference,
+    )?;
+    assert!(
+        is_identity(&loop_ordinals(mesh_of_node(&authored, "Regress")?)?),
+        "authoring allocates the layer in Blender's loop order"
+    );
     Ok(())
 }
+
+#[test]
+fn subdivision_level_two_keeps_only_the_loop_basis_until_authoring() -> TestResult {
+    let Some(blender) = blender_checked::blender_executable() else {
+        return Ok(());
+    };
+    let root = tempdir()?;
+    let (blend, _) = build_oracle(&blender, root.path())?;
+    let reference = authoring_reference(&blender, root.path(), &blend, 2)?;
+    let (project, _) = import_blend(&blender, root.path(), "project", &blend)?;
+    let node = node_id(&read_scene(&project)?, "Regress")?;
+    let applied = apply_operations(
+        &project,
+        root.path(),
+        json!([
+            {"op": "modifier.create", "target": {"id": node}, "id": "subdivide", "type": "subdivision", "params": {"levels": 2, "use_custom_normals": false}},
+            {"op": "modifier.apply", "target": {"id": node}, "modifier_id": "subdivide"}
+        ]),
+    )?;
+    assert_eq!(applied["ok"], true, "{applied}");
+
+    // Level 2 orders loops differently from storage, so the saved layer holds only that basis.
+    let saved = read_scene(&project)?;
+    let saved_mesh = mesh_of_node(&saved, "Regress")?;
+    let fields: BTreeSet<&str> = attribute(saved_mesh, "custom_normal")?
+        .as_object()
+        .ok_or("custom_normal must be an object")?
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        fields,
+        BTreeSet::from(["corner_order", "domain", "type"]),
+        "the basis-only layer must hold no values"
+    );
+    assert!(
+        !has_normal_code_values(saved_mesh),
+        "the basis-only layer must not store values"
+    );
+    let basis = loop_ordinals(saved_mesh)?;
+    assert!(
+        !is_identity(&basis),
+        "level 2 must keep a non-identity loop basis"
+    );
+
+    let authored = author_and_check_subdivision(
+        &blender,
+        root.path(),
+        &project,
+        &node,
+        saved_mesh,
+        &reference,
+    )?;
+    assert_eq!(
+        loop_ordinals(mesh_of_node(&authored, "Regress")?)?,
+        basis,
+        "authoring keeps the loop basis"
+    );
+    Ok(())
+}
+
 const NONMANIFOLD_SUBDIVISION_ORACLE: &str = r#"
 import json
 import math
@@ -1006,13 +1094,246 @@ fn nonmanifold_subdivision_auto_codes_match_blenders_evaluated_fan() -> TestResu
             } else {
                 StoredCorner::Code(code_pair(raw)?)
             };
+            let actual = &actual_rows[face_index][corner_index];
+            let within = match (actual, &expected_code) {
+                (StoredCorner::Code(a), StoredCorner::Code(e)) => code_within_beta_step(*a, *e),
+                (a, e) => a == e,
+            };
             assert!(
-                code_within_one_unit(&actual_rows[face_index][corner_index], &expected_code),
-                "Subsurf loop {source_loop} code within one unit of Blender: actual {:?}, expected {expected_code:?}",
-                actual_rows[face_index][corner_index]
+                within,
+                "Subsurf loop {source_loop} code is outside Blender's platform variance (alpha exact, beta ±1): actual {actual:?}, expected {expected_code:?}"
             );
         }
     }
     assert_eq!(matched.len(), source_loops.len());
+    Ok(())
+}
+
+const MIRROR_BLEND_CHAIN: &str = r#"
+import bpy
+import json
+import sys
+
+fixture_path, base_path, mirror_path, bisect_path, expected_path = sys.argv[sys.argv.index("--") + 1:]
+with open(fixture_path, encoding="utf-8") as handle:
+    source = json.load(handle)["input"]
+bpy.ops.wm.read_factory_settings(use_empty=True)
+mesh = bpy.data.meshes.new("SubjectMesh")
+mesh.from_pydata(source["vertices"], source.get("edges", []), source["faces"])
+mesh.update()
+for polygon, smooth in zip(mesh.polygons, source["face_smooth"]):
+    polygon.use_smooth = smooth
+edge_by_vertices = {tuple(sorted(edge.vertices)): edge for edge in mesh.edges}
+for a, b in source.get("sharp_edges", []):
+    edge_by_vertices[tuple(sorted((a, b)))].use_edge_sharp = True
+for a, b in source.get("seam_edges", []):
+    edge_by_vertices[tuple(sorted((a, b)))].use_seam = True
+mesh.update()
+corner_normals = []
+for row, polygon in zip(source["custom_normals"], mesh.polygons):
+    for corner in range(polygon.loop_total):
+        vector = row[corner]
+        corner_normals.append((0.0, 0.0, 0.0) if vector is None else tuple(vector))
+mesh.normals_split_custom_set(corner_normals)
+subject = bpy.data.objects.new("Subject", mesh)
+bpy.context.scene.collection.objects.link(subject)
+bpy.context.view_layer.objects.active = subject
+subject.select_set(True)
+bpy.ops.wm.save_as_mainfile(filepath=base_path)
+mirror_x = subject.modifiers.new("MirrorX", "MIRROR")
+mirror_x.use_axis = (True, False, False)
+bpy.ops.object.modifier_apply(modifier=mirror_x.name)
+bpy.ops.wm.save_as_mainfile(filepath=mirror_path)
+mirror_y = subject.modifiers.new("MirrorY", "MIRROR")
+mirror_y.use_axis = (False, True, False)
+mirror_y.use_bisect_axis = (False, True, False)
+bpy.ops.object.modifier_apply(modifier=mirror_y.name)
+bpy.ops.wm.save_as_mainfile(filepath=bisect_path)
+wave = subject.modifiers.new("Wave", "WAVE")
+wave.height = 0.2
+wave.width = 1.5
+wave.speed = 0.0
+wave.time_offset = 0.25
+bpy.ops.object.modifier_apply(modifier=wave.name)
+bpy.ops.wm.save_as_mainfile(filepath=expected_path)
+"#;
+
+fn codes_by_loop(mesh: &Value) -> TestResult<BTreeMap<usize, StoredCorner>> {
+    let codes = normal_code_rows(mesh)?;
+    let ordinals = loop_ordinals(mesh)?;
+    let mut result = BTreeMap::new();
+    for (code_row, ordinal_row) in codes.iter().zip(ordinals) {
+        for (code, ordinal) in code_row.iter().zip(ordinal_row) {
+            if result.insert(ordinal, *code).is_some() {
+                return Err(format!("duplicate custom-normal loop ordinal {ordinal}").into());
+            }
+        }
+    }
+    Ok(result)
+}
+
+fn dumped_reference_loop_rows(object: &Value) -> TestResult<Vec<Value>> {
+    let vertices = object["vertices"]
+        .as_array()
+        .ok_or("dumped vertices are missing")?;
+    let loops = object["loops"]
+        .as_array()
+        .ok_or("dumped loops are missing")?;
+    let normals = object["corner_normals"]
+        .as_array()
+        .ok_or("dumped corner normals are missing")?;
+    let mut result = Vec::with_capacity(loops.len());
+    for face in object["faces"]
+        .as_array()
+        .ok_or("dumped faces are missing")?
+    {
+        let start = usize::try_from(face["loop_start"].as_u64().ok_or("loop start is missing")?)?;
+        let count = usize::try_from(face["loop_total"].as_u64().ok_or("loop count is missing")?)?;
+        let center = face.get("center").ok_or("face center is missing")?;
+        for loop_index in start..start + count {
+            let vertex = usize::try_from(
+                loops[loop_index]["vertex"]
+                    .as_u64()
+                    .ok_or("loop vertex is missing")?,
+            )?;
+            result.push(json!({
+                "co": vertices[vertex],
+                "center": center,
+                "normal": normals[loop_index],
+            }));
+        }
+    }
+    Ok(result)
+}
+
+#[test]
+fn mirror_raw_codes_round_trip_before_bisect_and_wave() -> TestResult {
+    let Some(blender) = blender_checked::blender_executable() else {
+        return Ok(());
+    };
+    let root = tempdir()?;
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/pr18b_mirror/custom_chain_x_then_y_vertex.json");
+    let script = write_script(root.path(), "mirror_code_chain.py", MIRROR_BLEND_CHAIN)?;
+    let base = root.path().join("mirror_base.blend");
+    let expected_stage = root.path().join("mirror_x_reference.blend");
+    let expected_bisect = root.path().join("mirror_x_y_bisect_reference.blend");
+    let expected_final = root.path().join("mirror_x_y_wave_reference.blend");
+    run_blender_arguments(
+        &blender,
+        &script,
+        None,
+        &[
+            &fixture,
+            &base,
+            &expected_stage,
+            &expected_bisect,
+            &expected_final,
+        ],
+    )?;
+
+    let (project, imported) = import_blend(&blender, root.path(), "mirror_x", &base)?;
+    assert!(
+        losses(&imported).is_empty(),
+        "Mirror base import losses: {:?}",
+        losses(&imported)
+    );
+    let imported_scene = read_scene(&project)?;
+    let subject = node_id(&imported_scene, "Subject")?;
+    let applied = apply_operations(
+        &project,
+        root.path(),
+        json!([
+            {"op":"modifier.create","target":{"id":subject},"id":"mirror_x","type":"mirror","params":{"use_axis":[true,false,false]}},
+            {"op":"modifier.apply","target":{"id":subject},"modifier_id":"mirror_x"}
+        ]),
+    )?;
+    assert_eq!(applied["ok"], true, "{applied}");
+    let stage_scene = read_scene(&project)?;
+    let stage_mesh = mesh_of_node(&stage_scene, "Subject")?;
+    let stage_codes = codes_by_loop(stage_mesh)?;
+    let stage_blend = root.path().join("potter_mirror_x.blend");
+    export(&blender, &project, "blend", &stage_blend)?;
+    let stage_dump = dump_blend(&blender, root.path(), &stage_blend, "potter_mirror_x")?;
+    check_codes_against_blender(
+        stage_mesh,
+        dumped_object(&stage_dump, "Subject")?,
+        "Mirror X output",
+    )?;
+
+    let (reloaded_project, _) =
+        import_blend(&blender, root.path(), "mirror_x_reloaded", &stage_blend)?;
+    let reloaded_scene = read_scene(&reloaded_project)?;
+    let reloaded_mesh = mesh_of_node(&reloaded_scene, "Subject")?;
+    assert_eq!(
+        codes_by_loop(reloaded_mesh)?,
+        stage_codes,
+        "raw Mirror codes across .blend reload"
+    );
+    let reloaded_subject = node_id(&reloaded_scene, "Subject")?;
+    let continued = apply_operations(
+        &reloaded_project,
+        root.path(),
+        json!([
+            {"op":"modifier.create","target":{"id":reloaded_subject},"id":"mirror_y","type":"mirror","params":{"use_axis":[false,true,false],"use_bisect_axis":[false,true,false]}},
+            {"op":"modifier.apply","target":{"id":reloaded_subject},"modifier_id":"mirror_y"},
+            {"op":"modifier.create","target":{"id":reloaded_subject},"id":"wave","type":"wave","params":{"height":0.2,"width":1.5,"speed":0.0,"time_offset":0.25}},
+            {"op":"modifier.apply","target":{"id":reloaded_subject},"modifier_id":"wave"}
+        ]),
+    )?;
+    assert_eq!(continued["ok"], true, "{continued}");
+    let continued_blend = root.path().join("potter_mirror_x_y_wave.blend");
+    export(&blender, &reloaded_project, "blend", &continued_blend)?;
+    let actual_dump = dump_blend(
+        &blender,
+        root.path(),
+        &continued_blend,
+        "potter_mirror_x_y_wave",
+    )?;
+    let expected_dump = dump_blend(
+        &blender,
+        root.path(),
+        &expected_final,
+        "blender_mirror_x_y_wave",
+    )?;
+    let bisect_dump = dump_blend(
+        &blender,
+        root.path(),
+        &expected_bisect,
+        "blender_mirror_x_y_bisect",
+    )?;
+    let bisected_object = dumped_object(&bisect_dump, "Subject")?;
+    let expected_object = dumped_object(&expected_dump, "Subject")?;
+    let before_wave = bisected_object["vertices"]
+        .as_array()
+        .ok_or("bisect vertices missing")?;
+    let after_wave = expected_object["vertices"]
+        .as_array()
+        .ok_or("wave vertices missing")?;
+    assert_eq!(
+        before_wave.len(),
+        after_wave.len(),
+        "Wave preserves Mirror topology"
+    );
+    let wave_changed_positions = before_wave
+        .iter()
+        .zip(after_wave)
+        .map(|(before, after)| -> TestResult<bool> {
+            Ok(corner_distance(vec3(before)?, vec3(after)?) > 1.0e-4)
+        })
+        .collect::<TestResult<Vec<_>>>()?
+        .into_iter()
+        .any(|changed| changed);
+    assert!(
+        wave_changed_positions,
+        "Wave must deform the bisected Mirror output"
+    );
+    let expected_loops = dumped_reference_loop_rows(expected_object)?;
+    let actual = blender_loops(dumped_object(&actual_dump, "Subject")?)?;
+    match_reference_normals(
+        &actual,
+        &expected_loops,
+        "reloaded Mirror X then Y bisect and Wave",
+    )?;
     Ok(())
 }
