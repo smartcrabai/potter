@@ -131,21 +131,25 @@ fn shading_normals(mesh: &Mesh, positions: &[DVec3]) -> Result<Shading> {
             )
         })
         .transpose()?;
-    shade(mesh, positions, codes.as_deref(), resolved.as_deref())
+    shade(mesh, positions, codes.as_deref(), resolved.as_deref(), true)
 }
 
-/// Corner normals of `mesh` ignoring its custom-normal layer: the shading of the geometry alone.
-pub(crate) fn plain_corner_normals(mesh: &Mesh, positions: &[DVec3]) -> Result<Vec<DVec3>> {
+/// Corner normals of `mesh` in the corner (fan) domain, ignoring its custom-normal layer. This is the
+/// base the custom-normal setter replaces zero inputs with: Blender's `mesh_normals_corner_custom_set`
+/// takes it from `normals_calc_corners`, which always builds fans, never the POINT vertex normal.
+pub(crate) fn setter_corner_normals(mesh: &Mesh, positions: &[DVec3]) -> Result<Vec<DVec3>> {
     check_shading_input(mesh, positions)?;
-    Ok(shade(mesh, positions, None, None)?.corners)
+    Ok(shade(mesh, positions, None, None, false)?.corners)
 }
 
 /// Shading from geometry plus typed custom-normal codes and their shared, current-fan evaluation.
+/// `point_domain_allowed` is false for the custom-normal setter, whose corner normals are always fans.
 fn shade(
     mesh: &Mesh,
     positions: &[DVec3],
     custom_codes: Option<&[CornerNormalCode]>,
     custom_normals: Option<&[DVec3]>,
+    point_domain_allowed: bool,
 ) -> Result<Shading> {
     let index_by_id: HashMap<u32, usize> = mesh
         .vertices
@@ -163,9 +167,12 @@ fn shade(
 
         corner_total += face.vertices.len();
     }
-    // Blender's POINT domain: all faces smooth, no sharp edge, no custom-normal layer.
-    let point_domain =
-        custom_codes.is_none() && sharp_edges.is_empty() && smooth.iter().all(|smooth| *smooth);
+    // Blender's POINT domain: all faces smooth, no sharp edge, no custom-normal layer. The custom-normal
+    // setter never uses it: its corner normals come from `normals_calc_corners` (fans) on every mesh.
+    let point_domain = point_domain_allowed
+        && custom_codes.is_none()
+        && sharp_edges.is_empty()
+        && smooth.iter().all(|smooth| *smooth);
 
     // Face normals, corner angles, and the angle-weighted sum of every face at each vertex.
     // Blender's vertex normal sums all faces and ignores shading flags.

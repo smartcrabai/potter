@@ -19,7 +19,7 @@ use std::f32::consts::{FRAC_PI_2, PI, TAU};
 use glam::{DVec3, Vec3};
 use serde_json::{Map, Value, json};
 
-use super::normals::{plain_corner_normals, sharp_edge_flags, smooth_face_flags};
+use super::normals::{setter_corner_normals, sharp_edge_flags, smooth_face_flags};
 use super::{Mesh, edge_key};
 use crate::error::{ErrorCode, PotError, Result};
 
@@ -1121,7 +1121,7 @@ fn set_fan_codes(
         ));
     }
     let positions: Vec<DVec3> = mesh.vertices.iter().map(|vertex| vertex.co).collect();
-    let computed = plain_corner_normals(mesh, &positions)?;
+    let computed = setter_corner_normals(mesh, &positions)?;
     let mut filled = Vec::with_capacity(count);
     for (vector, base) in vectors.iter().zip(&computed) {
         let value = match vector {

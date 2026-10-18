@@ -101,25 +101,10 @@ fn grid_distance(a: &Grid, b: &Grid) -> f64 {
         .fold(0.0, f64::max)
 }
 
-/// Encodes a grid of Potter's linear values with Potter's own sRGB transfer (`potter_core::color`
-/// `linear_to_srgb`). Potter's export reads back as linear (`image.pixels` of the exported float
-/// buffer), while the oracle's `blender_pixels_bottom_up` holds the encoded byte values of the
-/// sRGB-declared PNG, so the export is encoded before comparison.
-fn encode_linear_rows(value: &Value) -> TestResult<Value> {
-    let encoded: Grid = rows(value)?
-        .into_iter()
-        .map(|row| {
-            row.into_iter()
-                .map(|pixel| pixel.map(potter_core::color::linear_to_srgb))
-                .collect()
-        })
-        .collect();
-    Ok(json!(encoded))
-}
-
 /// Checks one Blender render of the texture plane (`render_texture.py` output). `potter_export`
-/// marks Potter's export: its linear image pixels are encoded, then compared within f32 ulps
-/// (`STORED_PIXEL_ULPS`). The Blender reference is compared raw at `FLOAT_TOLERANCE`.
+/// marks Potter's export, whose packed PNG reopens as a FILE image with its raw encoded bytes, so
+/// `image.pixels` holds the stored sRGB values unconverted. Those are compared directly within f32
+/// ulps (`STORED_PIXEL_ULPS`). The Blender reference is compared raw at `FLOAT_TOLERANCE`.
 fn check_render(result: &Value, expected: &Value, label: &str, potter_export: bool) -> TestResult {
     let texture = &expected["texture"];
     assert_eq!(
@@ -135,7 +120,7 @@ fn check_render(result: &Value, expected: &Value, label: &str, potter_export: bo
     // The file's PNG, read by Blender (`image.pixels`, bottom row first): no flip anywhere.
     if potter_export {
         assert_stored_grid(
-            &encode_linear_rows(&result["image_pixels_bottom_up"])?,
+            &result["image_pixels_bottom_up"],
             &texture["blender_pixels_bottom_up"],
             STORED_PIXEL_ULPS,
             &format!("{label} image pixels"),

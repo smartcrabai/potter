@@ -5975,29 +5975,39 @@ def export_doc(doc, target, pack, scene_hash, context):
         scene["potter.view_layer_ids_json"] = json.dumps(view_layer_ids, sort_keys=True)
     image_map = {}
     for image_id, item in doc.get("images", {}).items():
-        # Float buffers pack as OpenEXR and byte buffers as PNG (Blender image.cc), so pixels stay unquantised.
-        image = bpy.data.images.new(item["name"], width=int(item["width"]),
-                                    height=int(item["height"]), alpha=True, float_buffer=True)
+        png_bytes = item.get("png_bytes")
         sidecar = _export_sidecar_path(doc, item.get("source_path"))
-        if sidecar is not None:
-            # A linked image is a FILE image on the sidecar copy the export wrote, so the .blend carries its pixels.
-            image.source = "FILE"
-            image.filepath = _relative_blend_path(sidecar, target)
-            image.reload()
         colorspace = {
             "srgb": "sRGB",
             "linear": "Linear Rec.709",
             "non_color": "Non-Color",
         }.get(item.get("colorspace"))
+        if sidecar is None and png_bytes is not None:
+            # An 8-bit PNG loads from its own file bytes, as the fixture's texture does: source FILE, packed PNG.
+            # The temp file is packed while it exists: Blender reads the source path when packing.
+            descriptor, png_path = tempfile.mkstemp(
+                suffix=".png", dir=os.path.dirname(os.path.abspath(target)))
+            try:
+                with os.fdopen(descriptor, "wb") as handle:
+                    handle.write(bytes(png_bytes))
+                image = bpy.data.images.load(png_path, check_existing=False)
+                image.pack()
+            finally:
+                os.remove(png_path)
+            image.name = item["name"]
+        else:
+            # Float buffers pack as OpenEXR and byte buffers as PNG (Blender image.cc), so pixels stay unquantised.
+            image = bpy.data.images.new(item["name"], width=int(item["width"]),
+                                        height=int(item["height"]), alpha=True, float_buffer=True)
+        if sidecar is not None:
+            # A linked image is a FILE image on the sidecar copy the export wrote, so the .blend carries its pixels.
+            image.source = "FILE"
+            image.filepath = _relative_blend_path(sidecar, target)
+            image.reload()
         if colorspace is not None:
             image.colorspace_settings.name = colorspace
         pixels = item.get("pixels")
-        png_bytes = item.get("png_bytes")
-        if sidecar is None and png_bytes is not None:
-            # An 8-bit PNG packs as its own file bytes: no float save touches the values.
-            data = bytes(png_bytes)
-            image.pack(data=data, data_len=len(data))
-        elif sidecar is None and pixels is not None:
+        if sidecar is None and png_bytes is None and pixels is not None:
             _pack_image(image, [channel for pixel in pixels for channel in pixel])
         if item.get("source") == "packed" and image.packed_file is None:
             image.pack()
