@@ -2777,16 +2777,24 @@ fn intersect_tri_pair(
         if seen_a.contains(&e0) || seen_a.contains(&e1) {
             continue;
         }
-        if let Some((ix, side)) = intersect_line_triangle(
-            state.verts[e0].co,
-            state.verts[e1].co,
-            b.map(|v| state.verts[v].co),
-            nb,
-            eps,
-            margin,
-            margin_sq,
-        ) {
-            let v = cached_edge_tri_vertex(state, e0, e1, b_index, b, side, ix);
+        let hit = cached_edge_tri_hit(state, e0, e1, b_index, b).or_else(|| {
+            intersect_line_triangle(
+                state.verts[e0].co,
+                state.verts[e1].co,
+                b.map(|v| state.verts[v].co),
+                nb,
+                eps,
+                margin,
+                margin_sq,
+            )
+            .map(|(ix, side)| {
+                (
+                    cached_edge_tri_vertex(state, e0, e1, b_index, b, side, ix),
+                    side,
+                )
+            })
+        });
+        if let Some((v, _)) = hit {
             push_unique(verts_a, seen_a, v);
             push_unique(verts_b, seen_b, v);
             if state.edge_orig.contains_key(&edge_key_usize(e0, e1)) {
@@ -2804,16 +2812,24 @@ fn intersect_tri_pair(
         if seen_b.contains(&e0) || seen_b.contains(&e1) {
             continue;
         }
-        if let Some((ix, side)) = intersect_line_triangle(
-            state.verts[e0].co,
-            state.verts[e1].co,
-            a.map(|v| state.verts[v].co),
-            na,
-            eps,
-            margin,
-            margin_sq,
-        ) {
-            let v = cached_edge_tri_vertex(state, e0, e1, a_index, a, side, ix);
+        let hit = cached_edge_tri_hit(state, e0, e1, a_index, a).or_else(|| {
+            intersect_line_triangle(
+                state.verts[e0].co,
+                state.verts[e1].co,
+                a.map(|v| state.verts[v].co),
+                na,
+                eps,
+                margin,
+                margin_sq,
+            )
+            .map(|(ix, side)| {
+                (
+                    cached_edge_tri_vertex(state, e0, e1, a_index, a, side, ix),
+                    side,
+                )
+            })
+        });
+        if let Some((v, _)) = hit {
             push_unique(verts_a, seen_a, v);
             push_unique(verts_b, seen_b, v);
             if state.edge_orig.contains_key(&edge_key_usize(e0, e1)) {
@@ -2847,15 +2863,9 @@ fn intersect_tri_pair(
     }
 }
 
-fn cached_edge_tri_vertex(
-    state: &mut State,
-    e0: usize,
-    e1: usize,
-    tri_index: usize,
-    tri: [usize; 3],
-    side: usize,
-    co: P3,
-) -> usize {
+/// The four cache keys of an edge-triangle intersection, as Blender's `k_arr` (`bmesh_intersect.cc`):
+/// index 0 is the edge with the triangle, indices 1-3 are the edge with each triangle edge.
+fn edge_tri_keys(e0: usize, e1: usize, tri_index: usize, tri: [usize; 3]) -> [[i32; 4]; 4] {
     let (a, b) = if e0 < e1 { (e0, e1) } else { (e1, e0) };
     let mut keys = [[0_i32; 4]; 4];
     keys[0] = [a as i32, b as i32, tri_index as i32, -1];
@@ -2872,10 +2882,41 @@ fn cached_edge_tri_vertex(
         }
         keys[i + 1] = key;
     }
-    let id = if let Some(id) = keys
-        .iter()
-        .find_map(|key| state.edge_tri_cache.get(key).copied())
-    {
+    keys
+}
+
+/// Blender's `bm_isect_edge_tri` cache lookup (bmesh_intersect.cc:395-417), run before the line
+/// predicate: the triangle edges are tried in order, then the triangle. Returns the cached vertex
+/// and the side it was cached for (3 for the triangle).
+fn cached_edge_tri_hit(
+    state: &State,
+    e0: usize,
+    e1: usize,
+    tri_index: usize,
+    tri: [usize; 3],
+) -> Option<(usize, usize)> {
+    let keys = edge_tri_keys(e0, e1, tri_index, tri);
+    for key_index in [1, 2, 3, 0] {
+        if let Some(&id) = state.edge_tri_cache.get(&keys[key_index]) {
+            let side = if key_index == 0 { 3 } else { key_index - 1 };
+            return Some((id, side));
+        }
+    }
+    None
+}
+
+fn cached_edge_tri_vertex(
+    state: &mut State,
+    e0: usize,
+    e1: usize,
+    tri_index: usize,
+    tri: [usize; 3],
+    side: usize,
+    co: P3,
+) -> usize {
+    let (a, b) = if e0 < e1 { (e0, e1) } else { (e1, e0) };
+    let keys = edge_tri_keys(e0, e1, tri_index, tri);
+    let id = if let Some((id, _)) = cached_edge_tri_hit(state, e0, e1, tri_index, tri) {
         id
     } else {
         let id = state.add_vertex(co, NO_INDEX);
