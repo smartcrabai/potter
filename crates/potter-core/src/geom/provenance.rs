@@ -12,7 +12,7 @@ use std::fmt::Display;
 use std::hash::Hash;
 use std::str::FromStr;
 
-use glam::DVec3;
+use glam::{DVec3, Vec3};
 use serde_json::{Map, Value, json};
 
 use crate::error::{ErrorCode, PotError, Result};
@@ -1248,7 +1248,7 @@ fn blend_outer(items: &[(Value, f64)], data_type: &str) -> Option<Value> {
         .map(|(value, weight)| (value, *weight))
         .collect();
     if data_type == "QUATERNION" && borrowed.iter().all(|(value, _)| is_quaternion(value)) {
-        return Some(mix_quaternions(&borrowed));
+        return blend_quaternion(borrowed.iter().copied());
     }
     blend(borrowed.into_iter(), data_type)
 }
@@ -1259,62 +1259,67 @@ fn is_quaternion(value: &Value) -> bool {
         .is_some_and(|array| array.len() == 4 && array.iter().all(Value::is_number))
 }
 
-/// The `[w, x, y, z]` components of a quaternion value.
-fn quaternion_components(value: &Value) -> [f64; 4] {
-    let mut components = [0.0; 4];
-    for (slot, component) in components
-        .iter_mut()
-        .zip(value.as_array().into_iter().flatten())
-    {
-        *slot = component.as_f64().unwrap_or_default();
-    }
-    components
+/// Wraps an angle into [-pi, pi), as Blender's `AngleRadianBase::wrapped` (`BLI_math_angle_types.hh:80`).
+fn wrap_radians(angle: f32) -> f32 {
+    (angle + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI
 }
 
-/// Blender's quaternion mix (`mix_indices` with `quat_to_expmap` and `expmap_to_quat`,
-/// `BKE_attribute_math.hh:431`): the weight-normalised mean of the exponential maps, mapped back.
-fn mix_quaternions(items: &[(&Value, f64)]) -> Value {
-    let mut sum = [0.0_f64; 3];
-    let mut total = 0.0_f64;
-    for &(value, weight) in items {
-        let map = quaternion_expmap(quaternion_components(value));
-        for (accum, component) in sum.iter_mut().zip(map) {
-            *accum += weight * component;
-        }
-        total += weight;
-    }
-    let mean = if total > 0.0 {
-        sum.map(|component| component / total)
-    } else {
-        [0.0; 3]
+/// Blender's `QuaternionBase::expmap()` (`BLI_math_quaternion.hh:698`) of a native `[x, y, z, w]` quaternion:
+/// the axis times the angle `2 * atan2(|xyz|, w)`. A rotation below Blender's `0.0005` sine threshold maps
+/// to zero. `None` unless the value is a finite quaternion.
+pub(crate) fn quaternion_expmap(value: &Value) -> Option<Vec3> {
+    let [x, y, z, w] = value.as_array()?.as_slice() else {
+        return None;
     };
-    json!(expmap_quaternion(mean))
-}
-
-/// Blender's `QuaternionBase::expmap()` (`BLI_math_quaternion.hh:698`): the rotation axis times its angle,
-/// `2 * atan2(|xyz|, w)`. A rotation of about zero angle maps to the zero vector.
-fn quaternion_expmap([w, x, y, z]: [f64; 4]) -> [f64; 3] {
-    let sin_half = (x * x + y * y + z * z).sqrt();
+    let vector = Vec3::new(x.as_f64()? as f32, y.as_f64()? as f32, z.as_f64()? as f32);
+    let real = w.as_f64()? as f32;
+    if !vector.is_finite() || !real.is_finite() {
+        return None;
+    }
+    let sin_half = vector.length();
     if sin_half < 0.0005 {
-        return [0.0; 3];
+        return Some(Vec3::ZERO);
     }
-    let angle = 2.0 * sin_half.atan2(w);
-    [x, y, z].map(|component| component / sin_half * angle)
+    let angle = 2.0 * sin_half.atan2(real);
+    Some((vector / sin_half) * angle)
 }
 
-/// Blender's `QuaternionBase::expmap(VecBase)` (`BLI_math_quaternion.hh:686`): the rotation about the
-/// vector's direction by its length, wrapped into [-pi, pi). A zero vector is the identity.
-fn expmap_quaternion(map: [f64; 3]) -> [f64; 4] {
-    let length_squared: f64 = map.iter().map(|component| component * component).sum();
-    if length_squared <= 1.0e-70 {
-        return [1.0, 0.0, 0.0, 0.0];
+/// Blender's `QuaternionBase::expmap(VecBase)` (`BLI_math_quaternion.hh:686`): the native `[x, y, z, w]`
+/// rotation about the vector's direction by its length, wrapped into [-pi, pi). A zero vector is the identity.
+pub(crate) fn quaternion_from_expmap(value: Vec3) -> [f32; 4] {
+    let length_squared = value.length_squared();
+    if length_squared.is_nan() || length_squared <= 1.0e-35 {
+        return [0.0, 0.0, 0.0, 1.0];
     }
-    let length = length_squared.sqrt();
-    let tau = 2.0 * std::f64::consts::PI;
-    let angle = (length + std::f64::consts::PI).rem_euclid(tau) - std::f64::consts::PI;
-    let half = angle / 2.0;
-    let scale = half.sin() / length;
-    [half.cos(), map[0] * scale, map[1] * scale, map[2] * scale]
+    let angle = length_squared.sqrt();
+    let half_angle = wrap_radians(angle) * 0.5;
+    let normalized = value / angle;
+    let imaginary = normalized * half_angle.sin();
+    [imaginary.x, imaginary.y, imaginary.z, half_angle.cos()]
+}
+
+/// Blender's `DefaultMixer` for `math::Quaternion` (`mix_indices` with `quat_to_expmap` and `expmap_to_quat`,
+/// `BKE_attribute_math.hh:431`): the weight-normalised mean of the expmaps, mapped back to a native quaternion.
+/// Every quaternion blend uses it. `None` without sources or with a non-finite source.
+pub(crate) fn blend_quaternion<'a>(items: impl Iterator<Item = (&'a Value, f64)>) -> Option<Value> {
+    let mut value = Vec3::ZERO;
+    let mut total_weight = 0.0_f32;
+    let mut has_source = false;
+    for (source, weight) in items {
+        has_source = true;
+        value += quaternion_expmap(source)? * (weight as f32);
+        total_weight += weight as f32;
+    }
+    if !has_source {
+        return None;
+    }
+    if total_weight > 0.0 {
+        Some(json!(quaternion_from_expmap(
+            value * (1.0_f32 / total_weight)
+        )))
+    } else {
+        Some(json!([0.0, 0.0, 0.0, 1.0]))
+    }
 }
 
 /// The weighted sum of the UVs at `sources`. Indices past the end of `uvs` are skipped, so a corner
@@ -1377,7 +1382,7 @@ fn blend<'a>(items: impl Iterator<Item = (&'a Value, f64)>, data_type: &str) -> 
         {
             return Some((*value).clone());
         }
-        return Some(mix_quaternions(&items));
+        return blend_quaternion(items.iter().copied());
     }
     if let Some(length) = first.as_array().map(Vec::len)
         && items.iter().all(|(value, _)| {

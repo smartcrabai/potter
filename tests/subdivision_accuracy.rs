@@ -831,6 +831,64 @@ fn input_mesh(spec: &Value, blender_input_edges: &Value) -> TestResult<Mesh> {
             json!({"domain": native_domain, "type": native_type, "values": values}),
         );
     }
+    // BYTE_COLOR layers enter Potter as linear colours; their sRGB byte source is recorded in
+    // `blender_metadata.color_data_types`, which `encode_byte_colors` re-blends from. The bytes come from
+    // `byte_color_values` in generate.py, by Blender loop index for CORNER.
+    let mut color_names = Vec::new();
+    let mut color_types = Map::new();
+    for definition in spec
+        .get("byte_colors")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let name = definition["name"]
+            .as_str()
+            .ok_or("byte colour name missing")?;
+        let domain = definition["domain"]
+            .as_str()
+            .ok_or("byte colour domain missing")?;
+        let mut values = Map::new();
+        match domain {
+            "POINT" => {
+                for (index, vertex) in mesh.vertices.iter().enumerate() {
+                    values.insert(
+                        format!("v{}", vertex.id),
+                        linear_color(byte_color_bytes(domain, index)),
+                    );
+                }
+            }
+            "CORNER" => {
+                for (index, face) in mesh.faces.iter().enumerate() {
+                    let size = face.vertices.len();
+                    let row: Vec<Value> = (0..size)
+                        .map(|corner| {
+                            let logical = loop_offsets[index] + (corner + shifts[index]) % size;
+                            linear_color(byte_color_bytes(domain, logical))
+                        })
+                        .collect();
+                    values.insert(format!("f{}", face.id), Value::Array(row));
+                }
+            }
+            _ => return Err(format!("unknown byte colour domain {domain}").into()),
+        }
+        mesh.attributes.insert(
+            name.to_owned(),
+            json!({"domain": domain.to_ascii_lowercase(), "type": "color", "values": values}),
+        );
+        color_names.push(Value::String(name.to_owned()));
+        color_types.insert(name.to_owned(), json!("BYTE_COLOR"));
+    }
+    if !color_names.is_empty() {
+        mesh.attributes.insert(
+            "color_layers".to_owned(),
+            json!({"layers": color_names, "active": null, "render": null}),
+        );
+        mesh.attributes.insert(
+            "blender_metadata".to_owned(),
+            json!({"color_data_types": color_types}),
+        );
+    }
     Ok(mesh)
 }
 
@@ -854,8 +912,9 @@ fn order_value(
     })
 }
 
-/// The unit quaternion `[w, x, y, z]` of vertex `index` in the ordered-attribute fixtures (`quaternion_for`
-/// in generate.py). For some vertices the angle exceeds pi, so w is negative.
+/// The unit quaternion `[x, y, z, w]` of vertex `index` in the ordered-attribute fixtures: Potter's native order
+/// for generic quaternions. It is `quaternion_for` in generate.py, which Blender stores as `w, x, y, z`. For some
+/// vertices the angle exceeds pi, so w is negative.
 fn order_quaternion(index: usize) -> [f64; 4] {
     let angle = 0.3 + 0.37 * index as f64;
     let axis = [
@@ -870,10 +929,10 @@ fn order_quaternion(index: usize) -> [f64; 4] {
         .sqrt();
     let scale = (angle / 2.0).sin() / length;
     [
-        (angle / 2.0).cos(),
         axis[0] * scale,
         axis[1] * scale,
         axis[2] * scale,
+        (angle / 2.0).cos(),
     ]
 }
 
@@ -1138,6 +1197,132 @@ fn generic_close(actual: &Value, expected: &Value) -> bool {
         },
         _ => false,
     }
+}
+
+/// Linear value of an sRGB byte, as Blender's colour attribute `color` reports it.
+fn srgb_to_linear(encoded: f64) -> f64 {
+    if encoded <= 0.04045 {
+        encoded / 12.92
+    } else {
+        ((encoded + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// sRGB-encoded value of a linear one, the inverse of [`srgb_to_linear`].
+fn linear_to_srgb(linear: f64) -> f64 {
+    if linear <= 0.003_130_8 {
+        linear * 12.92
+    } else {
+        1.055 * linear.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// The sRGB bytes `[r, g, b, a]` of a BYTE_COLOR element (`byte_color_values` in generate.py). `element` is the
+/// POINT vertex index or the Blender loop index of a CORNER.
+fn byte_color_bytes(domain: &str, element: usize) -> [u8; 4] {
+    let (base, alpha_base) = if domain == "POINT" {
+        (17, 101)
+    } else {
+        (53, 7)
+    };
+    [
+        ((element * 37 + base) % 256) as u8,
+        ((element * 37 + 91 + base) % 256) as u8,
+        ((element * 37 + 182 + base) % 256) as u8,
+        ((element * 29 + alpha_base) % 256) as u8,
+    ]
+}
+
+/// Potter's stored linear colour of a BYTE_COLOR element: each colour channel decoded from its sRGB byte, alpha
+/// linear.
+fn linear_color(bytes: [u8; 4]) -> Value {
+    let [r, g, b, a] = bytes.map(|byte| f64::from(byte) / 255.0);
+    json!([srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b), a])
+}
+
+/// Compares Blender's BYTE_COLOR values, in storage order, with Potter's output encoded back to sRGB bytes. The
+/// bytes must match exactly, so the per-slot truncation of `encode_byte_colors` is what is checked.
+fn compare_byte_colors(mesh: &Mesh, expected: &Value) -> TestResult<()> {
+    for definition in expected.as_array().ok_or("oracle byte colours missing")? {
+        let name = definition["name"]
+            .as_str()
+            .ok_or("oracle byte colour name missing")?;
+        let domain = definition["domain"]
+            .as_str()
+            .ok_or("oracle byte colour domain missing")?;
+        let attribute = mesh
+            .attributes
+            .get(name)
+            .ok_or_else(|| format!("byte colour {name} is missing"))?;
+        let values = attribute["values"]
+            .as_object()
+            .ok_or_else(|| format!("byte colour {name} has no values"))?;
+        let mut actual: Vec<&Value> = Vec::new();
+        match domain {
+            "POINT" => {
+                for vertex in &mesh.vertices {
+                    let value = values.get(&format!("v{}", vertex.id)).ok_or_else(|| {
+                        format!("byte colour {name} has no value for v{}", vertex.id)
+                    })?;
+                    actual.push(value);
+                }
+            }
+            "CORNER" => {
+                for face in &mesh.faces {
+                    let row = values
+                        .get(&format!("f{}", face.id))
+                        .and_then(Value::as_array)
+                        .ok_or_else(|| format!("byte colour {name} has no row for f{}", face.id))?;
+                    actual.extend(row.iter());
+                }
+            }
+            _ => return Err(format!("unknown byte colour domain {domain}").into()),
+        }
+        let expected_rows = definition["values"]
+            .as_array()
+            .ok_or("oracle byte colour values missing")?;
+        if actual.len() != expected_rows.len() {
+            return Err(format!(
+                "byte colour {name} has {} elements, Blender has {}",
+                actual.len(),
+                expected_rows.len()
+            )
+            .into());
+        }
+        for (index, (actual, expected)) in actual.into_iter().zip(expected_rows).enumerate() {
+            let linear = actual
+                .as_array()
+                .ok_or("byte colour value is not a colour")?
+                .iter()
+                .map(number)
+                .collect::<TestResult<Vec<f64>>>()?;
+            let bytes: Vec<i64> = linear
+                .iter()
+                .enumerate()
+                .map(|(channel, value)| {
+                    let encoded = if channel < 3 {
+                        linear_to_srgb(*value)
+                    } else {
+                        *value
+                    };
+                    (encoded * 255.0).round() as i64
+                })
+                .collect();
+            let wanted: Vec<i64> = expected
+                .as_array()
+                .ok_or("oracle byte colour is not a colour")?
+                .iter()
+                .map(|byte| byte.as_i64().ok_or("oracle byte is not an integer"))
+                .collect::<Result<Vec<i64>, &str>>()?;
+            if bytes != wanted {
+                return Err(format!(
+                    "byte colour {name} {domain} element {index} is {bytes:?}, Blender has {wanted:?}"
+                )
+                .into());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Compares two shapes by position. Faces match by their canonical position-cluster cycle, edges
@@ -1494,6 +1679,7 @@ fn compare_case(case: &Value, spec: &Value) -> TestResult<Errors> {
     };
     let actual_mesh = evaluate_modifiers(&mesh, &[modifier])?;
     compare_ordered_attributes(&actual_mesh, &case["expected"]["ordered_attributes"])?;
+    compare_byte_colors(&actual_mesh, &case["expected"]["byte_colors"])?;
     let actual = potter_shape(&actual_mesh)?;
     let expected = oracle_shape(&case["expected"])?;
     compare_storage_order(&actual, &expected)

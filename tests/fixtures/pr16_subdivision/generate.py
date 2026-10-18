@@ -255,6 +255,13 @@ def fixture_set():
         {"name": "OrderIntCorner", "domain": "CORNER", "type": "INT"},
         {"name": "OrderQuaternion", "domain": "POINT", "type": "QUATERNION"},
     ]
+    # BYTE_COLOR layers hold sRGB bytes that Blender interpolates per slot and truncates (encode_byte_colors).
+    byte_colors = [
+        {"name": "ByteColorPoint", "domain": "POINT"},
+        {"name": "ByteColorCorner", "domain": "CORNER"},
+    ]
+    meshes["quad"]["byte_colors"] = byte_colors
+    meshes["ngon"]["byte_colors"] = byte_colors
     meshes["vertex_crease_grid"] = make_mesh(grid_vertices, grid_faces, grid_seams,
                                              vertex_creases=[(5, 1.0), (6, 0.5), (1, 0.3)])
     meshes["vertex_crease_cube"] = make_mesh(cube_vertices, cube_faces, cube_seams,
@@ -512,11 +519,19 @@ def output_mesh(obj, params):
                 ordered_attributes.append({
                     "name": attribute.name, "domain": attribute.domain,
                     "data_type": attribute.data_type,
-                    "values": [attribute_value(item.value) for item in attribute.data],
+                    "values": [attribute_value(item.value, attribute.data_type) for item in attribute.data],
+                })
+        byte_colors = []
+        for attribute in mesh.color_attributes:
+            if attribute.name.startswith("ByteColor"):
+                byte_colors.append({
+                    "name": attribute.name, "domain": attribute.domain,
+                    "data_type": attribute.data_type,
+                    "values": [[int(round(channel * 255)) for channel in item.color_srgb] for item in attribute.data],
                 })
         return {"input_edges": coarse_edges, "vertices": [list(vertex.co) for vertex in mesh.vertices], "edges": edges,
                 "faces": faces, "vertex_groups": group_weights, "ordered_attributes": ordered_attributes,
-                "has_custom_normals": bool(mesh.has_custom_normals)}
+                "byte_colors": byte_colors, "has_custom_normals": bool(mesh.has_custom_normals)}
     finally:
         evaluated.to_mesh_clear()
 
@@ -550,10 +565,23 @@ def order_values(mesh, domain, data_type):
     raise RuntimeError(f"unsupported order test attribute {data_type} on {domain}")
 
 
-def attribute_value(value):
+def attribute_value(value, data_type):
+    """A generic value in Potter's canonical order: a quaternion is Blender's (w, x, y, z) read as (x, y, z, w)."""
+    if data_type == "QUATERNION":
+        w, x, y, z = (float(component) for component in value)
+        return [x, y, z, w]
     if hasattr(value, "__len__"):
         return [float(component) for component in value]
     return value if isinstance(value, int) else float(value)
+
+
+def byte_color_values(domain, mesh):
+    """Deterministic sRGB bytes (r, g, b, a) of each BYTE_COLOR element, by Blender loop or vertex index. The
+    Rust fixture builds the same bytes from the same formula."""
+    base = 17 if domain == "POINT" else 53
+    count = len(mesh.vertices) if domain == "POINT" else len(mesh.loops)
+    return [[(index * 37 + channel * 91 + base) % 256 for channel in range(3)]
+            + [(index * 29 + (101 if domain == "POINT" else 7)) % 256] for index in range(count)]
 
 
 
@@ -584,6 +612,11 @@ def make_object(name, spec):
         attribute = mesh.attributes.new(name=definition["name"], type=data_type, domain=domain)
         for item, value in zip(attribute.data, order_values(mesh, domain, data_type)):
             item.value = value
+    for definition in spec.get("byte_colors", []):
+        attribute = mesh.color_attributes.new(name=definition["name"], type="BYTE_COLOR",
+                                              domain=definition["domain"])
+        for item, bytes_ in zip(attribute.data, byte_color_values(definition["domain"], mesh)):
+            item.color_srgb = tuple(channel / 255.0 for channel in bytes_)
     for spec_layer in spec["uv_layers"]:
         layer = mesh.uv_layers.new(name=spec_layer["name"])
         for index, value in enumerate(spec_layer["values"]):
