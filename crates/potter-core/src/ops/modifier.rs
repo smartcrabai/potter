@@ -1394,6 +1394,7 @@ fn evaluate_modifier_output(
                         &world_matrices,
                         evaluated_operand_meshes,
                         &attribute_bone_matrices,
+                        engine.asset_root,
                     ),
                     _ => Err(PotError::new(
                         ErrorCode::InternalError,

@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::blender_rng::BlenderRng;
-use crate::geom::bvh::KdopTree;
+use crate::geom::bvh::{KdopTree, RayHit};
 use crate::geom::color_layers::{self, ColorDomain};
 use crate::geom::uv_layers::{UvLayer, UvStore, read as read_uv_store, read_layers, write_layers};
 use glam::{DVec2, DVec3};
@@ -1446,10 +1446,9 @@ impl<'a> TransferMapContext<'a> {
         }
         let vertex_bounds = source_positions
             .iter()
-            .map(|&point| (point, point))
-            .collect::<Vec<_>>();
-        let source_vertex_bvh = KdopTree::new(&vertex_bounds)?;
-        let ray_padding = DVec3::splat(max_ray_radius);
+            .map(|&point| padded_leaf_bounds([point, point, point], 0.0))
+            .collect::<Result<Vec<_>>>()?;
+        let source_vertex_bvh = KdopTree::from_leaf_bounds(&vertex_bounds);
         let edge_bounds = source
             .edges
             .iter()
@@ -1464,13 +1463,11 @@ impl<'a> TransferMapContext<'a> {
                 };
                 let first = source_positions[first];
                 let second = source_positions[second];
-                Ok((
-                    first.min(second) - ray_padding,
-                    first.max(second) + ray_padding,
-                ))
+                // The segment's box is the box of the degenerate triangle (first, second, second).
+                padded_leaf_bounds([first, second, second], max_ray_radius)
             })
             .collect::<Result<Vec<_>>>()?;
-        let source_edge_bvh = KdopTree::new(&edge_bounds)?;
+        let source_edge_bvh = KdopTree::from_leaf_bounds(&edge_bounds);
         let source_corner_normals = if needs_loop_normals {
             Some(crate::geom::normals::corner_normals(
                 source,
@@ -1894,18 +1891,14 @@ fn build_source_face_graph(
         })
     })
     .collect();
-    let triangle_padding = DVec3::splat(ray_padding);
     let triangle_bounds = triangles
         .iter()
         .map(|triangle| {
             let [first, second, third] = triangle.vertices.map(|index| positions[index]);
-            (
-                first.min(second).min(third) - triangle_padding,
-                first.max(second).max(third) + triangle_padding,
-            )
+            padded_leaf_bounds([first, second, third], ray_padding)
         })
-        .collect::<Vec<_>>();
-    let triangle_bvh = KdopTree::new(&triangle_bounds)?;
+        .collect::<Result<Vec<_>>>()?;
+    let triangle_bvh = KdopTree::from_leaf_bounds(&triangle_bounds);
     Ok(SourceFaceGraph {
         face_islands,
         islands,
@@ -2952,6 +2945,7 @@ fn closest_point_triangle_blender(
     let w = vc * denominator;
     first + edge_ab * v + edge_ac * w
 }
+// blocked: needs E's nearest-point BVH query (`KdopTree::nearest`); F's `KdopTree` only ray-casts.
 fn nearest_vertex(context: &TransferMapContext<'_>, point: DVec3) -> Option<usize> {
     let point = point.as_vec3();
     context
@@ -2967,6 +2961,7 @@ fn nearest_vertex(context: &TransferMapContext<'_>, point: DVec3) -> Option<usiz
         .map(|(index, _, ())| index)
 }
 
+// blocked: needs E's nearest-point BVH query (`KdopTree::nearest`); F's `KdopTree` only ray-casts.
 fn nearest_vertex_in_island(
     context: &TransferMapContext<'_>,
     point: DVec3,
@@ -2991,6 +2986,7 @@ fn nearest_vertex_in_island(
         .map(|(index, _, ())| index)
 }
 
+// blocked: needs E's nearest-point BVH query (`KdopTree::nearest`); F's `KdopTree` only ray-casts.
 fn nearest_edge(context: &TransferMapContext<'_>, point: DVec3) -> Option<(usize, DVec3, f64)> {
     let point_f32 = point.as_vec3();
     let max_distance_squared = blender_max_distance_squared(context.max_distance);
@@ -3028,6 +3024,7 @@ fn nearest_surface(context: &TransferMapContext<'_>, point: DVec3) -> Option<(us
     nearest_surface_in_island(context, point, None)
 }
 
+// blocked: needs E's nearest-point BVH query (`KdopTree::nearest`); F's `KdopTree` only ray-casts.
 fn nearest_surface_in_island(
     context: &TransferMapContext<'_>,
     point: DVec3,
@@ -3055,6 +3052,67 @@ fn nearest_surface_in_island(
     )?;
     let face = graph.triangles.get(triangle_index)?.face;
     Some((face, closest, distance))
+}
+
+/// The leaf box of the triangle `points`, grown by `padding` on every side. The box carries the
+/// tree epsilon from `KdopTree::leaf_bounds_for_triangle`; a point or segment is a degenerate
+/// triangle of its corners.
+fn padded_leaf_bounds(points: [DVec3; 3], padding: f64) -> Result<[f32; 6]> {
+    let mut bounds =
+        KdopTree::leaf_bounds_for_triangle(points.map(|point| point.as_vec3().to_array()));
+    let padding = padding as f32;
+    for axis in 0..3 {
+        bounds[2 * axis] -= padding;
+        bounds[2 * axis + 1] += padding;
+    }
+    if !bounds.iter().all(|value| value.is_finite()) {
+        return Err(crate::error::PotError::invalid_argument(
+            "spatial primitive bounds must be finite",
+        ));
+    }
+    Ok(bounds)
+}
+
+/// Nearest leaf hit of `test` along `origin + t * direction` for `t` in `[0, max_distance]`,
+/// traversed with `KdopTree::ray_cast`. `test(leaf, t_max)` returns the leaf's hit distance and
+/// payload, where `t_max` is the nearest distance found so far, clamped to `max_distance`. A later
+/// leaf replaces the hit only when strictly nearer, as Blender's ray-cast callbacks do.
+fn ray_cast_nearest<T>(
+    tree: &KdopTree,
+    origin: DVec3,
+    direction: DVec3,
+    max_distance: f64,
+    mut test: impl FnMut(usize, f64) -> Option<(f64, T)>,
+) -> Option<(usize, f64, T)> {
+    if !origin.is_finite()
+        || !direction.is_finite()
+        || direction == DVec3::ZERO
+        || max_distance.is_nan()
+        || max_distance < 0.0
+    {
+        return None;
+    }
+    let max_distance = max_distance.min(f64::from(f32::MAX));
+    let mut nearest = None;
+    tree.ray_cast(
+        origin.as_vec3().to_array(),
+        direction.as_vec3().to_array(),
+        &mut RayHit::open(),
+        &mut |leaf, _ray, running| {
+            let t_max = f64::from(running.dist).min(max_distance);
+            let Some((distance, payload)) = test(leaf, t_max) else {
+                return;
+            };
+            let nearer = running.index < 0 || distance < f64::from(running.dist);
+            if !distance.is_finite() || distance < 0.0 || distance > t_max || !nearer {
+                return;
+            }
+            running.index = leaf as isize;
+            running.dist = distance as f32;
+            nearest = Some((leaf, distance, payload));
+        },
+    );
+    nearest
 }
 
 fn raycast_surface(
@@ -3089,41 +3147,44 @@ fn raycast_surface_in_island(
     let max_distance = context.max_distance.min(f64::from(f32::MAX));
     let mut best: Option<(usize, DVec3, f64)> = None;
     for direction in [normal, -normal] {
-        let hit =
-            graph
-                .triangle_bvh
-                .raycast(origin, direction, 0.0, max_distance, |index, min, max| {
-                    let triangle = graph.triangles.get(index)?;
-                    if island.is_some_and(|value| graph.face_islands[triangle.face] != value) {
-                        return None;
-                    }
-                    let [a, b, c] = triangle
-                        .vertices
-                        .map(|vertex| context.source_positions[vertex].as_vec3());
-                    let origin_f32 = origin.as_vec3();
-                    let direction_f32 = direction.as_vec3();
-                    let hit = if radius > 0.0 {
-                        sphere_ray_triangle(
-                            origin_f32,
-                            direction_f32,
-                            max as f32,
-                            radius as f32,
-                            a,
-                            b,
-                            c,
+        let hit = ray_cast_nearest(
+            &graph.triangle_bvh,
+            origin,
+            direction,
+            max_distance,
+            |index, max| {
+                let triangle = graph.triangles.get(index)?;
+                if island.is_some_and(|value| graph.face_islands[triangle.face] != value) {
+                    return None;
+                }
+                let [a, b, c] = triangle
+                    .vertices
+                    .map(|vertex| context.source_positions[vertex].as_vec3());
+                let origin_f32 = origin.as_vec3();
+                let direction_f32 = direction.as_vec3();
+                let hit = if radius > 0.0 {
+                    sphere_ray_triangle(
+                        origin_f32,
+                        direction_f32,
+                        max as f32,
+                        radius as f32,
+                        a,
+                        b,
+                        c,
+                    )
+                    .map(|distance| {
+                        (
+                            (origin_f32 + direction_f32 * distance).as_dvec3(),
+                            f64::from(distance),
                         )
-                        .map(|distance| {
-                            (
-                                (origin_f32 + direction_f32 * distance).as_dvec3(),
-                                f64::from(distance),
-                            )
-                        })
-                    } else {
-                        ray_triangle(origin_f32, direction_f32, a, b, c)
-                            .map(|(distance, point)| (point.as_dvec3(), f64::from(distance)))
-                    }?;
-                    (hit.1 >= min && hit.1 < max).then_some((hit.1, hit.0))
-                });
+                    })
+                } else {
+                    ray_triangle(origin_f32, direction_f32, a, b, c)
+                        .map(|(distance, point)| (point.as_dvec3(), f64::from(distance)))
+                }?;
+                (hit.1 >= 0.0 && hit.1 < max).then_some((hit.1, hit.0))
+            },
+        );
         if let Some((triangle_index, distance, point)) = hit {
             let face = graph.triangles.get(triangle_index)?.face;
             if best.is_none_or(|(_, _, prior)| distance < prior) {
@@ -3468,9 +3529,12 @@ fn raycast_source_edge(
     radius: f32,
 ) -> Option<(usize, f32)> {
     let max_distance = context.max_distance.min(f64::from(f32::MAX));
-    context
-        .source_edge_bvh
-        .raycast(origin, direction, 0.0, max_distance, |index, _, max| {
+    ray_cast_nearest(
+        &context.source_edge_bvh,
+        origin,
+        direction,
+        max_distance,
+        |index, max| {
             let edge = context.source.edges.get(index)?;
             let [Some(first), Some(second)] = edge
                 .vertices
@@ -3489,8 +3553,9 @@ fn raycast_source_edge(
                 second,
             )?;
             Some((f64::from(distance), ()))
-        })
-        .map(|(edge, distance, ())| (edge, distance as f32))
+        },
+    )
+    .map(|(edge, distance, ())| (edge, distance as f32))
 }
 
 fn mesh_edge_spherecast(

@@ -901,6 +901,7 @@ impl Snapshot {
                                 &matrices,
                                 &meshes,
                                 &bone_matrices,
+                                modifier_context.project_root,
                             ),
                             "surface_deform" | "mesh_deform" => apply_scene_deform_modifier(
                                 mesh,
@@ -1186,6 +1187,7 @@ impl Snapshot {
                                 &matrices,
                                 &meshes,
                                 &bone_matrices,
+                                modifier_context.project_root,
                             ),
                             "surface_deform" | "mesh_deform" => apply_scene_deform_modifier(
                                 mesh,
@@ -2509,16 +2511,17 @@ fn operand_blender_matrices_f32(
                 (Some(object_f32), None, None)
             }
             (_, "mask_tex_map_object") => {
-                // A mask bone is read only from an armature object; a bone the armature lacks
-                // leaves the matrix unset so the weight evaluation reports it as missing.
-                let target_f32 = match non_empty_text(modifier, "mask_tex_map_bone")
+                // A mask bone is read only from an armature object. A bone the armature lacks uses
+                // the object's world matrix, as Blender's MOD_util does.
+                let target_f32 = non_empty_text(modifier, "mask_tex_map_bone")
                     .filter(|_| object.node.kind == "armature")
-                {
-                    None => Some(object_f32),
-                    Some(bone_name) => armature_bone_id(object.node, doc, bone_name)
-                        .and_then(|bone_id| bone_matrices.get(object.id)?.get(&bone_id).copied())
-                        .map(|matrix| matrix.map(|value| value as f32)),
-                };
+                    .and_then(|bone_name| armature_bone_id(object.node, doc, bone_name))
+                    .map_or(Some(object_f32), |bone_id| {
+                        bone_matrices
+                            .get(object.id)?
+                            .get(&bone_id)
+                            .map(|matrix| matrix.map(|value| value as f32))
+                    });
                 (
                     None,
                     None,
@@ -2827,6 +2830,7 @@ fn scene_subject_name<'a>(doc: &'a SceneDoc, subject_id: &Id) -> Result<&'a str>
 
 /// Evaluate an attribute modifier against its resolved scene operands. `bone_matrices` supplies
 /// the pose-bone world matrices that `uv_warp` bone references and `mask_tex_map_bone` read.
+/// `project_root` resolves image mask textures.
 pub(crate) fn apply_scene_attribute_modifier(
     mesh: &mut Mesh,
     modifier: &Modifier,
@@ -2835,20 +2839,8 @@ pub(crate) fn apply_scene_attribute_modifier(
     world_matrices: &BTreeMap<Id, DMat4>,
     evaluated_meshes: &BTreeMap<Id, Mesh>,
     bone_matrices: &BTreeMap<Id, BTreeMap<Id, [f64; 16]>>,
+    project_root: Option<&Path>,
 ) -> Result<()> {
-    // Scene evaluation has no resolved texture source yet, so a referenced mask texture fails
-    // rather than being ignored.
-    if modifier
-        .params
-        .get("mask_texture")
-        .is_some_and(|value| !value.is_null() && value.as_str() != Some(""))
-    {
-        return Err(PotError::with_details(
-            ErrorCode::DependencyMissing,
-            "weight modifier texture was not resolved",
-            json!({"modifier_id":modifier.id,"parameter":"mask_texture"}),
-        ));
-    }
     let mut uv_warp_modifier = None;
     if modifier.modifier_type == "uv_warp" {
         let source_world = resolve_uv_warp_reference_world_f32(
@@ -2911,16 +2903,58 @@ pub(crate) fn apply_scene_attribute_modifier(
         }),
         active_vertex_group_index: subject.active_vertex_group_index,
     };
+    let (texture, texture_mapping) = match attribute_mask_texture_id(modifier)? {
+        None => (None, None),
+        Some(texture_id) => {
+            let texture =
+                crate::geom::legacy_texture::resolve_texture(doc, &texture_id, project_root)?;
+            let mapping = texture_coordinate_mapping_with_parameters(
+                modifier,
+                subject_world,
+                doc,
+                world_matrices,
+                bone_matrices,
+                "mask_tex_mapping",
+                "mask_tex_map_object",
+                "mask_tex_map_bone",
+            )?;
+            (Some(texture), mapping)
+        }
+    };
     *mesh = crate::geom::modifiers::attributes::evaluate_with_context(
         mesh,
         modifier,
         &operands,
-        None,
+        texture.as_ref(),
+        texture_mapping.as_ref(),
         subject_world,
         &subject.name,
         &subject_layer_selection,
     )?;
     Ok(())
+}
+
+/// The `mask_texture` ID of an attribute modifier. An unset or empty parameter has no texture.
+fn attribute_mask_texture_id(modifier: &Modifier) -> Result<Option<Id>> {
+    let text = match modifier.params.get("mask_texture") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::String(text)) if text.is_empty() => return Ok(None),
+        Some(Value::String(text)) => text,
+        Some(_) => {
+            return Err(PotError::with_details(
+                ErrorCode::InvalidArgument,
+                "mask_texture must be a texture ID or null",
+                json!({"modifier_id":modifier.id,"parameter":"mask_texture"}),
+            ));
+        }
+    };
+    Id::new(text.to_owned()).map(Some).map_err(|error| {
+        PotError::with_details(
+            ErrorCode::InvalidArgument,
+            error.message,
+            json!({"modifier_id":modifier.id,"parameter":"mask_texture","texture":text}),
+        )
+    })
 }
 
 pub(crate) fn apply_scene_deform_modifier(

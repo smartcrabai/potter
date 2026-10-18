@@ -93,6 +93,7 @@ enum Field {
 
 struct Evaluator<'a> {
     group: &'a NodeGroup,
+    subject_name: &'a str,
     input: Option<&'a Mesh>,
     overrides: &'a Map<String, Value>,
     frame: f64,
@@ -118,8 +119,9 @@ pub fn evaluate(
     group: &NodeGroup,
     input: Option<&Mesh>,
     overrides: &Map<String, Value>,
+    subject_name: &str,
 ) -> Result<GraphEvaluation> {
-    evaluate_at_frame(group, input, overrides, 1.0)
+    evaluate_at_frame(group, input, overrides, 1.0, subject_name)
 }
 
 /// Evaluate a geometry node group at a scene frame.
@@ -129,11 +131,13 @@ pub fn evaluate(
 /// # Errors
 ///
 /// Returns an error for invalid graphs, unsupported graph kinds, or invalid evaluation.
+/// `subject_name` is the evaluating object's Blender name, which subject-bound modifiers use.
 pub fn evaluate_at_frame(
     group: &NodeGroup,
     input: Option<&Mesh>,
     overrides: &Map<String, Value>,
     frame: f64,
+    subject_name: &str,
 ) -> Result<GraphEvaluation> {
     if !frame.is_finite() {
         return Err(PotError::invalid_argument(
@@ -220,6 +224,7 @@ pub fn evaluate_at_frame(
     };
     let mut evaluator = Evaluator {
         group,
+        subject_name,
         input,
         overrides,
         frame,
@@ -1283,7 +1288,7 @@ impl Evaluator<'_> {
             binding_data: None,
             runtime: crate::model::ModifierRuntime::default(),
         };
-        let mesh = evaluate_modifiers(&geometry.mesh, &[modifier])?;
+        let mesh = evaluate_modifiers(&geometry.mesh, &[modifier], self.subject_name)?;
         Ok(EvalValue::Geometry(GeometryValue {
             mesh,
             instance_paths: geometry.instance_paths,

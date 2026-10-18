@@ -945,6 +945,7 @@ def _armature_dump(armature):
                       "roll": bone_rolls[bone.name], "deform": bool(bone.use_deform),
                       "inherit_rotation": bool(bone.use_inherit_rotation),
                       "use_connect": bool(bone.use_connect),
+                      "select": bool(bone.select),
                       "bbone_settings": _armature_bbone_settings(bone)})
     return {"name": armature.name_full, "potter_id": armature.get("potter.id"),
             "library": library_reference(armature),
@@ -1360,6 +1361,13 @@ def _vertex_groups_dump(obj):
     return result
 
 
+def _active_vertex_group_index(obj):
+    if not len(obj.vertex_groups):
+        return None
+    index = int(obj.vertex_groups.active_index)
+    return index if 0 <= index < len(obj.vertex_groups) else None
+
+
 def _pose_dump(obj):
     result = []
     if obj.type != "ARMATURE" or obj.pose is None:
@@ -1584,6 +1592,7 @@ def object_dump(obj):
             "material_links": material_links, "modifiers": modifiers,
             "constraints": constraints, "drivers": drivers, "nla_tracks": nla_tracks,
             "action": action, "action_slot": action_slot, "pose": _pose_dump(obj),
+            "active_vertex_group_index": _active_vertex_group_index(obj),
             "vertex_groups": _vertex_groups_dump(obj), "rigid_body": _rigid_body_dump(obj),
             "force_field": _force_field_dump(obj), "custom_properties": custom_props(obj),
             "volume_bounds": volume_bounds,
@@ -3968,6 +3977,15 @@ def _restore_vertex_groups(obj, groups):
         obj["potter.vertex_group_ids_json"] = json.dumps(group_ids, sort_keys=True)
 
 
+def _restore_active_vertex_group(obj, item):
+    index = item.get("active_vertex_group_index")
+    if index is None:
+        return
+    if not isinstance(index, int) or not 0 <= index < len(obj.vertex_groups):
+        raise ValueError("object %s has an out-of-range active vertex group" % obj.name)
+    obj.vertex_groups.active_index = index
+
+
 def _restore_grease_pencil(data, raw, materials):
     for layer_raw in raw.get("layers", []):
         layer = data.layers.new(layer_raw["name"], set_active=True)
@@ -4090,6 +4108,7 @@ def _restore_armature(obj, source, scene):
                 bone.use_deform = bool(item.get("deform", True))
                 bone.use_inherit_rotation = bool(item.get("inherit_rotation", True))
                 bone.use_connect = bool(item.get("use_connect", False))
+                bone.select = bool(item.get("select", False))
                 if item.get("potter_id"):
                     bone_ids[bone.name] = item["potter_id"]
                 edit_bones[item["name"]] = bone
@@ -4390,6 +4409,7 @@ def _armature_from_model(doc, data_id, source):
             "deform": bone.get("deform", True),
             "inherit_rotation": bone.get("inherit_rotation", True),
             "use_connect": bone.get("use_connect", False),
+            "select": bone.get("select", False),
             "bbone_settings": bone.get("bbone_settings", {}),
         }
     result = dict(source)
@@ -6383,6 +6403,7 @@ def export_doc(doc, target, pack, scene_hash, context):
             if not groups:
                 groups = source_object.get("vertex_groups", [])
             _restore_vertex_groups(obj, groups)
+            _restore_active_vertex_group(obj, item)
             mesh_source = compatibility_block(doc, "meshes", "Mesh", data_id)
             if data_id not in shape_key_meshes:
                 model_shape_keys = _shape_keys_from_model(doc, data_id)

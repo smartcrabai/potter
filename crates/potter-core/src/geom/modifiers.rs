@@ -268,7 +268,7 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
                 }
             };
             let graph_result =
-                graph::evaluate_at_frame(group, Some(&evaluated), &overrides, frame)?;
+                graph::evaluate_at_frame(group, Some(&evaluated), &overrides, frame, subject_name)?;
             evaluated = graph_result.mesh;
             instance_paths.extend(graph_result.instance_paths);
             continue;

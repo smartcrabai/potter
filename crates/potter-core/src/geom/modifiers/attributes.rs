@@ -81,28 +81,36 @@ pub(super) fn evaluate(mesh: &Mesh, modifier: &Modifier, subject_name: &str) -> 
         modifier,
         &BTreeMap::new(),
         None,
+        None,
         DMat4::IDENTITY,
         subject_name,
         &AttributeLayerSelection::default(),
     )
 }
 
-/// Evaluate an attribute modifier with an explicit subject identity.
+/// Evaluate an attribute modifier with an explicit subject identity, its resolved texture, and
+/// the texture coordinate mapping that the texture samples through.
+///
+/// `texture_mapping` is `None` only for UV mapping; a non-UV mask texture without a mapping is
+/// an invalid-parameter error.
 pub fn evaluate_with_context(
     mesh: &Mesh,
     modifier: &Modifier,
     operands: &BTreeMap<String, Vec<SceneOperand>>,
     texture: Option<&crate::geom::ResolvedTexture>,
+    texture_mapping: Option<&crate::model::TextureCoordinateMapping>,
     subject_world: DMat4,
     subject_name: &str,
     subject_layer_selection: &AttributeLayerSelection,
 ) -> Result<Mesh> {
+    // One texture stream per evaluation call; RANDOM falloff streams are separate instances.
     let mut rng = crate::blender_rng::BlenderRng::seed_random(0);
     evaluate_with_texture_context(
         mesh,
         modifier,
         operands,
-        texture.map(crate::geom::ResolvedTexture::source),
+        texture,
+        texture_mapping,
         subject_world,
         subject_name,
         subject_layer_selection,
@@ -114,7 +122,8 @@ pub(crate) fn evaluate_with_texture_context(
     mesh: &Mesh,
     modifier: &Modifier,
     operands: &BTreeMap<String, Vec<SceneOperand>>,
-    texture: Option<crate::geom::legacy_texture::TextureSource<'_>>,
+    texture: Option<&crate::geom::ResolvedTexture>,
+    texture_mapping: Option<&crate::model::TextureCoordinateMapping>,
     subject_world: DMat4,
     subject_name: &str,
     subject_layer_selection: &AttributeLayerSelection,
@@ -137,7 +146,7 @@ pub(crate) fn evaluate_with_texture_context(
         return Ok(mesh.clone());
     }
     let texture_weights =
-        texture_mask_weights(mesh, modifier, operands, texture, subject_world, rng)?;
+        texture_mask_weights(mesh, modifier, operands, texture, texture_mapping, rng)?;
     match modifier.modifier_type.as_str() {
         "vertex_weight_edit" => {
             vertex_weight_edit(mesh, modifier, texture_weights.as_ref(), subject_name)

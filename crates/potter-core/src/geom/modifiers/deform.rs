@@ -2505,6 +2505,7 @@ mod tests {
                 &source,
                 &[modifier],
                 &std::collections::BTreeMap::new(),
+                "Cube",
             )?;
             assert_eq!(evaluated.mesh, source);
             let warning = evaluated

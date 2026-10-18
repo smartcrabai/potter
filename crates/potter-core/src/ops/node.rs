@@ -4,7 +4,7 @@ use glam::{DMat4, DQuat};
 use serde_json::{Map, Value, json};
 
 use crate::{
-    error::{ErrorCode, Result},
+    error::{ErrorCode, PotError, Result},
     geom::{self, Mesh as GeomMesh},
     model::{
         ArmatureData, CameraData, DataBlock, GreasePencilData, Id, LightData, MaterialLink, Node,
@@ -37,6 +37,7 @@ pub(super) fn apply(
         "node.delete" => delete(engine, operation),
         "node.duplicate" => duplicate(engine, operation),
         "node.parent" => parent(engine, operation),
+        "node.vertex_group.active" => vertex_group_active(engine, operation),
         _ => Err(engine.error(
             ErrorCode::InternalError,
             "invalid node operation dispatch",
@@ -1572,6 +1573,99 @@ fn parent(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
     engine.mark("nodes", &target, ChangeKind::Updated);
     Ok(true)
 }
+
+fn vertex_group_active(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bool> {
+    check_fields(
+        engine,
+        operation,
+        &["op", "target", "index"],
+        &["target", "index"],
+    )?;
+    let target = operation.get("target").ok_or_else(|| {
+        engine.error(
+            ErrorCode::InvalidOperation,
+            "missing target",
+            &operation_pointer(engine.operation_index, "target"),
+        )
+    })?;
+    let node_id = resolve_node_targets(engine, target, false)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            engine.error(
+                ErrorCode::TargetNotFound,
+                "target selected no nodes",
+                &operation_pointer(engine.operation_index, "target"),
+            )
+        })?;
+    let data_id = engine
+        .doc
+        .nodes
+        .get(&node_id)
+        .and_then(|node| node.data.clone())
+        .ok_or_else(|| {
+            engine.error(
+                ErrorCode::InvalidOperation,
+                "target node has no data block",
+                &operation_pointer(engine.operation_index, "target"),
+            )
+        })?;
+    let group_count = engine
+        .doc
+        .data_blocks
+        .get(&data_id)
+        .filter(|block| block.data_type == "mesh" && block.mesh.is_some())
+        .map(|block| block.vertex_groups.len())
+        .ok_or_else(|| {
+            engine.error(
+                ErrorCode::InvalidOperation,
+                "target node must reference mesh data",
+                &operation_pointer(engine.operation_index, "target"),
+            )
+        })?;
+    let index_value = operation.get("index").ok_or_else(|| {
+        engine.error(
+            ErrorCode::InvalidOperation,
+            "index is required",
+            &operation_pointer(engine.operation_index, "index"),
+        )
+    })?;
+    let index = match index_value {
+        Value::Null => None,
+        value => {
+            let index = value
+                .as_u64()
+                .and_then(|index| usize::try_from(index).ok())
+                .ok_or_else(|| {
+                    engine.error(
+                        ErrorCode::InvalidOperation,
+                        "index must be a non-negative integer or null",
+                        &operation_pointer(engine.operation_index, "index"),
+                    )
+                })?;
+            if index >= group_count {
+                return Err(engine.error(
+                    ErrorCode::InvalidOperation,
+                    "vertex group index is out of range",
+                    &operation_pointer(engine.operation_index, "index"),
+                ));
+            }
+            Some(index)
+        }
+    };
+    let node = engine
+        .doc
+        .nodes
+        .get_mut(&node_id)
+        .ok_or_else(|| PotError::new(ErrorCode::InternalError, "node disappeared"))?;
+    if node.active_vertex_group_index == index {
+        return Ok(false);
+    }
+    node.active_vertex_group_index = index;
+    engine.mark("nodes", &node_id, ChangeKind::Updated);
+    Ok(true)
+}
+
 fn transform_from_matrix(matrix: DMat4, rotation_mode: &str) -> Option<Transform> {
     let (scale, rotation, translation) = matrix.to_scale_rotation_translation();
     if !scale.is_finite()

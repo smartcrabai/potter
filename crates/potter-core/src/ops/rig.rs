@@ -44,6 +44,7 @@ pub(super) fn apply(
         "bone_collection.delete" => bone_collection_delete(engine, operation),
         "bone_collection.assign" => bone_collection_assign(engine, operation, true),
         "rig.generate_basic_human" => rig_generate_basic_human(engine, operation),
+        "rig.bone.select" => bone_select(engine, operation),
         "bone_collection.unassign" => bone_collection_assign(engine, operation, false),
         "pose.set" => pose_set(engine, operation),
         "pose.reset" => pose_reset(engine, operation),
@@ -385,6 +386,46 @@ fn bone_delete(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resul
     engine.mark("nodes", &node_id, ChangeKind::Updated);
     engine.mark("data_blocks", &data_id, ChangeKind::Updated);
     Ok(true)
+}
+
+fn bone_select(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bool> {
+    check_fields(
+        engine,
+        operation,
+        &["op", "target", "bone_ids", "select"],
+        &["target", "bone_ids"],
+    )?;
+    let node_id = target_node(engine, operation)?;
+    let armature_data_id = data_id(engine, &node_id)?;
+    let select = read_bool(engine, operation, "select", true)?;
+    let bone_ids = parse_bone_ids(
+        engine,
+        operation
+            .get("bone_ids")
+            .ok_or_else(|| invalid(engine, "bone_ids is required", "bone_ids"))?,
+        "bone_ids",
+    )?;
+    if bone_ids.is_empty() {
+        return Err(invalid(engine, "bone_ids must not be empty", "bone_ids"));
+    }
+    let known_bones = &armature(engine, &node_id)?.bones;
+    if let Some(unknown) = bone_ids.iter().find(|id| !known_bones.contains_key(*id)) {
+        return Err(missing(engine, "bone", unknown, "bone_ids"));
+    }
+    let armature = armature_mut(engine, &node_id)?;
+    let mut changed = false;
+    for id in &bone_ids {
+        if let Some(bone) = armature.bones.get_mut(id)
+            && bone.select != select
+        {
+            bone.select = select;
+            changed = true;
+        }
+    }
+    if changed {
+        engine.mark("data_blocks", &armature_data_id, ChangeKind::Updated);
+    }
+    Ok(changed)
 }
 
 fn bone_collection_create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bool> {

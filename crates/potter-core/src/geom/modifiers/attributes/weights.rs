@@ -1,4 +1,4 @@
-//! Vertex-weight edit/mix/proximity and their image/bone mask coordinates.
+//! Vertex-weight edit/mix/proximity and their texture-mask weights.
 
 use super::*;
 use crate::blender_rng::BlenderRng;
@@ -7,8 +7,8 @@ pub(super) fn texture_mask_weights(
     mesh: &Mesh,
     modifier: &Modifier,
     operands: &BTreeMap<String, Vec<SceneOperand>>,
-    texture: Option<crate::geom::legacy_texture::TextureSource<'_>>,
-    subject_world: DMat4,
+    texture: Option<&crate::geom::ResolvedTexture>,
+    texture_mapping: Option<&crate::model::TextureCoordinateMapping>,
     rng: &mut crate::blender_rng::BlenderRng,
 ) -> Result<Option<BTreeMap<u32, f64>>> {
     if modifier.modifier_type == "vertex_weight_proximity"
@@ -53,22 +53,11 @@ pub(super) fn texture_mask_weights(
             "a Blender image channel",
         ));
     }
-    let uv_coordinates = if mapping == "UV" {
-        Some(vertex_uv_coordinates(mesh, modifier, uv_layer)?)
-    } else {
-        None
-    };
-    let object_matrix = texture_object_matrix(modifier, operands, mapping)?;
-    let coordinates = texture_coordinates(
-        mesh,
-        mapping,
-        uv_coordinates.as_ref(),
-        weight_matrix_f32(subject_world),
-        object_matrix.as_ref(),
-    );
+    let coordinates = texture_coordinates(mesh, modifier, mapping, uv_layer, texture_mapping)?;
+    let source = texture.source();
     let mut weights = BTreeMap::new();
     for (vertex, coordinate) in mesh.vertices.iter().zip(coordinates) {
-        let sample = crate::geom::legacy_texture::sample(texture, coordinate, rng)?;
+        let sample = crate::geom::legacy_texture::sample(source, coordinate, rng)?;
         let value = match channel {
             "INT" => sample.intensity,
             "ALPHA" => sample.alpha,
@@ -82,68 +71,51 @@ pub(super) fn texture_mask_weights(
     Ok(Some(weights))
 }
 
-/// The mask object's Blender-order f32 subject-to-object matrix. Only OBJECT mapping with a
-/// mapping object uses it; other mappings and an unset object yield `None` (LOCAL coordinates).
-/// A set `mask_tex_map_bone` selects the bone-relative matrix; a bone the operand could not
-/// resolve is an error, not a silent object-matrix fallback.
-fn texture_object_matrix(
-    modifier: &Modifier,
-    operands: &BTreeMap<String, Vec<SceneOperand>>,
-    mapping: &str,
-) -> Result<Option<[f32; 16]>> {
-    if mapping != "OBJECT" || optional_string(modifier, "mask_tex_map_object")?.is_none() {
-        return Ok(None);
-    }
-    let bone = optional_string(modifier, "mask_tex_map_bone")?.filter(|name| !name.is_empty());
-    operands
-        .get("mask_tex_map_object")
-        .and_then(|objects| objects.first())
-        .and_then(|object| object.blender_matrices_f32)
-        .and_then(|matrices| matrices.subject_to_local)
-        .map(Some)
-        .ok_or_else(|| match bone {
-            Some(bone) => PotError::with_details(
-                ErrorCode::DependencyMissing,
-                "weight texture bone coordinates were not resolved",
-                json!({"modifier_id":modifier.id,"parameter":"mask_tex_map_bone","bone":bone}),
-            ),
-            None => PotError::with_details(
-                ErrorCode::DependencyMissing,
-                "weight texture object coordinates were not resolved",
-                json!({"modifier_id":modifier.id,"parameter":"mask_tex_map_object"}),
-            ),
-        })
-}
-
-/// Per-vertex mask-texture coordinates, aligned with `mesh.vertices`. Matrix transforms run in
-/// f32 as in Blender's `MOD_get_texture_coords`.
+/// Per-vertex mask-texture coordinates, aligned with `mesh.vertices`. `mapping` is one of
+/// LOCAL, GLOBAL, OBJECT, or UV, validated by the caller. Non-UV coordinates come from the
+/// evaluation context's `TextureCoordinateMapping`, which already resolves the OBJECT and BONE
+/// reference (a missing bone uses the object world, as Blender's MOD_util.cc does).
 fn texture_coordinates(
     mesh: &Mesh,
+    modifier: &Modifier,
     mapping: &str,
-    uv_coordinates: Option<&BTreeMap<u32, DVec2>>,
-    subject_world: [f32; 16],
-    object_matrix: Option<&[f32; 16]>,
-) -> Vec<DVec3> {
-    mesh.vertices
+    uv_layer: &str,
+    texture_mapping: Option<&crate::model::TextureCoordinateMapping>,
+) -> Result<Vec<DVec3>> {
+    if mapping == "UV" {
+        let uv_coordinates = vertex_uv_coordinates(mesh, modifier, uv_layer)?;
+        return Ok(mesh
+            .vertices
+            .iter()
+            .map(|vertex| {
+                uv_coordinates
+                    .get(&vertex.id)
+                    .copied()
+                    .map_or(vertex.co, |uv| {
+                        DVec3::new(uv.x * 2.0 - 1.0, (1.0 - uv.y) * 2.0 - 1.0, 0.0)
+                    })
+            })
+            .collect());
+    }
+    let texture_mapping = texture_mapping.ok_or_else(|| {
+        invalid(
+            modifier,
+            "mask_tex_mapping",
+            "a texture coordinate mapping resolved by the evaluation context",
+        )
+    })?;
+    let global = mapping == "GLOBAL";
+    Ok(mesh
+        .vertices
         .iter()
-        .map(|vertex| match mapping {
-            "LOCAL" => vertex.co,
-            "GLOBAL" => transform_point_f32(&subject_world, vertex.co),
-            "OBJECT" => {
-                object_matrix.map_or(vertex.co, |matrix| transform_point_f32(matrix, vertex.co))
+        .map(|vertex| {
+            if global {
+                texture_mapping.global_coordinate(vertex.co)
+            } else {
+                texture_mapping.object_coordinate(vertex.co)
             }
-            "UV" => uv_coordinates
-                .and_then(|coordinates| coordinates.get(&vertex.id).copied())
-                .map_or(vertex.co, |uv| {
-                    DVec3::new(uv.x * 2.0 - 1.0, (1.0 - uv.y) * 2.0 - 1.0, 0.0)
-                }),
-            _ => unreachable!("texture mapping was validated"),
         })
-        .collect()
-}
-
-fn transform_point_f32(matrix: &[f32; 16], point: DVec3) -> DVec3 {
-    crate::geom::blender_matrix::blender_transform_point_f32(matrix, point.as_vec3()).as_dvec3()
+        .collect())
 }
 
 fn vertex_uv_coordinates(
@@ -785,8 +757,9 @@ fn clamp_weights(weights: &mut [f64]) {
     }
 }
 
-/// Blender's `BLI_ghashutil_strhash` (djb2 over signed bytes) of an object name. RANDOM falloff
-/// seeds its per-object stream from this hash of the subject name.
+/// Blender's `BLI_ghashutil_strhash_p` (seed 5381, `h = h * 33 + (signed char)c`) over the object
+/// name without its two-character ID-type prefix (Blender's `ob->id.name + 2`); Potter subject
+/// names are already unprefixed. RANDOM falloff seeds its per-object stream from this hash.
 fn object_name_hash(name: &str) -> u32 {
     name.bytes().fold(5381_u32, |hash, byte| {
         hash.wrapping_mul(33).wrapping_add(byte as i8 as i32 as u32)
