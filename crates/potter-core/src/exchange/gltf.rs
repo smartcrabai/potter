@@ -10694,7 +10694,7 @@ mod tests {
             };
 
             let fbx_path = directory.path().join("scene.fbx");
-            let fbx_bytes = as_case(crate::exchange::fbx::export(&source, &snapshot))?;
+            let fbx_bytes = as_case(crate::exchange::fbx::export_with_root_allow_lossy(&source, &snapshot, std::path::Path::new("."), false))?;
             std::fs::write(&fbx_path, fbx_bytes).map_err(|error| TestCaseError::fail(error.to_string()))?;
             let fbx = as_case(crate::exchange::fbx::import(&fbx_path, uuid::Uuid::new_v4().to_string()))?;
             let mut fbx_positions = as_case(mesh_positions(&fbx.doc))?;

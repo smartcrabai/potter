@@ -102,34 +102,9 @@ struct BoneExport {
     local: DMat4,
 }
 
-/// Export the evaluated mesh and scene transforms as ASCII FBX 7.4. Color layers and generic
-/// attributes are not written; `exchange::attribute_losses` reports them.
-pub(crate) fn export(doc: &SceneDoc, snapshot: &Snapshot) -> Result<Vec<u8>> {
-    export_with_root(doc, snapshot, Path::new("."))
-}
-
-/// Export ASCII FBX with the project root available for linked and packed images.
-pub(crate) fn export_with_root(
-    doc: &SceneDoc,
-    snapshot: &Snapshot,
-    project_root: &Path,
-) -> Result<Vec<u8>> {
-    export_with_root_allow_lossy(doc, snapshot, project_root, false)
-}
-
-/// Export ASCII FBX, optionally dropping attributes reported by the command's lossy-export gate.
-pub(crate) fn export_allow_lossy(
-    doc: &SceneDoc,
-    snapshot: &Snapshot,
-    allow_lossy: bool,
-) -> Result<Vec<u8>> {
-    if allow_lossy {
-        export_with_root_allow_lossy(doc, snapshot, Path::new("."), true)
-    } else {
-        export(doc, snapshot)
-    }
-}
-
+/// Export ASCII FBX 7.4 with texture assets resolved under `project_root`, optionally dropping attributes reported by
+/// the lossy-export gate. Color layers and generic attributes are not written; `exchange::attribute_losses` reports
+/// them.
 pub(crate) fn export_with_root_allow_lossy(
     doc: &SceneDoc,
     snapshot: &Snapshot,
@@ -3805,9 +3780,8 @@ fn write_error(_: std::fmt::Error) -> PotError {
 #[cfg(test)]
 mod tests {
     use super::{
-        export_with_root, export_with_root_allow_lossy, import_bytes, lex, material_slot_losses,
-        parse_nodes, parse_uv_layers, uv_texture_losses, uv_texture_warnings, write_geometry,
-        write_uv_layers,
+        export_with_root_allow_lossy, import_bytes, lex, material_slot_losses, parse_nodes,
+        parse_uv_layers, uv_texture_losses, uv_texture_warnings, write_geometry, write_uv_layers,
     };
     use crate::{
         error::{ErrorCode, PotError, Result},
@@ -4462,7 +4436,7 @@ mod tests {
 
         let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
         assert!(uv_texture_losses(&doc, &snapshot).is_empty());
-        let bytes = export_with_root(&doc, &snapshot, root.path())?;
+        let bytes = export_with_root_allow_lossy(&doc, &snapshot, root.path(), false)?;
         let imported = import_bytes(&bytes, "00000000-0000-4000-8000-000000000001".to_owned())?;
         assert_ne!(
             resolved_material_id(&imported.doc, "left", 0)?,
@@ -4496,7 +4470,7 @@ mod tests {
             .uv_layer = Some("Detail".to_owned());
         let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
         assert!(uv_texture_losses(&doc, &snapshot).is_empty());
-        let bytes = export_with_root(&doc, &snapshot, root.path())?;
+        let bytes = export_with_root_allow_lossy(&doc, &snapshot, root.path(), false)?;
         let imported = import_bytes(&bytes, "00000000-0000-4000-8000-000000000002".to_owned())?;
         assert_eq!(
             texture_on_node(&imported.doc, "left")?.uv_layer.as_deref(),
@@ -4537,7 +4511,7 @@ mod tests {
         assert_eq!(warnings[0].details["status"], "fallback");
         assert_eq!(warnings[0].details["node_id"], "right");
         assert_eq!(warnings[0].details["render_uv_layer"], "RightRender");
-        let bytes = export_with_root(&doc, &snapshot, root.path())?;
+        let bytes = export_with_root_allow_lossy(&doc, &snapshot, root.path(), false)?;
         let imported = import_bytes(&bytes, "00000000-0000-4000-8000-000000000003".to_owned())?;
         assert_eq!(
             texture_on_node(&imported.doc, "left")?.uv_layer.as_deref(),
