@@ -14659,6 +14659,100 @@ mod tests {
     }
 
     #[test]
+    fn main_texture_transform_reaches_the_colour_variant_graph() -> TestResult {
+        // The base color texture carries a VRM 0.x MToon main texture transform, set as the glTF import
+        // sets it. Its graph is built with the same `move_textures_to_graph` call the import makes.
+        let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+        let source = crate::model::Id::new("paint")?;
+        doc.materials.insert(
+            source.clone(),
+            crate::model::Material {
+                name: "paint".to_owned(),
+                ..crate::model::Material::default()
+            },
+        );
+        let textures = material_graph::GraphTextures {
+            base_color: Some(material_graph::SlotTexture {
+                texture: crate::model::TextureRef {
+                    image: crate::model::Id::new("paint_img")?,
+                    uv_layer: None,
+                    interpolation: crate::image::ImageInterpolation::Linear,
+                },
+                transform: Some(super::material_surface::TextureTransform {
+                    offset: [0.25, -2.1],
+                    rotation: 0.0,
+                    scale: [2.0, 3.0],
+                }),
+            }),
+            metallic_roughness: None,
+            roughness: None,
+            metallic: None,
+            normal: None,
+            normal_scale: 1.0,
+            emissive: None,
+            occlusion: None,
+        };
+        material_graph::move_textures_to_graph(&mut doc, &source, &textures)?;
+        // A primitive with COLOR_0 reading layer "Paint" builds the colour variant from that source.
+        let mut variants = BTreeMap::new();
+        let mut used_material_ids = BTreeSet::from([source.clone()]);
+        let mut used_graph_ids = doc.node_groups.keys().cloned().collect::<BTreeSet<_>>();
+        let variant = imported_color_material(
+            &mut doc,
+            &source,
+            "Paint",
+            &mut variants,
+            &mut used_material_ids,
+            &mut used_graph_ids,
+        )?;
+        assert_ne!(variant, source, "the colour variant is a separate material");
+        let variant_graph_id = doc.materials[&variant]
+            .node_tree
+            .clone()
+            .ok_or("the colour variant has no shader graph")?;
+        let graph = &doc.node_groups[&variant_graph_id];
+        let (mapping_name, mapping) = graph
+            .nodes
+            .iter()
+            .find(|(_, node)| node.node_type == "ShaderNodeMapping")
+            .ok_or("the colour variant graph has no Mapping node")?;
+        assert_eq!(mapping.inputs["Scale"], json!([2.0, 3.0, 1.0]));
+        let location = mapping
+            .inputs
+            .get("Location")
+            .and_then(Value::as_array)
+            .ok_or("the Mapping node has no Location")?
+            .iter()
+            .filter_map(Value::as_f64)
+            .collect::<Vec<_>>();
+        assert!(
+            location.len() == 3
+                && (location[0] - 0.25).abs() < 1e-9
+                && (location[1] - 0.1).abs() < 1e-9,
+            "the colour variant's Mapping location is {location:?}"
+        );
+        assert!(
+            graph.links.iter().any(|link| {
+                &link.from_node == mapping_name
+                    && link.to_socket == "Vector"
+                    && graph
+                        .nodes
+                        .get(&link.to_node)
+                        .is_some_and(|node| node.node_type == "ShaderNodeTexImage")
+            }),
+            "the colour variant's Mapping node does not feed its image Vector"
+        );
+        assert!(
+            graph.nodes.values().any(|node| {
+                node.node_type == "ShaderNodeVertexColor"
+                    && node.properties.get("layer_name") == Some(&json!("Paint"))
+            }),
+            "the colour variant does not read its colour layer"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn uvless_collection_slot_omits_union_uv_attrs_and_unsupported_textures() -> TestResult {
         let root = tempfile::tempdir()?;
         let mut doc = scene_with_asset_root(
