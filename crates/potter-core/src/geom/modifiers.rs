@@ -7006,12 +7006,17 @@ mod tests {
             let expected_max_x = size * 0.5 + travel.max(0.0);
             let bounds = result.bounds().unwrap();
             prop_assert_eq!(result.vertices.len(), mesh.vertices.len() * usize::try_from(count).unwrap());
-            prop_assert!((bounds.min.x - expected_min_x).abs() < 1.0e-9);
-            prop_assert!((bounds.max.x - expected_max_x).abs() < 1.0e-9);
-            prop_assert!((bounds.min.y + size * 0.5).abs() < 1.0e-12);
-            prop_assert!((bounds.max.y - size * 0.5).abs() < 1.0e-12);
-            prop_assert!((bounds.min.z + size * 0.5).abs() < 1.0e-12);
-            prop_assert!((bounds.max.z - size * 0.5).abs() < 1.0e-12);
+            // Array accumulates its float32 offsets as Blender does, so the bound carries f32 rounding
+            // in proportion to the travel distance.
+            let tolerance = 1.0e-5 * (1.0 + travel.abs());
+            prop_assert!((bounds.min.x - expected_min_x).abs() <= tolerance);
+            prop_assert!((bounds.max.x - expected_max_x).abs() <= tolerance);
+            // Every copied coordinate goes through the float32 transform, including untouched axes.
+            let axis_tolerance = 1.0e-6 * (1.0 + size);
+            prop_assert!((bounds.min.y + size * 0.5).abs() <= axis_tolerance);
+            prop_assert!((bounds.max.y - size * 0.5).abs() <= axis_tolerance);
+            prop_assert!((bounds.min.z + size * 0.5).abs() <= axis_tolerance);
+            prop_assert!((bounds.max.z - size * 0.5).abs() <= axis_tolerance);
         }
     }
 }

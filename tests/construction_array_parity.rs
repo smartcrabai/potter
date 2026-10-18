@@ -352,7 +352,7 @@ fn insert_curve_node(doc: &mut SceneDoc, curve: &Value) {
         "curve": {
             "resolution_u": 1,
             "use_path": curve["use_path"],
-            "splines": [{"type": "POLY", "points": points}],
+            "splines": [{"type": "poly", "points": points}],
         },
     }))
     .unwrap();
