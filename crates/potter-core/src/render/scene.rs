@@ -2680,6 +2680,7 @@ mod shading_normal_tests {
                 pixels: pixel.to_vec(),
                 tiles: BTreeMap::new(),
                 interpolation: ImageInterpolation::Closest,
+                srgb: false,
             },
         )]);
         let geometry = extract_geometry(&doc, &snapshot, Mode::Beauty, false, &images)?;

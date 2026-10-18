@@ -1453,6 +1453,7 @@ mod tests {
             pixels: vec![[1.0, 0.5, 0.5, 1.0]],
             tiles: std::collections::BTreeMap::new(),
             interpolation: crate::image::ImageInterpolation::Linear,
+            srgb: false,
         };
         let displaced = displace_volume(
             &volume,

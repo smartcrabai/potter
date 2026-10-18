@@ -2415,6 +2415,7 @@ mod tests {
                 pixels,
                 tiles: BTreeMap::new(),
                 interpolation: ImageInterpolation::Closest,
+                srgb: false,
             },
         )]);
         context = context.with_images(&images);

@@ -10653,6 +10653,7 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
                     pixels: vec![[128.0 / 255.0, 192.0 / 255.0, 230.0 / 255.0, 1.0]],
                     tiles: BTreeMap::new(),
                     interpolation: crate::image::ImageInterpolation::Linear,
+                    srgb: false,
                 },
             ),
             (
@@ -10663,6 +10664,7 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
                     pixels: vec![[64.0 / 255.0, 128.0 / 255.0, 1.0, 1.0]],
                     tiles: BTreeMap::new(),
                     interpolation: crate::image::ImageInterpolation::Linear,
+                    srgb: false,
                 },
             ),
         ]);

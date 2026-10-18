@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+use crate::color::{linear_to_srgb_unclamped, srgb_to_linear};
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImageInterpolation {
@@ -28,40 +30,60 @@ impl ImageExtension {
     }
 }
 
+/// One UDIM tile. `pixels` are linear light, and `srgb` is as in [`ImageData`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct ImageTileData {
     pub width: u32,
     pub height: u32,
     pub pixels: Vec<[f64; 4]>,
+    pub srgb: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ImageData {
     pub width: u32,
     pub height: u32,
+    /// Linear light, for consumers that read pixels directly.
     pub pixels: Vec<[f64; 4]>,
     pub tiles: BTreeMap<u32, ImageTileData>,
     pub interpolation: ImageInterpolation,
+    /// Whether `pixels` were decoded from sRGB-encoded storage. Linear sampling then interpolates the encoded values
+    /// and decodes the result, as Cycles does for images it compresses as sRGB (`svm_image_texture` with
+    /// `NODE_IMAGE_COMPRESS_AS_SRGB`, set from `ImageMetaData::is_compressible_as_srgb`).
+    pub srgb: bool,
 }
 
 const TRANSPARENT_BLACK: [f64; 4] = [0.0; 4];
 
-/// Samples linear RGBA image pixels at a normalized UV coordinate.
+/// Samples linear RGBA image pixels at a normalized UV coordinate, filtering decoded linear light.
 ///
 /// Tile zero samples the base image directly. Positive tiles are treated as UDIM
-/// base tiles, with integer UV offsets selecting neighboring tiles.
+/// base tiles, with integer UV offsets selecting neighboring tiles. This is the lookup of the modifier mask images,
+/// which decode sRGB before filtering as Blender's image buffer sampler does. Image Texture lookups use
+/// [`sample_with_interpolation`], which follows Cycles.
 #[must_use]
 pub fn sample(data: &ImageData, uv: [f64; 2], tile: u32) -> [f64; 4] {
-    sample_with_interpolation(data, uv, tile, data.interpolation)
+    sample_image(data, uv, tile, data.interpolation, false)
 }
 
-/// Samples an image with an explicit interpolation mode without copying the image data.
+/// Samples an image with an explicit interpolation mode, as a Cycles image texture does: an sRGB image's encoded texels
+/// are interpolated and the result is decoded (`svm_image_texture`), without copying the image data.
 #[must_use]
 pub fn sample_with_interpolation(
     data: &ImageData,
     uv: [f64; 2],
     tile: u32,
     interpolation: ImageInterpolation,
+) -> [f64; 4] {
+    sample_image(data, uv, tile, interpolation, true)
+}
+
+fn sample_image(
+    data: &ImageData,
+    uv: [f64; 2],
+    tile: u32,
+    interpolation: ImageInterpolation,
+    cycles_srgb: bool,
 ) -> [f64; 4] {
     if !uv[0].is_finite() || !uv[1].is_finite() {
         return TRANSPARENT_BLACK;
@@ -82,7 +104,9 @@ pub fn sample_with_interpolation(
     let v = local_uv[1].clamp(0.0, 1.0);
 
     match interpolation {
-        ImageInterpolation::Linear => sample_linear(image.pixels, width, height, u, v),
+        ImageInterpolation::Linear => {
+            sample_linear(image.pixels, width, height, u, v, cycles_srgb && image.srgb)
+        }
         ImageInterpolation::Closest => sample_closest(image.pixels, width, height, u, v),
     }
 }
@@ -134,6 +158,7 @@ pub fn sample_with_extension(
             local_uv[0],
             local_uv[1],
             extension,
+            image.srgb,
         ),
         ImageInterpolation::Closest => sample_closest_with_extension(
             image.pixels,
@@ -152,6 +177,7 @@ fn image_for_uv(data: &ImageData, uv: [f64; 2], tile: u32) -> Option<ImageTileDa
             width: data.width,
             height: data.height,
             pixels: &data.pixels,
+            srgb: data.srgb,
         })
     } else {
         let actual_tile = udim_tile(tile, uv)?;
@@ -162,12 +188,14 @@ fn image_for_uv(data: &ImageData, uv: [f64; 2], tile: u32) -> Option<ImageTileDa
                         width: data.width,
                         height: data.height,
                         pixels: &data.pixels,
+                        srgb: data.srgb,
                     }
                 } else {
                     ImageTileDataRef {
                         width: 0,
                         height: 0,
                         pixels: &[],
+                        srgb: false,
                     }
                 }
             },
@@ -175,6 +203,7 @@ fn image_for_uv(data: &ImageData, uv: [f64; 2], tile: u32) -> Option<ImageTileDa
                 width: image.width,
                 height: image.height,
                 pixels: &image.pixels,
+                srgb: image.srgb,
             },
         );
         Some(image)
@@ -185,6 +214,7 @@ struct ImageTileDataRef<'a> {
     width: u32,
     height: u32,
     pixels: &'a [[f64; 4]],
+    srgb: bool,
 }
 
 impl ImageTileDataRef<'_> {
@@ -239,7 +269,14 @@ fn sample_closest(pixels: &[[f64; 4]], width: usize, height: usize, u: f64, v: f
     clippy::cast_precision_loss,
     reason = "validated image dimensions and clamped UVs keep conversions within exact texel bounds"
 )]
-fn sample_linear(pixels: &[[f64; 4]], width: usize, height: usize, u: f64, v: f64) -> [f64; 4] {
+fn sample_linear(
+    pixels: &[[f64; 4]],
+    width: usize,
+    height: usize,
+    u: f64,
+    v: f64,
+    srgb: bool,
+) -> [f64; 4] {
     let x = (u * width as f64 - 0.5).clamp(0.0, (width - 1) as f64);
     let y = (v * height as f64 - 0.5).clamp(0.0, (height - 1) as f64);
     let x0 = x.floor() as usize;
@@ -249,17 +286,10 @@ fn sample_linear(pixels: &[[f64; 4]], width: usize, height: usize, u: f64, v: f6
     let tx = x - x0 as f64;
     let ty = y - y0 as f64;
 
-    let top = mix(
-        pixel(pixels, width, x0, y0),
-        pixel(pixels, width, x1, y0),
-        tx,
-    );
-    let bottom = mix(
-        pixel(pixels, width, x0, y1),
-        pixel(pixels, width, x1, y1),
-        tx,
-    );
-    mix(top, bottom, ty)
+    let texel = |x: usize, y: usize| interpolated_texel(pixel(pixels, width, x, y), srgb);
+    let top = mix(texel(x0, y0), texel(x1, y0), tx);
+    let bottom = mix(texel(x0, y1), texel(x1, y1), tx);
+    decode_interpolated(mix(top, bottom, ty), srgb)
 }
 
 #[expect(
@@ -301,6 +331,7 @@ fn sample_linear_with_extension(
     u: f64,
     v: f64,
     extension: ImageExtension,
+    srgb: bool,
 ) -> [f64; 4] {
     let x = u * width as f64 - 0.5;
     let y = v * height as f64 - 0.5;
@@ -315,17 +346,54 @@ fn sample_linear_with_extension(
     let tx = x - x0 as f64;
     let ty = y - y0 as f64;
 
-    let top = mix(
-        pixel_with_extension(pixels, width, height, x0, y0, extension),
-        pixel_with_extension(pixels, width, height, x1, y0, extension),
-        tx,
-    );
-    let bottom = mix(
-        pixel_with_extension(pixels, width, height, x0, y1, extension),
-        pixel_with_extension(pixels, width, height, x1, y1, extension),
-        tx,
-    );
-    mix(top, bottom, ty)
+    let texel = |x: i64, y: i64| {
+        interpolated_texel(
+            pixel_with_extension(pixels, width, height, x, y, extension),
+            srgb,
+        )
+    };
+    let top = mix(texel(x0, y0), texel(x1, y0), tx);
+    let bottom = mix(texel(x0, y1), texel(x1, y1), tx);
+    decode_interpolated(mix(top, bottom, ty), srgb)
+}
+
+/// The value a linear lookup mixes for one texel. For an sRGB image that is the encoded texel, which Cycles stores
+/// as the 8-bit or float value it interpolates (`svm_image_texture`). The lookup then decodes the mixed value. The
+/// encode is the exact inverse of the decode at load, so a texel round-trips to its stored value.
+fn interpolated_texel(linear: [f64; 4], srgb: bool) -> [f64; 4] {
+    if srgb {
+        [
+            linear_to_srgb_unclamped(linear[0]),
+            linear_to_srgb_unclamped(linear[1]),
+            linear_to_srgb_unclamped(linear[2]),
+            linear[3],
+        ]
+    } else {
+        linear
+    }
+}
+
+/// Decodes an interpolated sRGB value to linear light, as Cycles does after interpolating
+/// (`color_srgb_to_linear_v4`). Negative encoded values decode to zero, and alpha is unchanged.
+fn decode_interpolated(encoded: [f64; 4], srgb: bool) -> [f64; 4] {
+    if srgb {
+        [
+            decode_component(encoded[0]),
+            decode_component(encoded[1]),
+            decode_component(encoded[2]),
+            encoded[3],
+        ]
+    } else {
+        encoded
+    }
+}
+
+fn decode_component(encoded: f64) -> f64 {
+    if encoded < 0.0 {
+        0.0
+    } else {
+        srgb_to_linear(encoded)
+    }
 }
 
 fn pixel_with_extension(
@@ -406,7 +474,69 @@ mod tests {
             pixels,
             tiles: BTreeMap::new(),
             interpolation,
+            srgb: false,
         }
+    }
+
+    /// An sRGB two-texel row decoded to linear light, as the loader stores it.
+    fn srgb_row(encoded: [f64; 2]) -> ImageData {
+        ImageData {
+            width: 2,
+            height: 1,
+            pixels: encoded
+                .iter()
+                .map(|&value| {
+                    let linear = crate::color::srgb_to_linear(value);
+                    [linear, linear, linear, 1.0]
+                })
+                .collect(),
+            tiles: BTreeMap::new(),
+            interpolation: ImageInterpolation::Linear,
+            srgb: true,
+        }
+    }
+
+    #[test]
+    fn srgb_linear_sampling_interpolates_encoded_texels_then_decodes() {
+        // Cycles mixes an sRGB image's stored values and decodes the result. Halfway between encoded 0 and 1 is the
+        // decoded encoded midpoint, not the midpoint of the linear values.
+        let image = srgb_row([0.0, 1.0]);
+        let sampled = sample_with_interpolation(&image, [0.5, 0.5], 0, ImageInterpolation::Linear);
+        let expected = crate::color::srgb_to_linear(0.5);
+        assert!(
+            (sampled[0] - expected).abs() < 1e-12,
+            "sampled {} but Cycles' rule gives {expected}",
+            sampled[0]
+        );
+        assert!(
+            (sampled[0] - 0.5).abs() > 0.2,
+            "decode-before-mix would give 0.5"
+        );
+        assert!((sampled[3] - 1.0).abs() < 1e-12, "alpha is not decoded");
+    }
+
+    #[test]
+    fn srgb_closest_sampling_returns_the_decoded_texel() {
+        let image = srgb_row([0.25, 1.0]);
+        let sampled = sample_with_interpolation(&image, [0.1, 0.5], 0, ImageInterpolation::Closest);
+        assert_eq!(sampled, image.pixels[0]);
+    }
+
+    #[test]
+    fn srgb_extension_sampling_matches_the_decoded_linear_at_texel_centers() {
+        let image = srgb_row([0.5, 0.5]);
+        let sampled = sample_with_extension(
+            &image,
+            [0.25, 0.5],
+            [0.25, 0.5],
+            0,
+            ImageInterpolation::Linear,
+            ImageExtension::Extend,
+        );
+        assert!(
+            (sampled[0] - image.pixels[0][0]).abs() < 1e-12,
+            "a texel centre is the decoded texel"
+        );
     }
 
     #[test]
@@ -600,6 +730,7 @@ mod tests {
                 width: 2,
                 height: 1,
                 pixels: vec![[1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0]],
+                srgb: false,
             },
         );
 

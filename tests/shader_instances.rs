@@ -43,6 +43,7 @@ fn image_data(width: u32, height: u32, pixels: Vec<[f64; 4]>) -> ImageData {
         pixels,
         tiles: BTreeMap::new(),
         interpolation: ImageInterpolation::Linear,
+        srgb: false,
     }
 }
 
@@ -305,9 +306,11 @@ fn image_texture_samples_resolved_pixels_using_hit_uvs() {
                     width: 1,
                     height: 1,
                     pixels: vec![[0.0, 0.0, 1.0, 1.0]],
+                    srgb: false,
                 },
             )]),
             interpolation: ImageInterpolation::Linear,
+            srgb: false,
         },
     )]);
     let mut context = HitContext::new(&groups).with_images(&image_data);
@@ -338,6 +341,7 @@ fn image_texture_routes_blender_v_up_udims_and_flips_local_v() {
                         width: 1,
                         height: 1,
                         pixels: vec![[0.0, 1.0, 0.0, 1.0]],
+                        srgb: false,
                     },
                 ),
                 (
@@ -346,10 +350,12 @@ fn image_texture_routes_blender_v_up_udims_and_flips_local_v() {
                         width: 1,
                         height: 2,
                         pixels: vec![[1.0, 0.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]],
+                        srgb: false,
                     },
                 ),
             ]),
             interpolation: ImageInterpolation::Closest,
+            srgb: false,
         },
     )]);
     let make_material = |mapped: bool, vector: [f64; 3]| {

@@ -313,6 +313,7 @@ fn set_pixels(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result
                 width,
                 height,
                 pixels: vec![[0.0; 4]; pixel_count],
+                srgb: false,
             },
         );
         (width, height)
