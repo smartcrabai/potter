@@ -3,11 +3,15 @@ mod evaluator;
 mod model;
 mod sockets;
 
-pub use bake::{NodeBakeFrame, NodeBakeRecord, NodeBakeValue};
+pub use bake::{NodeBakeFrame, NodeBakePayloadTransaction, NodeBakeRecord, NodeBakeValue};
 pub(crate) use bake::{
-    delete_node_bake_payload, read_node_bake_payload, validate_node_bake_config,
-    validate_node_bake_resource, write_node_bake_payload,
+    MAX_NODE_BAKE_FRAME_COUNT, MAX_NODE_BAKE_PACKED_BYTES, NODE_BAKE_JSON_MEMORY_MULTIPLIER,
+    node_bake_frame_memory_bytes, read_node_bake_payload_limited, validate_node_bake_config,
+    validate_node_bake_frame, validate_node_bake_record, validate_node_bake_resource,
+    validate_node_bake_settings,
 };
+#[cfg(test)]
+pub(crate) use bake::read_node_bake_payload;
 pub use evaluator::{GraphEvaluation, evaluate, evaluate_at_frame, evaluate_at_frame_with_bakes};
 pub use model::{GraphInterface, GraphKind, GraphLink, GraphNode, GraphSocket, NodeGroup};
 pub use sockets::validate_link;

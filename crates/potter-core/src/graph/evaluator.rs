@@ -502,28 +502,32 @@ impl Evaluator<'_> {
                 } else {
                     EvalValue::Scalar(Value::Null)
                 };
-                inputs.push((
-                    item,
-                    identifier,
-                    item_type,
-                    self.input_value_with_node(id, node, &identifier, input_fallback)?,
-                ));
+                let input_value =
+                    self.input_value_with_node(id, node, &identifier, input_fallback)?;
+                inputs.push((item, identifier, item_type, input_value));
             }
-            let geometry = inputs.iter().find_map(|(_, _, _, value)| match value {
-                EvalValue::Geometry(geometry) => Some(geometry.clone()),
+            let geometry_index = inputs
+                .iter()
+                .position(|(_, _, _, value)| matches!(value, EvalValue::Geometry(_)));
+            let geometry = geometry_index.and_then(|index| match &inputs[index].3 {
+                EvalValue::Geometry(geometry) => Some(geometry),
                 _ => None,
             });
+            let geometry_identifier = geometry_index.map(|index| inputs[index].1.clone());
+            let mut captured_attributes = Vec::new();
             let mut values = BTreeMap::new();
-            for (item, identifier, socket_type, input) in inputs {
+            for (item, identifier, socket_type, input) in &inputs {
                 let baked = match input {
                     EvalValue::Geometry(geometry) => NodeBakeValue::Geometry {
-                        mesh: geometry.mesh,
-                        instance_paths: geometry.instance_paths,
+                        mesh: geometry.mesh.clone(),
+                        instance_paths: geometry.instance_paths.clone(),
                         material_refs: Vec::new(),
                     },
-                    EvalValue::Scalar(value) => NodeBakeValue::Scalar { value },
+                    EvalValue::Scalar(value) => NodeBakeValue::Scalar {
+                        value: value.clone(),
+                    },
                     EvalValue::Field(field) => {
-                        let geometry = geometry.as_ref().ok_or_else(|| {
+                        let geometry = geometry.ok_or_else(|| {
                             evaluation("Bake node field items require a geometry bake item")
                         })?;
                         let domain = item
@@ -532,11 +536,13 @@ impl Evaluator<'_> {
                             .unwrap_or("POINT")
                             .to_owned();
                         let count = domain_element_count(&geometry.mesh, &domain)?;
-                        let mut values = Vec::with_capacity(count);
+                        let mut field_values = Vec::with_capacity(count);
                         for index in 0..count {
-                            values.push(field_json(&field, &geometry.mesh, index, &domain)?);
+                            field_values.push(field_json(field, &geometry.mesh, index, &domain)?);
                         }
-                        NodeBakeValue::Field { domain, values }
+                        let attribute_name = format!(".bake_{node_id}_{identifier}");
+                        captured_attributes.push((attribute_name.clone(), domain, field_values));
+                        NodeBakeValue::Field { attribute_name }
                     }
                 };
                 if socket_type == "geometry" && !matches!(baked, NodeBakeValue::Geometry { .. }) {
@@ -544,7 +550,21 @@ impl Evaluator<'_> {
                         "Bake geometry item did not evaluate to geometry",
                     ));
                 }
-                values.insert(identifier, baked);
+                values.insert(identifier.clone(), baked);
+            }
+            if !captured_attributes.is_empty() {
+                let geometry_identifier = geometry_identifier.ok_or_else(|| {
+                    evaluation("Bake node field items require a geometry bake item")
+                })?;
+                let Some(NodeBakeValue::Geometry { mesh, .. }) =
+                    values.get_mut(&geometry_identifier)
+                else {
+                    return Err(evaluation("Bake node geometry item did not evaluate to geometry"));
+                };
+                for (name, domain, data) in captured_attributes {
+                    mesh.attributes
+                        .insert(name, json!({"domain":domain,"data":data}));
+                }
             }
             self.bake_captures.insert(
                 node_id.to_owned(),
@@ -3268,7 +3288,9 @@ impl NodeBakeValue {
                 instance_paths,
             }),
             Self::Scalar { value } => EvalValue::Scalar(value),
-            Self::Field { domain, values } => EvalValue::Field(Field::Captured { domain, values }),
+            Self::Field { attribute_name } => {
+                EvalValue::Field(Field::Attribute(attribute_name))
+            }
         }
     }
 }
@@ -3333,7 +3355,7 @@ fn mix_bake_values(first: &NodeBakeValue, second: &NodeBakeValue, factor: f64) -
             for (vertex, next) in mesh.vertices.iter_mut().zip(&second_mesh.vertices) {
                 vertex.co = vertex.co.lerp(next.co, factor);
             }
-            mix_point_attributes(&mut mesh, second_mesh, factor);
+            mix_mesh_attributes(&mut mesh, second_mesh, factor);
             NodeBakeValue::Geometry {
                 mesh,
                 instance_paths: instance_paths.clone(),
@@ -3347,23 +3369,14 @@ fn mix_bake_values(first: &NodeBakeValue, second: &NodeBakeValue, factor: f64) -
         }
         (
             NodeBakeValue::Field {
-                domain: first_domain,
-                values: first_values,
+                attribute_name: first,
             },
             NodeBakeValue::Field {
-                domain: second_domain,
-                values: second_values,
+                attribute_name: second,
             },
-        ) if first_domain == second_domain && first_values.len() == second_values.len() => {
-            NodeBakeValue::Field {
-                domain: first_domain.clone(),
-                values: first_values
-                    .iter()
-                    .zip(second_values)
-                    .map(|(first, second)| mix_json_value(first, second, factor))
-                    .collect(),
-            }
-        }
+        ) if first == second => NodeBakeValue::Field {
+            attribute_name: first.clone(),
+        },
         _ => first.clone(),
     }
 }
@@ -3383,20 +3396,31 @@ fn same_mesh_topology(first: &Mesh, second: &Mesh) -> bool {
             .all(|(first, second)| first.id == second.id && first.vertices == second.vertices)
 }
 
-fn mix_point_attributes(first: &mut Mesh, second: &Mesh, factor: f64) {
+fn mix_mesh_attributes(first: &mut Mesh, second: &Mesh, factor: f64) {
     for (name, first_attribute) in &mut first.attributes {
-        if !matches!(
-            first_attribute.get("domain").and_then(Value::as_str),
-            Some("point" | "vertices" | "POINT" | "POINTS")
-        ) {
-            continue;
-        }
         let Some(second_attribute) = second.attributes.get(name) else {
             continue;
         };
         if first_attribute.get("domain") != second_attribute.get("domain")
             || first_attribute.get("type") != second_attribute.get("type")
         {
+            continue;
+        }
+        if let (Some(first_data), Some(second_data)) = (
+            first_attribute.get_mut("data").and_then(Value::as_array_mut),
+            second_attribute.get("data").and_then(Value::as_array),
+        ) {
+            if first_data.len() == second_data.len() {
+                for (first, second) in first_data.iter_mut().zip(second_data) {
+                    *first = mix_json_value(first, second, factor);
+                }
+            }
+            continue;
+        }
+        if !matches!(
+            first_attribute.get("domain").and_then(Value::as_str),
+            Some("point" | "vertices" | "POINT" | "POINTS")
+        ) {
             continue;
         }
         let (Some(first_values), Some(second_values)) = (

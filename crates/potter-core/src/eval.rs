@@ -66,6 +66,24 @@ pub struct EvaluationContext {
     pub purpose: EvaluationPurpose,
 }
 
+/// Borrowed scene selection and frame, separate from modifier purpose and resources.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct EvaluationSceneContext<'a> {
+    pub(crate) scene_id: Option<&'a Id>,
+    pub(crate) view_layer: Option<&'a Id>,
+    pub(crate) frame: Option<f64>,
+}
+
+impl<'a> From<&'a EvaluationContext> for EvaluationSceneContext<'a> {
+    fn from(context: &'a EvaluationContext) -> Self {
+        Self {
+            scene_id: context.scene_id.as_ref(),
+            view_layer: context.view_layer.as_ref(),
+            frame: context.frame,
+        }
+    }
+}
+
 /// Borrowed project resources for one modifier evaluation.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ModifierEvaluationContext<'a> {
@@ -261,7 +279,18 @@ impl Snapshot {
         project_root: Option<&Path>,
         cache_directory: Option<&Path>,
     ) -> Result<Self> {
-        Self::evaluate_internal(doc, context, project_root, cache_directory, None, None)
+        let scene_context = EvaluationSceneContext::from(context);
+        Self::evaluate_internal(
+            doc,
+            &scene_context,
+            ModifierEvaluationContext {
+                purpose: context.purpose,
+                project_root,
+                cache_directory,
+            },
+            None,
+            None,
+        )
     }
 
     /// Evaluate only the geometry required for the selected nodes and their mesh operands.
@@ -281,11 +310,15 @@ impl Snapshot {
                 ));
             }
         }
+        let scene_context = EvaluationSceneContext::from(context);
         Self::evaluate_internal(
             doc,
-            context,
-            project_root,
-            cache_directory,
+            &scene_context,
+            ModifierEvaluationContext {
+                purpose: context.purpose,
+                project_root,
+                cache_directory,
+            },
             Some(node_ids),
             None,
         )
@@ -294,18 +327,16 @@ impl Snapshot {
     /// Evaluate the document and capture the Bake node selected by an explicit bake action.
     pub(crate) fn evaluate_with_node_bake_capture(
         doc: &SceneDoc,
-        context: &EvaluationContext,
-        project_root: Option<&Path>,
-        cache_directory: Option<&Path>,
+        scene_context: &EvaluationSceneContext<'_>,
+        modifier_context: ModifierEvaluationContext<'_>,
         object_id: &Id,
         modifier_id: &Id,
         bake_node_id: &str,
     ) -> Result<Self> {
         Self::evaluate_internal(
             doc,
-            context,
-            project_root,
-            cache_directory,
+            scene_context,
+            modifier_context,
             None,
             Some((
                 object_id.clone(),
@@ -378,10 +409,11 @@ impl Snapshot {
         doc.validate()?;
         crate::library::validate_linked_assets(doc, modifier_context.project_root)?;
         let scene_hash = source_scene_hash(doc)?;
+        let scene_context = EvaluationSceneContext::from(context);
         Self::evaluate_gated(
             doc,
             &scene_hash,
-            context,
+            &scene_context,
             modifier_context,
             Some(&selected_nodes),
             None,
@@ -404,6 +436,7 @@ impl Snapshot {
             project_root,
             cache_directory,
         };
+        let scene_context = EvaluationSceneContext::from(context);
         crate::library::validate_linked_assets(doc, modifier_context.project_root)?;
         let scene_hash = source_scene_hash(doc)?;
         let mut suppressed = BTreeSet::new();
@@ -420,7 +453,7 @@ impl Snapshot {
             let evaluation = Self::evaluate_gated(
                 doc,
                 &scene_hash,
-                context,
+                &scene_context,
                 modifier_context,
                 None,
                 None,
@@ -526,18 +559,12 @@ impl Snapshot {
 
     fn evaluate_internal(
         source: &SceneDoc,
-        context: &EvaluationContext,
-        project_root: Option<&Path>,
-        cache_directory: Option<&Path>,
+        scene_context: &EvaluationSceneContext<'_>,
+        modifier_context: ModifierEvaluationContext<'_>,
         selected_nodes: Option<&BTreeSet<Id>>,
         bake_capture: Option<(Id, Id, String)>,
     ) -> Result<Self> {
         source.validate()?;
-        let modifier_context = ModifierEvaluationContext {
-            purpose: context.purpose,
-            project_root,
-            cache_directory,
-        };
         crate::library::validate_linked_assets(source, modifier_context.project_root)?;
         let scene_hash = source_scene_hash(source)?;
         let suppressed = BTreeSet::new();
@@ -552,7 +579,7 @@ impl Snapshot {
         Self::evaluate_gated(
             source,
             &scene_hash,
-            context,
+            scene_context,
             modifier_context,
             selected_nodes,
             bake_capture,
@@ -571,7 +598,7 @@ impl Snapshot {
     fn evaluate_gated(
         doc: &SceneDoc,
         scene_hash: &str,
-        context: &EvaluationContext,
+        scene_context: &EvaluationSceneContext<'_>,
         modifier_context: ModifierEvaluationContext<'_>,
         selected_nodes: Option<&BTreeSet<Id>>,
         bake_capture: Option<(Id, Id, String)>,
@@ -583,9 +610,9 @@ impl Snapshot {
             context: modifier_context,
             suppressed,
         };
-        let scene_id = context
+        let scene_id = scene_context
             .scene_id
-            .clone()
+            .cloned()
             .unwrap_or_else(|| doc.active_scene.clone());
         let scene = doc.scenes.get(&scene_id).ok_or_else(|| {
             PotError::with_details(
@@ -594,7 +621,7 @@ impl Snapshot {
                 json!({ "scene_id": scene_id }),
             )
         })?;
-        let view_layer = match &context.view_layer {
+        let view_layer = match scene_context.view_layer {
             Some(view_layer) if scene.view_layers.contains_key(view_layer) => {
                 Some(view_layer.clone())
             }
@@ -602,12 +629,12 @@ impl Snapshot {
                 return Err(PotError::with_details(
                     ErrorCode::TargetNotFound,
                     "view layer context not found",
-                    json!({ "view_layer": view_layer }),
+                    json!({"view_layer":view_layer}),
                 ));
             }
             None => scene.view_layers.keys().next().cloned(),
         };
-        let frame = context.frame.unwrap_or(scene.frame_current);
+        let frame = scene_context.frame.unwrap_or(scene.frame_current);
         if !frame.is_finite() {
             return Err(PotError::new(
                 ErrorCode::InvalidArgument,
@@ -754,7 +781,7 @@ impl Snapshot {
             "scene_hash": scene_hash,
             "scene_id": scene_id,
             "view_layer": view_layer,
-            "purpose": context.purpose,
+            "purpose": modifier_context.purpose,
             "frame": frame,
             "simulation_cache_key": simulation_cache_key,
         });
@@ -879,8 +906,8 @@ impl Snapshot {
                     let evaluation_modifiers = prepare_node_bake_modifiers(
                         doc,
                         id,
-                        &node.modifiers,
-                        modifier_context.project_root,
+                        gated_modifiers.as_ref(),
+                        modifier_context,
                         bake_capture.as_ref(),
                     )?;
                     let evaluated = crate::geom::modifiers::evaluate_modifiers_with_scene_context(
@@ -1185,8 +1212,8 @@ impl Snapshot {
                     let evaluation_modifiers = prepare_node_bake_modifiers(
                         doc,
                         id,
-                        &node.modifiers,
-                        modifier_context.project_root,
+                        gated_modifiers.as_ref(),
+                        modifier_context,
                         bake_capture.as_ref(),
                     )?;
                     let evaluated = crate::geom::modifiers::evaluate_modifiers_with_scene_context(
@@ -1658,7 +1685,7 @@ impl Snapshot {
             scene_id,
             view_layer,
             frame,
-            purpose: context.purpose,
+            purpose: modifier_context.purpose,
             revision: doc.revision,
             scene_hash: scene_hash.to_owned(),
             evaluation_hash,
@@ -1894,7 +1921,7 @@ fn prepare_node_bake_modifiers<'a>(
     doc: &SceneDoc,
     object_id: &Id,
     modifiers: &'a [Modifier],
-    project_root: Option<&Path>,
+    modifier_context: ModifierEvaluationContext<'_>,
     capture_bake: Option<&(Id, Id, String)>,
 ) -> Result<Cow<'a, [Modifier]>> {
     let mut resolved = None;
@@ -1996,30 +2023,44 @@ fn prepare_node_bake_modifiers<'a>(
                             json!({"resource_id":resource_id}),
                         )
                     })?;
-                    crate::graph::validate_node_bake_resource(resource)?;
-                    Some(
-                        serde_json::from_value::<crate::graph::NodeBakeRecord>(resource.clone())
-                            .map_err(PotError::internal_json)?,
+                    if crate::model::migrate::inline_resource_kind(resource)? != Some("node_bake") {
+                        return Err(PotError::new(
+                            ErrorCode::SceneInvalid,
+                            "packed resource is not a node-bake resource",
+                        ));
+                    }
+                    let record = serde_json::from_value::<crate::graph::NodeBakeRecord>(
+                        resource.clone(),
                     )
+                    .map_err(|error| {
+                        PotError::with_details(
+                            ErrorCode::SceneInvalid,
+                            "packed node-bake resource is invalid",
+                            json!({"resource_id":resource_id,"cause":error.to_string()}),
+                        )
+                    })?;
+                    crate::graph::validate_node_bake_record(&record)?;
+                    Some(record)
                 }
                 "disk" => {
-                    let frame_entries =
-                        config
-                            .get("frames")
-                            .and_then(Value::as_array)
-                            .ok_or_else(|| {
-                                PotError::new(
-                                    ErrorCode::SceneInvalid,
-                                    "disk node-bake frame manifest is missing",
-                                )
-                            })?;
-                    if frame_entries.is_empty() || frame_entries.len() > 100_001 {
+                    let frame_entries = config
+                        .get("frames")
+                        .and_then(Value::as_array)
+                        .ok_or_else(|| {
+                            PotError::new(
+                                ErrorCode::SceneInvalid,
+                                "disk node-bake frame manifest is missing",
+                            )
+                        })?;
+                    if frame_entries.is_empty()
+                        || frame_entries.len() > crate::graph::MAX_NODE_BAKE_FRAME_COUNT
+                    {
                         return Err(PotError::new(
                             ErrorCode::SceneInvalid,
                             "disk node-bake frame manifest has an invalid number of frames",
                         ));
                     }
-                    let Some(project_root) = project_root else {
+                    let Some(project_root) = modifier_context.project_root else {
                         continue;
                     };
                     let bake_directory = if config
@@ -2042,7 +2083,11 @@ fn prepare_node_bake_modifiers<'a>(
                             .and_then(Value::as_str)
                             .unwrap_or_default()
                     };
-                    let mut frames = Vec::with_capacity(frame_entries.len());
+                    let mut frames: Vec<crate::graph::NodeBakeFrame> =
+                        Vec::with_capacity(frame_entries.len());
+                    let mut retained_bytes = frames
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<crate::graph::NodeBakeFrame>());
                     let mut previous_frame = None;
                     let mut missing_frame = false;
                     for entry in frame_entries {
@@ -2070,13 +2115,18 @@ fn prepare_node_bake_modifiers<'a>(
                                     "disk node-bake digest is missing",
                                 )
                             })?;
-                        let Some(bytes) = crate::graph::read_node_bake_payload(
+                        let remaining = crate::graph::MAX_NODE_BAKE_PACKED_BYTES
+                            .saturating_sub(retained_bytes);
+                        let read_limit = remaining
+                            / (crate::graph::NODE_BAKE_JSON_MEMORY_MULTIPLIER + 1);
+                        let Some(bytes) = crate::graph::read_node_bake_payload_limited(
                             project_root,
                             bake_directory,
                             object_id,
                             &modifier.id,
                             node_id,
                             digest,
+                            read_limit,
                         )?
                         else {
                             missing_frame = true;
@@ -2096,6 +2146,27 @@ fn prepare_node_bake_modifiers<'a>(
                                 "disk node-bake frame does not match its manifest",
                             ));
                         }
+                        crate::graph::validate_node_bake_frame(&frame)?;
+                        if frames
+                            .first()
+                            .is_some_and(|first| !first.values.keys().eq(frame.values.keys()))
+                        {
+                            return Err(PotError::new(
+                                ErrorCode::SceneInvalid,
+                                "disk node-bake frames do not contain matching sockets",
+                            ));
+                        }
+                        let frame_bytes = crate::graph::node_bake_frame_memory_bytes(&frame);
+                        let peak_bytes = retained_bytes
+                            .saturating_add(frame_bytes)
+                            .saturating_add(bytes.len());
+                        if peak_bytes > crate::graph::MAX_NODE_BAKE_PACKED_BYTES {
+                            return Err(PotError::new(
+                                ErrorCode::LimitExceeded,
+                                "loaded node-bake frames exceed the 2 GiB decoded memory limit",
+                            ));
+                        }
+                        retained_bytes = retained_bytes.saturating_add(frame_bytes);
                         frames.push(frame);
                     }
                     if missing_frame {
@@ -2117,8 +2188,6 @@ fn prepare_node_bake_modifiers<'a>(
                 }
             };
             if let Some(record) = record {
-                let value = serde_json::to_value(&record).map_err(PotError::internal_json)?;
-                crate::graph::validate_node_bake_resource(&value)?;
                 resolved_modifier
                     .runtime
                     .node_bakes

@@ -78,11 +78,7 @@ def find_socket(sockets, name, socket_type=None):
 
 
 def build_group(variant):
-    """variant: 'geo' (Transform by Shift, then Bake), 'float' (Shift baked as a FLOAT item that
-    drives Transform after the bake), 'topo' (Switch between Cube and IcoSphere on Shift > 1.25,
-    then Transform and Bake)."""
-    ng = bpy.data.node_groups.new("BakeOracle", "GeometryNodeTree")
-    ng.interface.new_socket(name="Geometry", in_out="INPUT", socket_type="NodeSocketGeometry")
+    """variant: geo, float, field, field_attribute or topo Geometry Nodes Bake graph."""
     ng.interface.new_socket(name="Shift", in_out="INPUT", socket_type="NodeSocketFloat").default_value = 0.0
     ng.interface.new_socket(name="Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
 
@@ -90,23 +86,52 @@ def build_group(variant):
     group_in = nodes.new("NodeGroupInput")
     group_out = nodes.new("NodeGroupOutput")
     combine = nodes.new("ShaderNodeCombineXYZ")
-    transform = nodes.new("GeometryNodeTransform")
     bake = nodes.new("GeometryNodeBake")
     bake.bake_items.new("GEOMETRY", "Geometry")
     if variant == "float":
         bake.bake_items.new("FLOAT", "Shift")
+    elif variant in ("field", "field_attribute"):
+        field_item = bake.bake_items.new("FLOAT", "X")
+        field_item.attribute_domain = "POINT"
+        field_item.is_attribute = variant == "field_attribute"
     bake_geo_in = find_socket(bake.inputs, "Geometry", "GEOMETRY")
     bake_geo_out = find_socket(bake.outputs, "Geometry", "GEOMETRY")
     geo_in = group_in.outputs["Geometry"]
     shift_in = group_in.outputs["Shift"]
 
     if variant == "float":
+        transform = nodes.new("GeometryNodeTransform")
         links.new(geo_in, bake_geo_in)
         links.new(shift_in, find_socket(bake.inputs, "Shift", "VALUE"))
         links.new(bake_geo_out, transform.inputs["Geometry"])
         links.new(find_socket(bake.outputs, "Shift", "VALUE"), combine.inputs["X"])
         links.new(transform.outputs["Geometry"], group_out.inputs["Geometry"])
+    elif variant in ("field", "field_attribute"):
+        position = nodes.new("GeometryNodeInputPosition")
+        separate = nodes.new("ShaderNodeSeparateXYZ")
+        add = nodes.new("ShaderNodeMath")
+        add.operation = "ADD"
+        set_position = nodes.new("GeometryNodeSetPosition")
+        links.new(geo_in, bake_geo_in)
+        links.new(position.outputs["Position"], separate.inputs["Vector"])
+        links.new(separate.outputs["X"], add.inputs["Value"])
+        links.new(shift_in, add.inputs["Value_001"])
+        links.new(add.outputs["Value"], find_socket(bake.inputs, "X", "VALUE"))
+        links.new(bake_geo_out, set_position.inputs["Geometry"])
+        links.new(find_socket(bake.outputs, "X", "VALUE"), combine.inputs["X"])
+        links.new(combine.outputs["Vector"], set_position.inputs["Offset"])
+        if variant == "field_attribute":
+            store = nodes.new("GeometryNodeStoreNamedAttribute")
+            store.data_type = "FLOAT"
+            store.domain = "POINT"
+            store.inputs["Name"].default_value = "BakedX"
+            links.new(set_position.outputs["Geometry"], store.inputs["Geometry"])
+            links.new(find_socket(bake.outputs, "X", "VALUE"), store.inputs["Value"])
+            links.new(store.outputs["Geometry"], group_out.inputs["Geometry"])
+        else:
+            links.new(set_position.outputs["Geometry"], group_out.inputs["Geometry"])
     else:
+        transform = nodes.new("GeometryNodeTransform")
         links.new(shift_in, combine.inputs["X"])
         if variant == "topo":
             compare = nodes.new("ShaderNodeMath")
@@ -128,7 +153,8 @@ def build_group(variant):
             raise ValueError(variant)
         links.new(transform.outputs["Geometry"], bake_geo_in)
         links.new(bake_geo_out, group_out.inputs["Geometry"])
-    links.new(combine.outputs[0], transform.inputs["Translation"])
+    if variant in ("geo", "float", "topo"):
+        links.new(combine.outputs[0], transform.inputs["Translation"])
     return ng
 
 
@@ -211,14 +237,16 @@ def bake_snapshot(mod):
     }
 
 
-def run_bake(op, ob, mod):
+def run_bake(op, ob, mod, method=None):
     bake = the_bake(mod)
+    arguments = {"session_uid": ob.session_uid, "modifier_name": mod.name, "bake_id": bake.bake_id}
+    if method is not None:
+        arguments["method"] = method
     with bpy.context.temp_override(object=ob, active_object=ob):
-        result = getattr(bpy.ops.object, op)(
-            session_uid=ob.session_uid, modifier_name=mod.name, bake_id=bake.bake_id
-        )
+        result = getattr(bpy.ops.object, op)(**arguments)
     if result != {"FINISHED"}:
         raise RuntimeError(f"{op} returned {result}")
+
 
 
 def replace_mesh_with_icosphere(ob):
@@ -259,6 +287,24 @@ def sample(ob, mod, ident, t, phase):
         "mean_x": sum(xs) / len(xs) if xs else None,
         "positions": [[round(c, 6) for c in p] for p in points],
     }
+
+def mesh_attribute_sample(ob, name, t):
+    frame = math.floor(t)
+    sub = round(t - frame, 6)
+    bpy.context.scene.frame_set(frame, subframe=sub)
+    ob.update_tag()
+    evaluated = ob.evaluated_get(bpy.context.evaluated_depsgraph_get())
+    mesh = evaluated.to_mesh()
+    attribute = mesh.attributes.get(name)
+    result = None
+    if attribute is not None:
+        result = {
+            "domain": attribute.domain,
+            "data_type": attribute.data_type,
+            "values": [round(value.value, 6) for value in attribute.data],
+        }
+    evaluated.to_mesh_clear()
+    return result
 
 
 def key(s):
@@ -687,6 +733,301 @@ def s10_topology_mix():
         ],
     }
 
+@scenario("S11_disk_missing_frame", "DISK bake with one missing frame after input change and reopen")
+def s11_disk_missing_frame():
+    work = fresh_dir(WORK / "s11")
+    blend = work / "s11.blend"
+    ob, mod, ident = setup()
+    save(blend)
+    mod.bake_target = "DISK"
+    mod.bake_directory = "//s11_disk"
+    the_bake(mod).bake_mode = "ANIMATION"
+    run_bake("geometry_node_bake_single", ob, mod)
+
+    disk_bake = work / "s11_disk" / str(the_bake(mod).bake_id)
+    missing_meta = disk_bake / "meta" / "00003_00000.json"
+    missing_blob = disk_bake / "blobs" / "00003_00000.blob"
+    replace_mesh_with_icosphere(ob)
+    ob.animation_data_clear()
+    set_input(mod, ident, 100.0)
+    save(blend)
+    missing_meta.unlink()
+    missing_blob.unlink()
+
+    reopened = run_child(blend, "after_missing_frame", [0, 1, 2, 2.5, 3, 3.5, 4, 5, 6], "s11")
+    samples = reopened["samples"]
+    return {
+        "samples": samples,
+        "observations": {
+            "after_reopen_bake": reopened["bake"],
+            "cache_files_after_missing_frame": walk(disk_bake),
+            "vertex_count_by_frame": {str(key(sample)): sample["vertex_count"] for sample in samples},
+            "min_x_by_frame": {str(key(sample)): sample["min_x"] for sample in samples},
+        },
+        "files": [str(blend)] + (walk(disk_bake) or []),
+        "notes": [
+            "The ANIMATION bake is saved to disk, then the live mesh is replaced with a 42-vertex IcoSphere and Shift=100.",
+            "The frame-3 metadata and blob files are deleted before reopening the .blend in a fresh Blender process.",
+        ],
+    }
+
+
+@scenario("S12_point_field_item", "Bake a POINT-domain FLOAT field derived from Position")
+def s12_point_field_item():
+    ob, mod, ident = setup("field")
+    bake_items = [
+        (item.name, item.socket_type, item.attribute_domain)
+        for item in the_bake(mod).node.bake_items
+    ]
+    run_bake("geometry_node_bake_single", ob, mod)
+    obs = {"bake_items": bake_items, "after_bake": bake_snapshot(mod)}
+    samples = [sample(ob, mod, ident, 1, "after_bake")]
+
+    ob.animation_data_clear()
+    set_input(mod, ident, 100.0)
+    samples.append(sample(ob, mod, ident, 1, "after_input_change"))
+    obs["input_change_keeps_bake"] = positions_equal(
+        pick(samples, 1, "after_bake"),
+        pick(samples, 1, "after_input_change"),
+    )
+
+    run_bake("geometry_node_bake_delete_single", ob, mod)
+    obs["after_delete"] = bake_snapshot(mod)
+    samples.append(sample(ob, mod, ident, 1, "after_delete"))
+    return {
+        "samples": samples,
+        "observations": obs,
+        "files": [],
+        "notes": [
+            "The Bake node captures Geometry and a POINT-domain FLOAT field (Position.x + Shift).",
+            "Changing Shift from 0.5 to 100 leaves the cached field and geometry intact; delete resumes live field evaluation.",
+        ],
+    }
+
+
+@scenario("S13_node_custom_disk_settings", "Bake-node DISK target, custom path, and frame range")
+def s13_node_custom_disk_settings():
+    work = fresh_dir(WORK / "s13")
+    blend = work / "s13.blend"
+    ob, mod, ident = setup()
+    save(blend)
+    bake = the_bake(mod)
+    bake.bake_mode = "ANIMATION"
+    bake.bake_target = "DISK"
+    bake.use_custom_simulation_frame_range = True
+    bake.frame_start = 2
+    bake.frame_end = 4
+    bake.use_custom_path = True
+    bake.directory = "//node_cache"
+    mod.bake_target = "PACKED"
+    mod.bake_directory = "//modifier_cache"
+    run_bake("geometry_node_bake_single", ob, mod)
+
+    obs = {"after_bake": bake_snapshot(mod)}
+    samples = [sample(ob, mod, ident, t, "after_bake") for t in [1, 2, 3, 4, 5]]
+    obs["node_cache_tree"] = walk(work / "node_cache")
+    obs["modifier_cache_tree"] = walk(work / "modifier_cache")
+
+    ob.animation_data_clear()
+    set_input(mod, ident, 100.0)
+    samples += [sample(ob, mod, ident, t, "after_input_change") for t in [1, 2, 3, 4, 5]]
+    save(blend)
+    reopened = run_child(blend, "after_reopen", [1, 2, 3, 4, 5], "s13")
+    samples += reopened["samples"]
+    obs["after_reopen_bake"] = reopened["bake"]
+    obs["after_reopen_equals_after_input_change"] = {
+        str(t): positions_equal(
+            pick(samples, t, "after_input_change"),
+            pick(samples, t, "after_reopen"),
+        )
+        for t in (1, 2, 3, 4, 5)
+    }
+
+    run_bake("geometry_node_bake_delete_single", ob, mod)
+    obs["after_delete"] = bake_snapshot(mod)
+    samples += [sample(ob, mod, ident, t, "after_delete") for t in [1, 2, 3, 4, 5]]
+    obs["node_cache_tree_after_delete"] = walk(work / "node_cache")
+    obs["modifier_cache_tree_after_delete"] = walk(work / "modifier_cache")
+    return {
+        "samples": samples,
+        "observations": obs,
+        "files": [str(blend)] + (walk(work) or []),
+        "notes": [
+            "The Bake node overrides modifier PACKED with DISK and uses its //node_cache path, not modifier //modifier_cache.",
+            "The custom 2..4 frame range clamps at its endpoints and cached values survive input changes and reopen.",
+        ],
+    }
+
+@scenario("S14_point_attribute_item", "Bake attribute-field output from a POINT-domain FLOAT item")
+def s14_point_attribute_item():
+    ob, mod, ident = setup("field_attribute")
+    bake_item = the_bake(mod).bake_items[1]
+    run_bake("geometry_node_bake_single", ob, mod)
+    obs = {
+        "bake_item": {
+            "name": bake_item.name,
+            "socket_type": bake_item.socket_type,
+            "is_attribute": bake_item.is_attribute,
+            "attribute_domain": bake_item.attribute_domain,
+        },
+        "after_bake": bake_snapshot(mod),
+        "attribute_after_bake": mesh_attribute_sample(ob, "BakedX", 1),
+    }
+    samples = [sample(ob, mod, ident, 1, "after_bake")]
+
+    ob.animation_data_clear()
+    set_input(mod, ident, 100.0)
+    samples.append(sample(ob, mod, ident, 1, "after_input_change"))
+    obs["attribute_after_input_change"] = mesh_attribute_sample(ob, "BakedX", 1)
+
+    run_bake("geometry_node_bake_delete_single", ob, mod)
+    obs["after_delete"] = bake_snapshot(mod)
+    samples.append(sample(ob, mod, ident, 1, "after_delete"))
+    obs["attribute_after_delete"] = mesh_attribute_sample(ob, "BakedX", 1)
+    return {
+        "samples": samples,
+        "observations": obs,
+        "files": [],
+        "notes": [
+            "The Bake item is marked as an attribute and is stored on the baked geometry.",
+            "The named attribute is sampled through Store Named Attribute downstream before and after delete.",
+        ],
+    }
+
+
+
+
+@scenario("S15_disk_pack_unpack_original", "Pack a disk Bake-node cache, reopen it, then unpack to its original path")
+def s15_disk_pack_unpack_original():
+    work = fresh_dir(WORK / "s15")
+    blend = work / "s15.blend"
+    ob, mod, ident = setup()
+    save(blend)
+    mod.bake_target = "DISK"
+    mod.bake_directory = "//s15_disk"
+    the_bake(mod).bake_mode = "ANIMATION"
+    run_bake("geometry_node_bake_single", ob, mod)
+    disk_root = work / "s15_disk"
+    obs = {"after_disk_bake": bake_snapshot(mod), "disk_tree_before_pack": walk(disk_root)}
+    samples = [sample(ob, mod, ident, t, "after_disk_bake") for t in FRAMES_CORE]
+
+    ob.animation_data_clear()
+    set_input(mod, ident, 100.0)
+    samples += [sample(ob, mod, ident, t, "after_input_change") for t in FRAMES_CORE]
+    run_bake("geometry_node_bake_pack_single", ob, mod)
+    obs["after_pack"] = bake_snapshot(mod)
+    obs["disk_tree_after_pack"] = walk(disk_root)
+    samples += [sample(ob, mod, ident, t, "after_pack") for t in FRAMES_CORE]
+    obs["input_change_equals_pack"] = {
+        str(t): positions_equal(pick(samples, t, "after_input_change"), pick(samples, t, "after_pack"))
+        for t in FRAMES_CORE
+    }
+
+    save(blend)
+    reopened = run_child(blend, "after_pack_reopen", FRAMES_CORE, "s15_packed")
+    samples += reopened["samples"]
+    obs["after_pack_reopen"] = reopened["bake"]
+    obs["pack_reopen_equals_pack"] = {
+        str(t): positions_equal(pick(samples, t, "after_pack"), pick(samples, t, "after_pack_reopen"))
+        for t in FRAMES_CORE
+    }
+
+    run_bake("geometry_node_bake_unpack_single", ob, mod, method="USE_ORIGINAL")
+    obs["after_unpack_original"] = bake_snapshot(mod)
+    obs["disk_tree_after_unpack"] = walk(disk_root)
+    samples += [sample(ob, mod, ident, t, "after_unpack_original") for t in FRAMES_CORE]
+    obs["unpack_equals_pack"] = {
+        str(t): positions_equal(pick(samples, t, "after_pack"), pick(samples, t, "after_unpack_original"))
+        for t in FRAMES_CORE
+    }
+    save(blend)
+    reopened = run_child(blend, "after_unpack_reopen", FRAMES_CORE, "s15_disk")
+    samples += reopened["samples"]
+    obs["after_unpack_reopen"] = reopened["bake"]
+    obs["unpack_reopen_equals_pack"] = {
+        str(t): positions_equal(pick(samples, t, "after_pack"), pick(samples, t, "after_unpack_reopen"))
+        for t in FRAMES_CORE
+    }
+
+    run_bake("geometry_node_bake_delete_single", ob, mod)
+    obs["after_delete"] = bake_snapshot(mod)
+    samples += [sample(ob, mod, ident, t, "after_delete") for t in FRAMES_CORE]
+    return {
+        "samples": samples,
+        "observations": obs,
+        "files": [str(blend)] + (walk(work) or []),
+        "notes": [
+            "Pack keeps the existing disk files and sets the node target to PACKED.",
+            "The packed state survives a fresh process and USE_ORIGINAL returns it to the original disk cache.",
+        ],
+    }
+
+
+@scenario("S16_packed_unpack_write_local", "Unpack a packed Bake-node cache to the current blend directory")
+def s16_packed_unpack_write_local():
+    work = fresh_dir(WORK / "s16")
+    blend = work / "s16.blend"
+    ob, mod, ident = setup()
+    save(blend)
+    mod.bake_target = "DISK"
+    mod.bake_directory = "//s16_original"
+    the_bake(mod).bake_mode = "ANIMATION"
+    run_bake("geometry_node_bake_single", ob, mod)
+    obs = {"after_disk_bake": bake_snapshot(mod)}
+    samples = [sample(ob, mod, ident, t, "after_disk_bake") for t in FRAMES_CORE]
+    run_bake("geometry_node_bake_pack_single", ob, mod)
+    obs["after_pack"] = bake_snapshot(mod)
+    obs["original_tree_after_pack"] = walk(work / "s16_original")
+
+    ob.animation_data_clear()
+    set_input(mod, ident, 100.0)
+    samples += [sample(ob, mod, ident, t, "after_pack_input_change") for t in FRAMES_CORE]
+    obs["input_change_equals_disk_bake"] = {
+        str(t): positions_equal(
+            pick(samples, t, "after_disk_bake"), pick(samples, t, "after_pack_input_change")
+        )
+        for t in FRAMES_CORE
+    }
+
+    local_root = work / "blendcache_s16" / "Cube_Nodes" / str(the_bake(mod).bake_id)
+    (local_root / "meta").mkdir(parents=True)
+    (local_root / "blobs").mkdir(parents=True)
+    (local_root / "meta" / "stale.json").write_text("stale")
+    (local_root / "blobs" / "stale.blob").write_bytes(b"stale")
+    run_bake("geometry_node_bake_unpack_single", ob, mod, method="WRITE_LOCAL")
+    obs["after_unpack_local"] = bake_snapshot(mod)
+    obs["local_tree_after_unpack"] = walk(local_root)
+    obs["original_tree_after_unpack"] = walk(work / "s16_original")
+    samples += [sample(ob, mod, ident, t, "after_unpack_local") for t in FRAMES_CORE]
+    obs["unpack_local_equals_disk_bake"] = {
+        str(t): positions_equal(pick(samples, t, "after_disk_bake"), pick(samples, t, "after_unpack_local"))
+        for t in FRAMES_CORE
+    }
+    obs["write_local_removed_stale_meta"] = not (local_root / "meta" / "stale.json").exists()
+
+    save(blend)
+    reopened = run_child(blend, "after_unpack_local_reopen", FRAMES_CORE, "s16_local")
+    samples += reopened["samples"]
+    obs["after_unpack_local_reopen"] = reopened["bake"]
+    obs["unpack_local_reopen_equals_before"] = {
+        str(t): positions_equal(
+            pick(samples, t, "after_unpack_local"), pick(samples, t, "after_unpack_local_reopen")
+        )
+        for t in FRAMES_CORE
+    }
+    run_bake("geometry_node_bake_delete_single", ob, mod)
+    obs["after_delete"] = bake_snapshot(mod)
+    samples += [sample(ob, mod, ident, t, "after_delete") for t in FRAMES_CORE]
+    return {
+        "samples": samples,
+        "observations": obs,
+        "files": [str(blend)] + (walk(work) or []),
+        "notes": [
+            "WRITE_LOCAL removes old metadata/blob cache directories, writes packed data to the current blend directory, and sets the node's custom path.",
+            "The unpacked disk cache survives save/reopen after the animated input is removed.",
+        ],
+    }
+
 
 SCENARIOS = [
     s1_unbaked,
@@ -699,6 +1040,12 @@ SCENARIOS = [
     s8_frame_range,
     s9_float_item,
     s10_topology_mix,
+    s11_disk_missing_frame,
+    s12_point_field_item,
+    s13_node_custom_disk_settings,
+    s14_point_attribute_item,
+    s15_disk_pack_unpack_original,
+    s16_packed_unpack_write_local,
 ]
 
 

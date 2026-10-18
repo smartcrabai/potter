@@ -172,6 +172,11 @@ impl SceneDoc {
                 "active_scene does not reference a scene",
             ));
         }
+        for resource in self.resources.values() {
+            if crate::model::migrate::inline_resource_kind(resource)? == Some("node_bake") {
+                crate::graph::validate_node_bake_resource(resource)?;
+            }
+        }
         for clip in self.movie_clips.values() {
             clip.validate()?;
         }

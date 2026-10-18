@@ -239,6 +239,12 @@ pub struct BakeArgs {
     pub node: Option<String>,
     #[arg(long, value_enum, help = "Node bake mode: still or animation.")]
     pub mode: Option<NodeBakeMode>,
+    #[arg(long, help = "Pack a node bake cache into the project.")]
+    pub pack: bool,
+    #[arg(long, help = "Unpack a packed node bake cache to disk.")]
+    pub unpack: bool,
+    #[arg(long, value_enum, requires = "unpack", help = "Unpack method: use-local, write-local, use-original, or write-original.")]
+    pub unpack_method: Option<NodeBakeUnpackMethod>,
     #[arg(long, help = "Delete a node bake and resume live evaluation.")]
     pub delete: bool,
     #[arg(long, help = "Frame range as start:end[:step].")]
@@ -364,6 +370,17 @@ pub enum BakeKind {
 pub enum NodeBakeMode {
     Still,
     Animation,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum NodeBakeUnpackMethod {
+    #[value(name = "use-local")]
+    UseLocal,
+    #[value(name = "write-local")]
+    WriteLocal,
+    #[value(name = "use-original")]
+    UseOriginal,
+    #[value(name = "write-original")]
+    WriteOriginal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
