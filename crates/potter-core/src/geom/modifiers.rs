@@ -166,7 +166,7 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
     }
     let mut instance_paths = Vec::new();
     let mut warnings = Vec::new();
-    for (modifier_index, modifier) in modifiers
+    for (_, modifier) in modifiers
         .iter()
         .enumerate()
         .filter(|&(modifier_index, modifier)| is_active(modifier_index, modifier))

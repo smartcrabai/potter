@@ -51,7 +51,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
-use glam::{DMat4, DVec3, Mat4};
+use glam::{DVec3, Mat4};
 use serde_json::{Map, Value, json};
 
 use crate::error::{PotError, Result};

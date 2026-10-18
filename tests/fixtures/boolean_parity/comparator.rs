@@ -345,7 +345,7 @@ fn user_attribute_name(storage_name: &str) -> &str {
     storage_name.strip_prefix("user:").unwrap_or(storage_name)
 }
 
-fn color_attribute(mesh: &Mesh, name: &str) -> Option<&Value> {
+fn color_attribute<'a>(mesh: &'a Mesh, name: &str) -> Option<&'a Value> {
     mesh.attributes
         .iter()
         .find_map(|(storage_name, attribute)| {
@@ -858,7 +858,7 @@ fn potter_canonical(
             None
         };
         let custom_normals = normals
-            .map(|values| values.into_iter().map(glam::DVec3::to_array).collect())
+            .map(|values| values.into_iter().map(|normal| normal.to_array()).collect())
             .or_else(|| {
                 derived_normal_rows.as_ref().map(|values| {
                     values[corner_offset..corner_offset + corner_count]
@@ -1037,7 +1037,7 @@ fn expected_faces(value: &Value) -> TestResult<Vec<CanonicalFace>> {
                 uv_layers,
                 point_attributes,
                 custom_normals: normals
-                    .map(|values| values.into_iter().map(glam::DVec3::to_array).collect()),
+                    .map(|values| values.into_iter().map(|normal| normal.to_array()).collect()),
                 face_attributes,
                 corner_attributes,
                 custom_normal_codes,
@@ -1194,7 +1194,7 @@ fn optional_layer_name(value: &Value, key: &str, owner: &str) -> TestResult<Opti
     } else {
         field
             .as_str()
-            .map(str::to_owned)
+            .map(|text| Some(text.to_owned()))
             .ok_or_else(|| format!("{owner} `{key}` is invalid").into())
     }
 }

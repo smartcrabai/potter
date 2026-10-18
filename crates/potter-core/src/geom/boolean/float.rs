@@ -540,7 +540,6 @@ fn joined_boolean_source(subject: &Mesh, operand: &Mesh) -> Result<Mesh> {
 }
 
 fn transfer_float_joined_defaults(subject: &Mesh, operand: &Mesh, source: &mut Mesh) {
-    let inputs = [subject, operand];
     let named: Vec<(String, String, String, Value)> = source
         .attributes
         .iter()
@@ -616,10 +615,11 @@ fn transfer_float_joined_defaults(subject: &Mesh, operand: &Mesh, source: &mut M
         let Some(data_type) = entry
             .get("data_type")
             .and_then(Value::as_str)
-            .map(blender_mixer_type)
+            .map(|value| blender_mixer_type(value).to_owned())
         else {
             continue;
         };
+        let data_type = data_type.as_str();
         let default = match data_type {
             "FLOAT_COLOR" | "BYTE_COLOR" => json!([1.0, 1.0, 1.0, 1.0]),
             "FLOAT4" => json!([0.0, 0.0, 0.0, 0.0]),
@@ -1434,7 +1434,6 @@ fn transfer_float_blender_uv_layers(
     else {
         return;
     };
-    let corner_starts = [corner_offsets(subject), corner_offsets(operand)];
     for output_layer in output_layers {
         let Some(name) = output_layer
             .get("name")
@@ -1445,7 +1444,7 @@ fn transfer_float_blender_uv_layers(
         };
         let mut values = Vec::new();
         for transfer in transfers {
-            let (slot, local_face, source_mesh) =
+            let (_, local_face, source_mesh) =
                 select_source_face(subject, operand, transfer.source_face);
             let source_layer = source_mesh
                 .attributes
@@ -1459,7 +1458,6 @@ fn transfer_float_blender_uv_layers(
             let row = source_layer
                 .and_then(|layer| layer.get("values"))
                 .and_then(Value::as_array);
-            let corner_start = corner_starts[slot][local_face];
             let source_values: Vec<Value> = (0..source_mesh.faces[local_face].vertices.len())
                 .map(|corner| {
                     row.and_then(|row| row.get(corner))
@@ -3957,7 +3955,7 @@ struct Bvh {
 
 impl Bvh {
     fn from_triangles(tris: &[Triangle], verts: &[Vertex], side: u8, pad: f32) -> Self {
-        let mut entries: Vec<usize> = tris
+        let entries: Vec<usize> = tris
             .iter()
             .enumerate()
             .filter_map(|(index, tri)| (tri.side == side).then_some(index))

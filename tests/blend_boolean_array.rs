@@ -228,7 +228,7 @@ fn surface_from_mesh(mesh: &Mesh, world: DMat4) -> TestResult<Surface> {
                     positions
                         .get(id)
                         .copied()
-                        .ok_or("Mesh face vertex is missing")
+                        .ok_or_else(|| "Mesh face vertex is missing".into())
                 })
                 .collect::<TestResult<Vec<_>>>()
         })

@@ -1586,6 +1586,7 @@ mod tests {
     use glam::DVec3;
     use serde_json::json;
 
+    use super::color_layers::ColorStore;
     use super::*;
 
     fn triangle() -> Mesh {
