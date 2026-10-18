@@ -19,6 +19,7 @@ use crate::{
     geom::{
         Mesh,
         bvh::{KdopTree, NearestHit, Ray, RayHit},
+        blender_matrix::blender_invert_m4,
         normals,
     },
     model::Modifier,
@@ -64,15 +65,6 @@ impl Cull {
 struct Space {
     subject_to_target: Mat,
     target_to_subject: Mat,
-}
-
-impl Space {
-    fn new(target_to_subject: DMat4) -> Self {
-        Self {
-            subject_to_target: to_mat(target_to_subject.inverse()),
-            target_to_subject: to_mat(target_to_subject),
-        }
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -185,11 +177,7 @@ pub(super) fn evaluate(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         return Ok(mesh.clone());
     }
 
-    let space = Space::new(matrix_from_runtime(
-        modifier.runtime.target_to_subject,
-        modifier,
-        "target",
-    )?);
+    let space = space_from_runtime(modifier.runtime.target_to_subject, modifier, "target")?;
     let offset = number_param(modifier, "offset")? as f32;
     let positions: Vec<Vec3> = mesh
         .vertices
@@ -287,11 +275,11 @@ pub(super) fn evaluate(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             let main = build_surface(target)?;
             let auxiliary =
                 auxiliary_surface(modifier.runtime.shrinkwrap_auxiliary_target_mesh.as_ref())?;
-            let auxiliary_space = Space::new(matrix_from_runtime(
+            let auxiliary_space = space_from_runtime(
                 modifier.runtime.auxiliary_target_to_subject,
                 modifier,
                 "auxiliary_target",
-            )?);
+            )?;
             let projection = Projection {
                 main: Target {
                     surface: &main,
@@ -330,20 +318,30 @@ pub(super) fn evaluate(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     Ok(result)
 }
 
-fn matrix_from_runtime(
+/// Blender's `BLI_SPACE_TRANSFORM_SETUP` in float: the object matrix is f32 and its inverse comes
+/// from `invert_m4` (`blender_invert_m4`), so both directions are built from one f32 matrix.
+fn space_from_runtime(
     matrix: Option<[f64; 16]>,
     modifier: &Modifier,
     parameter: &str,
-) -> Result<DMat4> {
-    let matrix = matrix.map_or(DMat4::IDENTITY, |matrix| DMat4::from_cols_array(&matrix));
-    if !matrix.is_finite() || !matrix.inverse().is_finite() {
-        return Err(invalid_parameter(
+) -> Result<Space> {
+    let target_to_subject = to_mat(matrix.map_or(DMat4::IDENTITY, |matrix| {
+        DMat4::from_cols_array(&matrix)
+    }));
+    let finite = |matrix: &Mat| matrix.iter().flatten().all(|value| value.is_finite());
+    match blender_invert_m4(&target_to_subject) {
+        Some(subject_to_target) if finite(&target_to_subject) && finite(&subject_to_target) => {
+            Ok(Space {
+                subject_to_target,
+                target_to_subject,
+            })
+        }
+        _ => Err(invalid_parameter(
             modifier,
             parameter,
             "a finite, invertible object transform",
-        ));
+        )),
     }
-    Ok(matrix)
 }
 
 fn wrap_mode(modifier: &Modifier) -> Result<WrapMode> {
@@ -445,11 +443,6 @@ fn build_surface(mesh: &Mesh) -> Result<Surface> {
         .enumerate()
         .map(|(index, vertex)| (vertex.id, index))
         .collect();
-    let position_by_id: HashMap<u32, DVec3> = mesh
-        .vertices
-        .iter()
-        .map(|vertex| (vertex.id, vertex.co))
-        .collect();
     let vertex_normals = to_vec3s(normals::geometric_vertex_normals(mesh, &points)?);
     let corner_normals = to_vec3s(normals::corner_normals(mesh, &points)?);
     let face_normals: Vec<Vec3> = mesh
@@ -470,13 +463,28 @@ fn build_surface(mesh: &Mesh) -> Result<Surface> {
 
     let (boundary, boundary_lookup) =
         boundary_edges(mesh, &index_by_id, &positions, &vertex_normals);
-    let mut tris = Vec::new();
+    let tessellation = mesh.tessellate().map_err(|error| {
+        PotError::invalid_argument(format!("invalid target triangulation: {error}"))
+    })?;
+    let expected: usize = mesh
+        .faces
+        .iter()
+        .map(|face| face.vertices.len().saturating_sub(2))
+        .sum();
+    if tessellation.len() != expected {
+        return Err(PotError::invalid_argument(
+            "target tessellation does not match its faces",
+        ));
+    }
+    let mut tri_index = 0;
+    let mut tris = Vec::with_capacity(tessellation.len());
     let mut corner_offset = 0;
     for (face_index, face) in mesh.faces.iter().enumerate() {
-        let triangles = crate::geom::triangulate_face(face, &position_by_id).map_err(|error| {
-            PotError::invalid_argument(format!("invalid target triangulation: {error}"))
-        })?;
-        for ids in triangles {
+        for _ in 0..face.vertices.len().saturating_sub(2) {
+            let ids = *tessellation.get(tri_index).ok_or_else(|| {
+                PotError::invalid_argument("target tessellation ended early")
+            })?;
+            tri_index += 1;
             let mut vertices = [0; 3];
             let mut corners = [0; 3];
             for (slot, id) in ids.into_iter().enumerate() {
