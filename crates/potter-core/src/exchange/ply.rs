@@ -45,7 +45,7 @@ pub(crate) fn export(meshes: &[ExchangeMesh]) -> Result<Vec<u8>> {
         } else {
             Vec::new()
         };
-        let colors = ply_vertex_colors(mesh)
+        let colors = ply_vertex_colors(mesh)?
             .map(|colors| colors.into_iter().map(ply_rgba).collect::<Vec<_>>());
         for &(position, uv) in &split.vertices {
             for value in mesh.positions[position] {
@@ -100,16 +100,15 @@ fn active_layer(mesh: &ExchangeMesh) -> Option<&ExchangeUvLayer> {
     mesh.uv_active.and_then(|index| mesh.uv_layers.get(index))
 }
 
-/// The active color layer as one value per vertex. Blender's PLY exporter reads colours only from
-/// the point domain (`lookup_or_default` on `AttrDomain::Point`, default zero), so a corner layer
-/// is written as zeros; `element_data_losses` reports that.
-fn ply_vertex_colors(mesh: &ExchangeMesh) -> Option<Vec<[f64; 4]>> {
-    let name = mesh.colors.active.as_deref()?;
-    let layer = mesh.colors.layers.iter().find(|layer| layer.name == name)?;
-    Some(match layer.domain {
-        ColorDomain::Point => layer.values.clone(),
-        ColorDomain::Corner => vec![[0.0; 4]; mesh.positions.len()],
-    })
+/// The active color layer adapted to one value per vertex, as Blender's point-domain lookup does.
+fn ply_vertex_colors(mesh: &ExchangeMesh) -> Result<Option<Vec<[f64; 4]>>> {
+    let Some(name) = mesh.colors.active.as_deref() else {
+        return Ok(None);
+    };
+    let Some(layer) = mesh.colors.layers.iter().find(|layer| layer.name == name) else {
+        return Ok(None);
+    };
+    super::point_color_values(mesh, layer).map(Some)
 }
 
 /// One mesh as PLY stores it. Without a UV layer the vertices are the positions. With the active
@@ -684,6 +683,7 @@ mod tests {
     use crate::{
         error::{ErrorCode, PotError, Result},
         exchange::{ExchangeMesh, ExchangeUvLayer},
+        geom::color_layers::{ColorDomain, ColorLayer, ColorStore},
     };
     use std::fs;
 
@@ -726,6 +726,50 @@ mod tests {
             .get(offset..offset + 4)
             .ok_or_else(|| PotError::new(ErrorCode::InternalError, "PLY test read out of range"))?;
         Ok(f32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
+    }
+
+    #[test]
+    fn averages_corner_colors_for_each_position_uv_split() -> Result<()> {
+        let mut mesh = quad_with_seam_uvs();
+        mesh.colors = ColorStore {
+            layers: vec![ColorLayer {
+                name: "Paint".to_owned(),
+                domain: ColorDomain::Corner,
+                values: vec![
+                    [0.0, 0.0, 0.0, 1.0],
+                    [1.0, 0.0, 0.0, 1.0],
+                    [0.0, 0.0, 0.0, 1.0],
+                    [0.0, 0.0, 0.0, 1.0],
+                    [0.0, 0.0, 1.0, 1.0],
+                    [0.0, 0.0, 0.0, 1.0],
+                ],
+            }],
+            active: Some("Paint".to_owned()),
+            render: Some("Paint".to_owned()),
+        };
+        let bytes = export(&[mesh])?;
+        let marker = b"end_header\n";
+        let header_end = bytes
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .ok_or_else(|| PotError::new(ErrorCode::InternalError, "PLY test has no header"))?
+            + marker.len();
+        let header = std::str::from_utf8(&bytes[..header_end])
+            .map_err(|error| PotError::new(ErrorCode::InternalError, error.to_string()))?;
+        assert!(header.contains("element vertex 6\n"), "{header}");
+        let mut shared_splits = 0;
+        for vertex in 0..6 {
+            let record = header_end + vertex * 24;
+            if read_f32(&bytes, record)? == 1.0
+                && read_f32(&bytes, record + 4)? == 0.0
+                && read_f32(&bytes, record + 8)? == 0.0
+            {
+                assert_eq!(&bytes[record + 12..record + 16], &[187, 0, 187, 255]);
+                shared_splits += 1;
+            }
+        }
+        assert_eq!(shared_splits, 2);
+        Ok(())
     }
 
     #[test]

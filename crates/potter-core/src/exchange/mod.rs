@@ -10,7 +10,7 @@ use crate::{
         Mesh, attribute_keys, color_layers,
         uv_layers::{self, UvLayer, UvStore},
     },
-    model::{DataBlock, Id, Node, SceneDoc, Transform},
+    model::{DataBlock, Id, Node, SceneDoc, Transform, VertexGroup},
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -94,6 +94,87 @@ pub(crate) struct ExchangeMesh {
 pub(crate) struct ExchangeVertexGroup {
     pub name: String,
     pub weights: Vec<(usize, f64)>,
+}
+
+/// Converts one canonical color layer to Blender's point-domain lookup result. Corner values are
+/// averaged over every incident face corner; vertices with no incident corners use zero RGBA.
+pub(super) fn point_color_values(
+    mesh: &ExchangeMesh,
+    layer: &color_layers::ColorLayer,
+) -> Result<Vec<[f64; 4]>> {
+    if layer
+        .values
+        .iter()
+        .flatten()
+        .any(|value| !value.is_finite())
+    {
+        return Err(PotError::new(
+            ErrorCode::SceneInvalid,
+            "color layer contains a non-finite value",
+        ));
+    }
+    match layer.domain {
+        color_layers::ColorDomain::Point => {
+            if layer.values.len() != mesh.positions.len() {
+                return Err(PotError::new(
+                    ErrorCode::SceneInvalid,
+                    "point color layer does not match vertex count",
+                ));
+            }
+            Ok(layer.values.clone())
+        }
+        color_layers::ColorDomain::Corner => {
+            let corner_count = mesh
+                .faces
+                .iter()
+                .try_fold(0_usize, |count, face| count.checked_add(face.len()));
+            let Some(corner_count) = corner_count else {
+                return Err(PotError::new(
+                    ErrorCode::LimitExceeded,
+                    "corner color layer size overflow",
+                ));
+            };
+            if layer.values.len() != corner_count {
+                return Err(PotError::new(
+                    ErrorCode::SceneInvalid,
+                    "corner color layer does not match face corners",
+                ));
+            }
+            let mut sums = vec![[0.0; 4]; mesh.positions.len()];
+            let mut counts = vec![0_usize; mesh.positions.len()];
+            let mut corner = 0;
+            for face in &mesh.faces {
+                for &vertex in face {
+                    let Some(sum) = sums.get_mut(vertex) else {
+                        return Err(PotError::new(
+                            ErrorCode::SceneInvalid,
+                            "face references a missing vertex",
+                        ));
+                    };
+                    for (sum, value) in sum.iter_mut().zip(layer.values[corner]) {
+                        *sum += value;
+                    }
+                    counts[vertex] += 1;
+                    corner += 1;
+                }
+            }
+            for (sum, count) in sums.iter_mut().zip(counts) {
+                if count != 0 {
+                    let count = u32::try_from(count).map_err(|_| {
+                        PotError::new(
+                            ErrorCode::LimitExceeded,
+                            "vertex corner count exceeds color average range",
+                        )
+                    })?;
+                    let divisor = f64::from(count);
+                    for value in sum {
+                        *value /= divisor;
+                    }
+                }
+            }
+            Ok(sums)
+        }
+    }
 }
 
 /// One UV layer of an exchange mesh.
@@ -345,6 +426,7 @@ pub(crate) fn evaluated_meshes(
         let uv_render = uv.render_index();
         let data = node.data.as_ref().and_then(|id| doc.data_blocks.get(id));
         let vertex_groups = data.map_or_else(Vec::new, |data| {
+            let weights = crate::eval::mesh_vertex_weights(source, &data.vertex_groups);
             data.vertex_groups
                 .iter()
                 .map(|group| ExchangeVertexGroup {
@@ -354,9 +436,9 @@ pub(crate) fn evaluated_meshes(
                         .iter()
                         .enumerate()
                         .filter_map(|(index, vertex)| {
-                            data.vertex_weights
+                            weights
                                 .get(&vertex.id)
-                                .and_then(|weights| weights.get(&group.id))
+                                .and_then(|by_group| by_group.get(&group.id))
                                 .map(|weight| (index, *weight))
                         })
                         .collect(),
@@ -493,6 +575,12 @@ pub(crate) fn element_data_losses(format: &str, meshes: &[ExchangeMesh]) -> Vec<
             .as_deref()
             .and_then(|name| mesh.colors.index_of(name));
         for (index, layer) in mesh.colors.layers.iter().enumerate() {
+            let point_values = if matches!(format, "obj" | "ply") && selected_color == Some(index) {
+                point_color_values(mesh, layer).ok()
+            } else {
+                None
+            };
+            let values = point_values.as_deref().unwrap_or(&layer.values);
             if format == "stl" {
                 losses.push(element_loss(
                     mesh,
@@ -530,17 +618,10 @@ pub(crate) fn element_data_losses(format: &str, meshes: &[ExchangeMesh]) -> Vec<
                     losses.push(element_loss(
                         mesh,
                         "mesh.color_attribute",
-                        if format == "ply" {
-                            format!(
-                                "PLY's exporter reads only point-domain colors; CORNER layer `{}` is written as zeros",
-                                layer.name
-                            )
-                        } else {
-                            format!(
-                                "{format} stores point colors; CORNER layer `{}` becomes point data",
-                                layer.name
-                            )
-                        },
+                        format!(
+                            "{format} averages CORNER layer `{}` to point colors; per-corner differences are lost",
+                            layer.name
+                        ),
                         "export as usda, usdc, fbx, or alembic to preserve the color domain",
                     ));
                 }
@@ -557,14 +638,13 @@ pub(crate) fn element_data_losses(format: &str, meshes: &[ExchangeMesh]) -> Vec<
                 }
             }
             if format == "ply" && selected_color == Some(index) {
-                let rgb_loss = layer.values.iter().any(|rgba| {
+                let rgb_loss = values.iter().any(|rgba| {
                     rgba[..3].iter().any(|value| {
                         let decoded = ply_channel_roundtrip(*value, false);
                         !decoded.is_finite() || (decoded - *value).abs() > 1.0e-6
                     })
                 });
-                let rgb_clipped = layer
-                    .values
+                let rgb_clipped = values
                     .iter()
                     .any(|rgba| rgba[..3].iter().any(|value| !(0.0..=1.0).contains(value)));
                 if rgb_loss {
@@ -586,7 +666,7 @@ pub(crate) fn element_data_losses(format: &str, meshes: &[ExchangeMesh]) -> Vec<
                         "export as usda, usdc, or fbx to preserve float color precision and HDR",
                     ));
                 }
-                let alpha_loss = layer.values.iter().any(|rgba| {
+                let alpha_loss = values.iter().any(|rgba| {
                     let decoded = ply_channel_roundtrip(rgba[3], true);
                     !decoded.is_finite() || (decoded - rgba[3]).abs() > 1.0e-6
                 });
@@ -602,19 +682,78 @@ pub(crate) fn element_data_losses(format: &str, meshes: &[ExchangeMesh]) -> Vec<
                     ));
                 }
             }
-            if format == "obj"
-                && selected_color == Some(index)
-                && layer.values.iter().any(|value| value[3] != 1.0)
-            {
-                losses.push(element_loss(
-                    mesh,
-                    "mesh.color_attribute",
-                    format!(
-                        "OBJ xyzrgb stores RGB only; non-opaque alpha in color layer `{}` is lost",
-                        layer.name
-                    ),
-                    "export as ply, usda, usdc, fbx, or alembic to preserve alpha",
-                ));
+            if matches!(format, "fbx" | "fbx-binary" | "alembic") {
+                let byte_precision_loss = layer.values.iter().any(|rgba| {
+                    rgba.iter().enumerate().any(|(channel, value)| {
+                        let decoded = byte_color_roundtrip(*value, channel == 3);
+                        !decoded.is_finite() || (decoded - *value).abs() > 1.0e-6
+                    })
+                });
+                if byte_precision_loss {
+                    losses.push(element_loss(
+                        mesh,
+                        "mesh.color_attribute",
+                        format!(
+                            "{format} stores color layer `{}` as Blender 8-bit BYTE_COLOR; channel precision is quantized",
+                            layer.name
+                        ),
+                        "export as usda or usdc to preserve float color precision",
+                    ));
+                }
+                if layer
+                    .values
+                    .iter()
+                    .flatten()
+                    .any(|value| !(0.0..=1.0).contains(value))
+                {
+                    losses.push(element_loss(
+                        mesh,
+                        "mesh.color_attribute",
+                        format!(
+                            "{format} clips color layer `{}` channels outside [0, 1] for Blender BYTE_COLOR",
+                            layer.name
+                        ),
+                        "export as usda or usdc to preserve HDR and out-of-range values",
+                    ));
+                }
+                if format == "alembic" && layer.domain == color_layers::ColorDomain::Point {
+                    losses.push(element_loss(
+                        mesh,
+                        "mesh.color_attribute",
+                        format!(
+                            "Blender imports Alembic POINT color layer `{}` as CORNER data",
+                            layer.name
+                        ),
+                        "export as blend, usda, usdc, or fbx to preserve the point domain",
+                    ));
+                }
+            }
+            if format == "obj" && selected_color == Some(index) {
+                if values.iter().any(|value| value[3] != 1.0) {
+                    losses.push(element_loss(
+                        mesh,
+                        "mesh.color_attribute",
+                        format!(
+                            "OBJ xyzrgb stores RGB only; non-opaque alpha in color layer `{}` is lost",
+                            layer.name
+                        ),
+                        "export as ply, usda, usdc, fbx, or alembic to preserve alpha",
+                    ));
+                }
+                if values
+                    .iter()
+                    .any(|value| value[..3].iter().any(|component| *component < 0.0))
+                {
+                    losses.push(element_loss(
+                        mesh,
+                        "mesh.color_attribute",
+                        format!(
+                            "OBJ clamps negative RGB components in color layer `{}` to zero",
+                            layer.name
+                        ),
+                        "export as usda, usdc, fbx, or alembic to preserve negative values",
+                    ));
+                }
             }
         }
         if format == "alembic"
@@ -626,7 +765,7 @@ pub(crate) fn element_data_losses(format: &str, meshes: &[ExchangeMesh]) -> Vec<
                 mesh,
                 "mesh.color_attribute",
                 format!(
-                    "Alembic preserves color-layer names and domains but imports active and render selections as the first layer `{first_name}`"
+                    "Alembic preserves color-layer names but imports active and render selections as the first layer `{first_name}`"
                 ),
                 "export as blend, usda, usdc, or fbx to preserve color-layer selections",
             ));
@@ -668,6 +807,44 @@ pub(crate) fn element_data_losses(format: &str, meshes: &[ExchangeMesh]) -> Vec<
                 ));
             }
         }
+        if format == "obj" {
+            let compatible = mesh
+                .vertex_groups
+                .iter()
+                .enumerate()
+                .filter(|(_, group)| obj_group_is_face_compatible(mesh, group))
+                .collect::<Vec<_>>();
+            let mut dropped = BTreeSet::new();
+            for face in &mesh.faces {
+                if face.len() < 3 {
+                    continue;
+                }
+                let mut matched = false;
+                for (group_index, group) in &compatible {
+                    if face
+                        .iter()
+                        .all(|vertex| group.weights.iter().any(|(index, _)| index == vertex))
+                    {
+                        if matched {
+                            dropped.insert(*group_index);
+                        } else {
+                            matched = true;
+                        }
+                    }
+                }
+            }
+            for group_index in dropped {
+                let name = &mesh.vertex_groups[group_index].name;
+                losses.push(element_loss(
+                    mesh,
+                    "mesh.vertex_group",
+                    format!(
+                        "OBJ writes one group per face; overlapping membership in vertex group `{name}` is not written"
+                    ),
+                    "export as usda or fbx to preserve overlapping vertex groups",
+                ));
+            }
+        }
     }
     losses
 }
@@ -690,7 +867,32 @@ pub(super) fn srgb_encode(value: f64) -> f64 {
 pub(super) fn srgb_decode(value: f64) -> f64 {
     crate::color::srgb_to_linear(value)
 }
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the input is clamped and rounded to Blender's 8-bit channel range"
+)]
+pub(super) fn blender_color_byte(value: f64) -> u8 {
+    (value.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
+}
 
+/// A canonical linear channel as Blender stores it in BYTE_COLOR interchange: encoded RGB, linear
+/// alpha, quantized to the nearest byte and normalized back to `[0, 1]`.
+pub(super) fn encode_byte_color(value: f64, alpha: bool) -> f64 {
+    let encoded = if alpha { value } else { srgb_encode(value) };
+    f64::from(blender_color_byte(encoded)) / 255.0
+}
+
+/// A normalized Blender BYTE_COLOR channel decoded to Potter's linear representation.
+pub(super) fn decode_byte_color(value: f64, alpha: bool) -> f64 {
+    let encoded = f64::from(blender_color_byte(value)) / 255.0;
+    if alpha { encoded } else { srgb_decode(encoded) }
+}
+
+/// The canonical linear value represented by one Blender BYTE_COLOR round-trip.
+pub(super) fn byte_color_roundtrip(value: f64, alpha: bool) -> f64 {
+    decode_byte_color(encode_byte_color(value, alpha), alpha)
+}
 /// PLY stores colours as bytes: RGB is sRGB-encoded, alpha is linear. Clamps to `[0, 1]`.
 #[expect(
     clippy::cast_possible_truncation,
@@ -718,7 +920,9 @@ pub(crate) fn obj_group_is_face_compatible(
     group: &ExchangeVertexGroup,
 ) -> bool {
     if group.weights.is_empty()
-        || group.name.chars().any(char::is_whitespace)
+        || group.name.trim() != group.name.as_str()
+        || group.name.contains('\n')
+        || group.name.contains('\r')
         || group.name.contains('#')
     {
         return false;
@@ -840,12 +1044,36 @@ pub(crate) fn graph_from_meshes(meshes: Vec<ExchangeMesh>, scene_id: String) -> 
             geometry.uv_active,
             geometry.uv_render,
         );
+        color_layers::write(&mut mesh, &geometry.colors);
+        let mut vertex_groups = Vec::with_capacity(geometry.vertex_groups.len());
+        let mut vertex_weights = BTreeMap::new();
+        for (group_index, exchange_group) in geometry.vertex_groups.iter().enumerate() {
+            let group_id = Id::new(format!("vertex_group_{group_index}"))?;
+            for &(vertex_index, weight) in &exchange_group.weights {
+                let vertex = mesh.vertices.get(vertex_index).ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::ImportFailed,
+                        "imported vertex group references a missing vertex",
+                    )
+                })?;
+                vertex_weights
+                    .entry(vertex.id)
+                    .or_insert_with(BTreeMap::new)
+                    .insert(group_id.clone(), weight);
+            }
+            vertex_groups.push(VertexGroup {
+                id: group_id,
+                name: exchange_group.name.clone(),
+            });
+        }
         doc.data_blocks.insert(
             data_id.clone(),
             DataBlock {
                 data_type: "mesh".to_owned(),
                 descriptor: None,
                 mesh: Some(mesh),
+                vertex_groups,
+                vertex_weights,
                 camera: None,
                 light: None,
                 ..DataBlock::default()
@@ -1135,7 +1363,8 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::{
-        mesh_attribute_losses,
+        ExchangeVertexGroup, byte_color_roundtrip, decode_byte_color, element_data_losses,
+        encode_byte_color, graph_from_meshes, mesh_attribute_losses, point_color_values,
         test_support::{triangle_with_attributes, triangle_with_layers},
         uv_layer_losses,
     };
@@ -1268,5 +1497,233 @@ mod tests {
                 .any(|loss| loss.reason.ends_with("mesh attribute `sharp`"))
         );
         Ok(())
+    }
+
+    #[test]
+    fn corner_colors_average_incident_corners_for_point_domain_writers() -> crate::error::Result<()>
+    {
+        use crate::geom::color_layers::{ColorDomain, ColorLayer};
+
+        let mut mesh = triangle_with_layers();
+        mesh.positions.push([1.0, 1.0, 0.0]);
+        mesh.positions.push([2.0, 2.0, 2.0]);
+        mesh.faces = vec![vec![0, 1, 2], vec![2, 1, 3]];
+        let layer = ColorLayer {
+            name: "paint".to_owned(),
+            domain: ColorDomain::Corner,
+            values: vec![
+                [0.0, 0.0, 1.0, 1.0],
+                [1.0, 0.0, 0.0, 1.0],
+                [0.0, 1.0, 0.0, 1.0],
+                [0.0, 0.0, 1.0, 1.0],
+                [0.0, 1.0, 0.0, 1.0],
+                [1.0, 0.0, 0.0, 1.0],
+            ],
+        };
+        let point = point_color_values(&mesh, &layer)?;
+        assert_eq!(point[1], [0.5, 0.5, 0.0, 1.0]);
+        assert_eq!(point[4], [0.0; 4]);
+        Ok(())
+    }
+
+    #[test]
+    fn imported_exchange_mesh_persists_colors_and_sparse_vertex_groups() -> crate::error::Result<()>
+    {
+        use crate::{
+            geom::color_layers::{self, ColorDomain, ColorLayer, ColorStore},
+            model::Id,
+        };
+
+        let mut exchange = triangle_with_layers();
+        let colors = ColorStore {
+            layers: vec![
+                ColorLayer {
+                    name: "PointPaint".to_owned(),
+                    domain: ColorDomain::Point,
+                    values: vec![[0.2, 0.3, 0.4, 0.5]; 3],
+                },
+                ColorLayer {
+                    name: "CornerPaint".to_owned(),
+                    domain: ColorDomain::Corner,
+                    values: vec![[0.7, 0.6, 0.5, 0.4]; 3],
+                },
+            ],
+            active: Some("PointPaint".to_owned()),
+            render: Some("CornerPaint".to_owned()),
+        };
+        exchange.colors = colors.clone();
+        exchange.vertex_groups = vec![ExchangeVertexGroup {
+            name: "Weights".to_owned(),
+            weights: vec![(0, 0.0), (2, 0.75)],
+        }];
+
+        let doc = graph_from_meshes(
+            vec![exchange],
+            "00000000-0000-4000-8000-000000000000".to_owned(),
+        )?;
+        let root = doc
+            .collections
+            .get(&Id::from_static("collection_root"))
+            .ok_or("root collection missing")?;
+        let node_id = root.objects.first().ok_or("imported node missing")?;
+        let node = doc.nodes.get(node_id).ok_or("imported node missing")?;
+        let data_id = node.data.as_ref().ok_or("imported mesh data missing")?;
+        let data = doc
+            .data_blocks
+            .get(data_id)
+            .ok_or("imported mesh data missing")?;
+        let mesh = data.mesh.as_ref().ok_or("imported mesh missing")?;
+        assert_eq!(color_layers::read(mesh), colors);
+        assert_eq!(data.vertex_groups.len(), 1);
+        assert_eq!(data.vertex_groups[0].name, "Weights");
+        let group_id = &data.vertex_groups[0].id;
+        assert_eq!(data.vertex_weights[&mesh.vertices[0].id][group_id], 0.0);
+        assert_eq!(data.vertex_weights[&mesh.vertices[2].id][group_id], 0.75);
+        assert!(!data.vertex_weights.contains_key(&mesh.vertices[1].id));
+        Ok(())
+    }
+
+    #[test]
+    fn evaluated_mesh_export_reads_mirror_propagated_vertex_weights() -> crate::error::Result<()> {
+        use std::collections::BTreeMap;
+
+        use crate::{
+            eval::{EvaluationContext, Snapshot},
+            geom::Mesh,
+            model::{DataBlock, Id, Modifier, Node, SceneDoc, VertexGroup},
+        };
+
+        let group_id = Id::new("weighted_group")?;
+        let data_id = Id::new("weighted_mesh")?;
+        let node_id = Id::new("mirrored_mesh")?;
+        let mesh = Mesh::from_positions_and_faces(
+            vec![
+                glam::DVec3::new(1.0, 0.0, 0.0),
+                glam::DVec3::new(2.0, 0.0, 0.0),
+                glam::DVec3::new(1.0, 1.0, 0.0),
+            ],
+            vec![vec![0, 1, 2]],
+        )
+        .map_err(|error| {
+            crate::error::PotError::new(crate::error::ErrorCode::InternalError, error.to_string())
+        })?;
+        let mut vertex_weights = BTreeMap::new();
+        for (vertex, weight) in mesh.vertices.iter().zip([0.0, 0.5, 1.0]) {
+            vertex_weights.insert(vertex.id, BTreeMap::from([(group_id.clone(), weight)]));
+        }
+        let modifier_params = serde_json::json!({
+            "use_axis": [true, false, false],
+            "use_mirror_merge": false,
+            "merge_threshold": 0.001
+        })
+        .as_object()
+        .cloned()
+        .ok_or("Mirror parameters are not an object")?;
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        doc.data_blocks.insert(
+            data_id.clone(),
+            DataBlock {
+                data_type: "mesh".to_owned(),
+                mesh: Some(mesh),
+                vertex_groups: vec![VertexGroup {
+                    id: group_id,
+                    name: "Weights".to_owned(),
+                }],
+                vertex_weights,
+                ..DataBlock::default()
+            },
+        );
+        doc.nodes.insert(
+            node_id.clone(),
+            Node {
+                name: "Mirror".to_owned(),
+                kind: "mesh".to_owned(),
+                data: Some(data_id),
+                modifiers: vec![Modifier {
+                    id: Id::new("mirror_modifier")?,
+                    modifier_type: "mirror".to_owned(),
+                    name: "Mirror".to_owned(),
+                    enabled: true,
+                    show_viewport: true,
+                    show_render: true,
+                    params: modifier_params,
+                    binding_data: None,
+                    runtime: Default::default(),
+                }],
+                ..Node::default()
+            },
+        );
+        doc.collections
+            .get_mut(&Id::from_static("collection_root"))
+            .ok_or("root collection missing")?
+            .objects
+            .push(node_id);
+        let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
+        let meshes = super::evaluated_meshes(&doc, &snapshot)?;
+        let weights = &meshes[0].vertex_groups[0].weights;
+        assert_eq!(meshes[0].positions.len(), 6);
+        assert_eq!(weights.len(), 6);
+        for expected in [0.0, 0.5, 1.0] {
+            assert_eq!(
+                weights.iter().filter(|entry| entry.1 == expected).count(),
+                2
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn blender_byte_color_roundtrip_encodes_rgb_and_alpha_differently() {
+        assert!((encode_byte_color(0.5, false) - 188.0 / 255.0).abs() < 1.0e-12);
+        assert!((encode_byte_color(0.5, true) - 128.0 / 255.0).abs() < 1.0e-12);
+        assert!((decode_byte_color(128.0 / 255.0, false) - 0.21586050011389926).abs() < 1.0e-12);
+        assert_eq!(decode_byte_color(128.0 / 255.0, true), 128.0 / 255.0);
+        assert!((byte_color_roundtrip(0.5, false) - 0.5028864580325687).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn byte_color_formats_report_quantization_clipping_and_alembic_domain_loss()
+    -> crate::error::Result<()> {
+        use crate::geom::color_layers::{ColorDomain, ColorLayer, ColorStore};
+
+        let mut mesh = triangle_with_layers();
+        mesh.colors = ColorStore {
+            layers: vec![ColorLayer {
+                name: "Paint".to_owned(),
+                domain: ColorDomain::Point,
+                values: vec![[-0.25, 0.5, 0.25, 0.5]; 3],
+            }],
+            active: Some("Paint".to_owned()),
+            render: Some("Paint".to_owned()),
+        };
+        let fbx = element_data_losses("fbx", &[mesh.clone()]);
+        assert!(fbx.iter().any(|loss| loss.reason.contains("quantized")));
+        assert!(fbx.iter().any(|loss| loss.reason.contains("clips")));
+        let alembic = element_data_losses("alembic", &[mesh]);
+        assert!(alembic.iter().any(|loss| loss.reason.contains("as CORNER")));
+        assert!(alembic.iter().any(|loss| loss.reason.contains("quantized")));
+        assert!(alembic.iter().any(|loss| loss.reason.contains("clips")));
+        Ok(())
+    }
+
+    #[test]
+    fn obj_validation_reports_overlapping_whole_face_groups() {
+        let mut mesh = triangle_with_layers();
+        mesh.vertex_groups = ["First", "Second"]
+            .into_iter()
+            .map(|name| ExchangeVertexGroup {
+                name: name.to_owned(),
+                weights: vec![(0, 1.0), (1, 1.0), (2, 1.0)],
+            })
+            .collect();
+        let losses = element_data_losses("obj", &[mesh]);
+        assert_eq!(
+            losses
+                .iter()
+                .filter(|loss| loss.reason.contains("overlapping membership"))
+                .count(),
+            1
+        );
+        assert!(losses.iter().any(|loss| loss.reason.contains("`Second`")));
     }
 }
