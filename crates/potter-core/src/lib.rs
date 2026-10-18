@@ -8,7 +8,6 @@
 )]
 
 mod blender_rng;
-pub(crate) mod cache_sequence;
 pub mod catalog;
 pub mod cli;
 pub mod color;

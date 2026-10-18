@@ -4,11 +4,6 @@
 //   source/blender/blenlib/intern/BLI_heap_simple.cc, SPDX-FileCopyrightText: 2013 Blender Authors,
 //   GPL-2.0-or-later.
 
-#![expect(
-    dead_code,
-    reason = "is_empty and top_value are used only by the nearest-point search, which has no caller until the shrinkwrap nearest callers land"
-)]
-
 /// Blender's `BLI_heapsimple` (`BLI_heap_simple.cc`): a binary min-heap. Insertion sifts up while the
 /// parent is larger; removal takes the root and sifts the last node down from the root. Equal keys
 /// therefore pop in the order these sift rules give, as in Blender.
@@ -20,16 +15,6 @@ impl<T: Copy> HeapSimple<T> {
     /// `BLI_heapsimple_new`.
     pub(crate) fn new() -> Self {
         Self { tree: Vec::new() }
-    }
-
-    /// `BLI_heapsimple_is_empty`.
-    pub(crate) fn is_empty(&self) -> bool {
-        self.tree.is_empty()
-    }
-
-    /// `BLI_heapsimple_top_value`: the smallest key. The heap must not be empty.
-    pub(crate) fn top_value(&self) -> f32 {
-        self.tree[0].0
     }
 
     /// `BLI_heapsimple_insert` (`heapsimple_up`).

@@ -6,15 +6,9 @@
 //! clamped to `FLT_EPSILON` (`BLI_kdopbvh.cc`). Leaves are inserted in order and built by
 //! `BLI_bvhtree_balance` (`non_recursive_bvh_div_nodes`, `split_leafs`, `partition_nth_element`,
 //! `get_largest_axis`). The ray cast is `dfs_raycast` with `BVH_RAYCAST_WATERTIGHT`
-//! (`fast_ray_nearest_hit`). The nearest-point search is `dfs_find_nearest_dfs` and, with
-//! `BVH_NEAREST_OPTIMAL_ORDER`, `heap_find_nearest_inner` over `BLI_heapsimple`. The tree knows
-//! nothing about its leaves: the caller tests each leaf index it is called back with.
-#![expect(
-    dead_code,
-    reason = "find_nearest and its traversal have no caller until the shrinkwrap nearest callers land"
-)]
+//! (`fast_ray_nearest_hit`). The tree knows nothing about its leaves: the caller tests each leaf
+//! index it is called back with.
 
-use crate::geom::heap_simple::HeapSimple;
 /// A point or direction in `f32`, as Blender stores them.
 pub(crate) type Vec3 = [f32; 3];
 
@@ -557,149 +551,6 @@ impl KdopTree {
                     }
                 }
             }
-        }
-    }
-
-    /// `BLI_bvhtree_find_nearest_ex`: the leaf nearest to `co`, searched from `nearest` (its `dist_sq`
-    /// bounds the search; `NearestHit::unbounded` for an open search). `callback` receives the leaf
-    /// index, the query point and the running nearest, and writes the leaf's nearest point into it.
-    /// `optimal_order` selects best-first search with a heap (`BVH_NEAREST_OPTIMAL_ORDER`) instead of
-    /// depth-first search. Returns the index of the nearest leaf, or -1.
-    pub(crate) fn find_nearest<F>(
-        &self,
-        co: Vec3,
-        nearest: &mut NearestHit,
-        callback: &mut F,
-        optimal_order: bool,
-    ) -> isize
-    where
-        F: FnMut(usize, Vec3, &mut NearestHit),
-    {
-        if let Some(root) = self.root {
-            let (root_dist_sq, _) = self.nearest_box(co, root);
-            if root_dist_sq < nearest.dist_sq {
-                if optimal_order {
-                    let mut heap = HeapSimple::new();
-                    self.heap_nearest_expand(co, root, &mut heap, nearest, callback);
-                    while !heap.is_empty() && heap.top_value() < nearest.dist_sq {
-                        let Some(node) = heap.pop_min() else {
-                            break;
-                        };
-                        self.heap_nearest_expand(co, node, &mut heap, nearest, callback);
-                    }
-                } else {
-                    self.dfs_nearest(co, root, nearest, callback);
-                }
-            }
-        }
-        nearest.index
-    }
-
-    /// `dfs_find_nearest_dfs`: prune children by their box distance, dive toward the query side of
-    /// each branch's split axis, and let the callback decide leaves.
-    fn dfs_nearest<F>(&self, co: Vec3, node: NodeRef, nearest: &mut NearestHit, callback: &mut F)
-    where
-        F: FnMut(usize, Vec3, &mut NearestHit),
-    {
-        match node {
-            NodeRef::Leaf(leaf) => callback(leaf, co, nearest),
-            NodeRef::Branch(branch) => {
-                let branch = self.branches[branch];
-                let children: Vec<NodeRef> = branch
-                    .children
-                    .iter()
-                    .take(branch.node_num)
-                    .flatten()
-                    .copied()
-                    .collect();
-                let Some(&first) = children.first() else {
-                    return;
-                };
-                let forward =
-                    co[branch.main_axis] <= self.node_bounds(first)[branch.main_axis * 2 + 1];
-                if forward {
-                    for &child in &children {
-                        if self.nearest_box(co, child).0 >= nearest.dist_sq {
-                            continue;
-                        }
-                        self.dfs_nearest(co, child, nearest, callback);
-                    }
-                } else {
-                    for &child in children.iter().rev() {
-                        if self.nearest_box(co, child).0 >= nearest.dist_sq {
-                            continue;
-                        }
-                        self.dfs_nearest(co, child, nearest, callback);
-                    }
-                }
-            }
-        }
-    }
-
-    /// `heap_find_nearest_inner`: a leaf goes to the callback; a branch queues each child closer than
-    /// the current nearest, keyed by its box distance.
-    fn heap_nearest_expand<F>(
-        &self,
-        co: Vec3,
-        node: NodeRef,
-        heap: &mut HeapSimple<NodeRef>,
-        nearest: &mut NearestHit,
-        callback: &mut F,
-    ) where
-        F: FnMut(usize, Vec3, &mut NearestHit),
-    {
-        match node {
-            NodeRef::Leaf(leaf) => callback(leaf, co, nearest),
-            NodeRef::Branch(branch) => {
-                let branch = self.branches[branch];
-                for &child in branch.children.iter().take(branch.node_num).flatten() {
-                    let dist_sq = self.nearest_box(co, child).0;
-                    if dist_sq < nearest.dist_sq {
-                        heap.insert(dist_sq, child);
-                    }
-                }
-            }
-        }
-    }
-
-    /// The bounds of a node: a leaf's box, or a branch's box over its leaves.
-    fn node_bounds(&self, node: NodeRef) -> [f32; 6] {
-        match node {
-            NodeRef::Leaf(leaf) => self.leaf_bv[leaf],
-            NodeRef::Branch(branch) => self.branches[branch].bv,
-        }
-    }
-
-    /// `calc_nearest_point_squared`: the squared distance from `co` to the node's box, and the box point
-    /// nearest to `co`. Each axis is clamped to the box slab, lower bound first, as Blender does.
-    fn nearest_box(&self, co: Vec3, node: NodeRef) -> (f32, Vec3) {
-        let bv = self.node_bounds(node);
-        let mut nearest = [0.0_f32; 3];
-        for axis in 0..3 {
-            let value = co[axis].max(bv[2 * axis]).min(bv[2 * axis + 1]);
-            nearest[axis] = value;
-        }
-        let offset = sub(co, nearest);
-        (dot(offset, offset), nearest)
-    }
-}
-
-/// Blender's `BVHTreeNearest`: the nearest leaf found so far, its nearest point, and the squared
-/// distance to it. `index` is -1 when no leaf has been accepted.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct NearestHit {
-    pub(crate) index: isize,
-    pub(crate) co: Vec3,
-    pub(crate) dist_sq: f32,
-}
-
-impl NearestHit {
-    /// The open search start: no leaf, infinite distance (`FLT_MAX`).
-    pub(crate) fn unbounded() -> Self {
-        Self {
-            index: -1,
-            co: [0.0; 3],
-            dist_sq: f32::MAX,
         }
     }
 }

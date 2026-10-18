@@ -299,15 +299,6 @@ enum ResolvedTextureKind {
     Legacy(LegacyTexture),
 }
 impl ResolvedTexture {
-    /// Wraps an in-memory image as a texture, sampled exactly like a document image without a
-    /// per-image sampler setting record.
-    #[must_use]
-    pub fn from_image(image: ImageData) -> Self {
-        Self {
-            resolved: ResolvedTextureKind::Image(image),
-        }
-    }
-
     pub(crate) fn source(&self) -> TextureSource<'_> {
         match &self.resolved {
             ResolvedTextureKind::Image(image) => TextureSource::Image(image),

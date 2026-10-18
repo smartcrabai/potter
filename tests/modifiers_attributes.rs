@@ -1,18 +1,12 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    error::Error,
-    fs,
-    path::Path,
-    process::Command,
-};
+use std::{collections::BTreeMap, error::Error, fs, path::Path, process::Command};
 
 use glam::{DMat4, DQuat, DVec3};
 use potter_core::{
     eval::{EvaluationContext, Snapshot},
     geom::{
-        Mesh, ResolvedTexture, edit,
+        Mesh, edit,
         modifiers::{
-            attributes::{AttributeLayerSelection, SceneOperand, evaluate_with_context},
+            attributes::{SceneOperand, evaluate_mesh_cache, evaluate_with_context},
             evaluate_modifiers,
         },
     },
@@ -73,58 +67,13 @@ fn weights(mesh: &Mesh, group: &str) -> Result<[f64; 2], Box<dyn Error>> {
     ])
 }
 
-fn scene_operand(mesh: Mesh, world: DMat4, camera: Option<CameraData>) -> SceneOperand {
+fn scene_operand(mesh: Mesh, local_to_subject: DMat4, camera: Option<CameraData>) -> SceneOperand {
     SceneOperand {
         mesh,
-        local_to_subject: None,
-        blender_matrices_f32: Some(
-            potter_core::geom::modifiers::attributes::SceneOperandMatricesF32 {
-                world: Some(world.to_cols_array().map(|value| value as f32)),
-                local_to_subject: None,
-                subject_to_local: None,
-            },
-        ),
+        local_to_subject,
         camera,
         armature: false,
-        object_scale: glam::DVec3::ONE,
-        selected_bones: std::collections::BTreeSet::new(),
-        deforming_bones: std::collections::BTreeSet::new(),
-        layer_selection: potter_core::geom::modifiers::attributes::AttributeLayerSelection::default(
-        ),
     }
-}
-
-fn scene_operand_with_space(
-    mesh: Mesh,
-    local_to_subject: [f32; 16],
-    subject_to_local: [f32; 16],
-    camera: Option<CameraData>,
-) -> SceneOperand {
-    SceneOperand {
-        mesh,
-        local_to_subject: None,
-        blender_matrices_f32: Some(
-            potter_core::geom::modifiers::attributes::SceneOperandMatricesF32 {
-                world: None,
-                local_to_subject: Some(local_to_subject),
-                subject_to_local: Some(subject_to_local),
-            },
-        ),
-        camera,
-        armature: false,
-        object_scale: glam::DVec3::ONE,
-        selected_bones: std::collections::BTreeSet::new(),
-        deforming_bones: std::collections::BTreeSet::new(),
-        layer_selection: potter_core::geom::modifiers::attributes::AttributeLayerSelection::default(
-        ),
-    }
-}
-
-fn scene_operand_with_identity_space(mesh: Mesh, camera: Option<CameraData>) -> SceneOperand {
-    const IDENTITY: [f32; 16] = [
-        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
-    ];
-    scene_operand_with_space(mesh, IDENTITY, IDENTITY, camera)
 }
 
 #[test]
@@ -145,7 +94,6 @@ fn vertex_weight_mix_applies_blender_operation_to_selected_vertices() -> Result<
                 "normalize":false
             }),
         )?],
-        "WeightedLine",
     )?;
     assert_eq!(weights(&result, "A")?, [0.75, 1.0]);
     Ok(())
@@ -173,7 +121,6 @@ fn vertex_weight_edit_supports_curve_mapping_and_threshold_removal() -> Result<(
                 "normalize":false
             }),
         )?],
-        "WeightedLine",
     )?;
     assert_eq!(weights(&result, "A")?, [0.0, 0.75]);
     Ok(())
@@ -189,7 +136,6 @@ fn weighted_normal_writes_unit_corner_normals() -> Result<(), Box<dyn Error>> {
             "weighted_normal",
             json!({"mode":"FACE_AREA","weight":50}),
         )?],
-        "WeightedNormalTriangle",
     )?;
     let evaluated = evaluated_face_normals(&result, "f0")?;
     let normals = evaluated
@@ -197,7 +143,13 @@ fn weighted_normal_writes_unit_corner_normals() -> Result<(), Box<dyn Error>> {
         .ok_or("custom corner normals missing")?;
     assert_eq!(normals.len(), 3);
     for normal in normals {
-        assert!((normal.length() - 1.0).abs() < 1.0e-12);
+        let values = normal.as_array().ok_or("normal must be a vector")?;
+        let length = values
+            .iter()
+            .map(|value| value.as_f64().unwrap_or_default().powi(2))
+            .sum::<f64>()
+            .sqrt();
+        assert!((length - 1.0).abs() < 1.0e-12);
     }
     Ok(())
 }
@@ -229,7 +181,6 @@ fn uv_warp_preserves_unknown_attributes_and_updates_named_uv_layer() -> Result<(
                 "uv_layer":"UVMap"
             }),
         )?],
-        "UVWarpTriangle",
     )?;
     assert_eq!(result.attributes["marker"], json!(true));
     assert_eq!(
@@ -260,7 +211,6 @@ fn uv_warp_empty_layer_writes_the_active_layer() -> Result<(), Box<dyn Error>> {
             "uv_warp",
             json!({"center":[0.0,0.0],"offset":[0.25,-0.5],"uv_layer":""}),
         )?],
-        "UVWarpMultipleLayers",
     )?;
     let layers = &result.attributes["uv_layers"]["layers"];
     assert_eq!(
@@ -284,7 +234,6 @@ fn uv_warp_empty_layer_on_mesh_without_layers_creates_uvmap() -> Result<(), Box<
             "uv_warp",
             json!({"center":[0.0,0.0],"offset":[0.25,-0.5],"uv_layer":""}),
         )?],
-        "UVWarpWithoutLayers",
     )?;
     assert_eq!(result.attributes["uv_layers"]["active"], json!("UVMap"));
     assert_eq!(result.attributes["uv_layers"]["render"], json!("UVMap"));
@@ -311,11 +260,8 @@ fn uv_warp_named_layer_the_mesh_lacks_is_an_error() -> Result<(), Box<dyn Error>
             "render": "UVMap"
         }),
     );
-    let Err(error) = evaluate_modifiers(
-        &mesh,
-        &[modifier("uv_warp", json!({"uv_layer":"Nope"}))?],
-        "UVWarpMissingLayer",
-    ) else {
+    let Err(error) = evaluate_modifiers(&mesh, &[modifier("uv_warp", json!({"uv_layer":"Nope"}))?])
+    else {
         return Err("a named layer the mesh lacks must be an error".into());
     };
     assert_eq!(error.code, potter_core::error::ErrorCode::InvalidArgument);
@@ -333,7 +279,6 @@ fn attribute_modifiers_do_not_mutate_the_source_mesh() -> Result<(), Box<dyn Err
             "vertex_weight_mix",
             json!({"vertex_group_a":"A","vertex_group_b":"B","mix_mode":"SUB","normalize":false}),
         )?],
-        "WeightedLine",
     )?;
     assert_ne!(result, source);
     assert_eq!(source, original);
@@ -364,15 +309,7 @@ fn proximity_modifier_uses_target_object_distance_and_assigns_vertex_weights()
             "normalize":false
         }),
     )?;
-    let result = evaluate_with_context(
-        &mesh,
-        &proximity,
-        &operands,
-        None,
-        DMat4::IDENTITY,
-        "WeightedLine",
-        &AttributeLayerSelection::default(),
-    )?;
+    let result = evaluate_with_context(&mesh, &proximity, &operands, None, DMat4::IDENTITY)?;
     assert_eq!(weights(&result, "A")?, [0.5, 0.5]);
     Ok(())
 }
@@ -384,14 +321,9 @@ fn normal_edit_writes_target_radial_split_normals() -> Result<(), Box<dyn Error>
     let mut operands = BTreeMap::new();
     operands.insert(
         "target".to_owned(),
-        vec![scene_operand_with_space(
+        vec![scene_operand(
             Mesh::default(),
-            [
-                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 2.0, 0.0, 0.0, 1.0,
-            ],
-            [
-                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, -2.0, 0.0, 0.0, 1.0,
-            ],
+            DMat4::from_translation(DVec3::new(2.0, 0.0, 0.0)),
             None,
         )],
     );
@@ -405,15 +337,7 @@ fn normal_edit_writes_target_radial_split_normals() -> Result<(), Box<dyn Error>
             "mix_limit":std::f64::consts::PI
         }),
     )?;
-    let result = evaluate_with_context(
-        &mesh,
-        &edit,
-        &operands,
-        None,
-        DMat4::IDENTITY,
-        "NormalEditTriangle",
-        &AttributeLayerSelection::default(),
-    )?;
+    let result = evaluate_with_context(&mesh, &edit, &operands, None, DMat4::IDENTITY)?;
     let evaluated = evaluated_face_normals(&result, "f0")?;
     let normal = evaluated[0].as_array().ok_or("custom normal missing")?;
     let tolerance = exchange_normals::normal_tolerance(true);
@@ -457,15 +381,7 @@ fn uv_project_uses_camera_projection_and_writes_corner_uvs() -> Result<(), Box<d
             "uv_layer":"UVMap"
         }),
     )?;
-    let result = evaluate_with_context(
-        &mesh,
-        &projection,
-        &operands,
-        None,
-        DMat4::IDENTITY,
-        "UVProjectQuad",
-        &AttributeLayerSelection::default(),
-    )?;
+    let result = evaluate_with_context(&mesh, &projection, &operands, None, DMat4::IDENTITY)?;
     let uv = result.attributes["uv_layers"]["layers"][0]["faces"][0]["uv"][0]
         .as_array()
         .ok_or("projected UV missing")?;
@@ -485,7 +401,7 @@ fn data_transfer_topology_replaces_vertex_group_weights() -> Result<(), Box<dyn 
     let mut operands = BTreeMap::new();
     operands.insert(
         "object".to_owned(),
-        vec![scene_operand_with_identity_space(source, None)],
+        vec![scene_operand(source, DMat4::IDENTITY, None)],
     );
     let transfer = modifier(
         "data_transfer",
@@ -499,15 +415,7 @@ fn data_transfer_topology_replaces_vertex_group_weights() -> Result<(), Box<dyn 
             "mix_factor":1.0
         }),
     )?;
-    let result = evaluate_with_context(
-        &destination,
-        &transfer,
-        &operands,
-        None,
-        DMat4::IDENTITY,
-        "TransferDestination",
-        &AttributeLayerSelection::default(),
-    )?;
+    let result = evaluate_with_context(&destination, &transfer, &operands, None, DMat4::IDENTITY)?;
     let transferred = weights(&result, "A")?;
     assert!((transferred[0] - 0.9).abs() < 1.0e-12);
     assert!((transferred[1] - 0.1).abs() < 1.0e-12);
@@ -515,7 +423,209 @@ fn data_transfer_topology_replaces_vertex_group_weights() -> Result<(), Box<dyn 
 }
 
 #[test]
-fn cli_applies_image_texture_mask_and_unknown_texture_fails() -> Result<(), Box<dyn Error>> {
+fn mesh_cache_mdd_interpolates_resource_frames() -> Result<(), Box<dyn Error>> {
+    let mut mesh = Mesh::from_positions_and_faces(vec![DVec3::ZERO], vec![])?;
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&2_i32.to_be_bytes());
+    bytes.extend_from_slice(&1_i32.to_be_bytes());
+    bytes.extend_from_slice(&0.0_f32.to_be_bytes());
+    bytes.extend_from_slice(&1.0_f32.to_be_bytes());
+    for x in [0.0_f32, 2.0] {
+        bytes.extend_from_slice(&x.to_be_bytes());
+        bytes.extend_from_slice(&0.0_f32.to_be_bytes());
+        bytes.extend_from_slice(&0.0_f32.to_be_bytes());
+    }
+    let cache = modifier(
+        "mesh_cache",
+        json!({
+            "resource":"cache",
+            "cache_format":"MDD",
+            "play_mode":"CUSTOM",
+            "time_mode":"TIME",
+            "eval_time":0.5,
+            "interpolation":"LINEAR",
+            "deform_mode":"OVERWRITE",
+            "factor":1.0
+        }),
+    )?;
+    evaluate_mesh_cache(&mut mesh, &cache, 1.0, 24, 1.0, &bytes)?;
+    assert!((mesh.vertices[0].co.x - 1.0).abs() < 1.0e-12);
+    Ok(())
+}
+
+#[test]
+fn vertex_weight_edit_blends_with_image_mask_channel() -> Result<(), Box<dyn Error>> {
+    let source = weighted_line()?;
+    let image = ImageData {
+        width: 1,
+        height: 1,
+        pixels: vec![[0.0, 0.0, 0.0, 1.0]],
+        tiles: BTreeMap::new(),
+        interpolation: ImageInterpolation::Closest,
+    };
+    let edit = modifier(
+        "vertex_weight_edit",
+        json!({
+            "vertex_group":"A",
+            "falloff_type":"SHARP",
+            "normalize":false,
+            "mask_texture":"mask_image",
+            "mask_tex_use_channel":"RED",
+            "mask_tex_mapping":"LOCAL"
+        }),
+    )?;
+    let result = evaluate_with_context(
+        &source,
+        &edit,
+        &BTreeMap::new(),
+        Some(&image),
+        DMat4::IDENTITY,
+    )?;
+    assert_eq!(weights(&result, "A")?, [0.25, 0.75]);
+    Ok(())
+}
+
+#[test]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "PC2 test data stores inspected f64 positions as f32 samples"
+)]
+fn cli_applies_resource_backed_mesh_cache_and_inspects_interpolated_positions()
+-> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let root = directory.path();
+    let scene = root.join("scene");
+    let operations_path = root.join("operations.json");
+    let initialized = Command::new(env!("CARGO_BIN_EXE_pot"))
+        .args(["init"])
+        .arg(&scene)
+        .arg("--json")
+        .output()?;
+    assert!(
+        initialized.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initialized.stdout)
+    );
+
+    fs::write(
+        &operations_path,
+        serde_json::to_vec(&json!({
+            "schema_version":1,
+            "base_revision":0,
+            "operations":[{"op":"node.create","id":"body","kind":"plane","params":{}}]
+        }))?,
+    )?;
+    let applied = Command::new(env!("CARGO_BIN_EXE_pot"))
+        .args(["apply"])
+        .arg(&scene)
+        .args(["--file"])
+        .arg(&operations_path)
+        .arg("--json")
+        .output()?;
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stdout)
+    );
+
+    let original = Command::new(env!("CARGO_BIN_EXE_pot"))
+        .args(["inspect"])
+        .arg(&scene)
+        .args(["--id", "body", "--json"])
+        .output()?;
+    assert!(
+        original.status.success(),
+        "{}",
+        String::from_utf8_lossy(&original.stdout)
+    );
+    let original: Value = serde_json::from_slice(&original.stdout)?;
+    let positions = original["result"]["items"][0]["evaluated_geometry"]["positions"]
+        .as_array()
+        .ok_or("plane positions missing from pot inspect")?;
+
+    let cache_path = root.join("plane.pc2");
+    let mut cache = b"POINTCACHE2\0".to_vec();
+    cache.extend_from_slice(&1_i32.to_le_bytes());
+    cache.extend_from_slice(&i32::try_from(positions.len())?.to_le_bytes());
+    cache.extend_from_slice(&1.0_f32.to_le_bytes());
+    cache.extend_from_slice(&1.0_f32.to_le_bytes());
+    cache.extend_from_slice(&2_i32.to_le_bytes());
+    for frame_offset in [0.0_f64, 2.0] {
+        for position in positions {
+            let components = position.as_array().ok_or("position is not a vector")?;
+            for component in components {
+                let position = component
+                    .as_f64()
+                    .ok_or("position component is not numeric")?;
+                cache.extend_from_slice(&((position + frame_offset) as f32).to_le_bytes());
+            }
+        }
+    }
+    fs::write(&cache_path, cache)?;
+
+    fs::write(
+        &operations_path,
+        serde_json::to_vec(&json!({
+            "schema_version":1,
+            "base_revision":1,
+            "operations":[
+                {"op":"resource.pack","id":"plane_cache","uri":cache_path.to_string_lossy(),"kind":"mesh_cache"},
+                {"op":"modifier.create","target":{"id":"body"},"id":"cache_modifier","type":"mesh_cache","params":{
+                    "resource":"plane_cache","cache_format":"PC2","play_mode":"SCENE",
+                    "time_mode":"FRAME","frame_start":0.0,"frame_scale":1.0,
+                    "interpolation":"LINEAR","deform_mode":"OVERWRITE","factor":1.0
+                }}
+            ]
+        }))?,
+    )?;
+    let applied = Command::new(env!("CARGO_BIN_EXE_pot"))
+        .args(["apply"])
+        .arg(&scene)
+        .args(["--file"])
+        .arg(&operations_path)
+        .arg("--json")
+        .output()?;
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stdout)
+    );
+
+    let inspected = Command::new(env!("CARGO_BIN_EXE_pot"))
+        .args(["inspect"])
+        .arg(&scene)
+        .args(["--id", "body", "--frame", "1.5", "--json"])
+        .output()?;
+    assert!(
+        inspected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inspected.stdout)
+    );
+    let inspected: Value = serde_json::from_slice(&inspected.stdout)?;
+    let actual = inspected["result"]["items"][0]["evaluated_geometry"]["positions"]
+        .as_array()
+        .ok_or("evaluated positions missing from pot inspect")?;
+    assert_eq!(actual.len(), positions.len());
+    for (expected, actual) in positions.iter().zip(actual) {
+        for (expected, actual) in expected
+            .as_array()
+            .ok_or("expected position is not a vector")?
+            .iter()
+            .zip(actual.as_array().ok_or("actual position is not a vector")?)
+        {
+            let expected = expected
+                .as_f64()
+                .ok_or("expected component is not numeric")?
+                + 1.0;
+            let actual = actual.as_f64().ok_or("actual component is not numeric")?;
+            assert!((actual - expected).abs() < 1.0e-5);
+        }
+    }
+    Ok(())
+}
+#[test]
+fn cli_applies_image_texture_mask_and_procedural_masks_are_typed_unsupported()
+-> Result<(), Box<dyn Error>> {
     let directory = tempdir()?;
     let scene = directory.path().join("scene");
     let operations_path = directory.path().join("mask-operations.json");
@@ -560,8 +670,12 @@ fn cli_applies_image_texture_mask_and_unknown_texture_fails() -> Result<(), Box<
     let scene_path = scene.join("scene.json");
     let serialized = fs::read(&scene_path)?;
     let doc: SceneDoc = serde_json::from_slice(&serialized)?;
-    let snapshot =
-        Snapshot::evaluate_with_cache(&doc, &EvaluationContext::default(), Some(&scene), None)?;
+    let snapshot = Snapshot::evaluate_with_cache(
+        &doc,
+        &EvaluationContext::default(),
+        Some(&scene),
+        Some(&scene.join(".potter/cache")),
+    )?;
     let body = snapshot
         .meshes
         .get(&potter_core::model::Id::new("body")?)
@@ -577,11 +691,14 @@ fn cli_applies_image_texture_mask_and_unknown_texture_fails() -> Result<(), Box<
         &procedural_scene,
         &EvaluationContext::default(),
         Some(&scene),
-        None,
+        Some(&scene.join(".potter/cache")),
     )
     .err()
-    .ok_or("unknown texture ID unexpectedly resolved")?;
-    assert_eq!(error.code, potter_core::error::ErrorCode::TargetNotFound);
+    .ok_or("procedural texture mask unexpectedly evaluated")?;
+    assert_eq!(
+        error.details["feature_id"],
+        json!("modifier.vertex_weight_edit.texture_type")
+    );
     Ok(())
 }
 
@@ -601,6 +718,49 @@ fn vertex_weights(mesh: &Mesh, group: &str) -> Result<Vec<f64>, Box<dyn Error>> 
                 .unwrap_or(0.0))
         })
         .collect()
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    reason = "cache fixtures serialize four finite mesh coordinates as f32"
+)]
+fn pc2_cache(samples: &[[DVec3; 4]; 2]) -> Vec<u8> {
+    let mut bytes = b"POINTCACHE2\0".to_vec();
+    bytes.extend_from_slice(&1_i32.to_le_bytes());
+    bytes.extend_from_slice(&(samples[0].len() as i32).to_le_bytes());
+    bytes.extend_from_slice(&0.0_f32.to_le_bytes());
+    bytes.extend_from_slice(&1.0_f32.to_le_bytes());
+    bytes.extend_from_slice(&(samples.len() as i32).to_le_bytes());
+    for sample in samples {
+        for point in sample {
+            for component in [point.x, point.y, point.z] {
+                bytes.extend_from_slice(&(component as f32).to_le_bytes());
+            }
+        }
+    }
+    bytes
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    reason = "cache fixtures serialize four finite mesh coordinates as f32"
+)]
+fn mdd_cache(samples: &[[DVec3; 4]; 2]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&(samples.len() as i32).to_be_bytes());
+    bytes.extend_from_slice(&(samples[0].len() as i32).to_be_bytes());
+    bytes.extend_from_slice(&0.0_f32.to_be_bytes());
+    bytes.extend_from_slice(&1.0_f32.to_be_bytes());
+    for sample in samples {
+        for point in sample {
+            for component in [point.x, point.y, point.z] {
+                bytes.extend_from_slice(&(component as f32).to_be_bytes());
+            }
+        }
+    }
+    bytes
 }
 
 fn flatten_numbers(value: &Value, output: &mut Vec<f64>) -> Result<(), Box<dyn Error>> {
@@ -670,6 +830,45 @@ fn assert_wrong_candidate_fails(
         "{label} fixture does not distinguish its plausible wrong implementation: {error}"
     );
     Ok(())
+}
+
+fn rigid_translation_candidate(
+    baseline: &Value,
+    expected: &Value,
+) -> Result<Value, Box<dyn Error>> {
+    let baseline = baseline
+        .as_array()
+        .ok_or("cache baseline is not an array")?;
+    let expected = expected.as_array().ok_or("cache result is not an array")?;
+    assert_eq!(
+        baseline.len(),
+        expected.len(),
+        "cache vertex correspondence"
+    );
+    let point = |value: &Value| -> Result<DVec3, Box<dyn Error>> {
+        let coordinates = value.as_array().ok_or("cache position is not an array")?;
+        Ok(DVec3::new(
+            coordinates
+                .first()
+                .and_then(Value::as_f64)
+                .ok_or("missing x coordinate")?,
+            coordinates
+                .get(1)
+                .and_then(Value::as_f64)
+                .ok_or("missing y coordinate")?,
+            coordinates
+                .get(2)
+                .and_then(Value::as_f64)
+                .ok_or("missing z coordinate")?,
+        ))
+    };
+    let translation = point(expected.first().ok_or("cache result has no vertices")?)?
+        - point(baseline.first().ok_or("cache baseline has no vertices")?)?;
+    let translated = baseline
+        .iter()
+        .map(|position| Ok((point(position)? + translation).to_array()))
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    Ok(json!(translated))
 }
 
 fn assert_normal_stimulus(
@@ -779,6 +978,12 @@ def read_weights(obj, group_name):
                     value = assignment.weight
                     break
         values.append(value)
+    evaluated.to_mesh_clear()
+    return values
+
+def read_positions(obj):
+    evaluated, mesh = evaluated_mesh(obj)
+    values = [list(vertex.co) for vertex in mesh.vertices]
     evaluated.to_mesh_clear()
     return values
 
@@ -1240,6 +1445,59 @@ for mapping in ("LOCAL", "GLOBAL", "OBJECT", "UV"):
         modifier.mask_tex_map_object = mask_object
     result["texture_mask_" + mapping.lower()] = read_weights(mask_obj, "A")
 
+for cache_format, filename, time_mode in (
+    ("PC2", "quad.pc2", "FRAME"),
+    ("MDD", "quad.mdd", "TIME"),
+):
+    cache_obj = make_object("Cache" + cache_format, quad_vertices, [(0, 1, 2, 3)])
+    result["baseline_mesh_cache_" + cache_format.lower()] = read_positions(cache_obj)
+    modifier = cache_obj.modifiers.new("Cache", "MESH_CACHE")
+    modifier.cache_format = cache_format
+    modifier.filepath = os.path.join(root, filename)
+    modifier.play_mode = "CUSTOM"
+    modifier.time_mode = time_mode
+    modifier.interpolation = "LINEAR"
+    modifier.deform_mode = "OVERWRITE"
+    modifier.factor = 1.0
+    if cache_format == "PC2":
+        modifier.frame_start = 0.0
+        modifier.frame_scale = 1.0
+        modifier.forward_axis = "POS_X"
+        modifier.up_axis = "POS_Z"
+        result["mesh_cache_pc2"] = {}
+        for evaluation_frame in (0.25, 0.75):
+            modifier.eval_frame = evaluation_frame
+            result["mesh_cache_pc2"][str(evaluation_frame)] = read_positions(cache_obj)
+    else:
+        result["mesh_cache_mdd"] = {}
+        for evaluation_time in (0.25, 0.75):
+            modifier.eval_time = evaluation_time
+            result["mesh_cache_mdd"][str(evaluation_time)] = read_positions(cache_obj)
+
+for cache_format, time_mode, evaluation, filename, result_key in (
+    ("PC2", "TIME", 0.4, "quad.pc2", "mesh_cache_integrate_time"),
+    ("MDD", "FACTOR", 0.35, "quad.mdd", "mesh_cache_integrate_factor"),
+):
+    cache_obj = make_object("CacheIntegrate" + time_mode, quad_vertices, [(0, 1, 2, 3)])
+    add_group(cache_obj, "A", [0.1, 0.4, 0.7, 1.0])
+    result["baseline_" + result_key] = read_positions(cache_obj)
+    modifier = cache_obj.modifiers.new("CacheIntegrate", "MESH_CACHE")
+    modifier.cache_format = cache_format
+    modifier.filepath = os.path.join(root, filename)
+    modifier.play_mode = "CUSTOM"
+    modifier.time_mode = time_mode
+    modifier.interpolation = "LINEAR"
+    modifier.deform_mode = "INTEGRATE"
+    modifier.vertex_group = "A"
+    modifier.factor = 0.8
+    modifier.forward_axis = "POS_X"
+    modifier.up_axis = "POS_Z"
+    if time_mode == "TIME":
+        modifier.eval_time = evaluation
+    else:
+        modifier.eval_factor = evaluation
+    result[result_key] = read_positions(cache_obj)
+
 with open(os.path.join(root, "expected.json"), "w", encoding="utf-8") as stream:
     json.dump(result, stream)
 "#;
@@ -1305,19 +1563,14 @@ fn blender_quantize_loop_normals(
                 .collect::<Result<Vec<_>, _>>()
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let sharp_values = mesh
-        .attributes
-        .get("sharp")
-        .and_then(|attribute| attribute.get("values"))
-        .and_then(Value::as_object);
     let sharp_edges = mesh
         .edges
         .iter()
         .filter(|edge| {
-            sharp_values
-                .and_then(|values| values.get(&format!("e{}", edge.id)))
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
+            mesh.attributes
+                .get("sharp_edges")
+                .and_then(Value::as_array)
+                .is_some_and(|ids| ids.iter().any(|id| id.as_u64() == Some(u64::from(edge.id))))
         })
         .map(|edge| {
             edge.vertices
@@ -1369,7 +1622,8 @@ fn blender_quantize_loop_normals(
     )?)?)
 }
 #[test]
-fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
+fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
+-> Result<(), Box<dyn Error>> {
     let Some(blender) = blender_executable() else {
         eprintln!("skipping modifier Blender parity test: Blender is unavailable");
         return Ok(());
@@ -1377,6 +1631,26 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
     let directory = tempdir()?;
     let root = fs::canonicalize(directory.path())?;
     let quad = quad_mesh_for_parity()?;
+    let cache_samples = [
+        [
+            DVec3::new(0.2, 0.1, 0.4),
+            DVec3::new(1.2, -0.2, 0.7),
+            DVec3::new(0.6, 1.1, -0.5),
+            DVec3::new(-0.4, 0.8, 1.4),
+        ],
+        [
+            DVec3::new(0.8, -0.3, 0.2),
+            DVec3::new(1.6, 0.6, -0.1),
+            DVec3::new(1.5, 0.2, 0.9),
+            DVec3::new(-0.2, 1.7, 0.3),
+        ],
+    ];
+    let pc2_path = root.join("quad.pc2");
+    let mdd_path = root.join("quad.mdd");
+    let pc2 = pc2_cache(&cache_samples);
+    let mdd = mdd_cache(&cache_samples);
+    fs::write(&pc2_path, &pc2)?;
+    fs::write(&mdd_path, &mdd)?;
     let script_path = root.join("modifier_parity.py");
     fs::write(&script_path, BLENDER_MODIFIER_PARITY_SCRIPT)?;
     let output = Command::new(&blender)
@@ -1409,7 +1683,6 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
             "vertex_weight_edit",
             json!({"vertex_group":"A","falloff_type":"SHARP","normalize":false}),
         )?],
-        "Edit",
     )?;
     assert_material_change(
         "vertex_weight_edit",
@@ -1430,7 +1703,6 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
             "vertex_weight_mix",
             json!({"vertex_group_a":"A","vertex_group_b":"B","mix_mode":"ADD","mix_set":"ALL","normalize":false}),
         )?],
-        "Mix",
     )?;
     assert_material_change(
         "vertex_weight_mix",
@@ -1460,7 +1732,6 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
                 "vertex_weight_edit",
                 json!({"vertex_group":"A","falloff_type":falloff,"normalize":false}),
             )?],
-            &format!("EditFalloff{falloff}"),
         )?;
         let actual = json!(vertex_weights(&falloff_result, "A")?);
         if falloff != "LINEAR" {
@@ -1492,7 +1763,6 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
                     "mix_mode":mix_mode,"mix_set":"ALL","normalize":false
                 }),
             )?],
-            &format!("MixMode{mix_mode}"),
         )?;
         let actual = json!(vertex_weights(&mix_result, "A")?);
         assert_material_change(
@@ -1514,37 +1784,15 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         DQuat::IDENTITY,
         DVec3::new(2.0, -1.0, 0.0),
     );
+    let proximity_target_world = DMat4::from_translation(DVec3::new(3.5, -1.0, 0.0));
     let mut proximity_operands = BTreeMap::new();
     proximity_operands.insert(
         "target".to_owned(),
-        // Exact f32 inverse(subject world) times target world for these fixture transforms.
-        vec![SceneOperand {
-            mesh: Mesh::default(),
-            local_to_subject: None,
-            blender_matrices_f32: Some(
-                potter_core::geom::modifiers::attributes::SceneOperandMatricesF32 {
-                    world: Some([
-                        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 3.5, -1.0, 0.0,
-                        1.0,
-                    ]),
-                    local_to_subject: Some([
-                        0.5, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.75, 0.0, 0.0,
-                        1.0,
-                    ]),
-                    subject_to_local: Some([
-                        2.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, -1.5, 0.0, 0.0,
-                        1.0,
-                    ]),
-                },
-            ),
-            camera: None,
-            armature: false,
-            object_scale: DVec3::ONE,
-            selected_bones: BTreeSet::new(),
-            deforming_bones: BTreeSet::new(),
-            layer_selection:
-                potter_core::geom::modifiers::attributes::AttributeLayerSelection::default(),
-        }],
+        vec![scene_operand(
+            Mesh::default(),
+            proximity_subject_world.inverse() * proximity_target_world,
+            None,
+        )],
     );
     let proximity = modifier(
         "vertex_weight_proximity",
@@ -1556,8 +1804,6 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         &proximity_operands,
         None,
         proximity_subject_world,
-        "Proximity",
-        &AttributeLayerSelection::default(),
     )?;
     assert_material_change(
         "vertex_weight_proximity OBJECT",
@@ -1581,8 +1827,9 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
     let mut geometry_operands = BTreeMap::new();
     geometry_operands.insert(
         "target".to_owned(),
-        vec![scene_operand_with_identity_space(
+        vec![scene_operand(
             Mesh::from_positions_and_faces(vec![DVec3::ZERO], vec![])?,
+            DMat4::IDENTITY,
             None,
         )],
     );
@@ -1596,8 +1843,6 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         &geometry_operands,
         None,
         DMat4::IDENTITY,
-        "Proximity",
-        &AttributeLayerSelection::default(),
     )?;
     assert_material_change(
         "vertex_weight_proximity GEOMETRY/VERTEX",
@@ -1636,16 +1881,7 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
     let mut proximity_surface_operands = BTreeMap::new();
     proximity_surface_operands.insert(
         "target".to_owned(),
-        vec![scene_operand_with_space(
-            proximity_surface_mesh,
-            [
-                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
-            ],
-            [
-                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
-            ],
-            None,
-        )],
+        vec![scene_operand(proximity_surface_mesh, DMat4::IDENTITY, None)],
     );
     for geometry in ["EDGE", "FACE"] {
         for falloff in [
@@ -1670,8 +1906,6 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
                 &proximity_surface_operands,
                 None,
                 DMat4::IDENTITY,
-                &format!("Proximity{geometry}{falloff}"),
-                &AttributeLayerSelection::default(),
             )?;
             let key = format!("{geometry}_{falloff}");
             let label = format!("vertex_weight_proximity GEOMETRY/{geometry} {falloff}");
@@ -1697,7 +1931,6 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
             "weighted_normal",
             json!({"mode":"FACE_AREA","weight":50,"keep_sharp":false}),
         )?],
-        "Weighted",
     )?;
     let weighted_corners = blender_quantize_loop_normals(
         &blender,
@@ -1725,7 +1958,6 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
             "weighted_normal",
             json!({"mode":"FACE_AREA","weight":50,"keep_sharp":true}),
         )?],
-        "WeightedSharp",
     )?;
     assert_normal_stimulus(
         "weighted_normal keep_sharp",
@@ -1756,7 +1988,6 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
             "weighted_normal",
             json!({"mode":"FACE_AREA","weight":50,"keep_sharp":false,"use_face_influence":true}),
         )?],
-        "WeightedFaceInfluence",
     )?;
     assert_normal_stimulus(
         "weighted_normal use_face_influence",
@@ -1779,14 +2010,9 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
     let mut normal_operands = BTreeMap::new();
     normal_operands.insert(
         "target".to_owned(),
-        vec![scene_operand_with_space(
+        vec![scene_operand(
             Mesh::default(),
-            [
-                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 2.0, 0.0, 0.0, 1.0,
-            ],
-            [
-                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, -2.0, 0.0, 0.0, 1.0,
-            ],
+            DMat4::from_translation(DVec3::new(2.0, 0.0, 0.0)),
             None,
         )],
     );
@@ -1794,15 +2020,8 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         "normal_edit",
         json!({"mode":"RADIAL","target":"target","mix_mode":"COPY","mix_factor":1.0,"mix_limit":std::f64::consts::PI,"use_direction_parallel":false}),
     )?;
-    let normals = evaluate_with_context(
-        &quad,
-        &normal_edit,
-        &normal_operands,
-        None,
-        DMat4::IDENTITY,
-        "Normal",
-        &AttributeLayerSelection::default(),
-    )?;
+    let normals =
+        evaluate_with_context(&quad, &normal_edit, &normal_operands, None, DMat4::IDENTITY)?;
     assert_normal_stimulus(
         "normal_edit RADIAL/COPY",
         &expected["baseline_normal_edit"],
@@ -1816,19 +2035,11 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         1.0e-4,
     )?;
 
+    let directional_target = DMat4::from_translation(DVec3::new(2.0, -1.0, 0.0));
     let mut directional_operands = BTreeMap::new();
     directional_operands.insert(
         "target".to_owned(),
-        vec![scene_operand_with_space(
-            Mesh::default(),
-            [
-                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 2.0, -1.0, 0.0, 1.0,
-            ],
-            [
-                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, -2.0, 1.0, 0.0, 1.0,
-            ],
-            None,
-        )],
+        vec![scene_operand(Mesh::default(), directional_target, None)],
     );
     let directional = modifier(
         "normal_edit",
@@ -1840,8 +2051,6 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         &directional_operands,
         None,
         DMat4::IDENTITY,
-        "DirectionalNormal",
-        &AttributeLayerSelection::default(),
     )?;
     assert_normal_stimulus(
         "normal_edit DIRECTIONAL/ADD",
@@ -1887,8 +2096,6 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         &projectors,
         None,
         DMat4::IDENTITY,
-        "Project",
-        &AttributeLayerSelection::default(),
     )?;
     let projected_uvs = json!([
         flip_v(&projected.attributes["uv_layers"]["layers"][0]["faces"][0]["uv"]),
@@ -1938,8 +2145,6 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         )]),
         None,
         DMat4::IDENTITY,
-        "ProjectOrtho",
-        &AttributeLayerSelection::default(),
     )?;
     let orthographic_uvs = json!([
         flip_v(&orthographic.attributes["uv_layers"]["layers"][0]["faces"][0]["uv"]),
@@ -1983,8 +2188,6 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         )]),
         None,
         DMat4::IDENTITY,
-        "ProjectOrthoClamped",
-        &AttributeLayerSelection::default(),
     )?;
     let orthographic_clamped_uvs = json!([
         flip_v(&orthographic_clamped.attributes["uv_layers"]["layers"][0]["faces"][0]["uv"]),
@@ -2009,7 +2212,6 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
             "uv_warp",
             json!({"center":[0.5,0.5],"axis_u":"X","axis_v":"Y","offset":[0.25,-0.5],"scale":[1.25,0.75],"rotation":0.35,"uv_layer":"UVMap"}),
         )?],
-        "Warp",
     )?;
     assert_material_change(
         "uv_warp scale/rotation",
@@ -2061,8 +2263,6 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         &warp_operands,
         None,
         DMat4::IDENTITY,
-        "WarpTransform",
-        &AttributeLayerSelection::default(),
     )?;
     assert_material_change(
         "uv_warp object transforms and vertex group",
@@ -2076,6 +2276,7 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         &expected["uv_warp_transforms"],
         1.0e-5,
     )?;
+
     let mut source = quad.clone();
     source.attributes.insert(
         "vertex_groups".to_owned(),
@@ -2089,7 +2290,7 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
     let mut source_operands = BTreeMap::new();
     source_operands.insert(
         "object".to_owned(),
-        vec![scene_operand_with_identity_space(source, None)],
+        vec![scene_operand(source, DMat4::IDENTITY, None)],
     );
     let transferred = evaluate_with_context(
         &destination,
@@ -2100,8 +2301,6 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         &source_operands,
         None,
         DMat4::IDENTITY,
-        "TransferDest",
-        &AttributeLayerSelection::default(),
     )?;
     assert_material_change(
         "data_transfer VGROUP_WEIGHTS/TOPOLOGY",
@@ -2140,8 +2339,9 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         let mut point_operands = BTreeMap::new();
         point_operands.insert(
             "object".to_owned(),
-            vec![scene_operand_with_identity_space(
+            vec![scene_operand(
                 interpolation_source.clone(),
+                DMat4::IDENTITY,
                 None,
             )],
         );
@@ -2158,8 +2358,6 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
             &point_operands,
             None,
             DMat4::IDENTITY,
-            &format!("Point{key}"),
-            &AttributeLayerSelection::default(),
         )?;
         assert_material_change(
             &format!("data_transfer VGROUP_WEIGHTS/{mapping}"),
@@ -2189,10 +2387,6 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         "uv_seam".to_owned(),
         json!({"domain":"edge","type":"bool","values":{"e0":false,"e1":true,"e2":false,"e3":false}}),
     );
-    let sharp = edge_boolean_attribute(&domain_source, &[2]);
-    domain_source.attributes.insert("sharp".to_owned(), sharp);
-    let seam = edge_boolean_attribute(&domain_source, &[1]);
-    domain_source.attributes.insert("seam".to_owned(), seam);
     domain_source.attributes.insert(
         "crease_edge".to_owned(),
         json!({"domain":"edge","type":"float","values":{"e0":0.75,"e1":0.0,"e2":0.0,"e3":0.0}}),
@@ -2214,7 +2408,7 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         json!({"layers":["color"],"active":"color","render":"color"}),
     );
     domain_source.attributes.insert(
-        "shade_smooth".to_owned(),
+        "smooth".to_owned(),
         json!({"domain":"face","type":"bool","values":{"f0":true}}),
     );
     domain_source.attributes.insert(
@@ -2224,7 +2418,7 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
     let mut domain_operands = BTreeMap::new();
     domain_operands.insert(
         "object".to_owned(),
-        vec![scene_operand_with_identity_space(domain_source, None)],
+        vec![scene_operand(domain_source, DMat4::IDENTITY, None)],
     );
     let domain_transfer = modifier(
         "data_transfer",
@@ -2245,8 +2439,6 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         &domain_operands,
         None,
         DMat4::IDENTITY,
-        "DomainDest",
-        &AttributeLayerSelection::default(),
     )?;
     let domain_values = transfer_domain_values(&domains)?;
     assert_material_change(
@@ -2267,7 +2459,229 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         &expected["data_transfer_domains"],
         1.0e-4,
     )?;
+    let image = ImageData {
+        width: 2,
+        height: 2,
+        pixels: vec![
+            [0.0, 0.0, 0.0, 1.0],
+            [0.25, 0.25, 0.25, 1.0],
+            [0.6, 0.6, 0.6, 1.0],
+            [1.0, 1.0, 1.0, 1.0],
+        ],
+        tiles: BTreeMap::new(),
+        interpolation: ImageInterpolation::Closest,
+    };
+    let subject_world = DMat4::from_scale_rotation_translation(
+        DVec3::new(0.8, 0.7, 1.0),
+        DQuat::from_rotation_z(0.2),
+        DVec3::new(0.25, -0.25, 0.0),
+    );
+    let map_object_world = DMat4::from_scale_rotation_translation(
+        DVec3::new(1.5, 0.75, 1.0),
+        DQuat::from_rotation_z(std::f64::consts::FRAC_PI_4),
+        DVec3::new(0.75, 0.25, 0.0),
+    );
+    for mapping in ["LOCAL", "GLOBAL", "OBJECT", "UV"] {
+        let mut mask_mesh = quad.clone();
+        if mapping == "UV" {
+            // Blender's V-up values, stored V-down.
+            mask_mesh.attributes.insert(
+                "uv_layers".to_owned(),
+                uv_layers_attribute(&json!([{
+                    "face_id":0,
+                    "uv":flip_v(&json!([[0.13,0.17],[0.73,0.24],[0.84,0.81],[0.2,0.69]]))
+                }])),
+            );
+        }
+        let mut operands = BTreeMap::new();
+        if mapping == "OBJECT" {
+            operands.insert(
+                "mask_tex_map_object".to_owned(),
+                vec![scene_operand(
+                    Mesh::default(),
+                    subject_world.inverse() * map_object_world,
+                    None,
+                )],
+            );
+        }
+        let mask_modifier = modifier(
+            "vertex_weight_edit",
+            json!({
+                "vertex_group":"A","falloff_type":"SHARP","normalize":false,
+                "mask_texture":"image_mask","mask_tex_use_channel":"RED",
+                "mask_tex_mapping":mapping,"mask_tex_uv_layer":"UVMap",
+                "mask_tex_map_object":"mask_object"
+            }),
+        )?;
+        let masked = evaluate_with_context(
+            &mask_mesh,
+            &mask_modifier,
+            &operands,
+            Some(&image),
+            subject_world,
+        )?;
+        let key = format!("texture_mask_{}", mapping.to_lowercase());
+        let baseline_key = format!("baseline_{key}");
+        assert_material_change(
+            &format!("image mask mapping {mapping}"),
+            &expected[&baseline_key],
+            &expected[&key],
+            1.0e-5,
+        )?;
+        assert_parity(
+            &format!("image mask mapping {mapping}"),
+            &json!(vertex_weights(&masked, "A")?),
+            &expected[&key],
+            1.0e-5,
+        )?;
+    }
 
+    for evaluation_frame in [0.25, 0.75] {
+        let mut pc2_mesh = quad.clone();
+        let pc2_modifier = modifier(
+            "mesh_cache",
+            json!({
+                "resource":"pc2",
+                "cache_format":"PC2",
+                "play_mode":"CUSTOM",
+                "time_mode":"FRAME",
+                "frame_start":0.0,
+                "frame_scale":1.0,
+                "eval_frame":evaluation_frame,
+                "forward_axis":"POS_X",
+                "up_axis":"POS_Z",
+                "interpolation":"LINEAR",
+                "deform_mode":"OVERWRITE",
+                "factor":1.0
+            }),
+        )?;
+        evaluate_mesh_cache(
+            &mut pc2_mesh,
+            &pc2_modifier,
+            evaluation_frame,
+            24,
+            1.0,
+            &pc2,
+        )?;
+        let key = format!("{evaluation_frame:.2}");
+        let expected_positions = expected["mesh_cache_pc2"]
+            .get(&key)
+            .ok_or("PC2 sample missing")?;
+        assert_material_change(
+            &format!("mesh_cache PC2 frame {evaluation_frame}"),
+            &expected["baseline_mesh_cache_pc2"],
+            expected_positions,
+            1.0e-5,
+        )?;
+        assert_wrong_candidate_fails(
+            &format!("mesh_cache PC2 non-rigid deformation at {evaluation_frame}"),
+            expected_positions,
+            &rigid_translation_candidate(&expected["baseline_mesh_cache_pc2"], expected_positions)?,
+            1.0e-5,
+        )?;
+        assert_parity(
+            &format!("mesh_cache PC2 interpolated frame {evaluation_frame}"),
+            &json!(
+                pc2_mesh
+                    .vertices
+                    .iter()
+                    .map(|vertex| vertex.co.to_array())
+                    .collect::<Vec<_>>()
+            ),
+            expected_positions,
+            1.0e-5,
+        )?;
+    }
+
+    for evaluation_time in [0.25, 0.75] {
+        let mut mdd_mesh = quad.clone();
+        let mdd_modifier = modifier(
+            "mesh_cache",
+            json!({
+                "resource":"mdd",
+                "cache_format":"MDD",
+                "play_mode":"CUSTOM",
+                "time_mode":"TIME",
+                "eval_time":evaluation_time,
+                "interpolation":"LINEAR",
+                "deform_mode":"OVERWRITE",
+                "factor":1.0
+            }),
+        )?;
+        evaluate_mesh_cache(&mut mdd_mesh, &mdd_modifier, 1.0, 24, 1.0, &mdd)?;
+        let key = format!("{evaluation_time:.2}");
+        let expected_positions = expected["mesh_cache_mdd"]
+            .get(&key)
+            .ok_or("MDD sample missing")?;
+        assert_material_change(
+            &format!("mesh_cache MDD time {evaluation_time}"),
+            &expected["baseline_mesh_cache_mdd"],
+            expected_positions,
+            1.0e-5,
+        )?;
+        assert_wrong_candidate_fails(
+            &format!("mesh_cache MDD non-rigid deformation at {evaluation_time}"),
+            expected_positions,
+            &rigid_translation_candidate(&expected["baseline_mesh_cache_mdd"], expected_positions)?,
+            1.0e-5,
+        )?;
+        assert_parity(
+            &format!("mesh_cache MDD interpolated time {evaluation_time}"),
+            &json!(
+                mdd_mesh
+                    .vertices
+                    .iter()
+                    .map(|vertex| vertex.co.to_array())
+                    .collect::<Vec<_>>()
+            ),
+            expected_positions,
+            1.0e-5,
+        )?;
+    }
+
+    for (cache_format, time_mode, evaluation, bytes, key) in [
+        ("PC2", "TIME", 0.4, &pc2, "mesh_cache_integrate_time"),
+        ("MDD", "FACTOR", 0.35, &mdd, "mesh_cache_integrate_factor"),
+    ] {
+        let mut integrated_mesh = quad.clone();
+        integrated_mesh.attributes.insert(
+            "vertex_groups".to_owned(),
+            json!({"A":{"v0":0.1,"v1":0.4,"v2":0.7,"v3":1.0}}),
+        );
+        let cache_modifier = modifier(
+            "mesh_cache",
+            json!({
+                "resource":cache_format.to_lowercase(),
+                "cache_format":cache_format,
+                "play_mode":"CUSTOM",
+                "time_mode":time_mode,
+                "eval_time":evaluation,
+                "eval_factor":evaluation,
+                "interpolation":"LINEAR",
+                "deform_mode":"INTEGRATE",
+                "vertex_group":"A",
+                "factor":0.8,
+                "forward_axis":"POS_X",
+                "up_axis":"POS_Z"
+            }),
+        )?;
+        evaluate_mesh_cache(&mut integrated_mesh, &cache_modifier, 1.0, 24, 1.0, bytes)?;
+        let actual = json!(
+            integrated_mesh
+                .vertices
+                .iter()
+                .map(|vertex| vertex.co.to_array())
+                .collect::<Vec<_>>()
+        );
+        let label = format!("mesh_cache INTEGRATE {cache_format} {time_mode}");
+        assert_material_change(
+            &label,
+            &expected[&format!("baseline_{key}")],
+            &expected[key],
+            1.0e-5,
+        )?;
+        assert_parity(&label, &actual, &expected[key], 1.0e-5)?;
+    }
     Ok(())
 }
 
@@ -2338,17 +2752,16 @@ fn weighted_normal_mesh(sharp_edge: bool) -> Result<Mesh, Box<dyn Error>> {
     )?;
     mesh.faces[2].material_index = 1;
     if sharp_edge {
-        let edge_id = mesh
+        let edge = mesh
             .edges
             .iter()
             .find(|edge| {
                 (edge.vertices[0] == 0 && edge.vertices[1] == 2)
                     || (edge.vertices[0] == 2 && edge.vertices[1] == 0)
             })
-            .map(|edge| edge.id)
             .ok_or("weighted-normal sharp edge missing")?;
-        let sharp = edge_boolean_attribute(&mesh, &[edge_id]);
-        mesh.attributes.insert("sharp".to_owned(), sharp);
+        mesh.attributes
+            .insert("sharp_edges".to_owned(), json!([edge.id]));
     }
     Ok(mesh)
 }
@@ -2399,20 +2812,6 @@ fn uv_project_mesh_for_parity() -> Result<Mesh, Box<dyn Error>> {
     Ok(mesh)
 }
 
-fn edge_boolean_attribute(mesh: &Mesh, selected_ids: &[u32]) -> Value {
-    let values = mesh
-        .edges
-        .iter()
-        .map(|edge| {
-            (
-                format!("e{}", edge.id),
-                Value::Bool(selected_ids.contains(&edge.id)),
-            )
-        })
-        .collect::<serde_json::Map<_, _>>();
-    json!({"domain":"edge","type":"bool","values":values})
-}
-
 /// The evaluated corner vectors of `mesh` in flattened face order, as JSON. The stored custom normals are
 /// `normal_code` pairs, which are not vectors, so they decode through the public evaluator first.
 fn corner_normal_vectors_json(mesh: &Mesh) -> Result<Value, Box<dyn Error>> {
@@ -2447,10 +2846,6 @@ fn transfer_domain_destination_mesh() -> Result<Mesh, Box<dyn Error>> {
         "uv_seam".to_owned(),
         json!({"domain":"edge","type":"bool","values":{"e0":false,"e1":false,"e2":false,"e3":false,"e4":false}}),
     );
-    let sharp = edge_boolean_attribute(&mesh, &[]);
-    let seam = edge_boolean_attribute(&mesh, &[]);
-    mesh.attributes.insert("sharp".to_owned(), sharp);
-    mesh.attributes.insert("seam".to_owned(), seam);
     mesh.attributes.insert(
         "crease_edge".to_owned(),
         json!({"domain":"edge","type":"float","values":{"e0":0.0,"e1":0.0,"e2":0.0,"e3":0.0,"e4":0.0}}),
@@ -2467,7 +2862,7 @@ fn transfer_domain_destination_mesh() -> Result<Mesh, Box<dyn Error>> {
         }),
     )?;
     mesh.attributes.insert(
-        "shade_smooth".to_owned(),
+        "smooth".to_owned(),
         json!({"domain":"face","type":"bool","values":{"f0":false,"f1":false}}),
     );
     mesh.attributes.insert(
@@ -2478,14 +2873,22 @@ fn transfer_domain_destination_mesh() -> Result<Mesh, Box<dyn Error>> {
 }
 
 fn transfer_domain_values(mesh: &Mesh) -> Result<Value, Box<dyn Error>> {
+    let sharp_ids = mesh
+        .attributes
+        .get("sharp_edges")
+        .and_then(Value::as_array)
+        .ok_or("sharp edge attribute missing")?
+        .iter()
+        .filter_map(Value::as_u64)
+        .filter_map(|id| u32::try_from(id).ok())
+        .collect::<std::collections::BTreeSet<_>>();
     let edge_attributes = |name: &str| {
         mesh.attributes
             .get(name)
             .and_then(|attribute| attribute.get("values"))
             .and_then(Value::as_object)
     };
-    let sharp_values = edge_attributes("sharp").ok_or("sharp edge values missing")?;
-    let seam_values = edge_attributes("seam").ok_or("seam edge values missing")?;
+    let seam_values = edge_attributes("uv_seam").ok_or("seam edge values missing")?;
     let crease_values = edge_attributes("crease_edge").ok_or("crease edge values missing")?;
     let mut sharp = serde_json::Map::new();
     let mut seam = serde_json::Map::new();
@@ -2494,15 +2897,7 @@ fn transfer_domain_values(mesh: &Mesh) -> Result<Value, Box<dyn Error>> {
         let first = edge.vertices[0].min(edge.vertices[1]);
         let second = edge.vertices[0].max(edge.vertices[1]);
         let key = format!("{first}-{second}");
-        sharp.insert(
-            key.clone(),
-            Value::Bool(
-                sharp_values
-                    .get(&format!("e{}", edge.id))
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-            ),
-        );
+        sharp.insert(key.clone(), Value::Bool(sharp_ids.contains(&edge.id)));
         seam.insert(
             key.clone(),
             Value::Bool(
@@ -2579,7 +2974,7 @@ fn transfer_domain_values(mesh: &Mesh) -> Result<Value, Box<dyn Error>> {
         "uv":uv,
         "color":corner_values("color")?,
         "normal":corner_normal_vectors_json(mesh)?,
-        "smooth":face_values("shade_smooth")?,
+        "smooth":face_values("smooth")?,
         "freestyle":face_values("freestyle_face")?
     }))
 }
@@ -2734,8 +3129,6 @@ fn run_uv_transfer(
         &operands,
         None,
         DMat4::IDENTITY,
-        "DataTransferDestination",
-        &AttributeLayerSelection::default(),
     )?)
 }
 
@@ -2822,16 +3215,8 @@ fn vertex_weight_mix_uv_mask_samples_blender_v_up_rows() -> Result<(), Box<dyn E
             "mask_tex_uv_layer": "UVMap"
         }),
     )?;
-    let texture = ResolvedTexture::from_image(image);
-    let result = evaluate_with_context(
-        &mesh,
-        &mix,
-        &BTreeMap::new(),
-        Some(&texture),
-        DMat4::IDENTITY,
-        "WeightedMesh",
-        &AttributeLayerSelection::default(),
-    )?;
+    let result =
+        evaluate_with_context(&mesh, &mix, &BTreeMap::new(), Some(&image), DMat4::IDENTITY)?;
     let weights = vertex_weights(&result, "A")?;
     assert_eq!(weights.len(), 4);
     for (weight, expected) in weights.iter().zip([0.1, 0.3, 0.6, 0.9]) {
