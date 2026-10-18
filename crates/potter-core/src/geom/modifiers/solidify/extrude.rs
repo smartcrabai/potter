@@ -833,7 +833,7 @@ fn source_edge_values(mesh: &Mesh, name: &str) -> Vec<f32> {
             })
             .collect();
     }
-    let values = mesh_attribute_values(mesh, name).unwrap_or(&[]);
+    let values = mesh_attribute_values(mesh, name).unwrap_or_default();
     (0..mesh.edges.len())
         .map(|index| {
             values

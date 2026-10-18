@@ -46,7 +46,8 @@ mod subdivision_normals;
 mod subdivision_uv;
 use subdivision_limit::Samples;
 type Polygon = (Vec<usize>, u32);
-type BevelEdgeFaces = BTreeMap<(usize, usize), Vec<(usize, usize, u32)>>;
+/// Output edge index map and per-output-edge source edge index, for explicit edge provenance.
+type EdgeSourceIndex<'a> = (&'a HashMap<(usize, usize), usize>, &'a [usize]);
 type BevelEdgeFacesWithMaterial = BTreeMap<(usize, usize), Vec<(usize, usize, usize, u32)>>;
 /// Merged points, polygons, and edges, with the input element each output point and polygon came from.
 struct MergedGeometry {
@@ -950,7 +951,7 @@ fn build_mesh_inner(
     loose_edges: Vec<[usize; 2]>,
     origin: &Origin,
     source: &Mesh,
-    edge_sources: Option<(&HashMap<(usize, usize), usize>, &[usize])>,
+    edge_sources: Option<EdgeSourceIndex<'_>>,
 ) -> Result<Mesh> {
     let mut result = Mesh::new();
     for point in points {

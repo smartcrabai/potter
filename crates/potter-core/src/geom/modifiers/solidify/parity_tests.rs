@@ -128,6 +128,8 @@ fn scene(input: &Value) -> TestResult<SceneDoc> {
             .ok_or("modifier params must be an object")?
             .clone(),
         binding_data: None,
+        show_viewport: true,
+        show_render: true,
         runtime: ModifierRuntime::default(),
     };
     let slot_count = input["material_slots"].as_u64().ok_or("material_slots")?;
@@ -186,7 +188,7 @@ fn scene(input: &Value) -> TestResult<SceneDoc> {
     doc.schema_version = 1;
     let mut document = serde_json::to_value(doc)?;
     crate::model::upgrade_scene(&mut document)?;
-    let doc = serde_json::from_value(document)?;
+    let doc: SceneDoc = serde_json::from_value(document)?;
     doc.validate()?;
     Ok(doc)
 }
