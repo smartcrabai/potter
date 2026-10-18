@@ -19,9 +19,8 @@ use crate::{
     eval::{EvaluationPurpose, SlotBinding, Snapshot},
     geom::{Mesh, normals::corner_normals, uv_layers},
     model::{
-        Action, ArmatureData, Bone, DataBlock, Extrapolation, FCurve, Id, Image, ImageAlphaMode,
-        ImageColorspace, ImageSource, Interpolation, Keyframe, Material, Node, SceneDoc,
-        TextureRef, Transform,
+        Action, ArmatureData, Bone, DataBlock, Extrapolation, FCurve, Id, Image, ImageColorspace,
+        ImageSource, Interpolation, Keyframe, Material, Node, SceneDoc, TextureRef, Transform,
     },
 };
 
@@ -2294,7 +2293,7 @@ fn import_bytes_with_base(
                     blob: None,
                     source_path: Some(source.to_string_lossy().into_owned()),
                     source_hash: Some(crate::hash::sha256(&bytes)),
-                    alpha_mode: ImageAlphaMode::Straight,
+                    alpha_mode: crate::image::storage::default_alpha_mode(&bytes),
                 },
             );
             images_by_source.insert(source_key, image_id.clone());

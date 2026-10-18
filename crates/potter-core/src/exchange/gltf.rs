@@ -359,6 +359,11 @@ fn pack_channels(
         let image = texture_image_for_export(doc, id)?;
         inputs.push((image, load_image_data(image, root_path, interpolation)?));
     }
+    // One straight-colour conversion per input, shared by every output texel that samples it.
+    let straight_inputs = inputs
+        .iter()
+        .map(|(_, input)| input.straight_pixels())
+        .collect::<Vec<_>>();
     let name = match inputs.first() {
         Some((image, _)) => format!("{}_packed", image.name),
         None => {
@@ -408,8 +413,7 @@ fn pack_channels(
                     let source_image = &inputs[input].1;
                     let sample_x = nearest_index(x, width, source_image.width);
                     let sample_y = nearest_index(y, height, source_image.height);
-                    let raw = source_image
-                        .pixels
+                    let raw = straight_inputs[input]
                         .get(sample_y * source_image.width as usize + sample_x)
                         .ok_or_else(|| {
                             PotError::new(
@@ -430,6 +434,7 @@ fn pack_channels(
     Ok(PackedImage {
         name,
         pixels: ImageData {
+            colour: crate::image::ColourCache::default(),
             storage: crate::image::ImageStorage {
                 straight_alpha: true,
                 ..crate::image::ImageStorage::default()
@@ -14989,6 +14994,7 @@ mod tests {
         let images = BTreeMap::from([(
             image_id,
             crate::image::ImageData {
+                colour: crate::image::ColourCache::default(),
                 storage: crate::image::ImageStorage::default(),
                 width: 2,
                 height: 1,

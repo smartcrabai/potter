@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, BTreeSet},
+};
 
 use glam::{DMat3, DMat4, DQuat, DVec3};
 use serde_json::{Map, Value, json};
@@ -576,6 +579,8 @@ pub fn displace_volume(
 struct VolumeDisplacement<'a> {
     texture_type: &'a str,
     image: Option<&'a ImageData>,
+    /// Straight colour of `image`, converted once here rather than for every sampled voxel.
+    image_pixels: Option<Cow<'a, [[f64; 4]]>>,
     mapping: DMat4,
     strength: f64,
     mid_level: [f64; 3],
@@ -632,6 +637,7 @@ impl<'a> VolumeDisplacement<'a> {
         Ok(Self {
             texture_type,
             image,
+            image_pixels: image.map(ImageData::straight_pixels),
             mapping,
             strength,
             mid_level: vector_param("volume_displace", params, "texture_mid_level")?,
@@ -650,13 +656,17 @@ impl<'a> VolumeDisplacement<'a> {
                 let image = self
                     .image
                     .ok_or_else(|| invalid("image texture source disappeared"))?;
+                let pixels = self
+                    .image_pixels
+                    .as_deref()
+                    .ok_or_else(|| invalid("image texture source disappeared"))?;
                 // Blender's flat Image Texture projection maps object coordinates from
                 // [-1, 1] to UVs and repeats outside the unit square.
                 let uv = [
                     (texture_position.x * 0.5 + 0.5).rem_euclid(1.0),
                     (texture_position.y * 0.5 + 0.5).rem_euclid(1.0),
                 ];
-                let rgba = sample_repeated_image(image, uv)?;
+                let rgba = sample_repeated_image(image, pixels, uv)?;
                 [rgba[0], rgba[1], rgba[2]]
             }
             _ => {
@@ -673,7 +683,7 @@ impl<'a> VolumeDisplacement<'a> {
         ) * self.strength)
     }
 }
-fn sample_repeated_image(image: &ImageData, uv: [f64; 2]) -> Result<[f64; 4]> {
+fn sample_repeated_image(image: &ImageData, pixels: &[[f64; 4]], uv: [f64; 2]) -> Result<[f64; 4]> {
     let width = usize::try_from(image.width)
         .map_err(|_| limit("image texture width exceeds addressable memory"))?;
     let height = usize::try_from(image.height)
@@ -684,8 +694,6 @@ fn sample_repeated_image(image: &ImageData, uv: [f64; 2]) -> Result<[f64; 4]> {
     if width == 0 || height == 0 || image.pixels.len() != pixel_count {
         return Err(invalid("image texture dimensions do not match its pixels"));
     }
-    // Straight colour, as Blender's texture reader sees it (`straight_pixels` converts a premultiplied image).
-    let pixels = image.straight_pixels();
     if uv.iter().any(|coordinate| !coordinate.is_finite()) {
         return Err(invalid("image texture coordinates must be finite"));
     }
@@ -1450,6 +1458,7 @@ mod tests {
         );
 
         let image = crate::image::ImageData {
+            colour: crate::image::ColourCache::default(),
             storage: crate::image::ImageStorage::default(),
             width: 1,
             height: 1,

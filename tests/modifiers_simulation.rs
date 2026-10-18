@@ -2418,6 +2418,7 @@ baseline_evaluated.to_mesh_clear()
         })
         .collect::<Vec<_>>();
     let image = potter_core::image::ImageData {
+        colour: potter_core::image::ColourCache::default(),
         storage: potter_core::image::ImageStorage::default(),
         width: 4,
         height: 3,

@@ -1,4 +1,7 @@
-use std::{cell::RefCell, collections::BTreeMap};
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, BTreeSet},
+};
 
 use glam::{DQuat, DVec3, EulerRot};
 use serde_json::{Value as JsonValue, json};
@@ -497,6 +500,8 @@ fn evaluate_surface_inner(
         material,
         hit_ctx: *hit_ctx,
         workspace,
+        output,
+        alpha_linked_images: None,
     };
     let Value::Shader(mut params) = evaluator.input(output, "Surface", ValueKind::Shader)? else {
         return Err(eval_error("material surface output is not a shader"));
@@ -601,6 +606,8 @@ fn evaluate_displacement_inner(
         material,
         hit_ctx: *hit_ctx,
         workspace,
+        output,
+        alpha_linked_images: None,
     };
     match evaluator.input(output, "Displacement", ValueKind::Vector)? {
         Value::Vector(displacement) => Ok(displacement.dot(hit_ctx.normal)),
@@ -818,9 +825,12 @@ struct Evaluator<'graph, 'material, 'registry, 'workspace> {
     material: &'material Material,
     hit_ctx: HitContext<'registry>,
     workspace: &'workspace mut EvaluatorWorkspace,
+    output: &'graph Id,
+    /// Set by [`linked_alpha_image_nodes`] on the first Image Texture sample of this evaluation.
+    alpha_linked_images: Option<BTreeSet<&'graph Id>>,
 }
 
-impl<'registry> Evaluator<'_, '_, 'registry, '_> {
+impl<'graph, 'registry> Evaluator<'graph, '_, 'registry, '_> {
     fn input(&mut self, node_id: &Id, socket: &str, kind: ValueKind) -> Result<Value> {
         let node = self.node(node_id)?;
         let incoming =
@@ -936,6 +946,16 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_> {
             .nodes
             .get(node_id)
             .ok_or_else(|| invalid(format!("shader graph references absent node `{node_id}`")))
+    }
+
+    /// Whether the Alpha output of the Image Texture `id` reaches the group's output; see
+    /// [`linked_alpha_image_nodes`]. The set is built on the first Image Texture sample of this evaluation, and
+    /// every later sample is a lookup.
+    fn alpha_linked_image(&mut self, id: &Id) -> bool {
+        let (group, output) = (self.group, self.output);
+        self.alpha_linked_images
+            .get_or_insert_with(|| linked_alpha_image_nodes(group, output))
+            .contains(id)
     }
 
     fn evaluate_node(&mut self, node_id: &Id, kind: NodeKind, socket: &str) -> Result<Value> {
@@ -1213,13 +1233,9 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_> {
                 ));
             }
         };
-        // Cycles unassociates an Image Texture's colour only when its Alpha output feeds something
-        // (`NODE_IMAGE_ALPHA_UNASSOCIATE`, set in `shader_nodes.cpp`), so the colour read depends on that link.
-        let alpha_linked = self
-            .group
-            .links
-            .iter()
-            .any(|link| link.from_node == *id && link.from_socket == "Alpha");
+        // Cycles unassociates an Image Texture's colour only when its Alpha output still has a link after
+        // dead nodes are removed, so the colour read depends on that link (see `linked_alpha_image_nodes`).
+        let alpha_linked = self.alpha_linked_image(id);
         let pixel = sample_image_texel(
             image,
             [uv.x, uv.y],
@@ -1958,6 +1974,44 @@ fn socket_matches(candidate: &str, requested: &str) -> bool {
     )
 }
 
+/// The Image Texture nodes whose Alpha output reaches the group's output. Cycles decides this in two steps.
+/// `ShaderGraph::clean` (`intern/cycles/scene/shader_graph.cpp`, ~lines 801-860) runs `break_cycles(output())`,
+/// which visits every node reachable backwards from the output through all of its inputs, then deletes the input
+/// links of unvisited nodes and the unvisited nodes. An Image Texture unassociates its colour only when its Alpha
+/// output still has a link after that pass (`intern/cycles/scene/shader_nodes.cpp`, ~line 449). So a link from Alpha
+/// into a dead node does not count. This function applies the same visit: reachability starts at `output` and
+/// follows every incoming link, and the result keeps Alpha links whose target was visited.
+fn linked_alpha_image_nodes<'graph>(
+    group: &'graph NodeGroup,
+    output: &'graph Id,
+) -> BTreeSet<&'graph Id> {
+    let mut reachable: BTreeSet<&'graph Id> = BTreeSet::new();
+    let mut pending = vec![output];
+    while let Some(node) = pending.pop() {
+        if reachable.insert(node) {
+            pending.extend(
+                group
+                    .links
+                    .iter()
+                    .filter(|link| link.to_node == *node)
+                    .map(|link| &link.from_node),
+            );
+        }
+    }
+    group
+        .links
+        .iter()
+        .filter(|link| link.from_socket == "Alpha" && reachable.contains(&link.to_node))
+        .map(|link| &link.from_node)
+        .filter(|from| {
+            group
+                .nodes
+                .get(*from)
+                .is_some_and(|node| node.node_type == "ShaderNodeTexImage")
+        })
+        .collect()
+}
+
 fn number(value: &JsonValue, default: f64) -> f64 {
     value
         .as_f64()
@@ -2444,6 +2498,7 @@ mod tests {
         let images = BTreeMap::from([(
             "image".to_owned(),
             ImageData {
+                colour: crate::image::ColourCache::default(),
                 storage: crate::image::ImageStorage::default(),
                 width: 8,
                 height: 8,
@@ -2490,6 +2545,7 @@ mod tests {
         let images = BTreeMap::from([(
             "image".to_owned(),
             ImageData {
+                colour: crate::image::ColourCache::default(),
                 storage: crate::image::ImageStorage::default(),
                 width: 8,
                 height: 8,

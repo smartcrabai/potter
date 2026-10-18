@@ -171,6 +171,7 @@ fn texture_material(uv_layer: Option<&str>) -> (Material, BTreeMap<String, Image
         ..Material::default()
     };
     let image = ImageData {
+        colour: potter_core::image::ColourCache::default(),
         storage: potter_core::image::ImageStorage::default(),
         width: 1,
         height: 1,

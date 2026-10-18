@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     error::{ErrorCode, PotError, Result},
     hash,
-    image::{ImageData, ImageInterpolation, ImageStorage, ImageTileData, Precision},
+    image::{ColourCache, ImageData, ImageInterpolation, ImageStorage, ImageTileData, Precision},
     model::{Image, ImageAlphaMode, ImageColorspace},
 };
 
@@ -76,7 +76,6 @@ pub fn load_image_data_with_staged(
     let mut tiles = BTreeMap::new();
     for tile in &image.tiles {
         let bytes = blob_bytes(&tile.blob, root, staged)?;
-        let tile_srgb = decodes_srgb(image.colorspace);
         let (tile_width, tile_height, tile_pixels) = decode_pixels(&bytes, image.colorspace)?;
         if tile_width != tile.width || tile_height != tile.height {
             return Err(PotError::with_details(
@@ -91,7 +90,8 @@ pub fn load_image_data_with_staged(
                 width: tile_width,
                 height: tile_height,
                 pixels: tile_pixels,
-                srgb: tile_srgb,
+                precision: source_precision(&bytes),
+                colour: ColourCache::default(),
             },
         );
     }
@@ -103,6 +103,7 @@ pub fn load_image_data_with_staged(
         interpolation,
         srgb,
         storage: image_storage(image, &base_bytes),
+        colour: ColourCache::default(),
     })
 }
 
@@ -745,6 +746,13 @@ fn image_blob_bytes<'a>(
         ));
     }
     Ok(Cow::Owned(bytes))
+}
+
+/// The encoded bytes an image is loaded from, read as the loader reads them: its packed blob, or its linked source file,
+/// with the same hash checks. Scene upgrades read an image's format through this.
+pub(crate) fn image_source_bytes(image: &Image, root: &Path) -> Result<Vec<u8>> {
+    let staged = BTreeMap::new();
+    image_blob_bytes(image.blob.as_deref(), image, root, &staged).map(Cow::into_owned)
 }
 
 fn blob_bytes<'a>(

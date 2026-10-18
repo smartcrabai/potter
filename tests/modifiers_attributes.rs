@@ -457,6 +457,7 @@ fn mesh_cache_mdd_interpolates_resource_frames() -> Result<(), Box<dyn Error>> {
 fn vertex_weight_edit_blends_with_image_mask_channel() -> Result<(), Box<dyn Error>> {
     let source = weighted_line()?;
     let image = ImageData {
+        colour: potter_core::image::ColourCache::default(),
         storage: potter_core::image::ImageStorage::default(),
         width: 1,
         height: 1,
@@ -2462,6 +2463,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         1.0e-4,
     )?;
     let image = ImageData {
+        colour: potter_core::image::ColourCache::default(),
         storage: potter_core::image::ImageStorage::default(),
         width: 2,
         height: 2,
@@ -3195,6 +3197,7 @@ fn vertex_weight_mix_uv_mask_samples_blender_v_up_rows() -> Result<(), Box<dyn E
         }),
     );
     let image = ImageData {
+        colour: potter_core::image::ColourCache::default(),
         storage: potter_core::image::ImageStorage::default(),
         width: 1,
         height: 4,

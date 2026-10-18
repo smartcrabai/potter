@@ -1982,6 +1982,7 @@ fn build_imported_graph(
             {
                 image.blob = packed.blob;
                 image.source_hash = packed.source_hash;
+                image.alpha_mode = packed.alpha_mode;
             }
             // A linked image reopens from the sidecar copy that its Blender filepath names, when that copy is the image.
             if image.source == ImageSource::File
@@ -2988,6 +2989,18 @@ fn imported_image_from_resource(
     });
     let (colorspace, width, height, _) =
         crate::image::storage::decode_pixels_with_default_colorspace(bytes, colorspace)?;
+    // Blender's alpha mode for the packed image, as the bridge names it. A record without one takes the encoding's default.
+    let alpha_mode = match item.get("alpha_mode").and_then(Value::as_str) {
+        None => crate::image::storage::default_alpha_mode(bytes),
+        Some("straight") => ImageAlphaMode::Straight,
+        Some("premultiplied") => ImageAlphaMode::Premultiplied,
+        Some("none") => ImageAlphaMode::None,
+        Some(other) => {
+            return Err(invalid_intermediate(&format!(
+                "image `{name}` has unknown alpha_mode `{other}`"
+            )));
+        }
+    };
     Ok(Some(Image {
         name: name.to_owned(),
         source: ImageSource::Packed,
@@ -2998,7 +3011,7 @@ fn imported_image_from_resource(
         blob: Some(source_hash.to_owned()),
         source_path: None,
         source_hash: Some(source_hash.to_owned()),
-        alpha_mode: ImageAlphaMode::Straight,
+        alpha_mode,
     }))
 }
 
@@ -10655,6 +10668,7 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
             (
                 normal_image_id.as_str().to_owned(),
                 crate::image::ImageData {
+                    colour: crate::image::ColourCache::default(),
                     storage: crate::image::ImageStorage::default(),
                     width: 1,
                     height: 1,
@@ -10667,6 +10681,7 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
             (
                 emissive_image_id.as_str().to_owned(),
                 crate::image::ImageData {
+                    colour: crate::image::ColourCache::default(),
                     storage: crate::image::ImageStorage::default(),
                     width: 1,
                     height: 1,

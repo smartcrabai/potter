@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::{borrow::Cow, collections::BTreeMap};
+use std::{borrow::Cow, collections::BTreeMap, sync::OnceLock};
 
 use crate::color::linear_to_srgb_unclamped;
 
@@ -30,13 +30,16 @@ impl ImageExtension {
     }
 }
 
-/// One UDIM tile. `pixels` are linear light, and `srgb` is as in [`ImageData`].
+/// One UDIM tile. `pixels` are linear light, as stored. `precision` is the precision of the tile's own file, which sets
+/// the rounding of its premultiply (see [`Precision`]). The tile's colour space and storage flags are the base image's.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ImageTileData {
     pub width: u32,
     pub height: u32,
     pub pixels: Vec<[f64; 4]>,
-    pub srgb: bool,
+    pub precision: Precision,
+    /// The tile's stored colour texels for colour reads (see [`ColourCache`]).
+    pub colour: ColourCache,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -55,6 +58,8 @@ pub struct ImageData {
     pub srgb: bool,
     /// How Blender stores the image's values for Image Texture colour reads.
     pub storage: ImageStorage,
+    /// The stored colour texels for colour reads, computed on the first colour read (see [`ColourCache`]).
+    pub colour: ColourCache,
 }
 
 impl ImageData {
@@ -89,6 +94,45 @@ impl ImageData {
                 .collect(),
         )
     }
+}
+
+/// The stored colour texels an Image Texture colour read mixes: each texel encoded for an sRGB image and premultiplied at
+/// the image's precision, as [`stored_texel`] makes them. They depend only on the pixels and the storage, so they are
+/// computed once, on the first colour read, and every later sample reuses them. This is the form Cycles' loaded buffer
+/// holds them in (`util_image_multiply_native`, `NODE_IMAGE_COMPRESS_AS_SRGB`).
+#[derive(Clone, Debug, Default)]
+pub struct ColourCache(OnceLock<Vec<[f64; 4]>>);
+
+/// Missing UDIM tiles read through this cache. It is never filled, because such a tile has no pixels.
+static EMPTY_COLOUR: ColourCache = ColourCache(OnceLock::new());
+
+impl PartialEq for ColourCache {
+    /// The cache is derived from the pixels and the storage, so it never makes two images differ.
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+/// The stored colour texels of `pixels` for a colour read of an image with these settings, computed once into `cache`.
+fn colour_texels<'a>(
+    cache: &'a ColourCache,
+    pixels: &[[f64; 4]],
+    srgb: bool,
+    storage: ImageStorage,
+) -> &'a [[f64; 4]] {
+    cache.0.get_or_init(|| {
+        let texels = Texels::new(
+            srgb,
+            storage,
+            Read::Colour {
+                alpha_linked: false,
+            },
+        );
+        pixels
+            .iter()
+            .map(|pixel| stored_texel(*pixel, texels))
+            .collect()
+    })
 }
 
 /// The precision a stored image was quantised to. Blender premultiplies straight alpha at load in the arithmetic of the
@@ -157,6 +201,8 @@ struct Texels {
     unassociate: bool,
     /// Alpha is ignored: every read returns alpha 1 (`ImageStorage::ignore_alpha`).
     ignore_alpha: bool,
+    /// The values are already stored, encoded and premultiplied in a [`ColourCache`], so [`stored_texel`] returns them.
+    precomputed: bool,
 }
 
 impl Texels {
@@ -180,6 +226,7 @@ impl Texels {
             premultiply,
             unassociate,
             ignore_alpha: storage.ignore_alpha,
+            precomputed: false,
         }
     }
 }
@@ -250,33 +297,11 @@ fn sample_image(
     let u = local_uv[0].clamp(0.0, 1.0);
     let v = local_uv[1].clamp(0.0, 1.0);
 
-    let texels = Texels::new(image.srgb, image.storage, read);
+    let (values, texels) = image.source(read);
     match interpolation {
-        ImageInterpolation::Linear => sample_linear(image.pixels, width, height, u, v, texels),
-        ImageInterpolation::Closest => sample_closest(image.pixels, width, height, u, v, texels),
+        ImageInterpolation::Linear => sample_linear(values, width, height, u, v, texels),
+        ImageInterpolation::Closest => sample_closest(values, width, height, u, v, texels),
     }
-}
-
-/// Samples an image as an Image Texture node reads it, with the node's Alpha output unlinked. See
-/// [`sample_with_extension_alpha`].
-#[must_use]
-pub fn sample_with_extension(
-    data: &ImageData,
-    routing_uv: [f64; 2],
-    pixel_uv: [f64; 2],
-    tile: u32,
-    interpolation: ImageInterpolation,
-    extension: ImageExtension,
-) -> [f64; 4] {
-    sample_with_extension_alpha(
-        data,
-        routing_uv,
-        pixel_uv,
-        tile,
-        interpolation,
-        extension,
-        false,
-    )
 }
 
 /// Samples an image using separate UVs for UDIM routing and pixel lookup, as an Image Texture node reads it.
@@ -320,10 +345,10 @@ pub fn sample_with_extension_alpha(
         ImageExtension::Mirror => [pixel_uv[0].rem_euclid(2.0), pixel_uv[1].rem_euclid(2.0)],
     };
 
-    let texels = Texels::new(image.srgb, image.storage, Read::Colour { alpha_linked });
+    let (values, texels) = image.source(Read::Colour { alpha_linked });
     match interpolation {
         ImageInterpolation::Linear => sample_linear_with_extension(
-            image.pixels,
+            values,
             width,
             height,
             local_uv[0],
@@ -332,7 +357,7 @@ pub fn sample_with_extension_alpha(
             texels,
         ),
         ImageInterpolation::Closest => sample_closest_with_extension(
-            image.pixels,
+            values,
             width,
             height,
             local_uv[0],
@@ -345,56 +370,59 @@ pub fn sample_with_extension_alpha(
 
 fn image_for_uv(data: &ImageData, uv: [f64; 2], tile: u32) -> Option<ImageTileDataRef<'_>> {
     if tile == 0 {
-        Some(ImageTileDataRef {
+        return Some(ImageTileDataRef {
             width: data.width,
             height: data.height,
             pixels: &data.pixels,
+            colour: &data.colour,
             srgb: data.srgb,
             storage: data.storage,
-        })
-    } else {
-        let actual_tile = udim_tile(tile, uv)?;
-        let image = data.tiles.get(&actual_tile).map_or_else(
-            || {
-                if actual_tile == 1001 {
-                    ImageTileDataRef {
-                        width: data.width,
-                        height: data.height,
-                        pixels: &data.pixels,
-                        srgb: data.srgb,
-                        storage: data.storage,
-                    }
-                } else {
-                    ImageTileDataRef {
-                        width: 0,
-                        height: 0,
-                        pixels: &[],
-                        srgb: false,
-                        storage: ImageStorage::default(),
-                    }
-                }
-            },
-            |image| ImageTileDataRef {
-                width: image.width,
-                height: image.height,
-                pixels: &image.pixels,
-                srgb: image.srgb,
-                storage: data.storage,
-            },
-        );
-        Some(image)
+        });
     }
+    let actual_tile = udim_tile(tile, uv)?;
+    let image = match data.tiles.get(&actual_tile) {
+        Some(image) => ImageTileDataRef {
+            width: image.width,
+            height: image.height,
+            pixels: &image.pixels,
+            colour: &image.colour,
+            srgb: data.srgb,
+            storage: ImageStorage {
+                precision: image.precision,
+                ..data.storage
+            },
+        },
+        // Tile 1001 reads the base image when no tile is stored for it.
+        None if actual_tile == 1001 => ImageTileDataRef {
+            width: data.width,
+            height: data.height,
+            pixels: &data.pixels,
+            colour: &data.colour,
+            srgb: data.srgb,
+            storage: data.storage,
+        },
+        None => ImageTileDataRef {
+            width: 0,
+            height: 0,
+            pixels: &[],
+            colour: &EMPTY_COLOUR,
+            srgb: false,
+            storage: ImageStorage::default(),
+        },
+    };
+    Some(image)
 }
 
 struct ImageTileDataRef<'a> {
     width: u32,
     height: u32,
     pixels: &'a [[f64; 4]],
+    colour: &'a ColourCache,
     srgb: bool,
     storage: ImageStorage,
 }
 
-impl ImageTileDataRef<'_> {
+impl<'a> ImageTileDataRef<'a> {
     fn valid_dimensions(&self) -> Option<(usize, usize)> {
         if self.width == 0 || self.height == 0 {
             return None;
@@ -403,6 +431,25 @@ impl ImageTileDataRef<'_> {
         let height = usize::try_from(self.height).ok()?;
         let pixel_count = width.checked_mul(height)?;
         (self.pixels.len() == pixel_count).then_some((width, height))
+    }
+
+    /// The values a read mixes, and the settings it stores them with. A colour read of an encoded or premultiplied image
+    /// mixes the cached colour texels; every other read mixes the stored pixels and stores each texel as it reads it.
+    fn source(&self, read: Read) -> (&'a [[f64; 4]], Texels) {
+        let texels = Texels::new(self.srgb, self.storage, read);
+        if matches!(read, Read::Colour { .. })
+            && (texels.transfer != Transfer::Linear || texels.premultiply.is_some())
+        {
+            let values = colour_texels(self.colour, self.pixels, self.srgb, self.storage);
+            return (
+                values,
+                Texels {
+                    precomputed: true,
+                    ..texels
+                },
+            );
+        }
+        (self.pixels, texels)
     }
 }
 
@@ -552,6 +599,9 @@ fn sample_linear_with_extension(
 /// Cycles interpolates (`svm_image_texture`). Straight alpha is premultiplied when the image loaded, in the arithmetic of
 /// the buffer's precision. The encode is the exact inverse of the load decode, so an unpremultiplied texel round-trips.
 fn stored_texel(linear: [f64; 4], texels: Texels) -> [f64; 4] {
+    if texels.precomputed {
+        return linear;
+    }
     let mut rgb = [linear[0], linear[1], linear[2]];
     if texels.transfer != Transfer::Linear {
         rgb = rgb.map(linear_to_srgb_unclamped);
@@ -586,28 +636,25 @@ fn integer_premultiply(value: f64, alpha: f64, max: f64) -> f64 {
 
 /// Rounds to the nearest IEEE half-precision value, ties to even, as Cycles' `float_to_half` does. Normal halves keep
 /// 11 significant bits (a step of 2^(e - 10) at exponent e), and values below 2^-14 share the subnormal step 2^-24.
-/// Values at or above 65520 overflow to infinity, as they do in half.
+/// Magnitudes above the largest finite half clamp to 65504, as `float_to_half_image` does (`intern/cycles/util/half.h`).
 fn round_to_half(value: f64) -> f64 {
-    if !value.is_finite() || value.abs() < f64::MIN_POSITIVE {
+    if value.is_nan() || value.abs() < f64::MIN_POSITIVE {
         return value;
     }
-    let magnitude = value.abs();
-    if magnitude >= 65_520.0 {
-        return value.signum() * f64::INFINITY;
-    }
+    let magnitude = value.abs().min(65_504.0);
     let exponent = i32::try_from((magnitude.to_bits() >> 52) & 0x7ff).unwrap_or(0) - 1023;
     let step = 2.0_f64.powi(exponent.max(-14) - 10);
     value.signum() * ((magnitude / step).round_ties_even() * step)
 }
 
 /// The colour a lookup returns from a mixed stored value. Cycles unassociates the colour when the Alpha output is
-/// linked (`svm_image_texture`, `NODE_IMAGE_ALPHA_UNASSOCIATE`, only for alpha strictly between 0 and 1), and then
+/// linked (`svm_image_texture`, `NODE_IMAGE_ALPHA_UNASSOCIATE`, for any alpha but 0 and 1), and then
 /// decodes an sRGB image to linear light (`color_srgb_to_linear_v4`). Alpha is unchanged.
 fn finish(mixed: [f64; 4], texels: Texels) -> [f64; 4] {
     // Alpha ignored (`IMA_ALPHA_IGNORE`): the loader made alpha 1, so every read returns 1 (`image_metadata.cpp`).
     let alpha = if texels.ignore_alpha { 1.0 } else { mixed[3] };
     let mut rgb = [mixed[0], mixed[1], mixed[2]];
-    if texels.unassociate && alpha > 0.0 && alpha < 1.0 {
+    if texels.unassociate && alpha != 0.0 && alpha != 1.0 {
         rgb = rgb.map(|value| value / alpha);
     }
     if texels.transfer == Transfer::SrgbDecoded {
@@ -686,9 +733,9 @@ fn mix(a: [f64; 4], b: [f64; 4], t: f64) -> [f64; 4] {
 #[cfg(test)]
 mod tests {
     use super::{
-        ImageData, ImageExtension, ImageInterpolation, ImageStorage, ImageTileData, Precision,
-        premultiply, round_to_half, sample, sample_encoded, sample_with_extension,
-        sample_with_extension_alpha, sample_with_interpolation,
+        ColourCache, ImageData, ImageExtension, ImageInterpolation, ImageStorage, ImageTileData,
+        Precision, premultiply, round_to_half, sample, sample_encoded, sample_with_extension_alpha,
+        sample_with_interpolation,
     };
     use std::collections::BTreeMap;
 
@@ -705,6 +752,7 @@ mod tests {
             tiles: BTreeMap::new(),
             interpolation,
             srgb: false,
+            colour: ColourCache::default(),
             storage: ImageStorage::default(),
         }
     }
@@ -724,6 +772,7 @@ mod tests {
             tiles: BTreeMap::new(),
             interpolation: ImageInterpolation::Linear,
             srgb: true,
+            colour: ColourCache::default(),
             storage: ImageStorage::default(),
         }
     }
@@ -755,6 +804,7 @@ mod tests {
             tiles: BTreeMap::new(),
             interpolation: ImageInterpolation::Linear,
             srgb,
+            colour: ColourCache::default(),
             storage,
         }
     }
@@ -854,6 +904,7 @@ mod tests {
             tiles: BTreeMap::new(),
             interpolation: ImageInterpolation::Linear,
             srgb: true,
+            colour: ColourCache::default(),
             storage: ImageStorage {
                 data: false,
                 straight_alpha: true,
@@ -1038,13 +1089,14 @@ mod tests {
     #[test]
     fn srgb_extension_sampling_matches_the_decoded_linear_at_texel_centers() {
         let image = srgb_row([0.5, 0.5]);
-        let sampled = sample_with_extension(
+        let sampled = sample_with_extension_alpha(
             &image,
             [0.25, 0.5],
             [0.25, 0.5],
             0,
             ImageInterpolation::Linear,
             ImageExtension::Extend,
+            false,
         );
         assert!(
             (sampled[0] - cycles_decode(0.5)).abs() < 1e-6,
@@ -1114,24 +1166,26 @@ mod tests {
         );
 
         assert_eq!(
-            sample_with_extension(
+            sample_with_extension_alpha(
                 &image,
                 [0.0, 0.5],
                 [0.0, 0.5],
                 0,
                 ImageInterpolation::Linear,
                 ImageExtension::Repeat,
+                false,
             ),
             [0.5, 0.5, 0.0, 1.0],
         );
         assert_eq!(
-            sample_with_extension(
+            sample_with_extension_alpha(
                 &image,
                 [0.0, 0.5],
                 [0.0, 0.5],
                 0,
                 ImageInterpolation::Linear,
                 ImageExtension::Mirror,
+                false,
             ),
             [1.0, 0.0, 0.0, 1.0],
         );
@@ -1147,24 +1201,26 @@ mod tests {
         );
 
         assert_eq!(
-            sample_with_extension(
+            sample_with_extension_alpha(
                 &image,
                 [1.5, 0.5],
                 [1.5, 0.5],
                 0,
                 ImageInterpolation::Linear,
                 ImageExtension::Extend,
+                false,
             ),
             [0.0, 1.0, 0.0, 1.0],
         );
         assert_eq!(
-            sample_with_extension(
+            sample_with_extension_alpha(
                 &image,
                 [1.01, 0.5],
                 [1.01, 0.5],
                 0,
                 ImageInterpolation::Linear,
                 ImageExtension::Clip,
+                false,
             ),
             [0.0; 4],
         );
@@ -1180,13 +1236,14 @@ mod tests {
         );
 
         assert_eq!(
-            sample_with_extension(
+            sample_with_extension_alpha(
                 &image,
                 [0.0, 0.5],
                 [0.0, 0.5],
                 0,
                 ImageInterpolation::Linear,
                 ImageExtension::Clip,
+                false,
             ),
             [0.5, 0.0, 0.0, 0.5],
         );
@@ -1202,13 +1259,14 @@ mod tests {
         );
 
         assert_eq!(
-            sample_with_extension(
+            sample_with_extension_alpha(
                 &image,
                 [1.0, 1.0],
                 [1.0, 1.0],
                 0,
                 ImageInterpolation::Closest,
                 ImageExtension::Clip,
+                false,
             ),
             [0.0, 1.0, 0.0, 1.0],
         );
@@ -1243,7 +1301,8 @@ mod tests {
                 width: 2,
                 height: 1,
                 pixels: vec![[1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0]],
-                srgb: false,
+                precision: Precision::Float,
+                colour: ColourCache::default(),
             },
         );
 
@@ -1251,13 +1310,14 @@ mod tests {
         assert_eq!(sample(&image, [0.25, 0.25], 1001), [0.25, 0.5, 0.75, 1.0]);
         assert_eq!(sample(&image, [1.25, 0.25], 1001), [0.0; 4]);
         assert_eq!(
-            sample_with_extension(
+            sample_with_extension_alpha(
                 &image,
                 [1.0, 1.5],
                 [0.0, 0.5],
                 1001,
                 ImageInterpolation::Linear,
                 ImageExtension::Repeat,
+                false,
             ),
             [0.5, 0.5, 0.0, 1.0],
         );
@@ -1289,5 +1349,191 @@ mod tests {
             ),
             [0.0; 4]
         );
+    }
+
+    /// The 8-bit texels of the generator's base table (`generate_alpha_oracle.py`, `INTEGER_TEXELS`).
+    const BASE8: [u8; 8] = [128, 40, 0, 128, 64, 0, 255, 255];
+    /// The 8-bit texels of the `floor` table, where the premultiply truncates.
+    const FLOOR8: [u8; 8] = [200, 100, 0, 200, 64, 0, 255, 255];
+    /// The 16-bit texels of the `floor` table.
+    const FLOOR16: [u16; 8] = [50_000, 20_000, 0, 50_000, 20_000, 0, 65_535, 65_535];
+    /// The half-float texels (`HALF_TEXELS`), rounded to half when the EXR is read.
+    const HALF_TEXELS: [f64; 8] = [0.7, 0.35, 0.0, 0.6, 0.3, 0.0, 1.0, 1.0];
+    /// The float texels of the single-layer 32-bit EXR cases (`FLOAT_TEXELS`).
+    const FLOAT_TEXELS: [f64; 8] = [0.8, 0.4, 0.2, 0.5, 0.3, 0.0, 1.0, 1.0];
+    /// The associated texels Potter's EXR writer produces (`POTTER_TEXELS`).
+    const POTTER_TEXELS: [f64; 8] = [0.4, 0.2, 0.1, 0.5, 0.15, 0.0, 0.5, 0.5];
+
+    /// The stored values of one oracle family, in the file's units, with the precision and straight flag Blender loads
+    /// it with. The suffix after `<colourspace>_<interpolation>_<extension>_<linked>` names the family.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "float EXR channels are f32, so the table values are rounded to f32 on purpose"
+    )]
+    fn oracle_family(suffix: &str) -> Option<(Vec<f64>, Precision, bool)> {
+        let byte = |table: [u8; 8]| table.map(|value| f64::from(value) / 255.0).to_vec();
+        let short = |table: [u16; 8]| table.map(|value| f64::from(value) / 65_535.0).to_vec();
+        let float = |table: [f64; 8]| table.map(|value| f64::from(value as f32)).to_vec();
+        let half = |table: [f64; 8]| table.map(round_to_half).to_vec();
+        match suffix {
+            "" | "base8_linear" => Some((byte(BASE8), Precision::Byte, true)),
+            "base8_premul" => Some((byte(BASE8), Precision::Byte, false)),
+            "floor8_straight" | "floor8_tiff" => Some((byte(FLOOR8), Precision::Byte, true)),
+            "png16_straight" | "floor16_tiff16" => Some((short(FLOOR16), Precision::Short, true)),
+            "half16_exr" => Some((half(HALF_TEXELS), Precision::Half, true)),
+            "float_straight_exr32" => Some((float(FLOAT_TEXELS), Precision::Float, true)),
+            "float_premul_exr32" => Some((float(FLOAT_TEXELS), Precision::Float, false)),
+            "potter_premul_exr32" => Some((float(POTTER_TEXELS), Precision::Float, false)),
+            _ => None,
+        }
+    }
+
+    /// Rebuilds one oracle case's image from its file name (`<colourspace>_<interpolation>_<extension>_<linked>[_<family>]`
+    /// or `multilayer_<interpolation>_<extension>_<linked>`) and returns it with the settings Blender rendered it with.
+    /// A multilayer case's texels are the ones Blender loaded from its EXR, which the JSON stores.
+    fn oracle_case(
+        stem: &str,
+        document: &serde_json::Value,
+    ) -> Result<(ImageData, ImageInterpolation, ImageExtension, bool), Box<dyn std::error::Error>>
+    {
+        let (colourspace, rest) = if let Some(rest) = stem.strip_prefix("srgb_") {
+            ("sRGB", rest)
+        } else if let Some(rest) = stem.strip_prefix("linear_") {
+            ("Linear", rest)
+        } else if let Some(rest) = stem.strip_prefix("non-color_") {
+            ("Non-Color", rest)
+        } else if let Some(rest) = stem.strip_prefix("multilayer_") {
+            ("Linear", rest)
+        } else {
+            return Err(format!("unclassified oracle case {stem}").into());
+        };
+        let mut parts = rest.splitn(4, '_');
+        let interpolation = match parts.next() {
+            Some("closest") => ImageInterpolation::Closest,
+            Some("linear") => ImageInterpolation::Linear,
+            _ => return Err(format!("unclassified interpolation in {stem}").into()),
+        };
+        let extension = match parts.next() {
+            Some("repeat") => ImageExtension::Repeat,
+            Some("extend") => ImageExtension::Extend,
+            _ => return Err(format!("unclassified extension in {stem}").into()),
+        };
+        let linked = match parts.next() {
+            Some("linked") => true,
+            Some("unlinked") => false,
+            _ => return Err(format!("unclassified alpha link in {stem}").into()),
+        };
+        let suffix = parts.next().unwrap_or("");
+        let srgb = colourspace == "sRGB";
+        let (width, height, pixels, precision, straight) = if stem.starts_with("multilayer_") {
+            let texels = document["texels"]
+                .as_array()
+                .ok_or("multilayer texels are missing")?;
+            let pixels = texels
+                .iter()
+                .map(|texel| -> Result<[f64; 4], Box<dyn std::error::Error>> {
+                    let channel =
+                        |index: usize| texel[index].as_f64().ok_or("texel channel is not a number");
+                    Ok([channel(0)?, channel(1)?, channel(2)?, channel(3)?])
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let width = u32::try_from(document["width"].as_u64().ok_or("width is missing")?)?;
+            let height = u32::try_from(document["height"].as_u64().ok_or("height is missing")?)?;
+            (width, height, pixels, Precision::Float, false)
+        } else {
+            let Some((file, precision, straight)) = oracle_family(suffix) else {
+                return Err(format!("unclassified texel family in {stem}").into());
+            };
+            let pixels: Vec<[f64; 4]> = file
+                .chunks_exact(4)
+                .map(|texel| {
+                    let colour = |value: f64| {
+                        if srgb {
+                            crate::color::srgb_to_linear(value)
+                        } else {
+                            value
+                        }
+                    };
+                    [
+                        colour(texel[0]),
+                        colour(texel[1]),
+                        colour(texel[2]),
+                        texel[3],
+                    ]
+                })
+                .collect();
+            (2, 1, pixels, precision, straight)
+        };
+        let image = ImageData {
+            width,
+            height,
+            pixels,
+            tiles: BTreeMap::new(),
+            interpolation,
+            srgb,
+            storage: ImageStorage {
+                data: colourspace == "Non-Color",
+                straight_alpha: straight,
+                ignore_alpha: false,
+                precision,
+            },
+            colour: ColourCache::default(),
+        };
+        Ok((image, interpolation, extension, linked))
+    }
+
+    /// Every committed Blender oracle case (`tests/fixtures/alpha_texture`, 60 files) samples to Blender 5.2.2's render
+    /// colour at each of its 1024 records, within 2e-6. The generator's fit leaves at most 8.4e-7 over these cases, and
+    /// each record is rounded to six decimals (5e-7), so 2e-6 is that residual plus f32 rounding, not a loosened check.
+    #[test]
+    fn alpha_texture_samples_match_blenders_render() -> Result<(), Box<dyn std::error::Error>> {
+        const TOLERANCE: f64 = 2.0e-6;
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/alpha_texture");
+        let mut cases = 0_usize;
+        for entry in std::fs::read_dir(&directory)? {
+            let path = entry?.path();
+            let Some(file) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let Some(stem) = file
+                .strip_prefix("blender_")
+                .and_then(|rest| rest.strip_suffix(".json"))
+            else {
+                continue;
+            };
+            let document: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+            let (image, interpolation, extension, linked) = oracle_case(stem, &document)?;
+            let records = document["records"]
+                .as_array()
+                .ok_or("records are missing")?;
+            let mut worst = 0.0_f64;
+            for record in records {
+                let value =
+                    |index: usize| record[index].as_f64().ok_or("record value is not a number");
+                let (sample_u, sample_v) = (value(5)?, value(6)?);
+                let expected = [value(2)?, value(3)?, value(4)?];
+                // The records give Blender's UV (V up); the stored rows run top-down, so the pixel lookup flips V.
+                let actual = sample_with_extension_alpha(
+                    &image,
+                    [sample_u, sample_v],
+                    [sample_u, 1.0 - sample_v],
+                    0,
+                    interpolation,
+                    extension,
+                    linked,
+                );
+                for channel in 0..3 {
+                    worst = worst.max((actual[channel] - expected[channel]).abs());
+                }
+            }
+            assert!(
+                worst <= TOLERANCE,
+                "{stem}: worst residual {worst:e} exceeds {TOLERANCE:e}"
+            );
+            cases += 1;
+        }
+        assert_eq!(cases, 60, "every committed oracle case must be checked");
+        Ok(())
     }
 }
