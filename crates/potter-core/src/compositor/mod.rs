@@ -11,7 +11,7 @@ use std::{
 use serde_json::Value;
 
 use crate::{
-    color::{ColorManagement, linear_to_srgb, sample_curve},
+    color::{ColorManagement, sample_curve},
     error::{ErrorCode, PotError, Result},
     graph::{GraphKind, GraphNode, NodeGroup},
     model::{Id, Scene, SceneDoc},
@@ -1078,18 +1078,13 @@ fn encode_display(bytes: &mut [u8], pixels: &[[f32; 4]], settings: &ColorManagem
         ));
     }
     for (pixel, linear) in encoded_pixels.iter_mut().zip(pixels) {
-        let transformed = settings.transform_linear([
+        let display = settings.display_encode([
             f64::from(linear[0]),
             f64::from(linear[1]),
             f64::from(linear[2]),
-        ]);
+        ])?;
         for channel in 0..3 {
-            let display = if settings.display_device == "sRGB" {
-                linear_to_srgb(transformed[channel])
-            } else {
-                transformed[channel]
-            };
-            pixel[channel] = (display.clamp(0.0, 1.0) * 255.0).round() as u8;
+            pixel[channel] = (display[channel] * 255.0).round() as u8;
         }
         pixel[3] = (linear[3].clamp(0.0, 1.0) * 255.0).round() as u8;
     }

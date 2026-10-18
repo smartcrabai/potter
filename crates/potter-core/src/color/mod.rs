@@ -1,5 +1,13 @@
 use serde::{Deserialize, Serialize};
 
+use crate::error::{ErrorCode, PotError, Result};
+
+mod ocio;
+
+/// Scene-to-display view transforms, matching Blender 5.2.2's OCIO views on display `sRGB`:
+/// `Standard`, `AgX` ("AgX Base Rec.1886"), `Filmic` ("Filmic sRGB"), `Raw` ("Non-Color"), and
+/// `FalseColor` ("AgX False Color Rec.709"). Each view has look `None`, exposure 0, and gamma 1.
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ViewTransform {
@@ -37,26 +45,71 @@ impl Default for ColorManagement {
 }
 
 impl ColorManagement {
-    /// Applies exposure, the selected scene-linear view transform, look, curve, and gamma.
-    /// The returned channels are display-linear values; sRGB encoding is a separate step.
-    #[must_use]
-    pub fn transform_linear(&self, rgb: [f64; 3]) -> [f64; 3] {
+    /// Applies exposure, the selected view transform, the RGB curve, and gamma. The returned
+    /// channels are display-linear; sRGB encoding is a separate step in [`Self::display_encode`].
+    ///
+    /// Exact Blender 5.2.2 semantics (OCIO 2.5.0, display `sRGB`, look `None`); exposure is
+    /// applied first as `2^exposure`:
+    /// - `Standard`: identity.
+    /// - `AgX`: E-Gamut matrix, `lg2` window, tetrahedral `AgX_Base_sRGB` LUT, Rec.1886 decode.
+    /// - `Filmic`: `lg2` window, tetrahedral `filmic_desat_33` LUT, uniform `[0, 0.66]`, 1D
+    ///   `filmic_to_0-70_1-03` LUT, sRGB decode.
+    /// - `Raw`: identity; no display encoding.
+    /// - `FalseColor`: E-Gamut matrix, `lg2` window, tetrahedral Rec.2020 `AgX_Base` LUT, Rec.2020
+    ///   luma `^(1/2.5)`, 1D `AgX_False_Color` palette, Rec.1886 decode.
+    ///
+    /// Errors with [`ErrorCode::UnsupportedFeature`] for any display other than `sRGB` or any look
+    /// other than `none`, and with [`ErrorCode::InternalError`] if a vendored LUT fails to load.
+    pub fn transform_linear(&self, rgb: [f64; 3]) -> Result<[f64; 3]> {
+        self.ensure_supported()?;
         let exposure = 2.0_f64.powf(self.exposure);
         let exposed = rgb.map(|value| value * exposure);
         let mut transformed = match self.view_transform {
             ViewTransform::Standard | ViewTransform::Raw => exposed,
-            ViewTransform::AgX => agx(exposed),
-            ViewTransform::Filmic => exposed.map(filmic_lut_approximation),
-            ViewTransform::FalseColor => false_color(exposed),
+            ViewTransform::AgX => ocio::agx_display_linear(exposed)?,
+            ViewTransform::Filmic => ocio::filmic_display_linear(exposed)?,
+            ViewTransform::FalseColor => ocio::false_color_display_linear(exposed)?,
         };
-        apply_look(&mut transformed, &self.look);
         if !self.curve.is_empty() {
             transformed = transformed.map(|value| sample_curve(value, &self.curve));
         }
         if self.gamma.is_finite() && self.gamma > 0.0 && (self.gamma - 1.0).abs() > f64::EPSILON {
             transformed = transformed.map(|value| value.max(0.0).powf(1.0 / self.gamma));
         }
-        transformed
+        Ok(transformed)
+    }
+
+    /// Returns the display buffer values for `rgb`: [`Self::transform_linear`] followed by the
+    /// sRGB OETF, except `Raw`, which is only clamped. The result is clamped to `[0, 1]`.
+    pub fn display_encode(&self, rgb: [f64; 3]) -> Result<[f64; 3]> {
+        let linear = self.transform_linear(rgb)?;
+        let encoded = match self.view_transform {
+            ViewTransform::Raw => linear,
+            _ => linear.map(linear_to_srgb),
+        };
+        Ok(encoded.map(|value| value.clamp(0.0, 1.0)))
+    }
+
+    fn ensure_supported(&self) -> Result<()> {
+        if self.display_device != "sRGB" {
+            return Err(PotError::new(
+                ErrorCode::UnsupportedFeature,
+                format!(
+                    "display device `{}` is not supported; only sRGB is implemented",
+                    self.display_device
+                ),
+            ));
+        }
+        if self.look != "none" {
+            return Err(PotError::new(
+                ErrorCode::UnsupportedFeature,
+                format!(
+                    "color look `{}` is not supported; only `none` is implemented",
+                    self.look
+                ),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -99,72 +152,6 @@ pub(crate) fn linear_to_srgb_f32(value: f32) -> f32 {
         value * 12.92
     } else {
         1.055 * value.max(0.0).powf(1.0 / 2.4) - 0.055
-    }
-}
-
-fn agx(rgb: [f64; 3]) -> [f64; 3] {
-    // AgX's published color-space matrix family, followed by a smooth sigmoid fit to its
-    // log-domain look-up curve. This is a compact monotone fit, not a bit-identical OCIO LUT.
-    const INPUT: [[f64; 3]; 3] = [
-        [0.842_479, 0.042_328, 0.042_375],
-        [0.078_434, 0.878_468, 0.078_433],
-        [0.079_223, 0.079_166, 0.879_142],
-    ];
-    let working = INPUT.map(|row| row[0] * rgb[0] + row[1] * rgb[1] + row[2] * rgb[2]);
-    working.map(|value| {
-        let value = value.max(0.0);
-        let log_value = (value + 0.000_001).log2();
-        let normalized = ((log_value + 10.0) / 16.0).clamp(0.0, 1.0);
-
-        normalized * normalized * (3.0 - 2.0 * normalized)
-    })
-}
-
-/// Analytic approximation of the familiar Filmic display LUT (Hable/Uncharted-2 curve).
-/// The normalized rational curve is used in place of a sampled Blender Filmic LUT.
-fn filmic_lut_approximation(value: f64) -> f64 {
-    const A: f64 = 0.15;
-    const B: f64 = 0.50;
-    const C: f64 = 0.10;
-    const D: f64 = 0.20;
-    const E: f64 = 0.02;
-    const F: f64 = 0.30;
-    let curve = |x: f64| ((x * (A * x + C * B) + D * E) / (x * (A * x + B) + D * F)) - E / F;
-    (curve(value.max(0.0)) / curve(11.2)).clamp(0.0, 1.0)
-}
-
-fn false_color(rgb: [f64; 3]) -> [f64; 3] {
-    let luminance = (rgb[0] * 0.2126 + rgb[1] * 0.7152 + rgb[2] * 0.0722).max(0.0);
-    let normalized = luminance / (1.0 + luminance);
-    let stops = [
-        [0.0, 0.0, 0.5],
-        [0.0, 0.8, 1.0],
-        [0.0, 1.0, 0.0],
-        [1.0, 1.0, 0.0],
-        [1.0, 0.0, 0.0],
-    ];
-    let scaled = normalized * 4.0;
-    let index = (scaled.floor() as usize).min(3);
-    let fraction = scaled - index as f64;
-    std::array::from_fn(|channel| {
-        stops[index][channel] * (1.0 - fraction) + stops[index + 1][channel] * fraction
-    })
-}
-
-fn apply_look(rgb: &mut [f64; 3], look: &str) {
-    let contrast: f64 = match look {
-        "high_contrast" | "High Contrast" | "AgX - High Contrast" | "AgX - Punchy" => 1.25,
-        "medium_high_contrast" | "Medium High Contrast" | "AgX - Medium High Contrast" => 1.1,
-        "medium_low_contrast" | "Medium Low Contrast" | "AgX - Medium Low Contrast" => 0.9,
-        "low_contrast" | "Low Contrast" | "AgX - Low Contrast" => 0.75,
-        "very_low_contrast" | "Very Low Contrast" | "AgX - Very Low Contrast" => 0.6,
-        "very_high_contrast" | "Very High Contrast" | "AgX - Very High Contrast" => 1.4,
-        _ => 1.0,
-    };
-    if (contrast - 1.0).abs() > f64::EPSILON {
-        for value in rgb {
-            *value = (*value - 0.18).mul_add(contrast, 0.18);
-        }
     }
 }
 

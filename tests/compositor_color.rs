@@ -5,6 +5,7 @@ use assert_cmd::Command;
 use potter_core::{
     color::{ColorManagement, ViewTransform, linear_to_srgb},
     compositor::{BlendMode, Image, gaussian_blur, mix_rgb},
+    error::ErrorCode,
 };
 use proptest::prelude::*;
 use tempfile::tempdir;
@@ -193,34 +194,35 @@ fn center_rgb_at(image: &[u8], x: usize, y: usize, width: usize) -> [u8; 3] {
 }
 
 #[test]
-fn exposure_plus_one_doubles_raw_linear_values() {
+fn exposure_plus_one_doubles_raw_linear_values() -> Result<(), Box<dyn Error>> {
     let settings = ColorManagement {
         view_transform: ViewTransform::Raw,
         exposure: 1.0,
         ..ColorManagement::default()
     };
-    let result = settings.transform_linear([0.25, 0.5, 0.75]);
+    let result = settings.transform_linear([0.25, 0.5, 0.75])?;
     assert_eq!(result, [0.5, 1.0, 1.5]);
+    Ok(())
 }
 
 #[test]
-fn view_transforms_look_gamma_and_srgb_encoding_are_applied() {
+fn view_transforms_look_gamma_and_srgb_encoding_are_applied() -> Result<(), Box<dyn Error>> {
     let sample = [0.25; 3];
-    let standard = ColorManagement::default().transform_linear(sample);
+    let standard = ColorManagement::default().transform_linear(sample)?;
     assert_eq!(standard, sample);
 
     let filmic = ColorManagement {
         view_transform: ViewTransform::Filmic,
         ..ColorManagement::default()
     }
-    .transform_linear(sample);
+    .transform_linear(sample)?;
     assert!(filmic[0] < standard[0]);
 
     let false_color = ColorManagement {
         view_transform: ViewTransform::FalseColor,
         ..ColorManagement::default()
     }
-    .transform_linear(sample);
+    .transform_linear(sample)?;
     assert_ne!(false_color[0], false_color[2]);
 
     let gamma = ColorManagement {
@@ -228,17 +230,21 @@ fn view_transforms_look_gamma_and_srgb_encoding_are_applied() {
         gamma: 2.0,
         ..ColorManagement::default()
     }
-    .transform_linear(sample);
+    .transform_linear(sample)?;
     assert_eq!(gamma, [0.5; 3]);
 
-    let look = ColorManagement {
+    let unsupported_look = ColorManagement {
         view_transform: ViewTransform::Raw,
         look: "high_contrast".to_owned(),
         ..ColorManagement::default()
     }
     .transform_linear([0.75; 3]);
-    assert!(look[0] > 0.75);
+    assert!(matches!(
+        unsupported_look,
+        Err(error) if error.code == ErrorCode::UnsupportedFeature
+    ));
     assert!((linear_to_srgb(0.5) - 0.735_356_983_052_449_5).abs() < 1.0e-12);
+    Ok(())
 }
 
 proptest! {
@@ -248,9 +254,14 @@ proptest! {
             view_transform: ViewTransform::AgX,
             ..ColorManagement::default()
         };
-        let zero = settings.transform_linear([0.0; 3]);
-        let lower = settings.transform_linear([value; 3]);
-        let upper = settings.transform_linear([value + delta; 3]);
+        let transform = |rgb: [f64; 3]| {
+            settings
+                .transform_linear(rgb)
+                .unwrap_or_else(|error| panic!("transform_linear failed: {error}"))
+        };
+        let zero = transform([0.0; 3]);
+        let lower = transform([value; 3]);
+        let upper = transform([value + delta; 3]);
         prop_assert!(zero.iter().all(|channel| channel.abs() < 1.0e-12));
         for (low, high) in lower.into_iter().zip(upper) {
             prop_assert!(high + 1.0e-12 >= low);

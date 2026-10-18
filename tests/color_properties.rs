@@ -6,6 +6,13 @@
 use potter_core::color::{ColorManagement, ViewTransform, linear_to_srgb};
 use proptest::prelude::*;
 
+/// Runs `transform_linear` for settings that are supported (sRGB display, look `none`).
+fn transform(settings: &ColorManagement, rgb: [f64; 3]) -> [f64; 3] {
+    settings
+        .transform_linear(rgb)
+        .unwrap_or_else(|error| panic!("transform_linear failed: {error}"))
+}
+
 proptest! {
     #[test]
     fn raw_and_standard_transforms_are_identity_for_finite_channels(
@@ -16,7 +23,7 @@ proptest! {
                 view_transform,
                 ..ColorManagement::default()
             };
-            prop_assert_eq!(settings.transform_linear(rgb), rgb);
+            prop_assert_eq!(transform(&settings, rgb), rgb);
         }
     }
 
@@ -30,8 +37,8 @@ proptest! {
                 view_transform,
                 ..ColorManagement::default()
             };
-            let lower = settings.transform_linear([value; 3]);
-            let upper = settings.transform_linear([value + delta; 3]);
+            let lower = transform(&settings, [value; 3]);
+            let upper = transform(&settings, [value + delta; 3]);
             for (low, high) in lower.into_iter().zip(upper) {
                 prop_assert!(high + 1.0e-12 >= low);
             }
@@ -42,8 +49,8 @@ proptest! {
             gamma: 2.5,
             ..ColorManagement::default()
         };
-        let lower = gamma.transform_linear([value; 3]);
-        let upper = gamma.transform_linear([value + delta; 3]);
+        let lower = transform(&gamma, [value; 3]);
+        let upper = transform(&gamma, [value + delta; 3]);
         for (low, high) in lower.into_iter().zip(upper) {
             prop_assert!(high + 1.0e-12 >= low);
         }
@@ -51,28 +58,20 @@ proptest! {
     }
 
     #[test]
-    fn monotone_curve_and_contrast_look_preserve_channel_order(
+    fn monotone_curve_preserves_channel_order(
         lower in 0.0_f64..0.9,
         delta in 0.0_f64..0.1
     ) {
         let upper = (lower + delta).min(1.0);
-        for settings in [
-            ColorManagement {
-                view_transform: ViewTransform::Raw,
-                curve: vec![[0.0, 0.0], [0.5, 0.25], [1.0, 1.0]],
-                ..ColorManagement::default()
-            },
-            ColorManagement {
-                view_transform: ViewTransform::Raw,
-                look: "high_contrast".to_owned(),
-                ..ColorManagement::default()
-            },
-        ] {
-            let lower = settings.transform_linear([lower; 3]);
-            let upper = settings.transform_linear([upper; 3]);
-            for (low, high) in lower.into_iter().zip(upper) {
-                prop_assert!(high + 1.0e-12 >= low);
-            }
+        let settings = ColorManagement {
+            view_transform: ViewTransform::Raw,
+            curve: vec![[0.0, 0.0], [0.5, 0.25], [1.0, 1.0]],
+            ..ColorManagement::default()
+        };
+        let lower = transform(&settings, [lower; 3]);
+        let upper = transform(&settings, [upper; 3]);
+        for (low, high) in lower.into_iter().zip(upper) {
+            prop_assert!(high + 1.0e-12 >= low);
         }
     }
 }
