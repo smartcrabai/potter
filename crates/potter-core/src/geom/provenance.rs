@@ -36,6 +36,9 @@ pub(crate) struct Origin {
     /// with the input corner index counted as in [`corner_offsets`]. `None` derives corner sources
     /// from the vertex origins restricted to each output face's source polygon.
     pub corners: Option<Vec<Vec<(usize, f64)>>>,
+    /// Explicit source edge per output edge, in output order: the input edge index, or `None` for an edge
+    /// with no source. `None` derives edge sources from the vertex origins (see [`edge_sources`]).
+    pub edges: Option<Vec<Option<usize>>>,
 }
 
 impl Origin {
@@ -51,6 +54,7 @@ impl Origin {
                 .collect(),
             faces,
             corners: None,
+            edges: None,
         }
     }
 }
@@ -87,6 +91,16 @@ pub(crate) fn remap_attributes_skipping(
     skipped: &[&str],
 ) -> Result<()> {
     if origin.vertices.len() != output.vertices.len() || origin.faces.len() != output.faces.len() {
+        return Err(PotError::new(
+            ErrorCode::InternalError,
+            "modifier provenance does not describe the rebuilt mesh",
+        ));
+    }
+    if origin
+        .edges
+        .as_ref()
+        .is_some_and(|edges| edges.len() != output.edges.len())
+    {
         return Err(PotError::new(
             ErrorCode::InternalError,
             "modifier provenance does not describe the rebuilt mesh",
@@ -289,7 +303,8 @@ fn with_values(entry: &Value, values: Value) -> Value {
     Value::Object(fields)
 }
 
-/// Source edges each output edge blends from, with equal weights. Candidates are the distinct input
+/// Source edges each output edge blends from, with equal weights. An explicit `origin.edges` entry is
+/// the output edge's only source, or none. Otherwise candidates are the distinct input
 /// edges joining a source vertex of the output edge's first endpoint to a source vertex of its
 /// second. When the endpoints share a source vertex (a subdivision inner edge, for example), a
 /// candidate counts only if its two vertices are every source of both endpoints; otherwise the
@@ -301,6 +316,12 @@ fn edge_sources(
     origin: &Origin,
     output_vertex_index: &HashMap<u32, usize>,
 ) -> Vec<Vec<(usize, f64)>> {
+    if let Some(edges) = &origin.edges {
+        return edges
+            .iter()
+            .map(|edge| edge.map_or_else(Vec::new, |index| vec![(index, 1.0)]))
+            .collect();
+    }
     let source_vertex_index: HashMap<u32, usize> = source
         .vertices
         .iter()
@@ -1291,6 +1312,7 @@ mod tests {
             vertices: vec![vec![(0, 1.0)], vec![(1, 1.0)], vec![(0, 0.5), (1, 0.5)]],
             faces: vec![Some(0)],
             corners: None,
+            edges: None,
         };
         remap_attributes(&source, &mut output, &origin).expect("remap");
         let out_ids: Vec<u32> = output.vertices.iter().map(|vertex| vertex.id).collect();
@@ -1367,6 +1389,7 @@ mod tests {
             ],
             faces: vec![Some(0); 4],
             corners: None,
+            edges: None,
         };
         remap_attributes(&source, &mut output, &origin).expect("remap");
         let centre = output.vertices[8].id;
@@ -1413,6 +1436,7 @@ mod tests {
             vertices: vec![vec![(0, 0.5), (2, 0.5)], vec![(1, 0.5), (3, 0.5)]],
             faces: Vec::new(),
             corners: None,
+            edges: None,
         };
         remap_attributes(&source, &mut output, &origin).expect("remap");
         assert_eq!(edge_flags(&output, "sharp"), vec![true]);
@@ -1454,6 +1478,7 @@ mod tests {
             vertices: vec![vec![(0, 1.0)], vec![(1, 1.0)], vec![(0, 0.5), (1, 0.5)]],
             faces: vec![Some(0)],
             corners: None,
+            edges: None,
         };
         remap_attributes(&source, &mut output, &origin).expect("remap");
         let out_vertex = format!("v{}", output.vertices[2].id);
@@ -1510,6 +1535,7 @@ mod tests {
             vertices: vec![vec![(0, 1.0)], vec![(1, 1.0)], vec![(0, 0.5), (1, 0.5)]],
             faces: vec![Some(0)],
             corners: None,
+            edges: None,
         };
         remap_attributes(&source, &mut output, &origin).expect("remap");
 
@@ -1576,6 +1602,7 @@ mod tests {
                 vec![(0, 0.5), (1, 0.5)],
                 vec![(2, 1.0)],
             ]),
+            edges: None,
         };
         remap_attributes(&source, &mut output, &origin).expect("remap");
         let layers = uv_layers::read_layers(&output);
@@ -1631,6 +1658,7 @@ mod tests {
                 vec![(1, 0.5), (3, 0.5)],
                 Vec::new(),
             ]),
+            edges: None,
         };
 
         remap_attributes(&source, &mut output, &origin).expect("remap");

@@ -569,3 +569,37 @@ pub(super) fn reorder_blender_attributes(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::reorder_blender_attributes;
+    use crate::geom::Mesh;
+
+    #[test]
+    fn positional_blender_entries_follow_element_permutations() {
+        let mut mesh = Mesh::new();
+        mesh.attributes.insert(
+            "blender_attributes".to_owned(),
+            json!([
+                {"name": "p", "domain": "POINT", "data_type": "FLOAT", "values": [0.0, 1.0, 2.0]},
+                {"name": "e", "domain": "EDGE", "data_type": "FLOAT", "values": [10.0, 11.0]},
+                {"name": "f", "domain": "FACE", "data_type": "FLOAT", "values": [20.0]},
+                {"name": "c", "domain": "CORNER", "data_type": "FLOAT", "values": [30.0, 31.0, 32.0, 33.0]},
+                {"name": "short", "domain": "POINT", "data_type": "FLOAT", "values": [7.0]}
+            ]),
+        );
+        reorder_blender_attributes(&mut mesh, &[2, 0, 1], &[1, 0], &[0]);
+        let entries = mesh.attributes["blender_attributes"]
+            .as_array()
+            .expect("entries stay an array");
+        assert_eq!(entries[0]["values"], json!([2.0, 0.0, 1.0]));
+        assert_eq!(entries[1]["values"], json!([11.0, 10.0]));
+        assert_eq!(entries[2]["values"], json!([20.0]));
+        // Corner rows are permuted by the corner order, not by this function.
+        assert_eq!(entries[3]["values"], json!([30.0, 31.0, 32.0, 33.0]));
+        // A length that matches no element domain is left as stored.
+        assert_eq!(entries[4]["values"], json!([7.0]));
+    }
+}

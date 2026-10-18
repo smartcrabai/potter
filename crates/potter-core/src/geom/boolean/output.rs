@@ -135,6 +135,7 @@ pub(crate) fn polys_to_mesh(
             .collect(),
         faces: planned.iter().map(|face| Some(face.joined_face)).collect(),
         corners: Some(corner_sources(&joined, &planned, &positions)),
+        edges: None,
     };
     remap_attributes(&joined.mesh, &mut mesh, &origin)?;
     negate_flipped_custom_normals(&mut mesh, &flipped)?;

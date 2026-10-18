@@ -507,6 +507,7 @@ pub(super) fn subdivided_mesh(
             .flat_map(|(index, (face, _))| std::iter::repeat_n(Some(index), face.len()))
             .collect(),
         corners: None,
+        edges: None,
     };
     let mut output = build_mesh(points, output_polygons, output_loose_edges, &origin, mesh)?;
     encode_byte_colors(mesh, &origin, &mut output);
@@ -536,7 +537,7 @@ pub(super) fn subdivided_mesh(
 /// linear. Each subdivided value mixes its sources' bytes and truncates the sum to a byte, so the result is
 /// not a linear mix. Potter's colour store is linear, so every byte-typed layer is re-blended here from the
 /// same origins the attribute remap used, and float layers keep the linear remap.
-fn encode_byte_colors(source: &Mesh, origin: &Origin, output: &mut Mesh) {
+pub(super) fn encode_byte_colors(source: &Mesh, origin: &Origin, output: &mut Mesh) {
     let Some(types) = source
         .attributes
         .get("blender_metadata")
@@ -561,7 +562,14 @@ fn encode_byte_colors(source: &Mesh, origin: &Origin, output: &mut Mesh) {
         .enumerate()
         .map(|(index, vertex)| (vertex.id, index))
         .collect();
-    let corners = corner_sources(source, origin, output, &output_vertex_index);
+    let derived;
+    let corners: &[Vec<(usize, f64)>] = match &origin.corners {
+        Some(corners) => corners,
+        None => {
+            derived = corner_sources(source, origin, output, &output_vertex_index);
+            &derived
+        }
+    };
     for layer in &mut store.layers {
         if !byte_layers.contains(layer.name.as_str()) {
             continue;
@@ -575,7 +583,7 @@ fn encode_byte_colors(source: &Mesh, origin: &Origin, output: &mut Mesh) {
         };
         let sources = match layer.domain {
             ColorDomain::Point => origin.vertices.as_slice(),
-            ColorDomain::Corner => corners.as_slice(),
+            ColorDomain::Corner => corners,
         };
         layer.values = sources
             .iter()

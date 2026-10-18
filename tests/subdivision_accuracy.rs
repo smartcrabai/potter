@@ -48,6 +48,9 @@ const CREASE_TOLERANCE: f64 = 1.0e-6;
 // Non-manifold splits put several Blender vertices at one position; vertices closer than this
 // are one position, and each position must have the same multiplicity on both sides.
 const CLUSTER_TOLERANCE: f64 = 1.0e-4;
+// Generic values are float32 interpolations of values near 300 (one ulp is 3e-5 there), so they
+// are bounded relative to magnitude at eight float32 ulps; this check is new, not an existing bound.
+const GENERIC_ATTRIBUTE_TOLERANCE: f64 = 1.0e-5;
 
 fn number(value: &Value) -> TestResult<f64> {
     value.as_f64().ok_or_else(|| "expected a number".into())
@@ -751,7 +754,7 @@ fn input_mesh(spec: &Value, blender_input_edges: &Value) -> TestResult<Mesh> {
             json!({"domain": "point", "type": "float", "values": values}),
         );
     }
-    let mut ordered = Vec::new();
+    // Generic attributes live in the native keyed store under their own names, keyed by element ID.
     for definition in spec["order_attributes"]
         .as_array()
         .ok_or("order attribute definitions missing")?
@@ -762,32 +765,50 @@ fn input_mesh(spec: &Value, blender_input_edges: &Value) -> TestResult<Mesh> {
         let domain = definition["domain"]
             .as_str()
             .ok_or("order attribute domain missing")?;
-        let values: Vec<Value> = match domain {
-            "POINT" => (0..mesh.vertices.len())
-                .map(|index| json!(index as f64 + 0.25))
-                .collect(),
-            "EDGE" => (0..mesh.edges.len())
-                .map(|index| json!(100.25 + index as f64))
-                .collect(),
-            "FACE" => (0..mesh.faces.len())
-                .map(|index| json!(200.25 + index as f64))
-                .collect(),
-            "CORNER" => mesh
-                .faces
-                .iter()
-                .enumerate()
-                .flat_map(|(face, polygon)| {
-                    std::iter::repeat_n(json!(300.25 + face as f64), polygon.vertices.len())
-                })
-                .collect(),
+        let (native_domain, values) = match domain {
+            "POINT" => (
+                "point",
+                mesh.vertices
+                    .iter()
+                    .enumerate()
+                    .map(|(index, vertex)| (format!("v{}", vertex.id), json!(index as f64 + 0.25)))
+                    .collect::<Map<_, _>>(),
+            ),
+            "EDGE" => (
+                "edge",
+                mesh.edges
+                    .iter()
+                    .enumerate()
+                    .map(|(index, edge)| (format!("e{}", edge.id), json!(100.25 + index as f64)))
+                    .collect::<Map<_, _>>(),
+            ),
+            "FACE" => (
+                "face",
+                mesh.faces
+                    .iter()
+                    .enumerate()
+                    .map(|(index, face)| (format!("f{}", face.id), json!(200.25 + index as f64)))
+                    .collect::<Map<_, _>>(),
+            ),
+            "CORNER" => (
+                "corner",
+                mesh.faces
+                    .iter()
+                    .enumerate()
+                    .map(|(index, face)| {
+                        (
+                            format!("f{}", face.id),
+                            Value::Array(vec![json!(300.25 + index as f64); face.vertices.len()]),
+                        )
+                    })
+                    .collect::<Map<_, _>>(),
+            ),
             _ => return Err(format!("unknown order attribute domain {domain}").into()),
         };
-        ordered
-            .push(json!({"name": name, "domain": domain, "data_type": "FLOAT", "values": values}));
-    }
-    if !ordered.is_empty() {
-        mesh.attributes
-            .insert("blender_attributes".to_owned(), Value::Array(ordered));
+        mesh.attributes.insert(
+            name.to_owned(),
+            json!({"domain": native_domain, "type": "float", "values": values}),
+        );
     }
     Ok(mesh)
 }
@@ -937,6 +958,99 @@ fn compare_storage_order(actual: &Shape, expected: &Shape) -> Result<(), String>
                 .any(|(a, b)| (a - b).abs() > 1.0e-6)
         {
             return Err(format!("vertex group {name} differs in vertex order"));
+        }
+    }
+    Ok(())
+}
+
+/// Compares Blender's generic POINT/EDGE/FACE/CORNER values, in storage order, with the values of the
+/// native keyed store of `mesh`. Every element must carry a value: none is defaulted.
+fn compare_ordered_attributes(mesh: &Mesh, expected: &Value) -> TestResult<()> {
+    let expected = expected
+        .as_array()
+        .ok_or("oracle ordered attributes missing")?;
+    for definition in expected {
+        let name = definition["name"]
+            .as_str()
+            .ok_or("oracle ordered attribute name missing")?;
+        let domain = definition["domain"]
+            .as_str()
+            .ok_or("oracle ordered attribute domain missing")?;
+        let attribute = mesh
+            .attributes
+            .get(name)
+            .ok_or_else(|| format!("generic attribute {name} is missing"))?;
+        let values = attribute["values"]
+            .as_object()
+            .ok_or_else(|| format!("generic attribute {name} has no values"))?;
+        let native_domain = domain.to_ascii_lowercase();
+        if attribute["domain"] != native_domain.as_str() {
+            return Err(
+                format!("generic attribute {name} is not on the {native_domain} domain").into(),
+            );
+        }
+        let stored = |key: String| -> TestResult<f64> {
+            values
+                .get(&key)
+                .ok_or_else(|| format!("generic attribute {name} has no value for {key}").into())
+                .and_then(number)
+        };
+        let actual: Vec<f64> = match domain {
+            "POINT" => mesh
+                .vertices
+                .iter()
+                .map(|vertex| stored(format!("v{}", vertex.id)))
+                .collect::<TestResult<_>>()?,
+            "EDGE" => mesh
+                .edges
+                .iter()
+                .map(|edge| stored(format!("e{}", edge.id)))
+                .collect::<TestResult<_>>()?,
+            "FACE" => mesh
+                .faces
+                .iter()
+                .map(|face| stored(format!("f{}", face.id)))
+                .collect::<TestResult<_>>()?,
+            "CORNER" => {
+                let mut corners = Vec::new();
+                for face in &mesh.faces {
+                    let row = values
+                        .get(&format!("f{}", face.id))
+                        .and_then(Value::as_array)
+                        .ok_or_else(|| format!("generic attribute {name} has no corner row"))?;
+                    if row.len() != face.vertices.len() {
+                        return Err(format!(
+                            "generic attribute {name} corner row has the wrong length"
+                        )
+                        .into());
+                    }
+                    for value in row {
+                        corners.push(number(value)?);
+                    }
+                }
+                corners
+            }
+            _ => return Err(format!("unknown order attribute domain {domain}").into()),
+        };
+        let expected_values = definition["values"]
+            .as_array()
+            .ok_or("oracle ordered attribute values missing")?;
+        if actual.len() != expected_values.len() {
+            return Err(format!(
+                "generic attribute {name} has {} elements, Blender has {}",
+                actual.len(),
+                expected_values.len()
+            )
+            .into());
+        }
+        for (index, (actual, expected)) in actual.iter().zip(expected_values).enumerate() {
+            let expected = number(expected)?;
+            if (actual - expected).abs() > GENERIC_ATTRIBUTE_TOLERANCE * expected.abs().max(1.0) {
+                return Err(format!(
+                    "generic attribute {name} {domain} element {index} is {actual}, Blender has {expected}"
+                )
+                .into());
+            }
         }
     }
     Ok(())
@@ -1295,6 +1409,7 @@ fn compare_case(case: &Value, spec: &Value) -> TestResult<Errors> {
         runtime: ModifierRuntime::default(),
     };
     let actual_mesh = evaluate_modifiers(&mesh, &[modifier])?;
+    compare_ordered_attributes(&actual_mesh, &case["expected"]["ordered_attributes"])?;
     let actual = potter_shape(&actual_mesh)?;
     let expected = oracle_shape(&case["expected"])?;
     compare_storage_order(&actual, &expected)

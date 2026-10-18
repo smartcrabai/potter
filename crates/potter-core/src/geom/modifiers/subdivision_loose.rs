@@ -179,6 +179,21 @@ impl LooseEdges {
             .collect()
     }
 
+    /// The base vertices a loose-only vertex blends, with Blender's weights, or `None` without a
+    /// placement. A loose end point copies its base vertex. An interior point mixes the stored ends of
+    /// its base edge by `(1 - u, u)` (`subdiv_mesh_vert_of_loose_edge_interpolate`, `subdiv_mesh.cc:1434`).
+    pub(super) fn sources(&self, vertex: usize) -> Option<Vec<(usize, f64)>> {
+        let placement = (*self.placements.get(vertex)?)?;
+        let [first, second] = self.edges[placement.edge];
+        Some(if placement.u <= 0.0 {
+            vec![(first, 1.0)]
+        } else if placement.u >= 1.0 {
+            vec![(second, 1.0)]
+        } else {
+            vec![(first, 1.0 - placement.u), (second, placement.u)]
+        })
+    }
+
     /// The other end of the base edge that continues `edge` at `vertex`. A vertex with exactly two
     /// edges has one (`find_edge_neighbors`); any other vertex has none.
     fn neighbour(&self, edge: usize, vertex: usize) -> Option<usize> {

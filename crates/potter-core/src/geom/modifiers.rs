@@ -24,7 +24,9 @@ use super::triangulate::{NgonMethod, QuadMethod, triangulate_mesh};
 use super::{
     Edge, Face, Mesh, MeshError, Vertex, edge_key,
     normals::{corner_normals, face_normal, safe_acos_approx, sharp_edge_flags},
-    provenance::{Origin, edge_flags, mean_value_corners, remap_attributes},
+    provenance::{
+        Origin, edge_flags, mean_value_corners, remap_attributes, remap_attributes_skipping,
+    },
     uv_layers,
 };
 
@@ -41,6 +43,7 @@ mod subdivision_limit;
 mod subdivision_loose;
 mod subdivision_normals;
 mod subdivision_order;
+mod subdivision_origin;
 mod subdivision_uv;
 use subdivision_limit::Samples;
 type Polygon = (Vec<usize>, u32);
@@ -1413,6 +1416,7 @@ fn mirror(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             .map(|&polygon| Some(polygon % source_polygons.len()))
             .collect(),
         corners: None,
+        edges: None,
     };
     // Each copy has one mirror pass per mirrored axis in its copy mask, so its UVs take that many
     // passes; merged polygons keep the lowest copy they came from, as in the origin above.
@@ -1795,6 +1799,7 @@ fn array(
             provenance_source,
             source_face,
         )),
+        edges: None,
     };
     let passes: Vec<usize> = merged
         .polygon_sources
@@ -2541,6 +2546,26 @@ fn subdivision(
             format!("Blender subdivision output ordering failed: {message}"),
         )
     })?;
+    // Attributes move by Blender's interpolation rules while the output is still in pre-permutation
+    // storage, the storage that `samples` and `loose` describe.
+    let origin = subdivision_origin::build(
+        mesh,
+        &base_polygons,
+        &base_edges,
+        &loop_starts,
+        &samples,
+        &loose,
+        &result,
+    )?;
+    let written = subdivision_origin::take_written(&mut result);
+    remap_attributes_skipping(
+        mesh,
+        &mut result,
+        &origin,
+        &subdivision_origin::WRITTEN_KEYS,
+    )?;
+    subdivision_origin::restore_written(&mut result, written);
+    subdivision_uv::encode_byte_colors(mesh, &origin, &mut result);
     for (face, &start) in result.faces.iter_mut().zip(&order.face_starts) {
         face.vertices.rotate_left(start);
     }
@@ -2551,6 +2576,7 @@ fn subdivision(
         &order.edges,
         &order.faces,
     );
+    subdivision_origin::reorder_legacy(&mut result, &order.vertices, &order.edges, &order.faces);
     let mut old_faces: Vec<Option<Face>> = std::mem::take(&mut result.faces)
         .into_iter()
         .map(Some)
@@ -4912,6 +4938,7 @@ fn bevel_vertices(
         vertices: compact_origins,
         faces: face_sources,
         corners: Some(corners),
+        edges: None,
     };
     build_mesh(
         compact_points,
@@ -5015,6 +5042,7 @@ fn decimate_compact(
         vertices: compact_origin,
         faces: origin.faces,
         corners: origin.corners,
+        edges: None,
     };
     build_mesh(compact_points, polygons, loose, &origin, source)
 }
@@ -5083,6 +5111,7 @@ fn weld(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             .map(|&face| Some(face))
             .collect(),
         corners: None,
+        edges: None,
     };
     let mut result = build_mesh(merged.points, merged.polygons, merged.edges, &origin, mesh)?;
     clnor::transfer_custom_normals(mesh, &mut result, &sources, NormalCodeOptions::default())?;
