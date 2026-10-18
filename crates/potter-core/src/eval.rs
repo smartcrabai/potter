@@ -92,7 +92,7 @@ pub struct EvaluatedNode {
     /// the evaluated count. Apply writes it back to DATA, and a quick Boolean operand hands it to its
     /// subject. Not serialized.
     #[serde(skip)]
-    pub(crate) mesh_materials: Vec<Option<Id>>,
+    pub mesh_materials: Vec<Option<Id>>,
 }
 
 /// Evaluated world-space Grease Pencil stroke used by vector exporters and preview.

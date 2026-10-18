@@ -2596,10 +2596,6 @@ pub fn evaluate_boolean(document: &SceneDoc, node_id: &Id) -> TestResult<Canonic
         .nodes
         .get(node_id)
         .ok_or_else(|| format!("Potter has no model node `{}`", node_id.as_str()))?;
-    let data = model_node
-        .data
-        .as_ref()
-        .and_then(|data_id| boolean_only.data_blocks.get(data_id));
     let slot_count = node.materials.len();
     let object_materials = (0..slot_count)
         .map(|slot| {
@@ -2615,8 +2611,8 @@ pub fn evaluate_boolean(document: &SceneDoc, node_id: &Id) -> TestResult<Canonic
         .iter()
         .map(|material| optional_material_name(&boolean_only, node_id, material.as_ref()))
         .collect::<TestResult<Vec<_>>>()?;
-    let data_materials = data
-        .map_or(&[][..], |data| data.materials.as_slice())
+    let data_materials = node
+        .mesh_materials
         .iter()
         .map(|material| optional_material_name(&boolean_only, node_id, material.as_ref()))
         .collect::<TestResult<Vec<_>>>()?;
