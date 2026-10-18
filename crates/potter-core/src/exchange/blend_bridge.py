@@ -1147,10 +1147,26 @@ def _armature_bbone_settings(bone):
     return settings
 
 
+def _armature_bone_selection(armature):
+    """Return {bone name: selected} read from the armature's owner object pose.
+
+    Blender 5.2 removed ``Bone.select``. Selection is edited through ``EditBone.select``, and
+    leaving edit mode mirrors it onto ``PoseBone.select``, so the owner object's pose channels
+    are the object-mode read. Armature data with no owning object that has a pose reports no
+    selection.
+    """
+    owner = next((obj for obj in bpy.data.objects
+                  if obj.data == armature and obj.pose is not None), None)
+    if owner is None:
+        return {}
+    return {pose_bone.name: bool(pose_bone.select) for pose_bone in owner.pose.bones}
+
+
 def _armature_dump(armature):
     bones = []
     bone_ids = _id_map(armature, "potter.bone_ids_json")
     bone_rolls = _armature_bone_rolls(armature)
+    selection = _armature_bone_selection(armature)
     for bone in armature.bones:
         bones.append({"name": bone.name, "potter_id": bone_ids.get(bone.name),
                       "parent": bone.parent.name if bone.parent else None,
@@ -1158,7 +1174,7 @@ def _armature_dump(armature):
                       "roll": bone_rolls[bone.name], "deform": bool(bone.use_deform),
                       "inherit_rotation": bool(bone.use_inherit_rotation),
                       "use_connect": bool(bone.use_connect),
-                      "select": bool(bone.select),
+                      "select": selection.get(bone.name, False),
                       "envelope_distance": float(bone.envelope_distance),
                       "envelope_weight": float(bone.envelope_weight),
                       "head_radius": float(bone.head_radius),
@@ -2467,7 +2483,8 @@ def set_rna(block, values, id_lookup=None, *, strict=False, owner=None):
                 raise
             continue
 
-def _restore_modifier_id_references(modifier, params, id_lookup, texture_lookup):
+def _restore_modifier_id_references(modifier, params, id_lookup, texture_lookup,
+                                    lost_texture_ids=frozenset()):
     for key, value in params.items():
         if not hasattr(modifier, key):
             continue
@@ -2477,6 +2494,9 @@ def _restore_modifier_id_references(modifier, params, id_lookup, texture_lookup)
         name = value.get("name") if isinstance(value, dict) else value
         lookup = texture_lookup if pointer_type == "Texture" else id_lookup
         candidate = lookup.get(name) if isinstance(name, str) else None
+        if candidate is None and pointer_type == "Texture" and name in lost_texture_ids:
+            # Rust reports a native Value Noise texture as a loss; the modifier keeps no texture.
+            continue
         if (candidate is None
                 or candidate.bl_rna.identifier != pointer_type
                 or (isinstance(value, dict)
@@ -2558,6 +2578,9 @@ def _legacy_textures_from_doc(doc, image_map):
             if texture_type != "IMAGE" or not hasattr(texture, "color_ramp"):
                 raise ValueError("legacy Texture %s cannot restore its ColorRamp"
                                  % texture_id)
+            # Blender allocates a texture's ColorRamp only while use_color_ramp is set.
+            if texture.color_ramp is None:
+                texture.use_color_ramp = True
             _restore_color_ramp(
                 texture.color_ramp, color_ramp_settings,
                 "legacy Image Texture %s ColorRamp" % texture_id)
@@ -3005,7 +3028,13 @@ def set_modifier_params(modifier, item, id_lookup, texture_lookup, doc, target, 
         rna_params.pop("texture", None)
         modifier.texture = None
     set_rna(modifier, rna_params, id_lookup)
-    _restore_modifier_id_references(modifier, rna_params, id_lookup, texture_lookup)
+    lost_texture_ids = {
+        texture_id
+        for texture_id, record in doc.get("resources", {}).items()
+        if record.get("texture_type") == "NATIVE_VALUE_NOISE"
+    }
+    _restore_modifier_id_references(modifier, rna_params, id_lookup, texture_lookup,
+                                    lost_texture_ids)
     if kind in ("vertex_weight_edit", "vertex_weight_proximity") and "map_curve" in params:
         _set_curve_mapping(modifier, params["map_curve"])
     if kind in ("hook", "warp") and "falloff_curve" in params:
@@ -3289,8 +3318,13 @@ def _bind_corrective_smooth(obj, modifier, binding_data, operator):
         for item in stack[index:]:
             item.show_viewport = False
         view_layer.update()
-        evaluated = obj.evaluated_get(bpy.context.evaluated_depsgraph_get())
-        input_mesh = evaluated.to_mesh(preserve_all_data_layers=True)
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        evaluated = obj.evaluated_get(depsgraph)
+        # preserve_all_data_layers=True needs the depsgraph; without it Blender returns None.
+        input_mesh = evaluated.to_mesh(preserve_all_data_layers=True, depsgraph=depsgraph)
+        if input_mesh is None:
+            raise RuntimeError("corrective smooth %s on %s has no input mesh"
+                               % (modifier.name, obj.name))
         try:
             if len(input_mesh.vertices) != len(coords):
                 raise ValueError(
