@@ -231,12 +231,13 @@ fn deform_vertex(
     };
     match stroke.brush {
         Brush::Draw => {
-            // Blender 5.2.2 Draw (draw.cc:194-197): offset = normal * radius * scale * bstrength.
-            // bstrength = strength^2 * pressure * overlap * flip * feather (sculpt.cc:2338-2360).
+            // Blender 5.2.2 Draw (draw.cc:196-197): offset = normal * radius * scale * bstrength, with
+            // scale = 1 (Potter has no stroke aspect scale). bstrength = alpha * pressure * overlap *
+            // flip * feather (sculpt.cc:2360), alpha = strength^2 (sculpt.cc:2338-2339).
             // `influence` holds falloff * pressure * strength, so radius * strength * influence is
-            // Blender's product for one unmasked dab (overlap, flip, feather = 1).
-            let deterministic = deterministic_scale(stroke.seed, point, &stroke.symmetry);
-            point + normal * (radius * strength * influence * deterministic)
+            // Blender's offset for one unmasked dab, taking overlap, flip and feather as 1.
+            // Blender has no per-vertex jitter, so none is applied here.
+            point + normal * (radius * strength * influence)
         }
         Brush::ClayStrips | Brush::Inflate | Brush::Layer => {
             let multiplier = if stroke.brush == Brush::ClayStrips {
@@ -1182,6 +1183,49 @@ mod tests {
             assert_eq!(first, second, "{brush:?}");
             first.validate().unwrap();
         }
+    }
+
+    #[test]
+    fn draw_offset_is_radius_times_strength_times_influence_without_jitter() {
+        // Blender 5.2.2 Draw: offset = normal * radius * scale * bstrength (draw.cc:196-197), with
+        // bstrength = alpha * pressure * overlap * flip * feather and alpha = strength^2
+        // (sculpt.cc:2338-2360). Overlap, flip and feather are 1; the linear falloff is the only
+        // spatial factor. Blender applies no per-vertex random scale.
+        let radius = 3.0;
+        let strength = 0.5;
+        let pressure = 1.0;
+        let stroke = |seed| Stroke {
+            brush: Brush::Draw,
+            samples: vec![StrokeSample {
+                position: DVec3::ZERO,
+                pressure,
+                radius,
+                strength,
+                time: 0.0,
+            }],
+            falloff: Falloff::Linear,
+            symmetry: Vec::new(),
+            seed,
+            delta: None,
+        };
+        // The sample sits on vertex 0 (distance 0) and 1 unit from vertices 1 and 2, so linear falloff
+        // at distance / radius gives weights 1, 1 - 1/3, 1 - 1/3. The triangle's normal is +Z.
+        let weights = [1.0, 1.0 - 1.0 / radius, 1.0 - 1.0 / radius];
+        let original = test_mesh();
+        let mut mesh = test_mesh();
+        apply_stroke(&mut mesh, &stroke(17)).unwrap();
+        for (index, (vertex, start)) in mesh.vertices.iter().zip(&original.vertices).enumerate() {
+            let expected =
+                start.co + DVec3::Z * (radius * strength * (weights[index] * pressure * strength));
+            assert!(
+                vertex.co.distance(expected) < 1.0e-12,
+                "vertex {index}: {:?} != {expected:?}",
+                vertex.co
+            );
+        }
+        let mut reseeded = test_mesh();
+        apply_stroke(&mut reseeded, &stroke(9_999)).unwrap();
+        assert_eq!(mesh, reseeded);
     }
 
     #[test]

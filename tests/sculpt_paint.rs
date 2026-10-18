@@ -173,11 +173,16 @@ const DRIVEN_ARMATURE_ORACLE: &str =
 /// Both sides evaluate the same pre-stroke geometry, so vertices are paired by pre-stroke position. Blender
 /// evaluates in float32 (one ulp at |x| ~ 2.5 is about 2.4e-7); 1e-5 is a 40x margin for pairing only.
 const ORACLE_PRESTROKE_TOLERANCE: f64 = 1.0e-5;
-/// Potter's Draw multiplies each displacement by a seeded per-vertex scale in [0.98, 1.0]
-/// (`deterministic_scale` in crates/potter-core/src/geom/sculpt.rs). Blender's Draw has no such jitter. The largest
-/// sculpt-level displacement is 1.5 * 0.25 = 0.375 at the centre, so the jitter can separate the two by at most
-/// 0.02 * 0.375. Evaluated positions are averages of the sculpt-level grid, so the bound carries to the evaluated mesh.
-const ORACLE_POSITION_TOLERANCE: f64 = 0.02 * 0.375;
+/// Potter's Draw (crates/potter-core/src/geom/sculpt.rs, Draw branch) computes Blender's Draw offset
+/// (draw.cc:196-197) exactly, so the remaining gap is float32 rounding in Blender. Bound, with u = 2^-24 = 5.96e-8:
+/// - M = 3.34 bounds |coordinate| in driven_armature_sculpt.json (object space; the largest is 3.3338).
+/// - N = 35 rounding steps on the stroke path, per axis: the offset scalars, fade and position add (5); tangent
+///   storage and reconstruction (6); bilinear grid interpolation (7); and a 9-weight Catmull-Clark stencil with
+///   8 adds (17). Counted from the stencil shapes, not from Blender's compiled instruction stream.
+/// - Euclidean bound sqrt(3) * N * u * M = 1.2e-5 for the stroke path.
+/// - Pre-stroke pairing is asserted separately to ORACLE_PRESTROKE_TOLERANCE (1e-5); adding it gives 2.2e-5.
+/// Rounded up to a power of ten: 1e-4.
+const ORACLE_POSITION_TOLERANCE: f64 = 1.0e-4;
 
 fn evaluated_positions(geometry: &Value) -> Result<Vec<[f64; 3]>, Box<dyn Error>> {
     Ok(serde_json::from_value(geometry["positions"].clone())?)

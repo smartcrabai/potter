@@ -77,8 +77,8 @@ Spacing (single dab)
                        (first dab not deferred, paint_stroke.cc:1613).
 
 Potter-only inputs
-  seed 7            -> no Blender equivalent. Potter deterministic_scale in [0.98, 1.0] (sculpt.rs:1046-1063)
-                       multiplies Draw displacement; Blender has no such jitter. Max 2% of displacement.
+  seed 7            -> no Blender equivalent. Potter's Draw has no random term (the former deterministic
+                       scale was removed; Blender's Draw has none, draw.cc:196-197). The seed is a no-op for Draw.
   symmetry off      -> tool_settings.sculpt.use_symmetry_x/y/z = False.
   dyntopo off       -> Object.use_dynamic_topology_sculpting must be False (asserted).
   level 1           -> MultiresModifier.sculpt_levels = 1 (asserted total_levels == 1).
