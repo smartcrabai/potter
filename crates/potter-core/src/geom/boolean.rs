@@ -16,6 +16,7 @@ mod classify;
 mod dissolve;
 mod exact;
 mod float;
+mod float_connect;
 mod imesh;
 mod input;
 mod intersect;
