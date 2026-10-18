@@ -543,12 +543,14 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     // Blender's final hull_merge_triangles deletes every edge still tagged BM_ELEM_TAG, which
     // removes all faces around it (MOD_skin.cc:1632). The tags come from the triangle split in
     // skin_fix_hole_no_good_verts.
-    let faces: Vec<Polygon> = merge_triangle_faces(&points, polygons, symmetry_axes)
-        .into_iter()
-        .filter(|face| !tagged_edges.0.iter().any(|&edge| face_has_edge(face, edge)))
-        .map(|face| (face, 0))
-        .collect();
-    let (points, origins, faces) = drop_welded_points(points, origins, faces, &welded);
+    let (kept, killed): (Vec<Vec<usize>>, Vec<Vec<usize>>) =
+        merge_triangle_faces(&points, polygons, symmetry_axes)
+            .into_iter()
+            .partition(|face| !tagged_edges.0.iter().any(|&edge| face_has_edge(face, edge)));
+    let loose_edges = skin_loose_edges(&kept, &killed, &tagged_edges.0);
+    let faces: Vec<Polygon> = kept.into_iter().map(|face| (face, 0)).collect();
+    let (points, origins, faces, loose_edges) =
+        drop_welded_points(points, origins, faces, &welded, loose_edges);
     let origin = Origin {
         vertices: origins,
         // Skin's fresh BMesh has no point CD_ORIGINDEX layer.
@@ -556,7 +558,7 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         faces: vec![None; faces.len()],
         corners: None,
     };
-    let mut result = build_mesh(points, faces, Vec::new(), &origin, mesh)?;
+    let mut result = build_mesh(points, faces, loose_edges, &origin, mesh)?;
     result.attributes.remove("blender_skin_vertices");
     result.attributes.remove("skin_radii");
     result.attributes.remove("skin_roots");
@@ -978,18 +980,18 @@ fn collapse_skin_face_corners(
 }
 
 /// Blender's `BM_ELEM_TAG` on the hull edges repaired by `skin_fix_hole_no_good_verts`, as ordered
-/// point pairs. Only the triangle split tags edges, and nothing else in MOD_skin.cc clears them
+/// point pairs. Only the triangle split tags edges, and nothing else in `MOD_skin.cc` clears them
 /// before the final `hull_merge_triangles`, whose `BM_mesh_delete_hflag_tagged` deletes tagged
-/// edges with every face around them (MOD_skin.cc:1632). Its face-tag reset is separate
-/// (MOD_skin.cc:1566).
+/// edges with every face around them (`MOD_skin.cc:1632`). Its face-tag reset is separate
+/// (`MOD_skin.cc:1566`).
 #[derive(Default)]
 struct TaggedEdges(Vec<(usize, usize)>);
 
 impl TaggedEdges {
-    /// `bmo_weld_verts_exec` (bmo_removedoubles.cc) for a target map. A tagged edge with a welded
+    /// `bmo_weld_verts_exec` (`bmo_removedoubles.cc`) for a target map. A tagged edge with a welded
     /// corner moves onto the targets. A collapsed edge (both ends on one vertex) is deleted. When
     /// the target pair already exists, that edge survives and keeps only its own tag, because
-    /// `BM_elem_flag_merge_ex` merges only BM_ELEM_HIDDEN, so the moved tag is lost. Otherwise
+    /// `BM_elem_flag_merge_ex` merges only `BM_ELEM_HIDDEN`, so the moved tag is lost. Otherwise
     /// `BM_edge_create(.., e, BM_CREATE_NOP)` copies the header flags, so the new edge is tagged.
     fn weld(&mut self, faces: &[Vec<usize>], mapping: &[(usize, usize)]) {
         let is_welded = |vertex: usize| mapping.iter().any(|&(from, _)| from == vertex);
@@ -1043,16 +1045,23 @@ fn dedupe_cyclic(face: &mut Vec<usize>) {
     }
 }
 
-/// The points, their origins and faces after welded points are dropped.
-type WeldedPoints = (Vec<DVec3>, Vec<Vec<(usize, f64)>>, Vec<Polygon>);
+/// The points, their origins, faces and loose edges after welded points are dropped.
+type WeldedPoints = (
+    Vec<DVec3>,
+    Vec<Vec<(usize, f64)>>,
+    Vec<Polygon>,
+    Vec<[usize; 2]>,
+);
 
-/// Blender's weld removes the vertices it merges away. Drops the `welded` points, renumbering the rest
-/// and every face that uses them.
+/// Blender's weld removes the vertices it merges away. Drops the `welded` points, renumbering the
+/// rest and every face and loose edge that uses them. Faces and loose edges are built from current
+/// corners, which the weld has already moved, so they never reference a welded point.
 fn drop_welded_points(
     points: Vec<DVec3>,
     origins: Vec<Vec<(usize, f64)>>,
     faces: Vec<Polygon>,
     welded: &[usize],
+    loose_edges: Vec<[usize; 2]>,
 ) -> WeldedPoints {
     let mut dropped = vec![false; points.len()];
     for &index in welded {
@@ -1080,7 +1089,39 @@ fn drop_welded_points(
             )
         })
         .collect();
-    (kept_points, kept_origins, faces)
+    let loose_edges = loose_edges
+        .into_iter()
+        .map(|[first, second]| [renumbered[first], renumbered[second]])
+        .collect();
+    (kept_points, kept_origins, faces, loose_edges)
+}
+
+/// Blender's final delete removes the faces around each tagged edge but leaves their other edges
+/// in the mesh (`MOD_skin.cc:1632`). An edge of a removed face survives as a loose edge unless a
+/// kept face still uses it. The nogood branch oracle has 69 edges for 68 face edges, which this
+/// rule reproduces.
+fn skin_loose_edges(
+    kept: &[Vec<usize>],
+    killed: &[Vec<usize>],
+    tagged: &[(usize, usize)],
+) -> Vec<[usize; 2]> {
+    let mut loose: Vec<(usize, usize)> = Vec::new();
+    for face in killed {
+        for corner in 0..face.len() {
+            let edge = ordered_edge(face[corner], face[(corner + 1) % face.len()]);
+            if tagged.contains(&edge)
+                || loose.contains(&edge)
+                || kept.iter().any(|kept_face| face_has_edge(kept_face, edge))
+            {
+                continue;
+            }
+            loose.push(edge);
+        }
+    }
+    loose
+        .into_iter()
+        .map(|(first, second)| [first, second])
+        .collect()
 }
 
 #[expect(
@@ -1861,13 +1902,13 @@ mod tagged_edge_tests {
     fn weld_loses_a_tag_when_the_target_edge_already_exists() {
         let mut tags = TaggedEdges(vec![(4, 5)]);
         tags.weld(&[vec![1, 5, 2]], &[(4, 1)]);
-        assert!(tags.0.is_empty());
+        assert_eq!(tags.0, Vec::<(usize, usize)>::new());
     }
 
     #[test]
     fn weld_deletes_a_tagged_edge_that_collapses() {
         let mut tags = TaggedEdges(vec![(4, 5)]);
         tags.weld(&[], &[(4, 5)]);
-        assert!(tags.0.is_empty());
+        assert_eq!(tags.0, Vec::<(usize, usize)>::new());
     }
 }
