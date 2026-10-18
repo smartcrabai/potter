@@ -30,6 +30,41 @@
 //! vertex the search began from, which is Blender's `face_verts[0]` and the first loop of the new face.
 //! An empty list means no split: Blender keeps the original face unchanged.
 //!
+//! # Corner provenance
+//! [`SplitNetResult::corner_sources`] gives every corner of every emitted face its loop-data source.
+//! Blender's rule, all inside `BM_face_split_edgenet` (`bmesh_polygon_edgenet.cc`):
+//! - Each new face is `BM_face_create(bm, verts, edges, len, f, BM_CREATE_NOP)` (line 575). Face-domain
+//!   attributes come from the split face `f` (`bmesh_core.cc:562-565`). Its loops start at
+//!   `CustomData_bmesh_set_default` (`bmesh_core.cc:337-343`), because `bm_loop_create` gets no example
+//!   loop.
+//! - The loop pass runs only if `CustomData_has_math(&bm->ldata)` (line 611). `bm->ldata` is the union of
+//!   every input mesh's corner layers (`geometry_mesh_boolean.cc:987-1000`). Math needs `equal`, `add`,
+//!   `multiply`, `initminmax` and `dominmax` (`CustomData_layer_has_math`, `customdata.cc:3777`). Live
+//!   types with all five are `CD_PROP_FLOAT2` (`customdata.cc:1913`), `CD_PROP_COLOR` (`:1885`) and
+//!   `CD_PROP_BYTE_COLOR` (`:1638`); deprecated `CD_ORIGSPACE_MLOOP` also has them. Without such a layer
+//!   no corner receives any data, not even at boundary vertices.
+//! - Step 1: a corner at a vertex `v` of `f`'s ring copies `f`'s loop at `v` for every layer
+//!   (`bmesh_polygon_edgenet.cc:628-635`; `CustomData_bmesh_copy_block`, `customdata.cc:3716`). This is
+//!   [`CornerSource::Original`] with `i` such that `boundary[i] == v`.
+//! - Step 2: every other vertex `v` of the edge net gets `CustomData_bmesh_interp` over `f`'s loops with
+//!   `interp_weights_poly_v2` weights of `v` in `f`'s 2D frame (`bmesh_polygon_edgenet.cc:652-660`). The
+//!   first loop at `v` is interpolated and the others copy it (`:665`). This is
+//!   [`CornerSource::Interpolated`], shared by all corners at `v`.
+//! - `CustomData_bmesh_interp` writes only layers whose type has an `interp` callback (`customdata.cc:3984`).
+//!   `INT8` (`:1869`), `INT16_2D` (`:1692`), `INT32_2D` (`:1877`) and `STRING` (`:1593`) have none, so an
+//!   interpolated corner keeps the default for them. The step-2 copy carries that default too.
+//! - `BM_face_copy_shared` (`all/bmesh_construct.cc:79`) and `BM_face_interp_from_face`
+//!   (`all/bmesh_interp.cc:176`) are not called here. The loop pass inlines the interpolation and only
+//!   touches net vertices.
+//! - The first emitted face is swapped into `f` (`bmesh_polygon_edgenet.cc:689`, `bmesh_core.cc:2999`).
+//!   Its corners are unchanged.
+//!
+//! Consumers: corner `i` of `faces[k]` takes its data from `corner_sources[k][i]`. An `Original` corner
+//! copies the source face's corner at that vertex. An `Interpolated` corner is interpolated from the
+//! source face's corners with the weights at the vertex. Ring vertices inserted onto the boundary before
+//! the call are in `boundary` and copy. Blender's copy there reads the split-time loop, which this port
+//! does not model.
+//!
 //! # Arithmetic
 //! f32, in Blender's operand order: the 2D frame of `axis_dominant_v3_to_m3(f->no)`, `normalize_v2`
 //! for search directions, and `angle_signed_on_axis_v3v3v3_v3` for fork order. Blender's arm64 FMA
@@ -53,12 +88,25 @@ type P3 = [f32; 3];
 /// `face_normal == l_walk->f->no` holds only for that face.
 const ORIGINAL: usize = usize::MAX;
 
+/// Where one corner of an emitted face takes its loop data from. Blender rule: module doc, "Corner
+/// provenance".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CornerSource {
+    /// The face's own loop `i`, at `boundary[i]`, which is the same vertex. Copied for every layer.
+    Original(usize),
+    /// Mean-value interpolation of the face's loops at the vertex, shared by every corner there. Only
+    /// layers with an `interp` callback are filled; the others keep their defaults.
+    Interpolated,
+}
+
 /// Result of splitting one face by an edge net.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct SplitNetResult {
     /// Emitted faces in Blender creation order. Loop `i` runs `ring[i] -> ring[i + 1]`, and each ring starts
     /// at the vertex its search began from. Empty means no split.
     pub(crate) faces: Vec<Vec<usize>>,
+    /// Corner sources, parallel to `faces`: `corner_sources[k][i]` describes corner `i` of `faces[k]`.
+    pub(crate) corner_sources: Vec<Vec<CornerSource>>,
     /// Net edges that no emitted face uses. Blender leaves these without loops.
     pub(crate) dangling: Vec<(usize, usize)>,
 }
@@ -121,7 +169,32 @@ pub(crate) fn face_split_edgenet_with_mesh(
         .map(|&e| net.edge_global[e])
         .collect();
     let faces = net.rings.split_off(base);
-    SplitNetResult { faces, dangling }
+    let corner_sources = ring_corner_sources(boundary, &faces);
+    SplitNetResult {
+        faces,
+        corner_sources,
+        dangling,
+    }
+}
+
+/// Corner sources of emitted rings, the rule in the module doc's "Corner provenance". A ring vertex
+/// that is in `boundary` copies the first boundary loop at that vertex; any other vertex interpolates.
+fn ring_corner_sources(boundary: &[usize], faces: &[Vec<usize>]) -> Vec<Vec<CornerSource>> {
+    let mut loop_of: HashMap<usize, usize> = HashMap::with_capacity(boundary.len());
+    for (i, &v) in boundary.iter().enumerate() {
+        loop_of.entry(v).or_insert(i);
+    }
+    faces
+        .iter()
+        .map(|ring| {
+            ring.iter()
+                .map(|v| match loop_of.get(v) {
+                    Some(&i) => CornerSource::Original(i),
+                    None => CornerSource::Interpolated,
+                })
+                .collect()
+        })
+        .collect()
 }
 
 /// Undirected edge table in creation order: boundary loops first, then net pairs.
@@ -669,6 +742,7 @@ fn angle_signed_on_axis(v1: P3, v2: P3, v3: P3, axis: P3) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    use super::CornerSource::{Interpolated, Original};
     use super::*;
 
     /// Square of side 2 with an interior point at its centre (index 4).
@@ -723,5 +797,72 @@ mod tests {
         let result = face_split_edgenet_with_mesh(&BOUNDARY, &[], &POINTS, UP, &[]);
         assert_eq!(result.faces, Vec::<Vec<usize>>::new());
         assert_eq!(result.dangling, Vec::<(usize, usize)>::new());
+    }
+
+    #[test]
+    fn split_net_corner_diagonal_copies_original_loops() {
+        // Every corner is a square vertex, so each copies the original face's loop at that vertex
+        // (Blender `bmesh_polygon_edgenet.cc:628-635`). The faces are the diagonal test's.
+        let result = face_split_edgenet_with_mesh(&BOUNDARY, &[(0, 2)], &POINTS, UP, &[]);
+        assert_eq!(
+            result.corner_sources,
+            vec![
+                vec![Original(0), Original(2), Original(3)],
+                vec![Original(2), Original(0), Original(1)],
+            ]
+        );
+    }
+
+    #[test]
+    fn split_net_corner_centre_is_interpolated() {
+        // The centre (4) is not a boundary vertex, so its corners interpolate (`:652-665`). Each
+        // triangle copies its two square corners and interpolates the centre corner.
+        let net = [(0, 4), (4, 2), (1, 4), (4, 3)];
+        let result = face_split_edgenet_with_mesh(&BOUNDARY, &net, &POINTS, UP, &[]);
+        assert_eq!(result.corner_sources.len(), result.faces.len());
+        for (ring, sources) in result.faces.iter().zip(&result.corner_sources) {
+            assert_eq!(ring.len(), sources.len());
+        }
+        assert_eq!(
+            result.corner_sources,
+            vec![
+                vec![Original(0), Interpolated, Original(3)],
+                vec![Original(3), Interpolated, Original(2)],
+                vec![Original(2), Interpolated, Original(1)],
+                vec![Original(1), Interpolated, Original(0)],
+            ]
+        );
+    }
+
+    #[test]
+    fn split_net_corner_index_is_boundary_position_not_vertex_id() {
+        // The diagonal square with boundary ids 5, 7, 2, 4. Faces are the diagonal test's faces with
+        // local ids 0, 1, 2, 3 mapped to 5, 7, 2, 4. Loop `i` is `boundary[i]`, so vertex 2 is loop 2.
+        let mut positions = vec![[0.0_f32; 3]; 8];
+        positions[5] = [0.0, 0.0, 0.0];
+        positions[7] = [2.0, 0.0, 0.0];
+        positions[2] = [2.0, 2.0, 0.0];
+        positions[4] = [0.0, 2.0, 0.0];
+        let result = face_split_edgenet_with_mesh(&[5, 7, 2, 4], &[(5, 2)], &positions, UP, &[]);
+        assert_eq!(result.faces, vec![vec![5, 2, 4], vec![2, 5, 7]]);
+        assert_eq!(
+            result.corner_sources,
+            vec![
+                vec![Original(0), Original(2), Original(3)],
+                vec![Original(2), Original(0), Original(1)],
+            ]
+        );
+    }
+
+    #[test]
+    fn split_net_corner_no_split_has_no_sources() {
+        // Blender keeps the original face when nothing is emitted, so there are no corners to describe.
+        let spur = face_split_edgenet_with_mesh(&BOUNDARY, &[(0, 4)], &POINTS, UP, &[]);
+        let existing = vec![vec![0, 2, 3]];
+        let duplicate = face_split_edgenet_with_mesh(&BOUNDARY, &[(0, 2)], &POINTS, UP, &existing);
+        let empty = face_split_edgenet_with_mesh(&BOUNDARY, &[], &POINTS, UP, &[]);
+        assert_eq!(spur.corner_sources.len(), 0);
+        assert_eq!(duplicate.corner_sources.len(), 0);
+        assert_eq!(empty.corner_sources.len(), 0);
     }
 }
