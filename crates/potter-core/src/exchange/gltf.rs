@@ -14653,9 +14653,12 @@ mod tests {
                 render: Some(0),
                 available_mask: None,
             };
-            let context = crate::shader::HitContext::new(&imported.doc.node_groups)
+            let mut context = crate::shader::HitContext::new(&imported.doc.node_groups)
                 .with_images(&images)
                 .with_uv_layers(layers);
+            // A texture on the render layer reads `TexCoord.UV`, which is the hit's render `uv`. The renderer
+            // sets it; without it the texture samples the (0, 0) default across the REPEAT seam.
+            context.uv = [u, 0.25];
             let params = crate::shader::evaluate_surface(material, &context)?;
             Ok((params.roughness, params.metallic))
         };
