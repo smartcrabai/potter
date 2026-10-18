@@ -1,6 +1,7 @@
 pub mod raster;
 
 mod bvh;
+mod light_model;
 mod path;
 mod pick;
 mod preview;
