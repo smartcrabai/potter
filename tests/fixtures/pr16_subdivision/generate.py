@@ -81,6 +81,7 @@ def make_mesh(vertices, faces, seams=(), creases=(), loose_edges=(), smooth=None
         "sharp_edges": [list(edge) for edge in sorted({edge_key(*edge) for edge in sharp_edges})],
         "vertex_creases": [[int(vertex), float(value)] for vertex, value in vertex_creases],
         "rotated_storage": bool(rotated_storage),
+        "order_attributes": [],
         "custom_normals": generated_normals if custom_normals is None else custom_normals,
     }
 
@@ -238,6 +239,12 @@ def fixture_set():
     meshes["mixed_rotated_storage"] = make_mesh(mixed["vertices"], mixed["faces"],
                                                 [(0, 1), (3, 0), (6, 7)], [(1, 2, 0.5)],
                                                 rotated_storage=True)
+    meshes["mixed_rotated_storage"]["order_attributes"] = [
+        {"name": "OrderPoint", "domain": "POINT"},
+        {"name": "OrderEdge", "domain": "EDGE"},
+        {"name": "OrderFace", "domain": "FACE"},
+        {"name": "OrderCorner", "domain": "CORNER"},
+    ]
     meshes["vertex_crease_grid"] = make_mesh(grid_vertices, grid_faces, grid_seams,
                                              vertex_creases=[(5, 1.0), (6, 0.5), (1, 0.3)])
     meshes["vertex_crease_cube"] = make_mesh(cube_vertices, cube_faces, cube_seams,
@@ -432,8 +439,8 @@ def build_cases():
     add("vertex_crease_cube_l2", "vertex_crease_cube", levels=2, use_creases=True)
     return cases
 
-
 def output_mesh(obj, params):
+    coarse_edges = [list(map(int, edge.vertices)) for edge in obj.data.edges]
     modifier = obj.modifiers.new("OracleSubdivision", "SUBSURF")
     modifier.subdivision_type = params["subdivision_type"]
     modifier.levels = params["levels"]
@@ -489,8 +496,15 @@ def output_mesh(obj, params):
                 group_name = group_indices.get(membership.group)
                 if group_name is not None:
                     group_weights[group_name][vertex.index] = float(membership.weight)
-        return {"vertices": [list(vertex.co) for vertex in mesh.vertices], "edges": edges,
-                "faces": faces, "vertex_groups": group_weights,
+        ordered_attributes = []
+        for attribute in mesh.attributes:
+            if attribute.name.startswith("Order"):
+                ordered_attributes.append({
+                    "name": attribute.name, "domain": attribute.domain, "data_type": "FLOAT",
+                    "values": [float(item.value) for item in attribute.data],
+                })
+        return {"input_edges": coarse_edges, "vertices": [list(vertex.co) for vertex in mesh.vertices], "edges": edges,
+                "faces": faces, "vertex_groups": group_weights, "ordered_attributes": ordered_attributes,
                 "has_custom_normals": bool(mesh.has_custom_normals)}
     finally:
         evaluated.to_mesh_clear()
@@ -517,6 +531,21 @@ def make_object(name, spec):
         vertex_crease = mesh.attributes.new(name="crease_vert", type="FLOAT", domain="POINT")
         for vertex in mesh.vertices:
             vertex_crease.data[vertex.index].value = vertex_crease_values.get(vertex.index, 0.0)
+    for definition in spec.get("order_attributes", []):
+        domain = definition["domain"]
+        attribute = mesh.attributes.new(name=definition["name"], type="FLOAT", domain=domain)
+        if domain == "POINT":
+            values = [index + 0.25 for index in range(len(mesh.vertices))]
+        elif domain == "EDGE":
+            values = [100.25 + index for index in range(len(mesh.edges))]
+        elif domain == "FACE":
+            values = [200.25 + index for index in range(len(mesh.polygons))]
+        elif domain == "CORNER":
+            values = [300.25 + face.index for face in mesh.polygons for _ in face.loop_indices]
+        else:
+            raise RuntimeError(f"unknown order test attribute domain {domain}")
+        for item, value in zip(attribute.data, values):
+            item.value = float(value)
     for spec_layer in spec["uv_layers"]:
         layer = mesh.uv_layers.new(name=spec_layer["name"])
         for index, value in enumerate(spec_layer["values"]):

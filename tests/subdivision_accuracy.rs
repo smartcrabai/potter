@@ -438,7 +438,7 @@ fn potter_shape(mesh: &Mesh) -> TestResult<Shape> {
     })
 }
 
-fn input_mesh(spec: &Value) -> TestResult<Mesh> {
+fn input_mesh(spec: &Value, blender_input_edges: &Value) -> TestResult<Mesh> {
     let vertices = spec["vertices"]
         .as_array()
         .ok_or("mesh vertices missing")?
@@ -473,6 +473,48 @@ fn input_mesh(spec: &Value) -> TestResult<Mesh> {
         .map(|(face, &shift)| rotated(face, shift))
         .collect();
     let mut mesh = Mesh::from_positions_and_faces(vertices, faces)?;
+    let vertex_ids: Vec<u32> = mesh.vertices.iter().map(|vertex| vertex.id).collect();
+    let vertex_index: HashMap<u32, usize> = vertex_ids
+        .iter()
+        .enumerate()
+        .map(|(index, &id)| (id, index))
+        .collect();
+    for loose in spec["loose_edges"]
+        .as_array()
+        .ok_or("mesh loose edges missing")?
+    {
+        let pair = indices(loose)?;
+        if pair.len() != 2 {
+            return Err("loose edge must reference two vertices".into());
+        }
+        mesh.insert_edge([vertex_ids[pair[0]], vertex_ids[pair[1]]])?;
+    }
+    let mut edges_by_pair = HashMap::new();
+    for edge in std::mem::take(&mut mesh.edges) {
+        let first = *vertex_index
+            .get(&edge.vertices[0])
+            .ok_or("edge vertex missing")?;
+        let second = *vertex_index
+            .get(&edge.vertices[1])
+            .ok_or("edge vertex missing")?;
+        edges_by_pair.insert(edge_key(first, second), edge);
+    }
+    mesh.edges = blender_input_edges
+        .as_array()
+        .ok_or("oracle input edges missing")?
+        .iter()
+        .map(|pair| -> TestResult<_> {
+            let pair = indices(pair)?;
+            let mut edge = edges_by_pair
+                .remove(&edge_key(pair[0], pair[1]))
+                .ok_or("Blender input edge missing from Potter input")?;
+            edge.vertices = [vertex_ids[pair[0]], vertex_ids[pair[1]]];
+            Ok(edge)
+        })
+        .collect::<TestResult<_>>()?;
+    if !edges_by_pair.is_empty() {
+        return Err("Potter input edge is absent from Blender's input edge order".into());
+    }
     let material_values = spec["materials"]
         .as_array()
         .ok_or("mesh material indices missing")?;
@@ -508,16 +550,6 @@ fn input_mesh(spec: &Value) -> TestResult<Mesh> {
             mesh.attributes
                 .insert("vertex_groups".to_owned(), Value::Object(groups));
         }
-    }
-    for loose in spec["loose_edges"]
-        .as_array()
-        .ok_or("mesh loose edges missing")?
-    {
-        let pair = indices(loose)?;
-        if pair.len() != 2 {
-            return Err("loose edge must reference two vertices".into());
-        }
-        mesh.insert_edge([u32::try_from(pair[0])?, u32::try_from(pair[1])?])?;
     }
 
     let seams = spec["seams"]
@@ -719,6 +751,44 @@ fn input_mesh(spec: &Value) -> TestResult<Mesh> {
             json!({"domain": "point", "type": "float", "values": values}),
         );
     }
+    let mut ordered = Vec::new();
+    for definition in spec["order_attributes"]
+        .as_array()
+        .ok_or("order attribute definitions missing")?
+    {
+        let name = definition["name"]
+            .as_str()
+            .ok_or("order attribute name missing")?;
+        let domain = definition["domain"]
+            .as_str()
+            .ok_or("order attribute domain missing")?;
+        let values: Vec<Value> = match domain {
+            "POINT" => (0..mesh.vertices.len())
+                .map(|index| json!(index as f64 + 0.25))
+                .collect(),
+            "EDGE" => (0..mesh.edges.len())
+                .map(|index| json!(100.25 + index as f64))
+                .collect(),
+            "FACE" => (0..mesh.faces.len())
+                .map(|index| json!(200.25 + index as f64))
+                .collect(),
+            "CORNER" => mesh
+                .faces
+                .iter()
+                .enumerate()
+                .flat_map(|(face, polygon)| {
+                    std::iter::repeat_n(json!(300.25 + face as f64), polygon.vertices.len())
+                })
+                .collect(),
+            _ => return Err(format!("unknown order attribute domain {domain}").into()),
+        };
+        ordered
+            .push(json!({"name": name, "domain": domain, "data_type": "FLOAT", "values": values}));
+    }
+    if !ordered.is_empty() {
+        mesh.attributes
+            .insert("blender_attributes".to_owned(), Value::Array(ordered));
+    }
     Ok(mesh)
 }
 
@@ -773,6 +843,103 @@ struct Errors {
     position: f64,
     uv: f64,
     crease: f64,
+}
+
+/// Checks Blender's consumer-visible vertex/edge/face/loop storage order, not only topology after
+/// position clustering. Geometry values retain their existing numeric tolerances.
+fn compare_storage_order(actual: &Shape, expected: &Shape) -> Result<(), String> {
+    if actual.points.len() != expected.points.len()
+        || actual.edges.len() != expected.edges.len()
+        || actual.faces.len() != expected.faces.len()
+    {
+        return Err(format!(
+            "ordered counts differ: vertices {}/{}, edges {}/{}, faces {}/{}",
+            actual.points.len(),
+            expected.points.len(),
+            actual.edges.len(),
+            expected.edges.len(),
+            actual.faces.len(),
+            expected.faces.len()
+        ));
+    }
+    for (index, (actual, expected)) in actual.points.iter().zip(&expected.points).enumerate() {
+        let error = actual.distance(*expected);
+        if error > POSITION_TOLERANCE {
+            return Err(format!(
+                "vertex {index} is out of Blender order or position: {actual:?} vs {expected:?}, error {error:.9e}"
+            ));
+        }
+    }
+    for (index, (actual, expected)) in actual.edges.iter().zip(&expected.edges).enumerate() {
+        if actual.vertices != expected.vertices {
+            return Err(format!(
+                "edge {index} endpoints differ in Blender order: {:?} != {:?}",
+                actual.vertices, expected.vertices
+            ));
+        }
+        if actual.seam != expected.seam || actual.sharp != expected.sharp {
+            return Err(format!("edge {index} seam/sharp flags differ"));
+        }
+        if (actual.crease - expected.crease).abs() > CREASE_TOLERANCE {
+            return Err(format!("edge {index} crease differs"));
+        }
+    }
+    for (index, (actual, expected)) in actual.faces.iter().zip(&expected.faces).enumerate() {
+        if actual.vertices != expected.vertices {
+            return Err(format!(
+                "face {index} loop order differs: {:?} != {:?}",
+                actual.vertices, expected.vertices
+            ));
+        }
+        if actual.material_index != expected.material_index || actual.smooth != expected.smooth {
+            return Err(format!("face {index} material/shade flag differs"));
+        }
+        if actual.uv.keys().collect::<Vec<_>>() != expected.uv.keys().collect::<Vec<_>>()
+            || actual.uv_pins != expected.uv_pins
+        {
+            return Err(format!("face {index} UV layers or pin rows differ"));
+        }
+        for (layer, actual_uvs) in &actual.uv {
+            let expected_uvs = &expected.uv[layer];
+            if actual_uvs.len() != expected_uvs.len()
+                || actual_uvs.iter().zip(expected_uvs).any(|(a, b)| {
+                    (a[0] - b[0]).abs() > UV_TOLERANCE || (a[1] - b[1]).abs() > UV_TOLERANCE
+                })
+            {
+                return Err(format!("face {index} UV loop order differs in {layer}"));
+            }
+        }
+        match (&actual.normal_codes, &expected.normal_codes) {
+            (Some(a), Some(b)) if a.len() == b.len() => {
+                if !a.iter().zip(b).all(|(x, y)| codes_within_beta_step(x, y)) {
+                    return Err(format!("face {index} custom-normal loop order differs"));
+                }
+            }
+            (None, None) => {}
+            _ => {
+                return Err(format!(
+                    "face {index} custom-normal layer/loop count differs"
+                ));
+            }
+        }
+    }
+    if actual.vertex_groups.keys().collect::<Vec<_>>()
+        != expected.vertex_groups.keys().collect::<Vec<_>>()
+    {
+        return Err("ordered vertex-group names differ".to_owned());
+    }
+    for (name, actual_values) in &actual.vertex_groups {
+        let expected_values = &expected.vertex_groups[name];
+        if actual_values.len() != expected_values.len()
+            || actual_values
+                .iter()
+                .zip(expected_values)
+                .any(|(a, b)| (a - b).abs() > 1.0e-6)
+        {
+            return Err(format!("vertex group {name} differs in vertex order"));
+        }
+    }
+    Ok(())
 }
 
 /// Compares two shapes by position. Faces match by their canonical position-cluster cycle, edges
@@ -1082,7 +1249,40 @@ fn compare_shapes(actual: &Shape, expected: &Shape) -> Result<Errors, String> {
 fn compare_case(case: &Value, spec: &Value) -> TestResult<Errors> {
     let name = case["name"].as_str().ok_or("case name missing")?;
     let params: Map<String, Value> = serde_json::from_value(case["params"].clone())?;
-    let mesh = input_mesh(spec)?;
+    let mesh = input_mesh(spec, &case["expected"]["input_edges"])?;
+    let input_vertex_index: HashMap<u32, usize> = mesh
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(index, vertex)| (vertex.id, index))
+        .collect();
+    let input_edges: Vec<[usize; 2]> = mesh
+        .edges
+        .iter()
+        .map(|edge| {
+            Ok([
+                *input_vertex_index
+                    .get(&edge.vertices[0])
+                    .ok_or("input edge's first vertex missing")?,
+                *input_vertex_index
+                    .get(&edge.vertices[1])
+                    .ok_or("input edge's second vertex missing")?,
+            ])
+        })
+        .collect::<TestResult<_>>()?;
+    let oracle_input_edges: Vec<[usize; 2]> = case["expected"]["input_edges"]
+        .as_array()
+        .ok_or("oracle input edge order missing")?
+        .iter()
+        .map(indices)
+        .map(|pair| -> TestResult<[usize; 2]> {
+            let pair = pair?;
+            Ok([pair[0], pair[1]])
+        })
+        .collect::<TestResult<_>>()?;
+    if input_edges != oracle_input_edges {
+        return Err(format!("{name}: input mesh edge storage order differs from Blender").into());
+    }
     let modifier = Modifier {
         id: Id::new("subdivision_oracle")?,
         modifier_type: "subdivision".to_owned(),
@@ -1094,9 +1294,11 @@ fn compare_case(case: &Value, spec: &Value) -> TestResult<Errors> {
         binding_data: None,
         runtime: ModifierRuntime::default(),
     };
-    let actual = evaluate_modifiers(&mesh, &[modifier])?;
-    let actual = potter_shape(&actual)?;
+    let actual_mesh = evaluate_modifiers(&mesh, &[modifier])?;
+    let actual = potter_shape(&actual_mesh)?;
     let expected = oracle_shape(&case["expected"])?;
+    compare_storage_order(&actual, &expected)
+        .map_err(|message| format!("{name}: storage order: {message}"))?;
     compare_shapes(&actual, &expected).map_err(|message| format!("{name}: {message}").into())
 }
 

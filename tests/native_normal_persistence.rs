@@ -10,8 +10,9 @@
 //!   Subdivision at level 1 without Use Custom Normals writes no `custom_normal` layer, as Blender.
 //!   After save and reload, `mesh.set_custom_normals` allocates the layer in Blender's loop order,
 //!   and Blender's own reference confirms every normal and Auto status.
-//! * `subdivision_level_two_keeps_only_the_loop_basis_until_authoring`: at level 2 the loop basis
-//!   differs from storage, so the saved layer holds only `corner_order`; authoring keeps that basis.
+//! * `subdivision_level_two_uses_blender_loop_order_until_authoring`: level-2 Subdivision stores
+//!   vertices, edges, faces, and loops in Blender's output order; the identity basis is omitted, and
+//!   later authoring allocates codes in that same loop order.
 
 #[path = "common/blender_checked.rs"]
 mod blender_checked;
@@ -35,9 +36,9 @@ use std::{
 use blender_code_tolerance::code_within_beta_step;
 use native_oracle::{
     BYTE_TOLERANCE, FLOAT_TOLERANCE, NORMAL_TOLERANCE, StoredCorner, TestResult, apply_operations,
-    assert_close, assert_floats, attribute, build_oracle, code_pair, dump_blend, dumped_object,
-    export, floats, has_normal_code_values, import_blend, mesh_of_node, node_id, normal_code_rows,
-    number, read_scene, run_blender, run_blender_arguments, vec3, vectors_close, write_script,
+    assert_close, assert_floats, build_oracle, code_pair, dump_blend, dumped_object, export,
+    floats, import_blend, mesh_of_node, node_id, normal_code_rows, number, read_scene, run_blender,
+    run_blender_arguments, vec3, vectors_close, write_script,
 };
 use serde_json::{Map, Value, json};
 use tempfile::tempdir;
@@ -308,7 +309,10 @@ fn potter_faces(mesh: &Value) -> TestResult<Vec<PotterFace>> {
 /// Blender loop index of every Potter corner, `[face][corner]` in `mesh.faces` order: the stored
 /// `corner_order` ordinal, or the flattened corner index when no order is stored.
 fn loop_ordinals(mesh: &Value) -> TestResult<Vec<Vec<usize>>> {
-    let order = attribute(mesh, "custom_normal")?.get("corner_order");
+    let order = mesh["attributes"]
+        .get("custom_normal")
+        .and_then(Value::as_object)
+        .and_then(|attribute| attribute.get("corner_order"));
     let mut next = 0;
     let mut rows = Vec::new();
     for face in mesh["faces"].as_array().ok_or("mesh faces are missing")? {
@@ -338,13 +342,12 @@ fn loop_ordinals(mesh: &Value) -> TestResult<Vec<Vec<usize>>> {
     Ok(rows)
 }
 
-/// Whether the loop basis is the flattened mesh order: corner `k` of the flattened corners is loop `k`.
-fn is_identity(basis: &[Vec<usize>]) -> bool {
-    basis
-        .iter()
-        .flatten()
-        .copied()
-        .eq(0..basis.iter().map(Vec::len).sum::<usize>())
+/// Potter stores a `corner_order` only for a non-identity loop basis: its absence is the identity.
+fn has_stored_corner_order(mesh: &Value) -> bool {
+    mesh["attributes"]
+        .get("custom_normal")
+        .and_then(Value::as_object)
+        .is_some_and(|attribute| attribute.contains_key("corner_order"))
 }
 
 /// (authored, automatic) corner counts of a mesh's stored `normal_code` layer.
@@ -655,7 +658,7 @@ fn subdivision_codes_and_corner_data_follow_one_loop_basis_through_blend() -> Te
     let subdivided = read_scene(&project)?;
     let subdivided_mesh = mesh_of_node(&subdivided, "Regress")?;
     assert!(
-        is_identity(&loop_ordinals(subdivided_mesh)?),
+        !has_stored_corner_order(subdivided_mesh),
         "the Subdivision result must store the identity corner order of Blender's loops"
     );
     let (authored, automatic) = stored_counts(subdivided_mesh)?;
@@ -849,14 +852,14 @@ fn subdivision_without_custom_normals_writes_no_layer_and_later_authoring_alloca
         &reference,
     )?;
     assert!(
-        is_identity(&loop_ordinals(mesh_of_node(&authored, "Regress")?)?),
+        !has_stored_corner_order(mesh_of_node(&authored, "Regress")?),
         "authoring allocates the layer in Blender's loop order"
     );
     Ok(())
 }
 
 #[test]
-fn subdivision_level_two_keeps_only_the_loop_basis_until_authoring() -> TestResult {
+fn subdivision_level_two_uses_blender_loop_order_until_authoring() -> TestResult {
     let Some(blender) = blender_checked::blender_executable() else {
         return Ok(());
     };
@@ -875,28 +878,18 @@ fn subdivision_level_two_keeps_only_the_loop_basis_until_authoring() -> TestResu
     )?;
     assert_eq!(applied["ok"], true, "{applied}");
 
-    // Level 2 orders loops differently from storage, so the saved layer holds only that basis.
+    // The evaluated mesh is now in Blender's loop order, so an identity basis needs no basis-only
+    // layer. Later authoring allocates codes in the same order.
     let saved = read_scene(&project)?;
     let saved_mesh = mesh_of_node(&saved, "Regress")?;
-    let fields: BTreeSet<&str> = attribute(saved_mesh, "custom_normal")?
-        .as_object()
-        .ok_or("custom_normal must be an object")?
-        .keys()
-        .map(String::as_str)
-        .collect();
-    assert_eq!(
-        fields,
-        BTreeSet::from(["corner_order", "domain", "type"]),
-        "the basis-only layer must hold no values"
-    );
     assert!(
-        !has_normal_code_values(saved_mesh),
-        "the basis-only layer must not store values"
+        saved_mesh["attributes"].get("custom_normal").is_none(),
+        "Subdivision without Use Custom Normals must not store a custom_normal layer"
     );
     let basis = loop_ordinals(saved_mesh)?;
     assert!(
-        !is_identity(&basis),
-        "level 2 must keep a non-identity loop basis"
+        !has_stored_corner_order(saved_mesh),
+        "subdivision storage order must match Blender loop order"
     );
 
     let authored = author_and_check_subdivision(
@@ -910,7 +903,7 @@ fn subdivision_level_two_keeps_only_the_loop_basis_until_authoring() -> TestResu
     assert_eq!(
         loop_ordinals(mesh_of_node(&authored, "Regress")?)?,
         basis,
-        "authoring keeps the loop basis"
+        "authoring keeps Blender's loop order"
     );
     Ok(())
 }

@@ -125,6 +125,30 @@ impl LooseEdges {
         self.current = next;
     }
 
+    /// The Blender output vertex index of each current loose-only vertex. Coarse endpoints retain
+    /// their input indices; interior edge samples occupy their coarse-edge block.
+    pub(super) fn blender_indices(
+        &self,
+        base_vertex_count: usize,
+        resolution: usize,
+    ) -> Vec<Option<usize>> {
+        self.placements
+            .iter()
+            .map(|placement| {
+                let placement = (*placement)?;
+                let [first, second] = self.edges[placement.edge];
+                let segment = (placement.u * (resolution - 1) as f64).round() as usize;
+                Some(if segment == 0 {
+                    first
+                } else if segment == resolution - 1 {
+                    second
+                } else {
+                    base_vertex_count + placement.edge * (resolution - 2) + segment - 1
+                })
+            })
+            .collect()
+    }
+
     /// The final position of every loose vertex, from the base points. Without `simple` each lies on
     /// the cubic B-spline through its base edge and the neighbouring base edges; with it, on the
     /// straight edge (`mesh_interpolate_position_on_edge`).
