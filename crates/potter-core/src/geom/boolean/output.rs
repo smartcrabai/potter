@@ -1125,7 +1125,7 @@ fn joined_face_attribute(
 /// corner order, with no transform. The EXACT probes `exact_clnor4`, `exact_rot90` and `exact_scale2`
 /// match every output corner from untransformed input codes under translation, a 90 degree rotation
 /// and a non-uniform scale. An operand without custom normals contributes automatic corners, and
-/// nothing is written when no operand holds custom normals.
+/// nothing is written when no operand holds a custom-normal layer (basis-only input has none).
 pub(super) fn join_custom_normal_codes(operands: &[Operand<'_>], mesh: &mut Mesh) -> Result<()> {
     let mut codes = Vec::new();
     let mut any = false;

@@ -182,6 +182,11 @@ def describe_mesh(case, regression, owner, mesh, *, rings):
                     start,
                 )
             if custom:
+                normal_layer = mesh.attributes["custom_normal"]
+                record["custom_normal_codes"] = rotated(
+                    [[int(component) for component in normal_layer.data[li].value] for li in corners],
+                    start,
+                )
                 record["custom_normals"] = rotated(
                     [[round(c, 6) + 0.0 for c in mesh.corner_normals[li].vector] for li in corners],
                     start,
