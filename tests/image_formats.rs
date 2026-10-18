@@ -89,12 +89,10 @@ fn assert_pixel(
     Ok(())
 }
 
+/// The sRGB decode the image sampler uses for sRGB images: Cycles' f32 decode, which differs from the exact decode by up
+/// to about 5e-7 (`color::cycles_srgb_to_linear`).
 fn srgb_to_linear(value: f64) -> f64 {
-    if value <= 0.04045 {
-        value / 12.92
-    } else {
-        ((value + 0.055) / 1.055).powf(2.4)
-    }
+    f64::from(potter_core::color::cycles_srgb_to_linear(value as f32))
 }
 
 #[test]
