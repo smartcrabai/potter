@@ -31,6 +31,7 @@ pub(crate) mod color_layers;
 pub(crate) mod concat;
 pub mod curve;
 pub mod edit;
+pub(crate) mod interpolation;
 pub mod lattice;
 pub mod mesh_cache;
 pub mod metaball;
