@@ -2446,7 +2446,7 @@ fn subdivision(
     let mut uv_maps = subdivision_uv::value_maps(mesh, &position);
     // Blender refines SIMPLE as Catmull-Clark with infinitely sharp edges and vertices, so its
     // positions are limit points too (see `BaseSharpness::Simple`). Loop normals use the same grid.
-    let mut samples = (simple || use_limit_surface || input_normals.is_some()).then(|| {
+    let mut samples = Some({
         let base_faces: Vec<Vec<usize>> = source_polygons
             .iter()
             .map(|(face, _)| face.clone())
@@ -2570,27 +2570,42 @@ fn subdivision(
             subdivision_uv::write_loop_uvs(&mut result, loops)?;
         }
     }
-    // Loop normals follow the final positions: Blender's fan spaces are measured on them.
-    if let Some(normals) = input_normals {
-        let samples = samples.as_ref().ok_or_else(|| {
-            PotError::new(
-                ErrorCode::InternalError,
-                "subdivision custom normals are missing output samples",
-            )
-        })?;
-        let face_sizes: Vec<usize> = mesh.faces.iter().map(|face| face.vertices.len()).collect();
-        let loops = subdivision_normals::loop_normals(&normals, &face_sizes, &samples.corners);
-        let numbering =
-            subdivision_normals::corner_numbering(&samples.corners, &face_sizes, levels as u32);
-        let vectors: Vec<Option<DVec3>> = loops.into_iter().map(Some).collect();
-        clnor::encode_vectors(
+    // Loop normals follow the final positions: Blender's fan spaces are measured on them. The loop
+    // basis (corner order) is stored with or without custom normals, as main does.
+    let samples = samples.as_ref().ok_or_else(|| {
+        PotError::new(
+            ErrorCode::InternalError,
+            "subdivision output samples are missing",
+        )
+    })?;
+    let face_sizes: Vec<usize> = mesh.faces.iter().map(|face| face.vertices.len()).collect();
+    let numbering =
+        subdivision_normals::corner_numbering(&samples.corners, &face_sizes, levels as u32);
+    let identity = numbering
+        .iter()
+        .enumerate()
+        .all(|(index, &ordinal)| index == ordinal);
+    match input_normals {
+        Some(normals) => {
+            let loops = subdivision_normals::loop_normals(&normals, &face_sizes, &samples.corners);
+            let vectors: Vec<Option<DVec3>> = loops.into_iter().map(Some).collect();
+            clnor::encode_vectors(
+                &mut result,
+                Some(&vectors),
+                NormalCodeOptions {
+                    corner_order: Some(&numbering),
+                    setter_input: clnor::SetterInput::AlreadyNormalized,
+                },
+            )?;
+        }
+        None => clnor::write_codes(
             &mut result,
-            Some(&vectors),
+            None,
             NormalCodeOptions {
-                corner_order: Some(&numbering),
+                corner_order: (!identity).then_some(numbering.as_slice()),
                 setter_input: clnor::SetterInput::AlreadyNormalized,
             },
-        )?;
+        )?,
     }
     Ok(result)
 }
