@@ -683,10 +683,10 @@ fn apply_material_textures(
     Ok(())
 }
 
-/// Samples an image as Blender's Image Texture node does. `blender_uv` is the V-up coordinate of Blender's
-/// `Vector`: a UDIM tile is routed from it, and the pixel lookup flips it into Potter's V-down storage. Native
-/// material fields and Image Texture nodes both sample through here, so they agree at every edge. `alpha_linked` is
-/// whether the node's Alpha output is linked, which decides whether Cycles unassociates the colour.
+/// Samples an image as Blender's Image Texture node does. `blender_uv` is the V-up coordinate of Blender's `Vector`. The
+/// sampler routes a UDIM tile from it and does the V flip into Potter's storage. Native material fields and Image Texture
+/// nodes both sample through here, so they agree at every edge. `alpha_linked` is whether the node's Alpha output is
+/// linked, which decides whether Cycles unassociates the colour.
 fn sample_image_texel(
     image: &ImageData,
     blender_uv: [f64; 2],
@@ -695,18 +695,9 @@ fn sample_image_texel(
     extension: ImageExtension,
     alpha_linked: bool,
 ) -> [f64; 4] {
-    let pixel_uv = if tile == 0 {
-        [blender_uv[0], 1.0 - blender_uv[1]]
-    } else {
-        [
-            blender_uv[0].rem_euclid(1.0),
-            1.0 - blender_uv[1].rem_euclid(1.0),
-        ]
-    };
     sample_with_extension_alpha(
         image,
         blender_uv,
-        pixel_uv,
         tile,
         interpolation,
         extension,
