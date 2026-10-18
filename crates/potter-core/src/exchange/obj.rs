@@ -24,11 +24,6 @@ use crate::{
     },
 };
 
-/// Material every file defines, and the `usemtl` of faces with no bound material slot.
-const DEFAULT_MATERIAL: &str = "potter_default";
-/// MTL body shared by every material entry.
-const MATERIAL_BODY: &str = "Kd 0.6 0.6 0.6\nKa 0 0 0\nKs 0 0 0\nNs 18\n";
-
 /// Blender's default OBJ axes (forward -Z, up Y): Potter's Z-up `(x, y, z)` is written as
 /// `(x, z, -y)`, so Blender's default importer reads the same placement.
 fn to_obj_axes(value: [f64; 3]) -> [f64; 3] {
@@ -40,13 +35,12 @@ fn from_obj_axes(value: [f64; 3]) -> [f64; 3] {
     [value[0], -value[2], value[1]]
 }
 
-/// What an OBJ export writes: the object and MTL text, the texture PNGs written beside the MTL as
-/// `(file name, bytes)`, and the losses of material parts the MTL format cannot carry.
+/// What an OBJ export writes: the object and MTL text, plus texture PNGs beside the MTL as
+/// `(file name, bytes)`. Losses are shared through `element_data_losses` and `material_diagnostics`.
 pub(crate) struct ObjExport {
     pub(crate) object: Vec<u8>,
     pub(crate) material: Vec<u8>,
     pub(crate) textures: Vec<(String, Vec<u8>)>,
-    pub(crate) losses: Vec<Loss>,
 }
 
 pub(crate) fn export(
@@ -58,11 +52,9 @@ pub(crate) fn export(
     let mut base = 0_usize;
     let mut normal_base = 0_usize;
     let mut uv_base = 0_usize;
-    // Whether the last `g` line written named groups. Groups stay in effect across `o` lines, so
-    // an object that starts without groups must reset them.
+    // Groups stay in effect across `o` lines, so an object without groups must reset them.
     let mut groups_on = false;
-    // Bound materials written so far, by MTL name, each with an MTL entry.
-    let mut bound_materials = BTreeMap::<String, &Id>::new();
+    let bound_materials = material_bindings(meshes)?;
     for mesh in meshes {
         object.push_str("o ");
         object.push_str(&obj_name(&mesh.name));
@@ -116,14 +108,6 @@ pub(crate) fn export(
             object.push_str(line);
             object.push('\n');
         }
-        if !mesh.face_material_indices.is_empty()
-            && mesh.face_material_indices.len() != mesh.faces.len()
-        {
-            return Err(PotError::new(
-                ErrorCode::ExportFailed,
-                "OBJ face material slots do not match the face count",
-            ));
-        }
         let face_materials = (0..mesh.faces.len())
             .map(|face| bound_material(mesh, face))
             .collect::<Vec<_>>();
@@ -142,15 +126,13 @@ pub(crate) fn export(
                 )
             })
             .collect::<Vec<_>>();
-        object.push_str("usemtl ");
-        object.push_str(DEFAULT_MATERIAL);
-        object.push('\n');
+        // Blender uses an empty material name to clear the current material.
+        object.push_str("usemtl\n");
         if groups_on {
             object.push_str("g\n");
         }
         let mut material_state = Some(None::<&Id>);
-        let mut group_state = Vec::<&str>::new();
-        let mut face_groups = Vec::<&str>::new();
+        let mut group_state = None::<&str>;
         let mut smooth_state = None::<bool>;
         let mut corner = 0_usize;
         for (face_index, (face, is_smooth)) in
@@ -165,31 +147,30 @@ pub(crate) fn export(
             }
             let material = face_materials.get(face_index).copied().flatten();
             if material_state != Some(material) {
-                let name = material.map_or_else(|| DEFAULT_MATERIAL.to_owned(), mtl_name);
-                writeln!(object, "usemtl {name}")
-                    .map_err(|error| PotError::new(ErrorCode::InternalError, error.to_string()))?;
                 if let Some(id) = material {
-                    bound_materials.insert(name, id);
+                    writeln!(object, "usemtl {}", id.as_str()).map_err(|error| {
+                        PotError::new(ErrorCode::InternalError, error.to_string())
+                    })?;
+                } else {
+                    object.push_str("usemtl\n");
                 }
                 material_state = Some(material);
             }
-            face_groups.clear();
-            if let Some(&first_vertex) = face.first() {
-                for (name, membership) in &compatible_groups {
-                    if membership.contains(&first_vertex) {
-                        face_groups.push(name);
-                    }
+            let mut face_group = None;
+            for (name, membership) in &compatible_groups {
+                if face.iter().all(|vertex| membership.contains(vertex)) && face_group.is_none() {
+                    face_group = Some(*name);
                 }
             }
-            if face_groups != group_state {
+            if face_group != group_state {
                 object.push('g');
-                for group in &face_groups {
-                    object.push(' ');
-                    object.push_str(group);
+                if let Some(name) = face_group {
+                    write!(object, " {name}").map_err(|error| {
+                        PotError::new(ErrorCode::InternalError, error.to_string())
+                    })?;
                 }
                 object.push('\n');
-                group_state.clear();
-                group_state.extend_from_slice(&face_groups);
+                group_state = face_group;
             }
             if smooth_state != Some(is_smooth) {
                 writeln!(object, "s {}", u8::from(is_smooth))
@@ -237,7 +218,7 @@ pub(crate) fn export(
             }
             object.push('\n');
         }
-        groups_on = !group_state.is_empty();
+        groups_on = group_state.is_some();
         base = base
             .checked_add(mesh.positions.len())
             .ok_or_else(|| PotError::new(ErrorCode::ExportFailed, "OBJ vertex index overflow"))?;
@@ -248,28 +229,78 @@ pub(crate) fn export(
             .checked_add(uv_lines.len())
             .ok_or_else(|| PotError::new(ErrorCode::ExportFailed, "OBJ UV index overflow"))?;
     }
-    let mut material = format!("newmtl {DEFAULT_MATERIAL}\n{MATERIAL_BODY}");
-    let mut textures = Vec::new();
-    let mut losses = Vec::new();
-    for (name, &id) in &bound_materials {
+    let mtl = mtl_entries(doc, root_path, &bound_materials, true)?;
+    Ok(ObjExport {
+        object: object.into_bytes(),
+        material: mtl.text.into_bytes(),
+        textures: mtl.textures,
+    })
+}
+
+struct MtlEntries {
+    text: String,
+    textures: Vec<(String, Vec<u8>)>,
+    losses: Vec<Loss>,
+}
+
+fn material_bindings(meshes: &[ExchangeMesh]) -> Result<BTreeMap<String, &Id>> {
+    let mut materials = BTreeMap::new();
+    for mesh in meshes {
+        if !mesh.face_material_indices.is_empty()
+            && mesh.face_material_indices.len() != mesh.faces.len()
+        {
+            return Err(PotError::new(
+                ErrorCode::ExportFailed,
+                "OBJ face material slots do not match the face count",
+            ));
+        }
+        for (face, geometry) in mesh.faces.iter().enumerate() {
+            if geometry.len() >= 3
+                && let Some(id) = bound_material(mesh, face)
+            {
+                materials.insert(id.as_str().to_owned(), id);
+            }
+        }
+    }
+    Ok(materials)
+}
+
+fn mtl_entries(
+    doc: &SceneDoc,
+    root_path: &Path,
+    bindings: &BTreeMap<String, &Id>,
+    write_output: bool,
+) -> Result<MtlEntries> {
+    let mut output = MtlEntries {
+        text: String::new(),
+        textures: Vec::new(),
+        losses: Vec::new(),
+    };
+    for (name, &id) in bindings {
         let mut entry = MtlWriter {
             doc,
             root_path,
             id,
-            name: name.as_str(),
+            name,
             textures: Vec::new(),
             losses: Vec::new(),
+            write_output,
         };
-        material.push_str(&entry.material_mtl()?);
-        textures.append(&mut entry.textures);
-        losses.append(&mut entry.losses);
+        output.text.push_str(&entry.material_mtl()?);
+        output.textures.append(&mut entry.textures);
+        output.losses.append(&mut entry.losses);
     }
-    Ok(ObjExport {
-        object: object.into_bytes(),
-        material: material.into_bytes(),
-        textures,
-        losses,
-    })
+    Ok(output)
+}
+
+/// MTL losses for bound materials without writing MTL text or loading texture pixels.
+pub(crate) fn material_diagnostics(
+    doc: &SceneDoc,
+    root_path: &Path,
+    meshes: &[ExchangeMesh],
+) -> Result<Vec<Loss>> {
+    let bindings = material_bindings(meshes)?;
+    Ok(mtl_entries(doc, root_path, &bindings, false)?.losses)
 }
 
 /// One bound material's MTL entry under construction: its texture PNGs and the losses found.
@@ -280,16 +311,19 @@ struct MtlWriter<'a> {
     name: &'a str,
     textures: Vec<(String, Vec<u8>)>,
     losses: Vec<Loss>,
+    write_output: bool,
 }
 
 impl MtlWriter<'_> {
     fn loss(&mut self, feature: &str, reason: &str) {
-        self.losses.push(Loss {
-            feature_id: feature.to_owned(),
-            data_id: Some(self.id.as_str().to_owned()),
-            reason: reason.to_owned(),
-            suggestion: None,
-        });
+        if !self.write_output {
+            self.losses.push(Loss {
+                feature_id: feature.to_owned(),
+                data_id: Some(self.id.as_str().to_owned()),
+                reason: reason.to_owned(),
+                suggestion: None,
+            });
+        }
     }
 
     /// One `map_*` line. Its options are Blender's `-o`, `-s`, and `-bm`; its file is the texture
@@ -309,14 +343,16 @@ impl MtlWriter<'_> {
                     "MTL has no texture rotation option; the rotation is not written",
                 );
             }
-            let (location, scale) = mtl_transform(transform);
-            if location != [0.0; 3] {
-                let [x, y, z] = location;
-                options.push_str(&format!(" -o {x:.6} {y:.6} {z:.6}"));
-            }
-            if scale != [1.0; 3] {
-                let [x, y, z] = scale;
-                options.push_str(&format!(" -s {x:.6} {y:.6} {z:.6}"));
+            if self.write_output {
+                let (location, scale) = mtl_transform(transform);
+                if location != [0.0; 3] {
+                    let [x, y, z] = location;
+                    options.push_str(&format!(" -o {x:.6} {y:.6} {z:.6}"));
+                }
+                if scale != [1.0; 3] {
+                    let [x, y, z] = scale;
+                    options.push_str(&format!(" -s {x:.6} {y:.6} {z:.6}"));
+                }
             }
         }
         if texture.wrap != [TextureWrap::Repeat; 2] {
@@ -325,10 +361,14 @@ impl MtlWriter<'_> {
                 "MTL has no texture wrap option; the wrap mode is not written",
             );
         }
-        if let Some(strength) = bump
+        if self.write_output
+            && let Some(strength) = bump
             && strength > 0.0001
         {
             options.push_str(&format!(" -bm {strength:.6}"));
+        }
+        if !self.write_output {
+            return Ok(String::new());
         }
         let file = format!("{}_{}.png", self.name, key.trim_start_matches("map_"));
         let packed =
@@ -344,7 +384,9 @@ impl MtlWriter<'_> {
     /// in Blender's `MTLTexMapType` order.
     fn material_mtl(&mut self) -> Result<String> {
         let (surface, surface_losses) = material_surface::resolve_surface(self.doc, self.id)?;
-        self.losses.extend(surface_losses);
+        if !self.write_output {
+            self.losses.extend(surface_losses);
+        }
         let [red, green, blue, alpha] = surface.base_color.factor;
         let metallic = surface.metallic;
         let level = surface.specular.as_ref().map_or(0.5, specular_level);
@@ -408,7 +450,7 @@ impl MtlWriter<'_> {
                 Some(self.map(
                     "map_d",
                     texture,
-                    gray_channels(texture.channels[3].clone()),
+                    [None, None, None, texture.channels[3].clone()],
                     None,
                 )?)
             }
@@ -482,6 +524,9 @@ impl MtlWriter<'_> {
             }
         }
 
+        if !self.write_output {
+            return Ok(String::new());
+        }
         let mut text = format!("newmtl {}\n", self.name);
         if ns_map.is_none() {
             text.push_str(&format!("Ns {ns:.6}\n"));
@@ -571,10 +616,9 @@ fn mean3(values: [f64; 3]) -> f64 {
     (values[0] + values[1] + values[2]) / 3.0
 }
 
-/// The active color layer as linear RGBA per vertex: a point layer as stored, and a corner layer as
-/// the value of each vertex's first corner. A vertex no face uses is opaque black. `None` without an
-/// active layer. OBJ and PLY both store one color per vertex through this.
-pub(super) fn active_vertex_colors(mesh: &ExchangeMesh) -> Result<Option<Vec<[f64; 4]>>> {
+/// The active color layer as nonnegative sRGB `r g b` values for OBJ's `v x y z r g b` form.
+/// Alpha is not written: xyzrgb carries RGB only.
+fn vertex_colors(mesh: &ExchangeMesh) -> Result<Option<Vec<[f64; 3]>>> {
     let Some(layer) = mesh
         .colors
         .active
@@ -584,56 +628,25 @@ pub(super) fn active_vertex_colors(mesh: &ExchangeMesh) -> Result<Option<Vec<[f6
     else {
         return Ok(None);
     };
-    let corner_count = mesh.faces.iter().map(Vec::len).sum::<usize>();
-    let expected = match layer.domain {
-        ColorDomain::Point => mesh.positions.len(),
-        ColorDomain::Corner => corner_count,
-    };
-    if layer.values.len() != expected {
-        return Err(PotError::new(
-            ErrorCode::ExportFailed,
-            "active color layer has an invalid value count",
-        ));
-    }
-    let mut colors = vec![None::<[f64; 4]>; mesh.positions.len()];
-    match layer.domain {
-        ColorDomain::Point => {
-            for (slot, value) in colors.iter_mut().zip(&layer.values) {
-                *slot = Some(*value);
-            }
-        }
-        ColorDomain::Corner => {
-            for (vertex, value) in mesh.faces.iter().flatten().copied().zip(&layer.values) {
-                if let Some(slot) = colors.get_mut(vertex)
-                    && slot.is_none()
-                {
-                    *slot = Some(*value);
-                }
-            }
-        }
-    }
-    let colors = colors
-        .into_iter()
-        .map(|color| color.unwrap_or([0.0, 0.0, 0.0, 1.0]))
-        .collect::<Vec<_>>();
+    let colors = super::point_color_values(mesh, layer)?;
     if colors.iter().flatten().any(|value| !value.is_finite()) {
         return Err(PotError::new(
             ErrorCode::ExportFailed,
             "color layer contains a non-finite value",
         ));
     }
-    Ok(Some(colors))
-}
-
-/// The active color layer as the sRGB-encoded `r g b` of each vertex, the `v x y z r g b` form.
-/// Alpha is not written: xyzrgb carries RGB only.
-fn vertex_colors(mesh: &ExchangeMesh) -> Result<Option<Vec<[f64; 3]>>> {
-    Ok(active_vertex_colors(mesh)?.map(|colors| {
+    Ok(Some(
         colors
             .into_iter()
-            .map(|[red, green, blue, _]| [srgb_encode(red), srgb_encode(green), srgb_encode(blue)])
-            .collect()
-    }))
+            .map(|[red, green, blue, _]| {
+                [
+                    srgb_encode(red.max(0.0)),
+                    srgb_encode(green.max(0.0)),
+                    srgb_encode(blue.max(0.0)),
+                ]
+            })
+            .collect(),
+    ))
 }
 
 /// The material slot a face is bound to, or `None` when it is unassigned. An index past the last
@@ -644,16 +657,6 @@ fn bound_material(mesh: &ExchangeMesh, face: usize) -> Option<&Id> {
         .unwrap_or(usize::MAX)
         .min(last);
     mesh.material_slots.get(index)?.as_ref()
-}
-
-/// `usemtl` and MTL name of a bound material. `potter_default` is the unassigned marker, so a
-/// material with that id is written under a distinct name.
-fn mtl_name(id: &Id) -> String {
-    if id.as_str() == DEFAULT_MATERIAL {
-        format!("{DEFAULT_MATERIAL}_material")
-    } else {
-        id.as_str().to_owned()
-    }
 }
 
 /// Blender's indexed table for one object: unique entries in first-use order, as text lines, plus
@@ -700,6 +703,7 @@ struct ObjImport {
     meshes: Vec<ExchangeMesh>,
     losses: Vec<Loss>,
     materials: BTreeMap<String, MtlMaterial>,
+    external_material_names: BTreeMap<Id, String>,
 }
 
 fn import(path: &Path) -> Result<ObjImport> {
@@ -724,6 +728,8 @@ fn import(path: &Path) -> Result<ObjImport> {
     let mut group_members = BTreeMap::<String, BTreeSet<usize>>::new();
     // Every `usemtl` name read, and the one in effect for each face of `current`, in face order.
     let mut material_names = Vec::<String>::new();
+    let mut imported_material_ids = BTreeMap::<String, Id>::new();
+    let mut external_material_names = BTreeMap::<Id, String>::new();
     let mut active_material = None::<usize>;
     let mut face_materials = Vec::<Option<usize>>::new();
     // Whether an `s` group is on at the current line, and whether any face of `current` was read
@@ -786,7 +792,13 @@ fn import(path: &Path) -> Result<ObjImport> {
                         &mut losses,
                     );
                     finish_colors(&mut current, &local_colors, &mut losses);
-                    finish_materials(&mut current, &face_materials, &material_names, &mut losses);
+                    finish_materials(
+                        &mut current,
+                        &face_materials,
+                        &material_names,
+                        &mut imported_material_ids,
+                        &mut external_material_names,
+                    )?;
                     meshes.push(current);
                     current = empty_mesh(
                         format!("object_{}", meshes.len()),
@@ -808,17 +820,16 @@ fn import(path: &Path) -> Result<ObjImport> {
                 }
             }
             "g" => {
-                // Blender reads `g` as a group, not an object, when split groups are off
-                // (`geom_update_group`). Potter's exporter writes several names on one line, so the
-                // names are split. `off`, `null`, and `default` clear the group instead.
-                let names = words.map(str::to_owned).collect::<Vec<_>>();
-                active_groups = if names
-                    .iter()
-                    .any(|name| matches!(name.as_str(), "off" | "null" | "default"))
+                // Blender treats the entire remainder as one group name (`geom_update_group`).
+                let name = split_word(line).1.trim();
+                active_groups = if name.is_empty()
+                    || name.contains("off")
+                    || name.contains("null")
+                    || name.contains("default")
                 {
                     Vec::new()
                 } else {
-                    names
+                    vec![name.to_owned()]
                 };
             }
             "mtllib" => {
@@ -835,7 +846,7 @@ fn import(path: &Path) -> Result<ObjImport> {
                 }
             }
             "usemtl" => {
-                let name = words.collect::<Vec<_>>().join(" ");
+                let name = split_word(line).1.trim().to_owned();
                 active_material = (!name.is_empty()).then(|| {
                     match material_names.iter().position(|known| *known == name) {
                         Some(index) => index,
@@ -915,7 +926,13 @@ fn import(path: &Path) -> Result<ObjImport> {
             &mut losses,
         );
         finish_colors(&mut current, &local_colors, &mut losses);
-        finish_materials(&mut current, &face_materials, &material_names, &mut losses);
+        finish_materials(
+            &mut current,
+            &face_materials,
+            &material_names,
+            &mut imported_material_ids,
+            &mut external_material_names,
+        )?;
         meshes.push(current);
     }
     if face_count == 0 && !positions.is_empty() {
@@ -986,6 +1003,7 @@ fn import(path: &Path) -> Result<ObjImport> {
         meshes,
         losses,
         materials,
+        external_material_names,
     })
 }
 
@@ -1009,9 +1027,8 @@ fn resolve_index(token: &str, count: usize, line: usize) -> Result<usize> {
     }
 }
 
-/// Sets `mesh.normals` when every face corner names a normal, the UV layer when every corner
-/// names a `vt`, and the vertex groups whose vertices fill whole faces. Partial values are dropped
-/// and smooth groups without any normals are kept as losses, so nothing vanishes silently.
+/// Sets complete custom normals and UV layers, and imports each OBJ group as unit-weight vertex
+/// memberships. Smooth groups without any normals are reported as losses.
 fn finish_object(
     mesh: &mut ExchangeMesh,
     corner_normals: &[Option<DVec3>],
@@ -1021,24 +1038,10 @@ fn finish_object(
     losses: &mut Vec<Loss>,
 ) {
     for (name, vertices) in group_members {
-        let group = ExchangeVertexGroup {
+        mesh.vertex_groups.push(ExchangeVertexGroup {
             name: name.clone(),
             weights: vertices.iter().map(|&vertex| (vertex, 1.0)).collect(),
-        };
-        if obj_group_is_face_compatible(mesh, &group) {
-            mesh.vertex_groups.push(group);
-        } else {
-            losses.push(Loss {
-                feature_id: "mesh.vertex_group".to_owned(),
-                data_id: Some(mesh.name.clone()),
-                reason: format!(
-                    "OBJ group `{name}` crosses face boundaries and cannot be represented as a vertex group"
-                ),
-                suggestion: Some(
-                    "use an OBJ group whose faces have disjoint or fully shared vertices".to_owned(),
-                ),
-            });
-        }
+        });
     }
     let supplied = corner_normals.iter().flatten().count();
     if supplied > 0 && supplied == corner_normals.len() {
@@ -1115,48 +1118,66 @@ fn finish_colors(
     }
 }
 
-/// Sets the material slots and per-face slot indices from the `usemtl` name in effect for each
-/// face. Each distinct name is one slot, in first-use order. `potter_default` and faces read before
-/// any `usemtl` are unassigned. A name that is not a Potter material id imports as unassigned and
-/// is a loss. Nothing is set when no face binds a material.
+fn unique_material_id(name: &str, ids_by_name: &mut BTreeMap<String, Id>) -> Result<Id> {
+    if let Some(id) = ids_by_name.get(name) {
+        return Ok(id.clone());
+    }
+    let mut base = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-') {
+                character.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if !base
+        .as_bytes()
+        .first()
+        .is_some_and(|byte| byte.is_ascii_lowercase())
+    {
+        base.insert_str(0, "material_");
+    }
+    base.truncate(64);
+    let mut candidate = base.clone();
+    let mut suffix_number = 1_usize;
+    while ids_by_name
+        .values()
+        .any(|id| id.as_str() == candidate.as_str())
+    {
+        suffix_number += 1;
+        let suffix = format!("_{suffix_number}");
+        candidate = format!("{}{suffix}", &base[..base.len().min(64 - suffix.len())]);
+    }
+    let id = Id::new(candidate)?;
+    ids_by_name.insert(name.to_owned(), id.clone());
+    Ok(id)
+}
+
+/// Sets the slots for each distinct raw `usemtl` name, retaining the external name separately.
 fn finish_materials(
     mesh: &mut ExchangeMesh,
     face_materials: &[Option<usize>],
     material_names: &[String],
-    losses: &mut Vec<Loss>,
-) {
-    // Name index of each slot, `None` for the unassigned slot.
+    ids_by_name: &mut BTreeMap<String, Id>,
+    external_names: &mut BTreeMap<Id, String>,
+) -> Result<()> {
     let mut keys = Vec::<Option<usize>>::new();
     let mut slots = Vec::<Option<Id>>::new();
     let mut indices = Vec::with_capacity(face_materials.len());
     for &material in face_materials {
-        let key = material.filter(|&index| {
-            material_names
-                .get(index)
-                .is_some_and(|name| name != DEFAULT_MATERIAL)
-        });
+        let key = material;
         let slot = match keys.iter().position(|&known| known == key) {
             Some(slot) => slot,
             None => {
                 let id = match key.and_then(|index| material_names.get(index)) {
                     None => None,
-                    Some(name) => match Id::new(name.as_str()) {
-                        Ok(id) => Some(id),
-                        Err(_) => {
-                            losses.push(Loss {
-                                feature_id: "material.binding".to_owned(),
-                                data_id: Some(mesh.name.clone()),
-                                reason: format!(
-                                    "OBJ material `{name}` is not a Potter material id; its faces are imported unassigned"
-                                ),
-                                suggestion: Some(
-                                    "name OBJ materials with Potter material ids: lowercase letters, digits, `_`, and `-`"
-                                        .to_owned(),
-                                ),
-                            });
-                            None
-                        }
-                    },
+                    Some(name) => {
+                        let id = unique_material_id(name, ids_by_name)?;
+                        external_names.insert(id.clone(), name.clone());
+                        Some(id)
+                    }
                 };
                 keys.push(key);
                 slots.push(id);
@@ -1166,10 +1187,11 @@ fn finish_materials(
         indices.push(u32::try_from(slot).unwrap_or(u32::MAX));
     }
     if slots.iter().all(Option::is_none) {
-        return;
+        return Ok(());
     }
     mesh.material_slots = slots;
     mesh.face_material_indices = indices;
+    Ok(())
 }
 
 fn parse_floats<'a>(
@@ -1959,6 +1981,7 @@ pub(crate) fn imported_graph(path: &Path, scene_id: String) -> Result<ImportedGr
         meshes,
         losses,
         materials: library,
+        external_material_names,
     } = import(path)?;
     let bindings = meshes
         .iter()
@@ -1976,9 +1999,14 @@ pub(crate) fn imported_graph(path: &Path, scene_id: String) -> Result<ImportedGr
     let mut graph = import_graph_from_meshes(meshes, path, scene_id, "obj", losses)?;
     let mut images = BTreeMap::<PathBuf, Id>::new();
     for id in &slot_ids {
+        let external_name = external_material_names
+            .get(id)
+            .map_or(id.as_str(), String::as_str);
         // A usemtl name with no MTL entry gets the default material, as Blender creates one.
-        let mtl = library.get(id.as_str()).cloned().unwrap_or_default();
-        let material = potter_material(&mtl, id, &mut graph.doc, &mut images, &mut graph.losses)?;
+        let mtl = library.get(external_name).cloned().unwrap_or_default();
+        let mut material =
+            potter_material(&mtl, id, &mut graph.doc, &mut images, &mut graph.losses)?;
+        material.name = external_name.to_owned();
         graph.doc.materials.insert(id.clone(), material);
     }
     bind_slots(&mut graph.doc, bindings)?;
@@ -1989,13 +2017,17 @@ pub(crate) fn imported_graph(path: &Path, scene_id: String) -> Result<ImportedGr
 #[cfg(test)]
 mod tests {
     use super::{
-        MtlMaterial, export, illum_flags, illum_mode, import, imported_graph, parse_mtl,
-        potter_material,
+        MtlMaterial, export, illum_flags, illum_mode, import, imported_graph, material_diagnostics,
+        parse_mtl, potter_material, srgb_encode,
     };
     use crate::{
         error::{ErrorCode, PotError, Result},
         exchange::test_support::triangle_with_layers,
-        model::{Id, Material, SceneDoc},
+        geom::color_layers::{ColorDomain, ColorLayer, ColorStore},
+        image::ImageInterpolation,
+        model::{
+            Id, Image, ImageAlphaMode, ImageColorspace, ImageSource, Material, SceneDoc, TextureRef,
+        },
     };
     use std::{collections::BTreeMap, fs, path::Path};
 
@@ -2025,6 +2057,348 @@ mod tests {
             .skip_while(|line| *line != format!("newmtl {name}"))
             .map(str::to_owned)
             .collect()
+    }
+
+    #[test]
+    fn averages_corner_colors_when_writing_obj_vertices() -> Result<()> {
+        // Blender's POINT lookup averages CORNER data (`BKE_attribute.hh:644-668`; `mesh_attributes.cc:24-44`).
+        let mut mesh = triangle_with_layers();
+        mesh.faces.push(vec![0, 1, 2]);
+        mesh.smooth.push(false);
+        mesh.normals = Some(vec![[0.0, 0.0, 1.0]; 6]);
+        mesh.uv_active = None;
+        mesh.colors = ColorStore {
+            layers: vec![ColorLayer {
+                name: "Corner".to_owned(),
+                domain: ColorDomain::Corner,
+                values: vec![[1.0, 0.0, 0.0, 1.0]; 3]
+                    .into_iter()
+                    .chain(vec![[0.0, 0.0, 1.0, 1.0]; 3])
+                    .collect(),
+            }],
+            active: Some("Corner".to_owned()),
+            render: Some("Corner".to_owned()),
+        };
+        let exported = export(&empty_doc(), Path::new(""), &[mesh])?;
+        let text = String::from_utf8_lossy(&exported.object);
+        let first_vertex = text
+            .lines()
+            .find(|line| line.starts_with("v "))
+            .ok_or_else(|| PotError::new(ErrorCode::InternalError, "OBJ vertex is missing"))?;
+        let color = first_vertex
+            .split_whitespace()
+            .skip(4)
+            .take(3)
+            .map(|value| {
+                value
+                    .parse::<f64>()
+                    .map_err(|error| PotError::new(ErrorCode::InternalError, error.to_string()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        assert!((color[0] - srgb_encode(0.5)).abs() < 1.0e-6);
+        assert_eq!(color[1], 0.0);
+        assert!((color[2] - srgb_encode(0.5)).abs() < 1.0e-6);
+        Ok(())
+    }
+
+    #[test]
+    fn negative_obj_vertex_colors_are_clamped_and_reported() -> Result<()> {
+        // Blender rejects color layers with a negative vertex RGB (`obj_import_file_reader.cc:92-105`; `obj_import_mesh.cc:463-474`).
+        let mut mesh = triangle_with_layers();
+        mesh.colors = ColorStore {
+            layers: vec![ColorLayer {
+                name: "Color".to_owned(),
+                domain: ColorDomain::Point,
+                values: vec![[-0.25, 0.25, 1.0, 1.0]; 3],
+            }],
+            active: Some("Color".to_owned()),
+            render: Some("Color".to_owned()),
+        };
+        let exported = export(&empty_doc(), Path::new(""), std::slice::from_ref(&mesh))?;
+        let object = String::from_utf8_lossy(&exported.object);
+        for line in object.lines().filter(|line| line.starts_with("v ")) {
+            let color = line.split_whitespace().skip(4).collect::<Vec<_>>();
+            assert_eq!(color[0], "0");
+            assert!(
+                color
+                    .iter()
+                    .all(|channel| { channel.parse::<f64>().is_ok_and(|value| value >= 0.0) })
+            );
+        }
+        let losses = crate::exchange::element_data_losses("obj", std::slice::from_ref(&mesh));
+        assert!(losses.iter().any(|loss| {
+            loss.feature_id == "mesh.color_attribute" && loss.reason.contains("negative")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn imports_the_entire_obj_g_remainder_as_one_group_name() -> Result<()> {
+        // Blender treats the `g` line remainder as one group name (`obj_import_file_reader.cc:398-408,632-649`).
+        let file = tempfile::NamedTempFile::new().map_err(|error| PotError::io(&error))?;
+        io(fs::write(
+            file.path(),
+            "o object\nv 0 0 0\nv 1 0 0\nv 0 1 0\ng Front Group\nf 1 2 3\n",
+        ))?;
+        let imported = import(file.path())?;
+        let group = imported.meshes[0]
+            .vertex_groups
+            .first()
+            .ok_or_else(|| PotError::new(ErrorCode::InternalError, "OBJ group is missing"))?;
+        assert_eq!(group.name, "Front Group");
+        assert_eq!(group.weights, vec![(0, 1.0), (1, 1.0), (2, 1.0)]);
+        Ok(())
+    }
+
+    #[test]
+    fn exports_one_group_per_face_and_reports_overlapping_memberships() -> Result<()> {
+        // Blender writes one deform group per face (`obj_export_file_writer.cc:402-413`).
+        let mut mesh = triangle_with_layers();
+        mesh.vertex_groups = ["Group Name", "Second"]
+            .into_iter()
+            .map(|name| crate::exchange::ExchangeVertexGroup {
+                name: name.to_owned(),
+                weights: vec![(0, 1.0), (1, 1.0), (2, 1.0)],
+            })
+            .collect();
+        let meshes = [mesh];
+        let exported = export(&empty_doc(), Path::new(""), &meshes)?;
+        let object = String::from_utf8_lossy(&exported.object);
+        assert!(object.lines().any(|line| line == "g Group Name"));
+        assert!(!object.lines().any(|line| line == "g Group Name Second"));
+        let losses = crate::exchange::element_data_losses("obj", &meshes);
+        assert!(losses.iter().any(|loss| {
+            loss.feature_id == "mesh.vertex_group" && loss.reason.contains("Second")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn imports_blender_material_names_and_resolves_mtl_by_raw_name() -> Result<()> {
+        // Blender preserves the raw `usemtl` name for material lookup (`obj_import_file_reader.cc:657-664`).
+        let dir = io(tempfile::tempdir())?;
+        let object_path = dir.path().join("scene.obj");
+        io(fs::write(
+            &object_path,
+            "mtllib scene.mtl\no object\nv 0 0 0\nv 1 0 0\nv 0 1 0\nusemtl Material.001\nf 1 2 3\nusemtl material_001\nf 1 3 2\n",
+        ))?;
+        io(fs::write(
+            dir.path().join("scene.mtl"),
+            "newmtl Material.001\nKd 1 0 0\nnewmtl material_001\nKd 0 1 0\n",
+        ))?;
+        let imported = import(&object_path)?;
+        let slots = &imported.meshes[0].material_slots;
+        assert_eq!(slots.len(), 2);
+        assert_ne!(slots[0], slots[1]);
+        assert_eq!(slots[0].as_ref().map(Id::as_str), Some("material_001"));
+        assert_eq!(slots[1].as_ref().map(Id::as_str), Some("material_001_2"));
+
+        let graph = imported_graph(&object_path, SCENE_ID.to_owned())?;
+        let (red_id, red) = graph
+            .doc
+            .materials
+            .iter()
+            .find(|(_, material)| material.name == "Material.001")
+            .ok_or_else(|| PotError::new(ErrorCode::InternalError, "raw OBJ material missing"))?;
+        let (green_id, green) = graph
+            .doc
+            .materials
+            .iter()
+            .find(|(_, material)| material.name == "material_001")
+            .ok_or_else(|| {
+                PotError::new(ErrorCode::InternalError, "second OBJ material missing")
+            })?;
+        assert_eq!(red_id.as_str(), "material_001");
+        assert_eq!(green_id.as_str(), "material_001_2");
+        assert_eq!(red.base_color[..3], [1.0, 0.0, 0.0]);
+        assert_eq!(green.base_color[..3], [0.0, 1.0, 0.0]);
+        let data = graph
+            .doc
+            .data_blocks
+            .values()
+            .find(|data| data.materials.len() == 2)
+            .ok_or_else(|| {
+                PotError::new(ErrorCode::InternalError, "bound material slots missing")
+            })?;
+        let slots = &data.materials;
+        assert_eq!(
+            graph.doc.materials[slots[0].as_ref().ok_or_else(|| {
+                PotError::new(ErrorCode::InternalError, "first material slot is empty")
+            })?]
+            .name,
+            "Material.001"
+        );
+        assert_eq!(
+            graph.doc.materials[slots[1].as_ref().ok_or_else(|| {
+                PotError::new(ErrorCode::InternalError, "second material slot is empty")
+            })?]
+            .name,
+            "material_001"
+        );
+        let imported_mesh = data
+            .mesh
+            .as_ref()
+            .ok_or_else(|| PotError::new(ErrorCode::InternalError, "imported mesh is missing"))?;
+        assert_eq!(
+            imported_mesh
+                .faces
+                .iter()
+                .map(|face| face.material_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unassigned_obj_faces_use_empty_usemtl() -> Result<()> {
+        // Blender clears the material with an empty name (`obj_export_file_writer.cc:56-62`).
+        let exported = export(&empty_doc(), Path::new(""), &[triangle_with_layers()])?;
+        let object = String::from_utf8_lossy(&exported.object);
+        assert!(object.lines().any(|line| line == "usemtl"));
+        assert!(exported.material.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn valid_default_like_material_ids_are_written_verbatim() -> Result<()> {
+        let mut doc = empty_doc();
+        let first = Id::new("potter_default")?;
+        let second = Id::new("potter_default_material")?;
+        doc.materials.insert(first.clone(), Material::default());
+        doc.materials.insert(second.clone(), Material::default());
+        let mut mesh = triangle_with_layers();
+        mesh.faces.push(mesh.faces[0].clone());
+        mesh.smooth.push(false);
+        mesh.normals = Some(vec![[0.0, 0.0, 1.0]; 6]);
+        mesh.uv_active = None;
+        mesh.material_slots = vec![Some(first), Some(second)];
+        mesh.face_material_indices = vec![0, 1];
+        let exported = export(&doc, Path::new(""), &[mesh])?;
+        let object = String::from_utf8_lossy(&exported.object);
+        let mtl = String::from_utf8_lossy(&exported.material);
+        assert!(object.lines().any(|line| line == "usemtl potter_default"));
+        assert!(
+            object
+                .lines()
+                .any(|line| line == "usemtl potter_default_material")
+        );
+        assert!(mtl.lines().any(|line| line == "newmtl potter_default"));
+        assert!(
+            mtl.lines()
+                .any(|line| line == "newmtl potter_default_material")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn map_d_packs_source_opacity_into_png_alpha() -> Result<()> {
+        // Blender connects the image Alpha output to Principled Alpha (`obj_import_mtl.cc:424-436`).
+        let dir = io(tempfile::tempdir())?;
+        let image_path = dir.path().join("opacity.pixels");
+        let pixels = crate::image::encode_pixels(1, 1, &[[0.2, 0.4, 0.6, 0.25]])?;
+        io(fs::write(&image_path, &pixels))?;
+        let image_id = Id::new("opacity")?;
+        let mut doc = empty_doc();
+        doc.images.insert(
+            image_id.clone(),
+            Image {
+                name: "Opacity".to_owned(),
+                source: ImageSource::File,
+                colorspace: ImageColorspace::Srgb,
+                width: 1,
+                height: 1,
+                tiles: Vec::new(),
+                blob: None,
+                source_path: Some(image_path.to_string_lossy().into_owned()),
+                source_hash: Some(crate::hash::sha256(&pixels)),
+                alpha_mode: ImageAlphaMode::default(),
+            },
+        );
+        let material_id = Id::new("shiny")?;
+        doc.materials.insert(
+            material_id.clone(),
+            Material {
+                name: "shiny".to_owned(),
+                alpha_mode: "blend".to_owned(),
+                base_color_texture: Some(TextureRef {
+                    image: image_id,
+                    uv_layer: None,
+                    interpolation: ImageInterpolation::Linear,
+                }),
+                ..Material::default()
+            },
+        );
+        let mut mesh = triangle_with_layers();
+        mesh.material_slots = vec![Some(material_id)];
+        mesh.face_material_indices = vec![0];
+        let exported = export(&doc, dir.path(), &[mesh])?;
+        let mtl = String::from_utf8_lossy(&exported.material);
+        let texture_name = mtl
+            .lines()
+            .find(|line| line.starts_with("map_d "))
+            .and_then(|line| line.split_whitespace().last())
+            .ok_or_else(|| PotError::new(ErrorCode::InternalError, "MTL map_d is missing"))?;
+        let png = exported
+            .textures
+            .iter()
+            .find(|(name, _)| name.as_str() == texture_name)
+            .map(|(_, bytes)| bytes)
+            .ok_or_else(|| PotError::new(ErrorCode::InternalError, "map_d PNG is missing"))?;
+        let (_, _, decoded) = crate::image::decode_pixels(png, ImageColorspace::Linear)?;
+        assert!((decoded[0][3] - 0.25).abs() < 0.005);
+        Ok(())
+    }
+
+    #[test]
+    fn material_diagnostics_report_losses_without_loading_texture_pixels() -> Result<()> {
+        let dir = io(tempfile::tempdir())?;
+        let mut doc = empty_doc();
+        let image_id = Id::new("missing_image")?;
+        doc.images.insert(
+            image_id.clone(),
+            Image {
+                name: "Missing".to_owned(),
+                source: ImageSource::File,
+                colorspace: ImageColorspace::Srgb,
+                width: 1,
+                height: 1,
+                tiles: Vec::new(),
+                blob: None,
+                source_path: Some(
+                    dir.path()
+                        .join("missing.pixels")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                source_hash: None,
+                alpha_mode: ImageAlphaMode::default(),
+            },
+        );
+        let material_id = Id::new("shiny")?;
+        doc.materials.insert(
+            material_id.clone(),
+            Material {
+                name: "shiny".to_owned(),
+                transmission: 0.5,
+                base_color_texture: Some(TextureRef {
+                    image: image_id,
+                    uv_layer: None,
+                    interpolation: ImageInterpolation::Linear,
+                }),
+                ..Material::default()
+            },
+        );
+        let mut mesh = triangle_with_layers();
+        mesh.material_slots = vec![Some(material_id)];
+        mesh.face_material_indices = vec![0];
+        let losses = material_diagnostics(&doc, dir.path(), &[mesh])?;
+        assert!(
+            losses
+                .iter()
+                .any(|loss| loss.feature_id == "material.mtl.transmission")
+        );
+        Ok(())
     }
 
     #[test]

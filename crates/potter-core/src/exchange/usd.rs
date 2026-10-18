@@ -1861,6 +1861,7 @@ fn parse_usda(text: &str, scene_id: String) -> Result<(SceneDoc, Vec<Loss>)> {
         {
             scene.fps_base = fps_base;
         }
+        let root_color_space = property_string(root, "colorSpace");
         for child in &root.children {
             import_node_tree(
                 child,
@@ -1870,6 +1871,7 @@ fn parse_usda(text: &str, scene_id: String) -> Result<(SceneDoc, Vec<Loss>)> {
                 &mut used_data,
                 &mut used_actions,
                 &materials_by_name,
+                root_color_space.as_deref(),
                 &mut losses,
             )?;
         }
@@ -1886,6 +1888,7 @@ fn parse_usda(text: &str, scene_id: String) -> Result<(SceneDoc, Vec<Loss>)> {
                 &mut used_data,
                 &mut used_actions,
                 &materials_by_name,
+                None,
                 &mut losses,
             )?;
         }
@@ -1913,7 +1916,7 @@ fn parse_usda(text: &str, scene_id: String) -> Result<(SceneDoc, Vec<Loss>)> {
     Ok((doc, losses))
 }
 
-/// The prim name and property of a connection target such as `</Scene/M.outputs:rgb>`.
+/// The full prim path and property of a connection target such as `</Scene/M.outputs:rgb>`.
 fn connection_target(raw: &str) -> Option<(String, String)> {
     let target: String = raw
         .chars()
@@ -1921,25 +1924,39 @@ fn connection_target(raw: &str) -> Option<(String, String)> {
         .collect();
     let target = target.strip_prefix('<')?.strip_suffix('>')?;
     let (path, property) = target.rsplit_once('.')?;
-    let name = path.rsplit('/').next()?;
-    Some((name.to_owned(), property.to_owned()))
+    Some((path.to_owned(), property.to_owned()))
 }
 
-/// The `UsdPrimvarReader_float3` or `_float4` shader of `material` that a `diffuseColor` connection
-/// names. Blender imports other sources differently, so they return `None`.
-fn primvar_color_reader<'a>(material: &'a Prim, connect: &str) -> Option<&'a Prim> {
-    let (name, property) = connection_target(connect)?;
-    if !property.starts_with("outputs:") {
-        return None;
+fn prim_by_path<'a>(prim: &'a Prim, path: &str) -> Option<&'a Prim> {
+    if prim.path == path {
+        return Some(prim);
     }
-    material.descendants().into_iter().find(|prim| {
-        prim.kind == "Shader"
-            && prim.name == name
+    prim.children
+        .iter()
+        .find_map(|child| prim_by_path(child, path))
+}
+
+/// Follows a material's diffuseColor connection through NodeGraph outputs to a supported reader.
+/// Blender imports other sources differently, so they return `None`.
+fn primvar_color_reader<'a>(material: &'a Prim, connect: &str) -> Option<&'a Prim> {
+    let mut target = connection_target(connect)?;
+    let mut visited = BTreeSet::new();
+    loop {
+        let (path, property) = target;
+        if !property.starts_with("outputs:") || !visited.insert((path.clone(), property.clone())) {
+            return None;
+        }
+        let source = prim_by_path(material, &path)?;
+        if source.kind == "Shader"
             && matches!(
-                property_string(prim, "info:id").as_deref(),
+                property_string(source, "info:id").as_deref(),
                 Some("UsdPrimvarReader_float3" | "UsdPrimvarReader_float4")
             )
-    })
+        {
+            return Some(source);
+        }
+        target = connection_target(source.properties.get(&format!("{property}.connect"))?)?;
+    }
 }
 
 /// The attribute that a primvar reader reads, as Blender takes it: its `inputs:varname`, or the
@@ -1948,13 +1965,11 @@ fn primvar_color_reader<'a>(material: &'a Prim, connect: &str) -> Option<&'a Pri
 fn primvar_reader_varname(material: &Prim, reader: &Prim) -> Option<String> {
     let name = match reader.properties.get("inputs:varname.connect") {
         Some(connect) => {
-            let (prim_name, property) = connection_target(connect)?;
+            let (path, property) = connection_target(connect)?;
             if !property.starts_with("inputs:") {
                 return None;
             }
-            let source = std::iter::once(material)
-                .chain(material.descendants())
-                .find(|prim| prim.name == prim_name)?;
+            let source = prim_by_path(material, &path)?;
             property_string(source, &property)?
         }
         None => property_string(reader, "inputs:varname")?,
@@ -2009,8 +2024,11 @@ fn import_node_tree(
     used_data: &mut BTreeSet<Id>,
     used_actions: &mut BTreeSet<Id>,
     materials: &BTreeMap<String, Id>,
+    inherited_color_space: Option<&str>,
     losses: &mut Vec<Loss>,
 ) -> Result<()> {
+    let prim_color_space = property_string(prim, "colorSpace");
+    let inherited_color_space = prim_color_space.as_deref().or(inherited_color_space);
     if prim.kind == "Scope" && prim.name == "Materials" {
         return Ok(());
     }
@@ -2028,6 +2046,7 @@ fn import_node_tree(
                 used_data,
                 used_actions,
                 materials,
+                inherited_color_space,
                 losses,
             )?;
         }
@@ -2080,7 +2099,7 @@ fn import_node_tree(
             )
         })?;
         import_uv_layers(&mut mesh, &uv_layers, uv_active, uv_render);
-        import_color_layers(mesh_prim, &mut mesh, losses)?;
+        import_color_layers(mesh_prim, &mut mesh, losses, inherited_color_space)?;
         if let Some(normals) = normals {
             shading::import_shading(&mut mesh, &normals)?;
         }
@@ -2300,6 +2319,7 @@ fn import_node_tree(
             used_data,
             used_actions,
             materials,
+            inherited_color_space,
             losses,
         )?;
     }
@@ -2466,13 +2486,32 @@ fn import_normals(
     ))
 }
 
-/// Splits an attribute's raw text into its value text and its `interpolation` metadata.
+/// Splits an attribute's array values from trailing metadata and returns its interpolation.
 fn split_interpolation(raw: &str) -> (&str, Option<String>) {
-    let Some(position) = raw.find("interpolation") else {
+    let metadata_start = raw
+        .find(']')
+        .and_then(|end| raw[end + 1..].find('(').map(|open| end + 1 + open))
+        .or_else(|| {
+            raw.find("interpolation")
+                .and_then(|position| raw[..position].rfind('('))
+        });
+    let Some(metadata_start) = metadata_start else {
         return (raw, None);
     };
-    let value = raw[..position].rfind('(').map_or(raw, |open| &raw[..open]);
-    (value, first_string(&raw[position..]))
+    let metadata = &raw[metadata_start..];
+    let interpolation = metadata
+        .find("interpolation")
+        .and_then(|position| first_string(&metadata[position..]));
+    (&raw[..metadata_start], interpolation)
+}
+
+fn attribute_color_space(raw: &str) -> Option<std::result::Result<String, String>> {
+    let metadata_start = raw
+        .find(']')
+        .and_then(|end| raw[end + 1..].find('(').map(|open| end + 1 + open))?;
+    let metadata = &raw[metadata_start..];
+    let position = metadata.find("colorSpace")?;
+    Some(first_string(&metadata[position..]).ok_or_else(|| "has an invalid colorSpace".to_owned()))
 }
 
 fn normal_loss(reason: &str) -> Loss {
@@ -2510,7 +2549,12 @@ fn color_loss(reason: String) -> Loss {
 /// primvar, and its active and render layers, in `potter:colorLayers`. Without that metadata, each
 /// array-valued color primvar is a layer in file order, and the render layer is `displayColor` or the
 /// first layer.
-fn import_color_layers(prim: &Prim, mesh: &mut Mesh, losses: &mut Vec<Loss>) -> Result<()> {
+fn import_color_layers(
+    prim: &Prim,
+    mesh: &mut Mesh,
+    losses: &mut Vec<Loss>,
+    inherited_color_space: Option<&str>,
+) -> Result<()> {
     let metadata = property_string(prim, "potter:colorLayers")
         .map(|encoded| {
             serde_json::from_str::<Value>(&encoded).map_err(|error| {
@@ -2556,7 +2600,7 @@ fn import_color_layers(prim: &Prim, mesh: &mut Mesh, losses: &mut Vec<Loss>) -> 
             )));
             continue;
         }
-        match read_color_layer(prim, &name, &primvar, mesh) {
+        match read_color_layer(prim, &name, &primvar, mesh, inherited_color_space) {
             Ok(layer) => layers.push(layer),
             Err(reason) => losses.push(color_loss(format!(
                 "USD color primvar `{primvar}` on `{}` {reason}",
@@ -2601,19 +2645,16 @@ fn color_width(type_name: &str) -> Option<usize> {
     }
 }
 
-/// Whether a color primvar's `colorSpace` asks for sRGB decoding. Scene-linear and data colors, or no
-/// `colorSpace`, keep their values. Blender converts other spaces with its OCIO config, which Potter
-/// does not carry, so those are an error rather than a misread (`colorspace_attr_to_scene_linear`,
+/// Whether the effective USD color space asks for sRGB decoding. Blender converts other named spaces
+/// with its OCIO config, which Potter does not carry (`colorspace_attr_to_scene_linear`,
 /// `usd_colorspace_utils.cc`).
-fn color_space_is_srgb(raw: &str) -> std::result::Result<bool, String> {
-    let Some(position) = raw.find("colorSpace") else {
-        return Ok(false);
-    };
-    let space = first_string(&raw[position..]).unwrap_or_default();
-    match space.as_str() {
-        "" | "lin_rec709_scene" | "Linear Rec.709 (sRGB)" | "raw" | "RAW" | "data" => Ok(false),
-        "sRGB" | "srgb_texture" | "Utility - sRGB - Texture" => Ok(true),
-        other => Err(format!(
+fn color_space_is_srgb(space: Option<&str>) -> std::result::Result<bool, String> {
+    match space {
+        None
+        | Some("")
+        | Some("lin_rec709_scene" | "Linear Rec.709 (sRGB)" | "raw" | "RAW" | "data") => Ok(false),
+        Some("sRGB" | "srgb_texture" | "Utility - sRGB - Texture") => Ok(true),
+        Some(other) => Err(format!(
             "has colorSpace `{other}`; only sRGB and scene-linear colors are imported"
         )),
     }
@@ -2629,6 +2670,7 @@ fn read_color_layer(
     name: &str,
     primvar: &str,
     mesh: &Mesh,
+    inherited_color_space: Option<&str>,
 ) -> std::result::Result<ColorLayer, String> {
     let raw = prim
         .properties
@@ -2642,7 +2684,16 @@ fn read_color_layer(
     let width = color_width(type_name).ok_or_else(|| {
         format!("has type `{type_name}`; only color3 and color4 primvars are imported")
     })?;
-    let srgb = color_space_is_srgb(raw)?;
+    let color_space = match attribute_color_space(raw) {
+        Some(value) => Some(value?),
+        None => match prim.properties.get("colorSpace") {
+            Some(raw) => {
+                Some(first_string(raw).ok_or_else(|| "has an invalid colorSpace".to_owned())?)
+            }
+            None => inherited_color_space.map(str::to_owned),
+        },
+    };
+    let srgb = color_space_is_srgb(color_space.as_deref())?;
     let (value_text, interpolation) = split_interpolation(raw);
     let interpolation = interpolation.unwrap_or_else(|| "constant".to_owned());
     let display_color = primvar == "primvars:displayColor";
@@ -3375,6 +3426,7 @@ struct Declaration {
 struct Prim {
     kind: String,
     name: String,
+    path: String,
     properties: BTreeMap<String, String>,
     declared: Vec<Declaration>,
     children: Vec<Prim>,
@@ -3398,7 +3450,7 @@ fn parse_prims(tokens: &[Token], start: usize, end: usize) -> Result<Vec<Prim>> 
     let mut index = start;
     while index < end {
         if tokens[index].value == "def" {
-            let (prim, next) = parse_prim(tokens, index, end)?;
+            let (prim, next) = parse_prim(tokens, index, end, "")?;
             result.push(prim);
             index = next;
         } else {
@@ -3408,7 +3460,12 @@ fn parse_prims(tokens: &[Token], start: usize, end: usize) -> Result<Vec<Prim>> 
     Ok(result)
 }
 
-fn parse_prim(tokens: &[Token], start: usize, end: usize) -> Result<(Prim, usize)> {
+fn parse_prim(
+    tokens: &[Token],
+    start: usize,
+    end: usize,
+    parent_path: &str,
+) -> Result<(Prim, usize)> {
     let kind = tokens
         .get(start + 1)
         .ok_or_else(|| import_error("USDA prim type is missing"))?
@@ -3418,6 +3475,7 @@ fn parse_prim(tokens: &[Token], start: usize, end: usize) -> Result<(Prim, usize
         .get(start + 2)
         .ok_or_else(|| import_error("USDA prim name is missing"))?;
     let name = decode_string(&name_token.value).unwrap_or_else(|| name_token.value.clone());
+    let path = format!("{parent_path}/{name}");
     let mut index = start + 3;
     if tokens.get(index).is_some_and(|token| token.value == "(") {
         index = skip_balanced(tokens, index, end, "(", ")")?;
@@ -3433,7 +3491,7 @@ fn parse_prim(tokens: &[Token], start: usize, end: usize) -> Result<(Prim, usize
     index = body_start;
     while index < body_end {
         if tokens[index].value == "def" {
-            let (child, next) = parse_prim(tokens, index, body_end)?;
+            let (child, next) = parse_prim(tokens, index, body_end, &path)?;
             children.push(child);
             index = next;
             continue;
@@ -3468,6 +3526,7 @@ fn parse_prim(tokens: &[Token], start: usize, end: usize) -> Result<(Prim, usize
         Prim {
             kind,
             name,
+            path,
             properties,
             declared,
             children,
@@ -4620,6 +4679,114 @@ def Material "M"
         Ok(())
     }
 
+    // Blender 5.2.2 `UsdColorSpaceAPI::ComputeColorSpaceName(attr)` checks attribute, prim, then
+    // ancestors (`usd_colorspace_utils.cc:46-65`).
+    #[test]
+    fn color_space_api_inherits_from_scene_prim() -> Result<()> {
+        let text = r##"#usda 1.0
+def Xform "Scene"
+{
+    token colorSpace = "sRGB"
+    def Mesh "Tri"
+    {
+        point3f[] points = [(0, 0, 0), (1, 0, 0), (0, 1, 0)]
+        int[] faceVertexCounts = [3]
+        int[] faceVertexIndices = [0, 1, 2]
+        color3f[] primvars:displayColor = [(0.5, 0.5, 0.5), (1, 1, 1), (0, 0, 0)] (interpolation = "vertex")
+    }
+}
+"##;
+        let (store, losses) = import_colors(text)?;
+        assert!(losses.is_empty(), "{losses:?}");
+        assert!((store.layers[0].values[0][0] - 0.214_041_14).abs() < 1e-6);
+        Ok(())
+    }
+
+    #[test]
+    fn color_space_api_owning_prim_overrides_ancestor() -> Result<()> {
+        let text = r##"#usda 1.0
+def Xform "Scene"
+{
+    token colorSpace = "ACEScg"
+    def Mesh "Tri"
+    {
+        token colorSpace = "lin_rec709_scene"
+        point3f[] points = [(0, 0, 0), (1, 0, 0), (0, 1, 0)]
+        int[] faceVertexCounts = [3]
+        int[] faceVertexIndices = [0, 1, 2]
+        color3f[] primvars:displayColor = [(0.5, 0.5, 0.5), (1, 1, 1), (0, 0, 0)] (interpolation = "vertex")
+    }
+}
+"##;
+        let (store, losses) = import_colors(text)?;
+        assert!(losses.is_empty(), "{losses:?}");
+        assert_eq!(store.layers[0].values[0][0], 0.5);
+        Ok(())
+    }
+
+    #[test]
+    fn unsupported_color_space_api_drops_layer_with_loss() -> Result<()> {
+        let text = r##"#usda 1.0
+def Xform "Scene"
+{
+    token colorSpace = "ACEScg"
+    def Mesh "Tri"
+    {
+        point3f[] points = [(0, 0, 0), (1, 0, 0), (0, 1, 0)]
+        int[] faceVertexCounts = [3]
+        int[] faceVertexIndices = [0, 1, 2]
+        color3f[] primvars:displayColor = [(1, 0, 0), (0, 1, 0), (0, 0, 1)] (interpolation = "vertex")
+    }
+}
+"##;
+        let (store, losses) = import_colors(text)?;
+        assert!(store.layers.is_empty());
+        assert!(
+            losses
+                .iter()
+                .any(|loss| loss.feature_id == "mesh.color_attribute")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn color_space_attribute_overrides_prim_and_ancestor_and_preserves_alpha() -> Result<()> {
+        let text = r##"#usda 1.0
+def Xform "Scene"
+{
+    token colorSpace = "ACEScg"
+    def Xform "Holder"
+    {
+        token colorSpace = "ACEScg"
+        def Mesh "Tri"
+        {
+            token colorSpace = "lin_rec709_scene"
+            point3f[] points = [(0, 0, 0), (1, 0, 0), (0, 1, 0)]
+            int[] faceVertexCounts = [3]
+            int[] faceVertexIndices = [0, 1, 2]
+            color4f[] primvars:Wear = [(0.5, 0.5, 0.5, 0.25), (1, 1, 1, 0.5), (0, 0, 0, 1)] (interpolation = "vertex", colorSpace = "sRGB")
+        }
+    }
+}
+"##;
+        let (store, losses) = import_colors(text)?;
+        assert!(losses.is_empty(), "{losses:?}");
+        let value = store.layers[0].values[0];
+        assert!((value[0] - 0.214_041_14).abs() < 1e-6, "{value:?}");
+        assert_eq!(value[3], 0.25);
+        Ok(())
+    }
+
+    #[test]
+    fn color_metadata_without_interpolation_does_not_add_numeric_components() -> Result<()> {
+        let (store, losses) = import_colors(&triangle(
+            r##"    color3f[] primvars:Paint = [(0.5, 0.25, 0.125)] (colorSpace = "lin_rec709_scene")"##,
+        ))?;
+        assert!(losses.is_empty(), "{losses:?}");
+        assert_eq!(store.layers[0].values, [[0.5, 0.25, 0.125, 1.0]; 3]);
+        Ok(())
+    }
+
     #[test]
     fn non_array_color_primvar_is_not_a_layer() -> Result<()> {
         // Blender reads only array-valued color primvars (`read_custom_data`, `usd_reader_mesh.cc`).
@@ -4654,6 +4821,101 @@ def Material "M"
         );
         assert_eq!(&material.base_color[..3], &[0.6, 0.6, 0.6]);
         assert!((material.roughness - 0.3).abs() < 1e-9);
+        Ok(())
+    }
+
+    // Blender 5.2.2 resolves connected shader outputs through `follow_connection`
+    // (`usd_reader_material.cc:997-1018`).
+    #[test]
+    fn primvar_reader_connection_resolves_full_shader_path() -> Result<()> {
+        let shaders = r##"    def Scope "A"
+    {
+        def Shader "Reader"
+        {
+            uniform token info:id = "UsdPrimvarReader_float3"
+            string inputs:varname = "WrongLayer"
+            float3 outputs:rgb
+        }
+    }
+    def Scope "B"
+    {
+        def Shader "Reader"
+        {
+            uniform token info:id = "UsdPrimvarReader_float3"
+            string inputs:varname = "RightLayer"
+            float3 outputs:rgb
+        }
+    }"##;
+        let text = material_fixture("", "</M/B/Reader.outputs:rgb>", shaders);
+        let (doc, losses) = parse_usda(&text, "scene".to_owned())?;
+        assert!(losses.is_empty(), "{losses:?}");
+        let (_, graph) = only_material(&doc)?;
+        assert_eq!(
+            base_color_vertex_layer(graph).as_deref(),
+            Some("RightLayer")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn primvar_reader_varname_connection_resolves_full_prim_path() -> Result<()> {
+        let shaders = r##"    def Scope "A"
+    {
+        def Scope "Inputs"
+        {
+            token inputs:varname = "WrongLayer"
+        }
+    }
+    def Scope "B"
+    {
+        def Scope "Inputs"
+        {
+            token inputs:varname = "RightLayer"
+        }
+    }
+    def Shader "Reader"
+    {
+        uniform token info:id = "UsdPrimvarReader_float3"
+        string inputs:varname.connect = </M/B/Inputs.inputs:varname>
+        float3 outputs:rgb
+    }"##;
+        let text = material_fixture("", "</M/Reader.outputs:rgb>", shaders);
+        let (doc, losses) = parse_usda(&text, "scene".to_owned())?;
+        assert!(losses.is_empty(), "{losses:?}");
+        let (_, graph) = only_material(&doc)?;
+        assert_eq!(
+            base_color_vertex_layer(graph).as_deref(),
+            Some("RightLayer")
+        );
+        Ok(())
+    }
+
+    // Blender 5.2.2 follows NodeGraph output connections to their source shader
+    // (`usd_reader_material.cc:997-1018`).
+    #[test]
+    fn primvar_reader_follows_wrapped_node_graph_outputs() -> Result<()> {
+        let shaders = r##"    def NodeGraph "Outer"
+    {
+        token outputs:rgb.connect = </M/Outer/Inner.outputs:rgb>
+        def NodeGraph "Inner"
+        {
+            token outputs:rgb.connect = </M/Reader.outputs:rgb>
+        }
+    }
+    def Shader "Reader"
+    {
+        uniform token info:id = "UsdPrimvarReader_float3"
+        string inputs:varname = "WrappedColor"
+        float3 outputs:rgb
+    }"##;
+        let text = material_fixture("", "</M/Outer.outputs:rgb>", shaders);
+        let (doc, losses) = parse_usda(&text, "scene".to_owned())?;
+        assert!(losses.is_empty(), "{losses:?}");
+        let (_, graph) = only_material(&doc)?;
+        assert_eq!(
+            base_color_vertex_layer(graph).as_deref(),
+            Some("WrappedColor")
+        );
         Ok(())
     }
 
