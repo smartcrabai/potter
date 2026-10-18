@@ -321,8 +321,8 @@ fn set_pixels(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result
         (width, height)
     };
     let pixels = parse_pixels(engine, operation.get("pixels"))?;
-    let x = optional_dimension(engine, operation, "x", 0)?;
-    let y = optional_dimension(engine, operation, "y", 0)?;
+    let x = optional_offset(engine, operation, "x")?;
+    let y = optional_offset(engine, operation, "y")?;
     let width = operation
         .get("width")
         .map(|value| read_dimension_value(engine, value, "width"))
@@ -783,17 +783,21 @@ fn read_dimension_value(engine: &Engine<'_>, value: &Value, field: &str) -> Resu
         })
 }
 
-fn optional_dimension(
-    engine: &Engine<'_>,
-    operation: &Map<String, Value>,
-    key: &str,
-    default: u32,
-) -> Result<u32> {
-    operation
-        .get(key)
-        .map(|value| read_dimension_value(engine, value, key))
-        .transpose()
-        .map(|value| value.unwrap_or(default))
+/// An optional pixel offset: absent means the origin, and zero is a valid origin.
+fn optional_offset(engine: &Engine<'_>, operation: &Map<String, Value>, key: &str) -> Result<u32> {
+    let Some(value) = operation.get(key) else {
+        return Ok(0);
+    };
+    value
+        .as_u64()
+        .and_then(|number| u32::try_from(number).ok())
+        .ok_or_else(|| {
+            engine.error(
+                ErrorCode::InvalidOperation,
+                "image offsets must be non-negative u32 integers",
+                &operation_pointer(engine.operation_index, key),
+            )
+        })
 }
 
 fn read_positive_integer(engine: &Engine<'_>, value: &Value, field: &str) -> Result<usize> {
