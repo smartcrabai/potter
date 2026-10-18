@@ -18,6 +18,11 @@
 //! Vertex groups are matched by position and weight. Counts, topology and payload presence are exact;
 //! numeric values use only the documented tolerances.
 
+#![expect(
+    clippy::ref_option,
+    reason = "the comparator borrows optional canonical payloads as stored in the canonical form"
+)]
+
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     error::Error,
@@ -480,9 +485,12 @@ fn attribute_rows(mesh: &Mesh, domain: &str) -> TestResult<Option<Vec<AttributeV
     Ok((!names.is_empty()).then_some(rows))
 }
 
+/// Per-face UV corners and their pin flags, indexed by output face.
+type UvMapFaces = (Vec<Option<Vec<[f64; 2]>>>, Vec<Option<Vec<bool>>>);
+
 /// Per-face UV corners of layer `UVMap` in Blender's V-up convention. The native `uv_layers` store
 /// uses persistent face IDs and Potter's V-down convention; faces without a row remain `None`.
-fn uv_map_faces(mesh: &Mesh) -> TestResult<(Vec<Option<Vec<[f64; 2]>>>, Vec<Option<Vec<bool>>>)> {
+fn uv_map_faces(mesh: &Mesh) -> TestResult<UvMapFaces> {
     let mut faces: Vec<Option<Vec<[f64; 2]>>> = vec![None; mesh.faces.len()];
     let mut pins: Vec<Option<Vec<bool>>> = vec![None; mesh.faces.len()];
     let Some(store) = mesh.attributes.get("uv_layers") else {
@@ -863,7 +871,7 @@ fn potter_canonical(
                 derived_normal_rows.as_ref().map(|values| {
                     values[corner_offset..corner_offset + corner_count]
                         .iter()
-                        .map(|normal| normal.to_array())
+                        .map(glam::DVec3::to_array)
                         .collect()
                 })
             });
@@ -873,8 +881,8 @@ fn potter_canonical(
             FacePayload {
                 material: u64::from(face.material_index),
                 fid,
-                uv: uv.map(|values| values.to_vec()),
-                uv_pins: uv_pins.map(|values| values.to_vec()),
+                uv: uv.map(<[[f64; 2]]>::to_vec),
+                uv_pins: uv_pins.map(<[bool]>::to_vec),
                 uv_layers: Some(uv_layers),
                 point_attributes: point_attribute_values,
                 custom_normals,
@@ -1753,7 +1761,7 @@ fn compare_uv_pins(
             }
         }
         (None, Some(expected)) => {
-            differences.push(format!("{context}: missing Blender UV pins {expected:?}"))
+            differences.push(format!("{context}: missing Blender UV pins {expected:?}"));
         }
     }
     differences
@@ -1828,8 +1836,7 @@ fn compare_uv_layers(
                         .all(|(actual, expected)| value_matches(actual, expected, FLOAT_TOLERANCE))
                     {
                         differences.push(format!(
-                            "{context}, UV layer `{name}` corner {corner}: UV {:?} differs from Blender {:?}",
-                            actual_uv, expected_uv
+                            "{context}, UV layer `{name}` corner {corner}: UV {actual_uv:?} differs from Blender {expected_uv:?}"
                         ));
                     }
                 }
@@ -2466,7 +2473,7 @@ pub fn mismatches(actual: &Canonical, expected: &Canonical) -> Vec<String> {
             "UV layers {actual:?} differ from Blender {expected:?}"
         )),
         (None, Some(expected)) => {
-            differences.push(format!("missing Blender UV layers {expected:?}"))
+            differences.push(format!("missing Blender UV layers {expected:?}"));
         }
     }
     match (&actual.color_layers, &expected.color_layers) {
@@ -2475,10 +2482,10 @@ pub fn mismatches(actual: &Canonical, expected: &Canonical) -> Vec<String> {
             "color layers {actual:?} differ from Blender {expected:?}"
         )),
         (Some(actual), None) => {
-            differences.push(format!("unexpected Potter color layers {actual:?}"))
+            differences.push(format!("unexpected Potter color layers {actual:?}"));
         }
         (None, Some(expected)) => {
-            differences.push(format!("missing Blender color layers {expected:?}"))
+            differences.push(format!("missing Blender color layers {expected:?}"));
         }
         (None, None) => {}
     }
@@ -2796,7 +2803,10 @@ mod edge_topology_tests {
     #[test]
     fn coincident_edges_match_as_a_multiset() {
         let edge = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]];
-        assert!(compare_edges(&[edge, edge], &[edge, edge]).is_empty());
+        assert_eq!(
+            compare_edges(&[edge, edge], &[edge, edge]),
+            Vec::<String>::new()
+        );
 
         let missing_duplicate = compare_edges(&[edge], &[edge, edge]);
         assert!(
@@ -2827,9 +2837,9 @@ mod edge_topology_tests {
             },
         ];
         let expected_attributes = vec![actual_attributes[1].clone(), actual_attributes[0].clone()];
-        assert!(
-            compare_edge_attributes(&Some(actual_attributes), &Some(expected_attributes))
-                .is_empty()
+        assert_eq!(
+            compare_edge_attributes(&Some(actual_attributes), &Some(expected_attributes)),
+            Vec::<String>::new()
         );
 
         let actual_points = vec![
@@ -2840,7 +2850,10 @@ mod edge_topology_tests {
             edge_point(edge, "up", "down"),
             edge_point(edge, "left", "right"),
         ];
-        assert!(compare_edge_points(&Some(actual_points), &Some(expected_points)).is_empty());
+        assert_eq!(
+            compare_edge_points(&Some(actual_points), &Some(expected_points)),
+            Vec::<String>::new()
+        );
 
         let misassociated_points = vec![
             edge_point(edge, "right", "left"),
@@ -2850,9 +2863,9 @@ mod edge_topology_tests {
             edge_point(edge, "left", "right"),
             edge_point(edge, "up", "down"),
         ];
-        assert!(
-            !compare_edge_points(&Some(misassociated_points), &Some(expected_associations))
-                .is_empty()
+        assert_ne!(
+            compare_edge_points(&Some(misassociated_points), &Some(expected_associations)),
+            Vec::<String>::new()
         );
     }
 }

@@ -109,7 +109,7 @@ pub fn upgrade_scene(value: &mut Value) -> Result<Vec<Value>> {
         upgrade_v2(value)?;
     }
     if value.get("schema_version").and_then(Value::as_u64) == Some(3) {
-        upgrade_v3(value)?;
+        upgrade_v3(value);
     }
     Ok(warnings)
 }
@@ -232,9 +232,8 @@ fn upgrade_v2(value: &mut Value) -> Result<()> {
 }
 
 /// Upgrades a schema-version-3 scene document to version 4 without changing its data.
-fn upgrade_v3(value: &mut Value) -> Result<()> {
+fn upgrade_v3(value: &mut Value) {
     value["schema_version"] = json!(4);
-    Ok(())
 }
 
 /// Blender-owned mesh attributes are mirrors or topology rebuilt by Potter. Their exact signatures

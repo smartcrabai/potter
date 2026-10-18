@@ -49,7 +49,7 @@ struct Vertex {
 struct Face {
     verts: Vec<usize>,
     side: u8,
-    source_face: i32,
+    source: i32,
 }
 
 #[derive(Clone, Copy)]
@@ -63,7 +63,7 @@ struct State {
     verts: Vec<Vertex>,
     faces: Vec<Face>,
     tris: Vec<Triangle>,
-    /// BMesh input boundary edges and their FLOAT output edge provenance.
+    /// `BMesh` input boundary edges and their FLOAT output edge provenance.
     edge_orig: HashMap<EdgeKey, i32>,
     edge_start: HashMap<EdgeKey, usize>,
     edge_order: Vec<EdgeKey>,
@@ -237,7 +237,7 @@ fn float_pair(
     remap_attributes(&source, &mut mesh, &origin)?;
     transfer_float_point_defaults(&source, &mut mesh, &origin.vertices);
     transfer_float_edge_attributes(&source, &mut mesh, &edge_sources);
-    transfer_float_corner_attributes(&subject_frame, &operand_frame, &transfers, &mut mesh)?;
+    transfer_float_corner_attributes(&subject_frame, &operand_frame, &transfers, &mut mesh);
     if has_normal_codes {
         transfer_float_normal_codes(&subject_frame, &operand_frame, &transfers, &mut mesh)?;
     }
@@ -283,7 +283,7 @@ fn build_float_output(subject: &Mesh, operand: &Mesh, state: &State) -> Result<F
                     })
                 })
                 .collect::<Result<Vec<_>>>()?,
-            orig: face.source_face,
+            orig: face.source,
             edge_orig,
         });
     }
@@ -341,8 +341,12 @@ fn build_float_output(subject: &Mesh, operand: &Mesh, state: &State) -> Result<F
             let state_edge = edge_key_usize(vertex, next);
             face_edges.insert(state_edge);
             if let Ok(source) = usize::try_from(polygon.edge_orig[corner]) {
-                let out_a = state_vertex_ids[vertex].expect("face vertex was inserted");
-                let out_b = state_vertex_ids[next].expect("face vertex was inserted");
+                let out_a = state_vertex_ids[vertex].ok_or_else(|| {
+                    PotError::invalid_argument("Boolean output face vertex is missing")
+                })?;
+                let out_b = state_vertex_ids[next].ok_or_else(|| {
+                    PotError::invalid_argument("Boolean output face vertex is missing")
+                })?;
                 edge_source_by_output.insert(edge_key(out_a, out_b), source);
             }
         }
@@ -403,14 +407,14 @@ fn build_float_output(subject: &Mesh, operand: &Mesh, state: &State) -> Result<F
         loose_vertices.insert(edge.0);
         loose_vertices.insert(edge.1);
     }
-    for state_index in 0..state.verts.len() {
-        if loose_vertices.contains(&state_index) && state_vertex_ids[state_index].is_none() {
+    for (state_index, state_vertex_id) in state_vertex_ids.iter_mut().enumerate() {
+        if loose_vertices.contains(&state_index) && state_vertex_id.is_none() {
             let id = mesh
                 .insert_vertex(to_dvec3(state.verts[state_index].co))
                 .map_err(|error| {
                     PotError::invalid_argument(format!("Boolean loose vertex failed: {error}"))
                 })?;
-            state_vertex_ids[state_index] = Some(id);
+            *state_vertex_id = Some(id);
         }
     }
     let mut output_edge_keys: HashSet<(u32, u32)> = mesh
@@ -813,7 +817,6 @@ fn float_output_origin(
             && source_index < source.vertices.len()
         {
             vertices[output_index] = vec![(source_index, 1.0)];
-            continue;
         }
     }
     let mut corner_starts = Vec::with_capacity(source.faces.len());
@@ -853,6 +856,10 @@ fn float_output_origin(
 }
 
 fn transfer_float_point_defaults(source: &Mesh, output: &mut Mesh, origins: &[Vec<(usize, f64)>]) {
+    #[expect(
+        clippy::float_cmp,
+        reason = "copied-corner weights are exactly 1.0 by construction; exact match is intended"
+    )]
     let source_index = |origin: &[(usize, f64)]| match origin {
         [(index, weight)] if *weight == 1.0 => Some(*index),
         _ => None,
@@ -979,11 +986,11 @@ fn transfer_float_edge_attributes(source: &Mesh, output: &mut Mesh, origins: &[O
     let named: Vec<String> = source
         .attributes
         .iter()
-        .filter_map(|(key, value)| {
-            (value.get("domain").and_then(Value::as_str) == Some("edge")
-                && value.get("values").and_then(Value::as_object).is_some())
-            .then(|| key.clone())
+        .filter(|&(_, value)| {
+            value.get("domain").and_then(Value::as_str) == Some("edge")
+                && value.get("values").and_then(Value::as_object).is_some()
         })
+        .map(|(key, _)| key.clone())
         .collect();
     for key in named {
         let Some(template) = source.attributes.get(&key) else {
@@ -992,8 +999,7 @@ fn transfer_float_edge_attributes(source: &Mesh, output: &mut Mesh, origins: &[O
         let data_type = template
             .get("type")
             .and_then(Value::as_str)
-            .map(blender_mixer_type)
-            .unwrap_or("FLOAT");
+            .map_or("FLOAT", blender_mixer_type);
         let source_values = template.get("values").and_then(Value::as_object);
         let mut values = serde_json::Map::new();
         for (edge, source_index) in output.edges.iter().zip(origins) {
@@ -1045,8 +1051,7 @@ fn transfer_float_edge_attributes(source: &Mesh, output: &mut Mesh, origins: &[O
             let data_type = output_entry
                 .get("data_type")
                 .and_then(Value::as_str)
-                .map(blender_mixer_type)
-                .unwrap_or("FLOAT");
+                .map_or("FLOAT", blender_mixer_type);
             let source_values = source_entries
                 .and_then(|entries| {
                     entries.iter().find(|entry| {
@@ -1269,14 +1274,13 @@ fn transfer_float_corner_attributes(
     operand: &Mesh,
     transfers: &[FloatFaceTransfer],
     output_mesh: &mut Mesh,
-) -> Result<()> {
+) {
     transfer_float_uv_layers(subject, operand, transfers, output_mesh);
     transfer_float_color_layers(subject, operand, transfers, output_mesh);
     transfer_float_blender_uv_layers(subject, operand, transfers, output_mesh);
     transfer_float_uv_map(subject, operand, transfers, output_mesh);
     transfer_float_attribute_entries(subject, operand, transfers, output_mesh);
     transfer_float_named_corner_attributes(subject, operand, transfers, output_mesh);
-    Ok(())
 }
 
 fn transfer_float_uv_layers(
@@ -1616,8 +1620,7 @@ fn transfer_float_attribute_entries(
         let data_type = output_entry
             .get("data_type")
             .and_then(Value::as_str)
-            .map(blender_mixer_type)
-            .unwrap_or("FLOAT")
+            .map_or("FLOAT", blender_mixer_type)
             .to_owned();
         let mut values = Vec::new();
         for transfer in transfers {
@@ -1681,12 +1684,12 @@ fn transfer_float_named_corner_attributes(
     let keys: Vec<String> = output_mesh
         .attributes
         .iter()
-        .filter_map(|(key, value)| {
-            (value.get("domain").and_then(Value::as_str) == Some("corner")
+        .filter(|&(key, value)| {
+            value.get("domain").and_then(Value::as_str) == Some("corner")
                 && value.get("values").and_then(Value::as_object).is_some()
-                && !color_keys.contains(key))
-            .then(|| key.clone())
+                && !color_keys.contains(key)
         })
+        .map(|(key, _)| key.clone())
         .collect();
     for key in keys {
         let stored_type = output_mesh
@@ -1827,6 +1830,10 @@ fn bmesh_default_value(data_type: &str) -> Value {
     }
 }
 
+#[expect(
+    clippy::float_cmp,
+    reason = "exact 1.0 full-weight test mirrors the Blender port's copy-only path"
+)]
 fn mix_json_values(values: &[Value], weights: &[f32], data_type: &str) -> Value {
     if let Some(index) = weights.iter().position(|&weight| weight == 1.0)
         && weights
@@ -1889,7 +1896,7 @@ fn mix_quaternion(values: &[Value], weights: &[f32]) -> Value {
         expmap[2] += rotation[2] * weight;
         total += weight;
     }
-    if !(total > 0.0) {
+    if total <= 0.0 || total.is_nan() {
         return default_value("QUATERNION");
     }
     let inverse = 1.0 / total;
@@ -1897,7 +1904,7 @@ fn mix_quaternion(values: &[Value], weights: &[f32]) -> Value {
     expmap[1] *= inverse;
     expmap[2] *= inverse;
     let length_squared = (expmap[0] * expmap[0] + expmap[1] * expmap[1]) + expmap[2] * expmap[2];
-    if !(length_squared > 1.0e-35) {
+    if length_squared <= 1.0e-35 || length_squared.is_nan() {
         return default_value("QUATERNION");
     }
     let angle = length_squared.sqrt();
@@ -2190,7 +2197,7 @@ fn build_state(
         state.faces.push(Face {
             verts,
             side: 1,
-            source_face,
+            source: source_face,
         });
     }
     for (fi, face) in subject.faces.iter().enumerate() {
@@ -2212,7 +2219,7 @@ fn build_state(
         state.faces.push(Face {
             verts,
             side: 0,
-            source_face,
+            source: source_face,
         });
     }
 
@@ -2259,10 +2266,10 @@ fn build_state(
         }
     }
     for &edge in &state.edge_order {
-        if !face_edge_keys.contains(&edge) {
-            if let Some(&source) = state.edge_orig.get(&edge) {
-                state.input_loose_edge_sources.insert(source);
-            }
+        if !face_edge_keys.contains(&edge)
+            && let Some(&source) = state.edge_orig.get(&edge)
+        {
+            state.input_loose_edge_sources.insert(source);
         }
     }
     Ok(state)
@@ -2380,9 +2387,8 @@ fn float_polyfill_with_scratch(
         next: (i + 1) % count,
         sign: EAR_CONVEX,
     }));
-    for i in 0..count {
-        let c = corners[i];
-        corners[i].sign = corner_sign(coordinates, c.previous, i, c.next);
+    for (i, corner) in corners.iter_mut().enumerate() {
+        corner.sign = corner_sign(coordinates, corner.previous, i, corner.next);
     }
     let concave = corners
         .iter()
@@ -2665,8 +2671,7 @@ fn intersect_tri_pair(
             }
         }
     }
-    for i in 0..3 {
-        let va = a[i];
+    for &va in &a {
         if seen_a.contains(&va) {
             continue;
         }
@@ -2690,8 +2695,7 @@ fn intersect_tri_pair(
             }
         }
     }
-    for i in 0..3 {
-        let vb = b[i];
+    for &vb in &b {
         if seen_b.contains(&vb) {
             continue;
         }
@@ -2715,28 +2719,26 @@ fn intersect_tri_pair(
             }
         }
     }
-    for i in 0..3 {
-        let p = state.verts[a[i]].co;
+    for &va in &a {
+        let p = state.verts[va].co;
         let t = scaled_triangle(state, b, eps2x);
-        if !seen_a.contains(&a[i]) {
-            if let Some(ix) = point_triangle(p, t) {
-                if dist_sq(ix, p) <= eps2x_sq {
-                    push_unique(verts_a, seen_a, a[i]);
-                    push_unique(verts_b, seen_b, a[i]);
-                }
-            }
+        if !seen_a.contains(&va)
+            && let Some(ix) = point_triangle(p, t)
+            && dist_sq(ix, p) <= eps2x_sq
+        {
+            push_unique(verts_a, seen_a, va);
+            push_unique(verts_b, seen_b, va);
         }
     }
-    for i in 0..3 {
-        let p = state.verts[b[i]].co;
+    for &vb in &b {
+        let p = state.verts[vb].co;
         let t = scaled_triangle(state, a, eps2x);
-        if !seen_b.contains(&b[i]) {
-            if let Some(ix) = point_triangle(p, t) {
-                if dist_sq(ix, p) <= eps2x_sq {
-                    push_unique(verts_a, seen_a, b[i]);
-                    push_unique(verts_b, seen_b, b[i]);
-                }
-            }
+        if !seen_b.contains(&vb)
+            && let Some(ix) = point_triangle(p, t)
+            && dist_sq(ix, p) <= eps2x_sq
+        {
+            push_unique(verts_a, seen_a, vb);
+            push_unique(verts_b, seen_b, vb);
         }
     }
     if verts_a.len() >= 3 && verts_b.len() >= 3 {
@@ -2983,7 +2985,7 @@ fn split_faces(state: &mut State) {
                 new_faces.push(Face {
                     verts: ring,
                     side: face.side,
-                    source_face: face.source_face,
+                    source: face.source,
                 });
             }
         }
@@ -3188,11 +3190,7 @@ impl FloatEdgeBvh {
             children: None,
         });
         if end - start > 8 {
-            let axis = if max[1] - min[1] > max[0] - min[0] {
-                1
-            } else {
-                0
-            };
+            let axis = usize::from(max[1] - min[1] > max[0] - min[0]);
             let segments = &self.segments;
             self.order[start..end].sort_unstable_by(|&left, &right| {
                 let a = segments[left];
@@ -3301,14 +3299,12 @@ fn find_island_connection(
             continue;
         }
         if let Some(distance) = island_ray_distance(origin_2d, direction, edge.a, edge.b)
-            && hit.map_or(true, |(best, _)| distance < best)
+            && hit.is_none_or(|(best, _)| distance < best)
         {
             hit = Some((distance, edge.key));
         }
     }
-    let Some((mut hit_distance, mut hit_edge)) = hit else {
-        return None;
-    };
+    let (mut hit_distance, mut hit_edge) = hit?;
     for &edge in added_edges {
         if edge.0 == origin || edge.1 == origin {
             continue;
@@ -3477,6 +3473,10 @@ fn island_vertex_blocker(
     blocker
 }
 
+#[expect(
+    clippy::float_cmp,
+    reason = "bit-exact degenerate-segment tests mirror Blender's f32 kernel; tolerances would change results"
+)]
 fn island_segment_intersection_factor(a: P2, b: P2, c: P2, d: P2) -> Option<f32> {
     let cross = |u: P2, v: P2| u[0] * v[1] - u[1] * v[0];
     let dot = |u: P2, v: P2| u[0] * v[0] + u[1] * v[1];
@@ -3577,6 +3577,10 @@ fn edge_components(edges: &HashSet<EdgeKey>, ordered_edges: &[EdgeKey]) -> Vec<H
     components
 }
 
+#[expect(
+    clippy::float_cmp,
+    reason = "exact f32 orientation test mirrors the Blender port's bit-exact sign check"
+)]
 fn planar_cycles(
     boundary: &[usize],
     edges: &HashSet<EdgeKey>,
@@ -3588,7 +3592,7 @@ fn planar_cycles(
     let fake = Face {
         verts: boundary.to_vec(),
         side: 0,
-        source_face: 0,
+        source: 0,
     };
     let (u, v) = face_basis(&fake, verts);
     let original_area = polygon_area2(boundary, verts, u, v);
@@ -3688,17 +3692,17 @@ fn classify_faces(state: &mut State, operation: Operation, bvh_a: &Bvh, bvh_b: &
                 if state.wire_edges.contains(&edge) {
                     continue;
                 }
-                if let Some(adjacent) = edge_faces.get(&edge) {
-                    if adjacent.len() > 1 {
-                        let same_side = adjacent
-                            .iter()
-                            .all(|&other| state.faces[other].side == side);
-                        if same_side {
-                            for &other in adjacent {
-                                if !seen[other] {
-                                    seen[other] = true;
-                                    queue.push_back(other);
-                                }
+                if let Some(adjacent) = edge_faces.get(&edge)
+                    && adjacent.len() > 1
+                {
+                    let same_side = adjacent
+                        .iter()
+                        .all(|&other| state.faces[other].side == side);
+                    if same_side {
+                        for &other in adjacent {
+                            if !seen[other] {
+                                seen[other] = true;
+                                queue.push_back(other);
                             }
                         }
                     }
@@ -3897,10 +3901,10 @@ fn ray_hits(
     for &index in candidates.iter() {
         let tri = tris[index];
         let p = tri.verts.map(|v| verts[v].co);
-        if let Some(distance) = ray_triangle(origin, p) {
-            if distance >= 0.0 {
-                depths.push(distance);
-            }
+        if let Some(distance) = ray_triangle(origin, p)
+            && distance >= 0.0
+        {
+            depths.push(distance);
         }
     }
     depths.sort_by(f32::total_cmp);
@@ -4020,7 +4024,15 @@ impl Bvh {
             .unwrap_or(0);
         let mid = start + (end - start) / 2;
         self.entries[start..end].select_nth_unstable_by(mid - start, |&a, &b| {
+            #[expect(
+                clippy::manual_midpoint,
+                reason = "keeps (min + max) * 0.5 centre arithmetic bit-identical to the FLOAT kernel"
+            )]
             let ca = (bounds[a].0[axis] + bounds[a].1[axis]) * 0.5;
+            #[expect(
+                clippy::manual_midpoint,
+                reason = "keeps (min + max) * 0.5 centre arithmetic bit-identical to the FLOAT kernel"
+            )]
             let cb = (bounds[b].0[axis] + bounds[b].1[axis]) * 0.5;
             ca.total_cmp(&cb)
         });
@@ -4349,7 +4361,7 @@ fn point_in_slice(point: P3, vertex: P3, line_start: P3, line_end: P3) -> bool {
         return false;
     }
     let factor = dot(toward_line, sub(point, vertex)) / length_squared;
-    factor >= 0.0 && factor <= 1.0
+    (0.0..=1.0).contains(&factor)
 }
 
 fn line_line_epsilon(p0: P3, p1: P3, p2: P3, p3: P3, epsilon: f32) -> (u8, P3, P3) {
@@ -4404,7 +4416,7 @@ fn line_segment_triangle(p0: P3, p1: P3, triangle: [P3; 3]) -> Option<f32> {
         return None;
     }
     let lambda = inverse * dot(e2, q);
-    (lambda >= 0.0 && lambda <= 1.0).then_some(lambda)
+    (0.0..=1.0).contains(&lambda).then_some(lambda)
 }
 
 fn intersect_line_triangle(
@@ -4439,18 +4451,18 @@ fn intersect_line_triangle(
             return Some((x0, i));
         }
     }
-    if dot(direction, normal).abs() >= eps {
-        if let Some(factor) = line_segment_triangle(p0, p1, triangle) {
-            if factor >= margin && factor <= 1.0 - margin {
-                let intersection = interp(p0, p1, factor);
-                let min_dist = triangle
-                    .iter()
-                    .map(|&vertex| dist_sq(vertex, intersection))
-                    .fold(f32::INFINITY, f32::min);
-                if min_dist >= margin_sq {
-                    return Some((intersection, 3));
-                }
-            }
+    if dot(direction, normal).abs() >= eps
+        && let Some(factor) = line_segment_triangle(p0, p1, triangle)
+        && factor >= margin
+        && factor <= 1.0 - margin
+    {
+        let intersection = interp(p0, p1, factor);
+        let min_dist = triangle
+            .iter()
+            .map(|&vertex| dist_sq(vertex, intersection))
+            .fold(f32::INFINITY, f32::min);
+        if min_dist >= margin_sq {
+            return Some((intersection, 3));
         }
     }
     None
@@ -4485,10 +4497,9 @@ fn reverse_corner_attributes(mesh: &mut Mesh) {
                 .get("domain")
                 .and_then(Value::as_str)
                 .is_some_and(|domain| domain.eq_ignore_ascii_case("corner"))
+                && let Some(values) = entry.get_mut("values").and_then(Value::as_array_mut)
             {
-                if let Some(values) = entry.get_mut("values").and_then(Value::as_array_mut) {
-                    reverse_segments(values, &faces, &offsets);
-                }
+                reverse_segments(values, &faces, &offsets);
             }
         }
     }
@@ -4503,10 +4514,9 @@ fn reverse_corner_attributes(mesh: &mut Mesh) {
             .get("domain")
             .and_then(Value::as_str)
             .is_some_and(|domain| domain.eq_ignore_ascii_case("corner"))
+            && let Some(Value::Object(rows)) = attribute.get_mut("values")
         {
-            if let Some(Value::Object(rows)) = attribute.get_mut("values") {
-                reverse_corner_rows(rows, &faces);
-            }
+            reverse_corner_rows(rows, &faces);
         }
     }
     if let Some(Value::Array(entries)) = mesh.attributes.get_mut("uv_map") {
@@ -4522,15 +4532,17 @@ fn reverse_corner_attributes(mesh: &mut Mesh) {
             let Some(size) = id.and_then(|id| face_sizes.get(&id).copied()) else {
                 continue;
             };
-            if let Some(values) = entry.get_mut("uv").and_then(Value::as_array_mut) {
-                if values.len() == size && size > 1 {
-                    values[1..].reverse();
-                }
+            if let Some(values) = entry.get_mut("uv").and_then(Value::as_array_mut)
+                && values.len() == size
+                && size > 1
+            {
+                values[1..].reverse();
             }
-            if let Some(values) = entry.get_mut("pinned").and_then(Value::as_array_mut) {
-                if values.len() == size && size > 1 {
-                    values[1..].reverse();
-                }
+            if let Some(values) = entry.get_mut("pinned").and_then(Value::as_array_mut)
+                && values.len() == size
+                && size > 1
+            {
+                values[1..].reverse();
             }
         }
     }
@@ -4552,10 +4564,11 @@ fn reverse_corner_attributes(mesh: &mut Mesh) {
 
 fn reverse_corner_rows(rows: &mut serde_json::Map<String, Value>, faces: &[crate::geom::Face]) {
     for face in faces {
-        if let Some(Value::Array(row)) = rows.get_mut(&format!("f{}", face.id)) {
-            if row.len() == face.vertices.len() && row.len() > 1 {
-                row[1..].reverse();
-            }
+        if let Some(Value::Array(row)) = rows.get_mut(&format!("f{}", face.id))
+            && row.len() == face.vertices.len()
+            && row.len() > 1
+        {
+            row[1..].reverse();
         }
     }
 }

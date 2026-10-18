@@ -3708,6 +3708,13 @@ fn world_matrix_f32(matrix: DMat4) -> glam::Mat4 {
     glam::Mat4::from_cols_array(&matrix.to_cols_array().map(|value| value as f32))
 }
 
+type BooleanOperandParts<'d> = (
+    crate::geom::boolean::BooleanOperand,
+    Vec<Option<Id>>,
+    Vec<Option<Id>>,
+    &'d [VertexGroup],
+);
+
 /// One Boolean operand object: its mesh (the evaluated mesh when present, else the data mesh with
 /// its vertex groups) and its transform into the subject's space: Blender's f32 product from
 /// `geom::blender_matrix` when it applies, else the f64 fallback. Also returns its effective and
@@ -3722,12 +3729,7 @@ fn boolean_operand<'d>(
     world_matrices: &BTreeMap<Id, DMat4>,
     evaluated_meshes: &BTreeMap<Id, Mesh>,
     evaluated_nodes: &BTreeMap<Id, EvaluatedNode>,
-) -> Result<(
-    crate::geom::boolean::BooleanOperand,
-    Vec<Option<Id>>,
-    Vec<Option<Id>>,
-    &'d [VertexGroup],
-)> {
+) -> Result<BooleanOperandParts<'d>> {
     let object = doc.nodes.get(object_id).ok_or_else(|| {
         PotError::with_details(
             ErrorCode::TargetNotFound,

@@ -187,12 +187,12 @@ fn blender_fastpow512(arg: f32) -> f32 {
         1.0 / value.sqrt()
     }
 
-    let xf = fastpow(0x3f2aaaab, 0x5eb504f3, arg);
+    let xf = fastpow(0x3f2a_aaab, 0x5eb5_04f3, arg);
     let xover = arg * xf;
     let xfm1 = rsqrt(xf);
     let x2 = arg * arg;
     let xunder = x2 * xfm1;
-    let mut xavg = (1.0 / (3.0 * 0.629_960_524_947_437) * 0.999_852) * (xover + xunder);
+    let mut xavg = (1.0 / (3.0 * 0.629_960_54) * 0.999_852) * (xover + xunder);
     xavg *= rsqrt(xavg);
     xavg *= rsqrt(xavg);
     xavg
@@ -236,7 +236,7 @@ pub(crate) fn mix_byte_color(values: &[[f64; 4]], sources: &[(usize, f64)]) -> [
             *sum += channel * weight;
         }
     }
-    if !found || !(total > 0.0) {
+    if !found || total <= 0.0 || total.is_nan() {
         return [0.0, 0.0, 0.0, 1.0];
     }
     let weight_inv = 1.0_f32 / total;

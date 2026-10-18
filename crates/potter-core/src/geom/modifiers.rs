@@ -469,7 +469,7 @@ fn invalid_parameter(modifier: &Modifier, parameter: &str, expected: &str) -> Po
 pub(crate) enum BooleanSolver {
     /// Mesh Arrangements (`geom::boolean`).
     Exact,
-    /// Blender's FLOAT solver (BMesh intersection, ported in `geom::boolean::float`).
+    /// Blender's FLOAT solver (`BMesh` intersection, ported in `geom::boolean::float`).
     Float,
     /// Blender's MANIFOLD solver, which Potter does not implement.
     Manifold,

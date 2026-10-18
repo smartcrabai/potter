@@ -2571,8 +2571,10 @@ mod tests {
         node.rigid_body = Some(super::RigidBody::default());
         assert_eq!(node.captured_matrix_basis(&effective).unwrap(), None);
         node.rigid_body = None;
-        let mut animated = super::Node::default();
-        animated.action = Some(super::Id::from_static("action"));
+        let mut animated = super::Node {
+            action: Some(super::Id::from_static("action")),
+            ..super::Node::default()
+        };
         let fingerprint = animated.matrix_basis_fingerprint(&effective).unwrap();
         animated.blender_matrix_basis = Some(super::CapturedMatrixBasis {
             matrix_basis: identity,

@@ -157,7 +157,7 @@ pub(crate) fn mix_codes(
         sum[1] += f32::from(pair[1]) * weight;
         total += weight;
     }
-    if !(total > 0.0) {
+    if total <= 0.0 || total.is_nan() {
         return CornerNormalCode::Auto;
     }
     let weight_inv = 1.0_f32 / total;
@@ -1391,6 +1391,11 @@ pub(crate) fn transfer_custom_normals(
 #[cfg(test)]
 mod tests {
     #![expect(clippy::expect_used, reason = "small mesh fixtures")]
+    #![expect(
+        clippy::unreadable_literal,
+        clippy::excessive_precision,
+        reason = "Blender 5.2.2 EXACT oracle values kept verbatim"
+    )]
 
     use glam::{DVec3, Vec3};
     use serde_json::{Map, Value, json};
@@ -1408,12 +1413,14 @@ mod tests {
     /// Authored vectors round-trip through 16-bit codes, so they match to this measured precision.
     const CODEC_TOLERANCE: f64 = 1.0e-3;
 
+    type WeightedCode = ([i16; 2], f32);
+
     /// Blender 5.2.2 EXACT oracle: probe `exact_clnor4` (subject cube, cutter translated by
     /// (0.5, 0.5, 0.5), subject and cutter authored normals). Each row is one output corner: the raw
     /// input codes of the source face's corners with Blender's weights (vertex one-hot, edge linear,
     /// mean-value interior), then the stored output code. Probes `exact_rot90` (cutter rotated 90
     /// degrees) and `exact_scale2` (cutter scaled 2x along x) also match with raw, untransformed codes.
-    const BLENDER_EXACT_CORNERS: &[(&[([i16; 2], f32)], [i16; 2])] = &[
+    const BLENDER_EXACT_CORNERS: &[(&[WeightedCode], [i16; 2])] = &[
         (&[([27123, -6834], 1.0)], [27123, -6834]),
         (&[([28649, -15397], 1.0)], [28649, -15397]),
         (&[([27803, -20142], 1.0)], [27803, -20142]),

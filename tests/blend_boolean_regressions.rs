@@ -199,7 +199,7 @@ fn expected_material_names(expected: &Value) -> TestResult<Vec<Option<String>>> 
     Ok(names)
 }
 
-/// The rotated fixtures carry Blender's local matrix_basis through import; as roots, it is their
+/// The rotated fixtures carry Blender's local `matrix_basis` through import; as roots, it is their
 /// evaluated world matrix too.
 fn assert_rotated_matrix_capture(document: &SceneDoc) -> TestResult {
     let snapshot = Snapshot::evaluate(document, &EvaluationContext::default())?;

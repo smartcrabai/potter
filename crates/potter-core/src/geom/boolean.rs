@@ -4,8 +4,8 @@
 //! rational intersection, classification of the intersected triangles, and assembly of the output
 //! polygons with Blender's attribute rules.
 //!
-//! `FLOAT` ports Blender's BMesh intersection solver in `boolean/float.rs`: f32 operand transforms,
-//! triangle BVH intersections, edgenet splitting, face-group ray parity, and BMesh attribute rules.
+//! `FLOAT` ports Blender's `BMesh` intersection solver in `boolean/float.rs`: f32 operand transforms,
+//! triangle BVH intersections, edgenet splitting, face-group ray parity, and `BMesh` attribute rules.
 //!
 //! Operand and material semantics follow Blender's `non_float_boolean_mesh`: an unset Object
 //! operand leaves the mesh unchanged, and `material_remaps` gives the INDEX and TRANSFER slot maps.
@@ -186,7 +186,7 @@ pub(crate) fn float_object_quick_mesh(
     })
 }
 
-/// Blender's FLOAT BMesh Boolean over operands already resolved into the subject's space.
+/// Blender's FLOAT `BMesh` Boolean over operands already resolved into the subject's space.
 pub(crate) fn float_boolean(
     subject: &Mesh,
     operands: &[BooleanOperand],

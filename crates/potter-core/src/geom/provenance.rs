@@ -61,8 +61,8 @@ impl Origin {
 /// layer, and every element-domain `mesh.attributes` entry are remapped. Corner data blends over the
 /// source corners of each output corner (see [`corner_sources`]), so UVs follow the face corner they
 /// came from. Shading flags follow the same origins: `shade_smooth` and `blender_polygon_smooth` copy
-/// their source face's flag, and `sharp` and `seam` OR over source edges. Canonical ColorStore layers
-/// preserve order/designations and use their Blender FLOAT_COLOR/BYTE_COLOR mixer. `custom_normal`
+/// their source face's flag, and `sharp` and `seam` OR over source edges. Canonical `ColorStore` layers
+/// preserve order/designations and use their Blender `FLOAT_COLOR/BYTE_COLOR` mixer. `custom_normal`
 /// codes are never interpolated; [`crate::geom::clnor::transfer_custom_normals`] handles them.
 /// Elements without a source get no entry, so readers use their type's default; no key points to a stale element.
 ///
@@ -634,7 +634,7 @@ fn line_point_factor(point: [f32; 2], first: [f32; 2], second: [f32; 2]) -> f32 
     }
 }
 
-/// Blender's `interp_weights_poly_v2`: f32 projected coordinates, 16*FLT_EPSILON scale-aware snapping,
+/// Blender's `interp_weights_poly_v2`: f32 projected coordinates, 16*`FLT_EPSILON` scale-aware snapping,
 /// and double half-tangent math for the interior mean-value weights.
 fn mean_value_weights(polygon: &[[f32; 2]], point: [f32; 2]) -> Option<Vec<f64>> {
     let count = polygon.len();
@@ -889,7 +889,7 @@ impl Sources<'_> {
     }
 
     /// Blender's color data type of the color attribute `name`: the `blender_metadata` entry written
-    /// with it, or FLOAT_COLOR when there is none.
+    /// with it, or `FLOAT_COLOR` when there is none.
     fn color_data_type(&self, name: &str) -> &'static str {
         let stored = self
             .source
@@ -1359,8 +1359,8 @@ fn blend_uv(uvs: &[[f64; 2]], sources: &[(usize, f64)]) -> [f64; 2] {
     if found { uv } else { [0.0, 1.0] }
 }
 
-/// Blend canonical RGBA colors of `data_type` by source weight, with Blender's FLOAT_COLOR and
-/// BYTE_COLOR mixers. `None` when no source has a weight.
+/// Blend canonical RGBA colors of `data_type` by source weight, with Blender's `FLOAT_COLOR` and
+/// `BYTE_COLOR` mixers. `None` when no source has a weight.
 fn blend_rgba(colors: impl Iterator<Item = ([f64; 4], f64)>, data_type: &str) -> Option<[f64; 4]> {
     let byte_color = data_type == "BYTE_COLOR";
     let mut sums = [0.0_f32; 4];
@@ -1732,7 +1732,7 @@ mod tests {
             source.insert_vertex(DVec3::ZERO).expect("vertex"),
             source.insert_vertex(DVec3::X).expect("vertex"),
         ];
-        for pair in vertices.chunks_exact(2) {
+        for pair in vertices.as_chunks::<2>().0 {
             source.insert_edge([pair[0], pair[1]]).expect("source edge");
         }
         let edge_ids: Vec<u32> = source.edges.iter().map(|edge| edge.id).collect();
