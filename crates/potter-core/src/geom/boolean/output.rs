@@ -24,10 +24,10 @@
 //! the vertex origins, and the POINT origin above is not an edge origin. FACE stores
 //! (`blender_polygon_smooth`, `shade_smooth`) are joined into `J` and gathered by the remap.
 //!
-//! `custom_normal` is a CORNER store of raw fan codes. [`joined_custom_normals`] builds each
-//! operand's authored normals per joined corner, which [`encode_joined_custom_normals`] stores as
-//! codes; [`mix_custom_normals`] then mixes every output corner from its weighted source corners
-//! with Blender's `DefaultMixer<short2>` (`clnor::mix_codes`).
+//! `custom_normal` is a CORNER store of raw fan codes. [`join_custom_normal_codes`] copies each
+//! operand's codes into the joined mesh untransformed, as Blender's join does (probes
+//! `exact_clnor4`, `exact_rot90`, `exact_scale2`). [`mix_custom_normals`] then mixes every output
+//! corner from its weighted source corners with Blender's `DefaultMixer<short2>` (`clnor::mix_codes`).
 //! A copied corner keeps its code, and a flipped face keeps its codes: Blender does not negate
 //! them, and the flip shows only when the codes decode on the flipped face's fan (probe
 //! `flip.json`).
@@ -50,7 +50,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
-use glam::{DMat3, DMat4, DVec3, Mat4};
+use glam::{DMat4, DVec3, Mat4};
 use serde_json::{Map, Value, json};
 
 use crate::error::{PotError, Result};
@@ -58,7 +58,6 @@ use crate::geom::{
     Edge, Face, IdCounters, Mesh, Vertex,
     clnor::{self, NormalCodeOptions},
     color_layers, edge_key,
-    normals::{face_normal, normal_matrix, vector3},
     provenance::{Origin, default_value, mean_value_corners, remap_attributes},
     uv_layers,
 };
@@ -99,7 +98,7 @@ pub(crate) fn polys_to_mesh(
     let layout = Layout::new(operands);
     let mut joined = join(operands, &layout)?;
     joined.mesh.attributes = join_attributes(operands, &layout, &joined.mesh)?;
-    encode_joined_custom_normals(&mut joined.mesh)?;
+    join_custom_normal_codes(operands, &mut joined.mesh)?;
     uv_layers::write(&mut joined.mesh, &joined_uv_store(operands));
     let (arena_ids, planned) = plan(polys, &layout)?;
 
@@ -584,11 +583,6 @@ fn join_attributes(
         &mut attributes,
         "shade_smooth",
         joined_face_attribute(operands, &face_ids, layout, "shade_smooth"),
-    );
-    insert_if(
-        &mut attributes,
-        "custom_normal",
-        joined_custom_normals(operands, layout)?,
     );
     insert_if(
         &mut attributes,
@@ -1126,141 +1120,38 @@ fn joined_face_attribute(
     Some(with_values(template, Value::Object(values)))
 }
 
-/// Relative tolerance of the similarity test in [`NormalTransform::new`].
-const SIMILARITY_TOLERANCE: f64 = 1.0e-6;
-
-/// An operand transform as Blender's realize step applies it to `custom_normal`. The direction goes
-/// through the inverse transpose. A similarity transform (rotation, mirror, translation, or uniform
-/// scale) keeps the length of the normal; any other transform normalises the result. Measured on
-/// Blender 5.2.2.
-struct NormalTransform {
-    linear: DMat3,
-    similarity: bool,
-}
-
-impl NormalTransform {
-    fn new(transform: DMat4) -> Self {
-        let linear = DMat3::from_mat4(transform);
-        let columns = [linear.x_axis, linear.y_axis, linear.z_axis];
-        let squared = columns.map(DVec3::length_squared);
-        let scale = squared[0];
-        let equal_lengths = squared
-            .iter()
-            .all(|length| (length - scale).abs() <= SIMILARITY_TOLERANCE * scale);
-        let orthogonal = [(0_usize, 1_usize), (0, 2), (1, 2)]
-            .iter()
-            .all(|&(a, b)| columns[a].dot(columns[b]).abs() <= SIMILARITY_TOLERANCE * scale);
-        Self {
-            // The cofactor matrix signed by the determinant is a positive multiple of the inverse
-            // transpose, so its direction is the transformed normal's direction.
-            linear: normal_matrix(transform),
-            similarity: scale > 0.0 && equal_lengths && orthogonal,
-        }
-    }
-
-    fn apply(&self, normal: DVec3) -> DVec3 {
-        let direction = (self.linear * normal).normalize_or_zero();
-        if self.similarity {
-            direction * normal.length()
-        } else {
-            direction
-        }
-    }
-}
-
-/// Blender's joined `custom_normal` as authored vectors per joined corner. An operand's authored
-/// corners decode on its own fans (`clnor::corner_custom_normals`) and pass through its transform
-/// ([`NormalTransform`]). A corner without an authored value takes its face's flat normal, passed
-/// through the same transform. `None` when no operand holds custom-normal values.
-/// [`encode_joined_custom_normals`] stores the rows as codes once the output mesh exists.
-pub(super) fn joined_custom_normals(
-    operands: &[Operand<'_>],
-    layout: &Layout,
-) -> Result<Option<Value>> {
-    let mut decoded = Vec::with_capacity(operands.len());
+/// Blender's joined `custom_normal` (`join_meshes`): each operand's raw codes are copied in joined
+/// corner order, with no transform. The EXACT probes `exact_clnor4`, `exact_rot90` and `exact_scale2`
+/// match every output corner from untransformed input codes under translation, a 90 degree rotation
+/// and a non-uniform scale. An operand without custom normals contributes automatic corners, and
+/// nothing is written when no operand holds custom normals.
+pub(super) fn join_custom_normal_codes(operands: &[Operand<'_>], mesh: &mut Mesh) -> Result<()> {
+    let mut codes = Vec::new();
+    let mut any = false;
     for operand in operands {
-        let positions: Vec<DVec3> = operand
+        let count: usize = operand
             .mesh
-            .vertices
+            .faces
             .iter()
-            .map(|vertex| vertex.co)
-            .collect();
-        decoded.push(clnor::corner_custom_normals(
-            operand.mesh,
-            &positions,
-            NormalCodeOptions::default(),
-        )?);
-    }
-    if decoded.iter().all(Option::is_none) {
-        return Ok(None);
-    }
-    let mut joined = Map::new();
-    for (index, operand) in operands.iter().enumerate() {
-        let transform = NormalTransform::new(operand.transform);
-        let authored = decoded[index].as_deref();
-        let positions: HashMap<u32, DVec3> = operand
-            .mesh
-            .vertices
-            .iter()
-            .map(|vertex| (vertex.id, vertex.co))
-            .collect();
-        let mut corner_base = 0;
-        for (local, face) in operand.mesh.faces.iter().enumerate() {
-            let points: Vec<DVec3> = face
-                .vertices
-                .iter()
-                .filter_map(|id| positions.get(id).copied())
-                .collect();
-            let flat = transform.apply(face_normal(&points));
-            let corners: Vec<Value> = (0..face.vertices.len())
-                .map(|corner| {
-                    let normal = authored
-                        .and_then(|normals| normals.get(corner_base + corner))
-                        .copied()
-                        .flatten()
-                        .map_or(flat, |value| transform.apply(value));
-                    json!(normal.to_array())
-                })
-                .collect();
-            corner_base += face.vertices.len();
-            joined.insert(
-                format!("f{}", layout.faces[index].start + local),
-                Value::Array(corners),
-            );
+            .map(|face| face.vertices.len())
+            .sum();
+        match clnor::corner_codes(operand.mesh)? {
+            Some(own) => {
+                if own.len() != count {
+                    return Err(PotError::invalid_argument(
+                        "boolean operand custom normal codes do not match the corners",
+                    ));
+                }
+                any = true;
+                codes.extend(own);
+            }
+            None => codes.extend(std::iter::repeat_n(clnor::CornerNormalCode::Auto, count)),
         }
     }
-    Ok(Some(
-        json!({"domain": "corner", "type": "float3", "values": Value::Object(joined)}),
-    ))
-}
-
-/// Encodes the joined vector rows as the joined mesh's native normal codes, on its own fans. The
-/// remap then rebuilds the output codes from these source codes (`rebuild_custom_normals`), so no
-/// float3 store reaches `clnor::corner_codes`. A `null` row stays Auto.
-pub(super) fn encode_joined_custom_normals(mesh: &mut Mesh) -> Result<()> {
-    let Some(attribute) = mesh.attributes.remove("custom_normal") else {
+    if !any {
         return Ok(());
-    };
-    let values = attribute
-        .get("values")
-        .and_then(Value::as_object)
-        .ok_or_else(|| {
-            PotError::invalid_argument("boolean output custom normals have no values")
-        })?;
-    let mut vectors = Vec::new();
-    for face in &mesh.faces {
-        let rows = values
-            .get(&format!("f{}", face.id))
-            .and_then(Value::as_array)
-            .filter(|rows| rows.len() == face.vertices.len())
-            .ok_or_else(|| {
-                PotError::invalid_argument(
-                    "boolean output custom normal rows do not match the corners",
-                )
-            })?;
-        vectors.extend(rows.iter().map(vector3));
     }
-    clnor::encode_vectors(mesh, Some(&vectors), NormalCodeOptions::default())
+    clnor::write_codes(mesh, Some(codes.as_slice()), NormalCodeOptions::default())
 }
 
 /// An edge-keyed object store (`{"domain","type","values":{"e{id}": value}}`, as `crease_edge` and
@@ -1921,7 +1812,7 @@ mod tests {
     }
 
     #[test]
-    fn custom_normals_follow_a_non_similarity_transform_as_unit_directions() -> TestResult {
+    fn custom_normal_codes_are_copied_without_the_operand_transform() -> TestResult {
         let mut a = triangle(0.0)?;
         set_authored_normals(&mut a, &[DVec3::new(0.0, 0.0, 2.0); 3])?;
         let mut arena = Arena::new();
@@ -1936,10 +1827,11 @@ mod tests {
             transform: DMat4::from_scale(DVec3::new(2.0, 1.0, 1.0)),
         };
         let mesh = build(&[poly(ids, 0)], &arena, &[scaled], &[])?;
-        let normals = authored_normals(&mesh)?;
-        for normal in &normals {
-            assert_near(*normal, DVec3::Z)?;
-        }
+        // Blender copies the raw codes of a joined operand; the operand transform does not touch them.
+        let source = crate::geom::clnor::corner_codes(&a).map_err(|error| format!("{error:?}"))?;
+        let joined =
+            crate::geom::clnor::corner_codes(&mesh).map_err(|error| format!("{error:?}"))?;
+        assert_eq!(joined, source);
         Ok(())
     }
 }
