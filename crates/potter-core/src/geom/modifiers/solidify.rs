@@ -106,26 +106,12 @@ pub(super) fn solidify(
     validated(mesh)?;
     let material_slot_count = context
         .material_slot_count
-        .unwrap_or_else(|| face_slot_count(mesh));
+        .unwrap_or_else(|| super::contextless_material_slot_count(mesh));
     let params = Params::parse(mesh, modifier, material_slot_count)?;
     match params.mode {
         Mode::Extrude => extrude::solidify_extrude(mesh, modifier, &params),
         Mode::NonManifold => nonmanifold::solidify_nonmanifold(mesh, modifier, &params),
     }
-}
-
-/// Material slots the mesh's faces address: one more than the largest `material_index`, or zero for a
-/// mesh without faces. Used when no scene object supplies the count.
-fn face_slot_count(mesh: &Mesh) -> usize {
-    mesh.faces
-        .iter()
-        .map(|face| {
-            usize::try_from(face.material_index)
-                .unwrap_or(usize::MAX)
-                .saturating_add(1)
-        })
-        .max()
-        .unwrap_or(0)
 }
 
 impl Params {

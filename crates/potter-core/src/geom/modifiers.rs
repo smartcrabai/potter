@@ -76,6 +76,21 @@ pub struct ModifierEvaluation {
     pub warnings: Vec<PotError>,
 }
 
+/// Material slots a mesh without scene context addresses: one more than the largest face
+/// `material_index`, or 0 for a mesh without faces. Blender's `totcol` is the object's own count;
+/// this is the closest count the mesh itself carries.
+pub(crate) fn contextless_material_slot_count(mesh: &Mesh) -> usize {
+    mesh.faces
+        .iter()
+        .map(|face| {
+            usize::try_from(face.material_index)
+                .unwrap_or(usize::MAX)
+                .saturating_add(1)
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 /// Evaluate the enabled modifier stack over a source mesh without node-group context.
 ///
 /// Disabled modifiers are ignored. Enabled modifiers are applied in the order supplied.
