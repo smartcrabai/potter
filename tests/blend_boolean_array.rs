@@ -245,22 +245,255 @@ fn same_point(first: DVec3, second: DVec3) -> bool {
     first.distance(second) <= 1.0e-5
 }
 
-fn assert_vertices(actual: &[DVec3], expected: &[DVec3], context: &str) {
-    assert_eq!(actual.len(), expected.len(), "{context}: vertex count");
+// Touching, 5 boxes, EXACT: the top and bottom faces each keep two keyhole bridges, chosen from four
+// candidates of exactly equal squared length. Blender 5.2.2 orders those ties with an unstable
+// `std::ranges::sort` (blenlib_mesh_boolean.cc:3226), so the bridge choice depends on the platform's
+// C++ standard library. Both observed results are accepted; they share vertices and volume and
+// differ only in the bottom face. Bridges: A=(2,1)-(0.75,0.275), B=(2,-1)-(0.75,-0.275),
+// C=(-2,-1)-(-0.75,-0.275), D=(-2,1)-(-0.75,0.275).
+//   macOS arm64, /Applications/Blender.app (libc++): top {B,C}, bottom {C,D}
+//   Linux amd64, potter-blender-linux:ready (libstdc++, GCC 14): top {B,C}, bottom {A,B}
+// Each result came from the ARRAY_BOOLEAN_FIXTURE generator and repeated identically across runs.
+// Potter's dissolve sorts with libstdc++'s algorithm (dissolve.rs `libstdcxx_sort_by`).
+const TOUCHING_EXACT_VERTICES: [[f64; 3]; 32] = [
+    [-2.0, -1.0, -0.5],
+    [-2.0, -1.0, 0.5],
+    [-2.0, 1.0, -0.5],
+    [-2.0, 1.0, 0.5],
+    [2.0, -1.0, -0.5],
+    [2.0, -1.0, 0.5],
+    [2.0, 1.0, -0.5],
+    [2.0, 1.0, 0.5],
+    [-0.450_000_017_881_393_43, 0.275_000_005_960_464_5, -0.5],
+    [0.149_999_976_158_142_1, 0.275_000_005_960_464_5, -0.5],
+    [-0.150_000_005_960_464_48, 0.275_000_005_960_464_5, -0.5],
+    [0.450_000_047_683_715_8, 0.275_000_005_960_464_5, -0.5],
+    [0.75, 0.275_000_005_960_464_5, -0.5],
+    [0.75, -0.275_000_005_960_464_5, -0.5],
+    [-0.75, 0.275_000_005_960_464_5, -0.5],
+    [-0.75, -0.275_000_005_960_464_5, -0.5],
+    [-0.450_000_017_881_393_43, -0.275_000_005_960_464_5, -0.5],
+    [-0.150_000_005_960_464_48, -0.275_000_005_960_464_5, -0.5],
+    [0.149_999_976_158_142_1, -0.275_000_005_960_464_5, -0.5],
+    [0.450_000_047_683_715_8, -0.275_000_005_960_464_5, -0.5],
+    [-0.75, -0.275_000_005_960_464_5, 0.5],
+    [-0.75, 0.275_000_005_960_464_5, 0.5],
+    [-0.450_000_017_881_393_43, 0.275_000_005_960_464_5, 0.5],
+    [-0.150_000_005_960_464_48, 0.275_000_005_960_464_5, 0.5],
+    [0.149_999_976_158_142_1, 0.275_000_005_960_464_5, 0.5],
+    [0.450_000_047_683_715_8, 0.275_000_005_960_464_5, 0.5],
+    [-0.450_000_017_881_393_43, -0.275_000_005_960_464_5, 0.5],
+    [-0.150_000_005_960_464_48, -0.275_000_005_960_464_5, 0.5],
+    [0.149_999_976_158_142_1, -0.275_000_005_960_464_5, 0.5],
+    [0.450_000_047_683_715_8, -0.275_000_005_960_464_5, 0.5],
+    [0.75, 0.275_000_005_960_464_5, 0.5],
+    [0.75, -0.275_000_005_960_464_5, 0.5],
+];
+const TOUCHING_EXACT_MACOS_EDGES: [[usize; 2]; 52] = [
+    [0, 1],
+    [0, 2],
+    [0, 4],
+    [0, 15],
+    [1, 3],
+    [1, 5],
+    [1, 20],
+    [2, 3],
+    [2, 6],
+    [2, 14],
+    [3, 7],
+    [4, 5],
+    [4, 6],
+    [5, 7],
+    [5, 31],
+    [6, 7],
+    [8, 10],
+    [8, 14],
+    [8, 22],
+    [9, 10],
+    [9, 11],
+    [9, 24],
+    [10, 23],
+    [11, 12],
+    [11, 25],
+    [12, 13],
+    [12, 30],
+    [13, 19],
+    [13, 31],
+    [14, 15],
+    [14, 21],
+    [15, 16],
+    [15, 20],
+    [16, 17],
+    [16, 26],
+    [17, 18],
+    [17, 27],
+    [18, 19],
+    [18, 28],
+    [19, 29],
+    [20, 21],
+    [20, 26],
+    [21, 22],
+    [22, 23],
+    [23, 24],
+    [24, 25],
+    [25, 30],
+    [26, 27],
+    [27, 28],
+    [28, 29],
+    [29, 31],
+    [30, 31],
+];
+const TOUCHING_EXACT_MACOS_FACES: [&[usize]; 20] = [
+    &[0, 1, 3, 2],
+    &[2, 3, 7, 6],
+    &[6, 7, 5, 4],
+    &[4, 5, 1, 0],
+    &[0, 2, 14, 15],
+    &[14, 2, 6, 4, 0, 15, 16, 17, 18, 19, 13, 12, 11, 9, 10, 8],
+    &[20, 1, 5, 31, 29, 28, 27, 26],
+    &[5, 7, 3, 1, 20, 21, 22, 23, 24, 25, 30, 31],
+    &[20, 15, 14, 21],
+    &[21, 14, 8, 22],
+    &[16, 15, 20, 26],
+    &[22, 8, 10, 23],
+    &[17, 16, 26, 27],
+    &[23, 10, 9, 24],
+    &[18, 17, 27, 28],
+    &[24, 9, 11, 25],
+    &[19, 18, 28, 29],
+    &[25, 11, 12, 30],
+    &[12, 13, 31, 30],
+    &[13, 19, 29, 31],
+];
+const TOUCHING_EXACT_LINUX_EDGES: [[usize; 2]; 52] = [
+    [0, 1],
+    [0, 2],
+    [0, 4],
+    [1, 3],
+    [1, 5],
+    [1, 20],
+    [2, 3],
+    [2, 6],
+    [3, 7],
+    [4, 5],
+    [4, 6],
+    [4, 13],
+    [5, 7],
+    [5, 31],
+    [6, 7],
+    [6, 12],
+    [8, 10],
+    [8, 14],
+    [8, 22],
+    [9, 10],
+    [9, 11],
+    [9, 24],
+    [10, 23],
+    [11, 12],
+    [11, 25],
+    [12, 13],
+    [12, 30],
+    [13, 19],
+    [13, 31],
+    [14, 15],
+    [14, 21],
+    [15, 16],
+    [15, 20],
+    [16, 17],
+    [16, 26],
+    [17, 18],
+    [17, 27],
+    [18, 19],
+    [18, 28],
+    [19, 29],
+    [20, 21],
+    [20, 26],
+    [21, 22],
+    [22, 23],
+    [23, 24],
+    [24, 25],
+    [25, 30],
+    [26, 27],
+    [27, 28],
+    [28, 29],
+    [29, 31],
+    [30, 31],
+];
+const TOUCHING_EXACT_LINUX_FACES: [&[usize]; 20] = [
+    &[0, 1, 3, 2],
+    &[2, 3, 7, 6],
+    &[6, 7, 5, 4],
+    &[4, 5, 1, 0],
+    &[12, 6, 4, 13],
+    &[13, 4, 0, 2, 6, 12, 11, 9, 10, 8, 14, 15, 16, 17, 18, 19],
+    &[20, 1, 5, 31, 29, 28, 27, 26],
+    &[5, 7, 3, 1, 20, 21, 22, 23, 24, 25, 30, 31],
+    &[20, 15, 14, 21],
+    &[21, 14, 8, 22],
+    &[16, 15, 20, 26],
+    &[22, 8, 10, 23],
+    &[17, 16, 26, 27],
+    &[23, 10, 9, 24],
+    &[18, 17, 27, 28],
+    &[24, 9, 11, 25],
+    &[19, 18, 28, 29],
+    &[25, 11, 12, 30],
+    &[12, 13, 31, 30],
+    &[13, 19, 29, 31],
+];
+const TOUCHING_EXACT_SIGNED_VOLUME: f64 = 7.174_999_951_695_4;
+
+/// The Blender results accepted for Touching, 5 boxes, EXACT: exactly the macOS and Linux results.
+fn touching_exact_observed_surfaces() -> Vec<Surface> {
+    let vertices: Vec<DVec3> = TOUCHING_EXACT_VERTICES
+        .iter()
+        .map(|point| DVec3::new(point[0], point[1], point[2]))
+        .collect();
+    [
+        (
+            TOUCHING_EXACT_MACOS_EDGES.as_slice(),
+            TOUCHING_EXACT_MACOS_FACES.as_slice(),
+        ),
+        (
+            TOUCHING_EXACT_LINUX_EDGES.as_slice(),
+            TOUCHING_EXACT_LINUX_FACES.as_slice(),
+        ),
+    ]
+    .into_iter()
+    .map(|(edges, faces)| Surface {
+        vertices: vertices.clone(),
+        edges: edges
+            .iter()
+            .map(|&[first, second]| [vertices[first], vertices[second]])
+            .collect(),
+        faces: faces
+            .iter()
+            .map(|ring| ring.iter().map(|&index| vertices[index]).collect())
+            .collect(),
+        signed_volume: TOUCHING_EXACT_SIGNED_VOLUME,
+    })
+    .collect()
+}
+
+fn check_vertices(actual: &[DVec3], expected: &[DVec3], context: &str) -> Result<(), String> {
+    if actual.len() != expected.len() {
+        return Err(format!("{context}: vertex count"));
+    }
     let mut unmatched = expected.to_vec();
     for vertex in actual {
         let Some(index) = unmatched
             .iter()
             .position(|candidate| same_point(*vertex, *candidate))
         else {
-            panic!("{context}: no Blender vertex matches {vertex:?}");
+            return Err(format!("{context}: no Blender vertex matches {vertex:?}"));
         };
         unmatched.swap_remove(index);
     }
-    assert!(
-        unmatched.is_empty(),
-        "{context}: Blender has unmatched vertices"
-    );
+    if unmatched.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("{context}: Blender has unmatched vertices"))
+    }
 }
 
 fn same_edge(actual: [DVec3; 2], expected: [DVec3; 2]) -> bool {
@@ -268,22 +501,29 @@ fn same_edge(actual: [DVec3; 2], expected: [DVec3; 2]) -> bool {
         || (same_point(actual[0], expected[1]) && same_point(actual[1], expected[0]))
 }
 
-fn assert_edges(actual: &[[DVec3; 2]], expected: &[[DVec3; 2]], context: &str) {
-    assert_eq!(actual.len(), expected.len(), "{context}: edge count");
+fn check_edges(
+    actual: &[[DVec3; 2]],
+    expected: &[[DVec3; 2]],
+    context: &str,
+) -> Result<(), String> {
+    if actual.len() != expected.len() {
+        return Err(format!("{context}: edge count"));
+    }
     let mut unmatched = expected.to_vec();
     for edge in actual {
         let Some(index) = unmatched
             .iter()
             .position(|candidate| same_edge(*edge, *candidate))
         else {
-            panic!("{context}: no Blender edge matches {edge:?}");
+            return Err(format!("{context}: no Blender edge matches {edge:?}"));
         };
         unmatched.swap_remove(index);
     }
-    assert!(
-        unmatched.is_empty(),
-        "{context}: Blender has unmatched edges"
-    );
+    if unmatched.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("{context}: Blender has unmatched edges"))
+    }
 }
 
 fn same_oriented_ring(actual: &[DVec3], expected: &[DVec3]) -> bool {
@@ -294,14 +534,16 @@ fn same_oriented_ring(actual: &[DVec3], expected: &[DVec3]) -> bool {
         })
 }
 
-fn assert_boolean_geometry(actual: &Surface, expected: &Surface, context: &str) {
-    assert_vertices(&actual.vertices, &expected.vertices, context);
-    assert_edges(&actual.edges, &expected.edges, context);
-    assert_eq!(
-        actual.faces.len(),
-        expected.faces.len(),
-        "{context}: face count"
-    );
+fn check_boolean_geometry(
+    actual: &Surface,
+    expected: &Surface,
+    context: &str,
+) -> Result<(), String> {
+    check_vertices(&actual.vertices, &expected.vertices, context)?;
+    check_edges(&actual.edges, &expected.edges, context)?;
+    if actual.faces.len() != expected.faces.len() {
+        return Err(format!("{context}: face count"));
+    }
 
     let mut unmatched = expected.faces.clone();
     for face in &actual.faces {
@@ -309,14 +551,15 @@ fn assert_boolean_geometry(actual: &Surface, expected: &Surface, context: &str) 
             .iter()
             .position(|candidate| same_oriented_ring(face, candidate))
         else {
-            panic!("{context}: no Blender face matches oriented ring {face:?}");
+            return Err(format!(
+                "{context}: no Blender face matches oriented ring {face:?}"
+            ));
         };
         unmatched.swap_remove(index);
     }
-    assert!(
-        unmatched.is_empty(),
-        "{context}: Blender has unmatched faces"
-    );
+    if !unmatched.is_empty() {
+        return Err(format!("{context}: Blender has unmatched faces"));
+    }
 
     let volume_error = (actual.signed_volume - expected.signed_volume).abs();
     let volume_tolerance = if expected.signed_volume.abs() <= 1.0e-9 {
@@ -324,12 +567,27 @@ fn assert_boolean_geometry(actual: &Surface, expected: &Surface, context: &str) 
     } else {
         expected.signed_volume.abs() * 1.0e-6
     };
-    assert!(
-        volume_error <= volume_tolerance,
-        "{context}: signed volume {} differs from Blender {}",
-        actual.signed_volume,
-        expected.signed_volume
-    );
+    if volume_error > volume_tolerance {
+        return Err(format!(
+            "{context}: signed volume {} differs from Blender {}",
+            actual.signed_volume, expected.signed_volume
+        ));
+    }
+    Ok(())
+}
+
+/// Accepts `actual` when it matches at least one entry of `expected`. Each entry is a complete
+/// Blender result, so the list is exactly the set of results accepted for the case.
+fn assert_boolean_geometry_any(actual: &Surface, expected: &[Surface], context: &str) {
+    let errors: Vec<String> = expected
+        .iter()
+        .filter_map(|candidate| check_boolean_geometry(actual, candidate, context).err())
+        .collect();
+    assert!(errors.len() < expected.len(), "{}", errors.join("\n"));
+}
+
+fn assert_boolean_geometry(actual: &Surface, expected: &Surface, context: &str) {
+    assert_boolean_geometry_any(actual, std::slice::from_ref(expected), context);
 }
 
 #[test]
@@ -423,9 +681,14 @@ fn boolean_array_box_cutter_layouts_match_blender_for_exact_and_float() -> TestR
                     .ok_or_else(|| format!("Potter did not evaluate `{name}`"))?,
                 world,
             )?;
-            assert_boolean_geometry(
+            let candidates = if name == "ArrayHostTouchingEXACT" {
+                touching_exact_observed_surfaces()
+            } else {
+                vec![expected_surface]
+            };
+            assert_boolean_geometry_any(
                 &actual,
-                &expected_surface,
+                &candidates,
                 &format!("{layout}, {count} boxes, {solver}"),
             );
         }
