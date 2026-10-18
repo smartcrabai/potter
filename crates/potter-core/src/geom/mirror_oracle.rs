@@ -321,7 +321,10 @@ fn mirror_fixtures_match_blender() -> TestResult {
             .to_owned();
         let fixture: Value = serde_json::from_str(&fs::read_to_string(&path)?)?;
         checked += 1;
-        let problems = mismatches(&fixture)?;
+        let problems = match mismatches(&fixture) {
+            Ok(problems) => problems,
+            Err(error) => vec![format!("evaluation error: {error}")],
+        };
         if !problems.is_empty() {
             failures.push(format!("{name}:\n  {}", problems.join("\n  ")));
         }

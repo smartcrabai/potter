@@ -142,7 +142,19 @@
     15
    ]
   ],
-  "edges": [
+  "edges": [],
+  "face_smooth": [
+   false,
+   false
+  ],
+  "sharp_edges": [],
+  "seam_edges": [],
+  "face_material_index": [
+   0,
+   0
+  ],
+  "vertex_groups": {},
+  "blender_edge_order": [
    [
     8,
     9
@@ -207,18 +219,7 @@
     7,
     0
    ]
-  ],
-  "face_smooth": [
-   false,
-   false
-  ],
-  "sharp_edges": [],
-  "seam_edges": [],
-  "face_material_index": [
-   0,
-   0
-  ],
-  "vertex_groups": {}
+  ]
  },
  "objects": {},
  "subject_transform": {

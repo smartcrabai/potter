@@ -385,16 +385,20 @@ def make_object(name, spec):
                     weights[str(i)] = w
             groups_doc[gname] = weights
 
+    face_edge_keys = {edge_key(f[k], f[(k + 1) % len(f)]) for f in spec["faces"] for k in range(len(f))}
     doc = dict(
         vertices=verts,
         faces=faces,
-        edges=spec["edges"],
+        edges=[list(edge) for edge in spec["edges"] if edge_key(*edge) not in face_edge_keys],
         face_smooth=[bool(p.use_smooth) for p in me.polygons],
         sharp_edges=[sorted(e.vertices) for e in me.edges if e.use_edge_sharp],
         seam_edges=[sorted(e.vertices) for e in me.edges if e.use_seam],
         face_material_index=[int(p.material_index) for p in me.polygons],
         vertex_groups=groups_doc,
     )
+    if spec["edges"]:
+        # Blender's storage order of every edge, so the loader keeps it without duplicating face edges.
+        doc["blender_edge_order"] = [list(edge.vertices) for edge in me.edges]
     if custom_doc is not None:
         doc["custom_normals"] = custom_doc
     if uv_doc is not None:
