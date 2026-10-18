@@ -1867,6 +1867,10 @@ fn build_imported_graph(
                     color: vec3_field(item, "color", [1.0; 3]),
                     energy: number_field(item, "energy", 1000.0),
                     radius: number_field(item, "shadow_soft_size", 0.1),
+                    soft_falloff: item
+                        .get("soft_falloff")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true),
                     spot_size: number_field(item, "spot_size", std::f64::consts::FRAC_PI_4),
                     spot_blend: number_field(item, "spot_blend", 0.15),
                     area_shape: item
