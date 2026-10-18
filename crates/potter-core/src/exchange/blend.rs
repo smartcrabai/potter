@@ -2860,11 +2860,7 @@ fn build_imported_graph(
                         )
                     })?;
                 if modifier.modifier_type != "ocean" || parameter != "time" {
-                    return Err(PotError::with_details(
-                        ErrorCode::UnsupportedFeature,
-                        "modifier animation binding is not an Ocean time parameter",
-                        json!({"action": action_name, "node": node_id, "modifier": modifier.id, "parameter": parameter}),
-                    ));
+                    continue;
                 }
                 bindings.push(ModifierParameterBinding {
                     node: node_id.clone(),
@@ -2876,6 +2872,9 @@ fn build_imported_graph(
                         &action_slot_ids,
                     )?,
                 });
+            }
+            if bindings.is_empty() {
+                continue;
             }
             let action = doc.actions.get_mut(action_id).ok_or_else(|| {
                 invalid_intermediate("modifier animation Action disappeared during import")
@@ -6785,6 +6784,35 @@ fn object_properties(item: &Value) -> Map<String, Value> {
     props
 }
 
+/// Whether a bridge binding names the `time` parameter of an OCEAN modifier on its Object.
+fn is_ocean_time_binding(raw: &Value, binding: &Value) -> bool {
+    if binding.get("parameter").and_then(Value::as_str) != Some("time") {
+        return false;
+    }
+    let (Some(node), Some(modifier)) = (
+        binding.get("node").and_then(Value::as_str),
+        binding.get("modifier").and_then(Value::as_str),
+    ) else {
+        return false;
+    };
+    raw.get("objects")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|object| object.get("name").and_then(Value::as_str) == Some(node))
+        .flat_map(|object| {
+            object
+                .get("modifiers")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .any(|candidate| {
+            candidate.get("name").and_then(Value::as_str) == Some(modifier)
+                && candidate.get("type").and_then(Value::as_str) == Some("OCEAN")
+        })
+}
+
 fn import_losses(raw: &Value) -> Vec<Loss> {
     let mut losses = Vec::new();
     for material in raw
@@ -6906,12 +6934,15 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
                 .get("path")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            if path.starts_with("modifiers[")
-                && !curve
-                    .get("modifier_bindings")
-                    .and_then(Value::as_array)
-                    .is_some_and(|bindings| !bindings.is_empty())
-            {
+            let bindings = curve
+                .get("modifier_bindings")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let supported = bindings
+                .iter()
+                .any(|binding| is_ocean_time_binding(raw, binding));
+            if path.starts_with("modifiers[") && !supported {
                 losses.push(loss(
                     "blender.animation.modifier_parameter",
                     action_name,
