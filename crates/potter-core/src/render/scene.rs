@@ -871,7 +871,7 @@ pub(super) fn extract_geometry(
                 Some(material),
                 material.base_color,
                 normal,
-                &shader_warnings,
+                &geometry.shader_warnings,
             );
             let color = shade(
                 doc,

@@ -306,7 +306,7 @@ fn f82_fresnel(cosine: f64, f0: DVec3, b: DVec3) -> DVec3 {
 
 /// `fresnel_f82tint_B`: correction term that makes the tint act at 82 degrees.
 fn f82_tint_b(f0: DVec3, tint: DVec3) -> DVec3 {
-    let f = 6.0 / 7.0;
+    let f: f64 = 6.0 / 7.0;
     let f5 = f.powi(5);
     let schlick = f0.lerp(DVec3::ONE, f5);
     schlick * (7.0 / (f5 * f)) * (DVec3::ONE - tint)
