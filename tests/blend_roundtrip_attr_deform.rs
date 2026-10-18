@@ -1782,7 +1782,7 @@ fn blender_mesh_cache_pc2_mdd_and_alembic_sequence_round_trip_resources()
     fs::write(&reopen_path, CACHE_REOPEN)?;
     let mut command = Command::new(&blender);
     command
-        .args(["--background"])
+        .args(["--background", "--python-exit-code", "1"])
         .arg(&exported)
         .arg("--python")
         .arg(&reopen_path)

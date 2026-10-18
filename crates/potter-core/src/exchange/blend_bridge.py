@@ -478,7 +478,8 @@ def _legacy_texture_settings(texture):
         settings = _rna_scalar_settings(
             texture, omit=("name", "name_full", "type", "image", "image_user",
                            "color_ramp", "use_nodes", "node_tree"))
-        settings["color_ramp"] = _color_ramp_settings(texture.color_ramp)
+        if texture.color_ramp is not None:
+            settings["color_ramp"] = _color_ramp_settings(texture.color_ramp)
         settings["image_user"] = _rna_scalar_settings(texture.image_user)
         return settings
     return {key: plain(getattr(texture, key))
@@ -6904,6 +6905,14 @@ def export_doc(doc, target, pack, scene_hash, context):
                     key: value for key, value in params.items() if key != "use_pin_to_last"})
                 set_modifier_params(
                     modifier, rna_item, id_lookup, texture_map, doc, target, node_id, obj)
+                if modifier_item.get("type") == "mesh_sequence_cache":
+                    resource_id = params.get("resource")
+                    cache_file = (
+                        _cache_file_for_resource(doc, resource_id, target, params)
+                        if resource_id else None
+                    )
+                    modifier.cache_file = cache_file
+                    modifier.object_path = params.get("object_path", "")
                 source_modifier = (
                     source_modifiers.get(modifier_item.get("id"))
                     or source_modifiers_by_rna_name.get(modifier_item.get("name"))

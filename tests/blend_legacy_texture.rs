@@ -136,17 +136,18 @@ def texture_state(texture):
     fields = settings.get(texture.type, ())
     result = {key: getattr(texture, key) for key in fields if hasattr(texture, key)}
     if texture.type == "IMAGE":
-        ramp = texture.color_ramp
-        result["color_ramp"] = {
-            "color_mode": ramp.color_mode,
-            "hue_interpolation": ramp.hue_interpolation,
-            "interpolation": ramp.interpolation,
-            "elements": [
-                {"position": float(element.position),
-                 "color": [float(value) for value in element.color]}
-                for element in ramp.elements
-            ],
-        }
+        if texture.color_ramp is not None:
+            ramp = texture.color_ramp
+            result["color_ramp"] = {
+                "color_mode": ramp.color_mode,
+                "hue_interpolation": ramp.hue_interpolation,
+                "interpolation": ramp.interpolation,
+                "elements": [
+                    {"position": float(element.position),
+                     "color": [float(value) for value in element.color]}
+                    for element in ramp.elements
+                ],
+            }
         result["image_user"] = {"frame_offset": texture.image_user.frame_offset}
     return result
 def modifier_state():
@@ -202,17 +203,18 @@ def texture_state(texture):
     fields = settings.get(texture.type, ())
     result = {key: getattr(texture, key) for key in fields if hasattr(texture, key)}
     if texture.type == "IMAGE":
-        ramp = texture.color_ramp
-        result["color_ramp"] = {
-            "color_mode": ramp.color_mode,
-            "hue_interpolation": ramp.hue_interpolation,
-            "interpolation": ramp.interpolation,
-            "elements": [
-                {"position": float(element.position),
-                 "color": [float(value) for value in element.color]}
-                for element in ramp.elements
-            ],
-        }
+        if texture.color_ramp is not None:
+            ramp = texture.color_ramp
+            result["color_ramp"] = {
+                "color_mode": ramp.color_mode,
+                "hue_interpolation": ramp.hue_interpolation,
+                "interpolation": ramp.interpolation,
+                "elements": [
+                    {"position": float(element.position),
+                     "color": [float(value) for value in element.color]}
+                    for element in ramp.elements
+                ],
+            }
         result["image_user"] = {"frame_offset": texture.image_user.frame_offset}
     return result
 
