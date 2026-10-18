@@ -1646,3 +1646,18 @@ fn packed_bake_feeds_preview_render_and_gltf_after_input_change() -> Result<(), 
     assert_positions_equal(&mesh_positions(imported_geometry)?, &expected);
     Ok(())
 }
+
+#[test]
+fn modifier_documents_without_bake_settings_have_no_bakes_key_and_load_unchanged()
+-> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let project = directory.path().join("old-document");
+    let batch_file = directory.path().join("operations.json");
+    create_project(&project, &batch_file, "PACKED", "", false)?;
+    let scene = document(&project)?;
+    let params = &scene["nodes"]["body"]["modifiers"][0]["params"];
+    assert!(params.get("bakes").is_none(), "{params}");
+    let unbaked = inspect(&project, 1.0)?;
+    assert_dimensions(&unbaked, [2.0, 2.0, 2.0])?;
+    Ok(())
+}
