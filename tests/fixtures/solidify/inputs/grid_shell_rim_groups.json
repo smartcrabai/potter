@@ -426,8 +426,8 @@
     }
    ],
    "vertex_groups": {
-    "rim": {},
-    "shell": {}
+    "shell": {},
+    "rim": {}
    }
   },
   "next_id": {

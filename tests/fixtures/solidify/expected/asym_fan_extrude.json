@@ -74,7 +74,8 @@
     ],
     "sharp": false,
     "seam": false,
-    "crease": 0.0
+    "crease": 0.0,
+    "bevel_weight": 0.0
    },
    {
     "v": [
@@ -83,7 +84,8 @@
     ],
     "sharp": false,
     "seam": false,
-    "crease": 0.0
+    "crease": 0.0,
+    "bevel_weight": 0.0
    },
    {
     "v": [
@@ -92,7 +94,8 @@
     ],
     "sharp": false,
     "seam": false,
-    "crease": 0.0
+    "crease": 0.0,
+    "bevel_weight": 0.0
    },
    {
     "v": [
@@ -101,7 +104,8 @@
     ],
     "sharp": false,
     "seam": false,
-    "crease": 0.0
+    "crease": 0.0,
+    "bevel_weight": 0.0
    },
    {
     "v": [
@@ -110,7 +114,8 @@
     ],
     "sharp": false,
     "seam": false,
-    "crease": 0.0
+    "crease": 0.0,
+    "bevel_weight": 0.0
    },
    {
     "v": [
@@ -119,7 +124,8 @@
     ],
     "sharp": false,
     "seam": false,
-    "crease": 0.0
+    "crease": 0.0,
+    "bevel_weight": 0.0
    },
    {
     "v": [
@@ -128,7 +134,8 @@
     ],
     "sharp": false,
     "seam": false,
-    "crease": 0.0
+    "crease": 0.0,
+    "bevel_weight": 0.0
    },
    {
     "v": [
@@ -137,7 +144,8 @@
     ],
     "sharp": false,
     "seam": false,
-    "crease": 0.0
+    "crease": 0.0,
+    "bevel_weight": 0.0
    },
    {
     "v": [
@@ -146,7 +154,8 @@
     ],
     "sharp": false,
     "seam": false,
-    "crease": 0.0
+    "crease": 0.0,
+    "bevel_weight": 0.0
    },
    {
     "v": [
@@ -155,7 +164,8 @@
     ],
     "sharp": false,
     "seam": false,
-    "crease": 0.0
+    "crease": 0.0,
+    "bevel_weight": 0.0
    },
    {
     "v": [
@@ -164,7 +174,8 @@
     ],
     "sharp": false,
     "seam": false,
-    "crease": 0.0
+    "crease": 0.0,
+    "bevel_weight": 0.0
    },
    {
     "v": [
@@ -173,7 +184,8 @@
     ],
     "sharp": false,
     "seam": false,
-    "crease": 0.0
+    "crease": 0.0,
+    "bevel_weight": 0.0
    },
    {
     "v": [
@@ -182,7 +194,8 @@
     ],
     "sharp": false,
     "seam": false,
-    "crease": 0.0
+    "crease": 0.0,
+    "bevel_weight": 0.0
    },
    {
     "v": [
@@ -191,7 +204,8 @@
     ],
     "sharp": false,
     "seam": false,
-    "crease": 0.0
+    "crease": 0.0,
+    "bevel_weight": 0.0
    },
    {
     "v": [
@@ -200,7 +214,8 @@
     ],
     "sharp": false,
     "seam": false,
-    "crease": 0.0
+    "crease": 0.0,
+    "bevel_weight": 0.0
    },
    {
     "v": [
@@ -209,7 +224,8 @@
     ],
     "sharp": false,
     "seam": false,
-    "crease": 0.0
+    "crease": 0.0,
+    "bevel_weight": 0.0
    },
    {
     "v": [
@@ -218,7 +234,8 @@
     ],
     "sharp": false,
     "seam": false,
-    "crease": 0.0
+    "crease": 0.0,
+    "bevel_weight": 0.0
    },
    {
     "v": [
@@ -227,7 +244,8 @@
     ],
     "sharp": false,
     "seam": false,
-    "crease": 0.0
+    "crease": 0.0,
+    "bevel_weight": 0.0
    },
    {
     "v": [
@@ -236,7 +254,8 @@
     ],
     "sharp": false,
     "seam": false,
-    "crease": 0.0
+    "crease": 0.0,
+    "bevel_weight": 0.0
    },
    {
     "v": [
@@ -245,7 +264,8 @@
     ],
     "sharp": false,
     "seam": false,
-    "crease": 0.0
+    "crease": 0.0,
+    "bevel_weight": 0.0
    },
    {
     "v": [
@@ -254,7 +274,8 @@
     ],
     "sharp": false,
     "seam": false,
-    "crease": 0.0
+    "crease": 0.0,
+    "bevel_weight": 0.0
    },
    {
     "v": [
@@ -263,7 +284,8 @@
     ],
     "sharp": false,
     "seam": false,
-    "crease": 0.0
+    "crease": 0.0,
+    "bevel_weight": 0.0
    },
    {
     "v": [
@@ -272,7 +294,8 @@
     ],
     "sharp": false,
     "seam": false,
-    "crease": 0.0
+    "crease": 0.0,
+    "bevel_weight": 0.0
    },
    {
     "v": [
@@ -281,7 +304,8 @@
     ],
     "sharp": false,
     "seam": false,
-    "crease": 0.0
+    "crease": 0.0,
+    "bevel_weight": 0.0
    },
    {
     "v": [
@@ -290,7 +314,8 @@
     ],
     "sharp": false,
     "seam": false,
-    "crease": 0.0
+    "crease": 0.0,
+    "bevel_weight": 0.0
    }
   ],
   "faces": [
@@ -469,6 +494,7 @@
   "uv_layer_names": [],
   "color_attribute_names": [],
   "has_custom_normals": false,
+  "has_bevel_weight_edge": false,
   "topology": {
    "vertices": 12,
    "edges": 25,

@@ -1,0 +1,476 @@
+{
+ "case": "grid_nm_bevel_weights",
+ "purpose": "NON_MANIFOLD input edge and vertex bevel weights with bevel_convex",
+ "material_slots": 1,
+ "material_slot_layout": [
+  true
+ ],
+ "modifier": {
+  "type": "solidify",
+  "params": {
+   "solidify_mode": "NON_MANIFOLD",
+   "thickness": 0.2,
+   "thickness_clamp": 0.0,
+   "use_thickness_angle_clamp": false,
+   "thickness_vertex_group": 0.0,
+   "offset": 0.25,
+   "edge_crease_inner": 0.0,
+   "edge_crease_outer": 0.0,
+   "edge_crease_rim": 0.0,
+   "material_offset": 0,
+   "material_offset_rim": 0,
+   "vertex_group": "",
+   "shell_vertex_group": "",
+   "rim_vertex_group": "",
+   "use_rim": true,
+   "use_even_offset": false,
+   "use_quality_normals": false,
+   "invert_vertex_group": false,
+   "use_flat_faces": false,
+   "use_flip_normals": false,
+   "use_rim_only": false,
+   "nonmanifold_thickness_mode": "FIXED",
+   "nonmanifold_boundary_mode": "NONE",
+   "nonmanifold_merge_threshold": 0.001,
+   "bevel_convex": 0.35,
+   "use_pin_to_last": false,
+   "use_apply_on_spline": false
+  }
+ },
+ "mesh": {
+  "vertices": [
+   {
+    "id": 0,
+    "co": [
+     0.0,
+     0.0,
+     0.0
+    ]
+   },
+   {
+    "id": 1,
+    "co": [
+     1.0,
+     0.07,
+     0.24088954635429824
+    ]
+   },
+   {
+    "id": 2,
+    "co": [
+     2.0,
+     0.28,
+     0.12887534295536604
+    ]
+   },
+   {
+    "id": 3,
+    "co": [
+     3.0,
+     0.6300000000000001,
+     -0.17194153979599353
+    ]
+   },
+   {
+    "id": 4,
+    "co": [
+     0.12,
+     0.9,
+     0.16105442180942275
+    ]
+   },
+   {
+    "id": 5,
+    "co": [
+     1.12,
+     0.97,
+     0.22732435670642043
+    ]
+   },
+   {
+    "id": 6,
+    "co": [
+     2.12,
+     1.1800000000000002,
+     -0.03943642353581205
+    ]
+   },
+   {
+    "id": 7,
+    "co": [
+     3.12,
+     1.5300000000000002,
+     -0.24842275090836613
+    ]
+   },
+   {
+    "id": 8,
+    "co": [
+     0.24,
+     1.8,
+     0.24636243249711504
+    ]
+   },
+   {
+    "id": 9,
+    "co": [
+     1.24,
+     1.87,
+     0.10684497005845744
+    ]
+   },
+   {
+    "id": 10,
+    "co": [
+     2.24,
+     2.08,
+     -0.18920062382698208
+    ]
+   },
+   {
+    "id": 11,
+    "co": [
+     3.24,
+     2.43,
+     -0.2080668605559752
+    ]
+   }
+  ],
+  "edges": [
+   {
+    "id": 0,
+    "v": [
+     0,
+     1
+    ]
+   },
+   {
+    "id": 1,
+    "v": [
+     1,
+     5
+    ]
+   },
+   {
+    "id": 2,
+    "v": [
+     4,
+     5
+    ]
+   },
+   {
+    "id": 3,
+    "v": [
+     0,
+     4
+    ]
+   },
+   {
+    "id": 4,
+    "v": [
+     1,
+     2
+    ]
+   },
+   {
+    "id": 5,
+    "v": [
+     2,
+     6
+    ]
+   },
+   {
+    "id": 6,
+    "v": [
+     5,
+     6
+    ]
+   },
+   {
+    "id": 7,
+    "v": [
+     2,
+     3
+    ]
+   },
+   {
+    "id": 8,
+    "v": [
+     3,
+     7
+    ]
+   },
+   {
+    "id": 9,
+    "v": [
+     6,
+     7
+    ]
+   },
+   {
+    "id": 10,
+    "v": [
+     5,
+     9
+    ]
+   },
+   {
+    "id": 11,
+    "v": [
+     8,
+     9
+    ]
+   },
+   {
+    "id": 12,
+    "v": [
+     4,
+     8
+    ]
+   },
+   {
+    "id": 13,
+    "v": [
+     6,
+     10
+    ]
+   },
+   {
+    "id": 14,
+    "v": [
+     9,
+     10
+    ]
+   },
+   {
+    "id": 15,
+    "v": [
+     7,
+     11
+    ]
+   },
+   {
+    "id": 16,
+    "v": [
+     10,
+     11
+    ]
+   }
+  ],
+  "faces": [
+   {
+    "id": 0,
+    "v": [
+     0,
+     1,
+     5,
+     4
+    ],
+    "material_index": 0
+   },
+   {
+    "id": 1,
+    "v": [
+     1,
+     2,
+     6,
+     5
+    ],
+    "material_index": 0
+   },
+   {
+    "id": 2,
+    "v": [
+     2,
+     3,
+     7,
+     6
+    ],
+    "material_index": 0
+   },
+   {
+    "id": 3,
+    "v": [
+     4,
+     5,
+     9,
+     8
+    ],
+    "material_index": 0
+   },
+   {
+    "id": 4,
+    "v": [
+     5,
+     6,
+     10,
+     9
+    ],
+    "material_index": 0
+   },
+   {
+    "id": 5,
+    "v": [
+     6,
+     7,
+     11,
+     10
+    ],
+    "material_index": 0
+   }
+  ],
+  "attributes": {
+   "shade_smooth": {
+    "domain": "face",
+    "type": "bool",
+    "values": {
+     "f0": false,
+     "f1": false,
+     "f2": false,
+     "f3": false,
+     "f4": false,
+     "f5": false
+    }
+   },
+   "sharp": {
+    "domain": "edge",
+    "type": "bool",
+    "values": {
+     "e0": false,
+     "e1": false,
+     "e2": false,
+     "e3": false,
+     "e4": false,
+     "e5": false,
+     "e6": false,
+     "e7": false,
+     "e8": false,
+     "e9": false,
+     "e10": false,
+     "e11": false,
+     "e12": false,
+     "e13": false,
+     "e14": false,
+     "e15": false,
+     "e16": false
+    }
+   },
+   "blender_edge_flags": [
+    {
+     "sharp": false,
+     "seam": false
+    },
+    {
+     "sharp": false,
+     "seam": false
+    },
+    {
+     "sharp": false,
+     "seam": false
+    },
+    {
+     "sharp": false,
+     "seam": false
+    },
+    {
+     "sharp": false,
+     "seam": false
+    },
+    {
+     "sharp": false,
+     "seam": false
+    },
+    {
+     "sharp": false,
+     "seam": false
+    },
+    {
+     "sharp": false,
+     "seam": false
+    },
+    {
+     "sharp": false,
+     "seam": false
+    },
+    {
+     "sharp": false,
+     "seam": false
+    },
+    {
+     "sharp": false,
+     "seam": false
+    },
+    {
+     "sharp": false,
+     "seam": false
+    },
+    {
+     "sharp": false,
+     "seam": false
+    },
+    {
+     "sharp": false,
+     "seam": false
+    },
+    {
+     "sharp": false,
+     "seam": false
+    },
+    {
+     "sharp": false,
+     "seam": false
+    },
+    {
+     "sharp": false,
+     "seam": false
+    }
+   ],
+   "bevel_weight_edge": {
+    "domain": "edge",
+    "type": "float",
+    "values": {
+     "e0": 0.25,
+     "e1": 0.0,
+     "e2": 0.75,
+     "e3": 0.0,
+     "e4": 0.0,
+     "e5": 0.0,
+     "e6": 0.5,
+     "e7": 0.0,
+     "e8": 0.0,
+     "e9": 0.0,
+     "e10": 0.0,
+     "e11": 0.0,
+     "e12": 0.0,
+     "e13": 0.0,
+     "e14": 0.0,
+     "e15": 0.0,
+     "e16": 0.0
+    }
+   },
+   "bevel_weight_vert": {
+    "domain": "point",
+    "type": "float",
+    "values": {
+     "v0": 0.25,
+     "v1": 0.0,
+     "v2": 0.0,
+     "v3": 0.0,
+     "v4": 0.0,
+     "v5": 0.5,
+     "v6": 0.0,
+     "v7": 0.0,
+     "v8": 0.0,
+     "v9": 0.0,
+     "v10": 0.0,
+     "v11": 0.75
+    }
+   }
+  },
+  "next_id": {
+   "vertex": 12,
+   "edge": 17,
+   "face": 6
+  }
+ }
+}
