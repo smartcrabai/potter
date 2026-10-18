@@ -72,17 +72,23 @@ const AGX_SUFFIXES: [(&str, &str); 9] = [
     ("Very Low Contrast", "very_low_contrast"),
 ];
 
-/// Float bound for display values in `[0, 1]`, per view and look family. Filmic looks: 1e-6, the
-/// largest fused-versus-unfused spread is 4.8e-7 and the Blender residual 4.8e-7. AgX looks: 2e-5, against
-/// a spread of 4.8e-6 and a Blender residual of 9.3e-6 (`Punchy` at gamma 2). AgX without a look keeps the
-/// 2.5e-6 bound of the no-look views (residual 4.2e-7). False Color: 4e-3, because the palette step has a
-/// slope of about 2000 per unit (spread 1.7e-3, residual 7.7e-4).
+/// Float bound for display values in `[0, 1]`: twice the largest fused-versus-unfused spread of the
+/// emulation for each view and look family (the same rule as the base views in
+/// `color_view_transform_blender.rs`), rounded up. Measured spreads: Standard and Raw 0, Filmic
+/// 4.8e-7 (looks) and 1.8e-7 (none), AgX with no look 7.7e-7, AgX looks 4.8e-6, False Color 1.7e-3.
+/// The AgX-look residual is 9.3e-6 (`Punchy`, gamma 2), inside 9.6e-6 with little margin. Its source is
+/// the GradingTone shadows (`ComputeHSFwd`, `GradingToneOpCPU.cpp:499`): the look-stage deviation is at
+/// most 2.4e-7 (ULP level, confined to the 0.1-0.4 shadow zone), and the 25-stop log-to-linear step of
+/// the display view multiplies it by about 17 before the display encode. The fused and unfused variants
+/// do not reproduce Blender bit-for-bit; the compiler's contraction choice is unverified (CMake flags
+/// UNREAD). False Color's palette step has a slope of about 2000 per unit, so its residual (7.7e-4) sits
+/// in the 3.5e-3 bound.
 fn float_tolerance(view: ViewTransform, has_look: bool) -> f64 {
     match view {
         ViewTransform::Standard | ViewTransform::Filmic | ViewTransform::Raw => 1.0e-6,
-        ViewTransform::AgX if has_look => 2.0e-5,
-        ViewTransform::AgX => 2.5e-6,
-        ViewTransform::FalseColor => 4.0e-3,
+        ViewTransform::AgX if has_look => 9.6e-6,
+        ViewTransform::AgX => 1.6e-6,
+        ViewTransform::FalseColor => 3.5e-3,
     }
 }
 
