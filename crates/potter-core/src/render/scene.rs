@@ -19,6 +19,7 @@ use crate::{
     model::{Id, Material, SceneDoc},
     shader::{
         BsdfParams, EvaluatorWorkspace, HitContext, HitUvLayers, dielectric_f0,
+        record_unevaluated_inputs,
         evaluate_displacement_with_workspace, evaluate_surface_with_workspace, fill_color_layers,
     },
 };
@@ -522,7 +523,12 @@ pub(super) fn extract_geometry(
                     {
                         base_color
                     } else {
-                        let params = shading_params(material, base_color, normal);
+                        let params = shading_params(
+                            material,
+                            base_color,
+                            normal,
+                            &shader_warnings,
+                        );
                         shade(
                             doc, snapshot, center, center, normal, normal, &params, mode, None,
                             images,
@@ -866,7 +872,12 @@ pub(super) fn extract_geometry(
                 .normalize_or_zero();
             let center =
                 (triangle.positions[0] + triangle.positions[1] + triangle.positions[2]) / 3.0;
-            let params = shading_params(Some(material), material.base_color, normal);
+            let params = shading_params(
+                Some(material),
+                material.base_color,
+                normal,
+                &shader_warnings,
+            );
             let color = shade(
                 doc,
                 snapshot,
@@ -1404,13 +1415,24 @@ fn world_face_normals(
 /// Principled inputs of a surface shaded with `material`: the path tracer's own construction
 /// (`BsdfParams::from_material`), with the surface colour `base` in place of the material's. An
 /// unmapped slot takes the default material's.
-fn shading_params(material: Option<&Material>, base: [f64; 4], normal: DVec3) -> BsdfParams {
+fn shading_params(
+    material: Option<&Material>,
+    base: [f64; 4],
+    normal: DVec3,
+    warnings: &RefCell<Vec<serde_json::Value>>,
+) -> BsdfParams {
     let mut params = material.map_or_else(
         || BsdfParams::from_material(&Material::default(), normal),
         |material| BsdfParams::from_material(material, normal),
     );
     params.base_color = base;
     params.alpha = base[3];
+    record_unevaluated_inputs(
+        Some(warnings),
+        material.map_or("", |material| material.name.as_str()),
+        None,
+        &params,
+    );
     params
 }
 
@@ -1467,7 +1489,7 @@ impl SurfaceShader for SceneShader<'_> {
                 triangle.color[2],
                 alpha,
             ];
-            shading_params(material, base, hit.normal)
+            shading_params(material, base, hit.normal, &self.geometry.shader_warnings)
         });
         let shadow = self.geometry.shadows.as_ref().map(|shadows| {
             (

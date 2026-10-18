@@ -57,6 +57,51 @@ pub(crate) fn unevaluated_principled_inputs(
     inputs
 }
 
+/// Records `UNSUPPORTED_FEATURE` for each Principled input in `params` that Potter's lobe model
+/// does not evaluate. `node` names the Principled node of a graph material; a native material
+/// passes `None`. Deduped per (material, input) in `warnings`, the sink the render output reports.
+pub(crate) fn record_unevaluated_inputs(
+    warnings: Option<&RefCell<Vec<JsonValue>>>,
+    material: &str,
+    node: Option<&Id>,
+    params: &BsdfParams,
+) {
+    let Some(warnings) = warnings else {
+        return;
+    };
+    for (feature_id, input) in unevaluated_principled_inputs(params) {
+        let mut recorded = warnings.borrow_mut();
+        let duplicate = recorded.iter().any(|warning| {
+            warning["material"].as_str() == Some(material)
+                && warning["input"].as_str() == Some(input)
+        });
+        if duplicate {
+            continue;
+        }
+        recorded.push(match node {
+            Some(node) => json!({
+                "code": "UNSUPPORTED_FEATURE",
+                "feature_id": feature_id,
+                "material": material,
+                "node_id": node.to_string(),
+                "input": input,
+                "message": format!(
+                    "Principled input '{input}' of material '{material}' (node '{node}') is not evaluated by Potter's lobe model; its Cycles contribution is omitted or approximated"
+                ),
+            }),
+            None => json!({
+                "code": "UNSUPPORTED_FEATURE",
+                "feature_id": feature_id,
+                "material": material,
+                "input": input,
+                "message": format!(
+                    "Principled input '{input}' of material '{material}' is not evaluated by Potter's lobe model; its Cycles contribution is omitted or approximated"
+                ),
+            }),
+        });
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BsdfParams {
     pub base_color: [f64; 4],
@@ -472,6 +517,7 @@ fn evaluate_surface_inner(
 ) -> Result<BsdfParams> {
     let Some(graph_id) = &material.node_tree else {
         let mut params = BsdfParams::from_material(material, hit_ctx.normal);
+        record_unevaluated_inputs(hit_ctx.warnings, &material.name, None, &params);
         apply_material_textures(material, hit_ctx, &mut params)?;
         return Ok(params);
     };
@@ -954,34 +1000,6 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_> {
         }
     }
 
-    /// Reports each Principled input this lobe model does not evaluate, naming the material and
-    /// node. Deduped per (material, input) in the warnings sink the render output reports.
-    fn record_unevaluated_inputs(&self, id: &Id, params: &BsdfParams) {
-        let Some(warnings) = self.hit_ctx.warnings else {
-            return;
-        };
-        let material = self.material.name.as_str();
-        for (feature_id, input) in unevaluated_principled_inputs(params) {
-            let mut recorded = warnings.borrow_mut();
-            let duplicate = recorded.iter().any(|warning| {
-                warning["material"].as_str() == Some(material)
-                    && warning["input"].as_str() == Some(input)
-            });
-            if !duplicate {
-                recorded.push(json!({
-                    "code": "UNSUPPORTED_FEATURE",
-                    "feature_id": feature_id,
-                    "material": material,
-                    "node_id": id.to_string(),
-                    "input": input,
-                    "message": format!(
-                        "Principled input '{input}' of material '{material}' (node '{id}') is not evaluated by Potter's lobe model; its Cycles contribution is omitted or approximated"
-                    ),
-                }));
-            }
-        }
-    }
-
     fn principled(&mut self, id: &Id) -> Result<BsdfParams> {
         let node = self.node(id)?;
         if node
@@ -991,7 +1009,12 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_> {
             == Some(true)
         {
             let params = BsdfParams::from_material(self.material, self.hit_ctx.normal);
-            self.record_unevaluated_inputs(id, &params);
+            record_unevaluated_inputs(
+                self.hit_ctx.warnings,
+                &self.material.name,
+                Some(id),
+                &params,
+            );
             return Ok(params);
         }
         let mut params = BsdfParams::from_material(self.material, self.hit_ctx.normal);
@@ -1039,7 +1062,12 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_> {
             self.vector_input(id, &["Normal"], self.hit_ctx.normal)?,
             self.hit_ctx.normal,
         );
-        self.record_unevaluated_inputs(id, &params);
+        record_unevaluated_inputs(
+            self.hit_ctx.warnings,
+            &self.material.name,
+            Some(id),
+            &params,
+        );
         Ok(params)
     }
 
@@ -2492,6 +2520,64 @@ mod tests {
         assert_eq!(params.volume_color, [0.2, 0.4, 0.6]);
         assert_eq!(params.volume_anisotropy, 0.35);
         assert!(params.volume_scattering);
+    }
+
+    #[test]
+    fn unevaluated_principled_inputs_warn_once_per_material_and_input() {
+        use std::cell::RefCell;
+
+        let sink = RefCell::new(Vec::new());
+        let mut groups = Registry::new();
+        // A native material sets rough transmission on the material itself.
+        let native = Material {
+            name: "Native".to_owned(),
+            transmission: 0.5,
+            roughness: 0.3,
+            ..Material::default()
+        };
+        let context = HitContext::new(&groups).with_warnings(&sink);
+        evaluate_surface(&native, &context).unwrap();
+        evaluate_surface(&native, &context).unwrap();
+
+        // A graph material sets coat and rough transmission on its Principled node.
+        let mut graph = NodeGroup::new("Graph", GraphKind::Shader);
+        insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
+        insert_node(
+            &mut graph,
+            "principled",
+            "ShaderNodeBsdfPrincipled",
+            json!({"Coat Weight":0.5,"Transmission Weight":0.5,"Roughness":0.3}),
+        );
+        link(&mut graph, "principled", "BSDF", "output", "Surface");
+        let graph_id = Id::new("graph_shader".to_owned()).unwrap();
+        groups.insert(graph_id.clone(), graph);
+        let graph_material = Material {
+            name: "Graph".to_owned(),
+            node_tree: Some(graph_id),
+            ..Material::default()
+        };
+        let graph_context = HitContext::new(&groups).with_warnings(&sink);
+        evaluate_surface(&graph_material, &graph_context).unwrap();
+        evaluate_surface(&graph_material, &graph_context).unwrap();
+
+        let warnings = sink.borrow();
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        let count = |material: &str, input: &str| {
+            warnings
+                .iter()
+                .filter(|warning| {
+                    warning["material"].as_str() == Some(material)
+                        && warning["input"].as_str() == Some(input)
+                })
+                .count()
+        };
+        assert_eq!(count("Native", "Transmission Weight"), 1);
+        assert_eq!(count("Graph", "Coat Weight"), 1);
+        assert_eq!(count("Graph", "Transmission Weight"), 1);
+        let native_warning = warnings.iter().find(|w| w["material"] == "Native").unwrap();
+        assert!(native_warning.get("node_id").is_none());
+        let coat_warning = warnings.iter().find(|w| w["input"] == "Coat Weight").unwrap();
+        assert_eq!(coat_warning["node_id"], "principled");
     }
 
     #[test]
