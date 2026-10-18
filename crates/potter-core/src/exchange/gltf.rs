@@ -14890,6 +14890,135 @@ mod tests {
     }
 
     #[test]
+    fn packed_metallic_roughness_graph_samples_like_the_authored_fields_everywhere() -> TestResult {
+        // The authored material samples its native fields and the imported one samples the packed graph. Both go
+        // through one Image Texture sampler, so they agree across the whole UV square, including the band where
+        // Blender's REPEAT wraps the texture edge. The packed PNG keeps each 8-bit channel, so the values can
+        // differ by one 8-bit step at most.
+        let root = tempfile::tempdir()?;
+        let doc = scene_with_asset_root(
+            root.path(),
+            &json!([
+                {"op":"image.create","id":"rough","width":4,"height":4,"colorspace":"linear","generator":"checker","checker_colors":[[0.1,0.6,0.9,1.0],[0.9,0.2,0.4,1.0]],"checker_size":2},
+                {"op":"image.create","id":"metal","width":4,"height":4,"colorspace":"linear","generator":"checker","checker_colors":[[0.8,0.3,0.1,1.0],[0.2,0.7,0.5,1.0]],"checker_size":2},
+                {"op":"material.create","id":"mr_box","metallic":1.0,"roughness":1.0,"roughness_texture":{"image":"rough"},"metallic_texture":{"image":"metal"}},
+                {"op":"node.create","id":"cube","kind":"box","params":{"size":2.0},"material":"mr_box"},
+                {"op":"uv.unwrap","target":{"id":"cube"},"method":"box"}
+            ]),
+        )?;
+        let names = ["UVMap".to_owned()];
+        let sample_at = |material: &crate::model::Material,
+                         groups: &BTreeMap<crate::model::Id, crate::graph::NodeGroup>,
+                         images: &BTreeMap<String, crate::image::ImageData>,
+                         u: f64,
+                         v: f64|
+         -> TestResult<(f64, f64)> {
+            let corners = [[[u, v]; 3]];
+            let layers = crate::shader::HitUvLayers {
+                names: &names,
+                corners: &corners,
+                positions: [DVec3::ZERO; 3],
+                barycentric: [1.0 / 3.0; 3],
+                render: Some(0),
+                available_mask: None,
+            };
+            let mut context = crate::shader::HitContext::new(groups)
+                .with_images(images)
+                .with_uv_layers(layers);
+            // A graph texture on the render layer reads `TexCoord.UV`, the hit's render `uv`, as the renderer sets it.
+            context.uv = [u, v];
+            let params = crate::shader::evaluate_surface(material, &context)?;
+            Ok((params.roughness, params.metallic))
+        };
+        let mut native_images = BTreeMap::new();
+        for name in ["rough", "metal"] {
+            let image = doc
+                .images
+                .get(&crate::model::Id::new(name)?)
+                .ok_or("image missing")?;
+            native_images.insert(
+                name.to_owned(),
+                crate::image::load_image_data(
+                    image,
+                    root.path(),
+                    crate::image::ImageInterpolation::Linear,
+                )?,
+            );
+        }
+        let native_material = doc
+            .materials
+            .get(&crate::model::Id::new("mr_box")?)
+            .ok_or("material missing")?;
+        let (document, binary) = export_root_and_binary_at_root(&doc, root.path())?;
+        std::fs::write(root.path().join("scene.bin"), &binary)?;
+        let path = root.path().join("packed.gltf");
+        std::fs::write(&path, serde_json::to_vec(&document)?)?;
+        let imported = import(&path, uuid::Uuid::new_v4().to_string())?;
+        export_imported_again(&imported, root.path())?;
+        let graph_material = imported
+            .doc
+            .materials
+            .get(&crate::model::Id::new("mr_box")?)
+            .ok_or("imported material missing")?;
+        let graph_id = graph_material
+            .node_tree
+            .as_ref()
+            .ok_or("imported material has no graph")?;
+        let graph = imported
+            .doc
+            .node_groups
+            .get(graph_id)
+            .ok_or("imported graph is missing")?;
+        let packed_id = graph
+            .nodes
+            .values()
+            .find(|node| node.node_type == "ShaderNodeTexImage")
+            .and_then(|node| node.properties.get("image"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or("packed texture node is missing")?
+            .to_owned();
+        let packed_image = imported
+            .doc
+            .images
+            .get(&crate::model::Id::new(&packed_id)?)
+            .ok_or("packed image is missing")?;
+        let mut graph_images = BTreeMap::new();
+        graph_images.insert(
+            packed_id,
+            crate::image::load_image_data(
+                packed_image,
+                root.path(),
+                crate::image::ImageInterpolation::Linear,
+            )?,
+        );
+        // 40 x 40 samples cover the interior and the wrap band at every edge of the texture.
+        let mut worst = 0.0_f64;
+        for vi in 0..40 {
+            for ui in 0..40 {
+                let u = (f64::from(ui) + 0.5) / 40.0;
+                let v = (f64::from(vi) + 0.5) / 40.0;
+                let (native_roughness, native_metallic) =
+                    sample_at(native_material, &doc.node_groups, &native_images, u, v)?;
+                let (graph_roughness, graph_metallic) = sample_at(
+                    graph_material,
+                    &imported.doc.node_groups,
+                    &graph_images,
+                    u,
+                    v,
+                )?;
+                worst = worst
+                    .max((native_roughness - graph_roughness).abs())
+                    .max((native_metallic - graph_metallic).abs());
+            }
+        }
+        assert!(
+            worst <= 1.0 / 255.0 + 1e-9,
+            "the authored field and the imported graph differ by {worst} at some UV"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn main_texture_transform_reaches_the_colour_variant_graph() -> TestResult {
         // The base color texture carries a VRM 0.x MToon main texture transform, set as the glTF import
         // sets it. Its graph is built with the same `move_textures_to_graph` call the import makes.

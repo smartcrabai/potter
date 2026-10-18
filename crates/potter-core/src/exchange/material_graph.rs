@@ -723,8 +723,7 @@ pub(crate) fn plan_blend_textures(doc: &SceneDoc) -> Result<(Vec<Loss>, BlendTex
                 if let Some(previous) = previous.filter(|previous| !replaced.contains(previous)) {
                     replaced.push(previous.clone());
                 }
-                let mut graph = build_graph(material, &textures, false)?;
-                clamp_texture_nodes(&mut graph, "");
+                let graph = build_graph(material, &textures, false)?;
                 (graph, generated_graph_id("blend-texture", material_id)?)
             }
         };
@@ -911,18 +910,6 @@ fn normal_map_node(slot: &SlotTexture, strength: f64) -> GraphNode {
     normal_map
 }
 
-/// Sets the Image Texture nodes whose IDs start with `prefix` to the Extend extension. Potter's native material textures
-/// clamp the UV to the image edge (`sample_with_interpolation`), while Blender's Image Texture repeats by default, so
-/// the export clamps the nodes it generates. Authored nodes never start with a generated prefix (`fresh_prefix`).
-fn clamp_texture_nodes(graph: &mut NodeGroup, prefix: &str) {
-    for (id, node) in &mut graph.nodes {
-        if node.node_type == "ShaderNodeTexImage" && id.as_str().starts_with(prefix) {
-            node.properties
-                .insert("extension".to_owned(), json!("EXTEND"));
-        }
-    }
-}
-
 /// The authored graph of a material with native texture fields, copied for export with the fields overlaid on its
 /// Principled BSDF, as Potter's evaluator applies them after the graph. Base Color multiplies its RGB, Roughness and
 /// Metallic multiply their Red channel, and Alpha multiplies its alpha on a non-opaque material (the renderer ignores
@@ -1041,7 +1028,6 @@ fn overlay_authored(
             )?;
         }
     }
-    clamp_texture_nodes(&mut graph, &prefix);
     Ok(Some(graph))
 }
 
@@ -1264,6 +1250,39 @@ mod tests {
         );
         assert_eq!(normal_map_properties(None)?, (None, Some(json!(true))));
         assert_eq!(normal_map_properties(Some(""))?, (None, Some(json!(true))));
+        Ok(())
+    }
+
+    #[test]
+    fn field_texture_nodes_keep_blenders_default_repeat_extension() -> Result<()> {
+        // Native fields store no wrap, and Blender's Image Texture repeats by default. The graph writes no
+        // extension, so exported field nodes keep Blender's REPEAT, which is what the render samples.
+        let material = Material {
+            name: "field".to_owned(),
+            base_color_texture: Some(texture("paint", None)?),
+            roughness_texture: Some(texture("rough", None)?),
+            ..Material::default()
+        };
+        let textures = GraphTextures::from_field_refs(
+            material.base_color_texture.clone(),
+            material.roughness_texture.clone(),
+            None,
+            None,
+        );
+        let graph = build_graph(&material, &textures, false)?;
+        let image_nodes = graph
+            .nodes
+            .iter()
+            .filter(|(_, node)| node.node_type == "ShaderNodeTexImage")
+            .collect::<Vec<_>>();
+        assert_eq!(image_nodes.len(), 2, "one Image Texture node per field");
+        for (id, node) in image_nodes {
+            assert!(
+                !node.properties.contains_key("extension"),
+                "Image Texture `{id}` sets an extension: {:?}",
+                node.properties.get("extension")
+            );
+        }
         Ok(())
     }
 

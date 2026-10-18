@@ -6,10 +6,7 @@ use serde_json::{Value as JsonValue, json};
 use crate::{
     error::{ErrorCode, PotError, Result},
     graph::{GraphKind, GraphNode, NodeGroup},
-    image::{
-        ImageData, ImageExtension, ImageInterpolation, sample_with_extension,
-        sample_with_interpolation,
-    },
+    image::{ImageData, ImageExtension, ImageInterpolation, sample_with_extension},
     model::{Id, Material, Registry, TextureRef},
 };
 
@@ -667,6 +664,27 @@ fn apply_material_textures(
     Ok(())
 }
 
+/// Samples an image as Blender's Image Texture node does. `blender_uv` is the V-up coordinate of Blender's
+/// `Vector`: a UDIM tile is routed from it, and the pixel lookup flips it into Potter's V-down storage. Native
+/// material fields and Image Texture nodes both sample through here, so they agree at every edge.
+fn sample_image_texel(
+    image: &ImageData,
+    blender_uv: [f64; 2],
+    tile: u32,
+    interpolation: ImageInterpolation,
+    extension: ImageExtension,
+) -> [f64; 4] {
+    let pixel_uv = if tile == 0 {
+        [blender_uv[0], 1.0 - blender_uv[1]]
+    } else {
+        [
+            blender_uv[0].rem_euclid(1.0),
+            1.0 - blender_uv[1].rem_euclid(1.0),
+        ]
+    };
+    sample_with_extension(image, blender_uv, pixel_uv, tile, interpolation, extension)
+}
+
 fn sample_material_texture(
     texture: &TextureRef,
     hit_ctx: &HitContext<'_>,
@@ -687,9 +705,17 @@ fn sample_material_texture(
             json!({"image_id":image_id}),
         )
     })?;
-    let uv = layer_uv(hit_ctx, layer);
+    // A material field stores no wrap, and Blender's Image Texture defaults to REPEAT, so the field samples
+    // through the same path as an Image Texture node with that extension.
+    let blender_uv = storage_to_blender_uv(layer_uv(hit_ctx, layer));
     let tile = if image.tiles.is_empty() { 0 } else { 1001 };
-    let pixel = sample_with_interpolation(image, uv, tile, texture.interpolation);
+    let pixel = sample_image_texel(
+        image,
+        blender_uv,
+        tile,
+        texture.interpolation,
+        ImageExtension::Repeat,
+    );
     if pixel.iter().any(|component| !component.is_finite()) {
         return Err(eval_error(format!(
             "Material texture `{image_id}` sampled non-finite pixels"
@@ -1162,14 +1188,7 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_> {
                 ));
             }
         };
-        let routing_uv = [uv.x, uv.y];
-        let pixel_uv = if tile == 0 {
-            [uv.x, 1.0 - uv.y]
-        } else {
-            [uv.x.rem_euclid(1.0), 1.0 - uv.y.rem_euclid(1.0)]
-        };
-        let pixel =
-            sample_with_extension(image, routing_uv, pixel_uv, tile, interpolation, extension);
+        let pixel = sample_image_texel(image, [uv.x, uv.y], tile, interpolation, extension);
         if pixel.iter().any(|component| !component.is_finite()) {
             return Err(eval_error(format!(
                 "Image Texture node `{id}` sampled non-finite pixels"
