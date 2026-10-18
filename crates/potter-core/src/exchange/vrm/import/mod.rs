@@ -10,10 +10,7 @@ mod meta;
 mod mtoon;
 mod spring;
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::Path,
-};
+use std::{collections::BTreeMap, path::Path};
 
 use glam::{DMat4, DVec3};
 use serde_json::{Value, json};
@@ -660,6 +657,8 @@ fn required_feature(error: &PotError) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use serde_json::json;
 
     use crate::model::Material;
@@ -697,6 +696,8 @@ mod tests {
             image_ids: Vec::new(),
             mesh_shape_key_ids: Vec::new(),
             joint_bones: BTreeMap::new(),
+            main_texture_transforms: BTreeSet::new(),
+            discarded_base_transforms: BTreeSet::new(),
         };
         Ok((doc, index, source, variant))
     }

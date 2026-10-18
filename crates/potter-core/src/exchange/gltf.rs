@@ -6675,7 +6675,7 @@ pub(crate) fn import(path: &Path, scene_id: String) -> Result<crate::exchange::I
 }
 
 /// Imports glTF or GLB with Potter axes mapped through `basis` (VRM 0.x adds a Ry(180) turn).
-/// `base_color_transform` gives a material's transform for its base color texture (VRM 0.x MToon main
+/// `base_color_transform` gives a material's transform for its base color texture (VRM 0.x `MToon` main
 /// texture). It replaces the texture's own `KHR_texture_transform`, which is then reported as discarded.
 pub(crate) fn import_indexed(
     path: &Path,
@@ -14790,14 +14790,14 @@ mod tests {
                 ..crate::model::Material::default()
             },
         );
-        let textures = material_graph::GraphTextures {
-            base_color: Some(material_graph::SlotTexture {
+        let textures = super::material_graph::GraphTextures {
+            base_color: Some(super::material_graph::SlotTexture {
                 texture: crate::model::TextureRef {
                     image: crate::model::Id::new("paint_img")?,
                     uv_layer: None,
                     interpolation: crate::image::ImageInterpolation::Linear,
                 },
-                transform: Some(super::material_surface::TextureTransform {
+                transform: Some(crate::exchange::material_surface::TextureTransform {
                     offset: [0.25, -2.1],
                     rotation: 0.0,
                     scale: [2.0, 3.0],
@@ -14811,12 +14811,12 @@ mod tests {
             emissive: None,
             occlusion: None,
         };
-        material_graph::move_textures_to_graph(&mut doc, &source, &textures)?;
+        super::material_graph::move_textures_to_graph(&mut doc, &source, &textures)?;
         // A primitive with COLOR_0 reading layer "Paint" builds the colour variant from that source.
         let mut variants = BTreeMap::new();
         let mut used_material_ids = BTreeSet::from([source.clone()]);
         let mut used_graph_ids = doc.node_groups.keys().cloned().collect::<BTreeSet<_>>();
-        let variant = imported_color_material(
+        let variant = super::imported_color_material(
             &mut doc,
             &source,
             "Paint",

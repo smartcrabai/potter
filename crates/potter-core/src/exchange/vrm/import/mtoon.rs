@@ -948,13 +948,13 @@ fn main_texture_transform(vectors: &Value) -> Option<TextureTransform> {
         }
         Some(output)
     };
-    let (offset_x, stored_y, scale_x, scale_y) = match numbers(&vectors["_MainTex"]) {
-        Some([offset_x, stored_y, scale_x, scale_y]) => (offset_x, stored_y, scale_x, scale_y),
-        None => {
+    let (offset_x, stored_y, scale_x, scale_y) =
+        if let Some([offset_x, stored_y, scale_x, scale_y]) = numbers(&vectors["_MainTex"]) {
+            (offset_x, stored_y, scale_x, scale_y)
+        } else {
             let [scale_x, scale_y, offset_x, stored_y] = numbers(&vectors["_MainTex_ST"])?;
             (offset_x, stored_y, scale_x, scale_y)
-        }
-    };
+        };
     let guard = |scale: f64| {
         if scale.abs() < f64::EPSILON {
             1.0
