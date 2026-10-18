@@ -2253,8 +2253,8 @@ impl Front {
         if pro.proj_dir == DVec3::ZERO {
             return;
         }
-        let d1 = f32_sub(bmvert, pro.start);
-        let d2 = f32_sub(bmvert, pro.end);
+        let d1 = f32_normalize(f32_sub(bmvert, pro.start));
+        let d2 = f32_normalize(f32_sub(bmvert, pro.end));
         let mut no = f32_cross(d1, d2);
         let mut no2 = f32_cross(d1, pro.proj_dir);
         let mut no3 = f32_cross(d2, pro.proj_dir);

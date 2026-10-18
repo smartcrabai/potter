@@ -1306,7 +1306,7 @@ fn recalculated_profile_samples(
 }
 
 /// Closest point of the segment `a`-`b` to `point` (Blender's `closest_to_line_segment_v3`).
-fn closest_on_segment(point: DVec3, a: DVec3, b: DVec3) -> DVec3 {
+pub(super) fn closest_on_segment(point: DVec3, a: DVec3, b: DVec3) -> DVec3 {
     let direction = b - a;
     let length_squared = direction.length_squared();
     if length_squared == 0.0 {
@@ -1599,6 +1599,7 @@ pub(super) struct Emission {
     polygons: Vec<OutPolygon>,
     seam_edges: Vec<(usize, usize)>,
     sharp_edges: Vec<(usize, usize)>,
+    edge_flag_suppressions: Vec<(usize, usize)>,
 }
 
 /// An output polygon: per corner, the output point, its UV query and source face. `face` is the
@@ -1631,6 +1632,11 @@ impl Emission {
         }
     }
 
+    /// Prevents inherited edge flags on interior bevel-strip rails.
+    pub(super) fn suppress_edge_flags(&mut self, first: usize, second: usize) {
+        self.edge_flag_suppressions.push((first, second));
+    }
+
     /// Starts a rebuild with copied source points and identity point origins.
     pub(super) fn new(source_points: &[DVec3]) -> Self {
         Self {
@@ -1639,6 +1645,7 @@ impl Emission {
             polygons: Vec::new(),
             seam_edges: Vec::new(),
             sharp_edges: Vec::new(),
+            edge_flag_suppressions: Vec::new(),
         }
     }
 
@@ -2558,6 +2565,30 @@ fn mark_output_edge_flag(mesh: &mut Mesh, edge_index: usize, name: &str) {
         flag.insert(name.to_owned(), Value::Bool(true));
     }
 }
+fn clear_output_edge_flag(mesh: &mut Mesh, edge_index: usize, name: &str) {
+    if name == "sharp"
+        && let Some(edge_key) = mesh
+            .edges
+            .get(edge_index)
+            .map(|edge| format!("e{}", edge.id))
+        && let Some(values) = mesh
+            .attributes
+            .get_mut("sharp")
+            .and_then(|attribute| attribute.get_mut("values"))
+            .and_then(Value::as_object_mut)
+    {
+        values.remove(&edge_key);
+    }
+    if let Some(flag) = mesh
+        .attributes
+        .get_mut("blender_edge_flags")
+        .and_then(Value::as_array_mut)
+        .and_then(|flags| flags.get_mut(edge_index))
+        .and_then(Value::as_object_mut)
+    {
+        flag.remove(name);
+    }
+}
 
 /// Blender's face projection for `BM_loop_interp_from_face`.
 struct BevelFaceProjection {
@@ -3108,6 +3139,7 @@ pub(super) fn finish(
         polygons: emitted_polygons,
         seam_edges: emitted_seam_edges,
         sharp_edges: emitted_sharp_edges,
+        edge_flag_suppressions: emitted_edge_flag_suppressions,
     } = emission;
     let mut used = vec![false; emitted_points.len()];
     for polygon in &emitted_polygons {
@@ -3378,13 +3410,25 @@ pub(super) fn finish(
         .collect();
     let mut result =
         build_mesh_with_edge_identity(points, polygons, loose, &origin, Some(&identities), mesh)?;
-    if !emitted_seam_edges.is_empty() || !emitted_sharp_edges.is_empty() {
+    if !emitted_edge_flag_suppressions.is_empty()
+        || !emitted_seam_edges.is_empty()
+        || !emitted_sharp_edges.is_empty()
+    {
         let edge_index: HashMap<(u32, u32), usize> = result
             .edges
             .iter()
             .enumerate()
             .map(|(index, edge)| (edge_key(edge.vertices[0], edge.vertices[1]), index))
             .collect();
+        for (first, second) in emitted_edge_flag_suppressions {
+            let first = result.vertices[remap[first]].id;
+            let second = result.vertices[remap[second]].id;
+            let Some(index) = edge_index.get(&edge_key(first, second)) else {
+                continue;
+            };
+            clear_output_edge_flag(&mut result, *index, "sharp");
+            clear_output_edge_flag(&mut result, *index, "seam");
+        }
         for (edges, name) in [(emitted_seam_edges, "seam"), (emitted_sharp_edges, "sharp")] {
             for (first, second) in edges {
                 let first = result.vertices[remap[first]].id;

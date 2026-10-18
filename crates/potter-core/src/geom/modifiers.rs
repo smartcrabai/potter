@@ -305,7 +305,7 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
             "subdivision" | "multires" => subdivision(&evaluated, modifier, context)?,
             "solidify" => solidify(&evaluated, modifier)?,
             "triangulate" => triangulate(&evaluated, modifier)?,
-            "bevel" => bevel(&evaluated, modifier)?,
+            "bevel" => bevel(&evaluated, modifier, context)?,
             "decimate" => without_custom_normals(decimate(&evaluated, modifier)?),
             "weld" => weld(&evaluated, modifier)?,
             "displace" => displace(&evaluated, modifier, owner_world_matrix)?,
@@ -3545,7 +3545,7 @@ fn mesh_attribute_values(mesh: &Mesh, name: &str) -> Option<Vec<Value>> {
     clippy::too_many_lines,
     reason = "bevel parses its settings, selects beveled elements, then runs the front end, topology, and shading"
 )]
-fn bevel(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
+fn bevel(mesh: &Mesh, modifier: &Modifier, context: ModifierEvaluationContext<'_>) -> Result<Mesh> {
     validated(mesh)?;
     let offset_type = bevel_choice(
         modifier,
@@ -3686,16 +3686,22 @@ fn bevel(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             "FSTR_NONE, FSTR_NEW, FSTR_AFFECTED, or FSTR_ALL",
         ));
     }
+    let material_slot_count = context
+        .material_slot_count
+        .unwrap_or_else(|| contextless_material_slot_count(mesh));
+    let material_upper_bound = i64::try_from(material_slot_count)
+        .unwrap_or(i64::MAX)
+        .saturating_sub(1);
     let material = match parameter_value(modifier, "material") {
         None => -1,
         Some(value) => value
             .as_i64()
             .filter(|value| (-1..=32767).contains(value))
+            .map(|value| value.clamp(-1, material_upper_bound))
             .ok_or_else(|| {
                 invalid_parameter(modifier, "material", "an integer from -1 through 32767")
             })?,
     };
-    let invert_vertex_group = bool_param(modifier, "invert_vertex_group")?;
 
     let source_points = positions(mesh);
     let source_polygons = polygons(mesh)?;
@@ -3989,14 +3995,13 @@ fn bevel(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         &float2_layers,
         source_loop_topology.as_ref(),
     )?;
-    let reconstructed = reconstructed_source_faces(&result, &source_points, &source_polygons);
     bevel_shading::shade_output(
         &mut result,
         &kinds,
         harden_normals,
         clnor::corner_codes(mesh)?.is_some(),
     )?;
-    apply_bevel_face_strength(&mut result, &face_strength_mode, &kinds, &reconstructed)?;
+    apply_bevel_face_strength(&mut result, &face_strength_mode, &kinds)?;
     Ok(result)
 }
 
@@ -4022,35 +4027,10 @@ fn bevel_choice<T: Copy>(
         .ok_or_else(|| invalid_parameter(modifier, name, expected))
 }
 
-fn reconstructed_source_faces(
-    result: &Mesh,
-    source_points: &[DVec3],
-    source_polygons: &[Polygon],
-) -> Vec<bool> {
-    let points = positions(result);
-    let indices = id_indices(result);
-    source_polygons
-        .iter()
-        .enumerate()
-        .map(|(face_index, (source_face, _))| {
-            let Some(output_face) = result.faces.get(face_index) else {
-                return true;
-            };
-            output_face.vertices.len() != source_face.len()
-                || output_face
-                    .vertices
-                    .iter()
-                    .zip(source_face)
-                    .any(|(id, source)| points[indices[id]] != source_points[*source])
-        })
-        .collect()
-}
-
 fn apply_bevel_face_strength(
     mesh: &mut Mesh,
     mode: &str,
     kinds: &[bevel_shading::Kind],
-    reconstructed: &[bool],
 ) -> Result<()> {
     if mode == "FSTR_NONE" {
         return Ok(());
@@ -4080,12 +4060,9 @@ fn apply_bevel_face_strength(
             .entry(format!("f{}", face.id))
             .or_insert_with(|| json!(0));
     }
-    for (index, (face, kind)) in mesh.faces.iter().zip(kinds).enumerate() {
+    for (face, kind) in mesh.faces.iter().zip(kinds) {
         let strength = match kind {
-            bevel_shading::Kind::Source
-                if mode == "FSTR_ALL"
-                    || (mode == "FSTR_AFFECTED" && reconstructed.get(index) == Some(&true)) =>
-            {
+            bevel_shading::Kind::Source if mode == "FSTR_ALL" || mode == "FSTR_AFFECTED" => {
                 Some(16_384)
             }
             bevel_shading::Kind::Original if mode == "FSTR_ALL" => Some(16_384),
@@ -4705,6 +4682,7 @@ mod tests {
 
     use crate::{
         error::{ErrorCode, PotError},
+        eval::ModifierEvaluationContext,
         geom::{
             BoxParams, Mesh,
             uv_layers::{self, UvLayer},
@@ -4712,7 +4690,10 @@ mod tests {
         model::{CurveData, CurvePoint, CurveSpline, Id, Modifier},
     };
 
-    use super::{check_subdivision_budget, evaluate_modifiers, evaluated_curve_path_length};
+    use super::{
+        bevel, check_subdivision_budget, evaluate_modifiers, evaluate_modifiers_with_scene_context,
+        evaluated_curve_path_length,
+    };
 
     fn modifier(enabled: bool, modifier_type: &str) -> Modifier {
         Modifier {
@@ -5259,6 +5240,74 @@ mod tests {
         assert_eq!(result.faces.len(), 26);
         assert_eq!(result.vertices.len(), 24);
         assert!(result.validate().is_ok());
+    }
+
+    #[test]
+    fn bevel_material_override_clamps_to_evaluated_slot_count() {
+        let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
+        for face in &mut mesh.faces {
+            face.material_index = 5;
+        }
+        let modifier = with_params("bevel", json!({"width": 0.1, "material": 32767}));
+        let result = bevel(
+            &mesh,
+            &modifier,
+            ModifierEvaluationContext {
+                material_slot_count: Some(2),
+                ..ModifierEvaluationContext::default()
+            },
+        )
+        .unwrap();
+        assert!(result.faces.iter().any(|face| face.material_index == 1));
+        assert!(
+            result
+                .faces
+                .iter()
+                .filter(|face| face.material_index != 5)
+                .all(|face| face.material_index == 1)
+        );
+    }
+
+    #[test]
+    fn scene_callback_refreshes_material_slot_count_before_bevel() {
+        let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
+        for face in &mut mesh.faces {
+            face.material_index = 5;
+        }
+        let modifiers = [
+            modifier(true, "lattice"),
+            with_params("bevel", json!({"width": 0.1, "material": 32767})),
+        ];
+        let result = evaluate_modifiers_with_scene_context(
+            mesh,
+            &modifiers,
+            &std::collections::BTreeMap::new(),
+            1.0,
+            DMat4::IDENTITY,
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
+            ModifierEvaluationContext {
+                material_slot_count: Some(6),
+                ..ModifierEvaluationContext::default()
+            },
+            |_, modifier| modifier.enabled,
+            |_, modifier, _| {
+                assert_eq!(modifier.modifier_type, "lattice");
+                Ok(Some(2))
+            },
+        )
+        .unwrap()
+        .mesh;
+        assert!(result.faces.iter().any(|face| face.material_index == 1));
+        assert!(
+            result
+                .faces
+                .iter()
+                .filter(|face| face.material_index != 5)
+                .all(|face| face.material_index == 1)
+        );
     }
 
     #[test]

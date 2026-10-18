@@ -64,6 +64,10 @@ def shape_data():
         (0, 3, 2, 1), (4, 5, 6, 7), (0, 1, 5, 4),
         (1, 2, 6, 5), (2, 3, 7, 6), (3, 0, 4, 7),
     ]
+    small_cube_vertices = [tuple(component * 1e-4 for component in vertex) for vertex in cube_vertices]
+    wire_cube_vertices = cube_vertices + [
+        (0, -1, -1), (0.5, -1, -1), (-1, -0.5, 0), (-1, 0.5, 0),
+    ]
     tetra_vertices = [(1, 1, 1), (-1, -1, 1), (-1, 1, -1), (1, -1, -1)]
     tetra_faces = orient_closed_faces(tetra_vertices, [(0, 1, 2), (0, 3, 1), (0, 2, 3), (1, 3, 2)])
     base = [(0, 0, 0), (2, 0, 0), (1.7, 1.0, 0), (-0.2, 1.2, 0)]
@@ -113,6 +117,9 @@ def shape_data():
     open_fan_faces = [(0, k, k + 1) for k in range(1, 5)]
     return {
         'cube': (cube_vertices, cube_faces),
+        'cube_review': (cube_vertices, cube_faces),
+        'small_cube': (small_cube_vertices, cube_faces),
+        'cube_wire_vertices': (wire_cube_vertices, cube_faces),
         'tetrahedron': (tetra_vertices, tetra_faces),
         'oblique_prism': (prism_vertices, prism_faces),
         'valence4_pyramid': (pyramid_vertices, pyramid_faces),
@@ -131,9 +138,9 @@ def shape_data():
     }
 
 
-def make_object(name, vertices, faces, custom_normals):
+def make_object(name, vertices, faces, custom_normals, edges=()):
     mesh = bpy.data.meshes.new(name + '_mesh')
-    mesh.from_pydata(vertices, [], faces)
+    mesh.from_pydata(vertices, edges, faces)
     mesh.update()
     obj = bpy.data.objects.new(name, mesh)
     bpy.context.scene.collection.objects.link(obj)
@@ -450,6 +457,7 @@ def evaluate(obj, shape, name, config):
     modifier.harden_normals = parameters['harden_normals']
     modifier.face_strength_mode = parameters['face_strength_mode']
     modifier.material = parameters['material']
+    parameters['material'] = int(modifier.material)
     if parameters['profile_type'] == 'CUSTOM':
         apply_custom_profile(modifier.custom_profile, custom_spec or {})
         parameters['custom_profile'] = capture_profile(modifier.custom_profile)
@@ -539,8 +547,41 @@ shape_inputs = shape_data()
 objects = {}
 inputs = {}
 for shape_name, (vertices, faces) in shape_inputs.items():
-    objects[shape_name], inputs[shape_name] = make_object(shape_name, vertices, faces, True)
+    extra_edges = ((8, 9), (10, 11)) if shape_name == 'cube_wire_vertices' else ()
+    objects[shape_name], inputs[shape_name] = make_object(
+        shape_name, vertices, faces, True, extra_edges)
 cube_vertices, cube_faces = shape_inputs['cube']
+review_selected_edges = {edge_key(0, 1), edge_key(1, 2)}
+review_mesh = objects['cube_review'].data
+review_weight = review_mesh.attributes.get('bevel_weight_edge')
+for edge in review_mesh.edges:
+    selected = edge_key(*edge.vertices) in review_selected_edges
+    weight = 1.0 if selected else 0.0
+    review_weight.data[edge.index].value = weight
+    inputs['cube_review']['edges'][edge.index]['bevel_weight'] = f32(weight)
+    if selected:
+        edge.use_seam = True
+        edge.use_edge_sharp = True
+        inputs['cube_review']['edges'][edge.index]['seam'] = True
+        inputs['cube_review']['edges'][edge.index]['sharp'] = True
+review_face_edges = [
+    {edge_key(first, second) for first, second in zip(face, face[1:] + face[:1])}
+    for face in cube_faces
+]
+assert any(len(face_edges & review_selected_edges) == 2 for face_edges in review_face_edges)
+assert any(not face_edges & review_selected_edges for face_edges in review_face_edges)
+assert sum(edge['bevel_weight'] == f32(1.0) for edge in inputs['cube_review']['edges']) == 2
+assert len(objects['cube'].material_slots) == 2
+wire_vertex_start = len(cube_vertices)
+wire_vertices = shape_inputs['cube_wire_vertices'][0][wire_vertex_start:]
+wire_faces = shape_inputs['cube_wire_vertices'][1]
+assert len(wire_vertices) >= 2
+assert all(not any(index in face for face in wire_faces)
+           for index in range(wire_vertex_start, wire_vertex_start + len(wire_vertices)))
+assert all(any(abs(component) == 1 for component in vertex) for vertex in wire_vertices)
+assert {edge_key(8, 9), edge_key(10, 11)} <= {
+    edge_key(*edge['vertices']) for edge in inputs['cube_wire_vertices']['edges']
+}
 
 
 def max_valence(faces):
@@ -768,6 +809,14 @@ cases.extend([
         'segments': 2, 'profile': 0.5, 'affect': 'VERTICES', 'offset_type': 'OFFSET',
         'face_strength_mode': 'FSTR_AFFECTED', 'material': 0,
     }),
+    evaluate(objects['cube_review'], 'cube_review', 'cube_review_fstr_affected_reconstructed_s2', {
+        'segments': 2, 'profile': 0.5, 'affect': 'EDGES', 'offset_type': 'OFFSET',
+        'limit_method': 'WEIGHT', 'face_strength_mode': 'FSTR_AFFECTED',
+    }),
+    evaluate(objects['cube_review'], 'cube_review', 'cube_review_mark_seam_sharp_interior_rails_s4', {
+        'segments': 4, 'profile': 0.5, 'affect': 'EDGES', 'offset_type': 'OFFSET',
+        'limit_method': 'WEIGHT', 'mark_seam': True, 'mark_sharp': True,
+    }),
     evaluate(objects['cube'], 'cube', 'cube_fstr_all_s1_p100', {
         'segments': 1, 'profile': 1.0, 'affect': 'EDGES', 'offset_type': 'OFFSET',
         'face_strength_mode': 'FSTR_ALL',
@@ -785,6 +834,19 @@ cases.extend([
                  'segments': 2, 'profile': 0.5, 'affect': 'EDGES', 'offset_type': 'OFFSET',
                  'material': 0, 'face_strength_mode': 'FSTR_ALL',
              }),
+    evaluate(objects['small_cube'], 'small_cube', 'small_cube_s3_p50_width_2e5', {
+        'segments': 3, 'profile': 0.5, 'affect': 'EDGES', 'offset_type': 'OFFSET',
+        'width': 2e-5,
+    }),
+    evaluate(objects['cube_wire_vertices'], 'cube_wire_vertices', 'cube_wire_vertices_s3', {
+        'segments': 3, 'profile': 0.5, 'affect': 'EDGES', 'offset_type': 'OFFSET',
+    }),
+    evaluate(objects['cube'], 'cube', 'cube_material_override_below_min_s2', {
+        'segments': 2, 'profile': 0.5, 'affect': 'EDGES', 'offset_type': 'OFFSET', 'material': -5,
+    }),
+    evaluate(objects['cube'], 'cube', 'cube_material_override_above_slot_range_s2', {
+        'segments': 2, 'profile': 0.5, 'affect': 'EDGES', 'offset_type': 'OFFSET', 'material': 2,
+    }),
     evaluate(objects['cube'], 'cube', 'cube_custom_free_handles_s3', {
         'segments': 3, 'profile': 0.5, 'affect': 'EDGES', 'offset_type': 'OFFSET',
         'profile_type': 'CUSTOM',
@@ -820,6 +882,15 @@ cases.extend([
         'segments': 6, 'profile': 0.5, 'affect': 'EDGES', 'offset_type': 'OFFSET',
         'profile_type': 'CUSTOM',
         'custom_profile': {'points': [((0.25, 0.5), 'AUTO', 'AUTO')], 'use_sample_even_lengths': True},
+    }),
+    evaluate(objects['cube'], 'cube', 'cube_custom_profile_sampled_fullness_s4', {
+        'segments': 4, 'profile': 0.25, 'affect': 'EDGES', 'offset_type': 'OFFSET',
+        'profile_type': 'CUSTOM',
+        'custom_profile': {
+            'points': [((0.5, 0.85), 'VECTOR', 'VECTOR')],
+            'use_sample_straight_edges': True,
+            'use_sample_even_lengths': True,
+        },
     }),
 ])
 # Open-boundary corpus: each surface omits a face, so its rim edges have one face. With EDGES affect
@@ -917,6 +988,15 @@ assert all(len(point['handle_1']) == 2 and len(point['handle_2']) == 2 for point
 assert custom_profile_case['parameters']['custom_profile']['use_clip'] is True
 assert custom_profile_case['parameters']['custom_profile']['use_sample_straight_edges'] is False
 assert custom_profile_case['parameters']['custom_profile']['use_sample_even_lengths'] is False
+sampled_fullness_case = next(case for case in cases
+                             if case['name'] == 'cube_custom_profile_sampled_fullness_s4')
+sampled_profile = sampled_fullness_case['parameters']['custom_profile']
+sampled_profile_point = next(point for point in sampled_profile['points']
+                             if point['location'] == [f32_round(0.5), f32_round(0.85)])
+assert sampled_fullness_case['parameters']['profile'] == 0.25
+assert sum(sampled_profile_point['location']) > 1.0
+assert sampled_profile['use_sample_straight_edges'] is True
+assert sampled_profile['use_sample_even_lengths'] is True
 
 assert {case['parameters']['miter_outer'] for case in cases} == {
     'MITER_SHARP', 'MITER_PATCH', 'MITER_ARC'}
@@ -926,7 +1006,7 @@ assert {case['parameters']['limit_method'] for case in cases} == {
     'NONE', 'ANGLE', 'WEIGHT', 'VGROUP'}
 assert {case['parameters']['face_strength_mode'] for case in cases} == {
     'FSTR_NONE', 'FSTR_NEW', 'FSTR_AFFECTED', 'FSTR_ALL'}
-assert {case['parameters']['material'] for case in cases} == {-1, 0, 1}
+assert {case['parameters']['material'] for case in cases} == {-5, -1, 0, 1, 2}
 assert any(case['parameters']['mark_sharp'] for case in cases)
 assert any(case['parameters']['mark_seam'] for case in cases)
 assert any(case['parameters']['harden_normals'] for case in cases)

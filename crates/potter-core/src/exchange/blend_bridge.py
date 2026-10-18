@@ -317,6 +317,30 @@ def _curve_profile_params(profile):
     }
 
 
+def _line_curve_profile_params():
+    return {
+        "points": [
+            {
+                "location": [1.0, 0.0],
+                "handle_1": [1.0, 0.0],
+                "handle_2": [1.0, 0.0],
+                "handle_type_1": "AUTO",
+                "handle_type_2": "AUTO",
+            },
+            {
+                "location": [0.0, 1.0],
+                "handle_1": [0.0, 1.0],
+                "handle_2": [0.0, 1.0],
+                "handle_type_1": "AUTO",
+                "handle_type_2": "AUTO",
+            },
+        ],
+        "use_clip": True,
+        "use_sample_straight_edges": False,
+        "use_sample_even_lengths": False,
+    }
+
+
 def _curve_profile_vec2(point, key):
     value = point.get(key)
     if not isinstance(value, (list, tuple)) or len(value) != 2:
@@ -457,8 +481,11 @@ def modifier_params(modifier):
     if modifier.type in ("VERTEX_WEIGHT_EDIT", "VERTEX_WEIGHT_PROXIMITY"):
         omitted += ("map_curve",)
     params = rna_props(modifier, omitted)
-    if modifier.type == "BEVEL" and getattr(modifier, "profile_type", None) == "CUSTOM":
-        params["custom_profile"] = _curve_profile_params(modifier.custom_profile)
+    if modifier.type == "BEVEL":
+        if getattr(modifier, "profile_type", None) == "CUSTOM":
+            params["custom_profile"] = _curve_profile_params(modifier.custom_profile)
+        else:
+            params["custom_profile"] = _line_curve_profile_params()
     if modifier.type in ("VERTEX_WEIGHT_EDIT", "VERTEX_WEIGHT_PROXIMITY"):
         params["map_curve"] = _curve_mapping_points(modifier.map_curve)
     bound_property = "is_bound" if hasattr(modifier, "is_bound") else "is_bind"
@@ -2747,11 +2774,13 @@ def set_modifier_params(modifier, item, id_lookup, doc, target, node_id, obj):
     rna_params = dict(params)
     if modifier.type == "BEVEL":
         rna_params.pop("custom_profile", None)
-        if params.get("profile_type") == "CUSTOM":
-            custom_profile_values = params.get("custom_profile")
+        if "custom_profile" in params:
+            custom_profile_values = params["custom_profile"]
             if (not isinstance(custom_profile_values, dict)
                     or not isinstance(custom_profile_values.get("points"), list)):
                 raise ValueError("custom bevel profile points are missing from modifier params")
+        else:
+            custom_profile_values = _line_curve_profile_params()
     for parameter in ("projectors", "resource", "is_bound", "cache_filepath", "map_curve"):
         rna_params.pop(parameter, None)
     set_rna(modifier, rna_params, id_lookup)

@@ -13,9 +13,9 @@ use super::Polygon;
 use super::bevel_boundary::{EdgeHalf, Front, MeshKind, PRO_SQUARE_IN_R, PRO_SQUARE_R};
 use super::bevel_shading::Kind;
 use super::bevel_vmesh::{
-    Emission, PRO_LINE_R, Profile, ProfileSpacing, VMesh, bounds_center, cube_corner_vmesh,
-    general_vmesh, pipe_adj_vmesh, point_strictly_inside, profile_fullness, project_to_face,
-    square_out_adj_vmesh, two_edge_vertex_samples, weld_profile_samples,
+    Emission, PRO_LINE_R, Profile, ProfileSpacing, VMesh, bounds_center, closest_on_segment,
+    cube_corner_vmesh, general_vmesh, pipe_adj_vmesh, point_strictly_inside, profile_fullness,
+    project_to_face, square_out_adj_vmesh, two_edge_vertex_samples, weld_profile_samples,
 };
 use crate::geom::edge_key;
 
@@ -86,6 +86,8 @@ pub(super) struct Builder<'a> {
     /// Blender's `bndv->index`: each boundary vertex's position in its vertex's ring.
     positions: Vec<usize>,
     emission: Emission,
+    /// Source vertices touched by an input face, computed once during construction.
+    vertex_has_face: Vec<bool>,
     wire_edges: Vec<Vec<(usize, usize)>>,
     /// Wire edges the topology reattaches or creates.
     loose: Vec<[usize; 2]>,
@@ -203,16 +205,6 @@ fn incident_neighbors(polygons: &[Polygon], face: usize, vertex: usize) -> Optio
     }
 }
 
-/// Blender's `closest_to_line_segment_v3`: the point of segment `a`-`b` nearest `p`.
-fn closest_on_segment(p: DVec3, a: DVec3, b: DVec3) -> DVec3 {
-    let direction = b - a;
-    let length_squared = direction.length_squared();
-    if length_squared == 0.0 {
-        return a;
-    }
-    a + direction * ((p - a).dot(direction) / length_squared).clamp(0.0, 1.0)
-}
-
 /// Blender's `find_closer_edge`: of the edges `vertex`-`first` and `vertex`-`second`, the one whose
 /// segment is nearer `co`, as its endpoint pair.
 fn closer_edge(
@@ -309,9 +301,7 @@ impl<'a> Builder<'a> {
     /// polygon; its profile is the only topology, and without faces at the vertex that profile chain
     /// is made of wire edges.
     fn emit_two_edge(&mut self, vertex: usize) {
-        if !self.front.p.affect_vertices
-            || self.polygons.iter().any(|(face, _)| face.contains(&vertex))
-        {
+        if !self.front.p.affect_vertices || self.vertex_has_face[vertex] {
             return;
         }
         let seg = self.front.p.seg;
@@ -326,6 +316,7 @@ impl<'a> Builder<'a> {
             previous = current;
         }
     }
+
     fn new(
         front: &'a Front,
         points: &'a [DVec3],
@@ -338,15 +329,21 @@ impl<'a> Builder<'a> {
                 positions[*id] = index;
             }
         }
+        let mut vertex_has_face = vec![false; front.verts.len()];
+        let mut face_edges = HashSet::new();
+        for (face, _) in polygons {
+            for index in 0..face.len() {
+                let first = face[index];
+                let second = face[(index + 1) % face.len()];
+                vertex_has_face[first] = true;
+                if !front.p.affect_vertices {
+                    face_edges.insert(edge_key(first, second));
+                }
+            }
+        }
         let wire_edges = if front.p.affect_vertices {
             Vec::new()
         } else {
-            let mut face_edges = HashSet::new();
-            for (face, _) in polygons {
-                for index in 0..face.len() {
-                    face_edges.insert(edge_key(face[index], face[(index + 1) % face.len()]));
-                }
-            }
             let mut wire_edges = vec![Vec::new(); front.verts.len()];
             for &(first, second) in &front.geo.edge_order {
                 if !face_edges.contains(&edge_key(first, second)) {
@@ -366,6 +363,7 @@ impl<'a> Builder<'a> {
             square_in: vec![false; front.verts.len()],
             positions,
             emission: Emission::new(points),
+            vertex_has_face,
             wire_edges,
             loose: Vec::new(),
         }
@@ -717,7 +715,19 @@ impl<'a> Builder<'a> {
             .iter()
             .map(|id| Profile::from_bound(&self.front.bounds[*id].profile, seg, seg_2))
             .collect();
-        let fullness = profile_fullness(seg, self.front.p.profile, self.front.p.pro_super_r);
+        let fullness = if self.front.p.custom.is_some() {
+            let denominator = 2.0 * seg as f64;
+            self.front
+                .pro_spacing
+                .xvals
+                .iter()
+                .zip(&self.front.pro_spacing.yvals)
+                .take(seg)
+                .map(|(x, y)| (x + y) / denominator)
+                .sum()
+        } else {
+            profile_fullness(seg, self.front.p.profile, self.front.p.pro_super_r)
+        };
         general_vmesh(
             seg,
             fullness,
@@ -1416,6 +1426,11 @@ impl<'a> Builder<'a> {
                 face,
                 Kind::Strip,
             );
+            if k < nseg
+                && let (Some(first), Some(second)) = (top[0], top[1])
+            {
+                self.emission.suppress_edge_flags(first, second);
+            }
             verts = [top[0], top[1]];
         }
         let (sharp, seam) = self.front.input_edge_flags_by_id(e1.edge_id);
