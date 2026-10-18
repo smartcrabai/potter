@@ -952,12 +952,11 @@ fn mesh_deform_nonuniform_bind_transform_matches_blender_translation() -> TestRe
         .map(|index| {
             let rest = flat_subject(index);
             [
-                // A uniform cage-local translation T maps to inv(S_lin) * C_lin * T in subject-local space
-                // (S_lin: subject world linear, C_lin: cage world linear); the harmonic weights reproduce
-                // translations exactly, so every vertex is rest + that constant.
-                rest[0] + 0.295_054_569_956,
-                rest[1] - 0.272_824_308_298,
-                rest[2] + 0.733_333_333_333,
+                // Blender 5.2.2 output of mesh_nonuniform_translation (generate_mesh_deform_exact_oracle.py),
+                // vertex 12 at rest (0, 0, 0). It agrees with inv(S_lin) * C_lin * T to about 1e-7.
+                rest[0] + 0.295_054_555,
+                rest[1] - 0.272_824_258,
+                rest[2] + 0.733_333_349,
             ]
         })
         .collect::<Vec<_>>();
@@ -977,11 +976,11 @@ fn mesh_deform_precision_dynamic_weights_and_nonuniform_transforms_match_blender
             false,
             false,
             [
-                [-1.0, -1.0, 0.0],
-                [-0.5, -0.5, 0.0],
-                [0.0, 0.0, 0.0],
-                [0.5, 0.5, 0.0],
-                [1.0, 1.0, 0.0],
+                [-0.999_766_111, -0.999_860_168, 0.003_000_149],
+                [-0.499_030_650, -0.499_423_414, 0.005_158_576],
+                [0.003_940_156, 0.002_502_045, -0.000_143_838],
+                [0.509_198_487, 0.505_932_748, -0.012_377_135],
+                [1.015_485_764, 1.009_996_057, -0.027_042_029],
             ],
         ),
         (
@@ -990,11 +989,11 @@ fn mesh_deform_precision_dynamic_weights_and_nonuniform_transforms_match_blender
             false,
             false,
             [
-                [-1.0, -1.0, 0.003_918_329],
-                [-0.5, -0.5, 0.0],
-                [0.0, 0.0, 0.0],
-                [0.5, 0.5, 0.0],
-                [1.0, 1.0, 0.0],
+                [-1.0, -1.0, 0.0],
+                [-0.499_120_027, -0.499_419_659, 0.005_543_638],
+                [0.003_891_449, 0.002_587_060, -0.000_233_018],
+                [0.509_109_735, 0.506_058_455, -0.012_536_480],
+                [1.016_342_759, 1.010_855_317, -0.030_186_351],
             ],
         ),
         (
@@ -1003,11 +1002,11 @@ fn mesh_deform_precision_dynamic_weights_and_nonuniform_transforms_match_blender
             true,
             true,
             [
-                [-1.0, -1.0, 0.022_203_874],
-                [-0.5, -0.5, 0.0],
-                [0.0, 0.0, 0.0],
-                [0.5, 0.5, 0.0],
-                [1.0, 1.0, 0.0],
+                [-1.0, -1.0, 0.0],
+                [-0.498_365_790, -0.498_922_199, 0.010_295_324],
+                [0.003_183_914, 0.002_116_686, -0.000_190_652],
+                [0.503_036_559, 0.502_019_465, -0.004_178_827],
+                [1.000_860_095, 1.000_571_370, -0.001_588_756],
             ],
         ),
     ];
