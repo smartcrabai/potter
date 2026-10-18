@@ -1646,6 +1646,16 @@ fn triangulate_face(
                 ))
         })
         .collect::<Result<_, _>>()?;
+    if blender_quads {
+        let corners: Vec<[f32; 3]> = points
+            .iter()
+            .map(|point| [point.x as f32, point.y as f32, point.z as f32])
+            .collect();
+        return Ok(triangulate::loop_triangles(&corners)
+            .into_iter()
+            .map(|[a, b, c]| [face.vertices[a], face.vertices[b], face.vertices[c]])
+            .collect());
+    }
     let normal = points
         .iter()
         .zip(points.iter().cycle().skip(1))
@@ -1685,16 +1695,6 @@ fn triangulate_face(
     let epsilon = f64::EPSILON * scale * scale * 32.0;
     if !twice_area.is_finite() || twice_area.abs() <= epsilon {
         return Err(MeshError::TriangulationFailed(face.id));
-    }
-    if blender_quads && let [first, second, third, fourth] = face.vertices[..] {
-        // Blender's quad tessellation: the 0-2 diagonal from the face's first corner, flipped to the
-        // 1-3 diagonal when `is_quad_flip_v3_first_third_fast` says the 0-2 split folds over.
-        let flip = quad_flip_first_third(points[0], points[1], points[2], points[3]);
-        return Ok(if flip {
-            vec![[first, second, fourth], [second, third, fourth]]
-        } else {
-            vec![[first, second, third], [first, third, fourth]]
-        });
     }
     let orientation = twice_area.signum();
     let mut remaining: Vec<usize> = (0..face.vertices.len()).collect();
@@ -1745,15 +1745,6 @@ fn triangulate_face(
         face.vertices[remaining[2]],
     ]);
     Ok(triangles)
-}
-
-/// `is_quad_flip_v3_first_third_fast` (Blender `math_geom.cc`): whether the 0-2 split of the quad
-/// `v1 v2 v3 v4` is degenerate and the split must use the 1-3 diagonal.
-fn quad_flip_first_third(v1: DVec3, v2: DVec3, v3: DVec3, v4: DVec3) -> bool {
-    let d12 = v2 - v1;
-    let d13 = v3 - v1;
-    let d14 = v4 - v1;
-    d12.cross(d13).dot(d14.cross(d13)) > 0.0
 }
 
 fn cross2(a: DVec2, b: DVec2) -> f64 {
