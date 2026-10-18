@@ -320,7 +320,11 @@ fn build_float_output(subject: &Mesh, operand: &Mesh, state: &State) -> Result<F
             edge_orig,
         });
     }
-
+    // Blender's output follows BMesh slot order, and `mesh_bm_concat` creates subject faces first
+    // (`geometry_mesh_boolean.cc:1000`), so surviving subject faces precede operand faces. Slot reuse
+    // after a kill (LIFO) is not modelled; this is the observed order for the corpus.
+    let subject_face_count = i32::try_from(subject.faces.len()).unwrap_or(i32::MAX);
+    polygons.sort_by_key(|polygon| polygon.orig >= subject_face_count);
     let mut mesh = Mesh::new();
     let mut state_vertex_ids = vec![None; state.verts.len()];
     for polygon in &polygons {
