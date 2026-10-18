@@ -563,12 +563,11 @@ pub(super) fn encode_byte_colors(source: &Mesh, origin: &Origin, output: &mut Me
         .map(|(index, vertex)| (vertex.id, index))
         .collect();
     let derived;
-    let corners: &[Vec<(usize, f64)>] = match &origin.corners {
-        Some(corners) => corners,
-        None => {
-            derived = corner_sources(source, origin, output, &output_vertex_index);
-            &derived
-        }
+    let corners: &[Vec<(usize, f64)>] = if let Some(corners) = &origin.corners {
+        corners
+    } else {
+        derived = corner_sources(source, origin, output, &output_vertex_index);
+        &derived
     };
     for layer in &mut store.layers {
         if !byte_layers.contains(layer.name.as_str()) {
