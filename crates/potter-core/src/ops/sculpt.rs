@@ -629,7 +629,7 @@ fn apply_multires(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Re
                     ("levels".to_owned(), json!(levels)),
                     ("sculpt_levels".to_owned(), json!(levels)),
                     ("render_levels".to_owned(), json!(render_levels)),
-                    ("total_levels".to_owned(), json!(levels)),
+                    ("total_levels".to_owned(), json!(total_levels)),
                 ]),
                 binding_data: None,
                 runtime: crate::model::ModifierRuntime::default(),
