@@ -6475,7 +6475,8 @@ fn import_skins(
                         envelope_weight: 1.0,
                         head_radius: 0.1,
                         tail_radius: 0.1,
-                        bbone_settings: BTreeMap::new(),
+                        select: false,
+                        bbone_settings: std::collections::BTreeMap::new(),
                     },
                 );
             }

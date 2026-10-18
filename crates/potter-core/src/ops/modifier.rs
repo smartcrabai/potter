@@ -1141,15 +1141,13 @@ fn evaluate_modifier_output(
                 "uv_warp" => ["object_from", "object_to"]
                     .iter()
                     .any(|key| modifier.params.get(*key).is_some_and(Value::is_string)),
-                "armature" => true,
-                "cast" => modifier.params.get("object").is_some_and(Value::is_string),
+                "armature" | "displace" | "wave" | "warp" => true,
+                "cast" | "screw" => modifier.params.get("object").is_some_and(Value::is_string),
                 "simple_deform" => modifier.params.get("origin").is_some_and(Value::is_string),
-                "displace" | "wave" | "warp" => true,
                 "vertex_weight_edit" | "vertex_weight_mix" => modifier
                     .params
                     .get("mask_tex_map_object")
                     .is_some_and(Value::is_string),
-                "screw" => modifier.params.get("object").is_some_and(Value::is_string),
                 "array" => {
                     (modifier.params.get("fit_type").and_then(Value::as_str) == Some("FIT_CURVE")
                         && modifier.params.get("curve").is_some_and(Value::is_string))

@@ -482,6 +482,7 @@ impl Snapshot {
                 modifier_context,
                 None,
                 None,
+                &suppressed,
                 &mesh_dependencies,
                 None,
                 None,
@@ -2766,7 +2767,7 @@ fn add_modifier_pose_armature_references(
     for (object_parameter, bone_parameter) in pose_reference_parameters {
         let Some(object_text) = modifier
             .params
-            .get(object_parameter)
+            .get(*object_parameter)
             .and_then(Value::as_str)
             .filter(|text| !text.is_empty())
         else {
@@ -2783,7 +2784,7 @@ fn add_modifier_pose_armature_references(
         }
         let Some(bone_name) = modifier
             .params
-            .get(bone_parameter)
+            .get(*bone_parameter)
             .and_then(Value::as_str)
             .filter(|name| !name.is_empty())
         else {
@@ -3855,7 +3856,8 @@ fn apply_generic_scene_mesh_operand_modifier(
     if matches!(modifier.modifier_type.as_str(), "shrinkwrap" | "curve") {
         resolved.runtime.target_mesh = Some(operand);
     } else {
-        resolved.runtime.operand_mesh = Some(operand);
+        resolved.runtime.operand_mesh =
+            Some(serde_json::to_value(operand).map_err(PotError::internal_json)?);
     }
     *mesh = crate::geom::modifiers::evaluate_modifiers(
         mesh,
@@ -4089,7 +4091,8 @@ pub(crate) fn apply_scene_operand_modifier(
     if matches!(modifier.modifier_type.as_str(), "shrinkwrap" | "curve") {
         resolved.runtime.target_mesh = Some(operand);
     } else {
-        resolved.runtime.operand_mesh = Some(operand);
+        resolved.runtime.operand_mesh =
+            Some(serde_json::to_value(operand).map_err(PotError::internal_json)?);
     }
     *mesh = crate::geom::modifiers::evaluate_modifiers(
         mesh,

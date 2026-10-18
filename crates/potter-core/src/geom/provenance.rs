@@ -82,7 +82,7 @@ fn carrier_source(origin: &Origin, vertex: usize) -> Option<usize> {
         return exact[vertex];
     }
     match origin.vertices[vertex].as_slice() {
-        [(index, weight)] if *weight == 1.0 => Some(*index),
+        [(index, weight)] if weight.to_bits() == 1.0_f64.to_bits() => Some(*index),
         _ => None,
     }
 }

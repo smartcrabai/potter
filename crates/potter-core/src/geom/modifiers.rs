@@ -81,6 +81,10 @@ const MAX_SUBDIVISION_TRIANGLES: u128 = 100_000_000;
 const MAX_SUBDIVISION_MEMORY_BYTES: u128 = 8 * 1024 * 1024 * 1024;
 
 /// Build Blender's `SpaceTransform` pair from original world matrices in f32 operation order.
+#[expect(
+    dead_code,
+    reason = "shared f32 SpaceTransform helper is consumed by PR18-I after F"
+)]
 pub(crate) fn blender_space_transform_f32(local: DMat4, target: DMat4) -> ([f32; 16], [f32; 16]) {
     let local = local.to_cols_array().map(|value| value as f32);
     let target = target.to_cols_array().map(|value| value as f32);

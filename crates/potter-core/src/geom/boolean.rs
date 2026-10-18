@@ -623,7 +623,7 @@ pub fn boolean_mesh(source: &Mesh, operand: &Mesh, operation: &str) -> Result<Me
 /// The FLOAT-solver BSP Boolean with the operation already parsed (see [`boolean_mesh`]).
 ///
 /// shortcut: FLOAT is the pre-PR17 BSP until `PR17b` ports Blender's float path. EXACT never calls it.
-/// Blender's exact Boolean path omits point CD_ORIGINDEX from its output, including shortcuts.
+/// Blender's exact Boolean path omits point `CD_ORIGINDEX` from its output, including shortcuts.
 pub(crate) fn boolean_mesh_op(source: &Mesh, operand: &Mesh, operation: Operation) -> Result<Mesh> {
     let mut result = boolean_mesh_op_solve(source, operand, operation)?;
     result.attributes.remove(ORIGINDEX_ATTRIBUTE);

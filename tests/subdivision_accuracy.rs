@@ -1094,7 +1094,7 @@ fn compare_case(case: &Value, spec: &Value) -> TestResult<Errors> {
         binding_data: None,
         runtime: ModifierRuntime::default(),
     };
-    let actual = evaluate_modifiers(&mesh, &[modifier])?;
+    let actual = evaluate_modifiers(&mesh, &[modifier], name)?;
     let actual = potter_shape(&actual)?;
     let expected = oracle_shape(&case["expected"])?;
     compare_shapes(&actual, &expected).map_err(|message| format!("{name}: {message}").into())

@@ -1,7 +1,6 @@
 #![recursion_limit = "512"]
 #![expect(
     clippy::unwrap_used,
-    clippy::expect_used,
     reason = "Blender adapter fixtures use fixed valid paths and values"
 )]
 

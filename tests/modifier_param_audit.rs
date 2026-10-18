@@ -353,7 +353,10 @@ fn f_modifier_parameter_scenarios_match_blender() {
         .as_array_mut()
         .unwrap()
         .retain(|scenario| F_MODIFIERS.contains(&scenario["modifier"].as_str().unwrap()));
-    assert!(!scenarios["scenarios"].as_array().unwrap().is_empty());
+    assert_ne!(
+        scenarios["scenarios"].as_array().unwrap().as_slice(),
+        &[] as &[Value]
+    );
     let Some(blender) = blender_scenario_results(&scenarios) else {
         return;
     };

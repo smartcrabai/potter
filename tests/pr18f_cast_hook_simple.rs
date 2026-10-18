@@ -1,6 +1,7 @@
 #![expect(
     clippy::unwrap_used,
-    reason = "integration tests use concise assertions"
+    clippy::expect_used,
+    reason = "integration tests use concise assertions and fixture parsing"
 )]
 
 //! PR18-F deformation parity for Simple Deform, Cast, Hook and Curve against Blender 5.2.2.

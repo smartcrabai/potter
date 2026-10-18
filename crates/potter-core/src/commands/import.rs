@@ -843,7 +843,7 @@ mod tests {
             configure_blender_resources(&mut doc, &BTreeMap::new(), AssetPolicy::Link)?;
 
         assert_eq!(doc.resources[&inline_id], inline);
-        assert!(external.is_empty());
+        assert_eq!(external, Vec::<Value>::new());
         assert_eq!(warnings, Vec::<serde_json::Value>::new());
         Ok(())
     }

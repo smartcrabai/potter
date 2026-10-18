@@ -578,7 +578,7 @@ mod tests {
     #[test]
     fn every_leaf_is_reachable_from_the_root() {
         let tree = KdopTree::from_leaf_bounds(&leaves(37));
-        let mut seen = vec![false; 37];
+        let mut seen = [false; 37];
         let mut stack = vec![tree.root.expect("tree has leaves")];
         while let Some(node) = stack.pop() {
             match node {

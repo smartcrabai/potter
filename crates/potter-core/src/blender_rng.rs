@@ -3,6 +3,14 @@
 //! Blender's random-number generators, ported from `BLI_rand.hh`, `rand.cc`, `BLI_noise` and
 //! `BKE_particle.h` (`psys_frand`). Particle modifiers depend on these exact sequences.
 
+#![cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Particle and Ocean consumers use these shared RNG APIs when their slices rebase onto F"
+    )
+)]
+
 use std::sync::OnceLock;
 
 /// Blender's `BLI_noise_hash_uchar_512` table (`intern/noise_c.cc`).

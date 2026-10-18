@@ -640,7 +640,6 @@ mod tests {
                 "face_attr":{"domain":"face","type":"int","values":{"f30":8,"f40":9}}
             }).as_object().unwrap().clone(),
             next_id: crate::geom::IdCounters { vertex: 23, edge: 18, face: 41 },
-            ..Mesh::default()
         }
     }
 
