@@ -1160,7 +1160,7 @@ fn subdivision_surface_matches_blender_522_across_the_modifier_matrix() -> TestR
 fn assert_matrix_coverage(cases: &[Value], meshes: &Map<String, Value>) -> TestResult {
     assert_eq!(
         cases.len(),
-        178,
+        186,
         "the complete Blender oracle corpus is required"
     );
     let mut levels = BTreeSet::new();

@@ -221,6 +221,16 @@ def fixture_set():
                                              vertex_creases=[(0, 0.2)])
     meshes["loose_corner"] = make_mesh(quad_vertices + [[2.0, 0.2, 0.3]], [[0, 1, 2, 3]],
                                        [(0, 1), (2, 3)], loose_edges=[(2, 4)])
+    # Loose chains that bend, so the B-spline differs from the midpoint: a free chain whose end points
+    # have one edge (extrapolated neighbours), and a chain attached to face corner 2, whose interior
+    # vertices have two edges each (real neighbours through the chain).
+    meshes["loose_chain"] = make_mesh(quad_vertices + [[2.0, 0.2, 0.3], [2.6, 1.2, 0.5],
+                                                       [1.8, 1.9, -0.4], [0.6, 2.4, 0.2]],
+                                      [[0, 1, 2, 3]], [], loose_edges=[(4, 5), (5, 6), (6, 7)])
+    meshes["loose_corner_chain"] = make_mesh(quad_vertices + [[2.0, 0.2, 0.3], [2.6, 1.2, 0.5],
+                                                              [1.8, 1.9, -0.4]],
+                                             [[0, 1, 2, 3]], [(0, 1), (2, 3)],
+                                             loose_edges=[(2, 4), (4, 5), (5, 6)])
     meshes["cube_rotated_storage"] = make_mesh(cube_vertices, cube_faces, cube_seams,
                                                [(0, 1, 0.25), (2, 3, 0.75)], rotated_storage=True)
     meshes["ngon_rotated_storage"] = make_mesh(ngon_vertices, [list(range(7))],
@@ -396,6 +406,15 @@ def build_cases():
     # A loose edge touching face corner 2 makes that corner infinitely sharp.
     add("loose_corner_l1_q2", "loose_corner", levels=1, quality=2, use_creases=True)
     add("loose_corner_l2_q4", "loose_corner", levels=2, quality=4, use_creases=True)
+    # Bent loose chains: the B-spline through base neighbours, at limit on, limit off, and SIMPLE.
+    add("loose_chain_l1", "loose_chain", levels=1)
+    add("loose_chain_l2_q4", "loose_chain", levels=2, quality=4)
+    add("loose_chain_l2_nolimit", "loose_chain", levels=2, use_limit_surface=False)
+    add("loose_chain_simple_l2", "loose_chain", levels=2, subdivision_type="SIMPLE")
+    add("loose_corner_chain_l1", "loose_corner_chain", levels=1)
+    add("loose_corner_chain_l2_q4", "loose_corner_chain", levels=2, quality=4)
+    add("loose_corner_chain_l2_nolimit", "loose_corner_chain", levels=2, use_limit_surface=False)
+    add("loose_corner_chain_simple_l2", "loose_corner_chain", levels=2, subdivision_type="SIMPLE")
     # Depth-2 seams with creases: UV selection must follow the same topology as positions.
     add("seams_uv_depth2_junctions", "grid_crease_0_5", levels=2, quality=4, use_creases=True,
         uv_smooth="PRESERVE_CORNERS_AND_JUNCTIONS")

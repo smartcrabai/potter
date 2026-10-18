@@ -38,6 +38,7 @@ mod ocean;
 mod remesh_modes;
 pub mod simulation;
 mod subdivision_limit;
+mod subdivision_loose;
 mod subdivision_normals;
 mod subdivision_uv;
 use subdivision_limit::Samples;
@@ -2454,6 +2455,13 @@ fn subdivision(
     let mut samples = Samples::base(&source_polygons, result.vertices.len());
     // Vertex creases start from the input and decay one level per subdivision, as edge creases do.
     let mut vertex_creases = vertex_crease_sharpness(mesh, options.use_creases)?;
+    // Loose-edge vertices are placed from the base mesh at the end, so their `u` is tracked per level.
+    let mut loose = subdivision_loose::LooseEdges::new(
+        edge_pairs(mesh)?,
+        &loose_edges(mesh)?,
+        &source_polygons,
+        mesh.vertices.len(),
+    );
     for level in 0..levels {
         // Without the limit surface every point is read; with it, only loose edges read the refined
         // positions of their endpoints.
@@ -2484,6 +2492,7 @@ fn subdivision(
             vertex_creases = decay_vertex_creases(&vertex_creases, next.vertices.len());
             (next, edge_points)
         };
+        loose.split(&edge_points, next.vertices.len());
         samples = samples.next(&source_polygons, &edge_points, level == 0);
         for layer in &mut uv_maps {
             layer.pins =
@@ -2610,6 +2619,11 @@ fn subdivision(
                 .collect();
             subdivision_uv::write_loop_uvs(&mut result, loops)?;
         }
+    }
+    // Loose-edge vertices come from their base edges, whether or not the limit surface is on
+    // (Blender's `subdiv_mesh_vert_of_loose_edge`). Only the limit's face samples touch other points.
+    for (vertex, position) in loose.positions(&positions(mesh), simple) {
+        result.vertices[vertex].co = position;
     }
     // Loop normals follow the final positions: Blender's fan spaces are measured on them. The loop
     // basis (corner order) is stored with or without custom normals, as main does.
