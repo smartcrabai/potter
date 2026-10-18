@@ -357,6 +357,7 @@ fn compare_numeric_values(actual: &Value, expected: &Value, context: &str) {
 }
 
 fn compare_case(case: &Value) {
+    let (doc, owner_id) = scene_for_case(case);
     let purpose = if case["render_mode"].as_bool().unwrap() {
         EvaluationPurpose::Render
     } else {

@@ -13,9 +13,8 @@ use crate::model::{Id, Modifier};
 
 use super::{
     MergedGeometry, Polygon, bool_param, build_mesh, closest_point_triangle, cyclic_pairs,
-    edge_pairs, id_indices, invalid_parameter, loose_edges, merge_by_dest_map, number_param,
-    polygons, positions, schema_value, string_param, uint_param, usize_as_f64, validated,
-    vec3_param,
+    edge_pairs, id_indices, invalid_parameter, loose_edges, number_param, polygons, positions,
+    schema_value, string_param, uint_param, usize_as_f64, validated, vec3_param,
 };
 use crate::{
     error::{ErrorCode, PotError, Result},

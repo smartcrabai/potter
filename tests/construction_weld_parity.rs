@@ -200,6 +200,8 @@ fn modifier_for(case: &Value) -> Modifier {
         modifier_type: "weld".to_owned(),
         name: "Weld parity".to_owned(),
         enabled: true,
+        show_viewport: true,
+        show_render: true,
         params: values,
         binding_data: None,
         runtime: ModifierRuntime::default(),

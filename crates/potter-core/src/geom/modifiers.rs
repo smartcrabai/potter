@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use glam::{DMat4, DVec3, Mat4, Vec3};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
@@ -5528,113 +5528,6 @@ fn smooth(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     Ok(result)
 }
 
-/// Keeps the first polygon for each vertex set, with the tag it arrived with.
-pub(super) fn unique_tagged_polygons<T>(polygons: Vec<(T, Polygon)>) -> Vec<(T, Polygon)> {
-    let mut seen = HashSet::new();
-    polygons
-        .into_iter()
-        .filter(|(_, (face, _))| {
-            let mut key = face.clone();
-            key.sort_unstable();
-            seen.insert(key)
-        })
-        .collect()
-}
-
-/// Merges each union-find cluster of `parent` into one point at the cluster centroid, recording the
-/// input points of each cluster so that its provenance is their equal-weight mean.
-fn collapse_clusters(
-    points: &[DVec3],
-    mut parent: Vec<usize>,
-    polygons: Vec<Polygon>,
-    edges: Vec<[usize; 2]>,
-) -> MergedGeometry {
-    let mut root_to_index = HashMap::new();
-    let mut sums = Vec::<DVec3>::new();
-    let mut point_members = Vec::<Vec<usize>>::new();
-    let mut remap = vec![0; points.len()];
-    for index in 0..points.len() {
-        let root = find(&mut parent, index);
-        let mapped = *root_to_index.entry(root).or_insert_with(|| {
-            sums.push(DVec3::ZERO);
-            point_members.push(Vec::new());
-            sums.len() - 1
-        });
-        remap[index] = mapped;
-        sums[mapped] += points[index];
-        point_members[mapped].push(index);
-    }
-    let merged_points = sums
-        .into_iter()
-        .zip(&point_members)
-        .map(|(sum, members)| sum / usize_as_f64(members.len()))
-        .collect::<Vec<_>>();
-    let (merged_polygons, polygon_sources): (Vec<Polygon>, Vec<usize>) = unique_tagged_polygons(
-        polygons
-            .into_iter()
-            .enumerate()
-            .filter_map(|(source, (face, material))| {
-                clean_polygon(face.into_iter().map(|index| remap[index]).collect())
-                    .map(|clean| (source, (clean, material)))
-            })
-            .collect(),
-    )
-    .into_iter()
-    .map(|(source, polygon)| (polygon, source))
-    .unzip();
-    let merged_edges = edges
-        .into_iter()
-        .filter_map(|[first, second]| {
-            let pair = [remap[first], remap[second]];
-            (pair[0] != pair[1]).then_some(pair)
-        })
-        .collect();
-    MergedGeometry {
-        generated_polygons: vec![false; merged_polygons.len()],
-        points: merged_points,
-        polygons: merged_polygons,
-        edges: merged_edges,
-        point_members,
-        polygon_sources,
-    }
-}
-
-fn merge_geometry(
-    points: &[DVec3],
-    polygons: Vec<Polygon>,
-    edges: Vec<[usize; 2]>,
-    threshold: f64,
-) -> Result<MergedGeometry> {
-    if points.len() > u32::MAX as usize {
-        return Err(mesh_error(&MeshError::IdExhausted));
-    }
-    let mut parent: Vec<_> = (0..points.len()).collect();
-    let mut cells: HashMap<[i64; 3], Vec<usize>> = HashMap::new();
-    for (index, point) in points.iter().enumerate() {
-        let cell = spatial_cell(*point, threshold);
-        for x in -1_i64..=1 {
-            for y in -1_i64..=1 {
-                for z in -1_i64..=1 {
-                    let nearby = [
-                        cell[0].saturating_add(x),
-                        cell[1].saturating_add(y),
-                        cell[2].saturating_add(z),
-                    ];
-                    if let Some(indices) = cells.get(&nearby) {
-                        for other in indices {
-                            if point.distance_squared(points[*other]) <= threshold * threshold {
-                                union(&mut parent, index, *other);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        cells.entry(cell).or_default().push(index);
-    }
-    Ok(collapse_clusters(points, parent, polygons, edges))
-}
-
 /// Blender's CONNECTED weld destination map (`mesh_merge_by_distance_connected`). Selected edges in
 /// mesh order collapse their two clusters when the float32 cluster positions are within the
 /// threshold; a cluster's position is the running mean of its members. Every member of a merged
@@ -5709,7 +5602,7 @@ fn connected_clusters(
 /// Applies Blender's resolved vertex destination map to positions, faces, and edges.
 /// `Some(root)` marks every member of a merged group, including its representative; `None`
 /// leaves a vertex untouched. When `mix_data` is false, the representative's position survives.
-pub(super) fn merge_by_dest_map(
+fn merge_by_dest_map(
     points: &[DVec3],
     polygons: Vec<Polygon>,
     edges: Vec<[usize; 2]>,
@@ -6053,37 +5946,11 @@ fn weld_kdtree_find_duplicates(
         weld_kdtree_find_duplicates(search_tree, node.right, point, search, dest, found);
     }
 }
-
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "spatial cells use saturating float-to-integer conversion"
-)]
-fn spatial_cell(point: DVec3, threshold: f64) -> [i64; 3] {
-    [
-        (point.x / threshold).floor() as i64,
-        (point.y / threshold).floor() as i64,
-        (point.z / threshold).floor() as i64,
-    ]
-}
-
 fn find(parent: &mut [usize], index: usize) -> usize {
     if parent[index] != index {
         parent[index] = find(parent, parent[index]);
     }
     parent[index]
-}
-
-fn union(parent: &mut [usize], first: usize, second: usize) {
-    let first_root = find(parent, first);
-    let second_root = find(parent, second);
-    if first_root != second_root {
-        let (root, child) = if first_root < second_root {
-            (first_root, second_root)
-        } else {
-            (second_root, first_root)
-        };
-        parent[child] = root;
-    }
 }
 
 #[cfg(test)]

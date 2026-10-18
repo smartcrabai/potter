@@ -135,6 +135,8 @@ fn modifier_for(variant: &Value) -> Modifier {
             .to_owned(),
         name: "Construction parity".to_owned(),
         enabled: true,
+        show_viewport: true,
+        show_render: true,
         params: data["params"]
             .as_object()
             .expect("fixture modifier params")
@@ -562,6 +564,8 @@ fn build_face_prefix_keeps_valid_custom_normal_corner_order() {
         modifier_type: "build".to_owned(),
         name: "Build".to_owned(),
         enabled: true,
+        show_viewport: true,
+        show_render: true,
         params: serde_json::from_value(json!({
             "frame_start": 1.0,
             "frame_duration": 2.0,
@@ -627,6 +631,8 @@ fn wireframe_material_offset_rejects_non_integer_values() {
         modifier_type: "wireframe".to_owned(),
         name: "Wireframe".to_owned(),
         enabled: true,
+        show_viewport: true,
+        show_render: true,
         params: serde_json::from_value(json!({"material_offset": 1.5})).expect("modifier params"),
         binding_data: None,
         runtime: ModifierRuntime::default(),

@@ -1077,6 +1077,10 @@ fn evaluate_modifier_output(
         .nodes
         .get(target)
         .map_or(0, |node| node.materials.len());
+    let material_slot_count = Some(crate::model::material_slot_count(
+        object_material_count,
+        material_slots.len(),
+    ));
     let evaluated = {
         let data_block = engine.doc.data_blocks.get(data_id).ok_or_else(|| {
             PotError::new(
