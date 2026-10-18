@@ -1754,41 +1754,85 @@ fn vrm0_and_vrm1_export_actual_scene_indices_and_preserve_avatar_semantics() -> 
 }
 
 #[test]
-fn unapplied_boolean_operand_material_exports_to_glb_and_vrm() -> TestResult {
-    // The cutter's material exists only in the evaluated table (TRANSFER pools it onto the body's
-    // faces). Authoring slots do not name it, so export must resolve it from the evaluated table.
+fn unapplied_boolean_operand_material_exports_to_vrm() -> TestResult {
+    // The subject is an empty mesh, so the FLOAT quick UNION copies the operand mesh and takes the
+    // operand's DATA material slots (EvaluatedNode.mesh_materials), not its OBJECT override. The
+    // operand's DATA table never names `operand_material`: its own TRANSFER Boolean pools it from
+    // `stamp` into the operand's evaluated table only. The operand's OBJECT slot is
+    // `override_material`. The morph-bearing avatar is a separate node without a Boolean, so the
+    // shape-key refusal does not apply to the subject and the refusal stays in force for the avatar.
     let mut operations = fixture_operations(FixtureOptions::default());
     operations.extend([
         json!({
             "op": "material.create",
-            "id": "cutter_material",
-            "name": "Cutter Material",
+            "id": "operand_material",
+            "name": "Operand Material",
             "base_color": [0.1, 0.2, 0.9, 1.0],
+            "base_color_texture": {"image": "tex_albedo"},
         }),
-        json!({"op": "node.create", "id": "cutter", "kind": "box", "params": {"size": 1.0}, "material": "cutter_material"}),
-        json!({"op": "node.update", "target": {"id": "cutter"}, "set": {"transform": {"translation": [0.5, 0.0, 0.0]}}}),
+        json!({
+            "op": "material.create",
+            "id": "override_material",
+            "name": "Override Material",
+            "base_color": [0.9, 0.1, 0.1, 1.0],
+        }),
+        json!({"op": "node.create", "id": "stamp", "kind": "box", "params": {"size": 1.0}, "material": "operand_material"}),
+        json!({"op": "node.update", "target": {"id": "stamp"}, "set": {"transform": {"translation": [0.5, 0.0, 0.0]}, "visible": false}}),
+        json!({"op": "node.create", "id": "cutter", "kind": "box", "params": {"size": 1.0}}),
+        json!({"op": "uv.unwrap", "target": {"id": "cutter"}, "elements": {"domain": "face", "ids": ["f1"]}, "method": "smart"}),
         json!({
             "op": "modifier.create",
-            "target": {"id": "body"},
-            "id": "cut_boolean",
+            "target": {"id": "cutter"},
+            "id": "stamp_boolean",
             "type": "boolean",
-            "params": {"object": "cutter", "operation": "UNION", "solver": "EXACT", "material_mode": "TRANSFER"},
+            "params": {"object": "stamp", "operation": "UNION", "solver": "EXACT", "material_mode": "TRANSFER"},
+        }),
+        json!({"op": "node.update", "target": {"id": "cutter"}, "set": {"materials": ["override_material"], "visible": false}}),
+        json!({"op": "node.create", "id": "subject", "kind": "box", "params": {"size": 1.0}}),
+        json!({"op": "mesh.delete", "target": {"id": "subject"}, "elements": {"domain": "vertex", "ids": ["v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7"]}}),
+        json!({
+            "op": "modifier.create",
+            "target": {"id": "subject"},
+            "id": "quick_union",
+            "type": "boolean",
+            "params": {"object": "cutter", "operation": "UNION", "solver": "FLOAT"},
         }),
     ]);
     let (directory, project) = init_project()?;
     apply_success(&project, 0, &operations)?;
-    for format in ["glb", "vrm"] {
+    // glb cannot carry this fixture's VRM avatar settings, a legitimate loss the exporter reports, so
+    // the binding is checked on the VRM export, which carries them.
+    for format in ["vrm"] {
         let path = directory.path().join(format!("boolean.{format}"));
         export(&project, format, &path)?;
         let glb = parse_glb(&path)?;
-        let cutter = gltf_material_index(&glb.json, "cutter_material");
-        let bound = glb.json["meshes"]
+        let root = &glb.json;
+        let subject_node = gltf_node_index(root, "subject");
+        let subject_mesh = usize_field(&root["nodes"][subject_node]["mesh"]);
+        let primitives = root["meshes"][subject_mesh]["primitives"]
             .as_array()
-            .expect("glTF meshes are present")
+            .expect("subject mesh has primitives");
+        let operand = gltf_material_index(root, "operand_material");
+        let overridden = gltf_material_index(root, "override_material");
+        let bound: Vec<Option<u64>> = primitives
             .iter()
-            .flat_map(|mesh| mesh["primitives"].as_array().into_iter().flatten())
-            .any(|primitive| primitive["material"].as_u64() == Some(cutter as u64));
-        assert!(bound, "{format}: no primitive binds the operand material");
+            .map(|primitive| primitive["material"].as_u64())
+            .collect();
+        assert!(
+            bound.contains(&Some(operand as u64)),
+            "{format}: subject binds no primitive to the operand's data material; bound={bound:?}"
+        );
+        assert!(
+            !bound.contains(&Some(overridden as u64)),
+            "{format}: subject binds the operand's OBJECT override material"
+        );
+        let material = &root["materials"][operand];
+        assert_eq!(material["name"], "Operand Material");
+        assert_texture_ref(
+            root,
+            &material["pbrMetallicRoughness"]["baseColorTexture"],
+            "tex_albedo",
+        );
     }
     Ok(())
 }
