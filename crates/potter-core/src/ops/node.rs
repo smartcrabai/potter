@@ -8,7 +8,8 @@ use crate::{
     geom::{self, Mesh as GeomMesh},
     model::{
         ArmatureData, CameraData, DataBlock, GreasePencilData, Id, LightData, MaterialLink, Node,
-        ParentType, PrimitiveDescriptor, Transform, canonicalize_quaternion, normalize_rotation,
+        ParentType, PrimitiveDescriptor, TrackAxis, Transform, UpAxis, canonicalize_quaternion,
+        normalize_rotation,
     },
 };
 
@@ -168,6 +169,8 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             "visible",
             "render_visible",
             "selectable",
+            "track_axis",
+            "up_axis",
         ],
         &["id", "kind"],
     )?;
@@ -517,6 +520,22 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
         None
     };
     let materials = read_material_slots(engine, operation)?;
+    let track_axis = match operation.get("track_axis") {
+        Some(value) => read_track_axis(
+            engine,
+            value,
+            &operation_pointer(engine.operation_index, "track_axis"),
+        )?,
+        None => TrackAxis::default(),
+    };
+    let up_axis = match operation.get("up_axis") {
+        Some(value) => read_up_axis(
+            engine,
+            value,
+            &operation_pointer(engine.operation_index, "up_axis"),
+        )?,
+        None => UpAxis::default(),
+    };
     let node = Node {
         name,
         kind,
@@ -531,6 +550,8 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
         visible: read_bool(engine, operation, "visible", true)?,
         render_visible: read_bool(engine, operation, "render_visible", true)?,
         selectable: read_bool(engine, operation, "selectable", true)?,
+        track_axis,
+        up_axis,
         action: None,
         properties: Map::new(),
         rigid_body: None,
@@ -634,6 +655,8 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             "render_visible",
             "selectable",
             "action",
+            "track_axis",
+            "up_axis",
         ],
         |engine, key| {
             let escaped = super::pointer_escape(key);
@@ -692,6 +715,26 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
     let visible = read_optional_bool(engine, set, "visible")?;
     let render_visible = read_optional_bool(engine, set, "render_visible")?;
     let selectable = read_optional_bool(engine, set, "selectable")?;
+    let track_axis = set
+        .get("track_axis")
+        .map(|value| {
+            read_track_axis(
+                engine,
+                value,
+                &operation_pointer(engine.operation_index, "set/track_axis"),
+            )
+        })
+        .transpose()?;
+    let up_axis = set
+        .get("up_axis")
+        .map(|value| {
+            read_up_axis(
+                engine,
+                value,
+                &operation_pointer(engine.operation_index, "set/up_axis"),
+            )
+        })
+        .transpose()?;
     let action = set
         .get("action")
         .map(|value| {
@@ -787,6 +830,18 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                     }
                 }
             }
+            if let Some(track_axis) = track_axis
+                && node.track_axis != track_axis
+            {
+                node.track_axis = track_axis;
+                item_changed = true;
+            }
+            if let Some(up_axis) = up_axis
+                && node.up_axis != up_axis
+            {
+                node.up_axis = up_axis;
+                item_changed = true;
+            }
             item_changed
         } else {
             false
@@ -797,6 +852,28 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
         }
     }
     Ok(changed)
+}
+
+/// Reads `track_axis` as Blender's object axis identifier.
+fn read_track_axis(engine: &Engine<'_>, value: &Value, pointer: &str) -> Result<TrackAxis> {
+    serde_json::from_value(value.clone()).map_err(|_| {
+        engine.error(
+            ErrorCode::InvalidOperation,
+            "track_axis must be POS_X, POS_Y, POS_Z, NEG_X, NEG_Y, or NEG_Z",
+            pointer,
+        )
+    })
+}
+
+/// Reads `up_axis` as Blender's object up-axis identifier.
+fn read_up_axis(engine: &Engine<'_>, value: &Value, pointer: &str) -> Result<UpAxis> {
+    serde_json::from_value(value.clone()).map_err(|_| {
+        engine.error(
+            ErrorCode::InvalidOperation,
+            "up_axis must be X, Y, or Z",
+            pointer,
+        )
+    })
 }
 
 fn read_optional_bool(

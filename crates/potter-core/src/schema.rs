@@ -816,6 +816,8 @@ fn operation_contract(name: &str) -> OperationContract {
                 "visible",
                 "render_visible",
                 "selectable",
+                "track_axis",
+                "up_axis",
             ],
             vec!["op", "id", "kind"],
             "object",
@@ -2088,6 +2090,10 @@ fn field_schema(operation: &str, field: &str) -> Value {
             "metaball","lattice","pointcloud","volume","armature","grease_pencil",
             "collection_instance"
         ]}),
+        "track_axis" if operation.starts_with("node.") => {
+            json!({"enum":["POS_X","POS_Y","POS_Z","NEG_X","NEG_Y","NEG_Z"]})
+        }
+        "up_axis" if operation.starts_with("node.") => json!({"enum":["X","Y","Z"]}),
         "kind" => {
             json!({"enum":["group","empty","mesh","camera","light","box","sphere","uv_sphere","cylinder","plane","cone","torus","icosphere","circle","grid"]})
         }
@@ -2261,6 +2267,7 @@ fn set_schema(operation: &str) -> Value {
             "transform":{"type":"object","properties":{"translation":vec_schema(3),"rotation_deg":vec_schema(3),"rotation":vec_schema(4),"scale":vec_schema(3)},"additionalProperties":false},
             "params":{"type":"object"},"materials":{"type":"array","items":{"oneOf":[id_schema(),{"type":"null"}]}},
             "visible":{"type":"boolean"},"render_visible":{"type":"boolean"},"selectable":{"type":"boolean"},
+            "track_axis":{"enum":["POS_X","POS_Y","POS_Z","NEG_X","NEG_Y","NEG_Z"]},"up_axis":{"enum":["X","Y","Z"]},
             "action":{"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]}
         }),
         "shape_key.update" => json!({
