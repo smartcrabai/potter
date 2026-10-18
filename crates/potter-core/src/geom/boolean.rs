@@ -212,8 +212,9 @@ fn bool_op(operation: Operation) -> BoolOp {
 /// in slot order; `None` is an empty slot. `remaps` has one entry per operand, subject first. The
 /// subject's entry is empty, so its indices stay. `pool` is the output node's slot list.
 ///
-/// - INDEX: `pool` is the subject's slots. An operand slot maps to the subject slot at its index
-///   when that slot holds the same material. Otherwise it maps to the first subject slot holding
+/// - INDEX: `pool` is the joined table of the subject and operands ([`index_pool`]). An operand slot
+///   maps to the subject slot at its index when that slot holds the same material. Otherwise it maps
+///   to the first subject slot holding
 ///   the material (`BKE_object_material_remap_calc`, material.cc:1307-1351, and `Map::add`, which
 ///   keeps the first key, BLI_map.hh:289-295). Otherwise it keeps its local index when the subject
 ///   has that slot, and maps to 0 when it does not. An operand with no slots maps to `[0]`
@@ -233,7 +234,7 @@ pub(crate) fn material_remaps<'a>(
     operands: &[Vec<Option<&'a Id>>],
 ) -> (Vec<Vec<u32>>, Vec<Option<Id>>) {
     let mut pool: Vec<Option<Id>> = match mode {
-        MaterialMode::Index => subject.iter().map(|&slot| slot.cloned()).collect(),
+        MaterialMode::Index => index_pool(subject, operands),
         MaterialMode::Transfer => transfer_pool(subject),
     };
     let mut remaps = vec![Vec::new()];
@@ -256,6 +257,30 @@ fn transfer_pool(subject: &[Option<&Id>]) -> Vec<Option<Id>> {
     for &slot in subject {
         if !pool.iter().any(|pooled| pooled.as_ref() == slot) {
             pool.push(slot.cloned());
+        }
+    }
+    pool
+}
+
+/// The INDEX result table. Blender joins the subject and operand meshes (`join_meshes`, the source of
+/// the output's material array), and each mesh contributes its slots, or one empty slot when it has
+/// none; a material already in the table is not repeated. The subject keeps its own slots as they are,
+/// so its face indices are unchanged. Measured on Blender 5.2.2 (EXACT, INDEX, default mode): an empty
+/// subject gives `[None]`, an empty subject with an operand gives `[None, O0]`, and a subject `[H0]`
+/// with an empty operand gives `[H0, None]`.
+fn index_pool(subject: &[Option<&Id>], operands: &[Vec<Option<&Id>>]) -> Vec<Option<Id>> {
+    let empty: [Option<&Id>; 1] = [None];
+    let mut pool: Vec<Option<Id>> = if subject.is_empty() {
+        vec![None]
+    } else {
+        subject.iter().map(|&slot| slot.cloned()).collect()
+    };
+    for slots in operands {
+        let entries: &[Option<&Id>] = if slots.is_empty() { &empty } else { slots };
+        for &slot in entries {
+            if !pool.iter().any(|pooled| pooled.as_ref() == slot) {
+                pool.push(slot.cloned());
+            }
         }
     }
     pool

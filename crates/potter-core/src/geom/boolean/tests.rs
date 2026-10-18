@@ -134,7 +134,10 @@ fn material_remaps_index_matches_subject_slots_and_transfer_pools_new_materials(
     let operands = [vec![Some("a1"), Some("b0")], vec![Some("b0"), Some("c0")]];
     assert_eq!(
         run_remaps(MaterialMode::Index, &subject, &operands),
-        (vec![vec![], vec![1, 1], vec![0, 1]], owned_slots(&subject))
+        (
+            vec![vec![], vec![1, 1], vec![0, 1]],
+            owned_slots(&[Some("a0"), Some("a1"), Some("b0"), Some("c0")])
+        )
     );
     assert_eq!(
         run_remaps(MaterialMode::Transfer, &subject, &operands),
@@ -152,7 +155,10 @@ fn material_remaps_index_prefers_same_slot_over_earlier_match() {
     let operands = [vec![Some("x"), Some("a")]];
     assert_eq!(
         run_remaps(MaterialMode::Index, &subject, &operands),
-        (vec![vec![], vec![0, 1]], owned_slots(&subject))
+        (
+            vec![vec![], vec![0, 1]],
+            owned_slots(&[Some("a"), Some("a"), Some("x")])
+        )
     );
 }
 
@@ -163,7 +169,10 @@ fn material_remaps_index_takes_first_matching_subject_slot() {
     let operands = [vec![Some("c"), Some("a")]];
     assert_eq!(
         run_remaps(MaterialMode::Index, &subject, &operands),
-        (vec![vec![], vec![0, 0]], owned_slots(&subject))
+        (
+            vec![vec![], vec![0, 0]],
+            owned_slots(&[Some("a"), Some("b"), Some("a"), Some("c")])
+        )
     );
 }
 
@@ -178,7 +187,7 @@ fn material_remaps_index_unmatched_slot_keeps_local_index_in_range_else_zero() {
         run_remaps(MaterialMode::Index, &subject, &operands),
         (
             vec![vec![], vec![0, 1], vec![0, 1, 0]],
-            owned_slots(&subject)
+            owned_slots(&[Some("a"), Some("b"), Some("x"), Some("y"), Some("z")])
         )
     );
 }
@@ -189,7 +198,7 @@ fn material_remaps_empty_operand_maps_by_mode() {
     let operands = [vec![]];
     assert_eq!(
         run_remaps(MaterialMode::Index, &subject, &operands),
-        (vec![vec![], vec![0]], owned_slots(&subject))
+        (vec![vec![], vec![0]], owned_slots(&[Some("a"), None]))
     );
     assert_eq!(
         run_remaps(MaterialMode::Transfer, &subject, &operands),
@@ -205,10 +214,11 @@ fn material_remaps_transfer_empty_subject_starts_pool_with_none() {
         run_remaps(MaterialMode::Transfer, &subject, &operands),
         (vec![vec![], vec![1, 0]], owned_slots(&[None, Some("a")]))
     );
-    // With no subject slots, INDEX has no pool and each operand slot falls back to 0.
+    // With no subject slots, INDEX's table is Blender's joined table: one empty slot, then the
+    // operand's materials it lacks. Each operand slot's remap is unchanged.
     assert_eq!(
         run_remaps(MaterialMode::Index, &subject, &operands),
-        (vec![vec![], vec![0, 0]], owned_slots(&[]))
+        (vec![vec![], vec![0, 0]], owned_slots(&[None, Some("a")]))
     );
 }
 
