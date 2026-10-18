@@ -141,7 +141,7 @@ pub fn evaluate_modifiers_with_groups_and_custom_at_frame(
     modifiers: &[Modifier],
     node_groups: &Registry<NodeGroup>,
     frame: f64,
-    custom_modifier: impl FnMut(&mut Mesh, &Modifier, &mut Vec<PotError>) -> Result<()>,
+    mut custom_modifier: impl FnMut(&mut Mesh, &Modifier, &mut Vec<PotError>) -> Result<()>,
 ) -> Result<ModifierEvaluation> {
     evaluate_modifiers_with_scene_context(
         evaluated,
@@ -155,7 +155,10 @@ pub fn evaluate_modifiers_with_groups_and_custom_at_frame(
         &BTreeMap::new(),
         ModifierEvaluationContext::default(),
         |_, modifier| modifier.enabled,
-        custom_modifier,
+        |mesh, modifier, warnings| {
+            custom_modifier(mesh, modifier, warnings)?;
+            Ok(None)
+        },
     )
 }
 
@@ -171,13 +174,14 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
     curve_path_lengths: &BTreeMap<Id, f64>,
     context: ModifierEvaluationContext<'_>,
     is_active: impl Fn(usize, &Modifier) -> bool,
-    mut custom_modifier: impl FnMut(&mut Mesh, &Modifier, &mut Vec<PotError>) -> Result<()>,
+    mut custom_modifier: impl FnMut(&mut Mesh, &Modifier, &mut Vec<PotError>) -> Result<Option<usize>>,
 ) -> Result<ModifierEvaluation> {
     if !frame.is_finite() {
         return Err(PotError::invalid_argument(
             "modifier evaluation frame must be finite",
         ));
     }
+    let mut context = context;
     let mut instance_paths = Vec::new();
     let mut warnings = Vec::new();
     for (modifier_index, modifier) in modifiers
@@ -239,7 +243,12 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
                 && modifier.params.get("object").is_some_and(Value::is_string))
             || scene_operand_modifier
         {
-            custom_modifier(&mut evaluated, modifier, &mut warnings)?;
+            // Scene callbacks may replace the Boolean TRANSFER pool used by later modifiers.
+            if let Some(material_slot_count) =
+                custom_modifier(&mut evaluated, modifier, &mut warnings)?
+            {
+                context.material_slot_count = Some(material_slot_count);
+            }
             continue;
         }
         if modifier.modifier_type == "nodes" {
