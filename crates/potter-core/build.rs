@@ -7,8 +7,12 @@ use std::{
 };
 
 fn main() -> io::Result<()> {
-    let manifest_dir =
-        PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("Cargo sets CARGO_MANIFEST_DIR"));
+    let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "Cargo did not set CARGO_MANIFEST_DIR",
+        )
+    })?);
     println!("cargo:rerun-if-env-changed=RUSTC");
     println!("cargo:rerun-if-env-changed=TARGET");
 
@@ -23,26 +27,28 @@ fn main() -> io::Result<()> {
     let mut hasher = Sha256::new();
     hasher.update(b"potter-core-build-identity-v1\0");
     hash_field(&mut hasher, "metadata/rustc -vV", &compiler.stdout);
-    hash_field(
-        &mut hasher,
-        "metadata/TARGET",
-        env::var("TARGET").expect("Cargo sets TARGET").as_bytes(),
-    );
+    let target =
+        env::var("TARGET").map_err(|error| io::Error::new(io::ErrorKind::NotFound, error))?;
+    hash_field(&mut hasher, "metadata/TARGET", target.as_bytes());
 
-    let mut features = env::vars_os()
-        .filter_map(|(name, value)| {
-            let name = name.as_os_str().to_str()?;
-            if !name.starts_with("CARGO_FEATURE_") {
-                return None;
-            }
-            let name = name.to_owned();
-            println!("cargo:rerun-if-env-changed={name}");
-            Some((
-                name,
-                value.into_string().expect("Cargo feature values are UTF-8"),
-            ))
-        })
-        .collect::<Vec<_>>();
+    let mut features = Vec::new();
+    for (name, value) in env::vars_os() {
+        let Some(name) = name.as_os_str().to_str() else {
+            continue;
+        };
+        if !name.starts_with("CARGO_FEATURE_") {
+            continue;
+        }
+        let name = name.to_owned();
+        let value = value.into_string().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Cargo feature {name} is not UTF-8"),
+            )
+        })?;
+        println!("cargo:rerun-if-env-changed={name}");
+        features.push((name, value));
+    }
     features.sort_unstable();
     for (name, value) in features {
         hash_field(&mut hasher, &format!("metadata/{name}"), value.as_bytes());
@@ -127,7 +133,7 @@ fn collect_tree(
         } else if file_type.is_file() {
             let relative = path
                 .strip_prefix(source_root)
-                .expect("walked path is below its input directory");
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
             let relative = relative
                 .components()
                 .map(|component| {
