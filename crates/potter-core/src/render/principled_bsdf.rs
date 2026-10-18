@@ -218,6 +218,29 @@ pub(crate) fn unevaluated_inputs(params: &BsdfParams) -> Vec<(&'static str, &'st
     inputs
 }
 
+/// Records `UNSUPPORTED_FEATURE` for each Principled input the lobe model does not evaluate, once
+/// per distinct warning, in the list the render output reports. Shared by the path tracer and the
+/// raster preview.
+pub(crate) fn record_unevaluated_inputs(
+    params: &BsdfParams,
+    warnings: &std::cell::RefCell<Vec<serde_json::Value>>,
+) {
+    for (feature_id, input) in unevaluated_inputs(params) {
+        let warning = serde_json::json!({
+            "code": "UNSUPPORTED_FEATURE",
+            "feature_id": feature_id,
+            "input": input,
+            "message": format!(
+                "Principled input '{input}' is not evaluated by Potter's lobe model; its Cycles contribution is omitted or approximated"
+            ),
+        });
+        let mut recorded = warnings.borrow_mut();
+        if !recorded.contains(&warning) {
+            recorded.push(warning);
+        }
+    }
+}
+
 /// `closure_layering_weight(layer_albedo, weight)` for a scalar weight and a per-channel albedo:
 /// `weight * saturate(1 - max(albedo / weight))`, i.e. `max(0, weight - max(albedo))`.
 fn closure_layering_weight(max_layer_albedo: f64, weight: f64) -> f64 {
