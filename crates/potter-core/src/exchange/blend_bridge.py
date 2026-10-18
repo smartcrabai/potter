@@ -1275,7 +1275,13 @@ def _attribute_item_value(item, data_type):
         return plain(item.color)
     if hasattr(item, "vector"):
         return plain(item.vector)
-    return plain(item.value)
+    value = item.value
+    if data_type == "QUATERNION":
+        # Blender stores (w, x, y, z); the core reads and defaults quaternions as (x, y, z, w).
+        return [float(value[1]), float(value[2]), float(value[3]), float(value[0])]
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return plain(value)
 
 
 def _set_attribute_item(item, data_type, value):
@@ -1283,6 +1289,8 @@ def _set_attribute_item(item, data_type, value):
         item.color = value
     elif hasattr(item, "vector"):
         item.vector = value
+    elif data_type == "QUATERNION":
+        item.value = (value[3], value[0], value[1], value[2])
     else:
         item.value = value
 
