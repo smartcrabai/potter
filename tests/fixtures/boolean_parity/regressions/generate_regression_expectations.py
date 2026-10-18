@@ -162,6 +162,10 @@ def cross(a, b):
 def describe_mesh(case, regression, owner, mesh, *, rings):
     matrix = owner.matrix_world
     raw = [tuple(float(c) for c in matrix @ vertex.co) for vertex in mesh.vertices]
+    edges = sorted(
+        sorted(canonical(raw[index]) for index in edge.vertices)
+        for edge in mesh.edges
+    )
     uv_layer = mesh.uv_layers["UVMap"] if "UVMap" in mesh.uv_layers else None
     custom = mesh.has_custom_normals
     faces = []
@@ -222,6 +226,7 @@ def describe_mesh(case, regression, owner, mesh, *, rings):
     }
     if rings:
         result["faces"] = faces
+    result["edges"] = edges
     return result
 
 
