@@ -64,7 +64,7 @@ use crate::geom::{
 };
 
 use super::dissolve::Poly;
-use super::imesh::Arena;
+use super::imesh::{Arena, NO_INDEX};
 use super::input::{Operand, clean_transform};
 
 /// Material tables of the operands (Blender `material_remaps`). Entry `k` maps operand `k`'s local
@@ -77,9 +77,10 @@ pub(crate) struct OutputMaterials<'a> {
 
 /// Assembles the output mesh of the exact boolean from the kept polygons (Blender `imesh_to_mesh`).
 ///
-/// Vertices are the distinct arena vertices used by `polys`, in first-seen order, at their `f32`
-/// positions. Faces keep their ring order and take fresh IDs. Edges are created as the faces need
-/// them. Attributes are gathered as described in the module documentation.
+/// Vertices are the distinct arena vertices used by `polys`, in Blender's `populate_vert` order, at
+/// their `f32` positions. Faces keep their ring order and take fresh IDs. Edges are stored in
+/// Blender's `mesh_calc_edges` order. Attributes are gathered as described in the module
+/// documentation.
 ///
 /// # Errors
 ///
@@ -101,7 +102,7 @@ pub(crate) fn polys_to_mesh(
     joined.mesh.attributes = join_attributes(operands, &layout, &joined.mesh)?;
     join_custom_normal_codes(operands, &mut joined.mesh)?;
     uv_layers::write(&mut joined.mesh, &joined_uv_store(operands));
-    let (arena_ids, planned) = plan(polys, &layout)?;
+    let (arena_ids, planned) = plan(polys, arena, &layout)?;
 
     let positions: Vec<DVec3> = arena_ids
         .iter()
@@ -129,6 +130,7 @@ pub(crate) fn polys_to_mesh(
             }),
     )
     .map_err(|error| PotError::invalid_argument(format!("boolean output face failed: {error}")))?;
+    blender_edge_order(&mut mesh);
 
     let origin = Origin {
         vertices: arena_ids
@@ -326,10 +328,12 @@ struct PlannedFace {
     local_face: usize,
 }
 
-/// Distinct arena vertices used by `polys` in first-seen order, and the polygons over them.
-fn plan(polys: &[Poly], layout: &Layout) -> Result<(Vec<u32>, Vec<PlannedFace>)> {
-    let mut arena_ids: Vec<u32> = Vec::new();
-    let mut output_of: HashMap<u32, usize> = HashMap::new();
+/// Distinct arena vertices used by `polys`, sorted as Blender's `IMesh::populate_vert` sorts them,
+/// and the polygons over them. Blender takes the vertices in first-seen order over the faces, then
+/// sorts stably: input vertices by ascending origin, created vertices after them by creation order.
+fn plan(polys: &[Poly], arena: &Arena, layout: &Layout) -> Result<(Vec<u32>, Vec<PlannedFace>)> {
+    let mut seen_ids: Vec<u32> = Vec::new();
+    let mut seen_slot: HashMap<u32, usize> = HashMap::new();
     let mut planned = Vec::with_capacity(polys.len());
     for poly in polys {
         let joined_face = usize::try_from(poly.orig)
@@ -343,9 +347,9 @@ fn plan(polys: &[Poly], layout: &Layout) -> Result<(Vec<u32>, Vec<PlannedFace>)>
             .verts
             .iter()
             .map(|&id| {
-                *output_of.entry(id).or_insert_with(|| {
-                    arena_ids.push(id);
-                    arena_ids.len() - 1
+                *seen_slot.entry(id).or_insert_with(|| {
+                    seen_ids.push(id);
+                    seen_ids.len() - 1
                 })
             })
             .collect();
@@ -356,7 +360,54 @@ fn plan(polys: &[Poly], layout: &Layout) -> Result<(Vec<u32>, Vec<PlannedFace>)>
             local_face,
         });
     }
+    let mut order: Vec<usize> = (0..seen_ids.len()).collect();
+    order.sort_by_key(|&slot| {
+        let id = seen_ids[slot];
+        let orig = arena.vert(id).orig;
+        if orig == NO_INDEX {
+            (true, 0, id)
+        } else {
+            (false, orig, 0)
+        }
+    });
+    let mut position = vec![0; seen_ids.len()];
+    for (index, &slot) in order.iter().enumerate() {
+        position[slot] = index;
+    }
+    for face in &mut planned {
+        for vertex in &mut face.ring {
+            *vertex = position[*vertex];
+        }
+    }
+    let arena_ids: Vec<u32> = order.iter().map(|&slot| seen_ids[slot]).collect();
     Ok((arena_ids, planned))
+}
+
+/// Blender `mesh_calc_edges` (`keep_existing_edges = false`): edges are stored in order of first
+/// appearance over the faces, where corner `c` of a face contributes the edge from the previous
+/// corner's vertex to its own, each stored with its lower vertex ID first (`OrderedEdge`). Only the
+/// storage order and orientation change; edge IDs are kept.
+fn blender_edge_order(mesh: &mut Mesh) {
+    let mut first_appearance: HashMap<(u32, u32), usize> = HashMap::with_capacity(mesh.edges.len());
+    for face in &mesh.faces {
+        let ring = &face.vertices;
+        let count = ring.len();
+        for corner in 0..count {
+            let key = edge_key(ring[(corner + count - 1) % count], ring[corner]);
+            let next = first_appearance.len();
+            first_appearance.entry(key).or_insert(next);
+        }
+    }
+    for edge in &mut mesh.edges {
+        let (low, high) = edge_key(edge.vertices[0], edge.vertices[1]);
+        edge.vertices = [low, high];
+    }
+    mesh.edges.sort_by_key(|edge| {
+        first_appearance
+            .get(&(edge.vertices[0], edge.vertices[1]))
+            .copied()
+            .unwrap_or(usize::MAX)
+    });
 }
 
 /// Blender `set_material_from_map`: the operand's table maps a local index inside it, and any other
@@ -1649,9 +1700,49 @@ mod tests {
         let ring = vec![ids[4], ids[2], ids[0], ids[3], ids[1]];
         let mesh = build(&[poly(ring, 0)], &arena, &[operand(&pentagon)], &[])?;
         assert_eq!(mesh.faces.len(), 1);
-        assert_eq!(mesh.faces[0].vertices, vec![0, 1, 2, 3, 4]);
+        assert_eq!(mesh.faces[0].vertices, vec![4, 2, 0, 3, 1]);
         assert_eq!(mesh.edges.len(), 5);
-        assert!(mesh.vertices[0].co.cmpeq(DVec3::new(0.0, 1.0, 0.0)).all());
+        assert!(mesh.vertices[0].co.cmpeq(DVec3::new(0.0, 0.0, 0.0)).all());
+        Ok(())
+    }
+
+    #[test]
+    fn vertices_follow_blender_populate_order() -> TestResult {
+        let a = triangle(0.0)?;
+        let mut arena = Arena::new();
+        let created = arena.add_or_find_dvec(DVec3::new(0.5, 0.5, 1.0), NO_INDEX);
+        let second = arena.add_or_find_dvec(DVec3::new(1.0, 0.0, 0.0), 1);
+        let first = arena.add_or_find_dvec(DVec3::new(0.0, 0.0, 0.0), 0);
+        let mesh = build(
+            &[poly(vec![created, second, first], 0)],
+            &arena,
+            &[operand(&a)],
+            &[],
+        )?;
+        assert_eq!(mesh.faces[0].vertices, vec![2, 1, 0]);
+        assert!(mesh.vertices[0].co.cmpeq(DVec3::new(0.0, 0.0, 0.0)).all());
+        assert!(mesh.vertices[1].co.cmpeq(DVec3::new(1.0, 0.0, 0.0)).all());
+        assert!(mesh.vertices[2].co.cmpeq(DVec3::new(0.5, 0.5, 1.0)).all());
+        Ok(())
+    }
+
+    #[test]
+    fn edges_follow_blender_mesh_calc_edges_order() -> TestResult {
+        let a = triangle(0.0)?;
+        let mut arena = Arena::new();
+        let ids = [
+            arena.add_or_find_dvec(DVec3::new(0.0, 0.0, 0.0), 0),
+            arena.add_or_find_dvec(DVec3::new(1.0, 0.0, 0.0), 1),
+            arena.add_or_find_dvec(DVec3::new(0.0, 1.0, 0.0), 2),
+            arena.add_or_find_dvec(DVec3::new(1.0, 1.0, 0.0), 3),
+        ];
+        let polys = [
+            poly(vec![ids[0], ids[1], ids[2]], 0),
+            poly(vec![ids[2], ids[1], ids[3]], 0),
+        ];
+        let mesh = build(&polys, &arena, &[operand(&a)], &[])?;
+        let edges: Vec<[u32; 2]> = mesh.edges.iter().map(|edge| edge.vertices).collect();
+        assert_eq!(edges, vec![[0, 2], [0, 1], [1, 2], [2, 3], [1, 3]]);
         Ok(())
     }
 
@@ -1723,8 +1814,8 @@ mod tests {
             attribute(&mesh, "blender_edge_flags"),
             json!([
                 {"sharp": false, "seam": false},
-                {"sharp": true, "seam": false},
-                {"sharp": false, "seam": false}
+                {"sharp": false, "seam": false},
+                {"sharp": true, "seam": false}
             ])
         );
         Ok(())
