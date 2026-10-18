@@ -77,8 +77,38 @@ pub(crate) fn continuous_density(
     density
 }
 
-/// Continuous Principled BSDF times reflectance, as used by `evaluate / density` estimators.
-pub(crate) fn evaluate(params: &BsdfParams, normal: DVec3, view: DVec3, light: DVec3) -> DVec3 {
+/// Diffuse lobe of the Principled BSDF: Lambert under the dielectric-layering weight, times
+/// reflectance. It depends on the view only (the layering albedo is view-dependent), so an area
+/// light can be integrated against it analytically.
+pub(crate) fn diffuse_coefficient(params: &BsdfParams, normal: DVec3, view: DVec3) -> DVec3 {
+    let n_dot_v = normal.dot(view).max(0.0);
+    if n_dot_v <= 0.0 {
+        return DVec3::ZERO;
+    }
+    let roughness = params.roughness.clamp(MIN_ROUGHNESS, 1.0);
+    let metallic = params.metallic.clamp(0.0, 1.0);
+    let transmission = params.transmission.clamp(0.0, 1.0);
+    let dielectric_weight = ((1.0 - metallic) * (1.0 - transmission)).max(0.0);
+    let diffuse_weight = match specular_layer(params) {
+        Some(layer) => {
+            let z = ((layer.eta - 1.0) / (layer.eta + 1.0)).abs().sqrt();
+            let albedo_remap = ggx_gen_schlick_ior_s(roughness, n_dot_v, z);
+            let albedo = layer.f0_tinted.lerp(DVec3::ONE, albedo_remap);
+            closure_layering_weight(albedo.max_element(), dielectric_weight)
+        }
+        None => dielectric_weight,
+    };
+    base_color(params) * (diffuse_weight / PI) * params.reflectance.clamp(0.0, 1.0)
+}
+
+/// Specular (dielectric and metallic) lobes along `light`, times reflectance. Zero when the
+/// light or view is below the surface.
+pub(crate) fn specular_coefficient(
+    params: &BsdfParams,
+    normal: DVec3,
+    view: DVec3,
+    light: DVec3,
+) -> DVec3 {
     let n_dot_v = normal.dot(view).max(0.0);
     let n_dot_l = normal.dot(light).max(0.0);
     if n_dot_v <= 0.0 || n_dot_l <= 0.0 {
@@ -91,12 +121,7 @@ pub(crate) fn evaluate(params: &BsdfParams, normal: DVec3, view: DVec3, light: D
     let alpha_squared = ggx_alpha_squared(roughness);
     let metallic = params.metallic.clamp(0.0, 1.0);
     let transmission = params.transmission.clamp(0.0, 1.0);
-    let base = DVec3::new(
-        params.base_color[0],
-        params.base_color[1],
-        params.base_color[2],
-    )
-    .clamp(DVec3::ZERO, DVec3::ONE);
+    let base = base_color(params);
 
     // Energy preservation: E is looked up at the view direction, as Cycles does at setup
     // (`microfacet_ggx_preserve_energy(kg, bsdf, sd->wi, ...)`), so it is constant per shading point.
@@ -109,7 +134,6 @@ pub(crate) fn evaluate(params: &BsdfParams, normal: DVec3, view: DVec3, light: D
         / (4.0 * n_dot_v * n_dot_l).max(1.0e-8);
 
     let dielectric_weight = ((1.0 - metallic) * (1.0 - transmission)).max(0.0);
-    let mut diffuse_weight = dielectric_weight;
     let mut reflected = DVec3::ZERO;
 
     if let Some(layer) = specular_layer(params) {
@@ -127,13 +151,6 @@ pub(crate) fn evaluate(params: &BsdfParams, normal: DVec3, view: DVec3, light: D
         let fss = f0.lerp(DVec3::ONE, fss_remap);
         let gain = multiscatter_gain(fss, energy_average, missing);
         reflected += gain * fresnel * dielectric_weight;
-
-        // Layering: the diffuse lobe sits below the dielectric specular lobe and is attenuated by
-        // the layer's view-dependent albedo (`bsdf_albedo` -> `ggx_gen_schlick_ior_s`).
-        let z = ((layer.eta - 1.0) / (layer.eta + 1.0)).abs().sqrt();
-        let albedo_remap = ggx_gen_schlick_ior_s(roughness, n_dot_v, z);
-        let albedo = f0.lerp(DVec3::ONE, albedo_remap);
-        diffuse_weight = closure_layering_weight(albedo.max_element(), dielectric_weight);
     }
 
     if metallic > 0.0 {
@@ -155,9 +172,50 @@ pub(crate) fn evaluate(params: &BsdfParams, normal: DVec3, view: DVec3, light: D
         reflected += gain * fresnel * metallic;
     }
 
-    let diffuse = base * (diffuse_weight / PI);
-    let specular = reflected * common;
-    (diffuse + specular) * params.reflectance.clamp(0.0, 1.0)
+    (reflected * common) * params.reflectance.clamp(0.0, 1.0)
+}
+
+/// Continuous Principled BSDF times reflectance, the `evaluate / density` estimator's numerator.
+pub(crate) fn evaluate(params: &BsdfParams, normal: DVec3, view: DVec3, light: DVec3) -> DVec3 {
+    if normal.dot(light) <= 0.0 {
+        return DVec3::ZERO;
+    }
+    diffuse_coefficient(params, normal, view) + specular_coefficient(params, normal, view, light)
+}
+
+fn base_color(params: &BsdfParams) -> DVec3 {
+    DVec3::new(
+        params.base_color[0],
+        params.base_color[1],
+        params.base_color[2],
+    )
+    .clamp(DVec3::ZERO, DVec3::ONE)
+}
+
+/// Principled inputs that change Cycles' result but that this lobe model does not evaluate, as
+/// `(feature_id, Blender input)` pairs. Renders report each one as an `UNSUPPORTED_FEATURE`
+/// warning, so no contribution is dropped silently.
+pub(crate) fn unevaluated_inputs(params: &BsdfParams) -> Vec<(&'static str, &'static str)> {
+    let mut inputs = Vec::new();
+    if params.coat_weight > 0.0 {
+        inputs.push(("shader.principled.coat", "Coat Weight"));
+    }
+    if params.sheen_weight > 0.0 {
+        inputs.push(("shader.principled.sheen", "Sheen Weight"));
+    }
+    if params.subsurface_weight > 0.0 {
+        inputs.push(("shader.principled.subsurface", "Subsurface Weight"));
+    }
+    if params.anisotropic_ior > 0.0 {
+        inputs.push(("shader.principled.anisotropic", "Anisotropic"));
+    }
+    if params.thin_film_thickness > 0.0 {
+        inputs.push(("shader.principled.thin_film", "Thin Film Thickness"));
+    }
+    if params.transmission > 0.0 && params.roughness > 0.0 {
+        inputs.push(("shader.principled.transmission_ggx", "Transmission Weight"));
+    }
+    inputs
 }
 
 /// `closure_layering_weight(layer_albedo, weight)` for a scalar weight and a per-channel albedo:
