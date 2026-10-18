@@ -6284,6 +6284,7 @@ mod tests {
                     "constant_offset_displace": [1.0, 0.0, 0.0],
                 }),
             )],
+            "ArrayFitCurveWithoutCurve",
         )
         .unwrap();
         // floor((2 + 1e-6) / 1) + 1 = 3 copies of the 8-vertex box.
@@ -6306,6 +6307,7 @@ mod tests {
                     "constant_offset_displace": [1.0, 0.0, 0.0],
                 }),
             )],
+            "ArrayFitCurveDanglingCurve",
         )
         .unwrap_err();
         assert_eq!(error.code, ErrorCode::TargetNotFound);
@@ -6356,6 +6358,7 @@ mod tests {
                     "constant_offset_displace": [1.0, 0.0, 0.0],
                 }),
             )],
+            "ArrayOutputPastMemoryBudget",
         )
         .unwrap_err();
         assert_eq!(error.code, ErrorCode::LimitExceeded);
@@ -7143,6 +7146,7 @@ mod tests {
             let result = evaluate_modifiers(
                 &mesh,
                 &[with_params("mirror", json!({"use_axis": [true, false, false], "use_mirror_merge": true, "merge_threshold": 0.001}))],
+                "MirrorTriangle",
             ).unwrap();
             prop_assert_eq!(result.vertices.len(), mesh.vertices.len());
             prop_assert_eq!(result.faces.len(), mesh.faces.len());

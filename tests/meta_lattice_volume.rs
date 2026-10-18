@@ -64,6 +64,7 @@ fn little_endian_f32_blob_samples_match_inline_density() {
             dims: [2, 2, 2],
             voxel_size: 1.0,
             origin: DVec3::ZERO,
+            index_to_local: None,
             values: None,
             blob_f32: Some(blob),
             content_ref: Some("sha256:sample-grid".to_owned()),
