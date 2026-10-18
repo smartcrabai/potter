@@ -986,13 +986,12 @@ fn operation_contract(name: &str) -> OperationContract {
         ),
         "sculpt.stroke" => (
             vec![
-                "target", "scope", "brush", "samples", "falloff", "symmetry", "seed", "delta",
-                "dyntopo",
+                "target", "scope", "brush", "samples", "falloff", "symmetry", "delta", "dyntopo",
             ],
             vec!["op", "target", "brush", "samples"],
             "mesh object and stroke samples",
             "shared|single_user for shared data",
-            json!({"falloff":"smooth","symmetry":[],"seed":0}),
+            json!({"falloff":"smooth","symmetry":[]}),
         ),
         "sculpt.dyntopo" => (
             vec![
@@ -1001,13 +1000,12 @@ fn operation_contract(name: &str) -> OperationContract {
                 "samples",
                 "falloff",
                 "symmetry",
-                "seed",
                 "edge_length",
             ],
             vec!["op", "target", "samples", "edge_length"],
             "mesh object and stroke samples",
             "shared|single_user for shared data",
-            json!({"falloff":"smooth","symmetry":[],"seed":0}),
+            json!({"falloff":"smooth","symmetry":[]}),
         ),
         "mesh.transform_elements" => (
             vec![
@@ -1967,7 +1965,6 @@ fn field_schema(operation: &str, field: &str) -> Value {
                 json!({"type":"array","minItems":1,"items":{"type":"object","required":["position","pressure","radius","strength","time"],"properties":{"position":vec_schema(3),"pressure":{"type":"number","minimum":0,"maximum":1},"radius":{"type":"number","minimum":0},"strength":{"type":"number"},"time":{"type":"number"}},"additionalProperties":false}})
             }
             "symmetry" => json!({"type":"array","items":{"enum":["x","y","z"]},"uniqueItems":true}),
-            "seed" => json!({"type":"integer","minimum":0,"maximum":u64::MAX}),
             "delta" => vec_schema(3),
             "dyntopo" => {
                 json!({"type":"object","required":["edge_length"],"properties":{"edge_length":{"type":"number","exclusiveMinimum":0}},"additionalProperties":false})

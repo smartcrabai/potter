@@ -39,8 +39,7 @@ fn apply_stroke(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resu
         engine,
         operation,
         &[
-            "op", "target", "scope", "brush", "samples", "falloff", "symmetry", "seed", "delta",
-            "dyntopo",
+            "op", "target", "scope", "brush", "samples", "falloff", "symmetry", "delta", "dyntopo",
         ],
         &["target", "brush", "samples"],
     )?;
@@ -255,7 +254,6 @@ fn apply_dyntopo(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Res
             "samples",
             "falloff",
             "symmetry",
-            "seed",
             "edge_length",
         ],
         &["target", "samples", "edge_length"],
@@ -789,21 +787,11 @@ pub(super) fn parse_stroke(
         .get("delta")
         .map(|value| vector3(engine, Some(value), "/delta"))
         .transpose()?;
-    let seed = operation.get("seed").map_or(Ok(0), |value| {
-        value.as_u64().ok_or_else(|| {
-            engine.error(
-                ErrorCode::InvalidOperation,
-                "seed must be a nonnegative integer",
-                "/seed",
-            )
-        })
-    })?;
     Ok(sculpt_geom::Stroke {
         brush,
         samples,
         falloff,
         symmetry,
-        seed,
         delta,
     })
 }

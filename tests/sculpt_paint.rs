@@ -117,7 +117,7 @@ fn sculpt_multires_stroke_updates_mdisps_and_base_mesh_mode_preserves_grids()
     let stroke = json!({
         "op":"sculpt.stroke", "target":{"id":"body"}, "brush":"draw", "scope":"shared",
         "samples":[{"position":[1.0,1.0,1.0],"pressure":1.0,"radius":1.0,"strength":0.5,"time":0.0}],
-        "falloff":"linear", "seed":7
+        "falloff":"linear"
     });
     let (_multires_directory, multires_scene) = create_scene()?;
     apply(
@@ -170,9 +170,12 @@ fn sculpt_multires_stroke_updates_mdisps_and_base_mesh_mode_preserves_grids()
 /// tests/fixtures/multires/sculpt_oracle/gen_brush_oracle.py, whose header derives every setting from the Blender source.
 const DRIVEN_ARMATURE_ORACLE: &str =
     include_str!("fixtures/multires/sculpt_oracle/driven_armature_sculpt.json");
-/// Both sides evaluate the same pre-stroke geometry, so vertices are paired by pre-stroke position. Blender
-/// evaluates in float32 (one ulp at |x| ~ 2.5 is about 2.4e-7); 1e-5 is a 40x margin for pairing only.
-const ORACLE_PRESTROKE_TOLERANCE: f64 = 1.0e-5;
+/// Both sides evaluate the same pre-stroke geometry, so vertices are paired by pre-stroke position, and the
+/// pairing must hold within the same float32 bound as the stroke. Bound, with u = 2^-24 = 5.96e-8 and M = 3.34
+/// (as for ORACLE_POSITION_TOLERANCE): N = 41 rounding steps on the pre-stroke chain (armature skin, shrinkwrap
+/// projection, multires base, subdivision stencils), counted from the stencils, not from Blender's instructions.
+/// Euclidean bound sqrt(3) * 41 * 5.96e-8 * 3.34 = 1.41e-5, rounded up to 1.42e-5.
+const ORACLE_PRESTROKE_TOLERANCE: f64 = 1.42e-5;
 /// Potter's Draw (crates/potter-core/src/geom/sculpt.rs, Draw branch) computes Blender's Draw offset
 /// (draw.cc:196-197) exactly, so the remaining gap is float32 rounding in Blender. Bound, with u = 2^-24 = 5.96e-8:
 /// - M = 3.34 bounds |coordinate| in driven_armature_sculpt.json (object space; the largest is 3.3338).
@@ -180,7 +183,7 @@ const ORACLE_PRESTROKE_TOLERANCE: f64 = 1.0e-5;
 ///   storage and reconstruction (6); bilinear grid interpolation (7); and a 9-weight Catmull-Clark stencil with
 ///   8 adds (17). Counted from the stencil shapes, not from Blender's compiled instruction stream.
 /// - Euclidean bound sqrt(3) * N * u * M = 1.2e-5 for the stroke path.
-/// - Pre-stroke pairing is asserted separately to ORACLE_PRESTROKE_TOLERANCE (1e-5); adding it gives 2.2e-5.
+/// - Pre-stroke pairing is asserted separately to ORACLE_PRESTROKE_TOLERANCE (1.42e-5); adding it gives 2.6e-5.
 /// Rounded up to a power of ten: 1e-4.
 const ORACLE_POSITION_TOLERANCE: f64 = 1.0e-4;
 
@@ -247,7 +250,7 @@ fn multires_sculpt_uses_driven_armature_and_shrinkwrap_prefix_for_brush_base()
     let stroke = json!([{
         "op":"sculpt.stroke","target":{"id":"body"},"brush":"draw","scope":"shared",
         "samples":[{"position":[2.5,0.0,0.0],"pressure":1.0,"radius":1.5,"strength":0.5,"time":0.0}],
-        "falloff":"linear","seed":7
+        "falloff":"linear"
     }]);
     // Stroke samples are world space. The deformed body's evaluated surface is at world z=0 (its local z=-1 plus its
     // translation z=+1), so the sample lies on it. The oracle sends the same point as object-space (2.5,0,-1).
@@ -343,7 +346,7 @@ fn sculpt_multires_stroke_respects_interpolated_control_masks() -> Result<(), Bo
             {"op":"sculpt.multires", "target":{"id":"body"}, "id":"multi_one", "levels":1, "render_levels":1},
             {"op":"sculpt.stroke", "target":{"id":"body"}, "brush":"draw", "scope":"shared",
              "samples":[{"position":[1.0,1.0,1.0],"pressure":1.0,"radius":1.0,"strength":0.5,"time":0.0}],
-             "falloff":"linear", "seed":7}
+             "falloff":"linear"}
         ]),
     )?;
     let masked_mesh = stored_mesh(&masked_scene)?;
@@ -381,7 +384,7 @@ fn multires_sculpt_levels_select_native_grid_resolution() -> Result<(), Box<dyn 
                  "set":{"params":{"levels":2,"sculpt_levels":sculpt_levels,"render_levels":2,"total_levels":2}}},
                 {"op":"sculpt.stroke", "target":{"id":"body"}, "brush":"draw", "scope":"shared",
                  "samples":[{"position":[1.0,1.0,1.0],"pressure":1.0,"radius":1.0,"strength":0.5,"time":0.0}],
-                 "falloff":"linear", "seed":7}
+                 "falloff":"linear"}
             ]),
         )?;
         let mesh = stored_mesh(&scene)?;
@@ -426,7 +429,7 @@ fn multires_blend_roundtrips_continue_sculpt_and_apply() -> Result<(), Box<dyn E
              "set":{"params":{"show_only_control_edges":false,"use_sculpt_base_mesh":false}}},
             {"op":"sculpt.stroke", "target":{"id":"body"}, "brush":"draw", "scope":"shared",
              "samples":[{"position":[1.0,1.0,1.0],"pressure":1.0,"radius":1.0,"strength":0.5,"time":0.0}],
-             "falloff":"linear", "seed":7}
+             "falloff":"linear"}
         ]),
     )?;
     let source_document: Value =
@@ -571,7 +574,7 @@ fn multires_blend_roundtrips_continue_sculpt_and_apply() -> Result<(), Box<dyn E
             &json!([{
                 "op":"sculpt.stroke", "target":{"id":node_id}, "brush":"draw", "scope":"shared",
                 "samples":[{"position":[1.0,1.0,1.0],"pressure":1.0,"radius":1.0,"strength":0.5,"time":0.0}],
-                "falloff":"linear", "seed":19
+                "falloff":"linear"
             }]),
             base_revision,
         )?;
@@ -645,7 +648,7 @@ fn draw_respects_radius_and_mask_and_vertex_paint_updates_touched_corners()
             {"op":"node.create", "id":"body", "kind":"box", "params":{}, "transform":{"translation":[2.0,0.0,0.0]}},
             {"op":"sculpt.stroke", "target":{"id":"body"}, "brush":"draw", "scope":"shared",
              "samples":[{"position":[3.0,1.0,1.0],"pressure":1.0,"radius":0.25,"strength":0.5,"time":0.0}],
-             "falloff":"linear", "seed":7}
+             "falloff":"linear"}
         ]),
     )?;
     let after_draw = stored_mesh(&scene)?;
@@ -675,7 +678,7 @@ fn draw_respects_radius_and_mask_and_vertex_paint_updates_touched_corners()
              "elements":{"domain":"vertex","ids":["v6"]}, "value":1.0},
             {"op":"sculpt.stroke", "target":{"id":"body"}, "brush":"draw", "scope":"shared",
              "samples":[{"position":[1.0,1.0,1.0],"pressure":1.0,"radius":0.25,"strength":0.5,"time":0.0}],
-             "falloff":"linear", "seed":7}
+             "falloff":"linear"}
         ]),
     )?;
     let masked = stored_mesh(&masked_scene)?;
@@ -836,7 +839,7 @@ fn sculpt_shared_data_requires_scope_and_single_user_isolates_stroke() -> Result
         {"op":"node.duplicate", "target":{"id":"body"}, "id":"body_copy", "mode":"linked"},
         {"op":"sculpt.stroke", "target":{"id":"body_copy"}, "brush":"draw",
          "samples":[{"position":[1.0,1.0,1.0],"pressure":1.0,"radius":0.25,"strength":0.5,"time":0.0}],
-         "falloff":"linear", "seed":4}
+         "falloff":"linear"}
     ]);
     let rejected_batch =
         json!({"schema_version":1,"base_revision":0,"operations":shared_operations});
@@ -860,7 +863,7 @@ fn sculpt_shared_data_requires_scope_and_single_user_isolates_stroke() -> Result
             {"op":"node.duplicate", "target":{"id":"body"}, "id":"body_copy", "mode":"linked"},
             {"op":"sculpt.stroke", "target":{"id":"body_copy"}, "brush":"draw", "scope":"single_user",
              "samples":[{"position":[1.0,1.0,1.0],"pressure":1.0,"radius":0.25,"strength":0.5,"time":0.0}],
-             "falloff":"linear", "seed":4}
+             "falloff":"linear"}
         ]),
     )?;
     let document: Value = serde_json::from_slice(&fs::read(scene.join("scene.json"))?)?;
@@ -875,9 +878,9 @@ fn sculpt_shared_data_requires_scope_and_single_user_isolates_stroke() -> Result
 }
 
 #[test]
-fn sculpt_symmetry_and_seed_are_deterministic() -> Result<(), Box<dyn Error>> {
+fn sculpt_symmetry_and_repeat_strokes_are_deterministic() -> Result<(), Box<dyn Error>> {
     let base = Mesh::box_mesh(potter_core::geom::BoxParams::default())?;
-    let stroke = |symmetry: &[&str], seed| sculpt::Stroke {
+    let stroke = |symmetry: &[&str]| sculpt::Stroke {
         brush: sculpt::Brush::Draw,
         samples: vec![sculpt::StrokeSample {
             position: DVec3::new(0.0, -1.0, 1.0),
@@ -888,11 +891,10 @@ fn sculpt_symmetry_and_seed_are_deterministic() -> Result<(), Box<dyn Error>> {
         }],
         falloff: sculpt::Falloff::Linear,
         symmetry: symmetry.iter().map(|axis| (*axis).to_owned()).collect(),
-        seed,
         delta: None,
     };
     let mut mirrored = base.clone();
-    sculpt::apply_stroke(&mut mirrored, &stroke(&["x"], 33))?;
+    sculpt::apply_stroke(&mut mirrored, &stroke(&["x"]))?;
     let movement = |mesh: &Mesh, id| {
         let original = base
             .vertices
@@ -913,7 +915,7 @@ fn sculpt_symmetry_and_seed_are_deterministic() -> Result<(), Box<dyn Error>> {
 
     let mut first = base.clone();
     let mut second = base;
-    let deterministic = stroke(&[], 9127);
+    let deterministic = stroke(&[]);
     sculpt::apply_stroke(&mut first, &deterministic)?;
     sculpt::apply_stroke(&mut second, &deterministic)?;
     let first_hash = sha256(&canonicalize(&serde_json::to_value(&first)?)?);

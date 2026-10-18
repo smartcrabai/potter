@@ -57,7 +57,6 @@ pub struct Stroke {
     pub samples: Vec<StrokeSample>,
     pub falloff: Falloff,
     pub symmetry: Vec<String>,
-    pub seed: u64,
     pub delta: Option<DVec3>,
 }
 
@@ -239,14 +238,23 @@ fn deform_vertex(
             // Blender has no per-vertex jitter, so none is applied here.
             point + normal * (radius * strength * influence)
         }
-        Brush::ClayStrips | Brush::Inflate | Brush::Layer => {
-            let multiplier = if stroke.brush == Brush::ClayStrips {
-                0.75
-            } else {
-                1.0
-            };
-            let deterministic = deterministic_scale(stroke.seed, point, &stroke.symmetry);
-            point + normal * (influence * multiplier * deterministic)
+        Brush::ClayStrips => {
+            // Blender 5.2.2 Clay Strips (mesh/brushes/clay_strips.cc:328): offset = plane_normal *
+            // bstrength * radius, applied with the falloff factors only (clay_strips.cc:190). No
+            // random factor. Potter's 0.75 is kept unchanged; Blender's offset has no such factor.
+            point + normal * (influence * 0.75)
+        }
+        Brush::Inflate => {
+            // Blender 5.2.2 Inflate (mesh/brushes/inflate.cc:142): scale = cache.scale * radius *
+            // bstrength, applied as normal * scale * falloff factor (inflate.cc:72-73). No random
+            // factor.
+            point + normal * influence
+        }
+        Brush::Layer => {
+            // Blender 5.2.2 Layer (mesh/brushes/layer.cc:51): displacement += factor * strength *
+            // (1.05 - |displacement|); translation = normal * height * displacement * factor
+            // (layer.cc:101-103). No random factor.
+            point + normal * influence
         }
         Brush::Grab => point + sample_delta * influence,
         Brush::Smooth => {
@@ -1058,26 +1066,6 @@ fn read_scalar_attribute(mesh: &Mesh, name: &str) -> Result<std::collections::BT
         )
 }
 
-fn deterministic_scale(seed: u64, position: DVec3, symmetry: &[String]) -> f64 {
-    let mut value = seed;
-    for (component, axis) in ["x", "y", "z"].iter().enumerate() {
-        let coordinate = position[component];
-        let coordinate = if symmetry.iter().any(|candidate| candidate == axis) {
-            coordinate.abs()
-        } else {
-            coordinate
-        };
-        value ^= coordinate.to_bits().wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    }
-    value ^= value >> 31;
-    let bytes = value.to_le_bytes();
-    let unit = f64::from(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-        / f64::from(u32::MAX);
-    0.98 + unit * 0.02
-}
-
 fn invalid(message: impl Into<String>) -> PotError {
     PotError::with_details(
         crate::error::ErrorCode::InvalidOperation,
@@ -1145,7 +1133,6 @@ mod tests {
             ],
             falloff: Falloff::Smooth,
             symmetry: Vec::new(),
-            seed: 17,
             delta,
         }
     }
@@ -1194,7 +1181,7 @@ mod tests {
         let radius = 3.0;
         let strength = 0.5;
         let pressure = 1.0;
-        let stroke = |seed| Stroke {
+        let stroke = Stroke {
             brush: Brush::Draw,
             samples: vec![StrokeSample {
                 position: DVec3::ZERO,
@@ -1205,7 +1192,6 @@ mod tests {
             }],
             falloff: Falloff::Linear,
             symmetry: Vec::new(),
-            seed,
             delta: None,
         };
         // The sample sits on vertex 0 (distance 0) and 1 unit from vertices 1 and 2, so linear falloff
@@ -1213,7 +1199,7 @@ mod tests {
         let weights = [1.0, 1.0 - 1.0 / radius, 1.0 - 1.0 / radius];
         let original = test_mesh();
         let mut mesh = test_mesh();
-        apply_stroke(&mut mesh, &stroke(17)).unwrap();
+        apply_stroke(&mut mesh, &stroke).unwrap();
         for (index, (vertex, start)) in mesh.vertices.iter().zip(&original.vertices).enumerate() {
             let expected =
                 start.co + DVec3::Z * (radius * strength * (weights[index] * pressure * strength));
@@ -1223,9 +1209,57 @@ mod tests {
                 vertex.co
             );
         }
-        let mut reseeded = test_mesh();
-        apply_stroke(&mut reseeded, &stroke(9_999)).unwrap();
-        assert_eq!(mesh, reseeded);
+    }
+
+    #[test]
+    fn clay_strips_inflate_and_layer_offsets_have_no_jitter() {
+        // Blender 5.2.2 applies no per-vertex random scale to these brushes:
+        // - Clay Strips: offset = plane_normal * bstrength * radius
+        //   (mesh/brushes/clay_strips.cc:328), applied with the falloff factors only
+        //   (clay_strips.cc:190).
+        // - Inflate: scale = cache.scale * radius * bstrength (mesh/brushes/inflate.cc:142),
+        //   applied as normal * scale * falloff factor (inflate.cc:72-73).
+        // - Layer: displacement += factor * strength * (1.05 - |displacement|)
+        //   (mesh/brushes/layer.cc:51), translation = normal * height * displacement * factor
+        //   (layer.cc:101-103).
+        // Potter's per-vertex amount is falloff weight * pressure * strength along +Z. Clay Strips
+        // keeps Potter's existing 0.75 factor, which Blender's offset does not contain.
+        let radius = 3.0;
+        let strength = 0.5;
+        let pressure = 1.0;
+        let weights = [1.0, 1.0 - 1.0 / radius, 1.0 - 1.0 / radius];
+        let original = test_mesh();
+        for (brush, factor) in [
+            (Brush::ClayStrips, 0.75_f64),
+            (Brush::Inflate, 1.0),
+            (Brush::Layer, 1.0),
+        ] {
+            let stroke = Stroke {
+                brush,
+                samples: vec![StrokeSample {
+                    position: DVec3::ZERO,
+                    pressure,
+                    radius,
+                    strength,
+                    time: 0.0,
+                }],
+                falloff: Falloff::Linear,
+                symmetry: Vec::new(),
+                delta: None,
+            };
+            let mut mesh = test_mesh();
+            apply_stroke(&mut mesh, &stroke).unwrap();
+            for (index, (vertex, start)) in mesh.vertices.iter().zip(&original.vertices).enumerate()
+            {
+                let expected =
+                    start.co + DVec3::Z * (weights[index] * pressure * strength * factor);
+                assert!(
+                    vertex.co.distance(expected) < 1.0e-12,
+                    "{brush:?} vertex {index}: {:?} != {expected:?}",
+                    vertex.co
+                );
+            }
+        }
     }
 
     #[test]
@@ -1249,7 +1283,6 @@ mod tests {
             samples: vec![sample(DVec3::new(0.1, 0.0, 0.0))],
             falloff: Falloff::Smooth,
             symmetry: Vec::new(),
-            seed: 0,
             delta: None,
         };
 
@@ -1294,7 +1327,6 @@ mod tests {
             samples: vec![sample(DVec3::ZERO)],
             falloff: Falloff::Smooth,
             symmetry: Vec::new(),
-            seed: 0,
             delta: None,
         };
 

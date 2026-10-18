@@ -324,7 +324,7 @@ Implement all families below in the first release. Each variant MUST cover every
 - node.delete: if children exist, specify `recursive:true` or `reparent:"to_parent"|"to_root"`. `to_parent` moves children to the nearest parent not being deleted; `to_root` moves them to no parent. Both preserve the world transform with `keep_world` (default true). `recursive:true` and `reparent` MUST NOT be used together. Explicitly specify cascade / unlink handling for referenced data. Determine whether deletion is allowed from the structure at the start of the operation.
 - material.create / update support both simplified PBR input and full shader graphs. For a referenced material.delete, explicitly handle assignments; do not silently change them to the default.
 - An ID collision yields ID_EXISTS; do not rename automatically. For Blender name collisions, also create a name mapping report and manage by ID.
-- A stroke is a sequence of world-space samples with time, pressure, radius, strength, falloff, symmetry, and seed. Convert screen input from the Snapshot, camera, and depth, and record the resulting world-space sequence.
+- A stroke is a sequence of world-space samples with time, pressure, radius, strength, falloff, and symmetry. Convert screen input from the Snapshot, camera, and depth, and record the resulting world-space sequence.
 - Validate attribute, material, UV, weight, shape key, and rig mappings after topology changes. If preservation is impossible, return an error; do not save corrupted creation data based on guesses.
 
 ## 6. Atomic Editing and Retries
