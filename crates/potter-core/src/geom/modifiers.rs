@@ -739,7 +739,6 @@ fn validated(mesh: &Mesh) -> Result<()> {
     mesh.validate().map_err(|error| mesh_error(&error))
 }
 
-
 fn parameter_value<'a>(modifier: &'a Modifier, name: &str) -> Option<&'a Value> {
     modifier
         .params
@@ -2525,7 +2524,6 @@ fn apply_first_source_edge_flags(
     }
     Ok(())
 }
-
 
 #[derive(Clone, Copy)]
 struct SubdivisionOptions {
