@@ -88,12 +88,18 @@ impl ColorManagement {
                 ),
             ));
         }
+        let curve = if let Some(curve) = &self.curve {
+            curve.validate()?;
+            Some(curve.prepare())
+        } else {
+            None
+        };
         Ok(DisplayEncoder {
             view_transform: self.view_transform,
             look,
             exposure: self.exposure,
             gamma: self.gamma,
-            curve: self.curve.as_ref().map(curve::CurveMapping::prepare),
+            curve,
         })
     }
 }
@@ -524,6 +530,25 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn display_encoder_rejects_deserialized_malformed_curve_before_preparing()
+    -> std::result::Result<(), Box<dyn Error>> {
+        let mut value = serde_json::to_value(ColorManagement::default())?;
+        value["curve"] = serde_json::to_value(curve::CurveMapping::default())?;
+        value["curve"]["curves"][0]["points"] = serde_json::json!([{
+            "location": [0.0, 0.0],
+            "handle": "auto"
+        }]);
+        let settings: ColorManagement = serde_json::from_value(value)?;
+
+        let error = match settings.display_encoder() {
+            Ok(_) => return Err("invalid curve was accepted".into()),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, crate::error::ErrorCode::InvalidArgument);
+        assert!(error.message.contains("curve 0 needs at least two points"));
+        Ok(())
+    }
     #[test]
     fn gamma_is_applied_to_the_encoded_value() -> Result<(), Box<dyn Error>> {
         // Gamma raises the sRGB-encoded value to 1/gamma; on linear light the result would differ.

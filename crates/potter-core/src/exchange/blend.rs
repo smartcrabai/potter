@@ -7234,6 +7234,18 @@ pub(crate) fn export_losses(doc: &SceneDoc) -> Vec<Loss> {
                 "the scene references a world missing from the world registry",
             ));
         }
+        if scene.color_management.curve.as_ref().is_some_and(|curve| {
+            curve
+                .clip
+                .iter()
+                .any(|value| !(-100.0..=100.0).contains(value))
+        }) {
+            losses.push(loss(
+                "blender.color_management.curve_clip",
+                Some(scene_id.as_str()),
+                "Blender clamps view-curve clip values to [-100, 100]; this clip rectangle cannot be restored exactly",
+            ));
+        }
         if !matches!(scene.render.engine.as_str(), "path" | "realtime") {
             losses.push(loss(
                 "blender.render.engine",
@@ -7869,6 +7881,40 @@ fn loss(feature: impl Into<String>, data_id: Option<&str>, reason: &str) -> Loss
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn color_curve_extension_serializes_as_bridge_boolean() -> Result<()> {
+        let mut curve = CurveMapping::default();
+        let extrapolated = serde_json::to_value(&curve).map_err(PotError::internal_json)?;
+        assert_eq!(extrapolated["extend_extrapolate"], json!(true));
+        assert!(extrapolated.get("extend").is_none());
+
+        curve.extend_extrapolate = false;
+        let horizontal = serde_json::to_value(curve).map_err(PotError::internal_json)?;
+        assert_eq!(horizontal["extend_extrapolate"], json!(false));
+        Ok(())
+    }
+
+    #[test]
+    fn color_curve_clip_outside_blender_rna_bounds_is_reported_as_export_loss() -> Result<()> {
+        let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+        let scene_id = doc.active_scene.clone();
+        let scene = doc
+            .scenes
+            .get_mut(&scene_id)
+            .ok_or_else(|| PotError::new(ErrorCode::SceneInvalid, "active scene missing"))?;
+        let mut curve = CurveMapping::default();
+        curve.clip = [0.0, 0.0, 101.0, 1.0];
+        scene.color_management.curve = Some(curve);
+
+        let losses = export_losses(&doc);
+        assert!(losses.iter().any(|loss| {
+            loss.feature_id == "blender.color_management.curve_clip"
+                && loss.data_id.as_deref() == Some(scene_id.as_str())
+                && loss.reason.contains("[-100, 100]")
+        }));
+        Ok(())
+    }
     #[test]
     fn modifier_type_mapping_covers_the_potter_schema() {
         let mappings = [

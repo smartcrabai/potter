@@ -232,9 +232,10 @@ fn upgrade_v2(value: &mut Value) -> Result<()> {
 
 /// Upgrades a schema-version-3 scene document to version 4. The released view curve, an array of
 /// `[x, y]` points evaluated piecewise-linearly with horizontal extension, becomes Blender's view
-/// `CurveMapping` on the combined curve with VECTOR handles (straight segments) and horizontal
-/// extension, so existing renders keep their shape. Clip is `[0, 1]`, black and white identity, and
-/// R, G, and B identity. An empty array means no curve.
+/// `CurveMapping` on the combined curve with VECTOR handles and horizontal extension, so existing
+/// renders keep their shape. The R/G/B identity curves cover the combined curve's full x-domain and
+/// `[0, 1]`; a single legacy point becomes a constant two-point curve. Clip is `[0, 1]`, black and
+/// white identity. An empty array means no curve.
 fn upgrade_v3(value: &mut Value) -> Result<()> {
     if let Some(scenes) = value.get_mut("scenes").and_then(Value::as_object_mut) {
         for scene in scenes.values_mut() {
@@ -254,14 +255,41 @@ fn upgrade_color_curve(color: &mut Value) -> Result<()> {
     let Value::Array(points) = curve else {
         return Err(invalid("color curve must be an array of [x, y] points"));
     };
-    let points = points
+    let mut points = points
         .iter()
         .map(legacy_curve_point)
         .collect::<Result<Vec<_>>>()?;
     let converted = if points.is_empty() {
         Value::Null
     } else {
+        if points.len() == 1 {
+            let y = points[0].location[1];
+            points = vec![
+                CurvePoint {
+                    location: [0.0, y],
+                    handle: HandleType::Vector,
+                },
+                CurvePoint {
+                    location: [1.0, y],
+                    handle: HandleType::Vector,
+                },
+            ];
+        }
+        let x_min = points[0].location[0].min(0.0);
+        let x_max = points[points.len() - 1].location[0].max(1.0);
         let mut mapping = CurveMapping::default();
+        for channel in &mut mapping.curves[..3] {
+            channel.points = vec![
+                CurvePoint {
+                    location: [x_min, x_min],
+                    handle: HandleType::Vector,
+                },
+                CurvePoint {
+                    location: [x_max, x_max],
+                    handle: HandleType::Vector,
+                },
+            ];
+        }
         mapping.curves[3].points = points;
         mapping.extend_extrapolate = false;
         mapping.validate()?;
@@ -1158,7 +1186,9 @@ mod tests {
             "schema_version": 3,
             "scenes": {
                 "empty": {"color_management": {"curve": []}},
-                "curved": {"color_management": {"curve": [[0.0, 0.0], [0.5, 0.25], [1.0, 1.0]]}}
+                "curved": {"color_management": {"curve": [[0.0, 0.0], [0.5, 0.25], [1.0, 1.0]]}},
+                "hdr": {"color_management": {"curve": [[0.0, 0.0], [2.0, 1.0]]}},
+                "single": {"color_management": {"curve": [[0.5, 0.25]]}}
             }
         });
         upgrade_scene(&mut scene)?;
@@ -1172,8 +1202,24 @@ mod tests {
         assert_eq!(curve.curves[3].points.len(), 3);
         assert_eq!(curve.curves[3].points[1].location, [0.5, 0.25]);
         assert_eq!(curve.curves[3].points[1].handle, HandleType::Vector);
-        assert_eq!(curve.curves[0], CurveMapping::default().curves[0]);
+        assert_eq!(curve.curves[0].points[0].location, [0.0, 0.0]);
+        assert_eq!(curve.curves[0].points[1].location, [1.0, 1.0]);
         assert!(!curve.extend_extrapolate);
+
+        let hdr: CurveMapping =
+            serde_json::from_value(scene["scenes"]["hdr"]["color_management"]["curve"].clone())?;
+        for channel in &hdr.curves[..3] {
+            assert_eq!(channel.points[0].location, [0.0, 0.0]);
+            assert_eq!(channel.points[1].location, [2.0, 2.0]);
+        }
+        assert!((hdr.prepare().evaluate_rgb([1.5; 3])[0] - 0.75).abs() < 1.0e-4);
+
+        let single: CurveMapping =
+            serde_json::from_value(scene["scenes"]["single"]["color_management"]["curve"].clone())?;
+        assert_eq!(single.curves[3].points.len(), 2);
+        assert_eq!(single.curves[3].points[0].location, [0.0, 0.25]);
+        assert_eq!(single.curves[3].points[1].location, [1.0, 0.25]);
+        assert!((single.prepare().evaluate_rgb([0.5; 3])[0] - 0.25).abs() < 1.0e-4);
         Ok(())
     }
 

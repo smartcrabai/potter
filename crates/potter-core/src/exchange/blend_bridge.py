@@ -1727,6 +1727,23 @@ def _color_curve_dump(view):
             "curves": curves}
 
 
+def _curve_extend_to_blender(curve):
+    return "EXTRAPOLATED" if curve["extend_extrapolate"] else "HORIZONTAL"
+
+
+def _restore_color_curve_clip(mapping, clip):
+    for minimum_name, maximum_name, minimum, maximum in (
+            ("clip_min_x", "clip_max_x", clip[0], clip[2]),
+            ("clip_min_y", "clip_max_y", clip[1], clip[3])):
+        # Blender clamps each minimum against the current maximum.
+        if minimum > getattr(mapping, maximum_name):
+            setattr(mapping, maximum_name, maximum)
+            setattr(mapping, minimum_name, minimum)
+        else:
+            setattr(mapping, minimum_name, minimum)
+            setattr(mapping, maximum_name, maximum)
+
+
 def _restore_color_curve(view, curve):
     """Writes Potter's view curve onto a scene: the inverse of `_color_curve_dump`.
 
@@ -1741,9 +1758,9 @@ def _restore_color_curve(view, curve):
     if mapping is None or len(mapping.curves) < 4:
         raise ValueError("Blender did not create the color-management curve mapping")
     mapping.tone = _CURVE_TONE_TO_BLENDER[curve["tone"]]
-    mapping.extend = "EXTRAPOLATED" if curve["extend"] == "extrapolated" else "HORIZONTAL"
+    mapping.extend = _curve_extend_to_blender(curve)
     mapping.use_clip = bool(curve["use_clip"])
-    mapping.clip_min_x, mapping.clip_min_y, mapping.clip_max_x, mapping.clip_max_y = curve["clip"]
+    _restore_color_curve_clip(mapping, curve["clip"])
     mapping.black_level = curve["black"]
     mapping.white_level = curve["white"]
     for index, source in enumerate(curve["curves"]):
