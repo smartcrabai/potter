@@ -33,11 +33,11 @@ use crate::{
 pub(super) enum FvarLinear {
     /// `uv_smooth` NONE: every edge and value is linear, so the UVs interpolate bilinearly.
     All,
-    /// `uv_smooth` SMOOTH_ALL: smooth everywhere, UV boundaries included.
+    /// `uv_smooth` `SMOOTH_ALL`: smooth everywhere, UV boundaries included.
     SmoothAll,
-    /// `uv_smooth` PRESERVE_CORNERS: UV corners stay put.
+    /// `uv_smooth` `PRESERVE_CORNERS`: UV corners stay put.
     CornersOnly,
-    /// `uv_smooth` PRESERVE_CORNERS_AND_JUNCTIONS: corners and junctions stay put.
+    /// `uv_smooth` `PRESERVE_CORNERS_AND_JUNCTIONS`: corners and junctions stay put.
     CornersPlus1,
     /// `uv_smooth` `PRESERVE_CORNERS_JUNCTIONS_AND_CONCAVE`: corners, junctions, and concave corners.
     CornersPlus2,
@@ -332,6 +332,7 @@ pub(super) fn write_loop_uvs(mesh: &mut Mesh, layers: Vec<UvLayerInput>) -> Resu
     uv_layers::write_layers(mesh, &written_layers);
     Ok(())
 }
+
 /// The pins of layer `name` that the rebuild carried onto `faces`. A face keeps its pins when they
 /// cover its corners; otherwise it has none.
 pub(super) fn carried_pins(

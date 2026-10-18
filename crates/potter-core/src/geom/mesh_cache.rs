@@ -482,6 +482,7 @@ fn layer_limit_warning(modifier: &Modifier, layer: &str) -> PotError {
         }),
     )
 }
+
 fn validate_cache_output(mesh: &Mesh, modifier: &Modifier) -> Result<()> {
     mesh.validate().map_err(|error| {
         PotError::with_details(

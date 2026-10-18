@@ -189,7 +189,6 @@ pub(crate) fn blend_color(corners: &[[f64; 4]; 3], weights: [f64; 3]) -> [f64; 4
             + corners[2][channel] * weights[2]
     })
 }
-
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Line {
     pub(crate) start: DVec3,

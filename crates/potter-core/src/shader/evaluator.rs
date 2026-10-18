@@ -2231,6 +2231,7 @@ fn color_output(color: [f64; 4], socket: &str, node: &str) -> Result<Value> {
         _ => Err(invalid(format!("unknown {node} output `{socket}`"))),
     }
 }
+
 fn unsupported_node(id: &Id, kind: &str) -> PotError {
     PotError::with_details(
         ErrorCode::UnsupportedFeature,

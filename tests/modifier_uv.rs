@@ -687,6 +687,7 @@ fn screw_keeps_each_uv_layer_complete_against_blender_oracle() -> TestResult {
     assert_eq!(matched_oracle_corners(mesh, &fixture, false)?, 144);
     Ok(())
 }
+
 // Decimate (collapse, ratio 0.5). Blender's corner positions and UVs are matched exactly by the port.
 
 #[test]
