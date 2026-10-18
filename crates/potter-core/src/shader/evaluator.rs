@@ -422,24 +422,27 @@ pub fn fill_color_layers<'a, 'n>(
 /// `EVALUATION_FAILED` for a cycle or missing material output, and `UNSUPPORTED_FEATURE` for unsupported
 /// node behavior or unresolved image pixels in the hit context.
 pub fn evaluate_surface(material: &Material, hit_ctx: &HitContext<'_>) -> Result<BsdfParams> {
+    let prepared = PreparedMaterial::new(material, hit_ctx.node_groups);
     let mut workspace = EvaluatorWorkspace::default();
-    evaluate_surface_with_workspace(material, hit_ctx, &mut workspace)
+    evaluate_surface_with_workspace(material, &prepared, hit_ctx, &mut workspace)
 }
 
 /// Evaluates a material surface using caller-owned reusable graph scratch.
 pub fn evaluate_surface_with_workspace(
     material: &Material,
+    prepared: &PreparedMaterial,
     hit_ctx: &HitContext<'_>,
     workspace: &mut EvaluatorWorkspace,
 ) -> Result<BsdfParams> {
     workspace.active.clear();
-    let result = evaluate_surface_inner(material, hit_ctx, workspace);
+    let result = evaluate_surface_inner(material, prepared, hit_ctx, workspace);
     workspace.active.clear();
     result
 }
 
 fn evaluate_surface_inner(
     material: &Material,
+    prepared: &PreparedMaterial,
     hit_ctx: &HitContext<'_>,
     workspace: &mut EvaluatorWorkspace,
 ) -> Result<BsdfParams> {
@@ -500,8 +503,7 @@ fn evaluate_surface_inner(
         material,
         hit_ctx: *hit_ctx,
         workspace,
-        output,
-        alpha_linked_images: None,
+        alpha_linked_images: &prepared.alpha_linked_images,
     };
     let Value::Shader(mut params) = evaluator.input(output, "Surface", ValueKind::Shader)? else {
         return Err(eval_error("material surface output is not a shader"));
@@ -534,24 +536,27 @@ fn evaluate_surface_inner(
 
 /// Evaluates the connected `OutputMaterial` displacement input without evaluating surface textures.
 pub fn evaluate_displacement(material: &Material, hit_ctx: &HitContext<'_>) -> Result<f64> {
+    let prepared = PreparedMaterial::new(material, hit_ctx.node_groups);
     let mut workspace = EvaluatorWorkspace::default();
-    evaluate_displacement_with_workspace(material, hit_ctx, &mut workspace)
+    evaluate_displacement_with_workspace(material, &prepared, hit_ctx, &mut workspace)
 }
 
 /// Evaluates material displacement using caller-owned reusable graph scratch.
 pub fn evaluate_displacement_with_workspace(
     material: &Material,
+    prepared: &PreparedMaterial,
     hit_ctx: &HitContext<'_>,
     workspace: &mut EvaluatorWorkspace,
 ) -> Result<f64> {
     workspace.active.clear();
-    let result = evaluate_displacement_inner(material, hit_ctx, workspace);
+    let result = evaluate_displacement_inner(material, prepared, hit_ctx, workspace);
     workspace.active.clear();
     result
 }
 
 fn evaluate_displacement_inner(
     material: &Material,
+    prepared: &PreparedMaterial,
     hit_ctx: &HitContext<'_>,
     workspace: &mut EvaluatorWorkspace,
 ) -> Result<f64> {
@@ -606,8 +611,7 @@ fn evaluate_displacement_inner(
         material,
         hit_ctx: *hit_ctx,
         workspace,
-        output,
-        alpha_linked_images: None,
+        alpha_linked_images: &prepared.alpha_linked_images,
     };
     match evaluator.input(output, "Displacement", ValueKind::Vector)? {
         Value::Vector(displacement) => Ok(displacement.dot(hit_ctx.normal)),
@@ -820,17 +824,70 @@ pub struct EvaluatorWorkspace {
     active: Vec<ActiveSocket>,
 }
 
-struct Evaluator<'graph, 'material, 'registry, 'workspace> {
+/// The per-material state a shader evaluation reads. A render builds it once for each material and passes it to every
+/// evaluation of that material, so no hit walks the graph again.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PreparedMaterial {
+    /// The Image Texture nodes whose Alpha output reaches the graph's output (see [`linked_alpha_image_nodes`]).
+    alpha_linked_images: BTreeSet<Id>,
+}
+
+impl PreparedMaterial {
+    /// Prepares `material` against the node groups its graph is looked up in. A material without a shader graph prepares
+    /// to nothing, since its surface is its PBR fields.
+    #[must_use]
+    pub fn new(material: &Material, node_groups: &Registry<NodeGroup>) -> Self {
+        let Some(group) = material
+            .node_tree
+            .as_ref()
+            .and_then(|graph_id| node_groups.get(graph_id))
+        else {
+            return Self::default();
+        };
+        let Some(output) = Self::active_output(group) else {
+            return Self::default();
+        };
+        Self {
+            alpha_linked_images: linked_alpha_image_nodes(group, output)
+                .into_iter()
+                .cloned()
+                .collect(),
+        }
+    }
+
+    /// The output node a surface evaluates from: the active one, else the first `OutputMaterial`.
+    fn active_output(group: &NodeGroup) -> Option<&Id> {
+        let mut fallback = None;
+        for (id, node) in &group.nodes {
+            if matches!(
+                node.node_type.as_str(),
+                "OutputMaterial" | "ShaderNodeOutputMaterial"
+            ) {
+                if node
+                    .properties
+                    .get("is_active_output")
+                    .and_then(JsonValue::as_bool)
+                    == Some(true)
+                {
+                    return Some(id);
+                }
+                fallback.get_or_insert(id);
+            }
+        }
+        fallback
+    }
+}
+
+struct Evaluator<'graph, 'material, 'registry, 'workspace, 'prepared> {
     group: &'graph NodeGroup,
     material: &'material Material,
     hit_ctx: HitContext<'registry>,
     workspace: &'workspace mut EvaluatorWorkspace,
-    output: &'graph Id,
-    /// Set by [`linked_alpha_image_nodes`] on the first Image Texture sample of this evaluation.
-    alpha_linked_images: Option<BTreeSet<&'graph Id>>,
+    /// The Alpha-linked Image Texture nodes of the material, from [`PreparedMaterial`].
+    alpha_linked_images: &'prepared BTreeSet<Id>,
 }
 
-impl<'graph, 'registry> Evaluator<'graph, '_, 'registry, '_> {
+impl<'graph, 'registry> Evaluator<'graph, '_, 'registry, '_, '_> {
     fn input(&mut self, node_id: &Id, socket: &str, kind: ValueKind) -> Result<Value> {
         let node = self.node(node_id)?;
         let incoming =
@@ -948,14 +1005,9 @@ impl<'graph, 'registry> Evaluator<'graph, '_, 'registry, '_> {
             .ok_or_else(|| invalid(format!("shader graph references absent node `{node_id}`")))
     }
 
-    /// Whether the Alpha output of the Image Texture `id` reaches the group's output; see
-    /// [`linked_alpha_image_nodes`]. The set is built on the first Image Texture sample of this evaluation, and
-    /// every later sample is a lookup.
-    fn alpha_linked_image(&mut self, id: &Id) -> bool {
-        let (group, output) = (self.group, self.output);
-        self.alpha_linked_images
-            .get_or_insert_with(|| linked_alpha_image_nodes(group, output))
-            .contains(id)
+    /// Whether the Alpha output of the Image Texture `id` reaches the group's output (see [`PreparedMaterial`]).
+    fn alpha_linked_image(&self, id: &Id) -> bool {
+        self.alpha_linked_images.contains(id)
     }
 
     fn evaluate_node(&mut self, node_id: &Id, kind: NodeKind, socket: &str) -> Result<Value> {
