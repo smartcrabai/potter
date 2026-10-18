@@ -258,7 +258,18 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
             continue;
         }
         if modifier.modifier_type == "mesh_to_volume" {
-            continue;
+            return Err(PotError::with_details(
+                ErrorCode::InvalidOperation,
+                "mesh_to_volume requires a volume Object; Blender cannot add it to a mesh Object",
+                json!({"modifier_id":modifier.id,"object_type":"mesh"}),
+            ));
+        }
+        if modifier.modifier_type == "volume_displace" {
+            return Err(PotError::with_details(
+                ErrorCode::InvalidOperation,
+                "volume_displace requires a volume Object; Blender cannot add it to a mesh Object",
+                json!({"modifier_id":modifier.id,"object_type":"mesh"}),
+            ));
         }
         if modifier.modifier_type == "surface_deform" {
             match deform::surface_deform(&evaluated, modifier) {
