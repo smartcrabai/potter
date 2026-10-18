@@ -770,6 +770,8 @@ enum NodeKind {
     VectorMath,
     Mapping,
     SeparateColor,
+    SeparateXyz,
+    CombineXyz,
     TexCoord,
     UvMap,
     NormalMap,
@@ -890,6 +892,8 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_> {
             "ShaderNodeVectorMath" => Ok(NodeKind::VectorMath),
             "ShaderNodeMapping" => Ok(NodeKind::Mapping),
             "ShaderNodeSeparateColor" => Ok(NodeKind::SeparateColor),
+            "ShaderNodeSeparateXYZ" => Ok(NodeKind::SeparateXyz),
+            "ShaderNodeCombineXYZ" => Ok(NodeKind::CombineXyz),
             "ShaderNodeTexCoord" => Ok(NodeKind::TexCoord),
             "ShaderNodeUVMap" => Ok(NodeKind::UvMap),
             "ShaderNodeNormalMap" => Ok(NodeKind::NormalMap),
@@ -943,6 +947,8 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_> {
             NodeKind::VectorMath => self.vector_math(node_id, socket),
             NodeKind::Mapping => self.mapping(node_id, socket),
             NodeKind::SeparateColor => self.separate_color(node_id, socket),
+            NodeKind::SeparateXyz => self.separate_xyz(node_id, socket),
+            NodeKind::CombineXyz => self.combine_xyz(node_id, socket),
             NodeKind::TexCoord => self.tex_coord(socket),
             NodeKind::UvMap => self.uv_map(node_id, socket),
             NodeKind::NormalMap => self.normal_map(node_id, socket),
@@ -1494,6 +1500,28 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_> {
             _ => Err(invalid(format!("unknown {label} output `{socket}`"))),
         }
     }
+    /// `ShaderNodeSeparateXYZ`: one component of its vector input as a scalar.
+    fn separate_xyz(&mut self, id: &Id, socket: &str) -> Result<Value> {
+        let vector = self.vector_input(id, &["Vector"], DVec3::ZERO)?;
+        let component = match socket {
+            "X" => vector.x,
+            "Y" => vector.y,
+            "Z" => vector.z,
+            _ => return Err(invalid(format!("unknown Separate XYZ output `{socket}`"))),
+        };
+        Ok(Value::Scalar(component))
+    }
+
+    /// `ShaderNodeCombineXYZ`: a vector from its three scalar inputs.
+    fn combine_xyz(&mut self, id: &Id, socket: &str) -> Result<Value> {
+        if socket != "Vector" {
+            return Err(invalid(format!("unknown Combine XYZ output `{socket}`")));
+        }
+        let x = self.scalar_input(id, &["X"], 0.0)?;
+        let y = self.scalar_input(id, &["Y"], 0.0)?;
+        let z = self.scalar_input(id, &["Z"], 0.0)?;
+        Ok(Value::Vector(DVec3::new(x, y, z)))
+    }
 
     fn math(&mut self, id: &Id, socket: &str) -> Result<Value> {
         let first = self.scalar_input(id, &["Value", "Value_001"], 0.0)?;
@@ -1531,6 +1559,15 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_> {
             "COMPARE" => {
                 let epsilon = self.scalar_input(id, &["Value_002", "Value_003"], 0.001)?;
                 f64::from((first - second).abs() <= epsilon.max(0.0))
+            }
+            "WRAP" => {
+                // Blender's `wrapf(value, max, min)`: the second input is the maximum and the third the minimum.
+                let range = second - third;
+                if crate::float::equal_f64(range, 0.0) {
+                    third
+                } else {
+                    first - range * ((first - third) / range).floor()
+                }
             }
             "PINGPONG" => {
                 let scale = second.abs().max(f64::MIN_POSITIVE);

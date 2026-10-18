@@ -29,7 +29,7 @@ use crate::{
         uv_layers::{self, UvStore},
     },
     graph::{GraphKind, GraphLink, GraphNode, GraphSocket, NodeGroup},
-    image::ImageInterpolation,
+    image::{ImageExtension, ImageInterpolation},
     model::{Id, Material, SceneDoc, TextureRef},
 };
 
@@ -38,11 +38,42 @@ const OUTPUT_GROUP_NAME: &str = "glTF Material Output";
 /// Potter ID of the group that holds the `Occlusion` input.
 const OUTPUT_GROUP_ID: &str = "gltf_material_output";
 
-/// A texture of one glTF slot and its `KHR_texture_transform`.
+/// A texture of one glTF slot, its `KHR_texture_transform`, and the wrap of each UV axis (S, T).
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct SlotTexture {
     pub(crate) texture: TextureRef,
     pub(crate) transform: Option<TextureTransform>,
+    pub(crate) wrap: [ImageExtension; 2],
+}
+
+impl SlotTexture {
+    /// Whether the two UV axes wrap differently, which a single extension cannot express. A field cannot hold it, so
+    /// the slot needs a graph with per-axis UV nodes, as Blender's importer builds it.
+    pub(crate) fn has_mixed_wrap(&self) -> bool {
+        self.wrap[0] != self.wrap[1]
+    }
+}
+
+/// The extension a texture field or node carries for a wrap pair: the shared extension of both axes, or EXTEND for a
+/// mixed pair, as Blender's importer sets it (the per-axis nodes then do the wrapping).
+pub(crate) fn uniform_extension(wrap: [ImageExtension; 2]) -> ImageExtension {
+    if wrap[0] == wrap[1] {
+        wrap[0]
+    } else {
+        ImageExtension::Extend
+    }
+}
+
+/// The Image Texture `extension` of a slot, or `None` for REPEAT, which Blender defaults to. A mixed wrap is EXTEND on
+/// the node, and the per-axis nodes do the rest.
+fn slot_extension_name(slot: &SlotTexture) -> Option<&'static str> {
+    let node_extension = uniform_extension(slot.wrap);
+    match node_extension {
+        ImageExtension::Repeat => None,
+        ImageExtension::Extend => Some("EXTEND"),
+        ImageExtension::Clip => Some("CLIP"),
+        ImageExtension::Mirror => Some("MIRROR"),
+    }
 }
 
 /// Every texture slot of one material that a graph can hold.
@@ -72,6 +103,7 @@ impl GraphTextures {
     ) -> Self {
         let plain = |texture: Option<TextureRef>| {
             texture.map(|texture| SlotTexture {
+                wrap: [texture.extension; 2],
                 texture,
                 transform: None,
             })
@@ -88,13 +120,26 @@ impl GraphTextures {
         }
     }
 
-    /// Whether any slot needs a graph: a transform, a packed metallic-roughness, emissive or occlusion
-    /// texture, or a normal scale that a Potter texture field cannot hold. A Potter field reads the
-    /// Red channel, while glTF packs roughness in Green and metallic in Blue.
+    /// Whether any slot needs a graph: a transform, a mixed per-axis wrap, a packed metallic-roughness, emissive or
+    /// occlusion texture, or a normal scale that a Potter texture field cannot hold. A Potter field reads the Red
+    /// channel, while glTF packs roughness in Green and metallic in Blue.
     pub(crate) fn needs_graph(&self) -> bool {
         let transformed =
             |slot: &Option<SlotTexture>| slot.as_ref().is_some_and(|slot| slot.transform.is_some());
-        transformed(&self.base_color)
+        let mixed = [
+            &self.base_color,
+            &self.metallic_roughness,
+            &self.roughness,
+            &self.metallic,
+            &self.normal,
+            &self.emissive,
+            &self.occlusion,
+        ]
+        .into_iter()
+        .flatten()
+        .any(SlotTexture::has_mixed_wrap);
+        mixed
+            || transformed(&self.base_color)
             || self.metallic_roughness.is_some()
             || transformed(&self.normal)
             || transformed(&self.emissive)
@@ -399,6 +444,39 @@ fn texture_node(graph: &mut NodeGroup, name: &str, slot: &SlotTexture) -> Result
         connect(graph, &source.0, &source.1, &map, "Vector")?;
         source = (map, "Vector".to_owned());
     }
+    if slot.has_mixed_wrap() {
+        // Blender's importer splits the UV per axis: [Separate XYZ] => [Wrap S] and [Wrap T] => [Combine XYZ].
+        // REPEAT is WRAP into [0, 1) and MIRRORED_REPEAT is PINGPONG; a CLAMP axis passes through, as the
+        // node's EXTEND makes it clamp.
+        let split = format!("{name}_split_uv");
+        insert(graph, &split, GraphNode::new("ShaderNodeSeparateXYZ"))?;
+        connect(graph, &source.0, &source.1, &split, "Vector")?;
+        let combine = format!("{name}_combine_uv");
+        insert(graph, &combine, GraphNode::new("ShaderNodeCombineXYZ"))?;
+        for (index, axis) in ["X", "Y"].into_iter().enumerate() {
+            match slot.wrap[index] {
+                ImageExtension::Repeat | ImageExtension::Mirror => {
+                    let wrap = format!("{name}_wrap_{}", axis.to_ascii_lowercase());
+                    let mut math = GraphNode::new("ShaderNodeMath");
+                    if slot.wrap[index] == ImageExtension::Repeat {
+                        math.properties
+                            .insert("operation".to_owned(), json!("WRAP"));
+                        math.inputs.insert("Value_001".to_owned(), json!(0.0));
+                        math.inputs.insert("Value_002".to_owned(), json!(1.0));
+                    } else {
+                        math.properties
+                            .insert("operation".to_owned(), json!("PINGPONG"));
+                        math.inputs.insert("Value_001".to_owned(), json!(1.0));
+                    }
+                    insert(graph, &wrap, math)?;
+                    connect(graph, &split, axis, &wrap, "Value")?;
+                    connect(graph, &wrap, "Value", &combine, axis)?;
+                }
+                _ => connect(graph, &split, axis, &combine, axis)?,
+            }
+        }
+        source = (combine, "Vector".to_owned());
+    }
     let mut image = GraphNode::new("ShaderNodeTexImage");
     image
         .properties
@@ -410,6 +488,11 @@ fn texture_node(graph: &mut NodeGroup, name: &str, slot: &SlotTexture) -> Result
     image
         .properties
         .insert("interpolation".to_owned(), json!(interpolation));
+    if let Some(extension) = slot_extension_name(slot) {
+        image
+            .properties
+            .insert("extension".to_owned(), json!(extension));
+    }
     insert(graph, &tex, image)?;
     connect(graph, &source.0, &source.1, &tex, "Vector")?;
     Ok(tex)
@@ -1219,10 +1302,12 @@ mod tests {
             roughness: None,
             metallic: None,
             normal: Some(SlotTexture {
+                wrap: [ImageExtension::Repeat; 2],
                 texture: TextureRef {
                     image: Id::new("normal_image")?,
                     uv_layer: uv_layer.map(str::to_owned),
                     interpolation: ImageInterpolation::Linear,
+                    extension: ImageExtension::Repeat,
                 },
                 transform: None,
             }),
@@ -1286,11 +1371,96 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn mixed_wrap_builds_blenders_per_axis_uv_nodes() -> Result<()> {
+        // Blender's importer splits the UV, wraps each axis by its mode, and recombines it, with EXTEND on the node.
+        let textures = GraphTextures {
+            base_color: Some(SlotTexture {
+                texture: texture("paint", None)?,
+                transform: None,
+                wrap: [ImageExtension::Repeat, ImageExtension::Mirror],
+            }),
+            metallic_roughness: None,
+            roughness: None,
+            metallic: None,
+            normal: None,
+            normal_scale: 1.0,
+            emissive: None,
+            occlusion: None,
+        };
+        assert!(textures.needs_graph(), "a mixed wrap needs a graph");
+        let graph = build_graph(&Material::default(), &textures, false)?;
+        let count = |node_type: &str| {
+            graph
+                .nodes
+                .values()
+                .filter(|node| node.node_type == node_type)
+                .count()
+        };
+        assert_eq!(count("ShaderNodeSeparateXYZ"), 1);
+        assert_eq!(count("ShaderNodeCombineXYZ"), 1);
+        let operations = graph
+            .nodes
+            .values()
+            .filter(|node| node.node_type == "ShaderNodeMath")
+            .filter_map(|node| node.properties.get("operation").cloned())
+            .filter(|operation| operation == &json!("WRAP") || operation == &json!("PINGPONG"))
+            .collect::<Vec<_>>();
+        assert_eq!(operations, vec![json!("WRAP"), json!("PINGPONG")]);
+        let image = graph
+            .nodes
+            .values()
+            .find(|node| node.node_type == "ShaderNodeTexImage")
+            .ok_or("no Image Texture node")?;
+        assert_eq!(image.properties["extension"], json!("EXTEND"));
+        Ok(())
+    }
+
+    #[test]
+    fn uniform_extension_sets_the_node_extension_without_per_axis_nodes() -> Result<()> {
+        let textures = GraphTextures {
+            base_color: Some(SlotTexture {
+                texture: TextureRef {
+                    extension: ImageExtension::Extend,
+                    ..texture("paint", None)?
+                },
+                transform: None,
+                wrap: [ImageExtension::Extend; 2],
+            }),
+            metallic_roughness: None,
+            roughness: None,
+            metallic: None,
+            normal: None,
+            normal_scale: 1.0,
+            emissive: None,
+            occlusion: None,
+        };
+        assert!(
+            !textures.needs_graph(),
+            "a uniform extension stays on the field"
+        );
+        let graph = build_graph(&Material::default(), &textures, false)?;
+        assert!(
+            graph
+                .nodes
+                .values()
+                .all(|node| node.node_type != "ShaderNodeSeparateXYZ")
+        );
+        let image = graph
+            .nodes
+            .values()
+            .find(|node| node.node_type == "ShaderNodeTexImage")
+            .ok_or("no Image Texture node")?;
+        assert_eq!(image.properties["extension"], json!("EXTEND"));
+        Ok(())
+    }
+
     fn texture(image: &str, uv_layer: Option<&str>) -> Result<TextureRef> {
         Ok(TextureRef {
             image: Id::new(image)?,
             uv_layer: uv_layer.map(str::to_owned),
             interpolation: ImageInterpolation::Linear,
+            extension: ImageExtension::Repeat,
         })
     }
 

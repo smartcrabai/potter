@@ -166,6 +166,7 @@ fn texture_material(uv_layer: Option<&str>) -> (Material, BTreeMap<String, Image
             image: Id::new("normal_image").unwrap(),
             uv_layer: uv_layer.map(str::to_owned),
             interpolation: ImageInterpolation::Closest,
+            extension: potter_core::image::ImageExtension::Repeat,
         }),
         ..Material::default()
     };

@@ -9,13 +9,23 @@ pub enum ImageInterpolation {
     Closest,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// How an image lookup past its edge is resolved, as Blender's Image Texture `extension`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImageExtension {
+    #[default]
     Repeat,
     Extend,
     Clip,
     Mirror,
+}
+
+impl ImageExtension {
+    /// Whether this is the default REPEAT, which scene JSON omits.
+    #[must_use]
+    pub const fn is_repeat(&self) -> bool {
+        matches!(self, Self::Repeat)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

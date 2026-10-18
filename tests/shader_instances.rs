@@ -51,6 +51,7 @@ fn texture_ref(image: &str, uv_layer: Option<&str>) -> TextureRef {
         image: Id::new(image).unwrap(),
         uv_layer: uv_layer.map(str::to_owned),
         interpolation: ImageInterpolation::Closest,
+        extension: potter_core::image::ImageExtension::Repeat,
     }
 }
 

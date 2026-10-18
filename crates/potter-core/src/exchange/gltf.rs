@@ -20,7 +20,7 @@ use crate::{
         normals::{close, corner_normals, sharp_edge_flags, smooth_face_flags},
         uv_layers::{self, UvLayer, UvStore},
     },
-    image::{ImageData, ImageInterpolation, load_image_data},
+    image::{ImageData, ImageExtension, ImageInterpolation, load_image_data},
     model::{
         Action, ArmatureData, AvatarSettings, AvatarVersion, Bone, CameraData, CameraProjection,
         DataBlock, Extrapolation, FCurve, Id, Image, ImageAlphaMode, ImageColorspace, ImageSource,
@@ -6019,8 +6019,17 @@ fn material_textures(
 ) -> Result<material_graph::GraphTextures> {
     let slot = |info: &Value| -> Result<Option<material_graph::SlotTexture>> {
         let transform = texture_transform(info)?;
-        Ok(import_texture_ref(info, root, image_ids)?
-            .map(|texture| material_graph::SlotTexture { texture, transform }))
+        let wrap = texture_wrap(info, root)?;
+        Ok(
+            import_texture_ref(info, root, image_ids)?.map(|mut texture| {
+                texture.extension = material_graph::uniform_extension(wrap);
+                material_graph::SlotTexture {
+                    texture,
+                    transform,
+                    wrap,
+                }
+            }),
+        )
     };
     let pbr = &material["pbrMetallicRoughness"];
     Ok(material_graph::GraphTextures {
@@ -6042,6 +6051,43 @@ fn uv_set_layer_name(set: usize) -> String {
         "UVMap".to_owned()
     } else {
         format!("UVMap.{set:03}")
+    }
+}
+
+/// The wrap of each UV axis (S, T) of a glTF texture reference, as Blender's importer reads its sampler (`texture.py`).
+/// An absent wrap is REPEAT, CLAMP_TO_EDGE is EXTEND, and MIRRORED_REPEAT is MIRROR.
+fn texture_wrap(info: &Value, root: &Value) -> Result<[ImageExtension; 2]> {
+    match info["index"]
+        .as_u64()
+        .and_then(|index| usize::try_from(index).ok())
+    {
+        Some(index) => texture_wrap_at(root, index),
+        None => Ok([ImageExtension::Repeat; 2]),
+    }
+}
+
+/// The wrap of each UV axis of glTF texture `texture_index`, read from its sampler.
+pub(crate) fn texture_wrap_at(root: &Value, texture_index: usize) -> Result<[ImageExtension; 2]> {
+    let sampler = root["textures"]
+        .get(texture_index)
+        .and_then(|texture| texture["sampler"].as_u64())
+        .and_then(|index| usize::try_from(index).ok())
+        .and_then(|index| root["samplers"].get(index));
+    let Some(sampler) = sampler else {
+        return Ok([ImageExtension::Repeat; 2]);
+    };
+    Ok([
+        sampler_wrap_axis(&sampler["wrapS"])?,
+        sampler_wrap_axis(&sampler["wrapT"])?,
+    ])
+}
+
+fn sampler_wrap_axis(value: &Value) -> Result<ImageExtension> {
+    match value.as_u64() {
+        None | Some(10497) => Ok(ImageExtension::Repeat),
+        Some(33071) => Ok(ImageExtension::Extend),
+        Some(33648) => Ok(ImageExtension::Mirror),
+        Some(_) => Err(import_error("glTF sampler wrap mode is invalid")),
     }
 }
 
@@ -6089,6 +6135,7 @@ fn import_texture_ref(info: &Value, root: &Value, image_ids: &[Id]) -> Result<Op
         image,
         uv_layer,
         interpolation,
+        extension: ImageExtension::Repeat,
     }))
 }
 
@@ -15018,6 +15065,193 @@ mod tests {
         Ok(())
     }
 
+    /// The texel of `coordinate` in `[0, 1]` on an axis of `size` texels: the last texel edge at or below it.
+    fn texel_index(coordinate: f64, size: usize) -> TestResult<usize> {
+        let size_f = f64::from(u32::try_from(size)?);
+        let mut index = 0_usize;
+        for edge in 1..=size {
+            if coordinate >= f64::from(u32::try_from(edge)?) / size_f {
+                index = edge;
+            }
+        }
+        Ok(index.min(size - 1))
+    }
+
+    /// One axis of a glTF sampler wrap applied to a texture coordinate, as the glTF specification defines it: REPEAT
+    /// (10497) takes the fraction, CLAMP_TO_EDGE (33071) clamps to the edge, and MIRRORED_REPEAT (33648) reflects.
+    fn gltf_wrapped(wrap: u64, coordinate: f64) -> f64 {
+        match wrap {
+            33071 => coordinate.clamp(0.0, 1.0),
+            33648 => {
+                let period = coordinate.rem_euclid(2.0);
+                if period > 1.0 { 2.0 - period } else { period }
+            }
+            _ => coordinate.rem_euclid(1.0),
+        }
+    }
+
+    #[test]
+    fn sampler_wrap_samples_each_axis_as_the_gltf_sampler_says() -> TestResult {
+        // Each wrap pair is a glTF sampler, and its S and T axes must sample the texel the glTF specification gives. The
+        // uniform pairs import as fields and the mixed pairs as a graph, so both routes are checked against the same
+        // expectation. The image is 4 x 4 with a distinct texel at every position.
+        let root = tempfile::tempdir()?;
+        let png = root.path().join("texels.png");
+        let texel =
+            |value: u32| -> u8 { [0_u8, 85, 170, 255][usize::try_from(value).unwrap_or(0).min(3)] };
+        ::image::RgbaImage::from_fn(4, 4, |x, y| ::image::Rgba([texel(x), texel(y), 128, 255]))
+            .save(&png)?;
+        let png_path = png.to_string_lossy().into_owned();
+        let doc = scene_with_asset_root(
+            root.path(),
+            &json!([
+                {"op":"image.load","id":"tex","path":png_path,"colorspace":"non_color"},
+                {"op":"material.create","id":"wrapped","base_color":[1.0,1.0,1.0,1.0],"base_color_texture":{"image":"tex","interpolation":"closest"}},
+                {"op":"node.create","id":"sheet","kind":"plane","params":{"size":1.0},"material":"wrapped"},
+                {"op":"uv.unwrap","target":{"id":"sheet"},"method":"box"}
+            ]),
+        )?;
+        let (document, binary) = export_root_and_binary_at_root(&doc, root.path())?;
+        std::fs::write(root.path().join("scene.bin"), &binary)?;
+        const REPEAT: u64 = 10497;
+        const CLAMP: u64 = 33071;
+        const MIRRORED: u64 = 33648;
+        // Coordinates off the texel edges, below 0 and above 1, so every wrap mode is exercised.
+        let grid = [-0.4, -0.1, 0.1, 0.35, 0.6, 0.9, 1.2, 1.6];
+        let names = ["UVMap".to_owned()];
+        for (wrap_s, wrap_t) in [
+            (CLAMP, CLAMP),
+            (MIRRORED, MIRRORED),
+            (REPEAT, REPEAT),
+            (CLAMP, REPEAT),
+            (MIRRORED, CLAMP),
+            (REPEAT, MIRRORED),
+        ] {
+            let mut edited = document.clone();
+            edited["samplers"] =
+                json!([{"magFilter": 9728, "minFilter": 9728, "wrapS": wrap_s, "wrapT": wrap_t}]);
+            edited["textures"][0]["sampler"] = json!(0);
+            let path = root.path().join("wrap.gltf");
+            std::fs::write(&path, serde_json::to_vec(&edited)?)?;
+            let imported = import(&path, uuid::Uuid::new_v4().to_string())?;
+            export_imported_again(&imported, root.path())?;
+            let mut images = BTreeMap::new();
+            for (id, image) in &imported.doc.images {
+                images.insert(
+                    id.as_str().to_owned(),
+                    crate::image::load_image_data(
+                        image,
+                        root.path(),
+                        crate::image::ImageInterpolation::Linear,
+                    )?,
+                );
+            }
+            let data = images.values().next().ok_or("the image is missing")?;
+            let width = usize::try_from(data.width)?;
+            let height = usize::try_from(data.height)?;
+            let material = imported
+                .doc
+                .materials
+                .get(&crate::model::Id::new("wrapped")?)
+                .ok_or("the material is missing")?;
+            let base_colour = |s_u: f64, s_v: f64| -> TestResult<[f64; 4]> {
+                let corners = [[[s_u, s_v]; 3]];
+                let layers = crate::shader::HitUvLayers {
+                    names: &names,
+                    corners: &corners,
+                    positions: [DVec3::ZERO; 3],
+                    barycentric: [1.0 / 3.0; 3],
+                    render: Some(0),
+                    available_mask: None,
+                };
+                let mut context = crate::shader::HitContext::new(&imported.doc.node_groups)
+                    .with_images(&images)
+                    .with_uv_layers(layers);
+                context.uv = [s_u, s_v];
+                Ok(crate::shader::evaluate_surface(material, &context)?.base_color)
+            };
+            for s_u in grid {
+                for s_v in grid {
+                    let actual = base_colour(s_u, s_v)?;
+                    let texel_x = texel_index(gltf_wrapped(wrap_s, s_u), width)?;
+                    let texel_y = texel_index(gltf_wrapped(wrap_t, s_v), height)?;
+                    let expected = data.pixels[texel_y * width + texel_x];
+                    for channel in 0..3 {
+                        assert!(
+                            (actual[channel] - expected[channel]).abs() < 1e-9,
+                            "wrap ({wrap_s}, {wrap_t}) at ({s_u}, {s_v}) samples {actual:?}, expected texel ({texel_x}, {texel_y}) {expected:?}"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn texture_extension_round_trips_through_the_gltf_sampler() -> TestResult {
+        // An extension exports as its glTF sampler wrap, and the sampler imports back as the same extension.
+        let root = tempfile::tempdir()?;
+        let doc = scene_with_asset_root(
+            root.path(),
+            &json!([
+                {"op":"image.create","id":"tex","width":2,"height":2,"colorspace":"linear","fill_color":[0.5,0.5,0.5,1.0]},
+                {"op":"material.create","id":"clamped","base_color_texture":{"image":"tex","extension":"extend"}},
+                {"op":"material.create","id":"mirrored","base_color_texture":{"image":"tex","extension":"mirror"}},
+                {"op":"node.create","id":"a","kind":"plane","params":{"size":1.0},"material":"clamped"},
+                {"op":"node.create","id":"b","kind":"plane","params":{"size":1.0},"material":"mirrored"},
+                {"op":"uv.unwrap","target":{"id":"a"},"method":"box"},
+                {"op":"uv.unwrap","target":{"id":"b"},"method":"box"}
+            ]),
+        )?;
+        let (document, binary) = export_root_and_binary_at_root(&doc, root.path())?;
+        let wrap_of = |name: &str| -> TestResult<u64> {
+            let material = document["materials"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|material| material["extras"]["potter"]["id"] == name)
+                .ok_or("the material is missing")?;
+            let texture = usize::try_from(
+                material["pbrMetallicRoughness"]["baseColorTexture"]["index"]
+                    .as_u64()
+                    .ok_or("the texture index is missing")?,
+            )?;
+            let sampler = usize::try_from(
+                document["textures"][texture]["sampler"]
+                    .as_u64()
+                    .ok_or("the sampler is missing")?,
+            )?;
+            document["samplers"][sampler]["wrapS"]
+                .as_u64()
+                .ok_or_else(|| "the wrap is missing".into())
+        };
+        assert_eq!(wrap_of("clamped")?, 33071, "extend writes CLAMP_TO_EDGE");
+        assert_eq!(wrap_of("mirrored")?, 33648, "mirror writes MIRRORED_REPEAT");
+        std::fs::write(root.path().join("scene.bin"), &binary)?;
+        let path = root.path().join("extension.gltf");
+        std::fs::write(&path, serde_json::to_vec(&document)?)?;
+        let imported = import(&path, uuid::Uuid::new_v4().to_string())?;
+        let extension_of = |name: &str| -> TestResult<crate::image::ImageExtension> {
+            imported
+                .doc
+                .materials
+                .get(&crate::model::Id::new(name)?)
+                .and_then(|material| material.base_color_texture.as_ref())
+                .map(|texture| texture.extension)
+                .ok_or_else(|| "the imported texture is missing".into())
+        };
+        assert_eq!(
+            extension_of("clamped")?,
+            crate::image::ImageExtension::Extend
+        );
+        assert_eq!(
+            extension_of("mirrored")?,
+            crate::image::ImageExtension::Mirror
+        );
+        Ok(())
+    }
+
     #[test]
     fn main_texture_transform_reaches_the_colour_variant_graph() -> TestResult {
         // The base color texture carries a VRM 0.x MToon main texture transform, set as the glTF import
@@ -15033,10 +15267,12 @@ mod tests {
         );
         let textures = super::material_graph::GraphTextures {
             base_color: Some(super::material_graph::SlotTexture {
+                wrap: [crate::image::ImageExtension::Repeat; 2],
                 texture: crate::model::TextureRef {
                     image: crate::model::Id::new("paint_img")?,
                     uv_layer: None,
                     interpolation: crate::image::ImageInterpolation::Linear,
+                    extension: crate::image::ImageExtension::Repeat,
                 },
                 transform: Some(crate::exchange::material_surface::TextureTransform {
                     offset: [0.25, -2.1],

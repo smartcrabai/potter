@@ -326,7 +326,7 @@ fn complete_data_block_schemas(defs: &mut Value) {
 /// A texture reference: an image, an optional UV layer name (`null` is the render layer), and the
 /// sampler interpolation.
 fn texture_ref_schema() -> Value {
-    json!({"type":"object","required":["image"],"properties":{"image":id_schema(),"uv_layer":{"type":["string","null"],"minLength":1,"default":null},"interpolation":{"enum":["linear","closest"],"default":"linear"}},"additionalProperties":false})
+    json!({"type":"object","required":["image"],"properties":{"image":id_schema(),"uv_layer":{"type":["string","null"],"minLength":1,"default":null},"interpolation":{"enum":["linear","closest"],"default":"linear"},"extension":{"enum":["repeat","extend","clip","mirror"],"default":"repeat"}},"additionalProperties":false})
 }
 
 fn nullable_texture_ref_schema() -> Value {

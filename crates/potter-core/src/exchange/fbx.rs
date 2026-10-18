@@ -2291,6 +2291,7 @@ fn import_bytes_with_base(
             image: image_id,
             uv_layer: texture.uv_layer.clone(),
             interpolation: crate::image::ImageInterpolation::Linear,
+            extension: crate::image::ImageExtension::Repeat,
         };
         match property {
             "DiffuseColor" => material.base_color_texture = Some(texture_ref),
@@ -4178,6 +4179,7 @@ mod tests {
                     image: image_id,
                     uv_layer: None,
                     interpolation: ImageInterpolation::Linear,
+                    extension: crate::image::ImageExtension::Repeat,
                 }),
                 ..Material::default()
             },

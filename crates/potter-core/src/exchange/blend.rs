@@ -10610,6 +10610,7 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
             image: image.clone(),
             uv_layer: Some(uv_layer.to_owned()),
             interpolation: crate::image::ImageInterpolation::Linear,
+            extension: crate::image::ImageExtension::Repeat,
         };
         crate::exchange::material_graph::move_textures_to_graph(
             &mut doc,
@@ -10620,12 +10621,14 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
                 roughness: None,
                 metallic: None,
                 normal: Some(crate::exchange::material_graph::SlotTexture {
+                    wrap: [crate::image::ImageExtension::Repeat; 2],
                     texture: texture(&normal_image_id, "Detail"),
                     transform: None,
                 }),
                 // Blender stores this Normal Map socket at float32 precision.
                 normal_scale: f64::from(0.65_f32),
                 emissive: Some(crate::exchange::material_graph::SlotTexture {
+                    wrap: [crate::image::ImageExtension::Repeat; 2],
                     texture: texture(&emissive_image_id, "UVMap"),
                     transform: Some(crate::exchange::material_surface::TextureTransform {
                         offset: [0.25, 0.5],
@@ -10920,6 +10923,7 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
                 image: image.clone(),
                 uv_layer: Some("Lightmap".to_owned()),
                 interpolation,
+                extension: crate::image::ImageExtension::Repeat,
             }
         };
         // An authored graph: a Principled BSDF with a default Base Color and a Roughness linked from a Math node. Its
@@ -11482,6 +11486,7 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
                     image: normal_id,
                     uv_layer: None,
                     interpolation: crate::image::ImageInterpolation::Linear,
+                    extension: crate::image::ImageExtension::Repeat,
                 }),
                 node_tree: Some(graph_id),
                 ..Material::default()

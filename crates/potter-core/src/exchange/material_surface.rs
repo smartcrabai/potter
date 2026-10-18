@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use crate::{
     error::{ErrorCode, PotError},
     graph::{GraphKind, GraphLink, GraphNode, NodeGroup},
-    image::ImageInterpolation,
+    image::{ImageExtension, ImageInterpolation},
     model::{Id, Material, SceneDoc, TextureRef},
 };
 
@@ -367,17 +367,28 @@ pub(crate) fn remapped_reference_sampled(
     sampled_from_ref(reference, [source(), source(), source(), None])
 }
 
-/// Sampling state of a Potter texture reference (repeat wrap, no transform).
+/// Sampling state of a Potter texture reference (no transform). Its extension sets the wrap of both axes.
 fn sampled_from_ref(
     reference: &TextureRef,
     channels: [Option<ChannelSource>; 4],
 ) -> SampledTexture {
+    let wrap = texture_wrap_of(reference.extension);
     SampledTexture {
         channels,
         uv_layer: reference.uv_layer.clone(),
         interpolation: reference.interpolation,
-        wrap: [TextureWrap::Repeat; 2],
+        wrap: [wrap; 2],
         transform: None,
+    }
+}
+
+/// The glTF sampler wrap of a Potter extension, as Blender's exporter writes it (`exp/sampler.py`): EXTEND and CLIP are
+/// CLAMP_TO_EDGE (CLIP is the closest, since glTF has no clip), MIRROR is MIRRORED_REPEAT, and REPEAT is the default.
+pub(crate) fn texture_wrap_of(extension: ImageExtension) -> TextureWrap {
+    match extension {
+        ImageExtension::Repeat => TextureWrap::Repeat,
+        ImageExtension::Extend | ImageExtension::Clip => TextureWrap::ClampToEdge,
+        ImageExtension::Mirror => TextureWrap::MirroredRepeat,
     }
 }
 
@@ -3004,6 +3015,7 @@ mod tests {
             image: id("img"),
             uv_layer: None,
             interpolation: ImageInterpolation::Closest,
+            extension: crate::image::ImageExtension::Repeat,
         };
         let mut doc = document(None);
         let material = doc.materials.get_mut(&id("mat")).expect("material");
@@ -3321,6 +3333,7 @@ mod tests {
             image: id("img"),
             uv_layer: None,
             interpolation: ImageInterpolation::Linear,
+            extension: crate::image::ImageExtension::Repeat,
         });
         let (_, losses) = resolved(&doc);
         assert!(
