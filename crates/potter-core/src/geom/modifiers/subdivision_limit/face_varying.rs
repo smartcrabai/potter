@@ -18,7 +18,7 @@ use super::{
     level::{
         Level, RULE_CORNER, RULE_CREASE, SHARPNESS_INFINITE, VTag, is_infinite, is_semi_sharp,
     },
-    refine::Refined,
+    refine::{Children, Refined},
 };
 
 impl FvarLinear {
@@ -144,6 +144,7 @@ pub(super) fn base(
         positions: map.uvs.clone(),
         face_children: Vec::new(),
         dependent_source: dependent_sources,
+        children: Children::default(),
     }
 }
 

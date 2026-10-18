@@ -271,8 +271,16 @@ impl Level {
                         if boundary_count > 0 {
                             inf_irregular = false;
                         } else if edges.len() == 4 {
-                            inf_irregular =
-                                self.etags[edges[0]].inf_sharp != self.etags[edges[2]].inf_sharp;
+                            // Two sharp edges are a regular crease only when they are opposite in the
+                            // ring, that is when no face holds both (OpenSubdiv compares opposite edges).
+                            let mut sharp =
+                                edges.iter().copied().filter(|&e| self.etags[e].inf_sharp);
+                            if let (Some(first), Some(second)) = (sharp.next(), sharp.next()) {
+                                inf_irregular = self.vertex_faces[vertex].iter().any(|&f| {
+                                    self.face_edges[f].contains(&first)
+                                        && self.face_edges[f].contains(&second)
+                                });
+                            }
                         }
                     }
                 } else if inf_rule == RULE_CORNER

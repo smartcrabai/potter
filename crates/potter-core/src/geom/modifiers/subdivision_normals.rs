@@ -94,11 +94,13 @@ fn midpoint(a: Vec3, b: Vec3) -> Vec3 {
 /// Blender's corner numbering of the subdivided mesh, one number per output corner in output face
 /// order. Output face `f` gets the block `4 * E..4 * E + 4`, where `E` is the emission index of the
 /// face: the faces of each base face form one block, in base face order. `loops[f]` holds the four
-/// ptex samples of output face `f`, `base_sizes` the corner count of each base face, and `levels` is
-/// at least one.
+/// ptex samples of output face `f`, `base_sizes` the corner count of each base face, `loop_starts`
+/// the corner holding each base face's first loop, and `levels` is at least one. The samples stay in
+/// canonical geometry; each is moved into its base face's loop frame before its cell is located.
 pub(super) fn corner_numbering(
     loops: &[Vec<Sample>],
     base_sizes: &[usize],
+    loop_starts: &[usize],
     levels: u32,
 ) -> Vec<usize> {
     let grid = 1_i64 << levels;
@@ -118,14 +120,18 @@ pub(super) fn corner_numbering(
     }
     let mut numbering = Vec::with_capacity(loops.len() * 4);
     for face_loops in loops {
-        let first = face_loops[0];
+        let frame: [Sample; 4] = std::array::from_fn(|k| {
+            let sample = face_loops[k];
+            sample.in_loop_frame(loop_starts[sample.face], base_sizes[sample.face])
+        });
+        let first = frame[0];
         let size = base_sizes[first.face];
         let cells = if size == 4 { grid } else { ptex_grid };
-        let low_u = face_loops
+        let low_u = frame
             .iter()
             .map(|sample| sample.u)
             .fold(f64::INFINITY, f64::min);
-        let low_v = face_loops
+        let low_v = frame
             .iter()
             .map(|sample| sample.v)
             .fold(f64::INFINITY, f64::min);
@@ -137,7 +143,7 @@ pub(super) fn corner_numbering(
             ngon_cell_index(x, y, first.ptex as i64, size as i64, ptex_grid)
         };
         let face = starts[first.face] + emitted;
-        for sample in face_loops {
+        for sample in &frame {
             let local_u = ((sample.u - low_u) * cells as f64).round() as i64;
             let local_v = ((sample.v - low_v) * cells as f64).round() as i64;
             let corner = match (local_u, local_v) {

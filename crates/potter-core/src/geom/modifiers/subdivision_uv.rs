@@ -8,7 +8,7 @@
 //! vertices: a position vertex splits wherever its UVs differ between faces. Each layer's limit is
 //! evaluated by `subdivision_limit::face_varying`, on the leaves of the position limit surface.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use glam::{DVec2, DVec3};
 use serde_json::{Map, Value, json};
@@ -66,7 +66,8 @@ pub(super) struct ValueMap {
     pub(super) corners: Vec<Vec<usize>>,
     /// The position vertex each value belongs to.
     pub(super) vertex: Vec<usize>,
-    /// The UV of each value: the UV of its first corner.
+    /// The UV of each value: that of its last corner in face order, the one Blender's upload
+    /// writes last.
     pub(super) uvs: Vec<DVec2>,
 }
 
@@ -82,16 +83,11 @@ pub(super) struct Position {
     pub(super) starts: Vec<usize>,
     pub(super) face_of: Vec<usize>,
     pub(super) corner_vertex: Vec<usize>,
-    pub(super) edge_starts: Vec<usize>,
-    pub(super) edge_sides: Vec<usize>,
     pub(super) edge_ends: Vec<(usize, usize)>,
     pub(super) edge_order: Vec<usize>,
     pub(super) edge_sharp: Vec<f64>,
     pub(super) vertex_starts: Vec<usize>,
     pub(super) vertex_corners: Vec<usize>,
-    pub(super) vertex_edge_starts: Vec<usize>,
-    pub(super) vertex_edges: Vec<usize>,
-    pub(super) non_manifold_corners: Vec<bool>,
 }
 
 /// Groups the indices `0..keys.len()` by `keys[index]` into `buckets` buckets: bucket `b` holds
@@ -137,38 +133,25 @@ impl Position {
             starts.push(corner_vertex.len());
         }
 
-        let mut edge_index: HashMap<(usize, usize), usize> =
-            HashMap::with_capacity(total / 2 + loose_edges.len());
+        let mut seen: HashSet<(usize, usize)> =
+            HashSet::with_capacity(total / 2 + loose_edges.len());
         let mut edge_ends = Vec::with_capacity(total / 2 + loose_edges.len());
         let mut edge_sharp = Vec::new();
-        let mut corner_edge = Vec::with_capacity(total);
+        let mut add_edge = |key: (usize, usize)| {
+            if seen.insert(key) {
+                edge_ends.push(key);
+                edge_sharp.push(sharpness.get(&key).copied().unwrap_or(0.0));
+            }
+        };
         for (poly, _) in polys {
             for corner in 0..poly.len() {
-                let key = edge_key(poly[corner], poly[(corner + 1) % poly.len()]);
-                let edge = *edge_index.entry(key).or_insert_with(|| {
-                    edge_ends.push(key);
-                    edge_sharp.push(sharpness.get(&key).copied().unwrap_or(0.0));
-                    edge_ends.len() - 1
-                });
-                corner_edge.push(edge);
+                add_edge(edge_key(poly[corner], poly[(corner + 1) % poly.len()]));
             }
         }
         for &[first, second] in loose_edges {
-            let key = edge_key(first, second);
-            edge_index.entry(key).or_insert_with(|| {
-                edge_ends.push(key);
-                edge_sharp.push(sharpness.get(&key).copied().unwrap_or(0.0));
-                edge_ends.len() - 1
-            });
+            add_edge(edge_key(first, second));
         }
-        let (edge_starts, edge_sides) = group(&corner_edge, edge_ends.len());
         let (vertex_starts, vertex_corners) = group(&corner_vertex, vertex_count);
-        let endpoints = edge_ends
-            .iter()
-            .flat_map(|(first, second)| [*first, *second])
-            .collect::<Vec<_>>();
-        let (vertex_edge_starts, endpoint_slots) = group(&endpoints, vertex_count);
-        let vertex_edges: Vec<usize> = endpoint_slots.into_iter().map(|slot| slot / 2).collect();
         let mut edge_order: Vec<usize> = (0..edge_ends.len()).collect();
         edge_order.sort_unstable_by_key(|edge| edge_ends[*edge]);
 
@@ -176,18 +159,11 @@ impl Position {
             starts,
             face_of,
             corner_vertex,
-            edge_starts,
-            edge_sides,
             edge_ends,
             edge_order,
             edge_sharp,
             vertex_starts,
             vertex_corners,
-            vertex_edge_starts,
-            vertex_edges,
-            non_manifold_corners: (0..vertex_count)
-                .map(|vertex| non_manifold.corner(vertex))
-                .collect(),
         }
     }
 
@@ -218,8 +194,9 @@ fn uv_winding(uvs: &[DVec2]) -> bool {
 }
 
 /// The value map of one layer. Corners at a position vertex share a value when their UVs connect and
-/// their face windings agree (Blender's `calc_uv_verts` with winding), grouped greedily in corner
-/// order. A value keeps the UV of its first corner.
+/// their face windings agree (Blender's `BKE_mesh_uv_vert_map_create` with winding). Groups seed from
+/// the last corner at each vertex, as Blender's prepended vertex list does. A value's UV is that of
+/// its last corner in face order, which Blender's face-varying upload writes last.
 fn value_map(position: &Position, corner_uv: &[DVec2]) -> ValueMap {
     let winding: Vec<bool> = position
         .starts
@@ -228,19 +205,17 @@ fn value_map(position: &Position, corner_uv: &[DVec2]) -> ValueMap {
         .collect();
     let mut value_of = vec![usize::MAX; corner_uv.len()];
     let mut vertex = Vec::new();
-    let mut uvs = Vec::new();
     for position_vertex in 0..position.vertex_starts.len() - 1 {
         let at_vertex = position.corners_at(position_vertex);
-        for (index, &corner) in at_vertex.iter().enumerate() {
+        for (index, &corner) in at_vertex.iter().enumerate().rev() {
             if value_of[corner] != usize::MAX {
                 continue;
             }
-            let value = uvs.len();
+            let value = vertex.len();
             let uv = corner_uv[corner];
-            uvs.push(uv);
             vertex.push(position_vertex);
             value_of[corner] = value;
-            for &other in &at_vertex[index + 1..] {
+            for &other in at_vertex[..index].iter().rev() {
                 let other_uv = corner_uv[other];
                 if value_of[other] == usize::MAX
                     && (other_uv.x - uv.x).abs() < UV_CONNECT_LIMIT
@@ -251,6 +226,10 @@ fn value_map(position: &Position, corner_uv: &[DVec2]) -> ValueMap {
                 }
             }
         }
+    }
+    let mut uvs = vec![DVec2::ZERO; vertex.len()];
+    for (corner, &value) in value_of.iter().enumerate() {
+        uvs[value] = corner_uv[corner];
     }
     let corners = position
         .starts
@@ -264,9 +243,8 @@ fn value_map(position: &Position, corner_uv: &[DVec2]) -> ValueMap {
     }
 }
 
-/// One layer's corner UVs in global corner order, zero where the layer has no value. The UVs stay in
-/// the store's convention: the winding test compares faces only with one another, and every
-/// subdivision rule is affine, so no V flip is needed.
+/// One layer's corner UVs in global corner order, zero where the layer has no value. UVs are
+/// converted to Blender's V-up convention.
 fn corner_uvs(position: &Position, layer: &UvLayer) -> Vec<DVec2> {
     let mut uvs = vec![DVec2::ZERO; position.corner_count()];
     for (face, values) in layer.faces.iter().enumerate() {

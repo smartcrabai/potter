@@ -8,8 +8,9 @@
 
 use std::f64::consts::PI;
 
-use super::gregory::{corner_span, fan, is_singular_edge};
-use super::level::Level;
+use super::gregory::{Corner, control_points, corner_span, fan, is_singular_edge};
+use super::level::{Level, VTag};
+use super::refine::Point;
 
 /// A sparse affine combination of level vertices: `(vertex, weight)`.
 pub(super) type Row = Vec<(usize, f64)>;
@@ -227,17 +228,22 @@ pub(super) fn tangent_coefficient(n: usize) -> f64 {
     }
 }
 
-/// Whether the leaf is evaluated by the B-spline (`OpenSubdiv` `IsPatchRegular`). `depth` is the
-/// leaf's level; `has_irregular_faces` is whether the base mesh has non-quad faces.
+/// The corner builder of a leaf: positions and face-varying values walk non-manifold spans differently.
+pub(super) type CornerBuilder = fn(&Level, usize, usize) -> Corner;
+
+/// Whether the leaf is evaluated by the B-spline (`OpenSubdiv` `IsPatchRegular`), for positions and
+/// face-varying values alike. `depth` is the leaf's level; `has_irregular_faces` is whether the base
+/// mesh has non-quad faces.
 pub(super) fn is_regular_leaf(
     level: &Level,
     face: usize,
     depth: usize,
     has_irregular_faces: bool,
 ) -> bool {
-    let corners = level.faces[face].clone();
-    let tags: Vec<_> = corners.iter().map(|&v| level.vtags[v]).collect();
-    let combined = super::level::VTag::combine(&tags);
+    let corners = &level.faces[face];
+    debug_assert_eq!(corners.len(), 4, "a leaf is a quad");
+    let tags: [VTag; 4] = std::array::from_fn(|corner| level.vtags[corners[corner]]);
+    let combined = VTag::combine(&tags);
     if !combined.inf_sharp && !combined.inf_sharp_edges {
         return !combined.xordinary;
     }
@@ -254,22 +260,25 @@ pub(super) fn is_regular_leaf(
             return !combined.inf_irregular;
         }
     }
-    for (i, tag) in tags.iter().enumerate() {
+    for (corner, tag) in tags.iter().enumerate() {
         if !(tag.non_manifold || tag.xordinary || tag.inf_irregular) {
             continue;
         }
         if tag.non_manifold {
-            // Non-manifold corners are only regular when their span is a single face with an
-            // infinitely sharp boundary, which the sharp-corner path reproduces.
-            return false;
+            let num_span_faces = corner_span(level, face, corners[corner]).faces.len();
+            let expected = if tag.inf_sharp { 1 } else { 2 };
+            if num_span_faces != expected {
+                return false;
+            }
+            continue;
         }
         if tag.xordinary {
             if !tag.inf_sharp_edges {
                 return false;
             }
             if tag.boundary && !tag.inf_sharp {
-                let previous = (i + 3) % 4;
-                let out_boundary = is_singular_edge(level, level.face_edges[face][i]);
+                let previous = (corner + 3) % 4;
+                let out_boundary = is_singular_edge(level, level.face_edges[face][corner]);
                 let in_boundary = is_singular_edge(level, level.face_edges[face][previous]);
                 if out_boundary && in_boundary {
                     continue;
@@ -277,14 +286,10 @@ pub(super) fn is_regular_leaf(
             }
         }
         if tag.inf_irregular {
-            if !tag.inf_sharp_edges {
+            if !tag.inf_sharp_edges || (tag.inf_sharp_crease && tag.boundary) {
                 return false;
             }
-            if tag.inf_sharp_crease && tag.boundary {
-                return false;
-            }
-            let span = corner_span(level, face, corners[i]);
-            let span_faces = span.faces.len();
+            let span_faces = corner_span(level, face, corners[corner]).faces.len();
             let expected = if tag.inf_sharp_crease { 2 } else { 1 };
             if span_faces != expected {
                 return false;
@@ -292,4 +297,59 @@ pub(super) fn is_regular_leaf(
         }
     }
     true
+}
+
+/// The limit patch of one leaf quad: the B-spline control grid of a regular leaf, or the Gregory
+/// control points. Built once per leaf and evaluated at any number of local coordinates.
+pub(super) enum Patch {
+    BSpline { grid: [Row; 16], mask: u8 },
+    Gregory([Row; 20]),
+}
+
+impl Patch {
+    /// The patch of leaf `face` at `depth`, with its corners built by `corner`.
+    pub(super) fn new(
+        level: &Level,
+        face: usize,
+        depth: usize,
+        has_irregular_faces: bool,
+        corner: CornerBuilder,
+    ) -> Patch {
+        if is_regular_leaf(level, face, depth, has_irregular_faces) {
+            let mask = boundary_mask(level, face);
+            Patch::BSpline {
+                grid: regular_grid(level, face, mask),
+                mask,
+            }
+        } else {
+            let corners: [Corner; 4] =
+                std::array::from_fn(|c| corner(level, face, level.faces[face][c]));
+            Patch::Gregory(control_points(&corners))
+        }
+    }
+
+    /// The limit point at local coordinates `(s, t)`, from the positions of the leaf's level.
+    pub(super) fn evaluate<T: Point>(&self, positions: &[T], s: f64, t: f64) -> T {
+        match self {
+            Patch::BSpline { grid, mask } => {
+                weighted_rows(grid, &bspline_weights(s, t, *mask), positions)
+            }
+            Patch::Gregory(rows) => weighted_rows(rows, &gregory_weights(s, t), positions),
+        }
+    }
+}
+
+/// `sum_k weights[k] * (sum_j row_k[j].weight * positions[row_k[j].vertex])`.
+fn weighted_rows<T: Point, const N: usize>(
+    rows: &[Row; N],
+    weights: &[f64; N],
+    positions: &[T],
+) -> T {
+    let mut point = T::default();
+    for (row, &weight) in rows.iter().zip(weights) {
+        for &(vertex, w) in row {
+            point = point + positions[vertex] * (weight * w);
+        }
+    }
+    point
 }

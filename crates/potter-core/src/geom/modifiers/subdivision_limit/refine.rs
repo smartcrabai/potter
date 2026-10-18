@@ -29,6 +29,17 @@ pub(super) struct Refined<T> {
     pub(super) face_children: Vec<Vec<Option<usize>>>,
     /// For a dependent-sharp fvar vertex, the sibling value supplying its fractional crease weight.
     pub(super) dependent_source: Vec<Option<usize>>,
+    /// The child vertex of each parent vertex, of each parent edge midpoint, and of each face center.
+    pub(super) children: Children,
+}
+
+/// Child vertex of each parent vertex, edge midpoint, and face center, `None` where the child does not
+/// exist. The three kinds share the child level's vertex numbering.
+#[derive(Default)]
+pub(super) struct Children {
+    pub(super) vertex: Vec<Option<usize>>,
+    pub(super) edge: Vec<Option<usize>>,
+    pub(super) face: Vec<Option<usize>>,
 }
 
 /// Feature-based selection of parent faces (`OpenSubdiv` `FeatureMask` with Blender's options).
@@ -43,7 +54,7 @@ fn does_face_have_features(level: &Level, face: usize, depth: usize) -> bool {
     if corners.len() != 4 {
         return true;
     }
-    let tags: Vec<VTag> = corners.iter().map(|&v| level.vtags[v]).collect();
+    let tags: [VTag; 4] = std::array::from_fn(|corner| level.vtags[corners[corner]]);
     let combined = VTag::combine(&tags);
     if combined.incid_irreg_face {
         return true;
@@ -86,95 +97,104 @@ fn inf_sharp_tag_has_features(tag: &VTag) -> bool {
     tag.inf_irregular && tag.rule & (RULE_CORNER | RULE_CREASE | RULE_DART) != 0
 }
 
-/// A child position is the parent-level mask applied to the parent positions and the child face
-/// centers. Each mask is stored by the parent's incidence order: the vertex, its incident edges'
-/// far ends, and its incident faces' centers.
-#[derive(Clone)]
-struct VertexMask {
-    vertex: f64,
-    edges: Vec<f64>,
-    faces: Vec<f64>,
+/// A vertex child's mask is a weighted sum of its parent vertex, the far ends of the parent's incident
+/// edges, and the centers of its incident faces.
+#[derive(Clone, Copy)]
+enum Term {
+    Vertex,
+    /// The far end of the `index`-th incident edge.
+    Edge(usize),
+    /// The center of an incident face. Every rule weights the faces alike.
+    Face,
 }
 
-impl VertexMask {
-    fn identity(edges: usize, faces: usize) -> VertexMask {
-        VertexMask {
-            vertex: 1.0,
-            edges: vec![0.0; edges],
-            faces: vec![0.0; faces],
+/// One vertex rule's mask over a parent vertex. `sharp_ends` are the first and last incident edges that
+/// are sharp under the rule's sharpness, when there are two or more.
+#[derive(Clone, Copy)]
+struct RuleMask {
+    rule: u8,
+    /// The number of incident faces, which is the valence of the smooth mask.
+    faces: usize,
+    sharp_ends: Option<(usize, usize)>,
+}
+
+impl RuleMask {
+    /// `sharp` marks the incident edges, in incidence order, that are sharp under this rule.
+    fn new(rule: u8, faces: usize, sharp: impl Iterator<Item = bool>) -> RuleMask {
+        let mut first = None;
+        let mut last = None;
+        for (index, is_sharp_edge) in sharp.enumerate() {
+            if is_sharp_edge {
+                first.get_or_insert(index);
+                last = Some(index);
+            }
+        }
+        let sharp_ends = match (first, last) {
+            (Some(first), Some(last)) if first != last => Some((first, last)),
+            _ => None,
+        };
+        RuleMask {
+            rule,
+            faces,
+            sharp_ends,
         }
     }
 
-    /// `self * weight + other * other_weight`.
-    fn blend(&self, weight: f64, other: &VertexMask, other_weight: f64) -> VertexMask {
-        VertexMask {
-            vertex: self.vertex * weight + other.vertex * other_weight,
-            edges: self
-                .edges
-                .iter()
-                .zip(&other.edges)
-                .map(|(a, b)| a * weight + b * other_weight)
-                .collect(),
-            faces: self
-                .faces
-                .iter()
-                .zip(&other.faces)
-                .map(|(a, b)| a * weight + b * other_weight)
-                .collect(),
+    /// Catmull-Clark smooth `(n-2)/n` on the vertex and `1/n^2` on each edge and face; crease `3/4` on the
+    /// vertex and `1/8` on each sharp end; the identity otherwise.
+    fn weight(self, term: Term) -> f64 {
+        match self.rule {
+            RULE_SMOOTH | RULE_DART => {
+                let n = self.faces as f64;
+                match term {
+                    Term::Vertex => (n - 2.0) / n,
+                    Term::Edge(_) | Term::Face => 1.0 / (n * n),
+                }
+            }
+            RULE_CREASE => match term {
+                Term::Vertex => 0.75,
+                Term::Edge(index)
+                    if self
+                        .sharp_ends
+                        .is_some_and(|(first, last)| index == first || index == last) =>
+                {
+                    0.125
+                }
+                Term::Edge(_) | Term::Face => 0.0,
+            },
+            _ => match term {
+                Term::Vertex => 1.0,
+                Term::Edge(_) | Term::Face => 0.0,
+            },
         }
     }
 }
 
-/// Catmull-Clark smooth vertex mask: `(n-2)/n` on the vertex, `1/n^2` on each edge and face.
-fn smooth_vertex_mask(edges: usize, faces: usize) -> VertexMask {
-    let n = faces as f64;
-    let weight = 1.0 / (n * n);
-    VertexMask {
-        vertex: (n - 2.0) / n,
-        edges: vec![weight; edges],
-        faces: vec![weight; faces],
-    }
-}
-
-/// Crease vertex mask over the two sharp incident edges: `3/4` on the vertex, `1/8` on each end.
-fn crease_vertex_mask(edges: usize, faces: usize, sharp: &[bool]) -> VertexMask {
-    let mut mask = VertexMask {
-        vertex: 0.75,
-        edges: vec![0.0; edges],
-        faces: vec![0.0; faces],
-    };
-    let mut ends = sharp
-        .iter()
-        .enumerate()
-        .filter(|(_, is_sharp_edge)| **is_sharp_edge)
-        .map(|(index, _)| index);
-    if let (Some(first), Some(last)) = (ends.next(), ends.next_back()) {
-        mask.edges[first] = 0.125;
-        mask.edges[last] = 0.125;
-    }
-    mask
-}
-
-/// Mask for a vertex under one rule. `sharp` marks the incident edges that are sharp under the rule's
-/// sharpness (the parent's for the parent rule, the child's for the child rule).
-fn rule_mask(rule: u8, edges: usize, faces: usize, sharp: &[bool]) -> VertexMask {
-    match rule {
-        RULE_SMOOTH | RULE_DART => smooth_vertex_mask(edges, faces),
-        RULE_CREASE => crease_vertex_mask(edges, faces, sharp),
-        _ => VertexMask::identity(edges, faces),
+/// The weight of `term` in a child vertex's mask: the parent rule's mask, blended with the child rule's
+/// mask by `blend = (child mask, parent weight)` when the rules differ.
+fn mask_weight(parent: RuleMask, blend: Option<(RuleMask, f64)>, term: Term) -> f64 {
+    match blend {
+        None => parent.weight(term),
+        Some((child, parent_weight)) => {
+            parent.weight(term) * parent_weight + child.weight(term) * (1.0 - parent_weight)
+        }
     }
 }
 
 /// Fractional weight of the parent rule at a vertex whose rule changes between levels (uniform
 /// creasing; `OpenSubdiv` `Crease::ComputeFractionalWeightAtVertex`).
-fn fractional_weight(parent_vertex: f64, child_vertex: f64, parent_edges: &[f64]) -> f64 {
+fn fractional_weight(
+    parent_vertex: f64,
+    child_vertex: f64,
+    parent_edges: impl Iterator<Item = f64>,
+) -> f64 {
     let mut count = 0.0;
     let mut sum = 0.0;
     if is_sharp(parent_vertex) && !is_sharp(child_vertex) {
         count += 1.0;
         sum += parent_vertex;
     }
-    for &sharpness in parent_edges {
+    for sharpness in parent_edges {
         if is_sharp(sharpness) && sharpness <= 1.0 {
             count += 1.0;
             sum += sharpness;
@@ -354,57 +374,56 @@ fn vertex_child_position<T: Point>(
     vertex: usize,
     child_rule: u8,
     child_sharpness: f64,
-    child_edge_sharpness: &[f64],
     dependent_source: Option<usize>,
     face_points: &[T],
 ) -> T {
     let parent_rule = parent.vtags[vertex].rule;
     let parent_edges = &parent.vertex_edges[vertex];
-    let parent_faces = &parent.vertex_faces[vertex];
-    let parent_edge_sharp: Vec<f64> = parent_edges
-        .iter()
-        .map(|&e| parent.edge_sharpness[e])
-        .collect();
-    let parent_sharp: Vec<bool> = parent_edge_sharp.iter().map(|&s| is_sharp(s)).collect();
-    let parent_vertex_sharpness = parent.vertex_sharpness[vertex];
-    let mut mask = rule_mask(
+    let face_count = parent.vertex_faces[vertex].len();
+    let parent_mask = RuleMask::new(
         parent_rule,
-        parent_edges.len(),
-        parent_faces.len(),
-        &parent_sharp,
+        face_count,
+        parent_edges
+            .iter()
+            .map(|&edge| is_sharp(parent.edge_sharpness[edge])),
     );
-    if parent_rule != RULE_SMOOTH && parent_rule != RULE_DART && child_rule != parent_rule {
-        let child_sharp: Vec<bool> = child_edge_sharpness.iter().map(|&s| is_sharp(s)).collect();
-        let child_mask = rule_mask(
-            child_rule,
-            parent_edges.len(),
-            parent_faces.len(),
-            &child_sharp,
-        );
-        let weight = if let Some(source) = dependent_source {
-            let source_edges: Vec<f64> = parent.vertex_edges[source]
-                .iter()
-                .map(|&edge| parent.edge_sharpness[edge])
-                .collect();
-            let source_child_sharpness =
-                child_vertex_sharpness(&parent.vtags[source], parent.vertex_sharpness[source]);
-            fractional_weight(
-                parent.vertex_sharpness[source],
-                source_child_sharpness,
-                &source_edges,
-            )
+    let blend =
+        if parent_rule != RULE_SMOOTH && parent_rule != RULE_DART && child_rule != parent_rule {
+            let child_mask = RuleMask::new(
+                child_rule,
+                face_count,
+                parent_edges
+                    .iter()
+                    .map(|&edge| is_sharp(child_edge_sharpness(parent.edge_sharpness[edge]))),
+            );
+            let weight = if let Some(source) = dependent_source {
+                let source_child_sharpness =
+                    child_vertex_sharpness(&parent.vtags[source], parent.vertex_sharpness[source]);
+                fractional_weight(
+                    parent.vertex_sharpness[source],
+                    source_child_sharpness,
+                    parent.vertex_edges[source]
+                        .iter()
+                        .map(|&edge| parent.edge_sharpness[edge]),
+                )
+            } else {
+                fractional_weight(
+                    parent.vertex_sharpness[vertex],
+                    child_sharpness,
+                    parent_edges.iter().map(|&edge| parent.edge_sharpness[edge]),
+                )
+            };
+            Some((child_mask, weight))
         } else {
-            fractional_weight(parent_vertex_sharpness, child_sharpness, &parent_edge_sharp)
+            None
         };
-        mask = mask.blend(weight, &child_mask, 1.0 - weight);
-    }
-    let mut point = positions[vertex] * mask.vertex;
+    let mut point = positions[vertex] * mask_weight(parent_mask, blend, Term::Vertex);
     for (index, &edge) in parent_edges.iter().enumerate() {
         let far = parent.far_vertex(edge, vertex);
-        point = point + positions[far] * mask.edges[index];
+        point = point + positions[far] * mask_weight(parent_mask, blend, Term::Edge(index));
     }
-    for (index, &face) in parent_faces.iter().enumerate() {
-        point = point + face_points[face] * mask.faces[index];
+    for &face in &parent.vertex_faces[vertex] {
+        point = point + face_points[face] * mask_weight(parent_mask, blend, Term::Face);
     }
     point
 }
@@ -462,8 +481,10 @@ pub(super) fn refine_values<T: Point>(
         dependent_sources,
     )
 }
-/// Refines a face-varying channel around its own features and the position surface's selected faces.
-/// This reproduces the combined feature mask `OpenSubdiv` uses when `FVar` channels are present.
+
+/// Refines a face-varying channel around its own features and the faces that the position surface
+/// selected. `extra[f]` marks value face `f` whose position face was selected, found through the
+/// parent/child links of both refinements: the channel and the positions share one topology.
 /// Position refinement remains unchanged; additional `FVar` features may add their own child quads.
 pub(super) fn refine_values_adaptive<T: Point>(
     parent: &Level,
@@ -471,13 +492,12 @@ pub(super) fn refine_values_adaptive<T: Point>(
     depth: usize,
     linear: bool,
     dependent_sources: &[Option<usize>],
-    position_selected: &[bool],
+    extra: &[bool],
 ) -> Option<(Vec<bool>, Refined<T>)> {
+    debug_assert_eq!(extra.len(), parent.faces.len());
     let mut selected = select_features(parent, depth);
-    if selected.len() == position_selected.len() {
-        for (selected, &position_selected) in selected.iter_mut().zip(position_selected) {
-            *selected |= position_selected;
-        }
+    for (selected, &extra) in selected.iter_mut().zip(extra) {
+        *selected |= extra;
     }
     if !selected.iter().any(|&selected| selected) {
         return None;
@@ -734,12 +754,9 @@ fn assemble<T: Point>(
                     dependent_source.and_then(|source| keys.vertex[source]);
                 let parent_tag = parent.vtags[v];
                 let edges = &parent.vertex_edges[v];
-                let halves: Vec<f64> = edges
-                    .iter()
-                    .map(|&e| child_edge_sharpness(parent.edge_sharpness[e]))
-                    .collect();
-                let inf_count = halves.iter().filter(|&&s| is_infinite(s)).count();
-                let semi_count = halves.iter().filter(|&&s| is_semi_sharp(s)).count();
+                let half = |e: usize| child_edge_sharpness(parent.edge_sharpness[e]);
+                let inf_count = edges.iter().filter(|&&e| is_infinite(half(e))).count();
+                let semi_count = edges.iter().filter(|&&e| is_semi_sharp(half(e))).count();
                 let sharpness = child_vertex_sharpness(&parent_tag, parent.vertex_sharpness[v]);
                 let rule = vertex_rule(sharpness, inf_count + semi_count);
                 let tag = VTag {
@@ -758,7 +775,6 @@ fn assemble<T: Point>(
                     v,
                     rule,
                     sharpness,
-                    &halves,
                     dependent_source,
                     &face_points,
                 );
@@ -836,5 +852,10 @@ fn assemble<T: Point>(
         positions: child_positions,
         face_children,
         dependent_source: child_dependent_sources,
+        children: Children {
+            vertex: keys.vertex.clone(),
+            edge: keys.edge.clone(),
+            face: keys.face.clone(),
+        },
     }
 }
