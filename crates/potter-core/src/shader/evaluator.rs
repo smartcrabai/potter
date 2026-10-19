@@ -2598,8 +2598,8 @@ mod tests {
     };
 
     use super::{
-        HitContext, HitUvLayers, color_lerp, evaluate_displacement, evaluate_surface, layer_index,
-        layer_uv,
+        BsdfParams, HitContext, HitUvLayers, color_lerp, evaluate_displacement, evaluate_surface,
+        layer_index, layer_uv,
     };
 
     fn set_properties(group: &mut NodeGroup, id: &str, properties: Value) {
