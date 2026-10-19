@@ -1367,6 +1367,8 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
+    type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
+
     use super::{
         ExchangeVertexGroup, byte_color_roundtrip, decode_byte_color, element_data_losses,
         encode_byte_color, graph_from_meshes, mesh_attribute_losses, point_color_values,
@@ -1542,8 +1544,7 @@ mod tests {
     }
 
     #[test]
-    fn imported_exchange_mesh_persists_colors_and_sparse_vertex_groups() -> crate::error::Result<()>
-    {
+    fn imported_exchange_mesh_persists_colors_and_sparse_vertex_groups() -> TestResult {
         use crate::{
             geom::color_layers::{self, ColorDomain, ColorLayer, ColorStore},
             model::Id,
@@ -1599,7 +1600,7 @@ mod tests {
     }
 
     #[test]
-    fn evaluated_mesh_export_reads_mirror_propagated_vertex_weights() -> crate::error::Result<()> {
+    fn evaluated_mesh_export_reads_mirror_propagated_vertex_weights() -> TestResult {
         use std::collections::BTreeMap;
 
         use crate::{

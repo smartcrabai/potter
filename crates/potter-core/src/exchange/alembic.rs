@@ -2886,10 +2886,11 @@ pub(crate) fn read_mesh_cache(
                             2,
                             sample_slot(values, sample_index),
                         )?;
-                        let corners = cache_uv_faces(&file_faces, &scope, &tuples)?
-                            .into_iter()
-                            .map(uv_to_storage)
-                            .collect();
+                        let corners: Vec<Vec<[f64; 2]>> =
+                            cache_uv_faces(&file_faces, &scope, &tuples)?
+                                .into_iter()
+                                .map(uv_to_storage)
+                                .collect();
                         let pinned = corners.iter().map(|face| vec![false; face.len()]).collect();
                         Ok(ExchangeUvLayer {
                             name: name.clone(),

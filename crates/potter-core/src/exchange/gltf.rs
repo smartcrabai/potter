@@ -331,9 +331,9 @@ fn color_layer_storage_key(mesh: &Mesh, key: &str) -> bool {
 }
 
 /// A derived glTF image: its pixels plus the Potter images it was packed from.
-struct PackedImage {
+pub(super) struct PackedImage {
     name: String,
-    pixels: ImageData,
+    pub(super) pixels: ImageData,
     sources: Vec<Id>,
 }
 
@@ -342,7 +342,7 @@ struct PackedImage {
 /// Each source contributes its raw glTF value: sRGB color channels are re-encoded from the loaded
 /// linear values. The output has the largest source's size; smaller or larger sources are sampled
 /// nearest.
-fn pack_channels(
+pub(super) fn pack_channels(
     channels: &[Option<ChannelSource>; 4],
     interpolation: ImageInterpolation,
     doc: &SceneDoc,
@@ -482,7 +482,10 @@ fn encode_png(image: &Image, pixels: &ImageData) -> Result<Vec<u8>> {
     encode_png_with_colorspace(image.colorspace, pixels)
 }
 
-fn encode_png_with_colorspace(colorspace: ImageColorspace, pixels: &ImageData) -> Result<Vec<u8>> {
+pub(super) fn encode_png_with_colorspace(
+    colorspace: ImageColorspace,
+    pixels: &ImageData,
+) -> Result<Vec<u8>> {
     let pixel_count = usize::try_from(pixels.width)
         .ok()
         .and_then(|width| {

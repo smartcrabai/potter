@@ -4741,11 +4741,7 @@ def Xform "Scene"
 "##;
         let (store, losses) = import_colors(text)?;
         assert!(store.layers.is_empty());
-        assert!(
-            losses
-                .iter()
-                .any(|loss| loss.feature_id == "mesh.color_attribute")
-        );
+        assert!(losses.iter().any(|loss| loss == "mesh.color_attribute"));
         Ok(())
     }
 
@@ -4956,7 +4952,7 @@ def Xform "Scene"
         assert!(
             losses
                 .iter()
-                .any(|feature| feature == "material.usd_shader_network")
+                .any(|loss| loss.feature_id == "material.usd_shader_network")
         );
         Ok(())
     }

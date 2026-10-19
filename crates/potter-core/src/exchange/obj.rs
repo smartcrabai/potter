@@ -18,7 +18,7 @@ use super::{
 use crate::{
     error::{ErrorCode, PotError, Result},
     geom::color_layers::{ColorDomain, ColorLayer, ColorStore},
-    image::ImageInterpolation,
+    image::{ImageExtension, ImageInterpolation},
     model::{
         Id, Image, ImageAlphaMode, ImageColorspace, ImageSource, Material, SceneDoc, TextureRef,
     },
@@ -1907,6 +1907,7 @@ fn reference(image: Id) -> TextureRef {
         image,
         uv_layer: None,
         interpolation: ImageInterpolation::Linear,
+        extension: ImageExtension::Repeat,
     }
 }
 
@@ -2024,7 +2025,7 @@ mod tests {
         error::{ErrorCode, PotError, Result},
         exchange::test_support::triangle_with_layers,
         geom::color_layers::{ColorDomain, ColorLayer, ColorStore},
-        image::ImageInterpolation,
+        image::{ImageExtension, ImageInterpolation},
         model::{
             Id, Image, ImageAlphaMode, ImageColorspace, ImageSource, Material, SceneDoc, TextureRef,
         },
@@ -2325,6 +2326,7 @@ mod tests {
                     image: image_id,
                     uv_layer: None,
                     interpolation: ImageInterpolation::Linear,
+                    extension: ImageExtension::Repeat,
                 }),
                 ..Material::default()
             },
@@ -2385,6 +2387,7 @@ mod tests {
                     image: image_id,
                     uv_layer: None,
                     interpolation: ImageInterpolation::Linear,
+                    extension: ImageExtension::Repeat,
                 }),
                 ..Material::default()
             },
