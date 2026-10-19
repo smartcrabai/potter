@@ -318,6 +318,7 @@ pub(super) fn render(
     samples: u32,
     seed: u32,
     max_bounces: u32,
+    transparent_max_bounces: u32,
     film_transparent: bool,
     images: &BTreeMap<String, ImageData>,
 ) -> Result<RasterOutput> {
@@ -432,6 +433,7 @@ pub(super) fn render(
                         left_direction,
                         environment,
                         max_bounces,
+                        transparent_max_bounces,
                         &mut left_rng,
                         &mut evaluator_workspace,
                     )?;
@@ -448,6 +450,7 @@ pub(super) fn render(
                         right_direction,
                         environment,
                         max_bounces,
+                        transparent_max_bounces,
                         &mut right_rng,
                         &mut evaluator_workspace,
                     )?;
@@ -471,6 +474,7 @@ pub(super) fn render(
                         direction,
                         environment,
                         max_bounces,
+                        transparent_max_bounces,
                         &mut rng,
                         &mut evaluator_workspace,
                     )?
@@ -761,6 +765,7 @@ fn trace_path(
     mut direction: DVec3,
     environment: DVec3,
     max_bounces: u32,
+    transparent_max_bounces: u32,
     rng: &mut Pcg32,
     evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<(DVec3, f64)> {
@@ -768,7 +773,9 @@ fn trace_path(
     let mut throughput = DVec3::ONE;
     let mut alpha = 0.0;
     let mut previous = Scatter::Unsampled;
-    for bounce in 0..=max_bounces {
+    let mut bounce = 0u32;
+    let mut transparent_bounce = 0u32;
+    loop {
         let hit = closest_hit(geometry, bvh, origin, direction, RAY_EPSILON, f64::INFINITY);
         let segment_limit = hit.map_or(f64::INFINITY, |hit| hit.distance);
         let environment = world_radiance(doc, &snapshot.scene_id, images, direction, environment)?;
@@ -811,6 +818,7 @@ fn trace_path(
             direction = sample_henyey_greenstein_direction(direction, event.anisotropy, rng);
             origin = event.point + direction * RAY_EPSILON;
             previous = Scatter::Volume;
+            bounce += 1;
             continue;
         }
         let Some(hit) = hit else {
@@ -882,9 +890,14 @@ fn trace_path(
             if throughput.max_element() <= 1.0e-8 {
                 break;
             }
+            bounce += 1;
             continue;
         }
         if rng.next_f64() >= surface.params.alpha.clamp(0.0, 1.0) {
+            transparent_bounce += 1;
+            if transparent_bounce > transparent_max_bounces {
+                break;
+            }
             origin = offset_origin(surface.point, direction, surface.geometric_normal);
             continue;
         }
@@ -942,6 +955,7 @@ fn trace_path(
         }
         direction = next_direction.normalize_or_zero();
         origin = offset_origin(surface.point, direction, surface.geometric_normal);
+        bounce += 1;
     }
     if !radiance.is_finite() {
         return Err(PotError::new(
