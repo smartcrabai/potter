@@ -119,11 +119,6 @@ pub fn apply_stroke_with_dyntopo(
     {
         return Err(invalid("dyntopo edge length must be finite and positive"));
     }
-    if stroke.brush.is_dab_brush() && !stroke.symmetry.is_empty() {
-        return Err(invalid(
-            "clay_strips, inflate, and layer do not support symmetry yet",
-        ));
-    }
     let positions = vertex_positions(mesh);
     let normals = vertex_normals(mesh, &positions);
     let adjacency = vertex_adjacency(mesh);
@@ -1086,7 +1081,7 @@ fn deterministic_scale(seed: u64, position: DVec3, symmetry: &[String]) -> f64 {
     0.98 + unit * 0.02
 }
 
-fn invalid(message: impl Into<String>) -> PotError {
+pub(super) fn invalid(message: impl Into<String>) -> PotError {
     PotError::with_details(
         crate::error::ErrorCode::InvalidOperation,
         message,

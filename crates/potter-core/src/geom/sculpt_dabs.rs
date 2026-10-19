@@ -4,6 +4,8 @@
 //! such dab at its `position`, applied in order to the positions the previous dabs left behind.
 //! Vertex normals are the stroke-start normals for every dab: Blender's pbvh normals are not
 //! refreshed between dabs of one stroke, which the Inflate and Layer oracles confirm.
+//! Mirror symmetry runs each dab once per pass, in Blender's order, against the positions the
+//! earlier passes left behind. The strength of every pass is scaled by Blender's symmetry feather.
 //!
 //! Potter's stroke has no brush settings, so the Blender 5.2.2 defaults for these brushes are
 //! fixed here: the constants below and the strength, pressure, and falloff a sample carries.
@@ -17,7 +19,7 @@ use std::collections::BTreeMap;
 
 use glam::{DVec2, DVec3};
 
-use super::sculpt::{Brush, Falloff, Stroke};
+use super::sculpt::{Brush, Falloff, Stroke, invalid};
 use crate::{error::Result, geom::Mesh};
 
 /// Clay Strips `plane_offset` default: the plane sits this many radii above the area center.
@@ -32,13 +34,62 @@ const LAYER_HEIGHT: f64 = 0.05;
 /// Layer `hardness` default.
 const LAYER_HARDNESS: f64 = 0.35;
 
-/// Apply every sample as one dab, in order. Returns whether any vertex moved.
+/// Blender's `symm` bit mask for the stroke's mirror axes: X = 1, Y = 2, Z = 4.
+fn symmetry_mask(axes: &[String]) -> Result<u8> {
+    let mut mask = 0_u8;
+    for axis in axes {
+        mask |= match axis.as_str() {
+            "x" => 1,
+            "y" => 2,
+            "z" => 4,
+            _ => return Err(invalid("symmetry axes must be x, y, or z")),
+        };
+    }
+    Ok(mask)
+}
+
+/// Blender's `is_symmetry_iteration_valid` (`paint_intern.hh`): the symmetry passes of a `symm`
+/// mask, as per-axis sign vectors. Pass 0 is the unflipped brush. Blender's
+/// `do_symmetrical_brush_actions` runs the whole brush once per pass, in order, with the location
+/// and grab delta flipped.
+fn symmetry_passes(symm: u8) -> Vec<DVec3> {
+    let sign = |bit: u8, i: u8| if i & bit != 0 { -1.0 } else { 1.0 };
+    (0..=symm)
+        .filter(|&i| {
+            i == 0
+                || ((symm & i) != 0 && !(symm == 5 && i == 3) && !(symm == 6 && (i == 3 || i == 5)))
+        })
+        .map(|i| DVec3::new(sign(1, i), sign(2, i), sign(4, i)))
+        .collect()
+}
+
+/// Blender's `calc_symmetry_feather` with the default `use_symmetry_feather`: each symmetry pass
+/// contributes an overlap of how close its mirrored dab center is to the original, and every
+/// pass's strength is divided by the total overlap (`sculpt.cc` `calc_overlap`).
+fn symmetry_feather(center: DVec3, radius: f64, passes: &[DVec3]) -> f64 {
+    let overlap: f64 = passes
+        .iter()
+        .map(|sign| {
+            let distance_sq = (center * *sign).distance_squared(center);
+            if distance_sq <= 4.0 * radius * radius {
+                (2.0 * radius - distance_sq.sqrt()) / (2.0 * radius)
+            } else {
+                0.0
+            }
+        })
+        .sum();
+    1.0 / overlap
+}
+
+/// Apply every sample as one dab, in order, running each dab's symmetry passes in Blender's order.
+/// Returns whether any vertex moved.
 pub(super) fn apply_dabs(
     mesh: &mut Mesh,
     stroke: &Stroke,
     normals: &BTreeMap<u32, DVec3>,
     masks: &BTreeMap<u32, f64>,
 ) -> Result<bool> {
+    let passes = symmetry_passes(symmetry_mask(&stroke.symmetry)?);
     let original: Vec<DVec3> = mesh.vertices.iter().map(|vertex| vertex.co).collect();
     let stroke_normals: Vec<DVec3> = mesh
         .vertices
@@ -62,9 +113,10 @@ pub(super) fn apply_dabs(
     let mut previous: Option<DVec3> = None;
     for sample in &stroke.samples {
         let center = sample.position;
-        // Blender's `sculpt.cc` `brush_strength` with alpha = strength squared, flip = 1,
-        // overlap = 1 and feather = 1 (DOTS dabs, no symmetry).
+        // Blender's `sculpt.cc` `brush_strength` with alpha = strength squared, flip = 1 and
+        // overlap = 1 (DOTS dabs without space attenuation), times the symmetry feather.
         let alpha = sample.strength * sample.strength;
+        let feather = symmetry_feather(center, sample.radius, &passes);
         let grab = previous.replace(center).map(|last| center - last);
         match stroke.brush {
             Brush::ClayStrips => {
@@ -74,12 +126,13 @@ pub(super) fn apply_dabs(
                     continue;
                 };
                 // Clay Strips strength curve: pressure^1.5 and a 0.3 factor (`brush_strength`).
-                let strength = 0.3 * alpha * sample.pressure.powf(1.5);
+                let strength = 0.3 * alpha * sample.pressure.powf(1.5) * feather;
                 clay_strips_dab(
                     &mut current,
                     &stroke_normals,
                     &mask_factors,
                     stroke.falloff,
+                    &passes,
                     ClayStripsDab {
                         center,
                         grab,
@@ -90,30 +143,34 @@ pub(super) fn apply_dabs(
             }
             Brush::Inflate => {
                 // Inflate's `brush_strength` case: 0.25 * alpha * pressure for a positive flip.
-                let strength = 0.25 * alpha * sample.pressure;
-                inflate_dab(
-                    &mut current,
-                    &stroke_normals,
-                    &mask_factors,
-                    stroke.falloff,
-                    center,
-                    sample.radius,
-                    strength,
-                );
+                let strength = 0.25 * alpha * sample.pressure * feather;
+                for sign in &passes {
+                    inflate_dab(
+                        &mut current,
+                        &stroke_normals,
+                        &mask_factors,
+                        stroke.falloff,
+                        center * *sign,
+                        sample.radius,
+                        strength,
+                    );
+                }
             }
             Brush::Layer => {
-                let strength = alpha * sample.pressure;
-                layer_dab(
-                    &mut current,
-                    &original,
-                    &stroke_normals,
-                    &mut layer_displacement,
-                    &mask_factors,
-                    stroke.falloff,
-                    center,
-                    sample.radius,
-                    strength,
-                );
+                let strength = alpha * sample.pressure * feather;
+                for sign in &passes {
+                    layer_dab(
+                        &mut current,
+                        &original,
+                        &stroke_normals,
+                        &mut layer_displacement,
+                        &mask_factors,
+                        stroke.falloff,
+                        center * *sign,
+                        sample.radius,
+                        strength,
+                    );
+                }
             }
             _ => unreachable!("apply_dabs receives only dab brushes"),
         }
@@ -138,15 +195,18 @@ struct ClayStripsDab {
     strength: f64,
 }
 
-/// Blender 5.2.2 Clay Strips for one dab. The plane comes from the area normal and center around
-/// the dab (`calc_brush_plane`, AREA). The strip frame has x = normal × grab, y = normal × x, and
-/// z = -normal, so vertices below the plane have positive local z. Each vertex moves along the
-/// plane normal by `strength * radius` times its depth and tip factors (`clay_strips.cc`).
+/// Blender 5.2.2 Clay Strips for one dab, run once per symmetry pass. Pass 0 takes the plane from
+/// the area normal and center around the dab (`calc_brush_plane`, AREA). A mirror pass flips that
+/// normal, center, and the grab delta instead of recomputing them (`sculpt.cc`, non-main-pass
+/// branch). The strip frame has x = normal × grab, y = normal × x, and z = -normal, so vertices
+/// below the plane have positive local z. Each vertex moves along the plane normal by
+/// `strength * radius` times its depth and tip factors (`clay_strips.cc`).
 fn clay_strips_dab(
     positions: &mut [DVec3],
     normals: &[DVec3],
     mask_factors: &[f64],
     falloff: Falloff,
+    passes: &[DVec3],
     dab: ClayStripsDab,
 ) {
     let Some((normal, area_center)) = area_plane(
@@ -157,30 +217,35 @@ fn clay_strips_dab(
     ) else {
         return;
     };
-    let plane_center = area_center + normal * (dab.radius * CLAY_STRIPS_PLANE_OFFSET);
-    let x_axis = normal.cross(dab.grab).normalize_or_zero();
-    if x_axis == DVec3::ZERO {
-        return;
-    }
-    let y_axis = normal.cross(x_axis).normalize_or_zero();
-    let z_axis = -normal;
-    for (index, position) in positions.iter_mut().enumerate() {
-        let offset = *position - plane_center;
-        let local_z = offset.dot(z_axis) / dab.radius;
-        let depth = (local_z * (1.0 - local_z)).max(0.0) * mask_factors[index];
-        if depth == 0.0 {
+    for sign in passes {
+        let plane_normal = normal * *sign;
+        let plane_center =
+            area_center * *sign + plane_normal * (dab.radius * CLAY_STRIPS_PLANE_OFFSET);
+        let grab = dab.grab * *sign;
+        let x_axis = plane_normal.cross(grab).normalize_or_zero();
+        if x_axis == DVec3::ZERO {
             continue;
         }
-        let tip = cube_distance(
-            offset.dot(x_axis) / dab.radius,
-            offset.dot(y_axis) / dab.radius,
-            CLAY_STRIPS_TIP_ROUNDNESS,
-        );
-        if tip >= 1.0 {
-            continue;
+        let y_axis = plane_normal.cross(x_axis).normalize_or_zero();
+        let z_axis = -plane_normal;
+        for (index, position) in positions.iter_mut().enumerate() {
+            let offset = *position - plane_center;
+            let local_z = offset.dot(z_axis) / dab.radius;
+            let depth = (local_z * (1.0 - local_z)).max(0.0) * mask_factors[index];
+            if depth == 0.0 {
+                continue;
+            }
+            let tip = cube_distance(
+                offset.dot(x_axis) / dab.radius,
+                offset.dot(y_axis) / dab.radius,
+                CLAY_STRIPS_TIP_ROUNDNESS,
+            );
+            if tip >= 1.0 {
+                continue;
+            }
+            let factor = depth * falloff.weight(tip);
+            *position += plane_normal * (dab.strength * dab.radius * factor);
         }
-        let factor = depth * falloff.weight(tip);
-        *position += normal * (dab.strength * dab.radius * factor);
     }
 }
 
