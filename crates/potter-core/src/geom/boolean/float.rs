@@ -3474,7 +3474,13 @@ fn dissolve_intersection_vertices(state: &mut State) {
             edges_at_vertex[b].insert(edge_key_usize(a, b));
         }
     }
-    for &edge in state.edge_orig.keys().chain(state.wire_edges.iter()) {
+    // Blender's disk counts every BMesh edge at the vertex, including split-net edges that no face loops.
+    for &edge in state
+        .edge_orig
+        .keys()
+        .chain(state.wire_edges.iter())
+        .chain(state.dangling_edges.iter())
+    {
         edges_at_vertex[edge.0].insert(edge);
         edges_at_vertex[edge.1].insert(edge);
     }
