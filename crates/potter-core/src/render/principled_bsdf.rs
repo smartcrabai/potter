@@ -94,11 +94,13 @@ pub(crate) fn diffuse_coefficient(params: &BsdfParams, normal: DVec3, view: DVec
             let z = ((layer.eta - 1.0) / (layer.eta + 1.0)).abs().sqrt();
             let albedo_remap = ggx_gen_schlick_ior_s(roughness, n_dot_v, z);
             let albedo = layer.f0_tinted.lerp(DVec3::ONE, albedo_remap);
-            closure_layering_weight(albedo.max_element(), dielectric_weight)
+            let energy = ggx_energy(roughness, n_dot_v).max(1.0e-6);
+            let darkened = albedo * dielectric_darkening(&layer, roughness, energy);
+            layered_diffuse_weight(dielectric_weight, darkened.max_element())
         }
         None => dielectric_weight,
     };
-    base_color(params) * (diffuse_weight / PI) * params.reflectance.clamp(0.0, 1.0)
+    diffuse_albedo(params) * (diffuse_weight / PI) * params.reflectance.clamp(0.0, 1.0)
 }
 
 /// Specular (dielectric and metallic) lobes along `light`, times reflectance. Zero when the
@@ -138,18 +140,11 @@ pub(crate) fn specular_coefficient(
 
     if let Some(layer) = specular_layer(params) {
         let f0 = layer.f0_tinted;
-        let real_f0 = f0_from_ior(layer.eta);
+        let real_f0 = dielectric_f0(layer.eta, 0.5);
         let real_f = fresnel_dielectric(v_dot_h, layer.eta);
         let remap = saturate(inverse_lerp(real_f0, 1.0, real_f));
         let fresnel = f0.lerp(DVec3::ONE, remap);
-
-        let fss_remap = saturate(inverse_lerp(
-            real_f0,
-            1.0,
-            fresnel_dielectric_fss(layer.eta),
-        ));
-        let fss = f0.lerp(DVec3::ONE, fss_remap);
-        let gain = multiscatter_gain(fss, energy_average, missing);
+        let gain = multiscatter_gain(dielectric_fss(&layer), energy_average, missing);
         reflected += gain * fresnel * dielectric_weight;
     }
 
@@ -183,23 +178,50 @@ pub(crate) fn evaluate(params: &BsdfParams, normal: DVec3, view: DVec3, light: D
     diffuse_coefficient(params, normal, view) + specular_coefficient(params, normal, view, light)
 }
 
+/// The base colour clamped to 1 (Cycles' `clamped_base_color`, used by the F82 metal lobe).
 fn base_color(params: &BsdfParams) -> DVec3 {
+    diffuse_albedo(params).min(DVec3::ONE)
+}
+
+/// The diffuse albedo: the base colour clamped at zero only. Cycles' diffuse closure takes the
+/// unclamped base colour (`svm_closure.h`, the `bsdf_oren_nayar_setup` call); the clamp to 1 is
+/// applied for the F82 metal lobe only.
+fn diffuse_albedo(params: &BsdfParams) -> DVec3 {
     DVec3::new(
         params.base_color[0],
         params.base_color[1],
         params.base_color[2],
     )
-    .clamp(DVec3::ZERO, DVec3::ONE)
+    .max(DVec3::ZERO)
 }
 
-/// `closure_layering_weight(layer_albedo, weight)` for a scalar weight and a per-channel albedo:
-/// `weight * saturate(1 - max(albedo / weight))`, i.e. `max(0, weight - max(albedo))`.
-fn closure_layering_weight(max_layer_albedo: f64, weight: f64) -> f64 {
-    if weight <= 0.0 {
-        return 0.0;
-    }
-    weight * (1.0 - max_layer_albedo / weight).clamp(0.0, 1.0)
+/// `closure_layering_weight` for the diffuse lobe under a dielectric layer. `layer_albedo` is the
+/// layer's albedo with its energy darkening applied (the weighted albedo the closure reports), so
+/// the diffuse lobe keeps `weight · (1 - albedo)` of its weight.
+fn layered_diffuse_weight(weight: f64, layer_albedo: f64) -> f64 {
+    weight * saturate(1.0 - layer_albedo)
 }
+
+/// Cycles' `microfacet_ggx_preserve_energy` darkening of the dielectric specular closure weight,
+/// `(1 + Fms · m) / (1 + m)` with `m = (1 - E) / E`, which equals `gain · E`.
+fn dielectric_darkening(layer: &SpecularLayer, roughness: f64, energy: f64) -> DVec3 {
+    let missing = (1.0 - energy) / energy;
+    multiscatter_gain(dielectric_fss(layer), ggx_energy_average(roughness), missing) * energy
+}
+
+/// The average single-scattering Fresnel of the dielectric layer, remapped from F0..1 as the
+/// specular lobe's energy compensation uses it (`fresnel_dielectric_Fss` through
+/// `generalized_schlick_fresnel`).
+fn dielectric_fss(layer: &SpecularLayer) -> DVec3 {
+    let real_f0 = dielectric_f0(layer.eta, 0.5);
+    let fss_remap = saturate(inverse_lerp(
+        real_f0,
+        1.0,
+        fresnel_dielectric_fss(layer.eta),
+    ));
+    layer.f0_tinted.lerp(DVec3::ONE, fss_remap)
+}
+
 
 struct SpecularLayer {
     eta: f64,
@@ -214,7 +236,7 @@ struct SpecularLayer {
 )]
 fn specular_layer(params: &BsdfParams) -> Option<SpecularLayer> {
     let level = params.specular_ior_level.max(0.0);
-    let f0_scalar = f0_from_ior(params.ior) * 2.0 * level;
+    let f0_scalar = dielectric_f0(params.ior, level);
     let eta = if level == 0.5 {
         params.ior
     } else {
@@ -267,10 +289,6 @@ fn saturate(value: f64) -> f64 {
 /// Cycles `inverse_lerp(a, b, x) = (x - a) / (b - a)`.
 fn inverse_lerp(a: f64, b: f64, x: f64) -> f64 {
     (x - a) / (b - a)
-}
-
-pub(crate) fn f0_from_ior(ior: f64) -> f64 {
-    ((ior - 1.0) / (ior + 1.0)).powi(2)
 }
 
 fn ior_from_f0(f0: f64) -> f64 {
@@ -330,18 +348,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn layering_weight_matches_cycles_formula() {
-        // weight * saturate(1 - albedo / weight) for a scalar weight.
-        assert!((closure_layering_weight(0.04, 1.0) - 0.96).abs() < 1.0e-12);
-        assert!((closure_layering_weight(0.04, 0.76) - 0.72).abs() < 1.0e-12);
-        assert_eq!(closure_layering_weight(0.5, 0.0), 0.0);
-        assert_eq!(closure_layering_weight(2.0, 1.0), 0.0);
+    fn layered_diffuse_weight_keeps_what_the_layer_does_not_reflect() {
+        // weight · (1 - layer albedo), with the albedo already darkened.
+        assert!((layered_diffuse_weight(1.0, 0.04) - 0.96).abs() < 1.0e-12);
+        assert!((layered_diffuse_weight(0.76, 0.04) - 0.7296).abs() < 1.0e-12);
+        assert_eq!(layered_diffuse_weight(0.0, 0.5), 0.0);
+        assert_eq!(layered_diffuse_weight(1.0, 2.0), 0.0);
     }
 
     #[test]
     fn dielectric_fresnel_at_normal_incidence_is_f0() {
         let eta = 1.5;
-        assert!((fresnel_dielectric(1.0, eta) - f0_from_ior(eta)).abs() < 1.0e-12);
+        assert!((fresnel_dielectric(1.0, eta) - dielectric_f0(eta, 0.5)).abs() < 1.0e-12);
     }
 
     #[test]
