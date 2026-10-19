@@ -2442,7 +2442,11 @@ baseline_evaluated.to_mesh_clear()
     let scene = root.join("volume-displacement-vdb");
     let batch = root.join("operations.json");
     initialize(&scene)?;
+    // Blender's image rows run bottom-up (the oracle's `image.pixels` row 0 is the bottom row), while Potter's
+    // storage, which `image.set_pixels` writes, runs top-down. The same visual image is therefore the Blender
+    // rows in reverse order, so the Potter side passes its rows top-down.
     let texture_pixels = (0_u32..3)
+        .rev()
         .flat_map(|y| {
             (0_u32..4).map(move |x| {
                 [
