@@ -16,7 +16,7 @@ use crate::{
     eval::{EvaluationContext, EvaluationPurpose, Snapshot},
     exchange::{self, ExportOptions, Loss, material_surface::resolve_surface},
     hash,
-    model::{AvatarVersion, Image, LightType, SceneDoc},
+    model::{AvatarVersion, CameraProjection, Image, LightType, SceneDoc},
     response::SceneInfo,
     store::Project,
 };
@@ -619,6 +619,23 @@ pub(crate) fn export_losses(
                 data_id: Some(id.to_string()),
                 reason: format!("{format} does not represent cameras"),
                 suggestion: Some("export as glb, gltf, usda, usdz, or blend".to_owned()),
+            });
+        }
+        // glTF and USD write a panorama camera as a perspective camera with its lens: the panorama projection is lost.
+        if let Some(camera) = &data.camera
+            && camera.projection == CameraProjection::Panorama
+            && supports_cameras
+        {
+            losses.push(Loss {
+                feature_id: "camera.panorama".to_owned(),
+                data_id: Some(id.to_string()),
+                reason: format!(
+                    "{format} writes a panorama camera as a perspective camera; its panorama projection is not represented"
+                ),
+                suggestion: Some(
+                    "export as blend to keep the panorama camera, or export with --allow-lossy"
+                        .to_owned(),
+                ),
             });
         }
         if let Some(light) = &data.light {
