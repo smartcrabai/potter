@@ -2483,6 +2483,14 @@ def set_rna(block, values, id_lookup=None, *, strict=False, owner=None):
                 raise
             continue
 
+def _id_matches_pointer_type(candidate, pointer_type):
+    # Typed textures report type-specific RNA identifiers (CloudsTexture, ImageTexture), so a
+    # Texture pointer matches by Python type.
+    if pointer_type == "Texture":
+        return isinstance(candidate, bpy.types.Texture)
+    return candidate.bl_rna.identifier == pointer_type
+
+
 def _restore_modifier_id_references(modifier, params, id_lookup, texture_lookup,
                                     lost_texture_ids=frozenset()):
     for key, value in params.items():
@@ -2498,12 +2506,12 @@ def _restore_modifier_id_references(modifier, params, id_lookup, texture_lookup,
             # Rust reports a native Value Noise texture as a loss; the modifier keeps no texture.
             continue
         if (candidate is None
-                or candidate.bl_rna.identifier != pointer_type
+                or not _id_matches_pointer_type(candidate, pointer_type)
                 or (isinstance(value, dict)
                     and value.get("id_type") != pointer_type)):
             raise ValueError(
-                "modifier %s references unavailable %s ID %s"
-                % (modifier.name, pointer_type, name))
+                "modifier %s property %s references unavailable %s ID %s"
+                % (modifier.name, key, pointer_type, name))
         setattr(modifier, key, candidate)
 
 

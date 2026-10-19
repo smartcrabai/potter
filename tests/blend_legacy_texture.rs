@@ -184,7 +184,7 @@ settings = {
     "CLOUDS": ("noise_scale", "noise_depth", "noise_basis", "noise_type", "cloud_type"),
     "MARBLE": ("noise_scale", "turbulence", "noise_depth", "noise_type", "marble_type",
                "noise_basis", "noise_basis_2"),
-    "WOOD": ("noise_scale", "turbulence", "noise_depth", "noise_type", "wood_type",
+    "WOOD": ("noise_scale", "turbulence", "noise_basis", "noise_type", "wood_type",
              "noise_basis_2"),
     "MAGIC": ("turbulence", "noise_depth"),
     "BLEND": ("progression", "use_flip_axis"),
