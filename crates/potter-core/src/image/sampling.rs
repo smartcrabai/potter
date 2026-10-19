@@ -60,6 +60,8 @@ pub struct ImageData {
     pub storage: ImageStorage,
     /// The stored colour texels for colour reads, computed on the first colour read (see [`ColourCache`]).
     pub colour: ColourCache,
+    /// The image routes UDIM lookups by tile (a TILED source or any stored tile), as `Image::is_udim` decides.
+    pub udim: bool,
 }
 
 impl ImageData {
@@ -364,10 +366,12 @@ fn base_tile(data: &ImageData) -> ImageTileDataRef<'_> {
     }
 }
 
-/// The stored tile `number`. The base image is tile 1001, which Potter keeps outside `tiles`. Any other tile must be stored.
+/// The stored tile `number`. The base image is tile 1001, which Potter keeps outside `tiles` unless a TILED base is
+/// stored there. A tile with no size has no file (a missing base, or a TILED base with no file), so it is missing and
+/// samples as Blender's missing colour: `None`.
 fn stored_tile(data: &ImageData, number: u32) -> Option<ImageTileDataRef<'_>> {
-    match data.tiles.get(&number) {
-        Some(image) => Some(ImageTileDataRef {
+    let image = match data.tiles.get(&number) {
+        Some(image) => ImageTileDataRef {
             width: image.width,
             height: image.height,
             pixels: &image.pixels,
@@ -377,10 +381,11 @@ fn stored_tile(data: &ImageData, number: u32) -> Option<ImageTileDataRef<'_>> {
                 precision: image.precision,
                 ..data.storage
             },
-        }),
-        None if number == 1001 => Some(base_tile(data)),
-        None => None,
-    }
+        },
+        None if number == 1001 => base_tile(data),
+        None => return None,
+    };
+    (image.width != 0 && image.height != 0).then_some(image)
 }
 
 /// The image a floor-routed lookup reads (`sample`, `sample_encoded`): the base image when `udim` is unset, else the stored
@@ -789,6 +794,7 @@ mod tests {
             tiles: BTreeMap::new(),
             interpolation,
             srgb: false,
+            udim: false,
             colour: ColourCache::default(),
             storage: ImageStorage::default(),
         }
@@ -809,6 +815,7 @@ mod tests {
             tiles: BTreeMap::new(),
             interpolation: ImageInterpolation::Linear,
             srgb: true,
+            udim: false,
             colour: ColourCache::default(),
             storage: ImageStorage::default(),
         }
@@ -841,6 +848,7 @@ mod tests {
             tiles: BTreeMap::new(),
             interpolation: ImageInterpolation::Linear,
             srgb,
+            udim: false,
             colour: ColourCache::default(),
             storage,
         }
@@ -939,6 +947,7 @@ mod tests {
             tiles: BTreeMap::new(),
             interpolation: ImageInterpolation::Linear,
             srgb: true,
+            udim: false,
             colour: ColourCache::default(),
             storage: ImageStorage {
                 data: false,
@@ -1538,6 +1547,7 @@ mod tests {
             tiles: BTreeMap::new(),
             interpolation,
             srgb,
+            udim: false,
             storage: ImageStorage {
                 data: colourspace == "Non-Color",
                 straight_alpha: straight,
@@ -1675,6 +1685,7 @@ mod tests {
                     tiles,
                     interpolation,
                     srgb: false,
+                    udim: false,
                     storage: non_colour_storage(),
                     colour: ColourCache::default(),
                 };
@@ -1693,6 +1704,7 @@ mod tests {
                     tiles: BTreeMap::new(),
                     interpolation,
                     srgb: false,
+                    udim: false,
                     storage: non_colour_storage(),
                     colour: ColourCache::default(),
                 };

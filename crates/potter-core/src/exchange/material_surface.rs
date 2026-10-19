@@ -2834,6 +2834,7 @@ mod tests {
             source_path: None,
             source_hash: None,
             alpha_mode: ImageAlphaMode::default(),
+            tiled: false,
         }
     }
 
