@@ -2307,11 +2307,13 @@ def dump_all():
                         "library": library_reference(x), "type": x.type,
                         "color": plain(x.color), "energy": float(x.energy), "shadow_soft_size": float(x.shadow_soft_size),
                         "soft_falloff": bool(getattr(x, "use_soft_falloff", True)),
+                        "use_multiple_importance_sampling": bool(x.cycles.use_multiple_importance_sampling),
                         "spot_size": float(getattr(x, "spot_size", math.pi / 4)),
                         "spot_blend": float(getattr(x, "spot_blend", 0.15)),
                         "shape": getattr(x, "shape", None), "custom_properties": custom_props(x),
                         "size": float(getattr(x, "size", 0.25)),
                         "size_y": float(getattr(x, "size_y", 0.25)),
+                        "spread": float(getattr(x, "spread", math.pi)),
                         "fake_user": bool(x.use_fake_user), "users": int(x.users)} for x in bpy.data.lights],
             "actions": [action_dump(x) for x in bpy.data.actions],
             "texts": [{"name": x.name_full, "potter_id": x.get("potter.id"),
@@ -6703,6 +6705,8 @@ def export_doc(doc, target, pack, scene_hash, context):
             if raw.get("light_type") == "spot":
                 light.spot_size = raw.get("spot_size", math.pi / 4)
                 light.spot_blend = raw.get("spot_blend", 0.15)
+            light.cycles.use_multiple_importance_sampling = bool(
+                raw.get("use_multiple_importance_sampling", True))
             set_id(light, data_id)
             set_props(light, source.get("custom_properties", {}))
             if source.get("fake_user"):
