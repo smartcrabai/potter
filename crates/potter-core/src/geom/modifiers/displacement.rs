@@ -591,7 +591,7 @@ pub(crate) fn warp_textured(
     }
     let falloff = string_param(modifier, "falloff_type")?;
     let curve = match falloff {
-        "CURVE" => Some(falloff_curve(modifier)?),
+        "CURVE" => Some(super::advanced::FalloffCurve::from_modifier(modifier)?),
         "NONE" | "SMOOTH" | "SPHERE" | "ROOT" | "INVERSE_SQUARE" | "SHARP" | "LINEAR"
         | "CONSTANT" => None,
         _ => {
@@ -680,34 +680,11 @@ pub(crate) fn warp_textured(
     Ok(result)
 }
 
-/// Warp `falloff_curve` controls in Blender's stored order and float precision.
-fn falloff_curve(modifier: &Modifier) -> Result<super::advanced::CurveMappingTable> {
-    let invalid = || {
-        invalid_parameter(
-            modifier,
-            "falloff_curve",
-            "at least two finite float32 [x, y] points with an optional AUTO, AUTO_CLAMPED, or VECTOR handle",
-        )
-    };
-    let points = super::advanced::curve_mapping_points(schema_value(modifier, "falloff_curve")?)
-        .ok_or_else(invalid)?;
-    let settings =
-        super::advanced::curve_mapping_settings(modifier.params.get("falloff_curve_settings"))
-            .ok_or_else(|| {
-                invalid_parameter(
-                    modifier,
-                    "falloff_curve_settings",
-                    "use_clip, finite ordered clip_bounds, and HORIZONTAL or EXTRAPOLATED extend",
-                )
-            })?;
-    super::advanced::curve_map_table(&points, settings).ok_or_else(invalid)
-}
-
 /// The falloff of a linear distance factor `linear` in `(0, 1]` for one warp falloff type.
 fn warp_falloff(
     kind: &str,
     linear: f64,
-    curve: Option<&super::advanced::CurveMappingTable>,
+    curve: Option<&super::advanced::FalloffCurve>,
 ) -> f64 {
     match kind {
         "CURVE" => curve.map_or(linear, |curve| curve.evaluate(linear)),

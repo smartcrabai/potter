@@ -7,9 +7,12 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use glam::{DMat3, DMat4, DQuat, DVec3, Mat4, Vec2, Vec3};
+use glam::{DMat3, DMat4, DQuat, DVec3, Mat4, Vec3};
 use serde_json::Value;
 
+use crate::color::curve::{
+    CurveMap, CurveMapping, CurvePoint, CurveTone, HandleType, PreparedCurve,
+};
 use crate::model::{Id, Modifier};
 
 use super::displacement::{VertexGroup, vertex_group};
@@ -2612,7 +2615,7 @@ pub(super) fn hook(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     let parent_inverse = matrix_param(modifier, "matrix_inverse")?;
     let indices = vertex_index_param(modifier)?;
     let falloff_table = if falloff == HookFalloff::Curve {
-        Some(hook_curve_table(modifier)?)
+        Some(FalloffCurve::from_modifier(modifier)?)
     } else {
         None
     };
@@ -2692,7 +2695,7 @@ fn hook_falloff(
     falloff: HookFalloff,
     distance_sq: f64,
     radius: f64,
-    curve: Option<&CurveMappingTable>,
+    curve: Option<&FalloffCurve>,
 ) -> f64 {
     let radius_sq = radius * radius;
     if distance_sq > radius_sq {
@@ -2788,59 +2791,53 @@ fn matrix_param(modifier: &Modifier, name: &str) -> Result<DMat4> {
     Ok(DMat4::from_cols_array(&matrix))
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum CurveMappingHandle {
-    Auto,
-    AutoClamped,
-    Vector,
+/// A Hook or Warp `falloff_curve` with its `falloff_curve_settings`: Blender's `CurveMapping` curve 0 from
+/// `color::curve`, evaluated as `BKE_curvemapping_evaluateF` (the curve table, then Y clipping when enabled).
+pub(super) struct FalloffCurve {
+    curve: PreparedCurve,
+    clip_y: Option<[f32; 2]>,
 }
 
-#[derive(Clone, Copy)]
-pub(super) struct CurveMappingPoint {
-    location: Vec2,
-    handle: CurveMappingHandle,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum CurveMappingExtend {
-    Horizontal,
-    Extrapolated,
-}
-
-#[derive(Clone, Copy)]
-pub(super) struct CurveMappingSettings {
+/// The `falloff_curve_settings` values that shape the falloff table and its clipping.
+struct FalloffSettings {
     use_clip: bool,
-    clip_min: Vec2,
-    clip_max: Vec2,
-    extend: CurveMappingExtend,
+    clip: [f64; 4],
+    extend_extrapolate: bool,
 }
 
-impl Default for CurveMappingSettings {
-    fn default() -> Self {
-        Self {
-            use_clip: true,
-            clip_min: Vec2::ZERO,
-            clip_max: Vec2::ONE,
-            extend: CurveMappingExtend::Extrapolated,
-        }
+/// The identity line through `(0, 0)` and `(1, 1)` with AUTO handles, for the curves a falloff does not read.
+fn unit_curve() -> CurveMap {
+    CurveMap {
+        points: vec![
+            CurvePoint {
+                location: [0.0, 0.0],
+                handle: HandleType::Auto,
+            },
+            CurvePoint {
+                location: [1.0, 1.0],
+                handle: HandleType::Auto,
+            },
+        ],
     }
 }
 
+/// Reads `falloff_curve_settings`. An absent object keeps Blender's defaults: clip on over `[0, 1]`, extrapolated.
 #[expect(
     clippy::cast_possible_truncation,
     reason = "Blender stores CurveMapping clip bounds as float"
 )]
-pub(super) fn curve_mapping_settings(value: Option<&Value>) -> Option<CurveMappingSettings> {
+fn falloff_settings(value: Option<&Value>) -> Option<FalloffSettings> {
     let Some(value) = value else {
-        return Some(CurveMappingSettings::default());
+        return Some(FalloffSettings {
+            use_clip: true,
+            clip: [0.0, 0.0, 1.0, 1.0],
+            extend_extrapolate: true,
+        });
     };
     let settings = value.as_object()?;
-    let use_clip = settings
-        .get("use_clip")
-        .map_or(Some(true), Value::as_bool)?;
-    let clip_bounds = if let Some(value) = settings.get("clip_bounds") {
-        let values = value.as_array()?;
-        let [min_x, min_y, max_x, max_y] = values.as_slice() else {
+    let use_clip = settings.get("use_clip").map_or(Some(true), Value::as_bool)?;
+    let clip = if let Some(value) = settings.get("clip_bounds") {
+        let [min_x, min_y, max_x, max_y] = value.as_array()?.as_slice() else {
             return None;
         };
         let bound = |value: &Value| {
@@ -2849,37 +2846,33 @@ pub(super) fn curve_mapping_settings(value: Option<&Value>) -> Option<CurveMappi
                 return None;
             }
             let value = value as f32;
-            value.is_finite().then_some(value)
+            value.is_finite().then_some(f64::from(value))
         };
         [bound(min_x)?, bound(min_y)?, bound(max_x)?, bound(max_y)?]
     } else {
         [0.0, 0.0, 1.0, 1.0]
     };
-    let [min_x, min_y, max_x, max_y] = clip_bounds;
-    if min_x > max_x || min_y > max_y {
-        return None;
-    }
-    let extend = match settings.get("extend") {
-        None => CurveMappingExtend::Extrapolated,
+    let extend_extrapolate = match settings.get("extend") {
+        None => true,
         Some(value) => match value.as_str()? {
-            "HORIZONTAL" => CurveMappingExtend::Horizontal,
-            "EXTRAPOLATED" => CurveMappingExtend::Extrapolated,
+            "HORIZONTAL" => false,
+            "EXTRAPOLATED" => true,
             _ => return None,
         },
     };
-    Some(CurveMappingSettings {
+    Some(FalloffSettings {
         use_clip,
-        clip_min: Vec2::new(min_x, min_y),
-        clip_max: Vec2::new(max_x, max_y),
-        extend,
+        clip,
+        extend_extrapolate,
     })
 }
 
+/// Reads the `falloff_curve` control points: `[x, y]` or `[x, y, handle]`, with `AUTO`, `AUTO_CLAMPED` or `VECTOR`.
 #[expect(
     clippy::cast_possible_truncation,
-    reason = "Blender CurveMapping stores point coordinates as float"
+    reason = "Blender stores CurveMapping point coordinates as float"
 )]
-pub(super) fn curve_mapping_points(value: &Value) -> Option<Vec<CurveMappingPoint>> {
+fn falloff_points(value: &Value) -> Option<Vec<CurvePoint>> {
     let points = value.as_array()?;
     if points.len() < 2 {
         return None;
@@ -2896,391 +2889,77 @@ pub(super) fn curve_mapping_points(value: &Value) -> Option<Vec<CurveMappingPoin
             if !x.is_finite() || !y.is_finite() {
                 return None;
             }
-            let location = Vec2::new(x as f32, y as f32);
-            if !location.is_finite() {
+            let location = [x as f32, y as f32];
+            if !location.iter().all(|component| component.is_finite()) {
                 return None;
             }
             let handle = match coordinates.get(2) {
-                None => CurveMappingHandle::Auto,
+                None => HandleType::Auto,
                 Some(value) => match value.as_str() {
-                    Some("AUTO") => CurveMappingHandle::Auto,
-                    Some("AUTO_CLAMPED") => CurveMappingHandle::AutoClamped,
-                    Some("VECTOR") => CurveMappingHandle::Vector,
+                    Some("AUTO") => HandleType::Auto,
+                    Some("AUTO_CLAMPED") => HandleType::AutoClamped,
+                    Some("VECTOR") => HandleType::Vector,
                     _ => return None,
                 },
             };
-            Some(CurveMappingPoint { location, handle })
+            Some(CurvePoint { location, handle })
         })
         .collect()
 }
 
-/// Hook falloff controls and optional `CurveMapping` settings in Blender's stored order and precision.
-fn hook_curve_table(modifier: &Modifier) -> Result<CurveMappingTable> {
-    let invalid_points = || {
-        invalid_parameter(
-            modifier,
-            "falloff_curve",
-            "at least two finite float32 [x, y] points with an optional AUTO, AUTO_CLAMPED, or VECTOR handle",
-        )
-    };
-    let points = curve_mapping_points(schema_value(modifier, "falloff_curve")?)
-        .ok_or_else(invalid_points)?;
-    let settings = curve_mapping_settings(modifier.params.get("falloff_curve_settings"))
-        .ok_or_else(|| {
-            invalid_parameter(
-                modifier,
-                "falloff_curve_settings",
-                "use_clip, finite ordered clip_bounds, and HORIZONTAL or EXTRAPOLATED extend",
-            )
-        })?;
-    curve_map_table(&points, settings).ok_or_else(invalid_points)
-}
-
-const CURVE_SAMPLES_PER_SEGMENT: usize = 32;
-const CURVE_TABLE_INTERVALS: usize = 256;
-const CURVE_TABLE_DIVISIONS: f32 = 256.0;
-
-/// Blender's float `CurveMapping` table: point-specific handles feed forward-difference Bezier
-/// sampling, then equal-x resampling over the clip-extended control range.
-pub(super) struct CurveMappingTable {
-    values: Vec<f32>,
-    ext_in: Vec2,
-    ext_out: Vec2,
-    table_min: f32,
-    table_max: f32,
-    inverse_range: f32,
-    settings: CurveMappingSettings,
-}
-
-impl CurveMappingTable {
-    /// Blender `BKE_curvemapping_evaluateF`, including configurable extrapolation and Y clipping.
+impl FalloffCurve {
+    /// Reads a modifier's `falloff_curve` and `falloff_curve_settings`, checked by `CurveMapping::validate`.
     #[expect(
         clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        clippy::cast_precision_loss,
-        reason = "Blender CurveMapping evaluates float inputs and table indices"
+        reason = "Blender evaluates CurveMapping clip bounds as float"
+    )]
+    pub(super) fn from_modifier(modifier: &Modifier) -> Result<Self> {
+        let invalid_points = || {
+            invalid_parameter(
+                modifier,
+                "falloff_curve",
+                "at least two finite float32 [x, y] points with an optional AUTO, AUTO_CLAMPED, or VECTOR handle",
+            )
+        };
+        let points =
+            falloff_points(schema_value(modifier, "falloff_curve")?).ok_or_else(invalid_points)?;
+        let settings = falloff_settings(modifier.params.get("falloff_curve_settings"))
+            .ok_or_else(|| {
+                invalid_parameter(
+                    modifier,
+                    "falloff_curve_settings",
+                    "use_clip, finite clip_bounds, and HORIZONTAL or EXTRAPOLATED extend",
+                )
+            })?;
+        let mapping = CurveMapping {
+            tone: CurveTone::Standard,
+            extend_extrapolate: settings.extend_extrapolate,
+            use_clip: settings.use_clip,
+            clip: settings.clip,
+            black: [0.0; 3],
+            white: [1.0; 3],
+            curves: [CurveMap { points }, unit_curve(), unit_curve(), unit_curve()],
+        };
+        mapping.validate().map_err(|_| invalid_points())?;
+        Ok(Self {
+            curve: mapping.prepare(),
+            clip_y: settings
+                .use_clip
+                .then_some([settings.clip[1] as f32, settings.clip[3] as f32]),
+        })
+    }
+
+    /// Blender's `BKE_curvemapping_evaluateF` for curve 0: the table at `value`, then Y clipping when enabled.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Blender evaluates the curve input as float"
     )]
     pub(super) fn evaluate(&self, value: f64) -> f64 {
-        let value = value as f32;
-        let fi = (value - self.table_min) * self.inverse_range;
-        let result = if fi < 0.0 || fi > CURVE_TABLE_DIVISIONS {
-            curve_map_extend(
-                value,
-                Vec2::new(self.table_min, self.values[0]),
-                Vec2::new(self.table_max, self.values[CURVE_TABLE_INTERVALS]),
-                self.ext_in,
-                self.ext_out,
-                self.settings.extend,
-            )
-        } else {
-            let index = fi as usize;
-            if index >= CURVE_TABLE_INTERVALS {
-                self.values[CURVE_TABLE_INTERVALS]
-            } else {
-                let fraction = fi - index as f32;
-                (1.0 - fraction) * self.values[index] + fraction * self.values[index + 1]
-            }
-        };
-        let result = if self.settings.use_clip {
-            result.clamp(self.settings.clip_min.y, self.settings.clip_max.y)
-        } else {
-            result
-        };
-        f64::from(result)
+        let result = self.curve.evaluate(0, value as f32);
+        f64::from(self.clip_y.map_or(result, |[min_y, max_y]| result.clamp(min_y, max_y)))
     }
 }
 
-/// Builds Blender's `curvemap_make_table` for raw controls in stored order,
-/// resampling over the settings-extended x range.
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "Blender's table loop converts its integer index to float"
-)]
-pub(super) fn curve_map_table(
-    points: &[CurveMappingPoint],
-    settings: CurveMappingSettings,
-) -> Option<CurveMappingTable> {
-    let count = points.len();
-    if count < 2
-        || points.iter().any(|point| !point.location.is_finite())
-        || !settings.clip_min.is_finite()
-        || !settings.clip_max.is_finite()
-        || settings.clip_min.x > settings.clip_max.x
-        || settings.clip_min.y > settings.clip_max.y
-    {
-        return None;
-    }
-    let table_min = points
-        .iter()
-        .fold(settings.clip_min.x, |min, point| min.min(point.location.x));
-    let table_max = points
-        .iter()
-        .fold(settings.clip_max.x, |max, point| max.max(point.location.x));
-    let table_range = table_max - table_min;
-    if !table_range.is_finite() || table_range <= 0.0 {
-        return None;
-    }
-
-    let mut handles: Vec<[Vec2; 3]> = Vec::with_capacity(count);
-    for (index, control) in points.iter().enumerate() {
-        let point = control.location;
-        let previous = index
-            .checked_sub(1)
-            .and_then(|prior| points.get(prior))
-            .map(|control| control.location);
-        let next = points.get(index + 1).map(|control| control.location);
-        let (before, after) = match (previous, next) {
-            (Some(before), Some(after)) => (before, after),
-            (None, Some(after)) => (2.0 * point - after, after),
-            (Some(before), None) => (before, 2.0 * point - before),
-            (None, None) => (point, point),
-        };
-        let incoming = point - before;
-        let outgoing = after - point;
-        let mut length_in = incoming.length();
-        let mut length_out = outgoing.length();
-        if length_in == 0.0 {
-            length_in = 1.0;
-        }
-        if length_out == 0.0 {
-            length_out = 1.0;
-        }
-        let mut left = Vec2::ZERO;
-        let mut right = Vec2::ZERO;
-        match control.handle {
-            CurveMappingHandle::Auto | CurveMappingHandle::AutoClamped => {
-                let tangent = outgoing / length_out + incoming / length_in;
-                let scale = tangent.length() * 2.5614_f32;
-                if scale != 0.0 {
-                    left = point + tangent * -(length_in / scale);
-                    right = point + tangent * (length_out / scale);
-                    if control.handle == CurveMappingHandle::AutoClamped
-                        && let (Some(previous), Some(next)) = (previous, next)
-                    {
-                        let ydiff_previous = previous.y - point.y;
-                        let ydiff_next = next.y - point.y;
-                        if (ydiff_previous <= 0.0 && ydiff_next <= 0.0)
-                            || (ydiff_previous >= 0.0 && ydiff_next >= 0.0)
-                        {
-                            left.y = point.y;
-                        } else if ydiff_previous <= 0.0 {
-                            left.y = left.y.max(previous.y);
-                        } else {
-                            left.y = left.y.min(previous.y);
-                        }
-                        if (ydiff_previous <= 0.0 && ydiff_next <= 0.0)
-                            || (ydiff_previous >= 0.0 && ydiff_next >= 0.0)
-                        {
-                            right.y = point.y;
-                        } else if ydiff_previous <= 0.0 {
-                            right.y = right.y.min(next.y);
-                        } else {
-                            right.y = right.y.max(next.y);
-                        }
-                    }
-                }
-            }
-            CurveMappingHandle::Vector => {
-                left = point + incoming * (-1.0_f32 / 3.0_f32);
-                right = point + outgoing * (1.0_f32 / 3.0_f32);
-            }
-        }
-        handles.push([left, point, right]);
-    }
-
-    if count > 2 {
-        if points[0].handle == CurveMappingHandle::Auto {
-            let first_length = (handles[0][1] - handles[0][2]).length();
-            let mut offset = handles[1][0];
-            offset.x = offset.x.max(handles[0][1].x);
-            offset -= handles[0][1];
-            let offset_length = offset.length();
-            if offset_length > f32::EPSILON {
-                offset *= first_length / offset_length;
-                handles[0][2] = offset + handles[0][1];
-                handles[0][0] = handles[0][1] - offset;
-            }
-        }
-
-        let last = count - 1;
-        if points[last].handle == CurveMappingHandle::Auto {
-            let last_length = (handles[last][1] - handles[last][0]).length();
-            let mut offset = handles[last - 1][2];
-            offset.x = offset.x.min(handles[last][1].x);
-            offset -= handles[last][1];
-            let offset_length = offset.length();
-            if offset_length > f32::EPSILON {
-                offset *= last_length / offset_length;
-                handles[last][0] = offset + handles[last][1];
-                handles[last][2] = handles[last][1] - offset;
-            }
-        }
-    }
-    if handles.iter().flatten().any(|point| !point.is_finite()) {
-        return None;
-    }
-
-    for segment in 0..count - 1 {
-        let (right_handle, left_handle) = correct_bezier_handles(
-            handles[segment][1],
-            handles[segment][2],
-            handles[segment + 1][0],
-            handles[segment + 1][1],
-        );
-        handles[segment][2] = right_handle;
-        handles[segment + 1][0] = left_handle;
-    }
-    if handles.iter().flatten().any(|point| !point.is_finite()) {
-        return None;
-    }
-
-    let mut samples = Vec::with_capacity((count - 1) * CURVE_SAMPLES_PER_SEGMENT);
-    for segment in 0..count - 1 {
-        let start = handles[segment];
-        let end = handles[segment + 1];
-        let mut x = bezier_forward_difference(start[1].x, start[2].x, end[0].x, end[1].x);
-        let mut y = bezier_forward_difference(start[1].y, start[2].y, end[0].y, end[1].y);
-        for _ in 0..CURVE_SAMPLES_PER_SEGMENT {
-            samples.push(Vec2::new(x[0], y[0]));
-            x[0] += x[1];
-            x[1] += x[2];
-            x[2] += x[3];
-            y[0] += y[1];
-            y[1] += y[2];
-            y[2] += y[3];
-        }
-    }
-    if samples.iter().any(|point| !point.is_finite()) {
-        return None;
-    }
-
-    let last_sample = samples.len() - 1;
-    let first_point = samples[0];
-    let end_point = samples[last_sample];
-    let ext_in = handles[0][0] - handles[0][1];
-    let ext_in_length = ext_in.length();
-    let ext_out = handles[count - 1][1] - handles[count - 1][2];
-    let ext_out_length = ext_out.length();
-    if !ext_in_length.is_finite()
-        || ext_in_length == 0.0
-        || !ext_out_length.is_finite()
-        || ext_out_length == 0.0
-    {
-        return None;
-    }
-    let ext_in = ext_in / ext_in_length;
-    let ext_out = ext_out / ext_out_length;
-    let table_step = table_range / CURVE_TABLE_DIVISIONS;
-    let inverse_range = CURVE_TABLE_DIVISIONS / table_range;
-    if !ext_in.is_finite()
-        || !ext_out.is_finite()
-        || !table_step.is_finite()
-        || !inverse_range.is_finite()
-    {
-        return None;
-    }
-
-    let mut table = Vec::with_capacity(CURVE_TABLE_INTERVALS + 1);
-    let mut sample_index = 0;
-    for step in 0..=CURVE_TABLE_INTERVALS {
-        let x = table_min + table_step * step as f32;
-        while sample_index < last_sample && x >= samples[sample_index].x {
-            sample_index += 1;
-        }
-        let value =
-            if sample_index == 0 || (sample_index == last_sample && x >= samples[sample_index].x) {
-                if (x - samples[sample_index].x).abs() <= 1.0e-6_f32 {
-                    samples[sample_index].y
-                } else {
-                    curve_map_extend(x, first_point, end_point, ext_in, ext_out, settings.extend)
-                }
-            } else {
-                let before = samples[sample_index - 1];
-                let after = samples[sample_index];
-                let span = after.x - before.x;
-                let factor = if span > f32::EPSILON {
-                    (after.x - x) / span
-                } else {
-                    0.0
-                };
-                factor * before.y + (1.0 - factor) * after.y
-            };
-        if !value.is_finite() {
-            return None;
-        }
-        table.push(value);
-    }
-
-    Some(CurveMappingTable {
-        values: table,
-        ext_in,
-        ext_out,
-        table_min,
-        table_max,
-        inverse_range,
-        settings,
-    })
-}
-
-/// Blender `BKE_curve_forward_diff_bezier`, returning the initial value and three differences.
-fn bezier_forward_difference(q0: f32, q1: f32, q2: f32, q3: f32) -> [f32; 4] {
-    let mut divisor = 31.0_f32;
-    let rt0 = q0;
-    let rt1 = 3.0_f32 * (q1 - q0) / divisor;
-    divisor *= divisor;
-    let rt2 = 3.0_f32 * (q0 - 2.0_f32 * q1 + q2) / divisor;
-    divisor *= 31.0_f32;
-    let rt3 = (q3 - q0 + 3.0_f32 * (q1 - q2)) / divisor;
-    [
-        rt0,
-        rt1 + rt2 + rt3,
-        2.0_f32 * rt2 + 6.0_f32 * rt3,
-        6.0_f32 * rt3,
-    ]
-}
-
-/// Blender `BKE_curve_correct_bezpart`: proportionally shortens overlapping X handles.
-fn correct_bezier_handles(
-    start: Vec2,
-    start_handle: Vec2,
-    end_handle: Vec2,
-    end: Vec2,
-) -> (Vec2, Vec2) {
-    let start_delta = start - start_handle;
-    let end_delta = end - end_handle;
-    let span = end.x - start.x;
-    let total = start_delta.x.abs() + end_delta.x.abs();
-    if total == 0.0 || total <= span {
-        return (start_handle, end_handle);
-    }
-    let factor = span / total;
-    (start - start_delta * factor, end - end_delta * factor)
-}
-
-fn curve_map_extend(
-    x: f32,
-    first: Vec2,
-    last: Vec2,
-    ext_in: Vec2,
-    ext_out: Vec2,
-    extend: CurveMappingExtend,
-) -> f32 {
-    if x <= first.x {
-        if extend == CurveMappingExtend::Horizontal {
-            first.y
-        } else if ext_in.x == 0.0 {
-            first.y + ext_in.y * 10000.0_f32
-        } else {
-            first.y + ext_in.y * (x - first.x) / ext_in.x
-        }
-    } else if extend == CurveMappingExtend::Horizontal {
-        last.y
-    } else if ext_out.x == 0.0 {
-        last.y - ext_out.y * 10000.0_f32
-    } else {
-        last.y + ext_out.y * (x - last.x) / ext_out.x
-    }
-}
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "geometry modifier unit tests")]
 mod tests {
