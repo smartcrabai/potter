@@ -307,8 +307,8 @@ struct BMesh {
     /// `BLI_mempool` slots of the edges and faces: the output order of the live elements.
     edge_slots: PoolSlots,
     face_slots: PoolSlots,
-    /// Data type of each EDGE attribute, in the order of every edge's `attributes` values.
-    edge_types: Vec<String>,
+    /// The EDGE attributes of the input: name and type, in the order of every edge's `attributes` values.
+    edge_attributes: Vec<collapse::EdgeAttribute>,
     /// Scratch membership of `sort_winding`: an edge (vertex) is in the set when its mark equals
     /// `mark_stamp`, so starting a new set costs nothing.
     edge_mark: Vec<usize>,
@@ -554,9 +554,9 @@ impl BMesh {
             jf: false,
             slot,
             attributes: self
-                .edge_types
+                .edge_attributes
                 .iter()
-                .map(|data_type| collapse::collapse_customdata_default(data_type))
+                .map(|attribute| collapse::collapse_customdata_default(&attribute.data_type))
                 .collect(),
         });
         self.disk_edge_append(e, v1);
@@ -2378,10 +2378,7 @@ impl BMesh {
             free_loops: Vec::new(),
             edge_slots: PoolSlots::default(),
             face_slots: PoolSlots::default(),
-            edge_types: edge_attributes
-                .iter()
-                .map(|attribute| attribute.data_type.clone())
-                .collect(),
+            edge_attributes,
             edge_mark: Vec::new(),
             vert_mark: Vec::new(),
             mark_stamp: 0,
@@ -2399,9 +2396,12 @@ impl BMesh {
             let e = bm.edge_create(v[0], v[1], false);
             bm.edges[e].seam = flags[index].0;
             bm.edges[e].smooth = !flags[index].1;
-            for (value, attribute) in bm.edges[e].attributes.iter_mut().zip(&edge_attributes) {
-                *value = attribute.values[index].clone();
-            }
+            let values: Vec<Value> = bm
+                .edge_attributes
+                .iter()
+                .map(|attribute| attribute.values[index].clone())
+                .collect();
+            bm.edges[e].attributes = values;
             edge_lookup.insert(edge_key(v[0], v[1]), e);
         }
         let mut corner = 0;
@@ -2585,7 +2585,11 @@ pub(super) fn decimate_dissolve(
     let flags = bm.output_edge_flags();
     let mut result = bm.to_mesh(points, mesh)?;
     write_dissolve_edge_flags(&mut result, &flags)?;
-    write_dissolve_edge_attributes(&mut result, mesh, bm.output_edge_attributes())?;
+    write_dissolve_edge_attributes(
+        &mut result,
+        &bm.edge_attributes,
+        bm.output_edge_attributes(),
+    )?;
     Ok(result)
 }
 
@@ -2599,39 +2603,23 @@ pub(super) fn decimate_unsubdivide(mesh: &Mesh, iterations: usize) -> Result<Mes
     let flags = bm.output_edge_flags();
     let mut result = bm.to_mesh(points, mesh)?;
     write_dissolve_edge_flags(&mut result, &flags)?;
-    write_dissolve_edge_attributes(&mut result, mesh, bm.output_edge_attributes())?;
+    write_dissolve_edge_attributes(
+        &mut result,
+        &bm.edge_attributes,
+        bm.output_edge_attributes(),
+    )?;
     Ok(result)
 }
 
-/// Writes the EDGE attributes of a DISSOLVE or UNSUBDIV result. `rows` holds one row per live edge in
-/// pool order, which is the rebuilt mesh's edge order, so row `k` goes to edge `k`. Blender's edge joins
-/// and splits keep each surviving edge's own customdata, so these values are never interpolated.
+/// Writes the EDGE attributes of a DISSOLVE or UNSUBDIV result from the BMesh that produced it. `rows` holds
+/// one row per live edge in pool order, which is the rebuilt mesh's edge order, so row `k` is edge `k`.
+/// Blender's edge joins and splits keep each surviving edge's own customdata, so these are never interpolated.
 fn write_dissolve_edge_attributes(
     result: &mut Mesh,
-    source: &Mesh,
+    attributes: &[collapse::EdgeAttribute],
     rows: Vec<Vec<Value>>,
 ) -> Result<()> {
-    let attributes = collapse::collect_edge_attributes(source);
-    if attributes.is_empty() {
-        return Ok(());
-    }
-    if rows.len() != result.edges.len() {
-        return Err(PotError::new(
-            ErrorCode::InternalError,
-            "decimate edge attributes do not match the rebuilt mesh",
-        ));
-    }
-    let index_of = id_indices(result);
-    let edge_values = result
-        .edges
-        .iter()
-        .zip(rows)
-        .map(|(edge, row)| {
-            let [first, second] = edge.vertices.map(|id| index_of[&id]);
-            ([first.min(second), first.max(second)], row)
-        })
-        .collect();
-    collapse::collapse_write_edge(result, &attributes, edge_values)
+    collapse::collapse_write_edge(result, attributes, rows)
 }
 
 /// `(seam, sharp)` of each edge of `mesh`: the compat `blender_edge_flags` OR-ed with the native `seam`

@@ -2162,46 +2162,31 @@ impl Decimator {
             .filter(|edge| edge.alive && edge.l == NONE)
             .map(|edge| [out_vertex[edge.v[0]], out_vertex[edge.v[1]]])
             .collect();
-        let edge_attributes: Vec<([usize; 2], Vec<Value>)> = if self.bm.edge_types.is_empty() {
-            Vec::new()
-        } else {
-            self.bm
-                .edges
-                .iter()
-                .filter(|edge| edge.alive)
-                .map(|edge| {
-                    let [first, second] = edge.v.map(|vertex| out_vertex[vertex]);
-                    (
-                        [first.min(second), first.max(second)],
-                        edge.attributes.clone(),
-                    )
-                })
-                .collect()
-        };
-        let edge_flags: Vec<([usize; 2], EdgeFlags)> = if self.bm.track_edge_flags {
-            self.bm
-                .edges
-                .iter()
-                .filter(|edge| edge.alive)
-                .map(|edge| {
-                    let [first, second] = edge.v.map(|vertex| out_vertex[vertex]);
-                    ([first.min(second), first.max(second)], edge.flags)
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+        // Blender's edge pool order: every per-edge row below is in this order, and `decimate_compact`
+        // puts the rebuilt mesh's edges in it.
         let mut pool: Vec<usize> = (0..self.bm.edges.len())
             .filter(|&e| self.bm.edges[e].alive)
             .collect();
         pool.sort_by_key(|&e| self.bm.edges[e].slot);
         let edge_order = pool
-            .into_iter()
-            .map(|e| {
+            .iter()
+            .map(|&e| {
                 let [first, second] = self.bm.edges[e].v.map(|vertex| out_vertex[vertex]);
                 [first.min(second), first.max(second)]
             })
             .collect();
+        let edge_attributes: Vec<Vec<Value>> = if self.bm.edge_types.is_empty() {
+            Vec::new()
+        } else {
+            pool.iter()
+                .map(|&e| self.bm.edges[e].attributes.clone())
+                .collect()
+        };
+        let edge_flags: Vec<EdgeFlags> = if self.bm.track_edge_flags {
+            pool.iter().map(|&e| self.bm.edges[e].flags).collect()
+        } else {
+            Vec::new()
+        };
         Output {
             edge_order,
             points,
@@ -2227,10 +2212,10 @@ struct Output {
     point: Vec<Vec<Value>>,
     faces: Vec<Option<usize>>,
     corner_uv: Vec<CornerUv>,
-    /// Per output edge, sorted endpoint indices and EDGE attribute values when present.
-    edge_attributes: Vec<([usize; 2], Vec<Value>)>,
-    /// Per output edge, sorted endpoint indices and Blender's seam/sharp flags when present.
-    edge_flags: Vec<([usize; 2], EdgeFlags)>,
+    /// EDGE attribute values per alive edge, in pool order (one row per edge).
+    edge_attributes: Vec<Vec<Value>>,
+    /// Blender's seam/sharp header flags per alive edge, in pool order, when tracked.
+    edge_flags: Vec<EdgeFlags>,
     /// Alive edges as sorted output-vertex pairs, in Blender's edge-pool order.
     edge_order: Vec<[usize; 2]>,
 }
@@ -2275,11 +2260,12 @@ fn collapse_write_point(
     Ok(())
 }
 
-/// Writes the collapse's EDGE values into `blender_attributes` in the rebuilt mesh edge order.
+/// Writes the EDGE values into `blender_attributes`. `rows` holds one row of `attributes` values per edge,
+/// in the rebuilt mesh's edge order (the pool order `decimate_compact` gives the edges), so row `k` is edge `k`.
 pub(super) fn collapse_write_edge(
     mesh: &mut Mesh,
     attributes: &[EdgeAttribute],
-    edge_values: Vec<([usize; 2], Vec<Value>)>,
+    rows: Vec<Vec<Value>>,
 ) -> Result<()> {
     if attributes.is_empty() {
         return Ok(());
@@ -2290,29 +2276,16 @@ pub(super) fn collapse_write_edge(
             "decimate edge attributes do not match the rebuilt mesh",
         )
     };
-    let mut by_pair = HashMap::with_capacity(edge_values.len());
-    for (vertices, values) in edge_values {
-        if by_pair.insert((vertices[0], vertices[1]), values).is_some() {
-            return Err(dropped());
-        }
+    if rows.len() != mesh.edges.len() || rows.iter().any(|row| row.len() != attributes.len()) {
+        return Err(dropped());
     }
-    let index_of = super::super::id_indices(mesh);
     let mut by_attribute: Vec<Vec<Value>> = (0..attributes.len())
-        .map(|_| Vec::with_capacity(mesh.edges.len()))
+        .map(|_| Vec::with_capacity(rows.len()))
         .collect();
-    for edge in &mesh.edges {
-        let [first, second] = edge.vertices.map(|id| index_of[&id]);
-        let key = (first.min(second), first.max(second));
-        let values = by_pair.remove(&key).ok_or_else(dropped)?;
-        if values.len() != attributes.len() {
-            return Err(dropped());
-        }
-        for (attribute, value) in by_attribute.iter_mut().zip(values) {
+    for row in rows {
+        for (attribute, value) in by_attribute.iter_mut().zip(row) {
             attribute.push(value);
         }
-    }
-    if !by_pair.is_empty() {
-        return Err(dropped());
     }
     let entries = mesh
         .attributes
@@ -2335,12 +2308,10 @@ pub(super) fn collapse_write_edge(
 /// A native edge-flag attribute and the `EdgeFlags` value it stores.
 type FlagStore = (&'static str, fn(&EdgeFlags) -> bool);
 
-/// Writes `BMesh` seam/sharp flags onto the output edges; `BM_edge_splice` ORs these header flags.
-fn collapse_write_edge_flags(
-    mesh: &mut Mesh,
-    edge_flags: Vec<([usize; 2], EdgeFlags)>,
-) -> Result<()> {
-    if edge_flags.is_empty() {
+/// Writes `BMesh` seam/sharp flags onto the output edges; `BM_edge_splice` ORs these header flags. `flags`
+/// holds one value per edge in the rebuilt mesh's edge order, so entry `k` is edge `k`.
+fn collapse_write_edge_flags(mesh: &mut Mesh, flags: &[EdgeFlags]) -> Result<()> {
+    if flags.is_empty() {
         return Ok(());
     }
     let invalid = || {
@@ -2349,23 +2320,7 @@ fn collapse_write_edge_flags(
             "decimate edge flags do not match the rebuilt mesh",
         )
     };
-    let mut by_pair = HashMap::with_capacity(edge_flags.len());
-    for (vertices, flags) in edge_flags {
-        if by_pair.insert((vertices[0], vertices[1]), flags).is_some() {
-            return Err(invalid());
-        }
-    }
-    let index_of = super::super::id_indices(mesh);
-    let mut output_flags = Vec::with_capacity(mesh.edges.len());
-    for edge in &mesh.edges {
-        let [first, second] = edge.vertices.map(|id| index_of[&id]);
-        output_flags.push(
-            by_pair
-                .remove(&(first.min(second), first.max(second)))
-                .ok_or_else(invalid)?,
-        );
-    }
-    if !by_pair.is_empty() {
+    if flags.len() != mesh.edges.len() {
         return Err(invalid());
     }
     let natives: [FlagStore; 2] = [
@@ -2379,20 +2334,20 @@ fn collapse_write_edge_flags(
                 .and_then(Value::as_object_mut)
                 .ok_or_else(invalid)?;
             values.clear();
-            for (edge, flags) in mesh.edges.iter().zip(&output_flags) {
-                values.insert(format!("e{}", edge.id), json!(flag(flags)));
+            for (edge, edge_flags) in mesh.edges.iter().zip(flags) {
+                values.insert(format!("e{}", edge.id), json!(flag(edge_flags)));
             }
         }
     }
     if let Some(blender_edge_flags) = mesh.attributes.get_mut("blender_edge_flags") {
         let values = blender_edge_flags.as_array_mut().ok_or_else(invalid)?;
-        if values.len() != output_flags.len() {
+        if values.len() != flags.len() {
             return Err(invalid());
         }
-        for (value, flags) in values.iter_mut().zip(&output_flags) {
+        for (value, edge_flags) in values.iter_mut().zip(flags) {
             let fields = value.as_object_mut().ok_or_else(invalid)?;
-            fields.insert("seam".to_owned(), json!(flags.seam));
-            fields.insert("sharp".to_owned(), json!(!flags.smooth));
+            fields.insert("seam".to_owned(), json!(edge_flags.seam));
+            fields.insert("sharp".to_owned(), json!(!edge_flags.smooth));
         }
     }
     Ok(())
@@ -2485,7 +2440,7 @@ pub(in crate::geom::modifiers) fn decimate_collapse(
     super::collapse_write_uv(&mut out, &layer_names, &output.corner_uv)?;
     collapse_write_point(&mut out, &point_attributes, &output.point)?;
     collapse_write_edge(&mut out, &edge_attributes, output.edge_attributes)?;
-    collapse_write_edge_flags(&mut out, output.edge_flags)?;
+    collapse_write_edge_flags(&mut out, &output.edge_flags)?;
     Ok(out)
 }
 
