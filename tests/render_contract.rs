@@ -409,7 +409,12 @@ fn path_render_applies_pixel_and_object_adaptive_subdivision() -> Result<(), Box
                        "adaptive_space":space,"adaptive_pixel_size":0.5,
                        "adaptive_object_edge_length":0.25}}
         ]);
-        let operations = serde_json::to_string(&operations)?;
+        let operations = serde_json::json!({
+            "schema_version": 1,
+            "base_revision": 0,
+            "operations": operations,
+        })
+        .to_string();
         let applied = apply_operations(&scene, &operations, &["--json"])?;
         assert_success(&applied)?;
         let output = directory.path().join(format!("{name}-render"));
