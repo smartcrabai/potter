@@ -86,6 +86,8 @@ struct Case {
     allow_lossy: bool,
     /// Layers Potter reports as `mesh.uv_layer` losses for the format.
     lost_layers: usize,
+    /// Whether the format cannot store per-corner UV pin flags, so its export reports one pin loss.
+    pin_loss: bool,
     topology: Topology,
     /// Loops in every re-import of the format.
     loops: usize,
@@ -99,8 +101,9 @@ const CASES: [Case; 6] = [
         format: "glb",
         extension: "glb",
         source: "textured.blend",
-        allow_lossy: false,
+        allow_lossy: true,
         lost_layers: 0,
+        pin_loss: true,
         topology: Topology::Triangles,
         loops: TRIANGLE_LOOPS,
         layers: &[
@@ -113,8 +116,9 @@ const CASES: [Case; 6] = [
         format: "usdc",
         extension: "usdc",
         source: "textured.blend",
-        allow_lossy: false,
+        allow_lossy: true,
         lost_layers: 0,
+        pin_loss: true,
         topology: Topology::Faces,
         loops: FACE_LOOPS,
         // The render layer is written as `primvars:st`, and Blender re-imports UV maps in
@@ -128,6 +132,7 @@ const CASES: [Case; 6] = [
         source: "textured.blend",
         allow_lossy: true,
         lost_layers: 2,
+        pin_loss: true,
         topology: Topology::Faces,
         loops: FACE_LOOPS,
         // OBJ carries the active layer only, under the importer's default name.
@@ -139,6 +144,7 @@ const CASES: [Case; 6] = [
         source: "textured.blend",
         allow_lossy: true,
         lost_layers: 2,
+        pin_loss: true,
         topology: Topology::Faces,
         loops: FACE_LOOPS,
         layers: &[("UVMap", "Detail")],
@@ -149,6 +155,7 @@ const CASES: [Case; 6] = [
         source: "textured.blend",
         allow_lossy: true,
         lost_layers: 0,
+        pin_loss: true,
         topology: Topology::Faces,
         loops: FACE_LOOPS,
         // Both exporters put the active layer first. Blender's Alembic importer preserves the
@@ -161,6 +168,7 @@ const CASES: [Case; 6] = [
         source: "plain.blend",
         allow_lossy: true,
         lost_layers: 0,
+        pin_loss: true,
         topology: Topology::Faces,
         loops: FACE_LOOPS,
         layers: IN_SOURCE_ORDER,
@@ -456,6 +464,28 @@ fn uv_losses(report: &Value) -> Vec<&Value> {
                 })
                 .collect()
         })
+}
+
+/// The `mesh.uv_layer` entries that report a layer dropped, not per-corner pin flags.
+fn layer_losses(report: &Value) -> Vec<&Value> {
+    uv_losses(report)
+        .into_iter()
+        .filter(|loss| !is_pin_loss(loss))
+        .collect()
+}
+
+/// The `mesh.uv_layer` entries that report dropped per-corner pin flags.
+fn pin_losses(report: &Value) -> Vec<&Value> {
+    uv_losses(report)
+        .into_iter()
+        .filter(|loss| is_pin_loss(loss))
+        .collect()
+}
+
+fn is_pin_loss(loss: &Value) -> bool {
+    loss["reason"]
+        .as_str()
+        .is_some_and(|reason| reason.contains("pin flags"))
 }
 
 /// The `uv_layers` store of the mesh that has one, read from the project's `scene.json`.
@@ -778,9 +808,15 @@ fn every_format_carries_layers_as_blender_does() -> TestResult {
         let out = root.join(format!("potter.{}", case.extension));
         let report = potter_export(&blender, project, case.format, &out, case.allow_lossy)?;
         assert_eq!(
-            uv_losses(&report).len(),
+            layer_losses(&report).len(),
             case.lost_layers,
             "{}: lost UV layers",
+            case.format
+        );
+        assert_eq!(
+            pin_losses(&report).len(),
+            usize::from(case.pin_loss),
+            "{}: lost UV pin flags",
             case.format
         );
         sources.push(root.join(format!("blender.{}", case.extension)));
