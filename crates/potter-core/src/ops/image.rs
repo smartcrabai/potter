@@ -154,6 +154,7 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             source_path: None,
             source_hash: None,
             alpha_mode,
+            tiled: false,
         },
     );
     engine.mark("images", &id, ChangeKind::Created);
@@ -251,6 +252,7 @@ fn load(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bool>
             source_path: image_source_path,
             source_hash: registered_hash,
             alpha_mode,
+            tiled: false,
         },
     );
     engine.mark("images", &id, ChangeKind::Created);
@@ -429,13 +431,13 @@ fn set_pixels(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result
         {
             metadata.width = tile.width;
             metadata.height = tile.height;
-            metadata.blob = blob;
+            metadata.blob = Some(blob);
         } else {
             updated.tiles.push(ImageTile {
                 number: tile_number,
                 width: tile.width,
                 height: tile.height,
-                blob,
+                blob: Some(blob),
             });
             updated.tiles.sort_by_key(|tile| tile.number);
         }

@@ -63,19 +63,29 @@ pub fn load_image_data_with_staged(
     interpolation: ImageInterpolation,
     staged: &BTreeMap<String, Vec<u8>>,
 ) -> Result<ImageData> {
-    let base_bytes = image_blob_bytes(image.blob.as_deref(), image, root, staged)?;
     let srgb = decodes_srgb(image.colorspace);
-    let (width, height, pixels) = decode_pixels(&base_bytes, image.colorspace)?;
-    if width != image.width || height != image.height {
-        return Err(PotError::with_details(
-            ErrorCode::SceneInvalid,
-            "image blob dimensions do not match its registry entry",
-            serde_json::json!({"image":image.name,"expected":[image.width,image.height],"actual":[width,height]}),
-        ));
-    }
+    // A UDIM image whose base file is missing keeps its listed tiles and no base pixels, so the base samples as missing.
+    let (width, height, pixels, storage) = if image.base_is_missing() {
+        (0, 0, Vec::new(), ImageStorage::default())
+    } else {
+        let base_bytes = image_blob_bytes(image.blob.as_deref(), image, root, staged)?;
+        let (width, height, pixels) = decode_pixels(&base_bytes, image.colorspace)?;
+        if width != image.width || height != image.height {
+            return Err(PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "image blob dimensions do not match its registry entry",
+                serde_json::json!({"image":image.name,"expected":[image.width,image.height],"actual":[width,height]}),
+            ));
+        }
+        (width, height, pixels, image_storage(image, &base_bytes))
+    };
     let mut tiles = BTreeMap::new();
     for tile in &image.tiles {
-        let bytes = blob_bytes(&tile.blob, root, staged)?;
+        // A listed tile without a blob is missing: it has no pixels, so it is left out and samples as the missing colour.
+        let Some(blob) = tile.blob.as_deref() else {
+            continue;
+        };
+        let bytes = blob_bytes(blob, root, staged)?;
         let (tile_width, tile_height, tile_pixels) = decode_pixels(&bytes, image.colorspace)?;
         if tile_width != tile.width || tile_height != tile.height {
             return Err(PotError::with_details(
@@ -95,6 +105,20 @@ pub fn load_image_data_with_staged(
             },
         );
     }
+    // A TILED image routes its lookups by tile even when only tile 1001 is stored. The sampler routes by the stored tiles
+    // (`!tiles.is_empty()`), so a TILED base with no other tile is also stored as tile 1001, which reads the same pixels.
+    if image.tiled && tiles.is_empty() && !image.base_is_missing() {
+        tiles.insert(
+            1001,
+            ImageTileData {
+                width,
+                height,
+                pixels: pixels.clone(),
+                precision: storage.precision,
+                colour: ColourCache::default(),
+            },
+        );
+    }
     Ok(ImageData {
         width,
         height,
@@ -102,7 +126,7 @@ pub fn load_image_data_with_staged(
         tiles,
         interpolation,
         srgb,
-        storage: image_storage(image, &base_bytes),
+        storage,
         colour: ColourCache::default(),
     })
 }

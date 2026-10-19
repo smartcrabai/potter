@@ -887,7 +887,7 @@ fn apply_batch_internal(
         if let Some(blob) = image.blob.as_deref() {
             referenced_assets.insert(blob);
         }
-        referenced_assets.extend(image.tiles.iter().map(|tile| tile.blob.as_str()));
+        referenced_assets.extend(image.tiles.iter().filter_map(|tile| tile.blob.as_deref()));
     }
     pending_assets.retain(|digest, _| referenced_assets.contains(digest.as_str()));
     changes.reconcile(doc, &working)?;

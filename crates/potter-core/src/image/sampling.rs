@@ -378,7 +378,8 @@ fn stored_tile(data: &ImageData, number: u32) -> Option<ImageTileDataRef<'_>> {
                 ..data.storage
             },
         }),
-        None if number == 1001 => Some(base_tile(data)),
+        // A missing base file has no size and no pixels (`storage::load_image_data`), so its lookups are missing tiles.
+        None if number == 1001 && data.width != 0 && data.height != 0 => Some(base_tile(data)),
         None => None,
     }
 }

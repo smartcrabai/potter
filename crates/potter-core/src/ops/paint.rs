@@ -632,13 +632,13 @@ fn texture(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bo
                 .iter_mut()
                 .find(|entry| entry.number == tile_number)
             {
-                metadata.blob = blob;
+                metadata.blob = Some(blob);
             } else {
                 updated.tiles.push(ImageTile {
                     number: tile_number,
                     width: tile.width,
                     height: tile.height,
-                    blob,
+                    blob: Some(blob),
                 });
                 updated.tiles.sort_by_key(|entry| entry.number);
             }

@@ -558,7 +558,7 @@ fn texture_image_for_export<'a>(doc: &'a SceneDoc, image_id: &Id) -> Result<&'a 
             json!({ "image": image_id }),
         )
     })?;
-    if !image.tiles.is_empty() {
+    if image.is_udim() {
         return Err(unsupported_export(
             "material.texture_udim",
             "glTF export does not represent Potter UDIM image tiles",
@@ -5929,6 +5929,7 @@ fn import_images(
                 source_path: None,
                 source_hash: None,
                 alpha_mode: ImageAlphaMode::Straight,
+                tiled: false,
             },
         );
         image_ids.push(id);

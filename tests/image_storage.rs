@@ -28,6 +28,7 @@ fn image(blob: Option<String>) -> Image {
         source_path: None,
         source_hash: None,
         alpha_mode: ImageAlphaMode::Straight,
+        tiled: false,
     }
 }
 
@@ -73,7 +74,7 @@ fn packed_staged_and_udim_blobs_load_by_verified_content_hash() -> Result<(), Bo
         number: 1012,
         width: 1,
         height: 1,
-        blob: tile_blob,
+        blob: Some(tile_blob),
     });
     let loaded = load_image_data(&packed, root, ImageInterpolation::Linear)?;
     assert_eq!(loaded.pixels, base_pixels);
@@ -138,6 +139,33 @@ fn linked_images_detect_changed_and_missing_sources() -> Result<(), Box<dyn Erro
             .unwrap_err()
             .code,
         ErrorCode::FileNotFound
+    );
+    Ok(())
+}
+
+#[test]
+fn image_tile_blob_is_optional_and_serializes_like_the_image_blob() -> Result<(), Box<dyn Error>> {
+    // Documents written before the missing state carry a string blob; a missing tile is a null blob, as the image's own
+    // optional blob is. An absent key also loads as missing, since the field has a serde default.
+    let digest = format!("sha256:{}", "0".repeat(64));
+    let present: ImageTile = serde_json::from_value(serde_json::json!({
+        "number": 1002, "width": 1, "height": 2, "blob": digest,
+    }))?;
+    assert_eq!(present.blob.as_deref(), Some(digest.as_str()));
+    let missing: ImageTile = serde_json::from_value(serde_json::json!({
+        "number": 1003, "width": 0, "height": 0, "blob": null,
+    }))?;
+    assert_eq!(missing.blob, None);
+    let absent: ImageTile =
+        serde_json::from_value(serde_json::json!({"number": 1004, "width": 0, "height": 0}))?;
+    assert_eq!(absent.blob, None);
+    assert_eq!(
+        serde_json::to_value(&missing)?,
+        serde_json::json!({"number": 1003, "width": 0, "height": 0, "blob": null}),
+    );
+    assert_eq!(
+        serde_json::to_value(&present)?,
+        serde_json::json!({"number": 1002, "width": 1, "height": 2, "blob": digest}),
     );
     Ok(())
 }
