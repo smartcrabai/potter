@@ -109,7 +109,11 @@ fn triangulate_face(
     match corners {
         [_, _, _] => vec![[0, 1, 2]],
         [a, b, c, d] => triangulate_quad([*a, *b, *c, *d], quad_method).to_vec(),
-        [_, _, _, _, ..] => triangulate_ngon(corners, face_normal(corners), ngon_method),
+        [_, _, _, _, ..] => triangulate_ngon(
+            corners,
+            face_normal(corners).unwrap_or([0.0; 3]),
+            ngon_method,
+        ),
         [..] => Vec::new(),
     }
 }
@@ -183,15 +187,12 @@ fn project(normal: Vec3, point: Vec3) -> Vec2 {
     [dot3(n1, point), dot3(n2, point)]
 }
 
-/// Newell's method over the corners, as `bm_face_calc_poly_normal` (`bmesh_polygon.cc`). A face
-/// with no net area (a collinear or self-cancelling n-gon) keeps the zero vector: the BMesh
-/// triangulation projects onto it as is. Only the Mesh tessellation substitutes +Z, see
-/// [`loop_triangles`].
-fn face_normal(corners: &[Vec3]) -> Vec3 {
+/// Newell's method over the corners, as `bm_face_calc_poly_normal` (`bmesh_polygon.cc`). `None` for a
+/// face with no net area (a collinear or self-cancelling n-gon): the `BMesh` triangulation projects
+/// onto the zero vector, and only the Mesh tessellation substitutes +Z, see [`loop_triangles`].
+fn face_normal(corners: &[Vec3]) -> Option<Vec3> {
     let mut normal = [0.0_f32; 3];
-    let Some(&last) = corners.last() else {
-        return normal;
-    };
+    let &last = corners.last()?;
     let mut prev = last;
     for &curr in corners {
         normal[0] += (prev[1] - curr[1]) * (prev[2] + curr[2]);
@@ -200,7 +201,7 @@ fn face_normal(corners: &[Vec3]) -> Vec3 {
         prev = curr;
     }
     let (unit, length) = normalize3(normal);
-    if length == 0.0 { [0.0; 3] } else { unit }
+    (length != 0.0).then_some(unit)
 }
 
 /// `is_quad_flip_v3`: bit 0 when the 0-2 diagonal is concave, bit 1 for the 1-3 diagonal.
@@ -359,10 +360,7 @@ pub(crate) fn loop_triangles(corners: &[[f32; 3]]) -> Vec<[usize; 3]> {
         }
         _ => {
             // `normal_calc_ngon`: a zero Newell sum projects onto +Z (`normal[2] = 1`).
-            let mut normal = face_normal(corners);
-            if normal == [0.0; 3] {
-                normal = [0.0, 0.0, 1.0];
-            }
+            let normal = face_normal(corners).unwrap_or([0.0, 0.0, 1.0]);
             triangulate_ngon(corners, normal, NgonMethod::Clip)
         }
     }
