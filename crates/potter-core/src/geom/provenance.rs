@@ -68,11 +68,22 @@ pub(crate) struct Stage {
     pub sources: Vec<(usize, f64)>,
 }
 
-/// Staged mixes of a subdivided mesh, indexed like the flat [`Origin`] lists. A vertex without stages
-/// (`None`) is a coarse copy or a loose-edge mix, whose flat sources are already Blender's single mix.
+/// How a subdivided vertex mixes its sources in Blender. A face-sampled vertex mixes its slots: each slot is
+/// converted to the attribute type first, then the slots are mixed by their outer weights (`mix4`). A loose-edge
+/// vertex is one two-source `mix2` with no outer mix (`subdiv_mesh_vert_of_loose_edge_interpolate`, `subdiv_mesh.cc:1434`).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Mixing {
+    /// Slots as [`Stage`]s, mixed by their outer weights.
+    Slots(Vec<Stage>),
+    /// Two `(source, weight)` sources; the second weight is the factor of `mix2`.
+    Pair(Vec<(usize, f64)>),
+}
+
+/// Staged mixes of a subdivided mesh, indexed like the flat [`Origin`] lists. A vertex without a mixing
+/// (`None`) is a coarse copy, whose flat source is the copied vertex.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Staged {
-    pub vertices: Vec<Option<Vec<Stage>>>,
+    pub vertices: Vec<Option<Mixing>>,
     /// `None` when the output carries no corner data, as for [`Origin::corners`].
     pub corners: Option<Vec<Vec<Stage>>>,
 }
@@ -102,17 +113,20 @@ impl Staged {
     }
 }
 
-/// How one output element mixes its sources: flat weighted sources, or Blender's staged slots.
+/// How one output element mixes its sources, as Blender's attribute math does: flat weighted sources
+/// (`mix_indices`), Blender's staged slots, or one two-source `mix2`.
 #[derive(Clone, Copy)]
 pub(crate) enum Mix<'a> {
     Flat(&'a [(usize, f64)]),
     Staged(&'a [Stage]),
+    Pair(&'a [(usize, f64)]),
 }
 
-/// [`Mix::Staged`] when `stages` is present, otherwise the flat `sources`.
-pub(crate) fn mix_of<'a>(stages: Option<&'a [Stage]>, sources: &'a [(usize, f64)]) -> Mix<'a> {
-    match stages {
-        Some(stages) => Mix::Staged(stages),
+/// The mix of an element with `mixing` (its staged or pair mixing, if any), otherwise its flat `sources`.
+pub(crate) fn element_mix<'a>(mixing: Option<&'a Mixing>, sources: &'a [(usize, f64)]) -> Mix<'a> {
+    match mixing {
+        Some(Mixing::Slots(stages)) => Mix::Staged(stages),
+        Some(Mixing::Pair(pair)) => Mix::Pair(pair),
         None => Mix::Flat(sources),
     }
 }
@@ -718,20 +732,23 @@ struct Sources<'a> {
 }
 
 impl Sources<'_> {
-    /// How output vertex `index` mixes: its stages when it has them, otherwise its flat sources.
+    /// How output vertex `index` mixes: its staged or pair mixing when it has one, otherwise its flat sources.
     fn vertex_mix(&self, index: usize) -> Mix<'_> {
-        let stages = self
+        let mixing = self
             .staged
-            .and_then(|staged| staged.vertices.get(index)?.as_deref());
-        mix_of(stages, &self.origin.vertices[index])
+            .and_then(|staged| staged.vertices.get(index)?.as_ref());
+        element_mix(mixing, &self.origin.vertices[index])
     }
 
-    /// How output corner `index` (in output corner order) mixes.
+    /// How output corner `index` (in output corner order) mixes: its stages when it has them, otherwise its flat sources.
     fn corner_mix(&self, index: usize) -> Mix<'_> {
-        let stages = self
+        match self
             .staged
-            .and_then(|staged| staged.corners.as_ref()?.get(index).map(Vec::as_slice));
-        mix_of(stages, &self.corner_origin[index])
+            .and_then(|staged| staged.corners.as_ref()?.get(index))
+        {
+            Some(stages) => Mix::Staged(stages),
+            None => Mix::Flat(&self.corner_origin[index]),
+        }
     }
 
     /// Interpolated vertex-group weights keyed `v{output id}` under each group name.
@@ -1262,6 +1279,30 @@ fn blend_indexed(values: &[Value], sources: &[(usize, f64)], data_type: &str) ->
     blend_mix(|index| values.get(index), Mix::Flat(sources), data_type)
 }
 
+/// The `(value, weight)` pairs of the sources that have a value.
+fn present_sources<'a>(
+    value: &impl Fn(usize) -> Option<&'a Value>,
+    sources: &[(usize, f64)],
+) -> Vec<(&'a Value, f64)> {
+    sources
+        .iter()
+        .filter_map(|&(index, weight)| Some((value(index)?, weight)))
+        .collect()
+}
+
+/// Blender's mix of `items`: two quaternion sources with a factor are `mix2` (`math::interpolate`); any
+/// other set is the weighted `mix_indices` of [`blend`].
+fn mix2_or_blend(items: Vec<(&Value, f64)>, data_type: &str) -> Option<Value> {
+    if let [(first, _), (second, factor)] = items.as_slice()
+        && data_type == "QUATERNION"
+        && is_quaternion(first)
+        && is_quaternion(second)
+    {
+        return quaternion_mix2(first, second, *factor as f32);
+    }
+    blend(items.into_iter(), data_type)
+}
+
 /// [`blend`] of an element's mix. Flat sources blend once. Staged sources blend each stage first, then the
 /// stage values by the stage weights, as Blender's `mix_attrs` does for face-sampled elements. A stage whose
 /// sources have no values is skipped, as flat sources without values are.
@@ -1271,6 +1312,7 @@ fn blend_mix<'a>(
     data_type: &str,
 ) -> Option<Value> {
     match mix {
+        Mix::Pair(sources) => mix2_or_blend(present_sources(&value, sources), data_type),
         Mix::Flat(sources) => blend(
             sources
                 .iter()
@@ -1278,16 +1320,12 @@ fn blend_mix<'a>(
             data_type,
         ),
         Mix::Staged(stages) => {
+            // A stage of two sources is Blender's `mix2` (an edge midpoint of the slots), while a stage of more
+            // sources is the weighted `mix_indices` of the centre slot.
             let mixed: Vec<(Value, f64)> = stages
                 .iter()
                 .filter_map(|stage| {
-                    let inner = blend(
-                        stage
-                            .sources
-                            .iter()
-                            .filter_map(|&(index, weight)| Some((value(index)?, weight))),
-                        data_type,
-                    )?;
+                    let inner = mix2_or_blend(present_sources(&value, &stage.sources), data_type)?;
                     Some((inner, stage.weight))
                 })
                 .collect();
@@ -1379,6 +1417,68 @@ pub(crate) fn blend_quaternion<'a>(items: impl Iterator<Item = (&'a Value, f64)>
     } else {
         Some(json!([0.0, 0.0, 0.0, 1.0]))
     }
+}
+
+/// Blender's `mix2` of two quaternions (`attribute_math.cc:19`), which is `math::interpolate`: the spherical
+/// interpolation along the shorter arc, `a * pow(a^-1 * b, t)`, with `-(a^-1 * b)` when `dot(a, b) < 0`
+/// (`BLI_math_quaternion.hh:304`). Values are native `[x, y, z, w]`; `factor` is `t`.
+fn quaternion_mix2(first: &Value, second: &Value, factor: f32) -> Option<Value> {
+    let a = native_quaternion(first)?;
+    let b = native_quaternion(second)?;
+    let dot: f32 = a.iter().zip(&b).map(|(x, y)| x * y).sum();
+    let mut difference = quaternion_product(quaternion_conjugate(a), b);
+    if dot < 0.0 {
+        difference = difference.map(|component| -component);
+    }
+    Some(json!(quaternion_product(
+        a,
+        quaternion_power(difference, factor)
+    )))
+}
+
+/// A native `[x, y, z, w]` quaternion as `f32` components, or `None` for a non-finite value.
+fn native_quaternion(value: &Value) -> Option<[f32; 4]> {
+    let array = value.as_array().filter(|array| array.len() == 4)?;
+    let mut components = [0.0_f32; 4];
+    for (slot, component) in components.iter_mut().zip(array) {
+        let component = component.as_f64()? as f32;
+        if !component.is_finite() {
+            return None;
+        }
+        *slot = component;
+    }
+    Some(components)
+}
+
+/// The conjugate of a unit native quaternion, which is its inverse (`invert_normalized`).
+fn quaternion_conjugate([x, y, z, w]: [f32; 4]) -> [f32; 4] {
+    [-x, -y, -z, w]
+}
+
+/// The Hamilton product of native quaternions (`QuaternionBase::operator*`, `BLI_math_quaternion_types.hh:146`).
+fn quaternion_product(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+    let [ax, ay, az, aw] = a;
+    let [bx, by, bz, bw] = b;
+    [
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by + ay * bw + az * bx - ax * bz,
+        aw * bz + az * bw + ax * by - ay * bx,
+        aw * bw - ax * bx - ay * by - az * bz,
+    ]
+}
+
+/// Blender's `pow(q, y)` of a unit quaternion (`BLI_math_quaternion.hh:204`): `cos(y * acos(w))` and
+/// `sin(y * acos(w))` times the normalised imaginary part.
+fn quaternion_power([x, y, z, w]: [f32; 4], exponent: f32) -> [f32; 4] {
+    let half_angle = exponent * w.clamp(-1.0, 1.0).acos();
+    let axis = Vec3::new(x, y, z).normalize_or_zero();
+    let sine = half_angle.sin();
+    [
+        axis.x * sine,
+        axis.y * sine,
+        axis.z * sine,
+        half_angle.cos(),
+    ]
 }
 
 /// The weighted sum of the UVs at `sources`. Indices past the end of `uvs` are skipped, so a corner
@@ -1968,5 +2068,44 @@ mod tests {
             uv_layers::read_layers(&output)[0].faces[0],
             Some(vec![[2.0, 4.0], [0.0, 1.0], [2.0, 3.5], [0.0, 1.0]])
         );
+    }
+
+    #[test]
+    fn quaternion_mix2_interpolates_along_the_shorter_arc() {
+        let identity = json!([0.0, 0.0, 0.0, 1.0]);
+        let quarter_turn = json!([0.0, 0.0, 0.5_f64.sqrt(), 0.5_f64.sqrt()]);
+        let halfway = quaternion_mix2(&identity, &quarter_turn, 0.5).expect("slerp");
+        // Halfway between 0 and 90 degrees about z is 45 degrees: [0, 0, sin(pi/8), cos(pi/8)].
+        let expected = [
+            0.0,
+            0.0,
+            (std::f64::consts::PI / 8.0).sin(),
+            (std::f64::consts::PI / 8.0).cos(),
+        ];
+        for (actual, expected) in halfway.as_array().expect("array").iter().zip(expected) {
+            assert!((actual.as_f64().expect("number") - expected).abs() < 1.0e-6);
+        }
+        // The sign of the second quaternion does not change the rotation: the shorter arc is taken.
+        let negated = json!([0.0, 0.0, -0.5_f64.sqrt(), -0.5_f64.sqrt()]);
+        assert_eq!(quaternion_mix2(&identity, &negated, 0.5), Some(halfway));
+        // The factor selects the end points exactly at 0 and 1.
+        let start = quaternion_mix2(&identity, &quarter_turn, 0.0).expect("slerp");
+        let end = quaternion_mix2(&identity, &quarter_turn, 1.0).expect("slerp");
+        for (actual, expected) in start
+            .as_array()
+            .expect("array")
+            .iter()
+            .zip([0.0, 0.0, 0.0, 1.0])
+        {
+            assert!((actual.as_f64().expect("number") - expected).abs() < 1.0e-6);
+        }
+        for (actual, expected) in
+            end.as_array()
+                .expect("array")
+                .iter()
+                .zip([0.0, 0.0, 0.5_f64.sqrt(), 0.5_f64.sqrt()])
+        {
+            assert!((actual.as_f64().expect("number") - expected).abs() < 1.0e-6);
+        }
     }
 }

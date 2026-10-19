@@ -26,7 +26,7 @@ use super::subdivision_limit::{Sample, Samples};
 use super::subdivision_loose::LooseEdges;
 use super::{Polygon, usize_as_f64};
 use crate::error::{ErrorCode, PotError, Result};
-use crate::geom::provenance::{Origin, Stage, Staged, needs_corner_sources};
+use crate::geom::provenance::{Mixing, Origin, Stage, Staged, needs_corner_sources};
 use crate::geom::{Mesh, uv_layers};
 
 /// Keys subdivision writes itself, so the remap skips them and their output entries are kept.
@@ -82,22 +82,24 @@ pub(super) fn build(
             "subdivision samples do not describe the subdivided mesh",
         ));
     }
-    let mut vertex_stages: Vec<Option<Vec<Stage>>> = Vec::with_capacity(samples.vertices.len());
+    let mut vertex_stages: Vec<Option<Mixing>> = Vec::with_capacity(samples.vertices.len());
     let mut vertex_sources: Vec<Vec<(usize, f64)>> = Vec::with_capacity(samples.vertices.len());
     for (vertex, sample) in samples.vertices.iter().enumerate() {
         if let Some(sample) = sample {
             let face = &polygons[sample.face].0;
             let mixed = remap_sources(slots(*sample, polygons, loop_starts), |corner| face[corner]);
             vertex_sources.push(Staged::flatten(&mixed));
-            vertex_stages.push((!is_copy(&mixed)).then_some(mixed));
+            vertex_stages.push((!is_copy(&mixed)).then_some(Mixing::Slots(mixed)));
         } else {
-            vertex_sources.push(match loose.sources(vertex) {
+            let sources = match loose.sources(vertex) {
                 Some(sources) => sources,
                 // A base vertex on no face and no loose edge is copied by `subdiv_mesh_vert_loose`.
                 None if vertex < mesh.vertices.len() => vec![(vertex, 1.0)],
                 None => Vec::new(),
-            });
-            vertex_stages.push(None);
+            };
+            // An interior loose-edge vertex is one `mix2` of its edge's ends; an end point is a copy.
+            vertex_stages.push((sources.len() == 2).then(|| Mixing::Pair(sources.clone())));
+            vertex_sources.push(sources);
         }
     }
     // Corner stages exist only when the remap reads corner sources; otherwise the origin carries an empty list.

@@ -23,7 +23,7 @@ use crate::{
         Mesh,
         color_layers::{self, ColorDomain},
         edge_key,
-        provenance::{Mix, Origin, Staged, corner_sources, mix_of},
+        provenance::{Mix, Origin, Staged, corner_sources, element_mix},
         uv_layers::{self, UvLayer},
     },
 };
@@ -588,18 +588,19 @@ pub(super) fn encode_byte_colors(
         layer.values = match layer.domain {
             ColorDomain::Point => (0..origin.vertices.len())
                 .map(|index| {
-                    let stages = staged.and_then(|staged| staged.vertices.get(index)?.as_deref());
+                    let mixing = staged.and_then(|staged| staged.vertices.get(index)?.as_ref());
                     mix_byte_color(
                         &source_layer.values,
-                        mix_of(stages, &origin.vertices[index]),
+                        element_mix(mixing, &origin.vertices[index]),
                     )
                 })
                 .collect(),
             ColorDomain::Corner => (0..corners.len())
                 .map(|corner| {
-                    let stages = staged
-                        .and_then(|staged| staged.corners.as_ref()?.get(corner).map(Vec::as_slice));
-                    mix_byte_color(&source_layer.values, mix_of(stages, &corners[corner]))
+                    match staged.and_then(|staged| staged.corners.as_ref()?.get(corner)) {
+                        Some(stages) => mix_byte_color(&source_layer.values, Mix::Staged(stages)),
+                        None => mix_byte_color(&source_layer.values, Mix::Flat(&corners[corner])),
+                    }
                 })
                 .collect(),
         };
@@ -607,32 +608,41 @@ pub(super) fn encode_byte_colors(
     color_layers::write(output, &store);
 }
 
-/// One output value of a `BYTE_COLOR` layer. Flat sources sum their stored bytes (each source's byte times its
-/// weight, rounded) and truncate the sum per channel. Staged sources truncate each stage's sum before the stages
-/// are weighted and summed. A value with no source is opaque black, as the attribute remap's default.
+/// One output value of a `BYTE_COLOR` layer, as Blender mixes it. A weighted list (`mix_indices`, and the
+/// centre slot of a face) sums the stored bytes and converts the sum to a byte by truncation. A two-source
+/// stage is `mix2` (`math::interpolate` on the channels), which rounds each channel. A staged value rounds
+/// its two-source slot values, truncates its other slot values, and then truncates the weighted slot sum.
+/// A value with no source is opaque black, as the attribute remap's default.
 fn mix_byte_color(values: &[[f64; 4]], mix: Mix<'_>) -> [f64; 4] {
-    let total = match mix {
-        Mix::Flat(sources) => source_bytes(values, sources),
+    let bytes = match mix {
+        Mix::Flat(sources) => source_bytes(values, sources).map(|bytes| bytes.map(truncate_byte)),
+        // A loose-edge vertex is one `mix2`, which rounds.
+        Mix::Pair(sources) => source_bytes(values, sources).map(|bytes| bytes.map(round_byte)),
         Mix::Staged(stages) => {
             let mut total: Option<[f64; 4]> = None;
             for stage in stages {
                 let Some(bytes) = source_bytes(values, &stage.sources) else {
                     continue;
                 };
+                let slot = if stage.sources.len() == 2 {
+                    bytes.map(round_byte)
+                } else {
+                    bytes.map(truncate_byte)
+                };
                 let sum = total.get_or_insert([0.0; 4]);
-                for (channel, byte) in bytes.iter().enumerate() {
-                    sum[channel] += stage.weight * truncate_byte(*byte);
+                for (channel, value) in slot.iter().enumerate() {
+                    sum[channel] += stage.weight * value;
                 }
             }
-            total
+            total.map(|bytes| bytes.map(truncate_byte))
         }
     };
-    let Some(bytes) = total else {
+    let Some(bytes) = bytes else {
         return [0.0, 0.0, 0.0, 1.0];
     };
     let mut color = [0.0; 4];
     for (channel, &byte) in bytes.iter().enumerate() {
-        let unit = truncate_byte(byte) / 255.0;
+        let unit = byte / 255.0;
         color[channel] = if channel < 3 {
             srgb_to_linear(unit)
         } else {
@@ -667,4 +677,9 @@ fn source_bytes(values: &[[f64; 4]], sources: &[(usize, f64)]) -> Option<[f64; 4
 /// A byte sum truncated to a byte's value, as Blender's conversion to `uint8_t` does.
 fn truncate_byte(value: f64) -> f64 {
     (value + 1.0e-9).floor().clamp(0.0, 255.0)
+}
+
+/// A byte sum rounded to the nearest byte, as Blender's `math::interpolate` on an integer channel does.
+fn round_byte(value: f64) -> f64 {
+    (value + 0.5).floor().clamp(0.0, 255.0)
 }
