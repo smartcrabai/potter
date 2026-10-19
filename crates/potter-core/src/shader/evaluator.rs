@@ -1214,8 +1214,15 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
             == Some(true)
         {
             let mut params = self.closure_params();
-            // The overlay writes an Alpha input only for a non-opaque material (`write_principled_inputs`).
-            params.alpha = self.scalar_input(id, &["Alpha"], 1.0)?;
+            // A simple-material graph holds no Alpha input unless the overlay wrote one (`write_principled_inputs`, for a
+            // non-opaque material). Without it the material's own alpha applies, as before the closure change: its base
+            // colour alpha, or 1 for an OPAQUE material, whose graph carries no transparency.
+            let default_alpha = if self.material.alpha_mode == "opaque" {
+                1.0
+            } else {
+                self.material.base_color[3]
+            };
+            params.alpha = self.scalar_input(id, &["Alpha"], default_alpha)?;
             record_unevaluated_inputs(
                 self.hit_ctx.warnings,
                 &self.material.name,
