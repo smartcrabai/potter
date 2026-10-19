@@ -243,8 +243,7 @@ fn upgrade_v2(value: &mut Value) -> Result<()> {
 /// `CurveMapping` on the combined curve with VECTOR handles and horizontal extension, so existing
 /// renders keep their shape. The R/G/B identity curves cover the combined curve's full x-domain and
 /// `[0, 1]`; a single legacy point becomes a constant two-point curve. Clip is `[0, 1]`, black and
-/// white identity. An empty array means no curve. A curve that is already a `CurveMapping` object is
-/// left as it is.
+/// white identity. An empty array means no curve.
 fn upgrade_v4(value: &mut Value) -> Result<()> {
     if let Some(scenes) = value.get_mut("scenes").and_then(Value::as_object_mut) {
         for scene in scenes.values_mut() {
@@ -261,12 +260,12 @@ fn upgrade_color_curve(color: &mut Value) -> Result<()> {
     let Some(curve) = color.get_mut("curve") else {
         return Ok(());
     };
-    if curve.is_null() || curve.is_object() {
+    if curve.is_null() {
         return Ok(());
     }
     let Value::Array(points) = curve else {
         return Err(invalid(
-            "color curve must be an array of [x, y] points, null, or a CurveMapping object",
+            "color curve must be an array of [x, y] points or null",
         ));
     };
     let mut points = points
