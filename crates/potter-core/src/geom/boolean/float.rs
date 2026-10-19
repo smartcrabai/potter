@@ -25,12 +25,14 @@ use crate::geom::{
     color_layers::{self, ColorDomain},
     concat::{self, Part},
     edge_key,
+    interpolation::interp_weights_poly_v2,
     provenance::{Origin, default_value, remap_attributes},
-    triangulate::{BeautyScratch, beautify_with_scratch},
+    triangulate::{NgonMethod, triangulate_ngon},
     uv_layers,
 };
 
 use super::dissolve::Poly;
+use super::float_connect::ortho_basis;
 use super::float_split_net::CornerSource;
 use super::imesh::NO_INDEX;
 use super::{BooleanOperand, Operation};
@@ -2136,6 +2138,7 @@ fn mix_json_array(values: &[Value], weights: &[f32], data_type: &str) -> Value {
     Value::Array(result)
 }
 
+/// A face's corners projected into its plane, for Blender's `interp_weights_poly_v2`.
 struct FloatPolyInterpolator {
     vertices: Vec<[f32; 2]>,
     axis_x: P3,
@@ -2149,22 +2152,8 @@ impl FloatPolyInterpolator {
             [a, b, c, d] => normalize(cross(sub(*a, *c), sub(*b, *d))),
             _ => normal_poly(points),
         };
-        let f = normal[0] * normal[0] + normal[1] * normal[1];
-        let (axis_x, axis_y) = if f > FLT_EPSILON {
-            let d = 1.0 / f.sqrt();
-            let x = [normal[1] * d, -normal[0] * d, 0.0];
-            let y = [
-                -normal[2] * x[1],
-                normal[2] * x[0],
-                normal[0] * x[1] - normal[1] * x[0],
-            ];
-            (x, y)
-        } else {
-            (
-                [if normal[2] < 0.0 { -1.0 } else { 1.0 }, 0.0, 0.0],
-                [0.0, 1.0, 0.0],
-            )
-        };
+        // Blender's `axis_dominant_v3_to_m3(f->no)`: the two in-plane basis vectors.
+        let (axis_x, axis_y) = ortho_basis(normal);
         Self {
             vertices: points
                 .iter()
@@ -2176,108 +2165,12 @@ impl FloatPolyInterpolator {
     }
 
     fn weights(&self, point: P3) -> Vec<f32> {
-        let n = self.vertices.len();
-        let mut weights = vec![0.0; n];
-        if n == 0 {
-            return weights;
-        }
+        let mut weights = vec![0.0; self.vertices.len()];
         let point2 = [dot(self.axis_x, point), dot(self.axis_y, point)];
-        let max_value = self.vertices.iter().fold(0.0_f32, |m, v| {
-            m.max((v[0] - point2[0]).abs())
-                .max((v[1] - point2[1]).abs())
-        });
-        let eps = 16.0 * FLT_EPSILON * max_value;
-        let eps_sq = eps * eps;
-        let mut i_curr = n - 1;
-        let mut i_next = 0;
-        let mut d_curr = double2_len(self.vertices[(n + n - 2) % n], point2);
-        let mut d_next = double2_len(self.vertices[i_curr], point2);
-        let mut ht_prev = mean_value_half_tan(&d_curr, &d_next);
-        let mut total = 0.0_f32;
-        let mut intersection = 0_u8;
-        while i_next < n {
-            if d_next.1 < f64::from(eps) {
-                intersection = 1;
-                break;
-            }
-            let current = self.vertices[i_curr];
-            let next = self.vertices[i_next];
-            if dist_point_segment_sq(point2, current, next) < eps_sq {
-                intersection = 2;
-                break;
-            }
-            d_curr = d_next;
-            d_next = double2_len(next, point2);
-            let ht = mean_value_half_tan(&d_curr, &d_next);
-            weights[i_curr] = if d_curr.1 == 0.0 {
-                0.0
-            } else {
-                ((ht_prev + ht) / d_curr.1) as f32
-            };
-            total += weights[i_curr];
-            i_curr = i_next;
-            i_next += 1;
-            ht_prev = ht;
-        }
-        match intersection {
-            1 => {
-                weights.fill(0.0);
-                weights[i_curr] = 1.0;
-            }
-            2 => {
-                weights.fill(0.0);
-                let a = self.vertices[i_curr];
-                let b = self.vertices[i_next];
-                let factor = line_factor_2d(point2, a, b).clamp(0.0, 1.0);
-                weights[i_curr] = 1.0 - factor;
-                weights[i_next] = factor;
-            }
-            _ if total != 0.0 => {
-                for weight in &mut weights {
-                    *weight /= total;
-                }
-            }
-            _ => {}
-        }
+        // Fewer than three vertices leave the zero weights.
+        interp_weights_poly_v2(&mut weights, &self.vertices, point2);
         weights
     }
-}
-
-fn double2_len(a: [f32; 2], b: [f32; 2]) -> ([f64; 2], f64) {
-    let dir = [
-        f64::from(a[0]) - f64::from(b[0]),
-        f64::from(a[1]) - f64::from(b[1]),
-    ];
-    let len = (dir[0] * dir[0] + dir[1] * dir[1]).sqrt();
-    (dir, len)
-}
-
-fn mean_value_half_tan(a: &([f64; 2], f64), b: &([f64; 2], f64)) -> f64 {
-    let area = a.0[0] * b.0[1] - a.0[1] * b.0[0];
-    if area == 0.0 {
-        return 0.0;
-    }
-    let dot = a.0[0] * b.0[0] + a.0[1] * b.0[1];
-    let value = (a.1 * b.1 - dot) / area;
-    if value.is_finite() { value } else { 0.0 }
-}
-
-fn line_factor_2d(point: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
-    let dx = b[0] - a[0];
-    let dy = b[1] - a[1];
-    let denominator = dx * dx + dy * dy;
-    if denominator > 0.0 {
-        ((point[0] - a[0]) * dx + (point[1] - a[1]) * dy) / denominator
-    } else {
-        0.0
-    }
-}
-
-fn dist_point_segment_sq(point: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
-    let factor = line_factor_2d(point, a, b).clamp(0.0, 1.0);
-    let x = a[0] + (b[0] - a[0]) * factor;
-    let y = a[1] + (b[1] - a[1]) * factor;
-    (point[0] - x) * (point[0] - x) + (point[1] - y) * (point[1] - y)
 }
 
 fn build_state(
@@ -2323,10 +2216,6 @@ fn build_state(
         .max()
         .unwrap_or(0);
     let mut local_positions = Vec::with_capacity(max_face_len);
-    let mut triangulation_coordinates = Vec::with_capacity(max_face_len);
-    let mut face_triangles = Vec::with_capacity(max_face_len.saturating_sub(2));
-    let mut triangulation_corners = Vec::with_capacity(max_face_len);
-    let mut beauty_scratch = BeautyScratch::default();
 
     for (i, edge) in operand_local.edges.iter().enumerate() {
         let a = *operand_vertex.get(&edge.vertices[0]).ok_or_else(|| {
@@ -2413,17 +2302,9 @@ fn build_state(
                 });
             }
         } else {
-            beauty_ngon_tris_into(
-                ring,
-                &local_positions,
-                &mut triangulation_coordinates,
-                &mut face_triangles,
-                &mut triangulation_corners,
-                &mut beauty_scratch,
-            );
-            for &verts in &face_triangles {
+            for corners in ngon_triangles(&local_positions, NgonMethod::Beauty) {
                 state.tris.push(Triangle {
-                    verts,
+                    verts: corners.map(|corner| ring[corner]),
                     face: face_index,
                     side: state.faces[face_index].side,
                 });
@@ -2456,7 +2337,7 @@ fn beauty_quad_tris(ring: &[usize], positions: &[P3]) -> [[usize; 3]; 2] {
 }
 fn quad_rotate_score(p: [P3; 4]) -> f32 {
     let n = normalize(cross(sub(p[0], p[2]), sub(p[1], p[3])));
-    let (u, v) = orthogonal_basis(n);
+    let (u, v) = ortho_basis(n);
     let projected = p.map(|co| [dot(co, u), dot(co, v)]);
     let cross2 = |a: [f32; 2], b: [f32; 2], c: [f32; 2]| {
         (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
@@ -2482,279 +2363,13 @@ fn quad_rotate_score(p: [P3; 4]) -> f32 {
     fac24 - fac13
 }
 
-const EAR_CONCAVE: i8 = -1;
-const EAR_TANGENTIAL: i8 = 0;
-const EAR_CONVEX: i8 = 1;
-
-#[derive(Clone, Copy)]
-struct EarCorner {
-    previous: usize,
-    next: usize,
-    sign: i8,
-}
-
-struct EarClipper<'a> {
-    coordinates: &'a [[f32; 2]],
-    corners: &'a mut [EarCorner],
-    head: usize,
-    count: usize,
-    concave: usize,
-    triangles: &'a mut Vec<[usize; 3]>,
-}
-
-struct EarTriangle {
-    edges: [[f32; 2]; 3],
-    offsets: [f32; 3],
-}
-
-impl EarTriangle {
-    fn new(vertices: [[f32; 2]; 3]) -> Self {
-        let edges = [
-            sub2(vertices[1], vertices[0]),
-            sub2(vertices[2], vertices[1]),
-            sub2(vertices[0], vertices[2]),
-        ];
-        let offsets = [
-            edges[0][0] * vertices[0][1] - vertices[0][0] * edges[0][1],
-            edges[1][0] * vertices[1][1] - vertices[1][0] * edges[1][1],
-            edges[2][0] * vertices[2][1] - vertices[2][0] * edges[2][1],
-        ];
-        Self { edges, offsets }
-    }
-
-    fn contains(&self, point: [f32; 2]) -> bool {
-        [1, 2, 0].into_iter().all(|i| {
-            self.edges[i][1] * point[0] - self.edges[i][0] * point[1] + self.offsets[i] >= 0.0
-        })
-    }
-}
-
-fn sub2(a: [f32; 2], b: [f32; 2]) -> [f32; 2] {
-    [a[0] - b[0], a[1] - b[1]]
-}
-
-fn corner_sign(coordinates: &[[f32; 2]], previous: usize, current: usize, next: usize) -> i8 {
-    let d2 = sub2(coordinates[current], coordinates[next]);
-    let d3 = sub2(coordinates[previous], coordinates[next]);
-    let area = d2[0] * d3[1] - d3[0] * d2[1];
-    if area > 0.0 {
-        EAR_CONVEX
-    } else if area >= 0.0 {
-        EAR_TANGENTIAL
-    } else {
-        EAR_CONCAVE
-    }
-}
-
-fn float_polyfill_with_scratch(
-    coordinates: &[[f32; 2]],
-    corners: &mut Vec<EarCorner>,
-    triangles: &mut Vec<[usize; 3]>,
-) {
-    let count = coordinates.len();
-    corners.clear();
-    corners.extend((0..count).map(|i| EarCorner {
-        previous: (i + count - 1) % count,
-        next: (i + 1) % count,
-        sign: EAR_CONVEX,
-    }));
-    for (i, corner) in corners.iter_mut().enumerate() {
-        corner.sign = corner_sign(coordinates, corner.previous, i, corner.next);
-    }
-    let concave = corners
-        .iter()
-        .filter(|corner| corner.sign != EAR_CONVEX)
-        .count();
-    triangles.clear();
-    let mut clipper = EarClipper {
-        coordinates,
-        corners: corners.as_mut_slice(),
-        head: 0,
-        count,
-        concave,
-        triangles,
-    };
-    clipper.clip_all();
-}
-
-impl EarClipper<'_> {
-    fn is_ear(&self, tip: usize, accepted_sign: i8) -> bool {
-        if self.concave == 0 {
-            return true;
-        }
-        let corner = self.corners[tip];
-        if corner.sign != accepted_sign {
-            return false;
-        }
-        let triangle = EarTriangle::new([
-            self.coordinates[tip],
-            self.coordinates[corner.next],
-            self.coordinates[corner.previous],
-        ]);
-        let mut checked = 0;
-        let mut current = self.corners[corner.next].next;
-        while current != corner.previous {
-            if self.corners[current].sign != EAR_CONVEX {
-                if triangle.contains(self.coordinates[current]) {
-                    return false;
-                }
-                checked += 1;
-                if checked == self.concave {
-                    break;
-                }
-            }
-            current = self.corners[current].next;
-        }
-        true
-    }
-
-    fn step(&self, index: usize, reverse: bool) -> usize {
-        if reverse {
-            self.corners[index].previous
-        } else {
-            self.corners[index].next
-        }
-    }
-
-    fn find_ear(&self, init: usize, reverse: bool) -> usize {
-        for accepted_sign in [EAR_CONVEX, EAR_TANGENTIAL] {
-            let mut ear = init;
-            for _ in 0..self.count {
-                if self.is_ear(ear, accepted_sign) {
-                    return ear;
-                }
-                ear = self.step(ear, reverse);
-            }
-        }
-        let mut ear = init;
-        for _ in 0..self.count {
-            if self.corners[ear].sign != EAR_CONCAVE {
-                return ear;
-            }
-            ear = self.corners[ear].next;
-        }
-        ear
-    }
-
-    fn clip_all(&mut self) {
-        let mut ear_init = self.head;
-        let mut reverse = false;
-        while self.count > 3 {
-            let ear = self.find_ear(ear_init, reverse);
-            if self.corners[ear].sign != EAR_CONVEX {
-                self.concave -= 1;
-            }
-            let corner = self.corners[ear];
-            self.triangles.push([corner.previous, ear, corner.next]);
-            self.corners[corner.next].previous = corner.previous;
-            self.corners[corner.previous].next = corner.next;
-            if self.head == ear {
-                self.head = corner.next;
-            }
-            self.count -= 1;
-            for neighbor in [corner.previous, corner.next] {
-                if self.corners[neighbor].sign != EAR_CONVEX {
-                    let c = self.corners[neighbor];
-                    self.corners[neighbor].sign =
-                        corner_sign(self.coordinates, c.previous, neighbor, c.next);
-                    if self.corners[neighbor].sign == EAR_CONVEX {
-                        self.concave -= 1;
-                    }
-                }
-            }
-            ear_init = if reverse {
-                self.corners[corner.previous].previous
-            } else {
-                self.corners[corner.next].next
-            };
-            if self.corners[ear_init].sign != EAR_CONVEX {
-                ear_init = self.step(ear_init, reverse);
-                reverse = !reverse;
-            }
-        }
-        if self.count == 3 {
-            let a = self.head;
-            let b = self.corners[a].next;
-            self.triangles.push([a, b, self.corners[b].next]);
-        }
-    }
-}
-
-fn float_face_tris_into(
-    ring: &[usize],
-    points: &[P3],
-    coordinates: &mut Vec<[f32; 2]>,
-    triangles: &mut Vec<[usize; 3]>,
-    corners: &mut Vec<EarCorner>,
-) {
-    triangles.clear();
-    if ring.len() == 3 {
-        triangles.push([ring[0], ring[1], ring[2]]);
-        return;
-    }
-    let normal = normal_poly(points);
-    let (basis_x, basis_y) = orthogonal_basis(scale(normal, -1.0));
-    coordinates.clear();
-    coordinates.extend(
-        points
-            .iter()
-            .map(|&point| [dot(basis_x, point), dot(basis_y, point)]),
-    );
-    float_polyfill_with_scratch(coordinates, corners, triangles);
-    for triangle in triangles {
-        for corner in triangle {
-            *corner = ring[*corner];
-        }
-    }
-}
-fn beauty_ngon_tris_into(
-    ring: &[usize],
-    points: &[P3],
-    coordinates: &mut Vec<[f32; 2]>,
-    triangles: &mut Vec<[usize; 3]>,
-    corners: &mut Vec<EarCorner>,
-    beauty_scratch: &mut BeautyScratch,
-) {
-    triangles.clear();
-    if ring.len() < 3 {
-        return;
-    }
-    if ring.len() == 3 {
-        triangles.push([ring[0], ring[1], ring[2]]);
-        return;
-    }
-    let normal = normal_poly(points);
-    let (basis_x, basis_y) = orthogonal_basis(scale(normal, -1.0));
-    coordinates.clear();
-    coordinates.extend(
-        points
-            .iter()
-            .map(|&point| [dot(basis_x, point), dot(basis_y, point)]),
-    );
-    float_polyfill_with_scratch(coordinates, corners, triangles);
-    beautify_with_scratch(coordinates, triangles, beauty_scratch);
-    for triangle in triangles.iter_mut() {
-        for corner in triangle {
-            *corner = ring[*corner];
-        }
-    }
-}
-fn orthogonal_basis(normal: P3) -> (P3, P3) {
-    let squared = normal[0] * normal[0] + normal[1] * normal[1];
-    if squared > FLT_EPSILON {
-        let scale = 1.0 / squared.sqrt();
-        let first = [normal[1] * scale, -normal[0] * scale, 0.0];
-        let second = [
-            -normal[2] * first[1],
-            normal[2] * first[0],
-            normal[0] * first[1] - normal[1] * first[0],
-        ];
-        (first, second)
-    } else {
-        (
-            [if normal[2] < 0.0 { -1.0 } else { 1.0 }, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
-        )
+/// Triangles of a face's corners as indices into `points`, from the `triangulate.rs` polyfill.
+/// Three corners pass through; fewer than three give none.
+fn ngon_triangles(points: &[P3], method: NgonMethod) -> Vec<[usize; 3]> {
+    match points {
+        [] | [_] | [_, _] => Vec::new(),
+        [_, _, _] => vec![[0, 1, 2]],
+        _ => triangulate_ngon(points, normal_poly(points), method),
     }
 }
 
@@ -4106,10 +3721,6 @@ impl Bvh {
 #[derive(Default)]
 struct FacePointScratch {
     points: Vec<P3>,
-    ring: Vec<usize>,
-    coordinates: Vec<[f32; 2]>,
-    triangles: Vec<[usize; 3]>,
-    corners: Vec<EarCorner>,
 }
 
 fn point_in_face(face: &Face, verts: &[Vertex], scratch: &mut FacePointScratch) -> P3 {
@@ -4117,18 +3728,10 @@ fn point_in_face(face: &Face, verts: &[Vertex], scratch: &mut FacePointScratch) 
     scratch
         .points
         .extend(face.verts.iter().map(|&vertex| verts[vertex].co));
-    scratch.ring.clear();
-    scratch.ring.extend(0..scratch.points.len());
-    float_face_tris_into(
-        &scratch.ring,
-        &scratch.points,
-        &mut scratch.coordinates,
-        &mut scratch.triangles,
-        &mut scratch.corners,
-    );
-    let mut best = scratch.triangles.first().copied().unwrap_or([0, 1, 2]);
+    let triangles = ngon_triangles(&scratch.points, NgonMethod::Clip);
+    let mut best = triangles.first().copied().unwrap_or([0, 1, 2]);
     let mut area_best = -1.0_f32;
-    for &triangle in &scratch.triangles {
+    for &triangle in &triangles {
         let p = triangle.map(|corner| scratch.points[corner]);
         let area = len_sq(cross(sub(p[0], p[1]), sub(p[1], p[2])));
         if area > area_best {

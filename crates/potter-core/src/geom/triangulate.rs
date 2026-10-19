@@ -327,7 +327,12 @@ fn triangulate_quad(corners: [Vec3; 4], method: QuadMethod) -> [[usize; 3]; 2] {
     ]
 }
 
-fn triangulate_ngon(corners: &[Vec3], normal: Vec3, method: NgonMethod) -> Vec<[usize; 3]> {
+/// `BLI_polyfill_calc` on an n-gon projected along `-normal`; `Beauty` also beautifies.
+pub(super) fn triangulate_ngon(
+    corners: &[Vec3],
+    normal: Vec3,
+    method: NgonMethod,
+) -> Vec<[usize; 3]> {
     let negated = [-normal[0], -normal[1], -normal[2]];
     let coords: Vec<Vec2> = corners
         .iter()

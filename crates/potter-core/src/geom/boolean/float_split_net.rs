@@ -54,8 +54,9 @@
 //!   (`bmesh_polygon_edgenet.cc:628-635`; `CustomData_bmesh_copy_block`, `customdata.cc:3716`). This is
 //!   [`CornerSource::Original`] with `i` such that `boundary[i] == v`.
 //! - Step 2: every other vertex `v` of the edge net gets `CustomData_bmesh_interp` over `f`'s loops with
-//!   `interp_weights_poly_v2` weights of `v` in `f`'s 2D frame (`bmesh_polygon_edgenet.cc:652-660`). The
-//!   first loop at `v` is interpolated and the others copy it (`:665`). This is
+//!   `interp_weights_poly_v2` weights of `v` in `f`'s 2D frame (`bmesh_polygon_edgenet.cc:652-660`). This
+//!   port computes those weights in `float.rs` (`FloatPolyInterpolator`). The first loop at `v` is
+//!   interpolated and the others copy it (`:665`). This is
 //!   [`CornerSource::Interpolated`], shared by all corners at `v`.
 //! - `CustomData_bmesh_interp` writes only layers whose type has an `interp` callback (`customdata.cc:3984`).
 //!   `INT8` (`:1869`), `INT16_2D` (`:1692`), `INT32_2D` (`:1877`) and `STRING` (`:1593`) have none, so an
@@ -87,6 +88,8 @@
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
+
+use super::float_connect::ortho_basis;
 
 type P2 = [f32; 2];
 type P3 = [f32; 3];
@@ -672,20 +675,6 @@ fn ring_matches(ring: &[usize], cand: &[usize]) -> bool {
         }
     }
     false
-}
-
-/// Blender `ortho_basis_v3v3_v3`: the two tangents of `n`, in the order used by `axis_dominant_v3_to_m3`.
-fn ortho_basis(n: P3) -> (P3, P3) {
-    let f = n[0] * n[0] + n[1] * n[1];
-    if f > f32::EPSILON {
-        let d = 1.0 / f.sqrt();
-        let n1 = [n[1] * d, -n[0] * d, 0.0];
-        let n2 = [-n[2] * n1[1], n[2] * n1[0], n[0] * n1[1] - n[1] * n1[0]];
-        (n1, n2)
-    } else {
-        let n1 = [if n[2] < 0.0 { -1.0 } else { 1.0 }, 0.0, 0.0];
-        (n1, [0.0, 1.0, 0.0])
-    }
 }
 
 /// Blender `mul_v2_m3v3` with `M = axis_dominant_v3_to_m3(n)`: the coordinates of `a` along the two

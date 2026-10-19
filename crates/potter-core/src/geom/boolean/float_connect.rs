@@ -937,7 +937,7 @@ fn axis_pt_cmp(a: P2, b: P2) -> Ordering {
 }
 
 /// Blender `ortho_basis_v3v3_v3`: the two tangents of `n`, in the order used by `axis_dominant_v3_to_m3`.
-fn ortho_basis(n: P3) -> (P3, P3) {
+pub(super) fn ortho_basis(n: P3) -> (P3, P3) {
     let f = n[0] * n[0] + n[1] * n[1];
     if f > f32::EPSILON {
         let d = 1.0 / f.sqrt();
