@@ -30,31 +30,27 @@ pub(crate) fn dielectric_f0(ior: f64, level: f64) -> f64 {
     (fresnel * 2.0 * level.max(0.0)).min(1.0)
 }
 
-/// Principled inputs that change Cycles' result but that Potter's lobe model does not evaluate, as
-/// `(feature_id, Blender input)` pairs.
+/// The Principled inputs that change Cycles' result but that Potter's lobe model does not evaluate,
+/// as `(feature_id, Blender input)` pairs in a fixed array, so checking a hit allocates nothing.
 pub(crate) fn unevaluated_principled_inputs(
     params: &BsdfParams,
-) -> Vec<(&'static str, &'static str)> {
-    let mut inputs = Vec::new();
-    if params.coat_weight > 0.0 {
-        inputs.push(("shader.principled.coat", "Coat Weight"));
-    }
-    if params.sheen_weight > 0.0 {
-        inputs.push(("shader.principled.sheen", "Sheen Weight"));
-    }
-    if params.subsurface_weight > 0.0 {
-        inputs.push(("shader.principled.subsurface", "Subsurface Weight"));
-    }
-    if params.anisotropic_ior > 0.0 {
-        inputs.push(("shader.principled.anisotropic", "Anisotropic"));
-    }
-    if params.thin_film_thickness > 0.0 {
-        inputs.push(("shader.principled.thin_film", "Thin Film Thickness"));
-    }
-    if params.transmission > 0.0 && params.roughness > 0.0 {
-        inputs.push(("shader.principled.transmission_ggx", "Transmission Weight"));
-    }
-    inputs
+) -> [Option<(&'static str, &'static str)>; 8] {
+    [
+        (params.coat_weight > 0.0).then_some(("shader.principled.coat", "Coat Weight")),
+        (params.sheen_weight > 0.0).then_some(("shader.principled.sheen", "Sheen Weight")),
+        (params.subsurface_weight > 0.0)
+            .then_some(("shader.principled.subsurface", "Subsurface Weight")),
+        (params.anisotropic_ior > 0.0).then_some(("shader.principled.anisotropic", "Anisotropic")),
+        (params.thin_film_thickness > 0.0)
+            .then_some(("shader.principled.thin_film", "Thin Film Thickness")),
+        (params.transmission > 0.0 && params.roughness > 0.0)
+            .then_some(("shader.principled.transmission_ggx", "Transmission Weight")),
+        (params.diffuse_roughness > 0.0)
+            .then_some(("shader.principled.diffuse_roughness", "Diffuse Roughness")),
+        params
+            .thin_wall
+            .then_some(("shader.principled.thin_wall", "Thin Wall")),
+    ]
 }
 
 /// Records `UNSUPPORTED_FEATURE` for each Principled input in `params` that Potter's lobe model
@@ -66,10 +62,14 @@ pub(crate) fn record_unevaluated_inputs(
     node: Option<&Id>,
     params: &BsdfParams,
 ) {
+    let inputs = unevaluated_principled_inputs(params);
+    if inputs.iter().all(Option::is_none) {
+        return;
+    }
     let Some(warnings) = warnings else {
         return;
     };
-    for (feature_id, input) in unevaluated_principled_inputs(params) {
+    for (feature_id, input) in inputs.into_iter().flatten() {
         let mut recorded = warnings.borrow_mut();
         let duplicate = recorded.iter().any(|warning| {
             warning["material"].as_str() == Some(material)
@@ -131,6 +131,12 @@ pub struct BsdfParams {
     pub anisotropic_rotation: f64,
     pub thin_film_thickness: f64,
     pub thin_film_ior: f64,
+    /// Oren-Nayar roughness of the diffuse lobe. Potter's diffuse lobe is Lambert, so a value above
+    /// zero is reported as unevaluated (Cycles `bsdf_oren_nayar_setup`).
+    pub diffuse_roughness: f64,
+    /// Thin Wall (Cycles' `thin_wall`): transmission through a thin sheet. Potter does not evaluate
+    /// it; it is reported as unevaluated.
+    pub thin_wall: bool,
     pub volume_density: f64,
     pub volume_color: [f64; 3],
     pub volume_anisotropy: f64,
@@ -168,6 +174,8 @@ impl BsdfParams {
             anisotropic_rotation: 0.0,
             thin_film_thickness: 0.0,
             thin_film_ior: 1.33,
+            diffuse_roughness: 0.0,
+            thin_wall: false,
             volume_density: material.volume_density.max(0.0),
             volume_color: material.volume_color,
             volume_anisotropy: material.volume_anisotropy.clamp(-0.999, 0.999),
@@ -223,6 +231,8 @@ impl BsdfParams {
             ),
             thin_film_thickness: mix_scalar(first.thin_film_thickness, second.thin_film_thickness),
             thin_film_ior: mix_scalar(first.thin_film_ior, second.thin_film_ior),
+            diffuse_roughness: mix_scalar(first.diffuse_roughness, second.diffuse_roughness),
+            thin_wall: first.thin_wall || second.thin_wall,
             volume_density: mix_scalar(first.volume_density, second.volume_density),
             volume_color: mix3(first.volume_color, second.volume_color),
             volume_anisotropy: mix_scalar(first.volume_anisotropy, second.volume_anisotropy),
@@ -269,6 +279,8 @@ impl BsdfParams {
             anisotropic_rotation: first.anisotropic_rotation,
             thin_film_thickness: first.thin_film_thickness.max(second.thin_film_thickness),
             thin_film_ior: first.thin_film_ior,
+            diffuse_roughness: first.diffuse_roughness.max(second.diffuse_roughness),
+            thin_wall: first.thin_wall || second.thin_wall,
             volume_density: first.volume_density + second.volume_density,
             volume_color: add3(first.volume_color, second.volume_color),
             volume_anisotropy: first.volume_anisotropy,
@@ -1176,6 +1188,8 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
         params.anisotropic_rotation = self.scalar_input(id, &["Anisotropic Rotation"], 0.0)?;
         params.thin_film_thickness = self.scalar_input(id, &["Thin Film Thickness"], 0.0)?;
         params.thin_film_ior = self.scalar_input(id, &["Thin Film IOR"], 1.33)?;
+        params.diffuse_roughness = self.scalar_input(id, &["Diffuse Roughness"], 0.0)?;
+        params.thin_wall = self.scalar_input(id, &["Thin Wall"], 0.0)? > 0.5;
         params.emission_color =
             self.color_input(id, &["Emission Color", "Emission"], [0.0, 0.0, 0.0, 1.0])?[..3]
                 .try_into()

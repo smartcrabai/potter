@@ -111,6 +111,20 @@ pub fn feature_catalog() -> Value {
             "Potter does not evaluate thin-film interference; a render with Thin Film Thickness above zero reports UNSUPPORTED_FEATURE.",
         ),
         unsupported(
+            "shader.principled.diffuse_roughness",
+            "Principled diffuse roughness",
+            "ShaderNodeBsdfPrincipled",
+            &["material.create", "material.update"],
+            "Potter's diffuse lobe is Lambert; Cycles' Oren-Nayar roughness is not evaluated, so a render with Diffuse Roughness above zero reports UNSUPPORTED_FEATURE.",
+        ),
+        unsupported(
+            "shader.principled.thin_wall",
+            "Principled thin wall",
+            "ShaderNodeBsdfPrincipled",
+            &["material.create", "material.update"],
+            "Potter does not evaluate Thin Wall; a render with Thin Wall enabled reports UNSUPPORTED_FEATURE.",
+        ),
+        unsupported(
             "shader.principled.transmission_ggx",
             "Principled rough transmission",
             "ShaderNodeBsdfPrincipled",
