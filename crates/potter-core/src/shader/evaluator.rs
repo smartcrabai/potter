@@ -683,28 +683,6 @@ fn apply_material_textures(
     Ok(())
 }
 
-/// Samples an image as Blender's Image Texture node does. `blender_uv` is the V-up coordinate of Blender's `Vector`. The
-/// sampler routes a UDIM tile from it and does the V flip into Potter's storage. Native material fields and Image Texture
-/// nodes both sample through here, so they agree at every edge. `alpha_linked` is whether the node's Alpha output is
-/// linked, which decides whether Cycles unassociates the colour.
-fn sample_image_texel(
-    image: &ImageData,
-    blender_uv: [f64; 2],
-    tile: u32,
-    interpolation: ImageInterpolation,
-    extension: ImageExtension,
-    alpha_linked: bool,
-) -> [f64; 4] {
-    sample_with_extension_alpha(
-        image,
-        blender_uv,
-        tile,
-        interpolation,
-        extension,
-        alpha_linked,
-    )
-}
-
 fn sample_material_texture(
     texture: &TextureRef,
     hit_ctx: &HitContext<'_>,
@@ -728,11 +706,11 @@ fn sample_material_texture(
     })?;
     // The field samples through the same path as an Image Texture node with the field's extension.
     let blender_uv = storage_to_blender_uv(layer_uv(hit_ctx, layer));
-    let tile = if image.tiles.is_empty() { 0 } else { 1001 };
-    let pixel = sample_image_texel(
+    let udim = !image.tiles.is_empty();
+    let pixel = sample_with_extension_alpha(
         image,
         blender_uv,
-        tile,
+        udim,
         texture.interpolation,
         texture.extension,
         alpha_linked,
@@ -1242,11 +1220,8 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
                 json!({"image_id":image_id,"node_id":id}),
             )
         })?;
-        let tile = ["tile", "image_user_tile", "udim_tile"]
-            .iter()
-            .find_map(|key| node.properties.get(*key).and_then(JsonValue::as_u64))
-            .and_then(|value| u32::try_from(value).ok())
-            .unwrap_or(if image.tiles.is_empty() { 0 } else { 1001 });
+        // A UDIM image routes its lookup from the UV; the node has no tile property (Cycles' kernel_image_udim_map).
+        let udim = !image.tiles.is_empty();
         let interpolation = match node
             .properties
             .get("interpolation")
@@ -1279,10 +1254,10 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
         // Cycles unassociates an Image Texture's colour only when its Alpha output still has a link after
         // dead nodes are removed, so the colour read depends on that link (see `linked_alpha_image_nodes`).
         let alpha_linked = self.alpha_linked_image(id);
-        let pixel = sample_image_texel(
+        let pixel = sample_with_extension_alpha(
             image,
             [uv.x, uv.y],
-            tile,
+            udim,
             interpolation,
             extension,
             alpha_linked,

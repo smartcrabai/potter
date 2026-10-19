@@ -826,35 +826,6 @@ fn pixel_in_bounds(width: u32, height: u32, x: u32, y: u32) -> bool {
     width != 0 && height != 0 && x < width && y < height
 }
 
-/// Cycles' equirectangular range for a panoramic camera's longitude and latitude limits, in radians
-/// (`intern/cycles/scene/camera.cpp`, `equirectangular_range`): `(longitude_min - longitude_max, -longitude_min,
-/// latitude_min - latitude_max, -latitude_min + π/2)`. The full sphere is `[-2π, π, -π, π]`.
-fn equirectangular_range(longitude: [f64; 2], latitude: [f64; 2]) -> [f64; 4] {
-    [
-        longitude[0] - longitude[1],
-        -longitude[0],
-        latitude[0] - latitude[1],
-        -latitude[0] + std::f64::consts::FRAC_PI_2,
-    ]
-}
-
-/// The camera-space direction of the equirectangular pixel at (u, v), where u and v are in [0, 1] and v runs bottom-up.
-/// Cycles' `equirectangular_range_to_direction` (`intern/cycles/kernel/camera/projection.h`) gives phi = range.x·u + range.y
-/// and theta = range.z·v + range.w, and `spherical_to_direction` (`intern/cycles/util/projection.h`) gives
-/// C = (sin θ cos φ, sin θ sin φ, cos θ). Blender's panorama camera matrix (`intern/cycles/blender/camera.cpp`,
-/// `blender_camera_matrix`) right-multiplies by M = [[0, −1, 0], [0, 0, 1], [−1, 0, 0]], so the direction in the camera's
-/// basis (X right, Y up, −Z forward) is B = M·C = (−sin θ sin φ, cos θ, −sin θ cos φ), with Y as the pole. Blender's
-/// renders agree (`tests/fixtures/panorama_camera`).
-fn equirectangular_range_direction(u: f64, v: f64, range: [f64; 4]) -> DVec3 {
-    let phi = range[0] * u + range[1];
-    let theta = range[2] * v + range[3];
-    DVec3::new(
-        -theta.sin() * phi.sin(),
-        theta.cos(),
-        -theta.sin() * phi.cos(),
-    )
-}
-
 fn camera_frame(camera: &Camera, width: u32, height: u32) -> Result<CameraFrame> {
     if width == 0 || height == 0 {
         return Err(PotError::invalid_argument(
@@ -1092,16 +1063,12 @@ fn ray_for_subpixel_in_frame(
             Ray { origin, direction }
         }
         ProjectionFrame::Panorama { fisheye: false } => {
-            let camera = equirectangular_range_direction(
-                f64::midpoint(ndc_x, 1.0),
-                f64::midpoint(ndc_y, 1.0),
-                equirectangular_range(
-                    [-std::f64::consts::PI, std::f64::consts::PI],
-                    [-std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2],
-                ),
-            );
+            let longitude = ndc_x * std::f64::consts::PI;
+            let latitude = ndc_y * std::f64::consts::FRAC_PI_2;
             let direction = safe_normalize(
-                frame.right * camera.x + frame.up * camera.y - frame.forward * camera.z,
+                frame.forward * (longitude.cos() * latitude.cos())
+                    + frame.right * (longitude.sin() * latitude.cos())
+                    + frame.up * latitude.sin(),
             )
             .ok_or_else(|| PotError::invalid_argument("panorama ray is out of range"))?;
             Ray { origin, direction }
@@ -2130,6 +2097,32 @@ mod smooth_shading_tests {
 #[cfg(test)]
 mod equirectangular_camera_tests {
     use super::*;
+
+    /// Cycles' equirectangular range for a panoramic camera's longitude and latitude limits, in radians
+    /// (`intern/cycles/scene/camera.cpp`, `equirectangular_range`): `(longitude_min - longitude_max, -longitude_min,
+    /// latitude_min - latitude_max, -latitude_min + π/2)`. The full sphere is `[-2π, π, -π, π]`. Potter's camera renders the
+    /// full sphere only, so this is the reference that a longitude and latitude range follow-up will implement.
+    fn equirectangular_range(longitude: [f64; 2], latitude: [f64; 2]) -> [f64; 4] {
+        [
+            longitude[0] - longitude[1],
+            -longitude[0],
+            latitude[0] - latitude[1],
+            -latitude[0] + std::f64::consts::FRAC_PI_2,
+        ]
+    }
+
+    /// The camera-space direction of the equirectangular pixel at (u, v), where u and v are in [0, 1] and v runs bottom-up.
+    /// Cycles' `equirectangular_range_to_direction` (`intern/cycles/kernel/camera/projection.h`) gives phi = range.x·u + range.y
+    /// and theta = range.z·v + range.w, and `spherical_to_direction` (`intern/cycles/util/projection.h`) gives
+    /// C = (sin θ cos φ, sin θ sin φ, cos θ). Blender's panorama camera matrix (`intern/cycles/blender/camera.cpp`,
+    /// `blender_camera_matrix`) right-multiplies by M = [[0, −1, 0], [0, 0, 1], [−1, 0, 0]], so the direction in the camera's
+    /// basis (X right, Y up, −Z forward) is B = M·C = (−sin θ sin φ, cos θ, −sin θ cos φ), with Y as the pole. Blender's
+    /// renders agree (`tests/fixtures/panorama_camera`).
+    fn equirectangular_range_direction(u: f64, v: f64, range: [f64; 4]) -> DVec3 {
+        let phi = range[0] * u + range[1];
+        let theta = range[2] * v + range[3];
+        DVec3::new(-theta.sin() * phi.sin(), theta.cos(), -theta.sin() * phi.cos())
+    }
 
     /// Blender 5.2.2's panorama camera rays (`tests/fixtures/panorama_camera/generate_panorama_camera_oracle.py`): a PANO
     /// EQUIRECTANGULAR camera with non-default longitude and latitude limits, rotated and translated, at 32 x 16 pixel

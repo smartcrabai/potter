@@ -276,7 +276,9 @@ impl WorldImportanceSampler {
         if direction == DVec3::ZERO {
             return 0.0;
         }
-        let [u, v] = equirectangular_uv(direction);
+        // The importance map's rows run top-down, as the image's storage does: row 0 is the zenith, as `sample` lays them out.
+        let [u, v_up] = equirectangular_uv(direction);
+        let v = 1.0 - v_up;
         let column = (u * f64::from(self.width)).floor() as usize;
         let row = (v * f64::from(self.height)).floor() as usize;
         let pixel_index = row

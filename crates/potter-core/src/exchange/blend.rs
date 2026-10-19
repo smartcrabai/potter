@@ -15180,8 +15180,7 @@ mod camera_import_tests {
     fn panorama(panorama_type: &str, longitude: (f64, f64), latitude: (f64, f64)) -> Value {
         json!({"name": "pano", "type": "PANO", "panorama_type": panorama_type,
                "longitude_min": longitude.0, "longitude_max": longitude.1,
-               "latitude_min": latitude.0, "latitude_max": latitude.1,
-               "fisheye_fov": 3.0, "fisheye_lens": 10.5})
+               "latitude_min": latitude.0, "latitude_max": latitude.1})
     }
 
     fn features(camera: &Value) -> Vec<String> {
@@ -15228,15 +15227,5 @@ mod camera_import_tests {
             (CameraProjection::Perspective, None)
         );
         assert_eq!(features(&equisolid), ["blender.camera.panorama_type"]);
-    }
-
-    #[test]
-    fn orthographic_cameras_are_not_panoramas() {
-        let camera = json!({"name": "ortho", "type": "ORTHO"});
-        assert_eq!(
-            imported_camera_projection(&camera),
-            (CameraProjection::Orthographic, None)
-        );
-        assert_eq!(features(&camera), Vec::<String>::new());
     }
 }

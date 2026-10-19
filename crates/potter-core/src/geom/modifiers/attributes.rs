@@ -183,11 +183,11 @@ fn texture_mask_weights(
         // Blender's intensity is the mean of the stored RGB, read with colour management off. The colour channels
         // come from the decoded sample (`BKE_texture_get_value`, `MOD_weightvg_util.cc`).
         let weight = if channel == "INT" {
-            let encoded = crate::image::sample_encoded(image, texture_uv.to_array(), 0);
+            let encoded = crate::image::sample_encoded(image, texture_uv.to_array(), false);
             (encoded[0] + encoded[1] + encoded[2]) / 3.0
         } else {
             texture_channel(
-                crate::image::sample(image, texture_uv.to_array(), 0),
+                crate::image::sample(image, texture_uv.to_array(), false),
                 channel,
             )
         };

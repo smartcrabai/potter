@@ -1,5 +1,5 @@
 """Blender 5.2.2's environment-texture colour around the equirectangular u = 0 seam and the poles, as the oracle for Potter's
-world reader (shader/world.rs, sample_with_interpolation).
+world reader (shader/world.rs, environment_colour).
 
 Regenerate from this directory with Blender 5.2.2, one thread, one run per case:
 
