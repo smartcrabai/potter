@@ -2282,16 +2282,19 @@ def dump_all():
                          "panorama_type": x.panorama_type, "longitude_min": float(x.longitude_min),
                          "longitude_max": float(x.longitude_max), "latitude_min": float(x.latitude_min),
                          "latitude_max": float(x.latitude_max),
+                         "fisheye_fov": float(x.fisheye_fov), "fisheye_lens": float(x.fisheye_lens),
                          "fake_user": bool(x.use_fake_user), "users": int(x.users)} for x in bpy.data.cameras],
             "lights": [{"name": x.name_full, "potter_id": x.get("potter.id"),
                         "library": library_reference(x), "type": x.type,
                         "color": plain(x.color), "energy": float(x.energy), "shadow_soft_size": float(x.shadow_soft_size),
                         "soft_falloff": bool(getattr(x, "use_soft_falloff", True)),
+                        "use_multiple_importance_sampling": bool(x.cycles.use_multiple_importance_sampling),
                         "spot_size": float(getattr(x, "spot_size", math.pi / 4)),
                         "spot_blend": float(getattr(x, "spot_blend", 0.15)),
                         "shape": getattr(x, "shape", None), "custom_properties": custom_props(x),
                         "size": float(getattr(x, "size", 0.25)),
                         "size_y": float(getattr(x, "size_y", 0.25)),
+                        "spread": float(getattr(x, "spread", math.pi)),
                         "fake_user": bool(x.use_fake_user), "users": int(x.users)} for x in bpy.data.lights],
             "actions": [action_dump(x) for x in bpy.data.actions],
             "texts": [{"name": x.name_full, "potter_id": x.get("potter.id"),
@@ -6648,6 +6651,9 @@ def export_doc(doc, target, pack, scene_hash, context):
             raw = item.get("camera") or {}
             source = compatibility_block(doc, "cameras", "Camera", data_id)
             camera = bpy.data.cameras.new(compatibility_name(doc, "Camera", data_id, data_id))
+            # Blender stores `lens` and every panorama setting on every camera, and Potter keeps them all, so each is written
+            # from Potter's camera data whatever the projection: a setting the projection ignores still round-trips. The camera
+            # type alone picks the projection that Blender draws.
             camera.lens = raw.get("lens_mm", 50.0)
             camera.sensor_width = raw.get("sensor_width_mm", 36.0)
             camera.sensor_height = raw.get("sensor_height_mm", 24.0)
@@ -6656,11 +6662,18 @@ def export_doc(doc, target, pack, scene_hash, context):
             camera.clip_start = raw.get("clip_start", 0.1)
             camera.clip_end = raw.get("clip_end", 1000.0)
             camera.shift_x, camera.shift_y = raw.get("shift", [0.0, 0.0])
-            if raw.get("projection") == "orthographic":
-                camera.type = "ORTHO"
-            elif raw.get("projection") == "panorama" and raw.get("panorama_type", "equirectangular") == "equirectangular":
-                camera.type = "PANO"
-                camera.panorama_type = "EQUIRECTANGULAR"
+            camera.panorama_type = {
+                "equirectangular": "EQUIRECTANGULAR",
+                "fisheye_equidistant": "FISHEYE_EQUIDISTANT",
+                "fisheye_equisolid": "FISHEYE_EQUISOLID",
+            }[raw.get("panorama_type", "equirectangular")]
+            camera.longitude_min = raw.get("longitude_min", -math.pi)
+            camera.longitude_max = raw.get("longitude_max", math.pi)
+            camera.latitude_min = raw.get("latitude_min", -0.5 * math.pi)
+            camera.latitude_max = raw.get("latitude_max", 0.5 * math.pi)
+            camera.fisheye_fov = raw.get("fisheye_fov", math.pi)
+            camera.fisheye_lens = raw.get("fisheye_lens", 10.5)
+            camera.type = {"orthographic": "ORTHO", "panorama": "PANO"}.get(raw.get("projection"), "PERSP")
             set_id(camera, data_id)
             set_props(camera, source.get("custom_properties", {}))
             if source.get("fake_user"):
@@ -6683,6 +6696,8 @@ def export_doc(doc, target, pack, scene_hash, context):
             if raw.get("light_type") == "spot":
                 light.spot_size = raw.get("spot_size", math.pi / 4)
                 light.spot_blend = raw.get("spot_blend", 0.15)
+            light.cycles.use_multiple_importance_sampling = bool(
+                raw.get("use_multiple_importance_sampling", True))
             set_id(light, data_id)
             set_props(light, source.get("custom_properties", {}))
             if source.get("fake_user"):
