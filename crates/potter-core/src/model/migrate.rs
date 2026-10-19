@@ -1231,9 +1231,9 @@ mod tests {
     }
 
     #[test]
-    fn current_schema_four_scenes_pass_through_untouched() {
+    fn current_schema_five_scenes_pass_through_untouched() {
         let mut scene = json!({
-            "schema_version": 4,
+            "schema_version": 5,
             "materials": {"m1": {"base_color_texture": {"image": "img", "uv_layer": "Light"}}}
         });
         let before = scene.clone();
