@@ -7284,6 +7284,21 @@ pub(crate) fn export_losses(doc: &SceneDoc) -> Vec<Loss> {
             ));
         }
     }
+    for (data_id, data) in &doc.data_blocks {
+        let Some(camera) = &data.camera else {
+            continue;
+        };
+        if camera.projection == CameraProjection::Fisheye
+            || (camera.projection == CameraProjection::Panorama
+                && camera.panorama_type == "fisheye_equidistant")
+        {
+            losses.push(loss(
+                "blender.camera.fisheye",
+                Some(data_id.as_str()),
+                "Potter's fisheye projection has no Blender camera type verified to match it; the camera exports as a perspective camera",
+            ));
+        }
+    }
     for (id, node) in &doc.nodes {
         if !matches!(
             node.kind.as_str(),

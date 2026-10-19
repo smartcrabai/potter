@@ -6164,6 +6164,9 @@ def export_doc(doc, target, pack, scene_hash, context):
             camera.shift_x, camera.shift_y = raw.get("shift", [0.0, 0.0])
             if raw.get("projection") == "orthographic":
                 camera.type = "ORTHO"
+            elif raw.get("projection") == "panorama" and raw.get("panorama_type", "equirectangular") == "equirectangular":
+                camera.type = "PANO"
+                camera.panorama_type = "EQUIRECTANGULAR"
             set_id(camera, data_id)
             set_props(camera, source.get("custom_properties", {}))
             if source.get("fake_user"):
