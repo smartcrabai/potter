@@ -51,6 +51,11 @@ fn create_camera(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Res
             "clip_end",
             "shift",
             "panorama_type",
+            "longitude_min",
+            "longitude_max",
+            "latitude_min",
+            "latitude_max",
+            "fisheye_fov",
             "dof_enabled",
             "focus_distance",
             "f_stop",
@@ -76,6 +81,11 @@ fn create_camera(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Res
             "clip_end",
             "shift",
             "panorama_type",
+            "longitude_min",
+            "longitude_max",
+            "latitude_min",
+            "latitude_max",
+            "fisheye_fov",
             "dof_enabled",
             "focus_distance",
             "f_stop",
@@ -148,6 +158,11 @@ fn apply_camera_values(
             "clip_end",
             "shift",
             "panorama_type",
+            "longitude_min",
+            "longitude_max",
+            "latitude_min",
+            "latitude_max",
+            "fisheye_fov",
             "dof_enabled",
             "focus_distance",
             "f_stop",
@@ -211,17 +226,85 @@ fn apply_camera_values(
     }
     if let Some(value) = values.get("panorama_type") {
         camera.panorama_type = match value.as_str() {
-            Some("equirectangular" | "fisheye_equidistant") => {
+            Some("equirectangular" | "fisheye_equidistant" | "fisheye_equisolid") => {
                 value.as_str().unwrap_or_default().to_owned()
             }
             _ => {
                 return Err(engine.error(
                     ErrorCode::InvalidOperation,
-                    "panorama_type must be equirectangular or fisheye_equidistant",
+                    "panorama_type must be equirectangular, fisheye_equidistant, or fisheye_equisolid",
                     &operation_pointer(engine.operation_index, &format!("{prefix}panorama_type")),
                 ));
             }
         };
+    }
+    for (field, destination) in [
+        ("longitude_min", &mut camera.longitude_min),
+        ("longitude_max", &mut camera.longitude_max),
+        ("latitude_min", &mut camera.latitude_min),
+        ("latitude_max", &mut camera.latitude_max),
+        ("fisheye_fov", &mut camera.fisheye_fov),
+    ] {
+        if let Some(value) = values.get(field) {
+            *destination = super::finite_number(
+                engine,
+                Some(value),
+                &format!("{prefix}{field}"),
+                super::FiniteNumberMessage::Field,
+            )?;
+        }
+    }
+    // The panorama limits apply to equirectangular cameras and the field of view to fisheye ones. A setting that
+    // the camera's projection would ignore is refused, not stored.
+    let equirectangular = camera.projection == CameraProjection::Panorama
+        && camera.panorama_type == "equirectangular";
+    let fisheye = camera.projection == CameraProjection::Fisheye
+        || (camera.projection == CameraProjection::Panorama && !equirectangular);
+    for field in ["longitude_min", "longitude_max", "latitude_min", "latitude_max"] {
+        if values.contains_key(field) && !equirectangular {
+            return Err(engine.error(
+                ErrorCode::InvalidOperation,
+                format!("{field} applies only to equirectangular panorama cameras"),
+                &operation_pointer(engine.operation_index, &format!("{prefix}{field}")),
+            ));
+        }
+    }
+    if values.contains_key("fisheye_fov") && !fisheye {
+        return Err(engine.error(
+            ErrorCode::InvalidOperation,
+            "fisheye_fov applies only to fisheye cameras",
+            &operation_pointer(engine.operation_index, &format!("{prefix}fisheye_fov")),
+        ));
+    }
+    if !(camera.fisheye_fov >= crate::model::FISHEYE_FOV_MIN
+        && camera.fisheye_fov <= std::f64::consts::TAU)
+    {
+        return Err(engine.error(
+            ErrorCode::InvalidOperation,
+            "fisheye_fov must be between 0.1745 and 2π radians",
+            &operation_pointer(engine.operation_index, &format!("{prefix}fisheye_fov")),
+        ));
+    }
+    if equirectangular {
+        if !(camera.longitude_max > camera.longitude_min
+            && camera.longitude_max - camera.longitude_min <= std::f64::consts::TAU)
+        {
+            return Err(engine.error(
+                ErrorCode::InvalidOperation,
+                "longitude_max must exceed longitude_min by at most 2π",
+                &operation_pointer(engine.operation_index, &format!("{prefix}longitude_max")),
+            ));
+        }
+        if !(camera.latitude_max > camera.latitude_min
+            && camera.latitude_min >= -std::f64::consts::FRAC_PI_2
+            && camera.latitude_max <= std::f64::consts::FRAC_PI_2)
+        {
+            return Err(engine.error(
+                ErrorCode::InvalidOperation,
+                "latitude_max must exceed latitude_min, and both lie within ±π/2",
+                &operation_pointer(engine.operation_index, &format!("{prefix}latitude_max")),
+            ));
+        }
     }
     if let Some(value) = values.get("dof_enabled") {
         camera.dof_enabled = value.as_bool().ok_or_else(|| {

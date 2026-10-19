@@ -1546,6 +1546,11 @@ fn operation_contract(name: &str) -> OperationContract {
                 "clip_end",
                 "shift",
                 "panorama_type",
+                "longitude_min",
+                "longitude_max",
+                "latitude_min",
+                "latitude_max",
+                "fisheye_fov",
                 "dof_enabled",
                 "focus_distance",
                 "f_stop",
@@ -2000,7 +2005,14 @@ fn field_schema(operation: &str, field: &str) -> Value {
     if ["camera.create", "camera.update"].contains(&operation) {
         return match field {
             "projection" => json!({"enum":["perspective","orthographic","panorama","fisheye"]}),
-            "panorama_type" => json!({"enum":["equirectangular","fisheye_equidistant"]}),
+            "panorama_type" => json!({"enum":["equirectangular","fisheye_equidistant","fisheye_equisolid"]}),
+            "longitude_min" | "longitude_max" => json!({"type":"number"}),
+            "latitude_min" | "latitude_max" => {
+                json!({"type":"number","minimum":-std::f64::consts::FRAC_PI_2,"maximum":std::f64::consts::FRAC_PI_2})
+            }
+            "fisheye_fov" => {
+                json!({"type":"number","minimum":crate::model::FISHEYE_FOV_MIN,"maximum":std::f64::consts::TAU})
+            }
             "stereo_mode" => json!({"enum":["none","side_by_side","anaglyph"]}),
             "dof_enabled" => json!({"type":"boolean"}),
             "focus_distance" | "f_stop" | "interocular_distance" => {
@@ -2494,7 +2506,12 @@ fn camera_set_properties() -> Value {
         "clip_start":{"type":"number","exclusiveMinimum":0},
         "clip_end":{"type":"number","exclusiveMinimum":0},
         "shift":vec_schema(2),
-        "panorama_type":{"enum":["equirectangular","fisheye_equidistant"]},
+        "panorama_type":{"enum":["equirectangular","fisheye_equidistant","fisheye_equisolid"]},
+        "longitude_min":{"type":"number"},
+        "longitude_max":{"type":"number"},
+        "latitude_min":{"type":"number","minimum":-std::f64::consts::FRAC_PI_2,"maximum":std::f64::consts::FRAC_PI_2},
+        "latitude_max":{"type":"number","minimum":-std::f64::consts::FRAC_PI_2,"maximum":std::f64::consts::FRAC_PI_2},
+        "fisheye_fov":{"type":"number","minimum":crate::model::FISHEYE_FOV_MIN,"maximum":std::f64::consts::TAU},
         "dof_enabled":{"type":"boolean"},
         "focus_distance":{"type":"number","exclusiveMinimum":0},
         "f_stop":{"type":"number","exclusiveMinimum":0},

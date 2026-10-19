@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::{
     color::ColorManagement,
     error::{ErrorCode, PotError, Result},
+    float::equal_f64,
     geom::{
         Mesh, lattice::LatticeData, metaball::MetaballData, pointcloud::PointCloudData,
         volume::VolumeData,
@@ -1213,6 +1214,36 @@ pub enum CameraProjection {
     Fisheye,
 }
 
+/// Blender's panorama limits and fisheye field of view are float32 defaults (`rna_camera.cc`, `M_PI_F`). They are kept as
+/// those float32 values widened to f64, so a camera imported at Blender's defaults equals them and is omitted from the scene.
+fn blender_pi() -> f64 {
+    f64::from(std::f32::consts::PI)
+}
+
+/// Blender's lower limit on the fisheye field of view, 10 degrees (`rna_camera.cc`). Blender clamps a smaller value, so
+/// Potter refuses one rather than store a field of view that its Blender camera would not keep.
+pub const FISHEYE_FOV_MIN: f64 = 0.1745;
+
+fn is_default_longitude_min(value: &f64) -> bool {
+    equal_f64(*value, -blender_pi())
+}
+
+fn is_default_longitude_max(value: &f64) -> bool {
+    equal_f64(*value, blender_pi())
+}
+
+fn is_default_latitude_min(value: &f64) -> bool {
+    equal_f64(*value, -0.5 * blender_pi())
+}
+
+fn is_default_latitude_max(value: &f64) -> bool {
+    equal_f64(*value, 0.5 * blender_pi())
+}
+
+fn is_default_fisheye_fov(value: &f64) -> bool {
+    equal_f64(*value, blender_pi())
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CameraData {
@@ -1226,6 +1257,18 @@ pub struct CameraData {
     pub clip_end: f64,
     pub shift: [f64; 2],
     pub panorama_type: String,
+    /// Blender's equirectangular longitude and latitude limits, in radians; the full sphere by default.
+    #[serde(skip_serializing_if = "is_default_longitude_min")]
+    pub longitude_min: f64,
+    #[serde(skip_serializing_if = "is_default_longitude_max")]
+    pub longitude_max: f64,
+    #[serde(skip_serializing_if = "is_default_latitude_min")]
+    pub latitude_min: f64,
+    #[serde(skip_serializing_if = "is_default_latitude_max")]
+    pub latitude_max: f64,
+    /// The fisheye field of view in radians, for the fisheye projections; Blender's default is 180 degrees.
+    #[serde(skip_serializing_if = "is_default_fisheye_fov")]
+    pub fisheye_fov: f64,
     pub dof_enabled: bool,
     pub focus_distance: f64,
     pub f_stop: f64,
@@ -1247,6 +1290,11 @@ impl Default for CameraData {
             clip_end: 1000.0,
             shift: [0.0, 0.0],
             panorama_type: "equirectangular".to_owned(),
+            longitude_min: -blender_pi(),
+            longitude_max: blender_pi(),
+            latitude_min: -0.5 * blender_pi(),
+            latitude_max: 0.5 * blender_pi(),
+            fisheye_fov: blender_pi(),
             dof_enabled: false,
             focus_distance: 10.0,
             f_stop: 2.8,
