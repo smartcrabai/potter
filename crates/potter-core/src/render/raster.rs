@@ -403,6 +403,9 @@ pub(crate) fn rasterize_with_samples(
     })?;
     let frame = camera_frame(camera, width, height)?;
     let prepared = prepare_triangles(triangles)?;
+    let visibility = super::bvh::Bvh::build_from_positions(
+        prepared.iter().map(|triangle| triangle.source.positions),
+    )?;
     let ao_bvh = if matches!(mode, Mode::Solid | Mode::Beauty | Mode::Wire) && !triangles.is_empty()
     {
         Some(super::bvh::Bvh::build(triangles)?)
@@ -435,10 +438,18 @@ pub(crate) fn rasterize_with_samples(
         )
     })?;
 
+    let mut candidates = Vec::new();
     for y in 0..height {
         for x in 0..width {
             let center_ray = ray_for_pixel_in_frame(&frame, camera.position, width, height, x, y)?;
-            let center_hit = nearest_visible_hit(&prepared, center_ray, &frame, shader)?;
+            let center_hit = nearest_visible_hit(
+                &prepared,
+                &visibility,
+                &mut candidates,
+                center_ray,
+                &frame,
+                shader,
+            )?;
             let pixel_index = usize::try_from(y)
                 .ok()
                 .and_then(|row| row.checked_mul(width_usize))
@@ -494,7 +505,17 @@ pub(crate) fn rasterize_with_samples(
                             sample_x,
                             sample_y,
                         )?;
-                        (ray, nearest_visible_hit(&prepared, ray, &frame, shader)?)
+                        (
+                            ray,
+                            nearest_visible_hit(
+                                &prepared,
+                                &visibility,
+                                &mut candidates,
+                                ray,
+                                &frame,
+                                shader,
+                            )?,
+                        )
                     };
                     let sample_color = if matches!(mode, Mode::Wire) {
                         sample_hit.map_or(background_linear, |visible_hit| {
@@ -513,6 +534,7 @@ pub(crate) fn rasterize_with_samples(
                         } else {
                             composite_sample(
                                 &prepared,
+                                &visibility,
                                 sample_ray,
                                 &frame,
                                 background_linear,
@@ -1200,15 +1222,20 @@ fn hit_color(
 
 fn nearest_visible_hit(
     triangles: &[PreparedTriangle],
+    visibility: &super::bvh::Bvh,
+    candidates: &mut Vec<usize>,
     ray: Ray,
     frame: &CameraFrame,
     shader: Option<&dyn SurfaceShader>,
 ) -> Result<Option<VisibleHit>> {
     let mut cursor = None;
     loop {
+        // Only triangles whose bounds the ray crosses can hit it. The nearest is the least
+        // (depth, index) pair, so the order of the candidates does not matter.
+        visibility.overlapping(ray.origin, ray.direction, candidates);
         let mut nearest: Option<(usize, Hit)> = None;
-        for (triangle_index, triangle) in triangles.iter().enumerate() {
-            let Some(hit) = intersect_triangle(triangle, ray, frame) else {
+        for &triangle_index in candidates.iter() {
+            let Some(hit) = intersect_triangle(&triangles[triangle_index], ray, frame) else {
                 continue;
             };
             if cursor.is_some_and(|(depth, index)| {
@@ -1241,6 +1268,7 @@ fn nearest_visible_hit(
 
 fn composite_sample(
     triangles: &[PreparedTriangle],
+    visibility: &super::bvh::Bvh,
     ray: Ray,
     frame: &CameraFrame,
     background: [f64; 4],
@@ -1250,7 +1278,12 @@ fn composite_sample(
     const MAX_ALPHA_LAYERS: usize = 16;
     let mut hits: [Option<VisibleHit>; MAX_ALPHA_LAYERS] = [None; MAX_ALPHA_LAYERS];
     let mut hit_count = 0;
-    for (triangle_index, triangle) in triangles.iter().enumerate() {
+    let mut candidates = Vec::new();
+    visibility.overlapping(ray.origin, ray.direction, &mut candidates);
+    // Equal depths keep the first layer inserted, so visit the candidates in triangle order.
+    candidates.sort_unstable();
+    for &triangle_index in &candidates {
+        let triangle = &triangles[triangle_index];
         let Some(hit) = intersect_triangle(triangle, ray, frame) else {
             continue;
         };
@@ -2090,6 +2123,131 @@ mod smooth_shading_tests {
         assert_eq!(
             super::smooth_shadow_origin(&flat, centre, [1.0 / 3.0; 3]),
             centre
+        );
+    }
+}
+
+#[cfg(test)]
+mod visibility_tests {
+    #![expect(clippy::expect_used, reason = "small raster fixtures")]
+
+    use glam::DVec3;
+
+    use super::{
+        AlphaMode, Camera, CameraFrame, Hit, PreparedTriangle, Projection, Ray, StereoMode,
+        Triangle, camera_frame, intersect_triangle, nearest_visible_hit, prepare_triangles,
+        ray_for_pixel_in_frame,
+    };
+    use crate::float::equal_f64;
+    use crate::render::bvh::Bvh;
+
+    const SIZE: u32 = 48;
+    const GRID: usize = 10;
+
+    fn corner(i: usize, j: usize) -> DVec3 {
+        let x = i as f64 / GRID as f64 * 2.0 - 1.0;
+        let y = j as f64 / GRID as f64 * 2.0 - 1.0;
+        let z = 0.1 * ((i * 7 + j * 5) % 4) as f64;
+        DVec3::new(x, y, z)
+    }
+
+    fn triangle(positions: [DVec3; 3]) -> Triangle {
+        Triangle {
+            positions,
+            object_index: 1,
+            element_index: 1,
+            color: [0.5, 0.5, 0.5, 1.0],
+            alpha_mode: AlphaMode::Opaque,
+            alpha_threshold: 0.5,
+            double_sided: true,
+            material_index: 0,
+            uv: [[0.0; 2]; 3],
+            layer_uvs: Vec::new(),
+            normals: None,
+            layer_colors: Vec::new(),
+            lit_per_pixel: false,
+        }
+    }
+
+    /// A bumpy grid whose every triangle appears twice, so each hit ties on depth and the lowest
+    /// index must win.
+    fn tied_grid() -> Vec<Triangle> {
+        let mut triangles = Vec::new();
+        for i in 0..GRID {
+            for j in 0..GRID {
+                let a = corner(i, j);
+                let b = corner(i + 1, j);
+                let c = corner(i, j + 1);
+                let d = corner(i + 1, j + 1);
+                triangles.push(triangle([a, b, c]));
+                triangles.push(triangle([b, d, c]));
+            }
+        }
+        let copies = triangles.clone();
+        triangles.extend(copies);
+        triangles
+    }
+
+    /// The reference: every prepared triangle, least (depth, index) hit.
+    fn scan_nearest(
+        triangles: &[PreparedTriangle],
+        ray: Ray,
+        frame: &CameraFrame,
+    ) -> Option<(usize, f64)> {
+        let mut nearest: Option<(usize, Hit)> = None;
+        for (index, triangle) in triangles.iter().enumerate() {
+            let Some(hit) = intersect_triangle(triangle, ray, frame) else {
+                continue;
+            };
+            if nearest.is_none_or(|(best, best_hit)| {
+                hit.depth < best_hit.depth || (equal_f64(hit.depth, best_hit.depth) && index < best)
+            }) {
+                nearest = Some((index, hit));
+            }
+        }
+        nearest.map(|(index, hit)| (index, hit.depth))
+    }
+
+    #[test]
+    fn bounded_nearest_hit_matches_a_scan_of_every_triangle() {
+        let prepared = prepare_triangles(&tied_grid()).expect("grid prepares");
+        let visibility =
+            Bvh::build_from_positions(prepared.iter().map(|triangle| triangle.source.positions))
+                .expect("visibility BVH builds");
+        let camera = Camera {
+            position: DVec3::new(0.0, 0.0, 5.0),
+            target: DVec3::ZERO,
+            up: DVec3::Y,
+            near: 0.1,
+            far: 100.0,
+            projection: Projection::Perspective {
+                lens_mm: 50.0,
+                sensor_width_mm: 36.0,
+            },
+            shift: [0.0; 2],
+            depth_of_field: None,
+            stereo_mode: StereoMode::None,
+            interocular_distance: 0.065,
+        };
+        let frame = camera_frame(&camera, SIZE, SIZE).expect("frame");
+        let mut candidates = Vec::new();
+        let mut hit_pixels = 0_usize;
+        for y in 0..SIZE {
+            for x in 0..SIZE {
+                let ray = ray_for_pixel_in_frame(&frame, camera.position, SIZE, SIZE, x, y)
+                    .expect("pixel ray");
+                let expected = scan_nearest(&prepared, ray, &frame);
+                let actual =
+                    nearest_visible_hit(&prepared, &visibility, &mut candidates, ray, &frame, None)
+                        .expect("visibility resolves")
+                        .map(|visible| (visible.triangle_index, visible.hit.depth));
+                assert_eq!(actual, expected, "pixel ({x}, {y})");
+                hit_pixels += usize::from(expected.is_some());
+            }
+        }
+        assert!(
+            hit_pixels > (SIZE * SIZE / 2) as usize,
+            "grid covers the view"
         );
     }
 }
