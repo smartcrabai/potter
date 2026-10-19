@@ -6014,7 +6014,7 @@ def _pack_image(image, channels):
         os.remove(path)
 
 
-def _pack_udim_image(name, colorspace, udim, record_alpha_mode):
+def _pack_udim_image(colorspace, udim, record_alpha_mode):
     # Every tile is a file that the loader groups by its tile token into one TILED image; packing that image stores
     # every tile. A PNG set packs each tile's original bytes (PR9: the byte path Blender samples for 8-bit PNG); a set
     # with any other tile packs each tile as the float EXR that `_pack_image` writes.
@@ -6227,7 +6227,7 @@ def export_doc(doc, target, pack, scene_hash, context):
             image.name = item["name"]
         elif udim:
             # A UDIM image packs every listed tile, the base tile 1001 included, into one TILED image.
-            image = _pack_udim_image(item["name"], colorspace, udim, item.get("alpha_mode", "straight"))
+            image = _pack_udim_image(colorspace, udim, item.get("alpha_mode", "straight"))
             image.name = item["name"]
         elif sidecar is None and png_bytes is not None:
             # An 8-bit PNG loads from its own file bytes, as the fixture's texture does: source FILE, packed PNG.
