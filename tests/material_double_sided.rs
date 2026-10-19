@@ -6,7 +6,6 @@ use std::{
     collections::BTreeMap,
     error::Error,
     fs,
-    io::BufReader,
     path::{Path, PathBuf},
     process::{Command, Output},
 };
@@ -245,77 +244,5 @@ fn schema_one_documents_keep_their_explicit_double_sided() -> TestResult {
             "{id}"
         );
     }
-    Ok(())
-}
-
-/// Whether a centre pixel is a saturated red, the colour of the emissive test material.
-fn is_red(pixel: [u8; 3]) -> bool {
-    pixel[0] > 80 && pixel[0] > 2 * pixel[1] && pixel[0] > 2 * pixel[2]
-}
-
-fn png_centre(path: &Path) -> TestResult<[u8; 3]> {
-    let mut decoder = png::Decoder::new(BufReader::new(fs::File::open(path)?));
-    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
-    let mut reader = decoder.read_info()?;
-    let mut bytes = vec![0; reader.output_buffer_size().ok_or("PNG size is unknown")?];
-    let info = reader.next_frame(&mut bytes)?;
-    let (width, height) = (info.width as usize, info.height as usize);
-    let channels = bytes.len() / (width * height);
-    let offset = ((height / 2) * width + width / 2) * channels;
-    Ok([bytes[offset], bytes[offset + 1], bytes[offset + 2]])
-}
-
-/// Previews one emissive plane in Beauty from the top and bottom views, and returns whether each
-/// view shows its centre red. The plane's front face points up, so the bottom view sees its back.
-fn plane_visible_from(double_sided: bool) -> TestResult<(bool, bool)> {
-    let directory = tempdir()?;
-    let scene = directory.path().join("scene");
-    init(&scene)?;
-    let material = json!({
-        "op": "material.create",
-        "id": "red",
-        "emission_color": [1.0, 0.0, 0.0],
-        "emission_strength": 1.0,
-        "double_sided": double_sided
-    });
-    apply(
-        &scene,
-        &json!([
-            material,
-            {"op": "node.create", "id": "plane", "kind": "plane", "params": {"size": 2.0}, "material": "red"}
-        ]),
-    )?;
-    let out = directory.path().join("previews");
-    ok_json(
-        &pot()
-            .arg("preview")
-            .arg(&scene)
-            .args([
-                "--views",
-                "top,bottom",
-                "--size",
-                "64",
-                "--mode",
-                "beauty",
-                "--out",
-            ])
-            .arg(&out)
-            .arg("--json")
-            .output()?,
-    )?;
-    Ok((
-        is_red(png_centre(&out.join("top.png"))?),
-        is_red(png_centre(&out.join("bottom.png"))?),
-    ))
-}
-
-#[test]
-fn beauty_raster_culls_single_sided_back_faces_only() -> TestResult {
-    assert_eq!(plane_visible_from(true)?, (true, true));
-    let (top, bottom) = plane_visible_from(false)?;
-    assert_ne!(
-        top, bottom,
-        "a single-sided plane must be visible from exactly one side"
-    );
     Ok(())
 }

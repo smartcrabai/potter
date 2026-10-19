@@ -22,18 +22,15 @@ use std::{
 };
 
 use blender_checked::blender_executable;
-use serde_json::{Value, json};
+use serde_json::Value;
 use tempfile::tempdir;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
-/// Exchange formats with the file name Blender writes for each.
-const FORMATS: [(&str, &str); 4] = [
-    ("glb", "box.glb"),
-    ("obj", "box.obj"),
-    ("usda", "box.usda"),
-    ("fbx", "box.fbx"),
-];
+/// Exchange formats with the file name Blender writes for each. FBX is not checked: Blender's FBX
+/// exporter writes binary FBX, which Potter's importer rejects (`format.fbx_binary`), so Potter
+/// cannot read Blender's FBX output. FBX round trips are covered by `material_double_sided.rs`.
+const FORMATS: [(&str, &str); 3] = [("glb", "box.glb"), ("obj", "box.obj"), ("usda", "box.usda")];
 /// `double`: Blender's default material. `single`: `use_backface_culling` on.
 const VARIANTS: [&str; 2] = ["double", "single"];
 
@@ -47,7 +44,7 @@ import sys
 import bpy
 
 out_dir, out_path = sys.argv[sys.argv.index("--") + 1 :][:2]
-FILES = {"glb": "box.glb", "obj": "box.obj", "usda": "box.usda", "fbx": "box.fbx"}
+FILES = {"glb": "box.glb", "obj": "box.obj", "usda": "box.usda"}
 
 
 def exporter(fmt, path):
@@ -55,10 +52,8 @@ def exporter(fmt, path):
         bpy.ops.export_scene.gltf(filepath=path, export_format="GLB")
     elif fmt == "obj":
         bpy.ops.wm.obj_export(filepath=path)
-    elif fmt == "usda":
-        bpy.ops.wm.usd_export(filepath=path)
     else:
-        bpy.ops.export_scene.fbx(filepath=path)
+        bpy.ops.wm.usd_export(filepath=path)
 
 
 def importer(fmt, path):
@@ -66,10 +61,8 @@ def importer(fmt, path):
         bpy.ops.import_scene.gltf(filepath=path)
     elif fmt == "obj":
         bpy.ops.wm.obj_import(filepath=path)
-    elif fmt == "usda":
-        bpy.ops.wm.usd_import(filepath=path)
     else:
-        bpy.ops.import_scene.fbx(filepath=path)
+        bpy.ops.wm.usd_import(filepath=path)
 
 
 def build(single_sided):

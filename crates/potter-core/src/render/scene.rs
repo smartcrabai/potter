@@ -2635,25 +2635,31 @@ mod shading_normal_tests {
             false,
             &BTreeMap::new(),
         )?;
-        // Each plane sits at X = 0, 3, 6; its triangles' centroid X identifies it.
-        let expected = [(0, false), (1, true), (2, true)];
-        for (slot, double_sided) in expected {
+        // Each node's triangles carry the object index recorded for that node.
+        let expected = [
+            ("single_body", false),
+            ("double_body", true),
+            ("bare_body", true),
+        ];
+        for (node, double_sided) in expected {
+            let node_id = Id::new(node).expect("valid id");
+            let object = geometry
+                .objects
+                .iter()
+                .find(|object| object.node_id == node_id)
+                .expect("node is rendered");
             let triangles = geometry
                 .triangles
                 .iter()
-                .filter(|triangle| {
-                    let centre =
-                        (triangle.positions[0] + triangle.positions[1] + triangle.positions[2]).x
-                            / 3.0;
-                    (centre / 3.0).round() as i64 == slot
-                })
+                .filter(|triangle| triangle.object_index == object.index)
                 .collect::<Vec<_>>();
-            assert_eq!(triangles.len(), 2, "plane {slot} triangle count");
+            // Beauty splits triangles that are not lit per pixel, so the count varies by material.
+            assert!(!triangles.is_empty(), "{node} has no triangles");
             assert!(
                 triangles
                     .iter()
                     .all(|triangle| triangle.double_sided == double_sided),
-                "plane {slot} double_sided should be {double_sided}"
+                "{node} double_sided should be {double_sided}"
             );
         }
         Ok(())
