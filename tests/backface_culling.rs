@@ -126,7 +126,7 @@ fn realtime_beauty_culls_single_sided_back_faces_as_eevee_does() -> TestResult {
     pot_json(|command| {
         command.arg("init").arg(&scene);
     })?;
-    // Diffuse white, single-sided (`double_sided` defaults to false), matching EEVEE's
+    // Diffuse white, single-sided (`double_sided` is set false explicitly below), matching EEVEE's
     // `use_backface_culling` on. Quaternions are [x,y,z,w] (spec.md), so identity is [0,0,0,1]
     // and [1,0,0,0] is a 180° turn about X. A sun above the plane (identity, shining down -Z, as
     // Blender's sun does) lights the front face; the top camera looks down at it, and the bottom

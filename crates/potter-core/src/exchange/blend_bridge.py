@@ -6713,7 +6713,7 @@ def export_doc(doc, target, pack, scene_hash, context):
         mat.use_nodes = True
         set_id(mat.node_tree, item.get("node_tree"))
         _set_principled_values(mat, item)
-        mat.use_backface_culling = not bool(item.get("double_sided", False))
+        mat.use_backface_culling = not bool(item.get("double_sided", True))
         mat.displacement_method = "DISPLACEMENT" if item.get("displacement_method") == "displacement" else "BUMP"
         set_id(mat, material_id)
         source = compatibility_block(doc, "materials", "Material", material_id)
