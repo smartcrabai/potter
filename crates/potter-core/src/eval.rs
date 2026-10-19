@@ -3765,9 +3765,6 @@ pub(crate) fn apply_scene_operand_modifier(
     evaluated_nodes: &BTreeMap<Id, EvaluatedNode>,
     material_slots: &mut Vec<Option<Id>>,
 ) -> Result<()> {
-    if modifier.modifier_type == "warp" {
-        return apply_scene_warp_modifier(mesh, modifier, subject_id, doc, world_matrices);
-    }
     if modifier.modifier_type == "hook" {
         return apply_scene_hook_modifier(mesh, modifier, subject_id, doc, world_matrices);
     }
@@ -3974,75 +3971,6 @@ pub(crate) fn apply_scene_operand_modifier(
         resolved.runtime.target_mesh = Some(operand);
     } else {
         resolved.runtime.operand_mesh = Some(operand);
-    }
-    *mesh = crate::geom::modifiers::evaluate_modifiers(mesh, &[resolved])?;
-    Ok(())
-}
-fn apply_scene_warp_modifier(
-    mesh: &mut Mesh,
-    modifier: &Modifier,
-    subject_id: &Id,
-    doc: &SceneDoc,
-    world_matrices: &BTreeMap<Id, DMat4>,
-) -> Result<()> {
-    let subject_world = world_matrices.get(subject_id).copied().ok_or_else(|| {
-        PotError::new(
-            ErrorCode::InternalError,
-            "warp subject world matrix is missing",
-        )
-    })?;
-    let subject_inverse = subject_world.inverse();
-    if !subject_inverse.is_finite() {
-        return Err(PotError::invalid_argument(
-            "warp subject transform must be invertible",
-        ));
-    }
-    let mut resolved = modifier.clone();
-    for (source_parameter, is_from) in [("object_from", true), ("object_to", false)] {
-        let object_id = modifier
-            .params
-            .get(source_parameter)
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| {
-                PotError::with_details(
-                    ErrorCode::InvalidArgument,
-                    format!("warp modifier requires `{source_parameter}`"),
-                    json!({
-                        "modifier_id":modifier.id,
-                        "pointer":format!("/params/{source_parameter}")
-                    }),
-                )
-            })?;
-        let object_id = Id::new(object_id).map_err(|_| {
-            PotError::with_details(
-                ErrorCode::InvalidArgument,
-                format!("warp `{source_parameter}` must be a valid object ID"),
-                json!({
-                    "modifier_id":modifier.id,
-                    "pointer":format!("/params/{source_parameter}")
-                }),
-            )
-        })?;
-        if !doc.nodes.contains_key(&object_id) {
-            return Err(PotError::with_details(
-                ErrorCode::TargetNotFound,
-                format!("warp object `{object_id}` was not found"),
-                json!({"modifier_id":modifier.id,"object":object_id}),
-            ));
-        }
-        let world = world_matrices.get(&object_id).copied().ok_or_else(|| {
-            PotError::new(
-                ErrorCode::InternalError,
-                "warp object world matrix is missing",
-            )
-        })?;
-        let point = subject_inverse.transform_point3(world.transform_point3(DVec3::ZERO));
-        resolved.params.remove(source_parameter);
-        if is_from {
-            resolved.runtime.warp_from = Some(point.to_array());
-        } else {
-            resolved.runtime.warp_to = Some(point.to_array());
-        }
     }
     *mesh = crate::geom::modifiers::evaluate_modifiers(mesh, &[resolved])?;
     Ok(())

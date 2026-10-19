@@ -1496,7 +1496,8 @@ fn evaluate_modifier_output(
                                 modifier,
                                 target,
                                 engine.doc,
-                                &references,
+                                &world_matrices,
+                                evaluated_operand_meshes,
                                 modifier_warnings,
                             )
                         }
@@ -1506,7 +1507,8 @@ fn evaluate_modifier_output(
                                 modifier,
                                 target,
                                 engine.doc,
-                                &references,
+                                &world_matrices,
+                                evaluated_operand_meshes,
                                 evaluated_operand_nodes,
                                 &mut material_slots,
                             )
