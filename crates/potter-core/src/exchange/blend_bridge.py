@@ -592,10 +592,6 @@ def _set_falloff_curve_mapping(mapping, values, owner, settings=None):
     clip_bounds = tuple(float(value) for value in settings.get(
         "clip_bounds", (0.0, 0.0, 1.0, 1.0)))
     mapping.use_clip = bool(settings.get("use_clip", True))
-    mapping.clip_min_x = min(mapping.clip_min_x, clip_bounds[0])
-    mapping.clip_max_x = max(mapping.clip_max_x, clip_bounds[2])
-    mapping.clip_min_y = min(mapping.clip_min_y, clip_bounds[1])
-    mapping.clip_max_y = max(mapping.clip_max_y, clip_bounds[3])
     mapping.clip_min_x = clip_bounds[0]
     mapping.clip_min_y = clip_bounds[1]
     mapping.clip_max_x = clip_bounds[2]
@@ -611,7 +607,6 @@ def _set_falloff_curve_mapping(mapping, values, owner, settings=None):
     for point, (x, y, handle_type) in zip(curve.points, points):
         point.location = (x, y)
         point.handle_type = handle_type
-    mapping.update()
 
 
 
