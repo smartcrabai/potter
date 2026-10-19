@@ -5,12 +5,13 @@
 //! then deserializes. Version 2 replaced the mesh attributes `uv_map` and `blender_uv_layers` with
 //! `uv_layers`, and the texture reference field `uv_map` with `uv_layer`. Version 3 converted
 //! Blender-keyed shading (including compressed custom normals), color, and generic element data to
-//! native keys, and user attributes to their storage keys (see [`upgrade_mesh_v2`]).
-use std::collections::BTreeSet;
+//! native keys, and user attributes to their storage keys (see [`upgrade_mesh_v2`]). Version 4 marks an EXR image's
+//! alpha as premultiplied (see [`upgrade_v3`]).
+use std::{collections::BTreeSet, path::Path};
 
 use serde_json::{Map, Value, json};
 
-use super::SceneDoc;
+use super::{Image, ImageAlphaMode, SceneDoc};
 use crate::{
     color::curve::{CurveMapping, CurvePoint, HandleType},
     error::{ErrorCode, PotError, Result},
@@ -47,16 +48,16 @@ pub struct ParsedScene {
 }
 
 /// Parses a scene document, upgrading it through every schema version to the current one.
-pub fn parse_scene(bytes: &[u8]) -> Result<ParsedScene> {
-    parse_scene_inner(bytes, false)
+pub fn parse_scene(bytes: &[u8], root: &Path) -> Result<ParsedScene> {
+    parse_scene_inner(bytes, root, false)
 }
 
 /// Parses a project scene while retaining its pre-migration hash for project metadata.
-pub(crate) fn parse_scene_with_original_hash(bytes: &[u8]) -> Result<ParsedScene> {
-    parse_scene_inner(bytes, true)
+pub(crate) fn parse_scene_with_original_hash(bytes: &[u8], root: &Path) -> Result<ParsedScene> {
+    parse_scene_inner(bytes, root, true)
 }
 
-fn parse_scene_inner(bytes: &[u8], retain_original_hash: bool) -> Result<ParsedScene> {
+fn parse_scene_inner(bytes: &[u8], root: &Path, retain_original_hash: bool) -> Result<ParsedScene> {
     let mut value = parse_value(bytes)?;
     let legacy = value.get("schema_version").and_then(Value::as_u64) == Some(1);
     let legacy_hash = if legacy && retain_original_hash {
@@ -64,7 +65,7 @@ fn parse_scene_inner(bytes: &[u8], retain_original_hash: bool) -> Result<ParsedS
     } else {
         None
     };
-    let warnings = upgrade_scene(&mut value)?;
+    let warnings = upgrade_scene(&mut value, root)?;
     let doc = serde_json::from_value(value).map_err(|error| json_error(&error))?;
     Ok(ParsedScene {
         doc,
@@ -75,10 +76,13 @@ fn parse_scene_inner(bytes: &[u8], retain_original_hash: bool) -> Result<ParsedS
 }
 
 /// Parses a history record, upgrading its snapshot's schema version first.
-pub(crate) fn parse_history_record(bytes: &[u8]) -> Result<(HistoryRecord, Vec<Value>)> {
+pub(crate) fn parse_history_record(
+    bytes: &[u8],
+    root: &Path,
+) -> Result<(HistoryRecord, Vec<Value>)> {
     let mut value = parse_value(bytes)?;
     let warnings = match value.get_mut("snapshot") {
-        Some(snapshot) => upgrade_scene(snapshot)?,
+        Some(snapshot) => upgrade_scene(snapshot, root)?,
         None => Vec::new(),
     };
     let record = serde_json::from_value(value).map_err(|error| json_error(&error))?;
@@ -97,8 +101,9 @@ fn json_error(error: &serde_json::Error) -> PotError {
     )
 }
 
-/// Upgrades a scene document in place through schema version 4.
-pub fn upgrade_scene(value: &mut Value) -> Result<Vec<Value>> {
+/// Upgrades a scene document in place through schema version 5. `root` is the project directory that holds the document's
+/// image blobs and linked sources, which the version 3 to 4 step reads.
+pub fn upgrade_scene(value: &mut Value, root: &Path) -> Result<Vec<Value>> {
     let warnings = if value.get("schema_version").and_then(Value::as_u64) == Some(1) {
         upgrade_v1(value)?
     } else {
@@ -108,7 +113,10 @@ pub fn upgrade_scene(value: &mut Value) -> Result<Vec<Value>> {
         upgrade_v2(value)?;
     }
     if value.get("schema_version").and_then(Value::as_u64) == Some(3) {
-        upgrade_v3(value)?;
+        upgrade_v3(value, root)?;
+    }
+    if value.get("schema_version").and_then(Value::as_u64) == Some(4) {
+        upgrade_v4(value)?;
     }
     Ok(warnings)
 }
@@ -230,13 +238,14 @@ fn upgrade_v2(value: &mut Value) -> Result<()> {
     Ok(())
 }
 
-/// Upgrades a schema-version-3 scene document to version 4. The released view curve, an array of
+/// Upgrades a schema-version-4 scene document to version 5. The released view curve, an array of
 /// `[x, y]` points evaluated piecewise-linearly with horizontal extension, becomes Blender's view
 /// `CurveMapping` on the combined curve with VECTOR handles and horizontal extension, so existing
 /// renders keep their shape. The R/G/B identity curves cover the combined curve's full x-domain and
 /// `[0, 1]`; a single legacy point becomes a constant two-point curve. Clip is `[0, 1]`, black and
-/// white identity. An empty array means no curve.
-fn upgrade_v3(value: &mut Value) -> Result<()> {
+/// white identity. An empty array means no curve. A curve that is already a `CurveMapping` object is
+/// left as it is.
+fn upgrade_v4(value: &mut Value) -> Result<()> {
     if let Some(scenes) = value.get_mut("scenes").and_then(Value::as_object_mut) {
         for scene in scenes.values_mut() {
             if let Some(color) = scene.get_mut("color_management") {
@@ -244,7 +253,7 @@ fn upgrade_v3(value: &mut Value) -> Result<()> {
             }
         }
     }
-    value["schema_version"] = json!(4);
+    value["schema_version"] = json!(5);
     Ok(())
 }
 
@@ -252,13 +261,8 @@ fn upgrade_color_curve(color: &mut Value) -> Result<()> {
     let Some(curve) = color.get_mut("curve") else {
         return Ok(());
     };
-    if curve.is_null() {
-        return Ok(());
-    }
     let Value::Array(points) = curve else {
-        return Err(invalid(
-            "color curve must be an array of [x, y] points or null",
-        ));
+        return Ok(());
     };
     let mut points = points
         .iter()
@@ -321,6 +325,35 @@ fn legacy_curve_point(point: &Value) -> Result<CurvePoint> {
     })
 }
 
+/// Upgrades a schema-version-3 scene document to version 4. Schema 3 labelled every image straight, EXR included, so a
+/// saved EXR was read as straight. Blender reads an EXR as premultiplied, and so does the loader now. The old loader
+/// unpremultiplied an EXR at load and premultiplied it again when sampling, so an EXR labelled straight becomes
+/// premultiplied here, and then samples the colour the old loader produced. Only images whose bytes are an EXR change. An
+/// image whose bytes cannot be read is left as it is, and the loader reports the missing or changed asset when it is used.
+fn upgrade_v3(value: &mut Value, root: &Path) -> Result<()> {
+    if let Some(images) = value.get_mut("images").and_then(Value::as_object_mut) {
+        for image in images.values_mut() {
+            // A missing alpha mode deserialises to straight, so it is straight here too.
+            if image
+                .get("alpha_mode")
+                .and_then(Value::as_str)
+                .is_some_and(|mode| mode != "straight")
+            {
+                continue;
+            }
+            let typed: Image =
+                serde_json::from_value(image.clone()).map_err(|error| json_error(&error))?;
+            let Ok(bytes) = crate::image::storage::image_source_bytes(&typed, root) else {
+                continue;
+            };
+            if crate::image::storage::default_alpha_mode(&bytes) == ImageAlphaMode::Premultiplied {
+                image["alpha_mode"] = json!("premultiplied");
+            }
+        }
+    }
+    value["schema_version"] = json!(4);
+    Ok(())
+}
 /// Blender-owned mesh attributes are mirrors or topology rebuilt by Potter. Their exact signatures
 /// match the `.blend` importer.
 fn is_blender_managed_attribute(name: &str, domain: &str, data_type: &str) -> bool {
@@ -1142,6 +1175,11 @@ mod tests {
 
     use super::*;
 
+    /// A project root with no assets, for documents that name no image blobs.
+    fn no_assets() -> &'static Path {
+        Path::new("no-assets")
+    }
+
     #[test]
     fn version_one_texture_refs_become_layer_references() {
         let mut scene = json!({
@@ -1159,8 +1197,8 @@ mod tests {
                 }
             }}}
         });
-        upgrade_scene(&mut scene).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(4));
+        upgrade_scene(&mut scene, no_assets()).expect("upgrade");
+        assert_eq!(scene["schema_version"], json!(5));
         let material = &scene["materials"]["m1"];
         assert_eq!(material["base_color_texture"]["uv_layer"], Value::Null);
         assert!(material["base_color_texture"].get("uv_map").is_none());
@@ -1175,14 +1213,85 @@ mod tests {
     }
 
     #[test]
-    fn current_scenes_pass_through_untouched() {
+    fn version_three_scenes_only_advance_their_version_without_images() {
         let mut scene = json!({
-            "schema_version": 4,
+            "schema_version": 3,
             "materials": {"m1": {"base_color_texture": {"image": "img", "uv_layer": "Light"}}}
         });
         let before = scene.clone();
-        upgrade_scene(&mut scene).expect("no-op");
-        assert_eq!(scene, before);
+        upgrade_scene(&mut scene, no_assets()).expect("upgrade");
+        assert_eq!(scene["schema_version"], json!(5));
+        assert_eq!(scene["materials"], before["materials"]);
+    }
+
+    /// A project saved at schema 3 labelled its EXR straight, but Blender and the loader read an EXR as premultiplied.
+    /// The upgrade relabels it, so it samples as the old loader did. The old loader unpremultiplied the file at load and
+    /// premultiplied it again when sampling: unlinked, the file's associated colour comes back; linked, the straight colour.
+    #[test]
+    fn version_three_exr_images_load_premultiplied_as_the_old_loader_sampled_them() -> TestResult {
+        let root = tempfile::tempdir()?;
+        // Blender writes an EXR's colour associated: this texel is straight (0.8, 0.4, 0.2) at alpha 0.5.
+        let exr_path = root.path().join("texel.exr");
+        exr::prelude::write_rgba_file(&exr_path, 1, 1, |_, _| {
+            (0.4_f32, 0.2_f32, 0.1_f32, 0.5_f32)
+        })?;
+        let bytes = std::fs::read(&exr_path)?;
+        let digest = crate::hash::sha256(&bytes);
+        let hex = digest
+            .strip_prefix("sha256:")
+            .ok_or("digest is not sha256")?;
+        let blob_dir = root.path().join("assets").join("sha256").join(hex);
+        std::fs::create_dir_all(&blob_dir)?;
+        std::fs::write(blob_dir.join("blob"), &bytes)?;
+        let image = Image {
+            name: "texel".to_owned(),
+            source: crate::model::ImageSource::Packed,
+            colorspace: crate::model::ImageColorspace::Linear,
+            width: 1,
+            height: 1,
+            tiles: Vec::new(),
+            blob: Some(digest.clone()),
+            source_path: None,
+            source_hash: Some(digest),
+            alpha_mode: ImageAlphaMode::Straight,
+        };
+        let mut scene = serde_json::to_value(SceneDoc::new(uuid::Uuid::new_v4().to_string()))?;
+        scene["schema_version"] = json!(3);
+        scene["images"] = json!({ "texel": serde_json::to_value(&image)? });
+        let parsed = parse_scene(&serde_json::to_vec(&scene)?, root.path())?;
+        assert_eq!(parsed.doc.schema_version, 5);
+        let id = crate::model::Id::new("texel")?;
+        let migrated = &parsed.doc.images[&id];
+        assert_eq!(migrated.alpha_mode, ImageAlphaMode::Premultiplied);
+        let data = crate::image::load_image_data(
+            migrated,
+            root.path(),
+            crate::image::ImageInterpolation::Closest,
+        )?;
+        let sample = |linked: bool| {
+            crate::image::sample_with_extension_alpha(
+                &data,
+                [0.5, 0.5],
+                [0.5, 0.5],
+                0,
+                crate::image::ImageInterpolation::Closest,
+                crate::image::ImageExtension::Repeat,
+                linked,
+            )
+        };
+        for (actual, expected) in sample(false).into_iter().zip([0.4, 0.2, 0.1, 0.5]) {
+            assert!(
+                (actual - expected).abs() < 1.0e-6,
+                "unlinked {actual} != {expected}"
+            );
+        }
+        for (actual, expected) in sample(true).into_iter().zip([0.8, 0.4, 0.2, 0.5]) {
+            assert!(
+                (actual - expected).abs() < 1.0e-6,
+                "linked {actual} != {expected}"
+            );
+        }
+        Ok(())
     }
 
     #[test]
@@ -1196,8 +1305,8 @@ mod tests {
                 "single": {"color_management": {"curve": [[0.5, 0.25]]}}
             }
         });
-        upgrade_scene(&mut scene)?;
-        assert_eq!(scene["schema_version"], json!(4));
+        upgrade_scene(&mut scene, no_assets())?;
+        assert_eq!(scene["schema_version"], json!(5));
         assert_eq!(
             scene["scenes"]["empty"]["color_management"]["curve"],
             Value::Null
@@ -1260,8 +1369,8 @@ mod tests {
             }]
         });
 
-        let migrated = parse_scene(&serde_json::to_vec(&source)?)?.doc;
-        assert_eq!(migrated.schema_version, 4);
+        let migrated = parse_scene(&serde_json::to_vec(&source)?, no_assets())?.doc;
+        assert_eq!(migrated.schema_version, 5);
         let mesh = migrated.data_blocks[&data_id]
             .mesh
             .as_ref()
@@ -1325,7 +1434,7 @@ mod tests {
     }
 
     fn migrated_mesh(source: &Value) -> TestResult<crate::geom::Mesh> {
-        let migrated = parse_scene(&serde_json::to_vec(source)?)?.doc;
+        let migrated = parse_scene(&serde_json::to_vec(source)?, no_assets())?.doc;
         let mesh = migrated.data_blocks[&crate::model::Id::new("meshdata")?]
             .mesh
             .clone()
@@ -1635,7 +1744,7 @@ mod tests {
                     }]
                 }),
             )?;
-            let error = parse_scene(&serde_json::to_vec(&source)?)
+            let error = parse_scene(&serde_json::to_vec(&source)?, no_assets())
                 .expect_err("malformed custom-normal codes must be rejected");
             assert_eq!(error.code, ErrorCode::SceneInvalid);
         }
@@ -1763,9 +1872,9 @@ mod tests {
         assert_eq!(store.active.as_deref(), Some("Tint"));
         assert_eq!(store.render.as_deref(), Some("Tint"));
         let (record, history_warnings) =
-            parse_history_record(&serde_json::to_vec(&history_record(&source))?)?;
+            parse_history_record(&serde_json::to_vec(&history_record(&source))?, no_assets())?;
         assert!(history_warnings.is_empty(), "{history_warnings:?}");
-        assert_eq!(record.snapshot.schema_version, 4);
+        assert_eq!(record.snapshot.schema_version, 5);
         let history_mesh = record
             .snapshot
             .data_blocks
@@ -1774,8 +1883,8 @@ mod tests {
             .and_then(|block| block.mesh.as_ref())
             .ok_or("history snapshot has no mesh")?;
         assert_eq!(&history_mesh.attributes, attributes);
-        let current = parse_scene(&serde_json::to_vec(&source)?)?.doc;
-        let current = parse_scene(&serde_json::to_vec(&current)?)?.doc;
+        let current = parse_scene(&serde_json::to_vec(&source)?, no_assets())?.doc;
+        let current = parse_scene(&serde_json::to_vec(&current)?, no_assets())?.doc;
         let current_mesh = current
             .data_blocks
             .values()
@@ -1830,9 +1939,9 @@ mod tests {
             Vec::new()
         );
         let (record, history_warnings) =
-            parse_history_record(&serde_json::to_vec(&history_record(&source))?)?;
+            parse_history_record(&serde_json::to_vec(&history_record(&source))?, no_assets())?;
         assert!(history_warnings.is_empty(), "{history_warnings:?}");
-        assert_eq!(record.snapshot.schema_version, 4);
+        assert_eq!(record.snapshot.schema_version, 5);
         let history_mesh = record
             .snapshot
             .data_blocks
@@ -1849,8 +1958,8 @@ mod tests {
             crate::geom::color_layers::read(history_mesh).layers,
             Vec::new()
         );
-        let current = parse_scene(&serde_json::to_vec(&source)?)?.doc;
-        let current = parse_scene(&serde_json::to_vec(&current)?)?.doc;
+        let current = parse_scene(&serde_json::to_vec(&source)?, no_assets())?.doc;
+        let current = parse_scene(&serde_json::to_vec(&current)?, no_assets())?.doc;
         let current_mesh = current
             .data_blocks
             .values()
@@ -1931,7 +2040,7 @@ mod tests {
                 "normal_texture": {"image": "img", "uv_map": "uv_map", "interpolation": "linear"}
             }}
         });
-        let warnings = upgrade_scene(&mut scene).expect("upgrade");
+        let warnings = upgrade_scene(&mut scene, no_assets()).expect("upgrade");
         assert!(warnings.is_empty(), "{warnings:?}");
         let material = &scene["materials"]["m1"];
         assert_eq!(material["base_color_texture"]["uv_layer"], Value::Null);
@@ -1944,7 +2053,7 @@ mod tests {
             "schema_version": 1,
             "materials": {"m1": {"base_color_texture": {"image": "img", "uv_map": 3}}}
         });
-        assert!(upgrade_scene(&mut scene).is_err());
+        assert!(upgrade_scene(&mut scene, no_assets()).is_err());
     }
 
     #[test]
@@ -1974,7 +2083,7 @@ mod tests {
             "blender_uv_layers": [{"name": "Light", "values": [[0.0, 0.25], [0.5, 0.5]]}]
         });
 
-        let parsed = parse_scene(&serde_json::to_vec(&source)?)?;
+        let parsed = parse_scene(&serde_json::to_vec(&source)?, no_assets())?;
         assert!(parsed.legacy);
         assert_eq!(parsed.warnings.len(), 1, "{:?}", parsed.warnings);
         assert_eq!(parsed.warnings[0]["code"], "uv.legacy_layer_skipped");
@@ -1982,7 +2091,10 @@ mod tests {
         assert_eq!(parsed.warnings[0]["mesh"], "meshdata");
 
         let current = SceneDoc::new(uuid::Uuid::new_v4().to_string());
-        let parsed = parse_scene(&serde_json::to_vec(&serde_json::to_value(current)?)?)?;
+        let parsed = parse_scene(
+            &serde_json::to_vec(&serde_json::to_value(current)?)?,
+            no_assets(),
+        )?;
         assert!(!parsed.legacy);
         assert_eq!(parsed.warnings, Vec::<Value>::new());
         Ok(())

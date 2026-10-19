@@ -1,0 +1,206 @@
+{
+ "case": "collinear_triangle_nm_fixed_none",
+ "blender_version": "5.2.2",
+ "input_normal_codec_max_error": null,
+ "outcome": "ok",
+ "output": {
+  "vertices": [
+   [
+    0.0,
+    0.0,
+    0.5
+   ],
+   [
+    0.0,
+    0.0,
+    -0.5
+   ],
+   [
+    1.0,
+    0.0,
+    -0.5
+   ],
+   [
+    1.0,
+    0.0,
+    0.5
+   ],
+   [
+    2.0,
+    0.0,
+    0.5
+   ],
+   [
+    2.0,
+    0.0,
+    -0.5
+   ]
+  ],
+  "edges": [
+   {
+    "v": [
+     0,
+     4
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     1,
+     5
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     1,
+     2
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     0,
+     3
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     2,
+     5
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     3,
+     4
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     0,
+     1
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     2,
+     3
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     4,
+     5
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   }
+  ],
+  "faces": [
+   {
+    "v": [
+     0,
+     4,
+     5,
+     1
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     1,
+     2,
+     3,
+     0
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     2,
+     5,
+     4,
+     3
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     4,
+     0,
+     3
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     5,
+     2,
+     1
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   }
+  ],
+  "vertex_groups": {},
+  "uv_layer_names": [],
+  "color_attribute_names": [],
+  "has_custom_normals": false,
+  "has_bevel_weight_edge": false,
+  "topology": {
+   "vertices": 6,
+   "edges": 9,
+   "faces": 5,
+   "loops": 18,
+   "loose_edges": 0
+  },
+  "canonical_hash": "25ca6ce05de3000f47ae2ff54c49ef177bc0d4bd342de863a772162db9c7a387"
+ },
+ "output_normal_codec_max_error": null
+}

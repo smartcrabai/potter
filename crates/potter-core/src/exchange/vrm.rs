@@ -1947,6 +1947,7 @@ fn vrm0_meta(
             image: thumbnail.clone(),
             uv_layer: None,
             interpolation: ImageInterpolation::Linear,
+            extension: crate::image::ImageExtension::Repeat,
         };
         let index = texture_export.sampled_index(
             &reference_sampled(&texture),

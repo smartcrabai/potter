@@ -780,7 +780,14 @@ fn add_blender_image_pixels(document: &mut Value, project: &Project) -> Result<(
             project.path(),
             crate::image::ImageInterpolation::Linear,
         )?;
+        // The stored values, with the alpha mode the Blender datablock gets: a premultiplied EXR stays associated, and a
+        // straight image is straight, so Blender's packed file and its alpha mode agree (`_pack_image`).
         image_json["pixels"] = json!(blender_image_pixels(&image, data.width, &data.pixels));
+        image_json["alpha_mode"] = json!(match image.alpha_mode {
+            crate::model::ImageAlphaMode::Straight => "straight",
+            crate::model::ImageAlphaMode::Premultiplied => "premultiplied",
+            crate::model::ImageAlphaMode::None => "none",
+        });
         if let Some(png) = eight_bit_png_bytes(&image, project)? {
             image_json["png_bytes"] = json!(png);
         }
@@ -1975,6 +1982,7 @@ fn build_imported_graph(
             {
                 image.blob = packed.blob;
                 image.source_hash = packed.source_hash;
+                image.alpha_mode = packed.alpha_mode;
             }
             // A linked image reopens from the sidecar copy that its Blender filepath names, when that copy is the image.
             if image.source == ImageSource::File
@@ -2981,6 +2989,18 @@ fn imported_image_from_resource(
     });
     let (colorspace, width, height, _) =
         crate::image::storage::decode_pixels_with_default_colorspace(bytes, colorspace)?;
+    // Blender's alpha mode for the packed image, as the bridge names it. A record without one takes the encoding's default.
+    let alpha_mode = match item.get("alpha_mode").and_then(Value::as_str) {
+        None => crate::image::storage::default_alpha_mode(bytes),
+        Some("straight") => ImageAlphaMode::Straight,
+        Some("premultiplied") => ImageAlphaMode::Premultiplied,
+        Some("none") => ImageAlphaMode::None,
+        Some(other) => {
+            return Err(invalid_intermediate(&format!(
+                "image `{name}` has unknown alpha_mode `{other}`"
+            )));
+        }
+    };
     Ok(Some(Image {
         name: name.to_owned(),
         source: ImageSource::Packed,
@@ -2991,7 +3011,7 @@ fn imported_image_from_resource(
         blob: Some(source_hash.to_owned()),
         source_path: None,
         source_hash: Some(source_hash.to_owned()),
-        alpha_mode: ImageAlphaMode::Straight,
+        alpha_mode,
     }))
 }
 
@@ -10641,6 +10661,7 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
             image: image.clone(),
             uv_layer: Some(uv_layer.to_owned()),
             interpolation: crate::image::ImageInterpolation::Linear,
+            extension: crate::image::ImageExtension::Repeat,
         };
         crate::exchange::material_graph::move_textures_to_graph(
             &mut doc,
@@ -10651,12 +10672,14 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
                 roughness: None,
                 metallic: None,
                 normal: Some(crate::exchange::material_graph::SlotTexture {
+                    wrap: [crate::image::ImageExtension::Repeat; 2],
                     texture: texture(&normal_image_id, "Detail"),
                     transform: None,
                 }),
                 // Blender stores this Normal Map socket at float32 precision.
                 normal_scale: f64::from(0.65_f32),
                 emissive: Some(crate::exchange::material_graph::SlotTexture {
+                    wrap: [crate::image::ImageExtension::Repeat; 2],
                     texture: texture(&emissive_image_id, "UVMap"),
                     transform: Some(crate::exchange::material_surface::TextureTransform {
                         offset: [0.25, 0.5],
@@ -10672,21 +10695,27 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
             (
                 normal_image_id.as_str().to_owned(),
                 crate::image::ImageData {
+                    colour: crate::image::ColourCache::default(),
+                    storage: crate::image::ImageStorage::default(),
                     width: 1,
                     height: 1,
                     pixels: vec![[128.0 / 255.0, 192.0 / 255.0, 230.0 / 255.0, 1.0]],
                     tiles: BTreeMap::new(),
                     interpolation: crate::image::ImageInterpolation::Linear,
+                    srgb: false,
                 },
             ),
             (
                 emissive_image_id.as_str().to_owned(),
                 crate::image::ImageData {
+                    colour: crate::image::ColourCache::default(),
+                    storage: crate::image::ImageStorage::default(),
                     width: 1,
                     height: 1,
                     pixels: vec![[64.0 / 255.0, 128.0 / 255.0, 1.0, 1.0]],
                     tiles: BTreeMap::new(),
                     interpolation: crate::image::ImageInterpolation::Linear,
+                    srgb: false,
                 },
             ),
         ]);
@@ -10951,6 +10980,7 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
                 image: image.clone(),
                 uv_layer: Some("Lightmap".to_owned()),
                 interpolation,
+                extension: crate::image::ImageExtension::Repeat,
             }
         };
         // An authored graph: a Principled BSDF with a default Base Color and a Roughness linked from a Math node. Its
@@ -11194,13 +11224,6 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
             imported.losses
         );
 
-        let srgb = |value: f64| {
-            if value <= 0.04045 {
-                value / 12.92
-            } else {
-                ((value + 0.055) / 1.055).powf(2.4)
-            }
-        };
         let mut reopened_image_data = BTreeMap::new();
         for (image_id, reopened_image) in &imported.doc.images {
             let source_image = doc
@@ -11308,46 +11331,49 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
             [LIGHTMAP[0], LIGHTMAP[1], LIGHTMAP[2]],
         ];
         let close = |left: f64, right: f64| (left - right).abs() < 1.0e-3;
-        // Per pixel, as the evaluator decodes it: sRGB red, green and blue for the shared image; raw for the others.
-        let shared_rgb = [
-            [srgb(128.0 / 255.0), srgb(40.0 / 255.0), 0.0],
-            [srgb(64.0 / 255.0), 0.0, 1.0],
-        ];
-        let shared_alpha = [128.0 / 255.0, 1.0];
-        let metal_red = [128.0 / 255.0, 200.0 / 255.0];
-        // Hit 2 extrapolates the Lightmap u to 1.06. It clamps to the edge pixel 1, where a repeat would read pixel 0.
+        // Blender 5.2.2 expectations, derived from the alpha oracle set (tests/fixtures/alpha_texture): the Image Texture
+        // colour model that reproduces the oracle to 6e-7, evaluated at each hit's Lightmap UV. Each hit blends the
+        // Lightmap corners with `barycentrics`, giving u = 0.1, 0.9, and 1.06. The field's extension is Repeat, so at
+        // u = 1.06 Closest reads texel 0 and Linear mixes texels 0 and 1. Pixel 0 has alpha 128, which Blender
+        // premultiplies at load. A colour read whose Alpha output is linked is unassociated, and an unlinked one keeps
+        // the premultiplied value. The field's base has its Alpha linked (non-opaque); its roughness and metallic, and
+        // the simple and authored textures, are unlinked. Metallic is Non-Color, so it is read as stored.
         let barycentrics = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [-0.2, 1.2, 0.0]];
-        let pixel_of_hit = [0_usize, 1, 1];
-        let hits = [0_usize, 1, 2];
-        let texel = |hit: usize| shared_rgb[pixel_of_hit[hit]];
-        let metal = |hit: usize| metal_red[pixel_of_hit[hit]];
-        let alpha = |hit: usize| shared_alpha[pixel_of_hit[hit]];
         // (label, material, base, roughness, metallic, alpha), each per hit.
         let cases = [
             (
                 "field",
                 &field_id,
-                hits.map(texel),
-                hits.map(|hit| 0.5 * texel(hit)[0]),
-                hits.map(|hit| 0.75 * metal(hit)),
-                hits.map(|hit| 0.5 * alpha(hit)),
+                [
+                    [0.214_041, 0.021_072, 0.0],
+                    [0.051_269, 0.0, 1.0],
+                    [0.214_041, 0.021_072, 0.0],
+                ],
+                [0.025_635; 3],
+                [0.376_471, 0.588_235, 0.376_471],
+                [0.250_980, 0.5, 0.250_980],
             ),
             (
                 "simple",
                 &simple_id,
-                hits.map(|hit| texel(hit).map(|value| 0.6 * value)),
-                hits.map(|hit| 0.75 * texel(hit)[0]),
+                [
+                    [0.030_762, 0.004_197, 0.0],
+                    [0.030_762, 0.0, 0.6],
+                    [0.030_762, 0.004_197, 0.0],
+                ],
+                [0.038_452; 3],
                 [0.25; 3],
                 [1.0; 3],
             ),
             (
                 "authored",
                 &authored_id,
-                hits.map(|hit| {
-                    let rgb = texel(hit);
-                    [0.5 * rgb[0], 0.25 * rgb[1], 0.125 * rgb[2]]
-                }),
-                hits.map(|hit| 0.25 * texel(hit)[0]),
+                [
+                    [0.025_635, 0.001_749, 0.0],
+                    [0.025_635, 0.0, 0.125],
+                    [0.025_635, 0.001_749, 0.0],
+                ],
+                [0.012_817; 3],
                 [0.0; 3],
                 [1.0; 3],
             ),
@@ -11513,6 +11539,7 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
                     image: normal_id,
                     uv_layer: None,
                     interpolation: crate::image::ImageInterpolation::Linear,
+                    extension: crate::image::ImageExtension::Repeat,
                 }),
                 node_tree: Some(graph_id),
                 ..Material::default()
