@@ -1811,7 +1811,7 @@ fn sample_bsdf(params: &BsdfParams, normal: DVec3, view: DVec3, rng: &mut Pcg32)
     let direction = if choice < diffuse_end {
         sample_cosine_hemisphere(normal, rng).0
     } else if choice < coat_end {
-        let half_vector = sample_ggx_half(params.coat_normal, params.coat_roughness, rng);
+        let half_vector = sample_ggx_half(params.coat_normal_or_shading(), params.coat_roughness, rng);
         reflect(-view, half_vector).normalize_or_zero()
     } else {
         let half_vector = sample_ggx_half(normal, params.roughness, rng);

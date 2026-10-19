@@ -1959,13 +1959,15 @@ fn shade(
                 prefiltered_world(world, &doc.node_groups, images, normal, 1.0)?;
             let metallic = params.metallic.clamp(0.0, 1.0);
             let roughness = params.roughness.clamp(0.0, 1.0);
-            result += albedo * diffuse_environment * (1.0 - metallic);
+            // The coat attenuates every layer below it, including the environment terms.
+            let lower = coat_lower_factor(params, view);
+            result += albedo * diffuse_environment * (1.0 - metallic) * lower;
             let reflection = (-view + normal * (2.0 * normal.dot(view))).normalize_or_zero();
             let specular_environment =
                 prefiltered_world(world, &doc.node_groups, images, reflection, roughness)?;
             let specular_f0 = dielectric_f0(params.ior, params.specular_ior_level);
             let f0 = albedo * metallic + DVec3::splat(specular_f0 * (1.0 - metallic));
-            result += specular_environment * f0 * (1.0 - roughness).powi(2);
+            result += specular_environment * f0 * (1.0 - roughness).powi(2) * lower;
         }
         for (id, light_node) in &doc.nodes {
             let Some(light) = light_node
