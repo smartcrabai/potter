@@ -40,7 +40,7 @@ mod tests {
             };
             let ray = ray_for_pixel(&camera, 128, 128, x, y);
             prop_assert!(ray.is_ok());
-            let Ok((origin, direction)) = ray else {
+            let Ok(Some((origin, direction))) = ray else {
                 return Ok(());
             };
             let forward = (camera.target - camera.position).normalize();
