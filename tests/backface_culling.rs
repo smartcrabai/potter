@@ -15,7 +15,7 @@ mod native_oracle;
 #[path = "common/process.rs"]
 mod process;
 
-use std::{error::Error, fs, io::BufReader, path::Path, process::Command};
+use std::{fs, io::BufReader, path::Path, process::Command};
 
 use blender_checked::blender_executable;
 use native_oracle::{
@@ -93,12 +93,8 @@ fn solid_preview_draws_back_faces_as_workbench_does() -> TestResult {
     assert_eq!(previews.len(), 2, "one preview per requested view");
     for item in previews {
         let view = item["view"].as_str().ok_or("preview has no view name")?;
-        let path = out.join(
-            item["image"]["path"]
-                .as_str()
-                .ok_or("preview has no image path")?,
-        );
-        let lit = lit_fraction(&path)?;
+        let path = Path::new(item["image"].as_str().ok_or("preview has no image path")?);
+        let lit = lit_fraction(path)?;
         let want = expected[view]
             .as_f64()
             .ok_or("oracle has no coverage for the view")?;
@@ -161,7 +157,7 @@ fn blender_scene_backface_culling_imports_as_a_reported_loss() -> TestResult {
             .args(extra);
         command
     };
-    let strict = import(&[]).output()?;
+    let strict = import(&["--json"]).output()?;
     assert!(
         !strict.status.success(),
         "a scene that culls back faces must not import silently"
