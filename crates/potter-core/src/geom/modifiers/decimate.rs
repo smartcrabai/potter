@@ -542,7 +542,8 @@ impl BMesh {
             disk: [NO_DISK; 2],
             l: NONE,
             alive: true,
-            smooth: false,
+            // `BM_edge_create` sets `BM_ELEM_SMOOTH` (bmesh_core.cc), so a new edge is not sharp.
+            smooth: true,
             seam: false,
             tag: false,
             jf: false,
@@ -2495,32 +2496,14 @@ impl BMesh {
             .collect()
     }
 
-    /// Output vertex of each live vertex: `to_mesh` keeps the live vertices in index order.
-    fn live_vertex_index(&self) -> Vec<usize> {
-        let mut next = 0;
-        self.verts
-            .iter()
-            .map(|vert| {
-                if vert.alive {
-                    next += 1;
-                    next - 1
-                } else {
-                    NONE
-                }
-            })
-            .collect()
-    }
-
-    /// `(seam, sharp)` of each live edge keyed by its output vertex pair.
-    fn output_edge_flags(&self) -> Vec<([usize; 2], (bool, bool))> {
-        let output_index = self.live_vertex_index();
-        self.edges
-            .iter()
-            .filter(|edge| edge.alive)
-            .map(|edge| {
-                let [a, b] = edge.v.map(|v| output_index[v]);
-                ([a.min(b), a.max(b)], (edge.seam, !edge.smooth))
-            })
+    /// `(seam, sharp)` of each live edge in pool order, the order the rebuilt mesh's edges take.
+    fn output_edge_flags(&self) -> Vec<(bool, bool)> {
+        let mut live: Vec<usize> = (0..self.edges.len())
+            .filter(|&e| self.edges[e].alive)
+            .collect();
+        live.sort_by_key(|&e| self.edges[e].slot);
+        live.into_iter()
+            .map(|e| (self.edges[e].seam, !self.edges[e].smooth))
             .collect()
     }
 }
@@ -2561,7 +2544,7 @@ pub(super) fn decimate_dissolve(
     bm.dissolve(angle_limit, dissolve_boundaries, delim);
     let flags = bm.output_edge_flags();
     let mut result = bm.to_mesh(points, mesh)?;
-    write_dissolve_edge_flags(&mut result, flags)?;
+    write_dissolve_edge_flags(&mut result, &flags)?;
     Ok(result)
 }
 
@@ -2572,7 +2555,10 @@ pub(super) fn decimate_unsubdivide(mesh: &Mesh, iterations: usize) -> Result<Mes
     let points = positions(mesh);
     let mut bm = BMesh::from_mesh(mesh, &points, &[])?;
     bm.unsubdivide(iterations);
-    bm.to_mesh(points, mesh)
+    let flags = bm.output_edge_flags();
+    let mut result = bm.to_mesh(points, mesh)?;
+    write_dissolve_edge_flags(&mut result, &flags)?;
+    Ok(result)
 }
 
 /// `(seam, sharp)` of each edge of `mesh`: the compat `blender_edge_flags` OR-ed with the native `seam`
@@ -2621,38 +2607,17 @@ fn decimate_edge_flags(mesh: &Mesh) -> Vec<(bool, bool)> {
 type DissolveFlagStore = (&'static str, fn(&(bool, bool)) -> bool);
 
 /// Writes the DISSOLVE edge flags onto the output edges the way COLLAPSE does: the native `seam` and
-/// `sharp` attributes and the compat `blender_edge_flags` take the `BMesh` edge header values. `flags`
-/// is keyed by output vertex pair; a pair shared by two live edges keeps the marks of both.
-fn write_dissolve_edge_flags(
-    mesh: &mut Mesh,
-    flags: Vec<([usize; 2], (bool, bool))>,
-) -> Result<()> {
+/// `sharp` attributes and the compat `blender_edge_flags` take the `BMesh` edge header values. `output`
+/// is in the rebuilt edges' order, the pool order, so each flag applies to the edge at its position.
+fn write_dissolve_edge_flags(mesh: &mut Mesh, output: &[(bool, bool)]) -> Result<()> {
+    // The rebuilt edges are in pool order, so the flags apply by position.
     let invalid = || {
         PotError::new(
             ErrorCode::InternalError,
             "decimate edge flags do not match the rebuilt mesh",
         )
     };
-    let mut by_pair: HashMap<(usize, usize), (bool, bool)> = HashMap::with_capacity(flags.len());
-    for ([first, second], (seam, sharp)) in flags {
-        let entry = by_pair.entry((first, second)).or_default();
-        entry.0 |= seam;
-        entry.1 |= sharp;
-    }
-    let index_of = id_indices(mesh);
-    let mut output = Vec::with_capacity(mesh.edges.len());
-    for edge in &mesh.edges {
-        let [first, second] = edge.vertices.map(|id| index_of.get(&id).copied());
-        let (Some(first), Some(second)) = (first, second) else {
-            return Err(invalid());
-        };
-        output.push(
-            by_pair
-                .remove(&(first.min(second), first.max(second)))
-                .ok_or_else(invalid)?,
-        );
-    }
-    if !by_pair.is_empty() {
+    if mesh.edges.len() != output.len() {
         return Err(invalid());
     }
     let natives: [DissolveFlagStore; 2] = [("sharp", |flags| flags.1), ("seam", |flags| flags.0)];
@@ -2663,7 +2628,7 @@ fn write_dissolve_edge_flags(
                 .and_then(Value::as_object_mut)
                 .ok_or_else(invalid)?;
             values.clear();
-            for (edge, flags) in mesh.edges.iter().zip(&output) {
+            for (edge, flags) in mesh.edges.iter().zip(output) {
                 values.insert(format!("e{}", edge.id), json!(flag(flags)));
             }
         }
@@ -2673,7 +2638,7 @@ fn write_dissolve_edge_flags(
         if values.len() != output.len() {
             return Err(invalid());
         }
-        for (value, &(seam, sharp)) in values.iter_mut().zip(&output) {
+        for (value, &(seam, sharp)) in values.iter_mut().zip(output) {
             let fields = value.as_object_mut().ok_or_else(invalid)?;
             fields.insert("seam".to_owned(), json!(seam));
             fields.insert("sharp".to_owned(), json!(sharp));
