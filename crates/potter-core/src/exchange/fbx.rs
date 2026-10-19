@@ -178,7 +178,7 @@ pub(crate) fn export_with_root_allow_lossy(
         );
     }
 
-    let (bone_models, bone_model_ids) = build_bone_models(doc, &ids, &mut next_id)?;
+    let (bone_models, bone_model_ids) = build_bone_models(doc, snapshot, &ids, &mut next_id)?;
     let (skin_exports, morph_exports) =
         build_deformers(doc, snapshot, &ids, &bone_model_ids, &mut next_id)?;
     let (material_exports, material_bindings, material_slot_indices) =
@@ -1225,8 +1225,61 @@ pub(crate) fn uv_texture_warnings(doc: &SceneDoc, snapshot: &Snapshot) -> Vec<Po
         .collect()
 }
 type BoneModelIds = BTreeMap<(Id, Id), i64>;
+/// Each bone's posed matrix in armature space. The snapshot's evaluated bone world matrices already
+/// include pose drivers, animation, IK and constraints, so the armature world is divided out of
+/// them. An armature the snapshot did not evaluate falls back to its forward-kinematics pose;
+/// `posed_armature_losses` reports that case when the armature has pose effects.
+fn posed_bone_matrices(
+    snapshot: &Snapshot,
+    node_id: &Id,
+    node: &Node,
+    armature: &ArmatureData,
+) -> Result<BTreeMap<Id, DMat4>> {
+    if let (Some(bones), Some(world)) = (
+        snapshot.bone_matrices.get(node_id),
+        snapshot.transform_world_matrices.get(node_id),
+    ) {
+        let inverse = world.inverse();
+        return Ok(bones
+            .iter()
+            .map(|(bone_id, matrix)| (bone_id.clone(), inverse * DMat4::from_cols_array(matrix)))
+            .collect());
+    }
+    Ok(
+        crate::eval::rig::evaluate_bone_matrices(armature, &node.pose)?
+            .into_iter()
+            .map(|(bone_id, matrices)| (bone_id, matrices.pose))
+            .collect(),
+    )
+}
+
+/// Armatures with pose-bone constraints or pose drivers that the snapshot did not evaluate. Their
+/// FBX bones carry only the forward-kinematics pose, so the omission must be reported.
+pub(crate) fn posed_armature_losses(doc: &SceneDoc, snapshot: &Snapshot) -> Vec<Loss> {
+    doc.nodes
+        .iter()
+        .filter(|(node_id, node)| {
+            let is_armature = node
+                .data
+                .as_ref()
+                .and_then(|data_id| doc.data_blocks.get(data_id))
+                .is_some_and(|data| data.armature.is_some());
+            let pose_effects = node.constraints.iter().any(|constraint| constraint.owner_bone.is_some())
+                || node.drivers.iter().any(|driver| driver.path.starts_with("pose."));
+            is_armature && pose_effects && !snapshot.bone_matrices.contains_key(*node_id)
+        })
+        .map(|(node_id, _)| Loss {
+            feature_id: "format.fbx.pose_effects".to_owned(),
+            data_id: Some(node_id.to_string()),
+            reason: "FBX writes the armature's forward-kinematics pose; its pose-bone constraints and drivers were not evaluated for this export".to_owned(),
+            suggestion: Some("export as blend or glb to keep the pose effects".to_owned()),
+        })
+        .collect()
+}
+
 fn build_bone_models(
     doc: &SceneDoc,
+    snapshot: &Snapshot,
     object_ids: &BTreeMap<Id, ObjectIds>,
     next_id: &mut i64,
 ) -> Result<(Vec<BoneExport>, BoneModelIds)> {
@@ -1254,24 +1307,18 @@ fn build_bone_models(
         }
         // Blender's LimbNode `Lcl` is the posed `matrix_local` (`export_fbx_bin.py`,
         // `fbx_data_armature_elements`, via `fbx_object_matrix`); only the bind data uses rest.
-        let matrices = crate::eval::rig::evaluate_bone_matrices(armature, &node.pose)?;
+        let posed_matrices = posed_bone_matrices(snapshot, node_id, node, armature)?;
         for (bone_id, bone) in &armature.bones {
-            let posed = matrices
-                .get(bone_id)
-                .ok_or_else(|| {
-                    PotError::new(
-                        ErrorCode::EvaluationFailed,
-                        "FBX posed bone matrix is missing",
-                    )
-                })?
-                .pose;
+            let posed = posed_matrices.get(bone_id).copied().ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::EvaluationFailed,
+                    "FBX posed bone matrix is missing",
+                )
+            })?;
             let local = if let Some(parent_id) = &bone.parent {
-                let parent = matrices
-                    .get(parent_id)
-                    .ok_or_else(|| {
-                        PotError::new(ErrorCode::SceneInvalid, "FBX bone parent is missing")
-                    })?
-                    .pose;
+                let parent = posed_matrices.get(parent_id).copied().ok_or_else(|| {
+                    PotError::new(ErrorCode::SceneInvalid, "FBX bone parent is missing")
+                })?;
                 parent.inverse() * posed
             } else {
                 posed

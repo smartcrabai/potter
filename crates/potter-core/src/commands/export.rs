@@ -593,6 +593,7 @@ pub(crate) fn export_losses(
         && let Some(snapshot) = snapshot
     {
         losses.extend(exchange::fbx::material_slot_losses(doc, snapshot));
+        losses.extend(exchange::fbx::posed_armature_losses(doc, snapshot));
     }
     if matches!(format, "fbx" | "fbx-binary") {
         losses.extend(exchange::fbx::material_graph_losses(doc));
