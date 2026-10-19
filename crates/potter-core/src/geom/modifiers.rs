@@ -3160,6 +3160,22 @@ fn subdivision_with_samples(
     rotate_corner_attributes(&mut result, &order.face_starts, &order.corners);
     subdivision_order::reorder_positional_attributes(&mut result, &order);
     result.faces = subdivision_order::permute(std::mem::take(&mut result.faces), &order.faces);
+    // Output faces and vertices are permuted above, so the sample corners follow them: each face's corners
+    // rotate with its vertices, then the faces are permuted. `samples` keeps the pre-permutation order for
+    // the limit, UV and loop-normal steps, which run before the vertices move.
+    let output_corners: Vec<Vec<subdivision_limit::Sample>> = subdivision_order::permute(
+        samples
+            .corners
+            .iter()
+            .enumerate()
+            .map(|(face, corners)| {
+                let mut corners = corners.clone();
+                corners.rotate_left(order.face_starts[face]);
+                corners
+            })
+            .collect(),
+        &order.faces,
+    );
     let limit_samples = (simple || use_limit_surface).then_some(&samples);
     let mut limit_surface = None;
     if simple || use_limit_surface || !uv_maps.is_empty() {
@@ -3209,9 +3225,9 @@ fn subdivision_with_samples(
         if modifier.modifier_type == "multires"
             && let Some(data) = multires_data.as_ref()
             && data.corner_grids.is_some()
-            && let Some(samples) = limit_samples
+            && limit_samples.is_some()
         {
-            apply_multires_displacements(mesh, data, &mut result, samples, &limit)?;
+            apply_multires_displacements(mesh, data, &mut result, &output_corners, &limit)?;
         }
         if !uv_maps.is_empty() {
             let loops: Vec<_> = uv_maps
@@ -3292,7 +3308,11 @@ fn subdivision_with_samples(
             },
         )?,
     }
-    Ok((result, Some(samples), limit_surface))
+    let output_samples = Samples {
+        vertices: subdivision_order::permute(samples.vertices, &order.vertices),
+        corners: output_corners,
+    };
+    Ok((result, Some(output_samples), limit_surface))
 }
 
 #[derive(Clone, Copy)]
@@ -4315,7 +4335,7 @@ fn apply_multires_displacements(
     source: &Mesh,
     data: &multires::DisplacementData,
     output: &mut Mesh,
-    samples: &Samples,
+    corners: &[Vec<subdivision_limit::Sample>],
     limit: &subdivision_limit::LimitSurface,
 ) -> Result<()> {
     let index_by_id: HashMap<u32, usize> = output
@@ -4328,13 +4348,13 @@ fn apply_multires_displacements(
     let mut counts = vec![0_usize; output.vertices.len()];
     let mut evaluated = HashMap::<(usize, usize, u64, u64), DVec3>::new();
     let mut patches = subdivision_limit::PatchCache::default();
-    if samples.corners.len() != output.faces.len() {
+    if corners.len() != output.faces.len() {
         return Err(PotError::new(
             ErrorCode::InternalError,
             "multires sample faces do not match the evaluated mesh",
         ));
     }
-    for (face, face_samples) in output.faces.iter().zip(&samples.corners) {
+    for (face, face_samples) in output.faces.iter().zip(corners) {
         if face.vertices.len() != face_samples.len() {
             return Err(PotError::new(
                 ErrorCode::InternalError,
