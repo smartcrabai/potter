@@ -1970,6 +1970,10 @@ fn build_imported_graph(
                         .to_owned(),
                     area_size: number_field(item, "size", 0.25),
                     area_size_y: number_field(item, "size_y", 0.25),
+                    use_multiple_importance_sampling: item
+                        .get("use_multiple_importance_sampling")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true),
                 }),
                 grease_pencil: None,
                 ..DataBlock::default()

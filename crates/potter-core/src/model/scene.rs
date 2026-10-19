@@ -1294,6 +1294,11 @@ pub struct LightData {
     pub area_shape: String,
     pub area_size: f64,
     pub area_size_y: f64,
+    /// Blender's `cycles.use_multiple_importance_sampling` (Cycles `SHADER_USE_MIS`). When `true`,
+    /// a BSDF-sampled ray can hit an area light, or a point or spot light with a radius, and that
+    /// hit is weighted against light sampling. When `false`, the light is only light-sampled.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub use_multiple_importance_sampling: bool,
 }
 
 impl Default for LightData {
@@ -1309,6 +1314,7 @@ impl Default for LightData {
             area_shape: "SQUARE".to_owned(),
             area_size: 0.25,
             area_size_y: 0.25,
+            use_multiple_importance_sampling: true,
         }
     }
 }
