@@ -14,7 +14,7 @@ mod process;
 use std::fs;
 
 use native_oracle::{
-    TestResult, blender, export, import_blend, read_scene, run_blender_arguments, write_script,
+    TestResult, export, import_blend, read_scene, run_blender_arguments, write_script,
 };
 use serde_json::Value;
 use tempfile::tempdir;
@@ -125,7 +125,7 @@ fn check_mask_and_face_hide(scene: &Value, expected_mask: &Value) -> TestResult 
 
 #[test]
 fn multires_grid_mask_and_face_hide_roundtrip_through_blend() -> TestResult {
-    let Some(blender) = blender() else {
+    let Some(blender) = blender_checked::blender_executable() else {
         return Ok(());
     };
     let directory = tempdir()?;
