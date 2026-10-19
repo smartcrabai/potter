@@ -189,15 +189,36 @@ fn schema_v1_project_keeps_revisions_uv_state_and_hashes_through_edit_history_an
     assert_eq!(redone["scene"]["revision"], 5);
     assert_corner(&scene, [-0.85, -0.8])?;
 
+    assert_eq!(
+        face_zero(&scene)?.1,
+        json!([true, true, true, true]),
+        "the export precondition: face zero is pinned"
+    );
+    // The cube's face zero is pinned, and glb does not write per-corner pin flags, so the export
+    // reports that loss and needs `--allow-lossy`.
     let exported = envelope(
         pot()
             .arg("export")
             .arg(&scene)
             .args(["--format", "glb", "--out"])
             .arg(directory.path().join("cube.glb"))
+            .arg("--allow-lossy")
             .arg("--json"),
     )?;
     assert_eq!(exported["ok"], true, "{exported}");
+    let losses = exported["result"]["losses"]
+        .as_array()
+        .ok_or("export result has no losses array")?;
+    assert!(
+        losses.iter().any(|loss| {
+            loss["feature_id"] == "mesh.uv_layer"
+                && loss["data_id"] == "cube"
+                && loss["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("UVMap"))
+        }),
+        "glb export did not report the pinned UVMap loss: {exported}"
+    );
     Ok(())
 }
 
