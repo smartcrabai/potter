@@ -273,15 +273,15 @@ enum DissolveMethod {
 
 /// Blender's `BMesh` as the decimators use it. Elements live in arenas indexed by creation order; a
 /// killed element is marked dead and never reused. Killed loops are the exception: their slots go
-/// on `free_loops` and are reused. No output depends on loop indices, since faces are walked from
+/// on `loop_slots` and are reused. No output depends on loop indices, since faces are walked from
 /// their `first` loop; without reuse a join's new face would keep every ring it ever replaced.
 struct BMesh {
     verts: Vec<BVert>,
     edges: Vec<BEdge>,
     loops: Vec<BLoop>,
     faces: Vec<BFace>,
-    /// Loop slots of killed faces, available to `loop_alloc`.
-    free_loops: Vec<usize>,
+    /// `BLI_mempool` slots of the loops; a loop's slot is its index in `loops`.
+    loop_slots: PoolSlots,
     /// `BLI_mempool` slots of the edges and faces: the output order of the live elements.
     edge_slots: PoolSlots,
     face_slots: PoolSlots,
@@ -564,7 +564,9 @@ impl BMesh {
     /// one is free (keeping its UV storage), else a new arena slot. Only `v`, `e` and `f` are set;
     /// the caller sets the UV and provenance.
     fn loop_alloc(&mut self, v: usize, e: usize, f: usize) -> usize {
-        let Some(l) = self.free_loops.pop() else {
+        let l = self.loop_slots.alloc();
+        // Loops enter `loops` only here, so a fresh slot is the next arena index.
+        if l == self.loops.len() {
             self.loops.push(BLoop {
                 v,
                 e,
@@ -576,18 +578,18 @@ impl BMesh {
                 uv: Vec::new(),
                 src: NONE,
             });
-            return self.loops.len() - 1;
-        };
-        let lp = &mut self.loops[l];
-        lp.v = v;
-        lp.e = e;
-        lp.f = f;
-        lp.next = NONE;
-        lp.prev = NONE;
-        lp.radial_next = NONE;
-        lp.radial_prev = NONE;
-        lp.uv.clear();
-        lp.src = NONE;
+        } else {
+            let lp = &mut self.loops[l];
+            lp.v = v;
+            lp.e = e;
+            lp.f = f;
+            lp.next = NONE;
+            lp.prev = NONE;
+            lp.radial_next = NONE;
+            lp.radial_prev = NONE;
+            lp.uv.clear();
+            lp.src = NONE;
+        }
         l
     }
 
@@ -653,7 +655,7 @@ impl BMesh {
             let next = self.loops[l].next;
             let e = self.loops[l].e;
             self.radial_remove(e, l);
-            self.free_loops.push(l);
+            self.loop_slots.release(l);
             l = next;
             if l == first {
                 break;
@@ -2353,7 +2355,7 @@ impl BMesh {
             edges: Vec::with_capacity(mesh.edges.len()),
             loops: Vec::new(),
             faces: Vec::with_capacity(mesh.faces.len()),
-            free_loops: Vec::new(),
+            loop_slots: PoolSlots::default(),
             edge_slots: PoolSlots::default(),
             face_slots: PoolSlots::default(),
             edge_attributes,
@@ -2406,25 +2408,20 @@ impl BMesh {
             let first = bm.loops.len();
             let f = bm.faces.len();
             for k in 0..n {
-                let uv = uv_values
+                let uv: Vec<[f32; 2]> = uv_values
                     .iter()
                     .map(|layer| {
                         let [u, v] = layer[corner + k];
                         [u as f32, v as f32]
                     })
                     .collect();
-                bm.loops.push(BLoop {
-                    v: indices[k],
-                    e: edges[k],
-                    f,
-                    next: first + (k + 1) % n,
-                    prev: first + (k + n - 1) % n,
-                    radial_next: NONE,
-                    radial_prev: NONE,
-                    uv,
-                    src: corner + k,
-                });
-                bm.radial_append(edges[k], first + k);
+                let l = bm.loop_alloc(indices[k], edges[k], f);
+                let lp = &mut bm.loops[l];
+                lp.next = first + (k + 1) % n;
+                lp.prev = first + (k + n - 1) % n;
+                lp.uv = uv;
+                lp.src = corner + k;
+                bm.radial_append(edges[k], l);
             }
             let cos: Vec<[f32; 3]> = indices.iter().map(|&v| bm.verts[v].co).collect();
             let slot = bm.face_slots.alloc();

@@ -5,7 +5,8 @@
 
 /// Blender's `BLI_mempool` slot order for one element type. `BLI_mempool_alloc` takes the head of the
 /// free list, the most recently freed slot, and then never-used slots in order. Blender emits elements
-/// in pool order (`BM_mesh_bm_to_me`), so an element's slot is its output position.
+/// in pool order (`BM_mesh_bm_to_me`), so an element's slot is its output position. Loops are never
+/// emitted; decimate uses their slots as arena indices.
 #[derive(Default)]
 pub(crate) struct PoolSlots {
     fresh: usize,
