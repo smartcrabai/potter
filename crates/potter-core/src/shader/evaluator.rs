@@ -34,9 +34,8 @@ pub(crate) fn dielectric_f0(ior: f64, level: f64) -> f64 {
 /// as `(feature_id, Blender input)` pairs in a fixed array, so checking a hit allocates nothing.
 pub(crate) fn unevaluated_principled_inputs(
     params: &BsdfParams,
-) -> [Option<(&'static str, &'static str)>; 8] {
+) -> [Option<(&'static str, &'static str)>; 7] {
     [
-        (params.coat_weight > 0.0).then_some(("shader.principled.coat", "Coat Weight")),
         (params.sheen_weight > 0.0).then_some(("shader.principled.sheen", "Sheen Weight")),
         (params.subsurface_weight > 0.0)
             .then_some(("shader.principled.subsurface", "Subsurface Weight")),
@@ -122,6 +121,10 @@ pub struct BsdfParams {
     pub coat_weight: f64,
     pub coat_roughness: f64,
     pub coat_ior: f64,
+    /// Coat Tint: the colour the coat absorbs on the way in and out (Cycles' coat tint).
+    pub coat_tint: [f64; 3],
+    /// Coat Normal, which the coat lobe and its tint use. Unlinked it is the shading normal.
+    pub coat_normal: DVec3,
     pub sheen_weight: f64,
     pub sheen_roughness: f64,
     pub sheen_tint: [f64; 3],
@@ -184,6 +187,8 @@ impl BsdfParams {
             volume_emission_strength: material.emission_strength,
             displacement_height: 0.0,
             normal: normalize_or(normal, DVec3::Z),
+            coat_tint: [1.0; 3],
+            coat_normal: normalize_or(normal, DVec3::Z),
         }
     }
 
@@ -244,6 +249,11 @@ impl BsdfParams {
             ),
             displacement_height: mix_scalar(first.displacement_height, second.displacement_height),
             normal: normalize_or(first.normal.lerp(second.normal, factor), first.normal),
+            coat_tint: mix3(first.coat_tint, second.coat_tint),
+            coat_normal: normalize_or(
+                first.coat_normal.lerp(second.coat_normal, factor),
+                first.coat_normal,
+            ),
         }
     }
 
@@ -291,6 +301,8 @@ impl BsdfParams {
                 .max(second.volume_emission_strength),
             displacement_height: first.displacement_height + second.displacement_height,
             normal: normalize_or(first.normal + second.normal, first.normal),
+            coat_tint: add3(first.coat_tint, second.coat_tint),
+            coat_normal: normalize_or(first.coat_normal + second.coat_normal, first.coat_normal),
         }
     }
 }
@@ -1139,6 +1151,9 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
         params.coat_roughness =
             self.scalar_input(id, &["Coat Roughness", "Clearcoat Roughness"], 0.03)?;
         params.coat_ior = self.scalar_input(id, &["Coat IOR"], 1.5)?;
+        params.coat_tint = self.color_input(id, &["Coat Tint"], [1.0, 1.0, 1.0, 1.0])?[..3]
+            .try_into()
+            .map_err(|_| invalid("invalid coat tint"))?;
         params.sheen_weight = self.scalar_input(id, &["Sheen Weight", "Sheen"], 0.0)?;
         params.sheen_roughness = self.scalar_input(id, &["Sheen Roughness"], 0.3)?;
         params.sheen_tint = self.color_input(id, &["Sheen Tint"], [1.0, 1.0, 1.0, 1.0])?[..3]
@@ -1167,6 +1182,10 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
         params.normal = normalize_or(
             self.vector_input(id, &["Normal"], self.hit_ctx.normal)?,
             self.hit_ctx.normal,
+        );
+        params.coat_normal = normalize_or(
+            self.vector_input(id, &["Coat Normal"], params.normal)?,
+            params.normal,
         );
         record_unevaluated_inputs(
             self.hit_ctx.warnings,

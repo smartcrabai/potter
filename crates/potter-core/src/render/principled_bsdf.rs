@@ -30,42 +30,49 @@ use crate::shader::{BsdfParams, dielectric_f0};
 /// Roughness floor shared with the sampler; Cycles treats roughness below ~1e-5 as delta.
 const MIN_ROUGHNESS: f64 = 0.02;
 
-/// Selection probabilities of the three sampling branches, identical to the thresholds
-/// `path.rs` uses to pick a branch.
+/// Selection probabilities of the four sampling branches, identical to the thresholds `path.rs`
+/// uses to pick a branch: transmission, diffuse, coat, specular.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct LobeProbabilities {
     pub(crate) diffuse: f64,
+    pub(crate) coat: f64,
     pub(crate) specular: f64,
     pub(crate) transmission: f64,
 }
 
-pub(crate) fn lobe_probabilities(params: &BsdfParams) -> LobeProbabilities {
+pub(crate) fn lobe_probabilities(params: &BsdfParams, view: DVec3) -> LobeProbabilities {
     let metallic = params.metallic.clamp(0.0, 1.0);
     let transmission = params.transmission.clamp(0.0, 1.0);
     let diffuse_weight = ((1.0 - metallic) * (1.0 - transmission)).max(0.0);
+    // The coat's layering albedo is its selection weight: Cycles' sample weight of the coat closure.
+    let coat_weight = coat_layer(params, view).map_or(0.0, |coat| coat.albedo);
     let specular_weight = (metallic
         + dielectric_f0(params.ior, params.specular_ior_level) * (1.0 - metallic))
         .max(1.0e-4);
-    let total = diffuse_weight + transmission + specular_weight;
+    let total = diffuse_weight + coat_weight + transmission + specular_weight;
     LobeProbabilities {
         diffuse: diffuse_weight / total,
+        coat: coat_weight / total,
         specular: specular_weight / total,
         transmission: transmission / total,
     }
 }
 
-/// Exact density of the continuous (diffuse + specular) directions drawn by `path.rs`, in solid
-/// angle. Diffuse is cosine-distributed; specular is the GGX half-vector distribution D·cosθh
-/// mapped to the reflected direction.
+/// Exact density of the continuous (diffuse, coat and specular) directions drawn by `path.rs`, in
+/// solid angle. Diffuse is cosine-distributed; the coat and specular lobes are the GGX half-vector
+/// distribution D·cosθh mapped to the reflected direction, with their own roughness.
 pub(crate) fn continuous_density(
     params: &BsdfParams,
     normal: DVec3,
     view: DVec3,
     light: DVec3,
 ) -> f64 {
-    let probabilities = lobe_probabilities(params);
+    let probabilities = lobe_probabilities(params, view);
     let n_dot_l = normal.dot(light).max(0.0);
     let mut density = probabilities.diffuse * n_dot_l / PI;
+    if let Some(coat) = coat_layer(params, view) {
+        density += probabilities.coat * half_vector_pdf(coat.normal, coat.roughness, view, light);
+    }
     let half = (view + light).normalize_or_zero();
     let n_dot_h = normal.dot(half).max(0.0);
     let v_dot_h = view.dot(half).max(0.0);
@@ -76,6 +83,20 @@ pub(crate) fn continuous_density(
     }
     density
 }
+
+/// Density in solid angle of the reflection of `view` about the half vector drawn with
+/// `sample_ggx_half`: `D(h)·(n·h) / (4 v·h)` for the half vector of `view` and `light`.
+fn half_vector_pdf(normal: DVec3, roughness: f64, view: DVec3, light: DVec3) -> f64 {
+    let half = (view + light).normalize_or_zero();
+    let n_dot_h = normal.dot(half).max(0.0);
+    let v_dot_h = view.dot(half).max(0.0);
+    if v_dot_h <= 0.0 {
+        return 0.0;
+    }
+    let pdf_half = ggx_distribution(ggx_alpha_squared(roughness), n_dot_h) * n_dot_h;
+    pdf_half / (4.0 * v_dot_h).max(1.0e-8)
+}
+
 
 /// Diffuse lobe of the Principled BSDF: Lambert under the dielectric-layering weight, times
 /// reflectance. It depends on the view only (the layering albedo is view-dependent), so an area
