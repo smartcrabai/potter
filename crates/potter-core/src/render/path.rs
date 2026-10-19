@@ -14,7 +14,9 @@ use crate::{
     },
 };
 
-use super::principled_bsdf::{continuous_density, evaluate as evaluate_bsdf, lobe_probabilities};
+use super::principled_bsdf::{
+    continuous_density, evaluate as evaluate_bsdf, light_lobes_coefficient, lobe_probabilities,
+};
 use super::{
     bvh::{Bvh, BvhHit},
     light_model::{
@@ -1480,8 +1482,15 @@ fn direct_lighting(
         } else {
             1.0
         };
-        contribution += evaluate_bsdf(&surface.params, normal, view, sample.direction)
-            * sample.radiance
+        // The lobes the light excludes are dropped from the value, but the MIS weight keeps the full
+        // BSDF density, as Cycles' `surface_shader_bsdf_eval` drops closures and keeps their pdf.
+        contribution += light_lobes_coefficient(
+            &surface.params,
+            normal,
+            view,
+            sample.direction,
+            light.ray_mask,
+        ) * sample.radiance
             * (cosine * visibility * mis);
     }
     let direction = match importance {

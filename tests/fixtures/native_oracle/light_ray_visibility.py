@@ -5,9 +5,9 @@ area lights above them. The lights' `visible_*` flags change what the camera see
 
   GlossyOff   visible_glossy=False. Its disk is absent from the sphere's mirror image, so the
               sphere's centre, where the mirror reflects it straight back up, is dark.
-  DiffuseOff  visible_diffuse=False and visible_glossy=False. A diffuse bounce no longer hits the
-              disk, so the floor under it keeps only the light that is light-sampled. It is not
-              reflected in the sphere.
+  DiffuseOff  visible_diffuse=False and visible_glossy=False. Cycles drops the diffuse closure from
+              the disk's direct lighting as well as from diffuse bounce hits, so the floor under it
+              receives no light from the disk. It is not reflected in the sphere.
 
 Each light is also drawn with default flags into a second render. The test checks that the flags
 change the reference, so a reference that lost the scene cannot pass by matching a broken render.

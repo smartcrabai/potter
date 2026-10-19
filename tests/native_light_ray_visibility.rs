@@ -47,9 +47,10 @@ const PIXEL_TOLERANCE: f64 = 0.01;
 /// (name, centre in metres, half width in metres). Each probe shows one light flag's effect:
 /// - `highlight`: the sphere's centre, where it mirrors GlossyOff straight back up. GlossyOff is
 ///   visible_glossy=False, so the reference is dark here, while the default render is bright.
-/// - `floor_diffuse`: the floor under DiffuseOff. visible_diffuse=False removes the disk's share
-///   that diffuse bounces would reach, so the reference is much darker than the default render.
-/// - `floor_far`: a floor point away from both lights' pools, lit through diffuse bounces only.
+/// - `floor_diffuse`: the floor under DiffuseOff. visible_diffuse=False drops the disk's direct
+///   diffuse light, so the reference is much darker than the default render.
+/// - `floor_far`: a floor point that both lights reach directly, away from the sphere. DiffuseOff's
+///   share of it is dropped as well, so it is darker than the default render too.
 const PATCHES: [(&str, [f64; 2], f64); 3] = [
     ("highlight", [0.0, 0.0], 0.03),
     ("floor_diffuse", [1.0, -0.9], 0.15),

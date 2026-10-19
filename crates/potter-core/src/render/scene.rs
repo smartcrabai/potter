@@ -31,7 +31,7 @@ use super::{
         point_intensity, spot_attenuation,
     },
     path::object_for_index,
-    principled_bsdf::{diffuse_coefficient, specular_coefficient},
+    principled_bsdf::light_lobes_coefficient,
     raster::{
         AlphaMode, Line, Mode, SurfaceHit, SurfaceShader, Triangle, blend_color,
         blend_corner_normals, blend_uv,
@@ -1471,10 +1471,11 @@ fn world_face_normals(
 }
 
 /// Ray-visibility flags that a Beauty engine does not honour, one warning per flag switched away
-/// from Blender's default for the node kind. Neither engine reads a light's `visible_shadow`
-/// (Cycles' `light_object_visibility_flags`, EEVEE's `eevee_light.cc`). Realtime Beauty honours
-/// mesh camera and shadow flags and light diffuse and glossy flags, as EEVEE does. The path tracer
-/// honours every mesh flag and every light flag but camera: it draws no light emitter to the camera.
+/// from Blender's default for the node kind. A light's `visible_shadow` is stored and round-trips
+/// without a warning: Blender reads it nowhere (Cycles' `light_object_visibility_flags`, EEVEE's
+/// `eevee_light.cc`), so no engine loses it. Realtime Beauty honours mesh camera and shadow flags
+/// and light diffuse and glossy flags, as EEVEE does. The path tracer honours every mesh flag and
+/// every light flag but camera: it draws no light emitter to the camera.
 fn ray_visibility_warnings(
     node_id: &Id,
     node: &Node,
@@ -1487,14 +1488,12 @@ fn ray_visibility_warnings(
         ("transmission", RayKind::Transmission),
         ("volume_scatter", RayKind::VolumeScatter),
     ];
-    const REALTIME_LIGHT: [(&str, RayKind); 4] = [
+    const REALTIME_LIGHT: [(&str, RayKind); 3] = [
         ("camera", RayKind::Camera),
-        ("shadow", RayKind::Shadow),
         ("transmission", RayKind::Transmission),
         ("volume_scatter", RayKind::VolumeScatter),
     ];
-    const PATH_LIGHT: [(&str, RayKind); 2] =
-        [("camera", RayKind::Camera), ("shadow", RayKind::Shadow)];
+    const PATH_LIGHT: [(&str, RayKind); 1] = [("camera", RayKind::Camera)];
     let flags: &[(&str, RayKind)] = match (path_traced, node.kind == "light") {
         (true, true) => &PATH_LIGHT,
         (true, false) => &[],
@@ -2237,7 +2236,7 @@ fn light_contribution(
             // Integrated Lambert irradiance is exact for rectangles and the visibility weight
             // scales it. The specular lobe is evaluated towards the emitter centre.
             let toward_centre = (position - point).normalize_or_zero();
-            light_lobes_coefficient(params, normal, view, toward_centre, lobes)
+            light_lobes_coefficient(params, normal, view, toward_centre, lobes.mask())
                 * color
                 * (irradiance * visible_weight / total_weight)
         }
@@ -2348,31 +2347,9 @@ fn punctual_radiance(
     if normal_light_cosine <= 0.0 {
         return DVec3::ZERO;
     }
-    light_lobes_coefficient(params, normal, view, light, lobes)
+    light_lobes_coefficient(params, normal, view, light, lobes.mask())
         * color
         * (intensity * normal_light_cosine)
-}
-
-/// The diffuse and specular lobes of `params` towards `light`, each kept only where the light
-/// emits through it: EEVEE applies a light's `visible_diffuse` and `visible_glossy` per light.
-fn light_lobes_coefficient(
-    params: &BsdfParams,
-    normal: DVec3,
-    view: DVec3,
-    light: DVec3,
-    lobes: RayVisibility,
-) -> DVec3 {
-    let diffuse = if lobes.allows(RayKind::Diffuse) {
-        diffuse_coefficient(params, normal, view)
-    } else {
-        DVec3::ZERO
-    };
-    let specular = if lobes.allows(RayKind::Glossy) {
-        specular_coefficient(params, normal, view, light)
-    } else {
-        DVec3::ZERO
-    };
-    diffuse + specular
 }
 
 #[cfg(test)]

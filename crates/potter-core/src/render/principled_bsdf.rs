@@ -25,6 +25,7 @@ use std::f64::consts::PI;
 use glam::DVec3;
 
 use super::principled_tables::{ggx_energy, ggx_energy_average, ggx_gen_schlick_ior_s};
+use crate::model::RayKind;
 use crate::shader::{BsdfParams, dielectric_f0};
 
 /// Roughness floor shared with the sampler; Cycles treats roughness below ~1e-5 as delta.
@@ -176,6 +177,30 @@ pub(crate) fn evaluate(params: &BsdfParams, normal: DVec3, view: DVec3, light: D
         return DVec3::ZERO;
     }
     diffuse_coefficient(params, normal, view) + specular_coefficient(params, normal, view, light)
+}
+
+/// The diffuse and specular lobes of `params` towards `light`, each kept only where the light's
+/// ray mask admits its ray kind. Cycles drops a closure from a light's direct lighting when that
+/// light excludes its kind (`surface_shader.h`, `_surface_shader_exclude`), and EEVEE applies a
+/// light's `visible_diffuse` and `visible_glossy` the same way.
+pub(crate) fn light_lobes_coefficient(
+    params: &BsdfParams,
+    normal: DVec3,
+    view: DVec3,
+    light: DVec3,
+    ray_mask: u8,
+) -> DVec3 {
+    let diffuse = if ray_mask & RayKind::Diffuse.bit() != 0 {
+        diffuse_coefficient(params, normal, view)
+    } else {
+        DVec3::ZERO
+    };
+    let specular = if ray_mask & RayKind::Glossy.bit() != 0 {
+        specular_coefficient(params, normal, view, light)
+    } else {
+        DVec3::ZERO
+    };
+    diffuse + specular
 }
 
 /// The base colour clamped to 1 (Cycles' `clamped_base_color`, used by the F82 metal lobe).
