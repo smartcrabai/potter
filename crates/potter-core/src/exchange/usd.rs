@@ -1811,7 +1811,8 @@ fn parse_usda(text: &str, scene_id: String) -> Result<(SceneDoc, Vec<Loss>)> {
                 base_color: color,
                 metallic,
                 roughness,
-                double_sided: property_bool(material, "potter:doubleSided").unwrap_or(false),
+                // Blender's USD importer leaves `use_backface_culling` off, so a foreign material is double-sided.
+                double_sided: property_bool(material, "potter:doubleSided").unwrap_or(true),
                 ..Material::default()
             },
         );

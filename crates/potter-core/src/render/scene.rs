@@ -552,7 +552,11 @@ pub(super) fn extract_geometry(
                             }
                         }),
                         alpha_threshold: material.map_or(0.5, |material| material.alpha_threshold),
-                        double_sided: material.is_some_and(|value| value.double_sided),
+                        // Only Beauty culls by the material's backface setting (EEVEE). Solid, Wire and the
+                        // id, normal and depth passes draw the Workbench geometry with back faces, as Blender does.
+                        // A face without a material shades with Blender's Default Surface, which is not culled.
+                        double_sided: !matches!(mode, Mode::Beauty)
+                            || material.is_none_or(|value| value.double_sided),
                         material_index,
                         uv,
                         layer_uvs,
@@ -1542,7 +1546,7 @@ impl SurfaceShader for SceneShader<'_> {
                 &shadows.point_maps,
             )
         });
-        let mut color = shade(
+        let color = shade(
             self.doc,
             self.snapshot,
             hit.point,
@@ -1554,13 +1558,6 @@ impl SurfaceShader for SceneShader<'_> {
             shadow,
             self.images,
         )?;
-        if matches!(self.mode, Mode::Beauty)
-            && let Some(params) = graph_params
-        {
-            color[0] += params.emission_color[0] * params.emission_strength;
-            color[1] += params.emission_color[1] * params.emission_strength;
-            color[2] += params.emission_color[2] * params.emission_strength;
-        }
         Ok(color)
     }
 }
@@ -1998,8 +1995,7 @@ fn shade(
     }
     // Beauty only: Solid/preview keeps Blender Solid's viewport-colour rule and ignores the closure
     // weight. In Beauty, reflectance weights every reflective closure (ambient, direct,
-    // environment); emission is added unscaled by the caller, as Cycles' `EmissionNode::compile`
-    // (intern/cycles/scene/shader_nodes.cpp:3071-3098) emits only NODE_CLOSURE_EMISSION.
+    // environment).
     let reflectance = if matches!(mode, Mode::Beauty) {
         params.reflectance.clamp(0.0, 1.0)
     } else {
@@ -2007,6 +2003,16 @@ fn shade(
     };
     let result = result * reflectance;
     let result = result.max(DVec3::ZERO).min(DVec3::splat(1.0));
+    // Emission sits outside the reflectance weight and the clamp: Cycles' `EmissionNode` emits
+    // NODE_CLOSURE_EMISSION unscaled (intern/cycles/scene/shader_nodes.cpp:3071-3098), and neither
+    // EEVEE nor Cycles clamps the strength (gpu_shader_material_principled.glsl:179,
+    // intern/cycles/kernel/svm/closure.h:206-207).
+    let emission = if matches!(mode, Mode::Beauty) {
+        DVec3::from_array(params.emission_color) * params.emission_strength
+    } else {
+        DVec3::ZERO
+    };
+    let result = result + emission;
     Ok([result.x, result.y, result.z, alpha])
 }
 
@@ -2672,6 +2678,63 @@ mod shading_normal_tests {
         assert_eq!(color[3], 1.0);
         Ok(())
     }
+
+    #[test]
+    fn beauty_triangles_take_double_sided_from_their_material_or_default_surface()
+    -> crate::error::Result<()> {
+        let initial = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        let applied = crate::ops::apply_batch(
+            &initial,
+            &json!({
+                "schema_version": 1,
+                "base_revision": 0,
+                "operations": [
+                    {"op":"material.create","id":"single","double_sided":false},
+                    {"op":"material.create","id":"double"},
+                    {"op":"node.create","id":"single_body","kind":"plane","params":{"size":1.0},"material":"single"},
+                    {"op":"node.create","id":"double_body","kind":"plane","params":{"size":1.0},"transform":{"translation":[3.0,0.0,0.0]},"material":"double"},
+                    {"op":"node.create","id":"bare_body","kind":"plane","params":{"size":1.0},"transform":{"translation":[6.0,0.0,0.0]}}
+                ]
+            }),
+        )?;
+        let snapshot = Snapshot::evaluate(&applied.doc, &EvaluationContext::default())?;
+        let geometry = extract_geometry(
+            &applied.doc,
+            &snapshot,
+            Mode::Beauty,
+            false,
+            &BTreeMap::new(),
+        )?;
+        // Each node's triangles carry the object index recorded for that node.
+        let expected = [
+            ("single_body", false),
+            ("double_body", true),
+            ("bare_body", true),
+        ];
+        for (node, double_sided) in expected {
+            let node_id = Id::new(node).expect("valid id");
+            let object = geometry
+                .objects
+                .iter()
+                .find(|object| object.node_id == node_id)
+                .expect("node is rendered");
+            let triangles = geometry
+                .triangles
+                .iter()
+                .filter(|triangle| triangle.object_index == object.index)
+                .collect::<Vec<_>>();
+            // Beauty splits triangles that are not lit per pixel, so the count varies by material.
+            assert!(!triangles.is_empty(), "{node} has no triangles");
+            assert!(
+                triangles
+                    .iter()
+                    .all(|triangle| triangle.double_sided == double_sided),
+                "{node} double_sided should be {double_sided}"
+            );
+        }
+        Ok(())
+    }
+
     fn source_triangle(positions: [DVec3; 3], normals: [DVec3; 3]) -> Triangle {
         Triangle {
             positions,

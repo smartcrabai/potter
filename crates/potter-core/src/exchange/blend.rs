@@ -2941,6 +2941,12 @@ fn build_imported_graph(
                 .map_err(|_| invalid_intermediate("render seed is out of range"))?,
             max_bounces: u32::try_from(integer_field(&render, "max_bounces", 4))
                 .map_err(|_| invalid_intermediate("render max_bounces is out of range"))?,
+            transparent_max_bounces: u32::try_from(integer_field(
+                &render,
+                "transparent_max_bounces",
+                8,
+            ))
+            .map_err(|_| invalid_intermediate("render transparent_max_bounces is out of range"))?,
             dicing_rate: number_field(&render, "dicing_rate", 1.0),
             preview_dicing_rate: number_field(&render, "preview_dicing_rate", 8.0),
             max_subdivisions: u32::try_from(integer_field(&render, "max_subdivisions", 12))
@@ -3317,7 +3323,7 @@ fn build_imported_graph(
                 double_sided: item
                     .get("double_sided")
                     .and_then(Value::as_bool)
-                    .unwrap_or(false),
+                    .unwrap_or(true),
                 displacement_method: displacement_method_field(name, item)?,
                 displacement_scale: number_field(item, "displacement_scale", 1.0),
                 displacement_midlevel: number_field(item, "displacement_midlevel", 0.5),
@@ -8324,6 +8330,41 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
                 ),
             )),
         }
+    }
+    // Workbench draws back faces unless the scene's viewport shading culls them; Potter's raster has no such setting.
+    for scene in raw
+        .get("scenes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|scene| scene["display_backface_culling"].as_bool() == Some(true))
+    {
+        losses.push(loss(
+            "blender.scene.display_backface_culling",
+            scene.get("name").and_then(Value::as_str),
+            "Blender's Workbench backface culling is not imported; Potter's solid preview draws back faces",
+        ));
+    }
+    // Cycles' area spread (`intern/cycles/kernel/light/area.h`, `area_light_spread_attenuation`)
+    // restricts emission to a cone and clamps the sampled region. Potter's area lights have no
+    // spread, so a non-default spread is reported rather than dropped. The default is pi.
+    for light in raw
+        .get("lights")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|light| light["type"].as_str() == Some("AREA"))
+        .filter(|light| {
+            light["spread"]
+                .as_f64()
+                .is_some_and(|spread| (spread - std::f64::consts::PI).abs() > 1.0e-6)
+        })
+    {
+        losses.push(loss(
+            "blender.light.spread",
+            light.get("name").and_then(Value::as_str),
+            "Blender's area light spread is not imported; Potter's area lights emit over the full hemisphere",
+        ));
     }
     for material in raw
         .get("materials")
@@ -17402,6 +17443,26 @@ mod camera_import_tests {
             .into_iter()
             .map(|loss| loss.feature_id)
             .collect()
+    }
+
+    #[test]
+    fn non_default_area_light_spread_is_reported_and_the_default_is_not() {
+        let light = |light_type: &str, spread: f64| json!({"name": "Spot", "type": light_type, "spread": spread});
+        let reported = |lights: Vec<Value>| -> Vec<String> {
+            import_losses(&json!({ "lights": lights }))
+                .into_iter()
+                .map(|loss| loss.feature_id)
+                .collect()
+        };
+        assert_eq!(
+            reported(vec![light("AREA", std::f64::consts::PI)]),
+            Vec::<String>::new()
+        );
+        assert_eq!(reported(vec![light("POINT", 0.5)]), Vec::<String>::new());
+        assert_eq!(
+            reported(vec![light("AREA", 0.5)]),
+            vec!["blender.light.spread".to_owned()]
+        );
     }
 
     #[test]

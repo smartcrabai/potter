@@ -215,7 +215,7 @@ Empty registries are also explicit. Standalone graphs / physics / tracking, etc.
 - Changing kind requires an explicit convert operation. Report losses to the source descriptor, attributes, rig, animation, etc. No implicit convert / apply / bake.
 - Materials are slot arrays plus face assignments. Support simplified base_color / metallic / roughness input through shader graphs as well. Preserve linear RGBA, alpha, all shader values, and the original graph.
 
-init creates an empty Scene `scene_main`, Collection `collection_root`, View Layer `view_main`, current frame=1, range 1-250, fps=24, and fps_base=1. The default material is linear RGBA=[0.6,0.6,0.6,1], metallic=0, roughness=0.8, double_sided=false. camera / world are null; an empty scene is valid.
+init creates an empty Scene `scene_main`, Collection `collection_root`, View Layer `view_main`, current frame=1, range 1-250, fps=24, and fps_base=1. The default material is linear RGBA=[0.6,0.6,0.6,1], metallic=0, roughness=0.8, double_sided=true. camera / world are null; an empty scene is valid.
 
 ## 5. Operations JSON
 
@@ -328,6 +328,7 @@ Implement all families below in the first release. Each variant MUST cover every
 - material.create / update support both simplified PBR input and full shader graphs. For a referenced material.delete, explicitly handle assignments; do not silently change them to the default.
 - An ID collision yields ID_EXISTS; do not rename automatically. For Blender name collisions, also create a name mapping report and manage by ID.
 - A stroke is a sequence of world-space samples with time, pressure, radius, strength, falloff, and symmetry. Convert screen input from the Snapshot, camera, and depth, and record the resulting world-space sequence.
+- Clay Strips, Inflate, and Layer treat each sample as one Blender DOTS dab, applied in order to the positions earlier dabs left, with the vertex normals of the stroke start. Each dab runs once per symmetry pass (x, y, z combinations in Blender's order) and its strength is scaled by Blender's symmetry feather. The default falloff is `smoother` for Clay Strips and `smooth` for the others.
 - Validate attribute, material, UV, weight, shape key, and rig mappings after topology changes. If preservation is impossible, return an error; do not save corrupted creation data based on guesses.
 
 ## 6. Atomic Editing and Retries

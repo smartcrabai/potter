@@ -120,7 +120,7 @@ fn scene_schema() -> Value {
         "unit":{"type":"object","required":["system","scale_length"],"properties":{"system":{"type":"string"},"scale_length":{"type":"number","exclusiveMinimum":0}},"additionalProperties":false},
         "view_layer":{"type":"object","required":["name","excluded_collections"],"properties":{"name":{"type":"string"},"excluded_collections":{"type":"array","items":{"$ref":"#/$defs/id"}}},"additionalProperties":false},
         "scene":{"type":"object","required":["name","root_collection","view_layers","frame_current","frame_start","frame_end","fps","fps_base","camera","world","unit","markers","render","rigid_body_world"],"properties":{"name":{"type":"string"},"root_collection":{"$ref":"#/$defs/id"},"view_layers":registry_schema("view_layer"),"frame_current":{"type":"number"},"frame_start":{"type":"integer"},"frame_end":{"type":"integer"},"fps":{"type":"integer","minimum":1},"fps_base":{"type":"number","exclusiveMinimum":0},"camera":{"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]},"world":{"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]},"unit":{"$ref":"#/$defs/unit"},"render":{"$ref":"#/$defs/render_settings"},"markers":{"type":"array","items":{"$ref":"#/$defs/marker"}},"rigid_body_world":{"oneOf":[{"$ref":"#/$defs/rigid_body_world"},{"type":"null"}]}},"additionalProperties":false},
-        "render_settings":{"type":"object","required":["resolution_x","resolution_y","resolution_percentage","samples","seed","max_bounces","film_transparent","engine","use_sequencer","audio_codec","passes"],"properties":{"resolution_x":{"type":"integer","minimum":1,"maximum":16384},"resolution_y":{"type":"integer","minimum":1,"maximum":16384},"resolution_percentage":{"type":"integer","minimum":1,"maximum":100},"samples":{"type":"integer","minimum":1,"maximum":1_000_000},"seed":{"type":"integer","minimum":0,"maximum":u32::MAX},"max_bounces":{"type":"integer","minimum":0,"maximum":1024},"film_transparent":{"type":"boolean"},"engine":{"enum":["path","realtime"]},"use_sequencer":{"type":"boolean"},"audio_codec":{"enum":["wav","flac"]},"passes":{"type":"array","items":{"type":"string"}},"cryptomatte_accurate":{"type":"boolean"}},"additionalProperties":false},
+        "render_settings":{"type":"object","required":["resolution_x","resolution_y","resolution_percentage","samples","seed","max_bounces","film_transparent","engine","use_sequencer","audio_codec","passes"],"properties":{"resolution_x":{"type":"integer","minimum":1,"maximum":16384},"resolution_y":{"type":"integer","minimum":1,"maximum":16384},"resolution_percentage":{"type":"integer","minimum":1,"maximum":100},"samples":{"type":"integer","minimum":1,"maximum":1_000_000},"seed":{"type":"integer","minimum":0,"maximum":u32::MAX},"max_bounces":{"type":"integer","minimum":0,"maximum":1024},"transparent_max_bounces":{"type":"integer","minimum":0,"maximum":1024,"default":8},"film_transparent":{"type":"boolean"},"engine":{"enum":["path","realtime"]},"use_sequencer":{"type":"boolean"},"audio_codec":{"enum":["wav","flac"]},"passes":{"type":"array","items":{"type":"string"}},"cryptomatte_accurate":{"type":"boolean"}},"additionalProperties":false},
         "marker":{"type":"object","required":["id","name","frame"],"properties":{"id":{"$ref":"#/$defs/id"},"name":{"type":"string"},"frame":{"type":"number"}},"additionalProperties":false},
         "rigid_body_world":{"type":"object","properties":{"enabled":{"type":"boolean"},"gravity":{"$ref":"#/$defs/vec3"},"substeps":{"type":"integer","minimum":1,"maximum":128},"solver_iterations":{"type":"integer","minimum":1,"maximum":128},"frame_start":{"type":"integer","minimum":i32::MIN,"maximum":i32::MAX},"frame_end":{"type":"integer","minimum":i32::MIN,"maximum":i32::MAX},"seed":{"type":"integer","minimum":0,"maximum":u32::MAX}},"additionalProperties":false},
         "rigid_body":{"type":"object","properties":{"type":{"enum":["active","passive"]},"mass":{"type":"number","minimum":0},"friction":{"type":"number","minimum":0},"restitution":{"type":"number","minimum":0,"maximum":1},"shape":{"enum":["box","sphere","convex_hull","mesh"]},"linear_damping":{"type":"number","minimum":0},"angular_damping":{"type":"number","minimum":0},"initial_velocity":{"$ref":"#/$defs/vec3"}},"additionalProperties":false},
@@ -1006,7 +1006,7 @@ fn operation_contract(name: &str) -> OperationContract {
             vec!["op", "target", "brush", "samples"],
             "mesh object and stroke samples",
             "shared|single_user for shared data",
-            json!({"falloff":"smooth","symmetry":[]}),
+            json!({"symmetry":[]}),
         ),
         "sculpt.dyntopo" => (
             vec![
@@ -1975,7 +1975,7 @@ fn field_schema(operation: &str, field: &str) -> Value {
                 json!({"enum":["draw","clay_strips","inflate","grab","smooth","flatten","pinch","crease","layer","snake_hook","thumb","rotate","nudge","blob","scrape","fill","draw_sharp","elastic_deform","pose_lite","boundary_lite"]})
             }
             "falloff" => {
-                json!({"enum":["smooth","sphere","root","sharp","linear","constant"],"default":"smooth"})
+                json!({"enum":["smooth","smoother","sphere","root","sharp","linear","constant"],"description":"Falloff curve. Defaults to smoother for clay_strips and smooth for other brushes."})
             }
             "samples" => {
                 json!({"type":"array","minItems":1,"items":{"type":"object","required":["position","pressure","radius","strength","time"],"properties":{"position":vec_schema(3),"pressure":{"type":"number","minimum":0,"maximum":1},"radius":{"type":"number","minimum":0},"strength":{"type":"number"},"time":{"type":"number"}},"additionalProperties":false}})
@@ -2331,6 +2331,7 @@ fn set_schema(operation: &str) -> Value {
             "samples":{"type":"integer","minimum":1,"maximum":1_000_000},
             "seed":{"type":"integer","minimum":0,"maximum":u32::MAX},
             "max_bounces":{"type":"integer","minimum":0,"maximum":1024},
+            "transparent_max_bounces":{"type":"integer","minimum":0,"maximum":1024},
             "film_transparent":{"type":"boolean"},
             "engine":{"enum":["path","realtime"]},
             "use_sequencer":{"type":"boolean"},

@@ -453,6 +453,12 @@ impl MtlWriter<'_> {
         if !self.write_output {
             self.losses.extend(surface_losses);
         }
+        if !surface.double_sided {
+            self.loss(
+                "material.mtl.double_sided",
+                "MTL has no two-sided flag; Blender's OBJ importer reads the material as double-sided",
+            );
+        }
         let [red, green, blue, alpha] = surface.base_color.factor;
         let metallic = surface.metallic;
         let level = surface.specular.as_ref().map_or(0.5, specular_level);
