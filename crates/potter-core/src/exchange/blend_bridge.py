@@ -6057,6 +6057,16 @@ def _pack_udim_image(name, colorspace, udim, record_alpha_mode):
         shutil.rmtree(directory)
 
 
+def _placeholder_udim_image(name):
+    # A TILED image whose `<UDIM>` filepath names no file: Blender holds it with no loadable tile, so the image and its
+    # filepath survive a save and reopen (probed). Its tiles and base are reported as losses by the exporter.
+    image = bpy.data.images.new("potter-udim-placeholder", width=1, height=1, alpha=True)
+    image.source = "TILED"
+    image.filepath = "//%s.<UDIM>.exr" % name
+    image.reload()
+    return image
+
+
 def export_doc(doc, target, pack, scene_hash, context):
     CACHE_FILES_BY_IDENTITY.clear()
     DEFERRED_ID_ASSIGNMENTS.clear()
@@ -6212,8 +6222,11 @@ def export_doc(doc, target, pack, scene_hash, context):
             "linear": "Linear Rec.709",
             "non_color": "Non-Color",
         }.get(item.get("colorspace"))
-        if udim:
-            # A UDIM image packs every tile, the base tile 1001 included, into one TILED image.
+        if udim and udim["format"] == "placeholder":
+            image = _placeholder_udim_image(item["name"])
+            image.name = item["name"]
+        elif udim:
+            # A UDIM image packs every listed tile, the base tile 1001 included, into one TILED image.
             image = _pack_udim_image(item["name"], colorspace, udim, item.get("alpha_mode", "straight"))
             image.name = item["name"]
         elif sidecar is None and png_bytes is not None:
@@ -6246,7 +6259,7 @@ def export_doc(doc, target, pack, scene_hash, context):
                 item.get("alpha_mode", "straight")
             ]
             _pack_image(image, [channel for pixel in pixels for channel in pixel])
-        if item.get("source") == "packed" and image.packed_file is None:
+        if not udim and item.get("source") == "packed" and image.packed_file is None:
             image.pack()
         set_id(image, image_id)
         image_metadata = {key: value for key, value in item.items()

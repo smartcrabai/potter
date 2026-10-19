@@ -867,14 +867,10 @@ fn udim_export_tiles(
             png,
         ));
     }
-    // shortcut: a UDIM image with no loadable tile has nothing to pack, so its export fails; upgrade when Blender can
-    // hold a TILED image whose tiles are all missing.
+    // A UDIM image with no loadable tile is written as a TILED placeholder with no files. Blender holds such an image
+    // (its `<UDIM>` filepath names nothing), and the missing base and tiles are reported as export losses.
     if sources.is_empty() {
-        return Err(PotError::with_details(
-            ErrorCode::ExportFailed,
-            "UDIM image has no loadable tile to export",
-            json!({"image": image.name}),
-        ));
+        return Ok(json!({"format": "placeholder", "tiles": []}));
     }
     let all_png = sources.iter().all(|source| source.4.is_some());
     let tiles = sources

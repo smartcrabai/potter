@@ -600,6 +600,91 @@ fn check_tiled_without_files(blender: &Path, fixture: &Path) -> Result<(), Box<d
     )
 }
 
+/// Exports a UDIM image with no loadable tile through `pot`. The strict export refuses it, the lossy export writes a TILED
+/// placeholder with its missing base and tiles reported as losses, and the placeholder reopens as the same TILED record
+/// with a missing base.
+fn check_missing_export(
+    blender: &Path,
+    fixture: &Path,
+    blend_name: &str,
+) -> Result<(), Box<dyn Error>> {
+    let blend = fixture.join(blend_name);
+    let stem = blend_name.trim_end_matches(".blend");
+    let project = fixture.join(format!("project_export_{stem}"));
+    let out = fixture.join(format!("export_{stem}.blend"));
+    let init = pot_ok(&["init", path_str(&project)?], "project initialization")?;
+    assert_eq!(init["ok"], true);
+    pot_ok(
+        &[
+            "import",
+            path_str(&project)?,
+            "--file",
+            path_str(&blend)?,
+            "--format",
+            "blend",
+            "--mode",
+            "replace",
+            "--base-revision",
+            "0",
+            "--blender",
+            path_str(blender)?,
+            "--allow-lossy",
+        ],
+        "missing-image import",
+    )?;
+    let strict = Command::new(env!("CARGO_BIN_EXE_pot"))
+        .args([
+            "export",
+            path_str(&project)?,
+            "--format",
+            "blend",
+            "--out",
+            path_str(&out)?,
+            "--blender",
+            path_str(blender)?,
+        ])
+        .output()?;
+    assert!(
+        !strict.status.success(),
+        "{stem}: strict export accepted a missing UDIM image"
+    );
+    let lossy = pot_ok(
+        &[
+            "export",
+            path_str(&project)?,
+            "--format",
+            "blend",
+            "--out",
+            path_str(&out)?,
+            "--blender",
+            path_str(blender)?,
+            "--allow-lossy",
+        ],
+        "missing-image lossy export",
+    )?;
+    assert_eq!(lossy["ok"], true, "{stem}: lossy export failed");
+    let reopened = import_blend(&out, Some(blender))?;
+    let image = find_udim_image(&reopened)?;
+    assert!(image.tiled, "{stem}: the TILED source was not exported");
+    assert_eq!(
+        (image.width, image.height),
+        (0, 0),
+        "{stem}: missing base reopened with a size"
+    );
+    assert!(
+        image.blob.is_none(),
+        "{stem}: missing base reopened with a blob"
+    );
+    assert!(
+        reopened
+            .losses
+            .iter()
+            .any(|loss| loss.feature_id == "blender.image.udim_tile_missing"),
+        "{stem}: the reopened missing image reports no loss"
+    );
+    Ok(())
+}
+
 #[test]
 fn blender_udim_tiles_import_sample_and_round_trip() -> Result<(), Box<dyn Error>> {
     let Some(blender) = blender_executable() else {
@@ -636,6 +721,8 @@ fn blender_udim_tiles_import_sample_and_round_trip() -> Result<(), Box<dyn Error
     check_missing_tile(&blender, &fixture)?;
     fs::remove_file(fixture.join("udim.1001.png"))?;
     check_missing_base(&blender, &fixture)?;
+    check_missing_export(&blender, &fixture, "udim_single_tile.blend")?;
+    check_missing_export(&blender, &fixture, "udim_base_plane.blend")?;
     // The packed variant must read only its packed tiles, so the remaining tile files are removed first.
     for name in ["udim.u1_v1.png", "udim.u2_v1.png"] {
         fs::remove_file(fixture.join(name))?;
