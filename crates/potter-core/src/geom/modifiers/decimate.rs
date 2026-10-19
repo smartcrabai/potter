@@ -16,11 +16,11 @@ use crate::{
 };
 
 use super::subdivision_uv::carried_pins;
-use crate::geom::pool_slots::PoolSlots;
 use super::{
     Mesh, Polygon, bool_param, cyclic_pairs, decimate_compact, edge_key, id_indices,
     invalid_parameter, number_param, positions, schema_value,
 };
+use crate::geom::pool_slots::PoolSlots;
 mod collapse;
 mod heap;
 mod interp;

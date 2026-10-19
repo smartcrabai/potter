@@ -19,6 +19,7 @@ use crate::error::{PotError, Result};
 use glam::{DMat4, DVec3, Mat3, Mat4};
 use serde_json::{Value, json};
 
+use crate::geom::pool_slots::PoolSlots;
 use crate::geom::{
     Mesh, attribute_keys, clnor,
     color_layers::{self, ColorDomain},
@@ -28,7 +29,6 @@ use crate::geom::{
     triangulate::{BeautyScratch, beautify_with_scratch},
     uv_layers,
 };
-use crate::geom::pool_slots::PoolSlots;
 
 use super::dissolve::Poly;
 use super::float_split_net::CornerSource;
