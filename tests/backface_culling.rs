@@ -78,11 +78,12 @@ fn solid_preview_draws_back_faces_as_workbench_does() -> TestResult {
     })?;
     // A default plane has no material, so it is single-sided in the material model. Solid still
     // draws its back face.
-    apply_operations(
+    let applied = apply_operations(
         &scene,
         root.path(),
         json!([{"op": "node.create", "id": "plane", "kind": "plane", "params": {"size": 2.0}}]),
     )?;
+    assert_eq!(applied["ok"], json!(true), "plane apply failed: {applied}");
 
     let out = root.path().join("preview");
     let preview = pot_json(|command| {
@@ -125,9 +126,10 @@ fn realtime_beauty_culls_single_sided_back_faces_as_eevee_does() -> TestResult {
     pot_json(|command| {
         command.arg("init").arg(&scene);
     })?;
-    // Emissive red, so every face Beauty draws is lit whatever the lights are. The material is
-    // single-sided (`double_sided` defaults to false), as EEVEE's `use_backface_culling` is on.
-    apply_operations(
+    // Single-sided material (`double_sided` defaults to false), matching EEVEE's
+    // `use_backface_culling` on. With no lights or world the plane is black, which still contrasts
+    // with the 13/255 background, so coverage measures whether the plane is drawn.
+    let applied = apply_operations(
         &scene,
         root.path(),
         json!([
@@ -146,6 +148,11 @@ fn realtime_beauty_culls_single_sided_back_faces_as_eevee_does() -> TestResult {
              "set": {"resolution_x": 64, "resolution_y": 64, "resolution_percentage": 100}}
         ]),
     )?;
+    assert_eq!(
+        applied["ok"],
+        json!(true),
+        "beauty scene apply failed: {applied}"
+    );
 
     let render_view = |camera: &str| -> TestResult<std::path::PathBuf> {
         let out = root.path().join(camera);
