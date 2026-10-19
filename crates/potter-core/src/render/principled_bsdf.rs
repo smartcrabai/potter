@@ -558,6 +558,7 @@ fn f82_fss(f0: DVec3, b: DVec3) -> DVec3 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Material;
 
     #[test]
     fn layered_diffuse_weight_keeps_what_the_layer_does_not_reflect() {
