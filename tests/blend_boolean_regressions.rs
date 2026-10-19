@@ -74,6 +74,14 @@ const REGRESSION_CASES: [&str; 23] = [
     "sphere_closed64_hole_tolerant_on",
 ];
 
+/// The sphere cases: EXACT Booleans on 1.7k to 7k-face UV spheres, the heaviest of the corpus.
+const SPHERE_CASES: [&str; 4] = [
+    "sphere_open64_hole_tolerant_on",
+    "sphere_open64_hole_tolerant_off",
+    "sphere_open128_hole_tolerant_on",
+    "sphere_closed64_hole_tolerant_on",
+];
+
 /// Hosts whose custom normals are authored in Potter before evaluation.
 const CUSTOM_NORMAL_HOSTS: [&str; 2] = ["cavity_wall_normal", "cavity_wall_normal.cutter"];
 
@@ -196,8 +204,9 @@ fn expected_material_names(expected: &Value) -> TestResult<Vec<Option<String>>> 
     Ok(names)
 }
 
-#[test]
-fn exact_boolean_regressions_match_blender() -> TestResult {
+/// Runs `cases` against Blender's expectations: one generator run, one import, one Potter batch for
+/// the operations those cases need, and each case compared with its expectation.
+fn check_regression_cases(cases: &[&str]) -> TestResult {
     let blender = blender_executable().ok_or(BLENDER_REQUIRED)?;
     let fixture =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/boolean_parity/regressions");
@@ -219,46 +228,55 @@ fn exact_boolean_regressions_match_blender() -> TestResult {
         REGRESSION_CASES.len()
     );
     let mut failures = Vec::new();
-    for case in REGRESSION_CASES {
-        if !expectations.contains_key(case) {
+    for case in cases {
+        if !expectations.contains_key(*case) {
             failures.push(format!("{case}: Blender expectation is missing"));
         }
     }
 
     // One batch: author the cavity custom normals, then apply the TRANSFER Boolean.
     let mut operations = Vec::new();
-    for name in CUSTOM_NORMAL_HOSTS {
-        let node_id = find_node(&document, name)?;
-        operations.push(face_normal_operation(&document, &node_id)?);
+    if cases.contains(&"cavity_wall_normal") {
+        for name in CUSTOM_NORMAL_HOSTS {
+            let node_id = find_node(&document, name)?;
+            operations.push(face_normal_operation(&document, &node_id)?);
+        }
     }
-    let applied_id = find_node(&document, APPLIED_CASE)?;
-    let modifier_id = document.nodes[&applied_id]
-        .modifiers
-        .first()
-        .ok_or("the TRANSFER host has no Boolean modifier")?
-        .id
-        .as_str()
-        .to_owned();
-    operations.push(json!({
-        "op": "modifier.apply",
-        "target": {"id": applied_id.as_str()},
-        "modifier_id": modifier_id,
-    }));
-    let batch = root.join("regression_batch.json");
-    fs::write(
-        &batch,
-        serde_json::to_vec(&json!({
-            "schema_version": 1,
-            "base_revision": 1,
-            "operations": operations,
-        }))?,
-    )?;
-    let project_path = project.to_str().ok_or("project path is not UTF-8")?;
-    let batch_path = batch.to_str().ok_or("batch path is not UTF-8")?;
-    run_pot(&["apply", project_path, "--file", batch_path, "--json"])?;
-    document = read_scene(&project)?;
+    if cases.contains(&APPLIED_CASE) {
+        let applied_id = find_node(&document, APPLIED_CASE)?;
+        let modifier_id = document.nodes[&applied_id]
+            .modifiers
+            .first()
+            .ok_or("the TRANSFER host has no Boolean modifier")?
+            .id
+            .as_str()
+            .to_owned();
+        operations.push(json!({
+            "op": "modifier.apply",
+            "target": {"id": applied_id.as_str()},
+            "modifier_id": modifier_id,
+        }));
+    }
+    if !operations.is_empty() {
+        let batch = root.join("regression_batch.json");
+        fs::write(
+            &batch,
+            serde_json::to_vec(&json!({
+                "schema_version": 1,
+                "base_revision": 1,
+                "operations": operations,
+            }))?,
+        )?;
+        let project_path = project.to_str().ok_or("project path is not UTF-8")?;
+        let batch_path = batch.to_str().ok_or("batch path is not UTF-8")?;
+        run_pot(&["apply", project_path, "--file", batch_path, "--json"])?;
+        document = read_scene(&project)?;
+    }
 
-    for (case, expected_json) in &expectations {
+    for case in cases {
+        let Some(expected_json) = expectations.get(*case) else {
+            continue;
+        };
         let node_id = find_node(&document, case)?;
         if expected_json["kind"] == "applied" {
             // Blender's `slot.material` is the effective material: a DATA-linked slot shows the mesh's
@@ -298,4 +316,20 @@ fn exact_boolean_regressions_match_blender() -> TestResult {
         failures.join("\n")
     );
     Ok(())
+}
+
+/// The non-sphere regression cases. The sphere cases run in their own test, so each test stays
+/// under the per-test budget; together they are exactly `REGRESSION_CASES`.
+#[test]
+fn exact_boolean_regressions_match_blender() -> TestResult {
+    let cases: Vec<&str> = REGRESSION_CASES
+        .into_iter()
+        .filter(|case| !SPHERE_CASES.contains(case))
+        .collect();
+    check_regression_cases(&cases)
+}
+
+#[test]
+fn exact_boolean_sphere_regressions_match_blender() -> TestResult {
+    check_regression_cases(&SPHERE_CASES)
 }

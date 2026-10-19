@@ -34,8 +34,8 @@ import bpy
 blend_out, exr_out, json_out, kind = sys.argv[sys.argv.index("--") + 1:][:4]
 
 PLANE_CASES = {"n2c4": (2, 4), "n2c3": (2, 3), "n2c2": (2, 2), "n1c2": (1, 2)}
-WIDTH = 32
-HEIGHT = 32
+WIDTH = 16
+HEIGHT = 16
 SAMPLES = 256
 PLANE_SPACING = 1.0
 LIGHT_HEIGHT = 5.0
@@ -44,8 +44,9 @@ LIGHT_RADIUS = 0.5
 SIGMA = 0.25
 SLAB_SIZE = 4.0
 CARD_HEIGHT = -2.5
-# Fractions of the frame: the same patch grid as `tests/native_transparent_cap.rs`.
-PATCH = [0.25 + 0.5 * index / 8 for index in range(9)]
+# Pixel rows and columns of the patch, as fractions of the frame (pixel centres): the central 12 x 12
+# of 16 x 16, the same window as `tests/native_transparent_cap.rs`.
+PATCH = [(index + 0.5) / WIDTH for index in range(2, 14)]
 
 
 def black_principled(material, alpha):

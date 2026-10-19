@@ -20,15 +20,16 @@ import bpy
 
 blend_out, exr_out, json_out = sys.argv[sys.argv.index("--") + 1:][:3]
 
-WIDTH = 64
-HEIGHT = 64
+WIDTH = 32
+HEIGHT = 32
 PLANE_COUNT = 6
 PLANE_SPACING = 1.0
 ALPHA = 0.5
 MAX_BOUNCES = 4
 WORLD = (1.0, 0.5, 0.0)
-# Fractions of the frame: the same patch grid as `tests/native_point_spot_light.rs`.
-PATCH = [0.25 + 0.5 * index / 8 for index in range(9)]
+# Pixel rows and columns of the patch (pixel centres, fractions of the frame): the central 16 x 16 of
+# 32 x 32, the same window as `tests/native_transparent_bounce.rs`.
+PATCH = [(index + 0.5) / WIDTH for index in range(8, 24)]
 
 bpy.ops.wm.read_factory_settings(use_empty=True)
 scene = bpy.context.scene
