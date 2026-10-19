@@ -2688,7 +2688,8 @@ fn affine_inline_volume_displacement_preserves_sampling_and_mesh_space()
     let expected_sample = 1.0 - 0.5 / max_voxel_side_length;
     let sampled = potter_core::geom::volume::sample_density_checked(sample_position, displaced)?;
     assert!(
-        (sampled - expected_sample).abs() <= 1.0e-9,
+        // The displaced density is stored as f32 (Blender's grid is float too), so the bound is one f32 epsilon.
+        (sampled - expected_sample).abs() <= f64::from(f32::EPSILON),
         "affine displaced density {sampled} differs from Blender's index-space value {expected_sample}",
     );
     let repeated = evaluated_volume(&document, &snapshot, "affine_repeated")?;
