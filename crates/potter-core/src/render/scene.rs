@@ -1962,11 +1962,12 @@ fn shade(
     };
     let result = result * reflectance;
     let result = result.max(DVec3::ZERO).min(DVec3::splat(1.0));
-    // Emission sits outside the reflectance weight and the clamp, as Cycles' `EmissionNode::compile`
-    // (intern/cycles/scene/shader_nodes.cpp:3071-3098) emits only NODE_CLOSURE_EMISSION. Path
-    // tracing clamps strength at zero the same way (path.rs emission term).
+    // Emission sits outside the reflectance weight and the clamp: Cycles' `EmissionNode` emits
+    // NODE_CLOSURE_EMISSION unscaled (intern/cycles/scene/shader_nodes.cpp:3071-3098), and neither
+    // EEVEE nor Cycles clamps the strength (gpu_shader_material_principled.glsl:179,
+    // intern/cycles/kernel/svm/closure.h:206-207).
     let emission = if matches!(mode, Mode::Beauty) {
-        DVec3::from_array(params.emission_color) * params.emission_strength.max(0.0)
+        DVec3::from_array(params.emission_color) * params.emission_strength
     } else {
         DVec3::ZERO
     };
