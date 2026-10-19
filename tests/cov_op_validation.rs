@@ -258,6 +258,138 @@ fn constraint_parameter_rejections_report_codes_and_pointers() {
 }
 
 #[test]
+fn camera_value_rejections_report_codes_and_pointers() {
+    let cases = [
+        invalid_case(
+            "fisheye_equisolid lens above Blender's fisheye_lens range",
+            json!([]),
+            json!({"op":"camera.create","id":"camera_main","projection":"panorama","panorama_type":"fisheye_equisolid","fisheye_lens":150.0}),
+            "INVALID_ARGUMENT",
+            Some("/operations/0/fisheye_lens"),
+            None,
+        ),
+        invalid_case(
+            "fisheye_lens below Blender's fisheye_lens range",
+            json!([]),
+            json!({"op":"camera.create","id":"camera_main","projection":"panorama","panorama_type":"fisheye_equisolid","fisheye_lens":0.001}),
+            "INVALID_ARGUMENT",
+            Some("/operations/0/fisheye_lens"),
+            None,
+        ),
+        invalid_case(
+            "fisheye_lens on a perspective camera",
+            json!([]),
+            json!({"op":"camera.create","id":"camera_main","fisheye_lens":12.0}),
+            "INVALID_OPERATION",
+            Some("/operations/0/fisheye_lens"),
+            None,
+        ),
+        invalid_case(
+            "fisheye_equisolid sensor narrower than Blender's minimum",
+            json!([]),
+            json!({"op":"camera.create","id":"camera_main","projection":"panorama","panorama_type":"fisheye_equisolid","sensor_width_mm":0.5}),
+            "INVALID_ARGUMENT",
+            Some("/operations/0/sensor_width_mm"),
+            None,
+        ),
+        invalid_case(
+            "fisheye field of view below Blender's minimum",
+            json!([]),
+            json!({"op":"camera.create","id":"camera_main","projection":"panorama","panorama_type":"fisheye_equidistant","fisheye_fov":0.1}),
+            "INVALID_ARGUMENT",
+            Some("/operations/0/fisheye_fov"),
+            None,
+        ),
+        invalid_case(
+            "fisheye field of view beyond Blender's 10π hard maximum",
+            json!([]),
+            json!({"op":"camera.create","id":"camera_main","projection":"panorama","panorama_type":"fisheye_equidistant","fisheye_fov":40.0}),
+            "INVALID_ARGUMENT",
+            Some("/operations/0/fisheye_fov"),
+            None,
+        ),
+        invalid_case(
+            "fisheye field of view on an equirectangular panorama",
+            json!([]),
+            json!({"op":"camera.create","id":"camera_main","projection":"panorama","panorama_type":"equirectangular","fisheye_fov":2.0}),
+            "INVALID_OPERATION",
+            Some("/operations/0/fisheye_fov"),
+            None,
+        ),
+        invalid_case(
+            "retired fisheye projection",
+            json!([]),
+            json!({"op":"camera.create","id":"camera_main","projection":"fisheye"}),
+            "INVALID_OPERATION",
+            Some("/operations/0/projection"),
+            None,
+        ),
+        invalid_case(
+            "perspective lens below Blender's minimum of 1 mm",
+            json!([]),
+            json!({"op":"camera.create","id":"camera_main","lens_mm":0.5}),
+            "INVALID_ARGUMENT",
+            Some("/operations/0/lens_mm"),
+            None,
+        ),
+        invalid_case(
+            "equirectangular lens below Blender's minimum of 1 mm",
+            json!([]),
+            json!({"op":"camera.create","id":"camera_main","projection":"panorama","panorama_type":"equirectangular","lens_mm":0.5}),
+            "INVALID_ARGUMENT",
+            Some("/operations/0/lens_mm"),
+            None,
+        ),
+        invalid_case(
+            "perspective sensor narrower than Blender's minimum of 1 mm",
+            json!([]),
+            json!({"op":"camera.create","id":"camera_main","sensor_width_mm":0.5}),
+            "INVALID_ARGUMENT",
+            Some("/operations/0/sensor_width_mm"),
+            None,
+        ),
+        invalid_case(
+            "clip start below Blender's clip range minimum",
+            json!([]),
+            json!({"op":"camera.create","id":"camera_main","clip_start":1e-7}),
+            "INVALID_ARGUMENT",
+            Some("/operations/0/clip_start"),
+            None,
+        ),
+    ];
+    run_invalid_cases(&cases);
+}
+
+/// Blender's default full-sphere and fisheye limits are float32 values, and a camera set to them must be committed, since
+/// its default values are then stored as omitted. `setup_scene` asserts that the operation applied.
+#[test]
+fn camera_blender_default_panorama_limits_are_committed() {
+    let full = f64::from(std::f32::consts::PI);
+    let (_directory, scene) = setup_scene(&json!([
+        {"op":"camera.create","id":"camera_sphere","projection":"panorama","panorama_type":"equirectangular",
+         "longitude_min":-full,"longitude_max":full,"latitude_min":-0.5*full,"latitude_max":0.5*full},
+        {"op":"camera.create","id":"camera_fisheye","projection":"panorama","panorama_type":"fisheye_equidistant","fisheye_fov":full},
+        {"op":"camera.create","id":"camera_fisheye_max","projection":"panorama","panorama_type":"fisheye_equisolid",
+         "fisheye_fov":potter_core::model::FISHEYE_FOV_MAX,"fisheye_lens":potter_core::model::FISHEYE_LENS_MAX,"lens_mm":1.0}
+    ]));
+    let document: Value =
+        serde_json::from_slice(&fs::read(scene.join("scene.json")).unwrap()).unwrap();
+    let cameras: Vec<&Value> = document["data_blocks"]
+        .as_object()
+        .unwrap()
+        .values()
+        .filter(|block| block["type"] == "camera")
+        .map(|block| &block["camera"])
+        .collect();
+    assert_eq!(cameras.len(), 3, "{document}");
+    assert!(
+        cameras
+            .iter()
+            .all(|camera| camera["projection"] == "panorama")
+    );
+}
+
+#[test]
 fn constraint_valid_boundaries_are_committed() {
     let (_directory, scene) = setup_scene(&json!([
         {"op":"node.create","id":"owner","kind":"empty"},

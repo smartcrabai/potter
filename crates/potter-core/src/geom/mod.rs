@@ -46,6 +46,7 @@ pub mod pointcloud;
 pub(crate) mod provenance;
 pub mod remesh;
 pub mod sculpt;
+mod sculpt_dabs;
 pub mod text;
 pub(crate) mod triangulate;
 pub(crate) mod uv_layers;
@@ -64,6 +65,28 @@ pub fn corner_normal_vectors(mesh: &Mesh) -> crate::error::Result<Vec<DVec3>> {
     let positions: Vec<DVec3> = mesh.vertices.iter().map(|vertex| vertex.co).collect();
     normals::corner_normals(mesh, &positions)
 }
+
+/// Corner signs of Blender's `primitive_cube_add` (`bmo_create_cube_exec`, `bmesh/operators/bmo_primitive.cc`):
+/// corners enumerate x, then y, then z, each from -1 to +1.
+const BOX_CORNER_SIGNS: [[f64; 3]; 8] = [
+    [-1.0, -1.0, -1.0],
+    [-1.0, -1.0, 1.0],
+    [-1.0, 1.0, -1.0],
+    [-1.0, 1.0, 1.0],
+    [1.0, -1.0, -1.0],
+    [1.0, -1.0, 1.0],
+    [1.0, 1.0, -1.0],
+    [1.0, 1.0, 1.0],
+];
+/// Face corner indices into [`BOX_CORNER_SIGNS`], Blender's `bmo_create_cube_exec` table.
+const BOX_FACES: [[usize; 4]; 6] = [
+    [0, 1, 3, 2],
+    [2, 3, 7, 6],
+    [6, 7, 5, 4],
+    [4, 5, 1, 0],
+    [2, 6, 4, 0],
+    [7, 3, 1, 5],
+];
 
 #[cfg(test)]
 mod mirror_oracle;
@@ -812,28 +835,34 @@ impl Mesh {
                 "box dimensions must be finite and positive",
             ));
         }
+        // Blender's `primitive_cube_add` order (`bmo_create_cube_exec`); see `BOX_CORNER_SIGNS`.
         let half = params.size * 0.5;
-        let positions = vec![
-            DVec3::new(-half.x, -half.y, -half.z),
-            DVec3::new(half.x, -half.y, -half.z),
-            DVec3::new(half.x, half.y, -half.z),
-            DVec3::new(-half.x, half.y, -half.z),
-            DVec3::new(-half.x, -half.y, half.z),
-            DVec3::new(half.x, -half.y, half.z),
-            DVec3::new(half.x, half.y, half.z),
-            DVec3::new(-half.x, half.y, half.z),
-        ];
-        Self::from_positions_and_faces(
-            positions,
-            vec![
-                vec![0, 3, 2, 1],
-                vec![4, 5, 6, 7],
-                vec![0, 1, 5, 4],
-                vec![1, 2, 6, 5],
-                vec![2, 3, 7, 6],
-                vec![3, 0, 4, 7],
-            ],
-        )
+        let mut mesh = Self::new();
+        let mut ids = [0_u32; 8];
+        for (id, sign) in ids.iter_mut().zip(BOX_CORNER_SIGNS) {
+            *id = mesh.insert_vertex(DVec3::new(
+                sign[0] * half.x,
+                sign[1] * half.y,
+                sign[2] * half.z,
+            ))?;
+        }
+        for face in BOX_FACES {
+            // BM_edges_from_verts_ensure (via BM_face_create_verts with create_edges) creates each
+            // boundary edge from the previous corner to the next, so the closing edge (last to first)
+            // comes first. Existing edges are reused.
+            let mut previous = face[3];
+            for corner in face {
+                let (first, second) = (ids[previous], ids[corner]);
+                if !mesh.edges.iter().any(|edge| {
+                    edge_key(edge.vertices[0], edge.vertices[1]) == edge_key(first, second)
+                }) {
+                    mesh.insert_edge([first, second])?;
+                }
+                previous = corner;
+            }
+            mesh.insert_face(face.iter().map(|&corner| ids[corner]).collect(), 0)?;
+        }
+        Ok(mesh)
     }
 
     /// Create a Blender-default or customized UV sphere.

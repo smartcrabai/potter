@@ -151,6 +151,21 @@ pub fn feature_catalog() -> Value {
             ],
             [true, true, true, true, true, false, false],
         ),
+        unsupported(
+            "shader.volume.spectral_extinction",
+            "Voxel volume with per-channel extinction",
+            "ShaderNodeVolumeAbsorption, ShaderNodeVolumeScatter, ShaderNodeVolumePrincipled",
+            &[
+                "volume.create",
+                "volume.update",
+                "material.create",
+                "material.update",
+                "graph.create",
+                "graph.node_add",
+                "graph.link",
+            ],
+            "Voxel volumes transport a grey extinction (the channel mean of the material's per-channel extinction) with a per-channel albedo, so a Volume whose Absorption or Scatter colour is not grey reports UNSUPPORTED_FEATURE and its colour is approximated. Material volumes on closed meshes transmit each channel exactly; their in-scatter is a single-scatter approximation.",
+        ),
         supported(
             "render.volume.scattering",
             "Density-weighted Henyey-Greenstein scattering, direct lighting, environment illumination, and volume emission",
@@ -1768,7 +1783,7 @@ pub fn feature_catalog() -> Value {
         ),
         supported(
             "camera.data",
-            "Perspective, orthographic, panorama, and fisheye camera data",
+            "Perspective, orthographic, and panorama camera data",
             "Camera",
             &["camera.create", "camera.update"],
             [true, true, true, true, true, false, false],
@@ -1782,7 +1797,7 @@ pub fn feature_catalog() -> Value {
         ),
         supported(
             "camera.panorama",
-            "Equirectangular and equidistant fisheye projections",
+            "Equirectangular panoramas with longitude and latitude limits, and fisheye equidistant and equisolid projections",
             "Camera",
             &["camera.create", "camera.update"],
             [true, true, true, true, true, false, false],

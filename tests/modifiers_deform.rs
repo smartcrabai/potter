@@ -1381,14 +1381,17 @@ with open(sys.argv[-1], 'w', encoding='utf-8') as output:
             {"op":"vertex_group.assign","target":{"id":"subject"},"group_id":"influence","weights":weights},
             {"op":"modifier.create","target":{"id":"subject"},"id":"deform","type":"mesh_deform","params":{"object":"cage","precision":precision,"use_dynamic_bind":dynamic,"vertex_group":"Influence","invert_vertex_group":invert}},
             {"op":"modifier.bind","target":{"id":"subject"},"modifier_id":"deform"},
+            // Ids follow Blender's primitive_cube_add corner order: 0 (-,-,-), 1 (-,-,+), 2 (-,+,-), 3 (-,+,+),
+            // 4 (+,-,-), 5 (+,-,+), 6 (+,+,-), 7 (+,+,+). Each translation is the Blender oracle's
+            // (x + 0.12y, y + 0.08x, 1.5z) displacement of that corner on a size-4 cube.
             {"op":"mesh.transform_elements","target":{"id":"cage","elements":{"domain":"vertex","ids":["v0"]}},"translation":[-0.24,-0.16,-1.0]},
-            {"op":"mesh.transform_elements","target":{"id":"cage","elements":{"domain":"vertex","ids":["v1"]}},"translation":[-0.24,0.16,-1.0]},
-            {"op":"mesh.transform_elements","target":{"id":"cage","elements":{"domain":"vertex","ids":["v2"]}},"translation":[0.24,0.16,-1.0]},
-            {"op":"mesh.transform_elements","target":{"id":"cage","elements":{"domain":"vertex","ids":["v3"]}},"translation":[0.24,-0.16,-1.0]},
-            {"op":"mesh.transform_elements","target":{"id":"cage","elements":{"domain":"vertex","ids":["v4"]}},"translation":[-0.24,-0.16,1.0]},
+            {"op":"mesh.transform_elements","target":{"id":"cage","elements":{"domain":"vertex","ids":["v4"]}},"translation":[-0.24,0.16,-1.0]},
+            {"op":"mesh.transform_elements","target":{"id":"cage","elements":{"domain":"vertex","ids":["v6"]}},"translation":[0.24,0.16,-1.0]},
+            {"op":"mesh.transform_elements","target":{"id":"cage","elements":{"domain":"vertex","ids":["v2"]}},"translation":[0.24,-0.16,-1.0]},
+            {"op":"mesh.transform_elements","target":{"id":"cage","elements":{"domain":"vertex","ids":["v1"]}},"translation":[-0.24,-0.16,1.0]},
             {"op":"mesh.transform_elements","target":{"id":"cage","elements":{"domain":"vertex","ids":["v5"]}},"translation":[-0.24,0.16,1.0]},
-            {"op":"mesh.transform_elements","target":{"id":"cage","elements":{"domain":"vertex","ids":["v6"]}},"translation":[0.24,0.16,1.0]},
-            {"op":"mesh.transform_elements","target":{"id":"cage","elements":{"domain":"vertex","ids":["v7"]}},"translation":[0.24,-0.16,1.0]}
+            {"op":"mesh.transform_elements","target":{"id":"cage","elements":{"domain":"vertex","ids":["v7"]}},"translation":[0.24,0.16,1.0]},
+            {"op":"mesh.transform_elements","target":{"id":"cage","elements":{"domain":"vertex","ids":["v3"]}},"translation":[0.24,-0.16,1.0]}
         ]);
         cases.push((name, operations, if dynamic { "dynamic" } else { "static" }));
     }

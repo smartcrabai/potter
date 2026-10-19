@@ -30,7 +30,7 @@ mod blender_checked;
 mod process;
 
 /// Owners of the measured Blender divergences in `behavior_scenarios.json`.
-const KNOWN_GAP_OWNERS: &[&str] = &["D", "PR15"];
+const KNOWN_GAP_OWNERS: &[&str] = &[];
 
 const F_MODIFIERS: &[&str] = &[
     "armature",

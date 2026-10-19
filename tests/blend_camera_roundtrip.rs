@@ -178,7 +178,31 @@ fn panorama_camera_round_trips_as_a_blender_pano_camera() -> Result<(), Box<dyn 
 }
 
 #[test]
-fn blender_panorama_ranges_import_as_a_reported_loss() -> Result<(), Box<dyn Error>> {
+fn panorama_ranges_round_trip_without_loss() -> Result<(), Box<dyn Error>> {
+    let Some(camera) = panorama_round_trip(
+        &json!({
+            "projection": "panorama",
+            "panorama_type": "equirectangular",
+            "longitude_min": -1.2,
+            "longitude_max": 2.0,
+            "latitude_min": -0.7,
+            "latitude_max": 1.1,
+        }),
+        "import bpy; cam = [c for c in bpy.data.cameras if c.type == 'PANO'][0]; assert cam.panorama_type == 'EQUIRECTANGULAR'; assert abs(cam.longitude_min + 1.2) < 1e-6 and abs(cam.longitude_max - 2.0) < 1e-6; assert abs(cam.latitude_min + 0.7) < 1e-6 and abs(cam.latitude_max - 1.1) < 1e-6",
+    )?
+    else {
+        return Ok(());
+    };
+    assert_eq!(camera["panorama_type"], "equirectangular");
+    assert_close_value(&camera["longitude_min"], -1.2);
+    assert_close_value(&camera["longitude_max"], 2.0);
+    assert_close_value(&camera["latitude_min"], -0.7);
+    assert_close_value(&camera["latitude_max"], 1.1);
+    Ok(())
+}
+
+#[test]
+fn panorama_ranges_blender_cannot_hold_import_as_a_reported_loss() -> Result<(), Box<dyn Error>> {
     let Some(blender) = blender_executable() else {
         eprintln!("skipping the panorama range import; no executable Blender was found");
         return Ok(());
@@ -194,18 +218,18 @@ fn blender_panorama_ranges_import_as_a_reported_loss() -> Result<(), Box<dyn Err
         &mut export_command(&scene, &blend, &blender, &[]),
         "exporting the panorama camera",
     )?;
-    // Blender-side edit: non-default longitude and latitude limits, saved back to the file.
+    // Blender-side edit: a longitude span beyond a full turn, which Potter's panorama cannot hold.
     blender_python(
         &blender,
         &blend,
-        "import bpy; cam = [c for c in bpy.data.cameras if c.type == 'PANO'][0]; cam.longitude_min = -1.2; cam.longitude_max = 2.0; cam.latitude_min = -0.7; cam.latitude_max = 1.1; bpy.ops.wm.save_as_mainfile(filepath=bpy.data.filepath)",
+        "import bpy; cam = [c for c in bpy.data.cameras if c.type == 'PANO'][0]; cam.longitude_min = 0.0; cam.longitude_max = 7.0; bpy.ops.wm.save_as_mainfile(filepath=bpy.data.filepath)",
     )?;
 
     // Strict import refuses the loss and names it.
     let strict = import_command(&scene, &blend, &blender, &[]).output()?;
     assert!(
         !strict.status.success(),
-        "non-default panorama ranges must not import silently"
+        "an unrepresentable panorama range must not import silently"
     );
     let report = format!(
         "{}{}",
@@ -217,7 +241,7 @@ fn blender_panorama_ranges_import_as_a_reported_loss() -> Result<(), Box<dyn Err
         "the strict import must name the range loss: {report}"
     );
 
-    // With --allow-lossy the import proceeds, keeps the panorama, and records the loss.
+    // With --allow-lossy the import proceeds, keeps the panorama at the full sphere, and records the loss.
     let output = run(
         &mut import_command(&scene, &blend, &blender, &["--allow-lossy"]),
         "importing the ranged panorama with --allow-lossy",
@@ -234,38 +258,143 @@ fn blender_panorama_ranges_import_as_a_reported_loss() -> Result<(), Box<dyn Err
     );
     let camera = camera_data(&scene)?;
     assert_eq!(camera["projection"], "panorama");
+    assert!(
+        camera.get("longitude_max").is_none(),
+        "the unrepresentable range imports at the default limits: {camera}"
+    );
     Ok(())
 }
 
 #[test]
-fn fisheye_camera_export_needs_allow_lossy() -> Result<(), Box<dyn Error>> {
+fn fisheye_equidistant_round_trips_as_a_blender_fisheye_panorama() -> Result<(), Box<dyn Error>> {
+    let Some(camera) = panorama_round_trip(
+        &json!({"projection": "panorama", "panorama_type": "fisheye_equidistant", "fisheye_fov": 2.5}),
+        "import bpy; cam = [c for c in bpy.data.cameras if c.type == 'PANO'][0]; assert cam.panorama_type == 'FISHEYE_EQUIDISTANT'; assert abs(cam.fisheye_fov - 2.5) < 1e-6",
+    )?
+    else {
+        return Ok(());
+    };
+    assert_eq!(camera["projection"], "panorama");
+    assert_eq!(camera["panorama_type"], "fisheye_equidistant");
+    assert_close_value(&camera["fisheye_fov"], 2.5);
+    Ok(())
+}
+
+#[test]
+fn fisheye_equisolid_round_trips_its_lens_and_its_perspective_lens_apart()
+-> Result<(), Box<dyn Error>> {
+    // `lens` is the perspective focal length and `fisheye_lens` the equisolid one: Blender keeps them separate, so both
+    // round-trip, and the equisolid lens may be any value in Blender's fisheye range.
+    let Some(camera) = panorama_round_trip(
+        &json!({"projection": "panorama", "panorama_type": "fisheye_equisolid", "lens_mm": 35.0, "fisheye_lens": 12.0, "fisheye_fov": 3.0}),
+        "import bpy; cam = [c for c in bpy.data.cameras if c.type == 'PANO'][0]; assert cam.panorama_type == 'FISHEYE_EQUISOLID'; assert abs(cam.lens - 35.0) < 1e-6; assert abs(cam.fisheye_lens - 12.0) < 1e-6; assert abs(cam.fisheye_fov - 3.0) < 1e-6",
+    )?
+    else {
+        return Ok(());
+    };
+    assert_eq!(camera["panorama_type"], "fisheye_equisolid");
+    assert_close_value(&camera["lens_mm"], 35.0);
+    assert_close_value(&camera["fisheye_lens"], 12.0);
+    assert_close_value(&camera["fisheye_fov"], 3.0);
+    Ok(())
+}
+
+#[test]
+fn panorama_settings_on_a_perspective_camera_import_without_loss() -> Result<(), Box<dyn Error>> {
+    // Operations refuse a panorama field on a camera whose projection ignores it, so the value is set in Blender, as a
+    // Blender file can hold it (Blender stores these on every camera). Import keeps each value, and reports no loss.
     let Some(blender) = blender_executable() else {
-        eprintln!("skipping the fisheye export check; no executable Blender was found");
+        eprintln!(
+            "skipping the perspective panorama settings check; no executable Blender was found"
+        );
         return Ok(());
     };
     let directory = tempdir()?;
     let scene = directory.path().join("scene");
-    build_scene(&scene, &json!({"projection": "fisheye"}))?;
-    let blend = directory.path().join("fisheye.blend");
-
-    let strict = export_command(&scene, &blend, &blender, &[]).output()?;
-    assert!(
-        !strict.status.success(),
-        "a fisheye camera must not export to .blend silently"
-    );
-    let report = format!(
-        "{}{}",
-        String::from_utf8_lossy(&strict.stdout),
-        String::from_utf8_lossy(&strict.stderr)
-    );
-    assert!(
-        report.contains("blender.camera.fisheye"),
-        "the strict export must name the fisheye loss: {report}"
-    );
-
-    run(
-        &mut export_command(&scene, &blend, &blender, &["--allow-lossy"]),
-        "exporting the fisheye camera with --allow-lossy",
+    build_scene(
+        &scene,
+        &json!({"projection": "perspective", "lens_mm": 28.0}),
     )?;
+    let blend = directory.path().join("perspective.blend");
+    run(
+        &mut export_command(&scene, &blend, &blender, &[]),
+        "exporting the perspective camera",
+    )?;
+    blender_python(
+        &blender,
+        &blend,
+        "import bpy; cam = [c for c in bpy.data.cameras if c.type == 'PERSP'][0]; cam.fisheye_lens = 12.0; cam.fisheye_fov = 3.0; cam.longitude_min = -1.2; cam.latitude_max = 1.1; bpy.ops.wm.save_as_mainfile(filepath=bpy.data.filepath)",
+    )?;
+    let output = run(
+        &mut import_command(&scene, &blend, &blender, &[]),
+        "importing the perspective camera",
+    )?;
+    let imported: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(imported["result"]["losses"], json!([]));
+    let camera = camera_data(&scene)?;
+    assert_eq!(camera["projection"], "perspective");
+    assert_close_value(&camera["lens_mm"], 28.0);
+    assert_close_value(&camera["fisheye_lens"], 12.0);
+    assert_close_value(&camera["fisheye_fov"], 3.0);
+    assert_close_value(&camera["longitude_min"], -1.2);
+    assert_close_value(&camera["latitude_max"], 1.1);
+    Ok(())
+}
+
+/// Builds a panorama camera from `settings`, exports it strictly so that Potter loses nothing, checks the Blender camera with
+/// the Python `check` expression, and imports it back without losses. Returns the imported camera data, or `None` when
+/// no Blender is installed.
+fn panorama_round_trip(settings: &Value, check: &str) -> Result<Option<Value>, Box<dyn Error>> {
+    let Some(blender) = blender_executable() else {
+        eprintln!("skipping the panorama round trip; no executable Blender was found");
+        return Ok(None);
+    };
+    let directory = tempdir()?;
+    let scene = directory.path().join("scene");
+    build_scene(&scene, settings)?;
+    let blend = directory.path().join("panorama.blend");
+    run(
+        &mut export_command(&scene, &blend, &blender, &[]),
+        "exporting the panorama camera",
+    )?;
+    blender_python(&blender, &blend, check)?;
+    let output = run(
+        &mut import_command(&scene, &blend, &blender, &[]),
+        "importing the panorama camera",
+    )?;
+    let imported: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(imported["result"]["losses"], json!([]));
+    Ok(Some(camera_data(&scene)?))
+}
+
+/// Blender stores its camera values as float32, so a round-tripped value matches to well within 1e-6.
+fn assert_close_value(value: &Value, expected: f64) {
+    let actual = value
+        .as_f64()
+        .unwrap_or_else(|| panic!("expected a number, found {value}"));
+    assert!(
+        (actual - expected).abs() <= 1.0e-6,
+        "{actual} differs from {expected}"
+    );
+}
+
+#[test]
+fn camera_settings_blender_cannot_hold_are_refused_before_export() -> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    for (index, settings) in [
+        json!({"projection": "panorama", "panorama_type": "fisheye_equisolid", "fisheye_lens": 150.0}),
+        json!({"projection": "panorama", "panorama_type": "fisheye_equidistant", "fisheye_fov": 0.1}),
+        json!({"projection": "perspective", "lens_mm": 0.5}),
+        json!({"projection": "fisheye"}),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let scene = directory.path().join(format!("scene{index}"));
+        assert!(
+            build_scene(&scene, settings).is_err(),
+            "the camera settings must be refused: {settings}"
+        );
+    }
     Ok(())
 }
