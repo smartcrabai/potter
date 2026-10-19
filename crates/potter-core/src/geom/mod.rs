@@ -768,28 +768,52 @@ impl Mesh {
                 "box dimensions must be finite and positive",
             ));
         }
-        let half = params.size * 0.5;
-        let positions = vec![
-            DVec3::new(-half.x, -half.y, -half.z),
-            DVec3::new(half.x, -half.y, -half.z),
-            DVec3::new(half.x, half.y, -half.z),
-            DVec3::new(-half.x, half.y, -half.z),
-            DVec3::new(-half.x, -half.y, half.z),
-            DVec3::new(half.x, -half.y, half.z),
-            DVec3::new(half.x, half.y, half.z),
-            DVec3::new(-half.x, half.y, half.z),
+        // Blender's `primitive_cube_add` (`bmo_create_cube_exec`, bmesh/operators/bmo_primitive.cc):
+        // corners enumerate x, then y, then z, each from -1 to +1; faces follow Blender's table.
+        const CORNER_SIGNS: [[f64; 3]; 8] = [
+            [-1.0, -1.0, -1.0],
+            [-1.0, -1.0, 1.0],
+            [-1.0, 1.0, -1.0],
+            [-1.0, 1.0, 1.0],
+            [1.0, -1.0, -1.0],
+            [1.0, -1.0, 1.0],
+            [1.0, 1.0, -1.0],
+            [1.0, 1.0, 1.0],
         ];
-        Self::from_positions_and_faces(
-            positions,
-            vec![
-                vec![0, 3, 2, 1],
-                vec![4, 5, 6, 7],
-                vec![0, 1, 5, 4],
-                vec![1, 2, 6, 5],
-                vec![2, 3, 7, 6],
-                vec![3, 0, 4, 7],
-            ],
-        )
+        const FACES: [[usize; 4]; 6] = [
+            [0, 1, 3, 2],
+            [2, 3, 7, 6],
+            [6, 7, 5, 4],
+            [4, 5, 1, 0],
+            [2, 6, 4, 0],
+            [7, 3, 1, 5],
+        ];
+        let half = params.size * 0.5;
+        let mut mesh = Self::new();
+        let mut ids = [0_u32; 8];
+        for (id, sign) in ids.iter_mut().zip(CORNER_SIGNS) {
+            *id = mesh.insert_vertex(DVec3::new(
+                sign[0] * half.x,
+                sign[1] * half.y,
+                sign[2] * half.z,
+            ))?;
+        }
+        for face in FACES {
+            // BM_face_create_ngon_verts creates each boundary edge from the previous corner to the
+            // next, so the closing edge (last to first) comes first. Existing edges are reused.
+            let mut previous = face[3];
+            for corner in face {
+                let (first, second) = (ids[previous], ids[corner]);
+                if !mesh.edges.iter().any(|edge| {
+                    edge_key(edge.vertices[0], edge.vertices[1]) == edge_key(first, second)
+                }) {
+                    mesh.insert_edge([first, second])?;
+                }
+                previous = corner;
+            }
+            mesh.insert_face(face.iter().map(|&corner| ids[corner]).collect(), 0)?;
+        }
+        Ok(mesh)
     }
 
     /// Create a Blender-default or customized UV sphere.
