@@ -69,19 +69,17 @@ fn import_blend(
     Ok(serde_json::from_slice(&output.stdout)?)
 }
 
-fn inspect_node(project: &Path, id: &str, frame: u32) -> Result<Value, Box<dyn Error>> {
+fn inspect_scene(project: &Path, frame: u32) -> Result<Value, Box<dyn Error>> {
     let output = Command::new(env!("CARGO_BIN_EXE_pot"))
         .arg("inspect")
         .arg(project)
-        .args(["--id"])
-        .arg(id)
-        .args(["--frame"])
+        .arg("--frame")
         .arg(frame.to_string())
         .arg("--json")
         .output()?;
     if !output.status.success() {
         return Err(io::Error::other(format!(
-            "inspecting `{id}` at frame {frame} failed: stdout={} stderr={}",
+            "inspecting frame {frame} failed: stdout={} stderr={}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         ))
@@ -381,17 +379,26 @@ fn assert_import_inspection(
         .collect::<Vec<_>>();
     let actual_names = ids.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>();
     assert_eq!(actual_names, expected_names, "imported object set differs");
-    for (name, id) in ids {
-        if GATED_OBJECTS.contains(&name.as_str()) {
-            continue;
-        }
-        for frame in [1_u32, 5, 10] {
-            let inspected = inspect_node(project, &id, frame)?;
-            let item = inspected["result"]["items"]
-                .as_array()
-                .and_then(|items| items.first())
+    for frame in [1_u32, 5, 10] {
+        let inspected = inspect_scene(project, frame)?;
+        let items = inspected["result"]["items"]
+            .as_array()
+            .ok_or_else(|| io::Error::other(format!("frame {frame}: inspect items missing")))?;
+        for (name, id) in &ids {
+            if GATED_OBJECTS.contains(&name.as_str()) {
+                continue;
+            }
+            let item = items
+                .iter()
+                .find(|candidate| candidate["id"].as_str() == Some(id.as_str()))
                 .ok_or_else(|| io::Error::other(format!("{name}: inspect item missing")))?;
-            let frame_data = &source["frames"][frame.to_string()][&name];
+            if let Some(error) = item.get("evaluation_error") {
+                return Err(io::Error::other(format!(
+                    "{name} frame {frame}: evaluation failed: {error}"
+                ))
+                .into());
+            }
+            let frame_data = &source["frames"][frame.to_string()][name.as_str()];
             let expected_matrix = matrix_from_blender(&frame_data["matrix_world"])?;
             let actual_matrix = item["transform"]["world"]["matrix"]
                 .as_array()
