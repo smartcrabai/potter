@@ -4984,6 +4984,7 @@ fn decimate_compact(
     origin: Origin,
     source: &Mesh,
     keep_vertices: &[bool],
+    edge_order: &[[usize; 2]],
 ) -> Result<Mesh> {
     // Blender's BMesh keeps the live vertices no face or edge uses; `keep_vertices` marks them.
     let mut used: Vec<bool> = (0..points.len())
@@ -5017,12 +5018,54 @@ fn decimate_compact(
         *first = remap[*first];
         *second = remap[*second];
     }
+    let compact_order: Vec<[usize; 2]> = edge_order
+        .iter()
+        .map(|&[first, second]| [remap[first], remap[second]])
+        .collect();
     let origin = Origin {
         vertices: compact_origin,
         faces: origin.faces,
         corners: origin.corners,
     };
-    build_mesh(compact_points, polygons, loose, &origin, source)
+    // The edges take Blender's pool order before the provenance remap writes the edge-indexed data.
+    let mut result = build_topology(compact_points, polygons, loose)?;
+    order_edges(&mut result, &compact_order)?;
+    remap_attributes_with_basis(source, &mut result, &origin, &[], None)?;
+    validated(&result)?;
+    Ok(result)
+}
+
+/// Puts `mesh`'s edges in `pool_order`, the live edges as vertex-index pairs in Blender's edge pool
+/// order. Every mesh edge must appear once in `pool_order`, else the rebuilt mesh does not describe
+/// the decimated topology and the call fails.
+fn order_edges(mesh: &mut Mesh, pool_order: &[[usize; 2]]) -> Result<()> {
+    let (rebuilt, pool) = (mesh.edges.len(), pool_order.len());
+    let mismatch = move || {
+        PotError::new(
+            ErrorCode::InternalError,
+            format!(
+                "decimate edge order does not match the rebuilt mesh (rebuilt {rebuilt} edges, pool {pool} edges)"
+            ),
+        )
+    };
+    if rebuilt != pool {
+        return Err(mismatch());
+    }
+    let index_of = id_indices(mesh);
+    let rank: HashMap<(usize, usize), usize> = pool_order
+        .iter()
+        .enumerate()
+        .map(|(rank, &[first, second])| (edge_key(first, second), rank))
+        .collect();
+    let mut ranked = Vec::with_capacity(mesh.edges.len());
+    for edge in mesh.edges.drain(..) {
+        let [first, second] = edge.vertices.map(|id| index_of[&id]);
+        let position = *rank.get(&edge_key(first, second)).ok_or_else(mismatch)?;
+        ranked.push((position, edge));
+    }
+    ranked.sort_by_key(|&(position, _)| position);
+    mesh.edges = ranked.into_iter().map(|(_, edge)| edge).collect();
+    Ok(())
 }
 
 fn weld(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
@@ -5818,6 +5861,152 @@ mod tests {
         let mut modifier = modifier(true, modifier_type);
         modifier.params = serde_json::from_value(params).unwrap();
         modifier
+    }
+
+    /// Blender 5.2.2 Wave (`MOD_wave.cc`) at frame 20 on a jittered quad grid, with and without
+    /// `use_normal`. With it, Blender moves each vertex along `vert_normals()`, the angle-weighted
+    /// normal that `vertex_normals` computes, so the `use_normal` case pins that term.
+    #[test]
+    fn wave_use_normal_matches_blender_vert_normals() {
+        const ORACLE: &str = include_str!("../../../../tests/fixtures/wave/blender_wave.json");
+        let oracle: serde_json::Value = serde_json::from_str(ORACLE).unwrap();
+        let cases = oracle["cases"].as_array().unwrap();
+        assert_eq!(cases.len(), 2, "complete Blender wave oracle is required");
+        for case in cases {
+            let kind = case["kind"].as_str().unwrap();
+            let frame = case["frame"].as_f64().unwrap();
+            let faces: Vec<Vec<usize>> = case["faces"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|face| {
+                    face.as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|index| usize::try_from(index.as_u64().unwrap()).unwrap())
+                        .collect()
+                })
+                .collect();
+            let mesh =
+                Mesh::from_positions_and_faces(oracle_points(&case["positions"]), faces).unwrap();
+            let modifier = with_params("wave", case["params"].clone());
+            let result = super::advanced::wave(&mesh, &modifier, frame).unwrap();
+            let expected = oracle_points(&case["output"]);
+            assert_eq!(result.vertices.len(), expected.len());
+            for (index, (vertex, expected)) in result.vertices.iter().zip(&expected).enumerate() {
+                assert!(
+                    (vertex.co - *expected).abs().max_element() <= 2.0e-5,
+                    "{kind}: vertex {index} is {:?}, Blender {expected:?}",
+                    vertex.co
+                );
+            }
+        }
+    }
+
+    /// Points stored as `[x, y, z]` arrays in an oracle file.
+    fn oracle_points(value: &serde_json::Value) -> Vec<DVec3> {
+        value
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|point| {
+                let point = point.as_array().unwrap();
+                DVec3::new(
+                    point[0].as_f64().unwrap(),
+                    point[1].as_f64().unwrap(),
+                    point[2].as_f64().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    /// Blender 5.2.2 Triangulate modifier (`MOD_triangulate.cc`, BEAUTY quads and n-gons) over every
+    /// case of `tests/fixtures/triangulate`, including zero-area collinear zigzags and a figure-eight
+    /// whose Newell sum is zero. Triangles are compared as sets, each rotated to its smallest corner.
+    #[test]
+    fn triangulate_modifier_matches_blender_beauty_diagonals() {
+        const ORACLE: &str =
+            include_str!("../../../../tests/fixtures/triangulate/blender_triangulate.json");
+        let oracle: serde_json::Value = serde_json::from_str(ORACLE).unwrap();
+        let cases = oracle["cases"].as_array().unwrap();
+        assert_eq!(
+            cases.len(),
+            117,
+            "complete Blender triangulate oracle is required"
+        );
+        for case in cases {
+            let kind = case["kind"].as_str().unwrap();
+            let points: Vec<DVec3> = case["positions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|point| {
+                    let point = point.as_array().unwrap();
+                    DVec3::new(
+                        point[0].as_f64().unwrap(),
+                        point[1].as_f64().unwrap(),
+                        point[2].as_f64().unwrap(),
+                    )
+                })
+                .collect();
+            let count = points.len();
+            let mesh = Mesh::from_positions_and_faces(points, vec![(0..count).collect()]).unwrap();
+            let modifier = with_params(
+                "triangulate",
+                json!({
+                    "quad_method": "BEAUTY",
+                    "ngon_method": "BEAUTY",
+                    "min_vertices": 4,
+                    "keep_custom_normals": false,
+                }),
+            );
+            let result = evaluate_modifiers(&mesh, &[modifier]).unwrap();
+            let index: HashMap<u32, usize> = result
+                .vertices
+                .iter()
+                .enumerate()
+                .map(|(index, vertex)| (vertex.id, index))
+                .collect();
+            let actual: Vec<[usize; 3]> = result
+                .faces
+                .iter()
+                .map(|face| {
+                    assert_eq!(
+                        face.vertices.len(),
+                        3,
+                        "{kind}: modifier left a non-triangle"
+                    );
+                    [0, 1, 2].map(|corner| index[&face.vertices[corner]])
+                })
+                .collect();
+            let expected: Vec<[usize; 3]> = case["triangles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|triangle| {
+                    let triangle = triangle.as_array().unwrap();
+                    [0, 1, 2].map(|i| usize::try_from(triangle[i].as_u64().unwrap()).unwrap())
+                })
+                .collect();
+            assert_eq!(
+                canonical_triangles(&actual),
+                canonical_triangles(&expected),
+                "Blender BEAUTY diagonals for {kind}"
+            );
+        }
+    }
+
+    /// Each triangle rotated so its smallest index comes first (winding kept), sorted.
+    fn canonical_triangles(triangles: &[[usize; 3]]) -> Vec<[usize; 3]> {
+        let mut canonical: Vec<[usize; 3]> = triangles
+            .iter()
+            .map(|triangle| {
+                let start = (0..3).min_by_key(|&i| triangle[i]).unwrap();
+                [0, 1, 2].map(|offset| triangle[(start + offset) % 3])
+            })
+            .collect();
+        canonical.sort_unstable();
+        canonical
     }
 
     #[test]

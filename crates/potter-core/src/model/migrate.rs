@@ -13,6 +13,7 @@ use serde_json::{Map, Value, json};
 
 use super::{Image, ImageAlphaMode, SceneDoc};
 use crate::{
+    color::curve::{CurveMapping, CurvePoint, HandleType},
     error::{ErrorCode, PotError, Result},
     store::HistoryRecord,
 };
@@ -100,7 +101,7 @@ fn json_error(error: &serde_json::Error) -> PotError {
     )
 }
 
-/// Upgrades a scene document in place through schema version 4. `root` is the project directory that holds the document's
+/// Upgrades a scene document in place through schema version 5. `root` is the project directory that holds the document's
 /// image blobs and linked sources, which the version 3 to 4 step reads.
 pub fn upgrade_scene(value: &mut Value, root: &Path) -> Result<Vec<Value>> {
     let warnings = if value.get("schema_version").and_then(Value::as_u64) == Some(1) {
@@ -113,6 +114,9 @@ pub fn upgrade_scene(value: &mut Value, root: &Path) -> Result<Vec<Value>> {
     }
     if value.get("schema_version").and_then(Value::as_u64) == Some(3) {
         upgrade_v3(value, root)?;
+    }
+    if value.get("schema_version").and_then(Value::as_u64) == Some(4) {
+        upgrade_v4(value)?;
     }
     Ok(warnings)
 }
@@ -234,6 +238,97 @@ fn upgrade_v2(value: &mut Value) -> Result<()> {
     Ok(())
 }
 
+/// Upgrades a schema-version-4 scene document to version 5. The released view curve, an array of
+/// `[x, y]` points evaluated piecewise-linearly with horizontal extension, becomes Blender's view
+/// `CurveMapping` on the combined curve with VECTOR handles and horizontal extension, so existing
+/// renders keep their shape. The R/G/B identity curves cover the combined curve's full x-domain and
+/// `[0, 1]`; a single legacy point becomes a constant two-point curve. Clip is `[0, 1]`, black and
+/// white identity. An empty array means no curve.
+fn upgrade_v4(value: &mut Value) -> Result<()> {
+    if let Some(scenes) = value.get_mut("scenes").and_then(Value::as_object_mut) {
+        for scene in scenes.values_mut() {
+            if let Some(color) = scene.get_mut("color_management") {
+                upgrade_color_curve(color)?;
+            }
+        }
+    }
+    value["schema_version"] = json!(5);
+    Ok(())
+}
+
+fn upgrade_color_curve(color: &mut Value) -> Result<()> {
+    let Some(curve) = color.get_mut("curve") else {
+        return Ok(());
+    };
+    if curve.is_null() {
+        return Ok(());
+    }
+    let Value::Array(points) = curve else {
+        return Err(invalid(
+            "color curve must be an array of [x, y] points or null",
+        ));
+    };
+    let mut points = points
+        .iter()
+        .map(legacy_curve_point)
+        .collect::<Result<Vec<_>>>()?;
+    let converted = if points.is_empty() {
+        Value::Null
+    } else {
+        if points.len() == 1 {
+            let y = points[0].location[1];
+            points = vec![
+                CurvePoint {
+                    location: [0.0, y],
+                    handle: HandleType::Vector,
+                },
+                CurvePoint {
+                    location: [1.0, y],
+                    handle: HandleType::Vector,
+                },
+            ];
+        }
+        let x_min = points[0].location[0].min(0.0);
+        let x_max = points[points.len() - 1].location[0].max(1.0);
+        let mut mapping = CurveMapping::default();
+        for channel in &mut mapping.curves[..3] {
+            channel.points = vec![
+                CurvePoint {
+                    location: [x_min, x_min],
+                    handle: HandleType::Vector,
+                },
+                CurvePoint {
+                    location: [x_max, x_max],
+                    handle: HandleType::Vector,
+                },
+            ];
+        }
+        mapping.curves[3].points = points;
+        mapping.extend_extrapolate = false;
+        mapping.validate()?;
+        serde_json::to_value(&mapping).map_err(|error| json_error(&error))?
+    };
+    *curve = converted;
+    Ok(())
+}
+
+fn legacy_curve_point(point: &Value) -> Result<CurvePoint> {
+    let [x, y] = point
+        .as_array()
+        .and_then(|pair| <&[Value; 2]>::try_from(pair.as_slice()).ok())
+        .ok_or_else(|| invalid("color curve point must be [x, y]"))?;
+    let coordinate = |value: &Value| {
+        value
+            .as_f64()
+            .map(|number| number as f32)
+            .ok_or_else(|| invalid("color curve coordinate must be a number"))
+    };
+    Ok(CurvePoint {
+        location: [coordinate(x)?, coordinate(y)?],
+        handle: HandleType::Vector,
+    })
+}
+
 /// Upgrades a schema-version-3 scene document to version 4. Schema 3 labelled every image straight, EXR included, so a
 /// saved EXR was read as straight. Blender reads an EXR as premultiplied, and so does the loader now. The old loader
 /// unpremultiplied an EXR at load and premultiplied it again when sampling, so an EXR labelled straight becomes
@@ -263,7 +358,6 @@ fn upgrade_v3(value: &mut Value, root: &Path) -> Result<()> {
     value["schema_version"] = json!(4);
     Ok(())
 }
-
 /// Blender-owned mesh attributes are mirrors or topology rebuilt by Potter. Their exact signatures
 /// match the `.blend` importer.
 fn is_blender_managed_attribute(name: &str, domain: &str, data_type: &str) -> bool {
@@ -1108,7 +1202,7 @@ mod tests {
             }}}
         });
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(4));
+        assert_eq!(scene["schema_version"], json!(5));
         let material = &scene["materials"]["m1"];
         assert_eq!(material["base_color_texture"]["uv_layer"], Value::Null);
         assert!(material["base_color_texture"].get("uv_map").is_none());
@@ -1130,7 +1224,7 @@ mod tests {
         });
         let before = scene.clone();
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(4));
+        assert_eq!(scene["schema_version"], json!(5));
         assert_eq!(scene["materials"], before["materials"]);
     }
 
@@ -1169,7 +1263,7 @@ mod tests {
         scene["schema_version"] = json!(3);
         scene["images"] = json!({ "texel": serde_json::to_value(&image)? });
         let parsed = parse_scene(&serde_json::to_vec(&scene)?, root.path())?;
-        assert_eq!(parsed.doc.schema_version, 4);
+        assert_eq!(parsed.doc.schema_version, 5);
         let id = crate::model::Id::new("texel")?;
         let migrated = &parsed.doc.images[&id];
         assert_eq!(migrated.alpha_mode, ImageAlphaMode::Premultiplied);
@@ -1200,6 +1294,49 @@ mod tests {
                 "linked {actual} != {expected}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn version_three_color_curve_array_becomes_view_curve() -> TestResult {
+        let mut scene = json!({
+            "schema_version": 3,
+            "scenes": {
+                "empty": {"color_management": {"curve": []}},
+                "curved": {"color_management": {"curve": [[0.0, 0.0], [0.5, 0.25], [1.0, 1.0]]}},
+                "hdr": {"color_management": {"curve": [[0.0, 0.0], [2.0, 1.0]]}},
+                "single": {"color_management": {"curve": [[0.5, 0.25]]}}
+            }
+        });
+        upgrade_scene(&mut scene, no_assets())?;
+        assert_eq!(scene["schema_version"], json!(5));
+        assert_eq!(
+            scene["scenes"]["empty"]["color_management"]["curve"],
+            Value::Null
+        );
+        let curve: CurveMapping =
+            serde_json::from_value(scene["scenes"]["curved"]["color_management"]["curve"].clone())?;
+        assert_eq!(curve.curves[3].points.len(), 3);
+        assert_eq!(curve.curves[3].points[1].location, [0.5, 0.25]);
+        assert_eq!(curve.curves[3].points[1].handle, HandleType::Vector);
+        assert_eq!(curve.curves[0].points[0].location, [0.0, 0.0]);
+        assert_eq!(curve.curves[0].points[1].location, [1.0, 1.0]);
+        assert!(!curve.extend_extrapolate);
+
+        let hdr: CurveMapping =
+            serde_json::from_value(scene["scenes"]["hdr"]["color_management"]["curve"].clone())?;
+        for channel in &hdr.curves[..3] {
+            assert_eq!(channel.points[0].location, [0.0, 0.0]);
+            assert_eq!(channel.points[1].location, [2.0, 2.0]);
+        }
+        assert!((hdr.prepare().evaluate_rgb([1.5; 3])[0] - 0.75).abs() < 1.0e-4);
+
+        let single: CurveMapping =
+            serde_json::from_value(scene["scenes"]["single"]["color_management"]["curve"].clone())?;
+        assert_eq!(single.curves[3].points.len(), 2);
+        assert_eq!(single.curves[3].points[0].location, [0.0, 0.25]);
+        assert_eq!(single.curves[3].points[1].location, [1.0, 0.25]);
+        assert!((single.prepare().evaluate_rgb([0.5; 3])[0] - 0.25).abs() < 1.0e-4);
         Ok(())
     }
 
@@ -1236,7 +1373,7 @@ mod tests {
         });
 
         let migrated = parse_scene(&serde_json::to_vec(&source)?, no_assets())?.doc;
-        assert_eq!(migrated.schema_version, 4);
+        assert_eq!(migrated.schema_version, 5);
         let mesh = migrated.data_blocks[&data_id]
             .mesh
             .as_ref()
@@ -1740,7 +1877,7 @@ mod tests {
         let (record, history_warnings) =
             parse_history_record(&serde_json::to_vec(&history_record(&source))?, no_assets())?;
         assert!(history_warnings.is_empty(), "{history_warnings:?}");
-        assert_eq!(record.snapshot.schema_version, 4);
+        assert_eq!(record.snapshot.schema_version, 5);
         let history_mesh = record
             .snapshot
             .data_blocks
@@ -1807,7 +1944,7 @@ mod tests {
         let (record, history_warnings) =
             parse_history_record(&serde_json::to_vec(&history_record(&source))?, no_assets())?;
         assert!(history_warnings.is_empty(), "{history_warnings:?}");
-        assert_eq!(record.snapshot.schema_version, 4);
+        assert_eq!(record.snapshot.schema_version, 5);
         let history_mesh = record
             .snapshot
             .data_blocks
