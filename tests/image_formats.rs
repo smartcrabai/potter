@@ -71,7 +71,7 @@ fn image_pixel(scene: &Path, id: &str) -> Result<[f64; 4], Box<dyn Error>> {
         scene,
         potter_core::image::ImageInterpolation::Closest,
     )?;
-    Ok(potter_core::image::sample(&data, [0.5, 0.5], 0))
+    Ok(potter_core::image::sample(&data, [0.5, 0.5], false))
 }
 fn assert_pixel(
     scene: &Path,

@@ -2222,6 +2222,9 @@ def dump_all():
                          "ortho_scale": float(x.ortho_scale),
                          "clip_start": float(x.clip_start), "clip_end": float(x.clip_end),
                          "shift_x": float(x.shift_x), "shift_y": float(x.shift_y), "custom_properties": custom_props(x),
+                         "panorama_type": x.panorama_type, "longitude_min": float(x.longitude_min),
+                         "longitude_max": float(x.longitude_max), "latitude_min": float(x.latitude_min),
+                         "latitude_max": float(x.latitude_max),
                          "fake_user": bool(x.use_fake_user), "users": int(x.users)} for x in bpy.data.cameras],
             "lights": [{"name": x.name_full, "potter_id": x.get("potter.id"),
                         "library": library_reference(x), "type": x.type,
@@ -6288,6 +6291,9 @@ def export_doc(doc, target, pack, scene_hash, context):
             camera.shift_x, camera.shift_y = raw.get("shift", [0.0, 0.0])
             if raw.get("projection") == "orthographic":
                 camera.type = "ORTHO"
+            elif raw.get("projection") == "panorama" and raw.get("panorama_type", "equirectangular") == "equirectangular":
+                camera.type = "PANO"
+                camera.panorama_type = "EQUIRECTANGULAR"
             set_id(camera, data_id)
             set_props(camera, source.get("custom_properties", {}))
             if source.get("fake_user"):

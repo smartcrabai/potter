@@ -1276,8 +1276,7 @@ mod tests {
             crate::image::sample_with_extension_alpha(
                 &data,
                 [0.5, 0.5],
-                [0.5, 0.5],
-                0,
+                false,
                 crate::image::ImageInterpolation::Closest,
                 crate::image::ImageExtension::Repeat,
                 linked,

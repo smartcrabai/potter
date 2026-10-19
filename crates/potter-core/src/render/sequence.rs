@@ -1163,7 +1163,7 @@ fn resample_image(source: &ImageData, width: u32, height: u32) -> Result<RgbaFra
                     (f64::from(x) + 0.5) / f64::from(width),
                     (f64::from(y) + 0.5) / f64::from(height),
                 ],
-                0,
+                false,
             );
             pixels.push([
                 finite_f64_to_f32(sampled[0])?,
