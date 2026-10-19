@@ -860,7 +860,7 @@ fn build_texture_exports(
                     json!({"material_id":material_id,"image_id":texture.image}),
                 )
             })?;
-            if !image.tiles.is_empty() {
+            if image.is_udim() {
                 return Err(PotError::with_details(
                     ErrorCode::UnrepresentableFeature,
                     "FBX texture export does not support image tiles",
@@ -2294,6 +2294,7 @@ fn import_bytes_with_base(
                     source_path: Some(source.to_string_lossy().into_owned()),
                     source_hash: Some(crate::hash::sha256(&bytes)),
                     alpha_mode: crate::image::storage::default_alpha_mode(&bytes),
+                    tiled: false,
                 },
             );
             images_by_source.insert(source_key, image_id.clone());
@@ -4031,6 +4032,7 @@ mod tests {
                 source_path: Some(image_path.to_string_lossy().into_owned()),
                 source_hash: Some(crate::hash::sha256(&pixels)),
                 alpha_mode: crate::model::ImageAlphaMode::default(),
+                tiled: false,
             },
         );
         let material_id = Id::new("textured")?;
@@ -4395,6 +4397,7 @@ mod tests {
                 source_path: Some(image_path.to_string_lossy().into_owned()),
                 source_hash: Some(crate::hash::sha256(&pixels)),
                 alpha_mode: crate::model::ImageAlphaMode::default(),
+                tiled: false,
             },
         );
         let material_id = Id::new("shared")?;
