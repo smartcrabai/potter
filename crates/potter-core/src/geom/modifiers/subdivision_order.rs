@@ -486,14 +486,6 @@ fn append_quad_edges(
     }
 }
 
-fn inner_edges_per_patch(resolution: usize) -> usize {
-    if resolution < 2 {
-        0
-    } else {
-        (resolution - 2) * resolution + (resolution - 1) * (resolution - 1)
-    }
-}
-
 fn append_ngon_edges(
     edges: &mut Vec<[usize; 2]>,
     face_base: usize,

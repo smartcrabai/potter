@@ -85,28 +85,24 @@ pub(super) fn build(
     let mut vertex_stages: Vec<Option<Vec<Stage>>> = Vec::with_capacity(samples.vertices.len());
     let mut vertex_sources: Vec<Vec<(usize, f64)>> = Vec::with_capacity(samples.vertices.len());
     for (vertex, sample) in samples.vertices.iter().enumerate() {
-        match sample {
-            Some(sample) => {
-                let face = &polygons[sample.face].0;
-                let mixed =
-                    remap_sources(slots(*sample, polygons, loop_starts), |corner| face[corner]);
-                vertex_sources.push(Staged::flatten(&mixed));
-                vertex_stages.push((!is_copy(&mixed)).then_some(mixed));
-            }
-            None => {
-                vertex_sources.push(match loose.sources(vertex) {
-                    Some(sources) => sources,
-                    // A base vertex on no face and no loose edge is copied by `subdiv_mesh_vert_loose`.
-                    None if vertex < mesh.vertices.len() => vec![(vertex, 1.0)],
-                    None => Vec::new(),
-                });
-                vertex_stages.push(None);
-            }
+        if let Some(sample) = sample {
+            let face = &polygons[sample.face].0;
+            let mixed = remap_sources(slots(*sample, polygons, loop_starts), |corner| face[corner]);
+            vertex_sources.push(Staged::flatten(&mixed));
+            vertex_stages.push((!is_copy(&mixed)).then_some(mixed));
+        } else {
+            vertex_sources.push(match loose.sources(vertex) {
+                Some(sources) => sources,
+                // A base vertex on no face and no loose edge is copied by `subdiv_mesh_vert_loose`.
+                None if vertex < mesh.vertices.len() => vec![(vertex, 1.0)],
+                None => Vec::new(),
+            });
+            vertex_stages.push(None);
         }
     }
-    let corners_needed = needs_corner_sources(mesh, &WRITTEN_KEYS);
-    let (corner_sources, corner_stages): (Vec<Vec<(usize, f64)>>, Option<Vec<Vec<Stage>>>) =
-        if corners_needed {
+    // Corner stages exist only when the remap reads corner sources; otherwise the origin carries an empty list.
+    let corner_stages: Option<Vec<Vec<Stage>>> =
+        needs_corner_sources(mesh, &WRITTEN_KEYS).then(|| {
             let offsets: Vec<usize> = polygons
                 .iter()
                 .scan(0, |total, (vertices, _)| {
@@ -115,7 +111,7 @@ pub(super) fn build(
                     Some(start)
                 })
                 .collect();
-            let stages: Vec<Vec<Stage>> = samples
+            samples
                 .corners
                 .iter()
                 .flatten()
@@ -124,15 +120,15 @@ pub(super) fn build(
                         offsets[sample.face] + corner
                     })
                 })
-                .collect();
-            let flat = stages
+                .collect()
+        });
+    let corner_sources: Vec<Vec<(usize, f64)>> =
+        corner_stages.as_ref().map_or_else(Vec::new, |stages| {
+            stages
                 .iter()
                 .map(|stages| Staged::flatten(stages))
-                .collect();
-            (flat, Some(stages))
-        } else {
-            (Vec::new(), None)
-        };
+                .collect()
+        });
     let origin = Origin {
         vertices: vertex_sources,
         faces: samples

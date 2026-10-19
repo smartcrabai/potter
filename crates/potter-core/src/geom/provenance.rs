@@ -1437,7 +1437,7 @@ fn blend<'a>(items: impl Iterator<Item = (&'a Value, f64)>, data_type: &str) -> 
     if data_type == "QUATERNION" && items.iter().all(|(value, _)| is_quaternion(value)) {
         // A lone full-weight source is copied, as Blender copies a coarse element without mixing it.
         if let [(value, weight)] = items.as_slice()
-            && *weight == 1.0
+            && *weight > 1.0 - 1.0e-9
         {
             return Some((*value).clone());
         }

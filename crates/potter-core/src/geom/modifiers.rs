@@ -26,7 +26,7 @@ use super::{
     Edge, Face, Mesh, MeshError, Vertex, edge_key,
     normals::{corner_normals, face_normal, safe_acos_approx, sharp_edge_flags},
     provenance::{
-        Origin, edge_flags, mean_value_corners, remap_attributes, remap_attributes_staged,
+        Origin, edge_flags, mean_value_corners, remap_attributes_staged,
         remap_attributes_with_basis, remap_attributes_with_edges,
     },
     uv_layers,

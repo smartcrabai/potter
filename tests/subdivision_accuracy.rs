@@ -1089,7 +1089,7 @@ fn compare_storage_order(actual: &Shape, expected: &Shape) -> Result<(), String>
 /// Compares Blender's generic POINT/EDGE/FACE/CORNER values, in storage order, with the native keyed store of
 /// `mesh`, componentwise for quaternion arrays. Provenance leaves an element without a source out of the store,
 /// and readers take the type's default (`provenance.rs` remap docs). Blender's `subdiv_copy_edge_data`
-/// (subdiv_mesh.cc L1199-1222) gives inner edges that default too, so an absent entry is accepted only where
+/// (`subdiv_mesh.cc` L1199-1222) gives inner edges that default too, so an absent entry is accepted only where
 /// Blender's value is 0.0. Any other absent element fails. Present values must match within
 /// `GENERIC_ATTRIBUTE_TOLERANCE`, relative to magnitude, and quaternion signs must match exactly.
 fn compare_ordered_attributes(mesh: &Mesh, expected: &Value) -> TestResult<()> {
@@ -1217,7 +1217,7 @@ fn linear_to_srgb(linear: f64) -> f64 {
     }
 }
 
-/// The sRGB bytes `[r, g, b, a]` of a BYTE_COLOR element (`byte_color_values` in generate.py). `element` is the
+/// The sRGB bytes `[r, g, b, a]` of a `BYTE_COLOR` element (`byte_color_values` in generate.py). `element` is the
 /// POINT vertex index or the Blender loop index of a CORNER.
 fn byte_color_bytes(domain: &str, element: usize) -> [u8; 4] {
     let (base, alpha_base) = if domain == "POINT" {
@@ -1233,14 +1233,14 @@ fn byte_color_bytes(domain: &str, element: usize) -> [u8; 4] {
     ]
 }
 
-/// Potter's stored linear colour of a BYTE_COLOR element: each colour channel decoded from its sRGB byte, alpha
+/// Potter's stored linear colour of a `BYTE_COLOR` element: each colour channel decoded from its sRGB byte, alpha
 /// linear.
 fn linear_color(bytes: [u8; 4]) -> Value {
     let [r, g, b, a] = bytes.map(|byte| f64::from(byte) / 255.0);
     json!([srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b), a])
 }
 
-/// Compares Blender's BYTE_COLOR values, in storage order, with Potter's output encoded back to sRGB bytes. The
+/// Compares Blender's `BYTE_COLOR` values, in storage order, with Potter's output encoded back to sRGB bytes. The
 /// bytes must match exactly, so the per-slot truncation of `encode_byte_colors` is what is checked.
 fn compare_byte_colors(mesh: &Mesh, expected: &Value) -> TestResult<()> {
     for definition in expected.as_array().ok_or("oracle byte colours missing")? {
