@@ -866,7 +866,7 @@ fn render_center_pixel(project: &Path, image_id: &str) -> TestResult<[f64; 4]> {
     let scene = read_scene(project)?;
     let image: Image = serde_json::from_value(scene["images"][image_id].clone())?;
     let data = load_image_data(&image, project, ImageInterpolation::Closest)?;
-    Ok(sample(&data, [0.5, 0.5], 0))
+    Ok(sample(&data, [0.5, 0.5], false))
 }
 
 #[test]

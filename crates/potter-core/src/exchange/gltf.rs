@@ -14,7 +14,7 @@ use crate::{
     error::{ErrorCode, PotError, Result},
     eval::{EvaluationPurpose, Snapshot, mesh_vertex_weights},
     geom::{
-        Mesh, MeshError, attribute_keys, clnor,
+        Mesh, attribute_keys, clnor,
         color_layers::{self, ColorDomain, ColorLayer, ColorStore},
         edge_key,
         normals::{close, corner_normals, sharp_edge_flags, smooth_face_flags},
@@ -1335,40 +1335,6 @@ fn export_vertex_layout(
         colors: colors_out,
         face_indices,
     })
-}
-
-/// Triangles for glTF export, `len - 2` per face in `mesh.faces` order. A face without area has no
-/// ear to clip, so it fans into degenerate triangles, as Blender's glTF exporter writes it.
-fn export_triangles(mesh: &Mesh) -> std::result::Result<Vec<[u32; 3]>, MeshError> {
-    if let Ok(triangles) = mesh.triangulate() {
-        return Ok(triangles);
-    }
-    let mut subset = mesh.clone();
-    let mut degenerate = BTreeSet::<u32>::new();
-    let triangles = loop {
-        match subset.triangulate() {
-            Ok(triangles) => break triangles,
-            Err(MeshError::TriangulationFailed(id))
-                if subset.faces.iter().any(|face| face.id == id) =>
-            {
-                degenerate.insert(id);
-                subset.faces.retain(|face| face.id != id);
-            }
-            Err(error) => return Err(error),
-        }
-    };
-    let mut regular = triangles.into_iter();
-    let mut output = Vec::new();
-    for face in &mesh.faces {
-        if degenerate.contains(&face.id) {
-            for pair in face.vertices[1..].windows(2) {
-                output.push([face.vertices[0], pair[0], pair[1]]);
-            }
-        } else {
-            output.extend(regular.by_ref().take(face.vertices.len().saturating_sub(2)));
-        }
-    }
-    Ok(output)
 }
 
 /// Bytes per element of a packed `extras.potter.polygons` field whose values stay at or below
@@ -4769,7 +4735,7 @@ fn export_with_root_inner(
             }
         }
         let mirrored = geometry_scale.x * geometry_scale.y * geometry_scale.z < 0.0;
-        let triangles = export_triangles(mesh).map_err(|error| {
+        let triangles = mesh.tessellate().map_err(|error| {
             PotError::with_details(
                 ErrorCode::ExportFailed,
                 "mesh triangulation failed",

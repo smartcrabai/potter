@@ -14,7 +14,7 @@ use crate::model::{Id, Modifier};
 use super::{
     MergedGeometry, Polygon, bool_param, build_mesh, closest_point_triangle, cyclic_pairs,
     edge_pairs, id_indices, invalid_parameter, loose_edges, number_param, polygons, positions,
-    schema_value, string_param, uint_param, usize_as_f64, validated, vec3_param,
+    schema_value, string_param, uint_param, usize_as_f64, validated, vec3_param, vertex_normals,
 };
 use crate::{
     error::{ErrorCode, PotError, Result},
@@ -1232,29 +1232,9 @@ pub(super) fn wave(mesh: &Mesh, modifier: &Modifier, frame: f64) -> Result<Mesh>
     let use_normal = bool_param(modifier, "use_normal")?;
     let mut result = mesh.clone();
     let normals = if use_normal {
-        let indices = id_indices(mesh);
-        let positions = positions(mesh);
-        let mut normals = vec![DVec3::ZERO; mesh.vertices.len()];
-        let triangles = mesh
-            .triangulate()
-            .map_err(|_| invalid_parameter(modifier, "mesh", "valid triangulation"))?;
-        for triangle in triangles {
-            let [first, second, third] =
-                triangle.map(|id| indices.get(&id).copied().unwrap_or(usize::MAX));
-            if [first, second, third].contains(&usize::MAX) {
-                continue;
-            }
-            let normal = (positions[second] - positions[first])
-                .cross(positions[third] - positions[first])
-                .normalize_or_zero();
-            normals[first] += normal;
-            normals[second] += normal;
-            normals[third] += normal;
-        }
-        for normal in &mut normals {
-            *normal = normal.normalize_or_zero();
-        }
-        normals
+        // Blender's `mesh->vert_normals()` (`MOD_wave.cc`): the angle-weighted face-normal sum
+        // per vertex, the shared `vertex_normals` that Displace and Solidify also use.
+        vertex_normals(&positions(mesh), &polygons(mesh)?)
     } else {
         Vec::new()
     };

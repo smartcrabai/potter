@@ -1901,7 +1901,7 @@ pub fn feature_catalog() -> Value {
         ),
         supported(
             "color_management",
-            "Standard, AgX, Filmic, Raw, and False Color scene display transforms matching Blender 5.2.2 OCIO on sRGB",
+            "Standard, AgX, Filmic, Raw, and False Color scene display transforms matching Blender 5.2.2 OCIO on sRGB, with an optional view curve (Blender's CurveMapping: point handles, extend, clip, black and white levels, tone, and per-channel R, G, B curves)",
             "ColorManagement",
             &["color.update"],
             [false, true, true, true, true, false, false],
@@ -1911,7 +1911,7 @@ pub fn feature_catalog() -> Value {
             "Arbitrary OpenColorIO configurations, displays, and views",
             "ColorManagement",
             &[],
-            "The renderer supports only the five fixed built-in transforms on the sRGB display, not arbitrary OCIO profiles, other displays, or looks.",
+            "The renderer supports Blender 5.2.2's five built-in views on the sRGB display and their compatible looks (the AgX, False Color, and Filmic looks). Arbitrary OCIO profiles, other displays, and ACES views and looks are not supported.",
         ),
         supported(
             "tracking",

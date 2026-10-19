@@ -8,4 +8,5 @@ pub use evaluator::{
     evaluate_surface_with_workspace, fill_color_layers, height_gradient,
 };
 pub(crate) use evaluator::{dielectric_f0, record_unevaluated_inputs};
+pub(crate) use world::equirectangular_uv;
 pub use world::evaluate_world;

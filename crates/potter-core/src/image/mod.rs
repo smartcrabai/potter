@@ -9,5 +9,5 @@ pub use storage::{
 
 pub use sampling::{
     ColourCache, ImageData, ImageExtension, ImageInterpolation, ImageStorage, ImageTileData,
-    Precision, sample, sample_encoded, sample_with_extension_alpha, sample_with_interpolation,
+    Precision, sample, sample_encoded, sample_with_extension_alpha,
 };

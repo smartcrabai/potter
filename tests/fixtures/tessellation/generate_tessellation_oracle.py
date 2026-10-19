@@ -5,6 +5,8 @@ Run: Blender -b --factory-startup --python generate_tessellation_oracle.py -- <o
 Cases (each is one face, positions stored as float32 values):
 - quads: random near-degenerate (|dot| small relative to |a||b|, the fold predicate), plus non-planar.
 - ngons: convex, concave, and polygons with collinear vertices.
+- self-crossing quads (bowties), self-intersecting n-gons (star polygons), and n-gons whose Newell
+  sum is exactly zero (collinear, and a figure-eight), which take Blender's +Z projection fallback.
 
 Triangles are face-local corner indices (0..n-1), in Blender's loop-triangle order.
 """
@@ -136,6 +138,36 @@ def ngon_collinear(n):
     mid = tuple(f32((a[i] + b[i]) * 0.5) for i in range(3))
     return [pts[0], mid] + pts[1:]
 
+def ngon_star(n, step):
+    # Visits vertex (i * step) mod n in order, so the boundary crosses itself (gcd(step, n) = 1).
+    pts = []
+    for i in range(n):
+        a = 2 * math.pi * ((i * step) % n) / n
+        r = rng.uniform(0.9, 1.1)
+        pts.append((f32(r * math.cos(a)), f32(r * math.sin(a)), f32(rng.uniform(-0.05, 0.05))))
+    return pts
+
+
+def ngon_line(n, step):
+    # Collinear corners in a zigzag order: the Newell sum is exactly zero.
+    return [(float((i * step) % n), 0.0, 0.0) for i in range(n)]
+
+
+def newell_sum(points):
+    total = [0.0, 0.0, 0.0]
+    prev = points[-1]
+    for curr in points:
+        total[0] += (prev[1] - curr[1]) * (prev[2] + curr[2])
+        total[1] += (prev[2] - curr[2]) * (prev[0] + curr[0])
+        total[2] += (prev[0] - curr[0]) * (prev[1] + curr[1])
+        prev = curr
+    return total
+
+
+FIGURE_EIGHT = [(0.0, 0.0, 0.0), (2.0, 2.0, 0.0), (4.0, 0.0, 0.0), (4.0, 2.0, 0.0), (2.0, 0.0, 0.0), (0.0, 2.0, 0.0)]
+assert newell_sum(FIGURE_EIGHT) == [0.0, 0.0, 0.0]
+
+
 
 cases = []
 for _ in range(48):
@@ -148,6 +180,19 @@ for n in (5, 6, 7, 8, 10):
         cases.append(("ngon_convex_%d" % n, ngon_convex(n), None, None))
         cases.append(("ngon_concave_%d" % n, ngon_concave(n), None, None))
         cases.append(("ngon_collinear_%d" % n, ngon_collinear(n), None, None))
+for _ in range(16):
+    points = random_quad()
+    points[2], points[3] = points[3], points[2]
+    cases.append(("quad_bowtie", points, quad_dot_f32(points), quad_dot_f64(points)))
+cases.append(("quad_bowtie_planar", [(0.0, 0.0, 0.0), (1.0, 1.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)], None, None))
+for n, step in ((5, 2), (7, 2), (8, 3), (10, 3)):
+    for _ in range(4):
+        cases.append(("ngon_star_%d" % n, ngon_star(n, step), None, None))
+cases.append(("ngon_zero_area_figure_eight", FIGURE_EIGHT, None, None))
+for n, step in ((5, 2), (7, 2), (8, 3), (10, 3)):
+    line = ngon_line(n, step)
+    assert newell_sum(line) == [0.0, 0.0, 0.0]
+    cases.append(("ngon_collinear_line_%d" % n, line, None, None))
 
 bpy.ops.wm.read_factory_settings(use_empty=True)
 all_points = []
