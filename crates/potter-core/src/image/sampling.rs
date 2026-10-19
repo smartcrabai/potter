@@ -786,8 +786,8 @@ fn mix(a: [f64; 4], b: [f64; 4], t: f64) -> [f64; 4] {
 mod tests {
     use super::{
         ColourCache, ImageData, ImageExtension, ImageInterpolation, ImageStorage, ImageTileData,
-        Precision, premultiply, round_to_half, sample, sample_encoded, sample_with_extension_alpha,
-        sample_with_interpolation,
+        Precision, cycles_frac_index, premultiply, round_to_half, sample, sample_encoded,
+        sample_with_extension_alpha, sample_with_interpolation, udim_route,
     };
     use std::collections::BTreeMap;
 
@@ -1258,13 +1258,26 @@ mod tests {
         assert_eq!(
             sample_with_extension_alpha(
                 &image,
-                [1.01, 0.5],
+                [1.25, 0.5],
                 0,
                 ImageInterpolation::Linear,
                 ImageExtension::Clip,
                 false,
             ),
             [0.0; 4],
+        );
+        // A linear sample partly inside a clip keeps its inside texel's weight (per texel, as Blender's clip does): at
+        // u = 0.875 the coordinate is 1.25 texels, so texel 1 weighs 0.75 and the clipped texel 2 contributes nothing.
+        assert_eq!(
+            sample_with_extension_alpha(
+                &image,
+                [0.875, 0.5],
+                0,
+                ImageInterpolation::Linear,
+                ImageExtension::Clip,
+                false,
+            ),
+            [0.0, 0.75, 0.0, 0.75],
         );
     }
 
@@ -1636,7 +1649,7 @@ mod tests {
             let Some(file) = path.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
-            if !file.ends_with(".json")
+            if path.extension().and_then(|extension| extension.to_str()) != Some("json")
                 || !(file.starts_with("blender_edge_") || file.starts_with("blender_udim_"))
             {
                 continue;
