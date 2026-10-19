@@ -2129,6 +2129,7 @@ def dump_scene(scene):
             "compositor": _scene_compositor(scene),
             "color_management": _color_management_dump(scene),
             "view_layers": layers,
+            "display_backface_culling": bool(scene.display.shading.show_backface_culling),
             "markers": [{"name": marker.name, "frame": int(marker.frame)} for marker in scene.timeline_markers],
             "rigid_body_world": _rigid_body_world_dump(scene),
             "sequencer": _sequencer_dump(scene),
