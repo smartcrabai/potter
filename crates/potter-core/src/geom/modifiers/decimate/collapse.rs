@@ -2492,7 +2492,7 @@ pub(in crate::geom::modifiers) fn decimate_collapse(
 
 #[cfg(test)]
 mod tests {
-    use super::{BMesh, Decimator, Heap, interp_customdata_value};
+    use super::{BMesh, Decimator, Heap, PoolSlots, interp_customdata_value};
     use serde_json::json;
 
     #[test]
@@ -2553,6 +2553,8 @@ mod tests {
             uv_stride: 0,
             totface: 0,
             point_types: Vec::new(),
+            face_slots: PoolSlots::default(),
+            edge_slots: PoolSlots::default(),
             edge_types: vec!["INT".to_owned()],
             track_edge_flags: false,
         };
