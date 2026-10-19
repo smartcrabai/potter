@@ -374,7 +374,7 @@ struct FormatCase {
 
 #[derive(Clone, Copy)]
 enum ColorEncoding {
-    /// OBJ `v x y z r g b`: the sRGB-encoded RGB is read back as written; alpha is opaque.
+    /// OBJ `v x y z r g b`: Potter writes sRGB, and Blender decodes it to linear on import; alpha is opaque.
     ObjSrgb,
     /// PLY `uchar` colors: sRGB RGB bytes (floored) and a linear alpha byte.
     PlySrgbBytes,
@@ -868,10 +868,10 @@ fn obj_rgb(value: [f64; 4]) -> [f64; 3] {
 
 fn expected_import_color(value: [f64; 4], encoding: ColorEncoding) -> [f64; 4] {
     match encoding {
-        ColorEncoding::ObjSrgb => {
-            let [red, green, blue] = obj_rgb(value);
-            [red, green, blue, 1.0]
-        }
+        // Blender decodes the `xyzrgb` sRGB values to linear on import
+        // (`obj_import_file_reader.cc`, `srgb_to_linearrgb_v3_v3`), so the imported colour is the
+        // linear value Potter wrote encoded.
+        ColorEncoding::ObjSrgb => [value[0].max(0.0), value[1].max(0.0), value[2].max(0.0), 1.0],
         ColorEncoding::PlySrgbBytes => [
             srgb_decode(f64::from(ply_byte(value[0], false)) / 255.0),
             srgb_decode(f64::from(ply_byte(value[1], false)) / 255.0),
@@ -2148,8 +2148,13 @@ fn assert_imported_mesh(case: FormatCase, source: &OracleMesh, actual: &DumpedMe
         "{} UV layers",
         case.format
     );
-    let expected_color_names: BTreeSet<_> =
+    let mut expected_color_names: BTreeSet<_> =
         case.color_layers.iter().map(|(name, _)| *name).collect();
+    // USD also writes the render layer as `displayColor` (`usd.rs`, `write_color_primvars`), which
+    // Blender reads as a colour attribute.
+    if case.format == "usda" {
+        expected_color_names.insert("displayColor");
+    }
     let actual_color_names: BTreeSet<_> = actual.color_layers.keys().map(String::as_str).collect();
     assert_eq!(
         actual_color_names, expected_color_names,
