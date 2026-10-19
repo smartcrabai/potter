@@ -546,7 +546,8 @@ pub(super) fn extract_geometry(
                             }
                         }),
                         alpha_threshold: material.map_or(0.5, |material| material.alpha_threshold),
-                        double_sided: material.is_some_and(|value| value.double_sided),
+                        // A face without a material shades with Blender's Default Surface, which is not culled.
+                        double_sided: material.is_none_or(|value| value.double_sided),
                         material_index,
                         uv,
                         layer_uvs,
