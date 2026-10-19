@@ -2934,10 +2934,11 @@ fn intersect_tri_pair(
         if seen_a.contains(&e0) || seen_a.contains(&e1) {
             continue;
         }
+        // Blender starts the segment at its lower BMesh index (bmesh_intersect.cc:356).
         let hit = cached_edge_tri_hit(state, e0, e1, b_index, b).or_else(|| {
             intersect_line_triangle(
-                state.verts[e0].co,
-                state.verts[e1].co,
+                state.verts[e0.min(e1)].co,
+                state.verts[e0.max(e1)].co,
                 b.map(|v| state.verts[v].co),
                 nb,
                 eps,
@@ -2969,10 +2970,11 @@ fn intersect_tri_pair(
         if seen_b.contains(&e0) || seen_b.contains(&e1) {
             continue;
         }
+        // Blender starts the segment at its lower BMesh index (bmesh_intersect.cc:356).
         let hit = cached_edge_tri_hit(state, e0, e1, a_index, a).or_else(|| {
             intersect_line_triangle(
-                state.verts[e0].co,
-                state.verts[e1].co,
+                state.verts[e0.min(e1)].co,
+                state.verts[e0.max(e1)].co,
                 a.map(|v| state.verts[v].co),
                 na,
                 eps,
