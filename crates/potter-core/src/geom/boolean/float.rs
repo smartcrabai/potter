@@ -2664,6 +2664,32 @@ impl TriangleIntersectScratch {
     }
 }
 
+/// Blender `BLI_bvhtree_insert` of each triangle on `side`, in looptri order, with the tree epsilon. Returns
+/// the state triangle index of each leaf.
+fn tri_leaf_bounds(state: &State, side: u8, pad: f32) -> (Vec<usize>, Vec<[f32; 8]>) {
+    state
+        .tris
+        .iter()
+        .enumerate()
+        .filter(|(_, tri)| tri.side == side)
+        .map(|(index, tri)| {
+            let points = tri.verts.map(|v| state.verts[v].co);
+            (index, super::float_connect::kdop_bounds(&points, pad))
+        })
+        .unzip()
+}
+
+/// Triangle candidate pairs `(side-1 triangle, side-0 triangle)` in the order of Blender's
+/// `BLI_bvhtree_overlap_ex(tree_b, tree_a)`.
+fn blender_overlap_pairs(state: &State, pad: f32) -> Vec<(usize, usize)> {
+    let (entries_b, leaves_b) = tri_leaf_bounds(state, 1, pad);
+    let (entries_a, leaves_a) = tri_leaf_bounds(state, 0, pad);
+    super::float_connect::overlap_pairs(leaves_b, leaves_a)
+        .into_iter()
+        .map(|(b, a)| (entries_b[b], entries_a[a]))
+        .collect()
+}
+
 fn intersect_triangles(state: &mut State, eps: f32) -> (Bvh, Bvh) {
     let eps2x = eps * 2.0;
     let eps2x_sq = eps2x * eps2x;
@@ -2671,8 +2697,7 @@ fn intersect_triangles(state: &mut State, eps: f32) -> (Bvh, Bvh) {
     let margin_sq = margin * margin;
     let tree_a = Bvh::from_triangles(&state.tris, &state.verts, 0, margin);
     let tree_b = Bvh::from_triangles(&state.tris, &state.verts, 1, margin);
-    let mut overlap = Vec::new();
-    tree_b.overlap_pairs(&tree_a, &mut overlap);
+    let overlap = blender_overlap_pairs(state, margin);
     let mut scratch = TriangleIntersectScratch::new();
     for (b_index, a_index) in overlap {
         intersect_tri_pair(
@@ -3716,33 +3741,6 @@ impl Bvh {
         index
     }
 
-    fn overlap_pairs(&self, other: &Self, out: &mut Vec<(usize, usize)>) {
-        if self.nodes.is_empty() || other.nodes.is_empty() {
-            return;
-        }
-        let mut stack = vec![(0_usize, 0_usize)];
-        while let Some((a, b)) = stack.pop() {
-            let na = self.nodes[a];
-            let nb = other.nodes[b];
-            if !bounds_overlap(na.min, na.max, nb.min, nb.max) {
-                continue;
-            }
-            if na.count > 0 && nb.count > 0 {
-                for &ia in &self.entries[na.start..na.start + na.count] {
-                    for &ib in &other.entries[nb.start..nb.start + nb.count] {
-                        out.push((ia, ib));
-                    }
-                }
-            } else if na.count == 0 && (nb.count > 0 || box_size(na) >= box_size(nb)) {
-                stack.push((na.right, b));
-                stack.push((a + 1, b));
-            } else {
-                stack.push((a, nb.right));
-                stack.push((a, b + 1));
-            }
-        }
-    }
-
     fn ray_candidates(&self, origin: P3, out: &mut Vec<usize>, stack: &mut Vec<usize>) {
         out.clear();
         stack.clear();
@@ -3768,14 +3766,6 @@ impl Bvh {
             }
         }
     }
-}
-
-fn bounds_overlap(a_min: P3, a_max: P3, b_min: P3, b_max: P3) -> bool {
-    (0..3).all(|axis| a_min[axis] <= b_max[axis] && b_min[axis] <= a_max[axis])
-}
-
-fn box_size(node: BvhNode) -> f32 {
-    (node.max[0] - node.min[0]) * (node.max[1] - node.min[1]) * (node.max[2] - node.min[2])
 }
 
 #[derive(Default)]

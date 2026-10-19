@@ -23,8 +23,9 @@ use std::collections::HashMap;
 
 type P2 = [f32; 2];
 type P3 = [f32; 3];
-/// Slab bounds of one box: `[min_x, max_x, min_y, max_y, min_z, max_z]`, Blender `bv` for the first three axes.
-type Bounds = [f32; 6];
+/// Slab bounds of one box, Blender `bv` for `BLI_bvhtree_new(…, axis = 8)`: `[min, max]` for `x`, `y`,
+/// `z` and `x + y + z`, in that order.
+type Bounds = [f32; 8];
 
 /// Blender `BVH_RAYCAST_DIST_MAX`.
 const RAYCAST_DIST_MAX: f32 = f32::MAX / 2.0;
@@ -34,11 +35,20 @@ const ENDPOINT_BIAS: f32 = 1.0e-4;
 const BVH_EPSILON: f32 = 1.0e-4;
 /// Blender `BLI_bvhtree_new` `tree_type`: children per node of the implicit tree.
 const BVH_TREE_TYPE: usize = 8;
-/// Blender `bvhtree_kdop_axes[0..3]`. `BLI_bvhtree_new(…, axis = 8)` also stores `x + y + z`, but the
-/// ray test and the split axis only read these three slabs, so that slab is not kept.
-const BVH_AXES: [P3; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+/// Blender `bvhtree_kdop_axes[0..4]`. The fourth slab `x + y + z` takes part in overlap tests only; the
+/// ray test and the split axis read the first three.
+const BVH_AXES: [P3; 4] = [
+    [1.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0],
+    [0.0, 0.0, 1.0],
+    [1.0, 1.0, 1.0],
+];
+/// Blender `bvhtree_kdop_axes_length`: each slab's leaf inflation is `epsilon * length`.
+const BVH_AXES_LENGTH: [f32; 4] = [1.0, 1.0, 1.0, 1.732_050_8];
 /// Blender `node_minmax_init`.
 const EMPTY_BOUNDS: Bounds = [
+    f32::MAX,
+    -f32::MAX,
     f32::MAX,
     -f32::MAX,
     f32::MAX,
@@ -580,12 +590,20 @@ fn child_index(parent: usize, k: usize) -> usize {
 
 /// Blender `create_kdop_hull` and `bvhtree_node_inflate` for one edge's two points (`z = 0`).
 fn leaf_bounds(a: P2, b: P2) -> Bounds {
+    kdop_bounds(&[[a[0], a[1], 0.0], [b[0], b[1], 0.0]], BVH_EPSILON)
+}
+
+/// Blender `BLI_bvhtree_insert` leaf box of `points` (`create_kdop_hull`, then `bvhtree_node_inflate`
+/// with `epsilon`).
+pub(super) fn kdop_bounds(points: &[P3], epsilon: f32) -> Bounds {
     let mut bounds = EMPTY_BOUNDS;
-    extend_bounds(&mut bounds, [a[0], a[1], 0.0]);
-    extend_bounds(&mut bounds, [b[0], b[1], 0.0]);
-    for axis in 0..3 {
-        bounds[2 * axis] -= BVH_EPSILON;
-        bounds[2 * axis + 1] += BVH_EPSILON;
+    for &p in points {
+        extend_bounds(&mut bounds, p);
+    }
+    for (axis, &length) in BVH_AXES_LENGTH.iter().enumerate() {
+        let dist = epsilon * length;
+        bounds[2 * axis] -= dist;
+        bounds[2 * axis + 1] += dist;
     }
     bounds
 }
@@ -603,7 +621,7 @@ fn extend_bounds(bounds: &mut Bounds, p: P3) {
 fn refit(leaves: &[Bounds], ids: &[usize]) -> Bounds {
     let mut bounds = EMPTY_BOUNDS;
     for &id in ids {
-        for axis in 0..3 {
+        for axis in 0..4 {
             bounds[2 * axis] = leaves[id][2 * axis].min(bounds[2 * axis]);
             bounds[2 * axis + 1] = leaves[id][2 * axis + 1].max(bounds[2 * axis + 1]);
         }
@@ -786,7 +804,7 @@ impl RayPrecalc {
             idot: [0.0; 3],
             index: [0; 6],
         };
-        for (axis, &axis_dir) in BVH_AXES.iter().enumerate() {
+        for (axis, &axis_dir) in BVH_AXES.iter().take(3).enumerate() {
             let d = dot3(dir, axis_dir);
             if d.abs() < f32::EPSILON {
                 pre.dot[axis] = 0.0;
@@ -1063,6 +1081,64 @@ fn isect_seg_seg_point(v0: P2, v1: P2, v2: P2, v3: P2, bias: f32) -> Option<P2> 
         return Some([a0[0] + basis[0] * lo, a0[1] + basis[1] * lo]);
     }
     None
+}
+
+/// Blender `BLI_bvhtree_overlap_ex` over two `BLI_bvhtree_new(…, 8, 8)` trees: both balanced as
+/// [`Bvh::new`], then `tree_overlap_traverse` from the roots. Each pair is `(leaf of first, leaf of second)`
+/// as positions in the given box lists. Blender's `BLI_stack_pop_n` hands the pushed pairs back last-first.
+pub(super) fn overlap_pairs(first: Vec<Bounds>, second: Vec<Bounds>) -> Vec<(usize, usize)> {
+    if first.is_empty() || second.is_empty() {
+        return Vec::new();
+    }
+    let tree_a = Bvh::new(first);
+    let tree_b = Bvh::new(second);
+    let mut out = Vec::new();
+    overlap_traverse(
+        &tree_a,
+        Child::Branch(1),
+        &tree_b,
+        Child::Branch(1),
+        &mut out,
+    );
+    out.reverse();
+    out
+}
+
+/// Bounds of a child node: its leaf box, or its branch box.
+fn child_bounds(tree: &Bvh, child: Child) -> Bounds {
+    match child {
+        Child::Leaf(id) => tree.leaves[id],
+        Child::Branch(index) => tree.branches[index].bounds,
+    }
+}
+
+/// Blender `tree_overlap_traverse`: while the boxes overlap, descend the first node while it is a branch,
+/// otherwise the second node's children, and emit a pair when both are leaves.
+fn overlap_traverse(
+    tree1: &Bvh,
+    node1: Child,
+    tree2: &Bvh,
+    node2: Child,
+    out: &mut Vec<(usize, usize)>,
+) {
+    let a = child_bounds(tree1, node1);
+    let b = child_bounds(tree2, node2);
+    if !(0..4).all(|axis| a[2 * axis] <= b[2 * axis + 1] && b[2 * axis] <= a[2 * axis + 1]) {
+        return;
+    }
+    match (node1, node2) {
+        (Child::Leaf(id1), Child::Leaf(id2)) => out.push((id1, id2)),
+        (Child::Leaf(_), Child::Branch(index)) => {
+            for &child in &tree2.branches[index].children {
+                overlap_traverse(tree1, node1, tree2, child, out);
+            }
+        }
+        (Child::Branch(index), _) => {
+            for &child in &tree1.branches[index].children {
+                overlap_traverse(tree1, child, tree2, node2, out);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
