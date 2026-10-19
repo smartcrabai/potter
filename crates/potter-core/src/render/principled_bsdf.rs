@@ -123,10 +123,7 @@ fn diffuse_lobe(params: &BsdfParams, normal: DVec3, view: DVec3, lower: DVec3) -
         }
         None => dielectric_weight,
     };
-    diffuse_albedo(params)
-        * (diffuse_weight / PI)
-        * params.reflectance.clamp(0.0, 1.0)
-        * lower
+    diffuse_albedo(params) * (diffuse_weight / PI) * params.reflectance.clamp(0.0, 1.0) * lower
 }
 
 /// Specular (dielectric and metallic) lobes along `light`, times reflectance. Zero when the

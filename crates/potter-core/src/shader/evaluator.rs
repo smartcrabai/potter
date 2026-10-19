@@ -308,7 +308,12 @@ impl BsdfParams {
             mix_scalar(first.base_color[2], second.base_color[2]),
             mix_scalar(first.base_color[3], second.base_color[3]),
         ];
-        let coat = combine_layers(first.coat_layer(), 1.0 - factor, second.coat_layer(), factor);
+        let coat = combine_layers(
+            first.coat_layer(),
+            1.0 - factor,
+            second.coat_layer(),
+            factor,
+        );
         Self {
             base_color,
             metallic: mix_scalar(first.metallic, second.metallic),
@@ -3055,7 +3060,6 @@ mod tests {
         let expected = (DVec3::Z * 0.5 + DVec3::X * 0.2).normalize();
         assert!((sum.coat_normal.unwrap_or(DVec3::ZERO) - expected).length() < 1e-12);
     }
-
 
     #[test]
     fn displacement_output_evaluates_scale_midlevel_and_surface_normal() {
