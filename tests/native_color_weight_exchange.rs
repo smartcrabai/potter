@@ -73,7 +73,7 @@ import bpy
 destination = sys.argv[sys.argv.index("--") + 1]
 bpy.ops.wm.read_factory_settings(use_empty=True)
 mesh = bpy.data.meshes.new("WeightedMesh")
-mesh.from_pydata([(-1, 0, 0), (1, 0, 0), (0, 1, 0)], [], [(0, 1, 2)])
+mesh.from_pydata([(-1, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1)], [], [(0, 1, 2), (0, 3, 1), (1, 3, 2), (2, 3, 0)])
 mesh.update()
 obj = bpy.data.objects.new("WeightedMesh", mesh)
 bpy.context.scene.collection.objects.link(obj)
@@ -3069,7 +3069,7 @@ fn armature_bound_vertex_group_roundtrips_through_blender_fbx_without_loss() -> 
         command
             .arg("validate")
             .arg(&project)
-            .args(["--format", "fbx-binary"]);
+            .args(["--format", "fbx-binary", "--strict"]);
     })?;
     assert!(
         !native_oracle::loss_features(&validation).contains(&"mesh.vertex_group".to_owned()),

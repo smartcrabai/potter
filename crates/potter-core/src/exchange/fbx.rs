@@ -1252,27 +1252,29 @@ fn build_bone_models(
         for bone_id in armature.bones.keys() {
             model_ids.insert((node_id.clone(), bone_id.clone()), take_object_id(next_id)?);
         }
-        let matrices = crate::eval::rig::evaluate_bone_matrices(armature, &BTreeMap::new())?;
+        // Blender's LimbNode `Lcl` is the posed `matrix_local` (`export_fbx_bin.py`,
+        // `fbx_data_armature_elements`, via `fbx_object_matrix`); only the bind data uses rest.
+        let matrices = crate::eval::rig::evaluate_bone_matrices(armature, &node.pose)?;
         for (bone_id, bone) in &armature.bones {
-            let rest = matrices
+            let posed = matrices
                 .get(bone_id)
                 .ok_or_else(|| {
                     PotError::new(
                         ErrorCode::EvaluationFailed,
-                        "FBX rest bone matrix is missing",
+                        "FBX posed bone matrix is missing",
                     )
                 })?
-                .rest;
+                .pose;
             let local = if let Some(parent_id) = &bone.parent {
                 let parent = matrices
                     .get(parent_id)
                     .ok_or_else(|| {
                         PotError::new(ErrorCode::SceneInvalid, "FBX bone parent is missing")
                     })?
-                    .rest;
-                parent.inverse() * rest
+                    .pose;
+                parent.inverse() * posed
             } else {
-                rest
+                posed
             };
             let parent_model = if let Some(parent_id) = &bone.parent {
                 *model_ids

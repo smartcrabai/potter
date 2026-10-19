@@ -246,8 +246,7 @@ struct MtlEntries {
     losses: Vec<Loss>,
 }
 
-/// Names each bound material in the OBJ and MTL by its own name, as Blender does, when that name is
-/// one token and no other bound material shares it. Otherwise the material's ID names it.
+/// Names each bound material for the OBJ `usemtl` and MTL `newmtl` lines; see the rule below.
 fn material_bindings(doc: &SceneDoc, meshes: &[ExchangeMesh]) -> Result<BTreeMap<Id, String>> {
     let mut bound = BTreeSet::<Id>::new();
     for mesh in meshes {
@@ -267,29 +266,41 @@ fn material_bindings(doc: &SceneDoc, meshes: &[ExchangeMesh]) -> Result<BTreeMap
             }
         }
     }
-    let mut sharing = BTreeMap::<&str, usize>::new();
+    // Blender names each material by `name.replace(' ', "_")` (`obj_export_mtl.cc`). A name that is
+    // empty or holds other whitespace or `#` (an MTL comment), or that an earlier material already
+    // took, falls back to the material's ID. Valid names are claimed first, so a fallback never
+    // steals a display name; every final name goes through one used-names set.
+    let mut used = BTreeSet::<String>::new();
+    let mut names = BTreeMap::<Id, String>::new();
+    let mut fallbacks = Vec::<Id>::new();
     for id in &bound {
-        if let Some(material) = doc.materials.get(id) {
-            *sharing.entry(material.name.as_str()).or_default() += 1;
+        let candidate = doc
+            .materials
+            .get(id)
+            .map(|material| material.name.replace(' ', "_"))
+            .unwrap_or_default();
+        if !candidate.is_empty()
+            && !candidate.contains(char::is_whitespace)
+            && !candidate.contains('#')
+            && used.insert(candidate.clone())
+        {
+            names.insert(id.clone(), candidate);
+        } else {
+            fallbacks.push(id.clone());
         }
     }
-    Ok(bound
-        .into_iter()
-        .map(|id| {
-            let name = doc
-                .materials
-                .get(&id)
-                .map(|material| material.name.as_str())
-                .filter(|name| {
-                    !name.is_empty()
-                        && !name.contains(char::is_whitespace)
-                        && !name.contains('#')
-                        && sharing.get(name) == Some(&1)
-                })
-                .map_or_else(|| id.as_str().to_owned(), str::to_owned);
-            (id, name)
-        })
-        .collect())
+    for id in fallbacks {
+        let root = id.as_str().to_owned();
+        let mut name = root.clone();
+        let mut index = 1_u32;
+        while used.contains(&name) {
+            name = format!("{root}_{index}");
+            index += 1;
+        }
+        used.insert(name.clone());
+        names.insert(id, name);
+    }
+    Ok(names)
 }
 
 fn mtl_entries(
@@ -438,17 +449,25 @@ impl MtlWriter<'_> {
         // material alpha, that is the colour image itself, and Potter's importer reads alpha only
         // from the image `map_Kd` names. The colour image therefore keeps its alpha channel and
         // `map_d` names it. A material with a scalar alpha factor keeps `d`.
-        #[expect(
-            clippy::float_cmp,
-            reason = "exact unit test: only a factor alpha of exactly 1.0 leaves the texture alpha as the material alpha"
-        )]
-        let alpha_from_map = !matches!(surface.alpha_mode, AlphaMode::Opaque)
-            && alpha == 1.0
+        let texture_alpha = !matches!(surface.alpha_mode, AlphaMode::Opaque)
             && surface
                 .base_color
                 .texture
                 .as_ref()
                 .is_some_and(|texture| texture.channels[3].is_some());
+        #[expect(
+            clippy::float_cmp,
+            reason = "exact unit test: only a factor alpha of exactly 1.0 leaves the texture alpha as the material alpha"
+        )]
+        let alpha_from_map = texture_alpha && alpha == 1.0;
+        if texture_alpha && !alpha_from_map {
+            // `map_d` would carry this alpha, but Potter's importer reads a map's alpha only when
+            // the factor is 1, so the texture alpha is not written.
+            self.loss(
+                "material.mtl.alpha_texture",
+                "MTL writes the colour image without its alpha when the alpha factor is not 1; the texture alpha is not written",
+            );
+        }
         let kd_map = match &surface.base_color.texture {
             Some(texture) => {
                 let channels = if alpha_from_map {
