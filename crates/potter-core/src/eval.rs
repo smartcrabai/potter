@@ -1019,6 +1019,11 @@ impl Snapshot {
                     "evaluated world matrix is missing",
                 )
             })?;
+            let texture_seed = crate::geom::modifiers::TextureSeed::new(
+                modifier_context.purpose,
+                scene.render.seed,
+                id.as_str(),
+            );
             let bounds = if instance_collection_target(node)?.is_some() {
                 None
             } else if let Some(data_id) = &node.data {
@@ -1118,6 +1123,7 @@ impl Snapshot {
                             &node.modifiers,
                             &doc.node_groups,
                             frame,
+                            node.name.as_str(),
                             matrix,
                             &matrices,
                             &object_meshes,
@@ -1125,8 +1131,9 @@ impl Snapshot {
                             &curve_path_lengths,
                             stack_context,
                             |_, modifier| gate.is_active(id, modifier),
+                            texture_seed,
                             adaptive_render.as_ref(),
-                            |mesh, modifier, modifier_warnings| {
+                            |mesh, modifier, modifier_warnings, multi_input, texture_rng| {
                                 let result = match modifier.modifier_type.as_str() {
                                     "armature" => rig::apply_armature_modifier_with_drivers(
                                         mesh,
@@ -1141,6 +1148,7 @@ impl Snapshot {
                                         scene.fps,
                                         scene.fps_base,
                                         &meshes,
+                                        multi_input,
                                     ),
                                     "lattice" => apply_lattice_modifier(
                                         mesh, modifier, id, data_block, doc, &matrices,
@@ -1423,6 +1431,7 @@ impl Snapshot {
                             &node.modifiers,
                             &doc.node_groups,
                             frame,
+                            node.name.as_str(),
                             matrix,
                             &matrices,
                             &object_meshes,
@@ -1430,8 +1439,9 @@ impl Snapshot {
                             &curve_path_lengths,
                             stack_context,
                             |_, modifier| gate.is_active(id, modifier),
+                            texture_seed,
                             adaptive_render.as_ref(),
-                            |mesh, modifier, modifier_warnings| {
+                            |mesh, modifier, modifier_warnings, multi_input, texture_rng| {
                                 let result = match modifier.modifier_type.as_str() {
                                     "armature" => rig::apply_armature_modifier_with_drivers(
                                         mesh,
@@ -1446,6 +1456,7 @@ impl Snapshot {
                                         scene.fps,
                                         scene.fps_base,
                                         &meshes,
+                                        multi_input,
                                     ),
                                     "lattice" => apply_lattice_modifier(
                                         mesh, modifier, id, data_block, doc, &matrices,
