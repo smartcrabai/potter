@@ -378,6 +378,12 @@ fn verify_render_key(manifest: &Manifest) -> Result<()> {
             format!("camera serialization failed: {error}"),
         )
     })?;
+    let adaptive_render = serde_json::to_value(&manifest.adaptive_render).map_err(|error| {
+        PotError::new(
+            ErrorCode::InternalError,
+            format!("adaptive render serialization failed: {error}"),
+        )
+    })?;
     let mut core = json!({
         "scene_id": manifest.scene_id,
         "revision": manifest.revision,
@@ -389,6 +395,7 @@ fn verify_render_key(manifest: &Manifest) -> Result<()> {
         "view_layer": manifest.view_layer,
         "view": manifest.view,
         "camera": camera,
+        "adaptive_render": adaptive_render,
         "units": manifest.units,
         "settings": manifest.settings,
         "pick_policy": manifest.pick_policy,
