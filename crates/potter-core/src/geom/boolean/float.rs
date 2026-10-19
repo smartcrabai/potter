@@ -28,6 +28,7 @@ use crate::geom::{
     triangulate::{BeautyScratch, beautify_with_scratch},
     uv_layers,
 };
+use crate::geom::pool_slots::PoolSlots;
 
 use super::dissolve::Poly;
 use super::float_split_net::CornerSource;
@@ -44,6 +45,8 @@ struct Vertex {
     co: P3,
     /// Joined index in the subject-first output attribute table, or `NO_INDEX` for generated data.
     source: i32,
+    /// `BLI_mempool` slot of this vertex's `BMVert` (see [`PoolSlots`]); output order follows slots.
+    slot: usize,
 }
 
 #[derive(Clone)]
@@ -130,6 +133,8 @@ struct State {
     /// Blender's per-vertex disk cycles: `disk[v]` lists the `BMesh` edges at `v`, oldest first. `BMesh`
     /// inserts each new edge before the disk head, so the head `v->e` is the first entry.
     disk: Vec<Vec<EdgeKey>>,
+    /// `BMesh` vertex pool: slots of every live and freed `BMVert`, in creation order.
+    vertex_slots: PoolSlots,
 }
 
 impl State {
@@ -149,12 +154,14 @@ impl State {
             edge_tri_cache: HashMap::new(),
             dangling_edges: HashSet::new(),
             disk: Vec::new(),
+            vertex_slots: PoolSlots::default(),
         }
     }
 
     fn add_vertex(&mut self, co: P3, source: i32) -> usize {
         let id = self.verts.len();
-        self.verts.push(Vertex { co, source });
+        let slot = self.vertex_slots.alloc();
+        self.verts.push(Vertex { co, source, slot });
         self.disk.push(Vec::new());
         id
     }
@@ -190,9 +197,12 @@ impl State {
         }
     }
 
-    /// Drops the last vertex, which must have no edges left.
+    /// Drops the last vertex, which must have no edges left. Blender `BM_vert_splice` kills the
+    /// spliced copy, and its slot returns to the pool free list.
     fn pop_vertex(&mut self) {
-        self.verts.pop();
+        if let Some(vertex) = self.verts.pop() {
+            self.vertex_slots.release(vertex.slot);
+        }
         self.disk.pop();
     }
 }
@@ -426,24 +436,30 @@ fn build_float_output(subject: &Mesh, operand: &Mesh, state: &State) -> Result<F
     }
     // Blender's output follows BMesh slot order, and `mesh_bm_concat` creates subject faces first
     // (`geometry_mesh_boolean.cc:1000`), so surviving subject faces precede operand faces. Slot reuse
-    // after a kill (LIFO) is not modelled; this is the observed order for the corpus.
+    // after a kill is not modelled for faces (vertices use `Vertex::slot`); this is the observed order.
     let subject_face_count = i32::try_from(subject.faces.len()).unwrap_or(i32::MAX);
     polygons.sort_by_key(|(polygon, _)| polygon.orig >= subject_face_count);
     let (polygons, loops): (Vec<Poly>, Vec<Vec<FaceLoop>>) = polygons.into_iter().unzip();
     let mut mesh = Mesh::new();
     let mut state_vertex_ids = vec![None; state.verts.len()];
+    let mut referenced = vec![false; state.verts.len()];
     for polygon in &polygons {
         for &index in &polygon.verts {
-            let index = index as usize;
-            if state_vertex_ids[index].is_none() {
-                let id = mesh
-                    .insert_vertex(to_dvec3(state.verts[index].co))
-                    .map_err(|error| {
-                        PotError::invalid_argument(format!("Boolean output vertex failed: {error}"))
-                    })?;
-                state_vertex_ids[index] = Some(id);
-            }
+            referenced[index as usize] = true;
         }
+    }
+    // Blender writes vertices in `BMesh` pool order (`BM_mesh_bm_to_me`), so output follows slots.
+    let mut output_order: Vec<usize> = (0..state.verts.len())
+        .filter(|&index| referenced[index])
+        .collect();
+    output_order.sort_by_key(|&index| state.verts[index].slot);
+    for index in output_order {
+        let id = mesh
+            .insert_vertex(to_dvec3(state.verts[index].co))
+            .map_err(|error| {
+                PotError::invalid_argument(format!("Boolean output vertex failed: {error}"))
+            })?;
+        state_vertex_ids[index] = Some(id);
     }
     let mut face_specs = Vec::with_capacity(polygons.len());
     for polygon in &polygons {

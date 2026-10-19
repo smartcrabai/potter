@@ -16,6 +16,7 @@ use crate::{
 };
 
 use super::subdivision_uv::carried_pins;
+use crate::geom::pool_slots::PoolSlots;
 use super::{
     Mesh, Polygon, bool_param, cyclic_pairs, decimate_compact, edge_key, id_indices,
     invalid_parameter, number_param, positions, schema_value,
@@ -192,29 +193,6 @@ const NO_DISK: DiskLink = DiskLink {
     next: NONE,
     prev: NONE,
 };
-
-/// Blender's `BLI_mempool` slot order for one element type. `BLI_mempool_alloc` takes the head of the
-/// free list, the most recently freed slot, and then never-used slots in order. Blender emits elements
-/// in pool order (`BM_mesh_bm_to_me`), so an element's slot is its output position.
-#[derive(Default)]
-struct PoolSlots {
-    fresh: usize,
-    freed: Vec<usize>,
-}
-
-impl PoolSlots {
-    fn alloc(&mut self) -> usize {
-        if let Some(slot) = self.freed.pop() {
-            return slot;
-        }
-        self.fresh += 1;
-        self.fresh - 1
-    }
-
-    fn release(&mut self, slot: usize) {
-        self.freed.push(slot);
-    }
-}
 
 struct BVert {
     co: [f32; 3],

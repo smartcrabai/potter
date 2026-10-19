@@ -37,6 +37,7 @@ pub mod mesh_cache;
 pub mod metaball;
 pub mod modifiers;
 pub(crate) mod normals;
+pub(crate) mod pool_slots;
 pub mod pointcloud;
 pub(crate) mod provenance;
 pub mod remesh;
