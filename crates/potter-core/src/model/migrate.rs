@@ -1521,6 +1521,7 @@ mod tests {
         image_scene.images.insert(
             noise_id,
             crate::model::Image {
+                tiled: false,
                 name: "noise".to_owned(),
                 source: crate::model::ImageSource::Generated,
                 colorspace: crate::model::ImageColorspace::Srgb,
@@ -1619,6 +1620,7 @@ mod tests {
             source_path: None,
             source_hash: Some(digest),
             alpha_mode: ImageAlphaMode::Straight,
+            tiled: false,
         };
         let mut scene = serde_json::to_value(SceneDoc::new(uuid::Uuid::new_v4().to_string()))?;
         scene["schema_version"] = json!(3);

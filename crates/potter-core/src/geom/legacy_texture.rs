@@ -1320,6 +1320,7 @@ pub fn resolve_texture(
                             interpolation: ImageInterpolation::Linear,
                             srgb: false,
                             storage: ImageStorage::default(),
+                            udim: false,
                             colour: ColourCache::default(),
                         },
                         settings: sampler,
@@ -3676,6 +3677,7 @@ mod tests {
             interpolation: ImageInterpolation::Linear,
             srgb: false,
             storage: ImageStorage::default(),
+            udim: false,
             colour: ColourCache::default(),
         }
     }
@@ -3699,6 +3701,7 @@ mod tests {
         doc.images.insert(
             Id::new(id.to_owned())?,
             Image {
+                tiled: false,
                 name: id.to_owned(),
                 source: ImageSource::File,
                 colorspace: ImageColorspace::Linear,
@@ -4042,6 +4045,7 @@ mod tests {
             interpolation: ImageInterpolation::Linear,
             srgb: false,
             storage: ImageStorage::default(),
+            udim: false,
             colour: ColourCache::default(),
         };
         for tile in [1001, 1002] {
@@ -4149,6 +4153,7 @@ mod tests {
             interpolation: ImageInterpolation::Linear,
             srgb: false,
             storage: ImageStorage::default(),
+            udim: false,
             colour: ColourCache::default(),
         };
         let LegacyTexture::ImageRecord { sampler, .. } = texture else {
@@ -4199,6 +4204,7 @@ mod tests {
             interpolation: ImageInterpolation::Linear,
             srgb: false,
             storage: ImageStorage::default(),
+            udim: false,
             colour: ColourCache::default(),
         };
         let mut rng = BlenderRng::seed(0);
@@ -4250,6 +4256,7 @@ mod tests {
             interpolation: ImageInterpolation::Linear,
             srgb: false,
             storage: ImageStorage::default(),
+            udim: false,
             colour: ColourCache::default(),
         };
         let mut settings = DEFAULT_IMAGE_SETTINGS;
@@ -4329,6 +4336,7 @@ mod tests {
             interpolation: ImageInterpolation::Linear,
             srgb: false,
             storage: ImageStorage::default(),
+            udim: false,
             colour: ColourCache::default(),
         };
         let mut settings = DEFAULT_IMAGE_SETTINGS;
@@ -4366,6 +4374,7 @@ mod tests {
             interpolation: ImageInterpolation::Linear,
             srgb: false,
             storage: ImageStorage::default(),
+            udim: false,
             colour: ColourCache::default(),
         };
         let mut settings = DEFAULT_IMAGE_SETTINGS;

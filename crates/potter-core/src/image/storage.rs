@@ -114,19 +114,38 @@ fn load_image_data_with_staged_and_user(
                 .map(|(width, height, pixels)| (width, height, pixels, true, 4))
         }
     };
-    let base_bytes = image_blob_bytes(image.blob.as_deref(), image, root, staged)?;
     let srgb = decodes_srgb(image.colorspace);
-    let (width, height, pixels, color_pass, source_channels) = decode(&base_bytes)?;
-    if width != image.width || height != image.height {
-        return Err(PotError::with_details(
-            ErrorCode::SceneInvalid,
-            "image blob dimensions do not match its registry entry",
-            serde_json::json!({"image":image.name,"expected":[image.width,image.height],"actual":[width,height]}),
-        ));
-    }
+    // A UDIM image whose base file is missing keeps its listed tiles and no base pixels, so the base samples as missing.
+    let (width, height, pixels, color_pass, source_channels, storage) = if image.base_is_missing() {
+        (0, 0, Vec::new(), true, 4, ImageStorage::default())
+    } else {
+        let base_bytes = image_blob_bytes(image.blob.as_deref(), image, root, staged)?;
+        let (width, height, pixels, color_pass, source_channels) = decode(&base_bytes)?;
+        if width != image.width || height != image.height {
+            return Err(PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "image blob dimensions do not match its registry entry",
+                serde_json::json!({"image":image.name,"expected":[image.width,image.height],"actual":[width,height]}),
+            ));
+        }
+        let mut storage = image_storage(image, &base_bytes);
+        // The legacy decode unpremultiplies a premultiplied EXR colour pass, so its texels are straight
+        // and the storage says so.
+        if selection.is_some()
+            && base_bytes.starts_with(&[0x76, 0x2f, 0x31, 0x01])
+            && legacy_colour_is_straight(image.alpha_mode, color_pass, source_channels)
+        {
+            storage.straight_alpha = true;
+        }
+        (width, height, pixels, color_pass, source_channels, storage)
+    };
     let mut tiles = BTreeMap::new();
     for tile in &image.tiles {
-        let bytes = blob_bytes(&tile.blob, root, staged)?;
+        // A listed tile without a blob is missing: it has no pixels, so it is left out and samples as the missing colour.
+        let Some(blob) = tile.blob.as_deref() else {
+            continue;
+        };
+        let bytes = blob_bytes(blob, root, staged)?;
         let (tile_width, tile_height, tile_pixels, _, _) = decode(&bytes)?;
         if tile_width != tile.width || tile_height != tile.height {
             return Err(PotError::with_details(
@@ -146,15 +165,6 @@ fn load_image_data_with_staged_and_user(
             },
         );
     }
-    let mut storage = image_storage(image, &base_bytes);
-    // The legacy decode unpremultiplies a premultiplied EXR colour pass, so its texels are straight
-    // and the storage says so.
-    if selection.is_some()
-        && base_bytes.starts_with(&[0x76, 0x2f, 0x31, 0x01])
-        && legacy_colour_is_straight(image.alpha_mode, color_pass, source_channels)
-    {
-        storage.straight_alpha = true;
-    }
     Ok((
         ImageData {
             width,
@@ -164,6 +174,7 @@ fn load_image_data_with_staged_and_user(
             interpolation,
             srgb,
             storage,
+            udim: image.is_udim(),
             colour: ColourCache::default(),
         },
         color_pass,

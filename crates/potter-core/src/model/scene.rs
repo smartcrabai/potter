@@ -377,32 +377,42 @@ impl SceneDoc {
                     hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
                 })
             };
-            if !dimensions_valid(image.width, image.height) {
-                return Err(PotError::with_details(
-                    ErrorCode::SceneInvalid,
-                    "image dimensions are invalid or exceed the pixel limit",
-                    json!({"image_id":image_id,"width":image.width,"height":image.height}),
-                ));
-            }
-            match image.source {
-                ImageSource::Generated | ImageSource::Packed if image.blob.is_none() => {
+            if image.base_is_missing() {
+                if (image.width, image.height) != (0, 0) {
                     return Err(PotError::with_details(
                         ErrorCode::SceneInvalid,
-                        "generated or packed image requires a content-addressed blob",
-                        json!({"image_id":image_id}),
+                        "a missing image base has no size",
+                        json!({"image_id":image_id,"width":image.width,"height":image.height}),
                     ));
                 }
-                ImageSource::File
-                    if image.blob.is_none()
-                        && (image.source_path.is_none() || image.source_hash.is_none()) =>
-                {
+            } else {
+                if !dimensions_valid(image.width, image.height) {
                     return Err(PotError::with_details(
                         ErrorCode::SceneInvalid,
-                        "linked image requires source_path and source_hash",
-                        json!({"image_id":image_id}),
+                        "image dimensions are invalid or exceed the pixel limit",
+                        json!({"image_id":image_id,"width":image.width,"height":image.height}),
                     ));
                 }
-                _ => {}
+                match image.source {
+                    ImageSource::Generated | ImageSource::Packed if image.blob.is_none() => {
+                        return Err(PotError::with_details(
+                            ErrorCode::SceneInvalid,
+                            "generated or packed image requires a content-addressed blob",
+                            json!({"image_id":image_id}),
+                        ));
+                    }
+                    ImageSource::File
+                        if image.blob.is_none()
+                            && (image.source_path.is_none() || image.source_hash.is_none()) =>
+                    {
+                        return Err(PotError::with_details(
+                            ErrorCode::SceneInvalid,
+                            "linked image requires source_path and source_hash",
+                            json!({"image_id":image_id}),
+                        ));
+                    }
+                    _ => {}
+                }
             }
             if image
                 .blob
@@ -421,11 +431,11 @@ impl SceneDoc {
             }
             let mut tile_numbers = std::collections::BTreeSet::new();
             for tile in &image.tiles {
-                if tile.number <= 1001
-                    || !tile_numbers.insert(tile.number)
-                    || !dimensions_valid(tile.width, tile.height)
-                    || !valid_hash(&tile.blob)
-                {
+                let content_valid = match tile.blob.as_deref() {
+                    Some(blob) => dimensions_valid(tile.width, tile.height) && valid_hash(blob),
+                    None => tile.width == 0 && tile.height == 0,
+                };
+                if tile.number <= 1001 || !tile_numbers.insert(tile.number) || !content_valid {
                     return Err(PotError::with_details(
                         ErrorCode::SceneInvalid,
                         "UDIM tile metadata is invalid",
@@ -2095,7 +2105,13 @@ pub struct ImageTile {
     pub number: u32,
     pub width: u32,
     pub height: u32,
-    pub blob: String,
+    /// `None` is the missing state: the tile stays listed, as Blender keeps it, but its file was not found, so it has
+    /// no size or pixels and samples as Blender's missing colour.
+    #[serde(default)]
+    pub blob: Option<String>,
+    /// Blender's tile label, carried through import and export. Omitted when empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub label: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2118,6 +2134,30 @@ pub struct Image {
     pub source_hash: Option<String>,
     #[serde(default)]
     pub alpha_mode: ImageAlphaMode,
+    /// Blender's TILED source: the image routes UDIM lookups even when only its base tile 1001 is stored, so a lookup
+    /// into any other tile is missing, as Blender renders it. Omitted when false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub tiled: bool,
+}
+
+impl Image {
+    /// A UDIM image routes its lookups by tile: a TILED source, or any stored tile beyond the base.
+    #[must_use]
+    pub fn is_udim(&self) -> bool {
+        self.tiled || !self.tiles.is_empty()
+    }
+
+    /// A UDIM file image whose base tile (1001) file was missing at import: no blob and no source, with its listed tiles
+    /// kept. Blender keeps such an image and renders the base's lookups as its missing colour, so Potter keeps the record.
+    /// A packed or generated image with no blob is still invalid.
+    #[must_use]
+    pub fn base_is_missing(&self) -> bool {
+        self.source == ImageSource::File
+            && self.blob.is_none()
+            && self.source_path.is_none()
+            && self.source_hash.is_none()
+            && self.is_udim()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -729,7 +729,9 @@ fn assert_imported_udim_tile(project: &Path) -> Result<(), Box<dyn Error>> {
         .ok_or("imported UDIM image has no tile 1002")?;
     assert_eq!((tile.width, tile.height), (1, 2), "tile 1002 dimensions");
     assert!(
-        tile.blob.starts_with("sha256:"),
+        tile.blob
+            .as_deref()
+            .is_some_and(|blob| blob.starts_with("sha256:")),
         "tile 1002 blob is not content-addressed"
     );
     Ok(())

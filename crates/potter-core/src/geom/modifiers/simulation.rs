@@ -1308,6 +1308,7 @@ mod tests {
             tiles: std::collections::BTreeMap::new(),
             interpolation: crate::image::ImageInterpolation::Linear,
             srgb: false,
+            udim: false,
         };
         let displaced = displace_volume(
             &volume,
@@ -1341,6 +1342,7 @@ mod tests {
             ..VolumeData::default()
         };
         let image = crate::image::ImageData {
+            udim: false,
             colour: crate::image::ColourCache::default(),
             storage: crate::image::ImageStorage::default(),
             width: 1,
