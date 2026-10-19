@@ -88,16 +88,15 @@ fn stacked_transparent_planes_keep_the_world_behind_the_regular_bounce_budget() 
     let (project, _) = import_blend(&blender, root.path(), "project", &blend)?;
     // The scene stores Blender's default transparent_max_bounces of 8, which the scene JSON omits.
     let scene = read_scene(&project)?;
-    assert!(
-        scene["render"].get("transparent_max_bounces").is_none(),
-        "the default transparent_max_bounces must be omitted: {}",
-        scene["render"]
-    );
-
     let active = scene["active_scene"]
         .as_str()
         .ok_or("active scene is missing")?
         .to_owned();
+    let render = &scene["scenes"][&active]["render"];
+    assert!(
+        render.get("transparent_max_bounces").is_none(),
+        "the default transparent_max_bounces must be omitted: {render}"
+    );
     let applied = apply_operations(
         &project,
         root.path(),
@@ -161,7 +160,7 @@ fn stacked_transparent_planes_keep_the_world_behind_the_regular_bounce_budget() 
     assert_eq!(applied["ok"], true, "{applied}");
     let scene = read_scene(&project)?;
     assert_eq!(
-        scene["render"]["transparent_max_bounces"].as_u64(),
+        scene["scenes"][&active]["render"]["transparent_max_bounces"].as_u64(),
         Some(3),
         "a non-default transparent_max_bounces must be stored"
     );
