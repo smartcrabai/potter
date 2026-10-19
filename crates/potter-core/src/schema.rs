@@ -245,12 +245,23 @@ fn complete_scene_schema(root: &mut Value) {
         "passes",
         "motion_blur",
         "shutter",
-        "motion_blur_samples"
+        "motion_blur_samples",
+        "dicing_rate",
+        "preview_dicing_rate",
+        "max_subdivisions",
+        "offscreen_dicing_scale"
     ]);
     render["properties"]["motion_blur"] = json!({"type":"boolean"});
     render["properties"]["shutter"] = json!({"type":"number"});
     render["properties"]["motion_blur_samples"] =
         json!({"type":"integer","minimum":0,"maximum":u32::MAX});
+    render["properties"]["dicing_rate"] = json!({"type":"number","minimum":0.1,"maximum":1000.0});
+    render["properties"]["preview_dicing_rate"] =
+        json!({"type":"number","minimum":0.1,"maximum":1000.0});
+    render["properties"]["max_subdivisions"] = json!({"type":"integer","minimum":0,"maximum":16});
+    render["properties"]["offscreen_dicing_scale"] =
+        json!({"type":"number","minimum":1.0,"maximum":f32::MAX});
+    render["properties"]["dicing_camera"] = json!({"oneOf":[id_schema(),{"type":"null"}]});
 
     defs["node"]["properties"]["kind"]["enum"] =
         json!(["empty", "mesh", "camera", "light", "armature"]);
@@ -990,13 +1001,12 @@ fn operation_contract(name: &str) -> OperationContract {
         ),
         "sculpt.stroke" => (
             vec![
-                "target", "scope", "brush", "samples", "falloff", "symmetry", "seed", "delta",
-                "dyntopo",
+                "target", "scope", "brush", "samples", "falloff", "symmetry", "delta", "dyntopo",
             ],
             vec!["op", "target", "brush", "samples"],
             "mesh object and stroke samples",
             "shared|single_user for shared data",
-            json!({"falloff":"smooth","symmetry":[],"seed":0}),
+            json!({"falloff":"smooth","symmetry":[]}),
         ),
         "sculpt.dyntopo" => (
             vec![
@@ -1005,13 +1015,12 @@ fn operation_contract(name: &str) -> OperationContract {
                 "samples",
                 "falloff",
                 "symmetry",
-                "seed",
                 "edge_length",
             ],
             vec!["op", "target", "samples", "edge_length"],
             "mesh object and stroke samples",
             "shared|single_user for shared data",
-            json!({"falloff":"smooth","symmetry":[],"seed":0}),
+            json!({"falloff":"smooth","symmetry":[]}),
         ),
         "mesh.transform_elements" => (
             vec![
@@ -1317,8 +1326,8 @@ fn operation_contract(name: &str) -> OperationContract {
         ),
         "paint.texture" => (
             vec![
-                "target", "scope", "image", "uv_layer", "samples", "falloff", "symmetry", "seed",
-                "color", "blend",
+                "target", "scope", "image", "uv_layer", "samples", "falloff", "symmetry", "color",
+                "blend",
             ],
             vec!["op", "target", "image", "samples", "color"],
             "mesh object and UV corners",
@@ -1972,7 +1981,6 @@ fn field_schema(operation: &str, field: &str) -> Value {
                 json!({"type":"array","minItems":1,"items":{"type":"object","required":["position","pressure","radius","strength","time"],"properties":{"position":vec_schema(3),"pressure":{"type":"number","minimum":0,"maximum":1},"radius":{"type":"number","minimum":0},"strength":{"type":"number"},"time":{"type":"number"}},"additionalProperties":false}})
             }
             "symmetry" => json!({"type":"array","items":{"enum":["x","y","z"]},"uniqueItems":true}),
-            "seed" => json!({"type":"integer","minimum":0,"maximum":u64::MAX}),
             "delta" => vec_schema(3),
             "dyntopo" => {
                 json!({"type":"object","required":["edge_length"],"properties":{"edge_length":{"type":"number","exclusiveMinimum":0}},"additionalProperties":false})
