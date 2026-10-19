@@ -1122,7 +1122,10 @@ pub struct RenderSettings {
     pub seed: u32,
     pub max_bounces: u32,
     /// Cycles' `transparent_max_bounces`. Omitted when equal to Blender's default of 8.
-    #[serde(default = "default_transparent_max_bounces", skip_serializing_if = "is_default_transparent_max_bounces")]
+    #[serde(
+        default = "default_transparent_max_bounces",
+        skip_serializing_if = "is_default_transparent_max_bounces"
+    )]
     pub transparent_max_bounces: u32,
     pub film_transparent: bool,
     pub engine: String,

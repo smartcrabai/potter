@@ -1573,9 +1573,7 @@ fn build_imported_graph(
                 "transparent_max_bounces",
                 8,
             ))
-            .map_err(|_| {
-                invalid_intermediate("render transparent_max_bounces is out of range")
-            })?,
+            .map_err(|_| invalid_intermediate("render transparent_max_bounces is out of range"))?,
             film_transparent: render
                 .get("film_transparent")
                 .and_then(Value::as_bool)

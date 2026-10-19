@@ -333,6 +333,12 @@ pub(super) fn render(
             "path tracer bounce count must not exceed 1024",
         ));
     }
+    if transparent_max_bounces > 1024 {
+        return Err(PotError::new(
+            ErrorCode::SceneInvalid,
+            "path tracer transparent bounce count must not exceed 1024",
+        ));
+    }
     let pixel_count = usize::try_from(width)
         .ok()
         .and_then(|width| {
