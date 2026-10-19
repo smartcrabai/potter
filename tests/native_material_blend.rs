@@ -497,7 +497,9 @@ fn blender_authored_materials_infer_alpha_mode_from_render_state() -> TestResult
         "blend"
     );
     let dithered = potter_material(&scene, "Authored Dithered Alpha")?;
-    assert_eq!(dithered["alpha_mode"], "clip");
+    // Blender 5.2.2 never thresholds a DITHERED material's alpha; its graph's transparency is dithered, so Potter
+    // leaves it to the graph as `opaque` (`blend_bridge.py` `_alpha_mode_of`).
+    assert_eq!(dithered["alpha_mode"], "opaque");
     // The threshold is Blender's own default (0.5), not derived from the inferred mode.
     assert_close(
         number(&dithered["alpha_threshold"])?,
