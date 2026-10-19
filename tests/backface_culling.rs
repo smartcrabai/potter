@@ -133,7 +133,8 @@ fn realtime_beauty_culls_single_sided_back_faces_as_eevee_does() -> TestResult {
         &scene,
         root.path(),
         json!([
-            {"op": "material.create", "id": "single", "base_color": [0.8, 0.8, 0.8, 1.0]},
+            {"op": "material.create", "id": "single", "base_color": [0.8, 0.8, 0.8, 1.0],
+             "double_sided": false},
             {"op": "node.create", "id": "plane", "kind": "plane", "params": {"size": 2.0},
              "material": "single"},
             {"op": "light.create", "id": "sun", "light_type": "sun", "energy": 3.0,
