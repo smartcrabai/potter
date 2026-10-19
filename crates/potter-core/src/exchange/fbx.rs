@@ -4200,10 +4200,10 @@ fn write_error(_: std::fmt::Error) -> PotError {
 #[cfg(test)]
 mod tests {
     use super::{
-        export_with_root_allow_lossy, import_bytes, lex, material_slot_losses,
-        numeric_array, parse_color_layers, parse_geometry, parse_nodes, parse_uv_layers,
-        resolve_material_slot, uv_texture_losses, uv_texture_warnings, vertex_group_losses,
-        write_color_layers, write_geometry, write_uv_layers,
+        export_with_root_allow_lossy, import_bytes, lex, material_slot_losses, numeric_array,
+        parse_color_layers, parse_geometry, parse_nodes, parse_uv_layers, resolve_material_slot,
+        uv_texture_losses, uv_texture_warnings, vertex_group_losses, write_color_layers,
+        write_geometry, write_uv_layers,
     };
     use crate::{
         error::{ErrorCode, PotError, Result},
