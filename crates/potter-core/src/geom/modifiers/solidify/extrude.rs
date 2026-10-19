@@ -595,7 +595,6 @@ pub(super) fn solidify_extrude(mesh: &Mesh, _modifier: &Modifier, params: &Param
             .collect(),
         faces: face_sources,
         corners: Some(corners.iter().map(|&corner| vec![(corner, 1.0)]).collect()),
-        edges: None,
     };
     let points: Vec<DVec3> = positions.iter().map(|point| point.as_dvec3()).collect();
     let mut result = build_mesh(points, out_polygons, loose, &origin, mesh)?;

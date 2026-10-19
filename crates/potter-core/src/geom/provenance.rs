@@ -36,9 +36,6 @@ pub(crate) struct Origin {
     /// with the input corner index counted as in [`corner_offsets`]. `None` derives corner sources
     /// from the vertex origins restricted to each output face's source polygon.
     pub corners: Option<Vec<Vec<(usize, f64)>>>,
-    /// Explicit source edge per output edge, in output order: the input edge index, or `None` for an edge
-    /// with no source. `None` derives edge sources from the vertex origins (see [`edge_sources`]).
-    pub edges: Option<Vec<Option<usize>>>,
 }
 
 impl Origin {
@@ -54,7 +51,6 @@ impl Origin {
                 .collect(),
             faces,
             corners: None,
-            edges: None,
         }
     }
 }
@@ -166,19 +162,21 @@ pub(crate) fn remap_attributes_skipping(
 }
 
 /// [`remap_attributes_skipping`] for a subdivided mesh whose face-sampled elements mix in Blender's stages.
-/// Integer, quaternion, and byte data mix stage by stage through `staged`; other data uses `origin`.
+/// Integer, quaternion, and byte data mix stage by stage through `staged`; other data uses `origin`. Each
+/// output edge's source edges are given explicitly in `edges`, in `output.edges` order.
 ///
 /// # Errors
 ///
-/// Returns `INTERNAL_ERROR` when `origin` or `staged` does not describe `output`.
+/// Returns `INTERNAL_ERROR` when `origin`, `staged`, or `edges` does not describe `output`.
 pub(crate) fn remap_attributes_staged(
     source: &Mesh,
     output: &mut Mesh,
     origin: &Origin,
     staged: Option<&Staged>,
+    edges: Vec<Vec<(usize, f64)>>,
     skipped: &[&str],
 ) -> Result<()> {
-    remap_attributes_internal(source, output, origin, staged, None, skipped, None)
+    remap_attributes_internal(source, output, origin, staged, Some(edges), skipped, None)
 }
 
 /// [`remap_attributes_skipping`] whose custom-normal loop basis is `corner_order` (a Blender loop
@@ -237,16 +235,6 @@ fn remap_attributes_internal(
         ));
     }
     if origin.vertices.len() != output.vertices.len() || origin.faces.len() != output.faces.len() {
-        return Err(PotError::new(
-            ErrorCode::InternalError,
-            "modifier provenance does not describe the rebuilt mesh",
-        ));
-    }
-    if origin
-        .edges
-        .as_ref()
-        .is_some_and(|edges| edges.len() != output.edges.len())
-    {
         return Err(PotError::new(
             ErrorCode::InternalError,
             "modifier provenance does not describe the rebuilt mesh",
@@ -453,8 +441,7 @@ fn with_values(entry: &Value, values: Value) -> Value {
     Value::Object(fields)
 }
 
-/// Source edges each output edge blends from, with equal weights. An explicit `origin.edges` entry is
-/// the output edge's only source, or none. Otherwise candidates are the distinct input
+/// Source edges each output edge blends from, with equal weights. Candidates are the distinct input
 /// edges joining a source vertex of the output edge's first endpoint to a source vertex of its
 /// second. When the endpoints share a source vertex (a subdivision inner edge, for example), a
 /// candidate counts only if its two vertices are every source of both endpoints; otherwise the
@@ -466,12 +453,6 @@ fn edge_sources(
     origin: &Origin,
     output_vertex_index: &HashMap<u32, usize>,
 ) -> Vec<Vec<(usize, f64)>> {
-    if let Some(edges) = &origin.edges {
-        return edges
-            .iter()
-            .map(|edge| edge.map_or_else(Vec::new, |index| vec![(index, 1.0)]))
-            .collect();
-    }
     let source_vertex_index: HashMap<u32, usize> = source
         .vertices
         .iter()
@@ -1713,7 +1694,6 @@ mod tests {
             vertices: vec![vec![(0, 1.0)], vec![(1, 1.0)], vec![(0, 0.5), (1, 0.5)]],
             faces: vec![Some(0)],
             corners: None,
-            edges: None,
         };
         remap_attributes(&source, &mut output, &origin).expect("remap");
         let out_ids: Vec<u32> = output.vertices.iter().map(|vertex| vertex.id).collect();
@@ -1790,7 +1770,6 @@ mod tests {
             ],
             faces: vec![Some(0); 4],
             corners: None,
-            edges: None,
         };
         remap_attributes(&source, &mut output, &origin).expect("remap");
         let centre = output.vertices[8].id;
@@ -1837,7 +1816,6 @@ mod tests {
             vertices: vec![vec![(0, 0.5), (2, 0.5)], vec![(1, 0.5), (3, 0.5)]],
             faces: Vec::new(),
             corners: None,
-            edges: None,
         };
         remap_attributes(&source, &mut output, &origin).expect("remap");
         assert_eq!(edge_flags(&output, "sharp"), vec![true]);
@@ -1879,7 +1857,6 @@ mod tests {
             vertices: vec![vec![(0, 1.0)], vec![(1, 1.0)], vec![(0, 0.5), (1, 0.5)]],
             faces: vec![Some(0)],
             corners: None,
-            edges: None,
         };
         remap_attributes(&source, &mut output, &origin).expect("remap");
         let out_vertex = format!("v{}", output.vertices[2].id);
@@ -1936,7 +1913,6 @@ mod tests {
             vertices: vec![vec![(0, 1.0)], vec![(1, 1.0)], vec![(0, 0.5), (1, 0.5)]],
             faces: vec![Some(0)],
             corners: None,
-            edges: None,
         };
         remap_attributes(&source, &mut output, &origin).expect("remap");
 
@@ -2003,7 +1979,6 @@ mod tests {
                 vec![(0, 0.5), (1, 0.5)],
                 vec![(2, 1.0)],
             ]),
-            edges: None,
         };
         remap_attributes(&source, &mut output, &origin).expect("remap");
         let layers = uv_layers::read_layers(&output);
@@ -2059,7 +2034,6 @@ mod tests {
                 vec![(1, 0.5), (3, 0.5)],
                 Vec::new(),
             ]),
-            edges: None,
         };
 
         remap_attributes(&source, &mut output, &origin).expect("remap");
@@ -2068,44 +2042,5 @@ mod tests {
             uv_layers::read_layers(&output)[0].faces[0],
             Some(vec![[2.0, 4.0], [0.0, 1.0], [2.0, 3.5], [0.0, 1.0]])
         );
-    }
-
-    #[test]
-    fn quaternion_mix2_interpolates_along_the_shorter_arc() {
-        let identity = json!([0.0, 0.0, 0.0, 1.0]);
-        let quarter_turn = json!([0.0, 0.0, 0.5_f64.sqrt(), 0.5_f64.sqrt()]);
-        let halfway = quaternion_mix2(&identity, &quarter_turn, 0.5).expect("slerp");
-        // Halfway between 0 and 90 degrees about z is 45 degrees: [0, 0, sin(pi/8), cos(pi/8)].
-        let expected = [
-            0.0,
-            0.0,
-            (std::f64::consts::PI / 8.0).sin(),
-            (std::f64::consts::PI / 8.0).cos(),
-        ];
-        for (actual, expected) in halfway.as_array().expect("array").iter().zip(expected) {
-            assert!((actual.as_f64().expect("number") - expected).abs() < 1.0e-6);
-        }
-        // The sign of the second quaternion does not change the rotation: the shorter arc is taken.
-        let negated = json!([0.0, 0.0, -0.5_f64.sqrt(), -0.5_f64.sqrt()]);
-        assert_eq!(quaternion_mix2(&identity, &negated, 0.5), Some(halfway));
-        // The factor selects the end points exactly at 0 and 1.
-        let start = quaternion_mix2(&identity, &quarter_turn, 0.0).expect("slerp");
-        let end = quaternion_mix2(&identity, &quarter_turn, 1.0).expect("slerp");
-        for (actual, expected) in start
-            .as_array()
-            .expect("array")
-            .iter()
-            .zip([0.0, 0.0, 0.0, 1.0])
-        {
-            assert!((actual.as_f64().expect("number") - expected).abs() < 1.0e-6);
-        }
-        for (actual, expected) in
-            end.as_array()
-                .expect("array")
-                .iter()
-                .zip([0.0, 0.0, 0.5_f64.sqrt(), 0.5_f64.sqrt()])
-        {
-            assert!((actual.as_f64().expect("number") - expected).abs() < 1.0e-6);
-        }
     }
 }

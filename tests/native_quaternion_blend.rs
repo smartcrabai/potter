@@ -120,6 +120,17 @@ fn quaternion_attribute_round_trips_through_blend_in_potter_order() -> TestResul
         blender_values[second_index],
         expected_blender(second)
     );
+    // Vertex 2 has no stored rotation, so the bridge writes Potter's identity default, which Blender reads as
+    // (1, 0, 0, 0) in w, x, y, z order.
+    let unassigned_index = storage_index(2)?;
+    assert!(
+        same_quaternion(
+            &floats(&blender_values[unassigned_index])?,
+            &[1.0, 0.0, 0.0, 0.0]
+        ),
+        "Blender holds {:?} for the unassigned v2, expected the identity (1, 0, 0, 0)",
+        blender_values[unassigned_index]
+    );
 
     // Reimport the saved file: Potter's native store must hold the original [x, y, z, w] values.
     let (reimported, _) = import_blend(&blender, root.path(), "reimported", &exported)?;

@@ -908,8 +908,29 @@ fn order_value(
         ("FACE", "FLOAT") => json!(200.25 + element as f64),
         ("CORNER", "FLOAT") => json!(300.25 + loop_index as f64),
         ("CORNER", "INT") => json!((loop_index * 5) % 13),
+        ("CORNER", "QUATERNION") => json!(order_corner_quaternion(loop_index)),
         _ => return Err(format!("unsupported order attribute {data_type} on {domain}").into()),
     })
+}
+
+/// The unit quaternion `[x, y, z, w]` of loop `loop_index` for the CORNER quaternion layer: `corner_quaternion_for`
+/// in generate.py, converted to Potter's native order. Neighbouring loops have a negative dot product.
+fn order_corner_quaternion(loop_index: usize) -> [f64; 4] {
+    let axis = [1.0, 0.5, 0.25];
+    let length = axis
+        .iter()
+        .map(|component| component * component)
+        .sum::<f64>()
+        .sqrt();
+    let angle = 0.2 + 0.05 * loop_index as f64;
+    let sign = if loop_index % 2 == 1 { -1.0 } else { 1.0 };
+    let scale = sign * (angle / 2.0).sin() / length;
+    [
+        axis[0] * scale,
+        axis[1] * scale,
+        axis[2] * scale,
+        sign * (angle / 2.0).cos(),
+    ]
 }
 
 /// The unit quaternion `[x, y, z, w]` of vertex `index` in the ordered-attribute fixtures: Potter's native order

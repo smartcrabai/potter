@@ -1026,7 +1026,6 @@ fn assemble(
         vertices: origin_vertices,
         faces: origin_faces,
         corners: None,
-        edges: None,
     };
     remap_attributes_with_edges(source, &mut result, &origin, explicit)?;
     validated(&result)?;

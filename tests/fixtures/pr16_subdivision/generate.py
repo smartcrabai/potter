@@ -254,6 +254,7 @@ def fixture_set():
         {"name": "OrderInt", "domain": "POINT", "type": "INT"},
         {"name": "OrderIntCorner", "domain": "CORNER", "type": "INT"},
         {"name": "OrderQuaternion", "domain": "POINT", "type": "QUATERNION"},
+        {"name": "OrderCornerQuaternion", "domain": "CORNER", "type": "QUATERNION"},
     ]
     # BYTE_COLOR layers hold sRGB bytes that Blender interpolates per slot and truncates (encode_byte_colors).
     byte_colors = [
@@ -536,6 +537,18 @@ def output_mesh(obj, params):
         evaluated.to_mesh_clear()
 
 
+def corner_quaternion_for(loop_index):
+    """A unit quaternion (w, x, y, z) of a loop. All loops share one axis and their angles differ by 0.05, so the
+    dot product of neighbours is positive before the sign alternates. Alternating the sign makes every pair of
+    neighbouring loops have a negative dot product, so slerp's shorter-arc sign rule decides the result."""
+    axis = (1.0, 0.5, 0.25)
+    length = math.sqrt(sum(component * component for component in axis))
+    angle = 0.2 + 0.05 * loop_index
+    sign = -1.0 if loop_index % 2 else 1.0
+    scale = sign * math.sin(angle / 2) / length
+    return (sign * math.cos(angle / 2), axis[0] * scale, axis[1] * scale, axis[2] * scale)
+
+
 def quaternion_for(index):
     """A unit quaternion (w, x, y, z); for some vertices the angle exceeds pi, so w is negative."""
     angle = 0.3 + 0.37 * index
@@ -562,6 +575,8 @@ def order_values(mesh, domain, data_type):
         return [300.25 + loop.index for loop in mesh.loops]
     if domain == "CORNER" and data_type == "INT":
         return [(loop.index * 5) % 13 for loop in mesh.loops]
+    if domain == "CORNER" and data_type == "QUATERNION":
+        return [corner_quaternion_for(loop.index) for loop in mesh.loops]
     raise RuntimeError(f"unsupported order test attribute {data_type} on {domain}")
 
 

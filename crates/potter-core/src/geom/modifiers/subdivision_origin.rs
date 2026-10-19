@@ -56,14 +56,23 @@ pub(super) fn restore_written(mesh: &mut Mesh, written: Vec<(&'static str, Value
     }
 }
 
+/// Each output edge's source as an explicit `(input edge, weight)` list for the remap: a subedge copies its
+/// coarse edge (`subdiv_mesh_edge`, `subdiv_mesh.cc:1226`), and an internal edge has none (`subdiv_copy_edge_data`,
+/// `subdiv_mesh.cc:1199`). `edge_sources` is the order builder's coarse-edge map.
+pub(super) fn edge_origins(edge_sources: Vec<Option<usize>>) -> Vec<Vec<(usize, f64)>> {
+    edge_sources
+        .into_iter()
+        .map(|source| source.map_or_else(Vec::new, |edge| vec![(edge, 1.0)]))
+        .collect()
+}
+
 /// The origin and staged mixes of every element of `output`, the subdivided mesh before its storage is
 /// permuted into Blender's order. `polygons` and `loop_starts` describe `mesh` as subdivision read it;
-/// `edge_sources` is the order builder's coarse-edge map; `samples` and `loose` place each output element on
-/// `mesh`. Corner sources are built only when the remap reads them.
+/// `samples` and `loose` place each output element on `mesh`. Corner sources are built only when the remap
+/// reads them.
 pub(super) fn build(
     mesh: &Mesh,
     polygons: &[Polygon],
-    edge_sources: Vec<Option<usize>>,
     loop_starts: &[usize],
     samples: &Samples,
     loose: &LooseEdges,
@@ -87,7 +96,10 @@ pub(super) fn build(
     for (vertex, sample) in samples.vertices.iter().enumerate() {
         if let Some(sample) = sample {
             let face = &polygons[sample.face].0;
-            let mixed = remap_sources(slots(*sample, polygons, loop_starts), |corner| face[corner]);
+            let mixed = remap_sources(
+                slots(*sample, polygons, loop_starts, Element::Vertex),
+                |corner| face[corner],
+            );
             vertex_sources.push(Staged::flatten(&mixed));
             vertex_stages.push((!is_copy(&mixed)).then_some(Mixing::Slots(mixed)));
         } else {
@@ -118,9 +130,10 @@ pub(super) fn build(
                 .iter()
                 .flatten()
                 .map(|sample| {
-                    remap_sources(slots(*sample, polygons, loop_starts), |corner| {
-                        offsets[sample.face] + corner
-                    })
+                    remap_sources(
+                        slots(*sample, polygons, loop_starts, Element::Corner),
+                        |corner| offsets[sample.face] + corner,
+                    )
                 })
                 .collect()
         });
@@ -139,7 +152,6 @@ pub(super) fn build(
             .map(|corners| corners.first().map(|sample| sample.face))
             .collect(),
         corners: Some(corner_sources),
-        edges: Some(edge_sources),
     };
     let staged = Staged {
         vertices: vertex_stages,
@@ -169,9 +181,24 @@ fn is_copy(stages: &[Stage]) -> bool {
     matches!(stages, [stage] if stage.weight > 1.0 - 1.0e-9 && stage.sources.len() == 1)
 }
 
+/// The element a slot set is mixed for. Blender builds the third slot's two-source midpoint in a different order
+/// for vertices and loops: `last_indices = {first_loop, last_loop}` for a vertex (`subdiv_mesh.cc:535`) and
+/// `{last_loop, first_loop}` for a loop (`subdiv_mesh.cc:691`). Slerp depends on that order when the two
+/// quaternions have a negative dot product.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Element {
+    Vertex,
+    Corner,
+}
+
 /// Blender's mixing slots of a face-sampled element, in the sample's loop frame (loop `j` is storage corner
 /// `(start + j) mod size`), as stages over the face's storage corners. Zero-weight stages are dropped.
-fn slots(sample: Sample, polygons: &[Polygon], loop_starts: &[usize]) -> Vec<Stage> {
+fn slots(
+    sample: Sample,
+    polygons: &[Polygon],
+    loop_starts: &[usize],
+    element: Element,
+) -> Vec<Stage> {
     let size = polygons[sample.face].0.len();
     let start = loop_starts[sample.face];
     let local = sample.in_loop_frame(start, size);
@@ -209,7 +236,10 @@ fn slots(sample: Sample, polygons: &[Polygon], loop_starts: &[usize]) -> Vec<Sta
             },
             Stage {
                 weight: weights[3],
-                sources: vec![(corner(ptex), 0.5), (corner(previous), 0.5)],
+                sources: match element {
+                    Element::Vertex => vec![(corner(ptex), 0.5), (corner(previous), 0.5)],
+                    Element::Corner => vec![(corner(previous), 0.5), (corner(ptex), 0.5)],
+                },
             },
         ]
     };

@@ -1780,7 +1780,6 @@ fn array(
             .map(|(&polygon, &generated)| (!generated).then(|| source_face(polygon)))
             .collect(),
         corners: Some(corners),
-        edges: None,
     };
     let passes: Vec<usize> = polygon_sources
         .iter()
@@ -2794,7 +2793,6 @@ fn subdivision(
     let (origin, staged) = subdivision_origin::build(
         mesh,
         &base_polygons,
-        std::mem::take(&mut order.edge_sources),
         &loop_starts,
         &samples,
         &loose,
@@ -2806,6 +2804,7 @@ fn subdivision(
         &mut result,
         &origin,
         Some(&staged),
+        subdivision_origin::edge_origins(std::mem::take(&mut order.edge_sources)),
         &subdivision_origin::WRITTEN_KEYS,
     )?;
     subdivision_origin::restore_written(&mut result, written);
@@ -4919,7 +4918,6 @@ fn bevel_vertices(
         vertices: compact_origins,
         faces: face_sources,
         corners: Some(corners),
-        edges: None,
     };
     build_mesh(
         compact_points,
@@ -5023,7 +5021,6 @@ fn decimate_compact(
         vertices: compact_origin,
         faces: origin.faces,
         corners: origin.corners,
-        edges: None,
     };
     build_mesh(compact_points, polygons, loose, &origin, source)
 }
@@ -5120,7 +5117,6 @@ fn weld(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             .map(|(&face, &generated)| (!generated).then_some(face))
             .collect(),
         corners: Some(corner_origins),
-        edges: None,
     };
     let mut result = build_mesh(merged.points, merged.polygons, merged.edges, &origin, mesh)?;
     mark_generated_faces_smooth(&mut result, &generated_face_indices);

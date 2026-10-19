@@ -2446,7 +2446,6 @@ pub(super) fn solidify_nonmanifold(
                 .map(|source| source.map(|corner| vec![(corner, 1.0)]).unwrap_or_default())
                 .collect(),
         ),
-        edges: None,
     };
     let output_polygons = out_faces
         .iter()
