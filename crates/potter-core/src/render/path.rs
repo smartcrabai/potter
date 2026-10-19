@@ -1068,10 +1068,14 @@ fn write_center_passes(
                 1.0,
             ));
             output.albedo[index] = surface.params.base_color.map(finite_f32);
+            // The emission pass is the beauty's emission term: the coat attenuates it per channel.
+            let emission = DVec3::from_array(surface.params.emission_color)
+                * surface.params.emission_strength
+                * coat_lower_factor(&surface.params, -direction);
             output.emission[index] = [
-                finite_f32(surface.params.emission_color[0] * surface.params.emission_strength),
-                finite_f32(surface.params.emission_color[1] * surface.params.emission_strength),
-                finite_f32(surface.params.emission_color[2] * surface.params.emission_strength),
+                finite_f32(emission.x),
+                finite_f32(emission.y),
+                finite_f32(emission.z),
                 1.0,
             ];
             if film_transparent {
