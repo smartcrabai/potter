@@ -15,8 +15,8 @@ use glam::{DMat3, DQuat};
 use super::{
     DMat4, DVec3, ErrorCode, Id, Mesh, Modifier, PotError, Result, Value, bool_param,
     corner_normals, id_indices, invalid_parameter, json, number_param, optional_string_param,
-    polygons, positions, safe_acos_approx, schema_value, string_param, string_param_with_expected,
-    uv_layers, validated, vertex_normals,
+    polygons, positions, safe_acos_approx, string_param, string_param_with_expected, uv_layers,
+    validated, vertex_normals,
 };
 use crate::blender_rng::BlenderRng;
 use crate::geom::legacy_texture::{self, ResolvedTexture};
@@ -681,11 +681,7 @@ pub(crate) fn warp_textured(
 }
 
 /// The falloff of a linear distance factor `linear` in `(0, 1]` for one warp falloff type.
-fn warp_falloff(
-    kind: &str,
-    linear: f64,
-    curve: Option<&super::advanced::FalloffCurve>,
-) -> f64 {
+fn warp_falloff(kind: &str, linear: f64, curve: Option<&super::advanced::FalloffCurve>) -> f64 {
     match kind {
         "CURVE" => curve.map_or(linear, |curve| curve.evaluate(linear)),
         "SHARP" => linear * linear,

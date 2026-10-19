@@ -1,5 +1,3 @@
-#![expect(clippy::unwrap_used, reason = "integration test fixtures")]
-
 use std::{
     error::Error,
     fs,
