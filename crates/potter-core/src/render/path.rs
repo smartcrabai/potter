@@ -1545,11 +1545,7 @@ fn shadow_transmittance(
     } else {
         f64::INFINITY
     };
-    loop {
-        let Some(hit) = closest_hit(geometry, bvh, origin, direction, RAY_EPSILON, remaining)
-        else {
-            break;
-        };
+    while let Some(hit) = closest_hit(geometry, bvh, origin, direction, RAY_EPSILON, remaining) {
         let surface = make_surface(
             doc,
             snapshot,

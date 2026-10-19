@@ -11,7 +11,7 @@
 //!   - a shadow ray may cross at most C minus the path's passes transparent surfaces and is
 //!     blocked past that (`kernel/bvh/intersect_filter.h`, `integrate_shadow_max_transparent_hits`).
 //!
-//! Volume case: a homogeneous absorbing slab over a transparent card with film_transparent. Every
+//! Volume case: a homogeneous absorbing slab over a transparent card with `film_transparent`. Every
 //! camera ray crosses the slab, so the film alpha is `1 - exp(-sigma * thickness)`. The film alpha
 //! passes through the camera-segment opacity that the path accumulates, so a regression that resets
 //! it on a later pass-through shows here.
