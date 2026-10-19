@@ -109,4 +109,13 @@ mod tests {
             f64::from(GGX_GEN_SCHLICK_IOR_S[4095])
         );
     }
+
+    #[test]
+    fn ggx_gen_schlick_ior_s_reads_roughness_as_the_fastest_axis() {
+        // `table[z][y][x]` with x fastest: (rough 1, cos 0, z 0) is entry 15.
+        assert_eq!(
+            ggx_gen_schlick_ior_s(1.0, 0.0, 0.0),
+            f64::from(GGX_GEN_SCHLICK_IOR_S[15])
+        );
+    }
 }
