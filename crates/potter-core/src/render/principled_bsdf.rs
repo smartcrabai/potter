@@ -512,9 +512,11 @@ mod single_bounce_tests {
     const LIGHT_DISTANCE: f64 = 4.0;
     const RADIUS: f64 = 1.2;
     const POWER: f64 = 1000.0;
-    /// Quadrature resolution over the disk's bounding square. 512 is needed at this radius: 256 is
-    /// 0.02% off on the diffuse variant, more than its Blender stderr.
-    const GRID: usize = 512;
+    /// Quadrature of the disk in polar coordinates. 96 radial × 192 angular midpoints agree with a
+    /// 768² square grid to 1e-4 relative on the diffuse, sheen and metal variants, inside the
+    /// Blender stderr × 4 tolerance, at about 1/14 of the cost of the square grid.
+    const RADIAL_STEPS: usize = 96;
+    const ANGULAR_STEPS: usize = 192;
     /// Orthographic width of the probe camera (Blender's `ortho_scale`) in units.
     const ORTHO_SCALE: f64 = 0.2;
 
@@ -547,24 +549,25 @@ mod single_bounce_tests {
         let w = toward_receiver.cross(u);
         let receiver = DVec3::new(x, y, 0.0);
         let radiance = POWER / (std::f64::consts::PI * std::f64::consts::PI * RADIUS * RADIUS);
-        let h = 2.0 / GRID as f64;
         let mut total = DVec3::ZERO;
-        for i in 0..GRID {
-            for j in 0..GRID {
-                let a = (i as f64 + 0.5) * h - 1.0;
-                let b = (j as f64 + 0.5) * h - 1.0;
-                if a * a + b * b > 1.0 {
-                    continue;
-                }
+        for i in 0..RADIAL_STEPS {
+            // Midpoint in radius, with the disk's area element r·dr·dφ.
+            let r = (i as f64 + 0.5) / RADIAL_STEPS as f64;
+            for j in 0..ANGULAR_STEPS {
+                let phi = (j as f64 + 0.5) / ANGULAR_STEPS as f64 * std::f64::consts::TAU;
+                let (a, b) = (r * phi.cos(), r * phi.sin());
                 let point = centre + RADIUS * (a * u + b * w);
                 let offset = point - receiver;
                 let distance = offset.length();
                 let direction = offset / distance;
                 let cos_receiver = direction.dot(normal).max(0.0);
                 let cos_emitter = (-direction).dot(toward_receiver).max(0.0);
-                let weight = RADIUS * RADIUS * h * h * cos_emitter / (distance * distance)
-                    * radiance
-                    * cos_receiver;
+                let area = r
+                    * (1.0 / RADIAL_STEPS as f64)
+                    * (std::f64::consts::TAU / ANGULAR_STEPS as f64)
+                    * RADIUS
+                    * RADIUS;
+                let weight = area * cos_emitter / (distance * distance) * radiance * cos_receiver;
                 total += evaluate(params, normal, view, direction) * weight;
             }
         }
@@ -655,6 +658,50 @@ mod single_bounce_tests {
             &params,
             [6.313_597_380_649_298; 3],
             [9.449_430_068_234_293e-4; 3],
+        );
+    }
+
+    /// Coat alone: the base diffuse is black and Specular IOR Level 0 removes the base dielectric
+    /// layer, so the pixel is the coat's own single-bounce integral (`coat_r024`). Its mean equals
+    /// the `spec_only_r024` oracle, as the same GGX dielectric layer with IOR 1.5 would give.
+    #[test]
+    fn single_bounce_coat_r024_matches_blender() {
+        let mut params = native([0.0, 0.0, 0.0, 1.0], 0.0);
+        params.specular_ior_level = 0.0;
+        params.coat_weight = 1.0;
+        params.coat_roughness = 0.24;
+        params.coat_ior = 1.5;
+        assert_matches_oracle(
+            "coat_r024",
+            &params,
+            [3.192_535_599_227_994_7; 3],
+            [3.107_007_194_890_755e-4; 3],
+        );
+    }
+
+    /// A tinted coat over a white diffuse base: the diffuse and the default dielectric layer are
+    /// attenuated by the coat's albedo and tint (`coat_tint_diffuse`).
+    #[test]
+    fn single_bounce_coat_tinted_over_diffuse_matches_blender() {
+        let mut params = native([0.8, 0.8, 0.8, 1.0], 0.0);
+        params.roughness = 0.5;
+        params.coat_weight = 0.5;
+        params.coat_roughness = 0.1;
+        params.coat_ior = 1.5;
+        params.coat_tint = [1.0, 0.5, 0.25];
+        assert_matches_oracle(
+            "coat_tint_diffuse",
+            &params,
+            [
+                5.929_943_926_632_404,
+                4.795_929_251_704_365,
+                4.279_176_461_044_699,
+            ],
+            [
+                8.170_508_334_674_762e-4,
+                8.176_943_583_903_099e-4,
+                8.181_972_915_078_506e-4,
+            ],
         );
     }
 }
