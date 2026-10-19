@@ -2215,7 +2215,8 @@ pub struct Material {
     pub transmission: f64,
     #[serde(default = "default_ior")]
     pub ior: f64,
-    #[serde(default = "default_double_sided")]
+    /// Blender's `use_backface_culling` is off for new materials (`MA_BL_CULL_BACKFACE` unset in `DNA_material_types.h`).
+    #[serde(default = "default_true")]
     pub double_sided: bool,
     #[serde(default)]
     pub node_tree: Option<Id>,
@@ -2253,7 +2254,7 @@ impl Default for Material {
             emission_strength: 0.0,
             transmission: 0.0,
             ior: default_ior(),
-            double_sided: default_double_sided(),
+            double_sided: default_true(),
             node_tree: None,
             base_color_texture: None,
             roughness_texture: None,
@@ -2286,10 +2287,6 @@ fn default_roughness() -> f64 {
 }
 fn default_ior() -> f64 {
     1.5
-}
-/// Blender's new materials are double-sided: `use_backface_culling` is off by default (`MA_BL_CULL_BACKFACE` unset in `DNA_material_types.h`).
-fn default_double_sided() -> bool {
-    true
 }
 
 fn default_displacement_method() -> String {
