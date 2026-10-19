@@ -2215,7 +2215,7 @@ mod visibility_tests {
             Bvh::build_from_positions(prepared.iter().map(|triangle| triangle.source.positions))
                 .expect("visibility BVH builds");
         let camera = Camera {
-            position: DVec3::new(0.0, 0.0, 5.0),
+            position: DVec3::new(0.0, 0.0, 2.5),
             target: DVec3::ZERO,
             up: DVec3::Y,
             near: 0.1,
@@ -2245,8 +2245,9 @@ mod visibility_tests {
                 hit_pixels += usize::from(expected.is_some());
             }
         }
+        // The grid spans [-1, 1]; at z = 2.5 this lens sees about [-0.9, 0.9], so it fills the view.
         assert!(
-            hit_pixels > (SIZE * SIZE / 2) as usize,
+            hit_pixels > (SIZE * SIZE) as usize * 9 / 10,
             "grid covers the view"
         );
     }
