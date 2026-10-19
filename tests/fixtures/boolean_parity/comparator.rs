@@ -5,7 +5,7 @@
 //! rings are in world space, rotated to a canonical vertex; face order is ignored. Potter faces
 //! are matched by cyclic vertex connectivity, then each payload is compared on the matched face/corner.
 //! Coordinates, UVs, and custom normals use absolute 1e-5 tolerance for Blender's f32 storage; vertex-group weights use 1e-6. Topology (counts, face sizes, edge
-//! endpoints, and face connectivity), material, `fid`, and payload presence are exact. No coordinate
+//! endpoints in stored order, and face connectivity), material, `fid`, `shade_smooth`, and payload presence are exact. No coordinate
 //! or payload is rounded into a lookup key. Signed volume uses relative tolerance 1e-6, or absolute
 //! tolerance 1e-9 for expected zero.
 //!
@@ -234,9 +234,10 @@ fn canonical_face(ring: &[DVec3], payload: FacePayload) -> CanonicalFace {
     }
 }
 
+/// Edges match endpoint for endpoint in stored order. Blender (`OrderedEdge`) and Potter
+/// (`blender_edge_order`) both store boolean-output edges lower vertex first, so a reversed pair differs.
 fn same_edge(left: [[f64; 3]; 2], right: [[f64; 3]; 2]) -> bool {
-    (point_matches(left[0], right[0]) && point_matches(left[1], right[1]))
-        || (point_matches(left[0], right[1]) && point_matches(left[1], right[0]))
+    point_matches(left[0], right[0]) && point_matches(left[1], right[1])
 }
 
 fn expected_edge_topology(faces: &[CanonicalFace]) -> Vec<[[f64; 3]; 2]> {
@@ -244,7 +245,12 @@ fn expected_edge_topology(faces: &[CanonicalFace]) -> Vec<[[f64; 3]; 2]> {
     for face in faces {
         for index in 0..face.ring.len() {
             let edge = [face.ring[index], face.ring[(index + 1) % face.ring.len()]];
-            if !edges.iter().any(|existing| same_edge(*existing, edge)) {
+            // Ring edges follow the face winding, so a shared edge appears once in each direction.
+            let reversed = [edge[1], edge[0]];
+            if !edges
+                .iter()
+                .any(|existing| same_edge(*existing, edge) || same_edge(*existing, reversed))
+            {
                 edges.push(edge);
             }
         }
@@ -425,8 +431,7 @@ fn attribute_rows(mesh: &Mesh, domain: &str) -> TestResult<Option<Vec<AttributeV
 
     for (storage_name, attribute) in &mesh.attributes {
         // Blender-internal state (`.select_*`, `.hide_*`) is not a user attribute; the generator skips it too.
-        // Shading is not a user attribute on either side: the generator excludes Blender's `sharp_face`
-        // (its inverse) from every domain, so Potter's raw `shade_smooth` store is skipped here too.
+        // `shade_smooth` is compared per face through `face_smooth_flags`, not as a stored row.
         if storage_name == "custom_normal"
             || storage_name == "shade_smooth"
             || user_attribute_name(storage_name).starts_with('.')
@@ -534,6 +539,28 @@ fn attribute_rows(mesh: &Mesh, domain: &str) -> TestResult<Option<Vec<AttributeV
         }
     }
     Ok((!names.is_empty()).then_some(rows))
+}
+
+/// Per face, Potter's stored `shade_smooth` flag (true is smooth). An absent store means every face is flat.
+fn face_smooth_flags(mesh: &Mesh) -> TestResult<Vec<bool>> {
+    let Some(attribute) = mesh.attributes.get("shade_smooth") else {
+        return Ok(vec![false; mesh.faces.len()]);
+    };
+    let values = attribute
+        .get("values")
+        .and_then(Value::as_object)
+        .ok_or("Potter shade_smooth values are not an object")?;
+    let mut flags = Vec::with_capacity(mesh.faces.len());
+    for face in &mesh.faces {
+        let flag = match values.get(&format!("f{}", face.id)) {
+            Some(value) => value
+                .as_bool()
+                .ok_or("Potter shade_smooth value is not a boolean")?,
+            None => false,
+        };
+        flags.push(flag);
+    }
+    Ok(flags)
 }
 
 /// Per-face UV corners and their pin flags, indexed by output face.
@@ -854,6 +881,7 @@ fn potter_canonical(
             }
         }
     }
+    let smooth_flags = face_smooth_flags(mesh)?;
     let mut faces = Vec::with_capacity(mesh.faces.len());
     let mut rings = Vec::with_capacity(mesh.faces.len());
     let mut face_sizes = BTreeMap::new();
@@ -869,14 +897,14 @@ fn potter_canonical(
                     .ok_or("Potter face references a missing vertex")
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let mut face_attribute_values =
-            face_attribute_rows.as_ref().map(|rows| rows[index].clone());
+        let mut face_attribute_values = face_attribute_rows
+            .as_ref()
+            .map_or_else(BTreeMap::new, |rows| rows[index].clone());
         let fid = face_attribute_values
-            .as_mut()
-            .and_then(|attributes| attributes.remove("fid"))
+            .remove("fid")
             .map(|value| value.as_i64().ok_or("Potter fid is not an integer"))
             .transpose()?;
-        let face_attributes = face_attribute_values.filter(|attributes| !attributes.is_empty());
+        face_attribute_values.insert("shade_smooth".to_owned(), Value::Bool(smooth_flags[index]));
         let uv = uv_faces[index].as_deref();
         let key = format!("f{}", face.id);
         let normals = normal_rows
@@ -937,7 +965,7 @@ fn potter_canonical(
                 uv_layers: Some(uv_layers),
                 point_attributes: point_attribute_values,
                 custom_normals,
-                face_attributes,
+                face_attributes: Some(face_attribute_values),
                 corner_attributes,
                 custom_normal_codes,
             },
@@ -2204,6 +2232,79 @@ fn compare_faces(actual: &[CanonicalFace], expected: &[CanonicalFace]) -> Vec<St
     differences
 }
 
+/// Actual edges keyed by the grid cell of their first endpoint. Cells are twice the point tolerance,
+/// so a point within tolerance of a query lies in the query's cell or one of its 26 neighbours.
+struct EdgeIndex {
+    cell: f64,
+    cells: HashMap<[i64; 3], Vec<usize>>,
+}
+
+impl EdgeIndex {
+    fn new(edges: &[[[f64; 3]; 2]]) -> Self {
+        let cell = 2.0 * point_tolerance();
+        let mut cells: HashMap<[i64; 3], Vec<usize>> = HashMap::new();
+        for (index, edge) in edges.iter().enumerate() {
+            cells
+                .entry(grid_cell(edge[0], cell))
+                .or_default()
+                .push(index);
+        }
+        Self { cell, cells }
+    }
+
+    /// Indices of the edges whose first endpoint lies in `point`'s cell or a neighbouring cell.
+    fn candidates(&self, point: [f64; 3]) -> impl Iterator<Item = usize> + '_ {
+        let cells = &self.cells;
+        let [x, y, z] = grid_cell(point, self.cell);
+        (-1_i64..=1)
+            .flat_map(move |dx| {
+                (-1_i64..=1).flat_map(move |dy| {
+                    (-1_i64..=1)
+                        .map(move |dz| [x.wrapping_add(dx), y.wrapping_add(dy), z.wrapping_add(dz)])
+                })
+            })
+            .filter_map(move |cell| cells.get(&cell))
+            .flatten()
+            .copied()
+    }
+}
+
+/// Grid cell of `point` for cells of side `cell`.
+fn grid_cell(point: [f64; 3], cell: f64) -> [i64; 3] {
+    point.map(|coordinate| (coordinate / cell).floor() as i64)
+}
+
+/// Pairs each expected edge, in order, with the first unused actual edge that matches it: the same
+/// endpoints in stored order, and `payloads_match` for the two indices. Returns the actual index
+/// paired with each expected edge, and which actual edges are paired.
+fn pair_edges(
+    actual: &[[[f64; 3]; 2]],
+    expected: &[[[f64; 3]; 2]],
+    payloads_match: impl Fn(usize, usize) -> bool,
+) -> (Vec<Option<usize>>, Vec<bool>) {
+    let index = EdgeIndex::new(actual);
+    let mut used = vec![false; actual.len()];
+    let pairs: Vec<Option<usize>> = expected
+        .iter()
+        .enumerate()
+        .map(|(expected_index, expected_edge)| {
+            let found = index
+                .candidates(expected_edge[0])
+                .filter(|&actual_index| {
+                    !used[actual_index]
+                        && same_edge(actual[actual_index], *expected_edge)
+                        && payloads_match(actual_index, expected_index)
+                })
+                .min();
+            if let Some(actual_index) = found {
+                used[actual_index] = true;
+            }
+            found
+        })
+        .collect();
+    (pairs, used)
+}
+
 fn compare_edges(actual: &[[[f64; 3]; 2]], expected: &[[[f64; 3]; 2]]) -> Vec<String> {
     let mut differences = Vec::new();
     if actual.len() != expected.len() {
@@ -2213,15 +2314,9 @@ fn compare_edges(actual: &[[[f64; 3]; 2]], expected: &[[[f64; 3]; 2]]) -> Vec<St
             expected.len()
         ));
     }
-    let mut used = vec![false; actual.len()];
-    for (expected_index, expected_edge) in expected.iter().enumerate() {
-        let matched = actual
-            .iter()
-            .enumerate()
-            .find(|(index, edge)| !used[*index] && same_edge(**edge, *expected_edge));
-        if let Some((actual_index, _)) = matched {
-            used[actual_index] = true;
-        } else {
+    let (pairs, used) = pair_edges(actual, expected, |_, _| true);
+    for (expected_index, (expected_edge, pair)) in expected.iter().zip(&pairs).enumerate() {
+        if pair.is_none() {
             differences.push(format!(
                 "Blender edge #{expected_index} {expected_edge:?} has no matching Potter edge; Potter edges: {actual:?}"
             ));
@@ -2244,12 +2339,10 @@ fn edge_point_endpoint_matches(actual: &EdgePointEndpoint, expected: &EdgePointE
         }
 }
 
-fn edge_point_matches(actual: &EdgePoint, expected: &EdgePoint) -> bool {
-    same_edge(actual.edge, expected.edge)
-        && ((edge_point_endpoint_matches(&actual.endpoints[0], &expected.endpoints[0])
-            && edge_point_endpoint_matches(&actual.endpoints[1], &expected.endpoints[1]))
-            || (edge_point_endpoint_matches(&actual.endpoints[0], &expected.endpoints[1])
-                && edge_point_endpoint_matches(&actual.endpoints[1], &expected.endpoints[0])))
+/// Endpoint payloads of two edge-point rows, endpoint by endpoint in stored order.
+fn edge_point_payloads_match(actual: &EdgePoint, expected: &EdgePoint) -> bool {
+    edge_point_endpoint_matches(&actual.endpoints[0], &expected.endpoints[0])
+        && edge_point_endpoint_matches(&actual.endpoints[1], &expected.endpoints[1])
 }
 
 fn compare_edge_points(
@@ -2271,14 +2364,18 @@ fn compare_edge_points(
                     expected.len()
                 ));
             }
-            let mut used = vec![false; actual.len()];
-            for (expected_index, expected_entry) in expected.iter().enumerate() {
-                let matched = actual.iter().enumerate().find(|(index, actual_entry)| {
-                    !used[*index] && edge_point_matches(actual_entry, expected_entry)
-                });
-                if let Some((actual_index, _)) = matched {
-                    used[actual_index] = true;
-                } else {
+            let actual_edges: Vec<_> = actual.iter().map(|entry| entry.edge).collect();
+            let expected_edges: Vec<_> = expected.iter().map(|entry| entry.edge).collect();
+            let (pairs, used) = pair_edges(
+                &actual_edges,
+                &expected_edges,
+                |actual_index, expected_index| {
+                    edge_point_payloads_match(&actual[actual_index], &expected[expected_index])
+                },
+            );
+            for (expected_index, (expected_entry, pair)) in expected.iter().zip(&pairs).enumerate()
+            {
+                if pair.is_none() {
                     differences.push(format!(
                         "Blender edge-point row #{expected_index} {:?} has no matching Potter row",
                         expected_entry.endpoints
@@ -2362,16 +2459,20 @@ fn compare_edge_attributes(
                     expected.len()
                 ));
             }
-            let mut used = vec![false; actual.len()];
-            for expected_entry in expected {
-                let matched = actual.iter().enumerate().find(|(index, actual_entry)| {
-                    !used[*index]
-                        && same_edge(actual_entry.edge, expected_entry.edge)
-                        && attribute_values_match(&actual_entry.values, &expected_entry.values)
-                });
-                if let Some((index, _)) = matched {
-                    used[index] = true;
-                } else {
+            let actual_edges: Vec<_> = actual.iter().map(|entry| entry.edge).collect();
+            let expected_edges: Vec<_> = expected.iter().map(|entry| entry.edge).collect();
+            let (pairs, used) = pair_edges(
+                &actual_edges,
+                &expected_edges,
+                |actual_index, expected_index| {
+                    attribute_values_match(
+                        &actual[actual_index].values,
+                        &expected[expected_index].values,
+                    )
+                },
+            );
+            for (expected_entry, pair) in expected.iter().zip(&pairs) {
+                if pair.is_none() {
                     differences.push(format!(
                         "missing Blender edge attributes on {:?}: {:?}",
                         expected_entry.edge, expected_entry.values

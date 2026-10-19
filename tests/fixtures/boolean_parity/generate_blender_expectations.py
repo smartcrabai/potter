@@ -24,8 +24,8 @@ evaluation is independent per host, so the shared scene gives the same result as
 per case.
 
 Expectations are canonical: face rings are rotated to start at their minimum vertex
-(coordinates rounded to 1e-6), faces are sorted by (ring, material_index), and each undirected
-edge stores sorted world-space endpoints. Point, edge, face, and corner attributes retain
+(coordinates rounded to 1e-6), faces are sorted by (ring, material_index), and each
+edge stores its world-space endpoints in `edge.vertices` order. Point, edge, face, and corner attributes retain
 position/ring association, including face-local point payloads and every named UV layer/pin; Blender
 element indices are not comparison keys.
 Material fields keep four distinct sources: raw OBJECT assignments (`object_materials`, null for DATA links), effective slot materials (`effective_materials`), raw DATA slots (`data_materials`), and per-slot link modes (`material_links`).
@@ -143,6 +143,14 @@ def domain_attribute_values(mesh, domain):
                 attribute_value(item, attribute.data_type) for item in attribute.data
             ]
     return values
+
+
+def smooth_faces(mesh):
+    # Blender stores flat faces in `sharp_face`; without that attribute every face is smooth.
+    sharp = mesh.attributes.get("sharp_face")
+    if sharp is None:
+        return [True] * len(mesh.polygons)
+    return [not item.value for item in sharp.data]
 
 
 def dot(a, b):
@@ -343,7 +351,7 @@ def describe_mesh(evaluated, mesh, spec):
     matrix = evaluated.matrix_world
     raw = [tuple(float(c) for c in matrix @ vertex.co) for vertex in mesh.vertices]
     edges = sorted(
-        sorted(canonical(raw[index]) for index in edge.vertices)
+        [canonical(raw[index]) for index in edge.vertices]
         for edge in mesh.edges
     )
     point_values = domain_attribute_values(mesh, "POINT")
@@ -366,7 +374,7 @@ def describe_mesh(evaluated, mesh, spec):
     edge_attributes = []
     for index, edge in enumerate(mesh.edges):
         edge_attributes.append({
-            "edge": sorted(canonical(raw[vertex]) for vertex in edge.vertices),
+            "edge": [canonical(raw[vertex]) for vertex in edge.vertices],
             "values": {name: values[index] for name, values in edge_values.items()},
         })
     edge_attributes.sort(key=lambda row: (
@@ -375,7 +383,7 @@ def describe_mesh(evaluated, mesh, spec):
     edge_points = []
     for edge in mesh.edges:
         edge_points.append({
-            "edge": sorted(canonical(raw[index]) for index in edge.vertices),
+            "edge": [canonical(raw[index]) for index in edge.vertices],
             "endpoints": [
                 {
                     "co": canonical(raw[index]),
@@ -419,6 +427,7 @@ def describe_mesh(evaluated, mesh, spec):
 
     uv_data = mesh.uv_layers["UVMap"].data if "UVMap" in mesh.uv_layers else None
     normal_layer = mesh.attributes.get("custom_normal")
+    smooth = smooth_faces(mesh)
     faces = []
     sizes = {}
     volume = 0.0
@@ -459,6 +468,7 @@ def describe_mesh(evaluated, mesh, spec):
         face_attributes = {
             name: values[polygon.index] for name, values in face_values.items()
         }
+        face_attributes["shade_smooth"] = smooth[polygon.index]
         point_attribute_rows = [
             {name: values[index] for name, values in point_values.items()}
             for index in indices
@@ -479,8 +489,7 @@ def describe_mesh(evaluated, mesh, spec):
             }
             for name, values in named_uv_layers.items()
         }
-        if face_attributes:
-            record["face_attributes"] = face_attributes
+        record["face_attributes"] = face_attributes
         if corner_attributes:
             record["corner_attributes"] = {
                 name: values[start:] + values[:start]

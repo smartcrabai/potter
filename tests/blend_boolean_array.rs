@@ -97,6 +97,15 @@ camera.rotation_euler = (Vector((0.0, 0.0, 0.0)) - camera.location).to_track_qua
 bpy.context.scene.camera = camera
 bpy.ops.object.light_add(type="AREA", location=(4.0, -4.0, 7.0))
 bpy.context.object.data.energy = 1200.0
+# The test checks that the frame file exists, not its pixels, so the frame stays small.
+scene = bpy.context.scene
+scene.render.resolution_x = 64
+scene.render.resolution_y = 36
+scene.eevee.taa_render_samples = 1
+try:
+    scene.cycles.samples = 1
+except AttributeError:
+    pass
 bpy.ops.wm.save_as_mainfile(filepath=os.path.join(root, "source.blend"))
 "#;
 
@@ -475,6 +484,16 @@ fn touching_exact_observed_surfaces() -> Vec<Surface> {
     .collect()
 }
 
+/// Recorded Blender results of the case whose result depends on the platform's sort (see the note
+/// above `TOUCHING_EXACT_VERTICES`). Empty for every other case.
+fn recorded_blender_variants(name: &str) -> Vec<Surface> {
+    if name == "ArrayHostTouchingEXACT" {
+        touching_exact_observed_surfaces()
+    } else {
+        Vec::new()
+    }
+}
+
 fn check_vertices(actual: &[DVec3], expected: &[DVec3], context: &str) -> Result<(), String> {
     if actual.len() != expected.len() {
         return Err(format!("{context}: vertex count"));
@@ -496,9 +515,9 @@ fn check_vertices(actual: &[DVec3], expected: &[DVec3], context: &str) -> Result
     }
 }
 
+/// Edges match as ordered pairs: Blender's edge direction (v1 to v2) is part of the result.
 fn same_edge(actual: [DVec3; 2], expected: [DVec3; 2]) -> bool {
-    (same_point(actual[0], expected[0]) && same_point(actual[1], expected[1]))
-        || (same_point(actual[0], expected[1]) && same_point(actual[1], expected[0]))
+    same_point(actual[0], expected[0]) && same_point(actual[1], expected[1])
 }
 
 fn check_edges(
@@ -681,11 +700,18 @@ fn boolean_array_box_cutter_layouts_match_blender_for_exact_and_float() -> TestR
                     .ok_or_else(|| format!("Potter did not evaluate `{name}`"))?,
                 world,
             )?;
-            let candidates = if name == "ArrayHostTouchingEXACT" {
-                touching_exact_observed_surfaces()
-            } else {
-                vec![expected_surface]
-            };
+            // The live Blender sample is always a candidate. Recorded platform variants join it only
+            // when the live sample reproduces one of them.
+            let variants = recorded_blender_variants(&name);
+            let mut candidates = vec![expected_surface.clone()];
+            if !variants.is_empty() {
+                assert_boolean_geometry_any(
+                    &expected_surface,
+                    &variants,
+                    &format!("{layout}, {count} boxes, {solver}: live Blender sample"),
+                );
+                candidates.extend(variants);
+            }
             assert_boolean_geometry_any(
                 &actual,
                 &candidates,

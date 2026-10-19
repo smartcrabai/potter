@@ -159,15 +159,24 @@ def cross(a, b):
     )
 
 
+def smooth_faces(mesh):
+    # Blender stores flat faces in `sharp_face`; without that attribute every face is smooth.
+    sharp = mesh.attributes.get("sharp_face")
+    if sharp is None:
+        return [True] * len(mesh.polygons)
+    return [not item.value for item in sharp.data]
+
+
 def describe_mesh(case, regression, owner, mesh, *, rings):
     matrix = owner.matrix_world
     raw = [tuple(float(c) for c in matrix @ vertex.co) for vertex in mesh.vertices]
     edges = sorted(
-        sorted(canonical(raw[index]) for index in edge.vertices)
+        [canonical(raw[index]) for index in edge.vertices]
         for edge in mesh.edges
     )
     uv_layer = mesh.uv_layers["UVMap"] if "UVMap" in mesh.uv_layers else None
     custom = mesh.has_custom_normals
+    smooth = smooth_faces(mesh)
     faces = []
     sizes = {}
     volume = 0.0
@@ -179,6 +188,7 @@ def describe_mesh(case, regression, owner, mesh, *, rings):
         start = min(range(len(ring)), key=ring.__getitem__)
         if rings:
             record = {"ring": rotated(ring, start), "material_index": polygon.material_index}
+            record["face_attributes"] = {"shade_smooth": smooth[polygon.index]}
             if uv_layer is not None:
                 record["uv"] = rotated(
                     [[round(uv_layer.data[li].uv[0], 6) + 0.0,

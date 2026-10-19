@@ -6,6 +6,12 @@
 # corners, vertex-group weights) and the Blender 5.2.2 evaluated result of the Decimate modifier.
 # `tests/modifier_decimate_parity.rs` rebuilds the input in Potter and asserts the same output.
 # Pass `--only <substring>` before the output directory to regenerate a subset.
+#
+# `inputs/float1_edge_potter_order.json` is hand-committed and no generator writes it. Its positions and
+# faces are Blender 5.2.2's Boolean FLOAT-1 result; its edge list is in the order Potter's FLOAT output
+# emits (the `note` field in the file). The Potter command or commit that produced that edge order is not
+# recorded in the repository. The case `float1_edge_potter_r0.6` decimates this mesh in Blender, so its
+# expected output is Blender's. This script only reads the file.
 import json
 import math
 import os
@@ -124,7 +130,7 @@ def build_base(spec):
 
 
 def explicit_mesh(spec):
-    # Mesh data stored as Blender-authored JSON, so edges keep their stored order.
+    # Mesh data from a committed JSON file; edges keep the file's order.
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), spec["file"])
     with open(path, encoding="utf-8") as handle:
         return json.load(handle)
