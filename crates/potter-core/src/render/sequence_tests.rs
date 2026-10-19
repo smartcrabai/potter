@@ -315,6 +315,7 @@ fn potter_exr_writer_stores_associated_alpha_and_reloads_the_straight_colour()
         tiles: std::collections::BTreeMap::new(),
         interpolation: crate::image::ImageInterpolation::Linear,
         srgb: false,
+        udim: false,
         colour: crate::image::ColourCache::default(),
         storage: crate::image::ImageStorage {
             data: false,

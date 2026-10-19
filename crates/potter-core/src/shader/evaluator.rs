@@ -791,7 +791,7 @@ fn sample_material_texture(
     })?;
     // The field samples through the same path as an Image Texture node with the field's extension.
     let blender_uv = storage_to_blender_uv(layer_uv(hit_ctx, layer));
-    let udim = !image.tiles.is_empty();
+    let udim = image.udim;
     let pixel = sample_with_extension_alpha(
         image,
         blender_uv,
@@ -1318,7 +1318,7 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
             )
         })?;
         // A UDIM image routes its lookup from the UV; the node has no tile property (Cycles' kernel_image_udim_map).
-        let udim = !image.tiles.is_empty();
+        let udim = image.udim;
         let interpolation = match node
             .properties
             .get("interpolation")
@@ -2621,6 +2621,7 @@ mod tests {
                 tiles: BTreeMap::new(),
                 interpolation: ImageInterpolation::Closest,
                 srgb: false,
+                udim: false,
             },
         )]);
         context = context.with_images(&images);
@@ -2668,6 +2669,7 @@ mod tests {
                 tiles: BTreeMap::new(),
                 interpolation: ImageInterpolation::Closest,
                 srgb: false,
+                udim: false,
             },
         )]);
         let context = context.with_images(&images);
