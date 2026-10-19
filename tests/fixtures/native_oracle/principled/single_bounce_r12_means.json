@@ -1,0 +1,137 @@
+{
+  "provenance": {
+    "blender": "5.2.2",
+    "engine": "CYCLES",
+    "device": "CPU",
+    "threads": 1,
+    "samples": 4096,
+    "seeds": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15
+    ],
+    "resolution": 16,
+    "patch": "central 8x8",
+    "generator": "tests/fixtures/native_oracle/principled/single_bounce_probe.py with PROBE_DIAMETER=2.4",
+    "geometry": {
+      "receiver": "plane at origin, normal +Z",
+      "view_theta_deg": 45.0,
+      "view_distance": 6.0,
+      "light_distance": 4.0,
+      "light_diameter": 2.4,
+      "power": 1000.0,
+      "world": "black"
+    }
+  },
+  "variants": {
+    "metal_r024": {
+      "mean": [
+        3.6158861538860947,
+        9.598245684988797,
+        15.271571726538241
+      ],
+      "stderr": [
+        0.00038951793721766885,
+        0.0010332277473525395,
+        0.0016438851824800524
+      ]
+    },
+    "metal_r024_white": {
+      "mean": [
+        63.41019209474325,
+        63.41019209474325,
+        63.41019209474325
+      ],
+      "stderr": [
+        0.006732953963258015,
+        0.006732953963258015,
+        0.006732953963258015
+      ]
+    },
+    "diffuse_white": {
+      "mean": [
+        3.2869444717653096,
+        3.2869444717653096,
+        3.2869444717653096
+      ],
+      "stderr": [
+        0.00015069875103773472,
+        0.00015069875103773472,
+        0.00015069875103773472
+      ]
+    },
+    "spec_only_r024": {
+      "mean": [
+        3.1925355992279947,
+        3.1925355992279947,
+        3.1925355992279947
+      ],
+      "stderr": [
+        0.0003107007194890755,
+        0.0003107007194890755,
+        0.0003107007194890755
+      ]
+    }
+  },
+  "linux_control": {
+    "platform": "linux/amd64 Blender 5.2.2 in potter-blender-linux:ready (emulated)",
+    "note": "same probe, radius 0.6; agrees with macOS to about 0.002% on every variant",
+    "means_r06": {
+      "metal_r024": [
+        11.14847169,
+        29.64969398,
+        47.1951895
+      ],
+      "metal_r024_white": [
+        196.06012015,
+        196.06012015,
+        196.06012015
+      ],
+      "diffuse_white": [
+        3.50381383,
+        3.50381383,
+        3.50381383
+      ],
+      "spec_only_r024": [
+        9.83107862,
+        9.83107862,
+        9.83107862
+      ]
+    },
+    "macos_means_r06_16seed": {
+      "metal_r024": [
+        11.14845706,
+        29.64965625,
+        47.19512944
+      ],
+      "metal_r024_white": [
+        196.06049651,
+        196.06049651,
+        196.06049651
+      ],
+      "diffuse_white": [
+        3.50381142,
+        3.50381142,
+        3.50381142
+      ],
+      "spec_only_r024": [
+        9.83107823,
+        9.83107823,
+        9.83107823
+      ]
+    }
+  }
+}
