@@ -782,6 +782,9 @@ fn trace_path(
     let mut bounce = 0u32;
     let mut transparent_bounce = 0u32;
     loop {
+        if bounce > max_bounces {
+            break;
+        }
         let hit = closest_hit(geometry, bvh, origin, direction, RAY_EPSILON, f64::INFINITY);
         let segment_limit = hit.map_or(f64::INFINITY, |hit| hit.distance);
         let environment = world_radiance(doc, &snapshot.scene_id, images, direction, environment)?;

@@ -15,7 +15,12 @@ use super::{
 use crate::{
     error::{ErrorCode, PotError, Result},
     eval::{EvaluationContext, Snapshot, animation::animated_transform},
-    geom::{Mesh, normals::corner_normals, uv_layers},
+    geom::{
+        Mesh, attribute_keys,
+        color_layers::{self, ColorDomain, ColorLayer, ColorStore},
+        normals::corner_normals,
+        uv_layers,
+    },
     model::{
         Action, DataBlock, FCurve, Id, Interpolation, Keyframe, Node, ParentType, SceneDoc,
         Transform,
@@ -257,8 +262,11 @@ pub(crate) fn export(
     let mut objects = Vec::new();
     let mut active = BTreeSet::new();
     if let Some(roots) = children.get(&None) {
+        let mut taken = BTreeSet::new();
         for id in roots {
-            objects.push(write_node(id, doc, &children, &sampled, &mut active, 0)?);
+            let mut object = write_node(id, doc, &children, &sampled, &mut active, 0)?;
+            object.name = alembic_object_name(doc, id, &mut taken);
+            objects.push(object);
         }
     }
     if objects.is_empty() && !doc.nodes.is_empty() {
@@ -437,7 +445,16 @@ struct MeshSample {
     positions: Vec<[f64; 3]>,
     faces: Vec<Vec<usize>>,
     uv_layers: Vec<UvSample>,
+    colors: Vec<ColorSample>,
     normals: Vec<[f64; 3]>,
+}
+
+/// One color layer of a mesh sample, in the storage order that `export_color_layers` gives.
+#[derive(Clone)]
+struct ColorSample {
+    name: String,
+    domain: ColorDomain,
+    values: Vec<[f64; 4]>,
 }
 
 /// One UV layer of a mesh sample: corner values per face in Alembic space (V up), in the reversed
@@ -505,12 +522,17 @@ fn mesh_sample(mesh: &Mesh, allow_lossy: bool) -> Result<MeshSample> {
             })?;
         faces.push(indices);
     }
+    let colors = color_layers::read(mesh);
     for attribute in mesh.attributes.keys() {
+        let is_color_value = colors
+            .layers
+            .iter()
+            .any(|layer| attribute_keys::storage_key(&layer.name) == attribute.as_str());
         let supported_attribute = matches!(
             attribute.as_str(),
-            "uv_layers" | "shade_smooth" | "sharp" | "custom_normal"
-        ) || (allow_lossy
-            && matches!(attribute.as_str(), "vertex_groups" | "alembic_normals"));
+            "uv_layers" | "color_layers" | "shade_smooth" | "sharp" | "custom_normal"
+        ) || is_color_value
+            || (allow_lossy && matches!(attribute.as_str(), "vertex_groups" | "alembic_normals"));
         if !supported_attribute && !allow_lossy {
             return Err(unsupported(
                 "mesh.attribute",
@@ -518,6 +540,7 @@ fn mesh_sample(mesh: &Mesh, allow_lossy: bool) -> Result<MeshSample> {
             ));
         }
     }
+    let color_samples = export_color_layers(&faces, colors)?;
     let points = mesh
         .vertices
         .iter()
@@ -532,11 +555,56 @@ fn mesh_sample(mesh: &Mesh, allow_lossy: bool) -> Result<MeshSample> {
             .collect(),
         faces: reversed_faces(&faces),
         uv_layers,
+        colors: color_samples,
         normals: normals
             .iter()
             .map(|normal| file_vector(normal.to_array()))
             .collect(),
     })
+}
+
+/// The color layers of `store` in Alembic space: Blender `BYTE_COLOR` values (sRGB RGB, linear
+/// alpha), quantized to bytes. Corner values follow the reversed corner order that
+/// `reversed_faces` gives. `faces` are in Potter order.
+fn export_color_layers(faces: &[Vec<usize>], store: ColorStore) -> Result<Vec<ColorSample>> {
+    store
+        .layers
+        .into_iter()
+        .map(|layer| {
+            let mut values = match layer.domain {
+                ColorDomain::Point => layer.values,
+                ColorDomain::Corner => reverse_corner_runs(faces, layer.values)?,
+            };
+            for [red, green, blue, alpha] in &mut values {
+                *red = super::encode_byte_color(*red, false);
+                *green = super::encode_byte_color(*green, false);
+                *blue = super::encode_byte_color(*blue, false);
+                *alpha = super::encode_byte_color(*alpha, true);
+            }
+            Ok(ColorSample {
+                name: layer.name,
+                domain: layer.domain,
+                values,
+            })
+        })
+        .collect()
+}
+
+/// `name` as an arbitrary `GeomParam` name that no earlier parameter uses. Names Alembic reserves,
+/// and empty names, become `Color`; a repeat takes a `.001`-style suffix.
+fn unique_geomparam_name(name: &str, taken: &mut BTreeSet<String>) -> String {
+    let base = if name.is_empty() || reserves_uv_layer_name(name) {
+        "Color"
+    } else {
+        name
+    };
+    let mut candidate = base.to_owned();
+    let mut suffix = 1_u32;
+    while !taken.insert(candidate.clone()) {
+        candidate = format!("{base}.{suffix:03}");
+        suffix += 1;
+    }
+    candidate
 }
 
 /// Whether Alembic reserves `name` for a `PolyMesh` property of its own (`P`, `N`, or a name starting
@@ -591,6 +659,29 @@ fn export_uv_layers(mesh: &Mesh) -> Vec<UvSample> {
         .collect()
 }
 
+/// The Alembic name of a node: its display name when that is one path element and unused among its
+/// siblings, else its Potter ID. The display name also rides in `potter_name_hex`, so import reads
+/// it back exactly.
+fn alembic_object_name(doc: &SceneDoc, id: &Id, taken: &mut BTreeSet<String>) -> String {
+    let display = doc.nodes.get(id).map_or("", |node| node.name.as_str());
+    let mut name = if display.is_empty() || display.contains('/') {
+        id.as_str().to_owned()
+    } else {
+        display.to_owned()
+    };
+    if taken.contains(&name) {
+        id.as_str().clone_into(&mut name);
+    }
+    let root = name.clone();
+    let mut index = 1_u32;
+    while taken.contains(&name) {
+        name = format!("{root}_{index}");
+        index += 1;
+    }
+    taken.insert(name.clone());
+    name
+}
+
 fn write_node(
     id: &Id,
     doc: &SceneDoc,
@@ -633,16 +724,15 @@ fn write_node(
             child_objects.push(write_polymesh(&mesh_samples, samples.len())?);
         }
     }
+    let mut taken = child_objects
+        .iter()
+        .map(|object: &AbcObject| object.name.clone())
+        .collect::<BTreeSet<_>>();
     if let Some(nested) = children.get(&Some(id.clone())) {
         for child in nested {
-            child_objects.push(write_node(
-                child,
-                doc,
-                children,
-                samples,
-                active,
-                depth + 1,
-            )?);
+            let mut object = write_node(child, doc, children, samples, active, depth + 1)?;
+            object.name = alembic_object_name(doc, child, &mut taken);
+            child_objects.push(object);
         }
     }
     active.remove(id);
@@ -729,6 +819,30 @@ fn write_polymesh(samples: &[&MeshSample], sample_count: usize) -> Result<AbcObj
     }
     let mut layer_uvs = vec![Vec::with_capacity(samples.len()); layer_names.len()];
     let mut layer_uv_indices = vec![Vec::with_capacity(samples.len()); layer_names.len()];
+    let color_specs = samples
+        .first()
+        .map(|sample| {
+            sample
+                .colors
+                .iter()
+                .map(|layer| (layer.name.as_str(), layer.domain))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if samples.iter().any(|sample| {
+        sample
+            .colors
+            .iter()
+            .map(|layer| (layer.name.as_str(), layer.domain))
+            .ne(color_specs.iter().copied())
+    }) {
+        return Err(PotError::new(
+            ErrorCode::ExportFailed,
+            "Alembic color layers changed between samples",
+        ));
+    }
+    let mut layer_colors = vec![Vec::with_capacity(samples.len()); color_specs.len()];
+    let mut layer_color_indices = vec![Vec::with_capacity(samples.len()); color_specs.len()];
     for sample in samples {
         positions.push(encode_vec3_f32(&sample.positions)?);
         let mut face_counts = Vec::with_capacity(sample.faces.len());
@@ -765,6 +879,33 @@ fn write_polymesh(samples: &[&MeshSample], sample_count: usize) -> Result<AbcObj
                 .collect::<Result<Vec<_>>>()?;
             layer_uv_indices[layer_index].push(encode_u32s(&uv_index_values));
         }
+        for (layer_index, layer) in sample.colors.iter().enumerate() {
+            let expected = match layer.domain {
+                ColorDomain::Point => sample.positions.len(),
+                ColorDomain::Corner => sample.faces.iter().map(Vec::len).sum::<usize>(),
+            };
+            if layer.values.len() != expected {
+                return Err(PotError::new(
+                    ErrorCode::ExportFailed,
+                    format!(
+                        "Alembic color layer `{}` does not match its scope",
+                        layer.name
+                    ),
+                ));
+            }
+            layer_colors[layer_index].push(encode_color_f32(&layer.values)?);
+            let color_indices = (0..layer.values.len())
+                .map(|index| {
+                    u32::try_from(index).map_err(|_| {
+                        PotError::new(
+                            ErrorCode::LimitExceeded,
+                            "Alembic color index exceeds uint32",
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            layer_color_indices[layer_index].push(encode_u32s(&color_indices));
+        }
     }
     let p_meta = metadata_map(&[("geoScope", "vtx"), ("interpretation", "point")]);
     let n_meta = geomparam_metadata("facevarying", "normal", 3);
@@ -792,7 +933,8 @@ fn write_polymesh(samples: &[&MeshSample], sample_count: usize) -> Result<AbcObj
     ];
     // Alembic's PolyMesh UV channel is the canonical `uv` GeomParam. Blender uses `sourceName` to
     // restore the active layer's name; additional UV layers live under `.arbGeomParams`.
-    let mut arbitrary_uvs = Vec::with_capacity(layer_names.len().saturating_sub(1));
+    let mut arbitrary_params =
+        Vec::with_capacity(layer_names.len().saturating_sub(1) + color_specs.len());
     if let Some(name) = layer_names.first() {
         let mut metadata = uv_meta.clone();
         metadata.insert("sourceName".to_owned(), (*name).to_owned());
@@ -807,7 +949,7 @@ fn write_polymesh(samples: &[&MeshSample], sample_count: usize) -> Result<AbcObj
         )?);
     }
     for (layer_index, name) in layer_names.iter().enumerate().skip(1) {
-        arbitrary_uvs.push(geomparam_property(
+        arbitrary_params.push(geomparam_property(
             name,
             uv_meta.clone(),
             10,
@@ -817,11 +959,35 @@ fn write_polymesh(samples: &[&MeshSample], sample_count: usize) -> Result<AbcObj
             std::mem::take(&mut layer_uv_indices[layer_index]),
         )?);
     }
-    if !arbitrary_uvs.is_empty() {
+    // Colors are arbitrary GeomParams too. `sourceName` restores each layer's name, so the parameter
+    // name only has to be unique among the arbitrary parameters.
+    let mut taken_names = layer_names
+        .iter()
+        .skip(1)
+        .map(|name| (*name).to_owned())
+        .collect::<BTreeSet<_>>();
+    for (layer_index, (name, domain)) in color_specs.iter().enumerate() {
+        let scope = match domain {
+            ColorDomain::Point => "vertex",
+            ColorDomain::Corner => "facevarying",
+        };
+        let mut metadata = geomparam_metadata(scope, "rgba", 4);
+        metadata.insert("sourceName".to_owned(), (*name).to_owned());
+        arbitrary_params.push(geomparam_property(
+            &unique_geomparam_name(name, &mut taken_names),
+            metadata,
+            10,
+            4,
+            sampling_index,
+            std::mem::take(&mut layer_colors[layer_index]),
+            std::mem::take(&mut layer_color_indices[layer_index]),
+        )?);
+    }
+    if !arbitrary_params.is_empty() {
         geometry_properties.push(compound_property(
             ".arbGeomParams",
             BTreeMap::new(),
-            arbitrary_uvs,
+            arbitrary_params,
         )?);
     }
     let geometry = compound_property(
@@ -863,6 +1029,16 @@ fn encode_vec3_f32(values: &[[f64; 3]]) -> Result<Vec<u8>> {
 
 fn encode_vec2_f32(values: &[[f64; 2]]) -> Result<Vec<u8>> {
     let mut output = Vec::with_capacity(values.len().saturating_mul(8));
+    for value in values {
+        for component in value {
+            output.extend_from_slice(&float_to_f32(*component)?.to_le_bytes());
+        }
+    }
+    Ok(output)
+}
+
+fn encode_color_f32(values: &[[f64; 4]]) -> Result<Vec<u8>> {
+    let mut output = Vec::with_capacity(values.len().saturating_mul(16));
     for value in values {
         for component in value {
             output.extend_from_slice(&float_to_f32(*component)?.to_le_bytes());
@@ -953,12 +1129,13 @@ fn geomparam_metadata(scope: &str, interpretation: &str, extent: u8) -> BTreeMap
         "constant" => "con",
         scope => scope,
     };
+    let pod_extent = extent.to_string();
     metadata_map(&[
         ("arrayExtent", "1"),
         ("geoScope", scope),
         ("interpretation", interpretation),
         ("isGeomParam", "true"),
-        ("podExtent", if extent == 2 { "2" } else { "3" }),
+        ("podExtent", pod_extent.as_str()),
         ("podName", "float32_t"),
     ])
 }
@@ -2350,11 +2527,16 @@ fn import_polymesh(
         .ok_or_else(|| import_error("Alembic PolyMesh .faceIndices array is missing"))?;
     let normals = property(&geom.children, "N");
     let uv_parameters = uv_geom_parameters(geom);
+    let color_parameters = color_geom_parameters(geom);
     let mut sample_count = positions_prop
         .sample_count
         .max(counts_prop.sample_count)
         .max(indices_prop.sample_count);
-    for parameter in normals.into_iter().chain(uv_parameters.iter().copied()) {
+    for parameter in normals
+        .into_iter()
+        .chain(uv_parameters.iter().copied())
+        .chain(color_parameters.iter().copied())
+    {
         let values = geomparam_values_property(parameter)?;
         sample_count = sample_count.max(values.sample_count);
     }
@@ -2387,6 +2569,7 @@ fn import_polymesh(
             faces,
             uv_layers: Vec::new(),
             normals: Vec::new(),
+            colors: Vec::new(),
         });
     }
     let first = mesh_samples
@@ -2414,7 +2597,11 @@ fn import_polymesh(
     if indices_prop.sample_count > time_property.sample_count {
         time_property = indices_prop;
     }
-    for parameter in normals.into_iter().chain(uv_parameters.iter().copied()) {
+    for parameter in normals
+        .into_iter()
+        .chain(uv_parameters.iter().copied())
+        .chain(color_parameters.iter().copied())
+    {
         let values = geomparam_values_property(parameter)?;
         if values.sample_count != 1 && values.sample_count != sample_count {
             return Err(import_error(
@@ -2505,7 +2692,7 @@ fn import_polymesh(
                         .collect::<Vec<_>>())
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let name = uv_source_name(parameter);
+            let name = geomparam_source_name(parameter);
             Ok((name, samples))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -2536,9 +2723,11 @@ fn import_polymesh(
         layers.push(ExchangeUvLayer {
             name,
             corners: first.clone(),
+            pinned: first.iter().map(|face| vec![false; face.len()]).collect(),
         });
     }
     import_uv_layers(&mut mesh, &layers, Some(0), Some(0));
+    import_color_layers(&mut mesh, bytes, &color_parameters, first)?;
     if sample_count > 1 {
         mesh.attributes.insert(
             "alembic_time_samples".to_owned(),
@@ -2705,6 +2894,7 @@ pub(crate) fn read_mesh_cache(
             faces: file_faces.clone(),
             uv_layers: Vec::new(),
             normals: Vec::new(),
+            colors: Vec::new(),
         };
         let uv_layers = read_uv
             .then(|| {
@@ -2721,13 +2911,16 @@ pub(crate) fn read_mesh_cache(
                             2,
                             sample_slot(values, sample_index),
                         )?;
-                        let corners = cache_uv_faces(&file_faces, &scope, &tuples)?
-                            .into_iter()
-                            .map(uv_to_storage)
-                            .collect();
+                        let corners: Vec<Vec<[f64; 2]>> =
+                            cache_uv_faces(&file_faces, &scope, &tuples)?
+                                .into_iter()
+                                .map(uv_to_storage)
+                                .collect();
+                        let pinned = corners.iter().map(|face| vec![false; face.len()]).collect();
                         Ok(ExchangeUvLayer {
                             name: name.clone(),
                             corners,
+                            pinned,
                         })
                     })
                     .collect::<Result<Vec<_>>>()
@@ -3159,8 +3352,8 @@ fn uv_geom_parameters(geom: &ParsedProperty) -> Vec<&ParsedProperty> {
     parameters
 }
 
-/// The name a UV parameter's layer carries: its `sourceName`, or its own name without one.
-fn uv_source_name(parameter: &ParsedProperty) -> String {
+/// The name a geometry parameter's layer carries: its `sourceName`, or its own name without one.
+fn geomparam_source_name(parameter: &ParsedProperty) -> String {
     parameter
         .metadata
         .get("sourceName")
@@ -3172,13 +3365,203 @@ fn uv_source_name(parameter: &ParsedProperty) -> String {
 fn uv_layer_names(parameters: &[&ParsedProperty]) -> Vec<String> {
     let mut layers = Vec::<ExchangeUvLayer>::new();
     for parameter in parameters {
-        let name = unique_uv_name(&uv_source_name(parameter), &layers);
+        let name = unique_uv_name(&geomparam_source_name(parameter), &layers);
         layers.push(ExchangeUvLayer {
             name,
             corners: Vec::new(),
+            pinned: Vec::new(),
         });
     }
     layers.into_iter().map(|layer| layer.name).collect()
+}
+
+/// Whether `parameter` is a color `GeomParam`: three or four float32 components, interpreted as
+/// `rgb` or `rgba` (or `color`), at any scope.
+fn is_color_geomparam(parameter: &ParsedProperty) -> bool {
+    let extent = parameter
+        .metadata
+        .get("podExtent")
+        .and_then(|extent| extent.parse::<u8>().ok());
+    let interpretation = parameter.metadata.get("interpretation").map(String::as_str);
+    matches!(parameter.property_type, 0 | 2)
+        && matches!(
+            (extent, interpretation),
+            (Some(3), Some("rgb" | "color")) | (Some(4), Some("rgba" | "color"))
+        )
+        && parameter
+            .metadata
+            .get("isGeomParam")
+            .is_some_and(|value| value == "true")
+        && parameter
+            .metadata
+            .get("podName")
+            .is_some_and(|pod| pod == "float32_t")
+        && parameter.metadata.get("geoScope").is_some_and(|scope| {
+            matches!(
+                scope.as_str(),
+                "vtx"
+                    | "vertex"
+                    | "vry"
+                    | "varying"
+                    | "fvr"
+                    | "facevarying"
+                    | "uni"
+                    | "uniform"
+                    | "con"
+                    | "constant"
+            )
+        })
+}
+
+/// Color `GeomParam`s of `.geom/.arbGeomParams`, in file order. Blender writes its color attributes
+/// there.
+fn color_geom_parameters(geom: &ParsedProperty) -> Vec<&ParsedProperty> {
+    property(&geom.children, ".arbGeomParams")
+        .filter(|parameter| parameter.property_type == 0)
+        .map(|arbitrary| {
+            arbitrary
+                .children
+                .iter()
+                .filter(|parameter| is_color_geomparam(parameter))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Imports color `GeomParam`s as color layers named by `sourceName`, from each parameter's first
+/// time sample. Alembic records no active or render designation, so the first layer is both.
+fn import_color_layers(
+    mesh: &mut Mesh,
+    bytes: &[u8],
+    parameters: &[&ParsedProperty],
+    sample: &MeshSample,
+) -> Result<()> {
+    let mut layers = Vec::<ColorLayer>::new();
+    for parameter in parameters {
+        let values = geomparam_values_property(parameter)?;
+        let (scope, tuples) =
+            geomparam_values(bytes, parameter, sample, usize::from(values.extent), 0)?;
+        let (domain, values) =
+            canonical_color_values(&sample.faces, sample.positions.len(), &scope, &tuples)?;
+        let name = unique_color_name(&geomparam_source_name(parameter), &layers);
+        layers.push(ColorLayer {
+            name,
+            domain,
+            values,
+        });
+    }
+    let first = layers.first().map(|layer| layer.name.clone());
+    if first.is_some() {
+        color_layers::write(
+            mesh,
+            &ColorStore {
+                layers,
+                active: first.clone(),
+                render: first,
+            },
+        );
+    }
+    Ok(())
+}
+
+/// Potter's linear RGBA values for one parameter's scope. Blender's Alembic importer stores every
+/// color `GeomParam` as a CORNER `BYTE_COLOR` attribute, expanding vertex/varying values through each
+/// face's point indices and decoding sRGB RGB while leaving alpha linear.
+fn canonical_color_values(
+    faces: &[Vec<usize>],
+    point_count: usize,
+    scope: &str,
+    tuples: &[Vec<f64>],
+) -> Result<(ColorDomain, Vec<[f64; 4]>)> {
+    let rgba = tuples
+        .iter()
+        .map(|tuple| {
+            let value = match tuple.as_slice() {
+                [red, green, blue] => [*red, *green, *blue, 1.0],
+                [red, green, blue, alpha] => [*red, *green, *blue, *alpha],
+                _ => return Err(import_error("Alembic color tuple extent is invalid")),
+            };
+            if value.iter().any(|component| !component.is_finite()) {
+                return Err(import_error("Alembic color value is not finite"));
+            }
+            Ok([
+                super::decode_byte_color(value[0], false),
+                super::decode_byte_color(value[1], false),
+                super::decode_byte_color(value[2], false),
+                super::decode_byte_color(value[3], true),
+            ])
+        })
+        .collect::<Result<Vec<_>>>()?;
+    match scope {
+        "vertex" | "varying" => {
+            if rgba.len() != point_count {
+                return Err(import_error(
+                    "Alembic vertex color count does not match point count",
+                ));
+            }
+            Ok((ColorDomain::Corner, point_color_corners(faces, &rgba)?))
+        }
+        "constant" => {
+            let value = *rgba
+                .first()
+                .ok_or_else(|| import_error("Alembic constant color is missing"))?;
+            let corner_count = faces
+                .iter()
+                .try_fold(0_usize, |count, face| count.checked_add(face.len()));
+            let corner_count =
+                corner_count.ok_or_else(|| import_error("Alembic color corner count overflow"))?;
+            Ok((ColorDomain::Corner, vec![value; corner_count]))
+        }
+        "facevarying" => Ok((ColorDomain::Corner, reverse_corner_runs(faces, rgba)?)),
+        "uniform" => Ok((
+            ColorDomain::Corner,
+            faces
+                .iter()
+                .zip(&rgba)
+                .flat_map(|(face, value)| std::iter::repeat_n(*value, face.len()))
+                .collect(),
+        )),
+        other => Err(unsupported(
+            "alembic.geom_scope",
+            format!("Alembic color scope `{other}` is unsupported"),
+        )),
+    }
+}
+
+/// Blender imports Alembic vertex colors into CORNER storage and resolves each corner through its
+/// control-point index. Potter faces reverse Alembic winding, so colors follow that same reversal.
+fn point_color_corners(faces: &[Vec<usize>], point_colors: &[[f64; 4]]) -> Result<Vec<[f64; 4]>> {
+    let corner_count = faces
+        .iter()
+        .try_fold(0_usize, |count, face| count.checked_add(face.len()));
+    let corner_count =
+        corner_count.ok_or_else(|| import_error("Alembic color corner count overflow"))?;
+    let mut colors = Vec::with_capacity(corner_count);
+    for face in faces {
+        for &point in face.iter().rev() {
+            colors.push(
+                *point_colors
+                    .get(point)
+                    .ok_or_else(|| import_error("Alembic color face references a missing point"))?,
+            );
+        }
+    }
+    Ok(colors)
+}
+
+/// `name`, or `name.001`-style with the first suffix that no earlier layer uses.
+fn unique_color_name(name: &str, layers: &[ColorLayer]) -> String {
+    if !layers.iter().any(|layer| layer.name == name) {
+        return name.to_owned();
+    }
+    let mut suffix = 1_usize;
+    loop {
+        let candidate = format!("{name}.{suffix:03}");
+        if !layers.iter().any(|layer| layer.name == candidate) {
+            return candidate;
+        }
+        suffix += 1;
+    }
 }
 
 /// Alembic stores V up, as Blender does; Potter stores V down, so the conversion flips V.
@@ -4505,6 +4888,97 @@ mod tests {
             static_samples
                 .iter()
                 .all(|sample| !sample.has_multiple_topology_samples)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn imports_blender_byte_rgba_as_linear_corner_values() -> Result<()> {
+        let faces = vec![vec![0, 1, 2]];
+        let tuples = vec![
+            vec![0.5, 0.0, 1.0, 0.5],
+            vec![0.0, 0.5, 0.0, 0.25],
+            vec![1.0, 1.0, 1.0, 1.0],
+        ];
+        let (domain, values) = canonical_color_values(&faces, 3, "facevarying", &tuples)?;
+
+        assert!(matches!(domain, ColorDomain::Corner));
+        assert_eq!(values.len(), 3);
+        let decoded = values
+            .last()
+            .ok_or_else(|| import_error("imported corner color is missing"))?;
+        assert!((decoded[0] - 0.215_860_500_113_899_26).abs() < 1.0e-12);
+        assert_eq!(decoded[3], 128.0 / 255.0);
+        Ok(())
+    }
+
+    #[test]
+    fn imports_blender_vertex_scope_colors_as_reversed_corner_values() -> Result<()> {
+        let faces = vec![vec![0, 1, 2], vec![2, 1, 3]];
+        let tuples = vec![
+            vec![0.5, 0.0, 0.0, 1.0],
+            vec![1.0, 0.0, 0.0, 0.5],
+            vec![0.0, 0.0, 1.0, 0.25],
+            vec![0.25, 0.5, 0.0, 1.0],
+        ];
+        let (domain, values) = canonical_color_values(&faces, 4, "vertex", &tuples)?;
+
+        assert_eq!(domain, ColorDomain::Corner);
+        assert_eq!(values.len(), 6);
+        assert_eq!(values[0], [0.0, 0.0, 1.0, 64.0 / 255.0]);
+        assert_eq!(values[1], [1.0, 0.0, 0.0, 128.0 / 255.0]);
+        assert!((values[2][0] - 0.215_860_500_113_899_26).abs() < 1.0e-12);
+        assert_eq!(values[4], values[1]);
+        Ok(())
+    }
+
+    #[test]
+    fn exports_blender_byte_rgba_without_changing_color_scope_or_order() -> Result<()> {
+        let colors = export_color_layers(
+            &[vec![0, 1, 2]],
+            ColorStore {
+                layers: vec![
+                    ColorLayer {
+                        name: "Corners".to_owned(),
+                        domain: ColorDomain::Corner,
+                        values: vec![
+                            [0.5, 0.0, 1.0, 0.5],
+                            [0.0, 0.5, 1.0, 0.25],
+                            [1.5, 0.5, -0.25, 128.0 / 255.0],
+                        ],
+                    },
+                    ColorLayer {
+                        name: "Points".to_owned(),
+                        domain: ColorDomain::Point,
+                        values: vec![[0.5, 0.0, 1.0, 0.5], [1.0, 1.0, 0.0, 0.25]],
+                    },
+                ],
+                active: None,
+                render: None,
+            },
+        )?;
+        let corners = colors
+            .first()
+            .ok_or_else(|| import_error("exported corner color layer is missing"))?;
+        assert_eq!(corners.domain, ColorDomain::Corner);
+        assert_eq!(
+            corners.values,
+            [
+                [1.0, 188.0 / 255.0, 0.0, 128.0 / 255.0],
+                [0.0, 188.0 / 255.0, 1.0, 64.0 / 255.0],
+                [188.0 / 255.0, 0.0, 1.0, 128.0 / 255.0],
+            ]
+        );
+        let points = colors
+            .get(1)
+            .ok_or_else(|| import_error("exported point color layer is missing"))?;
+        assert_eq!(points.domain, ColorDomain::Point);
+        assert_eq!(
+            points.values,
+            [
+                [188.0 / 255.0, 0.0, 1.0, 128.0 / 255.0],
+                [1.0, 1.0, 0.0, 64.0 / 255.0],
+            ]
         );
         Ok(())
     }

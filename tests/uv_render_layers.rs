@@ -179,6 +179,7 @@ fn texture_material(uv_layer: Option<&str>) -> (Material, BTreeMap<String, Image
         tiles: BTreeMap::new(),
         interpolation: ImageInterpolation::Closest,
         srgb: false,
+        udim: false,
     };
     (
         material,
