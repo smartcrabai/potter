@@ -3319,7 +3319,7 @@ fn build_imported_graph(
                 double_sided: item
                     .get("double_sided")
                     .and_then(Value::as_bool)
-                    .unwrap_or(false),
+                    .unwrap_or(true),
                 displacement_method: displacement_method_field(name, item)?,
                 displacement_scale: number_field(item, "displacement_scale", 1.0),
                 displacement_midlevel: number_field(item, "displacement_midlevel", 0.5),
@@ -8326,6 +8326,20 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
                 ),
             )),
         }
+    }
+    // Workbench draws back faces unless the scene's viewport shading culls them; Potter's raster has no such setting.
+    for scene in raw
+        .get("scenes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|scene| scene["display_backface_culling"].as_bool() == Some(true))
+    {
+        losses.push(loss(
+            "blender.scene.display_backface_culling",
+            scene.get("name").and_then(Value::as_str),
+            "Blender's Workbench backface culling is not imported; Potter's solid preview draws back faces",
+        ));
     }
     for material in raw
         .get("materials")

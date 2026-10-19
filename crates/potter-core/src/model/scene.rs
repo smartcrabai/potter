@@ -2234,7 +2234,8 @@ pub struct Material {
     pub transmission: f64,
     #[serde(default = "default_ior")]
     pub ior: f64,
-    #[serde(default)]
+    /// Blender's `use_backface_culling` is off for new materials (`MA_BL_CULL_BACKFACE` unset in `DNA_material_types.h`).
+    #[serde(default = "default_true")]
     pub double_sided: bool,
     #[serde(default)]
     pub node_tree: Option<Id>,
@@ -2272,7 +2273,7 @@ impl Default for Material {
             emission_strength: 0.0,
             transmission: 0.0,
             ior: default_ior(),
-            double_sided: false,
+            double_sided: default_true(),
             node_tree: None,
             base_color_texture: None,
             roughness_texture: None,
