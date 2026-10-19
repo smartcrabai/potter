@@ -256,7 +256,7 @@ fn constraint_parameter_rejections_report_codes_and_pointers() {
 }
 
 #[test]
-fn camera_panorama_rejections_report_codes_and_pointers() {
+fn camera_value_rejections_report_codes_and_pointers() {
     let cases = [
         invalid_case(
             "fisheye_equisolid lens above Blender's fisheye_lens range",
@@ -312,6 +312,38 @@ fn camera_panorama_rejections_report_codes_and_pointers() {
             json!({"op":"camera.create","id":"camera_main","projection":"fisheye"}),
             "INVALID_OPERATION",
             Some("/operations/0/projection"),
+            None,
+        ),
+        invalid_case(
+            "perspective lens below Blender's minimum of 1 mm",
+            json!([]),
+            json!({"op":"camera.create","id":"camera_main","lens_mm":0.5}),
+            "INVALID_ARGUMENT",
+            Some("/operations/0/lens_mm"),
+            None,
+        ),
+        invalid_case(
+            "equirectangular lens below Blender's minimum of 1 mm",
+            json!([]),
+            json!({"op":"camera.create","id":"camera_main","projection":"panorama","panorama_type":"equirectangular","lens_mm":0.5}),
+            "INVALID_ARGUMENT",
+            Some("/operations/0/lens_mm"),
+            None,
+        ),
+        invalid_case(
+            "perspective sensor narrower than Blender's minimum of 1 mm",
+            json!([]),
+            json!({"op":"camera.create","id":"camera_main","sensor_width_mm":0.5}),
+            "INVALID_ARGUMENT",
+            Some("/operations/0/sensor_width_mm"),
+            None,
+        ),
+        invalid_case(
+            "clip start below Blender's clip range minimum",
+            json!([]),
+            json!({"op":"camera.create","id":"camera_main","clip_start":1e-7}),
+            "INVALID_ARGUMENT",
+            Some("/operations/0/clip_start"),
             None,
         ),
     ];

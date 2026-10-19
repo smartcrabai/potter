@@ -288,12 +288,13 @@ fn apply_camera_values(
             &operation_pointer(engine.operation_index, &format!("{prefix}fisheye_fov")),
         ));
     }
-    // Blender's fisheye_lens hard range is 0.01 to 100, and its sensor width hard minimum is 1; Blender clamps other values
-    // on assignment, so Potter refuses them rather than exporting a silently different camera. An equisolid camera holds
-    // its lens in `lens_mm`.
-    if camera.projection == CameraProjection::Panorama
-        && camera.panorama_type == "fisheye_equisolid"
-    {
+    // Blender clamps a camera value outside its RNA hard range on assignment, so Potter refuses such a value rather than
+    // exporting a silently different camera. The ranges are Blender 5.2.2's: lens and sensor width at least 1 mm, clip
+    // planes at least 1e-6, and fisheye_lens 0.01 to 100 (fisheye_fov is checked above). An equisolid camera holds its
+    // lens in `lens_mm` and its Blender `lens` is never written, so the fisheye lens range applies to it instead.
+    let equisolid = camera.projection == CameraProjection::Panorama
+        && camera.panorama_type == "fisheye_equisolid";
+    if equisolid {
         if !(0.01..=100.0).contains(&camera.lens_mm) {
             return Err(engine.error(
                 ErrorCode::InvalidArgument,
@@ -301,11 +302,29 @@ fn apply_camera_values(
                 &operation_pointer(engine.operation_index, &format!("{prefix}lens_mm")),
             ));
         }
-        if camera.sensor_width_mm < 1.0 {
+    } else if camera.lens_mm < 1.0 {
+        return Err(engine.error(
+            ErrorCode::InvalidArgument,
+            "lens_mm must be at least 1 for this camera",
+            &operation_pointer(engine.operation_index, &format!("{prefix}lens_mm")),
+        ));
+    }
+    if camera.sensor_width_mm < 1.0 {
+        return Err(engine.error(
+            ErrorCode::InvalidArgument,
+            "sensor_width_mm must be at least 1",
+            &operation_pointer(engine.operation_index, &format!("{prefix}sensor_width_mm")),
+        ));
+    }
+    for (field, value) in [
+        ("clip_start", camera.clip_start),
+        ("clip_end", camera.clip_end),
+    ] {
+        if value < 1.0e-6 {
             return Err(engine.error(
                 ErrorCode::InvalidArgument,
-                "sensor_width_mm must be at least 1 for fisheye_equisolid cameras",
-                &operation_pointer(engine.operation_index, &format!("{prefix}sensor_width_mm")),
+                format!("{field} must be at least 1e-6"),
+                &operation_pointer(engine.operation_index, &format!("{prefix}{field}")),
             ));
         }
     }
