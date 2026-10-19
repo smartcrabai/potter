@@ -4984,6 +4984,7 @@ fn decimate_compact(
     origin: Origin,
     source: &Mesh,
     keep_vertices: &[bool],
+    edge_order: &[[usize; 2]],
 ) -> Result<Mesh> {
     // Blender's BMesh keeps the live vertices no face or edge uses; `keep_vertices` marks them.
     let mut used: Vec<bool> = (0..points.len())
@@ -5017,12 +5018,54 @@ fn decimate_compact(
         *first = remap[*first];
         *second = remap[*second];
     }
+    let compact_order: Vec<[usize; 2]> = edge_order
+        .iter()
+        .map(|&[first, second]| [remap[first], remap[second]])
+        .collect();
     let origin = Origin {
         vertices: compact_origin,
         faces: origin.faces,
         corners: origin.corners,
     };
-    build_mesh(compact_points, polygons, loose, &origin, source)
+    // The edges take Blender's pool order before the provenance remap writes the edge-indexed data.
+    let mut result = build_topology(compact_points, polygons, loose)?;
+    order_edges(&mut result, &compact_order)?;
+    remap_attributes_with_basis(source, &mut result, &origin, &[], None)?;
+    validated(&result)?;
+    Ok(result)
+}
+
+/// Puts `mesh`'s edges in `pool_order`, the live edges as vertex-index pairs in Blender's edge pool
+/// order. Every mesh edge must appear once in `pool_order`, else the rebuilt mesh does not describe
+/// the decimated topology and the call fails.
+fn order_edges(mesh: &mut Mesh, pool_order: &[[usize; 2]]) -> Result<()> {
+    let (rebuilt, pool) = (mesh.edges.len(), pool_order.len());
+    let mismatch = move || {
+        PotError::new(
+            ErrorCode::InternalError,
+            format!(
+                "decimate edge order does not match the rebuilt mesh (rebuilt {rebuilt} edges, pool {pool} edges)"
+            ),
+        )
+    };
+    if rebuilt != pool {
+        return Err(mismatch());
+    }
+    let index_of = id_indices(mesh);
+    let rank: HashMap<(usize, usize), usize> = pool_order
+        .iter()
+        .enumerate()
+        .map(|(rank, &[first, second])| (edge_key(first, second), rank))
+        .collect();
+    let mut ranked = Vec::with_capacity(mesh.edges.len());
+    for edge in mesh.edges.drain(..) {
+        let [first, second] = edge.vertices.map(|id| index_of[&id]);
+        let position = *rank.get(&edge_key(first, second)).ok_or_else(mismatch)?;
+        ranked.push((position, edge));
+    }
+    ranked.sort_by_key(|&(position, _)| position);
+    mesh.edges = ranked.into_iter().map(|(_, edge)| edge).collect();
+    Ok(())
 }
 
 fn weld(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
