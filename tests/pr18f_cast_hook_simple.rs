@@ -5,7 +5,7 @@
 )]
 
 //! PR18-F deformation parity for Simple Deform, Cast, Hook and Curve against Blender 5.2.2.
-//! Expected coordinates are headless oracle results (scripts in /tmp/pr18f/HookCastSimpleCurve/).
+//! Expected coordinates are headless oracle results (scripts and captured outputs in `fixtures/pr18f_cast_hook_simple/`).
 //! Reference transforms are Blender's `subject.matrix_world.inverted() @ reference.matrix_world`
 //! in column-major order, the form the scene resolves into `runtime.object_matrix`.
 

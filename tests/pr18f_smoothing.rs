@@ -8,7 +8,8 @@
 //! `fixtures/pr18f_smoothing/blender_oracle.json` holds the Blender outputs for a 4x6 open tube
 //! (flat rest, bent deformed input, vertex group G) and a closed torus, produced by running the
 //! Blender modifiers headless on the same inputs. Corrective BIND cases bind the flat tube, then
-//! move the mesh to the bent positions before evaluation.
+//! move the mesh to the bent positions before evaluation. `fixtures/pr18f_smoothing/generate_smoothing_oracle.py`
+//! regenerates the JSON in Blender (`blender -b --factory-startup --python`).
 
 use glam::DVec3;
 use potter_core::{

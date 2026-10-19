@@ -1,8 +1,8 @@
 #![expect(clippy::unwrap_used, clippy::expect_used, reason = "integration tests")]
 
 //! Scene-referenced deformers checked against Blender 5.2.2 headless results.
-//! Blender oracles: `/tmp/pr18f/SceneRefsEval/oracle.py`, `oracle_lattice_*`, and
-//! `oracle_texture_modes.py`.
+//! Blender oracles: `fixtures/pr18f_scene_refs/oracle.py`, `oracle_lattice_*`, and
+//! `oracle_texture_modes.py` (each with its captured JSON and log).
 //! Subjects are a size-1 box (corners at +-0.5) with non-uniform, rotated transforms and
 //! reference objects (hook, cast, origin, warp, wave start, lattice) that are also transformed.
 
