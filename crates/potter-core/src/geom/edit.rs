@@ -4724,6 +4724,93 @@ mod tests {
     use crate::geom::color_layers::{self, ColorDomain};
     use crate::geom::{BoxParams, Mesh, PlaneParams};
 
+    /// Blender 5.2.2 BEAUTY triangulation of each oracle case (`tests/fixtures/triangulate`, from the
+    /// Triangulate modifier, which runs the same `BM_mesh_triangulate` kernel as this op). The
+    /// triangles are compared as sets with each triangle rotated to its smallest corner first, so
+    /// the diagonals and winding must match, while output order does not.
+    #[test]
+    fn triangulate_op_matches_blender_beauty_diagonals() {
+        const ORACLE: &str =
+            include_str!("../../../../tests/fixtures/triangulate/blender_triangulate.json");
+        let oracle: serde_json::Value = serde_json::from_str(ORACLE).unwrap();
+        let cases = oracle["cases"].as_array().unwrap();
+        assert_eq!(
+            cases.len(),
+            117,
+            "complete Blender triangulate oracle is required"
+        );
+        for case in cases {
+            let kind = case["kind"].as_str().unwrap();
+            let points: Vec<DVec3> = case["positions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|point| {
+                    let point = point.as_array().unwrap();
+                    DVec3::new(
+                        point[0].as_f64().unwrap(),
+                        point[1].as_f64().unwrap(),
+                        point[2].as_f64().unwrap(),
+                    )
+                })
+                .collect();
+            let count = points.len();
+            let mut mesh =
+                Mesh::from_positions_and_faces(points, vec![(0..count).collect()]).unwrap();
+            apply(
+                &mut mesh,
+                "triangulate",
+                &json!({"elements": {"domain": "face", "ids": ["f0"]}}),
+            )
+            .unwrap();
+            let index: std::collections::HashMap<u32, usize> = mesh
+                .vertices
+                .iter()
+                .enumerate()
+                .map(|(index, vertex)| (vertex.id, index))
+                .collect();
+            let actual: Vec<[usize; 3]> = mesh
+                .faces
+                .iter()
+                .map(|face| {
+                    assert_eq!(
+                        face.vertices.len(),
+                        3,
+                        "{kind}: triangulate left a non-triangle"
+                    );
+                    [0, 1, 2].map(|corner| index[&face.vertices[corner]])
+                })
+                .collect();
+            let expected: Vec<[usize; 3]> = case["triangles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|triangle| {
+                    let triangle = triangle.as_array().unwrap();
+                    [0, 1, 2].map(|i| usize::try_from(triangle[i].as_u64().unwrap()).unwrap())
+                })
+                .collect();
+            assert_eq!(
+                canonical_triangles(&actual),
+                canonical_triangles(&expected),
+                "Blender BEAUTY diagonals for {kind}"
+            );
+        }
+    }
+
+    /// Each triangle rotated so its smallest index comes first (winding kept), sorted.
+    fn canonical_triangles(triangles: &[[usize; 3]]) -> Vec<[usize; 3]> {
+        let mut canonical: Vec<[usize; 3]> = triangles
+            .iter()
+            .map(|triangle| {
+                let start = (0..3).min_by_key(|&i| triangle[i]).unwrap();
+                [0, 1, 2].map(|offset| triangle[(start + offset) % 3])
+            })
+            .collect();
+        canonical.sort_unstable();
+        canonical
+    }
+
     #[test]
     fn triangulate_replaces_selected_ngon_with_winding_preserving_triangles() {
         let mut mesh = Mesh::plane(PlaneParams::default()).unwrap();
