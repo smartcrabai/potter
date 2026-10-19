@@ -1415,20 +1415,46 @@ fn skin_float_interp<const N: usize>(first: [f32; N], second: [f32; N], t: f32) 
     std::array::from_fn(|index| s * first[index] + t * second[index])
 }
 
-/// Triangle area in `f32`, as `BM_face_calc_area` (half the magnitude of the cross product).
+/// Blender's `BM_face_calc_area` for a triangle, in the same `f32` operation order: the Newell sum of
+/// `add_newell_cross_v3_v3v3` over the loops, then `len_v3(n) * 0.5f`. The order matters because the score of
+/// two candidate quads can differ by one f32 ulp, and the heap pops by that score.
 fn triangle_area32(points: &[glam::Vec3], triangle: [usize; 3]) -> f32 {
-    (points[triangle[1]] - points[triangle[0]])
-        .cross(points[triangle[2]] - points[triangle[0]])
-        .length()
-        * 0.5
+    let mut normal = [0.0_f32; 3];
+    for corner in 0..3 {
+        let previous = points[triangle[corner]].to_array();
+        let current = points[triangle[(corner + 1) % 3]].to_array();
+        normal[0] += (previous[1] - current[1]) * (previous[2] + current[2]);
+        normal[1] += (previous[2] - current[2]) * (previous[0] + current[0]);
+        normal[2] += (previous[0] - current[0]) * (previous[1] + current[1]);
+    }
+    dot32(normal, normal).sqrt() * 0.5
 }
 
-/// Triangle normal in `f32`, normalized (`BM_face_normal_update`). The sign convention differs from Blender's
-/// `normal_tri_v3` by a global flip, which leaves the dot product of two normals unchanged.
-fn triangle_normal32(points: &[glam::Vec3], triangle: [usize; 3]) -> glam::Vec3 {
-    (points[triangle[1]] - points[triangle[0]])
-        .cross(points[triangle[2]] - points[triangle[0]])
-        .normalize_or_zero()
+/// Blender's `BM_face_normal_update` for a triangle (`normal_tri_v3` followed by `normalize_v3`), in `f32`.
+fn triangle_normal32(points: &[glam::Vec3], triangle: [usize; 3]) -> [f32; 3] {
+    let v1 = points[triangle[0]].to_array();
+    let v2 = points[triangle[1]].to_array();
+    let v3 = points[triangle[2]].to_array();
+    let n1 = [v1[0] - v2[0], v1[1] - v2[1], v1[2] - v2[2]];
+    let n2 = [v2[0] - v3[0], v2[1] - v3[1], v2[2] - v3[2]];
+    let normal = [
+        n1[1] * n2[2] - n1[2] * n2[1],
+        n1[2] * n2[0] - n1[0] * n2[2],
+        n1[0] * n2[1] - n1[1] * n2[0],
+    ];
+    // `normalize_v3_v3_length` with unit length 1: scale by `1 / len` only above Blender's 1e-35 threshold.
+    let squared = dot32(normal, normal);
+    if squared > 1.0e-35 {
+        let scale = 1.0_f32 / squared.sqrt();
+        normal.map(|component| component * scale)
+    } else {
+        [0.0; 3]
+    }
+}
+
+/// Blender's `dot_v3v3`, left to right in `f32`.
+fn dot32(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
 /// The three corners of a triangular face.
@@ -1474,7 +1500,10 @@ fn merge_triangle_faces(
         };
         let mut score = (triangle_area32(&points32, first_tri)
             + triangle_area32(&points32, second_tri))
-            * triangle_normal32(&points32, first_tri).dot(triangle_normal32(&points32, second_tri));
+            * dot32(
+                triangle_normal32(&points32, first_tri),
+                triangle_normal32(&points32, second_tri),
+            );
         if quad_crosses_symmetry_plane(points, quad, symmetry_axes) {
             if quad_is_symmetric(points, quad, symmetry_axes) {
                 score *= 10.0;
