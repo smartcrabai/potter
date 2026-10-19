@@ -215,7 +215,7 @@ Empty registries are also explicit. Standalone graphs / physics / tracking, etc.
 - Changing kind requires an explicit convert operation. Report losses to the source descriptor, attributes, rig, animation, etc. No implicit convert / apply / bake.
 - Materials are slot arrays plus face assignments. Support simplified base_color / metallic / roughness input through shader graphs as well. Preserve linear RGBA, alpha, all shader values, and the original graph.
 
-init creates an empty Scene `scene_main`, Collection `collection_root`, View Layer `view_main`, current frame=1, range 1-250, fps=24, and fps_base=1. The default material is linear RGBA=[0.6,0.6,0.6,1], metallic=0, roughness=0.8, double_sided=false. camera / world are null; an empty scene is valid.
+init creates an empty Scene `scene_main`, Collection `collection_root`, View Layer `view_main`, current frame=1, range 1-250, fps=24, and fps_base=1. The default material is linear RGBA=[0.6,0.6,0.6,1], metallic=0, roughness=0.8, double_sided=true. camera / world are null; an empty scene is valid.
 
 ## 5. Operations JSON
 

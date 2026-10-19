@@ -2463,7 +2463,7 @@ fn import_bytes_with_base(
                 emission_strength: material.emission_strength,
                 transmission: material.transmission,
                 ior: material.ior,
-                double_sided: false,
+                double_sided: material.double_sided,
                 ..Material::default()
             },
         );
@@ -2817,6 +2817,7 @@ struct ImportedMaterial {
     emission_strength: f64,
     transmission: f64,
     ior: f64,
+    double_sided: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -3535,6 +3536,8 @@ fn parse_material(node: &FbxNode, numeric_id: i64) -> Result<ImportedMaterial> {
         emission_strength: read_scalar_property(properties, "potter:emission_strength", 0.0)?,
         transmission: read_scalar_property(properties, "potter:transmission", 0.0)?.clamp(0.0, 1.0),
         ior: read_scalar_property(properties, "potter:ior", 1.5)?,
+        // Blender's FBX importer never sets culling, so a file without the Potter property is double-sided.
+        double_sided: read_scalar_property(properties, "potter:double_sided", 1.0)? > 0.5,
     })
 }
 
