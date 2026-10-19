@@ -25,7 +25,10 @@ use super::triangulate::{NgonMethod, QuadMethod, triangulate_mesh};
 use super::{
     Edge, Face, Mesh, MeshError, Vertex, edge_key,
     normals::{corner_normals, face_normal, safe_acos_approx, sharp_edge_flags},
-    provenance::{Origin, edge_flags, mean_value_corners, remap_attributes_with_basis},
+    provenance::{
+        Origin, edge_flags, mean_value_corners, remap_attributes_staged,
+        remap_attributes_with_basis, remap_attributes_with_edges,
+    },
     uv_layers,
 };
 
@@ -39,13 +42,15 @@ mod mirror;
 mod ocean;
 mod remesh_modes;
 pub mod simulation;
+mod solidify;
 mod subdivision_limit;
 mod subdivision_loose;
 mod subdivision_normals;
+mod subdivision_order;
+mod subdivision_origin;
 mod subdivision_uv;
 use subdivision_limit::Samples;
 type Polygon = (Vec<usize>, u32);
-type BevelEdgeFaces = BTreeMap<(usize, usize), Vec<(usize, usize, u32)>>;
 type BevelEdgeFacesWithMaterial = BTreeMap<(usize, usize), Vec<(usize, usize, usize, u32)>>;
 /// Merged points, polygons, and edges, with the input element each output point and polygon came from.
 struct MergedGeometry {
@@ -314,7 +319,7 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
                 &mut warnings,
             )?,
             "subdivision" | "multires" => subdivision(&evaluated, modifier, context)?,
-            "solidify" => solidify(&evaluated, modifier)?,
+            "solidify" => solidify::solidify(&evaluated, modifier, context)?,
             "triangulate" => triangulate(&evaluated, modifier)?,
             "bevel" => bevel(&evaluated, modifier)?,
             "decimate" => without_custom_normals(decimate(&evaluated, modifier)?),
@@ -1078,6 +1083,41 @@ fn mark_generated_faces_smooth(mesh: &mut Mesh, generated: &[usize]) {
             }
         }
     }
+}
+
+/// [`build_mesh`] with each output edge's source edge given explicitly. `output_edge_indices` maps a
+/// vertex-index pair to its position in `output_edge_sources`, the input edge that output edge copies.
+fn build_mesh_with_edge_sources(
+    points: Vec<DVec3>,
+    polygons: Vec<Polygon>,
+    loose_edges: Vec<[usize; 2]>,
+    origin: &Origin,
+    source: &Mesh,
+    output_edge_indices: &HashMap<(usize, usize), usize>,
+    output_edge_sources: &[usize],
+) -> Result<Mesh> {
+    let mut result = build_topology(points, polygons, loose_edges)?;
+    let output_indices = id_indices(&result);
+    let edge_origins = result
+        .edges
+        .iter()
+        .map(|edge| {
+            output_indices
+                .get(&edge.vertices[0])
+                .copied()
+                .zip(output_indices.get(&edge.vertices[1]).copied())
+                .and_then(|(first, second)| {
+                    output_edge_indices
+                        .get(&edge_key(first, second))
+                        .and_then(|&index| output_edge_sources.get(index))
+                })
+                .map(|&source_edge| vec![(source_edge, 1.0)])
+                .unwrap_or_default()
+        })
+        .collect();
+    remap_attributes_with_edges(source, &mut result, origin, edge_origins)?;
+    validated(&result)?;
+    Ok(result)
 }
 
 /// Labels of the element-keyed data a modifier must carry through a rebuild: each top-level
@@ -2661,10 +2701,15 @@ fn subdivision(
     let sizes: Vec<usize> = mesh.faces.iter().map(|face| face.vertices.len()).collect();
     let loop_order = clnor::corner_order(mesh)?.unwrap_or_else(|| clnor::stored_corner_order(mesh));
     let loop_starts = first_loop_starts(&sizes, &loop_order);
-    // With levels, the output custom normals are re-encoded from the subdivided loop normals below.
+    // With levels, the output custom normals are re-encoded from the subdivided loop normals below. The level
+    // loop reads only the crease and UV stores, so the other attributes are remapped once, after the loop.
     result.attributes.remove("custom_normal");
-    let mut source_polygons = polygons(&result)?;
-    let mut source_edges = loose_edges(&result)?;
+    subdivision_origin::retain_written(&mut result);
+    let base_polygons = polygons(&result)?;
+    let mut source_polygons = base_polygons.clone();
+    let base_edges = edge_pairs(mesh)?;
+    let base_loose_edges = loose_edges(mesh)?;
+    let mut source_edges = base_loose_edges.clone();
     let mut edge_creases =
         subdivision_uv::Creases::from_values(edge_crease_values(&result, options.use_creases)?);
     let mut position = subdivision_uv::Position::new(
@@ -2681,8 +2726,8 @@ fn subdivision(
     let mut vertex_creases = vertex_crease_sharpness(mesh, options.use_creases)?;
     // Loose-edge vertices are placed from the base mesh at the end, so their `u` is tracked per level.
     let mut loose = subdivision_loose::LooseEdges::new(
-        edge_pairs(mesh)?,
-        &loose_edges(mesh)?,
+        base_edges.clone(),
+        &base_loose_edges,
         &source_polygons,
         mesh.vertices.len(),
     );
@@ -2734,34 +2779,60 @@ fn subdivision(
             );
         }
     }
-    // Blender stores each output face from its first emitted loop (the smallest loop ordinal). The
-    // face normal of the fan spaces starts its Newell sum at that vertex, so the output faces take
-    // that start. `corner_perm[c]` is the canonical corner now at position `c`; samples keep their
-    // canonical order, and every per-corner array is permuted through it.
+    // Blender's output indices come from subdiv_foreach's coarse vertex/edge/face blocks, not from
+    // runtime position matching. The same permutations move every domain after level refinement.
     let ordinals = subdivision_normals::corner_numbering(
         &samples.corners,
         &sizes,
         &loop_starts,
         levels as u32,
     );
-    let output_sizes: Vec<usize> = result
-        .faces
-        .iter()
-        .map(|face| face.vertices.len())
-        .collect();
-    let face_starts = first_loop_starts(&output_sizes, &ordinals);
-    let mut corner_perm = Vec::with_capacity(ordinals.len());
-    let mut offset = 0;
-    for (face, &start) in result.faces.iter_mut().zip(&face_starts) {
-        let count = face.vertices.len();
+    let resolution = (1_usize << (levels as u32)) + 1;
+    let loose_targets = loose.blender_indices(mesh.vertices.len(), resolution);
+    let mut order = subdivision_order::build(
+        &base_polygons,
+        &base_edges,
+        mesh.vertices.len(),
+        &loop_starts,
+        &samples,
+        &ordinals,
+        &loose_targets,
+        &result,
+        levels as u32,
+    )
+    .map_err(|message| {
+        PotError::new(
+            ErrorCode::InternalError,
+            format!("Blender subdivision output ordering failed: {message}"),
+        )
+    })?;
+    // Attributes move by Blender's interpolation rules while the output is still in pre-permutation
+    // storage, the storage that `samples` and `loose` describe.
+    let (origin, staged) = subdivision_origin::build(
+        mesh,
+        &base_polygons,
+        &loop_starts,
+        &samples,
+        &loose,
+        &result,
+    )?;
+    let written = subdivision_origin::take_written(&mut result);
+    remap_attributes_staged(
+        mesh,
+        &mut result,
+        &origin,
+        Some(&staged),
+        subdivision_origin::edge_origins(std::mem::take(&mut order.edge_sources)),
+        &subdivision_origin::WRITTEN_KEYS,
+    )?;
+    subdivision_origin::restore_written(&mut result, written);
+    subdivision_uv::encode_byte_colors(mesh, &origin, Some(&staged), &mut result);
+    for (face, &start) in result.faces.iter_mut().zip(&order.face_starts) {
         face.vertices.rotate_left(start);
-        corner_perm.extend((0..count).map(|corner| offset + (corner + start) % count));
-        offset += count;
     }
-    // Corner attributes the rebuild carried over are in canonical corner order too.
-    rotate_corner_attributes(&mut result, &face_starts, &corner_perm);
-    // Positions and UVs share the base level of the limit surface. SIMPLE is evaluated at isolation 1
-    // whatever the quality; without `use_limit_surface` only the base level serves the UVs.
+    rotate_corner_attributes(&mut result, &order.face_starts, &order.corners);
+    subdivision_order::reorder_positional_attributes(&mut result, &order);
+    result.faces = subdivision_order::permute(std::mem::take(&mut result.faces), &order.faces);
     let limit_samples = (simple || use_limit_surface).then_some(&samples);
     if simple || use_limit_surface || !uv_maps.is_empty() {
         let base = polygons(mesh)?;
@@ -2778,7 +2849,6 @@ fn subdivision(
             .map(|vertex| non_manifold.corner(vertex))
             .collect();
         let base_vertex_creases = vertex_crease_sharpness(mesh, options.use_creases)?;
-        let base_loose_edges = loose_edges(mesh)?;
         let sharpness = if simple {
             subdivision_limit::BaseSharpness::Simple
         } else {
@@ -2811,7 +2881,7 @@ fn subdivision(
         if !uv_maps.is_empty() {
             let loops: Vec<_> = uv_maps
                 .into_iter()
-                .map(|layer| {
+                .map(|mut layer| {
                     let values = match limit_samples {
                         Some(samples) => limit.face_varying_loops(
                             linear,
@@ -2826,14 +2896,13 @@ fn subdivision(
                             levels as usize,
                         ),
                     };
-                    let values: Vec<_> = corner_perm.iter().map(|&corner| values[corner]).collect();
-                    let pins: Vec<Option<Vec<bool>>> = layer
-                        .pins
-                        .into_iter()
-                        .enumerate()
-                        .map(|(face, row)| {
-                            row.map(|mut flags| {
-                                flags.rotate_left(face_starts[face]);
+                    let values = subdivision_order::permute(values, &order.corners);
+                    let pins: Vec<Option<Vec<bool>>> = order
+                        .faces
+                        .iter()
+                        .map(|&face| {
+                            std::mem::take(&mut layer.pins[face]).map(|mut flags| {
+                                flags.rotate_left(order.face_starts[face]);
                                 flags
                             })
                         })
@@ -2849,17 +2918,23 @@ fn subdivision(
     for (vertex, position) in loose.positions(&positions(mesh), simple) {
         result.vertices[vertex].co = position;
     }
-    // Loop normals follow the final positions: Blender's fan spaces are measured on them. The loop
-    // basis (corner order) is stored with or without custom normals, as main does.
-    let numbering: Vec<usize> = corner_perm.iter().map(|&corner| ordinals[corner]).collect();
-    let identity = numbering
-        .iter()
-        .enumerate()
-        .all(|(index, &ordinal)| index == ordinal);
+    result.vertices =
+        subdivision_order::permute(std::mem::take(&mut result.vertices), &order.vertices);
+    let mut edges = subdivision_order::permute(std::mem::take(&mut result.edges), &order.edges);
+    for (edge, endpoints) in edges.iter_mut().zip(&order.edge_vertices) {
+        edge.vertices = [
+            result.vertices[endpoints[0]].id,
+            result.vertices[endpoints[1]].id,
+        ];
+    }
+    result.edges = edges;
+    // Loop normals follow the final positions: Blender's fan spaces are measured on them. Output
+    // storage is already Blender's loop order, so the loop basis is the identity and is not stored.
     match input_normals {
         Some(normals) => {
             let loops = subdivision_normals::loop_normals(&normals, &sizes, &samples.corners);
-            let vectors: Vec<Option<DVec3>> = corner_perm
+            let vectors: Vec<Option<DVec3>> = order
+                .corners
                 .iter()
                 .map(|&corner| Some(loops[corner]))
                 .collect();
@@ -2867,7 +2942,7 @@ fn subdivision(
                 &mut result,
                 Some(&vectors),
                 NormalCodeOptions {
-                    corner_order: Some(&numbering),
+                    corner_order: None,
                     setter_input: clnor::SetterInput::AlreadyNormalized,
                 },
             )?;
@@ -2876,7 +2951,7 @@ fn subdivision(
             &mut result,
             None,
             NormalCodeOptions {
-                corner_order: (!identity).then_some(numbering.as_slice()),
+                corner_order: None,
                 setter_input: clnor::SetterInput::AlreadyNormalized,
             },
         )?,
@@ -2902,10 +2977,7 @@ fn rotate_corner_attributes(mesh: &mut Mesh, face_starts: &[usize], corner_perm:
                     continue;
                 };
                 if is_corner && values.len() == corner_perm.len() {
-                    *values = corner_perm
-                        .iter()
-                        .map(|&corner| values[corner].clone())
-                        .collect();
+                    *values = subdivision_order::permute(std::mem::take(values), corner_perm);
                 }
             }
             continue;
@@ -3566,215 +3638,8 @@ fn triangulate(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     Ok(result)
 }
 
-#[expect(
-    clippy::manual_midpoint,
-    reason = "matches Blender's float evaluation order for parity"
-)]
-fn solidify(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
-    validated(mesh)?;
-    let thickness = number_param(modifier, "thickness")?;
-    if thickness < 0.0 {
-        return Err(invalid_parameter(
-            modifier,
-            "thickness",
-            "a non-negative finite number",
-        ));
-    }
-    let offset = number_param(modifier, "offset")?;
-    if !(-1.0..=1.0).contains(&offset) {
-        return Err(invalid_parameter(
-            modifier,
-            "offset",
-            "a number from -1 through 1",
-        ));
-    }
-    let use_even_offset = bool_param(modifier, "use_even_offset")?;
-    let use_quality_normals = bool_param(modifier, "use_quality_normals")?;
-    let use_rim = bool_param(modifier, "use_rim")?;
-    let use_rim_only = bool_param(modifier, "use_rim_only")?;
-    let flip = bool_param(modifier, "use_flip_normals")?;
-    if mesh.faces.is_empty() {
-        return Ok(mesh.clone());
-    }
-
-    let source_points = positions(mesh);
-    let source_polygons = polygons(mesh)?;
-    let source_loose_edges = loose_edges(mesh)?;
-    let normals = vertex_normals(&source_points, &source_polygons, use_quality_normals);
-    let mut even_scales = vec![0.0; source_points.len()];
-    let mut angle_totals = vec![0.0; source_points.len()];
-    let mut edge_faces: BevelEdgeFaces = BTreeMap::new();
-    // Per edge: the first face that uses it, and that face's corner at the edge's first vertex.
-    let mut edge_owner: BTreeMap<(usize, usize), (usize, usize)> = BTreeMap::new();
-    let mut corner_base = Vec::with_capacity(source_polygons.len());
-    let mut corner_total = 0;
-    for (face_index, (face, material)) in source_polygons.iter().enumerate() {
-        corner_base.push(corner_total);
-        corner_total += face.len();
-        for (corner, (first, second)) in cyclic_pairs(face).enumerate() {
-            edge_faces
-                .entry(edge_key(*first, *second))
-                .or_default()
-                .push((*first, *second, *material));
-            edge_owner
-                .entry(edge_key(*first, *second))
-                .or_insert((face_index, corner));
-        }
-    }
-    if use_even_offset {
-        for (face, _) in &source_polygons {
-            let mut face_normal = DVec3::ZERO;
-            for (first, second) in cyclic_pairs(face) {
-                face_normal += source_points[*first].cross(source_points[*second]);
-            }
-            face_normal = face_normal.normalize_or_zero();
-            for (index, vertex) in face.iter().enumerate() {
-                let current = source_points[*vertex];
-                let previous = source_points[face[(index + face.len() - 1) % face.len()]];
-                let next = source_points[face[(index + 1) % face.len()]];
-                let angle = (previous - current)
-                    .normalize_or_zero()
-                    .dot((next - current).normalize_or_zero())
-                    .clamp(-1.0, 1.0)
-                    .acos()
-                    .max(f64::EPSILON);
-                let alignment = normals[*vertex].dot(face_normal).abs().max(1.0e-6);
-                even_scales[*vertex] += angle / alignment;
-                angle_totals[*vertex] += angle;
-            }
-        }
-    }
-    let even_scale = |index: usize| {
-        if use_even_offset && angle_totals[index] > 0.0 {
-            even_scales[index] / angle_totals[index]
-        } else {
-            1.0
-        }
-    };
-    let original_offset = (offset + 1.0) * 0.5 * thickness;
-    let shell_offset = (offset - 1.0) * 0.5 * thickness;
-    let mut points = Vec::with_capacity(source_points.len() * 2);
-    let mut point_sources: Vec<usize> = (0..source_points.len()).collect();
-    points.extend(
-        source_points
-            .iter()
-            .enumerate()
-            .map(|(index, point)| *point + normals[index] * (original_offset * even_scale(index))),
-    );
-    let rim_only = use_rim && use_rim_only;
-    let mut duplicate_indices = vec![None; source_points.len()];
-    if rim_only {
-        for faces in edge_faces.values().filter(|faces| faces.len() == 1) {
-            let (first, second, _) = faces[0];
-            for vertex in [first, second] {
-                if duplicate_indices[vertex].is_none() {
-                    duplicate_indices[vertex] = Some(points.len());
-                    points.push(
-                        source_points[vertex]
-                            + normals[vertex] * (shell_offset * even_scale(vertex)),
-                    );
-                    point_sources.push(vertex);
-                }
-            }
-        }
-    } else {
-        for (index, point) in source_points.iter().enumerate() {
-            duplicate_indices[index] = Some(source_points.len() + index);
-            points.push(*point + normals[index] * (shell_offset * even_scale(index)));
-            point_sources.push(index);
-        }
-    }
-    if points.iter().any(|point| !point.is_finite()) {
-        return Err(invalid_parameter(
-            modifier,
-            "thickness",
-            "a thickness that produces finite coordinates",
-        ));
-    }
-    let mut output_polygons = Vec::with_capacity(source_polygons.len() * 2 + edge_faces.len());
-    let mut face_sources = Vec::with_capacity(source_polygons.len() * 2 + edge_faces.len());
-    // Input corner each output corner copies, flattened in output order.
-    let mut corner_sources: Vec<Option<usize>> = Vec::new();
-    let mut push_polygon = |loops: Vec<(usize, usize)>, material: u32| {
-        output_polygons.push((loops.iter().map(|&(vertex, _)| vertex).collect(), material));
-        corner_sources.extend(loops.iter().map(|&(_, corner)| Some(corner)));
-    };
-    for (face_index, (face, material)) in source_polygons.iter().enumerate() {
-        let base = corner_base[face_index];
-        let mut outer: Vec<(usize, usize)> = face
-            .iter()
-            .enumerate()
-            .map(|(corner, &vertex)| (vertex, base + corner))
-            .collect();
-        if flip {
-            outer.reverse();
-        }
-        push_polygon(outer, *material);
-        face_sources.push(Some(face_index));
-        if !rim_only {
-            let mut shell: Vec<(usize, usize)> = face
-                .iter()
-                .enumerate()
-                .map(|(corner, &vertex)| {
-                    (duplicate_indices[vertex].unwrap_or(vertex), base + corner)
-                })
-                .collect();
-            // Blender copies the shell with reversed winding; a flipped mesh keeps the input winding.
-            shell.reverse();
-            if flip {
-                shell.reverse();
-            }
-            push_polygon(shell, *material);
-            face_sources.push(Some(face_index));
-        }
-    }
-    if use_rim {
-        for (edge, faces) in edge_faces.iter().filter(|(_, faces)| faces.len() == 1) {
-            let (first, second, material) = faces[0];
-            let (owner, first_corner) = edge_owner[edge];
-            let owner_count = source_polygons[owner].0.len();
-            let first_loop = corner_base[owner] + first_corner;
-            let second_loop = corner_base[owner] + (first_corner + 1) % owner_count;
-            let duplicate_first = duplicate_indices[first].unwrap_or(first);
-            let duplicate_second = duplicate_indices[second].unwrap_or(second);
-            // Blender's rim runs against its owner face along the boundary edge: second, first,
-            // then the shell copies of first and second.
-            let mut rim = vec![
-                (second, second_loop),
-                (first, first_loop),
-                (duplicate_first, first_loop),
-                (duplicate_second, second_loop),
-            ];
-            if flip {
-                rim.reverse();
-            }
-            push_polygon(rim, material);
-            face_sources.push(Some(owner));
-        }
-    }
-    let mut output_loose_edges = Vec::with_capacity(source_loose_edges.len().saturating_mul(2));
-    output_loose_edges.extend(source_loose_edges.iter().copied());
-    if !rim_only {
-        output_loose_edges.extend(source_loose_edges.iter().filter_map(|[first, second]| {
-            Some([duplicate_indices[*first]?, duplicate_indices[*second]?])
-        }));
-    }
-    let origin = Origin::copies(point_sources.into_iter().map(Some), face_sources);
-    let mut result = build_mesh(points, output_polygons, output_loose_edges, &origin, mesh)?;
-    clnor::transfer_custom_normals(
-        mesh,
-        &mut result,
-        &corner_sources,
-        NormalCodeOptions::default(),
-    )?;
-    Ok(result)
-}
-
-/// Vertex normals the solidify offset moves along. The default is Blender's `vert_normals_true`:
-/// face normals weighted by the approximate corner angle. With `use_quality_normals` it is Blender's
-/// `mesh_calc_hq_normal`: each edge adds the angle-weighted midpoint of its faces' normals (or its
-/// one face's normal), and a zero sum falls back to the default.
-fn vertex_normals(points: &[DVec3], polygons: &[Polygon], quality: bool) -> Vec<DVec3> {
+/// Blender's `vert_normals_true`: face normals weighted by the corner angle.
+fn vertex_normals(points: &[DVec3], polygons: &[Polygon]) -> Vec<DVec3> {
     let face_normals: Vec<DVec3> = polygons
         .iter()
         .map(|(face, _)| {
@@ -3792,51 +3657,10 @@ fn vertex_normals(points: &[DVec3], polygons: &[Polygon], quality: bool) -> Vec<
             angle_normals[vertex] += *normal * safe_acos_approx(previous.dot(next));
         }
     }
-    let angle_normals: Vec<DVec3> = angle_normals
+    angle_normals
         .into_iter()
         .map(DVec3::normalize_or_zero)
-        .collect();
-    if !quality {
-        return angle_normals;
-    }
-    let mut faces_by_edge: BTreeMap<(usize, usize), Vec<usize>> = BTreeMap::new();
-    for (index, (face, _)) in polygons.iter().enumerate() {
-        for (first, second) in cyclic_pairs(face) {
-            faces_by_edge
-                .entry(edge_key(*first, *second))
-                .or_default()
-                .push(index);
-        }
-    }
-    let mut sums = vec![DVec3::ZERO; points.len()];
-    for (&(first, second), faces) in &faces_by_edge {
-        let edge_normal = match *faces.as_slice() {
-            [one] => face_normals[one],
-            [one, other] => angle_weighted_midpoint(face_normals[one], face_normals[other]),
-            _ => continue,
-        };
-        sums[first] += edge_normal;
-        sums[second] += edge_normal;
-    }
-    sums.into_iter()
-        .zip(angle_normals)
-        .map(|(sum, fallback)| {
-            let normal = sum.normalize_or_zero();
-            if normal == DVec3::ZERO {
-                fallback
-            } else {
-                normal
-            }
-        })
         .collect()
-}
-
-/// Blender's `mid_v3_v3v3_angle_weighted`: the midpoint direction of two unit normals, scaled by
-/// `4 / pi` times the arc of their angle.
-fn angle_weighted_midpoint(first: DVec3, second: DVec3) -> DVec3 {
-    let sum = first + second;
-    let length = sum.length();
-    sum.normalize_or_zero() * (4.0 / std::f64::consts::PI * (length / 2.0).min(1.0).acos())
 }
 
 /// The values of the element attribute `name` in storage order. A native point or edge attribute is read
@@ -5178,6 +5002,7 @@ fn decimate_compact(
     origin: Origin,
     source: &Mesh,
     keep_vertices: &[bool],
+    edge_order: &[[usize; 2]],
 ) -> Result<Mesh> {
     // Blender's BMesh keeps the live vertices no face or edge uses; `keep_vertices` marks them.
     let mut used: Vec<bool> = (0..points.len())
@@ -5211,12 +5036,54 @@ fn decimate_compact(
         *first = remap[*first];
         *second = remap[*second];
     }
+    let compact_order: Vec<[usize; 2]> = edge_order
+        .iter()
+        .map(|&[first, second]| [remap[first], remap[second]])
+        .collect();
     let origin = Origin {
         vertices: compact_origin,
         faces: origin.faces,
         corners: origin.corners,
     };
-    build_mesh(compact_points, polygons, loose, &origin, source)
+    // The edges take Blender's pool order before the provenance remap writes the edge-indexed data.
+    let mut result = build_topology(compact_points, polygons, loose)?;
+    order_edges(&mut result, &compact_order)?;
+    remap_attributes_with_basis(source, &mut result, &origin, &[], None)?;
+    validated(&result)?;
+    Ok(result)
+}
+
+/// Puts `mesh`'s edges in `pool_order`, the live edges as vertex-index pairs in Blender's edge pool
+/// order. Every mesh edge must appear once in `pool_order`, else the rebuilt mesh does not describe
+/// the decimated topology and the call fails.
+fn order_edges(mesh: &mut Mesh, pool_order: &[[usize; 2]]) -> Result<()> {
+    let (rebuilt, pool) = (mesh.edges.len(), pool_order.len());
+    let mismatch = move || {
+        PotError::new(
+            ErrorCode::InternalError,
+            format!(
+                "decimate edge order does not match the rebuilt mesh (rebuilt {rebuilt} edges, pool {pool} edges)"
+            ),
+        )
+    };
+    if rebuilt != pool {
+        return Err(mismatch());
+    }
+    let index_of = id_indices(mesh);
+    let rank: HashMap<(usize, usize), usize> = pool_order
+        .iter()
+        .enumerate()
+        .map(|(rank, &[first, second])| (edge_key(first, second), rank))
+        .collect();
+    let mut ranked = Vec::with_capacity(mesh.edges.len());
+    for edge in mesh.edges.drain(..) {
+        let [first, second] = edge.vertices.map(|id| index_of[&id]);
+        let position = *rank.get(&edge_key(first, second)).ok_or_else(mismatch)?;
+        ranked.push((position, edge));
+    }
+    ranked.sort_by_key(|&(position, _)| position);
+    mesh.edges = ranked.into_iter().map(|(_, edge)| edge).collect();
+    Ok(())
 }
 
 fn weld(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
@@ -5398,7 +5265,7 @@ fn displace(mesh: &Mesh, modifier: &Modifier, owner_world_matrix: DMat4) -> Resu
     let points = positions(mesh);
     // Blender's NORMAL direction is `mesh->vert_normals_true()` (MOD_displace.cc, NOR case): the
     // angle-weighted unit face normals of `normals_calc_verts` (mesh_normals.cc L194-224).
-    let normals = vertex_normals(&points, &polygons(mesh)?, false);
+    let normals = vertex_normals(&points, &polygons(mesh)?);
     let delta = ((1.0 - mid_level) * strength).clamp(-10_000.0, 10_000.0);
     let mut result = mesh.clone();
     for (index, vertex) in result.vertices.iter_mut().enumerate() {

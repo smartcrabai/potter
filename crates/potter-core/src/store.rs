@@ -129,7 +129,7 @@ impl Project {
     /// digest and compatibility hash are returned only for schema version 1.
     fn read_snapshot(path: &Path) -> Result<SnapshotRead> {
         let bytes = fs::read(path.join("scene.json")).map_err(|error| PotError::io(&error))?;
-        let parsed = crate::model::migrate::parse_scene_with_original_hash(&bytes)?;
+        let parsed = crate::model::migrate::parse_scene_with_original_hash(&bytes, path)?;
         parsed.doc.validate()?;
         let digest = hash::sha256(&bytes);
         let mut warnings = parsed.warnings;
@@ -655,7 +655,7 @@ fn read_history_blob(root: &Path, digest: &str) -> Result<(HistoryRecord, Vec<Va
             "history record does not match its content hash",
         ));
     }
-    let (record, mut warnings) = crate::model::migrate::parse_history_record(&bytes)?;
+    let (record, mut warnings) = crate::model::migrate::parse_history_record(&bytes, root)?;
     tag_originals(
         &mut warnings,
         &content_path("history", "blob.json", digest),

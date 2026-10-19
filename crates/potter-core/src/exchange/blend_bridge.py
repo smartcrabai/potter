@@ -497,6 +497,15 @@ def _id_map(block, property_name):
     return value if isinstance(value, dict) else {}
 
 
+def _image_alpha_mode(image):
+    # Blender's alpha mode under the names the .blend importer reads. CHANNEL_PACKED holds straight colour.
+    if image.alpha_mode == "PREMUL":
+        return "premultiplied"
+    if image.alpha_mode == "NONE":
+        return "none"
+    return "straight"
+
+
 def images_dump():
     result = []
     for image in bpy.data.images:
@@ -517,6 +526,7 @@ def images_dump():
         result.append({"name": image.name_full, "potter_id": image.get("potter.id"),
                        "library": library_reference(image), "filepath": filepath,
                        "source": image.source, "colorspace": colorspace,
+                       "alpha_mode": _image_alpha_mode(image),
                        "potter_image": image_model})
     return result
 
@@ -1270,15 +1280,25 @@ MESH_RESTORE_SKIP = frozenset((
 ))
 
 
+def _quaternion_to_native(value):
+    """Blender stores a quaternion as w, x, y, z; Potter's native quaternion values are x, y, z, w (spec)."""
+    w, x, y, z = (float(component) for component in value)
+    return [x, y, z, w]
+
+
+def _quaternion_from_native(value):
+    x, y, z, w = (float(component) for component in value)
+    return (w, x, y, z)
+
+
 def _attribute_item_value(item, data_type):
     if data_type in MESH_COLOR_TYPES:
         return plain(item.color)
+    if data_type == "QUATERNION":
+        return _quaternion_to_native(item.value)
     if hasattr(item, "vector"):
         return plain(item.vector)
     value = item.value
-    if data_type == "QUATERNION":
-        # Blender stores (w, x, y, z); the core reads and defaults quaternions as (x, y, z, w).
-        return [float(value[1]), float(value[2]), float(value[3]), float(value[0])]
     if isinstance(value, bytes):
         return value.decode("utf-8")
     return plain(value)
@@ -1287,10 +1307,10 @@ def _attribute_item_value(item, data_type):
 def _set_attribute_item(item, data_type, value):
     if data_type in MESH_COLOR_TYPES:
         item.color = value
+    elif data_type == "QUATERNION":
+        item.value = _quaternion_from_native(value)
     elif hasattr(item, "vector"):
         item.vector = value
-    elif data_type == "QUATERNION":
-        item.value = (value[3], value[0], value[1], value[2])
     else:
         item.value = value
 
@@ -3082,11 +3102,12 @@ def _custom_normal_pair(entry):
 
 
 def _attribute_default(data_type):
-    """Blender's value for an element Potter stores no entry for: zero, or opaque black for colours."""
+    """Blender's value for an element Potter stores no entry for: zero, opaque black for colours, and the
+    identity quaternion in Potter's x, y, z, w order (the setter converts it to Blender's order)."""
     if data_type in MESH_COLOR_TYPES:
         return (0.0, 0.0, 0.0, 1.0)
     return {"BOOLEAN": False, "INT": 0, "FLOAT": 0.0, "FLOAT2": (0.0, 0.0),
-            "FLOAT_VECTOR": (0.0, 0.0, 0.0), "QUATERNION": (0.0, 0.0, 0.0, 0.0)}[data_type]
+            "FLOAT_VECTOR": (0.0, 0.0, 0.0), "QUATERNION": (0.0, 0.0, 0.0, 1.0)}[data_type]
 
 
 def _flatten_face_rows(rows, face_items, owner, default):
@@ -6029,6 +6050,9 @@ def export_doc(doc, target, pack, scene_hash, context):
             image.colorspace_settings.name = colorspace
         pixels = item.get("pixels")
         if sidecar is None and png_bytes is None and pixels is not None:
+            image.alpha_mode = {"straight": "STRAIGHT", "premultiplied": "PREMUL", "none": "NONE"}[
+                item.get("alpha_mode", "straight")
+            ]
             _pack_image(image, [channel for pixel in pixels for channel in pixel])
         if item.get("source") == "packed" and image.packed_file is None:
             image.pack()

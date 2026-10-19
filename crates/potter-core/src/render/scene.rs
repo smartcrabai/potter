@@ -18,9 +18,9 @@ use crate::{
     image::ImageData,
     model::{Id, Material, SceneDoc},
     shader::{
-        BsdfParams, DEFAULT_SPECULAR_IOR_LEVEL, EvaluatorWorkspace, HitContext, HitUvLayers,
-        dielectric_f0, evaluate_displacement_with_workspace, evaluate_surface_with_workspace,
-        fill_color_layers,
+        BsdfParams, EvaluatorWorkspace, HitContext, HitUvLayers, PreparedMaterial, dielectric_f0,
+        evaluate_displacement_with_workspace, evaluate_surface_with_workspace, fill_color_layers,
+        record_unevaluated_inputs,
     },
 };
 
@@ -31,6 +31,7 @@ use super::{
         point_intensity, spot_attenuation,
     },
     path::object_for_index,
+    principled_bsdf::{diffuse_coefficient, specular_coefficient},
     raster::{
         AlphaMode, Line, Mode, SurfaceHit, SurfaceShader, Triangle, blend_color,
         blend_corner_normals, blend_uv,
@@ -84,6 +85,7 @@ pub(super) struct Geometry {
     pub triangles: Vec<Triangle>,
     pub lines: Vec<Line>,
     pub materials: Vec<Material>,
+    pub prepared: Vec<PreparedMaterial>,
     pub objects: Vec<ObjectRecord>,
     pub elements: Vec<ElementRecord>,
     pub bounds: Option<(DVec3, DVec3)>,
@@ -158,6 +160,7 @@ pub(super) fn extract_geometry(
     );
 
     let mut materials = vec![Material::default()];
+    let mut prepared = vec![PreparedMaterial::default()];
     let mut material_indices =
         std::collections::BTreeMap::<(Id, Option<usize>, Option<Arc<[u64]>>), usize>::new();
     let mut triangles = Vec::new();
@@ -437,6 +440,7 @@ pub(super) fn extract_geometry(
                     } else if let Some(material) = doc.materials.get(id) {
                         let index = materials.len();
                         materials.push(material.clone());
+                        prepared.push(PreparedMaterial::new(material, &doc.node_groups));
                         material_indices.insert(key, index);
                         index
                     } else {
@@ -457,6 +461,7 @@ pub(super) fn extract_geometry(
                         .insert(material_index, slot_color_mask);
                 }
                 let material = materials.get(material_index);
+                let prepared_material = prepared.get(material_index);
                 let base_color = material.map_or([0.6, 0.6, 0.6, 1.0], |value| value.base_color);
                 let face_triangle_count = face.vertices.len().checked_sub(2).ok_or_else(|| {
                     PotError::new(
@@ -522,20 +527,9 @@ pub(super) fn extract_geometry(
                     {
                         base_color
                     } else {
+                        let params = shading_params(material, base_color, normal, &shader_warnings);
                         shade(
-                            doc,
-                            snapshot,
-                            center,
-                            center,
-                            normal,
-                            normal,
-                            base_color,
-                            material.map_or(0.0, |value| value.metallic),
-                            material.map_or(0.8, |value| value.roughness),
-                            1.0,
-                            dielectric_f0(material_ior(material), DEFAULT_SPECULAR_IOR_LEVEL),
-                            mode,
-                            None,
+                            doc, snapshot, center, center, normal, normal, &params, mode, None,
                             images,
                         )?
                     };
@@ -560,10 +554,13 @@ pub(super) fn extract_geometry(
                         layer_colors,
                         lit_per_pixel,
                     };
-                    if let Some(material) = material.filter(|material| {
-                        material.displacement_method == "displacement"
-                            && material.node_tree.is_some()
-                    }) {
+                    if let (Some(material), Some(prepared_material)) = (
+                        material.filter(|material| {
+                            material.displacement_method == "displacement"
+                                && material.node_tree.is_some()
+                        }),
+                        prepared_material,
+                    ) {
                         let layers = HitUvLayers {
                             names: &uv_names,
                             corners: &triangle.layer_uvs,
@@ -578,6 +575,7 @@ pub(super) fn extract_geometry(
                         triangles.extend(subdivide_displaced_triangle(
                             doc,
                             material,
+                            prepared_material,
                             matrix,
                             &triangle,
                             images,
@@ -851,6 +849,7 @@ pub(super) fn extract_geometry(
         triangles,
         lines,
         materials,
+        prepared,
         objects,
         elements,
         bounds,
@@ -877,6 +876,12 @@ pub(super) fn extract_geometry(
                 .normalize_or_zero();
             let center =
                 (triangle.positions[0] + triangle.positions[1] + triangle.positions[2]) / 3.0;
+            let params = shading_params(
+                Some(material),
+                material.base_color,
+                normal,
+                &geometry.shader_warnings,
+            );
             let color = shade(
                 doc,
                 snapshot,
@@ -884,11 +889,7 @@ pub(super) fn extract_geometry(
                 center,
                 normal,
                 normal,
-                material.base_color,
-                material.metallic,
-                material.roughness,
-                1.0,
-                dielectric_f0(material.ior, DEFAULT_SPECULAR_IOR_LEVEL),
+                &params,
                 mode,
                 Some((&bvh, &geometry.triangles, &shadow_maps)),
                 images,
@@ -1207,6 +1208,7 @@ fn corner_midpoints<const N: usize>(corners: [[f64; N]; 3]) -> [[f64; N]; 6] {
 fn subdivide_displaced_triangle(
     doc: &SceneDoc,
     material: &Material,
+    prepared: &PreparedMaterial,
     object_to_world: DMat4,
     triangle: &Triangle,
     images: &BTreeMap<String, ImageData>,
@@ -1237,7 +1239,7 @@ fn subdivide_displaced_triangle(
             },
             &mut tables,
         )?;
-        evaluate_displacement_with_workspace(material, &context, evaluator_workspace)
+        evaluate_displacement_with_workspace(material, prepared, &context, evaluator_workspace)
     })
 }
 
@@ -1415,9 +1417,28 @@ fn world_face_normals(
     faces
 }
 
-/// The material's index of refraction. An unmapped slot takes the default material's.
-fn material_ior(material: Option<&Material>) -> f64 {
-    material.map_or_else(|| Material::default().ior, |material| material.ior)
+/// Principled inputs of a surface shaded with `material`: the path tracer's own construction
+/// (`BsdfParams::from_material`), with the surface colour `base` in place of the material's. An
+/// unmapped slot takes the default material's.
+fn shading_params(
+    material: Option<&Material>,
+    base: [f64; 4],
+    normal: DVec3,
+    warnings: &RefCell<Vec<serde_json::Value>>,
+) -> BsdfParams {
+    let mut params = material.map_or_else(
+        || BsdfParams::from_material(&Material::default(), normal),
+        |material| BsdfParams::from_material(material, normal),
+    );
+    params.base_color = base;
+    params.alpha = base[3];
+    record_unevaluated_inputs(
+        Some(warnings),
+        material.map_or("", |material| material.name.as_str()),
+        None,
+        &params,
+    );
+    params
 }
 
 /// Per-pixel lighting for smooth triangles in raster Solid and realtime Beauty output. Flat
@@ -1458,35 +1479,25 @@ pub(super) fn surface_shader<'a>(
 impl SurfaceShader for SceneShader<'_> {
     fn shade(&self, triangle: &Triangle, hit: &SurfaceHit) -> Result<[f64; 4]> {
         let material = self.geometry.materials.get(triangle.material_index);
-        let params = if triangle.lit_per_pixel {
+        let prepared = self.geometry.prepared.get(triangle.material_index);
+        let graph_params = if triangle.lit_per_pixel {
             material
-                .map(|material| self.graph_params(triangle, material, hit))
+                .zip(prepared)
+                .map(|(material, prepared)| self.graph_params(triangle, material, prepared, hit))
                 .transpose()?
         } else {
             None
         };
-        let (base_color, metallic, roughness) = match (triangle.lit_per_pixel, params) {
-            (true, Some(params)) => (
-                [
-                    params.base_color[0],
-                    params.base_color[1],
-                    params.base_color[2],
-                ],
-                params.metallic,
-                params.roughness,
-            ),
-            _ => (
-                [triangle.color[0], triangle.color[1], triangle.color[2]],
-                material.map_or(0.0, |value| value.metallic),
-                material.map_or(0.8, |value| value.roughness),
-            ),
-        };
-        let alpha = params.map_or_else(
-            || material.map_or(1.0, |material| material.base_color[3]),
-            |params| params.alpha,
-        );
-        let reflectance = params.map_or(1.0, |params| params.reflectance);
-        let base = [base_color[0], base_color[1], base_color[2], alpha];
+        let params = graph_params.unwrap_or_else(|| {
+            let alpha = material.map_or(1.0, |material| material.base_color[3]);
+            let base = [
+                triangle.color[0],
+                triangle.color[1],
+                triangle.color[2],
+                alpha,
+            ];
+            shading_params(material, base, hit.normal, &self.geometry.shader_warnings)
+        });
         let shadow = self.geometry.shadows.as_ref().map(|shadows| {
             (
                 &shadows.bvh,
@@ -1494,10 +1505,6 @@ impl SurfaceShader for SceneShader<'_> {
                 &shadows.point_maps,
             )
         });
-        let (ior, specular_ior_level) = params.map_or_else(
-            || (material_ior(material), DEFAULT_SPECULAR_IOR_LEVEL),
-            |params| (params.ior, params.specular_ior_level),
-        );
         let mut color = shade(
             self.doc,
             self.snapshot,
@@ -1505,17 +1512,13 @@ impl SurfaceShader for SceneShader<'_> {
             hit.shadow_point,
             hit.normal,
             hit.geometric,
-            base,
-            metallic,
-            roughness,
-            reflectance,
-            dielectric_f0(ior, specular_ior_level),
+            &params,
             self.mode,
             shadow,
             self.images,
         )?;
         if matches!(self.mode, Mode::Beauty)
-            && let Some(params) = params
+            && let Some(params) = graph_params
         {
             color[0] += params.emission_color[0] * params.emission_strength;
             color[1] += params.emission_color[1] * params.emission_strength;
@@ -1531,6 +1534,7 @@ impl SceneShader<'_> {
         &self,
         triangle: &Triangle,
         material: &Material,
+        prepared: &PreparedMaterial,
         hit: &SurfaceHit,
     ) -> Result<BsdfParams> {
         let object =
@@ -1572,7 +1576,7 @@ impl SceneShader<'_> {
             &mut tables,
         )?;
         let mut workspace = self.evaluator_workspace.borrow_mut();
-        evaluate_surface_with_workspace(material, &context, &mut workspace)
+        evaluate_surface_with_workspace(material, prepared, &context, &mut workspace)
     }
 }
 /// Face-corner index of each triangle vertex; the UV and shading-normal lookups share it.
@@ -1863,21 +1867,27 @@ fn shade(
     shadow_point: DVec3,
     normal: DVec3,
     geometric: DVec3,
-    base: [f64; 4],
-    metallic: f64,
-    roughness: f64,
-    reflectance: f64,
-    specular_f0: f64,
+    params: &BsdfParams,
     mode: Mode,
     shadow: ShadowContext<'_>,
     images: &BTreeMap<String, ImageData>,
 ) -> Result<[f64; 4]> {
+    let albedo = DVec3::new(
+        params.base_color[0],
+        params.base_color[1],
+        params.base_color[2],
+    );
+    let alpha = params.alpha;
     if !matches!(mode, Mode::Solid | Mode::Beauty) {
-        return Ok(base);
+        return Ok([albedo.x, albedo.y, albedo.z, alpha]);
     }
     let scene = doc.scenes.get(&snapshot.scene_id);
     let mut result = DVec3::ZERO;
-    let albedo = DVec3::new(base[0], base[1], base[2]);
+    // Reflectance weights the whole sum once, below, so the direct lobes take unit reflectance.
+    let lobe = BsdfParams {
+        reflectance: 1.0,
+        ..*params
+    };
     if matches!(mode, Mode::Solid) {
         result += albedo * 0.30;
         for (direction, intensity, color) in [
@@ -1892,54 +1902,34 @@ fn shade(
                 DVec3::new(0.72, 0.82, 1.0),
             ),
         ] {
-            result += direct_brdf(
-                albedo,
-                metallic,
-                roughness,
-                specular_f0,
-                normal,
-                -direction,
-                normal,
-                color,
-                intensity,
-            );
+            result += punctual_radiance(&lobe, normal, normal, -direction, color, intensity);
         }
     } else {
-        let has_lights = doc.nodes.iter().any(|(id, light_node)| {
-            light_node
-                .data
-                .as_ref()
-                .and_then(|data_id| doc.data_blocks.get(data_id))
-                .is_some_and(|block| block.light.is_some())
-                && snapshot.nodes.contains_key(id)
-        });
+        // The camera is the view for the lobes and the environment; without one, the normal.
+        let view = scene
+            .and_then(|scene| scene.camera.as_ref())
+            .and_then(|camera_id| snapshot.nodes.get(camera_id))
+            .map(|camera| {
+                (DMat4::from_cols_array(&camera.world_matrix).transform_point3(DVec3::ZERO) - point)
+                    .normalize_or_zero()
+            })
+            .filter(|direction| direction.length_squared() > f64::EPSILON)
+            .unwrap_or(normal);
         if let Some(world) = scene
             .and_then(|value| value.world.as_ref())
             .and_then(|id| doc.worlds.get(id))
         {
             let diffuse_environment =
                 prefiltered_world(world, &doc.node_groups, images, normal, 1.0)?;
-            let metallic = metallic.clamp(0.0, 1.0);
-            let roughness = roughness.clamp(0.0, 1.0);
+            let metallic = params.metallic.clamp(0.0, 1.0);
+            let roughness = params.roughness.clamp(0.0, 1.0);
             result += albedo * diffuse_environment * (1.0 - metallic);
-            let view_direction = scene
-                .and_then(|scene| scene.camera.as_ref())
-                .and_then(|camera_id| snapshot.nodes.get(camera_id))
-                .map(|camera| {
-                    (DMat4::from_cols_array(&camera.world_matrix).transform_point3(DVec3::ZERO)
-                        - point)
-                        .normalize_or_zero()
-                })
-                .filter(|direction| direction.length_squared() > f64::EPSILON)
-                .unwrap_or(normal);
-            let reflection =
-                (-view_direction + normal * (2.0 * normal.dot(view_direction))).normalize_or_zero();
+            let reflection = (-view + normal * (2.0 * normal.dot(view))).normalize_or_zero();
             let specular_environment =
                 prefiltered_world(world, &doc.node_groups, images, reflection, roughness)?;
+            let specular_f0 = dielectric_f0(params.ior, params.specular_ior_level);
             let f0 = albedo * metallic + DVec3::splat(specular_f0 * (1.0 - metallic));
             result += specular_environment * f0 * (1.0 - roughness).powi(2);
-        } else if !has_lights {
-            result += albedo * 0.08;
         }
         for (id, light_node) in &doc.nodes {
             let Some(light) = light_node
@@ -1962,10 +1952,8 @@ fn shade(
                 shadow_point,
                 normal,
                 geometric,
-                albedo,
-                metallic,
-                roughness,
-                specular_f0,
+                view,
+                &lobe,
                 shadow,
                 point_shadow,
             );
@@ -1976,13 +1964,13 @@ fn shade(
     // environment); emission is added unscaled by the caller, as Cycles' `EmissionNode::compile`
     // (intern/cycles/scene/shader_nodes.cpp:3071-3098) emits only NODE_CLOSURE_EMISSION.
     let reflectance = if matches!(mode, Mode::Beauty) {
-        reflectance.clamp(0.0, 1.0)
+        params.reflectance.clamp(0.0, 1.0)
     } else {
         1.0
     };
     let result = result * reflectance;
     let result = result.max(DVec3::ZERO).min(DVec3::splat(1.0));
-    Ok([result.x, result.y, result.z, base[3]])
+    Ok([result.x, result.y, result.z, alpha])
 }
 
 fn prefiltered_world(
@@ -2025,10 +2013,8 @@ fn light_contribution(
     shadow_point: DVec3,
     normal: DVec3,
     geometric: DVec3,
-    albedo: DVec3,
-    metallic: f64,
-    roughness: f64,
-    specular_f0: f64,
+    view: DVec3,
+    params: &BsdfParams,
     shadow: ShadowContext<'_>,
     point_shadow: Option<&PointShadowMap>,
 ) -> DVec3 {
@@ -2038,37 +2024,25 @@ fn light_contribution(
     match light.light_type {
         crate::model::LightType::Sun => {
             let toward_light = matrix.transform_vector3(DVec3::Z).normalize_or_zero();
-            direct_brdf(
-                albedo,
-                metallic,
-                roughness,
-                specular_f0,
-                normal,
-                toward_light,
-                normal,
-                color,
-                energy,
-            ) * visibility_for_light(
-                shadow,
-                point_shadow,
-                shadow_point,
-                geometric,
-                toward_light,
-                f64::INFINITY,
-            )
+            punctual_radiance(params, normal, view, toward_light, color, energy)
+                * visibility_for_light(
+                    shadow,
+                    point_shadow,
+                    shadow_point,
+                    geometric,
+                    toward_light,
+                    f64::INFINITY,
+                )
         }
         crate::model::LightType::Point => {
             let delta = position - point;
             let distance_squared = delta.length_squared().max(1.0e-6);
             let toward_light = delta.normalize_or_zero();
-            direct_brdf(
-                albedo,
-                metallic,
-                roughness,
-                specular_f0,
+            punctual_radiance(
+                params,
                 normal,
+                view,
                 toward_light,
-                normal,
                 color,
                 point_intensity(energy) / distance_squared,
             ) * visibility_for_light(
@@ -2090,14 +2064,11 @@ fn light_contribution(
             if falloff <= 0.0 {
                 return DVec3::ZERO;
             }
-            direct_brdf(
-                albedo,
-                metallic,
-                roughness,
-                specular_f0,
+            punctual_radiance(
+                params,
                 normal,
+                view,
                 toward_light,
-                normal,
                 color,
                 (point_intensity(energy) / distance_squared) * falloff,
             ) * visibility_for_light(
@@ -2125,7 +2096,6 @@ fn light_contribution(
                 area_visibility_samples(&shape, position, light_direction, point, normal);
             let mut total_weight = 0.0;
             let mut visible_weight = 0.0;
-            let mut visible_fresnel = DVec3::ZERO;
             for sample in &samples[..count] {
                 total_weight += sample.weight;
                 let visibility = visibility_for_light(
@@ -2136,30 +2106,18 @@ fn light_contribution(
                     sample.direction,
                     sample.distance,
                 );
-                let weight = sample.weight * visibility;
-                visible_weight += weight;
-                visible_fresnel +=
-                    fresnel_at_direction(albedo, metallic, specular_f0, normal, sample.direction)
-                        * weight;
+                visible_weight += sample.weight * visibility;
             }
             if total_weight <= 0.0 || visible_weight <= 0.0 {
                 return DVec3::ZERO;
             }
-            // Integrated Lambert irradiance is exact for rectangles. The diffuse Fresnel and
-            // visibility use only contributing directions; the specular lobe uses the centre.
+            // Integrated Lambert irradiance is exact for rectangles and the visibility weight
+            // scales it. The specular lobe is evaluated towards the emitter centre.
             let toward_centre = (position - point).normalize_or_zero();
-            direct_irradiance(
-                albedo,
-                metallic,
-                roughness,
-                specular_f0,
-                normal,
-                toward_centre,
-                normal,
-                color,
-                irradiance,
-                visible_fresnel / visible_weight,
-            ) * (visible_weight / total_weight)
+            (diffuse_coefficient(params, normal, view)
+                + specular_coefficient(params, normal, view, toward_centre))
+                * color
+                * (irradiance * visible_weight / total_weight)
         }
     }
 }
@@ -2252,99 +2210,23 @@ fn shadow_visibility(
     visible / 9.0
 }
 
-fn fresnel_at_direction(
-    albedo: DVec3,
-    metallic: f64,
-    specular_f0: f64,
-    view_dir: DVec3,
-    light_dir: DVec3,
-) -> DVec3 {
-    let half_vector = (light_dir + view_dir).normalize_or_zero();
-    let view_half_cosine = view_dir.dot(half_vector).max(0.0);
-    let reflectance_at_normal = DVec3::splat(specular_f0) * (1.0 - metallic) + albedo * metallic;
-    reflectance_at_normal + (DVec3::ONE - reflectance_at_normal) * (1.0 - view_half_cosine).powi(5)
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Cook-Torrance evaluation consumes explicit BRDF and light inputs"
-)]
-fn direct_brdf(
-    albedo: DVec3,
-    metallic: f64,
-    roughness: f64,
-    specular_f0: f64,
+/// Radiance a point, spot or sun light reflects toward `view`: the Principled diffuse and specular
+/// lobes along `light`, times the light colour and `intensity` weighted by the receiver cosine.
+fn punctual_radiance(
+    params: &BsdfParams,
     normal: DVec3,
-    light_dir: DVec3,
-    view_dir: DVec3,
-    light_color: DVec3,
+    view: DVec3,
+    light: DVec3,
+    color: DVec3,
     intensity: f64,
 ) -> DVec3 {
-    let normal_light_cosine = normal.dot(light_dir).max(0.0);
+    let normal_light_cosine = normal.dot(light).max(0.0);
     if normal_light_cosine <= 0.0 {
         return DVec3::ZERO;
     }
-    let diffuse_fresnel = fresnel_at_direction(albedo, metallic, specular_f0, view_dir, light_dir);
-    direct_irradiance(
-        albedo,
-        metallic,
-        roughness,
-        specular_f0,
-        normal,
-        light_dir,
-        view_dir,
-        light_color,
-        intensity * normal_light_cosine,
-        diffuse_fresnel,
-    )
-}
-
-/// Reflected radiance for incident `irradiance` (W/m², already weighted by the receiver cosine).
-/// `diffuse_fresnel` is averaged over the contributing directions for an integrated area light;
-/// the specular lobe remains evaluated along `light_dir`.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Cook-Torrance evaluation consumes explicit BRDF and light inputs"
-)]
-fn direct_irradiance(
-    albedo: DVec3,
-    metallic: f64,
-    roughness: f64,
-    specular_f0: f64,
-    normal: DVec3,
-    light_dir: DVec3,
-    view_dir: DVec3,
-    light_color: DVec3,
-    irradiance: f64,
-    diffuse_fresnel: DVec3,
-) -> DVec3 {
-    let normal_light_cosine = normal.dot(light_dir).max(0.0);
-    let normal_view_cosine = normal.dot(view_dir).max(0.0);
-    if normal_view_cosine <= 0.0 {
-        return DVec3::ZERO;
-    }
-    let half_vector = (light_dir + view_dir).normalize_or_zero();
-    let specular_fresnel = fresnel_at_direction(albedo, metallic, specular_f0, view_dir, light_dir);
-    let diffuse =
-        (DVec3::ONE - diffuse_fresnel) * albedo * ((1.0 - metallic) / std::f64::consts::PI);
-    let specular = if normal_light_cosine > 0.0 {
-        let normal_half_cosine = normal.dot(half_vector).max(0.0);
-        let alpha = roughness.max(0.04).powi(2);
-        let alpha_squared = alpha * alpha;
-        let distribution_denominator =
-            (normal_half_cosine * normal_half_cosine * (alpha_squared - 1.0) + 1.0).powi(2)
-                * std::f64::consts::PI;
-        let distribution = alpha_squared / distribution_denominator.max(1.0e-9);
-        let smith_k = (roughness + 1.0).powi(2) / 8.0;
-        let geometry = |cosine: f64| cosine / (cosine * (1.0 - smith_k) + smith_k).max(1.0e-9);
-        let geometry_term = geometry(normal_light_cosine) * geometry(normal_view_cosine);
-        specular_fresnel
-            * (distribution * geometry_term
-                / (4.0 * normal_view_cosine * normal_light_cosine).max(1.0e-9))
-    } else {
-        DVec3::ZERO
-    };
-    (diffuse + specular) * light_color * irradiance
+    (diffuse_coefficient(params, normal, view) + specular_coefficient(params, normal, view, light))
+        * color
+        * (intensity * normal_light_cosine)
 }
 
 #[cfg(test)]
@@ -2360,10 +2242,11 @@ mod shading_normal_tests {
 
     use super::{
         ColorSlotReferences, carried_color_layers, color_layer_references, corner_values,
-        direct_irradiance, extract_geometry, fresnel_at_direction, source_has_color_layer,
-        subdivide_displaced, surface_shader, triangle_corners, triangle_layer_colors,
-        triangle_layer_uvs, world_face_normals,
+        extract_geometry, source_has_color_layer, subdivide_displaced, surface_shader,
+        triangle_corners, triangle_layer_colors, triangle_layer_uvs, world_face_normals,
     };
+    use crate::render::principled_bsdf::{diffuse_coefficient, specular_coefficient};
+    use crate::shader::BsdfParams;
     use crate::{
         eval::{EvaluationContext, Snapshot},
         geom::{
@@ -2675,11 +2558,14 @@ mod shading_normal_tests {
         let images = BTreeMap::from([(
             "asym".to_owned(),
             ImageData {
+                colour: crate::image::ColourCache::default(),
+                storage: crate::image::ImageStorage::default(),
                 width: 2,
                 height: 2,
                 pixels: pixel.to_vec(),
                 tiles: BTreeMap::new(),
                 interpolation: ImageInterpolation::Closest,
+                srgb: false,
             },
         )]);
         let geometry = extract_geometry(&doc, &snapshot, Mode::Beauty, false, &images)?;
@@ -2708,7 +2594,9 @@ mod shading_normal_tests {
                 view: DVec3::Z,
             },
         )?;
-        let expected_rgb = [0.756, 0.108, 0.216];
+        // No lights and no world: the hit returns its emission alone, as Cycles does. The old
+        // Potter-only `albedo * 0.08` ambient fallback is gone.
+        let expected_rgb = [0.7, 0.1, 0.2];
         for (actual, expected) in color[..3].iter().zip(expected_rgb) {
             assert!(
                 (actual - expected).abs() < 1.0e-6,
@@ -2918,7 +2806,7 @@ mod shading_normal_tests {
     }
 
     #[test]
-    fn horizon_crossing_area_uses_contributing_directions_for_diffuse_fresnel() {
+    fn horizon_crossing_area_keeps_the_visible_diffuse_lobe() {
         let axis_v = DVec3::new(
             0.0,
             std::f64::consts::FRAC_1_SQRT_2,
@@ -2952,41 +2840,26 @@ mod shading_normal_tests {
                 .all(|sample| sample.weight > 0.0 && sample.direction.z > 0.0)
         );
 
-        let albedo = DVec3::splat(0.8);
-        let sample = samples[0];
-        let diffuse_fresnel = fresnel_at_direction(albedo, 0.0, 0.04, normal, sample.direction);
+        let params = BsdfParams::from_material(
+            &Material {
+                base_color: [0.8, 0.8, 0.8, 1.0],
+                metallic: 0.0,
+                roughness: 0.5,
+                ..Material::default()
+            },
+            normal,
+        );
         let centre_direction = (centre - point).normalize_or_zero();
         assert!(centre_direction.dot(normal) < 0.0);
-        let centre_fresnel = fresnel_at_direction(albedo, 0.0, 0.04, normal, centre_direction);
-        assert!((centre_fresnel - DVec3::ONE).length() < 1.0e-12);
-        let output = direct_irradiance(
-            albedo,
-            0.0,
-            0.5,
-            0.04,
-            normal,
-            centre_direction,
-            normal,
-            DVec3::ONE,
-            irradiance,
-            diffuse_fresnel,
+        assert_eq!(
+            specular_coefficient(&params, normal, normal, centre_direction),
+            DVec3::ZERO,
+            "the specular lobe towards a below-horizon centre is zero"
         );
+        let output = diffuse_coefficient(&params, normal, normal) * irradiance;
         assert!(
             output.x > 0.0,
             "visible upper strip must retain diffuse light: {output:?}"
         );
-        let old_centre_fresnel_output = direct_irradiance(
-            albedo,
-            0.0,
-            0.5,
-            0.04,
-            normal,
-            centre_direction,
-            normal,
-            DVec3::ONE,
-            irradiance,
-            centre_fresnel,
-        );
-        assert_eq!(old_centre_fresnel_output, DVec3::ZERO);
     }
 }

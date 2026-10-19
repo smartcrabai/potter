@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use glam::DVec3;
 
+use super::subdivision_order::edge_vertex;
 use crate::geom::edge_key;
 
 /// A subdivided loose vertex: its base edge (an index into `LooseEdges::edges`) and `u` along it.
@@ -125,6 +126,31 @@ impl LooseEdges {
         self.current = next;
     }
 
+    /// The Blender output vertex index of each current loose-only vertex. Coarse endpoints retain
+    /// their input indices; interior edge samples occupy their coarse-edge block.
+    pub(super) fn blender_indices(
+        &self,
+        base_vertex_count: usize,
+        resolution: usize,
+    ) -> Vec<Option<usize>> {
+        self.placements
+            .iter()
+            .map(|placement| {
+                let placement = (*placement)?;
+                let [first, second] = self.edges[placement.edge];
+                let segment = (placement.u * (resolution - 1) as f64).round() as usize;
+                Some(edge_vertex(
+                    first,
+                    second,
+                    placement.edge,
+                    segment,
+                    resolution,
+                    base_vertex_count,
+                ))
+            })
+            .collect()
+    }
+
     /// The final position of every loose vertex, from the base points. Without `simple` each lies on
     /// the cubic B-spline through its base edge and the neighbouring base edges; with it, on the
     /// straight edge (`mesh_interpolate_position_on_edge`).
@@ -153,6 +179,21 @@ impl LooseEdges {
                 Some((vertex, position))
             })
             .collect()
+    }
+
+    /// The base vertices a loose-only vertex blends, with Blender's weights, or `None` without a
+    /// placement. A loose end point copies its base vertex. An interior point mixes the stored ends of
+    /// its base edge by `(1 - u, u)` (`subdiv_mesh_vert_of_loose_edge_interpolate`, `subdiv_mesh.cc:1434`).
+    pub(super) fn sources(&self, vertex: usize) -> Option<Vec<(usize, f64)>> {
+        let placement = (*self.placements.get(vertex)?)?;
+        let [first, second] = self.edges[placement.edge];
+        Some(if placement.u <= 0.0 {
+            vec![(first, 1.0)]
+        } else if placement.u >= 1.0 {
+            vec![(second, 1.0)]
+        } else {
+            vec![(first, 1.0 - placement.u), (second, placement.u)]
+        })
     }
 
     /// The other end of the base edge that continues `edge` at `vertex`. A vertex with exactly two
