@@ -47,12 +47,12 @@ const PIXEL_TOLERANCE: f64 = 0.01;
 
 /// (name, centre in metres, half width in metres). Each probe shows one flag's effect:
 /// - `floor_lit`: lit floor away from every object and shadow; scales the light.
-/// - `cube_camera`: the HiddenCube footprint. visible_camera=False shows floor here, not the cube.
-/// - `cube_shadow`: the HiddenCube's shadow on the floor. visible_shadow stays on, so it is dark.
-/// - `occluder_top`: the Occluder's top, which the camera sees.
-/// - `occluder_shadow`: where the Occluder's shadow would fall. visible_shadow=False keeps it lit.
-/// - `mirror_glossy`: the Reflector's disc, where it reflects the GlossyOffMirror only while that
-///   mirror is visible_glossy.
+/// - `cube_camera`: the `HiddenCube` footprint. `visible_camera=False` shows floor here, not the cube.
+/// - `cube_shadow`: the `HiddenCube`'s shadow on the floor. `visible_shadow` stays on, so it is dark.
+/// - `occluder_top`: the `Occluder`'s top, which the camera sees.
+/// - `occluder_shadow`: where the `Occluder`'s shadow would fall. `visible_shadow=False` keeps it lit.
+/// - `mirror_glossy`: the `Reflector`'s disc, where it reflects the `GlossyOffMirror` only while that
+///   mirror is `visible_glossy`.
 const PATCHES: [(&str, [f64; 2], f64); 6] = [
     ("floor_lit", [-1.0, 1.0], 0.1),
     ("cube_camera", [-0.5, 0.45], 0.1),

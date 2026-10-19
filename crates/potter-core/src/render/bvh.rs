@@ -104,17 +104,6 @@ impl Bvh {
         })
     }
 
-    pub(crate) fn closest_hit_two_sided(
-        &self,
-        triangles: &[Triangle],
-        origin: DVec3,
-        direction: DVec3,
-        t_min: f64,
-        t_max: f64,
-    ) -> Option<BvhHit> {
-        self.closest_hit_where(triangles, origin, direction, t_min, t_max, &|_| true)
-    }
-
     /// The nearest hit among the triangles `accepts` admits, so a ray passes through the others.
     pub(crate) fn closest_hit_where(
         &self,
@@ -638,7 +627,7 @@ mod tests {
             prop_assert!(expected.is_some(), "constructed ray should hit its target triangle");
             prop_assert_eq!(actual, expected);
             let actual_two_sided =
-                bvh.closest_hit_two_sided(&triangles, origin, ray_direction, t_min, t_max);
+                bvh.closest_hit_where(&triangles, origin, ray_direction, t_min, t_max, &|_| true);
             let expected_two_sided =
                 brute_force_hit(&triangles, origin, ray_direction, t_min, t_max, true);
             prop_assert_eq!(actual_two_sided, expected_two_sided);

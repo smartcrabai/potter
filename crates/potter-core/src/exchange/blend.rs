@@ -4096,7 +4096,7 @@ fn build_imported_graph(
                 .get("hide_viewport")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
-            ray_visibility: imported_ray_visibility(item, &kind),
+            ray_visibility: imported_ray_visibility(item, kind),
             render_visible: !item
                 .get("hide_render")
                 .and_then(Value::as_bool)

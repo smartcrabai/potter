@@ -2475,6 +2475,7 @@ mod tests {
             color: [1.0, 0.0, 0.0, 1.0],
             object_index: 7,
             element_index: 0,
+            ray_mask: crate::model::RayVisibility::default().mask(),
         };
         let output =
             rasterize_with_lines(&[], &[line], &camera, 64, 32, Mode::Id, [0; 4], 1, 0, None)?;
@@ -2500,6 +2501,7 @@ mod tests {
             color: [1.0, 0.0, 0.0, 1.0],
             object_index: 7,
             element_index: 0,
+            ray_mask: crate::model::RayVisibility::default().mask(),
         };
         let output = rasterize_with_lines(
             &[],

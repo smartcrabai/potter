@@ -1778,7 +1778,7 @@ mod tests {
     fn ray_visibility_losses_follow_what_each_format_stores() -> TestResult {
         use crate::{
             eval::{EvaluationContext, Snapshot},
-            model::RayVisibility,
+            model::{Id, RayVisibility},
         };
 
         let mut doc = graph_from_meshes(

@@ -2063,6 +2063,7 @@ enum BsdfSample {
     Continuous {
         direction: DVec3,
         weight: DVec3,
+        pdf: f64,
         ray: RayKind,
     },
     Delta {
