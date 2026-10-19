@@ -2117,11 +2117,13 @@ impl Image {
         self.tiled || !self.tiles.is_empty()
     }
 
-    /// A UDIM image whose base tile (1001) file was missing at import: no blob and no source, with its listed tiles kept.
-    /// Blender keeps such an image and renders the base's lookups as its missing colour, so Potter keeps the record.
+    /// A UDIM file image whose base tile (1001) file was missing at import: no blob and no source, with its listed tiles
+    /// kept. Blender keeps such an image and renders the base's lookups as its missing colour, so Potter keeps the record.
+    /// A packed or generated image with no blob is still invalid.
     #[must_use]
     pub fn base_is_missing(&self) -> bool {
-        self.blob.is_none()
+        self.source == ImageSource::File
+            && self.blob.is_none()
             && self.source_path.is_none()
             && self.source_hash.is_none()
             && self.is_udim()
