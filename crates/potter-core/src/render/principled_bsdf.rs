@@ -372,21 +372,38 @@ mod single_bounce_tests {
     const LIGHT_DISTANCE: f64 = 4.0;
     const RADIUS: f64 = 0.6;
     const POWER: f64 = 1000.0;
-    /// Quadrature resolution over the disk's bounding square. 512 agrees with 1400 to about 1e-4.
-    const GRID: usize = 512;
-    /// Measured offset of this quadrature from Blender on the specular variants (about -0.20%,
-    /// the same for the dielectric and the metal lobe) and on the diffuse variant (+0.01%). It is
-    /// a residual still under investigation, not a tuned constant; it is added to the tolerance
-    /// so the test checks the rest of the lobe at the Blender precision.
-    const MEASURED_SPECULAR_OFFSET: f64 = 0.0025;
+    /// Quadrature resolution over the disk's bounding square. 256 agrees with 512 to about 2e-5 on
+    /// the patch mean.
+    const GRID: usize = 256;
+    /// Orthographic width of the probe camera (Blender's `ortho_scale`) in units.
+    const ORTHO_SCALE: f64 = 0.2;
 
+    /// Mean over the central 8×8 pixel patch of the orthographic probe (16 pixels across 0.2 units,
+    /// so 0.0125 units a pixel). A glossy highlight depends on the receiver position, so the patch
+    /// is averaged, as Blender's pixel is. The probe is symmetric under y -> -y, so rows j and 7-j
+    /// contribute equally and only half the patch is integrated.
     fn probe_pixel(params: &BsdfParams) -> DVec3 {
+        let pixel = ORTHO_SCALE / 16.0;
+        let mut total = DVec3::ZERO;
+        for i in 0..8 {
+            for j in 0..4 {
+                let x = (f64::from(i) - 3.5) * pixel;
+                let y = (f64::from(j) - 3.5) * pixel;
+                total += 2.0 * receiver_integral(params, x, y);
+            }
+        }
+        total / 64.0
+    }
+
+    /// Single-bounce integral at the receiver `(x, y, 0)`.
+    fn receiver_integral(params: &BsdfParams, x: f64, y: f64) -> DVec3 {
         let normal = DVec3::Z;
         let view = DVec3::new(VIEW_THETA.sin(), 0.0, VIEW_THETA.cos());
         let centre = LIGHT_DISTANCE * DVec3::new(-VIEW_THETA.sin(), 0.0, VIEW_THETA.cos());
         let toward_receiver = -centre.normalize();
         let u = toward_receiver.cross(DVec3::Y).normalize();
         let w = toward_receiver.cross(u);
+        let receiver = DVec3::new(x, y, 0.0);
         let radiance = POWER / (std::f64::consts::PI * std::f64::consts::PI * RADIUS * RADIUS);
         let h = 2.0 / GRID as f64;
         let mut total = DVec3::ZERO;
@@ -398,8 +415,9 @@ mod single_bounce_tests {
                     continue;
                 }
                 let point = centre + RADIUS * (a * u + b * w);
-                let distance = point.length();
-                let direction = point / distance;
+                let offset = point - receiver;
+                let distance = offset.length();
+                let direction = offset / distance;
                 let cos_receiver = direction.dot(normal).max(0.0);
                 let cos_emitter = (-direction).dot(toward_receiver).max(0.0);
                 let weight = RADIUS * RADIUS * h * h * cos_emitter / (distance * distance)
@@ -410,6 +428,7 @@ mod single_bounce_tests {
         }
         total
     }
+
 
     fn native(base: [f64; 4], metallic: f64) -> BsdfParams {
         let material = Material {
@@ -424,8 +443,7 @@ mod single_bounce_tests {
     fn assert_matches_oracle(name: &str, params: &BsdfParams, mean: [f64; 3], stderr: [f64; 3]) {
         let potter = probe_pixel(params);
         for channel in 0..3 {
-            let tolerance =
-                4.0 * stderr[channel] + MEASURED_SPECULAR_OFFSET * mean[channel].abs();
+            let tolerance = 4.0 * stderr[channel];
             assert!(
                 (potter[channel] - mean[channel]).abs() <= tolerance,
                 "{name} channel {channel}: Potter {} vs Blender {} (tolerance {tolerance})",
@@ -441,8 +459,8 @@ mod single_bounce_tests {
         assert_matches_oracle(
             "metal_r024",
             &params,
-            [11.147_307_142_615_318, 29.646_610_014_140_606, 47.190_284_565_091_13],
-            [0.002_210_821_576_354_054, 0.005_896_716_017_539_817, 0.009_392_655_487_759_721],
+            [11.148_457_058_705_39, 29.649_656_252_935_53, 47.195_129_439_234_73],
+            [6.812_977_467_911_867e-4, 1.811_415_051_308_997e-3, 2.883_559_318_995_121e-3],
         );
     }
 
@@ -452,8 +470,8 @@ mod single_bounce_tests {
         assert_matches_oracle(
             "metal_r024_white",
             &params,
-            [196.040_982_186_793_6; 3],
-            [0.037_282_498_852_637_55; 3],
+            [196.060_496_509_075_16; 3],
+            [1.169_790_711_305_705_7e-2; 3],
         );
     }
 
@@ -463,8 +481,8 @@ mod single_bounce_tests {
         assert_matches_oracle(
             "spec_only_r024",
             &params,
-            [9.829_847_626_388_073; 3],
-            [0.002_038_357_495_416_9; 3],
+            [9.831_078_226_678_073; 3],
+            [7.116_958_950_052_36e-4; 3],
         );
     }
 
@@ -475,8 +493,8 @@ mod single_bounce_tests {
         assert_matches_oracle(
             "diffuse_white",
             &params,
-            [3.503_724_973_648_786_5; 3],
-            [8.455_005_572_645_985e-5; 3],
+            [3.503_811_418_544_501; 3],
+            [5.646_886_564_656_729e-5; 3],
         );
     }
 }
