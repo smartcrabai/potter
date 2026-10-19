@@ -2594,7 +2594,9 @@ mod shading_normal_tests {
                 view: DVec3::Z,
             },
         )?;
-        let expected_rgb = [0.756, 0.108, 0.216];
+        // No lights and no world: the hit returns its emission alone, as Cycles does. The old
+        // Potter-only `albedo * 0.08` ambient fallback is gone.
+        let expected_rgb = [0.7, 0.1, 0.2];
         for (actual, expected) in color[..3].iter().zip(expected_rgb) {
             assert!(
                 (actual - expected).abs() < 1.0e-6,
