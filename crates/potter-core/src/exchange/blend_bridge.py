@@ -1280,9 +1280,22 @@ MESH_RESTORE_SKIP = frozenset((
 ))
 
 
+def _quaternion_to_native(value):
+    """Blender stores a quaternion as w, x, y, z; Potter's native quaternion values are x, y, z, w (spec)."""
+    w, x, y, z = (float(component) for component in value)
+    return [x, y, z, w]
+
+
+def _quaternion_from_native(value):
+    x, y, z, w = (float(component) for component in value)
+    return (w, x, y, z)
+
+
 def _attribute_item_value(item, data_type):
     if data_type in MESH_COLOR_TYPES:
         return plain(item.color)
+    if data_type == "QUATERNION":
+        return _quaternion_to_native(item.value)
     if hasattr(item, "vector"):
         return plain(item.vector)
     return plain(item.value)
@@ -1291,6 +1304,8 @@ def _attribute_item_value(item, data_type):
 def _set_attribute_item(item, data_type, value):
     if data_type in MESH_COLOR_TYPES:
         item.color = value
+    elif data_type == "QUATERNION":
+        item.value = _quaternion_from_native(value)
     elif hasattr(item, "vector"):
         item.vector = value
     else:
@@ -3196,11 +3211,12 @@ def _custom_normal_pair(entry):
 
 
 def _attribute_default(data_type):
-    """Blender's value for an element Potter stores no entry for: zero, or opaque black for colours."""
+    """Blender's value for an element Potter stores no entry for: zero, opaque black for colours, and the
+    identity quaternion in Potter's x, y, z, w order (the setter converts it to Blender's order)."""
     if data_type in MESH_COLOR_TYPES:
         return (0.0, 0.0, 0.0, 1.0)
     return {"BOOLEAN": False, "INT": 0, "FLOAT": 0.0, "FLOAT2": (0.0, 0.0),
-            "FLOAT_VECTOR": (0.0, 0.0, 0.0), "QUATERNION": (0.0, 0.0, 0.0, 0.0)}[data_type]
+            "FLOAT_VECTOR": (0.0, 0.0, 0.0), "QUATERNION": (0.0, 0.0, 0.0, 1.0)}[data_type]
 
 
 def _flatten_face_rows(rows, face_items, owner, default):
