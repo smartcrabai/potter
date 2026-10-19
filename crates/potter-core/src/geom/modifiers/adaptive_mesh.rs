@@ -142,7 +142,12 @@ pub(super) fn assemble(
                     "adaptive mesh corner count overflows",
                 )
             })?;
-        let corners = origin.corners.as_mut().expect("corner origins are enabled");
+        let corners = origin.corners.as_mut().ok_or_else(|| {
+            PotError::new(
+                ErrorCode::InternalError,
+                "adaptive mesh corner origins are not enabled",
+            )
+        })?;
         corners.reserve(samples.len());
         for &sample in samples {
             validate_sample(base_faces, sample)?;

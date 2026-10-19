@@ -18,7 +18,7 @@
 //! - Layer type: bytes 40..44 contain 19 (`CD_MDISPS`).
 //! - Layer name: bytes 44..108 are empty in Blender's probe file.
 //! - Layer-header padding: bytes 108..112 are zero.
-//! - Layer data: each corner's row-major `[f32; 3]` MDisps vectors are concatenated in corner order.
+//! - Layer data: each corner's row-major `[f32; 3]` `MDisps` vectors are concatenated in corner order.
 //!
 //! Blender 5.2.2 reads every corner of this layer at the modifier's top level
 //! (`multires_ensure_external_read`), so a file holds exactly `grid_vector_count(total_levels)`

@@ -176,7 +176,7 @@ impl CameraDicingFrame {
                         panorama_camera_direction(camera, width * 0.5, height * 0.5 + 1.0),
                     ));
                     frame.panorama_pixel_scale =
-                        0.5 * (right.distance(center) + down.distance(center));
+                        f64::midpoint(right.distance(center), down.distance(center));
                 }
             }
         }
@@ -755,7 +755,6 @@ pub(super) fn dice(
                 surface,
                 patch,
                 request.edge,
-                edge,
                 config,
                 camera_frame.as_ref(),
                 target_size,
@@ -963,8 +962,7 @@ fn validate_camera(camera: &AdaptiveCamera) -> Result<()> {
             }
         }
         // preview.rs:462-465 maps every non-fisheye stored panorama type to equirectangular.
-        CameraProjection::Panorama => {}
-        CameraProjection::Fisheye => {}
+        CameraProjection::Panorama | CameraProjection::Fisheye => {}
     }
     Ok(())
 }
@@ -1052,7 +1050,6 @@ fn append_edge_dicing(
     surface: &LimitSurface,
     patch: &Patch,
     edge_index: usize,
-    edge: PatchEdge,
     config: &AdaptiveDicingConfig,
     camera_frame: Option<&CameraDicingFrame>,
     target_size: f64,
@@ -1064,7 +1061,7 @@ fn append_edge_dicing(
     end: f64,
     output: &mut Vec<f64>,
 ) -> Result<()> {
-    let midpoint = (start + end) * 0.5;
+    let midpoint = f64::midpoint(start, end);
     let samples = [
         sample_on_edge(patch, edge_index, start),
         sample_on_edge(patch, edge_index, midpoint),
@@ -1106,7 +1103,6 @@ fn append_edge_dicing(
             surface,
             patch,
             edge_index,
-            edge,
             config,
             camera_frame,
             target_size,
@@ -1122,7 +1118,6 @@ fn append_edge_dicing(
             surface,
             patch,
             edge_index,
-            edge,
             config,
             camera_frame,
             target_size,
@@ -1176,14 +1171,21 @@ fn edge_measure(
     match config.space {
         AdaptiveSpace::Object => Ok(local_delta.length()),
         AdaptiveSpace::Pixel => {
-            let camera = config
-                .camera
-                .as_ref()
-                .expect("pixel dicing camera validated");
+            let camera = config.camera.as_ref().ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::InternalError,
+                    "pixel dicing camera is missing after validation",
+                )
+            })?;
             let first_world = config.object_to_world.transform_point3(first);
             let second_world = config.object_to_world.transform_point3(second);
             let midpoint = (first_world + second_world) * 0.5;
-            let frame = camera_frame.expect("pixel dicing camera frame validated");
+            let frame = camera_frame.ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::InternalError,
+                    "pixel dicing camera frame is missing after validation",
+                )
+            })?;
             let pixel_width = world_pixel_width(camera, frame, midpoint, config.offscreen_scale)?;
             let length = (second_world - first_world).length() / pixel_width;
             if length.is_finite() {
@@ -1222,7 +1224,7 @@ fn world_pixel_width(
                 point.y.clamp(v1.y.min(v2.y), v1.y.max(v2.y)),
                 point.z.max(0.0),
             );
-            let denominator = (0.5 * (v1.x * v1.x + v1.y * v1.y)).sqrt();
+            let denominator = f64::midpoint(v1.x * v1.x, v1.y * v1.y).sqrt();
             (
                 frame.orthographic_pixel_width,
                 (point - closest).length() / denominator,
@@ -1350,8 +1352,7 @@ fn dice_patch(
     })?;
     builder.check_capacity(boundary_point_count, 0, edge_temp_bytes)?;
     let mut edge_vertices: [Vec<GridVertex>; 4] = std::array::from_fn(|_| Vec::new());
-    for edge_index in 0..4 {
-        let edge = patch.edges[edge_index];
+    for (edge_index, &edge) in patch.edges.iter().enumerate() {
         let points = curve_points.get(&edge.curve).ok_or_else(|| {
             PotError::new(
                 ErrorCode::InternalError,
@@ -1384,7 +1385,12 @@ fn dice_patch(
             let index = builder.vertex(key, sample, surface)?;
             edge_vertices[edge_index].push(GridVertex { index, sample });
         }
-        let last_index = *indices.last().expect("at least two edge samples");
+        let &last_index = indices.last().ok_or_else(|| {
+            PotError::new(
+                ErrorCode::InternalError,
+                "adaptive patch edge has fewer than two stitch points",
+            )
+        })?;
         let parameter = points[last_index];
         let sample = sample_on_edge(patch, edge_index, parameter);
         let key = shared_vertex_key(edge.curve, parameter, last_index, curve_points, base_faces)?;
@@ -1518,8 +1524,8 @@ fn dice_patch(
         },
     };
     let mut grid = vec![vec![placeholder; mu + 1]; mv + 1];
-    for j in 1..mv {
-        for i in 1..mu {
+    for (j, row) in grid.iter_mut().enumerate().take(mv).skip(1) {
+        for (i, cell) in row.iter_mut().enumerate().take(mu).skip(1) {
             let sample = Sample {
                 face: patch.face,
                 ptex: patch.ptex,
@@ -1528,7 +1534,7 @@ fn dice_patch(
             };
             let key = DicedVertexKey::Interior(patch.face, patch.ptex, i, j);
             let index = builder.insert_vertex(key, sample, surface)?;
-            grid[j][i] = GridVertex { index, sample };
+            *cell = GridVertex { index, sample };
         }
     }
     for j in 1..(mv - 1) {
@@ -1542,7 +1548,7 @@ fn dice_patch(
         }
     }
 
-    for edge in 0..4 {
+    for (edge, boundary) in edge_vertices.iter().enumerate() {
         let mut inner = Vec::new();
         match edge {
             0 => inner.extend((1..mu).map(|i| grid[1][i])),
@@ -1550,7 +1556,7 @@ fn dice_patch(
             2 => inner.extend((1..mu).rev().map(|i| grid[mv - 1][i])),
             _ => inner.extend((1..mv).rev().map(|j| grid[j][1])),
         }
-        builder.zip_boundaries(&inner, &edge_vertices[edge])?;
+        builder.zip_boundaries(&inner, boundary)?;
     }
     Ok(())
 }
@@ -1593,7 +1599,6 @@ fn shared_vertex_key(
         CurveKey::BaseEdge(_, b) if parameter >= 1.0 - PARAM_EPSILON => {
             Ok(DicedVertexKey::BaseVertex(b))
         }
-        CurveKey::BaseEdge(_, _) => Ok(DicedVertexKey::Curve(curve, index)),
         CurveKey::NgonSpoke(face, _) if parameter >= 1.0 - PARAM_EPSILON => {
             Ok(DicedVertexKey::NgonCenter(face))
         }
@@ -1624,8 +1629,16 @@ fn shared_vertex_key(
                 })?;
             Ok(DicedVertexKey::Curve(base_curve, midpoint))
         }
-        CurveKey::NgonSpoke(_, _) => Ok(DicedVertexKey::Curve(curve, index)),
+        CurveKey::BaseEdge(_, _) | CurveKey::NgonSpoke(_, _) => {
+            Ok(DicedVertexKey::Curve(curve, index))
+        }
     }
+}
+
+fn edge_end_corner(edge: &[GridVertex]) -> Result<GridVertex> {
+    edge.last()
+        .copied()
+        .ok_or_else(|| PotError::new(ErrorCode::InternalError, "patch edge has no corner"))
 }
 
 fn dice_single_quad(
@@ -1633,9 +1646,9 @@ fn dice_single_quad(
     builder: &mut DicedBuilder,
 ) -> Result<()> {
     let c0 = edge_vertices[0][0];
-    let c1 = *edge_vertices[0].last().expect("patch edge has a corner");
-    let c2 = *edge_vertices[1].last().expect("patch edge has a corner");
-    let c3 = *edge_vertices[2].last().expect("patch edge has a corner");
+    let c1 = edge_end_corner(&edge_vertices[0])?;
+    let c2 = edge_end_corner(&edge_vertices[1])?;
+    let c3 = edge_end_corner(&edge_vertices[2])?;
     let diagonal_02 =
         builder.local_positions[c0.index].distance_squared(builder.local_positions[c2.index]);
     let diagonal_13 =

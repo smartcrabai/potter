@@ -3353,7 +3353,7 @@ fn multires_lattice_index(value: f64, denominator: usize) -> Result<usize> {
         .map_err(|_| PotError::new(ErrorCode::LimitExceeded, "multires lattice index overflows"))
 }
 
-/// Sculpt at the configured CCG level and reshape the top-level MDisps on the old/new surfaces.
+/// Sculpt at the configured CCG level and reshape the top-level `MDisps` on the old/new surfaces.
 pub(crate) fn sculpt_multires(
     source: &Mesh,
     base: &Mesh,
@@ -3934,8 +3934,8 @@ fn multires_sculpt_grid_coordinates(
         })?);
     if !grid_u.is_finite()
         || !grid_v.is_finite()
-        || !(-1.0e-6..=1.000001).contains(&grid_u)
-        || !(-1.0e-6..=1.000001).contains(&grid_v)
+        || !(-1.0e-6..=1.000_001).contains(&grid_u)
+        || !(-1.0e-6..=1.000_001).contains(&grid_v)
     {
         return Err(PotError::new(
             ErrorCode::InternalError,
@@ -3993,13 +3993,17 @@ fn multires_initial_paint_mask_value(
         .ok_or_else(|| PotError::new(ErrorCode::LimitExceeded, "multires mask index overflows"))?;
     Ok(match sample_index {
         0 => average,
-        1 => (mask(vertex) + mask(next)) * 0.5,
-        2 => (mask(vertex) + mask(previous)) * 0.5,
+        1 => f32::midpoint(mask(vertex), mask(next)),
+        2 => f32::midpoint(mask(vertex), mask(previous)),
         3 => mask(vertex),
         _ => 0.0,
     })
 }
 
+#[expect(
+    clippy::float_cmp,
+    reason = "exact `==` decides whether a sample changed; `to_bits` would change ±0.0 and NaN handling and therefore the returned `changed` flag"
+)]
 fn apply_multires_sculpt_rebase(
     source: &Mesh,
     displacement: &mut multires::DisplacementData,
@@ -4262,6 +4266,10 @@ fn multires_sculpt_limit_surface(
 
 /// The limit point of `sample` plus its multires displacement: the value each output corner that
 /// uses the sample accumulates.
+#[expect(
+    clippy::float_cmp,
+    reason = "exact `==` identifies the sample the evaluator was called with; `to_bits` would change which ±0.0 coordinates match"
+)]
 fn multires_sample_position(
     source: &Mesh,
     data: &multires::DisplacementData,
@@ -4342,14 +4350,12 @@ fn apply_multires_displacements(
                 sample.u.to_bits(),
                 sample.v.to_bits(),
             );
-            let value = match evaluated.get(&key) {
-                Some(value) => *value,
-                None => {
-                    let value =
-                        multires_sample_position(source, data, limit, &mut patches, *sample)?;
-                    evaluated.insert(key, value);
-                    value
-                }
+            let value = if let Some(value) = evaluated.get(&key) {
+                *value
+            } else {
+                let value = multires_sample_position(source, data, limit, &mut patches, *sample)?;
+                evaluated.insert(key, value);
+                value
             };
             let vertex_index = index_by_id.get(&vertex_id).copied().ok_or_else(|| {
                 PotError::new(
@@ -8319,6 +8325,7 @@ mod tests {
 
 #[cfg(test)]
 mod multires_mask_tests {
+    #![expect(clippy::unwrap_used, reason = "tests")]
     use super::*;
 
     #[test]

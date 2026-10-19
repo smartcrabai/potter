@@ -12,7 +12,7 @@ use crate::{
     geom::Mesh,
 };
 
-/// One top-level MDisps layer in Blender loop order.
+/// One top-level `MDisps` layer in Blender loop order.
 #[derive(Clone, Debug)]
 pub(super) struct DisplacementData {
     pub total_levels: u32,
@@ -227,11 +227,13 @@ fn parse_grid_levels(
     .transpose()
 }
 
+type PaintMasks = (Option<Vec<u32>>, Option<Vec<Vec<f32>>>);
+
 fn parse_paint_masks(
     raw: Option<&Value>,
     corner_count: usize,
     total_levels: u32,
-) -> Result<(Option<Vec<u32>>, Option<Vec<Vec<f32>>>)> {
+) -> Result<PaintMasks> {
     let Some(raw) = raw else {
         return Ok((None, None));
     };
@@ -562,14 +564,14 @@ enum BoundaryAverage {
     Next,
 }
 
-fn ptex_mapping(
-    mesh: &Mesh,
-) -> Result<(
+type PtexMapping = (
     Vec<usize>,
     Vec<usize>,
     Vec<(usize, usize)>,
     Vec<(usize, usize)>,
-)> {
+);
+
+fn ptex_mapping(mesh: &Mesh) -> Result<PtexMapping> {
     let loop_count = mesh.faces.iter().try_fold(0_usize, |count, face| {
         count.checked_add(face.vertices.len())
     });

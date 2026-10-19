@@ -247,7 +247,7 @@ pub(super) fn gregory_weights(s: f64, t: f64) -> [f64; 20] {
     w
 }
 
-/// OpenSubdiv's default Gregory derivative approximation: differentiate the Bezier basis while
+/// `OpenSubdiv`'s default Gregory derivative approximation: differentiate the Bezier basis while
 /// holding the rational interior-point blend factors fixed.
 pub(super) fn gregory_weights_and_derivatives(s: f64, t: f64) -> ([f64; 20], [f64; 20], [f64; 20]) {
     let bs = bezier_basis(s);
@@ -429,7 +429,8 @@ impl Patch {
         }
     }
 
-    /// The limit point and its local derivatives, with the Gregory approximation used by OpenSubdiv.
+    /// The limit point and its local derivatives, with the Gregory approximation used by
+    /// `OpenSubdiv`.
     pub(super) fn evaluate_and_derivatives<T: Point>(
         &self,
         positions: &[T],

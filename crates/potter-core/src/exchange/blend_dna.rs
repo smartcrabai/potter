@@ -90,7 +90,7 @@ pub(crate) fn read_multires_displacements(bytes: &[u8]) -> Result<BTreeMap<Strin
 
     BlendFile::parse(bytes)?.read_multires_displacements()
 }
-/// Patch Blender's already-allocated MDisps, GridPaintMask, and hidden buffers in place.
+/// Patch Blender's already-allocated `MDisps`, `GridPaintMask`, and hidden buffers in place.
 ///
 /// Blender 5.2 saves compressed `.blend` files by default. Zstd input is decoded, patched in
 /// its decoded layout, and re-encoded as a single zstd frame, so the file keeps the container
@@ -1747,7 +1747,7 @@ impl<'a> BlendFile<'a> {
                     "Mesh {mesh_name} corner {corner_index} has an invalid MDisps level"
                 ));
             }
-            let grid_len = grid_vector_count(level).map_err(|error| error.message.to_string())?;
+            let grid_len = grid_vector_count(level).map_err(|error| error.message.clone())?;
             if totdisp != 0 && totdisp != grid_len {
                 return Err(format!(
                     "Mesh {mesh_name} corner {corner_index} has {totdisp} MDisps samples; level {level} requires {grid_len}"
@@ -1792,7 +1792,7 @@ impl<'a> BlendFile<'a> {
             max_level,
             additional_bytes,
         )
-        .map_err(|error| error.message.to_string())?;
+        .map_err(|error| error.message.clone())?;
         let mut corners = Vec::with_capacity(if include_disps { loop_count } else { 0 });
         let mut hidden_grids = Vec::with_capacity(if has_hidden { loop_count } else { 0 });
         let uint_type = if has_hidden {
@@ -2027,7 +2027,7 @@ impl<'a> BlendFile<'a> {
             let sample_count = if level == 0 {
                 0
             } else {
-                grid_vector_count(level).map_err(|error| error.message.to_string())?
+                grid_vector_count(level).map_err(|error| error.message.clone())?
             };
             max_level = max_level.max(level);
             total_samples = total_samples
@@ -2057,7 +2057,7 @@ impl<'a> BlendFile<'a> {
             total_levels,
             additional_bytes,
         )
-        .map_err(|error| error.message.to_string())?;
+        .map_err(|error| error.message.clone())?;
         let mut result = Vec::with_capacity(loop_count);
         for (index, (level, sample_count, data)) in metadata.into_iter().enumerate() {
             let values = if sample_count == 0 {
@@ -3070,8 +3070,7 @@ fn multires_export_patches(
                         "multires patch loop {loop_index} has an invalid level"
                     ));
                 }
-                let grid_len =
-                    grid_vector_count(level).map_err(|error| error.message.to_string())?;
+                let grid_len = grid_vector_count(level).map_err(|error| error.message.clone())?;
                 if let Some(raw_values) = raw_values {
                     let grid = raw_values[loop_index]
                         .as_array()
@@ -3184,8 +3183,7 @@ fn multires_export_patches(
                 let mdisps_offset =
                     checked_array_item_offset(mdisps_offset, loop_index, mdisps_size)?;
                 let level = levels[loop_index];
-                let grid_len =
-                    grid_vector_count(level).map_err(|error| error.message.to_string())?;
+                let grid_len = grid_vector_count(level).map_err(|error| error.message.clone())?;
                 let raw_grid = raw_values.and_then(|values| values.get(loop_index));
                 patches.push(patch_integer_field(
                     file,
@@ -3292,7 +3290,7 @@ fn multires_export_patches(
                     let expected = if level == 0 {
                         0
                     } else {
-                        grid_vector_count(level).map_err(|error| error.message.to_string())?
+                        grid_vector_count(level).map_err(|error| error.message.clone())?
                     };
                     if values.len() != expected {
                         return Err(format!(
@@ -3663,6 +3661,7 @@ fn parse_blocks(bytes: &[u8], header: Header) -> Result<Vec<Block>, String> {
 
 #[cfg(test)]
 mod tests {
+    #![expect(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
     use super::{
         BlendFile, Endian, Header, Schema, parse_blocks, patch_multires_export_data,
         read_multires_displacements,
@@ -3865,7 +3864,11 @@ mod tests {
                 .and_then(serde_json::Value::as_array)
                 .expect("fixture face grids");
             for grid in face {
-                let level = if loop_index % 2 == 0 { 1_u32 } else { 2_u32 };
+                let level = if loop_index.is_multiple_of(2) {
+                    1_u32
+                } else {
+                    2_u32
+                };
                 let mut samples = grid.as_array().expect("fixture grid samples").clone();
                 if level == 1 {
                     samples.truncate(4);
@@ -3887,11 +3890,11 @@ mod tests {
         let mut loop_index = 0_usize;
         for face_index in 1..=source_values.len() {
             let face = record["values"]
-                .get(&format!("f{face_index}"))
+                .get(format!("f{face_index}"))
                 .and_then(serde_json::Value::as_array)
                 .expect("patched face grids");
             for grid in face {
-                let expected = if loop_index % 2 == 0 { 4 } else { 9 };
+                let expected = if loop_index.is_multiple_of(2) { 4 } else { 9 };
                 assert_eq!(
                     grid.as_array().expect("patched grid samples").len(),
                     expected

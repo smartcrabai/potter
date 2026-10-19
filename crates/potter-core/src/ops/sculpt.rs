@@ -1122,6 +1122,7 @@ fn vector3(engine: &Engine<'_>, value: Option<&Value>, pointer: &str) -> Result<
 
 #[cfg(test)]
 mod multires_selection_tests {
+    #![expect(clippy::unwrap_used, reason = "tests")]
     use super::*;
 
     fn multires_modifier(id: &str, show_viewport: bool) -> Modifier {

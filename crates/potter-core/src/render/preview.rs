@@ -622,8 +622,10 @@ fn camera_matrix(position: DVec3, target: DVec3, up_hint: DVec3) -> [f64; 16] {
 }
 
 fn adaptive_camera_override(camera: &PreparedCamera) -> AdaptiveCameraOverride {
-    let mut data = CameraData::default();
-    data.shift = camera.camera.shift;
+    let mut data = CameraData {
+        shift: camera.camera.shift,
+        ..Default::default()
+    };
     match camera.camera.projection {
         Projection::Orthographic { height } => {
             data.projection = CameraProjection::Orthographic;

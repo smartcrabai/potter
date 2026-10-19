@@ -1600,7 +1600,7 @@ fn split_edges(
     changes: &mut IdChanges,
     lineage: &IdChanges,
     radial_lineage: Option<&HashMap<u32, Vec<u32>>>,
-    mut multires_data: Option<&mut MultiresGridData>,
+    multires_data: Option<&mut MultiresGridData>,
 ) -> Result<HashMap<(u32, u32), u32>> {
     let selected: Vec<_> = mesh
         .edges
@@ -1628,7 +1628,7 @@ fn split_edges(
         let id = insert_vertex(mesh, a.midpoint(b), changes)?;
         midpoints.insert(edge_key(edge.vertices[0], edge.vertices[1]), id);
     }
-    if let Some(data) = multires_data.as_deref_mut() {
+    if let Some(data) = multires_data {
         let mut root_lineage = IdChanges {
             mdisp_sources: lineage.mdisp_sources.clone(),
             ..IdChanges::default()
@@ -1940,7 +1940,7 @@ fn stage_quad_subdivide(
     let m1 = midpoints[&edge_key(vertices[1], vertices[2])];
     let m2 = midpoints[&edge_key(vertices[2], vertices[3])];
     let m3 = midpoints[&edge_key(vertices[3], vertices[0])];
-    let children = vec![
+    let children = [
         vec![vertices[0], m0, center, m3],
         vec![vertices[1], m1, center, m0],
         vec![vertices[2], m2, center, m1],
@@ -2289,8 +2289,7 @@ fn apply_subdivide_once(
                     }
                 }
             }
-            if let (Some(stage), Some(data)) = (staged_mesh.as_ref(), multires_data.as_deref_mut())
-            {
+            if let (Some(stage), Some(data)) = (staged_mesh.as_ref(), multires_data) {
                 reorder_multires_face_data(stage, mesh, data, &actual_to_stage_faces)?;
             }
         }
@@ -3061,10 +3060,8 @@ fn apply_bisect_multires(
             *vertex_id,
             if distance <= -epsilon {
                 -1_i8
-            } else if distance >= epsilon {
-                1_i8
             } else {
-                0_i8
+                i8::from(distance >= epsilon)
             },
         );
     }
@@ -3165,10 +3162,9 @@ fn apply_bisect_multires(
                 centers[1].0,
                 &mut changes,
                 data,
-            )? {
-                if selected_descendants.contains(&face.id) {
-                    selected_descendants.insert(new_face_id);
-                }
+            )? && selected_descendants.contains(&face.id)
+            {
+                selected_descendants.insert(new_face_id);
             }
             continue;
         }
@@ -5145,7 +5141,7 @@ fn interpolate_multires(
                 None
             };
             let mut target_grid = corner_grids.as_ref().map(|_| {
-                copied_grid.map_or_else(|| vec![[0.0; 3]; grid_len], |grid| grid.to_vec())
+                copied_grid.map_or_else(|| vec![[0.0; 3]; grid_len], std::clone::Clone::clone)
             });
             let copied_hidden = if let (Some(index), Some(grids)) = (copied_loop, source_hidden) {
                 Some(
@@ -5156,9 +5152,9 @@ fn interpolate_multires(
             } else {
                 None
             };
-            let mut target_hidden = hidden_grids
-                .as_ref()
-                .map(|_| copied_hidden.map_or_else(|| vec![false; grid_len], |grid| grid.to_vec()));
+            let mut target_hidden = hidden_grids.as_ref().map(|_| {
+                copied_hidden.map_or_else(|| vec![false; grid_len], std::clone::Clone::clone)
+            });
             if side > 0 {
                 for y in 0..side {
                     for x in 0..side {
@@ -5221,7 +5217,7 @@ fn interpolate_multires(
                     let grid = source_masks
                         .and_then(|grids| grids.get(index))
                         .ok_or_else(|| invalid("multires copied paint-mask mapping is invalid"))?;
-                    (level, grid.to_vec())
+                    (level, grid.clone())
                 } else {
                     (0, Vec::new())
                 };
@@ -6055,7 +6051,7 @@ fn apply_loop_cut(
             }
         }
     }
-    if let (Some(stage), Some(data)) = (staged_mesh.as_ref(), multires_data.as_deref_mut()) {
+    if let (Some(stage), Some(data)) = (staged_mesh.as_ref(), multires_data) {
         reorder_multires_face_data(stage, mesh, data, &actual_to_stage_faces)?;
     }
     Ok(changes)
@@ -6914,7 +6910,7 @@ fn apply_symmetrize(
             true
         }
     });
-    if let (Some(source), Some(data)) = (multires_source.as_ref(), multires_data.as_deref_mut()) {
+    if let (Some(source), Some(data)) = (multires_source.as_ref(), multires_data) {
         rebase_subdivide_stage(source, mesh, data, &multires_sources)?;
     }
     discard_transient_ids(&mut changes.vertices, &mut changes.deleted_vertices);
@@ -7204,7 +7200,7 @@ mod tests {
         for face in &mesh.faces {
             let mut corners = Vec::with_capacity(face.vertices.len());
             for _ in &face.vertices {
-                let level: u32 = if loop_index % 2 == 0 { 1 } else { 2 };
+                let level: u32 = if loop_index.is_multiple_of(2) { 1 } else { 2 };
                 let side: usize = if level == 1 { 2 } else { 3 };
                 let sample = json!([loop_index + 1, loop_index + 2, 0.5]);
                 corners.push(json!(vec![sample; side * side]));

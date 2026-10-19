@@ -160,13 +160,14 @@ fn adaptive_render_context<'a>(
             data,
             world_to_camera,
         })
-    } else if let Some(camera) = request.camera_override.as_ref() {
-        Some(AdaptiveRenderCamera {
-            data: &camera.data,
-            world_to_camera: DMat4::from_cols_array(&camera.world_to_camera),
-        })
     } else {
-        None
+        request
+            .camera_override
+            .as_ref()
+            .map(|camera| AdaptiveRenderCamera {
+                data: &camera.data,
+                world_to_camera: DMat4::from_cols_array(&camera.world_to_camera),
+            })
     };
     Ok(AdaptiveRenderContext {
         settings: &scene.render,

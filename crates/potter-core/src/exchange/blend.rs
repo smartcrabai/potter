@@ -45,6 +45,9 @@ use super::{ExportOptions, ExportReport, ImportedGraph, Loss, is_default_materia
 
 type ImportedResourceAssets = (BTreeMap<String, String>, Vec<(String, Vec<u8>)>);
 
+type PreparedBlendExportResources = (Value, Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>);
+type MultiresGridExport = (Vec<Vec<[f32; 3]>>, Vec<u32>, Vec<usize>);
+
 const BRIDGE: &str = include_str!("blend_bridge.py");
 const MAX_BLEND_VERSION: u32 = 502;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -598,7 +601,7 @@ fn prepare_blend_export_resources(
     project: &Project,
     out: &Path,
     pack: bool,
-) -> Result<(Value, Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>)> {
+) -> Result<PreparedBlendExportResources> {
     let original_blend_path = document
         .get("compatibility")
         .and_then(Value::as_object)
@@ -1019,7 +1022,7 @@ fn multires_grids_for_export(
     total_levels: u32,
     grid_levels: Option<&Value>,
     auxiliary_bytes: u64,
-) -> Result<(Vec<Vec<[f32; 3]>>, Vec<u32>, Vec<usize>)> {
+) -> Result<MultiresGridExport> {
     let faces = mesh
         .get("faces")
         .and_then(Value::as_array)
@@ -1293,7 +1296,7 @@ fn reorder_multires_loop_values(
 }
 
 /// Blender mesh datablock name the bridge gives a Potter mesh, mirroring
-/// `compatibility_name` in blend_bridge.py: the `Mesh:<name>` compatibility mapping whose
+/// `compatibility_name` in `blend_bridge.py`: the `Mesh:<name>` compatibility mapping whose
 /// value is the data ID, otherwise the data ID itself.
 fn blender_mesh_name(doc: &Value, data_id: &str) -> String {
     doc.get("compatibility")
@@ -9240,6 +9243,7 @@ fn loss(feature: impl Into<String>, data_id: Option<&str>, reason: &str) -> Loss
 
 #[cfg(test)]
 mod tests {
+    #![expect(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
     use super::*;
     #[test]
     fn modifier_type_mapping_covers_the_potter_schema() {
@@ -15746,7 +15750,7 @@ print("UNSUPPORTED_POSE " + json.dumps({
         assert!(!reopened_clip.tracking.reconstruction.is_valid);
         Ok(())
     }
-    fn tiny_multires_export_document(params: Value) -> Value {
+    fn tiny_multires_export_document(params: &Value) -> Value {
         let grid = vec![[0.0_f32; 3]; 4];
         json!({
             "data_blocks": {
@@ -15776,7 +15780,7 @@ print("UNSUPPORTED_POSE " + json.dumps({
         let directory = tempfile::tempdir().map_err(|error| PotError::io(&error))?;
         let output = directory.path().join("failed.blend");
         let sidecar = directory.path().join("failed_assets");
-        let mut document = tiny_multires_export_document(json!("invalid params"));
+        let mut document = tiny_multires_export_document(&json!("invalid params"));
         let mut files = Vec::new();
         let mut multires_sidecars = Vec::new();
         let mut created_multires_sidecars = Vec::new();
@@ -15851,7 +15855,7 @@ print("UNSUPPORTED_POSE " + json.dumps({
             1,
         )?;
         fs::write(&sidecar_file, &bytes).map_err(|error| PotError::io(&error))?;
-        let mut document = tiny_multires_export_document(json!({}));
+        let mut document = tiny_multires_export_document(&json!({}));
         let mut files = Vec::new();
         let mut multires_sidecars = Vec::new();
         let mut created_multires_sidecars = Vec::new();
@@ -15864,8 +15868,8 @@ print("UNSUPPORTED_POSE " + json.dumps({
             &mut created_multires_sidecars,
             false,
         )?;
-        assert_eq!(multires_sidecars, [sidecar_file.clone()]);
-        assert!(created_multires_sidecars.is_empty());
+        assert_eq!(multires_sidecars, std::slice::from_ref(&sidecar_file));
+        assert_eq!(created_multires_sidecars, Vec::<std::path::PathBuf>::new());
         remove_multires_sidecars(&created_multires_sidecars)?;
         assert_eq!(
             fs::read(sidecar_file).map_err(|error| PotError::io(&error))?,
@@ -16011,19 +16015,6 @@ print("UNSUPPORTED_POSE " + json.dumps({
 
     #[test]
     fn multires_dna_imports_inline_and_external_corner_grids() -> Result<()> {
-        let Some(blender) = optional_blender() else {
-            return Ok(());
-        };
-        let fixture_dir =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/multires");
-        let inline_path = fixture_dir.join("mr_inline.blend");
-        let external_path = fixture_dir.join("mr_external.blend");
-        assert!(inline_path.is_file(), "inline multires fixture is missing");
-        assert!(
-            external_path.is_file(),
-            "external multires fixture is missing"
-        );
-
         fn record(imported: &ImportedGraph) -> Value {
             imported
                 .doc
@@ -16072,6 +16063,18 @@ print("UNSUPPORTED_POSE " + json.dumps({
             assert!(z_sum.is_finite());
             (corner_count, z_sum, nonzero)
         }
+        let Some(blender) = optional_blender() else {
+            return Ok(());
+        };
+        let fixture_dir =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/multires");
+        let inline_path = fixture_dir.join("mr_inline.blend");
+        let external_path = fixture_dir.join("mr_external.blend");
+        assert!(inline_path.is_file(), "inline multires fixture is missing");
+        assert!(
+            external_path.is_file(),
+            "external multires fixture is missing"
+        );
 
         let inline = import_blend(&inline_path, Some(&blender))?;
         let inline_record = record(&inline);
@@ -16217,9 +16220,9 @@ print("UNSUPPORTED_POSE " + json.dumps({
             tempfile::tempdir().map_err(|error| PotError::io(&error))?;
         let missing_sidecar_blend = missing_sidecar_directory.path().join("external.blend");
         fs::copy(external_path, &missing_sidecar_blend).map_err(|error| PotError::io(&error))?;
-        let missing_sidecar_error = match import_blend(&missing_sidecar_blend, Some(&blender)) {
-            Ok(_) => panic!("importing a blend with a missing multires sidecar should fail"),
-            Err(error) => error,
+        let Err(missing_sidecar_error) = import_blend(&missing_sidecar_blend, Some(&blender))
+        else {
+            panic!("importing a blend with a missing multires sidecar should fail");
         };
         assert_eq!(missing_sidecar_error.code, ErrorCode::FileNotFound);
         eprintln!(
@@ -16252,7 +16255,11 @@ print("UNSUPPORTED_POSE " + json.dumps({
             .expect("fixture multires values");
         for corners in values.values_mut() {
             for corner in corners.as_array_mut().expect("fixture face corners") {
-                let level = if loop_index % 2 == 0 { 2_u64 } else { 1_u64 };
+                let level = if loop_index.is_multiple_of(2) {
+                    2_u64
+                } else {
+                    1_u64
+                };
                 if level == 1 {
                     corner
                         .as_array_mut()
