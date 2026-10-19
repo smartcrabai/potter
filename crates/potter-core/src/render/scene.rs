@@ -31,7 +31,7 @@ use super::{
         point_intensity, spot_attenuation,
     },
     path::object_for_index,
-    principled_bsdf::{diffuse_coefficient, specular_coefficient},
+    principled_bsdf::{diffuse_coefficient, sheen_coefficient, specular_coefficient},
     raster::{
         AlphaMode, Line, Mode, SurfaceHit, SurfaceShader, Triangle, blend_color,
         blend_corner_normals, blend_uv,
@@ -2155,10 +2155,11 @@ fn light_contribution(
                 return DVec3::ZERO;
             }
             // Integrated Lambert irradiance is exact for rectangles and the visibility weight
-            // scales it. The specular lobe is evaluated towards the emitter centre.
+            // scales it. The specular and sheen lobes are evaluated towards the emitter centre.
             let toward_centre = (position - point).normalize_or_zero();
             (diffuse_coefficient(params, normal, view)
-                + specular_coefficient(params, normal, view, toward_centre))
+                + specular_coefficient(params, normal, view, toward_centre)
+                + sheen_coefficient(params, normal, view, toward_centre))
                 * color
                 * (irradiance * visible_weight / total_weight)
         }
@@ -2253,8 +2254,8 @@ fn shadow_visibility(
     visible / 9.0
 }
 
-/// Radiance a point, spot or sun light reflects toward `view`: the Principled diffuse and specular
-/// lobes along `light`, times the light colour and `intensity` weighted by the receiver cosine.
+/// Radiance a point, spot or sun light reflects toward `view`: the Principled diffuse, specular and
+/// sheen lobes along `light`, times the light colour and `intensity` weighted by the receiver cosine.
 fn punctual_radiance(
     params: &BsdfParams,
     normal: DVec3,
@@ -2267,7 +2268,9 @@ fn punctual_radiance(
     if normal_light_cosine <= 0.0 {
         return DVec3::ZERO;
     }
-    (diffuse_coefficient(params, normal, view) + specular_coefficient(params, normal, view, light))
+    (diffuse_coefficient(params, normal, view)
+        + specular_coefficient(params, normal, view, light)
+        + sheen_coefficient(params, normal, view, light))
         * color
         * (intensity * normal_light_cosine)
 }

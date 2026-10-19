@@ -27,6 +27,7 @@ TABLES = [
     ("table_ggx_E", "GGX_E", 1024),
     ("table_ggx_Eavg", "GGX_E_AVG", 32),
     ("table_ggx_gen_schlick_ior_s", "GGX_GEN_SCHLICK_IOR_S", 4096),
+    ("table_sheen_ltc", "SHEEN_LTC", 3072),
 ]
 
 # Float literal as written in the Cycles source, with the C `f` suffix already removed.

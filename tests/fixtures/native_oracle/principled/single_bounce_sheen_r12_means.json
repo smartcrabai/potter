@@ -1,0 +1,32 @@
+{
+  "provenance": {
+    "blender": "5.2.2",
+    "engine": "CYCLES",
+    "device": "CPU",
+    "threads": 1,
+    "samples": 4096,
+    "seeds": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+    "resolution": 16,
+    "patch": "central 8x8",
+    "generator": "tests/fixtures/native_oracle/principled/single_bounce_probe.py with PROBE_DIAMETER=2.4 PROBE_VARIANTS=sheen_r050,sheen_r030_tint (16 seeds, 2 variants)",
+    "geometry": {
+      "receiver": "plane at origin, normal +Z",
+      "view_theta_deg": 45.0,
+      "view_distance": 6.0,
+      "light_distance": 4.0,
+      "light_diameter": 2.4,
+      "power": 1000.0,
+      "world": "black"
+    }
+  },
+  "variants": {
+    "sheen_r050": {
+      "mean": [0.17817549932806287, 0.17817549932806287, 0.17817549932806287],
+      "stderr": [5.081926241668168e-06, 5.081926241668168e-06, 5.081926241668168e-06]
+    },
+    "sheen_r030_tint": {
+      "mean": [0.004087217123924347, 0.0020436085619621736, 0.0010218042809810868],
+      "stderr": [2.6757491139633797e-07, 1.3378745569816899e-07, 6.689372784908449e-08]
+    }
+  }
+}

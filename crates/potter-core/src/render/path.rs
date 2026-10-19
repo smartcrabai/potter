@@ -14,7 +14,10 @@ use crate::{
     },
 };
 
-use super::principled_bsdf::{continuous_density, evaluate as evaluate_bsdf, lobe_probabilities};
+use super::principled_bsdf::{
+    continuous_density, evaluate as evaluate_bsdf, lobe_probabilities, sample_sheen,
+    sheen_layer_weight,
+};
 use super::{
     bvh::{Bvh, BvhHit},
     light_model::{
@@ -1795,7 +1798,7 @@ enum BsdfSample {
 }
 
 fn sample_bsdf(params: &BsdfParams, normal: DVec3, view: DVec3, rng: &mut Pcg32) -> BsdfSample {
-    let probabilities = lobe_probabilities(params);
+    let probabilities = lobe_probabilities(params, normal, view);
     let choice = rng.next_f64();
     if choice < probabilities.transmission {
         let direction = refract(-view, normal, 1.0 / params.ior.max(1.0e-3))
@@ -1805,16 +1808,22 @@ fn sample_bsdf(params: &BsdfParams, normal: DVec3, view: DVec3, rng: &mut Pcg32)
             params.base_color[1],
             params.base_color[2],
         );
+        let layer = sheen_layer_weight(params, normal, view);
         let weight = tint
-            * (params.reflectance.clamp(0.0, 1.0) * params.transmission.clamp(0.0, 1.0)
+            * (params.reflectance.clamp(0.0, 1.0) * params.transmission.clamp(0.0, 1.0) * layer
                 / probabilities.transmission.max(1.0e-8));
         return BsdfSample::Delta { direction, weight };
     }
-    let direction = if choice >= probabilities.transmission + probabilities.diffuse {
+    let diffuse_end = probabilities.transmission + probabilities.diffuse;
+    let direction = if choice < diffuse_end {
+        sample_cosine_hemisphere(normal, rng).0
+    } else if choice < diffuse_end + probabilities.sheen {
+        let first = rng.next_f64();
+        let second = rng.next_f64();
+        sample_sheen(params, normal, view, first, second)
+    } else {
         let half_vector = sample_ggx_half(normal, params.roughness, rng);
         reflect(-view, half_vector).normalize_or_zero()
-    } else {
-        sample_cosine_hemisphere(normal, rng).0
     };
     // Estimator `f cos / p_mix`: the density is the lobe mixture, not the branch's own lobe.
     let pdf = continuous_density(params, normal, view, direction);

@@ -22,6 +22,11 @@ VARIANTS = {
     "diffuse_white": dict(metallic=0.0, roughness=0.5, base=(0.8, 0.8, 0.8, 1.0), spec=0.0),
     "spec_only_r024": dict(metallic=0.0, roughness=0.24, base=(0.0, 0.0, 0.0, 1.0)),
     "dielectric_white": dict(metallic=0.0, roughness=0.24, base=(0.8, 0.8, 0.8, 1.0)),
+    # Sheen alone: no base diffuse and no specular layer (Specular IOR Level 0 gives eta 1).
+    "sheen_r050": dict(metallic=0.0, roughness=0.24, base=(0.0, 0.0, 0.0, 1.0), spec=0.0,
+                       sheen=1.0, sheen_roughness=0.5, sheen_tint=(1.0, 1.0, 1.0)),
+    "sheen_r030_tint": dict(metallic=0.0, roughness=0.24, base=(0.0, 0.0, 0.0, 1.0), spec=0.0,
+                            sheen=0.6, sheen_roughness=0.3, sheen_tint=(1.0, 0.5, 0.25)),
 }
 
 def aim(obj, target):
@@ -59,6 +64,10 @@ def make(v, seed):
     b.inputs['IOR'].default_value = 1.5
     if 'spec' in v:
         b.inputs['Specular IOR Level'].default_value = v['spec']
+    if 'sheen' in v:
+        b.inputs['Sheen Weight'].default_value = v['sheen']
+        b.inputs['Sheen Roughness'].default_value = v['sheen_roughness']
+        b.inputs['Sheen Tint'].default_value = (*v['sheen_tint'], 1.0)
     plane.data.materials.append(mat)
     ld = bpy.data.lights.new('Disk', 'AREA')
     ld.shape = 'DISK'
@@ -88,8 +97,12 @@ def centre_mean(path):
     bpy.data.images.remove(img)
     return [a / n for a in acc]
 
+# PROBE_VARIANTS=name,name... renders a subset (the committed means are never regenerated in place).
+selected = os.environ.get('PROBE_VARIANTS')
+names = selected.split(',') if selected else list(VARIANTS)
 result = {}
-for name, v in VARIANTS.items():
+for name in names:
+    v = VARIANTS[name]
     vals = []
     for seed in range(16):
         s = make(v, seed)

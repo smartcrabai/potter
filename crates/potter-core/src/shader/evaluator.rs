@@ -34,10 +34,9 @@ pub(crate) fn dielectric_f0(ior: f64, level: f64) -> f64 {
 /// as `(feature_id, Blender input)` pairs in a fixed array, so checking a hit allocates nothing.
 pub(crate) fn unevaluated_principled_inputs(
     params: &BsdfParams,
-) -> [Option<(&'static str, &'static str)>; 8] {
+) -> [Option<(&'static str, &'static str)>; 7] {
     [
         (params.coat_weight > 0.0).then_some(("shader.principled.coat", "Coat Weight")),
-        (params.sheen_weight > 0.0).then_some(("shader.principled.sheen", "Sheen Weight")),
         (params.subsurface_weight > 0.0)
             .then_some(("shader.principled.subsurface", "Subsurface Weight")),
         (params.anisotropic_ior > 0.0).then_some(("shader.principled.anisotropic", "Anisotropic")),
@@ -166,7 +165,7 @@ impl BsdfParams {
             coat_roughness: 0.03,
             coat_ior: 1.5,
             sheen_weight: 0.0,
-            sheen_roughness: 0.3,
+            sheen_roughness: 0.5,
             sheen_tint: [1.0; 3],
             specular_ior_level: DEFAULT_SPECULAR_IOR_LEVEL,
             specular_tint: [1.0; 3],
@@ -1140,7 +1139,7 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
             self.scalar_input(id, &["Coat Roughness", "Clearcoat Roughness"], 0.03)?;
         params.coat_ior = self.scalar_input(id, &["Coat IOR"], 1.5)?;
         params.sheen_weight = self.scalar_input(id, &["Sheen Weight", "Sheen"], 0.0)?;
-        params.sheen_roughness = self.scalar_input(id, &["Sheen Roughness"], 0.3)?;
+        params.sheen_roughness = self.scalar_input(id, &["Sheen Roughness"], 0.5)?;
         params.sheen_tint = self.color_input(id, &["Sheen Tint"], [1.0, 1.0, 1.0, 1.0])?[..3]
             .try_into()
             .map_err(|_| invalid("invalid sheen tint"))?;
