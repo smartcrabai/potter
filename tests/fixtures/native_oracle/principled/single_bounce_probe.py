@@ -90,7 +90,7 @@ def centre_mean(path):
 result = {}
 for name, v in VARIANTS.items():
     vals = []
-    for seed in range(4):
+    for seed in range(16):
         s = make(v, seed)
         p = os.path.join(out, f'{name}_s{seed}.exr'); s.render.filepath = p
         bpy.ops.render.render(write_still=True)
