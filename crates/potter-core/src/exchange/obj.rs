@@ -2413,6 +2413,7 @@ mod tests {
                 width: 1,
                 height: 1,
                 tiles: Vec::new(),
+                tiled: false,
                 blob: None,
                 source_path: Some(image_path.to_string_lossy().into_owned()),
                 source_hash: Some(crate::hash::sha256(&pixels)),
@@ -2469,6 +2470,7 @@ mod tests {
                 width: 1,
                 height: 1,
                 tiles: Vec::new(),
+                tiled: false,
                 blob: None,
                 source_path: Some(
                     dir.path()
