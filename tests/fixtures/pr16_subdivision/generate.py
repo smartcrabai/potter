@@ -81,6 +81,7 @@ def make_mesh(vertices, faces, seams=(), creases=(), loose_edges=(), smooth=None
         "sharp_edges": [list(edge) for edge in sorted({edge_key(*edge) for edge in sharp_edges})],
         "vertex_creases": [[int(vertex), float(value)] for vertex, value in vertex_creases],
         "rotated_storage": bool(rotated_storage),
+        "order_attributes": [],
         "custom_normals": generated_normals if custom_normals is None else custom_normals,
     }
 
@@ -238,6 +239,30 @@ def fixture_set():
     meshes["mixed_rotated_storage"] = make_mesh(mixed["vertices"], mixed["faces"],
                                                 [(0, 1), (3, 0), (6, 7)], [(1, 2, 0.5)],
                                                 rotated_storage=True)
+    # Each generic value identifies its element: POINT by vertex index, EDGE by edge index, FACE by face
+    # index, and CORNER by Blender loop index, so a wrong slot or corner frame changes a value. The n-gon
+    # also carries integer and quaternion data, which Blender mixes per ptex slot.
+    float_orders = [
+        {"name": "OrderPoint", "domain": "POINT", "type": "FLOAT"},
+        {"name": "OrderEdge", "domain": "EDGE", "type": "FLOAT"},
+        {"name": "OrderFace", "domain": "FACE", "type": "FLOAT"},
+        {"name": "OrderCorner", "domain": "CORNER", "type": "FLOAT"},
+    ]
+    for name in ("quad", "curved_grid", "mixed_rotated_storage"):
+        meshes[name]["order_attributes"] = float_orders
+    meshes["ngon"]["order_attributes"] = float_orders + [
+        {"name": "OrderInt", "domain": "POINT", "type": "INT"},
+        {"name": "OrderIntCorner", "domain": "CORNER", "type": "INT"},
+        {"name": "OrderQuaternion", "domain": "POINT", "type": "QUATERNION"},
+        {"name": "OrderCornerQuaternion", "domain": "CORNER", "type": "QUATERNION"},
+    ]
+    # BYTE_COLOR layers hold sRGB bytes that Blender interpolates per slot and truncates (encode_byte_colors).
+    byte_colors = [
+        {"name": "ByteColorPoint", "domain": "POINT"},
+        {"name": "ByteColorCorner", "domain": "CORNER"},
+    ]
+    meshes["quad"]["byte_colors"] = byte_colors
+    meshes["ngon"]["byte_colors"] = byte_colors
     meshes["vertex_crease_grid"] = make_mesh(grid_vertices, grid_faces, grid_seams,
                                              vertex_creases=[(5, 1.0), (6, 0.5), (1, 0.3)])
     meshes["vertex_crease_cube"] = make_mesh(cube_vertices, cube_faces, cube_seams,
@@ -432,8 +457,8 @@ def build_cases():
     add("vertex_crease_cube_l2", "vertex_crease_cube", levels=2, use_creases=True)
     return cases
 
-
 def output_mesh(obj, params):
+    coarse_edges = [list(map(int, edge.vertices)) for edge in obj.data.edges]
     modifier = obj.modifiers.new("OracleSubdivision", "SUBSURF")
     modifier.subdivision_type = params["subdivision_type"]
     modifier.levels = params["levels"]
@@ -489,11 +514,90 @@ def output_mesh(obj, params):
                 group_name = group_indices.get(membership.group)
                 if group_name is not None:
                     group_weights[group_name][vertex.index] = float(membership.weight)
-        return {"vertices": [list(vertex.co) for vertex in mesh.vertices], "edges": edges,
-                "faces": faces, "vertex_groups": group_weights,
-                "has_custom_normals": bool(mesh.has_custom_normals)}
+        ordered_attributes = []
+        for attribute in mesh.attributes:
+            if attribute.name.startswith("Order"):
+                ordered_attributes.append({
+                    "name": attribute.name, "domain": attribute.domain,
+                    "data_type": attribute.data_type,
+                    "values": [attribute_value(item.value, attribute.data_type) for item in attribute.data],
+                })
+        byte_colors = []
+        for attribute in mesh.color_attributes:
+            if attribute.name.startswith("ByteColor"):
+                byte_colors.append({
+                    "name": attribute.name, "domain": attribute.domain,
+                    "data_type": attribute.data_type,
+                    "values": [[int(round(channel * 255)) for channel in item.color_srgb] for item in attribute.data],
+                })
+        return {"input_edges": coarse_edges, "vertices": [list(vertex.co) for vertex in mesh.vertices], "edges": edges,
+                "faces": faces, "vertex_groups": group_weights, "ordered_attributes": ordered_attributes,
+                "byte_colors": byte_colors, "has_custom_normals": bool(mesh.has_custom_normals)}
     finally:
         evaluated.to_mesh_clear()
+
+
+def corner_quaternion_for(loop_index):
+    """A unit quaternion (w, x, y, z) of a loop. All loops share one axis and their angles differ by 0.05, so the
+    dot product of neighbours is positive before the sign alternates. Alternating the sign makes every pair of
+    neighbouring loops have a negative dot product, so slerp's shorter-arc sign rule decides the result."""
+    axis = (1.0, 0.5, 0.25)
+    length = math.sqrt(sum(component * component for component in axis))
+    angle = 0.2 + 0.05 * loop_index
+    sign = -1.0 if loop_index % 2 else 1.0
+    scale = sign * math.sin(angle / 2) / length
+    return (sign * math.cos(angle / 2), axis[0] * scale, axis[1] * scale, axis[2] * scale)
+
+
+def quaternion_for(index):
+    """A unit quaternion (w, x, y, z); for some vertices the angle exceeds pi, so w is negative."""
+    angle = 0.3 + 0.37 * index
+    axis = (1.0, 0.5 * (index % 3), 0.25 * (index % 5) + 0.1)
+    length = math.sqrt(sum(component * component for component in axis))
+    scale = math.sin(angle / 2) / length
+    return (math.cos(angle / 2), axis[0] * scale, axis[1] * scale, axis[2] * scale)
+
+
+def order_values(mesh, domain, data_type):
+    """Blender values of an order test attribute. POINT, EDGE and FACE index their element; CORNER uses
+    the Blender loop index, so every loop carries a value of its own."""
+    if domain == "POINT" and data_type == "FLOAT":
+        return [index + 0.25 for index in range(len(mesh.vertices))]
+    if domain == "POINT" and data_type == "INT":
+        return [(index * 3) % 7 for index in range(len(mesh.vertices))]
+    if domain == "POINT" and data_type == "QUATERNION":
+        return [quaternion_for(index) for index in range(len(mesh.vertices))]
+    if domain == "EDGE" and data_type == "FLOAT":
+        return [100.25 + index for index in range(len(mesh.edges))]
+    if domain == "FACE" and data_type == "FLOAT":
+        return [200.25 + index for index in range(len(mesh.polygons))]
+    if domain == "CORNER" and data_type == "FLOAT":
+        return [300.25 + loop.index for loop in mesh.loops]
+    if domain == "CORNER" and data_type == "INT":
+        return [(loop.index * 5) % 13 for loop in mesh.loops]
+    if domain == "CORNER" and data_type == "QUATERNION":
+        return [corner_quaternion_for(loop.index) for loop in mesh.loops]
+    raise RuntimeError(f"unsupported order test attribute {data_type} on {domain}")
+
+
+def attribute_value(value, data_type):
+    """A generic value in Potter's canonical order: a quaternion is Blender's (w, x, y, z) read as (x, y, z, w)."""
+    if data_type == "QUATERNION":
+        w, x, y, z = (float(component) for component in value)
+        return [x, y, z, w]
+    if hasattr(value, "__len__"):
+        return [float(component) for component in value]
+    return value if isinstance(value, int) else float(value)
+
+
+def byte_color_values(domain, mesh):
+    """Deterministic sRGB bytes (r, g, b, a) of each BYTE_COLOR element, by Blender loop or vertex index. The
+    Rust fixture builds the same bytes from the same formula."""
+    base = 17 if domain == "POINT" else 53
+    count = len(mesh.vertices) if domain == "POINT" else len(mesh.loops)
+    return [[(index * 37 + channel * 91 + base) % 256 for channel in range(3)]
+            + [(index * 29 + (101 if domain == "POINT" else 7)) % 256] for index in range(count)]
+
 
 
 def make_object(name, spec):
@@ -517,6 +621,17 @@ def make_object(name, spec):
         vertex_crease = mesh.attributes.new(name="crease_vert", type="FLOAT", domain="POINT")
         for vertex in mesh.vertices:
             vertex_crease.data[vertex.index].value = vertex_crease_values.get(vertex.index, 0.0)
+    for definition in spec.get("order_attributes", []):
+        domain = definition["domain"]
+        data_type = definition["type"]
+        attribute = mesh.attributes.new(name=definition["name"], type=data_type, domain=domain)
+        for item, value in zip(attribute.data, order_values(mesh, domain, data_type)):
+            item.value = value
+    for definition in spec.get("byte_colors", []):
+        attribute = mesh.color_attributes.new(name=definition["name"], type="BYTE_COLOR",
+                                              domain=definition["domain"])
+        for item, bytes_ in zip(attribute.data, byte_color_values(definition["domain"], mesh)):
+            item.color_srgb = tuple(channel / 255.0 for channel in bytes_)
     for spec_layer in spec["uv_layers"]:
         layer = mesh.uv_layers.new(name=spec_layer["name"])
         for index, value in enumerate(spec_layer["values"]):
