@@ -431,12 +431,35 @@ fn udim_texture_losses(doc: &SceneDoc, format: &str) -> Vec<Loss> {
     losses
 }
 
-/// Makes each UDIM image a plain image of its base tile, for a lossy export that writes only tile 1001.
+/// Makes each UDIM image a plain image of its base tile, for a lossy export that writes only tile 1001. A UDIM image with
+/// no base file has no tile 1001 to write, so the material textures that name it are dropped; the `material.texture_udim`
+/// loss reports them.
 fn flatten_udim_images(doc: &mut SceneDoc) {
+    let missing_base: BTreeSet<crate::model::Id> = doc
+        .images
+        .iter()
+        .filter(|(_, image)| image.base_is_missing())
+        .map(|(id, _)| id.clone())
+        .collect();
     for image in doc.images.values_mut() {
         if image.is_udim() {
             image.tiles.clear();
             image.tiled = false;
+        }
+    }
+    for material in doc.materials.values_mut() {
+        for texture in [
+            &mut material.base_color_texture,
+            &mut material.roughness_texture,
+            &mut material.metallic_texture,
+            &mut material.normal_texture,
+        ] {
+            if texture
+                .as_ref()
+                .is_some_and(|texture| missing_base.contains(&texture.image))
+            {
+                *texture = None;
+            }
         }
     }
 }
