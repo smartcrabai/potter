@@ -143,7 +143,11 @@ fn world_matrix(project: &str, id: &str) -> TestResult<Vec<f64>> {
         .as_array()
         .ok_or("world matrix is missing")?
         .iter()
-        .map(|value| value.as_f64().ok_or_else(|| "world element is not numeric".into()))
+        .map(|value| {
+            value
+                .as_f64()
+                .ok_or_else(|| "world element is not numeric".into())
+        })
         .collect()
 }
 
@@ -204,7 +208,11 @@ fn blender_root_parent_inverse_evaluates_as_blender_and_round_trips() -> TestRes
     );
 
     let before = column_major(&expected["before"]["world"])?;
-    assert_world_close(&world_matrix(project_text, &id)?, &before, "import, before edit");
+    assert_world_close(
+        &world_matrix(project_text, &id)?,
+        &before,
+        "import, before edit",
+    );
 
     let batch = root.join("edit.json");
     fs::write(
@@ -222,12 +230,14 @@ fn blender_root_parent_inverse_evaluates_as_blender_and_round_trips() -> TestRes
     let batch_text = batch.to_str().ok_or("batch path is not UTF-8")?;
     run_pot(&["apply", project_text, "--file", batch_text])?;
     let after = column_major(&expected["after"]["world"])?;
-    assert_world_close(&world_matrix(project_text, &id)?, &after, "after the same edit");
+    assert_world_close(
+        &world_matrix(project_text, &id)?,
+        &after,
+        "after the same edit",
+    );
 
     let exported_path = root.join("round-trip.blend");
-    let exported_text = exported_path
-        .to_str()
-        .ok_or("export path is not UTF-8")?;
+    let exported_text = exported_path.to_str().ok_or("export path is not UTF-8")?;
     let exported = run_pot(&[
         "export",
         project_text,
