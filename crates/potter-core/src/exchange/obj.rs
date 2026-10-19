@@ -54,7 +54,7 @@ pub(crate) fn export(
     let mut uv_base = 0_usize;
     // Groups stay in effect across `o` lines, so an object without groups must reset them.
     let mut groups_on = false;
-    let bound_materials = material_bindings(meshes)?;
+    let bound_materials = material_bindings(doc, meshes)?;
     for mesh in meshes {
         object.push_str("o ");
         object.push_str(&obj_name(&mesh.name));
@@ -148,7 +148,10 @@ pub(crate) fn export(
             let material = face_materials.get(face_index).copied().flatten();
             if material_state != Some(material) {
                 if let Some(id) = material {
-                    writeln!(object, "usemtl {}", id.as_str()).map_err(|error| {
+                    let name = bound_materials.get(id).ok_or_else(|| {
+                        PotError::new(ErrorCode::InternalError, "OBJ material binding is missing")
+                    })?;
+                    writeln!(object, "usemtl {name}").map_err(|error| {
                         PotError::new(ErrorCode::InternalError, error.to_string())
                     })?;
                 } else {
@@ -243,8 +246,10 @@ struct MtlEntries {
     losses: Vec<Loss>,
 }
 
-fn material_bindings(meshes: &[ExchangeMesh]) -> Result<BTreeMap<String, &Id>> {
-    let mut materials = BTreeMap::new();
+/// Names each bound material in the OBJ and MTL by its own name, as Blender does, when that name is
+/// one token and no other bound material shares it. Otherwise the material's ID names it.
+fn material_bindings(doc: &SceneDoc, meshes: &[ExchangeMesh]) -> Result<BTreeMap<Id, String>> {
+    let mut bound = BTreeSet::<Id>::new();
     for mesh in meshes {
         if !mesh.face_material_indices.is_empty()
             && mesh.face_material_indices.len() != mesh.faces.len()
@@ -258,17 +263,39 @@ fn material_bindings(meshes: &[ExchangeMesh]) -> Result<BTreeMap<String, &Id>> {
             if geometry.len() >= 3
                 && let Some(id) = bound_material(mesh, face)
             {
-                materials.insert(id.as_str().to_owned(), id);
+                bound.insert(id.clone());
             }
         }
     }
-    Ok(materials)
+    let mut sharing = BTreeMap::<&str, usize>::new();
+    for id in &bound {
+        if let Some(material) = doc.materials.get(id) {
+            *sharing.entry(material.name.as_str()).or_default() += 1;
+        }
+    }
+    Ok(bound
+        .into_iter()
+        .map(|id| {
+            let name = doc
+                .materials
+                .get(&id)
+                .map(|material| material.name.as_str())
+                .filter(|name| {
+                    !name.is_empty()
+                        && !name.contains(char::is_whitespace)
+                        && !name.contains('#')
+                        && sharing.get(name) == Some(&1)
+                })
+                .map_or_else(|| id.as_str().to_owned(), str::to_owned);
+            (id, name)
+        })
+        .collect())
 }
 
 fn mtl_entries(
     doc: &SceneDoc,
     root_path: &Path,
-    bindings: &BTreeMap<String, &Id>,
+    bindings: &BTreeMap<Id, String>,
     write_output: bool,
 ) -> Result<MtlEntries> {
     let mut output = MtlEntries {
@@ -276,12 +303,12 @@ fn mtl_entries(
         textures: Vec::new(),
         losses: Vec::new(),
     };
-    for (name, &id) in bindings {
+    for (id, name) in bindings {
         let mut entry = MtlWriter {
             doc,
             root_path,
             id,
-            name,
+            name: name.as_str(),
             textures: Vec::new(),
             losses: Vec::new(),
             write_output,
@@ -299,7 +326,7 @@ pub(crate) fn material_diagnostics(
     root_path: &Path,
     meshes: &[ExchangeMesh],
 ) -> Result<Vec<Loss>> {
-    let bindings = material_bindings(meshes)?;
+    let bindings = material_bindings(doc, meshes)?;
     Ok(mtl_entries(doc, root_path, &bindings, false)?.losses)
 }
 
@@ -2091,6 +2118,7 @@ mod tests {
         let mut mesh = triangle_with_layers();
         mesh.faces.push(vec![0, 1, 2]);
         mesh.smooth.push(false);
+        mesh.face_material_indices.push(0);
         mesh.normals = Some(vec![[0.0, 0.0, 1.0]; 6]);
         mesh.uv_active = None;
         mesh.colors = ColorStore {

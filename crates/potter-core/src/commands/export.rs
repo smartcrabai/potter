@@ -559,7 +559,8 @@ pub(crate) fn export_losses(
         let data_supported = matches!(data.data_type.as_str(), "mesh" | "camera" | "light")
             || (supports_strokes && data.data_type == "grease_pencil")
             || (supports_bvh && data.data_type == "armature")
-            || (supports_gltf_skin && data.data_type == "armature");
+            || (supports_gltf_skin && data.data_type == "armature")
+            || (matches!(format, "fbx" | "fbx-binary") && data.data_type == "armature");
         if format == "alembic"
             && data
                 .mesh
@@ -592,6 +593,9 @@ pub(crate) fn export_losses(
         && let Some(snapshot) = snapshot
     {
         losses.extend(exchange::fbx::material_slot_losses(doc, snapshot));
+    }
+    if matches!(format, "fbx" | "fbx-binary") {
+        losses.extend(exchange::fbx::material_graph_losses(doc));
     }
     if let Some(loss) = avatar_settings_loss(doc, format) {
         losses.push(loss);

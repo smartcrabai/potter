@@ -4405,6 +4405,8 @@ fn get_u32(bytes: &[u8], offset: usize) -> Result<u32> {
 
 #[cfg(test)]
 mod tests {
+    const SCENE_ID: &str = "00000000-0000-4000-8000-000000000000";
+
     use super::{all_strings, parse_usda, string_array, write_uv_primvars};
     use crate::{
         error::{ErrorCode, PotError, Result},
@@ -4454,7 +4456,7 @@ mod tests {
     }
 
     fn import_colors(text: &str) -> Result<(ColorStore, Vec<String>)> {
-        let (doc, losses) = parse_usda(text, "scene".to_owned())?;
+        let (doc, losses) = parse_usda(text, SCENE_ID.to_owned())?;
         let mesh = doc
             .data_blocks
             .values()
@@ -4811,7 +4813,7 @@ def Xform "Scene"
         float3 outputs:rgb
     }"#,
         );
-        let (doc, losses) = parse_usda(&text, "scene".to_owned())?;
+        let (doc, losses) = parse_usda(&text, SCENE_ID.to_owned())?;
         assert!(losses.is_empty());
         let (material, graph) = only_material(&doc)?;
         assert_eq!(
@@ -4846,7 +4848,7 @@ def Xform "Scene"
         }
     }"#;
         let text = material_fixture("", "</M/B/Reader.outputs:rgb>", shaders);
-        let (doc, losses) = parse_usda(&text, "scene".to_owned())?;
+        let (doc, losses) = parse_usda(&text, SCENE_ID.to_owned())?;
         assert!(losses.is_empty(), "{losses:?}");
         let (_, graph) = only_material(&doc)?;
         assert_eq!(
@@ -4879,7 +4881,7 @@ def Xform "Scene"
         float3 outputs:rgb
     }"#;
         let text = material_fixture("", "</M/Reader.outputs:rgb>", shaders);
-        let (doc, losses) = parse_usda(&text, "scene".to_owned())?;
+        let (doc, losses) = parse_usda(&text, SCENE_ID.to_owned())?;
         assert!(losses.is_empty(), "{losses:?}");
         let (_, graph) = only_material(&doc)?;
         assert_eq!(
@@ -4908,7 +4910,7 @@ def Xform "Scene"
         float3 outputs:rgb
     }"#;
         let text = material_fixture("", "</M/Outer.outputs:rgb>", shaders);
-        let (doc, losses) = parse_usda(&text, "scene".to_owned())?;
+        let (doc, losses) = parse_usda(&text, SCENE_ID.to_owned())?;
         assert!(losses.is_empty(), "{losses:?}");
         let (_, graph) = only_material(&doc)?;
         assert_eq!(
@@ -4931,7 +4933,7 @@ def Xform "Scene"
         float3 outputs:rgb
     }"#,
         );
-        let (doc, _) = parse_usda(&text, "scene".to_owned())?;
+        let (doc, _) = parse_usda(&text, SCENE_ID.to_owned())?;
         let (_, graph) = only_material(&doc)?;
         assert_eq!(base_color_vertex_layer(graph).as_deref(), Some("UVColor"));
         Ok(())
@@ -4949,7 +4951,7 @@ def Xform "Scene"
         float3 outputs:rgb
     }"#,
         );
-        let (doc, losses) = parse_usda(&text, "scene".to_owned())?;
+        let (doc, losses) = parse_usda(&text, SCENE_ID.to_owned())?;
         let material = doc.materials.values().next();
         assert!(material.is_some_and(|material| material.node_tree.is_none()));
         assert!(
@@ -4971,6 +4973,6 @@ def Xform "Scene"
         uniform token info:id = "UsdUVTexture"
     }"#,
         );
-        assert!(parse_usda(&text, "scene".to_owned()).is_err());
+        assert!(parse_usda(&text, SCENE_ID.to_owned()).is_err());
     }
 }

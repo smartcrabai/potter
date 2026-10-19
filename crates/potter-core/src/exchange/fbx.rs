@@ -18,7 +18,7 @@ use crate::{
     error::{ErrorCode, PotError, Result},
     eval::{EvaluationPurpose, SlotBinding, Snapshot},
     geom::{
-        Mesh, attribute_keys,
+        Mesh,
         color_layers::{self, ColorDomain, ColorLayer, ColorStore},
         normals::corner_normals,
         uv_layers,
@@ -840,17 +840,6 @@ fn build_texture_exports(
 ) -> Result<Vec<TextureExport>> {
     let mut paths = BTreeMap::<(Id, &'static str), String>::new();
     for (material_id, material) in &doc.materials {
-        if material
-            .node_tree
-            .as_ref()
-            .is_some_and(|graph_id| !super::is_default_material_graph(doc, graph_id))
-        {
-            return Err(PotError::with_details(
-                ErrorCode::UnrepresentableFeature,
-                "FBX cannot preserve arbitrary material node trees",
-                json!({"feature_id":"format.fbx.material_node_tree","material_id":material_id}),
-            ));
-        }
         for (texture, property) in material_texture_refs(material)
             .into_iter()
             .zip(TEXTURE_PROPERTIES)
@@ -1106,6 +1095,28 @@ pub(crate) fn material_slot_losses(doc: &SceneDoc, snapshot: &Snapshot) -> Vec<L
         });
     }
     losses
+}
+
+/// FBX writes each material's mirror fields instead of its node graph, so every non-default graph is
+/// a loss: strict export refuses it, and `--allow-lossy` writes the mirror fields.
+pub(crate) fn material_graph_losses(doc: &SceneDoc) -> Vec<Loss> {
+    doc.materials
+        .iter()
+        .filter(|(_, material)| {
+            material
+                .node_tree
+                .as_ref()
+                .is_some_and(|graph_id| !super::is_default_material_graph(doc, graph_id))
+        })
+        .map(|(material_id, _)| Loss {
+            feature_id: "format.fbx.material_node_tree".to_owned(),
+            data_id: Some(material_id.to_string()),
+            reason:
+                "FBX cannot preserve arbitrary material node trees; it writes the mirror fields"
+                    .to_owned(),
+            suggestion: Some("export as blend or glb to keep the node tree".to_owned()),
+        })
+        .collect()
 }
 
 /// Blender's FBX add-on stores vertex groups only as skin clusters bound to deform bones. Groups
@@ -1608,7 +1619,14 @@ fn write_skin_export(output: &mut String, skin: &SkinExport) -> Result<()> {
             cluster.indexes.iter().map(ToString::to_string).collect::<Vec<_>>().join(","),
             cluster.weights.len(),
             cluster.weights.iter().map(|weight| fmt_num(*weight)).collect::<Vec<_>>().join(","),
-            cluster.mesh_bind.to_cols_array().iter().map(|value| fmt_num(*value)).collect::<Vec<_>>().join(","),
+            // Blender stores `Transform` in bone space: `inv(bone_world) @ mesh_world`
+            // (`export_fbx_bin.py`, `fbx_data_armature_elements`).
+            (cluster.bone_bind.inverse() * cluster.mesh_bind)
+                .to_cols_array()
+                .iter()
+                .map(|value| fmt_num(*value))
+                .collect::<Vec<_>>()
+                .join(","),
             cluster.bone_bind.to_cols_array().iter().map(|value| fmt_num(*value)).collect::<Vec<_>>().join(","),
         )
         .map_err(write_error)?;
@@ -1739,17 +1757,7 @@ fn write_geometry(
     // Shading attributes, UV layers, and color layers have their own FBX layers. Unsupported
     // attributes are skipped only for lossy export and are reported by `commands::export::export_losses`.
     let colors = color_layers::read(mesh);
-    if !allow_lossy
-        && mesh.attributes.keys().any(|name| {
-            name != uv_layers::ATTRIBUTE
-                && name != color_layers::ATTRIBUTE
-                && !colors
-                    .layers
-                    .iter()
-                    .any(|layer| attribute_keys::storage_key(&layer.name) == name.as_str())
-                && !crate::geom::normals::SHADING_ATTRIBUTES.contains(&name.as_str())
-        })
-    {
+    if !allow_lossy && !super::mesh_attribute_losses("fbx", &node.name, mesh).is_empty() {
         return Err(PotError::with_details(
             ErrorCode::UnrepresentableFeature,
             "FBX adapter does not represent mesh custom attributes",

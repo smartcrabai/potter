@@ -714,13 +714,21 @@ fn decode_property(bytes: &[u8], cursor: &mut usize, end: usize) -> Result<Arg> 
             if string_end > end {
                 return Err(import_error("FBX string property is truncated"));
             }
-            let value = std::str::from_utf8(&bytes[*cursor..string_end])
-                .map_err(|_| import_error("FBX string property is not UTF-8"))?
-                .to_owned();
+            let payload = &bytes[*cursor..string_end];
             *cursor = string_end;
-            Arg {
-                value,
-                is_string: true,
+            // `'S'` is text; `'R'` is raw binary data, such as Blender's `FileId`, and is never text.
+            if kind == 'R' {
+                Arg {
+                    value: String::from_utf8_lossy(payload).into_owned(),
+                    is_string: false,
+                }
+            } else {
+                Arg {
+                    value: std::str::from_utf8(payload)
+                        .map_err(|_| import_error("FBX string property is not UTF-8"))?
+                        .to_owned(),
+                    is_string: true,
+                }
             }
         }
         'Y' => {

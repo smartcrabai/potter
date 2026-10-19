@@ -140,7 +140,7 @@ pub(super) fn point_color_values(
                     "corner color layer does not match face corners",
                 ));
             }
-            let mut sums = vec![[0.0; 4]; mesh.positions.len()];
+            let mut sums = vec![[0.0_f32; 4]; mesh.positions.len()];
             let mut counts = vec![0_usize; mesh.positions.len()];
             let mut corner = 0;
             for face in &mesh.faces {
@@ -151,8 +151,9 @@ pub(super) fn point_color_values(
                             "face references a missing vertex",
                         ));
                     };
+                    // Blender mixes CORNER colours in float32 (`ColorGeometry4fMixer::mix_in`).
                     for (sum, value) in sum.iter_mut().zip(layer.values[corner]) {
-                        *sum += value;
+                        *sum += value as f32;
                     }
                     counts[vertex] += 1;
                     corner += 1;
@@ -166,13 +167,14 @@ pub(super) fn point_color_values(
                             "vertex corner count exceeds color average range",
                         )
                     })?;
-                    let divisor = f64::from(count);
+                    // Blender multiplies by the float32 reciprocal of the total weight (`finalize`).
+                    let inverse = 1.0_f32 / count as f32;
                     for value in sum {
-                        *value /= divisor;
+                        *value *= inverse;
                     }
                 }
             }
-            Ok(sums)
+            Ok(sums.into_iter().map(|sum| sum.map(f64::from)).collect())
         }
     }
 }
