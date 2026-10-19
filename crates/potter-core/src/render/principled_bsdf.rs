@@ -97,7 +97,6 @@ fn half_vector_pdf(normal: DVec3, roughness: f64, view: DVec3, light: DVec3) -> 
     pdf_half / (4.0 * v_dot_h).max(1.0e-8)
 }
 
-
 /// Diffuse lobe of the Principled BSDF: Lambert under the dielectric-layering weight, times
 /// reflectance. It depends on the view only (the layering albedo is view-dependent), so an area
 /// light can be integrated against it analytically.
@@ -121,7 +120,10 @@ pub(crate) fn diffuse_coefficient(params: &BsdfParams, normal: DVec3, view: DVec
         }
         None => dielectric_weight,
     };
-    diffuse_albedo(params) * (diffuse_weight / PI) * params.reflectance.clamp(0.0, 1.0)
+    diffuse_albedo(params)
+        * (diffuse_weight / PI)
+        * params.reflectance.clamp(0.0, 1.0)
+        * coat_lower_factor(params, view)
 }
 
 /// Specular (dielectric and metallic) lobes along `light`, times reflectance. Zero when the
@@ -188,15 +190,111 @@ pub(crate) fn specular_coefficient(
         reflected += gain * fresnel * metallic;
     }
 
-    (reflected * common) * params.reflectance.clamp(0.0, 1.0)
+    (reflected * common) * (params.reflectance.clamp(0.0, 1.0) * coat_lower_factor(params, view))
 }
+
+/// Cycles' CLOSURE_WEIGHT_CUTOFF: a coat weight at or below it is not set up.
+const COAT_WEIGHT_CUTOFF: f64 = 1.0e-5;
 
 /// Continuous Principled BSDF times reflectance, the `evaluate / density` estimator's numerator.
 pub(crate) fn evaluate(params: &BsdfParams, normal: DVec3, view: DVec3, light: DVec3) -> DVec3 {
     if normal.dot(light) <= 0.0 {
         return DVec3::ZERO;
     }
-    diffuse_coefficient(params, normal, view) + specular_coefficient(params, normal, view, light)
+    diffuse_coefficient(params, normal, view)
+        + specular_coefficient(params, normal, view, light)
+        + coat_coefficient(params, view, light)
+}
+
+/// The Principled coat: a GGX dielectric reflection lobe over the layers below it, set up as
+/// Cycles' coat block of `principled_bsdf_emission` (`kernel/svm/closure.h`). `albedo` is the
+/// layering albedo `weight · F · gain · E`. `gain` is the multiscatter gain `1 + Fms · (1 - E) / E`
+/// of `microfacet_ggx_preserve_energy`: its darkening of the closure weight cancels the
+/// `energy_scale` of the eval, so the lobe carries `gain` alone.
+#[derive(Clone, Copy, Debug)]
+struct CoatLayer {
+    normal: DVec3,
+    ior: f64,
+    roughness: f64,
+    weight: f64,
+    gain: f64,
+    albedo: f64,
+}
+
+fn coat_layer(params: &BsdfParams, view: DVec3) -> Option<CoatLayer> {
+    let weight = params.coat_weight.max(0.0);
+    if weight <= COAT_WEIGHT_CUTOFF {
+        return None;
+    }
+    let normal = params.coat_normal;
+    let n_dot_v = normal.dot(view);
+    if n_dot_v <= 0.0 {
+        return None;
+    }
+    let ior = params.coat_ior.max(1.0);
+    let roughness = saturate(params.coat_roughness).clamp(MIN_ROUGHNESS, 1.0);
+    let energy = ggx_energy(roughness, n_dot_v).max(1.0e-6);
+    let missing = (1.0 - energy) / energy;
+    let fss = DVec3::splat(fresnel_dielectric_fss(ior));
+    let gain = multiscatter_gain(fss, ggx_energy_average(roughness), missing).x;
+    // Cycles' DIELECTRIC albedo: the `ggx_gen_schlick_ior_s` LUT for ior > 1, where ior 1 has no
+    // Fresnel reflectance at all.
+    let fresnel_albedo = if ior > 1.0 {
+        let f0 = dielectric_f0(ior, 0.5);
+        let z = ((ior - 1.0) / (ior + 1.0)).abs().sqrt();
+        let s = ggx_gen_schlick_ior_s(roughness, n_dot_v, z);
+        f0 + (1.0 - f0) * s
+    } else {
+        0.0
+    };
+    Some(CoatLayer {
+        normal,
+        ior,
+        roughness,
+        weight,
+        gain,
+        albedo: weight * fresnel_albedo * gain * energy,
+    })
+}
+
+/// The factor the coat leaves to the layers below it: Cycles' `closure_layering_weight` of the coat
+/// albedo, times the tint `mix(1, tint^(1/cos θt), coat weight)` (`kernel/svm/closure.h`). The
+/// diffuse, specular, metallic and transmission lobes and the emission all scale by it.
+pub(crate) fn coat_lower_factor(params: &BsdfParams, view: DVec3) -> DVec3 {
+    let Some(coat) = coat_layer(params, view) else {
+        return DVec3::ONE;
+    };
+    let layering = saturate(1.0 - coat.albedo);
+    let cos_ni = coat.normal.dot(view);
+    let cos_nt = (1.0 - (1.0 / coat.ior).powi(2) * (1.0 - cos_ni * cos_ni))
+        .max(1.0e-8)
+        .sqrt();
+    let tint = DVec3::from_array(params.coat_tint).max(DVec3::ZERO);
+    let transmitted = tint.powf(1.0 / cos_nt);
+    DVec3::ONE.lerp(transmitted, coat.weight) * layering
+}
+
+/// The coat lobe along `light`, times reflectance. It is zero when the coat is off or the light is
+/// below the coat's normal.
+pub(crate) fn coat_coefficient(params: &BsdfParams, view: DVec3, light: DVec3) -> DVec3 {
+    let Some(coat) = coat_layer(params, view) else {
+        return DVec3::ZERO;
+    };
+    let normal = coat.normal;
+    let n_dot_v = normal.dot(view);
+    let n_dot_l = normal.dot(light);
+    if n_dot_l <= 0.0 {
+        return DVec3::ZERO;
+    }
+    let half = (view + light).normalize_or_zero();
+    let n_dot_h = normal.dot(half).max(0.0);
+    let v_dot_h = view.dot(half).max(0.0);
+    let alpha_squared = ggx_alpha_squared(coat.roughness);
+    let common = ggx_distribution(alpha_squared, n_dot_h)
+        * ggx_height_correlated_g2(alpha_squared, n_dot_v, n_dot_l)
+        / (4.0 * n_dot_v * n_dot_l).max(1.0e-8);
+    let fresnel = fresnel_dielectric(v_dot_h, coat.ior);
+    DVec3::splat(coat.weight * coat.gain * fresnel * common) * params.reflectance.clamp(0.0, 1.0)
 }
 
 /// The base colour clamped to 1 (Cycles' `clamped_base_color`, used by the F82 metal lobe).

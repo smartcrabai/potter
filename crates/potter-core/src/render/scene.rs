@@ -31,7 +31,9 @@ use super::{
         point_intensity, spot_attenuation,
     },
     path::object_for_index,
-    principled_bsdf::{diffuse_coefficient, specular_coefficient},
+    principled_bsdf::{
+        coat_coefficient, coat_lower_factor, diffuse_coefficient, specular_coefficient,
+    },
     raster::{
         AlphaMode, Line, Mode, SurfaceHit, SurfaceShader, Triangle, blend_color,
         blend_corner_normals, blend_uv,
@@ -2008,7 +2010,9 @@ fn shade(
     // EEVEE nor Cycles clamps the strength (gpu_shader_material_principled.glsl:179,
     // intern/cycles/kernel/svm/closure.h:206-207).
     let emission = if matches!(mode, Mode::Beauty) {
-        DVec3::from_array(params.emission_color) * params.emission_strength
+        DVec3::from_array(params.emission_color)
+            * params.emission_strength
+            * coat_lower_factor(params, view)
     } else {
         DVec3::ZERO
     };
@@ -2158,7 +2162,8 @@ fn light_contribution(
             // scales it. The specular lobe is evaluated towards the emitter centre.
             let toward_centre = (position - point).normalize_or_zero();
             (diffuse_coefficient(params, normal, view)
-                + specular_coefficient(params, normal, view, toward_centre))
+                + specular_coefficient(params, normal, view, toward_centre)
+                + coat_coefficient(params, view, toward_centre))
                 * color
                 * (irradiance * visible_weight / total_weight)
         }
@@ -2267,7 +2272,9 @@ fn punctual_radiance(
     if normal_light_cosine <= 0.0 {
         return DVec3::ZERO;
     }
-    (diffuse_coefficient(params, normal, view) + specular_coefficient(params, normal, view, light))
+    (diffuse_coefficient(params, normal, view)
+        + specular_coefficient(params, normal, view, light)
+        + coat_coefficient(params, view, light))
         * color
         * (intensity * normal_light_cosine)
 }

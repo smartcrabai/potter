@@ -14,7 +14,9 @@ use crate::{
     },
 };
 
-use super::principled_bsdf::{continuous_density, evaluate as evaluate_bsdf, lobe_probabilities};
+use super::principled_bsdf::{
+    coat_lower_factor, continuous_density, evaluate as evaluate_bsdf, lobe_probabilities,
+};
 use super::{
     bvh::{Bvh, BvhHit},
     light_model::{
@@ -915,7 +917,8 @@ fn trace_path(
             alpha = 1.0;
             radiance += throughput
                 * DVec3::from_array(surface.params.emission_color)
-                * surface.params.emission_strength.max(0.0);
+                * surface.params.emission_strength.max(0.0)
+                * coat_lower_factor(&surface.params, -direction);
             break;
         }
         if rng.next_f64() >= surface.params.alpha.clamp(0.0, 1.0) {
@@ -927,7 +930,8 @@ fn trace_path(
         alpha = 1.0;
         radiance += throughput
             * DVec3::from_array(surface.params.emission_color)
-            * surface.params.emission_strength;
+            * surface.params.emission_strength
+            * coat_lower_factor(&surface.params, -direction);
         radiance += throughput
             * direct_lighting(
                 doc,
@@ -1795,7 +1799,7 @@ enum BsdfSample {
 }
 
 fn sample_bsdf(params: &BsdfParams, normal: DVec3, view: DVec3, rng: &mut Pcg32) -> BsdfSample {
-    let probabilities = lobe_probabilities(params);
+    let probabilities = lobe_probabilities(params, view);
     let choice = rng.next_f64();
     if choice < probabilities.transmission {
         let direction = refract(-view, normal, 1.0 / params.ior.max(1.0e-3))
@@ -1807,14 +1811,20 @@ fn sample_bsdf(params: &BsdfParams, normal: DVec3, view: DVec3, rng: &mut Pcg32)
         );
         let weight = tint
             * (params.reflectance.clamp(0.0, 1.0) * params.transmission.clamp(0.0, 1.0)
-                / probabilities.transmission.max(1.0e-8));
+                / probabilities.transmission.max(1.0e-8))
+            * coat_lower_factor(params, view);
         return BsdfSample::Delta { direction, weight };
     }
-    let direction = if choice >= probabilities.transmission + probabilities.diffuse {
-        let half_vector = sample_ggx_half(normal, params.roughness, rng);
+    let diffuse_end = probabilities.transmission + probabilities.diffuse;
+    let coat_end = diffuse_end + probabilities.coat;
+    let direction = if choice < diffuse_end {
+        sample_cosine_hemisphere(normal, rng).0
+    } else if choice < coat_end {
+        let half_vector = sample_ggx_half(params.coat_normal, params.coat_roughness, rng);
         reflect(-view, half_vector).normalize_or_zero()
     } else {
-        sample_cosine_hemisphere(normal, rng).0
+        let half_vector = sample_ggx_half(normal, params.roughness, rng);
+        reflect(-view, half_vector).normalize_or_zero()
     };
     // Estimator `f cos / p_mix`: the density is the lobe mixture, not the branch's own lobe.
     let pdf = continuous_density(params, normal, view, direction);
