@@ -13,7 +13,7 @@ use serde_json::Value;
 
 use potter_core::geom::{
     Mesh,
-    sculpt::{self, Brush, Falloff, Stroke, StrokeSample},
+    sculpt::{self, Brush, DabBrush, Falloff, Stroke, StrokeSample},
 };
 
 const TOLERANCE: f64 = 5e-6;
@@ -87,13 +87,13 @@ fn array<T>(
 fn max_error_against_blender(name: &str, text: &str) -> Result<f64, Box<dyn Error>> {
     let document: Value = serde_json::from_str(text)?;
     let brush = match document["brush"].as_str() {
-        Some("clay_strips") => Brush::ClayStrips,
-        Some("inflate") => Brush::Inflate,
-        Some("layer") => Brush::Layer,
+        Some("clay_strips") => Brush::Dab(DabBrush::ClayStrips),
+        Some("inflate") => Brush::Dab(DabBrush::Inflate),
+        Some("layer") => Brush::Dab(DabBrush::Layer),
         other => return Err(format!("{name}: unknown brush {other:?}").into()),
     };
     // Blender's Clay Strips brush uses the smoother falloff preset; the others use smooth.
-    let falloff = if matches!(brush, Brush::ClayStrips) {
+    let falloff = if matches!(brush, Brush::Dab(DabBrush::ClayStrips)) {
         Falloff::Smoother
     } else {
         Falloff::Smooth

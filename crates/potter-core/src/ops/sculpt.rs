@@ -644,26 +644,26 @@ pub(super) fn parse_stroke(
     operation: &Map<String, Value>,
 ) -> Result<sculpt_geom::Stroke> {
     let brush = match string_field(engine, operation, "brush")?.as_str() {
-        "draw" => sculpt_geom::Brush::Draw,
-        "clay_strips" => sculpt_geom::Brush::ClayStrips,
-        "inflate" => sculpt_geom::Brush::Inflate,
-        "grab" => sculpt_geom::Brush::Grab,
-        "smooth" => sculpt_geom::Brush::Smooth,
-        "flatten" => sculpt_geom::Brush::Flatten,
-        "pinch" => sculpt_geom::Brush::Pinch,
-        "crease" => sculpt_geom::Brush::Crease,
-        "layer" => sculpt_geom::Brush::Layer,
-        "snake_hook" => sculpt_geom::Brush::SnakeHook,
-        "thumb" => sculpt_geom::Brush::Thumb,
-        "rotate" => sculpt_geom::Brush::Rotate,
-        "nudge" => sculpt_geom::Brush::Nudge,
-        "blob" => sculpt_geom::Brush::Blob,
-        "scrape" => sculpt_geom::Brush::Scrape,
-        "fill" => sculpt_geom::Brush::Fill,
-        "draw_sharp" => sculpt_geom::Brush::DrawSharp,
-        "elastic_deform" => sculpt_geom::Brush::Elastic,
-        "pose_lite" => sculpt_geom::Brush::PoseLite,
-        "boundary_lite" => sculpt_geom::Brush::BoundaryLite,
+        "draw" => sculpt_geom::Brush::Vertex(sculpt_geom::VertexBrush::Draw),
+        "clay_strips" => sculpt_geom::Brush::Dab(sculpt_geom::DabBrush::ClayStrips),
+        "inflate" => sculpt_geom::Brush::Dab(sculpt_geom::DabBrush::Inflate),
+        "grab" => sculpt_geom::Brush::Vertex(sculpt_geom::VertexBrush::Grab),
+        "smooth" => sculpt_geom::Brush::Vertex(sculpt_geom::VertexBrush::Smooth),
+        "flatten" => sculpt_geom::Brush::Vertex(sculpt_geom::VertexBrush::Flatten),
+        "pinch" => sculpt_geom::Brush::Vertex(sculpt_geom::VertexBrush::Pinch),
+        "crease" => sculpt_geom::Brush::Vertex(sculpt_geom::VertexBrush::Crease),
+        "layer" => sculpt_geom::Brush::Dab(sculpt_geom::DabBrush::Layer),
+        "snake_hook" => sculpt_geom::Brush::Vertex(sculpt_geom::VertexBrush::SnakeHook),
+        "thumb" => sculpt_geom::Brush::Vertex(sculpt_geom::VertexBrush::Thumb),
+        "rotate" => sculpt_geom::Brush::Vertex(sculpt_geom::VertexBrush::Rotate),
+        "nudge" => sculpt_geom::Brush::Vertex(sculpt_geom::VertexBrush::Nudge),
+        "blob" => sculpt_geom::Brush::Vertex(sculpt_geom::VertexBrush::Blob),
+        "scrape" => sculpt_geom::Brush::Vertex(sculpt_geom::VertexBrush::Scrape),
+        "fill" => sculpt_geom::Brush::Vertex(sculpt_geom::VertexBrush::Fill),
+        "draw_sharp" => sculpt_geom::Brush::Vertex(sculpt_geom::VertexBrush::DrawSharp),
+        "elastic_deform" => sculpt_geom::Brush::Vertex(sculpt_geom::VertexBrush::Elastic),
+        "pose_lite" => sculpt_geom::Brush::Vertex(sculpt_geom::VertexBrush::PoseLite),
+        "boundary_lite" => sculpt_geom::Brush::Vertex(sculpt_geom::VertexBrush::BoundaryLite),
         other => {
             return Err(engine.error(
                 ErrorCode::InvalidOperation,
@@ -684,7 +684,7 @@ pub(super) fn parse_stroke(
     }
     // Blender 5.2.2's essentials Clay Strips brush uses the SMOOTHER falloff preset, the other
     // dab brushes SMOOTH. Potter's stroke carries no brush curve, so the default follows the brush.
-    let default_falloff = if brush == sculpt_geom::Brush::ClayStrips {
+    let default_falloff = if brush == sculpt_geom::Brush::Dab(sculpt_geom::DabBrush::ClayStrips) {
         "smoother"
     } else {
         "smooth"

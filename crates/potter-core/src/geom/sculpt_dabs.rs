@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 
 use glam::{DVec2, DVec3};
 
-use super::sculpt::{Brush, Falloff, Stroke, invalid};
+use super::sculpt::{DabBrush, Falloff, Stroke, invalid};
 use crate::{error::Result, geom::Mesh};
 
 /// Clay Strips `plane_offset` default: the plane sits this many radii above the area center.
@@ -86,6 +86,7 @@ fn symmetry_feather(center: DVec3, radius: f64, passes: &[DVec3]) -> f64 {
 pub(super) fn apply_dabs(
     mesh: &mut Mesh,
     stroke: &Stroke,
+    dab: DabBrush,
     normals: &BTreeMap<u32, DVec3>,
     masks: &BTreeMap<u32, f64>,
 ) -> Result<bool> {
@@ -118,8 +119,8 @@ pub(super) fn apply_dabs(
         let alpha = sample.strength * sample.strength;
         let feather = symmetry_feather(center, sample.radius, &passes);
         let grab = previous.replace(center).map(|last| center - last);
-        match stroke.brush {
-            Brush::ClayStrips => {
+        match dab {
+            DabBrush::ClayStrips => {
                 // Clay Strips has no strip direction before the second dab, and `calc_node_mask`
                 // returns no nodes for a zero grab delta.
                 let Some(grab) = grab.filter(|grab| *grab != DVec3::ZERO) else {
@@ -141,7 +142,7 @@ pub(super) fn apply_dabs(
                     },
                 );
             }
-            Brush::Inflate => {
+            DabBrush::Inflate => {
                 // Inflate's `brush_strength` case: 0.25 * alpha * pressure for a positive flip.
                 let strength = 0.25 * alpha * sample.pressure * feather;
                 for sign in &passes {
@@ -156,7 +157,7 @@ pub(super) fn apply_dabs(
                     );
                 }
             }
-            Brush::Layer => {
+            DabBrush::Layer => {
                 let strength = alpha * sample.pressure * feather;
                 for sign in &passes {
                     layer_dab(
@@ -172,7 +173,6 @@ pub(super) fn apply_dabs(
                     );
                 }
             }
-            _ => unreachable!("apply_dabs receives only dab brushes"),
         }
     }
     let changed = current
