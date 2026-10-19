@@ -179,6 +179,16 @@ impl State {
         self.disk_link(key.1, key);
     }
 
+    /// Blender `BM_edge_create(bm, start, end)`: a new edge's `v1` is `start`. An existing edge
+    /// (`BM_CREATE_NO_DOUBLE`) keeps its stored direction.
+    fn attach_created_edge(&mut self, start: usize, end: usize) {
+        let key = edge_key_usize(start, end);
+        if !self.disk[start].contains(&key) {
+            self.edge_start.insert(key, start);
+        }
+        self.disk_attach(key);
+    }
+
     /// Blender `bmesh_disk_edge_remove` at `at`.
     fn disk_unlink(&mut self, at: usize, key: EdgeKey) {
         self.disk[at].retain(|&edge| edge != key);
@@ -3003,7 +3013,7 @@ fn intersect_tri_pair(
     if verts_a.len() == 2 {
         let edge = edge_key_usize(verts_a[0], verts_a[1]);
         state.wire_edges.insert(edge);
-        state.disk_attach(edge);
+        state.attach_created_edge(verts_a[0], verts_a[1]);
         if !face_has_edge(&state.faces[face_a], edge) {
             let cuts = state.face_cuts.entry(face_a).or_default();
             if !cuts.contains(&edge) {
@@ -3014,7 +3024,7 @@ fn intersect_tri_pair(
     if verts_b.len() == 2 {
         let edge = edge_key_usize(verts_b[0], verts_b[1]);
         state.wire_edges.insert(edge);
-        state.disk_attach(edge);
+        state.attach_created_edge(verts_b[0], verts_b[1]);
         if !face_has_edge(&state.faces[face_b], edge) {
             let cuts = state.face_cuts.entry(face_b).or_default();
             if !cuts.contains(&edge) {
@@ -3390,7 +3400,7 @@ fn split_faces(state: &mut State) {
             &positions,
         );
         for &(a, b) in &connects {
-            state.disk_attach(edge_key_usize(a, b));
+            state.attach_created_edge(a, b);
         }
         let mut edge_net = net;
         edge_net.extend(connects);
@@ -3704,11 +3714,16 @@ fn dissolve_intersection_vertices(state: &mut State) {
         }
         state.edge_orig.remove(&edge_a);
         state.edge_orig.remove(&edge_b);
+        // Blender `bmesh_kernel_join_edge_kill_vert` replaces `vertex` by `tv` in place in the kept
+        // edge, so the survivor keeps that edge's start (measured: `b`, never `tv`).
+        let start_b = state.edge_start.remove(&edge_b);
         state.edge_start.remove(&edge_a);
-        state.edge_start.remove(&edge_b);
+        if !merges {
+            let new_start = if start_b == Some(vertex) { tv } else { b };
+            state.edge_start.insert(new_edge, new_start);
+        }
         if let Some(source) = source {
             state.edge_orig.insert(new_edge, source);
-            state.edge_start.insert(new_edge, tv);
         }
         state.wire_edges.remove(&edge_a);
         state.wire_edges.remove(&edge_b);
