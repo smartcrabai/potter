@@ -45,6 +45,21 @@ BRUSH_NAMES = {
     "clay_strips": "Clay Strips",
     "inflate": "Inflate/Deflate",
     "layer": "Layer",
+    "draw": "Draw",
+    "draw_sharp": "Draw Sharp",
+    "blob": "Blob",
+    "nudge": "Nudge",
+    "crease": "Crease Polish",
+    "pinch": "Pinch/Magnify",
+    "smooth": "Smooth",
+    "flatten": "Flatten/Contrast",
+    "fill": "Fill/Deepen",
+    "scrape": "Scrape/Fill",
+    "grab": "Grab",
+    "snake_hook": "Snake Hook",
+    "thumb": "Thumb",
+    "rotate": "Twist",
+    "elastic_deform": "Elastic Grab",
 }
 STRIP_DIRECTION = Vector((0.8, 0.6, 0.0)).normalized()
 
@@ -225,6 +240,22 @@ def cases():
             0.4,
             False,
         ),
+        ("draw_sphere", "draw", "sphere", sphere_dabs(4, 0.4, 0.5, [1.0, 1.0, 0.5, 1.0]), 0.5, 0.4, False),
+        ("draw_sphere_mirror", "draw", "sphere", sphere_dabs(3, 0.4, 0.5, [1.0]), 0.5, 0.4, True),
+        ("draw_sharp_sphere", "draw_sharp", "sphere", sphere_dabs(4, 0.4, 0.5, [1.0, 1.0, 0.5, 1.0]), 0.5, 0.4, False),
+        ("blob_sphere", "blob", "sphere", sphere_dabs(4, 0.4, 0.5, [1.0, 0.8, 1.0, 1.0]), 0.5, 0.4, False),
+        ("nudge_grid", "nudge", "grid", strip_dabs(4, 0.08, 0.5, 0.5, [1.0]), 0.5, 0.5, False),
+        ("crease_sphere", "crease", "sphere", sphere_dabs(3, 0.5, 0.25, [1.0]), 0.25, 0.5, False),
+        ("pinch_sphere", "pinch", "sphere", sphere_dabs(4, 0.4, 0.5, [1.0, 0.5, 1.0, 1.0]), 0.5, 0.4, False),
+        ("smooth_sphere", "smooth", "sphere", sphere_dabs(3, 0.5, 0.7, [1.0]), 0.7, 0.5, False),
+        ("flatten_sphere", "flatten", "sphere", sphere_dabs(4, 0.4, 0.5, [1.0]), 0.5, 0.4, False),
+        ("fill_sphere", "fill", "sphere", sphere_dabs(4, 0.4, 0.7, [1.0, 0.5, 1.0, 1.0]), 0.7, 0.4, False),
+        ("scrape_sphere", "scrape", "sphere", sphere_dabs(4, 0.4, 0.7, [1.0, 0.5, 1.0, 1.0]), 0.7, 0.4, False),
+        ("grab_grid", "grab", "grid", strip_dabs(4, 0.08, 0.5, 0.4, [1.0]), 0.4, 0.5, False),
+        ("snake_hook_grid", "snake_hook", "grid", strip_dabs(4, 0.08, 0.5, 1.0, [1.0]), 1.0, 0.5, False),
+        ("thumb_grid", "thumb", "grid", strip_dabs(4, 0.08, 0.5, 0.5, [1.0]), 0.5, 0.5, False),
+        ("rotate_sphere", "rotate", "sphere", sphere_dabs(3, 0.5, 0.6, [1.0]), 0.6, 0.5, False),
+        ("elastic_grab_grid", "elastic_deform", "grid", strip_dabs(4, 0.08, 0.5, 0.5, [1.0]), 0.5, 0.5, False),
     ]
 
 
@@ -233,9 +264,16 @@ def generate(output_dir):
         target.brushes = list(source.brushes)
     set_top_ortho_view()
     for name, brush_key, kind, dabs, strength, radius, mirror in cases():
-        case = run_case(
-            name, brush_key, kind, dabs, strength, radius, mirror, mask=MASKS.get(name)
-        )
+        # A failing case is recorded in its own error file, so the other brushes still generate.
+        try:
+            case = run_case(
+                name, brush_key, kind, dabs, strength, radius, mirror, mask=MASKS.get(name)
+            )
+        except AssertionError:
+            with open(os.path.join(output_dir, name + ".error.txt"), "w") as handle:
+                handle.write(traceback.format_exc())
+            print("FAILED", name, flush=True)
+            continue
         path = os.path.join(output_dir, name + ".json")
         with open(path, "w") as handle:
             json.dump(case, handle)
