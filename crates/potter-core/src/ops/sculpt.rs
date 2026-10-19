@@ -487,12 +487,20 @@ pub(super) fn parse_stroke(
             "/falloff",
         ));
     }
+    // Blender 5.2.2's essentials Clay Strips brush uses the SMOOTHER falloff preset, the other
+    // dab brushes SMOOTH. Potter's stroke carries no brush curve, so the default follows the brush.
+    let default_falloff = if brush == sculpt_geom::Brush::ClayStrips {
+        "smoother"
+    } else {
+        "smooth"
+    };
     let falloff = match operation
         .get("falloff")
         .and_then(Value::as_str)
-        .unwrap_or("smooth")
+        .unwrap_or(default_falloff)
     {
         "smooth" => sculpt_geom::Falloff::Smooth,
+        "smoother" => sculpt_geom::Falloff::Smoother,
         "sphere" => sculpt_geom::Falloff::Sphere,
         "root" => sculpt_geom::Falloff::Root,
         "sharp" => sculpt_geom::Falloff::Sharp,

@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 
 use crate::{
     error::{PotError, Result},
-    geom::Mesh,
+    geom::{Mesh, normals, sculpt_dabs},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,6 +32,15 @@ pub enum Brush {
     BoundaryLite,
 }
 
+impl Brush {
+    /// Brushes that apply one dab per sample, in order (`sculpt_dabs`), instead of evaluating each
+    /// vertex once against the whole stroke.
+    #[must_use]
+    pub fn is_dab_brush(self) -> bool {
+        matches!(self, Self::ClayStrips | Self::Inflate | Self::Layer)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Falloff {
     Smooth,
@@ -40,6 +49,8 @@ pub enum Falloff {
     Sharp,
     Linear,
     Constant,
+    /// Blender's `BRUSH_CURVE_SMOOTHER` (Clay Strips default): smootherstep of `1 - t`.
+    Smoother,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -108,11 +119,23 @@ pub fn apply_stroke_with_dyntopo(
     {
         return Err(invalid("dyntopo edge length must be finite and positive"));
     }
+    if stroke.brush.is_dab_brush() && !stroke.symmetry.is_empty() {
+        return Err(invalid(
+            "clay_strips, inflate, and layer do not support symmetry yet",
+        ));
+    }
     let positions = vertex_positions(mesh);
     let normals = vertex_normals(mesh, &positions);
     let adjacency = vertex_adjacency(mesh);
     let boundary_adjacency = boundary_adjacency(mesh);
     let mask_values = read_scalar_attribute(mesh, "sculpt.mask")?;
+    if stroke.brush.is_dab_brush() {
+        let changed = sculpt_dabs::apply_dabs(mesh, stroke, &normals, &mask_values)?;
+        return Ok(match dyntopo_edge_length {
+            Some(edge_length) => changed | dyntopo_edges_under_brush(mesh, stroke, edge_length)?,
+            None => changed,
+        });
+    }
     let mirrors = mirrored_samples(stroke)?;
     let (first_sample, last_sample) = stroke
         .samples
@@ -225,14 +248,12 @@ fn deform_vertex(
         stroke_motion
     };
     match stroke.brush {
-        Brush::Draw | Brush::ClayStrips | Brush::Inflate | Brush::Layer => {
-            let multiplier = if stroke.brush == Brush::ClayStrips {
-                0.75
-            } else {
-                1.0
-            };
+        Brush::Draw => {
             let deterministic = deterministic_scale(stroke.seed, point, &stroke.symmetry);
-            point + normal * (influence * multiplier * deterministic)
+            point + normal * (influence * deterministic)
+        }
+        Brush::ClayStrips | Brush::Inflate | Brush::Layer => {
+            unreachable!("dab brushes are evaluated by sculpt_dabs::apply_dabs")
         }
         Brush::Grab => point + sample_delta * influence,
         Brush::Smooth => {
@@ -974,40 +995,41 @@ fn average_neighbor_position(
     }
 }
 
+/// Blender's vertex normals (`normals_calc_verts`): each face's Newell normal, weighted by the
+/// approximate corner angle at the vertex, then normalized. A vertex without faces takes the
+/// direction of its position, as in Blender.
 fn vertex_normals(
     mesh: &Mesh,
     positions: &std::collections::BTreeMap<u32, DVec3>,
 ) -> std::collections::BTreeMap<u32, DVec3> {
-    let mut normals = std::collections::BTreeMap::<u32, DVec3>::new();
+    let mut sums = std::collections::BTreeMap::<u32, DVec3>::new();
     for face in &mesh.faces {
-        if face.vertices.len() < 3 {
+        let Some(points) = face
+            .vertices
+            .iter()
+            .map(|id| positions.get(id).copied())
+            .collect::<Option<Vec<DVec3>>>()
+        else {
+            continue;
+        };
+        if points.len() < 3 {
             continue;
         }
-        let Some(a) = positions.get(&face.vertices[0]).copied() else {
-            continue;
-        };
-        let Some(b) = positions.get(&face.vertices[1]).copied() else {
-            continue;
-        };
-        let Some(c) = positions.get(&face.vertices[2]).copied() else {
-            continue;
-        };
-        let normal = (b - a).cross(c - a);
-        for id in &face.vertices {
-            *normals.entry(*id).or_default() += normal;
+        let normal = normals::face_normal(&points);
+        for (corner, id) in face.vertices.iter().enumerate() {
+            *sums.entry(*id).or_default() += normal * normals::corner_angle(&points, corner);
         }
     }
-    for normal in normals.values_mut() {
-        *normal = if normal.length_squared() > 0.0 {
-            normal.normalize()
-        } else {
-            DVec3::Z
-        };
-    }
-    for vertex in &mesh.vertices {
-        normals.entry(vertex.id).or_insert(DVec3::Z);
-    }
-    normals
+    mesh.vertices
+        .iter()
+        .map(|vertex| {
+            let normal = match sums.get(&vertex.id) {
+                Some(sum) => sum.normalize_or_zero(),
+                None => vertex.co.normalize_or_zero(),
+            };
+            (vertex.id, normal)
+        })
+        .collect()
 }
 
 fn read_scalar_attribute(mesh: &Mesh, name: &str) -> Result<std::collections::BTreeMap<u32, f64>> {
@@ -1083,6 +1105,10 @@ impl Falloff {
             Self::Sharp => (1.0 - t).powi(2),
             Self::Linear => 1.0 - t,
             Self::Constant => 1.0,
+            Self::Smoother => {
+                let p = 1.0 - t;
+                p * p * p * (p * (6.0 * p - 15.0) + 10.0)
+            }
         }
     }
 }
