@@ -19,8 +19,8 @@ use std::collections::BTreeMap;
 
 use glam::{DVec2, DVec3};
 
-use super::sculpt::{DabBrush, Falloff, Stroke, invalid};
-use crate::{error::Result, geom::Mesh};
+use super::sculpt::{DabBrush, Falloff, Stroke};
+use crate::geom::Mesh;
 
 /// Clay Strips `plane_offset` default: the plane sits this many radii above the area center.
 const CLAY_STRIPS_PLANE_OFFSET: f64 = 0.15;
@@ -34,18 +34,17 @@ const LAYER_HEIGHT: f64 = 0.05;
 /// Layer `hardness` default.
 const LAYER_HARDNESS: f64 = 0.35;
 
-/// Blender's `symm` bit mask for the stroke's mirror axes: X = 1, Y = 2, Z = 4.
-fn symmetry_mask(axes: &[String]) -> Result<u8> {
-    let mut mask = 0_u8;
-    for axis in axes {
-        mask |= match axis.as_str() {
+/// Blender's `symm` bit mask for the stroke's mirror axes: X = 1, Y = 2, Z = 4. `validate_stroke`
+/// has already rejected any other axis name, so an unknown name contributes no bit.
+fn symmetry_mask(axes: &[String]) -> u8 {
+    axes.iter().fold(0, |mask, axis| {
+        mask | match axis.as_str() {
             "x" => 1,
             "y" => 2,
             "z" => 4,
-            _ => return Err(invalid("symmetry axes must be x, y, or z")),
-        };
-    }
-    Ok(mask)
+            _ => 0,
+        }
+    })
 }
 
 /// Blender's `is_symmetry_iteration_valid` (`paint_intern.hh`): the symmetry passes of a `symm`
@@ -87,16 +86,11 @@ pub(super) fn apply_dabs(
     mesh: &mut Mesh,
     stroke: &Stroke,
     dab: DabBrush,
-    normals: &BTreeMap<u32, DVec3>,
+    normals: &[DVec3],
     masks: &BTreeMap<u32, f64>,
-) -> Result<bool> {
-    let passes = symmetry_passes(symmetry_mask(&stroke.symmetry)?);
+) -> bool {
+    let passes = symmetry_passes(symmetry_mask(&stroke.symmetry));
     let original: Vec<DVec3> = mesh.vertices.iter().map(|vertex| vertex.co).collect();
-    let stroke_normals: Vec<DVec3> = mesh
-        .vertices
-        .iter()
-        .map(|vertex| normals.get(&vertex.id).copied().unwrap_or(DVec3::Z))
-        .collect();
     // Blender's `fill_factor_from_hide_and_mask`: a masked vertex keeps `1 - mask` of each dab.
     let mask_factors: Vec<f64> = mesh
         .vertices
@@ -130,7 +124,7 @@ pub(super) fn apply_dabs(
                 let strength = 0.3 * alpha * sample.pressure.powf(1.5) * feather;
                 clay_strips_dab(
                     &mut current,
-                    &stroke_normals,
+                    normals,
                     &mask_factors,
                     stroke.falloff,
                     &passes,
@@ -148,7 +142,7 @@ pub(super) fn apply_dabs(
                 for sign in &passes {
                     inflate_dab(
                         &mut current,
-                        &stroke_normals,
+                        normals,
                         &mask_factors,
                         stroke.falloff,
                         center * *sign,
@@ -163,7 +157,7 @@ pub(super) fn apply_dabs(
                     layer_dab(
                         &mut current,
                         &original,
-                        &stroke_normals,
+                        normals,
                         &mut layer_displacement,
                         &mask_factors,
                         stroke.falloff,
@@ -184,7 +178,7 @@ pub(super) fn apply_dabs(
             vertex.co = co;
         }
     }
-    Ok(changed)
+    changed
 }
 
 /// One Clay Strips dab: the stroke-relative grab delta, dab center, radius, and bstrength.

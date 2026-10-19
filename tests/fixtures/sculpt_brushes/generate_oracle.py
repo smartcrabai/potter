@@ -127,13 +127,17 @@ def make_object(kind):
     return ob
 
 
-def run_case(name, brush_key, kind, dabs, strength, radius, mirror=False):
+def run_case(name, brush_key, kind, dabs, strength, radius, mirror=False, mask=None):
     window, area, region, rv3d = view_context()
     ob = make_object(kind)
     bpy.context.view_layer.objects.active = ob
     base = [list(v.co) for v in ob.data.vertices]
     faces = [list(p.vertices) for p in ob.data.polygons]
     ob.data.use_mirror_x = mirror
+    if mask is not None:
+        attribute = ob.data.attributes.new(".sculpt_mask", "FLOAT", "POINT")
+        for vertex in ob.data.vertices:
+            attribute.data[vertex.index].value = mask(vertex.co)
     with bpy.context.temp_override(window=window, area=area, region=region):
         bpy.ops.object.mode_set(mode="SCULPT")
         ts = bpy.context.tool_settings
@@ -180,7 +184,7 @@ def run_case(name, brush_key, kind, dabs, strength, radius, mirror=False):
     result_positions = [list(v.co) for v in ob.data.vertices]
     moved = sum(1 for a, b in zip(base, result_positions) if a != b)
     assert moved > 0, f"{name}: stroke changed no vertices"
-    return {
+    case = {
         "name": name,
         "brush": brush_key,
         "strength": strength,
@@ -191,6 +195,14 @@ def run_case(name, brush_key, kind, dabs, strength, radius, mirror=False):
         "faces": faces,
         "result": result_positions,
     }
+    if mask is not None:
+        case["mask"] = [mask(Vector(co)) for co in base]
+    return case
+
+
+# Per-case sculpt masks, as a function of the vertex position. Written to Blender's `.sculpt_mask` attribute
+# and recorded in the fixture as the per-vertex mask values.
+MASKS = {"layer_sphere_masked": lambda co: 0.6 if co.x > 0.0 else 0.25}
 
 
 def cases():
@@ -201,6 +213,7 @@ def cases():
         ("layer_sphere_clamp", "layer", "sphere", sphere_dabs(12, 0.4, 1.0, [1.0]), 1.0, 0.4, False),
         ("layer_sphere_mirror", "layer", "sphere", sphere_dabs(4, 0.45, 0.8, [1.0, 0.5, 0.8, 1.0]), 0.8, 0.45, True),
         ("layer_sphere", "layer", "sphere", sphere_dabs(5, 0.45, 0.8, [1.0, 0.5, 1.0, 0.8, 1.0]), 0.8, 0.45, False),
+        ("layer_sphere_masked", "layer", "sphere", sphere_dabs(5, 0.45, 0.8, [1.0, 0.5, 1.0, 0.8, 1.0]), 0.8, 0.45, False),
         ("clay_strips_grid", "clay_strips", "grid", strip_dabs(4, 0.08, 0.5, 1.0, [1.0]), 1.0, 0.5, False),
         ("clay_strips_grid_mirror", "clay_strips", "grid", strip_dabs(4, 0.08, 0.5, 1.0, [1.0]), 1.0, 0.5, True),
         (
@@ -220,7 +233,9 @@ def generate(output_dir):
         target.brushes = list(source.brushes)
     set_top_ortho_view()
     for name, brush_key, kind, dabs, strength, radius, mirror in cases():
-        case = run_case(name, brush_key, kind, dabs, strength, radius, mirror)
+        case = run_case(
+            name, brush_key, kind, dabs, strength, radius, mirror, mask=MASKS.get(name)
+        )
         path = os.path.join(output_dir, name + ".json")
         with open(path, "w") as handle:
             json.dump(case, handle)

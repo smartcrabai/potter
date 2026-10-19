@@ -6,10 +6,10 @@
 //! the largest difference measured against these fixtures is 7.1e-7 (Clay Strips), so the tolerance
 //! of 5e-6 leaves about a sevenfold margin.
 
-use std::error::Error;
+use std::{error::Error, fs, path::Path, process::Command};
 
 use glam::DVec3;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use potter_core::geom::{
     Mesh,
@@ -54,6 +54,10 @@ const FIXTURES: &[(&str, &str)] = &[
     (
         "clay_strips_grid_pressure",
         include_str!("fixtures/sculpt_brushes/clay_strips_grid_pressure.json"),
+    ),
+    (
+        "layer_sphere_masked",
+        include_str!("fixtures/sculpt_brushes/layer_sphere_masked.json"),
     ),
 ];
 
@@ -143,6 +147,19 @@ fn max_error_against_blender(name: &str, text: &str) -> Result<f64, Box<dyn Erro
         delta: None,
     };
     let mut mesh = Mesh::from_positions_and_faces(base.clone(), faces)?;
+    if document["mask"].is_array() {
+        let values = array(&document["mask"], number)?;
+        let mask: serde_json::Map<String, Value> = mesh
+            .vertices
+            .iter()
+            .zip(values)
+            .map(|(vertex, value)| (format!("v{}", vertex.id), json!(value)))
+            .collect();
+        mesh.attributes.insert(
+            "sculpt.mask".to_owned(),
+            json!({"domain": "vertices", "values": mask}),
+        );
+    }
     sculpt::apply_stroke(&mut mesh, &stroke)?;
     if mesh.vertices.len() != result.len() {
         return Err(format!("{name}: vertex count changed").into());
@@ -172,5 +189,103 @@ fn dab_brushes_match_blender_5_2_2() -> Result<(), Box<dyn Error>> {
             "{name}: max vertex error {error:e} exceeds {TOLERANCE:e}"
         );
     }
+    Ok(())
+}
+
+fn create_scene() -> Result<(tempfile::TempDir, std::path::PathBuf), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let scene = directory.path().join("scene");
+    let initialized = Command::new(env!("CARGO_BIN_EXE_pot"))
+        .arg("init")
+        .arg(&scene)
+        .arg("--json")
+        .output()?;
+    assert!(initialized.status.success());
+    Ok((directory, scene))
+}
+
+fn apply(scene: &Path, operations: &Value) -> Result<Value, Box<dyn Error>> {
+    let file = scene.with_extension("operations.json");
+    fs::write(
+        &file,
+        serde_json::to_vec(
+            &json!({"schema_version": 1, "base_revision": 0, "operations": operations}),
+        )?,
+    )?;
+    let output = Command::new(env!("CARGO_BIN_EXE_pot"))
+        .arg("apply")
+        .arg(scene)
+        .arg("--file")
+        .arg(file)
+        .arg("--json")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+fn stored_body_mesh(scene: &Path) -> Result<Value, Box<dyn Error>> {
+    let document: Value = serde_json::from_slice(&fs::read(scene.join("scene.json"))?)?;
+    Ok(document["data_blocks"]["body_mesh"]["mesh"].clone())
+}
+
+/// The Clay Strips fixture's dabs through `sculpt.stroke` with no `falloff` field. The op's default
+/// must be the Smoother curve Blender's Clay Strips brush uses, so it equals an explicit `smoother`
+/// and differs from `smooth` on this stroke.
+#[test]
+fn clay_strips_op_without_falloff_defaults_to_smoother() -> Result<(), Box<dyn Error>> {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "fixtures/sculpt_brushes/clay_strips_grid.json"
+    ))?;
+    let samples: Vec<Value> = fixture["dabs"]
+        .as_array()
+        .ok_or("fixture dabs must be an array")?
+        .iter()
+        .enumerate()
+        .map(|(index, dab)| {
+            json!({
+                "position": dab["position"],
+                "pressure": dab["pressure"],
+                "radius": dab["radius"],
+                "strength": dab["strength"],
+                "time": index as f64
+            })
+        })
+        .collect();
+    let grid = json!({
+        "op": "node.create", "id": "body", "kind": "grid",
+        "params": {"size": 2.0, "x_subdivisions": 20, "y_subdivisions": 20}
+    });
+    let (_directory, scene) = create_scene()?;
+    apply(&scene, &json!([grid.clone()]))?;
+    let base = stored_body_mesh(&scene)?["vertices"].clone();
+
+    let stroked = |falloff: Option<&str>| -> Result<Value, Box<dyn Error>> {
+        let (_directory, scene) = create_scene()?;
+        let mut stroke = json!({
+            "op": "sculpt.stroke", "target": {"id": "body"}, "brush": "clay_strips",
+            "scope": "shared", "samples": samples.clone()
+        });
+        if let Some(falloff) = falloff {
+            stroke["falloff"] = json!(falloff);
+        }
+        apply(&scene, &json!([grid.clone(), stroke]))?;
+        Ok(stored_body_mesh(&scene)?["vertices"].clone())
+    };
+    let default = stroked(None)?;
+    let smoother = stroked(Some("smoother"))?;
+    let smooth = stroked(Some("smooth"))?;
+    assert_ne!(default, base, "the stroke must move vertices");
+    assert_eq!(
+        default, smoother,
+        "omitted falloff must run the smoother curve"
+    );
+    assert_ne!(
+        default, smooth,
+        "smoother and smooth must differ on this stroke"
+    );
     Ok(())
 }

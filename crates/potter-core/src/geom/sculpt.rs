@@ -128,14 +128,11 @@ pub fn apply_stroke_with_dyntopo(
     {
         return Err(invalid("dyntopo edge length must be finite and positive"));
     }
-    let positions = vertex_positions(mesh);
-    let normals = vertex_normals(mesh, &positions);
-    let adjacency = vertex_adjacency(mesh);
-    let boundary_adjacency = boundary_adjacency(mesh);
+    let normals = vertex_normals(mesh);
     let mask_values = read_scalar_attribute(mesh, "sculpt.mask")?;
     let brush = match stroke.brush {
         Brush::Dab(dab) => {
-            let changed = sculpt_dabs::apply_dabs(mesh, stroke, dab, &normals, &mask_values)?;
+            let changed = sculpt_dabs::apply_dabs(mesh, stroke, dab, &normals, &mask_values);
             return Ok(match dyntopo_edge_length {
                 Some(edge_length) => {
                     changed | dyntopo_edges_under_brush(mesh, stroke, edge_length)?
@@ -145,6 +142,9 @@ pub fn apply_stroke_with_dyntopo(
         }
         Brush::Vertex(brush) => brush,
     };
+    let positions = vertex_positions(mesh);
+    let adjacency = vertex_adjacency(mesh);
+    let boundary_adjacency = boundary_adjacency(mesh);
     let mirrors = mirrored_samples(stroke)?;
     let (first_sample, last_sample) = stroke
         .samples
@@ -155,8 +155,7 @@ pub fn apply_stroke_with_dyntopo(
     let mut next_positions = Vec::with_capacity(mesh.vertices.len());
     let mut changed = false;
 
-    for vertex in &mesh.vertices {
-        let normal = normals.get(&vertex.id).copied().unwrap_or(DVec3::Z);
+    for (vertex, normal) in mesh.vertices.iter().zip(&normals) {
         let mut influence = 0.0_f64;
         let mut center = DVec3::ZERO;
         let mut delta = DVec3::ZERO;
@@ -1013,41 +1012,28 @@ fn average_neighbor_position(
     }
 }
 
-/// Blender's vertex normals (`normals_calc_verts`): each face's Newell normal, weighted by the
-/// approximate corner angle at the vertex, then normalized. A vertex without faces takes the
-/// direction of its position, as in Blender.
-fn vertex_normals(
-    mesh: &Mesh,
-    positions: &std::collections::BTreeMap<u32, DVec3>,
-) -> std::collections::BTreeMap<u32, DVec3> {
-    let mut sums = std::collections::BTreeMap::<u32, DVec3>::new();
-    for face in &mesh.faces {
-        let Some(points) = face
-            .vertices
-            .iter()
-            .map(|id| positions.get(id).copied())
-            .collect::<Option<Vec<DVec3>>>()
-        else {
-            continue;
-        };
-        if points.len() < 3 {
-            continue;
-        }
-        let normal = normals::face_normal(&points);
-        for (corner, id) in face.vertices.iter().enumerate() {
-            *sums.entry(*id).or_default() += normal * normals::corner_angle(&points, corner);
-        }
-    }
-    mesh.vertices
+/// Blender's vertex normals (`normals_calc_verts`) in `mesh.vertices` order, via the shared
+/// `normals::vertex_normals`. Faces that name a missing vertex are skipped.
+fn vertex_normals(mesh: &Mesh) -> Vec<DVec3> {
+    let index: std::collections::BTreeMap<u32, usize> = mesh
+        .vertices
         .iter()
-        .map(|vertex| {
-            let normal = match sums.get(&vertex.id) {
-                Some(sum) => sum.normalize_or_zero(),
-                None => vertex.co.normalize_or_zero(),
-            };
-            (vertex.id, normal)
+        .enumerate()
+        .map(|(index, vertex)| (vertex.id, index))
+        .collect();
+    let points: Vec<DVec3> = mesh.vertices.iter().map(|vertex| vertex.co).collect();
+    let faces: Vec<Vec<usize>> = mesh
+        .faces
+        .iter()
+        .filter_map(|face| {
+            face.vertices
+                .iter()
+                .map(|id| index.get(id).copied())
+                .collect::<Option<Vec<usize>>>()
         })
-        .collect()
+        .collect();
+    let slices: Vec<&[usize]> = faces.iter().map(Vec::as_slice).collect();
+    normals::vertex_normals(&points, &slices)
 }
 
 fn read_scalar_attribute(mesh: &Mesh, name: &str) -> Result<std::collections::BTreeMap<u32, f64>> {
