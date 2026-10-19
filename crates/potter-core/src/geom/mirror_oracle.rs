@@ -453,6 +453,7 @@ fn mirror_codes_survive_reload_through_bisect_and_deformation() -> TestResult {
             0,
             &subject_name,
         ),
+        None,
         |_, _, _, _, _| Ok(None),
     )?
     .mesh;

@@ -4,6 +4,7 @@
 )]
 
 use glam::{DQuat, DVec3, EulerRot};
+use potter_core::error::ErrorCode;
 use potter_core::geom::{
     BoxParams, CylinderParams, Mesh, boolean::boolean_mesh, modifiers::evaluate_modifiers,
 };
@@ -457,6 +458,150 @@ fn boolean_modifier_apply_resolves_scene_object_operand() -> Result<(), Box<dyn 
     Ok(())
 }
 
+#[test]
+fn multires_levels_are_bounded_by_the_stored_top_level_and_budget() {
+    let source = Mesh::box_mesh(BoxParams::default()).unwrap();
+    let clamped = evaluate_modifiers(
+        &source,
+        &[modifier(
+            "multires",
+            json!({"levels": 6, "total_levels": 1}),
+        )],
+        "TestObject",
+    )
+    .unwrap();
+    assert_eq!(clamped.faces.len(), 24);
+    assert_eq!(clamped.vertices.len(), 26);
+    let multires_level_six = evaluate_modifiers(
+        &source,
+        &[modifier(
+            "multires",
+            json!({"levels": 6, "total_levels": 6}),
+        )],
+        "TestObject",
+    )
+    .unwrap();
+    assert_eq!(multires_level_six.faces.len(), 24_576);
+    assert_eq!(multires_level_six.vertices.len(), 24_578);
+    let resource_limited = evaluate_modifiers(
+        &source,
+        &[modifier(
+            "multires",
+            json!({"levels": 11, "total_levels": 11}),
+        )],
+        "TestObject",
+    )
+    .unwrap_err();
+    assert_eq!(resource_limited.code, ErrorCode::LimitExceeded);
+}
+
+#[test]
+fn custom_normals_follow_blender_per_modifier_type() {
+    let source = Mesh::box_mesh(BoxParams::default()).unwrap();
+    let mut sharp_only = source.clone();
+    sharp_only.attributes.insert(
+        "blender_edge_flags".to_owned(),
+        Value::Array(
+            (0..sharp_only.edges.len())
+                .map(|_| json!({"sharp": true, "seam": false}))
+                .collect(),
+        ),
+    );
+
+    let mut mixed_sharp = source.clone();
+    let mut edge_flags = (0..mixed_sharp.edges.len())
+        .map(|_| json!({"sharp": false, "seam": false}))
+        .collect::<Vec<_>>();
+    edge_flags[0] = json!({"sharp": true, "seam": false});
+    mixed_sharp
+        .attributes
+        .insert("blender_edge_flags".to_owned(), Value::Array(edge_flags));
+    let mixed_result = evaluate_modifiers(
+        &mixed_sharp,
+        &[modifier(
+            "multires",
+            json!({"levels": 1, "use_custom_normals": true}),
+        )],
+        "TestObject",
+    )
+    .unwrap();
+    // Blender 5.2.2 (tests/fixtures/custom_normal_presence): Multires with Use Custom Normals on writes a layer
+    // only when the input has one, so sharp edges alone leave it out.
+    assert!(
+        !mixed_result.attributes.contains_key("custom_normal"),
+        "multires with mixed sharp inputs and no custom-normal layer writes no custom normals, as Blender does"
+    );
+    // Blender 5.2.2: a Subdivision Surface with Use Custom Normals on writes a layer even with no input layer.
+    let subdivision_mixed = evaluate_modifiers(
+        &mixed_sharp,
+        &[modifier(
+            "subdivision",
+            json!({"levels": 1, "use_custom_normals": true}),
+        )],
+        "TestObject",
+    )
+    .unwrap();
+    assert!(
+        subdivision_mixed.attributes.contains_key("custom_normal"),
+        "subdivision with Use Custom Normals on writes custom normals, as Blender does"
+    );
+    let subdivision_off = evaluate_modifiers(
+        &mixed_sharp,
+        &[modifier(
+            "subdivision",
+            json!({"levels": 1, "use_custom_normals": false}),
+        )],
+        "TestObject",
+    )
+    .unwrap();
+    assert!(!subdivision_off.attributes.contains_key("custom_normal"));
+    let sharp_result = evaluate_modifiers(
+        &sharp_only,
+        &[modifier(
+            "multires",
+            json!({"levels": 1, "use_custom_normals": true}),
+        )],
+        "TestObject",
+    )
+    .unwrap();
+    assert!(!sharp_result.attributes.contains_key("custom_normal"));
+
+    let mut with_layer = source;
+    let values = with_layer
+        .faces
+        .iter()
+        .map(|face| {
+            (
+                format!("f{}", face.id),
+                json!(vec![[8192_i32, 0]; face.vertices.len()]),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    with_layer.attributes.insert(
+        "custom_normal".to_owned(),
+        json!({"domain": "corner", "type": "normal_code", "values": values}),
+    );
+    let enabled = evaluate_modifiers(
+        &with_layer,
+        &[modifier(
+            "multires",
+            json!({"levels": 1, "use_custom_normals": true}),
+        )],
+        "TestObject",
+    )
+    .unwrap();
+    assert!(enabled.attributes.contains_key("custom_normal"));
+    let disabled = evaluate_modifiers(
+        &with_layer,
+        &[modifier(
+            "multires",
+            json!({"levels": 1, "use_custom_normals": false}),
+        )],
+        "TestObject",
+    )
+    .unwrap();
+    assert!(!disabled.attributes.contains_key("custom_normal"));
+}
 #[test]
 fn skin_modifier_builds_a_closed_profile_around_skeleton_edges() {
     let mut line = Mesh::new();

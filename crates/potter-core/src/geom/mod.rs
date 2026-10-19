@@ -40,6 +40,7 @@ pub use legacy_texture::{ResolvedTexture, resolve_texture};
 pub mod mesh_cache;
 pub mod metaball;
 pub mod modifiers;
+pub(crate) mod multires_external;
 pub(crate) mod normals;
 pub mod pointcloud;
 pub(crate) mod provenance;

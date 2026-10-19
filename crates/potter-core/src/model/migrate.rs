@@ -96,20 +96,67 @@ fn parse_scene_inner(bytes: &[u8], root: &Path, retain_original_hash: bool) -> R
     })
 }
 
-/// Parses a history record, upgrading its snapshot's schema version first.
+/// Parses a history record, upgrading its snapshot's schema version and retiring the removed operation
+/// `seed` fields from its recorded operations.
 pub(crate) fn parse_history_record(
     bytes: &[u8],
     root: &Path,
 ) -> Result<(HistoryRecord, Vec<Value>)> {
     let mut value = parse_value(bytes)?;
-    let warnings = match value.get_mut("snapshot") {
+    let mut warnings = match value.get_mut("snapshot") {
         Some(snapshot) => upgrade_scene(snapshot, root)?,
         None => Vec::new(),
     };
+    if let Some(operations) = value.get_mut("operations") {
+        warnings.extend(retire_operation_seed(operations));
+    }
     let mut record: HistoryRecord =
         serde_json::from_value(value).map_err(|error| json_error(&error))?;
     crate::geom::legacy_texture::migrate_legacy_volume_noise_sentinel(&mut record.snapshot)?;
     Ok((record, warnings))
+}
+
+/// Drops the `seed` key from recorded operations whose schema no longer accepts it: `sculpt.stroke`,
+/// `sculpt.dyntopo`, `paint.vertex`, `paint.weight` and `paint.texture`. The parser rejects unknown
+/// fields, so an old record would not replay. Each dropped seed is reported. The sculpt brushes read
+/// the value in older builds, so a replay of such a record can differ from the one it was recorded with.
+fn retire_operation_seed(operations: &mut Value) -> Vec<Value> {
+    let mut warnings = Vec::new();
+    let Some(operations) = operations.as_array_mut() else {
+        return warnings;
+    };
+    for (index, operation) in operations.iter_mut().enumerate() {
+        let Some(fields) = operation.as_object_mut() else {
+            continue;
+        };
+        let Some(name) = fields
+            .get("op")
+            .and_then(Value::as_str)
+            .filter(|name| {
+                matches!(
+                    *name,
+                    "sculpt.stroke"
+                        | "sculpt.dyntopo"
+                        | "paint.vertex"
+                        | "paint.weight"
+                        | "paint.texture"
+                )
+            })
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        if let Some(seed) = fields.remove("seed") {
+            warnings.push(json!({
+                "code": "operation.seed_retired",
+                "message": "seed is no longer an operation field and was dropped",
+                "operation_index": index,
+                "op": name,
+                "seed": seed,
+            }));
+        }
+    }
+    warnings
 }
 
 fn parse_value(bytes: &[u8]) -> Result<Value> {
@@ -2463,6 +2510,59 @@ mod tests {
         )?;
         assert!(!parsed.legacy);
         assert_eq!(parsed.warnings, Vec::<Value>::new());
+        Ok(())
+    }
+
+    #[test]
+    fn history_operation_seed_is_dropped_at_load_and_the_record_replays() -> TestResult {
+        let snapshot = serde_json::to_value(SceneDoc::new(uuid::Uuid::new_v4().to_string()))?;
+        let mut source = history_record(&snapshot);
+        source["operations"] = json!([
+            {"op":"node.create","id":"body","kind":"box","params":{"size":2.0}},
+            {"op":"sculpt.stroke","target":{"id":"body"},"scope":"shared","brush":"draw",
+             "samples":[{"position":[1.0,1.0,1.0],"pressure":1.0,"radius":0.25,"strength":0.5,"time":0.0}],
+             "falloff":"linear","seed":7},
+            {"op":"sculpt.dyntopo","target":{"id":"body"},"scope":"shared",
+             "samples":[{"position":[0.0,0.0,0.0],"pressure":1.0,"radius":10.0,"strength":1.0,"time":0.0}],
+             "falloff":"constant","edge_length":0.5,"seed":7},
+            {"op":"paint.vertex","target":{"id":"body"},"scope":"shared","samples":[],"color":[1.0,0.0,0.0,1.0],"seed":7}
+        ]);
+        let (record, warnings) = parse_history_record(&serde_json::to_vec(&source)?, no_assets())?;
+        let operations = record
+            .operations
+            .as_array()
+            .ok_or("history operations are not an array")?;
+        assert_eq!(operations[0]["params"]["size"], 2.0);
+        assert!(operations[1].get("seed").is_none());
+        assert!(operations[2].get("seed").is_none());
+        assert!(operations[3].get("seed").is_none());
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert_eq!(warnings[0]["code"], "operation.seed_retired");
+        assert_eq!(warnings[0]["operation_index"], 1);
+        assert_eq!(warnings[0]["op"], "sculpt.stroke");
+        assert_eq!(warnings[0]["seed"], 7);
+        assert_eq!(warnings[1]["op"], "sculpt.dyntopo");
+        assert_eq!(warnings[2]["code"], "operation.seed_retired");
+        assert_eq!(warnings[2]["op"], "paint.vertex");
+
+        let replay = json!({
+            "schema_version": 1,
+            "base_revision": 0,
+            "operations": [operations[0], operations[1]]
+        });
+        crate::ops::apply_batch(&record.snapshot, &replay)?;
+
+        let mut rejected = operations[1].clone();
+        rejected["seed"] = json!(7);
+        let rejected_batch = json!({
+            "schema_version": 1,
+            "base_revision": 0,
+            "operations": [operations[0], rejected]
+        });
+        let error = crate::ops::apply_batch(&record.snapshot, &rejected_batch)
+            .err()
+            .ok_or("sculpt.stroke accepted a seed")?;
+        assert_eq!(error.code, ErrorCode::InvalidOperation);
         Ok(())
     }
 

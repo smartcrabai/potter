@@ -1576,23 +1576,81 @@ struct MeshExportLayout {
     key_deltas: Vec<Vec<DVec3>>,
 }
 
+fn adaptive_export_normals<'a>(
+    snapshot: &'a Snapshot,
+    node_id: &Id,
+    data_block: Option<&DataBlock>,
+) -> Option<&'a [Option<DVec3>]> {
+    if data_block
+        .and_then(|data| data.shape_keys.as_ref())
+        .is_some_and(|shape_keys| !shape_keys.keys.is_empty())
+    {
+        // VRM's shape-key layout uses the authored base mesh, not this evaluated render surface.
+        None
+    } else {
+        snapshot.adaptive_normals.get(node_id).map(Vec::as_slice)
+    }
+}
+
+fn adaptive_corner_normals(
+    mesh: &Mesh,
+    positions: &[DVec3],
+    adaptive_normals: &[Option<DVec3>],
+) -> Result<Vec<DVec3>> {
+    if adaptive_normals.len() != mesh.vertices.len() {
+        return Err(PotError::new(
+            ErrorCode::InternalError,
+            "adaptive normal count does not match exported mesh vertices",
+        ));
+    }
+    let mut corners = corner_normals(mesh, positions)?;
+    let smooth = smooth_face_flags(mesh)?;
+    if !smooth.iter().any(|smooth| *smooth) {
+        return Ok(corners);
+    }
+    let vertex_indices: BTreeMap<u32, usize> = mesh
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(index, vertex)| (vertex.id, index))
+        .collect();
+    let mut corner = 0;
+    for (face, smooth) in mesh.faces.iter().zip(smooth) {
+        for vertex_id in &face.vertices {
+            if smooth
+                && let Some(normal) = vertex_indices
+                    .get(vertex_id)
+                    .and_then(|index| adaptive_normals.get(*index))
+                    .copied()
+                    .flatten()
+            {
+                corners[corner] = normal;
+            }
+            corner += 1;
+        }
+    }
+    Ok(corners)
+}
+
 fn mesh_export_layout(
     mesh: &Mesh,
     data_block: Option<&DataBlock>,
     geometry_scale: DVec3,
     basis: DMat4,
     carried_color_layers: &[usize],
+    adaptive_normals: Option<&[Option<DVec3>]>,
 ) -> Result<MeshExportLayout> {
     let key_deltas = match data_block {
         Some(block) => shape_key_deltas(mesh, block)?,
         None => Vec::new(),
     };
     let base = shape_key_base_positions(mesh, data_block);
-    let mut layers = vec![output_normals(
-        &corner_normals(mesh, &base)?,
-        geometry_scale,
-        basis,
-    )];
+    let base_normals = if let Some(normals) = adaptive_normals {
+        adaptive_corner_normals(mesh, &base, normals)?
+    } else {
+        corner_normals(mesh, &base)?
+    };
+    let mut layers = vec![output_normals(&base_normals, geometry_scale, basis)];
     for deltas in &key_deltas {
         let morphed = base
             .iter()
@@ -1721,6 +1779,7 @@ fn blender_attribute_exportable(entry: &Value) -> bool {
     let name = entry["name"].as_str().unwrap_or_default();
     BLENDER_BOOKKEEPING_ATTRIBUTES.contains(&name) || is_color_attribute(entry)
 }
+
 fn validate_mesh_export_attributes(mesh: &Mesh, data_block: Option<&DataBlock>) -> Result<()> {
     for (name, value) in &mesh.attributes {
         let supported = match name.as_str() {
@@ -4328,7 +4387,14 @@ pub(crate) fn validate_vrm_mesh_references(
             .get(node_id)
             .copied()
             .unwrap_or(DVec3::ONE);
-        let export = mesh_export_layout(mesh, data_block, scale, avatar_basis(version), &[])?;
+        let export = mesh_export_layout(
+            mesh,
+            data_block,
+            scale,
+            avatar_basis(version),
+            &[],
+            adaptive_export_normals(snapshot, node_id, data_block),
+        )?;
         if let (Some(data_id), Some(data_block)) = (node.data.as_ref(), data_block)
             && let Some(binding) = data_skin_bindings.get(data_id)
         {
@@ -4590,6 +4656,8 @@ fn export_with_root_inner(
             geometry_scale,
             geometry_basis,
             &carried_color_layers,
+            vrm.as_ref()
+                .and_then(|_| adaptive_export_normals(snapshot, node_id, data_block)),
         )?;
         let uv_sets = &layout.uvs;
         if let Some(shape_keys) = data_block
@@ -8664,7 +8732,6 @@ fn imported_color_material(
     variants.insert(key, variant_id.clone());
     Ok(variant_id)
 }
-
 /// Groups glTF vertices that are copies of one Potter vertex. Returns each glTF vertex's welded
 /// index and the first glTF copy of each welded vertex; without IDs every vertex stays separate.
 fn weld_copies(
@@ -10100,7 +10167,6 @@ fn read_color(root: &Value, buffers: &[Vec<u8>], accessor_index: usize) -> Resul
     }
     Ok(colors)
 }
-
 fn read_joint_indices(
     root: &Value,
     buffers: &[Vec<u8>],

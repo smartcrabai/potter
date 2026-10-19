@@ -181,6 +181,7 @@ fn evaluation_context(
         scene_id,
         view_layer,
         frame,
+        adaptive_render: None,
         purpose: EvaluationPurpose::Preview,
     })
 }
