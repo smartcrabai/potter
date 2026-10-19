@@ -293,12 +293,13 @@ CASES = {
         skin=[((0.25,0.25), i==0) for i in range(8)],
         params={},
     ),
-    # The mesh Potter's `node.create kind box size 1` produces: Potter's geometry-nodes cube vertex order and
-    # its edge list in `Mesh::from_positions_and_faces` order (edges from the faces' cyclic pairs). Blender's
-    # skin output depends on the edge list, so this case pins the test input exactly.
+    # The mesh Potter's `node.create kind box size 1` produces (`Mesh::box_mesh`, eval.rs): its vertex order and
+    # its edge list in `Mesh::from_positions_and_faces` order (each face's cyclic pairs, first occurrence kept,
+    # stored in face direction). Blender's skin output depends on vertex and edge order, so this case pins the
+    # test input exactly.
     "cube_branch_potter_box": dict(
-        verts=[(-.5,-.5,-.5),(.5,-.5,-.5),(-.5,.5,-.5),(.5,.5,-.5),(-.5,-.5,.5),(.5,-.5,.5),(-.5,.5,.5),(.5,.5,.5)],
-        edges=[(0,2),(2,3),(3,1),(1,0),(4,5),(5,7),(7,6),(6,4),(1,5),(4,0),(2,6),(7,3)],
+        verts=[(-.5,-.5,-.5),(.5,-.5,-.5),(.5,.5,-.5),(-.5,.5,-.5),(-.5,-.5,.5),(.5,-.5,.5),(.5,.5,.5),(-.5,.5,.5)],
+        edges=[(0,3),(3,2),(2,1),(1,0),(4,5),(5,6),(6,7),(7,4),(1,5),(4,0),(2,6),(3,7)],
         skin=[((0.25,0.25), i==0) for i in range(8)],
         params={},
     ),
