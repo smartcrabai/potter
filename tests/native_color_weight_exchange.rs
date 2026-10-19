@@ -843,7 +843,8 @@ fn ply_byte(value: f64, alpha: bool) -> u8 {
 
 /// Blender's nearest-byte rounding of a `[0, 1]` value, as an integer-valued float.
 fn nearest_byte(value: f64) -> f64 {
-    (value.clamp(0.0, 1.0) * 255.0 + 0.5).floor()
+    // Rounded in float32, as Blender does; float64 would give 229 for the 0.9 alpha.
+    f64::from((value.clamp(0.0, 1.0) as f32 * 255.0_f32 + 0.5_f32).floor())
 }
 
 /// A linear RGBA value after one `BYTE_COLOR` round trip: sRGB RGB and linear alpha, each rounded

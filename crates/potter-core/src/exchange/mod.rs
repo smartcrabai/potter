@@ -884,7 +884,8 @@ pub(super) fn srgb_decode(value: f64) -> f64 {
     reason = "the input is clamped and rounded to Blender's 8-bit channel range"
 )]
 pub(super) fn blender_color_byte(value: f64) -> u8 {
-    (value.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
+    // Blender rounds in float32 (`0.9f * 255 + 0.5` is 230.0, where float64 gives 229.99999).
+    (value.clamp(0.0, 1.0) as f32 * 255.0_f32 + 0.5_f32) as u8
 }
 
 /// A canonical linear channel as Blender stores it in `BYTE_COLOR` interchange: encoded RGB, linear

@@ -262,8 +262,11 @@ pub(crate) fn export(
     let mut objects = Vec::new();
     let mut active = BTreeSet::new();
     if let Some(roots) = children.get(&None) {
+        let mut taken = BTreeSet::new();
         for id in roots {
-            objects.push(write_node(id, doc, &children, &sampled, &mut active, 0)?);
+            let mut object = write_node(id, doc, &children, &sampled, &mut active, 0)?;
+            object.name = alembic_object_name(doc, id, &mut taken);
+            objects.push(object);
         }
     }
     if objects.is_empty() && !doc.nodes.is_empty() {
@@ -656,6 +659,29 @@ fn export_uv_layers(mesh: &Mesh) -> Vec<UvSample> {
         .collect()
 }
 
+/// The Alembic name of a node: its display name when that is one path element and unused among its
+/// siblings, else its Potter ID. The display name also rides in `potter_name_hex`, so import reads
+/// it back exactly.
+fn alembic_object_name(doc: &SceneDoc, id: &Id, taken: &mut BTreeSet<String>) -> String {
+    let display = doc.nodes.get(id).map_or("", |node| node.name.as_str());
+    let mut name = if display.is_empty() || display.contains('/') {
+        id.as_str().to_owned()
+    } else {
+        display.to_owned()
+    };
+    if taken.contains(&name) {
+        id.as_str().clone_into(&mut name);
+    }
+    let root = name.clone();
+    let mut index = 1_u32;
+    while taken.contains(&name) {
+        name = format!("{root}_{index}");
+        index += 1;
+    }
+    taken.insert(name.clone());
+    name
+}
+
 fn write_node(
     id: &Id,
     doc: &SceneDoc,
@@ -698,16 +724,15 @@ fn write_node(
             child_objects.push(write_polymesh(&mesh_samples, samples.len())?);
         }
     }
+    let mut taken = child_objects
+        .iter()
+        .map(|object: &AbcObject| object.name.clone())
+        .collect::<BTreeSet<_>>();
     if let Some(nested) = children.get(&Some(id.clone())) {
         for child in nested {
-            child_objects.push(write_node(
-                child,
-                doc,
-                children,
-                samples,
-                active,
-                depth + 1,
-            )?);
+            let mut object = write_node(child, doc, children, samples, active, depth + 1)?;
+            object.name = alembic_object_name(doc, child, &mut taken);
+            child_objects.push(object);
         }
     }
     active.remove(id);
