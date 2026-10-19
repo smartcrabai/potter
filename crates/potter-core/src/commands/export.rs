@@ -119,6 +119,7 @@ pub fn run(args: &ExportArgs) -> Result<(Option<SceneInfo>, Value)> {
         let mut losses = export_losses(&doc, format, Some(&snapshot));
         losses.extend(exchange::shading::shading_losses(format, &meshes));
         losses.extend(exchange::uv_layer_losses(format, &meshes));
+        losses.extend(exchange::element_data_losses(format, &meshes));
         losses.extend(mesh_data_losses(&doc, format, &snapshot)?);
         let vrm = match (format, doc.avatar.as_ref()) {
             ("vrm", Some(avatar)) => Some((avatar, AvatarVersion::V1)),
@@ -134,6 +135,13 @@ pub fn run(args: &ExportArgs) -> Result<(Option<SceneInfo>, Value)> {
         if matches!(format, "fbx" | "fbx-binary") {
             losses.extend(exchange::fbx::uv_texture_losses(&doc, &snapshot));
             warnings.extend(exchange::fbx::uv_texture_warnings(&doc, &snapshot));
+        }
+        if format == "obj" {
+            losses.extend(exchange::obj::material_diagnostics(
+                &doc,
+                project.path(),
+                &meshes,
+            )?);
         }
         losses.extend(udim_texture_losses(&doc, format));
         if !losses.is_empty() && !args.allow_lossy {
@@ -233,18 +241,28 @@ pub fn run(args: &ExportArgs) -> Result<(Option<SceneInfo>, Value)> {
             }
             "obj" => {
                 let sidecar = sidecar_path(&args.out, "mtl")?;
-                let (object, material) = exchange::obj::export(&meshes)?;
+                let exported = exchange::obj::export(&doc, project.path(), &meshes)?;
                 let mtl_name = sidecar
                     .file_name()
                     .and_then(|value| value.to_str())
                     .ok_or_else(|| {
                         PotError::new(ErrorCode::InvalidArgument, "material filename is not UTF-8")
                     })?;
-                let object = String::from_utf8(object)
+                let object = String::from_utf8(exported.object)
                     .map_err(|error| PotError::new(ErrorCode::InternalError, error.to_string()))?
                     .replace("scene.mtl", mtl_name)
                     .into_bytes();
-                vec![(sidecar, material), (args.out.clone(), object)]
+                let mut files = vec![
+                    (sidecar.clone(), exported.material),
+                    (args.out.clone(), object),
+                ];
+                files.extend(
+                    exported
+                        .textures
+                        .into_iter()
+                        .map(|(name, bytes)| (sidecar.with_file_name(name), bytes)),
+                );
+                files
             }
             "stl" => vec![(args.out.clone(), exchange::stl::export(&meshes)?)],
             "ply" => vec![(args.out.clone(), exchange::ply::export(&meshes)?)],
@@ -621,7 +639,8 @@ pub(crate) fn export_losses(
         let data_supported = matches!(data.data_type.as_str(), "mesh" | "camera" | "light")
             || (supports_strokes && data.data_type == "grease_pencil")
             || (supports_bvh && data.data_type == "armature")
-            || (supports_gltf_skin && data.data_type == "armature");
+            || (supports_gltf_skin && data.data_type == "armature")
+            || (matches!(format, "fbx" | "fbx-binary") && data.data_type == "armature");
         if format == "alembic"
             && data
                 .mesh
@@ -654,6 +673,10 @@ pub(crate) fn export_losses(
         && let Some(snapshot) = snapshot
     {
         losses.extend(exchange::fbx::material_slot_losses(doc, snapshot));
+        losses.extend(exchange::fbx::posed_armature_losses(doc, snapshot));
+    }
+    if matches!(format, "fbx" | "fbx-binary") {
+        losses.extend(exchange::fbx::material_graph_losses(doc));
     }
     if let Some(loss) = avatar_settings_loss(doc, format) {
         losses.push(loss);
@@ -662,8 +685,8 @@ pub(crate) fn export_losses(
 }
 
 /// Mesh-data losses of a strict export of `format`, read from the evaluated meshes: generic
-/// attributes the format's writer drops, and glTF-family mesh data glTF cannot write losslessly.
-/// `run` and `validate` both report this set.
+/// attributes and vertex groups the format's Blender writer drops, plus glTF-family mesh data
+/// glTF cannot write losslessly. `run` and `validate` both report this set.
 pub(crate) fn mesh_data_losses(
     doc: &SceneDoc,
     format: &str,
@@ -675,6 +698,9 @@ pub(crate) fn mesh_data_losses(
         "fbx" | "fbx-binary" | "alembic" | "obj" | "ply" | "stl" | "usda" | "usdc" | "usd" | "usdz"
     ) {
         losses.extend(exchange::attribute_losses(format, doc, snapshot)?);
+    }
+    if matches!(format, "fbx" | "fbx-binary") {
+        losses.extend(exchange::fbx::vertex_group_losses(doc, snapshot)?);
     }
     if matches!(format, "glb" | "gltf" | "vrm" | "vrm0") {
         losses.extend(exchange::gltf::mesh_export_losses(doc, snapshot)?);
