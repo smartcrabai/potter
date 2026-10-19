@@ -505,6 +505,7 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                     candidate.insert(key.clone(), value.clone());
                 }
             }
+            synchronize_bevel_amount(engine, modifier_type, &raw, &mut candidate)?;
             validate_parameter_map(
                 engine,
                 ParameterFamily::Modifier,
@@ -617,6 +618,45 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
         }
     }
     Ok(changed)
+}
+
+/// Blender's Bevel `width` and `width_pct` are two RNA views of one stored amount (`rna_modifier.cc`; both
+/// read and write `BevelModifierData.value`). The graph keeps both keys from import, so an update that sets
+/// one must set the other to the same value. Otherwise the exporter writes the keys in sorted order and the
+/// stale one wins. A JSON null for either key restores the default for both, and two different values in
+/// one update are refused, because Blender has no value for them to hold.
+fn synchronize_bevel_amount(
+    engine: &Engine<'_>,
+    modifier_type: &str,
+    raw: &Map<String, Value>,
+    candidate: &mut Map<String, Value>,
+) -> Result<()> {
+    const AMOUNT_KEYS: [&str; 2] = ["width", "width_pct"];
+    if modifier_type != "bevel" {
+        return Ok(());
+    }
+    let touched: Vec<&Value> = AMOUNT_KEYS.iter().filter_map(|key| raw.get(*key)).collect();
+    if touched.is_empty() {
+        return Ok(());
+    }
+    if touched.iter().any(|value| value.is_null()) {
+        for key in AMOUNT_KEYS {
+            candidate.remove(key);
+        }
+        return Ok(());
+    }
+    if touched.len() == 2 && touched[0] != touched[1] {
+        return Err(engine.error(
+            ErrorCode::InvalidOperation,
+            "bevel width and width_pct are one Blender amount; set one value",
+            "/set/params",
+        ));
+    }
+    let amount = touched[0].clone();
+    for key in AMOUNT_KEYS {
+        candidate.insert(key.to_owned(), amount.clone());
+    }
+    Ok(())
 }
 
 fn delete(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bool> {

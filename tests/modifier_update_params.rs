@@ -84,3 +84,53 @@ fn partial_modifier_update_keeps_other_params_and_null_resets_one() -> TestResul
     assert_eq!(params.get("levels"), Some(&json!(2)));
     Ok(())
 }
+
+/// Blender's Bevel `width` and `width_pct` are one stored amount, so an update that sets either one leaves
+/// both equal; the exporter then cannot write a stale imported value over the edit.
+#[test]
+fn bevel_width_update_keeps_width_pct_equal_and_refuses_conflicting_amounts() -> TestResult<()> {
+    let doc = apply_one(
+        &SceneDoc::new(SCENE_ID.to_owned()),
+        &json!({"op": "node.create", "id": OBJECT, "kind": "box", "params": {"size": 2.0}}),
+    )?;
+    let doc = apply_one(
+        &doc,
+        &json!({
+            "op": "modifier.create",
+            "target": {"id": OBJECT},
+            "id": MODIFIER,
+            "type": "bevel",
+            "params": {"width": 0.035, "width_pct": 0.035, "segments": 2},
+        }),
+    )?;
+
+    let doc = apply_one(
+        &doc,
+        &json!({
+            "op": "modifier.update",
+            "target": {"id": OBJECT},
+            "id": MODIFIER,
+            "set": {"params": {"width": 0.08}},
+        }),
+    )?;
+    let params = modifier_params(&doc)?;
+    assert_eq!(params["width"], json!(0.08));
+    assert_eq!(params["width_pct"], json!(0.08));
+    assert_eq!(params["segments"], json!(2));
+
+    let batch = json!({
+        "schema_version": 1,
+        "base_revision": doc.revision,
+        "operations": [{
+            "op": "modifier.update",
+            "target": {"id": OBJECT},
+            "id": MODIFIER,
+            "set": {"params": {"width": 0.05, "width_pct": 0.09}},
+        }],
+    });
+    let error = ops::apply_batch(&doc, &batch)
+        .err()
+        .ok_or("conflicting amounts were accepted")?;
+    assert_eq!(error.code, potter_core::error::ErrorCode::InvalidOperation);
+    Ok(())
+}
