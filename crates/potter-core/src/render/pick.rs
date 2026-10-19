@@ -245,7 +245,7 @@ pub fn pick(
     }
     let geometry = extract_geometry(doc, &snapshot, Mode::Solid, false, &BTreeMap::new())?;
     verify_mapping_matches_geometry(&manifest, &geometry)?;
-    let camera = camera_from_manifest(&manifest.camera)?;
+    let camera = camera_from_manifest(&manifest.camera);
     let (ray_origin, ray_direction) =
         ray_for_pixel(&camera, buffers.width, buffers.height, pixel.0, pixel.1)?.ok_or_else(
             || render_invalid("object ID buffer has a hit where the camera has no ray"),
@@ -939,7 +939,7 @@ fn pixel_threshold(camera: &Camera, depth: f64, width: u32, height: u32) -> f64 
     pixel_size.max(1.0e-6)
 }
 
-fn camera_from_manifest(camera: &CameraManifest) -> Result<Camera> {
+fn camera_from_manifest(camera: &CameraManifest) -> Camera {
     let depth_of_field = camera.depth_of_field.as_ref().map(|dof| DepthOfField {
         focus_distance: dof.focus_distance,
         aperture_radius: dof.aperture_radius,
@@ -950,7 +950,7 @@ fn camera_from_manifest(camera: &CameraManifest) -> Result<Camera> {
         "anaglyph" => StereoMode::Anaglyph,
         _ => StereoMode::None,
     };
-    Ok(Camera {
+    Camera {
         position: DVec3::from_array(camera.position),
         target: DVec3::from_array(camera.target),
         up: DVec3::from_array(camera.up),
@@ -961,7 +961,7 @@ fn camera_from_manifest(camera: &CameraManifest) -> Result<Camera> {
         depth_of_field,
         stereo_mode,
         interocular_distance: camera.interocular_distance,
-    })
+    }
 }
 
 fn valid_camera(camera: &CameraManifest) -> bool {

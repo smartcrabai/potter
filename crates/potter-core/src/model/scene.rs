@@ -1233,22 +1233,42 @@ fn blender_pi() -> f64 {
 /// Potter refuses one rather than store a field of view that its Blender camera would not keep.
 pub const FISHEYE_FOV_MIN: f64 = 0.1745;
 
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if passes a reference"
+)]
 fn is_default_longitude_min(value: &f64) -> bool {
     equal_f64(*value, -blender_pi())
 }
 
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if passes a reference"
+)]
 fn is_default_longitude_max(value: &f64) -> bool {
     equal_f64(*value, blender_pi())
 }
 
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if passes a reference"
+)]
 fn is_default_latitude_min(value: &f64) -> bool {
     equal_f64(*value, -0.5 * blender_pi())
 }
 
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if passes a reference"
+)]
 fn is_default_latitude_max(value: &f64) -> bool {
     equal_f64(*value, 0.5 * blender_pi())
 }
 
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if passes a reference"
+)]
 fn is_default_fisheye_fov(value: &f64) -> bool {
     equal_f64(*value, blender_pi())
 }

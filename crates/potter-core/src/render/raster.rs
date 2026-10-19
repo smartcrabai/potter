@@ -891,7 +891,7 @@ fn project_world(
             let lon_span = longitude[1] - longitude[0];
             let lat_span = latitude[1] - latitude[0];
             // The longitude of the point, wrapped to the turn that lies nearest the range's centre.
-            let mid = 0.5 * (longitude[0] + longitude[1]);
+            let mid = f64::midpoint(longitude[0], longitude[1]);
             let raw = right.atan2(depth);
             let point_longitude = raw + TAU * ((mid - raw) / TAU).round();
             let point_latitude = (up / clip_depth).clamp(-1.0, 1.0).asin();
@@ -1281,8 +1281,8 @@ fn ray_for_subpixel_in_frame(
             latitude,
         } => {
             // Cycles' `equirectangular_range_to_direction`: u and v run from the range's minimum to its maximum.
-            let u = 0.5 * (ndc_x + 1.0);
-            let v = 0.5 * (ndc_y + 1.0);
+            let u = f64::midpoint(ndc_x, 1.0);
+            let v = f64::midpoint(ndc_y, 1.0);
             let point_longitude = longitude[0] + (longitude[1] - longitude[0]) * u;
             let point_latitude = latitude[0] + (latitude[1] - latitude[0]) * v;
             let direction = safe_normalize(

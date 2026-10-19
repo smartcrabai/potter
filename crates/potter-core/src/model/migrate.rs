@@ -119,7 +119,7 @@ pub fn upgrade_scene(value: &mut Value, root: &Path) -> Result<Vec<Value>> {
         upgrade_v4(value)?;
     }
     if value.get("schema_version").and_then(Value::as_u64) == Some(5) {
-        upgrade_v5(value)?;
+        upgrade_v5(value);
     }
     Ok(warnings)
 }
@@ -262,7 +262,7 @@ fn upgrade_v4(value: &mut Value) -> Result<()> {
 /// Upgrades a schema-version-5 scene document to version 6. The `fisheye` camera projection, which rendered an
 /// equidistant fisheye over a full turn, becomes the panorama projection with `fisheye_equidistant` and a
 /// `fisheye_fov` of 2π, so the stored camera keeps its image and there is one representation of a fisheye.
-fn upgrade_v5(value: &mut Value) -> Result<()> {
+fn upgrade_v5(value: &mut Value) {
     if let Some(blocks) = value.get_mut("data_blocks").and_then(Value::as_object_mut) {
         for camera in blocks
             .values_mut()
@@ -276,7 +276,6 @@ fn upgrade_v5(value: &mut Value) -> Result<()> {
         }
     }
     value["schema_version"] = json!(6);
-    Ok(())
 }
 
 fn upgrade_color_curve(color: &mut Value) -> Result<()> {

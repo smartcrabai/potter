@@ -6928,7 +6928,7 @@ fn imported_camera_projection(item: &Value, camera: &mut CameraData) {
         Some("PANO") => match item.get("panorama_type").and_then(Value::as_str) {
             None | Some("EQUIRECTANGULAR") => {
                 camera.projection = CameraProjection::Panorama;
-                camera.panorama_type = "equirectangular".to_owned();
+                "equirectangular".clone_into(&mut camera.panorama_type);
                 if let Some([longitude_min, longitude_max, latitude_min, latitude_max]) =
                     imported_panorama_range(item)
                 {
@@ -6940,14 +6940,14 @@ fn imported_camera_projection(item: &Value, camera: &mut CameraData) {
             }
             Some("FISHEYE_EQUIDISTANT") => {
                 camera.projection = CameraProjection::Panorama;
-                camera.panorama_type = "fisheye_equidistant".to_owned();
+                "fisheye_equidistant".clone_into(&mut camera.panorama_type);
                 if let Some(fov) = imported_fisheye_fov(item) {
                     camera.fisheye_fov = fov;
                 }
             }
             Some("FISHEYE_EQUISOLID") => {
                 camera.projection = CameraProjection::Panorama;
-                camera.panorama_type = "fisheye_equisolid".to_owned();
+                "fisheye_equisolid".clone_into(&mut camera.panorama_type);
                 // Blender's equisolid lens is `fisheye_lens`; its `lens` is the perspective focal length.
                 camera.lens_mm = number_field(item, "fisheye_lens", 10.5);
                 if let Some(fov) = imported_fisheye_fov(item) {
