@@ -396,16 +396,18 @@ mod single_bounce_tests {
     /// Orthographic width of the probe camera (Blender's `ortho_scale`) in units.
     const ORTHO_SCALE: f64 = 0.2;
 
-    /// Mean over the central 8×8 pixel patch of the orthographic probe (16 pixels across 0.2 units,
-    /// so 0.0125 units a pixel). A glossy highlight depends on the receiver position, so the patch
-    /// is averaged, as Blender's pixel is. The probe is symmetric under y -> -y, so rows j and 7-j
-    /// contribute equally and only half the patch is integrated.
+    /// Mean over the central 8×8 pixel patch of the orthographic probe (16 pixels across 0.2 units).
+    /// The camera views the plane at `VIEW_THETA`, so the image's vertical axis maps to receiver x
+    /// with a factor cos(VIEW_THETA): one pixel is `pixel / cos` in x and `pixel` in y. A glossy
+    /// highlight depends on the receiver position, so the patch is averaged, as Blender's pixel is.
+    /// The probe is symmetric under y -> -y, so rows j and 7-j contribute equally.
     fn probe_pixel(params: &BsdfParams) -> DVec3 {
         let pixel = ORTHO_SCALE / 16.0;
+        let x_step = pixel / VIEW_THETA.cos();
         let mut total = DVec3::ZERO;
         for i in 0..8 {
             for j in 0..4 {
-                let x = (f64::from(i) - 3.5) * pixel;
+                let x = (f64::from(i) - 3.5) * x_step;
                 let y = (f64::from(j) - 3.5) * pixel;
                 total += 2.0 * receiver_integral(params, x, y);
             }
