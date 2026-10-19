@@ -24,9 +24,8 @@ use crate::{
         uv_layers,
     },
     model::{
-        Action, ArmatureData, Bone, DataBlock, Extrapolation, FCurve, Id, Image, ImageAlphaMode,
-        ImageColorspace, ImageSource, Interpolation, Keyframe, Material, Node, SceneDoc,
-        TextureRef, Transform,
+        Action, ArmatureData, Bone, DataBlock, Extrapolation, FCurve, Id, Image, ImageColorspace,
+        ImageSource, Interpolation, Keyframe, Material, Node, SceneDoc, TextureRef, Transform,
     },
 };
 
@@ -94,6 +93,8 @@ struct TextureExport {
     property: &'static str,
     path: String,
     uv_layer: Option<String>,
+    /// Blender's exporter writes `WrapModeU` and `WrapModeV` as clamp (1) for any extension but REPEAT (0).
+    clamp: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -105,34 +106,9 @@ struct BoneExport {
     local: DMat4,
 }
 
-/// Export the evaluated mesh and scene transforms as ASCII FBX 7.4. Color layers are written as
-/// `LayerElementColor`; generic attributes are not written.
-pub(crate) fn export(doc: &SceneDoc, snapshot: &Snapshot) -> Result<Vec<u8>> {
-    export_with_root(doc, snapshot, Path::new("."))
-}
-
-/// Export ASCII FBX with the project root available for linked and packed images.
-pub(crate) fn export_with_root(
-    doc: &SceneDoc,
-    snapshot: &Snapshot,
-    project_root: &Path,
-) -> Result<Vec<u8>> {
-    export_with_root_allow_lossy(doc, snapshot, project_root, false)
-}
-
-/// Export ASCII FBX, optionally dropping attributes reported by the command's lossy-export gate.
-pub(crate) fn export_allow_lossy(
-    doc: &SceneDoc,
-    snapshot: &Snapshot,
-    allow_lossy: bool,
-) -> Result<Vec<u8>> {
-    if allow_lossy {
-        export_with_root_allow_lossy(doc, snapshot, Path::new("."), true)
-    } else {
-        export(doc, snapshot)
-    }
-}
-
+/// Export ASCII FBX 7.4 with texture assets resolved under `project_root`, optionally dropping
+/// attributes reported by the lossy-export gate. Color layers are written as `LayerElementColor`;
+/// generic attributes are not written, and `exchange::attribute_losses` reports them.
 pub(crate) fn export_with_root_allow_lossy(
     doc: &SceneDoc,
     snapshot: &Snapshot,
@@ -498,9 +474,10 @@ pub(crate) fn export_with_root_allow_lossy(
                     quote(layer)
                 )
             });
+        let wrap_mode = i32::from(texture.clamp);
         writeln!(
             output,
-            "\tTexture: {}, \"Texture::{}\", \"TextureVideoClip\" {{\n\t\tType: \"TextureVideoClip\"\n\t\tVersion: 202\n\t\tTextureName: \"Texture::{}\"\n\t\tProperties70:  {{\n{}{default_name_property}\t\t\tP: \"potter:property\", \"KString\", \"\", \"\", \"{}\"\n\t\t}}\n\t\tFileName: \"{}\"\n\t\tRelativeFilename: \"{}\"\n\t\tModelUVTranslation: 0,0\n\t\tModelUVScaling: 1,1\n\t\tTexture_Alpha_Source: \"None\"\n\t\tCropping: 0,0,0,0\n\t}}",
+            "\tTexture: {}, \"Texture::{}\", \"TextureVideoClip\" {{\n\t\tType: \"TextureVideoClip\"\n\t\tVersion: 202\n\t\tTextureName: \"Texture::{}\"\n\t\tProperties70:  {{\n{}{default_name_property}\t\t\tP: \"WrapModeU\", \"enum\", \"\", \"\", {wrap_mode}\n\t\t\tP: \"WrapModeV\", \"enum\", \"\", \"\", {wrap_mode}\n\t\t\tP: \"potter:property\", \"KString\", \"\", \"\", \"{}\"\n\t\t}}\n\t\tFileName: \"{}\"\n\t\tRelativeFilename: \"{}\"\n\t\tModelUVTranslation: 0,0\n\t\tModelUVScaling: 1,1\n\t\tTexture_Alpha_Source: \"None\"\n\t\tCropping: 0,0,0,0\n\t}}",
             texture.id,
             quote(&material.name),
             quote(&material.name),
@@ -973,6 +950,9 @@ fn build_texture_exports(
                 property,
                 path: path.clone(),
                 uv_layer: material_export.uv_layers[index].clone(),
+                clamp: texture.as_ref().is_some_and(|texture| {
+                    texture.extension != crate::image::ImageExtension::Repeat
+                }),
             });
         }
     }
@@ -1020,9 +1000,9 @@ fn missing_texture_uv_layers(
     missing
 }
 
-/// Textures whose requested or default render UV layer is unavailable on an evaluated mesh.
+/// FBX losses for texture wrap extensions and texture references to unavailable UV layers.
 pub(crate) fn uv_texture_losses(doc: &SceneDoc, snapshot: &Snapshot) -> Vec<Loss> {
-    missing_texture_uv_layers(doc, snapshot)
+    let mut losses: Vec<Loss> = missing_texture_uv_layers(doc, snapshot)
         .into_iter()
         .filter_map(|((material, layer, node, render_layer), slot)| {
             render_layer.is_none().then_some(Loss {
@@ -1041,7 +1021,56 @@ pub(crate) fn uv_texture_losses(doc: &SceneDoc, snapshot: &Snapshot) -> Vec<Loss
                 ),
             })
         })
-        .collect()
+        .collect();
+    losses.extend(texture_extension_losses(doc, snapshot));
+    losses
+}
+
+/// FBX has no mirror or clip wrap. Blender's exporter writes both as clamp, so each texture field on an exported
+/// material with one of those extensions reports `format.fbx.texture_extension`.
+pub(crate) fn texture_extension_losses(doc: &SceneDoc, snapshot: &Snapshot) -> Vec<Loss> {
+    let mut losses = Vec::new();
+    let mut seen = BTreeSet::<Id>::new();
+    for (node_id, node) in &doc.nodes {
+        if !snapshot.meshes.contains_key(node_id) {
+            continue;
+        }
+        for material_id in fbx_material_slots(doc, snapshot, node_id, node)
+            .into_iter()
+            .flatten()
+        {
+            if !seen.insert(material_id.clone()) {
+                continue;
+            }
+            let Some(material) = doc.materials.get(&material_id) else {
+                continue;
+            };
+            for (texture, property) in material_texture_refs(material)
+                .into_iter()
+                .zip(TEXTURE_PROPERTIES)
+            {
+                let Some(texture) = texture else {
+                    continue;
+                };
+                if matches!(
+                    texture.extension,
+                    crate::image::ImageExtension::Mirror | crate::image::ImageExtension::Clip
+                ) {
+                    losses.push(Loss {
+                        feature_id: "format.fbx.texture_extension".to_owned(),
+                        data_id: Some(material_id.to_string()),
+                        reason: format!(
+                            "material `{material_id}` samples its {property} texture with a mirror or clip extension, which FBX cannot represent; FBX writes it as clamp"
+                        ),
+                        suggestion: Some(
+                            "use the repeat or extend extension for FBX export".to_owned(),
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    losses
 }
 
 /// Empty material slots cannot be represented by FBX material connections.
@@ -2499,7 +2528,7 @@ fn import_bytes_with_base(
                     blob: None,
                     source_path: Some(source.to_string_lossy().into_owned()),
                     source_hash: Some(crate::hash::sha256(&bytes)),
-                    alpha_mode: ImageAlphaMode::Straight,
+                    alpha_mode: crate::image::storage::default_alpha_mode(&bytes),
                 },
             );
             images_by_source.insert(source_key, image_id.clone());
@@ -2516,6 +2545,7 @@ fn import_bytes_with_base(
             image: image_id,
             uv_layer: texture.uv_layer.clone(),
             interpolation: crate::image::ImageInterpolation::Linear,
+            extension: texture.extension,
         };
         match property {
             "DiffuseColor" => material.base_color_texture = Some(texture_ref),
@@ -2737,6 +2767,8 @@ struct ImportedTexture {
     file_name: String,
     uv_layer: Option<String>,
     property: Option<String>,
+    /// `EXTEND` when either wrap mode is a clamp, as Blender's importer sets it (`import_fbx.py` `texture_mapping_set`).
+    extension: crate::image::ImageExtension,
 }
 #[derive(Clone, Debug)]
 struct Connection {
@@ -3460,11 +3492,19 @@ fn parse_texture(node: &FbxNode, numeric_id: i64) -> Result<ImportedTexture> {
         read_string_property(properties, "UVSet")
             .filter(|value| !value.is_empty() && value != "default")
     });
+    // Blender's importer sets EXTEND when either wrap mode is a clamp (1); REPEAT (0) keeps the default.
+    let clamp = read_scalar_property(properties, "WrapModeU", 0.0)? != 0.0
+        || read_scalar_property(properties, "WrapModeV", 0.0)? != 0.0;
     Ok(ImportedTexture {
         numeric_id,
         file_name,
         uv_layer,
         property: read_string_property(properties, "potter:property"),
+        extension: if clamp {
+            crate::image::ImageExtension::Extend
+        } else {
+            crate::image::ImageExtension::Repeat
+        },
     })
 }
 
@@ -4160,7 +4200,7 @@ fn write_error(_: std::fmt::Error) -> PotError {
 #[cfg(test)]
 mod tests {
     use super::{
-        export_with_root, export_with_root_allow_lossy, import_bytes, lex, material_slot_losses,
+        export_with_root_allow_lossy, import_bytes, lex, material_slot_losses,
         numeric_array, parse_color_layers, parse_geometry, parse_nodes, parse_uv_layers,
         resolve_material_slot, uv_texture_losses, uv_texture_warnings, vertex_group_losses,
         write_color_layers, write_geometry, write_uv_layers,
@@ -4174,7 +4214,7 @@ mod tests {
             color_layers::{ColorDomain, ColorLayer, ColorStore},
             uv_layers::{self, UvLayer, UvStore},
         },
-        image::ImageInterpolation,
+        image::{ImageExtension, ImageInterpolation},
         model::{
             DataBlock, Id, Image, ImageColorspace, ImageSource, Material, Node, SceneDoc,
             TextureRef, VertexGroup,
@@ -4497,6 +4537,150 @@ mod tests {
         let no_slot_export =
             export_with_root_allow_lossy(&no_slot_doc, &no_slot_snapshot, Path::new("."), true)?;
         assert!(!String::from_utf8(no_slot_export)?.contains("LayerElementMaterial: 0"));
+        Ok(())
+    }
+
+    /// One triangle whose base colour texture has `extension`.
+    fn textured_triangle_scene(extension: ImageExtension, root: &Path) -> TestResult<SceneDoc> {
+        let image_path = root.join("texture.pixels");
+        let pixels = crate::image::encode_pixels(1, 1, &[[1.0, 1.0, 1.0, 1.0]])?;
+        fs::write(&image_path, &pixels)?;
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        let image_id = Id::new("image")?;
+        doc.images.insert(
+            image_id.clone(),
+            Image {
+                name: "Image".to_owned(),
+                source: ImageSource::File,
+                colorspace: ImageColorspace::Srgb,
+                width: 1,
+                height: 1,
+                tiles: Vec::new(),
+                blob: None,
+                source_path: Some(image_path.to_string_lossy().into_owned()),
+                source_hash: Some(crate::hash::sha256(&pixels)),
+                alpha_mode: crate::model::ImageAlphaMode::default(),
+            },
+        );
+        let material_id = Id::new("textured")?;
+        doc.materials.insert(
+            material_id.clone(),
+            Material {
+                name: "Textured".to_owned(),
+                base_color: [1.0; 4],
+                base_color_texture: Some(TextureRef {
+                    image: image_id,
+                    uv_layer: None,
+                    interpolation: ImageInterpolation::Linear,
+                    extension,
+                }),
+                ..Material::default()
+            },
+        );
+        let data_id = Id::new("triangle_data")?;
+        doc.data_blocks.insert(
+            data_id.clone(),
+            DataBlock {
+                data_type: "mesh".to_owned(),
+                mesh: Some(triangle()?),
+                materials: vec![Some(material_id)],
+                ..DataBlock::default()
+            },
+        );
+        doc.nodes.insert(
+            Id::new("sheet")?,
+            Node {
+                name: "Sheet".to_owned(),
+                kind: "mesh".to_owned(),
+                data: Some(data_id),
+                ..Node::default()
+            },
+        );
+        Ok(doc)
+    }
+
+    fn textured_triangle_fbx(extension: ImageExtension, root: &Path) -> TestResult<Vec<u8>> {
+        let doc = textured_triangle_scene(extension, root)?;
+        let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
+        Ok(export_with_root_allow_lossy(&doc, &snapshot, root, true)?)
+    }
+
+    fn textured_extension(doc: &SceneDoc) -> TestResult<ImageExtension> {
+        doc.materials
+            .values()
+            .find_map(|material| material.base_color_texture.as_ref())
+            .map(|texture| texture.extension)
+            .ok_or_else(|| "FBX test texture is missing".into())
+    }
+
+    #[test]
+    fn mirror_and_clip_texture_extensions_report_fbx_losses() -> TestResult {
+        let root = tempfile::tempdir()?;
+        for extension in [
+            ImageExtension::Repeat,
+            ImageExtension::Extend,
+            ImageExtension::Mirror,
+            ImageExtension::Clip,
+        ] {
+            let doc = textured_triangle_scene(extension, root.path())?;
+            let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
+            let has_extension_loss = uv_texture_losses(&doc, &snapshot)
+                .iter()
+                .any(|loss| loss.feature_id == "format.fbx.texture_extension");
+            assert_eq!(
+                has_extension_loss,
+                matches!(extension, ImageExtension::Mirror | ImageExtension::Clip),
+                "unexpected FBX texture-extension loss for {extension:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn texture_wrap_modes_export_as_blenders_exporter_writes_them() -> TestResult {
+        // Blender's exporter writes WrapModeU and WrapModeV as clamp (1) for any extension but REPEAT (0).
+        let root = tempfile::tempdir()?;
+        for (extension, expected) in [
+            (ImageExtension::Extend, 1),
+            (ImageExtension::Mirror, 1),
+            (ImageExtension::Repeat, 0),
+        ] {
+            let text = String::from_utf8(textured_triangle_fbx(extension, root.path())?)?;
+            assert!(
+                text.contains(&format!(
+                    "P: \"WrapModeU\", \"enum\", \"\", \"\", {expected}\n"
+                )),
+                "WrapModeU is {expected} for {extension:?}"
+            );
+            assert!(
+                text.contains(&format!(
+                    "P: \"WrapModeV\", \"enum\", \"\", \"\", {expected}\n"
+                )),
+                "WrapModeV is {expected} for {extension:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn texture_wrap_modes_import_as_blenders_importer_reads_them() -> TestResult {
+        // Blender's importer sets EXTEND when either wrap mode is a clamp; REPEAT only when both are 0.
+        let root = tempfile::tempdir()?;
+        let scene_id = "00000000-0000-4000-8000-000000000001".to_owned();
+        let clamp = textured_triangle_fbx(ImageExtension::Extend, root.path())?;
+        let imported = import_bytes(&clamp, scene_id.clone())?;
+        assert_eq!(textured_extension(&imported.doc)?, ImageExtension::Extend);
+
+        let clamp_on_v_only = String::from_utf8(clamp)?.replace(
+            "P: \"WrapModeU\", \"enum\", \"\", \"\", 1",
+            "P: \"WrapModeU\", \"enum\", \"\", \"\", 0",
+        );
+        let imported = import_bytes(clamp_on_v_only.as_bytes(), scene_id.clone())?;
+        assert_eq!(textured_extension(&imported.doc)?, ImageExtension::Extend);
+
+        let repeat = textured_triangle_fbx(ImageExtension::Repeat, root.path())?;
+        let imported = import_bytes(&repeat, scene_id)?;
+        assert_eq!(textured_extension(&imported.doc)?, ImageExtension::Repeat);
         Ok(())
     }
 
@@ -5216,6 +5400,7 @@ mod tests {
                     image: image_id,
                     uv_layer: None,
                     interpolation: ImageInterpolation::Linear,
+                    extension: crate::image::ImageExtension::Repeat,
                 }),
                 ..Material::default()
             },
@@ -5243,7 +5428,7 @@ mod tests {
 
         let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
         assert!(uv_texture_losses(&doc, &snapshot).is_empty());
-        let bytes = export_with_root(&doc, &snapshot, root.path())?;
+        let bytes = export_with_root_allow_lossy(&doc, &snapshot, root.path(), false)?;
         let imported = import_bytes(&bytes, "00000000-0000-4000-8000-000000000001".to_owned())?;
         assert_ne!(
             resolved_material_id(&imported.doc, "left", 0)?,
@@ -5277,7 +5462,7 @@ mod tests {
             .uv_layer = Some("Detail".to_owned());
         let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
         assert!(uv_texture_losses(&doc, &snapshot).is_empty());
-        let bytes = export_with_root(&doc, &snapshot, root.path())?;
+        let bytes = export_with_root_allow_lossy(&doc, &snapshot, root.path(), false)?;
         let imported = import_bytes(&bytes, "00000000-0000-4000-8000-000000000002".to_owned())?;
         assert_eq!(
             texture_on_node(&imported.doc, "left")?.uv_layer.as_deref(),
@@ -5318,7 +5503,7 @@ mod tests {
         assert_eq!(warnings[0].details["status"], "fallback");
         assert_eq!(warnings[0].details["node_id"], "right");
         assert_eq!(warnings[0].details["render_uv_layer"], "RightRender");
-        let bytes = export_with_root(&doc, &snapshot, root.path())?;
+        let bytes = export_with_root_allow_lossy(&doc, &snapshot, root.path(), false)?;
         let imported = import_bytes(&bytes, "00000000-0000-4000-8000-000000000003".to_owned())?;
         assert_eq!(
             texture_on_node(&imported.doc, "left")?.uv_layer.as_deref(),

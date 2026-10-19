@@ -19,8 +19,8 @@ use crate::{
     model::{Id, Material, SceneDoc},
     shader::{
         BsdfParams, DEFAULT_SPECULAR_IOR_LEVEL, EvaluatorWorkspace, HitContext, HitUvLayers,
-        dielectric_f0, evaluate_displacement_with_workspace, evaluate_surface_with_workspace,
-        fill_color_layers,
+        PreparedMaterial, dielectric_f0, evaluate_displacement_with_workspace,
+        evaluate_surface_with_workspace, fill_color_layers,
     },
 };
 
@@ -84,6 +84,7 @@ pub(super) struct Geometry {
     pub triangles: Vec<Triangle>,
     pub lines: Vec<Line>,
     pub materials: Vec<Material>,
+    pub prepared: Vec<PreparedMaterial>,
     pub objects: Vec<ObjectRecord>,
     pub elements: Vec<ElementRecord>,
     pub bounds: Option<(DVec3, DVec3)>,
@@ -158,6 +159,7 @@ pub(super) fn extract_geometry(
     );
 
     let mut materials = vec![Material::default()];
+    let mut prepared = vec![PreparedMaterial::default()];
     let mut material_indices =
         std::collections::BTreeMap::<(Id, Option<usize>, Option<Arc<[u64]>>), usize>::new();
     let mut triangles = Vec::new();
@@ -437,6 +439,7 @@ pub(super) fn extract_geometry(
                     } else if let Some(material) = doc.materials.get(id) {
                         let index = materials.len();
                         materials.push(material.clone());
+                        prepared.push(PreparedMaterial::new(material, &doc.node_groups));
                         material_indices.insert(key, index);
                         index
                     } else {
@@ -457,6 +460,7 @@ pub(super) fn extract_geometry(
                         .insert(material_index, slot_color_mask);
                 }
                 let material = materials.get(material_index);
+                let prepared_material = prepared.get(material_index);
                 let base_color = material.map_or([0.6, 0.6, 0.6, 1.0], |value| value.base_color);
                 let face_triangle_count = face.vertices.len().checked_sub(2).ok_or_else(|| {
                     PotError::new(
@@ -560,10 +564,13 @@ pub(super) fn extract_geometry(
                         layer_colors,
                         lit_per_pixel,
                     };
-                    if let Some(material) = material.filter(|material| {
-                        material.displacement_method == "displacement"
-                            && material.node_tree.is_some()
-                    }) {
+                    if let (Some(material), Some(prepared_material)) = (
+                        material.filter(|material| {
+                            material.displacement_method == "displacement"
+                                && material.node_tree.is_some()
+                        }),
+                        prepared_material,
+                    ) {
                         let layers = HitUvLayers {
                             names: &uv_names,
                             corners: &triangle.layer_uvs,
@@ -578,6 +585,7 @@ pub(super) fn extract_geometry(
                         triangles.extend(subdivide_displaced_triangle(
                             doc,
                             material,
+                            prepared_material,
                             matrix,
                             &triangle,
                             images,
@@ -851,6 +859,7 @@ pub(super) fn extract_geometry(
         triangles,
         lines,
         materials,
+        prepared,
         objects,
         elements,
         bounds,
@@ -1207,6 +1216,7 @@ fn corner_midpoints<const N: usize>(corners: [[f64; N]; 3]) -> [[f64; N]; 6] {
 fn subdivide_displaced_triangle(
     doc: &SceneDoc,
     material: &Material,
+    prepared: &PreparedMaterial,
     object_to_world: DMat4,
     triangle: &Triangle,
     images: &BTreeMap<String, ImageData>,
@@ -1237,7 +1247,7 @@ fn subdivide_displaced_triangle(
             },
             &mut tables,
         )?;
-        evaluate_displacement_with_workspace(material, &context, evaluator_workspace)
+        evaluate_displacement_with_workspace(material, prepared, &context, evaluator_workspace)
     })
 }
 
@@ -1458,9 +1468,11 @@ pub(super) fn surface_shader<'a>(
 impl SurfaceShader for SceneShader<'_> {
     fn shade(&self, triangle: &Triangle, hit: &SurfaceHit) -> Result<[f64; 4]> {
         let material = self.geometry.materials.get(triangle.material_index);
+        let prepared = self.geometry.prepared.get(triangle.material_index);
         let params = if triangle.lit_per_pixel {
             material
-                .map(|material| self.graph_params(triangle, material, hit))
+                .zip(prepared)
+                .map(|(material, prepared)| self.graph_params(triangle, material, prepared, hit))
                 .transpose()?
         } else {
             None
@@ -1531,6 +1543,7 @@ impl SceneShader<'_> {
         &self,
         triangle: &Triangle,
         material: &Material,
+        prepared: &PreparedMaterial,
         hit: &SurfaceHit,
     ) -> Result<BsdfParams> {
         let object =
@@ -1572,7 +1585,7 @@ impl SceneShader<'_> {
             &mut tables,
         )?;
         let mut workspace = self.evaluator_workspace.borrow_mut();
-        evaluate_surface_with_workspace(material, &context, &mut workspace)
+        evaluate_surface_with_workspace(material, prepared, &context, &mut workspace)
     }
 }
 /// Face-corner index of each triangle vertex; the UV and shading-normal lookups share it.
@@ -2675,11 +2688,14 @@ mod shading_normal_tests {
         let images = BTreeMap::from([(
             "asym".to_owned(),
             ImageData {
+                colour: crate::image::ColourCache::default(),
+                storage: crate::image::ImageStorage::default(),
                 width: 2,
                 height: 2,
                 pixels: pixel.to_vec(),
                 tiles: BTreeMap::new(),
                 interpolation: ImageInterpolation::Closest,
+                srgb: false,
             },
         )]);
         let geometry = extract_geometry(&doc, &snapshot, Mode::Beauty, false, &images)?;

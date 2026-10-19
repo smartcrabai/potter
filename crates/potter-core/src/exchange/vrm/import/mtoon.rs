@@ -12,7 +12,7 @@ use crate::{
         material_surface::TextureTransform,
     },
     float::equal_f64,
-    image::ImageInterpolation,
+    image::{ImageExtension, ImageInterpolation},
     model::{
         AvatarMtoon, AvatarMtoonShadingShiftTexture, AvatarOutlineWidthMode,
         AvatarTextureTransform, AvatarVersion, Id, TextureRef,
@@ -302,11 +302,12 @@ fn v1_texture(decoder: &mut Decoder<'_>, name: &str, info: &Value) -> Result<Opt
             SUGGESTION,
         );
     }
-    let (image, interpolation) = texture_source(&decoder.index.root, index_value(&info["index"])?)?;
+    let (image, interpolation, extension) = texture_source(decoder, index_value(&info["index"])?)?;
     Ok(Some(potter_texture(
         decoder.image_id(image)?,
         interpolation,
         imported_uv_layer(info),
+        extension,
     )))
 }
 
@@ -660,15 +661,20 @@ fn v0_outline_mode(
 }
 
 /// A VRM 0.x texture property. The value is a glTF texture index, as `add_texture` writes it.
-fn v0_texture(decoder: &Decoder<'_>, textures: &Value, name: &str) -> Result<Option<TextureRef>> {
+fn v0_texture(
+    decoder: &mut Decoder<'_>,
+    textures: &Value,
+    name: &str,
+) -> Result<Option<TextureRef>> {
     let Some(value) = field(textures, name) else {
         return Ok(None);
     };
-    let (image, interpolation) = texture_source(&decoder.index.root, index_value(value)?)?;
+    let (image, interpolation, extension) = texture_source(decoder, index_value(value)?)?;
     Ok(Some(potter_texture(
         decoder.image_id(image)?,
         interpolation,
         None,
+        extension,
     )))
 }
 
@@ -684,13 +690,14 @@ fn v0_channel_texture(
     let Some(value) = field(textures, name) else {
         return Ok(None);
     };
-    let (copy, interpolation) = texture_source(&decoder.index.root, index_value(value)?)?;
+    let (copy, interpolation, extension) = texture_source(decoder, index_value(value)?)?;
     let source = remapped_source(&decoder.index.root, copy, channel);
     if let Some(image) = source {
         Ok(Some(potter_texture(
             decoder.image_id(image)?,
             interpolation,
             None,
+            extension,
         )))
     } else {
         decoder.loss(
@@ -718,16 +725,22 @@ fn remapped_source(root: &Value, image: usize, channel: u64) -> Option<usize> {
     Some(original.unwrap_or(image))
 }
 
-/// The glTF image a texture reads, and the interpolation its sampler implies (`gltf.rs` `import_texture_ref`).
-fn texture_source(root: &Value, texture_index: usize) -> Result<(usize, ImageInterpolation)> {
-    let texture = root["textures"]
+/// The glTF image a texture reads, the interpolation and extension its sampler implies (`gltf.rs`
+/// `import_texture_ref`). A sampler whose two axes wrap differently is a loss: a field holds one extension, so the
+/// texture is read as EXTEND.
+fn texture_source(
+    decoder: &mut Decoder<'_>,
+    texture_index: usize,
+) -> Result<(usize, ImageInterpolation, ImageExtension)> {
+    let index = decoder.index;
+    let texture = index.root["textures"]
         .get(texture_index)
         .ok_or_else(|| import_error("VRM MToon references a missing glTF texture"))?;
     let image = index_value(&texture["source"])?;
     let nearest = texture["sampler"]
         .as_u64()
-        .and_then(|index| usize::try_from(index).ok())
-        .and_then(|index| root["samplers"].get(index))
+        .and_then(|sampler| usize::try_from(sampler).ok())
+        .and_then(|sampler| index.root["samplers"].get(sampler))
         .is_some_and(|sampler| {
             sampler["magFilter"].as_u64() == Some(9728)
                 || sampler["minFilter"].as_u64() == Some(9728)
@@ -737,7 +750,19 @@ fn texture_source(root: &Value, texture_index: usize) -> Result<(usize, ImageInt
     } else {
         ImageInterpolation::Linear
     };
-    Ok((image, interpolation))
+    let wrap = crate::exchange::gltf::texture_wrap_at(&index.root, texture_index);
+    if wrap[0] != wrap[1] {
+        decoder.loss(
+            "vrm.mtoon.texture_wrap",
+            "VRM MToon texture's glTF sampler wraps the S and T axes differently; a Potter texture holds one extension, so it is sampled as clamp to edge",
+            SUGGESTION,
+        );
+    }
+    Ok((
+        image,
+        interpolation,
+        crate::exchange::material_graph::uniform_extension(wrap),
+    ))
 }
 
 /// A `MToon` texture on `uv_layer` (`None` is the render layer). VRM 0.x textures have no `texCoord` and pass
@@ -746,11 +771,13 @@ fn potter_texture(
     image: Id,
     interpolation: ImageInterpolation,
     uv_layer: Option<String>,
+    extension: ImageExtension,
 ) -> TextureRef {
     TextureRef {
         image,
         uv_layer,
         interpolation,
+        extension,
     }
 }
 
