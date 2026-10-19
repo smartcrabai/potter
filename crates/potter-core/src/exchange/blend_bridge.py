@@ -2127,13 +2127,31 @@ def dump_scene(scene):
             "compositor": _scene_compositor(scene),
             "color_management": _color_management_dump(scene),
             "view_layers": layers,
-            "display_backface_culling": bool(scene.display.shading.show_backface_culling),
+            "display_shading": _display_shading_dump(scene.display.shading),
             "markers": [{"name": marker.name, "frame": int(marker.frame)} for marker in scene.timeline_markers],
             "rigid_body_world": _rigid_body_world_dump(scene),
             "sequencer": _sequencer_dump(scene),
             "root_collection": scene.get("potter.root_collection", scene.collection.get("potter.name", scene.collection.name_full)),
             "world": world_info, "custom_properties": custom_props(scene),
             "rna_properties": rna_props(scene, ("objects", "collection", "view_layers", "world", "camera", "render", "tool_settings", "unit_settings"))}
+
+
+def _display_shading_dump(shading):
+    """The viewport shading options a Workbench render reads (`scene.display.shading`)."""
+    return {
+        "light": shading.light,
+        "studio_light": shading.studio_light,
+        "color_type": shading.color_type,
+        "use_world_space_lighting": bool(shading.use_world_space_lighting),
+        "show_specular_highlight": bool(shading.show_specular_highlight),
+        "show_cavity": bool(shading.show_cavity),
+        "show_shadows": bool(shading.show_shadows),
+        "show_object_outline": bool(shading.show_object_outline),
+        "show_backface_culling": bool(shading.show_backface_culling),
+        "show_xray": bool(shading.show_xray),
+        "use_dof": bool(shading.use_dof),
+        "background_type": shading.background_type,
+    }
 
 
 def _startup_metadata_datablock(collection_name, block):

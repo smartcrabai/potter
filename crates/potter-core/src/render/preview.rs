@@ -19,14 +19,15 @@ use crate::{
 
 use super::{
     raster::{
-        Camera, DepthOfField, Mode, Projection, RasterOutput, StereoMode, rasterize_with_lines,
+        Camera, DepthOfField, Mode, Projection, RasterOutput, StereoMode, ViewBasis,
+        rasterize_with_lines,
     },
     scene::{Geometry, extract_geometry, surface_shader},
 };
 
 const MIN_SIZE: u32 = 64;
 const MAX_SIZE: u32 = 16_384;
-pub(super) const ENGINE: &str = "potter-cpu-path-2";
+pub(super) const ENGINE: &str = "potter-cpu-path-3";
 const VALID_VIEWS: [&str; 7] = ["front", "back", "right", "left", "top", "bottom", "iso"];
 
 #[derive(Clone, Debug)]
@@ -197,7 +198,8 @@ pub fn render_previews(
                 )
             })?
         };
-        let shader = surface_shader(doc, snapshot, &images, geometry, mode);
+        let view = ViewBasis::from_camera(&prepared.camera)?;
+        let shader = surface_shader(doc, snapshot, &images, geometry, mode, view);
         let background = background_color(doc, snapshot, mode, false);
         let mut raster = if matches!(mode, Mode::Beauty) {
             super::path::render(
@@ -335,8 +337,15 @@ pub(crate) fn render_camera_frame(
         engine == "path" && matches!(mode, Mode::Beauty),
         &images,
     )?;
-    let shader = surface_shader(doc, &snapshot, &images, &geometry, mode);
     let camera = stored_camera(doc, &snapshot, camera_id)?;
+    let shader = surface_shader(
+        doc,
+        &snapshot,
+        &images,
+        &geometry,
+        mode,
+        ViewBasis::from_camera(&camera.camera)?,
+    );
     let scene = doc
         .scenes
         .get(&snapshot.scene_id)

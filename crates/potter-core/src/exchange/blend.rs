@@ -8327,19 +8327,85 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
             )),
         }
     }
-    // Workbench draws back faces unless the scene's viewport shading culls them; Potter's raster has no such setting.
+    // Workbench's viewport shading changes what its render draws. Potter's solid preview models the
+    // factory studio light with material colours, and none of the other options below.
     for scene in raw
         .get("scenes")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter(|scene| scene["display_backface_culling"].as_bool() == Some(true))
     {
-        losses.push(loss(
-            "blender.scene.display_backface_culling",
-            scene.get("name").and_then(Value::as_str),
-            "Blender's Workbench backface culling is not imported; Potter's solid preview draws back faces",
-        ));
+        let name = scene.get("name").and_then(Value::as_str);
+        let shading = &scene["display_shading"];
+        let on = |key: &str| shading[key].as_bool() == Some(true);
+        let off = |key: &str| shading[key].as_bool() == Some(false);
+        let unsupported = [
+            (
+                shading["light"] != "STUDIO",
+                "blender.scene.display_light",
+                "Blender's Workbench lighting is not STUDIO; Potter's solid preview is studio-lit only",
+            ),
+            (
+                !matches!(shading["studio_light"].as_str(), Some("" | "Default")),
+                "blender.scene.display_studio_light",
+                "Blender's studio light is not Default; Potter's solid preview uses the Default studio light",
+            ),
+            (
+                shading["color_type"] != "MATERIAL",
+                "blender.scene.display_color_type",
+                "Blender's Workbench colour source is not MATERIAL; Potter's solid preview draws material colours",
+            ),
+            (
+                on("use_world_space_lighting"),
+                "blender.scene.display_world_space_lighting",
+                "Blender's world-space studio lighting is not imported; Potter's solid preview lights in view space",
+            ),
+            (
+                off("show_specular_highlight"),
+                "blender.scene.display_specular_highlight",
+                "Blender's Workbench specular highlight is off; Potter's solid preview always shows it",
+            ),
+            (
+                on("show_cavity"),
+                "blender.scene.display_cavity",
+                "Blender's Workbench cavity is not imported; Potter's solid preview draws no cavity",
+            ),
+            (
+                on("show_shadows"),
+                "blender.scene.display_shadows",
+                "Blender's Workbench shadows are not imported; Potter's solid preview draws no shadows",
+            ),
+            (
+                on("show_object_outline"),
+                "blender.scene.display_object_outline",
+                "Blender's Workbench object outline is not imported; Potter's solid preview draws no outline",
+            ),
+            (
+                on("show_backface_culling"),
+                "blender.scene.display_backface_culling",
+                "Blender's Workbench backface culling is not imported; Potter's solid preview draws back faces",
+            ),
+            (
+                on("show_xray"),
+                "blender.scene.display_xray",
+                "Blender's Workbench X-ray is not imported; Potter's solid preview is opaque",
+            ),
+            (
+                on("use_dof"),
+                "blender.scene.display_dof",
+                "Blender's Workbench depth of field is not imported; Potter's solid preview has no depth of field",
+            ),
+            (
+                shading["background_type"] != "THEME",
+                "blender.scene.display_background",
+                "Blender's Workbench background is not the theme background; Potter's solid preview uses its fixed background",
+            ),
+        ];
+        for (is_unsupported, feature, reason) in unsupported {
+            if is_unsupported {
+                losses.push(loss(feature, name, reason));
+            }
+        }
     }
     for material in raw
         .get("materials")

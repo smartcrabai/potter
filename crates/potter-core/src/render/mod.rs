@@ -10,6 +10,7 @@ mod principled_tables;
 mod principled_tables_data;
 mod scene;
 mod sequence;
+mod studio;
 
 pub use pick::pick;
 pub use preview::{PreviewRequest, render_previews};

@@ -33,9 +33,10 @@ use super::{
     path::object_for_index,
     principled_bsdf::{diffuse_coefficient, specular_coefficient},
     raster::{
-        AlphaMode, Line, Mode, SurfaceHit, SurfaceShader, Triangle, blend_color,
+        AlphaMode, Line, Mode, SurfaceHit, SurfaceShader, Triangle, ViewBasis, blend_color,
         blend_corner_normals, blend_uv,
     },
+    studio,
 };
 
 /// Most color layers one object carries, and one hit can read (Blender's per-mesh limit).
@@ -527,9 +528,11 @@ pub(super) fn extract_geometry(
                         && matches!(mode, Mode::Beauty)
                         && (face_reads_colors || face_requires_hit_shading);
                     // Smooth triangles take lighting per pixel (raster) or per hit (path tracer).
+                    // Solid lights every hit from its view ray, so it keeps the base colour too.
                     let color = if corner_normals.is_some()
                         || (path_traced && matches!(mode, Mode::Beauty))
                         || lit_per_pixel
+                        || matches!(mode, Mode::Solid)
                     {
                         base_color
                     } else {
@@ -1482,25 +1485,29 @@ fn shading_params(
     params
 }
 
-/// Per-pixel lighting for smooth triangles in raster Solid and realtime Beauty output. Flat
-/// triangles keep the lighting baked into `Triangle::color`, which equals per-pixel lighting
-/// for a constant normal.
+/// Per-pixel lighting for raster Solid, which lights every hit in the camera's view space, and for
+/// smooth triangles in realtime Beauty output. Flat Beauty triangles keep the lighting baked into
+/// `Triangle::color`, which equals per-pixel lighting for a constant normal.
 pub(super) struct SceneShader<'a> {
     doc: &'a SceneDoc,
     snapshot: &'a Snapshot,
     images: &'a BTreeMap<String, ImageData>,
     geometry: &'a Geometry,
     mode: Mode,
+    /// The camera's view space, in which Solid's studio lights are fixed.
+    view: ViewBasis,
     evaluator_workspace: RefCell<EvaluatorWorkspace>,
 }
 
 /// The per-pixel shader for `mode`, or `None` when the raster outputs unlit or per-triangle colour.
+/// Beauty shades in world space and ignores `view`.
 pub(super) fn surface_shader<'a>(
     doc: &'a SceneDoc,
     snapshot: &'a Snapshot,
     images: &'a BTreeMap<String, ImageData>,
     geometry: &'a Geometry,
     mode: Mode,
+    view: ViewBasis,
 ) -> Option<Box<dyn SurfaceShader + 'a>> {
     match mode {
         Mode::Solid => {}
@@ -1513,11 +1520,16 @@ pub(super) fn surface_shader<'a>(
         images,
         geometry,
         mode,
+        view,
         evaluator_workspace: RefCell::new(EvaluatorWorkspace::default()),
     }))
 }
 
 impl SurfaceShader for SceneShader<'_> {
+    fn shades_every_hit(&self) -> bool {
+        matches!(self.mode, Mode::Solid)
+    }
+
     fn shade(&self, triangle: &Triangle, hit: &SurfaceHit) -> Result<[f64; 4]> {
         let material = self.geometry.materials.get(triangle.material_index);
         let prepared = self.geometry.prepared.get(triangle.material_index);
@@ -1539,6 +1551,28 @@ impl SurfaceShader for SceneShader<'_> {
             ];
             shading_params(material, base, hit.normal, &self.geometry.shader_warnings)
         });
+        if matches!(self.mode, Mode::Solid) {
+            // A back face is lit as its front: Workbench turns the normal toward the viewer
+            // before it encodes it (`workbench_normal_encode`, `front_face`).
+            let facing = if hit.view.dot(hit.geometric) < 0.0 {
+                -hit.normal
+            } else {
+                hit.normal
+            };
+            let albedo = DVec3::new(
+                params.base_color[0],
+                params.base_color[1],
+                params.base_color[2],
+            );
+            let lit = studio::shade(
+                albedo,
+                params.roughness,
+                params.metallic,
+                self.view.to_view(facing),
+                self.view.to_view(hit.view),
+            );
+            return Ok([lit.x, lit.y, lit.z, params.alpha]);
+        }
         let shadow = self.geometry.shadows.as_ref().map(|shadows| {
             (
                 &shadows.bvh,
@@ -1912,7 +1946,7 @@ fn shade(
         params.base_color[2],
     );
     let alpha = params.alpha;
-    if !matches!(mode, Mode::Solid | Mode::Beauty) {
+    if !matches!(mode, Mode::Beauty) {
         return Ok([albedo.x, albedo.y, albedo.z, alpha]);
     }
     let scene = doc.scenes.get(&snapshot.scene_id);
@@ -1922,96 +1956,66 @@ fn shade(
         reflectance: 1.0,
         ..*params
     };
-    if matches!(mode, Mode::Solid) {
-        result += albedo * 0.30;
-        for (direction, intensity, color) in [
-            (
-                DVec3::new(-0.45, -0.55, 0.70).normalize(),
-                1.05,
-                DVec3::splat(1.0),
-            ),
-            (
-                DVec3::new(0.65, 0.35, 0.55).normalize(),
-                0.45,
-                DVec3::new(0.72, 0.82, 1.0),
-            ),
-        ] {
-            result += punctual_radiance(&lobe, normal, normal, -direction, color, intensity);
-        }
-    } else {
-        // The camera is the view for the lobes and the environment; without one, the normal.
-        let view = scene
-            .and_then(|scene| scene.camera.as_ref())
-            .and_then(|camera_id| snapshot.nodes.get(camera_id))
-            .map(|camera| {
-                (DMat4::from_cols_array(&camera.world_matrix).transform_point3(DVec3::ZERO) - point)
-                    .normalize_or_zero()
-            })
-            .filter(|direction| direction.length_squared() > f64::EPSILON)
-            .unwrap_or(normal);
-        if let Some(world) = scene
-            .and_then(|value| value.world.as_ref())
-            .and_then(|id| doc.worlds.get(id))
-        {
-            let diffuse_environment =
-                prefiltered_world(world, &doc.node_groups, images, normal, 1.0)?;
-            let metallic = params.metallic.clamp(0.0, 1.0);
-            let roughness = params.roughness.clamp(0.0, 1.0);
-            result += albedo * diffuse_environment * (1.0 - metallic);
-            let reflection = (-view + normal * (2.0 * normal.dot(view))).normalize_or_zero();
-            let specular_environment =
-                prefiltered_world(world, &doc.node_groups, images, reflection, roughness)?;
-            let specular_f0 = dielectric_f0(params.ior, params.specular_ior_level);
-            let f0 = albedo * metallic + DVec3::splat(specular_f0 * (1.0 - metallic));
-            result += specular_environment * f0 * (1.0 - roughness).powi(2);
-        }
-        for (id, light_node) in &doc.nodes {
-            let Some(light) = light_node
-                .data
-                .as_ref()
-                .and_then(|data_id| doc.data_blocks.get(data_id))
-                .and_then(|block| block.light.as_ref())
-            else {
-                continue;
-            };
-            let Some(evaluated) = snapshot.nodes.get(id) else {
-                continue;
-            };
-            let matrix = DMat4::from_cols_array(&evaluated.world_matrix);
-            let point_shadow = shadow.and_then(|(_, _, maps)| maps.get(id));
-            result += light_contribution(
-                light,
-                matrix,
-                point,
-                shadow_point,
-                normal,
-                geometric,
-                view,
-                &lobe,
-                shadow,
-                point_shadow,
-            );
-        }
+    // The camera is the view for the lobes and the environment; without one, the normal.
+    let view = scene
+        .and_then(|scene| scene.camera.as_ref())
+        .and_then(|camera_id| snapshot.nodes.get(camera_id))
+        .map(|camera| {
+            (DMat4::from_cols_array(&camera.world_matrix).transform_point3(DVec3::ZERO) - point)
+                .normalize_or_zero()
+        })
+        .filter(|direction| direction.length_squared() > f64::EPSILON)
+        .unwrap_or(normal);
+    if let Some(world) = scene
+        .and_then(|value| value.world.as_ref())
+        .and_then(|id| doc.worlds.get(id))
+    {
+        let diffuse_environment = prefiltered_world(world, &doc.node_groups, images, normal, 1.0)?;
+        let metallic = params.metallic.clamp(0.0, 1.0);
+        let roughness = params.roughness.clamp(0.0, 1.0);
+        result += albedo * diffuse_environment * (1.0 - metallic);
+        let reflection = (-view + normal * (2.0 * normal.dot(view))).normalize_or_zero();
+        let specular_environment =
+            prefiltered_world(world, &doc.node_groups, images, reflection, roughness)?;
+        let specular_f0 = dielectric_f0(params.ior, params.specular_ior_level);
+        let f0 = albedo * metallic + DVec3::splat(specular_f0 * (1.0 - metallic));
+        result += specular_environment * f0 * (1.0 - roughness).powi(2);
     }
-    // Beauty only: Solid/preview keeps Blender Solid's viewport-colour rule and ignores the closure
-    // weight. In Beauty, reflectance weights every reflective closure (ambient, direct,
-    // environment).
-    let reflectance = if matches!(mode, Mode::Beauty) {
-        params.reflectance.clamp(0.0, 1.0)
-    } else {
-        1.0
-    };
-    let result = result * reflectance;
+    for (id, light_node) in &doc.nodes {
+        let Some(light) = light_node
+            .data
+            .as_ref()
+            .and_then(|data_id| doc.data_blocks.get(data_id))
+            .and_then(|block| block.light.as_ref())
+        else {
+            continue;
+        };
+        let Some(evaluated) = snapshot.nodes.get(id) else {
+            continue;
+        };
+        let matrix = DMat4::from_cols_array(&evaluated.world_matrix);
+        let point_shadow = shadow.and_then(|(_, _, maps)| maps.get(id));
+        result += light_contribution(
+            light,
+            matrix,
+            point,
+            shadow_point,
+            normal,
+            geometric,
+            view,
+            &lobe,
+            shadow,
+            point_shadow,
+        );
+    }
+    // In Beauty, reflectance weights every reflective closure (ambient, direct, environment).
+    let result = result * params.reflectance.clamp(0.0, 1.0);
     let result = result.max(DVec3::ZERO).min(DVec3::splat(1.0));
     // Emission sits outside the reflectance weight and the clamp: Cycles' `EmissionNode` emits
     // NODE_CLOSURE_EMISSION unscaled (intern/cycles/scene/shader_nodes.cpp:3071-3098), and neither
     // EEVEE nor Cycles clamps the strength (gpu_shader_material_principled.glsl:179,
     // intern/cycles/kernel/svm/closure.h:206-207).
-    let emission = if matches!(mode, Mode::Beauty) {
-        DVec3::from_array(params.emission_color) * params.emission_strength
-    } else {
-        DVec3::ZERO
-    };
+    let emission = DVec3::from_array(params.emission_color) * params.emission_strength;
     let result = result + emission;
     Ok([result.x, result.y, result.z, alpha])
 }
@@ -2289,6 +2293,7 @@ mod shading_normal_tests {
         triangle_corners, triangle_layer_colors, triangle_layer_uvs, world_face_normals,
     };
     use crate::render::principled_bsdf::{diffuse_coefficient, specular_coefficient};
+    use crate::render::raster::ViewBasis;
     use crate::shader::BsdfParams;
     use crate::{
         eval::{EvaluationContext, Snapshot},
@@ -2652,8 +2657,15 @@ mod shading_normal_tests {
             triangle.lit_per_pixel,
             "flat graph materials must be evaluated per hit"
         );
-        let shader = surface_shader(&doc, &snapshot, &images, &geometry, Mode::Beauty)
-            .ok_or_else(|| PotError::new(ErrorCode::InternalError, "Beauty shader is missing"))?;
+        let shader = surface_shader(
+            &doc,
+            &snapshot,
+            &images,
+            &geometry,
+            Mode::Beauty,
+            ViewBasis::default(),
+        )
+        .ok_or_else(|| PotError::new(ErrorCode::InternalError, "Beauty shader is missing"))?;
         let point = triangle.positions.iter().copied().sum::<DVec3>() / 3.0;
         let color = shader.shade(
             triangle,
