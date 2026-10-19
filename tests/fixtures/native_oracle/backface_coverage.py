@@ -1,8 +1,14 @@
-"""Blender 5.2.2 oracle: Workbench Solid draws back faces unless the scene's viewport culls them.
+"""Blender 5.2.2 oracle: which side of a plane each renderer draws.
 
-A 2x2 plane at z = 0 (normal +Z) is framed by an orthographic camera of scale 2.2, the framing
-Potter's preset `top` and `bottom` views use, and rendered in Workbench Solid from above and from
-below. Each value is the fraction of pixels that differ from the corner, which is background.
+A 2x2 plane at z = 0 (normal +Z) is framed by an orthographic camera of scale 2.2 at z = +5 (top)
+or z = -5 (bottom, rotated to look up), the framing Potter's `top` and `bottom` views use. Each
+case renders one PNG and records the fraction of pixels that differ from the corner, which is
+background.
+
+- Workbench (Solid): the scene's `show_backface_culling` decides. Off draws the back face; on
+  hides it.
+- EEVEE (Beauty): the material's `use_backface_culling` decides. The material is emissive red, so
+  a drawn face is lit regardless of lights.
 
 Run: blender -b --factory-startup --python backface_coverage.py -- <out.json> <png_dir>
 """
@@ -19,9 +25,18 @@ out_json, png_dir = sys.argv[sys.argv.index("--") + 1 :][:2]
 bpy.ops.wm.read_factory_settings(use_empty=True)
 scene = bpy.context.scene
 bpy.ops.mesh.primitive_plane_add(size=2.0, location=(0.0, 0.0, 0.0))
+plane = bpy.context.active_object
 # Workbench outlines the selected object; the outline is not part of the plane's coverage.
 bpy.context.view_layer.objects.active = None
 bpy.ops.object.select_all(action="DESELECT")
+
+material = bpy.data.materials.new("Single")
+material.use_nodes = True
+principled = material.node_tree.nodes["Principled BSDF"]
+principled.inputs["Base Color"].default_value = (0.0, 0.0, 0.0, 1.0)
+principled.inputs["Emission Color"].default_value = (1.0, 0.0, 0.0, 1.0)
+principled.inputs["Emission Strength"].default_value = 1.0
+plane.data.materials.append(material)
 
 camera_data = bpy.data.cameras.new("Camera")
 camera_data.type = "ORTHO"
@@ -30,7 +45,6 @@ camera = bpy.data.objects.new("Camera", camera_data)
 scene.collection.objects.link(camera)
 scene.camera = camera
 
-scene.render.engine = "BLENDER_WORKBENCH"
 scene.render.resolution_x = 64
 scene.render.resolution_y = 64
 scene.render.resolution_percentage = 100
@@ -58,14 +72,18 @@ VIEWS = {
     "top": ((0.0, 0.0, 5.0), (0.0, 0.0, 0.0)),
     "bottom": ((0.0, 0.0, -5.0), (math.pi, 0.0, 0.0)),
 }
+# label, view, engine, scene Workbench culling, material culling
 CASES = [
-    ("top", "top", False),
-    ("bottom", "bottom", False),
-    ("bottom_scene_culling", "bottom", True),
+    ("top", "top", "BLENDER_WORKBENCH", False, False),
+    ("bottom", "bottom", "BLENDER_WORKBENCH", False, False),
+    ("bottom_scene_culling", "bottom", "BLENDER_WORKBENCH", True, False),
+    ("eevee_bottom_material_culling", "bottom", "BLENDER_EEVEE", False, True),
 ]
 result = {}
-for label, view, culling in CASES:
-    scene.display.shading.show_backface_culling = culling
+for label, view, engine, scene_culling, material_culling in CASES:
+    scene.render.engine = engine
+    scene.display.shading.show_backface_culling = scene_culling
+    material.use_backface_culling = material_culling
     location, rotation = VIEWS[view]
     camera.location = location
     camera.rotation_euler = rotation
