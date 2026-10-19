@@ -255,6 +255,9 @@ pub struct Snapshot {
     /// Evaluated armature bone-head matrices in world space.
     #[serde(skip)]
     pub bone_matrices: BTreeMap<Id, BTreeMap<Id, [f64; 16]>>,
+    /// Raw armature-local pose matrices for f32 bone references, keyed by armature then bone.
+    #[serde(skip)]
+    pub bone_pose_matrices: BTreeMap<Id, BTreeMap<Id, [f64; 16]>>,
     /// Instance source paths recorded by geometry-node modifiers.
     #[serde(skip)]
     pub instance_paths: BTreeMap<Id, Vec<Vec<Id>>>,
@@ -944,32 +947,63 @@ impl Snapshot {
             }
         }
         let mut bone_matrices = BTreeMap::new();
+        let mut bone_pose_matrices = BTreeMap::new();
+        let modifier_pose_armatures = modifier_pose_armatures(doc, &evaluated_node_ids, gate, None);
         for (id, node) in &doc.nodes {
-            if node.kind == "armature" && evaluated_node_ids.contains(id) {
+            if node.kind == "armature"
+                && (evaluated_node_ids.contains(id) || modifier_pose_armatures.contains(id))
+            {
                 let armature_world = matrices.get(id).copied().ok_or_else(|| {
                     PotError::new(
                         ErrorCode::InternalError,
                         "evaluated armature world matrix is missing",
                     )
                 })?;
-                let bones = rig::evaluate_armature_bone_world_matrices_with_resources(
-                    doc,
-                    id,
-                    frame,
-                    armature_world,
-                    &matrices,
-                    driver_values,
-                    modifier_context.project_root,
-                    scene.fps,
-                    scene.fps_base,
-                )?;
+                let (world, pose) = if modifier_pose_armatures.contains(id) {
+                    let evaluated =
+                        rig::evaluate_armature_bone_world_and_pose_matrices_with_resources(
+                            doc,
+                            id,
+                            frame,
+                            armature_world,
+                            &matrices,
+                            driver_values,
+                            modifier_context.project_root,
+                            scene.fps,
+                            scene.fps_base,
+                        )?;
+                    (evaluated.world, evaluated.pose)
+                } else {
+                    (
+                        rig::evaluate_armature_bone_world_matrices_with_resources(
+                            doc,
+                            id,
+                            frame,
+                            armature_world,
+                            &matrices,
+                            driver_values,
+                            modifier_context.project_root,
+                            scene.fps,
+                            scene.fps_base,
+                        )?,
+                        None,
+                    )
+                };
                 bone_matrices.insert(
                     id.clone(),
-                    bones
+                    world
                         .into_iter()
                         .map(|(bone_id, matrix)| (bone_id, matrix.to_cols_array()))
                         .collect(),
                 );
+                if let Some(pose) = pose {
+                    bone_pose_matrices.insert(
+                        id.clone(),
+                        pose.into_iter()
+                            .map(|(bone_id, matrix)| (bone_id, matrix.to_cols_array()))
+                            .collect(),
+                    );
+                }
             }
         }
         let mut evaluation_key = json!({
@@ -1804,33 +1838,64 @@ impl Snapshot {
                 }
             }
             bone_matrices.clear();
+            bone_pose_matrices.clear();
             for (id, node) in &doc.nodes {
-                if node.kind == "armature" && evaluated_node_ids.contains(id) {
+                if node.kind == "armature"
+                    && (evaluated_node_ids.contains(id) || modifier_pose_armatures.contains(id))
+                {
                     let armature_world = matrices.get(id).copied().ok_or_else(|| {
                         PotError::new(
                             ErrorCode::InternalError,
                             "evaluated armature world matrix is missing",
                         )
                     })?;
-                    let bones = rig::evaluate_armature_bone_world_matrices_with_evaluated_meshes(
-                        doc,
-                        id,
-                        frame,
-                        armature_world,
-                        &matrices,
-                        driver_values,
-                        modifier_context.project_root,
-                        scene.fps,
-                        scene.fps_base,
-                        &meshes,
-                    )?;
+                    let (world, pose) = if modifier_pose_armatures.contains(id) {
+                        let evaluated =
+                            rig::evaluate_armature_bone_world_and_pose_matrices_with_evaluated_meshes(
+                                doc,
+                                id,
+                                frame,
+                                armature_world,
+                                &matrices,
+                                driver_values,
+                                modifier_context.project_root,
+                                scene.fps,
+                                scene.fps_base,
+                                &meshes,
+                            )?;
+                        (evaluated.world, evaluated.pose)
+                    } else {
+                        (
+                            rig::evaluate_armature_bone_world_matrices_with_evaluated_meshes(
+                                doc,
+                                id,
+                                frame,
+                                armature_world,
+                                &matrices,
+                                driver_values,
+                                modifier_context.project_root,
+                                scene.fps,
+                                scene.fps_base,
+                                &meshes,
+                            )?,
+                            None,
+                        )
+                    };
                     bone_matrices.insert(
                         id.clone(),
-                        bones
+                        world
                             .into_iter()
                             .map(|(bone_id, matrix)| (bone_id, matrix.to_cols_array()))
                             .collect(),
                     );
+                    if let Some(pose) = pose {
+                        bone_pose_matrices.insert(
+                            id.clone(),
+                            pose.into_iter()
+                                .map(|(bone_id, matrix)| (bone_id, matrix.to_cols_array()))
+                                .collect(),
+                        );
+                    }
                 }
             }
         }
@@ -1915,6 +1980,7 @@ impl Snapshot {
             strokes,
             volume_data,
             bone_matrices,
+            bone_pose_matrices,
             simulation_cache_key,
             simulated_velocities,
             simulated_particles,
