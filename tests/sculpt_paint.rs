@@ -900,7 +900,8 @@ fn sculpt_symmetry_and_repeat_strokes_are_deterministic() -> Result<(), Box<dyn 
         falloff: sculpt::Falloff::Linear,
         symmetry: symmetry.iter().map(|axis| (*axis).to_owned()).collect(),
         delta: None,
-        view: None,
+        // The top-view viewer at +Z, as the Blender oracles are generated (see sculpt_brush_parity.rs).
+        view: Some(DVec3::Z),
     };
     let mut mirrored = base.clone();
     sculpt::apply_stroke(&mut mirrored, &stroke(&["x"]))?;
