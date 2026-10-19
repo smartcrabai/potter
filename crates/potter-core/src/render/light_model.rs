@@ -9,6 +9,9 @@
 //!   `spot_smooth = 1 / ((1 − cos(angle / 2)) · blend)`.
 //! - `intern/cycles/scene/light.cpp`, `AreaLight::area`: a rectangle's area is its extents, and an
 //!   ellipse's (`DISK`, `ELLIPSE`) is `π/4` of its bounding rectangle.
+//! - `intern/cycles/kernel/light/area.h`: `area_light_spread_attenuation` confines an area light's
+//!   emission to a cone about its normal (`spread`), and `area_light_spread_clamp_light` makes light
+//!   sampling draw from the part of the emitter that the cone reaches.
 
 use std::f64::consts::{PI, TAU};
 
@@ -70,6 +73,31 @@ pub(crate) struct AreaShape {
     pub(crate) area: f64,
 }
 
+impl AreaShape {
+    /// A shape with unit axes and half extents, whose area is `AreaLight::area`'s.
+    pub(crate) fn new(
+        axis_u: DVec3,
+        axis_v: DVec3,
+        half_u: f64,
+        half_v: f64,
+        ellipse: bool,
+    ) -> Self {
+        let rectangle_area = 4.0 * half_u * half_v;
+        Self {
+            axis_u,
+            axis_v,
+            half_u,
+            half_v,
+            ellipse,
+            area: if ellipse {
+                rectangle_area * std::f64::consts::FRAC_PI_4
+            } else {
+                rectangle_area
+            },
+        }
+    }
+}
+
 /// Builds the world-space shape of an area light from its data and object transform
 /// (`intern/cycles/blender/light.cpp`, `BlenderSync::sync_light`).
 pub(crate) fn area_shape(data: &LightData, matrix: &DMat4) -> AreaShape {
@@ -81,21 +109,170 @@ pub(crate) fn area_shape(data: &LightData, matrix: &DMat4) -> AreaShape {
     };
     let extent_u = matrix.transform_vector3(DVec3::X) * data.area_size;
     let extent_v = matrix.transform_vector3(DVec3::Y) * size_v;
-    let half_u = extent_u.length() * 0.5;
-    let half_v = extent_v.length() * 0.5;
-    let ellipse = matches!(data.area_shape.as_str(), "DISK" | "ELLIPSE");
-    let rectangle_area = 4.0 * half_u * half_v;
-    AreaShape {
-        axis_u: extent_u.normalize_or_zero(),
-        axis_v: extent_v.normalize_or_zero(),
-        half_u,
-        half_v,
-        ellipse,
-        area: if ellipse {
-            rectangle_area * std::f64::consts::FRAC_PI_4
+    AreaShape::new(
+        extent_u.normalize_or_zero(),
+        extent_v.normalize_or_zero(),
+        extent_u.length() * 0.5,
+        extent_v.length() * 0.5,
+        matches!(data.area_shape.as_str(), "DISK" | "ELLIPSE"),
+    )
+}
+
+/// A Blender area light's `spread` (Cycles' `AreaLight::spread`): the emission is confined to the
+/// cone of half-angle `spread / 2` about the emitting normal.
+#[derive(Clone, Copy)]
+pub(crate) struct Spread {
+    /// Half the spread, in radians.
+    half: f64,
+}
+
+impl Spread {
+    /// The spread of a light with `spread` radians, or `None` at the default π, which leaves the
+    /// emission and the sampling unchanged.
+    pub(crate) fn new(spread: f64) -> Option<Self> {
+        (spread < PI).then(|| Self {
+            half: 0.5 * spread.max(0.0),
+        })
+    }
+
+    /// Whether the cone is a line (`spread` 0), which Cycles samples as a delta.
+    pub(crate) fn is_zero(self) -> bool {
+        self.half == 0.0
+    }
+
+    /// `tan(spread / 2)`.
+    fn tan_half(self) -> f64 {
+        self.half.tan()
+    }
+
+    /// Cycles' normalisation in `spread_attenuation`: `1 / (tan a − a)` for the half-angle `a`, with
+    /// its third-order form at small angles.
+    fn normalize(self) -> f64 {
+        if self.half > 0.05 {
+            1.0 / (self.tan_half() - self.half)
         } else {
-            rectangle_area
-        },
+            3.0 / self.half.powi(3)
+        }
+    }
+}
+
+/// Cycles' `area_light_spread_attenuation`: the factor on the emitter radiance towards `to_receiver`,
+/// the unit direction from the emitter point to the receiver, for an emitter with normal `normal`.
+pub(crate) fn spread_attenuation(spread: Spread, to_receiver: DVec3, normal: DVec3) -> f64 {
+    let cosine = normal.dot(to_receiver);
+    if cosine <= 0.0 {
+        return 0.0;
+    }
+    let tan_angle = normal.cross(to_receiver).length() / cosine;
+    if spread.is_zero() {
+        // Emission along the normal alone; π is the hemisphere integral that Cycles folds in.
+        return if tan_angle > 1.0e-5 { 0.0 } else { PI };
+    }
+    ((spread.tan_half() - tan_angle) * spread.normalize()).max(0.0)
+}
+
+/// The part of an area light that light sampling draws from for `receiver`, as Cycles'
+/// `area_light_spread_clamp_light`: the smallest of the emitter, a rectangle, and a disk that covers
+/// where the spread cone meets the emitter. Points of a rectangle or disk outside the emitter emit
+/// nothing, so sampling them only wastes samples. Returns the region's centre and shape, or `None`
+/// when the receiver is not in front of the emitter or no part of it reaches the receiver.
+pub(crate) fn spread_region(
+    shape: &AreaShape,
+    centre: DVec3,
+    normal: DVec3,
+    spread: Spread,
+    receiver: DVec3,
+) -> Option<(DVec3, AreaShape)> {
+    let height = normal.dot(receiver - centre);
+    if height <= 0.0 {
+        return None;
+    }
+    // The foot of the receiver on the emitter's plane, and the radius of the disk on that plane
+    // that the cone reaches.
+    let closest = receiver - height * normal;
+    let r_spread = height * spread.tan_half();
+    let offset = closest - centre;
+    let spread_u = shape.axis_u.dot(offset);
+    let spread_v = shape.axis_v.dot(offset);
+    let mut sample_spread = r_spread == 0.0;
+    let is_round = shape.ellipse && shape.half_u == shape.half_v;
+    if is_round && !sample_spread {
+        let r = shape.half_u;
+        let dist = spread_u.hypot(spread_v);
+        if dist >= r + r_spread {
+            return None;
+        }
+        sample_spread = dist <= (r - r_spread).abs() && r_spread < r;
+        if dist > (r - r_spread).abs() {
+            // The two disks cross: the smallest rectangle covering their overlap, along the line of
+            // centres.
+            let len_u = r + r_spread - dist;
+            let len_v = if (r * r - r_spread * r_spread).abs() >= dist * dist {
+                2.0 * r.min(r_spread)
+            } else {
+                ((2.0 * r_spread).powi(2) - (dist + (r_spread * r_spread - r * r) / dist).powi(2))
+                    .sqrt()
+            };
+            let circle_area = PI * r * r;
+            let spread_area = PI * r_spread * r_spread;
+            if len_u * len_v < circle_area.min(spread_area) {
+                let axis_u = (centre - closest).normalize_or_zero();
+                let axis_v = normal.cross(axis_u);
+                let rectangle_centre = 0.5 * (centre + closest + axis_u * (r_spread - r));
+                return Some((
+                    rectangle_centre,
+                    AreaShape::new(axis_u, axis_v, 0.5 * len_u, 0.5 * len_v, false),
+                ));
+            }
+            sample_spread = spread_area < circle_area;
+        }
+    } else if !is_round && !sample_spread {
+        // The rectangle that covers the disk, clipped to the emitter's own extents.
+        let min_u = (spread_u - r_spread).max(-shape.half_u);
+        let max_u = (spread_u + r_spread).min(shape.half_u);
+        let min_v = (spread_v - r_spread).max(-shape.half_v);
+        let max_v = (spread_v + r_spread).min(shape.half_v);
+        if min_u >= max_u || min_v >= max_v {
+            return None;
+        }
+        let rectangle_area = (max_u - min_u) * (max_v - min_v);
+        let spread_area = PI * r_spread * r_spread;
+        if !shape.ellipse || rectangle_area < shape.area.min(spread_area) {
+            let rectangle_centre = centre
+                + shape.axis_u * (0.5 * (min_u + max_u))
+                + shape.axis_v * (0.5 * (min_v + max_v));
+            return Some((
+                rectangle_centre,
+                AreaShape::new(
+                    shape.axis_u,
+                    shape.axis_v,
+                    0.5 * (max_u - min_u),
+                    0.5 * (max_v - min_v),
+                    false,
+                ),
+            ));
+        }
+        sample_spread = spread_area < shape.area;
+    }
+    if sample_spread {
+        let disk_centre = centre + shape.axis_u * spread_u + shape.axis_v * spread_v;
+        return Some((
+            disk_centre,
+            AreaShape::new(shape.axis_u, shape.axis_v, r_spread, r_spread, true),
+        ));
+    }
+    Some((centre, *shape))
+}
+
+/// Whether `point` lies on the emitter of `shape` centred at `centre`: inside its rectangle or ellipse.
+pub(crate) fn inside_emitter(shape: &AreaShape, centre: DVec3, point: DVec3) -> bool {
+    let offset = point - centre;
+    let u = offset.dot(shape.axis_u) / shape.half_u;
+    let v = offset.dot(shape.axis_v) / shape.half_v;
+    if shape.ellipse {
+        u * u + v * v <= 1.0
+    } else {
+        u.abs() <= 1.0 && v.abs() <= 1.0
     }
 }
 
