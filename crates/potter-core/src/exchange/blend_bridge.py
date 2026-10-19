@@ -2126,6 +2126,7 @@ def dump_scene(scene):
             "compositor": _scene_compositor(scene),
             "color_management": _color_management_dump(scene),
             "view_layers": layers,
+            "display_backface_culling": bool(scene.display.shading.show_backface_culling),
             "markers": [{"name": marker.name, "frame": int(marker.frame)} for marker in scene.timeline_markers],
             "rigid_body_world": _rigid_body_world_dump(scene),
             "sequencer": _sequencer_dump(scene),
@@ -6712,7 +6713,7 @@ def export_doc(doc, target, pack, scene_hash, context):
         mat.use_nodes = True
         set_id(mat.node_tree, item.get("node_tree"))
         _set_principled_values(mat, item)
-        mat.use_backface_culling = not bool(item.get("double_sided", False))
+        mat.use_backface_culling = not bool(item.get("double_sided", True))
         mat.displacement_method = "DISPLACEMENT" if item.get("displacement_method") == "displacement" else "BUMP"
         set_id(mat, material_id)
         source = compatibility_block(doc, "materials", "Material", material_id)
