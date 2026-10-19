@@ -19,6 +19,11 @@ const SET_FIELDS: &[&str] = &[
     "motion_blur",
     "shutter",
     "motion_blur_samples",
+    "dicing_rate",
+    "preview_dicing_rate",
+    "max_subdivisions",
+    "offscreen_dicing_scale",
+    "dicing_camera",
 ];
 
 pub(super) fn apply(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bool> {
@@ -110,6 +115,39 @@ pub(super) fn apply(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> 
     let max_bounces = optional_u32(engine, set, "max_bounces", 0, 1024)?;
     let transparent_max_bounces = optional_u32(engine, set, "transparent_max_bounces", 0, 1024)?;
     let motion_blur_samples = optional_u32(engine, set, "motion_blur_samples", 1, 64)?;
+    let dicing_rate = optional_f64(engine, set, "dicing_rate", 0.1, 1000.0)?;
+    let preview_dicing_rate = optional_f64(engine, set, "preview_dicing_rate", 0.1, 1000.0)?;
+    let max_subdivisions = optional_u32(engine, set, "max_subdivisions", 0, 16)?;
+    let offscreen_dicing_scale =
+        optional_f64(engine, set, "offscreen_dicing_scale", 1.0, f32::MAX as f64)?;
+    let dicing_camera = set
+        .get("dicing_camera")
+        .map(|value| {
+            if value.is_null() {
+                return Ok(None);
+            }
+            let camera_id = value.as_str().ok_or_else(|| {
+                engine.error(
+                    ErrorCode::InvalidOperation,
+                    "dicing_camera must be null or a camera ID",
+                    &operation_pointer(engine.operation_index, "set/dicing_camera"),
+                )
+            })?;
+            let camera_id = parse_id(
+                engine,
+                camera_id,
+                &operation_pointer(engine.operation_index, "set/dicing_camera"),
+            )?;
+            if !engine.doc.is_camera_object(&camera_id) {
+                return Err(engine.error(
+                    ErrorCode::InvalidOperation,
+                    "dicing_camera must reference a camera object",
+                    &operation_pointer(engine.operation_index, "set/dicing_camera"),
+                ));
+            }
+            Ok(Some(camera_id))
+        })
+        .transpose()?;
     let motion_blur = set
         .get("motion_blur")
         .map(|value| {
@@ -251,6 +289,21 @@ pub(super) fn apply(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> 
         if let Some(value) = motion_blur_samples {
             scene.render.motion_blur_samples = value;
         }
+        if let Some(value) = dicing_rate {
+            scene.render.dicing_rate = value;
+        }
+        if let Some(value) = preview_dicing_rate {
+            scene.render.preview_dicing_rate = value;
+        }
+        if let Some(value) = max_subdivisions {
+            scene.render.max_subdivisions = value;
+        }
+        if let Some(value) = offscreen_dicing_scale {
+            scene.render.offscreen_dicing_scale = value;
+        }
+        if let Some(value) = dicing_camera {
+            scene.render.dicing_camera = value;
+        }
         scene.render != before
     };
     if changed {
@@ -290,6 +343,28 @@ fn optional_u32(
                 ));
             }
             Ok(number)
+        })
+        .transpose()
+}
+fn optional_f64(
+    engine: &Engine<'_>,
+    set: &Map<String, Value>,
+    key: &str,
+    minimum: f64,
+    maximum: f64,
+) -> Result<Option<f64>> {
+    set.get(key)
+        .map(|value| {
+            let number = value
+                .as_f64()
+                .filter(|number| number.is_finite() && (minimum..=maximum).contains(number));
+            number.ok_or_else(|| {
+                engine.error(
+                    ErrorCode::InvalidOperation,
+                    format!("{key} must be finite and in {minimum}..={maximum}"),
+                    &operation_pointer(engine.operation_index, &format!("set/{key}")),
+                )
+            })
         })
         .transpose()
 }

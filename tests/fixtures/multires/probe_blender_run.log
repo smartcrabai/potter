@@ -1,0 +1,18 @@
+00:01.062  blend            | Read blend: "/Users/admin/apps/potter-pr18m/tests/fixtures/multires/probe_uniform_level2.blend"
+PROBE external_save result {'FINISHED'} is_external True
+PROBE blender uniform bytes 2704 {'magic': 'BCDF', 'endian': 0, 'version': 0, 'subversion': 0, 'file_header_size': 20, 'file_type': 1, 'layer_count': 1, 'mesh_header_size': 4, 'layer_header_size': 88, 'layer_datatype': 0, 'layer_data_size': 2592, 'layer_type': 19}
+Info: Saved as "probe_uniform_level2.blend"
+PROBE reload start blender_uniform_level2 filepath /Users/admin/apps/potter-pr18m/tests/fixtures/multires/probe_uniform_level2.btx
+PROBE reload done blender_uniform_level2 evaluated_vertices 98
+00:01.068  blend            | Read blend: "/Users/admin/apps/potter-pr18m/tests/fixtures/multires/probe_uniform_level2.blend"
+PROBE reload start python_uniform_level1_total2 filepath /Users/admin/apps/potter-pr18m/tests/fixtures/multires/probe_uniform_level1_total2.btx
+00:01.073  geom.customdata  | ERROR failed to read multires displacement 10/24 9
+PROBE reload done python_uniform_level1_total2 evaluated_vertices 98
+00:01.074  blend            | Read blend: "/Users/admin/apps/potter-pr18m/tests/fixtures/multires/probe_uniform_level2.blend"
+PROBE reload start python_mixed_levels_total2 filepath /Users/admin/apps/potter-pr18m/tests/fixtures/multires/probe_mixed_levels_total2.btx
+00:01.079  geom.customdata  | ERROR failed to read multires displacement 17/24 9
+PROBE reload done python_mixed_levels_total2 evaluated_vertices 98
+PROBE report written /Users/admin/apps/potter-pr18m/tests/fixtures/multires/probe_report.json
+Blender 5.2.2 LTS (hash d13f752e3b9c built 2026-09-15 01:49:19)
+
+Blender quit
