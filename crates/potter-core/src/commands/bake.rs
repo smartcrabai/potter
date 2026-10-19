@@ -69,6 +69,7 @@ pub fn run(args: BakeArgs) -> Result<(Option<SceneInfo>, Value)> {
             .map(parse_id)
             .transpose()?,
         frame: None,
+        adaptive_render: None,
         purpose: EvaluationPurpose::Render,
     };
     let cache_directory = project.cache_directory();

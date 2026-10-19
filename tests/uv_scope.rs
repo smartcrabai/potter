@@ -477,8 +477,7 @@ fn paint_operation(uv_layer: Option<&str>) -> Value {
         "samples":[{"position":[0.0,0.0,1.0],"radius":0.2,"pressure":1.0,"strength":1.0,"time":0.0}],
         "color":[1.0,0.0,0.0,1.0],
         "blend":"mix",
-        "falloff":"linear",
-        "seed":7
+        "falloff":"linear"
     });
     if let Some(uv_layer) = uv_layer {
         operation["uv_layer"] = json!(uv_layer);
