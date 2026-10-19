@@ -21,12 +21,7 @@ mod native_oracle;
 #[path = "common/process.rs"]
 mod process;
 
-use std::{
-    error::Error,
-    fs,
-    path::Path,
-    process::Command,
-};
+use std::{error::Error, fs, path::Path, process::Command};
 
 use blender_checked::blender_executable;
 use native_oracle::{
