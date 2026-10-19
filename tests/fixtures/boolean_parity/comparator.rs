@@ -425,7 +425,10 @@ fn attribute_rows(mesh: &Mesh, domain: &str) -> TestResult<Option<Vec<AttributeV
 
     for (storage_name, attribute) in &mesh.attributes {
         // Blender-internal state (`.select_*`, `.hide_*`) is not a user attribute; the generator skips it too.
+        // Shading is not a user attribute on either side: the generator excludes Blender's `sharp_face`
+        // (its inverse) from every domain, so Potter's raw `shade_smooth` store is skipped here too.
         if storage_name == "custom_normal"
+            || storage_name == "shade_smooth"
             || user_attribute_name(storage_name).starts_with('.')
             || attribute.get("domain").and_then(Value::as_str) != Some(native_domain)
         {
