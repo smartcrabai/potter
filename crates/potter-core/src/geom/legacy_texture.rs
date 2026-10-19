@@ -14,7 +14,7 @@
 
 use std::{collections::BTreeMap, f64::consts::PI, path::Path};
 
-use crate::blender_rng::BlenderRng;
+use crate::blender_rng::{BlenderRng, HASH_UCHAR_512};
 use glam::DVec3;
 use serde_json::{Map, Value, json};
 
@@ -2390,21 +2390,6 @@ const fn decode_u8_table<const N: usize>(hex: &str) -> [u8; N] {
     output
 }
 
-const HASH512_HEX: &str = concat!(
-    "a2a0193bf8ebaaeef31c67281ded00de952edc3f3a82354d6cba36d0f60c7932d159f4088b63892fb8b49783f28f18c7",
-    "51146587482042a880b54013b2227e57bc7f6b9d864cc8db7cd5254e5a557450cdb37abbc3cbb6e2e4ecfd980b96d39e",
-    "5ca164f18161e1c42472498c904b843438ab78ca1f01d79311c158a931f9446dbf339c5f0994a38506c69a1e7b461530",
-    "272b1b713c5bd66f62ac4fc2c00eb123a7df47b0776905e9e6e776730ffe6e9b56ef12a537fcaed9038edd10b9cec98d",
-    "da2abd68179fbed40accd2e8433d70b7027d99d80d608a042c3e92e5af5307e029a6c5e3f5f74a41266a165e522d21ad",
-    "f091ffea54fa661a4539cf75a488fb5da2a0193bf8ebaaeef31c67281ded00de952edc3f3a82354d6cba36d0f60c7932",
-    "d159f4088b63892fb8b49783f28f18c751146587482042a880b54013b2227e57bc7f6b9d864cc8db7cd5254e5a557450",
-    "cdb37abbc3cbb6e2e4ecfd980b96d39e5ca164f18161e1c42472498c904b843438ab78ca1f01d79311c158a931f9446d",
-    "bf339c5f0994a38506c69a1e7b461530272b1b713c5bd66f62ac4fc2c00eb123a7df47b0776905e9e6e776730ffe6e9b",
-    "56ef12a537fcaed9038edd10b9cec98dda2abd68179fbed40accd2e8433d70b7027d99d80d608a042c3e92e5af5307e0",
-    "29a6c5e3f5f74a41266a165e522d21adf091ffea54fa661a4539cf75a488fb5d",
-);
-const HASH512: [u8; 512] = decode_u8_table::<512>(HASH512_HEX);
-
 const HASHPOINT_HEX: &str = concat!(
     "3f0972693cab55ef3f005eb33e5d81f13f045c793f528d223f771ee23ec12f2b3f2dc37a3f3e9a803dc827313ecaef4e",
     "3e7d22853f0559813f1d07853f0ac8a33e1656263e82cf743f4f950c3f237dfa3f7b11e83e95aa713eb744f63dea411c",
@@ -2694,7 +2679,7 @@ fn table_float(table: &[u32], index: usize) -> f32 {
 }
 
 fn hash_value(index: usize) -> usize {
-    HASH512.get(index).copied().map_or(0, usize::from)
+    HASH_UCHAR_512.get(index).copied().map_or(0, usize::from)
 }
 
 fn noise_hash(x: i32, y: i32, z: i32) -> usize {
