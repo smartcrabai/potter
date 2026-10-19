@@ -30,8 +30,8 @@ LIGHT_SIZE = float(light_size)
 SAMPLES = int(samples)
 SEEDS = int(seeds)
 
-WIDTH = 64
-HEIGHT = 64
+WIDTH = 16
+HEIGHT = 16
 # Fractions of the frame: [0.25, 0.75] spans the central half of the plane's image.
 PATCH = [0.25 + 0.5 * index / 8 for index in range(9)]
 # Radiance 506 W/(sr m²) for every size: power = radiance · π · area.
