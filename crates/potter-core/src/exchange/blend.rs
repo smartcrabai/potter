@@ -26,7 +26,7 @@ use crate::{
         CurvePoint, CurveSpline, CurveSplineType, DataBlock, Driver, DriverType, DriverVariable,
         DriverVariableType, Extrapolation, FCurve, ForceField, ForceFieldType, GreasePencilData,
         GreasePencilFrame, GreasePencilLayer, GreasePencilPoint, GreasePencilStroke, Id, Image,
-        ImageAlphaMode, ImageColorspace, ImageSource, Interpolation, Keyframe, Library,
+        ImageAlphaMode, ImageColorspace, ImageSource, ImageTile, Interpolation, Keyframe, Library,
         LibraryKind, LibraryOverride, LibraryOverrideProperty, LibraryStatus, LightData, LightType,
         Material, MaterialLink, Modifier, MovieClip, MovieTracking, NlaBlendType, NlaExtrapolation,
         NlaStrip, NlaTrack, Node, ParentType, Profile, Registry, RenderSettings, RigidBody,
@@ -1447,7 +1447,10 @@ fn add_blender_image_pixels(document: &mut Value, project: &Project) -> Result<(
     for image_json in images.values_mut() {
         let image: Image =
             serde_json::from_value(image_json.clone()).map_err(PotError::internal_json)?;
-        if image.blob.is_none() && image.source_path.as_deref().is_none_or(str::is_empty) {
+        if image.blob.is_none()
+            && image.source_path.as_deref().is_none_or(str::is_empty)
+            && !image.base_is_missing()
+        {
             continue;
         }
         let data = crate::image::load_image_data(
@@ -1456,16 +1459,21 @@ fn add_blender_image_pixels(document: &mut Value, project: &Project) -> Result<(
             crate::image::ImageInterpolation::Linear,
         )?;
         // The stored values, with the alpha mode the Blender datablock gets: a premultiplied EXR stays associated, and a
-        // straight image is straight, so Blender's packed file and its alpha mode agree (`_pack_image`).
-        image_json["pixels"] = json!(blender_image_pixels(&image, data.width, &data.pixels));
+        // straight image is straight, so Blender's packed file and its alpha mode agree (`_pack_image`). A UDIM image is
+        // sent as its tiles only: the base is tile 1001 among them, so its pixels are not sent twice.
+        if image.is_udim() {
+            image_json["udim_tiles"] = udim_export_tiles(&image, &data, project)?;
+        } else {
+            image_json["pixels"] = json!(blender_image_pixels(&image, data.width, &data.pixels));
+            if let Some(png) = eight_bit_png_bytes(&image, project)? {
+                image_json["png_bytes"] = json!(png);
+            }
+        }
         image_json["alpha_mode"] = json!(match image.alpha_mode {
             crate::model::ImageAlphaMode::Straight => "straight",
             crate::model::ImageAlphaMode::Premultiplied => "premultiplied",
             crate::model::ImageAlphaMode::None => "none",
         });
-        if let Some(png) = eight_bit_png_bytes(&image, project)? {
-            image_json["png_bytes"] = json!(png);
-        }
     }
     Ok(())
 }
@@ -1474,11 +1482,14 @@ fn add_blender_image_pixels(document: &mut Value, project: &Project) -> Result<(
 /// unchanged, so the reopened values are the file's own 8-bit values; a float save would convert them. Only the
 /// PNG signature and the IHDR bit depth (byte 24, after 8 signature, 4 length, 4 type, 8 size bytes) decide.
 fn eight_bit_png_bytes(image: &Image, project: &Project) -> Result<Option<Vec<u8>>> {
-    let Some(hex) = image
+    image
         .blob
         .as_deref()
-        .and_then(|blob| blob.strip_prefix("sha256:"))
-    else {
+        .map_or(Ok(None), |blob| eight_bit_png_blob(blob, project))
+}
+
+fn eight_bit_png_blob(blob: &str, project: &Project) -> Result<Option<Vec<u8>>> {
+    let Some(hex) = blob.strip_prefix("sha256:") else {
         return Ok(None);
     };
     let path = project
@@ -1490,6 +1501,81 @@ fn eight_bit_png_bytes(image: &Image, project: &Project) -> Result<Option<Vec<u8
     let bytes = fs::read(&path).map_err(|error| PotError::io(&error))?;
     let is_png = bytes.starts_with(b"\x89PNG\r\n\x1a\n");
     Ok((is_png && bytes.get(24) == Some(&8)).then_some(bytes))
+}
+
+/// The UDIM tiles of an image for Blender's packed TILED image, base tile 1001 included. When every tile is an 8-bit
+/// PNG, each carries its original bytes, so Blender samples the same byte path as the source. Otherwise every tile
+/// carries its float pixels and is written as EXR.
+// shortcut: a set with any non-PNG tile re-encodes every tile as EXR, since one TILED image has one file extension,
+// and a linked base without a blob is not packed as PNG; upgrade when Blender tiles carry per-tile formats.
+fn udim_export_tiles(
+    image: &Image,
+    data: &crate::image::ImageData,
+    project: &Project,
+) -> Result<Value> {
+    let mut sources = Vec::with_capacity(image.tiles.len() + 1);
+    // A missing base has no size and no pixels to pack; Blender then samples tile 1001 as unlisted, as it does here.
+    if data.width != 0 && data.height != 0 {
+        sources.push((
+            1001,
+            data.width,
+            data.height,
+            data.pixels.as_slice(),
+            eight_bit_png_bytes(image, project)?,
+        ));
+    }
+    for tile in &image.tiles {
+        // A missing tile has no pixels to pack, and Blender samples its number as unlisted, which renders the same
+        // missing colour; `export_losses` reports the tile.
+        let Some(decoded) = data.tiles.get(&tile.number) else {
+            continue;
+        };
+        let png = match tile.blob.as_deref() {
+            Some(blob) => eight_bit_png_blob(blob, project)?,
+            None => None,
+        };
+        sources.push((
+            tile.number,
+            decoded.width,
+            decoded.height,
+            decoded.pixels.as_slice(),
+            png,
+        ));
+    }
+    // A UDIM image with no loadable tile is written as a TILED placeholder with no files. Blender holds such an image
+    // (its `<UDIM>` filepath names nothing), and the missing base and tiles are reported as export losses.
+    if sources.is_empty() {
+        return Ok(json!({"format": "placeholder", "tiles": []}));
+    }
+    let all_png = sources.iter().all(|source| source.4.is_some());
+    let mut tiles = sources
+        .into_iter()
+        .map(|(number, width, height, pixels, png)| match png {
+            Some(bytes) if all_png => {
+                json!({"number": number, "width": width, "height": height, "png_bytes": bytes})
+            }
+            _ => json!({
+                "number": number,
+                "width": width,
+                "height": height,
+                "pixels": blender_image_pixels(image, width, pixels),
+            }),
+        })
+        .collect::<Vec<_>>();
+    // A tile's label goes with its record. The base tile has no record, so it carries no label.
+    for tile_json in &mut tiles {
+        let number = tile_json["number"].as_u64();
+        let label = image
+            .tiles
+            .iter()
+            .find(|tile| Some(u64::from(tile.number)) == number)
+            .map(|tile| tile.label.as_str())
+            .filter(|label| !label.is_empty());
+        if let Some(label) = label {
+            tile_json["label"] = json!(label);
+        }
+    }
+    Ok(json!({"format": if all_png { "png" } else { "exr" }, "tiles": tiles}))
 }
 
 /// Potter's decoded pixels in Blender's image layout. Potter stores rows top-down and scene-linear values; Blender's
@@ -3266,12 +3352,21 @@ fn build_imported_graph(
                 .map_err(|_| invalid_intermediate("image metadata is invalid"))?;
             // The Blender image carries its own packed pixels; they are the only asset that exists after reopen,
             // so they replace the blob recorded for the source image (a generated image's stored pixels).
-            if image.source != ImageSource::File
+            let tiled = is_tiled_image(item);
+            image.tiled = tiled;
+            if (image.source != ImageSource::File || tiled)
                 && let Some(packed) =
                     imported_image_from_resource(item, &resource_ids, &resource_assets, &doc)?
             {
                 image.blob = packed.blob;
                 image.source_hash = packed.source_hash;
+                image.tiles = packed.tiles;
+                image.width = packed.width;
+                image.height = packed.height;
+                if tiled {
+                    image.source = packed.source;
+                    image.source_path = None;
+                }
                 image.alpha_mode = packed.alpha_mode;
             }
             // A linked image reopens from the sidecar copy that its Blender filepath names, when that copy is the image.
@@ -4190,7 +4285,8 @@ fn build_imported_graph(
             .unwrap_or("5.2.0")
             .to_owned(),
     };
-    let losses = import_losses(raw);
+    let mut losses = import_losses(raw);
+    losses.extend(missing_udim_tile_losses(images, &resource_ids, &doc)?);
     let id_mappings = serde_json::to_value(&mappings).map_err(PotError::internal_json)?;
     let source = json!({
         "format": "blend",
@@ -4247,35 +4343,92 @@ fn imported_image_from_resource(
     doc: &SceneDoc,
 ) -> Result<Option<Image>> {
     let name = string_field(item, "name")?;
-    let resource_id = item
-        .get("filepath")
-        .and_then(Value::as_str)
-        .filter(|path| !path.is_empty())
-        .and_then(|path| resource_ids.get(path))
-        .or_else(|| resource_ids.get(name));
-    let Some(resource_id) = resource_id else {
-        return Ok(None);
+    let tiled = is_tiled_image(item);
+    let resource_id = if tiled {
+        resource_ids.get(&blend_tile_key(name, 1001))
+    } else {
+        item.get("filepath")
+            .and_then(Value::as_str)
+            .filter(|path| !path.is_empty())
+            .and_then(|path| resource_ids.get(path))
+            .or_else(|| resource_ids.get(name))
     };
-    let resource_id = Id::new(resource_id.clone())?;
-    let Some(resource) = doc.resources.get(&resource_id) else {
-        return Ok(None);
+    let declared = declared_colorspace(item);
+    let Some((source_hash, bytes)) = resource_source(resource_id, resource_assets, doc)? else {
+        // Blender keeps a UDIM image whose base file is missing and renders the base as its missing colour, so the
+        // record keeps its listed tiles with the base in the missing state.
+        if !tiled {
+            return Ok(None);
+        }
+        let tiles = imported_image_tiles(item, name, resource_ids, resource_assets, doc, declared)?;
+        // A TILED source keeps the image even with no listed tile: Blender still routes its lookups.
+        return Ok(Some(Image {
+            name: name.to_owned(),
+            source: ImageSource::File,
+            colorspace: declared.unwrap_or_default(),
+            width: 0,
+            height: 0,
+            tiles,
+            blob: None,
+            source_path: None,
+            source_hash: None,
+            tiled,
+            alpha_mode: imported_alpha_mode(name, item, None)?,
+        }));
     };
-    let Some(source_hash) = resource.get("hash").and_then(Value::as_str) else {
-        return Ok(None);
+    let (colorspace, width, height, _) =
+        crate::image::storage::decode_pixels_with_default_colorspace(bytes, declared)?;
+    let tiles = if tiled {
+        imported_image_tiles(
+            item,
+            name,
+            resource_ids,
+            resource_assets,
+            doc,
+            Some(colorspace),
+        )?
+    } else {
+        Vec::new()
     };
-    let Some((_, bytes)) = resource_assets
-        .iter()
-        .find(|(digest, _)| digest.as_str() == source_hash)
-    else {
-        return Ok(None);
-    };
-    // The document's image record declares the colour space; Blender's name is the fallback for records without one.
-    // A reloaded packed EXR takes its colour space from the file header, which the record does not depend on.
+    Ok(Some(Image {
+        name: name.to_owned(),
+        source: ImageSource::Packed,
+        colorspace,
+        width,
+        height,
+        tiles,
+        blob: Some(source_hash.to_owned()),
+        source_path: None,
+        source_hash: Some(source_hash.to_owned()),
+        tiled,
+        alpha_mode: imported_alpha_mode(name, item, Some(bytes))?,
+    }))
+}
+
+/// The alpha mode an imported image takes: the mode the bridge names for the Blender datablock, or the encoding's
+/// default when the record has none. A missing base has no bytes, so without a named mode it is straight.
+fn imported_alpha_mode(name: &str, item: &Value, bytes: Option<&[u8]>) -> Result<ImageAlphaMode> {
+    match item.get("alpha_mode").and_then(Value::as_str) {
+        None => Ok(bytes.map_or(
+            ImageAlphaMode::Straight,
+            crate::image::storage::default_alpha_mode,
+        )),
+        Some("straight") => Ok(ImageAlphaMode::Straight),
+        Some("premultiplied") => Ok(ImageAlphaMode::Premultiplied),
+        Some("none") => Ok(ImageAlphaMode::None),
+        Some(other) => Err(invalid_intermediate(&format!(
+            "image `{name}` has unknown alpha_mode `{other}`"
+        ))),
+    }
+}
+
+/// The colour space an imported image declares: its document record first, Blender's colour-space name as the fallback.
+fn declared_colorspace(item: &Value) -> Option<ImageColorspace> {
     let record_colorspace = item
         .get("potter_image")
         .and_then(|image| image.get("colorspace"))
         .and_then(|value| serde_json::from_value::<ImageColorspace>(value.clone()).ok());
-    let colorspace = record_colorspace.or_else(|| {
+    record_colorspace.or_else(|| {
         match item
             .get("colorspace")
             .and_then(Value::as_str)
@@ -4292,33 +4445,144 @@ fn imported_image_from_resource(
             Some(_) => Some(ImageColorspace::Srgb),
             None => None,
         }
-    });
-    let (colorspace, width, height, _) =
-        crate::image::storage::decode_pixels_with_default_colorspace(bytes, colorspace)?;
-    // Blender's alpha mode for the packed image, as the bridge names it. A record without one takes the encoding's default.
-    let alpha_mode = match item.get("alpha_mode").and_then(Value::as_str) {
-        None => crate::image::storage::default_alpha_mode(bytes),
-        Some("straight") => ImageAlphaMode::Straight,
-        Some("premultiplied") => ImageAlphaMode::Premultiplied,
-        Some("none") => ImageAlphaMode::None,
-        Some(other) => {
-            return Err(invalid_intermediate(&format!(
-                "image `{name}` has unknown alpha_mode `{other}`"
-            )));
-        }
+    })
+}
+
+/// The content hash and bytes of an imported resource, or `None` when it has no resource, no recorded hash, or no bytes
+/// (its file was missing at import).
+fn resource_source<'a>(
+    resource_id: Option<&String>,
+    resource_assets: &'a [(String, Vec<u8>)],
+    doc: &'a SceneDoc,
+) -> Result<Option<(&'a str, &'a [u8])>> {
+    let Some(resource_id) = resource_id else {
+        return Ok(None);
     };
-    Ok(Some(Image {
-        name: name.to_owned(),
-        source: ImageSource::Packed,
-        colorspace,
-        width,
-        height,
-        tiles: Vec::new(),
-        blob: Some(source_hash.to_owned()),
-        source_path: None,
-        source_hash: Some(source_hash.to_owned()),
-        alpha_mode,
-    }))
+    let resource_id = Id::new(resource_id.clone())?;
+    let Some(hash) = doc
+        .resources
+        .get(&resource_id)
+        .and_then(|resource| resource.get("hash"))
+        .and_then(Value::as_str)
+    else {
+        return Ok(None);
+    };
+    let Some((_, bytes)) = resource_assets
+        .iter()
+        .find(|(digest, _)| digest.as_str() == hash)
+    else {
+        return Ok(None);
+    };
+    Ok(Some((hash, bytes.as_slice())))
+}
+
+fn is_tiled_image(item: &Value) -> bool {
+    item.get("source").and_then(Value::as_str) == Some("TILED")
+}
+
+/// The resource key of one UDIM tile of a Blender image: its owner name and tile number.
+fn blend_tile_key(owner: &str, number: u32) -> String {
+    format!("{owner}\0tile\0{number}")
+}
+
+/// The UDIM tiles above 1001 of a TILED Blender image, each an immutable blob decoded in the base's colour space (the
+/// declared one when the base is missing). A tile whose file was missing at import keeps its number with no size or
+/// blob: the missing state. `missing_udim_tile_losses` reports it.
+fn imported_image_tiles(
+    item: &Value,
+    name: &str,
+    resource_ids: &BTreeMap<String, String>,
+    resource_assets: &[(String, Vec<u8>)],
+    doc: &SceneDoc,
+    colorspace: Option<ImageColorspace>,
+) -> Result<Vec<ImageTile>> {
+    let mut tiles = Vec::new();
+    for number in tiled_image_numbers(item)? {
+        if number <= 1001 {
+            continue;
+        }
+        let label = tile_label(item, number);
+        let Some((hash, bytes)) = resource_source(
+            resource_ids.get(&blend_tile_key(name, number)),
+            resource_assets,
+            doc,
+        )?
+        else {
+            tiles.push(ImageTile {
+                number,
+                width: 0,
+                height: 0,
+                blob: None,
+                label,
+            });
+            continue;
+        };
+        let (_, width, height, _) =
+            crate::image::storage::decode_pixels_with_default_colorspace(bytes, colorspace)?;
+        tiles.push(ImageTile {
+            number,
+            width,
+            height,
+            blob: Some(hash.to_owned()),
+            label,
+        });
+    }
+    Ok(tiles)
+}
+
+/// The label Blender gives a UDIM tile, from the bridge's `tile_labels`; empty when the tile has none.
+fn tile_label(item: &Value, number: u32) -> String {
+    item.get("tile_labels")
+        .and_then(|labels| labels.get(number.to_string()))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// The tile numbers a TILED Blender image lists, in Blender's order.
+fn tiled_image_numbers(item: &Value) -> Result<Vec<u32>> {
+    optional_array(item, "tile_numbers")?
+        .iter()
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|number| u32::try_from(number).ok())
+                .ok_or_else(|| invalid_intermediate("image tile number is invalid"))
+        })
+        .collect()
+}
+
+/// The tiles of TILED Blender images whose file was missing at import. Blender draws such a tile as opaque magenta
+/// (`IMAGE_MISSING_RGBA`, Blender 5.2.2 `intern/cycles/util/types_image.h`, returned by the CPU kernel when a tile
+/// load fails), so the loss names that render result; Potter imports no bytes for the tile.
+fn missing_udim_tile_losses(
+    images: &[Value],
+    resource_ids: &BTreeMap<String, String>,
+    doc: &SceneDoc,
+) -> Result<Vec<Loss>> {
+    let mut losses = Vec::new();
+    for item in images.iter().filter(|item| is_tiled_image(item)) {
+        let name = string_field(item, "name")?;
+        for number in tiled_image_numbers(item)? {
+            let available = resource_ids
+                .get(&blend_tile_key(name, number))
+                .and_then(|resource_id| Id::new(resource_id.clone()).ok())
+                .and_then(|resource_id| doc.resources.get(&resource_id))
+                .and_then(|resource| resource.get("status"))
+                .and_then(Value::as_str)
+                == Some("available");
+            if !available {
+                losses.push(loss(
+                    "blender.image.udim_tile_missing",
+                    Some(name),
+                    &format!(
+                        "UDIM tile {number} of image {name} has no file at import; Blender renders that tile as opaque magenta (IMAGE_MISSING_RGBA, intern/cycles/util/types_image.h), and Potter imports no bytes for it"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(losses)
 }
 
 /// The sidecar copy a linked image reopens from: the imported resource that the image's Blender filepath names, when that
@@ -5632,10 +5896,18 @@ fn import_blender_resources(
             .get("owner")
             .and_then(Value::as_str)
             .unwrap_or("Blender resource");
+        let tile_number = source
+            .get("tile_number")
+            .and_then(Value::as_u64)
+            .and_then(|number| u32::try_from(number).ok());
         let identity = resolved_path.as_ref().map_or_else(
             || owner.to_owned(),
             |path| path.to_string_lossy().into_owned(),
         );
+        let identity = match tile_number {
+            Some(number) => format!("{identity}\0{number}"),
+            None => identity,
+        };
         let seed = format!(
             "resource_{}",
             &crate::hash::sha256(format!("{kind}:{identity}").as_bytes())[7..19]
@@ -5690,6 +5962,9 @@ fn import_blender_resources(
             path_ids
                 .entry(owner.to_owned())
                 .or_insert_with(|| id.as_str().to_owned());
+        }
+        if let Some(number) = tile_number {
+            path_ids.insert(blend_tile_key(owner, number), id.as_str().to_owned());
         }
         if let (Some(digest), Some(bytes)) = (digest, bytes) {
             assets.push((digest, bytes));
@@ -8572,6 +8847,28 @@ fn socket_rgb(
 /// they are never a loss. Any other mesh attribute is a loss.
 pub(crate) fn export_losses(doc: &SceneDoc) -> Vec<Loss> {
     let mut losses = Vec::new();
+    for (image_id, image) in &doc.images {
+        if image.base_is_missing() {
+            losses.push(loss(
+                "blender.image.udim_tile_missing",
+                Some(image_id.as_str()),
+                &format!(
+                    "UDIM base tile 1001 of image {} is missing, so it has no pixels and is not exported; Blender renders the base as the missing colour",
+                    image.name
+                ),
+            ));
+        }
+        for tile in image.tiles.iter().filter(|tile| tile.blob.is_none()) {
+            losses.push(loss(
+                "blender.image.udim_tile_missing",
+                Some(image_id.as_str()),
+                &format!(
+                    "UDIM tile {} of image {} is missing, so Blender cannot pack it and it is not exported; Blender samples its number as unlisted, which renders as the missing colour",
+                    tile.number, image.name
+                ),
+            ));
+        }
+    }
     let mut fill_by_material = BTreeMap::<Id, [f64; 4]>::new();
     let mut unfilled_by_material = BTreeSet::<Id>::new();
     for (clip_id, clip) in &doc.movie_clips {
@@ -12053,6 +12350,7 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
                 source_path: Some(normal_path.to_string_lossy().into_owned()),
                 source_hash: Some(crate::hash::sha256(&normal_bytes)),
                 alpha_mode: ImageAlphaMode::Straight,
+                tiled: false,
             },
         );
         doc.images.insert(
@@ -12068,6 +12366,7 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
                 source_path: Some(emissive_path.to_string_lossy().into_owned()),
                 source_hash: Some(crate::hash::sha256(&emissive_bytes)),
                 alpha_mode: ImageAlphaMode::Straight,
+                tiled: false,
             },
         );
         let texture = |image: &Id, uv_layer: &str| crate::model::TextureRef {
@@ -12116,6 +12415,7 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
                     tiles: BTreeMap::new(),
                     interpolation: crate::image::ImageInterpolation::Linear,
                     srgb: false,
+                    udim: false,
                 },
             ),
             (
@@ -12129,6 +12429,7 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
                     tiles: BTreeMap::new(),
                     interpolation: crate::image::ImageInterpolation::Linear,
                     srgb: false,
+                    udim: false,
                 },
             ),
         ]);
@@ -12352,6 +12653,7 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
                     source_path: Some(path.to_string_lossy().into_owned()),
                     source_hash: Some(crate::hash::sha256(bytes)),
                     alpha_mode: ImageAlphaMode::Straight,
+                    tiled: false,
                 }
             };
         let shared_id = Id::new("shared_texture")?;
@@ -12904,6 +13206,7 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
                 source_path: Some(normal_path.to_string_lossy().into_owned()),
                 source_hash: Some(crate::hash::sha256(&bytes)),
                 alpha_mode: ImageAlphaMode::Straight,
+                tiled: false,
             },
         );
         // An authored Normal link: the native normal perturbs this vector, so the export must refuse it.

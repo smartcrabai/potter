@@ -1305,6 +1305,7 @@ mod tests {
             source_path: None,
             source_hash: Some(digest),
             alpha_mode: ImageAlphaMode::Straight,
+            tiled: false,
         };
         let mut scene = serde_json::to_value(SceneDoc::new(uuid::Uuid::new_v4().to_string()))?;
         scene["schema_version"] = json!(3);

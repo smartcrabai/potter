@@ -2631,6 +2631,7 @@ mod shading_normal_tests {
                 tiles: BTreeMap::new(),
                 interpolation: ImageInterpolation::Closest,
                 srgb: false,
+                udim: false,
             },
         )]);
         let geometry = extract_geometry(&doc, &snapshot, Mode::Beauty, false, &images)?;

@@ -1107,6 +1107,7 @@ fn load_strip_image(
         width: image_width,
         height: image_height,
         srgb: storage::decodes_srgb(ImageColorspace::Srgb),
+        udim: false,
         pixels,
         tiles: std::collections::BTreeMap::new(),
         interpolation: ImageInterpolation::Linear,
@@ -1132,6 +1133,7 @@ fn resize_image_data(data: &ImageData, width: u32, height: u32) -> Result<RgbaFr
                 tiles: std::collections::BTreeMap::new(),
                 interpolation: data.interpolation,
                 srgb: data.srgb,
+                udim: data.udim,
                 colour: crate::image::ColourCache::default(),
                 storage: crate::image::ImageStorage::default(),
             };

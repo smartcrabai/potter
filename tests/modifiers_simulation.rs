@@ -2426,6 +2426,7 @@ baseline_evaluated.to_mesh_clear()
         tiles: std::collections::BTreeMap::new(),
         interpolation: potter_core::image::ImageInterpolation::Linear,
         srgb: false,
+        udim: false,
     };
     let mapping_columns: [f64; 16] =
         serde_json::from_value(blender_expected["mapping_world"].clone())?;
