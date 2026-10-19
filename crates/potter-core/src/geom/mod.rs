@@ -802,8 +802,9 @@ impl Mesh {
             ))?;
         }
         for face in BOX_FACES {
-            // BM_face_create_ngon_verts creates each boundary edge from the previous corner to the
-            // next, so the closing edge (last to first) comes first. Existing edges are reused.
+            // BM_edges_from_verts_ensure (via BM_face_create_verts with create_edges) creates each
+            // boundary edge from the previous corner to the next, so the closing edge (last to first)
+            // comes first. Existing edges are reused.
             let mut previous = face[3];
             for corner in face {
                 let (first, second) = (ids[previous], ids[corner]);
