@@ -1,4 +1,4 @@
-//! View-curve export through Potter's `.blend` bridge, readback in Blender 5.2.x, and production re-import.
+//! View-curve and look export through Potter's `.blend` bridge, readback in Blender 5.2.x, and production re-import.
 
 use std::{error::Error, fs};
 
@@ -12,7 +12,10 @@ mod process;
 use blender_checked::blender_executable;
 use blender_script::run_blender_script;
 use potter_core::{
-    color::curve::{CurveMapping, CurvePoint, HandleType},
+    color::{
+        ViewTransform,
+        curve::{CurveMapping, CurvePoint, HandleType},
+    },
     eval::EvaluationContext,
     exchange::{
         ExportOptions,
@@ -41,6 +44,8 @@ bpy.ops.wm.open_mainfile(filepath=str(root / "view_curve.blend"))
 view = bpy.context.scene.view_settings
 mapping = view.curve_mapping
 assert view.use_curve_mapping is True
+assert view.view_transform == "AgX", view.view_transform
+assert view.look == "AgX - High Contrast", view.look
 assert mapping.extend == "HORIZONTAL", mapping.extend
 assert mapping.use_clip is True
 clip = [float(mapping.clip_min_x), float(mapping.clip_min_y),
@@ -66,6 +71,8 @@ samples = [1.5, 2.0, 2.125, 2.375, 2.625, 3.0, 3.5]
 with (root / "view_curve_readback.json").open("w", encoding="utf-8") as stream:
     json.dump({
         "enabled": bool(view.use_curve_mapping),
+        "view_transform": view.view_transform,
+        "look": view.look,
         "extend": mapping.extend,
         "use_clip": bool(mapping.use_clip),
         "clip": clip,
@@ -79,7 +86,7 @@ with (root / "view_curve_readback.json").open("w", encoding="utf-8") as stream:
 "#;
 
 #[test]
-fn view_curve_round_trips_through_blend_and_matches_blender() -> TestResult {
+fn view_curve_and_look_round_trip_through_blend_and_match_blender() -> TestResult {
     let Some(blender) = blender_executable() else {
         eprintln!("skipping view-curve roundtrip: Blender is unavailable");
         return Ok(());
@@ -113,6 +120,8 @@ fn view_curve_round_trips_through_blend_and_matches_blender() -> TestResult {
         .get_mut(&doc.active_scene)
         .ok_or("new scene document has an active scene")?;
     scene.color_management.curve = Some(expected_curve.clone());
+    scene.color_management.view_transform = ViewTransform::AgX;
+    scene.color_management.look = "agx_high_contrast".to_owned();
 
     let blend = root.join("view_curve.blend");
     let context = EvaluationContext::default();
@@ -138,6 +147,9 @@ fn view_curve_round_trips_through_blend_and_matches_blender() -> TestResult {
         serde_json::from_slice(&fs::read(root.join("view_curve_readback.json"))?)?;
 
     let imported = import_blend(&blend, Some(blender.as_path()))?;
+    let imported_color = &imported.doc.scenes[&imported.doc.active_scene].color_management;
+    assert_eq!(imported_color.view_transform, ViewTransform::AgX);
+    assert_eq!(imported_color.look, "agx_high_contrast");
     let imported_curve = imported.doc.scenes[&imported.doc.active_scene]
         .color_management
         .curve
@@ -196,6 +208,8 @@ fn view_curve_round_trips_through_blend_and_matches_blender() -> TestResult {
         serde_json::json!([2.0, 0.0, 3.0, 1.0])
     );
     assert_eq!(blender_data["tone"], "STANDARD");
+    assert_eq!(blender_data["view_transform"], "AgX");
+    assert_eq!(blender_data["look"], "AgX - High Contrast");
     assert_eq!(blender_data["curves"][3][1]["handle"], "AUTO_CLAMPED");
     let sample_x = blender_data["sample_x"]
         .as_array()
