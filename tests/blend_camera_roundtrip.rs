@@ -300,21 +300,44 @@ fn fisheye_equisolid_round_trips_its_lens_and_its_perspective_lens_apart()
 }
 
 #[test]
-fn settings_a_camera_projection_ignores_round_trip_without_loss() -> Result<(), Box<dyn Error>> {
-    // A perspective camera that holds panorama settings (Blender stores them on every camera) keeps them through Blender.
-    let Some(camera) = panorama_round_trip(
-        &json!({"projection": "perspective", "lens_mm": 28.0, "fisheye_lens": 12.0, "fisheye_fov": 3.0,
-                "longitude_min": -1.2, "longitude_max": 2.0, "latitude_min": -0.7, "latitude_max": 1.1}),
-        "import bpy; cam = [c for c in bpy.data.cameras if c.type == 'PERSP'][0]; assert abs(cam.lens - 28.0) < 1e-6; assert abs(cam.fisheye_lens - 12.0) < 1e-6; assert abs(cam.fisheye_fov - 3.0) < 1e-6; assert abs(cam.longitude_min + 1.2) < 1e-6; assert abs(cam.latitude_max - 1.1) < 1e-6",
-    )?
-    else {
+fn panorama_settings_on_a_perspective_camera_import_without_loss() -> Result<(), Box<dyn Error>> {
+    // Operations refuse a panorama field on a camera whose projection ignores it, so the value is set in Blender, as a
+    // Blender file can hold it (Blender stores these on every camera). Import keeps each value, and reports no loss.
+    let Some(blender) = blender_executable() else {
+        eprintln!(
+            "skipping the perspective panorama settings check; no executable Blender was found"
+        );
         return Ok(());
     };
+    let directory = tempdir()?;
+    let scene = directory.path().join("scene");
+    build_scene(
+        &scene,
+        &json!({"projection": "perspective", "lens_mm": 28.0}),
+    )?;
+    let blend = directory.path().join("perspective.blend");
+    run(
+        &mut export_command(&scene, &blend, &blender, &[]),
+        "exporting the perspective camera",
+    )?;
+    blender_python(
+        &blender,
+        &blend,
+        "import bpy; cam = [c for c in bpy.data.cameras if c.type == 'PERSP'][0]; cam.fisheye_lens = 12.0; cam.fisheye_fov = 3.0; cam.longitude_min = -1.2; cam.latitude_max = 1.1; bpy.ops.wm.save_as_mainfile(filepath=bpy.data.filepath)",
+    )?;
+    let output = run(
+        &mut import_command(&scene, &blend, &blender, &[]),
+        "importing the perspective camera",
+    )?;
+    let imported: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(imported["result"]["losses"], json!([]));
+    let camera = camera_data(&scene)?;
     assert_eq!(camera["projection"], "perspective");
     assert_close_value(&camera["lens_mm"], 28.0);
     assert_close_value(&camera["fisheye_lens"], 12.0);
     assert_close_value(&camera["fisheye_fov"], 3.0);
     assert_close_value(&camera["longitude_min"], -1.2);
+    assert_close_value(&camera["latitude_max"], 1.1);
     Ok(())
 }
 

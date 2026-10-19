@@ -2267,26 +2267,31 @@ mod tests {
             .as_array()
             .ok_or("oracle cameras are missing")?
         {
-            let data = CameraData {
+            let equisolid = match oracle_camera_data["panorama_type"].as_str() {
+                Some("FISHEYE_EQUISOLID") => true,
+                Some("FISHEYE_EQUIDISTANT") => false,
+                _ => return Err("oracle panorama type is unknown".into()),
+            };
+            let mut data = CameraData {
                 projection: CameraProjection::Panorama,
-                panorama_type: oracle_camera_data["panorama_type"]
-                    .as_str()
-                    .map(|name| match name {
-                        "FISHEYE_EQUIDISTANT" => "fisheye_equidistant",
-                        _ => "fisheye_equisolid",
-                    })
-                    .ok_or("oracle panorama type is missing")?
-                    .to_owned(),
+                panorama_type: if equisolid {
+                    "fisheye_equisolid".to_owned()
+                } else {
+                    "fisheye_equidistant".to_owned()
+                },
                 fisheye_fov: number(&oracle_camera_data["fisheye_fov"])?,
-                fisheye_lens: number(&oracle_camera_data["fisheye_lens"])?,
-                sensor_width_mm: number(&oracle_camera_data["sensor_width"])?,
-                sensor_height_mm: number(&oracle_camera_data["sensor_height"])?,
-                sensor_fit: oracle_camera_data["sensor_fit"]
-                    .as_str()
-                    .ok_or("oracle sensor fit is missing")?
-                    .to_owned(),
                 ..CameraData::default()
             };
+            // The equisolid lens and sensor are stored only for equisolid cameras; an equidistant camera has none.
+            if equisolid {
+                data.fisheye_lens = number(&oracle_camera_data["fisheye_lens"])?;
+                data.sensor_width_mm = number(&oracle_camera_data["sensor_width"])?;
+                data.sensor_height_mm = number(&oracle_camera_data["sensor_height"])?;
+                data.sensor_fit = oracle_camera_data["sensor_fit"]
+                    .as_str()
+                    .ok_or("oracle sensor fit is missing")?
+                    .to_owned();
+            }
             let projection = projection_for_camera(&data, CameraEngine::Path)?;
             let camera = oracle_camera(&oracle_camera_data["camera_to_world"], projection)?;
             let records = oracle_camera_data["records"]
