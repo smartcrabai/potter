@@ -1,0 +1,40 @@
+== subsurf_off
+PROBE input: edges=12 sharp=[] has_custom_normals=False
+PROBE flag use_custom_normals=False
+PROBE output has_custom_normals=False
+PROBE sharp_edges_out=0
+== subsurf_plain
+PROBE input: edges=12 sharp=[] has_custom_normals=False
+PROBE flag use_custom_normals=True
+PROBE output has_custom_normals=True
+PROBE sharp_edges_out=0
+== subsurf_sharp
+PROBE input: edges=12 sharp=[0] has_custom_normals=False
+PROBE flag use_custom_normals=True
+PROBE output has_custom_normals=True
+PROBE sharp_edges_out=2
+== subsurf_layer
+PROBE input: edges=12 sharp=[] has_custom_normals=True
+PROBE flag use_custom_normals=True
+PROBE output has_custom_normals=True
+PROBE sharp_edges_out=0
+== multires_off
+PROBE input: edges=12 sharp=[] has_custom_normals=False
+PROBE flag use_custom_normals=False
+PROBE output has_custom_normals=False
+PROBE sharp_edges_out=0
+== multires_plain
+PROBE input: edges=12 sharp=[] has_custom_normals=False
+PROBE flag use_custom_normals=True
+PROBE output has_custom_normals=False
+PROBE sharp_edges_out=0
+== multires_sharp
+PROBE input: edges=12 sharp=[0] has_custom_normals=False
+PROBE flag use_custom_normals=True
+PROBE output has_custom_normals=False
+PROBE sharp_edges_out=2
+== multires_layer
+PROBE input: edges=12 sharp=[] has_custom_normals=True
+PROBE flag use_custom_normals=True
+PROBE output has_custom_normals=True
+PROBE sharp_edges_out=0
