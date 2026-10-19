@@ -11072,6 +11072,7 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
                     tiles: BTreeMap::new(),
                     interpolation: crate::image::ImageInterpolation::Linear,
                     srgb: false,
+                    udim: false,
                 },
             ),
             (
@@ -11085,6 +11086,7 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
                     tiles: BTreeMap::new(),
                     interpolation: crate::image::ImageInterpolation::Linear,
                     srgb: false,
+                    udim: false,
                 },
             ),
         ]);

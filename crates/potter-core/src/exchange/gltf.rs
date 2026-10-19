@@ -445,6 +445,7 @@ fn pack_channels(
             tiles: BTreeMap::new(),
             interpolation,
             srgb: false,
+            udim: false,
         },
         sources,
     })
@@ -14969,6 +14970,7 @@ mod tests {
                 tiles: BTreeMap::new(),
                 interpolation: crate::image::ImageInterpolation::Closest,
                 srgb: false,
+                udim: false,
             },
         )]);
         let names = ["UVMap".to_owned()];

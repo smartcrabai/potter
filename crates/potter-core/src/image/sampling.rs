@@ -60,6 +60,8 @@ pub struct ImageData {
     pub storage: ImageStorage,
     /// The stored colour texels for colour reads, computed on the first colour read (see [`ColourCache`]).
     pub colour: ColourCache,
+    /// The image routes UDIM lookups by tile (a TILED source or any stored tile), as `Image::is_udim` decides.
+    pub udim: bool,
 }
 
 impl ImageData {
@@ -792,6 +794,7 @@ mod tests {
             tiles: BTreeMap::new(),
             interpolation,
             srgb: false,
+            udim: false,
             colour: ColourCache::default(),
             storage: ImageStorage::default(),
         }
@@ -812,6 +815,7 @@ mod tests {
             tiles: BTreeMap::new(),
             interpolation: ImageInterpolation::Linear,
             srgb: true,
+            udim: false,
             colour: ColourCache::default(),
             storage: ImageStorage::default(),
         }
@@ -844,6 +848,7 @@ mod tests {
             tiles: BTreeMap::new(),
             interpolation: ImageInterpolation::Linear,
             srgb,
+            udim: false,
             colour: ColourCache::default(),
             storage,
         }
@@ -942,6 +947,7 @@ mod tests {
             tiles: BTreeMap::new(),
             interpolation: ImageInterpolation::Linear,
             srgb: true,
+            udim: false,
             colour: ColourCache::default(),
             storage: ImageStorage {
                 data: false,
@@ -1541,6 +1547,7 @@ mod tests {
             tiles: BTreeMap::new(),
             interpolation,
             srgb,
+            udim: false,
             storage: ImageStorage {
                 data: colourspace == "Non-Color",
                 straight_alpha: straight,
@@ -1678,6 +1685,7 @@ mod tests {
                     tiles,
                     interpolation,
                     srgb: false,
+                    udim: false,
                     storage: non_colour_storage(),
                     colour: ColourCache::default(),
                 };
@@ -1696,6 +1704,7 @@ mod tests {
                     tiles: BTreeMap::new(),
                     interpolation,
                     srgb: false,
+                    udim: false,
                     storage: non_colour_storage(),
                     colour: ColourCache::default(),
                 };

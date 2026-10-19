@@ -105,26 +105,6 @@ pub fn load_image_data_with_staged(
             },
         );
     }
-    // A TILED image routes its lookups by tile, and the sampler routes by the stored tiles (`!tiles.is_empty()`), so its
-    // base is stored as tile 1001 too. A missing base is stored with no size: Blender lists that tile with size 0 and
-    // draws it as the missing colour (probed), and the sampler reads a zero-size tile as missing.
-    if image.tiled && tiles.is_empty() {
-        let (width, height, pixels) = if image.base_is_missing() {
-            (0, 0, Vec::new())
-        } else {
-            (width, height, pixels.clone())
-        };
-        tiles.insert(
-            1001,
-            ImageTileData {
-                width,
-                height,
-                pixels,
-                precision: storage.precision,
-                colour: ColourCache::default(),
-            },
-        );
-    }
     Ok(ImageData {
         width,
         height,
@@ -133,6 +113,7 @@ pub fn load_image_data_with_staged(
         interpolation,
         srgb,
         storage,
+        udim: image.is_udim(),
         colour: ColourCache::default(),
     })
 }
