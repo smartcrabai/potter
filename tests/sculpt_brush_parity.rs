@@ -96,6 +96,14 @@ const FIXTURES: &[(&str, &str)] = &[
         include_str!("fixtures/sculpt_brushes/smooth_sphere_four_dabs.json"),
     ),
     (
+        "smooth_sphere_mirror",
+        include_str!("fixtures/sculpt_brushes/smooth_sphere_mirror.json"),
+    ),
+    (
+        "smooth_sphere_mirror_two",
+        include_str!("fixtures/sculpt_brushes/smooth_sphere_mirror_two.json"),
+    ),
+    (
         "flatten_sphere",
         include_str!("fixtures/sculpt_brushes/flatten_sphere.json"),
     ),
