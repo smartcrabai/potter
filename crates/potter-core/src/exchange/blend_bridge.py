@@ -2265,6 +2265,7 @@ def dump_all():
                          "panorama_type": x.panorama_type, "longitude_min": float(x.longitude_min),
                          "longitude_max": float(x.longitude_max), "latitude_min": float(x.latitude_min),
                          "latitude_max": float(x.latitude_max),
+                         "fisheye_fov": float(x.fisheye_fov), "fisheye_lens": float(x.fisheye_lens),
                          "fake_user": bool(x.use_fake_user), "users": int(x.users)} for x in bpy.data.cameras],
             "lights": [{"name": x.name_full, "potter_id": x.get("potter.id"),
                         "library": library_reference(x), "type": x.type,
@@ -6387,7 +6388,10 @@ def export_doc(doc, target, pack, scene_hash, context):
             raw = item.get("camera") or {}
             source = compatibility_block(doc, "cameras", "Camera", data_id)
             camera = bpy.data.cameras.new(compatibility_name(doc, "Camera", data_id, data_id))
-            camera.lens = raw.get("lens_mm", 50.0)
+            # An equisolid camera's lens is `fisheye_lens`, which Potter refuses outside Blender's 0.01 to 100 range. Its
+            # `lens` is unused, so it keeps Blender's default instead of being clamped to the perspective range.
+            if not (raw.get("projection") == "panorama" and raw.get("panorama_type") == "fisheye_equisolid"):
+                camera.lens = raw.get("lens_mm", 50.0)
             camera.sensor_width = raw.get("sensor_width_mm", 36.0)
             camera.sensor_height = raw.get("sensor_height_mm", 24.0)
             camera.sensor_fit = raw.get("sensor_fit", "AUTO")
@@ -6397,9 +6401,22 @@ def export_doc(doc, target, pack, scene_hash, context):
             camera.shift_x, camera.shift_y = raw.get("shift", [0.0, 0.0])
             if raw.get("projection") == "orthographic":
                 camera.type = "ORTHO"
-            elif raw.get("projection") == "panorama" and raw.get("panorama_type", "equirectangular") == "equirectangular":
+            elif raw.get("projection") == "panorama":
                 camera.type = "PANO"
-                camera.panorama_type = "EQUIRECTANGULAR"
+                panorama_type = raw.get("panorama_type", "equirectangular")
+                if panorama_type == "equirectangular":
+                    camera.panorama_type = "EQUIRECTANGULAR"
+                    camera.longitude_min = raw.get("longitude_min", -math.pi)
+                    camera.longitude_max = raw.get("longitude_max", math.pi)
+                    camera.latitude_min = raw.get("latitude_min", -0.5 * math.pi)
+                    camera.latitude_max = raw.get("latitude_max", 0.5 * math.pi)
+                elif panorama_type == "fisheye_equidistant":
+                    camera.panorama_type = "FISHEYE_EQUIDISTANT"
+                    camera.fisheye_fov = raw.get("fisheye_fov", math.pi)
+                elif panorama_type == "fisheye_equisolid":
+                    camera.panorama_type = "FISHEYE_EQUISOLID"
+                    camera.fisheye_lens = raw.get("lens_mm", 50.0)
+                    camera.fisheye_fov = raw.get("fisheye_fov", math.pi)
             set_id(camera, data_id)
             set_props(camera, source.get("custom_properties", {}))
             if source.get("fake_user"):
