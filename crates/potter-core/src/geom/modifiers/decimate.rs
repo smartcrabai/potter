@@ -2480,7 +2480,7 @@ impl BMesh {
         )
     }
 
-    /// The live edges as BMesh vertex-index pairs, in pool order (the index space `to_mesh` passes on).
+    /// The live edges as `BMesh` vertex-index pairs, in pool order (the index space `to_mesh` passes on).
     fn pool_edge_pairs(&self) -> Vec<[usize; 2]> {
         // `decimate_compact` remaps from the full vertex index space, dead vertices included.
         let mut live: Vec<usize> = (0..self.edges.len())
