@@ -1271,6 +1271,7 @@ mod tests {
             source_path: None,
             source_hash: Some(digest),
             alpha_mode: ImageAlphaMode::Straight,
+            tiled: false,
         };
         let mut scene = serde_json::to_value(SceneDoc::new(uuid::Uuid::new_v4().to_string()))?;
         scene["schema_version"] = json!(3);
@@ -1289,8 +1290,7 @@ mod tests {
             crate::image::sample_with_extension_alpha(
                 &data,
                 [0.5, 0.5],
-                [0.5, 0.5],
-                0,
+                false,
                 crate::image::ImageInterpolation::Closest,
                 crate::image::ImageExtension::Repeat,
                 linked,

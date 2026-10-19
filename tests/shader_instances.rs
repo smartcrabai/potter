@@ -46,6 +46,7 @@ fn image_data(width: u32, height: u32, pixels: Vec<[f64; 4]>) -> ImageData {
         tiles: BTreeMap::new(),
         interpolation: ImageInterpolation::Linear,
         srgb: false,
+        udim: false,
     }
 }
 
@@ -316,6 +317,7 @@ fn image_texture_samples_resolved_pixels_using_hit_uvs() {
             )]),
             interpolation: ImageInterpolation::Linear,
             srgb: false,
+            udim: true,
         },
     )]);
     let mut context = HitContext::new(&groups).with_images(&image_data);
@@ -365,6 +367,7 @@ fn image_texture_routes_blender_v_up_udims_and_flips_local_v() {
             ]),
             interpolation: ImageInterpolation::Closest,
             srgb: false,
+            udim: true,
         },
     )]);
     let make_material = |mapped: bool, vector: [f64; 3]| {
@@ -403,7 +406,8 @@ fn image_texture_routes_blender_v_up_udims_and_flips_local_v() {
     let cases = [
         ([0.25, 1.25, 0.0], [0.0, 0.0, 1.0, 1.0]),
         ([1.25, 0.25, 0.0], [0.0, 1.0, 0.0, 1.0]),
-        ([0.25, 2.25, 0.0], [0.0; 4]),
+        // Tile 1021 is not stored. Cycles returns its missing colour, magenta, not transparent black.
+        ([0.25, 2.25, 0.0], [1.0, 0.0, 1.0, 1.0]),
     ];
     for mapped in [false, true] {
         for (vector, expected) in cases {

@@ -624,6 +624,23 @@ pub fn validate_with_context(
                             losses
                                 .extend(crate::exchange::shading::shading_losses(format, &meshes));
                             losses.extend(crate::exchange::uv_layer_losses(format, &meshes));
+                            losses.extend(crate::exchange::element_data_losses(format, &meshes));
+                            if format == "obj" {
+                                let root = project_root.unwrap_or_else(|| Path::new("."));
+                                match crate::exchange::obj::material_diagnostics(doc, root, &meshes)
+                                {
+                                    Ok(obj_losses) => losses.extend(obj_losses),
+                                    Err(error) => issue(
+                                        &mut issues,
+                                        "error",
+                                        "EXPORT_DIAGNOSTICS_FAILED",
+                                        &error.message,
+                                        None,
+                                        None,
+                                        error.details,
+                                    ),
+                                }
+                            }
                             match crate::commands::export::mesh_data_losses(doc, format, snapshot) {
                                 Ok(mesh_losses) => losses.extend(mesh_losses),
                                 Err(error) => issue(
@@ -990,10 +1007,10 @@ mod tests {
 
     use glam::DVec3;
 
-    use super::validate;
+    use super::{validate, validate_with_context};
     use crate::{
         geom::Mesh,
-        model::{DataBlock, Id, SceneDoc},
+        model::{DataBlock, Id, Material, Node, SceneDoc},
     };
 
     #[test]
@@ -1023,5 +1040,63 @@ mod tests {
                 .iter()
                 .any(|item| item["code"] == "ZERO_AREA_FACE" && item["severity"] == "warning")
         }));
+    }
+
+    #[test]
+    fn obj_validation_reports_mtl_material_losses() {
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        let material_id = Id::new("matte").unwrap();
+        let data_id = Id::new("triangle_mesh").unwrap();
+        let node_id = Id::new("triangle").unwrap();
+        doc.materials.insert(
+            material_id.clone(),
+            Material {
+                name: "Matte".to_owned(),
+                alpha_mode: "clip".to_owned(),
+                alpha_threshold: 0.5,
+                ..Material::default()
+            },
+        );
+        doc.data_blocks.insert(
+            data_id.clone(),
+            DataBlock {
+                data_type: "mesh".to_owned(),
+                mesh: Some(
+                    Mesh::from_positions_and_faces(
+                        vec![DVec3::ZERO, DVec3::X, DVec3::Y],
+                        vec![vec![0, 1, 2]],
+                    )
+                    .unwrap(),
+                ),
+                ..DataBlock::default()
+            },
+        );
+        doc.nodes.insert(
+            node_id.clone(),
+            Node {
+                name: "Triangle".to_owned(),
+                kind: "mesh".to_owned(),
+                data: Some(data_id),
+                materials: vec![Some(material_id)],
+                ..Node::default()
+            },
+        );
+        doc.collections
+            .get_mut(&Id::from_static("collection_root"))
+            .unwrap()
+            .objects
+            .push(node_id);
+
+        let report = validate_with_context(&doc, Some("obj"), None, None).unwrap();
+        assert!(
+            report.value["issues"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|issue| {
+                    issue["code"] == "UNREPRESENTABLE_FEATURE"
+                        && issue["details"]["feature_id"] == "material.mtl.alpha_cutoff"
+                })
+        );
     }
 }

@@ -101,7 +101,7 @@ fn check_scenario(kind: &str) -> TestResult {
     let mut total = [0.0_f64; 3];
     for v in PATCH {
         for u in PATCH {
-            let pixel = sample(&data, [u, v], 0);
+            let pixel = sample(&data, [u, v], false);
             for (sum, value) in total.iter_mut().zip(pixel.iter().take(3)) {
                 *sum += value;
             }

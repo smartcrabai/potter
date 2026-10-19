@@ -331,9 +331,9 @@ fn color_layer_storage_key(mesh: &Mesh, key: &str) -> bool {
 }
 
 /// A derived glTF image: its pixels plus the Potter images it was packed from.
-struct PackedImage {
+pub(super) struct PackedImage {
     name: String,
-    pixels: ImageData,
+    pub(super) pixels: ImageData,
     sources: Vec<Id>,
 }
 
@@ -342,7 +342,7 @@ struct PackedImage {
 /// Each source contributes its raw glTF value: sRGB color channels are re-encoded from the loaded
 /// linear values. The output has the largest source's size; smaller or larger sources are sampled
 /// nearest.
-fn pack_channels(
+pub(super) fn pack_channels(
     channels: &[Option<ChannelSource>; 4],
     interpolation: ImageInterpolation,
     doc: &SceneDoc,
@@ -445,6 +445,7 @@ fn pack_channels(
             tiles: BTreeMap::new(),
             interpolation,
             srgb: false,
+            udim: false,
         },
         sources,
     })
@@ -482,7 +483,10 @@ fn encode_png(image: &Image, pixels: &ImageData) -> Result<Vec<u8>> {
     encode_png_with_colorspace(image.colorspace, pixels)
 }
 
-fn encode_png_with_colorspace(colorspace: ImageColorspace, pixels: &ImageData) -> Result<Vec<u8>> {
+pub(super) fn encode_png_with_colorspace(
+    colorspace: ImageColorspace,
+    pixels: &ImageData,
+) -> Result<Vec<u8>> {
     let pixel_count = usize::try_from(pixels.width)
         .ok()
         .and_then(|width| {
@@ -558,7 +562,7 @@ fn texture_image_for_export<'a>(doc: &'a SceneDoc, image_id: &Id) -> Result<&'a 
             json!({ "image": image_id }),
         )
     })?;
-    if !image.tiles.is_empty() {
+    if image.is_udim() {
         return Err(unsupported_export(
             "material.texture_udim",
             "glTF export does not represent Potter UDIM image tiles",
@@ -5929,6 +5933,7 @@ fn import_images(
                 source_path: None,
                 source_hash: None,
                 alpha_mode: ImageAlphaMode::Straight,
+                tiled: false,
             },
         );
         image_ids.push(id);
@@ -14968,6 +14973,7 @@ mod tests {
                 tiles: BTreeMap::new(),
                 interpolation: crate::image::ImageInterpolation::Closest,
                 srgb: false,
+                udim: false,
             },
         )]);
         let names = ["UVMap".to_owned()];

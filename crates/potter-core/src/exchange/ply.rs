@@ -2,8 +2,13 @@ use std::{collections::HashMap, fs, path::Path};
 
 use glam::DVec3;
 
-use super::{ExchangeMesh, ExchangeUvLayer, shading, single_uv_set};
-use crate::error::{ErrorCode, PotError, Result};
+use super::{
+    ExchangeMesh, ExchangeUvLayer, ply_byte_to_color, ply_color_to_byte, shading, single_uv_set,
+};
+use crate::{
+    error::{ErrorCode, PotError, Result},
+    geom::color_layers::{ColorDomain, ColorLayer, ColorStore},
+};
 
 pub(crate) fn export(meshes: &[ExchangeMesh]) -> Result<Vec<u8>> {
     let splits = meshes.iter().map(split_mesh).collect::<Result<Vec<_>>>()?;
@@ -40,6 +45,8 @@ pub(crate) fn export(meshes: &[ExchangeMesh]) -> Result<Vec<u8>> {
         } else {
             Vec::new()
         };
+        let colors = ply_vertex_colors(mesh)?
+            .map(|colors| colors.into_iter().map(ply_rgba).collect::<Vec<_>>());
         for &(position, uv) in &split.vertices {
             for value in mesh.positions[position] {
                 push_f32(&mut output, value)?;
@@ -49,7 +56,12 @@ pub(crate) fn export(meshes: &[ExchangeMesh]) -> Result<Vec<u8>> {
                     output.extend_from_slice(&value.to_le_bytes());
                 }
             }
-            output.extend_from_slice(&[153, 153, 153, 255]);
+            let rgba = colors
+                .as_ref()
+                .and_then(|colors| colors.get(position))
+                .copied()
+                .unwrap_or([153, 153, 153, 255]);
+            output.extend_from_slice(&rgba);
             if with_uv {
                 for value in uv {
                     output.extend_from_slice(&value.to_le_bytes());
@@ -86,6 +98,17 @@ pub(crate) fn export(meshes: &[ExchangeMesh]) -> Result<Vec<u8>> {
 /// The active UV layer of `mesh`, the one PLY writes.
 fn active_layer(mesh: &ExchangeMesh) -> Option<&ExchangeUvLayer> {
     mesh.uv_active.and_then(|index| mesh.uv_layers.get(index))
+}
+
+/// The active color layer adapted to one value per vertex, as Blender's point-domain lookup does.
+fn ply_vertex_colors(mesh: &ExchangeMesh) -> Result<Option<Vec<[f64; 4]>>> {
+    let Some(name) = mesh.colors.active.as_deref() else {
+        return Ok(None);
+    };
+    let Some(layer) = mesh.colors.layers.iter().find(|layer| layer.name == name) else {
+        return Ok(None);
+    };
+    super::point_color_values(mesh, layer).map(Some)
 }
 
 /// One mesh as PLY stores it. Without a UV layer the vertices are the positions. With the active
@@ -173,14 +196,21 @@ pub(crate) fn import(path: &Path) -> Result<Vec<ExchangeMesh>> {
     let mut positions = Vec::with_capacity(parsed.vertex_count);
     let mut per_vertex_normals = Vec::with_capacity(parsed.vertex_count);
     let mut per_vertex_uvs = Vec::with_capacity(parsed.vertex_count);
+    let mut per_vertex_colors = Vec::<[u8; 4]>::with_capacity(parsed.vertex_count);
     for _ in 0..parsed.vertex_count {
         let mut position = [0.0_f64; 3];
         let mut normal = [0.0_f64; 3];
         let mut uv = [0.0_f64; 2];
+        let mut color = [0_u8, 0, 0, 255];
         for property in &parsed.vertex_properties {
             let raw = take(&bytes, &mut cursor, scalar_size(&property.scalar_type)?)?;
             if let Some(axis) = uv_axis(&property.name) {
                 uv[axis] = read_scalar(raw, &property.scalar_type)?;
+                continue;
+            }
+            if let Some(channel) = color_channel(&property.name).filter(|_| parsed.has_colors) {
+                color[channel] = u8::try_from(read_integer(raw, &property.scalar_type)?)
+                    .map_err(|_| ply_error("PLY color channel is out of range"))?;
                 continue;
             }
             let (target, axis) = match property.name.as_str() {
@@ -204,6 +234,9 @@ pub(crate) fn import(path: &Path) -> Result<Vec<ExchangeMesh>> {
         per_vertex_normals.push(normal);
         // Blender's PLY writes raw V, which points up; Potter stores V down.
         per_vertex_uvs.push([uv[0], 1.0 - uv[1]]);
+        if parsed.has_colors {
+            per_vertex_colors.push(color);
+        }
     }
     let mut faces = Vec::with_capacity(parsed.face_count);
     for _ in 0..parsed.face_count {
@@ -273,6 +306,29 @@ pub(crate) fn import(path: &Path) -> Result<Vec<ExchangeMesh>> {
     } else {
         (Vec::<ExchangeUvLayer>::new(), None, None)
     };
+    let colors = if parsed.has_colors {
+        ColorStore {
+            layers: vec![ColorLayer {
+                name: "Col".to_owned(),
+                domain: ColorDomain::Point,
+                values: per_vertex_colors
+                    .iter()
+                    .map(|rgba| {
+                        [
+                            ply_byte_to_color(rgba[0], false),
+                            ply_byte_to_color(rgba[1], false),
+                            ply_byte_to_color(rgba[2], false),
+                            ply_byte_to_color(rgba[3], true),
+                        ]
+                    })
+                    .collect(),
+            }],
+            active: Some("Col".to_owned()),
+            render: Some("Col".to_owned()),
+        }
+    } else {
+        ColorStore::default()
+    };
     Ok(vec![ExchangeMesh {
         id: "ply_mesh".to_owned(),
         name: "PLY Mesh".to_owned(),
@@ -286,6 +342,10 @@ pub(crate) fn import(path: &Path) -> Result<Vec<ExchangeMesh>> {
         uv_layers,
         uv_active,
         uv_render,
+        colors,
+        vertex_groups: Vec::new(),
+        material_slots: Vec::new(),
+        face_material_indices: Vec::new(),
     }])
 }
 
@@ -297,6 +357,7 @@ struct Header {
     face_properties: Vec<FaceProperty>,
     has_normals: bool,
     has_uv: bool,
+    has_colors: bool,
 }
 
 struct ScalarProperty {
@@ -386,6 +447,7 @@ fn parse_header(header: &str) -> Result<Header> {
             .iter()
             .any(|property| uv_axis(&property.name) == Some(*axis))
     });
+    let has_colors = has_vertex_properties(&vertex_properties, ["red", "green", "blue"]);
     let has_indices = face_properties.iter().any(|property| matches!(property, FaceProperty::List(_, _, name) if name == "vertex_indices" || name == "vertex_index"));
     if !has_coordinates || !has_indices {
         return Err(ply_error(
@@ -400,6 +462,7 @@ fn parse_header(header: &str) -> Result<Header> {
         face_properties,
         has_normals,
         has_uv,
+        has_colors,
     })
 }
 
@@ -415,6 +478,28 @@ fn uv_axis(name: &str) -> Option<usize> {
     match name {
         "s" | "u" | "texture_u" => Some(0),
         "t" | "v" | "texture_v" => Some(1),
+        _ => None,
+    }
+}
+
+/// PLY's bytes for a linear RGBA color: RGB sRGB-encoded, alpha linear, each clamped to `[0, 1]`.
+fn ply_rgba(color: [f64; 4]) -> [u8; 4] {
+    let [red, green, blue, alpha] = color;
+    [
+        ply_color_to_byte(red, false),
+        ply_color_to_byte(green, false),
+        ply_color_to_byte(blue, false),
+        ply_color_to_byte(alpha, true),
+    ]
+}
+
+/// The RGBA channel a vertex color property names.
+fn color_channel(name: &str) -> Option<usize> {
+    match name {
+        "red" => Some(0),
+        "green" => Some(1),
+        "blue" => Some(2),
+        "alpha" => Some(3),
         _ => None,
     }
 }
@@ -598,6 +683,7 @@ mod tests {
     use crate::{
         error::{ErrorCode, PotError, Result},
         exchange::{ExchangeMesh, ExchangeUvLayer},
+        geom::color_layers::{ColorDomain, ColorLayer, ColorStore},
     };
     use std::fs;
 
@@ -624,9 +710,14 @@ mod tests {
                     vec![[0.0, 0.0], [0.5, 0.0], [0.0, 0.5]],
                     vec![[0.5, 0.0], [1.0, 0.5], [0.5, 0.5]],
                 ],
+                pinned: vec![vec![false; 3], vec![false; 3]],
             }],
             uv_active: Some(0),
             uv_render: Some(0),
+            colors: ColorStore::default(),
+            vertex_groups: Vec::new(),
+            material_slots: Vec::new(),
+            face_material_indices: Vec::new(),
         }
     }
 
@@ -635,6 +726,50 @@ mod tests {
             .get(offset..offset + 4)
             .ok_or_else(|| PotError::new(ErrorCode::InternalError, "PLY test read out of range"))?;
         Ok(f32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
+    }
+
+    #[test]
+    fn averages_corner_colors_for_each_position_uv_split() -> Result<()> {
+        let mut mesh = quad_with_seam_uvs();
+        mesh.colors = ColorStore {
+            layers: vec![ColorLayer {
+                name: "Paint".to_owned(),
+                domain: ColorDomain::Corner,
+                values: vec![
+                    [0.0, 0.0, 0.0, 1.0],
+                    [1.0, 0.0, 0.0, 1.0],
+                    [0.0, 0.0, 0.0, 1.0],
+                    [0.0, 0.0, 0.0, 1.0],
+                    [0.0, 0.0, 1.0, 1.0],
+                    [0.0, 0.0, 0.0, 1.0],
+                ],
+            }],
+            active: Some("Paint".to_owned()),
+            render: Some("Paint".to_owned()),
+        };
+        let bytes = export(&[mesh])?;
+        let marker = b"end_header\n";
+        let header_end = bytes
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .ok_or_else(|| PotError::new(ErrorCode::InternalError, "PLY test has no header"))?
+            + marker.len();
+        let header = std::str::from_utf8(&bytes[..header_end])
+            .map_err(|error| PotError::new(ErrorCode::InternalError, error.to_string()))?;
+        assert!(header.contains("element vertex 6\n"), "{header}");
+        let mut shared_splits = 0;
+        for vertex in 0..6 {
+            let record = header_end + vertex * 24;
+            if read_f32(&bytes, record)? == 1.0
+                && read_f32(&bytes, record + 4)? == 0.0
+                && read_f32(&bytes, record + 8)? == 0.0
+            {
+                assert_eq!(&bytes[record + 12..record + 16], &[187, 0, 187, 255]);
+                shared_splits += 1;
+            }
+        }
+        assert_eq!(shared_splits, 2);
+        Ok(())
     }
 
     #[test]

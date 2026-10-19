@@ -60,6 +60,8 @@ pub struct ImageData {
     pub storage: ImageStorage,
     /// The stored colour texels for colour reads, computed on the first colour read (see [`ColourCache`]).
     pub colour: ColourCache,
+    /// The image routes UDIM lookups by tile (a TILED source or any stored tile), as `Image::is_udim` decides.
+    pub udim: bool,
 }
 
 impl ImageData {
@@ -102,9 +104,6 @@ impl ImageData {
 /// holds them in (`util_image_multiply_native`, `NODE_IMAGE_COMPRESS_AS_SRGB`).
 #[derive(Clone, Debug, Default)]
 pub struct ColourCache(OnceLock<Vec<[f64; 4]>>);
-
-/// Missing UDIM tiles read through this cache. It is never filled, because such a tile has no pixels.
-static EMPTY_COLOUR: ColourCache = ColourCache(OnceLock::new());
 
 impl PartialEq for ColourCache {
     /// The cache is derived from the pixels and the storage, so it never makes two images differ.
@@ -237,45 +236,24 @@ impl Texels {
 /// bilinear weighting), and then converts the colour channels with `IMB_colormanagement_colorspace_to_scene_linear_v3`.
 /// The modifier reader does not premultiply.
 ///
-/// Tile zero samples the base image directly. Positive tiles are treated as UDIM
-/// base tiles, with integer UV offsets selecting neighboring tiles.
+/// With `udim` set, the tile is the one the UV's floored offsets select from tile 1001; a missing tile reads transparent
+/// black.
 #[must_use]
-pub fn sample(data: &ImageData, uv: [f64; 2], tile: u32) -> [f64; 4] {
-    sample_image(data, uv, tile, data.interpolation, Read::Decoded)
+pub fn sample(data: &ImageData, uv: [f64; 2], udim: bool) -> [f64; 4] {
+    sample_image(data, uv, udim, data.interpolation, Read::Decoded)
 }
 
 /// Samples an image's straight stored values as Blender's intensity channel reads them: an sRGB image's encoded texels
 /// are mixed and returned encoded, with no decode. Other images return the same values as [`sample`].
 #[must_use]
-pub fn sample_encoded(data: &ImageData, uv: [f64; 2], tile: u32) -> [f64; 4] {
-    sample_image(data, uv, tile, data.interpolation, Read::Encoded)
-}
-
-/// Samples an image's colour as an Image Texture node does, with its Alpha output unlinked: the stored values are
-/// premultiplied (for a straight-alpha non-data image) and mixed encoded, then decoded for sRGB. Used by the world
-/// environment, whose Alpha output is not wired.
-#[must_use]
-pub fn sample_with_interpolation(
-    data: &ImageData,
-    uv: [f64; 2],
-    tile: u32,
-    interpolation: ImageInterpolation,
-) -> [f64; 4] {
-    sample_image(
-        data,
-        uv,
-        tile,
-        interpolation,
-        Read::Colour {
-            alpha_linked: false,
-        },
-    )
+pub fn sample_encoded(data: &ImageData, uv: [f64; 2], udim: bool) -> [f64; 4] {
+    sample_image(data, uv, udim, data.interpolation, Read::Encoded)
 }
 
 fn sample_image(
     data: &ImageData,
     uv: [f64; 2],
-    tile: u32,
+    udim: bool,
     interpolation: ImageInterpolation,
     read: Read,
 ) -> [f64; 4] {
@@ -283,16 +261,16 @@ fn sample_image(
         return TRANSPARENT_BLACK;
     }
 
-    let Some(image) = image_for_uv(data, uv, tile) else {
+    let Some(image) = image_for_uv(data, uv, udim) else {
         return TRANSPARENT_BLACK;
     };
     let Some((width, height)) = image.valid_dimensions() else {
         return TRANSPARENT_BLACK;
     };
-    let local_uv = if tile == 0 {
-        uv
-    } else {
+    let local_uv = if udim {
         [uv[0] - uv[0].floor(), uv[1] - uv[1].floor()]
+    } else {
+        uv
     };
     let u = local_uv[0].clamp(0.0, 1.0);
     let v = local_uv[1].clamp(0.0, 1.0);
@@ -304,83 +282,95 @@ fn sample_image(
     }
 }
 
-/// Samples an image using separate UVs for UDIM routing and pixel lookup, as an Image Texture node reads it.
-///
-/// `routing_uv` selects the UDIM tile. `pixel_uv` is the full-image UV for tile zero and the
-/// tile-local V-down UV for positive base tiles. `alpha_linked` is whether the node's Alpha output is linked, which
-/// is when Cycles unassociates the colour (see [`ImageStorage`]).
+/// The colour of a UDIM lookup whose tile is missing or outside the tile grid: Cycles' `IMAGE_MISSING_RGBA`, which
+/// Blender shows as magenta (the `blender_udim_*` cases in `tests/fixtures/repeat_edge`).
+const MISSING_TILE_RGBA: [f64; 4] = [1.0, 0.0, 1.0, 1.0];
+
+/// Samples an image as an Image Texture node reads it. `uv` is Blender's V-up coordinate. A UDIM image (`udim`) routes its
+/// tile from `uv` ([`udim_route`]), and the lookup inside it is the same as an image's, at the tile-local coordinate
+/// (Cycles samples each UDIM tile as its own image: `kernel_image_udim_map`, then the interpolators of
+/// `kernel/device/cpu/image.h`). A missing tile is [`MISSING_TILE_RGBA`]. `alpha_linked` is whether the node's Alpha
+/// output is linked, which is when Cycles unassociates the colour (see [`ImageStorage`]).
 #[must_use]
 pub fn sample_with_extension_alpha(
     data: &ImageData,
-    routing_uv: [f64; 2],
-    pixel_uv: [f64; 2],
-    tile: u32,
+    uv: [f64; 2],
+    udim: bool,
     interpolation: ImageInterpolation,
     extension: ImageExtension,
     alpha_linked: bool,
 ) -> [f64; 4] {
-    if !pixel_uv[0].is_finite()
-        || !pixel_uv[1].is_finite()
-        || (tile != 0 && (!routing_uv[0].is_finite() || !routing_uv[1].is_finite()))
-    {
+    if !uv[0].is_finite() || !uv[1].is_finite() {
         return TRANSPARENT_BLACK;
     }
-
-    let Some(image) = image_for_uv(data, routing_uv, tile) else {
-        return TRANSPARENT_BLACK;
+    let (image, local) = if udim {
+        let Some((number, local)) = udim_route(uv) else {
+            return MISSING_TILE_RGBA;
+        };
+        let Some(image) = stored_tile(data, number) else {
+            return MISSING_TILE_RGBA;
+        };
+        (image, local)
+    } else {
+        (base_tile(data), uv)
     };
     let Some((width, height)) = image.valid_dimensions() else {
         return TRANSPARENT_BLACK;
     };
-    if extension == ImageExtension::Clip
-        && (pixel_uv[0] < 0.0 || pixel_uv[0] > 1.0 || pixel_uv[1] < 0.0 || pixel_uv[1] > 1.0)
-    {
-        return TRANSPARENT_BLACK;
-    }
-
-    let local_uv = match extension {
-        ImageExtension::Repeat => [pixel_uv[0].rem_euclid(1.0), pixel_uv[1].rem_euclid(1.0)],
-        ImageExtension::Extend => [pixel_uv[0].clamp(0.0, 1.0), pixel_uv[1].clamp(0.0, 1.0)],
-        ImageExtension::Clip => pixel_uv,
-        ImageExtension::Mirror => [pixel_uv[0].rem_euclid(2.0), pixel_uv[1].rem_euclid(2.0)],
-    };
-
     let (values, texels) = image.source(Read::Colour { alpha_linked });
     match interpolation {
+        // The linear lookup reads Potter's V-down storage: the flipped coordinate, with the extension on storage indices.
         ImageInterpolation::Linear => sample_linear_with_extension(
             values,
             width,
             height,
-            local_uv[0],
-            local_uv[1],
+            local[0],
+            1.0 - local[1],
             extension,
             texels,
         ),
-        ImageInterpolation::Closest => sample_closest_with_extension(
-            values,
-            width,
-            height,
-            local_uv[0],
-            local_uv[1],
-            extension,
-            texels,
-        ),
+        ImageInterpolation::Closest => {
+            sample_closest_cycles(values, width, height, local, extension, texels)
+        }
     }
 }
 
-fn image_for_uv(data: &ImageData, uv: [f64; 2], tile: u32) -> Option<ImageTileDataRef<'_>> {
-    if tile == 0 {
-        return Some(ImageTileDataRef {
-            width: data.width,
-            height: data.height,
-            pixels: &data.pixels,
-            colour: &data.colour,
-            srgb: data.srgb,
-            storage: data.storage,
-        });
+/// Cycles' UDIM routing (`kernel_image_udim_map`): the tile holding `uv` and the coordinate relative to it. Each coordinate
+/// is truncated, so a coordinate in (-1, 0) belongs to tile column or row 0. A tile column of 10 or more, a negative
+/// column, or a negative row has no tile.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the tile number is checked against the u32 range before the conversion, and it is never negative"
+)]
+fn udim_route(uv: [f64; 2]) -> Option<(u32, [f64; 2])> {
+    let (column, row) = (uv[0].trunc(), uv[1].trunc());
+    if !(0.0..10.0).contains(&column) || row < 0.0 {
+        return None;
     }
-    let actual_tile = udim_tile(tile, uv)?;
-    let image = match data.tiles.get(&actual_tile) {
+    let number = 1001.0 + 10.0 * row + column;
+    if number > f64::from(u32::MAX) {
+        return None;
+    }
+    Some((number as u32, [uv[0] - column, uv[1] - row]))
+}
+
+fn base_tile(data: &ImageData) -> ImageTileDataRef<'_> {
+    ImageTileDataRef {
+        width: data.width,
+        height: data.height,
+        pixels: &data.pixels,
+        colour: &data.colour,
+        srgb: data.srgb,
+        storage: data.storage,
+    }
+}
+
+/// The stored tile `number`. The base image is tile 1001, which Potter keeps outside `tiles` unless a TILED base is
+/// stored there. A tile with no size has no file (a missing base, or a TILED base with no file), so it is missing and
+/// samples as Blender's missing colour: `None`.
+fn stored_tile(data: &ImageData, number: u32) -> Option<ImageTileDataRef<'_>> {
+    let image = match data.tiles.get(&number) {
         Some(image) => ImageTileDataRef {
             width: image.width,
             height: image.height,
@@ -392,25 +382,19 @@ fn image_for_uv(data: &ImageData, uv: [f64; 2], tile: u32) -> Option<ImageTileDa
                 ..data.storage
             },
         },
-        // Tile 1001 reads the base image when no tile is stored for it.
-        None if actual_tile == 1001 => ImageTileDataRef {
-            width: data.width,
-            height: data.height,
-            pixels: &data.pixels,
-            colour: &data.colour,
-            srgb: data.srgb,
-            storage: data.storage,
-        },
-        None => ImageTileDataRef {
-            width: 0,
-            height: 0,
-            pixels: &[],
-            colour: &EMPTY_COLOUR,
-            srgb: false,
-            storage: ImageStorage::default(),
-        },
+        None if number == 1001 => base_tile(data),
+        None => return None,
     };
-    Some(image)
+    (image.width != 0 && image.height != 0).then_some(image)
+}
+
+/// The image a floor-routed lookup reads (`sample`, `sample_encoded`): the base image when `udim` is unset, else the stored
+/// tile the UV's floored offsets select. A missing tile has no pixels, so the lookup returns transparent black.
+fn image_for_uv(data: &ImageData, uv: [f64; 2], udim: bool) -> Option<ImageTileDataRef<'_>> {
+    if !udim {
+        return Some(base_tile(data));
+    }
+    stored_tile(data, udim_tile(uv)?)
 }
 
 struct ImageTileDataRef<'a> {
@@ -455,11 +439,12 @@ impl<'a> ImageTileDataRef<'a> {
 
 const I64_UPPER_EXCLUSIVE: f64 = 9_223_372_036_854_775_808.0;
 const I64_LOWER_INCLUSIVE: f64 = -9_223_372_036_854_775_808.0;
-fn udim_tile(base_tile: u32, uv: [f64; 2]) -> Option<u32> {
+/// The UDIM tile at the floored UV offsets from tile 1001: the floor routing `sample` and `sample_encoded` use.
+fn udim_tile(uv: [f64; 2]) -> Option<u32> {
     let u_offset = floor_to_i64(uv[0])?;
     let v_offset = floor_to_i64(uv[1])?;
     let offset = v_offset.checked_mul(10)?.checked_add(u_offset)?;
-    let actual_tile = i64::from(base_tile).checked_add(offset)?;
+    let actual_tile = 1001_i64.checked_add(offset)?;
     u32::try_from(actual_tile).ok()
 }
 
@@ -523,37 +508,57 @@ fn sample_linear(
     finish(mix(top, bottom, ty), texels)
 }
 
+/// Cycles' `frac` index of a coordinate (`kernel/device/cpu/image.h`): the integer part, truncated, and one less when the
+/// coordinate is negative. That is `floor` for every coordinate except an exact negative integer, which Cycles reads one
+/// texel lower (`floor(x) - 1`), so `-12.0` gives `-13`.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the truncated input is checked against exclusive i64 conversion bounds"
+)]
+fn cycles_frac_index(value: f64) -> Option<i64> {
+    let truncated = value.trunc();
+    if !(I64_LOWER_INCLUSIVE..I64_UPPER_EXCLUSIVE).contains(&truncated) {
+        return None;
+    }
+    let index = truncated as i64;
+    if value < 0.0 {
+        index.checked_sub(1)
+    } else {
+        Some(index)
+    }
+}
+
+/// The closest texel of a full-image lookup, as Cycles' `interp_closest` reads it (`kernel/device/cpu/image.h`). The texel
+/// is Cycles' `frac` of the Blender coordinate scaled by the image size, with no offset, then the extension maps it.
+/// Blender's rows run bottom-up and the storage runs top-down, so the storage row is the mirror of the wrapped row. For a
+/// non-integer coordinate this is the floor of the coordinate, as before. At an exact integer the top-down flip used to
+/// pick the neighbouring texel, and at an exact negative integer Cycles reads one texel lower.
 #[expect(
     clippy::cast_precision_loss,
     reason = "validated u32 image dimensions are exactly representable as f64"
 )]
-fn sample_closest_with_extension(
+fn sample_closest_cycles(
     pixels: &[[f64; 4]],
     width: usize,
     height: usize,
-    u: f64,
-    v: f64,
+    uv: [f64; 2],
     extension: ImageExtension,
     texels: Texels,
 ) -> [f64; 4] {
-    let Some(mut x) = floor_to_i64(u * width as f64) else {
+    let (Some(column), Some(row)) = (
+        cycles_frac_index(uv[0] * width as f64),
+        cycles_frac_index(uv[1] * height as f64),
+    ) else {
         return TRANSPARENT_BLACK;
     };
-    let Some(mut y) = floor_to_i64(v * height as f64) else {
+    let (Some(x), Some(y)) = (
+        extension_index(column, width, extension),
+        extension_index(row, height, extension),
+    ) else {
         return TRANSPARENT_BLACK;
     };
-    if extension == ImageExtension::Clip {
-        let (Ok(width), Ok(height)) = (i64::try_from(width), i64::try_from(height)) else {
-            return TRANSPARENT_BLACK;
-        };
-        x = x.min(width - 1);
-        y = y.min(height - 1);
-    }
     finish(
-        stored_texel(
-            pixel_with_extension(pixels, width, height, x, y, extension),
-            texels,
-        ),
+        stored_texel(pixel(pixels, width, x, height - 1 - y), texels),
         texels,
     )
 }
@@ -732,12 +737,47 @@ fn mix(a: [f64; 4], b: [f64; 4], t: f64) -> [f64; 4] {
     ]
 }
 
+/// Fixture grids shared by the sampler and world tests, read from `tests/fixtures/repeat_edge`.
+#[cfg(test)]
+pub(crate) mod test_fixtures {
+    /// The texels of a fixture grid (`texels_blender_rows`, bottom-up rows of `width` texels) in the storage order Potter
+    /// keeps (top-down rows).
+    pub(crate) fn fixture_pixels(
+        width: usize,
+        height: usize,
+        blender_rows: &[[f64; 4]],
+    ) -> Vec<[f64; 4]> {
+        let mut pixels = vec![[0.0; 4]; width * height];
+        for row in 0..height {
+            for x in 0..width {
+                pixels[row * width + x] = blender_rows[(height - 1 - row) * width + x];
+            }
+        }
+        pixels
+    }
+
+    pub(crate) fn fixture_texels(
+        value: &serde_json::Value,
+    ) -> Result<Vec<[f64; 4]>, Box<dyn std::error::Error>> {
+        value
+            .as_array()
+            .ok_or("texels are missing")?
+            .iter()
+            .map(|texel| -> Result<[f64; 4], Box<dyn std::error::Error>> {
+                let channel = |index: usize| texel[index].as_f64().ok_or("texel is not a number");
+                Ok([channel(0)?, channel(1)?, channel(2)?, channel(3)?])
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_fixtures::{fixture_pixels, fixture_texels};
     use super::{
         ColourCache, ImageData, ImageExtension, ImageInterpolation, ImageStorage, ImageTileData,
         Precision, premultiply, round_to_half, sample, sample_encoded, sample_with_extension_alpha,
-        sample_with_interpolation,
+        udim_route,
     };
     use std::collections::BTreeMap;
 
@@ -754,6 +794,7 @@ mod tests {
             tiles: BTreeMap::new(),
             interpolation,
             srgb: false,
+            udim: false,
             colour: ColourCache::default(),
             storage: ImageStorage::default(),
         }
@@ -774,6 +815,7 @@ mod tests {
             tiles: BTreeMap::new(),
             interpolation: ImageInterpolation::Linear,
             srgb: true,
+            udim: false,
             colour: ColourCache::default(),
             storage: ImageStorage::default(),
         }
@@ -806,6 +848,7 @@ mod tests {
             tiles: BTreeMap::new(),
             interpolation: ImageInterpolation::Linear,
             srgb,
+            udim: false,
             colour: ColourCache::default(),
             storage,
         }
@@ -828,8 +871,7 @@ mod tests {
         let unlinked = sample_with_extension_alpha(
             &image,
             [0.1, 0.5],
-            [0.1, 0.5],
-            0,
+            false,
             ImageInterpolation::Closest,
             ImageExtension::Repeat,
             false,
@@ -851,8 +893,7 @@ mod tests {
         let linked = sample_with_extension_alpha(
             &image,
             [0.1, 0.5],
-            [0.1, 0.5],
-            0,
+            false,
             ImageInterpolation::Closest,
             ImageExtension::Repeat,
             true,
@@ -906,6 +947,7 @@ mod tests {
             tiles: BTreeMap::new(),
             interpolation: ImageInterpolation::Linear,
             srgb: true,
+            udim: false,
             colour: ColourCache::default(),
             storage: ImageStorage {
                 data: false,
@@ -918,8 +960,7 @@ mod tests {
             sample_with_extension_alpha(
                 &image,
                 [0.1, 0.5],
-                [0.1, 0.5],
-                0,
+                false,
                 ImageInterpolation::Closest,
                 ImageExtension::Repeat,
                 alpha_linked,
@@ -945,8 +986,7 @@ mod tests {
         let unlinked = sample_with_extension_alpha(
             &image,
             [0.1, 0.5],
-            [0.1, 0.5],
-            0,
+            false,
             ImageInterpolation::Closest,
             ImageExtension::Repeat,
             false,
@@ -955,8 +995,7 @@ mod tests {
         let linked = sample_with_extension_alpha(
             &image,
             [0.1, 0.5],
-            [0.1, 0.5],
-            0,
+            false,
             ImageInterpolation::Closest,
             ImageExtension::Repeat,
             true,
@@ -985,8 +1024,7 @@ mod tests {
         let linked = sample_with_extension_alpha(
             &image,
             [0.1, 0.5],
-            [0.1, 0.5],
-            0,
+            false,
             ImageInterpolation::Closest,
             ImageExtension::Repeat,
             true,
@@ -1029,8 +1067,7 @@ mod tests {
             let sampled = sample_with_extension_alpha(
                 &image,
                 [0.1, 0.5],
-                [0.1, 0.5],
-                0,
+                false,
                 ImageInterpolation::Closest,
                 ImageExtension::Repeat,
                 linked,
@@ -1053,7 +1090,14 @@ mod tests {
         // Cycles mixes an sRGB image's stored values and decodes the result. Halfway between encoded 0 and 1 is the
         // decoded encoded midpoint, not the midpoint of the linear values.
         let image = srgb_row([0.0, 1.0]);
-        let sampled = sample_with_interpolation(&image, [0.5, 0.5], 0, ImageInterpolation::Linear);
+        let sampled = sample_with_extension_alpha(
+            &image,
+            [0.5, 0.5],
+            false,
+            ImageInterpolation::Linear,
+            ImageExtension::Repeat,
+            false,
+        );
         let expected = cycles_decode(0.5);
         assert!(
             (sampled[0] - expected).abs() < 1e-6,
@@ -1070,7 +1114,14 @@ mod tests {
     #[test]
     fn srgb_closest_sampling_returns_the_decoded_texel() {
         let image = srgb_row([0.25, 1.0]);
-        let sampled = sample_with_interpolation(&image, [0.1, 0.5], 0, ImageInterpolation::Closest);
+        let sampled = sample_with_extension_alpha(
+            &image,
+            [0.1, 0.5],
+            false,
+            ImageInterpolation::Closest,
+            ImageExtension::Repeat,
+            false,
+        );
         assert!(
             (sampled[0] - cycles_decode(0.25)).abs() < 1e-6,
             "closest reads the texel through the same decode"
@@ -1081,12 +1132,12 @@ mod tests {
     fn srgb_intensity_reads_the_encoded_texel_without_decoding() {
         // Blender's intensity channel reads the encoded bytes (`BKE_texture_get_value` with colour management off).
         let image = srgb_row([0.25, 1.0]);
-        let encoded = sample_encoded(&image, [0.1, 0.5], 0);
+        let encoded = sample_encoded(&image, [0.1, 0.5], false);
         assert!(
             (encoded[0] - 0.25).abs() < 1e-9,
             "the encoded texel is returned"
         );
-        let decoded = sample(&image, [0.1, 0.5], 0);
+        let decoded = sample(&image, [0.1, 0.5], false);
         assert!((decoded[0] - cycles_decode(0.25)).abs() < 1e-6);
     }
 
@@ -1096,8 +1147,7 @@ mod tests {
         let sampled = sample_with_extension_alpha(
             &image,
             [0.25, 0.5],
-            [0.25, 0.5],
-            0,
+            false,
             ImageInterpolation::Linear,
             ImageExtension::Extend,
             false,
@@ -1122,8 +1172,8 @@ mod tests {
             ImageInterpolation::Linear,
         );
 
-        assert_eq!(sample(&image, [0.5, 0.5], 0), [0.5, 0.5, 0.25, 0.5]);
-        assert_eq!(sample(&image, [0.25, 0.25], 0), [0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(sample(&image, [0.5, 0.5], false), [0.5, 0.5, 0.25, 0.5]);
+        assert_eq!(sample(&image, [0.25, 0.25], false), [0.0, 0.0, 0.0, 0.0]);
     }
 
     #[test]
@@ -1140,8 +1190,8 @@ mod tests {
             ImageInterpolation::Closest,
         );
 
-        assert_eq!(sample(&image, [0.74, 0.26], 0), [0.0, 1.0, 0.0, 1.0]);
-        assert_eq!(sample(&image, [1.0, 1.0], 0), [1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(sample(&image, [0.74, 0.26], false), [0.0, 1.0, 0.0, 1.0]);
+        assert_eq!(sample(&image, [1.0, 1.0], false), [1.0, 1.0, 1.0, 1.0]);
     }
 
     #[test]
@@ -1153,9 +1203,16 @@ mod tests {
             ImageInterpolation::Closest,
         );
 
-        assert_eq!(sample(&image, [0.5, 0.5], 0), [0.0, 1.0, 0.0, 1.0]);
+        assert_eq!(sample(&image, [0.5, 0.5], false), [0.0, 1.0, 0.0, 1.0]);
         assert_eq!(
-            sample_with_interpolation(&image, [0.5, 0.5], 0, ImageInterpolation::Linear),
+            sample_with_extension_alpha(
+                &image,
+                [0.5, 0.5],
+                false,
+                ImageInterpolation::Linear,
+                ImageExtension::Repeat,
+                false,
+            ),
             [0.5, 0.5, 0.0, 1.0],
         );
     }
@@ -1173,8 +1230,7 @@ mod tests {
             sample_with_extension_alpha(
                 &image,
                 [0.0, 0.5],
-                [0.0, 0.5],
-                0,
+                false,
                 ImageInterpolation::Linear,
                 ImageExtension::Repeat,
                 false,
@@ -1185,8 +1241,7 @@ mod tests {
             sample_with_extension_alpha(
                 &image,
                 [0.0, 0.5],
-                [0.0, 0.5],
-                0,
+                false,
                 ImageInterpolation::Linear,
                 ImageExtension::Mirror,
                 false,
@@ -1208,8 +1263,7 @@ mod tests {
             sample_with_extension_alpha(
                 &image,
                 [1.5, 0.5],
-                [1.5, 0.5],
-                0,
+                false,
                 ImageInterpolation::Linear,
                 ImageExtension::Extend,
                 false,
@@ -1219,14 +1273,26 @@ mod tests {
         assert_eq!(
             sample_with_extension_alpha(
                 &image,
-                [1.01, 0.5],
-                [1.01, 0.5],
-                0,
+                [1.25, 0.5],
+                false,
                 ImageInterpolation::Linear,
                 ImageExtension::Clip,
                 false,
             ),
             [0.0; 4],
+        );
+        // A linear sample partly inside a clip keeps its inside texel's weight (per texel, as Blender's clip does): at
+        // u = 0.875 the coordinate is 1.25 texels, so texel 1 weighs 0.75 and the clipped texel 2 contributes nothing.
+        assert_eq!(
+            sample_with_extension_alpha(
+                &image,
+                [0.875, 0.5],
+                false,
+                ImageInterpolation::Linear,
+                ImageExtension::Clip,
+                false,
+            ),
+            [0.0, 0.75, 0.0, 0.75],
         );
     }
 
@@ -1243,8 +1309,7 @@ mod tests {
             sample_with_extension_alpha(
                 &image,
                 [0.0, 0.5],
-                [0.0, 0.5],
-                0,
+                false,
                 ImageInterpolation::Linear,
                 ImageExtension::Clip,
                 false,
@@ -1254,7 +1319,7 @@ mod tests {
     }
 
     #[test]
-    fn clip_closest_at_one_selects_the_last_texel() {
+    fn clip_closest_at_one_is_outside_the_image_as_cycles_reads_it() {
         let image = data(
             2,
             1,
@@ -1266,18 +1331,17 @@ mod tests {
             sample_with_extension_alpha(
                 &image,
                 [1.0, 1.0],
-                [1.0, 1.0],
-                0,
+                false,
                 ImageInterpolation::Closest,
                 ImageExtension::Clip,
                 false,
             ),
-            [0.0, 1.0, 0.0, 1.0],
+            [0.0; 4],
         );
     }
 
     #[test]
-    fn native_sampler_keeps_clamped_linear_edge_behavior() {
+    fn world_sampler_wraps_the_seam_as_cycles_environment_textures_do() {
         let image = data(
             2,
             1,
@@ -1286,8 +1350,15 @@ mod tests {
         );
 
         assert_eq!(
-            sample_with_interpolation(&image, [0.0, 0.5], 0, ImageInterpolation::Linear),
-            [1.0, 0.0, 0.0, 1.0],
+            sample_with_extension_alpha(
+                &image,
+                [0.0, 0.5],
+                false,
+                ImageInterpolation::Linear,
+                ImageExtension::Repeat,
+                false,
+            ),
+            [0.5, 0.5, 0.0, 1.0],
         );
     }
 
@@ -1310,15 +1381,14 @@ mod tests {
             },
         );
 
-        assert_eq!(sample(&image, [1.25, 1.25], 1001), [1.0, 0.0, 0.0, 1.0]);
-        assert_eq!(sample(&image, [0.25, 0.25], 1001), [0.25, 0.5, 0.75, 1.0]);
-        assert_eq!(sample(&image, [1.25, 0.25], 1001), [0.0; 4]);
+        assert_eq!(sample(&image, [1.25, 1.25], true), [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(sample(&image, [0.25, 0.25], true), [0.25, 0.5, 0.75, 1.0]);
+        assert_eq!(sample(&image, [1.25, 0.25], true), [0.0; 4]);
         assert_eq!(
             sample_with_extension_alpha(
                 &image,
                 [1.0, 1.5],
-                [0.0, 0.5],
-                1001,
+                true,
                 ImageInterpolation::Linear,
                 ImageExtension::Repeat,
                 false,
@@ -1333,7 +1403,7 @@ mod tests {
             sample(
                 &data(0, 1, vec![], ImageInterpolation::Linear),
                 [0.5, 0.5],
-                0,
+                false,
             ),
             [0.0; 4]
         );
@@ -1341,7 +1411,7 @@ mod tests {
             sample(
                 &data(2, 2, vec![[1.0; 4]; 3], ImageInterpolation::Closest),
                 [0.5, 0.5],
-                0,
+                false,
             ),
             [0.0; 4]
         );
@@ -1349,7 +1419,7 @@ mod tests {
             sample(
                 &data(1, 1, vec![[1.0; 4]], ImageInterpolation::Linear),
                 [f64::NAN, 0.5],
-                0,
+                false,
             ),
             [0.0; 4]
         );
@@ -1477,6 +1547,7 @@ mod tests {
             tiles: BTreeMap::new(),
             interpolation,
             srgb,
+            udim: false,
             storage: ImageStorage {
                 data: colourspace == "Non-Color",
                 straight_alpha: straight,
@@ -1519,12 +1590,11 @@ mod tests {
                     |index: usize| record[index].as_f64().ok_or("record value is not a number");
                 let (sample_u, sample_v) = (value(5)?, value(6)?);
                 let expected = [value(2)?, value(3)?, value(4)?];
-                // The records give Blender's UV (V up); the stored rows run top-down, so the pixel lookup flips V.
+                // The records give Blender's UV (V up); the sampler flips V into the stored rows.
                 let actual = sample_with_extension_alpha(
                     &image,
                     [sample_u, sample_v],
-                    [sample_u, 1.0 - sample_v],
-                    0,
+                    false,
                     interpolation,
                     extension,
                     linked,
@@ -1541,5 +1611,142 @@ mod tests {
         }
         assert_eq!(cases, 60, "every committed oracle case must be checked");
         Ok(())
+    }
+
+    fn non_colour_storage() -> ImageStorage {
+        ImageStorage {
+            data: true,
+            straight_alpha: false,
+            ignore_alpha: false,
+            precision: Precision::Float,
+        }
+    }
+
+    /// Blender 5.2.2 at exact and near-edge UVs (`tests/fixtures/repeat_edge`). The eight `blender_edge_*` cases are one
+    /// 2 x 2 texture with 16 x 16 pixel-centre UVs in eighths from -0.75 to 1.125, for each of the four extensions and
+    /// both interpolations. The eight `blender_udim_*` cases are UDIM tiles 1001 and 1002 with UVs from 0.25 to 2.125, so
+    /// tile 1002 is entered at exactly u = 1.0, and tile 1003 is missing (magenta). Each record is sampled at the Blender
+    /// UV the Image Texture received, and every colour must match to 1e-6 (the fixtures round to six decimals).
+    #[test]
+    fn edge_oracles_match_blenders_render() -> Result<(), Box<dyn std::error::Error>> {
+        const TOLERANCE: f64 = 1.0e-6;
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/repeat_edge");
+        let mut cases = 0_usize;
+        for entry in std::fs::read_dir(&directory)? {
+            let path = entry?.path();
+            let Some(file) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if path.extension().and_then(|extension| extension.to_str()) != Some("json")
+                || !(file.starts_with("blender_edge_") || file.starts_with("blender_udim_"))
+            {
+                continue;
+            }
+            let document: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+            let interpolation = match document["interpolation"].as_str() {
+                Some("Closest") => ImageInterpolation::Closest,
+                Some("Linear") => ImageInterpolation::Linear,
+                _ => return Err(format!("{file}: interpolation is missing").into()),
+            };
+            let extension = match document["extension"].as_str() {
+                Some("REPEAT") => ImageExtension::Repeat,
+                Some("EXTEND") => ImageExtension::Extend,
+                Some("CLIP") => ImageExtension::Clip,
+                Some("MIRROR") => ImageExtension::Mirror,
+                _ => return Err(format!("{file}: extension is missing").into()),
+            };
+            let (image, udim) = if document["kind"].as_str() == Some("udim") {
+                let base = &document["tiles"]["1001"];
+                let width = usize::try_from(base["width"].as_u64().ok_or("width is missing")?)?;
+                let pixels =
+                    fixture_pixels(width, width, &fixture_texels(&base["texels_blender_rows"])?);
+                let mut tiles = BTreeMap::new();
+                let second = &document["tiles"]["1002"];
+                let second_pixels = fixture_pixels(
+                    width,
+                    width,
+                    &fixture_texels(&second["texels_blender_rows"])?,
+                );
+                tiles.insert(
+                    1002,
+                    ImageTileData {
+                        width: u32::try_from(width)?,
+                        height: u32::try_from(width)?,
+                        pixels: second_pixels,
+                        precision: Precision::Float,
+                        colour: ColourCache::default(),
+                    },
+                );
+                let image = ImageData {
+                    width: u32::try_from(width)?,
+                    height: u32::try_from(width)?,
+                    pixels,
+                    tiles,
+                    interpolation,
+                    srgb: false,
+                    udim: false,
+                    storage: non_colour_storage(),
+                    colour: ColourCache::default(),
+                };
+                (image, true)
+            } else {
+                let width = usize::try_from(document["width"].as_u64().ok_or("width is missing")?)?;
+                let pixels = fixture_pixels(
+                    width,
+                    width,
+                    &fixture_texels(&document["texels_blender_rows"])?,
+                );
+                let image = ImageData {
+                    width: u32::try_from(width)?,
+                    height: u32::try_from(width)?,
+                    pixels,
+                    tiles: BTreeMap::new(),
+                    interpolation,
+                    srgb: false,
+                    udim: false,
+                    storage: non_colour_storage(),
+                    colour: ColourCache::default(),
+                };
+                (image, false)
+            };
+            let mut worst = 0.0_f64;
+            for record in document["records"]
+                .as_array()
+                .ok_or("records are missing")?
+            {
+                let value =
+                    |index: usize| record[index].as_f64().ok_or("record value is not a number");
+                let uv = [value(5)?, value(6)?];
+                let expected = [value(2)?, value(3)?, value(4)?];
+                let actual =
+                    sample_with_extension_alpha(&image, uv, udim, interpolation, extension, false);
+                for channel in 0..3 {
+                    worst = worst.max((actual[channel] - expected[channel]).abs());
+                }
+            }
+            assert!(
+                worst <= TOLERANCE,
+                "{file}: worst residual {worst:e} exceeds {TOLERANCE:e}"
+            );
+            cases += 1;
+        }
+        assert_eq!(
+            cases, 16,
+            "every committed edge oracle case must be checked"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn udim_routing_truncates_each_coordinate_as_cycles_does() {
+        // A coordinate in (-1, 0) stays in column or row 0 and is relative to it, so it is not missing.
+        assert_eq!(udim_route([-0.25, 0.5]), Some((1001, [-0.25, 0.5])));
+        assert_eq!(udim_route([1.0, -0.25]), Some((1002, [0.0, -0.25])));
+        assert_eq!(udim_route([1.5, 1.25]), Some((1012, [0.5, 0.25])));
+        // Columns outside 0..10 and negative rows have no tile (`kernel_image_udim_map`).
+        assert_eq!(udim_route([-1.5, 0.5]), None);
+        assert_eq!(udim_route([10.0, 0.5]), None);
+        assert_eq!(udim_route([0.5, -1.0]), None);
     }
 }
