@@ -588,6 +588,10 @@ fn skin_vertex_radii_set_cross_section_bounds() {
             "1":[0.5,0.25]
         }),
     );
+    // Blender builds a skin only from a skeleton with a root vertex; without one the input is kept
+    // (tests/pr18f_skin.rs, skeleton_without_root_reports_blender_modifier_warning_and_keeps_input).
+    line.attributes
+        .insert("skin_roots".to_owned(), json!({"0": true, "1": false}));
     let result = evaluate_modifiers(&line, &[modifier("skin", json!({}))], "SkinSkeleton").unwrap();
     let bounds = result.bounds().unwrap();
     assert!((bounds.min.x + 0.5).abs() < 1.0e-12);
