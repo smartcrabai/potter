@@ -653,9 +653,7 @@ mod tests {
             edge_sources: Vec::new(),
         };
         reorder_positional_attributes(&mut mesh, &order);
-        let entries = mesh.attributes["blender_attributes"]
-            .as_array()
-            .expect("entries stay an array");
+        let entries = &mesh.attributes["blender_attributes"];
         assert_eq!(entries[0]["values"], json!([2.0, 0.0, 1.0]));
         assert_eq!(entries[1]["values"], json!([11.0, 10.0]));
         assert_eq!(entries[2]["values"], json!([20.0]));
