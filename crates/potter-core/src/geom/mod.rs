@@ -35,6 +35,7 @@ pub mod lattice;
 pub mod mesh_cache;
 pub mod metaball;
 pub mod modifiers;
+pub(crate) mod multires_external;
 pub(crate) mod normals;
 pub mod pointcloud;
 pub(crate) mod provenance;

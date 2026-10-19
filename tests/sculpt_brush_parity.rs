@@ -140,7 +140,6 @@ fn max_error_against_blender(name: &str, text: &str) -> Result<f64, Box<dyn Erro
         samples,
         falloff,
         symmetry,
-        seed: 0,
         delta: None,
     };
     let mut mesh = Mesh::from_positions_and_faces(base.clone(), faces)?;
