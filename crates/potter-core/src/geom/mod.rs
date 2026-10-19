@@ -1455,7 +1455,10 @@ impl Mesh {
         for face in &mesh.faces {
             let count = face.vertices.len();
             for corner in 0..count {
-                let key = edge_key(face.vertices[(corner + count - 1) % count], face.vertices[corner]);
+                let key = edge_key(
+                    face.vertices[(corner + count - 1) % count],
+                    face.vertices[corner],
+                );
                 let next = rank.len();
                 rank.entry(key).or_insert(next);
             }
