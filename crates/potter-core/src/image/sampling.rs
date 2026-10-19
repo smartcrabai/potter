@@ -265,10 +265,10 @@ fn sample_image(
     let Some((width, height)) = image.valid_dimensions() else {
         return TRANSPARENT_BLACK;
     };
-    let local_uv = if !udim {
-        uv
-    } else {
+    let local_uv = if udim {
         [uv[0] - uv[0].floor(), uv[1] - uv[1].floor()]
+    } else {
+        uv
     };
     let u = local_uv[0].clamp(0.0, 1.0);
     let v = local_uv[1].clamp(0.0, 1.0);
@@ -301,9 +301,7 @@ pub fn sample_with_extension_alpha(
     if !uv[0].is_finite() || !uv[1].is_finite() {
         return TRANSPARENT_BLACK;
     }
-    let (image, local) = if !udim {
-        (base_tile(data), uv)
-    } else {
+    let (image, local) = if udim {
         let Some((number, local)) = udim_route(uv) else {
             return MISSING_TILE_RGBA;
         };
@@ -311,6 +309,8 @@ pub fn sample_with_extension_alpha(
             return MISSING_TILE_RGBA;
         };
         (image, local)
+    } else {
+        (base_tile(data), uv)
     };
     let Some((width, height)) = image.valid_dimensions() else {
         return TRANSPARENT_BLACK;
@@ -1584,7 +1584,7 @@ mod tests {
                 let actual = sample_with_extension_alpha(
                     &image,
                     [sample_u, sample_v],
-                    0,
+                    false,
                     interpolation,
                     extension,
                     linked,
