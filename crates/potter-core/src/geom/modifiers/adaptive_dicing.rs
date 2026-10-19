@@ -300,8 +300,9 @@ fn panorama_camera_direction(camera: &AdaptiveCamera, x: f64, y: f64) -> Result<
         height,
         pixel_x,
         pixel_y,
-        x - f64::from(pixel_x),
-        y - f64::from(pixel_y),
+        // The offset lies in [0, 1) by construction, except past the last pixel, where a one-pixel image puts it at 1.
+        (x - f64::from(pixel_x)).clamp(0.0, 1.0 - f64::EPSILON),
+        (y - f64::from(pixel_y)).clamp(0.0, 1.0 - f64::EPSILON),
     )?;
     Ok(ray.map_or(DVec3::ZERO, |(_, direction)| direction))
 }

@@ -624,7 +624,6 @@ fn nearest_hit(
     direction: DVec3,
     camera: &Camera,
 ) -> Option<Hit> {
-    let forward = (camera.target - camera.position).normalize_or_zero();
     geometry
         .triangles
         .iter()
@@ -634,14 +633,7 @@ fn nearest_hit(
                 && (element_index == 0 || triangle.element_index == element_index)
         })
         .filter_map(|(evaluation_index, triangle)| {
-            ray_triangle(
-                origin,
-                direction,
-                triangle,
-                camera,
-                forward,
-                evaluation_index,
-            )
+            ray_triangle(origin, direction, triangle, camera, evaluation_index)
         })
         .min_by(|left, right| left.depth.total_cmp(&right.depth))
 }
@@ -749,8 +741,7 @@ fn ray_line(
     }
     let position = line.start + segment * fraction;
     let ray_position = origin + direction * ray_distance;
-    let depth =
-        (position - camera.position).dot((camera.target - camera.position).normalize_or_zero());
+    let depth = camera.depth_of(position);
     if !depth.is_finite() || depth < camera.near || depth > camera.far {
         return None;
     }
@@ -772,7 +763,6 @@ fn ray_triangle(
     direction: DVec3,
     triangle: &Triangle,
     camera: &Camera,
-    forward: DVec3,
     evaluation_index: usize,
 ) -> Option<Hit> {
     let edge1 = triangle.positions[1] - triangle.positions[0];
@@ -802,7 +792,7 @@ fn ray_triangle(
         return None;
     }
     let position = origin + direction * distance;
-    let depth = (position - camera.position).dot(forward);
+    let depth = camera.depth_of(position);
     if !depth.is_finite() || depth < camera.near || depth > camera.far {
         return None;
     }

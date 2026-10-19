@@ -419,7 +419,8 @@ pub(super) fn render(
                         ray_for_sample(&right_camera, width, height, x, y, sample_x, sample_y)?;
                     let mut left_rng = rng.clone();
                     let mut right_rng = rng.clone();
-                    // A sample with no ray in one eye, outside a fisheye's circle, contributes nothing for that eye.
+                    // A sample with no ray (outside a fisheye's circle, or past its field of view) is opaque black: Blender's
+                    // film writes a pixel with no ray as black with alpha 1 under either film (`probe_transparent_film_fisheye.py`).
                     let (left, left_alpha) = match left_ray {
                         Some((left_origin, left_direction)) => trace_path(
                             doc,
@@ -437,7 +438,7 @@ pub(super) fn render(
                             &mut left_rng,
                             &mut evaluator_workspace,
                         )?,
-                        None => (DVec3::ZERO, 0.0),
+                        None => (DVec3::ZERO, 1.0),
                     };
                     let (right, right_alpha) = match right_ray {
                         Some((right_origin, right_direction)) => trace_path(
@@ -456,7 +457,7 @@ pub(super) fn render(
                             &mut right_rng,
                             &mut evaluator_workspace,
                         )?,
-                        None => (DVec3::ZERO, 0.0),
+                        None => (DVec3::ZERO, 1.0),
                     };
                     (
                         DVec3::new(left.x, right.y, right.z),
@@ -480,7 +481,7 @@ pub(super) fn render(
                             &mut rng,
                             &mut evaluator_workspace,
                         )?,
-                        None => (DVec3::ZERO, 0.0),
+                        None => (DVec3::ZERO, 1.0),
                     }
                 };
                 sum += radiance;
@@ -567,7 +568,6 @@ pub(super) fn composite_realtime_volumes(
             "image width exceeds platform limits",
         )
     })?;
-    let camera_forward = (camera.target - camera.position).normalize_or_zero();
     for y in 0..height {
         let row = usize::try_from(y)
             .ok()
@@ -599,7 +599,7 @@ pub(super) fn composite_realtime_volumes(
                 f64::INFINITY
             } else {
                 let projected_depth = f64::from(output.depths[index]);
-                projected_depth / direction.dot(camera_forward).max(f64::MIN_POSITIVE)
+                camera.ray_distance_for_depth(direction, projected_depth)
             };
             let mut rng = Pcg32::for_sample(seed, x, y, 0);
             let (volume_radiance, transmittance) = realtime_volume_integral(
@@ -981,7 +981,6 @@ fn write_center_passes(
     output: &mut RasterOutput,
     evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<()> {
-    let camera_forward = (camera.target - camera.position).normalize_or_zero();
     for y in 0..height {
         for x in 0..width {
             let index = usize::try_from(y)
@@ -1029,8 +1028,7 @@ fn write_center_passes(
             }
             output.ids[index] = surface.object_index;
             output.elements[index] = surface.element_index;
-            output.depths[index] =
-                finite_f32((surface.point - camera.position).dot(camera_forward));
+            output.depths[index] = finite_f32(camera.depth_of(surface.point));
             output.normals[index] = surface.normal.to_array().map(finite_f32);
             output.ambient_occlusion[index] = finite_f32(super::raster::ambient_visibility(
                 bvh,

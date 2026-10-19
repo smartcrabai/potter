@@ -19,8 +19,8 @@ use crate::{
 
 use super::{
     raster::{
-        Camera, DepthOfField, Mode, Projection, RasterOutput, StereoMode, projection_for_camera,
-        rasterize_with_lines,
+        Camera, CameraEngine, DepthOfField, Mode, Projection, RasterOutput, StereoMode,
+        projection_for_camera, rasterize_with_lines,
     },
     scene::{Geometry, extract_geometry, surface_shader},
 };
@@ -188,7 +188,13 @@ pub fn render_previews(
                 PotError::new(ErrorCode::InternalError, "preview geometry is missing")
             })?;
         let prepared = if let Some(camera_id) = request.camera_id {
-            stored_camera(doc, snapshot, camera_id)?
+            // Beauty is path-traced here, as Cycles draws a panorama camera; the other modes are rasterized.
+            let engine = if matches!(mode, Mode::Beauty) {
+                CameraEngine::Path
+            } else {
+                CameraEngine::Raster
+            };
+            stored_camera(doc, snapshot, camera_id, engine)?
         } else {
             prepared_from_base.ok_or_else(|| {
                 PotError::new(
@@ -335,7 +341,12 @@ pub(crate) fn render_camera_frame(
         &images,
     )?;
     let shader = surface_shader(doc, &snapshot, &images, &geometry, mode);
-    let camera = stored_camera(doc, &snapshot, camera_id)?;
+    let engine_for_camera = if engine == "path" && matches!(mode, Mode::Beauty) {
+        CameraEngine::Path
+    } else {
+        CameraEngine::Raster
+    };
+    let camera = stored_camera(doc, &snapshot, camera_id, engine_for_camera)?;
     let scene = doc
         .scenes
         .get(&snapshot.scene_id)
@@ -518,7 +529,12 @@ fn preset_camera(geometry: &Geometry, view: &str) -> Result<PreparedCamera> {
     })
 }
 
-fn stored_camera(doc: &SceneDoc, snapshot: &Snapshot, camera_id: &str) -> Result<PreparedCamera> {
+fn stored_camera(
+    doc: &SceneDoc,
+    snapshot: &Snapshot,
+    camera_id: &str,
+    engine: CameraEngine,
+) -> Result<PreparedCamera> {
     let id = Id::new(camera_id.to_owned())?;
     let node = doc.nodes.get(&id).ok_or_else(|| {
         PotError::with_details(
@@ -556,11 +572,12 @@ fn stored_camera(doc: &SceneDoc, snapshot: &Snapshot, camera_id: &str) -> Result
         ));
     }
     let target = position + forward;
-    let projection = projection_for_camera(camera_data)?;
-    let projection_name = match camera_data.projection {
-        CameraProjection::Orthographic => "orthographic",
-        CameraProjection::Perspective => "perspective",
-        CameraProjection::Panorama => "panorama",
+    let projection = projection_for_camera(camera_data, engine)?;
+    // The manifest names the projection the render used, so a rasterized panorama camera is "perspective".
+    let projection_name = match projection {
+        Projection::Orthographic { .. } => "orthographic",
+        Projection::Perspective { .. } => "perspective",
+        _ => "panorama",
     };
     let depth_of_field = camera_data.dof_enabled.then_some(DepthOfField {
         focus_distance: camera_data.focus_distance,

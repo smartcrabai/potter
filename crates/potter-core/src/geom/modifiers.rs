@@ -2835,7 +2835,11 @@ fn adaptive_subdivision(
                     sensor_height_mm: camera.data.sensor_height_mm,
                     sensor_fit: camera.data.sensor_fit.clone(),
                     clip_end: camera.data.clip_end,
-                    render_projection: crate::render::raster::projection_for_camera(camera.data)?,
+                    // Adaptive subdivision only runs for the path tracer (`render_camera_frame`), so it dices the path camera.
+                    render_projection: crate::render::raster::projection_for_camera(
+                        camera.data,
+                        crate::render::raster::CameraEngine::Path,
+                    )?,
                     clip_start: camera.data.clip_start,
                     ortho_scale: camera.data.ortho_scale,
                     shift_x: camera.data.shift[0],
