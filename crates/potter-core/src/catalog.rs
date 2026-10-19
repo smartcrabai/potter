@@ -600,13 +600,19 @@ pub fn feature_catalog() -> Value {
             &["modifier.create", "modifier.apply"],
             "Blender's MANIFOLD solver is not implemented; the modifier refuses it with UnsupportedFeature.",
         ),
-        unsupported(
-            "modifier.boolean.solver_float",
-            "Boolean FLOAT solver parity",
-            "BOOLEAN",
-            &["modifier.create", "modifier.apply"],
-            "FLOAT ports Blender's float32 BMesh intersection solver (`geom/boolean/float.rs`). Collection INTERSECT and empty collection operands are refused, as in Blender; double_threshold is FLOAT-only, as in Blender's float path. The row stays unsupported until FLOAT parity against Blender's output is gated.",
-        ),
+        {
+            let mut row = supported(
+                "modifier.boolean.solver_float",
+                "Boolean FLOAT solver parity",
+                "BOOLEAN",
+                &["modifier.create", "modifier.apply"],
+                [true, true, true, true, true, false, false],
+            );
+            row["reason"] = json!(
+                "FLOAT ports Blender's float32 BMesh intersection solver (`geom/boolean/float.rs`) and evaluates the Boolean, reading `double_threshold` as Blender's float path does. Collection INTERSECT and empty collection operands are refused, as in Blender. Gated against Blender 5.2.2 by blend_boolean_parity (the FLOAT corpus rows), blend_boolean_float_regressions (boundary, attribute, and double_threshold cases), blend_boolean_array (FLOAT array layouts, applying one, and reopening), and blend_boolean_stack (FLOAT Boolean followed by Decimate and Solidify). Topology after other modifiers is not verified against Blender."
+            );
+            row
+        },
         unsupported(
             "modifier.boolean.exact_point_attribute_local_index",
             "Boolean EXACT point attributes read the local vertex index",
