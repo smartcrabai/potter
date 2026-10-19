@@ -7,7 +7,7 @@
 //!
 //! The public [`Mesh`] stores stable `u32` IDs independently for vertices, edges, and
 //! polygon faces. References in edges/faces use vertex IDs, never vector positions.
-//! [`Mesh::validate`] checks this invariant and [`Mesh::triangulate`] returns vertex
+//! [`Mesh::validate`] checks this invariant and [`Mesh::tessellate`] returns vertex
 //! IDs while preserving each polygon's winding. Primitive parameter structs implement
 //! [`Default`] with Blender's standard add-primitive settings; override only the fields
 //! that differ. [`Mesh::bounds`] includes loose vertices and returns `None` for an
@@ -19,7 +19,7 @@ use std::{
     fmt,
 };
 
-use glam::{DVec2, DVec3};
+use glam::DVec3;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
 
@@ -205,8 +205,6 @@ pub enum MeshError {
     InvalidTopology(&'static str),
     /// The next ID cannot be incremented without overflowing `u32`.
     IdExhausted,
-    /// Polygon could not be triangulated (usually because it is degenerate).
-    TriangulationFailed(u32),
 }
 
 impl fmt::Display for MeshError {
@@ -217,7 +215,6 @@ impl fmt::Display for MeshError {
             }
             Self::InvalidTopology(message) => write!(formatter, "invalid mesh topology: {message}"),
             Self::IdExhausted => formatter.write_str("mesh element ID space exhausted"),
-            Self::TriangulationFailed(id) => write!(formatter, "could not triangulate face {id}"),
         }
     }
 }
@@ -774,30 +771,17 @@ impl Mesh {
         Some(Aabb { min, max })
     }
 
-    /// Triangulate polygons into vertex-ID triples, preserving face winding.
-    ///
-    /// Each simple, non-degenerate polygon produces exactly `n - 2` triangles.
-    /// Loose vertices and edges do not appear in the result.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for invalid mesh topology, degenerate polygons, or ID exhaustion.
-    pub fn triangulate(&self) -> Result<Vec<[u32; 3]>, MeshError> {
-        self.triangulate_with(false)
-    }
-
-    /// Triangulate as Blender's tessellation does (`mesh_tessellate.cc`): a quad splits along its
-    /// 0-2 diagonal from its first corner, flipped to 1-3 when that split folds. Use this where
-    /// Blender's looptris define the surface, such as a Shrinkwrap target.
+    /// Triangulate every face as Blender's `Mesh::corner_tris` does (`mesh_tessellate.cc`): a
+    /// quad splits along its 0-2 diagonal, flipped to 1-3 when that split folds; any other face
+    /// uses Blender's clip ear-clipper (`BLI_polyfill_calc`), which accepts self-intersecting and
+    /// zero-area input. Each face yields `n - 2` triangles in its winding; loose vertices and edges
+    /// do not appear. Render, preview, exports, and modifiers that need Blender's looptris use this
+    /// one implementation, so their diagonals match Blender.
     ///
     /// # Errors
     ///
-    /// Returns the errors of [`Mesh::triangulate`].
+    /// Returns an error only for invalid mesh topology or ID exhaustion.
     pub fn tessellate(&self) -> Result<Vec<[u32; 3]>, MeshError> {
-        self.triangulate_with(true)
-    }
-
-    fn triangulate_with(&self, blender_quads: bool) -> Result<Vec<[u32; 3]>, MeshError> {
         self.validate()?;
         let capacity = self.faces.iter().try_fold(0_usize, |capacity, face| {
             capacity
@@ -811,7 +795,7 @@ impl Mesh {
             .collect();
         let mut result = Vec::with_capacity(capacity);
         for face in &self.faces {
-            result.extend(triangulate_face(face, &positions, blender_quads)?);
+            result.extend(tessellate_face(face, &positions)?);
         }
         Ok(result)
     }
@@ -1676,139 +1660,25 @@ fn normalize_sphere_point(mut point: [f32; 3], radius: f32) -> [f32; 3] {
     point
 }
 
-fn triangulate_face(
+/// One face's triangles as `mesh_tessellate.cc` lays them out (see [`Mesh::tessellate`]).
+fn tessellate_face(
     face: &Face,
     vertex_positions: &HashMap<u32, DVec3>,
-    blender_quads: bool,
 ) -> Result<Vec<[u32; 3]>, MeshError> {
-    let points: Vec<DVec3> = face
+    let corners = face
         .vertices
         .iter()
         .map(|id| {
-            vertex_positions
-                .get(id)
-                .copied()
-                .ok_or(MeshError::InvalidTopology(
-                    "face references a missing vertex",
-                ))
+            let point = vertex_positions.get(id).ok_or(MeshError::InvalidTopology(
+                "face references a missing vertex",
+            ))?;
+            Ok([point.x as f32, point.y as f32, point.z as f32])
         })
-        .collect::<Result<_, _>>()?;
-    if blender_quads {
-        let corners: Vec<[f32; 3]> = points
-            .iter()
-            .map(|point| [point.x as f32, point.y as f32, point.z as f32])
-            .collect();
-        return Ok(triangulate::loop_triangles(&corners)
-            .into_iter()
-            .map(|[a, b, c]| [face.vertices[a], face.vertices[b], face.vertices[c]])
-            .collect());
-    }
-    let normal = points
-        .iter()
-        .zip(points.iter().cycle().skip(1))
-        .take(points.len())
-        .fold(DVec3::ZERO, |sum, (current, next)| {
-            sum + DVec3::new(
-                (current.y - next.y) * (current.z + next.z),
-                (current.z - next.z) * (current.x + next.x),
-                (current.x - next.x) * (current.y + next.y),
-            )
-        });
-    let absolute = normal.abs();
-    let axis = if absolute.x >= absolute.y && absolute.x >= absolute.z {
-        0
-    } else if absolute.y >= absolute.z {
-        1
-    } else {
-        2
-    };
-    let projected: Vec<DVec2> = points
-        .iter()
-        .map(|point| match axis {
-            0 => DVec2::new(point.y, point.z),
-            1 => DVec2::new(point.x, point.z),
-            _ => DVec2::new(point.x, point.y),
-        })
-        .collect();
-    let twice_area = projected
-        .iter()
-        .zip(projected.iter().cycle().skip(1))
-        .take(projected.len())
-        .map(|(a, b)| a.x * b.y - b.x * a.y)
-        .sum::<f64>();
-    let scale = projected
-        .iter()
-        .fold(1.0_f64, |scale, point| scale.max(point.abs().max_element()));
-    let epsilon = f64::EPSILON * scale * scale * 32.0;
-    if !twice_area.is_finite() || twice_area.abs() <= epsilon {
-        return Err(MeshError::TriangulationFailed(face.id));
-    }
-    let orientation = twice_area.signum();
-    let mut remaining: Vec<usize> = (0..face.vertices.len()).collect();
-    let mut triangles = Vec::with_capacity(remaining.len() - 2);
-    while remaining.len() > 3 {
-        let mut ear = None;
-        for cursor in 0..remaining.len() {
-            let previous = remaining[(cursor + remaining.len() - 1) % remaining.len()];
-            let current = remaining[cursor];
-            let next = remaining[(cursor + 1) % remaining.len()];
-            let a = projected[previous];
-            let b = projected[current];
-            let c = projected[next];
-            if cross2(b - a, c - b) * orientation <= epsilon {
-                continue;
-            }
-            if remaining
-                .iter()
-                .copied()
-                .filter(|candidate| {
-                    *candidate != previous && *candidate != current && *candidate != next
-                })
-                .any(|candidate| {
-                    point_in_triangle_2d(projected[candidate], a, b, c, orientation, epsilon)
-                })
-            {
-                continue;
-            }
-            ear = Some((
-                cursor,
-                [
-                    face.vertices[previous],
-                    face.vertices[current],
-                    face.vertices[next],
-                ],
-            ));
-            break;
-        }
-        let Some((cursor, triangle)) = ear else {
-            return Err(MeshError::TriangulationFailed(face.id));
-        };
-        triangles.push(triangle);
-        remaining.remove(cursor);
-    }
-    triangles.push([
-        face.vertices[remaining[0]],
-        face.vertices[remaining[1]],
-        face.vertices[remaining[2]],
-    ]);
-    Ok(triangles)
-}
-
-fn cross2(a: DVec2, b: DVec2) -> f64 {
-    a.x * b.y - a.y * b.x
-}
-
-fn point_in_triangle_2d(
-    point: DVec2,
-    a: DVec2,
-    b: DVec2,
-    c: DVec2,
-    orientation: f64,
-    epsilon: f64,
-) -> bool {
-    cross2(b - a, point - a) * orientation >= -epsilon
-        && cross2(c - b, point - b) * orientation >= -epsilon
-        && cross2(a - c, point - c) * orientation >= -epsilon
+        .collect::<Result<Vec<[f32; 3]>, MeshError>>()?;
+    Ok(triangulate::loop_triangles(&corners)
+        .into_iter()
+        .map(|[a, b, c]| [face.vertices[a], face.vertices[b], face.vertices[c]])
+        .collect())
 }
 
 #[must_use]
@@ -1851,34 +1721,34 @@ mod tests {
             (cube.vertices.len(), cube.edges.len(), cube.faces.len()),
             (8, 12, 6)
         );
-        assert_eq!(cube.triangulate().unwrap().len(), 12);
+        assert_eq!(cube.tessellate().unwrap().len(), 12);
 
         let sphere = Mesh::uv_sphere(UvSphereParams::default()).unwrap();
         assert_eq!((sphere.vertices.len(), sphere.faces.len()), (482, 512));
-        assert_eq!(sphere.triangulate().unwrap().len(), 960);
+        assert_eq!(sphere.tessellate().unwrap().len(), 960);
 
         let cylinder = Mesh::cylinder(CylinderParams::default()).unwrap();
         assert_eq!((cylinder.vertices.len(), cylinder.faces.len()), (64, 34));
-        assert_eq!(cylinder.triangulate().unwrap().len(), 124);
+        assert_eq!(cylinder.tessellate().unwrap().len(), 124);
 
         let plane = Mesh::plane(PlaneParams::default()).unwrap();
         assert_eq!(
             (plane.vertices.len(), plane.edges.len(), plane.faces.len()),
             (4, 4, 1)
         );
-        assert_eq!(plane.triangulate().unwrap().len(), 2);
+        assert_eq!(plane.tessellate().unwrap().len(), 2);
 
         let cone = Mesh::cone(ConeParams::default()).unwrap();
         assert_eq!((cone.vertices.len(), cone.faces.len()), (33, 33));
-        assert_eq!(cone.triangulate().unwrap().len(), 62);
+        assert_eq!(cone.tessellate().unwrap().len(), 62);
 
         let torus = Mesh::torus(TorusParams::default()).unwrap();
         assert_eq!((torus.vertices.len(), torus.faces.len()), (576, 576));
-        assert_eq!(torus.triangulate().unwrap().len(), 1_152);
+        assert_eq!(torus.tessellate().unwrap().len(), 1_152);
 
         let ico = Mesh::icosphere(IcosphereParams::default()).unwrap();
         assert_eq!((ico.vertices.len(), ico.faces.len()), (42, 80));
-        assert_eq!(ico.triangulate().unwrap().len(), 80);
+        assert_eq!(ico.tessellate().unwrap().len(), 80);
 
         let circle = Mesh::circle(CircleParams::default()).unwrap();
         assert_eq!(
@@ -1895,7 +1765,7 @@ mod tests {
             (grid.vertices.len(), grid.edges.len(), grid.faces.len()),
             (100, 180, 81)
         );
-        assert_eq!(grid.triangulate().unwrap().len(), 162);
+        assert_eq!(grid.tessellate().unwrap().len(), 162);
     }
 
     #[test]
@@ -1942,28 +1812,12 @@ mod tests {
             vec![vec![0, 1, 2, 3, 4]],
         )
         .unwrap();
-        let triangles = mesh.triangulate().unwrap();
+        let triangles = mesh.tessellate().unwrap();
         assert_eq!(triangles.len(), 3);
         for [a, b, c] in triangles {
             let points = [a, b, c].map(|id| mesh.vertex(id).unwrap().co);
             assert!((points[1] - points[0]).cross(points[2] - points[0]).z > 0.0);
         }
-    }
-
-    #[test]
-    fn triangulation_retains_collinear_boundary_vertices() {
-        let mesh = Mesh::from_positions_and_faces(
-            vec![
-                DVec3::new(0.0, 0.0, 0.0),
-                DVec3::new(1.0, 0.0, 0.0),
-                DVec3::new(2.0, 0.0, 0.0),
-                DVec3::new(2.0, 2.0, 0.0),
-                DVec3::new(0.0, 2.0, 0.0),
-            ],
-            vec![vec![0, 1, 2, 3, 4]],
-        )
-        .unwrap();
-        assert_eq!(mesh.triangulate().unwrap().len(), 3);
     }
 
     #[test]
@@ -2012,7 +1866,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!((inverted.vertices.len(), inverted.faces.len()), (33, 33));
-        assert_eq!(inverted.triangulate().unwrap().len(), 62);
+        assert_eq!(inverted.tessellate().unwrap().len(), 62);
         let truncated = Mesh::cone(ConeParams {
             radius1: 0.5,
             radius2: 1.0,
@@ -2020,7 +1874,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(truncated.vertices.len(), 64);
-        assert_eq!(truncated.triangulate().unwrap().len(), 124);
+        assert_eq!(truncated.tessellate().unwrap().len(), 124);
     }
 
     fn triangle_mesh() -> Mesh {
@@ -2092,7 +1946,7 @@ mod tests {
         let empty = Mesh::new();
         assert!(empty.bounds().is_none());
         assert!(
-            empty.triangulate().unwrap().is_empty(),
+            empty.tessellate().unwrap().is_empty(),
             "an empty mesh has no triangles"
         );
 
@@ -2101,10 +1955,7 @@ mod tests {
             vec![vec![0, 1, 2]],
         )
         .unwrap();
-        assert_eq!(
-            collinear.triangulate(),
-            Err(MeshError::TriangulationFailed(0))
-        );
+        assert_eq!(collinear.tessellate().unwrap(), vec![[0, 1, 2]]);
     }
 
     #[test]
@@ -2164,7 +2015,7 @@ mod tests {
                 .collect();
             let polygon = (0..count).collect();
             let mesh = Mesh::from_positions_and_faces(positions, vec![polygon]).unwrap();
-            prop_assert_eq!(mesh.triangulate().unwrap().len(), count - 2);
+            prop_assert_eq!(mesh.tessellate().unwrap().len(), count - 2);
         }
     }
 }

@@ -48,6 +48,9 @@ const CREASE_TOLERANCE: f64 = 1.0e-6;
 // Non-manifold splits put several Blender vertices at one position; vertices closer than this
 // are one position, and each position must have the same multiplicity on both sides.
 const CLUSTER_TOLERANCE: f64 = 1.0e-4;
+// Generic values are float32 interpolations of values near 300 (one ulp is 3e-5 there), so they
+// are bounded relative to magnitude at eight float32 ulps; this check is new, not an existing bound.
+const GENERIC_ATTRIBUTE_TOLERANCE: f64 = 1.0e-5;
 
 fn number(value: &Value) -> TestResult<f64> {
     value.as_f64().ok_or_else(|| "expected a number".into())
@@ -438,7 +441,7 @@ fn potter_shape(mesh: &Mesh) -> TestResult<Shape> {
     })
 }
 
-fn input_mesh(spec: &Value) -> TestResult<Mesh> {
+fn input_mesh(spec: &Value, blender_input_edges: &Value) -> TestResult<Mesh> {
     let vertices = spec["vertices"]
         .as_array()
         .ok_or("mesh vertices missing")?
@@ -473,6 +476,48 @@ fn input_mesh(spec: &Value) -> TestResult<Mesh> {
         .map(|(face, &shift)| rotated(face, shift))
         .collect();
     let mut mesh = Mesh::from_positions_and_faces(vertices, faces)?;
+    let vertex_ids: Vec<u32> = mesh.vertices.iter().map(|vertex| vertex.id).collect();
+    let vertex_index: HashMap<u32, usize> = vertex_ids
+        .iter()
+        .enumerate()
+        .map(|(index, &id)| (id, index))
+        .collect();
+    for loose in spec["loose_edges"]
+        .as_array()
+        .ok_or("mesh loose edges missing")?
+    {
+        let pair = indices(loose)?;
+        if pair.len() != 2 {
+            return Err("loose edge must reference two vertices".into());
+        }
+        mesh.insert_edge([vertex_ids[pair[0]], vertex_ids[pair[1]]])?;
+    }
+    let mut edges_by_pair = HashMap::new();
+    for edge in std::mem::take(&mut mesh.edges) {
+        let first = *vertex_index
+            .get(&edge.vertices[0])
+            .ok_or("edge vertex missing")?;
+        let second = *vertex_index
+            .get(&edge.vertices[1])
+            .ok_or("edge vertex missing")?;
+        edges_by_pair.insert(edge_key(first, second), edge);
+    }
+    mesh.edges = blender_input_edges
+        .as_array()
+        .ok_or("oracle input edges missing")?
+        .iter()
+        .map(|pair| -> TestResult<_> {
+            let pair = indices(pair)?;
+            let mut edge = edges_by_pair
+                .remove(&edge_key(pair[0], pair[1]))
+                .ok_or("Blender input edge missing from Potter input")?;
+            edge.vertices = [vertex_ids[pair[0]], vertex_ids[pair[1]]];
+            Ok(edge)
+        })
+        .collect::<TestResult<_>>()?;
+    if !edges_by_pair.is_empty() {
+        return Err("Potter input edge is absent from Blender's input edge order".into());
+    }
     let material_values = spec["materials"]
         .as_array()
         .ok_or("mesh material indices missing")?;
@@ -508,16 +553,6 @@ fn input_mesh(spec: &Value) -> TestResult<Mesh> {
             mesh.attributes
                 .insert("vertex_groups".to_owned(), Value::Object(groups));
         }
-    }
-    for loose in spec["loose_edges"]
-        .as_array()
-        .ok_or("mesh loose edges missing")?
-    {
-        let pair = indices(loose)?;
-        if pair.len() != 2 {
-            return Err("loose edge must reference two vertices".into());
-        }
-        mesh.insert_edge([u32::try_from(pair[0])?, u32::try_from(pair[1])?])?;
     }
 
     let seams = spec["seams"]
@@ -719,7 +754,207 @@ fn input_mesh(spec: &Value) -> TestResult<Mesh> {
             json!({"domain": "point", "type": "float", "values": values}),
         );
     }
+    // Generic attributes live in the native keyed store under their own names, keyed by element ID. Values
+    // mirror `order_values` in generate.py: POINT, EDGE, and FACE index their element, and CORNER indexes
+    // Blender's loop. Storage corner `c` of face `f` is logical corner `(c + shift) mod n`, and the logical
+    // loops of face `f` start after the earlier faces' corners.
+    let loop_offsets: Vec<usize> = logical_faces
+        .iter()
+        .scan(0, |total, face| {
+            let start = *total;
+            *total += face.len();
+            Some(start)
+        })
+        .collect();
+    for definition in spec["order_attributes"]
+        .as_array()
+        .ok_or("order attribute definitions missing")?
+    {
+        let name = definition["name"]
+            .as_str()
+            .ok_or("order attribute name missing")?;
+        let domain = definition["domain"]
+            .as_str()
+            .ok_or("order attribute domain missing")?;
+        let data_type = definition["type"]
+            .as_str()
+            .ok_or("order attribute type missing")?;
+        let mut values = Map::new();
+        match domain {
+            "POINT" => {
+                for (index, vertex) in mesh.vertices.iter().enumerate() {
+                    values.insert(
+                        format!("v{}", vertex.id),
+                        order_value(domain, data_type, index, 0)?,
+                    );
+                }
+            }
+            "EDGE" => {
+                for (index, edge) in mesh.edges.iter().enumerate() {
+                    values.insert(
+                        format!("e{}", edge.id),
+                        order_value(domain, data_type, index, 0)?,
+                    );
+                }
+            }
+            "FACE" => {
+                for (index, face) in mesh.faces.iter().enumerate() {
+                    values.insert(
+                        format!("f{}", face.id),
+                        order_value(domain, data_type, index, 0)?,
+                    );
+                }
+            }
+            "CORNER" => {
+                for (index, face) in mesh.faces.iter().enumerate() {
+                    let size = face.vertices.len();
+                    let row = (0..size)
+                        .map(|corner| {
+                            let logical = (corner + shifts[index]) % size;
+                            order_value(domain, data_type, index, loop_offsets[index] + logical)
+                        })
+                        .collect::<TestResult<Vec<_>>>()?;
+                    values.insert(format!("f{}", face.id), Value::Array(row));
+                }
+            }
+            _ => return Err(format!("unknown order attribute domain {domain}").into()),
+        }
+        let native_domain = domain.to_ascii_lowercase();
+        let native_type = match data_type {
+            "FLOAT" => "float",
+            "INT" => "int",
+            "QUATERNION" => "quaternion",
+            _ => return Err(format!("unknown order attribute type {data_type}").into()),
+        };
+        mesh.attributes.insert(
+            name.to_owned(),
+            json!({"domain": native_domain, "type": native_type, "values": values}),
+        );
+    }
+    // BYTE_COLOR layers enter Potter as linear colours; their sRGB byte source is recorded in
+    // `blender_metadata.color_data_types`, which `encode_byte_colors` re-blends from. The bytes come from
+    // `byte_color_values` in generate.py, by Blender loop index for CORNER.
+    let mut color_names = Vec::new();
+    let mut color_types = Map::new();
+    for definition in spec
+        .get("byte_colors")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let name = definition["name"]
+            .as_str()
+            .ok_or("byte colour name missing")?;
+        let domain = definition["domain"]
+            .as_str()
+            .ok_or("byte colour domain missing")?;
+        let mut values = Map::new();
+        match domain {
+            "POINT" => {
+                for (index, vertex) in mesh.vertices.iter().enumerate() {
+                    values.insert(
+                        format!("v{}", vertex.id),
+                        linear_color(byte_color_bytes(domain, index)),
+                    );
+                }
+            }
+            "CORNER" => {
+                for (index, face) in mesh.faces.iter().enumerate() {
+                    let size = face.vertices.len();
+                    let row: Vec<Value> = (0..size)
+                        .map(|corner| {
+                            let logical = loop_offsets[index] + (corner + shifts[index]) % size;
+                            linear_color(byte_color_bytes(domain, logical))
+                        })
+                        .collect();
+                    values.insert(format!("f{}", face.id), Value::Array(row));
+                }
+            }
+            _ => return Err(format!("unknown byte colour domain {domain}").into()),
+        }
+        mesh.attributes.insert(
+            name.to_owned(),
+            json!({"domain": domain.to_ascii_lowercase(), "type": "color", "values": values}),
+        );
+        color_names.push(Value::String(name.to_owned()));
+        color_types.insert(name.to_owned(), json!("BYTE_COLOR"));
+    }
+    if !color_names.is_empty() {
+        mesh.attributes.insert(
+            "color_layers".to_owned(),
+            json!({"layers": color_names, "active": null, "render": null}),
+        );
+        mesh.attributes.insert(
+            "blender_metadata".to_owned(),
+            json!({"color_data_types": color_types}),
+        );
+    }
     Ok(mesh)
+}
+
+/// Blender's value of one order-attribute element, as `order_values` in generate.py computes it. `element`
+/// is the POINT, EDGE, or FACE index; `loop_index` is the Blender loop of a CORNER element.
+fn order_value(
+    domain: &str,
+    data_type: &str,
+    element: usize,
+    loop_index: usize,
+) -> TestResult<Value> {
+    Ok(match (domain, data_type) {
+        ("POINT", "FLOAT") => json!(element as f64 + 0.25),
+        ("POINT", "INT") => json!((element * 3) % 7),
+        ("POINT", "QUATERNION") => json!(order_quaternion(element)),
+        ("EDGE", "FLOAT") => json!(100.25 + element as f64),
+        ("FACE", "FLOAT") => json!(200.25 + element as f64),
+        ("CORNER", "FLOAT") => json!(300.25 + loop_index as f64),
+        ("CORNER", "INT") => json!((loop_index * 5) % 13),
+        ("CORNER", "QUATERNION") => json!(order_corner_quaternion(loop_index)),
+        _ => return Err(format!("unsupported order attribute {data_type} on {domain}").into()),
+    })
+}
+
+/// The unit quaternion `[x, y, z, w]` of loop `loop_index` for the CORNER quaternion layer: `corner_quaternion_for`
+/// in generate.py, converted to Potter's native order. Neighbouring loops have a negative dot product.
+fn order_corner_quaternion(loop_index: usize) -> [f64; 4] {
+    let axis = [1.0, 0.5, 0.25];
+    let length = axis
+        .iter()
+        .map(|component| component * component)
+        .sum::<f64>()
+        .sqrt();
+    let angle = 0.2 + 0.05 * loop_index as f64;
+    let sign = if loop_index % 2 == 1 { -1.0 } else { 1.0 };
+    let scale = sign * (angle / 2.0).sin() / length;
+    [
+        axis[0] * scale,
+        axis[1] * scale,
+        axis[2] * scale,
+        sign * (angle / 2.0).cos(),
+    ]
+}
+
+/// The unit quaternion `[x, y, z, w]` of vertex `index` in the ordered-attribute fixtures: Potter's native order
+/// for generic quaternions. It is `quaternion_for` in generate.py, which Blender stores as `w, x, y, z`. For some
+/// vertices the angle exceeds pi, so w is negative.
+fn order_quaternion(index: usize) -> [f64; 4] {
+    let angle = 0.3 + 0.37 * index as f64;
+    let axis = [
+        1.0,
+        0.5 * (index % 3) as f64,
+        0.25 * (index % 5) as f64 + 0.1,
+    ];
+    let length = axis
+        .iter()
+        .map(|component| component * component)
+        .sum::<f64>()
+        .sqrt();
+    let scale = (angle / 2.0).sin() / length;
+    [
+        axis[0] * scale,
+        axis[1] * scale,
+        axis[2] * scale,
+        (angle / 2.0).cos(),
+    ]
 }
 
 /// Groups vertices whose positions coincide. Returns each vertex's cluster, each cluster's
@@ -773,6 +1008,342 @@ struct Errors {
     position: f64,
     uv: f64,
     crease: f64,
+}
+
+/// Checks Blender's consumer-visible vertex/edge/face/loop storage order, not only topology after
+/// position clustering. Geometry values retain their existing numeric tolerances.
+fn compare_storage_order(actual: &Shape, expected: &Shape) -> Result<(), String> {
+    if actual.points.len() != expected.points.len()
+        || actual.edges.len() != expected.edges.len()
+        || actual.faces.len() != expected.faces.len()
+    {
+        return Err(format!(
+            "ordered counts differ: vertices {}/{}, edges {}/{}, faces {}/{}",
+            actual.points.len(),
+            expected.points.len(),
+            actual.edges.len(),
+            expected.edges.len(),
+            actual.faces.len(),
+            expected.faces.len()
+        ));
+    }
+    for (index, (actual, expected)) in actual.points.iter().zip(&expected.points).enumerate() {
+        let error = actual.distance(*expected);
+        if error > POSITION_TOLERANCE {
+            return Err(format!(
+                "vertex {index} is out of Blender order or position: {actual:?} vs {expected:?}, error {error:.9e}"
+            ));
+        }
+    }
+    for (index, (actual, expected)) in actual.edges.iter().zip(&expected.edges).enumerate() {
+        if actual.vertices != expected.vertices {
+            return Err(format!(
+                "edge {index} endpoints differ in Blender order: {:?} != {:?}",
+                actual.vertices, expected.vertices
+            ));
+        }
+        if actual.seam != expected.seam || actual.sharp != expected.sharp {
+            return Err(format!("edge {index} seam/sharp flags differ"));
+        }
+        if (actual.crease - expected.crease).abs() > CREASE_TOLERANCE {
+            return Err(format!("edge {index} crease differs"));
+        }
+    }
+    for (index, (actual, expected)) in actual.faces.iter().zip(&expected.faces).enumerate() {
+        if actual.vertices != expected.vertices {
+            return Err(format!(
+                "face {index} loop order differs: {:?} != {:?}",
+                actual.vertices, expected.vertices
+            ));
+        }
+        if actual.material_index != expected.material_index || actual.smooth != expected.smooth {
+            return Err(format!("face {index} material/shade flag differs"));
+        }
+        if actual.uv.keys().collect::<Vec<_>>() != expected.uv.keys().collect::<Vec<_>>()
+            || actual.uv_pins != expected.uv_pins
+        {
+            return Err(format!("face {index} UV layers or pin rows differ"));
+        }
+        for (layer, actual_uvs) in &actual.uv {
+            let expected_uvs = &expected.uv[layer];
+            if actual_uvs.len() != expected_uvs.len()
+                || actual_uvs.iter().zip(expected_uvs).any(|(a, b)| {
+                    (a[0] - b[0]).abs() > UV_TOLERANCE || (a[1] - b[1]).abs() > UV_TOLERANCE
+                })
+            {
+                return Err(format!("face {index} UV loop order differs in {layer}"));
+            }
+        }
+        match (&actual.normal_codes, &expected.normal_codes) {
+            (Some(a), Some(b)) if a.len() == b.len() => {
+                if !a.iter().zip(b).all(|(x, y)| codes_within_beta_step(x, y)) {
+                    return Err(format!("face {index} custom-normal loop order differs"));
+                }
+            }
+            (None, None) => {}
+            _ => {
+                return Err(format!(
+                    "face {index} custom-normal layer/loop count differs"
+                ));
+            }
+        }
+    }
+    if actual.vertex_groups.keys().collect::<Vec<_>>()
+        != expected.vertex_groups.keys().collect::<Vec<_>>()
+    {
+        return Err("ordered vertex-group names differ".to_owned());
+    }
+    for (name, actual_values) in &actual.vertex_groups {
+        let expected_values = &expected.vertex_groups[name];
+        if actual_values.len() != expected_values.len()
+            || actual_values
+                .iter()
+                .zip(expected_values)
+                .any(|(a, b)| (a - b).abs() > 1.0e-6)
+        {
+            return Err(format!("vertex group {name} differs in vertex order"));
+        }
+    }
+    Ok(())
+}
+
+/// Compares Blender's generic POINT/EDGE/FACE/CORNER values, in storage order, with the native keyed store of
+/// `mesh`, componentwise for quaternion arrays. Provenance leaves an element without a source out of the store,
+/// and readers take the type's default (`provenance.rs` remap docs). Blender's `subdiv_copy_edge_data`
+/// (`subdiv_mesh.cc` L1199-1222) gives inner edges that default too, so an absent entry is accepted only where
+/// Blender's value is 0.0. Any other absent element fails. Present values must match within
+/// `GENERIC_ATTRIBUTE_TOLERANCE`, relative to magnitude, and quaternion signs must match exactly.
+fn compare_ordered_attributes(mesh: &Mesh, expected: &Value) -> TestResult<()> {
+    let expected = expected
+        .as_array()
+        .ok_or("oracle ordered attributes missing")?;
+    for definition in expected {
+        let name = definition["name"]
+            .as_str()
+            .ok_or("oracle ordered attribute name missing")?;
+        let domain = definition["domain"]
+            .as_str()
+            .ok_or("oracle ordered attribute domain missing")?;
+        let attribute = mesh
+            .attributes
+            .get(name)
+            .ok_or_else(|| format!("generic attribute {name} is missing"))?;
+        let native_domain = domain.to_ascii_lowercase();
+        if attribute["domain"] != native_domain.as_str() {
+            return Err(
+                format!("generic attribute {name} is not on the {native_domain} domain").into(),
+            );
+        }
+        let values = attribute["values"]
+            .as_object()
+            .ok_or_else(|| format!("generic attribute {name} has no values"))?;
+        let actual: Vec<Option<&Value>> = match domain {
+            "POINT" => mesh
+                .vertices
+                .iter()
+                .map(|vertex| values.get(&format!("v{}", vertex.id)))
+                .collect(),
+            "EDGE" => mesh
+                .edges
+                .iter()
+                .map(|edge| values.get(&format!("e{}", edge.id)))
+                .collect(),
+            "FACE" => mesh
+                .faces
+                .iter()
+                .map(|face| values.get(&format!("f{}", face.id)))
+                .collect(),
+            "CORNER" => {
+                let mut corners = Vec::new();
+                for face in &mesh.faces {
+                    let row = values
+                        .get(&format!("f{}", face.id))
+                        .and_then(Value::as_array)
+                        .ok_or_else(|| format!("generic attribute {name} has no corner row"))?;
+                    if row.len() != face.vertices.len() {
+                        return Err(format!(
+                            "generic attribute {name} corner row has the wrong length"
+                        )
+                        .into());
+                    }
+                    corners.extend(row.iter().map(Some));
+                }
+                corners
+            }
+            _ => return Err(format!("unknown order attribute domain {domain}").into()),
+        };
+        let expected_values = definition["values"]
+            .as_array()
+            .ok_or("oracle ordered attribute values missing")?;
+        if actual.len() != expected_values.len() {
+            return Err(format!(
+                "generic attribute {name} has {} elements, Blender has {}",
+                actual.len(),
+                expected_values.len()
+            )
+            .into());
+        }
+        for (index, (actual, expected)) in actual.into_iter().zip(expected_values).enumerate() {
+            match actual {
+                Some(actual) if generic_close(actual, expected) => {}
+                None if expected.as_f64() == Some(0.0) => {}
+                _ => {
+                    return Err(format!(
+                        "generic attribute {name} {domain} element {index} is {actual:?}, Blender has {expected}"
+                    )
+                    .into());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether a stored value matches Blender's: numbers within tolerance relative to magnitude, arrays
+/// componentwise, and nothing else.
+fn generic_close(actual: &Value, expected: &Value) -> bool {
+    match (actual.as_array(), expected.as_array()) {
+        (Some(actual), Some(expected)) => {
+            actual.len() == expected.len()
+                && actual
+                    .iter()
+                    .zip(expected)
+                    .all(|(actual, expected)| generic_close(actual, expected))
+        }
+        (None, None) => match (actual.as_f64(), expected.as_f64()) {
+            (Some(actual), Some(expected)) => {
+                (actual - expected).abs() <= GENERIC_ATTRIBUTE_TOLERANCE * expected.abs().max(1.0)
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Linear value of an sRGB byte, as Blender's colour attribute `color` reports it.
+fn srgb_to_linear(encoded: f64) -> f64 {
+    if encoded <= 0.04045 {
+        encoded / 12.92
+    } else {
+        ((encoded + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// sRGB-encoded value of a linear one, the inverse of [`srgb_to_linear`].
+fn linear_to_srgb(linear: f64) -> f64 {
+    if linear <= 0.003_130_8 {
+        linear * 12.92
+    } else {
+        1.055 * linear.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// The sRGB bytes `[r, g, b, a]` of a `BYTE_COLOR` element (`byte_color_values` in generate.py). `element` is the
+/// POINT vertex index or the Blender loop index of a CORNER.
+fn byte_color_bytes(domain: &str, element: usize) -> [u8; 4] {
+    let (base, alpha_base) = if domain == "POINT" {
+        (17, 101)
+    } else {
+        (53, 7)
+    };
+    [
+        ((element * 37 + base) % 256) as u8,
+        ((element * 37 + 91 + base) % 256) as u8,
+        ((element * 37 + 182 + base) % 256) as u8,
+        ((element * 29 + alpha_base) % 256) as u8,
+    ]
+}
+
+/// Potter's stored linear colour of a `BYTE_COLOR` element: each colour channel decoded from its sRGB byte, alpha
+/// linear.
+fn linear_color(bytes: [u8; 4]) -> Value {
+    let [r, g, b, a] = bytes.map(|byte| f64::from(byte) / 255.0);
+    json!([srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b), a])
+}
+
+/// Compares Blender's `BYTE_COLOR` values, in storage order, with Potter's output encoded back to sRGB bytes. The
+/// bytes must match exactly, so the per-slot truncation of `encode_byte_colors` is what is checked.
+fn compare_byte_colors(mesh: &Mesh, expected: &Value) -> TestResult<()> {
+    for definition in expected.as_array().ok_or("oracle byte colours missing")? {
+        let name = definition["name"]
+            .as_str()
+            .ok_or("oracle byte colour name missing")?;
+        let domain = definition["domain"]
+            .as_str()
+            .ok_or("oracle byte colour domain missing")?;
+        let attribute = mesh
+            .attributes
+            .get(name)
+            .ok_or_else(|| format!("byte colour {name} is missing"))?;
+        let values = attribute["values"]
+            .as_object()
+            .ok_or_else(|| format!("byte colour {name} has no values"))?;
+        let mut actual: Vec<&Value> = Vec::new();
+        match domain {
+            "POINT" => {
+                for vertex in &mesh.vertices {
+                    let value = values.get(&format!("v{}", vertex.id)).ok_or_else(|| {
+                        format!("byte colour {name} has no value for v{}", vertex.id)
+                    })?;
+                    actual.push(value);
+                }
+            }
+            "CORNER" => {
+                for face in &mesh.faces {
+                    let row = values
+                        .get(&format!("f{}", face.id))
+                        .and_then(Value::as_array)
+                        .ok_or_else(|| format!("byte colour {name} has no row for f{}", face.id))?;
+                    actual.extend(row.iter());
+                }
+            }
+            _ => return Err(format!("unknown byte colour domain {domain}").into()),
+        }
+        let expected_rows = definition["values"]
+            .as_array()
+            .ok_or("oracle byte colour values missing")?;
+        if actual.len() != expected_rows.len() {
+            return Err(format!(
+                "byte colour {name} has {} elements, Blender has {}",
+                actual.len(),
+                expected_rows.len()
+            )
+            .into());
+        }
+        for (index, (actual, expected)) in actual.into_iter().zip(expected_rows).enumerate() {
+            let linear = actual
+                .as_array()
+                .ok_or("byte colour value is not a colour")?
+                .iter()
+                .map(number)
+                .collect::<TestResult<Vec<f64>>>()?;
+            let bytes: Vec<i64> = linear
+                .iter()
+                .enumerate()
+                .map(|(channel, value)| {
+                    let encoded = if channel < 3 {
+                        linear_to_srgb(*value)
+                    } else {
+                        *value
+                    };
+                    (encoded * 255.0).round() as i64
+                })
+                .collect();
+            let wanted: Vec<i64> = expected
+                .as_array()
+                .ok_or("oracle byte colour is not a colour")?
+                .iter()
+                .map(|byte| byte.as_i64().ok_or("oracle byte is not an integer"))
+                .collect::<Result<Vec<i64>, &str>>()?;
+            if bytes != wanted {
+                return Err(format!(
+                    "byte colour {name} {domain} element {index} is {bytes:?}, Blender has {wanted:?}"
+                )
+                .into());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Compares two shapes by position. Faces match by their canonical position-cluster cycle, edges
@@ -1082,7 +1653,40 @@ fn compare_shapes(actual: &Shape, expected: &Shape) -> Result<Errors, String> {
 fn compare_case(case: &Value, spec: &Value) -> TestResult<Errors> {
     let name = case["name"].as_str().ok_or("case name missing")?;
     let params: Map<String, Value> = serde_json::from_value(case["params"].clone())?;
-    let mesh = input_mesh(spec)?;
+    let mesh = input_mesh(spec, &case["expected"]["input_edges"])?;
+    let input_vertex_index: HashMap<u32, usize> = mesh
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(index, vertex)| (vertex.id, index))
+        .collect();
+    let input_edges: Vec<[usize; 2]> = mesh
+        .edges
+        .iter()
+        .map(|edge| {
+            Ok([
+                *input_vertex_index
+                    .get(&edge.vertices[0])
+                    .ok_or("input edge's first vertex missing")?,
+                *input_vertex_index
+                    .get(&edge.vertices[1])
+                    .ok_or("input edge's second vertex missing")?,
+            ])
+        })
+        .collect::<TestResult<_>>()?;
+    let oracle_input_edges: Vec<[usize; 2]> = case["expected"]["input_edges"]
+        .as_array()
+        .ok_or("oracle input edge order missing")?
+        .iter()
+        .map(indices)
+        .map(|pair| -> TestResult<[usize; 2]> {
+            let pair = pair?;
+            Ok([pair[0], pair[1]])
+        })
+        .collect::<TestResult<_>>()?;
+    if input_edges != oracle_input_edges {
+        return Err(format!("{name}: input mesh edge storage order differs from Blender").into());
+    }
     let modifier = Modifier {
         id: Id::new("subdivision_oracle")?,
         modifier_type: "subdivision".to_owned(),
@@ -1094,9 +1698,13 @@ fn compare_case(case: &Value, spec: &Value) -> TestResult<Errors> {
         binding_data: None,
         runtime: ModifierRuntime::default(),
     };
-    let actual = evaluate_modifiers(&mesh, &[modifier], name)?;
-    let actual = potter_shape(&actual)?;
+    let actual_mesh = evaluate_modifiers(&mesh, &[modifier], name)?;
+    compare_ordered_attributes(&actual_mesh, &case["expected"]["ordered_attributes"])?;
+    compare_byte_colors(&actual_mesh, &case["expected"]["byte_colors"])?;
+    let actual = potter_shape(&actual_mesh)?;
     let expected = oracle_shape(&case["expected"])?;
+    compare_storage_order(&actual, &expected)
+        .map_err(|message| format!("{name}: storage order: {message}"))?;
     compare_shapes(&actual, &expected).map_err(|message| format!("{name}: {message}").into())
 }
 

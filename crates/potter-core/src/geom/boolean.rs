@@ -905,7 +905,7 @@ fn mesh_polygons(mesh: &Mesh, has_operand_b: bool) -> Result<Vec<Polygon>> {
         .iter()
         .map(|vertex| (vertex.id, vertex.co))
         .collect();
-    let triangles = mesh.triangulate().map_err(|error| {
+    let triangles = mesh.tessellate().map_err(|error| {
         PotError::invalid_argument(format!("cannot triangulate boolean mesh: {error}"))
     })?;
     let mut cursor = 0;

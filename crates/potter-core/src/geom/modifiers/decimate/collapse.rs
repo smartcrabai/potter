@@ -9,7 +9,7 @@ use glam::DVec3;
 use serde_json::{Value, json};
 
 use super::{
-    CornerUv,
+    CornerUv, PoolSlots,
     heap::{Heap, NodeId},
     interp::{float2_equal, interp_float2},
     kdtree::KdTree,
@@ -171,6 +171,8 @@ struct Edge {
     /// EDGE attribute values, one per [`BMesh::edge_types`] entry.
     attributes: Vec<Value>,
     flags: EdgeFlags,
+    /// `BLI_mempool` slot of this edge (see [`PoolSlots`]).
+    slot: usize,
 }
 
 struct Loop {
@@ -194,6 +196,8 @@ struct Face {
     origin: usize,
     alive: bool,
     tag: bool,
+    /// `BLI_mempool` slot of this face (see [`PoolSlots`]).
+    slot: usize,
 }
 
 /// The BMesh-shaped topology the collapse works on. Elements live in arenas indexed by creation order;
@@ -208,6 +212,9 @@ struct BMesh {
     uv: Vec<[f32; 2]>,
     uv_stride: usize,
     totface: usize,
+    /// Blender's `BMFace` pool slots; live faces are output in slot order.
+    face_slots: PoolSlots,
+    edge_slots: PoolSlots,
     /// Data type of each POINT attribute, in the order of every vertex's `point` values.
     point_types: Vec<String>,
     /// Data type of each EDGE attribute, in the order of every edge's `attributes` values.
@@ -407,10 +414,17 @@ impl BMesh {
         self.disk_edge_remove(e, v1);
         self.disk_edge_remove(e, v2);
         self.edges[e].alive = false;
+        self.edge_slots.release(self.edges[e].slot);
     }
 
-    /// `BM_face_kill`.
+    /// `BM_face_kill`: unlinks the face and releases its pool slot.
     fn face_kill(&mut self, f: usize) {
+        self.face_unlink(f);
+        self.face_slots.release(self.faces[f].slot);
+    }
+
+    /// The loop and radial part of `BM_face_kill`, leaving the pool slot to the caller.
+    fn face_unlink(&mut self, f: usize) {
         let first = self.faces[f].first;
         let mut l = first;
         loop {
@@ -450,6 +464,7 @@ impl BMesh {
             return e;
         }
         let e = self.edges.len();
+        let slot = self.edge_slots.alloc();
         self.edges.push(Edge {
             v: [v1, v2],
             disk: [NO_DISK, NO_DISK],
@@ -461,6 +476,7 @@ impl BMesh {
                 .iter()
                 .map(|data_type| collapse_customdata_default(data_type))
                 .collect(),
+            slot,
         });
         self.disk_edge_append(e, v1);
         self.disk_edge_append(e, v2);
@@ -487,6 +503,7 @@ impl BMesh {
             self.radial_append(edges[k], first + k);
         }
         self.uv.resize(self.loops.len() * self.uv_stride, [0.0; 2]);
+        let slot = self.face_slots.alloc();
         let source = &self.faces[example];
         let face = Face {
             first,
@@ -496,6 +513,7 @@ impl BMesh {
             origin: source.origin,
             alive: true,
             tag: false,
+            slot,
         };
         self.faces.push(face);
         self.totface += 1;
@@ -732,6 +750,7 @@ impl BMesh {
         };
         let mut new_faces = Vec::new();
         let mut new_edges = Vec::new();
+        let mut last_face = NONE;
         for (i, tri) in tris.iter().enumerate() {
             let ltri = [order[tri[0]], order[tri[1]], order[tri[2]]];
             let verts = [
@@ -740,6 +759,7 @@ impl BMesh {
                 self.loops[ltri[2]].v,
             ];
             let face = self.face_create_verts(&verts, f);
+            last_face = face;
             let first = self.faces[face].first;
             let first_next = self.loops[first].next;
             let first_prev = self.loops[first].prev;
@@ -793,7 +813,11 @@ impl BMesh {
             let points = self.face_points(face);
             self.faces[face].no = face_normal(&points);
         }
-        self.face_kill(f);
+        // Blender swaps the last triangle into `f`'s pool slot and frees the slot it was created in.
+        let released = self.faces[last_face].slot;
+        self.face_slots.release(released);
+        self.faces[last_face].slot = self.faces[f].slot;
+        self.face_unlink(f);
         !new_edges.is_empty()
     }
 
@@ -861,6 +885,101 @@ impl BMesh {
             join.push(e);
         }
         join
+    }
+
+    /// `BM_faces_join` of the two faces across `e` (`do_del` false), then `BM_edge_kill` of `e` once no
+    /// face uses it. The joined ring starts at the first boundary loop of `faces[0]` (the radial head of
+    /// `e`), which is `BM_faces_join`'s `v1`; each new corner copies UVs from the boundary loop on its edge.
+    /// shortcut: `BM_face_find_double` (#159549) is not ported, so a join that duplicates an existing face keeps both; upgrade when input meshes can hold duplicate faces.
+    /// shortcut: a boundary vertex with several open boundary edges takes the first in discovery order, Blender takes disk order; only non-manifold boundaries differ.
+    fn join_across(&mut self, e: usize) {
+        let Some((la, lb)) = self.edge_loop_pair(e) else {
+            return;
+        };
+        let faces = [self.loops[la].f, self.loops[lb].f];
+        if faces[0] == faces[1] {
+            return;
+        }
+        let mut boundary = Vec::new();
+        let mut loops = Vec::new();
+        for &f in &faces {
+            self.face_loops(f, &mut loops);
+            for &l in &loops {
+                match self.radial_count_in(self.loops[l].e, faces) {
+                    1 => boundary.push(l),
+                    2 => {}
+                    _ => return,
+                }
+            }
+        }
+        let Some(&first) = boundary.first() else {
+            return;
+        };
+        // Walks the boundary edge by edge from `first`, as `bm_edges_sort_winding` does.
+        let v1 = self.loops[first].v;
+        let mut open: Vec<usize> = boundary.iter().map(|&l| self.loops[l].e).collect();
+        let mut verts = vec![v1];
+        let mut edges = Vec::with_capacity(boundary.len());
+        let mut edge = self.loops[first].e;
+        let mut v = v1;
+        loop {
+            let Some(pos) = open.iter().position(|&x| x == edge) else {
+                return;
+            };
+            open.swap_remove(pos);
+            edges.push(edge);
+            v = self.edge_other_vert(edge, v);
+            if edges.len() == boundary.len() {
+                if v != v1 {
+                    return;
+                }
+                break;
+            }
+            verts.push(v);
+            let Some(&next) = open.iter().find(|&&x| self.vert_in_edge(x, v)) else {
+                return;
+            };
+            edge = next;
+        }
+        let mut sources = Vec::with_capacity(verts.len());
+        for (&edge_k, &vert_k) in edges.iter().zip(&verts) {
+            let Some(&source) = boundary.iter().find(|&&l| self.loops[l].e == edge_k) else {
+                return;
+            };
+            sources.push(if self.loops[source].v == vert_k {
+                source
+            } else {
+                self.loops[source].next
+            });
+        }
+        let joined = self.face_create(&verts, &edges, faces[0]);
+        let first_new = self.faces[joined].first;
+        for (k, &source) in sources.iter().enumerate() {
+            for layer in 0..self.uv_stride {
+                self.uv[(first_new + k) * self.uv_stride + layer] =
+                    self.uv[source * self.uv_stride + layer];
+            }
+        }
+        self.face_kill(faces[0]);
+        self.face_kill(faces[1]);
+        if self.edges[e].l == NONE {
+            self.edge_kill(e);
+        }
+    }
+
+    /// Loops of `e`'s radial cycle that belong to one of `faces` (`bm_loop_systag_count_radial`).
+    fn radial_count_in(&self, e: usize, faces: [usize; 2]) -> usize {
+        let start = self.edges[e].l;
+        let mut count = 0;
+        let mut l = start;
+        loop {
+            count += usize::from(faces.contains(&self.loops[l].f));
+            l = self.loops[l].radial_next;
+            if l == start {
+                break;
+            }
+        }
+        count
     }
 }
 
@@ -1020,14 +1139,14 @@ fn collect_point_attributes(mesh: &Mesh) -> Vec<PointAttribute> {
 }
 
 /// An EDGE attribute of `blender_attributes` with one value per input edge in storage order.
-struct EdgeAttribute {
-    name: String,
-    data_type: String,
-    values: Vec<Value>,
+pub(super) struct EdgeAttribute {
+    pub(super) name: String,
+    pub(super) data_type: String,
+    pub(super) values: Vec<Value>,
 }
 
 /// The EDGE entries of `blender_attributes`; missing edge values take the type default.
-fn collect_edge_attributes(mesh: &Mesh) -> Vec<EdgeAttribute> {
+pub(super) fn collect_edge_attributes(mesh: &Mesh) -> Vec<EdgeAttribute> {
     let entries = mesh
         .attributes
         .get("blender_attributes")
@@ -1105,7 +1224,7 @@ fn collect_edge_flags(mesh: &Mesh) -> Vec<EdgeFlags> {
 }
 
 /// Blender's generic color customdata initializes to white (`layerDefault_propcol`, `layerDefault_mloopcol`).
-fn collapse_customdata_default(data_type: &str) -> Value {
+pub(super) fn collapse_customdata_default(data_type: &str) -> Value {
     if matches!(data_type, "FLOAT_COLOR" | "BYTE_COLOR") {
         json!([1.0, 1.0, 1.0, 1.0])
     } else {
@@ -1236,15 +1355,6 @@ fn byte_color_linear(bytes: [f32; 4]) -> Value {
     )
 }
 
-/// Root of `parent`'s set, with path halving.
-fn root(parent: &mut [usize], mut f: usize) -> usize {
-    while parent[f] != f {
-        parent[f] = parent[parent[f]];
-        f = parent[f];
-    }
-    f
-}
-
 /// Builds the `BMesh` of `mesh` as `BKE_mesh_to_bmesh_ex` does for decimation: vertices, then edges in
 /// mesh order, then faces with radially appended loops. Face normals are recomputed and vertex normals
 /// are the mesh normals; corner UVs come from `uv_values[layer][corner]`.
@@ -1292,6 +1402,8 @@ fn bmesh_from_mesh(
         uv: Vec::new(),
         uv_stride,
         totface: 0,
+        face_slots: PoolSlots::default(),
+        edge_slots: PoolSlots::default(),
         point_types: point
             .iter()
             .map(|attribute| attribute.data_type.clone())
@@ -1345,6 +1457,7 @@ fn bmesh_from_mesh(
         }
         corner += n;
         let verts: Vec<[f32; 3]> = indices.iter().map(|&i| points[i]).collect();
+        let slot = bm.face_slots.alloc();
         bm.faces.push(Face {
             first,
             len: n,
@@ -1353,6 +1466,7 @@ fn bmesh_from_mesh(
             origin: face_index,
             alive: true,
             tag: false,
+            slot,
         });
         bm.totface += 1;
     }
@@ -1988,14 +2102,15 @@ impl Decimator {
         a == c || a == d || b == c || b == d
     }
 
-    /// Output polygons, provenance and corner UVs of the decimated mesh, with joined triangles merged.
-    fn output(&self, join: bool, layer_count: usize) -> Output {
-        let joins = if join {
-            self.bm.join_edges()
-        } else {
-            Vec::new()
-        };
-        let join_set: std::collections::HashSet<usize> = joins.iter().copied().collect();
+    /// Output polygons, provenance and corner UVs of the decimated mesh. With `join`, the triangles are
+    /// joined back first (`bm_decim_triangulate_end`); every live face is then emitted from its own ring
+    /// start, as `BM_mesh_bm_to_me` does.
+    fn output(&mut self, join: bool, layer_count: usize) -> Output {
+        if join {
+            for e in self.bm.join_edges() {
+                self.bm.join_across(e);
+            }
+        }
         let mut out_vertex = vec![NONE; self.bm.verts.len()];
         let mut points = Vec::new();
         let mut origins = Vec::new();
@@ -2014,42 +2129,22 @@ impl Decimator {
                 }
             }
         }
-        // Union-find over triangles joined across `joins`.
-        let mut parent: Vec<usize> = (0..self.bm.faces.len()).collect();
-        for &e in &joins {
-            if let Some((la, lb)) = self.bm.edge_loop_pair(e) {
-                let (a, b) = (
-                    root(&mut parent, self.bm.loops[la].f),
-                    root(&mut parent, self.bm.loops[lb].f),
-                );
-                parent[b] = a;
-            }
-        }
-        let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-        for f in 0..self.bm.faces.len() {
-            if self.bm.faces[f].alive {
-                let r = root(&mut parent, f);
-                groups.entry(r).or_default().push(f);
-            }
-        }
         let mut polygons: Vec<Polygon> = Vec::new();
         let mut faces_origin = Vec::new();
         let mut corner_uv: Vec<CornerUv> = Vec::new();
-        for members in groups.values() {
-            let first_face = members[0];
-            let ring = if members.len() == 1 {
-                let mut loops = Vec::new();
-                self.bm.face_loops(first_face, &mut loops);
-                loops
-            } else {
-                self.merged_ring(members, &join_set)
-            };
+        let mut ring = Vec::new();
+        let mut order: Vec<usize> = (0..self.bm.faces.len())
+            .filter(|&f| self.bm.faces[f].alive)
+            .collect();
+        order.sort_by_key(|&f| self.bm.faces[f].slot);
+        for f in order {
+            self.bm.face_loops(f, &mut ring);
             let verts = ring
                 .iter()
                 .map(|&l| out_vertex[self.bm.loops[l].v])
                 .collect();
-            polygons.push((verts, self.bm.faces[first_face].mat));
-            faces_origin.push(Some(self.bm.faces[first_face].origin));
+            polygons.push((verts, self.bm.faces[f].mat));
+            faces_origin.push(Some(self.bm.faces[f].origin));
             for &l in &ring {
                 corner_uv.push(
                     (0..layer_count)
@@ -2068,38 +2163,33 @@ impl Decimator {
             .filter(|edge| edge.alive && edge.l == NONE)
             .map(|edge| [out_vertex[edge.v[0]], out_vertex[edge.v[1]]])
             .collect();
-        let edge_attributes: Vec<([usize; 2], Vec<Value>)> = if self.bm.edge_types.is_empty() {
+        // Blender's edge pool order: every per-edge row below is in this order, and `decimate_compact`
+        // puts the rebuilt mesh's edges in it.
+        let mut pool: Vec<usize> = (0..self.bm.edges.len())
+            .filter(|&e| self.bm.edges[e].alive)
+            .collect();
+        pool.sort_by_key(|&e| self.bm.edges[e].slot);
+        let edge_order = pool
+            .iter()
+            .map(|&e| {
+                let [first, second] = self.bm.edges[e].v.map(|vertex| out_vertex[vertex]);
+                [first.min(second), first.max(second)]
+            })
+            .collect();
+        let edge_attributes: Vec<Vec<Value>> = if self.bm.edge_types.is_empty() {
             Vec::new()
         } else {
-            self.bm
-                .edges
-                .iter()
-                .enumerate()
-                .filter(|(index, edge)| edge.alive && !join_set.contains(index))
-                .map(|(_, edge)| {
-                    let [first, second] = edge.v.map(|vertex| out_vertex[vertex]);
-                    (
-                        [first.min(second), first.max(second)],
-                        edge.attributes.clone(),
-                    )
-                })
+            pool.iter()
+                .map(|&e| self.bm.edges[e].attributes.clone())
                 .collect()
         };
-        let edge_flags: Vec<([usize; 2], EdgeFlags)> = if self.bm.track_edge_flags {
-            self.bm
-                .edges
-                .iter()
-                .enumerate()
-                .filter(|(index, edge)| edge.alive && !join_set.contains(index))
-                .map(|(_, edge)| {
-                    let [first, second] = edge.v.map(|vertex| out_vertex[vertex]);
-                    ([first.min(second), first.max(second)], edge.flags)
-                })
-                .collect()
+        let edge_flags: Vec<EdgeFlags> = if self.bm.track_edge_flags {
+            pool.iter().map(|&e| self.bm.edges[e].flags).collect()
         } else {
             Vec::new()
         };
         Output {
+            edge_order,
             points,
             polygons,
             loose,
@@ -2110,42 +2200,6 @@ impl Decimator {
             edge_attributes,
             edge_flags,
         }
-    }
-
-    /// Boundary loops of a joined group, chained into one ring.
-    fn merged_ring(
-        &self,
-        members: &[usize],
-        join_set: &std::collections::HashSet<usize>,
-    ) -> Vec<usize> {
-        let mut boundary = Vec::new();
-        let mut loops = Vec::new();
-        for &f in members {
-            self.bm.face_loops(f, &mut loops);
-            for &l in &loops {
-                if !join_set.contains(&self.bm.loops[l].e) {
-                    boundary.push(l);
-                }
-            }
-        }
-        let mut by_start = HashMap::with_capacity(boundary.len());
-        for &l in &boundary {
-            by_start.entry(self.bm.loops[l].v).or_insert(l);
-        }
-        let mut ring = Vec::with_capacity(boundary.len());
-        let Some(&start) = boundary.first() else {
-            return ring;
-        };
-        let mut l = start;
-        loop {
-            ring.push(l);
-            let end = self.bm.loops[self.bm.loops[l].next].v;
-            match by_start.get(&end) {
-                Some(&next) if next != start && ring.len() < boundary.len() => l = next,
-                _ => break,
-            }
-        }
-        ring
     }
 }
 
@@ -2159,10 +2213,12 @@ struct Output {
     point: Vec<Vec<Value>>,
     faces: Vec<Option<usize>>,
     corner_uv: Vec<CornerUv>,
-    /// Per output edge, sorted endpoint indices and EDGE attribute values when present.
-    edge_attributes: Vec<([usize; 2], Vec<Value>)>,
-    /// Per output edge, sorted endpoint indices and Blender's seam/sharp flags when present.
-    edge_flags: Vec<([usize; 2], EdgeFlags)>,
+    /// EDGE attribute values per alive edge, in pool order (one row per edge).
+    edge_attributes: Vec<Vec<Value>>,
+    /// Blender's seam/sharp header flags per alive edge, in pool order, when tracked.
+    edge_flags: Vec<EdgeFlags>,
+    /// Alive edges as sorted output-vertex pairs, in Blender's edge-pool order.
+    edge_order: Vec<[usize; 2]>,
 }
 
 /// `Polygon` of `modifiers.rs`: vertex indices and material index.
@@ -2205,11 +2261,12 @@ fn collapse_write_point(
     Ok(())
 }
 
-/// Writes the collapse's EDGE values into `blender_attributes` in the rebuilt mesh edge order.
-fn collapse_write_edge(
+/// Writes the EDGE values into `blender_attributes`. `rows` holds one row of `attributes` values per edge,
+/// in the rebuilt mesh's edge order (the pool order `decimate_compact` gives the edges), so row `k` is edge `k`.
+pub(super) fn collapse_write_edge(
     mesh: &mut Mesh,
     attributes: &[EdgeAttribute],
-    edge_values: Vec<([usize; 2], Vec<Value>)>,
+    rows: Vec<Vec<Value>>,
 ) -> Result<()> {
     if attributes.is_empty() {
         return Ok(());
@@ -2220,29 +2277,16 @@ fn collapse_write_edge(
             "decimate edge attributes do not match the rebuilt mesh",
         )
     };
-    let mut by_pair = HashMap::with_capacity(edge_values.len());
-    for (vertices, values) in edge_values {
-        if by_pair.insert((vertices[0], vertices[1]), values).is_some() {
-            return Err(dropped());
-        }
+    if rows.len() != mesh.edges.len() || rows.iter().any(|row| row.len() != attributes.len()) {
+        return Err(dropped());
     }
-    let index_of = super::super::id_indices(mesh);
     let mut by_attribute: Vec<Vec<Value>> = (0..attributes.len())
-        .map(|_| Vec::with_capacity(mesh.edges.len()))
+        .map(|_| Vec::with_capacity(rows.len()))
         .collect();
-    for edge in &mesh.edges {
-        let [first, second] = edge.vertices.map(|id| index_of[&id]);
-        let key = (first.min(second), first.max(second));
-        let values = by_pair.remove(&key).ok_or_else(dropped)?;
-        if values.len() != attributes.len() {
-            return Err(dropped());
-        }
-        for (attribute, value) in by_attribute.iter_mut().zip(values) {
+    for row in rows {
+        for (attribute, value) in by_attribute.iter_mut().zip(row) {
             attribute.push(value);
         }
-    }
-    if !by_pair.is_empty() {
-        return Err(dropped());
     }
     let entries = mesh
         .attributes
@@ -2265,12 +2309,10 @@ fn collapse_write_edge(
 /// A native edge-flag attribute and the `EdgeFlags` value it stores.
 type FlagStore = (&'static str, fn(&EdgeFlags) -> bool);
 
-/// Writes `BMesh` seam/sharp flags onto the output edges; `BM_edge_splice` ORs these header flags.
-fn collapse_write_edge_flags(
-    mesh: &mut Mesh,
-    edge_flags: Vec<([usize; 2], EdgeFlags)>,
-) -> Result<()> {
-    if edge_flags.is_empty() {
+/// Writes `BMesh` seam/sharp flags onto the output edges; `BM_edge_splice` ORs these header flags. `flags`
+/// holds one value per edge in the rebuilt mesh's edge order, so entry `k` is edge `k`.
+fn collapse_write_edge_flags(mesh: &mut Mesh, flags: &[EdgeFlags]) -> Result<()> {
+    if flags.is_empty() {
         return Ok(());
     }
     let invalid = || {
@@ -2279,23 +2321,7 @@ fn collapse_write_edge_flags(
             "decimate edge flags do not match the rebuilt mesh",
         )
     };
-    let mut by_pair = HashMap::with_capacity(edge_flags.len());
-    for (vertices, flags) in edge_flags {
-        if by_pair.insert((vertices[0], vertices[1]), flags).is_some() {
-            return Err(invalid());
-        }
-    }
-    let index_of = super::super::id_indices(mesh);
-    let mut output_flags = Vec::with_capacity(mesh.edges.len());
-    for edge in &mesh.edges {
-        let [first, second] = edge.vertices.map(|id| index_of[&id]);
-        output_flags.push(
-            by_pair
-                .remove(&(first.min(second), first.max(second)))
-                .ok_or_else(invalid)?,
-        );
-    }
-    if !by_pair.is_empty() {
+    if flags.len() != mesh.edges.len() {
         return Err(invalid());
     }
     let natives: [FlagStore; 2] = [
@@ -2309,20 +2335,20 @@ fn collapse_write_edge_flags(
                 .and_then(Value::as_object_mut)
                 .ok_or_else(invalid)?;
             values.clear();
-            for (edge, flags) in mesh.edges.iter().zip(&output_flags) {
-                values.insert(format!("e{}", edge.id), json!(flag(flags)));
+            for (edge, edge_flags) in mesh.edges.iter().zip(flags) {
+                values.insert(format!("e{}", edge.id), json!(flag(edge_flags)));
             }
         }
     }
     if let Some(blender_edge_flags) = mesh.attributes.get_mut("blender_edge_flags") {
         let values = blender_edge_flags.as_array_mut().ok_or_else(invalid)?;
-        if values.len() != output_flags.len() {
+        if values.len() != flags.len() {
             return Err(invalid());
         }
-        for (value, flags) in values.iter_mut().zip(&output_flags) {
+        for (value, edge_flags) in values.iter_mut().zip(flags) {
             let fields = value.as_object_mut().ok_or_else(invalid)?;
-            fields.insert("seam".to_owned(), json!(flags.seam));
-            fields.insert("sharp".to_owned(), json!(!flags.smooth));
+            fields.insert("seam".to_owned(), json!(edge_flags.seam));
+            fields.insert("sharp".to_owned(), json!(!edge_flags.smooth));
         }
     }
     Ok(())
@@ -2411,17 +2437,18 @@ pub(in crate::geom::modifiers) fn decimate_collapse(
         origin,
         mesh,
         &keep_vertices,
+        &output.edge_order,
     )?;
     super::collapse_write_uv(&mut out, &layer_names, &output.corner_uv)?;
     collapse_write_point(&mut out, &point_attributes, &output.point)?;
     collapse_write_edge(&mut out, &edge_attributes, output.edge_attributes)?;
-    collapse_write_edge_flags(&mut out, output.edge_flags)?;
+    collapse_write_edge_flags(&mut out, &output.edge_flags)?;
     Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{BMesh, Decimator, Heap, interp_customdata_value};
+    use super::{BMesh, Decimator, Heap, PoolSlots, interp_customdata_value};
     use serde_json::json;
 
     #[test]
@@ -2482,6 +2509,8 @@ mod tests {
             uv_stride: 0,
             totface: 0,
             point_types: Vec::new(),
+            face_slots: PoolSlots::default(),
+            edge_slots: PoolSlots::default(),
             edge_types: vec!["INT".to_owned()],
             track_edge_flags: false,
         };

@@ -38,6 +38,11 @@ const FORBIDDEN_LOSSES: [&str; 3] = [
     "material.shader_graph.vertex_color",
 ];
 const RENDER_TOLERANCE: f64 = 0.12;
+/// Samples for the probed Potter render. At 64 samples one probe pixel of this lit plane has a
+/// sample standard deviation of about 0.14 (Potter's estimator, one light sample per path vertex;
+/// measured over eight seeds), which exceeds the 0.12 tolerance on its own. At 1024 samples the
+/// standard deviation is about 0.035 and the mean matches Blender's oracle within 1%.
+const PROBE_SAMPLES: u32 = 1024;
 
 fn build_reserved_oracle(blender: &Path, root: &Path) -> TestResult<(PathBuf, Value)> {
     let script = write_script(
@@ -332,7 +337,7 @@ fn pixel_at(project: &Path, image_id: &str, uv: [f64; 2]) -> TestResult<[f64; 4]
     let scene = read_scene(project)?;
     let image: Image = serde_json::from_value(scene["images"][image_id].clone())?;
     let data = load_image_data(&image, project, ImageInterpolation::Closest)?;
-    Ok(sample(&data, uv, 0))
+    Ok(sample(&data, uv, false))
 }
 
 fn check_blend_colors(object: &Value, expected: &Value) -> TestResult {
@@ -570,6 +575,16 @@ fn reserved_color_layer_names_coexist_with_weights_material_render_and_exports()
     check_imported_material(&scene, &expected)?;
 
     let frames = root.path().join("rendered");
+    let active = scene["active_scene"]
+        .as_str()
+        .ok_or("active scene is missing")?
+        .to_owned();
+    let applied = apply_operations(
+        &project,
+        root.path(),
+        json!([{"op": "render.update", "target": {"id": active}, "set": {"samples": PROBE_SAMPLES}}]),
+    )?;
+    assert_eq!(applied["ok"], true, "{applied}");
     let mut render = pot();
     render
         .arg("render")

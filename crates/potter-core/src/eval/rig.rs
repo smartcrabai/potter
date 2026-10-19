@@ -7396,7 +7396,7 @@ fn shrinkwrap_target_hit(
     ) {
         return Err(evaluation_error("shrinkwrap type is invalid"));
     }
-    let triangles = mesh.triangulate().map_err(|error| {
+    let triangles = mesh.tessellate().map_err(|error| {
         evaluation_error(format!("shrinkwrap target triangulation failed: {error}"))
     })?;
     if shrink_type == "PROJECT" {

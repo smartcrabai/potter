@@ -155,7 +155,7 @@ fn potter_triangles(mesh: &Mesh) -> TestResult<Vec<[DVec3; 3]>> {
         .iter()
         .map(|vertex| (vertex.id, vertex.co))
         .collect();
-    mesh.triangulate()?
+    mesh.tessellate()?
         .iter()
         .map(|triangle| {
             Ok([

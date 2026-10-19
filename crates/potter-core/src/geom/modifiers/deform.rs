@@ -1095,10 +1095,7 @@ pub(super) fn mesh_triangles(mesh: &Mesh, coordinates: &[DVec3]) -> Result<Vec<[
                     .iter()
                     .map(|index| coordinates[*index].as_vec3().to_array())
                     .collect::<Vec<_>>();
-                for triangle in crate::geom::triangulate::triangulate_ngon(
-                    &face_positions,
-                    crate::geom::triangulate::NgonMethod::Clip,
-                ) {
+                for triangle in crate::geom::triangulate::loop_triangles(&face_positions) {
                     triangles.push([
                         vertices[triangle[0]],
                         vertices[triangle[1]],
@@ -2497,7 +2494,7 @@ mod tests {
         bind_surface, closest_triangle_point, laplacian_deform, mesh_deform, mesh_triangles,
         polygon_interp_weights, surface_deform,
     };
-    use crate::geom::triangulate::{NgonMethod, triangulate_ngon};
+    use crate::geom::triangulate::loop_triangles;
     use crate::{
         geom::{BoxParams, Edge, Face, Mesh, Vertex},
         model::{Id, Modifier, ModifierRuntime},
@@ -2617,7 +2614,7 @@ mod tests {
             .iter()
             .map(|point| point.as_vec3().to_array())
             .collect::<Vec<_>>();
-        let expected = triangulate_ngon(&corners, NgonMethod::Clip);
+        let expected = loop_triangles(&corners);
         let fan = (1..points.len() - 1)
             .map(|index| [0, index, index + 1])
             .collect::<Vec<_>>();

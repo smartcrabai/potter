@@ -5,6 +5,9 @@ mod light_model;
 mod path;
 mod pick;
 mod preview;
+mod principled_bsdf;
+mod principled_tables;
+mod principled_tables_data;
 mod scene;
 mod sequence;
 

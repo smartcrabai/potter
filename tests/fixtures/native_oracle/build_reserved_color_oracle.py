@@ -136,8 +136,8 @@ scene = bpy.context.scene
 scene.render.engine = "CYCLES"
 scene.cycles.samples = 64
 scene.cycles.use_denoising = False
-scene.render.resolution_x = 128
-scene.render.resolution_y = 64
+scene.render.resolution_x = 32
+scene.render.resolution_y = 16
 scene.render.resolution_percentage = 100
 scene.render.image_settings.file_format = "OPEN_EXR"
 scene.render.film_transparent = False
@@ -179,7 +179,7 @@ render_result = bpy.data.images.load(scene.render.filepath)
 render_width, render_height = render_result.size
 probe_pixels = {}
 probe_uv = {}
-for name, x in (("ReservedLeft", 32), ("ReservedRight", 96)):
+for name, x in (("ReservedLeft", 8), ("ReservedRight", 24)):
     y = render_height // 2
     offset = (y * render_width + x) * 4
     probe_pixels[name] = [float(channel) for channel in render_result.pixels[offset:offset + 4]]
