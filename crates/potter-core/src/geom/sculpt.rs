@@ -562,49 +562,6 @@ pub fn influences(mesh: &Mesh, stroke: &Stroke) -> Result<Vec<(u32, f64)>> {
         .collect())
 }
 
-/// Smooth one persistent vertex toward its one-ring neighbor average.
-pub fn smooth_vertex(mesh: &mut Mesh, vertex_id: u32, factor: f64) -> Result<bool> {
-    if !factor.is_finite() || !(0.0..=1.0).contains(&factor) {
-        return Err(invalid(
-            "smooth factor must be finite and between zero and one",
-        ));
-    }
-    let adjacency = vertex_adjacency(mesh);
-    let neighbors = adjacency
-        .get(&vertex_id)
-        .filter(|neighbors| !neighbors.is_empty())
-        .ok_or_else(|| invalid("smooth vertex has no adjacent vertices"))?;
-    let positions = vertex_positions(mesh);
-    let average = average_neighbor_position(&positions, neighbors);
-    let vertex = mesh
-        .vertices
-        .iter_mut()
-        .find(|vertex| vertex.id == vertex_id)
-        .ok_or_else(|| invalid("smooth vertex ID does not exist"))?;
-    let position = vertex.co.lerp(average, factor);
-    let changed = position != vertex.co;
-    vertex.co = position;
-    Ok(changed)
-}
-
-/// Sum squared distances from vertices to the average of their adjacent vertices.
-#[must_use]
-pub fn laplacian_energy(mesh: &Mesh) -> f64 {
-    let positions = vertex_positions(mesh);
-    let adjacency = vertex_adjacency(mesh);
-    mesh.vertices
-        .iter()
-        .filter_map(|vertex| {
-            let neighbors = adjacency.get(&vertex.id)?;
-            if neighbors.is_empty() {
-                return None;
-            }
-            let average = average_neighbor_position(&positions, neighbors);
-            Some(vertex.co.distance_squared(average))
-        })
-        .sum()
-}
-
 fn validate_stroke(stroke: &Stroke) -> Result<()> {
     if stroke.samples.is_empty() {
         return Err(invalid("stroke requires at least one sample"));
@@ -760,25 +717,6 @@ fn vertex_positions(mesh: &Mesh) -> std::collections::BTreeMap<u32, DVec3> {
         .iter()
         .map(|vertex| (vertex.id, vertex.co))
         .collect()
-}
-
-fn average_neighbor_position(
-    positions: &std::collections::BTreeMap<u32, DVec3>,
-    neighbors: &[u32],
-) -> DVec3 {
-    let mut sum = DVec3::ZERO;
-    let mut count = 0.0_f64;
-    for neighbor in neighbors {
-        if let Some(position) = positions.get(neighbor) {
-            sum += *position;
-            count += 1.0;
-        }
-    }
-    if count > 0.0 {
-        sum / count
-    } else {
-        DVec3::ZERO
-    }
 }
 
 /// Blender's vertex normals (`normals_calc_verts`) in `mesh.vertices` order, via the shared

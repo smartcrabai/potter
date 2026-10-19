@@ -42,9 +42,8 @@ fn iteration_strengths(strength: f64) -> Vec<f64> {
 ///   iteration translations accumulate on top of them;
 /// - later calls: each iteration reads the positions the previous iteration wrote.
 fn smooth_dab(field: &mut Field, dab: &DabInput) {
-    let passes = field.passes.clone();
-    for sign in passes {
-        let center = dab.center * sign;
+    for pass in 0..field.passes.len() {
+        let center = dab.center * field.passes[pass];
         if !field
             .positions
             .iter()
@@ -55,12 +54,12 @@ fn smooth_dab(field: &mut Field, dab: &DabInput) {
         let first_call = !field.smooth_started;
         field.smooth_started = true;
         if first_call {
-            let snapshot = field.positions.clone();
-            let mut accumulated = vec![DVec3::ZERO; snapshot.len()];
+            // Every iteration reads the call-start positions, so the translations are summed first
+            // and applied once.
+            let mut accumulated = vec![DVec3::ZERO; field.positions.len()];
             for strength in iteration_strengths(dab.strength) {
-                for (index, translation) in
-                    smooth_moves(field, &snapshot, center, dab.radius, strength)
-                {
+                let moves = smooth_moves(field, &field.positions, center, dab.radius, strength);
+                for (index, translation) in moves {
                     accumulated[index] += translation;
                 }
             }

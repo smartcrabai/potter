@@ -33,7 +33,7 @@ import traceback
 
 import bpy
 from bpy_extras import view3d_utils
-from mathutils import Quaternion, Vector
+from mathutils import Euler, Quaternion, Vector
 
 ESSENTIALS = os.path.join(
     bpy.utils.system_resource("DATAFILES"),
@@ -112,22 +112,40 @@ def view_context():
     return window, area, region, area.spaces.active.region_3d
 
 
-def set_top_ortho_view():
+# Cases that stroke from a view other than TOP. The rotation is the view's world-to-view rotation.
+OBLIQUE_VIEWS = {
+    "rotate_sphere_oblique": Euler((0.5, 0.3, 0.0), "XYZ").to_quaternion(),
+}
+
+
+def set_view(rotation):
     window, area, region, rv3d = view_context()
     rv3d.view_perspective = "ORTHO"
-    # Blender's TOP view is the identity view rotation (look down -Z, X right, Y up).
-    rv3d.view_rotation = Quaternion((1.0, 0.0, 0.0, 0.0))
+    rv3d.view_rotation = rotation
     rv3d.view_location = Vector((0.0, 0.0, 0.0))
     rv3d.view_distance = 10.0
     with bpy.context.temp_override(window=window, area=area, region=region):
         bpy.ops.wm.redraw_timer(type="DRAW_WIN_SWAP", iterations=1)
     rv3d.update()
+    return region, rv3d
+
+
+def view_normal(rv3d):
+    # Blender's cache->view_normal is the world direction of the view's +Z axis (viewinv[2]), which
+    # points from the scene toward the viewer.
+    return list((rv3d.view_matrix.inverted().to_3x3() @ Vector((0.0, 0.0, 1.0))).normalized())
+
+
+def set_top_ortho_view():
+    # Blender's TOP view is the identity view rotation (look down -Z, X right, Y up).
+    region, rv3d = set_view(Quaternion((1.0, 0.0, 0.0, 0.0)))
     origin = view3d_utils.location_3d_to_region_2d(region, rv3d, Vector((0.0, 0.0, 0.0)))
     x_axis = view3d_utils.location_3d_to_region_2d(region, rv3d, Vector((1.0, 0.0, 0.0)))
     y_axis = view3d_utils.location_3d_to_region_2d(region, rv3d, Vector((0.0, 1.0, 0.0)))
     # X must point right and Y up on screen, so the mouse deltas match world deltas.
     assert x_axis.x > origin.x and abs(x_axis.y - origin.y) < 1e-3, (origin, x_axis)
     assert y_axis.y > origin.y and abs(y_axis.x - origin.x) < 1e-3, (origin, y_axis)
+    return region, rv3d
 
 
 def make_object(kind):
@@ -277,6 +295,8 @@ def cases():
         ("snake_hook_grid", "snake_hook", "grid", strip_dabs(4, 0.08, 0.5, 1.0, [1.0]), 1.0, 0.5, False),
         ("thumb_grid", "thumb", "grid", strip_dabs(4, 0.08, 0.5, 0.5, [1.0]), 0.5, 0.5, False),
         ("rotate_sphere", "rotate", "sphere", sphere_dabs(3, 0.5, 0.6, [1.0]), 0.6, 0.5, False),
+        ("rotate_sphere_oblique", "rotate", "sphere", sphere_dabs(3, 0.5, 0.6, [1.0]), 0.6, 0.5, False),
+        ("thumb_grid_pressure", "thumb", "grid", strip_dabs(4, 0.08, 0.5, 0.5, [1.0, 0.5, 1.0, 0.5]), 0.5, 0.5, False),
         ("elastic_grab_grid", "elastic_deform", "grid", strip_dabs(4, 0.08, 0.5, 0.5, [1.0]), 0.5, 0.5, False),
     ]
 
@@ -321,8 +341,11 @@ def deform_cases():
 def generate(output_dir):
     with bpy.data.libraries.load(ESSENTIALS, link=False) as (source, target):
         target.brushes = list(source.brushes)
-    set_top_ortho_view()
     for name, brush_key, kind, dabs, strength, radius, mirror, deform in all_cases():
+        if name in OBLIQUE_VIEWS:
+            region, rv3d = set_view(OBLIQUE_VIEWS[name])
+        else:
+            region, rv3d = set_top_ortho_view()
         # A failing case is recorded in its own error file, so the other brushes still generate.
         try:
             case = run_case(
@@ -336,6 +359,7 @@ def generate(output_dir):
                 mask=MASKS.get(name),
                 deform=deform,
             )
+            case["view"] = view_normal(rv3d)
         except AssertionError:
             with open(os.path.join(output_dir, name + ".error.txt"), "w") as handle:
                 handle.write(traceback.format_exc())

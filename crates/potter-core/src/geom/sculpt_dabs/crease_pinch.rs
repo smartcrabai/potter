@@ -4,7 +4,7 @@
 
 use glam::DVec3;
 
-use super::{DabInput, Field, area_plane};
+use super::{DabInput, Field, area_normal, project_translation};
 use crate::geom::sculpt::DabBrush;
 
 /// Crease Polish `normal_radius_factor` (asset value 0.5). A non-plane brush's normal radius is the
@@ -26,25 +26,6 @@ pub(super) fn apply(field: &mut Field, dab: DabBrush, input: &DabInput) {
         DabBrush::Pinch => pinch_dab(field, input),
         _ => unreachable!("crease_pinch::apply only receives Crease and Pinch"),
     }
-}
-
-/// Blender's `calc_sculpt_normal` for the AREA plane (`sculpt.cc:2706`): the normal of
-/// `calc_area_normal`, or the zero vector when that normal sum is zero (`value_or(float3(0))`).
-/// Only the normal is read; the position radius of the area center is not used by these brushes.
-fn area_normal(field: &Field, center: DVec3, normal_radius: f64, accumulate: bool) -> DVec3 {
-    area_plane(field, center, normal_radius, normal_radius, accumulate)
-        .map_or(DVec3::ZERO, |area| area.normal)
-}
-
-/// Blender's `project_translations` (`sculpt.cc:7705`): removes the component of `translation`
-/// along `plane`. A plane shorter than Blender's float epsilon leaves the translation unchanged.
-fn project_out(translation: DVec3, plane: DVec3) -> DVec3 {
-    let epsilon = f64::from(f32::EPSILON);
-    let length_sq = plane.length_squared();
-    if length_sq < epsilon {
-        return translation;
-    }
-    translation - plane * (translation.dot(plane) / length_sq)
 }
 
 /// Blender's crease strength (`crease.cc:209-217`): `|bstrength|` times `crease_correction`, where
@@ -77,7 +58,8 @@ fn crease_dab(field: &mut Field, dab: &DabInput) {
         dab.center,
         dab.radius * CREASE_NORMAL_RADIUS_FACTOR,
         CREASE_ACCUMULATE,
-    );
+    )
+    .unwrap_or(DVec3::ZERO);
     let strength = crease_strength(dab);
     for sign in &field.passes {
         let location = dab.center * *sign;
@@ -92,7 +74,7 @@ fn crease_dab(field: &mut Field, dab: &DabInput) {
             if factor == 0.0 {
                 continue;
             }
-            let pull = project_out((location - *position) * (factor * strength), plane);
+            let pull = project_translation((location - *position) * (factor * strength), plane);
             *position += pull + offset * factor;
         }
     }
@@ -115,7 +97,8 @@ fn pinch_dab(field: &mut Field, dab: &DabInput) {
         dab.center,
         dab.radius * PINCH_NORMAL_RADIUS_FACTOR,
         PINCH_ACCUMULATE,
-    );
+    )
+    .unwrap_or(DVec3::ZERO);
     for sign in &field.passes {
         let plane = normal * *sign;
         let location = dab.center * *sign;

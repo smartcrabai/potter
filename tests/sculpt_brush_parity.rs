@@ -297,15 +297,21 @@ fn max_error_against_blender(name: &str, text: &str) -> Result<f64, Box<dyn Erro
             },
         )
         .collect();
+    let view = if document["view"].is_array() {
+        vec3(&document["view"])?
+    } else {
+        DVec3::Z
+    };
     let stroke = Stroke {
         brush,
         samples,
         falloff,
         symmetry,
         delta: None,
-        // The fixtures come from Blender's TOP orthographic view (`generate_oracle.py`
-        // `set_top_ortho_view`), whose viewer sits at +Z.
-        view: Some(DVec3::Z),
+        // Each fixture records the view it was stroked from. Fixtures without one come from
+        // Blender's TOP orthographic view (`generate_oracle.py` `set_top_ortho_view`), whose viewer
+        // sits at +Z.
+        view: Some(view),
     };
     let mut mesh = Mesh::from_positions_and_faces(base.clone(), faces)?;
     if document["mask"].is_array() {
