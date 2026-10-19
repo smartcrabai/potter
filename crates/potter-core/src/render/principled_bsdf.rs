@@ -685,9 +685,9 @@ mod tests {
     #[test]
     fn sheen_samples_follow_the_density() {
         // The fraction of LTC samples inside a cap equals the density's integral over the cap.
+        const SIDE: usize = 400;
         let view = DVec3::new(0.5, 0.0, 0.5_f64.sqrt());
         let params = sheen_params(1.0, 0.5, [1.0; 3]);
-        const SIDE: usize = 400;
         for cap in [0.6_f64, 1.0] {
             let inside = (0..SIDE)
                 .flat_map(|i| (0..SIDE).map(move |j| (i, j)))
