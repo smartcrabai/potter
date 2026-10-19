@@ -140,7 +140,8 @@ pub fn export_blend(
     add_blender_material_slot_fields(doc, &mut document);
     texture_edits.apply(&mut document)?;
     add_blender_shader_graph_ownership(doc, &mut document);
-    let (document, asset_files) = prepare_blend_export_resources(document, project, out)?;
+    let (mut document, asset_files) = prepare_blend_export_resources(document, project, out)?;
+    strip_native_value_noise_texture_links(doc, &mut document);
     let input = temporary_path("blend-export-input.json")?;
     let script = temporary_path("blend-bridge.py")?;
     let blend_temp = temporary_blend_path(parent)?;
@@ -7382,25 +7383,17 @@ pub(crate) fn export_losses(doc: &SceneDoc) -> Vec<Loss> {
                     "modifier kind is not supported by the adapter",
                 ));
             }
-            if let Some(texture_id) = modifier.params.get("texture").and_then(Value::as_str)
-                && doc.resources.iter().any(|(resource_id, resource)| {
-                    resource_id.as_str() == texture_id
-                        && crate::model::migrate::inline_resource_kind(resource)
-                            .is_ok_and(|kind| kind == Some("legacy_texture"))
-                        && resource.get("texture_type").and_then(Value::as_str)
-                            == Some("NATIVE_VALUE_NOISE")
-                })
-            {
-                losses.push(loss(
-                    "blender.texture.native_value_noise",
-                    Some(modifier.id.as_str()),
-                    &format!(
-                        "modifier `{}` references native Value Noise resource `{texture_id}`, which has no Blender legacy Texture type; export omits its texture link",
-                        modifier.name
-                    ),
-                ));
-            }
         }
+    }
+    for link in native_value_noise_texture_links(doc) {
+        losses.push(loss(
+            "blender.texture.native_value_noise",
+            Some(link.modifier_id.as_str()),
+            &format!(
+                "modifier `{}` references native Value Noise resource `{}`, which has no Blender legacy Texture type; export omits its texture link",
+                link.modifier_name, link.texture_id
+            ),
+        ));
     }
     for (scene_id, scene) in &doc.scenes {
         if scene
@@ -7744,6 +7737,63 @@ fn native_bind_source_topology_matches(doc: &SceneDoc, node_id: &Id, modifier: &
     };
     raw_mesh_for_data(doc, target_data_id.as_str())
         .is_some_and(|raw| mesh_topology_matches_raw(target_mesh, raw))
+}
+
+/// A modifier texture link to a native Value Noise resource. Blender has no legacy Texture type for
+/// it, so export reports a loss and omits the link.
+struct NativeNoiseLink<'a> {
+    node_id: &'a Id,
+    modifier_id: &'a Id,
+    modifier_name: &'a str,
+    texture_id: &'a str,
+}
+
+fn native_value_noise_texture_links(doc: &SceneDoc) -> Vec<NativeNoiseLink<'_>> {
+    let mut links = Vec::new();
+    for (node_id, node) in &doc.nodes {
+        for modifier in &node.modifiers {
+            let Some(texture_id) = modifier.params.get("texture").and_then(Value::as_str) else {
+                continue;
+            };
+            let native = doc.resources.iter().any(|(resource_id, resource)| {
+                resource_id.as_str() == texture_id
+                    && crate::model::migrate::inline_resource_kind(resource)
+                        .is_ok_and(|kind| kind == Some("legacy_texture"))
+                    && resource.get("texture_type").and_then(Value::as_str)
+                        == Some("NATIVE_VALUE_NOISE")
+            });
+            if native {
+                links.push(NativeNoiseLink {
+                    node_id,
+                    modifier_id: &modifier.id,
+                    modifier_name: &modifier.name,
+                    texture_id,
+                });
+            }
+        }
+    }
+    links
+}
+
+/// Removes the texture link of every native Value Noise modifier from the exported document. It
+/// applies the same decision that `export_losses` reports.
+fn strip_native_value_noise_texture_links(doc: &SceneDoc, document: &mut Value) {
+    for link in native_value_noise_texture_links(doc) {
+        let modifiers = document
+            .get_mut("nodes")
+            .and_then(|nodes| nodes.get_mut(link.node_id.as_str()))
+            .and_then(|node| node.get_mut("modifiers"))
+            .and_then(Value::as_array_mut);
+        let Some(modifier) = modifiers.and_then(|list| {
+            list.iter_mut()
+                .find(|modifier| modifier["id"] == link.modifier_id.as_str())
+        }) else {
+            continue;
+        };
+        if let Some(params) = modifier.get_mut("params").and_then(Value::as_object_mut) {
+            params.remove("texture");
+        }
+    }
 }
 
 fn native_bind_export_losses(doc: &SceneDoc, project: &Project) -> Vec<Loss> {
