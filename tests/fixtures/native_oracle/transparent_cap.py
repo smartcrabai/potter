@@ -92,6 +92,9 @@ def build_volume_slab(scene):
     scene.render.film_transparent = True
 
     slab_material = bpy.data.materials.new("Slab")
+    # BLENDED: Potter imports a DITHERED material whose Principled Alpha is unauthored as `opaque`,
+    # which forces alpha 1 and hides the Transparent BSDF; the card needs the same for the same reason.
+    slab_material.surface_render_method = "BLENDED"
     slab_material.use_nodes = True
     tree = slab_material.node_tree
     output = tree.nodes["Material Output"]
@@ -106,6 +109,7 @@ def build_volume_slab(scene):
     bpy.context.object.data.materials.append(slab_material)
 
     card_material = bpy.data.materials.new("Card")
+    card_material.surface_render_method = "BLENDED"
     card_material.use_nodes = True
     card_tree = card_material.node_tree
     card_tree.links.new(
