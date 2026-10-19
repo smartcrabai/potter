@@ -6,7 +6,7 @@
 
 use glam::DVec3;
 
-use super::{Boundary, DeformData, EditInfo};
+use super::{Boundary, DeformData, EditInfo, rotate};
 use crate::geom::sculpt_dabs::Field;
 
 /// Bend's per-vertex pivot and axis, indexed by vertex position (`bend_data_init_mesh`).
@@ -68,12 +68,4 @@ pub(super) fn apply(field: &mut Field, boundary: &Boundary, angle: f64) {
         let from_pivot = field.original[index] - data.pivot[index];
         *position = rotate(from_pivot, data.axis[index], scaled) + data.pivot[index];
     }
-}
-
-/// Blender's `rotate_v3_v3v3fl`: rotation of `point` about `axis` by `angle`, with the axis
-/// normalized first. A zero axis gives `cos(angle) * point`, as Blender's matrix does.
-fn rotate(point: DVec3, axis: DVec3, angle: f64) -> DVec3 {
-    let axis = axis.normalize_or_zero();
-    let (sin, cos) = angle.sin_cos();
-    point * cos + axis.cross(point) * sin + axis * (axis.dot(point) * (1.0 - cos))
 }

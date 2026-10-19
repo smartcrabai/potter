@@ -311,6 +311,10 @@ def deform_cases():
         ("boundary_grid_inflate", "boundary", "grid", path_dabs(boundary_path, 1.05, 0.5), 0.5, 1.05, False, "INFLATE"),
         ("boundary_grid_twist", "boundary", "grid", path_dabs(boundary_path, 1.05, 0.5), 0.5, 1.05, False, "TWIST"),
         ("boundary_grid_smooth", "boundary", "grid", path_dabs(boundary_path, 1.05, 0.5), 0.5, 1.05, False, "SMOOTH"),
+        ("pose_grid_mirror", "pose", "grid", path_dabs(pose_path, 0.45, 0.5), 0.5, 0.45, True, "ROTATE_TWIST"),
+        ("pose_grid_scale_translate_mirror", "pose", "grid", path_dabs(pose_path, 0.45, 0.5), 0.5, 0.45, True, "SCALE_TRANSLATE"),
+        ("boundary_grid_bend_mirror", "boundary", "grid", path_dabs(boundary_path, 1.05, 0.5), 0.5, 1.05, True, "BEND"),
+        ("boundary_grid_grab_mirror", "boundary", "grid", path_dabs(boundary_path, 1.05, 0.5), 0.5, 1.05, True, "GRAB"),
     ]
 
 

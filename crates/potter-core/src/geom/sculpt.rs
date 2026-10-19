@@ -46,6 +46,8 @@ pub enum PoseDeform {
     RotateTwist,
     /// `BRUSH_POSE_DEFORM_SCALE_TRANSLATE`, non-inverted: rotate, then scale along the chain.
     ScaleTranslate,
+    /// `BRUSH_POSE_DEFORM_SQUASH_STRETCH`: scale the segment along its own axis, uniform in x and y.
+    SquashStretch,
 }
 
 /// Blender's `boundary_deform_type`.
@@ -58,7 +60,6 @@ pub enum BoundaryDeform {
     Twist,
     Smooth,
 }
-
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Falloff {
@@ -117,7 +118,11 @@ pub fn apply_stroke_with_dyntopo(
     validate_stroke(stroke)?;
     let accepts_delta = matches!(
         stroke.brush,
-        DabBrush::Grab | DabBrush::SnakeHook | DabBrush::Thumb | DabBrush::Nudge | DabBrush::Elastic,
+        DabBrush::Grab
+            | DabBrush::SnakeHook
+            | DabBrush::Thumb
+            | DabBrush::Nudge
+            | DabBrush::Elastic,
     );
     if !accepts_delta && stroke.delta.is_some() {
         return Err(invalid(

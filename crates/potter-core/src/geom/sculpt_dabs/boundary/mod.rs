@@ -10,9 +10,14 @@
 //! loop's pivot, every dab (`do_*_brush`). Boundary is not restored between dabs.
 //!
 //! Potter's brush has the Blender 5.2.2 essentials defaults for the settings it does not expose:
-//! `boundary_falloff_type` CONSTANT, `boundary_offset` 0, no `deform_target` change, and no
-//! symmetry. The falloff is then one for every propagated vertex short of the last step, and zero
-//! on the last step (`BKE_brush_curve_strength` with a CONSTANT curve).
+//! `boundary_falloff_type` CONSTANT, `boundary_offset` 0, and no `deform_target` change. The falloff
+//! is then one for every propagated vertex short of the last step, and zero on the last step
+//! (`BKE_brush_curve_strength` with a CONSTANT curve).
+//!
+//! Mirror symmetry runs each dab once per pass, in `Field::passes` order. Each pass finds its own
+//! loop on the stroke's first dab, from the mirror image of the active vertex, and deforms it with
+//! the mirror image of the grab. A vertex outside a pass's symmetry area gets no factor, so the
+//! passes split the mesh between them (`filter_verts_outside_symmetry_area`).
 //!
 //! Blender computes the propagation distance in single precision. Potter uses double precision,
 //! so a distance that sits exactly on the radius can stop one step apart from Blender.
@@ -33,20 +38,19 @@ mod inflate;
 mod smooth;
 mod twist;
 
-/// Boundary state that persists between dabs.
+/// Boundary state that persists between dabs: Blender's `cache->boundaries[symm_area]` for each
+/// symmetry pass, in `Field::passes` order. Empty until the stroke's first dab.
 #[derive(Default)]
-pub(super) enum State {
-    /// The first dab has not run.
-    #[default]
-    Unstarted,
-    /// The first dab found no editable boundary, so the stroke deforms nothing.
-    Missing,
-    /// The loop the stroke deforms.
-    Found(Box<Boundary>),
+pub(super) struct State {
+    /// `None` for a pass whose loop was not found.
+    passes: Vec<Option<Box<Boundary>>>,
 }
 
 /// Blender's `SculptBoundary`, for the single loop the stroke found.
 pub(super) struct Boundary {
+    /// `boundary.verts`: the loop's vertices in the order the loop grew from the initial one. The
+    /// initial vertex appears twice, as Blender's flood fill adds it again when a neighbor reaches it.
+    verts: Vec<usize>,
     /// `boundary.pivot_position`: the vertex the propagation reached last from the initial vertex's
     /// cone, the reference direction of the bend and displacement.
     pivot: DVec3,
@@ -54,7 +58,7 @@ pub(super) struct Boundary {
     max_steps: u32,
     /// `boundary.edit_info`.
     edit: EditInfo,
-    /// `cache->initial_location`: the stroke's first location (Blender's cursor at stroke start).
+    /// `cache->initial_location_symm`: the stroke's first location, mirrored for this pass.
     initial_location: DVec3,
     /// Data each deform type precomputes once per stroke.
     deform: DeformData,
@@ -66,7 +70,8 @@ pub(super) struct EditInfo {
     pub(super) original: Vec<Option<usize>>,
     /// `propagation_steps_num`: steps from the loop, `None` when the propagation never reached it.
     pub(super) steps: Vec<Option<u32>>,
-    /// `strength_factor`: the mask times the falloff of the vertex's step, zero when unreached.
+    /// `strength_factor`: the mask times the falloff of the vertex's step, zero when unreached, and
+    /// zero outside the pass's symmetry area.
     pub(super) factor: Vec<f64>,
 }
 
@@ -79,23 +84,24 @@ pub(super) enum DeformData {
     Twist(twist::Data),
 }
 
-/// Apply one Boundary dab. The loop is found on the stroke's first dab only.
+/// Apply one Boundary dab, once per symmetry pass in `Field::passes` order. Each pass's loop is
+/// found on the stroke's first dab only.
 pub(super) fn apply(field: &mut Field, deform: BoundaryDeform, input: &DabInput) {
-    let state = std::mem::take(&mut field.boundary);
-    let state = match state {
-        State::Unstarted => match find(field, deform, input) {
-            Some(boundary) => State::Found(Box::new(boundary)),
-            None => State::Missing,
-        },
-        other => other,
-    };
-    if let State::Found(boundary) = &state {
-        let amount = deform_amount(boundary, deform, input);
+    let mut state = std::mem::take(&mut field.boundary);
+    if state.passes.is_empty() {
+        state.passes = init_passes(field, deform, input);
+    }
+    for (pass, slot) in state.passes.iter().enumerate() {
+        let Some(boundary) = slot else {
+            continue;
+        };
+        let dab = mirrored(input, field.passes[pass]);
+        let amount = deform_amount(boundary, deform, &dab);
         match deform {
             BoundaryDeform::Bend => bend::apply(field, boundary, amount),
             BoundaryDeform::Expand => expand::apply(field, boundary, amount),
             BoundaryDeform::Inflate => inflate::apply(field, boundary, amount),
-            BoundaryDeform::Grab => grab::apply(field, boundary, input, amount),
+            BoundaryDeform::Grab => grab::apply(field, boundary, &dab, amount),
             BoundaryDeform::Twist => twist::apply(field, boundary, amount),
             BoundaryDeform::Smooth => smooth::apply(field, boundary, amount),
         }
@@ -126,18 +132,31 @@ fn displacement(boundary: &Boundary, grab: DVec3) -> f64 {
     normal.dot(grab)
 }
 
-/// Blender's `data_init_mesh` for one stroke: the loop around the boundary vertex nearest the
-/// active vertex, with its propagation and deform data. `None` when no editable loop is in reach.
-fn find(field: &Field, deform: BoundaryDeform, input: &DabInput) -> Option<Boundary> {
+/// Blender's `rotate_v3_v3v3fl` (`rotate_normalized_v3_v3v3fl` after normalizing the axis): `point`
+/// rotated by `angle` about `axis`. A zero axis gives `cos(angle) * point`, as Blender's matrix does.
+pub(super) fn rotate(point: DVec3, axis: DVec3, angle: f64) -> DVec3 {
+    let axis = axis.normalize_or_zero();
+    let (sin, cos) = angle.sin_cos();
+    point * cos + axis.cross(point) * sin + axis * (axis.dot(point) * (1.0 - cos))
+}
+
+/// Blender's `data_init_mesh` for one symmetry pass: the loop around the boundary vertex `initial`,
+/// with its propagation and deform data. `input` is the pass's mirrored dab. `None` when no editable
+/// loop is in reach.
+fn find(
+    field: &Field,
+    deform: BoundaryDeform,
+    input: &DabInput,
+    initial: usize,
+) -> Option<Boundary> {
     let topology = &field.topology;
-    let initial = nearest_vertex(&field.original, input.center);
     let radius = input.radius;
     let closest = closest_boundary_vertex(topology, &field.original, initial, radius)?;
     if !is_editable(topology, initial) {
         return None;
     }
     let verts = boundary_loop(topology, closest);
-    let (edit, pivot, max_steps) = propagate(
+    let (mut edit, pivot, max_steps) = propagate(
         topology,
         &field.original,
         &field.mask_factors,
@@ -145,7 +164,15 @@ fn find(field: &Field, deform: BoundaryDeform, input: &DabInput) -> Option<Bound
         closest,
         radius,
     );
+    // `filter_verts_outside_symmetry_area`, against the loop's initial vertex.
+    let mirror = mirror_axes(&field.passes);
+    for (index, factor) in edit.factor.iter_mut().enumerate() {
+        if !in_symmetry_area(field.original[index], field.original[closest], mirror) {
+            *factor = 0.0;
+        }
+    }
     let mut boundary = Boundary {
+        verts,
         pivot,
         max_steps,
         edit,
@@ -159,6 +186,67 @@ fn find(field: &Field, deform: BoundaryDeform, input: &DabInput) -> Option<Bound
         BoundaryDeform::Grab | BoundaryDeform::Inflate | BoundaryDeform::Smooth => DeformData::None,
     };
     Some(boundary)
+}
+
+/// Blender's `init_boundary_mesh` for every symmetry pass, on the stroke's first dab. The main pass
+/// starts from the active vertex, the vertex nearest the stroke's first location. A mirror pass
+/// starts from the vertex nearest the mirror image of the active vertex, if it lies within the
+/// radius. Each pass then finds its loop from its mirrored dab.
+fn init_passes(
+    field: &Field,
+    deform: BoundaryDeform,
+    input: &DabInput,
+) -> Vec<Option<Box<Boundary>>> {
+    let active = nearest_vertex(&field.original, input.center);
+    field
+        .passes
+        .iter()
+        .enumerate()
+        .map(|(pass, &sign)| {
+            let initial = if pass == 0 {
+                Some(active)
+            } else {
+                nearest_within(&field.original, sign * field.original[active], input.radius)
+            };
+            let dab = mirrored(input, sign);
+            initial
+                .and_then(|initial| find(field, deform, &dab, initial))
+                .map(Box::new)
+        })
+        .collect()
+}
+
+/// The dab as one symmetry pass sees it: Blender's `cache_calc_brushdata_symm` flips the location,
+/// the grab delta, and the initial location. The initial location is the dab center for anchored
+/// brushes, so the center is what gets flipped.
+fn mirrored(input: &DabInput, sign: DVec3) -> DabInput {
+    DabInput {
+        center: input.center * sign,
+        grab: input.grab * sign,
+        ..*input
+    }
+}
+
+/// Blender's `nearest_vert_calc_mesh`: the vertex nearest `location` when it lies within `radius`
+/// of it. Blender tests the mesh nodes the sphere touches; testing the vertex itself agrees with it
+/// whenever the nearest vertex is inside the sphere.
+fn nearest_within(positions: &[DVec3], location: DVec3, radius: f64) -> Option<usize> {
+    let vertex = nearest_vertex(positions, location);
+    (positions[vertex].distance(location) <= radius).then_some(vertex)
+}
+
+/// The mirror axes of a stroke's symmetry passes: an axis is mirrored when some pass flips it.
+fn mirror_axes(passes: &[DVec3]) -> [bool; 3] {
+    std::array::from_fn(|axis| passes.iter().any(|sign| sign[axis] < 0.0))
+}
+
+/// Blender's `check_vertex_pivot_symmetry` (`sculpt.cc` 671): on each mirror axis, a vertex must
+/// lie on the pivot's side. A pivot on the mirror plane admits only vertices at or below it.
+fn in_symmetry_area(vertex: DVec3, pivot: DVec3, mirror: [bool; 3]) -> bool {
+    (0..3).all(|axis| {
+        let (co, pv) = (vertex[axis], pivot[axis]);
+        !mirror[axis] || (!(pv == 0.0 && co > 0.0) && co * pv >= 0.0)
+    })
 }
 
 /// Blender's `check_counts` with `is_vert_in_editable_boundary_mesh`: a vertex can grow the loop
