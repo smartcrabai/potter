@@ -1,4 +1,9 @@
-use std::{collections::HashMap, error::Error, fs, process::Command};
+use std::{
+    collections::{HashMap, HashSet},
+    error::Error,
+    fs,
+    process::Command,
+};
 
 #[path = "common/blender_file.rs"]
 mod blender_file;
@@ -10,12 +15,15 @@ use potter_core::{
     geom::Mesh,
     model::{Id, SceneDoc},
 };
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tempfile::tempdir;
 
 type TestResult<T> = Result<T, Box<dyn Error>>;
 
 const BLENDER_REQUIRED: &str = "Blender is required for the Boolean stack parity test: install Blender 5.2, or set POTTER_BLENDER to its executable";
+
+const WEIGHT_TOLERANCE: f64 = 1.0e-6;
+const POSITION_TOLERANCE: f64 = 1.0e-5;
 
 const BOOLEAN_STACK_FIXTURE: &str = r#"
 import bpy
@@ -278,8 +286,6 @@ fn find_node(document: &SceneDoc, name: &str) -> TestResult<Id> {
         .ok_or_else(|| format!("imported node `{name}` is missing").into())
 }
 fn assert_float_operand_group_remap(document: &SceneDoc, expected: &Value) -> TestResult<()> {
-    const WEIGHT_TOLERANCE: f64 = 1.0e-6;
-    const POSITION_TOLERANCE: f64 = 1.0e-5;
     let host_id = find_node(document, "FloatGroupHost")?;
     let operand_id = find_node(document, "FloatGroupOperand")?;
     let data_block = |node_id: &Id| {
@@ -318,46 +324,103 @@ fn assert_float_operand_group_remap(document: &SceneDoc, expected: &Value) -> Te
         1,
         "operand-only groups must be ignored"
     );
-    let actual_host_weights = actual_groups["Host"]
-        .as_object()
-        .ok_or("FLOAT group output did not map Cutter onto Host")?;
     let expected_positions = points_from_json(&expected["positions"])?;
-    let expected_host_weights = expected["vertex_groups"]["Host"]
+    let expected_groups = expected["vertex_groups"]
         .as_object()
+        .ok_or("Blender FLOAT group output is missing vertex groups")?;
+    let expected_names: HashSet<&String> = expected_groups.keys().collect();
+    let actual_names: HashSet<&String> = actual_groups.keys().collect();
+    assert_eq!(
+        actual_names, expected_names,
+        "FLOAT group names differ from Blender"
+    );
+    let expected_host_weights = expected_groups
+        .get("Host")
+        .and_then(Value::as_object)
         .ok_or("Blender FLOAT group output is missing Host weights")?;
-    let mut matched_operand_weight = false;
-    for (index, expected_weight) in expected_host_weights {
-        let Some(weight) = expected_weight.as_f64() else {
-            continue;
-        };
-        if (weight - 0.75).abs() > WEIGHT_TOLERANCE {
-            continue;
-        }
-        let index = index
-            .parse::<usize>()
-            .map_err(|_| "Blender FLOAT group vertex index is invalid")?;
-        let position = *expected_positions
-            .get(index)
-            .ok_or("Blender FLOAT group vertex position is missing")?;
-        let mapped = mesh.vertices.iter().any(|vertex| {
-            if vertex.co.distance(position) > POSITION_TOLERANCE {
-                return false;
-            }
-            actual_host_weights
-                .get(&format!("v{}", vertex.id))
-                .and_then(Value::as_f64)
-                .is_some_and(|actual| (actual - weight).abs() <= WEIGHT_TOLERANCE)
-        });
-        assert!(
-            mapped,
-            "Blender Cutter weight did not land on Potter Host at {position:?}"
-        );
-        matched_operand_weight = true;
-    }
+    let retains_operand_weight = expected_host_weights.values().any(|weight| {
+        weight
+            .as_f64()
+            .is_some_and(|weight| (weight - 0.75).abs() <= WEIGHT_TOLERANCE)
+    });
     assert!(
-        matched_operand_weight,
+        retains_operand_weight,
         "Blender FLOAT union did not retain a weighted operand vertex"
     );
+    for (name, expected_weights) in expected_groups {
+        let expected_weights = expected_weights
+            .as_object()
+            .ok_or("Blender FLOAT group weights are invalid")?;
+        let actual_weights = actual_groups
+            .get(name)
+            .and_then(Value::as_object)
+            .ok_or_else(|| format!("FLOAT group `{name}` output is missing"))?;
+        assert_vertex_group_weights_match(
+            name,
+            &expected_positions,
+            expected_weights,
+            mesh,
+            actual_weights,
+        )?;
+    }
+    Ok(())
+}
+
+/// Compares one vertex group in both directions. Each Blender (vertex index, weight) entry must
+/// match a distinct Potter entry at the same position and weight, and the counts must be equal so
+/// Potter holds no extra entries. Potter keys are vertex IDs, so positions bridge the two sides.
+fn assert_vertex_group_weights_match(
+    group: &str,
+    expected_positions: &[DVec3],
+    expected_weights: &Map<String, Value>,
+    mesh: &Mesh,
+    actual_weights: &Map<String, Value>,
+) -> TestResult<()> {
+    let positions_by_key: HashMap<String, DVec3> = mesh
+        .vertices
+        .iter()
+        .map(|vertex| (format!("v{}", vertex.id), vertex.co))
+        .collect();
+    let mut blender_entries = Vec::with_capacity(expected_weights.len());
+    for (index, weight) in expected_weights {
+        let index = index
+            .parse::<usize>()
+            .map_err(|_| format!("Blender {group} vertex index is invalid"))?;
+        let position = *expected_positions
+            .get(index)
+            .ok_or_else(|| format!("Blender {group} vertex {index} has no position"))?;
+        let weight = weight
+            .as_f64()
+            .ok_or_else(|| format!("Blender {group} weight of vertex {index} is invalid"))?;
+        blender_entries.push((position, weight));
+    }
+    let mut potter_entries = Vec::with_capacity(actual_weights.len());
+    for (key, weight) in actual_weights {
+        let position = *positions_by_key
+            .get(key)
+            .ok_or_else(|| format!("Potter {group} weight names missing vertex {key}"))?;
+        let weight = weight
+            .as_f64()
+            .ok_or_else(|| format!("Potter {group} weight of {key} is invalid"))?;
+        potter_entries.push((position, weight));
+    }
+    assert_eq!(
+        potter_entries.len(),
+        blender_entries.len(),
+        "Potter weights for group {group} differ in vertex count from Blender"
+    );
+    for (position, weight) in blender_entries {
+        let matched = potter_entries
+            .iter()
+            .position(|(actual_position, actual_weight)| {
+                actual_position.distance(position) <= POSITION_TOLERANCE
+                    && (actual_weight - weight).abs() <= WEIGHT_TOLERANCE
+            })
+            .ok_or_else(|| {
+                format!("Blender {group} weight {weight} at {position:?} has no Potter entry")
+            })?;
+        potter_entries.swap_remove(matched);
+    }
     Ok(())
 }
 

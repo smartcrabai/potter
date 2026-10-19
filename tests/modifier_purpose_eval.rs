@@ -6,12 +6,13 @@
 //! `show_render=False` the render export gives the base 8 vertices; with `show_viewport=False` the
 //! viewport gives 8 and the render gives 98.
 
-use std::{error::Error, fmt::Debug};
+use std::{collections::HashMap, error::Error, fmt::Debug};
 
 use glam::DVec3;
 use potter_core::{
     error::{ErrorCode, PotError},
     eval::{EvaluationContext, EvaluationPurpose, Snapshot},
+    geom::Mesh,
     model::{Id, SceneDoc},
     ops,
 };
@@ -23,6 +24,7 @@ const SCENE_ID: &str = "00000000-0000-4000-8000-000000000000";
 const BASE_VERTICES: usize = 8;
 const LEVEL_ONE_VERTICES: usize = 26;
 const LEVEL_TWO_VERTICES: usize = 98;
+const VOLUME_TOLERANCE: f64 = 1.0e-9;
 
 fn ensure_eq<T: PartialEq + Debug>(actual: &T, expected: &T, what: &str) -> TestResult {
     if actual == expected {
@@ -85,6 +87,45 @@ fn cube_vertices(doc: &SceneDoc, purpose: EvaluationPurpose) -> TestResult<Vec<D
         .get(&Id::new("cube")?)
         .ok_or("evaluated cube mesh is missing")?;
     Ok(mesh.vertices.iter().map(|vertex| vertex.co).collect())
+}
+
+fn ensure(condition: bool, what: &str) -> TestResult {
+    if condition { Ok(()) } else { Err(what.into()) }
+}
+
+fn ensure_volume(actual: f64, expected: f64, what: &str) -> TestResult {
+    ensure(
+        (actual - expected).abs() <= VOLUME_TOLERANCE,
+        &format!("{what}: expected {expected}, got {actual}"),
+    )
+}
+
+fn evaluated_mesh<'a>(snapshot: &'a Snapshot, id: &Id) -> TestResult<&'a Mesh> {
+    snapshot
+        .meshes
+        .get(id)
+        .ok_or_else(|| "evaluated mesh is missing".into())
+}
+
+/// Vertex count, face count and signed volume by the divergence theorem over the tessellation.
+/// The volume is positive for a closed mesh with outward winding.
+fn summary(mesh: &Mesh) -> TestResult<(usize, usize, f64)> {
+    let positions: HashMap<u32, DVec3> = mesh
+        .vertices
+        .iter()
+        .map(|vertex| (vertex.id, vertex.co))
+        .collect();
+    let corner = |id: u32| {
+        positions
+            .get(&id)
+            .copied()
+            .ok_or("tessellated vertex is missing")
+    };
+    let mut six_volume = 0.0;
+    for [a, b, c] in mesh.tessellate()? {
+        six_volume += corner(a)?.dot(corner(b)?.cross(corner(c)?));
+    }
+    Ok((mesh.vertices.len(), mesh.faces.len(), six_volume / 6.0))
 }
 
 #[test]
@@ -378,6 +419,19 @@ fn boolean_results_feed_dependent_modifiers_for_both_purposes() -> TestResult {
     let follower = Id::new("follower")?;
     let cutter = Id::new("cutter")?;
 
+    // The same host without its Decimate, so the Boolean's own output can be checked in closed form.
+    let mut boolean_only = doc.clone();
+    let host_node = boolean_only
+        .nodes
+        .get_mut(&host)
+        .ok_or("host node is missing")?;
+    for modifier in &mut host_node.modifiers {
+        if modifier.modifier_type == "decimate" {
+            modifier.enabled = false;
+        }
+    }
+
+    let mut outcomes = Vec::new();
     for purpose in [EvaluationPurpose::Preview, EvaluationPurpose::Render] {
         let (snapshot, node_errors) =
             Snapshot::evaluate_available_with_cache(&doc, &purpose_context(purpose), None, None)?;
@@ -389,6 +443,48 @@ fn boolean_results_feed_dependent_modifiers_for_both_purposes() -> TestResult {
         ] {
             ensure_eq(&snapshot.meshes.contains_key(id), &true, name)?;
         }
+
+        // Unmodified box of edge length 1: 8 corners, 6 quads, volume 1^3.
+        let (vertices, faces, volume) = summary(evaluated_mesh(&snapshot, &cutter)?)?;
+        ensure_eq(&vertices, &8, "cutter vertex count")?;
+        ensure_eq(&faces, &6, "cutter face count")?;
+        ensure_volume(volume, 1.0, "cutter volume")?;
+
+        // Edge-2 box minus an enclosed edge-1 box: no faces intersect, so the output keeps the 8
+        // outer corners and adds the 8 cavity corners; the volume is 2^3 - 1^3.
+        let boolean_snapshot = Snapshot::evaluate(&boolean_only, &purpose_context(purpose))?;
+        let (vertices, _, volume) = summary(evaluated_mesh(&boolean_snapshot, &host)?)?;
+        ensure_eq(&vertices, &16, "Boolean host vertex count")?;
+        ensure_volume(volume, 7.0, "Boolean host volume")?;
+
+        // Decimate has no closed form here; the decimated host only has to enclose positive volume.
+        let host_summary = summary(evaluated_mesh(&snapshot, &host)?)?;
+        let host_volume = host_summary.2;
+        ensure(host_volume > 0.0, "decimated host encloses positive volume")?;
+
+        // The FLOAT union contains the host and a box of edge 1 that fills the cavity, and is at
+        // most their volumes added together.
+        let follower_summary = summary(evaluated_mesh(&snapshot, &follower)?)?;
+        let follower_volume = follower_summary.2;
+        ensure(
+            follower_volume >= host_volume.max(1.0) - VOLUME_TOLERANCE,
+            "follower union is smaller than one of its operands",
+        )?;
+        ensure(
+            follower_volume <= host_volume + 1.0 + VOLUME_TOLERANCE,
+            "follower union is larger than the sum of its operands",
+        )?;
+        outcomes.push((host_summary, follower_summary));
+    }
+
+    // Boolean, Decimate and union have no purpose-dependent settings here, so both purposes agree.
+    for (name, preview, render) in [
+        ("host", outcomes[0].0, outcomes[1].0),
+        ("follower", outcomes[0].1, outcomes[1].1),
+    ] {
+        ensure_eq(&preview.0, &render.0, &format!("{name} vertex count"))?;
+        ensure_eq(&preview.1, &render.1, &format!("{name} face count"))?;
+        ensure_volume(preview.2, render.2, &format!("{name} volume"))?;
     }
     Ok(())
 }
