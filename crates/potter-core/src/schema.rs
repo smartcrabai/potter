@@ -89,7 +89,7 @@ fn scene_schema() -> Value {
     let mut root = base("Potter scene document");
     root["required"] = json!(["schema_version", "scene_id", "revision", "active_scene"]);
     root["properties"] = json!({
-        "schema_version":{"const":3},
+        "schema_version":{"const":4},
         "scene_id":{"type":"string","format":"uuid"},
         "revision":{"type":"integer","minimum":0,"maximum":9_007_199_254_740_991_u64},
         "active_scene":{"$ref":"#/$defs/id"},
@@ -109,6 +109,9 @@ fn scene_schema() -> Value {
         "history":{"$ref":"#/$defs/history"}
     });
     root["additionalProperties"] = json!(false);
+    // The scene document requires `interpolation`; the operation schema defaults it to linear.
+    let mut texture_ref = texture_ref_schema();
+    texture_ref["required"] = json!(["image", "interpolation"]);
     root["$defs"] = json!({
         "id":id_schema(),
         "vec2":vec_schema(2),
@@ -137,7 +140,7 @@ fn scene_schema() -> Value {
         "camera":{"type":"object","required":["projection","lens_mm","sensor_width_mm","ortho_scale","clip_start","clip_end","shift"],"properties":{"projection":{"enum":["perspective","orthographic"]},"lens_mm":{"type":"number"},"sensor_width_mm":{"type":"number"},"ortho_scale":{"type":"number"},"clip_start":{"type":"number"},"clip_end":{"type":"number"},"shift":{"$ref":"#/$defs/vec2"}},"additionalProperties":false},
         "light":{"type":"object","required":["light_type","color","energy","radius","spot_size","spot_blend"],"properties":{"light_type":{"enum":["point","sun","spot","area"]},"color":{"$ref":"#/$defs/vec3"},"energy":{"type":"number"},"radius":{"type":"number"},"soft_falloff":{"type":"boolean"},"spot_size":{"type":"number"},"spot_blend":{"type":"number"}},"additionalProperties":false},
         "material":{"type":"object","required":["name","base_color","metallic","roughness","emission_color","emission_strength","transmission","ior","double_sided","node_tree","base_color_texture","roughness_texture","metallic_texture","normal_texture"],"properties":{"name":{"type":"string"},"base_color":{"type":"array","items":{"type":"number","minimum":0,"maximum":1},"minItems":4,"maxItems":4},"metallic":{"type":"number","minimum":0,"maximum":1},"roughness":{"type":"number","minimum":0,"maximum":1},"emission_color":{"$ref":"#/$defs/vec3"},"emission_strength":{"type":"number","minimum":0},"transmission":{"type":"number","minimum":0,"maximum":1},"ior":{"type":"number","exclusiveMinimum":0},"double_sided":{"type":"boolean"},"node_tree":{"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]},"base_color_texture":{"oneOf":[{"$ref":"#/$defs/texture_ref"},{"type":"null"}]},"roughness_texture":{"oneOf":[{"$ref":"#/$defs/texture_ref"},{"type":"null"}]},"metallic_texture":{"oneOf":[{"$ref":"#/$defs/texture_ref"},{"type":"null"}]},"normal_texture":{"oneOf":[{"$ref":"#/$defs/texture_ref"},{"type":"null"}]}},"additionalProperties":false},
-        "texture_ref":{"type":"object","required":["image","interpolation"],"properties":{"image":{"$ref":"#/$defs/id"},"uv_layer":{"type":["string","null"],"minLength":1,"default":null},"interpolation":{"enum":["linear","closest"]}},"additionalProperties":false},
+        "texture_ref":texture_ref,
         "world":{"type":"object","required":["color","strength"],"properties":{"color":{"$ref":"#/$defs/vec3"},"strength":{"type":"number","minimum":0}},"additionalProperties":false},
         "keyframe":keyframe_schema(),
         "fcurve":fcurve_schema(),
@@ -326,7 +329,7 @@ fn complete_data_block_schemas(defs: &mut Value) {
 /// A texture reference: an image, an optional UV layer name (`null` is the render layer), and the
 /// sampler interpolation.
 fn texture_ref_schema() -> Value {
-    json!({"type":"object","required":["image"],"properties":{"image":id_schema(),"uv_layer":{"type":["string","null"],"minLength":1,"default":null},"interpolation":{"enum":["linear","closest"],"default":"linear"}},"additionalProperties":false})
+    json!({"type":"object","required":["image"],"properties":{"image":id_schema(),"uv_layer":{"type":["string","null"],"minLength":1,"default":null},"interpolation":{"enum":["linear","closest"],"default":"linear"},"extension":{"enum":["repeat","extend","clip","mirror"],"default":"repeat"}},"additionalProperties":false})
 }
 
 fn nullable_texture_ref_schema() -> Value {
@@ -2567,7 +2570,6 @@ mod tests {
         );
         Ok(())
     }
-
     #[test]
     fn modifier_and_constraint_schemas_use_rna_parameter_tables() -> crate::error::Result<()> {
         let modifier_create = schema("operations", Some("modifier.create"))?;

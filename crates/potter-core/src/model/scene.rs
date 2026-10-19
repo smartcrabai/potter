@@ -10,7 +10,7 @@ use crate::{
         volume::VolumeData,
     },
     graph::NodeGroup,
-    image::ImageInterpolation,
+    image::{ImageExtension, ImageInterpolation},
     mask::Mask,
     sequencer::Sequencer,
 };
@@ -118,7 +118,7 @@ impl SceneDoc {
             },
         )]);
         Self {
-            schema_version: 3,
+            schema_version: 4,
             scene_id,
             revision: 0,
             active_scene,
@@ -145,7 +145,7 @@ impl SceneDoc {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.schema_version != 3 {
+        if self.schema_version != 4 {
             return Err(PotError::with_details(
                 ErrorCode::UnsupportedVersion,
                 format!("unsupported scene schema_version {}", self.schema_version),
@@ -2144,6 +2144,10 @@ pub struct TextureRef {
     pub uv_layer: Option<String>,
     #[serde(default)]
     pub interpolation: ImageInterpolation,
+    /// Blender's Image Texture `extension`: how a lookup past the edge repeats, extends, or mirrors. Omitted when
+    /// REPEAT, which is the default for scene JSON written before this field existed.
+    #[serde(default, skip_serializing_if = "ImageExtension::is_repeat")]
+    pub extension: ImageExtension,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

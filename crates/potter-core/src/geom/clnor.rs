@@ -896,6 +896,15 @@ pub(crate) fn evaluate_codes(
     evaluate_code_buffer(mesh, codes, positions, options.corner_order)
 }
 
+/// Converts a vector in one already-computed fan space to its canonical stored code.
+pub(crate) fn encode_vector_in_space(space: &Space, vector: DVec3) -> CornerNormalCode {
+    if vector == DVec3::ZERO {
+        return CornerNormalCode::ExplicitZero;
+    }
+    let [first, second] = space.encode(vector.as_vec3());
+    CornerNormalCode::from_pair([short(first), short(second)])
+}
+
 /// Authored/Auto view of the canonical code state; automatic entries remain `None`.
 pub(crate) fn corner_custom_normals(
     mesh: &Mesh,

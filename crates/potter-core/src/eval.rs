@@ -94,6 +94,9 @@ pub(crate) struct ModifierEvaluationContext<'a> {
     pub(crate) purpose: EvaluationPurpose,
     pub(crate) project_root: Option<&'a Path>,
     pub(crate) cache_directory: Option<&'a Path>,
+    /// The owning object's material slot count (`Node::material_slot_count`); `None` when there is
+    /// no scene object, in which case consumers fall back to the mesh's own face material indices.
+    pub(crate) material_slot_count: Option<usize>,
 }
 fn adaptive_render_context<'a>(
     doc: &'a SceneDoc,
@@ -455,6 +458,7 @@ impl Snapshot {
             purpose: context.purpose,
             project_root,
             cache_directory,
+            material_slot_count: None,
         };
         let suppressed = BTreeSet::new();
         let mut world_matrix_ids = BTreeSet::from([target_id.clone()]);
@@ -533,6 +537,7 @@ impl Snapshot {
             purpose: context.purpose,
             project_root,
             cache_directory,
+            material_slot_count: None,
         };
         crate::library::validate_linked_assets(doc, modifier_context.project_root)?;
         let scene_hash = source_scene_hash(doc)?;
@@ -569,6 +574,7 @@ impl Snapshot {
                     snapshot.scene_hash.clone_from(&scene_hash);
                     let evaluation_key = json!({
                         "engine": EVALUATION_ENGINE,
+                        "build_identity": crate::BUILD_IDENTITY,
                         "simulation_engine": crate::sim::SOLVER_VERSION,
                         "scene_hash": scene_hash,
                         "scene_id": snapshot.scene_id,
@@ -673,6 +679,7 @@ impl Snapshot {
             purpose: context.purpose,
             project_root,
             cache_directory,
+            material_slot_count: None,
         };
         crate::library::validate_linked_assets(source, modifier_context.project_root)?;
         let scene_hash = source_scene_hash(source)?;
@@ -966,6 +973,7 @@ impl Snapshot {
         }
         let mut evaluation_key = json!({
             "engine": EVALUATION_ENGINE,
+            "build_identity": crate::BUILD_IDENTITY,
             "simulation_engine": crate::sim::SOLVER_VERSION,
             "scene_hash": scene_hash,
             "scene_id": scene_id,
@@ -1098,6 +1106,11 @@ impl Snapshot {
                     attach_vertex_group_weights(&mut rigged_source, data_block);
                     // Shape keys are applied above before modifiers, so adaptive derivatives use the same
                     // evaluated coordinates as the render mesh.
+                    let mut stack_context = gate.context;
+                    stack_context.material_slot_count = Some(crate::model::material_slot_count(
+                        node.materials.len(),
+                        node_materials.len(),
+                    ));
                     let (evaluated, mesh_normals) =
                         crate::geom::modifiers::evaluate_modifiers_with_scene_context_and_normals(
                             rigged_source,
@@ -1109,57 +1122,55 @@ impl Snapshot {
                             &object_meshes,
                             &meshes,
                             &curve_path_lengths,
-                            gate.context,
+                            stack_context,
                             |_, modifier| gate.is_active(id, modifier),
                             adaptive_render.as_ref(),
-                            |mesh, modifier, modifier_warnings| match modifier
-                                .modifier_type
-                                .as_str()
-                            {
-                                "armature" => rig::apply_armature_modifier_with_drivers(
-                                    mesh,
-                                    data_block,
-                                    modifier,
-                                    matrix,
-                                    doc,
-                                    frame,
-                                    &matrices,
-                                    driver_values,
-                                    modifier_context.project_root,
-                                    scene.fps,
-                                    scene.fps_base,
-                                    &meshes,
-                                ),
-                                "lattice" => apply_lattice_modifier(
-                                    mesh, modifier, id, data_block, doc, &matrices,
-                                ),
-                                "volume_to_mesh" => apply_volume_to_mesh_modifier(
-                                    mesh,
-                                    modifier,
-                                    id,
-                                    doc,
-                                    &matrices,
-                                    &volume_data,
-                                ),
-                                "boolean" | "shrinkwrap" | "curve" | "hook" | "warp" => {
-                                    apply_scene_operand_modifier(
+                            |mesh, modifier, modifier_warnings| {
+                                let result = match modifier.modifier_type.as_str() {
+                                    "armature" => rig::apply_armature_modifier_with_drivers(
+                                        mesh,
+                                        data_block,
+                                        modifier,
+                                        matrix,
+                                        doc,
+                                        frame,
+                                        &matrices,
+                                        driver_values,
+                                        modifier_context.project_root,
+                                        scene.fps,
+                                        scene.fps_base,
+                                        &meshes,
+                                    ),
+                                    "lattice" => apply_lattice_modifier(
+                                        mesh, modifier, id, data_block, doc, &matrices,
+                                    ),
+                                    "volume_to_mesh" => apply_volume_to_mesh_modifier(
                                         mesh,
                                         modifier,
                                         id,
                                         doc,
                                         &matrices,
-                                        &meshes,
-                                        &nodes,
-                                        &mut node_materials,
-                                    )
-                                }
-                                "vertex_weight_edit"
-                                | "vertex_weight_mix"
-                                | "vertex_weight_proximity"
-                                | "normal_edit"
-                                | "uv_project"
-                                | "uv_warp"
-                                | "data_transfer" => apply_scene_attribute_modifier(
+                                        &volume_data,
+                                    ),
+                                    "boolean" | "shrinkwrap" | "curve" | "hook" | "warp" => {
+                                        apply_scene_operand_modifier(
+                                            mesh,
+                                            modifier,
+                                            id,
+                                            doc,
+                                            &matrices,
+                                            &meshes,
+                                            &nodes,
+                                            &mut node_materials,
+                                        )
+                                    }
+                                    "vertex_weight_edit"
+                                    | "vertex_weight_mix"
+                                    | "vertex_weight_proximity"
+                                    | "normal_edit"
+                                    | "uv_project"
+                                    | "uv_warp"
+                                    | "data_transfer" => apply_scene_attribute_modifier(
                                     mesh,
                                     modifier,
                                     id,
@@ -1234,9 +1245,16 @@ impl Snapshot {
                                     ErrorCode::InternalError,
                                     "unexpected custom modifier callback",
                                 )),
-                            },
-                        )
-                        .map_err(|error| attach_node_owner(error, id))?;
+                            };
+                            result.map(|()| {
+                                Some(crate::model::material_slot_count(
+                                    node.materials.len(),
+                                    node_materials.len(),
+                                ))
+                            })
+                        },
+                    )
+                    .map_err(|error| attach_node_owner(error, id))?;
                     modifier_warnings.extend(
                         evaluated
                             .warnings
@@ -1391,6 +1409,11 @@ impl Snapshot {
                         }
                     };
                     attach_vertex_group_weights(&mut source_mesh, data_block);
+                    let mut stack_context = gate.context;
+                    stack_context.material_slot_count = Some(crate::model::material_slot_count(
+                        node.materials.len(),
+                        node_materials.len(),
+                    ));
                     let (evaluated, evaluated_normals) =
                         crate::geom::modifiers::evaluate_modifiers_with_scene_context_and_normals(
                             source_mesh,
@@ -1402,57 +1425,55 @@ impl Snapshot {
                             &object_meshes,
                             &meshes,
                             &curve_path_lengths,
-                            gate.context,
+                            stack_context,
                             |_, modifier| gate.is_active(id, modifier),
                             adaptive_render.as_ref(),
-                            |mesh, modifier, modifier_warnings| match modifier
-                                .modifier_type
-                                .as_str()
-                            {
-                                "armature" => rig::apply_armature_modifier_with_drivers(
-                                    mesh,
-                                    data_block,
-                                    modifier,
-                                    matrix,
-                                    doc,
-                                    frame,
-                                    &matrices,
-                                    driver_values,
-                                    modifier_context.project_root,
-                                    scene.fps,
-                                    scene.fps_base,
-                                    &meshes,
-                                ),
-                                "lattice" => apply_lattice_modifier(
-                                    mesh, modifier, id, data_block, doc, &matrices,
-                                ),
-                                "volume_to_mesh" => apply_volume_to_mesh_modifier(
-                                    mesh,
-                                    modifier,
-                                    id,
-                                    doc,
-                                    &matrices,
-                                    &volume_data,
-                                ),
-                                "boolean" | "shrinkwrap" | "curve" | "hook" | "warp" => {
-                                    apply_scene_operand_modifier(
+                            |mesh, modifier, modifier_warnings| {
+                                let result = match modifier.modifier_type.as_str() {
+                                    "armature" => rig::apply_armature_modifier_with_drivers(
+                                        mesh,
+                                        data_block,
+                                        modifier,
+                                        matrix,
+                                        doc,
+                                        frame,
+                                        &matrices,
+                                        driver_values,
+                                        modifier_context.project_root,
+                                        scene.fps,
+                                        scene.fps_base,
+                                        &meshes,
+                                    ),
+                                    "lattice" => apply_lattice_modifier(
+                                        mesh, modifier, id, data_block, doc, &matrices,
+                                    ),
+                                    "volume_to_mesh" => apply_volume_to_mesh_modifier(
                                         mesh,
                                         modifier,
                                         id,
                                         doc,
                                         &matrices,
-                                        &meshes,
-                                        &nodes,
-                                        &mut node_materials,
-                                    )
-                                }
-                                "vertex_weight_edit"
-                                | "vertex_weight_mix"
-                                | "vertex_weight_proximity"
-                                | "normal_edit"
-                                | "uv_project"
-                                | "uv_warp"
-                                | "data_transfer" => apply_scene_attribute_modifier(
+                                        &volume_data,
+                                    ),
+                                    "boolean" | "shrinkwrap" | "curve" | "hook" | "warp" => {
+                                        apply_scene_operand_modifier(
+                                            mesh,
+                                            modifier,
+                                            id,
+                                            doc,
+                                            &matrices,
+                                            &meshes,
+                                            &nodes,
+                                            &mut node_materials,
+                                        )
+                                    }
+                                    "vertex_weight_edit"
+                                    | "vertex_weight_mix"
+                                    | "vertex_weight_proximity"
+                                    | "normal_edit"
+                                    | "uv_project"
+                                    | "uv_warp"
+                                    | "data_transfer" => apply_scene_attribute_modifier(
                                     mesh,
                                     modifier,
                                     id,
@@ -1527,9 +1548,16 @@ impl Snapshot {
                                     ErrorCode::InternalError,
                                     "unexpected custom modifier callback",
                                 )),
-                            },
-                        )
-                        .map_err(|error| attach_node_owner(error, id))?;
+                            };
+                            result.map(|()| {
+                                Some(crate::model::material_slot_count(
+                                    node.materials.len(),
+                                    node_materials.len(),
+                                ))
+                            })
+                        },
+                    )
+                    .map_err(|error| attach_node_owner(error, id))?;
                     modifier_warnings.extend(
                         evaluated
                             .warnings
@@ -1915,7 +1943,8 @@ fn modifier_transform_references(modifier: &Modifier) -> BTreeSet<Id> {
     }
 
     let parameters: &[&str] = match modifier.modifier_type.as_str() {
-        "armature" | "hook" | "lattice" => &["object"],
+        "armature" | "hook" | "lattice" | "screw" => &["object"],
+        "mirror" => &["mirror_object"],
         "uv_project" => &["projectors"],
         "uv_warp" | "warp" => &["object_from", "object_to"],
         "vertex_weight_edit" | "vertex_weight_mix" | "vertex_weight_proximity" => {
@@ -1951,14 +1980,6 @@ fn modifier_transform_references(modifier: &Modifier) -> BTreeSet<Id> {
         {
             add_reference(&mut references, modifier.params.get("offset_object"));
         }
-    } else if modifier.modifier_type == "screw"
-        && modifier
-            .params
-            .get("use_object_screw_offset")
-            .and_then(Value::as_bool)
-            == Some(true)
-    {
-        add_reference(&mut references, modifier.params.get("object"));
     }
     references
 }
@@ -5587,6 +5608,7 @@ mod tests {
                 purpose: super::EvaluationPurpose::Preview,
                 project_root: None,
                 cache_directory: None,
+                material_slot_count: None,
             },
             suppressed: &suppressed,
             modifier_prefix: None,

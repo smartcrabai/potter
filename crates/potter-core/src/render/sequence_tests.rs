@@ -287,3 +287,49 @@ fn unsupported_movie_and_unresolved_scene_strips_report_errors() -> Result<(), B
     );
     Ok(())
 }
+
+/// Potter's EXR writer stores associated alpha, as Blender's `OpenEXR` path does (`openexr_api.cpp`): a straight colour
+/// `[0.8, 0.4, 0.2]` with alpha 0.5 is stored as `[0.4, 0.2, 0.1, 0.5]`. Reloading the file gives the stored values
+/// (premultiplied), and `straight_pixels` returns the straight colour again. The Blender side of this file is the
+/// `exr32` premultiplied oracle in `tests/fixtures/alpha_texture` with texels `potter` (`generate_alpha_oracle.py`).
+#[test]
+fn potter_exr_writer_stores_associated_alpha_and_reloads_the_straight_colour()
+-> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let path = directory.path().join("alpha_half.exr");
+    super::write_exr(&path, &[[0.8, 0.4, 0.2, 0.5]], 1, 1)?;
+    let (width, height, stored) =
+        crate::image::decode_pixels(&fs::read(&path)?, crate::model::ImageColorspace::Linear)?;
+    assert_eq!((width, height), (1, 1));
+    for (channel, expected) in [0.4, 0.2, 0.1, 0.5].into_iter().enumerate() {
+        assert!(
+            (stored[0][channel] - expected).abs() < 1.0e-6,
+            "stored channel {channel} is {}, expected {expected}",
+            stored[0][channel]
+        );
+    }
+    let image = crate::image::ImageData {
+        width,
+        height,
+        pixels: stored,
+        tiles: std::collections::BTreeMap::new(),
+        interpolation: crate::image::ImageInterpolation::Linear,
+        srgb: false,
+        colour: crate::image::ColourCache::default(),
+        storage: crate::image::ImageStorage {
+            data: false,
+            straight_alpha: false,
+            ignore_alpha: false,
+            precision: crate::image::Precision::Float,
+        },
+    };
+    let straight = image.straight_pixels();
+    for (channel, expected) in [0.8, 0.4, 0.2, 0.5].into_iter().enumerate() {
+        assert!(
+            (straight[0][channel] - expected).abs() < 1.0e-6,
+            "straight channel {channel} is {}, expected {expected}",
+            straight[0][channel]
+        );
+    }
+    Ok(())
+}
