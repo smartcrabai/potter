@@ -670,7 +670,21 @@ fn adaptive_camera_override(camera: &PreparedCamera) -> AdaptiveCameraOverride {
 fn background_color(doc: &SceneDoc, snapshot: &Snapshot, mode: Mode, transparent: bool) -> [u8; 4] {
     let alpha = if transparent { 0 } else { 255 };
     if matches!(mode, Mode::Solid) {
-        return [242, 242, 242, alpha];
+        // Workbench's render background is the scene world's horizon colour (`World.color`, not
+        // scaled by strength), and black with no world (`workbench_state.cc`, `background_color`).
+        let world = doc
+            .scenes
+            .get(&snapshot.scene_id)
+            .and_then(|value| value.world.as_ref())
+            .and_then(|id| doc.worlds.get(id));
+        return world.map_or([0, 0, 0, alpha], |value| {
+            [
+                linear_to_byte(value.color[0]),
+                linear_to_byte(value.color[1]),
+                linear_to_byte(value.color[2]),
+                alpha,
+            ]
+        });
     }
     let scene = doc.scenes.get(&snapshot.scene_id);
     let world = scene

@@ -2250,6 +2250,8 @@ def material_dump(material):
     return {"name": material.name_full, "potter_id": material.get("potter.id"),
             "library": library_reference(material),
             "base_color": base_color,
+            "viewport_display": {"diffuse_color": [float(c) for c in material.diffuse_color],
+                                 "roughness": float(material.roughness), "metallic": float(material.metallic)},
             "metallic": metallic, "roughness": roughness,
             "emission_color": emission_color, "emission_strength": emission_strength,
             "transmission": transmission, "ior": ior,

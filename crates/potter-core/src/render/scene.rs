@@ -160,7 +160,19 @@ pub(super) fn extract_geometry(
         &mut visible_nodes,
     );
 
-    let mut materials = vec![Material::default()];
+    // Workbench's Solid shades faces with no material as Blender's empty default material:
+    // colour 0.8, roughness 0.4, metallic 0 (`DNA_material_types.h`; `BKE_material_default_empty`
+    // via `workbench_engine.cc` `get_material`). Beauty keeps Potter's default material.
+    let default_surface = if matches!(mode, Mode::Solid) {
+        Material {
+            base_color: [0.8, 0.8, 0.8, 1.0],
+            roughness: 0.4,
+            ..Material::default()
+        }
+    } else {
+        Material::default()
+    };
+    let mut materials = vec![default_surface];
     let mut prepared = vec![PreparedMaterial::default()];
     let mut material_indices =
         std::collections::BTreeMap::<(Id, Option<usize>, Option<Arc<[u64]>>), usize>::new();

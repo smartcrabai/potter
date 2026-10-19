@@ -8327,6 +8327,50 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
             )),
         }
     }
+    // Workbench's Solid colours a material from its viewport display colour, roughness and metallic
+    // (`workbench_engine.cc` `get_material`), but Potter's Solid shades with the material's own
+    // values. A material whose viewport values differ is reported, not silently dropped.
+    for material in raw
+        .get("materials")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let viewport = &material["viewport_display"];
+        let colour: Vec<f64> = viewport["diffuse_color"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .take(3)
+            .filter_map(Value::as_f64)
+            .collect();
+        let base: Vec<f64> = material["base_color"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .take(3)
+            .filter_map(Value::as_f64)
+            .collect();
+        let same = |a: &Value, b: &Value| match (a.as_f64(), b.as_f64()) {
+            (Some(a), Some(b)) => (a - b).abs() <= 1.0e-6,
+            _ => false,
+        };
+        let colour_differs = colour.len() != 3
+            || base.len() != 3
+            || colour
+                .iter()
+                .zip(&base)
+                .any(|(a, b)| (a - b).abs() > 1.0e-6);
+        let values_differ = !same(&viewport["roughness"], &material["roughness"])
+            || !same(&viewport["metallic"], &material["metallic"]);
+        if colour_differs || values_differ {
+            losses.push(loss(
+                "blender.material.viewport_display",
+                material.get("name").and_then(Value::as_str),
+                "Blender's viewport display colour, roughness or metallic differs from the material's values; Potter's Solid preview shades with the material's values",
+            ));
+        }
+    }
     // Workbench's viewport shading changes what its render draws. Potter's solid preview models the
     // factory studio light with material colours, and none of the other options below.
     for scene in raw

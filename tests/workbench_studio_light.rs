@@ -169,6 +169,16 @@ fn solid_preview_lights_surfaces_as_workbench_studio_lighting_does() -> TestResu
         ]),
     )?;
     assert_eq!(applied["ok"], json!(true), "scene apply failed: {applied}");
+    // The Solid background is the world's horizon colour: the oracle's linear value of sRGB 242.
+    let world = apply_operations(
+        &scene,
+        root.path(),
+        json!([
+            {"op": "world.create", "id": "world_main", "color": [0.887923, 0.887923, 0.887923]},
+            {"op": "scene.update", "target": {"id": "scene_main"}, "set": {"world": "world_main"}}
+        ]),
+    )?;
+    assert_eq!(world["ok"], json!(true), "world apply failed: {world}");
 
     for camera in ["perspective", "orthographic"] {
         let out = root.path().join(format!("preview-{camera}"));
