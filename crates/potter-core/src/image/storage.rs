@@ -1180,84 +1180,122 @@ fn exr_channel_id(name: &str) -> Option<char> {
     })
 }
 
+/// Blender's `RE_PASSNAME_*` tokens and their `SCE_PASS_*` bits, in `passtype_from_name` order
+/// (`render_result.cc`, `DNA_scene_enums.h`). The first token that starts the pass name gives its type.
+const BLENDER_PASS_TYPES: &[(&str, u32)] = &[
+    ("Combined", 1 << 0),
+    ("Depth", 1 << 1),
+    ("Vector", 1 << 9),
+    ("Normal", 1 << 8),
+    ("UV", 1 << 12),
+    ("Emission", 1 << 16),
+    ("Shadow", 1 << 5),
+    ("Ambient Occlusion", 1 << 6),
+    ("Environment", 1 << 17),
+    ("Object Index", 1 << 11),
+    ("Material Index", 1 << 18),
+    ("Mist", 1 << 14),
+    ("Diffuse Direct", 1 << 19),
+    ("Diffuse Indirect", 1 << 20),
+    ("Diffuse Color", 1 << 21),
+    ("Glossy Direct", 1 << 22),
+    ("Glossy Indirect", 1 << 23),
+    ("Glossy Color", 1 << 24),
+    ("Transmission Direct", 1 << 25),
+    ("Transmission Indirect", 1 << 26),
+    ("Transmission Color", 1 << 27),
+    ("Subsurface Direct", 1 << 28),
+    ("Subsurface Indirect", 1 << 29),
+    ("Subsurface Color", 1 << 30),
+];
+
+/// Blender's `passtype_from_name`: the type of the first token of `name` that its `RE_PASSNAME_*`
+/// starts with, where an empty token matches the first entry (`STREQLEN` with length 0).
+fn blender_pass_type(name: &str) -> u32 {
+    let token = name.split('.').next().unwrap_or_default();
+    BLENDER_PASS_TYPES
+        .iter()
+        .find(|(pass, _)| pass.as_bytes().starts_with(token.as_bytes()))
+        .map_or(0, |(_, bit)| *bit)
+}
+
+/// Blender's `order_render_passes` (`render_result.cc`): whether `left` sorts after `right`.
+/// Typed passes come before untyped ones, typed passes sort by type, untyped passes by name, and
+/// equal passes put the left view first, then the right view, then by view id.
+fn exr_pass_sorts_after(left: &ExrSelectionPass<'_>, right: &ExrSelectionPass<'_>) -> bool {
+    let left_type = blender_pass_type(&left.name);
+    let right_type = blender_pass_type(&right.name);
+    if right_type != 0 && left_type == 0 {
+        return true;
+    }
+    if left_type != 0 && right_type == 0 {
+        return false;
+    }
+    if left_type != 0 && right_type != 0 {
+        if left_type != right_type {
+            return left_type > right_type;
+        }
+    } else if left.name != right.name {
+        return left.name > right.name;
+    }
+    if left.view == "left" {
+        return false;
+    }
+    if right.view == "left" {
+        return true;
+    }
+    if left.view == "right" {
+        return false;
+    }
+    if right.view == "right" {
+        return true;
+    }
+    left.view_id < right.view_id
+}
+
 fn compare_exr_passes(
     left: &ExrSelectionPass<'_>,
     right: &ExrSelectionPass<'_>,
 ) -> std::cmp::Ordering {
-    const PASS_ORDER: &[&str] = &[
-        "Combined",
-        "Depth",
-        "Shadow",
-        "Ambient Occlusion",
-        "Normal",
-        "Vector",
-        "Object Index",
-        "UV",
-        "Mist",
-        "Emission",
-        "Environment",
-        "Material Index",
-        "Diffuse Direct",
-        "Diffuse Indirect",
-        "Diffuse Color",
-        "Glossy Direct",
-        "Glossy Indirect",
-        "Glossy Color",
-        "Transmission Direct",
-        "Transmission Indirect",
-        "Transmission Color",
-        "Subsurface Direct",
-        "Subsurface Indirect",
-        "Subsurface Color",
-    ];
-    let left_order = PASS_ORDER
-        .iter()
-        .position(|name| *name == left.name.as_str());
-    let right_order = PASS_ORDER
-        .iter()
-        .position(|name| *name == right.name.as_str());
-    let pass_order = match (left_order, right_order) {
-        (Some(left), Some(right)) => left.cmp(&right),
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => left.name.cmp(&right.name),
-    };
-    if pass_order != std::cmp::Ordering::Equal {
-        return pass_order;
+    if exr_pass_sorts_after(left, right) {
+        std::cmp::Ordering::Greater
+    } else if exr_pass_sorts_after(right, left) {
+        std::cmp::Ordering::Less
+    } else {
+        std::cmp::Ordering::Equal
     }
-    if left.view == "left" && right.view != "left" {
-        return std::cmp::Ordering::Less;
-    }
-    if right.view == "left" && left.view != "left" {
-        return std::cmp::Ordering::Greater;
-    }
-    if left.view == "right" && right.view != "right" {
-        return std::cmp::Ordering::Less;
-    }
-    if right.view == "right" && left.view != "right" {
-        return std::cmp::Ordering::Greater;
-    }
-    left.view_id.cmp(&right.view_id)
 }
 
+/// Blender's `BKE_image_multilayer_index` with `image_render_pass_get` (`imbuf` `image.cc`). The
+/// layer is taken by index and the pass by its index in that layer. A view other than 0 takes the
+/// next pass after the requested one that has the same name and view. A pass that is not found
+/// falls back to the layer's first pass. A layer index beyond the layers has no pass.
 fn select_exr_render_pass<'layers, 'image>(
     layers: &'layers [ExrSelectionLayer<'image>],
     selection: ImageUserSelection,
 ) -> Option<&'layers ExrSelectionPass<'image>> {
     let layer = layers.get(usize::from(selection.layer))?;
-    let pass = layer
-        .passes
-        .get(usize::from(selection.pass))
-        .or_else(|| layer.passes.first())?;
-    if selection.view == 0 {
-        return Some(pass);
+    let requested = usize::from(selection.pass);
+    let view = usize::from(selection.view);
+    let mut found = None;
+    let mut requested_name: Option<&str> = None;
+    for (index, candidate) in layer.passes.iter().enumerate() {
+        if index == requested {
+            found = Some(index);
+            if view == 0 {
+                break;
+            }
+            requested_name = Some(candidate.name.as_str());
+        } else if let Some(name) = requested_name.filter(|name| !name.is_empty())
+            && candidate.name == name
+            && candidate.view_id == view
+        {
+            found = Some(index);
+            break;
+        }
     }
-    layer
-        .passes
-        .iter()
-        .find(|candidate| {
-            candidate.name == pass.name && candidate.view_id == usize::from(selection.view)
-        })
+    found
+        .map(|index| &layer.passes[index])
         .or_else(|| layer.passes.first())
 }
 
