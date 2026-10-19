@@ -661,6 +661,10 @@ pub(crate) static GGX_GEN_SCHLICK_IOR_S: [f32; 4096] = [
     0.000_000, 0.000_000, 0.000_000, 0.000_000, 0.000_000, 0.000_000, 0.000_000, 0.000_000,
 ];
 
+#[expect(
+    clippy::approx_constant,
+    reason = "Cycles' sheen table holds ln 2 as 0.69314 verbatim"
+)]
 #[rustfmt::skip]
 pub(crate) static SHEEN_LTC: [f32; 3072] = [
     0.014_15, 0.000_00, 0.000_00, 0.000_00, 0.000_00, 0.000_00, 0.000_00, 0.000_00, 0.000_00,
