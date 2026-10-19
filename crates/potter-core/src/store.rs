@@ -880,6 +880,7 @@ mod tests {
                     width: 1,
                     height: 1,
                     blob: Some(digest.clone()),
+                    label: String::new(),
                 }],
             )),
         );

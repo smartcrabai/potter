@@ -639,6 +639,7 @@ fn texture(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bo
                     width: tile.width,
                     height: tile.height,
                     blob: Some(blob),
+                    label: String::new(),
                 });
                 updated.tiles.sort_by_key(|entry| entry.number);
             }

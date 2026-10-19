@@ -438,6 +438,7 @@ fn set_pixels(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result
                 width: tile.width,
                 height: tile.height,
                 blob: Some(blob),
+                label: String::new(),
             });
             updated.tiles.sort_by_key(|tile| tile.number);
         }

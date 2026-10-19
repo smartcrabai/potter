@@ -873,7 +873,7 @@ fn udim_export_tiles(
         return Ok(json!({"format": "placeholder", "tiles": []}));
     }
     let all_png = sources.iter().all(|source| source.4.is_some());
-    let tiles = sources
+    let mut tiles = sources
         .into_iter()
         .map(|(number, width, height, pixels, png)| match png {
             Some(bytes) if all_png => {
@@ -887,6 +887,19 @@ fn udim_export_tiles(
             }),
         })
         .collect::<Vec<_>>();
+    // A tile's label goes with its record. The base tile has no record, so it carries no label.
+    for tile_json in &mut tiles {
+        let number = tile_json["number"].as_u64();
+        let label = image
+            .tiles
+            .iter()
+            .find(|tile| Some(u64::from(tile.number)) == number)
+            .map(|tile| tile.label.as_str())
+            .filter(|label| !label.is_empty());
+        if let Some(label) = label {
+            tile_json["label"] = json!(label);
+        }
+    }
     Ok(json!({"format": if all_png { "png" } else { "exr" }, "tiles": tiles}))
 }
 
@@ -3179,6 +3192,7 @@ fn imported_image_tiles(
         if number <= 1001 {
             continue;
         }
+        let label = tile_label(item, number);
         let Some((hash, bytes)) = tile_source(name, number, resource_ids, resource_assets, doc)?
         else {
             tiles.push(ImageTile {
@@ -3186,6 +3200,7 @@ fn imported_image_tiles(
                 width: 0,
                 height: 0,
                 blob: None,
+                label,
             });
             continue;
         };
@@ -3196,9 +3211,19 @@ fn imported_image_tiles(
             width,
             height,
             blob: Some(hash.to_owned()),
+            label,
         });
     }
     Ok(tiles)
+}
+
+/// The label Blender gives a UDIM tile, from the bridge's `tile_labels`; empty when the tile has none.
+fn tile_label(item: &Value, number: u32) -> String {
+    item.get("tile_labels")
+        .and_then(|labels| labels.get(number.to_string()))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
 }
 
 /// The content hash and bytes of one imported UDIM tile (see `resource_source`).

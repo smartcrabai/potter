@@ -2079,6 +2079,9 @@ pub struct ImageTile {
     /// no size or pixels and samples as Blender's missing colour.
     #[serde(default)]
     pub blob: Option<String>,
+    /// Blender's tile label, carried through import and export. Omitted when empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub label: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

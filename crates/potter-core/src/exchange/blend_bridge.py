@@ -519,6 +519,13 @@ def _tile_numbers(image):
         return []
     return sorted(tile.number for tile in image.tiles)
 
+def _tile_labels(image):
+    # The labels a TILED image's tiles carry, keyed by tile number as a string. Blender labels every loaded tile with its
+    # number, so only a label that differs from that default is kept.
+    if image.source != "TILED":
+        return {}
+    return {str(tile.number): tile.label for tile in image.tiles if tile.label != str(tile.number)}
+
 
 def _image_alpha_mode(image):
     # Blender's alpha mode under the names the .blend importer reads. CHANNEL_PACKED holds straight colour.
@@ -545,7 +552,8 @@ def images_dump():
         result.append({"name": image.name_full, "potter_id": image.get("potter.id"),
                        "library": library_reference(image), "filepath": filepath,
                        "source": image.source, "colorspace": colorspace,
-                       "tile_numbers": _tile_numbers(image), "alpha_mode": _image_alpha_mode(image),
+                       "tile_numbers": _tile_numbers(image), "tile_labels": _tile_labels(image),
+                       "alpha_mode": _image_alpha_mode(image),
                        "potter_image": image_model})
     return result
 
@@ -6046,6 +6054,10 @@ def _pack_udim_image(colorspace, udim, record_alpha_mode):
         image.source = "TILED"
         image.filepath = os.path.join(directory, "tile.<UDIM>.%s" % extension)
         image.reload()
+        labels = {int(tile["number"]): tile["label"] for tile in udim["tiles"] if tile.get("label")}
+        for tile in image.tiles:
+            if tile.number in labels:
+                tile.label = labels[tile.number]
         if extension == "exr":
             image.alpha_mode = {"straight": "STRAIGHT", "premultiplied": "PREMUL", "none": "NONE"}[
                 record_alpha_mode]

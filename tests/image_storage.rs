@@ -75,6 +75,7 @@ fn packed_staged_and_udim_blobs_load_by_verified_content_hash() -> Result<(), Bo
         width: 1,
         height: 1,
         blob: Some(tile_blob),
+        label: String::new(),
     });
     let loaded = load_image_data(&packed, root, ImageInterpolation::Linear)?;
     assert_eq!(loaded.pixels, base_pixels);
