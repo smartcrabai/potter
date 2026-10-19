@@ -127,8 +127,10 @@ fn realtime_beauty_culls_single_sided_back_faces_as_eevee_does() -> TestResult {
         command.arg("init").arg(&scene);
     })?;
     // Diffuse white, single-sided (`double_sided` defaults to false), matching EEVEE's
-    // `use_backface_culling` on. A sun above the plane (identity rotation shines down -Z, as
-    // Blender's sun does) lights the front face, so coverage measures shading, not emission.
+    // `use_backface_culling` on. Quaternions are [x,y,z,w] (spec.md), so identity is [0,0,0,1]
+    // and [1,0,0,0] is a 180° turn about X. A sun above the plane (identity, shining down -Z, as
+    // Blender's sun does) lights the front face; the top camera looks down at it, and the bottom
+    // camera (turned about X, at z=-5) looks up at its back face.
     let applied = apply_operations(
         &scene,
         root.path(),
@@ -138,13 +140,13 @@ fn realtime_beauty_culls_single_sided_back_faces_as_eevee_does() -> TestResult {
             {"op": "node.create", "id": "plane", "kind": "plane", "params": {"size": 2.0},
              "material": "single"},
             {"op": "light.create", "id": "sun", "light_type": "sun", "energy": 3.0,
-             "transform": {"translation": [0.0, 0.0, 5.0], "rotation": [1.0, 0.0, 0.0, 0.0]}},
+             "transform": {"translation": [0.0, 0.0, 5.0], "rotation": [0.0, 0.0, 0.0, 1.0]}},
             {"op": "camera.create", "id": "camera_top", "projection": "orthographic",
              "ortho_scale": 2.2, "transform": {"translation": [0.0, 0.0, 5.0],
-             "rotation": [1.0, 0.0, 0.0, 0.0]}},
+             "rotation": [0.0, 0.0, 0.0, 1.0]}},
             {"op": "camera.create", "id": "camera_bottom", "projection": "orthographic",
              "ortho_scale": 2.2, "transform": {"translation": [0.0, 0.0, -5.0],
-             "rotation": [0.0, 1.0, 0.0, 0.0]}},
+             "rotation": [1.0, 0.0, 0.0, 0.0]}},
             {"op": "scene.update", "target": {"id": "scene_main"}, "set": {"camera": "camera_top"}},
             {"op": "render.update", "target": {"id": "scene_main"},
              "set": {"resolution_x": 64, "resolution_y": 64, "resolution_percentage": 100}}
