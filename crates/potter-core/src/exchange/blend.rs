@@ -8248,63 +8248,59 @@ fn object_properties(item: &Value) -> Map<String, Value> {
     props
 }
 
-/// Imports a Blender camera's projection and panorama settings into `camera`. Blender's equirectangular and fisheye
-/// panoramas (equidistant and equisolid) import as Potter's panoramas with their limits. The other Blender panorama types
-/// have no Potter projection and leave the camera perspective, which `import_losses` reports. A limit Potter cannot hold
-/// keeps its default there, and `import_losses` reports it.
-fn imported_camera_projection(item: &Value, camera: &mut CameraData) {
-    match item.get("type").and_then(Value::as_str) {
-        Some("ORTHO") => camera.projection = CameraProjection::Orthographic,
-        Some("PANO") => match item.get("panorama_type").and_then(Value::as_str) {
-            None | Some("EQUIRECTANGULAR") => {
-                camera.projection = CameraProjection::Panorama;
-                "equirectangular".clone_into(&mut camera.panorama_type);
-                if let Some([longitude_min, longitude_max, latitude_min, latitude_max]) =
-                    imported_panorama_range(item)
-                {
-                    camera.longitude_min = longitude_min;
-                    camera.longitude_max = longitude_max;
-                    camera.latitude_min = latitude_min;
-                    camera.latitude_max = latitude_max;
-                }
-            }
-            Some("FISHEYE_EQUIDISTANT") => {
-                camera.projection = CameraProjection::Panorama;
-                "fisheye_equidistant".clone_into(&mut camera.panorama_type);
-                if let Some(fov) = imported_fisheye_fov(item) {
-                    camera.fisheye_fov = fov;
-                }
-            }
-            Some("FISHEYE_EQUISOLID") => {
-                camera.projection = CameraProjection::Panorama;
-                "fisheye_equisolid".clone_into(&mut camera.panorama_type);
-                // Blender's equisolid lens is `fisheye_lens`; its `lens` is the perspective focal length.
-                camera.lens_mm = number_field(item, "fisheye_lens", 10.5);
-                if let Some(fov) = imported_fisheye_fov(item) {
-                    camera.fisheye_fov = fov;
-                }
-            }
-            // The other panorama types have no Potter projection, so the camera stays perspective.
-            Some(_) => {}
-        },
-        _ => {}
+/// Blender's panorama type as Potter's `panorama_type`, when Potter has a projection for it. Blender's other panorama types
+/// (mirror ball, equiangular cubemap, and the rest) have none.
+fn imported_panorama_type(item: &Value) -> Option<&'static str> {
+    match item.get("panorama_type").and_then(Value::as_str) {
+        None | Some("EQUIRECTANGULAR") => Some("equirectangular"),
+        Some("FISHEYE_EQUIDISTANT") => Some("fisheye_equidistant"),
+        Some("FISHEYE_EQUISOLID") => Some("fisheye_equisolid"),
+        Some(_) => None,
     }
 }
 
-/// Blender's equirectangular limits `[longitude_min, longitude_max, latitude_min, latitude_max]`, when Potter's camera
-/// can hold them: each a finite number, the longitudes increasing across at most a turn, and the latitudes increasing
-/// within ±π/2.
+/// Imports a Blender camera's type and the panorama settings Blender stores on every camera. The camera type picks the
+/// projection, and a PANO camera of a panorama type Potter has no projection for stays perspective. Each setting is kept
+/// whatever the projection, so it round-trips; a value Potter cannot hold keeps its default, and `import_losses` reports it.
+fn imported_camera_projection(item: &Value, camera: &mut CameraData) {
+    let panorama = imported_panorama_type(item);
+    camera.projection = match item.get("type").and_then(Value::as_str) {
+        Some("ORTHO") => CameraProjection::Orthographic,
+        Some("PANO") if panorama.is_some() => CameraProjection::Panorama,
+        _ => CameraProjection::Perspective,
+    };
+    if let Some(panorama) = panorama {
+        panorama.clone_into(&mut camera.panorama_type);
+    }
+    if let Some([longitude_min, longitude_max, latitude_min, latitude_max]) =
+        imported_panorama_range(item)
+    {
+        camera.longitude_min = longitude_min;
+        camera.longitude_max = longitude_max;
+        camera.latitude_min = latitude_min;
+        camera.latitude_max = latitude_max;
+    }
+    if let Some(fov) = imported_fisheye_fov(item) {
+        camera.fisheye_fov = fov;
+    }
+    if let Some(lens) = imported_fisheye_lens(item) {
+        camera.fisheye_lens = lens;
+    }
+}
+
+/// Blender's equirectangular limits `[longitude_min, longitude_max, latitude_min, latitude_max]`, when Potter's camera can
+/// hold them: each a finite number, the longitudes increasing across at most a turn, and the latitudes increasing within
+/// ±π/2. A key Blender's dump omits is Blender's default.
 fn imported_panorama_range(item: &Value) -> Option<[f64; 4]> {
-    let limit = |key: &str| {
-        item.get(key)
-            .and_then(Value::as_f64)
-            .filter(|value| value.is_finite())
+    let limit = |key: &str, default: f64| match item.get(key) {
+        None => Some(default),
+        Some(value) => value.as_f64().filter(|value| value.is_finite()),
     };
     let range = [
-        limit("longitude_min")?,
-        limit("longitude_max")?,
-        limit("latitude_min")?,
-        limit("latitude_max")?,
+        limit("longitude_min", -crate::model::BLENDER_PI)?,
+        limit("longitude_max", crate::model::BLENDER_PI)?,
+        limit("latitude_min", -crate::model::BLENDER_RIGHT_ANGLE)?,
+        limit("latitude_max", crate::model::BLENDER_RIGHT_ANGLE)?,
     ];
     let [longitude_min, longitude_max, latitude_min, latitude_max] = range;
     (longitude_max > longitude_min
@@ -8315,54 +8311,70 @@ fn imported_panorama_range(item: &Value) -> Option<[f64; 4]> {
         .then_some(range)
 }
 
-/// Blender's fisheye field of view, when Potter's fisheye cameras hold it: at least Blender's lower limit, and at most a turn.
+/// Blender's fisheye field of view, when Potter holds it: within Blender's hard range, 10 degrees to 10π. Absent is π.
 fn imported_fisheye_fov(item: &Value) -> Option<f64> {
-    item.get("fisheye_fov")
-        .and_then(Value::as_f64)
-        .filter(|fov| *fov >= crate::model::FISHEYE_FOV_MIN && *fov <= crate::model::BLENDER_TURN)
+    match item.get("fisheye_fov") {
+        None => Some(crate::model::BLENDER_PI),
+        Some(value) => value.as_f64().filter(|fov| {
+            (crate::model::FISHEYE_FOV_MIN..=crate::model::FISHEYE_FOV_MAX).contains(fov)
+        }),
+    }
+}
+
+/// Blender's `fisheye_lens` in millimetres, when Potter holds it: within Blender's hard range, 0.01 to 100. Absent is 10.5.
+fn imported_fisheye_lens(item: &Value) -> Option<f64> {
+    match item.get("fisheye_lens") {
+        None => Some(10.5),
+        Some(value) => value.as_f64().filter(|lens| {
+            (crate::model::FISHEYE_LENS_MIN..=crate::model::FISHEYE_LENS_MAX).contains(lens)
+        }),
+    }
 }
 
 fn import_losses(raw: &Value) -> Vec<Loss> {
     let mut losses = Vec::new();
-    // Blender panorama settings that Potter cannot represent are reported, so the import never changes a camera silently.
+    // Blender stores every panorama setting on every camera, so a value Potter cannot hold is reported whatever the camera's
+    // type: the import never changes a camera silently.
     for camera in raw
         .get("cameras")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter(|camera| camera.get("type").and_then(Value::as_str) == Some("PANO"))
     {
         let name = camera.get("name").and_then(Value::as_str);
-        match camera
-            .get("panorama_type")
-            .and_then(Value::as_str)
-            .unwrap_or("EQUIRECTANGULAR")
-        {
-            "EQUIRECTANGULAR" => {
-                if imported_panorama_range(camera).is_none() {
-                    losses.push(loss(
-                        "blender.camera.panorama_range",
-                        name,
-                        "Blender's equirectangular longitude and latitude limits are not representable in Potter (the longitudes must increase across at most a turn, and the latitudes must increase within ±π/2); the camera imports with the full sphere",
-                    ));
-                }
-            }
-            "FISHEYE_EQUIDISTANT" | "FISHEYE_EQUISOLID" => {
-                if imported_fisheye_fov(camera).is_none() {
-                    losses.push(loss(
-                        "blender.camera.fisheye_fov",
-                        name,
-                        "Blender's fisheye field of view is outside the 10 to 360 degree range that Potter's fisheye cameras hold; the camera imports at 180 degrees",
-                    ));
-                }
-            }
-            other => losses.push(loss(
+        if imported_panorama_type(camera).is_none() {
+            let other = camera
+                .get("panorama_type")
+                .and_then(Value::as_str)
+                .unwrap_or("EQUIRECTANGULAR");
+            losses.push(loss(
                 "blender.camera.panorama_type",
                 name,
                 &format!(
-                    "Blender's {other} panorama has no Potter projection; the camera imports as a perspective camera"
+                    "Blender's {other} panorama type has no Potter projection, so the camera's panorama type is not kept; a PANO camera of that type imports as a perspective camera"
                 ),
-            )),
+            ));
+        }
+        if imported_panorama_range(camera).is_none() {
+            losses.push(loss(
+                "blender.camera.panorama_range",
+                name,
+                "Blender's equirectangular longitude and latitude limits are not representable in Potter (the longitudes must increase across at most a turn, and the latitudes must increase within ±π/2); the camera keeps the full sphere",
+            ));
+        }
+        if imported_fisheye_fov(camera).is_none() {
+            losses.push(loss(
+                "blender.camera.fisheye_fov",
+                name,
+                "Blender's fisheye field of view is outside the 10 degree to 10π range that Potter's fisheye cameras hold; the camera keeps 180 degrees",
+            ));
+        }
+        if imported_fisheye_lens(camera).is_none() {
+            losses.push(loss(
+                "blender.camera.fisheye_lens",
+                name,
+                "Blender's fisheye lens is outside the 0.01 to 100 mm range that Potter holds; the camera keeps 10.5 mm",
+            ));
         }
     }
     // Workbench draws back faces unless the scene's viewport shading culls them; Potter's raster has no such setting.
@@ -17506,16 +17518,44 @@ mod camera_import_tests {
         let data = imported(&camera);
         assert_eq!(data.projection, CameraProjection::Panorama);
         assert_eq!(data.panorama_type, "fisheye_equisolid");
-        assert!((data.lens_mm - 12.0).abs() <= 1.0e-12);
+        // Blender's `fisheye_lens` is its own setting: the perspective `lens_mm` is not touched by the import.
+        assert!((data.fisheye_lens - 12.0).abs() <= 1.0e-12);
+        assert_eq!(data.lens_mm, CameraData::default().lens_mm);
         assert_eq!(features(&camera), Vec::<String>::new());
     }
 
     #[test]
-    fn fisheye_fields_of_view_potter_cannot_hold_report_a_loss() {
-        let beyond_turn = json!({"name": "pano", "type": "PANO", "panorama_type": "FISHEYE_EQUIDISTANT", "fisheye_fov": 7.0 * PI});
-        assert_eq!(features(&beyond_turn), ["blender.camera.fisheye_fov"]);
+    fn fisheye_fields_of_view_are_held_across_blenders_range_and_reported_beyond_it() {
+        // Blender's hard range tops out at 10π in float32, which is a little below the f64 value of 10π, so the test uses the
+        // constant itself: that maximum is held, and a value beyond it is reported.
+        let wide = json!({"name": "pano", "type": "PANO", "panorama_type": "FISHEYE_EQUIDISTANT", "fisheye_fov": crate::model::FISHEYE_FOV_MAX});
+        assert!((imported(&wide).fisheye_fov - crate::model::FISHEYE_FOV_MAX).abs() <= 1.0e-12);
+        assert_eq!(features(&wide), Vec::<String>::new());
+        let beyond_range = json!({"name": "pano", "type": "PANO", "panorama_type": "FISHEYE_EQUIDISTANT", "fisheye_fov": 11.0 * PI});
+        assert_eq!(features(&beyond_range), ["blender.camera.fisheye_fov"]);
         let too_narrow = json!({"name": "pano", "type": "PANO", "panorama_type": "FISHEYE_EQUISOLID", "fisheye_fov": 0.1});
         assert_eq!(features(&too_narrow), ["blender.camera.fisheye_fov"]);
+    }
+
+    #[test]
+    fn fisheye_lens_outside_blenders_range_is_reported() {
+        let beyond = json!({"name": "pano", "type": "PANO", "panorama_type": "FISHEYE_EQUISOLID", "fisheye_lens": 150.0});
+        assert_eq!(features(&beyond), ["blender.camera.fisheye_lens"]);
+    }
+
+    #[test]
+    fn settings_a_camera_ignores_are_still_kept_and_reported_only_when_unrepresentable() {
+        // A perspective camera stores the panorama settings Blender holds on it, so they round-trip with no loss.
+        let perspective = json!({"name": "cam", "type": "PERSP", "panorama_type": "FISHEYE_EQUISOLID",
+            "fisheye_lens": 12.0, "fisheye_fov": 3.0, "longitude_min": -1.2, "longitude_max": 2.0,
+            "latitude_min": -0.7, "latitude_max": 1.1});
+        let data = imported(&perspective);
+        assert_eq!(data.projection, CameraProjection::Perspective);
+        assert_eq!(data.panorama_type, "fisheye_equisolid");
+        assert!((data.fisheye_lens - 12.0).abs() <= 1.0e-12);
+        assert!((data.fisheye_fov - 3.0).abs() <= 1.0e-12);
+        assert!((data.longitude_min + 1.2).abs() <= 1.0e-12);
+        assert_eq!(features(&perspective), Vec::<String>::new());
     }
 
     #[test]
