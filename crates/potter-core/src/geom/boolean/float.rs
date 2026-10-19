@@ -3326,6 +3326,7 @@ fn split_faces(state: &mut State) {
             &positions,
             normal,
             &mesh_faces,
+            &state.disk,
         );
         if split.faces.is_empty() {
             dangling.extend(edge_net.iter().map(|&(a, b)| edge_key_usize(a, b)));

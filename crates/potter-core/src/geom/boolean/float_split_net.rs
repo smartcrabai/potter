@@ -19,11 +19,11 @@
 //! - `edge_net`: undirected vertex pairs. Blender's `BMEdge` orientation is never read by this routine,
 //!   only the endpoints, so no edge direction is assumed. Duplicates and pairs equal to a boundary edge
 //!   are merged, which matches Blender's flag semantics (`EDGE_NET` is idempotent).
-//! - Disk cycle order. Blender appends a new edge just before the vertex's head, so the cycle read from
-//!   the head is creation order. This port takes creation order to be the boundary edges in ring order,
-//!   then the net edges in the given order, and starts each vertex's head at its first edge. Disk order
-//!   decides LIFO pops in the pair search and sort ties in the walk. Callers that know the mesh's real
-//!   creation order should pass lists in that order.
+//! - Disk cycle order. `disk_order[v]` lists the mesh's edges at global vertex `v` as undirected pairs,
+//!   oldest first: the `BMesh` disk read from its head (`State::disk` in `float.rs`). Each vertex's cycle
+//!   follows that order, its head starts at the oldest edge, and the order decides LIFO pops in the pair
+//!   search and sort ties in the walk. A graph edge the order does not name follows the named ones, in
+//!   table order, so an empty order gives table order everywhere.
 //!
 //! # Output
 //! [`SplitNetResult::faces`] lists the emitted faces in Blender's creation order. Each ring starts at the
@@ -116,12 +116,14 @@ pub(crate) struct SplitNetResult {
 /// `mesh_faces` must not repeat the face being split. Its rings matter only for `BM_edge_is_wire` and
 /// `BM_face_exists`, so they decide whether an identical face already present is kept rather than
 /// duplicated.
+/// `disk_order` gives each vertex's mesh edges oldest first (module doc, "Disk cycle order").
 pub(crate) fn face_split_edgenet_with_mesh(
     boundary: &[usize],
     edge_net: &[(usize, usize)],
     positions: &[P3],
     face_normal: P3,
     mesh_faces: &[Vec<usize>],
+    disk_order: &[Vec<(usize, usize)>],
 ) -> SplitNetResult {
     // Blender returns before touching the face when the net is empty.
     let Some(&first) = boundary.first() else {
@@ -131,7 +133,14 @@ pub(crate) fn face_split_edgenet_with_mesh(
         return SplitNetResult::default();
     }
 
-    let mut net = Net::new(boundary, edge_net, positions, face_normal, mesh_faces);
+    let mut net = Net::new(
+        boundary,
+        edge_net,
+        positions,
+        face_normal,
+        mesh_faces,
+        disk_order,
+    );
     let start = net.local_of[&first];
     net.in_queue[start] = true;
     let mut queue = vec![start];
@@ -272,6 +281,7 @@ impl Net {
         positions: &[P3],
         normal: P3,
         mesh_faces: &[Vec<usize>],
+        disk_order: &[Vec<(usize, usize)>],
     ) -> Self {
         let n = boundary.len();
         let mut ids: Vec<usize> = boundary
@@ -316,14 +326,31 @@ impl Net {
             .map(|&(a, b)| [local_of[&a], local_of[&b]])
             .collect();
 
-        // Disk cycles in creation order; the head starts at each vertex's first edge.
+        // Disk cycles in the caller's order, oldest edge first; the head starts at the first. A graph
+        // edge that `disk_order` does not name follows the named ones, in table order.
         let mut disk: Vec<Vec<usize>> = vec![Vec::new(); ids.len()];
-        let mut slot_pos = vec![[0usize; 2]; m];
         for (e, &[a, b]) in ends.iter().enumerate() {
-            slot_pos[e][0] = disk[a].len();
             disk[a].push(e);
-            slot_pos[e][1] = disk[b].len();
             disk[b].push(e);
+        }
+        for (local, cycle) in disk.iter_mut().enumerate() {
+            let global = ids[local];
+            let order = disk_order.get(global).map_or(&[][..], Vec::as_slice);
+            cycle.sort_by_key(|&e| {
+                let (ga, gb) = table.ends[e];
+                let other = if ga == global { gb } else { ga };
+                let key = (global.min(other), global.max(other));
+                order
+                    .iter()
+                    .position(|&listed| listed == key)
+                    .unwrap_or(usize::MAX)
+            });
+        }
+        let mut slot_pos = vec![[0usize; 2]; m];
+        for (v, cycle) in disk.iter().enumerate() {
+            for (k, &e) in cycle.iter().enumerate() {
+                slot_pos[e][usize::from(ends[e][0] != v)] = k;
+            }
         }
         let head = vec![0; ids.len()];
 
@@ -758,7 +785,7 @@ mod tests {
 
     #[test]
     fn split_net_diagonal_makes_two_triangles() {
-        let result = face_split_edgenet_with_mesh(&BOUNDARY, &[(0, 2)], &POINTS, UP, &[]);
+        let result = face_split_edgenet_with_mesh(&BOUNDARY, &[(0, 2)], &POINTS, UP, &[], &[]);
         assert_eq!(result.faces, vec![vec![0, 2, 3], vec![2, 0, 1]]);
         assert_eq!(result.dangling, Vec::<(usize, usize)>::new());
     }
@@ -767,7 +794,7 @@ mod tests {
     fn split_net_interior_spur_keeps_face_and_dangles() {
         // The spur leaves the search at corner 0 with only a two-vertex loop, so Blender emits nothing
         // and the original square stays. The spur has no loop and is reported as dangling.
-        let result = face_split_edgenet_with_mesh(&BOUNDARY, &[(0, 4)], &POINTS, UP, &[]);
+        let result = face_split_edgenet_with_mesh(&BOUNDARY, &[(0, 4)], &POINTS, UP, &[], &[]);
         assert_eq!(result.faces, Vec::<Vec<usize>>::new());
         assert_eq!(result.dangling, vec![(0, 4)]);
     }
@@ -775,7 +802,7 @@ mod tests {
     #[test]
     fn split_net_cross_makes_four_triangles() {
         let net = [(0, 4), (4, 2), (1, 4), (4, 3)];
-        let result = face_split_edgenet_with_mesh(&BOUNDARY, &net, &POINTS, UP, &[]);
+        let result = face_split_edgenet_with_mesh(&BOUNDARY, &net, &POINTS, UP, &[], &[]);
         assert_eq!(
             result.faces,
             vec![vec![0, 4, 3], vec![3, 4, 2], vec![2, 4, 1], vec![1, 4, 0]]
@@ -787,14 +814,15 @@ mod tests {
     fn split_net_existing_identical_face_is_not_duplicated() {
         // The mesh already holds triangle (0, 2, 3), so Blender's `BM_face_exists` skips the loop.
         let existing = vec![vec![0, 2, 3]];
-        let result = face_split_edgenet_with_mesh(&BOUNDARY, &[(0, 2)], &POINTS, UP, &existing);
+        let result =
+            face_split_edgenet_with_mesh(&BOUNDARY, &[(0, 2)], &POINTS, UP, &existing, &[]);
         assert_eq!(result.faces, Vec::<Vec<usize>>::new());
         assert_eq!(result.dangling, vec![(0, 2)]);
     }
 
     #[test]
     fn split_net_empty_net_keeps_face() {
-        let result = face_split_edgenet_with_mesh(&BOUNDARY, &[], &POINTS, UP, &[]);
+        let result = face_split_edgenet_with_mesh(&BOUNDARY, &[], &POINTS, UP, &[], &[]);
         assert_eq!(result.faces, Vec::<Vec<usize>>::new());
         assert_eq!(result.dangling, Vec::<(usize, usize)>::new());
     }
@@ -803,7 +831,7 @@ mod tests {
     fn split_net_corner_diagonal_copies_original_loops() {
         // Every corner is a square vertex, so each copies the original face's loop at that vertex
         // (Blender `bmesh_polygon_edgenet.cc:628-635`). The faces are the diagonal test's.
-        let result = face_split_edgenet_with_mesh(&BOUNDARY, &[(0, 2)], &POINTS, UP, &[]);
+        let result = face_split_edgenet_with_mesh(&BOUNDARY, &[(0, 2)], &POINTS, UP, &[], &[]);
         assert_eq!(
             result.corner_sources,
             vec![
@@ -818,7 +846,7 @@ mod tests {
         // The centre (4) is not a boundary vertex, so its corners interpolate (`:652-665`). Each
         // triangle copies its two square corners and interpolates the centre corner.
         let net = [(0, 4), (4, 2), (1, 4), (4, 3)];
-        let result = face_split_edgenet_with_mesh(&BOUNDARY, &net, &POINTS, UP, &[]);
+        let result = face_split_edgenet_with_mesh(&BOUNDARY, &net, &POINTS, UP, &[], &[]);
         assert_eq!(result.corner_sources.len(), result.faces.len());
         for (ring, sources) in result.faces.iter().zip(&result.corner_sources) {
             assert_eq!(ring.len(), sources.len());
@@ -843,7 +871,8 @@ mod tests {
         positions[7] = [2.0, 0.0, 0.0];
         positions[2] = [2.0, 2.0, 0.0];
         positions[4] = [0.0, 2.0, 0.0];
-        let result = face_split_edgenet_with_mesh(&[5, 7, 2, 4], &[(5, 2)], &positions, UP, &[]);
+        let result =
+            face_split_edgenet_with_mesh(&[5, 7, 2, 4], &[(5, 2)], &positions, UP, &[], &[]);
         assert_eq!(result.faces, vec![vec![5, 2, 4], vec![2, 5, 7]]);
         assert_eq!(
             result.corner_sources,
@@ -857,10 +886,11 @@ mod tests {
     #[test]
     fn split_net_corner_no_split_has_no_sources() {
         // Blender keeps the original face when nothing is emitted, so there are no corners to describe.
-        let spur = face_split_edgenet_with_mesh(&BOUNDARY, &[(0, 4)], &POINTS, UP, &[]);
+        let spur = face_split_edgenet_with_mesh(&BOUNDARY, &[(0, 4)], &POINTS, UP, &[], &[]);
         let existing = vec![vec![0, 2, 3]];
-        let duplicate = face_split_edgenet_with_mesh(&BOUNDARY, &[(0, 2)], &POINTS, UP, &existing);
-        let empty = face_split_edgenet_with_mesh(&BOUNDARY, &[], &POINTS, UP, &[]);
+        let duplicate =
+            face_split_edgenet_with_mesh(&BOUNDARY, &[(0, 2)], &POINTS, UP, &existing, &[]);
+        let empty = face_split_edgenet_with_mesh(&BOUNDARY, &[], &POINTS, UP, &[], &[]);
         assert_eq!(spur.corner_sources.len(), 0);
         assert_eq!(duplicate.corner_sources.len(), 0);
         assert_eq!(empty.corner_sources.len(), 0);
