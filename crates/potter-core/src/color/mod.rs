@@ -2,7 +2,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{ErrorCode, PotError, Result};
 
+pub mod curve;
+mod looks;
 mod ocio;
+
+use looks::Look;
 
 /// Scene-to-display view transforms, matching Blender 5.2.2's OCIO views on display `sRGB`:
 /// `Standard`, `AgX` (`AgX Base Rec.1886`), `Filmic` (`Filmic sRGB`), `Raw` (`Non-Color`), and
@@ -23,11 +27,12 @@ pub enum ViewTransform {
 pub struct ColorManagement {
     pub display_device: String,
     pub view_transform: ViewTransform,
+    /// Blender look token (see `Look::parse`): `none`, or a look that applies to the view.
     pub look: String,
     pub exposure: f64,
     pub gamma: f64,
-    /// Shared RGB display curve control points `(input, output)`, sorted by input.
-    pub curve: Vec<[f64; 2]>,
+    /// Blender's view curve (`view_settings.curve_mapping`), or `None` when `use_curve_mapping` is off.
+    pub curve: Option<curve::CurveMapping>,
 }
 
 impl Default for ColorManagement {
@@ -38,28 +43,84 @@ impl Default for ColorManagement {
             look: "none".to_owned(),
             exposure: 0.0,
             gamma: 1.0,
-            curve: Vec::new(),
+            curve: None,
         }
     }
 }
 
 impl ColorManagement {
-    /// Returns the display values for scene-linear `rgb`, in Blender's order: the RGB curve on
-    /// scene-linear values (`colormanagement.cc`), exposure `2^exposure`, the view (which ends in its
-    /// sRGB encode, except `Raw`), then gamma `encoded^(1/gamma)` on the encoded value
-    /// (`libocio_display_processor.cc`), clamped to `[0, 1]`. The arithmetic is float32 and follows
-    /// OCIO's fast paths; see `ocio` for the operation order.
+    /// Returns the display values for scene-linear `rgb`, in Blender's order: the view curve, exposure
+    /// `2^exposure`, the look, the view (which ends in its sRGB encode, except `Raw` and `Filmic`), then
+    /// gamma `encoded^(1/gamma)` (`libocio_display_processor.cc`), clamped to `[0, 1]`.
     ///
-    /// Errors with [`ErrorCode::UnsupportedFeature`] for any display other than `sRGB` or any look
-    /// other than `none`, and with [`ErrorCode::InternalError`] if a vendored LUT fails to load.
+    /// Builds the curve tables on each call. Render paths encode whole images with
+    /// [`ColorManagement::display_encoder`] instead.
     pub fn display_encode(&self, rgb: [f32; 3]) -> Result<[f32; 3]> {
-        self.ensure_supported()?;
-        let curved = if self.curve.is_empty() {
-            rgb
+        self.display_encoder()?.encode(rgb)
+    }
+
+    /// Validates the settings and prepares the curve tables once, for encoding many pixels.
+    ///
+    /// Errors with [`ErrorCode::UnsupportedFeature`] for any display other than `sRGB`, and with
+    /// [`ErrorCode::InvalidArgument`] for an unknown look or a look that does not apply to the view.
+    pub fn display_encoder(&self) -> Result<DisplayEncoder> {
+        if self.display_device != "sRGB" {
+            return Err(PotError::new(
+                ErrorCode::UnsupportedFeature,
+                format!(
+                    "display device `{}` is not supported; only sRGB is implemented",
+                    self.display_device
+                ),
+            ));
+        }
+        let look = Look::parse(&self.look).ok_or_else(|| {
+            PotError::new(
+                ErrorCode::InvalidArgument,
+                format!("color look `{}` is not a Blender 5.2.2 look", self.look),
+            )
+        })?;
+        if !look.is_compatible_with(self.view_transform) {
+            return Err(PotError::new(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "color look `{}` does not apply to view `{:?}`",
+                    self.look, self.view_transform
+                ),
+            ));
+        }
+        let curve = if let Some(curve) = &self.curve {
+            curve.validate()?;
+            Some(curve.prepare())
         } else {
-            rgb.map(|value| sample_curve(f64::from(value), &self.curve) as f32)
+            None
         };
-        let encoded = ocio::display_view(self.view_transform, self.exposure, curved)?;
+        Ok(DisplayEncoder {
+            view_transform: self.view_transform,
+            look,
+            exposure: self.exposure,
+            gamma: self.gamma,
+            curve,
+        })
+    }
+}
+
+/// Display encoding with its curve tables prepared once, for encoding many pixels.
+pub struct DisplayEncoder {
+    view_transform: ViewTransform,
+    look: Look,
+    exposure: f64,
+    gamma: f64,
+    curve: Option<curve::PreparedCurve>,
+}
+
+impl DisplayEncoder {
+    /// Encodes scene-linear `rgb` for the display; see [`ColorManagement::display_encode`].
+    pub fn encode(&self, rgb: [f32; 3]) -> Result<[f32; 3]> {
+        let curved = self
+            .curve
+            .as_ref()
+            .map_or(rgb, |view_curve| view_curve.evaluate_rgb(rgb));
+        let encoded = ocio::display_view(self.view_transform, self.look, self.exposure, curved)?;
         let graded = if self.gamma.is_finite()
             && self.gamma > 0.0
             && (self.gamma - 1.0).abs() > f64::EPSILON
@@ -70,28 +131,6 @@ impl ColorManagement {
             encoded
         };
         Ok(graded.map(|value| value.clamp(0.0, 1.0)))
-    }
-
-    fn ensure_supported(&self) -> Result<()> {
-        if self.display_device != "sRGB" {
-            return Err(PotError::new(
-                ErrorCode::UnsupportedFeature,
-                format!(
-                    "display device `{}` is not supported; only sRGB is implemented",
-                    self.display_device
-                ),
-            ));
-        }
-        if !matches!(self.look.as_str(), "none" | "None") {
-            return Err(PotError::new(
-                ErrorCode::UnsupportedFeature,
-                format!(
-                    "color look `{}` is not supported; only `none` is implemented",
-                    self.look
-                ),
-            ));
-        }
-        Ok(())
     }
 }
 
@@ -538,19 +577,47 @@ mod tests {
 
     #[test]
     fn curve_is_applied_before_exposure() -> Result<(), Box<dyn Error>> {
-        // The curve maps scene-linear 0.5 to 0.25 (curve 0->0, 1->0.5); +1 stop doubles it to 0.5.
-        // Applying exposure first would give curve(1.0) = 0.5.
+        // The curve maps (0, 0.5, 1) to (0, 0.1, 1). Exposure -1 halves values. Curve first gives
+        // curve(1.0) * 0.5 = 0.5; exposure first would give curve(0.5) = 0.1.
+        let mut view_curve = curve::CurveMapping {
+            extend_extrapolate: false,
+            ..curve::CurveMapping::default()
+        };
+        view_curve.curves[3].points = [(0.0_f32, 0.0_f32), (0.5, 0.1), (1.0, 1.0)]
+            .map(|(x, y)| curve::CurvePoint {
+                location: [x, y],
+                handle: curve::HandleType::Vector,
+            })
+            .to_vec();
         let settings = ColorManagement {
             view_transform: ViewTransform::Raw,
-            exposure: 1.0,
-            curve: vec![[0.0, 0.0], [1.0, 0.5]],
+            exposure: -1.0,
+            curve: Some(view_curve),
             ..ColorManagement::default()
         };
-        let out = settings.display_encode([0.5; 3])?;
-        assert!((out[0] - 0.5).abs() < 1.0e-6, "got {out:?}");
+        let out = settings.display_encode([1.0; 3])?;
+        assert!((out[0] - 0.5).abs() < 1.0e-3, "got {out:?}");
         Ok(())
     }
 
+    #[test]
+    fn display_encoder_rejects_deserialized_malformed_curve_before_preparing()
+    -> std::result::Result<(), Box<dyn Error>> {
+        let mut value = serde_json::to_value(ColorManagement::default())?;
+        value["curve"] = serde_json::to_value(curve::CurveMapping::default())?;
+        value["curve"]["curves"][0]["points"] = serde_json::json!([{
+            "location": [0.0, 0.0],
+            "handle": "auto"
+        }]);
+        let settings: ColorManagement = serde_json::from_value(value)?;
+
+        let Err(error) = settings.display_encoder() else {
+            return Err("invalid curve was accepted".into());
+        };
+        assert_eq!(error.code, crate::error::ErrorCode::InvalidArgument);
+        assert!(error.message.contains("curve 0 needs at least two points"));
+        Ok(())
+    }
     #[test]
     fn gamma_is_applied_to_the_encoded_value() -> Result<(), Box<dyn Error>> {
         // Gamma raises the sRGB-encoded value to 1/gamma; on linear light the result would differ.

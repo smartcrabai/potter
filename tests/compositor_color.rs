@@ -200,16 +200,24 @@ fn view_transforms_look_gamma_and_srgb_encoding_are_applied() -> Result<(), Box<
         "{gamma:?}"
     );
 
-    let unsupported_look = ColorManagement {
+    let incompatible_look = ColorManagement {
+        view_transform: ViewTransform::Raw,
+        look: "agx_high_contrast".to_owned(),
+        ..ColorManagement::default()
+    }
+    .display_encode([0.75; 3]);
+    assert!(matches!(
+        incompatible_look,
+        Err(error) if error.code == ErrorCode::InvalidArgument
+    ));
+
+    let filmic_look_on_raw = ColorManagement {
         view_transform: ViewTransform::Raw,
         look: "high_contrast".to_owned(),
         ..ColorManagement::default()
     }
     .display_encode([0.75; 3]);
-    assert!(matches!(
-        unsupported_look,
-        Err(error) if error.code == ErrorCode::UnsupportedFeature
-    ));
+    assert!(filmic_look_on_raw.is_ok(), "{filmic_look_on_raw:?}");
     assert!((linear_to_srgb(0.5) - 0.735_356_983_052_449_5).abs() < 1.0e-12);
     Ok(())
 }
