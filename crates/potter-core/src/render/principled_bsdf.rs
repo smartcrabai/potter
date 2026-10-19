@@ -739,9 +739,11 @@ mod single_bounce_tests {
     const LIGHT_DISTANCE: f64 = 4.0;
     const RADIUS: f64 = 1.2;
     const POWER: f64 = 1000.0;
-    /// Quadrature resolution over the disk's bounding square. 512 is needed at this radius: 256 is
-    /// 0.02% off on the diffuse variant, more than its Blender stderr.
-    const GRID: usize = 512;
+    /// Quadrature of the disk in polar coordinates. 96 radial × 192 angular midpoints agree with a
+    /// 768² square grid to 1e-4 relative on the diffuse, sheen and metal variants, inside the
+    /// Blender stderr × 4 tolerance, at about 1/14 of the cost of the square grid.
+    const RADIAL_STEPS: usize = 96;
+    const ANGULAR_STEPS: usize = 192;
     /// Orthographic width of the probe camera (Blender's `ortho_scale`) in units.
     const ORTHO_SCALE: f64 = 0.2;
 
@@ -774,24 +776,25 @@ mod single_bounce_tests {
         let w = toward_receiver.cross(u);
         let receiver = DVec3::new(x, y, 0.0);
         let radiance = POWER / (std::f64::consts::PI * std::f64::consts::PI * RADIUS * RADIUS);
-        let h = 2.0 / GRID as f64;
         let mut total = DVec3::ZERO;
-        for i in 0..GRID {
-            for j in 0..GRID {
-                let a = (i as f64 + 0.5) * h - 1.0;
-                let b = (j as f64 + 0.5) * h - 1.0;
-                if a * a + b * b > 1.0 {
-                    continue;
-                }
+        for i in 0..RADIAL_STEPS {
+            // Midpoint in radius, with the disk's area element r·dr·dφ.
+            let r = (i as f64 + 0.5) / RADIAL_STEPS as f64;
+            for j in 0..ANGULAR_STEPS {
+                let phi = (j as f64 + 0.5) / ANGULAR_STEPS as f64 * std::f64::consts::TAU;
+                let (a, b) = (r * phi.cos(), r * phi.sin());
                 let point = centre + RADIUS * (a * u + b * w);
                 let offset = point - receiver;
                 let distance = offset.length();
                 let direction = offset / distance;
                 let cos_receiver = direction.dot(normal).max(0.0);
                 let cos_emitter = (-direction).dot(toward_receiver).max(0.0);
-                let weight = RADIUS * RADIUS * h * h * cos_emitter / (distance * distance)
-                    * radiance
-                    * cos_receiver;
+                let area = r
+                    * (1.0 / RADIAL_STEPS as f64)
+                    * (std::f64::consts::TAU / ANGULAR_STEPS as f64)
+                    * RADIUS
+                    * RADIUS;
+                let weight = area * cos_emitter / (distance * distance) * radiance * cos_receiver;
                 total += evaluate(params, normal, view, direction) * weight;
             }
         }
