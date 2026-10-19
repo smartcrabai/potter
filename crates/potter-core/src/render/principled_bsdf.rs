@@ -524,4 +524,15 @@ mod single_bounce_tests {
             [1.506_987_510_377_347_2e-4; 3],
         );
     }
+
+    #[test]
+    fn single_bounce_dielectric_white_matches_blender() {
+        let params = native([0.8, 0.8, 0.8, 1.0], 0.0);
+        assert_matches_oracle(
+            "dielectric_white",
+            &params,
+            [6.313_597_380_649_298; 3],
+            [9.449_430_068_234_293e-4; 3],
+        );
+    }
 }
