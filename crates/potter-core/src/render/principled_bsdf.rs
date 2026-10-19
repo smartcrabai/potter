@@ -206,7 +206,11 @@ fn layered_diffuse_weight(weight: f64, layer_albedo: f64) -> f64 {
 /// `(1 + Fms · m) / (1 + m)` with `m = (1 - E) / E`, which equals `gain · E`.
 fn dielectric_darkening(layer: &SpecularLayer, roughness: f64, energy: f64) -> DVec3 {
     let missing = (1.0 - energy) / energy;
-    multiscatter_gain(dielectric_fss(layer), ggx_energy_average(roughness), missing) * energy
+    multiscatter_gain(
+        dielectric_fss(layer),
+        ggx_energy_average(roughness),
+        missing,
+    ) * energy
 }
 
 /// The average single-scattering Fresnel of the dielectric layer, remapped from F0..1 as the
@@ -221,7 +225,6 @@ fn dielectric_fss(layer: &SpecularLayer) -> DVec3 {
     ));
     layer.f0_tinted.lerp(DVec3::ONE, fss_remap)
 }
-
 
 struct SpecularLayer {
     eta: f64,
