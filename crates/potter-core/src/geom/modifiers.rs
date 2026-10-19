@@ -5820,6 +5820,63 @@ mod tests {
         modifier
     }
 
+    /// Blender 5.2.2 Wave (`MOD_wave.cc`) at frame 20 on a jittered quad grid, with and without
+    /// `use_normal`. With it, Blender moves each vertex along `vert_normals()`, the angle-weighted
+    /// normal that `vertex_normals` computes, so the `use_normal` case pins that term.
+    #[test]
+    fn wave_use_normal_matches_blender_vert_normals() {
+        const ORACLE: &str = include_str!("../../../../tests/fixtures/wave/blender_wave.json");
+        let oracle: serde_json::Value = serde_json::from_str(ORACLE).unwrap();
+        let cases = oracle["cases"].as_array().unwrap();
+        assert_eq!(cases.len(), 2, "complete Blender wave oracle is required");
+        for case in cases {
+            let kind = case["kind"].as_str().unwrap();
+            let frame = case["frame"].as_f64().unwrap();
+            let faces: Vec<Vec<usize>> = case["faces"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|face| {
+                    face.as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|index| usize::try_from(index.as_u64().unwrap()).unwrap())
+                        .collect()
+                })
+                .collect();
+            let mesh =
+                Mesh::from_positions_and_faces(oracle_points(&case["positions"]), faces).unwrap();
+            let modifier = with_params("wave", case["params"].clone());
+            let result = super::advanced::wave(&mesh, &modifier, frame).unwrap();
+            let expected = oracle_points(&case["output"]);
+            assert_eq!(result.vertices.len(), expected.len());
+            for (index, (vertex, expected)) in result.vertices.iter().zip(&expected).enumerate() {
+                assert!(
+                    (vertex.co - *expected).abs().max_element() <= 2.0e-5,
+                    "{kind}: vertex {index} is {:?}, Blender {expected:?}",
+                    vertex.co
+                );
+            }
+        }
+    }
+
+    /// Points stored as `[x, y, z]` arrays in an oracle file.
+    fn oracle_points(value: &serde_json::Value) -> Vec<DVec3> {
+        value
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|point| {
+                let point = point.as_array().unwrap();
+                DVec3::new(
+                    point[0].as_f64().unwrap(),
+                    point[1].as_f64().unwrap(),
+                    point[2].as_f64().unwrap(),
+                )
+            })
+            .collect()
+    }
+
     /// Blender 5.2.2 Triangulate modifier (`MOD_triangulate.cc`, BEAUTY quads and n-gons) over every
     /// case of `tests/fixtures/triangulate`, including zero-area collinear zigzags and a figure-eight
     /// whose Newell sum is zero. Triangles are compared as sets, each rotated to its smallest corner.
