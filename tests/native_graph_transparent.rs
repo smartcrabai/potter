@@ -257,6 +257,27 @@ fn a_tinted_transparent_bsdf_tints_camera_and_shadow_rays_as_cycles_does() -> Te
     Ok(())
 }
 
+#[test]
+fn a_tinted_transparent_bsdf_in_realtime_matches_eevee() -> TestResult {
+    let Some(blender) = blender_executable() else {
+        eprintln!("skipping the tinted realtime oracle; no executable Blender was found");
+        return Ok(());
+    };
+    let root = tempdir()?;
+    let (blend, wanted) = blender_render(
+        &blender,
+        root.path(),
+        "tinted_eevee",
+        "graph_alpha_cases.py",
+        CASES,
+        &["BLENDER_EEVEE", "tinted_transparent"],
+    )?;
+    let (project, _) = import_scene(&blender, root.path(), &blend)?;
+    let frame = potter_frame(&project, root.path(), "realtime", &["--engine", "realtime"])?;
+    assert_patch_matches(&patch_mean(&frame), &wanted, "EEVEE");
+    Ok(())
+}
+
 /// A 1x1 RGB PNG (200, 100, 50).
 const PNG: [u8; 69] = [
     137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 2, 0,

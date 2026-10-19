@@ -246,15 +246,13 @@ impl BsdfParams {
         } else {
             factor
         };
-        // Each arm's transparent share is `(1 - alpha) * weight`; the mixed tint is the share-weighted average, so
-        // `(1 - alpha) * tint` is the mixed Cycles closure weight `(1 - f) * w1 * t1 + f * w2 * t2`.
-        let transparent_tint = average_tint(
-            [
-                (1.0 - factor) * (1.0 - first.alpha),
-                factor * (1.0 - second.alpha),
-            ],
-            [first.transparent_tint, second.transparent_tint],
-        );
+        // Cycles weights each closure by its factor and its transparent weight is `(1 - alpha) * tint`, so the mixed
+        // transparency is the factor-weighted sum of the arms' transparencies (`tint_for_transparency`).
+        let transparency = std::array::from_fn(|channel| {
+            (1.0 - factor) * (1.0 - first.alpha) * first.transparent_tint[channel]
+                + factor * (1.0 - second.alpha) * second.transparent_tint[channel]
+        });
+        let transparent_tint = tint_for_transparency(alpha, transparency);
         let mix_scalar = |a: f64, b: f64| a + (b - a) * shade;
         let mix3 = |a: [f64; 3], b: [f64; 3]| {
             [
@@ -324,12 +322,16 @@ impl BsdfParams {
             emission_strength: first.emission_strength.max(second.emission_strength),
             transmission: first.transmission.max(second.transmission),
             ior: first.ior,
-            // Add keeps alpha as the larger opacity, so its transparent share is the arms' average tint, weighted by
-            // their shares: a shortcut, since Cycles sums the transparent closures' weights.
+            // Add keeps alpha as the larger opacity (its shading is Potter's one-scalar blend), and sums the arms'
+            // transparent weights as Cycles sums closures. A fully opaque arm leaves no pass chance, so a transparent
+            // share beside it is dropped: the deviation the CHANGELOG records.
             alpha: first.alpha.max(second.alpha),
-            transparent_tint: average_tint(
-                [1.0 - first.alpha, 1.0 - second.alpha],
-                [first.transparent_tint, second.transparent_tint],
+            transparent_tint: tint_for_transparency(
+                first.alpha.max(second.alpha),
+                std::array::from_fn(|channel| {
+                    (1.0 - first.alpha) * first.transparent_tint[channel]
+                        + (1.0 - second.alpha) * second.transparent_tint[channel]
+                }),
             ),
             reflectance: (first.reflectance + second.reflectance).min(1.0),
             subsurface_weight: first.subsurface_weight.max(second.subsurface_weight),
@@ -359,16 +361,15 @@ impl BsdfParams {
     }
 }
 
-/// The average of two transparent tints weighted by their transparent shares. No share means no transparency, so the
-/// tint is white.
-fn average_tint(shares: [f64; 2], tints: [[f64; 3]; 2]) -> [f64; 3] {
-    let total = shares[0] + shares[1];
-    if total <= 0.0 {
+/// The transparent tint that gives a pass chance `1 - alpha` the expected throughput `transparency` (Cycles' summed
+/// transparent weight): `(1 - alpha) * tint = transparency`. A surface with no pass chance (`alpha` 1) cannot pass,
+/// so the tint is white and the transparency is dropped.
+fn tint_for_transparency(alpha: f64, transparency: [f64; 3]) -> [f64; 3] {
+    let chance = 1.0 - alpha;
+    if chance <= 0.0 {
         return [1.0; 3];
     }
-    std::array::from_fn(|channel| {
-        (shares[0] * tints[0][channel] + shares[1] * tints[1][channel]) / total
-    })
+    transparency.map(|weight| weight / chance)
 }
 
 /// The UV layers of the triangle a hit lies on, borrowed from the render geometry.
