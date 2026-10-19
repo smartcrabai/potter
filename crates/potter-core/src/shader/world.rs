@@ -455,6 +455,7 @@ mod tests {
                 tiles: BTreeMap::new(),
                 interpolation,
                 srgb: false,
+                udim: false,
                 storage: ImageStorage {
                     data: true,
                     straight_alpha: false,
