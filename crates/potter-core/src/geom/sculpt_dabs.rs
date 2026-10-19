@@ -188,6 +188,7 @@ pub(super) fn apply_dabs(
 }
 
 /// One Clay Strips dab: the stroke-relative grab delta, dab center, radius, and bstrength.
+#[derive(Clone, Copy)]
 struct ClayStripsDab {
     center: DVec3,
     grab: DVec3,
