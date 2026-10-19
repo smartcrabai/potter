@@ -245,12 +245,23 @@ fn complete_scene_schema(root: &mut Value) {
         "passes",
         "motion_blur",
         "shutter",
-        "motion_blur_samples"
+        "motion_blur_samples",
+        "dicing_rate",
+        "preview_dicing_rate",
+        "max_subdivisions",
+        "offscreen_dicing_scale"
     ]);
     render["properties"]["motion_blur"] = json!({"type":"boolean"});
     render["properties"]["shutter"] = json!({"type":"number"});
     render["properties"]["motion_blur_samples"] =
         json!({"type":"integer","minimum":0,"maximum":u32::MAX});
+    render["properties"]["dicing_rate"] = json!({"type":"number","minimum":0.1,"maximum":1000.0});
+    render["properties"]["preview_dicing_rate"] =
+        json!({"type":"number","minimum":0.1,"maximum":1000.0});
+    render["properties"]["max_subdivisions"] = json!({"type":"integer","minimum":0,"maximum":16});
+    render["properties"]["offscreen_dicing_scale"] =
+        json!({"type":"number","minimum":1.0,"maximum":f32::MAX});
+    render["properties"]["dicing_camera"] = json!({"oneOf":[id_schema(),{"type":"null"}]});
 
     defs["node"]["properties"]["kind"]["enum"] =
         json!(["empty", "mesh", "camera", "light", "armature"]);
