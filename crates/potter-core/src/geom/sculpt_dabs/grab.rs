@@ -8,7 +8,7 @@ use std::f64::consts::{FRAC_PI_2, PI, TAU};
 
 use glam::{DQuat, DVec3};
 
-use super::{DabInput, Field, area_plane};
+use super::{DabInput, Field, area_normal};
 use crate::geom::sculpt::{DabBrush, Falloff};
 
 /// `SCULPT_RAKE_BRUSH_FACTOR` (`sculpt_intern.hh` 137): the rake follow distance per brush radius.
@@ -38,7 +38,8 @@ pub(super) struct State {
     previous_grab: DVec3,
     /// Snake Hook `rake_data.follow_co`: the point the rake trails behind the mouse.
     follow: DVec3,
-    /// Thumb `cache->sculpt_normal` (computed at the first dab), and the view proxy of Twist's dial.
+    /// Thumb `cache->sculpt_normal` (computed at the first dab). Twist's dial uses it only when
+    /// Potter has no view.
     stroke_normal: Option<DVec3>,
     /// Twist `cache->dial` (`BLI_dial_2d`).
     dial: Dial,
@@ -180,14 +181,12 @@ fn grab_dab(field: &mut Field, input: &DabInput) {
 /// the first dab and kept for the stroke (`update_sculpt_normal`, sculpt.cc 2729-2739).
 fn thumb_dab(field: &mut Field, input: &DabInput, first: bool) {
     if first {
-        field.grab.stroke_normal = area_plane(
+        field.grab.stroke_normal = area_normal(
             field,
             input.center,
             input.radius * THUMB_NORMAL_RADIUS_FACTOR,
-            input.radius * THUMB_NORMAL_RADIUS_FACTOR,
             false,
-        )
-        .map(|area| area.normal);
+        );
     }
     let Some(normal) = field.grab.stroke_normal else {
         return;
@@ -303,33 +302,23 @@ fn rake_rotation(
 }
 
 /// Blender 5.2.2 Twist (Rotate) for one dab (`rotate.cc` `calc_translations`). The rotation is
-/// about the stroke origin, around the stroke-start sculpt normal, by `factor * vertex_rotation`
-/// (`vertex_rotation = -dial_angle * bstrength`, sculpt.cc 5913-5914). The dial's view proxy is
-/// the stroke-start normal, since Potter has no view; the dial vector is the origin-relative move.
+/// about the stroke origin, around the sculpt normal, by `factor * vertex_rotation`
+/// (`vertex_rotation = -dial_angle * bstrength`, sculpt.cc 5913-5914). Blender's dial is measured
+/// in the screen plane, so its normal is the view; without a view it falls back to the stroke-start
+/// sculpt normal.
 fn rotate_dab(field: &mut Field, input: &DabInput, first: bool) {
+    let radius = input.radius * TWIST_NORMAL_RADIUS_FACTOR;
     if first {
-        field.grab.stroke_normal = area_plane(
-            field,
-            input.center,
-            input.radius * TWIST_NORMAL_RADIUS_FACTOR,
-            input.radius * TWIST_NORMAL_RADIUS_FACTOR,
-            false,
-        )
-        .map(|area| area.normal);
+        field.grab.stroke_normal = area_normal(field, input.center, radius, false);
     }
     // `update_sculpt_normal` recomputes the Twist normal every dab (sculpt.cc 2729-2739).
-    let normal = area_plane(
-        field,
-        input.center,
-        input.radius * TWIST_NORMAL_RADIUS_FACTOR,
-        input.radius * TWIST_NORMAL_RADIUS_FACTOR,
-        false,
-    )
-    .map(|area| area.normal);
-    let Some(view) = field.grab.stroke_normal else {
-        return;
+    let normal = area_normal(field, input.center, radius, false);
+    let dial_normal = match (field.view, field.grab.stroke_normal) {
+        (Some(view), _) => view,
+        (None, Some(stroke_normal)) => stroke_normal,
+        (None, None) => return,
     };
-    let dial = field.grab.dial.angle(view, input.grab);
+    let dial = field.grab.dial.angle(dial_normal, input.grab);
     let Some(normal) = normal else {
         return;
     };

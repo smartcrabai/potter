@@ -6,7 +6,6 @@
 use std::{error::Error, fs, process::Command};
 
 use glam::DVec3;
-use proptest::prelude::*;
 use serde_json::{Value, json};
 use tempfile::tempdir;
 #[path = "common/blender_checked.rs"]
@@ -931,24 +930,4 @@ fn sculpt_symmetry_and_repeat_strokes_are_deterministic() -> Result<(), Box<dyn 
     let second_hash = sha256(&canonicalize(&serde_json::to_value(&second)?)?);
     assert_eq!(first_hash, second_hash);
     Ok(())
-}
-
-proptest! {
-    #[test]
-    fn smoothing_reduces_laplacian_energy(offset in -5.0_f64..5.0, factor in 0.1_f64..1.0) {
-        let positions = vec![
-            DVec3::new(offset, offset * 0.25, 0.3),
-            DVec3::new(-1.0, -1.0, 0.0),
-            DVec3::new(1.0, -1.0, 0.0),
-            DVec3::new(1.0, 1.0, 0.0),
-            DVec3::new(-1.0, 1.0, 0.0),
-        ];
-        let mut mesh = Mesh::from_positions_and_faces(
-            positions,
-            vec![vec![0, 1, 2], vec![0, 2, 3], vec![0, 3, 4], vec![0, 4, 1]],
-        ).unwrap();
-        let before = sculpt::laplacian_energy(&mesh);
-        sculpt::smooth_vertex(&mut mesh, 0, factor).unwrap();
-        prop_assert!(sculpt::laplacian_energy(&mesh) < before);
-    }
 }

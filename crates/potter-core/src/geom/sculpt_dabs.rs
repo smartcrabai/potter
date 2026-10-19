@@ -117,7 +117,7 @@ pub(super) fn apply_dabs(
         .collect();
     let mut field = Field {
         positions: original.clone(),
-        original: original.clone(),
+        original,
         normals: normals.to_vec(),
         // Blender's `fill_factor_from_hide_and_mask`: a masked vertex keeps `1 - mask` of each dab.
         mask_factors: mesh
@@ -132,7 +132,7 @@ pub(super) fn apply_dabs(
             })
             .collect(),
         neighbors: vertex_neighbors(mesh, &index),
-        displacement: vec![0.0; original.len()],
+        displacement: vec![0.0; mesh.vertices.len()],
         falloff: stroke.falloff,
         passes,
         view: stroke.view.map(DVec3::normalize),
@@ -175,7 +175,7 @@ pub(super) fn apply_dabs(
     let changed = field
         .positions
         .iter()
-        .zip(&original)
+        .zip(&field.original)
         .any(|(after, before)| after != before);
     if changed {
         for (vertex, co) in mesh.vertices.iter_mut().zip(field.positions) {
@@ -393,6 +393,29 @@ fn vertex_neighbors(mesh: &Mesh, index: &BTreeMap<u32, usize>) -> Vec<Vec<usize>
         neighbors[i] = list;
     }
     neighbors
+}
+
+/// Blender's `calc_area_normal` for the AREA plane: the area normal within `normal_radius` of
+/// `center`, or `None` when no group has a nonzero normal sum. Callers that need a vector apply
+/// Blender's `value_or(float3(0))` with `unwrap_or(DVec3::ZERO)`.
+fn area_normal(
+    field: &Field,
+    center: DVec3,
+    normal_radius: f64,
+    accumulate: bool,
+) -> Option<DVec3> {
+    area_plane(field, center, normal_radius, normal_radius, accumulate).map(|area| area.normal)
+}
+
+/// Blender's `project_translations` (`sculpt.cc` 7705): removes the component of `translation`
+/// along `plane`. A plane whose squared length is below `f32::EPSILON` leaves the translation
+/// unchanged, as Blender's guard does.
+fn project_translation(translation: DVec3, plane: DVec3) -> DVec3 {
+    let length_squared = plane.length_squared();
+    if length_squared < f64::from(f32::EPSILON) {
+        return translation;
+    }
+    translation - plane * (translation.dot(plane) / length_squared)
 }
 
 /// Blender's `calc_area_normal_and_center` over the mesh vertices. Normals are summed with the
