@@ -2611,7 +2611,7 @@ pub(super) fn decimate_unsubdivide(mesh: &Mesh, iterations: usize) -> Result<Mes
     Ok(result)
 }
 
-/// Writes the EDGE attributes of a DISSOLVE or UNSUBDIV result from the BMesh that produced it. `rows` holds
+/// Writes the EDGE attributes of a DISSOLVE or UNSUBDIV result from the `BMesh` that produced it. `rows` holds
 /// one row per live edge in pool order, which is the rebuilt mesh's edge order, so row `k` is edge `k`.
 /// Blender's edge joins and splits keep each surviving edge's own customdata, so these are never interpolated.
 fn write_dissolve_edge_attributes(
