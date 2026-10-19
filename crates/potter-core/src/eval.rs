@@ -1202,7 +1202,16 @@ impl Snapshot {
                                         &matrices,
                                         &volume_data,
                                     ),
-                                    "boolean" | "shrinkwrap" | "curve" | "hook" | "warp" => {
+                                    "displace" | "wave" | "warp" => apply_scene_displacement_modifier(
+                                        mesh,
+                                        modifier,
+                                        id,
+                                        doc,
+                                        &references,
+                                        frame,
+                                        texture_rng,
+                                    ),
+                                    "boolean" | "shrinkwrap" | "curve" | "hook" => {
                                         apply_scene_operand_modifier(
                                             mesh,
                                             modifier,
@@ -1510,7 +1519,16 @@ impl Snapshot {
                                         &matrices,
                                         &volume_data,
                                     ),
-                                    "boolean" | "shrinkwrap" | "curve" | "hook" | "warp" => {
+                                    "displace" | "wave" | "warp" => apply_scene_displacement_modifier(
+                                        mesh,
+                                        modifier,
+                                        id,
+                                        doc,
+                                        &references,
+                                        frame,
+                                        texture_rng,
+                                    ),
+                                    "boolean" | "shrinkwrap" | "curve" | "hook" => {
                                         apply_scene_operand_modifier(
                                             mesh,
                                             modifier,
