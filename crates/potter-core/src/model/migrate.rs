@@ -306,16 +306,24 @@ fn upgrade_v4(value: &mut Value) -> Result<()> {
     Ok(())
 }
 
-/// Upgrades a schema-version-5 scene document to version 6. The `fisheye` camera projection, which rendered an
-/// equidistant fisheye over a full turn, becomes the panorama projection with `fisheye_equidistant` and a
-/// `fisheye_fov` of 2π, so the stored camera keeps its image and there is one representation of a fisheye.
+/// Upgrades a schema-version-5 scene document to version 6. Version 5 drew a fisheye camera over a full turn in two forms:
+/// the `fisheye` projection, and a `panorama` with `panorama_type` `fisheye_equidistant`. Both become a `panorama` with
+/// `fisheye_equidistant` and a `fisheye_fov` of 2π, so each keeps its image and a fisheye has one representation.
 fn upgrade_v5(value: &mut Value) {
     if let Some(blocks) = value.get_mut("data_blocks").and_then(Value::as_object_mut) {
         for camera in blocks
             .values_mut()
             .filter_map(|block| block.get_mut("camera")?.as_object_mut())
         {
-            if camera.get("projection").and_then(Value::as_str) == Some("fisheye") {
+            let full_turn_fisheye = match camera.get("projection").and_then(Value::as_str) {
+                Some("fisheye") => true,
+                Some("panorama") => {
+                    camera.get("panorama_type").and_then(Value::as_str)
+                        == Some("fisheye_equidistant")
+                }
+                _ => false,
+            };
+            if full_turn_fisheye {
                 camera.insert("projection".to_owned(), json!("panorama"));
                 camera.insert("panorama_type".to_owned(), json!("fisheye_equidistant"));
                 camera.insert("fisheye_fov".to_owned(), json!(std::f64::consts::TAU));
@@ -1298,20 +1306,38 @@ mod tests {
     }
 
     #[test]
-    fn version_five_fisheye_projection_becomes_an_equidistant_panorama() {
+    fn version_five_full_turn_fisheyes_become_equidistant_panoramas() {
         let mut scene = json!({
             "schema_version": 5,
             "data_blocks": {
-                "cam": {"type": "camera", "camera": {"projection": "fisheye", "lens_mm": 50.0}},
+                "legacy": {"type": "camera", "camera": {"projection": "fisheye", "lens_mm": 50.0}},
+                "panorama": {"type": "camera", "camera": {
+                    "projection": "panorama", "panorama_type": "fisheye_equidistant", "lens_mm": 50.0
+                }},
+                "sphere": {"type": "camera", "camera": {
+                    "projection": "panorama", "panorama_type": "equirectangular"
+                }},
                 "plain": {"type": "camera", "camera": {"projection": "perspective"}}
             }
         });
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
         assert_eq!(scene["schema_version"], json!(6));
-        let camera = &scene["data_blocks"]["cam"]["camera"];
-        assert_eq!(camera["projection"], json!("panorama"));
-        assert_eq!(camera["panorama_type"], json!("fisheye_equidistant"));
-        assert_eq!(camera["fisheye_fov"], json!(std::f64::consts::TAU));
+        // Both forms drew a full turn in version 5, so both keep it as a 2π equidistant fisheye.
+        for id in ["legacy", "panorama"] {
+            let camera = &scene["data_blocks"][id]["camera"];
+            assert_eq!(camera["projection"], json!("panorama"), "{id}");
+            assert_eq!(
+                camera["panorama_type"],
+                json!("fisheye_equidistant"),
+                "{id}"
+            );
+            assert_eq!(camera["fisheye_fov"], json!(std::f64::consts::TAU), "{id}");
+            assert_eq!(camera["lens_mm"], json!(50.0), "{id}");
+        }
+        // An equirectangular panorama and a perspective camera gain no fisheye field.
+        let sphere = &scene["data_blocks"]["sphere"]["camera"];
+        assert_eq!(sphere["panorama_type"], json!("equirectangular"));
+        assert!(sphere.get("fisheye_fov").is_none());
         assert_eq!(
             scene["data_blocks"]["plain"]["camera"]["projection"],
             json!("perspective")

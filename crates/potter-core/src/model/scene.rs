@@ -1272,28 +1272,30 @@ pub enum CameraProjection {
     Panorama,
 }
 
-/// Blender's panorama limits and fisheye field of view are float32 defaults (`rna_camera.cc`, `M_PI_F`). They are kept as
-/// those float32 values widened to f64, so a camera imported at Blender's defaults equals them and is omitted from the scene.
-fn blender_pi() -> f64 {
-    f64::from(std::f32::consts::PI)
-}
-
-/// Blender's lower limit on the fisheye field of view, 10 degrees (`rna_camera.cc`). Blender clamps a smaller value, so
-/// Potter refuses one rather than store a field of view that its Blender camera would not keep.
+/// Blender's `M_PI_F` (`rna_camera.cc`): the float32 π that Blender's panorama limits and fisheye field of view are built
+/// from. Doubling and halving are exact in float32, so the derived constants below are the values Blender holds.
+pub const BLENDER_PI: f64 = std::f32::consts::PI as f64;
+/// A full turn, Blender's float32 longitude span. Blender's full-sphere default is ±π, so its span is this turn, a hair
+/// beyond the f64 `TAU`; the bounds Potter checks use it so Blender's own defaults validate.
+pub const BLENDER_TURN: f64 = 2.0 * BLENDER_PI;
+/// A right angle, Blender's float32 latitude limit.
+pub const BLENDER_RIGHT_ANGLE: f64 = 0.5 * BLENDER_PI;
+/// Blender's fisheye field of view hard range (`rna_camera.cc`): 10 degrees to 10π. Blender clamps a value outside it, so
+/// Potter refuses one rather than store a field of view its Blender camera would not keep. The soft limit is 2π.
 pub const FISHEYE_FOV_MIN: f64 = 0.1745;
-
-/// A full turn and a right angle, as Blender's float32 limits (`rna_camera.cc`, `M_PI_F`). Blender's full-sphere panorama
-/// defaults are ±π in float32, so their span is this turn, a hair beyond the f64 `TAU`; the bounds Potter checks use these
-/// so the defaults validate.
-pub const BLENDER_TURN: f64 = 6.283_185_482_025_146_5;
-pub const BLENDER_RIGHT_ANGLE: f64 = 1.570_796_370_506_286_6;
+pub const FISHEYE_FOV_MAX: f64 = 31.415_925_979_614_258;
+/// Blender's `fisheye_lens` hard range (`rna_camera.cc`): 0.01 to 100 mm. Blender clamps a value outside it.
+pub const FISHEYE_LENS_MIN: f64 = 0.01;
+pub const FISHEYE_LENS_MAX: f64 = 100.0;
+/// Blender's default `fisheye_lens`, in millimetres.
+const FISHEYE_LENS_DEFAULT: f64 = 10.5;
 
 #[expect(
     clippy::trivially_copy_pass_by_ref,
     reason = "serde skip_serializing_if passes a reference"
 )]
 fn is_default_longitude_min(value: &f64) -> bool {
-    equal_f64(*value, -blender_pi())
+    equal_f64(*value, -BLENDER_PI)
 }
 
 #[expect(
@@ -1301,7 +1303,7 @@ fn is_default_longitude_min(value: &f64) -> bool {
     reason = "serde skip_serializing_if passes a reference"
 )]
 fn is_default_longitude_max(value: &f64) -> bool {
-    equal_f64(*value, blender_pi())
+    equal_f64(*value, BLENDER_PI)
 }
 
 #[expect(
@@ -1309,7 +1311,7 @@ fn is_default_longitude_max(value: &f64) -> bool {
     reason = "serde skip_serializing_if passes a reference"
 )]
 fn is_default_latitude_min(value: &f64) -> bool {
-    equal_f64(*value, -0.5 * blender_pi())
+    equal_f64(*value, -BLENDER_RIGHT_ANGLE)
 }
 
 #[expect(
@@ -1317,7 +1319,7 @@ fn is_default_latitude_min(value: &f64) -> bool {
     reason = "serde skip_serializing_if passes a reference"
 )]
 fn is_default_latitude_max(value: &f64) -> bool {
-    equal_f64(*value, 0.5 * blender_pi())
+    equal_f64(*value, BLENDER_RIGHT_ANGLE)
 }
 
 #[expect(
@@ -1325,13 +1327,23 @@ fn is_default_latitude_max(value: &f64) -> bool {
     reason = "serde skip_serializing_if passes a reference"
 )]
 fn is_default_fisheye_fov(value: &f64) -> bool {
-    equal_f64(*value, blender_pi())
+    equal_f64(*value, BLENDER_PI)
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if passes a reference"
+)]
+fn is_default_fisheye_lens(value: &f64) -> bool {
+    equal_f64(*value, FISHEYE_LENS_DEFAULT)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CameraData {
     pub projection: CameraProjection,
+    /// Blender's `lens` in millimetres, the perspective focal length. A perspective camera uses it, and so does a panorama
+    /// camera in the engines that draw it as perspective (EEVEE and Workbench); the path tracer ignores it for panoramas.
     pub lens_mm: f64,
     pub sensor_height_mm: f64,
     pub sensor_fit: String,
@@ -1350,9 +1362,12 @@ pub struct CameraData {
     pub latitude_min: f64,
     #[serde(skip_serializing_if = "is_default_latitude_max")]
     pub latitude_max: f64,
-    /// The fisheye field of view in radians, for the fisheye projections; Blender's default is 180 degrees.
+    /// The fisheye field of view in radians, for the fisheye panoramas; Blender's default is 180 degrees.
     #[serde(skip_serializing_if = "is_default_fisheye_fov")]
     pub fisheye_fov: f64,
+    /// Blender's `fisheye_lens` in millimetres: the focal length of an equisolid fisheye, separate from `lens_mm`.
+    #[serde(skip_serializing_if = "is_default_fisheye_lens")]
+    pub fisheye_lens: f64,
     pub dof_enabled: bool,
     pub focus_distance: f64,
     pub f_stop: f64,
@@ -1374,11 +1389,12 @@ impl Default for CameraData {
             clip_end: 1000.0,
             shift: [0.0, 0.0],
             panorama_type: "equirectangular".to_owned(),
-            longitude_min: -blender_pi(),
-            longitude_max: blender_pi(),
-            latitude_min: -0.5 * blender_pi(),
-            latitude_max: 0.5 * blender_pi(),
-            fisheye_fov: blender_pi(),
+            longitude_min: -BLENDER_PI,
+            longitude_max: BLENDER_PI,
+            latitude_min: -BLENDER_RIGHT_ANGLE,
+            latitude_max: BLENDER_RIGHT_ANGLE,
+            fisheye_fov: BLENDER_PI,
+            fisheye_lens: FISHEYE_LENS_DEFAULT,
             dof_enabled: false,
             focus_distance: 10.0,
             f_stop: 2.8,

@@ -137,7 +137,7 @@ fn scene_schema() -> Value {
         "face":{"type":"object","required":["id","v","material_index"],"properties":{"id":{"type":"integer","minimum":0,"maximum":u32::MAX},"v":{"type":"array","items":{"type":"integer","minimum":0,"maximum":u32::MAX},"minItems":3},"material_index":{"type":"integer","minimum":0,"maximum":u32::MAX}},"additionalProperties":false},
         "mesh":{"type":"object","required":["vertices","edges","faces","attributes","next_id"],"properties":{"vertices":{"type":"array","items":{"$ref":"#/$defs/vertex"}},"edges":{"type":"array","items":{"$ref":"#/$defs/edge"}},"faces":{"type":"array","items":{"$ref":"#/$defs/face"}},"attributes":{"type":"object"},"next_id":{"type":"object","properties":{"vertex":{"type":"integer","minimum":0},"edge":{"type":"integer","minimum":0},"face":{"type":"integer","minimum":0}},"required":["vertex","edge","face"],"additionalProperties":false}},"additionalProperties":false},
         "data_block":{"type":"object","required":["type"],"properties":{"type":{"type":"string"},"descriptor":{"type":["object","null"]},"mesh":{"oneOf":[{"$ref":"#/$defs/mesh"},{"type":"null"}]},"camera":{"oneOf":[{"$ref":"#/$defs/camera"},{"type":"null"}]},"light":{"oneOf":[{"$ref":"#/$defs/light"},{"type":"null"}]},"grease_pencil":{"type":["object","null"]},"armature":{"type":["object","null"]},"shape_keys":{"type":["object","null"]},"vertex_groups":{"type":"array","items":{"type":"object"}},"vertex_weights":{"type":"object"}},"additionalProperties":false},
-        "camera":{"type":"object","required":["projection","lens_mm","sensor_width_mm","ortho_scale","clip_start","clip_end","shift"],"properties":{"projection":{"enum":["perspective","orthographic"]},"lens_mm":{"type":"number"},"sensor_width_mm":{"type":"number"},"ortho_scale":{"type":"number"},"clip_start":{"type":"number"},"clip_end":{"type":"number"},"shift":{"$ref":"#/$defs/vec2"}},"additionalProperties":false},
+        "camera": camera_data_schema(),
         "light":{"type":"object","required":["light_type","color","energy","radius","spot_size","spot_blend"],"properties":{"light_type":{"enum":["point","sun","spot","area"]},"color":{"$ref":"#/$defs/vec3"},"energy":{"type":"number"},"radius":{"type":"number"},"soft_falloff":{"type":"boolean"},"spot_size":{"type":"number"},"spot_blend":{"type":"number"}},"additionalProperties":false},
         "material":{"type":"object","required":["name","base_color","metallic","roughness","emission_color","emission_strength","transmission","ior","double_sided","node_tree","base_color_texture","roughness_texture","metallic_texture","normal_texture"],"properties":{"name":{"type":"string"},"base_color":{"type":"array","items":{"type":"number","minimum":0,"maximum":1},"minItems":4,"maxItems":4},"metallic":{"type":"number","minimum":0,"maximum":1},"roughness":{"type":"number","minimum":0,"maximum":1},"emission_color":{"$ref":"#/$defs/vec3"},"emission_strength":{"type":"number","minimum":0},"transmission":{"type":"number","minimum":0,"maximum":1},"ior":{"type":"number","exclusiveMinimum":0},"double_sided":{"type":"boolean"},"node_tree":{"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]},"base_color_texture":{"oneOf":[{"$ref":"#/$defs/texture_ref"},{"type":"null"}]},"roughness_texture":{"oneOf":[{"$ref":"#/$defs/texture_ref"},{"type":"null"}]},"metallic_texture":{"oneOf":[{"$ref":"#/$defs/texture_ref"},{"type":"null"}]},"normal_texture":{"oneOf":[{"$ref":"#/$defs/texture_ref"},{"type":"null"}]}},"additionalProperties":false},
         "texture_ref":texture_ref,
@@ -1560,6 +1560,7 @@ fn operation_contract(name: &str) -> OperationContract {
                 "latitude_min",
                 "latitude_max",
                 "fisheye_fov",
+                "fisheye_lens",
                 "dof_enabled",
                 "focus_distance",
                 "f_stop",
@@ -2021,7 +2022,10 @@ fn field_schema(operation: &str, field: &str) -> Value {
                 json!({"type":"number","minimum":-crate::model::BLENDER_RIGHT_ANGLE,"maximum":crate::model::BLENDER_RIGHT_ANGLE})
             }
             "fisheye_fov" => {
-                json!({"type":"number","minimum":crate::model::FISHEYE_FOV_MIN,"maximum":crate::model::BLENDER_TURN})
+                json!({"type":"number","minimum":crate::model::FISHEYE_FOV_MIN,"maximum":crate::model::FISHEYE_FOV_MAX})
+            }
+            "fisheye_lens" => {
+                json!({"type":"number","minimum":crate::model::FISHEYE_LENS_MIN,"maximum":crate::model::FISHEYE_LENS_MAX})
             }
             "stereo_mode" => json!({"enum":["none","side_by_side","anaglyph"]}),
             "dof_enabled" => json!({"type":"boolean"}),
@@ -2521,7 +2525,8 @@ fn camera_set_properties() -> Value {
         "longitude_max":{"type":"number"},
         "latitude_min":{"type":"number","minimum":-crate::model::BLENDER_RIGHT_ANGLE,"maximum":crate::model::BLENDER_RIGHT_ANGLE},
         "latitude_max":{"type":"number","minimum":-crate::model::BLENDER_RIGHT_ANGLE,"maximum":crate::model::BLENDER_RIGHT_ANGLE},
-        "fisheye_fov":{"type":"number","minimum":crate::model::FISHEYE_FOV_MIN,"maximum":crate::model::BLENDER_TURN},
+        "fisheye_fov":{"type":"number","minimum":crate::model::FISHEYE_FOV_MIN,"maximum":crate::model::FISHEYE_FOV_MAX},
+        "fisheye_lens":{"type":"number","minimum":crate::model::FISHEYE_LENS_MIN,"maximum":crate::model::FISHEYE_LENS_MAX},
         "dof_enabled":{"type":"boolean"},
         "focus_distance":{"type":"number","exclusiveMinimum":0},
         "f_stop":{"type":"number","exclusiveMinimum":0},
@@ -2529,6 +2534,15 @@ fn camera_set_properties() -> Value {
         "stereo_mode":{"enum":["none","side_by_side","anaglyph"]},
         "interocular_distance":{"type":"number","exclusiveMinimum":0}
     })
+}
+
+/// The schema of camera data as a scene document stores it: every field `CameraData` serialises, with the ranges the camera
+/// operations accept.
+fn camera_data_schema() -> Value {
+    let mut properties = camera_set_properties();
+    properties["sensor_height_mm"] = json!({"type":"number","exclusiveMinimum":0});
+    properties["sensor_fit"] = json!({"enum":["AUTO","HORIZONTAL","VERTICAL"]});
+    json!({"type":"object","properties":properties,"additionalProperties":false})
 }
 
 fn light_set_properties() -> Value {

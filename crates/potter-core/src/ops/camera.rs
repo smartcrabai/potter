@@ -56,6 +56,7 @@ fn create_camera(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Res
             "latitude_min",
             "latitude_max",
             "fisheye_fov",
+            "fisheye_lens",
             "dof_enabled",
             "focus_distance",
             "f_stop",
@@ -86,6 +87,7 @@ fn create_camera(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Res
             "latitude_min",
             "latitude_max",
             "fisheye_fov",
+            "fisheye_lens",
             "dof_enabled",
             "focus_distance",
             "f_stop",
@@ -163,6 +165,7 @@ fn apply_camera_values(
             "latitude_min",
             "latitude_max",
             "fisheye_fov",
+            "fisheye_lens",
             "dof_enabled",
             "focus_distance",
             "f_stop",
@@ -243,6 +246,7 @@ fn apply_camera_values(
         ("latitude_min", &mut camera.latitude_min),
         ("latitude_max", &mut camera.latitude_max),
         ("fisheye_fov", &mut camera.fisheye_fov),
+        ("fisheye_lens", &mut camera.fisheye_lens),
     ] {
         if let Some(value) = values.get(field) {
             *destination = super::finite_number(
@@ -279,33 +283,39 @@ fn apply_camera_values(
             &operation_pointer(engine.operation_index, &format!("{prefix}fisheye_fov")),
         ));
     }
-    if !(camera.fisheye_fov >= crate::model::FISHEYE_FOV_MIN
-        && camera.fisheye_fov <= crate::model::BLENDER_TURN)
-    {
+    if values.contains_key("fisheye_lens") && !fisheye {
         return Err(engine.error(
-            ErrorCode::InvalidArgument,
-            "fisheye_fov must be between 0.1745 and 2π radians",
-            &operation_pointer(engine.operation_index, &format!("{prefix}fisheye_fov")),
+            ErrorCode::InvalidOperation,
+            "fisheye_lens applies only to fisheye cameras",
+            &operation_pointer(engine.operation_index, &format!("{prefix}fisheye_lens")),
         ));
     }
     // Blender clamps a camera value outside its RNA hard range on assignment, so Potter refuses such a value rather than
-    // exporting a silently different camera. The ranges are Blender 5.2.2's: lens and sensor width at least 1 mm, clip
-    // planes at least 1e-6, and fisheye_lens 0.01 to 100 (fisheye_fov is checked above). An equisolid camera holds its
-    // lens in `lens_mm` and its Blender `lens` is never written, so the fisheye lens range applies to it instead.
-    let equisolid = camera.projection == CameraProjection::Panorama
-        && camera.panorama_type == "fisheye_equisolid";
-    if equisolid {
-        if !(0.01..=100.0).contains(&camera.lens_mm) {
-            return Err(engine.error(
-                ErrorCode::InvalidArgument,
-                "lens_mm must be between 0.01 and 100 for fisheye_equisolid cameras",
-                &operation_pointer(engine.operation_index, &format!("{prefix}lens_mm")),
-            ));
-        }
-    } else if camera.lens_mm < 1.0 {
+    // exporting a silently different camera. The ranges are Blender 5.2.2's (`rna_camera.cc`): the fisheye field of view
+    // 10 degrees to 10π and the fisheye lens 0.01 to 100 mm, the lens and sensor width at least 1 mm, and the clip planes at
+    // least 1e-6. Blender stores the fisheye values on every camera, so an import holds them whatever the projection.
+    if !(crate::model::FISHEYE_FOV_MIN..=crate::model::FISHEYE_FOV_MAX)
+        .contains(&camera.fisheye_fov)
+    {
         return Err(engine.error(
             ErrorCode::InvalidArgument,
-            "lens_mm must be at least 1 for this camera",
+            "fisheye_fov must be between 0.1745 and 10π radians",
+            &operation_pointer(engine.operation_index, &format!("{prefix}fisheye_fov")),
+        ));
+    }
+    if !(crate::model::FISHEYE_LENS_MIN..=crate::model::FISHEYE_LENS_MAX)
+        .contains(&camera.fisheye_lens)
+    {
+        return Err(engine.error(
+            ErrorCode::InvalidArgument,
+            "fisheye_lens must be between 0.01 and 100 mm",
+            &operation_pointer(engine.operation_index, &format!("{prefix}fisheye_lens")),
+        ));
+    }
+    if camera.lens_mm < 1.0 {
+        return Err(engine.error(
+            ErrorCode::InvalidArgument,
+            "lens_mm must be at least 1",
             &operation_pointer(engine.operation_index, &format!("{prefix}lens_mm")),
         ));
     }
