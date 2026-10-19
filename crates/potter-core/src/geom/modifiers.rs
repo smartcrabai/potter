@@ -5005,13 +5005,16 @@ fn decimate_compact(
 /// order. Every mesh edge must appear once in `pool_order`, else the rebuilt mesh does not describe
 /// the decimated topology and the call fails.
 fn order_edges(mesh: &mut Mesh, pool_order: &[[usize; 2]]) -> Result<()> {
-    let mismatch = || {
+    let (rebuilt, pool) = (mesh.edges.len(), pool_order.len());
+    let mismatch = move || {
         PotError::new(
             ErrorCode::InternalError,
-            "decimate edge order does not match the rebuilt mesh",
+            format!(
+                "decimate edge order does not match the rebuilt mesh (rebuilt {rebuilt} edges, pool {pool} edges)"
+            ),
         )
     };
-    if mesh.edges.len() != pool_order.len() {
+    if rebuilt != pool {
         return Err(mismatch());
     }
     let index_of = id_indices(mesh);
