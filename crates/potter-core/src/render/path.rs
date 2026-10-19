@@ -779,7 +779,7 @@ fn trace_path(
 ) -> Result<(DVec3, f64)> {
     let mut radiance = DVec3::ZERO;
     let mut throughput = DVec3::ONE;
-    let mut alpha = 0.0;
+    let mut escaped = false;
     let mut previous = Scatter::Unsampled;
     let mut bounce = 0u32;
     let mut transparent_bounce = 0u32;
@@ -801,9 +801,6 @@ fn trace_path(
         }
         if throughput.max_element() <= 1.0e-8 {
             break;
-        }
-        if bounce == 0 {
-            alpha = 1.0 - (1.0 - alpha) * volume_segment.transmittance;
         }
         if let Some(event) = volume_segment.event {
             let scatter_probability = (event.albedo.x + event.albedo.y + event.albedo.z) / 3.0;
@@ -847,6 +844,7 @@ fn trace_path(
                 Scatter::Volume => 0.5,
             };
             radiance += throughput * environment * environment_weight;
+            escaped = true;
             break;
         };
         let surface = make_surface(
@@ -879,7 +877,6 @@ fn trace_path(
                 * (4.0 * std::f64::consts::PI);
             radiance += throughput * environment * in_scatter * phase;
             throughput *= transmittance;
-            alpha = 1.0 - (1.0 - alpha) * (transmittance.element_sum() / 3.0);
             if exits_medium {
                 origin = surface.point + direction * (distance + 2.0 * RAY_EPSILON);
             } else {
@@ -896,7 +893,6 @@ fn trace_path(
         }
         if terminate_on_next_surface {
             // Cycles shades the surface for emission, then ends the path (`integrate_surface_terminate`).
-            alpha = 1.0;
             radiance += throughput
                 * DVec3::from_array(surface.params.emission_color)
                 * surface.params.emission_strength.max(0.0);
@@ -908,7 +904,6 @@ fn trace_path(
             origin = offset_origin(surface.point, direction, surface.geometric_normal);
             continue;
         }
-        alpha = 1.0;
         radiance += throughput
             * DVec3::from_array(surface.params.emission_color)
             * surface.params.emission_strength;
@@ -971,6 +966,14 @@ fn trace_path(
             "path tracer produced a non-finite radiance value",
         ));
     }
+    // Cycles writes film transparency only for a path that escapes to the background, as
+    // `average(throughput)` (`intern/cycles/kernel/integrator/shade_background.h`). Every other
+    // termination leaves the pixel covered.
+    let alpha = if escaped {
+        1.0 - throughput.element_sum() / 3.0
+    } else {
+        1.0
+    };
     Ok((radiance.max(DVec3::ZERO), alpha.clamp(0.0, 1.0)))
 }
 
@@ -1543,7 +1546,7 @@ fn shadow_transmittance(
         // Cycles counts each transparent surface a shadow ray crosses against the path's remaining
         // budget and blocks the ray past it (`intern/cycles/kernel/bvh/intersect_filter.h`);
         // volume-bounds surfaces are not counted (`SD_HAS_ONLY_VOLUME`).
-        if surface.params.volume_density <= 0.0 {
+        if !surface.params.has_medium() {
             transparent_hits += 1;
             if transparent_hits > transparent_budget {
                 return Ok(0.0);
