@@ -336,17 +336,6 @@ pub(crate) struct ViewBasis {
     backward: DVec3,
 }
 
-impl Default for ViewBasis {
-    /// The view space of a camera at the origin looking down `-Z` with `+Y` up.
-    fn default() -> Self {
-        Self {
-            right: DVec3::X,
-            up: DVec3::Y,
-            backward: DVec3::Z,
-        }
-    }
-}
-
 impl ViewBasis {
     pub(crate) fn from_camera(camera: &Camera) -> Result<Self> {
         let (forward, right, up) = view_axes(camera)?;

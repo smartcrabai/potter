@@ -560,10 +560,18 @@ pub(super) fn extract_geometry(
                         element_index,
                         color,
                         alpha_mode: material.map_or(AlphaMode::Opaque, |material| {
-                            match material.alpha_mode.as_str() {
-                                "blend" => AlphaMode::Blend,
-                                "clip" => AlphaMode::Clip,
-                                _ => AlphaMode::Opaque,
+                            match (mode, &material.viewport_display) {
+                                // Workbench draws a viewport-displayed material through its transparent pass only
+                                // below full alpha (`Material::is_transparent`).
+                                (Mode::Solid, Some(viewport)) if viewport.diffuse_color[3] < 1.0 => {
+                                    AlphaMode::Blend
+                                }
+                                (Mode::Solid, Some(_)) => AlphaMode::Opaque,
+                                _ => match material.alpha_mode.as_str() {
+                                    "blend" => AlphaMode::Blend,
+                                    "clip" => AlphaMode::Clip,
+                                    _ => AlphaMode::Opaque,
+                                },
                             }
                         }),
                         alpha_threshold: material.map_or(0.5, |material| material.alpha_threshold),
@@ -1594,6 +1602,9 @@ impl SurfaceShader for SceneShader<'_> {
                     params.metallic,
                 ),
             };
+            // Workbench's transparency reads the viewport alpha (`workbench_private.hh`, `Material::is_transparent`),
+            // not the node tree's; a Potter-native material has no viewport values and keeps its base alpha.
+            let alpha = viewport.map_or(params.alpha, |viewport| viewport.diffuse_color[3]);
             let lit = studio::shade(
                 albedo,
                 roughness,
@@ -1601,7 +1612,7 @@ impl SurfaceShader for SceneShader<'_> {
                 self.view.to_view(facing),
                 self.view.to_view(hit.view),
             );
-            return Ok([lit.x, lit.y, lit.z, params.alpha]);
+            return Ok([lit.x, lit.y, lit.z, alpha]);
         }
         let shadow = self.geometry.shadows.as_ref().map(|shadows| {
             (
@@ -2323,7 +2334,7 @@ mod shading_normal_tests {
         triangle_corners, triangle_layer_colors, triangle_layer_uvs, world_face_normals,
     };
     use crate::render::principled_bsdf::{diffuse_coefficient, specular_coefficient};
-    use crate::render::raster::ViewBasis;
+    use crate::render::raster::{Camera, Projection, StereoMode, ViewBasis};
     use crate::shader::BsdfParams;
     use crate::{
         eval::{EvaluationContext, Snapshot},
@@ -2334,7 +2345,7 @@ mod shading_normal_tests {
         },
         graph::{GraphKind, GraphNode, NodeGroup},
         image::{ImageData, ImageInterpolation},
-        model::{Id, Material, MaterialLink, SceneDoc},
+        model::{Id, Material, MaterialLink, SceneDoc, ViewportDisplay},
         render::{
             light_model::{
                 AreaShape, area_irradiance_per_radiance, area_radiance, area_visibility_samples,
@@ -2693,7 +2704,19 @@ mod shading_normal_tests {
             &images,
             &geometry,
             Mode::Beauty,
-            ViewBasis::default(),
+            // Beauty shades in world space and ignores the view; any valid camera supplies the basis.
+            ViewBasis::from_camera(&Camera {
+                position: DVec3::new(0.0, 0.0, 2.5),
+                target: DVec3::ZERO,
+                up: DVec3::Y,
+                near: 0.1,
+                far: 100.0,
+                projection: Projection::Orthographic { height: 2.0 },
+                shift: [0.0; 2],
+                depth_of_field: None,
+                stereo_mode: StereoMode::None,
+                interocular_distance: 0.065,
+            })?,
         )
         .ok_or_else(|| PotError::new(ErrorCode::InternalError, "Beauty shader is missing"))?;
         let point = triangle.positions.iter().copied().sum::<DVec3>() / 3.0;
@@ -2849,6 +2872,64 @@ mod shading_normal_tests {
                 .expect("smooth sub-triangle keeps shading normals");
             assert!(normals.iter().all(|normal| normal.abs_diff_eq(face, 1e-9)));
         }
+    }
+
+    #[test]
+    fn solid_blends_a_viewport_material_only_below_full_viewport_alpha() -> crate::error::Result<()> {
+        let initial = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        let mut doc = crate::ops::apply_batch(
+            &initial,
+            &json!({
+                "schema_version": 1,
+                "base_revision": 0,
+                "operations": [
+                    {"op":"node.create","id":"body","kind":"plane","params":{"size":2.0}}
+                ]
+            }),
+        )?
+        .doc;
+        let body_id = Id::new("body")?;
+        let material_id = Id::new("glass")?;
+        let data_id = doc.nodes[&body_id]
+            .data
+            .clone()
+            .expect("plane has mesh data");
+        doc.data_blocks
+            .get_mut(&data_id)
+            .expect("plane data block exists")
+            .materials = vec![Some(material_id.clone())];
+        let body = doc.nodes.get_mut(&body_id).expect("body exists");
+        body.materials = vec![None];
+        body.material_links = vec![MaterialLink::Data];
+        // Solid reads the viewport alpha; Beauty keeps the node tree's alpha mode ("opaque" here).
+        for (alpha, transparent) in [(0.5, true), (1.0, false)] {
+            doc.materials.insert(
+                material_id.clone(),
+                Material {
+                    name: "Glass".to_owned(),
+                    base_color: [0.1, 0.6, 0.9, 1.0],
+                    viewport_display: Some(ViewportDisplay {
+                        diffuse_color: [0.8, 0.3, 0.2, alpha],
+                        roughness: 0.25,
+                        metallic: 0.5,
+                    }),
+                    ..Material::default()
+                },
+            );
+            for (mode, expected) in [(Mode::Solid, transparent), (Mode::Beauty, false)] {
+                let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
+                let geometry = extract_geometry(&doc, &snapshot, mode, false, &BTreeMap::new())?;
+                assert!(!geometry.triangles.is_empty(), "the plane has triangles");
+                for triangle in &geometry.triangles {
+                    assert_eq!(
+                        matches!(triangle.alpha_mode, AlphaMode::Blend),
+                        expected,
+                        "alpha {alpha} in {mode:?} must blend only when Solid's alpha is below one"
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]

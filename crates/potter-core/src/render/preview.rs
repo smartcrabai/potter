@@ -27,7 +27,7 @@ use super::{
 
 const MIN_SIZE: u32 = 64;
 const MAX_SIZE: u32 = 16_384;
-pub(super) const ENGINE: &str = "potter-cpu-path-3";
+pub(super) const ENGINE: &str = "potter-cpu-path-4";
 const VALID_VIEWS: [&str; 7] = ["front", "back", "right", "left", "top", "bottom", "iso"];
 
 #[derive(Clone, Debug)]
@@ -769,7 +769,7 @@ fn manifest_value(
         "ambient": if ambient { json!({ "color": [0.08, 0.08, 0.08], "source": "default_no_lights_or_world" }) } else { Value::Null },
         "engine": "cpu",
         "device": "cpu",
-        "view_transform": "sRGB standard",
+        "view_transform": scene.color_management.view_transform,
         "ocio": Value::Null,
     });
     let pick_policy = json!({

@@ -288,3 +288,81 @@ fn blender_workbench_display_options_import_as_reported_losses() -> TestResult {
     }
     Ok(())
 }
+
+/// Blender 5.2.2 oracle: a `.blend` whose node tree differs from its viewport display.
+const VIEWPORT_SCRIPT: &str = include_str!("fixtures/native_oracle/workbench_viewport_display.py");
+
+/// Solid preview of an imported `.blend` shades with the material's viewport display values, not its
+/// node tree, and applies the scene's view transform. Blender's Workbench render is the oracle for both
+/// the Standard and the AgX view, so a view-transform regression shows up as a pixel difference.
+#[test]
+fn blend_solid_preview_shades_with_viewport_display_under_the_scene_view_transform() -> TestResult {
+    let Some(blender) = blender_executable() else {
+        eprintln!("skipping the viewport display oracle; no executable Blender was found");
+        return Ok(());
+    };
+    for view_transform in ["Standard", "AgX"] {
+        let root = tempdir()?;
+        let oracle = root.path().join("oracle");
+        fs::create_dir(&oracle)?;
+        let blend = root.path().join("viewport-display.blend");
+        let script = write_script(root.path(), "workbench_viewport_display.py", VIEWPORT_SCRIPT)?;
+        run_blender_arguments(
+            &blender,
+            &script,
+            None,
+            &[
+                oracle.as_path(),
+                blend.as_path(),
+                Path::new(view_transform),
+            ],
+        )?;
+
+        let project = root.path().join("project");
+        pot_json(|command| {
+            command.arg("init").arg(&project);
+        })?;
+        // A strict import: the scene's Workbench options and view transform must import without a loss.
+        let imported = pot_json(|command| {
+            command
+                .arg("import")
+                .arg(&project)
+                .arg("--file")
+                .arg(&blend)
+                .args([
+                    "--format",
+                    "blend",
+                    "--mode",
+                    "replace",
+                    "--base-revision",
+                    "0",
+                    "--blender",
+                ])
+                .arg(&blender);
+        })?;
+        let mappings = &imported["result"]["id_mappings"];
+        for camera in ["perspective", "orthographic"] {
+            let camera_id = mappings[format!("Object:{camera}")]
+                .as_str()
+                .ok_or("camera ID mapping is missing")?;
+            let out = root.path().join(format!("preview-{camera}"));
+            let preview = pot_json(|command| {
+                command
+                    .arg("preview")
+                    .arg(&project)
+                    .args(["--camera", camera_id, "--mode", "solid", "--size", "128"])
+                    .arg("--out")
+                    .arg(&out);
+            })?;
+            let image = preview["result"]["previews"]
+                .as_array()
+                .and_then(|previews| previews.first())
+                .and_then(|item| item["image"].as_str())
+                .ok_or("preview result has no image path")?;
+            let solid = read_image(Path::new(image))?;
+            let reference = read_image(&oracle.join(format!("{camera}.png")))?;
+            assert_studio_lighting(&format!("{view_transform}/{camera}"), &reference, &solid);
+        }
+    }
+    Ok(())
+}
