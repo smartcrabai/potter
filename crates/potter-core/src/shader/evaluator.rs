@@ -1159,7 +1159,14 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
             NodeKind::Displacement => self.displacement(node_id, socket),
             NodeKind::ImageTexture => self.image_texture(node_id, socket),
             NodeKind::Emission => Ok(Value::Shader(self.emission(node_id)?)),
-            NodeKind::Diffuse => Ok(Value::Shader(self.diffuse(node_id)?)),
+            NodeKind::Diffuse => {
+                // Blender's Diffuse BSDF is a Lambert lobe with no specular. Its Roughness input is Oren-Nayar, which
+                // Potter does not evaluate, so the default dielectric layer must not come from it: keeping it made a
+                // roughness-0 floor under a sun a 1600x GGX spike (`source/blender/nodes/shader/nodes/node_shader_bsdf_diffuse.cc`).
+                let mut params = self.diffuse(node_id)?;
+                params.specular_ior_level = 0.0;
+                Ok(Value::Shader(params))
+            }
             NodeKind::Glossy => Ok(Value::Shader(self.glossy(node_id)?)),
             NodeKind::Glass => Ok(Value::Shader(self.glass(node_id)?)),
             NodeKind::Transparent => Ok(Value::Shader(self.transparent(node_id)?)),
