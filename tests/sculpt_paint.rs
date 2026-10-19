@@ -737,7 +737,7 @@ fn draw_respects_radius_and_mask_and_vertex_paint_updates_touched_corners()
     let painted_document: Value =
         serde_json::from_slice(&fs::read(paint_scene.join("scene.json"))?)?;
     assert_eq!(
-        painted_document["data_blocks"]["body_mesh"]["vertex_weights"]["6"]["bone"],
+        painted_document["data_blocks"]["body_mesh"]["vertex_weights"]["7"]["bone"],
         json!(0.25)
     );
     Ok(())
