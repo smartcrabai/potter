@@ -189,7 +189,16 @@ impl BsdfParams {
 
     fn mix(first: Self, second: Self, factor: f64) -> Self {
         let factor = bounded_factor(factor);
-        let mix_scalar = |a: f64, b: f64| a + (b - a) * factor;
+        // Alpha is the share of rays that reach the surface's own shading (Cycles' Transparent closure carries only
+        // that share). The shading mixes the arms by their share of the hits, so a Transparent arm adds no colour,
+        // reflectance, or transmission.
+        let alpha = (1.0 - factor) * first.alpha + factor * second.alpha;
+        let shade = if alpha > 0.0 {
+            factor * second.alpha / alpha
+        } else {
+            factor
+        };
+        let mix_scalar = |a: f64, b: f64| a + (b - a) * shade;
         let mix3 = |a: [f64; 3], b: [f64; 3]| {
             [
                 mix_scalar(a[0], b[0]),
@@ -211,7 +220,7 @@ impl BsdfParams {
             emission_strength: mix_scalar(first.emission_strength, second.emission_strength),
             transmission: mix_scalar(first.transmission, second.transmission),
             ior: mix_scalar(first.ior, second.ior),
-            alpha: mix_scalar(first.alpha, second.alpha),
+            alpha,
             reflectance: mix_scalar(first.reflectance, second.reflectance),
             subsurface_weight: mix_scalar(first.subsurface_weight, second.subsurface_weight),
             subsurface_radius: mix3(first.subsurface_radius, second.subsurface_radius),
@@ -243,7 +252,7 @@ impl BsdfParams {
                 second.volume_emission_strength,
             ),
             displacement_height: mix_scalar(first.displacement_height, second.displacement_height),
-            normal: normalize_or(first.normal.lerp(second.normal, factor), first.normal),
+            normal: normalize_or(first.normal.lerp(second.normal, shade), first.normal),
         }
     }
 
@@ -733,7 +742,9 @@ fn apply_material_textures(
         for (channel, texel) in params.base_color[..3].iter_mut().zip(pixel) {
             *channel *= texel;
         }
-        params.alpha *= pixel[3];
+        if alpha_linked {
+            params.alpha *= pixel[3];
+        }
     }
     if let Some(texture) = &material.roughness_texture {
         let layer = texture_layer(hit_ctx, texture);

@@ -1293,8 +1293,9 @@ fn make_surface(
     )?;
     let mut params =
         evaluate_surface_with_workspace(material, prepared, &context, evaluator_workspace)?;
+    // The graph is the only source of transparency for a material with one (Cycles ignores the render method).
     params.alpha = match material.alpha_mode.as_str() {
-        "opaque" => 1.0,
+        "opaque" if material.node_tree.is_none() => 1.0,
         "clip" => {
             if params.alpha >= material.alpha_threshold {
                 1.0
