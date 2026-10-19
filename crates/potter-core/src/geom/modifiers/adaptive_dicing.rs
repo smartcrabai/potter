@@ -13,6 +13,7 @@ use glam::{DMat4, DVec3};
 use crate::{
     error::{ErrorCode, PotError, Result},
     model::CameraProjection,
+    render::raster::{Camera, Projection, StereoMode, ray_for_sample},
 };
 
 use super::subdivision_limit::{LimitSurface, PatchCache, Sample, Samples};
@@ -35,7 +36,8 @@ pub(super) struct AdaptiveCamera {
     pub(super) sensor_width_mm: f64,
     pub(super) sensor_height_mm: f64,
     pub(super) sensor_fit: String,
-    pub(super) panorama_type: String,
+    /// The render projection of the stored camera, from `raster::projection_for_camera`.
+    pub(super) render_projection: Projection,
     pub(super) clip_start: f64,
     pub(super) ortho_scale: f64,
     pub(super) shift_x: f64,
@@ -162,18 +164,18 @@ impl CameraDicingFrame {
                     normalized(DVec3::new(0.0, -bottom.z, bottom.y)),
                 ];
             }
-            CameraProjection::Panorama | CameraProjection::Fisheye => {
+            CameraProjection::Panorama => {
                 let center = normalized(camera_to_world.transform_vector3(
-                    panorama_camera_direction(camera, width * 0.5, height * 0.5),
+                    panorama_camera_direction(camera, width * 0.5, height * 0.5)?,
                 ));
                 if center == DVec3::ZERO {
                     frame.panorama_pixel_scale = 0.0;
                 } else {
                     let right = normalized(camera_to_world.transform_vector3(
-                        panorama_camera_direction(camera, width * 0.5 + 1.0, height * 0.5),
+                        panorama_camera_direction(camera, width * 0.5 + 1.0, height * 0.5)?,
                     ));
                     let down = normalized(camera_to_world.transform_vector3(
-                        panorama_camera_direction(camera, width * 0.5, height * 0.5 + 1.0),
+                        panorama_camera_direction(camera, width * 0.5, height * 0.5 + 1.0)?,
                     ));
                     frame.panorama_pixel_scale =
                         f64::midpoint(right.distance(center), down.distance(center));
@@ -184,7 +186,7 @@ impl CameraDicingFrame {
         let positive_metric = match camera.projection {
             CameraProjection::Orthographic => frame.orthographic_pixel_width,
             CameraProjection::Perspective => frame.perspective_pixel_scale,
-            CameraProjection::Panorama | CameraProjection::Fisheye => frame.panorama_pixel_scale,
+            CameraProjection::Panorama => frame.panorama_pixel_scale,
         };
         if !positive_metric.is_finite() || positive_metric < 0.0 {
             return Err(PotError::new(
@@ -265,35 +267,42 @@ fn positive_camera_point(point: DVec3) -> DVec3 {
     DVec3::new(point.x, point.y, -point.z)
 }
 
-fn panorama_camera_direction(camera: &AdaptiveCamera, x: f64, y: f64) -> DVec3 {
-    let width = f64::from(camera.resolution[0]);
-    let height = f64::from(camera.resolution[1]);
-    let ndc_x = 2.0 * x / width - 1.0 + 2.0 * camera.shift_x;
-    let ndc_y = 1.0 - 2.0 * y / height + 2.0 * camera.shift_y;
-    if camera_is_fisheye(camera) {
-        let radius = ndc_x.hypot(ndc_y);
-        if radius > 1.0 {
-            return DVec3::ZERO;
-        }
-        let angle = radius * std::f64::consts::PI;
-        if radius <= f64::EPSILON {
-            return DVec3::new(0.0, 0.0, -1.0);
-        }
-        let sin_angle = angle.sin();
-        DVec3::new(
-            ndc_x / radius * sin_angle,
-            ndc_y / radius * sin_angle,
-            -angle.cos(),
-        )
-    } else {
-        let longitude = ndc_x * std::f64::consts::PI;
-        let latitude = ndc_y * std::f64::consts::FRAC_PI_2;
-        DVec3::new(
-            longitude.sin() * latitude.cos(),
-            latitude.sin(),
-            -longitude.cos() * latitude.cos(),
-        )
-    }
+/// The camera-local direction through a continuous pixel position, from the renderer's own ray function, so a pixel's
+/// estimated width is the width it renders at (Blender's equirectangular ranges and fisheye field of view included).
+/// Zero where the projection has no ray, outside a fisheye's circle.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the pixel is the floor of a non-negative coordinate, clamped to the image's last column and row"
+)]
+fn panorama_camera_direction(camera: &AdaptiveCamera, x: f64, y: f64) -> Result<DVec3> {
+    let [width, height] = camera.resolution;
+    let pixel_x = (x.floor().max(0.0) as u32).min(width.saturating_sub(1));
+    let pixel_y = (y.floor().max(0.0) as u32).min(height.saturating_sub(1));
+    // The camera sits at the origin looking down -Z, so the ray direction is the camera-local direction. The clip planes do
+    // not affect a ray, so they are the camera's own near plane and an unbounded far plane.
+    let local = Camera {
+        position: DVec3::ZERO,
+        target: -DVec3::Z,
+        up: DVec3::Y,
+        near: camera.clip_start,
+        far: f64::INFINITY,
+        projection: camera.render_projection,
+        shift: [camera.shift_x, camera.shift_y],
+        depth_of_field: None,
+        stereo_mode: StereoMode::None,
+        interocular_distance: 0.065,
+    };
+    let ray = ray_for_sample(
+        &local,
+        width,
+        height,
+        pixel_x,
+        pixel_y,
+        x - f64::from(pixel_x),
+        y - f64::from(pixel_y),
+    )?;
+    Ok(ray.map_or(DVec3::ZERO, |(_, direction)| direction))
 }
 
 /// Diced faces address the unique output vertex table described by `samples`.
@@ -961,8 +970,8 @@ fn validate_camera(camera: &AdaptiveCamera) -> Result<()> {
                 ));
             }
         }
-        // preview.rs:462-465 maps every non-fisheye stored panorama type to equirectangular.
-        CameraProjection::Panorama | CameraProjection::Fisheye => {}
+        // The panorama projection's parameters were validated when the render projection was built.
+        CameraProjection::Panorama => {}
     }
     Ok(())
 }
@@ -1244,7 +1253,7 @@ fn world_pixel_width(
                 frame.perspective_pixel_scale,
             )
         }
-        CameraProjection::Panorama | CameraProjection::Fisheye => (
+        CameraProjection::Panorama => (
             (distance + camera.clip_start) * frame.panorama_pixel_scale,
             0.0,
             0.0,
@@ -1579,14 +1588,6 @@ fn check_strip_capacity(
     builder.check_capacity(0, triangles, edge_temp_bytes)
 }
 
-// Match render/preview.rs:462-465: stored panorama type selects equirectangular or equidistant;
-// the separate Fisheye projection maps to equidistant.
-fn camera_is_fisheye(camera: &AdaptiveCamera) -> bool {
-    camera.projection == CameraProjection::Fisheye
-        || (camera.projection == CameraProjection::Panorama
-            && camera.panorama_type == "fisheye_equidistant")
-}
-
 fn shared_vertex_key(
     curve: CurveKey,
     parameter: f64,
@@ -1670,9 +1671,14 @@ fn dice_single_quad(
 mod tests {
     use super::{AdaptiveCamera, CameraDicingFrame, world_pixel_width};
     use crate::model::CameraProjection;
+    use crate::render::raster::Projection;
     use glam::{DMat4, DVec3};
 
-    fn camera(projection: CameraProjection, camera_to_world: DMat4) -> AdaptiveCamera {
+    fn camera(
+        projection: CameraProjection,
+        render_projection: Projection,
+        camera_to_world: DMat4,
+    ) -> AdaptiveCamera {
         AdaptiveCamera {
             world_to_camera: camera_to_world.inverse(),
             projection,
@@ -1680,7 +1686,7 @@ mod tests {
             sensor_width_mm: 36.0,
             sensor_height_mm: 24.0,
             sensor_fit: "AUTO".to_owned(),
-            panorama_type: "equirectangular".to_owned(),
+            render_projection,
             clip_start: 0.1,
             ortho_scale: 8.0,
             shift_x: 0.0,
@@ -1705,14 +1711,34 @@ mod tests {
             position.extend(1.0),
         );
 
-        for projection in [
-            CameraProjection::Orthographic,
-            CameraProjection::Perspective,
-            CameraProjection::Panorama,
-            CameraProjection::Fisheye,
-        ] {
-            let unit_camera = camera(projection, unit);
-            let scaled_camera = camera(projection, scaled);
+        let full = std::f64::consts::PI;
+        let projections = [
+            (
+                CameraProjection::Orthographic,
+                Projection::Orthographic { height: 8.0 },
+            ),
+            (
+                CameraProjection::Perspective,
+                Projection::Perspective {
+                    lens_mm: 50.0,
+                    sensor_width_mm: 36.0,
+                },
+            ),
+            (
+                CameraProjection::Panorama,
+                Projection::Equirectangular {
+                    longitude: [-full, full],
+                    latitude: [-0.5 * full, 0.5 * full],
+                },
+            ),
+            (
+                CameraProjection::Panorama,
+                Projection::FisheyeEquidistant { fov: full },
+            ),
+        ];
+        for (projection, render_projection) in projections {
+            let unit_camera = camera(projection, render_projection, unit);
+            let scaled_camera = camera(projection, render_projection, scaled);
             let unit_frame = CameraDicingFrame::build(&unit_camera).unwrap();
             let scaled_frame = CameraDicingFrame::build(&scaled_camera).unwrap();
             assert_eq!(

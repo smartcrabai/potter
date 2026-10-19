@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{ErrorCode, PotError, Result};
 use crate::float::equal_f64;
+use crate::model::{CameraData, CameraProjection};
 
 /// A camera projection in Blender's units: angles in radians, lengths in millimetres.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -1157,6 +1158,52 @@ fn camera_frame(camera: &Camera, width: u32, height: u32) -> Result<CameraFrame>
 
 fn is_valid_fov(fov: f64) -> bool {
     fov.is_finite() && fov > 0.0 && fov <= crate::model::BLENDER_TURN
+}
+
+/// The render projection of a stored camera. Panorama types and fisheye settings come from the camera data. The renderer,
+/// the preview, and adaptive dicing all map a camera through this one function.
+pub(crate) fn projection_for_camera(camera_data: &CameraData) -> Result<Projection> {
+    Ok(match camera_data.projection {
+        CameraProjection::Orthographic => Projection::Orthographic {
+            height: camera_data.ortho_scale,
+        },
+        CameraProjection::Perspective => Projection::Perspective {
+            lens_mm: camera_data.lens_mm,
+            sensor_width_mm: camera_data.sensor_width_mm,
+        },
+        CameraProjection::Panorama => match camera_data.panorama_type.as_str() {
+            "equirectangular" => Projection::Equirectangular {
+                longitude: [camera_data.longitude_min, camera_data.longitude_max],
+                latitude: [camera_data.latitude_min, camera_data.latitude_max],
+            },
+            "fisheye_equidistant" => Projection::FisheyeEquidistant {
+                fov: camera_data.fisheye_fov,
+            },
+            "fisheye_equisolid" => Projection::FisheyeEquisolid {
+                fov: camera_data.fisheye_fov,
+                lens_mm: camera_data.lens_mm,
+                sensor_width_mm: camera_data.sensor_width_mm,
+                sensor_height_mm: camera_data.sensor_height_mm,
+                sensor_fit: sensor_fit(&camera_data.sensor_fit)?,
+            },
+            _ => {
+                return Err(PotError::invalid_argument(
+                    "camera panorama_type must be equirectangular, fisheye_equidistant, or fisheye_equisolid",
+                ));
+            }
+        },
+    })
+}
+
+fn sensor_fit(name: &str) -> Result<SensorFit> {
+    match name {
+        "AUTO" => Ok(SensorFit::Auto),
+        "HORIZONTAL" => Ok(SensorFit::Horizontal),
+        "VERTICAL" => Ok(SensorFit::Vertical),
+        _ => Err(PotError::invalid_argument(
+            "camera sensor_fit must be AUTO, HORIZONTAL, or VERTICAL",
+        )),
+    }
 }
 
 pub(crate) fn ambient_visibility(

@@ -19,7 +19,7 @@ use crate::{
 
 use super::{
     raster::{
-        Camera, DepthOfField, Mode, Projection, RasterOutput, SensorFit, StereoMode,
+        Camera, DepthOfField, Mode, Projection, RasterOutput, StereoMode, projection_for_camera,
         rasterize_with_lines,
     },
     scene::{Geometry, extract_geometry, surface_shader},
@@ -45,6 +45,8 @@ pub struct PreviewRequest<'a> {
 #[derive(Clone, Debug)]
 struct PreparedCamera {
     camera: Camera,
+    /// The camera data the render was prepared from, which adaptive dicing reads so its pixel estimate matches the render.
+    data: CameraData,
     projection_name: &'static str,
     matrix: [f64; 16],
 }
@@ -506,6 +508,11 @@ fn preset_camera(geometry: &Geometry, view: &str) -> Result<PreparedCamera> {
     let matrix = camera_matrix(position, target, up_hint);
     Ok(PreparedCamera {
         camera,
+        data: CameraData {
+            projection: CameraProjection::Orthographic,
+            ortho_scale: ortho_height,
+            ..CameraData::default()
+        },
         projection_name: "orthographic",
         matrix,
     })
@@ -549,7 +556,7 @@ fn stored_camera(doc: &SceneDoc, snapshot: &Snapshot, camera_id: &str) -> Result
         ));
     }
     let target = position + forward;
-    let projection = camera_projection(camera_data)?;
+    let projection = projection_for_camera(camera_data)?;
     let projection_name = match camera_data.projection {
         CameraProjection::Orthographic => "orthographic",
         CameraProjection::Perspective => "perspective",
@@ -579,54 +586,10 @@ fn stored_camera(doc: &SceneDoc, snapshot: &Snapshot, camera_id: &str) -> Result
     };
     Ok(PreparedCamera {
         camera,
+        data: camera_data.clone(),
         projection_name,
         matrix: evaluated.world_matrix,
     })
-}
-
-/// The render projection of a stored camera. Panorama types and fisheye settings come from the camera data.
-fn camera_projection(camera_data: &CameraData) -> Result<Projection> {
-    Ok(match camera_data.projection {
-        CameraProjection::Orthographic => Projection::Orthographic {
-            height: camera_data.ortho_scale,
-        },
-        CameraProjection::Perspective => Projection::Perspective {
-            lens_mm: camera_data.lens_mm,
-            sensor_width_mm: camera_data.sensor_width_mm,
-        },
-        CameraProjection::Panorama => match camera_data.panorama_type.as_str() {
-            "equirectangular" => Projection::Equirectangular {
-                longitude: [camera_data.longitude_min, camera_data.longitude_max],
-                latitude: [camera_data.latitude_min, camera_data.latitude_max],
-            },
-            "fisheye_equidistant" => Projection::FisheyeEquidistant {
-                fov: camera_data.fisheye_fov,
-            },
-            "fisheye_equisolid" => Projection::FisheyeEquisolid {
-                fov: camera_data.fisheye_fov,
-                lens_mm: camera_data.lens_mm,
-                sensor_width_mm: camera_data.sensor_width_mm,
-                sensor_height_mm: camera_data.sensor_height_mm,
-                sensor_fit: sensor_fit(&camera_data.sensor_fit)?,
-            },
-            _ => {
-                return Err(PotError::invalid_argument(
-                    "camera panorama_type must be equirectangular, fisheye_equidistant, or fisheye_equisolid",
-                ));
-            }
-        },
-    })
-}
-
-fn sensor_fit(name: &str) -> Result<SensorFit> {
-    match name {
-        "AUTO" => Ok(SensorFit::Auto),
-        "HORIZONTAL" => Ok(SensorFit::Horizontal),
-        "VERTICAL" => Ok(SensorFit::Vertical),
-        _ => Err(PotError::invalid_argument(
-            "camera sensor_fit must be AUTO, HORIZONTAL, or VERTICAL",
-        )),
-    }
 }
 
 fn camera_matrix(position: DVec3, target: DVec3, up_hint: DVec3) -> [f64; 16] {
@@ -643,34 +606,8 @@ fn camera_matrix(position: DVec3, target: DVec3, up_hint: DVec3) -> [f64; 16] {
 }
 
 fn adaptive_camera_override(camera: &PreparedCamera) -> AdaptiveCameraOverride {
-    let mut data = CameraData {
-        shift: camera.camera.shift,
-        ..Default::default()
-    };
-    match camera.camera.projection {
-        Projection::Orthographic { height } => {
-            data.projection = CameraProjection::Orthographic;
-            data.ortho_scale = height;
-        }
-        Projection::Perspective {
-            lens_mm,
-            sensor_width_mm,
-        } => {
-            data.projection = CameraProjection::Perspective;
-            data.lens_mm = lens_mm;
-            data.sensor_width_mm = sensor_width_mm;
-        }
-        Projection::Panorama { fisheye } => {
-            data.projection = CameraProjection::Panorama;
-            data.panorama_type = if fisheye {
-                "fisheye_equidistant".to_owned()
-            } else {
-                "equirectangular".to_owned()
-            };
-        }
-    }
     AdaptiveCameraOverride {
-        data,
+        data: camera.data.clone(),
         world_to_camera: DMat4::from_cols_array(&camera.matrix)
             .inverse()
             .to_cols_array(),
