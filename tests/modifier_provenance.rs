@@ -394,9 +394,24 @@ fn weld_and_subdivision_remap_corner_colours_from_oracle() -> TestResult {
         &[modifier("weld", json!({"merge_threshold":0.001}))?],
         "WeldPair",
     )?;
+    // Blender stores FLOAT corner attributes as f32 (a 5.2.2 readback of 1.1 gives 1.100000023841858), so the
+    // expected values are the f32 of each input.
     assert_eq!(
         sorted_corner_values_by_face(&welded, "Col")?,
-        vec![vec![1.0, 1.1, 1.2, 1.3], vec![2.0, 2.1, 2.2, 2.3]]
+        vec![
+            vec![
+                1.0,
+                f64::from(1.1_f32),
+                f64::from(1.2_f32),
+                f64::from(1.3_f32)
+            ],
+            vec![
+                2.0,
+                f64::from(2.1_f32),
+                f64::from(2.2_f32),
+                f64::from(2.3_f32)
+            ],
+        ]
     );
 
     let mut subdivision_mesh = Mesh::from_positions_and_faces(
