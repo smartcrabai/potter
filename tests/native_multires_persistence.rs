@@ -1,4 +1,4 @@
-//! Blender 5.2.2 multires persistence through Potter's native MDisps bridge.
+//! Blender 5.2.2 multires persistence through Potter's native `MDisps` bridge.
 
 #[path = "common/blender_checked.rs"]
 mod blender_checked;

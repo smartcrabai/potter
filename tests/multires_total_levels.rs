@@ -1,8 +1,3 @@
-#![expect(
-    clippy::unwrap_used,
-    reason = "integration-test setup uses fixed valid data"
-)]
-
 use std::{error::Error, fs, process::Command};
 
 use serde_json::{Value, json};
