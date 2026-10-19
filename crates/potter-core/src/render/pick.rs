@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use crate::{
     cli::PickDomain,
     error::{ErrorCode, PotError, Result},
-    eval::{EvaluationContext, EvaluationPurpose, Snapshot},
+    eval::{AdaptiveRenderRequest, EvaluationContext, EvaluationPurpose, Snapshot},
     hash,
     model::{Id, SceneDoc},
 };
@@ -47,6 +47,8 @@ struct Manifest {
     render_key: String,
     width: u32,
     height: u32,
+    #[serde(default)]
+    adaptive_render: Option<AdaptiveRenderRequest>,
 }
 
 #[derive(Debug, Deserialize, serde::Serialize)]
@@ -177,6 +179,7 @@ pub fn pick(
         scene_id: Some(scene_id),
         view_layer: manifest.view_layer.clone(),
         frame: Some(manifest.frame),
+        adaptive_render: manifest.adaptive_render.clone(),
         purpose,
     };
     let snapshot =
@@ -375,6 +378,12 @@ fn verify_render_key(manifest: &Manifest) -> Result<()> {
             format!("camera serialization failed: {error}"),
         )
     })?;
+    let adaptive_render = serde_json::to_value(&manifest.adaptive_render).map_err(|error| {
+        PotError::new(
+            ErrorCode::InternalError,
+            format!("adaptive render serialization failed: {error}"),
+        )
+    })?;
     let mut core = json!({
         "scene_id": manifest.scene_id,
         "revision": manifest.revision,
@@ -386,6 +395,7 @@ fn verify_render_key(manifest: &Manifest) -> Result<()> {
         "view_layer": manifest.view_layer,
         "view": manifest.view,
         "camera": camera,
+        "adaptive_render": adaptive_render,
         "units": manifest.units,
         "settings": manifest.settings,
         "pick_policy": manifest.pick_policy,

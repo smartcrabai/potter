@@ -46,6 +46,27 @@ pub(crate) fn type_spec(family: ParameterFamily, kind: &str) -> Option<&'static 
     type_specs(family)?.get(kind)
 }
 
+/// The RNA property pairs that read and write one stored Blender value for a modifier type, from the
+/// table's `aliases` (generated and checked against Blender by `tests/fixtures/param_audit/generate.py`).
+pub(crate) fn rna_aliases(family: ParameterFamily, kind: &str) -> Vec<Vec<&'static str>> {
+    type_spec(family, kind)
+        .and_then(|spec| spec.get("aliases"))
+        .and_then(Value::as_array)
+        .map(|groups| {
+            groups
+                .iter()
+                .filter_map(|group| {
+                    group
+                        .as_array()?
+                        .iter()
+                        .map(|name| name.as_str())
+                        .collect::<Option<Vec<&'static str>>>()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 pub(crate) fn params_schema(family: ParameterFamily, kind: &str) -> Option<Value> {
     let type_spec = type_spec(family, kind)?;
     Some(json!({

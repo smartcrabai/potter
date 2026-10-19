@@ -113,6 +113,7 @@ fn bind_modifier(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Res
                 scene_id: None,
                 view_layer: None,
                 frame: Some(engine.evaluation_frame),
+                adaptive_render: None,
                 purpose: EvaluationPurpose::Preview,
             },
             engine.asset_root,
@@ -330,7 +331,9 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
     let enabled = read_bool(engine, operation, "enabled", true)?;
     let show_viewport = read_bool(engine, operation, "show_viewport", true)?;
     let show_render = read_bool(engine, operation, "show_render", true)?;
-    let params = read_params(engine, operation.get("params"), "params")?;
+    let raw_params = read_params(engine, operation.get("params"), "params")?;
+    let mut params = raw_params.clone();
+    synchronize_rna_aliases(engine, &modifier_type, &raw_params, &mut params)?;
     validate_parameter_map(
         engine,
         ParameterFamily::Modifier,
@@ -487,28 +490,58 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                 })
             })
             .transpose()?;
-        let modifier_params = if let Some(params) = params {
+        let modifier_params = if let Some(raw) = params {
+            // The same type merges into the current params (RNA property semantics). A type change
+            // replaces them, because the old params do not belong to the new type. A JSON null
+            // removes its key. Validation runs on the complete merged result, not the changed keys,
+            // so a partial update is judged the way the modifier will actually evaluate.
+            let mut candidate = if modifier_type == existing.modifier_type {
+                existing.params.clone()
+            } else {
+                Map::new()
+            };
+            for (key, value) in &raw {
+                if value.is_null() {
+                    candidate.remove(key);
+                } else {
+                    candidate.insert(key.clone(), value.clone());
+                }
+            }
+            synchronize_rna_aliases(engine, modifier_type, &raw, &mut candidate)?;
             validate_parameter_map(
                 engine,
                 ParameterFamily::Modifier,
                 modifier_type,
-                &params,
+                &candidate,
                 "/set/params",
             )?;
-            validate_modifier_resource(engine, modifier_type, &params, "/set/params")?;
+            validate_modifier_resource(engine, modifier_type, &candidate, "/set/params")?;
             if modifier_type == "volume_displace" {
-                validate_volume_displace_params(engine, &params)?;
+                validate_volume_displace_params(engine, &candidate)?;
             } else if is_attribute_modifier_type(modifier_type) {
-                validate_attribute_modifier_params(engine, modifier_type, &params, "/set/params")?;
+                validate_attribute_modifier_params(
+                    engine,
+                    modifier_type,
+                    &candidate,
+                    "/set/params",
+                )?;
             }
-            validate_particle_modifier_params(engine, modifier_type, &params)?;
-            Some(super::physics::update_linked_modifier_settings(
+            validate_particle_modifier_params(engine, modifier_type, &candidate)?;
+            let assigned: Map<String, Value> = raw
+                .iter()
+                .filter(|(_, value)| !value.is_null())
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            let linked = super::physics::update_linked_modifier_settings(
                 engine,
                 &target,
                 &id,
                 modifier_type,
-                &params,
-            )?)
+                &assigned,
+            )?;
+            let mut merged = candidate;
+            merged.extend(linked);
+            Some(merged)
         } else {
             None
         };
@@ -587,6 +620,47 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
         }
     }
     Ok(changed)
+}
+
+/// Keeps every RNA alias group of a modifier type equal. The members of a group read and write one stored
+/// Blender value (`rna_modifier.cc`; the table's `aliases` are found from Blender by
+/// `tests/fixtures/param_audit/generate.py`). The graph keeps every key from import, so an update that names
+/// one member sets the rest of its group to the same value. Otherwise the exporter writes the keys in sorted
+/// order and a stale member wins. A JSON null for any member restores the default for the group. Two different
+/// values for one group in one update are refused, because Blender holds one value.
+fn synchronize_rna_aliases(
+    engine: &Engine<'_>,
+    modifier_type: &str,
+    raw: &Map<String, Value>,
+    candidate: &mut Map<String, Value>,
+) -> Result<()> {
+    for group in params::rna_aliases(ParameterFamily::Modifier, modifier_type) {
+        let touched: Vec<&Value> = group.iter().filter_map(|key| raw.get(*key)).collect();
+        if touched.is_empty() {
+            continue;
+        }
+        if touched.iter().any(|value| value.is_null()) {
+            for key in &group {
+                candidate.remove(*key);
+            }
+            continue;
+        }
+        if touched.iter().any(|value| *value != touched[0]) {
+            return Err(engine.error(
+                ErrorCode::InvalidOperation,
+                format!(
+                    "{} are one Blender value; set one value",
+                    group.join(" and ")
+                ),
+                "/set/params",
+            ));
+        }
+        let value = touched[0].clone();
+        for key in &group {
+            candidate.insert((*key).to_owned(), value.clone());
+        }
+    }
+    Ok(())
 }
 
 fn delete(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bool> {
@@ -703,7 +777,7 @@ fn reorder(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bo
 }
 
 /// Blender's `ModifierTypeType::OnlyDeform` for each Potter modifier type.
-fn only_deform(modifier_type: &str) -> bool {
+pub(crate) fn only_deform(modifier_type: &str) -> bool {
     matches!(
         modifier_type,
         "armature"
@@ -1299,6 +1373,7 @@ fn evaluate_modifier_output(
                     )),
                 },
                 |_, modifier| modifier.enabled,
+                None,
                 |mesh, modifier, modifier_warnings| {
                     let result = match modifier.modifier_type.as_str() {
                         "armature" => crate::eval::rig::apply_armature_modifier_with_drivers(
