@@ -125,6 +125,8 @@ struct State {
     input_loose_edge_sources: HashSet<i32>,
     edge_splits: HashMap<EdgeKey, Vec<usize>>,
     face_cuts: HashMap<usize, Vec<EdgeKey>>,
+    /// Faces in the order each first gained a cut edge: Blender's `face_edges` `GHash` insertion order.
+    face_cut_order: Vec<usize>,
     wire_edges: HashSet<EdgeKey>,
     /// Split-net edges that no output face loops (Blender keeps an edge with no loops as wire).
     dangling_edges: HashSet<EdgeKey>,
@@ -149,6 +151,7 @@ impl State {
             input_loose_edge_sources: HashSet::new(),
             edge_splits: HashMap::new(),
             face_cuts: HashMap::new(),
+            face_cut_order: Vec::new(),
             wire_edges: HashSet::new(),
             dissolve_verts: Vec::new(),
             edge_tri_cache: HashMap::new(),
@@ -187,6 +190,14 @@ impl State {
             self.edge_start.insert(key, start);
         }
         self.disk_attach(key);
+    }
+
+    /// Records `face` in `face_cut_order` when it first gains a cut, as Blender `face_edges_add` inserts
+    /// the face's `face_edges` key at that moment (`bmesh_intersect.cc` 198-205).
+    fn note_face_cut(&mut self, face: usize) {
+        if !self.face_cuts.contains_key(&face) {
+            self.face_cut_order.push(face);
+        }
     }
 
     /// Blender `bmesh_disk_edge_remove` at `at`.
@@ -704,12 +715,14 @@ fn joined_boolean_source(subject: &Mesh, operand: &Mesh) -> Result<Mesh> {
             matrix: DMat4::IDENTITY,
             material_offset: 0,
             slot_count: material_slot_count(subject),
+            adaptive_normals: None,
         },
         Part {
             mesh: Cow::Borrowed(operand),
             matrix: DMat4::IDENTITY,
             material_offset: 0,
             slot_count: material_slot_count(operand),
+            adaptive_normals: None,
         },
     ])?;
     transfer_float_joined_defaults(subject, operand, &mut source);
@@ -3015,6 +3028,7 @@ fn intersect_tri_pair(
         state.wire_edges.insert(edge);
         state.attach_created_edge(verts_a[0], verts_a[1]);
         if !face_has_edge(&state.faces[face_a], edge) {
+            state.note_face_cut(face_a);
             let cuts = state.face_cuts.entry(face_a).or_default();
             if !cuts.contains(&edge) {
                 cuts.push(edge);
@@ -3026,6 +3040,7 @@ fn intersect_tri_pair(
         state.wire_edges.insert(edge);
         state.attach_created_edge(verts_b[0], verts_b[1]);
         if !face_has_edge(&state.faces[face_b], edge) {
+            state.note_face_cut(face_b);
             let cuts = state.face_cuts.entry(face_b).or_default();
             if !cuts.contains(&edge) {
                 cuts.push(edge);
@@ -3376,14 +3391,21 @@ fn split_input_edges(state: &mut State) {
 fn split_faces(state: &mut State) {
     let old_faces = std::mem::take(&mut state.faces);
     let old_cuts = std::mem::take(&mut state.face_cuts);
+    let face_cut_order = std::mem::take(&mut state.face_cut_order);
+    debug_assert_eq!(
+        face_cut_order.len(),
+        old_cuts.len(),
+        "every cut face is in the GHash order"
+    );
     let positions: Vec<P3> = state.verts.iter().map(|vertex| vertex.co).collect();
-    let mut new_faces: Vec<Face> = Vec::new();
     let mut dangling: HashSet<EdgeKey> = HashSet::new();
-    for (index, face) in old_faces.iter().enumerate() {
-        let Some(cuts) = old_cuts.get(&index) else {
-            new_faces.push(face.clone());
-            continue;
-        };
+    // Each old face's emitted faces once it is split (or kept); `None` while it is still unsplit.
+    let mut emitted: Vec<Option<Vec<Face>>> = vec![None; old_faces.len()];
+    // Blender splits faces in `face_edges` GHash order (`bmesh_intersect.cc` 1451-1461), not index order.
+    // The order decides which walk writes each vertex's disk head last.
+    for index in blender_hash_order(&face_cut_order) {
+        let face = &old_faces[index];
+        let cuts = &old_cuts[&index];
         // Blender's edge net: the cut edges in stored order (most recent first), then the connect
         // edges that `BM_face_split_edgenet_connect_islands` appends.
         let net: Vec<(usize, usize)> = cuts.iter().rev().copied().collect();
@@ -3404,12 +3426,17 @@ fn split_faces(state: &mut State) {
         }
         let mut edge_net = net;
         edge_net.extend(connects);
-        // The mesh's other faces: the originals not yet split, then the faces already emitted.
-        let mut mesh_faces: Vec<Vec<usize>> = old_faces[index + 1..]
-            .iter()
-            .map(|other| other.verts.clone())
-            .collect();
-        mesh_faces.extend(new_faces.iter().map(|other| other.verts.clone()));
+        // The mesh's other faces as they stand now: split faces are already emitted, the rest are originals.
+        let mut mesh_faces: Vec<Vec<usize>> = Vec::with_capacity(old_faces.len());
+        for (other, other_face) in old_faces.iter().enumerate() {
+            if other == index {
+                continue;
+            }
+            match &emitted[other] {
+                Some(done) => mesh_faces.extend(done.iter().map(|split| split.verts.clone())),
+                None => mesh_faces.push(other_face.verts.clone()),
+            }
+        }
         let split = super::float_split_net::face_split_edgenet_with_mesh(
             &face.verts,
             &edge_net,
@@ -3426,45 +3453,106 @@ fn split_faces(state: &mut State) {
                 state.disk[v].rotate_left(at);
             }
         }
-        if split.faces.is_empty() {
+        let produced: Vec<Face> = if split.faces.is_empty() {
             dangling.extend(edge_net.iter().map(|&(a, b)| edge_key_usize(a, b)));
-            new_faces.push(face.clone());
+            vec![face.clone()]
         } else {
             dangling.extend(split.dangling.iter().map(|&(a, b)| edge_key_usize(a, b)));
             // A net vertex interpolates over the split-time ring of `face` (`BM_face_split_edgenet`
             // step 2 weights it over `f`'s loops), so the ring's interpolable values blend there.
             let ring_interp = FloatPolyInterpolator::new(&points);
-            for (ring, sources) in split.faces.into_iter().zip(split.corner_sources) {
-                // Blender's loop pass: a ring-vertex corner copies the face's loop. A net vertex
-                // interpolates interpolable layers over the ring. Copy-only layers keep the default
-                // there.
-                let loops = ring
-                    .iter()
-                    .zip(sources)
-                    .map(|(&vertex, source)| match source {
-                        CornerSource::Original(corner) => face.loops[corner].clone(),
-                        CornerSource::Interpolated => FaceLoop {
-                            copy: None,
-                            value: LoopValue::blend(
-                                face.loops
-                                    .iter()
-                                    .map(|ring_loop| ring_loop.value.clone())
-                                    .zip(ring_interp.weights(state.verts[vertex].co)),
-                            ),
-                        },
-                    })
-                    .collect();
-                new_faces.push(Face {
-                    verts: ring,
-                    loops,
-                    side: face.side,
-                    source: face.source,
-                });
-            }
+            split
+                .faces
+                .into_iter()
+                .zip(split.corner_sources)
+                .map(|(ring, sources)| {
+                    // Blender's loop pass: a ring-vertex corner copies the face's loop. A net vertex
+                    // interpolates interpolable layers over the ring. Copy-only layers keep the default
+                    // there.
+                    let loops = ring
+                        .iter()
+                        .zip(sources)
+                        .map(|(&vertex, source)| match source {
+                            CornerSource::Original(corner) => face.loops[corner].clone(),
+                            CornerSource::Interpolated => FaceLoop {
+                                copy: None,
+                                value: LoopValue::blend(
+                                    face.loops
+                                        .iter()
+                                        .map(|ring_loop| ring_loop.value.clone())
+                                        .zip(ring_interp.weights(state.verts[vertex].co)),
+                                ),
+                            },
+                        })
+                        .collect();
+                    Face {
+                        verts: ring,
+                        loops,
+                        side: face.side,
+                        source: face.source,
+                    }
+                })
+                .collect()
+        };
+        emitted[index] = Some(produced);
+    }
+    // Output keeps face index order; only the split sequence follows Blender's hash order.
+    let mut new_faces: Vec<Face> = Vec::new();
+    for (index, face) in old_faces.into_iter().enumerate() {
+        match emitted[index].take() {
+            Some(done) => new_faces.extend(done),
+            None => new_faces.push(face),
         }
     }
     state.faces = new_faces;
     state.dangling_edges = dangling;
+}
+
+/// Blender's `GHash` iteration order for int keys (`BLI_ghash_int_new`) inserted in `keys` order.
+/// A bucket is `hash % nbuckets` over the prime sizes of `BLI_ghash.cc` (`GHASH_USE_MODULO_BUCKETS`).
+/// An insert prepends to its bucket, and growth rehashes the old buckets in order, prepending each entry.
+/// Iteration walks buckets ascending, each chain from its head (`BLI_ghashIterator_init` and `_step`).
+fn blender_hash_order(keys: &[usize]) -> Vec<usize> {
+    const HASHSIZES: [u32; 27] = [
+        5, 11, 17, 37, 67, 131, 257, 521, 1031, 2053, 4099, 8209, 16411, 32771, 65537, 131101,
+        262147, 524309, 1048583, 2097169, 4194319, 8388617, 16777259, 33554467, 67108879,
+        134217757, 268435459,
+    ];
+    // `BLI_ghashutil_inthash_p` (`BLI_ghash_utils.cc`).
+    fn int_hash(key: usize) -> u32 {
+        let mut key = key as u64;
+        key = key.wrapping_add(!(key << 16));
+        key ^= key >> 5;
+        key = key.wrapping_add(key << 3);
+        key ^= key >> 13;
+        key = key.wrapping_add(!(key << 9));
+        key ^= key >> 17;
+        key as u32
+    }
+    let mut cursize = 0_usize;
+    let mut buckets: Vec<VecDeque<usize>> = vec![VecDeque::new(); HASHSIZES[0] as usize];
+    let mut limit_grow = (HASHSIZES[0] * 3 / 4) as usize;
+    let mut nentries = 0_usize;
+    for &key in keys {
+        let nbuckets = buckets.len() as u32;
+        buckets[(int_hash(key) % nbuckets) as usize].push_front(key);
+        nentries += 1;
+        if nentries > limit_grow && cursize + 1 < HASHSIZES.len() {
+            while nentries > limit_grow && cursize + 1 < HASHSIZES.len() {
+                cursize += 1;
+                limit_grow = (HASHSIZES[cursize] * 3 / 4) as usize;
+            }
+            let new_nbuckets = HASHSIZES[cursize];
+            let mut grown: Vec<VecDeque<usize>> = vec![VecDeque::new(); new_nbuckets as usize];
+            for chain in &buckets {
+                for &entry in chain {
+                    grown[(int_hash(entry) % new_nbuckets) as usize].push_front(entry);
+                }
+            }
+            buckets = grown;
+        }
+    }
+    buckets.into_iter().flatten().collect()
 }
 
 /// The edges of a face ring, each as a sorted key.
