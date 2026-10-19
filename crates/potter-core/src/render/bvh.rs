@@ -112,7 +112,20 @@ impl Bvh {
         t_min: f64,
         t_max: f64,
     ) -> Option<BvhHit> {
-        self.closest_hit_mode(triangles, origin, direction, t_min, t_max, true)
+        self.closest_hit_where(triangles, origin, direction, t_min, t_max, &|_| true)
+    }
+
+    /// The nearest hit among the triangles `accepts` admits, so a ray passes through the others.
+    pub(crate) fn closest_hit_where(
+        &self,
+        triangles: &[Triangle],
+        origin: DVec3,
+        direction: DVec3,
+        t_min: f64,
+        t_max: f64,
+        accepts: &dyn Fn(&Triangle) -> bool,
+    ) -> Option<BvhHit> {
+        self.closest_hit_mode(triangles, origin, direction, t_min, t_max, true, accepts)
     }
 
     /// Clears `out` and fills it with the index of every primitive whose leaf bounds the ray
@@ -152,6 +165,10 @@ impl Bvh {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "closest-hit queries carry sidedness and the triangle filter through traversal"
+    )]
     fn closest_hit_mode(
         &self,
         triangles: &[Triangle],
@@ -160,6 +177,7 @@ impl Bvh {
         t_min: f64,
         t_max: f64,
         two_sided: bool,
+        accepts: &dyn Fn(&Triangle) -> bool,
     ) -> Option<BvhHit> {
         if triangles.len() != self.triangle_count
             || !is_finite_vec3(origin)
@@ -181,6 +199,7 @@ impl Bvh {
                 t_min,
                 t_max,
                 two_sided,
+                accepts,
                 &mut nearest,
             );
         }
@@ -200,6 +219,7 @@ impl Bvh {
         t_min: f64,
         t_max: f64,
         two_sided: bool,
+        accepts: &dyn Fn(&Triangle) -> bool,
         nearest: &mut Option<BvhHit>,
     ) {
         let Some(node) = self.nodes.get(node_index).copied() else {
@@ -226,6 +246,9 @@ impl Bvh {
                     let Some(triangle) = triangles.get(triangle_index) else {
                         continue;
                     };
+                    if !accepts(triangle) {
+                        continue;
+                    }
                     let Some(hit) = intersect_triangle(
                         triangle,
                         triangle_index,
@@ -264,31 +287,33 @@ impl Bvh {
                         if left_interval.0 <= right_interval.0 {
                             self.visit(
                                 left, triangles, origin, direction, t_min, t_max, two_sided,
-                                nearest,
+                                accepts, nearest,
                             );
                             self.visit(
                                 right, triangles, origin, direction, t_min, t_max, two_sided,
-                                nearest,
+                                accepts, nearest,
                             );
                         } else {
                             self.visit(
                                 right, triangles, origin, direction, t_min, t_max, two_sided,
-                                nearest,
+                                accepts, nearest,
                             );
                             self.visit(
                                 left, triangles, origin, direction, t_min, t_max, two_sided,
-                                nearest,
+                                accepts, nearest,
                             );
                         }
                     }
                     (Some(_), None) => {
                         self.visit(
-                            left, triangles, origin, direction, t_min, t_max, two_sided, nearest,
+                            left, triangles, origin, direction, t_min, t_max, two_sided, accepts,
+                            nearest,
                         );
                     }
                     (None, Some(_)) => {
                         self.visit(
-                            right, triangles, origin, direction, t_min, t_max, two_sided, nearest,
+                            right, triangles, origin, direction, t_min, t_max, two_sided, accepts,
+                            nearest,
                         );
                     }
                     (None, None) => {}
@@ -537,6 +562,7 @@ mod tests {
     use glam::DVec3;
     use proptest::prelude::*;
 
+    use crate::model::RayVisibility;
     use crate::render::raster::{AlphaMode, Triangle};
 
     use super::{Bvh, BvhHit};
@@ -582,6 +608,7 @@ mod tests {
                         normals: None,
                         layer_colors: Vec::new(),
                         lit_per_pixel: false,
+                        ray_visibility: RayVisibility::default(),
                     }
                 })
                 .collect::<Vec<_>>();

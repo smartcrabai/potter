@@ -178,6 +178,9 @@ fn scene_schema() -> Value {
         "type":"array",
         "items":{"enum":["data","object"]}
     });
+    root["$defs"]["node"]["properties"]["ray_visibility"] = json!({
+        "oneOf":[{"type":"null"},{"type":"object","required":["camera","diffuse","glossy","transmission","volume_scatter","shadow"],"properties":{"camera":{"type":"boolean"},"diffuse":{"type":"boolean"},"glossy":{"type":"boolean"},"transmission":{"type":"boolean"},"volume_scatter":{"type":"boolean"},"shadow":{"type":"boolean"}},"additionalProperties":false}]
+    });
     root["$defs"]["data_block"]["properties"]["materials"] = nullable_id_array_schema();
     complete_scene_schema(&mut root);
     root

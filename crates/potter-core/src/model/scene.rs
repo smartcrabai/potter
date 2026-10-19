@@ -1565,6 +1565,72 @@ pub enum MaterialLink {
     Object,
 }
 
+/// A Cycles ray class that Blender's object visibility gates (`PATH_RAY_*` in Cycles' kernel).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RayKind {
+    Camera,
+    Diffuse,
+    Glossy,
+    Transmission,
+    VolumeScatter,
+    Shadow,
+}
+
+/// Blender's per-object ray visibility (`visible_camera`, `visible_diffuse`, ...). Cycles masks
+/// each object with these bits and skips it for rays whose kind is switched off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "one flag per Blender ray visibility toggle"
+)]
+pub struct RayVisibility {
+    pub camera: bool,
+    pub diffuse: bool,
+    pub glossy: bool,
+    pub transmission: bool,
+    pub volume_scatter: bool,
+    pub shadow: bool,
+}
+
+impl Default for RayVisibility {
+    /// Every ray kind is on: Blender's default for an object that is not a light.
+    fn default() -> Self {
+        Self {
+            camera: true,
+            diffuse: true,
+            glossy: true,
+            transmission: true,
+            volume_scatter: true,
+            shadow: true,
+        }
+    }
+}
+
+impl RayVisibility {
+    /// Blender's flags for a new object of `kind`. Lights are hidden from camera rays
+    /// (`BKE_object_init`, object.cc:2177); every other object starts fully visible.
+    #[must_use]
+    pub fn default_for_kind(kind: &str) -> Self {
+        Self {
+            camera: kind != "light",
+            ..Self::default()
+        }
+    }
+
+    #[must_use]
+    pub fn allows(self, ray: RayKind) -> bool {
+        match ray {
+            RayKind::Camera => self.camera,
+            RayKind::Diffuse => self.diffuse,
+            RayKind::Glossy => self.glossy,
+            RayKind::Transmission => self.transmission,
+            RayKind::VolumeScatter => self.volume_scatter,
+            RayKind::Shadow => self.shadow,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Node {
@@ -1618,6 +1684,10 @@ pub struct Node {
     pub constraints: Vec<Constraint>,
     #[serde(default)]
     pub drivers: Vec<Driver>,
+    /// Blender's object ray visibility. `None` means the default for the node's kind; see
+    /// [`Node::resolved_ray_visibility`]. Omitted from JSON when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ray_visibility: Option<RayVisibility>,
 }
 
 impl Default for Node {
@@ -1647,6 +1717,7 @@ impl Default for Node {
             pose: BTreeMap::new(),
             constraints: Vec::new(),
             drivers: Vec::new(),
+            ray_visibility: None,
         }
     }
 }
@@ -1701,6 +1772,13 @@ impl Node {
             self.materials.len(),
             data.map_or(0, |data| data.materials.len()),
         )
+    }
+
+    /// Blender's ray visibility for this node: the stored flags, or the default for its kind.
+    #[must_use]
+    pub fn resolved_ray_visibility(&self) -> RayVisibility {
+        self.ray_visibility
+            .unwrap_or_else(|| RayVisibility::default_for_kind(&self.kind))
     }
 
     /// Effective material for one indexed slot; out-of-range access clamps like Blender.

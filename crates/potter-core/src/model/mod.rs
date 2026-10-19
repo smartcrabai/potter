@@ -39,10 +39,10 @@ pub use scene::{
     Interpolation, Keyframe, Library, LibraryKind, LibraryOverride, LibraryOverrideProperty,
     LibraryStatus, LightData, LightType, MAX_REVISION, Material, MaterialLink, Modifier,
     ModifierRuntime, MovieClip, MovieTracking, NlaBlendType, NlaExtrapolation, NlaStrip, NlaTrack,
-    Node, PlaneHomography, PlaneTrack, PrimitiveDescriptor, Profile, ReconstructedPoint,
-    Reconstruction, RenderSettings, RigidBody, RigidBodyShape, RigidBodyType, RigidBodyWorld,
-    Scene, SceneDoc, SolvedCamera, SurfaceData, SurfacePoint, TextObjectData, TextureRef,
-    TimelineMarker, TrackingMarker, TrackingObject, TrackingObjectPose, TrackingTrack,
+    Node, PlaneHomography, PlaneTrack, PrimitiveDescriptor, Profile, RayKind, RayVisibility,
+    ReconstructedPoint, Reconstruction, RenderSettings, RigidBody, RigidBodyShape, RigidBodyType,
+    RigidBodyWorld, Scene, SceneDoc, SolvedCamera, SurfaceData, SurfacePoint, TextObjectData,
+    TextureRef, TimelineMarker, TrackingMarker, TrackingObject, TrackingObjectPose, TrackingTrack,
     UnitSettings, ViewLayer, World,
 };
 pub(crate) use scene::{material_link_at, material_slot_count, resolve_material_slot};

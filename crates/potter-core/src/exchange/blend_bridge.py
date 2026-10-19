@@ -6631,6 +6631,12 @@ def export_doc(doc, target, pack, scene_hash, context):
                 and key not in ("hide_viewport", "hide_render", "hide_select"))
         }
         set_rna(obj, visibility_rna)
+        ray_visibility = item.get("ray_visibility") or {}
+        for field, prop in (("camera", "visible_camera"), ("diffuse", "visible_diffuse"),
+                            ("glossy", "visible_glossy"), ("transmission", "visible_transmission"),
+                            ("volume_scatter", "visible_volume_scatter"), ("shadow", "visible_shadow")):
+            if field in ray_visibility:
+                setattr(obj, prop, bool(ray_visibility[field]))
         if item.get("tags"):
             obj["potter.tags"] = item["tags"]
 

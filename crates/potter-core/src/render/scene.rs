@@ -16,7 +16,7 @@ use crate::{
         uv_layers::{self, UvStore},
     },
     image::ImageData,
-    model::{Id, Material, SceneDoc},
+    model::{Id, Material, Node, RayKind, RayVisibility, SceneDoc},
     shader::{
         BsdfParams, EvaluatorWorkspace, HitContext, HitUvLayers, PreparedMaterial, dielectric_f0,
         evaluate_displacement_with_workspace, evaluate_surface_with_workspace, fill_color_layers,
@@ -178,6 +178,10 @@ pub(super) fn extract_geometry(
                 && !node.render_visible)
         {
             continue;
+        }
+        let ray_visibility = node.resolved_ray_visibility();
+        if matches!(mode, Mode::Beauty) {
+            ray_visibility_warnings(node_id, node, path_traced, &mut warnings);
         }
         let data_block = node
             .data
@@ -553,6 +557,7 @@ pub(super) fn extract_geometry(
                         normals: corner_normals,
                         layer_colors,
                         lit_per_pixel,
+                        ray_visibility,
                     };
                     if let (Some(material), Some(prepared_material)) = (
                         material.filter(|material| {
@@ -664,6 +669,7 @@ pub(super) fn extract_geometry(
                     color,
                     object_index,
                     element_index,
+                    ray_visibility,
                 });
             }
         }
@@ -731,6 +737,7 @@ pub(super) fn extract_geometry(
                         color: stroke.color,
                         object_index,
                         element_index,
+                        ray_visibility,
                     });
                 }
                 let stroke_element_index = u32::try_from(elements.len() + 1).map_err(|_| {
@@ -765,6 +772,7 @@ pub(super) fn extract_geometry(
                         color: stroke.color,
                         object_index,
                         element_index: stroke_element_index,
+                        ray_visibility,
                     });
                 }
             }
@@ -840,6 +848,7 @@ pub(super) fn extract_geometry(
                         color,
                         object_index,
                         element_index,
+                        ray_visibility,
                     });
                 }
             }
@@ -974,7 +983,10 @@ impl PointShadowMap {
                 depth,
             });
         }
-        for triangle in triangles {
+        let casters = triangles
+            .iter()
+            .filter(|triangle| triangle.ray_visibility.allows(RayKind::Shadow));
+        for triangle in casters {
             for face in &mut faces {
                 rasterize_shadow_triangle(face, position, triangle);
             }
@@ -1415,6 +1427,65 @@ fn world_face_normals(
         }));
     }
     faces
+}
+
+/// Ray-visibility flags that Beauty does not honour, one warning per flag switched away from
+/// Blender's default for the node kind. Realtime Beauty honours mesh camera and shadow flags and
+/// light diffuse and glossy flags, as EEVEE does. The path tracer honours every mesh flag; it
+/// draws no light emitter to the camera and does not yet test light hits against any flag.
+fn ray_visibility_warnings(
+    node_id: &Id,
+    node: &Node,
+    path_traced: bool,
+    warnings: &mut Vec<serde_json::Value>,
+) {
+    const MESH_FLAGS: [(&str, RayKind); 4] = [
+        ("diffuse", RayKind::Diffuse),
+        ("glossy", RayKind::Glossy),
+        ("transmission", RayKind::Transmission),
+        ("volume_scatter", RayKind::VolumeScatter),
+    ];
+    const LIGHT_FLAGS: [(&str, RayKind); 3] = [
+        ("camera", RayKind::Camera),
+        ("transmission", RayKind::Transmission),
+        ("volume_scatter", RayKind::VolumeScatter),
+    ];
+    const PATH_LIGHT_FLAGS: [(&str, RayKind); 5] = [
+        ("camera", RayKind::Camera),
+        ("diffuse", RayKind::Diffuse),
+        ("glossy", RayKind::Glossy),
+        ("transmission", RayKind::Transmission),
+        ("volume_scatter", RayKind::VolumeScatter),
+    ];
+    let flags: &[(&str, RayKind)] = match (path_traced, node.kind == "light") {
+        (true, true) => &PATH_LIGHT_FLAGS,
+        (true, false) => &[],
+        (false, true) => &LIGHT_FLAGS,
+        (false, false) => &MESH_FLAGS,
+    };
+    let engine = if path_traced {
+        "the path tracer"
+    } else {
+        "realtime Beauty"
+    };
+    let visibility = node.resolved_ray_visibility();
+    let default = RayVisibility::default_for_kind(&node.kind);
+    for &(name, ray) in flags {
+        let value = visibility.allows(ray);
+        let expected = default.allows(ray);
+        if value == expected {
+            continue;
+        }
+        warnings.push(serde_json::json!({
+            "code": "UNSUPPORTED_FEATURE",
+            "feature_id": format!("object.ray_visibility.{name}"),
+            "node_id": node_id,
+            "message": format!(
+                "visible_{name} is {value}, which {engine} does not honour for this {}; it renders as if visible_{name} were {expected}",
+                node.kind,
+            ),
+        }));
+    }
 }
 
 /// Principled inputs of a surface shaded with `material`: the path tracer's own construction
@@ -1902,7 +1973,15 @@ fn shade(
                 DVec3::new(0.72, 0.82, 1.0),
             ),
         ] {
-            result += punctual_radiance(&lobe, normal, normal, -direction, color, intensity);
+            result += punctual_radiance(
+                &lobe,
+                normal,
+                normal,
+                -direction,
+                color,
+                intensity,
+                RayVisibility::default(),
+            );
         }
     } else {
         // The camera is the view for the lobes and the environment; without one, the normal.
@@ -1956,6 +2035,7 @@ fn shade(
                 &lobe,
                 shadow,
                 point_shadow,
+                light_node.resolved_ray_visibility(),
             );
         }
     }
@@ -2017,6 +2097,7 @@ fn light_contribution(
     params: &BsdfParams,
     shadow: ShadowContext<'_>,
     point_shadow: Option<&PointShadowMap>,
+    lobes: RayVisibility,
 ) -> DVec3 {
     let color = DVec3::from_array(light.color).max(DVec3::ZERO);
     let energy = light.energy.max(0.0);
@@ -2024,7 +2105,7 @@ fn light_contribution(
     match light.light_type {
         crate::model::LightType::Sun => {
             let toward_light = matrix.transform_vector3(DVec3::Z).normalize_or_zero();
-            punctual_radiance(params, normal, view, toward_light, color, energy)
+            punctual_radiance(params, normal, view, toward_light, color, energy, lobes)
                 * visibility_for_light(
                     shadow,
                     point_shadow,
@@ -2045,6 +2126,7 @@ fn light_contribution(
                 toward_light,
                 color,
                 point_intensity(energy) / distance_squared,
+                lobes,
             ) * visibility_for_light(
                 shadow,
                 point_shadow,
@@ -2071,6 +2153,7 @@ fn light_contribution(
                 toward_light,
                 color,
                 (point_intensity(energy) / distance_squared) * falloff,
+                lobes,
             ) * visibility_for_light(
                 shadow,
                 point_shadow,
@@ -2114,8 +2197,7 @@ fn light_contribution(
             // Integrated Lambert irradiance is exact for rectangles and the visibility weight
             // scales it. The specular lobe is evaluated towards the emitter centre.
             let toward_centre = (position - point).normalize_or_zero();
-            (diffuse_coefficient(params, normal, view)
-                + specular_coefficient(params, normal, view, toward_centre))
+            light_lobes_coefficient(params, normal, view, toward_centre, lobes)
                 * color
                 * (irradiance * visible_weight / total_weight)
         }
@@ -2195,12 +2277,13 @@ fn shadow_visibility(
         };
         let origin = point + normal * (side * epsilon);
         if bvh
-            .closest_hit_two_sided(
+            .closest_hit_where(
                 triangles,
                 origin,
                 sample_direction,
                 epsilon,
                 maximum_distance,
+                &|triangle| triangle.ray_visibility.allows(RayKind::Shadow),
             )
             .is_none()
         {
@@ -2219,14 +2302,37 @@ fn punctual_radiance(
     light: DVec3,
     color: DVec3,
     intensity: f64,
+    lobes: RayVisibility,
 ) -> DVec3 {
     let normal_light_cosine = normal.dot(light).max(0.0);
     if normal_light_cosine <= 0.0 {
         return DVec3::ZERO;
     }
-    (diffuse_coefficient(params, normal, view) + specular_coefficient(params, normal, view, light))
+    light_lobes_coefficient(params, normal, view, light, lobes)
         * color
         * (intensity * normal_light_cosine)
+}
+
+/// The diffuse and specular lobes of `params` towards `light`, each kept only where the light
+/// emits through it: EEVEE applies a light's `visible_diffuse` and `visible_glossy` per light.
+fn light_lobes_coefficient(
+    params: &BsdfParams,
+    normal: DVec3,
+    view: DVec3,
+    light: DVec3,
+    lobes: RayVisibility,
+) -> DVec3 {
+    let diffuse = if lobes.allows(RayKind::Diffuse) {
+        diffuse_coefficient(params, normal, view)
+    } else {
+        DVec3::ZERO
+    };
+    let specular = if lobes.allows(RayKind::Glossy) {
+        specular_coefficient(params, normal, view, light)
+    } else {
+        DVec3::ZERO
+    };
+    diffuse + specular
 }
 
 #[cfg(test)]
@@ -2256,7 +2362,7 @@ mod shading_normal_tests {
         },
         graph::{GraphKind, GraphNode, NodeGroup},
         image::{ImageData, ImageInterpolation},
-        model::{Id, Material, MaterialLink, SceneDoc},
+        model::{Id, Material, MaterialLink, RayVisibility, SceneDoc},
         render::{
             light_model::{
                 AreaShape, area_irradiance_per_radiance, area_radiance, area_visibility_samples,
@@ -2623,6 +2729,7 @@ mod shading_normal_tests {
             normals: Some(normals),
             layer_colors: Vec::new(),
             lit_per_pixel: false,
+            ray_visibility: RayVisibility::default(),
         }
     }
 

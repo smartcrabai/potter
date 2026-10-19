@@ -7,7 +7,7 @@ use crate::{
     eval::Snapshot,
     geom::volume::{VolumeData, sample_density, sample_density_checked},
     image::{ImageData, ImageInterpolation},
-    model::{Id, LightType, SceneDoc},
+    model::{Id, LightType, RayKind, SceneDoc},
     shader::{
         BsdfParams, EvaluatorWorkspace, HitContext, HitUvLayers, PreparedMaterial,
         equirectangular_uv, evaluate_surface_with_workspace, height_gradient,
@@ -768,8 +768,17 @@ fn trace_path(
     let mut throughput = DVec3::ONE;
     let mut alpha = 0.0;
     let mut previous = Scatter::Unsampled;
+    let mut ray = RayKind::Camera;
     for bounce in 0..=max_bounces {
-        let hit = closest_hit(geometry, bvh, origin, direction, RAY_EPSILON, f64::INFINITY);
+        let hit = closest_hit(
+            geometry,
+            bvh,
+            origin,
+            direction,
+            RAY_EPSILON,
+            f64::INFINITY,
+            ray,
+        );
         let segment_limit = hit.map_or(f64::INFINITY, |hit| hit.distance);
         let environment = world_radiance(doc, &snapshot.scene_id, images, direction, environment)?;
         let volume_segment = trace_volume_segment(volumes, origin, direction, segment_limit, rng)?;
@@ -811,6 +820,7 @@ fn trace_path(
             direction = sample_henyey_greenstein_direction(direction, event.anisotropy, rng);
             origin = event.point + direction * RAY_EPSILON;
             previous = Scatter::Volume;
+            ray = RayKind::VolumeScatter;
             continue;
         }
         let Some(hit) = hit else {
@@ -843,6 +853,7 @@ fn trace_path(
                 direction,
                 RAY_EPSILON,
                 f64::INFINITY,
+                ray,
             )
         {
             let exits_medium = geometry
@@ -917,15 +928,18 @@ fn trace_path(
                     direction,
                     weight,
                     pdf,
+                    ray: lobe,
                 } => {
                     previous = Scatter::Surface(MisVertex {
                         bsdf_pdf: pdf,
                         normal: surface.normal,
                     });
+                    ray = lobe;
                     (direction, weight)
                 }
                 BsdfSample::Delta { direction, weight } => {
                     previous = Scatter::Unsampled;
+                    ray = RayKind::Transmission;
                     (direction, weight)
                 }
             };
@@ -984,7 +998,15 @@ fn write_center_passes(
                     )
                 })?;
             let (origin, direction) = ray_for_sample(camera, width, height, x, y, 0.5, 0.5)?;
-            let hit = closest_hit(geometry, bvh, origin, direction, RAY_EPSILON, f64::INFINITY);
+            let hit = closest_hit(
+                geometry,
+                bvh,
+                origin,
+                direction,
+                RAY_EPSILON,
+                f64::INFINITY,
+                RayKind::Camera,
+            );
             let segment_limit = hit.map_or(f64::INFINITY, |hit| hit.distance);
             let volume_transmittance =
                 march_volumes(volumes, origin, direction, segment_limit, None)?;
@@ -1150,6 +1172,7 @@ fn overlay_rasterized_lines(
     Ok(())
 }
 
+/// The nearest hit a ray of kind `ray` can see: objects hidden from that kind are passed through.
 fn closest_hit(
     geometry: &Geometry,
     bvh: &Bvh,
@@ -1157,8 +1180,16 @@ fn closest_hit(
     direction: DVec3,
     t_min: f64,
     t_max: f64,
+    ray: RayKind,
 ) -> Option<BvhHit> {
-    bvh.closest_hit_two_sided(&geometry.triangles, origin, direction, t_min, t_max)
+    bvh.closest_hit_where(
+        &geometry.triangles,
+        origin,
+        direction,
+        t_min,
+        t_max,
+        &|triangle| triangle.ray_visibility.allows(ray),
+    )
 }
 
 fn make_surface(
@@ -1500,8 +1531,15 @@ fn shadow_transmittance(
         f64::INFINITY
     };
     for _ in 0..MAX_SHADOW_LAYERS {
-        let Some(hit) = closest_hit(geometry, bvh, origin, direction, RAY_EPSILON, remaining)
-        else {
+        let Some(hit) = closest_hit(
+            geometry,
+            bvh,
+            origin,
+            direction,
+            RAY_EPSILON,
+            remaining,
+            RayKind::Shadow,
+        ) else {
             break;
         };
         let surface = make_surface(
@@ -1736,6 +1774,7 @@ enum BsdfSample {
         direction: DVec3,
         weight: DVec3,
         pdf: f64,
+        ray: RayKind,
     },
     Delta {
         direction: DVec3,
@@ -1759,7 +1798,8 @@ fn sample_bsdf(params: &BsdfParams, normal: DVec3, view: DVec3, rng: &mut Pcg32)
                 / probabilities.transmission.max(1.0e-8));
         return BsdfSample::Delta { direction, weight };
     }
-    let direction = if choice >= probabilities.transmission + probabilities.diffuse {
+    let glossy = choice >= probabilities.transmission + probabilities.diffuse;
+    let direction = if glossy {
         let half_vector = sample_ggx_half(normal, params.roughness, rng);
         reflect(-view, half_vector).normalize_or_zero()
     } else {
@@ -1773,6 +1813,11 @@ fn sample_bsdf(params: &BsdfParams, normal: DVec3, view: DVec3, rng: &mut Pcg32)
         direction,
         weight,
         pdf,
+        ray: if glossy {
+            RayKind::Glossy
+        } else {
+            RayKind::Diffuse
+        },
     }
 }
 

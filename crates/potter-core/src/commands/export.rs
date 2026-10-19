@@ -685,8 +685,9 @@ pub(crate) fn export_losses(
 }
 
 /// Mesh-data losses of a strict export of `format`, read from the evaluated meshes: generic
-/// attributes and vertex groups the format's Blender writer drops, plus glTF-family mesh data
-/// glTF cannot write losslessly. `run` and `validate` both report this set.
+/// attributes and vertex groups the format's Blender writer drops, glTF-family mesh data glTF
+/// cannot write losslessly, and the object ray-visibility flags the format cannot store. `run` and
+/// `validate` both report this set.
 pub(crate) fn mesh_data_losses(
     doc: &SceneDoc,
     format: &str,
@@ -705,6 +706,7 @@ pub(crate) fn mesh_data_losses(
     if matches!(format, "glb" | "gltf" | "vrm" | "vrm0") {
         losses.extend(exchange::gltf::mesh_export_losses(doc, snapshot)?);
     }
+    losses.extend(exchange::ray_visibility_losses(format, doc, snapshot)?);
     Ok(losses)
 }
 
