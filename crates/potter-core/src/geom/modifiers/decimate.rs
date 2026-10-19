@@ -216,26 +216,6 @@ impl PoolSlots {
     }
 }
 
-/// Puts `mesh`'s edges in `pool_order`: the live edges as output-vertex pairs in Blender's edge pool
-/// order. Mesh vertex `k` is output vertex `k`.
-fn order_mesh_edges(mesh: &mut Mesh, pool_order: &[[usize; 2]]) {
-    let index_of: HashMap<u32, usize> = mesh
-        .vertices
-        .iter()
-        .enumerate()
-        .map(|(index, vertex)| (vertex.id, index))
-        .collect();
-    let rank: HashMap<[usize; 2], usize> = pool_order
-        .iter()
-        .enumerate()
-        .map(|(rank, pair)| (*pair, rank))
-        .collect();
-    mesh.edges.sort_by_key(|edge| {
-        let [a, b] = edge.vertices.map(|id| index_of[&id]);
-        rank[&[a.min(b), a.max(b)]]
-    });
-}
-
 struct BVert {
     co: [f32; 3],
     /// First edge of the disk cycle, or `NONE`.
@@ -2489,9 +2469,15 @@ impl BMesh {
         let mut origin = Origin::copies((0..points.len()).map(Some), face_origins);
         origin.corners = Some(corners);
         let keep_vertices: Vec<bool> = self.verts.iter().map(|vert| vert.alive).collect();
-        let mut result = decimate_compact(points, polygons, loose, origin, source, &keep_vertices)?;
-        order_mesh_edges(&mut result, &self.pool_edge_pairs());
-        Ok(result)
+        decimate_compact(
+            points,
+            polygons,
+            loose,
+            origin,
+            source,
+            &keep_vertices,
+            &self.pool_edge_pairs(),
+        )
     }
 
     /// The live edges as sorted output-vertex pairs, in pool order.

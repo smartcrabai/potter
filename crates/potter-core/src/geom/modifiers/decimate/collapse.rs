@@ -14,7 +14,6 @@ use super::{
     interp::{float2_equal, interp_float2},
     kdtree::KdTree,
     normals::{face_center_median, face_normal, project_axis_dominant, vertex_normals},
-    order_mesh_edges,
     polyfill::triangulate_ngon,
     quad::{is_quad_convex, quad_split_24},
 };
@@ -2481,8 +2480,8 @@ pub(in crate::geom::modifiers) fn decimate_collapse(
         origin,
         mesh,
         &keep_vertices,
+        &output.edge_order,
     )?;
-    order_mesh_edges(&mut out, &output.edge_order);
     super::collapse_write_uv(&mut out, &layer_names, &output.corner_uv)?;
     collapse_write_point(&mut out, &point_attributes, &output.point)?;
     collapse_write_edge(&mut out, &edge_attributes, output.edge_attributes)?;

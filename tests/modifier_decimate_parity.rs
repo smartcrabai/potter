@@ -64,6 +64,7 @@ fn attribute_type(name: &str) -> &'static str {
         "idx" | "edge_idx" => "INT",
         "flag" | "edge_flag" => "BOOLEAN",
         "bcol" => "BYTE_COLOR",
+        "edge_w" => "FLOAT",
         _ => "FLOAT_COLOR",
     }
 }
