@@ -15186,7 +15186,7 @@ mod camera_import_tests {
                 Some("equirectangular".to_owned())
             )
         );
-        assert!(features(&camera).is_empty());
+        assert_eq!(features(&camera), Vec::<String>::new());
     }
 
     #[test]
@@ -15222,6 +15222,6 @@ mod camera_import_tests {
             imported_camera_projection(&camera),
             (CameraProjection::Orthographic, None)
         );
-        assert!(features(&camera).is_empty());
+        assert_eq!(features(&camera), Vec::<String>::new());
     }
 }
