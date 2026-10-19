@@ -9,11 +9,12 @@ use crate::{
     image::{ImageData, ImageInterpolation},
     model::{Id, LightType, SceneDoc},
     shader::{
-        BsdfParams, EvaluatorWorkspace, HitContext, HitUvLayers, PreparedMaterial, dielectric_f0,
+        BsdfParams, EvaluatorWorkspace, HitContext, HitUvLayers, PreparedMaterial,
         evaluate_surface_with_workspace, height_gradient,
     },
 };
 
+use super::principled_bsdf::{continuous_density, evaluate as evaluate_bsdf, lobe_probabilities};
 use super::{
     bvh::{Bvh, BvhHit},
     light_model::{
@@ -29,6 +30,7 @@ use super::{
 const RAY_EPSILON: f64 = 1.0e-5;
 const MAX_VOLUME_STEPS: usize = 2048;
 const MAX_SHADOW_LAYERS: usize = 16;
+
 // Calibrated against the Blender-gated Cycles VDB comparison; surface lighting uses its own energy convention.
 const VOLUME_DIRECT_LIGHT_SCALE: f64 = 0.75;
 
@@ -763,7 +765,7 @@ fn trace_path(
     let mut radiance = DVec3::ZERO;
     let mut throughput = DVec3::ONE;
     let mut alpha = 0.0;
-    let mut previous_diffuse = false;
+    let mut previous = Scatter::Unsampled;
     for bounce in 0..=max_bounces {
         let hit = closest_hit(geometry, bvh, origin, direction, RAY_EPSILON, f64::INFINITY);
         let segment_limit = hit.map_or(f64::INFINITY, |hit| hit.distance);
@@ -806,11 +808,18 @@ fn trace_path(
             }
             direction = sample_henyey_greenstein_direction(direction, event.anisotropy, rng);
             origin = event.point + direction * RAY_EPSILON;
-            previous_diffuse = true;
+            previous = Scatter::Volume;
             continue;
         }
         let Some(hit) = hit else {
-            let environment_weight = if previous_diffuse { 0.5 } else { 1.0 };
+            let environment_weight = match previous {
+                Scatter::Unsampled => 1.0,
+                Scatter::Surface(vertex) => power_heuristic(
+                    vertex.bsdf_pdf,
+                    environment_light_pdf(vertex.normal, direction, importance),
+                ),
+                Scatter::Volume => 0.5,
+            };
             radiance += throughput * environment * environment_weight;
             break;
         };
@@ -900,7 +909,24 @@ fn trace_path(
         if bounce == max_bounces {
             break;
         }
-        let (next_direction, weight, diffuse_event) = sample_bsdf(&surface.params, -direction, rng);
+        let (next_direction, weight) =
+            match sample_bsdf(&surface.params, surface.normal, -direction, rng) {
+                BsdfSample::Continuous {
+                    direction,
+                    weight,
+                    pdf,
+                } => {
+                    previous = Scatter::Surface(MisVertex {
+                        bsdf_pdf: pdf,
+                        normal: surface.normal,
+                    });
+                    (direction, weight)
+                }
+                BsdfSample::Delta { direction, weight } => {
+                    previous = Scatter::Unsampled;
+                    (direction, weight)
+                }
+            };
         if !next_direction.is_finite() || !weight.is_finite() {
             break;
         }
@@ -912,7 +938,6 @@ fn trace_path(
             }
             throughput /= survival;
         }
-        previous_diffuse = diffuse_event;
         direction = next_direction.normalize_or_zero();
         origin = offset_origin(surface.point, direction, surface.geometric_normal);
     }
@@ -1328,9 +1353,13 @@ fn direct_lighting(
             * sample.radiance
             * (cosine * visibility);
     }
-    let (direction, cosine_pdf) = sample_cosine_hemisphere(normal, rng);
+    let direction = match importance {
+        Some(sampler) if rng.next_f64() >= 0.5 => sampler.sample(rng).0,
+        _ => sample_cosine_hemisphere(normal, rng).0,
+    };
     let cosine = normal.dot(direction).max(0.0);
-    if cosine > 0.0 && cosine_pdf > 0.0 {
+    let light_pdf = environment_light_pdf(normal, direction, importance);
+    if cosine > 0.0 && light_pdf > 0.0 {
         let environment_sample =
             world_radiance(doc, &snapshot.scene_id, images, direction, environment)?;
         let visibility = shadow_transmittance(
@@ -1347,38 +1376,11 @@ fn direct_lighting(
             rng,
             evaluator_workspace,
         )?;
-        let environment_pdf = importance.map_or(0.0, |sampler| sampler.pdf(direction));
-        let weight = importance.map_or(1.0, |_| power_heuristic(cosine_pdf, environment_pdf));
+        let bsdf_pdf = continuous_density(&surface.params, normal, view, direction);
+        let weight = power_heuristic(light_pdf, bsdf_pdf);
         contribution += evaluate_bsdf(&surface.params, normal, view, direction)
             * environment_sample
-            * (cosine / cosine_pdf * visibility * 0.5 * weight);
-    }
-    if let Some(sampler) = importance {
-        let (direction, environment_pdf) = sampler.sample(rng);
-        let cosine = normal.dot(direction).max(0.0);
-        if cosine > 0.0 && environment_pdf > 0.0 {
-            let environment_sample =
-                world_radiance(doc, &snapshot.scene_id, images, direction, environment)?;
-            let visibility = shadow_transmittance(
-                doc,
-                snapshot,
-                geometry,
-                bvh,
-                volumes,
-                images,
-                surface.shadow_point,
-                geometric,
-                direction,
-                f64::INFINITY,
-                rng,
-                evaluator_workspace,
-            )?;
-            let cosine_pdf = cosine / std::f64::consts::PI;
-            let weight = power_heuristic(environment_pdf, cosine_pdf);
-            contribution += evaluate_bsdf(&surface.params, normal, view, direction)
-                * environment_sample
-                * (cosine / environment_pdf * visibility * 0.5 * weight);
-        }
+            * (cosine * visibility * weight / light_pdf);
     }
     Ok(contribution)
 }
@@ -1706,98 +1708,88 @@ fn sample_area_light(light: &PointLight, point: DVec3, rng: &mut Pcg32) -> Optio
     })
 }
 
-fn sample_bsdf(params: &BsdfParams, view: DVec3, rng: &mut Pcg32) -> (DVec3, DVec3, bool) {
-    let diffuse_weight = ((1.0 - params.metallic) * (1.0 - params.transmission)).max(0.0);
-    let transmission_weight = params.transmission.clamp(0.0, 1.0);
-    let specular_weight = (params.metallic.clamp(0.0, 1.0)
-        + dielectric_f0(params.ior, params.specular_ior_level)
-            * (1.0 - params.metallic.clamp(0.0, 1.0)))
-    .max(1.0e-4);
-    let total = diffuse_weight + transmission_weight + specular_weight;
-    let p_diffuse = diffuse_weight / total;
-    let p_transmission = transmission_weight / total;
+/// Surface vertex context kept for MIS at the next environment miss. `bsdf_pdf` is the density of
+/// the continuous lobe mixture that generated the direction.
+#[derive(Clone, Copy)]
+struct MisVertex {
+    bsdf_pdf: f64,
+    normal: DVec3,
+}
+
+/// What scattered the path into its current segment, for the environment weight at a miss.
+#[derive(Clone, Copy)]
+enum Scatter {
+    /// The camera ray, or a delta (specular transmission) bounce: light sampling cannot reach it.
+    Unsampled,
+    /// A continuous surface bounce, weighted against light sampling by its lobe-mixture density.
+    Surface(MisVertex),
+    /// A volume phase bounce. Its environment weight stays the fixed value of the volume path.
+    Volume,
+}
+
+/// Outcome of sampling the Principled BSDF. `Continuous` carries the exact lobe-mixture density
+/// that MIS needs; `Delta` is the specular transmission lobe, which light sampling cannot reach.
+enum BsdfSample {
+    Continuous {
+        direction: DVec3,
+        weight: DVec3,
+        pdf: f64,
+    },
+    Delta {
+        direction: DVec3,
+        weight: DVec3,
+    },
+}
+
+fn sample_bsdf(params: &BsdfParams, normal: DVec3, view: DVec3, rng: &mut Pcg32) -> BsdfSample {
+    let probabilities = lobe_probabilities(params);
     let choice = rng.next_f64();
-    if choice < p_transmission {
-        let direction = refract(-view, params.normal, 1.0 / params.ior.max(1.0e-3))
-            .unwrap_or_else(|| reflect(-view, params.normal));
+    if choice < probabilities.transmission {
+        let direction = refract(-view, normal, 1.0 / params.ior.max(1.0e-3))
+            .unwrap_or_else(|| reflect(-view, normal));
         let tint = DVec3::new(
             params.base_color[0],
             params.base_color[1],
             params.base_color[2],
         );
-        return (
-            direction,
-            tint * (params.reflectance.clamp(0.0, 1.0) * transmission_weight
-                / p_transmission.max(1.0e-8)),
-            false,
-        );
+        let weight = tint
+            * (params.reflectance.clamp(0.0, 1.0) * params.transmission.clamp(0.0, 1.0)
+                / probabilities.transmission.max(1.0e-8));
+        return BsdfSample::Delta { direction, weight };
     }
-    if choice >= p_transmission + p_diffuse {
-        let half_vector = sample_ggx_half(params.normal, params.roughness, rng);
-        let direction = reflect(-view, half_vector).normalize_or_zero();
-        let cosine = params.normal.dot(direction).max(0.0);
-        let half_cosine = params.normal.dot(half_vector).max(0.0);
-        let alpha = params.roughness.max(0.02).powi(2);
-        let denominator = half_cosine * half_cosine * (alpha * alpha - 1.0) + 1.0;
-        let distribution =
-            alpha * alpha / (std::f64::consts::PI * denominator * denominator).max(1.0e-12);
-        let pdf_specular =
-            distribution * half_cosine / (4.0 * view.dot(half_vector).abs()).max(1.0e-8);
-        let pdf = (1.0 - p_transmission) * pdf_specular;
-        let bsdf = evaluate_bsdf(params, params.normal, view, direction);
-        return (direction, bsdf * (cosine / pdf.max(1.0e-8)), false);
+    let direction = if choice >= probabilities.transmission + probabilities.diffuse {
+        let half_vector = sample_ggx_half(normal, params.roughness, rng);
+        reflect(-view, half_vector).normalize_or_zero()
+    } else {
+        sample_cosine_hemisphere(normal, rng).0
+    };
+    // Estimator `f cos / p_mix`: the density is the lobe mixture, not the branch's own lobe.
+    let pdf = continuous_density(params, normal, view, direction);
+    let cosine = normal.dot(direction).max(0.0);
+    let weight = evaluate_bsdf(params, normal, view, direction) * (cosine / pdf.max(1.0e-8));
+    BsdfSample::Continuous {
+        direction,
+        weight,
+        pdf,
     }
-    let (direction, _) = sample_cosine_hemisphere(params.normal, rng);
-    let cosine = params.normal.dot(direction).max(0.0);
-    let pdf = p_diffuse * cosine / std::f64::consts::PI;
-    let bsdf = evaluate_bsdf(params, params.normal, view, direction);
-    (direction, bsdf * (cosine / pdf.max(1.0e-8)), true)
 }
 
-fn evaluate_bsdf(params: &BsdfParams, normal: DVec3, view: DVec3, light: DVec3) -> DVec3 {
-    let n_dot_v = normal.dot(view).max(0.0);
-    let n_dot_l = normal.dot(light).max(0.0);
-    if n_dot_v <= 0.0 || n_dot_l <= 0.0 {
-        return DVec3::ZERO;
-    }
-    let half = (view + light).normalize_or_zero();
-    let n_dot_h = normal.dot(half).max(0.0);
-    let v_dot_h = view.dot(half).max(0.0);
-    let albedo = DVec3::new(
-        params.base_color[0],
-        params.base_color[1],
-        params.base_color[2],
-    )
-    .max(DVec3::ZERO);
-    // The dielectric reflectance is the shared Principled rule (`shader::dielectric_f0`).
-    let f0 = DVec3::splat(dielectric_f0(params.ior, params.specular_ior_level))
-        .lerp(albedo, params.metallic.clamp(0.0, 1.0));
-    let fresnel = f0 + (DVec3::ONE - f0) * (1.0 - v_dot_h).powi(5);
-    let alpha = params.roughness.clamp(0.02, 1.0).powi(2);
-    let alpha_squared = alpha * alpha;
-    let denominator = n_dot_h * n_dot_h * (alpha_squared - 1.0) + 1.0;
-    let distribution =
-        alpha_squared / (std::f64::consts::PI * denominator * denominator).max(1.0e-12);
-    let geometry_v = smith_g1(n_dot_v, alpha_squared);
-    let geometry_l = smith_g1(n_dot_l, alpha_squared);
-    let specular =
-        fresnel * (distribution * geometry_v * geometry_l / (4.0 * n_dot_v * n_dot_l).max(1.0e-8));
-    let diffuse = albedo
-        * ((1.0 - params.metallic.clamp(0.0, 1.0)) * (1.0 - params.transmission.clamp(0.0, 1.0))
-            / std::f64::consts::PI);
-    // Emission contributes no reflection; `reflectance` weights the reflective closures
-    // (Cycles' `EmissionNode::compile`, intern/cycles/scene/shader_nodes.cpp:3071-3098).
-    (diffuse + specular) * params.reflectance.clamp(0.0, 1.0)
-}
-
-fn smith_g1(cosine: f64, alpha_squared: f64) -> f64 {
-    let cosine = cosine.max(0.0);
-    2.0 * cosine
-        / (cosine + (alpha_squared + (1.0 - alpha_squared) * cosine * cosine).sqrt()).max(1.0e-8)
+/// Density with which a direction is light-sampled at a surface vertex. The cosine strategy is
+/// mixed 50/50 with the importance strategy when a world sampler exists, exactly as
+/// `direct_lighting` draws.
+fn environment_light_pdf(
+    normal: DVec3,
+    direction: DVec3,
+    importance: Option<&WorldImportanceSampler>,
+) -> f64 {
+    let cosine_pdf = normal.dot(direction).max(0.0) / std::f64::consts::PI;
+    importance.map_or(cosine_pdf, |sampler| {
+        0.5 * cosine_pdf + 0.5 * sampler.pdf(direction)
+    })
 }
 
 fn sample_ggx_half(normal: DVec3, roughness: f64, rng: &mut Pcg32) -> DVec3 {
-    let alpha = roughness.max(0.02).powi(2);
+    let alpha = roughness.clamp(0.02, 1.0).powi(2);
     let alpha_squared = alpha * alpha;
     let first = rng.next_f64();
     let second = rng.next_f64();
@@ -2696,5 +2688,78 @@ mod volume_extinction_tests {
         let denominator = (1.0 + anisotropy * anisotropy - 2.0 * anisotropy * cosine).sqrt();
         (1.0 - anisotropy * anisotropy) / (2.0 * anisotropy)
             * (denominator.recip() - 1.0 / (1.0 + anisotropy))
+    }
+}
+
+#[cfg(test)]
+mod sampling_tests {
+    use std::f64::consts::{FRAC_PI_2, TAU};
+
+    use super::*;
+    use crate::model::Material;
+
+    /// The mean of `sample_bsdf`'s weight (`f · cos / p_mix`) over the sampler's own directions is the
+    /// integral of `f · cos` over the hemisphere, if the mixture density the sampler reports matches
+    /// how it draws the directions. At metallic 0.5 all three branches contribute, so a wrong
+    /// density in any of them biases the mean. The reference is a midpoint quadrature of
+    /// `evaluate · cos` at two resolutions; its disagreement is part of the tolerance.
+    #[test]
+    fn sampled_bsdf_weight_mean_matches_the_evaluate_cos_quadrature() {
+        let material = Material {
+            base_color: [0.8, 0.5, 0.3, 1.0],
+            metallic: 0.5,
+            roughness: 0.3,
+            ..Material::default()
+        };
+        let params = BsdfParams::from_material(&material, DVec3::Z);
+        let normal = DVec3::Z;
+        let view = DVec3::new(0.3, 0.1, 0.95).normalize();
+
+        let quadrature = |n_theta: usize, n_phi: usize| -> DVec3 {
+            let d_theta = FRAC_PI_2 / n_theta as f64;
+            let d_phi = TAU / n_phi as f64;
+            let mut total = DVec3::ZERO;
+            for i in 0..n_theta {
+                let theta = (i as f64 + 0.5) * d_theta;
+                for j in 0..n_phi {
+                    let phi = (j as f64 + 0.5) * d_phi;
+                    let light = DVec3::new(
+                        theta.sin() * phi.cos(),
+                        theta.sin() * phi.sin(),
+                        theta.cos(),
+                    );
+                    let cosine = light.dot(normal);
+                    total += evaluate_bsdf(&params, normal, view, light)
+                        * (cosine * theta.sin() * d_theta * d_phi);
+                }
+            }
+            total
+        };
+        let coarse = quadrature(400, 200);
+        let fine = quadrature(800, 400);
+
+        let samples = 400_000_usize;
+        let mut rng = Pcg32::for_sample(1, 0, 0, 0);
+        let mut sum = DVec3::ZERO;
+        let mut sum_squares = DVec3::ZERO;
+        for _ in 0..samples {
+            let weight = match sample_bsdf(&params, normal, view, &mut rng) {
+                BsdfSample::Continuous { weight, .. } | BsdfSample::Delta { weight, .. } => weight,
+            };
+            sum += weight;
+            sum_squares += weight * weight;
+        }
+        let count = samples as f64;
+        let mean = sum / count;
+        let variance = (sum_squares / count - mean * mean).max(DVec3::ZERO);
+        let stderr = (variance / count).sqrt();
+        let reference = fine;
+        let quadrature_error = (coarse - fine).abs();
+        let tolerance = stderr * 4.0 + quadrature_error;
+        let delta = (mean - reference).abs();
+        assert!(
+            delta.cmple(tolerance).all(),
+            "sampled mean {mean:?} vs quadrature {reference:?} (tolerance {tolerance:?})"
+        );
     }
 }

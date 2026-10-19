@@ -30,6 +30,78 @@ pub(crate) fn dielectric_f0(ior: f64, level: f64) -> f64 {
     (fresnel * 2.0 * level.max(0.0)).min(1.0)
 }
 
+/// The Principled inputs that change Cycles' result but that Potter's lobe model does not evaluate,
+/// as `(feature_id, Blender input)` pairs in a fixed array, so checking a hit allocates nothing.
+pub(crate) fn unevaluated_principled_inputs(
+    params: &BsdfParams,
+) -> [Option<(&'static str, &'static str)>; 8] {
+    [
+        (params.coat_weight > 0.0).then_some(("shader.principled.coat", "Coat Weight")),
+        (params.sheen_weight > 0.0).then_some(("shader.principled.sheen", "Sheen Weight")),
+        (params.subsurface_weight > 0.0)
+            .then_some(("shader.principled.subsurface", "Subsurface Weight")),
+        (params.anisotropic_ior > 0.0).then_some(("shader.principled.anisotropic", "Anisotropic")),
+        (params.thin_film_thickness > 0.0)
+            .then_some(("shader.principled.thin_film", "Thin Film Thickness")),
+        (params.transmission > 0.0 && params.roughness > 0.0)
+            .then_some(("shader.principled.transmission_ggx", "Transmission Weight")),
+        (params.diffuse_roughness > 0.0)
+            .then_some(("shader.principled.diffuse_roughness", "Diffuse Roughness")),
+        params
+            .thin_wall
+            .then_some(("shader.principled.thin_wall", "Thin Wall")),
+    ]
+}
+
+/// Records `UNSUPPORTED_FEATURE` for each Principled input in `params` that Potter's lobe model
+/// does not evaluate. `node` names the Principled node of a graph material; a native material
+/// passes `None`. Deduped per (material, input) in `warnings`, the sink the render output reports.
+pub(crate) fn record_unevaluated_inputs(
+    warnings: Option<&RefCell<Vec<JsonValue>>>,
+    material: &str,
+    node: Option<&Id>,
+    params: &BsdfParams,
+) {
+    let inputs = unevaluated_principled_inputs(params);
+    if inputs.iter().all(Option::is_none) {
+        return;
+    }
+    let Some(warnings) = warnings else {
+        return;
+    };
+    for (feature_id, input) in inputs.into_iter().flatten() {
+        let mut recorded = warnings.borrow_mut();
+        let duplicate = recorded.iter().any(|warning| {
+            warning["material"].as_str() == Some(material)
+                && warning["input"].as_str() == Some(input)
+        });
+        if duplicate {
+            continue;
+        }
+        recorded.push(match node {
+            Some(node) => json!({
+                "code": "UNSUPPORTED_FEATURE",
+                "feature_id": feature_id,
+                "material": material,
+                "node_id": node.to_string(),
+                "input": input,
+                "message": format!(
+                    "Principled input '{input}' of material '{material}' (node '{node}') is not evaluated by Potter's lobe model; its Cycles contribution is omitted or approximated"
+                ),
+            }),
+            None => json!({
+                "code": "UNSUPPORTED_FEATURE",
+                "feature_id": feature_id,
+                "material": material,
+                "input": input,
+                "message": format!(
+                    "Principled input '{input}' of material '{material}' is not evaluated by Potter's lobe model; its Cycles contribution is omitted or approximated"
+                ),
+            }),
+        });
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BsdfParams {
     pub base_color: [f64; 4],
@@ -59,6 +131,12 @@ pub struct BsdfParams {
     pub anisotropic_rotation: f64,
     pub thin_film_thickness: f64,
     pub thin_film_ior: f64,
+    /// Oren-Nayar roughness of the diffuse lobe. Potter's diffuse lobe is Lambert, so a value above
+    /// zero is reported as unevaluated (Cycles `bsdf_oren_nayar_setup`).
+    pub diffuse_roughness: f64,
+    /// Thin Wall (Cycles' `thin_wall`): transmission through a thin sheet. Potter does not evaluate
+    /// it; it is reported as unevaluated.
+    pub thin_wall: bool,
     pub volume_density: f64,
     pub volume_color: [f64; 3],
     pub volume_anisotropy: f64,
@@ -70,7 +148,7 @@ pub struct BsdfParams {
 }
 
 impl BsdfParams {
-    fn from_material(material: &Material, normal: DVec3) -> Self {
+    pub(crate) fn from_material(material: &Material, normal: DVec3) -> Self {
         Self {
             base_color: material.base_color,
             metallic: material.metallic,
@@ -96,6 +174,8 @@ impl BsdfParams {
             anisotropic_rotation: 0.0,
             thin_film_thickness: 0.0,
             thin_film_ior: 1.33,
+            diffuse_roughness: 0.0,
+            thin_wall: false,
             volume_density: material.volume_density.max(0.0),
             volume_color: material.volume_color,
             volume_anisotropy: material.volume_anisotropy.clamp(-0.999, 0.999),
@@ -151,6 +231,8 @@ impl BsdfParams {
             ),
             thin_film_thickness: mix_scalar(first.thin_film_thickness, second.thin_film_thickness),
             thin_film_ior: mix_scalar(first.thin_film_ior, second.thin_film_ior),
+            diffuse_roughness: mix_scalar(first.diffuse_roughness, second.diffuse_roughness),
+            thin_wall: first.thin_wall || second.thin_wall,
             volume_density: mix_scalar(first.volume_density, second.volume_density),
             volume_color: mix3(first.volume_color, second.volume_color),
             volume_anisotropy: mix_scalar(first.volume_anisotropy, second.volume_anisotropy),
@@ -197,6 +279,8 @@ impl BsdfParams {
             anisotropic_rotation: first.anisotropic_rotation,
             thin_film_thickness: first.thin_film_thickness.max(second.thin_film_thickness),
             thin_film_ior: first.thin_film_ior,
+            diffuse_roughness: first.diffuse_roughness.max(second.diffuse_roughness),
+            thin_wall: first.thin_wall || second.thin_wall,
             volume_density: first.volume_density + second.volume_density,
             volume_color: add3(first.volume_color, second.volume_color),
             volume_anisotropy: first.volume_anisotropy,
@@ -448,6 +532,7 @@ fn evaluate_surface_inner(
 ) -> Result<BsdfParams> {
     let Some(graph_id) = &material.node_tree else {
         let mut params = BsdfParams::from_material(material, hit_ctx.normal);
+        record_unevaluated_inputs(hit_ctx.warnings, &material.name, None, &params);
         apply_material_textures(material, hit_ctx, &mut params)?;
         return Ok(params);
     };
@@ -1058,10 +1143,14 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
             .and_then(JsonValue::as_bool)
             == Some(true)
         {
-            return Ok(BsdfParams::from_material(
-                self.material,
-                self.hit_ctx.normal,
-            ));
+            let params = BsdfParams::from_material(self.material, self.hit_ctx.normal);
+            record_unevaluated_inputs(
+                self.hit_ctx.warnings,
+                &self.material.name,
+                Some(id),
+                &params,
+            );
+            return Ok(params);
         }
         let mut params = BsdfParams::from_material(self.material, self.hit_ctx.normal);
         params.base_color = self.color_input(id, &["Base Color"], [0.8, 0.8, 0.8, 1.0])?;
@@ -1099,6 +1188,8 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
         params.anisotropic_rotation = self.scalar_input(id, &["Anisotropic Rotation"], 0.0)?;
         params.thin_film_thickness = self.scalar_input(id, &["Thin Film Thickness"], 0.0)?;
         params.thin_film_ior = self.scalar_input(id, &["Thin Film IOR"], 1.33)?;
+        params.diffuse_roughness = self.scalar_input(id, &["Diffuse Roughness"], 0.0)?;
+        params.thin_wall = self.scalar_input(id, &["Thin Wall"], 0.0)? > 0.5;
         params.emission_color =
             self.color_input(id, &["Emission Color", "Emission"], [0.0, 0.0, 0.0, 1.0])?[..3]
                 .try_into()
@@ -1107,6 +1198,12 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
         params.normal = normalize_or(
             self.vector_input(id, &["Normal"], self.hit_ctx.normal)?,
             self.hit_ctx.normal,
+        );
+        record_unevaluated_inputs(
+            self.hit_ctx.warnings,
+            &self.material.name,
+            Some(id),
+            &params,
         );
         Ok(params)
     }
@@ -2705,6 +2802,67 @@ mod tests {
         assert_eq!(params.volume_color, [0.2, 0.4, 0.6]);
         assert_eq!(params.volume_anisotropy, 0.35);
         assert!(params.volume_scattering);
+    }
+
+    #[test]
+    fn unevaluated_principled_inputs_warn_once_per_material_and_input() {
+        use std::cell::RefCell;
+
+        let sink = RefCell::new(Vec::new());
+        let mut groups = Registry::new();
+        // A native material sets rough transmission on the material itself.
+        let native = Material {
+            name: "Native".to_owned(),
+            transmission: 0.5,
+            roughness: 0.3,
+            ..Material::default()
+        };
+        let context = HitContext::new(&groups).with_warnings(&sink);
+        evaluate_surface(&native, &context).unwrap();
+        evaluate_surface(&native, &context).unwrap();
+
+        // A graph material sets coat and rough transmission on its Principled node.
+        let mut graph = NodeGroup::new("Graph", GraphKind::Shader);
+        insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
+        insert_node(
+            &mut graph,
+            "principled",
+            "ShaderNodeBsdfPrincipled",
+            json!({"Coat Weight":0.5,"Transmission Weight":0.5,"Roughness":0.3}),
+        );
+        link(&mut graph, "principled", "BSDF", "output", "Surface");
+        let graph_id = Id::new("graph_shader".to_owned()).unwrap();
+        groups.insert(graph_id.clone(), graph);
+        let graph_material = Material {
+            name: "Graph".to_owned(),
+            node_tree: Some(graph_id),
+            ..Material::default()
+        };
+        let graph_context = HitContext::new(&groups).with_warnings(&sink);
+        evaluate_surface(&graph_material, &graph_context).unwrap();
+        evaluate_surface(&graph_material, &graph_context).unwrap();
+
+        let warnings = sink.borrow();
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        let count = |material: &str, input: &str| {
+            warnings
+                .iter()
+                .filter(|warning| {
+                    warning["material"].as_str() == Some(material)
+                        && warning["input"].as_str() == Some(input)
+                })
+                .count()
+        };
+        assert_eq!(count("Native", "Transmission Weight"), 1);
+        assert_eq!(count("Graph", "Coat Weight"), 1);
+        assert_eq!(count("Graph", "Transmission Weight"), 1);
+        let native_warning = warnings.iter().find(|w| w["material"] == "Native").unwrap();
+        assert!(native_warning.get("node_id").is_none());
+        let coat_warning = warnings
+            .iter()
+            .find(|w| w["input"] == "Coat Weight")
+            .unwrap();
+        assert_eq!(coat_warning["node_id"], "principled");
     }
 
     #[test]
