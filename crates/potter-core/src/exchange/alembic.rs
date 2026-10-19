@@ -560,7 +560,7 @@ fn mesh_sample(mesh: &Mesh, allow_lossy: bool) -> Result<MeshSample> {
     })
 }
 
-/// The color layers of `store` in Alembic space: Blender BYTE_COLOR values (sRGB RGB, linear
+/// The color layers of `store` in Alembic space: Blender `BYTE_COLOR` values (sRGB RGB, linear
 /// alpha), quantized to bytes. Corner values follow the reversed corner order that
 /// `reversed_faces` gives. `faces` are in Potter order.
 fn export_color_layers(faces: &[Vec<usize>], store: ColorStore) -> Result<Vec<ColorSample>> {
@@ -3440,7 +3440,7 @@ fn import_color_layers(
 }
 
 /// Potter's linear RGBA values for one parameter's scope. Blender's Alembic importer stores every
-/// color `GeomParam` as a CORNER BYTE_COLOR attribute, expanding vertex/varying values through each
+/// color `GeomParam` as a CORNER `BYTE_COLOR` attribute, expanding vertex/varying values through each
 /// face's point indices and decoding sRGB RGB while leaving alpha linear.
 fn canonical_color_values(
     faces: &[Vec<usize>],

@@ -1936,7 +1936,7 @@ fn prim_by_path<'a>(prim: &'a Prim, path: &str) -> Option<&'a Prim> {
         .find_map(|child| prim_by_path(child, path))
 }
 
-/// Follows a material's diffuseColor connection through NodeGraph outputs to a supported reader.
+/// Follows a material's diffuseColor connection through `NodeGraph` outputs to a supported reader.
 /// Blender imports other sources differently, so they return `None`.
 fn primvar_color_reader<'a>(material: &'a Prim, connect: &str) -> Option<&'a Prim> {
     let mut target = connection_target(connect)?;
@@ -2608,19 +2608,18 @@ fn import_color_layers(
             ))),
         }
     }
-    let (active, render) = match &metadata {
-        Some(metadata) => (
+    let (active, render) = if let Some(metadata) = &metadata {
+        (
             metadata["active"].as_str().map(str::to_owned),
             metadata["render"].as_str().map(str::to_owned),
-        ),
-        None => {
-            let render = layers
-                .iter()
-                .find(|layer| layer.name == "displayColor")
-                .or(layers.first())
-                .map(|layer| layer.name.clone());
-            (render.clone(), render)
-        }
+        )
+    } else {
+        let render = layers
+            .iter()
+            .find(|layer| layer.name == "displayColor")
+            .or(layers.first())
+            .map(|layer| layer.name.clone());
+        (render.clone(), render)
     };
     if !layers.is_empty() {
         color_layers::write(
@@ -2650,9 +2649,9 @@ fn color_width(type_name: &str) -> Option<usize> {
 /// `usd_colorspace_utils.cc`).
 fn color_space_is_srgb(space: Option<&str>) -> std::result::Result<bool, String> {
     match space {
-        None
-        | Some("")
-        | Some("lin_rec709_scene" | "Linear Rec.709 (sRGB)" | "raw" | "RAW" | "data") => Ok(false),
+        None | Some("" | "lin_rec709_scene" | "Linear Rec.709 (sRGB)" | "raw" | "RAW" | "data") => {
+            Ok(false)
+        }
         Some("sRGB" | "srgb_texture" | "Utility - sRGB - Texture") => Ok(true),
         Some(other) => Err(format!(
             "has colorSpace `{other}`; only sRGB and scene-linear colors are imported"
@@ -3901,15 +3900,19 @@ fn unique_primvar_name(base: String, used: &mut BTreeSet<String>) -> Result<Stri
     if used.insert(base.clone()) {
         return Ok(base);
     }
-    (1_usize..)
-        .map(|suffix| format!("{base}_{suffix}"))
-        .find(|candidate| used.insert(candidate.clone()))
-        .ok_or_else(|| {
+    let mut suffix = 1_usize;
+    loop {
+        let candidate = format!("{base}_{suffix}");
+        if used.insert(candidate.clone()) {
+            return Ok(candidate);
+        }
+        suffix = suffix.checked_add(1).ok_or_else(|| {
             PotError::new(
                 ErrorCode::LimitExceeded,
                 "USD primvar namespace is exhausted",
             )
-        })
+        })?;
+    }
 }
 
 /// Writes each color layer as a linear `color4f[]` primvar. `potter:colorLayers` names every layer,
@@ -4406,7 +4409,7 @@ mod tests {
     use crate::{
         error::{ErrorCode, PotError, Result},
         exchange::test_support::triangle_with_layers,
-        geom::color_layers::{self, ColorDomain, ColorStore},
+        geom::color_layers::{self, ColorDomain, ColorLayer, ColorStore},
         graph::NodeGroup,
         model::{Material, SceneDoc},
     };
@@ -4479,7 +4482,7 @@ mod tests {
     /// and `diffuse` is the target of the `Preview` shader's `diffuseColor` connection.
     fn material_fixture(material_inputs: &str, diffuse: &str, shaders: &str) -> String {
         format!(
-            r##"#usda 1.0
+            r#"#usda 1.0
 
 def Mesh "Tri"
 {{
@@ -4501,7 +4504,7 @@ def Material "M"
     }}
 {shaders}
 }}
-"##
+"#
         )
     }
 
@@ -4548,7 +4551,7 @@ def Material "M"
     fn display_color_vertex_primvar_is_a_point_layer_and_the_render_layer() -> Result<()> {
         // Blender: a vertex-interpolated displayColor is a point attribute, and it is the active color.
         let (store, losses) = import_colors(&triangle(
-            r##"    color3f[] primvars:displayColor = [(1, 0, 0), (0, 1, 0), (0, 0, 1)] (interpolation = "vertex")"##,
+            r#"    color3f[] primvars:displayColor = [(1, 0, 0), (0, 1, 0), (0, 0, 1)] (interpolation = "vertex")"#,
         ))?;
         assert!(losses.is_empty(), "{losses:?}");
         assert_eq!(store.layers.len(), 1);
@@ -4572,7 +4575,7 @@ def Material "M"
     fn uniform_display_color_lands_on_corners_one_value_per_face() -> Result<()> {
         // Blender: a uniform displayColor is copied to the corners of each face (`read_face_display_color`).
         let (store, _) = import_colors(&square(
-            r##"    color3f[] primvars:displayColor = [(1, 0, 0), (0, 0, 1)] (interpolation = "uniform")"##,
+            r#"    color3f[] primvars:displayColor = [(1, 0, 0), (0, 0, 1)] (interpolation = "uniform")"#,
         ))?;
         let layer = &store.layers[0];
         assert_eq!(layer.domain, ColorDomain::Corner);
@@ -4586,7 +4589,7 @@ def Material "M"
     fn constant_display_color_is_one_corner_value() -> Result<()> {
         // Blender: a constant displayColor is a single value on the corner domain (`read_face_display_color`).
         let (store, _) = import_colors(&square(
-            r##"    color3f[] primvars:displayColor = [(0.5, 0.25, 0.125)] (interpolation = "constant")"##,
+            r#"    color3f[] primvars:displayColor = [(0.5, 0.25, 0.125)] (interpolation = "constant")"#,
         ))?;
         let layer = &store.layers[0];
         assert_eq!(layer.domain, ColorDomain::Corner);
@@ -4598,7 +4601,7 @@ def Material "M"
     fn constant_color_primvar_is_one_point_value_and_first_layer_renders() -> Result<()> {
         // Blender: a constant non-displayColor primvar is a single point value (`copy_primvar_to_blender_buffer`).
         let (store, _) = import_colors(&triangle(
-            r##"    color3f[] primvars:Paint = [(0.5, 0.25, 0.125)] (interpolation = "constant")"##,
+            r#"    color3f[] primvars:Paint = [(0.5, 0.25, 0.125)] (interpolation = "constant")"#,
         ))?;
         let layer = &store.layers[0];
         assert_eq!(layer.name, "Paint");
@@ -4612,7 +4615,7 @@ def Material "M"
     fn face_varying_color4_keeps_its_alpha() -> Result<()> {
         // Blender: a faceVarying color4 primvar keeps all four components on the corner domain.
         let (store, _) = import_colors(&triangle(
-            r##"    color4f[] primvars:Wear = [(0.1, 0.2, 0.3, 0.5), (0.4, 0.5, 0.6, 0.25), (0.7, 0.8, 0.9, 1)] (interpolation = "faceVarying")"##,
+            r#"    color4f[] primvars:Wear = [(0.1, 0.2, 0.3, 0.5), (0.4, 0.5, 0.6, 0.25), (0.7, 0.8, 0.9, 1)] (interpolation = "faceVarying")"#,
         ))?;
         let layer = &store.layers[0];
         assert_eq!(layer.domain, ColorDomain::Corner);
@@ -4653,7 +4656,7 @@ def Material "M"
         // Blender converts a colorSpace of sRGB to scene linear (`colorspace_attr_to_scene_linear`);
         // sRGB 0.5 decodes to 0.2140411.
         let (store, losses) = import_colors(&triangle(
-            r##"    color3f[] primvars:displayColor = [(0.5, 0.5, 0.5), (1, 1, 1), (0, 0, 0)] (interpolation = "vertex", colorSpace = "sRGB")"##,
+            r#"    color3f[] primvars:displayColor = [(0.5, 0.5, 0.5), (1, 1, 1), (0, 0, 0)] (interpolation = "vertex", colorSpace = "sRGB")"#,
         ))?;
         assert!(losses.is_empty(), "{losses:?}");
         let values = &store.layers[0].values;
@@ -4668,9 +4671,9 @@ def Material "M"
     fn unknown_color_space_drops_the_layer_with_a_loss() -> Result<()> {
         // Blender converts with its OCIO config, which Potter does not carry, so the layer is a loss.
         let (store, losses) = import_colors(&triangle(
-            r##"    color3f[] primvars:displayColor = [(1, 0, 0), (0, 1, 0), (0, 0, 1)] (interpolation = "vertex", colorSpace = "ACEScg")"##,
+            r#"    color3f[] primvars:displayColor = [(1, 0, 0), (0, 1, 0), (0, 0, 1)] (interpolation = "vertex", colorSpace = "ACEScg")"#,
         ))?;
-        assert!(store.layers.is_empty());
+        assert_eq!(store.layers, [] as [ColorLayer; 0]);
         assert!(
             losses
                 .iter()
@@ -4683,7 +4686,7 @@ def Material "M"
     // ancestors (`usd_colorspace_utils.cc:46-65`).
     #[test]
     fn color_space_api_inherits_from_scene_prim() -> Result<()> {
-        let text = r##"#usda 1.0
+        let text = r#"#usda 1.0
 def Xform "Scene"
 {
     token colorSpace = "sRGB"
@@ -4695,7 +4698,7 @@ def Xform "Scene"
         color3f[] primvars:displayColor = [(0.5, 0.5, 0.5), (1, 1, 1), (0, 0, 0)] (interpolation = "vertex")
     }
 }
-"##;
+"#;
         let (store, losses) = import_colors(text)?;
         assert!(losses.is_empty(), "{losses:?}");
         assert!((store.layers[0].values[0][0] - 0.214_041_14).abs() < 1e-6);
@@ -4704,7 +4707,7 @@ def Xform "Scene"
 
     #[test]
     fn color_space_api_owning_prim_overrides_ancestor() -> Result<()> {
-        let text = r##"#usda 1.0
+        let text = r#"#usda 1.0
 def Xform "Scene"
 {
     token colorSpace = "ACEScg"
@@ -4717,7 +4720,7 @@ def Xform "Scene"
         color3f[] primvars:displayColor = [(0.5, 0.5, 0.5), (1, 1, 1), (0, 0, 0)] (interpolation = "vertex")
     }
 }
-"##;
+"#;
         let (store, losses) = import_colors(text)?;
         assert!(losses.is_empty(), "{losses:?}");
         assert_eq!(store.layers[0].values[0][0], 0.5);
@@ -4726,7 +4729,7 @@ def Xform "Scene"
 
     #[test]
     fn unsupported_color_space_api_drops_layer_with_loss() -> Result<()> {
-        let text = r##"#usda 1.0
+        let text = r#"#usda 1.0
 def Xform "Scene"
 {
     token colorSpace = "ACEScg"
@@ -4738,16 +4741,16 @@ def Xform "Scene"
         color3f[] primvars:displayColor = [(1, 0, 0), (0, 1, 0), (0, 0, 1)] (interpolation = "vertex")
     }
 }
-"##;
+"#;
         let (store, losses) = import_colors(text)?;
-        assert!(store.layers.is_empty());
+        assert_eq!(store.layers, [] as [ColorLayer; 0]);
         assert!(losses.iter().any(|loss| loss == "mesh.color_attribute"));
         Ok(())
     }
 
     #[test]
     fn color_space_attribute_overrides_prim_and_ancestor_and_preserves_alpha() -> Result<()> {
-        let text = r##"#usda 1.0
+        let text = r#"#usda 1.0
 def Xform "Scene"
 {
     token colorSpace = "ACEScg"
@@ -4764,7 +4767,7 @@ def Xform "Scene"
         }
     }
 }
-"##;
+"#;
         let (store, losses) = import_colors(text)?;
         assert!(losses.is_empty(), "{losses:?}");
         let value = store.layers[0].values[0];
@@ -4776,7 +4779,7 @@ def Xform "Scene"
     #[test]
     fn color_metadata_without_interpolation_does_not_add_numeric_components() -> Result<()> {
         let (store, losses) = import_colors(&triangle(
-            r##"    color3f[] primvars:Paint = [(0.5, 0.25, 0.125)] (colorSpace = "lin_rec709_scene")"##,
+            r#"    color3f[] primvars:Paint = [(0.5, 0.25, 0.125)] (colorSpace = "lin_rec709_scene")"#,
         ))?;
         assert!(losses.is_empty(), "{losses:?}");
         assert_eq!(store.layers[0].values, [[0.5, 0.25, 0.125, 1.0]; 3]);
@@ -4787,9 +4790,9 @@ def Xform "Scene"
     fn non_array_color_primvar_is_not_a_layer() -> Result<()> {
         // Blender reads only array-valued color primvars (`read_custom_data`, `usd_reader_mesh.cc`).
         let (store, losses) = import_colors(&triangle(
-            r##"    color3f primvars:Paint = (0.5, 0.25, 0.125) (interpolation = "constant")"##,
+            r#"    color3f primvars:Paint = (0.5, 0.25, 0.125) (interpolation = "constant")"#,
         ))?;
-        assert!(store.layers.is_empty());
+        assert_eq!(store.layers, [] as [ColorLayer; 0]);
         assert!(losses.is_empty(), "{losses:?}");
         Ok(())
     }
@@ -4801,12 +4804,12 @@ def Xform "Scene"
         let text = material_fixture(
             "",
             "</M/Reader.outputs:rgb>",
-            r##"    def Shader "Reader"
+            r#"    def Shader "Reader"
     {
         uniform token info:id = "UsdPrimvarReader_float3"
         string inputs:varname = "displayColor"
         float3 outputs:rgb
-    }"##,
+    }"#,
         );
         let (doc, losses) = parse_usda(&text, "scene".to_owned())?;
         assert!(losses.is_empty());
@@ -4824,7 +4827,7 @@ def Xform "Scene"
     // (`usd_reader_material.cc:997-1018`).
     #[test]
     fn primvar_reader_connection_resolves_full_shader_path() -> Result<()> {
-        let shaders = r##"    def Scope "A"
+        let shaders = r#"    def Scope "A"
     {
         def Shader "Reader"
         {
@@ -4841,7 +4844,7 @@ def Xform "Scene"
             string inputs:varname = "RightLayer"
             float3 outputs:rgb
         }
-    }"##;
+    }"#;
         let text = material_fixture("", "</M/B/Reader.outputs:rgb>", shaders);
         let (doc, losses) = parse_usda(&text, "scene".to_owned())?;
         assert!(losses.is_empty(), "{losses:?}");
@@ -4855,7 +4858,7 @@ def Xform "Scene"
 
     #[test]
     fn primvar_reader_varname_connection_resolves_full_prim_path() -> Result<()> {
-        let shaders = r##"    def Scope "A"
+        let shaders = r#"    def Scope "A"
     {
         def Scope "Inputs"
         {
@@ -4874,7 +4877,7 @@ def Xform "Scene"
         uniform token info:id = "UsdPrimvarReader_float3"
         string inputs:varname.connect = </M/B/Inputs.inputs:varname>
         float3 outputs:rgb
-    }"##;
+    }"#;
         let text = material_fixture("", "</M/Reader.outputs:rgb>", shaders);
         let (doc, losses) = parse_usda(&text, "scene".to_owned())?;
         assert!(losses.is_empty(), "{losses:?}");
@@ -4890,7 +4893,7 @@ def Xform "Scene"
     // (`usd_reader_material.cc:997-1018`).
     #[test]
     fn primvar_reader_follows_wrapped_node_graph_outputs() -> Result<()> {
-        let shaders = r##"    def NodeGraph "Outer"
+        let shaders = r#"    def NodeGraph "Outer"
     {
         token outputs:rgb.connect = </M/Outer/Inner.outputs:rgb>
         def NodeGraph "Inner"
@@ -4903,7 +4906,7 @@ def Xform "Scene"
         uniform token info:id = "UsdPrimvarReader_float3"
         string inputs:varname = "WrappedColor"
         float3 outputs:rgb
-    }"##;
+    }"#;
         let text = material_fixture("", "</M/Outer.outputs:rgb>", shaders);
         let (doc, losses) = parse_usda(&text, "scene".to_owned())?;
         assert!(losses.is_empty(), "{losses:?}");
@@ -4921,12 +4924,12 @@ def Xform "Scene"
         let text = material_fixture(
             "    token inputs:frame:stPrimvarName = \"UVColor\"",
             "</M/Reader.outputs:rgb>",
-            r##"    def Shader "Reader"
+            r#"    def Shader "Reader"
     {
         uniform token info:id = "UsdPrimvarReader_float3"
         string inputs:varname.connect = </M.inputs:frame:stPrimvarName>
         float3 outputs:rgb
-    }"##,
+    }"#,
         );
         let (doc, _) = parse_usda(&text, "scene".to_owned())?;
         let (_, graph) = only_material(&doc)?;
@@ -4940,11 +4943,11 @@ def Xform "Scene"
         let text = material_fixture(
             "",
             "</M/Reader.outputs:rgb>",
-            r##"    def Shader "Reader"
+            r#"    def Shader "Reader"
     {
         uniform token info:id = "UsdPrimvarReader_float3"
         float3 outputs:rgb
-    }"##,
+    }"#,
         );
         let (doc, losses) = parse_usda(&text, "scene".to_owned())?;
         let material = doc.materials.values().next();
@@ -4963,10 +4966,10 @@ def Xform "Scene"
         let text = material_fixture(
             "",
             "</M/Texture.outputs:rgb>",
-            r##"    def Shader "Texture"
+            r#"    def Shader "Texture"
     {
         uniform token info:id = "UsdUVTexture"
-    }"##,
+    }"#,
         );
         assert!(parse_usda(&text, "scene".to_owned()).is_err());
     }

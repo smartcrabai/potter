@@ -380,7 +380,7 @@ enum ColorEncoding {
     PlySrgbBytes,
     /// USD `color4f` in `lin_rec709_scene`: exact linear floats.
     Linear,
-    /// FBX and Alembic BYTE_COLOR: sRGB RGB and linear alpha, each rounded to the nearest byte.
+    /// FBX and Alembic `BYTE_COLOR`: sRGB RGB and linear alpha, each rounded to the nearest byte.
     ByteColor,
 }
 
@@ -845,7 +845,7 @@ fn nearest_byte(value: f64) -> f64 {
     (value.clamp(0.0, 1.0) * 255.0 + 0.5).floor()
 }
 
-/// A linear RGBA value after one BYTE_COLOR round trip: sRGB RGB and linear alpha, each rounded
+/// A linear RGBA value after one `BYTE_COLOR` round trip: sRGB RGB and linear alpha, each rounded
 /// to the nearest byte, then read back by Blender as linear light.
 fn byte_color(value: [f64; 4]) -> [f64; 4] {
     [
@@ -1332,7 +1332,7 @@ fn decode_ply(path: &Path, source: &OracleMesh) -> TestResult<PlyFile> {
                 element = "face";
             }
             ["property", scalar, name] if element == "vertex" => {
-                vertex_properties.push(((*name).to_owned(), (*scalar).to_owned()))
+                vertex_properties.push(((*name).to_owned(), (*scalar).to_owned()));
             }
             ["property", "list", count_type, item_type, "vertex_indices"] if element == "face" => {
                 face_index_types = Some(((*count_type).to_owned(), (*item_type).to_owned()));
@@ -1796,7 +1796,7 @@ fn assert_usda_group_payload(text: &str, source: &OracleMesh) -> TestResult<()> 
         .find(|line| line.contains("custom string potter:deformation ="))
         .ok_or("USDA deformation payload missing")?;
     let encoded = line
-        .split_once("=")
+        .split_once('=')
         .ok_or("USDA deformation assignment malformed")?
         .1
         .trim();
@@ -1943,7 +1943,7 @@ fn blender_dumps(blender: &Path, root: &Path, files: &[PathBuf]) -> TestResult<V
     let script = write_script(root, "import_exchange_files.py", IMPORT_DUMP_SCRIPT)?;
     let output = root.join("blender_imports.json");
     let mut arguments = vec![output.as_path()];
-    arguments.extend(files.iter().map(|path| path.as_path()));
+    arguments.extend(files.iter().map(PathBuf::as_path));
     run_blender_arguments(blender, &script, None, &arguments)?;
     Ok(serde_json::from_slice(&fs::read(output)?)?)
 }
@@ -3094,7 +3094,7 @@ fn armature_bound_vertex_group_roundtrips_through_blender_fbx_without_loss() -> 
         });
         Ok(values)
     };
-    let source_weights = group_values(&source_mesh)?;
+    let source_weights = group_values(source_mesh)?;
     let imported_weights = group_values(imported_mesh)?;
     assert_eq!(source_weights.len(), 3);
     assert_eq!(imported_weights.len(), 3);

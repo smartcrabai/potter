@@ -734,6 +734,10 @@ pub(crate) fn element_data_losses(format: &str, meshes: &[ExchangeMesh]) -> Vec<
                 }
             }
             if format == "obj" && selected_color == Some(index) {
+                #[expect(
+                    clippy::float_cmp,
+                    reason = "exact 1.0 marks opaque alpha; any other alpha is non-opaque"
+                )]
                 if values.iter().any(|value| value[3] != 1.0) {
                     losses.push(element_loss(
                         mesh,
@@ -881,20 +885,20 @@ pub(super) fn blender_color_byte(value: f64) -> u8 {
     (value.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
 }
 
-/// A canonical linear channel as Blender stores it in BYTE_COLOR interchange: encoded RGB, linear
+/// A canonical linear channel as Blender stores it in `BYTE_COLOR` interchange: encoded RGB, linear
 /// alpha, quantized to the nearest byte and normalized back to `[0, 1]`.
 pub(super) fn encode_byte_color(value: f64, alpha: bool) -> f64 {
     let encoded = if alpha { value } else { srgb_encode(value) };
     f64::from(blender_color_byte(encoded)) / 255.0
 }
 
-/// A normalized Blender BYTE_COLOR channel decoded to Potter's linear representation.
+/// A normalized Blender `BYTE_COLOR` channel decoded to Potter's linear representation.
 pub(super) fn decode_byte_color(value: f64, alpha: bool) -> f64 {
     let encoded = f64::from(blender_color_byte(value)) / 255.0;
     if alpha { encoded } else { srgb_decode(encoded) }
 }
 
-/// The canonical linear value represented by one Blender BYTE_COLOR round-trip.
+/// The canonical linear value represented by one Blender `BYTE_COLOR` round-trip.
 pub(super) fn byte_color_roundtrip(value: f64, alpha: bool) -> f64 {
     decode_byte_color(encode_byte_color(value, alpha), alpha)
 }
@@ -937,6 +941,10 @@ pub(crate) fn obj_group_is_face_compatible(
         let Some(value) = assigned.get_mut(*index) else {
             return false;
         };
+        #[expect(
+            clippy::float_cmp,
+            reason = "exact 1.0 is the binary whole-face weight; other weights are rejected"
+        )]
         if *weight != 1.0 || *value {
             return false;
         }
@@ -948,12 +956,11 @@ pub(crate) fn obj_group_is_face_compatible(
             let Some(value) = assigned.get(*index) else {
                 return false;
             };
-            match membership {
-                Some(expected) => *value == expected,
-                None => {
-                    membership = Some(*value);
-                    true
-                }
+            if let Some(expected) = membership {
+                *value == expected
+            } else {
+                membership = Some(*value);
+                true
             }
         })
     }) && group
@@ -1280,6 +1287,8 @@ pub(crate) mod test_support {
     /// One triangle with two UV layers. Layer 0 is `UVMap` and is the render layer. Layer 1 is
     /// `Lightmap` and is the active layer, which OBJ and PLY write.
     pub(crate) fn triangle_with_layers() -> ExchangeMesh {
+        use crate::geom::color_layers::ColorStore;
+
         ExchangeMesh {
             id: "triangle".to_owned(),
             name: "Triangle".to_owned(),
@@ -1304,7 +1313,7 @@ pub(crate) mod test_support {
             ],
             uv_active: Some(1),
             uv_render: Some(0),
-            colors: Default::default(),
+            colors: ColorStore::default(),
             vertex_groups: Vec::new(),
             material_slots: Vec::new(),
             face_material_indices: vec![0],
@@ -1606,7 +1615,7 @@ mod tests {
         use crate::{
             eval::{EvaluationContext, Snapshot},
             geom::Mesh,
-            model::{DataBlock, Id, Modifier, Node, SceneDoc, VertexGroup},
+            model::{DataBlock, Id, Modifier, ModifierRuntime, Node, SceneDoc, VertexGroup},
         };
 
         let group_id = Id::new("weighted_group")?;
@@ -1664,7 +1673,7 @@ mod tests {
                     show_render: true,
                     params: modifier_params,
                     binding_data: None,
-                    runtime: Default::default(),
+                    runtime: ModifierRuntime::default(),
                 }],
                 ..Node::default()
             },
@@ -1692,14 +1701,15 @@ mod tests {
     fn blender_byte_color_roundtrip_encodes_rgb_and_alpha_differently() {
         assert!((encode_byte_color(0.5, false) - 188.0 / 255.0).abs() < 1.0e-12);
         assert!((encode_byte_color(0.5, true) - 128.0 / 255.0).abs() < 1.0e-12);
-        assert!((decode_byte_color(128.0 / 255.0, false) - 0.21586050011389926).abs() < 1.0e-12);
+        assert!(
+            (decode_byte_color(128.0 / 255.0, false) - 0.215_860_500_113_899_26).abs() < 1.0e-12
+        );
         assert_eq!(decode_byte_color(128.0 / 255.0, true), 128.0 / 255.0);
-        assert!((byte_color_roundtrip(0.5, false) - 0.5028864580325687).abs() < 1.0e-9);
+        assert!((byte_color_roundtrip(0.5, false) - 0.502_886_458_032_568_7).abs() < 1.0e-9);
     }
 
     #[test]
-    fn byte_color_formats_report_quantization_clipping_and_point_to_corner_losses()
-    -> crate::error::Result<()> {
+    fn byte_color_formats_report_quantization_clipping_and_point_to_corner_losses() {
         use crate::geom::color_layers::{ColorDomain, ColorLayer, ColorStore};
 
         let mut mesh = triangle_with_layers();
@@ -1720,7 +1730,6 @@ mod tests {
         assert!(alembic.iter().any(|loss| loss.reason.contains("as CORNER")));
         assert!(alembic.iter().any(|loss| loss.reason.contains("quantized")));
         assert!(alembic.iter().any(|loss| loss.reason.contains("clips")));
-        Ok(())
     }
 
     #[test]

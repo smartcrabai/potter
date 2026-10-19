@@ -714,7 +714,7 @@ mod tests {
             }],
             uv_active: Some(0),
             uv_render: Some(0),
-            colors: Default::default(),
+            colors: ColorStore::default(),
             vertex_groups: Vec::new(),
             material_slots: Vec::new(),
             face_material_indices: Vec::new(),

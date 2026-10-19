@@ -1155,7 +1155,7 @@ pub(crate) fn vertex_group_losses(doc: &SceneDoc, snapshot: &Snapshot) -> Result
                 .and_then(|id| doc.data_blocks.get(id))
                 .and_then(|data| data.armature.as_ref());
             if let Some(armature) = armature {
-                for (_, bone) in &armature.bones {
+                for bone in armature.bones.values() {
                     if bone.deform {
                         deform_bones.insert(bone.name.clone());
                     }
@@ -2007,7 +2007,7 @@ fn fbx_encode_color(value: [f64; 4]) -> [f64; 4] {
 fn fbx_decode_color(value: [f64; 4]) -> [f64; 4] {
     std::array::from_fn(|channel| decode_byte_color(value[channel], channel == 3))
 }
-/// Writes FBX BYTE_COLOR values: RGB is sRGB encoded, alpha is linear, and all channels are
+/// Writes FBX `BYTE_COLOR` values: RGB is sRGB encoded, alpha is linear, and all channels are
 /// nearest-byte quantized. Blender imports all color layers into CORNER (`import_fbx.py`:
 /// `blen_read_geom_layer_color`); `ByVertice`/`Direct` expands point values onto loops. POINT
 /// domain loss is reported by `element_data_losses`. CORNER colors use ByPolygonVertex/IndexToDirect.
@@ -4262,7 +4262,7 @@ mod tests {
         let colors = parse_color_layers(geometry, 3, &[vec![0, 1, 2]], 1, None, &mut losses)?;
         assert!(losses.is_empty());
         assert_eq!(colors.layers[0].domain, ColorDomain::Point);
-        assert!((colors.layers[0].values[0][0] - 0.21586050011389926).abs() < 1.0e-12);
+        assert!((colors.layers[0].values[0][0] - 0.215_860_500_113_899_26).abs() < 1.0e-12);
         assert!((colors.layers[0].values[0][3] - 128.0 / 255.0).abs() < 1.0e-12);
         Ok(())
     }
@@ -4297,7 +4297,7 @@ mod tests {
         assert!((raw[3] - 128.0 / 255.0).abs() < 1.0e-12);
         let mut losses = Vec::new();
         let colors = parse_color_layers(geometry, 3, &[vec![0, 1, 2]], 1, None, &mut losses)?;
-        assert!((colors.layers[0].values[0][0] - 0.5028864580325687).abs() < 1.0e-9);
+        assert!((colors.layers[0].values[0][0] - 0.502_886_458_032_568_7).abs() < 1.0e-9);
         assert!((colors.layers[0].values[0][3] - 128.0 / 255.0).abs() < 1.0e-12);
         Ok(())
     }
