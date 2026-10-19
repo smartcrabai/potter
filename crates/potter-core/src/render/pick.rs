@@ -51,6 +51,7 @@ struct Manifest {
 
 #[derive(Debug, Deserialize, serde::Serialize)]
 struct CameraManifest {
+    projection: String,
     projection_params: Projection,
     position: [f64; 3],
     target: [f64; 3],
