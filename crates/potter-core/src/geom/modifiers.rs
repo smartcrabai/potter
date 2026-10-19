@@ -3062,6 +3062,11 @@ fn subdivision(
         &subdivision_origin::WRITTEN_KEYS,
     )?;
     subdivision_origin::restore_written(&mut result, written);
+    if !simple {
+        // Catmull-Clark output carries no source indices (`subdivide_once`): the remap above reads the
+        // input carrier and would re-attach it to weight-one vertices, so the clear is repeated here.
+        crate::geom::clear_origindex(&mut result);
+    }
     subdivision_uv::encode_byte_colors(mesh, &origin, Some(&staged), &mut result);
     for (face, &start) in result.faces.iter_mut().zip(&order.face_starts) {
         face.vertices.rotate_left(start);
@@ -6002,7 +6007,10 @@ mod tests {
             let mesh =
                 Mesh::from_positions_and_faces(oracle_points(&case["positions"]), faces).unwrap();
             let modifier = with_params("wave", case["params"].clone());
-            let result = super::advanced::wave(&mesh, &modifier, frame).unwrap();
+            let mut rng = crate::blender_rng::BlenderRng::seed(0);
+            let result =
+                super::displacement::wave_textured(&mesh, &modifier, frame, None, &mut rng)
+                    .unwrap();
             let expected = oracle_points(&case["output"]);
             assert_eq!(result.vertices.len(), expected.len());
             for (index, (vertex, expected)) in result.vertices.iter().zip(&expected).enumerate() {
@@ -6072,7 +6080,7 @@ mod tests {
                     "keep_custom_normals": false,
                 }),
             );
-            let result = evaluate_modifiers(&mesh, &[modifier]).unwrap();
+            let result = evaluate_modifiers(&mesh, &[modifier], "TestObject").unwrap();
             let index: HashMap<u32, usize> = result
                 .vertices
                 .iter()
@@ -7082,6 +7090,64 @@ mod tests {
         assert_eq!(result.faces.len(), 24);
         assert!(result.faces.iter().all(|face| face.vertices.len() == 4));
         assert!(result.validate().is_ok());
+    }
+
+    /// Blender's origindex through subdivision: SIMPLE keeps each original vertex's index once and marks
+    /// generated vertices `ORIGINDEX_NONE`; Catmull-Clark marks every vertex generated
+    /// (`tests/fixtures/pr18f_hook/subdivision_origin_oracle.json`). The staged remap of the subdivision
+    /// path must keep both rules.
+    #[test]
+    fn subdivision_origindex_keeps_originals_for_simple_and_clears_for_catmull_clark() {
+        let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
+        let base = mesh.vertices.len();
+        let indices: Vec<i32> = (0..base)
+            .map(|index| i32::try_from(index).unwrap())
+            .collect();
+        crate::geom::set_origindex(&mut mesh, &indices);
+
+        let simple = evaluate_modifiers(
+            &mesh,
+            &[with_params(
+                "subdivision",
+                json!({"levels": 1, "subdivision_type": "SIMPLE"}),
+            )],
+            "TestObject",
+        )
+        .unwrap();
+        let carrier = crate::geom::origindex_values(&simple).unwrap();
+        assert_eq!(carrier.len(), simple.vertices.len());
+        let mut originals: Vec<i32> = carrier
+            .iter()
+            .copied()
+            .filter(|&index| index != crate::geom::ORIGINDEX_NONE)
+            .collect();
+        originals.sort_unstable();
+        assert_eq!(
+            originals, indices,
+            "each original vertex keeps its index exactly once"
+        );
+        assert_eq!(
+            carrier
+                .iter()
+                .filter(|&&index| index == crate::geom::ORIGINDEX_NONE)
+                .count(),
+            simple.vertices.len() - base,
+            "every generated vertex is ORIGINDEX_NONE"
+        );
+
+        let catmull = evaluate_modifiers(
+            &mesh,
+            &[with_params("subdivision", json!({"levels": 1}))],
+            "TestObject",
+        )
+        .unwrap();
+        let carrier = crate::geom::origindex_values(&catmull).unwrap();
+        assert!(
+            carrier
+                .iter()
+                .all(|&index| index == crate::geom::ORIGINDEX_NONE),
+            "Catmull-Clark output carries no source indices"
+        );
     }
 
     #[test]
