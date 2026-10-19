@@ -167,6 +167,20 @@ fn check_scenario(roughness: f64, light_size: f64) -> TestResult {
         potter_runs.push(patch_mean(&project, &image_id)?);
     }
     let (actual, actual_error) = mean_and_error(&potter_runs);
+    // Seed spread (sample standard deviation of the per-seed patch means, red channel) for the
+    // before/after comparison; `--nocapture` shows it.
+    let spread = |runs: &[[f64; 3]]| {
+        let mean = runs.iter().map(|run| run[0]).sum::<f64>() / runs.len() as f64;
+        (runs.iter().map(|run| (run[0] - mean).powi(2)).sum::<f64>() / (runs.len() as f64 - 1.0))
+            .sqrt()
+    };
+    eprintln!(
+        "POTTER_SPREAD {label}: potter mean {:.5} sd {:.5} | cycles mean {:.5} sd {:.5}",
+        actual[0],
+        spread(&potter_runs),
+        wanted[0],
+        spread(&wanted_runs),
+    );
 
     for channel in 0..3 {
         let tolerance =
