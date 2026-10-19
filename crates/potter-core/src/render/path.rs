@@ -2690,3 +2690,76 @@ mod volume_extinction_tests {
             * (denominator.recip() - 1.0 / (1.0 + anisotropy))
     }
 }
+
+#[cfg(test)]
+mod sampling_tests {
+    use std::f64::consts::{FRAC_PI_2, TAU};
+
+    use super::*;
+    use crate::model::Material;
+
+    /// The mean of `sample_bsdf`'s weight (`f · cos / p_mix`) over the sampler's own directions is the
+    /// integral of `f · cos` over the hemisphere, if the mixture density the sampler reports matches
+    /// how it draws the directions. At metallic 0.5 all three branches contribute, so a wrong
+    /// density in any of them biases the mean. The reference is a midpoint quadrature of
+    /// `evaluate · cos` at two resolutions; its disagreement is part of the tolerance.
+    #[test]
+    fn sampled_bsdf_weight_mean_matches_the_evaluate_cos_quadrature() {
+        let material = Material {
+            base_color: [0.8, 0.5, 0.3, 1.0],
+            metallic: 0.5,
+            roughness: 0.3,
+            ..Material::default()
+        };
+        let params = BsdfParams::from_material(&material, DVec3::Z);
+        let normal = DVec3::Z;
+        let view = DVec3::new(0.3, 0.1, 0.95).normalize();
+
+        let quadrature = |n_theta: usize, n_phi: usize| -> DVec3 {
+            let d_theta = FRAC_PI_2 / n_theta as f64;
+            let d_phi = TAU / n_phi as f64;
+            let mut total = DVec3::ZERO;
+            for i in 0..n_theta {
+                let theta = (i as f64 + 0.5) * d_theta;
+                for j in 0..n_phi {
+                    let phi = (j as f64 + 0.5) * d_phi;
+                    let light = DVec3::new(
+                        theta.sin() * phi.cos(),
+                        theta.sin() * phi.sin(),
+                        theta.cos(),
+                    );
+                    let cosine = light.dot(normal);
+                    total += evaluate_bsdf(&params, normal, view, light)
+                        * (cosine * theta.sin() * d_theta * d_phi);
+                }
+            }
+            total
+        };
+        let coarse = quadrature(400, 200);
+        let fine = quadrature(800, 400);
+
+        let samples = 400_000_usize;
+        let mut rng = Pcg32::for_sample(1, 0, 0, 0);
+        let mut sum = DVec3::ZERO;
+        let mut sum_squares = DVec3::ZERO;
+        for _ in 0..samples {
+            let weight = match sample_bsdf(&params, normal, view, &mut rng) {
+                BsdfSample::Continuous { weight, .. } | BsdfSample::Delta { weight, .. } => weight,
+            };
+            sum += weight;
+            sum_squares += weight * weight;
+        }
+        let count = samples as f64;
+        let mean = sum / count;
+        let variance = (sum_squares / count - mean * mean).max(DVec3::ZERO);
+        let stderr = (variance / count).sqrt();
+        let reference = fine;
+        let quadrature_error = (coarse - fine).abs();
+        let tolerance = stderr * 4.0 + quadrature_error;
+        let delta = (mean - reference).abs();
+        assert!(
+            delta.cmple(tolerance).all(),
+            "sampled mean {mean:?} vs quadrature {reference:?} (tolerance {tolerance:?})"
+        );
+    }
+}
