@@ -17,6 +17,18 @@ import sys
 OUT = sys.argv[sys.argv.index("--") + 1]
 os.makedirs(OUT, exist_ok=True)
 
+def blender_primitive_cube():
+    """Blender 5.2.2's own `primitive_cube_add` cube (size 1, centred): its vertex coordinates and the
+    edge vertex pairs in the order Blender stores them. Read from Blender at load time, not typed by hand."""
+    bpy.ops.wm.read_factory_settings(use_empty=True)
+    bpy.ops.mesh.primitive_cube_add(size=1.0)
+    mesh = bpy.context.active_object.data
+    verts = [tuple(v.co) for v in mesh.vertices]
+    edges = [tuple(e.vertices) for e in mesh.edges]
+    return verts, edges
+
+
+BLENDER_CUBE_VERTS, BLENDER_CUBE_EDGES = blender_primitive_cube()
 CASES = {
     # straight 3-vertex chain, root at the first vertex, default radii
     "line_default": dict(
@@ -300,6 +312,14 @@ CASES = {
     "cube_branch_potter_box": dict(
         verts=[(-.5,-.5,-.5),(.5,-.5,-.5),(.5,.5,-.5),(-.5,.5,-.5),(-.5,-.5,.5),(.5,-.5,.5),(.5,.5,.5),(-.5,.5,.5)],
         edges=[(0,3),(3,2),(2,1),(1,0),(4,5),(5,6),(6,7),(7,4),(1,5),(4,0),(2,6),(3,7)],
+        skin=[((0.25,0.25), i==0) for i in range(8)],
+        params={},
+    ),
+    # Blender's own primitive_cube_add cube (read from Blender by blender_primitive_cube), so the expectation is
+    # Blender's vertex and edge order with no hand-typed table.
+    "cube_branch_blender": dict(
+        verts=BLENDER_CUBE_VERTS,
+        edges=BLENDER_CUBE_EDGES,
         skin=[((0.25,0.25), i==0) for i in range(8)],
         params={},
     ),
