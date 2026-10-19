@@ -281,17 +281,40 @@ fn fisheye_equidistant_round_trips_as_a_blender_fisheye_panorama() -> Result<(),
 }
 
 #[test]
-fn fisheye_equisolid_round_trips_with_its_lens_and_field_of_view() -> Result<(), Box<dyn Error>> {
+fn fisheye_equisolid_round_trips_its_lens_and_its_perspective_lens_apart()
+-> Result<(), Box<dyn Error>> {
+    // `lens` is the perspective focal length and `fisheye_lens` the equisolid one: Blender keeps them separate, so both
+    // round-trip, and the equisolid lens may be any value in Blender's fisheye range.
     let Some(camera) = panorama_round_trip(
-        &json!({"projection": "panorama", "panorama_type": "fisheye_equisolid", "lens_mm": 12.0, "fisheye_fov": 3.0}),
-        "import bpy; cam = [c for c in bpy.data.cameras if c.type == 'PANO'][0]; assert cam.panorama_type == 'FISHEYE_EQUISOLID'; assert abs(cam.fisheye_lens - 12.0) < 1e-6; assert abs(cam.fisheye_fov - 3.0) < 1e-6",
+        &json!({"projection": "panorama", "panorama_type": "fisheye_equisolid", "lens_mm": 35.0, "fisheye_lens": 12.0, "fisheye_fov": 3.0}),
+        "import bpy; cam = [c for c in bpy.data.cameras if c.type == 'PANO'][0]; assert cam.panorama_type == 'FISHEYE_EQUISOLID'; assert abs(cam.lens - 35.0) < 1e-6; assert abs(cam.fisheye_lens - 12.0) < 1e-6; assert abs(cam.fisheye_fov - 3.0) < 1e-6",
     )?
     else {
         return Ok(());
     };
     assert_eq!(camera["panorama_type"], "fisheye_equisolid");
-    assert_close_value(&camera["lens_mm"], 12.0);
+    assert_close_value(&camera["lens_mm"], 35.0);
+    assert_close_value(&camera["fisheye_lens"], 12.0);
     assert_close_value(&camera["fisheye_fov"], 3.0);
+    Ok(())
+}
+
+#[test]
+fn settings_a_camera_projection_ignores_round_trip_without_loss() -> Result<(), Box<dyn Error>> {
+    // A perspective camera that holds panorama settings (Blender stores them on every camera) keeps them through Blender.
+    let Some(camera) = panorama_round_trip(
+        &json!({"projection": "perspective", "lens_mm": 28.0, "fisheye_lens": 12.0, "fisheye_fov": 3.0,
+                "longitude_min": -1.2, "longitude_max": 2.0, "latitude_min": -0.7, "latitude_max": 1.1}),
+        "import bpy; cam = [c for c in bpy.data.cameras if c.type == 'PERSP'][0]; assert abs(cam.lens - 28.0) < 1e-6; assert abs(cam.fisheye_lens - 12.0) < 1e-6; assert abs(cam.fisheye_fov - 3.0) < 1e-6; assert abs(cam.longitude_min + 1.2) < 1e-6; assert abs(cam.latitude_max - 1.1) < 1e-6",
+    )?
+    else {
+        return Ok(());
+    };
+    assert_eq!(camera["projection"], "perspective");
+    assert_close_value(&camera["lens_mm"], 28.0);
+    assert_close_value(&camera["fisheye_lens"], 12.0);
+    assert_close_value(&camera["fisheye_fov"], 3.0);
+    assert_close_value(&camera["longitude_min"], -1.2);
     Ok(())
 }
 
@@ -336,8 +359,9 @@ fn assert_close_value(value: &Value, expected: f64) {
 fn camera_settings_blender_cannot_hold_are_refused_before_export() -> Result<(), Box<dyn Error>> {
     let directory = tempdir()?;
     for (index, settings) in [
-        json!({"projection": "panorama", "panorama_type": "fisheye_equisolid", "lens_mm": 150.0}),
+        json!({"projection": "panorama", "panorama_type": "fisheye_equisolid", "fisheye_lens": 150.0}),
         json!({"projection": "panorama", "panorama_type": "fisheye_equidistant", "fisheye_fov": 0.1}),
+        json!({"projection": "perspective", "lens_mm": 0.5}),
         json!({"projection": "fisheye"}),
     ]
     .iter()
