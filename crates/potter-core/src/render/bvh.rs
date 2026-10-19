@@ -41,9 +41,6 @@ struct Aabb {
 
 impl Bvh {
     pub(crate) fn build(triangles: &[Triangle]) -> Result<Self> {
-        let triangle_count = triangles.len();
-        let node_capacity = maximum_node_count(triangle_count)?;
-
         for triangle in triangles {
             if triangle
                 .positions
@@ -55,6 +52,19 @@ impl Bvh {
                 ));
             }
         }
+        Self::build_from_positions(triangles.iter().map(|triangle| triangle.positions))
+    }
+
+    /// A BVH over triangles given by their corner positions; primitive `i` is the `i`th item.
+    pub(crate) fn build_from_positions(
+        positions: impl IntoIterator<Item = [DVec3; 3]>,
+    ) -> Result<Self> {
+        let primitive_bounds: Vec<Aabb> = positions
+            .into_iter()
+            .map(|corners| Aabb::for_corners(&corners))
+            .collect();
+        let triangle_count = primitive_bounds.len();
+        let node_capacity = maximum_node_count(triangle_count)?;
 
         let mut triangle_indices = Vec::new();
         triangle_indices
@@ -78,7 +88,12 @@ impl Bvh {
         let root = if triangle_count == 0 {
             None
         } else {
-            Some(build_node(triangles, &mut triangle_indices, 0, &mut nodes)?)
+            Some(build_node(
+                &primitive_bounds,
+                &mut triangle_indices,
+                0,
+                &mut nodes,
+            )?)
         };
 
         Ok(Self {
@@ -98,6 +113,43 @@ impl Bvh {
         t_max: f64,
     ) -> Option<BvhHit> {
         self.closest_hit_mode(triangles, origin, direction, t_min, t_max, true)
+    }
+
+    /// Clears `out` and fills it with the index of every primitive whose leaf bounds the ray
+    /// `origin + t * direction` (t >= 0) may cross. Every primitive the ray hits is among them.
+    pub(crate) fn overlapping(&self, origin: DVec3, direction: DVec3, out: &mut Vec<usize>) {
+        out.clear();
+        if let Some(root) = self.root {
+            self.collect(root, origin, direction, out);
+        }
+    }
+
+    fn collect(&self, node_index: usize, origin: DVec3, direction: DVec3, out: &mut Vec<usize>) {
+        let Some(node) = self.nodes.get(node_index).copied() else {
+            return;
+        };
+        if node
+            .bounds
+            .padded(origin)
+            .intersect_interval(origin, direction, 0.0, f64::INFINITY)
+            .is_none()
+        {
+            return;
+        }
+        match node.kind {
+            NodeKind::Leaf { start, count } => {
+                if let Some(indices) = start
+                    .checked_add(count)
+                    .and_then(|end| self.triangle_indices.get(start..end))
+                {
+                    out.extend_from_slice(indices);
+                }
+            }
+            NodeKind::Branch { left, right } => {
+                self.collect(left, origin, direction, out);
+                self.collect(right, origin, direction, out);
+            }
+        }
     }
 
     fn closest_hit_mode(
@@ -261,12 +313,12 @@ fn maximum_node_count(triangle_count: usize) -> Result<usize> {
 }
 
 fn build_node(
-    triangles: &[Triangle],
+    primitive_bounds: &[Aabb],
     triangle_indices: &mut [usize],
     start: usize,
     nodes: &mut Vec<Node>,
 ) -> Result<usize> {
-    let bounds = bounds_for_indices(triangles, triangle_indices)?;
+    let bounds = bounds_for_indices(primitive_bounds, triangle_indices)?;
     if triangle_indices.len() <= LEAF_TRIANGLE_COUNT {
         let index = nodes.len();
         let _next_count = index
@@ -287,8 +339,8 @@ fn build_node(
 
     let axis = bounds.largest_axis();
     triangle_indices.sort_unstable_by(|left, right| {
-        let left_center = Aabb::for_triangle(&triangles[*left]).center(axis);
-        let right_center = Aabb::for_triangle(&triangles[*right]).center(axis);
+        let left_center = primitive_bounds[*left].center(axis);
+        let right_center = primitive_bounds[*right].center(axis);
         left_center
             .total_cmp(&right_center)
             .then_with(|| left.cmp(right))
@@ -299,8 +351,8 @@ fn build_node(
         .checked_add(middle)
         .ok_or_else(|| PotError::new(ErrorCode::LimitExceeded, "BVH split index overflow"))?;
     let (left_indices, right_indices) = triangle_indices.split_at_mut(middle);
-    let left = build_node(triangles, left_indices, start, nodes)?;
-    let right = build_node(triangles, right_indices, right_start, nodes)?;
+    let left = build_node(primitive_bounds, left_indices, start, nodes)?;
+    let right = build_node(primitive_bounds, right_indices, right_start, nodes)?;
     let index = nodes.len();
     index
         .checked_add(1)
@@ -312,37 +364,36 @@ fn build_node(
     Ok(index)
 }
 
-fn bounds_for_indices(triangles: &[Triangle], indices: &[usize]) -> Result<Aabb> {
+fn bounds_for_indices(primitive_bounds: &[Aabb], indices: &[usize]) -> Result<Aabb> {
     let Some(first_index) = indices.first().copied() else {
         return Err(PotError::new(
             ErrorCode::InternalError,
             "cannot bound an empty BVH node",
         ));
     };
-    let Some(first_triangle) = triangles.get(first_index) else {
+    let Some(mut bounds) = primitive_bounds.get(first_index).copied() else {
         return Err(PotError::new(
             ErrorCode::InternalError,
             "BVH triangle index is out of range",
         ));
     };
-    let mut bounds = Aabb::for_triangle(first_triangle);
     for &index in &indices[1..] {
-        let Some(triangle) = triangles.get(index) else {
+        let Some(other) = primitive_bounds.get(index).copied() else {
             return Err(PotError::new(
                 ErrorCode::InternalError,
                 "BVH triangle index is out of range",
             ));
         };
-        bounds.include(Aabb::for_triangle(triangle));
+        bounds.include(other);
     }
     Ok(bounds)
 }
 
 impl Aabb {
-    fn for_triangle(triangle: &Triangle) -> Self {
-        let mut min = triangle.positions[0];
-        let mut max = triangle.positions[0];
-        for point in &triangle.positions[1..] {
+    fn for_corners(corners: &[DVec3; 3]) -> Self {
+        let mut min = corners[0];
+        let mut max = corners[0];
+        for point in &corners[1..] {
             min = min.min(*point);
             max = max.max(*point);
         }
@@ -401,6 +452,22 @@ impl Aabb {
             }
         }
         Some((near, far))
+    }
+
+    /// The box grown by a margin far above the rounding error of the slab test at `origin`, so a
+    /// primitive that a ray crosses is never culled by rounding.
+    fn padded(self, origin: DVec3) -> Self {
+        let scale = self
+            .min
+            .abs()
+            .max(self.max.abs())
+            .max(origin.abs())
+            .max_element();
+        let margin = DVec3::splat(1.0e-9 * (1.0 + scale));
+        Self {
+            min: self.min - margin,
+            max: self.max + margin,
+        }
     }
 }
 
