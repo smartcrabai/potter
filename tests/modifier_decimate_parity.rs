@@ -578,7 +578,7 @@ fn compare(case: &Value) -> TestResult<Report> {
                 continue;
             };
             let blender_values = blender_values.as_array().map_or(&[][..], Vec::as_slice);
-            for corner in 0..ring.len() {
+            for (corner, &vertex) in ring.iter().enumerate() {
                 let p = potter_values
                     .get(potter_corner_offsets[face_index] + corner)
                     .copied()
@@ -596,7 +596,7 @@ fn compare(case: &Value) -> TestResult<Report> {
                     report.problems.push(format!(
                         "UV layer {layer_name} output face {} corner {corner} at Blender vertex {}: Potter {p:?}, Blender {b:?}",
                         output.faces[face_index].id,
-                        ring[corner]
+                        vertex
                     ));
                 }
             }
