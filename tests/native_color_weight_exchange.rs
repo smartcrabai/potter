@@ -3051,17 +3051,18 @@ fn armature_bound_vertex_group_roundtrips_through_blender_fbx_without_loss() -> 
     let vertices = data["mesh"]["vertices"]
         .as_array()
         .ok_or("native mesh vertices are missing")?;
-    let native_weights = vertices
-        .iter()
-        .map(|vertex| {
-            let id = vertex["id"].as_u64().ok_or("native vertex ID is missing")?;
-            weights
-                .get(&id.to_string())
-                .and_then(|groups| groups[group_id].as_f64())
-                .ok_or_else(|| "native deform weight is missing".into())
-        })
-        .collect::<TestResult<Vec<_>>>()?;
-    let mut native_weights = native_weights;
+    // The fixture is a closed tetrahedron whose apex is outside the DeformBone group, so only the
+    // weighted vertices carry a value.
+    let mut native_weights = Vec::new();
+    for vertex in vertices {
+        let id = vertex["id"].as_u64().ok_or("native vertex ID is missing")?;
+        if let Some(weight) = weights
+            .get(&id.to_string())
+            .and_then(|groups| groups[group_id].as_f64())
+        {
+            native_weights.push(weight);
+        }
+    }
     native_weights.sort_by(f64::total_cmp);
     assert_eq!(native_weights, vec![0.25, 0.5, 0.75]);
 

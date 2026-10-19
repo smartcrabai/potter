@@ -18,7 +18,7 @@ use super::{
 use crate::{
     error::{ErrorCode, PotError, Result},
     geom::color_layers::{ColorDomain, ColorLayer, ColorStore},
-    image::{ImageExtension, ImageInterpolation},
+    image::{ImageExtension, ImageInterpolation, load_image_data},
     model::{
         Id, Image, ImageAlphaMode, ImageColorspace, ImageSource, Material, SceneDoc, TextureRef,
     },
@@ -364,6 +364,26 @@ impl MtlWriter<'_> {
         }
     }
 
+    /// Whether the base colour image carries alpha below 1 in any texel. A source without an alpha
+    /// channel, or with opaque texels, has no texture alpha to lose: Blender reads its Alpha as 1.
+    /// If the image cannot be loaded, its alpha is unknown and is treated as present.
+    fn texture_has_alpha(&self, texture: &SampledTexture) -> bool {
+        let Some(source) = texture.channels[3].as_ref() else {
+            return false;
+        };
+        let Some(image) = self.doc.images.get(&source.image) else {
+            return true;
+        };
+        match load_image_data(image, self.root_path, texture.interpolation) {
+            Ok(data) => data
+                .pixels
+                .iter()
+                .chain(data.tiles.values().flat_map(|tile| tile.pixels.iter()))
+                .any(|pixel| pixel[3] < 1.0),
+            Err(_) => true,
+        }
+    }
+
     /// One `map_*` line. Its options are Blender's `-o`, `-s`, and `-bm`; its file is the texture
     /// packed from `channels` and written as PNG beside the MTL.
     fn map(
@@ -454,7 +474,7 @@ impl MtlWriter<'_> {
                 .base_color
                 .texture
                 .as_ref()
-                .is_some_and(|texture| texture.channels[3].is_some());
+                .is_some_and(|texture| self.texture_has_alpha(texture));
         #[expect(
             clippy::float_cmp,
             reason = "exact unit test: only a factor alpha of exactly 1.0 leaves the texture alpha as the material alpha"
