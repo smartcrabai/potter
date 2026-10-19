@@ -1752,6 +1752,11 @@ pub struct Node {
     /// Blender-authored local basis; omitted for ordinary Potter-authored nodes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blender_matrix_basis: Option<CapturedMatrixBasis>,
+    /// Blender's `matrix_parent_inverse` for a root that came from Blender. Blender ignores it without a
+    /// parent, so evaluation and the captured basis never apply it; it is round-trip data that export
+    /// writes back unchanged. Omitted when identity or when the node is parented.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blender_parent_inverse: Option<[f64; 16]>,
     #[serde(default)]
     pub data: Option<Id>,
     /// Material slots in slot order; OBJECT-linked entries are overrides of the data material.
@@ -1803,6 +1808,7 @@ impl Default for Node {
             parent_inverse: None,
             transform: Transform::default(),
             blender_matrix_basis: None,
+            blender_parent_inverse: None,
             data: None,
             materials: Vec::new(),
             material_links: Vec::new(),
@@ -1993,7 +1999,7 @@ fn update_matrix_basis_transform(hasher: &mut sha2::Sha256, transform: &Transfor
     Ok(())
 }
 
-fn is_identity_matrix(matrix: &[f64; 16]) -> bool {
+pub(crate) fn is_identity_matrix(matrix: &[f64; 16]) -> bool {
     // Column-major: the diagonal is indices 0, 5, 10 and 15.
     matrix
         .iter()

@@ -32,7 +32,7 @@ use crate::{
         NlaStrip, NlaTrack, Node, ParentType, Profile, Registry, RenderSettings, RigidBody,
         RigidBodyShape, RigidBodyType, RigidBodyWorld, Scene, SceneDoc, ShapeKey, ShapeKeyData,
         SurfaceData, SurfacePoint, TextObjectData, TimelineMarker, Transform, UnitSettings,
-        VertexGroup, ViewLayer, World,
+        VertexGroup, ViewLayer, World, is_identity_matrix,
     },
     sequencer::{
         EffectType as SequenceEffectType, RetimingKey, Strip as SequenceStrip, StripBlendType,
@@ -4008,9 +4008,17 @@ fn build_imported_graph(
         let root_override = root_matrix_override(item);
         let has_root_override = root_override.is_some();
         let mut parent_inverse = matrix_column_major(item.get("matrix_parent_inverse"));
+        let mut blender_parent_inverse = None;
         if let Some((stored_transform, stored_parent_inverse)) = root_override {
             transform = stored_transform;
             parent_inverse = Some(stored_parent_inverse);
+        } else if item.get("parent").is_none_or(Value::is_null)
+            && let Some(matrix) = parent_inverse.filter(|matrix| !is_identity_matrix(matrix))
+        {
+            // Blender ignores matrix_parent_inverse without a parent, so the evaluated transform
+            // stays the basis. The inverse is kept as round-trip data for export.
+            blender_parent_inverse = Some(matrix);
+            parent_inverse = None;
         }
         transform.rotation = crate::model::normalize_rotation(transform.rotation)?;
         let mut constraints = parse_constraints(
@@ -4142,6 +4150,7 @@ fn build_imported_graph(
             constraints,
             drivers,
             blender_matrix_basis: None,
+            blender_parent_inverse,
             pose,
         };
         if !has_root_override

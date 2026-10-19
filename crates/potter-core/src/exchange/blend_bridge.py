@@ -7126,6 +7126,13 @@ def export_doc(doc, target, pack, scene_hash, context):
                 rows = [[values[column * 4 + row] for column in range(4)]
                         for row in range(4)]
                 root_parent_inverse = Matrix(rows)
+            elif item.get("blender_parent_inverse"):
+                # Round-trip of a Blender root's inverse: Blender ignores it without a parent, so it is
+                # written as is and the basis stays the evaluated transform.
+                values = item["blender_parent_inverse"]
+                rows = [[values[column * 4 + row] for column in range(4)]
+                        for row in range(4)]
+                obj.matrix_parent_inverse = Matrix(rows)
             basis = item.get("matrix_basis")
             if isinstance(basis, (list, tuple)) and len(basis) == 16:
                 has_captured_basis = True
