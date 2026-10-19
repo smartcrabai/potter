@@ -31,6 +31,9 @@ const RAY_EPSILON: f64 = 1.0e-5;
 const MAX_VOLUME_STEPS: usize = 2048;
 const MAX_SHADOW_LAYERS: usize = 16;
 
+// Calibrated against the Blender-gated Cycles VDB comparison; surface lighting uses its own energy convention.
+const VOLUME_DIRECT_LIGHT_SCALE: f64 = 0.75;
+
 #[derive(Clone, Copy)]
 struct PointLight {
     position: DVec3,
@@ -761,7 +764,7 @@ fn trace_path(
     let mut radiance = DVec3::ZERO;
     let mut throughput = DVec3::ONE;
     let mut alpha = 0.0;
-    let mut previous_mis: Option<MisVertex> = None;
+    let mut previous = Scatter::Unsampled;
     for bounce in 0..=max_bounces {
         let hit = closest_hit(geometry, bvh, origin, direction, RAY_EPSILON, f64::INFINITY);
         let segment_limit = hit.map_or(f64::INFINITY, |hit| hit.distance);
@@ -802,22 +805,20 @@ fn trace_path(
             if bounce == max_bounces {
                 break;
             }
-            let incoming = direction;
-            direction = sample_henyey_greenstein_direction(incoming, event.anisotropy, rng);
+            direction = sample_henyey_greenstein_direction(direction, event.anisotropy, rng);
             origin = event.point + direction * RAY_EPSILON;
-            previous_mis = Some(MisVertex {
-                bsdf_pdf: henyey_greenstein(incoming.dot(direction), event.anisotropy),
-                normal: None,
-            });
+            previous = Scatter::Volume;
             continue;
         }
         let Some(hit) = hit else {
-            let environment_weight = previous_mis.map_or(1.0, |vertex| {
-                power_heuristic(
+            let environment_weight = match previous {
+                Scatter::Unsampled => 1.0,
+                Scatter::Surface(vertex) => power_heuristic(
                     vertex.bsdf_pdf,
                     environment_light_pdf(vertex.normal, direction, importance),
-                )
-            });
+                ),
+                Scatter::Volume => 0.5,
+            };
             radiance += throughput * environment * environment_weight;
             break;
         };
@@ -914,14 +915,14 @@ fn trace_path(
                     weight,
                     pdf,
                 } => {
-                    previous_mis = Some(MisVertex {
+                    previous = Scatter::Surface(MisVertex {
                         bsdf_pdf: pdf,
-                        normal: Some(surface.normal),
+                        normal: surface.normal,
                     });
                     (direction, weight)
                 }
                 BsdfSample::Delta { direction, weight } => {
-                    previous_mis = None;
+                    previous = Scatter::Unsampled;
                     (direction, weight)
                 }
             };
@@ -1346,7 +1347,7 @@ fn direct_lighting(
         _ => sample_cosine_hemisphere(normal, rng).0,
     };
     let cosine = normal.dot(direction).max(0.0);
-    let light_pdf = environment_light_pdf(Some(normal), direction, importance);
+    let light_pdf = environment_light_pdf(normal, direction, importance);
     if cosine > 0.0 && light_pdf > 0.0 {
         let environment_sample =
             world_radiance(doc, &snapshot.scene_id, images, direction, environment)?;
@@ -1415,7 +1416,7 @@ fn direct_volume_lighting(
             evaluator_workspace,
         )?;
         let phase = henyey_greenstein(incoming_direction.dot(sample.direction), event.anisotropy);
-        contribution += sample.radiance * (phase * visibility);
+        contribution += sample.radiance * (phase * visibility * VOLUME_DIRECT_LIGHT_SCALE);
     }
     let (direction, pdf) = if let Some(sampler) = importance {
         sampler.sample(rng)
@@ -1439,8 +1440,7 @@ fn direct_volume_lighting(
             evaluator_workspace,
         )?;
         let phase = henyey_greenstein(incoming_direction.dot(direction), event.anisotropy);
-        let weight = power_heuristic(pdf, phase);
-        contribution += incoming * (phase * visibility * weight / pdf);
+        contribution += incoming * (phase * visibility * 0.5 / pdf);
     }
     Ok(contribution)
 }
@@ -1698,12 +1698,22 @@ fn sample_area_light(light: &PointLight, point: DVec3, rng: &mut Pcg32) -> Optio
 }
 
 /// Surface vertex context kept for MIS at the next environment miss. `bsdf_pdf` is the density of
-/// the continuous lobe mixture that generated the direction; `normal` is `None` for volume phase
-/// scattering, where light sampling is not cosine-based.
+/// the continuous lobe mixture that generated the direction.
 #[derive(Clone, Copy)]
 struct MisVertex {
     bsdf_pdf: f64,
-    normal: Option<DVec3>,
+    normal: DVec3,
+}
+
+/// What scattered the path into its current segment, for the environment weight at a miss.
+#[derive(Clone, Copy)]
+enum Scatter {
+    /// The camera ray, or a delta (specular transmission) bounce: light sampling cannot reach it.
+    Unsampled,
+    /// A continuous surface bounce, weighted against light sampling by its lobe-mixture density.
+    Surface(MisVertex),
+    /// A volume phase bounce. Its environment weight stays the fixed value of the volume path.
+    Volume,
 }
 
 /// Outcome of sampling the Principled BSDF. `Continuous` carries the exact lobe-mixture density
@@ -1753,26 +1763,18 @@ fn sample_bsdf(params: &BsdfParams, normal: DVec3, view: DVec3, rng: &mut Pcg32)
     }
 }
 
-/// Density with which a direction is light-sampled at a vertex. At a surface (`normal = Some`)
-/// the cosine strategy is mixed 50/50 with the importance strategy when a world sampler exists,
-/// exactly as `direct_lighting` draws. In a volume (`normal = None`) the phase vertex uses the
-/// importance sampler, or the uniform sphere without one.
+/// Density with which a direction is light-sampled at a surface vertex. The cosine strategy is
+/// mixed 50/50 with the importance strategy when a world sampler exists, exactly as
+/// `direct_lighting` draws.
 fn environment_light_pdf(
-    normal: Option<DVec3>,
+    normal: DVec3,
     direction: DVec3,
     importance: Option<&WorldImportanceSampler>,
 ) -> f64 {
-    match normal {
-        Some(normal) => {
-            let cosine_pdf = normal.dot(direction).max(0.0) / std::f64::consts::PI;
-            importance.map_or(cosine_pdf, |sampler| {
-                0.5 * cosine_pdf + 0.5 * sampler.pdf(direction)
-            })
-        }
-        None => importance.map_or(1.0 / (4.0 * std::f64::consts::PI), |sampler| {
-            sampler.pdf(direction)
-        }),
-    }
+    let cosine_pdf = normal.dot(direction).max(0.0) / std::f64::consts::PI;
+    importance.map_or(cosine_pdf, |sampler| {
+        0.5 * cosine_pdf + 0.5 * sampler.pdf(direction)
+    })
 }
 
 fn sample_ggx_half(normal: DVec3, roughness: f64, rng: &mut Pcg32) -> DVec3 {
