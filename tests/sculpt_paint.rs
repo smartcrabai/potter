@@ -882,7 +882,7 @@ fn sculpt_shared_data_requires_scope_and_single_user_isolates_stroke() -> Result
 fn sculpt_symmetry_and_repeat_strokes_are_deterministic() -> Result<(), Box<dyn Error>> {
     let base = Mesh::box_mesh(potter_core::geom::BoxParams::default())?;
     let stroke = |symmetry: &[&str]| sculpt::Stroke {
-        brush: sculpt::Brush::Draw,
+        brush: sculpt::Brush::Vertex(sculpt::VertexBrush::Draw),
         samples: vec![sculpt::StrokeSample {
             position: DVec3::new(0.0, -1.0, 1.0),
             pressure: 1.0,

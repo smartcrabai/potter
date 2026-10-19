@@ -29,7 +29,9 @@ use super::{
 
 const RAY_EPSILON: f64 = 1.0e-5;
 const MAX_VOLUME_STEPS: usize = 2048;
-const MAX_SHADOW_LAYERS: usize = 16;
+/// Cycles' `VOLUME_BOUNDS_MAX` (`intern/cycles/kernel/types.h`): volume-only boundary crossings
+/// have their own counter, and the path ends past this many.
+const VOLUME_BOUNDS_MAX: u32 = 1024;
 
 // Calibrated against the Blender-gated Cycles VDB comparison; surface lighting uses its own energy convention.
 const VOLUME_DIRECT_LIGHT_SCALE: f64 = 0.75;
@@ -47,6 +49,24 @@ struct PointLight {
     spot_blend: f64,
     /// The emitting shape of an area light; `None` for every other light type.
     area: Option<AreaShape>,
+    /// Blender's `use_multiple_importance_sampling`: a BSDF-sampled ray may hit this light.
+    use_mis: bool,
+    /// Blender's object ray mask of the light; a ray kind not in it passes the light by.
+    ray_mask: u8,
+}
+
+impl PointLight {
+    /// Whether a BSDF-sampled ray can hit this light (Cycles' `SHADER_USE_MIS`, set by
+    /// `AreaLight::copy_to_kernel` for an emitter with area and by `PointLight::copy_to_kernel` for
+    /// a radius). Zero-radius point and spot lights are delta lights, and the sun is never hit.
+    fn hittable(&self) -> bool {
+        self.use_mis
+            && match self.kind {
+                LightType::Area => self.area.is_some_and(|shape| shape.area > 0.0),
+                LightType::Point | LightType::Spot => self.radius > 0.0,
+                LightType::Sun => false,
+            }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -58,12 +78,12 @@ struct VolumeInstance<'a> {
     voxel_size: f64,
     meters_per_unit: f64,
     density_range: Option<(f64, f64)>,
-    density_scale: f64,
     albedo: DVec3,
     anisotropy: f64,
     emission: DVec3,
     scattering: bool,
-    absorption_tint: Option<DVec3>,
+    /// Channel-mean σt per unit grid density (absolute, as `BsdfParams`'s coefficients).
+    extinction_scale: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -99,6 +119,17 @@ struct LightSample {
     direction: DVec3,
     distance: f64,
     radiance: DVec3,
+    /// Solid-angle density of `direction` under light sampling. Only set for hittable lights.
+    pdf: f64,
+}
+
+/// A BSDF-sampled ray's meeting with an emitter, as Cycles' `lights_intersect` with
+/// `light_eval_from_intersection`. `radiance` is before the MIS weight.
+#[derive(Clone, Copy)]
+struct LightHit {
+    distance: f64,
+    radiance: DVec3,
+    pdf: f64,
 }
 
 #[derive(Clone)]
@@ -318,6 +349,7 @@ pub(super) fn render(
     samples: u32,
     seed: u32,
     max_bounces: u32,
+    transparent_max_bounces: u32,
     film_transparent: bool,
     images: &BTreeMap<String, ImageData>,
 ) -> Result<RasterOutput> {
@@ -330,6 +362,12 @@ pub(super) fn render(
         return Err(PotError::new(
             ErrorCode::SceneInvalid,
             "path tracer bounce count must not exceed 1024",
+        ));
+    }
+    if transparent_max_bounces > 1024 {
+        return Err(PotError::new(
+            ErrorCode::SceneInvalid,
+            "path tracer transparent bounce count must not exceed 1024",
         ));
     }
     let pixel_count = usize::try_from(width)
@@ -432,6 +470,7 @@ pub(super) fn render(
                         left_direction,
                         environment,
                         max_bounces,
+                        transparent_max_bounces,
                         &mut left_rng,
                         &mut evaluator_workspace,
                     )?;
@@ -448,6 +487,7 @@ pub(super) fn render(
                         right_direction,
                         environment,
                         max_bounces,
+                        transparent_max_bounces,
                         &mut right_rng,
                         &mut evaluator_workspace,
                     )?;
@@ -471,6 +511,7 @@ pub(super) fn render(
                         direction,
                         environment,
                         max_bounces,
+                        transparent_max_bounces,
                         &mut rng,
                         &mut evaluator_workspace,
                     )?
@@ -687,14 +728,14 @@ fn realtime_volume_integral(
         let mut source = DVec3::ZERO;
         for instance in volumes {
             let density = volume_density_at(instance, point)?;
-            let density_scaled = density * instance.density_scale.max(0.0);
+            let extinction_coefficient = volume_extinction_density(instance, density);
             let scattering_coefficient = if instance.scattering {
-                density_scaled
+                extinction_coefficient
             } else {
                 0.0
             };
-            extinction += volume_extinction_density(instance, density);
-            source += instance.emission * density_scaled;
+            extinction += extinction_coefficient;
+            source += instance.emission * density;
             if instance.scattering {
                 source += ambient * instance.albedo * scattering_coefficient;
                 for light in lights {
@@ -761,15 +802,25 @@ fn trace_path(
     mut direction: DVec3,
     environment: DVec3,
     max_bounces: u32,
+    transparent_max_bounces: u32,
     rng: &mut Pcg32,
     evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<(DVec3, f64)> {
     let mut radiance = DVec3::ZERO;
     let mut throughput = DVec3::ONE;
-    let mut alpha = 0.0;
-    let mut previous = Scatter::Unsampled;
+    let mut escaped = false;
+    let mut previous = Scatter::Camera;
     let mut ray = RayKind::Camera;
-    for bounce in 0..=max_bounces {
+    let mut bounce = 0u32;
+    let mut transparent_bounce = 0u32;
+    // Cycles' `transparent_max_bounce` is at least one: the first pass-through is always taken
+    // (`intern/cycles/kernel/integrator/path_state.h`, the FIXME at `path_state_next`).
+    let transparent_cap = transparent_max_bounces.max(1);
+    let mut volume_bounds = 0u32;
+    // Set by the pass that reaches the cap: the next surface is shaded for emission and ends the
+    // path (`PATH_RAY_TERMINATE_ON_NEXT_SURFACE`, `integrate_surface_terminate`).
+    let mut terminate_on_next_surface = false;
+    loop {
         let hit = closest_hit(
             geometry,
             bvh,
@@ -779,7 +830,19 @@ fn trace_path(
             f64::INFINITY,
             ray,
         );
-        let segment_limit = hit.map_or(f64::INFINITY, |hit| hit.distance);
+        let surface_distance = hit.map_or(f64::INFINITY, |hit| hit.distance);
+        // Camera rays do not see lights, and a volume scatter is light-sampled only. A surface
+        // vertex's light hit needs its light sample as MIS partner, which a volume scatter on the
+        // way would drop, so a scene with volumes does not count those hits.
+        let receiver = match previous {
+            Scatter::Surface(vertex) if volumes.is_empty() => Some(vertex.point),
+            Scatter::Delta(point) => Some(point),
+            Scatter::Camera | Scatter::Surface(_) | Scatter::Volume => None,
+        };
+        let light = receiver.and_then(|receiver| {
+            nearest_light_hit(lights, origin, direction, receiver, surface_distance, ray)
+        });
+        let segment_limit = light.map_or(surface_distance, |light| light.distance);
         let environment = world_radiance(doc, &snapshot.scene_id, images, direction, environment)?;
         let volume_segment = trace_volume_segment(volumes, origin, direction, segment_limit, rng)?;
         radiance += throughput * volume_segment.emission;
@@ -788,9 +851,6 @@ fn trace_path(
         }
         if throughput.max_element() <= 1.0e-8 {
             break;
-        }
-        if bounce == 0 {
-            alpha = 1.0 - volume_segment.transmittance;
         }
         if let Some(event) = volume_segment.event {
             let scatter_probability = (event.albedo.x + event.albedo.y + event.albedo.z) / 3.0;
@@ -811,6 +871,7 @@ fn trace_path(
                     event,
                     direction,
                     environment,
+                    transparent_max_bounces.saturating_sub(transparent_bounce),
                     rng,
                     evaluator_workspace,
                 )?;
@@ -821,11 +882,27 @@ fn trace_path(
             origin = event.point + direction * RAY_EPSILON;
             previous = Scatter::Volume;
             ray = RayKind::VolumeScatter;
+            bounce += 1;
+            continue;
+        }
+        if let Some(light) = light {
+            let weight = match previous {
+                Scatter::Surface(vertex) => power_heuristic(vertex.bsdf_pdf, light.pdf),
+                Scatter::Camera | Scatter::Delta(_) | Scatter::Volume => 1.0,
+            };
+            radiance += throughput * light.radiance * weight;
+            origin += direction * (light.distance + RAY_EPSILON);
+            // A light is a transparent pass in Cycles (`integrate_light_forward`): it spends the
+            // transparent budget, and the path ends at the cap, after the emission above.
+            transparent_bounce += 1;
+            if transparent_bounce >= transparent_max_bounces {
+                break;
+            }
             continue;
         }
         let Some(hit) = hit else {
             let environment_weight = match previous {
-                Scatter::Unsampled => 1.0,
+                Scatter::Camera | Scatter::Delta(_) => 1.0,
                 Scatter::Surface(vertex) => power_heuristic(
                     vertex.bsdf_pdf,
                     environment_light_pdf(vertex.normal, direction, importance),
@@ -833,6 +910,7 @@ fn trace_path(
                 Scatter::Volume => 0.5,
             };
             radiance += throughput * environment * environment_weight;
+            escaped = true;
             break;
         };
         let surface = make_surface(
@@ -845,7 +923,7 @@ fn trace_path(
             images,
             evaluator_workspace,
         )?;
-        if surface.params.volume_density > 0.0
+        if surface.params.has_medium()
             && let Some(boundary) = closest_hit(
                 geometry,
                 bvh,
@@ -861,30 +939,11 @@ fn trace_path(
                 .get(boundary.triangle_index)
                 .is_some_and(|triangle| triangle.object_index == surface.object_index);
             let distance = boundary.distance.max(0.0);
-            let scalar_transmittance = (-surface.params.volume_density * distance).exp();
-            let transmittance = if surface.params.volume_scattering {
-                DVec3::splat(scalar_transmittance)
-            } else {
-                let absorption = DVec3::from_array(surface.params.volume_color)
-                    .clamp(DVec3::splat(1.0e-8), DVec3::ONE);
-                DVec3::new(
-                    absorption.x.powf(surface.params.volume_density * distance),
-                    absorption.y.powf(surface.params.volume_density * distance),
-                    absorption.z.powf(surface.params.volume_density * distance),
-                )
-            };
-            if surface.params.volume_scattering {
-                let phase = henyey_greenstein(-1.0, surface.params.volume_anisotropy)
-                    * (4.0 * std::f64::consts::PI);
-                radiance += throughput
-                    * environment
-                    * DVec3::from_array(surface.params.volume_color)
-                    * ((1.0 - scalar_transmittance) * phase);
-            }
+            let (transmittance, in_scatter) = homogeneous_medium_segment(&surface.params, distance);
+            let phase = henyey_greenstein(-1.0, surface.params.volume_anisotropy)
+                * (4.0 * std::f64::consts::PI);
+            radiance += throughput * environment * in_scatter * phase;
             throughput *= transmittance;
-            if bounce == 0 {
-                alpha = 1.0 - transmittance.element_sum() / 3.0;
-            }
             if exits_medium {
                 origin = surface.point + direction * (distance + 2.0 * RAY_EPSILON);
             } else {
@@ -893,16 +952,28 @@ fn trace_path(
             if throughput.max_element() <= 1.0e-8 {
                 break;
             }
+            volume_bounds += 1;
+            if volume_bounds > VOLUME_BOUNDS_MAX {
+                break;
+            }
             continue;
         }
+        if terminate_on_next_surface {
+            // Cycles shades the surface for emission, then ends the path (`integrate_surface_terminate`).
+            radiance += throughput
+                * DVec3::from_array(surface.params.emission_color)
+                * surface.params.emission_strength;
+            break;
+        }
         if rng.next_f64() >= surface.params.alpha.clamp(0.0, 1.0) {
+            transparent_bounce += 1;
+            terminate_on_next_surface |= transparent_bounce >= transparent_cap;
             origin = offset_origin(surface.point, direction, surface.geometric_normal);
             continue;
         }
-        alpha = 1.0;
         radiance += throughput
             * DVec3::from_array(surface.params.emission_color)
-            * surface.params.emission_strength.max(0.0);
+            * surface.params.emission_strength;
         radiance += throughput
             * direct_lighting(
                 doc,
@@ -916,6 +987,8 @@ fn trace_path(
                 &surface,
                 direction,
                 environment,
+                bounce < max_bounces,
+                transparent_max_bounces.saturating_sub(transparent_bounce),
                 rng,
                 evaluator_workspace,
             )?;
@@ -933,12 +1006,13 @@ fn trace_path(
                     previous = Scatter::Surface(MisVertex {
                         bsdf_pdf: pdf,
                         normal: surface.normal,
+                        point: surface.point,
                     });
                     ray = lobe;
                     (direction, weight)
                 }
                 BsdfSample::Delta { direction, weight } => {
-                    previous = Scatter::Unsampled;
+                    previous = Scatter::Delta(surface.point);
                     ray = RayKind::Transmission;
                     (direction, weight)
                 }
@@ -956,6 +1030,7 @@ fn trace_path(
         }
         direction = next_direction.normalize_or_zero();
         origin = offset_origin(surface.point, direction, surface.geometric_normal);
+        bounce += 1;
     }
     if !radiance.is_finite() {
         return Err(PotError::new(
@@ -963,6 +1038,14 @@ fn trace_path(
             "path tracer produced a non-finite radiance value",
         ));
     }
+    // Cycles writes film transparency only for a path that escapes to the background, as
+    // `average(throughput)` (`intern/cycles/kernel/integrator/shade_background.h`). Every other
+    // termination leaves the pixel covered.
+    let alpha = if escaped {
+        1.0 - throughput.element_sum() / 3.0
+    } else {
+        1.0
+    };
     Ok((radiance.max(DVec3::ZERO), alpha.clamp(0.0, 1.0)))
 }
 
@@ -1172,7 +1255,7 @@ fn overlay_rasterized_lines(
     Ok(())
 }
 
-/// The nearest hit a ray of kind `ray` can see: objects hidden from that kind are passed through.
+/// The nearest hit a ray of kind `ray` can see; objects hidden from that kind are passed through.
 fn closest_hit(
     geometry: &Geometry,
     bvh: &Bvh,
@@ -1350,6 +1433,10 @@ fn direct_lighting(
     surface: &Surface,
     incoming_direction: DVec3,
     environment: DVec3,
+    // Whether the path samples a BSDF continuation here. Only then does a BSDF ray pair with the
+    // light sample for MIS; at the last vertex the light sample is unweighted.
+    scatters: bool,
+    transparent_budget: u32,
     rng: &mut Pcg32,
     evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<DVec3> {
@@ -1376,15 +1463,26 @@ fn direct_lighting(
             geometric,
             sample.direction,
             sample.distance,
+            transparent_budget,
             rng,
             evaluator_workspace,
         )?;
         if visibility <= 0.0 {
             continue;
         }
+        // A BSDF ray reaches a hittable light only when the path continues past this vertex and
+        // no volume can scatter it first (`trace_path`).
+        let mis = if scatters && volumes.is_empty() && light.hittable() {
+            power_heuristic(
+                sample.pdf,
+                continuous_density(&surface.params, normal, view, sample.direction),
+            )
+        } else {
+            1.0
+        };
         contribution += evaluate_bsdf(&surface.params, normal, view, sample.direction)
             * sample.radiance
-            * (cosine * visibility);
+            * (cosine * visibility * mis);
     }
     let direction = match importance {
         Some(sampler) if rng.next_f64() >= 0.5 => sampler.sample(rng).0,
@@ -1406,11 +1504,16 @@ fn direct_lighting(
             geometric,
             direction,
             f64::INFINITY,
+            transparent_budget,
             rng,
             evaluator_workspace,
         )?;
         let bsdf_pdf = continuous_density(&surface.params, normal, view, direction);
-        let weight = power_heuristic(light_pdf, bsdf_pdf);
+        let weight = if scatters {
+            power_heuristic(light_pdf, bsdf_pdf)
+        } else {
+            1.0
+        };
         contribution += evaluate_bsdf(&surface.params, normal, view, direction)
             * environment_sample
             * (cosine * visibility * weight / light_pdf);
@@ -1434,11 +1537,16 @@ fn direct_volume_lighting(
     event: VolumeEvent,
     incoming_direction: DVec3,
     environment: DVec3,
+    transparent_budget: u32,
     rng: &mut Pcg32,
     evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<DVec3> {
     let mut contribution = DVec3::ZERO;
     for light in lights {
+        // Cycles' volume light sampling skips a light hidden from volume scatter (`SHADER_EXCLUDE_SCATTER`).
+        if light.ray_mask & RayKind::VolumeScatter.bit() == 0 {
+            continue;
+        }
         let Some(sample) = sample_light(light, event.point, rng) else {
             continue;
         };
@@ -1456,6 +1564,7 @@ fn direct_volume_lighting(
             DVec3::ZERO,
             sample.direction,
             sample.distance,
+            transparent_budget,
             rng,
             evaluator_workspace,
         )?;
@@ -1480,6 +1589,7 @@ fn direct_volume_lighting(
             DVec3::ZERO,
             direction,
             f64::INFINITY,
+            transparent_budget,
             rng,
             evaluator_workspace,
         )?;
@@ -1520,28 +1630,27 @@ fn shadow_transmittance(
     normal: DVec3,
     direction: DVec3,
     distance: f64,
+    transparent_budget: u32,
     rng: &mut Pcg32,
     evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<f64> {
     let mut transmittance = 1.0;
+    let mut transparent_hits = 0u32;
     let mut origin = offset_origin(point, direction, normal);
     let mut remaining = if distance.is_finite() {
         (distance - RAY_EPSILON).max(0.0)
     } else {
         f64::INFINITY
     };
-    for _ in 0..MAX_SHADOW_LAYERS {
-        let Some(hit) = closest_hit(
-            geometry,
-            bvh,
-            origin,
-            direction,
-            RAY_EPSILON,
-            remaining,
-            RayKind::Shadow,
-        ) else {
-            break;
-        };
+    while let Some(hit) = closest_hit(
+        geometry,
+        bvh,
+        origin,
+        direction,
+        RAY_EPSILON,
+        remaining,
+        RayKind::Shadow,
+    ) {
         let surface = make_surface(
             doc,
             snapshot,
@@ -1552,6 +1661,15 @@ fn shadow_transmittance(
             images,
             evaluator_workspace,
         )?;
+        // Cycles counts each transparent surface a shadow ray crosses against the path's remaining
+        // budget and blocks the ray past it (`intern/cycles/kernel/bvh/intersect_filter.h`);
+        // volume-bounds surfaces are not counted (`SD_HAS_ONLY_VOLUME`).
+        if !surface.params.has_medium() {
+            transparent_hits += 1;
+            if transparent_hits > transparent_budget {
+                return Ok(0.0);
+            }
+        }
         let alpha = surface.params.alpha.clamp(0.0, 1.0);
         let transmission = surface.params.transmission.clamp(0.0, 1.0);
         if alpha >= 1.0 && transmission <= 0.0 {
@@ -1592,25 +1710,17 @@ fn sample_light(light: &PointLight, point: DVec3, rng: &mut Pcg32) -> Option<Lig
             direction,
             distance: f64::INFINITY,
             radiance: light.color * light.energy,
+            pdf: 0.0,
         });
     }
     if light.kind == LightType::Area {
         return sample_area_light(light, point, rng);
     }
     // Point and spot lights, as `point_light_sample` and `spot_light_sample` in
-    // `intern/cycles/kernel/light/`. Each returned `radiance` is the sample's weight: the emitter
-    // radiance times the sampling Jacobian (solid-angle pdf inverse), so no extra pdf is applied.
-    let attenuation = |to_point: DVec3| -> f64 {
-        if light.kind == LightType::Spot {
-            spot_attenuation(
-                light.direction.dot(to_point),
-                light.spot_size,
-                light.spot_blend,
-            )
-        } else {
-            1.0
-        }
-    };
+    // `intern/cycles/kernel/light/`. Each returned `radiance` is the sample's weight, the emitter
+    // radiance over the sampling density. For a light with a radius, `radiance * pdf` is the emitter
+    // radiance, and `pdf` is that density in solid angle for the MIS weight of a BSDF hit. A
+    // zero-radius point is a delta light, with `pdf` 0.
     let offset_to_centre = light.position - point;
     let distance_squared = offset_to_centre.length_squared();
     if !distance_squared.is_finite() {
@@ -1637,7 +1747,9 @@ fn sample_light(light: &PointLight, point: DVec3, rng: &mut Pcg32) -> Option<Lig
         return Some(LightSample {
             direction,
             distance: distance_to_centre,
-            radiance: light.color * (intensity / distance_squared * attenuation(-direction)),
+            radiance: light.color
+                * (intensity / distance_squared * light_attenuation(light, -direction)),
+            pdf: 0.0,
         });
     }
     let emitter = emitter_radiance(light.energy, radius);
@@ -1664,15 +1776,14 @@ fn sample_light(light: &PointLight, point: DVec3, rng: &mut Pcg32) -> Option<Lig
         return Some(LightSample {
             direction,
             distance,
-            radiance: light.color * (weight * attenuation(-direction)),
+            radiance: light.color * (weight * light_attenuation(light, -direction)),
+            pdf: distance * distance / (std::f64::consts::PI * radius * radius * cos_light),
         });
     }
     // Sphere (`is_sphere = true`).
     if distance_squared > radius * radius {
         // Uniform cone over the visible cap, pdf `1 / (2π (1 − cos θ_max))`.
-        let sin_squared = radius * radius / distance_squared;
-        // Stable `sin_sqr_to_one_minus_cos` form; `1 - sqrt(1 - x)` cancels for tiny x.
-        let one_minus_cos = sin_squared / (1.0 + (1.0 - sin_squared).clamp(0.0, 1.0).sqrt());
+        let one_minus_cos = sphere_one_minus_cos(radius * radius, distance_squared);
         let cosine = 1.0 - one_minus_cos * rng.next_f64();
         let sine = (1.0 - cosine * cosine).max(0.0).sqrt();
         let phi = std::f64::consts::TAU * rng.next_f64();
@@ -1688,12 +1799,13 @@ fn sample_light(light: &PointLight, point: DVec3, rng: &mut Pcg32) -> Option<Lig
         return Some(LightSample {
             direction,
             distance,
-            radiance: light.color * (emitter * solid_angle * attenuation(-direction)),
+            radiance: light.color * (emitter * solid_angle * light_attenuation(light, -direction)),
+            pdf: 1.0 / solid_angle,
         });
     }
     // Receiver inside the sphere: uniform directions (pdf `1 / 4π`), and the spot cone does not
     // attenuate, as in `spot_light_sample`'s inside branch.
-    let (direction, _) = sample_uniform_sphere(rng);
+    let (direction, pdf) = sample_uniform_sphere(rng);
     let cosine = direction.dot(toward_centre);
     let distance = distance_to_centre * cosine
         + (radius * radius - distance_squared + distance_squared * cosine * cosine)
@@ -1703,6 +1815,7 @@ fn sample_light(light: &PointLight, point: DVec3, rng: &mut Pcg32) -> Option<Lig
         direction,
         distance,
         radiance: light.color * (emitter * 4.0 * std::f64::consts::PI),
+        pdf,
     })
 }
 
@@ -1745,25 +1858,180 @@ fn sample_area_light(light: &PointLight, point: DVec3, rng: &mut Pcg32) -> Optio
         direction,
         distance,
         radiance: emitted * (shape.area * cos_light / distance_squared),
+        pdf: distance_squared / (shape.area * cos_light),
     })
 }
 
-/// Surface vertex context kept for MIS at the next environment miss. `bsdf_pdf` is the density of
-/// the continuous lobe mixture that generated the direction.
+/// `1 − cos θ` of the cone that a sphere of squared radius `radius_squared` subtends from a point
+/// at squared distance `distance_squared`, in the stable `sin_sqr_to_one_minus_cos` form.
+fn sphere_one_minus_cos(radius_squared: f64, distance_squared: f64) -> f64 {
+    let sin_squared = radius_squared / distance_squared;
+    // `1 - sqrt(1 - x)` cancels for tiny x.
+    sin_squared / (1.0 + (1.0 - sin_squared).clamp(0.0, 1.0).sqrt())
+}
+
+/// The spot cone's factor for `light` towards `to_point` (the light-to-receiver direction). Every
+/// other light type has no angular falloff.
+fn light_attenuation(light: &PointLight, to_point: DVec3) -> f64 {
+    if light.kind == LightType::Spot {
+        spot_attenuation(
+            light.direction.dot(to_point),
+            light.spot_size,
+            light.spot_blend,
+        )
+    } else {
+        1.0
+    }
+}
+
+/// The nearest crossing of a ray with a hittable light in `(RAY_EPSILON, limit)`. `receiver` is the
+/// vertex that light sampling starts from: it fixes the disk orientation, the sphere's inside and
+/// outside cases, and the sampling density the MIS weight needs. A light the path has just crossed
+/// is never found again: its crossing lies behind the advanced origin, so its distance is negative.
+fn nearest_light_hit(
+    lights: &[PointLight],
+    origin: DVec3,
+    direction: DVec3,
+    receiver: DVec3,
+    limit: f64,
+    ray: RayKind,
+) -> Option<LightHit> {
+    let mut nearest: Option<LightHit> = None;
+    for light in lights
+        .iter()
+        .filter(|light| light.hittable() && light.ray_mask & ray.bit() != 0)
+    {
+        let closest = nearest.map_or(limit, |hit| hit.distance);
+        if let Some((distance, radiance, pdf)) =
+            light_hit(light, origin, direction, receiver, closest)
+        {
+            nearest = Some(LightHit {
+                distance,
+                radiance,
+                pdf,
+            });
+        }
+    }
+    nearest
+}
+
+/// Intersects a ray with a hittable light, as Cycles' `area_light_intersect`, `point_light_intersect`
+/// and `spot_light_intersect`. Returns the distance, the emitter radiance, and the solid-angle
+/// density that `sample_light` gives this direction from `receiver`. Area lights and the disk of a
+/// soft-falloff point or spot light are one-sided (they emit towards the receiver); a sphere emits
+/// from every side.
+fn light_hit(
+    light: &PointLight,
+    origin: DVec3,
+    direction: DVec3,
+    receiver: DVec3,
+    limit: f64,
+) -> Option<(f64, DVec3, f64)> {
+    if let Some(shape) = light.area {
+        let cos_light = -light.direction.dot(direction);
+        if cos_light <= 0.0 {
+            return None;
+        }
+        let distance = (origin - light.position).dot(light.direction) / cos_light;
+        if !(distance > RAY_EPSILON && distance < limit) {
+            return None;
+        }
+        let offset = origin + direction * distance - light.position;
+        let u = offset.dot(shape.axis_u) / shape.half_u;
+        let v = offset.dot(shape.axis_v) / shape.half_v;
+        let inside = if shape.ellipse {
+            u * u + v * v <= 1.0
+        } else {
+            u.abs() <= 1.0 && v.abs() <= 1.0
+        };
+        if !inside {
+            return None;
+        }
+        let radiance = light.color * area_radiance(light.energy, shape.area);
+        // The sampling density is per solid angle from the receiver, not from the advanced origin.
+        let pdf =
+            (origin + direction * distance - receiver).length_squared() / (shape.area * cos_light);
+        return Some((distance, radiance, pdf));
+    }
+    let radius = light.radius;
+    let radius_squared = radius * radius;
+    let offset_to_receiver = receiver - light.position;
+    let distance_squared = offset_to_receiver.length_squared();
+    let emitted = emitter_radiance(light.energy, radius);
+    if light.soft_falloff {
+        // The disk faces the receiver, as `point_light_sample`'s disk branch.
+        let normal = offset_to_receiver.normalize_or_zero();
+        let cos_light = -normal.dot(direction);
+        if cos_light <= 0.0 {
+            return None;
+        }
+        let distance = (origin - light.position).dot(normal) / cos_light;
+        if !(distance > RAY_EPSILON && distance < limit) {
+            return None;
+        }
+        let hit = origin + direction * distance - light.position;
+        if hit.length_squared() > radius_squared {
+            return None;
+        }
+        let radiance = light.color * (emitted * light_attenuation(light, -direction));
+        let pdf = (origin + direction * distance - receiver).length_squared()
+            / (std::f64::consts::PI * radius_squared * cos_light);
+        return Some((distance, radiance, pdf));
+    }
+    // The sphere: its first crossing from outside, or its far crossing from inside.
+    let offset = origin - light.position;
+    let half_b = offset.dot(direction);
+    let discriminant = half_b * half_b - (offset.length_squared() - radius_squared);
+    if discriminant < 0.0 {
+        return None;
+    }
+    let root = discriminant.sqrt();
+    let inside = distance_squared <= radius_squared;
+    let distance = if inside {
+        -half_b + root
+    } else {
+        -half_b - root
+    };
+    if !(distance > RAY_EPSILON && distance < limit) {
+        return None;
+    }
+    if inside {
+        // Uniform directions, and no spot attenuation, as `sample_light`'s inside branch.
+        return Some((
+            distance,
+            light.color * emitted,
+            1.0 / (4.0 * std::f64::consts::PI),
+        ));
+    }
+    let solid_angle =
+        2.0 * std::f64::consts::PI * sphere_one_minus_cos(radius_squared, distance_squared);
+    let radiance = light.color * (emitted * light_attenuation(light, -direction));
+    Some((distance, radiance, 1.0 / solid_angle))
+}
+
+/// Surface vertex context kept for MIS at the next environment miss or light hit. `bsdf_pdf` is the
+/// density of the continuous lobe mixture that generated the direction, and `point` is the vertex
+/// that light sampling would have used.
 #[derive(Clone, Copy)]
 struct MisVertex {
     bsdf_pdf: f64,
     normal: DVec3,
+    point: DVec3,
 }
 
-/// What scattered the path into its current segment, for the environment weight at a miss.
+/// What scattered the path into its current segment, for the environment and light weights.
 #[derive(Clone, Copy)]
 enum Scatter {
-    /// The camera ray, or a delta (specular transmission) bounce: light sampling cannot reach it.
-    Unsampled,
+    /// The camera ray. Lights are not visible to camera rays.
+    Camera,
+    /// A delta (specular transmission) bounce at `point`: light sampling cannot reach it, so a
+    /// light hit is unweighted. The light is evaluated from `point`, as Cycles uses the segment's
+    /// `ray_P`.
+    Delta(DVec3),
     /// A continuous surface bounce, weighted against light sampling by its lobe-mixture density.
     Surface(MisVertex),
-    /// A volume phase bounce. Its environment weight stays the fixed value of the volume path.
+    /// A volume phase bounce. Its environment weight stays the fixed value of the volume path, and
+    /// its lights are light-sampled only.
     Volume,
 }
 
@@ -1773,7 +2041,6 @@ enum BsdfSample {
     Continuous {
         direction: DVec3,
         weight: DVec3,
-        pdf: f64,
         ray: RayKind,
     },
     Delta {
@@ -1907,6 +2174,8 @@ fn collect_lights(doc: &SceneDoc, snapshot: &Snapshot) -> Vec<PointLight> {
                 spot_size: data.spot_size,
                 spot_blend: data.spot_blend,
                 area: (data.light_type == LightType::Area).then(|| area_shape(data, &matrix)),
+                use_mis: data.use_multiple_importance_sampling,
+                ray_mask: node.resolved_ray_visibility().mask(),
             })
         })
         .collect()
@@ -2023,29 +2292,46 @@ fn collect_volumes<'a>(
                 && material.volume_density > 0.0
         });
         let params = evaluated_material;
-        let scattering = params.is_none_or(|params| params.volume_scattering) || simple_volume;
-        let density_scale = params.map_or(1.0, |params| {
-            if has_volume_output || simple_volume {
-                params.volume_density.max(0.0)
-            } else {
-                1.0
+        // Cycles' absolute coefficients (`BsdfParams`): a material volume's σs and σa, or, for a
+        // material without a volume output, unit grey absorption. No material is the Principled
+        // Volume default (colour 0.5, density 1).
+        let (scatter, absorption) = match params {
+            Some(params) if has_volume_output || simple_volume => {
+                (params.volume_scatter, params.volume_absorption)
             }
-        });
-        let albedo = if scattering {
-            params.map_or(DVec3::splat(0.5), |params| {
-                DVec3::from_array(params.volume_color).clamp(DVec3::ZERO, DVec3::ONE)
-            })
-        } else {
-            DVec3::ZERO
+            Some(_) => ([0.0; 3], [1.0; 3]),
+            None => ([0.5; 3], [0.5; 3]),
         };
-        let absorption_tint = (!scattering && has_volume_output).then(|| {
-            DVec3::from_array(params.map_or([1.0; 3], |params| params.volume_color))
-                .clamp(DVec3::splat(1.0e-8), DVec3::ONE)
-        });
+        // Voxel transport is scalar: extinction is the channel mean of σt per unit grid density, and
+        // the albedo is the per-channel σs / σt. That is exact for grey media only.
+        let extinction: [f64; 3] = std::array::from_fn(|index| scatter[index] + absorption[index]);
+        let extinction_scale = extinction.iter().sum::<f64>() / 3.0;
+        let albedo = DVec3::from_array(std::array::from_fn(|index| {
+            if extinction[index] > 0.0 {
+                scatter[index] / extinction[index]
+            } else {
+                0.0
+            }
+        }))
+        .clamp(DVec3::ZERO, DVec3::ONE);
+        let scattering = scatter.iter().any(|weight| *weight > 0.0);
+        if (has_volume_output || simple_volume)
+            && extinction
+                .iter()
+                .any(|weight| (weight - extinction_scale).abs() > 1.0e-12)
+        {
+            warnings.borrow_mut().push(serde_json::json!({
+                "code": "UNSUPPORTED_FEATURE",
+                "feature_id": "shader.volume.spectral_extinction",
+                "node_id": node_id.to_string(),
+                "message": format!(
+                    "Volume '{node_id}' has per-channel extinction; voxel volumes transport the channel-mean extinction, so the colour of its absorption and scattering is approximated"
+                ),
+            }));
+        }
         let emission = if has_volume_output || simple_volume {
             params.map_or(DVec3::ZERO, |params| {
-                DVec3::from_array(params.volume_emission_color)
-                    * params.volume_emission_strength.max(0.0)
+                DVec3::from_array(params.volume_emission)
             })
         } else {
             DVec3::ZERO
@@ -2058,12 +2344,11 @@ fn collect_volumes<'a>(
             voxel_size,
             meters_per_unit,
             density_range,
-            density_scale,
             albedo,
             anisotropy: params.map_or(0.0, |params| params.volume_anisotropy),
             emission,
             scattering,
-            absorption_tint,
+            extinction_scale,
         });
     }
     Ok(volumes)
@@ -2081,11 +2366,25 @@ fn homogeneous_segment_integral(extinction: f64, distance: f64) -> (f64, f64) {
     (transmittance, source_distance)
 }
 
-fn volume_extinction_density(instance: &VolumeInstance<'_>, density: f64) -> f64 {
-    let absorption_scale = instance.absorption_tint.map_or(1.0, |tint| {
-        (-(tint.x.ln() + tint.y.ln() + tint.z.ln()) / 3.0).max(0.0)
+/// Cycles' homogeneous medium over `distance` for a material volume on a mesh: per-channel
+/// transmittance `exp(-σt·d)` and the in-scatter `∫ σs·exp(-σt·s) ds` against constant environment
+/// light, with σt = σs + σa from the absolute coefficients of `BsdfParams`.
+fn homogeneous_medium_segment(params: &BsdfParams, distance: f64) -> (DVec3, DVec3) {
+    let channels: [(f64, f64); 3] = std::array::from_fn(|channel| {
+        let scattering = params.volume_scatter[channel];
+        let extinction = scattering + params.volume_absorption[channel];
+        let (transmittance, source_distance) = homogeneous_segment_integral(extinction, distance);
+        (transmittance, scattering * source_distance)
     });
-    density.max(0.0) * instance.density_scale.max(0.0) * absorption_scale
+    let [red, green, blue] = channels;
+    (
+        DVec3::new(red.0, green.0, blue.0),
+        DVec3::new(red.1, green.1, blue.1),
+    )
+}
+
+fn volume_extinction_density(instance: &VolumeInstance<'_>, density: f64) -> f64 {
+    density.max(0.0) * instance.extinction_scale
 }
 
 fn trace_volume_segment(
@@ -2125,7 +2424,7 @@ fn trace_volume_segment(
             minimum_step = minimum_step.min(instance.voxel_size / local_speed * 0.5);
             stochastic |= instance.scattering
                 && instance.albedo.max_element() > 0.0
-                && instance.density_scale > 0.0;
+                && instance.extinction_scale > 0.0;
         }
     }
     if !entry.is_finite() || exit <= entry {
@@ -2159,7 +2458,7 @@ fn trace_volume_segment(
         for instance in volumes {
             let density = volume_density_at(instance, point)?;
             extinction += volume_extinction_density(instance, density);
-            source += instance.emission * (density * instance.density_scale.max(0.0));
+            source += instance.emission * density;
         }
         if extinction <= 0.0 {
             continue;
@@ -2550,12 +2849,11 @@ mod volume_extinction_tests {
             voxel_size: 1.0,
             meters_per_unit: 0.5,
             density_range: Some((1.0, 1.0)),
-            density_scale: 1.0,
             albedo: DVec3::ZERO,
             anisotropy: 0.0,
             emission: DVec3::ZERO,
             scattering: false,
-            absorption_tint: None,
+            extinction_scale: 1.0,
         };
         let mut rng = Pcg32::for_sample(0, 0, 0, 0);
         let transmittance = march_volumes(
@@ -2649,6 +2947,8 @@ mod volume_extinction_tests {
             energy: power,
             radius: 0.0,
             soft_falloff: false,
+            use_mis: false,
+            ray_mask: crate::model::RayVisibility::default().mask(),
             spot_size: 0.0,
             spot_blend: 0.0,
             area: Some(AreaShape {
@@ -2689,6 +2989,8 @@ mod volume_extinction_tests {
             energy: 4.0 * std::f64::consts::PI,
             radius: 1.0e-6,
             soft_falloff: false,
+            use_mis: false,
+            ray_mask: crate::model::RayVisibility::default().mask(),
             spot_size: std::f64::consts::FRAC_PI_4,
             spot_blend: 0.15,
             area: None,
@@ -2716,6 +3018,8 @@ mod volume_extinction_tests {
             energy: 100.0,
             radius: 1.0,
             soft_falloff: false,
+            use_mis: false,
+            ray_mask: crate::model::RayVisibility::default().mask(),
             spot_size: std::f64::consts::FRAC_PI_4,
             spot_blend: 0.15,
             area: None,
@@ -2807,6 +3111,207 @@ mod sampling_tests {
         assert!(
             delta.cmple(tolerance).all(),
             "sampled mean {mean:?} vs quadrature {reference:?} (tolerance {tolerance:?})"
+        );
+    }
+
+    /// A BSDF ray that reaches a light must see the crossing, emitter radiance, and density that
+    /// light sampling gives that direction. Otherwise the two MIS strategies do not partition the
+    /// same integral, and the weights bias the image.
+    #[test]
+    fn light_hits_agree_with_light_samples_in_distance_radiance_and_density() {
+        let receiver = DVec3::ZERO;
+        let area = |half_u: f64, half_v: f64, ellipse: bool| AreaShape {
+            axis_u: DVec3::X,
+            axis_v: DVec3::Y,
+            half_u,
+            half_v,
+            ellipse,
+            area: if ellipse {
+                std::f64::consts::PI * half_u * half_v
+            } else {
+                4.0 * half_u * half_v
+            },
+        };
+        let light =
+            |kind: LightType, position: DVec3, radius: f64, soft_falloff: bool| PointLight {
+                position,
+                direction: -DVec3::Z,
+                kind,
+                color: DVec3::new(1.0, 0.5, 0.25),
+                energy: 50.0,
+                radius,
+                soft_falloff,
+                spot_size: 1.2,
+                spot_blend: 0.3,
+                area: None,
+                use_mis: true,
+                ray_mask: crate::model::RayVisibility::default().mask(),
+            };
+        let above = DVec3::new(0.2, -0.1, 3.0);
+        let cases = [
+            (
+                "rectangle",
+                PointLight {
+                    area: Some(area(0.6, 0.3, false)),
+                    ..light(LightType::Area, above, 0.0, false)
+                },
+            ),
+            (
+                "ellipse",
+                PointLight {
+                    area: Some(area(0.6, 0.3, true)),
+                    ..light(LightType::Area, above, 0.0, false)
+                },
+            ),
+            ("soft disk", light(LightType::Point, above, 0.5, true)),
+            ("spot disk", light(LightType::Spot, above, 0.5, true)),
+            ("sphere", light(LightType::Point, above, 0.5, false)),
+            ("spot sphere", light(LightType::Spot, above, 0.5, false)),
+            (
+                "receiver inside a sphere",
+                light(LightType::Point, DVec3::new(0.0, 0.0, 0.2), 0.5, false),
+            ),
+        ];
+        let mut rng = Pcg32::for_sample(0x41e, 0, 0, 0);
+        for (label, light) in cases {
+            let mut checked = 0;
+            for _ in 0..200 {
+                let Some(sample) = sample_light(&light, receiver, &mut rng) else {
+                    continue;
+                };
+                let Some((distance, radiance, pdf)) =
+                    light_hit(&light, receiver, sample.direction, receiver, f64::INFINITY)
+                else {
+                    panic!("{label}: a sampled direction must hit its light");
+                };
+                assert!(
+                    (distance - sample.distance).abs() <= 1.0e-7 * sample.distance,
+                    "{label}: hit at {distance}, sampled at {}",
+                    sample.distance
+                );
+                assert!(
+                    (pdf - sample.pdf).abs() <= 1.0e-7 * sample.pdf,
+                    "{label}: hit density {pdf}, sampled density {}",
+                    sample.pdf
+                );
+                let emitted = sample.radiance * sample.pdf;
+                let scale = radiance
+                    .abs()
+                    .max_element()
+                    .max(emitted.abs().max_element());
+                assert!(
+                    (radiance - emitted).abs().max_element() <= 1.0e-7 * scale,
+                    "{label}: hit radiance {radiance:?}, sampled radiance × pdf {emitted:?}"
+                );
+                checked += 1;
+            }
+            assert!(checked >= 100, "{label}: only {checked} samples were lit");
+        }
+    }
+
+    /// A light the path has just crossed is never found again: the origin is advanced past it, so
+    /// each shape's crossing lies behind the origin. Covers the one-sided disk, the one-sided
+    /// rectangle, a sphere seen from outside, and a receiver inside a sphere.
+    #[test]
+    fn a_crossed_light_is_not_hit_again() {
+        let light = |kind: LightType, area: Option<AreaShape>, radius: f64, soft_falloff: bool| {
+            PointLight {
+                position: DVec3::new(0.0, 0.0, 2.0),
+                direction: -DVec3::Z,
+                kind,
+                color: DVec3::ONE,
+                energy: 10.0,
+                radius,
+                soft_falloff,
+                spot_size: 0.0,
+                spot_blend: 0.0,
+                area,
+                use_mis: true,
+                ray_mask: crate::model::RayVisibility::default().mask(),
+            }
+        };
+        let rectangle = AreaShape {
+            axis_u: DVec3::X,
+            axis_v: DVec3::Y,
+            half_u: 0.5,
+            half_v: 0.5,
+            ellipse: false,
+            area: 1.0,
+        };
+        let cases = [
+            (
+                "rectangle",
+                light(LightType::Area, Some(rectangle), 0.0, false),
+                DVec3::ZERO,
+            ),
+            (
+                "soft disk",
+                light(LightType::Point, None, 0.5, true),
+                DVec3::ZERO,
+            ),
+            (
+                "sphere from outside",
+                light(LightType::Point, None, 0.5, false),
+                DVec3::ZERO,
+            ),
+            (
+                "sphere from inside",
+                light(LightType::Point, None, 0.5, false),
+                DVec3::new(0.0, 0.0, 1.8),
+            ),
+        ];
+        for (label, light, receiver) in cases {
+            let direction = DVec3::Z;
+            let first = light_hit(&light, receiver, direction, receiver, f64::INFINITY)
+                .unwrap_or_else(|| panic!("{label}: the first crossing must be hit"));
+            let advanced = receiver + direction * (first.0 + RAY_EPSILON);
+            assert!(
+                light_hit(&light, advanced, direction, receiver, f64::INFINITY).is_none(),
+                "{label}: a crossed light must not be found again"
+            );
+        }
+    }
+
+    /// The sampling density of a light hit is per solid angle from the receiver. An origin past
+    /// the receiver shortens the ray distance, but not the density: the rectangle at height 2 is
+    /// 2 m from the receiver, so its density is `d² / (A cos) = 4` even though the origin is 1 m
+    /// away.
+    #[test]
+    fn light_hit_density_is_measured_from_the_receiver_past_an_advanced_origin() {
+        let light = PointLight {
+            position: DVec3::new(0.0, 0.0, 2.0),
+            direction: -DVec3::Z,
+            kind: LightType::Area,
+            color: DVec3::ONE,
+            energy: 10.0,
+            radius: 0.0,
+            soft_falloff: false,
+            spot_size: 0.0,
+            spot_blend: 0.0,
+            area: Some(AreaShape {
+                axis_u: DVec3::X,
+                axis_v: DVec3::Y,
+                half_u: 0.5,
+                half_v: 0.5,
+                ellipse: false,
+                area: 1.0,
+            }),
+            use_mis: true,
+            ray_mask: crate::model::RayVisibility::default().mask(),
+        };
+        let receiver = DVec3::ZERO;
+        let origin = DVec3::new(0.0, 0.0, 1.0);
+        let Some((distance, _, pdf)) = light_hit(&light, origin, DVec3::Z, receiver, f64::INFINITY)
+        else {
+            panic!("the advanced origin still sees the light");
+        };
+        assert!(
+            (distance - 1.0).abs() < 1.0e-12,
+            "distance {distance} from the origin"
+        );
+        assert!(
+            (pdf - 4.0).abs() < 1.0e-12,
+            "density {pdf} is not measured from the receiver"
         );
     }
 }

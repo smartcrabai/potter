@@ -180,8 +180,8 @@ pub(super) fn extract_geometry(
             continue;
         }
         let ray_visibility = node.resolved_ray_visibility();
-        if !path_traced && matches!(mode, Mode::Beauty) {
-            ray_visibility_warnings(node_id, node, &mut warnings);
+        if matches!(mode, Mode::Beauty) {
+            ray_visibility_warnings(node_id, node, path_traced, &mut warnings);
         }
         let data_block = node
             .data
@@ -556,7 +556,11 @@ pub(super) fn extract_geometry(
                             }
                         }),
                         alpha_threshold: material.map_or(0.5, |material| material.alpha_threshold),
-                        double_sided: material.is_some_and(|value| value.double_sided),
+                        // Only Beauty culls by the material's backface setting (EEVEE). Solid, Wire and the
+                        // id, normal and depth passes draw the Workbench geometry with back faces, as Blender does.
+                        // A face without a material shades with Blender's Default Surface, which is not culled.
+                        double_sided: !matches!(mode, Mode::Beauty)
+                            || material.is_none_or(|value| value.double_sided),
                         material_index,
                         uv,
                         layer_uvs,
@@ -1466,25 +1470,41 @@ fn world_face_normals(
     faces
 }
 
-/// Ray-visibility flags that realtime Beauty does not honour, one warning per flag switched away
-/// from Blender's default for the node kind. Realtime Beauty honours mesh camera and shadow flags
-/// and light diffuse and glossy flags, as EEVEE does.
-fn ray_visibility_warnings(node_id: &Id, node: &Node, warnings: &mut Vec<serde_json::Value>) {
-    const MESH_FLAGS: [(&str, RayKind); 4] = [
+/// Ray-visibility flags that a Beauty engine does not honour, one warning per flag switched away
+/// from Blender's default for the node kind. Neither engine reads a light's `visible_shadow`
+/// (Cycles' `light_object_visibility_flags`, EEVEE's `eevee_light.cc`). Realtime Beauty honours
+/// mesh camera and shadow flags and light diffuse and glossy flags, as EEVEE does. The path tracer
+/// honours every mesh flag and every light flag but camera: it draws no light emitter to the camera.
+fn ray_visibility_warnings(
+    node_id: &Id,
+    node: &Node,
+    path_traced: bool,
+    warnings: &mut Vec<serde_json::Value>,
+) {
+    const REALTIME_MESH: [(&str, RayKind); 4] = [
         ("diffuse", RayKind::Diffuse),
         ("glossy", RayKind::Glossy),
         ("transmission", RayKind::Transmission),
         ("volume_scatter", RayKind::VolumeScatter),
     ];
-    const LIGHT_FLAGS: [(&str, RayKind); 3] = [
+    const REALTIME_LIGHT: [(&str, RayKind); 4] = [
         ("camera", RayKind::Camera),
+        ("shadow", RayKind::Shadow),
         ("transmission", RayKind::Transmission),
         ("volume_scatter", RayKind::VolumeScatter),
     ];
-    let flags: &[(&str, RayKind)] = if node.kind == "light" {
-        &LIGHT_FLAGS
+    const PATH_LIGHT: [(&str, RayKind); 2] =
+        [("camera", RayKind::Camera), ("shadow", RayKind::Shadow)];
+    let flags: &[(&str, RayKind)] = match (path_traced, node.kind == "light") {
+        (true, true) => &PATH_LIGHT,
+        (true, false) => &[],
+        (false, true) => &REALTIME_LIGHT,
+        (false, false) => &REALTIME_MESH,
+    };
+    let engine = if path_traced {
+        "the path tracer"
     } else {
-        &MESH_FLAGS
+        "realtime Beauty"
     };
     let visibility = node.resolved_ray_visibility();
     let default = RayVisibility::default_for_kind(&node.kind);
@@ -1499,7 +1519,7 @@ fn ray_visibility_warnings(node_id: &Id, node: &Node, warnings: &mut Vec<serde_j
             "feature_id": format!("object.ray_visibility.{name}"),
             "node_id": node_id,
             "message": format!(
-                "visible_{name} is {value}, which realtime Beauty does not honour for this {}; it renders as if visible_{name} were {expected}",
+                "visible_{name} is {value}, which {engine} does not honour for this {}; it renders as if visible_{name} were {expected}",
                 node.kind,
             ),
         }));
@@ -1594,7 +1614,7 @@ impl SurfaceShader for SceneShader<'_> {
                 &shadows.point_maps,
             )
         });
-        let mut color = shade(
+        let color = shade(
             self.doc,
             self.snapshot,
             hit.point,
@@ -1606,13 +1626,6 @@ impl SurfaceShader for SceneShader<'_> {
             shadow,
             self.images,
         )?;
-        if matches!(self.mode, Mode::Beauty)
-            && let Some(params) = graph_params
-        {
-            color[0] += params.emission_color[0] * params.emission_strength;
-            color[1] += params.emission_color[1] * params.emission_strength;
-            color[2] += params.emission_color[2] * params.emission_strength;
-        }
         Ok(color)
     }
 }
@@ -2059,8 +2072,7 @@ fn shade(
     }
     // Beauty only: Solid/preview keeps Blender Solid's viewport-colour rule and ignores the closure
     // weight. In Beauty, reflectance weights every reflective closure (ambient, direct,
-    // environment); emission is added unscaled by the caller, as Cycles' `EmissionNode::compile`
-    // (intern/cycles/scene/shader_nodes.cpp:3071-3098) emits only NODE_CLOSURE_EMISSION.
+    // environment).
     let reflectance = if matches!(mode, Mode::Beauty) {
         params.reflectance.clamp(0.0, 1.0)
     } else {
@@ -2068,6 +2080,16 @@ fn shade(
     };
     let result = result * reflectance;
     let result = result.max(DVec3::ZERO).min(DVec3::splat(1.0));
+    // Emission sits outside the reflectance weight and the clamp: Cycles' `EmissionNode` emits
+    // NODE_CLOSURE_EMISSION unscaled (intern/cycles/scene/shader_nodes.cpp:3071-3098), and neither
+    // EEVEE nor Cycles clamps the strength (gpu_shader_material_principled.glsl:179,
+    // intern/cycles/kernel/svm/closure.h:206-207).
+    let emission = if matches!(mode, Mode::Beauty) {
+        DVec3::from_array(params.emission_color) * params.emission_strength
+    } else {
+        DVec3::ZERO
+    };
+    let result = result + emission;
     Ok([result.x, result.y, result.z, alpha])
 }
 
@@ -2759,6 +2781,63 @@ mod shading_normal_tests {
         assert_eq!(color[3], 1.0);
         Ok(())
     }
+
+    #[test]
+    fn beauty_triangles_take_double_sided_from_their_material_or_default_surface()
+    -> crate::error::Result<()> {
+        let initial = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        let applied = crate::ops::apply_batch(
+            &initial,
+            &json!({
+                "schema_version": 1,
+                "base_revision": 0,
+                "operations": [
+                    {"op":"material.create","id":"single","double_sided":false},
+                    {"op":"material.create","id":"double"},
+                    {"op":"node.create","id":"single_body","kind":"plane","params":{"size":1.0},"material":"single"},
+                    {"op":"node.create","id":"double_body","kind":"plane","params":{"size":1.0},"transform":{"translation":[3.0,0.0,0.0]},"material":"double"},
+                    {"op":"node.create","id":"bare_body","kind":"plane","params":{"size":1.0},"transform":{"translation":[6.0,0.0,0.0]}}
+                ]
+            }),
+        )?;
+        let snapshot = Snapshot::evaluate(&applied.doc, &EvaluationContext::default())?;
+        let geometry = extract_geometry(
+            &applied.doc,
+            &snapshot,
+            Mode::Beauty,
+            false,
+            &BTreeMap::new(),
+        )?;
+        // Each node's triangles carry the object index recorded for that node.
+        let expected = [
+            ("single_body", false),
+            ("double_body", true),
+            ("bare_body", true),
+        ];
+        for (node, double_sided) in expected {
+            let node_id = Id::new(node).expect("valid id");
+            let object = geometry
+                .objects
+                .iter()
+                .find(|object| object.node_id == node_id)
+                .expect("node is rendered");
+            let triangles = geometry
+                .triangles
+                .iter()
+                .filter(|triangle| triangle.object_index == object.index)
+                .collect::<Vec<_>>();
+            // Beauty splits triangles that are not lit per pixel, so the count varies by material.
+            assert!(!triangles.is_empty(), "{node} has no triangles");
+            assert!(
+                triangles
+                    .iter()
+                    .all(|triangle| triangle.double_sided == double_sided),
+                "{node} double_sided should be {double_sided}"
+            );
+        }
+        Ok(())
+    }
+
     fn source_triangle(positions: [DVec3; 3], normals: [DVec3; 3]) -> Triangle {
         Triangle {
             positions,
