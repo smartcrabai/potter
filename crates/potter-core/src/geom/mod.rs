@@ -43,6 +43,7 @@ pub(crate) mod pool_slots;
 pub(crate) mod provenance;
 pub mod remesh;
 pub mod sculpt;
+mod sculpt_dabs;
 pub mod text;
 pub(crate) mod triangulate;
 pub(crate) mod uv_layers;

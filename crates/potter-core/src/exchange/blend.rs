@@ -2964,6 +2964,12 @@ fn build_imported_graph(
                 .map_err(|_| invalid_intermediate("render seed is out of range"))?,
             max_bounces: u32::try_from(integer_field(&render, "max_bounces", 4))
                 .map_err(|_| invalid_intermediate("render max_bounces is out of range"))?,
+            transparent_max_bounces: u32::try_from(integer_field(
+                &render,
+                "transparent_max_bounces",
+                8,
+            ))
+            .map_err(|_| invalid_intermediate("render transparent_max_bounces is out of range"))?,
             dicing_rate: number_field(&render, "dicing_rate", 1.0),
             preview_dicing_rate: number_field(&render, "preview_dicing_rate", 8.0),
             max_subdivisions: u32::try_from(integer_field(&render, "max_subdivisions", 12))
@@ -3336,7 +3342,7 @@ fn build_imported_graph(
                 double_sided: item
                     .get("double_sided")
                     .and_then(Value::as_bool)
-                    .unwrap_or(false),
+                    .unwrap_or(true),
                 displacement_method: displacement_method_field(name, item)?,
                 displacement_scale: number_field(item, "displacement_scale", 1.0),
                 displacement_midlevel: number_field(item, "displacement_midlevel", 0.5),

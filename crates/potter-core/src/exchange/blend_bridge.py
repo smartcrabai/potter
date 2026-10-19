@@ -2111,6 +2111,7 @@ def dump_scene(scene):
                 "samples": samples,
                 "seed": seed,
                 "max_bounces": int(getattr(getattr(scene, "cycles", None), "max_bounces", 4)),
+                "transparent_max_bounces": int(getattr(getattr(scene, "cycles", None), "transparent_max_bounces", 8)),
                 "use_sequencer": bool(getattr(scene.render, "use_sequencer", False)),
                 "audio_codec": potter_audio_codec(getattr(getattr(scene.render, "ffmpeg", None),
                                                           "audio_codec", "PCM")),
@@ -6408,6 +6409,8 @@ def export_doc(doc, target, pack, scene_hash, context):
             scene.render.ffmpeg.audio_codec = blender_audio_codec(render.get("audio_codec", "wav"))
         if engine == "CYCLES" and hasattr(scene, "cycles"):
             scene.cycles.max_bounces = int(render.get("max_bounces", 4))
+            if "transparent_max_bounces" in render:
+                scene.cycles.transparent_max_bounces = int(render["transparent_max_bounces"])
         scene.render.engine = engine
         if hasattr(scene, "cycles"):
             scene.cycles.dicing_rate = float(render.get("dicing_rate", 1.0))
@@ -6716,7 +6719,7 @@ def export_doc(doc, target, pack, scene_hash, context):
         mat.use_nodes = True
         set_id(mat.node_tree, item.get("node_tree"))
         _set_principled_values(mat, item)
-        mat.use_backface_culling = not bool(item.get("double_sided", False))
+        mat.use_backface_culling = not bool(item.get("double_sided", True))
         mat.displacement_method = "DISPLACEMENT" if item.get("displacement_method") == "displacement" else "BUMP"
         set_id(mat, material_id)
         source = compatibility_block(doc, "materials", "Material", material_id)
