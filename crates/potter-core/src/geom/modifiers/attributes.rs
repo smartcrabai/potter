@@ -1453,7 +1453,7 @@ fn project_uv_point(
                     - 2.0 * shift_y * view_factor / ycor,
             )
         }
-        crate::model::CameraProjection::Panorama | crate::model::CameraProjection::Fisheye => {
+        crate::model::CameraProjection::Panorama => {
             return Err(PotError::with_details(
                 ErrorCode::UnsupportedFeature,
                 "UV Project does not model panoramic or fisheye camera projections",

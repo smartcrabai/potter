@@ -2844,20 +2844,28 @@ fn adaptive_subdivision(
     let camera = if space == adaptive_dicing::AdaptiveSpace::Pixel {
         adaptive_render
             .camera
-            .map(|camera| adaptive_dicing::AdaptiveCamera {
-                world_to_camera: camera.world_to_camera,
-                projection: camera.data.projection,
-                lens_mm: camera.data.lens_mm,
-                sensor_width_mm: camera.data.sensor_width_mm,
-                sensor_height_mm: camera.data.sensor_height_mm,
-                sensor_fit: camera.data.sensor_fit.clone(),
-                panorama_type: camera.data.panorama_type.clone(),
-                clip_start: camera.data.clip_start,
-                ortho_scale: camera.data.ortho_scale,
-                shift_x: camera.data.shift[0],
-                shift_y: camera.data.shift[1],
-                resolution: adaptive_render.resolution,
+            .map(|camera| -> Result<adaptive_dicing::AdaptiveCamera> {
+                Ok(adaptive_dicing::AdaptiveCamera {
+                    world_to_camera: camera.world_to_camera,
+                    projection: camera.data.projection,
+                    lens_mm: camera.data.lens_mm,
+                    sensor_width_mm: camera.data.sensor_width_mm,
+                    sensor_height_mm: camera.data.sensor_height_mm,
+                    sensor_fit: camera.data.sensor_fit.clone(),
+                    clip_end: camera.data.clip_end,
+                    // Adaptive subdivision only runs for the path tracer (`render_camera_frame`), so it dices the path camera.
+                    render_projection: crate::render::raster::projection_for_camera(
+                        camera.data,
+                        crate::render::raster::CameraEngine::Path,
+                    )?,
+                    clip_start: camera.data.clip_start,
+                    ortho_scale: camera.data.ortho_scale,
+                    shift_x: camera.data.shift[0],
+                    shift_y: camera.data.shift[1],
+                    resolution: adaptive_render.resolution,
+                })
             })
+            .transpose()?
     } else {
         None
     };

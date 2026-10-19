@@ -1776,7 +1776,7 @@ pub fn feature_catalog() -> Value {
         ),
         supported(
             "camera.data",
-            "Perspective, orthographic, panorama, and fisheye camera data",
+            "Perspective, orthographic, and panorama camera data",
             "Camera",
             &["camera.create", "camera.update"],
             [true, true, true, true, true, false, false],
@@ -1790,7 +1790,7 @@ pub fn feature_catalog() -> Value {
         ),
         supported(
             "camera.panorama",
-            "Equirectangular and equidistant fisheye projections",
+            "Equirectangular panoramas with longitude and latitude limits, and fisheye equidistant and equisolid projections",
             "Camera",
             &["camera.create", "camera.update"],
             [true, true, true, true, true, false, false],
