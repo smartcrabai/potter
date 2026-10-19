@@ -9,8 +9,8 @@ use crate::{
     image::{ImageData, ImageInterpolation},
     model::{Id, LightType, SceneDoc},
     shader::{
-        BsdfParams, EvaluatorWorkspace, HitContext, HitUvLayers, evaluate_surface_with_workspace,
-        height_gradient,
+        BsdfParams, EvaluatorWorkspace, HitContext, HitUvLayers, PreparedMaterial,
+        evaluate_surface_with_workspace, height_gradient,
     },
 };
 
@@ -206,6 +206,7 @@ impl WorldImportanceSampler {
                 )
             })?;
         let mut total_weight = 0.0;
+        let environment_pixels = image.straight_pixels();
         for row in 0..height_usize {
             let latitude = std::f64::consts::PI
                 * (f64::from(u32::try_from(row).unwrap_or(u32::MAX)) + 0.5)
@@ -221,7 +222,7 @@ impl WorldImportanceSampler {
                             "environment pixel index overflows",
                         )
                     })?;
-                let pixel = image.pixels.get(pixel_index).ok_or_else(|| {
+                let pixel = environment_pixels.get(pixel_index).ok_or_else(|| {
                     PotError::new(
                         ErrorCode::EvaluationFailed,
                         "environment image pixel data is incomplete",
@@ -1210,6 +1211,15 @@ fn make_surface(
                 "triangle references an unmapped material",
             )
         })?;
+    let prepared = geometry
+        .prepared
+        .get(triangle.material_index)
+        .ok_or_else(|| {
+            PotError::new(
+                ErrorCode::EvaluationFailed,
+                "triangle references an unmapped material",
+            )
+        })?;
     let element = triangle
         .element_index
         .checked_sub(1)
@@ -1241,7 +1251,8 @@ fn make_surface(
         uv_layers,
         &mut tables,
     )?;
-    let mut params = evaluate_surface_with_workspace(material, &context, evaluator_workspace)?;
+    let mut params =
+        evaluate_surface_with_workspace(material, prepared, &context, evaluator_workspace)?;
     params.alpha = match material.alpha_mode.as_str() {
         "opaque" => 1.0,
         "clip" => {
@@ -1255,7 +1266,7 @@ fn make_surface(
     };
     if params.displacement_height != 0.0 && material.displacement_method != "displacement" {
         let gradient = height_gradient(&context, normal, |sample| {
-            evaluate_surface_with_workspace(material, sample, evaluator_workspace)
+            evaluate_surface_with_workspace(material, prepared, sample, evaluator_workspace)
                 .map(|surface| surface.displacement_height)
         })?;
         params.normal = normal - gradient;
@@ -1938,6 +1949,7 @@ fn collect_volumes<'a>(
             context.position = matrix.transform_point3(local_center);
             Some(evaluate_surface_with_workspace(
                 material,
+                &PreparedMaterial::new(material, &doc.node_groups),
                 &context,
                 &mut evaluator_workspace,
             )?)

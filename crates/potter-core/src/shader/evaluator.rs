@@ -1,4 +1,7 @@
-use std::{cell::RefCell, collections::BTreeMap};
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, BTreeSet},
+};
 
 use glam::{DQuat, DVec3, EulerRot};
 use serde_json::{Value as JsonValue, json};
@@ -6,10 +9,7 @@ use serde_json::{Value as JsonValue, json};
 use crate::{
     error::{ErrorCode, PotError, Result},
     graph::{GraphKind, GraphNode, NodeGroup},
-    image::{
-        ImageData, ImageExtension, ImageInterpolation, sample_with_extension,
-        sample_with_interpolation,
-    },
+    image::{ImageData, ImageExtension, ImageInterpolation, sample_with_extension_alpha},
     model::{Id, Material, Registry, TextureRef},
 };
 
@@ -494,24 +494,27 @@ pub fn fill_color_layers<'a, 'n>(
 /// `EVALUATION_FAILED` for a cycle or missing material output, and `UNSUPPORTED_FEATURE` for unsupported
 /// node behavior or unresolved image pixels in the hit context.
 pub fn evaluate_surface(material: &Material, hit_ctx: &HitContext<'_>) -> Result<BsdfParams> {
+    let prepared = PreparedMaterial::new(material, hit_ctx.node_groups);
     let mut workspace = EvaluatorWorkspace::default();
-    evaluate_surface_with_workspace(material, hit_ctx, &mut workspace)
+    evaluate_surface_with_workspace(material, &prepared, hit_ctx, &mut workspace)
 }
 
 /// Evaluates a material surface using caller-owned reusable graph scratch.
 pub fn evaluate_surface_with_workspace(
     material: &Material,
+    prepared: &PreparedMaterial,
     hit_ctx: &HitContext<'_>,
     workspace: &mut EvaluatorWorkspace,
 ) -> Result<BsdfParams> {
     workspace.active.clear();
-    let result = evaluate_surface_inner(material, hit_ctx, workspace);
+    let result = evaluate_surface_inner(material, prepared, hit_ctx, workspace);
     workspace.active.clear();
     result
 }
 
 fn evaluate_surface_inner(
     material: &Material,
+    prepared: &PreparedMaterial,
     hit_ctx: &HitContext<'_>,
     workspace: &mut EvaluatorWorkspace,
 ) -> Result<BsdfParams> {
@@ -573,6 +576,7 @@ fn evaluate_surface_inner(
         material,
         hit_ctx: *hit_ctx,
         workspace,
+        alpha_linked_images: &prepared.alpha_linked_images,
     };
     let Value::Shader(mut params) = evaluator.input(output, "Surface", ValueKind::Shader)? else {
         return Err(eval_error("material surface output is not a shader"));
@@ -605,24 +609,27 @@ fn evaluate_surface_inner(
 
 /// Evaluates the connected `OutputMaterial` displacement input without evaluating surface textures.
 pub fn evaluate_displacement(material: &Material, hit_ctx: &HitContext<'_>) -> Result<f64> {
+    let prepared = PreparedMaterial::new(material, hit_ctx.node_groups);
     let mut workspace = EvaluatorWorkspace::default();
-    evaluate_displacement_with_workspace(material, hit_ctx, &mut workspace)
+    evaluate_displacement_with_workspace(material, &prepared, hit_ctx, &mut workspace)
 }
 
 /// Evaluates material displacement using caller-owned reusable graph scratch.
 pub fn evaluate_displacement_with_workspace(
     material: &Material,
+    prepared: &PreparedMaterial,
     hit_ctx: &HitContext<'_>,
     workspace: &mut EvaluatorWorkspace,
 ) -> Result<f64> {
     workspace.active.clear();
-    let result = evaluate_displacement_inner(material, hit_ctx, workspace);
+    let result = evaluate_displacement_inner(material, prepared, hit_ctx, workspace);
     workspace.active.clear();
     result
 }
 
 fn evaluate_displacement_inner(
     material: &Material,
+    prepared: &PreparedMaterial,
     hit_ctx: &HitContext<'_>,
     workspace: &mut EvaluatorWorkspace,
 ) -> Result<f64> {
@@ -677,6 +684,7 @@ fn evaluate_displacement_inner(
         material,
         hit_ctx: *hit_ctx,
         workspace,
+        alpha_linked_images: &prepared.alpha_linked_images,
     };
     match evaluator.input(output, "Displacement", ValueKind::Vector)? {
         Value::Vector(displacement) => Ok(displacement.dot(hit_ctx.normal)),
@@ -700,8 +708,16 @@ fn apply_material_textures(
     if !has_textures {
         return Ok(());
     }
+    // Blender's exporter links a base texture's Alpha only for a non-opaque material, and wires roughness, metallic,
+    // and normal from the texture's Color with Alpha unlinked. Cycles' colour read depends on that link.
     if let Some(texture) = &material.base_color_texture {
-        let pixel = sample_material_texture(texture, hit_ctx, texture_layer(hit_ctx, texture))?;
+        let alpha_linked = material.alpha_mode != "opaque";
+        let pixel = sample_material_texture(
+            texture,
+            hit_ctx,
+            texture_layer(hit_ctx, texture),
+            alpha_linked,
+        )?;
         for (channel, texel) in params.base_color[..3].iter_mut().zip(pixel) {
             *channel *= texel;
         }
@@ -709,15 +725,15 @@ fn apply_material_textures(
     }
     if let Some(texture) = &material.roughness_texture {
         let layer = texture_layer(hit_ctx, texture);
-        params.roughness *= sample_material_texture(texture, hit_ctx, layer)?[0];
+        params.roughness *= sample_material_texture(texture, hit_ctx, layer, false)?[0];
     }
     if let Some(texture) = &material.metallic_texture {
         let layer = texture_layer(hit_ctx, texture);
-        params.metallic *= sample_material_texture(texture, hit_ctx, layer)?[0];
+        params.metallic *= sample_material_texture(texture, hit_ctx, layer, false)?[0];
     }
     if let Some(texture) = &material.normal_texture {
         let layer = texture_layer(hit_ctx, texture);
-        let pixel = sample_material_texture(texture, hit_ctx, layer)?;
+        let pixel = sample_material_texture(texture, hit_ctx, layer, false)?;
         let tangent_normal = normalize_or(
             DVec3::new(
                 pixel[0] * 2.0 - 1.0,
@@ -740,10 +756,42 @@ fn apply_material_textures(
     Ok(())
 }
 
+/// Samples an image as Blender's Image Texture node does. `blender_uv` is the V-up coordinate of Blender's
+/// `Vector`: a UDIM tile is routed from it, and the pixel lookup flips it into Potter's V-down storage. Native
+/// material fields and Image Texture nodes both sample through here, so they agree at every edge. `alpha_linked` is
+/// whether the node's Alpha output is linked, which decides whether Cycles unassociates the colour.
+fn sample_image_texel(
+    image: &ImageData,
+    blender_uv: [f64; 2],
+    tile: u32,
+    interpolation: ImageInterpolation,
+    extension: ImageExtension,
+    alpha_linked: bool,
+) -> [f64; 4] {
+    let pixel_uv = if tile == 0 {
+        [blender_uv[0], 1.0 - blender_uv[1]]
+    } else {
+        [
+            blender_uv[0].rem_euclid(1.0),
+            1.0 - blender_uv[1].rem_euclid(1.0),
+        ]
+    };
+    sample_with_extension_alpha(
+        image,
+        blender_uv,
+        pixel_uv,
+        tile,
+        interpolation,
+        extension,
+        alpha_linked,
+    )
+}
+
 fn sample_material_texture(
     texture: &TextureRef,
     hit_ctx: &HitContext<'_>,
     layer: Option<usize>,
+    alpha_linked: bool,
 ) -> Result<[f64; 4]> {
     let image_id = texture.image.as_str();
     let images = hit_ctx.image_data.ok_or_else(|| {
@@ -760,9 +808,17 @@ fn sample_material_texture(
             json!({"image_id":image_id}),
         )
     })?;
-    let uv = layer_uv(hit_ctx, layer);
+    // The field samples through the same path as an Image Texture node with the field's extension.
+    let blender_uv = storage_to_blender_uv(layer_uv(hit_ctx, layer));
     let tile = if image.tiles.is_empty() { 0 } else { 1001 };
-    let pixel = sample_with_interpolation(image, uv, tile, texture.interpolation);
+    let pixel = sample_image_texel(
+        image,
+        blender_uv,
+        tile,
+        texture.interpolation,
+        texture.extension,
+        alpha_linked,
+    );
     if pixel.iter().any(|component| !component.is_finite()) {
         return Err(eval_error(format!(
             "Material texture `{image_id}` sampled non-finite pixels"
@@ -817,6 +873,8 @@ enum NodeKind {
     VectorMath,
     Mapping,
     SeparateColor,
+    SeparateXyz,
+    CombineXyz,
     TexCoord,
     UvMap,
     NormalMap,
@@ -839,14 +897,70 @@ pub struct EvaluatorWorkspace {
     active: Vec<ActiveSocket>,
 }
 
-struct Evaluator<'graph, 'material, 'registry, 'workspace> {
+/// The per-material state a shader evaluation reads. A render builds it once for each material and passes it to every
+/// evaluation of that material, so no hit walks the graph again.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PreparedMaterial {
+    /// The Image Texture nodes whose Alpha output reaches the graph's output (see [`linked_alpha_image_nodes`]).
+    alpha_linked_images: BTreeSet<Id>,
+}
+
+impl PreparedMaterial {
+    /// Prepares `material` against the node groups its graph is looked up in. A material without a shader graph prepares
+    /// to nothing, since its surface is its PBR fields.
+    #[must_use]
+    pub fn new(material: &Material, node_groups: &Registry<NodeGroup>) -> Self {
+        let Some(group) = material
+            .node_tree
+            .as_ref()
+            .and_then(|graph_id| node_groups.get(graph_id))
+        else {
+            return Self::default();
+        };
+        let Some(output) = Self::active_output(group) else {
+            return Self::default();
+        };
+        Self {
+            alpha_linked_images: linked_alpha_image_nodes(group, output)
+                .into_iter()
+                .cloned()
+                .collect(),
+        }
+    }
+
+    /// The output node a surface evaluates from: the active one, else the first `OutputMaterial`.
+    fn active_output(group: &NodeGroup) -> Option<&Id> {
+        let mut fallback = None;
+        for (id, node) in &group.nodes {
+            if matches!(
+                node.node_type.as_str(),
+                "OutputMaterial" | "ShaderNodeOutputMaterial"
+            ) {
+                if node
+                    .properties
+                    .get("is_active_output")
+                    .and_then(JsonValue::as_bool)
+                    == Some(true)
+                {
+                    return Some(id);
+                }
+                fallback.get_or_insert(id);
+            }
+        }
+        fallback
+    }
+}
+
+struct Evaluator<'graph, 'material, 'registry, 'workspace, 'prepared> {
     group: &'graph NodeGroup,
     material: &'material Material,
     hit_ctx: HitContext<'registry>,
     workspace: &'workspace mut EvaluatorWorkspace,
+    /// The Alpha-linked Image Texture nodes of the material, from [`PreparedMaterial`].
+    alpha_linked_images: &'prepared BTreeSet<Id>,
 }
 
-impl<'registry> Evaluator<'_, '_, 'registry, '_> {
+impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
     fn input(&mut self, node_id: &Id, socket: &str, kind: ValueKind) -> Result<Value> {
         let node = self.node(node_id)?;
         let incoming =
@@ -937,6 +1051,8 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_> {
             "ShaderNodeVectorMath" => Ok(NodeKind::VectorMath),
             "ShaderNodeMapping" => Ok(NodeKind::Mapping),
             "ShaderNodeSeparateColor" => Ok(NodeKind::SeparateColor),
+            "ShaderNodeSeparateXYZ" => Ok(NodeKind::SeparateXyz),
+            "ShaderNodeCombineXYZ" => Ok(NodeKind::CombineXyz),
             "ShaderNodeTexCoord" => Ok(NodeKind::TexCoord),
             "ShaderNodeUVMap" => Ok(NodeKind::UvMap),
             "ShaderNodeNormalMap" => Ok(NodeKind::NormalMap),
@@ -960,6 +1076,11 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_> {
             .nodes
             .get(node_id)
             .ok_or_else(|| invalid(format!("shader graph references absent node `{node_id}`")))
+    }
+
+    /// Whether the Alpha output of the Image Texture `id` reaches the group's output (see [`PreparedMaterial`]).
+    fn alpha_linked_image(&self, id: &Id) -> bool {
+        self.alpha_linked_images.contains(id)
     }
 
     fn evaluate_node(&mut self, node_id: &Id, kind: NodeKind, socket: &str) -> Result<Value> {
@@ -990,6 +1111,8 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_> {
             NodeKind::VectorMath => self.vector_math(node_id, socket),
             NodeKind::Mapping => self.mapping(node_id, socket),
             NodeKind::SeparateColor => self.separate_color(node_id, socket),
+            NodeKind::SeparateXyz => self.separate_xyz(node_id, socket),
+            NodeKind::CombineXyz => self.combine_xyz(node_id, socket),
             NodeKind::TexCoord => self.tex_coord(socket),
             NodeKind::UvMap => self.uv_map(node_id, socket),
             NodeKind::NormalMap => self.normal_map(node_id, socket),
@@ -1245,14 +1368,17 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_> {
                 ));
             }
         };
-        let routing_uv = [uv.x, uv.y];
-        let pixel_uv = if tile == 0 {
-            [uv.x, 1.0 - uv.y]
-        } else {
-            [uv.x.rem_euclid(1.0), 1.0 - uv.y.rem_euclid(1.0)]
-        };
-        let pixel =
-            sample_with_extension(image, routing_uv, pixel_uv, tile, interpolation, extension);
+        // Cycles unassociates an Image Texture's colour only when its Alpha output still has a link after
+        // dead nodes are removed, so the colour read depends on that link (see `linked_alpha_image_nodes`).
+        let alpha_linked = self.alpha_linked_image(id);
+        let pixel = sample_image_texel(
+            image,
+            [uv.x, uv.y],
+            tile,
+            interpolation,
+            extension,
+            alpha_linked,
+        );
         if pixel.iter().any(|component| !component.is_finite()) {
             return Err(eval_error(format!(
                 "Image Texture node `{id}` sampled non-finite pixels"
@@ -1558,6 +1684,28 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_> {
             _ => Err(invalid(format!("unknown {label} output `{socket}`"))),
         }
     }
+    /// `ShaderNodeSeparateXYZ`: one component of its vector input as a scalar.
+    fn separate_xyz(&mut self, id: &Id, socket: &str) -> Result<Value> {
+        let vector = self.vector_input(id, &["Vector"], DVec3::ZERO)?;
+        let component = match socket {
+            "X" => vector.x,
+            "Y" => vector.y,
+            "Z" => vector.z,
+            _ => return Err(invalid(format!("unknown Separate XYZ output `{socket}`"))),
+        };
+        Ok(Value::Scalar(component))
+    }
+
+    /// `ShaderNodeCombineXYZ`: a vector from its three scalar inputs.
+    fn combine_xyz(&mut self, id: &Id, socket: &str) -> Result<Value> {
+        if socket != "Vector" {
+            return Err(invalid(format!("unknown Combine XYZ output `{socket}`")));
+        }
+        let x = self.scalar_input(id, &["X"], 0.0)?;
+        let y = self.scalar_input(id, &["Y"], 0.0)?;
+        let z = self.scalar_input(id, &["Z"], 0.0)?;
+        Ok(Value::Vector(DVec3::new(x, y, z)))
+    }
 
     fn math(&mut self, id: &Id, socket: &str) -> Result<Value> {
         let first = self.scalar_input(id, &["Value", "Value_001"], 0.0)?;
@@ -1596,10 +1744,26 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_> {
                 let epsilon = self.scalar_input(id, &["Value_002", "Value_003"], 0.001)?;
                 f64::from((first - second).abs() <= epsilon.max(0.0))
             }
+            "WRAP" => {
+                // Blender's `wrapf(value, max, min)`: the second input is the maximum and the third the minimum.
+                let range = second - third;
+                if crate::float::equal_f64(range, 0.0) {
+                    third
+                } else {
+                    first - range * ((first - third) / range).floor()
+                }
+            }
             "PINGPONG" => {
-                let scale = second.abs().max(f64::MIN_POSITIVE);
-                let value = first.rem_euclid(2.0 * scale);
-                scale - (value - scale).abs()
+                // Blender's `pingpongf(value, scale)` (`math_base_inline.cc`): a zero scale gives 0, and otherwise the
+                // triangle wave of the signed scale, `|fract((value - scale) / (2 scale)) * 2 scale - scale|`.
+                let wave = if crate::float::equal_f64(second, 0.0) {
+                    0.0
+                } else {
+                    let period = second * 2.0;
+                    let ratio = (first - second) / period;
+                    (ratio - ratio.floor()) * period - second
+                };
+                wave.abs()
             }
             other => return Err(unsupported_node(id, &format!("Math:{other}"))),
         };
@@ -1943,6 +2107,44 @@ fn socket_matches(candidate: &str, requested: &str) -> bool {
             | ("Emission", "Emission Color")
             | ("Emission Color", "Emission")
     )
+}
+
+/// The Image Texture nodes whose Alpha output reaches the group's output. Cycles decides this in two steps.
+/// `ShaderGraph::clean` (`intern/cycles/scene/shader_graph.cpp`, ~lines 801-860) runs `break_cycles(output())`,
+/// which visits every node reachable backwards from the output through all of its inputs, then deletes the input
+/// links of unvisited nodes and the unvisited nodes. An Image Texture unassociates its colour only when its Alpha
+/// output still has a link after that pass (`intern/cycles/scene/shader_nodes.cpp`, ~line 449). So a link from Alpha
+/// into a dead node does not count. This function applies the same visit: reachability starts at `output` and
+/// follows every incoming link, and the result keeps Alpha links whose target was visited.
+fn linked_alpha_image_nodes<'graph>(
+    group: &'graph NodeGroup,
+    output: &'graph Id,
+) -> BTreeSet<&'graph Id> {
+    let mut reachable: BTreeSet<&'graph Id> = BTreeSet::new();
+    let mut pending = vec![output];
+    while let Some(node) = pending.pop() {
+        if reachable.insert(node) {
+            pending.extend(
+                group
+                    .links
+                    .iter()
+                    .filter(|link| link.to_node == *node)
+                    .map(|link| &link.from_node),
+            );
+        }
+    }
+    group
+        .links
+        .iter()
+        .filter(|link| link.from_socket == "Alpha" && reachable.contains(&link.to_node))
+        .map(|link| &link.from_node)
+        .filter(|from| {
+            group
+                .nodes
+                .get(*from)
+                .is_some_and(|node| node.node_type == "ShaderNodeTexImage")
+        })
+        .collect()
 }
 
 fn number(value: &JsonValue, default: f64) -> f64 {
@@ -2343,8 +2545,8 @@ mod tests {
 
     use crate::{
         graph::{GraphKind, GraphLink, GraphNode, NodeGroup},
-        image::{ImageData, ImageInterpolation},
-        model::{Id, Material, Registry},
+        image::{ImageData, ImageExtension, ImageInterpolation},
+        model::{Id, Material, Registry, TextureRef},
     };
 
     use super::{
@@ -2431,15 +2633,81 @@ mod tests {
         let images = BTreeMap::from([(
             "image".to_owned(),
             ImageData {
+                colour: crate::image::ColourCache::default(),
+                storage: crate::image::ImageStorage::default(),
                 width: 8,
                 height: 8,
                 pixels,
                 tiles: BTreeMap::new(),
                 interpolation: ImageInterpolation::Closest,
+                srgb: false,
             },
         )]);
         context = context.with_images(&images);
         evaluate_surface(&material, &context).unwrap().base_color
+    }
+
+    /// Red at storage U `u` of a plain field (no graph) whose texture uses `extension`. Pixels are 8 columns of
+    /// increasing red, so column 7 is the edge texel with red 1.0.
+    fn field_red_at(extension: ImageExtension, u: f64) -> f64 {
+        let material = Material {
+            base_color: [1.0; 4],
+            base_color_texture: Some(TextureRef {
+                image: Id::new("image".to_owned()).unwrap(),
+                uv_layer: None,
+                interpolation: ImageInterpolation::Closest,
+                extension,
+            }),
+            ..Material::default()
+        };
+        let names = vec!["UVMap".to_owned()];
+        let corners = vec![[[u, 0.5]; 3]];
+        let groups = Registry::new();
+        let context = HitContext::new(&groups).with_uv_layers(HitUvLayers {
+            names: &names,
+            corners: &corners,
+            positions: [DVec3::ZERO, DVec3::X, DVec3::Y],
+            barycentric: [1.0 / 3.0; 3],
+            render: Some(0),
+            available_mask: None,
+        });
+        let mut pixels = Vec::with_capacity(64);
+        for _ in 0..8 {
+            for x in 0..8 {
+                pixels.push([f64::from(x) / 7.0, 0.0, 0.0, 1.0]);
+            }
+        }
+        let images = BTreeMap::from([(
+            "image".to_owned(),
+            ImageData {
+                colour: crate::image::ColourCache::default(),
+                storage: crate::image::ImageStorage::default(),
+                width: 8,
+                height: 8,
+                pixels,
+                tiles: BTreeMap::new(),
+                interpolation: ImageInterpolation::Closest,
+                srgb: false,
+            },
+        )]);
+        let context = context.with_images(&images);
+        evaluate_surface(&material, &context).unwrap().base_color[0]
+    }
+
+    #[test]
+    fn material_field_extension_sets_the_sample_past_its_edge() {
+        // Blender's Image Texture: extend holds the edge texel past the UV edge, repeat wraps around.
+        let edge = field_red_at(ImageExtension::Extend, 0.99);
+        assert!((edge - 1.0).abs() < 1e-12, "the edge texel is column 7");
+        assert!(
+            (field_red_at(ImageExtension::Extend, 1.25) - edge).abs() < 1e-12,
+            "extend past the edge equals the edge texel"
+        );
+        let wrapped = field_red_at(ImageExtension::Repeat, 1.25);
+        assert!(
+            (wrapped - 2.0 / 7.0).abs() < 1e-12,
+            "repeat wraps 1.25 to column 2, got {wrapped}"
+        );
     }
 
     fn insert_node(group: &mut NodeGroup, id: &str, node_type: &str, inputs: Value) {
@@ -2910,6 +3178,65 @@ mod tests {
                     "extension {extension:?}: expected {expected:?}, got {actual:?}"
                 );
             }
+        }
+    }
+
+    /// The Roughness a Math node drives on a material, for `Value`, `Value_001` and `Value_002`.
+    fn math_roughness(operation: &str, value: f64, second: f64, third: f64) -> f64 {
+        let mut graph = NodeGroup::new("Math", GraphKind::Shader);
+        insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
+        insert_node(
+            &mut graph,
+            "principled",
+            "ShaderNodeBsdfPrincipled",
+            json!({}),
+        );
+        insert_node(
+            &mut graph,
+            "math",
+            "ShaderNodeMath",
+            json!({"Value": value, "Value_001": second, "Value_002": third}),
+        );
+        set_properties(&mut graph, "math", json!({"operation": operation}));
+        link(&mut graph, "math", "Value", "principled", "Roughness");
+        link(&mut graph, "principled", "BSDF", "output", "Surface");
+        let graph_id = Id::new("math_shader".to_owned()).unwrap();
+        let mut groups = Registry::new();
+        groups.insert(graph_id.clone(), graph);
+        let material = Material {
+            node_tree: Some(graph_id),
+            ..Material::default()
+        };
+        evaluate_surface(&material, &HitContext::new(&groups))
+            .unwrap()
+            .roughness
+    }
+
+    #[test]
+    fn math_wrap_and_pingpong_match_blenders_wrapf_and_pingpongf() {
+        // Blender's `wrapf(value, max, min)` takes the second input as the maximum and the third as the minimum, and
+        // `pingpongf(value, scale)` is the triangle wave of the signed scale (`math_base_inline.cc`).
+        let cases = [
+            // The importer's REPEAT wrap (max 0, min 1) maps the negative and the overflowing input into [0, 1].
+            ("WRAP", -0.3, 0.0, 1.0, 0.7),
+            ("WRAP", 1.3, 0.0, 1.0, 0.3),
+            ("WRAP", -0.3, 1.0, 0.0, 0.7),
+            ("WRAP", 0.4, 1.0, 0.0, 0.4),
+            // A zero range returns the minimum.
+            ("WRAP", 0.4, 0.0, 0.0, 0.0),
+            ("PINGPONG", -0.4, 1.0, 0.0, 0.4),
+            ("PINGPONG", 2.5, 1.0, 0.0, 0.5),
+            // The signed scale: a negative scale gives the same wave.
+            ("PINGPONG", -0.4, -1.0, 0.0, 0.4),
+            // A zero scale returns zero.
+            ("PINGPONG", 0.5, 0.0, 0.0, 0.0),
+        ];
+        for (operation, value, second, third, expected) in cases {
+            let actual = math_roughness(operation, value, second, third);
+            assert!(
+                (actual - expected).abs() < 1.0e-12,
+                "{operation}({value}, {second}, {third}): expected {expected}, got {actual}"
+            );
         }
     }
 

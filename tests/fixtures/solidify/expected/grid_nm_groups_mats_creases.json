@@ -1,0 +1,879 @@
+{
+ "case": "grid_nm_groups_mats_creases",
+ "blender_version": "5.2.2",
+ "input_normal_codec_max_error": null,
+ "outcome": "ok",
+ "output": {
+  "vertices": [
+   [
+    -1.0312763834008365e-06,
+    -4.287182377993304e-07,
+    6.9103298301342875e-06
+   ],
+   [
+    0.020625527948141098,
+    0.008574365638196468,
+    -0.1382066160440445
+   ],
+   [
+    1.0,
+    0.07000000029802322,
+    0.2408895492553711
+   ],
+   [
+    1.0,
+    0.07000000029802322,
+    0.2408895492553711
+   ],
+   [
+    1.984663963317871,
+    0.2728842496871948,
+    0.050655730068683624
+   ],
+   [
+    2.0000007152557373,
+    0.28000035881996155,
+    0.12887924909591675
+   ],
+   [
+    2.966186761856079,
+    0.6133612394332886,
+    -0.32744014263153076
+   ],
+   [
+    3.0000016689300537,
+    0.6300008296966553,
+    -0.17193375527858734
+   ],
+   [
+    0.11999993771314621,
+    0.8999999761581421,
+    0.16105541586875916
+   ],
+   [
+    0.12112026661634445,
+    0.9004896283149719,
+    0.1409924477338791
+   ],
+   [
+    1.119999885559082,
+    0.9700000286102295,
+    0.22732940316200256
+   ],
+   [
+    1.121253252029419,
+    0.9703335165977478,
+    0.12623445689678192
+   ],
+   [
+    2.1200013160705566,
+    1.1800005435943604,
+    -0.03942753002047539
+   ],
+   [
+    2.093233346939087,
+    1.1673778295516968,
+    -0.21728426218032837
+   ],
+   [
+    3.1138205528259277,
+    1.5269445180892944,
+    -0.2879100441932678
+   ],
+   [
+    3.120000123977661,
+    1.53000009059906,
+    -0.24842078983783722
+   ],
+   [
+    0.24000020325183868,
+    1.8000000715255737,
+    0.2463684231042862
+   ],
+   [
+    0.23573258519172668,
+    1.7982258796691895,
+    0.12645146250724792
+   ],
+   [
+    1.2400014400482178,
+    1.8700006008148193,
+    0.10685491561889648
+   ],
+   [
+    1.2105909585952759,
+    1.8587520122528076,
+    -0.09209048002958298
+   ],
+   [
+    2.2400004863739014,
+    2.080000162124634,
+    -0.18919767439365387
+   ],
+   [
+    2.229724407196045,
+    2.0749170780181885,
+    -0.24830983579158783
+   ],
+   [
+    3.226472854614258,
+    2.4233436584472656,
+    -0.3472527265548706
+   ],
+   [
+    3.2400007247924805,
+    2.4300003051757812,
+    -0.2080599069595337
+   ]
+  ],
+  "edges": [
+   {
+    "v": [
+     0,
+     8
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     1,
+     9
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     1,
+     2
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.25,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     0,
+     3
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.25,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     3,
+     10
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     2,
+     11
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     9,
+     11
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.5,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     8,
+     10
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.5,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     2,
+     4
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     3,
+     5
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     5,
+     12
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     4,
+     13
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     11,
+     13
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.75,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     10,
+     12
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.75,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     4,
+     6
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     5,
+     7
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     6,
+     14
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     7,
+     15
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     13,
+     14
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     12,
+     15
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     8,
+     16
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     9,
+     17
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     10,
+     18
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     11,
+     19
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     16,
+     18
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     17,
+     19
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     12,
+     20
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     13,
+     21
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     18,
+     20
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     19,
+     21
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     14,
+     22
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     15,
+     23
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     20,
+     23
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     21,
+     22
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     0,
+     1
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     2,
+     3
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     4,
+     5
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     6,
+     7
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     8,
+     9
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.5,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     14,
+     15
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     16,
+     17
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     18,
+     19
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     20,
+     21
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     22,
+     23
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   }
+  ],
+  "faces": [
+   {
+    "v": [
+     0,
+     8,
+     9,
+     1
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     1,
+     2,
+     3,
+     0
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     2,
+     4,
+     5,
+     3
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     4,
+     6,
+     7,
+     5
+    ],
+    "material_index": 1,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     6,
+     14,
+     15,
+     7
+    ],
+    "material_index": 1,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     8,
+     16,
+     17,
+     9
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     16,
+     18,
+     19,
+     17
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     18,
+     20,
+     21,
+     19
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     14,
+     22,
+     23,
+     15
+    ],
+    "material_index": 1,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     20,
+     23,
+     22,
+     21
+    ],
+    "material_index": 1,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     8,
+     0,
+     3,
+     10
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     9,
+     11,
+     2,
+     1
+    ],
+    "material_index": 1,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     10,
+     3,
+     5,
+     12
+    ],
+    "material_index": 1,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     11,
+     13,
+     4,
+     2
+    ],
+    "material_index": 1,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     12,
+     5,
+     7,
+     15
+    ],
+    "material_index": 1,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     13,
+     14,
+     6,
+     4
+    ],
+    "material_index": 1,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     16,
+     8,
+     10,
+     18
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     17,
+     19,
+     11,
+     9
+    ],
+    "material_index": 1,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     18,
+     10,
+     12,
+     20
+    ],
+    "material_index": 1,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     19,
+     21,
+     13,
+     11
+    ],
+    "material_index": 1,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     20,
+     12,
+     15,
+     23
+    ],
+    "material_index": 1,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     21,
+     22,
+     14,
+     13
+    ],
+    "material_index": 1,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   }
+  ],
+  "vertex_groups": {
+   "thick": [
+    0.30000001192092896,
+    0.30000001192092896,
+    1.0,
+    1.0,
+    0.6000000238418579,
+    0.6000000238418579,
+    0.20000000298023224,
+    0.20000000298023224,
+    0.8999999761581421,
+    0.8999999761581421,
+    0.5,
+    0.5,
+    0.10000000149011612,
+    0.10000000149011612,
+    0.800000011920929,
+    0.800000011920929,
+    0.4000000059604645,
+    0.4000000059604645,
+    0.0,
+    0.0,
+    0.699999988079071,
+    0.699999988079071,
+    0.30000001192092896,
+    0.30000001192092896
+   ]
+  },
+  "uv_layer_names": [],
+  "color_attribute_names": [],
+  "has_custom_normals": false,
+  "has_bevel_weight_edge": false,
+  "topology": {
+   "vertices": 24,
+   "edges": 44,
+   "faces": 22,
+   "loops": 88,
+   "loose_edges": 0
+  },
+  "canonical_hash": "9d2f977b105d61f2ee54545086e6a4b17e5f8f811b27467bbb8b2765b0aa9144"
+ },
+ "output_normal_codec_max_error": null
+}
