@@ -480,7 +480,7 @@ fn multires_levels_are_bounded_by_the_stored_top_level_and_budget() {
 }
 
 #[test]
-fn multires_custom_normals_follow_corner_layer_presence() {
+fn custom_normals_follow_blender_per_modifier_type() {
     let source = Mesh::box_mesh(BoxParams::default()).unwrap();
     let mut sharp_only = source.clone();
     sharp_only.attributes.insert(
@@ -508,10 +508,34 @@ fn multires_custom_normals_follow_corner_layer_presence() {
         )],
     )
     .unwrap();
+    // Blender 5.2.2 (tests/fixtures/custom_normal_presence): Multires with Use Custom Normals on writes a layer
+    // only when the input has one, so sharp edges alone leave it out.
     assert!(
-        mixed_result.attributes.contains_key("custom_normal"),
-        "mixed sharp inputs use the corner-normal domain when custom normals are enabled"
+        !mixed_result.attributes.contains_key("custom_normal"),
+        "multires with mixed sharp inputs and no custom-normal layer writes no custom normals, as Blender does"
     );
+    // Blender 5.2.2: a Subdivision Surface with Use Custom Normals on writes a layer even with no input layer.
+    let subdivision_mixed = evaluate_modifiers(
+        &mixed_sharp,
+        &[modifier(
+            "subdivision",
+            json!({"levels": 1, "use_custom_normals": true}),
+        )],
+    )
+    .unwrap();
+    assert!(
+        subdivision_mixed.attributes.contains_key("custom_normal"),
+        "subdivision with Use Custom Normals on writes custom normals, as Blender does"
+    );
+    let subdivision_off = evaluate_modifiers(
+        &mixed_sharp,
+        &[modifier(
+            "subdivision",
+            json!({"levels": 1, "use_custom_normals": false}),
+        )],
+    )
+    .unwrap();
+    assert!(!subdivision_off.attributes.contains_key("custom_normal"));
     let sharp_result = evaluate_modifiers(
         &sharp_only,
         &[modifier(

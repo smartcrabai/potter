@@ -24,9 +24,7 @@ use super::color_layers::{self, ColorDomain};
 use super::triangulate::{NgonMethod, QuadMethod, triangulate_mesh};
 use super::{
     Edge, Face, Mesh, MeshError, Vertex, edge_key,
-    normals::{
-        corner_normal_domain, corner_normals, face_normal, safe_acos_approx, sharp_edge_flags,
-    },
+    normals::{corner_normals, face_normal, safe_acos_approx, sharp_edge_flags},
     provenance::{
         Origin, edge_flags, mean_value_corners, remap_attributes_staged,
         remap_attributes_with_basis, remap_attributes_with_edges,
@@ -2858,7 +2856,7 @@ fn adaptive_subdivision(
         },
     )?;
     let use_custom_normals = bool_param(modifier, "use_custom_normals")?;
-    let input_normals = if use_custom_normals && corner_normal_domain(mesh)? {
+    let input_normals = if use_custom_normals {
         match clnor::corner_codes(mesh)? {
             Some(codes) => Some(clnor::evaluate_codes(
                 mesh,
@@ -3016,9 +3014,13 @@ fn subdivision_with_samples(
             ),
         ));
     }
-    // Subsurf interpolates the evaluated input loop normals only when the source has a custom layer
-    // and the option is enabled; automatic corners participate as their evaluated fan normals.
-    let input_normals = if use_custom_normals && clnor::corner_codes(mesh)?.is_some() {
+    // Blender 5.2.2 probe (`tests/fixtures/custom_normal_presence`): a Subdivision Surface with Use Custom
+    // Normals on writes a custom-normal layer even with no input layer and no sharp edges, at level 1 as well.
+    // Multires with the option on writes one only when the input has a custom-normal layer (sharp edges and
+    // the option alone leave it out). The loop normals are the evaluated fan normals either way.
+    let input_normals = if use_custom_normals
+        && (modifier.modifier_type == "subdivision" || clnor::corner_codes(mesh)?.is_some())
+    {
         Some(corner_normals(mesh, &positions(mesh))?)
     } else {
         None

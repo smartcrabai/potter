@@ -493,44 +493,6 @@ pub(crate) fn sharp_edge_flags(mesh: &Mesh) -> Result<Vec<bool>> {
         .collect()
 }
 
-/// Blender's normal domain, including the split-corner domain implied by mixed sharp flags.
-pub(crate) fn corner_normal_domain(mesh: &Mesh) -> Result<bool> {
-    if mesh.faces.is_empty() {
-        return Ok(false);
-    }
-    if let Some(custom) = mesh.attributes.get("custom_normal") {
-        let fields = custom
-            .as_object()
-            .ok_or_else(|| PotError::invalid_argument("custom_normal must be an object"))?;
-        if fields.contains_key("values") {
-            match fields.get("domain").and_then(Value::as_str) {
-                Some("corner") => return Ok(true),
-                Some("point" | "face") => return Ok(false),
-                Some("edge") => {}
-                _ => {
-                    return Err(PotError::invalid_argument(
-                        "custom_normal.domain is invalid",
-                    ));
-                }
-            }
-        }
-    }
-    let face_values = attribute_values(mesh, "sharp_face", "face", "bool")?;
-    let sharp_faces = mesh
-        .faces
-        .iter()
-        .map(|face| flag(face_values, &format!("f{}", face.id)))
-        .collect::<Result<Vec<_>>>()?;
-    if sharp_faces.iter().any(|sharp| *sharp) && sharp_faces.iter().all(|sharp| *sharp) {
-        return Ok(false);
-    }
-    let sharp_edges = sharp_edge_flags(mesh)?;
-    if sharp_edges.iter().any(|sharp| *sharp) && sharp_edges.iter().all(|sharp| *sharp) {
-        return Ok(false);
-    }
-    Ok(sharp_faces.iter().any(|sharp| *sharp) || sharp_edges.iter().any(|sharp| *sharp))
-}
-
 fn union(parent: &mut [usize], first: usize, second: usize) {
     let first = find(parent, first);
     let second = find(parent, second);
@@ -1088,32 +1050,5 @@ mod tests {
         let faces = render_corner_normals(&mesh, &points).expect("fold is valid");
         assert_eq!(faces[0].as_ref().map(Vec::len), Some(4));
         assert!(faces[1].is_none());
-    }
-
-    #[test]
-    fn mixed_sharp_input_uses_corner_normals_but_all_sharp_is_face_domain() {
-        let mut mesh = Mesh::box_mesh(crate::geom::BoxParams::default()).expect("cube");
-        let sharp_edge_id = mesh.edges[0].id;
-        let edge_values = mesh
-            .edges
-            .iter()
-            .map(|edge| (format!("e{}", edge.id), json!(edge.id == sharp_edge_id)))
-            .collect::<Map<_, _>>();
-        mesh.attributes.insert(
-            "sharp".to_owned(),
-            json!({"domain": "edge", "type": "bool", "values": edge_values}),
-        );
-        assert!(corner_normal_domain(&mesh).expect("mixed sharp domain"));
-
-        let edge_values = mesh
-            .edges
-            .iter()
-            .map(|edge| (format!("e{}", edge.id), json!(true)))
-            .collect::<Map<_, _>>();
-        mesh.attributes.insert(
-            "sharp".to_owned(),
-            json!({"domain": "edge", "type": "bool", "values": edge_values}),
-        );
-        assert!(!corner_normal_domain(&mesh).expect("all sharp domain"));
     }
 }
