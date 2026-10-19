@@ -1749,6 +1749,10 @@ fn default_transparent_max_bounces() -> u32 {
     8
 }
 
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if passes a reference"
+)]
 fn is_false(value: &bool) -> bool {
     !*value
 }

@@ -24,7 +24,7 @@ mod process;
 use std::{
     error::Error,
     fs,
-    path::{Path, PathBuf},
+    path::Path,
     process::Command,
 };
 
