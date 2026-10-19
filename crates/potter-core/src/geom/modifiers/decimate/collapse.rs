@@ -1138,14 +1138,14 @@ fn collect_point_attributes(mesh: &Mesh) -> Vec<PointAttribute> {
 }
 
 /// An EDGE attribute of `blender_attributes` with one value per input edge in storage order.
-struct EdgeAttribute {
-    name: String,
-    data_type: String,
-    values: Vec<Value>,
+pub(super) struct EdgeAttribute {
+    pub(super) name: String,
+    pub(super) data_type: String,
+    pub(super) values: Vec<Value>,
 }
 
 /// The EDGE entries of `blender_attributes`; missing edge values take the type default.
-fn collect_edge_attributes(mesh: &Mesh) -> Vec<EdgeAttribute> {
+pub(super) fn collect_edge_attributes(mesh: &Mesh) -> Vec<EdgeAttribute> {
     let entries = mesh
         .attributes
         .get("blender_attributes")
@@ -1223,7 +1223,7 @@ fn collect_edge_flags(mesh: &Mesh) -> Vec<EdgeFlags> {
 }
 
 /// Blender's generic color customdata initializes to white (`layerDefault_propcol`, `layerDefault_mloopcol`).
-fn collapse_customdata_default(data_type: &str) -> Value {
+pub(super) fn collapse_customdata_default(data_type: &str) -> Value {
     if matches!(data_type, "FLOAT_COLOR" | "BYTE_COLOR") {
         json!([1.0, 1.0, 1.0, 1.0])
     } else {
@@ -2276,7 +2276,7 @@ fn collapse_write_point(
 }
 
 /// Writes the collapse's EDGE values into `blender_attributes` in the rebuilt mesh edge order.
-fn collapse_write_edge(
+pub(super) fn collapse_write_edge(
     mesh: &mut Mesh,
     attributes: &[EdgeAttribute],
     edge_values: Vec<([usize; 2], Vec<Value>)>,
