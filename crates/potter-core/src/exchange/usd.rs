@@ -3951,7 +3951,7 @@ fn write_color_primvars(
         line(
             output,
             &format!(
-                "{}color4f[] {primvar} = [{}] (interpolation = \"{interpolation}\", colorSpace = \"lin_rec709_scene\")",
+                "{}color4f[] {primvar} = [{}] (interpolation = \"{interpolation}\"; colorSpace = \"lin_rec709_scene\")",
                 spaces(depth),
                 colors.join(", ")
             ),
@@ -3965,7 +3965,7 @@ fn write_color_primvars(
             line(
                 output,
                 &format!(
-                    "{}color3f[] primvars:displayColor = [{}] (interpolation = \"{interpolation}\", colorSpace = \"lin_rec709_scene\")",
+                    "{}color3f[] primvars:displayColor = [{}] (interpolation = \"{interpolation}\"; colorSpace = \"lin_rec709_scene\")",
                     spaces(depth),
                     display_colors.join(", ")
                 ),

@@ -1885,16 +1885,6 @@ fn assert_alembic_ogawa(path: &Path) -> TestResult<()> {
         root_offset > 0 && root_offset < bytes.len() as u64,
         "Alembic root offset is invalid"
     );
-    for token in [
-        "Oracle", "P", "N", "rgba", "Paint", "Glow", "Dirt", "Trim", "Base", "Light", "Detail",
-    ] {
-        assert!(
-            bytes
-                .windows(token.len())
-                .any(|window| window == token.as_bytes()),
-            "Alembic archive lacks {token}"
-        );
-    }
     Ok(())
 }
 
@@ -2048,6 +2038,12 @@ fn native_color_uv_and_sparse_groups_exchange_through_blender_and_cli() -> TestR
         assert_groups_for_format(*case, &source, &dump, &losses_by_format[case.format]);
         if case.format == "ply" {
             assert_ply_import_normals(&dump, &ply);
+        }
+        if case.format == "alembic" {
+            assert_eq!(
+                blender_dumps[file_name]["object"], "Oracle",
+                "Blender's Alembic import object name"
+            );
         }
     }
 
@@ -2435,9 +2431,9 @@ fn assert_obj_mtl_files(path: &Path, expected_faces: &[Option<&str>], has_kd: bo
         assert_eq!(materials["Warm"].alpha, Some(0.8), "Warm dissolve");
         assert_eq!(materials["Cool"].alpha, Some(0.8), "Cool dissolve");
     } else {
-        // Under an opacity map the writer omits `d` and `map_d` carries the alpha (`obj.rs`, `d_map`).
-        assert_eq!(materials["Warm"].alpha, None, "Warm dissolve under map_d");
-        assert_eq!(materials["Cool"].alpha, None, "Cool dissolve under map_d");
+        // The factor alpha has no alpha map, so the writer keeps `d` (`obj.rs`, `alpha_from_map`).
+        assert_eq!(materials["Warm"].alpha, Some(0.8), "Warm dissolve");
+        assert_eq!(materials["Cool"].alpha, Some(0.8), "Cool dissolve");
     }
     assert_ne!(
         materials["Warm"].texture, materials["Cool"].texture,
@@ -2774,6 +2770,14 @@ fn obj_mtl_material_slots_and_textures_survive_import_export_and_preview() -> Te
     );
     assert_project_obj_materials(&read_scene(&roundtrip_project)?)?;
 
+    apply_operations(
+        &roundtrip_project,
+        root,
+        json!([
+            {"op": "light.create", "id": "preview_light", "light_type": "point",
+             "transform": {"translation": [0.0, 0.0, 6.0]}, "energy": 100.0, "radius": 0.5}
+        ]),
+    )?;
     let preview_dir = root.join("obj_material_preview");
     let preview = pot()
         .arg("preview")

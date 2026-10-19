@@ -434,9 +434,29 @@ impl MtlWriter<'_> {
         )]
         let illum = illum_mode(level, metallic, alpha != 1.0);
 
+        // Blender's `map_d` names the image linked to Alpha. When the colour image's alpha is the
+        // material alpha, that is the colour image itself, and Potter's importer reads alpha only
+        // from the image `map_Kd` names. The colour image therefore keeps its alpha channel and
+        // `map_d` names it. A material with a scalar alpha factor keeps `d`.
+        #[expect(
+            clippy::float_cmp,
+            reason = "exact unit test: only a factor alpha of exactly 1.0 leaves the texture alpha as the material alpha"
+        )]
+        let alpha_from_map = !matches!(surface.alpha_mode, AlphaMode::Opaque)
+            && alpha == 1.0
+            && surface
+                .base_color
+                .texture
+                .as_ref()
+                .is_some_and(|texture| texture.channels[3].is_some());
         let kd_map = match &surface.base_color.texture {
             Some(texture) => {
-                Some(self.map("map_Kd", texture, &rgb_channels(&texture.channels), None)?)
+                let channels = if alpha_from_map {
+                    texture.channels.clone()
+                } else {
+                    rgb_channels(&texture.channels)
+                };
+                Some(self.map("map_Kd", texture, &channels, None)?)
             }
             None => None,
         };
@@ -485,20 +505,10 @@ impl MtlWriter<'_> {
             }
             _ => None,
         };
-        let d_map = match &surface.base_color.texture {
-            Some(texture)
-                if !matches!(surface.alpha_mode, AlphaMode::Opaque)
-                    && texture.channels[3].is_some() =>
-            {
-                Some(self.map(
-                    "map_d",
-                    texture,
-                    &[None, None, None, texture.channels[3].clone()],
-                    None,
-                )?)
-            }
-            _ => None,
-        };
+        let d_map = kd_map
+            .as_ref()
+            .filter(|_| alpha_from_map)
+            .map(|line| line.replacen("map_Kd", "map_d", 1));
         let bump_map = match &surface.normal {
             Some(normal) => Some(self.map(
                 "map_Bump",
