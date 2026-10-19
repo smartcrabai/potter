@@ -364,10 +364,12 @@ fn base_tile(data: &ImageData) -> ImageTileDataRef<'_> {
     }
 }
 
-/// The stored tile `number`. The base image is tile 1001, which Potter keeps outside `tiles`. Any other tile must be stored.
+/// The stored tile `number`. The base image is tile 1001, which Potter keeps outside `tiles` unless a TILED base is
+/// stored there. A tile with no size has no file (a missing base, or a TILED base with no file), so it is missing and
+/// samples as Blender's missing colour: `None`.
 fn stored_tile(data: &ImageData, number: u32) -> Option<ImageTileDataRef<'_>> {
-    match data.tiles.get(&number) {
-        Some(image) => Some(ImageTileDataRef {
+    let image = match data.tiles.get(&number) {
+        Some(image) => ImageTileDataRef {
             width: image.width,
             height: image.height,
             pixels: &image.pixels,
@@ -377,11 +379,11 @@ fn stored_tile(data: &ImageData, number: u32) -> Option<ImageTileDataRef<'_>> {
                 precision: image.precision,
                 ..data.storage
             },
-        }),
-        // A missing base file has no size and no pixels (`storage::load_image_data`), so its lookups are missing tiles.
-        None if number == 1001 && data.width != 0 && data.height != 0 => Some(base_tile(data)),
-        None => None,
-    }
+        },
+        None if number == 1001 => base_tile(data),
+        None => return None,
+    };
+    (image.width != 0 && image.height != 0).then_some(image)
 }
 
 /// The image a floor-routed lookup reads (`sample`, `sample_encoded`): the base image when `udim` is unset, else the stored

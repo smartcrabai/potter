@@ -2102,8 +2102,8 @@ pub struct Image {
     #[serde(default)]
     pub alpha_mode: ImageAlphaMode,
     /// Blender's TILED source: the image routes UDIM lookups even when only its base tile 1001 is stored, so a lookup
-    /// into any other tile is missing, as Blender renders it.
-    #[serde(default)]
+    /// into any other tile is missing, as Blender renders it. Omitted when false.
+    #[serde(default, skip_serializing_if = "is_false")]
     pub tiled: bool,
 }
 

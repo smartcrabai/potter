@@ -547,16 +547,57 @@ fn check_missing_base(blender: &Path, fixture: &Path) -> Result<(), Box<dyn Erro
 /// Imports the single-tile variant: a TILED image whose only file is tile 1001. Blender keeps the TILED source, so a
 /// lookup past tile 1001 is missing (magenta) while the base still samples, and Potter keeps the `tiled` flag and
 /// routes the same way. The plane spans U from 0.5 to 1.5, so both cases appear in one render.
-fn check_single_tile(blender: &Path, fixture: &Path, expected: &Value) -> Result<(), Box<dyn Error>> {
+fn check_single_tile(
+    blender: &Path,
+    fixture: &Path,
+    expected: &Value,
+) -> Result<(), Box<dyn Error>> {
     let graph = import_blend(&fixture.join("udim_single_tile.blend"), Some(blender))?;
     let image = find_udim_image(&graph)?;
     assert!(image.tiled, "the TILED source was not kept");
-    assert!(image.tiles.is_empty(), "tile 1001 is stored as a listed tile");
+    assert!(
+        image.tiles.is_empty(),
+        "tile 1001 is stored as a listed tile"
+    );
     assert_eq!((image.width, image.height), (1, 2), "base tile size");
     let store = fixture.join("store_single_tile");
     write_assets(&graph.assets, &store)?;
     let data = load_image_data(image, &store, ImageInterpolation::Closest)?;
-    assert_render_matches(&data, &expected["single_tile"], "single tile", 0.5, ImageExtension::Repeat)
+    assert_render_matches(
+        &data,
+        &expected["single_tile"],
+        "single tile",
+        0.5,
+        ImageExtension::Repeat,
+    )
+}
+
+/// Imports the single-tile blend after its only tile file is removed: a TILED image with no file. Blender lists tile
+/// 1001 with size 0 and draws every lookup as the missing colour (probed: magenta for the whole plane), and Potter keeps
+/// the TILED record with a zero-size base, which the sampler reads as the missing colour too.
+fn check_tiled_without_files(blender: &Path, fixture: &Path) -> Result<(), Box<dyn Error>> {
+    let blend = fixture.join("udim_single_tile.blend");
+    let graph = import_blend(&blend, Some(blender))?;
+    let image = find_udim_image(&graph)?;
+    assert!(image.tiled, "the TILED source was not kept");
+    assert!(image.tiles.is_empty(), "a tile with no file was imported");
+    assert_eq!(
+        (image.width, image.height),
+        (0, 0),
+        "a missing base has no size"
+    );
+    assert!(image.blob.is_none(), "a missing base has a blob");
+    let store = fixture.join("store_tiled_without_files");
+    write_assets(&graph.assets, &store)?;
+    let data = load_image_data(image, &store, ImageInterpolation::Closest)?;
+    let rendered = render(blender, fixture, &blend, "tiled_without_files")?;
+    assert_render_matches(
+        &data,
+        &rendered,
+        "tiled without files",
+        0.5,
+        ImageExtension::Repeat,
+    )
 }
 
 #[test]
@@ -589,6 +630,8 @@ fn blender_udim_tiles_import_sample_and_round_trip() -> Result<(), Box<dyn Error
     check_variant(&blender, &fixture, &expected, "uvtile")?;
     check_negative(&blender, &fixture, &expected)?;
     check_single_tile(&blender, &fixture, &expected)?;
+    fs::remove_file(fixture.join("single/udim.1001.png"))?;
+    check_tiled_without_files(&blender, &fixture)?;
     fs::remove_file(fixture.join("udim.1002.png"))?;
     check_missing_tile(&blender, &fixture)?;
     fs::remove_file(fixture.join("udim.1001.png"))?;
