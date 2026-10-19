@@ -21,8 +21,8 @@ use tempfile::tempdir;
 /// Two 1x2 UDIM tiles (1001 base, 1002) in a TILED image named "UDIM Image", rendered through a Cycles emission
 /// material. The plane's U starts at a per-variant offset: "external" and "uvtile" read tile files from disk through the
 /// <UDIM> and <UVTILE> tokens, "packed" reads only the tiles packed into its .blend, "negative" spans U in (-1.25, -0.25),
-/// and "base_plane" covers tile 1001 alone.
-const FIXTURE_SCRIPT: &str = r##"
+/// and `base_plane` covers tile 1001 alone.
+const FIXTURE_SCRIPT: &str = r#"
 import bpy
 import json
 import os
@@ -142,10 +142,10 @@ for variant in ["external", "uvtile", "packed", "negative", "base_plane", "singl
 with open(os.path.join(root, "expected.json"), "w", encoding="utf-8") as handle:
     json.dump(expected, handle)
 print("FIXTURE_OK")
-"##;
+"#;
 
 /// Reopens an exported .blend and reports the UDIM image's source, tile numbers and sizes, and packed tiles.
-const REPORT_SCRIPT: &str = r##"
+const REPORT_SCRIPT: &str = r#"
 import bpy
 import json
 import sys
@@ -161,10 +161,10 @@ report = {
 with open(args[1], "w", encoding="utf-8") as handle:
     json.dump(report, handle)
 print("REPORT_OK")
-"##;
+"#;
 
 /// Renders a saved .blend with its own camera and render settings, and writes the pixels as JSON in Blender's row order.
-const RENDER_SCRIPT: &str = r##"
+const RENDER_SCRIPT: &str = r#"
 import bpy
 import json
 import sys
@@ -184,7 +184,7 @@ report = {
 with open(args[2], "w", encoding="utf-8") as handle:
     json.dump(report, handle)
 print("RENDER_OK")
-"##;
+"#;
 
 fn run_ok(command: &mut Command, label: &str) -> Result<Output, Box<dyn Error>> {
     let output = command.output()?;
@@ -311,9 +311,9 @@ fn assert_render_matches(
     Ok(())
 }
 
-fn find_udim_image<'a>(
-    graph: &'a potter_core::exchange::ImportedGraph,
-) -> Result<&'a potter_core::model::Image, Box<dyn Error>> {
+fn find_udim_image(
+    graph: &potter_core::exchange::ImportedGraph,
+) -> Result<&potter_core::model::Image, Box<dyn Error>> {
     graph
         .doc
         .images
