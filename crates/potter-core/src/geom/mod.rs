@@ -1446,7 +1446,26 @@ impl Mesh {
                 ]);
             }
         }
-        Self::from_positions_and_faces(positions, polygons)
+        let mut mesh = Self::from_positions_and_faces(positions, polygons)?;
+        // Blender's grid primitive stores each face's edges from each corner to the corner before it, so the
+        // first face contributes (last, first), (first, second), ... and subdivision numbers its edge points in
+        // that stored order. `from_positions_and_faces` stores the (corner, next) edges, so the stored order is
+        // reordered by first occurrence of the (previous, corner) edges. Only storage order moves; ids stay.
+        let mut rank: HashMap<(u32, u32), usize> = HashMap::new();
+        for face in &mesh.faces {
+            let count = face.vertices.len();
+            for corner in 0..count {
+                let key = edge_key(face.vertices[(corner + count - 1) % count], face.vertices[corner]);
+                let next = rank.len();
+                rank.entry(key).or_insert(next);
+            }
+        }
+        mesh.edges.sort_by_key(|edge| {
+            rank.get(&edge_key(edge.vertices[0], edge.vertices[1]))
+                .copied()
+                .unwrap_or(usize::MAX)
+        });
+        Ok(mesh)
     }
 }
 /// Create a Blender-style primitive by lowercase kind and optional JSON parameters.
