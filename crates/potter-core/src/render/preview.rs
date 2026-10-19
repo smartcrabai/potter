@@ -210,6 +210,7 @@ pub fn render_previews(
                 scene.render.samples,
                 scene.render.seed,
                 scene.render.max_bounces,
+                scene.render.transparent_max_bounces,
                 false,
                 &images,
             )?
@@ -352,6 +353,7 @@ pub(crate) fn render_camera_frame(
             samples,
             seed,
             scene.render.max_bounces,
+            scene.render.transparent_max_bounces,
             film_transparent,
             &images,
         )?

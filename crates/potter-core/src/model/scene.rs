@@ -1150,6 +1150,12 @@ pub struct RenderSettings {
     pub samples: u32,
     pub seed: u32,
     pub max_bounces: u32,
+    /// Cycles' `transparent_max_bounces`. Omitted when equal to Blender's default of 8.
+    #[serde(
+        default = "default_transparent_max_bounces",
+        skip_serializing_if = "is_default_transparent_max_bounces"
+    )]
+    pub transparent_max_bounces: u32,
     pub film_transparent: bool,
     pub engine: String,
     pub use_sequencer: bool,
@@ -1202,6 +1208,7 @@ impl Default for RenderSettings {
             samples: 64,
             seed: 0,
             max_bounces: 4,
+            transparent_max_bounces: 8,
             film_transparent: false,
             engine: "path".to_owned(),
             use_sequencer: false,
@@ -1777,6 +1784,18 @@ fn default_true() -> bool {
 )]
 fn is_true(value: &bool) -> bool {
     *value
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if passes a reference"
+)]
+fn is_default_transparent_max_bounces(value: &u32) -> bool {
+    *value == 8
+}
+
+fn default_transparent_max_bounces() -> u32 {
+    8
 }
 
 #[expect(
