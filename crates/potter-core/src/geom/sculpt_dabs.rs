@@ -67,6 +67,9 @@ struct Field {
     view: Option<DVec3>,
     /// Grab-family per-stroke state: Blender `StrokeCache` fields that persist between dabs.
     grab: grab::State,
+    /// Whether a Smooth call has already run this stroke (`smooth::smooth_dab` reads the first call
+    /// from its start positions).
+    smooth_started: bool,
 }
 
 /// One dab's values as Blender's `StrokeCache` holds them, before any symmetry pass.
@@ -134,6 +137,7 @@ pub(super) fn apply_dabs(
         passes,
         view: stroke.view.map(DVec3::normalize),
         grab: grab::State::default(),
+        smooth_started: false,
     };
     // Blender's `need_delta_from_anchored_origin` brushes measure every dab from the stroke's
     // first dab, which also becomes the dab center (`brush_delta_update`, sculpt.cc 4277-4312).

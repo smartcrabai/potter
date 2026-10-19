@@ -32,29 +32,66 @@ fn iteration_strengths(strength: f64) -> Vec<f64> {
 }
 
 /// Blender's `do_smooth_brush` (`smooth.cc:239`) for one dab, run once per symmetry pass. Each pass
-/// smooths around its mirrored center (`location_symm`), and the passes run in order against the
-/// positions the earlier passes left behind. Within a pass, every iteration is a full smoothing step.
+/// is one `do_smooth_brush` call, and the calls run in order. A pass with no vertex in range never
+/// reaches `do_smooth_brush` in Blender (`do_brush_action` returns when no node is in range), so it
+/// does nothing and does not count as the stroke's first call.
+///
+/// Within a call, the iterations read the positions in one of two ways, which Blender's oracles pin
+/// down (`tests/fixtures/sculpt_brushes/smooth_sphere.json` and the two-dab probes):
+/// - the first call of the stroke: every iteration reads the call-start positions, and the
+///   iteration translations accumulate on top of them;
+/// - later calls: each iteration reads the positions the previous iteration wrote.
 fn smooth_dab(field: &mut Field, dab: &DabInput) {
-    for sign in &field.passes {
-        let center = dab.center * *sign;
-        for strength in iteration_strengths(dab.strength) {
-            let moves = smooth_moves(field, center, dab.radius, strength);
-            for (index, translation) in moves {
-                field.positions[index] += translation;
+    let passes = field.passes.clone();
+    for sign in passes {
+        let center = dab.center * sign;
+        if !field
+            .positions
+            .iter()
+            .any(|position| position.distance(center) < dab.radius)
+        {
+            continue;
+        }
+        let first_call = !field.smooth_started;
+        field.smooth_started = true;
+        if first_call {
+            let snapshot = field.positions.clone();
+            let mut accumulated = vec![DVec3::ZERO; snapshot.len()];
+            for strength in iteration_strengths(dab.strength) {
+                for (index, translation) in
+                    smooth_moves(field, &snapshot, center, dab.radius, strength)
+                {
+                    accumulated[index] += translation;
+                }
+            }
+            for (position, translation) in field.positions.iter_mut().zip(accumulated) {
+                *position += translation;
+            }
+        } else {
+            for strength in iteration_strengths(dab.strength) {
+                let moves = smooth_moves(field, &field.positions, center, dab.radius, strength);
+                for (index, translation) in moves {
+                    field.positions[index] += translation;
+                }
             }
         }
     }
 }
 
 /// One Blender smoothing iteration (`do_smooth_brush_mesh`, `smooth.cc:113-162`). The factors come
-/// from the current positions (`calc_factors_common_mesh_indexed` reads `position_data.eval`), and
-/// every neighbor average reads the same snapshot, since Blender computes all new positions before
-/// it applies any translation. A vertex moves by `factor * (average - position)`, where the factor
-/// is the falloff times the mask factor times the iteration strength (`scale_factors`,
+/// from `positions` (`calc_factors_common_mesh_indexed` reads `position_data.eval`), and every
+/// neighbor average reads the same `positions`, since Blender computes all new positions before it
+/// applies any translation. A vertex moves by `factor * (average - position)`, where the factor is
+/// the falloff times the mask factor times the iteration strength (`scale_factors`,
 /// `scale_translations`). Vertices outside the radius and vertices without neighbors do not move.
-fn smooth_moves(field: &Field, center: DVec3, radius: f64, strength: f64) -> Vec<(usize, DVec3)> {
-    field
-        .positions
+fn smooth_moves(
+    field: &Field,
+    positions: &[DVec3],
+    center: DVec3,
+    radius: f64,
+    strength: f64,
+) -> Vec<(usize, DVec3)> {
+    positions
         .iter()
         .enumerate()
         .filter_map(|(index, position)| {
@@ -67,7 +104,7 @@ fn smooth_moves(field: &Field, center: DVec3, radius: f64, strength: f64) -> Vec
             if factor == 0.0 {
                 return None;
             }
-            let average = neighbor_average(&field.positions, &field.neighbors[index])?;
+            let average = neighbor_average(positions, &field.neighbors[index])?;
             Some((index, (average - *position) * factor))
         })
         .collect()

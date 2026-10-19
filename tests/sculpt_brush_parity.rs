@@ -87,7 +87,14 @@ const FIXTURES: &[(&str, &str)] = &[
         "pinch_sphere",
         include_str!("fixtures/sculpt_brushes/pinch_sphere.json"),
     ),
-    // `smooth_sphere` is not listed: the Smooth port misses Blender's result by about 4e-2 (open).
+    (
+        "smooth_sphere",
+        include_str!("fixtures/sculpt_brushes/smooth_sphere.json"),
+    ),
+    (
+        "smooth_sphere_four_dabs",
+        include_str!("fixtures/sculpt_brushes/smooth_sphere_four_dabs.json"),
+    ),
     (
         "flatten_sphere",
         include_str!("fixtures/sculpt_brushes/flatten_sphere.json"),

@@ -248,6 +248,7 @@ def cases():
         ("crease_sphere", "crease", "sphere", sphere_dabs(3, 0.5, 0.25, [1.0]), 0.25, 0.5, False),
         ("pinch_sphere", "pinch", "sphere", sphere_dabs(4, 0.4, 0.5, [1.0, 0.5, 1.0, 1.0]), 0.5, 0.4, False),
         ("smooth_sphere", "smooth", "sphere", sphere_dabs(3, 0.5, 0.7, [1.0]), 0.7, 0.5, False),
+        ("smooth_sphere_four_dabs", "smooth", "sphere", sphere_dabs(4, 0.5, 1.0, [1.0]), 1.0, 0.5, False),
         ("flatten_sphere", "flatten", "sphere", sphere_dabs(4, 0.4, 0.5, [1.0]), 0.5, 0.4, False),
         ("fill_sphere", "fill", "sphere", sphere_dabs(4, 0.4, 0.7, [1.0, 0.5, 1.0, 1.0]), 0.7, 0.4, False),
         ("scrape_sphere", "scrape", "sphere", sphere_dabs(4, 0.4, 0.7, [1.0, 0.5, 1.0, 1.0]), 0.7, 0.4, False),
