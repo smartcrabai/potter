@@ -2612,12 +2612,15 @@ fn affine_inline_volume_displacement_preserves_sampling_and_mesh_space()
         assert!(potter_core::geom::volume::validate_data(&invalid_volume).is_err());
     }
     let sample_index = DVec3::new(0.25, 0.5, 0.75);
-    assert_eq!(
-        potter_core::geom::volume::sample_density_checked(
-            index_to_local.transform_point3(sample_index),
-            &volume,
-        )?,
-        sample_index.x,
+    // The density is recovered through the matrix inverse, so it carries f64 rounding (about 4e-16 here).
+    let sampled = potter_core::geom::volume::sample_density_checked(
+        index_to_local.transform_point3(sample_index),
+        &volume,
+    )?;
+    assert!(
+        (sampled - sample_index.x).abs() <= 1.0e-12,
+        "affine density round trip {sampled} differs from {}",
+        sample_index.x
     );
 
     let parameters = Map::from_iter([
