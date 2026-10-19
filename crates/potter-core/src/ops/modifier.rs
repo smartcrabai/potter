@@ -331,7 +331,9 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
     let enabled = read_bool(engine, operation, "enabled", true)?;
     let show_viewport = read_bool(engine, operation, "show_viewport", true)?;
     let show_render = read_bool(engine, operation, "show_render", true)?;
-    let params = read_params(engine, operation.get("params"), "params")?;
+    let raw_params = read_params(engine, operation.get("params"), "params")?;
+    let mut params = raw_params.clone();
+    synchronize_rna_aliases(engine, &modifier_type, &raw_params, &mut params)?;
     validate_parameter_map(
         engine,
         ParameterFamily::Modifier,
@@ -505,7 +507,7 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                     candidate.insert(key.clone(), value.clone());
                 }
             }
-            synchronize_bevel_amount(engine, modifier_type, &raw, &mut candidate)?;
+            synchronize_rna_aliases(engine, modifier_type, &raw, &mut candidate)?;
             validate_parameter_map(
                 engine,
                 ParameterFamily::Modifier,
@@ -620,41 +622,43 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
     Ok(changed)
 }
 
-/// Blender's Bevel `width` and `width_pct` are two RNA views of one stored amount (`rna_modifier.cc`; both
-/// read and write `BevelModifierData.value`). The graph keeps both keys from import, so an update that sets
-/// one must set the other to the same value. Otherwise the exporter writes the keys in sorted order and the
-/// stale one wins. A JSON null for either key restores the default for both, and two different values in
-/// one update are refused, because Blender has no value for them to hold.
-fn synchronize_bevel_amount(
+/// Keeps every RNA alias group of a modifier type equal. The members of a group read and write one stored
+/// Blender value (`rna_modifier.cc`; the table's `aliases` are found from Blender by
+/// `tests/fixtures/param_audit/generate.py`). The graph keeps every key from import, so an update that names
+/// one member sets the rest of its group to the same value. Otherwise the exporter writes the keys in sorted
+/// order and a stale member wins. A JSON null for any member restores the default for the group. Two different
+/// values for one group in one update are refused, because Blender holds one value.
+fn synchronize_rna_aliases(
     engine: &Engine<'_>,
     modifier_type: &str,
     raw: &Map<String, Value>,
     candidate: &mut Map<String, Value>,
 ) -> Result<()> {
-    const AMOUNT_KEYS: [&str; 2] = ["width", "width_pct"];
-    if modifier_type != "bevel" {
-        return Ok(());
-    }
-    let touched: Vec<&Value> = AMOUNT_KEYS.iter().filter_map(|key| raw.get(*key)).collect();
-    if touched.is_empty() {
-        return Ok(());
-    }
-    if touched.iter().any(|value| value.is_null()) {
-        for key in AMOUNT_KEYS {
-            candidate.remove(key);
+    for group in params::rna_aliases(ParameterFamily::Modifier, modifier_type) {
+        let touched: Vec<&Value> = group.iter().filter_map(|key| raw.get(*key)).collect();
+        if touched.is_empty() {
+            continue;
         }
-        return Ok(());
-    }
-    if touched.len() == 2 && touched[0] != touched[1] {
-        return Err(engine.error(
-            ErrorCode::InvalidOperation,
-            "bevel width and width_pct are one Blender amount; set one value",
-            "/set/params",
-        ));
-    }
-    let amount = touched[0].clone();
-    for key in AMOUNT_KEYS {
-        candidate.insert(key.to_owned(), amount.clone());
+        if touched.iter().any(|value| value.is_null()) {
+            for key in &group {
+                candidate.remove(*key);
+            }
+            continue;
+        }
+        if touched.iter().any(|value| *value != touched[0]) {
+            return Err(engine.error(
+                ErrorCode::InvalidOperation,
+                format!(
+                    "{} are one Blender value; set one value",
+                    group.join(" and ")
+                ),
+                "/set/params",
+            ));
+        }
+        let value = touched[0].clone();
+        for key in &group {
+            candidate.insert((*key).to_owned(), value.clone());
+        }
     }
     Ok(())
 }

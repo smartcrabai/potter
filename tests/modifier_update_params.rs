@@ -134,3 +134,56 @@ fn bevel_width_update_keeps_width_pct_equal_and_refuses_conflicting_amounts() ->
     assert_eq!(error.code, potter_core::error::ErrorCode::InvalidOperation);
     Ok(())
 }
+
+/// Blender's Simple Deform `angle` and `factor` are one stored value too, found by the param audit from
+/// Blender and recorded as the table's `aliases`. Create and update keep both members equal.
+#[test]
+fn simple_deform_angle_and_factor_are_kept_equal_by_create_and_update() -> TestResult<()> {
+    let doc = apply_one(
+        &SceneDoc::new(SCENE_ID.to_owned()),
+        &json!({"op": "node.create", "id": OBJECT, "kind": "box", "params": {"size": 2.0}}),
+    )?;
+    let doc = apply_one(
+        &doc,
+        &json!({
+            "op": "modifier.create",
+            "target": {"id": OBJECT},
+            "id": MODIFIER,
+            "type": "simple_deform",
+            "params": {"angle": 0.5},
+        }),
+    )?;
+    let params = modifier_params(&doc)?;
+    assert_eq!(params["angle"], json!(0.5));
+    assert_eq!(params["factor"], json!(0.5));
+
+    let doc = apply_one(
+        &doc,
+        &json!({
+            "op": "modifier.update",
+            "target": {"id": OBJECT},
+            "id": MODIFIER,
+            "set": {"params": {"factor": 0.25}},
+        }),
+    )?;
+    let params = modifier_params(&doc)?;
+    assert_eq!(params["angle"], json!(0.25));
+    assert_eq!(params["factor"], json!(0.25));
+
+    let conflicting = json!({
+        "schema_version": 1,
+        "base_revision": doc.revision,
+        "operations": [{
+            "op": "modifier.create",
+            "target": {"id": OBJECT},
+            "id": "other",
+            "type": "simple_deform",
+            "params": {"angle": 0.1, "factor": 0.2},
+        }],
+    });
+    let error = ops::apply_batch(&doc, &conflicting)
+        .err()
+        .ok_or("conflicting alias values were accepted at create")?;
+    assert_eq!(error.code, potter_core::error::ErrorCode::InvalidOperation);
+    Ok(())
+}
