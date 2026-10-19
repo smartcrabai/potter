@@ -546,7 +546,10 @@ pub(super) fn extract_geometry(
                             }
                         }),
                         alpha_threshold: material.map_or(0.5, |material| material.alpha_threshold),
-                        double_sided: material.is_some_and(|value| value.double_sided),
+                        // Workbench (Solid, Wire) culls only by the viewport's backface flag, which Potter does
+                        // not model, so it draws back faces as Blender does. Beauty culls by material.
+                        double_sided: matches!(mode, Mode::Solid | Mode::Wire)
+                            || material.is_some_and(|value| value.double_sided),
                         material_index,
                         uv,
                         layer_uvs,
