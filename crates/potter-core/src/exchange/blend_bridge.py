@@ -6748,6 +6748,8 @@ def export_doc(doc, target, pack, scene_hash, context):
     native_bind_copies, preserved_native_binds = _source_modifier_object_copies(
         doc, mesh_map)
     object_map = dict(linked_maps["nodes"])
+    # Nodes whose Blender rotation was restored from the source Euler/quaternion values exactly.
+    exact_rotation_nodes = set()
     for node_id, item in doc.get("nodes", {}).items():
         if node_id in linked_maps["nodes"]:
             continue
@@ -6845,6 +6847,8 @@ def export_doc(doc, target, pack, scene_hash, context):
                 and source_rotation_mode == obj.rotation_mode
                 and abs(abs(source_quaternion.dot(quaternion)) - 1.0) <= 1.0e-14
             )
+            if source_rotation_unchanged:
+                exact_rotation_nodes.add(node_id)
             if source_rotation_unchanged and obj.rotation_mode == "QUATERNION":
                 obj.rotation_quaternion = source_rotation_values
             elif source_rotation_unchanged and obj.rotation_mode == "AXIS_ANGLE":
@@ -7109,10 +7113,14 @@ def export_doc(doc, target, pack, scene_hash, context):
                 root_parent_inverse = Matrix(rows)
             basis = item.get("matrix_basis")
             if isinstance(basis, (list, tuple)) and len(basis) == 16:
-                rows = [[basis[column * 4 + row] for column in range(4)]
-                        for row in range(4)]
-                obj.matrix_basis = Matrix(rows)
                 has_captured_basis = True
+                # Assigning a matrix decomposes it into loc/rot/scale and moves rotation and scale by an
+                # ulp. A rotation restored exactly above (Blender's own Euler values) is already the
+                # Blender basis, so only the other captured nodes take the matrix.
+                if node_id not in exact_rotation_nodes:
+                    rows = [[basis[column * 4 + row] for column in range(4)]
+                            for row in range(4)]
+                    obj.matrix_basis = Matrix(rows)
         memberships = 0
         for collection_id, collection_item in collections_raw.items():
             if node_id not in collection_item.get("objects", []):
