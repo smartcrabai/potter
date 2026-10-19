@@ -110,16 +110,15 @@ fn potter_frame(
     render_args: &[&str],
 ) -> TestResult<ImageData> {
     let frames = root.join(name);
-    checked(
-        &mut pot()
-            .arg("render")
-            .arg(project)
-            .args(render_args)
-            .args(["--format", "exr", "--out"])
-            .arg(&frames)
-            .arg("--json"),
-        name,
-    )?;
+    let mut render = pot();
+    render
+        .arg("render")
+        .arg(project)
+        .args(render_args)
+        .args(["--format", "exr", "--out"])
+        .arg(&frames)
+        .arg("--json");
+    checked(&mut render, name)?;
     let loaded = apply_operations(
         project,
         root,
@@ -343,19 +342,17 @@ fn an_opaque_textured_gltf_material_keeps_its_base_alpha_out_of_its_graph() -> T
     });
     let gltf = write_gltf(directory.path(), &material)?;
     let project = directory.path().join("scene");
-    checked(
-        &mut pot().arg("init").arg(&project).arg("--json"),
-        "pot init",
-    )?;
-    let output = checked(
-        &mut pot()
-            .arg("import")
-            .arg(&project)
-            .arg("--file")
-            .arg(&gltf)
-            .args(["--format", "gltf", "--base-revision", "0", "--json"]),
-        "pot import",
-    )?;
+    let mut init = pot();
+    init.arg("init").arg(&project).arg("--json");
+    checked(&mut init, "pot init")?;
+    let mut import = pot();
+    import
+        .arg("import")
+        .arg(&project)
+        .arg("--file")
+        .arg(&gltf)
+        .args(["--format", "gltf", "--base-revision", "0", "--json"]);
+    let output = checked(&mut import, "pot import")?;
     let envelope: Value = serde_json::from_slice(&output.stdout)?;
     assert_eq!(envelope["ok"], true, "import failed: {envelope}");
     let scene = read_scene(&project)?;
