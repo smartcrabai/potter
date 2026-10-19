@@ -1571,15 +1571,33 @@ impl SurfaceShader for SceneShader<'_> {
             } else {
                 hit.normal
             };
-            let albedo = DVec3::new(
-                params.base_color[0],
-                params.base_color[1],
-                params.base_color[2],
-            );
+            // Workbench shades a material with its viewport display values when it has them; Potter-native
+            // materials have none and keep their own (`workbench_engine.cc` `get_material`).
+            let viewport = material.and_then(|material| material.viewport_display.as_ref());
+            let (albedo, roughness, metallic) = match viewport {
+                Some(viewport) => (
+                    DVec3::new(
+                        viewport.diffuse_color[0],
+                        viewport.diffuse_color[1],
+                        viewport.diffuse_color[2],
+                    ),
+                    viewport.roughness,
+                    viewport.metallic,
+                ),
+                None => (
+                    DVec3::new(
+                        params.base_color[0],
+                        params.base_color[1],
+                        params.base_color[2],
+                    ),
+                    params.roughness,
+                    params.metallic,
+                ),
+            };
             let lit = studio::shade(
                 albedo,
-                params.roughness,
-                params.metallic,
+                roughness,
+                metallic,
                 self.view.to_view(facing),
                 self.view.to_view(hit.view),
             );

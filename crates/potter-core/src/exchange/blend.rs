@@ -32,7 +32,7 @@ use crate::{
         NlaStrip, NlaTrack, Node, ParentType, Profile, Registry, RenderSettings, RigidBody,
         RigidBodyShape, RigidBodyType, RigidBodyWorld, Scene, SceneDoc, ShapeKey, ShapeKeyData,
         SurfaceData, SurfacePoint, TextObjectData, TimelineMarker, Transform, UnitSettings,
-        VertexGroup, ViewLayer, World,
+        VertexGroup, ViewLayer, ViewportDisplay, World,
     },
     sequencer::{
         EffectType as SequenceEffectType, RetimingKey, Strip as SequenceStrip, StripBlendType,
@@ -3291,6 +3291,14 @@ fn build_imported_graph(
             "Material",
         )?;
         let color = vec4_field(item, "base_color", [0.6, 0.6, 0.6, 1.0]);
+        let viewport_display = item
+            .get("viewport_display")
+            .filter(|value| value.is_object())
+            .map(|viewport| ViewportDisplay {
+                diffuse_color: vec4_field(viewport, "diffuse_color", [0.8, 0.8, 0.8, 1.0]),
+                roughness: number_field(viewport, "roughness", 0.4),
+                metallic: number_field(viewport, "metallic", 0.0),
+            });
         let alpha_mode = match item
             .get("alpha_mode")
             .and_then(Value::as_str)
@@ -3308,6 +3316,7 @@ fn build_imported_graph(
             Material {
                 name: name.to_owned(),
                 base_color: color,
+                viewport_display,
                 alpha_mode,
                 alpha_threshold: number_field(item, "alpha_threshold", 0.5),
                 metallic: number_field(item, "metallic", 0.0),
@@ -8327,50 +8336,6 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
             )),
         }
     }
-    // Workbench's Solid colours a material from its viewport display colour, roughness and metallic
-    // (`workbench_engine.cc` `get_material`), but Potter's Solid shades with the material's own
-    // values. A material whose viewport values differ is reported, not silently dropped.
-    for material in raw
-        .get("materials")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let viewport = &material["viewport_display"];
-        let colour: Vec<f64> = viewport["diffuse_color"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .take(3)
-            .filter_map(Value::as_f64)
-            .collect();
-        let base: Vec<f64> = material["base_color"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .take(3)
-            .filter_map(Value::as_f64)
-            .collect();
-        let same = |a: &Value, b: &Value| match (a.as_f64(), b.as_f64()) {
-            (Some(a), Some(b)) => (a - b).abs() <= 1.0e-6,
-            _ => false,
-        };
-        let colour_differs = colour.len() != 3
-            || base.len() != 3
-            || colour
-                .iter()
-                .zip(&base)
-                .any(|(a, b)| (a - b).abs() > 1.0e-6);
-        let values_differ = !same(&viewport["roughness"], &material["roughness"])
-            || !same(&viewport["metallic"], &material["metallic"]);
-        if colour_differs || values_differ {
-            losses.push(loss(
-                "blender.material.viewport_display",
-                material.get("name").and_then(Value::as_str),
-                "Blender's viewport display colour, roughness or metallic differs from the material's values; Potter's Solid preview shades with the material's values",
-            ));
-        }
-    }
     // Workbench's viewport shading changes what its render draws. Potter's solid preview models the
     // factory studio light with material colours, and none of the other options below.
     for scene in raw
@@ -8442,7 +8407,7 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
             (
                 shading["background_type"] != "THEME",
                 "blender.scene.display_background",
-                "Blender's Workbench background is not the theme background; Potter's solid preview uses its fixed background",
+                "Blender's Workbench background is not the theme background; Potter's solid preview uses the world's colour",
             ),
         ];
         for (is_unsupported, feature, reason) in unsupported {
@@ -13725,6 +13690,112 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
             Some(&smoke_id)
         );
         assert_eq!(imported_node.material_slot(Some(imported_data), 1), None);
+        Ok(())
+    }
+
+    #[test]
+    fn blender_viewport_display_roundtrips_beside_the_principled_values() -> Result<()> {
+        let Some(blender) = optional_blender() else {
+            return Ok(());
+        };
+        let directory = tempfile::tempdir().map_err(|error| PotError::io(&error))?;
+        let project = Project::init(directory.path().join("project"))?;
+        let script_path = directory.path().join("make_viewport_fixture.py");
+        let blend_path = directory.path().join("viewport-fixture.blend");
+        fs::write(
+            &script_path,
+            r#"
+import bpy, sys
+path = sys.argv[sys.argv.index("--") + 1]
+material = bpy.data.materials.new("Viewport")
+material.use_nodes = True
+principled = next(node for node in material.node_tree.nodes if node.type == "BSDF_PRINCIPLED")
+principled.inputs["Base Color"].default_value = (0.25, 0.5, 0.75, 1.0)
+principled.inputs["Metallic"].default_value = 0.125
+principled.inputs["Roughness"].default_value = 0.75
+material.diffuse_color = (0.875, 0.125, 0.25, 1.0)
+material.metallic = 0.5
+material.roughness = 0.25
+bpy.ops.mesh.primitive_plane_add()
+bpy.context.object.data.materials.append(material)
+bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
+"#,
+        )
+        .map_err(|error| PotError::io(&error))?;
+        let generated = Command::new(&blender)
+            .arg("--background")
+            .arg("--factory-startup")
+            .arg("--disable-depsgraph-on-file-load")
+            .arg("--disable-autoexec")
+            .arg("--python-exit-code")
+            .arg("3")
+            .arg("--python")
+            .arg(&script_path)
+            .arg("--")
+            .arg(&blend_path)
+            .output()
+            .map_err(|error| PotError::io(&error))?;
+        if !generated.status.success() {
+            return Err(PotError::with_details(
+                ErrorCode::ImportFailed,
+                "Blender viewport fixture creation failed",
+                child_details(&generated),
+            ));
+        }
+        let find = |doc: &SceneDoc| -> Result<Material> {
+            doc.materials
+                .values()
+                .find(|material| material.name == "Viewport")
+                .cloned()
+                .ok_or_else(|| invalid_intermediate("viewport fixture material was not imported"))
+        };
+        let imported = import_blend(&blend_path, Some(&blender))?;
+        assert!(
+            imported.losses.is_empty(),
+            "viewport fixture import reported losses: {:?}",
+            imported.losses
+        );
+        let first = find(&imported.doc)?;
+        let viewport = first
+            .viewport_display
+            .as_ref()
+            .ok_or_else(|| invalid_intermediate("viewport display was not imported"))?;
+        assert_eq!(first.base_color, [0.25, 0.5, 0.75, 1.0]);
+        assert_eq!(first.metallic, 0.125);
+        assert_eq!(first.roughness, 0.75);
+        assert_eq!(viewport.diffuse_color, [0.875, 0.125, 0.25, 1.0]);
+        assert_eq!(viewport.metallic, 0.5);
+        assert_eq!(viewport.roughness, 0.25);
+        let output = directory.path().join("viewport-roundtrip.blend");
+        let context = export_context();
+        export_blend(
+            &imported.doc,
+            &project,
+            &output,
+            &ExportOptions {
+                allow_lossy: false,
+                pack: false,
+                blender: Some(&blender),
+                context: &context,
+            },
+        )?;
+        let reimported = import_blend(&output, Some(&blender))?;
+        assert!(
+            reimported.losses.is_empty(),
+            "viewport round-trip reported losses: {:?}",
+            reimported.losses
+        );
+        let again = find(&reimported.doc)?;
+        let viewport = again
+            .viewport_display
+            .as_ref()
+            .ok_or_else(|| invalid_intermediate("viewport display did not survive export"))?;
+        assert_eq!(again.base_color, [0.25, 0.5, 0.75, 1.0]);
+        assert_eq!(again.metallic, 0.125);
+        assert_eq!(again.roughness, 0.75);
+        assert_eq!(viewport.diffuse_color, [0.875, 0.125, 0.25, 1.0]);
+        assert_eq!(viewport.metallic, 0.5);
+        assert_eq!(viewport.roughness, 0.25);
         Ok(())
     }
 

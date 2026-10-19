@@ -6732,10 +6732,13 @@ def export_doc(doc, target, pack, scene_hash, context):
         if material_id in material_map:
             continue
         mat = bpy.data.materials.new(item["name"])
-        mat.diffuse_color = item["base_color"]
+        viewport = item.get("viewport_display")
+        mat.diffuse_color = viewport["diffuse_color"] if viewport else item["base_color"]
         mat.use_nodes = True
         set_id(mat.node_tree, item.get("node_tree"))
         _set_principled_values(mat, item)
+        mat.roughness = viewport["roughness"] if viewport else item["roughness"]
+        mat.metallic = viewport["metallic"] if viewport else item["metallic"]
         mat.use_backface_culling = not bool(item.get("double_sided", True))
         mat.displacement_method = "DISPLACEMENT" if item.get("displacement_method") == "displacement" else "BUMP"
         set_id(mat, material_id)
