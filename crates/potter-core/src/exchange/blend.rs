@@ -3193,7 +3193,11 @@ fn imported_image_tiles(
             continue;
         }
         let label = tile_label(item, number);
-        let Some((hash, bytes)) = tile_source(name, number, resource_ids, resource_assets, doc)?
+        let Some((hash, bytes)) = resource_source(
+            resource_ids.get(&blend_tile_key(name, number)),
+            resource_assets,
+            doc,
+        )?
         else {
             tiles.push(ImageTile {
                 number,
@@ -3224,21 +3228,6 @@ fn tile_label(item: &Value, number: u32) -> String {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned()
-}
-
-/// The content hash and bytes of one imported UDIM tile (see `resource_source`).
-fn tile_source<'a>(
-    name: &str,
-    number: u32,
-    resource_ids: &BTreeMap<String, String>,
-    resource_assets: &'a [(String, Vec<u8>)],
-    doc: &'a SceneDoc,
-) -> Result<Option<(&'a str, &'a [u8])>> {
-    resource_source(
-        resource_ids.get(&blend_tile_key(name, number)),
-        resource_assets,
-        doc,
-    )
 }
 
 /// The tile numbers a TILED Blender image lists, in Blender's order.
