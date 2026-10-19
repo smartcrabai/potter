@@ -401,7 +401,7 @@ mod single_bounce_tests {
 
     /// Mean over the central 8×8 pixel patch of the orthographic probe (16 pixels across 0.2 units).
     /// The camera views the plane at `VIEW_THETA`, so the image's vertical axis maps to receiver x
-    /// with a factor cos(VIEW_THETA): one pixel is `pixel / cos` in x and `pixel` in y. A glossy
+    /// with a factor `cos(VIEW_THETA)`: one pixel is `pixel / cos` in x and `pixel` in y. A glossy
     /// highlight depends on the receiver position, so the patch is averaged, as Blender's pixel is.
     /// The probe is symmetric under y -> -y, so rows j and 7-j contribute equally.
     fn probe_pixel(params: &BsdfParams) -> DVec3 {
