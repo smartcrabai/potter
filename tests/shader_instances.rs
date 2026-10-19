@@ -461,21 +461,13 @@ fn material_volume_output_evaluates_volume_properties() {
     link(&mut graph, "volume", "Volume", "out", "Volume");
     let (material, groups) = material_with_graph(graph);
     let params = evaluate_surface(&material, &HitContext::new(&groups)).unwrap();
-    assert_eq!(params.volume_density, 0.7);
-    assert!(
-        params
-            .volume_scatter
-            .iter()
-            .zip([0.2, 0.4, 0.6])
-            .all(|(actual, expected)| (actual - expected).abs() < 1e-12)
-    );
-    assert!(
-        params
-            .volume_absorption
-            .iter()
-            .zip([0.8, 0.6, 0.4])
-            .all(|(actual, expected)| (actual - expected).abs() < 1e-12)
-    );
+    // Principled Volume at Density 0.7: σs = Color · 0.7 and σa = (1 - Color) · 0.7, absolute.
+    for (actual, expected) in params.volume_scatter.iter().zip([0.14, 0.28, 0.42]) {
+        assert!((actual - expected).abs() < 1e-12);
+    }
+    for (actual, expected) in params.volume_absorption.iter().zip([0.56, 0.42, 0.28]) {
+        assert!((actual - expected).abs() < 1e-12);
+    }
     assert_eq!(params.volume_anisotropy, 0.35);
 }
 #[test]

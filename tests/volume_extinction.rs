@@ -1,8 +1,9 @@
 //! Cycles' volume closures (`intern/cycles/kernel/svm/closure.h`): Volume Absorption has extinction
 //! `(1 - Color) · Density`, Principled Volume has scatter `Color · Density` and absorption
 //! `(1 - Color) · (1 - sqrt(Absorption Color)) · Density`, and Volume Scatter has extinction and scatter
-//! `Color · Density` with albedo 1. The oracle is `tests/fixtures/volume_extinction`, rendered by Blender
-//! 5.2.2 with `generate_volume_extinction_oracle.py`.
+//! `Color · Density` with albedo 1. Add Shader sums each closure's extinction and Mix Shader weights it.
+//! The oracle is `tests/fixtures/volume_extinction`, rendered by Blender 5.2.2 with
+//! `generate_volume_extinction_oracle.py`.
 
 use std::{error::Error, fs, io::Cursor, path::Path, process::Output};
 
@@ -11,6 +12,8 @@ use serde_json::{Value, json};
 use tempfile::tempdir;
 
 const SIZE: u32 = 24;
+const GRAPH: &str = "volume_graph";
+const ABSORPTION: &str = "ShaderNodeVolumeAbsorption";
 
 fn pot() -> Command {
     Command::new(env!("CARGO_BIN_EXE_pot"))
@@ -66,6 +69,28 @@ fn srgb_to_linear(encoded: f64) -> f64 {
     }
 }
 
+/// A shader-graph node operation in `GRAPH`.
+fn node(id: &str, node_type: &str, inputs: Value) -> Value {
+    json!({"op":"graph.node_add","graph":GRAPH,"id":id,"type":node_type,"inputs":inputs})
+}
+
+/// A shader-graph link operation in `GRAPH`.
+fn link(from: &str, from_socket: &str, to: &str, to_socket: &str) -> Value {
+    json!({"op":"graph.link","graph":GRAPH,"from_node":from,"from_socket":from_socket,"to_node":to,"to_socket":to_socket})
+}
+
+/// The graph's operations: its Output Material plus `nodes` and `links`. The caller links the final
+/// closure to the output's Volume socket.
+fn graph_operations(nodes: Vec<Value>, links: Vec<Value>) -> Vec<Value> {
+    let mut operations = vec![
+        json!({"op":"graph.create","id":GRAPH,"kind":"shader"}),
+        json!({"op":"graph.node_add","graph":GRAPH,"id":"output","type":"ShaderNodeOutputMaterial"}),
+    ];
+    operations.extend(nodes);
+    operations.extend(links);
+    operations
+}
+
 /// Renders the centre pixel of the scene in linear RGB.
 fn render_center_pixel(scene: &Path, output_directory: &Path) -> Result<[f64; 3], Box<dyn Error>> {
     let output = pot()
@@ -92,27 +117,30 @@ fn render_center_pixel(scene: &Path, output_directory: &Path) -> Result<[f64; 3]
     Ok([0_usize, 1, 2].map(|channel| srgb_to_linear(f64::from(pixels[offset + channel]) / 255.0)))
 }
 
-/// Renders one unit slab with a volume-only material in front of a white world of strength 1.
-/// `volume_node` is the `graph.node_add` operation of the volume shader; its id and graph are set here.
-fn render_slab(mut volume_node: Value) -> Result<[f64; 3], Box<dyn Error>> {
+/// Renders one unit slab with a volume-only material in front of a white world of strength 1. The
+/// graph is `nodes` and `links`; the caller links the final closure to the output's Volume socket.
+fn render_slab(nodes: Vec<Value>, links: Vec<Value>) -> Result<[f64; 3], Box<dyn Error>> {
     let directory = tempdir()?;
     let scene = directory.path().join("scene");
-    volume_node["id"] = json!("volume");
-    volume_node["graph"] = json!("volume_graph");
-    let operations = vec![
-        json!({"op":"graph.create","id":"volume_graph","kind":"shader"}),
-        json!({"op":"graph.node_add","graph":"volume_graph","id":"output","type":"ShaderNodeOutputMaterial"}),
-        volume_node,
-        json!({"op":"graph.link","graph":"volume_graph","from_node":"volume","from_socket":"Volume","to_node":"output","to_socket":"Volume"}),
-        json!({"op":"material.create","id":"slab","graph":"volume_graph"}),
+    let mut operations = graph_operations(nodes, links);
+    operations.extend([
+        json!({"op":"material.create","id":"slab","graph":GRAPH}),
         json!({"op":"node.create","id":"slab_cube","kind":"box","params":{"size":1.0},"material":"slab"}),
         json!({"op":"world.create","id":"world_main","color":[1.0,1.0,1.0],"strength":1.0}),
         json!({"op":"camera.create","id":"camera_main","transform":{"translation":[0.0,0.0,3.0]},"projection":"orthographic","ortho_scale":2.0}),
         json!({"op":"scene.update","target":{"id":"scene_main"},"set":{"camera":"camera_main","world":"world_main"}}),
         json!({"op":"render.update","target":{"id":"scene_main"},"set":{"resolution_x":SIZE,"resolution_y":SIZE,"samples":1,"seed":0,"max_bounces":2}}),
-    ];
+    ]);
     make_scene(&scene, &operations)?;
     render_center_pixel(&scene, &directory.path().join("render"))
+}
+
+/// Renders the slab with one volume node of `node_type` and `inputs` feeding the output.
+fn render_single_volume(node_type: &str, inputs: Value) -> Result<[f64; 3], Box<dyn Error>> {
+    render_slab(
+        vec![node("volume", node_type, inputs)],
+        vec![link("volume", "Volume", "output", "Volume")],
+    )
 }
 
 /// The Blender oracle's mean and standard error of one case, per channel.
@@ -164,27 +192,32 @@ fn assert_matches(
 
 #[test]
 fn volume_absorption_transmits_exp_of_one_minus_colour_per_channel() -> Result<(), Box<dyn Error>> {
-    let measured = render_slab(json!({
-        "op": "graph.node_add",
-        "type": "ShaderNodeVolumeAbsorption",
-        "inputs": {"Color": [0.2, 0.5, 0.8, 1.0], "Density": 1.0},
-    }))?;
+    let measured = render_single_volume(
+        ABSORPTION,
+        json!({"Color": [0.2, 0.5, 0.8, 1.0], "Density": 1.0}),
+    )?;
     let analytic = [0.2, 0.5, 0.8].map(|color: f64| (-(1.0 - color)).exp());
     assert_matches("volume_absorption", measured, analytic)
 }
 
 #[test]
+fn volume_absorption_with_colour_unset_uses_blenders_default_0_8() -> Result<(), Box<dyn Error>> {
+    // Blender's Volume Absorption Color defaults to 0.8, so the absorption is 0.2 in every channel.
+    let measured = render_single_volume(ABSORPTION, json!({"Density": 1.0}))?;
+    assert_matches("volume_absorption_default", measured, [(-0.2_f64).exp(); 3])
+}
+
+#[test]
 fn principled_absorption_colour_transmits_exp_of_one_minus_sqrt_per_channel()
 -> Result<(), Box<dyn Error>> {
-    let measured = render_slab(json!({
-        "op": "graph.node_add",
-        "type": "ShaderNodeVolumePrincipled",
-        "inputs": {
+    let measured = render_single_volume(
+        "ShaderNodeVolumePrincipled",
+        json!({
             "Color": [0.0, 0.0, 0.0, 1.0],
             "Absorption Color": [0.36, 0.25, 0.04, 1.0],
             "Density": 1.0,
-        },
-    }))?;
+        }),
+    )?;
     let analytic = [0.36, 0.25, 0.04].map(|absorption: f64| (-(1.0 - absorption.sqrt())).exp());
     assert_matches("principled_absorption", measured, analytic)
 }
@@ -193,10 +226,123 @@ fn principled_absorption_colour_transmits_exp_of_one_minus_sqrt_per_channel()
 fn volume_scatter_conserves_a_white_environment() -> Result<(), Box<dyn Error>> {
     // Albedo 1 in a uniform white world: every path ends in the environment, so the radiance is 1.
     // The former grey model (extinction Density, albedo Color) gave 0.68 for Color 0.5.
-    let measured = render_slab(json!({
-        "op": "graph.node_add",
-        "type": "ShaderNodeVolumeScatter",
-        "inputs": {"Color": [0.2, 0.5, 0.8, 1.0], "Density": 1.0},
-    }))?;
+    let measured = render_single_volume(
+        "ShaderNodeVolumeScatter",
+        json!({"Color": [0.2, 0.5, 0.8, 1.0], "Density": 1.0}),
+    )?;
     assert_matches("volume_scatter_white", measured, [1.0; 3])
+}
+
+#[test]
+fn add_shader_sums_each_closures_own_absorption() -> Result<(), Box<dyn Error>> {
+    // σa = (0.8, 0.5, 0.2) + (0.25, 0.25, 0.25) per channel: each closure keeps its own density.
+    let measured = render_slab(
+        vec![
+            node(
+                "first",
+                ABSORPTION,
+                json!({"Color": [0.2, 0.5, 0.8, 1.0], "Density": 1.0}),
+            ),
+            node(
+                "second",
+                ABSORPTION,
+                json!({"Color": [0.5, 0.5, 0.5, 1.0], "Density": 0.5}),
+            ),
+            node("add", "ShaderNodeAddShader", json!({})),
+        ],
+        vec![
+            link("first", "Volume", "add", "Shader"),
+            link("second", "Volume", "add", "Shader_001"),
+            link("add", "Shader", "output", "Volume"),
+        ],
+    )?;
+    let analytic = [1.05, 0.75, 0.45].map(|extinction: f64| (-extinction).exp());
+    assert_matches("add_absorption", measured, analytic)
+}
+
+#[test]
+fn mix_shader_weights_each_closures_own_absorption() -> Result<(), Box<dyn Error>> {
+    // Fac 0.25 on the second closure: σa = 0.75 · (0.8, 0.5, 0.2) + 0.25 · (0.25, 0.25, 0.25).
+    let measured = render_slab(
+        vec![
+            node(
+                "first",
+                ABSORPTION,
+                json!({"Color": [0.2, 0.5, 0.8, 1.0], "Density": 1.0}),
+            ),
+            node(
+                "second",
+                ABSORPTION,
+                json!({"Color": [0.5, 0.5, 0.5, 1.0], "Density": 0.5}),
+            ),
+            node("mix", "ShaderNodeMixShader", json!({"Fac": 0.25})),
+        ],
+        vec![
+            link("first", "Volume", "mix", "Shader"),
+            link("second", "Volume", "mix", "Shader_001"),
+            link("mix", "Shader", "output", "Volume"),
+        ],
+    )?;
+    let analytic = [0.6625, 0.4375, 0.2125].map(|extinction: f64| (-extinction).exp());
+    assert_matches("mix_absorption", measured, analytic)
+}
+
+/// Renders a voxel volume (a 2 × 2 × 2 grid of unit density) whose material has a Volume Absorption with
+/// `absorption_inputs`, and returns the render's `shader.volume.spectral_extinction` warnings.
+fn voxel_spectral_warnings(absorption_inputs: Value) -> Result<Vec<Value>, Box<dyn Error>> {
+    let directory = tempdir()?;
+    let scene = directory.path().join("scene");
+    let mut operations = graph_operations(
+        vec![node("volume", ABSORPTION, absorption_inputs)],
+        vec![link("volume", "Volume", "output", "Volume")],
+    );
+    operations.extend([
+        json!({"op":"material.create","id":"fog","graph":GRAPH}),
+        json!({"op":"volume.create","id":"fog_volume","materials":["fog"],"grids":[{"dims":[2,2,2],"voxel_size":1.0,"origin":[-0.5,-0.5,-0.5],"values":vec![1.0; 8]}]}),
+        json!({"op":"world.create","id":"world_main","color":[1.0,1.0,1.0],"strength":1.0}),
+        json!({"op":"camera.create","id":"camera_main","transform":{"translation":[0.0,0.0,3.0]},"projection":"orthographic","ortho_scale":2.0}),
+        json!({"op":"scene.update","target":{"id":"scene_main"},"set":{"camera":"camera_main","world":"world_main"}}),
+        json!({"op":"render.update","target":{"id":"scene_main"},"set":{"resolution_x":8,"resolution_y":8,"samples":1,"seed":0,"max_bounces":2}}),
+    ]);
+    make_scene(&scene, &operations)?;
+    let output = pot()
+        .arg("render")
+        .arg(&scene)
+        .args(["--engine", "path", "--format", "png", "--out"])
+        .arg(directory.path().join("render"))
+        .arg("--json")
+        .output()?;
+    let result = assert_cli_success(&output)?;
+    let warnings = result["result"]["warnings"]
+        .as_array()
+        .ok_or("render warnings are missing")?;
+    Ok(warnings
+        .iter()
+        .filter(|warning| warning["feature_id"] == "shader.volume.spectral_extinction")
+        .cloned()
+        .collect())
+}
+
+#[test]
+fn voxel_volume_with_coloured_absorption_reports_spectral_extinction() -> Result<(), Box<dyn Error>>
+{
+    let warnings = voxel_spectral_warnings(json!({"Color": [0.2, 0.5, 0.8, 1.0], "Density": 1.0}))?;
+    assert_eq!(
+        warnings.len(),
+        1,
+        "a coloured voxel absorption must report shader.volume.spectral_extinction once"
+    );
+    Ok(())
+}
+
+#[test]
+fn voxel_volume_with_default_absorption_colour_reports_no_spectral_extinction()
+-> Result<(), Box<dyn Error>> {
+    // The default Color 0.8 is grey, so the channels' extinction is equal and nothing is approximated.
+    let warnings = voxel_spectral_warnings(json!({"Density": 1.0}))?;
+    assert!(
+        warnings.is_empty(),
+        "a grey voxel absorption must not report shader.volume.spectral_extinction: {warnings:?}"
+    );
+    Ok(())
 }

@@ -17068,10 +17068,6 @@ print("UNSUPPORTED_POSE " + json.dumps({
         let source_params = crate::shader::evaluate_surface(source, &source_hit)?;
         let reopened_params = crate::shader::evaluate_surface(reopened, &reopened_hit)?;
         assert!(close(
-            reopened_params.volume_density,
-            source_params.volume_density
-        ));
-        assert!(close(
             reopened_params.volume_anisotropy,
             source_params.volume_anisotropy
         ));
