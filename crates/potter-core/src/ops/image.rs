@@ -215,6 +215,7 @@ fn load(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bool>
         ));
     }
     let source_hash = hash::sha256(&bytes);
+    let alpha_mode = crate::image::storage::default_alpha_mode(&bytes);
     let (image_source, blob, image_source_path, registered_hash) = if asset_policy == "copy" {
         let blob = stage_blob(engine, bytes);
         (ImageSource::Packed, Some(blob), None, Some(source_hash))
@@ -249,7 +250,7 @@ fn load(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bool>
             blob,
             source_path: image_source_path,
             source_hash: registered_hash,
-            alpha_mode: ImageAlphaMode::Straight,
+            alpha_mode,
         },
     );
     engine.mark("images", &id, ChangeKind::Created);
@@ -313,6 +314,8 @@ fn set_pixels(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result
                 width,
                 height,
                 pixels: vec![[0.0; 4]; pixel_count],
+                precision: crate::image::Precision::Float,
+                colour: crate::image::ColourCache::default(),
             },
         );
         (width, height)

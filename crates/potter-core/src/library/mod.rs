@@ -71,7 +71,7 @@ pub(crate) fn load_project(uri: &str) -> Result<(PathBuf, SceneDoc, String, Vec<
         ));
     }
     let bytes = fs::read(&scene_path).map_err(|error| PotError::io(&error))?;
-    let parsed = crate::model::parse_scene(&bytes)?;
+    let parsed = crate::model::parse_scene(&bytes, &project)?;
     parsed.doc.validate()?;
     Ok((project, parsed.doc, hash::sha256(&bytes), parsed.warnings))
 }

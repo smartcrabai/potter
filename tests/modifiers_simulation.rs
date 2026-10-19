@@ -2418,11 +2418,14 @@ baseline_evaluated.to_mesh_clear()
         })
         .collect::<Vec<_>>();
     let image = potter_core::image::ImageData {
+        colour: potter_core::image::ColourCache::default(),
+        storage: potter_core::image::ImageStorage::default(),
         width: 4,
         height: 3,
         pixels,
         tiles: std::collections::BTreeMap::new(),
         interpolation: potter_core::image::ImageInterpolation::Linear,
+        srgb: false,
     };
     let mapping_columns: [f64; 16] =
         serde_json::from_value(blender_expected["mapping_world"].clone())?;

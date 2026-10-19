@@ -200,11 +200,21 @@ pub fn run(args: &ExportArgs) -> Result<(Option<SceneInfo>, Value)> {
             "bvh" => vec![(args.out.clone(), exchange::bvh::export(&doc, &snapshot)?)],
             "fbx-binary" => vec![(
                 args.out.clone(),
-                exchange::fbx_binary::export_allow_lossy(&doc, &snapshot, options.allow_lossy)?,
+                exchange::fbx_binary::export_allow_lossy(
+                    &doc,
+                    &snapshot,
+                    options.allow_lossy,
+                    project.path(),
+                )?,
             )],
             "fbx" => vec![(
                 args.out.clone(),
-                exchange::fbx::export_allow_lossy(&doc, &snapshot, options.allow_lossy)?,
+                exchange::fbx::export_with_root_allow_lossy(
+                    &doc,
+                    &snapshot,
+                    project.path(),
+                    options.allow_lossy,
+                )?,
             )],
             "svg" => vec![(
                 args.out.clone(),
