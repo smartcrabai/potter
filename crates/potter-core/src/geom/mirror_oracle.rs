@@ -441,6 +441,7 @@ fn mirror_codes_survive_reload_through_bisect_and_deformation() -> TestResult {
         &BTreeMap::new(),
         crate::eval::ModifierEvaluationContext::default(),
         |_, modifier| modifier.enabled,
+        None,
         |_, _, _| Ok(None),
     )?
     .mesh;

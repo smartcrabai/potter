@@ -38,10 +38,32 @@ fn bspline_basis(t: f64) -> [f64; 4] {
     ]
 }
 
+/// Derivative of the cubic B-spline basis with respect to its parameter.
+fn bspline_basis_derivative(t: f64) -> [f64; 4] {
+    let t2 = t * t;
+    [
+        (-3.0 + 6.0 * t - 3.0 * t2) / 6.0,
+        (-12.0 * t + 9.0 * t2) / 6.0,
+        (3.0 + 6.0 * t - 9.0 * t2) / 6.0,
+        0.5 * t2,
+    ]
+}
+
 /// Cubic Bezier basis (`OpenSubdiv` `evalBezierCurve`).
 fn bezier_basis(t: f64) -> [f64; 4] {
     let it = 1.0 - t;
     [it * it * it, 3.0 * t * it * it, 3.0 * t * t * it, t * t * t]
+}
+
+/// Derivative of the cubic Bezier basis with respect to its parameter.
+fn bezier_basis_derivative(t: f64) -> [f64; 4] {
+    let it = 1.0 - t;
+    [
+        -3.0 * it * it,
+        3.0 * it * it - 6.0 * t * it,
+        6.0 * t * it - 3.0 * t * t,
+        3.0 * t * t,
+    ]
 }
 
 /// Control-point indices of the 4x4 B-spline grid touched by each corner's ring
@@ -121,42 +143,81 @@ pub(super) fn bspline_weights(s: f64, t: f64, mask: u8) -> [f64; 16] {
             w[4 * row + col] = bs[col] * bt[row];
         }
     }
+    apply_boundary_mask(&mut w, mask);
+    w
+}
+
+/// Folds each singular boundary edge's weights onto its neighbours (`OpenSubdiv`
+/// `adjustBSplineBoundaryWeights`). Bit `i` of `mask` marks the edge from corner `i` to `i + 1`.
+fn apply_boundary_mask(weights: &mut [f64; 16], mask: u8) {
     if mask & 1 != 0 {
         for i in 0..4 {
-            w[i + 8] -= w[i];
-            w[i + 4] += 2.0 * w[i];
-            w[i] = 0.0;
+            weights[i + 8] -= weights[i];
+            weights[i + 4] += 2.0 * weights[i];
+            weights[i] = 0.0;
         }
     }
     if mask & 2 != 0 {
         for i in [0, 4, 8, 12] {
-            w[i + 1] -= w[i + 3];
-            w[i + 2] += 2.0 * w[i + 3];
-            w[i + 3] = 0.0;
+            weights[i + 1] -= weights[i + 3];
+            weights[i + 2] += 2.0 * weights[i + 3];
+            weights[i + 3] = 0.0;
         }
     }
     if mask & 4 != 0 {
         for i in 0..4 {
-            w[i + 4] -= w[i + 12];
-            w[i + 8] += 2.0 * w[i + 12];
-            w[i + 12] = 0.0;
+            weights[i + 4] -= weights[i + 12];
+            weights[i + 8] += 2.0 * weights[i + 12];
+            weights[i + 12] = 0.0;
         }
     }
     if mask & 8 != 0 {
         for i in [0, 4, 8, 12] {
-            w[i + 2] -= w[i];
-            w[i + 1] += 2.0 * w[i];
-            w[i] = 0.0;
+            weights[i + 2] -= weights[i];
+            weights[i + 1] += 2.0 * weights[i];
+            weights[i] = 0.0;
         }
     }
-    w
 }
 
-/// Gregory basis of the 20 control points of a quad with an irregular corner (`OpenSubdiv`
-/// `EvalBasisGregory`).
-pub(super) fn gregory_weights(s: f64, t: f64) -> [f64; 20] {
-    let bs = bezier_basis(s);
-    let bt = bezier_basis(t);
+/// B-spline weights and their derivatives with respect to the patch's local `s` and `t`.
+pub(super) fn bspline_weights_and_derivatives(
+    s: f64,
+    t: f64,
+    mask: u8,
+) -> ([f64; 16], [f64; 16], [f64; 16]) {
+    let bs = bspline_basis(s);
+    let bt = bspline_basis(t);
+    let ds = bspline_basis_derivative(s);
+    let dt = bspline_basis_derivative(t);
+    let mut w = [0.0; 16];
+    let mut ws = [0.0; 16];
+    let mut wt = [0.0; 16];
+    for row in 0..4 {
+        for col in 0..4 {
+            let i = 4 * row + col;
+            w[i] = bs[col] * bt[row];
+            ws[i] = ds[col] * bt[row];
+            wt[i] = bs[col] * dt[row];
+        }
+    }
+    for weights in [&mut w, &mut ws, &mut wt] {
+        apply_boundary_mask(weights, mask);
+    }
+    (w, ws, wt)
+}
+
+/// Boundary Gregory slots: control-point index and the B-spline basis indices along `s` and `t`.
+const GREGORY_BOUNDARY_INDEX: [usize; 12] = [0, 1, 7, 5, 2, 6, 16, 12, 15, 17, 11, 10];
+const GREGORY_BOUNDARY_S: [usize; 12] = [0, 1, 2, 3, 0, 3, 0, 3, 0, 1, 2, 3];
+const GREGORY_BOUNDARY_T: [usize; 12] = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 3, 3];
+/// Interior Gregory slots, indexed the same way as the boundary slots.
+const GREGORY_INTERIOR_INDEX: [usize; 8] = [3, 4, 8, 9, 13, 14, 18, 19];
+const GREGORY_INTERIOR_S: [usize; 8] = [1, 1, 2, 2, 2, 2, 1, 1];
+const GREGORY_INTERIOR_T: [usize; 8] = [1, 1, 1, 1, 2, 2, 2, 2];
+
+/// Rational blend factors of the eight interior Gregory points at `(s, t)`.
+fn gregory_blend(s: f64, t: f64) -> [f64; 8] {
     let (sc, tc) = (1.0 - s, 1.0 - t);
     let guard = |sum: f64| if sum > 0.0 { 1.0 / sum } else { 1.0 };
     let df0 = guard(s + t);
@@ -167,21 +228,51 @@ pub(super) fn gregory_weights(s: f64, t: f64) -> [f64; 20] {
     let g2 = t * df1;
     let g4 = sc * df2;
     let g6 = tc * df3;
-    let g = [g0, 1.0 - g0, g2, 1.0 - g2, g4, 1.0 - g4, g6, 1.0 - g6];
-    let boundary_index = [0, 1, 7, 5, 2, 6, 16, 12, 15, 17, 11, 10];
-    let boundary_s = [0, 1, 2, 3, 0, 3, 0, 3, 0, 1, 2, 3];
-    let boundary_t = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 3, 3];
-    let interior_index = [3, 4, 8, 9, 13, 14, 18, 19];
-    let interior_s = [1, 1, 2, 2, 2, 2, 1, 1];
-    let interior_t = [1, 1, 1, 1, 2, 2, 2, 2];
+    [g0, 1.0 - g0, g2, 1.0 - g2, g4, 1.0 - g4, g6, 1.0 - g6]
+}
+
+/// Gregory basis of the 20 control points of a quad with an irregular corner (`OpenSubdiv`
+/// `EvalBasisGregory`).
+pub(super) fn gregory_weights(s: f64, t: f64) -> [f64; 20] {
+    let bs = bezier_basis(s);
+    let bt = bezier_basis(t);
+    let g = gregory_blend(s, t);
     let mut w = [0.0; 20];
     for i in 0..12 {
-        w[boundary_index[i]] = bs[boundary_s[i]] * bt[boundary_t[i]];
+        w[GREGORY_BOUNDARY_INDEX[i]] = bs[GREGORY_BOUNDARY_S[i]] * bt[GREGORY_BOUNDARY_T[i]];
     }
     for i in 0..8 {
-        w[interior_index[i]] = bs[interior_s[i]] * bt[interior_t[i]] * g[i];
+        w[GREGORY_INTERIOR_INDEX[i]] = bs[GREGORY_INTERIOR_S[i]] * bt[GREGORY_INTERIOR_T[i]] * g[i];
     }
     w
+}
+
+/// `OpenSubdiv`'s default Gregory derivative approximation: differentiate the Bezier basis while
+/// holding the rational interior-point blend factors fixed.
+pub(super) fn gregory_weights_and_derivatives(s: f64, t: f64) -> ([f64; 20], [f64; 20], [f64; 20]) {
+    let bs = bezier_basis(s);
+    let bt = bezier_basis(t);
+    let ds = bezier_basis_derivative(s);
+    let dt = bezier_basis_derivative(t);
+    let g = gregory_blend(s, t);
+    let mut w = [0.0; 20];
+    let mut ws = [0.0; 20];
+    let mut wt = [0.0; 20];
+    for i in 0..12 {
+        let dst = GREGORY_BOUNDARY_INDEX[i];
+        let (s_index, t_index) = (GREGORY_BOUNDARY_S[i], GREGORY_BOUNDARY_T[i]);
+        w[dst] = bs[s_index] * bt[t_index];
+        ws[dst] = ds[s_index] * bt[t_index];
+        wt[dst] = bs[s_index] * dt[t_index];
+    }
+    for i in 0..8 {
+        let dst = GREGORY_INTERIOR_INDEX[i];
+        let (s_index, t_index) = (GREGORY_INTERIOR_S[i], GREGORY_INTERIOR_T[i]);
+        w[dst] = bs[s_index] * bt[t_index] * g[i];
+        ws[dst] = ds[s_index] * bt[t_index] * g[i];
+        wt[dst] = bs[s_index] * dt[t_index] * g[i];
+    }
+    (w, ws, wt)
 }
 
 /// Catmull-Clark tangent coefficient for valence `n` (`OpenSubdiv` `CatmarkLimits::computeCoefficient`).
@@ -335,6 +426,34 @@ impl Patch {
                 weighted_rows(grid, &bspline_weights(s, t, *mask), positions)
             }
             Patch::Gregory(rows) => weighted_rows(rows, &gregory_weights(s, t), positions),
+        }
+    }
+
+    /// The limit point and its local derivatives, with the Gregory approximation used by
+    /// `OpenSubdiv`.
+    pub(super) fn evaluate_and_derivatives<T: Point>(
+        &self,
+        positions: &[T],
+        s: f64,
+        t: f64,
+    ) -> (T, T, T) {
+        match self {
+            Patch::BSpline { grid, mask } => {
+                let (weights, ds, dt) = bspline_weights_and_derivatives(s, t, *mask);
+                (
+                    weighted_rows(grid, &weights, positions),
+                    weighted_rows(grid, &ds, positions),
+                    weighted_rows(grid, &dt, positions),
+                )
+            }
+            Patch::Gregory(rows) => {
+                let (weights, ds, dt) = gregory_weights_and_derivatives(s, t);
+                (
+                    weighted_rows(rows, &weights, positions),
+                    weighted_rows(rows, &ds, positions),
+                    weighted_rows(rows, &dt, positions),
+                )
+            }
         }
     }
 }

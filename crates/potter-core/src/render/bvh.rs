@@ -625,7 +625,15 @@ mod tests {
             let bvh = Bvh::build(&triangles);
             prop_assert!(bvh.is_ok(), "BVH build failed: {bvh:?}");
             let Ok(bvh) = bvh else { return Ok(()); };
-            let actual = bvh.closest_hit_mode(&triangles, origin, ray_direction, t_min, t_max, false);
+            let actual = bvh.closest_hit_mode(
+                &triangles,
+                origin,
+                ray_direction,
+                t_min,
+                t_max,
+                false,
+                &|_| true,
+            );
             let expected = brute_force_hit(&triangles, origin, ray_direction, t_min, t_max, false);
             prop_assert!(expected.is_some(), "constructed ray should hit its target triangle");
             prop_assert_eq!(actual, expected);
