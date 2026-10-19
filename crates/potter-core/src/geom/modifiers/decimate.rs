@@ -2013,7 +2013,17 @@ impl BMesh {
                     if self.faces[self.loops[l].f].len > 3 {
                         let f = self.loops[l].f;
                         let (prev, next) = (self.loops[l].prev, self.loops[l].next);
-                        self.split_face(f, prev, next, true);
+                        // `BM_face_split(.., nullptr, true)` then `BM_elem_flag_merge_into(l_new->e, l->e,
+                        // l->prev->e)` (bmesh_decimate_unsubdivide.cc): the new diagonal's header flags are
+                        // the OR of the two edges at this corner. Its customdata stays the default.
+                        if let Some((_, l_new)) = self.split_face(f, prev, next, true) {
+                            let e_new = self.loops[l_new].e;
+                            let (a, b) = (self.loops[l].e, self.loops[self.loops[l].prev].e);
+                            let seam = self.edges[a].seam || self.edges[b].seam;
+                            let smooth = self.edges[a].smooth || self.edges[b].smooth;
+                            self.edges[e_new].seam = seam;
+                            self.edges[e_new].smooth = smooth;
+                        }
                     }
                 }
                 self.vert_dissolve(v)
