@@ -2835,7 +2835,9 @@ fn falloff_settings(value: Option<&Value>) -> Option<FalloffSettings> {
         });
     };
     let settings = value.as_object()?;
-    let use_clip = settings.get("use_clip").map_or(Some(true), Value::as_bool)?;
+    let use_clip = settings
+        .get("use_clip")
+        .map_or(Some(true), Value::as_bool)?;
     let clip = if let Some(value) = settings.get("clip_bounds") {
         let [min_x, min_y, max_x, max_y] = value.as_array()?.as_slice() else {
             return None;
@@ -2923,8 +2925,8 @@ impl FalloffCurve {
         };
         let points =
             falloff_points(schema_value(modifier, "falloff_curve")?).ok_or_else(invalid_points)?;
-        let settings = falloff_settings(modifier.params.get("falloff_curve_settings"))
-            .ok_or_else(|| {
+        let settings =
+            falloff_settings(modifier.params.get("falloff_curve_settings")).ok_or_else(|| {
                 invalid_parameter(
                     modifier,
                     "falloff_curve_settings",
@@ -2938,9 +2940,31 @@ impl FalloffCurve {
             clip: settings.clip,
             black: [0.0; 3],
             white: [1.0; 3],
-            curves: [CurveMap { points }, unit_curve(), unit_curve(), unit_curve()],
+            curves: [
+                CurveMap { points },
+                unit_curve(),
+                unit_curve(),
+                unit_curve(),
+            ],
         };
-        mapping.validate().map_err(|_| invalid_points())?;
+        // Blender evaluates the control points in their stored order and does not sort them, so `x` need
+        // not increase. The table domain is the clip range widened by the points, and it must be non-empty.
+        let clip_min_x = settings.clip[0] as f32;
+        let clip_max_x = settings.clip[2] as f32;
+        let domain_min = mapping.curves[0]
+            .points
+            .iter()
+            .fold(clip_min_x, |min, point| min.min(point.location[0]));
+        let domain_max = mapping.curves[0]
+            .points
+            .iter()
+            .fold(clip_max_x, |max, point| max.max(point.location[0]));
+        if settings.clip[0] > settings.clip[2]
+            || settings.clip[1] > settings.clip[3]
+            || domain_max - domain_min <= 0.0
+        {
+            return Err(invalid_points());
+        }
         Ok(Self {
             curve: mapping.prepare(),
             clip_y: settings
@@ -2956,7 +2980,10 @@ impl FalloffCurve {
     )]
     pub(super) fn evaluate(&self, value: f64) -> f64 {
         let result = self.curve.evaluate(0, value as f32);
-        f64::from(self.clip_y.map_or(result, |[min_y, max_y]| result.clamp(min_y, max_y)))
+        f64::from(
+            self.clip_y
+                .map_or(result, |[min_y, max_y]| result.clamp(min_y, max_y)),
+        )
     }
 }
 

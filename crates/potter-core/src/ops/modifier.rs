@@ -1820,8 +1820,8 @@ fn valid_curve_mapping_settings(value: &Value) -> bool {
         [min_x, min_y, max_x, max_y]
             .iter()
             .all(|bound| bound.is_finite() && (-100.0..=100.0).contains(bound))
-            && min_x < max_x
-            && min_y < max_y
+            && min_x <= max_x
+            && min_y <= max_y
     });
     settings.get("use_clip").is_none_or(Value::is_boolean)
         && clip_bounds_valid
@@ -1832,7 +1832,6 @@ fn valid_curve_mapping_settings(value: &Value) -> bool {
 
 fn valid_curve_mapping_points(value: &Value) -> bool {
     value.as_array().is_some_and(|points| {
-        let mut previous_x = f32::NEG_INFINITY;
         points.len() >= 2
             && points.iter().all(|point| {
                 let Some(coordinates) = point.as_array() else {
@@ -1847,17 +1846,9 @@ fn valid_curve_mapping_points(value: &Value) -> bool {
                     && coordinates.get(2).is_none_or(|handle| {
                         matches!(handle.as_str(), Some("AUTO" | "AUTO_CLAMPED" | "VECTOR"))
                     })
-                    && {
-                        // Blender's CurveMapping x values are strictly increasing float32 values.
-                        let x = coordinates[0].as_f64().map_or(f32::NAN, |x| x as f32);
-                        let increasing = x > previous_x;
-                        previous_x = x;
-                        increasing
-                    }
             })
     })
 }
-
 fn validate_modifier_resource(
     engine: &Engine<'_>,
     modifier_type: &str,
