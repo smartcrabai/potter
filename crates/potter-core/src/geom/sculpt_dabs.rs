@@ -24,12 +24,17 @@ use glam::{DVec2, DVec3};
 use super::sculpt::{DabBrush, Falloff, Stroke, StrokeSample};
 use crate::geom::Mesh;
 
+mod boundary;
 mod crease_pinch;
 mod elastic;
 mod grab;
 mod offset;
 mod plane;
+mod pose;
 mod smooth;
+mod topology;
+
+use topology::Topology;
 
 /// Clay Strips `plane_offset` default: the plane sits this many radii above the area center.
 const CLAY_STRIPS_PLANE_OFFSET: f64 = 0.15;
@@ -70,6 +75,12 @@ struct Field {
     /// Whether a Smooth call has already run this stroke (`smooth::smooth_dab` reads the first call
     /// from its start positions).
     smooth_started: bool,
+    /// Blender's vertex rings and boundary flags, in Blender's order, for Pose and Boundary.
+    topology: Topology,
+    /// Pose's inverse-kinematics chain, built by the stroke's first dab.
+    pose: pose::State,
+    /// Boundary's loop and its propagation, found by the stroke's first dab.
+    boundary: boundary::State,
 }
 
 /// One dab's values as Blender's `StrokeCache` holds them, before any symmetry pass.
@@ -132,12 +143,15 @@ pub(super) fn apply_dabs(
             })
             .collect(),
         neighbors: vertex_neighbors(mesh, &index),
+        topology: Topology::new(mesh, &index),
         displacement: vec![0.0; original.len()],
         falloff: stroke.falloff,
         passes,
         view: stroke.view.map(DVec3::normalize),
         grab: grab::State::default(),
         smooth_started: false,
+        pose: pose::State::default(),
+        boundary: boundary::State::default(),
     };
     // Blender's `need_delta_from_anchored_origin` brushes measure every dab from the stroke's
     // first dab, which also becomes the dab center (`brush_delta_update`, sculpt.cc 4277-4312).
@@ -200,6 +214,8 @@ fn apply_dab(field: &mut Field, dab: DabBrush, input: &DabInput) {
             grab::apply(field, dab, input);
         }
         DabBrush::Elastic => elastic::apply(field, dab, input),
+        DabBrush::Pose(deform) => pose::apply(field, deform, input),
+        DabBrush::Boundary(deform) => boundary::apply(field, deform, input),
     }
 }
 
@@ -237,7 +253,11 @@ fn brush_strength(brush: DabBrush, sample: &StrokeSample, feather: f64) -> f64 {
         | DabBrush::Scrape
         | DabBrush::Rotate
         | DabBrush::Thumb => alpha * pressure * feather,
-        DabBrush::Grab | DabBrush::SnakeHook | DabBrush::Elastic => root_alpha * feather,
+        DabBrush::Grab
+        | DabBrush::SnakeHook
+        | DabBrush::Elastic
+        | DabBrush::Pose(_)
+        | DabBrush::Boundary(_) => root_alpha * feather,
     }
 }
 
@@ -255,16 +275,28 @@ fn brush_flip(brush: DabBrush) -> f64 {
 /// Whether the brush's `use_pressure_strength` is on in the Blender 5.2.2 essentials asset. When it
 /// is off, Blender's `brush_strength` sees pressure 1.
 fn uses_pressure_strength(brush: DabBrush) -> bool {
-    !matches!(brush, DabBrush::Grab | DabBrush::Thumb | DabBrush::Elastic)
+    !matches!(
+        brush,
+        DabBrush::Grab
+            | DabBrush::Thumb
+            | DabBrush::Elastic
+            | DabBrush::Pose(_)
+            | DabBrush::Boundary(_)
+    )
 }
 
 /// Brushes whose dabs measure from the stroke's first dab (`need_delta_from_anchored_origin`,
 /// sculpt.cc 4170-4190; Rotate's `cache->location` stays pinned to the first dab, sculpt.cc
-/// 5831-5837). Pose and Boundary, which share the first rule, are not dab brushes here.
+/// 5831-5837). Pose and Boundary share this rule (sculpt.cc 4180-4181).
 fn anchors_to_stroke_start(brush: DabBrush) -> bool {
     matches!(
         brush,
-        DabBrush::Grab | DabBrush::Thumb | DabBrush::Elastic | DabBrush::Rotate
+        DabBrush::Grab
+            | DabBrush::Thumb
+            | DabBrush::Elastic
+            | DabBrush::Rotate
+            | DabBrush::Pose(_)
+            | DabBrush::Boundary(_)
     )
 }
 
@@ -284,6 +316,21 @@ fn grab_on_view_plane(delta: DVec3, view: Option<DVec3>) -> DVec3 {
         Some(view) => delta - view * delta.dot(view),
         None => delta,
     }
+}
+
+/// The vertex nearest `point`, the lowest index winning ties. Blender takes the active vertex from
+/// the ray cast under the cursor, which is this vertex when the stroke starts on the mesh.
+fn nearest_vertex(positions: &[DVec3], point: DVec3) -> usize {
+    let mut best = 0;
+    let mut best_distance = f64::INFINITY;
+    for (index, position) in positions.iter().enumerate() {
+        let distance = position.distance_squared(point);
+        if distance < best_distance {
+            best = index;
+            best_distance = distance;
+        }
+    }
+    best
 }
 
 /// Blender's `symm` bit mask for the stroke's mirror axes: X = 1, Y = 2, Z = 4. `validate_stroke`
