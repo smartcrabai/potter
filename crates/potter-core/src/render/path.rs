@@ -29,7 +29,9 @@ use super::{
 
 const RAY_EPSILON: f64 = 1.0e-5;
 const MAX_VOLUME_STEPS: usize = 2048;
-const MAX_SHADOW_LAYERS: usize = 16;
+/// Cycles' `VOLUME_BOUNDS_MAX` (`intern/cycles/kernel/types.h`): volume-only boundary crossings
+/// have their own counter, and the path ends past this many.
+const VOLUME_BOUNDS_MAX: u32 = 1024;
 
 // Calibrated against the Blender-gated Cycles VDB comparison; surface lighting uses its own energy convention.
 const VOLUME_DIRECT_LIGHT_SCALE: f64 = 0.75;
@@ -781,10 +783,14 @@ fn trace_path(
     let mut previous = Scatter::Unsampled;
     let mut bounce = 0u32;
     let mut transparent_bounce = 0u32;
+    // Cycles' `transparent_max_bounce` is at least one: the first pass-through is always taken
+    // (`intern/cycles/kernel/integrator/path_state.h`, the FIXME at `path_state_next`).
+    let transparent_cap = transparent_max_bounces.max(1);
+    let mut volume_bounds = 0u32;
+    // Set by the pass that reaches the cap: the next surface is shaded for emission and ends the
+    // path (`PATH_RAY_TERMINATE_ON_NEXT_SURFACE`, `integrate_surface_terminate`).
+    let mut terminate_on_next_surface = false;
     loop {
-        if bounce > max_bounces {
-            break;
-        }
         let hit = closest_hit(geometry, bvh, origin, direction, RAY_EPSILON, f64::INFINITY);
         let segment_limit = hit.map_or(f64::INFINITY, |hit| hit.distance);
         let environment = world_radiance(doc, &snapshot.scene_id, images, direction, environment)?;
@@ -797,7 +803,7 @@ fn trace_path(
             break;
         }
         if bounce == 0 {
-            alpha = 1.0 - volume_segment.transmittance;
+            alpha = 1.0 - (1.0 - alpha) * volume_segment.transmittance;
         }
         if let Some(event) = volume_segment.event {
             let scatter_probability = (event.albedo.x + event.albedo.y + event.albedo.z) / 3.0;
@@ -818,6 +824,7 @@ fn trace_path(
                     event,
                     direction,
                     environment,
+                    transparent_max_bounces.saturating_sub(transparent_bounce),
                     rng,
                     evaluator_workspace,
                 )?;
@@ -888,9 +895,7 @@ fn trace_path(
                     * ((1.0 - scalar_transmittance) * phase);
             }
             throughput *= transmittance;
-            if bounce == 0 {
-                alpha = 1.0 - transmittance.element_sum() / 3.0;
-            }
+            alpha = 1.0 - (1.0 - alpha) * (transmittance.element_sum() / 3.0);
             if exits_medium {
                 origin = surface.point + direction * (distance + 2.0 * RAY_EPSILON);
             } else {
@@ -899,14 +904,23 @@ fn trace_path(
             if throughput.max_element() <= 1.0e-8 {
                 break;
             }
-            bounce += 1;
+            volume_bounds += 1;
+            if volume_bounds > VOLUME_BOUNDS_MAX {
+                break;
+            }
             continue;
+        }
+        if terminate_on_next_surface {
+            // Cycles shades the surface for emission, then ends the path (`integrate_surface_terminate`).
+            alpha = 1.0;
+            radiance += throughput
+                * DVec3::from_array(surface.params.emission_color)
+                * surface.params.emission_strength.max(0.0);
+            break;
         }
         if rng.next_f64() >= surface.params.alpha.clamp(0.0, 1.0) {
             transparent_bounce += 1;
-            if transparent_bounce > transparent_max_bounces {
-                break;
-            }
+            terminate_on_next_surface |= transparent_bounce >= transparent_cap;
             origin = offset_origin(surface.point, direction, surface.geometric_normal);
             continue;
         }
@@ -927,6 +941,7 @@ fn trace_path(
                 &surface,
                 direction,
                 environment,
+                transparent_max_bounces.saturating_sub(transparent_bounce),
                 rng,
                 evaluator_workspace,
             )?;
@@ -1342,6 +1357,7 @@ fn direct_lighting(
     surface: &Surface,
     incoming_direction: DVec3,
     environment: DVec3,
+    transparent_budget: u32,
     rng: &mut Pcg32,
     evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<DVec3> {
@@ -1368,6 +1384,7 @@ fn direct_lighting(
             geometric,
             sample.direction,
             sample.distance,
+            transparent_budget,
             rng,
             evaluator_workspace,
         )?;
@@ -1398,6 +1415,7 @@ fn direct_lighting(
             geometric,
             direction,
             f64::INFINITY,
+            transparent_budget,
             rng,
             evaluator_workspace,
         )?;
@@ -1426,6 +1444,7 @@ fn direct_volume_lighting(
     event: VolumeEvent,
     incoming_direction: DVec3,
     environment: DVec3,
+    transparent_budget: u32,
     rng: &mut Pcg32,
     evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<DVec3> {
@@ -1448,6 +1467,7 @@ fn direct_volume_lighting(
             DVec3::ZERO,
             sample.direction,
             sample.distance,
+            transparent_budget,
             rng,
             evaluator_workspace,
         )?;
@@ -1472,6 +1492,7 @@ fn direct_volume_lighting(
             DVec3::ZERO,
             direction,
             f64::INFINITY,
+            transparent_budget,
             rng,
             evaluator_workspace,
         )?;
@@ -1512,17 +1533,19 @@ fn shadow_transmittance(
     normal: DVec3,
     direction: DVec3,
     distance: f64,
+    transparent_budget: u32,
     rng: &mut Pcg32,
     evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<f64> {
     let mut transmittance = 1.0;
+    let mut transparent_hits = 0u32;
     let mut origin = offset_origin(point, direction, normal);
     let mut remaining = if distance.is_finite() {
         (distance - RAY_EPSILON).max(0.0)
     } else {
         f64::INFINITY
     };
-    for _ in 0..MAX_SHADOW_LAYERS {
+    loop {
         let Some(hit) = closest_hit(geometry, bvh, origin, direction, RAY_EPSILON, remaining)
         else {
             break;
@@ -1537,6 +1560,15 @@ fn shadow_transmittance(
             images,
             evaluator_workspace,
         )?;
+        // Cycles counts each transparent surface a shadow ray crosses against the path's remaining
+        // budget and blocks the ray past it (`intern/cycles/kernel/bvh/intersect_filter.h`);
+        // volume-bounds surfaces are not counted (`SD_HAS_ONLY_VOLUME`).
+        if surface.params.volume_density <= 0.0 {
+            transparent_hits += 1;
+            if transparent_hits > transparent_budget {
+                return Ok(0.0);
+            }
+        }
         let alpha = surface.params.alpha.clamp(0.0, 1.0);
         let transmission = surface.params.transmission.clamp(0.0, 1.0);
         if alpha >= 1.0 && transmission <= 0.0 {
