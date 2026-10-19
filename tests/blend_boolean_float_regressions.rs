@@ -790,9 +790,8 @@ fn boolean_float_boundaries_match_blender() -> TestResult {
     // Blender 5.2.2 FLOAT reads double_threshold (MOD_boolean.cc:347-358 -> BM_mesh_intersect eps):
     // the 1e-4 near gap coincides at 0.5 and changes the union, so the probe must discriminate.
     if low_threshold == high_threshold {
-        failures.push(
-            "Blender FLOAT threshold probe no longer changes the near-gap union".to_owned(),
-        );
+        failures
+            .push("Blender FLOAT threshold probe no longer changes the near-gap union".to_owned());
     }
     for operation in ["difference", "union", "intersect"] {
         let mut without_self = expected[&format!("self_{operation}_false")].clone();

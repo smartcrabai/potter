@@ -258,7 +258,6 @@ pub(crate) fn evaluate_modifiers_with_scene_context_and_normals(
         .enumerate()
         .filter(|&(modifier_index, modifier)| is_active(modifier_index, modifier))
     {
-        validate_boolean_topology_suffix(modifiers, modifier_index, &is_active)?;
         // Blender's Surface deformer updates runtime velocity data but leaves vertex positions unchanged.
         if modifier.modifier_type == "surface" {
             continue;
