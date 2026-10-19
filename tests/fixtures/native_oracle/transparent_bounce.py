@@ -55,8 +55,8 @@ background.inputs["Strength"].default_value = 1.0
 
 material = bpy.data.materials.new("Alpha")
 material.use_nodes = True
-# BLENDED keeps the sub-one Principled Alpha as an alpha blend (Potter's `blend` alpha mode); the
-# default DITHERED method would import as `clip`, which binarizes the alpha at the threshold.
+# BLENDED pins Potter's `blend` alpha mode. A DITHERED material imports as `opaque` and its graph's Principled Alpha
+# is honoured too, so both give Cycles' result; BLENDED is kept as the explicit blend path.
 material.surface_render_method = "BLENDED"
 bsdf = material.node_tree.nodes["Principled BSDF"]
 bsdf.inputs["Base Color"].default_value = (0.0, 0.0, 0.0, 1.0)
