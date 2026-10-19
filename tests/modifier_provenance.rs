@@ -287,7 +287,7 @@ fn remesh_reports_dropped_vertex_groups_as_a_typed_warning() -> TestResult {
         }),
     )?;
     let evaluation =
-        evaluate_modifiers_with_groups_at_frame(&mesh, &[remesh], &Registry::new(), 1.0)?;
+        evaluate_modifiers_with_groups_at_frame(&mesh, &[remesh], &Registry::new(), 1.0, None)?;
     assert!(
         evaluation.mesh.attributes.get("vertex_groups").is_none(),
         "remesh output must not carry stale vertex groups"

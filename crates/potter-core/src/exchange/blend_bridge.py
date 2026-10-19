@@ -497,6 +497,15 @@ def _id_map(block, property_name):
     return value if isinstance(value, dict) else {}
 
 
+def _image_alpha_mode(image):
+    # Blender's alpha mode under the names the .blend importer reads. CHANNEL_PACKED holds straight colour.
+    if image.alpha_mode == "PREMUL":
+        return "premultiplied"
+    if image.alpha_mode == "NONE":
+        return "none"
+    return "straight"
+
+
 def images_dump():
     result = []
     for image in bpy.data.images:
@@ -517,6 +526,7 @@ def images_dump():
         result.append({"name": image.name_full, "potter_id": image.get("potter.id"),
                        "library": library_reference(image), "filepath": filepath,
                        "source": image.source, "colorspace": colorspace,
+                       "alpha_mode": _image_alpha_mode(image),
                        "potter_image": image_model})
     return result
 
@@ -6021,6 +6031,9 @@ def export_doc(doc, target, pack, scene_hash, context):
             image.colorspace_settings.name = colorspace
         pixels = item.get("pixels")
         if sidecar is None and png_bytes is None and pixels is not None:
+            image.alpha_mode = {"straight": "STRAIGHT", "premultiplied": "PREMUL", "none": "NONE"}[
+                item.get("alpha_mode", "straight")
+            ]
             _pack_image(image, [channel for pixel in pixels for channel in pixel])
         if item.get("source") == "packed" and image.packed_file is None:
             image.pack()
