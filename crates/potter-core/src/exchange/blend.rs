@@ -17112,23 +17112,22 @@ print("UNSUPPORTED_POSE " + json.dumps({
         let reopened_hit = crate::shader::HitContext::new(&imported.doc.node_groups);
         let source_params = crate::shader::evaluate_surface(source, &source_hit)?;
         let reopened_params = crate::shader::evaluate_surface(reopened, &reopened_hit)?;
-        assert_eq!(
-            reopened_params.volume_scattering,
-            source_params.volume_scattering
-        );
-        assert!(close(
-            reopened_params.volume_density,
-            source_params.volume_density
-        ));
         assert!(close(
             reopened_params.volume_anisotropy,
             source_params.volume_anisotropy
         ));
         assert!(
             reopened_params
-                .volume_color
+                .volume_scatter
                 .iter()
-                .zip(source_params.volume_color)
+                .zip(source_params.volume_scatter)
+                .all(|(actual, expected)| close(*actual, expected))
+        );
+        assert!(
+            reopened_params
+                .volume_absorption
+                .iter()
+                .zip(source_params.volume_absorption)
                 .all(|(actual, expected)| close(*actual, expected))
         );
         assert!(
