@@ -39,7 +39,7 @@ fn vertex(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
         engine,
         operation,
         &[
-            "op", "target", "scope", "samples", "falloff", "symmetry", "seed", "color", "blend",
+            "op", "target", "scope", "samples", "falloff", "symmetry", "color", "blend",
         ],
         &["target", "samples", "color"],
     )?;
@@ -113,7 +113,6 @@ fn weight(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             "samples",
             "falloff",
             "symmetry",
-            "seed",
             "group",
             "weight",
             "normalize",
@@ -469,7 +468,7 @@ fn texture(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bo
         engine,
         operation,
         &[
-            "op", "target", "scope", "image", "uv_layer", "samples", "falloff", "symmetry", "seed",
+            "op", "target", "scope", "image", "uv_layer", "samples", "falloff", "symmetry",
             "color", "blend",
         ],
         &["target", "image", "samples", "color"],

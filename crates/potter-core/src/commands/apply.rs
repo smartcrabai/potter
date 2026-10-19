@@ -162,6 +162,7 @@ fn render_candidate_preview(
         scene_id,
         view_layer,
         frame,
+        adaptive_render: None,
         purpose: EvaluationPurpose::Preview,
     };
     render_previews(
