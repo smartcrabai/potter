@@ -235,6 +235,11 @@ fn check_spread(spread: f64) -> TestResult {
 }
 
 #[test]
+fn a_zero_spread_lights_only_under_the_emitter_as_cycles() -> TestResult {
+    check_spread(0.0)
+}
+
+#[test]
 fn a_narrow_spread_matches_cycles() -> TestResult {
     check_spread(0.3)
 }

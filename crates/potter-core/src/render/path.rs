@@ -1859,13 +1859,18 @@ fn sample_area_light(light: &PointLight, point: DVec3, rng: &mut Pcg32) -> Optio
     })
 }
 
-/// A zero spread emits along the normal alone, so a receiver sees the emitter at the point straight
-/// above it. Cycles samples that point with pdf 1 (`area_light_eval`, `tan_half_spread == 0`), so it
-/// is a delta here, as the sun is, weighted by Cycles' `eval_fac` on the normal: `π` times the
-/// radiance.
+/// A zero spread emits along the normal alone, so a receiver sees the emitter only at its foot on
+/// the emitter's plane, if that foot is on the emitter. Cycles samples that point with pdf 1
+/// (`area_light_eval`, `tan_half_spread == 0`), so it is a delta here, as the sun is, weighted by
+/// Cycles' `eval_fac` on the normal: `π` times the radiance. A Blender render of a zero spread
+/// lights exactly the receivers under the emitter.
 fn sample_spread_line(light: &PointLight, shape: &AreaShape, point: DVec3) -> Option<LightSample> {
     let distance = light.direction.dot(point - light.position);
     if distance <= 0.0 {
+        return None;
+    }
+    let foot = point - distance * light.direction;
+    if !inside_emitter(shape, light.position, foot) {
         return None;
     }
     Some(LightSample {
@@ -3357,6 +3362,8 @@ mod sampling_tests {
             !light.hittable(),
             "a zero spread is never hit by a BSDF ray"
         );
+        // Past the emitter's edge, the foot of the receiver is off the emitter, which emits nothing there.
+        assert!(sample_light(&light, DVec3::new(0.8, 0.0, 0.5), &mut rng).is_none());
     }
 
     /// A light the path has just crossed is never found again: the origin is advanced past it, so
