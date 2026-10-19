@@ -5,9 +5,9 @@
 //! then deserializes. Version 2 replaced the mesh attributes `uv_map` and `blender_uv_layers` with
 //! `uv_layers`, and the texture reference field `uv_map` with `uv_layer`. Version 3 converted
 //! Blender-keyed shading (including compressed custom normals), color, and generic element data to
-//! native keys, and user attributes to their storage keys (see [`upgrade_mesh_v2`]). Version 4 marks an EXR image's
-//! alpha as premultiplied (see [`upgrade_v3`]) and adds optional captured Blender authoring matrices, which older
-//! documents lack.
+//! native keys, and user attributes to their storage keys (see [`upgrade_mesh_v2`]). Version 4 marks an
+//! EXR image's alpha as premultiplied (see [`upgrade_v3`]). Version 7 adds the optional captured Blender
+//! `matrix_basis` on a node; version 6 documents have none, so [`upgrade_v6`] changes nothing else.
 use std::{collections::BTreeSet, path::Path};
 
 use serde_json::{Map, Value, json};
@@ -149,7 +149,7 @@ fn json_error(error: &serde_json::Error) -> PotError {
     )
 }
 
-/// Upgrades a scene document in place through schema version 6. `root` is the project directory that holds the document's
+/// Upgrades a scene document in place through schema version 7. `root` is the project directory that holds the document's
 /// image blobs and linked sources, which the version 3 to 4 step reads.
 pub fn upgrade_scene(value: &mut Value, root: &Path) -> Result<Vec<Value>> {
     let warnings = if value.get("schema_version").and_then(Value::as_u64) == Some(1) {
@@ -168,6 +168,9 @@ pub fn upgrade_scene(value: &mut Value, root: &Path) -> Result<Vec<Value>> {
     }
     if value.get("schema_version").and_then(Value::as_u64) == Some(5) {
         upgrade_v5(value);
+    }
+    if value.get("schema_version").and_then(Value::as_u64) == Some(6) {
+        upgrade_v6(value);
     }
     Ok(warnings)
 }
@@ -332,6 +335,12 @@ fn upgrade_v5(value: &mut Value) {
         }
     }
     value["schema_version"] = json!(6);
+}
+
+/// Upgrades a schema-version-6 scene document to version 7. Version 7 adds the optional `blender_matrix_basis`
+/// node field. A node without it is valid, so nothing is rewritten.
+fn upgrade_v6(value: &mut Value) {
+    value["schema_version"] = json!(7);
 }
 
 fn upgrade_color_curve(color: &mut Value) -> Result<()> {
@@ -1280,7 +1289,7 @@ mod tests {
             }}}
         });
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(6));
+        assert_eq!(scene["schema_version"], json!(7));
         let material = &scene["materials"]["m1"];
         assert_eq!(material["base_color_texture"]["uv_layer"], Value::Null);
         assert!(material["base_color_texture"].get("uv_map").is_none());
@@ -1302,7 +1311,7 @@ mod tests {
         });
         let before = scene.clone();
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(6));
+        assert_eq!(scene["schema_version"], json!(7));
         assert_eq!(scene["materials"], before["materials"]);
     }
 
@@ -1322,7 +1331,7 @@ mod tests {
             }
         });
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(6));
+        assert_eq!(scene["schema_version"], json!(7));
         // Both forms drew a full turn in version 5, so both keep it as a 2π equidistant fisheye.
         for id in ["legacy", "panorama"] {
             let camera = &scene["data_blocks"][id]["camera"];
@@ -1346,9 +1355,9 @@ mod tests {
     }
 
     #[test]
-    fn current_schema_six_scenes_pass_through_untouched() {
+    fn current_schema_seven_scenes_pass_through_untouched() {
         let mut scene = json!({
-            "schema_version": 6,
+            "schema_version": 7,
             "materials": {"m1": {"base_color_texture": {"image": "img", "uv_layer": "Light"}}}
         });
         let before = scene.clone();
@@ -1392,7 +1401,7 @@ mod tests {
         scene["schema_version"] = json!(3);
         scene["images"] = json!({ "texel": serde_json::to_value(&image)? });
         let parsed = parse_scene(&serde_json::to_vec(&scene)?, root.path())?;
-        assert_eq!(parsed.doc.schema_version, 6);
+        assert_eq!(parsed.doc.schema_version, 7);
         let id = crate::model::Id::new("texel")?;
         let migrated = &parsed.doc.images[&id];
         assert_eq!(migrated.alpha_mode, ImageAlphaMode::Premultiplied);
@@ -1438,7 +1447,7 @@ mod tests {
             }
         });
         upgrade_scene(&mut scene, no_assets())?;
-        assert_eq!(scene["schema_version"], json!(6));
+        assert_eq!(scene["schema_version"], json!(7));
         assert_eq!(
             scene["scenes"]["empty"]["color_management"]["curve"],
             Value::Null
@@ -1481,7 +1490,7 @@ mod tests {
         let parsed = parse_scene(&serde_json::to_vec(&expected)?, no_assets())?;
         parsed.doc.validate()?;
         let migrated = serde_json::to_value(parsed.doc)?;
-        expected["schema_version"] = json!(6);
+        expected["schema_version"] = json!(7);
         assert_eq!(migrated, expected);
         Ok(())
     }
@@ -1519,7 +1528,7 @@ mod tests {
         });
 
         let migrated = parse_scene(&serde_json::to_vec(&source)?, no_assets())?.doc;
-        assert_eq!(migrated.schema_version, 6);
+        assert_eq!(migrated.schema_version, 7);
         let mesh = migrated.data_blocks[&data_id]
             .mesh
             .as_ref()
@@ -2023,7 +2032,7 @@ mod tests {
         let (record, history_warnings) =
             parse_history_record(&serde_json::to_vec(&history_record(&source))?, no_assets())?;
         assert!(history_warnings.is_empty(), "{history_warnings:?}");
-        assert_eq!(record.snapshot.schema_version, 6);
+        assert_eq!(record.snapshot.schema_version, 7);
         let history_mesh = record
             .snapshot
             .data_blocks
@@ -2090,7 +2099,7 @@ mod tests {
         let (record, history_warnings) =
             parse_history_record(&serde_json::to_vec(&history_record(&source))?, no_assets())?;
         assert!(history_warnings.is_empty(), "{history_warnings:?}");
-        assert_eq!(record.snapshot.schema_version, 6);
+        assert_eq!(record.snapshot.schema_version, 7);
         let history_mesh = record
             .snapshot
             .data_blocks

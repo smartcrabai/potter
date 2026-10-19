@@ -119,7 +119,7 @@ impl SceneDoc {
             },
         )]);
         Self {
-            schema_version: 6,
+            schema_version: 7,
             scene_id,
             revision: 0,
             active_scene,
@@ -146,7 +146,7 @@ impl SceneDoc {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.schema_version != 6 {
+        if self.schema_version != 7 {
             return Err(PotError::with_details(
                 ErrorCode::UnsupportedVersion,
                 format!("unsupported scene schema_version {}", self.schema_version),
@@ -1901,21 +1901,28 @@ impl Node {
         use sha2::Digest as _;
 
         let mut hasher = sha2::Sha256::new();
-        hasher.update(b"potter-captured-matrix-basis-v1\0");
+        hasher.update(b"potter-captured-matrix-basis-v2\0");
         update_matrix_basis_transform(&mut hasher, effective_transform)?;
-        update_matrix_basis_optional_id(&mut hasher, self.parent.as_ref());
-        match &self.parent_inverse {
-            Some(matrix) => {
-                hasher.update([1]);
-                update_matrix_basis_values(&mut hasher, matrix);
+        // Only whether a parent exists is hashed: a parent id changes on import remap or duplicate
+        // without changing the local basis. A root's parent_inverse, parent_type and parent_bone do
+        // not change the captured basis, so they are hashed only under a parent (bone parents
+        // change the world matrix). A root with a non-identity parent_inverse never uses the capture
+        // (see `captured_matrix_basis`).
+        hasher.update([u8::from(self.parent.is_some())]);
+        if self.parent.is_some() {
+            match &self.parent_inverse {
+                Some(matrix) => {
+                    hasher.update([1]);
+                    update_matrix_basis_values(&mut hasher, matrix);
+                }
+                None => hasher.update([0]),
             }
-            None => hasher.update([0]),
+            hasher.update([match self.parent_type {
+                ParentType::Object => 0,
+                ParentType::Bone => 1,
+            }]);
+            update_matrix_basis_optional_id(&mut hasher, self.parent_bone.as_ref());
         }
-        hasher.update([match self.parent_type {
-            ParentType::Object => 0,
-            ParentType::Bone => 1,
-        }]);
-        update_matrix_basis_optional_id(&mut hasher, self.parent_bone.as_ref());
         update_matrix_basis_delta_transforms(&mut hasher, &self.properties);
         // Dynamic state is part of the fingerprint, so removing it leaves a capture stale.
         hasher.update([
@@ -1951,6 +1958,16 @@ impl Node {
         {
             return Ok(None);
         }
+        // The transform path applies a root's parent_inverse (keep-world unparenting keeps shear,
+        // spec.md). Blender's captured basis is local and ignores it for a root, so such a root
+        // takes the transform path in both states and its world does not jump after an edit.
+        if self.parent.is_none()
+            && self
+                .parent_inverse
+                .is_some_and(|matrix| !is_identity_matrix(&matrix))
+        {
+            return Ok(None);
+        }
         let digest = self.matrix_basis_fingerprint_digest(effective_transform)?;
         Ok(
             matrix_basis_fingerprint_matches(&captured.fingerprint, &digest)
@@ -1974,6 +1991,14 @@ fn update_matrix_basis_transform(hasher: &mut sha2::Sha256, transform: &Transfor
     }
     update_matrix_basis_string(hasher, &transform.rotation_mode);
     Ok(())
+}
+
+fn is_identity_matrix(matrix: &[f64; 16]) -> bool {
+    // Column-major: the diagonal is indices 0, 5, 10 and 15.
+    matrix
+        .iter()
+        .enumerate()
+        .all(|(index, &value)| value == if index % 5 == 0 { 1.0 } else { 0.0 })
 }
 
 fn update_matrix_basis_values(hasher: &mut sha2::Sha256, values: &[f64; 16]) {
@@ -2768,9 +2793,34 @@ mod tests {
         );
         assert_eq!(node.captured_matrix_basis(&effective).unwrap(), None);
         node.properties.clear();
+        // Without a parent, parent_inverse, parent_type and parent_bone do not affect the capture.
+        node.parent_inverse = Some(identity);
+        node.parent_type = super::ParentType::Bone;
+        node.parent_bone = Some(super::Id::from_static("bone"));
+        assert_eq!(
+            node.captured_matrix_basis(&effective).unwrap(),
+            Some(identity)
+        );
+        node.parent_inverse = None;
+        node.parent_type = super::ParentType::Object;
+        node.parent_bone = None;
         node.parent = Some(super::Id::from_static("parent"));
         assert_eq!(node.captured_matrix_basis(&effective).unwrap(), None);
-        node.parent = None;
+        let fingerprint = node.matrix_basis_fingerprint(&effective).unwrap();
+        node.blender_matrix_basis = Some(super::CapturedMatrixBasis {
+            matrix_basis: identity,
+            fingerprint,
+        });
+        assert_eq!(
+            node.captured_matrix_basis(&effective).unwrap(),
+            Some(identity)
+        );
+        // A parent id change keeps the capture; parent_inverse under a parent does not.
+        node.parent = Some(super::Id::from_static("remapped_parent"));
+        assert_eq!(
+            node.captured_matrix_basis(&effective).unwrap(),
+            Some(identity)
+        );
         node.parent_inverse = Some(identity);
         assert_eq!(node.captured_matrix_basis(&effective).unwrap(), None);
         node.parent_inverse = None;
