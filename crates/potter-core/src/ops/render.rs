@@ -11,6 +11,7 @@ const SET_FIELDS: &[&str] = &[
     "samples",
     "seed",
     "max_bounces",
+    "transparent_max_bounces",
     "film_transparent",
     "engine",
     "use_sequencer",
@@ -112,6 +113,7 @@ pub(super) fn apply(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> 
     let samples = optional_u32(engine, set, "samples", 1, 1_000_000)?;
     let seed = optional_u32(engine, set, "seed", 0, u32::MAX)?;
     let max_bounces = optional_u32(engine, set, "max_bounces", 0, 1024)?;
+    let transparent_max_bounces = optional_u32(engine, set, "transparent_max_bounces", 0, 1024)?;
     let motion_blur_samples = optional_u32(engine, set, "motion_blur_samples", 1, 64)?;
     let dicing_rate = optional_f64(engine, set, "dicing_rate", 0.1, 1000.0)?;
     let preview_dicing_rate = optional_f64(engine, set, "preview_dicing_rate", 0.1, 1000.0)?;
@@ -262,6 +264,9 @@ pub(super) fn apply(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> 
         }
         if let Some(value) = max_bounces {
             scene.render.max_bounces = value;
+        }
+        if let Some(value) = transparent_max_bounces {
+            scene.render.transparent_max_bounces = value;
         }
         if let Some(value) = film_transparent {
             scene.render.film_transparent = value;
