@@ -417,6 +417,7 @@ fn create_light(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resu
             "energy",
             "radius",
             "soft_falloff",
+            "use_multiple_importance_sampling",
             "spot_size",
             "spot_blend",
         ],
@@ -435,6 +436,7 @@ fn create_light(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resu
             "energy",
             "radius",
             "soft_falloff",
+            "use_multiple_importance_sampling",
             "spot_size",
             "spot_blend",
         ],
@@ -500,6 +502,7 @@ fn apply_light_values(
             "energy",
             "radius",
             "soft_falloff",
+            "use_multiple_importance_sampling",
             "spot_size",
             "spot_blend",
         ],
@@ -542,6 +545,18 @@ fn apply_light_values(
                 ErrorCode::InvalidOperation,
                 "soft_falloff must be true or false",
                 &operation_pointer(engine.operation_index, &format!("{prefix}soft_falloff")),
+            )
+        })?;
+    }
+    if let Some(value) = values.get("use_multiple_importance_sampling") {
+        light.use_multiple_importance_sampling = value.as_bool().ok_or_else(|| {
+            engine.error(
+                ErrorCode::InvalidOperation,
+                "use_multiple_importance_sampling must be true or false",
+                &operation_pointer(
+                    engine.operation_index,
+                    &format!("{prefix}use_multiple_importance_sampling"),
+                ),
             )
         })?;
     }
