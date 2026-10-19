@@ -247,8 +247,9 @@ pub fn pick(
     verify_mapping_matches_geometry(&manifest, &geometry)?;
     let camera = camera_from_manifest(&manifest.camera)?;
     let (ray_origin, ray_direction) =
-        ray_for_pixel(&camera, buffers.width, buffers.height, pixel.0, pixel.1)?
-            .ok_or_else(|| render_invalid("object ID buffer has a hit where the camera has no ray"))?;
+        ray_for_pixel(&camera, buffers.width, buffers.height, pixel.0, pixel.1)?.ok_or_else(
+            || render_invalid("object ID buffer has a hit where the camera has no ray"),
+        )?;
     let element_domain = element.map(|record| record.domain.as_str());
     let requested_domain_matches_channel = match domain {
         PickDomain::Object => true,

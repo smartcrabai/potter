@@ -1068,7 +1068,10 @@ fn camera_frame(camera: &Camera, width: u32, height: u32) -> Result<CameraFrame>
         Projection::Equirectangular {
             longitude,
             latitude,
-        } if longitude.iter().chain(&latitude).all(|value| value.is_finite())
+        } if longitude
+            .iter()
+            .chain(&latitude)
+            .all(|value| value.is_finite())
             && longitude[1] > longitude[0]
             && longitude[1] - longitude[0] <= TAU
             && latitude[1] > latitude[0]
@@ -1824,7 +1827,6 @@ mod tests {
     use serde_json::Value;
     use std::error::Error;
 
-
     fn camera(projection: Projection) -> Camera {
         Camera {
             position: DVec3::new(1.0, 2.0, 3.0),
@@ -1978,7 +1980,9 @@ mod tests {
     }
 
     fn number(value: &Value) -> Result<f64, Box<dyn Error>> {
-        value.as_f64().ok_or_else(|| "oracle value is not a number".into())
+        value
+            .as_f64()
+            .ok_or_else(|| "oracle value is not a number".into())
     }
 
     fn pair(value: &Value) -> Result<[f64; 2], Box<dyn Error>> {
@@ -1989,7 +1993,9 @@ mod tests {
     fn oracle_camera(matrix: &Value, projection: Projection) -> Result<Camera, Box<dyn Error>> {
         let mut rows = [[0.0_f64; 4]; 3];
         for (index, row) in rows.iter_mut().enumerate() {
-            let entries = matrix[index].as_array().ok_or("camera matrix row is missing")?;
+            let entries = matrix[index]
+                .as_array()
+                .ok_or("camera matrix row is missing")?;
             for (slot, entry) in row.iter_mut().zip(entries) {
                 *slot = number(entry)?;
             }
@@ -2026,7 +2032,9 @@ mod tests {
         let ray = ray_for_pixel(camera, width, height, x, y)?;
         match (ray, expected) {
             (Some((_, direction)), Some(expected)) => {
-                let error = (direction - DVec3::from_array(expected)).abs().max_element();
+                let error = (direction - DVec3::from_array(expected))
+                    .abs()
+                    .max_element();
                 assert!(
                     error <= TOLERANCE,
                     "pixel ({x}, {y}) ray {direction:?} differs from Blender's {expected:?} by {error}"
@@ -2046,19 +2054,29 @@ mod tests {
             "../../../../tests/fixtures/panorama_camera/blender_panorama_camera_range.json"
         ))?;
         let width = u32::try_from(oracle["width"].as_u64().ok_or("oracle width is missing")?)?;
-        let height = u32::try_from(oracle["height"].as_u64().ok_or("oracle height is missing")?)?;
+        let height = u32::try_from(
+            oracle["height"]
+                .as_u64()
+                .ok_or("oracle height is missing")?,
+        )?;
         let projection = Projection::Equirectangular {
             longitude: pair(&oracle["longitude"])?,
             latitude: pair(&oracle["latitude"])?,
         };
         let camera = oracle_camera(&oracle["camera_to_world"], projection)?;
-        let records = oracle["records"].as_array().ok_or("oracle records are missing")?;
+        let records = oracle["records"]
+            .as_array()
+            .ok_or("oracle records are missing")?;
         assert_eq!(records.len(), usize::try_from(width * height)?);
         for record in records {
             let x = u32::try_from(record[0].as_u64().ok_or("oracle column is missing")?)?;
             // The oracle's rows are bottom-up, Potter's pixel rows count from the top.
             let row = u32::try_from(record[1].as_u64().ok_or("oracle row is missing")?)?;
-            let expected = [number(&record[2])?, number(&record[3])?, number(&record[4])?];
+            let expected = [
+                number(&record[2])?,
+                number(&record[3])?,
+                number(&record[4])?,
+            ];
             assert_ray_matches(&camera, width, height, x, height - 1 - row, Some(expected))?;
         }
         Ok(())
@@ -2071,8 +2089,15 @@ mod tests {
             "../../../../tests/fixtures/panorama_camera/blender_fisheye_camera.json"
         ))?;
         let width = u32::try_from(oracle["width"].as_u64().ok_or("oracle width is missing")?)?;
-        let height = u32::try_from(oracle["height"].as_u64().ok_or("oracle height is missing")?)?;
-        for oracle_camera_data in oracle["cameras"].as_array().ok_or("oracle cameras are missing")? {
+        let height = u32::try_from(
+            oracle["height"]
+                .as_u64()
+                .ok_or("oracle height is missing")?,
+        )?;
+        for oracle_camera_data in oracle["cameras"]
+            .as_array()
+            .ok_or("oracle cameras are missing")?
+        {
             let fov = number(&oracle_camera_data["fisheye_fov"])?;
             let projection = match oracle_camera_data["panorama_type"].as_str() {
                 Some("FISHEYE_EQUIDISTANT") => Projection::FisheyeEquidistant { fov },
@@ -2099,7 +2124,11 @@ mod tests {
                 let x = u32::try_from(record[0].as_u64().ok_or("oracle column is missing")?)?;
                 let y = u32::try_from(record[1].as_u64().ok_or("oracle row is missing")?)?;
                 let expected = if record[2].as_bool() == Some(true) {
-                    Some([number(&record[3])?, number(&record[4])?, number(&record[5])?])
+                    Some([
+                        number(&record[3])?,
+                        number(&record[4])?,
+                        number(&record[5])?,
+                    ])
                 } else {
                     None
                 };

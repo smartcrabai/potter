@@ -177,11 +177,10 @@ fn apply_camera_values(
             Some("perspective") => CameraProjection::Perspective,
             Some("orthographic") => CameraProjection::Orthographic,
             Some("panorama") => CameraProjection::Panorama,
-            Some("fisheye") => CameraProjection::Fisheye,
             _ => {
                 return Err(engine.error(
                     ErrorCode::InvalidOperation,
-                    "projection must be perspective, orthographic, panorama, or fisheye",
+                    "projection must be perspective, orthographic, or panorama",
                     &operation_pointer(engine.operation_index, &format!("{prefix}projection")),
                 ));
             }
@@ -258,9 +257,13 @@ fn apply_camera_values(
     // the camera's projection would ignore is refused, not stored.
     let equirectangular = camera.projection == CameraProjection::Panorama
         && camera.panorama_type == "equirectangular";
-    let fisheye = camera.projection == CameraProjection::Fisheye
-        || (camera.projection == CameraProjection::Panorama && !equirectangular);
-    for field in ["longitude_min", "longitude_max", "latitude_min", "latitude_max"] {
+    let fisheye = camera.projection == CameraProjection::Panorama && !equirectangular;
+    for field in [
+        "longitude_min",
+        "longitude_max",
+        "latitude_min",
+        "latitude_max",
+    ] {
         if values.contains_key(field) && !equirectangular {
             return Err(engine.error(
                 ErrorCode::InvalidOperation,
@@ -280,10 +283,31 @@ fn apply_camera_values(
         && camera.fisheye_fov <= std::f64::consts::TAU)
     {
         return Err(engine.error(
-            ErrorCode::InvalidOperation,
+            ErrorCode::InvalidArgument,
             "fisheye_fov must be between 0.1745 and 2π radians",
             &operation_pointer(engine.operation_index, &format!("{prefix}fisheye_fov")),
         ));
+    }
+    // Blender's fisheye_lens hard range is 0.01 to 100, and its sensor width hard minimum is 1; Blender clamps other values
+    // on assignment, so Potter refuses them rather than exporting a silently different camera. An equisolid camera holds
+    // its lens in `lens_mm`.
+    if camera.projection == CameraProjection::Panorama
+        && camera.panorama_type == "fisheye_equisolid"
+    {
+        if !(0.01..=100.0).contains(&camera.lens_mm) {
+            return Err(engine.error(
+                ErrorCode::InvalidArgument,
+                "lens_mm must be between 0.01 and 100 for fisheye_equisolid cameras",
+                &operation_pointer(engine.operation_index, &format!("{prefix}lens_mm")),
+            ));
+        }
+        if camera.sensor_width_mm < 1.0 {
+            return Err(engine.error(
+                ErrorCode::InvalidArgument,
+                "sensor_width_mm must be at least 1 for fisheye_equisolid cameras",
+                &operation_pointer(engine.operation_index, &format!("{prefix}sensor_width_mm")),
+            ));
+        }
     }
     if equirectangular {
         if !(camera.longitude_max > camera.longitude_min

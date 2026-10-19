@@ -448,7 +448,6 @@ fn stored_camera(doc: &SceneDoc, snapshot: &Snapshot, camera_id: &str) -> Result
         CameraProjection::Orthographic => "orthographic",
         CameraProjection::Perspective => "perspective",
         CameraProjection::Panorama => "panorama",
-        CameraProjection::Fisheye => "fisheye",
     };
     let depth_of_field = camera_data.dof_enabled.then_some(DepthOfField {
         focus_distance: camera_data.focus_distance,
@@ -509,9 +508,6 @@ fn camera_projection(camera_data: &CameraData) -> Result<Projection> {
                     "camera panorama_type must be equirectangular, fisheye_equidistant, or fisheye_equisolid",
                 ));
             }
-        },
-        CameraProjection::Fisheye => Projection::FisheyeEquidistant {
-            fov: camera_data.fisheye_fov,
         },
     })
 }

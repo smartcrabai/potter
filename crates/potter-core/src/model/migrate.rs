@@ -101,7 +101,7 @@ fn json_error(error: &serde_json::Error) -> PotError {
     )
 }
 
-/// Upgrades a scene document in place through schema version 5. `root` is the project directory that holds the document's
+/// Upgrades a scene document in place through schema version 6. `root` is the project directory that holds the document's
 /// image blobs and linked sources, which the version 3 to 4 step reads.
 pub fn upgrade_scene(value: &mut Value, root: &Path) -> Result<Vec<Value>> {
     let warnings = if value.get("schema_version").and_then(Value::as_u64) == Some(1) {
@@ -117,6 +117,9 @@ pub fn upgrade_scene(value: &mut Value, root: &Path) -> Result<Vec<Value>> {
     }
     if value.get("schema_version").and_then(Value::as_u64) == Some(4) {
         upgrade_v4(value)?;
+    }
+    if value.get("schema_version").and_then(Value::as_u64) == Some(5) {
+        upgrade_v5(value)?;
     }
     Ok(warnings)
 }
@@ -253,6 +256,26 @@ fn upgrade_v4(value: &mut Value) -> Result<()> {
         }
     }
     value["schema_version"] = json!(5);
+    Ok(())
+}
+
+/// Upgrades a schema-version-5 scene document to version 6. The `fisheye` camera projection, which rendered an
+/// equidistant fisheye over a full turn, becomes the panorama projection with `fisheye_equidistant` and a
+/// `fisheye_fov` of 2π, so the stored camera keeps its image and there is one representation of a fisheye.
+fn upgrade_v5(value: &mut Value) -> Result<()> {
+    if let Some(blocks) = value.get_mut("data_blocks").and_then(Value::as_object_mut) {
+        for camera in blocks
+            .values_mut()
+            .filter_map(|block| block.get_mut("camera")?.as_object_mut())
+        {
+            if camera.get("projection").and_then(Value::as_str) == Some("fisheye") {
+                camera.insert("projection".to_owned(), json!("panorama"));
+                camera.insert("panorama_type".to_owned(), json!("fisheye_equidistant"));
+                camera.insert("fisheye_fov".to_owned(), json!(std::f64::consts::TAU));
+            }
+        }
+    }
+    value["schema_version"] = json!(6);
     Ok(())
 }
 
@@ -1202,7 +1225,7 @@ mod tests {
             }}}
         });
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(5));
+        assert_eq!(scene["schema_version"], json!(6));
         let material = &scene["materials"]["m1"];
         assert_eq!(material["base_color_texture"]["uv_layer"], Value::Null);
         assert!(material["base_color_texture"].get("uv_map").is_none());
@@ -1224,8 +1247,29 @@ mod tests {
         });
         let before = scene.clone();
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(5));
+        assert_eq!(scene["schema_version"], json!(6));
         assert_eq!(scene["materials"], before["materials"]);
+    }
+
+    #[test]
+    fn version_five_fisheye_projection_becomes_an_equidistant_panorama() {
+        let mut scene = json!({
+            "schema_version": 5,
+            "data_blocks": {
+                "cam": {"type": "camera", "camera": {"projection": "fisheye", "lens_mm": 50.0}},
+                "plain": {"type": "camera", "camera": {"projection": "perspective"}}
+            }
+        });
+        upgrade_scene(&mut scene, no_assets()).expect("upgrade");
+        assert_eq!(scene["schema_version"], json!(6));
+        let camera = &scene["data_blocks"]["cam"]["camera"];
+        assert_eq!(camera["projection"], json!("panorama"));
+        assert_eq!(camera["panorama_type"], json!("fisheye_equidistant"));
+        assert_eq!(camera["fisheye_fov"], json!(std::f64::consts::TAU));
+        assert_eq!(
+            scene["data_blocks"]["plain"]["camera"]["projection"],
+            json!("perspective")
+        );
     }
 
     /// A project saved at schema 3 labelled its EXR straight, but Blender and the loader read an EXR as premultiplied.
@@ -1264,7 +1308,7 @@ mod tests {
         scene["schema_version"] = json!(3);
         scene["images"] = json!({ "texel": serde_json::to_value(&image)? });
         let parsed = parse_scene(&serde_json::to_vec(&scene)?, root.path())?;
-        assert_eq!(parsed.doc.schema_version, 5);
+        assert_eq!(parsed.doc.schema_version, 6);
         let id = crate::model::Id::new("texel")?;
         let migrated = &parsed.doc.images[&id];
         assert_eq!(migrated.alpha_mode, ImageAlphaMode::Premultiplied);
@@ -1310,7 +1354,7 @@ mod tests {
             }
         });
         upgrade_scene(&mut scene, no_assets())?;
-        assert_eq!(scene["schema_version"], json!(5));
+        assert_eq!(scene["schema_version"], json!(6));
         assert_eq!(
             scene["scenes"]["empty"]["color_management"]["curve"],
             Value::Null
@@ -1374,7 +1418,7 @@ mod tests {
         });
 
         let migrated = parse_scene(&serde_json::to_vec(&source)?, no_assets())?.doc;
-        assert_eq!(migrated.schema_version, 5);
+        assert_eq!(migrated.schema_version, 6);
         let mesh = migrated.data_blocks[&data_id]
             .mesh
             .as_ref()
@@ -1878,7 +1922,7 @@ mod tests {
         let (record, history_warnings) =
             parse_history_record(&serde_json::to_vec(&history_record(&source))?, no_assets())?;
         assert!(history_warnings.is_empty(), "{history_warnings:?}");
-        assert_eq!(record.snapshot.schema_version, 5);
+        assert_eq!(record.snapshot.schema_version, 6);
         let history_mesh = record
             .snapshot
             .data_blocks
@@ -1945,7 +1989,7 @@ mod tests {
         let (record, history_warnings) =
             parse_history_record(&serde_json::to_vec(&history_record(&source))?, no_assets())?;
         assert!(history_warnings.is_empty(), "{history_warnings:?}");
-        assert_eq!(record.snapshot.schema_version, 5);
+        assert_eq!(record.snapshot.schema_version, 6);
         let history_mesh = record
             .snapshot
             .data_blocks

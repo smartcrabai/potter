@@ -5401,7 +5401,7 @@ fn camera_definitions(doc: &SceneDoc) -> (Vec<Value>, BTreeMap<Id, usize>) {
                     "zfar": camera.clip_end
                 }
             }),
-            CameraProjection::Panorama | CameraProjection::Fisheye => {
+            CameraProjection::Panorama => {
                 let field_of_view = (camera.sensor_width_mm / (2.0 * camera.lens_mm)).atan() * 2.0;
                 json!({
                     "name": data_id,

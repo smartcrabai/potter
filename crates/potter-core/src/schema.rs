@@ -89,7 +89,7 @@ fn scene_schema() -> Value {
     let mut root = base("Potter scene document");
     root["required"] = json!(["schema_version", "scene_id", "revision", "active_scene"]);
     root["properties"] = json!({
-        "schema_version":{"const":5},
+        "schema_version":{"const":6},
         "scene_id":{"type":"string","format":"uuid"},
         "revision":{"type":"integer","minimum":0,"maximum":9_007_199_254_740_991_u64},
         "active_scene":{"$ref":"#/$defs/id"},
@@ -2004,8 +2004,10 @@ fn field_schema(operation: &str, field: &str) -> Value {
     }
     if ["camera.create", "camera.update"].contains(&operation) {
         return match field {
-            "projection" => json!({"enum":["perspective","orthographic","panorama","fisheye"]}),
-            "panorama_type" => json!({"enum":["equirectangular","fisheye_equidistant","fisheye_equisolid"]}),
+            "projection" => json!({"enum":["perspective","orthographic","panorama"]}),
+            "panorama_type" => {
+                json!({"enum":["equirectangular","fisheye_equidistant","fisheye_equisolid"]})
+            }
             "longitude_min" | "longitude_max" => json!({"type":"number"}),
             "latitude_min" | "latitude_max" => {
                 json!({"type":"number","minimum":-std::f64::consts::FRAC_PI_2,"maximum":std::f64::consts::FRAC_PI_2})
@@ -2499,7 +2501,7 @@ fn material_set_properties() -> Value {
 
 fn camera_set_properties() -> Value {
     json!({
-        "projection":{"enum":["perspective","orthographic","panorama","fisheye"]},
+        "projection":{"enum":["perspective","orthographic","panorama"]},
         "lens_mm":{"type":"number","exclusiveMinimum":0},
         "sensor_width_mm":{"type":"number","exclusiveMinimum":0},
         "ortho_scale":{"type":"number","exclusiveMinimum":0},

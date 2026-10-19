@@ -119,7 +119,7 @@ impl SceneDoc {
             },
         )]);
         Self {
-            schema_version: 5,
+            schema_version: 6,
             scene_id,
             revision: 0,
             active_scene,
@@ -146,7 +146,7 @@ impl SceneDoc {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.schema_version != 5 {
+        if self.schema_version != 6 {
             return Err(PotError::with_details(
                 ErrorCode::UnsupportedVersion,
                 format!("unsupported scene schema_version {}", self.schema_version),
@@ -1221,7 +1221,6 @@ pub enum CameraProjection {
     Perspective,
     Orthographic,
     Panorama,
-    Fisheye,
 }
 
 /// Blender's panorama limits and fisheye field of view are float32 defaults (`rna_camera.cc`, `M_PI_F`). They are kept as
