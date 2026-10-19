@@ -229,8 +229,8 @@ fn brush_strength(brush: DabBrush, sample: &StrokeSample, feather: f64) -> f64 {
         | DabBrush::Draw
         | DabBrush::DrawSharp
         | DabBrush::Blob
-        | DabBrush::Crease => alpha * flip * pressure * feather,
-        DabBrush::Smooth => flip * alpha * pressure * feather,
+        | DabBrush::Crease
+        | DabBrush::Smooth => alpha * flip * pressure * feather,
         DabBrush::Nudge
         | DabBrush::Flatten
         | DabBrush::Fill
@@ -559,7 +559,8 @@ fn layer_dab(field: &mut Field, dab: &DabInput) {
             field.displacement[index] = grown.clamp(-limit, limit);
             let target = field.original[index]
                 + field.normals[index] * (LAYER_HEIGHT * field.displacement[index]);
-            field.positions[index] += (target - field.positions[index]) * factor;
+            let current = field.positions[index];
+            field.positions[index] = current + (target - current) * factor;
         }
     }
 }

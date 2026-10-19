@@ -18,7 +18,7 @@ const VOLUME_PRESERVATION: f64 = 0.4;
 /// The `shear_modulus` argument of `BKE_kelvinlet_init_params` in `do_elastic_deform_brush`.
 const SHEAR_MODULUS: f64 = 1.0;
 /// `calc_translations` scales the Kelvinlet translations by `cache.bstrength * 20.0f`
-/// (elastic_deform.cc).
+/// (`elastic_deform.cc`).
 const STRENGTH_SCALE: f64 = 20.0;
 
 /// Blender's `BKE_kelvinlet_grab_triscale` (kelvinlet.cc): the scalar fade that multiplies the grab

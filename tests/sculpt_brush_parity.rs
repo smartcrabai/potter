@@ -236,6 +236,9 @@ fn max_error_against_blender(name: &str, text: &str) -> Result<f64, Box<dyn Erro
         falloff,
         symmetry,
         delta: None,
+        // The fixtures come from Blender's TOP orthographic view (`generate_oracle.py`
+        // `set_top_ortho_view`), whose viewer sits at +Z.
+        view: Some(DVec3::Z),
     };
     let mut mesh = Mesh::from_positions_and_faces(base.clone(), faces)?;
     if document["mask"].is_array() {
