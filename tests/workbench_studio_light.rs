@@ -161,11 +161,11 @@ fn solid_preview_lights_surfaces_as_workbench_studio_lighting_does() -> TestResu
              "material": "floor_mat", "transform": {"translation": [0.0, 0.0, -1.0]}},
             {"op": "camera.create", "id": "perspective",
              "transform": {"translation": [3.2, -4.6, 2.6],
-             "rotation": [0.513445087, 0.161024448, 0.252227132, 0.804255397]}},
+             "rotation": [0.513_445_087, 0.161_024_448, 0.252_227_132, 0.804_255_397]}},
             {"op": "camera.create", "id": "orthographic", "projection": "orthographic",
              "ortho_scale": 4.4,
              "transform": {"translation": [-2.6, -3.4, 3.9],
-             "rotation": [0.382697454, -0.129555881, -0.293319548, 0.866441905]}}
+             "rotation": [0.382_697_454, -0.129_555_881, -0.293_319_548, 0.866_441_905]}}
         ]),
     )?;
     assert_eq!(applied["ok"], json!(true), "scene apply failed: {applied}");
@@ -174,7 +174,7 @@ fn solid_preview_lights_surfaces_as_workbench_studio_lighting_does() -> TestResu
         &scene,
         root.path(),
         json!([
-            {"op": "world.create", "id": "world_main", "color": [0.887923, 0.887923, 0.887923]},
+            {"op": "world.create", "id": "world_main", "color": [0.887_923, 0.887_923, 0.887_923]},
             {"op": "scene.update", "target": {"id": "scene_main"}, "set": {"world": "world_main"}}
         ]),
     )?;

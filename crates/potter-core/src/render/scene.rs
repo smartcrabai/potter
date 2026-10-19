@@ -2958,7 +2958,8 @@ mod shading_normal_tests {
             colors_for(&body_id),
             vec![
                 [0.0, 0.0, 1.0, 1.0],
-                Material::default().base_color,
+                // Solid's no-material face takes Blender's empty default surface, not Potter's Beauty default.
+                [0.8, 0.8, 0.8, 1.0],
                 [1.0, 0.7, 0.0, 1.0],
                 [1.0, 0.7, 0.0, 1.0],
             ]
@@ -2967,7 +2968,8 @@ mod shading_normal_tests {
             colors_for(&linked_id),
             vec![
                 [0.0, 0.0, 1.0, 1.0],
-                Material::default().base_color,
+                // Solid's no-material face takes Blender's empty default surface, not Potter's Beauty default.
+                [0.8, 0.8, 0.8, 1.0],
                 [1.0, 0.0, 0.0, 1.0],
                 [1.0, 0.7, 0.0, 1.0],
             ]
