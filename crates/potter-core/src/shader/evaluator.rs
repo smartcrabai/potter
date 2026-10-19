@@ -2927,14 +2927,15 @@ mod tests {
         evaluate_surface(&native, &context).unwrap();
         evaluate_surface(&native, &context).unwrap();
 
-        // A graph material sets coat and rough transmission on its Principled node.
+        // A graph material sets subsurface and rough transmission on its Principled node. Coat is
+        // evaluated, so it must not warn.
         let mut graph = NodeGroup::new("Graph", GraphKind::Shader);
         insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
         insert_node(
             &mut graph,
             "principled",
             "ShaderNodeBsdfPrincipled",
-            json!({"Coat Weight":0.5,"Transmission Weight":0.5,"Roughness":0.3}),
+            json!({"Subsurface Weight":0.5,"Transmission Weight":0.5,"Roughness":0.3}),
         );
         link(&mut graph, "principled", "BSDF", "output", "Surface");
         let graph_id = Id::new("graph_shader".to_owned()).unwrap();
@@ -2960,15 +2961,16 @@ mod tests {
                 .count()
         };
         assert_eq!(count("Native", "Transmission Weight"), 1);
-        assert_eq!(count("Graph", "Coat Weight"), 1);
+        assert_eq!(count("Graph", "Subsurface Weight"), 1);
+        assert_eq!(count("Graph", "Coat Weight"), 0);
         assert_eq!(count("Graph", "Transmission Weight"), 1);
         let native_warning = warnings.iter().find(|w| w["material"] == "Native").unwrap();
         assert!(native_warning.get("node_id").is_none());
-        let coat_warning = warnings
+        let subsurface_warning = warnings
             .iter()
-            .find(|w| w["input"] == "Coat Weight")
+            .find(|w| w["input"] == "Subsurface Weight")
             .unwrap();
-        assert_eq!(coat_warning["node_id"], "principled");
+        assert_eq!(subsurface_warning["node_id"], "principled");
     }
 
     #[test]

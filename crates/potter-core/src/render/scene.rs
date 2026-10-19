@@ -1924,6 +1924,16 @@ fn shade(
         reflectance: 1.0,
         ..*params
     };
+    // The camera is the view for the lobes and the environment; without one, the normal.
+    let view = scene
+        .and_then(|scene| scene.camera.as_ref())
+        .and_then(|camera_id| snapshot.nodes.get(camera_id))
+        .map(|camera| {
+            (DMat4::from_cols_array(&camera.world_matrix).transform_point3(DVec3::ZERO) - point)
+                .normalize_or_zero()
+        })
+        .filter(|direction| direction.length_squared() > f64::EPSILON)
+        .unwrap_or(normal);
     if matches!(mode, Mode::Solid) {
         result += albedo * 0.30;
         for (direction, intensity, color) in [
@@ -1941,16 +1951,6 @@ fn shade(
             result += punctual_radiance(&lobe, normal, normal, -direction, color, intensity);
         }
     } else {
-        // The camera is the view for the lobes and the environment; without one, the normal.
-        let view = scene
-            .and_then(|scene| scene.camera.as_ref())
-            .and_then(|camera_id| snapshot.nodes.get(camera_id))
-            .map(|camera| {
-                (DMat4::from_cols_array(&camera.world_matrix).transform_point3(DVec3::ZERO) - point)
-                    .normalize_or_zero()
-            })
-            .filter(|direction| direction.length_squared() > f64::EPSILON)
-            .unwrap_or(normal);
         if let Some(world) = scene
             .and_then(|value| value.world.as_ref())
             .and_then(|id| doc.worlds.get(id))

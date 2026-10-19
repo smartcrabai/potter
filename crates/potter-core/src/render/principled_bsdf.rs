@@ -193,7 +193,7 @@ pub(crate) fn specular_coefficient(
     (reflected * common) * (params.reflectance.clamp(0.0, 1.0) * coat_lower_factor(params, view))
 }
 
-/// Cycles' CLOSURE_WEIGHT_CUTOFF: a coat weight at or below it is not set up.
+/// Cycles' `CLOSURE_WEIGHT_CUTOFF`: a coat weight at or below it is not set up.
 const COAT_WEIGHT_CUTOFF: f64 = 1.0e-5;
 
 /// Continuous Principled BSDF times reflectance, the `evaluate / density` estimator's numerator.
