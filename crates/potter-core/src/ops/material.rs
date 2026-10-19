@@ -80,7 +80,6 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
         emission_strength: 0.0,
         transmission: 0.0,
         ior: 1.5,
-        double_sided: false,
         ..Material::default()
     };
     if let Some(value) = operation.get("alpha_mode") {
