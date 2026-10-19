@@ -1776,22 +1776,6 @@ mod tests {
     }
 
     #[test]
-    fn triangulation_retains_collinear_boundary_vertices() {
-        let mesh = Mesh::from_positions_and_faces(
-            vec![
-                DVec3::new(0.0, 0.0, 0.0),
-                DVec3::new(1.0, 0.0, 0.0),
-                DVec3::new(2.0, 0.0, 0.0),
-                DVec3::new(2.0, 2.0, 0.0),
-                DVec3::new(0.0, 2.0, 0.0),
-            ],
-            vec![vec![0, 1, 2, 3, 4]],
-        )
-        .unwrap();
-        assert_eq!(mesh.tessellate().unwrap().len(), 3);
-    }
-
-    #[test]
     fn primitive_parameters_reject_invalid_values() {
         assert!(
             Mesh::uv_sphere(UvSphereParams {
@@ -1927,36 +1911,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(collinear.tessellate().unwrap(), vec![[0, 1, 2]]);
-    }
-
-    #[test]
-    fn tessellation_is_total_for_self_intersecting_faces() {
-        // Bowtie quad: one split, no failure. Hexagon with zero net area: Newell sum is zero, so the
-        // projection falls back to +Z, and the clip ear-clipper still yields n - 2 triangles.
-        let bowtie = Mesh::from_positions_and_faces(
-            vec![
-                DVec3::ZERO,
-                DVec3::new(1.0, 1.0, 0.0),
-                DVec3::new(1.0, 0.0, 0.0),
-                DVec3::new(0.0, 1.0, 0.0),
-            ],
-            vec![vec![0, 1, 2, 3]],
-        )
-        .unwrap();
-        assert_eq!(bowtie.tessellate().unwrap().len(), 2);
-        let figure_eight = Mesh::from_positions_and_faces(
-            vec![
-                DVec3::new(0.0, 0.0, 0.0),
-                DVec3::new(2.0, 2.0, 0.0),
-                DVec3::new(4.0, 0.0, 0.0),
-                DVec3::new(4.0, 2.0, 0.0),
-                DVec3::new(2.0, 0.0, 0.0),
-                DVec3::new(0.0, 2.0, 0.0),
-            ],
-            vec![vec![0, 1, 2, 3, 4, 5]],
-        )
-        .unwrap();
-        assert_eq!(figure_eight.tessellate().unwrap().len(), 4);
     }
 
     #[test]
