@@ -460,6 +460,7 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     let mut faces = Vec::<Polygon>::new();
     let mut branch_faces = Vec::new();
     let mut branch_frame_states = vec![(false, [false; 4]); frames.len()];
+    let mut hull_edge_slots = HullEdgeSlots::default();
     for ring_frames in &branch_rings {
         let rings: Vec<[usize; 4]> = ring_frames
             .iter()
@@ -471,6 +472,7 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             ring_frames,
             &mut branch_faces,
             &mut branch_frame_states,
+            &mut hull_edge_slots,
         )?;
     }
     let mut detached_frames: Vec<(usize, [bool; 4])> = branch_frame_states
@@ -481,7 +483,8 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     // skin_fix_hull_topology walks skin nodes in index order and each node's frames in order
     // (MOD_skin.cc:1676-1690), so repairs run in (node, frame) order rather than frame order.
     detached_frames.sort_by_key(|&(frame, _)| (frame_nodes[frame], frame));
-    branch_faces = merge_triangle_faces(&points, branch_faces, symmetry_axes);
+    let hull_edge_order = hull_edge_slots.order();
+    branch_faces = merge_triangle_faces(&points, branch_faces, symmetry_axes, &hull_edge_order);
     let mut welded = Vec::new();
     let mut tagged_edges = TaggedEdges::default();
     repair_detached_branch_frames(
@@ -561,8 +564,9 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     // Blender's final hull_merge_triangles deletes every edge still tagged BM_ELEM_TAG, which
     // removes all faces around it (MOD_skin.cc:1632). The tags come from the triangle split in
     // skin_fix_hole_no_good_verts.
+    let polygon_edge_order = first_appearance_edges(&polygons);
     let (kept, killed): (Vec<Vec<usize>>, Vec<Vec<usize>>) =
-        merge_triangle_faces(&points, polygons, symmetry_axes)
+        merge_triangle_faces(&points, polygons, symmetry_axes, &polygon_edge_order)
             .into_iter()
             .partition(|face| !tagged_edges.0.iter().any(|&edge| face_has_edge(face, edge)));
     let loose_edges = skin_loose_edges(&kept, &killed, &tagged_edges.0);
@@ -663,12 +667,75 @@ fn frame_side_length(frame: [DVec3; 4]) -> f32 {
     (skin_float_distance(frame[0], frame[1]) + skin_float_distance(frame[1], frame[2])) * 0.5
 }
 
+/// Blender's BMesh edge storage for one skin's branch hulls. A mempool hands out the most recently freed
+/// slot first and iterates slots in order. `hull_merge_triangles` visits edges in that order, and equal
+/// candidate scores pop in insertion order, so the slots decide ties.
+#[derive(Default)]
+struct HullEdgeSlots {
+    slots: Vec<Option<(usize, usize)>>,
+    free: Vec<usize>,
+    slot_of: HashMap<(usize, usize), usize>,
+}
+
+impl HullEdgeSlots {
+    /// Blender's `BM_edge_create`: an edge that already exists keeps its slot.
+    fn create(&mut self, edge: (usize, usize)) {
+        if self.slot_of.contains_key(&edge) {
+            return;
+        }
+        let slot = match self.free.pop() {
+            Some(slot) => slot,
+            None => {
+                self.slots.push(None);
+                self.slots.len() - 1
+            }
+        };
+        self.slots[slot] = Some(edge);
+        self.slot_of.insert(edge, slot);
+    }
+
+    /// Blender's `BM_edge_kill`: the slot goes on the free list.
+    fn kill(&mut self, edge: (usize, usize)) {
+        if let Some(slot) = self.slot_of.remove(&edge) {
+            self.slots[slot] = None;
+            self.free.push(slot);
+        }
+    }
+
+    fn slot(&self, edge: (usize, usize)) -> usize {
+        self.slot_of.get(&edge).copied().unwrap_or(usize::MAX)
+    }
+
+    /// The live edges in BMesh iteration order.
+    fn order(&self) -> Vec<(usize, usize)> {
+        self.slots.iter().flatten().copied().collect()
+    }
+}
+
+/// Edges in first-appearance order over `faces`. Only the final pass uses this, because Blender's order there
+/// needs the edge history of skin_fix_hull_topology and skin_output_connections, which Potter does not track.
+/// shortcut: final-pass edge order is first appearance, upgrade when those phases record BMesh slots (the
+/// cube case has no final-pass candidates).
+fn first_appearance_edges(faces: &[Vec<usize>]) -> Vec<(usize, usize)> {
+    let mut seen = HashSet::new();
+    let mut order = Vec::new();
+    for face in faces {
+        for edge in face_edges(face) {
+            if seen.insert(edge) {
+                order.push(edge);
+            }
+        }
+    }
+    order
+}
+
 fn branch_hull_faces(
     points: &[DVec3],
     rings: &[[usize; 4]],
     ring_frames: &[usize],
     faces: &mut Vec<Vec<usize>>,
     frame_states: &mut [(bool, [bool; 4])],
+    edge_slots: &mut HullEdgeSlots,
 ) -> Result<()> {
     if rings.len() != ring_frames.len() {
         return Err(PotError::new(
@@ -681,6 +748,12 @@ fn branch_hull_faces(
     input.dedup();
     let hull_start = faces.len();
     faces.extend(bullet_hull_faces(points, &input)?);
+    // hull_output_triangles creates each triangle's edges in order before its face.
+    for face in &faces[hull_start..] {
+        for edge in face_edges(face) {
+            edge_slots.create(edge);
+        }
+    }
     let mut hull_vertices = HashSet::new();
     let mut hull_edges = HashSet::new();
     for face in faces.iter() {
@@ -749,6 +822,24 @@ fn branch_hull_faces(
                 *detached = true;
             }
         }
+    }
+
+    // BM_mesh_delete_hflag_tagged: removed triangles free the edges no surviving triangle uses,
+    // lowest slot first.
+    let surviving: HashSet<(usize, usize)> = (hull_start..faces.len())
+        .filter(|&index| !removed_faces[index])
+        .flat_map(|index| face_edges(&faces[index]))
+        .collect();
+    let mut freed: Vec<(usize, usize)> = (hull_start..faces.len())
+        .filter(|&index| removed_faces[index])
+        .flat_map(|index| face_edges(&faces[index]))
+        .filter(|edge| !surviving.contains(edge))
+        .collect();
+    freed.sort_unstable();
+    freed.dedup();
+    freed.sort_by_key(|&edge| edge_slots.slot(edge));
+    for edge in freed {
+        edge_slots.kill(edge);
     }
 
     let mut face_index = 0;
@@ -1465,28 +1556,26 @@ fn triangle_of(face: &[usize]) -> [usize; 3] {
 /// Blender's `hull_merge_triangles` (MOD_skin.cc:1557-1632). Each edge used by two triangles offers a quad.
 /// Candidates are scored in `f32` at build time and kept in a `BLI_heapsimple`; the heap pops the best first.
 /// A pop takes its quad only when both triangles are still free and they share no neighbouring face
-/// (`BM_face_share_face_check`). Edges are visited in first-appearance order over the faces, which stands in
-/// for the `BMesh` edge order.
+/// (`BM_face_share_face_check`). `edge_order` is the BMesh edge iteration order; equal scores pop in
+/// the order their edges were inserted, so it decides ties (see `HullEdgeSlots`).
 fn merge_triangle_faces(
     points: &[DVec3],
     faces: Vec<Vec<usize>>,
     symmetry_axes: [bool; 3],
+    edge_order: &[(usize, usize)],
 ) -> Vec<Vec<usize>> {
     let points32: Vec<glam::Vec3> = points.iter().map(|point| point.as_vec3()).collect();
     let mut edge_faces: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
-    let mut edge_order: Vec<(usize, usize)> = Vec::new();
     for (face_index, face) in faces.iter().enumerate() {
         for edge in face_edges(face) {
-            let adjacent = edge_faces.entry(edge).or_default();
-            if adjacent.is_empty() {
-                edge_order.push(edge);
-            }
-            adjacent.push(face_index);
+            edge_faces.entry(edge).or_default().push(face_index);
         }
     }
     let mut heap = HeapSimple::new();
     for (edge_position, &edge) in edge_order.iter().enumerate() {
-        let adjacent = &edge_faces[&edge];
+        let Some(adjacent) = edge_faces.get(&edge) else {
+            continue;
+        };
         if adjacent.len() != 2 {
             continue;
         }
