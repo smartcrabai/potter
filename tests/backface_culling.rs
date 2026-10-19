@@ -126,17 +126,18 @@ fn realtime_beauty_culls_single_sided_back_faces_as_eevee_does() -> TestResult {
     pot_json(|command| {
         command.arg("init").arg(&scene);
     })?;
-    // Single-sided material (`double_sided` defaults to false), matching EEVEE's
-    // `use_backface_culling` on. With no lights or world the plane is black, which still contrasts
-    // with the 13/255 background, so coverage measures whether the plane is drawn.
+    // Diffuse white, single-sided (`double_sided` defaults to false), matching EEVEE's
+    // `use_backface_culling` on. A sun above the plane (identity rotation shines down -Z, as
+    // Blender's sun does) lights the front face, so coverage measures shading, not emission.
     let applied = apply_operations(
         &scene,
         root.path(),
         json!([
-            {"op": "material.create", "id": "single", "base_color": [0.0, 0.0, 0.0, 1.0],
-             "emission_color": [1.0, 0.0, 0.0], "emission_strength": 1.0},
+            {"op": "material.create", "id": "single", "base_color": [0.8, 0.8, 0.8, 1.0]},
             {"op": "node.create", "id": "plane", "kind": "plane", "params": {"size": 2.0},
              "material": "single"},
+            {"op": "light.create", "id": "sun", "light_type": "sun", "energy": 3.0,
+             "transform": {"translation": [0.0, 0.0, 5.0], "rotation": [1.0, 0.0, 0.0, 0.0]}},
             {"op": "camera.create", "id": "camera_top", "projection": "orthographic",
              "ortho_scale": 2.2, "transform": {"translation": [0.0, 0.0, 5.0],
              "rotation": [1.0, 0.0, 0.0, 0.0]}},

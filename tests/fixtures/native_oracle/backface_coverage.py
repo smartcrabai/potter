@@ -7,8 +7,9 @@ background.
 
 - Workbench (Solid): the scene's `show_backface_culling` decides. Off draws the back face; on
   hides it.
-- EEVEE (Beauty): the material's `use_backface_culling` decides. The material is emissive red, so
-  a drawn face is lit regardless of lights.
+- EEVEE (Beauty): the material's `use_backface_culling` decides. The material is diffuse white and
+  a sun above the plane (identity rotation, shining down -Z) lights its front face; the back face
+  is unlit, so a drawn back face covers pixels that differ from the background.
 
 Run: blender -b --factory-startup --python backface_coverage.py -- <out.json> <png_dir>
 """
@@ -33,10 +34,15 @@ bpy.ops.object.select_all(action="DESELECT")
 material = bpy.data.materials.new("Single")
 material.use_nodes = True
 principled = material.node_tree.nodes["Principled BSDF"]
-principled.inputs["Base Color"].default_value = (0.0, 0.0, 0.0, 1.0)
-principled.inputs["Emission Color"].default_value = (1.0, 0.0, 0.0, 1.0)
-principled.inputs["Emission Strength"].default_value = 1.0
+principled.inputs["Base Color"].default_value = (0.8, 0.8, 0.8, 1.0)
 plane.data.materials.append(material)
+
+sun_data = bpy.data.lights.new("Sun", "SUN")
+sun_data.energy = 3.0
+sun = bpy.data.objects.new("Sun", sun_data)
+scene.collection.objects.link(sun)
+sun.location = (0.0, 0.0, 5.0)
+sun.rotation_euler = (0.0, 0.0, 0.0)
 
 camera_data = bpy.data.cameras.new("Camera")
 camera_data.type = "ORTHO"
