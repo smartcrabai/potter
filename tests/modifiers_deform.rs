@@ -1999,16 +1999,6 @@ with open(sys.argv[-1], 'w', encoding='utf-8') as output:
         .collect::<Vec<_>>();
     let maximum_error = errors.iter().copied().fold(0.0, f64::max);
     let mean_error = errors.iter().sum::<f64>() / errors.len() as f64;
-    let worst_index = errors
-        .iter()
-        .enumerate()
-        .max_by(|left, right| left.1.total_cmp(right.1))
-        .map(|(index, _)| index)
-        .ok_or("Laplacian error vector is empty")?;
-    eprintln!(
-        "Laplacian topology max/mean vertex errors: {maximum_error}/{mean_error}; worst={worst_index}, native={}, Blender={}",
-        native[worst_index], reference[worst_index]
-    );
     assert!(
         maximum_error <= 1.0e-5,
         "Laplacian Deform max/mean vertex errors were {maximum_error}/{mean_error}"
