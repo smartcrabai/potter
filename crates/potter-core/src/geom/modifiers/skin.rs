@@ -667,7 +667,7 @@ fn frame_side_length(frame: [DVec3; 4]) -> f32 {
     (skin_float_distance(frame[0], frame[1]) + skin_float_distance(frame[1], frame[2])) * 0.5
 }
 
-/// Blender's BMesh edge storage for one skin's branch hulls. A mempool hands out the most recently freed
+/// Blender's `BMesh` edge storage for one skin's branch hulls. A mempool hands out the most recently freed
 /// slot first and iterates slots in order. `hull_merge_triangles` visits edges in that order, and equal
 /// candidate scores pop in insertion order, so the slots decide ties.
 #[derive(Default)]
@@ -683,12 +683,11 @@ impl HullEdgeSlots {
         if self.slot_of.contains_key(&edge) {
             return;
         }
-        let slot = match self.free.pop() {
-            Some(slot) => slot,
-            None => {
-                self.slots.push(None);
-                self.slots.len() - 1
-            }
+        let slot = if let Some(slot) = self.free.pop() {
+            slot
+        } else {
+            self.slots.push(None);
+            self.slots.len() - 1
         };
         self.slots[slot] = Some(edge);
         self.slot_of.insert(edge, slot);
@@ -706,15 +705,15 @@ impl HullEdgeSlots {
         self.slot_of.get(&edge).copied().unwrap_or(usize::MAX)
     }
 
-    /// The live edges in BMesh iteration order.
+    /// The live edges in `BMesh` iteration order.
     fn order(&self) -> Vec<(usize, usize)> {
         self.slots.iter().flatten().copied().collect()
     }
 }
 
 /// Edges in first-appearance order over `faces`. Only the final pass uses this, because Blender's order there
-/// needs the edge history of skin_fix_hull_topology and skin_output_connections, which Potter does not track.
-/// shortcut: final-pass edge order is first appearance, upgrade when those phases record BMesh slots (the
+/// needs the edge history of `skin_fix_hull_topology` and `skin_output_connections`, which Potter does not track.
+/// shortcut: final-pass edge order is first appearance, upgrade when those phases record `BMesh` slots (the
 /// cube case has no final-pass candidates).
 fn first_appearance_edges(faces: &[Vec<usize>]) -> Vec<(usize, usize)> {
     let mut seen = HashSet::new();
@@ -1556,7 +1555,7 @@ fn triangle_of(face: &[usize]) -> [usize; 3] {
 /// Blender's `hull_merge_triangles` (MOD_skin.cc:1557-1632). Each edge used by two triangles offers a quad.
 /// Candidates are scored in `f32` at build time and kept in a `BLI_heapsimple`; the heap pops the best first.
 /// A pop takes its quad only when both triangles are still free and they share no neighbouring face
-/// (`BM_face_share_face_check`). `edge_order` is the BMesh edge iteration order; equal scores pop in
+/// (`BM_face_share_face_check`). `edge_order` is the `BMesh` edge iteration order; equal scores pop in
 /// the order their edges were inserted, so it decides ties (see `HullEdgeSlots`).
 fn merge_triangle_faces(
     points: &[DVec3],
