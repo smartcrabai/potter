@@ -540,6 +540,7 @@ pub fn evaluate_modifiers_with_groups_at_frame(
             ..ModifierEvaluationContext::default()
         },
         |_, modifier| modifier.enabled,
+        None,
         |_, modifier, _warnings| Err(unsupported_modifier(modifier)),
     )
 }
@@ -7266,8 +7267,8 @@ mod tests {
     };
 
     use super::{
-        array_chunk_elements, blender_edge_crease_sharpness, check_evaluation_memory_budget,
-        check_subdivision_budget, contextless_material_slot_count, edge_pairs, evaluate_modifiers,
+        array_chunk_elements, check_evaluation_memory_budget, check_subdivision_budget,
+        contextless_material_slot_count, edge_pairs, evaluate_modifiers,
         evaluated_curve_path_length, loose_edges,
     };
 

@@ -83,7 +83,7 @@ fn apply_stroke(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resu
             .get(&node_id)
             .and_then(|node| active_multires_modifier(&node.modifiers, dyntopo_edge_length))
             .map(|(index, modifier)| (index, modifier.clone()));
-        let (mut sculpted_mesh, mesh_changed) = if let Some((modifier_index, modifier)) =
+        let (sculpted_mesh, mesh_changed) = if let Some((modifier_index, modifier)) =
             multires_modifier
         {
             let deformed_base = multires_deformed_base(engine, &node_id, &before, modifier_index)?;
