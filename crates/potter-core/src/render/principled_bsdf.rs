@@ -365,16 +365,16 @@ mod single_bounce_tests {
     use crate::model::Material;
 
     // Geometry of tests/fixtures/native_oracle/principled/single_bounce_probe.py: a receiver at the
-    // origin with normal +Z under a disk emitter of radius 0.6 and flux 1000 W, radiance
+    // origin with normal +Z under a disk emitter of radius 1.2 and flux 1000 W, radiance
     // P / (π · area) (Cycles' AreaLight convention), 4 units away on the mirror of a view 45°
     // from the normal. The Blender pixel is the single-bounce integral of the lobe.
     const VIEW_THETA: f64 = std::f64::consts::FRAC_PI_4;
     const LIGHT_DISTANCE: f64 = 4.0;
-    const RADIUS: f64 = 0.6;
+    const RADIUS: f64 = 1.2;
     const POWER: f64 = 1000.0;
-    /// Quadrature resolution over the disk's bounding square. 256 agrees with 512 to about 2e-5 on
-    /// the patch mean.
-    const GRID: usize = 256;
+    /// Quadrature resolution over the disk's bounding square. 512 is needed at this radius: 256 is
+    /// 0.02% off on the diffuse variant, more than its Blender stderr.
+    const GRID: usize = 512;
     /// Orthographic width of the probe camera (Blender's `ortho_scale`) in units.
     const ORTHO_SCALE: f64 = 0.2;
 
@@ -459,8 +459,8 @@ mod single_bounce_tests {
         assert_matches_oracle(
             "metal_r024",
             &params,
-            [11.148_457_058_705_39, 29.649_656_252_935_53, 47.195_129_439_234_73],
-            [6.812_977_467_911_867e-4, 1.811_415_051_308_997e-3, 2.883_559_318_995_121e-3],
+            [3.615_886_153_886_094_7, 9.598_245_684_988_797, 15.271_571_726_538_241],
+            [3.895_179_372_176_688_5e-4, 1.033_227_747_352_539_5e-3, 1.643_885_182_480_052_4e-3],
         );
     }
 
@@ -470,8 +470,8 @@ mod single_bounce_tests {
         assert_matches_oracle(
             "metal_r024_white",
             &params,
-            [196.060_496_509_075_16; 3],
-            [1.169_790_711_305_705_7e-2; 3],
+            [63.410_192_094_743_25; 3],
+            [6.732_953_963_258_015e-3; 3],
         );
     }
 
@@ -481,8 +481,8 @@ mod single_bounce_tests {
         assert_matches_oracle(
             "spec_only_r024",
             &params,
-            [9.831_078_226_678_073; 3],
-            [7.116_958_950_052_36e-4; 3],
+            [3.192_535_599_227_994_7; 3],
+            [3.107_007_194_890_755e-4; 3],
         );
     }
 
@@ -493,8 +493,8 @@ mod single_bounce_tests {
         assert_matches_oracle(
             "diffuse_white",
             &params,
-            [3.503_811_418_544_501; 3],
-            [5.646_886_564_656_729e-5; 3],
+            [3.286_944_471_765_309_6; 3],
+            [1.506_987_510_377_347_2e-4; 3],
         );
     }
 }
