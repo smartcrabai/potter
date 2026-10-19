@@ -198,6 +198,11 @@ def make_object(name, spec):
             edge_idx.data[i].value = (7 * i) % 19
             edge_flag.data[i].value = i % 3 == 0
             edge_col.data[i].color = ((i % 5) / 4.0, (i % 7) / 6.0, (i % 11) / 10.0, 1.0)
+    if spec.get("edge_float"):
+        # One FLOAT EDGE attribute with exact binary fractions, so each value identifies its edge's input.
+        edge_w = me.attributes.new("edge_w", "FLOAT", "EDGE")
+        for i in range(len(me.edges)):
+            edge_w.data[i].value = ((5 * i) % 16) / 8.0
     if spec.get("bytecol"):
         # Bytes are written exactly: `color_srgb` = byte / 255 quantises back to the same byte in Blender.
         bcol = me.attributes.new("bcol", "BYTE_COLOR", "POINT")
@@ -208,7 +213,7 @@ def make_object(name, spec):
 
 # Generic custom attributes Blender interpolates during collapse.
 POINT_ATTRIBUTE_TYPES = {"idx": "INT", "flag": "BOOLEAN", "col": "FLOAT_COLOR", "bcol": "BYTE_COLOR"}
-EDGE_ATTRIBUTE_TYPES = {"edge_idx": "INT", "edge_flag": "BOOLEAN", "edge_col": "FLOAT_COLOR"}
+EDGE_ATTRIBUTE_TYPES = {"edge_idx": "INT", "edge_flag": "BOOLEAN", "edge_col": "FLOAT_COLOR", "edge_w": "FLOAT"}
 
 
 def generic_attributes(me, types):
@@ -512,6 +517,13 @@ def all_cases():
         {"decimate_type": "DISSOLVE", "angle_limit": 3.14, "delimit": ["SHARP", "SEAM"]})
     cases["grid9_dissolve_material3"] = (dict(mesh="grid", n=9, wave=True, materials=3),
                                          {"decimate_type": "DISSOLVE", "angle_limit": 3.14, "delimit": ["MATERIAL"]})
+    # EDGE FLOAT values and seams through UNSUBDIV and DISSOLVE: each output edge keeps its own value.
+    cases["grid9_unsubdiv1_seam_edgew"] = (
+        dict(mesh="grid", n=9, wave=True, seam=center_line_x, edge_float=True),
+        {"decimate_type": "UNSUBDIV", "iterations": 1})
+    cases["grid9_dissolve_edgew_a0.3"] = (
+        dict(mesh="grid", n=9, wave=True, edge_float=True),
+        {"decimate_type": "DISSOLVE", "angle_limit": 0.3})
     return cases
 
 
