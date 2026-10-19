@@ -462,9 +462,21 @@ fn material_volume_output_evaluates_volume_properties() {
     let (material, groups) = material_with_graph(graph);
     let params = evaluate_surface(&material, &HitContext::new(&groups)).unwrap();
     assert_eq!(params.volume_density, 0.7);
-    assert_eq!(params.volume_color, [0.2, 0.4, 0.6]);
+    assert!(
+        params
+            .volume_scatter
+            .iter()
+            .zip([0.2, 0.4, 0.6])
+            .all(|(actual, expected)| (actual - expected).abs() < 1e-12)
+    );
+    assert!(
+        params
+            .volume_absorption
+            .iter()
+            .zip([0.8, 0.6, 0.4])
+            .all(|(actual, expected)| (actual - expected).abs() < 1e-12)
+    );
     assert_eq!(params.volume_anisotropy, 0.35);
-    assert!(params.volume_scattering);
 }
 #[test]
 fn material_texture_refs_sample_uv_and_override_pbr_fields_for_graphs() {

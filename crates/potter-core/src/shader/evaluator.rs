@@ -102,6 +102,36 @@ pub(crate) fn record_unevaluated_inputs(
     }
 }
 
+/// Per-channel volume closure weights per unit density (Cycles' closure weight times density).
+/// The scatter weight feeds σs, the absorption weight σa; extinction is σt = σs + σa.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct VolumeWeights {
+    pub(crate) scatter: [f64; 3],
+    pub(crate) absorption: [f64; 3],
+}
+
+/// Principled Volume weights (`intern/cycles/kernel/svm/closure.h`, `svm_node_principled_volume`):
+/// scatter `color`, absorption `(1 - color) · (1 - sqrt(absorption_color))`, both clamped at zero.
+pub(crate) fn principled_volume_weights(
+    color: [f64; 3],
+    absorption_color: [f64; 3],
+) -> VolumeWeights {
+    VolumeWeights {
+        scatter: color.map(|channel| channel.max(0.0)),
+        absorption: std::array::from_fn(|index| {
+            (1.0 - color[index]).max(0.0) * (1.0 - absorption_color[index].max(0.0).sqrt()).max(0.0)
+        }),
+    }
+}
+
+/// The Cycles volume closure a volume node compiles to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VolumeClosure {
+    Principled,
+    Scatter,
+    Absorption,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BsdfParams {
     pub base_color: [f64; 4],
@@ -138,9 +168,12 @@ pub struct BsdfParams {
     /// it; it is reported as unevaluated.
     pub thin_wall: bool,
     pub volume_density: f64,
-    pub volume_color: [f64; 3],
+    /// Cycles' scatter weight per unit density, per channel: σs = `volume_scatter` · ρ.
+    pub volume_scatter: [f64; 3],
+    /// Cycles' absorption weight per unit density, per channel: σa = `volume_absorption` · ρ.
+    /// Extinction is σt = σs + σa; the albedo is σs / σt.
+    pub volume_absorption: [f64; 3],
     pub volume_anisotropy: f64,
-    pub volume_scattering: bool,
     pub volume_emission_color: [f64; 3],
     pub volume_emission_strength: f64,
     pub displacement_height: f64,
@@ -177,9 +210,10 @@ impl BsdfParams {
             diffuse_roughness: 0.0,
             thin_wall: false,
             volume_density: material.volume_density.max(0.0),
-            volume_color: material.volume_color,
+            volume_scatter: principled_volume_weights(material.volume_color, [0.0; 3]).scatter,
+            volume_absorption: principled_volume_weights(material.volume_color, [0.0; 3])
+                .absorption,
             volume_anisotropy: material.volume_anisotropy.clamp(-0.999, 0.999),
-            volume_scattering: false,
             volume_emission_color: material.emission_color,
             volume_emission_strength: material.emission_strength,
             displacement_height: 0.0,
@@ -234,9 +268,9 @@ impl BsdfParams {
             diffuse_roughness: mix_scalar(first.diffuse_roughness, second.diffuse_roughness),
             thin_wall: first.thin_wall || second.thin_wall,
             volume_density: mix_scalar(first.volume_density, second.volume_density),
-            volume_color: mix3(first.volume_color, second.volume_color),
+            volume_scatter: mix3(first.volume_scatter, second.volume_scatter),
+            volume_absorption: mix3(first.volume_absorption, second.volume_absorption),
             volume_anisotropy: mix_scalar(first.volume_anisotropy, second.volume_anisotropy),
-            volume_scattering: first.volume_scattering || second.volume_scattering,
             volume_emission_color: mix3(first.volume_emission_color, second.volume_emission_color),
             volume_emission_strength: mix_scalar(
                 first.volume_emission_strength,
@@ -282,9 +316,9 @@ impl BsdfParams {
             diffuse_roughness: first.diffuse_roughness.max(second.diffuse_roughness),
             thin_wall: first.thin_wall || second.thin_wall,
             volume_density: first.volume_density + second.volume_density,
-            volume_color: add3(first.volume_color, second.volume_color),
+            volume_scatter: add3(first.volume_scatter, second.volume_scatter),
+            volume_absorption: add3(first.volume_absorption, second.volume_absorption),
             volume_anisotropy: first.volume_anisotropy,
-            volume_scattering: first.volume_scattering || second.volume_scattering,
             volume_emission_color: add3(first.volume_emission_color, second.volume_emission_color),
             volume_emission_strength: first
                 .volume_emission_strength
@@ -598,9 +632,9 @@ fn evaluate_surface_inner(
             return Err(eval_error("material volume output is not a volume shader"));
         };
         params.volume_density = volume.volume_density;
-        params.volume_color = volume.volume_color;
+        params.volume_scatter = volume.volume_scatter;
+        params.volume_absorption = volume.volume_absorption;
         params.volume_anisotropy = volume.volume_anisotropy;
-        params.volume_scattering = volume.volume_scattering;
         params.volume_emission_color = volume.volume_emission_color;
         params.volume_emission_strength = volume.volume_emission_strength;
     }
@@ -1068,10 +1102,15 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
         match kind {
             NodeKind::OutputMaterial => Err(invalid("material output has no output sockets")),
             NodeKind::Principled => Ok(Value::Shader(self.principled(node_id)?)),
-            NodeKind::VolumePrincipled | NodeKind::VolumeScatter => {
-                Ok(Value::Shader(self.volume(node_id, true)?))
+            NodeKind::VolumePrincipled => Ok(Value::Shader(
+                self.volume(node_id, VolumeClosure::Principled)?,
+            )),
+            NodeKind::VolumeScatter => {
+                Ok(Value::Shader(self.volume(node_id, VolumeClosure::Scatter)?))
             }
-            NodeKind::VolumeAbsorption => Ok(Value::Shader(self.volume(node_id, false)?)),
+            NodeKind::VolumeAbsorption => Ok(Value::Shader(
+                self.volume(node_id, VolumeClosure::Absorption)?,
+            )),
             NodeKind::Displacement => self.displacement(node_id, socket),
             NodeKind::ImageTexture => self.image_texture(node_id, socket),
             NodeKind::Emission => Ok(Value::Shader(self.emission(node_id)?)),
@@ -1177,25 +1216,50 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
         Ok(params)
     }
 
-    fn volume(&mut self, id: &Id, scattering: bool) -> Result<BsdfParams> {
+    fn volume(&mut self, id: &Id, closure: VolumeClosure) -> Result<BsdfParams> {
         let mut params = BsdfParams::from_material(self.material, self.hit_ctx.normal);
         params.volume_density = self.scalar_input(id, &["Density"], 1.0)?.max(0.0);
-        params.volume_color = self.color_input(id, &["Color"], [0.5, 0.5, 0.5, 1.0])?[..3]
+        // Blender's node defaults: Principled Volume 0.5; Volume Absorption and Scatter 0.8.
+        let default_color = match closure {
+            VolumeClosure::Principled => [0.5, 0.5, 0.5, 1.0],
+            VolumeClosure::Scatter | VolumeClosure::Absorption => [0.8, 0.8, 0.8, 1.0],
+        };
+        let color: [f64; 3] = self.color_input(id, &["Color"], default_color)?[..3]
             .try_into()
             .map_err(|_| invalid("invalid volume color"))?;
+        let weights = match closure {
+            VolumeClosure::Principled => {
+                let absorption_color: [f64; 3] =
+                    self.color_input(id, &["Absorption Color"], [0.0, 0.0, 0.0, 1.0])?[..3]
+                        .try_into()
+                        .map_err(|_| invalid("invalid volume absorption color"))?;
+                principled_volume_weights(color, absorption_color)
+            }
+            // Cycles' scatter closure: the colour weights scattering and extinction alike.
+            VolumeClosure::Scatter => VolumeWeights {
+                scatter: color.map(|channel| channel.max(0.0)),
+                absorption: [0.0; 3],
+            },
+            // Cycles' absorption closure: extinction weight `1 - color`, no scattering.
+            VolumeClosure::Absorption => VolumeWeights {
+                scatter: [0.0; 3],
+                absorption: color.map(|channel| (1.0 - channel).max(0.0)),
+            },
+        };
+        params.volume_scatter = weights.scatter;
+        params.volume_absorption = weights.absorption;
         params.volume_anisotropy = self
             .scalar_input(id, &["Anisotropy"], 0.0)?
             .clamp(-0.999, 0.999);
-        params.volume_scattering = scattering;
-        if scattering {
+        if closure == VolumeClosure::Absorption {
+            params.volume_emission_color = [0.0; 3];
+            params.volume_emission_strength = 0.0;
+        } else {
             params.volume_emission_color =
                 self.color_input(id, &["Emission Color", "Emission"], [0.0, 0.0, 0.0, 1.0])?[..3]
                     .try_into()
                     .map_err(|_| invalid("invalid volume emission color"))?;
             params.volume_emission_strength = self.scalar_input(id, &["Emission Strength"], 0.0)?;
-        } else {
-            params.volume_emission_color = [0.0; 3];
-            params.volume_emission_strength = 0.0;
         }
         Ok(params)
     }
@@ -2767,9 +2831,21 @@ mod tests {
         };
         let params = evaluate_surface(&material, &HitContext::new(&groups)).unwrap();
         assert_eq!(params.volume_density, 0.7);
-        assert_eq!(params.volume_color, [0.2, 0.4, 0.6]);
+        assert!(
+            params
+                .volume_scatter
+                .iter()
+                .zip([0.2, 0.4, 0.6])
+                .all(|(actual, expected)| (actual - expected).abs() < 1e-12)
+        );
+        assert!(
+            params
+                .volume_absorption
+                .iter()
+                .zip([0.8, 0.6, 0.4])
+                .all(|(actual, expected)| (actual - expected).abs() < 1e-12)
+        );
         assert_eq!(params.volume_anisotropy, 0.35);
-        assert!(params.volume_scattering);
     }
 
     #[test]
