@@ -196,7 +196,7 @@ pub fn apply_stroke_with_dyntopo(
                 stroke,
                 brush,
                 vertex.co,
-                normal,
+                *normal,
                 center,
                 delta,
                 motion,
