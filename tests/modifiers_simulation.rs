@@ -2676,9 +2676,20 @@ fn affine_inline_volume_displacement_preserves_sampling_and_mesh_space()
         expected_index_to_local.transform_point3(DVec3::ZERO),
     );
     let sample_position = expected_index_to_local.transform_point3(DVec3::new(2.0, 1.0, 1.0));
-    assert_eq!(
-        potter_core::geom::volume::sample_density_checked(sample_position, displaced)?,
-        0.75,
+    // Blender's Volume Displace subtracts `(texture - mid) * strength / max_voxel_side_length` in index space
+    // (MOD_volume_displace.cc DisplaceOp). The texture displacement is (0.5, 0, 0) in object space, and OpenVDB's
+    // voxelSize() of this affine map is [0.5, 2.0223748, 1.5] (queried in Blender's bundled OpenVDB), so the
+    // density at index 1 - 0.5 / 2.0223748 is the linear ramp value 1 - 0.5 / max voxel.
+    let max_voxel_side_length = index_to_local
+        .transform_vector3(DVec3::X)
+        .length()
+        .max(index_to_local.transform_vector3(DVec3::Y).length())
+        .max(index_to_local.transform_vector3(DVec3::Z).length());
+    let expected_sample = 1.0 - 0.5 / max_voxel_side_length;
+    let sampled = potter_core::geom::volume::sample_density_checked(sample_position, displaced)?;
+    assert!(
+        (sampled - expected_sample).abs() <= 1.0e-9,
+        "affine displaced density {sampled} differs from Blender's index-space value {expected_sample}",
     );
     let repeated = evaluated_volume(&document, &snapshot, "affine_repeated")?;
     let repeated_grid = repeated
