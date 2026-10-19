@@ -2480,16 +2480,16 @@ impl BMesh {
         )
     }
 
-    /// The live edges as sorted output-vertex pairs, in pool order.
+    /// The live edges as BMesh vertex-index pairs, in pool order (the index space `to_mesh` passes on).
     fn pool_edge_pairs(&self) -> Vec<[usize; 2]> {
-        let output_index = self.live_vertex_index();
+        // `decimate_compact` remaps from the full vertex index space, dead vertices included.
         let mut live: Vec<usize> = (0..self.edges.len())
             .filter(|&e| self.edges[e].alive)
             .collect();
         live.sort_by_key(|&e| self.edges[e].slot);
         live.into_iter()
             .map(|e| {
-                let [a, b] = self.edges[e].v.map(|v| output_index[v]);
+                let [a, b] = self.edges[e].v;
                 [a.min(b), a.max(b)]
             })
             .collect()
