@@ -331,7 +331,7 @@ fn pixel_at(project: &Path, image_id: &str, uv: [f64; 2]) -> TestResult<[f64; 4]
     let scene = read_scene(project)?;
     let image: Image = serde_json::from_value(scene["images"][image_id].clone())?;
     let data = load_image_data(&image, project, ImageInterpolation::Closest)?;
-    Ok(sample(&data, uv, 0))
+    Ok(sample(&data, uv, false))
 }
 
 fn check_blend_colors(object: &Value, expected: &Value) -> TestResult {

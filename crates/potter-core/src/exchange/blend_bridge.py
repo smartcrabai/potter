@@ -1718,18 +1718,115 @@ def _view_transform_name(value):
     return aliases.get(token, token)
 
 
+_CURVE_TONE_TO_POTTER = {"STANDARD": "standard", "FILMLIKE": "film_like"}
+_CURVE_TONE_TO_BLENDER = {"standard": "STANDARD", "film_like": "FILMLIKE"}
+_CURVE_EXTEND_TO_POTTER = {"HORIZONTAL": "horizontal", "EXTRAPOLATED": "extrapolated"}
+_CURVE_HANDLE_TO_POTTER = {"AUTO": "auto", "AUTO_CLAMPED": "auto_clamped", "VECTOR": "vector"}
+_CURVE_HANDLE_TO_BLENDER = {"auto": "AUTO", "auto_clamped": "AUTO_CLAMPED", "vector": "VECTOR"}
+
+
+def _color_curve_dump(view):
+    """The view CurveMapping (colortools.cc), or None when use_curve_mapping is off.
+
+    All four curves are read, with their handle types. Free and aligned handles are refused rather
+    than reshaped, since Potter cannot represent them.
+    """
+    if not bool(getattr(view, "use_curve_mapping", False)):
+        return None
+    mapping = getattr(view, "curve_mapping", None)
+    if mapping is None or len(mapping.curves) < 4:
+        raise ValueError("Blender color-management curve mapping is unavailable")
+    tone = _CURVE_TONE_TO_POTTER.get(mapping.tone)
+    extend = _CURVE_EXTEND_TO_POTTER.get(mapping.extend)
+    if tone is None or extend is None:
+        raise ValueError(f"Blender color-management curve has tone {mapping.tone} and extend {mapping.extend}, which Potter cannot represent")
+    curves = []
+    for curve_index, curve in enumerate(mapping.curves):
+        points = []
+        for point_index, point in enumerate(curve.points):
+            handle = _CURVE_HANDLE_TO_POTTER.get(point.handle_type)
+            if handle is None:
+                raise ValueError(
+                    f"Blender color-management curve {curve_index} point {point_index} uses the "
+                    f"{point.handle_type} handle, which Potter cannot represent")
+            points.append({"location": [float(point.location[0]), float(point.location[1])],
+                           "handle": handle})
+        curves.append({"points": points})
+    return {"tone": tone, "extend": extend, "use_clip": bool(mapping.use_clip),
+            "clip": [float(mapping.clip_min_x), float(mapping.clip_min_y),
+                     float(mapping.clip_max_x), float(mapping.clip_max_y)],
+            "black": [float(value) for value in mapping.black_level],
+            "white": [float(value) for value in mapping.white_level],
+            "curves": curves}
+
+
+def _curve_extend_to_blender(curve):
+    return "EXTRAPOLATED" if curve["extend_extrapolate"] else "HORIZONTAL"
+
+
+def _restore_color_curve_clip(mapping, clip):
+    for minimum_name, maximum_name, minimum, maximum in (
+            ("clip_min_x", "clip_max_x", clip[0], clip[2]),
+            ("clip_min_y", "clip_max_y", clip[1], clip[3])):
+        # Blender clamps each minimum against the current maximum.
+        if minimum > getattr(mapping, maximum_name):
+            setattr(mapping, maximum_name, maximum)
+            setattr(mapping, minimum_name, minimum)
+        else:
+            setattr(mapping, minimum_name, minimum)
+            setattr(mapping, maximum_name, maximum)
+
+
+def _restore_color_curve(view, curve):
+    """Writes Potter's view curve onto a scene: the inverse of `_color_curve_dump`.
+
+    `update()` rebuilds the tables. Each point's select flag is cleared first, because update()
+    clamps selected points to the clip rectangle and the stored points must survive unchanged.
+    """
+    if curve is None:
+        view.use_curve_mapping = False
+        return
+    view.use_curve_mapping = True
+    mapping = view.curve_mapping
+    if mapping is None or len(mapping.curves) < 4:
+        raise ValueError("Blender did not create the color-management curve mapping")
+    mapping.tone = _CURVE_TONE_TO_BLENDER[curve["tone"]]
+    mapping.extend = _curve_extend_to_blender(curve)
+    mapping.use_clip = bool(curve["use_clip"])
+    _restore_color_curve_clip(mapping, curve["clip"])
+    mapping.black_level = curve["black"]
+    mapping.white_level = curve["white"]
+    for index, source in enumerate(curve["curves"]):
+        _restore_curve_points(mapping.curves[index], source["points"], index)
+    mapping.update()
+
+
+def _restore_curve_points(target, points, index):
+    collection = target.points
+    while len(collection) < len(points):
+        before = len(collection)
+        # A distinct x keeps the insert from merging with an existing point; locations are
+        # overwritten below in order.
+        collection.new(1000.0 + before, 0.0)
+        if len(collection) == before:
+            raise ValueError(f"Blender refused a point for color-management curve {index}")
+    while len(collection) > len(points):
+        before = len(collection)
+        collection.remove(collection[before - 1])
+        if len(collection) == before:
+            raise ValueError(f"Blender refused to remove a point from color-management curve {index}")
+    for point, source in zip(collection, points):
+        point.location = source["location"]
+        point.handle_type = _CURVE_HANDLE_TO_BLENDER[source["handle"]]
+        point.select = False
+
+
 def _color_management_dump(scene):
     view = scene.view_settings
-    curve = []
-    if bool(getattr(view, "use_curve_mapping", False)):
-        mapping = getattr(view, "curve_mapping", None)
-        if mapping is None or len(mapping.curves) < 4:
-            raise ValueError("Blender color-management curve mapping is unavailable")
-        curve = [plain(point.location)[:2] for point in mapping.curves[3].points]
     return {"display_device": scene.display_settings.display_device,
             "view_transform": _view_transform_name(view.view_transform),
             "look": potter_color_look(view.look), "exposure": float(view.exposure),
-            "gamma": float(view.gamma), "curve": curve}
+            "gamma": float(view.gamma), "curve": _color_curve_dump(view)}
 
 
 # ViewLayer.use_pass_cryptomatte_accurate is an accuracy flag, not a pass (rna_scene.cc,
@@ -1870,31 +1967,46 @@ def blender_audio_codec(value):
     return "PCM" if codec == "WAV" else codec
 
 
+# Blender look name (RNA identifier, as in config.ocio) to Potter's token, for the looks Potter
+# implements. An unknown Blender look is kept as its raw name, so the render refuses it explicitly.
+_LOOK_TOKENS = (
+    ("None", "none"),
+    ("Very High Contrast", "very_high_contrast"),
+    ("High Contrast", "high_contrast"),
+    ("Medium High Contrast", "medium_high_contrast"),
+    ("Medium Contrast", "medium_contrast"),
+    ("Medium Low Contrast", "medium_low_contrast"),
+    ("Low Contrast", "low_contrast"),
+    ("Very Low Contrast", "very_low_contrast"),
+    ("AgX - Punchy", "agx_punchy"),
+    ("AgX - Greyscale", "agx_greyscale"),
+    ("AgX - Very High Contrast", "agx_very_high_contrast"),
+    ("AgX - High Contrast", "agx_high_contrast"),
+    ("AgX - Medium High Contrast", "agx_medium_high_contrast"),
+    ("AgX - Base Contrast", "agx_base_contrast"),
+    ("AgX - Medium Low Contrast", "agx_medium_low_contrast"),
+    ("AgX - Low Contrast", "agx_low_contrast"),
+    ("AgX - Very Low Contrast", "agx_very_low_contrast"),
+    ("False Color - Punchy", "false_color_punchy"),
+    ("False Color - Greyscale", "false_color_greyscale"),
+    ("False Color - Very High Contrast", "false_color_very_high_contrast"),
+    ("False Color - High Contrast", "false_color_high_contrast"),
+    ("False Color - Medium High Contrast", "false_color_medium_high_contrast"),
+    ("False Color - Base Contrast", "false_color_base_contrast"),
+    ("False Color - Medium Low Contrast", "false_color_medium_low_contrast"),
+    ("False Color - Low Contrast", "false_color_low_contrast"),
+    ("False Color - Very Low Contrast", "false_color_very_low_contrast"),
+)
+_POTTER_LOOK_BY_BLENDER = dict(_LOOK_TOKENS)
+_BLENDER_LOOK_BY_POTTER = {token: name for name, token in _LOOK_TOKENS}
+
+
 def potter_color_look(value):
-    normalized = str(value).strip().casefold()
-    return {
-        "none": "none",
-        "very high contrast": "very_high_contrast",
-        "high contrast": "high_contrast",
-        "medium high contrast": "medium_high_contrast",
-        "medium contrast": "medium_contrast",
-        "medium low contrast": "medium_low_contrast",
-        "low contrast": "low_contrast",
-        "very low contrast": "very_low_contrast",
-    }.get(normalized, str(value))
+    return _POTTER_LOOK_BY_BLENDER.get(str(value), str(value))
 
 
 def blender_color_look(value):
-    return {
-        "none": "None",
-        "very_high_contrast": "Very High Contrast",
-        "high_contrast": "High Contrast",
-        "medium_high_contrast": "Medium High Contrast",
-        "medium_contrast": "Medium Contrast",
-        "medium_low_contrast": "Medium Low Contrast",
-        "low_contrast": "Low Contrast",
-        "very_low_contrast": "Very Low Contrast",
-    }.get(str(value).strip().casefold(), value)
+    return _BLENDER_LOOK_BY_POTTER.get(str(value), value)
 
 
 def dump_scene(scene):
@@ -2125,6 +2237,9 @@ def dump_all():
                          "ortho_scale": float(x.ortho_scale),
                          "clip_start": float(x.clip_start), "clip_end": float(x.clip_end),
                          "shift_x": float(x.shift_x), "shift_y": float(x.shift_y), "custom_properties": custom_props(x),
+                         "panorama_type": x.panorama_type, "longitude_min": float(x.longitude_min),
+                         "longitude_max": float(x.longitude_max), "latitude_min": float(x.latitude_min),
+                         "latitude_max": float(x.latitude_max),
                          "fake_user": bool(x.use_fake_user), "users": int(x.users)} for x in bpy.data.cameras],
             "lights": [{"name": x.name_full, "potter_id": x.get("potter.id"),
                         "library": library_reference(x), "type": x.type,
@@ -6433,6 +6548,9 @@ def export_doc(doc, target, pack, scene_hash, context):
             camera.shift_x, camera.shift_y = raw.get("shift", [0.0, 0.0])
             if raw.get("projection") == "orthographic":
                 camera.type = "ORTHO"
+            elif raw.get("projection") == "panorama" and raw.get("panorama_type", "equirectangular") == "equirectangular":
+                camera.type = "PANO"
+                camera.panorama_type = "EQUIRECTANGULAR"
             set_id(camera, data_id)
             set_props(camera, source.get("custom_properties", {}))
             if source.get("fake_user"):
@@ -6775,6 +6893,7 @@ def export_doc(doc, target, pack, scene_hash, context):
         view.look = blender_color_look(color.get("look", "none"))
         view.exposure = float(color.get("exposure", 0.0))
         view.gamma = float(color.get("gamma", 1.0))
+        _restore_color_curve(view, color.get("curve"))
         _restore_sequencer(scene, item.get("sequencer"), scene_map, doc, target)
     for node_id, item in doc.get("nodes", {}).items():
         if (node_id in linked_maps["nodes"]

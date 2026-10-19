@@ -29,7 +29,7 @@ use potter_core::{
     hash,
     model::{DataBlock, Id, LightData, Modifier, Node, SceneDoc},
     ops,
-    store::{HistoryRecord, Project},
+    store::Project,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -84,9 +84,9 @@ fn history_blob_paths(scene: &Path) -> TestResult<Vec<PathBuf>> {
     Ok(paths)
 }
 
-/// Checks each history blob against its content address and checks that re-serializing the
-/// record with the current code reproduces the stored bytes exactly.
-fn verify_history_blobs(scene: &Path) -> TestResult<usize> {
+/// Checks stored history blobs against their raw content addresses and canonical JSON bytes. Historical
+/// snapshots are then read through `Project::history_records`, which applies the normal schema upgrades.
+fn verify_history_blobs(scene: &Path, project: &Project) -> TestResult<usize> {
     let paths = history_blob_paths(scene)?;
     for path in &paths {
         let raw = fs::read(path)?;
@@ -97,10 +97,11 @@ fn verify_history_blobs(scene: &Path) -> TestResult<usize> {
             .ok_or("history blob directory must be named by its digest")?;
         let digest = format!("sha256:{hex}");
         assert_eq!(hash::sha256(&raw), digest, "{}", path.display());
-        let record: HistoryRecord = serde_json::from_slice(&raw)?;
-        let reserialized = hash::canonicalize(&serde_json::to_value(&record)?)?;
-        assert_eq!(reserialized, raw, "{}", path.display());
+        let value: Value = serde_json::from_slice(&raw)?;
+        assert_eq!(hash::canonicalize(&value)?, raw, "{}", path.display());
     }
+    let (records, _) = project.history_records()?;
+    assert_eq!(records.len(), paths.len());
     Ok(paths.len())
 }
 
@@ -164,7 +165,7 @@ fn old_project_loads_with_its_recorded_hashes() -> TestResult {
     assert_eq!(records.len(), OLD_BLOB_COUNT);
     assert_eq!(records[0].0, OLD_HEAD_ID);
     assert_eq!(records[0].1.scene_hash, OLD_HEAD_SCENE_HASH);
-    assert_eq!(verify_history_blobs(&scene)?, OLD_BLOB_COUNT);
+    assert_eq!(verify_history_blobs(&scene, &project)?, OLD_BLOB_COUNT);
     Ok(())
 }
 
@@ -218,7 +219,10 @@ fn apply_undo_redo_keep_old_project_hashes_verifiable() -> TestResult {
     let applied = applied.ok_or("apply must commit")?;
     assert_eq!(applied.revision, 3);
     assert_eq!(applied.hash, Project::open(&scene)?.info()?.hash);
-    assert_eq!(verify_history_blobs(&scene)?, OLD_BLOB_COUNT + 1);
+    assert_eq!(
+        verify_history_blobs(&scene, &Project::open(&scene)?)?,
+        OLD_BLOB_COUNT + 1
+    );
     assert_no_visibility_keys(&scene)?;
     assert_eq!(array_count(&scene)?, 4);
     let applied_doc = serde_json::to_value(Project::open(&scene)?.doc())?;
@@ -232,7 +236,10 @@ fn apply_undo_redo_keep_old_project_hashes_verifiable() -> TestResult {
     assert_eq!(undone.revision, 4);
     assert_eq!(undone.hash, Project::open(&scene)?.info()?.hash);
     assert_eq!(array_count(&scene)?, 3);
-    assert_eq!(verify_history_blobs(&scene)?, OLD_BLOB_COUNT + 2);
+    assert_eq!(
+        verify_history_blobs(&scene, &Project::open(&scene)?)?,
+        OLD_BLOB_COUNT + 2
+    );
 
     let (redone, _) = redo::run(UndoArgs {
         scene: scene.clone(),
@@ -243,7 +250,10 @@ fn apply_undo_redo_keep_old_project_hashes_verifiable() -> TestResult {
     assert_eq!(redone.revision, 5);
     assert_eq!(redone.hash, Project::open(&scene)?.info()?.hash);
     assert_eq!(array_count(&scene)?, 4);
-    assert_eq!(verify_history_blobs(&scene)?, OLD_BLOB_COUNT + 3);
+    assert_eq!(
+        verify_history_blobs(&scene, &Project::open(&scene)?)?,
+        OLD_BLOB_COUNT + 3
+    );
     assert_no_visibility_keys(&scene)?;
 
     let redone_doc = serde_json::to_value(Project::open(&scene)?.doc())?;

@@ -118,7 +118,7 @@ impl SceneDoc {
             },
         )]);
         Self {
-            schema_version: 4,
+            schema_version: 5,
             scene_id,
             revision: 0,
             active_scene,
@@ -145,7 +145,7 @@ impl SceneDoc {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.schema_version != 4 {
+        if self.schema_version != 5 {
             return Err(PotError::with_details(
                 ErrorCode::UnsupportedVersion,
                 format!("unsupported scene schema_version {}", self.schema_version),
@@ -192,6 +192,9 @@ impl SceneDoc {
                     "render dicing_camera must reference a camera object",
                     json!({"scene_id":scene_id,"camera_id":camera_id}),
                 ));
+            }
+            if let Some(curve) = &scene.color_management.curve {
+                curve.validate()?;
             }
             if let Some(world) = &scene.rigid_body_world
                 && (!world.gravity.iter().all(|value| value.is_finite())
@@ -2288,6 +2291,25 @@ mod tests {
             value["collections"]["collection_root"]["objects"],
             serde_json::json!([])
         );
+    }
+
+    #[test]
+    fn document_validation_rejects_deserialized_malformed_color_curve() {
+        let mut value = serde_json::to_value(SceneDoc::new(
+            "00000000-0000-4000-8000-000000000000".to_owned(),
+        ))
+        .unwrap();
+        let mut curve = serde_json::to_value(crate::color::curve::CurveMapping::default()).unwrap();
+        curve["curves"][0]["points"] = serde_json::json!([{
+            "location": [0.0, 0.0],
+            "handle": "auto"
+        }]);
+        value["scenes"]["scene_main"]["color_management"]["curve"] = curve;
+        let doc: SceneDoc = serde_json::from_value(value).unwrap();
+
+        let error = doc.validate().unwrap_err();
+        assert_eq!(error.code, crate::error::ErrorCode::InvalidArgument);
+        assert!(error.message.contains("curve 0 needs at least two points"));
     }
 
     #[test]

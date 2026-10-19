@@ -1090,8 +1090,9 @@ fn encode_display(bytes: &mut [u8], pixels: &[[f32; 4]], settings: &ColorManagem
             "display image buffer dimensions do not match",
         ));
     }
+    let encoder = settings.display_encoder()?;
     for (pixel, linear) in encoded_pixels.iter_mut().zip(pixels) {
-        let display = settings.display_encode([linear[0], linear[1], linear[2]])?;
+        let display = encoder.encode([linear[0], linear[1], linear[2]])?;
         for channel in 0..3 {
             pixel[channel] = (display[channel] * 255.0).round() as u8;
         }

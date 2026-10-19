@@ -12,6 +12,7 @@ use crate::{
         clnor::{self, NormalCodeOptions, SetterInput},
         color_layers::{self, ColorDomain, ColorLayer},
         edge_key,
+        triangulate::{NgonMethod, QuadMethod, triangulate_mesh},
         uv_layers::{self, UvLayer, UvStore},
     },
 };
@@ -2405,34 +2406,24 @@ fn apply_triangulate(mesh: &mut Mesh, selected: &Selection) -> Result<IdChanges>
         .collect();
     let mut changes = IdChanges::default();
     for face in faces {
-        let positions: Vec<_> = face
+        let corners: Vec<[f32; 3]> = face
             .vertices
             .iter()
             .map(|id| {
                 mesh.vertex(*id)
-                    .map(|vertex| vertex.co)
+                    .map(|vertex| vertex.co.as_vec3().to_array())
                     .ok_or_else(|| invalid("face references a missing vertex"))
             })
             .collect::<Result<_>>()?;
-        let polygon: Vec<_> = (0..face.vertices.len()).collect();
-        let temporary = Mesh::from_positions_and_faces(positions, vec![polygon])
-            .map_err(|error| mesh_error(&error))?;
-        let triangles = temporary
-            .triangulate()
-            .map_err(|error| mesh_error(&error))?;
+        // Blender's Triangulate Faces runs `bmesh.ops.triangulate` with BEAUTY quads and n-gons.
+        let polygons = triangulate_mesh(&[corners], QuadMethod::Beauty, NgonMethod::Beauty, 3);
         remove_face(mesh, face.id, &mut changes);
-        for triangle in triangles {
-            let mut mapped = Vec::with_capacity(3);
-            for temporary_id in triangle {
-                let index = usize::try_from(temporary_id)
-                    .map_err(|_| invalid("temporary triangulation index is out of range"))?;
-                mapped.push(
-                    *face
-                        .vertices
-                        .get(index)
-                        .ok_or_else(|| invalid("temporary triangulation index is invalid"))?,
-                );
-            }
+        for polygon in polygons {
+            let mapped: Vec<u32> = polygon
+                .corners
+                .iter()
+                .map(|&index| face.vertices[index])
+                .collect();
             let source_corners = source_corners(&face, &mapped);
             insert_face_from_parent(
                 mesh,
@@ -7826,6 +7817,92 @@ mod tests {
         assert_eq!(mesh, before);
     }
 
+    /// Blender 5.2.2 BEAUTY triangulation of each oracle case (`tests/fixtures/triangulate`, from the
+    /// Triangulate modifier, which runs the same `BM_mesh_triangulate` kernel as this op). The
+    /// triangles are compared as sets with each triangle rotated to its smallest corner first, so
+    /// the diagonals and winding must match, while output order does not.
+    #[test]
+    fn triangulate_op_matches_blender_beauty_diagonals() {
+        const ORACLE: &str =
+            include_str!("../../../../tests/fixtures/triangulate/blender_triangulate.json");
+        let oracle: serde_json::Value = serde_json::from_str(ORACLE).unwrap();
+        let cases = oracle["cases"].as_array().unwrap();
+        assert_eq!(
+            cases.len(),
+            117,
+            "complete Blender triangulate oracle is required"
+        );
+        for case in cases {
+            let kind = case["kind"].as_str().unwrap();
+            let points: Vec<DVec3> = case["positions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|point| {
+                    let point = point.as_array().unwrap();
+                    DVec3::new(
+                        point[0].as_f64().unwrap(),
+                        point[1].as_f64().unwrap(),
+                        point[2].as_f64().unwrap(),
+                    )
+                })
+                .collect();
+            let count = points.len();
+            let mut mesh =
+                Mesh::from_positions_and_faces(points, vec![(0..count).collect()]).unwrap();
+            apply(
+                &mut mesh,
+                "triangulate",
+                &json!({"elements": {"domain": "face", "ids": ["f0"]}}),
+            )
+            .unwrap();
+            let index: std::collections::HashMap<u32, usize> = mesh
+                .vertices
+                .iter()
+                .enumerate()
+                .map(|(index, vertex)| (vertex.id, index))
+                .collect();
+            let actual: Vec<[usize; 3]> = mesh
+                .faces
+                .iter()
+                .map(|face| {
+                    assert_eq!(
+                        face.vertices.len(),
+                        3,
+                        "{kind}: triangulate left a non-triangle"
+                    );
+                    [0, 1, 2].map(|corner| index[&face.vertices[corner]])
+                })
+                .collect();
+            let expected: Vec<[usize; 3]> = case["triangles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|triangle| {
+                    let triangle = triangle.as_array().unwrap();
+                    [0, 1, 2].map(|i| usize::try_from(triangle[i].as_u64().unwrap()).unwrap())
+                })
+                .collect();
+            assert_eq!(
+                canonical_triangles(&actual),
+                canonical_triangles(&expected),
+                "Blender BEAUTY diagonals for {kind}"
+            );
+        }
+    }
+
+    /// Each triangle rotated so its smallest index comes first (winding kept), sorted.
+    fn canonical_triangles(triangles: &[[usize; 3]]) -> Vec<[usize; 3]> {
+        let mut canonical: Vec<[usize; 3]> = triangles
+            .iter()
+            .map(|triangle| {
+                let start = (0..3).min_by_key(|&i| triangle[i]).unwrap();
+                [0, 1, 2].map(|offset| triangle[(start + offset) % 3])
+            })
+            .collect();
+        canonical.sort_unstable();
+        canonical
+    }
     #[test]
     fn triangulate_replaces_selected_ngon_with_winding_preserving_triangles() {
         let mut mesh = Mesh::plane(PlaneParams::default()).unwrap();
@@ -7836,7 +7913,7 @@ mod tests {
         )
         .unwrap();
 
-        let triangles = mesh.triangulate().unwrap();
+        let triangles = mesh.tessellate().unwrap();
         assert_eq!(triangles.len(), 2);
         assert_eq!(result["created"]["faces"].as_array().unwrap().len(), 2);
         assert_eq!(result["deleted"]["faces"], json!(["f0"]));
@@ -7866,7 +7943,7 @@ mod tests {
             (mesh.vertices.len(), mesh.edges.len(), mesh.faces.len()),
             (8, 12, 5)
         );
-        assert_eq!(mesh.triangulate().unwrap().len(), 10);
+        assert_eq!(mesh.tessellate().unwrap().len(), 10);
         assert_eq!(result["created"]["faces"].as_array().unwrap().len(), 5);
         assert_eq!(result["deleted"]["faces"], json!(["f0"]));
         assert!(

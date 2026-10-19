@@ -196,7 +196,7 @@ fn pixel_at_center(project: &Path, image_id: &str) -> Result<[f64; 4], Box<dyn E
     let scene: Value = read_scene(project)?;
     let image: Image = serde_json::from_value(scene["images"][image_id].clone())?;
     let data = load_image_data(&image, project, ImageInterpolation::Closest)?;
-    Ok(sample(&data, [0.5, 0.5], 0))
+    Ok(sample(&data, [0.5, 0.5], false))
 }
 
 #[test]

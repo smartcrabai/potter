@@ -11,7 +11,7 @@ use glam::{DMat4, DQuat, DVec3, EulerRot};
 use serde_json::{Map, Value, json};
 
 use crate::{
-    color::{ColorManagement, ViewTransform},
+    color::{ColorManagement, ViewTransform, curve::CurveMapping},
     error::{ErrorCode, PotError, Result},
     float::{equal_f64, equal_f64_array},
     geom::{
@@ -3103,11 +3103,7 @@ fn build_imported_graph(
             &mut mappings,
             "Camera",
         )?;
-        let projection = if item.get("type").and_then(Value::as_str) == Some("ORTHO") {
-            CameraProjection::Orthographic
-        } else {
-            CameraProjection::Perspective
-        };
+        let (projection, panorama_type) = imported_camera_projection(item);
         doc.data_blocks.insert(
             id,
             DataBlock {
@@ -3131,6 +3127,7 @@ fn build_imported_graph(
                         number_field(item, "shift_x", 0.0),
                         number_field(item, "shift_y", 0.0),
                     ],
+                    panorama_type: panorama_type.unwrap_or_else(|| "equirectangular".to_owned()),
                     ..CameraData::default()
                 }),
                 grease_pencil: None,
@@ -4953,34 +4950,13 @@ fn parse_color_management(value: Option<&Value>) -> Result<ColorManagement> {
             )));
         }
     };
-    let curve = value
-        .get("curve")
-        .map(|curve| {
-            curve
-                .as_array()
-                .ok_or_else(|| invalid_intermediate("color curve must be an array"))?
-                .iter()
-                .map(|pair| {
-                    let values = pair
-                        .as_array()
-                        .filter(|values| values.len() == 2)
-                        .ok_or_else(|| {
-                            invalid_intermediate("color curve point must have two values")
-                        })?;
-                    let x = values[0]
-                        .as_f64()
-                        .filter(|number| number.is_finite())
-                        .ok_or_else(|| invalid_intermediate("color curve input is invalid"))?;
-                    let y = values[1]
-                        .as_f64()
-                        .filter(|number| number.is_finite())
-                        .ok_or_else(|| invalid_intermediate("color curve output is invalid"))?;
-                    Ok([x, y])
-                })
-                .collect::<Result<Vec<_>>>()
-        })
-        .transpose()?
-        .unwrap_or_default();
+    let curve = match value.get("curve") {
+        None | Some(Value::Null) => None,
+        Some(curve) => Some(
+            CurveMapping::from_json(curve)
+                .map_err(|message| invalid_intermediate(&format!("color curve {message}")))?,
+        ),
+    };
     Ok(ColorManagement {
         display_device: value
             .get("display_device")
@@ -7998,8 +7974,78 @@ fn object_properties(item: &Value) -> Map<String, Value> {
     props
 }
 
+/// The Potter projection of a Blender camera, and the Potter panorama type when it is a panorama. Blender's equirectangular
+/// and equidistant fisheye panoramas import as Potter's panoramas. Other Blender panorama types have no Potter projection
+/// and import as a perspective camera, which `import_losses` reports.
+fn imported_camera_projection(item: &Value) -> (CameraProjection, Option<String>) {
+    match item.get("type").and_then(Value::as_str) {
+        Some("ORTHO") => (CameraProjection::Orthographic, None),
+        Some("PANO") => match item.get("panorama_type").and_then(Value::as_str) {
+            None | Some("EQUIRECTANGULAR") => (
+                CameraProjection::Panorama,
+                Some("equirectangular".to_owned()),
+            ),
+            Some("FISHEYE_EQUIDISTANT") => (
+                CameraProjection::Panorama,
+                Some("fisheye_equidistant".to_owned()),
+            ),
+            Some(_) => (CameraProjection::Perspective, None),
+        },
+        _ => (CameraProjection::Perspective, None),
+    }
+}
+
 fn import_losses(raw: &Value) -> Vec<Loss> {
     let mut losses = Vec::new();
+    // Blender panorama settings that Potter cannot represent are reported, so the import never changes a camera silently.
+    for camera in raw
+        .get("cameras")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|camera| camera.get("type").and_then(Value::as_str) == Some("PANO"))
+    {
+        let name = camera.get("name").and_then(Value::as_str);
+        match camera
+            .get("panorama_type")
+            .and_then(Value::as_str)
+            .unwrap_or("EQUIRECTANGULAR")
+        {
+            "EQUIRECTANGULAR" => {
+                let full_sphere = [
+                    ("longitude_min", -std::f64::consts::PI),
+                    ("longitude_max", std::f64::consts::PI),
+                    ("latitude_min", -std::f64::consts::FRAC_PI_2),
+                    ("latitude_max", std::f64::consts::FRAC_PI_2),
+                ];
+                let ranged = full_sphere.iter().any(|(key, expected)| {
+                    camera
+                        .get(*key)
+                        .and_then(Value::as_f64)
+                        .is_none_or(|actual| (actual - expected).abs() > 1.0e-6)
+                });
+                if ranged {
+                    losses.push(loss(
+                        "blender.camera.panorama_range",
+                        name,
+                        "Blender's equirectangular longitude and latitude limits are not imported; Potter's panorama camera covers the full sphere",
+                    ));
+                }
+            }
+            "FISHEYE_EQUIDISTANT" => losses.push(loss(
+                "blender.camera.fisheye_fov",
+                name,
+                "Blender's fisheye field of view is not imported; Potter's fisheye camera has no field-of-view setting, and its mapping is not oracled against Blender",
+            )),
+            other => losses.push(loss(
+                "blender.camera.panorama_type",
+                name,
+                &format!(
+                    "Blender's {other} panorama has no Potter projection; the camera imports as a perspective camera"
+                ),
+            )),
+        }
+    }
     for material in raw
         .get("materials")
         .and_then(Value::as_array)
@@ -8547,6 +8593,21 @@ pub(crate) fn export_losses(doc: &SceneDoc) -> Vec<Loss> {
             ));
         }
     }
+    for (data_id, data) in &doc.data_blocks {
+        let Some(camera) = &data.camera else {
+            continue;
+        };
+        if camera.projection == CameraProjection::Fisheye
+            || (camera.projection == CameraProjection::Panorama
+                && camera.panorama_type == "fisheye_equidistant")
+        {
+            losses.push(loss(
+                "blender.camera.fisheye",
+                Some(data_id.as_str()),
+                "Potter's fisheye projection has no Blender camera type verified to match it; the camera exports as a perspective camera",
+            ));
+        }
+    }
     for (id, node) in &doc.nodes {
         if !matches!(
             node.kind.as_str(),
@@ -8607,6 +8668,18 @@ pub(crate) fn export_losses(doc: &SceneDoc) -> Vec<Loss> {
                 "blender.world",
                 Some(scene_id.as_str()),
                 "the scene references a world missing from the world registry",
+            ));
+        }
+        if scene.color_management.curve.as_ref().is_some_and(|curve| {
+            curve
+                .clip
+                .iter()
+                .any(|value| !(-100.0..=100.0).contains(value))
+        }) {
+            losses.push(loss(
+                "blender.color_management.curve_clip",
+                Some(scene_id.as_str()),
+                "Blender clamps view-curve clip values to [-100, 100]; this clip rectangle cannot be restored exactly",
             ));
         }
         if !matches!(scene.render.engine.as_str(), "path" | "realtime") {
@@ -9245,6 +9318,42 @@ fn loss(feature: impl Into<String>, data_id: Option<&str>, reason: &str) -> Loss
 mod tests {
     #![expect(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
     use super::*;
+
+    #[test]
+    fn color_curve_extension_serializes_as_bridge_boolean() -> Result<()> {
+        let mut curve = CurveMapping::default();
+        let extrapolated = serde_json::to_value(&curve).map_err(PotError::internal_json)?;
+        assert_eq!(extrapolated["extend_extrapolate"], json!(true));
+        assert!(extrapolated.get("extend").is_none());
+
+        curve.extend_extrapolate = false;
+        let horizontal = serde_json::to_value(curve).map_err(PotError::internal_json)?;
+        assert_eq!(horizontal["extend_extrapolate"], json!(false));
+        Ok(())
+    }
+
+    #[test]
+    fn color_curve_clip_outside_blender_rna_bounds_is_reported_as_export_loss() -> Result<()> {
+        let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+        let scene_id = doc.active_scene.clone();
+        let scene = doc
+            .scenes
+            .get_mut(&scene_id)
+            .ok_or_else(|| PotError::new(ErrorCode::SceneInvalid, "active scene missing"))?;
+        let curve = CurveMapping {
+            clip: [0.0, 0.0, 101.0, 1.0],
+            ..CurveMapping::default()
+        };
+        scene.color_management.curve = Some(curve);
+
+        let losses = export_losses(&doc);
+        assert!(losses.iter().any(|loss| {
+            loss.feature_id == "blender.color_management.curve_clip"
+                && loss.data_id.as_deref() == Some(scene_id.as_str())
+                && loss.reason.contains("[-100, 100]")
+        }));
+        Ok(())
+    }
     #[test]
     fn modifier_type_mapping_covers_the_potter_schema() {
         let mappings = [
@@ -16967,5 +17076,63 @@ print("UNSUPPORTED_POSE " + json.dumps({
             "a stored-nothing Density must read as Blender's default of 1.0"
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod camera_import_tests {
+    use super::*;
+    use std::f64::consts::{FRAC_PI_2, PI};
+
+    fn panorama(panorama_type: &str, longitude: (f64, f64), latitude: (f64, f64)) -> Value {
+        json!({"name": "pano", "type": "PANO", "panorama_type": panorama_type,
+               "longitude_min": longitude.0, "longitude_max": longitude.1,
+               "latitude_min": latitude.0, "latitude_max": latitude.1})
+    }
+
+    fn features(camera: &Value) -> Vec<String> {
+        import_losses(&json!({"cameras": [camera]}))
+            .into_iter()
+            .map(|loss| loss.feature_id)
+            .collect()
+    }
+
+    #[test]
+    fn equirectangular_panoramas_import_as_panoramas_without_losses() {
+        let camera = panorama("EQUIRECTANGULAR", (-PI, PI), (-FRAC_PI_2, FRAC_PI_2));
+        assert_eq!(
+            imported_camera_projection(&camera),
+            (
+                CameraProjection::Panorama,
+                Some("equirectangular".to_owned())
+            )
+        );
+        assert_eq!(features(&camera), Vec::<String>::new());
+    }
+
+    #[test]
+    fn ranged_equirectangular_panoramas_report_their_limits() {
+        let camera = panorama("EQUIRECTANGULAR", (-1.2, 2.0), (-0.7, 1.1));
+        assert_eq!(features(&camera), ["blender.camera.panorama_range"]);
+    }
+
+    #[test]
+    fn fisheye_and_other_panoramas_report_what_potter_lacks() {
+        let fisheye = panorama("FISHEYE_EQUIDISTANT", (-PI, PI), (-FRAC_PI_2, FRAC_PI_2));
+        assert_eq!(
+            imported_camera_projection(&fisheye),
+            (
+                CameraProjection::Panorama,
+                Some("fisheye_equidistant".to_owned())
+            )
+        );
+        assert_eq!(features(&fisheye), ["blender.camera.fisheye_fov"]);
+
+        let equisolid = panorama("FISHEYE_EQUISOLID", (-PI, PI), (-FRAC_PI_2, FRAC_PI_2));
+        assert_eq!(
+            imported_camera_projection(&equisolid),
+            (CameraProjection::Perspective, None)
+        );
+        assert_eq!(features(&equisolid), ["blender.camera.panorama_type"]);
     }
 }

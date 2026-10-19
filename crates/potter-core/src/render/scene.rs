@@ -370,7 +370,7 @@ pub(super) fn extract_geometry(
                 .iter()
                 .map(|vertex| (vertex.id, vertex.co))
                 .collect();
-            let mesh_triangles = mesh.triangulate().map_err(|error| {
+            let mesh_triangles = mesh.tessellate().map_err(|error| {
                 PotError::with_details(
                     ErrorCode::EvaluationFailed,
                     format!("mesh triangulation failed: {error}"),
