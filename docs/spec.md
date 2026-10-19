@@ -309,11 +309,6 @@ Implement all families below in the first release. Each variant MUST cover every
 | script / extension | `text.*`, `property.*`, `extension.*`: source, custom data, dependency registration, permitted native adapters |
 | avatar | `avatar.update`, `avatar.clear`: typed `SceneDoc.avatar` settings |
 
-#### Mesh Cache modifiers
-
-- `modifier.mesh_cache` consumes a `mesh_cache` resource containing PC2 or MDD samples. `play_mode` selects SCENE/CUSTOM values; `time_mode` maps FRAME, TIME, or FACTOR; `interpolation` selects NONE or LINEAR; `deform_mode` selects OVERWRITE or triangle-relative INTEGRATE. Axis/flip, factor, vertex-group, and disabled-resource behavior follow Blender.
-- `modifier.mesh_sequence_cache` reads an Alembic `object_path` at CacheFile frame/seconds time, or a numbered frame sequence. Its `read_data` flags are independent; POLY reads topology and custom normals, while UV and COLOR update named corner layers. The configured velocity name/unit controls the special point velocity attribute independently of `read_data`; Blender 5.2's Alembic stream reader does not generically import arbitrary custom properties through `ATTRIBUTES`. CacheFile settings and sequence resource paths survive `.blend` round trips.
-
 ### Avatar Settings
 
 - `SceneDoc.avatar` is optional and includes `armature`, `humanoid`, `meta`, `expressions`, `first_person`, `look_at`, `spring_bone`, and per-material `mtoon`.
