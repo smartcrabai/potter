@@ -11,12 +11,13 @@ use crate::{
     error::{ErrorCode, PotError, Result},
     eval::{EvaluationContext, EvaluationPurpose, Snapshot},
     hash,
-    model::{CameraProjection, Id, SceneDoc},
+    model::{CameraData, CameraProjection, Id, SceneDoc},
 };
 
 use super::{
     raster::{
-        Camera, DepthOfField, Mode, Projection, RasterOutput, StereoMode, rasterize_with_lines,
+        Camera, DepthOfField, Mode, Projection, RasterOutput, SensorFit, StereoMode,
+        rasterize_with_lines,
     },
     scene::{Geometry, extract_geometry, surface_shader},
 };
@@ -43,9 +44,6 @@ struct PreparedCamera {
     camera: Camera,
     projection_name: &'static str,
     matrix: [f64; 16],
-    ortho_height: Option<f64>,
-    lens_mm: Option<f64>,
-    sensor_width_mm: Option<f64>,
 }
 
 struct RenderFiles {
@@ -404,9 +402,6 @@ fn preset_camera(geometry: &Geometry, view: &str) -> Result<PreparedCamera> {
         camera,
         projection_name: "orthographic",
         matrix,
-        ortho_height: Some(ortho_height),
-        lens_mm: None,
-        sensor_width_mm: None,
     })
 }
 
@@ -448,19 +443,7 @@ fn stored_camera(doc: &SceneDoc, snapshot: &Snapshot, camera_id: &str) -> Result
         ));
     }
     let target = position + forward;
-    let projection = match camera_data.projection {
-        CameraProjection::Orthographic => Projection::Orthographic {
-            height: camera_data.ortho_scale,
-        },
-        CameraProjection::Perspective => Projection::Perspective {
-            lens_mm: camera_data.lens_mm,
-            sensor_width_mm: camera_data.sensor_width_mm,
-        },
-        CameraProjection::Panorama => Projection::Panorama {
-            fisheye: camera_data.panorama_type == "fisheye_equidistant",
-        },
-        CameraProjection::Fisheye => Projection::Panorama { fisheye: true },
-    };
+    let projection = camera_projection(camera_data)?;
     let projection_name = match camera_data.projection {
         CameraProjection::Orthographic => "orthographic",
         CameraProjection::Perspective => "perspective",
@@ -493,13 +476,55 @@ fn stored_camera(doc: &SceneDoc, snapshot: &Snapshot, camera_id: &str) -> Result
         camera,
         projection_name,
         matrix: evaluated.world_matrix,
-        ortho_height: (camera_data.projection == CameraProjection::Orthographic)
-            .then_some(camera_data.ortho_scale),
-        lens_mm: (camera_data.projection == CameraProjection::Perspective)
-            .then_some(camera_data.lens_mm),
-        sensor_width_mm: (camera_data.projection == CameraProjection::Perspective)
-            .then_some(camera_data.sensor_width_mm),
     })
+}
+
+/// The render projection of a stored camera. Panorama types and fisheye settings come from the camera data.
+fn camera_projection(camera_data: &CameraData) -> Result<Projection> {
+    Ok(match camera_data.projection {
+        CameraProjection::Orthographic => Projection::Orthographic {
+            height: camera_data.ortho_scale,
+        },
+        CameraProjection::Perspective => Projection::Perspective {
+            lens_mm: camera_data.lens_mm,
+            sensor_width_mm: camera_data.sensor_width_mm,
+        },
+        CameraProjection::Panorama => match camera_data.panorama_type.as_str() {
+            "equirectangular" => Projection::Equirectangular {
+                longitude: [camera_data.longitude_min, camera_data.longitude_max],
+                latitude: [camera_data.latitude_min, camera_data.latitude_max],
+            },
+            "fisheye_equidistant" => Projection::FisheyeEquidistant {
+                fov: camera_data.fisheye_fov,
+            },
+            "fisheye_equisolid" => Projection::FisheyeEquisolid {
+                fov: camera_data.fisheye_fov,
+                lens_mm: camera_data.lens_mm,
+                sensor_width_mm: camera_data.sensor_width_mm,
+                sensor_height_mm: camera_data.sensor_height_mm,
+                sensor_fit: sensor_fit(&camera_data.sensor_fit)?,
+            },
+            _ => {
+                return Err(PotError::invalid_argument(
+                    "camera panorama_type must be equirectangular, fisheye_equidistant, or fisheye_equisolid",
+                ));
+            }
+        },
+        CameraProjection::Fisheye => Projection::FisheyeEquidistant {
+            fov: camera_data.fisheye_fov,
+        },
+    })
+}
+
+fn sensor_fit(name: &str) -> Result<SensorFit> {
+    match name {
+        "AUTO" => Ok(SensorFit::Auto),
+        "HORIZONTAL" => Ok(SensorFit::Horizontal),
+        "VERTICAL" => Ok(SensorFit::Vertical),
+        _ => Err(PotError::invalid_argument(
+            "camera sensor_fit must be AUTO, HORIZONTAL, or VERTICAL",
+        )),
+    }
 }
 
 fn camera_matrix(position: DVec3, target: DVec3, up_hint: DVec3) -> [f64; 16] {
@@ -592,15 +617,8 @@ fn manifest_value(
         "near": prepared.camera.near,
         "far": prepared.camera.far,
         "matrix": prepared.matrix,
-        "ortho_height": prepared.ortho_height,
-        "lens_mm": prepared.lens_mm,
-        "sensor_width_mm": prepared.sensor_width_mm,
+        "projection_params": prepared.camera.projection,
         "shift": prepared.camera.shift,
-        "panorama_type": match prepared.camera.projection {
-            Projection::Panorama { fisheye: true } => "fisheye_equidistant",
-            Projection::Panorama { fisheye: false } => "equirectangular",
-            _ => Value::Null.as_str().unwrap_or(""),
-        },
         "depth_of_field": prepared.camera.depth_of_field.map(|dof| json!({
             "focus_distance": dof.focus_distance,
             "aperture_radius": dof.aperture_radius,

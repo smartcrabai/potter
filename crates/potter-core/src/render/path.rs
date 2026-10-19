@@ -413,67 +413,75 @@ pub(super) fn render(
                 let (radiance, alpha) = if camera.stereo_mode == StereoMode::Anaglyph {
                     let left_camera = camera_eye(camera, -1.0);
                     let right_camera = camera_eye(camera, 1.0);
-                    let (left_origin, left_direction) =
+                    let left_ray =
                         ray_for_sample(&left_camera, width, height, x, y, sample_x, sample_y)?;
-                    let (right_origin, right_direction) =
+                    let right_ray =
                         ray_for_sample(&right_camera, width, height, x, y, sample_x, sample_y)?;
                     let mut left_rng = rng.clone();
                     let mut right_rng = rng.clone();
-                    let (left, left_alpha) = trace_path(
-                        doc,
-                        snapshot,
-                        geometry,
-                        &bvh,
-                        &lights,
-                        &volumes,
-                        images,
-                        world_importance.as_ref(),
-                        left_origin,
-                        left_direction,
-                        environment,
-                        max_bounces,
-                        &mut left_rng,
-                        &mut evaluator_workspace,
-                    )?;
-                    let (right, right_alpha) = trace_path(
-                        doc,
-                        snapshot,
-                        geometry,
-                        &bvh,
-                        &lights,
-                        &volumes,
-                        images,
-                        world_importance.as_ref(),
-                        right_origin,
-                        right_direction,
-                        environment,
-                        max_bounces,
-                        &mut right_rng,
-                        &mut evaluator_workspace,
-                    )?;
+                    // A sample with no ray in one eye, outside a fisheye's circle, contributes nothing for that eye.
+                    let (left, left_alpha) = match left_ray {
+                        Some((left_origin, left_direction)) => trace_path(
+                            doc,
+                            snapshot,
+                            geometry,
+                            &bvh,
+                            &lights,
+                            &volumes,
+                            images,
+                            world_importance.as_ref(),
+                            left_origin,
+                            left_direction,
+                            environment,
+                            max_bounces,
+                            &mut left_rng,
+                            &mut evaluator_workspace,
+                        )?,
+                        None => (DVec3::ZERO, 0.0),
+                    };
+                    let (right, right_alpha) = match right_ray {
+                        Some((right_origin, right_direction)) => trace_path(
+                            doc,
+                            snapshot,
+                            geometry,
+                            &bvh,
+                            &lights,
+                            &volumes,
+                            images,
+                            world_importance.as_ref(),
+                            right_origin,
+                            right_direction,
+                            environment,
+                            max_bounces,
+                            &mut right_rng,
+                            &mut evaluator_workspace,
+                        )?,
+                        None => (DVec3::ZERO, 0.0),
+                    };
                     (
                         DVec3::new(left.x, right.y, right.z),
                         f64::midpoint(left_alpha, right_alpha),
                     )
                 } else {
-                    let (origin, direction) =
-                        ray_for_sample(camera, width, height, x, y, sample_x, sample_y)?;
-                    trace_path(
-                        doc,
-                        snapshot,
-                        geometry,
-                        &bvh,
-                        &lights,
-                        &volumes,
-                        images,
-                        world_importance.as_ref(),
-                        origin,
-                        direction,
-                        environment,
-                        max_bounces,
-                        &mut rng,
-                        &mut evaluator_workspace,
-                    )?
+                    match ray_for_sample(camera, width, height, x, y, sample_x, sample_y)? {
+                        Some((origin, direction)) => trace_path(
+                            doc,
+                            snapshot,
+                            geometry,
+                            &bvh,
+                            &lights,
+                            &volumes,
+                            images,
+                            world_importance.as_ref(),
+                            origin,
+                            direction,
+                            environment,
+                            max_bounces,
+                            &mut rng,
+                            &mut evaluator_workspace,
+                        )?,
+                        None => (DVec3::ZERO, 0.0),
+                    }
                 };
                 sum += radiance;
                 alpha_sum += alpha;
@@ -583,7 +591,10 @@ pub(super) fn composite_realtime_volumes(
                     "pixel index exceeds platform limits",
                 )
             })?;
-            let (origin, direction) = ray_for_sample(camera, width, height, x, y, 0.5, 0.5)?;
+            let Some((origin, direction)) = ray_for_sample(camera, width, height, x, y, 0.5, 0.5)?
+            else {
+                continue;
+            };
             let max_distance = if output.ids[index] == 0 {
                 f64::INFINITY
             } else {
@@ -983,7 +994,11 @@ fn write_center_passes(
                         "pixel index exceeds platform limits",
                     )
                 })?;
-            let (origin, direction) = ray_for_sample(camera, width, height, x, y, 0.5, 0.5)?;
+            // A pixel with no ray has no volume to attenuate, so its path-pass value stands.
+            let Some((origin, direction)) = ray_for_sample(camera, width, height, x, y, 0.5, 0.5)?
+            else {
+                continue;
+            };
             let hit = closest_hit(geometry, bvh, origin, direction, RAY_EPSILON, f64::INFINITY);
             let segment_limit = hit.map_or(f64::INFINITY, |hit| hit.distance);
             let volume_transmittance =

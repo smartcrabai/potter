@@ -51,20 +51,15 @@ struct Manifest {
 
 #[derive(Debug, Deserialize, serde::Serialize)]
 struct CameraManifest {
-    projection: String,
+    projection_params: Projection,
     position: [f64; 3],
     target: [f64; 3],
     up: [f64; 3],
     near: f64,
     far: f64,
     matrix: [f64; 16],
-    ortho_height: Option<f64>,
-    lens_mm: Option<f64>,
-    sensor_width_mm: Option<f64>,
     #[serde(default)]
     shift: [f64; 2],
-    #[serde(default)]
-    panorama_type: String,
     #[serde(default)]
     depth_of_field: Option<DepthOfFieldManifest>,
     #[serde(default)]
@@ -252,7 +247,8 @@ pub fn pick(
     verify_mapping_matches_geometry(&manifest, &geometry)?;
     let camera = camera_from_manifest(&manifest.camera)?;
     let (ray_origin, ray_direction) =
-        ray_for_pixel(&camera, buffers.width, buffers.height, pixel.0, pixel.1)?;
+        ray_for_pixel(&camera, buffers.width, buffers.height, pixel.0, pixel.1)?
+            .ok_or_else(|| render_invalid("object ID buffer has a hit where the camera has no ray"))?;
     let element_domain = element.map(|record| record.domain.as_str());
     let requested_domain_matches_channel = match domain {
         PickDomain::Object => true,
@@ -934,35 +930,15 @@ fn pixel_threshold(camera: &Camera, depth: f64, width: u32, height: u32) -> f64 
             lens_mm,
             sensor_width_mm,
         } => (depth * sensor_width_mm / lens_mm) / f64::from(width),
-        Projection::Panorama { .. } => (depth * std::f64::consts::PI) / f64::from(height),
+        _ => camera
+            .projection
+            .panorama_angle_per_pixel(width, height)
+            .map_or(0.0, |angle| depth * angle),
     };
     pixel_size.max(1.0e-6)
 }
 
 fn camera_from_manifest(camera: &CameraManifest) -> Result<Camera> {
-    let projection = match camera.projection.as_str() {
-        "orthographic" => Projection::Orthographic {
-            height: camera
-                .ortho_height
-                .filter(|height| height.is_finite() && *height > 0.0)
-                .ok_or_else(|| render_invalid("orthographic height is missing or invalid"))?,
-        },
-        "perspective" => Projection::Perspective {
-            lens_mm: camera
-                .lens_mm
-                .filter(|lens| lens.is_finite() && *lens > 0.0)
-                .ok_or_else(|| render_invalid("camera lens is missing or invalid"))?,
-            sensor_width_mm: camera
-                .sensor_width_mm
-                .filter(|sensor| sensor.is_finite() && *sensor > 0.0)
-                .ok_or_else(|| render_invalid("camera sensor width is missing or invalid"))?,
-        },
-        "panorama" => Projection::Panorama {
-            fisheye: camera.panorama_type == "fisheye_equidistant",
-        },
-        "fisheye" => Projection::Panorama { fisheye: true },
-        _ => return Err(render_invalid("camera projection is not supported")),
-    };
     let depth_of_field = camera.depth_of_field.as_ref().map(|dof| DepthOfField {
         focus_distance: dof.focus_distance,
         aperture_radius: dof.aperture_radius,
@@ -979,7 +955,7 @@ fn camera_from_manifest(camera: &CameraManifest) -> Result<Camera> {
         up: DVec3::from_array(camera.up),
         near: camera.near,
         far: camera.far,
-        projection,
+        projection: camera.projection_params,
         shift: camera.shift,
         depth_of_field,
         stereo_mode,

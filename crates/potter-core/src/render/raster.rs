@@ -1,13 +1,96 @@
+use std::f64::consts::{FRAC_PI_2, TAU};
+
 use glam::DVec3;
+use serde::{Deserialize, Serialize};
 
 use crate::error::{ErrorCode, PotError, Result};
 use crate::float::equal_f64;
 
-#[derive(Debug, Clone, Copy)]
+/// A camera projection in Blender's units: angles in radians, lengths in millimetres.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum Projection {
-    Orthographic { height: f64 },
-    Perspective { lens_mm: f64, sensor_width_mm: f64 },
-    Panorama { fisheye: bool },
+    Orthographic {
+        height: f64,
+    },
+    Perspective {
+        lens_mm: f64,
+        sensor_width_mm: f64,
+    },
+    /// Cycles' equirectangular mapping over the longitude and latitude limits `[min, max]`.
+    Equirectangular {
+        longitude: [f64; 2],
+        latitude: [f64; 2],
+    },
+    FisheyeEquidistant {
+        fov: f64,
+    },
+    FisheyeEquisolid {
+        fov: f64,
+        lens_mm: f64,
+        sensor_width_mm: f64,
+        sensor_height_mm: f64,
+        sensor_fit: SensorFit,
+    },
+}
+
+/// Blender's sensor fit. The fit's size is the width (AUTO and HORIZONTAL) or the height (VERTICAL), and the other side
+/// follows the render's aspect (`blender_camera_viewplane` in `intern/cycles/blender/camera.cpp`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub(crate) enum SensorFit {
+    Auto,
+    Horizontal,
+    Vertical,
+}
+
+/// The sensor of an equisolid fisheye for a `width` x `height` view, in millimetres, as Cycles sets `sensorwidth` and
+/// `sensorheight` for a fisheye camera.
+fn equisolid_sensor(
+    sensor_width_mm: f64,
+    sensor_height_mm: f64,
+    sensor_fit: SensorFit,
+    width: f64,
+    height: f64,
+) -> (f64, f64) {
+    let (horizontal_fit, size) = match sensor_fit {
+        SensorFit::Auto => (width > height, sensor_width_mm),
+        SensorFit::Horizontal => (true, sensor_width_mm),
+        SensorFit::Vertical => (false, sensor_height_mm),
+    };
+    if horizontal_fit {
+        (size, size * height / width)
+    } else {
+        (size * width / height, size)
+    }
+}
+
+impl Projection {
+    /// The angle one pixel spans at the image centre, in radians, for the panorama projections.
+    pub(crate) fn panorama_angle_per_pixel(self, width: u32, height: u32) -> Option<f64> {
+        let height = f64::from(height);
+        match self {
+            Self::Equirectangular { latitude, .. } => Some((latitude[1] - latitude[0]) / height),
+            Self::FisheyeEquidistant { fov } => Some(fov / height),
+            Self::FisheyeEquisolid {
+                lens_mm,
+                sensor_width_mm,
+                sensor_height_mm,
+                sensor_fit,
+                ..
+            } => {
+                let (_, sensor_height) = equisolid_sensor(
+                    sensor_width_mm,
+                    sensor_height_mm,
+                    sensor_fit,
+                    f64::from(width),
+                    height,
+                );
+                Some(sensor_height / (lens_mm * height))
+            }
+            Self::Orthographic { .. } | Self::Perspective { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -225,6 +308,8 @@ struct CameraFrame {
     stereo_mode: StereoMode,
     interocular_distance: f64,
     projection: ProjectionFrame,
+    /// The angle one pixel spans at the centre of a panorama image; `None` for the planar projections.
+    panorama_pixel_angle: Option<f64>,
 }
 
 #[derive(Clone, Copy)]
@@ -237,8 +322,19 @@ enum ProjectionFrame {
         horizontal_scale: f64,
         vertical_scale: f64,
     },
-    Panorama {
-        fisheye: bool,
+    Equirectangular {
+        longitude: [f64; 2],
+        latitude: [f64; 2],
+    },
+    FisheyeEquidistant {
+        fov: f64,
+    },
+    /// The sensor is the fitted size of the view, in millimetres.
+    FisheyeEquisolid {
+        fov: f64,
+        lens_mm: f64,
+        sensor_width_mm: f64,
+        sensor_height_mm: f64,
     },
 }
 
@@ -271,13 +367,14 @@ struct VisibleHit {
     color: [f64; 4],
 }
 
+/// The world ray through a pixel centre, or `None` when the projection has no ray there (outside a fisheye's circle).
 pub(crate) fn ray_for_pixel(
     camera: &Camera,
     width: u32,
     height: u32,
     x: u32,
     y: u32,
-) -> Result<(DVec3, DVec3)> {
+) -> Result<Option<(DVec3, DVec3)>> {
     if !pixel_in_bounds(width, height, x, y) {
         return Err(PotError::invalid_argument(
             "pixel coordinates must lie inside a non-empty image",
@@ -286,9 +383,10 @@ pub(crate) fn ray_for_pixel(
 
     let frame = camera_frame(camera, width, height)?;
     let ray = ray_for_pixel_in_frame(&frame, camera.position, width, height, x, y)?;
-    Ok((ray.origin, ray.direction))
+    Ok(ray.map(|ray| (ray.origin, ray.direction)))
 }
 
+/// The world ray through a sample of a pixel, or `None` when the projection has no ray there.
 pub(crate) fn ray_for_sample(
     camera: &Camera,
     width: u32,
@@ -297,7 +395,7 @@ pub(crate) fn ray_for_sample(
     y: u32,
     sample_x: f64,
     sample_y: f64,
-) -> Result<(DVec3, DVec3)> {
+) -> Result<Option<(DVec3, DVec3)>> {
     let frame = camera_frame(camera, width, height)?;
     let ray = ray_for_subpixel_in_frame(
         &frame,
@@ -309,7 +407,7 @@ pub(crate) fn ray_for_sample(
         sample_x,
         sample_y,
     )?;
-    Ok((ray.origin, ray.direction))
+    Ok(ray.map(|ray| (ray.origin, ray.direction)))
 }
 
 pub(crate) fn camera_eye(camera: &Camera, eye: f64) -> Camera {
@@ -438,7 +536,10 @@ pub(crate) fn rasterize_with_samples(
     for y in 0..height {
         for x in 0..width {
             let center_ray = ray_for_pixel_in_frame(&frame, camera.position, width, height, x, y)?;
-            let center_hit = nearest_visible_hit(&prepared, center_ray, &frame, shader)?;
+            let center_hit = match center_ray {
+                Some(ray) => nearest_visible_hit(&prepared, ray, &frame, shader)?,
+                None => None,
+            };
             let pixel_index = usize::try_from(y)
                 .ok()
                 .and_then(|row| row.checked_mul(width_usize))
@@ -459,7 +560,7 @@ pub(crate) fn rasterize_with_samples(
                     .to_array()
                     .map(|value| value as f32);
                 albedo[pixel_index] = linear_color_to_f32(triangle.source.color);
-                if let Some(bvh) = &ao_bvh {
+                if let (Some(bvh), Some(center_ray)) = (&ao_bvh, center_ray) {
                     let geometric = if triangle.normal.dot(hit.direction) > 0.0 {
                         -triangle.normal
                     } else {
@@ -494,7 +595,11 @@ pub(crate) fn rasterize_with_samples(
                             sample_x,
                             sample_y,
                         )?;
-                        (ray, nearest_visible_hit(&prepared, ray, &frame, shader)?)
+                        let hit = match ray {
+                            Some(ray) => nearest_visible_hit(&prepared, ray, &frame, shader)?,
+                            None => None,
+                        };
+                        (ray, hit)
                     };
                     let sample_color = if matches!(mode, Mode::Wire) {
                         sample_hit.map_or(background_linear, |visible_hit| {
@@ -505,7 +610,7 @@ pub(crate) fn rasterize_with_samples(
                                 background_linear
                             }
                         })
-                    } else if let Some(visible_hit) = sample_hit {
+                    } else if let (Some(visible_hit), Some(sample_ray)) = (sample_hit, sample_ray) {
                         let triangle = &prepared[visible_hit.triangle_index];
                         if hit_opacity(&triangle.source, visible_hit.color) >= 1.0 {
                             let [red, green, blue, _] = visible_hit.color;
@@ -728,7 +833,14 @@ fn project_world(
 ) -> Option<ProjectedPoint> {
     let relative = point - camera.position;
     let depth = relative.dot(frame.forward);
-    if !depth.is_finite() || depth < frame.near || depth > frame.far {
+    // A panorama covers every direction, so it clips by distance from the camera, not by depth along the view axis.
+    let clip_depth = match frame.projection {
+        ProjectionFrame::Orthographic { .. } | ProjectionFrame::Perspective { .. } => depth,
+        ProjectionFrame::Equirectangular { .. }
+        | ProjectionFrame::FisheyeEquidistant { .. }
+        | ProjectionFrame::FisheyeEquisolid { .. } => relative.length(),
+    };
+    if !clip_depth.is_finite() || clip_depth < frame.near || clip_depth > frame.far {
         return None;
     }
     let right = relative.dot(frame.right);
@@ -752,25 +864,55 @@ fn project_world(
             f64::from(width) / (2.0 * depth * horizontal_scale),
             f64::from(height) / (2.0 * depth * vertical_scale),
         ),
-        ProjectionFrame::Panorama { fisheye: false } => {
-            let longitude = right.atan2(relative.dot(frame.forward));
-            let latitude = (up / relative.length()).clamp(-1.0, 1.0).asin();
+        ProjectionFrame::Equirectangular {
+            longitude,
+            latitude,
+        } => {
+            let lon_span = longitude[1] - longitude[0];
+            let lat_span = latitude[1] - latitude[0];
+            // The longitude of the point, wrapped to the turn that lies nearest the range's centre.
+            let mid = 0.5 * (longitude[0] + longitude[1]);
+            let raw = right.atan2(depth);
+            let point_longitude = raw + TAU * ((mid - raw) / TAU).round();
+            let point_latitude = (up / clip_depth).clamp(-1.0, 1.0).asin();
             (
-                longitude / std::f64::consts::PI,
-                latitude / std::f64::consts::FRAC_PI_2,
-                f64::from(width) / (std::f64::consts::TAU * depth),
-                f64::from(height) / (std::f64::consts::PI * depth),
+                2.0 * (point_longitude - longitude[0]) / lon_span - 1.0,
+                2.0 * (point_latitude - latitude[0]) / lat_span - 1.0,
+                f64::from(width) / (lon_span.abs() * clip_depth),
+                f64::from(height) / (lat_span.abs() * clip_depth),
             )
         }
-        ProjectionFrame::Panorama { fisheye: true } => {
-            let direction = relative.normalize_or_zero();
-            let angle = direction.dot(frame.forward).clamp(-1.0, 1.0).acos();
+        ProjectionFrame::FisheyeEquidistant { fov } => {
+            let angle = (relative / clip_depth)
+                .dot(frame.forward)
+                .clamp(-1.0, 1.0)
+                .acos();
+            let radial = DVec3::new(right, up, 0.0).normalize_or_zero();
+            let radius = 2.0 * angle / fov;
+            (
+                radial.x * radius,
+                radial.y * radius,
+                f64::from(width) / (fov * clip_depth),
+                f64::from(height) / (fov * clip_depth),
+            )
+        }
+        ProjectionFrame::FisheyeEquisolid {
+            fov: _,
+            lens_mm,
+            sensor_width_mm,
+            sensor_height_mm,
+        } => {
+            let angle = (relative / clip_depth)
+                .dot(frame.forward)
+                .clamp(-1.0, 1.0)
+                .acos();
+            let image_radius = 2.0 * lens_mm * (0.5 * angle).sin();
             let radial = DVec3::new(right, up, 0.0).normalize_or_zero();
             (
-                radial.x * angle / std::f64::consts::PI,
-                radial.y * angle / std::f64::consts::PI,
-                f64::from(width) / (2.0 * depth),
-                f64::from(height) / (2.0 * depth),
+                radial.x * image_radius * 2.0 / sensor_width_mm,
+                radial.y * image_radius * 2.0 / sensor_height_mm,
+                f64::from(width) * lens_mm / (sensor_width_mm * clip_depth),
+                f64::from(height) * lens_mm / (sensor_height_mm * clip_depth),
             )
         }
     };
@@ -923,7 +1065,49 @@ fn camera_frame(camera: &Camera, width: u32, height: u32) -> Result<CameraFrame>
                 vertical_scale,
             }
         }
-        Projection::Panorama { fisheye } => ProjectionFrame::Panorama { fisheye },
+        Projection::Equirectangular {
+            longitude,
+            latitude,
+        } if longitude.iter().chain(&latitude).all(|value| value.is_finite())
+            && longitude[1] > longitude[0]
+            && longitude[1] - longitude[0] <= TAU
+            && latitude[1] > latitude[0]
+            && latitude[0] >= -FRAC_PI_2
+            && latitude[1] <= FRAC_PI_2 =>
+        {
+            ProjectionFrame::Equirectangular {
+                longitude,
+                latitude,
+            }
+        }
+        Projection::FisheyeEquidistant { fov } if is_valid_fov(fov) => {
+            ProjectionFrame::FisheyeEquidistant { fov }
+        }
+        Projection::FisheyeEquisolid {
+            fov,
+            lens_mm,
+            sensor_width_mm,
+            sensor_height_mm,
+            sensor_fit,
+        } if is_valid_fov(fov)
+            && [lens_mm, sensor_width_mm, sensor_height_mm]
+                .iter()
+                .all(|value| value.is_finite() && *value > 0.0) =>
+        {
+            let (sensor_width_mm, sensor_height_mm) = equisolid_sensor(
+                sensor_width_mm,
+                sensor_height_mm,
+                sensor_fit,
+                f64::from(view_width),
+                f64::from(height),
+            );
+            ProjectionFrame::FisheyeEquisolid {
+                fov,
+                lens_mm,
+                sensor_width_mm,
+                sensor_height_mm,
+            }
+        }
         _ => {
             return Err(PotError::invalid_argument(
                 "projection parameters are invalid",
@@ -942,7 +1126,14 @@ fn camera_frame(camera: &Camera, width: u32, height: u32) -> Result<CameraFrame>
         stereo_mode: camera.stereo_mode,
         interocular_distance: camera.interocular_distance,
         projection,
+        panorama_pixel_angle: camera
+            .projection
+            .panorama_angle_per_pixel(view_width, height),
     })
+}
+
+fn is_valid_fov(fov: f64) -> bool {
+    fov.is_finite() && fov > 0.0 && fov <= TAU
 }
 
 pub(crate) fn ambient_visibility(
@@ -999,7 +1190,7 @@ fn ray_for_pixel_in_frame(
     height: u32,
     x: u32,
     y: u32,
-) -> Result<Ray> {
+) -> Result<Option<Ray>> {
     ray_for_subpixel_in_frame(frame, camera_position, width, height, x, y, 0.5, 0.5)
 }
 
@@ -1016,7 +1207,7 @@ fn ray_for_subpixel_in_frame(
     y: u32,
     sample_x: f64,
     sample_y: f64,
-) -> Result<Ray> {
+) -> Result<Option<Ray>> {
     if !pixel_in_bounds(width, height, x, y)
         || !sample_x.is_finite()
         || !sample_y.is_finite()
@@ -1042,14 +1233,14 @@ fn ray_for_subpixel_in_frame(
         2.0 * ((f64::from(view_x) + sample_x) / f64::from(view_width)) - 1.0 + 2.0 * frame.shift[0];
     let ndc_y = 1.0 - 2.0 * ((f64::from(y) + sample_y) / f64::from(height)) + 2.0 * frame.shift[1];
     let origin = camera_position + frame.right * (eye * frame.interocular_distance * 0.5);
-    let mut ray = match frame.projection {
+    let Some(mut ray) = (match frame.projection {
         ProjectionFrame::Orthographic {
             half_width,
             half_height,
-        } => Ray {
+        } => Some(Ray {
             origin: origin + frame.right * (ndc_x * half_width) + frame.up * (ndc_y * half_height),
             direction: frame.forward,
-        },
+        }),
         ProjectionFrame::Perspective {
             horizontal_scale,
             vertical_scale,
@@ -1060,35 +1251,60 @@ fn ray_for_subpixel_in_frame(
                     + frame.up * (ndc_y * vertical_scale),
             )
             .ok_or_else(|| PotError::invalid_argument("pixel ray is out of range"))?;
-            Ray { origin, direction }
+            Some(Ray { origin, direction })
         }
-        ProjectionFrame::Panorama { fisheye: false } => {
-            let longitude = ndc_x * std::f64::consts::PI;
-            let latitude = ndc_y * std::f64::consts::FRAC_PI_2;
+        ProjectionFrame::Equirectangular {
+            longitude,
+            latitude,
+        } => {
+            // Cycles' `equirectangular_range_to_direction`: u and v run from the range's minimum to its maximum.
+            let u = 0.5 * (ndc_x + 1.0);
+            let v = 0.5 * (ndc_y + 1.0);
+            let point_longitude = longitude[0] + (longitude[1] - longitude[0]) * u;
+            let point_latitude = latitude[0] + (latitude[1] - latitude[0]) * v;
             let direction = safe_normalize(
-                frame.forward * (longitude.cos() * latitude.cos())
-                    + frame.right * (longitude.sin() * latitude.cos())
-                    + frame.up * latitude.sin(),
+                frame.forward * (point_longitude.cos() * point_latitude.cos())
+                    + frame.right * (point_longitude.sin() * point_latitude.cos())
+                    + frame.up * point_latitude.sin(),
             )
             .ok_or_else(|| PotError::invalid_argument("panorama ray is out of range"))?;
-            Ray { origin, direction }
+            Some(Ray { origin, direction })
         }
-        ProjectionFrame::Panorama { fisheye: true } => {
+        ProjectionFrame::FisheyeEquidistant { fov } => {
             let radius = ndc_x.hypot(ndc_y);
-            if radius > 1.0 {
-                return Err(PotError::invalid_argument(
-                    "fisheye pixel falls outside the projection circle",
-                ));
-            }
-            let angle = radius * std::f64::consts::PI;
-            let direction = if radius <= f64::EPSILON {
-                frame.forward
-            } else {
-                let radial = (frame.right * ndc_x + frame.up * ndc_y) / radius;
-                frame.forward * angle.cos() + radial * angle.sin()
-            };
-            Ray { origin, direction }
+            (radius <= 1.0).then(|| {
+                let angle = 0.5 * fov * radius;
+                let direction = if radius <= f64::EPSILON {
+                    frame.forward
+                } else {
+                    let radial = (frame.right * ndc_x + frame.up * ndc_y) / radius;
+                    frame.forward * angle.cos() + radial * angle.sin()
+                };
+                Ray { origin, direction }
+            })
         }
+        ProjectionFrame::FisheyeEquisolid {
+            fov,
+            lens_mm,
+            sensor_width_mm,
+            sensor_height_mm,
+        } => {
+            let sensor_x = 0.5 * ndc_x * sensor_width_mm;
+            let sensor_y = 0.5 * ndc_y * sensor_height_mm;
+            let radius = sensor_x.hypot(sensor_y);
+            (radius <= 2.0 * lens_mm * (0.25 * fov).sin()).then(|| {
+                let angle = 2.0 * (radius / (2.0 * lens_mm)).clamp(-1.0, 1.0).asin();
+                let direction = if radius <= f64::EPSILON {
+                    frame.forward
+                } else {
+                    let radial = (frame.right * sensor_x + frame.up * sensor_y) / radius;
+                    frame.forward * angle.cos() + radial * angle.sin()
+                };
+                Ray { origin, direction }
+            })
+        }
+    }) else {
+        return Ok(None);
     };
     if let Some(dof) = frame.depth_of_field
         && dof.aperture_radius > 0.0
@@ -1104,7 +1320,7 @@ fn ray_for_subpixel_in_frame(
     if !is_finite_vec3(ray.origin) || !is_finite_vec3(ray.direction) {
         return Err(PotError::invalid_argument("pixel ray is out of range"));
     }
-    Ok(ray)
+    Ok(Some(ray))
 }
 
 fn concentric_disk(sample_x: f64, sample_y: f64, blades: u32) -> glam::DVec2 {
@@ -1463,7 +1679,10 @@ fn is_wire_edge(
         ProjectionFrame::Perspective {
             horizontal_scale, ..
         } => (2.0 * hit.depth * horizontal_scale) / f64::from(width),
-        ProjectionFrame::Panorama { .. } => (std::f64::consts::PI * hit.depth) / f64::from(height),
+        _ => match frame.panorama_pixel_angle {
+            Some(angle) => angle * hit.depth,
+            None => return false,
+        },
     };
     let incidence = hit.direction.dot(triangle.normal).abs().max(1.0e-6);
     let edge_radius = (pixel_footprint / incidence) * 0.65;
@@ -1598,8 +1817,13 @@ fn is_finite_vec3(vector: DVec3) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Camera, Projection, StereoMode, camera_frame, pixel_in_bounds, ray_for_pixel};
+    use super::{
+        Camera, Projection, SensorFit, StereoMode, camera_frame, pixel_in_bounds, ray_for_pixel,
+    };
     use glam::DVec3;
+    use serde_json::Value;
+    use std::error::Error;
+
 
     fn camera(projection: Projection) -> Camera {
         Camera {
@@ -1627,13 +1851,13 @@ mod tests {
         let baseline = ray_for_pixel(&camera, width, height, 4, 4);
         let frame = camera_frame(&camera, width, height);
         assert!(baseline.is_ok() && frame.is_ok());
-        let (Ok((_, baseline)), Ok(frame)) = (baseline, frame) else {
+        let (Ok(Some((_, baseline))), Ok(frame)) = (baseline, frame) else {
             return;
         };
         camera.shift = [0.25, -0.25];
         let shifted = ray_for_pixel(&camera, width, height, 4, 4);
         assert!(shifted.is_ok());
-        let Ok((_, shifted)) = shifted else {
+        let Ok(Some((_, shifted))) = shifted else {
             return;
         };
         let delta = shifted - baseline;
@@ -1641,17 +1865,36 @@ mod tests {
         assert!(delta.dot(frame.up) < 0.0);
     }
 
+    fn panorama_projections() -> [Projection; 3] {
+        [
+            Projection::Equirectangular {
+                longitude: [-1.2, 2.0],
+                latitude: [-0.7, 1.1],
+            },
+            Projection::FisheyeEquidistant { fov: 2.0 },
+            Projection::FisheyeEquisolid {
+                fov: 2.5,
+                lens_mm: 12.0,
+                sensor_width_mm: 20.0,
+                sensor_height_mm: 15.0,
+                sensor_fit: SensorFit::Auto,
+            },
+        ]
+    }
+
     #[test]
     fn pixel_rays_round_trip_to_their_pixel_centers() {
         let width = 7;
         let height = 5;
-        for projection in [
+        let mut projections = vec![
             Projection::Orthographic { height: 4.0 },
             Projection::Perspective {
                 lens_mm: 50.0,
                 sensor_width_mm: 36.0,
             },
-        ] {
+        ];
+        projections.extend(panorama_projections());
+        for projection in projections {
             let camera = camera(projection);
             let frame = camera_frame(&camera, width, height);
             assert!(frame.is_ok());
@@ -1662,14 +1905,15 @@ mod tests {
             let y = 3;
             let ray = ray_for_pixel(&camera, width, height, x, y);
             assert!(ray.is_ok());
-            let Ok((origin, direction)) = ray else {
-                return;
+            let Ok(Some((origin, direction))) = ray else {
+                panic!("pixel {x},{y} has no ray for {projection:?}");
             };
             let point = origin + direction * 5.0;
             let relative = point - camera.position;
             let camera_x = relative.dot(frame.right);
             let camera_y = relative.dot(frame.up);
             let camera_depth = relative.dot(frame.forward);
+            let radius_to_point = relative.length();
             let (ndc_x, ndc_y) = match frame.projection {
                 super::ProjectionFrame::Orthographic {
                     half_width,
@@ -1678,21 +1922,39 @@ mod tests {
                 super::ProjectionFrame::Perspective {
                     horizontal_scale,
                     vertical_scale,
-                    ..
                 } => (
                     camera_x / camera_depth / horizontal_scale,
                     camera_y / camera_depth / vertical_scale,
                 ),
-                super::ProjectionFrame::Panorama { fisheye: false } => (
-                    camera_x.atan2(camera_depth) / std::f64::consts::PI,
-                    (camera_y / relative.length()).asin() / std::f64::consts::FRAC_PI_2,
-                ),
-                super::ProjectionFrame::Panorama { fisheye: true } => {
-                    let angle = (camera_depth / relative.length()).clamp(-1.0, 1.0).acos();
+                super::ProjectionFrame::Equirectangular {
+                    longitude,
+                    latitude,
+                } => {
+                    let point_longitude = camera_x.atan2(camera_depth);
+                    let point_latitude = (camera_y / radius_to_point).asin();
+                    (
+                        2.0 * (point_longitude - longitude[0]) / (longitude[1] - longitude[0])
+                            - 1.0,
+                        2.0 * (point_latitude - latitude[0]) / (latitude[1] - latitude[0]) - 1.0,
+                    )
+                }
+                super::ProjectionFrame::FisheyeEquidistant { fov } => {
+                    let angle = (camera_depth / radius_to_point).clamp(-1.0, 1.0).acos();
+                    let radial = glam::DVec2::new(camera_x, camera_y).normalize_or_zero();
+                    (radial.x * 2.0 * angle / fov, radial.y * 2.0 * angle / fov)
+                }
+                super::ProjectionFrame::FisheyeEquisolid {
+                    lens_mm,
+                    sensor_width_mm,
+                    sensor_height_mm,
+                    ..
+                } => {
+                    let angle = (camera_depth / radius_to_point).clamp(-1.0, 1.0).acos();
+                    let image_radius = 2.0 * lens_mm * (0.5 * angle).sin();
                     let radial = glam::DVec2::new(camera_x, camera_y).normalize_or_zero();
                     (
-                        radial.x * angle / std::f64::consts::PI,
-                        radial.y * angle / std::f64::consts::PI,
+                        radial.x * image_radius * 2.0 / sensor_width_mm,
+                        radial.y * image_radius * 2.0 / sensor_height_mm,
                     )
                 }
             };
@@ -1713,6 +1975,154 @@ mod tests {
         assert!(pixel_in_bounds(2, 2, 1, 1));
         assert!(!pixel_in_bounds(2, 2, 2, 1));
         assert!(!pixel_in_bounds(2, 2, 1, 2));
+    }
+
+    fn number(value: &Value) -> Result<f64, Box<dyn Error>> {
+        value.as_f64().ok_or_else(|| "oracle value is not a number".into())
+    }
+
+    fn pair(value: &Value) -> Result<[f64; 2], Box<dyn Error>> {
+        Ok([number(&value[0])?, number(&value[1])?])
+    }
+
+    /// The camera of a Blender `camera_to_world` matrix: its position, its -Z forward, and its +Y up.
+    fn oracle_camera(matrix: &Value, projection: Projection) -> Result<Camera, Box<dyn Error>> {
+        let mut rows = [[0.0_f64; 4]; 3];
+        for (index, row) in rows.iter_mut().enumerate() {
+            let entries = matrix[index].as_array().ok_or("camera matrix row is missing")?;
+            for (slot, entry) in row.iter_mut().zip(entries) {
+                *slot = number(entry)?;
+            }
+        }
+        let column = |index: usize| DVec3::new(rows[0][index], rows[1][index], rows[2][index]);
+        let position = DVec3::new(rows[0][3], rows[1][3], rows[2][3]);
+        let forward = -column(2);
+        Ok(Camera {
+            position,
+            target: position + forward,
+            up: column(1),
+            near: 0.1,
+            far: 100.0,
+            projection,
+            shift: [0.0; 2],
+            depth_of_field: None,
+            stereo_mode: StereoMode::None,
+            interocular_distance: 0.065,
+        })
+    }
+
+    /// The ray through `(x, y)` must match Blender's direction, or both must have no ray. Blender samples each pixel
+    /// centre to within about 0.0005 px, which moves a direction by up to 1e-4 rad, so the tolerance is 2e-4 rad
+    /// (about a thousandth of a pixel). Each oracle is a Blender render of the same camera (see its generator).
+    fn assert_ray_matches(
+        camera: &Camera,
+        width: u32,
+        height: u32,
+        x: u32,
+        y: u32,
+        expected: Option<[f64; 3]>,
+    ) -> Result<(), Box<dyn Error>> {
+        const TOLERANCE: f64 = 2.0e-4;
+        let ray = ray_for_pixel(camera, width, height, x, y)?;
+        match (ray, expected) {
+            (Some((_, direction)), Some(expected)) => {
+                let error = (direction - DVec3::from_array(expected)).abs().max_element();
+                assert!(
+                    error <= TOLERANCE,
+                    "pixel ({x}, {y}) ray {direction:?} differs from Blender's {expected:?} by {error}"
+                );
+            }
+            (None, None) => {}
+            (ray, expected) => {
+                panic!("pixel ({x}, {y}) ray {ray:?} does not match Blender's {expected:?}")
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn equirectangular_range_rays_match_blenders_render() -> Result<(), Box<dyn Error>> {
+        let oracle: Value = serde_json::from_str(include_str!(
+            "../../../../tests/fixtures/panorama_camera/blender_panorama_camera_range.json"
+        ))?;
+        let width = u32::try_from(oracle["width"].as_u64().ok_or("oracle width is missing")?)?;
+        let height = u32::try_from(oracle["height"].as_u64().ok_or("oracle height is missing")?)?;
+        let projection = Projection::Equirectangular {
+            longitude: pair(&oracle["longitude"])?,
+            latitude: pair(&oracle["latitude"])?,
+        };
+        let camera = oracle_camera(&oracle["camera_to_world"], projection)?;
+        let records = oracle["records"].as_array().ok_or("oracle records are missing")?;
+        assert_eq!(records.len(), usize::try_from(width * height)?);
+        for record in records {
+            let x = u32::try_from(record[0].as_u64().ok_or("oracle column is missing")?)?;
+            // The oracle's rows are bottom-up, Potter's pixel rows count from the top.
+            let row = u32::try_from(record[1].as_u64().ok_or("oracle row is missing")?)?;
+            let expected = [number(&record[2])?, number(&record[3])?, number(&record[4])?];
+            assert_ray_matches(&camera, width, height, x, height - 1 - row, Some(expected))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fisheye_rays_match_blenders_render_and_leave_outside_pixels_rayless()
+    -> Result<(), Box<dyn Error>> {
+        let oracle: Value = serde_json::from_str(include_str!(
+            "../../../../tests/fixtures/panorama_camera/blender_fisheye_camera.json"
+        ))?;
+        let width = u32::try_from(oracle["width"].as_u64().ok_or("oracle width is missing")?)?;
+        let height = u32::try_from(oracle["height"].as_u64().ok_or("oracle height is missing")?)?;
+        for oracle_camera_data in oracle["cameras"].as_array().ok_or("oracle cameras are missing")? {
+            let fov = number(&oracle_camera_data["fisheye_fov"])?;
+            let projection = match oracle_camera_data["panorama_type"].as_str() {
+                Some("FISHEYE_EQUIDISTANT") => Projection::FisheyeEquidistant { fov },
+                Some("FISHEYE_EQUISOLID") => Projection::FisheyeEquisolid {
+                    fov,
+                    lens_mm: number(&oracle_camera_data["fisheye_lens"])?,
+                    sensor_width_mm: number(&oracle_camera_data["sensor_width"])?,
+                    sensor_height_mm: number(&oracle_camera_data["sensor_height"])?,
+                    sensor_fit: match oracle_camera_data["sensor_fit"].as_str() {
+                        Some("AUTO") => SensorFit::Auto,
+                        Some("HORIZONTAL") => SensorFit::Horizontal,
+                        Some("VERTICAL") => SensorFit::Vertical,
+                        _ => return Err("oracle sensor fit is unknown".into()),
+                    },
+                },
+                _ => return Err("oracle panorama type is unknown".into()),
+            };
+            let camera = oracle_camera(&oracle_camera_data["camera_to_world"], projection)?;
+            let records = oracle_camera_data["records"]
+                .as_array()
+                .ok_or("oracle records are missing")?;
+            assert_eq!(records.len(), usize::try_from(width * height)?);
+            for record in records {
+                let x = u32::try_from(record[0].as_u64().ok_or("oracle column is missing")?)?;
+                let y = u32::try_from(record[1].as_u64().ok_or("oracle row is missing")?)?;
+                let expected = if record[2].as_bool() == Some(true) {
+                    Some([number(&record[3])?, number(&record[4])?, number(&record[5])?])
+                } else {
+                    None
+                };
+                assert_ray_matches(&camera, width, height, x, y, expected)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn panorama_ray_directions_are_unit_vectors() -> Result<(), Box<dyn Error>> {
+        for projection in panorama_projections() {
+            let camera = camera(projection);
+            for y in 0..5 {
+                for x in 0..7 {
+                    let ray = ray_for_pixel(&camera, 7, 5, x, y)?;
+                    if let Some((_, direction)) = ray {
+                        assert!((direction.length() - 1.0).abs() < 1.0e-9);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
