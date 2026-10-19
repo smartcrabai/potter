@@ -1481,7 +1481,7 @@ mod tests {
         let parsed = parse_scene(&serde_json::to_vec(&expected)?, no_assets())?;
         parsed.doc.validate()?;
         let migrated = serde_json::to_value(parsed.doc)?;
-        expected["schema_version"] = json!(5);
+        expected["schema_version"] = json!(6);
         assert_eq!(migrated, expected);
         Ok(())
     }
