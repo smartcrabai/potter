@@ -535,6 +535,7 @@ pub(crate) fn rasterize_with_samples(
                             composite_sample(
                                 &prepared,
                                 &visibility,
+                                &mut candidates,
                                 sample_ray,
                                 &frame,
                                 background_linear,
@@ -1229,10 +1230,10 @@ fn nearest_visible_hit(
     shader: Option<&dyn SurfaceShader>,
 ) -> Result<Option<VisibleHit>> {
     let mut cursor = None;
+    // The ray is fixed, so its candidates are too. The nearest is the least (depth, index) pair
+    // among them, so their order does not matter.
+    visibility.overlapping(ray.origin, ray.direction, candidates);
     loop {
-        // Only triangles whose bounds the ray crosses can hit it. The nearest is the least
-        // (depth, index) pair, so the order of the candidates does not matter.
-        visibility.overlapping(ray.origin, ray.direction, candidates);
         let mut nearest: Option<(usize, Hit)> = None;
         for &triangle_index in candidates.iter() {
             let Some(hit) = intersect_triangle(&triangles[triangle_index], ray, frame) else {
@@ -1269,6 +1270,7 @@ fn nearest_visible_hit(
 fn composite_sample(
     triangles: &[PreparedTriangle],
     visibility: &super::bvh::Bvh,
+    candidates: &mut Vec<usize>,
     ray: Ray,
     frame: &CameraFrame,
     background: [f64; 4],
@@ -1278,11 +1280,10 @@ fn composite_sample(
     const MAX_ALPHA_LAYERS: usize = 16;
     let mut hits: [Option<VisibleHit>; MAX_ALPHA_LAYERS] = [None; MAX_ALPHA_LAYERS];
     let mut hit_count = 0;
-    let mut candidates = Vec::new();
-    visibility.overlapping(ray.origin, ray.direction, &mut candidates);
+    visibility.overlapping(ray.origin, ray.direction, candidates);
     // Equal depths keep the first layer inserted, so visit the candidates in triangle order.
     candidates.sort_unstable();
-    for &triangle_index in &candidates {
+    for &triangle_index in candidates.iter() {
         let triangle = &triangles[triangle_index];
         let Some(hit) = intersect_triangle(triangle, ray, frame) else {
             continue;
@@ -2135,14 +2136,15 @@ mod visibility_tests {
 
     use super::{
         AlphaMode, Camera, CameraFrame, Hit, PreparedTriangle, Projection, Ray, StereoMode,
-        Triangle, camera_frame, intersect_triangle, nearest_visible_hit, prepare_triangles,
-        ray_for_pixel_in_frame,
+        Triangle, camera_frame, composite_sample, hit_opacity, intersect_triangle,
+        nearest_visible_hit, prepare_triangles, ray_for_pixel_in_frame,
     };
     use crate::float::equal_f64;
     use crate::render::bvh::Bvh;
 
     const SIZE: u32 = 48;
     const GRID: usize = 10;
+    const BACKGROUND: [f64; 4] = [0.2, 0.3, 0.4, 1.0];
 
     fn corner(i: usize, j: usize) -> DVec3 {
         let x = i as f64 / GRID as f64 * 2.0 - 1.0;
@@ -2169,23 +2171,52 @@ mod visibility_tests {
         }
     }
 
-    /// A bumpy grid whose every triangle appears twice, so each hit ties on depth and the lowest
-    /// index must win.
+    fn translucent(mut triangle: Triangle, color: [f64; 4]) -> Triangle {
+        triangle.alpha_mode = AlphaMode::Blend;
+        triangle.color = color;
+        triangle
+    }
+
+    /// A bumpy grid whose every triangle appears twice, so each hit ties on depth. The first copy
+    /// is translucent green and the second translucent red, so the order of tied layers changes
+    /// the composite. A zero-area triangle comes first: preparation drops it, so the visibility
+    /// BVH's indices must count prepared triangles, not input triangles.
     fn tied_grid() -> Vec<Triangle> {
-        let mut triangles = Vec::new();
+        let mut triangles = vec![triangle([DVec3::ZERO, DVec3::X, DVec3::X * 2.0])];
         for i in 0..GRID {
             for j in 0..GRID {
                 let a = corner(i, j);
                 let b = corner(i + 1, j);
                 let c = corner(i, j + 1);
                 let d = corner(i + 1, j + 1);
-                triangles.push(triangle([a, b, c]));
-                triangles.push(triangle([b, d, c]));
+                triangles.push(translucent(triangle([a, b, c]), [0.2, 0.6, 0.2, 0.5]));
+                triangles.push(translucent(triangle([b, d, c]), [0.2, 0.6, 0.2, 0.5]));
             }
         }
-        let copies = triangles.clone();
+        let copies: Vec<Triangle> = triangles
+            .iter()
+            .map(|original| translucent(original.clone(), [0.9, 0.1, 0.1, 0.5]))
+            .collect();
         triangles.extend(copies);
         triangles
+    }
+
+    fn test_camera() -> Camera {
+        Camera {
+            position: DVec3::new(0.0, 0.0, 2.5),
+            target: DVec3::ZERO,
+            up: DVec3::Y,
+            near: 0.1,
+            far: 100.0,
+            projection: Projection::Perspective {
+                lens_mm: 50.0,
+                sensor_width_mm: 36.0,
+            },
+            shift: [0.0; 2],
+            depth_of_field: None,
+            stereo_mode: StereoMode::None,
+            interocular_distance: 0.065,
+        }
     }
 
     /// The reference: every prepared triangle, least (depth, index) hit.
@@ -2208,27 +2239,68 @@ mod visibility_tests {
         nearest.map(|(index, hit)| (index, hit.depth))
     }
 
+    /// The composite before candidate culling: every prepared triangle in index order, inserted
+    /// by depth (equal depths keep index order), the 16 nearest layers kept, then the same
+    /// accumulation as `composite_sample`. Shading is the triangle colour, as with no shader.
+    fn scan_composite(
+        triangles: &[PreparedTriangle],
+        ray: Ray,
+        frame: &CameraFrame,
+        background: [f64; 4],
+    ) -> [f64; 4] {
+        let mut layers: Vec<(usize, Hit)> = Vec::new();
+        for (index, triangle) in triangles.iter().enumerate() {
+            let Some(hit) = intersect_triangle(triangle, ray, frame) else {
+                continue;
+            };
+            if hit_opacity(&triangle.source, triangle.source.color) <= 0.0 {
+                continue;
+            }
+            let at = layers
+                .iter()
+                .position(|(_, previous)| previous.depth > hit.depth)
+                .unwrap_or(layers.len());
+            layers.insert(at, (index, hit));
+            layers.truncate(16);
+        }
+        let mut transmittance = 1.0;
+        let mut alpha = 0.0;
+        let mut premultiplied = DVec3::ZERO;
+        for (index, _) in &layers {
+            let triangle = &triangles[*index];
+            let color = triangle.source.color;
+            let opacity = hit_opacity(&triangle.source, color);
+            let contribution = transmittance * opacity;
+            premultiplied += DVec3::new(color[0], color[1], color[2]) * contribution;
+            alpha += contribution;
+            transmittance *= 1.0 - opacity;
+            if transmittance <= 1.0e-6 {
+                break;
+            }
+        }
+        let background_alpha = background[3].clamp(0.0, 1.0);
+        premultiplied += DVec3::new(background[0], background[1], background[2])
+            * (transmittance * background_alpha);
+        alpha += transmittance * background_alpha;
+        if alpha <= f64::MIN_POSITIVE {
+            return background;
+        }
+        let color = premultiplied / alpha;
+        [color.x, color.y, color.z, alpha]
+    }
+
     #[test]
     fn bounded_nearest_hit_matches_a_scan_of_every_triangle() {
         let prepared = prepare_triangles(&tied_grid()).expect("grid prepares");
+        assert_eq!(
+            prepared.len(),
+            4 * GRID * GRID,
+            "the zero-area triangle is dropped"
+        );
         let visibility =
             Bvh::build_from_positions(prepared.iter().map(|triangle| triangle.source.positions))
                 .expect("visibility BVH builds");
-        let camera = Camera {
-            position: DVec3::new(0.0, 0.0, 2.5),
-            target: DVec3::ZERO,
-            up: DVec3::Y,
-            near: 0.1,
-            far: 100.0,
-            projection: Projection::Perspective {
-                lens_mm: 50.0,
-                sensor_width_mm: 36.0,
-            },
-            shift: [0.0; 2],
-            depth_of_field: None,
-            stereo_mode: StereoMode::None,
-            interocular_distance: 0.065,
-        };
+        let camera = test_camera();
         let frame = camera_frame(&camera, SIZE, SIZE).expect("frame");
         let mut candidates = Vec::new();
         let mut hit_pixels = 0_usize;
@@ -2250,5 +2322,35 @@ mod visibility_tests {
             hit_pixels > (SIZE * SIZE) as usize * 9 / 10,
             "grid covers the view"
         );
+    }
+
+    #[test]
+    fn translucent_composite_matches_a_scan_of_every_triangle() {
+        let prepared = prepare_triangles(&tied_grid()).expect("grid prepares");
+        let visibility =
+            Bvh::build_from_positions(prepared.iter().map(|triangle| triangle.source.positions))
+                .expect("visibility BVH builds");
+        let camera = test_camera();
+        let frame = camera_frame(&camera, SIZE, SIZE).expect("frame");
+        let mut candidates = Vec::new();
+        for y in 0..SIZE {
+            for x in 0..SIZE {
+                let ray = ray_for_pixel_in_frame(&frame, camera.position, SIZE, SIZE, x, y)
+                    .expect("pixel ray");
+                let expected = scan_composite(&prepared, ray, &frame, BACKGROUND);
+                let actual = composite_sample(
+                    &prepared,
+                    &visibility,
+                    &mut candidates,
+                    ray,
+                    &frame,
+                    BACKGROUND,
+                    None,
+                    None,
+                )
+                .expect("composite resolves");
+                assert_eq!(actual, expected, "pixel ({x}, {y})");
+            }
+        }
     }
 }
