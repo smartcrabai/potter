@@ -71,7 +71,9 @@ fn srgb_to_linear(encoded: f64) -> f64 {
 
 /// A shader-graph node operation in `GRAPH`.
 fn node(id: &str, node_type: &str, inputs: Value) -> Value {
-    json!({"op":"graph.node_add","graph":GRAPH,"id":id,"type":node_type,"inputs":inputs})
+    let mut operation = json!({"op":"graph.node_add","graph":GRAPH,"id":id,"type":node_type});
+    operation["inputs"] = inputs;
+    operation
 }
 
 /// A shader-graph link operation in `GRAPH`.
