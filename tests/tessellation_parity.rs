@@ -19,7 +19,7 @@ fn tessellation_matches_blender_522_loop_triangles() -> TestResult {
     let cases = oracle["cases"].as_array().ok_or("oracle cases missing")?;
     assert_eq!(
         cases.len(),
-        140,
+        178,
         "complete Blender tessellation oracle is required"
     );
     for case in cases {

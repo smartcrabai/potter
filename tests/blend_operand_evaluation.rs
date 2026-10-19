@@ -331,7 +331,7 @@ fn mesh_triangles(mesh: &Mesh, material: Option<u32>) -> TestResult<Vec<[DVec3; 
     {
         let mut one_face = mesh.clone();
         one_face.faces = vec![face.clone()];
-        for triangle in one_face.triangulate()? {
+        for triangle in one_face.tessellate()? {
             triangles.push([
                 *positions
                     .get(&triangle[0])

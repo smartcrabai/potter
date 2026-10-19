@@ -1,7 +1,7 @@
 use serde_json::{Map, Value};
 
 use crate::{
-    color::ViewTransform,
+    color::{ViewTransform, curve::CurveMapping},
     error::{ErrorCode, Result},
 };
 
@@ -108,21 +108,13 @@ fn color_update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resu
     let look = set
         .get("look")
         .map(|value| {
-            let look = value.as_str().ok_or_else(|| {
+            value.as_str().map(str::to_owned).ok_or_else(|| {
                 engine.error(
                     ErrorCode::InvalidOperation,
                     "look must be a string",
                     &operation_pointer(engine.operation_index, "set/look"),
                 )
-            })?;
-            if !matches!(look, "none" | "None") {
-                return Err(engine.error(
-                    ErrorCode::UnsupportedFeature,
-                    format!("color look `{look}` is not supported; only `none` is implemented"),
-                    &operation_pointer(engine.operation_index, "set/look"),
-                ));
-            }
-            Ok::<String, crate::error::PotError>("none".to_owned())
+            })
         })
         .transpose()?;
     let exposure = numeric_setting(engine, set, "exposure")?;
@@ -165,6 +157,9 @@ fn color_update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resu
         if let Some(value) = curve {
             scene.color_management.curve = value;
         }
+        // Rejects an unknown look, a look that does not apply to the resulting view, or an unsupported
+        // display. The batch is atomic, so a rejected update leaves the document unchanged.
+        scene.color_management.display_encoder()?;
         scene.color_management != before
     };
     if changed {
@@ -311,64 +306,17 @@ fn numeric_setting(
         .transpose()
 }
 
-fn parse_curve(engine: &Engine<'_>, value: &Value) -> Result<Vec<[f64; 2]>> {
-    let points = value.as_array().ok_or_else(|| {
+/// Parses `set.curve`: `null` removes the view curve, and an object is a full view `CurveMapping`
+/// (see [`CurveMapping::from_json`]).
+fn parse_curve(engine: &Engine<'_>, value: &Value) -> Result<Option<CurveMapping>> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    CurveMapping::from_json(value).map(Some).map_err(|message| {
         engine.error(
             ErrorCode::InvalidOperation,
-            "curve must be an array of [x,y] points",
+            message,
             &operation_pointer(engine.operation_index, "set/curve"),
         )
-    })?;
-    if points.len() < 2 {
-        return Err(engine.error(
-            ErrorCode::InvalidOperation,
-            "curve requires at least two points",
-            &operation_pointer(engine.operation_index, "set/curve"),
-        ));
-    }
-    let mut curve = Vec::with_capacity(points.len());
-    for (index, point) in points.iter().enumerate() {
-        let pair = point
-            .as_array()
-            .filter(|pair| pair.len() == 2)
-            .ok_or_else(|| {
-                engine.error(
-                    ErrorCode::InvalidOperation,
-                    "curve points must have two coordinates",
-                    &operation_pointer(engine.operation_index, &format!("set/curve/{index}")),
-                )
-            })?;
-        let x = pair[0]
-            .as_f64()
-            .filter(|number| number.is_finite())
-            .ok_or_else(|| {
-                engine.error(
-                    ErrorCode::InvalidOperation,
-                    "curve x coordinate must be finite",
-                    &operation_pointer(engine.operation_index, &format!("set/curve/{index}/0")),
-                )
-            })?;
-        let y = pair[1]
-            .as_f64()
-            .filter(|number| number.is_finite())
-            .ok_or_else(|| {
-                engine.error(
-                    ErrorCode::InvalidOperation,
-                    "curve y coordinate must be finite",
-                    &operation_pointer(engine.operation_index, &format!("set/curve/{index}/1")),
-                )
-            })?;
-        if curve
-            .last()
-            .is_some_and(|previous: &[f64; 2]| x <= previous[0])
-        {
-            return Err(engine.error(
-                ErrorCode::InvalidOperation,
-                "curve x coordinates must be strictly increasing",
-                &operation_pointer(engine.operation_index, &format!("set/curve/{index}/0")),
-            ));
-        }
-        curve.push([x, y]);
-    }
-    Ok(curve)
+    })
 }
