@@ -4,7 +4,10 @@ use glam::DVec3;
 use serde_json::json;
 
 use super::{ExchangeMesh, Loss, shading};
-use crate::error::{ErrorCode, PotError, Result};
+use crate::{
+    error::{ErrorCode, PotError, Result},
+    geom::color_layers::ColorStore,
+};
 
 /// Per-component slack for stored facet normals, which exporters often round to two decimals.
 const FACET_NORMAL_TOLERANCE: f64 = 1.0e-2;
@@ -144,6 +147,10 @@ pub(crate) fn import(path: &Path) -> Result<(Vec<ExchangeMesh>, Vec<Loss>)> {
             uv_layers: Vec::new(),
             uv_active: None,
             uv_render: None,
+            colors: ColorStore::default(),
+            vertex_groups: Vec::new(),
+            material_slots: Vec::new(),
+            face_material_indices: Vec::new(),
         }],
         losses,
     ))
