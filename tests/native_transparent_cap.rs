@@ -1,6 +1,7 @@
-//! The transparent bounce cap and the shadow-ray budget against Blender's Cycles render.
+//! The transparent bounce cap, the shadow-ray budget, and volume film alpha against Blender's Cycles
+//! render.
 //!
-//! Blender puts N alpha-0.5 planes between a point light and a lit diffuse floor, with
+//! Plane cases: Blender puts N alpha-0.5 planes between a point light and a lit diffuse floor, with
 //! `transparent_max_bounces` C, and saves the scene as a `.blend`. Potter imports it, renders it,
 //! and both images are reduced to the mean RGB of the same central patch. The four cases pin the
 //! two Cycles rules that `transparent_max_bounces` governs (`transparent_bounce` counts the passes
@@ -10,9 +11,12 @@
 //!   - a shadow ray may cross at most C minus the path's passes transparent surfaces and is
 //!     blocked past that (`kernel/bvh/intersect_filter.h`, `integrate_shadow_max_transparent_hits`).
 //!
-//! `n2c4` and `n1c2` are lit, so a budget that is ignored or a shadow that is not transmitted
-//! through the remaining planes shows as a wrong mean. `n2c3` and `n2c2` are zero in Cycles, so
-//! a shadow that ignores its budget or a floor that is shaded past the cap shows as a nonzero mean.
+//! Volume case: a homogeneous absorbing slab over a transparent card with film_transparent. Every
+//! camera ray crosses the slab, so the film alpha is `1 - exp(-sigma * thickness)`. The film alpha
+//! passes through the camera-segment opacity that the path accumulates, so a regression that resets
+//! it on a later pass-through shows here.
+//!
+//! Every case compares the RGB and the alpha patch means of Potter with Blender's.
 
 #[path = "common/blender_checked.rs"]
 mod blender_checked;
@@ -47,9 +51,10 @@ const PATCH: [f64; 9] = [
 /// lit through all planes) is far outside it.
 const PIXEL_TOLERANCE: f64 = 0.01;
 
-fn check_scenario(kind: &str) -> TestResult {
+/// Renders `kind` in Blender and in Potter, compares their patch means, and returns Blender's JSON.
+fn check_scenario(kind: &str) -> TestResult<Value> {
     let Some(blender) = blender_checked::blender_executable() else {
-        return Ok(());
+        return Ok(json!(null));
     };
     let root = tempdir()?;
     let script = write_script(root.path(), "transparent_cap.py", SCRIPT)?;
@@ -63,6 +68,9 @@ fn check_scenario(kind: &str) -> TestResult {
     let wanted = expected["patch_mean"]
         .as_array()
         .ok_or("the Blender patch mean is missing")?;
+    let wanted_alpha = expected["patch_alpha_mean"]
+        .as_f64()
+        .ok_or("the Blender patch alpha mean is missing")?;
 
     let (project, _) = import_blend(&blender, root.path(), "project", &blend)?;
     let scene = read_scene(&project)?;
@@ -102,17 +110,18 @@ fn check_scenario(kind: &str) -> TestResult {
     let scene = read_scene(&project)?;
     let image: Image = serde_json::from_value(scene["images"]["render"].clone())?;
     let data = load_image_data(&image, &project, ImageInterpolation::Closest)?;
-    let mut total = [0.0_f64; 3];
+    let mut total = [0.0_f64; 4];
     for v in PATCH {
         for u in PATCH {
             let pixel = sample(&data, [u, v], false);
-            for (sum, value) in total.iter_mut().zip(pixel.iter().take(3)) {
+            for (sum, value) in total.iter_mut().zip(pixel.iter()) {
                 *sum += value;
             }
         }
     }
     let count = (PATCH.len() * PATCH.len()) as f64;
-    for (channel, (actual, wanted)) in total.iter().map(|sum| sum / count).zip(wanted).enumerate() {
+    let actual = total.map(|sum| sum / count);
+    for (channel, (actual, wanted)) in actual.iter().take(3).zip(wanted).enumerate() {
         let wanted = wanted
             .as_f64()
             .ok_or("the Blender patch mean is not a number")?;
@@ -121,25 +130,50 @@ fn check_scenario(kind: &str) -> TestResult {
             "{kind} channel {channel}: Potter {actual} differs from Cycles {wanted}"
         );
     }
-    Ok(())
+    assert!(
+        (actual[3] - wanted_alpha).abs() <= PIXEL_TOLERANCE,
+        "{kind} alpha: Potter {} differs from Cycles {wanted_alpha}",
+        actual[3]
+    );
+    Ok(expected)
 }
 
 #[test]
 fn floor_behind_two_planes_with_budget_four_is_shadowed_through_both() -> TestResult {
-    check_scenario("n2c4")
+    check_scenario("n2c4").map(|_| ())
 }
 
 #[test]
 fn shadow_ray_past_its_remaining_budget_is_blocked() -> TestResult {
-    check_scenario("n2c3")
+    check_scenario("n2c3").map(|_| ())
 }
 
 #[test]
 fn floor_at_the_transparent_cap_is_terminated_without_direct_light() -> TestResult {
-    check_scenario("n2c2")
+    check_scenario("n2c2").map(|_| ())
 }
 
 #[test]
 fn one_plane_with_budget_two_leaves_one_shadow_crossing() -> TestResult {
-    check_scenario("n1c2")
+    check_scenario("n1c2").map(|_| ())
+}
+
+#[test]
+fn absorbing_slab_film_alpha_is_one_minus_transmittance() -> TestResult {
+    let Some(_) = blender_checked::blender_executable() else {
+        return Ok(());
+    };
+    let expected = check_scenario("volume_alpha")?;
+    let analytic = expected["beer_lambert_alpha"]
+        .as_f64()
+        .ok_or("the analytic alpha is missing")?;
+    // Blender's own alpha must equal 1 - exp(-sigma * thickness), or the oracle is not the model.
+    let blender_alpha = expected["patch_alpha_mean"]
+        .as_f64()
+        .ok_or("the Blender patch alpha mean is missing")?;
+    assert!(
+        (blender_alpha - analytic).abs() <= PIXEL_TOLERANCE,
+        "Blender alpha {blender_alpha} differs from 1 - exp(-sigma d) = {analytic}"
+    );
+    Ok(())
 }
