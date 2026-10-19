@@ -310,7 +310,10 @@ impl Project {
             });
             let image_uses_blob = candidate.images.values().any(|image| {
                 image.blob.as_deref() == Some(digest.as_str())
-                    || image.tiles.iter().any(|tile| tile.blob == *digest)
+                    || image
+                        .tiles
+                        .iter()
+                        .any(|tile| tile.blob.as_deref() == Some(digest.as_str()))
             });
             if !has_resource_alias || image_uses_blob {
                 let destination = self
@@ -781,6 +784,7 @@ mod tests {
             source_path: None,
             source_hash: None,
             alpha_mode: ImageAlphaMode::Straight,
+            tiled: false,
         }
     }
 
@@ -875,7 +879,8 @@ mod tests {
                     number: 1002,
                     width: 1,
                     height: 1,
-                    blob: digest.clone(),
+                    blob: Some(digest.clone()),
+                    label: String::new(),
                 }],
             )),
         );

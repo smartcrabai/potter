@@ -10,6 +10,7 @@ import bpy
 import json
 import math
 import os
+import shutil
 import sys
 import traceback
 import tempfile
@@ -497,6 +498,35 @@ def _id_map(block, property_name):
     return value if isinstance(value, dict) else {}
 
 
+def _image_filepath(image):
+    try:
+        return bpy.path.abspath(image.filepath, library=image.library)
+    except TypeError:
+        return bpy.path.abspath(image.filepath)
+
+
+def _tile_path(template, number):
+    # Blender's tile tokens, 1-based: <UDIM> is the tile number, <UVTILE> is u<column>_v<row> (BKE_image_set_filepath_from_tile_number).
+    if "<UVTILE>" in template:
+        offset = number - 1001
+        return template.replace("<UVTILE>", "u%d_v%d" % (offset % 10 + 1, offset // 10 + 1))
+    return template.replace("<UDIM>", str(number))
+
+
+def _tile_numbers(image):
+    # The UDIM tile numbers of a TILED image in ascending order; a single-tile image has none.
+    if image.source != "TILED":
+        return []
+    return sorted(tile.number for tile in image.tiles)
+
+def _tile_labels(image):
+    # The labels a TILED image's tiles carry, keyed by tile number as a string. Blender labels every loaded tile with its
+    # number, so only a label that differs from that default is kept.
+    if image.source != "TILED":
+        return {}
+    return {str(tile.number): tile.label for tile in image.tiles if tile.label != str(tile.number)}
+
+
 def _image_alpha_mode(image):
     # Blender's alpha mode under the names the .blend importer reads. CHANNEL_PACKED holds straight colour.
     if image.alpha_mode == "PREMUL":
@@ -504,7 +534,6 @@ def _image_alpha_mode(image):
     if image.alpha_mode == "NONE":
         return "none"
     return "straight"
-
 
 def images_dump():
     result = []
@@ -515,10 +544,7 @@ def images_dump():
             image_model = json.loads(image.get("potter.image_json", "null"))
         except Exception:
             image_model = None
-        try:
-            filepath = bpy.path.abspath(image.filepath, library=image.library)
-        except TypeError:
-            filepath = bpy.path.abspath(image.filepath)
+        filepath = _image_filepath(image)
         try:
             colorspace = image.colorspace_settings.name
         except Exception:
@@ -526,6 +552,7 @@ def images_dump():
         result.append({"name": image.name_full, "potter_id": image.get("potter.id"),
                        "library": library_reference(image), "filepath": filepath,
                        "source": image.source, "colorspace": colorspace,
+                       "tile_numbers": _tile_numbers(image), "tile_labels": _tile_labels(image),
                        "alpha_mode": _image_alpha_mode(image),
                        "potter_image": image_model})
     return result
@@ -637,17 +664,30 @@ def volume_filepath(volume):
     filepath = bpy.path.abspath(volume.filepath) if volume.filepath else ""
     return "" if filepath and os.path.isdir(filepath) else filepath
 
+def _tiled_image_records(image):
+    # One resource per UDIM tile: its packed bytes, or the file that the tile token (<UDIM> or <UVTILE>) names for it.
+    packed = {packed_file.tile_number: packed_file.packed_file for packed_file in image.packed_files}
+    template = _image_filepath(image)
+    records = []
+    for number in sorted(tile.number for tile in image.tiles):
+        record = _resource_record("image", image.name_full, _tile_path(template, number),
+                                  packed.get(number))
+        record["tile_number"] = number
+        if record["path"] or record["packed"]:
+            records.append(record)
+    return records
+
+
 def resources_dump():
     result = []
     for image in bpy.data.images:
         if _startup_metadata_datablock("images", image):
             continue
-        try:
-            filepath = bpy.path.abspath(image.filepath, library=image.library)
-        except TypeError:
-            filepath = bpy.path.abspath(image.filepath)
-        record = _resource_record("image", image.name_full, filepath,
-                                 getattr(image, "packed_file", None))
+        if image.source == "TILED":
+            result.extend(_tiled_image_records(image))
+            continue
+        record = _resource_record("image", image.name_full, _image_filepath(image),
+                                  getattr(image, "packed_file", None))
         if record["path"] or record["packed"]:
             result.append(record)
     for curve in bpy.data.curves:
@@ -5983,6 +6023,63 @@ def _pack_image(image, channels):
         os.remove(path)
 
 
+def _pack_udim_image(colorspace, udim, record_alpha_mode):
+    # Every tile is a file that the loader groups by its tile token into one TILED image; packing that image stores
+    # every tile. A PNG set packs each tile's original bytes (PR9: the byte path Blender samples for 8-bit PNG); a set
+    # with any other tile packs each tile as the float EXR that `_pack_image` writes.
+    extension = udim["format"]
+    directory = tempfile.mkdtemp(prefix="potter-udim-")
+    try:
+        for tile in udim["tiles"]:
+            path = os.path.join(directory, "tile.%d.%s" % (int(tile["number"]), extension))
+            if extension == "png":
+                with open(path, "wb") as handle:
+                    handle.write(bytes(tile["png_bytes"]))
+                continue
+            temp = bpy.data.images.new("potter-udim-tile", width=int(tile["width"]),
+                                       height=int(tile["height"]), alpha=True, float_buffer=True)
+            try:
+                temp.alpha_mode = {"straight": "STRAIGHT", "premultiplied": "PREMUL", "none": "NONE"}[
+                    record_alpha_mode]
+                if colorspace is not None:
+                    temp.colorspace_settings.name = colorspace
+                _pack_image(temp, [channel for pixel in tile["pixels"] for channel in pixel])
+                data = temp.packed_file.data
+            finally:
+                bpy.data.images.remove(temp)
+            with open(path, "wb") as handle:
+                handle.write(data)
+        # The first listed tile starts the TILED image; its tile token then groups the set, base 1001 or not.
+        first = int(udim["tiles"][0]["number"])
+        image = bpy.data.images.load(os.path.join(directory, "tile.%d.%s" % (first, extension)), check_existing=False)
+        image.source = "TILED"
+        image.filepath = os.path.join(directory, "tile.<UDIM>.%s" % extension)
+        image.reload()
+        labels = {int(tile["number"]): tile["label"] for tile in udim["tiles"] if tile.get("label")}
+        for tile in image.tiles:
+            if tile.number in labels:
+                tile.label = labels[tile.number]
+        if extension == "exr":
+            image.alpha_mode = {"straight": "STRAIGHT", "premultiplied": "PREMUL", "none": "NONE"}[
+                record_alpha_mode]
+        if colorspace is not None:
+            image.colorspace_settings.name = colorspace
+        image.pack()
+        return image
+    finally:
+        shutil.rmtree(directory)
+
+
+def _placeholder_udim_image(name):
+    # A TILED image whose `<UDIM>` filepath names no file: Blender holds it with no loadable tile, so the image and its
+    # filepath survive a save and reopen (probed). Its tiles and base are reported as losses by the exporter.
+    image = bpy.data.images.new("potter-udim-placeholder", width=1, height=1, alpha=True)
+    image.source = "TILED"
+    image.filepath = "//%s.<UDIM>.exr" % name
+    image.reload()
+    return image
+
+
 def export_doc(doc, target, pack, scene_hash, context):
     CACHE_FILES_BY_IDENTITY.clear()
     DEFERRED_ID_ASSIGNMENTS.clear()
@@ -6131,13 +6228,21 @@ def export_doc(doc, target, pack, scene_hash, context):
     image_map = {}
     for image_id, item in doc.get("images", {}).items():
         png_bytes = item.get("png_bytes")
-        sidecar = _export_sidecar_path(doc, item.get("source_path"))
+        udim = item.get("udim_tiles")
+        sidecar = None if udim else _export_sidecar_path(doc, item.get("source_path"))
         colorspace = {
             "srgb": "sRGB",
             "linear": "Linear Rec.709",
             "non_color": "Non-Color",
         }.get(item.get("colorspace"))
-        if sidecar is None and png_bytes is not None:
+        if udim and udim["format"] == "placeholder":
+            image = _placeholder_udim_image(item["name"])
+            image.name = item["name"]
+        elif udim:
+            # A UDIM image packs every listed tile, the base tile 1001 included, into one TILED image.
+            image = _pack_udim_image(colorspace, udim, item.get("alpha_mode", "straight"))
+            image.name = item["name"]
+        elif sidecar is None and png_bytes is not None:
             # An 8-bit PNG loads from its own file bytes, as the fixture's texture does: source FILE, packed PNG.
             # The temp file is packed while it exists: Blender reads the source path when packing.
             descriptor, png_path = tempfile.mkstemp(
@@ -6162,15 +6267,16 @@ def export_doc(doc, target, pack, scene_hash, context):
         if colorspace is not None:
             image.colorspace_settings.name = colorspace
         pixels = item.get("pixels")
-        if sidecar is None and png_bytes is None and pixels is not None:
+        if not udim and sidecar is None and png_bytes is None and pixels is not None:
             image.alpha_mode = {"straight": "STRAIGHT", "premultiplied": "PREMUL", "none": "NONE"}[
                 item.get("alpha_mode", "straight")
             ]
             _pack_image(image, [channel for pixel in pixels for channel in pixel])
-        if item.get("source") == "packed" and image.packed_file is None:
+        if not udim and item.get("source") == "packed" and image.packed_file is None:
             image.pack()
         set_id(image, image_id)
-        image_metadata = {key: value for key, value in item.items() if key not in ("pixels", "png_bytes")}
+        image_metadata = {key: value for key, value in item.items()
+                          if key not in ("pixels", "png_bytes", "udim_tiles")}
         image["potter.image_json"] = json.dumps(image_metadata, sort_keys=True)
         image_map[image_id] = image
         image.use_fake_user = True
