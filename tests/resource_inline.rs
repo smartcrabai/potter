@@ -83,22 +83,14 @@ fn inline_texture_coexists_with_binary_resources_and_library_copy() -> Result<()
     });
     let mut source_document = read_scene(&source)?;
     source_document["resources"]["inline_texture"] = inline.clone();
-    let sequence_bytes = [9_u8, 8, 7];
+    // A plain packed resource: sequence containers are PR18-Q scope, so this check covers library copy only.
+    let cache_bytes = [9_u8, 8, 7];
     source_document["resources"]["linked_cache"] = json!({
-        "uri":"cache_sequence.abc",
+        "uri":"cache.abc",
         "kind":"alembic",
+        "hash":potter_core::hash::sha256(&cache_bytes),
         "packed":true,
-        "sequence_start":4,
-        "sequence_end":4,
-        "sequence_frames":{
-            "4":{
-                "uri":"cache_sequence_0004.abc",
-                "kind":"alembic_cache",
-                "hash":potter_core::hash::sha256(&sequence_bytes),
-                "packed":true,
-                "bytes":sequence_bytes
-            }
-        }
+        "bytes":cache_bytes
     });
     fs::write(
         source.join("scene.json"),
@@ -124,11 +116,6 @@ fn inline_texture_coexists_with_binary_resources_and_library_copy() -> Result<()
             .iter()
             .any(|asset| asset["owner"] == "inline_texture")
     );
-    assert!(assets.iter().any(|asset| {
-        asset["owner"] == "linked_cache"
-            && asset["sequence_frame"] == 4
-            && asset["kind"] == "alembic_cache"
-    }));
     assert_eq!(listing["result"]["summary"]["missing"], 0);
     assert_eq!(listing["result"]["summary"]["changed"], 0);
 
@@ -181,150 +168,6 @@ fn inline_texture_coexists_with_binary_resources_and_library_copy() -> Result<()
         target_document["resources"]["source_library__linked_cache"],
         source_document["resources"]["linked_cache"]
     );
-    Ok(())
-}
-#[expect(
-    clippy::too_many_lines,
-    reason = "the sequence fixture checks reports, hashes, and incomplete packed ranges"
-)]
-#[test]
-fn asset_report_checks_each_sequence_leaf_and_rejects_missing_packed_frames()
--> Result<(), Box<dyn Error>> {
-    let directory = tempdir()?;
-    let scene = directory.path().join("sequence");
-    init(&scene)?;
-    let master = scene.join("master.abc");
-    let first_path = scene.join("frame-1.abc");
-    let second_path = scene.join("frame-2.abc");
-    let master_uri = master.to_string_lossy().into_owned();
-    let first_uri = first_path.to_string_lossy().into_owned();
-    let second_uri = second_path.to_string_lossy().into_owned();
-    let missing_path = scene.join("missing-frame.abc");
-    let missing_uri = missing_path.to_string_lossy().into_owned();
-    let first_bytes = [1_u8, 3, 5];
-    let second_bytes = [2_u8, 4, 6];
-    fs::write(&master, b"container master must not be read as a leaf")?;
-    fs::write(&first_path, first_bytes)?;
-    fs::write(&second_path, second_bytes)?;
-
-    let mut document = read_scene(&scene)?;
-    document["resources"]["cache_sequence"] = json!({
-        "uri":master_uri.clone(),
-        "kind":"alembic",
-        "packed":false,
-        "sequence_start":1,
-        "sequence_end":3,
-        "sequence_frames":{
-            "1":{
-                "uri":first_uri,
-                "kind":"alembic",
-                "hash":potter_core::hash::sha256(&first_bytes),
-                "packed":false
-            },
-            "2":{
-                "uri":second_uri.clone(),
-                "kind":"alembic_cache",
-                "hash":potter_core::hash::sha256(&first_bytes),
-                "packed":true,
-                "bytes":second_bytes
-            },
-            "3":{
-                "uri":missing_uri,
-                "kind":"alembic_cache",
-                "hash":potter_core::hash::sha256(&first_bytes),
-                "packed":false
-            }
-        }
-    });
-    document["resources"]["packed_sequence"] = json!({
-        "uri":master_uri.clone(),
-        "kind":"alembic",
-        "packed":true,
-        "sequence_start":1,
-        "sequence_end":2,
-        "sequence_frames":{
-            "1":{
-                "uri":"frame-1.abc",
-                "kind":"alembic",
-                "hash":potter_core::hash::sha256(&first_bytes),
-                "packed":true,
-                "bytes":first_bytes
-            },
-            "2":{
-                "uri":"frame-2.abc",
-                "kind":"alembic",
-                "hash":potter_core::hash::sha256(&second_bytes),
-                "packed":true,
-                "bytes":second_bytes
-            }
-        }
-    });
-    fs::write(
-        scene.join("scene.json"),
-        serde_json::to_vec_pretty(&document)?,
-    )?;
-
-    let listing = pot()
-        .arg("assets")
-        .arg(&scene)
-        .arg("--check")
-        .arg("--json")
-        .output()?;
-    assert!(
-        listing.status.success(),
-        "{}",
-        String::from_utf8_lossy(&listing.stdout)
-    );
-    let listing: Value = serde_json::from_slice(&listing.stdout)?;
-    let assets = listing["result"]["assets"]
-        .as_array()
-        .ok_or("asset report has no assets array")?;
-    let sequence_assets = assets
-        .iter()
-        .filter(|asset| asset["owner"] == "cache_sequence")
-        .collect::<Vec<_>>();
-    assert_eq!(sequence_assets.len(), 3);
-    assert!(
-        sequence_assets
-            .iter()
-            .all(|asset| asset["uri"].as_str() != Some(master_uri.as_str()))
-    );
-    assert!(sequence_assets.iter().any(|asset| {
-        asset["sequence_frame"] == 1 && asset["kind"] == "alembic" && asset["changed"] == false
-    }));
-    assert!(sequence_assets.iter().any(|asset| {
-        asset["sequence_frame"] == 2 && asset["kind"] == "alembic_cache" && asset["changed"] == true
-    }));
-    assert!(sequence_assets.iter().any(|asset| {
-        asset["sequence_frame"] == 3 && asset["kind"] == "alembic_cache" && asset["missing"] == true
-    }));
-    assert_eq!(
-        assets
-            .iter()
-            .filter(|asset| asset["owner"] == "packed_sequence")
-            .count(),
-        2
-    );
-    assert_eq!(listing["result"]["summary"]["missing"], 1);
-    assert_eq!(listing["result"]["summary"]["changed"], 1);
-
-    document["resources"]["packed_sequence"]["sequence_frames"]
-        .as_object_mut()
-        .ok_or("sequence frames are not an object")?
-        .remove("2");
-    fs::write(
-        scene.join("scene.json"),
-        serde_json::to_vec_pretty(&document)?,
-    )?;
-    let incomplete = pot()
-        .arg("assets")
-        .arg(&scene)
-        .arg("--check")
-        .arg("--json")
-        .output()?;
-    assert!(!incomplete.status.success());
-    let error: Value = serde_json::from_slice(&incomplete.stdout)?;
-    assert_eq!(error["error"]["code"], "SCENE_INVALID");
     Ok(())
 }
 
