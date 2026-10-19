@@ -2609,6 +2609,56 @@ mod shading_normal_tests {
         Ok(())
     }
 
+    #[test]
+    fn beauty_triangles_take_double_sided_from_their_material_or_default_surface()
+    -> crate::error::Result<()> {
+        let initial = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        let applied = crate::ops::apply_batch(
+            &initial,
+            &json!({
+                "schema_version": 1,
+                "base_revision": 0,
+                "operations": [
+                    {"op":"material.create","id":"single","double_sided":false},
+                    {"op":"material.create","id":"double"},
+                    {"op":"node.create","id":"single_body","kind":"plane","params":{"size":1.0},"material":"single"},
+                    {"op":"node.create","id":"double_body","kind":"plane","params":{"size":1.0},"transform":{"translation":[3.0,0.0,0.0]},"material":"double"},
+                    {"op":"node.create","id":"bare_body","kind":"plane","params":{"size":1.0},"transform":{"translation":[6.0,0.0,0.0]}}
+                ]
+            }),
+        )?;
+        let snapshot = Snapshot::evaluate(&applied.doc, &EvaluationContext::default())?;
+        let geometry = extract_geometry(
+            &applied.doc,
+            &snapshot,
+            Mode::Beauty,
+            false,
+            &BTreeMap::new(),
+        )?;
+        // Each plane sits at X = 0, 3, 6; its triangles' centroid X identifies it.
+        let expected = [(0, false), (1, true), (2, true)];
+        for (slot, double_sided) in expected {
+            let triangles = geometry
+                .triangles
+                .iter()
+                .filter(|triangle| {
+                    let centre =
+                        (triangle.positions[0] + triangle.positions[1] + triangle.positions[2]).x
+                            / 3.0;
+                    (centre / 3.0).round() as i64 == slot
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(triangles.len(), 2, "plane {slot} triangle count");
+            assert!(
+                triangles
+                    .iter()
+                    .all(|triangle| triangle.double_sided == double_sided),
+                "plane {slot} double_sided should be {double_sided}"
+            );
+        }
+        Ok(())
+    }
+
     fn source_triangle(positions: [DVec3; 3], normals: [DVec3; 3]) -> Triangle {
         Triangle {
             positions,
