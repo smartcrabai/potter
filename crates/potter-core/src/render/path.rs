@@ -60,12 +60,12 @@ struct VolumeInstance<'a> {
     voxel_size: f64,
     meters_per_unit: f64,
     density_range: Option<(f64, f64)>,
-    density_scale: f64,
     albedo: DVec3,
     anisotropy: f64,
     emission: DVec3,
     scattering: bool,
-    absorption_tint: Option<DVec3>,
+    /// Channel-mean σt per unit grid density (absolute, as `BsdfParams`'s coefficients).
+    extinction_scale: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -699,14 +699,14 @@ fn realtime_volume_integral(
         let mut source = DVec3::ZERO;
         for instance in volumes {
             let density = volume_density_at(instance, point)?;
-            let density_scaled = density * instance.density_scale.max(0.0);
+            let extinction_coefficient = volume_extinction_density(instance, density);
             let scattering_coefficient = if instance.scattering {
-                density_scaled
+                extinction_coefficient
             } else {
                 0.0
             };
-            extinction += volume_extinction_density(instance, density);
-            source += instance.emission * density_scaled;
+            extinction += extinction_coefficient;
+            source += instance.emission * density;
             if instance.scattering {
                 source += ambient * instance.albedo * scattering_coefficient;
                 for light in lights {
@@ -779,7 +779,7 @@ fn trace_path(
 ) -> Result<(DVec3, f64)> {
     let mut radiance = DVec3::ZERO;
     let mut throughput = DVec3::ONE;
-    let mut alpha = 0.0;
+    let mut escaped = false;
     let mut previous = Scatter::Unsampled;
     let mut bounce = 0u32;
     let mut transparent_bounce = 0u32;
@@ -801,9 +801,6 @@ fn trace_path(
         }
         if throughput.max_element() <= 1.0e-8 {
             break;
-        }
-        if bounce == 0 {
-            alpha = 1.0 - (1.0 - alpha) * volume_segment.transmittance;
         }
         if let Some(event) = volume_segment.event {
             let scatter_probability = (event.albedo.x + event.albedo.y + event.albedo.z) / 3.0;
@@ -847,6 +844,7 @@ fn trace_path(
                 Scatter::Volume => 0.5,
             };
             radiance += throughput * environment * environment_weight;
+            escaped = true;
             break;
         };
         let surface = make_surface(
@@ -859,7 +857,7 @@ fn trace_path(
             images,
             evaluator_workspace,
         )?;
-        if surface.params.volume_density > 0.0
+        if surface.params.has_medium()
             && let Some(boundary) = closest_hit(
                 geometry,
                 bvh,
@@ -874,28 +872,11 @@ fn trace_path(
                 .get(boundary.triangle_index)
                 .is_some_and(|triangle| triangle.object_index == surface.object_index);
             let distance = boundary.distance.max(0.0);
-            let scalar_transmittance = (-surface.params.volume_density * distance).exp();
-            let transmittance = if surface.params.volume_scattering {
-                DVec3::splat(scalar_transmittance)
-            } else {
-                let absorption = DVec3::from_array(surface.params.volume_color)
-                    .clamp(DVec3::splat(1.0e-8), DVec3::ONE);
-                DVec3::new(
-                    absorption.x.powf(surface.params.volume_density * distance),
-                    absorption.y.powf(surface.params.volume_density * distance),
-                    absorption.z.powf(surface.params.volume_density * distance),
-                )
-            };
-            if surface.params.volume_scattering {
-                let phase = henyey_greenstein(-1.0, surface.params.volume_anisotropy)
-                    * (4.0 * std::f64::consts::PI);
-                radiance += throughput
-                    * environment
-                    * DVec3::from_array(surface.params.volume_color)
-                    * ((1.0 - scalar_transmittance) * phase);
-            }
+            let (transmittance, in_scatter) = homogeneous_medium_segment(&surface.params, distance);
+            let phase = henyey_greenstein(-1.0, surface.params.volume_anisotropy)
+                * (4.0 * std::f64::consts::PI);
+            radiance += throughput * environment * in_scatter * phase;
             throughput *= transmittance;
-            alpha = 1.0 - (1.0 - alpha) * (transmittance.element_sum() / 3.0);
             if exits_medium {
                 origin = surface.point + direction * (distance + 2.0 * RAY_EPSILON);
             } else {
@@ -912,7 +893,6 @@ fn trace_path(
         }
         if terminate_on_next_surface {
             // Cycles shades the surface for emission, then ends the path (`integrate_surface_terminate`).
-            alpha = 1.0;
             radiance += throughput
                 * DVec3::from_array(surface.params.emission_color)
                 * surface.params.emission_strength.max(0.0);
@@ -924,7 +904,6 @@ fn trace_path(
             origin = offset_origin(surface.point, direction, surface.geometric_normal);
             continue;
         }
-        alpha = 1.0;
         radiance += throughput
             * DVec3::from_array(surface.params.emission_color)
             * surface.params.emission_strength;
@@ -987,6 +966,14 @@ fn trace_path(
             "path tracer produced a non-finite radiance value",
         ));
     }
+    // Cycles writes film transparency only for a path that escapes to the background, as
+    // `average(throughput)` (`intern/cycles/kernel/integrator/shade_background.h`). Every other
+    // termination leaves the pixel covered.
+    let alpha = if escaped {
+        1.0 - throughput.element_sum() / 3.0
+    } else {
+        1.0
+    };
     Ok((radiance.max(DVec3::ZERO), alpha.clamp(0.0, 1.0)))
 }
 
@@ -1559,7 +1546,7 @@ fn shadow_transmittance(
         // Cycles counts each transparent surface a shadow ray crosses against the path's remaining
         // budget and blocks the ray past it (`intern/cycles/kernel/bvh/intersect_filter.h`);
         // volume-bounds surfaces are not counted (`SD_HAS_ONLY_VOLUME`).
-        if surface.params.volume_density <= 0.0 {
+        if !surface.params.has_medium() {
             transparent_hits += 1;
             if transparent_hits > transparent_budget {
                 return Ok(0.0);
@@ -2029,29 +2016,46 @@ fn collect_volumes<'a>(
                 && material.volume_density > 0.0
         });
         let params = evaluated_material;
-        let scattering = params.is_none_or(|params| params.volume_scattering) || simple_volume;
-        let density_scale = params.map_or(1.0, |params| {
-            if has_volume_output || simple_volume {
-                params.volume_density.max(0.0)
-            } else {
-                1.0
+        // Cycles' absolute coefficients (`BsdfParams`): a material volume's σs and σa, or, for a
+        // material without a volume output, unit grey absorption. No material is the Principled
+        // Volume default (colour 0.5, density 1).
+        let (scatter, absorption) = match params {
+            Some(params) if has_volume_output || simple_volume => {
+                (params.volume_scatter, params.volume_absorption)
             }
-        });
-        let albedo = if scattering {
-            params.map_or(DVec3::splat(0.5), |params| {
-                DVec3::from_array(params.volume_color).clamp(DVec3::ZERO, DVec3::ONE)
-            })
-        } else {
-            DVec3::ZERO
+            Some(_) => ([0.0; 3], [1.0; 3]),
+            None => ([0.5; 3], [0.5; 3]),
         };
-        let absorption_tint = (!scattering && has_volume_output).then(|| {
-            DVec3::from_array(params.map_or([1.0; 3], |params| params.volume_color))
-                .clamp(DVec3::splat(1.0e-8), DVec3::ONE)
-        });
+        // Voxel transport is scalar: extinction is the channel mean of σt per unit grid density, and
+        // the albedo is the per-channel σs / σt. That is exact for grey media only.
+        let extinction: [f64; 3] = std::array::from_fn(|index| scatter[index] + absorption[index]);
+        let extinction_scale = extinction.iter().sum::<f64>() / 3.0;
+        let albedo = DVec3::from_array(std::array::from_fn(|index| {
+            if extinction[index] > 0.0 {
+                scatter[index] / extinction[index]
+            } else {
+                0.0
+            }
+        }))
+        .clamp(DVec3::ZERO, DVec3::ONE);
+        let scattering = scatter.iter().any(|weight| *weight > 0.0);
+        if (has_volume_output || simple_volume)
+            && extinction
+                .iter()
+                .any(|weight| (weight - extinction_scale).abs() > 1.0e-12)
+        {
+            warnings.borrow_mut().push(serde_json::json!({
+                "code": "UNSUPPORTED_FEATURE",
+                "feature_id": "shader.volume.spectral_extinction",
+                "node_id": node_id.to_string(),
+                "message": format!(
+                    "Volume '{node_id}' has per-channel extinction; voxel volumes transport the channel-mean extinction, so the colour of its absorption and scattering is approximated"
+                ),
+            }));
+        }
         let emission = if has_volume_output || simple_volume {
             params.map_or(DVec3::ZERO, |params| {
-                DVec3::from_array(params.volume_emission_color)
-                    * params.volume_emission_strength.max(0.0)
+                DVec3::from_array(params.volume_emission)
             })
         } else {
             DVec3::ZERO
@@ -2064,12 +2068,11 @@ fn collect_volumes<'a>(
             voxel_size,
             meters_per_unit,
             density_range,
-            density_scale,
             albedo,
             anisotropy: params.map_or(0.0, |params| params.volume_anisotropy),
             emission,
             scattering,
-            absorption_tint,
+            extinction_scale,
         });
     }
     Ok(volumes)
@@ -2087,11 +2090,25 @@ fn homogeneous_segment_integral(extinction: f64, distance: f64) -> (f64, f64) {
     (transmittance, source_distance)
 }
 
-fn volume_extinction_density(instance: &VolumeInstance<'_>, density: f64) -> f64 {
-    let absorption_scale = instance.absorption_tint.map_or(1.0, |tint| {
-        (-(tint.x.ln() + tint.y.ln() + tint.z.ln()) / 3.0).max(0.0)
+/// Cycles' homogeneous medium over `distance` for a material volume on a mesh: per-channel
+/// transmittance `exp(-σt·d)` and the in-scatter `∫ σs·exp(-σt·s) ds` against constant environment
+/// light, with σt = σs + σa from the absolute coefficients of `BsdfParams`.
+fn homogeneous_medium_segment(params: &BsdfParams, distance: f64) -> (DVec3, DVec3) {
+    let channels: [(f64, f64); 3] = std::array::from_fn(|channel| {
+        let scattering = params.volume_scatter[channel];
+        let extinction = scattering + params.volume_absorption[channel];
+        let (transmittance, source_distance) = homogeneous_segment_integral(extinction, distance);
+        (transmittance, scattering * source_distance)
     });
-    density.max(0.0) * instance.density_scale.max(0.0) * absorption_scale
+    let [red, green, blue] = channels;
+    (
+        DVec3::new(red.0, green.0, blue.0),
+        DVec3::new(red.1, green.1, blue.1),
+    )
+}
+
+fn volume_extinction_density(instance: &VolumeInstance<'_>, density: f64) -> f64 {
+    density.max(0.0) * instance.extinction_scale
 }
 
 fn trace_volume_segment(
@@ -2131,7 +2148,7 @@ fn trace_volume_segment(
             minimum_step = minimum_step.min(instance.voxel_size / local_speed * 0.5);
             stochastic |= instance.scattering
                 && instance.albedo.max_element() > 0.0
-                && instance.density_scale > 0.0;
+                && instance.extinction_scale > 0.0;
         }
     }
     if !entry.is_finite() || exit <= entry {
@@ -2165,7 +2182,7 @@ fn trace_volume_segment(
         for instance in volumes {
             let density = volume_density_at(instance, point)?;
             extinction += volume_extinction_density(instance, density);
-            source += instance.emission * (density * instance.density_scale.max(0.0));
+            source += instance.emission * density;
         }
         if extinction <= 0.0 {
             continue;
@@ -2556,12 +2573,11 @@ mod volume_extinction_tests {
             voxel_size: 1.0,
             meters_per_unit: 0.5,
             density_range: Some((1.0, 1.0)),
-            density_scale: 1.0,
             albedo: DVec3::ZERO,
             anisotropy: 0.0,
             emission: DVec3::ZERO,
             scattering: false,
-            absorption_tint: None,
+            extinction_scale: 1.0,
         };
         let mut rng = Pcg32::for_sample(0, 0, 0, 0);
         let transmittance = march_volumes(

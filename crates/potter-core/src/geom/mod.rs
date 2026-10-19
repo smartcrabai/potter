@@ -61,6 +61,28 @@ pub fn corner_normal_vectors(mesh: &Mesh) -> crate::error::Result<Vec<DVec3>> {
     normals::corner_normals(mesh, &positions)
 }
 
+/// Corner signs of Blender's `primitive_cube_add` (`bmo_create_cube_exec`, `bmesh/operators/bmo_primitive.cc`):
+/// corners enumerate x, then y, then z, each from -1 to +1.
+const BOX_CORNER_SIGNS: [[f64; 3]; 8] = [
+    [-1.0, -1.0, -1.0],
+    [-1.0, -1.0, 1.0],
+    [-1.0, 1.0, -1.0],
+    [-1.0, 1.0, 1.0],
+    [1.0, -1.0, -1.0],
+    [1.0, -1.0, 1.0],
+    [1.0, 1.0, -1.0],
+    [1.0, 1.0, 1.0],
+];
+/// Face corner indices into [`BOX_CORNER_SIGNS`], Blender's `bmo_create_cube_exec` table.
+const BOX_FACES: [[usize; 4]; 6] = [
+    [0, 1, 3, 2],
+    [2, 3, 7, 6],
+    [6, 7, 5, 4],
+    [4, 5, 1, 0],
+    [2, 6, 4, 0],
+    [7, 3, 1, 5],
+];
+
 #[cfg(test)]
 mod mirror_oracle;
 #[cfg(test)]
@@ -768,37 +790,18 @@ impl Mesh {
                 "box dimensions must be finite and positive",
             ));
         }
-        // Blender's `primitive_cube_add` (`bmo_create_cube_exec`, bmesh/operators/bmo_primitive.cc):
-        // corners enumerate x, then y, then z, each from -1 to +1; faces follow Blender's table.
-        const CORNER_SIGNS: [[f64; 3]; 8] = [
-            [-1.0, -1.0, -1.0],
-            [-1.0, -1.0, 1.0],
-            [-1.0, 1.0, -1.0],
-            [-1.0, 1.0, 1.0],
-            [1.0, -1.0, -1.0],
-            [1.0, -1.0, 1.0],
-            [1.0, 1.0, -1.0],
-            [1.0, 1.0, 1.0],
-        ];
-        const FACES: [[usize; 4]; 6] = [
-            [0, 1, 3, 2],
-            [2, 3, 7, 6],
-            [6, 7, 5, 4],
-            [4, 5, 1, 0],
-            [2, 6, 4, 0],
-            [7, 3, 1, 5],
-        ];
+        // Blender's `primitive_cube_add` order (`bmo_create_cube_exec`); see `BOX_CORNER_SIGNS`.
         let half = params.size * 0.5;
         let mut mesh = Self::new();
         let mut ids = [0_u32; 8];
-        for (id, sign) in ids.iter_mut().zip(CORNER_SIGNS) {
+        for (id, sign) in ids.iter_mut().zip(BOX_CORNER_SIGNS) {
             *id = mesh.insert_vertex(DVec3::new(
                 sign[0] * half.x,
                 sign[1] * half.y,
                 sign[2] * half.z,
             ))?;
         }
-        for face in FACES {
+        for face in BOX_FACES {
             // BM_face_create_ngon_verts creates each boundary edge from the previous corner to the
             // next, so the closing edge (last to first) comes first. Existing edges are reused.
             let mut previous = face[3];
