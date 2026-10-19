@@ -13,7 +13,9 @@ mod level;
 mod patch;
 mod refine;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+
+use crate::error::{ErrorCode, PotError, Result};
 
 use glam::{DVec2, DVec3};
 
@@ -56,6 +58,13 @@ impl Sample {
             }
         }
     }
+}
+
+/// Leaf patches built by `LimitSurface::point_and_derivatives_cached`, keyed by `(level, face)`. A
+/// patch depends only on its leaf, so a cache serves one limit surface and must not outlive it.
+#[derive(Default)]
+pub(super) struct PatchCache {
+    patches: HashMap<(usize, usize), Patch>,
 }
 
 /// The refined levels of one mesh, with the selection that produced each level from the previous one.
@@ -245,6 +254,57 @@ impl LimitSurface {
         out
     }
 
+    /// Evaluates the limit point and its object-space derivatives with respect to ptex-local `u` and `v`.
+    /// Each leaf's patch is built once per `cache` and reused by later samples on that leaf; the
+    /// patch and the arithmetic are those of a fresh build.
+    pub(super) fn point_and_derivatives_cached(
+        &self,
+        sample: Sample,
+        cache: &mut PatchCache,
+    ) -> Result<(DVec3, DVec3, DVec3)> {
+        let Some(&is_ngon) = self.ngon_root.get(sample.face) else {
+            return Err(PotError::new(
+                ErrorCode::InvalidArgument,
+                "subdivision sample references a missing face",
+            ));
+        };
+        let face = &self.levels[0].level.faces[sample.face];
+        let ptex_count = if is_ngon { face.len() } else { 1 };
+        if sample.ptex >= ptex_count
+            || !sample.u.is_finite()
+            || !sample.v.is_finite()
+            || !(0.0..=1.0).contains(&sample.u)
+            || !(0.0..=1.0).contains(&sample.v)
+        {
+            return Err(PotError::new(
+                ErrorCode::InvalidArgument,
+                "subdivision sample has invalid ptex coordinates",
+            ));
+        }
+        let (located, jacobian) =
+            locate_with_jacobian(&self.ngon_root, &self.levels, &self.selected, sample);
+        let refined = &self.levels[located.level];
+        let patch = cache
+            .patches
+            .entry((located.level, located.face))
+            .or_insert_with(|| {
+                Patch::new(
+                    &refined.level,
+                    located.face,
+                    located.level,
+                    self.has_irregular_faces,
+                    leaf_corner,
+                )
+            });
+        let (point, ds, dt) =
+            patch.evaluate_and_derivatives(&refined.positions, located.s, located.t);
+        Ok((
+            point,
+            ds * jacobian[0][0] + dt * jacobian[1][0],
+            ds * jacobian[0][1] + dt * jacobian[1][1],
+        ))
+    }
+
     /// The UV layer's value at every output loop, for the loops' `samples`, on this limit surface. The
     /// layer's values refine over the position levels and are evaluated on the same leaf, at the same
     /// local coordinates, as the position of each loop.
@@ -410,18 +470,35 @@ struct Leaf {
     t: f64,
 }
 
-/// The leaf that holds `sample` (Blender's quadtree lookup) in a refinement with the given levels and
-/// selections. Positions and face-varying values use the same lookup.
-#[expect(
-    clippy::expect_used,
-    reason = "a sampled n-gon sub-face is refined at the first level, and every selected leaf has child quads"
-)]
 fn locate<T>(
     ngon_root: &[bool],
     levels: &[Refined<T>],
     selected: &[Vec<bool>],
     sample: Sample,
 ) -> Leaf {
+    locate_inner::<T, false>(ngon_root, levels, selected, sample).0
+}
+
+fn locate_with_jacobian<T>(
+    ngon_root: &[bool],
+    levels: &[Refined<T>],
+    selected: &[Vec<bool>],
+    sample: Sample,
+) -> (Leaf, [[f64; 2]; 2]) {
+    locate_inner::<T, true>(ngon_root, levels, selected, sample)
+}
+
+/// The leaf that holds `sample` (Blender's quadtree lookup) and its ptex-to-leaf Jacobian.
+#[expect(
+    clippy::expect_used,
+    reason = "a sampled n-gon sub-face is refined at the first level, and every selected leaf has child quads"
+)]
+fn locate_inner<T, const TRACK_JACOBIAN: bool>(
+    ngon_root: &[bool],
+    levels: &[Refined<T>],
+    selected: &[Vec<bool>],
+    sample: Sample,
+) -> (Leaf, [[f64; 2]; 2]) {
     let (mut level, mut face, mut s, mut t) = if ngon_root[sample.face] {
         let child = levels[1].face_children[sample.face][sample.ptex]
             .expect("n-gon sub-faces are refined at the first level");
@@ -429,6 +506,7 @@ fn locate<T>(
     } else {
         (0, sample.face, sample.u, sample.v)
     };
+    let mut jacobian = [[1.0, 0.0], [0.0, 1.0]];
     while level + 1 < levels.len() && selected[level][face] {
         let quadrant = match (s >= 0.5, t >= 0.5) {
             (false, false) => 0,
@@ -438,13 +516,15 @@ fn locate<T>(
         };
         let child = levels[level + 1].face_children[face][quadrant]
             .expect("a selected face has all of its child quads");
+        if TRACK_JACOBIAN {
+            jacobian = compose_jacobian(child_coordinates_jacobian(quadrant), jacobian);
+        }
         (s, t) = child_coordinates(quadrant, s, t);
         face = child;
         level += 1;
     }
-    Leaf { level, face, s, t }
+    (Leaf { level, face, s, t }, jacobian)
 }
-
 /// Local coordinates of a point in child quad `quadrant` of its parent, in the child's own frame
 /// (whose corner 0 is the parent's corner `quadrant`).
 fn child_coordinates(quadrant: usize, s: f64, t: f64) -> (f64, f64) {
@@ -454,6 +534,28 @@ fn child_coordinates(quadrant: usize, s: f64, t: f64) -> (f64, f64) {
         2 => (2.0 - 2.0 * s, 2.0 - 2.0 * t),
         _ => (2.0 - 2.0 * t, 2.0 * s),
     }
+}
+
+fn child_coordinates_jacobian(quadrant: usize) -> [[f64; 2]; 2] {
+    match quadrant {
+        0 => [[2.0, 0.0], [0.0, 2.0]],
+        1 => [[0.0, 2.0], [-2.0, 0.0]],
+        2 => [[-2.0, 0.0], [0.0, -2.0]],
+        _ => [[0.0, -2.0], [2.0, 0.0]],
+    }
+}
+
+fn compose_jacobian(child: [[f64; 2]; 2], parent: [[f64; 2]; 2]) -> [[f64; 2]; 2] {
+    [
+        [
+            child[0][0] * parent[0][0] + child[0][1] * parent[1][0],
+            child[0][0] * parent[0][1] + child[0][1] * parent[1][1],
+        ],
+        [
+            child[1][0] * parent[0][0] + child[1][1] * parent[1][0],
+            child[1][0] * parent[0][1] + child[1][1] * parent[1][1],
+        ],
+    ]
 }
 
 /// The values at `leaves`, in their order. Leaves are visited grouped by level and face, so each
@@ -651,4 +753,68 @@ fn bilinear(level: &Level, positions: &[DVec2], face: usize, s: f64, t: f64) -> 
         .fold(DVec2::ZERO, |sum, (&value, weight)| {
             sum + positions[value] * weight
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{child_coordinates, child_coordinates_jacobian, compose_jacobian};
+
+    fn child_quadrant(s: f64, t: f64) -> usize {
+        match (s >= 0.5, t >= 0.5) {
+            (false, false) => 0,
+            (true, false) => 1,
+            (true, true) => 2,
+            (false, true) => 3,
+        }
+    }
+
+    fn parent_coordinates(quadrant: usize, s: f64, t: f64) -> (f64, f64) {
+        match quadrant {
+            0 => (0.5 * s, 0.5 * t),
+            1 => (1.0 - 0.5 * t, 0.5 * s),
+            2 => (1.0 - 0.5 * s, 1.0 - 0.5 * t),
+            _ => (0.5 * t, 1.0 - 0.5 * s),
+        }
+    }
+
+    fn map_path(path: &[usize], mut s: f64, mut t: f64) -> (f64, f64) {
+        for &quadrant in path {
+            (s, t) = child_coordinates(quadrant, s, t);
+        }
+        (s, t)
+    }
+
+    #[test]
+    fn child_jacobians_compose_for_every_three_level_quadrant_path() {
+        let leaf = (0.31, 0.67);
+        let epsilon = 1.0e-7;
+        for encoded_path in 0..64 {
+            let path = [
+                encoded_path & 3,
+                (encoded_path >> 2) & 3,
+                (encoded_path >> 4) & 3,
+            ];
+            let mut root = leaf;
+            for &quadrant in path.iter().rev() {
+                root = parent_coordinates(quadrant, root.0, root.1);
+            }
+
+            let mut local = root;
+            let mut jacobian = [[1.0, 0.0], [0.0, 1.0]];
+            for quadrant in path {
+                assert_eq!(child_quadrant(local.0, local.1), quadrant);
+                jacobian = compose_jacobian(child_coordinates_jacobian(quadrant), jacobian);
+                local = child_coordinates(quadrant, local.0, local.1);
+            }
+            assert!((local.0 - leaf.0).abs() < 1.0e-12);
+            assert!((local.1 - leaf.1).abs() < 1.0e-12);
+
+            let du = map_path(&path, root.0 + epsilon, root.1);
+            let dv = map_path(&path, root.0, root.1 + epsilon);
+            assert!(((du.0 - local.0) / epsilon - jacobian[0][0]).abs() < 1.0e-8);
+            assert!(((du.1 - local.1) / epsilon - jacobian[1][0]).abs() < 1.0e-8);
+            assert!(((dv.0 - local.0) / epsilon - jacobian[0][1]).abs() < 1.0e-8);
+            assert!(((dv.1 - local.1) / epsilon - jacobian[1][1]).abs() < 1.0e-8);
+        }
+    }
 }

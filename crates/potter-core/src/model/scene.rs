@@ -184,6 +184,16 @@ impl SceneDoc {
             }
         }
         for (scene_id, scene) in &self.scenes {
+            scene.render.validate()?;
+            if let Some(camera_id) = &scene.render.dicing_camera
+                && !self.is_camera_object(camera_id)
+            {
+                return Err(PotError::with_details(
+                    ErrorCode::SceneInvalid,
+                    "render dicing_camera must reference a camera object",
+                    json!({"scene_id":scene_id,"camera_id":camera_id}),
+                ));
+            }
             if let Some(curve) = &scene.color_management.curve {
                 curve.validate()?;
             }
@@ -455,6 +465,15 @@ impl SceneDoc {
             })?;
         }
         Ok(())
+    }
+
+    pub(crate) fn is_camera_object(&self, camera_id: &Id) -> bool {
+        self.nodes
+            .get(camera_id)
+            .filter(|node| node.kind == "camera")
+            .and_then(|node| node.data.as_ref())
+            .and_then(|data_id| self.data_blocks.get(data_id))
+            .is_some_and(|data| data.camera.is_some())
     }
 }
 
@@ -1148,6 +1167,31 @@ pub struct RenderSettings {
     pub shutter: f64,
     #[serde(default = "default_motion_blur_samples")]
     pub motion_blur_samples: u32,
+    pub dicing_rate: f64,
+    pub preview_dicing_rate: f64,
+    pub max_subdivisions: u32,
+    pub offscreen_dicing_scale: f64,
+    #[serde(default)]
+    pub dicing_camera: Option<Id>,
+}
+
+impl RenderSettings {
+    fn validate(&self) -> Result<()> {
+        if !self.dicing_rate.is_finite()
+            || !(0.1..=1000.0).contains(&self.dicing_rate)
+            || !self.preview_dicing_rate.is_finite()
+            || !(0.1..=1000.0).contains(&self.preview_dicing_rate)
+            || self.max_subdivisions > 16
+            || !self.offscreen_dicing_scale.is_finite()
+            || !(1.0..=f32::MAX as f64).contains(&self.offscreen_dicing_scale)
+        {
+            return Err(PotError::new(
+                ErrorCode::SceneInvalid,
+                "Cycles adaptive dicing settings are outside Blender RNA ranges",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Default for RenderSettings {
@@ -1168,6 +1212,11 @@ impl Default for RenderSettings {
             motion_blur: false,
             shutter: default_shutter(),
             motion_blur_samples: default_motion_blur_samples(),
+            dicing_rate: 1.0,
+            preview_dicing_rate: 8.0,
+            max_subdivisions: 12,
+            offscreen_dicing_scale: 4.0,
+            dicing_camera: None,
         }
     }
 }
