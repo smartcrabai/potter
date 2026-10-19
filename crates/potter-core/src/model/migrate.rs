@@ -261,8 +261,13 @@ fn upgrade_color_curve(color: &mut Value) -> Result<()> {
     let Some(curve) = color.get_mut("curve") else {
         return Ok(());
     };
-    let Value::Array(points) = curve else {
+    if curve.is_null() || curve.is_object() {
         return Ok(());
+    }
+    let Value::Array(points) = curve else {
+        return Err(invalid(
+            "color curve must be an array of [x, y] points, null, or a CurveMapping object",
+        ));
     };
     let mut points = points
         .iter()
