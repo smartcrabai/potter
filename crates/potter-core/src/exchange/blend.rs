@@ -784,19 +784,21 @@ fn add_blender_image_pixels(document: &mut Value, project: &Project) -> Result<(
             crate::image::ImageInterpolation::Linear,
         )?;
         // The stored values, with the alpha mode the Blender datablock gets: a premultiplied EXR stays associated, and a
-        // straight image is straight, so Blender's packed file and its alpha mode agree (`_pack_image`).
-        image_json["pixels"] = json!(blender_image_pixels(&image, data.width, &data.pixels));
+        // straight image is straight, so Blender's packed file and its alpha mode agree (`_pack_image`). A UDIM image is
+        // sent as its tiles only: the base is tile 1001 among them, so its pixels are not sent twice.
         if image.is_udim() {
             image_json["udim_tiles"] = udim_export_tiles(&image, &data, project)?;
+        } else {
+            image_json["pixels"] = json!(blender_image_pixels(&image, data.width, &data.pixels));
+            if let Some(png) = eight_bit_png_bytes(&image, project)? {
+                image_json["png_bytes"] = json!(png);
+            }
         }
         image_json["alpha_mode"] = json!(match image.alpha_mode {
             crate::model::ImageAlphaMode::Straight => "straight",
             crate::model::ImageAlphaMode::Premultiplied => "premultiplied",
             crate::model::ImageAlphaMode::None => "none",
         });
-        if let Some(png) = eight_bit_png_bytes(&image, project)? {
-            image_json["png_bytes"] = json!(png);
-        }
     }
     Ok(())
 }
