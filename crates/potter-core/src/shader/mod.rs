@@ -8,5 +8,5 @@ pub use evaluator::{
     evaluate_surface_with_workspace, fill_color_layers, height_gradient,
 };
 pub(crate) use evaluator::{DEFAULT_SPECULAR_IOR_LEVEL, dielectric_f0};
+pub(crate) use world::equirectangular_uv;
 pub use world::evaluate_world;
-pub(crate) use world::{environment_colour, equirectangular_uv};
