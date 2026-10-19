@@ -42,8 +42,8 @@ mod bevel_shading;
 mod bevel_vmesh;
 mod decimate;
 pub(crate) mod deform;
-pub(crate) mod multires;
 mod mirror;
+pub(crate) mod multires;
 mod ocean;
 mod remesh_modes;
 pub mod simulation;
@@ -1306,7 +1306,6 @@ fn without_custom_normals(mut mesh: Mesh) -> Mesh {
     mesh.attributes.remove("custom_normal");
     mesh
 }
-
 
 fn array(
     mesh: &Mesh,
