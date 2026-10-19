@@ -1993,6 +1993,7 @@ fn texture_ref(
             width,
             height,
             tiles: Vec::new(),
+            tiled: false,
             blob: None,
             source_path: Some(path.to_string_lossy().into_owned()),
             source_hash: Some(crate::hash::sha256(&bytes)),
