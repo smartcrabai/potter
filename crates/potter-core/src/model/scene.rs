@@ -1657,6 +1657,15 @@ impl Default for RayVisibility {
 }
 
 impl RayVisibility {
+    /// The Blender RNA property that holds each flag, in the order of the fields.
+    pub const RNA_PROPERTIES: [&'static str; 6] = [
+        "visible_camera",
+        "visible_diffuse",
+        "visible_glossy",
+        "visible_transmission",
+        "visible_volume_scatter",
+        "visible_shadow",
+    ];
     /// Blender's flags for a new object of `kind`. Lights are hidden from camera rays
     /// (`BKE_object_init`, object.cc:2177); every other object starts fully visible.
     #[must_use]
@@ -1677,6 +1686,42 @@ impl RayVisibility {
             RayKind::VolumeScatter => self.volume_scatter,
             RayKind::Shadow => self.shadow,
         }
+    }
+
+    /// Sets one flag.
+    pub fn set(&mut self, ray: RayKind, value: bool) {
+        match ray {
+            RayKind::Camera => self.camera = value,
+            RayKind::Diffuse => self.diffuse = value,
+            RayKind::Glossy => self.glossy = value,
+            RayKind::Transmission => self.transmission = value,
+            RayKind::VolumeScatter => self.volume_scatter = value,
+            RayKind::Shadow => self.shadow = value,
+        }
+    }
+
+    /// One bit per ray kind, the mask a triangle carries so a BVH query tests a single `u8`.
+    #[must_use]
+    pub fn mask(self) -> u8 {
+        [
+            RayKind::Camera,
+            RayKind::Diffuse,
+            RayKind::Glossy,
+            RayKind::Transmission,
+            RayKind::VolumeScatter,
+            RayKind::Shadow,
+        ]
+        .into_iter()
+        .filter(|ray| self.allows(*ray))
+        .fold(0, |mask, ray| mask | ray.bit())
+    }
+}
+
+impl RayKind {
+    /// The kind's bit in a ray mask (`PATH_RAY_*` in Cycles' kernel).
+    #[must_use]
+    pub const fn bit(self) -> u8 {
+        1 << self as u8
     }
 }
 

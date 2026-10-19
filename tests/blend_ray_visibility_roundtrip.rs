@@ -20,8 +20,8 @@ mod process;
 use std::{fs, path::Path};
 
 use native_oracle::{
-    TestResult, export, import_blend, loss_features, node_id, read_scene, run_blender_arguments,
-    write_script,
+    TestResult, apply_operations, export, import_blend, loss_features, node_id, read_scene,
+    run_blender_arguments, write_script,
 };
 use serde_json::{Value, json};
 use tempfile::tempdir;
@@ -147,5 +147,47 @@ fn object_ray_visibility_survives_import_export_and_reads_back_in_blender() -> T
             "{name}: Blender must read back the flags after Potter's export"
         );
     }
+    Ok(())
+}
+
+/// An edit wins over the imported RNA copy: `HiddenFromCamera` imports `visible_camera=False`, a
+/// `node.update` sets camera back on, and the export must carry the edit while keeping the other
+/// flags that were imported.
+#[test]
+fn edited_ray_visibility_wins_over_the_imported_rna_on_export() -> TestResult {
+    let Some(blender) = blender_checked::blender_executable() else {
+        return Ok(());
+    };
+    let root = tempdir()?;
+    let build = write_script(root.path(), "ray_visibility_build.py", BUILD_SCRIPT)?;
+    let source = root.path().join("source.blend");
+    run_blender_arguments(&blender, &build, None, &[source.as_path()])?;
+    let (project, _report) = import_blend(&blender, root.path(), "project", &source)?;
+    let id = node_id(&read_scene(&project)?, "HiddenFromCamera")?;
+    apply_operations(
+        &project,
+        root.path(),
+        json!([{
+            "op": "node.update",
+            "target": {"id": id},
+            "set": {"ray_visibility": {"camera": true}},
+        }]),
+    )?;
+
+    let mut edited = expected_flags()["HiddenFromCamera"].clone();
+    edited["visible_camera"] = json!(true);
+    assert_eq!(
+        read_scene(&project)?["nodes"][&id]["ray_visibility"],
+        stored_visibility(&edited),
+        "the edit must be the stored value, with the imported shadow flag kept"
+    );
+
+    let exported = root.path().join("edited.blend");
+    export(&blender, &project, "blend", &exported)?;
+    let reread = dump_flags(&blender, root.path(), &exported, "edited")?;
+    assert_eq!(
+        reread["HiddenFromCamera"], edited,
+        "Blender must read the edited flags, not the imported RNA copy"
+    );
     Ok(())
 }

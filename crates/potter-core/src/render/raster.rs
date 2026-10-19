@@ -2,7 +2,7 @@ use glam::DVec3;
 
 use crate::error::{ErrorCode, PotError, Result};
 use crate::float::equal_f64;
-use crate::model::{RayKind, RayVisibility};
+use crate::model::RayKind;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Projection {
@@ -78,8 +78,8 @@ pub(crate) struct Triangle {
     /// Lit per pixel by the surface shader instead of once per triangle: realtime Beauty triangles
     /// whose material graph reads color layers. Smooth triangles are lit per pixel regardless.
     pub(crate) lit_per_pixel: bool,
-    /// The owning object's ray visibility; realtime Beauty filters primary rays by it.
-    pub(crate) ray_visibility: RayVisibility,
+    /// The owning object's ray mask (one `RayKind` bit each); realtime Beauty filters primary rays.
+    pub(crate) ray_mask: u8,
 }
 
 impl Triangle {
@@ -105,7 +105,7 @@ impl Triangle {
             normals: self.normals,
             layer_colors,
             lit_per_pixel: self.lit_per_pixel,
-            ray_visibility: self.ray_visibility,
+            ray_mask: self.ray_mask,
         }
     }
 
@@ -202,8 +202,8 @@ pub(crate) struct Line {
     pub(crate) color: [f64; 4],
     pub(crate) object_index: u32,
     pub(crate) element_index: u32,
-    /// Object ray visibility; realtime Beauty leaves out lines hidden from camera rays.
-    pub(crate) ray_visibility: RayVisibility,
+    /// Object ray mask; realtime Beauty leaves out lines hidden from camera rays.
+    pub(crate) ray_mask: u8,
 }
 
 #[derive(Debug)]
@@ -655,7 +655,7 @@ pub(crate) fn rasterize_with_lines(
                 "evaluated stroke contains invalid geometry or color",
             ));
         }
-        if matches!(mode, Mode::Beauty) && !line.ray_visibility.allows(RayKind::Camera) {
+        if matches!(mode, Mode::Beauty) && line.ray_mask & RayKind::Camera.bit() == 0 {
             continue;
         }
         let Some(start) = project_world(camera, &frame, width, height, line.start) else {
@@ -1024,7 +1024,7 @@ pub(crate) fn ambient_visibility(
                 direction,
                 1.0e-5,
                 distance,
-                &|triangle| triangle.ray_visibility.allows(RayKind::Shadow),
+                &|triangle| triangle.ray_mask & RayKind::Shadow.bit() != 0,
             )
             .is_none()
         {
@@ -1390,7 +1390,7 @@ fn prepare_triangles(triangles: &[Triangle], mode: Mode) -> Result<Vec<PreparedT
                 "triangle positions and colors must be finite",
             ));
         }
-        if matches!(mode, Mode::Beauty) && !triangle.ray_visibility.allows(RayKind::Camera) {
+        if matches!(mode, Mode::Beauty) && triangle.ray_mask & RayKind::Camera.bit() == 0 {
             continue;
         }
         let edge1 = triangle.positions[1] - triangle.positions[0];
@@ -1802,7 +1802,7 @@ mod line_tests {
             color: [1.0, 0.0, 0.0, 1.0],
             object_index: 1,
             element_index: 2,
-            ray_visibility: RayVisibility::default(),
+            ray_mask: RayVisibility::default().mask(),
         };
         let output = rasterize_with_lines(
             &[],
@@ -1923,7 +1923,7 @@ mod smooth_shading_tests {
             normals,
             layer_colors: Vec::new(),
             lit_per_pixel: false,
-            ray_visibility: RayVisibility::default(),
+            ray_mask: RayVisibility::default().mask(),
         }
     }
 
@@ -2197,7 +2197,7 @@ mod visibility_tests {
             normals: None,
             layer_colors: Vec::new(),
             lit_per_pixel: false,
-            ray_visibility: RayVisibility::default(),
+            ray_mask: RayVisibility::default().mask(),
         }
     }
 

@@ -180,8 +180,8 @@ pub(super) fn extract_geometry(
             continue;
         }
         let ray_visibility = node.resolved_ray_visibility();
-        if matches!(mode, Mode::Beauty) {
-            ray_visibility_warnings(node_id, node, path_traced, &mut warnings);
+        if !path_traced && matches!(mode, Mode::Beauty) {
+            ray_visibility_warnings(node_id, node, &mut warnings);
         }
         let data_block = node
             .data
@@ -563,7 +563,7 @@ pub(super) fn extract_geometry(
                         normals: corner_normals,
                         layer_colors,
                         lit_per_pixel,
-                        ray_visibility,
+                        ray_mask: ray_visibility.mask(),
                     };
                     if let (Some(material), Some(prepared_material)) = (
                         material.filter(|material| {
@@ -675,7 +675,7 @@ pub(super) fn extract_geometry(
                     color,
                     object_index,
                     element_index,
-                    ray_visibility,
+                    ray_mask: ray_visibility.mask(),
                 });
             }
         }
@@ -743,7 +743,7 @@ pub(super) fn extract_geometry(
                         color: stroke.color,
                         object_index,
                         element_index,
-                        ray_visibility,
+                        ray_mask: ray_visibility.mask(),
                     });
                 }
                 let stroke_element_index = u32::try_from(elements.len() + 1).map_err(|_| {
@@ -778,7 +778,7 @@ pub(super) fn extract_geometry(
                         color: stroke.color,
                         object_index,
                         element_index: stroke_element_index,
-                        ray_visibility,
+                        ray_mask: ray_visibility.mask(),
                     });
                 }
             }
@@ -854,7 +854,7 @@ pub(super) fn extract_geometry(
                         color,
                         object_index,
                         element_index,
-                        ray_visibility,
+                        ray_mask: ray_visibility.mask(),
                     });
                 }
             }
@@ -991,7 +991,7 @@ impl PointShadowMap {
         }
         let casters = triangles
             .iter()
-            .filter(|triangle| triangle.ray_visibility.allows(RayKind::Shadow));
+            .filter(|triangle| triangle.ray_mask & RayKind::Shadow.bit() != 0);
         for triangle in casters {
             for face in &mut faces {
                 rasterize_shadow_triangle(face, position, triangle);
@@ -1466,16 +1466,10 @@ fn world_face_normals(
     faces
 }
 
-/// Ray-visibility flags that Beauty does not honour, one warning per flag switched away from
-/// Blender's default for the node kind. Realtime Beauty honours mesh camera and shadow flags and
-/// light diffuse and glossy flags, as EEVEE does. The path tracer honours every mesh flag; it
-/// draws no light emitter to the camera and does not yet test light hits against any flag.
-fn ray_visibility_warnings(
-    node_id: &Id,
-    node: &Node,
-    path_traced: bool,
-    warnings: &mut Vec<serde_json::Value>,
-) {
+/// Ray-visibility flags that realtime Beauty does not honour, one warning per flag switched away
+/// from Blender's default for the node kind. Realtime Beauty honours mesh camera and shadow flags
+/// and light diffuse and glossy flags, as EEVEE does.
+fn ray_visibility_warnings(node_id: &Id, node: &Node, warnings: &mut Vec<serde_json::Value>) {
     const MESH_FLAGS: [(&str, RayKind); 4] = [
         ("diffuse", RayKind::Diffuse),
         ("glossy", RayKind::Glossy),
@@ -1487,23 +1481,10 @@ fn ray_visibility_warnings(
         ("transmission", RayKind::Transmission),
         ("volume_scatter", RayKind::VolumeScatter),
     ];
-    const PATH_LIGHT_FLAGS: [(&str, RayKind); 5] = [
-        ("camera", RayKind::Camera),
-        ("diffuse", RayKind::Diffuse),
-        ("glossy", RayKind::Glossy),
-        ("transmission", RayKind::Transmission),
-        ("volume_scatter", RayKind::VolumeScatter),
-    ];
-    let flags: &[(&str, RayKind)] = match (path_traced, node.kind == "light") {
-        (true, true) => &PATH_LIGHT_FLAGS,
-        (true, false) => &[],
-        (false, true) => &LIGHT_FLAGS,
-        (false, false) => &MESH_FLAGS,
-    };
-    let engine = if path_traced {
-        "the path tracer"
+    let flags: &[(&str, RayKind)] = if node.kind == "light" {
+        &LIGHT_FLAGS
     } else {
-        "realtime Beauty"
+        &MESH_FLAGS
     };
     let visibility = node.resolved_ray_visibility();
     let default = RayVisibility::default_for_kind(&node.kind);
@@ -1518,7 +1499,7 @@ fn ray_visibility_warnings(
             "feature_id": format!("object.ray_visibility.{name}"),
             "node_id": node_id,
             "message": format!(
-                "visible_{name} is {value}, which {engine} does not honour for this {}; it renders as if visible_{name} were {expected}",
+                "visible_{name} is {value}, which realtime Beauty does not honour for this {}; it renders as if visible_{name} were {expected}",
                 node.kind,
             ),
         }));
@@ -2320,7 +2301,7 @@ fn shadow_visibility(
                 sample_direction,
                 epsilon,
                 maximum_distance,
-                &|triangle| triangle.ray_visibility.allows(RayKind::Shadow),
+                &|triangle| triangle.ray_mask & RayKind::Shadow.bit() != 0,
             )
             .is_none()
         {
@@ -2793,7 +2774,7 @@ mod shading_normal_tests {
             normals: Some(normals),
             layer_colors: Vec::new(),
             lit_per_pixel: false,
-            ray_visibility: RayVisibility::default(),
+            ray_mask: RayVisibility::default().mask(),
         }
     }
 

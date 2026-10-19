@@ -8234,22 +8234,13 @@ fn root_matrix_requires_approximation(node: &Node) -> bool {
     false
 }
 
-/// Blender's `visible_*` object flags. The typed `Node::ray_visibility` owns them, so they are
+/// Blender's `visible_*` object flags are owned by the typed `Node::ray_visibility`, so they are
 /// kept out of the opaque RNA dump.
-const RAY_VISIBILITY_RNA: [&str; 6] = [
-    "visible_camera",
-    "visible_diffuse",
-    "visible_glossy",
-    "visible_transmission",
-    "visible_volume_scatter",
-    "visible_shadow",
-];
-
 fn rna_properties_without_ray_visibility(item: &Value) -> Value {
     match item.get("rna_properties").and_then(Value::as_object) {
         Some(rna) => Value::Object(
             rna.iter()
-                .filter(|(key, _)| !RAY_VISIBILITY_RNA.contains(&key.as_str()))
+                .filter(|(key, _)| !RayVisibility::RNA_PROPERTIES.contains(&key.as_str()))
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect(),
         ),

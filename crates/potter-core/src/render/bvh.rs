@@ -608,7 +608,7 @@ mod tests {
                         normals: None,
                         layer_colors: Vec::new(),
                         lit_per_pixel: false,
-                        ray_visibility: RayVisibility::default(),
+                        ray_mask: RayVisibility::default().mask(),
                     }
                 })
                 .collect::<Vec<_>>();

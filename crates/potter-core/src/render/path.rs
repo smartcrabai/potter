@@ -1188,7 +1188,7 @@ fn closest_hit(
         direction,
         t_min,
         t_max,
-        &|triangle| triangle.ray_visibility.allows(ray),
+        &|triangle| triangle.ray_mask & ray.bit() != 0,
     )
 }
 

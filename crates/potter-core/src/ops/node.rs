@@ -633,6 +633,7 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             "visible",
             "render_visible",
             "selectable",
+            "ray_visibility",
             "action",
         ],
         |engine, key| {
@@ -692,6 +693,10 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
     let visible = read_optional_bool(engine, set, "visible")?;
     let render_visible = read_optional_bool(engine, set, "render_visible")?;
     let selectable = read_optional_bool(engine, set, "selectable")?;
+    let ray_visibility = set
+        .get("ray_visibility")
+        .map(|value| read_ray_visibility(engine, value))
+        .transpose()?;
     let action = set
         .get("action")
         .map(|value| {
@@ -787,6 +792,33 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                     }
                 }
             }
+            if let Some(updates) = &ray_visibility {
+                let mut visibility = node.resolved_ray_visibility();
+                for &(ray, value) in updates {
+                    visibility.set(ray, value);
+                }
+                // The typed field is the only copy afterwards: a default is omitted, and the legacy
+                // RNA copy in the metadata is dropped so it cannot override this edit on export.
+                let stored = (visibility
+                    != crate::model::RayVisibility::default_for_kind(&node.kind))
+                .then_some(visibility);
+                if node.ray_visibility != stored {
+                    node.ray_visibility = stored;
+                    item_changed = true;
+                }
+                if let Some(rna) = node
+                    .properties
+                    .get_mut("blender_object_metadata")
+                    .and_then(|metadata| metadata.get_mut("rna_properties"))
+                    .and_then(Value::as_object_mut)
+                {
+                    for key in crate::model::RayVisibility::RNA_PROPERTIES {
+                        if rna.remove(key).is_some() {
+                            item_changed = true;
+                        }
+                    }
+                }
+            }
             item_changed
         } else {
             false
@@ -797,6 +829,53 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
         }
     }
     Ok(changed)
+}
+
+/// The flags an update names, by ray kind. Flags it leaves out keep their current value.
+fn read_ray_visibility(
+    engine: &Engine<'_>,
+    value: &Value,
+) -> Result<Vec<(crate::model::RayKind, bool)>> {
+    use crate::model::RayKind;
+    const FLAGS: [(&str, RayKind); 6] = [
+        ("camera", RayKind::Camera),
+        ("diffuse", RayKind::Diffuse),
+        ("glossy", RayKind::Glossy),
+        ("transmission", RayKind::Transmission),
+        ("volume_scatter", RayKind::VolumeScatter),
+        ("shadow", RayKind::Shadow),
+    ];
+    let object = value.as_object().ok_or_else(|| {
+        engine.error(
+            ErrorCode::InvalidOperation,
+            "ray_visibility must be an object",
+            &operation_pointer(engine.operation_index, "set/ray_visibility"),
+        )
+    })?;
+    if let Some(key) = object
+        .keys()
+        .find(|key| !FLAGS.iter().any(|(name, _)| *name == key.as_str()))
+    {
+        return Err(engine.error(
+            ErrorCode::InvalidOperation,
+            format!("unknown ray_visibility flag `{key}`"),
+            &operation_pointer(engine.operation_index, "set/ray_visibility"),
+        ));
+    }
+    FLAGS
+        .iter()
+        .filter_map(|(name, ray)| {
+            object.get(*name).map(|flag| {
+                flag.as_bool().map(|flag| (*ray, flag)).ok_or_else(|| {
+                    engine.error(
+                        ErrorCode::InvalidOperation,
+                        format!("ray_visibility.{name} must be a boolean"),
+                        &operation_pointer(engine.operation_index, "set/ray_visibility"),
+                    )
+                })
+            })
+        })
+        .collect()
 }
 
 fn read_optional_bool(
