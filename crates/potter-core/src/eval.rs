@@ -1058,6 +1058,13 @@ impl Snapshot {
                 scene.render.seed,
                 id.as_str(),
             );
+            let references = SceneReferences {
+                world_matrices: &matrices,
+                bone_matrices: &bone_matrices,
+                bone_pose_matrices: &bone_pose_matrices,
+                evaluated_meshes: &meshes,
+                project_root: modifier_context.project_root,
+            };
             let bounds = if instance_collection_target(node)?.is_some() {
                 None
             } else if let Some(data_id) = &node.data {
