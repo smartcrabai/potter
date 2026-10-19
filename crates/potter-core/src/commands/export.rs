@@ -16,14 +16,14 @@ use crate::{
     eval::{EvaluationContext, EvaluationPurpose, Snapshot},
     exchange::{self, ExportOptions, Loss, material_surface::resolve_surface},
     hash,
-    model::{AvatarVersion, LightType, SceneDoc},
+    model::{AvatarVersion, Image, LightType, SceneDoc},
     response::SceneInfo,
     store::Project,
 };
 
 pub fn run(args: &ExportArgs) -> Result<(Option<SceneInfo>, Value)> {
     let project = Project::open(&args.scene)?;
-    let doc = project.doc().clone();
+    let mut doc = project.doc().clone();
     let format = exchange_format_name(args.format);
     let context = evaluation_context(
         args.context.scene_id.as_deref(),
@@ -135,8 +135,12 @@ pub fn run(args: &ExportArgs) -> Result<(Option<SceneInfo>, Value)> {
             losses.extend(exchange::fbx::uv_texture_losses(&doc, &snapshot));
             warnings.extend(exchange::fbx::uv_texture_warnings(&doc, &snapshot));
         }
+        losses.extend(udim_texture_losses(&doc, format));
         if !losses.is_empty() && !args.allow_lossy {
             return Err(lossy_error(format, &losses));
+        }
+        if args.allow_lossy && udim_base_only_format(format) {
+            flatten_udim_images(&mut doc);
         }
         let artifacts = match format {
             "glb" => {
@@ -382,6 +386,59 @@ fn blend_export_context_json(doc: &SceneDoc, context: &EvaluationContext) -> Res
         "evaluation_hash": null,
         "requested": context,
     }))
+}
+
+/// Formats whose exporter writes only the base tile of a UDIM image. Blender's glTF exporter splits geometry per tile and
+/// Potter does not, so a lossy export writes tile 1001 and reports the other tiles as a loss.
+fn udim_base_only_format(format: &str) -> bool {
+    matches!(
+        format,
+        "glb" | "gltf" | "vrm" | "vrm0" | "fbx" | "fbx-binary"
+    )
+}
+
+/// The `material.texture_udim` losses: a material texture that names a UDIM image in a base-only format.
+fn udim_texture_losses(doc: &SceneDoc, format: &str) -> Vec<Loss> {
+    if !udim_base_only_format(format) {
+        return Vec::new();
+    }
+    let mut losses = Vec::new();
+    for (material_id, material) in &doc.materials {
+        for texture in [
+            &material.base_color_texture,
+            &material.roughness_texture,
+            &material.metallic_texture,
+            &material.normal_texture,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if doc.images.get(&texture.image).is_some_and(Image::is_udim) {
+                losses.push(Loss {
+                    feature_id: "material.texture_udim".to_owned(),
+                    data_id: Some(material_id.to_string()),
+                    reason: format!(
+                        "{format} writes only tile 1001 of UDIM image {}; its other tiles are not exported",
+                        texture.image.as_str()
+                    ),
+                    suggestion: Some(
+                        "export as blend to keep every tile, or remove the UDIM tiles".to_owned(),
+                    ),
+                });
+            }
+        }
+    }
+    losses
+}
+
+/// Makes each UDIM image a plain image of its base tile, for a lossy export that writes only tile 1001.
+fn flatten_udim_images(doc: &mut SceneDoc) {
+    for image in doc.images.values_mut() {
+        if image.is_udim() {
+            image.tiles.clear();
+            image.tiled = false;
+        }
+    }
 }
 
 pub(crate) fn export_losses(
