@@ -29,9 +29,17 @@ use serde_json::{Value, json};
 use tempfile::tempdir;
 
 const SCRIPT: &str = include_str!("fixtures/native_oracle/glossy_area_light.py");
-/// Patch grid of the Blender oracle (`glossy_area_light.py`): fractions of the frame.
-const PATCH: [f64; 9] = [
-    0.25, 0.3125, 0.375, 0.4375, 0.5, 0.5625, 0.625, 0.6875, 0.75,
+/// Texel centres of the central 8×8 block of the 16 px frame, the same as `glossy_area_light.py`.
+/// The block is symmetric under a row flip, so the mean does not depend on the row origin.
+const PATCH: [f64; 8] = [
+    4.5 / 16.0,
+    5.5 / 16.0,
+    6.5 / 16.0,
+    7.5 / 16.0,
+    8.5 / 16.0,
+    9.5 / 16.0,
+    10.5 / 16.0,
+    11.5 / 16.0,
 ];
 /// Samples per pixel and seeds, the same for Blender and Potter.
 const SAMPLES: u32 = 256;

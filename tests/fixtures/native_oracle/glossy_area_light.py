@@ -32,8 +32,10 @@ SEEDS = int(seeds)
 
 WIDTH = 16
 HEIGHT = 16
-# Fractions of the frame: [0.25, 0.75] spans the central half of the plane's image.
-PATCH = [0.25 + 0.5 * index / 8 for index in range(9)]
+# Texel centres of the central 8×8 block, texels 4..11 of 16. The block is symmetric under a row
+# flip, so its mean does not depend on whether the renderer's row 0 is the top or the bottom. A
+# patch that reached one texel further on one side would bias the mean by the vertical gradient.
+PATCH = [(index + 0.5) / WIDTH for index in range(4, 12)]
 # Radiance 506 W/(sr m²) for every size: power = radiance · π · area.
 LIGHT_RADIANCE = 506.0
 
