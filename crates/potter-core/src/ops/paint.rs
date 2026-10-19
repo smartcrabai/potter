@@ -644,13 +644,16 @@ fn texture(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bo
             }
         }
     }
-    if updated.blob.is_none() {
-        let bytes = encode_pixels(image_data.width, image_data.height, &image_data.pixels)?;
-        updated.blob = Some(stage_image_blob(engine, bytes));
+    // A missing base has no pixels to encode, so the stroke stores only its tiles and the image stays missing at its base.
+    if !updated.base_is_missing() {
+        if updated.blob.is_none() {
+            let bytes = encode_pixels(image_data.width, image_data.height, &image_data.pixels)?;
+            updated.blob = Some(stage_image_blob(engine, bytes));
+        }
+        updated.source = ImageSource::Packed;
+        updated.source_path = None;
+        updated.source_hash = None;
     }
-    updated.source = ImageSource::Packed;
-    updated.source_path = None;
-    updated.source_hash = None;
     engine.doc.images.insert(image_id.clone(), updated);
     engine.mark("images", &image_id, ChangeKind::Updated);
     Ok(true)

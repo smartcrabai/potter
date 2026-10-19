@@ -442,13 +442,16 @@ fn set_pixels(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result
             updated.tiles.sort_by_key(|tile| tile.number);
         }
     }
-    if updated.blob.is_none() {
-        let bytes = encode_pixels(data.width, data.height, &data.pixels)?;
-        updated.blob = Some(stage_blob(engine, bytes));
+    // A missing base has no pixels to encode, so the edit stores only the tile and the image stays missing at its base.
+    if !updated.base_is_missing() {
+        if updated.blob.is_none() {
+            let bytes = encode_pixels(data.width, data.height, &data.pixels)?;
+            updated.blob = Some(stage_blob(engine, bytes));
+        }
+        updated.source = ImageSource::Packed;
+        updated.source_path = None;
+        updated.source_hash = None;
     }
-    updated.source = ImageSource::Packed;
-    updated.source_path = None;
-    updated.source_hash = None;
     engine.doc.images.insert(id.clone(), updated);
     engine.mark("images", &id, ChangeKind::Updated);
     Ok(true)

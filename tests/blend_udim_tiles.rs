@@ -685,6 +685,92 @@ fn check_missing_export(
     Ok(())
 }
 
+/// Edits tile 1002 of a missing-base image through `pot apply`. The base has no file, so the edit must store only the
+/// tile: the image stays a linked-missing record with no base size or blob, and the edited tile gets a blob.
+fn check_base_edit(blender: &Path, fixture: &Path) -> Result<(), Box<dyn Error>> {
+    let blend = fixture.join("udim_base_plane.blend");
+    let project = fixture.join("project_base_edit");
+    let init = pot_ok(&["init", path_str(&project)?], "project initialization")?;
+    assert_eq!(init["ok"], true);
+    pot_ok(
+        &[
+            "import",
+            path_str(&project)?,
+            "--file",
+            path_str(&blend)?,
+            "--format",
+            "blend",
+            "--mode",
+            "replace",
+            "--base-revision",
+            "0",
+            "--blender",
+            path_str(blender)?,
+            "--allow-lossy",
+        ],
+        "missing-base import",
+    )?;
+    let scene: Value = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
+    let id = scene["images"]
+        .as_object()
+        .and_then(|images| {
+            images
+                .iter()
+                .find(|(_, image)| image["name"] == "UDIM Image")
+                .map(|(id, _)| id.clone())
+        })
+        .ok_or_else(|| missing("UDIM Image id"))?;
+    let revision = scene["revision"]
+        .as_u64()
+        .ok_or_else(|| missing("scene revision"))?;
+    let batch = fixture.join("base_edit.operations.json");
+    fs::write(
+        &batch,
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "base_revision": revision,
+            "operations": [{
+                "op": "image.set_pixels",
+                "id": id,
+                "tile": 1002,
+                "width": 1,
+                "height": 2,
+                "pixels": [[1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0]],
+            }],
+        }))?,
+    )?;
+    pot_ok(
+        &["apply", path_str(&project)?, "--file", path_str(&batch)?],
+        "missing-base tile edit",
+    )?;
+    let edited: Value = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
+    let image = &edited["images"][&id];
+    assert_eq!(image["source"], "file", "the missing base became packed");
+    assert!(image["blob"].is_null(), "the missing base gained a blob");
+    assert_eq!(
+        (image["width"].as_u64(), image["height"].as_u64()),
+        (Some(0), Some(0)),
+        "the missing base gained a size"
+    );
+    let tile = &image["tiles"][0];
+    assert_eq!(
+        (
+            tile["number"].as_u64(),
+            tile["width"].as_u64(),
+            tile["height"].as_u64()
+        ),
+        (Some(1002), Some(1), Some(2)),
+        "the edited tile record is wrong"
+    );
+    assert!(
+        tile["blob"]
+            .as_str()
+            .is_some_and(|blob| blob.starts_with("sha256:")),
+        "the edited tile has no blob"
+    );
+    Ok(())
+}
+
 #[test]
 fn blender_udim_tiles_import_sample_and_round_trip() -> Result<(), Box<dyn Error>> {
     let Some(blender) = blender_executable() else {
@@ -723,6 +809,7 @@ fn blender_udim_tiles_import_sample_and_round_trip() -> Result<(), Box<dyn Error
     check_missing_base(&blender, &fixture)?;
     check_missing_export(&blender, &fixture, "udim_single_tile.blend")?;
     check_missing_export(&blender, &fixture, "udim_base_plane.blend")?;
+    check_base_edit(&blender, &fixture)?;
     // The packed variant must read only its packed tiles, so the remaining tile files are removed first.
     for name in ["udim.u1_v1.png", "udim.u2_v1.png"] {
         fs::remove_file(fixture.join(name))?;
