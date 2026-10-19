@@ -70,9 +70,11 @@ fn patch_mean(data: &ImageData, centre: [f64; 2], half: f64) -> [f64; 3] {
             let offset = |index: usize| 2.0 * half * (index as f64 + 0.5) / GRID as f64 - half;
             let x = centre[0] + offset(column);
             let y = centre[1] + offset(row);
+            // Potter's `sample` takes V down: row 0 is the top, +Y. Measured against the Blender
+            // reference, U runs with +X and V runs against +Y.
             let uv = [
                 (x + FRAME_SIZE / 2.0) / FRAME_SIZE,
-                (y + FRAME_SIZE / 2.0) / FRAME_SIZE,
+                (FRAME_SIZE / 2.0 - y) / FRAME_SIZE,
             ];
             let pixel = sample(data, uv, false);
             for (sum, value) in total.iter_mut().zip(pixel.iter().take(3)) {
