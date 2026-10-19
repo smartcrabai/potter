@@ -130,7 +130,8 @@ pub struct ModifierEvaluation {
 /// Evaluate the enabled modifier stack over a source mesh without node-group context.
 ///
 /// Disabled modifiers are ignored. Enabled modifiers are applied in the order supplied.
-/// `subject_name` is the owning object's Blender name for name-seeded weight falloffs.
+/// `subject_name` is the owning object's Blender name. It seeds the texture noise of standalone evaluation
+/// (`TextureSeed`); weight falloffs are seeded per vertex and do not read it.
 ///
 /// # Errors
 ///
@@ -302,11 +303,6 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
     ) -> Result<Option<usize>>,
 ) -> Result<ModifierEvaluation> {
     let had_origindex = origindex_values(&evaluated).is_some();
-    if subject_name.is_empty() {
-        return Err(PotError::invalid_argument(
-            "modifier evaluation requires a subject name",
-        ));
-    }
     if !frame.is_finite() {
         return Err(PotError::invalid_argument(
             "modifier evaluation frame must be finite",
@@ -6147,14 +6143,6 @@ mod tests {
             evaluate_modifiers(&mesh, &[modifier(true, "unknown")], "TestObject").unwrap_err();
         assert_eq!(error.code, ErrorCode::UnsupportedFeature);
         assert_eq!(error.details["feature_id"], "modifier.unknown");
-    }
-
-    #[test]
-    fn modifier_evaluation_requires_the_subject_name() {
-        let mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
-        let error = evaluate_modifiers(&mesh, &[], "").unwrap_err();
-        assert_eq!(error.code, ErrorCode::InvalidArgument);
-        assert_eq!(error.message, "modifier evaluation requires a subject name");
     }
 
     #[test]

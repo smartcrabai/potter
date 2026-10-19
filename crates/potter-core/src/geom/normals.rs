@@ -74,7 +74,7 @@ pub(crate) fn export_normals(mesh: &Mesh, positions: &[DVec3]) -> Result<ExportN
 /// # Errors
 ///
 /// Returns the errors of [`export_normals`].
-pub fn corner_normals(mesh: &Mesh, positions: &[DVec3]) -> Result<Vec<DVec3>> {
+pub(crate) fn corner_normals(mesh: &Mesh, positions: &[DVec3]) -> Result<Vec<DVec3>> {
     shading_normals(mesh, positions).map(|shading| shading.corners)
 }
 

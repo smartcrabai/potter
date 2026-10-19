@@ -114,7 +114,7 @@ struct Evaluator<'a> {
 ///
 /// Inputs are keyed by interface socket ID or name. Generated instances are realized
 /// into `mesh` for bounds and rendering while `instance_paths` records each instance.
-/// `subject_name` is forwarded to modifier nodes that use name-seeded weight falloffs.
+/// `subject_name` is forwarded to modifier nodes, which use it to seed texture noise.
 ///
 /// # Errors
 ///
@@ -144,11 +144,6 @@ pub fn evaluate_at_frame(
     frame: f64,
     subject_name: &str,
 ) -> Result<GraphEvaluation> {
-    if subject_name.is_empty() {
-        return Err(PotError::invalid_argument(
-            "geometry graph evaluation requires a subject name",
-        ));
-    }
     if !frame.is_finite() {
         return Err(PotError::invalid_argument(
             "graph evaluation frame must be finite",

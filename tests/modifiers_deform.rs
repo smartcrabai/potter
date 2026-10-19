@@ -75,15 +75,6 @@ fn modifier(modifier_type: &str, params: Value) -> Result<Modifier, Box<dyn Erro
     })
 }
 
-#[test]
-fn modifier_evaluation_requires_the_subject_name() -> Result<(), Box<dyn Error>> {
-    let mesh = Mesh::box_mesh(BoxParams::default())?;
-    let error = evaluate_modifiers(&mesh, &[], "").unwrap_err();
-    assert_eq!(error.code, potter_core::error::ErrorCode::InvalidArgument);
-    assert_eq!(error.message, "modifier evaluation requires a subject name");
-    Ok(())
-}
-
 fn remesh_fixture() -> Result<Mesh, Box<dyn Error>> {
     let mut primary = Mesh::uv_sphere(UvSphereParams {
         segments: 16,
