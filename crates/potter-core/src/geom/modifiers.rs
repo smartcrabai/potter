@@ -2834,6 +2834,7 @@ fn adaptive_subdivision(
                     sensor_width_mm: camera.data.sensor_width_mm,
                     sensor_height_mm: camera.data.sensor_height_mm,
                     sensor_fit: camera.data.sensor_fit.clone(),
+                    clip_end: camera.data.clip_end,
                     render_projection: crate::render::raster::projection_for_camera(camera.data)?,
                     clip_start: camera.data.clip_start,
                     ortho_scale: camera.data.ortho_scale,

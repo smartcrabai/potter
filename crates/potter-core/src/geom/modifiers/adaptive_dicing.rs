@@ -39,6 +39,7 @@ pub(super) struct AdaptiveCamera {
     /// The render projection of the stored camera, from `raster::projection_for_camera`.
     pub(super) render_projection: Projection,
     pub(super) clip_start: f64,
+    pub(super) clip_end: f64,
     pub(super) ortho_scale: f64,
     pub(super) shift_x: f64,
     pub(super) shift_y: f64,
@@ -279,14 +280,14 @@ fn panorama_camera_direction(camera: &AdaptiveCamera, x: f64, y: f64) -> Result<
     let [width, height] = camera.resolution;
     let pixel_x = (x.floor().max(0.0) as u32).min(width.saturating_sub(1));
     let pixel_y = (y.floor().max(0.0) as u32).min(height.saturating_sub(1));
-    // The camera sits at the origin looking down -Z, so the ray direction is the camera-local direction. The clip planes do
-    // not affect a ray, so they are the camera's own near plane and an unbounded far plane.
+    // The camera sits at the origin looking down -Z, so the ray direction is the camera-local direction. The renderer checks
+    // the clip planes for a valid frame, so the camera's own planes are passed; they do not change the ray.
     let local = Camera {
         position: DVec3::ZERO,
         target: -DVec3::Z,
         up: DVec3::Y,
         near: camera.clip_start,
-        far: f64::INFINITY,
+        far: camera.clip_end,
         projection: camera.render_projection,
         shift: [camera.shift_x, camera.shift_y],
         depth_of_field: None,
@@ -1688,6 +1689,7 @@ mod tests {
             sensor_fit: "AUTO".to_owned(),
             render_projection,
             clip_start: 0.1,
+            clip_end: 1000.0,
             ortho_scale: 8.0,
             shift_x: 0.0,
             shift_y: 0.0,
