@@ -13,6 +13,7 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::rc::Rc;
 
 use crate::error::{PotError, Result};
 use glam::{DMat4, DVec3, Mat3, Mat4};
@@ -48,18 +49,52 @@ struct Vertex {
 #[derive(Clone)]
 struct Face {
     verts: Vec<usize>,
-    /// Per corner, the origin face's corner whose non-interpolable loop data it carries. Blender's
-    /// `CustomData_bmesh_interp` never writes those layers, so a corner keeps its source's value.
-    /// `None` is the `BMesh` default.
-    loops: Vec<Option<usize>>,
+    /// Per corner, the loop data it carries (see `FaceLoop`).
+    loops: Vec<FaceLoop>,
     side: u8,
-    source: i32,
+    source: usize,
+}
+
+/// Loop data of one face corner, in the two forms Blender's loop passes write.
+#[derive(Clone)]
+struct FaceLoop {
+    /// Non-interpolable layers copy this origin-face corner (`None` is the `BMesh` default).
+    /// Blender's `CustomData_bmesh_interp` never writes those layers, so a corner keeps its
+    /// source's value.
+    copy: Option<usize>,
+    /// Interpolable layers: the value as an expression over input loops, read once layer data is
+    /// known.
+    value: LoopValue,
+}
+
+/// A `CustomData_bmesh_interp` result, kept symbolic until the layer data is known.
+#[derive(Clone)]
+enum LoopValue {
+    /// Loop `corner` of input face `face` (joined face index, as in `Face::source`).
+    Input { face: usize, corner: usize },
+    /// Weighted sum of loop values, in the order Blender's interp reads them. An edge split blends
+    /// its two endpoints; a split-net vertex blends the split-time ring of the face it lies in.
+    Blend(Rc<[(LoopValue, f32)]>),
+}
+
+impl LoopValue {
+    fn blend(parts: impl IntoIterator<Item = (LoopValue, f32)>) -> Self {
+        Self::Blend(parts.into_iter().collect())
+    }
 }
 
 impl Face {
     /// A face of an input mesh: corner `i` carries the mesh's own loop `i`.
-    fn input(verts: Vec<usize>, side: u8, source: i32) -> Self {
-        let loops = (0..verts.len()).map(Some).collect();
+    fn input(verts: Vec<usize>, side: u8, source: usize) -> Self {
+        let loops = (0..verts.len())
+            .map(|corner| FaceLoop {
+                copy: Some(corner),
+                value: LoopValue::Input {
+                    face: source,
+                    corner,
+                },
+            })
+            .collect();
         Self {
             verts,
             loops,
@@ -314,8 +349,8 @@ fn float_pair(
 struct FloatOutput {
     mesh: Mesh,
     polygons: Vec<Poly>,
-    /// Loop-data source of each output corner, parallel to `polygons` (see `Face::loops`).
-    loops: Vec<Vec<Option<usize>>>,
+    /// Loop data of each output corner, parallel to `polygons` (see `FaceLoop`).
+    loops: Vec<Vec<FaceLoop>>,
     state_vertex_ids: Vec<Option<u32>>,
     edge_sources: Vec<Option<usize>>,
 }
@@ -381,7 +416,9 @@ fn build_float_output(subject: &Mesh, operand: &Mesh, state: &State) -> Result<F
                         })
                     })
                     .collect::<Result<Vec<_>>>()?,
-                orig: face.source,
+                orig: i32::try_from(face.source).map_err(|_| {
+                    PotError::invalid_argument("Boolean output face index overflow")
+                })?,
                 edge_orig,
             },
             face.loops.clone(),
@@ -392,7 +429,7 @@ fn build_float_output(subject: &Mesh, operand: &Mesh, state: &State) -> Result<F
     // after a kill (LIFO) is not modelled; this is the observed order for the corpus.
     let subject_face_count = i32::try_from(subject.faces.len()).unwrap_or(i32::MAX);
     polygons.sort_by_key(|(polygon, _)| polygon.orig >= subject_face_count);
-    let (polygons, loops): (Vec<Poly>, Vec<Vec<Option<usize>>>) = polygons.into_iter().unzip();
+    let (polygons, loops): (Vec<Poly>, Vec<Vec<FaceLoop>>) = polygons.into_iter().unzip();
     let mut mesh = Mesh::new();
     let mut state_vertex_ids = vec![None; state.verts.len()];
     for polygon in &polygons {
@@ -1210,6 +1247,8 @@ struct FloatFaceTransfer {
     copied: Vec<Option<usize>>,
     /// Per output corner, the origin face's corner whose non-interpolable loop data it carries.
     loops: Vec<Option<usize>>,
+    /// Per output corner, the interpolable loop value that colour layers resolve.
+    values: Vec<LoopValue>,
     weights: Vec<Vec<f32>>,
 }
 
@@ -1219,7 +1258,7 @@ fn float_face_transfers(
     state: &State,
     state_output_ids: &[Option<u32>],
     polys: &[Poly],
-    loops: &[Vec<Option<usize>>],
+    loops: &[Vec<FaceLoop>],
     output_mesh: &Mesh,
 ) -> Result<Vec<FloatFaceTransfer>> {
     let subject_vertices: HashMap<u32, usize> = subject
@@ -1295,7 +1334,11 @@ fn float_face_transfers(
         transfers.push(FloatFaceTransfer {
             source_face,
             copied,
-            loops: poly_loops.clone(),
+            loops: poly_loops.iter().map(|loop_data| loop_data.copy).collect(),
+            values: poly_loops
+                .iter()
+                .map(|loop_data| loop_data.value.clone())
+                .collect(),
             weights,
         });
     }
@@ -1479,40 +1522,32 @@ fn transfer_float_color_layers(
             .and_then(|types| types.get(&layer.name))
             .and_then(Value::as_str)
             == Some("BYTE_COLOR");
-        let mut values = Vec::new();
-        for transfer in transfers {
-            let (source_slot, local_face, _) =
-                select_source_face(subject, operand, transfer.source_face);
-            let source_layer = stores[source_slot]
+        let source_layers = [0, 1].map(|slot| {
+            stores[slot]
                 .layers
                 .iter()
-                .find(|source| source.name == layer.name);
-            let source_mesh = if source_slot == 0 { subject } else { operand };
-            let face = &source_mesh.faces[local_face];
-            let corner_start = corner_starts[source_slot][local_face];
-            for (output_corner, weights) in transfer.weights.iter().enumerate() {
-                let source_color = |corner: usize| {
-                    let vertex_id = face.vertices[corner];
-                    source_layer.map_or([1.0, 1.0, 1.0, 1.0], |source| match source.domain {
-                        ColorDomain::Corner => source
-                            .values
-                            .get(corner_start + corner)
-                            .copied()
-                            .unwrap_or([1.0, 1.0, 1.0, 1.0]),
-                        ColorDomain::Point => vertex_indices[source_slot]
-                            .get(&vertex_id)
-                            .and_then(|&index| source.values.get(index).copied())
-                            .unwrap_or([1.0, 1.0, 1.0, 1.0]),
-                    })
-                };
-                if let Some(corner) = transfer.copied[output_corner] {
-                    values.push(source_color(corner));
-                } else {
-                    let colors = (0..face.vertices.len()).map(source_color);
-                    values.push(mix_color(colors, weights, byte_color));
-                }
-            }
-        }
+                .find(|source| source.name == layer.name)
+        });
+        let source_color = |face: usize, corner: usize| -> [f64; 4] {
+            let (slot, local_face, source_mesh) = select_source_face(subject, operand, face);
+            let vertex_id = source_mesh.faces[local_face].vertices[corner];
+            source_layers[slot].map_or([1.0, 1.0, 1.0, 1.0], |source| match source.domain {
+                ColorDomain::Corner => source
+                    .values
+                    .get(corner_starts[slot][local_face] + corner)
+                    .copied()
+                    .unwrap_or([1.0, 1.0, 1.0, 1.0]),
+                ColorDomain::Point => vertex_indices[slot]
+                    .get(&vertex_id)
+                    .and_then(|&index| source.values.get(index).copied())
+                    .unwrap_or([1.0, 1.0, 1.0, 1.0]),
+            })
+        };
+        let values: Vec<[f64; 4]> = transfers
+            .iter()
+            .flat_map(|transfer| &transfer.values)
+            .map(|value| resolve_loop_color(value, &source_color, byte_color))
+            .collect();
         layer.values = values;
     }
     color_layers::write(output_mesh, &output);
@@ -1857,13 +1892,27 @@ fn corner_offsets(mesh: &Mesh) -> Vec<usize> {
         .collect()
 }
 
-fn mix_color(
-    colors: impl IntoIterator<Item = [f64; 4]>,
-    weights: &[f32],
+/// Blender `CustomData_bmesh_interp` on a colour layer: an input loop reads its colour, and a blend
+/// mixes its parts' colours (`mix_color`), so every interpolated loop stores a whole colour.
+fn resolve_loop_color(
+    value: &LoopValue,
+    source: &impl Fn(usize, usize) -> [f64; 4],
     byte_color: bool,
 ) -> [f64; 4] {
+    match value {
+        LoopValue::Input { face, corner } => source(*face, *corner),
+        LoopValue::Blend(parts) => mix_color(
+            parts
+                .iter()
+                .map(|(part, weight)| (resolve_loop_color(part, source, byte_color), *weight)),
+            byte_color,
+        ),
+    }
+}
+
+fn mix_color(parts: impl IntoIterator<Item = ([f64; 4], f32)>, byte_color: bool) -> [f64; 4] {
     let mut accum = [0.0_f32; 4];
-    for (color, &weight) in colors.into_iter().zip(weights) {
+    for (color, weight) in parts {
         if byte_color {
             let encoded = color_layers::byte_color_encoded_components(color);
             for component in 0..4 {
@@ -2284,8 +2333,7 @@ fn build_state(
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let source_face = i32::try_from(subject.faces.len() + fi)
-            .map_err(|_| PotError::invalid_argument("Boolean input exceeds index range"))?;
+        let source_face = subject.faces.len() + fi;
         face_vertex_rings.push(verts.clone());
         state.faces.push(Face::input(verts, 1, source_face));
     }
@@ -2302,8 +2350,7 @@ fn build_state(
                     })
             })
             .collect::<Result<Vec<_>>>()?;
-        let source_face = i32::try_from(fi)
-            .map_err(|_| PotError::invalid_argument("Boolean input exceeds index range"))?;
+        let source_face = fi;
         face_vertex_rings.push(verts.clone());
         state.faces.push(Face::input(verts, 0, source_face));
     }
@@ -3165,14 +3212,29 @@ fn splice_double_face(state: &State, a: usize, b: usize) -> bool {
 /// the segment, and a wire segment is replaced by its two halves.
 fn insert_split_vertex(state: &mut State, tail: usize, end: usize, split: usize, wire: bool) {
     let segment = edge_key_usize(tail, end);
+    // The split's factor from `tail`: `BM_edge_split` interpolates from the vertex it splits at.
+    let fac = line_point_factor(
+        state.verts[split].co,
+        state.verts[tail].co,
+        state.verts[end].co,
+    );
     for face in &mut state.faces {
         let len = face.verts.len();
         if let Some(i) =
             (0..len).find(|&i| edge_key_usize(face.verts[i], face.verts[(i + 1) % len]) == segment)
         {
+            let next = (i + 1) % len;
+            // `BM_data_interp_face_vert_edge`: the split loop blends the face's loops at the ends.
+            let (tail_loop, end_loop) = if face.verts[i] == tail {
+                (face.loops[i].value.clone(), face.loops[next].value.clone())
+            } else {
+                (face.loops[next].value.clone(), face.loops[i].value.clone())
+            };
+            let value = LoopValue::blend([(tail_loop, 1.0 - fac), (end_loop, fac)]);
             face.verts.insert(i + 1, split);
             // Blender `BM_edge_split` copies the loop that starts the segment in this face: corner `i`.
-            face.loops.insert(i + 1, face.loops[i]);
+            let copy = face.loops[i].copy;
+            face.loops.insert(i + 1, FaceLoop { copy, value });
         }
     }
     // Blender `BM_edge_split`: the new edge `tail..split` is created first, then `segment` is re-pointed
@@ -3341,14 +3403,27 @@ fn split_faces(state: &mut State) {
             new_faces.push(face.clone());
         } else {
             dangling.extend(split.dangling.iter().map(|&(a, b)| edge_key_usize(a, b)));
+            // A net vertex interpolates over the split-time ring of `face` (`BM_face_split_edgenet`
+            // step 2 weights it over `f`'s loops), so the ring's interpolable values blend there.
+            let ring_interp = FloatPolyInterpolator::new(&points);
             for (ring, sources) in split.faces.into_iter().zip(split.corner_sources) {
-                // Blender's loop pass: a corner at a ring vertex copies the face's loop there, and a net
-                // vertex interpolates, which leaves the non-interpolable loop data at its default.
-                let loops = sources
-                    .into_iter()
-                    .map(|source| match source {
-                        CornerSource::Original(corner) => face.loops[corner],
-                        CornerSource::Interpolated => None,
+                // Blender's loop pass: a ring-vertex corner copies the face's loop. A net vertex
+                // interpolates interpolable layers over the ring. Copy-only layers keep the default
+                // there.
+                let loops = ring
+                    .iter()
+                    .zip(sources)
+                    .map(|(&vertex, source)| match source {
+                        CornerSource::Original(corner) => face.loops[corner].clone(),
+                        CornerSource::Interpolated => FaceLoop {
+                            copy: None,
+                            value: LoopValue::blend(
+                                face.loops
+                                    .iter()
+                                    .map(|ring_loop| ring_loop.value.clone())
+                                    .zip(ring_interp.weights(state.verts[vertex].co)),
+                            ),
+                        },
                     })
                     .collect();
                 new_faces.push(Face {
@@ -3664,14 +3739,15 @@ fn disk_matches_edges(state: &State) -> bool {
 }
 
 /// Blender `BM_vert_collapse_faces` on one ring: `vertex` leaves the ring. Where the ring runs
-/// `tv -> vertex`, the kill-side loop survives and takes the `tv` place, so the `tv` corner takes the
-/// `vertex` corner's loop data. Every other corner keeps its own.
+/// `tv -> vertex`, the `tv` corner takes the copy-only loop data of the kill-side `vertex` corner.
+/// Interpolable data stays with `tv`: `BM_vert_collapse_edge` interpolates the kill loop at
+/// weight 1 on `tv`, so the `tv` corner keeps its own value. Every other corner keeps its own loop.
 fn collapse_ring_corners(
     verts: &[usize],
-    loops: &[Option<usize>],
+    loops: &[FaceLoop],
     vertex: usize,
     tv: usize,
-) -> (Vec<usize>, Vec<Option<usize>>) {
+) -> (Vec<usize>, Vec<FaceLoop>) {
     let len = verts.len();
     let mut ring = Vec::with_capacity(len);
     let mut ring_loops = Vec::with_capacity(len);
@@ -3682,9 +3758,12 @@ fn collapse_ring_corners(
         let next = (i + 1) % len;
         ring.push(verts[i]);
         ring_loops.push(if verts[i] == tv && verts[next] == vertex {
-            loops[next]
+            FaceLoop {
+                copy: loops[next].copy,
+                value: loops[i].value.clone(),
+            }
         } else {
-            loops[i]
+            loops[i].clone()
         });
     }
     (ring, ring_loops)
