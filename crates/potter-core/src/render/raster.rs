@@ -838,9 +838,9 @@ fn equirectangular_range(longitude: [f64; 2], latitude: [f64; 2]) -> [f64; 4] {
     ]
 }
 
-/// The camera-space direction of the equirectangular pixel at (u, v), where u and v are in [0, 1] and v runs bottom-up,
-/// as Cycles' `equirectangular_range_to_direction` gives it (`intern/cycles/kernel/camera/projection.h`): phi = range.x·u
-/// + range.y and theta = range.z·v + range.w, and `spherical_to_direction` (`intern/cycles/util/projection.h`) gives
+/// The camera-space direction of the equirectangular pixel at (u, v), where u and v are in [0, 1] and v runs bottom-up.
+/// Cycles' `equirectangular_range_to_direction` (`intern/cycles/kernel/camera/projection.h`) gives phi = range.x·u + range.y
+/// and theta = range.z·v + range.w, and `spherical_to_direction` (`intern/cycles/util/projection.h`) gives
 /// C = (sin θ cos φ, sin θ sin φ, cos θ). Blender's panorama camera matrix (`intern/cycles/blender/camera.cpp`,
 /// `blender_camera_matrix`) right-multiplies by M = [[0, −1, 0], [0, 0, 1], [−1, 0, 0]], so the direction in the camera's
 /// basis (X right, Y up, −Z forward) is B = M·C = (−sin θ sin φ, cos θ, −sin θ cos φ), with Y as the pole. Blender's
@@ -1093,8 +1093,8 @@ fn ray_for_subpixel_in_frame(
         }
         ProjectionFrame::Panorama { fisheye: false } => {
             let camera = equirectangular_range_direction(
-                (ndc_x + 1.0) * 0.5,
-                (ndc_y + 1.0) * 0.5,
+                f64::midpoint(ndc_x, 1.0),
+                f64::midpoint(ndc_y, 1.0),
                 equirectangular_range(
                     [-std::f64::consts::PI, std::f64::consts::PI],
                     [-std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2],
