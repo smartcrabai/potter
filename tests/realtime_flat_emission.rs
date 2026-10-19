@@ -77,12 +77,10 @@ fn realtime_flat_and_smooth_emission_match_eevee() -> TestResult {
             "EEVEE {plane} interior deviates {deviation} from colour times strength"
         );
         let rgba = vec4(&oracle[plane]["rgba"])?;
-        for channel in 0..3 {
+        for (channel, (actual, wanted)) in rgba.into_iter().zip(&expected).take(3).enumerate() {
             assert!(
-                (rgba[channel] - expected[channel]).abs() <= TOLERANCE,
-                "EEVEE {plane} channel {channel} is {}, expected {}",
-                rgba[channel],
-                expected[channel]
+                (actual - wanted).abs() <= TOLERANCE,
+                "EEVEE {plane} channel {channel} is {actual}, expected {wanted}"
             );
         }
     }
@@ -129,12 +127,10 @@ fn realtime_flat_and_smooth_emission_match_eevee() -> TestResult {
         let uv = floats(&oracle[plane]["uv"])?;
         let actual = pixel_at(&project, "render", [uv[0], uv[1]])?;
         let wanted = vec4(&oracle[plane]["rgba"])?;
-        for channel in 0..3 {
+        for (channel, (actual, wanted)) in actual.into_iter().zip(wanted).take(3).enumerate() {
             assert!(
-                (actual[channel] - wanted[channel]).abs() <= TOLERANCE,
-                "{plane} plane channel {channel}: Potter realtime {} differs from EEVEE {}",
-                actual[channel],
-                wanted[channel]
+                (actual - wanted).abs() <= TOLERANCE,
+                "{plane} plane channel {channel}: Potter realtime {actual} differs from EEVEE {wanted}"
             );
         }
     }
