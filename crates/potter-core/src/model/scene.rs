@@ -1233,6 +1233,12 @@ fn blender_pi() -> f64 {
 /// Potter refuses one rather than store a field of view that its Blender camera would not keep.
 pub const FISHEYE_FOV_MIN: f64 = 0.1745;
 
+/// A full turn and a right angle, as Blender's float32 limits (`rna_camera.cc`, `M_PI_F`). Blender's full-sphere panorama
+/// defaults are ±π in float32, so their span is this turn, a hair beyond the f64 `TAU`; the bounds Potter checks use these
+/// so the defaults validate.
+pub const BLENDER_TURN: f64 = 6.283_185_482_025_146_5;
+pub const BLENDER_RIGHT_ANGLE: f64 = 1.570_796_370_506_286_6;
+
 #[expect(
     clippy::trivially_copy_pass_by_ref,
     reason = "serde skip_serializing_if passes a reference"

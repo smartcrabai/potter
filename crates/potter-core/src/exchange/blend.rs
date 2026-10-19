@@ -6978,10 +6978,10 @@ fn imported_panorama_range(item: &Value) -> Option<[f64; 4]> {
     ];
     let [longitude_min, longitude_max, latitude_min, latitude_max] = range;
     (longitude_max > longitude_min
-        && longitude_max - longitude_min <= std::f64::consts::TAU
+        && longitude_max - longitude_min <= crate::model::BLENDER_TURN
         && latitude_max > latitude_min
-        && latitude_min >= -std::f64::consts::FRAC_PI_2
-        && latitude_max <= std::f64::consts::FRAC_PI_2)
+        && latitude_min >= -crate::model::BLENDER_RIGHT_ANGLE
+        && latitude_max <= crate::model::BLENDER_RIGHT_ANGLE)
         .then_some(range)
 }
 
@@ -6989,7 +6989,7 @@ fn imported_panorama_range(item: &Value) -> Option<[f64; 4]> {
 fn imported_fisheye_fov(item: &Value) -> Option<f64> {
     item.get("fisheye_fov")
         .and_then(Value::as_f64)
-        .filter(|fov| *fov >= crate::model::FISHEYE_FOV_MIN && *fov <= std::f64::consts::TAU)
+        .filter(|fov| *fov >= crate::model::FISHEYE_FOV_MIN && *fov <= crate::model::BLENDER_TURN)
 }
 
 fn import_losses(raw: &Value) -> Vec<Loss> {

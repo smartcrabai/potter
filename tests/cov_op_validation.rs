@@ -350,6 +350,33 @@ fn camera_value_rejections_report_codes_and_pointers() {
     run_invalid_cases(&cases);
 }
 
+/// Blender's default full-sphere and fisheye limits are float32 values, and a camera set to them must be committed, since
+/// its default values are then stored as omitted. `setup_scene` asserts that the operation applied.
+#[test]
+fn camera_blender_default_panorama_limits_are_committed() {
+    let full = f64::from(std::f32::consts::PI);
+    let (_directory, scene) = setup_scene(&json!([
+        {"op":"camera.create","id":"camera_sphere","projection":"panorama","panorama_type":"equirectangular",
+         "longitude_min":-full,"longitude_max":full,"latitude_min":-0.5*full,"latitude_max":0.5*full},
+        {"op":"camera.create","id":"camera_fisheye","projection":"panorama","panorama_type":"fisheye_equidistant","fisheye_fov":full}
+    ]));
+    let document: Value =
+        serde_json::from_slice(&fs::read(scene.join("scene.json")).unwrap()).unwrap();
+    let cameras: Vec<&Value> = document["data_blocks"]
+        .as_object()
+        .unwrap()
+        .values()
+        .filter(|block| block["type"] == "camera")
+        .map(|block| &block["camera"])
+        .collect();
+    assert_eq!(cameras.len(), 2, "{document}");
+    assert!(
+        cameras
+            .iter()
+            .all(|camera| camera["projection"] == "panorama")
+    );
+}
+
 #[test]
 fn constraint_valid_boundaries_are_committed() {
     let (_directory, scene) = setup_scene(&json!([

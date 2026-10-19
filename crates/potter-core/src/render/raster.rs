@@ -1,4 +1,4 @@
-use std::f64::consts::{FRAC_PI_2, TAU};
+use std::f64::consts::TAU;
 
 use glam::DVec3;
 use serde::{Deserialize, Serialize};
@@ -1093,10 +1093,10 @@ fn camera_frame(camera: &Camera, width: u32, height: u32) -> Result<CameraFrame>
             .chain(&latitude)
             .all(|value| value.is_finite())
             && longitude[1] > longitude[0]
-            && longitude[1] - longitude[0] <= TAU
+            && longitude[1] - longitude[0] <= crate::model::BLENDER_TURN
             && latitude[1] > latitude[0]
-            && latitude[0] >= -FRAC_PI_2
-            && latitude[1] <= FRAC_PI_2 =>
+            && latitude[0] >= -crate::model::BLENDER_RIGHT_ANGLE
+            && latitude[1] <= crate::model::BLENDER_RIGHT_ANGLE =>
         {
             ProjectionFrame::Equirectangular {
                 longitude,
@@ -1156,7 +1156,7 @@ fn camera_frame(camera: &Camera, width: u32, height: u32) -> Result<CameraFrame>
 }
 
 fn is_valid_fov(fov: f64) -> bool {
-    fov.is_finite() && fov > 0.0 && fov <= TAU
+    fov.is_finite() && fov > 0.0 && fov <= crate::model::BLENDER_TURN
 }
 
 pub(crate) fn ambient_visibility(
@@ -2179,6 +2179,47 @@ mod tests {
                     if let Some((_, direction)) = ray {
                         assert!((direction.length() - 1.0).abs() < 1.0e-9);
                     }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Blender's default full-sphere panorama and fisheye limits are float32 values (`rna_camera.cc`), so their spans sit a
+    /// hair beyond the f64 turn. Each default must be accepted and give a ray for every pixel, or a default camera fails.
+    #[test]
+    fn blender_default_panorama_limits_are_accepted_and_ray_every_pixel()
+    -> Result<(), Box<dyn Error>> {
+        assert!(crate::float::equal_f64(
+            crate::model::BLENDER_TURN,
+            f64::from(std::f32::consts::TAU)
+        ));
+        assert!(crate::float::equal_f64(
+            crate::model::BLENDER_RIGHT_ANGLE,
+            f64::from(std::f32::consts::FRAC_PI_2)
+        ));
+        let full = f64::from(std::f32::consts::PI);
+        let defaults = [
+            Projection::Equirectangular {
+                longitude: [-full, full],
+                latitude: [-0.5 * full, 0.5 * full],
+            },
+            Projection::FisheyeEquidistant { fov: full },
+        ];
+        for projection in defaults {
+            let camera = camera(projection);
+            for y in 0..5 {
+                for x in 0..7 {
+                    let ray = ray_for_pixel(&camera, 7, 5, x, y)?;
+                    let Some((_, direction)) = ray else {
+                        // Only a fisheye's corners lie outside its circle; the full sphere covers every pixel.
+                        assert!(
+                            matches!(projection, Projection::FisheyeEquidistant { .. }),
+                            "{projection:?} pixel {x},{y} has no ray"
+                        );
+                        continue;
+                    };
+                    assert!((direction.length() - 1.0).abs() < 1.0e-9);
                 }
             }
         }

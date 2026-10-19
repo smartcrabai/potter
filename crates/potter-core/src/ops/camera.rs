@@ -280,7 +280,7 @@ fn apply_camera_values(
         ));
     }
     if !(camera.fisheye_fov >= crate::model::FISHEYE_FOV_MIN
-        && camera.fisheye_fov <= std::f64::consts::TAU)
+        && camera.fisheye_fov <= crate::model::BLENDER_TURN)
     {
         return Err(engine.error(
             ErrorCode::InvalidArgument,
@@ -330,7 +330,7 @@ fn apply_camera_values(
     }
     if equirectangular {
         if !(camera.longitude_max > camera.longitude_min
-            && camera.longitude_max - camera.longitude_min <= std::f64::consts::TAU)
+            && camera.longitude_max - camera.longitude_min <= crate::model::BLENDER_TURN)
         {
             return Err(engine.error(
                 ErrorCode::InvalidOperation,
@@ -339,8 +339,8 @@ fn apply_camera_values(
             ));
         }
         if !(camera.latitude_max > camera.latitude_min
-            && camera.latitude_min >= -std::f64::consts::FRAC_PI_2
-            && camera.latitude_max <= std::f64::consts::FRAC_PI_2)
+            && camera.latitude_min >= -crate::model::BLENDER_RIGHT_ANGLE
+            && camera.latitude_max <= crate::model::BLENDER_RIGHT_ANGLE)
         {
             return Err(engine.error(
                 ErrorCode::InvalidOperation,

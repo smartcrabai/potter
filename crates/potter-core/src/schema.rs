@@ -2010,10 +2010,10 @@ fn field_schema(operation: &str, field: &str) -> Value {
             }
             "longitude_min" | "longitude_max" => json!({"type":"number"}),
             "latitude_min" | "latitude_max" => {
-                json!({"type":"number","minimum":-std::f64::consts::FRAC_PI_2,"maximum":std::f64::consts::FRAC_PI_2})
+                json!({"type":"number","minimum":-crate::model::BLENDER_RIGHT_ANGLE,"maximum":crate::model::BLENDER_RIGHT_ANGLE})
             }
             "fisheye_fov" => {
-                json!({"type":"number","minimum":crate::model::FISHEYE_FOV_MIN,"maximum":std::f64::consts::TAU})
+                json!({"type":"number","minimum":crate::model::FISHEYE_FOV_MIN,"maximum":crate::model::BLENDER_TURN})
             }
             "stereo_mode" => json!({"enum":["none","side_by_side","anaglyph"]}),
             "dof_enabled" => json!({"type":"boolean"}),
@@ -2511,9 +2511,9 @@ fn camera_set_properties() -> Value {
         "panorama_type":{"enum":["equirectangular","fisheye_equidistant","fisheye_equisolid"]},
         "longitude_min":{"type":"number"},
         "longitude_max":{"type":"number"},
-        "latitude_min":{"type":"number","minimum":-std::f64::consts::FRAC_PI_2,"maximum":std::f64::consts::FRAC_PI_2},
-        "latitude_max":{"type":"number","minimum":-std::f64::consts::FRAC_PI_2,"maximum":std::f64::consts::FRAC_PI_2},
-        "fisheye_fov":{"type":"number","minimum":crate::model::FISHEYE_FOV_MIN,"maximum":std::f64::consts::TAU},
+        "latitude_min":{"type":"number","minimum":-crate::model::BLENDER_RIGHT_ANGLE,"maximum":crate::model::BLENDER_RIGHT_ANGLE},
+        "latitude_max":{"type":"number","minimum":-crate::model::BLENDER_RIGHT_ANGLE,"maximum":crate::model::BLENDER_RIGHT_ANGLE},
+        "fisheye_fov":{"type":"number","minimum":crate::model::FISHEYE_FOV_MIN,"maximum":crate::model::BLENDER_TURN},
         "dof_enabled":{"type":"boolean"},
         "focus_distance":{"type":"number","exclusiveMinimum":0},
         "f_stop":{"type":"number","exclusiveMinimum":0},
