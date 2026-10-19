@@ -1006,7 +1006,7 @@ fn operation_contract(name: &str) -> OperationContract {
             vec!["op", "target", "brush", "samples"],
             "mesh object and stroke samples",
             "shared|single_user for shared data",
-            json!({"falloff":"smooth","symmetry":[]}),
+            json!({"symmetry":[]}),
         ),
         "sculpt.dyntopo" => (
             vec![
@@ -1979,7 +1979,7 @@ fn field_schema(operation: &str, field: &str) -> Value {
                 json!({"enum":["draw","clay_strips","inflate","grab","smooth","flatten","pinch","crease","layer","snake_hook","thumb","rotate","nudge","blob","scrape","fill","draw_sharp","elastic_deform","pose_lite","boundary_lite"]})
             }
             "falloff" => {
-                json!({"enum":["smooth","sphere","root","sharp","linear","constant"],"default":"smooth"})
+                json!({"enum":["smooth","smoother","sphere","root","sharp","linear","constant"],"description":"Falloff curve. Defaults to smoother for clay_strips and smooth for other brushes."})
             }
             "samples" => {
                 json!({"type":"array","minItems":1,"items":{"type":"object","required":["position","pressure","radius","strength","time"],"properties":{"position":vec_schema(3),"pressure":{"type":"number","minimum":0,"maximum":1},"radius":{"type":"number","minimum":0},"strength":{"type":"number"},"time":{"type":"number"}},"additionalProperties":false}})

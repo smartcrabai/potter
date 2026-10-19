@@ -902,7 +902,7 @@ fn trace_path(
         alpha = 1.0;
         radiance += throughput
             * DVec3::from_array(surface.params.emission_color)
-            * surface.params.emission_strength.max(0.0);
+            * surface.params.emission_strength;
         radiance += throughput
             * direct_lighting(
                 doc,

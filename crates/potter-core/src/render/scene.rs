@@ -1546,7 +1546,7 @@ impl SurfaceShader for SceneShader<'_> {
                 &shadows.point_maps,
             )
         });
-        let mut color = shade(
+        let color = shade(
             self.doc,
             self.snapshot,
             hit.point,
@@ -1558,13 +1558,6 @@ impl SurfaceShader for SceneShader<'_> {
             shadow,
             self.images,
         )?;
-        if matches!(self.mode, Mode::Beauty)
-            && let Some(params) = graph_params
-        {
-            color[0] += params.emission_color[0] * params.emission_strength;
-            color[1] += params.emission_color[1] * params.emission_strength;
-            color[2] += params.emission_color[2] * params.emission_strength;
-        }
         Ok(color)
     }
 }
@@ -2002,8 +1995,7 @@ fn shade(
     }
     // Beauty only: Solid/preview keeps Blender Solid's viewport-colour rule and ignores the closure
     // weight. In Beauty, reflectance weights every reflective closure (ambient, direct,
-    // environment); emission is added unscaled by the caller, as Cycles' `EmissionNode::compile`
-    // (intern/cycles/scene/shader_nodes.cpp:3071-3098) emits only NODE_CLOSURE_EMISSION.
+    // environment).
     let reflectance = if matches!(mode, Mode::Beauty) {
         params.reflectance.clamp(0.0, 1.0)
     } else {
@@ -2011,6 +2003,16 @@ fn shade(
     };
     let result = result * reflectance;
     let result = result.max(DVec3::ZERO).min(DVec3::splat(1.0));
+    // Emission sits outside the reflectance weight and the clamp: Cycles' `EmissionNode` emits
+    // NODE_CLOSURE_EMISSION unscaled (intern/cycles/scene/shader_nodes.cpp:3071-3098), and neither
+    // EEVEE nor Cycles clamps the strength (gpu_shader_material_principled.glsl:179,
+    // intern/cycles/kernel/svm/closure.h:206-207).
+    let emission = if matches!(mode, Mode::Beauty) {
+        DVec3::from_array(params.emission_color) * params.emission_strength
+    } else {
+        DVec3::ZERO
+    };
+    let result = result + emission;
     Ok([result.x, result.y, result.z, alpha])
 }
 

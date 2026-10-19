@@ -24,7 +24,7 @@ use super::color_layers::{self, ColorDomain};
 use super::triangulate::{NgonMethod, QuadMethod, triangulate_mesh};
 use super::{
     Edge, Face, Mesh, MeshError, Vertex, edge_key,
-    normals::{corner_normals, face_normal, safe_acos_approx, sharp_edge_flags},
+    normals::{corner_normals, sharp_edge_flags},
     provenance::{
         Origin, edge_flags, mean_value_corners, remap_attributes_staged,
         remap_attributes_with_basis, remap_attributes_with_edges,
@@ -5081,29 +5081,11 @@ fn triangulate(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     Ok(result)
 }
 
-/// Blender's `vert_normals_true`: face normals weighted by the corner angle.
+/// Blender's `vert_normals_true` over a modifier's polygons, computed by the shared
+/// `normals::vertex_normals`.
 fn vertex_normals(points: &[DVec3], polygons: &[Polygon]) -> Vec<DVec3> {
-    let face_normals: Vec<DVec3> = polygons
-        .iter()
-        .map(|(face, _)| {
-            let corners: Vec<DVec3> = face.iter().map(|&vertex| points[vertex]).collect();
-            face_normal(&corners)
-        })
-        .collect();
-    let mut angle_normals = vec![DVec3::ZERO; points.len()];
-    for ((face, _), normal) in polygons.iter().zip(&face_normals) {
-        let count = face.len();
-        for (corner, &vertex) in face.iter().enumerate() {
-            let previous =
-                (points[face[(corner + count - 1) % count]] - points[vertex]).normalize_or_zero();
-            let next = (points[face[(corner + 1) % count]] - points[vertex]).normalize_or_zero();
-            angle_normals[vertex] += *normal * safe_acos_approx(previous.dot(next));
-        }
-    }
-    angle_normals
-        .into_iter()
-        .map(DVec3::normalize_or_zero)
-        .collect()
+    let faces: Vec<&[usize]> = polygons.iter().map(|(face, _)| face.as_slice()).collect();
+    super::normals::vertex_normals(points, &faces)
 }
 
 /// The values of the element attribute `name` in storage order. A native point or edge attribute is read
