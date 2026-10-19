@@ -3514,9 +3514,33 @@ fn split_faces(state: &mut State) {
 /// Iteration walks buckets ascending, each chain from its head (`BLI_ghashIterator_init` and `_step`).
 fn blender_hash_order(keys: &[usize]) -> Vec<usize> {
     const HASHSIZES: [u32; 27] = [
-        5, 11, 17, 37, 67, 131, 257, 521, 1031, 2053, 4099, 8209, 16411, 32771, 65537, 131101,
-        262147, 524309, 1048583, 2097169, 4194319, 8388617, 16777259, 33554467, 67108879,
-        134217757, 268435459,
+        5,
+        11,
+        17,
+        37,
+        67,
+        131,
+        257,
+        521,
+        1_031,
+        2_053,
+        4_099,
+        8_209,
+        16_411,
+        32_771,
+        65_537,
+        131_101,
+        262_147,
+        524_309,
+        1_048_583,
+        2_097_169,
+        4_194_319,
+        8_388_617,
+        16_777_259,
+        33_554_467,
+        67_108_879,
+        134_217_757,
+        268_435_459,
     ];
     // `BLI_ghashutil_inthash_p` (`BLI_ghash_utils.cc`).
     fn int_hash(key: usize) -> u32 {
@@ -4528,6 +4552,7 @@ mod dangling_edge_tests {
     fn spur_ending_inside_a_face_stays_loose() {
         // The square keeps its ring; the spur to the centre closes no loop, so Blender keeps it as wire.
         let mut state = unit_square_with_centre();
+        state.note_face_cut(0);
         state.face_cuts.insert(0, vec![edge_key_usize(0, 4)]);
         split_faces(&mut state);
         assert_eq!(state.faces.len(), 1);
@@ -4538,6 +4563,7 @@ mod dangling_edge_tests {
     fn chord_that_closes_two_rings_is_not_dangling() {
         // A diagonal splits the square into two loops, so no split-net edge is dangling.
         let mut state = unit_square_with_centre();
+        state.note_face_cut(0);
         state.face_cuts.insert(0, vec![edge_key_usize(0, 2)]);
         split_faces(&mut state);
         assert_eq!(state.faces.len(), 2);
