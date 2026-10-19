@@ -29,6 +29,7 @@ use crate::geom::{
 };
 
 use super::dissolve::Poly;
+use super::float_split_net::CornerSource;
 use super::imesh::NO_INDEX;
 use super::{BooleanOperand, Operation};
 
@@ -47,8 +48,25 @@ struct Vertex {
 #[derive(Clone)]
 struct Face {
     verts: Vec<usize>,
+    /// Per corner, the origin face's corner whose non-interpolable loop data it carries. Blender's
+    /// `CustomData_bmesh_interp` never writes those layers, so a corner keeps its source's value.
+    /// `None` is the `BMesh` default.
+    loops: Vec<Option<usize>>,
     side: u8,
     source: i32,
+}
+
+impl Face {
+    /// A face of an input mesh: corner `i` carries the mesh's own loop `i`.
+    fn input(verts: Vec<usize>, side: u8, source: i32) -> Self {
+        let loops = (0..verts.len()).map(Some).collect();
+        Self {
+            verts,
+            loops,
+            side,
+            source,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -74,6 +92,9 @@ struct State {
     dangling_edges: HashSet<EdgeKey>,
     dissolve_verts: Vec<usize>,
     edge_tri_cache: HashMap<[i32; 4], usize>,
+    /// Blender's per-vertex disk cycles: `disk[v]` lists the `BMesh` edges at `v`, oldest first. `BMesh`
+    /// inserts each new edge before the disk head, so the head `v->e` is the first entry.
+    disk: Vec<Vec<EdgeKey>>,
 }
 
 impl State {
@@ -92,13 +113,52 @@ impl State {
             dissolve_verts: Vec::new(),
             edge_tri_cache: HashMap::new(),
             dangling_edges: HashSet::new(),
+            disk: Vec::new(),
         }
     }
 
     fn add_vertex(&mut self, co: P3, source: i32) -> usize {
         let id = self.verts.len();
         self.verts.push(Vertex { co, source });
+        self.disk.push(Vec::new());
         id
+    }
+
+    /// Blender `bmesh_disk_edge_append` at `at`: `key` joins the disk unless it is already listed.
+    fn disk_link(&mut self, at: usize, key: EdgeKey) {
+        if !self.disk[at].contains(&key) {
+            self.disk[at].push(key);
+        }
+    }
+
+    /// `disk_link` at both ends of `key`, as `BMesh` creates an edge.
+    fn disk_attach(&mut self, key: EdgeKey) {
+        self.disk_link(key.0, key);
+        self.disk_link(key.1, key);
+    }
+
+    /// Blender `bmesh_disk_edge_remove` at `at`.
+    fn disk_unlink(&mut self, at: usize, key: EdgeKey) {
+        self.disk[at].retain(|&edge| edge != key);
+    }
+
+    /// `disk_unlink` at both ends of `key`, as `BMesh` kills an edge.
+    fn disk_detach(&mut self, key: EdgeKey) {
+        self.disk_unlink(key.0, key);
+        self.disk_unlink(key.1, key);
+    }
+
+    /// Replaces `old` with `new` in place at `at`: the edge object is kept, so its other end is unchanged.
+    fn disk_relink(&mut self, at: usize, old: EdgeKey, new: EdgeKey) {
+        if let Some(slot) = self.disk[at].iter_mut().find(|edge| **edge == old) {
+            *slot = new;
+        }
+    }
+
+    /// Drops the last vertex, which must have no edges left.
+    fn pop_vertex(&mut self) {
+        self.verts.pop();
+        self.disk.pop();
     }
 }
 
@@ -224,6 +284,7 @@ fn float_pair(
     let FloatOutput {
         mut mesh,
         polygons,
+        loops,
         state_vertex_ids,
         edge_sources,
     } = build_float_output(&subject_frame, &operand_frame, &state)?;
@@ -233,6 +294,7 @@ fn float_pair(
         &state,
         &state_vertex_ids,
         &polygons,
+        &loops,
         &mesh,
     )?;
     let origin = float_output_origin(&source, &state, &state_vertex_ids, &polygons, &transfers)?;
@@ -252,6 +314,8 @@ fn float_pair(
 struct FloatOutput {
     mesh: Mesh,
     polygons: Vec<Poly>,
+    /// Loop-data source of each output corner, parallel to `polygons` (see `Face::loops`).
+    loops: Vec<Vec<Option<usize>>>,
     state_vertex_ids: Vec<Option<u32>>,
     edge_sources: Vec<Option<usize>>,
 }
@@ -306,25 +370,29 @@ fn build_float_output(subject: &Mesh, operand: &Mesh, state: &State) -> Result<F
                     .unwrap_or(NO_INDEX)
             })
             .collect();
-        polygons.push(Poly {
-            verts: face
-                .verts
-                .iter()
-                .map(|&vertex| {
-                    u32::try_from(vertex).map_err(|_| {
-                        PotError::invalid_argument("Boolean output vertex index overflow")
+        polygons.push((
+            Poly {
+                verts: face
+                    .verts
+                    .iter()
+                    .map(|&vertex| {
+                        u32::try_from(vertex).map_err(|_| {
+                            PotError::invalid_argument("Boolean output vertex index overflow")
+                        })
                     })
-                })
-                .collect::<Result<Vec<_>>>()?,
-            orig: face.source,
-            edge_orig,
-        });
+                    .collect::<Result<Vec<_>>>()?,
+                orig: face.source,
+                edge_orig,
+            },
+            face.loops.clone(),
+        ));
     }
     // Blender's output follows BMesh slot order, and `mesh_bm_concat` creates subject faces first
     // (`geometry_mesh_boolean.cc:1000`), so surviving subject faces precede operand faces. Slot reuse
     // after a kill (LIFO) is not modelled; this is the observed order for the corpus.
     let subject_face_count = i32::try_from(subject.faces.len()).unwrap_or(i32::MAX);
-    polygons.sort_by_key(|polygon| polygon.orig >= subject_face_count);
+    polygons.sort_by_key(|(polygon, _)| polygon.orig >= subject_face_count);
+    let (polygons, loops): (Vec<Poly>, Vec<Vec<Option<usize>>>) = polygons.into_iter().unzip();
     let mut mesh = Mesh::new();
     let mut state_vertex_ids = vec![None; state.verts.len()];
     for polygon in &polygons {
@@ -503,6 +571,7 @@ fn build_float_output(subject: &Mesh, operand: &Mesh, state: &State) -> Result<F
     Ok(FloatOutput {
         mesh,
         polygons,
+        loops,
         state_vertex_ids,
         edge_sources,
     })
@@ -1139,7 +1208,8 @@ fn normal_codes_present(mesh: &Mesh) -> bool {
 struct FloatFaceTransfer {
     source_face: usize,
     copied: Vec<Option<usize>>,
-    edge_copied: Vec<Option<usize>>,
+    /// Per output corner, the origin face's corner whose non-interpolable loop data it carries.
+    loops: Vec<Option<usize>>,
     weights: Vec<Vec<f32>>,
 }
 
@@ -1149,6 +1219,7 @@ fn float_face_transfers(
     state: &State,
     state_output_ids: &[Option<u32>],
     polys: &[Poly],
+    loops: &[Vec<Option<usize>>],
     output_mesh: &Mesh,
 ) -> Result<Vec<FloatFaceTransfer>> {
     let subject_vertices: HashMap<u32, usize> = subject
@@ -1169,19 +1240,18 @@ fn float_face_transfers(
         .map(|vertex| to_f32(vertex.co))
         .collect();
     let mut transfers = Vec::with_capacity(polys.len());
-    for poly in polys {
+    for (poly, poly_loops) in polys.iter().zip(loops) {
         let source_face = usize::try_from(poly.orig)
             .map_err(|_| PotError::invalid_argument("Boolean corner face has no source"))?;
-        let (source_mesh, local_face, vertex_index, point_base, edge_base) =
+        let (source_mesh, local_face, vertex_index, point_base) =
             if source_face < subject.faces.len() {
-                (subject, source_face, &subject_vertices, 0, 0)
+                (subject, source_face, &subject_vertices, 0)
             } else {
                 (
                     operand,
                     source_face - subject.faces.len(),
                     &operand_vertices,
                     subject.vertices.len(),
-                    subject.edges.len(),
                 )
             };
         let face = source_mesh.faces.get(local_face).ok_or_else(|| {
@@ -1201,9 +1271,8 @@ fn float_face_transfers(
             .collect::<Result<_>>()?;
         let interpolator = FloatPolyInterpolator::new(&source_points);
         let mut copied = Vec::with_capacity(poly.verts.len());
-        let mut edge_copied = Vec::with_capacity(poly.verts.len());
         let mut weights = Vec::with_capacity(poly.verts.len());
-        for (corner_index, &state_vertex) in poly.verts.iter().enumerate() {
+        for &state_vertex in &poly.verts {
             let state_index = usize::try_from(state_vertex).map_err(|_| {
                 PotError::invalid_argument("Boolean corner vertex index is invalid")
             })?;
@@ -1220,43 +1289,13 @@ fn float_face_transfers(
                 let local = *vertex_index.get(id)?;
                 (point_origin == i32::try_from(point_base + local).ok()?).then_some(corner)
             });
-            // Winding reversal can move the split source edge to either adjacent output edge.
-            let edge_corner = if copied_corner.is_none() {
-                [
-                    (corner_index + poly.verts.len() - 1) % poly.verts.len(),
-                    corner_index,
-                ]
-                .into_iter()
-                .find_map(|edge_index| {
-                    poly.edge_orig
-                        .get(edge_index)
-                        .copied()
-                        .and_then(|source| usize::try_from(source).ok())
-                        .and_then(|source| source.checked_sub(edge_base))
-                        .and_then(|source| source_mesh.edges.get(source))
-                        .and_then(|edge| {
-                            face.vertices
-                                .iter()
-                                .enumerate()
-                                .find_map(|(corner, &vertex)| {
-                                    let next = face.vertices[(corner + 1) % face.vertices.len()];
-                                    ((vertex == edge.vertices[0] && next == edge.vertices[1])
-                                        || (vertex == edge.vertices[1] && next == edge.vertices[0]))
-                                        .then_some(corner)
-                                })
-                        })
-                })
-            } else {
-                None
-            };
             copied.push(copied_corner);
-            edge_copied.push(edge_corner);
             weights.push(values);
         }
         transfers.push(FloatFaceTransfer {
             source_face,
             copied,
-            edge_copied,
+            loops: poly_loops.clone(),
             weights,
         });
     }
@@ -1304,11 +1343,10 @@ fn transfer_float_normal_codes(
     let mut output_codes = Vec::new();
     for transfer in transfers {
         let start = starts[transfer.source_face];
-        for (copied, edge_copied) in transfer.copied.iter().zip(&transfer.edge_copied) {
+        for &loop_source in &transfer.loops {
             // These are raw short2 loop codes: copy the source block, never decode or negate it.
-            let source_corner = (*copied).or(*edge_copied);
             output_codes.push(
-                source_corner
+                loop_source
                     .and_then(|corner| source_codes.get(start + corner).copied())
                     .unwrap_or(clnor::CornerNormalCode::Auto),
             );
@@ -1626,27 +1664,28 @@ fn mix_float_corner_attribute(
     values: &[Value],
     weights: &[f32],
     copied: Option<usize>,
-    edge_copied: Option<usize>,
+    loop_source: Option<usize>,
     data_type: &str,
 ) -> Value {
     let data_type = blender_mixer_type(data_type);
+    // CustomData_bmesh_interp skips these types: the corner keeps its loop source or the default.
+    if matches!(
+        data_type,
+        "INT8" | "INT16_2D" | "INT32_2D" | "FLOAT4X4" | "STRING"
+    ) {
+        return loop_source
+            .and_then(|corner| values.get(corner).cloned())
+            .unwrap_or_else(|| bmesh_default_value(data_type));
+    }
     if let Some(corner) = copied {
         return values
             .get(corner)
             .cloned()
             .unwrap_or_else(|| bmesh_default_value(data_type));
     }
-    // CustomData_bmesh_interp skips these types, so the destination keeps its edge copy/default.
-    if matches!(
-        data_type,
-        "INT8" | "INT16_2D" | "INT32_2D" | "FLOAT4X4" | "STRING"
-    ) {
-        return edge_copied
-            .and_then(|corner| values.get(corner).cloned())
-            .unwrap_or_else(|| bmesh_default_value(data_type));
-    }
     mix_json_values_interpolated(values, weights, data_type)
 }
+
 fn transfer_float_attribute_entries(
     subject: &Mesh,
     operand: &Mesh,
@@ -1704,13 +1743,13 @@ fn transfer_float_attribute_entries(
                     .weights
                     .iter()
                     .zip(&transfer.copied)
-                    .zip(&transfer.edge_copied)
-                    .map(|((weights, copied), edge_copied)| {
+                    .zip(&transfer.loops)
+                    .map(|((weights, copied), loop_source)| {
                         mix_float_corner_attribute(
                             &source_values,
                             weights,
                             *copied,
-                            *edge_copied,
+                            *loop_source,
                             &data_type,
                         )
                     }),
@@ -1775,9 +1814,9 @@ fn transfer_float_named_corner_attributes(
                 .weights
                 .iter()
                 .zip(&transfer.copied)
-                .zip(&transfer.edge_copied)
-                .map(|((weights, copied), edge_copied)| {
-                    mix_float_corner_attribute(&inputs, weights, *copied, *edge_copied, &data_type)
+                .zip(&transfer.loops)
+                .map(|((weights, copied), loop_source)| {
+                    mix_float_corner_attribute(&inputs, weights, *copied, *loop_source, &data_type)
                 })
                 .collect();
             if let Some(face) = output_mesh.faces.get(output_face) {
@@ -2214,6 +2253,7 @@ fn build_state(
         state.edge_orig.insert(key, src);
         state.edge_start.insert(key, a);
         state.edge_order.push(key);
+        state.disk_attach(key);
     }
     for (i, edge) in subject.edges.iter().enumerate() {
         let a = subject_vertex_base
@@ -2229,6 +2269,7 @@ fn build_state(
             .map_err(|_| PotError::invalid_argument("Boolean input exceeds index range"))?;
         state.edge_orig.insert(key, src);
         state.edge_order.push(key);
+        state.disk_attach(key);
         state.edge_start.insert(key, a);
     }
 
@@ -2246,11 +2287,7 @@ fn build_state(
         let source_face = i32::try_from(subject.faces.len() + fi)
             .map_err(|_| PotError::invalid_argument("Boolean input exceeds index range"))?;
         face_vertex_rings.push(verts.clone());
-        state.faces.push(Face {
-            verts,
-            side: 1,
-            source: source_face,
-        });
+        state.faces.push(Face::input(verts, 1, source_face));
     }
     for (fi, face) in subject.faces.iter().enumerate() {
         let verts = face
@@ -2268,11 +2305,7 @@ fn build_state(
         let source_face = i32::try_from(fi)
             .map_err(|_| PotError::invalid_argument("Boolean input exceeds index range"))?;
         face_vertex_rings.push(verts.clone());
-        state.faces.push(Face {
-            verts,
-            side: 0,
-            source: source_face,
-        });
+        state.faces.push(Face::input(verts, 0, source_face));
     }
 
     for (face_index, ring) in face_vertex_rings.iter().enumerate() {
@@ -2905,6 +2938,7 @@ fn intersect_tri_pair(
     if verts_a.len() == 2 {
         let edge = edge_key_usize(verts_a[0], verts_a[1]);
         state.wire_edges.insert(edge);
+        state.disk_attach(edge);
         if !face_has_edge(&state.faces[face_a], edge) {
             let cuts = state.face_cuts.entry(face_a).or_default();
             if !cuts.contains(&edge) {
@@ -2915,6 +2949,7 @@ fn intersect_tri_pair(
     if verts_b.len() == 2 {
         let edge = edge_key_usize(verts_b[0], verts_b[1]);
         state.wire_edges.insert(edge);
+        state.disk_attach(edge);
         if !face_has_edge(&state.faces[face_b], edge) {
             let cuts = state.face_cuts.entry(face_b).or_default();
             if !cuts.contains(&edge) {
@@ -3136,8 +3171,19 @@ fn insert_split_vertex(state: &mut State, tail: usize, end: usize, split: usize,
             (0..len).find(|&i| edge_key_usize(face.verts[i], face.verts[(i + 1) % len]) == segment)
         {
             face.verts.insert(i + 1, split);
+            // Blender `BM_edge_split` copies the loop that starts the segment in this face: corner `i`.
+            face.loops.insert(i + 1, face.loops[i]);
         }
     }
+    // Blender `BM_edge_split`: the new edge `tail..split` is created first, then `segment` is re-pointed
+    // to `split`, so its far end `end` keeps the edge in place.
+    let head = edge_key_usize(tail, split);
+    let rest = edge_key_usize(split, end);
+    state.disk_unlink(tail, segment);
+    state.disk_link(tail, head);
+    state.disk_relink(end, segment, rest);
+    state.disk_link(split, head);
+    state.disk_link(split, rest);
     if wire {
         state.wire_edges.remove(&segment);
         state.wire_edges.insert(edge_key_usize(tail, split));
@@ -3153,6 +3199,13 @@ fn splice_split_vertex(state: &mut State, split: usize, keep: usize) {
                 *v = keep;
             }
         }
+    }
+    // Blender `BM_vert_splice`: the moved edges join `keep`'s disk after its own, in `split`'s order.
+    for key in std::mem::take(&mut state.disk[split]) {
+        let other = other_end(key, split);
+        let moved = edge_key_usize(keep, other);
+        state.disk_relink(other, key, moved);
+        state.disk_link(keep, moved);
     }
     let moved: Vec<EdgeKey> = state
         .wire_edges
@@ -3199,9 +3252,8 @@ fn split_input_edges(state: &mut State) {
         let mut chain = Vec::with_capacity(points.len());
         let mut tail = start;
         for vi in points {
-            let split = state.verts.len();
-            let point = state.verts[vi].clone();
-            state.verts.push(point);
+            let (co, source) = (state.verts[vi].co, state.verts[vi].source);
+            let split = state.add_vertex(co, source);
             insert_split_vertex(state, tail, end, split, wire);
             let touching = vertex_neighbours(state, split).contains(&vi);
             if !touching
@@ -3210,7 +3262,7 @@ fn split_input_edges(state: &mut State) {
                 && !splice_double_face(state, split, vi)
             {
                 splice_split_vertex(state, split, vi);
-                state.verts.pop();
+                state.pop_vertex();
                 chain.push(vi);
                 tail = vi;
             } else {
@@ -3257,6 +3309,9 @@ fn split_faces(state: &mut State) {
             &net,
             &positions,
         );
+        for &(a, b) in &connects {
+            state.disk_attach(edge_key_usize(a, b));
+        }
         let mut edge_net = net;
         edge_net.extend(connects);
         // The mesh's other faces: the originals not yet split, then the faces already emitted.
@@ -3277,9 +3332,19 @@ fn split_faces(state: &mut State) {
             new_faces.push(face.clone());
         } else {
             dangling.extend(split.dangling.iter().map(|&(a, b)| edge_key_usize(a, b)));
-            for ring in split.faces {
+            for (ring, sources) in split.faces.into_iter().zip(split.corner_sources) {
+                // Blender's loop pass: a corner at a ring vertex copies the face's loop there, and a net
+                // vertex interpolates, which leaves the non-interpolable loop data at its default.
+                let loops = sources
+                    .into_iter()
+                    .map(|source| match source {
+                        CornerSource::Original(corner) => face.loops[corner],
+                        CornerSource::Interpolated => None,
+                    })
+                    .collect();
                 new_faces.push(Face {
                     verts: ring,
+                    loops,
                     side: face.side,
                     source: face.source,
                 });
@@ -3387,6 +3452,7 @@ fn classify_faces(state: &mut State, operation: Operation, bvh_a: &Bvh, bvh_b: &
         }
         if flipped[index] && face.verts.len() > 2 {
             face.verts[1..].reverse();
+            face.loops[1..].reverse();
         }
         output.push(face);
     }
@@ -3399,6 +3465,9 @@ fn classify_faces(state: &mut State, operation: Operation, bvh_a: &Bvh, bvh_b: &
     for edge in removed_edges.difference(&kept_edges) {
         state.wire_edges.remove(edge);
         state.dangling_edges.remove(edge);
+        if !state.edge_orig.contains_key(edge) {
+            state.disk_detach(*edge);
+        }
     }
     state.faces = output;
 }
@@ -3458,47 +3527,31 @@ fn collapse_double_face(state: &State, vertex: usize, a: usize, b: usize) -> boo
 }
 
 fn dissolve_intersection_vertices(state: &mut State) {
+    debug_assert!(
+        disk_matches_edges(state),
+        "disk model is out of step with the edge sets"
+    );
     let mut candidates = state.dissolve_verts.clone();
     candidates.sort_unstable();
     candidates.dedup();
 
     let mut faces_at_vertex = vec![Vec::new(); state.verts.len()];
-    let mut edges_at_vertex: Vec<HashSet<EdgeKey>> =
-        (0..state.verts.len()).map(|_| HashSet::new()).collect();
     for (face_index, face) in state.faces.iter().enumerate() {
-        for i in 0..face.verts.len() {
-            let a = face.verts[i];
-            let b = face.verts[(i + 1) % face.verts.len()];
-            faces_at_vertex[a].push(face_index);
-            edges_at_vertex[a].insert(edge_key_usize(a, b));
-            edges_at_vertex[b].insert(edge_key_usize(a, b));
+        for &v in &face.verts {
+            faces_at_vertex[v].push(face_index);
         }
-    }
-    // Blender's disk counts every BMesh edge at the vertex, including split-net edges that no face loops.
-    for &edge in state
-        .edge_orig
-        .keys()
-        .chain(state.wire_edges.iter())
-        .chain(state.dangling_edges.iter())
-    {
-        edges_at_vertex[edge.0].insert(edge);
-        edges_at_vertex[edge.1].insert(edge);
     }
 
-    let mut neighbors = Vec::new();
     let mut face_indices = Vec::new();
     for vertex in candidates {
-        neighbors.clear();
-        neighbors.extend(
-            edges_at_vertex[vertex]
-                .iter()
-                .map(|edge| if edge.0 == vertex { edge.1 } else { edge.0 }),
-        );
-        neighbors.sort_unstable();
-        neighbors.dedup();
-        if neighbors.len() != 2 {
+        // Blender `BM_vert_collapse_edge(bm, v->e, v)`: the head edge is the oldest one at `vertex`. It
+        // collapses onto its other end `tv`, and the vertex's remaining edge moves onto `tv`.
+        let &[head, rest] = state.disk[vertex].as_slice() else {
             continue;
-        }
+        };
+        let tv = other_end(head, vertex);
+        let b = other_end(rest, vertex);
+        let new_edge = edge_key_usize(tv, b);
         std::mem::swap(&mut face_indices, &mut faces_at_vertex[vertex]);
         let has_triangle = face_indices
             .iter()
@@ -3506,70 +3559,54 @@ fn dissolve_intersection_vertices(state: &mut State) {
         if has_triangle {
             continue;
         }
-        let (a, b) = (neighbors[0], neighbors[1]);
-        let new_edge = edge_key_usize(a, b);
         // Blender: a collapse onto an existing edge is refused only when it would make a double face
         // (`BM_vert_collapse_check_double_face`, bmesh_core.cc:2290); an absent edge never does.
-        if (edges_at_vertex[a].contains(&new_edge) || edges_at_vertex[b].contains(&new_edge))
-            && collapse_double_face(state, vertex, a, b)
-        {
+        let merges = state.disk[tv].contains(&new_edge);
+        if merges && collapse_double_face(state, vertex, tv, b) {
             continue;
-        }
-
-        let mut reduced = Vec::new();
-        for &face_index in &face_indices {
-            let face = &state.faces[face_index];
-            if face.verts.len() < 3 || !face.verts.contains(&vertex) {
-                continue;
-            }
-            let ring: Vec<usize> = face
-                .verts
-                .iter()
-                .copied()
-                .filter(|&v| v != vertex)
-                .collect();
-            if ring.len() >= 3 {
-                reduced.push((face_index, ring));
-            }
         }
 
         let source = state
             .edge_orig
-            .get(&edge_key_usize(a, vertex))
+            .get(&edge_key_usize(tv, vertex))
             .or_else(|| state.edge_orig.get(&edge_key_usize(b, vertex)))
             .copied();
-        let wire = state.wire_edges.contains(&edge_key_usize(a, vertex))
+        let wire = state.wire_edges.contains(&edge_key_usize(tv, vertex))
             || state.wire_edges.contains(&edge_key_usize(b, vertex));
         for &face_index in &face_indices {
-            let old = std::mem::take(&mut state.faces[face_index].verts);
+            let face = &mut state.faces[face_index];
+            let old = std::mem::take(&mut face.verts);
+            let old_loops = std::mem::take(&mut face.loops);
             if old.is_empty() {
                 continue;
             }
-            let ring: Vec<usize> = old.iter().copied().filter(|&v| v != vertex).collect();
+            let (ring, loops) = collapse_ring_corners(&old, &old_loops, vertex, tv);
             if ring.len() >= 3 {
-                state.faces[face_index].verts = ring;
+                face.verts = ring;
+                face.loops = loops;
             } else {
                 for old_vertex in old {
                     faces_at_vertex[old_vertex].retain(|&index| index != face_index);
                 }
             }
         }
-        let edge_a = edge_key_usize(a, vertex);
+        let edge_a = edge_key_usize(tv, vertex);
         let edge_b = edge_key_usize(b, vertex);
-        edges_at_vertex[a].remove(&edge_a);
-        edges_at_vertex[vertex].remove(&edge_a);
-        edges_at_vertex[b].remove(&edge_b);
-        edges_at_vertex[vertex].remove(&edge_b);
-        edges_at_vertex[a].insert(new_edge);
-        edges_at_vertex[b].insert(new_edge);
-        edges_at_vertex[vertex].clear();
+        state.disk_unlink(tv, edge_a);
+        state.disk[vertex].clear();
+        if merges {
+            state.disk_unlink(b, edge_b);
+        } else {
+            state.disk_relink(b, edge_b, new_edge);
+            state.disk_link(tv, new_edge);
+        }
         state.edge_orig.remove(&edge_a);
         state.edge_orig.remove(&edge_b);
         state.edge_start.remove(&edge_a);
         state.edge_start.remove(&edge_b);
         if let Some(source) = source {
             state.edge_orig.insert(new_edge, source);
-            state.edge_start.insert(new_edge, a);
+            state.edge_start.insert(new_edge, tv);
         }
         state.wire_edges.remove(&edge_a);
         state.wire_edges.remove(&edge_b);
@@ -3583,6 +3620,65 @@ fn dissolve_intersection_vertices(state: &mut State) {
         }
     }
     state.faces.retain(|face| face.verts.len() >= 3);
+}
+
+/// The end of `key` that is not `vertex`.
+fn other_end(key: EdgeKey, vertex: usize) -> usize {
+    if key.0 == vertex { key.1 } else { key.0 }
+}
+
+/// Every edge of the faces, the input edges, the wire edges and the dangling edges is listed once in
+/// each of its two disks, and the disks list nothing else.
+fn disk_matches_edges(state: &State) -> bool {
+    let mut edges: HashSet<EdgeKey> = state
+        .edge_orig
+        .keys()
+        .chain(&state.wire_edges)
+        .chain(&state.dangling_edges)
+        .copied()
+        .collect();
+    for face in &state.faces {
+        edges.extend(ring_edges(&face.verts));
+    }
+    let mut listed = 0;
+    for (vertex, disk) in state.disk.iter().enumerate() {
+        let unique: HashSet<&EdgeKey> = disk.iter().collect();
+        let at_vertex = disk
+            .iter()
+            .all(|&key| (key.0 == vertex || key.1 == vertex) && edges.contains(&key));
+        if unique.len() != disk.len() || !at_vertex {
+            return false;
+        }
+        listed += disk.len();
+    }
+    listed == 2 * edges.len()
+}
+
+/// Blender `BM_vert_collapse_faces` on one ring: `vertex` leaves the ring. Where the ring runs
+/// `tv -> vertex`, the kill-side loop survives and takes the `tv` place, so the `tv` corner takes the
+/// `vertex` corner's loop data. Every other corner keeps its own.
+fn collapse_ring_corners(
+    verts: &[usize],
+    loops: &[Option<usize>],
+    vertex: usize,
+    tv: usize,
+) -> (Vec<usize>, Vec<Option<usize>>) {
+    let len = verts.len();
+    let mut ring = Vec::with_capacity(len);
+    let mut ring_loops = Vec::with_capacity(len);
+    for i in 0..len {
+        if verts[i] == vertex {
+            continue;
+        }
+        let next = (i + 1) % len;
+        ring.push(verts[i]);
+        ring_loops.push(if verts[i] == tv && verts[next] == vertex {
+            loops[next]
+        } else {
+            loops[i]
+        });
+    }
+    (ring, ring_loops)
 }
 
 fn ray_hits(
@@ -4215,11 +4311,7 @@ mod dangling_edge_tests {
         ] {
             state.add_vertex(co, NO_INDEX);
         }
-        state.faces.push(Face {
-            verts: vec![0, 1, 2, 3],
-            side: 0,
-            source: 0,
-        });
+        state.faces.push(Face::input(vec![0, 1, 2, 3], 0, 0));
         state
     }
 
