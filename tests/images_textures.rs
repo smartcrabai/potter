@@ -228,7 +228,7 @@ fn texture_paint_maps_world_stroke_through_face_corner_uvs() -> Result<(), Box<d
             {"op":"image.create","id":"canvas","width":16,"height":16,"fill_color":[0.0,0.0,0.0,1.0]},
             {"op":"material.create","id":"surface","base_color_texture":{"image":"canvas","uv_layer":"UVMap","interpolation":"closest"}},
             {"op":"node.create","id":"body","kind":"box","params":{"size":2},"material":"surface"},
-            {"op":"uv.unwrap","target":{"id":"body"},"elements":{"domain":"face","ids":["f1"]},"method":"smart"}
+            {"op":"uv.unwrap","target":{"id":"body"},"elements":{"domain":"face","ids":["f5"]},"method":"smart"}
         ]),
     )?;
 
@@ -239,7 +239,7 @@ fn texture_paint_maps_world_stroke_through_face_corner_uvs() -> Result<(), Box<d
             .ok_or_else(|| std::io::Error::other("box has no face-corner UV map"))?;
     let top_uv = uv_entries
         .iter()
-        .find(|entry| entry["face_id"] == 1)
+        .find(|entry| entry["face_id"] == 5)
         .ok_or_else(|| std::io::Error::other("top face UV coordinates are missing"))?;
     assert_eq!(top_uv["uv"].as_array().map(std::vec::Vec::len), Some(4));
     for corner in top_uv["uv"]

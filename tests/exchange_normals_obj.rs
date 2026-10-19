@@ -205,11 +205,12 @@ fn obj_export_matches_blender_reference_corners() -> TestResult {
         .iter()
         .find(|object| object.name == "mirror")
         .ok_or("mirror object is missing")?;
+    // f3 (-Y) carries custom normals, which need not follow its winding; every other face must.
     for (index, face) in mirror
         .faces
         .iter()
         .enumerate()
-        .filter(|(index, _)| *index != 2)
+        .filter(|(index, _)| *index != 3)
     {
         let points = face
             .iter()
@@ -259,19 +260,20 @@ fn obj_export_writes_shared_normals_and_smooth_groups() -> TestResult {
         .find(|object| object.name == "mixed")
         .ok_or("OBJ has no object named mixed")?;
     let shading = mixed.shading.iter().map(String::as_str).collect::<Vec<_>>();
-    assert_eq!(shading, ["s 0", "s 1"]);
+    // Smooth-group runs in face order: f0..f3 smooth, f4 flat (-Z), f5 smooth.
+    assert_eq!(shading, ["s 1", "s 0", "s 1"]);
 
-    // f0 is flat: its four corners all carry (0, 0, -1).
-    for normal in &mixed.corner_normals[0..4] {
-        assert!(close(*normal, [0.0, 0.0, -1.0]), "f0 corner {normal:?}");
+    // f4 is flat, the -Z face of Blender's cube order: its four corners all carry (0, 0, -1).
+    for normal in &mixed.corner_normals[4 * 4..4 * 4 + 4] {
+        assert!(close(*normal, [0.0, 0.0, -1.0]), "f4 corner {normal:?}");
     }
-    // f5 = [3, 0, 4, 7] shares vertex 0 with f0 across the sharp edge e0 = (v0, v3), so its
-    // corner at vertex 0 (corner 5 * 4 + 1) must carry a different vn value.
-    assert_eq!(mixed.faces[5][1], mixed.faces[0][0]);
-    let across_edge = mixed.corner_normals[5 * 4 + 1];
+    // f0 = [0, 1, 3, 2] shares vertex 0 with f4 = [2, 6, 4, 0] across the sharp edge e0 = (v0, v2),
+    // so its corner at vertex 0 (corner 0) must carry a different vn value than the flat -Z face.
+    assert_eq!(mixed.faces[0][0], mixed.faces[4][3]);
+    let across_edge = mixed.corner_normals[0];
     assert!(
         !close(across_edge, [0.0, 0.0, -1.0]),
-        "sharp edge e0 should split vertex 0 normals, got {across_edge:?} at f5"
+        "sharp edge e0 should split vertex 0 normals, got {across_edge:?} at f0"
     );
     Ok(())
 }
