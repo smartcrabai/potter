@@ -2,7 +2,7 @@ use serde_json::{Map, Value};
 
 use crate::{
     error::{ErrorCode, Result},
-    image::ImageInterpolation,
+    image::{ImageExtension, ImageInterpolation},
     model::{Id, Material, TextureRef},
 };
 
@@ -753,7 +753,7 @@ fn parse_texture_ref(
         )
     })?;
     for key in object.keys() {
-        if !["image", "uv_layer", "interpolation"].contains(&key.as_str()) {
+        if !["image", "uv_layer", "interpolation", "extension"].contains(&key.as_str()) {
             return Err(engine.error(
                 ErrorCode::InvalidOperation,
                 format!("unknown texture reference field `{key}`"),
@@ -813,10 +813,25 @@ fn parse_texture_ref(
             ));
         }
     };
+    let extension = match object.get("extension") {
+        None | Some(Value::Null) => ImageExtension::Repeat,
+        Some(Value::String(value)) if value == "repeat" => ImageExtension::Repeat,
+        Some(Value::String(value)) if value == "extend" => ImageExtension::Extend,
+        Some(Value::String(value)) if value == "clip" => ImageExtension::Clip,
+        Some(Value::String(value)) if value == "mirror" => ImageExtension::Mirror,
+        _ => {
+            return Err(engine.error(
+                ErrorCode::InvalidOperation,
+                "texture extension must be repeat, extend, clip, or mirror",
+                &operation_pointer(engine.operation_index, &format!("{pointer}/extension")),
+            ));
+        }
+    };
     Ok(Some(TextureRef {
         image: image_id,
         uv_layer,
         interpolation,
+        extension,
     }))
 }
 

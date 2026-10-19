@@ -1,0 +1,368 @@
+{
+ "case": "ngon_concave_extrude",
+ "blender_version": "5.2.2",
+ "input_normal_codec_max_error": null,
+ "outcome": "ok",
+ "output": {
+  "vertices": [
+   [
+    -0.008633281104266644,
+    -0.008633282035589218,
+    0.0739995539188385
+   ],
+   [
+    1.9913667440414429,
+    -0.008633282035589218,
+    0.0739995539188385
+   ],
+   [
+    1.9913667440414429,
+    0.9913667440414429,
+    0.27399957180023193
+   ],
+   [
+    0.9913667440414429,
+    0.9913667440414429,
+    0.17399954795837402
+   ],
+   [
+    0.9913667440414429,
+    1.9913667440414429,
+    0.473999559879303
+   ],
+   [
+    -0.008633281104266644,
+    1.9913667440414429,
+    0.0739995539188385
+   ],
+   [
+    0.025899844244122505,
+    0.025899846106767654,
+    -0.2219986766576767
+   ],
+   [
+    2.025899887084961,
+    0.025899846106767654,
+    -0.2219986766576767
+   ],
+   [
+    2.025899887084961,
+    1.025899887084961,
+    -0.021998673677444458
+   ],
+   [
+    1.025899887084961,
+    1.025899887084961,
+    -0.12199867516756058
+   ],
+   [
+    1.025899887084961,
+    2.025899887084961,
+    0.17800132930278778
+   ],
+   [
+    0.025899844244122505,
+    2.025899887084961,
+    -0.2219986766576767
+   ]
+  ],
+  "edges": [
+   {
+    "v": [
+     0,
+     5
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     0,
+     1
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     1,
+     2
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     2,
+     3
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     3,
+     4
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     4,
+     5
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     6,
+     11
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     6,
+     7
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     7,
+     8
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     8,
+     9
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     9,
+     10
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     10,
+     11
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     0,
+     6
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     1,
+     7
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     2,
+     8
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     3,
+     9
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     4,
+     10
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   },
+   {
+    "v": [
+     5,
+     11
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0,
+    "bevel_weight": 0.0
+   }
+  ],
+  "faces": [
+   {
+    "v": [
+     0,
+     1,
+     2,
+     3,
+     4,
+     5
+    ],
+    "material_index": 0,
+    "smooth": true,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     6,
+     11,
+     10,
+     9,
+     8,
+     7
+    ],
+    "material_index": 0,
+    "smooth": true,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     0,
+     5,
+     11,
+     6
+    ],
+    "material_index": 0,
+    "smooth": true,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     1,
+     0,
+     6,
+     7
+    ],
+    "material_index": 0,
+    "smooth": true,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     2,
+     1,
+     7,
+     8
+    ],
+    "material_index": 0,
+    "smooth": true,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     3,
+     2,
+     8,
+     9
+    ],
+    "material_index": 0,
+    "smooth": true,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     4,
+     3,
+     9,
+     10
+    ],
+    "material_index": 0,
+    "smooth": true,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     5,
+     4,
+     10,
+     11
+    ],
+    "material_index": 0,
+    "smooth": true,
+    "uv": {},
+    "colors": {}
+   }
+  ],
+  "vertex_groups": {},
+  "uv_layer_names": [],
+  "color_attribute_names": [],
+  "has_custom_normals": false,
+  "has_bevel_weight_edge": false,
+  "topology": {
+   "vertices": 12,
+   "edges": 18,
+   "faces": 8,
+   "loops": 36,
+   "loose_edges": 0
+  },
+  "canonical_hash": "64124a48cd9defc64553b0feb5d53d0e85e0d2a74e93a1e73f2c47fa203f089a"
+ },
+ "output_normal_codec_max_error": null
+}
