@@ -12,7 +12,7 @@ use crate::{
     eval::{EvaluationPurpose, Snapshot},
     geom::{
         color_layers::{self, ColorDomain, ColorLayer, ColorStore},
-        normals::render_corner_normals,
+        normals::{render_corner_normals, smooth_face_flags},
         uv_layers::{self, UvStore},
     },
     image::ImageData,
@@ -377,7 +377,13 @@ pub(super) fn extract_geometry(
                     serde_json::json!({ "node_id": node_id }),
                 )
             })?;
-            let face_normals = world_face_normals(mesh, matrix, node_id, &mut warnings);
+            let face_normals = world_face_normals(
+                mesh,
+                matrix,
+                node_id,
+                snapshot.adaptive_normals.get(node_id).map(Vec::as_slice),
+                &mut warnings,
+            );
             let mut triangle_offset = 0_usize;
             let mut corner_base = 0_usize;
             let vertex_slots: BTreeMap<u32, usize> = if carried_layers.is_empty() {
@@ -1375,6 +1381,7 @@ fn world_face_normals(
     mesh: &crate::geom::Mesh,
     matrix: DMat4,
     node_id: &Id,
+    adaptive_normals: Option<&[Option<DVec3>]>,
     warnings: &mut Vec<serde_json::Value>,
 ) -> Vec<Option<Vec<DVec3>>> {
     let positions: Vec<DVec3> = mesh.vertices.iter().map(|vertex| vertex.co).collect();
@@ -1391,6 +1398,36 @@ fn world_face_normals(
             return vec![None; mesh.faces.len()];
         }
     };
+    let mut local = local;
+    if let Some(normals) = adaptive_normals.filter(|normals| normals.len() == mesh.vertices.len())
+        && let Ok(smooth_faces) = smooth_face_flags(mesh)
+        && smooth_faces.iter().any(|smooth| *smooth)
+    {
+        let vertex_indices: BTreeMap<u32, usize> = mesh
+            .vertices
+            .iter()
+            .enumerate()
+            .map(|(index, vertex)| (vertex.id, index))
+            .collect();
+        for (face_index, (face, smooth)) in mesh.faces.iter().zip(smooth_faces).enumerate() {
+            if !smooth {
+                continue;
+            }
+            let Some(face_normals) = local.get_mut(face_index).and_then(Option::as_mut) else {
+                continue;
+            };
+            for (corner, vertex_id) in face.vertices.iter().enumerate() {
+                if let Some(normal) = vertex_indices
+                    .get(vertex_id)
+                    .and_then(|index| normals.get(*index))
+                    .copied()
+                    .flatten()
+                {
+                    face_normals[corner] = normal;
+                }
+            }
+        }
+    }
     // Inverse-transpose keeps normals perpendicular to the surface under non-uniform scale.
     let normal_matrix = DMat3::from_mat4(matrix).inverse().transpose();
     let mut degenerate = false;
@@ -2386,7 +2423,7 @@ mod shading_normal_tests {
     fn flat_faces_keep_geometric_normals_without_warnings() {
         let mesh = single_face_mesh([DVec3::ZERO, DVec3::Y, DVec3::new(1.0, 0.0, -1.0)], false);
         let mut warnings = Vec::new();
-        let faces = world_face_normals(&mesh, DMat4::IDENTITY, &node_id(), &mut warnings);
+        let faces = world_face_normals(&mesh, DMat4::IDENTITY, &node_id(), None, &mut warnings);
         assert_eq!(faces, vec![None]);
         assert_eq!(warnings, Vec::<serde_json::Value>::new());
     }
@@ -2396,7 +2433,7 @@ mod shading_normal_tests {
         let mesh = single_face_mesh([DVec3::ZERO, DVec3::Y, DVec3::new(1.0, 0.0, -1.0)], true);
         let matrix = DMat4::from_scale(DVec3::new(1.0, 1.0, 3.0));
         let mut warnings = Vec::new();
-        let faces = world_face_normals(&mesh, matrix, &node_id(), &mut warnings);
+        let faces = world_face_normals(&mesh, matrix, &node_id(), None, &mut warnings);
         let corners = faces[0].as_ref().expect("smooth face has corner normals");
         let expected = DVec3::new(-3.0, 0.0, -1.0).normalize();
         assert_eq!(corners.len(), 3);
@@ -2407,10 +2444,38 @@ mod shading_normal_tests {
     }
 
     #[test]
+    fn adaptive_normals_override_smooth_faces_but_not_flat_faces() {
+        let points = [DVec3::ZERO, DVec3::Y, DVec3::new(1.0, 0.0, -1.0)];
+        let smooth = single_face_mesh(points, true);
+        let flat = single_face_mesh(points, false);
+        let adaptive = [Some(DVec3::X); 3];
+        let mut warnings = Vec::new();
+
+        let smooth_faces = world_face_normals(
+            &smooth,
+            DMat4::IDENTITY,
+            &node_id(),
+            Some(&adaptive),
+            &mut warnings,
+        );
+        assert_eq!(smooth_faces, vec![Some(vec![DVec3::X; 3])]);
+
+        let flat_faces = world_face_normals(
+            &flat,
+            DMat4::IDENTITY,
+            &node_id(),
+            Some(&adaptive),
+            &mut warnings,
+        );
+        assert_eq!(flat_faces, vec![None]);
+        assert_eq!(warnings, Vec::<serde_json::Value>::new());
+    }
+
+    #[test]
     fn degenerate_smooth_fans_fall_back_to_flat_with_a_warning() {
         let mesh = single_face_mesh([DVec3::ZERO, DVec3::X, DVec3::new(2.0, 0.0, 0.0)], true);
         let mut warnings = Vec::new();
-        let faces = world_face_normals(&mesh, DMat4::IDENTITY, &node_id(), &mut warnings);
+        let faces = world_face_normals(&mesh, DMat4::IDENTITY, &node_id(), None, &mut warnings);
         assert_eq!(faces, vec![None]);
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0]["code"], "shading.corner_normals_failed");
@@ -2422,7 +2487,7 @@ mod shading_normal_tests {
         let mesh = single_face_mesh([DVec3::ZERO, DVec3::X, DVec3::Y], true);
         let mut warnings = Vec::new();
         let matrix = DMat4::from_scale(DVec3::new(1.0, 1.0, 0.0));
-        let faces = world_face_normals(&mesh, matrix, &node_id(), &mut warnings);
+        let faces = world_face_normals(&mesh, matrix, &node_id(), None, &mut warnings);
         assert_eq!(faces, vec![None]);
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0]["code"], "shading.corner_normals_failed");
