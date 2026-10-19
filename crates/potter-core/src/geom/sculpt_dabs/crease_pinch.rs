@@ -1,5 +1,5 @@
 //! Blender 5.2.2 Crease and Pinch for the dab framework. Both take their plane from the dab's area
-//! normal (`calc_area_normal`, sculpt_plane AREA) at the asset's `normal_radius_factor`, and both
+//! normal (`calc_area_normal`, `sculpt_plane` AREA) at the asset's `normal_radius_factor`, and both
 //! read the stroke-start positions because their assets do not accumulate.
 
 use glam::DVec3;

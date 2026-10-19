@@ -883,6 +883,26 @@ mod tests {
             .unwrap()
     }
 
+    /// Smooth moves only interior vertices: Blender's `calc_vert_neighbors_interior` clears the
+    /// neighbors of a boundary corner (two neighbors), so a lone triangle has nothing to average.
+    /// A four-triangle fan around an interior center vertex gives Smooth something to move.
+    fn test_mesh_for(brush: Brush) -> Mesh {
+        if brush != Brush::Dab(DabBrush::Smooth) {
+            return test_mesh();
+        }
+        Mesh::from_positions_and_faces(
+            vec![
+                DVec3::new(0.25, 0.25, 0.0),
+                DVec3::new(0.0, 0.0, 0.0),
+                DVec3::new(1.0, 0.0, 0.0),
+                DVec3::new(1.0, 1.0, 0.0),
+                DVec3::new(0.0, 1.0, 0.0),
+            ],
+            vec![vec![0, 1, 2], vec![0, 2, 3], vec![0, 3, 4], vec![0, 4, 1]],
+        )
+        .unwrap()
+    }
+
     fn sample(position: DVec3) -> StrokeSample {
         StrokeSample {
             position,
@@ -946,11 +966,12 @@ mod tests {
             DabBrush::Elastic,
         ] {
             let stroke = test_stroke(brush);
-            let mut first = test_mesh();
-            let mut second = test_mesh();
+            let base = test_mesh_for(brush);
+            let mut first = base.clone();
+            let mut second = base.clone();
             assert!(apply_stroke(&mut first, &stroke).unwrap(), "{brush:?}");
             assert!(apply_stroke(&mut second, &stroke).unwrap(), "{brush:?}");
-            assert_ne!(first, test_mesh(), "{brush:?}");
+            assert_ne!(first, base, "{brush:?}");
             assert_eq!(first, second, "{brush:?}");
             first.validate().unwrap();
         }
