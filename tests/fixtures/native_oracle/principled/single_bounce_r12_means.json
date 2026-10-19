@@ -25,7 +25,7 @@
     ],
     "resolution": 16,
     "patch": "central 8x8",
-    "generator": "tests/fixtures/native_oracle/principled/single_bounce_probe.py with PROBE_DIAMETER=2.4",
+    "generator": "tests/fixtures/native_oracle/principled/single_bounce_probe.py with PROBE_DIAMETER=2.4 (16 seeds, 5 variants)",
     "geometry": {
       "receiver": "plane at origin, normal +Z",
       "view_theta_deg": 45.0,
@@ -83,6 +83,18 @@
         0.0003107007194890755,
         0.0003107007194890755,
         0.0003107007194890755
+      ]
+    },
+    "dielectric_white": {
+      "mean": [
+        6.313597380649298,
+        6.313597380649298,
+        6.313597380649298
+      ],
+      "stderr": [
+        0.0009449430068234293,
+        0.0009449430068234293,
+        0.0009449430068234293
       ]
     }
   },

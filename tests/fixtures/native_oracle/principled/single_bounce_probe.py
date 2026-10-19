@@ -21,6 +21,7 @@ VARIANTS = {
     "metal_r024_white": dict(metallic=1.0, roughness=0.24, base=(1.0, 1.0, 1.0, 1.0)),
     "diffuse_white": dict(metallic=0.0, roughness=0.5, base=(0.8, 0.8, 0.8, 1.0), spec=0.0),
     "spec_only_r024": dict(metallic=0.0, roughness=0.24, base=(0.0, 0.0, 0.0, 1.0)),
+    "dielectric_white": dict(metallic=0.0, roughness=0.24, base=(0.8, 0.8, 0.8, 1.0)),
 }
 
 def aim(obj, target):
