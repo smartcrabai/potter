@@ -20,15 +20,22 @@
 //!   only the endpoints, so no edge direction is assumed. Duplicates and pairs equal to a boundary edge
 //!   are merged, which matches Blender's flag semantics (`EDGE_NET` is idempotent).
 //! - Disk cycle order. `disk_order[v]` lists the mesh's edges at global vertex `v` as undirected pairs,
-//!   oldest first: the `BMesh` disk read from its head (`State::disk` in `float.rs`). Each vertex's cycle
-//!   follows that order, its head starts at the oldest edge, and the order decides LIFO pops in the pair
-//!   search and sort ties in the walk. A graph edge the order does not name follows the named ones, in
-//!   table order, so an empty order gives table order everywhere.
+//!   read from the `BMesh` disk head (`State::disk` in `float.rs`, head first). Each vertex's cycle
+//!   follows that order and its head starts at the first listed edge; the order decides LIFO pops in the
+//!   pair search and sort ties in the walk. A graph edge the order does not name follows the named ones,
+//!   in table order, so an empty order gives table order everywhere. The head is `v->e`, which the walk
+//!   rewrites (see "Disk heads" below).
 //!
 //! # Output
 //! [`SplitNetResult::faces`] lists the emitted faces in Blender's creation order. Each ring starts at the
 //! vertex the search began from, which is Blender's `face_verts[0]` and the first loop of the new face.
 //! An empty list means no split: Blender keeps the original face unchanged.
+//!
+//! # Disk heads
+//! Blender's walk writes `v->e = e` at each vertex it expands and at each reached child
+//! (`bmesh_polygon_edgenet.cc`, `find_loop_walk`). `v->e` is the `BMesh` disk head that the next face
+//! split reads, so the walk's writes persist after the call. [`SplitNetResult::heads`] reports the final
+//! head of every vertex written; the caller rotates the mesh's disk cycle so that edge comes first.
 //!
 //! # Corner provenance
 //! [`SplitNetResult::corner_sources`] gives every corner of every emitted face its loop-data source.
@@ -109,6 +116,10 @@ pub(crate) struct SplitNetResult {
     pub(crate) corner_sources: Vec<Vec<CornerSource>>,
     /// Net edges that no emitted face uses. Blender leaves these without loops.
     pub(crate) dangling: Vec<(usize, usize)>,
+    /// Disk heads the walks left behind: Blender's `v->e = e` writes (`bmesh_polygon_edgenet.cc`). Each
+    /// entry is a global vertex and its final head edge. The head lives on the vertex, so it outlives
+    /// this call; the caller applies these to the mesh's disk cycles. Module doc, "Disk heads".
+    pub(crate) heads: Vec<(usize, (usize, usize))>,
 }
 
 /// Blender `BM_face_split_edgenet`, the only entry point. `mesh_faces` are the other faces of the mesh;
@@ -179,10 +190,20 @@ pub(crate) fn face_split_edgenet_with_mesh(
         .collect();
     let faces = net.rings.split_off(base);
     let corner_sources = ring_corner_sources(boundary, &faces);
+    // Each written vertex keeps its last head (module doc, "Disk heads").
+    let mut written = vec![false; net.ids.len()];
+    let mut heads = Vec::new();
+    for &v in &net.head_writes {
+        if !written[v] {
+            written[v] = true;
+            heads.push((net.ids[v], net.edge_global[net.head_edge(v)]));
+        }
+    }
     SplitNetResult {
         faces,
         corner_sources,
         dangling,
+        heads,
     }
 }
 
@@ -251,6 +272,8 @@ struct Net {
     edge_global: Vec<(usize, usize)>,
     /// Local endpoints of each graph edge.
     ends: Vec<[usize; 2]>,
+    /// Local vertices whose head the walks wrote, in write order (repeats allowed).
+    head_writes: Vec<usize>,
     /// Net edges, deduplicated, in input order. Boundary edges are excluded.
     edges: Vec<usize>,
     /// Disk cycle per local vertex: its graph edges in cyclic order.
@@ -386,6 +409,7 @@ impl Net {
             disk,
             slot_pos,
             head,
+            head_writes: Vec::new(),
             flagged,
             mesh_loops,
             rings,
@@ -420,6 +444,7 @@ impl Net {
     /// Blender `v->e = e`, stored as a disk position.
     fn set_head(&mut self, v: usize, e: usize) {
         self.head[v] = self.pos_in(e, v);
+        self.head_writes.push(v);
     }
 
     /// Edges at `v` in disk order from its head, split into boundary edges (one flagged loop) and

@@ -3328,6 +3328,14 @@ fn split_faces(state: &mut State) {
             &mesh_faces,
             &state.disk,
         );
+        // Blender's walk wrote `v->e` at each vertex it visited, and that head outlives this split: the
+        // cycle is rotated so the written edge comes first, as `bmesh_disk_edge_remove` reads it.
+        for &(v, (a, b)) in &split.heads {
+            let key = edge_key_usize(a, b);
+            if let Some(at) = state.disk[v].iter().position(|&edge| edge == key) {
+                state.disk[v].rotate_left(at);
+            }
+        }
         if split.faces.is_empty() {
             dangling.extend(edge_net.iter().map(|&(a, b)| edge_key_usize(a, b)));
             new_faces.push(face.clone());
