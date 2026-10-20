@@ -39,7 +39,8 @@ fn apply_stroke(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resu
         engine,
         operation,
         &[
-            "op", "target", "scope", "brush", "samples", "falloff", "symmetry", "delta", "dyntopo",
+            "op", "target", "scope", "brush", "samples", "falloff", "symmetry", "delta", "view",
+            "dyntopo",
         ],
         &["target", "brush", "samples"],
     )?;
@@ -644,24 +645,24 @@ pub(super) fn parse_stroke(
     operation: &Map<String, Value>,
 ) -> Result<sculpt_geom::Stroke> {
     let brush = match string_field(engine, operation, "brush")?.as_str() {
-        "draw" => sculpt_geom::Brush::Vertex(sculpt_geom::VertexBrush::Draw),
+        "draw" => sculpt_geom::Brush::Dab(sculpt_geom::DabBrush::Draw),
         "clay_strips" => sculpt_geom::Brush::Dab(sculpt_geom::DabBrush::ClayStrips),
         "inflate" => sculpt_geom::Brush::Dab(sculpt_geom::DabBrush::Inflate),
-        "grab" => sculpt_geom::Brush::Vertex(sculpt_geom::VertexBrush::Grab),
-        "smooth" => sculpt_geom::Brush::Vertex(sculpt_geom::VertexBrush::Smooth),
-        "flatten" => sculpt_geom::Brush::Vertex(sculpt_geom::VertexBrush::Flatten),
-        "pinch" => sculpt_geom::Brush::Vertex(sculpt_geom::VertexBrush::Pinch),
-        "crease" => sculpt_geom::Brush::Vertex(sculpt_geom::VertexBrush::Crease),
+        "grab" => sculpt_geom::Brush::Dab(sculpt_geom::DabBrush::Grab),
+        "smooth" => sculpt_geom::Brush::Dab(sculpt_geom::DabBrush::Smooth),
+        "flatten" => sculpt_geom::Brush::Dab(sculpt_geom::DabBrush::Flatten),
+        "pinch" => sculpt_geom::Brush::Dab(sculpt_geom::DabBrush::Pinch),
+        "crease" => sculpt_geom::Brush::Dab(sculpt_geom::DabBrush::Crease),
         "layer" => sculpt_geom::Brush::Dab(sculpt_geom::DabBrush::Layer),
-        "snake_hook" => sculpt_geom::Brush::Vertex(sculpt_geom::VertexBrush::SnakeHook),
-        "thumb" => sculpt_geom::Brush::Vertex(sculpt_geom::VertexBrush::Thumb),
-        "rotate" => sculpt_geom::Brush::Vertex(sculpt_geom::VertexBrush::Rotate),
-        "nudge" => sculpt_geom::Brush::Vertex(sculpt_geom::VertexBrush::Nudge),
-        "blob" => sculpt_geom::Brush::Vertex(sculpt_geom::VertexBrush::Blob),
-        "scrape" => sculpt_geom::Brush::Vertex(sculpt_geom::VertexBrush::Scrape),
-        "fill" => sculpt_geom::Brush::Vertex(sculpt_geom::VertexBrush::Fill),
-        "draw_sharp" => sculpt_geom::Brush::Vertex(sculpt_geom::VertexBrush::DrawSharp),
-        "elastic_deform" => sculpt_geom::Brush::Vertex(sculpt_geom::VertexBrush::Elastic),
+        "snake_hook" => sculpt_geom::Brush::Dab(sculpt_geom::DabBrush::SnakeHook),
+        "thumb" => sculpt_geom::Brush::Dab(sculpt_geom::DabBrush::Thumb),
+        "rotate" => sculpt_geom::Brush::Dab(sculpt_geom::DabBrush::Rotate),
+        "nudge" => sculpt_geom::Brush::Dab(sculpt_geom::DabBrush::Nudge),
+        "blob" => sculpt_geom::Brush::Dab(sculpt_geom::DabBrush::Blob),
+        "scrape" => sculpt_geom::Brush::Dab(sculpt_geom::DabBrush::Scrape),
+        "fill" => sculpt_geom::Brush::Dab(sculpt_geom::DabBrush::Fill),
+        "draw_sharp" => sculpt_geom::Brush::Dab(sculpt_geom::DabBrush::DrawSharp),
+        "elastic_deform" => sculpt_geom::Brush::Dab(sculpt_geom::DabBrush::Elastic),
         "pose_lite" => sculpt_geom::Brush::Vertex(sculpt_geom::VertexBrush::PoseLite),
         "boundary_lite" => sculpt_geom::Brush::Vertex(sculpt_geom::VertexBrush::BoundaryLite),
         other => {
@@ -672,6 +673,16 @@ pub(super) fn parse_stroke(
             ));
         }
     };
+    if brush == sculpt_geom::Brush::Dab(sculpt_geom::DabBrush::Elastic)
+        && operation.contains_key("falloff")
+    {
+        // Blender's Elastic Grab has no falloff: its Kelvinlet fade is the only spatial factor.
+        return Err(engine.error(
+            ErrorCode::InvalidOperation,
+            "elastic_deform has no falloff; Blender's Elastic Grab uses its Kelvinlet fade",
+            "/falloff",
+        ));
+    }
     if operation
         .get("falloff")
         .is_some_and(|value| !value.is_string())
@@ -682,12 +693,13 @@ pub(super) fn parse_stroke(
             "/falloff",
         ));
     }
-    // Blender 5.2.2's essentials Clay Strips brush uses the SMOOTHER falloff preset, the other
-    // dab brushes SMOOTH. Potter's stroke carries no brush curve, so the default follows the brush.
-    let default_falloff = if brush == sculpt_geom::Brush::Dab(sculpt_geom::DabBrush::ClayStrips) {
-        "smoother"
-    } else {
-        "smooth"
+    // Blender 5.2.2's essentials presets: Clay Strips uses SMOOTHER, Draw Sharp uses POW4, and the
+    // other dab brushes use SMOOTH. Potter's stroke carries no brush curve, so the default follows
+    // the brush.
+    let default_falloff = match brush {
+        sculpt_geom::Brush::Dab(sculpt_geom::DabBrush::ClayStrips) => "smoother",
+        sculpt_geom::Brush::Dab(sculpt_geom::DabBrush::DrawSharp) => "pow4",
+        _ => "smooth",
     };
     let falloff = match operation
         .get("falloff")
@@ -696,6 +708,7 @@ pub(super) fn parse_stroke(
     {
         "smooth" => sculpt_geom::Falloff::Smooth,
         "smoother" => sculpt_geom::Falloff::Smoother,
+        "pow4" => sculpt_geom::Falloff::Pow4,
         "sphere" => sculpt_geom::Falloff::Sphere,
         "root" => sculpt_geom::Falloff::Root,
         "sharp" => sculpt_geom::Falloff::Sharp,
@@ -795,12 +808,17 @@ pub(super) fn parse_stroke(
         .get("delta")
         .map(|value| vector3(engine, Some(value), "/delta"))
         .transpose()?;
+    let view = operation
+        .get("view")
+        .map(|value| vector3(engine, Some(value), "/view"))
+        .transpose()?;
     Ok(sculpt_geom::Stroke {
         brush,
         samples,
         falloff,
         symmetry,
         delta,
+        view,
     })
 }
 

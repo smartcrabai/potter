@@ -565,15 +565,21 @@ pub(super) fn extract_geometry(
                             match (mode, &material.viewport_display) {
                                 // Workbench draws a viewport-displayed material through its transparent pass only
                                 // below full alpha (`Material::is_transparent`).
-                                (Mode::Solid, Some(viewport))
-                                    if viewport.diffuse_color[3] < 1.0 =>
-                                {
+                                (Mode::Solid, Some(viewport)) if viewport.diffuse_color[3] < 1.0 => {
                                     AlphaMode::Blend
                                 }
                                 (Mode::Solid, Some(_)) => AlphaMode::Opaque,
                                 _ => match material.alpha_mode.as_str() {
                                     "blend" => AlphaMode::Blend,
                                     "clip" => AlphaMode::Clip,
+                                    // EEVEE dithers a DITHERED graph's transparency; blending its alpha matches the dither's
+                                    // expectation. Potter's raster has no per-sample dither, so the blend stands in for it.
+                                    "opaque"
+                                        if matches!(mode, Mode::Beauty)
+                                            && material.node_tree.is_some() =>
+                                    {
+                                        AlphaMode::Blend
+                                    }
                                     _ => AlphaMode::Opaque,
                                 },
                             }
