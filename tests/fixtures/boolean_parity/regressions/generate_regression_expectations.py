@@ -31,7 +31,6 @@ import math
 import os
 import sys
 
-import bmesh
 import bpy
 from mathutils import Matrix, Vector
 
@@ -40,6 +39,8 @@ if bpy.app.version != (5, 2, 2):
 
 OUTPUT = os.path.realpath(sys.argv[sys.argv.index("--") + 1])
 EXPECTED = os.path.join(OUTPUT, "expected")
+# Pinned Boolean input meshes (dump_sphere_hosts.py), next to this script.
+HOSTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hosts")
 
 BOX_FACES = (
     (0, 3, 2, 1),  # bottom
@@ -108,44 +109,20 @@ def primitive(operator, name, **arguments):
     return obj
 
 
-def canonical_order(obj):
-    """Renumber a mesh so its order does not depend on the Blender process.
+def load_host(case, scene):
+    """The pinned sphere host `hosts/<case>.json` (see dump_sphere_hosts.py), as a scene object.
 
-    Blender 5.2.2's UV sphere primitive keeps the same vertex positions in every process but emits
-    them, and its faces, in an order that changes from run to run. Vertices are sorted by exact
-    position, each face starts at its lowest vertex index, and faces are sorted, so the Boolean
-    input (and the edge order Blender builds from it) is one fixed mesh per run.
+    The UV sphere is not generated here: Blender's primitive takes its float32 coordinates from the
+    platform libm, which differs between macOS and Linux by a few ulps, so each platform would
+    build a different Boolean input. The pinned file is the exact input the expectations came from.
     """
-    mesh = obj.data
-    coords = [tuple(vertex.co) for vertex in mesh.vertices]
-    order = sorted(range(len(coords)), key=lambda index: coords[index])
-    renumber = {old: new for new, old in enumerate(order)}
-    faces = []
-    for polygon in mesh.polygons:
-        ring = [renumber[index] for index in polygon.vertices]
-        start = ring.index(min(ring))
-        faces.append(tuple(ring[start:] + ring[:start]))
-    faces.sort()
-    mesh.clear_geometry()
-    mesh.from_pydata([coords[index] for index in order], [], faces)
-    mesh.update()
-
-
-def uv_sphere(name, segments, open_top):
-    obj = primitive(
-        bpy.ops.mesh.primitive_uv_sphere_add, name,
-        segments=segments, ring_count=segments // 2, radius=1.0,
+    with open(os.path.join(HOSTS, case + ".json")) as handle:
+        data = json.load(handle)
+    return mesh_object(
+        case, scene, ([tuple(vertex) for vertex in data["verts"]],
+                      [tuple(face) for face in data["faces"]]),
+        edges=[tuple(edge) for edge in data["edges"]],
     )
-    canonical_order(obj)
-    if open_top:
-        # Same cut as the probes: faces with every vertex above z = 0.95 are removed.
-        bm = bmesh.new()
-        bm.from_mesh(obj.data)
-        cap = [face for face in bm.faces if all(vert.co.z > 0.95 for vert in face.verts)]
-        bmesh.ops.delete(bm, geom=cap, context="FACES")
-        bm.to_mesh(obj.data)
-        bm.free()
-    return obj
 
 
 def boolean(host, operation, solver, *, operand=None, collection=None, use_self=False,
@@ -397,14 +374,14 @@ def build_scene(scene):
     boolean(host, "DIFFERENCE", "EXACT", operand=cutter)
     add("cavity_wall_normal", "h", host)
 
-    # i: open and closed UV spheres with use_hole_tolerant.
-    for case, segments, open_top, hole_tolerant in (
-        ("sphere_open64_hole_tolerant_on", 64, True, True),
-        ("sphere_open64_hole_tolerant_off", 64, True, False),
-        ("sphere_open128_hole_tolerant_on", 128, True, True),
-        ("sphere_closed64_hole_tolerant_on", 64, False, True),
+    # i: open and closed UV spheres with use_hole_tolerant. The hosts are pinned (load_host).
+    for case, hole_tolerant in (
+        ("sphere_open64_hole_tolerant_on", True),
+        ("sphere_open64_hole_tolerant_off", False),
+        ("sphere_open128_hole_tolerant_on", True),
+        ("sphere_closed64_hole_tolerant_on", True),
     ):
-        host = uv_sphere(case, segments, open_top)
+        host = load_host(case, scene)
         cutter = primitive(
             bpy.ops.mesh.primitive_cube_add, case + ".cutter", size=1.0, location=(0.9, 0.0, 0.0)
         )

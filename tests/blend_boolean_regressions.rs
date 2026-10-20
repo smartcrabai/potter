@@ -11,7 +11,14 @@
 //!   empty slot as `null`, and the cutter materials after it.
 //! - g: touching cubes rotated about Z, in world space (the rot.py reviewer probe).
 //! - h: a cavity wall keeps the cutter's custom normal, flipped: (-1,0,0) appears as (1,0,0).
-//! - i: open and closed UV spheres with `use_hole_tolerant` (counts, face sizes, volume).
+//! - i: open and closed UV spheres with `use_hole_tolerant` (counts, face sizes, volume). Their hosts
+//!   are pinned in `regressions/hosts/` (exact float32 bits, `dump_sphere_hosts.py`), because Blender's
+//!   UV-sphere primitive differs by a few ulps between macOS arm64 and Linux x86_64 libm.
+//!
+//! Platform note (known gap): the expectations are recorded with macOS arm64 Blender 5.2.2. On
+//! identical input, Linux x86_64 Blender 5.2.2 gives a different result for `rotated_touch_10`
+//! (16 vertices, 24 edges, 12 faces against 20, 32, 14) and a last-bit different `volume` for
+//! `rotated_touch_61`. Potter follows the macOS result on every platform; the gap is Blender's.
 //!
 //! The six reviewer-verified corpus cases are asserted by `blend_boolean_parity.rs`.
 //!
