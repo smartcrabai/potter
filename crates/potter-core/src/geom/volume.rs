@@ -1279,8 +1279,8 @@ mod tests {
     };
 
     use super::{
-        VolumeData, VolumeGrid, cubic_weights, mesh_to_volume, sample_density, sample_density_checked,
-        sample_density_with, volume_to_mesh,
+        VolumeData, VolumeGrid, cubic_weights, mesh_to_volume, sample_density,
+        sample_density_checked, sample_density_with, volume_to_mesh,
     };
     use crate::model::VolumeInterpolation;
 
@@ -1400,7 +1400,10 @@ mod tests {
                 .map(|(weight, offset)| weight * offset)
                 .sum();
             assert!((total - 1.0).abs() <= 1.0e-12, "t {t}: sum {total}");
-            assert!((centroid - t).abs() <= 1.0e-12, "t {t}: centroid {centroid}");
+            assert!(
+                (centroid - t).abs() <= 1.0e-12,
+                "t {t}: centroid {centroid}"
+            );
         }
     }
 
@@ -1413,7 +1416,10 @@ mod tests {
         for z in 0..dims[2] {
             for y in 0..dims[1] {
                 for x in 0..dims[0] {
-                    values.push((1.0 + 0.1 * f64::from(x) + 0.2 * f64::from(y) + 0.05 * f64::from(z)) as f32);
+                    values.push(
+                        (1.0 + 0.1 * f64::from(x) + 0.2 * f64::from(y) + 0.05 * f64::from(z))
+                            as f32,
+                    );
                 }
             }
         }
@@ -1428,11 +1434,18 @@ mod tests {
             }],
             ..VolumeData::default()
         };
-        for coordinate in [DVec3::new(3.25, 4.5, 2.75), DVec3::new(2.5, 2.5, 5.9), DVec3::new(4.0, 3.0, 3.0)] {
+        for coordinate in [
+            DVec3::new(3.25, 4.5, 2.75),
+            DVec3::new(2.5, 2.5, 5.9),
+            DVec3::new(4.0, 3.0, 3.0),
+        ] {
             let expected = 1.0 + 0.1 * coordinate.x + 0.2 * coordinate.y + 0.05 * coordinate.z;
             let actual = sample_density_with(coordinate, &volume, VolumeInterpolation::Cubic);
             // f32 storage of the samples bounds the error at about 1e-7 relative.
-            assert!((actual - expected).abs() <= 1.0e-6, "{coordinate:?}: {actual} vs {expected}");
+            assert!(
+                (actual - expected).abs() <= 1.0e-6,
+                "{coordinate:?}: {actual} vs {expected}"
+            );
         }
     }
 
@@ -1452,8 +1465,16 @@ mod tests {
             }],
             ..VolumeData::default()
         };
-        let edge = sample_density_with(DVec3::new(0.5, 3.5, 3.5), &volume, VolumeInterpolation::Cubic);
-        let interior = sample_density_with(DVec3::new(3.5, 3.5, 3.5), &volume, VolumeInterpolation::Cubic);
+        let edge = sample_density_with(
+            DVec3::new(0.5, 3.5, 3.5),
+            &volume,
+            VolumeInterpolation::Cubic,
+        );
+        let interior = sample_density_with(
+            DVec3::new(3.5, 3.5, 3.5),
+            &volume,
+            VolumeInterpolation::Cubic,
+        );
         assert!((edge - (1.0 - 1.0 / 48.0)).abs() <= 1.0e-6, "edge {edge}");
         assert!((interior - 1.0).abs() <= 1.0e-6, "interior {interior}");
     }
