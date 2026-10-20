@@ -869,7 +869,18 @@ fn trace_path(
         });
         let segment_limit = light.map_or(surface_distance, |light| light.distance);
         let environment = world_radiance(doc, &snapshot.scene_id, images, direction, environment)?;
-        let volume_segment = trace_volume_segment(volumes, origin, direction, segment_limit, rng)?;
+        // The exit probe is a local intersection inside the object (`subsurface_disk`), not a light path: no volume
+        // transport, emission or scatter applies along it, so it takes the neutral segment.
+        let volume_segment = if exit_pending {
+            VolumeSegment {
+                transmittance: 1.0,
+                emission: DVec3::ZERO,
+                event: None,
+                stochastic: false,
+            }
+        } else {
+            trace_volume_segment(volumes, origin, direction, segment_limit, rng)?
+        };
         radiance += throughput * volume_segment.emission;
         if !volume_segment.stochastic {
             throughput *= volume_segment.transmittance;
@@ -1039,10 +1050,10 @@ fn trace_path(
                 rng,
                 evaluator_workspace,
             )?;
-        // Cycles schedules the next segment with the budget flag set, and that segment's vertex still gets its direct
-        // light before the path ends. A Burley entry at the last bounce is sampled, and its exit is that extra vertex;
-        // any other scatter at the budget ends the path (`shade_surface.h`, `PATH_RAY_TERMINATE_AFTER_TRANSPARENT`).
-        if bounce > max_bounces || (bounce == max_bounces && !burley_active(&surface.params)) {
+        // The budget is spent by `path_state_next` only: a subsurface entry returns before it (`subsurface_bounce`), so
+        // its exit keeps the entry's bounce count. A Burley entry at the last bounce is sampled, and its exit is the
+        // vertex that still gets direct light; any other scatter at the budget ends the path (`shade_surface.h`).
+        if bounce >= max_bounces && !burley_active(&surface.params) {
             break;
         }
         let sampled = sample_bsdf(
@@ -1053,14 +1064,13 @@ fn trace_path(
         );
         if let BsdfSample::Subsurface { weight: entry } = sampled {
             // The path enters the surface and leaves at a probed exit, which is shaded as diffuse next (Cycles'
-            // `subsurface_bounce` and `subsurface_scatter`). The entry is one bounce; the probe is no light's path.
+            // `subsurface_bounce` and `subsurface_scatter`). The entry takes no bounce; the probe is no light's path.
             let Some(exit) = burley_exit(geometry, bvh, &surface, rng) else {
                 break;
             };
             exit_backfacing = intrinsic_normal(geometry, hit.triangle_index)
                 .is_some_and(|normal| normal.dot(direction) > 0.0);
             throughput *= entry * exit.weight;
-            bounce += 1;
             origin = exit.origin;
             direction = exit.direction;
             exit_hit = Some(exit.hit);
@@ -2321,19 +2331,20 @@ fn sample_bsdf(
         let direction = sample_cosine_hemisphere(normal, rng).0;
         return continuous_sample(params, layers, direction, true);
     }
-    let direction = if choice < sheen_end {
+    // Cycles' sheen samples are `LABEL_REFLECT | LABEL_DIFFUSE` (`bsdf_sheen.h`), so they set the diffuse ancestor.
+    let (direction, diffuse) = if choice < sheen_end {
         let first = rng.next_f64();
         let second = rng.next_f64();
-        layers.sample_sheen(first, second)
+        (layers.sample_sheen(first, second), true)
     } else if choice < coat_end {
         let half_vector =
             sample_ggx_half(params.coat_normal_or_shading(), params.coat_roughness, rng);
-        reflect(-view, half_vector).normalize_or_zero()
+        (reflect(-view, half_vector).normalize_or_zero(), false)
     } else {
         let half_vector = sample_ggx_half(normal, params.roughness, rng);
-        reflect(-view, half_vector).normalize_or_zero()
+        (reflect(-view, half_vector).normalize_or_zero(), false)
     };
-    continuous_sample(params, layers, direction, false)
+    continuous_sample(params, layers, direction, diffuse)
 }
 
 /// The estimator `f cos / p_mix` of a continuous direction. The density is the lobe mixture, not the
@@ -2453,7 +2464,13 @@ fn burley_exit(
     );
     let (seen, mut found) = probe.finish();
     // The recorded hits are sorted by distance (`sort_intersections_and_normals`), so the resample has a fixed order.
-    found.sort_by(|a, b| a.0.total_cmp(&b.0));
+    // The empty slots of the fixed array sort last.
+    found.sort_by(|a, b| match (a, b) {
+        (Some(a), Some(b)) => a.0.total_cmp(&b.0),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
     // Hits the reservoir replaced still count: `w *= num_hits / max_hits` (`subsurface_disk`).
     let reservoir_scale = if seen > MAX_HITS {
         seen as f64 / MAX_HITS as f64
@@ -2461,18 +2478,16 @@ fn burley_exit(
         1.0
     };
     let disk_pdf = pdf_mean(radius, mask, disk_radius);
-    if disk_pdf <= 0.0 || found.is_empty() {
+    if disk_pdf <= 0.0 || found.iter().all(Option::is_none) {
         return None;
     }
-    let mut weighted: Vec<(BvhHit, DVec3, DVec3)> = Vec::with_capacity(found.len());
+    let mut weighted: [Option<(BvhHit, DVec3, DVec3)>; MAX_HITS] = [None; MAX_HITS];
+    let mut count = 0;
     let mut total = 0.0;
-    for (_, (hit, from)) in found {
-        let Some(triangle) = geometry.triangles.get(hit.triangle_index) else {
+    for (_, (hit, from)) in found.into_iter().flatten() {
+        let Some(ng) = intrinsic_normal(geometry, hit.triangle_index) else {
             continue;
         };
-        let ng = (triangle.positions[1] - triangle.positions[0])
-            .cross(triangle.positions[2] - triangle.positions[0])
-            .normalize_or_zero();
         let point = from + direction * hit.distance;
         let pdf_n = pick_pdf[0] * disk_normal.dot(ng).abs();
         let pdf_t = pick_pdf[1] * disk_tangent.dot(ng).abs();
@@ -2487,7 +2502,8 @@ fn burley_exit(
         let distance = (point - surface.point).length();
         let weight = burley_eval(radius, mask, distance) / disk_pdf * mis * reservoir_scale;
         total += weight.abs().element_sum() / 3.0;
-        weighted.push((hit, from, weight));
+        weighted[count] = Some((hit, from, weight));
+        count += 1;
     }
     if total <= 0.0 {
         return None;
@@ -2495,7 +2511,7 @@ fn burley_exit(
     // Importance resampling: one hit, chosen in proportion to its mean weight.
     let target = rng.next_f64() * total;
     let mut partial = 0.0;
-    for (hit, from, weight) in weighted {
+    for (hit, from, weight) in weighted.into_iter().take(count).flatten() {
         let average = weight.abs().element_sum() / 3.0;
         partial += average;
         if average > 0.0 && target < partial {

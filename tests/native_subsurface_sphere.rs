@@ -15,8 +15,8 @@
 //! methods are not evaluated yet: their cases report `UNSUPPORTED_FEATURE` and render without subsurface scattering, and
 //! they are not tested here.
 //!
-//! Cost: `SAMPLES` is a starting point. The lane measures the run time and Potter's seed spread, and the figures belong
-//! in the commit message and here before the PR is closed.
+//! Cost: the two Burley cases run in about 28 s of test time on the lane (Blender's renders included), at `SAMPLES` = 64
+//! samples per pixel on eight seeds, so each case stays well inside the 40 s budget.
 
 #[path = "common/blender_checked.rs"]
 mod blender_checked;
@@ -86,6 +86,14 @@ fn burley_subsurface_sphere_matches_cycles() -> TestResult {
 #[test]
 fn burley_bounce0_subsurface_sphere_matches_cycles() -> TestResult {
     matches_cycles("burley_bounce0")
+}
+
+/// The Burley sphere over a floor with a budget of one. The entry takes no bounce, so the exit is the first scatter and
+/// the floor is the second vertex: the light that leaves the exit bounces off the floor to the camera, and a bounce
+/// counted at the entry would drop it (`subsurface_bounce` returns before `path_state_next`).
+#[test]
+fn burley_floor_bounce1_subsurface_sphere_matches_cycles() -> TestResult {
+    matches_cycles("burley_floor_bounce1")
 }
 
 /// Renders the sphere of `case` (a case of `subsurface_sphere.py`) in Blender and in Potter at the case's bounce

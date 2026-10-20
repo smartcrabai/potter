@@ -50,9 +50,12 @@ pub(crate) fn exit_params(params: &BsdfParams) -> BsdfParams {
 }
 
 /// Whether a Principled BSDF with these parameters has a subsurface closure Potter evaluates: a Subsurface Weight
-/// above zero under the Burley method. The random walk methods are reported as unsupported and drop out here.
+/// above zero under the Burley method, and not Thin Wall. Thin Wall takes Cycles' thin-subsurface closure and creates
+/// no BSSRDF (`svm/closure.h`, `bsdf_thin_subsurface_setup`). The random walk methods are reported as unsupported.
 pub(crate) fn burley_active(params: &BsdfParams) -> bool {
-    params.subsurface_weight > 0.0 && params.subsurface_method == SubsurfaceMethod::Burley
+    params.subsurface_weight > 0.0
+        && !params.thin_wall
+        && params.subsurface_method == SubsurfaceMethod::Burley
 }
 
 /// The Burley mean free path of each channel: `subsurface_radius × subsurface_scale × 0.25 / π`, clamped at zero
@@ -86,7 +89,7 @@ pub(crate) fn pdf(d: f64, r: f64) -> f64 {
 }
 
 /// `bssrdf_burley_root_find`: the scaled radius `x` with `1 - ¼e^{-x} - ¾e^{-x/3} = xi`, by Newton's method from a
-/// fit to the curve (Cycles' twelve-step bound is kept: the iteration stops at its tolerance first).
+/// fit to the curve (Cycles' ten-iteration bound is kept: the iteration stops at its tolerance first).
 pub(crate) fn root_find(xi: f64) -> f64 {
     const TOLERANCE: f64 = 1.0e-6;
     const MAX_ITERATIONS: usize = 10;
@@ -171,16 +174,16 @@ pub(crate) fn lcg_step(state: &mut u32) -> u32 {
 /// is skipped; the first `MAX_HITS` are stored; a later hit replaces the stored hit at slot `lcg_step % seen` when
 /// that slot is below `MAX_HITS`, so each hit is kept with probability `MAX_HITS / seen`. `seen` counts every hit.
 pub(crate) struct ProbeHits<T> {
-    hits: Vec<(f64, T)>,
+    hits: [Option<(f64, T)>; MAX_HITS],
     seen: usize,
     lcg: u32,
 }
 
-impl<T> ProbeHits<T> {
+impl<T: Copy> ProbeHits<T> {
     /// A probe whose reservoir generator starts from `seed`.
     pub(crate) fn new(seed: u32) -> Self {
         Self {
-            hits: Vec::with_capacity(MAX_HITS),
+            hits: [None; MAX_HITS],
             seen: 0,
             lcg: seed,
         }
@@ -192,23 +195,25 @@ impl<T> ProbeHits<T> {
         if self
             .hits
             .iter()
+            .flatten()
             .any(|(stored, _)| stored.to_bits() == t.to_bits())
         {
             return;
         }
         self.seen += 1;
         if self.seen <= MAX_HITS {
-            self.hits.push((t, item));
+            self.hits[self.seen - 1] = Some((t, item));
             return;
         }
         let slot = lcg_step(&mut self.lcg) % self.seen as u32;
         if (slot as usize) < MAX_HITS {
-            self.hits[slot as usize] = (t, item);
+            self.hits[slot as usize] = Some((t, item));
         }
     }
 
-    /// The number of hits seen and the stored hits, in the order they were stored.
-    pub(crate) fn finish(self) -> (usize, Vec<(f64, T)>) {
+    /// The number of hits seen, and the stored hits: slots `0..min(seen, MAX_HITS)` are filled, in the order they were
+    /// stored, and the rest are `None`.
+    pub(crate) fn finish(self) -> (usize, [Option<(f64, T)>; MAX_HITS]) {
         (self.seen, self.hits)
     }
 }
@@ -355,9 +360,10 @@ mod tests {
         }
         let (seen, hits) = probe.finish();
         assert_eq!(seen, 10);
-        assert_eq!(hits.len(), MAX_HITS);
+        assert_eq!(hits.iter().flatten().count(), MAX_HITS);
         assert!(
             hits.iter()
+                .flatten()
                 .all(|(t, index)| (*t - *index as f64).abs() < 1.0e-12)
         );
     }
@@ -372,15 +378,15 @@ mod tests {
         probe.record(0.0, 9);
         let (seen, hits) = probe.finish();
         assert_eq!(seen, 2);
-        assert_eq!(hits.len(), 2);
+        assert_eq!(hits.iter().flatten().count(), 2);
     }
 
     #[test]
-    fn probe_reservoir_matches_the_cycles_reference() {
-        // The outcomes are those of Cycles' reservoir on `lcg_step_uint`, run as a reference for twelve hits at
-        // distances 0..12. The slot is `lcg % seen`, which reads the generator's low bits, so the kept hits are not
-        // uniform over the hits. Cycles has that bias too, and the port keeps it, so the outcomes are pinned rather
-        // than tested for uniformity.
+    fn probe_reservoir_outcomes_are_pinned() {
+        // A regression pin, not an external reference: the outcomes for twelve hits at distances 0..12 were produced by
+        // a Python transcription of Cycles' reservoir (`lcg_step_uint`, `local_intersect_get_record_index`) that is not
+        // in the repository. The slot is `lcg % seen`, which reads the generator's low bits, so the kept hits are not
+        // uniform over the hits. Cycles has that bias too, and the port keeps it, so the outcomes are pinned.
         for (seed, expected) in [
             (1u32, vec![1usize, 3, 4, 10]),
             (7, vec![0, 1, 10, 11]),
@@ -394,6 +400,7 @@ mod tests {
                 .finish()
                 .1
                 .into_iter()
+                .flatten()
                 .map(|(_, index)| index)
                 .collect();
             kept.sort_unstable();

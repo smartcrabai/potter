@@ -54,15 +54,10 @@ pub(crate) struct LobeProbabilities {
 pub(crate) fn lobe_probabilities(params: &BsdfParams, layers: &Layers) -> LobeProbabilities {
     let metallic = params.metallic.clamp(0.0, 1.0);
     let transmission = params.transmission.clamp(0.0, 1.0);
-    // The Burley subsurface closure takes its Subsurface Weight from the diffuse share (Cycles' diffuse weight is
-    // `base × (1 - subsurface weight) × weight`, `svm/closure.h`).
-    let subsurface_share = if burley_active(params) {
-        params.subsurface_weight.clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    let diffuse_weight =
-        ((1.0 - metallic) * (1.0 - transmission) * (1.0 - subsurface_share)).max(0.0);
+    // The diffuse lobe keeps `base × subsurface_share` per channel (`diffuse_lobe`): a channel with no radius keeps its
+    // full diffuse. The diffuse branch is chosen with the channel average of that share, so it is never starved.
+    let diffuse_share = subsurface_share(params).element_sum() / 3.0;
+    let diffuse_weight = ((1.0 - metallic) * (1.0 - transmission) * diffuse_share).max(0.0);
     // The subsurface closure's sample weight is its mean channel weight times the channels it covers
     // (`bssrdf_setup`, `sample_weight = |average(weight)| * channels`).
     let covered_channels = channel_mask(burley_radius(params))

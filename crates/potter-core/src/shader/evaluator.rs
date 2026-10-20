@@ -217,10 +217,6 @@ pub struct BsdfParams {
     pub subsurface_scale: f64,
     /// Cycles' subsurface method (`SubsurfaceMethod`), read from the Principled node's `subsurface_method` property.
     pub subsurface_method: SubsurfaceMethod,
-    /// The Principled Subsurface IOR, used by the random walk skin method's refractive entry.
-    pub subsurface_ior: f64,
-    /// The Principled Subsurface Anisotropy, the phase function's g of the random walk.
-    pub subsurface_anisotropy: f64,
     pub coat_weight: f64,
     pub coat_roughness: f64,
     pub coat_ior: f64,
@@ -320,8 +316,6 @@ impl BsdfParams {
             subsurface_radius: [1.0, 0.2, 0.1],
             subsurface_scale: 0.005,
             subsurface_method: SubsurfaceMethod::default(),
-            subsurface_ior: 1.4,
-            subsurface_anisotropy: 0.0,
             coat_weight: 0.0,
             coat_roughness: 0.03,
             coat_ior: 1.5,
@@ -467,11 +461,6 @@ impl BsdfParams {
             subsurface_radius: mix3(first.subsurface_radius, second.subsurface_radius),
             subsurface_scale: mix_scalar(first.subsurface_scale, second.subsurface_scale),
             subsurface_method: SubsurfaceMethod::of_arms(&first, &second),
-            subsurface_ior: mix_scalar(first.subsurface_ior, second.subsurface_ior),
-            subsurface_anisotropy: mix_scalar(
-                first.subsurface_anisotropy,
-                second.subsurface_anisotropy,
-            ),
             coat_weight: coat.weight,
             coat_roughness: coat.roughness,
             coat_ior: mix_scalar(first.coat_ior, second.coat_ior),
@@ -550,17 +539,6 @@ impl BsdfParams {
             subsurface_radius: add3(first.subsurface_radius, second.subsurface_radius),
             subsurface_scale: first.subsurface_scale.max(second.subsurface_scale),
             subsurface_method: SubsurfaceMethod::of_arms(&first, &second),
-            // Add has no single IOR or anisotropy for two closures: the arm with the larger subsurface weight gives them.
-            subsurface_ior: if second.subsurface_weight > first.subsurface_weight {
-                second.subsurface_ior
-            } else {
-                first.subsurface_ior
-            },
-            subsurface_anisotropy: if second.subsurface_weight > first.subsurface_weight {
-                second.subsurface_anisotropy
-            } else {
-                first.subsurface_anisotropy
-            },
             coat_weight: coat.weight,
             coat_roughness: coat.roughness,
             coat_ior: first.coat_ior,
@@ -1523,8 +1501,6 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
         let method = method_token.as_str();
         params.subsurface_method = SubsurfaceMethod::parse(method)
             .ok_or_else(|| invalid(format!("unknown Principled subsurface method `{method}`")))?;
-        params.subsurface_ior = self.scalar_input(id, &["Subsurface IOR"], 1.4)?;
-        params.subsurface_anisotropy = self.scalar_input(id, &["Subsurface Anisotropy"], 0.0)?;
         params.coat_weight = self.scalar_input(id, &["Coat Weight", "Clearcoat"], 0.0)?;
         params.coat_roughness =
             self.scalar_input(id, &["Coat Roughness", "Clearcoat Roughness"], 0.03)?;
