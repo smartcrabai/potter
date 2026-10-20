@@ -74,6 +74,7 @@ pub fn run(args: RenderArgs) -> Result<(Option<SceneInfo>, Value)> {
         || settings.samples == 0
         || settings.samples > 1_000_000
         || settings.max_bounces > 1024
+        || settings.transparent_max_bounces > 1024
     {
         return Err(PotError::new(
             ErrorCode::SceneInvalid,

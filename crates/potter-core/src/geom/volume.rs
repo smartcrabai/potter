@@ -1629,7 +1629,7 @@ pub fn mesh_to_volume(mesh: &Mesh, voxel_size: f64, padding: u32) -> Result<Volu
     }
 
     let triangles = mesh
-        .triangulate()
+        .tessellate()
         .map_err(|error| invalid_mesh_input(&error))?;
     let vertex_positions: HashMap<_, _> = mesh
         .vertices

@@ -15,7 +15,11 @@ use serde_json::{Value, json};
 use crate::{
     error::{ErrorCode, PotError, Result},
     eval::animation::animated_transform,
-    geom::{Mesh, uv_layers},
+    geom::{
+        Mesh,
+        blender_matrix::{blender_matrix_from_f64, blender_mul_m4, dmat4_from_blender},
+        uv_layers,
+    },
     model::{
         ArmatureData, Constraint, ConstraintType, DataBlock, Driver, DriverType, DriverVariable,
         DriverVariableType, Id, Modifier, Node, ParentType, PoseBone, SceneDoc, ShapeKeyData,
@@ -626,7 +630,7 @@ fn evaluate_armature_bone_world_matrices_with_meshes(
         )
     })?;
     let mut pose = crate::eval::animation::animated_pose_bones(node, doc, frame)?;
-    apply_pose_drivers(armature_node_id, &mut pose, driver_values)?;
+    apply_pose_drivers(armature_node_id, armature, &mut pose, driver_values)?;
     apply_spline_ik(
         armature_node_id,
         armature,
@@ -2627,7 +2631,7 @@ pub(crate) fn apply_armature_modifier_with_drivers(
         )
     })?;
     let mut pose = crate::eval::animation::animated_pose_bones(armature_node, doc, frame)?;
-    apply_pose_drivers(&armature_id, &mut pose, driver_values)?;
+    apply_pose_drivers(&armature_id, armature, &mut pose, driver_values)?;
     apply_spline_ik(
         &armature_id,
         armature,
@@ -2865,7 +2869,12 @@ fn evaluate_world_matrices_with_meshes(
             }
         }
         let animated = animated_transform(node, doc, frame)?;
-        let local = apply_transform_drivers(id, animated, driver_values)?.matrix();
+        let effective_transform = apply_transform_drivers(id, animated, driver_values)?;
+        let captured_matrix_basis = node.captured_matrix_basis(&effective_transform)?;
+        let local = captured_matrix_basis.map_or_else(
+            || effective_transform.matrix(),
+            |matrix| DMat4::from_cols_array(&matrix),
+        );
         let parent_inverse = node
             .parent_inverse
             .map_or(DMat4::IDENTITY, |array| DMat4::from_cols_array(&array));
@@ -2910,7 +2919,19 @@ fn evaluate_world_matrices_with_meshes(
             } else {
                 parent_world
             };
-            parent_space * parent_inverse * local
+            if captured_matrix_basis.is_some() {
+                let parent_space_and_inverse = blender_mul_m4(
+                    &blender_matrix_from_f64(parent_space),
+                    &blender_matrix_from_f64(parent_inverse),
+                );
+                let world =
+                    blender_mul_m4(&parent_space_and_inverse, &blender_matrix_from_f64(local));
+                dmat4_from_blender(&world)
+            } else {
+                parent_space * parent_inverse * local
+            }
+        } else if captured_matrix_basis.is_some() {
+            local
         } else {
             parent_inverse * local
         };
@@ -5881,7 +5902,7 @@ fn shrinkwrap_target_hit(
     ) {
         return Err(evaluation_error("shrinkwrap type is invalid"));
     }
-    let triangles = mesh.triangulate().map_err(|error| {
+    let triangles = mesh.tessellate().map_err(|error| {
         evaluation_error(format!("shrinkwrap target triangulation failed: {error}"))
     })?;
     if shrink_type == "PROJECT" {
@@ -7122,11 +7143,17 @@ fn animated_pose_channel(
         return Ok(None);
     }
     let pose = crate::eval::animation::animated_pose_bones(node, doc, frame)?;
-    Ok(pose_channel(&pose, path, index))
+    let armature = node
+        .data
+        .as_ref()
+        .and_then(|data_id| doc.data_blocks.get(data_id))
+        .and_then(|data| data.armature.as_ref());
+    Ok(pose_channel(&pose, armature, path, index))
 }
 
 fn apply_pose_drivers(
     node_id: &Id,
+    armature: &ArmatureData,
     pose_bones: &mut BTreeMap<Id, PoseBone>,
     drivers: &BTreeMap<(Id, String, u32), f64>,
 ) -> Result<()> {
@@ -7134,15 +7161,18 @@ fn apply_pose_drivers(
         if target_id != node_id {
             continue;
         }
-        let Some((bone_id, channel)) = pose_channel_path(path) else {
+        let Some((bone_key, channel)) = pose_channel_path(path) else {
             continue;
         };
-        let pose = pose_bones.get_mut(&bone_id).ok_or_else(|| {
+        let bone_id = pose_driver_bone_id(armature, bone_key).ok_or_else(|| {
             evaluation_error_with(
                 "pose driver targets an unknown bone",
-                json!({ "node": node_id, "bone_id": bone_id }),
+                json!({ "node": node_id, "bone_id": bone_key }),
             )
         })?;
+        // A bone the node has not posed still exists in the armature; it starts at rest, as
+        // evaluate_bone_matrices treats a missing pose entry.
+        let pose = pose_bones.entry(bone_id).or_default();
         let values = match channel {
             "location" | "translation" => &mut pose.translation[..],
             "rotation" => &mut pose.rotation[..],
@@ -7152,7 +7182,7 @@ fn apply_pose_drivers(
         if !value.is_finite() {
             return Err(evaluation_error_with(
                 "pose driver value is non-finite",
-                json!({ "node": node_id, "bone_id": bone_id, "path": path }),
+                json!({ "node": node_id, "bone_id": bone_key, "path": path }),
             ));
         }
         set_component(values, *index, *value, path)?;
@@ -7160,8 +7190,33 @@ fn apply_pose_drivers(
     Ok(())
 }
 
-fn pose_channel(pose_bones: &BTreeMap<Id, PoseBone>, path: &str, index: u32) -> Option<f64> {
-    let (bone_id, channel) = pose_channel_path(path)?;
+/// Resolves a pose driver's bone reference like a constraint subtarget: the bone ID first, then the
+/// bone name that Blender's `pose.bones["name"]` paths use. Names such as `Arm.L` are not Potter IDs,
+/// so the raw key is matched directly.
+fn pose_driver_bone_id(armature: &ArmatureData, key: &str) -> Option<Id> {
+    if let Ok(id) = Id::new(key)
+        && armature.bones.contains_key(&id)
+    {
+        return Some(id);
+    }
+    armature
+        .bones
+        .iter()
+        .find(|(_, bone)| bone.name == key)
+        .map(|(bone_id, _)| bone_id.clone())
+}
+
+fn pose_channel(
+    pose_bones: &BTreeMap<Id, PoseBone>,
+    armature: Option<&ArmatureData>,
+    path: &str,
+    index: u32,
+) -> Option<f64> {
+    let (bone_key, channel) = pose_channel_path(path)?;
+    let bone_id = match armature {
+        Some(armature) => pose_driver_bone_id(armature, bone_key)?,
+        None => Id::new(bone_key).ok()?,
+    };
     let pose = pose_bones.get(&bone_id)?;
     let values = match channel {
         "location" | "translation" => &pose.translation[..],
@@ -7172,19 +7227,18 @@ fn pose_channel(pose_bones: &BTreeMap<Id, PoseBone>, path: &str, index: u32) -> 
     values.get(usize::try_from(index).ok()?).copied()
 }
 
-fn pose_channel_path(path: &str) -> Option<(Id, &str)> {
-    let (bone_key, channel) = if let Some(start) = path.find("pose.bones[") {
+fn pose_channel_path(path: &str) -> Option<(&str, &str)> {
+    if let Some(start) = path.find("pose.bones[") {
         let start = start + "pose.bones[".len();
         let end = path[start..].find(']')? + start;
-        (
+        Some((
             path[start..end].trim_matches(['"', '\'']),
             path[end + 1..].trim_start_matches('.'),
-        )
+        ))
     } else {
         let rest = path.strip_prefix("pose.")?;
-        rest.split_once('.')?
-    };
-    Some((Id::new(bone_key).ok()?, channel))
+        rest.split_once('.')
+    }
 }
 
 fn shape_key_value_from_path(shape_keys: &ShapeKeyData, path: &str) -> Option<f64> {

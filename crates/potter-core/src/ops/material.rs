@@ -2,7 +2,7 @@ use serde_json::{Map, Value};
 
 use crate::{
     error::{ErrorCode, Result},
-    image::ImageInterpolation,
+    image::{ImageExtension, ImageInterpolation},
     model::{Id, Material, TextureRef},
 };
 
@@ -42,6 +42,7 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             "metallic",
             "roughness",
             "double_sided",
+            "use_transparent_shadow",
             "emission_color",
             "emission_strength",
             "transmission",
@@ -80,7 +81,6 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
         emission_strength: 0.0,
         transmission: 0.0,
         ior: 1.5,
-        double_sided: false,
         ..Material::default()
     };
     if let Some(value) = operation.get("alpha_mode") {
@@ -149,6 +149,10 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
     }
     if operation.contains_key("double_sided") {
         material.double_sided = read_bool(engine, operation, "double_sided", false)?;
+    }
+    if operation.contains_key("use_transparent_shadow") {
+        material.use_transparent_shadow =
+            read_bool(engine, operation, "use_transparent_shadow", true)?;
     }
     if let Some(value) = operation.get("emission_color") {
         material.emission_color = read_emission_color(
@@ -247,6 +251,7 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             "metallic",
             "roughness",
             "double_sided",
+            "use_transparent_shadow",
             "emission_color",
             "emission_strength",
             "transmission",
@@ -348,6 +353,18 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                     ErrorCode::InvalidOperation,
                     "double_sided must be a boolean",
                     &operation_pointer(engine.operation_index, "set/double_sided"),
+                )
+            })
+        })
+        .transpose()?;
+    let use_transparent_shadow = set
+        .get("use_transparent_shadow")
+        .map(|value| {
+            value.as_bool().ok_or_else(|| {
+                engine.error(
+                    ErrorCode::InvalidOperation,
+                    "use_transparent_shadow must be a boolean",
+                    &operation_pointer(engine.operation_index, "set/use_transparent_shadow"),
                 )
             })
         })
@@ -506,6 +523,12 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                 && material.double_sided != value
             {
                 material.double_sided = value;
+                item_changed = true;
+            }
+            if let Some(value) = use_transparent_shadow
+                && material.use_transparent_shadow != value
+            {
+                material.use_transparent_shadow = value;
                 item_changed = true;
             }
             if let Some(value) = &base_color_texture
@@ -753,7 +776,7 @@ fn parse_texture_ref(
         )
     })?;
     for key in object.keys() {
-        if !["image", "uv_layer", "interpolation"].contains(&key.as_str()) {
+        if !["image", "uv_layer", "interpolation", "extension"].contains(&key.as_str()) {
             return Err(engine.error(
                 ErrorCode::InvalidOperation,
                 format!("unknown texture reference field `{key}`"),
@@ -813,10 +836,25 @@ fn parse_texture_ref(
             ));
         }
     };
+    let extension = match object.get("extension") {
+        None | Some(Value::Null) => ImageExtension::Repeat,
+        Some(Value::String(value)) if value == "repeat" => ImageExtension::Repeat,
+        Some(Value::String(value)) if value == "extend" => ImageExtension::Extend,
+        Some(Value::String(value)) if value == "clip" => ImageExtension::Clip,
+        Some(Value::String(value)) if value == "mirror" => ImageExtension::Mirror,
+        _ => {
+            return Err(engine.error(
+                ErrorCode::InvalidOperation,
+                "texture extension must be repeat, extend, clip, or mirror",
+                &operation_pointer(engine.operation_index, &format!("{pointer}/extension")),
+            ));
+        }
+    };
     Ok(Some(TextureRef {
         image: image_id,
         uv_layer,
         interpolation,
+        extension,
     }))
 }
 

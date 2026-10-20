@@ -5,13 +5,16 @@
 //! then deserializes. Version 2 replaced the mesh attributes `uv_map` and `blender_uv_layers` with
 //! `uv_layers`, and the texture reference field `uv_map` with `uv_layer`. Version 3 converted
 //! Blender-keyed shading (including compressed custom normals), color, and generic element data to
-//! native keys, and user attributes to their storage keys (see [`upgrade_mesh_v2`]).
-use std::collections::BTreeSet;
+//! native keys, and user attributes to their storage keys (see [`upgrade_mesh_v2`]). Version 4 marks an
+//! EXR image's alpha as premultiplied (see [`upgrade_v3`]). Version 7 adds the optional captured Blender
+//! `matrix_basis` on a node; version 6 documents have none, so [`upgrade_v6`] changes nothing else.
+use std::{collections::BTreeSet, path::Path};
 
 use serde_json::{Map, Value, json};
 
-use super::SceneDoc;
+use super::{Image, ImageAlphaMode, SceneDoc};
 use crate::{
+    color::curve::{CurveMapping, CurvePoint, HandleType},
     error::{ErrorCode, PotError, Result},
     store::HistoryRecord,
 };
@@ -46,16 +49,16 @@ pub struct ParsedScene {
 }
 
 /// Parses a scene document, upgrading it through every schema version to the current one.
-pub fn parse_scene(bytes: &[u8]) -> Result<ParsedScene> {
-    parse_scene_inner(bytes, false)
+pub fn parse_scene(bytes: &[u8], root: &Path) -> Result<ParsedScene> {
+    parse_scene_inner(bytes, root, false)
 }
 
 /// Parses a project scene while retaining its pre-migration hash for project metadata.
-pub(crate) fn parse_scene_with_original_hash(bytes: &[u8]) -> Result<ParsedScene> {
-    parse_scene_inner(bytes, true)
+pub(crate) fn parse_scene_with_original_hash(bytes: &[u8], root: &Path) -> Result<ParsedScene> {
+    parse_scene_inner(bytes, root, true)
 }
 
-fn parse_scene_inner(bytes: &[u8], retain_original_hash: bool) -> Result<ParsedScene> {
+fn parse_scene_inner(bytes: &[u8], root: &Path, retain_original_hash: bool) -> Result<ParsedScene> {
     let mut value = parse_value(bytes)?;
     let legacy = value.get("schema_version").and_then(Value::as_u64) == Some(1);
     let legacy_hash = if legacy && retain_original_hash {
@@ -63,7 +66,7 @@ fn parse_scene_inner(bytes: &[u8], retain_original_hash: bool) -> Result<ParsedS
     } else {
         None
     };
-    let warnings = upgrade_scene(&mut value)?;
+    let warnings = upgrade_scene(&mut value, root)?;
     let doc = serde_json::from_value(value).map_err(|error| json_error(&error))?;
     Ok(ParsedScene {
         doc,
@@ -73,15 +76,95 @@ fn parse_scene_inner(bytes: &[u8], retain_original_hash: bool) -> Result<ParsedS
     })
 }
 
-/// Parses a history record, upgrading its snapshot's schema version first.
-pub(crate) fn parse_history_record(bytes: &[u8]) -> Result<(HistoryRecord, Vec<Value>)> {
+/// Parses a history record, upgrading its snapshot's schema version and retiring the removed operation
+/// `seed` fields from its recorded operations.
+pub(crate) fn parse_history_record(
+    bytes: &[u8],
+    root: &Path,
+) -> Result<(HistoryRecord, Vec<Value>)> {
     let mut value = parse_value(bytes)?;
-    let warnings = match value.get_mut("snapshot") {
-        Some(snapshot) => upgrade_scene(snapshot)?,
+    let mut warnings = match value.get_mut("snapshot") {
+        Some(snapshot) => upgrade_scene(snapshot, root)?,
         None => Vec::new(),
     };
+    if let Some(operations) = value.get_mut("operations") {
+        warnings.extend(retire_operation_seed(operations));
+        warnings.extend(report_retired_brushes(operations));
+    }
     let record = serde_json::from_value(value).map_err(|error| json_error(&error))?;
     Ok((record, warnings))
+}
+
+/// Drops the `seed` key from recorded operations whose schema no longer accepts it: `sculpt.stroke`,
+/// `sculpt.dyntopo`, `paint.vertex`, `paint.weight` and `paint.texture`. The parser rejects unknown
+/// fields, so an old record would not replay. Each dropped seed is reported. The sculpt brushes read
+/// the value in older builds, so a replay of such a record can differ from the one it was recorded with.
+fn retire_operation_seed(operations: &mut Value) -> Vec<Value> {
+    let mut warnings = Vec::new();
+    let Some(operations) = operations.as_array_mut() else {
+        return warnings;
+    };
+    for (index, operation) in operations.iter_mut().enumerate() {
+        let Some(fields) = operation.as_object_mut() else {
+            continue;
+        };
+        let Some(name) = fields
+            .get("op")
+            .and_then(Value::as_str)
+            .filter(|name| {
+                matches!(
+                    *name,
+                    "sculpt.stroke"
+                        | "sculpt.dyntopo"
+                        | "paint.vertex"
+                        | "paint.weight"
+                        | "paint.texture"
+                )
+            })
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        if let Some(seed) = fields.remove("seed") {
+            warnings.push(json!({
+                "code": "operation.seed_retired",
+                "message": "seed is no longer an operation field and was dropped",
+                "operation_index": index,
+                "op": name,
+                "seed": seed,
+            }));
+        }
+    }
+    warnings
+}
+
+/// Reports recorded `sculpt.stroke` operations that name a brush the schema no longer has. The
+/// record is not rewritten: `pose_lite` and `boundary_lite` were replaced by algorithms with
+/// different results, so renaming them to `pose` or `boundary` would replay a different stroke. The
+/// record stays as recorded, and its replay fails with `unknown sculpt brush`, which this explains.
+fn report_retired_brushes(operations: &Value) -> Vec<Value> {
+    let Some(operations) = operations.as_array() else {
+        return Vec::new();
+    };
+    operations
+        .iter()
+        .enumerate()
+        .filter_map(|(index, operation)| {
+            if operation.get("op").and_then(Value::as_str) != Some("sculpt.stroke") {
+                return None;
+            }
+            let brush = operation.get("brush").and_then(Value::as_str)?;
+            matches!(brush, "pose_lite" | "boundary_lite").then(|| {
+                json!({
+                    "code": "operation.brush_retired",
+                    "message": "brush was removed; this stroke will not replay with the same result",
+                    "operation_index": index,
+                    "op": "sculpt.stroke",
+                    "brush": brush,
+                })
+            })
+        })
+        .collect()
 }
 
 fn parse_value(bytes: &[u8]) -> Result<Value> {
@@ -96,8 +179,9 @@ fn json_error(error: &serde_json::Error) -> PotError {
     )
 }
 
-/// Upgrades a scene document in place through schema version 3.
-pub fn upgrade_scene(value: &mut Value) -> Result<Vec<Value>> {
+/// Upgrades a scene document in place through schema version 7. `root` is the project directory that holds the document's
+/// image blobs and linked sources, which the version 3 to 4 step reads.
+pub fn upgrade_scene(value: &mut Value, root: &Path) -> Result<Vec<Value>> {
     let warnings = if value.get("schema_version").and_then(Value::as_u64) == Some(1) {
         upgrade_v1(value)?
     } else {
@@ -105,6 +189,18 @@ pub fn upgrade_scene(value: &mut Value) -> Result<Vec<Value>> {
     };
     if value.get("schema_version").and_then(Value::as_u64) == Some(2) {
         upgrade_v2(value)?;
+    }
+    if value.get("schema_version").and_then(Value::as_u64) == Some(3) {
+        upgrade_v3(value, root)?;
+    }
+    if value.get("schema_version").and_then(Value::as_u64) == Some(4) {
+        upgrade_v4(value)?;
+    }
+    if value.get("schema_version").and_then(Value::as_u64) == Some(5) {
+        upgrade_v5(value);
+    }
+    if value.get("schema_version").and_then(Value::as_u64) == Some(6) {
+        upgrade_v6(value);
     }
     Ok(warnings)
 }
@@ -226,6 +322,159 @@ fn upgrade_v2(value: &mut Value) -> Result<()> {
     Ok(())
 }
 
+/// Upgrades a schema-version-4 scene document to version 5. The released view curve, an array of
+/// `[x, y]` points evaluated piecewise-linearly with horizontal extension, becomes Blender's view
+/// `CurveMapping` on the combined curve with VECTOR handles and horizontal extension, so existing
+/// renders keep their shape. The R/G/B identity curves cover the combined curve's full x-domain and
+/// `[0, 1]`; a single legacy point becomes a constant two-point curve. Clip is `[0, 1]`, black and
+/// white identity. An empty array means no curve.
+fn upgrade_v4(value: &mut Value) -> Result<()> {
+    if let Some(scenes) = value.get_mut("scenes").and_then(Value::as_object_mut) {
+        for scene in scenes.values_mut() {
+            if let Some(color) = scene.get_mut("color_management") {
+                upgrade_color_curve(color)?;
+            }
+        }
+    }
+    value["schema_version"] = json!(5);
+    Ok(())
+}
+
+/// Upgrades a schema-version-5 scene document to version 6. Version 5 drew a fisheye camera over a full turn in two forms:
+/// the `fisheye` projection, and a `panorama` with `panorama_type` `fisheye_equidistant`. Both become a `panorama` with
+/// `fisheye_equidistant` and a `fisheye_fov` of 2π, so each keeps its image and a fisheye has one representation.
+fn upgrade_v5(value: &mut Value) {
+    if let Some(blocks) = value.get_mut("data_blocks").and_then(Value::as_object_mut) {
+        for camera in blocks
+            .values_mut()
+            .filter_map(|block| block.get_mut("camera")?.as_object_mut())
+        {
+            let full_turn_fisheye = match camera.get("projection").and_then(Value::as_str) {
+                Some("fisheye") => true,
+                Some("panorama") => {
+                    camera.get("panorama_type").and_then(Value::as_str)
+                        == Some("fisheye_equidistant")
+                }
+                _ => false,
+            };
+            if full_turn_fisheye {
+                camera.insert("projection".to_owned(), json!("panorama"));
+                camera.insert("panorama_type".to_owned(), json!("fisheye_equidistant"));
+                camera.insert("fisheye_fov".to_owned(), json!(std::f64::consts::TAU));
+            }
+        }
+    }
+    value["schema_version"] = json!(6);
+}
+
+/// Upgrades a schema-version-6 scene document to version 7. Version 7 adds the optional `blender_matrix_basis`
+/// node field. A node without it is valid, so nothing is rewritten.
+fn upgrade_v6(value: &mut Value) {
+    value["schema_version"] = json!(7);
+}
+
+fn upgrade_color_curve(color: &mut Value) -> Result<()> {
+    let Some(curve) = color.get_mut("curve") else {
+        return Ok(());
+    };
+    if curve.is_null() {
+        return Ok(());
+    }
+    let Value::Array(points) = curve else {
+        return Err(invalid(
+            "color curve must be an array of [x, y] points or null",
+        ));
+    };
+    let mut points = points
+        .iter()
+        .map(legacy_curve_point)
+        .collect::<Result<Vec<_>>>()?;
+    let converted = if points.is_empty() {
+        Value::Null
+    } else {
+        if points.len() == 1 {
+            let y = points[0].location[1];
+            points = vec![
+                CurvePoint {
+                    location: [0.0, y],
+                    handle: HandleType::Vector,
+                },
+                CurvePoint {
+                    location: [1.0, y],
+                    handle: HandleType::Vector,
+                },
+            ];
+        }
+        let x_min = points[0].location[0].min(0.0);
+        let x_max = points[points.len() - 1].location[0].max(1.0);
+        let mut mapping = CurveMapping::default();
+        for channel in &mut mapping.curves[..3] {
+            channel.points = vec![
+                CurvePoint {
+                    location: [x_min, x_min],
+                    handle: HandleType::Vector,
+                },
+                CurvePoint {
+                    location: [x_max, x_max],
+                    handle: HandleType::Vector,
+                },
+            ];
+        }
+        mapping.curves[3].points = points;
+        mapping.extend_extrapolate = false;
+        mapping.validate()?;
+        serde_json::to_value(&mapping).map_err(|error| json_error(&error))?
+    };
+    *curve = converted;
+    Ok(())
+}
+
+fn legacy_curve_point(point: &Value) -> Result<CurvePoint> {
+    let [x, y] = point
+        .as_array()
+        .and_then(|pair| <&[Value; 2]>::try_from(pair.as_slice()).ok())
+        .ok_or_else(|| invalid("color curve point must be [x, y]"))?;
+    let coordinate = |value: &Value| {
+        value
+            .as_f64()
+            .map(|number| number as f32)
+            .ok_or_else(|| invalid("color curve coordinate must be a number"))
+    };
+    Ok(CurvePoint {
+        location: [coordinate(x)?, coordinate(y)?],
+        handle: HandleType::Vector,
+    })
+}
+
+/// Upgrades a schema-version-3 scene document to version 4. Schema 3 labelled every image straight, EXR included, so a
+/// saved EXR was read as straight. Blender reads an EXR as premultiplied, and so does the loader now. The old loader
+/// unpremultiplied an EXR at load and premultiplied it again when sampling, so an EXR labelled straight becomes
+/// premultiplied here, and then samples the colour the old loader produced. Only images whose bytes are an EXR change. An
+/// image whose bytes cannot be read is left as it is, and the loader reports the missing or changed asset when it is used.
+fn upgrade_v3(value: &mut Value, root: &Path) -> Result<()> {
+    if let Some(images) = value.get_mut("images").and_then(Value::as_object_mut) {
+        for image in images.values_mut() {
+            // A missing alpha mode deserialises to straight, so it is straight here too.
+            if image
+                .get("alpha_mode")
+                .and_then(Value::as_str)
+                .is_some_and(|mode| mode != "straight")
+            {
+                continue;
+            }
+            let typed: Image =
+                serde_json::from_value(image.clone()).map_err(|error| json_error(&error))?;
+            let Ok(bytes) = crate::image::storage::image_source_bytes(&typed, root) else {
+                continue;
+            };
+            if crate::image::storage::default_alpha_mode(&bytes) == ImageAlphaMode::Premultiplied {
+                image["alpha_mode"] = json!("premultiplied");
+            }
+        }
+    }
+    value["schema_version"] = json!(4);
+    Ok(())
+}
 /// Blender-owned mesh attributes are mirrors or topology rebuilt by Potter. Their exact signatures
 /// match the `.blend` importer.
 fn is_blender_managed_attribute(name: &str, domain: &str, data_type: &str) -> bool {
@@ -1047,6 +1296,11 @@ mod tests {
 
     use super::*;
 
+    /// A project root with no assets, for documents that name no image blobs.
+    fn no_assets() -> &'static Path {
+        Path::new("no-assets")
+    }
+
     #[test]
     fn version_one_texture_refs_become_layer_references() {
         let mut scene = json!({
@@ -1064,8 +1318,8 @@ mod tests {
                 }
             }}}
         });
-        upgrade_scene(&mut scene).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(3));
+        upgrade_scene(&mut scene, no_assets()).expect("upgrade");
+        assert_eq!(scene["schema_version"], json!(7));
         let material = &scene["materials"]["m1"];
         assert_eq!(material["base_color_texture"]["uv_layer"], Value::Null);
         assert!(material["base_color_texture"].get("uv_map").is_none());
@@ -1080,14 +1334,195 @@ mod tests {
     }
 
     #[test]
-    fn current_scenes_pass_through_untouched() {
+    fn version_three_scenes_only_advance_their_version_without_images() {
         let mut scene = json!({
             "schema_version": 3,
             "materials": {"m1": {"base_color_texture": {"image": "img", "uv_layer": "Light"}}}
         });
         let before = scene.clone();
-        upgrade_scene(&mut scene).expect("no-op");
+        upgrade_scene(&mut scene, no_assets()).expect("upgrade");
+        assert_eq!(scene["schema_version"], json!(7));
+        assert_eq!(scene["materials"], before["materials"]);
+    }
+
+    #[test]
+    fn version_five_full_turn_fisheyes_become_equidistant_panoramas() {
+        let mut scene = json!({
+            "schema_version": 5,
+            "data_blocks": {
+                "legacy": {"type": "camera", "camera": {"projection": "fisheye", "lens_mm": 50.0}},
+                "panorama": {"type": "camera", "camera": {
+                    "projection": "panorama", "panorama_type": "fisheye_equidistant", "lens_mm": 50.0
+                }},
+                "sphere": {"type": "camera", "camera": {
+                    "projection": "panorama", "panorama_type": "equirectangular"
+                }},
+                "plain": {"type": "camera", "camera": {"projection": "perspective"}}
+            }
+        });
+        upgrade_scene(&mut scene, no_assets()).expect("upgrade");
+        assert_eq!(scene["schema_version"], json!(7));
+        // Both forms drew a full turn in version 5, so both keep it as a 2π equidistant fisheye.
+        for id in ["legacy", "panorama"] {
+            let camera = &scene["data_blocks"][id]["camera"];
+            assert_eq!(camera["projection"], json!("panorama"), "{id}");
+            assert_eq!(
+                camera["panorama_type"],
+                json!("fisheye_equidistant"),
+                "{id}"
+            );
+            assert_eq!(camera["fisheye_fov"], json!(std::f64::consts::TAU), "{id}");
+            assert_eq!(camera["lens_mm"], json!(50.0), "{id}");
+        }
+        // An equirectangular panorama and a perspective camera gain no fisheye field.
+        let sphere = &scene["data_blocks"]["sphere"]["camera"];
+        assert_eq!(sphere["panorama_type"], json!("equirectangular"));
+        assert!(sphere.get("fisheye_fov").is_none());
+        assert_eq!(
+            scene["data_blocks"]["plain"]["camera"]["projection"],
+            json!("perspective")
+        );
+    }
+
+    #[test]
+    fn current_schema_seven_scenes_pass_through_untouched() {
+        let mut scene = json!({
+            "schema_version": 7,
+            "materials": {"m1": {"base_color_texture": {"image": "img", "uv_layer": "Light"}}}
+        });
+        let before = scene.clone();
+        upgrade_scene(&mut scene, no_assets()).expect("upgrade");
         assert_eq!(scene, before);
+    }
+
+    /// A project saved at schema 3 labelled its EXR straight, but Blender and the loader read an EXR as premultiplied.
+    /// The upgrade relabels it, so it samples as the old loader did. The old loader unpremultiplied the file at load and
+    /// premultiplied it again when sampling: unlinked, the file's associated colour comes back; linked, the straight colour.
+    #[test]
+    fn version_three_exr_images_load_premultiplied_as_the_old_loader_sampled_them() -> TestResult {
+        let root = tempfile::tempdir()?;
+        // Blender writes an EXR's colour associated: this texel is straight (0.8, 0.4, 0.2) at alpha 0.5.
+        let exr_path = root.path().join("texel.exr");
+        exr::prelude::write_rgba_file(&exr_path, 1, 1, |_, _| {
+            (0.4_f32, 0.2_f32, 0.1_f32, 0.5_f32)
+        })?;
+        let bytes = std::fs::read(&exr_path)?;
+        let digest = crate::hash::sha256(&bytes);
+        let hex = digest
+            .strip_prefix("sha256:")
+            .ok_or("digest is not sha256")?;
+        let blob_dir = root.path().join("assets").join("sha256").join(hex);
+        std::fs::create_dir_all(&blob_dir)?;
+        std::fs::write(blob_dir.join("blob"), &bytes)?;
+        let image = Image {
+            name: "texel".to_owned(),
+            source: crate::model::ImageSource::Packed,
+            colorspace: crate::model::ImageColorspace::Linear,
+            width: 1,
+            height: 1,
+            tiles: Vec::new(),
+            blob: Some(digest.clone()),
+            source_path: None,
+            source_hash: Some(digest),
+            alpha_mode: ImageAlphaMode::Straight,
+            tiled: false,
+        };
+        let mut scene = serde_json::to_value(SceneDoc::new(uuid::Uuid::new_v4().to_string()))?;
+        scene["schema_version"] = json!(3);
+        scene["images"] = json!({ "texel": serde_json::to_value(&image)? });
+        let parsed = parse_scene(&serde_json::to_vec(&scene)?, root.path())?;
+        assert_eq!(parsed.doc.schema_version, 7);
+        let id = crate::model::Id::new("texel")?;
+        let migrated = &parsed.doc.images[&id];
+        assert_eq!(migrated.alpha_mode, ImageAlphaMode::Premultiplied);
+        let data = crate::image::load_image_data(
+            migrated,
+            root.path(),
+            crate::image::ImageInterpolation::Closest,
+        )?;
+        let sample = |linked: bool| {
+            crate::image::sample_with_extension_alpha(
+                &data,
+                [0.5, 0.5],
+                false,
+                crate::image::ImageInterpolation::Closest,
+                crate::image::ImageExtension::Repeat,
+                linked,
+            )
+        };
+        for (actual, expected) in sample(false).into_iter().zip([0.4, 0.2, 0.1, 0.5]) {
+            assert!(
+                (actual - expected).abs() < 1.0e-6,
+                "unlinked {actual} != {expected}"
+            );
+        }
+        for (actual, expected) in sample(true).into_iter().zip([0.8, 0.4, 0.2, 0.5]) {
+            assert!(
+                (actual - expected).abs() < 1.0e-6,
+                "linked {actual} != {expected}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn version_three_color_curve_array_becomes_view_curve() -> TestResult {
+        let mut scene = json!({
+            "schema_version": 3,
+            "scenes": {
+                "empty": {"color_management": {"curve": []}},
+                "curved": {"color_management": {"curve": [[0.0, 0.0], [0.5, 0.25], [1.0, 1.0]]}},
+                "hdr": {"color_management": {"curve": [[0.0, 0.0], [2.0, 1.0]]}},
+                "single": {"color_management": {"curve": [[0.5, 0.25]]}}
+            }
+        });
+        upgrade_scene(&mut scene, no_assets())?;
+        assert_eq!(scene["schema_version"], json!(7));
+        assert_eq!(
+            scene["scenes"]["empty"]["color_management"]["curve"],
+            Value::Null
+        );
+        let curve: CurveMapping =
+            serde_json::from_value(scene["scenes"]["curved"]["color_management"]["curve"].clone())?;
+        assert_eq!(curve.curves[3].points.len(), 3);
+        assert_eq!(curve.curves[3].points[1].location, [0.5, 0.25]);
+        assert_eq!(curve.curves[3].points[1].handle, HandleType::Vector);
+        assert_eq!(curve.curves[0].points[0].location, [0.0, 0.0]);
+        assert_eq!(curve.curves[0].points[1].location, [1.0, 1.0]);
+        assert!(!curve.extend_extrapolate);
+
+        let hdr: CurveMapping =
+            serde_json::from_value(scene["scenes"]["hdr"]["color_management"]["curve"].clone())?;
+        for channel in &hdr.curves[..3] {
+            assert_eq!(channel.points[0].location, [0.0, 0.0]);
+            assert_eq!(channel.points[1].location, [2.0, 2.0]);
+        }
+        assert!((hdr.prepare().evaluate_rgb([1.5; 3])[0] - 0.75).abs() < 1.0e-4);
+
+        let single: CurveMapping =
+            serde_json::from_value(scene["scenes"]["single"]["color_management"]["curve"].clone())?;
+        assert_eq!(single.curves[3].points.len(), 2);
+        assert_eq!(single.curves[3].points[0].location, [0.0, 0.25]);
+        assert_eq!(single.curves[3].points[1].location, [1.0, 0.25]);
+        assert!((single.prepare().evaluate_rgb([0.5; 3])[0] - 0.25).abs() < 1.0e-4);
+        Ok(())
+    }
+
+    #[test]
+    fn parsing_version_three_scene_migrates_and_validates() -> TestResult {
+        let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+        doc.nodes.insert(
+            crate::model::Id::new("node")?,
+            super::super::Node::default(),
+        );
+        doc.schema_version = 3;
+        let mut expected = serde_json::to_value(&doc)?;
+        let parsed = parse_scene(&serde_json::to_vec(&expected)?, no_assets())?;
+        parsed.doc.validate()?;
+        let migrated = serde_json::to_value(parsed.doc)?;
+        expected["schema_version"] = json!(7);
+        assert_eq!(migrated, expected);
+        Ok(())
     }
 
     #[test]
@@ -1122,8 +1557,8 @@ mod tests {
             }]
         });
 
-        let migrated = parse_scene(&serde_json::to_vec(&source)?)?.doc;
-        assert_eq!(migrated.schema_version, 3);
+        let migrated = parse_scene(&serde_json::to_vec(&source)?, no_assets())?.doc;
+        assert_eq!(migrated.schema_version, 7);
         let mesh = migrated.data_blocks[&data_id]
             .mesh
             .as_ref()
@@ -1187,7 +1622,7 @@ mod tests {
     }
 
     fn migrated_mesh(source: &Value) -> TestResult<crate::geom::Mesh> {
-        let migrated = parse_scene(&serde_json::to_vec(source)?)?.doc;
+        let migrated = parse_scene(&serde_json::to_vec(source)?, no_assets())?.doc;
         let mesh = migrated.data_blocks[&crate::model::Id::new("meshdata")?]
             .mesh
             .clone()
@@ -1497,7 +1932,7 @@ mod tests {
                     }]
                 }),
             )?;
-            let error = parse_scene(&serde_json::to_vec(&source)?)
+            let error = parse_scene(&serde_json::to_vec(&source)?, no_assets())
                 .expect_err("malformed custom-normal codes must be rejected");
             assert_eq!(error.code, ErrorCode::SceneInvalid);
         }
@@ -1625,9 +2060,9 @@ mod tests {
         assert_eq!(store.active.as_deref(), Some("Tint"));
         assert_eq!(store.render.as_deref(), Some("Tint"));
         let (record, history_warnings) =
-            parse_history_record(&serde_json::to_vec(&history_record(&source))?)?;
+            parse_history_record(&serde_json::to_vec(&history_record(&source))?, no_assets())?;
         assert!(history_warnings.is_empty(), "{history_warnings:?}");
-        assert_eq!(record.snapshot.schema_version, 3);
+        assert_eq!(record.snapshot.schema_version, 7);
         let history_mesh = record
             .snapshot
             .data_blocks
@@ -1636,8 +2071,8 @@ mod tests {
             .and_then(|block| block.mesh.as_ref())
             .ok_or("history snapshot has no mesh")?;
         assert_eq!(&history_mesh.attributes, attributes);
-        let current = parse_scene(&serde_json::to_vec(&source)?)?.doc;
-        let current = parse_scene(&serde_json::to_vec(&current)?)?.doc;
+        let current = parse_scene(&serde_json::to_vec(&source)?, no_assets())?.doc;
+        let current = parse_scene(&serde_json::to_vec(&current)?, no_assets())?.doc;
         let current_mesh = current
             .data_blocks
             .values()
@@ -1692,9 +2127,9 @@ mod tests {
             Vec::new()
         );
         let (record, history_warnings) =
-            parse_history_record(&serde_json::to_vec(&history_record(&source))?)?;
+            parse_history_record(&serde_json::to_vec(&history_record(&source))?, no_assets())?;
         assert!(history_warnings.is_empty(), "{history_warnings:?}");
-        assert_eq!(record.snapshot.schema_version, 3);
+        assert_eq!(record.snapshot.schema_version, 7);
         let history_mesh = record
             .snapshot
             .data_blocks
@@ -1711,8 +2146,8 @@ mod tests {
             crate::geom::color_layers::read(history_mesh).layers,
             Vec::new()
         );
-        let current = parse_scene(&serde_json::to_vec(&source)?)?.doc;
-        let current = parse_scene(&serde_json::to_vec(&current)?)?.doc;
+        let current = parse_scene(&serde_json::to_vec(&source)?, no_assets())?.doc;
+        let current = parse_scene(&serde_json::to_vec(&current)?, no_assets())?.doc;
         let current_mesh = current
             .data_blocks
             .values()
@@ -1793,7 +2228,7 @@ mod tests {
                 "normal_texture": {"image": "img", "uv_map": "uv_map", "interpolation": "linear"}
             }}
         });
-        let warnings = upgrade_scene(&mut scene).expect("upgrade");
+        let warnings = upgrade_scene(&mut scene, no_assets()).expect("upgrade");
         assert!(warnings.is_empty(), "{warnings:?}");
         let material = &scene["materials"]["m1"];
         assert_eq!(material["base_color_texture"]["uv_layer"], Value::Null);
@@ -1806,7 +2241,7 @@ mod tests {
             "schema_version": 1,
             "materials": {"m1": {"base_color_texture": {"image": "img", "uv_map": 3}}}
         });
-        assert!(upgrade_scene(&mut scene).is_err());
+        assert!(upgrade_scene(&mut scene, no_assets()).is_err());
     }
 
     #[test]
@@ -1836,7 +2271,7 @@ mod tests {
             "blender_uv_layers": [{"name": "Light", "values": [[0.0, 0.25], [0.5, 0.5]]}]
         });
 
-        let parsed = parse_scene(&serde_json::to_vec(&source)?)?;
+        let parsed = parse_scene(&serde_json::to_vec(&source)?, no_assets())?;
         assert!(parsed.legacy);
         assert_eq!(parsed.warnings.len(), 1, "{:?}", parsed.warnings);
         assert_eq!(parsed.warnings[0]["code"], "uv.legacy_layer_skipped");
@@ -1844,9 +2279,94 @@ mod tests {
         assert_eq!(parsed.warnings[0]["mesh"], "meshdata");
 
         let current = SceneDoc::new(uuid::Uuid::new_v4().to_string());
-        let parsed = parse_scene(&serde_json::to_vec(&serde_json::to_value(current)?)?)?;
+        let parsed = parse_scene(
+            &serde_json::to_vec(&serde_json::to_value(current)?)?,
+            no_assets(),
+        )?;
         assert!(!parsed.legacy);
         assert_eq!(parsed.warnings, Vec::<Value>::new());
+        Ok(())
+    }
+
+    #[test]
+    fn history_retired_sculpt_brush_is_reported_at_load_and_kept() -> TestResult {
+        let snapshot = serde_json::to_value(SceneDoc::new(uuid::Uuid::new_v4().to_string()))?;
+        let mut source = history_record(&snapshot);
+        source["operations"] = json!([
+            {"op":"node.create","id":"body","kind":"box","params":{"size":2.0}},
+            {"op":"sculpt.stroke","target":{"id":"body"},"scope":"shared","brush":"pose_lite",
+             "samples":[{"position":[1.0,1.0,1.0],"pressure":1.0,"radius":0.25,"strength":0.5,"time":0.0}],
+             "falloff":"linear"}
+        ]);
+        let (record, warnings) = parse_history_record(&serde_json::to_vec(&source)?, no_assets())?;
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(warnings[0]["code"], "operation.brush_retired");
+        assert_eq!(warnings[0]["operation_index"], 1);
+        assert_eq!(warnings[0]["brush"], "pose_lite");
+        assert_eq!(record.operations[1]["brush"], "pose_lite");
+
+        let replay = json!({
+            "schema_version": 1,
+            "base_revision": 0,
+            "operations": [record.operations[0], record.operations[1]]
+        });
+        let error = crate::ops::apply_batch(&record.snapshot, &replay)
+            .err()
+            .ok_or("a retired brush replayed")?;
+        assert_eq!(error.code, ErrorCode::InvalidOperation);
+        Ok(())
+    }
+
+    #[test]
+    fn history_operation_seed_is_dropped_at_load_and_the_record_replays() -> TestResult {
+        let snapshot = serde_json::to_value(SceneDoc::new(uuid::Uuid::new_v4().to_string()))?;
+        let mut source = history_record(&snapshot);
+        source["operations"] = json!([
+            {"op":"node.create","id":"body","kind":"box","params":{"size":2.0}},
+            {"op":"sculpt.stroke","target":{"id":"body"},"scope":"shared","brush":"draw",
+             "samples":[{"position":[1.0,1.0,1.0],"pressure":1.0,"radius":0.25,"strength":0.5,"time":0.0}],
+             "falloff":"linear","seed":7},
+            {"op":"sculpt.dyntopo","target":{"id":"body"},"scope":"shared",
+             "samples":[{"position":[0.0,0.0,0.0],"pressure":1.0,"radius":10.0,"strength":1.0,"time":0.0}],
+             "falloff":"constant","edge_length":0.5,"seed":7},
+            {"op":"paint.vertex","target":{"id":"body"},"scope":"shared","samples":[],"color":[1.0,0.0,0.0,1.0],"seed":7}
+        ]);
+        let (record, warnings) = parse_history_record(&serde_json::to_vec(&source)?, no_assets())?;
+        let operations = record
+            .operations
+            .as_array()
+            .ok_or("history operations are not an array")?;
+        assert_eq!(operations[0]["params"]["size"], 2.0);
+        assert!(operations[1].get("seed").is_none());
+        assert!(operations[2].get("seed").is_none());
+        assert!(operations[3].get("seed").is_none());
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert_eq!(warnings[0]["code"], "operation.seed_retired");
+        assert_eq!(warnings[0]["operation_index"], 1);
+        assert_eq!(warnings[0]["op"], "sculpt.stroke");
+        assert_eq!(warnings[0]["seed"], 7);
+        assert_eq!(warnings[1]["op"], "sculpt.dyntopo");
+        assert_eq!(warnings[2]["code"], "operation.seed_retired");
+        assert_eq!(warnings[2]["op"], "paint.vertex");
+
+        let replay = json!({
+            "schema_version": 1,
+            "base_revision": 0,
+            "operations": [operations[0], operations[1]]
+        });
+        crate::ops::apply_batch(&record.snapshot, &replay)?;
+
+        let mut rejected = operations[1].clone();
+        rejected["seed"] = json!(7);
+        let rejected_batch = json!({
+            "schema_version": 1,
+            "base_revision": 0,
+            "operations": [operations[0], rejected]
+        });
+        let error = crate::ops::apply_batch(&record.snapshot, &rejected_batch)
+            .err()
+            .ok_or("sculpt.stroke accepted a seed")?;
+        assert_eq!(error.code, ErrorCode::InvalidOperation);
         Ok(())
     }
 

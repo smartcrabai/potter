@@ -51,6 +51,12 @@ fn create_camera(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Res
             "clip_end",
             "shift",
             "panorama_type",
+            "longitude_min",
+            "longitude_max",
+            "latitude_min",
+            "latitude_max",
+            "fisheye_fov",
+            "fisheye_lens",
             "dof_enabled",
             "focus_distance",
             "f_stop",
@@ -76,6 +82,12 @@ fn create_camera(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Res
             "clip_end",
             "shift",
             "panorama_type",
+            "longitude_min",
+            "longitude_max",
+            "latitude_min",
+            "latitude_max",
+            "fisheye_fov",
+            "fisheye_lens",
             "dof_enabled",
             "focus_distance",
             "f_stop",
@@ -148,6 +160,12 @@ fn apply_camera_values(
             "clip_end",
             "shift",
             "panorama_type",
+            "longitude_min",
+            "longitude_max",
+            "latitude_min",
+            "latitude_max",
+            "fisheye_fov",
+            "fisheye_lens",
             "dof_enabled",
             "focus_distance",
             "f_stop",
@@ -162,11 +180,10 @@ fn apply_camera_values(
             Some("perspective") => CameraProjection::Perspective,
             Some("orthographic") => CameraProjection::Orthographic,
             Some("panorama") => CameraProjection::Panorama,
-            Some("fisheye") => CameraProjection::Fisheye,
             _ => {
                 return Err(engine.error(
                     ErrorCode::InvalidOperation,
-                    "projection must be perspective, orthographic, panorama, or fisheye",
+                    "projection must be perspective, orthographic, or panorama",
                     &operation_pointer(engine.operation_index, &format!("{prefix}projection")),
                 ));
             }
@@ -211,17 +228,136 @@ fn apply_camera_values(
     }
     if let Some(value) = values.get("panorama_type") {
         camera.panorama_type = match value.as_str() {
-            Some("equirectangular" | "fisheye_equidistant") => {
+            Some("equirectangular" | "fisheye_equidistant" | "fisheye_equisolid") => {
                 value.as_str().unwrap_or_default().to_owned()
             }
             _ => {
                 return Err(engine.error(
                     ErrorCode::InvalidOperation,
-                    "panorama_type must be equirectangular or fisheye_equidistant",
+                    "panorama_type must be equirectangular, fisheye_equidistant, or fisheye_equisolid",
                     &operation_pointer(engine.operation_index, &format!("{prefix}panorama_type")),
                 ));
             }
         };
+    }
+    for (field, destination) in [
+        ("longitude_min", &mut camera.longitude_min),
+        ("longitude_max", &mut camera.longitude_max),
+        ("latitude_min", &mut camera.latitude_min),
+        ("latitude_max", &mut camera.latitude_max),
+        ("fisheye_fov", &mut camera.fisheye_fov),
+        ("fisheye_lens", &mut camera.fisheye_lens),
+    ] {
+        if let Some(value) = values.get(field) {
+            *destination = super::finite_number(
+                engine,
+                Some(value),
+                &format!("{prefix}{field}"),
+                super::FiniteNumberMessage::Field,
+            )?;
+        }
+    }
+    // The panorama limits apply to equirectangular cameras and the field of view to fisheye ones. A setting that
+    // the camera's projection would ignore is refused, not stored.
+    let equirectangular = camera.projection == CameraProjection::Panorama
+        && camera.panorama_type == "equirectangular";
+    let fisheye = camera.projection == CameraProjection::Panorama && !equirectangular;
+    for field in [
+        "longitude_min",
+        "longitude_max",
+        "latitude_min",
+        "latitude_max",
+    ] {
+        if values.contains_key(field) && !equirectangular {
+            return Err(engine.error(
+                ErrorCode::InvalidOperation,
+                format!("{field} applies only to equirectangular panorama cameras"),
+                &operation_pointer(engine.operation_index, &format!("{prefix}{field}")),
+            ));
+        }
+    }
+    if values.contains_key("fisheye_fov") && !fisheye {
+        return Err(engine.error(
+            ErrorCode::InvalidOperation,
+            "fisheye_fov applies only to fisheye cameras",
+            &operation_pointer(engine.operation_index, &format!("{prefix}fisheye_fov")),
+        ));
+    }
+    if values.contains_key("fisheye_lens") && !fisheye {
+        return Err(engine.error(
+            ErrorCode::InvalidOperation,
+            "fisheye_lens applies only to fisheye cameras",
+            &operation_pointer(engine.operation_index, &format!("{prefix}fisheye_lens")),
+        ));
+    }
+    // Blender clamps a camera value outside its RNA hard range on assignment, so Potter refuses such a value rather than
+    // exporting a silently different camera. The ranges are Blender 5.2.2's (`rna_camera.cc`): the fisheye field of view
+    // 10 degrees to 10π and the fisheye lens 0.01 to 100 mm, the lens and sensor width at least 1 mm, and the clip planes at
+    // least 1e-6. Blender stores the fisheye values on every camera, so an import holds them whatever the projection.
+    if !(crate::model::FISHEYE_FOV_MIN..=crate::model::FISHEYE_FOV_MAX)
+        .contains(&camera.fisheye_fov)
+    {
+        return Err(engine.error(
+            ErrorCode::InvalidArgument,
+            "fisheye_fov must be between 0.1745 and 10π radians",
+            &operation_pointer(engine.operation_index, &format!("{prefix}fisheye_fov")),
+        ));
+    }
+    if !(crate::model::FISHEYE_LENS_MIN..=crate::model::FISHEYE_LENS_MAX)
+        .contains(&camera.fisheye_lens)
+    {
+        return Err(engine.error(
+            ErrorCode::InvalidArgument,
+            "fisheye_lens must be between 0.01 and 100 mm",
+            &operation_pointer(engine.operation_index, &format!("{prefix}fisheye_lens")),
+        ));
+    }
+    if camera.lens_mm < 1.0 {
+        return Err(engine.error(
+            ErrorCode::InvalidArgument,
+            "lens_mm must be at least 1",
+            &operation_pointer(engine.operation_index, &format!("{prefix}lens_mm")),
+        ));
+    }
+    if camera.sensor_width_mm < 1.0 {
+        return Err(engine.error(
+            ErrorCode::InvalidArgument,
+            "sensor_width_mm must be at least 1",
+            &operation_pointer(engine.operation_index, &format!("{prefix}sensor_width_mm")),
+        ));
+    }
+    for (field, value) in [
+        ("clip_start", camera.clip_start),
+        ("clip_end", camera.clip_end),
+    ] {
+        if value < 1.0e-6 {
+            return Err(engine.error(
+                ErrorCode::InvalidArgument,
+                format!("{field} must be at least 1e-6"),
+                &operation_pointer(engine.operation_index, &format!("{prefix}{field}")),
+            ));
+        }
+    }
+    if equirectangular {
+        if !(camera.longitude_max > camera.longitude_min
+            && camera.longitude_max - camera.longitude_min <= crate::model::BLENDER_TURN)
+        {
+            return Err(engine.error(
+                ErrorCode::InvalidOperation,
+                "longitude_max must exceed longitude_min by at most 2π",
+                &operation_pointer(engine.operation_index, &format!("{prefix}longitude_max")),
+            ));
+        }
+        if !(camera.latitude_max > camera.latitude_min
+            && camera.latitude_min >= -crate::model::BLENDER_RIGHT_ANGLE
+            && camera.latitude_max <= crate::model::BLENDER_RIGHT_ANGLE)
+        {
+            return Err(engine.error(
+                ErrorCode::InvalidOperation,
+                "latitude_max must exceed latitude_min, and both lie within ±π/2",
+                &operation_pointer(engine.operation_index, &format!("{prefix}latitude_max")),
+            ));
+        }
     }
     if let Some(value) = values.get("dof_enabled") {
         camera.dof_enabled = value.as_bool().ok_or_else(|| {
@@ -280,6 +416,9 @@ fn create_light(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resu
             "color",
             "energy",
             "radius",
+            "soft_falloff",
+            "use_multiple_importance_sampling",
+            "spread",
             "spot_size",
             "spot_blend",
         ],
@@ -297,6 +436,9 @@ fn create_light(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resu
             "color",
             "energy",
             "radius",
+            "soft_falloff",
+            "use_multiple_importance_sampling",
+            "spread",
             "spot_size",
             "spot_blend",
         ],
@@ -361,6 +503,9 @@ fn apply_light_values(
             "color",
             "energy",
             "radius",
+            "soft_falloff",
+            "use_multiple_importance_sampling",
+            "spread",
             "spot_size",
             "spot_blend",
         ],
@@ -396,6 +541,55 @@ fn apply_light_values(
     }
     if let Some(value) = values.get("radius") {
         light.radius = nonnegative_number(engine, value, &format!("{prefix}radius"))?;
+    }
+    if let Some(value) = values.get("soft_falloff") {
+        light.soft_falloff = value.as_bool().ok_or_else(|| {
+            engine.error(
+                ErrorCode::InvalidOperation,
+                "soft_falloff must be true or false",
+                &operation_pointer(engine.operation_index, &format!("{prefix}soft_falloff")),
+            )
+        })?;
+    }
+    if let Some(value) = values.get("use_multiple_importance_sampling") {
+        light.use_multiple_importance_sampling = value.as_bool().ok_or_else(|| {
+            engine.error(
+                ErrorCode::InvalidOperation,
+                "use_multiple_importance_sampling must be true or false",
+                &operation_pointer(
+                    engine.operation_index,
+                    &format!("{prefix}use_multiple_importance_sampling"),
+                ),
+            )
+        })?;
+    }
+    if let Some(value) = values.get("spread") {
+        if light.light_type != LightType::Area {
+            return Err(engine.error(
+                ErrorCode::InvalidOperation,
+                "spread applies only to area lights",
+                &operation_pointer(engine.operation_index, &format!("{prefix}spread")),
+            ));
+        }
+        let spread = super::finite_number(
+            engine,
+            Some(value),
+            &format!("{prefix}spread"),
+            super::FiniteNumberMessage::Field,
+        )?;
+        // Blender stores spread as a float32, so its π arrives rounded; accept it as the import does.
+        light.spread = if (spread - std::f64::consts::PI).abs() <= 1.0e-6 {
+            std::f64::consts::PI
+        } else {
+            spread
+        };
+        if !(0.0..=std::f64::consts::PI).contains(&light.spread) {
+            return Err(engine.error(
+                ErrorCode::InvalidOperation,
+                "spread must be between 0 and π radians",
+                &operation_pointer(engine.operation_index, &format!("{prefix}spread")),
+            ));
+        }
     }
     if let Some(value) = values.get("spot_size") {
         light.spot_size = super::finite_number(

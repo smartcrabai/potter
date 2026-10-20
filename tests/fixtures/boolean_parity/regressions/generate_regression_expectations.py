@@ -31,7 +31,6 @@ import math
 import os
 import sys
 
-import bmesh
 import bpy
 from mathutils import Matrix, Vector
 
@@ -40,6 +39,8 @@ if bpy.app.version != (5, 2, 2):
 
 OUTPUT = os.path.realpath(sys.argv[sys.argv.index("--") + 1])
 EXPECTED = os.path.join(OUTPUT, "expected")
+# Pinned Boolean input meshes (dump_sphere_hosts.py), next to this script.
+HOSTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hosts")
 
 BOX_FACES = (
     (0, 3, 2, 1),  # bottom
@@ -78,10 +79,12 @@ def new_collection(name, parent):
     return collection
 
 
-def mesh_object(name, collection, geometry, *, slots=(), slot_of_face=None, custom_normals=False):
+def mesh_object(
+    name, collection, geometry, *, slots=(), slot_of_face=None, custom_normals=False, edges=(),
+):
     verts, faces = geometry
     mesh = bpy.data.meshes.new(name)
-    mesh.from_pydata(verts, [], faces)
+    mesh.from_pydata(verts, edges, faces)
     mesh.update()
     for slot in slots:
         mesh.materials.append(None if slot is None else material(slot))
@@ -106,20 +109,20 @@ def primitive(operator, name, **arguments):
     return obj
 
 
-def uv_sphere(name, segments, open_top):
-    obj = primitive(
-        bpy.ops.mesh.primitive_uv_sphere_add, name,
-        segments=segments, ring_count=segments // 2, radius=1.0,
+def load_host(case, scene):
+    """The pinned sphere host `hosts/<case>.json` (see dump_sphere_hosts.py), as a scene object.
+
+    The UV sphere is not generated here: Blender's primitive takes its float32 coordinates from the
+    platform libm, which differs between macOS and Linux by a few ulps, so each platform would
+    build a different Boolean input. The pinned file is the exact input the expectations came from.
+    """
+    with open(os.path.join(HOSTS, case + ".json")) as handle:
+        data = json.load(handle)
+    return mesh_object(
+        case, scene, ([tuple(vertex) for vertex in data["verts"]],
+                      [tuple(face) for face in data["faces"]]),
+        edges=[tuple(edge) for edge in data["edges"]],
     )
-    if open_top:
-        # Same cut as the probes: faces with every vertex above z = 0.95 are removed.
-        bm = bmesh.new()
-        bm.from_mesh(obj.data)
-        cap = [face for face in bm.faces if all(vert.co.z > 0.95 for vert in face.verts)]
-        bmesh.ops.delete(bm, geom=cap, context="FACES")
-        bm.to_mesh(obj.data)
-        bm.free()
-    return obj
 
 
 def boolean(host, operation, solver, *, operand=None, collection=None, use_self=False,
@@ -159,11 +162,24 @@ def cross(a, b):
     )
 
 
+def smooth_faces(mesh):
+    # Blender stores flat faces in `sharp_face`; without that attribute every face is smooth.
+    sharp = mesh.attributes.get("sharp_face")
+    if sharp is None:
+        return [True] * len(mesh.polygons)
+    return [not item.value for item in sharp.data]
+
+
 def describe_mesh(case, regression, owner, mesh, *, rings):
     matrix = owner.matrix_world
     raw = [tuple(float(c) for c in matrix @ vertex.co) for vertex in mesh.vertices]
+    edges = sorted(
+        [canonical(raw[index]) for index in edge.vertices]
+        for edge in mesh.edges
+    )
     uv_layer = mesh.uv_layers["UVMap"] if "UVMap" in mesh.uv_layers else None
     custom = mesh.has_custom_normals
+    smooth = smooth_faces(mesh)
     faces = []
     sizes = {}
     volume = 0.0
@@ -175,6 +191,7 @@ def describe_mesh(case, regression, owner, mesh, *, rings):
         start = min(range(len(ring)), key=ring.__getitem__)
         if rings:
             record = {"ring": rotated(ring, start), "material_index": polygon.material_index}
+            record["face_attributes"] = {"shade_smooth": smooth[polygon.index]}
             if uv_layer is not None:
                 record["uv"] = rotated(
                     [[round(uv_layer.data[li].uv[0], 6) + 0.0,
@@ -182,6 +199,11 @@ def describe_mesh(case, regression, owner, mesh, *, rings):
                     start,
                 )
             if custom:
+                normal_layer = mesh.attributes["custom_normal"]
+                record["custom_normal_codes"] = rotated(
+                    [[int(component) for component in normal_layer.data[li].value] for li in corners],
+                    start,
+                )
                 record["custom_normals"] = rotated(
                     [[round(c, 6) + 0.0 for c in mesh.corner_normals[li].vector] for li in corners],
                     start,
@@ -215,8 +237,9 @@ def describe_mesh(case, regression, owner, mesh, *, rings):
         "vertex_groups": groups,
         "blender_version": bpy.app.version_string,
     }
-    if rings:
-        result["faces"] = faces
+    # Always written: the sphere cases (rings=False) record counts, face sizes, and volume only.
+    result["faces"] = faces if rings else None
+    result["edges"] = edges
     return result
 
 
@@ -307,9 +330,9 @@ def build_scene(scene):
         indexed_pair("index_remap_same_material_keeps_slot",
                      [prefix + ".A", prefix + ".B", prefix + ".C"],
                      [prefix + ".X", prefix + ".B"]))
-    prefix = "regress.index_last"
-    add("index_remap_last_matching_slot", "e",
-        indexed_pair("index_remap_last_matching_slot",
+    prefix = "regress.index_first"
+    add("index_remap_first_matching_slot", "e",
+        indexed_pair("index_remap_first_matching_slot",
                      [prefix + ".A", prefix + ".B", prefix + ".A", prefix + ".D"],
                      [prefix + ".B", prefix + ".A", prefix + ".C", prefix + ".E"]))
 
@@ -351,18 +374,36 @@ def build_scene(scene):
     boolean(host, "DIFFERENCE", "EXACT", operand=cutter)
     add("cavity_wall_normal", "h", host)
 
-    # i: open and closed UV spheres with use_hole_tolerant.
-    for case, segments, open_top, hole_tolerant in (
-        ("sphere_open64_hole_tolerant_on", 64, True, True),
-        ("sphere_open64_hole_tolerant_off", 64, True, False),
-        ("sphere_open128_hole_tolerant_on", 128, True, True),
-        ("sphere_closed64_hole_tolerant_on", 64, False, True),
+    # i: open and closed UV spheres with use_hole_tolerant. The hosts are pinned (load_host).
+    for case, hole_tolerant in (
+        ("sphere_open64_hole_tolerant_on", True),
+        ("sphere_open64_hole_tolerant_off", False),
+        ("sphere_open128_hole_tolerant_on", True),
+        ("sphere_closed64_hole_tolerant_on", True),
     ):
-        host = uv_sphere(case, segments, open_top)
+        host = load_host(case, scene)
         cutter = primitive(
             bpy.ops.mesh.primitive_cube_add, case + ".cutter", size=1.0, location=(0.9, 0.0, 0.0)
         )
         boolean(host, "DIFFERENCE", "EXACT", operand=cutter, hole_tolerant=hole_tolerant)
+        add(case, "i", host, rings=False)
+    # Raw Blender sphere orders (dump_sphere_input.py): one case per committed input file.
+    inputs = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inputs")
+    for name in sorted(os.listdir(inputs)):
+        if not name.endswith(".json"):
+            continue
+        case = name[: -len(".json")]
+        with open(os.path.join(inputs, name)) as handle:
+            data = json.load(handle)
+        host = mesh_object(
+            case, scene, ([tuple(vertex) for vertex in data["verts"]],
+                          [tuple(face) for face in data["faces"]]),
+            edges=[tuple(edge) for edge in data["edges"]],
+        )
+        cutter = primitive(
+            bpy.ops.mesh.primitive_cube_add, case + ".cutter", size=1.0, location=(0.9, 0.0, 0.0)
+        )
+        boolean(host, "DIFFERENCE", "EXACT", operand=cutter, hole_tolerant=True)
         add(case, "i", host, rings=False)
     return cases
 
