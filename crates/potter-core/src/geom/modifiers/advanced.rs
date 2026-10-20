@@ -4,23 +4,24 @@
 //   source/blender/modifiers/intern/MOD_build.cc, source/blender/modifiers/intern/MOD_laplaciansmooth.cc, SPDX-FileCopyrightText: 2005 Blender Authors, GPL-2.0-or-later.
 //   source/blender/modifiers/intern/MOD_wireframe.cc, source/blender/modifiers/intern/MOD_skin.cc, source/blender/modifiers/intern/MOD_warp.cc, source/blender/blenkernel/intern/mesh_remap.cc, source/blender/modifiers/intern/MOD_mesh_to_volume.cc, source/blender/bmesh/tools/bmesh_wireframe.cc, SPDX-FileCopyrightText: 2023 Blender Authors, GPL-2.0-or-later.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-use glam::{DQuat, DVec3};
+use glam::{DMat4, DQuat, DVec3, Mat4, Vec3};
 use serde_json::Value;
 
-use crate::model::Modifier;
+use crate::model::{Id, Modifier};
 
 use super::{
-    bool_param, build_mesh, closest_point_triangle, id_indices, invalid_parameter, loose_edges,
-    number_param, polygons, positions, schema_value, string_param, uint_param, usize_as_f64,
-    validated, vec3_param,
+    MergedGeometry, Polygon, bool_param, build_mesh, closest_point_triangle, cyclic_pairs,
+    edge_pairs, id_indices, invalid_parameter, loose_edges, number_param, polygons, positions,
+    schema_value, string_param, uint_param, usize_as_f64, validated, vec3_param, vertex_normals,
 };
 use crate::{
     error::{ErrorCode, PotError, Result},
     geom::{
         Mesh,
         clnor::{self, NormalCodeOptions},
+        color_layers::{self, ColorDomain},
         normals::{corner_angle, corner_normals, face_normal, sharp_edge_flags},
         provenance::Origin,
         uv_layers,
@@ -204,218 +205,801 @@ fn simple_deform_bend(coordinates: [f64; 3], cut: [f64; 3], axis: usize, factor:
     }
 }
 
+/// Blender's Screw modifier (`MOD_screw.cc`): the profile edges sweep around the axis through the
+/// pivot, one ring per step, and the screw offset rises along the axis.
 pub(super) fn screw(
     mesh: &Mesh,
     modifier: &Modifier,
     context: crate::eval::ModifierEvaluationContext<'_>,
+    owner_world_matrix: DMat4,
+    object_world_matrices: &BTreeMap<Id, DMat4>,
 ) -> Result<Mesh> {
     // Blender returns an empty template before reading any Screw parameters.
     if mesh.vertices.is_empty() {
         return Ok(mesh.clone());
     }
+    validated(mesh)?;
+    let axis_index = match schema_value(modifier, "axis")? {
+        Value::String(axis) => match axis.as_str() {
+            "X" => 0,
+            "Y" => 1,
+            "Z" => 2,
+            _ => return Err(invalid_parameter(modifier, "axis", "X, Y, or Z")),
+        },
+        _ => return Err(invalid_parameter(modifier, "axis", "X, Y, or Z")),
+    };
     let steps_name = if context.purpose == crate::eval::EvaluationPurpose::Render {
         "render_steps"
     } else {
         "steps"
     };
-    let steps = usize::try_from(uint_param(modifier, steps_name)?)
-        .map_err(|_| invalid_parameter(modifier, steps_name, "an integer from 1 to 4096"))?;
-    if !(1..=4096).contains(&steps) {
-        return Err(invalid_parameter(
-            modifier,
-            steps_name,
-            "an integer from 1 to 4096",
-        ));
-    }
-    let angle = number_param(modifier, "angle")?;
-    let axis = match schema_value(modifier, "axis")? {
-        Value::String(axis) => match axis.as_str() {
-            "X" => DVec3::X,
-            "Y" => DVec3::Y,
-            "Z" => DVec3::Z,
-            _ => return Err(invalid_parameter(modifier, "axis", "X, Y, or Z")),
-        },
-        _ => return Err(invalid_parameter(modifier, "axis", "X, Y, or Z")),
-    };
-    let center = DVec3::ZERO;
-    let height = number_param(modifier, "screw_offset")?;
+    let steps = screw_count(modifier, steps_name)?;
+    let iterations = screw_count(modifier, "iterations")?;
+    // Both counts are at most 10000, so the product fits a usize.
+    let base_step_count = steps * iterations;
+    let angle = screw_float(modifier, "angle")?;
+    let input_screw_offset = screw_float(modifier, "screw_offset")?;
     let stretch_u = bool_param(modifier, "use_stretch_u")?;
     let stretch_v = bool_param(modifier, "use_stretch_v")?;
-    let source_positions = positions(mesh);
-    let vertex_indices = id_indices(mesh);
-    let source_edges = mesh
-        .edges
-        .iter()
-        .map(|edge| {
-            let first = vertex_indices
-                .get(&edge.vertices[0])
-                .copied()
-                .ok_or_else(|| {
-                    invalid_parameter(modifier, "mesh", "edges referencing existing vertices")
-                })?;
-            let second = vertex_indices
-                .get(&edge.vertices[1])
-                .copied()
-                .ok_or_else(|| {
-                    invalid_parameter(modifier, "mesh", "edges referencing existing vertices")
-                })?;
-            Ok([first, second])
-        })
-        .collect::<Result<Vec<_>>>()?;
-    if source_edges.is_empty() {
+    let merge = bool_param(modifier, "use_merge_vertices")?;
+    let merge_threshold = screw_float(modifier, "merge_threshold")?;
+    if merge_threshold < 0.0 {
         return Err(invalid_parameter(
             modifier,
-            "mesh",
-            "at least one profile edge",
+            "merge_threshold",
+            "a non-negative finite number",
+        ));
+    }
+    let normal_calculate = bool_param(modifier, "use_normal_calculate")?;
+    let normal_flip = bool_param(modifier, "use_normal_flip")?;
+    let smooth_shade = bool_param(modifier, "use_smooth_shade")?;
+
+    let axis_object = match schema_value(modifier, "object")? {
+        Value::Null => None,
+        Value::String(name) => {
+            let id = Id::new(name.as_str())
+                .map_err(|_| invalid_parameter(modifier, "object", "a valid object ID or null"))?;
+            let world = object_world_matrices.get(&id).ok_or_else(|| {
+                PotError::with_details(
+                    ErrorCode::TargetNotFound,
+                    "screw axis object was not found",
+                    serde_json::json!({"modifier_id": modifier.id, "object": id}),
+                )
+            })?;
+            // Blender's relative axis transform: the axis object expressed in the owner's space.
+            let owner =
+                Mat4::from_cols_array(&owner_world_matrix.to_cols_array().map(|c| c as f32));
+            let target = Mat4::from_cols_array(&world.to_cols_array().map(|c| c as f32));
+            let relative = owner.inverse() * target;
+            if !relative
+                .to_cols_array()
+                .iter()
+                .all(|component| component.is_finite())
+            {
+                return Err(invalid_parameter(
+                    modifier,
+                    "object",
+                    "an axis object with a finite relative transform",
+                ));
+            }
+            Some(relative)
+        }
+        _ => {
+            return Err(invalid_parameter(
+                modifier,
+                "object",
+                "an object ID or null",
+            ));
+        }
+    };
+    let mut axis = match axis_index {
+        0 => Vec3::X,
+        1 => Vec3::Y,
+        _ => Vec3::Z,
+    };
+    let pivot = if let Some(relative) = axis_object {
+        let transformed = relative.transform_vector3(axis);
+        if !transformed.is_finite()
+            || !transformed.length_squared().is_finite()
+            || transformed.length_squared() == 0.0
+        {
+            return Err(invalid_parameter(
+                modifier,
+                "object",
+                "an axis object whose transformed axis is non-degenerate",
+            ));
+        }
+        axis = transformed.normalize();
+        relative.w_axis.truncate()
+    } else {
+        Vec3::ZERO
+    };
+    let mut screw_offset = input_screw_offset;
+    if axis_object.is_some() && bool_param(modifier, "use_object_screw_offset")? {
+        // The axis object's offset is its pivot's projection onto the axis.
+        screw_offset = axis.dot(pivot);
+    }
+    let iterations_f32 = iterations as f32;
+    let scaled_angle = angle * iterations_f32;
+    screw_offset *= iterations_f32;
+    if !scaled_angle.is_finite() {
+        return Err(invalid_parameter(
+            modifier,
+            "angle",
+            "a finite angle after applying iterations",
+        ));
+    }
+    if !screw_offset.is_finite() {
+        return Err(invalid_parameter(
+            modifier,
+            "screw_offset",
+            "a finite offset after applying iterations",
         ));
     }
     // Blender closes a full turn only from three steps up, and only when the screw offset and the
     // turn's excess over 2π are within FLT_EPSILON * 100 (float32, MOD_screw.cc); a closed screw
-    // then ignores the offset. The angle is a float32 parameter, so 2π is compared in float32 too.
-    let tolerance = f32::EPSILON * 100.0;
-    let closed = steps >= 3
-        && (height as f32).abs() <= tolerance
-        && ((angle as f32).abs() - std::f32::consts::TAU).abs() <= tolerance;
-    let height = if closed { 0.0 } else { height };
-    let ring_count = if closed { steps } else { steps + 1 };
-    let mut points = Vec::with_capacity(source_positions.len() * ring_count);
-    for step in 0..ring_count {
-        let t = step as f64 / steps as f64;
-        let rotation = DQuat::from_axis_angle(axis, angle * t);
-        for point in &source_positions {
-            let offset = *point - center;
-            points.push(center + rotation * offset + axis * (height * t));
-        }
+    // then ignores the offset and drops its duplicate ring.
+    let closure_tolerance = f32::EPSILON * 100.0;
+    let mut ring_count = base_step_count + 1;
+    let closed = screw_offset.abs() <= closure_tolerance
+        && (scaled_angle.abs() - std::f32::consts::TAU).abs() <= closure_tolerance
+        && ring_count > 3;
+    if closed {
+        ring_count -= 1;
+        screw_offset = 0.0;
     }
-    let segments = if closed { ring_count } else { ring_count - 1 };
-    let mut faces = Vec::with_capacity(segments * source_edges.len());
-    let flip = bool_param(modifier, "use_normal_flip")?;
-    for step in 0..segments {
-        let next_step = (step + 1) % ring_count;
-        for [first, second] in &source_edges {
-            // Blender's screw loops run against the profile edge's winding, so each face's cycle runs
-            // back from the next ring to this one. `use_normal_flip` reverses every quad (quad_ord in
-            // MOD_screw.cc).
-            let mut quad = vec![
-                next_step * source_positions.len() + second,
-                next_step * source_positions.len() + first,
-                step * source_positions.len() + first,
-                step * source_positions.len() + second,
-            ];
-            if flip {
-                quad.reverse();
-            }
-            faces.push((quad, 0));
-        }
-    }
-    let vertex_count = source_positions.len();
-    // Blender takes each screw loop's data from the last source loop of its profile vertex. A profile
-    // edge that no face uses has no loops, so its screw corners carry no source data.
-    let mut last_loop: Vec<Option<usize>> = vec![None; vertex_count];
-    let mut loop_start = 0_usize;
-    let mut face_edges: HashSet<(usize, usize)> = HashSet::new();
-    for source_face in &mesh.faces {
-        for (corner, id) in source_face.vertices.iter().enumerate() {
-            if let Some(&index) = vertex_indices.get(id) {
-                last_loop[index] = Some(loop_start + corner);
-            }
-        }
-        loop_start += source_face.vertices.len();
-        let ring: Vec<usize> = source_face
-            .vertices
-            .iter()
-            .filter_map(|id| vertex_indices.get(id).copied())
-            .collect();
-        for pair in 0..ring.len() {
-            let (a, b) = (ring[pair], ring[(pair + 1) % ring.len()]);
-            face_edges.insert((a.min(b), a.max(b)));
-        }
-    }
-    let edge_count = source_edges.len();
-    let loose_edge: Vec<bool> = source_edges
+    let segment_count = if closed { ring_count } else { ring_count - 1 };
+    let vertex_count = mesh.vertices.len();
+    let point_count = vertex_count
+        .checked_mul(ring_count)
+        .ok_or_else(|| invalid_parameter(modifier, steps_name, "a fitting generated mesh"))?;
+    let source_positions: Vec<Vec3> = mesh
+        .vertices
         .iter()
-        .map(|&[a, b]| !face_edges.contains(&(a.min(b), a.max(b))))
+        .map(|vertex| vertex.co.as_vec3())
         .collect();
-    let mut corners = Vec::with_capacity(faces.len() * 4);
-    for (face, (vertices, _)) in faces.iter().enumerate() {
-        let loose = loose_edge[face % edge_count];
-        for index in vertices {
-            corners.push(match last_loop[index % vertex_count] {
-                Some(corner) if !loose => vec![(corner, 1.0)],
-                _ => Vec::new(),
-            });
-        }
+    if source_positions.iter().any(|point| !point.is_finite()) {
+        return Err(invalid_parameter(
+            modifier,
+            "mesh",
+            "finite float32 vertex positions",
+        ));
     }
-    let origin = Origin {
-        corners: Some(corners),
-        ..Origin::copies(
-            (0..ring_count * vertex_count).map(|index| Some(index % vertex_count)),
-            vec![None; faces.len()],
-        )
-    };
-    // Each corner's U advances by the rings between its face's step and its vertex's ring: one share
-    // of the angle per ring, or 1/steps per ring under use_stretch_u. A closed seam keeps counting:
-    // its wrap ring is one full share further on. Corners of a loose profile edge (no face loop) start
-    // from zero U and take V from the profile vertex's height along the axis: that height unchanged
-    // without use_stretch_v, and rescaled over the profile's height range with it (zero when flat).
-    // Corners of face-loop edges keep their source V.
-    let turn = if stretch_u {
-        1.0 / usize_as_f64(steps)
-    } else {
-        angle / (std::f64::consts::TAU * usize_as_f64(steps))
-    };
-    let axial: Vec<f64> = source_positions
+    let has_uv_layers = uv_layers::layer_count(mesh) > 0;
+    // Each profile vertex's height along the axis: V without stretch, or its share of the range.
+    let axial: Vec<f32> = source_positions
         .iter()
         .map(|point| point.dot(axis))
         .collect();
-    let (low, high) = axial.iter().fold(
-        (f64::INFINITY, f64::NEG_INFINITY),
-        |(low, high), &height| (low.min(height), high.max(height)),
-    );
-    let loose_v = |profile: usize| {
-        if !stretch_v {
-            axial[profile]
-        } else if high > low {
-            (axial[profile] - low) / (high - low)
-        } else {
-            0.0
-        }
-    };
-    let corner_uv: Vec<Vec<(usize, Option<f64>)>> = faces
+    let (axial_low, axial_high) = axial
         .iter()
-        .enumerate()
-        .map(|(face, (vertices, _))| {
-            let step = face / edge_count;
-            let loose = loose_edge[face % edge_count];
-            vertices
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |(low, high), &value| {
+            (low.min(value), high.max(value))
+        });
+    // U advances one share of the turn per ring; stretch U spreads the turn over the steps.
+    let u_scale = if stretch_u {
+        1.0_f32 / steps as f32
+    } else {
+        (1.0_f32 / steps as f32 / iterations as f32) * (scaled_angle / std::f32::consts::TAU)
+    };
+
+    let mut profile_edges = edge_pairs(mesh)?;
+    let mut edge_lookup = HashMap::with_capacity(profile_edges.len());
+    for (edge, [first, second]) in profile_edges.iter().enumerate() {
+        edge_lookup.insert((*first.min(second), *first.max(second)), edge);
+    }
+    let source_polygons = polygons(mesh)?;
+    let mut edge_faces: Vec<Option<usize>> = vec![None; profile_edges.len()];
+    let mut last_loop: Vec<Option<usize>> = vec![None; vertex_count];
+    let mut corner_start = 0;
+    for (face_index, (face_vertices, _)) in source_polygons.iter().enumerate() {
+        for (corner, &vertex) in face_vertices.iter().enumerate() {
+            last_loop[vertex] = Some(corner_start + corner);
+            let next = face_vertices[(corner + 1) % face_vertices.len()];
+            let edge = *edge_lookup
+                .get(&(vertex.min(next), vertex.max(next)))
+                .ok_or_else(|| invalid_parameter(modifier, "mesh", "faces with valid edges"))?;
+            edge_faces[edge] = Some(face_index);
+            // MOD_screw orients each source edge to the last face loop using it.
+            profile_edges[edge] = [vertex, next];
+        }
+        corner_start += face_vertices.len();
+    }
+    if normal_calculate {
+        screw_calculate_normals(
+            &mut profile_edges,
+            &source_positions,
+            axis_index,
+            axis_object,
+            scaled_angle,
+        );
+    }
+
+    let mut points: Vec<DVec3> = Vec::new();
+    points
+        .try_reserve_exact(point_count)
+        .map_err(|_| invalid_parameter(modifier, steps_name, "a fitting generated mesh"))?;
+    let step_angle = scaled_angle
+        / if closed {
+            ring_count as f32
+        } else {
+            (ring_count - 1) as f32
+        };
+    points.extend(source_positions.iter().map(|point| point.as_dvec3()));
+    for step in 1..ring_count {
+        let rotation_angle = step_angle * step as f32;
+        let angle_cos = rotation_angle.cos();
+        let angle_sin = rotation_angle.sin();
+        let rotation = if axis_object.is_some() {
+            let ico = 1.0_f32 - angle_cos;
+            let [axis_x, axis_y, axis_z] = axis.to_array();
+            let nsi = [axis_x * angle_sin, axis_y * angle_sin, axis_z * angle_sin];
+            let n_00 = (axis_x * axis_x) * ico;
+            let n_01 = (axis_x * axis_y) * ico;
+            let n_11 = (axis_y * axis_y) * ico;
+            let n_02 = (axis_x * axis_z) * ico;
+            let n_12 = (axis_y * axis_z) * ico;
+            let n_22 = (axis_z * axis_z) * ico;
+            [
+                [n_00 + angle_cos, n_01 + nsi[2], n_02 - nsi[1]],
+                [n_01 - nsi[2], n_11 + angle_cos, n_12 + nsi[0]],
+                [n_02 + nsi[1], n_12 - nsi[0], n_22 + angle_cos],
+            ]
+        } else {
+            match axis_index {
+                0 => [
+                    [1.0, 0.0, 0.0],
+                    [0.0, angle_cos, angle_sin],
+                    [0.0, -angle_sin, angle_cos],
+                ],
+                1 => [
+                    [angle_cos, 0.0, -angle_sin],
+                    [0.0, 1.0, 0.0],
+                    [angle_sin, 0.0, angle_cos],
+                ],
+                _ => [
+                    [angle_cos, angle_sin, 0.0],
+                    [-angle_sin, angle_cos, 0.0],
+                    [0.0, 0.0, 1.0],
+                ],
+            }
+        };
+        let offset = if closed {
+            0.0
+        } else {
+            screw_offset * step as f32 / (ring_count - 1) as f32
+        };
+        for &point in &source_positions {
+            let relative = point - pivot;
+            let rotated = Vec3::new(
+                relative.x * rotation[0][0]
+                    + relative.y * rotation[1][0]
+                    + rotation[2][0] * relative.z,
+                relative.x * rotation[0][1]
+                    + relative.y * rotation[1][1]
+                    + rotation[2][1] * relative.z,
+                relative.x * rotation[0][2]
+                    + relative.y * rotation[1][2]
+                    + rotation[2][2] * relative.z,
+            );
+            points.push((pivot + rotated + axis * offset).as_dvec3());
+        }
+    }
+
+    // One quad per profile edge and segment. Blender's screw loops run against the profile edge's
+    // winding; `use_normal_flip` reverses every quad (quad_ord in MOD_screw.cc).
+    let face_count = segment_count * profile_edges.len();
+    let mut quads: Vec<Polygon> = Vec::with_capacity(face_count);
+    // Each generated quad's point indices, kept after the merge consumes `quads`.
+    let mut quad_points: Vec<[usize; 4]> = Vec::with_capacity(face_count);
+    let mut face_sources: Vec<Option<usize>> = Vec::with_capacity(face_count);
+    let mut corner_sources: Vec<Vec<Vec<(usize, f64)>>> = Vec::with_capacity(face_count);
+    let mut corner_uv: Vec<Vec<(usize, Option<f64>)>> =
+        Vec::with_capacity(if has_uv_layers { face_count } else { 0 });
+    for (edge_index, &[first, second]) in profile_edges.iter().enumerate() {
+        let source_face = edge_faces[edge_index];
+        let material = source_face.map_or(0, |face| source_polygons[face].1);
+        for step in 0..segment_count {
+            let next_step = (step + 1) % ring_count;
+            let mut quad = [
+                step * vertex_count + first,
+                step * vertex_count + second,
+                next_step * vertex_count + second,
+                next_step * vertex_count + first,
+            ];
+            if normal_flip {
+                quad.reverse();
+            }
+            // A corner takes the data of its profile vertex's last source loop, on source faces only.
+            let corners: Vec<Vec<(usize, f64)>> = quad
                 .iter()
-                .map(|index| {
-                    let ring = index / vertex_count;
-                    let turns = step + (ring + ring_count - step) % ring_count;
-                    (turns, loose.then(|| loose_v(index % vertex_count)))
+                .map(|&point| {
+                    source_face
+                        .and_then(|_| last_loop[point % vertex_count])
+                        .map(|corner| vec![(corner, 1.0)])
+                        .unwrap_or_default()
                 })
-                .collect()
+                .collect();
+            if has_uv_layers {
+                // Each corner's U advances by the rings between its face's step and its ring.
+                corner_uv.push(
+                    quad.iter()
+                        .map(|&point| {
+                            let profile = point % vertex_count;
+                            let ring = point / vertex_count;
+                            let turns = step + (ring + ring_count - step) % ring_count;
+                            let loose_v = source_face.is_none().then(|| {
+                                if !stretch_v {
+                                    f64::from(axial[profile])
+                                } else if axial_high > axial_low {
+                                    f64::from(
+                                        (axial[profile] - axial_low) / (axial_high - axial_low),
+                                    )
+                                } else {
+                                    0.0
+                                }
+                            });
+                            (turns, loose_v)
+                        })
+                        .collect(),
+                );
+            }
+            quads.push((quad.to_vec(), material));
+            quad_points.push(quad);
+            face_sources.push(source_face);
+            corner_sources.push(corners);
+        }
+    }
+
+    // Blender copies the source profile edges at each ring and adds one longitudinal edge per
+    // profile vertex and segment. Keep these edges even when a merge removes their only face.
+    let mut generated_edges = Vec::with_capacity(
+        profile_edges
+            .len()
+            .saturating_mul(ring_count)
+            .saturating_add(vertex_count.saturating_mul(segment_count)),
+    );
+    for ring in 0..ring_count {
+        for &[first, second] in &profile_edges {
+            generated_edges.push([ring * vertex_count + first, ring * vertex_count + second]);
+        }
+    }
+    for step in 0..segment_count {
+        let next_step = (step + 1) % ring_count;
+        for vertex in 0..vertex_count {
+            generated_edges.push([
+                step * vertex_count + vertex,
+                next_step * vertex_count + vertex,
+            ]);
+        }
+    }
+
+    let merged = if merge && screw_offset == 0.0 {
+        // On-axis profile vertices snap to the axis; every ring copy merges into its ring-0 vertex.
+        let threshold_squared = merge_threshold * merge_threshold;
+        let mut destinations = vec![None; point_count];
+        for profile in 0..vertex_count {
+            let relative = source_positions[profile] - pivot;
+            let projection = pivot + axis * relative.dot(axis);
+            if (source_positions[profile] - projection).length_squared() <= threshold_squared {
+                points[profile] = projection.as_dvec3();
+                for ring in 0..ring_count {
+                    destinations[ring * vertex_count + profile] = Some(profile);
+                }
+            }
+        }
+        super::merge_by_dest_map(&points, quads, generated_edges, &destinations, false)
+    } else {
+        MergedGeometry::unmerged(points, quads, generated_edges)
+    };
+
+    let mut remap = vec![0; point_count];
+    for (output, members) in merged.point_members.iter().enumerate() {
+        for &member in members {
+            remap[member] = output;
+        }
+    }
+    let mut output_face_sources = Vec::with_capacity(merged.polygons.len());
+    let mut output_corner_sources = Vec::with_capacity(
+        merged
+            .polygons
+            .iter()
+            .map(|(face, _)| face.len())
+            .sum::<usize>(),
+    );
+    let mut output_corner_uv: Vec<Vec<(f64, Option<f64>)>> = Vec::with_capacity(if has_uv_layers {
+        merged.polygons.len()
+    } else {
+        0
+    });
+    for (output_face, (face, _)) in merged.polygons.iter().enumerate() {
+        let original_face = merged.polygon_sources[output_face];
+        let source_face = face_sources[original_face];
+        output_face_sources.push(source_face);
+        let mut face_uv = Vec::with_capacity(if has_uv_layers { face.len() } else { 0 });
+        for &output_vertex in face {
+            let mut source_corners = Vec::new();
+            let mut source_corner_count = 0_usize;
+            let mut u_sum = 0.0_f32;
+            let mut loose_v_sum = 0.0_f32;
+            for (corner, &old_vertex) in quad_points[original_face].iter().enumerate() {
+                if remap[old_vertex] != output_vertex {
+                    continue;
+                }
+                source_corner_count += 1;
+                source_corners.extend(corner_sources[original_face][corner].iter().copied());
+                if has_uv_layers {
+                    let (turns, loose_v) = corner_uv[original_face][corner];
+                    u_sum += turns as f32 * u_scale;
+                    if let Some(v) = loose_v {
+                        loose_v_sum += v as f32;
+                    }
+                }
+            }
+            if source_corner_count == 0 {
+                return Err(invalid_parameter(
+                    modifier,
+                    "mesh",
+                    "valid merged face corners",
+                ));
+            }
+            let source_weight = 1.0 / source_corner_count as f64;
+            output_corner_sources.push(
+                source_corners
+                    .into_iter()
+                    .map(|(source, weight)| (source, weight * source_weight))
+                    .collect(),
+            );
+            if has_uv_layers {
+                let loose_v = source_face
+                    .is_none()
+                    .then(|| f64::from(loose_v_sum / source_corner_count as f32));
+                face_uv.push((f64::from(u_sum / source_corner_count as f32), loose_v));
+            }
+        }
+        if has_uv_layers {
+            output_corner_uv.push(face_uv);
+        }
+    }
+
+    // Generated edges that no output face uses (profile edges with no face loop, or the longitudinal
+    // edges of isolated profile vertices) become loose edges of the result.
+    let face_edges: HashSet<(usize, usize)> = merged
+        .polygons
+        .iter()
+        .flat_map(|(face, _)| {
+            cyclic_pairs(face).map(|(&first, &second)| (first.min(second), first.max(second)))
         })
         .collect();
-    let mut result = build_mesh(points, faces, Vec::new(), &origin, mesh)?;
-    if bool_param(modifier, "use_smooth_shade")? {
-        crate::geom::normals::shade_faces_smooth(&mut result);
+    let mut emitted_edges = HashSet::new();
+    let loose_output_edges: Vec<[usize; 2]> = merged
+        .edges
+        .iter()
+        .copied()
+        .filter(|&[first, second]| {
+            let key = (first.min(second), first.max(second));
+            !face_edges.contains(&key) && emitted_edges.insert(key)
+        })
+        .collect();
+    let origin = Origin {
+        vertices: merged
+            .point_members
+            .iter()
+            .map(|members| {
+                members
+                    .first()
+                    .map(|member| vec![(member % vertex_count, 1.0)])
+                    .unwrap_or_default()
+            })
+            .collect(),
+        faces: output_face_sources,
+        corners: Some(output_corner_sources),
+        ..Default::default()
+    };
+    let mut result = build_mesh(
+        merged.points,
+        merged.polygons,
+        loose_output_edges,
+        &origin,
+        mesh,
+    )?;
+    let mut colors = color_layers::read(&result);
+    if !colors.layers.is_empty() {
+        // Blender initializes new Screw CORNER FLOAT_COLOR elements to opaque white.
+        let encodings = result
+            .attributes
+            .get("blender_metadata")
+            .and_then(|metadata| metadata.get("color_data_types"))
+            .and_then(Value::as_object);
+        let mut corner_start = 0;
+        for (face, source) in result.faces.iter().zip(&origin.faces) {
+            let corner_end = corner_start + face.vertices.len();
+            if source.is_none() {
+                for layer in &mut colors.layers {
+                    let encoding = encodings
+                        .and_then(|types| types.get(&layer.name))
+                        .and_then(Value::as_str)
+                        .unwrap_or("FLOAT_COLOR");
+                    if layer.domain == ColorDomain::Corner && encoding == "FLOAT_COLOR" {
+                        layer.values[corner_start..corner_end].fill([1.0; 4]);
+                    }
+                }
+            }
+            corner_start = corner_end;
+        }
+        color_layers::write(&mut result, &colors);
     }
-    let mut layers = uv_layers::read_layers(&result);
-    for layer in &mut layers {
-        for (face, values) in layer.faces.iter_mut().enumerate() {
-            let corners = &corner_uv[face];
-            if values.is_none() && corners.iter().all(|(_, value)| value.is_some()) {
-                *values = Some(vec![[0.0, 0.0]; corners.len()]);
+    // Blender allocates Screw's edge custom data with CD_SET_DEFAULT and does not interpolate
+    // edge attributes, so copied edge flags and creases are cleared on the rebuilt topology.
+    result.attributes.remove("sharp");
+    result.attributes.remove("blender_edge_flags");
+    result.attributes.remove("crease_edge");
+    if smooth_shade && origin.faces.iter().any(Option::is_none) {
+        let mut flags = crate::geom::normals::smooth_face_flags(&result)?;
+        for (flag, source) in flags.iter_mut().zip(&origin.faces) {
+            if source.is_none() {
+                *flag = true;
+            }
+        }
+        let values: serde_json::Map<String, Value> = result
+            .faces
+            .iter()
+            .zip(flags)
+            .map(|(face, smooth)| (format!("f{}", face.id), Value::Bool(smooth)))
+            .collect();
+        result.attributes.insert(
+            "shade_smooth".to_owned(),
+            serde_json::json!({"domain": "face", "type": "bool", "values": values}),
+        );
+    }
+    if has_uv_layers {
+        // A generated face has no source UV entry, so it starts from zero before its U and V are set.
+        let mut layers = uv_layers::read_layers(&result);
+        for layer in &mut layers {
+            for (face, values) in layer.faces.iter_mut().enumerate() {
+                let corners = &output_corner_uv[face];
+                if values.is_none() && corners.iter().all(|(_, loose)| loose.is_some()) {
+                    *values = Some(vec![[0.0, 0.0]; corners.len()]);
+                }
+            }
+        }
+        uv_layers::write_layers(&mut result, &layers);
+        super::map_uv_values(&mut result, |face, corner, [u, v]| {
+            let (u_offset, loose_v) = output_corner_uv[face][corner];
+            let offset = u_offset as f32;
+            [
+                f64::from(if loose_v.is_some() {
+                    offset
+                } else {
+                    u as f32 + offset
+                }),
+                loose_v.unwrap_or(v),
+            ]
+        });
+    }
+    Ok(result)
+}
+
+fn screw_count(modifier: &Modifier, name: &str) -> Result<usize> {
+    let count = usize::try_from(uint_param(modifier, name)?)
+        .map_err(|_| invalid_parameter(modifier, name, "an integer from 1 through 10000"))?;
+    if !(1..=10000).contains(&count) {
+        return Err(invalid_parameter(
+            modifier,
+            name,
+            "an integer from 1 through 10000",
+        ));
+    }
+    Ok(count)
+}
+
+fn screw_float(modifier: &Modifier, name: &str) -> Result<f32> {
+    let value = number_param(modifier, name)? as f32;
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(invalid_parameter(modifier, name, "a finite Blender float"))
+    }
+}
+
+/// One profile vertex's neighbours in the screw's edge chain (`ScrewConnection` in `MOD_screw.cc`).
+/// A vertex with more than two profile edges is invalid and breaks its chain.
+#[derive(Clone, Copy, Default)]
+struct ScrewConnection {
+    neighbors: [Option<usize>; 2],
+    edges: [Option<usize>; 2],
+    invalid: bool,
+}
+
+#[derive(Clone, Copy)]
+struct ScrewVertexIter {
+    vertex: Option<usize>,
+    other: Option<usize>,
+    edge: Option<usize>,
+}
+
+fn screw_vertex_iter(
+    connections: &[ScrewConnection],
+    vertex: usize,
+    direction: usize,
+) -> ScrewVertexIter {
+    if connections[vertex].invalid {
+        return ScrewVertexIter {
+            vertex: None,
+            other: None,
+            edge: None,
+        };
+    }
+    ScrewVertexIter {
+        vertex: Some(vertex),
+        other: connections[vertex].neighbors[direction],
+        edge: connections[vertex].edges[1 - direction],
+    }
+}
+
+fn screw_vertex_step(iter: &mut ScrewVertexIter, connections: &[ScrewConnection]) {
+    let Some(vertex) = iter.vertex else {
+        return;
+    };
+    if connections[vertex].invalid {
+        iter.vertex = None;
+        iter.edge = None;
+        return;
+    }
+    let links = &connections[vertex];
+    if links.neighbors[0] == iter.other {
+        iter.other = Some(vertex);
+        iter.vertex = links.neighbors[1];
+    } else if links.neighbors[1] == iter.other {
+        iter.other = Some(vertex);
+        iter.vertex = links.neighbors[0];
+    }
+    if let Some(next) = iter.vertex {
+        let next_links = &connections[next];
+        let edge_slot = usize::from(next_links.edges[0] == iter.edge);
+        iter.edge = next_links.edges[edge_slot];
+    } else {
+        iter.edge = None;
+    }
+}
+
+/// Blender's `screw_calculate_normals`: orients each profile chain so its screw faces wind away
+/// from the axis, judged at the chain vertex farthest from the axis, and flips for a negative angle.
+fn screw_calculate_normals(
+    edges: &mut [[usize; 2]],
+    positions: &[Vec3],
+    axis_index: usize,
+    axis_object: Option<Mat4>,
+    angle: f32,
+) {
+    if edges.is_empty() {
+        return;
+    }
+    let coordinates: Vec<Vec3> = positions
+        .iter()
+        .map(|&position| {
+            axis_object.map_or(position, |relative| relative.transform_point3(position))
+        })
+        .collect();
+    let other_axes = match axis_index {
+        0 => [1, 2],
+        1 => [0, 2],
+        _ => [0, 1],
+    };
+    let mut connections = vec![ScrewConnection::default(); positions.len()];
+    for (edge_index, &[first, second]) in edges.iter().enumerate() {
+        for (vertex, neighbor) in [(first, second), (second, first)] {
+            let connection = &mut connections[vertex];
+            if connection.invalid {
+                continue;
+            }
+            if connection.neighbors[0].is_none() {
+                connection.neighbors[0] = Some(neighbor);
+                connection.edges[0] = Some(edge_index);
+            } else if connection.neighbors[1].is_none() {
+                connection.neighbors[1] = Some(neighbor);
+                connection.edges[1] = Some(edge_index);
+            } else {
+                connection.neighbors = [None; 2];
+                connection.edges = [None; 2];
+                connection.invalid = true;
             }
         }
     }
-    uv_layers::write_layers(&mut result, &layers);
-    super::map_uv_values(&mut result, |face, corner, [u, v]| {
-        let (turns, loose_value) = corner_uv[face][corner];
-        [u + turn * usize_as_f64(turns), loose_value.unwrap_or(v)]
-    });
-    Ok(result)
+    let distances: Vec<f32> = coordinates
+        .iter()
+        .map(|point| {
+            point[other_axes[0]] * point[other_axes[0]]
+                + point[other_axes[1]] * point[other_axes[1]]
+        })
+        .collect();
+    let mut flags = vec![0_u8; positions.len()];
+    for start in 0..positions.len() {
+        if flags[start] != 0 || connections[start].invalid {
+            continue;
+        }
+        let mut linked = 0;
+        let mut best = None;
+        let mut best_distance = -1.0_f32;
+        let mut closed = false;
+        for direction in 0..2 {
+            let mut iter = screw_vertex_iter(&connections, start, direction);
+            if direction == 1 {
+                screw_vertex_step(&mut iter, &connections);
+            }
+            while let Some(vertex) = iter.vertex {
+                if flags[vertex] != 0 {
+                    closed = true;
+                    break;
+                }
+                flags[vertex] = 1;
+                linked += 1;
+                if best_distance <= distances[vertex] {
+                    best_distance = distances[vertex];
+                    best = Some(vertex);
+                }
+                screw_vertex_step(&mut iter, &connections);
+            }
+        }
+        if linked <= 1 {
+            continue;
+        }
+        let Some(best) = best else {
+            continue;
+        };
+        let best_links = connections[best];
+        let mut flip = false;
+        match best_links.neighbors {
+            [Some(first), Some(second)] => {
+                let center = coordinates[best][axis_index];
+                let first_axis = coordinates[first][axis_index];
+                let second_axis = coordinates[second][axis_index];
+                if first_axis < center && center < second_axis {
+                    flip = false;
+                } else if first_axis > center && center > second_axis {
+                    flip = true;
+                } else {
+                    let first_delta = (coordinates[first] - coordinates[best]).normalize_or_zero();
+                    let second_delta =
+                        (coordinates[second] - coordinates[best]).normalize_or_zero();
+                    flip = first_delta[axis_index] < second_delta[axis_index];
+                }
+            }
+            [Some(neighbor), None] | [None, Some(neighbor)] => {
+                flip = coordinates[neighbor][axis_index] < coordinates[best][axis_index];
+            }
+            _ => {}
+        }
+        if angle < 0.0 {
+            flip = !flip;
+        }
+        for direction in usize::from(closed)..2 {
+            let mut iter = screw_vertex_iter(&connections, best, direction);
+            flags[best] = 1;
+            if direction == 1
+                && best_links.neighbors[0].is_some()
+                && best_links.neighbors[1].is_some()
+            {
+                flip = !flip;
+            }
+            while let Some(vertex) = iter.vertex {
+                if flags[vertex] == 2 {
+                    break;
+                }
+                flags[vertex] = 2;
+                if let Some(edge) = iter.edge {
+                    if vertex == edges[edge][0] {
+                        if !flip {
+                            edges[edge].swap(0, 1);
+                        }
+                    } else if vertex == edges[edge][1] && flip {
+                        edges[edge].swap(0, 1);
+                    }
+                }
+                screw_vertex_step(&mut iter, &connections);
+            }
+        }
+    }
 }
 
 pub(super) fn shrinkwrap(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
@@ -649,29 +1233,9 @@ pub(super) fn wave(mesh: &Mesh, modifier: &Modifier, frame: f64) -> Result<Mesh>
     let use_normal = bool_param(modifier, "use_normal")?;
     let mut result = mesh.clone();
     let normals = if use_normal {
-        let indices = id_indices(mesh);
-        let positions = positions(mesh);
-        let mut normals = vec![DVec3::ZERO; mesh.vertices.len()];
-        let triangles = mesh
-            .triangulate()
-            .map_err(|_| invalid_parameter(modifier, "mesh", "valid triangulation"))?;
-        for triangle in triangles {
-            let [first, second, third] =
-                triangle.map(|id| indices.get(&id).copied().unwrap_or(usize::MAX));
-            if [first, second, third].contains(&usize::MAX) {
-                continue;
-            }
-            let normal = (positions[second] - positions[first])
-                .cross(positions[third] - positions[first])
-                .normalize_or_zero();
-            normals[first] += normal;
-            normals[second] += normal;
-            normals[third] += normal;
-        }
-        for normal in &mut normals {
-            *normal = normal.normalize_or_zero();
-        }
-        normals
+        // Blender's `mesh->vert_normals()` (`MOD_wave.cc`): the angle-weighted face-normal sum
+        // per vertex, the shared `vertex_normals` that Displace and Solidify also use.
+        vertex_normals(&positions(mesh), &polygons(mesh)?)
     } else {
         Vec::new()
     };
@@ -1260,9 +1824,9 @@ pub(super) fn corrective_smooth(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh
 }
 
 pub(super) fn build(mesh: &Mesh, modifier: &Modifier, frame: f64) -> Result<Mesh> {
-    let start = number_param(modifier, "frame_start")?;
-    let duration = number_param(modifier, "frame_duration")?.max(1.0);
-    let factor = ((frame - start) / duration).clamp(0.0, 1.0);
+    let start = number_param(modifier, "frame_start")? as f32;
+    let duration = (number_param(modifier, "frame_duration")? as f32).max(1.0);
+    let factor = ((frame as f32 - start) / duration).clamp(0.0, 1.0);
     let reverse = bool_param(modifier, "use_reverse")?;
     let threshold = if reverse { 1.0 - factor } else { factor };
     let use_random_order = bool_param(modifier, "use_random_order")?;
@@ -1271,9 +1835,9 @@ pub(super) fn build(mesh: &Mesh, modifier: &Modifier, frame: f64) -> Result<Mesh
     if use_random_order {
         randomize_build_order(&mut face_order, seed);
     }
-    let face_count = (mesh.faces.len() as f64 * threshold) as usize;
-    let edge_count = (mesh.edges.len() as f64 * threshold) as usize;
-    let vertex_count = (mesh.vertices.len() as f64 * threshold) as usize;
+    let face_count = (mesh.faces.len() as f32 * threshold) as usize;
+    let edge_count = (mesh.edges.len() as f32 * threshold) as usize;
+    let vertex_count = (mesh.vertices.len() as f32 * threshold) as usize;
     let source_positions = positions(mesh);
     let source_indices = id_indices(mesh);
     let mut sources = Vec::new();
@@ -1357,11 +1921,16 @@ pub(super) fn build(mesh: &Mesh, modifier: &Modifier, frame: f64) -> Result<Mesh
 }
 
 fn randomize_build_order(indices: &mut [usize], seed: u64) {
-    let mut state = (seed << 16) | 0x330e;
-    for index in (0..indices.len()).rev() {
+    let elem_num = indices.len();
+    if elem_num <= 1 {
+        return;
+    }
+    // Mirrors BLI_array_randomize: a seeded BLI_rng_shuffle_array shuffle over the full array.
+    let mut state = (u64::from(seed as u32) << 16) | 0x330e;
+    for index in (0..elem_num).rev() {
         state = state.wrapping_mul(0x0005_deec_e66d).wrapping_add(0xb) & 0x0000_ffff_ffff_ffff;
-        let random = (state >> 17) as usize;
-        let other = random % indices.len();
+        let random = (state >> 17) as u32;
+        let other = (random % elem_num as u32) as usize;
         indices.swap(index, other);
     }
 }
@@ -1565,7 +2134,7 @@ fn target_triangles(mesh: &Mesh) -> Result<Vec<[DVec3; 3]>> {
         .iter()
         .map(|vertex| (vertex.id, vertex.co))
         .collect();
-    mesh.triangulate()
+    mesh.tessellate()
         .map_err(|error| {
             PotError::invalid_argument(format!("invalid target triangulation: {error}"))
         })?
@@ -1760,27 +2329,26 @@ pub(super) fn mask(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     clippy::manual_midpoint,
     reason = "matches Blender's float evaluation order for parity"
 )]
-pub(super) fn wireframe(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
+pub(super) fn wireframe(
+    mesh: &Mesh,
+    modifier: &Modifier,
+    object_material_slots: usize,
+) -> Result<Mesh> {
     let thickness = number_param(modifier, "thickness")?;
     let offset = number_param(modifier, "offset")?;
-    if thickness < 0.0 {
-        return Err(invalid_parameter(
-            modifier,
-            "thickness",
-            "a non-negative number",
-        ));
-    }
     let use_boundary = bool_param(modifier, "use_boundary")?;
     let use_replace = bool_param(modifier, "use_replace")?;
     let use_even_offset = bool_param(modifier, "use_even_offset")?;
     let use_relative_offset = bool_param(modifier, "use_relative_offset")?;
     let use_crease = bool_param(modifier, "use_crease")?;
     let crease_weight = number_param(modifier, "crease_weight")?;
-    let material_offset = modifier
-        .params
-        .get("material_offset")
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
+    let material_offset = schema_value(modifier, "material_offset")?
+        .as_i64()
+        .ok_or_else(|| invalid_parameter(modifier, "material_offset", "an integer"))?;
+    let vertex_group = string_param(modifier, "vertex_group")?;
+    let invert_vertex_group = bool_param(modifier, "invert_vertex_group")?;
+    let thickness_vertex_group = number_param(modifier, "thickness_vertex_group")?.clamp(0.0, 1.0);
+    let (has_deform_data, group_weights) = wireframe_group_data(mesh, modifier, vertex_group)?;
     let source_positions = positions(mesh);
     let vertex_indices = id_indices(mesh);
     let mut face_normals = Vec::with_capacity(mesh.faces.len());
@@ -1832,27 +2400,57 @@ pub(super) fn wireframe(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         *normal = normal.normalize_or_zero();
     }
 
+    let mut tagged_vertices = vec![false; mesh.vertices.len()];
+    for indices in &face_indices {
+        for index in indices {
+            tagged_vertices[*index] = true;
+        }
+    }
+
     let mut relative_factors = vec![1.0; mesh.vertices.len()];
     if use_relative_offset {
-        let mut edge_lengths = vec![Vec::new(); mesh.vertices.len()];
+        let mut edge_length_sums = vec![0.0_f32; mesh.vertices.len()];
+        let mut edge_counts = vec![0_usize; mesh.vertices.len()];
         for edge in &mesh.edges {
             let first = vertex_indices[&edge.vertices[0]];
             let second = vertex_indices[&edge.vertices[1]];
-            let length = source_positions[first].distance(source_positions[second]);
-            edge_lengths[first].push(length);
-            edge_lengths[second].push(length);
+            let dx = (source_positions[first].x - source_positions[second].x) as f32;
+            let dy = (source_positions[first].y - source_positions[second].y) as f32;
+            let dz = (source_positions[first].z - source_positions[second].z) as f32;
+            let length = (dx * dx + dy * dy + dz * dz).sqrt();
+            edge_counts[first] += 1;
+            edge_counts[second] += 1;
+            if tagged_vertices[second] {
+                edge_length_sums[first] += length;
+            }
+            if tagged_vertices[first] {
+                edge_length_sums[second] += length;
+            }
         }
-        for (index, lengths) in edge_lengths.iter_mut().enumerate() {
-            if lengths.is_empty() {
+        for index in 0..mesh.vertices.len() {
+            relative_factors[index] = if edge_counts[index] > 0 {
+                f64::from(edge_length_sums[index] / edge_counts[index] as f32)
+            } else {
+                0.0
+            };
+        }
+    }
+    if has_deform_data && let Some(weights) = &group_weights {
+        for (index, tagged) in tagged_vertices.iter().enumerate() {
+            if !tagged {
                 continue;
             }
-            lengths.sort_by(f64::total_cmp);
-            let middle = lengths.len() / 2;
-            relative_factors[index] = if lengths.len() % 2 == 0 {
-                (lengths[middle - 1] + lengths[middle]) * 0.5
-            } else {
-                lengths[middle]
-            };
+            let mut factor = weights
+                .get(&mesh.vertices[index].id)
+                .copied()
+                .unwrap_or(0.0);
+            if invert_vertex_group {
+                factor = 1.0 - factor;
+            }
+            if thickness_vertex_group > 0.0 {
+                factor = thickness_vertex_group + factor * (1.0 - thickness_vertex_group);
+            }
+            relative_factors[index] *= factor;
         }
     }
 
@@ -1867,12 +2465,6 @@ pub(super) fn wireframe(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     }
     let mut negative_vertices = vec![usize::MAX; mesh.vertices.len()];
     let mut positive_vertices = vec![usize::MAX; mesh.vertices.len()];
-    let mut tagged_vertices = vec![false; mesh.vertices.len()];
-    for indices in &face_indices {
-        for index in indices {
-            tagged_vertices[*index] = true;
-        }
-    }
     for index in 0..mesh.vertices.len() {
         if !tagged_vertices[index] {
             continue;
@@ -2044,12 +2636,9 @@ pub(super) fn wireframe(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         loop_vertices.push(face_loops);
     }
 
-    let material_max = mesh
-        .faces
-        .iter()
-        .map(|face| face.material_index)
-        .max()
-        .unwrap_or(0);
+    let material_max = object_material_slots
+        .saturating_sub(1)
+        .min(i64::MAX as usize) as i64;
     let mut faces = Vec::new();
     let mut face_sources: Vec<usize> = Vec::new();
     if !use_replace {
@@ -2061,9 +2650,13 @@ pub(super) fn wireframe(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     let mut crease_edges = HashSet::new();
     for (face_index, indices) in face_indices.iter().enumerate() {
         let source_face = &mesh.faces[face_index];
-        let material_index = i64::from(source_face.material_index)
-            .saturating_add(material_offset)
-            .clamp(0, i64::from(material_max)) as u32;
+        let material_index = if material_offset == 0 {
+            source_face.material_index
+        } else {
+            i64::from(source_face.material_index)
+                .saturating_add(material_offset)
+                .clamp(0, material_max) as u32
+        };
         let emitted_before = faces.len();
         for corner in 0..indices.len() {
             let next = (corner + 1) % indices.len();
@@ -2167,7 +2760,12 @@ pub(super) fn wireframe(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         sources.into_iter().map(Some),
         face_sources.into_iter().map(Some).collect(),
     );
-    let mut result = build_mesh(coords, faces, Vec::new(), &origin, mesh)?;
+    let output_loose_edges = if use_replace {
+        Vec::new()
+    } else {
+        loose_edges(mesh)?
+    };
+    let mut result = build_mesh(coords, faces, output_loose_edges, &origin, mesh)?;
     // BMesh gives new edges the SMOOTH flag (bmesh_core.cc), so only source edges between kept
     // original vertices (use_replace off) stay sharp.
     let source_sharp: HashSet<(usize, usize)> = mesh
@@ -2253,6 +2851,55 @@ pub(super) fn wireframe(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         );
     }
     Ok(result)
+}
+
+/// Whether the mesh carries any vertex-group weights, and the named group's weights when it exists.
+/// A missing or empty group name yields no per-vertex weights.
+fn wireframe_group_data(
+    mesh: &Mesh,
+    modifier: &Modifier,
+    group_name: &str,
+) -> Result<(bool, Option<HashMap<u32, f64>>)> {
+    let Some(groups) = mesh
+        .attributes
+        .get("vertex_groups")
+        .and_then(Value::as_object)
+    else {
+        return Ok((false, None));
+    };
+    let has_deform_data = groups
+        .values()
+        .any(|group| group.as_object().is_some_and(|weights| !weights.is_empty()));
+    let Some(group_values) = (!group_name.is_empty())
+        .then(|| groups.get(group_name))
+        .flatten()
+    else {
+        return Ok((has_deform_data, None));
+    };
+    let values = group_values
+        .as_object()
+        .ok_or_else(|| invalid_parameter(modifier, "vertex_group", "a vertex group"))?;
+    let mut weights = HashMap::with_capacity(values.len());
+    for (key, value) in values {
+        let Some(id) = key
+            .strip_prefix('v')
+            .and_then(|suffix| suffix.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Some(weight) = value
+            .as_f64()
+            .filter(|weight| weight.is_finite() && (0.0..=1.0).contains(weight))
+        else {
+            return Err(invalid_parameter(
+                modifier,
+                "vertex_group",
+                "finite weights in [0, 1]",
+            ));
+        };
+        weights.insert(id, weight);
+    }
+    Ok((has_deform_data, Some(weights)))
 }
 
 /// Skin for the modifier stack. Blender reports a skin failure as a modifier error and keeps the
@@ -2879,9 +3526,11 @@ mod tests {
             radius: 2.0,
         })
         .unwrap();
+        // The 32 x 16 unit sphere is the `uv_sphere_default` oracle, whose largest radius error in
+        // Blender's f32 output is 1.2177e-6 (`primitive_uv_oracle.json`); the bound below covers it.
         let target = Mesh::uv_sphere(UvSphereParams {
-            segments: 24,
-            ring_count: 12,
+            segments: 32,
+            ring_count: 16,
             radius: 1.0,
         })
         .unwrap();
@@ -2891,11 +3540,13 @@ mod tests {
             target,
         );
         let result = shrinkwrap(&source, &modifier).unwrap();
+        // Blender stores UV sphere vertices as f32: its own radius-1 sphere output is off by up to
+        // 1.22e-6 (`tests/fixtures/primitive_uvs/primitive_uv_oracle.json`, `uv_sphere_default`).
         assert!(
             result
                 .vertices
                 .iter()
-                .all(|vertex| (vertex.co.length() - 1.0).abs() < 1.0e-8)
+                .all(|vertex| (vertex.co.length() - 1.0).abs() < 2.0e-6)
         );
     }
 

@@ -277,20 +277,6 @@ pub fn code_pair(value: &Value) -> TestResult<[i64; 2]> {
     Ok([code_component(&items[0])?, code_component(&items[1])?])
 }
 
-/// Whether a stored corner matches Blender's within one code unit per component. Used only by the
-/// nonmanifold subdivision check (loop 28). The cause is f64 subdivision positions in Potter versus
-/// Blender's f32 arithmetic: the positions agree to about 1e-7, and the fan frame amplifies that at the
-/// quantisation boundary. Switching subdivision to f32 arithmetic is PR16 (subdivision accuracy); PR-B
-/// keeps the f64 arithmetic and this window.
-pub fn code_within_one_unit(actual: &StoredCorner, expected: &StoredCorner) -> bool {
-    match (actual, expected) {
-        (StoredCorner::Code(a), StoredCorner::Code(e)) => {
-            (a[0] - e[0]).abs() <= 1 && (a[1] - e[1]).abs() <= 1
-        }
-        _ => actual == expected,
-    }
-}
-
 fn code_component(value: &Value) -> TestResult<i64> {
     let number = value
         .as_i64()

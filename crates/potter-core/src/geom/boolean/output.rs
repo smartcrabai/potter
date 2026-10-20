@@ -6,8 +6,9 @@
 //!
 //! Blender builds the output attributes by gathering from the joined mesh through one index map
 //! per domain. This module builds the same joined mesh `J` (the analogue of Blender's
-//! `joined_mesh`) and the same index maps, then hands `J` to [`remap_attributes`], which owns the
-//! value rules of the ID-keyed stores:
+//! `joined_mesh`) and the same index maps, then hands `J` to [`remap_interpolated_corners_skipping`],
+//! which owns the value rules of the ID-keyed stores and applies Blender's weighted bool mixer to
+//! interpolated CORNER booleans:
 //!
 //! - POINT: an output vertex whose arena origin is `k` takes joined vertex `k`. Blender stores the
 //!   LOCAL vertex index as the origin, so operand B's vertex `k` reads the joined element `k`, which
@@ -20,18 +21,21 @@
 //!
 //! Edge stores are gathered here instead: `crease_edge`, `sharp`, `blender_edge_flags`, and EDGE
 //! entries of `blender_attributes` take the global edge index of each output edge (`Poly::edge_orig`,
-//! last writer wins, as in Blender's `dst_to_src_edge`). `remap_attributes` would derive edges from
+//! last writer wins, as in Blender's `dst_to_src_edge`). The generic remap would derive edges from
 //! the vertex origins, and the POINT origin above is not an edge origin. FACE stores
 //! (`blender_polygon_smooth`, `shade_smooth`) are joined into `J` and gathered by the remap.
 //!
-//! `custom_normal` is a CORNER store. Blender realizes each operand's custom normals through its
-//! transform, so [`joined_custom_normals`] builds them per joined corner. The remap interpolates
-//! them without normalising, and [`negate_flipped_custom_normals`] negates the flipped faces.
+//! `custom_normal` is a CORNER store of raw fan codes. [`join_custom_normal_codes`] copies each
+//! operand's codes into the joined mesh untransformed, as Blender's join does (probes
+//! `exact_clnor4`, `exact_rot90`, `exact_scale2`). [`mix_custom_normals`] then mixes every output
+//! corner from its weighted source corners with Blender's `DefaultMixer<short2>` (`clnor::mix_codes`).
+//! A copied corner keeps its code, and a flipped face keeps its codes: Blender does not negate
+//! them, and the flip shows only when the codes decode on the flipped face's fan (probe
+//! `flip.json`).
 //!
 //! Native generic attributes (`{"domain","type","values"}` stores keyed by element ID) join every
 //! operand's values per element, as Blender's `join_meshes` concatenates each domain. Other stores
-//! that are neither gathered nor structured (shading and metadata keys) are copied from operand A,
-//! as the BSP path does.
+//! that are neither gathered nor structured (shading and metadata keys) are copied from operand A.
 //!
 //! # Deviations
 //!
@@ -47,7 +51,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
-use glam::{DMat3, DMat4, DVec3, Mat4};
+use glam::{DVec3, Mat4};
 use serde_json::{Map, Value, json};
 
 use crate::error::{PotError, Result};
@@ -55,13 +59,12 @@ use crate::geom::{
     Edge, Face, IdCounters, Mesh, Vertex,
     clnor::{self, NormalCodeOptions},
     color_layers, edge_key,
-    normals::{face_normal, normal_matrix, vector3},
-    provenance::{Origin, default_value, mean_value_corners, remap_attributes},
+    provenance::{Origin, default_value, mean_value_corners, remap_interpolated_corners_skipping},
     uv_layers,
 };
 
 use super::dissolve::Poly;
-use super::imesh::Arena;
+use super::imesh::{Arena, NO_INDEX};
 use super::input::{Operand, clean_transform};
 
 /// Material tables of the operands (Blender `material_remaps`). Entry `k` maps operand `k`'s local
@@ -74,9 +77,10 @@ pub(crate) struct OutputMaterials<'a> {
 
 /// Assembles the output mesh of the exact boolean from the kept polygons (Blender `imesh_to_mesh`).
 ///
-/// Vertices are the distinct arena vertices used by `polys`, in first-seen order, at their `f32`
-/// positions. Faces keep their ring order and take fresh IDs. Edges are created as the faces need
-/// them. Attributes are gathered as described in the module documentation.
+/// Vertices are the distinct arena vertices used by `polys`, in Blender's `populate_vert` order, at
+/// their `f32` positions. Faces keep their ring order and take fresh IDs. Edges are stored in
+/// Blender's `mesh_calc_edges` order. Attributes are gathered as described in the module
+/// documentation.
 ///
 /// # Errors
 ///
@@ -96,9 +100,9 @@ pub(crate) fn polys_to_mesh(
     let layout = Layout::new(operands);
     let mut joined = join(operands, &layout)?;
     joined.mesh.attributes = join_attributes(operands, &layout, &joined.mesh)?;
-    encode_joined_custom_normals(&mut joined.mesh)?;
+    join_custom_normal_codes(operands, &mut joined.mesh)?;
     uv_layers::write(&mut joined.mesh, &joined_uv_store(operands));
-    let (arena_ids, planned) = plan(polys, &layout)?;
+    let (arena_ids, planned) = plan(polys, arena, &layout)?;
 
     let positions: Vec<DVec3> = arena_ids
         .iter()
@@ -126,8 +130,8 @@ pub(crate) fn polys_to_mesh(
             }),
     )
     .map_err(|error| PotError::invalid_argument(format!("boolean output face failed: {error}")))?;
+    blender_edge_order(&mut mesh);
 
-    let flipped = flipped_faces(&joined, &planned, &positions);
     let origin = Origin {
         vertices: arena_ids
             .iter()
@@ -137,8 +141,12 @@ pub(crate) fn polys_to_mesh(
         corners: Some(corner_sources(&joined, &planned, &positions)),
         ..Default::default()
     };
-    remap_attributes(&joined.mesh, &mut mesh, &origin)?;
-    negate_flipped_custom_normals(&mut mesh, &flipped)?;
+    remap_interpolated_corners_skipping(&joined.mesh, &mut mesh, &origin, &["custom_normal"])?;
+    mix_custom_normals(
+        &joined.mesh,
+        &mut mesh,
+        origin.corners.as_deref().unwrap_or(&[]),
+    )?;
 
     let sources = edge_sources(&mesh, polys, &planned, &vertex_ids);
     let crease = keyed_edge_attribute(operands, &layout, &mesh, &sources, "crease_edge");
@@ -156,7 +164,7 @@ pub(crate) fn polys_to_mesh(
 }
 
 /// Joined index ranges of the operands (Blender `MeshOffsets`).
-struct Layout {
+pub(super) struct Layout {
     vertices: Vec<Range<usize>>,
     edges: Vec<Range<usize>>,
     faces: Vec<Range<usize>>,
@@ -321,10 +329,16 @@ struct PlannedFace {
     local_face: usize,
 }
 
-/// Distinct arena vertices used by `polys` in first-seen order, and the polygons over them.
-fn plan(polys: &[Poly], layout: &Layout) -> Result<(Vec<u32>, Vec<PlannedFace>)> {
-    let mut arena_ids: Vec<u32> = Vec::new();
-    let mut output_of: HashMap<u32, usize> = HashMap::new();
+/// Distinct arena vertices used by `polys`, sorted as Blender's `IMesh::populate_vert` sorts them,
+/// and the polygons over them. Blender fills `vert_` in first-seen order (`mesh_intersect.cc:571-577`,
+/// `vert_[index] = item.key`) and sorts it with the comparator at `mesh_intersect.cc:583-594`: input
+/// vertices by ascending origin, created vertices after them by id. Two input vertices with the same
+/// local origin (different operands) tie in that sort, and the tie order sets the stored direction of
+/// an edge joining them. `libcxx_sort::parallel_sort_by` reproduces the tie order: libc++ below 500
+/// vertices, and oneTBB's quicksort at 500 or more (Blender's TBB `parallel_sort`).
+fn plan(polys: &[Poly], arena: &Arena, layout: &Layout) -> Result<(Vec<u32>, Vec<PlannedFace>)> {
+    let mut seen_ids: Vec<u32> = Vec::new();
+    let mut seen_slot: HashMap<u32, usize> = HashMap::new();
     let mut planned = Vec::with_capacity(polys.len());
     for poly in polys {
         let joined_face = usize::try_from(poly.orig)
@@ -338,9 +352,9 @@ fn plan(polys: &[Poly], layout: &Layout) -> Result<(Vec<u32>, Vec<PlannedFace>)>
             .verts
             .iter()
             .map(|&id| {
-                *output_of.entry(id).or_insert_with(|| {
-                    arena_ids.push(id);
-                    arena_ids.len() - 1
+                *seen_slot.entry(id).or_insert_with(|| {
+                    seen_ids.push(id);
+                    seen_ids.len() - 1
                 })
             })
             .collect();
@@ -351,7 +365,55 @@ fn plan(polys: &[Poly], layout: &Layout) -> Result<(Vec<u32>, Vec<PlannedFace>)>
             local_face,
         });
     }
+    let mut order: Vec<usize> = (0..seen_ids.len()).collect();
+    let key = |slot: usize| {
+        let id = seen_ids[slot];
+        let orig = arena.vert(id).orig;
+        if orig == NO_INDEX {
+            (true, 0, id)
+        } else {
+            (false, orig, 0)
+        }
+    };
+    super::libcxx_sort::parallel_sort_by(&mut order, |&a, &b| key(a) < key(b));
+    let mut position = vec![0; seen_ids.len()];
+    for (index, &slot) in order.iter().enumerate() {
+        position[slot] = index;
+    }
+    for face in &mut planned {
+        for vertex in &mut face.ring {
+            *vertex = position[*vertex];
+        }
+    }
+    let arena_ids: Vec<u32> = order.iter().map(|&slot| seen_ids[slot]).collect();
     Ok((arena_ids, planned))
+}
+
+/// Blender `mesh_calc_edges` (`keep_existing_edges = false`): edges are stored in order of first
+/// appearance over the faces, where corner `c` of a face contributes the edge from the previous
+/// corner's vertex to its own, each stored with its lower vertex ID first (`OrderedEdge`). Only the
+/// storage order and orientation change; edge IDs are kept.
+fn blender_edge_order(mesh: &mut Mesh) {
+    let mut first_appearance: HashMap<(u32, u32), usize> = HashMap::with_capacity(mesh.edges.len());
+    for face in &mesh.faces {
+        let ring = &face.vertices;
+        let count = ring.len();
+        for corner in 0..count {
+            let key = edge_key(ring[(corner + count - 1) % count], ring[corner]);
+            let next = first_appearance.len();
+            first_appearance.entry(key).or_insert(next);
+        }
+    }
+    for edge in &mut mesh.edges {
+        let (low, high) = edge_key(edge.vertices[0], edge.vertices[1]);
+        edge.vertices = [low, high];
+    }
+    mesh.edges.sort_by_key(|edge| {
+        first_appearance
+            .get(&(edge.vertices[0], edge.vertices[1]))
+            .copied()
+            .unwrap_or(usize::MAX)
+    });
 }
 
 /// Blender `set_material_from_map`: the operand's table maps a local index inside it, and any other
@@ -456,62 +518,25 @@ fn unchanged_corners(
     })
 }
 
-/// Blender's flip test in `copy_or_interp_loop_attributes`: an output face is flipped when its
-/// normal points against the normal of its source face in the joined mesh.
-fn flipped_faces(joined: &Joined, planned: &[PlannedFace], positions: &[DVec3]) -> Vec<bool> {
-    planned
-        .iter()
-        .map(|face| {
-            let source: Vec<DVec3> = joined.rings[face.joined_face]
-                .iter()
-                .map(|&vertex| joined.mesh.vertices[vertex].co)
-                .collect();
-            let output: Vec<DVec3> = face.ring.iter().map(|&vertex| positions[vertex]).collect();
-            ring_normal(&source).dot(ring_normal(&output)) < 0.0
-        })
-        .collect()
-}
-
-/// Newell's normal of a ring, not normalised, as Blender's `face_normal_calc` sums it. A degenerate
-/// ring has a zero normal, so it is never flipped.
-fn ring_normal(points: &[DVec3]) -> DVec3 {
-    points
-        .iter()
-        .zip(points.iter().cycle().skip(1))
-        .take(points.len())
-        .fold(DVec3::ZERO, |sum, (current, next)| {
-            sum + DVec3::new(
-                (current.y - next.y) * (current.z + next.z),
-                (current.z - next.z) * (current.x + next.x),
-                (current.x - next.x) * (current.y + next.y),
-            )
-        })
-}
-
-/// Blender negates the interpolated `custom_normal` corners of flipped faces. A flipped face never
-/// copies its source corners (its ring runs the other way), so every authored corner of one is
-/// negated. The output's codes decode to vectors on its own fans, negate, and re-encode. Auto
-/// corners stay Auto.
-fn negate_flipped_custom_normals(mesh: &mut Mesh, flipped: &[bool]) -> Result<()> {
-    if !flipped.iter().any(|&flip| flip) {
-        return Ok(());
-    }
-    let positions: Vec<DVec3> = mesh.vertices.iter().map(|vertex| vertex.co).collect();
-    let Some(mut vectors) =
-        clnor::corner_custom_normals(mesh, &positions, NormalCodeOptions::default())?
-    else {
+/// Blender `interpolate_corner_attributes` for `custom_normal` (`geometry_mesh_boolean.cc`): each
+/// output corner mixes the raw codes of its weighted source corners with `DefaultMixer<short2>`
+/// (`clnor::mix_codes`). A copied corner has one source at weight 1, so it keeps its code. Blender
+/// does not negate the codes of a flipped face (probe `flip.json`: an unchanged code decodes to the
+/// flipped direction on the flipped fan), so no negation is applied here.
+fn mix_custom_normals(joined: &Mesh, mesh: &mut Mesh, sources: &[Vec<(usize, f64)>]) -> Result<()> {
+    let Some(codes) = clnor::corner_codes(joined)? else {
         return Ok(());
     };
-    let mut corner = 0;
-    for (face, &flip) in mesh.faces.iter().zip(flipped) {
-        for _ in 0..face.vertices.len() {
-            if flip && let Some(normal) = vectors[corner] {
-                vectors[corner] = Some(-normal);
-            }
-            corner += 1;
-        }
-    }
-    clnor::encode_vectors(mesh, Some(&vectors), NormalCodeOptions::default())
+    let mixed: Vec<clnor::CornerNormalCode> =
+        sources
+            .iter()
+            .map(|corner| {
+                clnor::mix_codes(corner.iter().filter_map(|&(index, weight)| {
+                    codes.get(index).map(|&code| (code, weight as f32))
+                }))
+            })
+            .collect();
+    clnor::write_codes(mesh, Some(mixed.as_slice()), NormalCodeOptions::default())
 }
 
 /// Global edge index each output edge takes its attributes from (Blender `dst_to_src_edge`). The
@@ -547,7 +572,7 @@ fn edge_sources(
     sources
 }
 
-/// Joined attributes that `remap_attributes` rewrites, or that this module gathers itself. Other
+/// Joined attributes that the generic remap rewrites, or that this module gathers itself. Other
 /// keys are shading and metadata, copied from operand A.
 fn is_structured_key(key: &str) -> bool {
     matches!(
@@ -568,7 +593,7 @@ fn is_structured_key(key: &str) -> bool {
     )
 }
 
-/// The attribute store `J` carries into `remap_attributes`. EDGE entries and the edge stores
+/// The attribute store `J` carries into the generic remap. EDGE entries and the edge stores
 /// gathered here are left out and written after the remap.
 fn join_attributes(
     operands: &[Operand<'_>],
@@ -619,11 +644,6 @@ fn join_attributes(
     );
     insert_if(
         &mut attributes,
-        "custom_normal",
-        joined_custom_normals(operands, layout)?,
-    );
-    insert_if(
-        &mut attributes,
         "blender_polygon_smooth",
         joined_array(operands, "blender_polygon_smooth", &face_counts, || {
             json!(false)
@@ -661,6 +681,22 @@ fn join_attributes(
         color_layers::ATTRIBUTE,
         joined_color_layers(operands),
     );
+    let color_types = joined_color_data_types(operands);
+    if let Some(metadata) = attributes.get_mut("blender_metadata") {
+        let metadata = metadata.as_object_mut().ok_or_else(|| {
+            PotError::invalid_argument("Boolean blender_metadata must be an object")
+        })?;
+        if color_types.is_empty() {
+            metadata.remove("color_data_types");
+        } else {
+            metadata.insert("color_data_types".to_owned(), Value::Object(color_types));
+        }
+    } else if !color_types.is_empty() {
+        attributes.insert(
+            "blender_metadata".to_owned(),
+            json!({"color_data_types": color_types}),
+        );
+    }
     Ok(attributes)
 }
 
@@ -692,19 +728,51 @@ fn joined_native_attribute(
         .iter()
         .map(|edge| (edge_key(edge.vertices[0], edge.vertices[1]), edge.id))
         .collect();
-    let domain = text_field(template, "domain");
+    let promote = text_field(template, "type") == "color"
+        && operands.iter().any(|operand| {
+            operand
+                .mesh
+                .attributes
+                .get(key)
+                .filter(|value| is_native_store(value))
+                .is_some_and(|value| text_field(value, "domain") == "corner")
+        });
+    let domain = if promote {
+        "corner"
+    } else {
+        text_field(template, "domain")
+    };
     let mut values = Map::new();
     for (index, operand) in operands.iter().enumerate() {
-        let Some(entries) = operand
+        let Some(store) = operand
             .mesh
             .attributes
             .get(key)
             .filter(|value| is_native_store(value))
-            .and_then(|value| value.get("values"))
-            .and_then(Value::as_object)
         else {
             continue;
         };
+        let Some(entries) = store.get("values").and_then(Value::as_object) else {
+            continue;
+        };
+        if domain == "corner" && text_field(store, "domain") == "point" {
+            // A promoted point layer gives every corner its vertex's value. A face with a missing
+            // vertex value has no row, so its corners take the default.
+            for (local, face) in operand.mesh.faces.iter().enumerate() {
+                let row: Option<Vec<Value>> = face
+                    .vertices
+                    .iter()
+                    .map(|id| entries.get(&format!("v{id}")).cloned())
+                    .collect();
+                if let Some(row) = row {
+                    values.insert(
+                        format!("f{}", layout.faces[index].start + local),
+                        Value::Array(row),
+                    );
+                }
+            }
+            continue;
+        }
         let vertices = local_index(operand.mesh.vertices.iter().map(|vertex| vertex.id));
         let faces = local_index(operand.mesh.faces.iter().map(|face| face.id));
         match domain {
@@ -748,7 +816,9 @@ fn joined_native_attribute(
             _ => {}
         }
     }
-    with_values(template, Value::Object(values))
+    let mut output = with_values(template, Value::Object(values));
+    output["domain"] = json!(domain);
+    output
 }
 
 fn insert_if(attributes: &mut Map<String, Value>, key: &str, value: Option<Value>) {
@@ -897,6 +967,38 @@ fn joined_color_layers(operands: &[Operand<'_>]) -> Option<Value> {
         .then(|| json!({"layers": names, "active": subject.active, "render": subject.render}))
 }
 
+/// The joined `blender_metadata.color_data_types`: each colour layer's encoding over the operands that
+/// hold it. A layer stays `BYTE_COLOR` only when every such operand stores `BYTE_COLOR`. A layer with
+/// no entry is `FLOAT_COLOR`, so a mix of encodings joins as float, as Blender's `join_meshes` does.
+fn joined_color_data_types(operands: &[Operand<'_>]) -> Map<String, Value> {
+    let mut types = Map::new();
+    for operand in operands {
+        let layers = color_layers::read(operand.mesh).layers;
+        if layers.is_empty() {
+            continue;
+        }
+        let stored = operand
+            .mesh
+            .attributes
+            .get("blender_metadata")
+            .and_then(|metadata| metadata.get("color_data_types"))
+            .and_then(Value::as_object);
+        for layer in layers {
+            let byte = stored
+                .and_then(|stored| stored.get(&layer.name))
+                .and_then(Value::as_str)
+                == Some("BYTE_COLOR");
+            let encoding = types
+                .entry(layer.name)
+                .or_insert_with(|| json!("BYTE_COLOR"));
+            if !byte {
+                *encoding = json!("FLOAT_COLOR");
+            }
+        }
+    }
+    types
+}
+
 /// The `blender_attributes` entries of `J`: POINT, FACE, and CORNER entries joined per element,
 /// and entries of other domains as they are. EDGE entries are gathered by [`merge_blender_attributes`].
 fn joined_blender_attributes(operands: &[Operand<'_>]) -> Option<Value> {
@@ -976,7 +1078,7 @@ fn concat_elements(
     joined
 }
 
-/// Merges the joined `blender_attributes` entries of `remap_attributes` with the EDGE entries,
+/// Merges the joined `blender_attributes` entries from the generic remap with the EDGE entries,
 /// in the order of the first operand that declares each entry.
 fn merge_blender_attributes(
     mesh: &mut Mesh,
@@ -1076,138 +1178,38 @@ fn joined_face_attribute(
     Some(with_values(template, Value::Object(values)))
 }
 
-/// Relative tolerance of the similarity test in [`NormalTransform::new`].
-const SIMILARITY_TOLERANCE: f64 = 1.0e-6;
-
-/// An operand transform as Blender's realize step applies it to `custom_normal`. The direction goes
-/// through the inverse transpose. A similarity transform (rotation, mirror, translation, or uniform
-/// scale) keeps the length of the normal; any other transform normalises the result. Measured on
-/// Blender 5.2.2.
-struct NormalTransform {
-    linear: DMat3,
-    similarity: bool,
-}
-
-impl NormalTransform {
-    fn new(transform: DMat4) -> Self {
-        let linear = DMat3::from_mat4(transform);
-        let columns = [linear.x_axis, linear.y_axis, linear.z_axis];
-        let squared = columns.map(DVec3::length_squared);
-        let scale = squared[0];
-        let equal_lengths = squared
-            .iter()
-            .all(|length| (length - scale).abs() <= SIMILARITY_TOLERANCE * scale);
-        let orthogonal = [(0_usize, 1_usize), (0, 2), (1, 2)]
-            .iter()
-            .all(|&(a, b)| columns[a].dot(columns[b]).abs() <= SIMILARITY_TOLERANCE * scale);
-        Self {
-            // The cofactor matrix signed by the determinant is a positive multiple of the inverse
-            // transpose, so its direction is the transformed normal's direction.
-            linear: normal_matrix(transform),
-            similarity: scale > 0.0 && equal_lengths && orthogonal,
-        }
-    }
-
-    fn apply(&self, normal: DVec3) -> DVec3 {
-        let direction = (self.linear * normal).normalize_or_zero();
-        if self.similarity {
-            direction * normal.length()
-        } else {
-            direction
-        }
-    }
-}
-
-/// Blender's joined `custom_normal` as authored vectors per joined corner. An operand's authored
-/// corners decode on its own fans (`clnor::corner_custom_normals`) and pass through its transform
-/// ([`NormalTransform`]). A corner without an authored value takes its face's flat normal, passed
-/// through the same transform. `None` when no operand holds custom-normal values.
-/// [`encode_joined_custom_normals`] stores the rows as codes once the output mesh exists.
-fn joined_custom_normals(operands: &[Operand<'_>], layout: &Layout) -> Result<Option<Value>> {
-    let mut decoded = Vec::with_capacity(operands.len());
+/// Blender's joined `custom_normal` (`join_meshes`): each operand's raw codes are copied in joined
+/// corner order, with no transform. The EXACT probes `exact_clnor4`, `exact_rot90` and `exact_scale2`
+/// match every output corner from untransformed input codes under translation, a 90 degree rotation
+/// and a non-uniform scale. An operand without custom normals contributes automatic corners, and
+/// nothing is written when no operand holds a custom-normal layer (basis-only input has none).
+pub(super) fn join_custom_normal_codes(operands: &[Operand<'_>], mesh: &mut Mesh) -> Result<()> {
+    let mut codes = Vec::new();
+    let mut any = false;
     for operand in operands {
-        let positions: Vec<DVec3> = operand
+        let count: usize = operand
             .mesh
-            .vertices
+            .faces
             .iter()
-            .map(|vertex| vertex.co)
-            .collect();
-        decoded.push(clnor::corner_custom_normals(
-            operand.mesh,
-            &positions,
-            NormalCodeOptions::default(),
-        )?);
-    }
-    if decoded.iter().all(Option::is_none) {
-        return Ok(None);
-    }
-    let mut joined = Map::new();
-    for (index, operand) in operands.iter().enumerate() {
-        let transform = NormalTransform::new(operand.transform);
-        let authored = decoded[index].as_deref();
-        let positions: HashMap<u32, DVec3> = operand
-            .mesh
-            .vertices
-            .iter()
-            .map(|vertex| (vertex.id, vertex.co))
-            .collect();
-        let mut corner_base = 0;
-        for (local, face) in operand.mesh.faces.iter().enumerate() {
-            let points: Vec<DVec3> = face
-                .vertices
-                .iter()
-                .filter_map(|id| positions.get(id).copied())
-                .collect();
-            let flat = transform.apply(face_normal(&points));
-            let corners: Vec<Value> = (0..face.vertices.len())
-                .map(|corner| {
-                    let normal = authored
-                        .and_then(|normals| normals.get(corner_base + corner))
-                        .copied()
-                        .flatten()
-                        .map_or(flat, |value| transform.apply(value));
-                    json!(normal.to_array())
-                })
-                .collect();
-            corner_base += face.vertices.len();
-            joined.insert(
-                format!("f{}", layout.faces[index].start + local),
-                Value::Array(corners),
-            );
+            .map(|face| face.vertices.len())
+            .sum();
+        match clnor::corner_codes(operand.mesh)? {
+            Some(own) => {
+                if own.len() != count {
+                    return Err(PotError::invalid_argument(
+                        "boolean operand custom normal codes do not match the corners",
+                    ));
+                }
+                any = true;
+                codes.extend(own);
+            }
+            None => codes.extend(std::iter::repeat_n(clnor::CornerNormalCode::Auto, count)),
         }
     }
-    Ok(Some(
-        json!({"domain": "corner", "type": "float3", "values": Value::Object(joined)}),
-    ))
-}
-
-/// Encodes the joined vector rows as the joined mesh's native normal codes, on its own fans. The
-/// remap then rebuilds the output codes from these source codes (`rebuild_custom_normals`), so no
-/// float3 store reaches `clnor::corner_codes`. A `null` row stays Auto.
-fn encode_joined_custom_normals(mesh: &mut Mesh) -> Result<()> {
-    let Some(attribute) = mesh.attributes.remove("custom_normal") else {
+    if !any {
         return Ok(());
-    };
-    let values = attribute
-        .get("values")
-        .and_then(Value::as_object)
-        .ok_or_else(|| {
-            PotError::invalid_argument("boolean output custom normals have no values")
-        })?;
-    let mut vectors = Vec::new();
-    for face in &mesh.faces {
-        let rows = values
-            .get(&format!("f{}", face.id))
-            .and_then(Value::as_array)
-            .filter(|rows| rows.len() == face.vertices.len())
-            .ok_or_else(|| {
-                PotError::invalid_argument(
-                    "boolean output custom normal rows do not match the corners",
-                )
-            })?;
-        vectors.extend(rows.iter().map(vector3));
     }
-    clnor::encode_vectors(mesh, Some(&vectors), NormalCodeOptions::default())
+    clnor::write_codes(mesh, Some(codes.as_slice()), NormalCodeOptions::default())
 }
 
 /// An edge-keyed object store (`{"domain","type","values":{"e{id}": value}}`, as `crease_edge` and
@@ -1704,9 +1706,49 @@ mod tests {
         let ring = vec![ids[4], ids[2], ids[0], ids[3], ids[1]];
         let mesh = build(&[poly(ring, 0)], &arena, &[operand(&pentagon)], &[])?;
         assert_eq!(mesh.faces.len(), 1);
-        assert_eq!(mesh.faces[0].vertices, vec![0, 1, 2, 3, 4]);
+        assert_eq!(mesh.faces[0].vertices, vec![4, 2, 0, 3, 1]);
         assert_eq!(mesh.edges.len(), 5);
-        assert!(mesh.vertices[0].co.cmpeq(DVec3::new(0.0, 1.0, 0.0)).all());
+        assert!(mesh.vertices[0].co.cmpeq(DVec3::new(0.0, 0.0, 0.0)).all());
+        Ok(())
+    }
+
+    #[test]
+    fn vertices_follow_blender_populate_order() -> TestResult {
+        let a = triangle(0.0)?;
+        let mut arena = Arena::new();
+        let created = arena.add_or_find_dvec(DVec3::new(0.5, 0.5, 1.0), NO_INDEX);
+        let second = arena.add_or_find_dvec(DVec3::new(1.0, 0.0, 0.0), 1);
+        let first = arena.add_or_find_dvec(DVec3::new(0.0, 0.0, 0.0), 0);
+        let mesh = build(
+            &[poly(vec![created, second, first], 0)],
+            &arena,
+            &[operand(&a)],
+            &[],
+        )?;
+        assert_eq!(mesh.faces[0].vertices, vec![2, 1, 0]);
+        assert!(mesh.vertices[0].co.cmpeq(DVec3::new(0.0, 0.0, 0.0)).all());
+        assert!(mesh.vertices[1].co.cmpeq(DVec3::new(1.0, 0.0, 0.0)).all());
+        assert!(mesh.vertices[2].co.cmpeq(DVec3::new(0.5, 0.5, 1.0)).all());
+        Ok(())
+    }
+
+    #[test]
+    fn edges_follow_blender_mesh_calc_edges_order() -> TestResult {
+        let a = triangle(0.0)?;
+        let mut arena = Arena::new();
+        let ids = [
+            arena.add_or_find_dvec(DVec3::new(0.0, 0.0, 0.0), 0),
+            arena.add_or_find_dvec(DVec3::new(1.0, 0.0, 0.0), 1),
+            arena.add_or_find_dvec(DVec3::new(0.0, 1.0, 0.0), 2),
+            arena.add_or_find_dvec(DVec3::new(1.0, 1.0, 0.0), 3),
+        ];
+        let polys = [
+            poly(vec![ids[0], ids[1], ids[2]], 0),
+            poly(vec![ids[2], ids[1], ids[3]], 0),
+        ];
+        let mesh = build(&polys, &arena, &[operand(&a)], &[])?;
+        let edges: Vec<[u32; 2]> = mesh.edges.iter().map(|edge| edge.vertices).collect();
+        assert_eq!(edges, vec![[0, 2], [0, 1], [1, 2], [2, 3], [1, 3]]);
         Ok(())
     }
 
@@ -1778,15 +1820,64 @@ mod tests {
             attribute(&mesh, "blender_edge_flags"),
             json!([
                 {"sharp": false, "seam": false},
-                {"sharp": true, "seam": false},
-                {"sharp": false, "seam": false}
+                {"sharp": false, "seam": false},
+                {"sharp": true, "seam": false}
             ])
         );
         Ok(())
     }
 
     #[test]
-    fn custom_normals_of_flipped_faces_are_negated() -> TestResult {
+    fn boolean_joins_color_encodings_and_promotes_point_layers() -> TestResult {
+        let mut a = triangle(0.0)?;
+        let mut b = triangle(5.0)?;
+        let corner = ColorStore {
+            layers: vec![ColorLayer {
+                name: "Body".to_owned(),
+                domain: ColorDomain::Corner,
+                values: vec![[0.1, 0.2, 0.3, 0.4]; 3],
+            }],
+            active: Some("Body".to_owned()),
+            render: Some("Body".to_owned()),
+        };
+        color_layers::write(&mut a, &corner);
+        let point = ColorStore {
+            layers: vec![ColorLayer {
+                name: "Body".to_owned(),
+                domain: ColorDomain::Point,
+                values: vec![
+                    [1.0, 0.0, 0.0, 1.0],
+                    [0.0, 1.0, 0.0, 1.0],
+                    [0.0, 0.0, 1.0, 1.0],
+                ],
+            }],
+            active: None,
+            render: None,
+        };
+        color_layers::write(&mut b, &point);
+        a.attributes.insert(
+            "blender_metadata".to_owned(),
+            json!({"color_data_types": {"Body": "BYTE_COLOR"}}),
+        );
+        let mut arena = Arena::new();
+        let a_ids = arena_vertices(&mut arena, &a)?;
+        let b_ids = arena_vertices(&mut arena, &b)?;
+        let polys = [poly(a_ids, 0), poly(b_ids, 1)];
+        let mesh = build(&polys, &arena, &[operand(&a), operand(&b)], &[])?;
+
+        // One operand is FLOAT_COLOR (no entry), so the joined layer is float.
+        assert_eq!(
+            mesh.attributes["blender_metadata"]["color_data_types"]["Body"],
+            json!("FLOAT_COLOR")
+        );
+        let store = color_layers::read(&mesh);
+        assert_eq!(store.layers.len(), 1);
+        assert_eq!(store.layers[0].domain, ColorDomain::Corner);
+        Ok(())
+    }
+
+    #[test]
+    fn custom_normals_of_flipped_faces_keep_their_codes_and_decode_flipped() -> TestResult {
         let mut a = mesh_from(
             vec![
                 DVec3::new(0.0, 0.0, 0.0),
@@ -1807,7 +1898,8 @@ mod tests {
         ];
         let mesh = build(&polys, &arena, &[operand(&a)], &[])?;
         let normals = authored_normals(&mesh)?;
-        // The kept face copies its source; the reversed face is flipped, so its normals negate.
+        // The kept face copies its codes. The reversed face keeps its codes too; they decode on its
+        // flipped fan to the flipped direction (Blender does not negate them).
         for normal in &normals[..3] {
             assert_near(*normal, DVec3::Z)?;
         }
@@ -1818,7 +1910,7 @@ mod tests {
     }
 
     #[test]
-    fn custom_normals_follow_a_non_similarity_transform_as_unit_directions() -> TestResult {
+    fn custom_normal_codes_are_copied_without_the_operand_transform() -> TestResult {
         let mut a = triangle(0.0)?;
         set_authored_normals(&mut a, &[DVec3::new(0.0, 0.0, 2.0); 3])?;
         let mut arena = Arena::new();
@@ -1833,10 +1925,11 @@ mod tests {
             transform: DMat4::from_scale(DVec3::new(2.0, 1.0, 1.0)),
         };
         let mesh = build(&[poly(ids, 0)], &arena, &[scaled], &[])?;
-        let normals = authored_normals(&mesh)?;
-        for normal in &normals {
-            assert_near(*normal, DVec3::Z)?;
-        }
+        // Blender copies the raw codes of a joined operand; the operand transform does not touch them.
+        let source = crate::geom::clnor::corner_codes(&a).map_err(|error| format!("{error:?}"))?;
+        let joined =
+            crate::geom::clnor::corner_codes(&mesh).map_err(|error| format!("{error:?}"))?;
+        assert_eq!(joined, source);
         Ok(())
     }
 }

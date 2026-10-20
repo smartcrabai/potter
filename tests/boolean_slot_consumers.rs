@@ -155,7 +155,6 @@ fn float_boolean_with_itself_as_object_is_unchanged() -> TestResult {
 }
 
 #[test]
-#[ignore = "unignore when PR17 removes the Boolean downstream-topology refusal"]
 fn boolean_transfer_pool_clamps_downstream_bevel_material_override() -> TestResult {
     let mut doc = apply(&[
         json!({"op":"material.create","id":"m_host","base_color":[0.9,0.05,0.02,1.0]}),

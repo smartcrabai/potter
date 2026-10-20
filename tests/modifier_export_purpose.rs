@@ -226,6 +226,10 @@ fn run_export(
         .args(["--format", format, "--out"])
         .arg(&out)
         .arg("--json");
+    // The projects' box and plane primitives carry Blender's default `UVMap`, which STL cannot store.
+    if format == "stl" {
+        command.arg("--allow-lossy");
+    }
     if let Some(blender) = blender {
         command.arg("--blender").arg(blender);
     }

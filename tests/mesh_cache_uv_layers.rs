@@ -152,6 +152,12 @@ fn layer_op(op: &str, name: &str) -> Value {
     json!({"op":op, "target":{"id":"body"}, "name":name})
 }
 
+/// A plane has Blender's default `UVMap`; these tests start from a receiver with no UV layers, as
+/// they always did, so the layer limit and the layer order they check are the cache's own.
+fn without_default_uv() -> Value {
+    layer_op("uv.layer_delete", "UVMap")
+}
+
 /// The evaluated receiver mesh, UV store, per-face-corner positions, and warnings.
 struct Evaluated {
     mesh: Mesh,
@@ -320,7 +326,7 @@ fn assert_corner_associations(
 fn cache_restores_every_uv_parameter_into_the_layer_it_names() -> TestResult {
     let temporary = tempdir()?;
     let scene = temporary.path().join("scene.pot");
-    scene_with_cache(&scene, Vec::new())?;
+    scene_with_cache(&scene, vec![without_default_uv()])?;
     apply(&scene, &json!([cache_modifier(&["VERT", "POLY", "UV"])]))?;
 
     let evaluated = evaluate_body(&scene)?;
@@ -352,6 +358,7 @@ fn cache_keeps_mesh_layers_it_does_not_name_and_keeps_selectors() -> TestResult 
     scene_with_cache(
         &scene,
         vec![
+            without_default_uv(),
             layer_op("uv.layer_create", "Base"),
             layer_op("uv.layer_create", "Extra"),
             layer_op("uv.layer_set_active", "Extra"),
@@ -394,10 +401,8 @@ fn cache_writes_named_layers_past_the_first_and_reports_the_one_without_room() -
     let names = ["L0", "Base", "L2", "L3", "L4", "L5", "L6", "L7"];
     let temporary = tempdir()?;
     let scene = temporary.path().join("scene.pot");
-    let operations = names
-        .iter()
-        .map(|name| layer_op("uv.layer_create", name))
-        .collect();
+    let mut operations: Vec<Value> = vec![without_default_uv()];
+    operations.extend(names.iter().map(|name| layer_op("uv.layer_create", name)));
     scene_with_cache(&scene, operations)?;
     let before = evaluate_body(&scene)?;
     // Without topology reads the mesh keeps its own layers, so the limit applies to the store.

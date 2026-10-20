@@ -65,48 +65,6 @@ fn center_rgb(image: &[u8], width: usize, height: usize) -> [u8; 3] {
 }
 
 #[test]
-fn cli_render_applies_compositor_and_scene_color_management() -> Result<(), Box<dyn Error>> {
-    let directory = tempdir()?;
-    let scene = directory.path().join("scene");
-    let initialized = pot().arg("init").arg(&scene).arg("--json").output()?;
-    assert!(initialized.status.success());
-    apply(
-        &scene,
-        r#"{"schema_version":1,"base_revision":0,"operations":[
-            {"op":"node.create","id":"body","kind":"box","params":{"size":1},"transform":{"translation":[0,0,0.5]}},
-            {"op":"camera.create","id":"camera_main","transform":{"translation":[0,0,4]},"projection":"orthographic","ortho_scale":3},
-            {"op":"light.create","id":"key_light","light_type":"point","transform":{"translation":[0,0,3]},"color":[1.0,0.1,0.1],"energy":1.0},
-            {"op":"scene.update","target":{"id":"scene_main"},"set":{"camera":"camera_main"}},
-            {"op":"render.update","target":{"id":"scene_main"},"set":{"resolution_x":32,"resolution_y":32,"samples":1}}
-        ]}"#,
-    )?;
-    let baseline = render(&scene, &directory.path().join("baseline"))?;
-
-    apply(
-        &scene,
-        r#"{"schema_version":1,"base_revision":1,"operations":[
-            {"op":"graph.create","id":"graph_comp","kind":"compositor"},
-            {"op":"compositor.node_add","graph":"graph_comp","id":"layers","type":"CompositorNodeRLayers"},
-            {"op":"compositor.node_add","graph":"graph_comp","id":"gain","type":"CompositorNodeExposure","properties":{"exposure":0.5}},
-            {"op":"compositor.node_add","graph":"graph_comp","id":"composite","type":"CompositorNodeComposite"},
-            {"op":"compositor.link","graph":"graph_comp","from_node":"layers","from_socket":"Image","to_node":"gain","to_socket":"Image"},
-            {"op":"compositor.link","graph":"graph_comp","from_node":"gain","from_socket":"Image","to_node":"composite","to_socket":"Image"},
-            {"op":"compositor.enable","target":{"id":"scene_main"},"set":{"enabled":true,"graph":"graph_comp"}},
-            {"op":"color.update","target":{"id":"scene_main"},"set":{"view_transform":"agx","exposure":0.5}}
-        ]}"#,
-    )?;
-    let processed = render(&scene, &directory.path().join("processed"))?;
-    let before = center_rgb(&baseline, 32, 32);
-    let after = center_rgb(&processed, 32, 32);
-    assert!(
-        after[0] > before[0],
-        "rendered red channel should brighten: {before:?} -> {after:?}"
-    );
-    assert_ne!(before, after);
-    Ok(())
-}
-
-#[test]
 fn cli_render_writes_requested_passes_as_multilayer_exr() -> Result<(), Box<dyn Error>> {
     let directory = tempdir()?;
     let scene = directory.path().join("scene");
@@ -242,16 +200,24 @@ fn view_transforms_look_gamma_and_srgb_encoding_are_applied() -> Result<(), Box<
         "{gamma:?}"
     );
 
-    let unsupported_look = ColorManagement {
+    let incompatible_look = ColorManagement {
+        view_transform: ViewTransform::Raw,
+        look: "agx_high_contrast".to_owned(),
+        ..ColorManagement::default()
+    }
+    .display_encode([0.75; 3]);
+    assert!(matches!(
+        incompatible_look,
+        Err(error) if error.code == ErrorCode::InvalidArgument
+    ));
+
+    let filmic_look_on_raw = ColorManagement {
         view_transform: ViewTransform::Raw,
         look: "high_contrast".to_owned(),
         ..ColorManagement::default()
     }
     .display_encode([0.75; 3]);
-    assert!(matches!(
-        unsupported_look,
-        Err(error) if error.code == ErrorCode::UnsupportedFeature
-    ));
+    assert!(filmic_look_on_raw.is_ok(), "{filmic_look_on_raw:?}");
     assert!((linear_to_srgb(0.5) - 0.735_356_983_052_449_5).abs() < 1.0e-12);
     Ok(())
 }

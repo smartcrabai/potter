@@ -935,6 +935,14 @@ fn inspected_item<'a>(items: &'a [Value], id: &str) -> TestResult<&'a Value> {
         .find(|item| item["id"] == id)
         .ok_or_else(|| format!("inspect has no item {id}").into())
 }
+/// The text of a thread's panic payload: `panic!` yields a `&str` or a `String`.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|text| (*text).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_owned())
+}
 
 fn run_case(
     blender: &Path,
@@ -1198,12 +1206,41 @@ fn collection_instance_cases_match_blenders_exporter() -> TestResult {
     let dumper = root.join("blend_collection_instances_dump.py");
     fs::write(&dumper, DUMPER)?;
 
+    // The cases are independent (own directory, own Blender and Potter processes), so they run
+    // concurrently; each case's result is kept, so no failure is hidden.
+    let outcomes: Vec<(&str, Result<(), String>)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = CASES
+            .into_iter()
+            .map(|(case, check)| {
+                let case_root = root.join(case);
+                let (blender, builder, dumper) = (&blender, &builder, &dumper);
+                scope.spawn(move || -> Result<(), String> {
+                    fs::create_dir_all(&case_root).map_err(|error| error.to_string())?;
+                    run_case(blender, builder, dumper, &case_root, case, check)
+                        .map_err(|error| error.to_string())
+                })
+            })
+            .collect();
+        CASES
+            .iter()
+            .zip(handles)
+            .map(|(&(case, _), handle)| {
+                (
+                    case,
+                    handle.join().unwrap_or_else(|payload| {
+                        Err(format!(
+                            "the case thread panicked: {}",
+                            panic_message(payload.as_ref())
+                        ))
+                    }),
+                )
+            })
+            .collect()
+    });
     let mut exercised = Vec::new();
     let mut failures = Vec::new();
-    for (case, check) in CASES {
-        let case_root = root.join(case);
-        fs::create_dir_all(&case_root)?;
-        match run_case(&blender, &builder, &dumper, &case_root, case, check) {
+    for (case, outcome) in outcomes {
+        match outcome {
             Ok(()) => exercised.push(case),
             Err(error) => failures.push(format!("{case}: {error}")),
         }

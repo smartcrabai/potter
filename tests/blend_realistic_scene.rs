@@ -15,8 +15,6 @@ use tempfile::tempdir;
 const SCENE_BUILDER: &str = include_str!("fixtures/blend_realistic_scene.py");
 const SCENE_DUMPER: &str = include_str!("fixtures/blend_realistic_scene_dump.py");
 const FRAME_TOLERANCE: f64 = 1.0e-5;
-const GATED_OBJECTS: [&str; 1] = ["Housing_Boolean_Decimate_Solidify"];
-
 fn checked_output(mut command: Command, label: &str) -> Result<Output, Box<dyn Error>> {
     let output = command.output()?;
     if !output.status.success() {
@@ -69,19 +67,17 @@ fn import_blend(
     Ok(serde_json::from_slice(&output.stdout)?)
 }
 
-fn inspect_node(project: &Path, id: &str, frame: u32) -> Result<Value, Box<dyn Error>> {
+fn inspect_scene(project: &Path, frame: u32) -> Result<Value, Box<dyn Error>> {
     let output = Command::new(env!("CARGO_BIN_EXE_pot"))
         .arg("inspect")
         .arg(project)
-        .args(["--id"])
-        .arg(id)
-        .args(["--frame"])
+        .arg("--frame")
         .arg(frame.to_string())
         .arg("--json")
         .output()?;
     if !output.status.success() {
         return Err(io::Error::other(format!(
-            "inspecting `{id}` at frame {frame} failed: stdout={} stderr={}",
+            "inspecting frame {frame} failed: stdout={} stderr={}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         ))
@@ -381,17 +377,23 @@ fn assert_import_inspection(
         .collect::<Vec<_>>();
     let actual_names = ids.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>();
     assert_eq!(actual_names, expected_names, "imported object set differs");
-    for (name, id) in ids {
-        if GATED_OBJECTS.contains(&name.as_str()) {
-            continue;
-        }
-        for frame in [1_u32, 5, 10] {
-            let inspected = inspect_node(project, &id, frame)?;
-            let item = inspected["result"]["items"]
-                .as_array()
-                .and_then(|items| items.first())
+    for frame in [1_u32, 5, 10] {
+        let inspected = inspect_scene(project, frame)?;
+        let items = inspected["result"]["items"]
+            .as_array()
+            .ok_or_else(|| io::Error::other(format!("frame {frame}: inspect items missing")))?;
+        for (name, id) in &ids {
+            let item = items
+                .iter()
+                .find(|candidate| candidate["id"].as_str() == Some(id.as_str()))
                 .ok_or_else(|| io::Error::other(format!("{name}: inspect item missing")))?;
-            let frame_data = &source["frames"][frame.to_string()][&name];
+            if let Some(error) = item.get("evaluation_error") {
+                return Err(io::Error::other(format!(
+                    "{name} frame {frame}: evaluation failed: {error}"
+                ))
+                .into());
+            }
+            let frame_data = &source["frames"][frame.to_string()][name.as_str()];
             let expected_matrix = matrix_from_blender(&frame_data["matrix_world"])?;
             let actual_matrix = item["transform"]["world"]["matrix"]
                 .as_array()
@@ -433,33 +435,6 @@ fn assert_import_inspection(
             }
         }
     }
-    Ok(())
-}
-
-fn assert_gated_feature_error(
-    project: &Path,
-    document: &Value,
-    object: &str,
-    feature: &str,
-) -> Result<(), Box<dyn Error>> {
-    let (_, id) = object_ids_by_name(document)?
-        .into_iter()
-        .find(|(name, _)| name == object)
-        .ok_or_else(|| io::Error::other(format!("gated object `{object}` missing")))?;
-    let output = Command::new(env!("CARGO_BIN_EXE_pot"))
-        .arg("inspect")
-        .arg(project)
-        .args(["--id"])
-        .arg(&id)
-        .args(["--frame", "1", "--json"])
-        .output()?;
-    assert!(!output.status.success(), "{object} unexpectedly evaluated");
-    let envelope: Value = serde_json::from_slice(&output.stdout)?;
-    assert_eq!(envelope["error"]["code"], "UNSUPPORTED_FEATURE", "{object}");
-    assert_eq!(
-        envelope["error"]["details"]["feature_id"], feature,
-        "{object}"
-    );
     Ok(())
 }
 
@@ -588,27 +563,14 @@ fn realistic_blender_scene_import_export_reopen_preserves_settings_and_evaluatio
         .arg("render")
         .arg(&project)
         .args(["--format", "png", "--out"])
-        .arg(root.join("unsupported-render"))
+        .arg(root.join("realistic-render"))
         .arg("--json")
         .output()?;
     assert!(
-        !render.status.success(),
-        "render unexpectedly evaluated unsupported stack"
+        render.status.success(),
+        "render refused the realistic stack: {}",
+        String::from_utf8_lossy(&render.stdout)
     );
-    let render_error: Value = serde_json::from_slice(&render.stdout)?;
-    assert_eq!(render_error["error"]["code"], "UNSUPPORTED_FEATURE");
-    let details = &render_error["error"]["details"];
-    let feature = details["feature_id"]
-        .as_str()
-        .ok_or("render error lacks feature_id")?;
-    let expected_object = match feature {
-        "modifier.boolean.downstream_topology" => GATED_OBJECTS[0],
-        _ => return Err(format!("unexpected render feature {feature}").into()),
-    };
-    let node_id = details["node_id"]
-        .as_str()
-        .ok_or("render error lacks node_id")?;
-    assert_eq!(document["nodes"][node_id]["name"], expected_object);
     assert_modifier_reference(
         &document,
         "Rigged_Cylinder_Skin",
@@ -625,7 +587,7 @@ fn realistic_blender_scene_import_export_reopen_preserves_settings_and_evaluatio
     )?;
     assert_modifier_reference(
         &document,
-        GATED_OBJECTS[0],
+        "Housing_Boolean_Decimate_Solidify",
         "01 | exact through-bore",
         "object",
         "Housing_Bore_Cutter",
@@ -640,12 +602,6 @@ fn realistic_blender_scene_import_export_reopen_preserves_settings_and_evaluatio
     assert_surface_binding_data(&document)?;
     assert_shape_key_action_slot(&document)?;
     assert_import_inspection(&project, &source, &document)?;
-    assert_gated_feature_error(
-        &project,
-        &document,
-        GATED_OBJECTS[0],
-        "modifier.boolean.downstream_topology",
-    )?;
 
     let lossy_project = root.join("allow-lossy-project");
     run_pot(
@@ -769,5 +725,6 @@ fn realistic_blender_scene_import_export_reopen_preserves_settings_and_evaluatio
             }
         }
     }
+
     Ok(())
 }
