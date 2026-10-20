@@ -182,6 +182,12 @@ fn scene_schema() -> Value {
         "oneOf":[{"type":"null"},{"type":"object","required":["camera","diffuse","glossy","transmission","volume_scatter","shadow"],"properties":{"camera":{"type":"boolean"},"diffuse":{"type":"boolean"},"glossy":{"type":"boolean"},"transmission":{"type":"boolean"},"volume_scatter":{"type":"boolean"},"shadow":{"type":"boolean"}},"additionalProperties":false}]
     });
     root["$defs"]["data_block"]["properties"]["materials"] = nullable_id_array_schema();
+    root["$defs"]["material"]["properties"]["viewport_display"] = json!({
+        "type":"object",
+        "required":["diffuse_color","roughness","metallic"],
+        "properties":{"diffuse_color":vec_schema(4),"roughness":{"type":"number","minimum":0,"maximum":1},"metallic":{"type":"number","minimum":0,"maximum":1}},
+        "additionalProperties":false
+    });
     complete_scene_schema(&mut root);
     root
 }

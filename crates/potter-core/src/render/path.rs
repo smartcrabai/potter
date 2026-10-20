@@ -15,7 +15,7 @@ use crate::{
 };
 
 use super::principled_bsdf::{
-    coat_lower_factor, continuous_density, evaluate as evaluate_bsdf, light_lobes_coefficient,
+    Layers, continuous_density, evaluate as evaluate_bsdf, layers, light_lobes_coefficient,
     lobe_probabilities,
 };
 use super::{
@@ -138,6 +138,8 @@ struct Surface {
     /// Origin of shadow rays: `point` on flat triangles, lifted onto the smooth surface otherwise.
     shadow_point: DVec3,
     params: BsdfParams,
+    /// The sheen and coat layers at this hit, set up once for the hit's view direction.
+    layers: Layers,
     object_index: u32,
     element_index: u32,
     distance: f64,
@@ -1016,7 +1018,7 @@ fn trace_path(
             radiance += throughput
                 * DVec3::from_array(surface.params.emission_color)
                 * surface.params.emission_strength
-                * coat_lower_factor(&surface.params, -direction);
+                * surface.layers.lower();
             break;
         }
         if rng.next_f64() >= surface.params.alpha.clamp(0.0, 1.0) {
@@ -1031,7 +1033,7 @@ fn trace_path(
         radiance += throughput
             * DVec3::from_array(surface.params.emission_color)
             * surface.params.emission_strength
-            * coat_lower_factor(&surface.params, -direction);
+            * surface.layers.lower();
         radiance += throughput
             * direct_lighting(
                 doc,
@@ -1043,7 +1045,6 @@ fn trace_path(
                 images,
                 importance,
                 &surface,
-                direction,
                 environment,
                 bounce < max_bounces,
                 transparent_max_bounces.saturating_sub(transparent_bounce),
@@ -1053,32 +1054,31 @@ fn trace_path(
         if bounce == max_bounces {
             break;
         }
-        let (next_direction, weight) =
-            match sample_bsdf(&surface.params, surface.normal, -direction, rng) {
-                BsdfSample::Continuous {
-                    direction,
-                    weight,
-                    pdf,
-                    ray: lobe,
-                } => {
-                    previous = Scatter::Surface(MisVertex {
-                        bsdf_pdf: pdf,
-                        normal: surface.normal,
-                        point: surface.point,
-                    });
-                    ray = lobe;
-                    (direction, weight)
-                }
-                BsdfSample::Delta {
-                    direction,
-                    weight,
-                    ray: lobe,
-                } => {
-                    previous = Scatter::Delta(surface.point);
-                    ray = lobe;
-                    (direction, weight)
-                }
-            };
+        let (next_direction, weight) = match sample_bsdf(&surface.params, &surface.layers, rng) {
+            BsdfSample::Continuous {
+                direction,
+                weight,
+                pdf,
+                ray: lobe,
+            } => {
+                previous = Scatter::Surface(MisVertex {
+                    bsdf_pdf: pdf,
+                    normal: surface.normal,
+                    point: surface.point,
+                });
+                ray = lobe;
+                (direction, weight)
+            }
+            BsdfSample::Delta {
+                direction,
+                weight,
+                ray: lobe,
+            } => {
+                previous = Scatter::Delta(surface.point);
+                ray = lobe;
+                (direction, weight)
+            }
+        };
         if !next_direction.is_finite() || !weight.is_finite() {
             break;
         }
@@ -1204,7 +1204,7 @@ fn write_center_passes(
             // The emission pass is the beauty's emission term: the coat attenuates it per channel.
             let emission = DVec3::from_array(surface.params.emission_color)
                 * surface.params.emission_strength
-                * coat_lower_factor(&surface.params, -direction);
+                * surface.layers.lower();
             output.emission[index] = [
                 finite_f32(emission.x),
                 finite_f32(emission.y),
@@ -1470,12 +1470,14 @@ fn make_surface(
     if params.normal.dot(-direction) < 0.0 {
         params.normal = -params.normal;
     }
+    let hit_layers = layers(&params, params.normal, -direction);
     Ok(Surface {
         point,
         normal: params.normal,
         geometric_normal,
         shadow_point,
         params,
+        layers: hit_layers,
         object_index: triangle.object_index,
         element_index: triangle.element_index,
         distance: hit.distance,
@@ -1506,7 +1508,6 @@ fn direct_lighting(
     images: &BTreeMap<String, ImageData>,
     importance: Option<&WorldImportanceSampler>,
     surface: &Surface,
-    incoming_direction: DVec3,
     environment: DVec3,
     // Whether the path samples a BSDF continuation here. Only then does a BSDF ray pair with the
     // light sample for MIS; at the last vertex the light sample is unweighted.
@@ -1517,7 +1518,6 @@ fn direct_lighting(
 ) -> Result<DVec3> {
     let normal = surface.normal;
     let geometric = surface.geometric_normal;
-    let view = -incoming_direction;
     let mut contribution = DVec3::ZERO;
     for light in lights {
         let Some(sample) = sample_light(light, surface.point, rng) else {
@@ -1550,17 +1550,14 @@ fn direct_lighting(
         let mis = if scatters && volumes.is_empty() && light.hittable() {
             power_heuristic(
                 sample.pdf,
-                continuous_density(&surface.params, normal, view, sample.direction),
+                continuous_density(&surface.params, &surface.layers, sample.direction),
             )
         } else {
             1.0
         };
-        // The lobes the light excludes are dropped from the value, but the MIS weight keeps the full
-        // BSDF density, as Cycles' `surface_shader_bsdf_eval` drops closures and keeps their pdf.
         contribution += light_lobes_coefficient(
             &surface.params,
-            normal,
-            view,
+            &surface.layers,
             sample.direction,
             light.ray_mask,
         ) * sample.radiance
@@ -1590,13 +1587,13 @@ fn direct_lighting(
             rng,
             evaluator_workspace,
         )?;
-        let bsdf_pdf = continuous_density(&surface.params, normal, view, direction);
+        let bsdf_pdf = continuous_density(&surface.params, &surface.layers, direction);
         let weight = if scatters {
             power_heuristic(light_pdf, bsdf_pdf)
         } else {
             1.0
         };
-        contribution += evaluate_bsdf(&surface.params, normal, view, direction)
+        contribution += evaluate_bsdf(&surface.params, &surface.layers, direction)
             * environment_sample
             * (cosine * visibility * weight / light_pdf);
     }
@@ -2202,8 +2199,9 @@ enum BsdfSample {
     },
 }
 
-fn sample_bsdf(params: &BsdfParams, normal: DVec3, view: DVec3, rng: &mut Pcg32) -> BsdfSample {
-    let probabilities = lobe_probabilities(params, view);
+fn sample_bsdf(params: &BsdfParams, layers: &Layers, rng: &mut Pcg32) -> BsdfSample {
+    let (normal, view) = (layers.normal, layers.view);
+    let probabilities = lobe_probabilities(params, layers);
     let choice = rng.next_f64();
     if choice < probabilities.transmission {
         // Total internal reflection is a singular reflection, which Cycles gives the glossy ray kind
@@ -2220,7 +2218,7 @@ fn sample_bsdf(params: &BsdfParams, normal: DVec3, view: DVec3, rng: &mut Pcg32)
         let weight = tint
             * (params.reflectance.clamp(0.0, 1.0) * params.transmission.clamp(0.0, 1.0)
                 / probabilities.transmission.max(1.0e-8))
-            * coat_lower_factor(params, view);
+            * layers.lower();
         return BsdfSample::Delta {
             direction,
             weight,
@@ -2228,31 +2226,38 @@ fn sample_bsdf(params: &BsdfParams, normal: DVec3, view: DVec3, rng: &mut Pcg32)
         };
     }
     let diffuse_end = probabilities.transmission + probabilities.diffuse;
-    let coat_end = diffuse_end + probabilities.coat;
-    let glossy = choice >= diffuse_end;
-    let direction = if choice < diffuse_end {
-        sample_cosine_hemisphere(normal, rng).0
+    let sheen_end = diffuse_end + probabilities.sheen;
+    let coat_end = sheen_end + probabilities.coat;
+    let (direction, ray) = if choice < diffuse_end {
+        (sample_cosine_hemisphere(normal, rng).0, RayKind::Diffuse)
+    } else if choice < sheen_end {
+        // Sheen is a diffuse-class closure (`CLOSURE_IS_BSDF_DIFFUSE`, `svm/types.h`).
+        let first = rng.next_f64();
+        let second = rng.next_f64();
+        (layers.sample_sheen(first, second), RayKind::Diffuse)
     } else if choice < coat_end {
         let half_vector =
             sample_ggx_half(params.coat_normal_or_shading(), params.coat_roughness, rng);
-        reflect(-view, half_vector).normalize_or_zero()
+        (
+            reflect(-view, half_vector).normalize_or_zero(),
+            RayKind::Glossy,
+        )
     } else {
         let half_vector = sample_ggx_half(normal, params.roughness, rng);
-        reflect(-view, half_vector).normalize_or_zero()
+        (
+            reflect(-view, half_vector).normalize_or_zero(),
+            RayKind::Glossy,
+        )
     };
     // Estimator `f cos / p_mix`: the density is the lobe mixture, not the branch's own lobe.
-    let pdf = continuous_density(params, normal, view, direction);
+    let pdf = continuous_density(params, layers, direction);
     let cosine = normal.dot(direction).max(0.0);
-    let weight = evaluate_bsdf(params, normal, view, direction) * (cosine / pdf.max(1.0e-8));
+    let weight = evaluate_bsdf(params, layers, direction) * (cosine / pdf.max(1.0e-8));
     BsdfSample::Continuous {
         direction,
         weight,
         pdf,
-        ray: if glossy {
-            RayKind::Glossy
-        } else {
-            RayKind::Diffuse
-        },
+        ray,
     }
 }
 
@@ -3265,7 +3270,7 @@ mod sampling_tests {
                         theta.cos(),
                     );
                     let cosine = light.dot(normal);
-                    total += evaluate_bsdf(&params, normal, view, light)
+                    total += evaluate_bsdf(&params, &layers(&params, normal, view), light)
                         * (cosine * theta.sin() * d_theta * d_phi);
                 }
             }
@@ -3279,7 +3284,7 @@ mod sampling_tests {
         let mut sum = DVec3::ZERO;
         let mut sum_squares = DVec3::ZERO;
         for _ in 0..samples {
-            let weight = match sample_bsdf(&params, normal, view, &mut rng) {
+            let weight = match sample_bsdf(&params, &layers(&params, normal, view), &mut rng) {
                 BsdfSample::Continuous { weight, .. } | BsdfSample::Delta { weight, .. } => weight,
             };
             sum += weight;
