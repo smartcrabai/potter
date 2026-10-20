@@ -100,6 +100,10 @@ group_host = bpy.context.object
 group_host.name = "FloatGroupHost"
 host_group = group_host.vertex_groups.new(name="Host")
 host_group.add(list(range(len(group_host.data.vertices))), 0.2, "REPLACE")
+# The operand sits off the host's coplanar faces. At (11.5, 0, 0) the operand shares faces with the
+# host, and Blender's FLOAT union is process-nondeterministic there: 10 headless runs gave 27 or 32
+# output vertices and 0 to 4 vertices at x = 2.5. At (11.3, 0.3, 0.2) 6 of 6 runs gave 20 vertices
+# and no vertex at x = 2.5, so the expectation is a single Blender result.
 bpy.ops.mesh.primitive_cube_add(size=2.0, location=(11.3, 0.3, 0.2))
 group_operand = bpy.context.object
 group_operand.name = "FloatGroupOperand"

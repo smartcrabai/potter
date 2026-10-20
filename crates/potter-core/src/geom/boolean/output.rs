@@ -331,9 +331,11 @@ struct PlannedFace {
 /// Distinct arena vertices used by `polys`, sorted as Blender's `IMesh::populate_vert` sorts them,
 /// and the polygons over them. Blender takes the vertices in a pointer-hashed map order and sorts
 /// them with an unstable sort: input vertices by ascending origin, created vertices after them by
-/// creation order. Two input vertices with the same local origin (different operands) therefore
-/// tie in Blender with an address-dependent order; first-seen order stands in for it, and that
-/// order sets the stored direction of an edge joining such a pair.
+/// creation order. Two input vertices with the same local origin (different operands) tie in that
+/// sort. Headless Blender 5.2.2 gave one order for every tie edge in the Boolean corpus over 11 runs
+/// on macOS and Linux, so the tie order is fixed for these inputs, but the source does not guarantee
+/// it. First-seen order stands in for it, and that order sets the stored direction of an edge joining
+/// such a pair.
 fn plan(polys: &[Poly], arena: &Arena, layout: &Layout) -> Result<(Vec<u32>, Vec<PlannedFace>)> {
     let mut seen_ids: Vec<u32> = Vec::new();
     let mut seen_slot: HashMap<u32, usize> = HashMap::new();
