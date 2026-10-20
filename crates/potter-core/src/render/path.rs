@@ -967,6 +967,9 @@ fn trace_path(
             break;
         }
         if rng.next_f64() >= surface.params.alpha.clamp(0.0, 1.0) {
+            // A pass carries the Transparent closure's colour: the tint is its mean, weighted by the pass chance
+            // `1 - alpha`, so the expected throughput is Cycles' `(1 - alpha) * tint`.
+            throughput *= DVec3::from_array(surface.params.transparent_tint);
             transparent_bounce += 1;
             terminate_on_next_surface |= transparent_bounce >= transparent_cap;
             origin = offset_origin(surface.point, direction, surface.geometric_normal);
@@ -1357,8 +1360,9 @@ fn make_surface(
     )?;
     let mut params =
         evaluate_surface_with_workspace(material, prepared, &context, evaluator_workspace)?;
+    // The graph is the only source of transparency for a material with one (Cycles ignores the render method).
     params.alpha = match material.alpha_mode.as_str() {
-        "opaque" => 1.0,
+        "opaque" if material.node_tree.is_none() => 1.0,
         "clip" => {
             if params.alpha >= material.alpha_threshold {
                 1.0
@@ -1455,7 +1459,7 @@ fn direct_lighting(
             rng,
             evaluator_workspace,
         )?;
-        if visibility <= 0.0 {
+        if visibility.max_element() <= 0.0 {
             continue;
         }
         // A BSDF ray reaches a hittable light only when the path continues past this vertex and
@@ -1617,8 +1621,8 @@ fn shadow_transmittance(
     transparent_budget: u32,
     rng: &mut Pcg32,
     evaluator_workspace: &mut EvaluatorWorkspace,
-) -> Result<f64> {
-    let mut transmittance = 1.0;
+) -> Result<DVec3> {
+    let mut transmittance = DVec3::ONE;
     let mut transparent_hits = 0u32;
     let mut origin = offset_origin(point, direction, normal);
     let mut remaining = if distance.is_finite() {
@@ -1643,22 +1647,27 @@ fn shadow_transmittance(
         if !surface.params.has_medium() {
             transparent_hits += 1;
             if transparent_hits > transparent_budget {
-                return Ok(0.0);
+                return Ok(DVec3::ZERO);
             }
         }
         let alpha = surface.params.alpha.clamp(0.0, 1.0);
         let transmission = surface.params.transmission.clamp(0.0, 1.0);
         if alpha >= 1.0 && transmission <= 0.0 {
-            return Ok(0.0);
+            return Ok(DVec3::ZERO);
         }
-        let tint = DVec3::new(
+        // Each transparent share passes its Transparent colour, `(1 - alpha) * tint` as Cycles' closure weight
+        // (`bsdf_transparent.h`). A glass share passes its transmission, tinted by the base colour as before.
+        let base_tint = DVec3::new(
             surface.params.base_color[0],
             surface.params.base_color[1],
             surface.params.base_color[2],
-        );
-        transmittance *= (1.0 - alpha) + alpha * transmission * tint.max_element().clamp(0.0, 1.0);
-        if transmittance <= 1.0e-5 {
-            return Ok(0.0);
+        )
+        .max_element()
+        .clamp(0.0, 1.0);
+        transmittance *= DVec3::from_array(surface.params.transparent_tint) * (1.0 - alpha)
+            + DVec3::splat(alpha * transmission * base_tint);
+        if transmittance.max_element() <= 1.0e-5 {
+            return Ok(DVec3::ZERO);
         }
         let advance = surface.distance + RAY_EPSILON;
         origin += direction * advance;
@@ -1670,7 +1679,7 @@ fn shadow_transmittance(
         }
     }
     let volume_transmittance = march_volumes(volumes, origin, direction, remaining, Some(rng))?;
-    Ok((transmittance * volume_transmittance).clamp(0.0, 1.0))
+    Ok(transmittance.clamp(DVec3::ZERO, DVec3::ONE) * volume_transmittance)
 }
 
 fn sample_light(light: &PointLight, point: DVec3, rng: &mut Pcg32) -> Option<LightSample> {
