@@ -93,7 +93,8 @@ def draw(records, width, height, p0, p1, c0, c1):
             if t < -LINE_SPAN or t > length + LINE_SPAN:
                 continue
             d = rx * perp[0] + ry * perp[1]  # signed distance to the infinite line
-            if abs(d) > 0.5:
+            major = max(abs(ux), abs(uy))
+            if not (-0.5 * major <= d < 0.5 * major):
                 continue
             f = min(max(t / length, 0.0), 1.0)
             colour = [mix(a, b, f) for a, b in zip(c0, c1)]

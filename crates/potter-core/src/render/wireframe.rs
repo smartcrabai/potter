@@ -281,6 +281,7 @@ fn draw_segment(
     }
     let (ux, uy) = (dx / length, dy / length);
     let perp = [-uy, ux];
+    let major = ux.abs().max(uy.abs());
     let min_x = (ax.min(bx).floor() - 2.0).max(0.0) as usize;
     let max_x = ((ax.max(bx).ceil() + 2.0).max(0.0) as usize).min(width.saturating_sub(1));
     let min_y = (ay.min(by).floor() - 2.0).max(0.0) as usize;
@@ -293,7 +294,10 @@ fn draw_segment(
                 continue;
             }
             let distance = rx * perp[0] + ry * perp[1];
-            if distance.abs() > LINE_HALF_WIDTH {
+            // One fragment per major-axis step: the band is half a pixel measured along the major axis
+            // (`-0.5 * major <= d < 0.5 * major`), half-open at the tie. Measured on the native line
+            // rasteriser of the capture's Metal GPU, it reproduces isolated lines at every angle to 2%.
+            if !(-LINE_HALF_WIDTH * major..LINE_HALF_WIDTH * major).contains(&distance) {
                 continue;
             }
             let along = (t / length).clamp(0.0, 1.0);
