@@ -821,7 +821,7 @@ impl BMesh {
     }
 
     /// `bm_decim_triangulate_end`: the edges whose two triangles came from the same input face and
-    /// merge into a convex quad (or a flat one) are joined back; returns them in edge order.
+    /// merge into a convex quad (or a flat one) are joined back; returns them in edge pool order.
     fn join_edges(&self) -> Vec<usize> {
         let mut join = Vec::new();
         let can_merge = |bm: &Self, l: usize, mark: isize| {
@@ -830,10 +830,12 @@ impl BMesh {
                 && mark == bm.loops[l].mark
                 && mark == bm.loops[bm.loops[l].radial_next].mark
         };
-        for e in 0..self.edges.len() {
-            if !self.edges[e].alive {
-                continue;
-            }
+        // `BM_ITER_MESH` walks the edge pool in slot order, and the joins run in that order.
+        let mut pool: Vec<usize> = (0..self.edges.len())
+            .filter(|&e| self.edges[e].alive)
+            .collect();
+        pool.sort_by_key(|&e| self.edges[e].slot);
+        for e in pool {
             let Some((la, lb)) = self.edge_loop_pair(e) else {
                 continue;
             };
@@ -889,7 +891,8 @@ impl BMesh {
     /// `BM_faces_join` of the two faces across `e` (`do_del` false), then `BM_edge_kill` of `e` once no
     /// face uses it. The joined ring starts at the first boundary loop of `faces[0]` (the radial head of
     /// `e`), which is `BM_faces_join`'s `v1`; each new corner copies UVs from the boundary loop on its edge.
-    /// shortcut: `BM_face_find_double` (#159549) is not ported, so a join that duplicates an existing face keeps both; upgrade when input meshes can hold duplicate faces.
+    /// A join that doubles an existing face (`BM_face_find_double`) is killed after the joined faces, so
+    /// the existing face stays (`bm_decim_triangulate_end`, #159549).
     /// shortcut: a boundary vertex with several open boundary edges takes the first in discovery order, Blender takes disk order; only non-manifold boundaries differ.
     fn join_across(&mut self, e: usize) {
         let Some((la, lb)) = self.edge_loop_pair(e) else {
@@ -952,6 +955,8 @@ impl BMesh {
             });
         }
         let joined = self.face_create(&verts, &edges, faces[0]);
+        // `BM_faces_join` checks for a double before it kills the joined faces.
+        let double = self.face_find_double(joined).is_some();
         let first_new = self.faces[joined].first;
         for (k, &source) in sources.iter().enumerate() {
             for layer in 0..self.uv_stride {
@@ -961,6 +966,9 @@ impl BMesh {
         }
         self.face_kill(faces[0]);
         self.face_kill(faces[1]);
+        if double {
+            self.face_kill(joined);
+        }
         if self.edges[e].l == NONE {
             self.edge_kill(e);
         }
@@ -979,6 +987,43 @@ impl BMesh {
             }
         }
         count
+    }
+
+    /// `BM_face_find_double`: an existing face with the same corners, in either winding, found on the
+    /// radial cycle of the first loop of `f`.
+    fn face_find_double(&self, f: usize) -> Option<usize> {
+        let l_first = self.faces[f].first;
+        let len = self.faces[f].len;
+        let mut l_iter = self.loops[l_first].radial_next;
+        while l_iter != l_first {
+            let other = self.loops[l_iter].f;
+            if self.faces[other].len == len {
+                let same_winding = self.loops[l_iter].v == self.loops[l_first].v;
+                let mut a = l_first;
+                let mut b = l_iter;
+                let mut same = true;
+                loop {
+                    if self.loops[a].e != self.loops[b].e {
+                        same = false;
+                        break;
+                    }
+                    a = if same_winding {
+                        self.loops[a].next
+                    } else {
+                        self.loops[a].prev
+                    };
+                    b = self.loops[b].next;
+                    if b == l_iter {
+                        break;
+                    }
+                }
+                if same {
+                    return Some(other);
+                }
+            }
+            l_iter = self.loops[l_iter].radial_next;
+        }
+        None
     }
 }
 
