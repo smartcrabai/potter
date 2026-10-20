@@ -34,16 +34,19 @@ impl Heap {
         self.tree.is_empty()
     }
 
-    /// Empties the heap and forgets every node, keeping the allocations.
-    pub(super) fn clear(&mut self) {
-        self.tree.clear();
-        self.nodes.clear();
-        self.free.clear();
-    }
-
     /// Value of the minimum node. The heap must not be empty.
     pub(super) fn top_value(&self) -> f32 {
         self.nodes[self.tree[0]].value
+    }
+
+    /// Element pointer of the minimum node. The heap must not be empty.
+    pub(super) fn top_ptr(&self) -> usize {
+        self.nodes[self.tree[0]].ptr
+    }
+
+    /// Value of `node`, which must be live.
+    pub(super) fn value(&self, node: NodeId) -> f32 {
+        self.nodes[node].value
     }
 
     pub(super) fn insert(&mut self, value: f32, ptr: usize) -> NodeId {

@@ -5,10 +5,9 @@
 //! The Mesh vertex normals come from `normals_calc_verts`, which uses the Mesh face normals
 //! (`normal_calc_ngon`), not the `BMesh` ones.
 
-use crate::geom::triangulate::ortho_basis;
+use crate::geom::triangulate::project;
 
 type Vec3 = [f32; 3];
-type Mat3 = [[f32; 3]; 3];
 
 fn sub(a: Vec3, b: Vec3) -> Vec3 {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
@@ -182,29 +181,9 @@ pub(super) fn face_center_median(points: &[[f32; 3]]) -> [f32; 3] {
     [c[0] * scale, c[1] * scale, c[2] * scale]
 }
 
-/// `axis_dominant_v3_to_m3` body (`math_geom.cc`) given the third row, which is already negated for
-/// the `_negate` variant.
-fn axis_dominant_matrix(third: Vec3) -> Mat3 {
-    let (r0, r1) = ortho_basis(third);
-    let mut m = [r0, r1, third];
-    for (i, j) in [(0, 1), (0, 2), (1, 2)] {
-        let t = m[i][j];
-        m[i][j] = m[j][i];
-        m[j][i] = t;
-    }
-    m
-}
-
-/// `mul_v2_m3v3` (`math_matrix_c.cc`), with `M[col][row]` indexing.
-fn mul_v2_m3v3(m: &Mat3, a: Vec3) -> [f32; 2] {
-    [
-        m[0][0] * a[0] + m[1][0] * a[1] + m[2][0] * a[2],
-        m[0][1] * a[0] + m[1][1] * a[1] + m[2][1] * a[2],
-    ]
-}
-
-/// `axis_dominant_v3_to_m3_negate` followed by `mul_v2_m3v3` for every point.
+/// `axis_dominant_v3_to_m3_negate` followed by `mul_v2_m3v3` for every point: the shared
+/// `triangulate::project` with the negated normal.
 pub(super) fn project_axis_dominant(normal: [f32; 3], points: &[[f32; 3]]) -> Vec<[f32; 2]> {
-    let m = axis_dominant_matrix([-normal[0], -normal[1], -normal[2]]);
-    points.iter().map(|&p| mul_v2_m3v3(&m, p)).collect()
+    let negated = [-normal[0], -normal[1], -normal[2]];
+    points.iter().map(|&p| project(negated, p)).collect()
 }

@@ -191,7 +191,8 @@ pub(in crate::geom) fn ortho_basis(n: Vec3) -> (Vec3, Vec3) {
 }
 
 /// `axis_dominant_v3_to_m3` followed by `mul_v2_m3v3`: projects `point` onto the plane of `normal`.
-fn project(normal: Vec3, point: Vec3) -> Vec2 {
+/// Shared with Decimate, whose matrix product is the same two dot products.
+pub(in crate::geom) fn project(normal: Vec3, point: Vec3) -> Vec2 {
     let (n1, n2) = ortho_basis(normal);
     [dot3(n1, point), dot3(n2, point)]
 }
@@ -222,6 +223,19 @@ fn is_quad_flip(v1: Vec3, v2: Vec3, v3: Vec3, v4: Vec3) -> (bool, bool) {
     let flip_02 = dot3(cross3(d12, d23), cross3(d34, d41)) < 0.0;
     let flip_13 = dot3(cross3(d23, d34), cross3(d41, d12)) < 0.0;
     (flip_02, flip_13)
+}
+/// `split_24` of `BM_face_triangulate` for `MOD_TRIANGULATE_QUAD_BEAUTY` on the quad `v1..v4` in face
+/// order (`bmesh_polygon.cc`): a flip bit decides outright, otherwise the beauty cost does. True
+/// splits along the diagonal `v2`-`v4`. Decimate's COLLAPSE uses the same decision.
+pub(in crate::geom) fn quad_beauty_split_24(v1: Vec3, v2: Vec3, v3: Vec3, v4: Vec3) -> bool {
+    let (flip_bit0, flip_bit1) = is_quad_flip(v1, v2, v3, v4);
+    if flip_bit0 {
+        true
+    } else if flip_bit1 {
+        false
+    } else {
+        rotate_beauty3(v1, v2, v3, v4) > 0.0
+    }
 }
 
 /// `BLI_polyfill_edge_calc_rotate_beauty__area`: the 3D rotation cost of the quad `v1..v4`,
@@ -316,16 +330,7 @@ fn triangulate_quad(corners: [Vec3; 4], method: QuadMethod) -> [[usize; 3]; 2] {
                     let d2 = len_squared3(co1, co3);
                     (d2 - d1) < 0.0
                 }
-                _ => {
-                    let (flip_02, flip_13) = is_quad_flip(co1, co2, co3, co0);
-                    if flip_02 {
-                        true
-                    } else if flip_13 {
-                        false
-                    } else {
-                        rotate_beauty3(co1, co2, co3, co0) > 0.0
-                    }
-                }
+                _ => quad_beauty_split_24(co1, co2, co3, co0),
             };
             if split_02 { [0, 1, 2, 3] } else { [1, 2, 3, 0] }
         }
@@ -405,32 +410,12 @@ fn is_boundary_edge(a: usize, b: usize, coord_last: usize) -> bool {
     a + 1 == b || (a == 0 && b == coord_last)
 }
 
-/// Reusable storage for [`beautify_with_scratch`], so repeated triangulations keep their buffers.
-#[derive(Default)]
-pub(super) struct BeautyScratch {
-    half: Vec<HalfEdge>,
-    order: Vec<([usize; 2], usize)>,
-    eheap_table: Vec<Option<usize>>,
-    heap: Heap,
-}
-
 /// `BLI_polyfill_beautify`: flips internal diagonals while that improves the triangulation.
 pub(super) fn beautify(coords: &[[f32; 2]], tris: &mut [[usize; 3]]) {
-    beautify_with_scratch(coords, tris, &mut BeautyScratch::default());
-}
-
-/// [`beautify`] with caller-owned storage.
-pub(super) fn beautify_with_scratch(
-    coords: &[[f32; 2]],
-    tris: &mut [[usize; 3]],
-    scratch: &mut BeautyScratch,
-) {
-    let BeautyScratch {
-        half,
-        order,
-        eheap_table,
-        heap,
-    } = scratch;
+    let mut half: Vec<HalfEdge> = Vec::new();
+    let mut order: Vec<([usize; 2], usize)> = Vec::new();
+    let mut eheap_table: Vec<Option<usize>> = Vec::new();
+    let mut heap = Heap::default();
     let coords_num = coords.len();
     let coord_last = coords_num - 1;
     let tris_len = coords_num - 2;
@@ -477,10 +462,9 @@ pub(super) fn beautify_with_scratch(
         half[*b].base = base;
     }
 
-    heap.clear();
     for i in 0..half_len {
         if half[i].e_radial < i {
-            let (cost, _) = rotate_cost(coords, half, i);
+            let (cost, _) = rotate_cost(coords, &half, i);
             eheap_table[half[i].base] = if cost < 0.0 {
                 Some(heap.insert(cost, i))
             } else {
@@ -491,7 +475,7 @@ pub(super) fn beautify_with_scratch(
 
     while let Some(e) = heap.pop_min() {
         eheap_table[half[e].base] = None;
-        rotate_edge(half, e);
+        rotate_edge(&mut half, e);
         let e_next = half[e].e_next;
         let e_next_next = half[e_next].e_next;
         let radial = half[e].e_radial;
@@ -500,7 +484,7 @@ pub(super) fn beautify_with_scratch(
         for idx in [e_next, e_next_next, radial_next, radial_next_next] {
             if half[idx].base != NONE {
                 let base = half[idx].base;
-                let (cost, area) = rotate_cost(coords, half, idx);
+                let (cost, area) = rotate_cost(coords, &half, idx);
                 if cost < -1e-6 * area.max(1.0) {
                     heap.insert_or_update(&mut eheap_table[base], cost, idx);
                 } else if let Some(node) = eheap_table[base].take() {

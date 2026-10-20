@@ -1,8 +1,9 @@
 //! Blender's ear-clipping polyfill, the kd-tree variant (`BLI_polyfill_calc_arena`,
 //! `blenlib/intern/polyfill_2d.cc`, `coords_sign == 1`), the one routine behind every polygon
 //! triangulation in Potter: Mesh tessellation (`mesh_tessellate.cc:116`, `BLI_polyfill_calc_arena`),
-//! Boolean EXACT and FLOAT n-gon triangulation (`mesh_intersect.cc:1953`, `BLI_polyfill_calc`), and
-//! Decimate's COLLAPSE n-gon fill.
+//! Boolean EXACT n-gon triangulation (`mesh_intersect.cc:1953`, `BLI_polyfill_calc`), and Decimate's
+//! COLLAPSE n-gon fill. Boolean FLOAT tessellates its faces with `BM_mesh_calc_tessellation_beauty`
+//! (`modifiers/intern/MOD_boolean.cc:269`).
 //!
 //! Blender 5.2.2 compiles that file with `USE_CLIP_EVEN`, `USE_CONVEX_SKIP` and `USE_CLIP_SWEEP`
 //! defined unconditionally (`polyfill_2d.cc:54-57`). `USE_CONVEX_SKIP` implies `USE_KDTREE`

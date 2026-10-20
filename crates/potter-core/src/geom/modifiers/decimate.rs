@@ -20,6 +20,7 @@ use super::{
     Mesh, Polygon, bool_param, cyclic_pairs, decimate_compact, edge_key, id_indices,
     invalid_parameter, number_param, positions, schema_value,
 };
+use crate::geom::heap::{Heap, NodeId};
 use crate::geom::pool_slots::PoolSlots;
 use crate::geom::triangulate::ortho_basis;
 mod collapse;
@@ -2200,13 +2201,13 @@ impl BMesh {
         for &e in &einput {
             self.edges[e].tag = self.is_wire(e);
         }
-        let mut eheap = DecimateHeap::new(self.edges.len());
+        let mut eheap = ElementHeap::new(self.edges.len());
         for &e in &einput {
             let cost = self.edge_calc_dissolve_error(e, delim);
             eheap.insert(e, cost);
         }
         while let Some(top) = eheap.top() {
-            if eheap.value(top) >= angle_limit_cos_neg {
+            if eheap.top_value() >= angle_limit_cos_neg {
                 break;
             }
             let mut joined = None;
@@ -2252,7 +2253,7 @@ impl BMesh {
             }
             return;
         }
-        let mut vheap = DecimateHeap::new(self.verts.len());
+        let mut vheap = ElementHeap::new(self.verts.len());
         for v in 0..self.verts.len() {
             if self.verts[v].alive {
                 let cost = self.vert_edge_face_angle(v, delim);
@@ -2260,7 +2261,7 @@ impl BMesh {
             }
         }
         while let Some(v) = vheap.top() {
-            if vheap.value(v) >= angle_limit {
+            if vheap.top_value() >= angle_limit {
                 break;
             }
             let collapsed = if self.vert_collapse_is_degenerate(v) {
@@ -2290,7 +2291,7 @@ impl BMesh {
                 let mut l_cycle = self.loops[self.loops[l_iter].next].next;
                 loop {
                     let j = self.loops[l_cycle].v;
-                    if vheap.contains(j) && vheap.value(j) == COST_INVALID {
+                    if vheap.value_of(j) == Some(COST_INVALID) {
                         let cost = self.vert_edge_face_angle(j, delim);
                         vheap.update(j, cost);
                     }
@@ -2664,118 +2665,54 @@ fn write_dissolve_edge_flags(mesh: &mut Mesh, output: &[(bool, bool)]) -> Result
     Ok(())
 }
 
-/// Blender's `BLI_heap` over a fixed set of nodes, where a node's id is the caller's element index.
-/// Only inserted nodes take part, in insertion order. `heap_up` and `heap_down` compare with `<` as
-/// Blender does, so ties resolve in the same order.
-struct DecimateHeap {
-    values: Vec<f32>,
-    tree: Vec<usize>,
-    positions: Vec<Option<usize>>,
+/// The shared `BLI_heap` (`geom::heap`) keyed by element index, as DISSOLVE uses it: `table[e]` is
+/// the node of element `e` while `e` is in the heap, and the node's pointer is `e`.
+struct ElementHeap {
+    heap: Heap,
+    table: Vec<Option<NodeId>>,
 }
 
-impl DecimateHeap {
-    fn new(nodes: usize) -> Self {
+impl ElementHeap {
+    fn new(elements: usize) -> Self {
         Self {
-            values: vec![0.0; nodes],
-            tree: Vec::new(),
-            positions: vec![None; nodes],
+            heap: Heap::with_capacity(elements),
+            table: vec![None; elements],
         }
     }
 
-    /// `BLI_heap_top`: the minimum node.
+    fn insert(&mut self, element: usize, value: f32) {
+        self.table[element] = Some(self.heap.insert(value, element));
+    }
+
+    /// The element of the minimum node.
     fn top(&self) -> Option<usize> {
-        self.tree.first().copied()
+        (!self.heap.is_empty()).then(|| self.heap.top_ptr())
     }
 
-    fn value(&self, node: usize) -> f32 {
-        self.values[node]
+    fn top_value(&self) -> f32 {
+        self.heap.top_value()
     }
 
-    fn contains(&self, node: usize) -> bool {
-        self.positions[node].is_some()
+    fn contains(&self, element: usize) -> bool {
+        self.table[element].is_some()
     }
 
-    /// `BLI_heap_insert`.
-    fn insert(&mut self, node: usize, value: f32) {
-        self.values[node] = value;
-        self.positions[node] = Some(self.tree.len());
-        self.tree.push(node);
-        self.up(self.tree.len() - 1);
+    /// The value of `element` while it is in the heap.
+    fn value_of(&self, element: usize) -> Option<f32> {
+        self.table[element].map(|node| self.heap.value(node))
     }
 
-    fn swap(&mut self, first: usize, second: usize) {
-        self.tree.swap(first, second);
-        self.positions[self.tree[first]] = Some(first);
-        self.positions[self.tree[second]] = Some(second);
-    }
-
-    fn less(&self, first: usize, second: usize) -> bool {
-        self.values[self.tree[first]] < self.values[self.tree[second]]
-    }
-
-    fn up(&mut self, mut index: usize) {
-        while index > 0 {
-            let parent = (index - 1) >> 1;
-            if self.less(parent, index) {
-                break;
-            }
-            self.swap(parent, index);
-            index = parent;
+    /// `BLI_heap_node_value_update` on `element`, if it is in the heap.
+    fn update(&mut self, element: usize, value: f32) {
+        if let Some(node) = self.table[element] {
+            self.heap.update(node, value, element);
         }
     }
 
-    fn down(&mut self, mut index: usize) {
-        loop {
-            let left = (index << 1) + 1;
-            let right = left + 1;
-            let mut smallest = index;
-            if left < self.tree.len() && self.less(left, smallest) {
-                smallest = left;
-            }
-            if right < self.tree.len() && self.less(right, smallest) {
-                smallest = right;
-            }
-            if smallest == index {
-                break;
-            }
-            self.swap(index, smallest);
-            index = smallest;
-        }
-    }
-
-    /// `BLI_heap_node_value_update`.
-    fn update(&mut self, node: usize, value: f32) {
-        let Some(position) = self.positions[node] else {
-            return;
-        };
-        let old = self.values[node];
-        if value < old {
-            self.values[node] = value;
-            self.up(position);
-        } else if value > old {
-            self.values[node] = value;
-            self.down(position);
-        }
-    }
-
-    /// `BLI_heap_remove`: moves the node to the root, then pops it.
-    fn remove(&mut self, node: usize) {
-        let Some(mut position) = self.positions[node] else {
-            return;
-        };
-        while position > 0 {
-            let parent = (position - 1) >> 1;
-            self.swap(parent, position);
-            position = parent;
-        }
-        let last = self.tree.len() - 1;
-        if last > 0 {
-            self.swap(0, last);
-        }
-        self.tree.pop();
-        self.positions[node] = None;
-        if !self.tree.is_empty() {
-            self.down(0);
+    /// `BLI_heap_remove` of `element`, if it is in the heap.
+    fn remove(&mut self, element: usize) {
+        if let Some(node) = self.table[element].take() {
+            self.heap.remove(node);
         }
     }
 }
