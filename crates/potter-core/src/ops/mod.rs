@@ -2383,7 +2383,9 @@ mod tests {
                 .as_object_mut()
                 .unwrap()
                 .extend(fields.as_object().unwrap().clone());
-            apply_batch(&created.doc, &batch(json!([operation])))
+            let mut batch = batch(json!([operation]));
+            batch["base_revision"] = json!(created.doc.revision);
+            apply_batch(&created.doc, &batch)
         };
         for fields in [
             json!({"brush": "pose"}),
@@ -2392,7 +2394,9 @@ mod tests {
             json!({"brush": "boundary", "deform_type": "twist"}),
             json!({"brush": "boundary", "deform_type": "smooth"}),
         ] {
-            assert!(run(fields.clone()).is_ok(), "{fields}");
+            if let Err(error) = run(fields.clone()) {
+                panic!("{fields}: {} {:?}", error.message, error.details);
+            }
         }
         // Each refusal names its JSON pointer when the operation parser raises it. A geometry-level
         // refusal raised after parsing carries no pointer.
