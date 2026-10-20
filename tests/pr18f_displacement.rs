@@ -1251,7 +1251,7 @@ fn inline_blend_texture_diagonal_matches_blender() -> Result<(), Box<dyn std::er
 
 /// Procedural displacement oracles: `fixtures/pr18f_displacement/procedural_oracle.json`, whose
 /// `expected` tables are written by the committed `generate_procedural_oracle.py` (Blender 5.2.2
-/// headless; NATIVE_VALUE_NOISE by its port of Potter's former sampler).
+/// headless; `NATIVE_VALUE_NOISE` by its port of Potter's former sampler).
 const PROCEDURAL_ORACLE: &str = include_str!("fixtures/pr18f_displacement/procedural_oracle.json");
 
 struct ProceduralCase {
