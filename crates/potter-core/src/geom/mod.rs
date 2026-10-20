@@ -1022,13 +1022,8 @@ impl Mesh {
             [10, 9, 11],
         ];
         if params.subdivisions == 1 {
-            return Self::from_positions_and_faces(
-                positions,
-                base_faces
-                    .into_iter()
-                    .map(|face| face.into_iter().collect())
-                    .collect(),
-            );
+            let polygons: Vec<Vec<usize>> = base_faces.iter().map(|face| face.to_vec()).collect();
+            return primitive_order::polygons(positions, &polygons);
         }
 
         // Blender subdivides the original edges once with all cuts for the
@@ -1108,6 +1103,41 @@ impl Mesh {
             grids[face_index] = rows;
         }
 
+        // Blender's subdivide_edges (bmo_subdivide.cc): each original edge keeps its slot, now
+        // holding its last cut point and end vertex. Then each edge's first half and cut edges are
+        // appended in edge order. Then each face's grid is filled, last face first (the operator's
+        // stack), with the diagonal and its splits, and the grid's connecting edges.
+        let mut edge_pairs: Vec<[usize; 2]> =
+            Vec::with_capacity(edges.len() * (cuts + 1) + base_faces.len() * 3 * cuts * cuts);
+        for (endpoints, points) in &edges {
+            edge_pairs.push([points[cuts - 1], endpoints[1]]);
+        }
+        for (endpoints, points) in &edges {
+            let mut previous = endpoints[0];
+            for &point in points {
+                edge_pairs.push([previous, point]);
+                previous = point;
+            }
+        }
+        for rows in grids.iter().rev() {
+            for row in 0..cuts {
+                let diagonal = edge_pairs.len();
+                edge_pairs.push([rows[row + 1][0], rows[row + 1][row + 1]]);
+                for split in 0..row {
+                    edge_pairs.push([rows[row + 1][split], rows[row + 1][split + 1]]);
+                }
+                if row > 0 {
+                    edge_pairs[diagonal] = [rows[row + 1][row], rows[row + 1][row + 1]];
+                }
+            }
+            for row in 1..=cuts {
+                for column in 0..row {
+                    edge_pairs.push([rows[row][column], rows[row + 1][column + 1]]);
+                    edge_pairs.push([rows[row][column + 1], rows[row + 1][column + 1]]);
+                }
+            }
+        }
+
         let face_count = base_faces.len() * (cuts + 1).pow(2);
         let mut polygons = Vec::with_capacity(face_count);
         let mut retained_faces = Vec::with_capacity(base_faces.len());
@@ -1138,7 +1168,7 @@ impl Mesh {
         for added in added_faces.into_iter().rev() {
             polygons.extend(added);
         }
-        primitive_order::polygons(positions, &polygons)
+        primitive_order::explicit_edges(positions, &edge_pairs, &polygons)
     }
 
     /// Create a Blender-default or customized XY circle with optional fill.

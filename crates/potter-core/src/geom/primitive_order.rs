@@ -398,6 +398,34 @@ pub(super) fn polygons(positions: Vec<DVec3>, polygons: &[Vec<usize>]) -> Result
     elements.into_mesh()
 }
 
+/// Polygons whose edges are given explicitly in Blender's creation order (`subdivide_edges`). Every
+/// boundary edge of a polygon must appear in `edges`; a missing one is an error, not a silent insert.
+pub(super) fn explicit_edges(
+    positions: Vec<DVec3>,
+    edges: &[[usize; 2]],
+    polygons: &[Vec<usize>],
+) -> Result<Mesh, MeshError> {
+    let mut elements = Elements::default();
+    for position in positions {
+        elements.vertex(position);
+    }
+    for &[first, second] in edges {
+        elements.edge(first, second);
+    }
+    for polygon in polygons {
+        for (index, &corner) in polygon.iter().enumerate() {
+            let next = polygon[(index + 1) % polygon.len()];
+            if !elements.edge_keys.contains(&super::edge_key(corner, next)) {
+                return Err(MeshError::InvalidTopology(
+                    "face boundary edge is missing from the primitive's edge order",
+                ));
+            }
+        }
+        elements.faces.push(polygon.clone());
+    }
+    elements.into_mesh()
+}
+
 /// A torus (`add_torus` in `scripts/startup/bl_operators/add_mesh_torus.py`): its vertices and faces
 /// are given, and its edges follow the closing-first face walk, each stored lower vertex first.
 pub(super) fn torus(positions: Vec<DVec3>, polygons: &[Vec<usize>]) -> Result<Mesh, MeshError> {

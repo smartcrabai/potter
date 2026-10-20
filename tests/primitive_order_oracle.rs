@@ -254,11 +254,19 @@ fn torus_storage_order_matches_blender() -> TestResult {
 }
 
 #[test]
-fn icosphere_level_one_storage_order_matches_blender() -> TestResult {
+fn icosphere_storage_order_matches_blender() -> TestResult {
     let cases = oracle()?;
-    let icosphere = Mesh::icosphere(IcosphereParams {
-        subdivisions: 1,
-        radius: 1.0,
-    })?;
-    assert_matches("ico_sphere_1", &icosphere, &cases)
+    for (name, subdivisions) in [
+        ("ico_sphere_1", 1),
+        ("ico_sphere_default", 2),
+        ("ico_sphere_3", 3),
+        ("ico_sphere_4", 4),
+    ] {
+        let icosphere = Mesh::icosphere(IcosphereParams {
+            subdivisions,
+            radius: 1.0,
+        })?;
+        assert_matches(name, &icosphere, &cases)?;
+    }
+    Ok(())
 }
