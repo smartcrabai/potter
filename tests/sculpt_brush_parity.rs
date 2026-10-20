@@ -128,8 +128,16 @@ const FIXTURES: &[(&str, &str)] = &[
         include_str!("fixtures/sculpt_brushes/thumb_grid.json"),
     ),
     (
+        "thumb_grid_pressure",
+        include_str!("fixtures/sculpt_brushes/thumb_grid_pressure.json"),
+    ),
+    (
         "rotate_sphere",
         include_str!("fixtures/sculpt_brushes/rotate_sphere.json"),
+    ),
+    (
+        "rotate_sphere_oblique",
+        include_str!("fixtures/sculpt_brushes/rotate_sphere_oblique.json"),
     ),
     (
         "elastic_grab_grid",
