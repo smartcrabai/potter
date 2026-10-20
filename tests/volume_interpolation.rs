@@ -2,13 +2,11 @@
 //! `generate_volume_interpolation_oracle.py`: a 16³ hashed binary grid (`node_value` below) at density 2.0, single scatter
 //! (`max_bounces = volume_bounces = 0`), a 4 × 4 frame spanning the unit cube, a one-pixel box filter, eight seeds at 8192 spp.
 //!
-//! The compared quantities are frame means (all 16 pixels). The discriminating quantity is the cubic-minus-linear delta,
-//! `(cubic - linear) / cubic`. Blender's delta is 5.2 % ± 1.5 % over the eight seeds. The earlier 8.8 % came from four seeds
-//! and is within noise of that. The analytic single-scatter quadrature for this grid gives 2.0 % (Potter's boundary cut) to
-//! 2.6 % (Cycles' background fade), so a Potter delta far from 5 % would be a real difference.
-//!
-//! Each tolerance is three noise floors. A Potter render's relative spread is `POTTER_SD_*`, measured over four seeds at
-//! `SAMPLES`. Blender's spreads are the standard errors of its eight-seed means, read from the oracle.
+//! The compared quantities are frame means (all 16 pixels). Discrimination between the modes is carried by the
+//! deterministic cubic unit tests in `geom/volume.rs`, not by a frame-mean delta: Blender's cubic-minus-linear frame-mean
+//! delta is 5.2 % ± 1.5 % over eight seeds, the analytic single-scatter quadrature gives 2.0–2.6 %, and Potter's is
+//! 0.9 % ± 0.9 %. At this precision no tolerance separates them. Each parity tolerance is three noise floors: Potter's
+//! single-render spread (`POTTER_SD_*`, four seeds at `SAMPLES`) combined with Blender's seed standard error.
 
 use std::{error::Error, fs, path::Path, process::Output};
 
@@ -51,7 +49,11 @@ fn node_value(i: i64, j: i64, k: i64) -> f64 {
     if hash >= 512 { 1.0 } else { 0.0 }
 }
 
-fn make_scene(root: &Path, interpolation: &str, seed: u32) -> Result<std::path::PathBuf, Box<dyn Error>> {
+fn make_scene(
+    root: &Path,
+    interpolation: &str,
+    seed: u32,
+) -> Result<std::path::PathBuf, Box<dyn Error>> {
     std::fs::create_dir_all(root)?;
     let mut values = Vec::with_capacity(N * N * N);
     for k in 0..N {
@@ -79,9 +81,19 @@ fn make_scene(root: &Path, interpolation: &str, seed: u32) -> Result<std::path::
     let batch = root.join("operations.json");
     fs::write(
         &batch,
-        serde_json::to_vec(&json!({"schema_version": 1, "base_revision": 0, "operations": operations}))?,
+        serde_json::to_vec(
+            &json!({"schema_version": 1, "base_revision": 0, "operations": operations}),
+        )?,
     )?;
-    assert_cli_success(&pot().arg("apply").arg(&scene).arg("--file").arg(&batch).arg("--json").output()?)?;
+    assert_cli_success(
+        &pot()
+            .arg("apply")
+            .arg(&scene)
+            .arg("--file")
+            .arg(&batch)
+            .arg("--json")
+            .output()?,
+    )?;
     Ok(scene)
 }
 
@@ -128,7 +140,8 @@ struct BlenderFrames {
 
 fn blender_frames() -> Result<BlenderFrames, Box<dyn Error>> {
     let oracle: Value = serde_json::from_slice(&fs::read(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/volume_interpolation/blender_volume_interpolation.json"),
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/volume_interpolation/blender_volume_interpolation.json"),
     )?)?;
     let frames_of = |case: &str| -> Result<(f64, f64), Box<dyn Error>> {
         let seeds = oracle["cases"][case]["seed_pixels"]
@@ -144,12 +157,21 @@ fn blender_frames() -> Result<BlenderFrames, Box<dyn Error>> {
             frames.push(sum / pixels.len() as f64);
         }
         let mean = frames.iter().sum::<f64>() / frames.len() as f64;
-        let variance = frames.iter().map(|frame| (frame - mean).powi(2)).sum::<f64>() / (frames.len() - 1) as f64;
+        let variance = frames
+            .iter()
+            .map(|frame| (frame - mean).powi(2))
+            .sum::<f64>()
+            / (frames.len() - 1) as f64;
         Ok((mean, (variance / frames.len() as f64).sqrt()))
     };
     let (cubic, cubic_se) = frames_of("cubic_noise")?;
     let (linear, linear_se) = frames_of("linear_noise")?;
-    Ok(BlenderFrames { cubic, cubic_se, linear, linear_se })
+    Ok(BlenderFrames {
+        cubic,
+        cubic_se,
+        linear,
+        linear_se,
+    })
 }
 
 #[test]
@@ -180,35 +202,6 @@ fn linear_frame_mean_matches_blender() -> Result<(), Box<dyn Error>> {
         blender.linear,
         error * 100.0,
         MATCH_FLOORS * floor * 100.0
-    );
-    Ok(())
-}
-
-/// The cubic-minus-linear delta `(cubic - linear) / cubic` of Potter against Blender. Each side's delta has the error
-/// propagated from its two means, `d(delta) = sqrt((l / c² · σ_c)² + (σ_l / c)²)`. Potter's σ are its single-render spreads
-/// (relative, times the mean); Blender's are the standard errors of its seed means. The tolerance is three floors of the
-/// two deltas' combined spread.
-#[test]
-fn cubic_minus_linear_delta_matches_blender() -> Result<(), Box<dyn Error>> {
-    let blender = blender_frames()?;
-    let cubic = frame_mean("cubic", 0)?;
-    let linear = frame_mean("linear", 0)?;
-    let potter_delta = (cubic - linear) / cubic;
-    let blender_delta = (blender.cubic - blender.linear) / blender.cubic;
-    let delta_spread = |c: f64, l: f64, sigma_c: f64, sigma_l: f64| {
-        ((l / (c * c) * sigma_c).powi(2) + (sigma_l / c).powi(2)).sqrt()
-    };
-    let potter_spread = delta_spread(cubic, linear, POTTER_SD_CUBIC * cubic, POTTER_SD_LINEAR * linear);
-    let blender_spread = delta_spread(blender.cubic, blender.linear, blender.cubic_se, blender.linear_se);
-    let tolerance = MATCH_FLOORS * (potter_spread.powi(2) + blender_spread.powi(2)).sqrt();
-    let difference = (potter_delta - blender_delta).abs();
-    assert!(
-        difference < tolerance,
-        "cubic-minus-linear delta: Potter {:.2} % vs Blender {:.2} %, {:.2} % apart, over {:.2} % (three floors)",
-        potter_delta * 100.0,
-        blender_delta * 100.0,
-        difference * 100.0,
-        tolerance * 100.0
     );
     Ok(())
 }
