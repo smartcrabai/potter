@@ -3649,7 +3649,11 @@ fn apply_generic_scene_mesh_operand_modifier(
             "object"
         };
     let mut combined = None;
+    let mut curve_object_matrix = None;
     for operand in operands.get(object_parameter).into_iter().flatten() {
+        if modifier.modifier_type == "curve" && curve_object_matrix.is_none() {
+            curve_object_matrix = Some(operand.local_to_subject.to_cols_array());
+        }
         let mut transformed = operand.mesh.clone();
         for vertex in &mut transformed.vertices {
             vertex.co = operand.local_to_subject.transform_point3(vertex.co);
@@ -3677,6 +3681,9 @@ fn apply_generic_scene_mesh_operand_modifier(
         resolved.runtime.operand_mesh = Some(serde_json::to_value(operand).map_err(|error| {
             PotError::invalid_argument(format!("modifier operand serialization failed: {error}"))
         })?);
+    }
+    if let Some(matrix) = curve_object_matrix {
+        resolved.runtime.object_matrix = Some(matrix);
     }
     *mesh = crate::geom::modifiers::evaluate_modifiers(
         mesh,
@@ -4390,24 +4397,10 @@ pub(crate) fn apply_lattice_modifier(
     doc: &SceneDoc,
     matrices: &BTreeMap<Id, DMat4>,
 ) -> Result<()> {
-    let lattice_text = modifier
-        .params
-        .get("object")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            PotError::with_details(
-                ErrorCode::InvalidArgument,
-                "lattice modifier requires an object node ID",
-                json!({"modifier_id":modifier.id,"parameter":"object"}),
-            )
-        })?;
-    let lattice_id = Id::new(lattice_text.to_owned()).map_err(|_| {
-        PotError::with_details(
-            ErrorCode::InvalidArgument,
-            "lattice modifier target is not a valid node ID",
-            json!({"modifier_id":modifier.id,"parameter":"object"}),
-        )
-    })?;
+    // Blender disables the modifier when no lattice object is set.
+    let Some(lattice_id) = reference_object_id(modifier, "object", doc)? else {
+        return Ok(());
+    };
     let lattice_node = doc.nodes.get(&lattice_id).ok_or_else(|| {
         PotError::with_details(
             ErrorCode::TargetNotFound,
@@ -4447,13 +4440,18 @@ pub(crate) fn apply_lattice_modifier(
         )
     })?;
     let source_world = matrices.get(source_node_id).copied().ok_or_else(|| {
-        PotError::new(
-            ErrorCode::InternalError,
-            "source mesh world matrix is missing",
+        PotError::with_details(
+            ErrorCode::DependencyMissing,
+            "lattice modifier subject transform is unavailable",
+            json!({"modifier_id":modifier.id,"node_id":source_node_id}),
         )
     })?;
     let lattice_world = matrices.get(&lattice_id).copied().ok_or_else(|| {
-        PotError::new(ErrorCode::InternalError, "lattice world matrix is missing")
+        PotError::with_details(
+            ErrorCode::DependencyMissing,
+            "lattice modifier lattice transform is unavailable",
+            json!({"modifier_id":modifier.id,"node_id":lattice_id}),
+        )
     })?;
     let source_inverse = source_world.inverse();
     if !source_inverse.is_finite() {
@@ -4461,61 +4459,79 @@ pub(crate) fn apply_lattice_modifier(
             "lattice modifier source transform must be invertible",
         ));
     }
+    // The kernel maps lattice-space offsets through inv(subject) * lattice, as Blender's latmat does.
     let lattice_to_mesh = source_inverse * lattice_world;
-
-    let weights = if let Some(group_name) = modifier
-        .params
-        .get("vertex_group")
-        .and_then(serde_json::Value::as_str)
+    // An absent strength is the schema default 1.0; a present value must still be a finite number.
+    let strength = match modifier.params.get("strength") {
+        None | Some(Value::Null) => 1.0,
+        Some(_) => modifier_number_param(modifier, "strength")?,
+    };
+    let weights = lattice_vertex_group_weights(mesh, modifier, source_data)?
+        .unwrap_or_else(|| vec![1.0; mesh.vertices.len()]);
+    let fully_deformed =
+        crate::geom::lattice::deform_mesh_with_transform(mesh, lattice, None, lattice_to_mesh)?;
+    // The full-weight result scaled by strength * weight is Blender's per-vertex blend.
+    let mut result = mesh.clone();
+    for ((vertex, deformed), weight) in result
+        .vertices
+        .iter_mut()
+        .zip(&fully_deformed.vertices)
+        .zip(weights)
     {
-        let mut matches = source_data
-            .vertex_groups
-            .iter()
-            .filter(|group| group.id.as_str() == group_name || group.name == group_name);
-        let group = matches.next().ok_or_else(|| {
-            PotError::with_details(
-                ErrorCode::TargetNotFound,
-                format!("vertex group `{group_name}` was not found"),
-                json!({"modifier_id":modifier.id,"vertex_group":group_name}),
-            )
-        })?;
-        if matches.next().is_some() {
-            return Err(PotError::with_details(
-                ErrorCode::InvalidArgument,
-                format!("vertex group name `{group_name}` is ambiguous"),
-                json!({"modifier_id":modifier.id,"vertex_group":group_name}),
-            ));
+        vertex.co += (deformed.co - vertex.co) * (strength * weight);
+    }
+    *mesh = result;
+    Ok(())
+}
+
+fn lattice_vertex_group_weights(
+    mesh: &Mesh,
+    modifier: &Modifier,
+    source_data: &DataBlock,
+) -> Result<Option<Vec<f64>>> {
+    let name = match modifier.params.get("vertex_group") {
+        None | Some(Value::Null) => "",
+        Some(Value::String(name)) => name.as_str(),
+        Some(_) => {
+            return Err(invalid_reference(modifier, "vertex_group", "a group name"));
         }
-        let group_id = &group.id;
-        let weights_by_vertex = mesh_vertex_weights(mesh, &source_data.vertex_groups);
-        Some(
-            mesh.vertices
-                .iter()
-                .map(|vertex| {
-                    weights_by_vertex
-                        .get(&vertex.id)
-                        .and_then(|groups| groups.get(group_id))
-                        .copied()
-                        .unwrap_or(0.0)
-                })
-                .collect::<Vec<_>>(),
-        )
-    } else if modifier.params.contains_key("vertex_group") {
+    };
+    if name.is_empty() {
+        return Ok(None);
+    }
+    let mut matches = source_data
+        .vertex_groups
+        .iter()
+        .filter(|group| group.id.as_str() == name || group.name == name);
+    let Some(group) = matches.next() else {
+        // Blender reads a missing group as full influence.
+        return Ok(None);
+    };
+    if matches.next().is_some() {
         return Err(PotError::with_details(
             ErrorCode::InvalidArgument,
-            "lattice modifier vertex_group must be a group ID or name",
-            json!({"modifier_id":modifier.id,"parameter":"vertex_group"}),
+            format!("vertex group name `{name}` is ambiguous"),
+            json!({"modifier_id":modifier.id,"vertex_group":name}),
         ));
-    } else {
-        None
-    };
-    *mesh = crate::geom::lattice::deform_mesh_with_transform(
-        mesh,
-        lattice,
-        weights.as_deref(),
-        lattice_to_mesh,
-    )?;
-    Ok(())
+    }
+    let invert = modifier_bool_param(modifier, "invert_vertex_group")?;
+    let weights_by_vertex = mesh_vertex_weights(mesh, &source_data.vertex_groups);
+    if weights_by_vertex.values().all(BTreeMap::is_empty) {
+        return Ok(None);
+    }
+    Ok(Some(
+        mesh.vertices
+            .iter()
+            .map(|vertex| {
+                let weight = weights_by_vertex
+                    .get(&vertex.id)
+                    .and_then(|groups| groups.get(&group.id))
+                    .copied()
+                    .unwrap_or(0.0);
+                if invert { 1.0 - weight } else { weight }
+            })
+            .collect(),
+    ))
 }
 
 pub(crate) fn apply_volume_to_mesh_modifier(
@@ -5575,6 +5591,24 @@ fn modifier_str_param<'a>(modifier: &'a Modifier, name: &str) -> Result<&'a str>
         .get(name)
         .and_then(Value::as_str)
         .ok_or_else(|| invalid_reference(modifier, name, "a string"))
+}
+
+fn modifier_number_param(modifier: &Modifier, name: &str) -> Result<f64> {
+    modifier
+        .params
+        .get(name)
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| invalid_reference(modifier, name, "a finite number"))
+}
+
+fn modifier_bool_param(modifier: &Modifier, name: &str) -> Result<bool> {
+    modifier
+        .params
+        .get(name)
+        .or_else(|| params::default_value(ParameterFamily::Modifier, &modifier.modifier_type, name))
+        .and_then(Value::as_bool)
+        .ok_or_else(|| invalid_reference(modifier, name, "a boolean"))
 }
 
 fn subject_world_matrix(

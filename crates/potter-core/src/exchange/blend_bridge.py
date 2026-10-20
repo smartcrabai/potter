@@ -548,7 +548,23 @@ def modifier_params(modifier):
     if modifier.type == "MULTIRES":
         params["total_levels"] = int(modifier.total_levels)
         params["is_external"] = bool(modifier.is_external)
+    if modifier.type == "HOOK":
+        params["matrix_inverse"] = matrix_column_major(modifier.matrix_inverse)
     return params
+
+
+def matrix_column_major(matrix):
+    """Sixteen column-major numbers, the layout of Potter's matrix parameters."""
+    return [float(matrix[row][column]) for column in range(4) for row in range(4)]
+
+
+def matrix_rows_from_column_major(values):
+    """Blender rows for a matrix given as sixteen column-major numbers or as nested rows."""
+    if len(values) == 16:
+        return [[float(values[column * 4 + row]) for column in range(4)] for row in range(4)]
+    return values
+
+
 def _curve_mapping_points(mapping, include_handle_types=False):
     if mapping is None or not mapping.curves:
         return []
@@ -2643,7 +2659,8 @@ def set_rna(block, values, id_lookup=None, *, strict=False, owner=None):
                 continue
             if strict:
                 if isinstance(current, Matrix) and isinstance(value, (list, tuple)):
-                    _set_required(block, key, Matrix(value), owner)
+                    _set_required(
+                        block, key, Matrix(matrix_rows_from_column_major(value)), owner)
                     continue
                 if hasattr(current, "bl_rna"):
                     if value not in (None, {"rna_type": current.bl_rna.identifier}):
@@ -2661,6 +2678,8 @@ def set_rna(block, values, id_lookup=None, *, strict=False, owner=None):
             if (getattr(property_definition, "is_enum_flag", False)
                     and isinstance(value, (list, tuple))):
                 value = set(value)
+            if isinstance(current, Matrix) and isinstance(value, (list, tuple)):
+                value = Matrix(matrix_rows_from_column_major(value))
             if isinstance(current, (int, float, bool, str)) or hasattr(current, "__len__"):
                 setattr(block, key, value)
         except Exception:
