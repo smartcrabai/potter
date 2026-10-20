@@ -2319,6 +2319,10 @@ fn validate_attribute_modifier_params_inner(
             )
         })?;
         for item in items {
+            // An empty slot still occupies its position in `projectors_num` (MOD_uvproject.cc).
+            if item.is_null() {
+                continue;
+            }
             let identifier = item.as_str().ok_or_else(|| {
                 invalid_attribute_modifier_parameter(
                     modifier_type,

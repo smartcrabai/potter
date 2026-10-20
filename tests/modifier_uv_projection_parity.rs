@@ -75,12 +75,26 @@ def project_case(key, projectors, count, aspect, scale, layer='UVMap'):
     obj = make_subject('Subject_' + key)
     mod = obj.modifiers.new('Project', 'UV_PROJECT')
     mod.uv_layer = layer
-    mod.projector_count = count
+    mod.projector_count = max(count, len(projectors))
     mod.aspect_x, mod.aspect_y = aspect
     mod.scale_x, mod.scale_y = scale
     for index, projector in enumerate(projectors):
         if projector is not None:
             mod.projectors[index].object = projector
+    mod.projector_count = count
+    return read_uv(obj, layer)
+
+def project_created_case(key, projector, aspect, scale, layer):
+    # RNA rejects a UV name that is not on the mesh, so create it, select it, then remove it.
+    obj = make_subject('Subject_' + key)
+    obj.data.uv_layers.new(name=layer)
+    mod = obj.modifiers.new('Project', 'UV_PROJECT')
+    mod.uv_layer = layer
+    mod.projector_count = 1
+    mod.aspect_x, mod.aspect_y = aspect
+    mod.scale_x, mod.scale_y = scale
+    mod.projectors[0].object = projector
+    obj.data.uv_layers.remove(obj.data.uv_layers[layer])
     return read_uv(obj, layer)
 
 persp = make_camera('Perspective', 'PERSP', (1.1,0.4,4.3),(0.1,0.12,-0.2),(1.4,0.7,1.2),lens=42.0,fit='AUTO',shift=(0.12,-0.08))
@@ -114,7 +128,9 @@ result = {
     'orthographic': project_case('orthographic',[ortho],1,(1.2,2.0),(0.7,1.4)),
     'panorama': project_case('panorama',[pano],1,(2.1,1.2),(1.3,0.7)),
     'projector_count_with_null_slot': project_case('multi',[pano,None,plain],3,(1.0,1.0),(1.0,1.0)),
-    'created_layer': project_case('created',[persp],1,(1.0,1.0),(1.0,1.0),'CreatedUV'),
+    'projector_count_smaller_than_array': project_case('multi_one',[pano,None,plain],1,(1.0,1.0),(1.0,1.0)),
+    'projector_count_larger_than_array': project_case('multi_five',[pano,None,plain],5,(1.0,1.0),(1.0,1.0)),
+    'created_layer': project_created_case('created',persp,(1.0,1.0),(1.0,1.0),'CreatedUV'),
     'scaled_projector_normal_selection': scaled_normal_selection,
     'matrices': {
         'subject':mat_cols(subject_transform),
@@ -658,9 +674,12 @@ fn uv_project_matches_blender_camera_modes_aspect_scale_and_projector_list()
         let actual = evaluate_project_case(&mesh, subject, projectors, params)?;
         assert_uv_parity(name, &actual, &expected[name], layer)?;
     }
-    // Blender resizes the projectors collection from `projector_count`; once imported,
-    // the explicit projector array is the canonical slot list, including null slots.
-    for count in [1, 5] {
+    // `projector_count` is Blender's `projectors_num`: slots past it are ignored, and empty slots keep
+    // their positions (MOD_uvproject.cc). Each count has its own Blender oracle.
+    for (count, name) in [
+        (1, "projector_count_smaller_than_array"),
+        (5, "projector_count_larger_than_array"),
+    ] {
         let actual = evaluate_project_case(
             &mesh,
             subject,
@@ -683,17 +702,7 @@ fn uv_project_matches_blender_camera_modes_aspect_scale_and_projector_list()
                 "uv_layer":"UVMap","aspect_x":1.0,"aspect_y":1.0,"scale_x":1.0,"scale_y":1.0
             }),
         )?;
-        let name = if count < 3 {
-            "projector_count_smaller_than_array"
-        } else {
-            "projector_count_larger_than_array"
-        };
-        assert_uv_parity(
-            name,
-            &actual,
-            &expected["projector_count_with_null_slot"],
-            "UVMap",
-        )?;
+        assert_uv_parity(name, &actual, &expected[name], "UVMap")?;
     }
     let angle = 75.0_f64.to_radians();
     let tangent = DVec3::new(angle.cos(), 0.0, -angle.sin());

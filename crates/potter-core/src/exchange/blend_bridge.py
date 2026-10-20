@@ -3018,9 +3018,12 @@ def set_modifier_params(modifier, item, id_lookup, doc, target, node_id, obj, pa
         modifier.filepath = _relative_blend_path(filepath, target)
     elif kind == "uv_project":
         projectors = params.get("projectors", [])
-        if projectors:
-            modifier.projector_count = len(projectors)
-        for index, reference in enumerate(projectors):
+        # `projector_count` is the slot count; empty slots stay empty (rna_modifier.cc projectors_num).
+        count = int(params.get("projector_count", 1))
+        modifier.projector_count = count
+        for index, reference in enumerate(projectors[:count]):
+            if reference is None:
+                continue
             candidate = id_lookup.get(reference) if isinstance(reference, str) else None
             if candidate is None:
                 raise ValueError("UV Project projector references missing object %s" % reference)

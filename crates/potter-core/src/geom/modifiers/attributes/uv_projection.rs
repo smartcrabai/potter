@@ -17,7 +17,26 @@ pub(super) fn uv_project(
     operands: &BTreeMap<String, Vec<SceneOperand>>,
     subject_world: DMat4,
 ) -> Result<Mesh> {
-    let Some(projectors) = operands.get("projectors").filter(|items| !items.is_empty()) else {
+    // `projectors_num` slots (MOD_uvproject.cc) include empty ones: only filled slots among the first
+    // `projector_count` project. The operands hold filled entries in slot order, so the first
+    // `filled_slots` operands are exactly those slots.
+    let projector_count = number(modifier, "projector_count")?.max(1.0) as usize;
+    let filled_slots = modifier
+        .params
+        .get("projectors")
+        .and_then(Value::as_array)
+        .map_or(0, |items| {
+            items
+                .iter()
+                .take(projector_count)
+                .filter(|item| item.as_str().is_some_and(|text| !text.is_empty()))
+                .count()
+        });
+    let Some(projectors) = operands
+        .get("projectors")
+        .map(|items| &items[..filled_slots.min(items.len())])
+        .filter(|items| !items.is_empty())
+    else {
         return Ok(mesh.clone());
     };
     let aspect_x = (number(modifier, "aspect_x")? as f32).max(1.0);
@@ -27,8 +46,6 @@ pub(super) fn uv_project(
     let scale_y = (number(modifier, "scale_y")? as f32).max(0.0);
     let scale_x = if scale_x == 0.0 { 1.0 } else { scale_x };
     let scale_y = if scale_y == 0.0 { 1.0 } else { scale_y };
-    // `projectors_num` (MOD_uvproject.cc) limits which projector slots are read; later slots are ignored.
-    let projector_count = number(modifier, "projector_count")?.max(1.0) as usize;
 
     let requested_layer = string(modifier, "uv_layer")?;
     let mut store = crate::geom::uv_layers::read(mesh);
@@ -67,7 +84,6 @@ pub(super) fn uv_project(
         .collect::<Vec<_>>();
     let projector_data = projectors
         .iter()
-        .take(projector_count)
         .map(|projector| {
             make_projector_f32(
                 projector,

@@ -1962,6 +1962,16 @@ pub(crate) fn effective_material_slots(
         .collect()
 }
 
+/// The UV Project slot count (`projectors_num`, MOD_uvproject.cc). Slots past it are ignored, empty
+/// slots included, so their objects are neither resolved nor depended on.
+fn uv_project_slot_count(modifier: &Modifier) -> usize {
+    modifier
+        .params
+        .get("projector_count")
+        .and_then(Value::as_u64)
+        .map_or(1, |count| count.max(1) as usize)
+}
+
 fn modifier_transform_references(modifier: &Modifier) -> BTreeSet<Id> {
     fn add_reference(references: &mut BTreeSet<Id>, value: Option<&Value>) {
         if let Some(text) = value.and_then(Value::as_str)
@@ -1989,7 +1999,7 @@ fn modifier_transform_references(modifier: &Modifier) -> BTreeSet<Id> {
         };
         if *parameter == "projectors" {
             if let Some(projectors) = value.as_array() {
-                for projector in projectors {
+                for projector in projectors.iter().take(uv_project_slot_count(modifier)) {
                     add_reference(&mut references, Some(projector));
                 }
             }
@@ -2986,6 +2996,7 @@ pub(crate) fn resolve_modifier_object_operands(
             Value::String(text) => vec![text.as_str()],
             Value::Array(values) if *parameter == "projectors" => values
                 .iter()
+                .take(uv_project_slot_count(modifier))
                 .filter(|value| !value.is_null())
                 .map(|value| {
                     value.as_str().ok_or_else(|| {

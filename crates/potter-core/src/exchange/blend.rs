@@ -3836,11 +3836,13 @@ fn build_imported_graph(
                         .and_then(Value::as_array)
                         .ok_or_else(|| invalid_intermediate("UV Project projectors are invalid"))?
                         .iter()
-                        .filter_map(|projector| {
+                        // Empty slots stay in place: `projectors_num` counts them (MOD_uvproject.cc).
+                        .map(|projector| {
                             projector
                                 .get("object")
                                 .filter(|object| !object.is_null())
                                 .cloned()
+                                .unwrap_or(Value::Null)
                         })
                         .collect::<Vec<_>>();
                     params.insert("projectors".to_owned(), Value::Array(projectors));
