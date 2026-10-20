@@ -1,9 +1,12 @@
 //! Voxel `volume_interpolation`. The oracle is `tests/fixtures/volume_interpolation`, rendered by Blender 5.2.2 with
-//! `generate_volume_interpolation_oracle.py`: a 16³ hashed grid (the same values as `hashed` below), imported as a
-//! Volume object with CUBIC or LINEAR interpolation and a Volume Scatter at density 0.05, single scatter under a
-//! point light. Cycles' CUBIC is the B-spline of `kernel_image_interp_tricubic_nanovdb`, which Potter's
-//! `cubic_weights` follows. The block mean barely separates the two modes (the B-spline preserves the field's mean),
-//! so the comparison is per pixel over the whole image.
+//! `generate_volume_interpolation_oracle.py`: a 16³ hashed binary grid (`node_value` below), imported as a Volume
+//! object with CUBIC or LINEAR interpolation, a Volume Scatter at density 0.2, single scatter under a point light.
+//! Cycles' CUBIC is the B-spline of `kernel_image_interp_tricubic_nanovdb`, which Potter's `cubic_weights` follows.
+//!
+//! Thresholds come from noise, not from a fixed tolerance. Each image is compared over the whole 24×24 frame. The
+//! noise floor of a comparison is sqrt(σ_potter² + σ_blender²), where σ is the per-pixel RMS of an image's mean
+//! about its expectation, relative to the image mean. σ_blender is the oracle's (`noise.sigma_blender`, four seeds).
+//! σ_potter is measured here from two seeds per mode, σ_single / √2.
 
 use std::{error::Error, fs, path::Path, process::Output};
 
@@ -15,8 +18,12 @@ const SIZE: u32 = 24;
 const N: usize = 16;
 const ENERGY: f64 = 100.0;
 const POSITION: [f64; 3] = [1.6, 0.6, 0.9];
-const DENSITY_SCALE: f64 = 0.05;
-const SAMPLES: u32 = 8192;
+const DENSITY_SCALE: f64 = 0.2;
+const SAMPLES: u32 = 32768;
+/// Potter seeds per mode. The mean of the two has noise σ_single / √2.
+const SEEDS: [u32; 2] = [0, 1];
+/// A match is within this many noise floors (three RMS deviations of noise alone).
+const MATCH_BANDS: f64 = 3.0;
 
 fn pot() -> Command {
     Command::new(env!("CARGO_BIN_EXE_pot"))
@@ -35,17 +42,23 @@ fn assert_cli_success(output: &Output) -> Result<Value, Box<dyn Error>> {
     Ok(serde_json::from_slice(&output.stdout)?)
 }
 
-/// The grid value at node `(i, j, k)`, as `generate_volume_interpolation_oracle.py` writes it.
-fn hashed(i: i64, j: i64, k: i64) -> f64 {
-    (((i * 73_856_093) ^ (j * 19_349_663) ^ (k * 83_492_791)) & 1023) as f64 / 1023.0
+/// The grid value at node `(i, j, k)`: 1 where the hash is at least 512, else 0, as the oracle writes it.
+fn node_value(i: i64, j: i64, k: i64) -> f64 {
+    let hash = ((i * 73_856_093) ^ (j * 19_349_663) ^ (k * 83_492_791)) & 1023;
+    if hash >= 512 { 1.0 } else { 0.0 }
 }
 
-fn make_scene(root: &Path, interpolation: &str) -> Result<std::path::PathBuf, Box<dyn Error>> {
+fn make_scene(
+    root: &Path,
+    interpolation: &str,
+    seed: u32,
+) -> Result<std::path::PathBuf, Box<dyn Error>> {
+    fs::create_dir_all(root)?;
     let mut values = Vec::with_capacity(N * N * N);
     for k in 0..N {
         for j in 0..N {
             for i in 0..N {
-                values.push(hashed(i as i64, j as i64, k as i64));
+                values.push(node_value(i as i64, j as i64, k as i64));
             }
         }
     }
@@ -60,7 +73,7 @@ fn make_scene(root: &Path, interpolation: &str) -> Result<std::path::PathBuf, Bo
         json!({"op":"material.create","id":"voxels","graph":"voxel_graph","volume_interpolation":interpolation}),
         json!({"op":"volume.create","id":"voxel_volume","materials":["voxels"],"grids":[{"dims":[N,N,N],"voxel_size":1.0 / N as f64,"origin":[-0.5,-0.5,-0.5],"values":values}]}),
         json!({"op":"scene.update","target":{"id":"scene_main"},"set":{"camera":"camera_main","world":"world_main"}}),
-        json!({"op":"render.update","target":{"id":"scene_main"},"set":{"resolution_x":SIZE,"resolution_y":SIZE,"samples":SAMPLES,"seed":0,"max_bounces":0}}),
+        json!({"op":"render.update","target":{"id":"scene_main"},"set":{"resolution_x":SIZE,"resolution_y":SIZE,"samples":SAMPLES,"seed":seed,"max_bounces":0}}),
     ];
     let scene = root.join("scene");
     let output = pot().arg("init").arg(&scene).arg("--json").output()?;
@@ -90,7 +103,8 @@ struct Pixels {
     red: Vec<f32>,
 }
 
-/// The red channel of the whole rendered image, in the EXR's row order.
+/// The red channel of the whole rendered image, top-down: `position.y()` counts from the top row, as the oracle's
+/// `row_order` says.
 fn render_image(scene: &Path, out: &Path) -> Result<Vec<f64>, Box<dyn Error>> {
     let output = pot()
         .arg("render")
@@ -114,12 +128,15 @@ fn render_image(scene: &Path, out: &Path) -> Result<Vec<f64>, Box<dyn Error>> {
     Ok(pixels.red.iter().map(|value| f64::from(*value)).collect())
 }
 
-/// The oracle's per-pixel image for a case, in the row order of `generate_volume_interpolation_oracle.py`.
-fn blender_image(case: &str) -> Result<Vec<f64>, Box<dyn Error>> {
-    let oracle: Value = serde_json::from_slice(&fs::read(
+fn oracle() -> Result<Value, Box<dyn Error>> {
+    Ok(serde_json::from_slice(&fs::read(
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/volume_interpolation/blender_volume_interpolation.json"),
-    )?)?;
+    )?)?)
+}
+
+/// The oracle's per-pixel mean over its seeds, in top-down row order, for a case.
+fn blender_pixels(oracle: &Value, case: &str) -> Result<Vec<f64>, Box<dyn Error>> {
     oracle["cases"][case]["pixels"]
         .as_array()
         .ok_or("oracle pixels are missing")?
@@ -129,6 +146,16 @@ fn blender_image(case: &str) -> Result<Vec<f64>, Box<dyn Error>> {
         .map_err(Into::into)
 }
 
+fn blender_noise(oracle: &Value, case: &str) -> Result<f64, Box<dyn Error>> {
+    oracle["noise"]["sigma_blender"][case]
+        .as_f64()
+        .ok_or_else(|| format!("oracle noise for {case} is missing").into())
+}
+
+fn mean(values: &[f64]) -> f64 {
+    values.iter().sum::<f64>() / values.len() as f64
+}
+
 /// The root-mean-square difference of two images, relative to the mean of the reference.
 fn relative_rms(measured: &[f64], reference: &[f64]) -> f64 {
     let squares: f64 = measured
@@ -136,52 +163,84 @@ fn relative_rms(measured: &[f64], reference: &[f64]) -> f64 {
         .zip(reference)
         .map(|(a, b)| (a - b) * (a - b))
         .sum();
-    let rms = (squares / reference.len() as f64).sqrt();
-    let mean = reference.iter().sum::<f64>() / reference.len() as f64;
-    rms / mean
+    (squares / reference.len() as f64).sqrt() / mean(reference)
 }
 
-/// `relative_rms` under the better of the two row orders. The EXR row origin of the two renderers is a file-format
-/// convention, not part of the sampler under test.
-fn oriented_relative_rms(measured: &[f64], reference: &[f64]) -> f64 {
-    let width = SIZE as usize;
-    let flipped: Vec<f64> = (0..reference.len())
-        .map(|index| measured[(width - 1 - index / width) * width + index % width])
-        .collect();
-    relative_rms(measured, reference).min(relative_rms(&flipped, reference))
+/// The per-render noise of two independent renders of one scene, relative to the mean of the first: the RMS of one
+/// render about its expectation, since the difference of two has variance 2σ².
+fn single_render_noise(first: &[f64], second: &[f64]) -> f64 {
+    let squares: f64 = first
+        .iter()
+        .zip(second)
+        .map(|(a, b)| (a - b) * (a - b))
+        .sum();
+    (squares / first.len() as f64 / 2.0).sqrt() / mean(first)
+}
+
+fn average(first: &[f64], second: &[f64]) -> Vec<f64> {
+    first
+        .iter()
+        .zip(second)
+        .map(|(a, b)| (a + b) / 2.0)
+        .collect()
+}
+
+/// Renders the scene at each of `SEEDS` for one interpolation mode. Returns the seed mean and its noise, σ_single / √2.
+fn render_mode(directory: &Path, interpolation: &str) -> Result<(Vec<f64>, f64), Box<dyn Error>> {
+    let mut runs = Vec::new();
+    for seed in SEEDS {
+        let root = directory.join(format!("{interpolation}_{seed}"));
+        let scene = make_scene(&root, interpolation, seed)?;
+        runs.push(render_image(&scene, &root.join("render"))?);
+    }
+    let sigma = single_render_noise(&runs[0], &runs[1]) / (SEEDS.len() as f64).sqrt();
+    Ok((average(&runs[0], &runs[1]), sigma))
 }
 
 #[test]
 fn cubic_and_linear_voxel_interpolation_match_blender_per_pixel() -> Result<(), Box<dyn Error>> {
-    let cubic_blender = blender_image("cubic_noise")?;
-    let linear_blender = blender_image("linear_noise")?;
+    let oracle = oracle()?;
+    let blender_cubic = blender_pixels(&oracle, "cubic_noise")?;
+    let blender_linear = blender_pixels(&oracle, "linear_noise")?;
+    let sigma_blender_cubic = blender_noise(&oracle, "cubic_noise")?;
+    let sigma_blender_linear = blender_noise(&oracle, "linear_noise")?;
+    let signal = oracle["noise"]["linear_vs_cubic_signal"]
+        .as_f64()
+        .ok_or("oracle signal is missing")?;
+
     let directory = tempdir()?;
-    let cubic = render_image(
-        &make_scene(&directory.path().join("cubic"), "cubic")?,
-        &directory.path().join("cubic_render"),
-    )?;
-    let linear = render_image(
-        &make_scene(&directory.path().join("linear"), "linear")?,
-        &directory.path().join("linear_render"),
-    )?;
-    let cubic_error = oriented_relative_rms(&cubic, &cubic_blender);
-    let linear_error = oriented_relative_rms(&linear, &linear_blender);
-    // The two modes must be distinguishable: a linear render must not match Blender's cubic one.
-    let linear_against_cubic = oriented_relative_rms(&linear, &cubic_blender);
+    let (cubic, sigma_potter_cubic) = render_mode(directory.path(), "cubic")?;
+    let (linear, sigma_potter_linear) = render_mode(directory.path(), "linear")?;
+
+    let cubic_floor = (sigma_potter_cubic.powi(2) + sigma_blender_cubic.powi(2)).sqrt();
+    let linear_floor = (sigma_potter_linear.powi(2) + sigma_blender_linear.powi(2)).sqrt();
+    let cubic_error = relative_rms(&cubic, &blender_cubic);
+    let linear_error = relative_rms(&linear, &blender_linear);
     assert!(
-        cubic_error < 0.03,
-        "CUBIC voxels: per-pixel error {:.2} % against Blender's CUBIC render",
-        cubic_error * 100.0
+        cubic_error < MATCH_BANDS * cubic_floor,
+        "CUBIC voxels: per-pixel error {:.2} % against Blender's CUBIC render, over {:.2} % (3 noise floors)",
+        cubic_error * 100.0,
+        MATCH_BANDS * cubic_floor * 100.0
     );
     assert!(
-        linear_error < 0.03,
-        "LINEAR voxels: per-pixel error {:.2} % against Blender's LINEAR render",
-        linear_error * 100.0
+        linear_error < MATCH_BANDS * linear_floor,
+        "LINEAR voxels: per-pixel error {:.2} % against Blender's LINEAR render, over {:.2} % (3 noise floors)",
+        linear_error * 100.0,
+        MATCH_BANDS * linear_floor * 100.0
     );
+
+    // The modes must be distinguishable. A LINEAR render against Blender's CUBIC has the noise floor of that pair
+    // and, if the modes differ, the Blender LINEAR-to-CUBIC signal on top. The threshold is halfway between the two.
+    let cross_floor = (sigma_potter_linear.powi(2) + sigma_blender_cubic.powi(2)).sqrt();
+    let expected_separation = (cross_floor.powi(2) + signal.powi(2)).sqrt();
+    let threshold = (cross_floor + expected_separation) / 2.0;
+    let linear_against_cubic = relative_rms(&linear, &blender_cubic);
     assert!(
-        linear_against_cubic > 0.045,
-        "LINEAR voxels match CUBIC too closely ({:.2} %): the interpolation mode is not taking effect",
-        linear_against_cubic * 100.0
+        linear_against_cubic > threshold,
+        "LINEAR voxels differ from Blender's CUBIC by {:.2} %, under the {:.2} % that separates the modes: the \
+         interpolation mode is not taking effect",
+        linear_against_cubic * 100.0,
+        threshold * 100.0
     );
     Ok(())
 }

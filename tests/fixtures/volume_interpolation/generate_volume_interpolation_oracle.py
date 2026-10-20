@@ -1,16 +1,34 @@
 """Blender 5.2.2 single-scatter oracle for a voxel grid under LINEAR and CUBIC volume interpolation.
 
-The grid is 16 x 16 x 16 nodes at index (i, j, k), with value v = h(i, j, k) / 1023 where h = ((i * 73856093) ^
-(j * 19349663) ^ (k * 83492791)) & 1023, a hash that is noisy enough for the cubic B-spline to differ from the
-trilinear sample. It is written to a VDB named "density" (background 0, every node active), imported as a Volume
-object placed so that index (i, j, k) sits at world origin + (i, j, k) / 16, with origin (-0.5, -0.5, -0.5), the
-same node convention as Potter's inline grids. The material is a Volume Scatter (Color 1, Anisotropy 0) with
-Density = 0.05 * Volume Info density, so the optical depth is small and the render is single scatter, as in
-generate_volume_nee_oracle.py: volume_bounces = max_bounces = 1, a point light of 100 W at (1.6, 0.6, 0.9),
-an orthographic camera at (0, 0, 3) with ortho scale 2, and a black world. Each case records the mean and the
-standard error of the 4 x 4 pixels at the image centre.
+The grid is 16 x 16 x 16 nodes at index (i, j, k), with value v = 1 where h(i, j, k) >= 512 and 0 otherwise, where
+h = ((i * 73856093) ^ (j * 19349663) ^ (k * 83492791)) & 1023: a hashed binary grid, whose sharp edges make LINEAR and
+CUBIC differ far more than a smooth noise field does. It is written to a VDB named "density" (background 0, every node active),
+imported as a Volume object placed so that index (i, j, k) sits at world origin + (i, j, k) / 16, with origin
+(-0.5, -0.5, -0.5), the same node convention as Potter's inline grids. The material is a Volume Scatter (Color 1,
+Anisotropy 0) with Density = 0.2 * Volume Info density, so the render is single scatter, with enough scattering events per
+sample for the seed-to-seed noise to fall below the LINEAR-to-CUBIC difference: volume_bounces = max_bounces = 1, a point light of 100 W at (1.6, 0.6, 0.9), an orthographic camera at
+(0, 0, 3) with ortho scale 2, and a black world.
 
-Regenerate from this directory with Blender 5.2.2 (openvdb must be importable), one thread, one run:
+Pixels are written top-down, the row order of the Potter test's EXR reader (`position.y()` from the top). Blender's
+`image.pixels` is bottom-up, so Blender row r is top row SIZE - 1 - r, the same convention as the panorama oracle
+(`generate_render_world_panorama_oracle.py`: the EXR row is HEIGHT - 1 - top_row).
+
+Noise derivation. Each case is rendered at SEEDS, and the oracle image is the per-pixel mean over them. The per-render noise,
+relative to the mean of the image, is sigma = sqrt(mean over seed pairs of mean_pixels((a - b)^2) / 2) / mean(image):
+the RMS of one render about its expectation, since two independent renders differ with variance 2 sigma^2. The
+mean of K seeds has noise sigma / sqrt(K). The image the test compares with is that mean, so its noise is
+sigma_blender = sigma / sqrt(K). For LINEAR against CUBIC, delta = rms(linear - cubic) / mean(cubic) with the
+means. The signal, the part of delta that is not noise, is
+signal = sqrt(max(0, delta^2 - sigma_blender_linear^2 - sigma_blender_cubic^2)).
+
+The test derives its thresholds from these. Potter's own noise is measured by the test from two seeds per mode:
+sigma_potter = sigma_single_potter / sqrt(2). The noise floor of a comparison is sqrt(sigma_potter^2 + sigma_blender^2).
+A Potter render matches Blender's when its error is within MATCH_BANDS = 3 noise floors (three RMS deviations of
+noise alone). The discriminating check is that LINEAR against CUBIC exceeds the midpoint between the cross noise
+floor and sqrt(cross floor^2 + signal^2), so it separates the modes halfway between the noise and the expected
+signal.
+
+Regenerate from this directory with Blender 5.2.2 (openvdb must be importable), one thread:
 
     Blender -b --factory-startup --threads 1 -P generate_volume_interpolation_oracle.py -- OUT.json
 """
@@ -28,11 +46,11 @@ argv = sys.argv[sys.argv.index("--") + 1 :]
 out_path = os.path.abspath(argv[0])
 work = tempfile.mkdtemp(prefix="volume_interpolation_")
 SIZE = 24
-SAMPLES = 65536
-BLOCK = range(10, 14)
+SAMPLES = 32768
+SEEDS = (0, 1, 2, 3)
 ENERGY = 100.0
 POSITION = (1.6, 0.6, 0.9)
-DENSITY_SCALE = 0.05
+DENSITY_SCALE = 0.2
 N = 16
 ORIGIN = -0.5
 VOXEL = 1.0 / N
@@ -42,6 +60,10 @@ def hashed(i, j, k):
     return ((i * 73856093) ^ (j * 19349663) ^ (k * 83492791)) & 1023
 
 
+def node_value(i, j, k):
+    return 1.0 if hashed(i, j, k) >= 512 else 0.0
+
+
 def write_vdb(path):
     grid = openvdb.FloatGrid()
     grid.name = "density"
@@ -49,11 +71,11 @@ def write_vdb(path):
     for i in range(N):
         for j in range(N):
             for k in range(N):
-                accessor.setValueOn((i, j, k), hashed(i, j, k) / 1023.0)
+                accessor.setValueOn((i, j, k), node_value(i, j, k))
     openvdb.write(path, grids=[grid])
 
 
-def reset(interpolation):
+def reset(interpolation, seed):
     bpy.ops.wm.read_factory_settings(use_empty=True)
     scene = bpy.context.scene
     render = scene.render
@@ -64,6 +86,7 @@ def reset(interpolation):
     render.film_transparent = False
     scene.cycles.device = "CPU"
     scene.cycles.samples = SAMPLES
+    scene.cycles.seed = seed
     scene.cycles.use_denoising = False
     scene.cycles.max_bounces = 1
     scene.cycles.volume_bounces = 1
@@ -125,34 +148,69 @@ def voxel_volume(vdb_path, interpolation):
     volume.data.materials.append(material)
 
 
-def render_block(name):
+def render_red(name):
+    """The red channel, top-down: row y of the output is Blender's bottom-up row SIZE - 1 - y."""
     path = os.path.join(work, name + ".exr")
     bpy.context.scene.render.filepath = path
     bpy.ops.render.render(write_still=True)
     loaded = bpy.data.images.load(path, check_existing=False)
     pixels = list(loaded.pixels)
     bpy.data.images.remove(loaded)
-    values = []
-    for y in BLOCK:
-        for x in BLOCK:
-            values.append(pixels[(y * SIZE + x) * 4])
-    mean = sum(values) / len(values)
-    variance = sum((value - mean) ** 2 for value in values) / (len(values) - 1)
-    # The whole image's red channel, row by row from the top, so Potter's per-pixel values can be compared with
-    # Blender's. The block mean alone barely separates LINEAR from CUBIC: the B-spline preserves the field's mean.
-    image = [round(pixels[(y * SIZE + x) * 4], 6) for y in range(SIZE) for x in range(SIZE)]
-    return round(mean, 6), round(math.sqrt(variance / len(values)), 6), image
+    return [
+        round(pixels[((SIZE - 1 - y) * SIZE + x) * 4], 6)
+        for y in range(SIZE)
+        for x in range(SIZE)
+    ]
+
+
+def mean(values):
+    return sum(values) / len(values)
+
+
+def relative_noise(seed_images):
+    """sigma: the RMS of one render about its expectation, relative to the image mean."""
+    pairs = [(a, b) for index, a in enumerate(seed_images) for b in seed_images[index + 1 :]]
+    squares = [
+        mean([(x - y) ** 2 for x, y in zip(a, b)]) / 2.0 for a, b in pairs
+    ]
+    return math.sqrt(mean(squares)) / mean(seed_images[0])
 
 
 vdb_path = os.path.join(work, "density.vdb")
 write_vdb(vdb_path)
-records = {}
+images = {"linear_noise": [], "cubic_noise": []}
 for name, interpolation in (("linear_noise", "LINEAR"), ("cubic_noise", "CUBIC")):
-    reset(interpolation)
-    voxel_volume(vdb_path, interpolation)
-    mean, stderr, image = render_block(name)
-    records[name] = {"mean": mean, "stderr": stderr, "pixels": image}
-    print("ORACLE_CASE", name, mean, stderr)
+    for seed in SEEDS:
+        reset(interpolation, seed)
+        voxel_volume(vdb_path, interpolation)
+        images[name].append(render_red(f"{name}_{seed}"))
+        print("ORACLE_RENDER", name, seed)
+
+sigma_single = {name: relative_noise(seeds) for name, seeds in images.items()}
+averaged = {
+    name: [mean([seed[index] for seed in seeds]) for index in range(SIZE * SIZE)]
+    for name, seeds in images.items()
+}
+sigma = {name: sigma_single[name] / math.sqrt(len(SEEDS)) for name in images}
+linear, cubic = averaged["linear_noise"], averaged["cubic_noise"]
+delta = math.sqrt(mean([(x - y) ** 2 for x, y in zip(linear, cubic)])) / mean(cubic)
+signal = math.sqrt(max(0.0, delta**2 - sigma["linear_noise"] ** 2 - sigma["cubic_noise"] ** 2))
+records = {
+    name: {
+        "mean": round(mean(averaged[name]), 6),
+        "pixels": [round(value, 6) for value in averaged[name]],
+        "seed_pixels": images[name],
+    }
+    for name in images
+}
+noise = {
+    "seeds": list(SEEDS),
+    "sigma_single_render": sigma_single,
+    "sigma_blender": sigma,
+    "linear_vs_cubic_delta": delta,
+    "linear_vs_cubic_signal": signal,
+}
+print("ORACLE_NOISE", json.dumps(noise))
 
 with open(out_path, "w") as handle:
     json.dump(
@@ -163,10 +221,12 @@ with open(out_path, "w") as handle:
             "position": list(POSITION),
             "density_scale": DENSITY_SCALE,
             "image_size": SIZE,
+            "row_order": "top_down",
             "grid": {"dims": [N, N, N], "voxel_size": VOXEL, "origin": [ORIGIN] * 3},
+            "noise": noise,
             "cases": records,
         },
         handle,
         indent=1,
     )
-print("ORACLE_OK volume_interpolation", json.dumps(records))
+print("ORACLE_OK volume_interpolation")
