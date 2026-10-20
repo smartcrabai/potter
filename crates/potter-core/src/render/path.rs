@@ -1273,6 +1273,31 @@ fn closest_hit(
     bvh.closest_hit_two_sided(&geometry.triangles, origin, direction, t_min, t_max)
 }
 
+/// The shading parameters at one hit, for the transparent pass of a realtime shadow ray (`render/scene.rs`). They
+/// are the path tracer's, so a realtime shadow and a path-traced one read the same alpha and tint.
+pub(super) fn hit_params(
+    doc: &SceneDoc,
+    snapshot: &Snapshot,
+    geometry: &Geometry,
+    hit: BvhHit,
+    origin: DVec3,
+    direction: DVec3,
+    images: &BTreeMap<String, ImageData>,
+    evaluator_workspace: &mut EvaluatorWorkspace,
+) -> Result<BsdfParams> {
+    Ok(make_surface(
+        doc,
+        snapshot,
+        geometry,
+        hit,
+        origin,
+        direction,
+        images,
+        evaluator_workspace,
+    )?
+    .params)
+}
+
 fn make_surface(
     doc: &SceneDoc,
     snapshot: &Snapshot,

@@ -25,12 +25,12 @@ use crate::{
 };
 
 use super::{
-    bvh::Bvh,
+    bvh::{Bvh, BvhHit},
     light_model::{
         area_irradiance_per_radiance, area_radiance, area_shape, area_visibility_samples,
         point_intensity, spot_attenuation,
     },
-    path::object_for_index,
+    path::{hit_params, object_for_index},
     principled_bsdf::{
         Layers, coat_coefficient, diffuse_coefficient, layers as principled_layers,
         sheen_coefficient, specular_coefficient,
@@ -116,6 +116,8 @@ impl Geometry {
 pub(super) struct RealtimeShadows {
     bvh: Bvh,
     point_maps: BTreeMap<Id, PointShadowMap>,
+    /// Whether some triangle can cast a transparent shadow, so shadow rays must evaluate the occluders they hit.
+    transparent_casters: bool,
 }
 
 const SHADOW_MAP_SIZE: u32 = 64;
@@ -133,7 +135,184 @@ struct PointShadowMap {
     faces: Vec<ShadowFace>,
 }
 
-type ShadowContext<'a> = Option<(&'a Bvh, &'a [Triangle], &'a BTreeMap<Id, PointShadowMap>)>;
+/// The shadow rays of one light cross the BVH over every triangle. Point and spot lights take the opaque triangles
+/// from their depth map, which holds only triangles that cannot cast a transparent shadow.
+#[derive(Clone, Copy)]
+struct ShadowScene<'a> {
+    bvh: &'a Bvh,
+    triangles: &'a [Triangle],
+    point_maps: &'a BTreeMap<Id, PointShadowMap>,
+    occluders: Option<&'a ShadowOccluders<'a>>,
+}
+
+type ShadowContext<'a> = Option<ShadowScene<'a>>;
+
+/// Tolerance of shadow rays along their own surface and at a hit (the epsilon of the realtime shadow code).
+const SHADOW_EPSILON: f64 = 1.0e-5;
+
+/// Whether a material can cast a transparent shadow: EEVEE compiles the transparent shadow pass only for a material
+/// with a transparent closure (a Transparent BSDF, or a Principled Alpha that is not one) and transparent shadows
+/// on (`eevee_shader.cc` `transparent_shadows`, `eevee_material.cc` `has_transparent_shadows`). A material without a
+/// graph is transparent only through its alpha, which Blender writes as the Principled Alpha of a non-opaque material
+/// (`blend_bridge.py` `_set_principled_values`).
+fn may_cast_transparent_shadow(material: &Material) -> bool {
+    material.use_transparent_shadow
+        && (material.node_tree.is_some() || material.alpha_mode != "opaque")
+}
+
+/// EEVEE's transparent shadow pass for one hit (`eevee_surf_shadow.bsl.hh`): a fragment is kept with probability
+/// `1 - transparency`, where `transparency` is the average of the transparent closures' weight. That weight is
+/// `(1 - alpha) * tint` (a Transparent BSDF's colour, or a Principled Alpha's `1 - alpha`), so the shadow ray passes
+/// with the same average. Refraction is no transparent closure (`closure_eval(ClosureTransparency)` is the only writer
+/// of `g_transmittance`), so glass casts an opaque shadow.
+fn transparent_shadow_pass(params: &BsdfParams) -> f64 {
+    let tint = params.transparent_tint;
+    ((1.0 - params.alpha.clamp(0.0, 1.0)) * (tint[0] + tint[1] + tint[2]) / 3.0).clamp(0.0, 1.0)
+}
+
+/// Evaluates the transparent pass of the triangles a shadow ray hits. A failed evaluation is kept and reported by
+/// [`ShadowOccluders::finish`], because the light loops that ask for a pass return no `Result`.
+struct ShadowOccluders<'a> {
+    doc: &'a SceneDoc,
+    snapshot: &'a Snapshot,
+    geometry: &'a Geometry,
+    images: &'a BTreeMap<String, ImageData>,
+    workspace: &'a RefCell<EvaluatorWorkspace>,
+    error: RefCell<Option<PotError>>,
+}
+
+impl<'a> ShadowOccluders<'a> {
+    fn new(
+        doc: &'a SceneDoc,
+        snapshot: &'a Snapshot,
+        geometry: &'a Geometry,
+        images: &'a BTreeMap<String, ImageData>,
+        workspace: &'a RefCell<EvaluatorWorkspace>,
+    ) -> Self {
+        Self {
+            doc,
+            snapshot,
+            geometry,
+            images,
+            workspace,
+            error: RefCell::new(None),
+        }
+    }
+
+    /// The transparent pass of a hit, or `None` when the triangle cannot cast a transparent shadow and so blocks like
+    /// opaque geometry. A failed evaluation is recorded and passes nothing.
+    fn pass(&self, hit: BvhHit, origin: DVec3, direction: DVec3) -> Option<f64> {
+        match self.try_pass(hit, origin, direction) {
+            Ok(pass) => pass,
+            Err(error) => {
+                let mut slot = self.error.borrow_mut();
+                if slot.is_none() {
+                    *slot = Some(error);
+                }
+                Some(0.0)
+            }
+        }
+    }
+
+    fn try_pass(&self, hit: BvhHit, origin: DVec3, direction: DVec3) -> Result<Option<f64>> {
+        let triangle = self
+            .geometry
+            .triangles
+            .get(hit.triangle_index)
+            .ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::EvaluationFailed,
+                    "BVH returned an invalid triangle index",
+                )
+            })?;
+        let material = self
+            .geometry
+            .materials
+            .get(triangle.material_index)
+            .ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::EvaluationFailed,
+                    "triangle references an unmapped material",
+                )
+            })?;
+        if !may_cast_transparent_shadow(material) {
+            return Ok(None);
+        }
+        let params = hit_params(
+            self.doc,
+            self.snapshot,
+            self.geometry,
+            hit,
+            origin,
+            direction,
+            self.images,
+            &mut self.workspace.borrow_mut(),
+        )?;
+        Ok(Some(transparent_shadow_pass(&params)))
+    }
+
+    /// The first failed evaluation, if any shadow ray hit one.
+    fn finish(self) -> Result<()> {
+        match self.error.into_inner() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Expected transmittance of a shadow ray from `origin` along `direction`, up to `distance`. A hit on a triangle that
+/// cannot cast a transparent shadow blocks the ray when `opaque_blocks` (sun and area lights); a point or spot light
+/// passes `false`, because its depth map already holds those triangles.
+fn ray_transmittance(
+    shadow: ShadowScene<'_>,
+    origin: DVec3,
+    direction: DVec3,
+    distance: f64,
+    opaque_blocks: bool,
+) -> f64 {
+    let mut transmittance = 1.0;
+    let mut origin = origin;
+    let mut remaining = distance;
+    while let Some(hit) = shadow.bvh.closest_hit_two_sided(
+        shadow.triangles,
+        origin,
+        direction,
+        SHADOW_EPSILON,
+        remaining,
+    ) {
+        match shadow
+            .occluders
+            .and_then(|occluders| occluders.pass(hit, origin, direction))
+        {
+            Some(pass) => transmittance *= pass,
+            None if opaque_blocks => return 0.0,
+            None => {}
+        }
+        if transmittance <= 1.0e-5 {
+            return 0.0;
+        }
+        let advance = hit.distance + SHADOW_EPSILON;
+        origin += direction * advance;
+        if remaining.is_finite() {
+            remaining = (remaining - advance).max(0.0);
+            if remaining <= SHADOW_EPSILON {
+                break;
+            }
+        }
+    }
+    transmittance
+}
+
+/// The origin of a shadow ray leaving `point`, lifted to the side of `normal` that `direction` points to.
+fn shadow_origin(point: DVec3, normal: DVec3, direction: DVec3) -> DVec3 {
+    let side = if normal.dot(direction) >= 0.0 {
+        1.0
+    } else {
+        -1.0
+    };
+    point + normal * (side * SHADOW_EPSILON)
+}
+
 pub(super) fn extract_geometry(
     doc: &SceneDoc,
     snapshot: &Snapshot,
@@ -880,10 +1059,26 @@ pub(super) fn extract_geometry(
     };
     if !path_traced && matches!(mode, Mode::Beauty) && !geometry.triangles.is_empty() {
         geometry.triangles = subdivide_realtime_triangles(&geometry.triangles)?;
-        let shadow_maps = build_point_shadow_maps(doc, snapshot, &geometry.triangles)?;
+        let shadow_maps =
+            build_point_shadow_maps(doc, snapshot, &geometry.triangles, &geometry.materials)?;
         let bvh = Bvh::build(&geometry.triangles)?;
-        for index in 0..geometry.triangles.len() {
-            let triangle = &geometry.triangles[index];
+        let transparent_casters = geometry.triangles.iter().any(|triangle| {
+            geometry
+                .materials
+                .get(triangle.material_index)
+                .is_some_and(may_cast_transparent_shadow)
+        });
+        let workspace = RefCell::new(EvaluatorWorkspace::default());
+        let occluders = ShadowOccluders::new(doc, snapshot, &geometry, images, &workspace);
+        let scene = ShadowScene {
+            bvh: &bvh,
+            triangles: &geometry.triangles,
+            point_maps: &shadow_maps,
+            occluders: transparent_casters.then_some(&occluders),
+        };
+        // The colours are collected first: the occluders borrow the geometry until `finish`.
+        let mut colors: Vec<Option<[f64; 4]>> = vec![None; geometry.triangles.len()];
+        for (index, triangle) in geometry.triangles.iter().enumerate() {
             if triangle.normals.is_some() || triangle.lit_per_pixel {
                 // Smooth and per-pixel lit triangles are shaded at each visible hit.
                 continue;
@@ -903,7 +1098,7 @@ pub(super) fn extract_geometry(
                 normal,
                 &geometry.shader_warnings,
             );
-            let color = shade(
+            colors[index] = Some(shade(
                 doc,
                 snapshot,
                 center,
@@ -912,16 +1107,20 @@ pub(super) fn extract_geometry(
                 normal,
                 &params,
                 mode,
-                Some((&bvh, &geometry.triangles, &shadow_maps)),
+                Some(scene),
                 images,
-            )?;
-            if let Some(target) = geometry.triangles.get_mut(index) {
-                target.color = color;
+            )?);
+        }
+        occluders.finish()?;
+        for (triangle, color) in geometry.triangles.iter_mut().zip(colors) {
+            if let Some(color) = color {
+                triangle.color = color;
             }
         }
         geometry.shadows = Some(RealtimeShadows {
             bvh,
             point_maps: shadow_maps,
+            transparent_casters,
         });
     }
     Ok(geometry)
@@ -931,7 +1130,17 @@ fn build_point_shadow_maps(
     doc: &SceneDoc,
     snapshot: &Snapshot,
     triangles: &[Triangle],
+    materials: &[Material],
 ) -> Result<BTreeMap<Id, PointShadowMap>> {
+    // A triangle that casts a transparent shadow is left out: its occlusion is the ray pass of `ray_transmittance`.
+    let opaque: Vec<&Triangle> = triangles
+        .iter()
+        .filter(|triangle| {
+            !materials
+                .get(triangle.material_index)
+                .is_some_and(may_cast_transparent_shadow)
+        })
+        .collect();
     let mut maps = BTreeMap::new();
     for (id, node) in &doc.nodes {
         let Some(light) = node
@@ -953,13 +1162,13 @@ fn build_point_shadow_maps(
         };
         let position =
             DMat4::from_cols_array(&evaluated.world_matrix).transform_point3(DVec3::ZERO);
-        maps.insert(id.clone(), PointShadowMap::build(position, triangles)?);
+        maps.insert(id.clone(), PointShadowMap::build(position, &opaque)?);
     }
     Ok(maps)
 }
 
 impl PointShadowMap {
-    fn build(position: DVec3, triangles: &[Triangle]) -> Result<Self> {
+    fn build(position: DVec3, triangles: &[&Triangle]) -> Result<Self> {
         let bases = [
             (DVec3::X, DVec3::Z),
             (-DVec3::X, DVec3::Z),
@@ -1550,12 +1759,18 @@ impl SurfaceShader for SceneShader<'_> {
             ];
             shading_params(material, base, hit.normal, &self.geometry.shader_warnings)
         });
-        let shadow = self.geometry.shadows.as_ref().map(|shadows| {
-            (
-                &shadows.bvh,
-                self.geometry.triangles.as_slice(),
-                &shadows.point_maps,
-            )
+        let occluders = ShadowOccluders::new(
+            self.doc,
+            self.snapshot,
+            self.geometry,
+            self.images,
+            &self.evaluator_workspace,
+        );
+        let shadow = self.geometry.shadows.as_ref().map(|shadows| ShadowScene {
+            bvh: &shadows.bvh,
+            triangles: self.geometry.triangles.as_slice(),
+            point_maps: &shadows.point_maps,
+            occluders: shadows.transparent_casters.then_some(&occluders),
         });
         let color = shade(
             self.doc,
@@ -1569,6 +1784,7 @@ impl SurfaceShader for SceneShader<'_> {
             shadow,
             self.images,
         )?;
+        occluders.finish()?;
         Ok(color)
     }
 }
@@ -1995,7 +2211,7 @@ fn shade(
                 continue;
             };
             let matrix = DMat4::from_cols_array(&evaluated.world_matrix);
-            let point_shadow = shadow.and_then(|(_, _, maps)| maps.get(id));
+            let point_shadow = shadow.and_then(|scene| scene.point_maps.get(id));
             result += light_contribution(
                 light,
                 matrix,
@@ -2190,10 +2406,41 @@ fn visibility_for_light(
     direction: DVec3,
     distance: f64,
 ) -> f64 {
-    point_shadow.map_or_else(
-        || shadow_visibility(shadow, point, normal, direction, distance),
-        |shadow_map| shadow_map.visibility(point),
-    )
+    let Some(shadow_map) = point_shadow else {
+        return shadow_visibility(shadow, point, normal, direction, distance);
+    };
+    let opaque = shadow_map.visibility(point);
+    match shadow {
+        Some(scene) if scene.occluders.is_some() && opaque > 0.0 => {
+            opaque * point_light_transparency(scene, point, normal, direction, distance)
+        }
+        _ => opaque,
+    }
+}
+
+/// A point or spot light's transparent pass: one ray toward the light through the transparent casters, since the depth
+/// map holds only the opaque triangles.
+fn point_light_transparency(
+    shadow: ShadowScene<'_>,
+    point: DVec3,
+    normal: DVec3,
+    direction: DVec3,
+    distance: f64,
+) -> f64 {
+    let direction = direction.normalize_or_zero();
+    if direction == DVec3::ZERO {
+        return 0.0;
+    }
+    let maximum_distance = if distance.is_finite() {
+        (distance - SHADOW_EPSILON).max(0.0)
+    } else {
+        f64::INFINITY
+    };
+    if maximum_distance <= SHADOW_EPSILON {
+        return 1.0;
+    }
+    let origin = shadow_origin(point, normal, direction);
+    ray_transmittance(shadow, origin, direction, maximum_distance, false)
 }
 
 fn shadow_visibility(
@@ -2214,14 +2461,14 @@ fn shadow_visibility(
         [0.0, 1.0],
         [1.0, 1.0],
     ];
-    let Some((bvh, triangles, _)) = shadow else {
+    let Some(shadow) = shadow else {
         return 1.0;
     };
     let direction = direction.normalize_or_zero();
     if direction == DVec3::ZERO {
         return 0.0;
     }
-    let epsilon = 1.0e-5;
+    let epsilon = SHADOW_EPSILON;
     let normal = normal.normalize_or_zero();
     let tangent = if normal.z.abs() < 0.999 {
         normal.cross(DVec3::Z).normalize_or_zero()
@@ -2248,24 +2495,8 @@ fn shadow_visibility(
             + tangent * (offset[0] * angular_radius)
             + bitangent * (offset[1] * angular_radius))
             .normalize_or_zero();
-        let side = if normal.dot(sample_direction) >= 0.0 {
-            1.0
-        } else {
-            -1.0
-        };
-        let origin = point + normal * (side * epsilon);
-        if bvh
-            .closest_hit_two_sided(
-                triangles,
-                origin,
-                sample_direction,
-                epsilon,
-                maximum_distance,
-            )
-            .is_none()
-        {
-            visible += 1.0;
-        }
+        let origin = shadow_origin(point, normal, sample_direction);
+        visible += ray_transmittance(shadow, origin, sample_direction, maximum_distance, true);
     }
     visible / 9.0
 }
@@ -3016,5 +3247,56 @@ mod shading_normal_tests {
             output.x > 0.0,
             "visible upper strip must retain diffuse light: {output:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod transparent_shadow_tests {
+    use glam::DVec3;
+
+    use crate::model::Material;
+    use crate::shader::BsdfParams;
+
+    use super::{may_cast_transparent_shadow, transparent_shadow_pass};
+
+    fn params(alpha: f64, tint: [f64; 3]) -> BsdfParams {
+        BsdfParams {
+            alpha,
+            transparent_tint: tint,
+            ..BsdfParams::from_material(&Material::default(), DVec3::Z)
+        }
+    }
+
+    #[test]
+    fn principled_alpha_passes_one_minus_alpha() {
+        assert!((transparent_shadow_pass(&params(0.4, [1.0; 3])) - 0.6).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn transparent_bsdf_passes_its_tint_on_average() {
+        // A Transparent BSDF has alpha 0 and its colour as tint: the average of (0.9, 0.3, 0.6) is 0.6.
+        let pass = transparent_shadow_pass(&params(0.0, [0.9, 0.3, 0.6]));
+        assert!((pass - 0.6).abs() < 1.0e-12, "{pass}");
+    }
+
+    #[test]
+    fn an_opaque_surface_passes_nothing() {
+        assert_eq!(transparent_shadow_pass(&params(1.0, [1.0; 3])), 0.0);
+    }
+
+    #[test]
+    fn only_a_non_opaque_material_with_shadows_on_may_cast_one() {
+        let opaque = Material::default();
+        assert!(!may_cast_transparent_shadow(&opaque));
+        let blend = Material {
+            alpha_mode: "blend".to_owned(),
+            ..Material::default()
+        };
+        assert!(may_cast_transparent_shadow(&blend));
+        let blend_off = Material {
+            use_transparent_shadow: false,
+            ..blend.clone()
+        };
+        assert!(!may_cast_transparent_shadow(&blend_off));
     }
 }
