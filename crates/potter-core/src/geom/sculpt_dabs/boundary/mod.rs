@@ -48,6 +48,9 @@ pub(super) struct State {
 
 /// Blender's `SculptBoundary`, for the single loop the stroke found.
 pub(super) struct Boundary {
+    /// `boundary.initial_vert_i`: the loop vertex nearest the active vertex. Twist's axis points from
+    /// it to the propagation pivot.
+    initial: usize,
     /// `boundary.verts`: the loop's vertices in the order the loop grew from the initial one. The
     /// initial vertex appears twice, as Blender's flood fill adds it again when a neighbor reaches it.
     verts: Vec<usize>,
@@ -76,7 +79,7 @@ pub(super) struct EditInfo {
 }
 
 /// Per-stroke data that only some deform types need, computed once with the loop.
-pub(super) enum DeformData {
+enum DeformData {
     /// Grab, Inflate, and Smooth precompute nothing.
     None,
     Bend(bend::Data),
@@ -172,6 +175,7 @@ fn find(
         }
     }
     let mut boundary = Boundary {
+        initial: closest,
         verts,
         pivot,
         max_steps,

@@ -824,8 +824,8 @@ mod tests {
     /// Smooth moves only interior vertices: Blender's `calc_vert_neighbors_interior` clears the
     /// neighbors of a boundary corner (two neighbors), so a lone triangle has nothing to average.
     /// A four-triangle fan around an interior center vertex gives Smooth something to move.
-    fn test_mesh_for(brush: Brush) -> Mesh {
-        if brush != Brush::Dab(DabBrush::Smooth) {
+    fn test_mesh_for(brush: DabBrush) -> Mesh {
+        if brush != DabBrush::Smooth {
             return test_mesh();
         }
         Mesh::from_positions_and_faces(
