@@ -34,15 +34,13 @@ pub(crate) fn dielectric_f0(ior: f64, level: f64) -> f64 {
 /// as `(feature_id, Blender input)` pairs in a fixed array, so checking a hit allocates nothing.
 pub(crate) fn unevaluated_principled_inputs(
     params: &BsdfParams,
-) -> [Option<(&'static str, &'static str)>; 6] {
+) -> [Option<(&'static str, &'static str)>; 5] {
     [
         (params.subsurface_weight > 0.0)
             .then_some(("shader.principled.subsurface", "Subsurface Weight")),
         (params.anisotropic_ior > 0.0).then_some(("shader.principled.anisotropic", "Anisotropic")),
         (params.thin_film_thickness > 0.0)
             .then_some(("shader.principled.thin_film", "Thin Film Thickness")),
-        (params.transmission > 0.0 && params.roughness > 0.0)
-            .then_some(("shader.principled.transmission_ggx", "Transmission Weight")),
         (params.diffuse_roughness > 0.0)
             .then_some(("shader.principled.diffuse_roughness", "Diffuse Roughness")),
         params
@@ -139,6 +137,13 @@ pub struct BsdfParams {
     pub emission_strength: f64,
     pub transmission: f64,
     pub ior: f64,
+    /// Tints of the rough glass lobe (Cycles' `generalized_schlick_setup`): the reflection tint and the
+    /// transmission tint. The Principled BSDF takes white reflection and the square root of its base colour
+    /// for transmission (`kernel/svm/closure.h`); the Glass BSDF node takes its Color for both.
+    pub glass_reflection_tint: [f64; 3],
+    pub glass_transmission_tint: [f64; 3],
+    /// The view is on the back of the geometric normal (Cycles' `SD_BACKFACING`), where a glass closure uses `1 / ior`.
+    pub back_facing: bool,
     pub alpha: f64,
     /// Tint of the transparent share, Cycles' Transparent BSDF colour. The share is `1 - alpha`, so a camera
     /// pass-through multiplies by this tint and a shadow ray's transmittance is `(1 - alpha) * tint`
@@ -240,6 +245,11 @@ impl BsdfParams {
             emission_strength: material.emission_strength,
             transmission: material.transmission,
             ior: material.ior,
+            glass_reflection_tint: [1.0; 3],
+            glass_transmission_tint: std::array::from_fn(|channel| {
+                material.base_color[channel].clamp(0.0, 1.0).sqrt()
+            }),
+            back_facing: false,
             alpha: material.base_color[3],
             transparent_tint: [1.0; 3],
             reflectance: 1.0,
@@ -356,6 +366,12 @@ impl BsdfParams {
             emission_strength: mix_scalar(first.emission_strength, second.emission_strength),
             transmission: mix_scalar(first.transmission, second.transmission),
             ior: mix_scalar(first.ior, second.ior),
+            glass_reflection_tint: mix3(first.glass_reflection_tint, second.glass_reflection_tint),
+            glass_transmission_tint: mix3(
+                first.glass_transmission_tint,
+                second.glass_transmission_tint,
+            ),
+            back_facing: first.back_facing,
             alpha,
             transparent_tint,
             reflectance: mix_scalar(first.reflectance, second.reflectance),
@@ -393,6 +409,7 @@ impl BsdfParams {
 
     fn add(first: Self, second: Self) -> Self {
         let add3 = |a: [f64; 3], b: [f64; 3]| [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
+        let max3 = |a: [f64; 3], b: [f64; 3]| [a[0].max(b[0]), a[1].max(b[1]), a[2].max(b[2])];
         let coat = combine_layers(first.coat_layer(), 1.0, second.coat_layer(), 1.0);
         let sheen = combine_layers(first.sheen_layer(), 1.0, second.sheen_layer(), 1.0);
         Self {
@@ -408,6 +425,12 @@ impl BsdfParams {
             emission_strength: first.emission_strength.max(second.emission_strength),
             transmission: first.transmission.max(second.transmission),
             ior: first.ior,
+            glass_reflection_tint: max3(first.glass_reflection_tint, second.glass_reflection_tint),
+            glass_transmission_tint: max3(
+                first.glass_transmission_tint,
+                second.glass_transmission_tint,
+            ),
+            back_facing: first.back_facing,
             // Add keeps alpha as the larger opacity (its shading is Potter's one-scalar blend), and sums the arms'
             // transparent weights as Cycles sums closures. A fully opaque arm leaves no pass chance, so a transparent
             // share beside it is dropped: the deviation the CHANGELOG records.
@@ -1322,6 +1345,8 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
         }
         let mut params = self.closure_params();
         params.base_color = self.color_input(id, &["Base Color"], [0.8, 0.8, 0.8, 1.0])?;
+        params.glass_transmission_tint =
+            std::array::from_fn(|channel| params.base_color[channel].clamp(0.0, 1.0).sqrt());
         params.metallic = self.scalar_input(id, &["Metallic"], 0.0)?;
         params.roughness = self.scalar_input(id, &["Roughness"], 0.5)?;
         params.ior = self.scalar_input(id, &["IOR"], 1.5)?;
@@ -1482,6 +1507,14 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
         params.transmission = 1.0;
         params.ior = self.scalar_input(id, &["IOR"], 1.5)?;
         params.roughness = self.scalar_input(id, &["Roughness"], 0.0)?;
+        // Cycles' Glass closure takes its Color as both the reflection and the transmission tint.
+        let color = [
+            params.base_color[0],
+            params.base_color[1],
+            params.base_color[2],
+        ];
+        params.glass_reflection_tint = color;
+        params.glass_transmission_tint = color;
         Ok(params)
     }
 
@@ -3065,7 +3098,7 @@ mod tests {
 
         let sink = RefCell::new(Vec::new());
         let mut groups = Registry::new();
-        // A native material sets rough transmission on the material itself.
+        // A native material sets rough transmission on the material itself. The glass lobe evaluates it, so it does not warn.
         let native = Material {
             name: "Native".to_owned(),
             transmission: 0.5,
@@ -3076,8 +3109,8 @@ mod tests {
         evaluate_surface(&native, &context).unwrap();
         evaluate_surface(&native, &context).unwrap();
 
-        // A graph material sets subsurface and rough transmission on its Principled node. Coat is
-        // evaluated, so it must not warn.
+        // A graph material sets subsurface and rough transmission on its Principled node. Subsurface is not
+        // evaluated and warns; rough transmission and coat are evaluated, so they must not warn.
         let mut graph = NodeGroup::new("Graph", GraphKind::Shader);
         insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
         insert_node(
@@ -3099,7 +3132,7 @@ mod tests {
         evaluate_surface(&graph_material, &graph_context).unwrap();
 
         let warnings = sink.borrow();
-        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
         let count = |material: &str, input: &str| {
             warnings
                 .iter()
@@ -3109,12 +3142,10 @@ mod tests {
                 })
                 .count()
         };
-        assert_eq!(count("Native", "Transmission Weight"), 1);
+        assert_eq!(count("Native", "Transmission Weight"), 0);
         assert_eq!(count("Graph", "Subsurface Weight"), 1);
         assert_eq!(count("Graph", "Coat Weight"), 0);
-        assert_eq!(count("Graph", "Transmission Weight"), 1);
-        let native_warning = warnings.iter().find(|w| w["material"] == "Native").unwrap();
-        assert!(native_warning.get("node_id").is_none());
+        assert_eq!(count("Graph", "Transmission Weight"), 0);
         let subsurface_warning = warnings
             .iter()
             .find(|w| w["input"] == "Subsurface Weight")

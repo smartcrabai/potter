@@ -111,13 +111,6 @@ pub fn feature_catalog() -> Value {
             "Potter does not evaluate Thin Wall; a render with Thin Wall enabled reports UNSUPPORTED_FEATURE.",
         ),
         unsupported(
-            "shader.principled.transmission_ggx",
-            "Principled rough transmission",
-            "ShaderNodeBsdfPrincipled",
-            &["material.create", "material.update"],
-            "Potter's transmission is a sharp refraction; Cycles' rough GGX glass lobe is not evaluated, so a render with Transmission Weight and Roughness above zero reports UNSUPPORTED_FEATURE.",
-        ),
-        unsupported(
             "shader.advanced",
             "Other Blender shader nodes",
             "ShaderNodeTree",
