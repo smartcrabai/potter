@@ -87,7 +87,8 @@ struct VolumeInstance<'a> {
     meters_per_unit: f64,
     density_range: Option<(f64, f64)>,
     albedo: DVec3,
-    anisotropy: f64,
+    /// The instance's one phase, a single-closure list.
+    phase: PhaseClosure,
     emission: DVec3,
     scattering: bool,
     /// Channel-mean σt per unit grid density (absolute, as `BsdfParams`'s coefficients).
@@ -98,7 +99,7 @@ struct VolumeInstance<'a> {
 struct VolumeEvent {
     point: DVec3,
     albedo: DVec3,
-    anisotropy: f64,
+    phase: PhaseClosure,
 }
 
 struct VolumeSegment {
@@ -322,38 +323,104 @@ impl Closures {
     }
 }
 
+/// One volume phase closure, as Cycles keeps them (`ShaderVolumeClosure`): `weight` is its scatter sample weight, the
+/// mean σs of the closure with the closure's weight already in it, and `anisotropy` is its Henyey-Greenstein g.
+#[derive(Clone, Copy)]
+struct PhaseClosure {
+    weight: f64,
+    anisotropy: f64,
+}
+
+impl PhaseClosure {
+    /// The one phase of an instance medium: a single-closure list, so picking it takes no draw.
+    fn single(anisotropy: f64) -> Self {
+        Self {
+            weight: 1.0,
+            anisotropy,
+        }
+    }
+}
+
+/// Cycles' `volume_shader_phase_pick` (`intern/cycles/kernel/integrator/volume_shader.h:161-187`): a scatter event picks
+/// one closure with probability `weight_i / Σ weight`, then samples that closure's own phase. A single closure is picked
+/// without a draw, as Cycles does.
+fn pick_phase(phases: &[PhaseClosure], rng: &mut Pcg32) -> Option<PhaseClosure> {
+    if let [only] = phases {
+        return Some(*only);
+    }
+    let total: f64 = phases.iter().map(|phase| phase.weight).sum();
+    if total <= 0.0 {
+        return None;
+    }
+    let target = rng.next_f64() * total;
+    let mut cumulative = 0.0;
+    for phase in phases {
+        cumulative += phase.weight;
+        if target < cumulative {
+            return Some(*phase);
+        }
+    }
+    phases.last().copied()
+}
+
+/// Cycles' `_volume_shader_phase_eval_mis` (`volume_shader.h:190-211`): the closures' phases weighted by their sample
+/// weights, divided by the total sample weight. The weight is the scalar mean σs, not a per-channel one. Cycles' own
+/// TODO (`volume_shader.h:159-160`) notes that per-channel anisotropy weighting is inexact, and this scalar matches its
+/// `sample_weight` rule.
+fn phase_eval(phases: &[PhaseClosure], cosine: f64) -> f64 {
+    let total: f64 = phases.iter().map(|phase| phase.weight).sum();
+    if total <= 0.0 {
+        return 0.0;
+    }
+    let weighted: f64 = phases
+        .iter()
+        .map(|phase| phase.weight * henyey_greenstein(cosine, phase.anisotropy))
+        .sum();
+    weighted / total
+}
+
 /// The medium a surface bounds, from its Volume output's closures. Cycles sums volume closures, so each coefficient is
 /// the closure-weighted sum. `scatter` is σs and `absorption` is σa per channel, and `emission` is the emitted radiance
-/// per unit length, all absolute.
-#[derive(Clone, Copy, Default)]
+/// per unit length, all absolute. `phases` keeps one phase closure per volume closure that scatters.
+#[derive(Default)]
 struct Medium {
     scatter: [f64; 3],
     absorption: [f64; 3],
     emission: [f64; 3],
-    /// The Henyey-Greenstein anisotropy of the mixed medium. This is the one documented approximation: Cycles keeps a
-    /// phase function per volume closure, while the mixed medium takes the scatter-weighted average of the closures'
-    /// anisotropies.
-    anisotropy: f64,
+    phases: Vec<PhaseClosure>,
 }
 
 impl Medium {
     fn from_closures(volume: &[ShaderClosure]) -> Self {
         let mut medium = Self::default();
-        let mut phase_weight = 0.0;
-        let mut phase_sum = 0.0;
         for closure in volume.iter().filter(|closure| closure.weight > 0.0) {
             let (weight, params) = (closure.weight, &closure.params);
             add_scaled(&mut medium.scatter, weight, params.volume_scatter);
             add_scaled(&mut medium.absorption, weight, params.volume_absorption);
             add_scaled(&mut medium.emission, weight, params.volume_emission);
-            let scatter_mean = weight * params.volume_scatter.iter().sum::<f64>() / 3.0;
-            phase_weight += scatter_mean;
-            phase_sum += scatter_mean * params.volume_anisotropy;
-        }
-        if phase_weight > 0.0 {
-            medium.anisotropy = phase_sum / phase_weight;
+            let scatter_weight = weight * params.volume_scatter.iter().sum::<f64>() / 3.0;
+            if scatter_weight > 0.0 {
+                medium.phases.push(PhaseClosure {
+                    weight: scatter_weight,
+                    anisotropy: params.volume_anisotropy,
+                });
+            }
         }
         medium
+    }
+
+    /// The medium's phase at `cosine` for the in-scatter against the environment (`phase_eval` over its closures).
+    fn phase(&self, cosine: f64) -> f64 {
+        phase_eval(&self.phases, cosine)
+    }
+
+    /// The anisotropy of the heaviest scattering closure. A voxel instance keeps one phase, so it takes this one:
+    /// its voxel transport is scalar, and this is its single-phase approximation.
+    fn dominant_anisotropy(&self) -> Option<f64> {
+        self.phases
+            .iter()
+            .max_by(|first, second| first.weight.total_cmp(&second.weight))
+            .map(|phase| phase.anisotropy)
     }
 
     /// Whether the medium scatters or absorbs light, so a path crossing its boundary takes a segment through it.
@@ -1050,8 +1117,10 @@ fn realtime_volume_integral(
                         Some(rng),
                         16,
                     )?;
-                    let phase =
-                        henyey_greenstein(direction.dot(sample.direction), instance.anisotropy);
+                    let phase = phase_eval(
+                        std::slice::from_ref(&instance.phase),
+                        direction.dot(sample.direction),
+                    );
                     source += instance.albedo
                         * sample.radiance
                         * (scattering_coefficient * phase * visibility);
@@ -1169,7 +1238,11 @@ fn trace_path(
             if bounce == max_bounces {
                 break;
             }
-            direction = sample_henyey_greenstein_direction(direction, event.anisotropy, rng);
+            // Cycles picks one phase closure by its scatter weight, then samples that closure's own Henyey-Greenstein lobe.
+            let Some(phase) = pick_phase(std::slice::from_ref(&event.phase), rng) else {
+                break;
+            };
+            direction = sample_henyey_greenstein_direction(direction, phase.anisotropy, rng);
             origin = event.point + direction * RAY_EPSILON;
             previous = Scatter::Volume;
             bounce += 1;
@@ -1230,8 +1303,7 @@ fn trace_path(
             let distance = boundary.distance.max(0.0);
             let (transmittance, in_scatter, emitted) =
                 homogeneous_medium_segment(&surface.medium, distance);
-            let phase =
-                henyey_greenstein(-1.0, surface.medium.anisotropy) * (4.0 * std::f64::consts::PI);
+            let phase = surface.medium.phase(-1.0) * (4.0 * std::f64::consts::PI);
             radiance += throughput * (environment * in_scatter * phase + emitted);
             throughput *= transmittance;
             if exits_medium {
@@ -1278,8 +1350,11 @@ fn trace_path(
             // Nothing reflects or passes (emission only), so the path ends at this surface.
             None => break,
             Some(Pick::Pass { multiplier }) => {
-                // The pass carries the transparent tint scaled by its pick weight, so its expected throughput is
-                // Cycles' `Σ w · (1 − α) · tint`.
+                // A transparent event is not a regular bounce: it spends its own budget, `transparent_bounce`, and does
+                // not advance `bounce` (Cycles `path_state.h:118-121`, which gives transparent events their own max). It
+                // writes no MIS state (`shade_surface.h:609-611`), so the next light hit is MIS-weighted against the last
+                // non-transparent vertex, `previous`. The pass carries the transparent tint scaled by its pick weight, so
+                // its expected throughput is Cycles' `Σ w · (1 − α) · tint`.
                 throughput *= multiplier;
                 transparent_bounce += 1;
                 terminate_on_next_surface |= transparent_bounce >= transparent_cap;
@@ -1974,7 +2049,10 @@ fn direct_volume_lighting(
             rng,
             evaluator_workspace,
         )?;
-        let phase = henyey_greenstein(incoming_direction.dot(sample.direction), event.anisotropy);
+        let phase = phase_eval(
+            std::slice::from_ref(&event.phase),
+            incoming_direction.dot(sample.direction),
+        );
         contribution += sample.radiance * (phase * visibility * VOLUME_DIRECT_LIGHT_SCALE);
     }
     let (direction, pdf) = if let Some(sampler) = importance {
@@ -1999,7 +2077,10 @@ fn direct_volume_lighting(
             rng,
             evaluator_workspace,
         )?;
-        let phase = henyey_greenstein(incoming_direction.dot(direction), event.anisotropy);
+        let phase = phase_eval(
+            std::slice::from_ref(&event.phase),
+            incoming_direction.dot(direction),
+        );
         contribution += incoming * (phase * visibility * 0.5 / pdf);
     }
     Ok(contribution)
@@ -2748,7 +2829,7 @@ fn collect_volumes<'a>(
         // Cycles' absolute coefficients (`BsdfParams`): a material volume's σs and σa, or, for a
         // material without a volume output, unit grey absorption. No material is the Principled
         // Volume default (colour 0.5, density 1).
-        let (scatter, absorption) = match medium {
+        let (scatter, absorption) = match medium.as_ref() {
             Some(medium) if has_volume_output || simple_volume => {
                 (medium.scatter, medium.absorption)
             }
@@ -2783,7 +2864,9 @@ fn collect_volumes<'a>(
             }));
         }
         let emission = if has_volume_output || simple_volume {
-            medium.map_or(DVec3::ZERO, |medium| DVec3::from_array(medium.emission))
+            medium
+                .as_ref()
+                .map_or(DVec3::ZERO, |medium| DVec3::from_array(medium.emission))
         } else {
             DVec3::ZERO
         };
@@ -2796,7 +2879,12 @@ fn collect_volumes<'a>(
             meters_per_unit,
             density_range,
             albedo,
-            anisotropy: medium.map_or(0.0, |medium| medium.anisotropy),
+            phase: PhaseClosure::single(
+                medium
+                    .as_ref()
+                    .and_then(|medium| medium.dominant_anisotropy())
+                    .unwrap_or(0.0),
+            ),
             emission,
             scattering,
             extinction_scale,
@@ -2948,7 +3036,7 @@ fn trace_volume_segment(
                 VolumeEvent {
                     point: event_point,
                     albedo: DVec3::ZERO,
-                    anisotropy: 0.0,
+                    phase: PhaseClosure::single(0.0),
                 },
                 |instance| VolumeEvent {
                     point: event_point,
@@ -2957,7 +3045,7 @@ fn trace_volume_segment(
                     } else {
                         DVec3::ZERO
                     },
-                    anisotropy: instance.anisotropy,
+                    phase: instance.phase,
                 },
             );
             return Ok(VolumeSegment {
@@ -3306,7 +3394,7 @@ mod volume_extinction_tests {
             meters_per_unit: 0.5,
             density_range: Some((1.0, 1.0)),
             albedo: DVec3::ZERO,
-            anisotropy: 0.0,
+            phase: PhaseClosure::single(0.0),
             emission: DVec3::ZERO,
             scattering: false,
             extinction_scale: 1.0,

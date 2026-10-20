@@ -3,7 +3,7 @@
 //! `tests/fixtures/closure_list/generate_closure_oracle.py` renders three scenes with Cycles and commits each scene's
 //! `.blend`, its linear EXR, and a JSON of per-pixel RGB values over a fixed region. The scenes exercise closures that
 //! Cycles keeps as a list rather than blending one parameter set: a Mix of two Principled BSDFs with different roughness
-//! and normals (a Bump drives one arm), an Add of Diffuse and Glossy, and a Mix of Glass and Diffuse.
+//! and normals (one arm uses a constant normal), an Add of Diffuse and Glossy, and a Mix of Glass and Diffuse.
 //!
 //! Each `.blend` is imported into Potter and rendered with two seeds. Every Potter render is compared with the committed
 //! Cycles values as a mean absolute error over the region. The bound is measured, not chosen: Potter's seed-to-seed
@@ -68,7 +68,7 @@ struct Reference {
 }
 
 #[test]
-fn mix_of_two_principled_bsdfs_with_roughness_and_bump_normals_matches_cycles() -> TestResult {
+fn mix_of_two_principled_bsdfs_with_roughness_and_constant_normals_matches_cycles() -> TestResult {
     check_scene("mix_principled")
 }
 

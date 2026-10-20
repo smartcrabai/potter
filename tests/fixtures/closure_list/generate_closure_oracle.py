@@ -5,10 +5,9 @@ frame). A uniform world (0.25, 0.4, 0.6, strength 1) and a Sun (energy 3, tilted
 +X) light it. Standard view transform, 32-bit linear EXR, no denoising, no adaptive sampling, max_bounces 8.
 
 - mix_principled: Mix Shader, Factor 0.3 (the second arm weighs 0.3), of two Principled BSDFs. The first arm has
-  Roughness 0.1 and the geometric normal. The second has Roughness 0.6 and a Bump normal. The Bump's Height is the
-  Generated X coordinate, which rises 0.5 per unit across the plane. Distance 0.3 and Filter Width 0.1 make Cycles tilt
-  the normal by Distance / Filter Width (3) times that slope, about 56 degrees (`svm_node_set_bump`,
-  intern/cycles/kernel/svm/displace.h). The Filter Width factor is what this scene is meant to exercise.
+  Roughness 0.1 and the geometric normal. The second has Roughness 0.6 and a constant normal (0.6, 0.0, 0.8) from a
+  Combine XYZ node: a unit vector about 37 degrees from the plane normal toward +X. The two arms differ in roughness and
+  in normal, so the mix must keep each closure's own normal.
 - add_diffuse_glossy: Add Shader (weights 1 and 1) of a Diffuse BSDF (Color (0.8, 0.3, 0.1)) and a Glossy BSDF
   (Color 0.5, Roughness 0.3).
 - mix_glass_diffuse: Mix Shader, Factor 0.5, of a Glass BSDF (Color 1, Roughness 0, IOR 1.45) and the same Diffuse. The
@@ -103,20 +102,17 @@ def principled(tree, color, roughness):
 
 def graph_mix_principled(tree):
     flat_arm = principled(tree, (0.8, 0.2, 0.2), 0.1)
-    bumped_arm = principled(tree, (0.2, 0.6, 0.3), 0.6)
-    coords = tree.nodes.new("ShaderNodeTexCoord")
-    split = tree.nodes.new("ShaderNodeSeparateXYZ")
-    bump = tree.nodes.new("ShaderNodeBump")
-    bump.inputs["Strength"].default_value = 1.0
-    bump.inputs["Distance"].default_value = 0.3
-    bump.inputs["Filter Width"].default_value = 0.1
-    tree.links.new(coords.outputs["Generated"], split.inputs["Vector"])
-    tree.links.new(split.outputs["X"], bump.inputs["Height"])
-    tree.links.new(bump.outputs["Normal"], bumped_arm.inputs["Normal"])
+    tilted_arm = principled(tree, (0.2, 0.6, 0.3), 0.6)
+    # A constant unit vector, about 37 degrees from the geometric normal toward +X.
+    normal = tree.nodes.new("ShaderNodeCombineXYZ")
+    normal.inputs["X"].default_value = 0.6
+    normal.inputs["Y"].default_value = 0.0
+    normal.inputs["Z"].default_value = 0.8
+    tree.links.new(normal.outputs["Vector"], tilted_arm.inputs["Normal"])
     mix = tree.nodes.new("ShaderNodeMixShader")
     mix.inputs["Factor"].default_value = 0.3
     tree.links.new(flat_arm.outputs["BSDF"], mix.inputs[1])
-    tree.links.new(bumped_arm.outputs["BSDF"], mix.inputs[2])
+    tree.links.new(tilted_arm.outputs["BSDF"], mix.inputs[2])
     return mix
 
 
