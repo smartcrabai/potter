@@ -263,7 +263,7 @@ mod tests {
         let d = 0.25;
         let n = 4_000;
         let sampled: f64 = (0..n)
-            .map(|i| sample_radius(d, (f64::from(i) + 0.5) / f64::from(n) * TRUNCATE_CDF).0)
+            .map(|i| sample_radius(d, (f64::from(i) + 0.5) / f64::from(n)).0)
             .sum::<f64>()
             / f64::from(n);
         let moment = simpson(0.0, TRUNCATE * d, 20_000, |r| r * pdf(d, r));
@@ -348,44 +348,56 @@ mod tests {
     }
 
     #[test]
-    fn probe_keeps_four_hits_and_skips_a_repeated_distance() {
+    fn probe_keeps_four_hits_of_ten() {
         let mut probe = ProbeHits::new(7);
         for index in 0..10 {
             probe.record(f64::from(index), index);
         }
-        // A repeated distance is skipped and not counted, as Cycles' `local_intersect_get_record_index` does.
-        probe.record(3.0, 99);
         let (seen, hits) = probe.finish();
         assert_eq!(seen, 10);
         assert_eq!(hits.len(), MAX_HITS);
         assert!(
             hits.iter()
-                .all(|(t, index)| *t == *index as f64 && *index != 99)
+                .all(|(t, index)| (*t - *index as f64).abs() < 1.0e-12)
         );
     }
 
     #[test]
-    fn probe_reservoir_keeps_each_hit_with_probability_four_in_n() {
-        // The reservoir is uniform: each of N hits is kept with probability 4/N, over many seeds.
-        let n = 12;
-        let trials: u32 = 20_000;
-        let mut kept = vec![0usize; n];
-        for seed in 0..trials {
-            let mut probe = ProbeHits::new(seed.wrapping_mul(2_654_435_761).wrapping_add(1));
-            for index in 0..n {
+    fn probe_skips_a_distance_already_stored() {
+        // Cycles compares a new hit with the stored hits only (`min(max_hits, num_hits)` of them), and a repeat is not
+        // counted (`local_intersect_get_record_index`).
+        let mut probe = ProbeHits::new(7);
+        probe.record(0.0, 0);
+        probe.record(1.0, 1);
+        probe.record(0.0, 9);
+        let (seen, hits) = probe.finish();
+        assert_eq!(seen, 2);
+        assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn probe_reservoir_matches_the_cycles_reference() {
+        // The outcomes are those of Cycles' reservoir on `lcg_step_uint`, run as a reference for twelve hits at
+        // distances 0..12. The slot is `lcg % seen`, which reads the generator's low bits, so the kept hits are not
+        // uniform over the hits. Cycles has that bias too, and the port keeps it, so the outcomes are pinned rather
+        // than tested for uniformity.
+        for (seed, expected) in [
+            (1u32, vec![1usize, 3, 4, 10]),
+            (7, vec![0, 1, 10, 11]),
+            (12345, vec![0, 2, 3, 5]),
+        ] {
+            let mut probe = ProbeHits::new(seed);
+            for index in 0..12 {
                 probe.record(index as f64, index);
             }
-            for (_, index) in probe.finish().1 {
-                kept[index] += 1;
-            }
-        }
-        let expected = f64::from(trials) * MAX_HITS as f64 / n as f64;
-        for (index, count) in kept.iter().enumerate() {
-            let deviation = (*count as f64 - expected).abs() / expected;
-            assert!(
-                deviation < 0.05,
-                "hit {index}: kept {count}, expected {expected}"
-            );
+            let mut kept: Vec<usize> = probe
+                .finish()
+                .1
+                .into_iter()
+                .map(|(_, index)| index)
+                .collect();
+            kept.sort_unstable();
+            assert_eq!(kept, expected, "seed {seed}");
         }
     }
 }

@@ -847,6 +847,8 @@ fn trace_path(
     // diffuse surface (`exit_pending`). `diffuse_ancestor` disables the Burley closure after a diffuse bounce.
     let mut exit_hit: Option<BvhHit> = None;
     let mut exit_pending = false;
+    // Cycles' `PATH_RAY_SUBSURFACE_BACKFACING`: the entry was on a backfacing side, which flips the exit's normal.
+    let mut exit_backfacing = false;
     let mut diffuse_ancestor = false;
     loop {
         let hit = match exit_hit.take() {
@@ -946,7 +948,16 @@ fn trace_path(
             evaluator_workspace,
         )?;
         if std::mem::take(&mut exit_pending) {
-            // The exit of a Burley entry is a diffuse surface (`subsurface_shader_data_setup`), not its material.
+            // The exit of a Burley entry is a diffuse surface (`subsurface_shader_data_setup`), not its material. Cycles
+            // shades it along the exit hit's own normal: `subsurface_disk` sets the probe ray to `Ng[hit]`, flipped for a
+            // backfacing entry, and `subsurface_scatter` reverses that ray, so the exit faces outward at every hit.
+            if let Some(outward) = intrinsic_normal(geometry, hit.triangle_index) {
+                let outward = if exit_backfacing { -outward } else { outward };
+                if surface.normal.dot(outward) < 0.0 {
+                    surface.normal = -surface.normal;
+                    surface.geometric_normal = -surface.geometric_normal;
+                }
+            }
             surface.params = exit_params(&surface.params);
             surface.layers = layers(&surface.params, surface.normal, -direction);
         } else if diffuse_ancestor {
@@ -1040,6 +1051,8 @@ fn trace_path(
             let Some(exit) = burley_exit(geometry, bvh, &surface, rng) else {
                 break;
             };
+            exit_backfacing = intrinsic_normal(geometry, hit.triangle_index)
+                .is_some_and(|normal| normal.dot(direction) > 0.0);
             throughput *= entry * exit.weight;
             bounce += 1;
             origin = exit.origin;
@@ -2340,6 +2353,17 @@ struct BurleyExit {
     direction: DVec3,
     hit: BvhHit,
     weight: DVec3,
+}
+
+/// The geometric normal of a triangle from its winding, as Cycles' `Ng` is: the cross product of its edges, outward
+/// for a mesh wound outward. It is not flipped towards any ray, so a subsurface exit can tell its side of the surface.
+fn intrinsic_normal(geometry: &Geometry, triangle_index: usize) -> Option<DVec3> {
+    let triangle = geometry.triangles.get(triangle_index)?;
+    Some(
+        (triangle.positions[1] - triangle.positions[0])
+            .cross(triangle.positions[2] - triangle.positions[0])
+            .normalize_or_zero(),
+    )
 }
 
 /// Probes the object of `surface` for the exit of the Burley profile, as Cycles' `subsurface_disk` does: a disk

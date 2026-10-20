@@ -3954,3 +3954,51 @@ fn kani_bounded_mix_factor_stays_unit_interval() {
     let bounded = bounded_factor(factor);
     assert!(bounded >= 0.0 && bounded <= 1.0);
 }
+
+#[cfg(test)]
+mod subsurface_method_tests {
+    use super::SubsurfaceMethod;
+
+    #[test]
+    fn subsurface_method_parses_the_blender_identifiers() {
+        assert_eq!(
+            SubsurfaceMethod::parse("BURLEY"),
+            Some(SubsurfaceMethod::Burley)
+        );
+        assert_eq!(
+            SubsurfaceMethod::parse("RANDOM_WALK"),
+            Some(SubsurfaceMethod::RandomWalk)
+        );
+        assert_eq!(
+            SubsurfaceMethod::parse("RANDOM_WALK_SKIN"),
+            Some(SubsurfaceMethod::RandomWalkSkin)
+        );
+        assert_eq!(
+            SubsurfaceMethod::parse("RANDOM_WALK_LEGACY"),
+            Some(SubsurfaceMethod::RandomWalkLegacy)
+        );
+        assert_eq!(SubsurfaceMethod::parse("random_walk"), None);
+    }
+
+    #[test]
+    fn only_the_unevaluated_methods_report_a_feature() {
+        // PR-a evaluates Burley only: every other method is reported, never rendered as Burley.
+        assert_eq!(SubsurfaceMethod::Burley.unsupported_feature(), None);
+        assert_eq!(
+            SubsurfaceMethod::RandomWalk.unsupported_feature(),
+            Some("shader.principled.subsurface_method.random_walk")
+        );
+        assert_eq!(
+            SubsurfaceMethod::RandomWalkSkin.unsupported_feature(),
+            Some("shader.principled.subsurface_method.random_walk_skin")
+        );
+        assert_eq!(
+            SubsurfaceMethod::RandomWalkLegacy.unsupported_feature(),
+            Some("shader.principled.subsurface_method.random_walk_legacy")
+        );
+        assert_eq!(
+            SubsurfaceMethod::Mixed.unsupported_feature(),
+            Some("shader.principled.subsurface_method.mixed")
+        );
+    }
+}

@@ -2050,3 +2050,61 @@ mod single_bounce_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod subsurface_tests {
+    use super::*;
+    use crate::model::Material;
+    use crate::shader::SubsurfaceMethod;
+
+    fn principled(method: SubsurfaceMethod, weight: f64) -> BsdfParams {
+        let material = Material {
+            base_color: [0.8, 0.5, 0.3, 1.0],
+            roughness: 0.5,
+            ..Material::default()
+        };
+        BsdfParams {
+            subsurface_weight: weight,
+            subsurface_method: method,
+            subsurface_scale: 6.0,
+            ..BsdfParams::from_material(&material, DVec3::Z)
+        }
+    }
+
+    #[test]
+    fn lobe_probabilities_sum_to_one_with_a_burley_subsurface_share() {
+        let params = principled(SubsurfaceMethod::Burley, 0.5);
+        let layers = layers(&params, DVec3::Z, DVec3::Z);
+        let probabilities = lobe_probabilities(&params, &layers);
+        let total = probabilities.diffuse
+            + probabilities.subsurface
+            + probabilities.sheen
+            + probabilities.coat
+            + probabilities.specular
+            + probabilities.transmission;
+        assert!((total - 1.0).abs() < 1.0e-12, "{total}");
+        assert!(probabilities.subsurface > 0.0);
+    }
+
+    #[test]
+    fn an_unevaluated_method_has_no_subsurface_lobe() {
+        // A method Potter does not evaluate must not take probability mass from the diffuse lobe.
+        let params = principled(SubsurfaceMethod::Mixed, 0.5);
+        let layers = layers(&params, DVec3::Z, DVec3::Z);
+        assert_eq!(lobe_probabilities(&params, &layers).subsurface, 0.0);
+        assert_eq!(
+            subsurface_closure_weight(&params, DVec3::Z, DVec3::Z, layers.lower),
+            DVec3::ZERO
+        );
+    }
+
+    #[test]
+    fn the_subsurface_closure_is_zero_below_the_surface() {
+        let params = principled(SubsurfaceMethod::Burley, 0.5);
+        let layers = layers(&params, DVec3::Z, -DVec3::Z);
+        assert_eq!(
+            subsurface_closure_weight(&params, DVec3::Z, -DVec3::Z, layers.lower),
+            DVec3::ZERO
+        );
+    }
+}
