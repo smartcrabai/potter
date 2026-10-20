@@ -43,12 +43,26 @@ impl Elements {
     /// `BM_face_create_verts` with `create_edges`: each missing boundary edge is created from the
     /// previous corner to the next, so the closing edge (last corner to first) comes first.
     fn face(&mut self, corners: &[usize]) {
+        self.add_face(corners, false);
+    }
+
+    /// Like [`Self::face`], but each edge is stored with its lower vertex first, as the torus
+    /// primitive's `from_pydata` mesh stores them.
+    fn face_lower_first(&mut self, corners: &[usize]) {
+        self.add_face(corners, true);
+    }
+
+    fn add_face(&mut self, corners: &[usize], lower_first: bool) {
         let Some(&last) = corners.last() else {
             return;
         };
         let mut previous = last;
         for &corner in corners {
-            self.edge(previous, corner);
+            if lower_first {
+                self.edge(previous.min(corner), previous.max(corner));
+            } else {
+                self.edge(previous, corner);
+            }
             previous = corner;
         }
         self.faces.push(corners.to_vec());
@@ -369,6 +383,19 @@ fn assemble_cone(
     }
     result.faces = faces;
     result.into_mesh()
+}
+
+/// A torus (`add_torus` in `scripts/startup/bl_operators/add_mesh_torus.py`): its vertices and faces
+/// are given, and its edges follow the closing-first face walk, each stored lower vertex first.
+pub(super) fn torus(positions: Vec<DVec3>, polygons: &[Vec<usize>]) -> Result<Mesh, MeshError> {
+    let mut elements = Elements::default();
+    for position in positions {
+        elements.vertex(position);
+    }
+    for polygon in polygons {
+        elements.face_lower_first(polygon);
+    }
+    elements.into_mesh()
 }
 
 /// The unit box of `bmo_create_cube_exec` with corner `(x, y, z)` signs enumerated x, then y, then z.

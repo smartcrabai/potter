@@ -958,7 +958,7 @@ impl Mesh {
                 ]);
             }
         }
-        Self::from_positions_and_faces(positions, polygons)
+        primitive_order::torus(positions, &polygons)
     }
 
     /// Create a Blender-default or customized recursively subdivided icosphere.

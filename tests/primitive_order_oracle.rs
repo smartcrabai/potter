@@ -9,7 +9,7 @@ use std::error::Error;
 use glam::DVec3;
 use potter_core::geom::{
     BoxParams, CircleFillType, CircleParams, ConeParams, CylinderParams, EndFillType, GridParams,
-    Mesh, PlaneParams,
+    Mesh, PlaneParams, TorusParams,
 };
 use serde_json::Value;
 
@@ -235,4 +235,20 @@ fn cone_storage_order_matches_blender() -> TestResult {
         &cone(32, 0.0, 1.0, EndFillType::Ngon)?,
         &cases,
     )
+}
+
+#[test]
+fn torus_storage_order_matches_blender() -> TestResult {
+    let cases = oracle()?;
+    let torus = |major_segments, minor_segments| {
+        Mesh::torus(TorusParams {
+            major_segments,
+            minor_segments,
+            major_radius: 1.0,
+            minor_radius: 0.25,
+            ..TorusParams::default()
+        })
+    };
+    assert_matches("torus_8x4", &torus(8, 4)?, &cases)?;
+    assert_matches("torus_default", &torus(48, 12)?, &cases)
 }
