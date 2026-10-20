@@ -10,23 +10,26 @@
 //! side and `T` the two-sided 99.9% t quantile at 7 degrees of freedom (5.408). Welch's degrees of freedom for
 //! two 8-seed samples are at least 7, and the quantile falls as they grow, so `T` is conservative.
 //!
-//! Cost (measured on the lane, see the commit message): the import and Blender's render are fixed costs; the
-//! eight Potter renders are the rest. The per-seed cost is set by the 16 × 16 × 32 render of about 120 sphere
-//! pixels, not by process overhead.
+//! Measured on the lane (D-glass-2): the test takes 19 to 24 s wall time when the machine is quiet (the
+//! Blender render, the import and eight in-process Potter renders), and 101 s wall time with 35 s of user CPU
+//! under a load average near 100. Potter's per-seed frame-mean spread at 32 samples is 0.00478, Blender's at 256
+//! samples is 0.00162, so the tolerance is 5.408 · √(0.00478²/8 + 0.00162²/8) = 0.00966, and the unmutated
+//! frame means differ by 0.00066 (Potter 0.01422, Blender 0.01488).
 //!
-//! What the test must detect, as a margin per case (effect over tolerance, in frame-mean units). The figures are
-//! Blender 5.2.2 renders of the same scene, with Potter's noise at 32 samples taken as Blender's at 32 samples, so
-//! they are estimates until the lane run measures Potter's noise:
-//!   - the old pass-through shadow rule, where the interior glass is lit through the sphere (Blender with the
-//!     sphere casting no shadow): 0.0438 over a tolerance of 0.0085, a margin of 5.1×;
-//!   - a roughness error in Potter's lobe (Potter at 0.5 where the reference is 0.2, the roughness swap of the
-//!     two oracle roughnesses): 0.0238 over 0.0074, a margin of 3.2×. The plane oracle checks both roughnesses
-//!     exactly.
+//! What the test must detect, measured by mutation on the lane (effect over the unmutated tolerance 0.00966):
+//!   - the old pass-through shadow rule, where the interior glass passes shadow rays at transmission × base:
+//!     Potter 0.07178 against 0.01488, an effect of 0.0569, a margin of 5.9×;
+//!   - a roughness error in Potter's lobe (roughness 0.5 used where the material says 0.2): Potter 0.03534
+//!     against 0.01488, an effect of 0.0205, a margin of 2.1×, which is about 11 standard errors of the
+//!     difference, so it is detected with certainty at this noise. The plane oracle checks both roughnesses
+//!     exactly;
+//!   - the textured-base glass tint is not in the sphere (it has no texture); it is checked by the unit test
+//!     `textured_base_sets_the_principled_glass_tint` in `shader/evaluator.rs`, which fails when the per-arm tint
+//!     is dropped (the tint stays 1.0 where sqrt(0.25) = 0.5 is expected).
 //!
-//! The sqrt(base) transmission tint is not checked here: at this noise its difference per channel (0.0013 to
-//! 0.0018 at 64 samples) is below the tolerance. The plane oracle in `render/principled_bsdf.rs` (`glass_tests`)
-//! checks the tint at 4 standard errors of Cycles' 16-seed plane means, where a base colour used directly in
-//! place of its square root misses by 6 to 16 radiance units.
+//! The sqrt(base) transmission tint is not checked by the sphere at this noise. The plane oracle in
+//! `render/principled_bsdf.rs` (`glass_tests`) checks the tint at 4 standard errors of Cycles' 16-seed plane
+//! means, where a base colour used directly in place of its square root misses by 6 to 16 radiance units.
 //!
 //! The sphere's interior shadow rays are blocked by the glass, as Cycles blocks them
 //! (`kernel/integrator/surface_shader.h`), so light reaches the camera through the front reflection, the
