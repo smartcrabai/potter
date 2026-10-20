@@ -454,6 +454,40 @@ fn mesh_cache_mdd_interpolates_resource_frames() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn mesh_cache_mdd_scans_unordered_times_as_blender_does() -> Result<(), Box<dyn Error>> {
+    // Blender scans the stored times in file order without checking them. For eval time 2.5 the
+    // scan breaks at the stored time 3.0, which follows 1.0, so the frame is 2 + (2.5 - 1.0) / 2.0.
+    let mut mesh = Mesh::from_positions_and_faces(vec![DVec3::ZERO], vec![])?;
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&4_i32.to_be_bytes());
+    bytes.extend_from_slice(&1_i32.to_be_bytes());
+    for time in [0.0_f32, 2.0, 1.0, 3.0] {
+        bytes.extend_from_slice(&time.to_be_bytes());
+    }
+    for x in [0.0_f32, 10.0, 20.0, 30.0] {
+        bytes.extend_from_slice(&x.to_be_bytes());
+        bytes.extend_from_slice(&0.0_f32.to_be_bytes());
+        bytes.extend_from_slice(&0.0_f32.to_be_bytes());
+    }
+    let cache = modifier(
+        "mesh_cache",
+        json!({
+            "resource":"cache",
+            "cache_format":"MDD",
+            "play_mode":"CUSTOM",
+            "time_mode":"TIME",
+            "eval_time":2.5,
+            "interpolation":"LINEAR",
+            "deform_mode":"OVERWRITE",
+            "factor":1.0
+        }),
+    )?;
+    evaluate_mesh_cache(&mut mesh, None, &cache, 1.0, 24, 1.0, &bytes)?;
+    assert!((mesh.vertices[0].co.x - 27.5).abs() < 1.0e-6);
+    Ok(())
+}
+
+#[test]
 fn mesh_cache_frame_mode_uses_positional_indices_and_linear_snap() -> Result<(), Box<dyn Error>> {
     let samples = [[DVec3::ZERO; 4], [DVec3::new(2.0, 0.0, 0.0); 4]];
     let mut bytes = pc2_cache(&samples);

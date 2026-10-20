@@ -742,6 +742,9 @@ fn read_mdd_metadata(bytes: &[u8], modifier: &Modifier) -> Result<CacheMetadata>
     })
 }
 
+/// Blender's `meshcache_read_mdd_range_from_time`: the stored times are scanned in file order, and
+/// the scan stops at the first time that is not below `time`. The times are not checked for order,
+/// so unordered times give the frame that Blender's scan gives.
 fn cache_frame_at_time(
     bytes: &[u8],
     times_offset: usize,
@@ -749,55 +752,34 @@ fn cache_frame_at_time(
     time: f32,
     modifier: &Modifier,
 ) -> Result<f32> {
-    let Some(last) = count.checked_sub(1) else {
-        return Err(invalid(modifier, "resource", "valid MDD frame times"));
-    };
-    let mut first_time = None;
-    let mut last_time = 0.0_f32;
     let mut previous_time = None;
-    let mut upper = None;
-    for index in 0..count {
-        let offset = index
+    let mut index = 0;
+    let mut sample_time = 0.0_f32;
+    while index < count {
+        let sample = index
             .checked_mul(4)
-            .and_then(|offset| times_offset.checked_add(offset));
-        let time_sample = offset
+            .and_then(|offset| times_offset.checked_add(offset))
             .and_then(|offset| be_f32(bytes, offset))
-            .filter(|time| time.is_finite())
-            .ok_or_else(|| invalid(modifier, "resource", "finite MDD frame times"))?;
-        if previous_time.is_some_and(|previous| time_sample < previous) {
-            return Err(invalid(modifier, "resource", "ordered MDD frame times"));
+            .ok_or_else(|| invalid(modifier, "resource", "valid MDD frame times"))?;
+        sample_time = sample;
+        if sample_time >= time {
+            break;
         }
-        first_time.get_or_insert(time_sample);
-        #[expect(
-            clippy::neg_cmp_op_on_partial_ord,
-            reason = "!(a < b) also holds for NaN frame times, unlike a >= b"
-        )]
-        if upper.is_none() && !(time_sample < time) {
-            upper = Some((index, time_sample, previous_time.unwrap_or(time_sample)));
-        }
-        previous_time = Some(time_sample);
-        last_time = time_sample;
+        previous_time = Some(sample_time);
+        index += 1;
     }
-    let first_time = first_time.unwrap_or(last_time);
-    if time <= first_time {
+    let Some(previous_time) = previous_time else {
         return Ok(0.0);
-    }
-    let last_frame = cache_float(f64::from(u32::try_from(last).unwrap_or(u32::MAX)));
-    let Some((upper_index, upper_time, lower_time)) = upper else {
-        return Ok(last_frame);
     };
-    if upper_index == 0 {
-        return Ok(0.0);
-    }
-    let lower = upper_index - 1;
-    let width = upper_time - lower_time;
-    if width <= 0.0001_f32 {
+    let range = sample_time - previous_time;
+    if range <= 0.0001_f32 {
         return Ok(cache_float(f64::from(
-            u32::try_from(upper_index).unwrap_or(u32::MAX),
+            u32::try_from(index).unwrap_or(u32::MAX),
         )));
     }
-    let fraction = (time - lower_time) / width;
-    Ok(cache_float(f64::from(u32::try_from(lower).unwrap_or(u32::MAX))) + fraction)
+    // The scan broke at `index >= 1`, so the sample before it exists.
+    let lower = u32::try_from(index - 1).unwrap_or(u32::MAX);
+    Ok(cache_float(f64::from(lower)) + (time - previous_time) / range)
 }
 
 #[expect(
