@@ -25,7 +25,7 @@ pub(super) fn libcxx_sort_by<T: Copy, F: Fn(&T, &T) -> bool>(v: &mut [T], less: 
     if n == 0 {
         return;
     }
-    let depth = 2 * (63 - (n as u64).leading_zeros()) as isize;
+    let depth = 2 * (n as u64).ilog2() as isize;
     Sorter { v, less }.introsort(0, n, depth, true);
 }
 
@@ -264,7 +264,7 @@ impl<T: Copy, F: Fn(&T, &T) -> bool> Sorter<'_, T, F> {
         } else {
             loop {
                 first += 1;
-                if !(first < last && !self.p_lt(&pivot, first)) {
+                if first >= last || self.p_lt(&pivot, first) {
                     break;
                 }
             }
