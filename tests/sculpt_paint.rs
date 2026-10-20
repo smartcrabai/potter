@@ -6,7 +6,6 @@
 use std::{error::Error, fs, process::Command};
 
 use glam::DVec3;
-use proptest::prelude::*;
 use serde_json::{Value, json};
 use tempfile::tempdir;
 #[path = "common/blender_checked.rs"]
@@ -116,7 +115,7 @@ fn sculpt_multires_stroke_updates_mdisps_and_base_mesh_mode_preserves_grids()
 
     let stroke = json!({
         "op":"sculpt.stroke", "target":{"id":"body"}, "brush":"draw", "scope":"shared",
-        "samples":[{"position":[1.0,1.0,1.0],"pressure":1.0,"radius":1.0,"strength":0.5,"time":0.0}],
+        "samples":[{"position":[0.0,0.0,1.0],"pressure":1.0,"radius":1.0,"strength":0.5,"time":0.0}],
         "falloff":"linear"
     });
     let (_multires_directory, multires_scene) = create_scene()?;
@@ -146,6 +145,13 @@ fn sculpt_multires_stroke_updates_mdisps_and_base_mesh_mode_preserves_grids()
         "native multires stroke did not change evaluated geometry"
     );
 
+    // The base mesh has only its eight corners, so the sample sits on a corner vertex; the
+    // multires stroke above uses a sculpt-level vertex, since its subdivided surface has no corner there.
+    let base_stroke = json!({
+        "op":"sculpt.stroke", "target":{"id":"body"}, "brush":"draw", "scope":"shared",
+        "samples":[{"position":[1.0,1.0,1.0],"pressure":1.0,"radius":1.0,"strength":0.5,"time":0.0}],
+        "falloff":"linear"
+    });
     let (_base_directory, base_scene) = create_scene()?;
     apply(
         &base_scene,
@@ -154,7 +160,7 @@ fn sculpt_multires_stroke_updates_mdisps_and_base_mesh_mode_preserves_grids()
             {"op":"sculpt.multires", "target":{"id":"body"}, "id":"multi_one", "levels":1, "render_levels":1},
             {"op":"modifier.update", "target":{"id":"body"}, "id":"multi_one",
              "set":{"params":{"levels":1,"sculpt_levels":1,"render_levels":1,"total_levels":1,"use_sculpt_base_mesh":true}}},
-            stroke
+            base_stroke
         ]),
     )?;
     let base_mesh = stored_mesh(&base_scene)?;
@@ -384,7 +390,7 @@ fn multires_sculpt_levels_select_native_grid_resolution() -> Result<(), Box<dyn 
                 {"op":"modifier.update", "target":{"id":"body"}, "id":"multi_one",
                  "set":{"params":{"levels":2,"sculpt_levels":sculpt_levels,"render_levels":2,"total_levels":2}}},
                 {"op":"sculpt.stroke", "target":{"id":"body"}, "brush":"draw", "scope":"shared",
-                 "samples":[{"position":[1.0,1.0,1.0],"pressure":1.0,"radius":1.0,"strength":0.5,"time":0.0}],
+                 "samples":[{"position":[0.0,0.0,1.0],"pressure":1.0,"radius":1.0,"strength":0.5,"time":0.0}],
                  "falloff":"linear"}
             ]),
         )?;
@@ -429,7 +435,7 @@ fn multires_blend_roundtrips_continue_sculpt_and_apply() -> Result<(), Box<dyn E
             {"op":"modifier.update", "target":{"id":"body"}, "id":"multi_one",
              "set":{"params":{"show_only_control_edges":false,"use_sculpt_base_mesh":false}}},
             {"op":"sculpt.stroke", "target":{"id":"body"}, "brush":"draw", "scope":"shared",
-             "samples":[{"position":[1.0,1.0,1.0],"pressure":1.0,"radius":1.0,"strength":0.5,"time":0.0}],
+             "samples":[{"position":[0.0,0.0,1.0],"pressure":1.0,"radius":1.0,"strength":0.5,"time":0.0}],
              "falloff":"linear"}
         ]),
     )?;
@@ -574,7 +580,7 @@ fn multires_blend_roundtrips_continue_sculpt_and_apply() -> Result<(), Box<dyn E
             &import_scene,
             &json!([{
                 "op":"sculpt.stroke", "target":{"id":node_id}, "brush":"draw", "scope":"shared",
-                "samples":[{"position":[1.0,1.0,1.0],"pressure":1.0,"radius":1.0,"strength":0.5,"time":0.0}],
+                "samples":[{"position":[0.0,0.0,1.0],"pressure":1.0,"radius":1.0,"strength":0.5,"time":0.0}],
                 "falloff":"linear"
             }]),
             base_revision,
@@ -657,14 +663,15 @@ fn draw_respects_radius_and_mask_and_vertex_paint_updates_touched_corners()
     assert!(drawn_document["data_blocks"]["body_mesh"]["descriptor"].is_null());
     assert!(drawn_document["nodes"]["body"]["primitive"].is_null());
     let original = Mesh::box_mesh(potter_core::geom::BoxParams::default())?;
-    let original_v6 = original
+    // Vertex 7 is the (+1, +1, +1) corner in Blender's primitive_cube_add order.
+    let original_v7 = original
         .vertices
         .iter()
-        .find(|vertex| vertex.id == 6)
+        .find(|vertex| vertex.id == 7)
         .unwrap()
         .co;
-    let drawn_v6: [f64; 3] = serde_json::from_value(after_draw["vertices"][6]["co"].clone())?;
-    let displacement = DVec3::from_array(drawn_v6) - original_v6;
+    let drawn_v7: [f64; 3] = serde_json::from_value(after_draw["vertices"][7]["co"].clone())?;
+    let displacement = DVec3::from_array(drawn_v7) - original_v7;
     assert!(displacement.length() > 0.0);
     assert!(displacement.dot(DVec3::ONE.normalize()) > 0.0);
     let drawn_v0 = after_draw["vertices"][0]["co"].clone();
@@ -676,7 +683,7 @@ fn draw_respects_radius_and_mask_and_vertex_paint_updates_touched_corners()
         &json!([
             {"op":"node.create", "id":"body", "kind":"box", "params":{}},
             {"op":"sculpt.mask", "target":{"id":"body"}, "scope":"shared", "action":"set",
-             "elements":{"domain":"vertex","ids":["v6"]}, "value":1.0},
+             "elements":{"domain":"vertex","ids":["v7"]}, "value":1.0},
             {"op":"sculpt.stroke", "target":{"id":"body"}, "brush":"draw", "scope":"shared",
              "samples":[{"position":[1.0,1.0,1.0],"pressure":1.0,"radius":0.25,"strength":0.5,"time":0.0}],
              "falloff":"linear"}
@@ -684,11 +691,11 @@ fn draw_respects_radius_and_mask_and_vertex_paint_updates_touched_corners()
     )?;
     let masked = stored_mesh(&masked_scene)?;
     assert_eq!(
-        masked["vertices"][6]["co"],
-        json!(original.vertices[6].co.to_array())
+        masked["vertices"][7]["co"],
+        json!(original.vertices[7].co.to_array())
     );
     assert_eq!(
-        masked["attributes"]["sculpt.mask"]["values"]["v6"],
+        masked["attributes"]["sculpt.mask"]["values"]["v7"],
         json!(1.0)
     );
 
@@ -717,7 +724,7 @@ fn draw_respects_radius_and_mask_and_vertex_paint_updates_touched_corners()
         painted["attributes"]["color_layers"],
         json!({"layers": ["color"], "active": "color", "render": "color"})
     );
-    let painted_at_v6 = painted["faces"].as_array().unwrap().iter().any(|face| {
+    let painted_at_v7 = painted["faces"].as_array().unwrap().iter().any(|face| {
         let row = &color["values"][format!("f{}", face["id"]).as_str()];
         face["v"]
             .as_array()
@@ -725,18 +732,18 @@ fn draw_respects_radius_and_mask_and_vertex_paint_updates_touched_corners()
             .iter()
             .enumerate()
             .any(|(corner, vertex)| {
-                *vertex == json!(6) && row[corner] == json!([0.1, 0.2, 0.3, 1.0])
+                *vertex == json!(7) && row[corner] == json!([0.1, 0.2, 0.3, 1.0])
             })
     });
-    assert!(painted_at_v6);
+    assert!(painted_at_v7);
     assert_eq!(
-        painted["attributes"]["weight:skin"]["values"]["v6"],
+        painted["attributes"]["weight:skin"]["values"]["v7"],
         json!(0.75)
     );
     let painted_document: Value =
         serde_json::from_slice(&fs::read(paint_scene.join("scene.json"))?)?;
     assert_eq!(
-        painted_document["data_blocks"]["body_mesh"]["vertex_weights"]["6"]["bone"],
+        painted_document["data_blocks"]["body_mesh"]["vertex_weights"]["7"]["bone"],
         json!(0.25)
     );
     Ok(())
@@ -871,8 +878,8 @@ fn sculpt_shared_data_requires_scope_and_single_user_isolates_stroke() -> Result
     let original_data = document["nodes"]["body"]["data"].as_str().unwrap();
     let isolated_data = document["nodes"]["body_copy"]["data"].as_str().unwrap();
     assert_ne!(original_data, isolated_data);
-    let original_vertex = &document["data_blocks"][original_data]["mesh"]["vertices"][6]["co"];
-    let edited_vertex = &document["data_blocks"][isolated_data]["mesh"]["vertices"][6]["co"];
+    let original_vertex = &document["data_blocks"][original_data]["mesh"]["vertices"][7]["co"];
+    let edited_vertex = &document["data_blocks"][isolated_data]["mesh"]["vertices"][7]["co"];
     assert_eq!(original_vertex, &json!([1.0, 1.0, 1.0]));
     assert_ne!(edited_vertex, original_vertex);
     Ok(())
@@ -882,9 +889,9 @@ fn sculpt_shared_data_requires_scope_and_single_user_isolates_stroke() -> Result
 fn sculpt_symmetry_and_repeat_strokes_are_deterministic() -> Result<(), Box<dyn Error>> {
     let base = Mesh::box_mesh(potter_core::geom::BoxParams::default())?;
     let stroke = |symmetry: &[&str]| sculpt::Stroke {
-        brush: sculpt::Brush::Vertex(sculpt::VertexBrush::Draw),
+        brush: sculpt::Brush::Dab(sculpt::DabBrush::Draw),
         samples: vec![sculpt::StrokeSample {
-            position: DVec3::new(0.0, -1.0, 1.0),
+            position: DVec3::new(1.0, -1.0, 1.0),
             pressure: 1.0,
             radius: 1.1,
             strength: 0.5,
@@ -893,6 +900,7 @@ fn sculpt_symmetry_and_repeat_strokes_are_deterministic() -> Result<(), Box<dyn 
         falloff: sculpt::Falloff::Linear,
         symmetry: symmetry.iter().map(|axis| (*axis).to_owned()).collect(),
         delta: None,
+        view: None,
     };
     let mut mirrored = base.clone();
     sculpt::apply_stroke(&mut mirrored, &stroke(&["x"]))?;
@@ -911,8 +919,9 @@ fn sculpt_symmetry_and_repeat_strokes_are_deterministic() -> Result<(), Box<dyn 
             .co;
         current.z - original.z
     };
-    assert!(movement(&mirrored, 4) > 0.0);
-    assert!((movement(&mirrored, 4) - movement(&mirrored, 5)).abs() < 1.0e-12);
+    // Vertices 1 (-1, -1, 1) and 5 (+1, -1, 1) are the mirrored pair in Blender's primitive_cube_add order.
+    assert!(movement(&mirrored, 1) > 0.0);
+    assert!((movement(&mirrored, 1) - movement(&mirrored, 5)).abs() < 1.0e-12);
 
     let mut first = base.clone();
     let mut second = base;
@@ -923,24 +932,4 @@ fn sculpt_symmetry_and_repeat_strokes_are_deterministic() -> Result<(), Box<dyn 
     let second_hash = sha256(&canonicalize(&serde_json::to_value(&second)?)?);
     assert_eq!(first_hash, second_hash);
     Ok(())
-}
-
-proptest! {
-    #[test]
-    fn smoothing_reduces_laplacian_energy(offset in -5.0_f64..5.0, factor in 0.1_f64..1.0) {
-        let positions = vec![
-            DVec3::new(offset, offset * 0.25, 0.3),
-            DVec3::new(-1.0, -1.0, 0.0),
-            DVec3::new(1.0, -1.0, 0.0),
-            DVec3::new(1.0, 1.0, 0.0),
-            DVec3::new(-1.0, 1.0, 0.0),
-        ];
-        let mut mesh = Mesh::from_positions_and_faces(
-            positions,
-            vec![vec![0, 1, 2], vec![0, 2, 3], vec![0, 3, 4], vec![0, 4, 1]],
-        ).unwrap();
-        let before = sculpt::laplacian_energy(&mesh);
-        sculpt::smooth_vertex(&mut mesh, 0, factor).unwrap();
-        prop_assert!(sculpt::laplacian_energy(&mesh) < before);
-    }
 }

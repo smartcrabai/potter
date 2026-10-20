@@ -72,7 +72,7 @@ def build_plane_stack(planes, cap, scene):
 
     plane_material = bpy.data.materials.new("Alpha")
     plane_material.use_nodes = True
-    # BLENDED keeps the sub-one Alpha as an alpha blend; the default DITHERED method imports as `clip`.
+    # BLENDED pins Potter's `blend` alpha mode; a DITHERED material imports as `opaque` and keeps its graph's alpha.
     plane_material.surface_render_method = "BLENDED"
     black_principled(plane_material, 0.5)
     for index in range(planes):
@@ -93,8 +93,8 @@ def build_volume_slab(scene):
     scene.render.film_transparent = True
 
     slab_material = bpy.data.materials.new("Slab")
-    # BLENDED: Potter imports a DITHERED material whose Principled Alpha is unauthored as `opaque`,
-    # which forces alpha 1 and hides the Transparent BSDF; the card needs the same for the same reason.
+    # BLENDED pins Potter's `blend` alpha mode. A DITHERED material also honours its graph's transparency now (as
+    # `opaque`, which keeps a Transparent BSDF), so the choice here is the explicit blend path, not a workaround.
     slab_material.surface_render_method = "BLENDED"
     slab_material.use_nodes = True
     tree = slab_material.node_tree

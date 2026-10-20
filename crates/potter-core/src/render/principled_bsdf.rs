@@ -20,67 +20,83 @@
 //! directions (lobe mixture), so `evaluate / density` is unbiased for the mixture. The transmission
 //! lobe stays a delta, handled by `path.rs`.
 
-use std::f64::consts::PI;
+use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI};
 
 use glam::DVec3;
 
-use super::principled_tables::{ggx_energy, ggx_energy_average, ggx_gen_schlick_ior_s};
+use super::principled_tables::{ggx_energy, ggx_energy_average, ggx_gen_schlick_ior_s, sheen_ltc};
 use crate::shader::{BsdfParams, dielectric_f0};
 
 /// Roughness floor shared with the sampler; Cycles treats roughness below ~1e-5 as delta.
 const MIN_ROUGHNESS: f64 = 0.02;
 
-/// Selection probabilities of the three sampling branches, identical to the thresholds
-/// `path.rs` uses to pick a branch.
+/// Selection probabilities of the sampling branches, identical to the thresholds `path.rs` uses to
+/// pick a branch: transmission, diffuse, sheen, coat, specular.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct LobeProbabilities {
     pub(crate) diffuse: f64,
+    pub(crate) sheen: f64,
+    pub(crate) coat: f64,
     pub(crate) specular: f64,
     pub(crate) transmission: f64,
 }
 
-pub(crate) fn lobe_probabilities(params: &BsdfParams) -> LobeProbabilities {
+pub(crate) fn lobe_probabilities(params: &BsdfParams, layers: &Layers) -> LobeProbabilities {
     let metallic = params.metallic.clamp(0.0, 1.0);
     let transmission = params.transmission.clamp(0.0, 1.0);
     let diffuse_weight = ((1.0 - metallic) * (1.0 - transmission)).max(0.0);
+    // Each layer's selection weight is its layering albedo: Cycles' sample weight of the closure.
+    let sheen_weight = layers.sheen.selection_weight();
+    let coat_weight = layers.coat.map_or(0.0, |coat| coat.albedo);
     let specular_weight = (metallic
         + dielectric_f0(params.ior, params.specular_ior_level) * (1.0 - metallic))
         .max(1.0e-4);
-    let total = diffuse_weight + transmission + specular_weight;
+    let total = diffuse_weight + sheen_weight + coat_weight + transmission + specular_weight;
     LobeProbabilities {
         diffuse: diffuse_weight / total,
+        sheen: sheen_weight / total,
+        coat: coat_weight / total,
         specular: specular_weight / total,
         transmission: transmission / total,
     }
 }
 
-/// Exact density of the continuous (diffuse + specular) directions drawn by `path.rs`, in solid
-/// angle. Diffuse is cosine-distributed; specular is the GGX half-vector distribution D·cosθh
-/// mapped to the reflected direction.
-pub(crate) fn continuous_density(
-    params: &BsdfParams,
-    normal: DVec3,
-    view: DVec3,
-    light: DVec3,
-) -> f64 {
-    let probabilities = lobe_probabilities(params);
-    let n_dot_l = normal.dot(light).max(0.0);
-    let mut density = probabilities.diffuse * n_dot_l / PI;
+/// Exact density of the continuous (diffuse, sheen, coat and specular) directions drawn by
+/// `path.rs`, in solid angle. Diffuse is cosine-distributed; sheen is the LTC distribution; the coat
+/// and specular lobes are the GGX half-vector distribution D·cosθh mapped to the reflected direction.
+pub(crate) fn continuous_density(params: &BsdfParams, layers: &Layers, light: DVec3) -> f64 {
+    let (normal, view) = (layers.normal, layers.view);
+    let probabilities = lobe_probabilities(params, layers);
+    let mut density = probabilities.diffuse * normal.dot(light).max(0.0) / PI;
+    density += probabilities.sheen * layers.sheen.density(light);
+    if let Some(coat) = layers.coat {
+        density += probabilities.coat * half_vector_pdf(coat.normal, coat.roughness, view, light);
+    }
+    density + probabilities.specular * half_vector_pdf(normal, params.roughness, view, light)
+}
+
+/// Density in solid angle of the reflection of `view` about the half vector drawn with
+/// `sample_ggx_half`: `D(h)·(n·h) / (4 v·h)` for the half vector of `view` and `light`.
+fn half_vector_pdf(normal: DVec3, roughness: f64, view: DVec3, light: DVec3) -> f64 {
     let half = (view + light).normalize_or_zero();
     let n_dot_h = normal.dot(half).max(0.0);
     let v_dot_h = view.dot(half).max(0.0);
-    if v_dot_h > 0.0 {
-        let alpha_squared = ggx_alpha_squared(params.roughness);
-        let pdf_half = ggx_distribution(alpha_squared, n_dot_h) * n_dot_h;
-        density += probabilities.specular * pdf_half / (4.0 * v_dot_h).max(1.0e-8);
+    if v_dot_h <= 0.0 {
+        return 0.0;
     }
-    density
+    let pdf_half = ggx_distribution(ggx_alpha_squared(roughness), n_dot_h) * n_dot_h;
+    pdf_half / (4.0 * v_dot_h).max(1.0e-8)
 }
 
 /// Diffuse lobe of the Principled BSDF: Lambert under the dielectric-layering weight, times
 /// reflectance. It depends on the view only (the layering albedo is view-dependent), so an area
 /// light can be integrated against it analytically.
-pub(crate) fn diffuse_coefficient(params: &BsdfParams, normal: DVec3, view: DVec3) -> DVec3 {
+pub(crate) fn diffuse_coefficient(params: &BsdfParams, layers: &Layers) -> DVec3 {
+    diffuse_lobe(params, layers.normal, layers.view, layers.lower)
+}
+
+/// The diffuse lobe, given the coat's lower-layer factor (set up once by the caller).
+fn diffuse_lobe(params: &BsdfParams, normal: DVec3, view: DVec3, lower: DVec3) -> DVec3 {
     let n_dot_v = normal.dot(view).max(0.0);
     if n_dot_v <= 0.0 {
         return DVec3::ZERO;
@@ -100,16 +116,22 @@ pub(crate) fn diffuse_coefficient(params: &BsdfParams, normal: DVec3, view: DVec
         }
         None => dielectric_weight,
     };
-    diffuse_albedo(params) * (diffuse_weight / PI) * params.reflectance.clamp(0.0, 1.0)
+    diffuse_albedo(params) * (diffuse_weight / PI) * params.reflectance.clamp(0.0, 1.0) * lower
 }
 
 /// Specular (dielectric and metallic) lobes along `light`, times reflectance. Zero when the
 /// light or view is below the surface.
-pub(crate) fn specular_coefficient(
+pub(crate) fn specular_coefficient(params: &BsdfParams, layers: &Layers, light: DVec3) -> DVec3 {
+    specular_lobe(params, layers.normal, layers.view, light, layers.lower)
+}
+
+/// The specular lobe, given the coat's lower-layer factor (set up once by the caller).
+fn specular_lobe(
     params: &BsdfParams,
     normal: DVec3,
     view: DVec3,
     light: DVec3,
+    lower: DVec3,
 ) -> DVec3 {
     let n_dot_v = normal.dot(view).max(0.0);
     let n_dot_l = normal.dot(light).max(0.0);
@@ -167,15 +189,336 @@ pub(crate) fn specular_coefficient(
         reflected += gain * fresnel * metallic;
     }
 
-    (reflected * common) * params.reflectance.clamp(0.0, 1.0)
+    (reflected * common) * (params.reflectance.clamp(0.0, 1.0) * lower)
 }
 
+/// Cycles' `CLOSURE_WEIGHT_CUTOFF`: a coat weight at or below it is not set up.
+const COAT_WEIGHT_CUTOFF: f64 = 1.0e-5;
+
 /// Continuous Principled BSDF times reflectance, the `evaluate / density` estimator's numerator.
-pub(crate) fn evaluate(params: &BsdfParams, normal: DVec3, view: DVec3, light: DVec3) -> DVec3 {
-    if normal.dot(light) <= 0.0 {
+pub(crate) fn evaluate(params: &BsdfParams, layers: &Layers, light: DVec3) -> DVec3 {
+    if layers.normal.dot(light) <= 0.0 {
         return DVec3::ZERO;
     }
-    diffuse_coefficient(params, normal, view) + specular_coefficient(params, normal, view, light)
+    diffuse_lobe(params, layers.normal, layers.view, layers.lower)
+        + specular_lobe(params, layers.normal, layers.view, light, layers.lower)
+        + sheen_coefficient(params, layers, light)
+        + coat_coefficient(params, layers, light)
+}
+
+/// The sheen lobe along `light`, times reflectance. It depends on the light, so an area light is
+/// integrated numerically or at its centre (`scene.rs`), like the specular lobe.
+pub(crate) fn sheen_coefficient(params: &BsdfParams, layers: &Layers, light: DVec3) -> DVec3 {
+    layers.sheen.value(light) * params.reflectance.clamp(0.0, 1.0)
+}
+
+/// The Principled coat: a GGX dielectric reflection lobe over the layers below it, set up as
+/// Cycles' coat block of `principled_bsdf_emission` (`kernel/svm/closure.h`). `albedo` is the
+/// layering albedo `weight · F · gain · E`. `gain` is the multiscatter gain `1 + Fms · (1 - E) / E`
+/// of `microfacet_ggx_preserve_energy`: its darkening of the closure weight cancels the
+/// `energy_scale` of the eval, so the lobe carries `gain` alone.
+#[derive(Clone, Copy, Debug)]
+struct CoatLayer {
+    normal: DVec3,
+    n_dot_v: f64,
+    ior: f64,
+    roughness: f64,
+    weight: f64,
+    gain: f64,
+    albedo: f64,
+}
+
+/// The coat layer for `view`, or `None` when the coat is off or the view is below its normal. The
+/// normal is the linked Coat Normal, or the final shading normal when unlinked.
+fn coat_layer(params: &BsdfParams, view: DVec3) -> Option<CoatLayer> {
+    let weight = params.coat_weight.max(0.0);
+    if weight <= COAT_WEIGHT_CUTOFF {
+        return None;
+    }
+    let normal = params.coat_normal_or_shading();
+    let n_dot_v = normal.dot(view);
+    if n_dot_v <= 0.0 {
+        return None;
+    }
+    let ior = params.coat_ior.max(1.0);
+    let roughness = saturate(params.coat_roughness).clamp(MIN_ROUGHNESS, 1.0);
+    let energy = ggx_energy(roughness, n_dot_v).max(1.0e-6);
+    let missing = (1.0 - energy) / energy;
+    let fss = DVec3::splat(fresnel_dielectric_fss(ior));
+    let gain = multiscatter_gain(fss, ggx_energy_average(roughness), missing).x;
+    // Cycles' DIELECTRIC albedo: the `ggx_gen_schlick_ior_s` LUT for ior > 1, where ior 1 has no
+    // Fresnel reflectance at all.
+    let fresnel_albedo = if ior > 1.0 {
+        let f0 = dielectric_f0(ior, 0.5);
+        let z = ((ior - 1.0) / (ior + 1.0)).abs().sqrt();
+        let s = ggx_gen_schlick_ior_s(roughness, n_dot_v, z);
+        f0 + (1.0 - f0) * s
+    } else {
+        0.0
+    };
+    Some(CoatLayer {
+        normal,
+        n_dot_v,
+        ior,
+        roughness,
+        weight,
+        gain,
+        albedo: weight * fresnel_albedo * gain * energy,
+    })
+}
+
+/// The layers above the base lobes at one shading point, set up once and shared by every lobe they
+/// attenuate. `lower` is the factor they leave to the diffuse, specular and metallic lobes, the
+/// transmission delta and the emission: the coat's layering and tint, times the sheen's layering,
+/// as Cycles layers them (`principled_bsdf_emission`, `kernel/svm/closure.h`).
+#[derive(Clone, Copy)]
+pub(crate) struct Layers {
+    pub(crate) normal: DVec3,
+    pub(crate) view: DVec3,
+    coat: Option<CoatLayer>,
+    sheen: SheenLobe,
+    lower: DVec3,
+}
+
+/// Sets up the sheen and coat layers of a shading point with normal `normal`, seen along `view`.
+pub(crate) fn layers(params: &BsdfParams, normal: DVec3, view: DVec3) -> Layers {
+    let coat = coat_layer(params, view);
+    // Cycles sets the sheen's normal to `safe_normalize(mix(N, coat normal, saturate(coat weight)))`
+    // (`kernel/svm/closure.h`, `principled_bsdf_emission`), so the sheen frame and LTC follow the coat.
+    let coat_weight = params.coat_weight.clamp(0.0, 1.0);
+    let mixed = normal.lerp(params.coat_normal_or_shading(), coat_weight);
+    let sheen_normal = if mixed.length_squared() > f64::EPSILON {
+        mixed.normalize()
+    } else {
+        normal
+    };
+    let sheen = sheen_lobe(params, sheen_normal, view);
+    let lower = coat_lower_factor_of(params, coat.as_ref()) * sheen.layer_weight();
+    Layers {
+        normal,
+        view,
+        coat,
+        sheen,
+        lower,
+    }
+}
+
+impl Layers {
+    /// The factor the layers leave to the lobes below them and to the emission.
+    pub(crate) fn lower(&self) -> DVec3 {
+        self.lower
+    }
+
+    /// Sheen direction for the square sample `(u, v)` in `[0, 1)²`, drawn from the LTC distribution.
+    pub(crate) fn sample_sheen(&self, u: f64, v: f64) -> DVec3 {
+        self.sheen.direction(u, v)
+    }
+}
+
+/// `coat_lower_factor` for a coat layer that is already set up.
+fn coat_lower_factor_of(params: &BsdfParams, coat: Option<&CoatLayer>) -> DVec3 {
+    let Some(coat) = coat else {
+        return DVec3::ONE;
+    };
+    let layering = saturate(1.0 - coat.albedo);
+    let cos_ni = coat.n_dot_v;
+    let cos_nt = (1.0 - (1.0 / coat.ior).powi(2) * (1.0 - cos_ni * cos_ni))
+        .max(1.0e-8)
+        .sqrt();
+    let tint = DVec3::from_array(params.coat_tint).max(DVec3::ZERO);
+    let transmitted = tint.powf(1.0 / cos_nt);
+    DVec3::ONE.lerp(transmitted, coat.weight) * layering
+}
+
+/// The coat lobe along `light`, times reflectance, attenuated by the sheen layer above it (Cycles
+/// sets the sheen up first, so the coat's weight is the sheen-layered one). Zero when the coat is off
+/// or the light is below the coat's normal.
+pub(crate) fn coat_coefficient(params: &BsdfParams, layers: &Layers, light: DVec3) -> DVec3 {
+    coat_term(params, layers.coat.as_ref(), layers.view, light) * layers.sheen.layer_weight()
+}
+
+/// The coat lobe for a coat layer that is already set up.
+fn coat_term(params: &BsdfParams, coat: Option<&CoatLayer>, view: DVec3, light: DVec3) -> DVec3 {
+    let Some(coat) = coat else {
+        return DVec3::ZERO;
+    };
+    let normal = coat.normal;
+    let n_dot_v = coat.n_dot_v;
+    let n_dot_l = normal.dot(light);
+    if n_dot_l <= 0.0 {
+        return DVec3::ZERO;
+    }
+    let half = (view + light).normalize_or_zero();
+    let n_dot_h = normal.dot(half).max(0.0);
+    let v_dot_h = view.dot(half).max(0.0);
+    let alpha_squared = ggx_alpha_squared(coat.roughness);
+    let common = ggx_distribution(alpha_squared, n_dot_h)
+        * ggx_height_correlated_g2(alpha_squared, n_dot_v, n_dot_l)
+        / (4.0 * n_dot_v * n_dot_l).max(1.0e-8);
+    let fresnel = fresnel_dielectric(v_dot_h, coat.ior);
+    DVec3::splat(coat.weight * coat.gain * fresnel * common) * params.reflectance.clamp(0.0, 1.0)
+}
+
+/// Cycles' `CLOSURE_WEIGHT_CUTOFF`: a sheen weight at or below it is not set up at all.
+const CLOSURE_WEIGHT_CUTOFF: f64 = 1.0e-5;
+
+/// The sheen (microfiber) lobe, set up as Cycles' `bsdf_sheen_setup`. The distribution is the LTC
+/// transform of a cosine lobe in the frame `(tangent, bitangent, normal)` built from the view.
+/// `weight` is the lobe's reflectance per channel, `tint · sheen weight · LTC albedo`. It is zero
+/// when the lobe is off: sheen weight at most the closure cutoff, view below the surface, or an
+/// invalid LTC, which Cycles drops.
+#[derive(Clone, Copy, Debug)]
+struct SheenLobe {
+    normal: DVec3,
+    tangent: DVec3,
+    bitangent: DVec3,
+    transform_a: f64,
+    transform_b: f64,
+    weight: DVec3,
+}
+
+fn sheen_lobe(params: &BsdfParams, normal: DVec3, view: DVec3) -> SheenLobe {
+    let off = SheenLobe {
+        normal,
+        tangent: DVec3::ZERO,
+        bitangent: DVec3::ZERO,
+        transform_a: 0.0,
+        transform_b: 0.0,
+        weight: DVec3::ZERO,
+    };
+    let sheen_weight = params.sheen_weight.max(0.0);
+    let cos_ni = normal.dot(view);
+    if sheen_weight <= CLOSURE_WEIGHT_CUTOFF || cos_ni <= 0.0 {
+        return off;
+    }
+    let roughness = saturate(params.sheen_roughness).clamp(1.0e-3, 1.0);
+    let ltc = sheen_ltc(roughness, cos_ni);
+    if ltc.transform_a.abs() < 1.0e-5 || ltc.albedo < 1.0e-5 {
+        return off;
+    }
+    let (tangent, bitangent) = sheen_frame(normal, view);
+    let tint = DVec3::from_array(params.sheen_tint).max(DVec3::ZERO);
+    SheenLobe {
+        normal,
+        tangent,
+        bitangent,
+        transform_a: ltc.transform_a,
+        transform_b: ltc.transform_b,
+        weight: tint * (sheen_weight * ltc.albedo),
+    }
+}
+
+impl SheenLobe {
+    /// The lobe's share of the sampler's branch choice: its mean reflectance over the channels.
+    fn selection_weight(&self) -> f64 {
+        self.weight.element_sum() / 3.0
+    }
+
+    /// The weight the layers below keep, `closure_layering_weight` of the sheen albedo:
+    /// `1 - max_c(sheen weight · tint_c · albedo)`.
+    fn layer_weight(&self) -> f64 {
+        saturate(1.0 - self.weight.max_element())
+    }
+
+    /// The LTC cosine `z` and distribution shape `(a / |L|²)²` of `light` in the lobe frame.
+    fn shape(&self, light: DVec3) -> (f64, f64) {
+        let local = DVec3::new(
+            light.dot(self.tangent),
+            light.dot(self.bitangent),
+            light.dot(self.normal),
+        );
+        let (a, b) = (self.transform_a, self.transform_b);
+        let length_squared =
+            (a * local.x + b * local.z).powi(2) + (a * local.y).powi(2) + local.z.powi(2);
+        (local.z, (a / length_squared).powi(2))
+    }
+
+    /// The BSDF value `weight · (a / |L|²)² / π`, Cycles' `bsdf_sheen_eval` without its cosine.
+    fn value(&self, light: DVec3) -> DVec3 {
+        if self.weight.max_element() <= 0.0 {
+            return DVec3::ZERO;
+        }
+        let (cosine, shape) = self.shape(light);
+        if cosine <= 0.0 {
+            return DVec3::ZERO;
+        }
+        self.weight * (shape / PI)
+    }
+
+    /// Solid-angle density `z · (a / |L|²)² / π` of `light`, the pdf Cycles reports for it.
+    fn density(&self, light: DVec3) -> f64 {
+        if self.weight.max_element() <= 0.0 {
+            return 0.0;
+        }
+        let (cosine, shape) = self.shape(light);
+        if cosine <= 0.0 {
+            return 0.0;
+        }
+        cosine * shape / PI
+    }
+
+    /// Cycles' `bsdf_sheen_sample`: the LTC-warped disk sample, in the lobe frame.
+    fn direction(&self, u: f64, v: f64) -> DVec3 {
+        let (disk_x, disk_y) = concentric_disk(u, v);
+        let disk_z = (1.0 - disk_x * disk_x - disk_y * disk_y).max(0.0).sqrt();
+        let local = DVec3::new(
+            disk_x - disk_z * self.transform_b,
+            disk_y,
+            disk_z * self.transform_a,
+        )
+        .normalize_or_zero();
+        self.tangent * local.x + self.bitangent * local.y + self.normal * local.z
+    }
+}
+
+/// Cycles' `sample_uniform_disk`: the concentric mapping of `[0, 1)²` onto the unit disk.
+fn concentric_disk(u: f64, v: f64) -> (f64, f64) {
+    let a = 2.0 * u - 1.0;
+    let b = 2.0 * v - 1.0;
+    if a * a + b * b <= 0.0 {
+        return (0.0, 0.0);
+    }
+    let (radius, phi) = if a * a > b * b {
+        (a, FRAC_PI_4 * (b / a))
+    } else {
+        (b, FRAC_PI_2 - FRAC_PI_4 * (a / b))
+    };
+    (radius * phi.cos(), radius * phi.sin())
+}
+
+/// Cycles' `make_orthonormals_safe_tangent(N, wi)`: the bitangent is `normalize(N × wi)` and the
+/// tangent `B × N`. Only a view along the normal fails the normalisation; the basis then comes from
+/// `make_orthonormals`.
+fn sheen_frame(normal: DVec3, view: DVec3) -> (DVec3, DVec3) {
+    let bitangent = normal.cross(view).normalize_or_zero();
+    if bitangent.length_squared() < 0.99 {
+        return make_orthonormals(normal);
+    }
+    (bitangent.cross(normal), bitangent)
+}
+
+/// Cycles' `make_orthonormals` (`util/math_float3.h`): a tangent from the cross product with
+/// `(1, 1, 1)`, chosen by exact component equality.
+#[expect(
+    clippy::float_cmp,
+    reason = "Cycles selects the tangent basis by exact component equality of the normal"
+)]
+fn make_orthonormals(normal: DVec3) -> (DVec3, DVec3) {
+    let tangent = if normal.x != normal.y || normal.x != normal.z {
+        DVec3::new(
+            normal.z - normal.y,
+            normal.x - normal.z,
+            normal.y - normal.x,
+        )
+    } else {
+        DVec3::new(
+            normal.z - normal.y,
+            normal.x + normal.z,
+            -normal.y - normal.x,
+        )
+    }
+    .normalize_or_zero();
+    (tangent, normal.cross(tangent))
 }
 
 /// The base colour clamped to 1 (Cycles' `clamped_base_color`, used by the F82 metal lobe).
@@ -378,6 +721,162 @@ mod tests {
         let gain = multiscatter_gain(DVec3::splat(0.5), 1.0, 0.0);
         assert_eq!(gain, DVec3::ONE);
     }
+
+    #[test]
+    fn concentric_disk_stays_in_the_unit_disk_and_maps_the_centre_to_the_origin() {
+        for (u, v) in [
+            (0.0, 0.0),
+            (0.999, 0.5),
+            (0.5, 0.001),
+            (0.25, 0.75),
+            (0.9, 0.1),
+        ] {
+            let (x, y) = concentric_disk(u, v);
+            assert!(
+                x * x + y * y <= 1.0 + 1.0e-12,
+                "({u}, {v}) maps to ({x}, {y})"
+            );
+        }
+        assert_eq!(concentric_disk(0.5, 0.5), (0.0, 0.0));
+    }
+
+    #[test]
+    fn sheen_frame_is_orthonormal_with_bitangent_along_normal_cross_view() {
+        let normal = DVec3::new(0.2, -0.3, 0.9).normalize();
+        let view = DVec3::new(0.5, 0.1, 0.7).normalize();
+        let (tangent, bitangent) = sheen_frame(normal, view);
+        assert!((tangent.length() - 1.0).abs() < 1.0e-12);
+        assert!((bitangent.length() - 1.0).abs() < 1.0e-12);
+        assert!(tangent.dot(normal).abs() < 1.0e-12);
+        assert!(bitangent.dot(normal).abs() < 1.0e-12);
+        assert!(tangent.dot(bitangent).abs() < 1.0e-12);
+        assert!((bitangent - normal.cross(view).normalize()).length() < 1.0e-12);
+    }
+
+    #[test]
+    fn sheen_frame_falls_back_to_an_orthonormal_basis_at_normal_incidence() {
+        let (tangent, bitangent) = sheen_frame(DVec3::Z, DVec3::Z);
+        assert!((tangent.length() - 1.0).abs() < 1.0e-12);
+        assert!((bitangent.length() - 1.0).abs() < 1.0e-12);
+        assert!(tangent.dot(DVec3::Z).abs() < 1.0e-12);
+        assert!(bitangent.dot(DVec3::Z).abs() < 1.0e-12);
+        assert!(tangent.dot(bitangent).abs() < 1.0e-12);
+    }
+
+    /// Midpoint quadrature of `f` over the upper hemisphere with the solid-angle measure.
+    fn hemisphere_integral(f: impl Fn(DVec3) -> f64) -> f64 {
+        const THETA_STEPS: usize = 400;
+        const PHI_STEPS: usize = 800;
+        let mut total = 0.0;
+        for i in 0..THETA_STEPS {
+            let theta = (i as f64 + 0.5) / THETA_STEPS as f64 * FRAC_PI_2;
+            for j in 0..PHI_STEPS {
+                let phi = (j as f64 + 0.5) / PHI_STEPS as f64 * std::f64::consts::TAU;
+                let direction = DVec3::new(
+                    theta.sin() * phi.cos(),
+                    theta.sin() * phi.sin(),
+                    theta.cos(),
+                );
+                let measure = theta.sin()
+                    * (FRAC_PI_2 / THETA_STEPS as f64)
+                    * (std::f64::consts::TAU / PHI_STEPS as f64);
+                total += f(direction) * measure;
+            }
+        }
+        total
+    }
+
+    fn sheen_params(weight: f64, roughness: f64, tint: [f64; 3]) -> BsdfParams {
+        let material = crate::model::Material {
+            base_color: [0.0, 0.0, 0.0, 1.0],
+            metallic: 0.0,
+            roughness: 0.24,
+            ..crate::model::Material::default()
+        };
+        let mut params = BsdfParams::from_material(&material, DVec3::Z);
+        params.specular_ior_level = 0.0;
+        params.sheen_weight = weight;
+        params.sheen_roughness = roughness;
+        params.sheen_tint = tint;
+        params
+    }
+
+    #[test]
+    fn sheen_density_integrates_to_one_over_the_hemisphere() {
+        let view = DVec3::new(0.5, 0.0, 0.5_f64.sqrt());
+        for roughness in [0.3, 0.5, 1.0] {
+            let params = sheen_params(1.0, roughness, [1.0; 3]);
+            let lobe = sheen_lobe(&params, DVec3::Z, view);
+            let total = hemisphere_integral(|light| lobe.density(light));
+            assert!(
+                (total - 1.0).abs() < 1.0e-2,
+                "roughness {roughness}: density integrates to {total}"
+            );
+        }
+    }
+
+    #[test]
+    fn sheen_samples_follow_the_density() {
+        // The fraction of LTC samples inside a cap equals the density's integral over the cap.
+        const SIDE: usize = 400;
+        let view = DVec3::new(0.5, 0.0, 0.5_f64.sqrt());
+        let params = sheen_params(1.0, 0.5, [1.0; 3]);
+        let shading = layers(&params, DVec3::Z, view);
+        for cap in [0.6_f64, 1.0] {
+            let inside = (0..SIDE)
+                .flat_map(|i| (0..SIDE).map(move |j| (i, j)))
+                .filter(|&(i, j)| {
+                    let u = (i as f64 + 0.5) / SIDE as f64;
+                    let v = (j as f64 + 0.5) / SIDE as f64;
+                    shading.sample_sheen(u, v).z >= cap.cos()
+                })
+                .count();
+            let sampled = inside as f64 / (SIDE * SIDE) as f64;
+            let lobe = sheen_lobe(&params, DVec3::Z, view);
+            let expected = hemisphere_integral(|light| {
+                if light.z >= cap.cos() {
+                    lobe.density(light)
+                } else {
+                    0.0
+                }
+            });
+            assert!(
+                (sampled - expected).abs() < 5.0e-3,
+                "cap {cap}: sampled {sampled} vs density {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn sheen_layer_keeps_one_minus_the_largest_channel_albedo() {
+        let view = DVec3::new(0.5, 0.0, 0.5_f64.sqrt());
+        let params = sheen_params(0.6, 0.3, [1.0, 0.5, 0.25]);
+        let albedo = sheen_ltc(0.3, view.z).albedo;
+        let layer = sheen_lobe(&params, DVec3::Z, view).layer_weight();
+        assert!((layer - (1.0 - 0.6 * albedo)).abs() < 1.0e-12);
+        let off = sheen_params(0.0, 0.3, [1.0; 3]);
+        assert_eq!(sheen_lobe(&off, DVec3::Z, view).layer_weight(), 1.0);
+        assert_eq!(
+            sheen_coefficient(&off, &layers(&off, DVec3::Z, view), view),
+            DVec3::ZERO
+        );
+    }
+
+    #[test]
+    fn sheen_normal_mixes_toward_the_coat_normal_by_coat_weight() {
+        let view = DVec3::new(0.5, 0.0, 0.5_f64.sqrt());
+        let mut params = sheen_params(1.0, 0.5, [1.0; 3]);
+        params.coat_normal = Some(DVec3::X);
+        params.coat_weight = 0.5;
+        // normalize(mix(N, coat normal, 0.5)) with N = +Z, as Cycles' sheen N.
+        let expected = DVec3::Z.lerp(DVec3::X, 0.5).normalize();
+        let shading = layers(&params, DVec3::Z, view);
+        assert!((shading.sheen.normal - expected).length() < 1.0e-12);
+        // Without a coat the sheen keeps the shading normal.
+        params.coat_weight = 0.0;
+        let shading = layers(&params, DVec3::Z, view);
+        assert!((shading.sheen.normal - DVec3::Z).length() < 1.0e-12);
+    }
 }
 
 #[cfg(test)]
@@ -393,9 +892,23 @@ mod single_bounce_tests {
     const LIGHT_DISTANCE: f64 = 4.0;
     const RADIUS: f64 = 1.2;
     const POWER: f64 = 1000.0;
-    /// Quadrature resolution over the disk's bounding square. 512 is needed at this radius: 256 is
-    /// 0.02% off on the diffuse variant, more than its Blender stderr.
-    const GRID: usize = 512;
+    /// Quadrature of the disk in polar coordinates. `COARSE` (96 radial × 192 angular midpoints)
+    /// agrees with a converged square grid to about 1e-4 relative on the diffuse, sheen and metal
+    /// variants. On the coat it is 9e-5 at roughness 0.24 and 1.7e-3 at roughness 0.1, so the coat
+    /// oracles use `FINE` (384 × 768: 5e-7 and 1.0e-4 respectively).
+    #[derive(Clone, Copy)]
+    struct Steps {
+        radial: usize,
+        angular: usize,
+    }
+    const COARSE: Steps = Steps {
+        radial: 96,
+        angular: 192,
+    };
+    const FINE: Steps = Steps {
+        radial: 384,
+        angular: 768,
+    };
     /// Orthographic width of the probe camera (Blender's `ortho_scale`) in units.
     const ORTHO_SCALE: f64 = 0.2;
 
@@ -404,7 +917,7 @@ mod single_bounce_tests {
     /// with a factor `cos(VIEW_THETA)`: one pixel is `pixel / cos` in x and `pixel` in y. A glossy
     /// highlight depends on the receiver position, so the patch is averaged, as Blender's pixel is.
     /// The probe is symmetric under y -> -y, so rows j and 7-j contribute equally.
-    fn probe_pixel(params: &BsdfParams) -> DVec3 {
+    fn probe_pixel(params: &BsdfParams, steps: Steps) -> DVec3 {
         let pixel = ORTHO_SCALE / 16.0;
         let x_step = pixel / VIEW_THETA.cos();
         let mut total = DVec3::ZERO;
@@ -412,14 +925,14 @@ mod single_bounce_tests {
             for j in 0..4 {
                 let x = (f64::from(i) - 3.5) * x_step;
                 let y = (f64::from(j) - 3.5) * pixel;
-                total += 2.0 * receiver_integral(params, x, y);
+                total += 2.0 * receiver_integral(params, x, y, steps);
             }
         }
         total / 64.0
     }
 
     /// Single-bounce integral at the receiver `(x, y, 0)`.
-    fn receiver_integral(params: &BsdfParams, x: f64, y: f64) -> DVec3 {
+    fn receiver_integral(params: &BsdfParams, x: f64, y: f64, steps: Steps) -> DVec3 {
         let normal = DVec3::Z;
         let view = DVec3::new(VIEW_THETA.sin(), 0.0, VIEW_THETA.cos());
         let centre = LIGHT_DISTANCE * DVec3::new(-VIEW_THETA.sin(), 0.0, VIEW_THETA.cos());
@@ -428,25 +941,26 @@ mod single_bounce_tests {
         let w = toward_receiver.cross(u);
         let receiver = DVec3::new(x, y, 0.0);
         let radiance = POWER / (std::f64::consts::PI * std::f64::consts::PI * RADIUS * RADIUS);
-        let h = 2.0 / GRID as f64;
         let mut total = DVec3::ZERO;
-        for i in 0..GRID {
-            for j in 0..GRID {
-                let a = (i as f64 + 0.5) * h - 1.0;
-                let b = (j as f64 + 0.5) * h - 1.0;
-                if a * a + b * b > 1.0 {
-                    continue;
-                }
+        for i in 0..steps.radial {
+            // Midpoint in radius, with the disk's area element r·dr·dφ.
+            let r = (i as f64 + 0.5) / steps.radial as f64;
+            for j in 0..steps.angular {
+                let phi = (j as f64 + 0.5) / steps.angular as f64 * std::f64::consts::TAU;
+                let (a, b) = (r * phi.cos(), r * phi.sin());
                 let point = centre + RADIUS * (a * u + b * w);
                 let offset = point - receiver;
                 let distance = offset.length();
                 let direction = offset / distance;
                 let cos_receiver = direction.dot(normal).max(0.0);
                 let cos_emitter = (-direction).dot(toward_receiver).max(0.0);
-                let weight = RADIUS * RADIUS * h * h * cos_emitter / (distance * distance)
-                    * radiance
-                    * cos_receiver;
-                total += evaluate(params, normal, view, direction) * weight;
+                let area = r
+                    * (1.0 / steps.radial as f64)
+                    * (std::f64::consts::TAU / steps.angular as f64)
+                    * RADIUS
+                    * RADIUS;
+                let weight = area * cos_emitter / (distance * distance) * radiance * cos_receiver;
+                total += evaluate(params, &layers(params, normal, view), direction) * weight;
             }
         }
         total
@@ -463,7 +977,17 @@ mod single_bounce_tests {
     }
 
     fn assert_matches_oracle(name: &str, params: &BsdfParams, mean: [f64; 3], stderr: [f64; 3]) {
-        let potter = probe_pixel(params);
+        assert_matches_oracle_at(name, params, mean, stderr, COARSE);
+    }
+
+    fn assert_matches_oracle_at(
+        name: &str,
+        params: &BsdfParams,
+        mean: [f64; 3],
+        stderr: [f64; 3],
+        steps: Steps,
+    ) {
+        let potter = probe_pixel(params, steps);
         for channel in 0..3 {
             let tolerance = 4.0 * stderr[channel];
             assert!(
@@ -536,6 +1060,114 @@ mod single_bounce_tests {
             &params,
             [6.313_597_380_649_298; 3],
             [9.449_430_068_234_293e-4; 3],
+        );
+    }
+
+    /// Coat alone: the base diffuse is black and Specular IOR Level 0 removes the base dielectric
+    /// layer, so the pixel is the coat's own single-bounce integral (`coat_r024`). Its mean equals
+    /// the `spec_only_r024` oracle, as the same GGX dielectric layer with IOR 1.5 would give.
+    #[test]
+    fn single_bounce_coat_r024_matches_blender() {
+        let mut params = native([0.0, 0.0, 0.0, 1.0], 0.0);
+        params.specular_ior_level = 0.0;
+        params.coat_weight = 1.0;
+        params.coat_roughness = 0.24;
+        params.coat_ior = 1.5;
+        assert_matches_oracle_at(
+            "coat_r024",
+            &params,
+            [3.192_535_599_227_994_7; 3],
+            [3.107_007_194_890_755e-4; 3],
+            FINE,
+        );
+    }
+
+    /// A tinted coat over a white diffuse base: the diffuse and the default dielectric layer are
+    /// attenuated by the coat's albedo and tint (`coat_tint_diffuse`).
+    #[test]
+    fn single_bounce_coat_tinted_over_diffuse_matches_blender() {
+        let mut params = native([0.8, 0.8, 0.8, 1.0], 0.0);
+        params.roughness = 0.5;
+        params.coat_weight = 0.5;
+        params.coat_roughness = 0.1;
+        params.coat_ior = 1.5;
+        params.coat_tint = [1.0, 0.5, 0.25];
+        assert_matches_oracle_at(
+            "coat_tint_diffuse",
+            &params,
+            [
+                5.929_943_926_632_404,
+                4.795_929_251_704_365,
+                4.279_176_461_044_699,
+            ],
+            [
+                8.170_508_334_674_762e-4,
+                8.176_943_583_903_099e-4,
+                8.181_972_915_078_506e-4,
+            ],
+            FINE,
+        );
+    }
+
+    /// Sheen alone: the base diffuse is black and Specular IOR Level 0 removes the dielectric layer,
+    /// so the sheen lobe is the only term (`sheen_only`).
+    fn sheen_only(weight: f64, roughness: f64, tint: [f64; 3]) -> BsdfParams {
+        let mut params = native([0.0, 0.0, 0.0, 1.0], 0.0);
+        params.specular_ior_level = 0.0;
+        params.sheen_weight = weight;
+        params.sheen_roughness = roughness;
+        params.sheen_tint = tint;
+        params
+    }
+
+    #[test]
+    fn single_bounce_sheen_r050_matches_blender() {
+        assert_matches_oracle_at(
+            "sheen_r050",
+            &sheen_only(1.0, 0.5, [1.0; 3]),
+            [0.178_175_499_328_062_87; 3],
+            [5.081_926_241_668_168e-6; 3],
+            FINE,
+        );
+    }
+
+    #[test]
+    fn single_bounce_sheen_tinted_r030_matches_blender() {
+        assert_matches_oracle_at(
+            "sheen_r030_tint",
+            &sheen_only(0.6, 0.3, [1.0, 0.5, 0.25]),
+            [
+                4.087_217_123_924_347e-3,
+                2.043_608_561_962_173_6e-3,
+                1.021_804_280_981_086_8e-3,
+            ],
+            [
+                2.675_749_113_963_379_7e-7,
+                1.337_874_556_981_689_9e-7,
+                6.689_372_784_908_449e-8,
+            ],
+            FINE,
+        );
+    }
+
+    /// Sheen over a white base with the default specular layer: the sheen's layering attenuates the
+    /// diffuse and the dielectric lobes, as Cycles layers it (`sheen_r050_base08`).
+    #[test]
+    fn single_bounce_sheen_over_white_base_matches_blender() {
+        let mut params = native([0.8, 0.8, 0.8, 1.0], 0.0);
+        params.roughness = 0.24;
+        params.sheen_weight = 1.0;
+        params.sheen_roughness = 0.5;
+        params.sheen_tint = [1.0; 3];
+        assert_matches_oracle_at(
+            "sheen_r050_base08",
+            &params,
+            [6.065_270_029_474_05; 3],
+            [7.655_433_604_088_337e-4; 3],
+            // Measured on the sheen lobe alone at roughness 0.5 against a 1024² reference: COARSE is
+            // 4.8e-5 off and FINE 5.0e-5. The test sums the diffuse and specular lobes too, which the
+            // quadrature checks did not cover, so this is an assumption checked by the run.
+            COARSE,
         );
     }
 }
