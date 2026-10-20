@@ -3536,11 +3536,13 @@ mod tests {
             target,
         );
         let result = shrinkwrap(&source, &modifier).unwrap();
+        // Blender stores UV sphere vertices as f32: its own radius-1 sphere output is off by up to
+        // 1.22e-6 (`tests/fixtures/primitive_uvs/primitive_uv_oracle.json`, `uv_sphere_default`).
         assert!(
             result
                 .vertices
                 .iter()
-                .all(|vertex| (vertex.co.length() - 1.0).abs() < 1.0e-8)
+                .all(|vertex| (vertex.co.length() - 1.0).abs() < 2.0e-6)
         );
     }
 

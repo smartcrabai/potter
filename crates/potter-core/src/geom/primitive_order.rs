@@ -1,11 +1,11 @@
-//! Blender's BMesh element order for the mesh primitives.
+//! Blender's `BMesh` element order for the mesh primitives.
 //!
 //! References (Blender 5.2.2): `bmesh/operators/bmo_primitive.cc` (`bmo_create_grid_exec`,
 //! `bmo_create_circle_exec`, `bmo_create_cone_exec`, `bmo_create_cube_exec`) and
 //! `bmesh/intern/bmesh_construct.cc` (`BM_edges_from_verts_ensure`, reached through
 //! `BM_face_create_verts` with `create_edges`).
 //!
-//! BMesh appends each vertex, edge and face in creation order, and a face creates its missing
+//! `BMesh` appends each vertex, edge and face in creation order, and a face creates its missing
 //! boundary edges closing edge first. The operators also delete temporary elements after building
 //! (cap centres, fan spokes, collapsed apex vertices, dissolved cap fans). The builders here replay
 //! the creation sequence and then apply those deletions, so survivors keep their creation order.
@@ -385,7 +385,7 @@ fn assemble_cone(
     result.into_mesh()
 }
 
-/// Polygons built face by face in BMesh order (`BM_face_create_verts` with `create_edges`), for
+/// Polygons built face by face in `BMesh` order (`BM_face_create_verts` with `create_edges`), for
 /// primitives whose edges follow their faces: the closing edge of each face is created first.
 pub(super) fn polygons(positions: Vec<DVec3>, polygons: &[Vec<usize>]) -> Result<Mesh, MeshError> {
     let mut elements = Elements::default();
