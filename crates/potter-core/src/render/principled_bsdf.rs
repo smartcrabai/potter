@@ -33,16 +33,17 @@ use super::principled_tables::{
     ggx_glass_energy_average, ggx_glass_inverse_energy, ggx_glass_inverse_energy_average,
     sheen_ltc,
 };
-use crate::shader::{BsdfParams, dielectric_f0};
+use super::subsurface::{burley_active, burley_radius, channel_mask};
 
 /// Roughness floor shared with the sampler; Cycles treats roughness below ~1e-5 as delta.
 const MIN_ROUGHNESS: f64 = 0.02;
 
 /// Selection probabilities of the sampling branches, identical to the thresholds `path.rs` uses to
-/// pick a branch: transmission, diffuse, sheen, coat, specular.
+/// pick a branch: subsurface, diffuse, sheen, coat, specular, transmission.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct LobeProbabilities {
     pub(crate) diffuse: f64,
+    pub(crate) subsurface: f64,
     pub(crate) sheen: f64,
     pub(crate) coat: f64,
     pub(crate) specular: f64,
@@ -52,7 +53,28 @@ pub(crate) struct LobeProbabilities {
 pub(crate) fn lobe_probabilities(params: &BsdfParams, layers: &Layers) -> LobeProbabilities {
     let metallic = params.metallic.clamp(0.0, 1.0);
     let transmission = params.transmission.clamp(0.0, 1.0);
-    let diffuse_weight = ((1.0 - metallic) * (1.0 - transmission)).max(0.0);
+    // The Burley subsurface closure takes its Subsurface Weight from the diffuse share (Cycles' diffuse weight is
+    // `base × (1 - subsurface weight) × weight`, `svm/closure.h`).
+    let subsurface_share = if burley_active(params) {
+        params.subsurface_weight.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let diffuse_weight =
+        ((1.0 - metallic) * (1.0 - transmission) * (1.0 - subsurface_share)).max(0.0);
+    // The subsurface closure's sample weight is its mean channel weight times the channels it covers
+    // (`bssrdf_setup`, `sample_weight = |average(weight)| * channels`).
+    let covered_channels = channel_mask(burley_radius(params))
+        .iter()
+        .filter(|&&on| on)
+        .count() as f64;
+    let subsurface_weight =
+        subsurface_closure_weight(params, layers.normal, layers.view, layers.lower).element_sum()
+            / 3.0
+            * covered_channels;
+    // Each layer's selection weight is its layering albedo: Cycles' sample weight of the closure.
+    let sheen_weight = layers.sheen.selection_weight();
+    let coat_weight = layers.coat.map_or(0.0, |coat| coat.albedo);
     // The glass closure is weighted `(1 - metallic) · transmission`: Cycles takes the metallic weight
     // first (`kernel/svm/closure.h`). A view below the surface has no glass lobe.
     let glass_weight = if layers.glass.is_some() {
@@ -60,9 +82,6 @@ pub(crate) fn lobe_probabilities(params: &BsdfParams, layers: &Layers) -> LobePr
     } else {
         0.0
     };
-    // Each layer's selection weight is its layering albedo: Cycles' sample weight of the closure.
-    let sheen_weight = layers.sheen.selection_weight();
-    let coat_weight = layers.coat.map_or(0.0, |coat| coat.albedo);
     // The dielectric specular layer is weighted `(1 - metallic) · (1 - transmission)`, as `specular_lobe`
     // evaluates it.
     let specular_weight = (metallic
@@ -70,9 +89,15 @@ pub(crate) fn lobe_probabilities(params: &BsdfParams, layers: &Layers) -> LobePr
             * (1.0 - metallic)
             * (1.0 - transmission))
         .max(1.0e-4);
-    let total = diffuse_weight + sheen_weight + coat_weight + glass_weight + specular_weight;
+    let total = diffuse_weight
+        + subsurface_weight
+        + sheen_weight
+        + coat_weight
+        + glass_weight
+        + specular_weight;
     LobeProbabilities {
         diffuse: diffuse_weight / total,
+        subsurface: subsurface_weight / total,
         sheen: sheen_weight / total,
         coat: coat_weight / total,
         specular: specular_weight / total,
@@ -113,24 +138,30 @@ fn half_vector_pdf(normal: DVec3, roughness: f64, view: DVec3, light: DVec3) -> 
     pdf_half / (4.0 * v_dot_h).max(1.0e-8)
 }
 
-/// Diffuse lobe of the Principled BSDF: Lambert under the dielectric-layering weight, times
-/// reflectance. It depends on the view only (the layering albedo is view-dependent), so an area
-/// light can be integrated against it analytically.
+/// Diffuse lobe of the Principled BSDF: Lambert under the dielectric-layering weight, times reflectance, less the
+/// share the subsurface closure takes. The raster preview has no subsurface closure, so it shades the lobe without
+/// that share (the realtime gap); the path tracer uses `evaluate`, which keeps it.
 pub(crate) fn diffuse_coefficient(params: &BsdfParams, layers: &Layers) -> DVec3 {
-    diffuse_lobe(params, layers.normal, layers.view, layers.lower)
+    let without_subsurface = BsdfParams {
+        subsurface_weight: 0.0,
+        ..*params
+    };
+    diffuse_lobe(
+        &without_subsurface,
+        layers.normal,
+        layers.view,
+        layers.lower,
+    )
 }
 
-/// The diffuse lobe, given the coat's lower-layer factor (set up once by the caller).
-fn diffuse_lobe(params: &BsdfParams, normal: DVec3, view: DVec3, lower: DVec3) -> DVec3 {
+/// The Lambert weight of the dielectric-layered diffuse lobe, before the 1/π and the albedo (Cycles' diffuse weight).
+fn diffuse_layer_weight(params: &BsdfParams, normal: DVec3, view: DVec3) -> f64 {
     let n_dot_v = normal.dot(view).max(0.0);
-    if n_dot_v <= 0.0 {
-        return DVec3::ZERO;
-    }
     let roughness = params.roughness.clamp(MIN_ROUGHNESS, 1.0);
     let metallic = params.metallic.clamp(0.0, 1.0);
     let transmission = params.transmission.clamp(0.0, 1.0);
     let dielectric_weight = ((1.0 - metallic) * (1.0 - transmission)).max(0.0);
-    let diffuse_weight = match specular_layer(params) {
+    match specular_layer(params) {
         Some(layer) => {
             let z = ((layer.eta - 1.0) / (layer.eta + 1.0)).abs().sqrt();
             let albedo_remap = ggx_gen_schlick_ior_s(roughness, n_dot_v, z);
@@ -140,8 +171,56 @@ fn diffuse_lobe(params: &BsdfParams, normal: DVec3, view: DVec3, lower: DVec3) -
             layered_diffuse_weight(dielectric_weight, darkened.max_element())
         }
         None => dielectric_weight,
-    };
-    diffuse_albedo(params) * (diffuse_weight / PI) * params.reflectance.clamp(0.0, 1.0) * lower
+    }
+}
+
+/// The per-channel share of the diffuse base that the Burley subsurface closure leaves to diffuse: `1 - Subsurface
+/// Weight` on the channels with a radius, and `1` on the others, which fall back to diffuse (`bssrdf_setup`).
+fn subsurface_share(params: &BsdfParams) -> DVec3 {
+    if !burley_active(params) {
+        return DVec3::ONE;
+    }
+    let sss = params.subsurface_weight.clamp(0.0, 1.0);
+    let mask = channel_mask(burley_radius(params));
+    DVec3::from_array(std::array::from_fn(|channel| {
+        if mask[channel] { 1.0 - sss } else { 1.0 }
+    }))
+}
+
+/// The Burley subsurface closure's weight per channel, `clamped base × subsurface weight × diffuse layer weight ×
+/// reflectance × lower`, zero on channels without a radius (Cycles' `closure_weight` of the BSSRDF, `svm/closure.h`).
+/// It is the weight the path tracer divides by the branch's probability to enter the surface.
+pub(crate) fn subsurface_closure_weight(
+    params: &BsdfParams,
+    normal: DVec3,
+    view: DVec3,
+    lower: DVec3,
+) -> DVec3 {
+    if !burley_active(params) || normal.dot(view) <= 0.0 {
+        return DVec3::ZERO;
+    }
+    let mask = channel_mask(burley_radius(params));
+    let covered = DVec3::from_array(mask.map(|on| if on { 1.0 } else { 0.0 }));
+    base_color(params)
+        * covered
+        * (params.subsurface_weight.clamp(0.0, 1.0)
+            * diffuse_layer_weight(params, normal, view)
+            * params.reflectance.clamp(0.0, 1.0))
+        * lower
+}
+
+/// The diffuse lobe, given the coat's lower-layer factor (set up once by the caller).
+fn diffuse_lobe(params: &BsdfParams, normal: DVec3, view: DVec3, lower: DVec3) -> DVec3 {
+    let n_dot_v = normal.dot(view).max(0.0);
+    if n_dot_v <= 0.0 {
+        return DVec3::ZERO;
+    }
+    let weight = diffuse_layer_weight(params, normal, view);
+    diffuse_albedo(params)
+        * subsurface_share(params)
+        * (weight / PI)
+        * params.reflectance.clamp(0.0, 1.0)
+        * lower
 }
 
 /// Specular (dielectric and metallic) lobes along `light`, times reflectance. Zero when the

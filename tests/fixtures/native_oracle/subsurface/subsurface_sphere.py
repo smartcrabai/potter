@@ -2,7 +2,7 @@
 Cycles (v5.2.2), one render per (method, subsurface weight) case.
 
 A unit sphere with a Principled BSDF (Base Color (0.8, 0.2, 0.1), Roughness 0.5, IOR 1.4, Subsurface Radius
-(1.0, 0.2, 0.1) with Subsurface Scale 0.1, Subsurface Anisotropy 0) sits on the origin in an empty black world.
+(1.0, 0.2, 0.1) with Subsurface Scale 6.0, Subsurface Anisotropy 0) sits on the origin in an empty black world.
 A point light and a disk light (radius 0.75) sit above and in front of it; an orthographic camera looks along +Y.
 `max_bounces` is 8 so the subsurface walk has room. Each case renders eight seeds at SAMPLES samples per pixel and
 writes the whole-frame mean RGB per seed, so the Potter test can take the seed-to-seed spread as the Monte Carlo
@@ -11,7 +11,8 @@ error.
 Cases: every subsurface method (burley, random_walk, random_walk_skin, random_walk_legacy) with Subsurface Weight
 1.0, and random_walk with Subsurface Weight 0.0 (no subsurface: the reference for the subsurface effect).
 
-Arguments after `--`: blend_out, json_out.
+Arguments after `--`: blend_out, json_out, and optionally a case name (burley, random_walk, random_walk_skin,
+random_walk_legacy, no_subsurface).
 """
 
 import json
@@ -23,6 +24,8 @@ import bpy
 from mathutils import Vector
 
 blend_out, json_out = sys.argv[sys.argv.index("--") + 1:][:2]
+# An optional case name renders that case alone (the Potter test runs the Burley case); no name renders every case.
+CASE = sys.argv[sys.argv.index("--") + 3:][:1]
 SEEDS = list(range(8))
 RESOLUTION = 16
 SAMPLES = 256
@@ -41,6 +44,11 @@ CASES = [
     ("random_walk_legacy", "RANDOM_WALK_LEGACY", 1.0),
     ("no_subsurface", "RANDOM_WALK", 0.0),
 ]
+
+
+CASES = [case for case in CASES if not CASE or case[0] == CASE[0]]
+if not CASES:
+    raise SystemExit(f"unknown case {CASE}")
 
 
 def aim(obj, target):
@@ -81,7 +89,7 @@ shader.inputs["Metallic"].default_value = 0.0
 shader.inputs["Roughness"].default_value = 0.5
 shader.inputs["IOR"].default_value = 1.4
 shader.inputs["Subsurface Radius"].default_value = (1.0, 0.2, 0.1)
-shader.inputs["Subsurface Scale"].default_value = 0.1
+shader.inputs["Subsurface Scale"].default_value = 6.0
 shader.inputs["Subsurface Anisotropy"].default_value = 0.0
 sphere.data.materials.append(material)
 
@@ -110,6 +118,9 @@ camera.location = CAMERA
 aim(camera, (0.0, 0.0, 0.0))
 scene.camera = camera
 
+# The saved file carries the first selected case's method and weight, so an import reproduces that case.
+shader.subsurface_method = CASES[0][1]
+shader.inputs["Subsurface Weight"].default_value = CASES[0][2]
 bpy.ops.wm.save_as_mainfile(filepath=blend_out)
 
 work = tempfile.mkdtemp()

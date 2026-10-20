@@ -16,7 +16,11 @@ use crate::{
 
 use super::principled_bsdf::{
     GlassSample, Layers, continuous_density, evaluate as evaluate_bsdf, layers, lobe_probabilities,
-    sample_glass,
+    sample_glass, subsurface_closure_weight,
+};
+use super::subsurface::{
+    burley_radius, channel_mask, eval as burley_eval, exit_params, pdf_mean, pick_channel,
+    sample_radius,
 };
 use super::{
     bvh::{Bvh, BvhHit},
@@ -839,8 +843,16 @@ fn trace_path(
     // Set by the pass that reaches the cap: the next surface is shaded for emission and ends the
     // path (`PATH_RAY_TERMINATE_ON_NEXT_SURFACE`, `integrate_surface_terminate`).
     let mut terminate_on_next_surface = false;
+    // A Burley exit replaces the next closest hit: the probe's hit is shaded as the exit (`exit_hit`), and the exit is a
+    // diffuse surface (`exit_pending`). `diffuse_ancestor` disables the Burley closure after a diffuse bounce.
+    let mut exit_hit: Option<BvhHit> = None;
+    let mut exit_pending = false;
+    let mut diffuse_ancestor = false;
     loop {
-        let hit = closest_hit(geometry, bvh, origin, direction, RAY_EPSILON, f64::INFINITY);
+        let hit = match exit_hit.take() {
+            Some(exit) => Some(exit),
+            None => closest_hit(geometry, bvh, origin, direction, RAY_EPSILON, f64::INFINITY),
+        };
         let surface_distance = hit.map_or(f64::INFINITY, |hit| hit.distance);
         // Camera rays do not see lights, and a volume scatter is light-sampled only. A surface
         // vertex's light hit needs its light sample as MIS partner, which a volume scatter on the
@@ -923,7 +935,7 @@ fn trace_path(
             escaped = true;
             break;
         };
-        let surface = make_surface(
+        let mut surface = make_surface(
             doc,
             snapshot,
             geometry,
@@ -933,6 +945,14 @@ fn trace_path(
             images,
             evaluator_workspace,
         )?;
+        if std::mem::take(&mut exit_pending) {
+            // The exit of a Burley entry is a diffuse surface (`subsurface_shader_data_setup`), not its material.
+            surface.params = exit_params(surface.params);
+            surface.layers = layers(&surface.params, surface.normal, -direction);
+        } else if diffuse_ancestor {
+            // A Burley closure falls back to diffuse after a diffuse bounce (Cycles' `PATH_RAY_DIFFUSE_ANCESTOR`).
+            surface.params.subsurface_weight = 0.0;
+        }
         if surface.params.has_medium()
             && let Some(boundary) = closest_hit(
                 geometry,
@@ -1008,17 +1028,35 @@ fn trace_path(
         if bounce == max_bounces {
             break;
         }
-        let (next_direction, weight) = match sample_bsdf(
+        let sampled = sample_bsdf(
             &surface.params,
             &surface.layers,
             surface.geometric_normal,
             rng,
-        ) {
+        );
+        if let BsdfSample::Subsurface { weight: entry } = sampled {
+            // The path enters the surface and leaves at a probed exit, which is shaded as diffuse next (Cycles'
+            // `subsurface_bounce` and `subsurface_scatter`). The entry is one bounce; the probe is no light's path.
+            let Some(exit) = burley_exit(geometry, bvh, &surface, rng) else {
+                break;
+            };
+            throughput *= entry * exit.weight;
+            bounce += 1;
+            origin = exit.origin;
+            direction = exit.direction;
+            exit_hit = Some(exit.hit);
+            exit_pending = true;
+            previous = Scatter::Camera;
+            continue;
+        }
+        let (next_direction, weight) = match sampled {
             BsdfSample::Continuous {
                 direction,
                 weight,
                 pdf,
+                diffuse,
             } => {
+                diffuse_ancestor |= diffuse;
                 previous = Scatter::Surface(MisVertex {
                     bsdf_pdf: pdf,
                     normal: surface.normal,
@@ -1030,8 +1068,8 @@ fn trace_path(
                 previous = Scatter::Delta(surface.point);
                 (direction, weight)
             }
-            // Cycles' `LABEL_NONE`: a rejected draw ends the path.
-            BsdfSample::Absorbed => break,
+            // Cycles' `LABEL_NONE`: a rejected draw ends the path. A subsurface draw was handled above.
+            BsdfSample::Absorbed | BsdfSample::Subsurface { .. } => break,
         };
         if !next_direction.is_finite() || !weight.is_finite() {
             break;
@@ -2207,17 +2245,23 @@ enum Scatter {
     Volume,
 }
 
-/// Outcome of sampling the Principled BSDF. `Continuous` carries the exact lobe-mixture density that MIS
-/// needs. `Delta` is a singular glass reflection or refraction, which light sampling cannot reach.
+/// Outcome of sampling the Principled BSDF. `Continuous` carries the exact lobe-mixture density that MIS needs, and
+/// whether it is the diffuse branch (a Burley subsurface closure falls back to diffuse after one). `Delta` is a
+/// singular glass reflection or refraction, which light sampling cannot reach. `Subsurface` enters the surface through
+/// the Burley profile; its weight is the closure's over the branch probability, and the path leaves at a probed exit.
 /// `Absorbed` is a draw Cycles rejects (`LABEL_NONE`), so the path ends.
 enum BsdfSample {
     Continuous {
         direction: DVec3,
         weight: DVec3,
         pdf: f64,
+        diffuse: bool,
     },
     Delta {
         direction: DVec3,
+        weight: DVec3,
+    },
+    Subsurface {
         weight: DVec3,
     },
     Absorbed,
@@ -2233,21 +2277,29 @@ fn sample_bsdf(
     let view = layers.view;
     let probabilities = lobe_probabilities(params, layers);
     let choice = rng.next_f64();
-    if choice < probabilities.transmission {
+    if choice < probabilities.subsurface {
+        let weight = subsurface_closure_weight(params, normal, view, layers.lower)
+            / probabilities.subsurface.max(1.0e-8);
+        return BsdfSample::Subsurface { weight };
+    }
+    let transmission_end = probabilities.subsurface + probabilities.transmission;
+    if choice < transmission_end {
         let rands = [rng.next_f64(), rng.next_f64(), rng.next_f64()];
         let glass = sample_glass(params, layers, geometric, probabilities.transmission, rands);
         return match glass {
             GlassSample::Absorbed => BsdfSample::Absorbed,
             GlassSample::Singular { direction, weight } => BsdfSample::Delta { direction, weight },
-            GlassSample::Rough { direction } => continuous_sample(params, layers, direction),
+            GlassSample::Rough { direction } => continuous_sample(params, layers, direction, false),
         };
     }
-    let diffuse_end = probabilities.transmission + probabilities.diffuse;
+    let diffuse_end = transmission_end + probabilities.diffuse;
     let sheen_end = diffuse_end + probabilities.sheen;
     let coat_end = sheen_end + probabilities.coat;
-    let direction = if choice < diffuse_end {
-        sample_cosine_hemisphere(normal, rng).0
-    } else if choice < sheen_end {
+    if choice < diffuse_end {
+        let direction = sample_cosine_hemisphere(normal, rng).0;
+        return continuous_sample(params, layers, direction, true);
+    }
+    let direction = if choice < sheen_end {
         let first = rng.next_f64();
         let second = rng.next_f64();
         layers.sample_sheen(first, second)
@@ -2259,12 +2311,17 @@ fn sample_bsdf(
         let half_vector = sample_ggx_half(normal, params.roughness, rng);
         reflect(-view, half_vector).normalize_or_zero()
     };
-    continuous_sample(params, layers, direction)
+    continuous_sample(params, layers, direction, false)
 }
 
 /// The estimator `f cos / p_mix` of a continuous direction. The density is the lobe mixture, not the
 /// branch's own lobe, and `|cos|` admits the glass lobe's transmission below the surface.
-fn continuous_sample(params: &BsdfParams, layers: &Layers, direction: DVec3) -> BsdfSample {
+fn continuous_sample(
+    params: &BsdfParams,
+    layers: &Layers,
+    direction: DVec3,
+    diffuse: bool,
+) -> BsdfSample {
     let pdf = continuous_density(params, layers, direction);
     let cosine = layers.normal.dot(direction).abs();
     let weight = evaluate_bsdf(params, layers, direction) * (cosine / pdf.max(1.0e-8));
@@ -2272,7 +2329,136 @@ fn continuous_sample(params: &BsdfParams, layers: &Layers, direction: DVec3) -> 
         direction,
         weight,
         pdf,
+        diffuse,
     }
+}
+
+/// A Burley subsurface exit: the ray it leaves along, the hit it leaves at, and the exit's weight relative to the
+/// entry (Cycles' `subsurface_disk` with its resampled weight).
+struct BurleyExit {
+    origin: DVec3,
+    direction: DVec3,
+    hit: BvhHit,
+    weight: DVec3,
+}
+
+/// Probes the object of `surface` for the exit of the Burley profile, as Cycles' `subsurface_disk` does: a disk
+/// sample of the profile on one of the three axes of the surface, a ray through the object along that axis, and an
+/// importance resample among every hit of the ray on the object. Cycles caps the hits at `BSSRDF_MAX_HITS` with a
+/// random subset; Potter keeps them all, which has the same expectation.
+fn burley_exit(
+    geometry: &Geometry,
+    bvh: &Bvh,
+    surface: &Surface,
+    rng: &mut Pcg32,
+) -> Option<BurleyExit> {
+    let radius = burley_radius(&surface.params);
+    let mask = channel_mask(radius);
+    // One draw picks the channel and, remapped, the radius (`bssrdf_sample`).
+    let (channel, xi_radius) = pick_channel(mask, rng.next_f64())?;
+    let mean_free_path = radius.to_array()[channel];
+    let (disk_radius, height) = sample_radius(mean_free_path, xi_radius);
+    // The second draw picks the disk's axis and phase (`subsurface_disk`).
+    let axis_draw = rng.next_f64();
+    let normal = surface.geometric_normal;
+    let (tangent, bitangent) = basis(normal);
+    // The normal axis is probed with half the probability, the others with a quarter each.
+    let (disk_normal, disk_tangent, disk_bitangent, pick_pdf, phase_draw) = if axis_draw < 0.5 {
+        (
+            normal,
+            tangent,
+            bitangent,
+            [0.5, 0.25, 0.25],
+            axis_draw * 2.0,
+        )
+    } else if axis_draw < 0.75 {
+        (
+            tangent,
+            normal,
+            bitangent,
+            [0.25, 0.5, 0.25],
+            (axis_draw - 0.5) * 4.0,
+        )
+    } else {
+        (
+            bitangent,
+            tangent,
+            normal,
+            [0.25, 0.25, 0.5],
+            (axis_draw - 0.75) * 4.0,
+        )
+    };
+    let phase = std::f64::consts::TAU * phase_draw;
+    let disk_point =
+        (disk_radius * phase.cos()) * disk_tangent + (disk_radius * phase.sin()) * disk_bitangent;
+    let origin = surface.point + disk_normal * height + disk_point;
+    let direction = -disk_normal;
+    let mut found: Vec<(BvhHit, DVec3)> = Vec::new();
+    bvh.walk_hits(
+        &geometry.triangles,
+        origin,
+        direction,
+        RAY_EPSILON,
+        2.0 * height,
+        |hit, from| {
+            if geometry
+                .triangles
+                .get(hit.triangle_index)
+                .is_some_and(|triangle| triangle.object_index == surface.object_index)
+            {
+                found.push((hit, from));
+            }
+            true
+        },
+    );
+    let disk_pdf = pdf_mean(radius, mask, disk_radius);
+    if disk_pdf <= 0.0 || found.is_empty() {
+        return None;
+    }
+    let mut weighted: Vec<(BvhHit, DVec3, DVec3)> = Vec::with_capacity(found.len());
+    let mut total = 0.0;
+    for (hit, from) in found {
+        let Some(triangle) = geometry.triangles.get(hit.triangle_index) else {
+            continue;
+        };
+        let ng = (triangle.positions[1] - triangle.positions[0])
+            .cross(triangle.positions[2] - triangle.positions[0])
+            .normalize_or_zero();
+        let point = from + direction * hit.distance;
+        let pdf_n = pick_pdf[0] * disk_normal.dot(ng).abs();
+        let pdf_t = pick_pdf[1] * disk_tangent.dot(ng).abs();
+        let pdf_b = pick_pdf[2] * disk_bitangent.dot(ng).abs();
+        // The power-heuristic weight of the normal axis over the three axes (`subsurface_disk`).
+        let denominator = pdf_n * pdf_n + pdf_t * pdf_t + pdf_b * pdf_b;
+        let mis = if denominator > 0.0 {
+            pdf_n / denominator
+        } else {
+            0.0
+        };
+        let distance = (point - surface.point).length();
+        let weight = burley_eval(radius, mask, distance) / disk_pdf * mis;
+        total += weight.abs().element_sum() / 3.0;
+        weighted.push((hit, from, weight));
+    }
+    if total <= 0.0 {
+        return None;
+    }
+    // Importance resampling: one hit, chosen in proportion to its mean weight.
+    let target = rng.next_f64() * total;
+    let mut partial = 0.0;
+    for (hit, from, weight) in weighted {
+        let average = weight.abs().element_sum() / 3.0;
+        partial += average;
+        if average > 0.0 && target < partial {
+            return Some(BurleyExit {
+                origin: from,
+                direction,
+                hit,
+                weight: weight * (total / average),
+            });
+        }
+    }
+    None
 }
 
 /// Density with which a direction is light-sampled at a surface vertex. The cosine strategy is
@@ -3280,7 +3466,7 @@ mod sampling_tests {
                     BsdfSample::Continuous { weight, .. } | BsdfSample::Delta { weight, .. } => {
                         weight
                     }
-                    BsdfSample::Absorbed => DVec3::ZERO,
+                    BsdfSample::Absorbed | BsdfSample::Subsurface { .. } => DVec3::ZERO,
                 };
             sum += weight;
             sum_squares += weight * weight;

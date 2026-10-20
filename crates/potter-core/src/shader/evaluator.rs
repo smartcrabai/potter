@@ -42,7 +42,9 @@ pub(crate) fn unevaluated_principled_inputs(
 ) -> [Option<(&'static str, &'static str)>; 5] {
     [
         (params.subsurface_weight > 0.0)
-            .then_some(("shader.principled.subsurface", "Subsurface Weight")),
+            .then(|| params.subsurface_method.unsupported_feature())
+            .flatten()
+            .map(|feature_id| (feature_id, "Subsurface Weight")),
         (params.anisotropic_ior > 0.0).then_some(("shader.principled.anisotropic", "Anisotropic")),
         (params.thin_film_thickness > 0.0)
             .then_some(("shader.principled.thin_film", "Thin Film Thickness")),
@@ -133,6 +135,58 @@ enum VolumeClosure {
     Absorption,
 }
 
+/// Cycles' subsurface method, the Principled node's `subsurface_method` property (`node_shader_bsdf_principled.cc`,
+/// `CLOSURE_BSSRDF_*_ID`). The default is random walk. `Mixed` marks a Mix or Add of two arms that use different
+/// methods, which Potter's single parameter set cannot hold.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SubsurfaceMethod {
+    Burley,
+    #[default]
+    RandomWalk,
+    RandomWalkSkin,
+    RandomWalkLegacy,
+    Mixed,
+}
+
+impl SubsurfaceMethod {
+    /// The Blender enum identifier of a method, as the node property stores it.
+    pub(crate) fn parse(token: &str) -> Option<Self> {
+        match token {
+            "BURLEY" => Some(Self::Burley),
+            "RANDOM_WALK" => Some(Self::RandomWalk),
+            "RANDOM_WALK_SKIN" => Some(Self::RandomWalkSkin),
+            "RANDOM_WALK_LEGACY" => Some(Self::RandomWalkLegacy),
+            _ => None,
+        }
+    }
+
+    /// The feature id Potter reports for a method it does not evaluate, or `None` for a method it evaluates.
+    pub(crate) fn unsupported_feature(self) -> Option<&'static str> {
+        match self {
+            Self::Burley => None,
+            Self::RandomWalk => Some("shader.principled.subsurface_method.random_walk"),
+            Self::RandomWalkSkin => Some("shader.principled.subsurface_method.random_walk_skin"),
+            Self::RandomWalkLegacy => {
+                Some("shader.principled.subsurface_method.random_walk_legacy")
+            }
+            Self::Mixed => Some("shader.principled.subsurface_method.mixed"),
+        }
+    }
+
+    /// The method of a Mix or Add of two arms: the one method a subsurface arm uses, or `Mixed` when both arms have
+    /// subsurface scattering with different methods. An arm without subsurface scattering takes no part.
+    fn of_arms(first: &BsdfParams, second: &BsdfParams) -> Self {
+        match (
+            first.subsurface_weight > 0.0,
+            second.subsurface_weight > 0.0,
+        ) {
+            (true, true) if first.subsurface_method != second.subsurface_method => Self::Mixed,
+            (false, true) => second.subsurface_method,
+            _ => first.subsurface_method,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BsdfParams {
     pub base_color: [f64; 4],
@@ -161,6 +215,12 @@ pub struct BsdfParams {
     pub subsurface_weight: f64,
     pub subsurface_radius: [f64; 3],
     pub subsurface_scale: f64,
+    /// Cycles' subsurface method (`SubsurfaceMethod`), read from the Principled node's `subsurface_method` property.
+    pub subsurface_method: SubsurfaceMethod,
+    /// The Principled Subsurface IOR, used by the random walk skin method's refractive entry.
+    pub subsurface_ior: f64,
+    /// The Principled Subsurface Anisotropy, the phase function's g of the random walk.
+    pub subsurface_anisotropy: f64,
     pub coat_weight: f64,
     pub coat_roughness: f64,
     pub coat_ior: f64,
@@ -257,8 +317,11 @@ impl BsdfParams {
             transparent_tint: [1.0; 3],
             reflectance: 1.0,
             subsurface_weight: 0.0,
-            subsurface_radius: [1.0; 3],
-            subsurface_scale: 0.05,
+            subsurface_radius: [1.0, 0.2, 0.1],
+            subsurface_scale: 0.005,
+            subsurface_method: SubsurfaceMethod::default(),
+            subsurface_ior: 1.4,
+            subsurface_anisotropy: 0.0,
             coat_weight: 0.0,
             coat_roughness: 0.03,
             coat_ior: 1.5,
@@ -403,6 +466,12 @@ impl BsdfParams {
             subsurface_weight: mix_scalar(first.subsurface_weight, second.subsurface_weight),
             subsurface_radius: mix3(first.subsurface_radius, second.subsurface_radius),
             subsurface_scale: mix_scalar(first.subsurface_scale, second.subsurface_scale),
+            subsurface_method: SubsurfaceMethod::of_arms(&first, &second),
+            subsurface_ior: mix_scalar(first.subsurface_ior, second.subsurface_ior),
+            subsurface_anisotropy: mix_scalar(
+                first.subsurface_anisotropy,
+                second.subsurface_anisotropy,
+            ),
             coat_weight: coat.weight,
             coat_roughness: coat.roughness,
             coat_ior: mix_scalar(first.coat_ior, second.coat_ior),
@@ -480,6 +549,18 @@ impl BsdfParams {
             subsurface_weight: first.subsurface_weight.max(second.subsurface_weight),
             subsurface_radius: add3(first.subsurface_radius, second.subsurface_radius),
             subsurface_scale: first.subsurface_scale.max(second.subsurface_scale),
+            subsurface_method: SubsurfaceMethod::of_arms(&first, &second),
+            // Add has no single IOR or anisotropy for two closures: the arm with the larger subsurface weight gives them.
+            subsurface_ior: if second.subsurface_weight > first.subsurface_weight {
+                second.subsurface_ior
+            } else {
+                first.subsurface_ior
+            },
+            subsurface_anisotropy: if second.subsurface_weight > first.subsurface_weight {
+                second.subsurface_anisotropy
+            } else {
+                first.subsurface_anisotropy
+            },
             coat_weight: coat.weight,
             coat_roughness: coat.roughness,
             coat_ior: first.coat_ior,
@@ -1429,9 +1510,19 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
         params.subsurface_weight =
             self.scalar_input(id, &["Subsurface Weight", "Subsurface"], 0.0)?;
         params.subsurface_radius = self
-            .vector_input(id, &["Subsurface Radius"], DVec3::ONE)?
+            .vector_input(id, &["Subsurface Radius"], DVec3::new(1.0, 0.2, 0.1))?
             .to_array();
-        params.subsurface_scale = self.scalar_input(id, &["Subsurface Scale"], 0.05)?;
+        params.subsurface_scale = self.scalar_input(id, &["Subsurface Scale"], 0.005)?;
+        // Blender's default is random walk; a node without the property (an authored graph) is that default.
+        let method = node
+            .properties
+            .get("subsurface_method")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("RANDOM_WALK");
+        params.subsurface_method = SubsurfaceMethod::parse(method)
+            .ok_or_else(|| invalid(format!("unknown Principled subsurface method `{method}`")))?;
+        params.subsurface_ior = self.scalar_input(id, &["Subsurface IOR"], 1.4)?;
+        params.subsurface_anisotropy = self.scalar_input(id, &["Subsurface Anisotropy"], 0.0)?;
         params.coat_weight = self.scalar_input(id, &["Coat Weight", "Clearcoat"], 0.0)?;
         params.coat_roughness =
             self.scalar_input(id, &["Coat Roughness", "Clearcoat Roughness"], 0.03)?;
