@@ -230,7 +230,15 @@ fn obj_stl_and_ply_round_trips_preserve_vertex_counts_and_bounds() -> Result<(),
             .args(["init", imported.to_str().unwrap(), "--json"])
             .output()?;
         import_replace(&imported, &output_path, format)?;
-        assert_eq!(vertex_count(&imported)?, expected_vertices, "{format}");
+        // Blender's PLY export writes one vertex per unique (vertex, UV) pair (`export_uv` defaults
+        // on), and its importer keeps them (`merge_verts` defaults off). A cube's default UVs give 14
+        // pairs for its 8 vertices (`box_size_2` in the primitive UV oracle). OBJ and STL write 8.
+        let expected = if format == "ply" {
+            14
+        } else {
+            expected_vertices
+        };
+        assert_eq!(vertex_count(&imported)?, expected, "{format}");
         assert_box_bounds(&imported)?;
     }
     Ok(())

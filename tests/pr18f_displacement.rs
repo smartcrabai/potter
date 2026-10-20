@@ -750,7 +750,6 @@ fn displace_texture_uses_named_native_uv_layer() -> Result<(), Box<dyn std::erro
     let operations = [
         json!({"op":"node.create","id":"subject","kind":"plane","params":{"size":2.0}}),
         json!({"op":"texture.create","id":"blend_tex","texture_type":"BLEND","settings":{"progression":"DIAGONAL"}}),
-        json!({"op":"uv.layer_create","target":{"id":"subject"},"name":"UVMap"}),
         json!({"op":"uv.unwrap","target":{"id":"subject"},"method":"box","uv_layer":"UVMap"}),
         json!({"op":"uv.transform","target":{"id":"subject"},"uv_layer":"UVMap","scale":[-0.5,0.5],"translation":[0.5,0.5]}),
         json!({"op":"modifier.create","target":{"id":"subject"},"id":"deform","type":"displace","params":{"direction":"X","strength":1.0,"mid_level":0.5,"texture":"blend_tex","texture_coords":"UV","uv_layer":"UVMap"}}),

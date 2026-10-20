@@ -46,6 +46,7 @@ pub(crate) mod normals;
 pub mod pointcloud;
 pub(crate) mod pool_slots;
 mod primitive_order;
+mod primitive_uv;
 pub(crate) mod provenance;
 pub mod remesh;
 pub mod sculpt;
@@ -820,7 +821,9 @@ impl Mesh {
                 "box dimensions must be finite and positive",
             ));
         }
-        primitive_order::cube(params.size * 0.5)
+        let mut mesh = primitive_order::cube(params.size * 0.5)?;
+        primitive_uv::cube(&mut mesh);
+        Ok(mesh)
     }
 
     /// Create a Blender-default or customized UV sphere in Blender 5.2.2 storage order.
@@ -852,7 +855,9 @@ impl Mesh {
         {
             return Err(MeshError::IdExhausted);
         }
-        uv_sphere::build(params)
+        let mut mesh = uv_sphere::build(params)?;
+        primitive_uv::uv_sphere(&mut mesh);
+        Ok(mesh)
     }
     /// Create a Blender-default or customized capped cylinder.
     ///
@@ -863,13 +868,22 @@ impl Mesh {
         validate_radial_count(params.vertices, "cylinder vertices")?;
         positive(params.radius, "cylinder radius")?;
         positive(params.depth, "cylinder depth")?;
-        primitive_order::cone(
-            params.vertices as usize,
+        let count = params.vertices as usize;
+        let mut mesh = primitive_order::cone(
+            count,
             params.radius,
             params.radius,
             params.depth,
             params.end_fill_type,
-        )
+        )?;
+        primitive_uv::cone(
+            &mut mesh,
+            params.radius,
+            params.radius,
+            count,
+            params.end_fill_type,
+        );
+        Ok(mesh)
     }
 
     /// Create a Blender-default or customized XY plane.
@@ -879,7 +893,9 @@ impl Mesh {
     /// Returns an error when the plane size is not finite and positive.
     pub fn plane(params: PlaneParams) -> Result<Self, MeshError> {
         positive(params.size, "plane size")?;
-        primitive_order::grid(2, 2, params.size, params.size)
+        let mut mesh = primitive_order::grid(2, 2, params.size, params.size)?;
+        primitive_uv::grid(&mut mesh, 1, 1);
+        Ok(mesh)
     }
 
     /// Create a Blender-default or customized cone/truncated cone with capped ends.
@@ -897,13 +913,22 @@ impl Mesh {
                 "at least one cone radius must be positive",
             ));
         }
-        primitive_order::cone(
-            params.vertices as usize,
+        let count = params.vertices as usize;
+        let mut mesh = primitive_order::cone(
+            count,
             params.radius1,
             params.radius2,
             params.depth,
             params.end_fill_type,
-        )
+        )?;
+        primitive_uv::cone(
+            &mut mesh,
+            params.radius2,
+            params.radius1,
+            count,
+            params.end_fill_type,
+        );
+        Ok(mesh)
     }
 
     /// Create a Blender-default or customized torus.
@@ -971,7 +996,9 @@ impl Mesh {
                 ]);
             }
         }
-        primitive_order::torus(positions, &polygons)
+        let mut mesh = primitive_order::torus(positions, &polygons)?;
+        primitive_uv::torus(&mut mesh, major, minor);
+        Ok(mesh)
     }
 
     /// Create a Blender-default or customized recursively subdivided icosphere.
@@ -1036,7 +1063,9 @@ impl Mesh {
         ];
         if params.subdivisions == 1 {
             let polygons: Vec<Vec<usize>> = base_faces.iter().map(|face| face.to_vec()).collect();
-            return primitive_order::polygons(positions, &polygons);
+            let mut mesh = primitive_order::polygons(positions, &polygons)?;
+            primitive_uv::icosphere_level_one(&mut mesh);
+            return Ok(mesh);
         }
 
         // Blender subdivides the original edges once with all cuts for the
@@ -1152,6 +1181,7 @@ impl Mesh {
         }
 
         let face_count = base_faces.len() * (cuts + 1).pow(2);
+        let uv_table = primitive_uv::icosphere_uv_table(&base_faces, &edges, &grids);
         let mut polygons = Vec::with_capacity(face_count);
         let mut retained_faces = Vec::with_capacity(base_faces.len());
         let mut added_faces = Vec::with_capacity(base_faces.len());
@@ -1181,7 +1211,18 @@ impl Mesh {
         for added in added_faces.into_iter().rev() {
             polygons.extend(added);
         }
-        primitive_order::explicit_edges(positions, &edge_pairs, &polygons)
+        // Polygons come retained faces first, then each base face's cut faces last face first; every
+        // polygon's origin is the base face it was cut from.
+        let mut origins: Vec<usize> = (0..base_faces.len()).collect();
+        let cut_faces = (cuts + 1).pow(2) - 1;
+        origins.extend(
+            (0..base_faces.len())
+                .rev()
+                .flat_map(|face| std::iter::repeat_n(face, cut_faces)),
+        );
+        let mut mesh = primitive_order::explicit_edges(positions, &edge_pairs, &polygons)?;
+        primitive_uv::attach_by_origin(&mut mesh, &polygons, &origins, &uv_table)?;
+        Ok(mesh)
     }
 
     /// Create a Blender-default or customized XY circle with optional fill.
@@ -1192,7 +1233,10 @@ impl Mesh {
     pub fn circle(params: CircleParams) -> Result<Self, MeshError> {
         validate_radial_count(params.vertices, "circle vertices")?;
         positive(params.radius, "circle radius")?;
-        primitive_order::circle(params.vertices as usize, params.radius, params.fill_type)
+        let mut mesh =
+            primitive_order::circle(params.vertices as usize, params.radius, params.fill_type)?;
+        primitive_uv::circle(&mut mesh, params.radius);
+        Ok(mesh)
     }
 
     /// Create a Blender-default or customized subdivided XY grid.
@@ -1209,25 +1253,26 @@ impl Mesh {
             ));
         }
         // Vertices, edges and faces each take a u32 ID; refuse before anything is allocated.
-        let (nx, ny) = (
+        let (x, y) = (
             u64::from(params.x_subdivisions),
             u64::from(params.y_subdivisions),
         );
-        let vertices = nx * ny;
-        let edges = nx * (ny - 1) + ny * (nx - 1);
-        let faces = (nx - 1) * (ny - 1);
+        let vertices = x * y;
+        let edges = x * (y - 1) + y * (x - 1);
+        let faces = (x - 1) * (y - 1);
         if [vertices, edges, faces]
             .iter()
             .any(|count| *count > u64::from(u32::MAX))
         {
             return Err(MeshError::IdExhausted);
         }
-        primitive_order::grid(
+        let (nx, ny) = (
             params.x_subdivisions as usize,
             params.y_subdivisions as usize,
-            params.size_x,
-            params.size_y,
-        )
+        );
+        let mut mesh = primitive_order::grid(nx, ny, params.size_x, params.size_y)?;
+        primitive_uv::grid(&mut mesh, nx - 1, ny - 1);
+        Ok(mesh)
     }
 }
 /// Create a Blender-style primitive by lowercase kind and optional JSON parameters.
