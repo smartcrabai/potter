@@ -2587,6 +2587,10 @@ pub struct Material {
     /// Blender's `use_backface_culling` is off for new materials (`MA_BL_CULL_BACKFACE` unset in `DNA_material_types.h`).
     #[serde(default = "default_true")]
     pub double_sided: bool,
+    /// Blender's `use_transparent_shadow` (`MA_BL_TRANSPARENT_SHADOW`, on by default): a transparent surface casts a
+    /// partly transparent shadow, as EEVEE's shadow pass does (`eevee_surf_shadow.bsl.hh`). Off, it casts an opaque one.
+    #[serde(default = "default_true")]
+    pub use_transparent_shadow: bool,
     #[serde(default)]
     pub node_tree: Option<Id>,
     #[serde(default)]
@@ -2627,6 +2631,7 @@ impl Default for Material {
             transmission: 0.0,
             ior: default_ior(),
             double_sided: default_true(),
+            use_transparent_shadow: default_true(),
             node_tree: None,
             base_color_texture: None,
             roughness_texture: None,

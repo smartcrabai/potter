@@ -283,6 +283,7 @@ fn complete_scene_schema(root: &mut Value) {
     defs["node"]["properties"]["kind"]["enum"] =
         json!(["empty", "mesh", "camera", "light", "armature"]);
     let material = &mut defs["material"];
+    material["properties"]["use_transparent_shadow"] = json!({"type":"boolean"});
     material["required"] = json!([
         "name",
         "base_color",
@@ -910,6 +911,7 @@ fn operation_contract(name: &str) -> OperationContract {
                 "metallic",
                 "roughness",
                 "double_sided",
+                "use_transparent_shadow",
                 "emission_color",
                 "emission_strength",
                 "transmission",
@@ -2515,6 +2517,7 @@ fn material_set_properties() -> Value {
         "metallic":{"type":"number","minimum":0,"maximum":1},
         "roughness":{"type":"number","minimum":0,"maximum":1},
         "double_sided":{"type":"boolean"},
+        "use_transparent_shadow":{"type":"boolean"},
         "emission_color":{"type":"array","items":{"type":"number","minimum":0},"minItems":3,"maxItems":3},
         "emission_strength":{"type":"number","minimum":0},
         "transmission":{"type":"number","minimum":0,"maximum":1},

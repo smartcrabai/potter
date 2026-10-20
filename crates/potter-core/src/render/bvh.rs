@@ -115,6 +115,36 @@ impl Bvh {
         self.closest_hit_mode(triangles, origin, direction, t_min, t_max, true)
     }
 
+    /// Walks the surfaces a shadow ray meets, nearest first, while `remaining` is left along it. `visit` receives each
+    /// hit and the origin the ray left from, and returns whether the walk goes on. The ray restarts `epsilon` past each
+    /// hit, and the walk ends when the distance is spent. Returns the origin and the distance where the walk stopped.
+    pub(crate) fn walk_hits(
+        &self,
+        triangles: &[Triangle],
+        mut origin: DVec3,
+        direction: DVec3,
+        epsilon: f64,
+        mut remaining: f64,
+        mut visit: impl FnMut(BvhHit, DVec3) -> bool,
+    ) -> (DVec3, f64) {
+        while let Some(hit) =
+            self.closest_hit_two_sided(triangles, origin, direction, epsilon, remaining)
+        {
+            if !visit(hit, origin) {
+                break;
+            }
+            let advance = hit.distance + epsilon;
+            origin += direction * advance;
+            if remaining.is_finite() {
+                remaining = (remaining - advance).max(0.0);
+                if remaining <= epsilon {
+                    break;
+                }
+            }
+        }
+        (origin, remaining)
+    }
+
     /// Clears `out` and fills it with the index of every primitive whose leaf bounds the ray
     /// `origin + t * direction` (t >= 0) may cross. Every primitive the ray hits is among them.
     pub(crate) fn overlapping(&self, origin: DVec3, direction: DVec3, out: &mut Vec<usize>) {
