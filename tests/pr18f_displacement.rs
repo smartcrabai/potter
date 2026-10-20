@@ -1249,162 +1249,126 @@ fn inline_blend_texture_diagonal_matches_blender() -> Result<(), Box<dyn std::er
     Ok(())
 }
 
+/// Procedural displacement oracles: `fixtures/pr18f_displacement/procedural_oracle.json`, whose
+/// `expected` tables are written by the committed `generate_procedural_oracle.py` (Blender 5.2.2
+/// headless; NATIVE_VALUE_NOISE by its port of Potter's former sampler).
+const PROCEDURAL_ORACLE: &str = include_str!("fixtures/pr18f_displacement/procedural_oracle.json");
+
+struct ProceduralCase {
+    id: String,
+    texture_type: String,
+    settings: Value,
+    direction: String,
+    strength: f64,
+    mid_level: f64,
+    texture_coords: String,
+    expected: [[f64; 3]; 4],
+}
+
+fn plane_rows(value: &Value) -> Result<[[f64; 3]; 4], Box<dyn std::error::Error>> {
+    let rows = value.as_array().ok_or("oracle expected is not an array")?;
+    let rows = rows
+        .iter()
+        .map(|row| -> Result<[f64; 3], Box<dyn std::error::Error>> {
+            let coords = row.as_array().ok_or("oracle row is not an array")?;
+            if coords.len() != 3 {
+                return Err("oracle row is not a 3-vector".into());
+            }
+            let mut out = [0.0; 3];
+            for (slot, value) in out.iter_mut().zip(coords) {
+                *slot = value.as_f64().ok_or("oracle coordinate is not a number")?;
+            }
+            Ok(out)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    rows.try_into()
+        .map_err(|_| "oracle does not hold four plane vertices".into())
+}
+
+/// The oracle cases whose JSON entry satisfies `keep`, in file order.
+fn procedural_cases(
+    keep: impl Fn(&Value) -> bool,
+) -> Result<Vec<ProceduralCase>, Box<dyn std::error::Error>> {
+    let document: Value = serde_json::from_str(PROCEDURAL_ORACLE)?;
+    let mut cases = Vec::new();
+    for case in document["cases"]
+        .as_array()
+        .ok_or("procedural oracle has no cases")?
+    {
+        if !keep(case) {
+            continue;
+        }
+        cases.push(ProceduralCase {
+            id: case["id"]
+                .as_str()
+                .ok_or("oracle id is not a string")?
+                .to_owned(),
+            texture_type: case["texture_type"]
+                .as_str()
+                .ok_or("oracle texture type is not a string")?
+                .to_owned(),
+            settings: case["settings"].clone(),
+            direction: case["direction"]
+                .as_str()
+                .ok_or("oracle direction is not a string")?
+                .to_owned(),
+            strength: case["strength"]
+                .as_f64()
+                .ok_or("oracle strength is not a number")?,
+            mid_level: case["mid_level"]
+                .as_f64()
+                .ok_or("oracle mid_level is not a number")?,
+            texture_coords: case["texture_coords"]
+                .as_str()
+                .ok_or("oracle texture coords is not a string")?
+                .to_owned(),
+            expected: plane_rows(&case["expected"])?,
+        });
+    }
+    Ok(cases)
+}
+
+/// The scene of one oracle case: a size-2 plane, its procedural texture, and one Displace modifier.
+fn procedural_ops(case: &ProceduralCase) -> Vec<Value> {
+    let mut texture =
+        json!({"op":"texture.create","id":"procedural_tex","texture_type":case.texture_type});
+    if case
+        .settings
+        .as_object()
+        .is_some_and(|settings| !settings.is_empty())
+    {
+        texture["settings"] = case.settings.clone();
+    }
+    vec![
+        json!({"op":"node.create","id":"subject","kind":"plane","params":{"size":2.0}}),
+        texture,
+        json!({"op":"modifier.create","target":{"id":"subject"},"id":"deform","type":"displace","params":{"direction":case.direction,"strength":case.strength,"mid_level":case.mid_level,"texture":"procedural_tex","texture_coords":case.texture_coords}}),
+    ]
+}
+
 #[test]
 fn inline_clouds_texture_uses_blender_noise_turbulence() -> Result<(), Box<dyn std::error::Error>> {
-    let operations = [
-        json!({"op":"node.create","id":"subject","kind":"plane","params":{"size":2.0}}),
-        json!({"op":"texture.create","id":"cloud_tex","texture_type":"CLOUDS","settings":{"noise_scale":0.7,"noise_depth":2,"noise_basis":"BLENDER_ORIGINAL","noise_type":"SOFT_NOISE","cloud_type":"GRAYSCALE"}}),
-        json!({"op":"modifier.create","target":{"id":"subject"},"id":"deform","type":"displace","params":{"direction":"X","strength":1.0,"mid_level":0.5,"texture":"cloud_tex","texture_coords":"LOCAL"}}),
-    ];
-    let mesh = scene_subject(&operations, None)?;
-    let expected = [
-        [-0.980_161_905, -1.0, 0.0],
-        [1.006_510_735, -1.0, 0.0],
-        [-1.306_399_941, 1.0, 0.0],
-        [0.890_910_566, 1.0, 0.0],
-    ];
-    assert_plane("inline Clouds texture", &mesh, &expected);
+    let cases = procedural_cases(|case| case["id"] == "inline_clouds_grayscale")?;
+    let case = cases.first().ok_or("missing inline Clouds oracle")?;
+    let mesh = scene_subject(&procedural_ops(case), None)?;
+    assert_plane("inline Clouds texture", &mesh, &case.expected);
     Ok(())
 }
 
 #[test]
 fn legacy_procedural_texture_types_match_blender() -> Result<(), Box<dyn std::error::Error>> {
-    let cases: [(&str, &str, Value, [[f64; 3]; 4]); 7] = [
-        (
-            "wood",
-            "WOOD",
-            json!({"noise_scale":0.7,"turbulence":1.3,"wood_type":"BANDNOISE","noise_basis":"IMPROVED_PERLIN","noise_type":"SOFT_NOISE","noise_basis_2":"TRI"}),
-            [
-                [-0.786_335_468, -1.0, 0.0],
-                [1.388_136_148, -1.0, 0.0],
-                [-0.723_966_121, 1.0, 0.0],
-                [0.876_659_393, 1.0, 0.0],
-            ],
-        ),
-        (
-            "marble",
-            "MARBLE",
-            json!({"noise_scale":0.7,"turbulence":1.7,"noise_depth":3,"noise_type":"HARD_NOISE","marble_type":"SHARP","noise_basis":"ORIGINAL_PERLIN","noise_basis_2":"SAW"}),
-            [
-                [-0.826_449_752, -1.0, 0.0],
-                [0.694_319_665, -1.0, 0.0],
-                [-1.291_079_879, 1.0, 0.0],
-                [1.307_487_249, 1.0, 0.0],
-            ],
-        ),
-        (
-            "magic",
-            "MAGIC",
-            json!({"turbulence":4.0,"noise_depth":3}),
-            [
-                [-0.891_056_001, -1.0, 0.0],
-                [1.002_521_873, -1.0, 0.0],
-                [-0.997_478_127, 1.0, 0.0],
-                [1.099_560_261, 1.0, 0.0],
-            ],
-        ),
-        (
-            "stucci",
-            "STUCCI",
-            json!({"noise_scale":0.7,"turbulence":6.0,"noise_basis":"IMPROVED_PERLIN","noise_type":"HARD_NOISE","stucci_type":"WALL_IN"}),
-            [
-                [-0.890_909_791, -1.0, 0.0],
-                [0.956_595_302, -1.0, 0.0],
-                [-1.417_513_132, 1.0, 0.0],
-                [0.742_240_787, 1.0, 0.0],
-            ],
-        ),
-        (
-            "voronoi",
-            "VORONOI",
-            json!({"noise_scale":0.7,"weight_1":0.7,"weight_2":0.3,"weight_3":0.1,"weight_4":0.0,"distance_metric":"MANHATTAN","color_mode":"INTENSITY"}),
-            [
-                [-0.914_880_514, -1.0, 0.0],
-                [1.328_364_611, -1.0, 0.0],
-                [-0.446_137_071, 1.0, 0.0],
-                [1.523_912_549, 1.0, 0.0],
-            ],
-        ),
-        (
-            "distorted noise",
-            "DISTORTED_NOISE",
-            json!({"noise_scale":0.7,"distortion":1.2,"noise_basis":"IMPROVED_PERLIN","noise_distortion":"ORIGINAL_PERLIN"}),
-            [
-                [-2.025_891_304, -1.0, 0.0],
-                [0.319_869_339, -1.0, 0.0],
-                [-1.473_574_638, 1.0, 0.0],
-                [0.645_129_561, 1.0, 0.0],
-            ],
-        ),
-        (
-            "musgrave",
-            "MUSGRAVE",
-            json!({"noise_scale":0.7,"musgrave_type":"HYBRID_MULTIFRACTAL","dimension_max":1.2,"lacunarity":2.0,"octaves":3.0,"offset":1.0,"gain":2.0,"noise_intensity":0.75,"noise_basis":"ORIGINAL_PERLIN"}),
-            [
-                [-0.465_015_054, -1.0, 0.0],
-                [1.687_701_941, -1.0, 0.0],
-                [-0.498_639_464, 1.0, 0.0],
-                [1.442_296_505, 1.0, 0.0],
-            ],
-        ),
-    ];
-    for (id, texture_type, settings, expected) in cases {
-        let operations = [
-            json!({"op":"node.create","id":"subject","kind":"plane","params":{"size":2.0}}),
-            json!({"op":"texture.create","id":"procedural_tex","texture_type":texture_type,"settings":settings}),
-            json!({"op":"modifier.create","target":{"id":"subject"},"id":"deform","type":"displace","params":{"direction":"X","strength":1.0,"mid_level":0.5,"texture":"procedural_tex","texture_coords":"LOCAL"}}),
-        ];
-        let mesh = scene_subject(&operations, None)?;
-        assert_plane(id, &mesh, &expected);
+    for case in procedural_cases(|case| case["group"] == "legacy")? {
+        let mesh = scene_subject(&procedural_ops(&case), None)?;
+        assert_plane(&case.id, &mesh, &case.expected);
     }
     Ok(())
 }
 
 #[test]
 fn procedural_rgb_textures_feed_blender_rgb_to_xyz() -> Result<(), Box<dyn std::error::Error>> {
-    let cases: [(&str, &str, Value, [[f64; 3]; 4]); 3] = [
-        (
-            "clouds color",
-            "CLOUDS",
-            json!({"noise_scale":0.7,"noise_depth":2,"noise_basis":"IMPROVED_PERLIN","noise_type":"HARD_NOISE","cloud_type":"COLOR"}),
-            [
-                [-1.020_454_764, -1.020_454_764, -0.234_896_079],
-                [0.887_225_568, -1.247_156_024, -0.070_604_682],
-                [-1.247_156_024, 0.887_225_568, -0.214_647_397],
-                [0.826_765_239, 0.826_765_239, -0.218_865_976],
-            ],
-        ),
-        (
-            "magic",
-            "MAGIC",
-            json!({"turbulence":4.0,"noise_depth":3}),
-            [
-                [-1.259_343_863, -0.713_979_006, 0.169_422_061],
-                [1.006_774_307, -0.702_482_820, -0.299_752_236],
-                [-0.993_225_694, 1.297_517_180, -0.299_752_236],
-                [0.727_355_063, 1.253_543_615, 0.198_309_809],
-            ],
-        ),
-        (
-            "voronoi color",
-            "VORONOI",
-            json!({"noise_scale":0.7,"weight_1":0.7,"weight_2":0.3,"weight_3":0.1,"weight_4":0.0,"distance_metric":"MANHATTAN","color_mode":"POSITION_OUTLINE_INTENSITY"}),
-            [
-                [-1.157_602_906, -1.126_606_226, 0.032_202_959],
-                [0.890_928_745, -1.047_678_709, 0.170_679_048],
-                [-0.654_694_438, 0.936_932_743, 0.195_293_725],
-                [0.871_754_527, 1.027_703_524, -0.112_273_268],
-            ],
-        ),
-    ];
-    for (id, texture_type, settings, expected) in cases {
-        let operations = [
-            json!({"op":"node.create","id":"subject","kind":"plane","params":{"size":2.0}}),
-            json!({"op":"texture.create","id":"procedural_tex","texture_type":texture_type,"settings":settings}),
-            json!({"op":"modifier.create","target":{"id":"subject"},"id":"deform","type":"displace","params":{"direction":"RGB_TO_XYZ","strength":0.6,"mid_level":0.5,"texture":"procedural_tex","texture_coords":"LOCAL"}}),
-        ];
-        let mesh = scene_subject(&operations, None)?;
-        assert_plane(id, &mesh, &expected);
+    for case in procedural_cases(|case| case["group"] == "rgb")? {
+        let mesh = scene_subject(&procedural_ops(&case), None)?;
+        assert_plane(&case.id, &mesh, &case.expected);
     }
     Ok(())
 }
@@ -1412,19 +1376,10 @@ fn procedural_rgb_textures_feed_blender_rgb_to_xyz() -> Result<(), Box<dyn std::
 #[test]
 fn native_value_noise_record_preserves_old_volume_noise_color()
 -> Result<(), Box<dyn std::error::Error>> {
-    let operations = [
-        json!({"op":"node.create","id":"subject","kind":"plane","params":{"size":2.0}}),
-        json!({"op":"texture.create","id":"native_noise","texture_type":"NATIVE_VALUE_NOISE"}),
-        json!({"op":"modifier.create","target":{"id":"subject"},"id":"deform","type":"displace","params":{"direction":"RGB_TO_XYZ","strength":1.0,"mid_level":0.5,"texture":"native_noise","texture_coords":"LOCAL"}}),
-    ];
-    let mesh = scene_subject(&operations, None)?;
-    let expected = [
-        [-0.867_057_829, -1.453_320_316, 0.359_089_834],
-        [0.906_857_550, -0.835_678_429, 0.219_494_253],
-        [-1.093_142_450, 1.164_321_571, 0.219_494_253],
-        [1.132_942_171, 0.546_679_684, 0.359_089_834],
-    ];
-    assert_plane("native value noise migration", &mesh, &expected);
+    let cases = procedural_cases(|case| case["id"] == "native_value_noise")?;
+    let case = cases.first().ok_or("missing native value noise oracle")?;
+    let mesh = scene_subject(&procedural_ops(case), None)?;
+    assert_plane("native value noise migration", &mesh, &case.expected);
     Ok(())
 }
 
