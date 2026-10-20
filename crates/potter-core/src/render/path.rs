@@ -120,7 +120,6 @@ struct Surface {
     layers: Layers,
     object_index: u32,
     element_index: u32,
-    distance: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -1500,7 +1499,6 @@ fn make_surface(
                 layers: hit_layers,
                 object_index: frame.triangle.object_index,
                 element_index: frame.triangle.element_index,
-                distance: hit.distance,
             })
         },
     )
