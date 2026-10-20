@@ -103,7 +103,7 @@ fn smooth_moves(
             if factor == 0.0 {
                 return None;
             }
-            let average = neighbor_average(positions, &field.neighbors[index])?;
+            let average = neighbor_average(positions, &field.topology.interior[index])?;
             Some((index, (average - *position) * factor))
         })
         .collect()

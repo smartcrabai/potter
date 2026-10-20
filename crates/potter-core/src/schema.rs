@@ -89,7 +89,7 @@ fn scene_schema() -> Value {
     let mut root = base("Potter scene document");
     root["required"] = json!(["schema_version", "scene_id", "revision", "active_scene"]);
     root["properties"] = json!({
-        "schema_version":{"const":6},
+        "schema_version":{"const":7},
         "scene_id":{"type":"string","format":"uuid"},
         "revision":{"type":"integer","minimum":0,"maximum":9_007_199_254_740_991_u64},
         "active_scene":{"$ref":"#/$defs/id"},
@@ -178,6 +178,17 @@ fn scene_schema() -> Value {
         "type":"array",
         "items":{"enum":["data","object"]}
     });
+    root["$defs"]["captured_matrix_basis"] = json!({
+        "type":"object",
+        "required":["matrix_basis","fingerprint"],
+        "properties":{
+            "matrix_basis":{"type":"array","items":{"type":"number"},"minItems":16,"maxItems":16},
+            "fingerprint":{"type":"string"}
+        },
+        "additionalProperties":false
+    });
+    root["$defs"]["node"]["properties"]["blender_matrix_basis"] =
+        json!({"oneOf":[{"$ref":"#/$defs/captured_matrix_basis"},{"type":"null"}]});
     root["$defs"]["data_block"]["properties"]["materials"] = nullable_id_array_schema();
     root["$defs"]["material"]["properties"]["viewport_display"] = json!({
         "type":"object",
@@ -1014,7 +1025,15 @@ fn operation_contract(name: &str) -> OperationContract {
         ),
         "sculpt.stroke" => (
             vec![
-                "target", "scope", "brush", "samples", "falloff", "symmetry", "delta", "view",
+                "target",
+                "scope",
+                "brush",
+                "deform_type",
+                "samples",
+                "falloff",
+                "symmetry",
+                "delta",
+                "view",
                 "dyntopo",
             ],
             vec!["op", "target", "brush", "samples"],
@@ -1993,10 +2012,13 @@ fn field_schema(operation: &str, field: &str) -> Value {
         return match field {
             "scope" => json!({"enum":["shared","single_user"]}),
             "brush" => {
-                json!({"enum":["draw","clay_strips","inflate","grab","smooth","flatten","pinch","crease","layer","snake_hook","thumb","rotate","nudge","blob","scrape","fill","draw_sharp","elastic_deform","pose_lite","boundary_lite"]})
+                json!({"enum":["draw","clay_strips","inflate","grab","smooth","flatten","pinch","crease","layer","snake_hook","thumb","rotate","nudge","blob","scrape","fill","draw_sharp","elastic_deform","pose","boundary"]})
             }
             "falloff" => {
                 json!({"enum":["smooth","smoother","sphere","root","sharp","linear","constant","pow4"],"description":"Falloff curve. Defaults to smoother for clay_strips, pow4 for draw_sharp, and smooth for other brushes."})
+            }
+            "deform_type" => {
+                json!({"enum":["rotate_twist","scale_translate","squash_stretch","bend","expand","inflate","grab","twist","smooth"],"description":"Deform type of the pose or boundary brush. Pose: rotate_twist (default), scale_translate, or squash_stretch; pose twist is refused. Boundary: bend (default), expand, inflate, grab, twist, or smooth. Other brushes refuse it."})
             }
             "samples" => {
                 json!({"type":"array","minItems":1,"items":{"type":"object","required":["position","pressure","radius","strength","time"],"properties":{"position":vec_schema(3),"pressure":{"type":"number","minimum":0,"maximum":1},"radius":{"type":"number","minimum":0},"strength":{"type":"number"},"time":{"type":"number"}},"additionalProperties":false}})

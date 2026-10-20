@@ -5,6 +5,18 @@
  "operation": "INTERSECT",
  "use_self": true,
  "material_mode": "INDEX",
+ "object_materials": [
+  null
+ ],
+ "effective_materials": [
+  null
+ ],
+ "data_materials": [
+  null
+ ],
+ "material_links": [
+  "data"
+ ],
  "counts": {
   "vertices": 0,
   "edges": 0,
@@ -12,7 +24,17 @@
  },
  "face_sizes": {},
  "volume": 0.0,
+ "edges": [],
+ "edge_points": [],
  "faces": [],
+ "uv_layers": {
+  "layers": [],
+  "active": null,
+  "render": null
+ },
  "vertex_groups": {},
- "blender_version": "5.2.2 LTS"
+ "blender_version": "5.2.2 LTS",
+ "edge_attributes": null,
+ "point_attributes": null,
+ "color_layers": null
 }
