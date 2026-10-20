@@ -2218,13 +2218,13 @@ def _alpha_mode_of(material):
     if blended:
         return "blend"
     # A DITHERED material whose Alpha is Blender's glTF MASK clip is clip, as the glTF importer makes it.
-    return "clip" if _clip_cutoff(_principled(material)) is not None else "opaque"
+    return "clip" if _clip_cutoff(material) is not None else "opaque"
 
 
 def material_dump(material):
     base_color = plain(material.diffuse_color)
     alpha_mode = _alpha_mode_of(material)
-    cutoff = _clip_cutoff(_principled(material))
+    cutoff = _clip_cutoff(material)
     metallic = float(getattr(material, "metallic", 0.0))
     roughness = float(getattr(material, "roughness", 0.8))
     emission_color = [0.0, 0.0, 0.0]
@@ -5951,14 +5951,26 @@ def _constant_alpha(item):
     return base_alpha
 
 
-def _clip_cutoff(shader):
-    """The cutoff of Blender's glTF MASK clip on a Principled Alpha socket, or None when there is none.
+def _clip_cutoff(material):
+    """The cutoff of Blender's glTF MASK clip in a material's surface, or None when there is none.
 
-    The importer builds `Alpha = SUBTRACT(1, LESS_THAN(x, cutoff))` (`pbrMetallicRoughness.py` 668-700): the
-    LESS_THAN compares the alpha source `x` (a texture alpha, times the factor) with the cutoff, and the SUBTRACT
-    inverts it. Any other shape is not a clip.
+    The surface is the active output's Surface input, which must come straight from a Principled BSDF's BSDF output:
+    a Mix Shader or any other node in between keeps the clip out of the surface, so it is not a clip. That Principled
+    Alpha must be the importer's `Alpha = SUBTRACT(1, LESS_THAN(x, cutoff))` (`pbrMetallicRoughness.py` 668-700):
+    LESS_THAN compares the alpha source `x` (a texture alpha, times the factor) with the cutoff, and SUBTRACT inverts
+    it. Any other shape is not a clip.
     """
-    alpha = shader.inputs.get("Alpha") if shader is not None else None
+    if material.node_tree is None:
+        return None
+    output = _material_output(material.node_tree)
+    surface = output.inputs.get("Surface") if output is not None else None
+    if surface is None or not surface.is_linked:
+        return None
+    link = surface.links[0]
+    shader = link.from_node
+    if shader.type != "BSDF_PRINCIPLED" or link.from_socket.name != "BSDF":
+        return None
+    alpha = shader.inputs.get("Alpha")
     if alpha is None or not alpha.is_linked:
         return None
     subtract = alpha.links[0].from_node
@@ -5971,12 +5983,6 @@ def _clip_cutoff(shader):
     if compare.type != "MATH" or compare.operation != "LESS_THAN" or compare.inputs[1].is_linked:
         return None
     return float(compare.inputs[1].default_value)
-
-
-def _principled(material):
-    if material.node_tree is None:
-        return None
-    return next((node for node in material.node_tree.nodes if node.type == "BSDF_PRINCIPLED"), None)
 
 
 def _set_principled_values(material, item):

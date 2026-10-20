@@ -1124,7 +1124,13 @@ fn overlay_authored(
                 principled.as_str(),
                 "Alpha",
             )?;
-            let value = input_scalar(&inputs, "Alpha", 1.0);
+            // A simple graph's Alpha input holds the binary clip value, so its factor is the base alpha the renderer
+            // multiplies the texel by. An authored graph keeps its own Alpha default.
+            let value = if simple {
+                material.base_color[3]
+            } else {
+                input_scalar(&inputs, "Alpha", 1.0)
+            };
             multiply_input(
                 &mut graph,
                 source,

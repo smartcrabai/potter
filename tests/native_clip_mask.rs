@@ -53,6 +53,8 @@ const SAMPLES: u32 = 16;
 const WINDOW: std::ops::Range<usize> = 16..48;
 /// The two-sided 99.9% Student t quantile at 7 degrees of freedom.
 const T_QUANTILE: f64 = 5.408;
+/// The cutoff of the oracle's MASK graph (`blend_clip_mask_render.py`, `CUTOFF`).
+const CLIP_CUTOFF: f64 = 0.5;
 /// The opaque, transparent and in-between fractions, in that order.
 const METRICS: [&str; 3] = ["opaque", "transparent", "fractional"];
 
@@ -111,6 +113,20 @@ fn clip_mask_cutout_matches_cycles_window_statistics() -> TestResult {
     let (project_path, _) = import_blend(&blender, root.path(), "project", &blend)?;
     let project = Project::open(&project_path)?;
     let mut doc = project.doc().clone();
+    // The oracle's `.blend` has no `potter.alpha_mode` marker, so this is the detection of Blender's MASK graph alone:
+    // the plane's DITHERED material reads back as clip with the graph's cutoff as its threshold. Without that detection
+    // the material would be opaque, and the render would not show the cutout.
+    let clips: Vec<_> = doc
+        .materials
+        .values()
+        .filter(|material| material.alpha_mode == "clip")
+        .collect();
+    assert_eq!(clips.len(), 1, "the plane's material must import as clip");
+    assert!(
+        (clips[0].alpha_threshold - CLIP_CUTOFF).abs() <= 1.0e-6,
+        "imported threshold {} differs from the graph cutoff {CLIP_CUTOFF}",
+        clips[0].alpha_threshold
+    );
     let scene_id = doc.active_scene.clone();
     let (camera, frame) = {
         let scene = doc
