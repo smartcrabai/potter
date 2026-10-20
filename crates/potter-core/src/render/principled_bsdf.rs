@@ -618,7 +618,7 @@ fn sheen_frame(normal: DVec3, view: DVec3) -> (DVec3, DVec3) {
     clippy::float_cmp,
     reason = "Cycles selects the tangent basis by exact component equality of the normal"
 )]
-fn make_orthonormals(normal: DVec3) -> (DVec3, DVec3) {
+pub(super) fn make_orthonormals(normal: DVec3) -> (DVec3, DVec3) {
     let tangent = if normal.x != normal.y || normal.x != normal.z {
         DVec3::new(
             normal.z - normal.y,

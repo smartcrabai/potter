@@ -16,7 +16,7 @@ use crate::{
 
 use super::principled_bsdf::{
     GlassSample, Layers, continuous_density, evaluate as evaluate_bsdf, layers, lobe_probabilities,
-    sample_glass, subsurface_closure_weight,
+    make_orthonormals, sample_glass, subsurface_closure_weight,
 };
 use super::subsurface::{
     MAX_HITS, ProbeHits, burley_radius, channel_mask, eval as burley_eval, exit_params, pdf_mean,
@@ -2386,7 +2386,9 @@ fn burley_exit(
     // The second draw picks the disk's axis and phase (`subsurface_disk`).
     let axis_draw = rng.next_f64();
     let normal = surface.geometric_normal;
-    let (tangent, bitangent) = basis(normal);
+    // Cycles' `make_orthonormals(disk_N, &disk_T, &disk_B)`: the tangent and bitangent the T and B probes travel along.
+    // Their hit distribution is not symmetric about the normal, so the basis changes the exit weights.
+    let (tangent, bitangent) = make_orthonormals(normal);
     // The normal axis is probed with half the probability, the others with a quarter each.
     let (disk_normal, disk_tangent, disk_bitangent, pick_pdf, phase_draw) = if axis_draw < 0.5 {
         (
