@@ -1668,6 +1668,19 @@ def _vertex_groups_dump(obj):
     return result
 
 
+def _pose_rotation_quaternion(bone):
+    """The pose bone's rotation as (w, x, y, z), read from the field its rotation mode uses."""
+    mode = bone.rotation_mode
+    if mode == "QUATERNION":
+        rotation = bone.rotation_quaternion
+    elif mode == "AXIS_ANGLE":
+        angle, *axis = bone.rotation_axis_angle
+        rotation = Quaternion(axis, angle)
+    else:
+        rotation = bone.rotation_euler.to_quaternion()
+    return [rotation.w, rotation.x, rotation.y, rotation.z]
+
+
 def _pose_dump(obj):
     result = []
     if obj.type != "ARMATURE" or obj.pose is None:
@@ -1677,12 +1690,7 @@ def _pose_dump(obj):
         constraints = inverse_map.get(bone.name, {})
         result.append({"bone": bone.name, "location": plain(bone.location),
                        "rotation_mode": bone.rotation_mode,
-                       "rotation_quaternion": [
-                           bone.rotation_quaternion.w,
-                           bone.rotation_quaternion.x,
-                           bone.rotation_quaternion.y,
-                           bone.rotation_quaternion.z,
-                       ],
+                       "rotation_quaternion": _pose_rotation_quaternion(bone),
                        "scale": plain(bone.scale),
                        "lock_ik": [bool(bone.lock_ik_x), bool(bone.lock_ik_y),
                                   bool(bone.lock_ik_z)],
