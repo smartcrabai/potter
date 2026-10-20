@@ -1132,11 +1132,15 @@ pub struct EvaluatorWorkspace {
 pub struct PreparedMaterial {
     /// The Image Texture nodes whose Alpha output reaches the graph's output (see [`linked_alpha_image_nodes`]).
     alpha_linked_images: BTreeSet<Id>,
+    /// Whether EEVEE would compile the material as transparent (`GPU_MATFLAG_TRANSPARENT`), which decides whether its
+    /// surfaces cast transparent shadows (see [`graph_is_transparent`]).
+    transparent: bool,
 }
 
 impl PreparedMaterial {
     /// Prepares `material` against the node groups its graph is looked up in. A material without a shader graph prepares
-    /// to nothing, since its surface is its PBR fields.
+    /// to its own PBR fields: its export is a Principled whose Alpha is the base colour alpha for a non-opaque material
+    /// (`blend_bridge.py` `_set_principled_values`), so it is transparent when that alpha is below one.
     #[must_use]
     pub fn new(material: &Material, node_groups: &Registry<NodeGroup>) -> Self {
         let Some(group) = material
@@ -1144,7 +1148,10 @@ impl PreparedMaterial {
             .as_ref()
             .and_then(|graph_id| node_groups.get(graph_id))
         else {
-            return Self::default();
+            return Self {
+                transparent: material.alpha_mode != "opaque" && material.base_color[3] < 1.0,
+                ..Self::default()
+            };
         };
         let Some(output) = Self::active_output(group) else {
             return Self::default();
@@ -1154,7 +1161,13 @@ impl PreparedMaterial {
                 .into_iter()
                 .cloned()
                 .collect(),
+            transparent: graph_is_transparent(group, output),
         }
+    }
+
+    /// Whether a surface of this material casts a transparent shadow, as EEVEE's static transparency decides it.
+    pub(crate) fn is_transparent(&self) -> bool {
+        self.transparent
     }
 
     /// The output node a surface evaluates from: the active one, else the first `OutputMaterial`.
@@ -2428,6 +2441,23 @@ fn linked_alpha_image_nodes<'graph>(
     group: &'graph NodeGroup,
     output: &'graph Id,
 ) -> BTreeSet<&'graph Id> {
+    let reachable = reachable_nodes(group, output);
+    group
+        .links
+        .iter()
+        .filter(|link| link.from_socket == "Alpha" && reachable.contains(&link.to_node))
+        .map(|link| &link.from_node)
+        .filter(|from| {
+            group
+                .nodes
+                .get(*from)
+                .is_some_and(|node| node.node_type == "ShaderNodeTexImage")
+        })
+        .collect()
+}
+
+/// The nodes that feed `output`, `output` included. Blender's shader compile keeps only these (see the Alpha visit above).
+fn reachable_nodes<'graph>(group: &'graph NodeGroup, output: &'graph Id) -> BTreeSet<&'graph Id> {
     let mut reachable: BTreeSet<&'graph Id> = BTreeSet::new();
     let mut pending = vec![output];
     while let Some(node) = pending.pop() {
@@ -2441,18 +2471,44 @@ fn linked_alpha_image_nodes<'graph>(
             );
         }
     }
-    group
-        .links
-        .iter()
-        .filter(|link| link.from_socket == "Alpha" && reachable.contains(&link.to_node))
-        .map(|link| &link.from_node)
-        .filter(|from| {
-            group
-                .nodes
-                .get(*from)
-                .is_some_and(|node| node.node_type == "ShaderNodeTexImage")
-        })
-        .collect()
+    reachable
+}
+
+/// Whether EEVEE compiles the graph as transparent, `GPU_MATFLAG_TRANSPARENT`, which is set statically per node:
+/// a Transparent BSDF whose Color is linked or not black (`node_shader_bsdf_transparent.cc:30`), and a Principled
+/// whose Alpha is linked or not one (`node_shader_bsdf_principled.cc:400`). Only the nodes that feed the output count.
+/// Specular and Ray Portal set the same flag in Blender, but Potter's evaluator rejects both node types, so a material
+/// with one never evaluates and needs no rule.
+fn graph_is_transparent(group: &NodeGroup, output: &Id) -> bool {
+    let reachable = reachable_nodes(group, output);
+    let linked = |node: &Id, socket: &str| {
+        group
+            .links
+            .iter()
+            .any(|link| link.to_node == *node && link.to_socket == socket)
+    };
+    group.nodes.iter().any(|(id, node)| {
+        if !reachable.contains(id) {
+            return false;
+        }
+        match node.node_type.as_str() {
+            "ShaderNodeBsdfTransparent" => {
+                linked(id, "Color")
+                    || node
+                        .inputs
+                        .get("Color")
+                        .is_none_or(|value| color(value, [1.0; 4])[..3].iter().any(|c| *c != 0.0))
+            }
+            "ShaderNodeBsdfPrincipled" => {
+                linked(id, "Alpha")
+                    || node.inputs.get("Alpha").is_some_and(|value| {
+                        // Blender's `alpha != 1.0`. `number` never yields a NaN, and `total_cmp` is exact for 1.0.
+                        number(value, 1.0).total_cmp(&1.0).is_ne()
+                    })
+            }
+            _ => false,
+        }
+    })
 }
 
 fn number(value: &JsonValue, default: f64) -> f64 {
@@ -2858,8 +2914,8 @@ mod tests {
     };
 
     use super::{
-        BsdfParams, HitContext, HitUvLayers, color_lerp, evaluate_displacement, evaluate_surface,
-        layer_index, layer_uv,
+        BsdfParams, HitContext, HitUvLayers, PreparedMaterial, color_lerp, evaluate_displacement,
+        evaluate_surface, layer_index, layer_uv,
     };
 
     fn set_properties(group: &mut NodeGroup, id: &str, properties: Value) {
@@ -3036,6 +3092,105 @@ mod tests {
             to_node: Id::new(to.to_owned()).unwrap(),
             to_socket: input.to_owned(),
         });
+    }
+
+    /// A graph whose Principled BSDF feeds the output with the given inputs.
+    fn principled_output(principled_inputs: Value) -> NodeGroup {
+        let mut graph = NodeGroup::new("Principled", GraphKind::Shader);
+        insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
+        insert_node(
+            &mut graph,
+            "principled",
+            "ShaderNodeBsdfPrincipled",
+            principled_inputs,
+        );
+        link(&mut graph, "principled", "BSDF", "output", "Surface");
+        graph
+    }
+
+    fn is_transparent(graph: NodeGroup) -> bool {
+        let id = Id::new("transparency_graph").unwrap();
+        let mut groups = Registry::new();
+        groups.insert(id.clone(), graph);
+        let material = Material {
+            node_tree: Some(id),
+            ..Material::default()
+        };
+        PreparedMaterial::new(&material, &groups).is_transparent()
+    }
+
+    #[test]
+    fn a_principled_is_transparent_only_when_its_alpha_is_linked_or_below_one() {
+        assert!(!is_transparent(principled_output(json!({}))));
+        assert!(!is_transparent(principled_output(json!({"Alpha": 1.0}))));
+        assert!(is_transparent(principled_output(json!({"Alpha": 0.5}))));
+
+        let mut linked = principled_output(json!({}));
+        insert_node(&mut linked, "texture", "ShaderNodeTexImage", json!({}));
+        link(&mut linked, "texture", "Alpha", "principled", "Alpha");
+        assert!(is_transparent(linked));
+    }
+
+    #[test]
+    fn a_transparent_bsdf_is_transparent_unless_its_color_is_black() {
+        let transparent = |color: Value| {
+            let mut graph = NodeGroup::new("Transparent", GraphKind::Shader);
+            insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
+            insert_node(
+                &mut graph,
+                "transparent",
+                "ShaderNodeBsdfTransparent",
+                color,
+            );
+            link(&mut graph, "transparent", "BSDF", "output", "Surface");
+            graph
+        };
+        assert!(is_transparent(transparent(json!({}))));
+        assert!(is_transparent(transparent(
+            json!({"Color": [0.9, 0.4, 0.2, 1.0]})
+        )));
+        assert!(!is_transparent(transparent(
+            json!({"Color": [0.0, 0.0, 0.0, 1.0]})
+        )));
+    }
+
+    #[test]
+    fn only_a_node_that_feeds_the_output_makes_a_graph_transparent() {
+        // A Transparent BSDF behind a Mix that reaches the output is transparent.
+        let mut mixed = NodeGroup::new("Mix", GraphKind::Shader);
+        insert_node(&mut mixed, "output", "ShaderNodeOutputMaterial", json!({}));
+        insert_node(
+            &mut mixed,
+            "principled",
+            "ShaderNodeBsdfPrincipled",
+            json!({}),
+        );
+        insert_node(
+            &mut mixed,
+            "transparent",
+            "ShaderNodeBsdfTransparent",
+            json!({}),
+        );
+        insert_node(
+            &mut mixed,
+            "mix",
+            "ShaderNodeMixShader",
+            json!({"Fac": 0.5}),
+        );
+        link(&mut mixed, "principled", "BSDF", "mix", "Shader");
+        link(&mut mixed, "transparent", "BSDF", "mix", "Shader_001");
+        link(&mut mixed, "mix", "Shader", "output", "Surface");
+        assert!(is_transparent(mixed));
+
+        // The same Transparent BSDF, left unconnected, feeds nothing and does not make the graph transparent.
+        let mut dangling = principled_output(json!({}));
+        insert_node(
+            &mut dangling,
+            "transparent",
+            "ShaderNodeBsdfTransparent",
+            json!({}),
+        );
+        assert!(!is_transparent(dangling));
     }
 
     #[test]
