@@ -2066,33 +2066,6 @@ fn shade(
             point_shadow,
         );
     }
-    for (id, light_node) in &doc.nodes {
-        let Some(light) = light_node
-            .data
-            .as_ref()
-            .and_then(|data_id| doc.data_blocks.get(data_id))
-            .and_then(|block| block.light.as_ref())
-        else {
-            continue;
-        };
-        let Some(evaluated) = snapshot.nodes.get(id) else {
-            continue;
-        };
-        let matrix = DMat4::from_cols_array(&evaluated.world_matrix);
-        let point_shadow = shadow.and_then(|(_, _, maps)| maps.get(id));
-        result += light_contribution(
-            light,
-            matrix,
-            point,
-            shadow_point,
-            normal,
-            geometric,
-            view,
-            &lobe,
-            shadow,
-            point_shadow,
-        );
-    }
     // In Beauty, reflectance weights every reflective closure (ambient, direct, environment).
     let result = result * params.reflectance.clamp(0.0, 1.0);
     let result = result.max(DVec3::ZERO).min(DVec3::splat(1.0));
@@ -2100,9 +2073,8 @@ fn shade(
     // NODE_CLOSURE_EMISSION unscaled (intern/cycles/scene/shader_nodes.cpp:3071-3098), and neither
     // EEVEE nor Cycles clamps the strength (gpu_shader_material_principled.glsl:179,
     // intern/cycles/kernel/svm/closure.h:206-207).
-    let emission = DVec3::from_array(params.emission_color)
-        * params.emission_strength
-        * shading.lower();
+    let emission =
+        DVec3::from_array(params.emission_color) * params.emission_strength * shading.lower();
     let result = result + emission;
     Ok([result.x, result.y, result.z, alpha])
 }
