@@ -189,7 +189,8 @@ fn cylinder_storage_order_matches_blender() -> TestResult {
         "cylinder_8_nothing",
         &cylinder(8, EndFillType::Nothing)?,
         &cases,
-    )
+    )?;
+    assert_matches("cylinder_4_ngon", &cylinder(4, EndFillType::Ngon)?, &cases)
 }
 
 #[test]
@@ -233,6 +234,11 @@ fn cone_storage_order_matches_blender() -> TestResult {
     assert_matches(
         "cone_inverted_32",
         &cone(32, 0.0, 1.0, EndFillType::Ngon)?,
+        &cases,
+    )?;
+    assert_matches(
+        "cone_trunc_4_ngon",
+        &cone(4, 1.0, 0.5, EndFillType::Ngon)?,
         &cases,
     )
 }

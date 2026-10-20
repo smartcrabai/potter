@@ -106,18 +106,6 @@ fn positions_by_id(mesh: &Mesh) -> HashMap<u32, DVec3> {
         .collect()
 }
 
-/// Newell normal of a polygon, unnormalized, following its winding.
-fn newell(points: &[DVec3]) -> DVec3 {
-    let mut normal = DVec3::ZERO;
-    for (index, current) in points.iter().enumerate() {
-        let next = points[(index + 1) % points.len()];
-        normal.x += (current.y - next.y) * (current.z + next.z);
-        normal.y += (current.z - next.z) * (current.x + next.x);
-        normal.z += (current.x - next.x) * (current.y + next.y);
-    }
-    normal
-}
-
 /// `BM_mesh_calc_uvs_cube`: a cross-shaped strip of six squares, walked face by face.
 pub(super) fn cube(mesh: &mut Mesh) {
     let mut x = 0.375;
@@ -228,7 +216,11 @@ pub(super) fn cone(
     let mut loops = Vec::with_capacity(mesh.faces.len());
     for face in &mesh.faces {
         let points: Vec<DVec3> = face.vertices.iter().map(|id| positions[id]).collect();
-        if points.len() == 4 && radius_top != 0.0 && radius_bottom != 0.0 {
+        // Blender runs this before its caps are dissolved, when a cap is a triangle fan, so only a
+        // quad that spans both ends is a side. A four-sided N-gon cap lies in one plane.
+        let spans_both_ends =
+            points.iter().any(|co| co.z > 0.0) && points.iter().any(|co| co.z < 0.0);
+        if points.len() == 4 && radius_top != 0.0 && radius_bottom != 0.0 && spans_both_ends {
             let mut corners = Vec::with_capacity(4);
             for corner in 0..4 {
                 match corner {
@@ -241,7 +233,7 @@ pub(super) fn cone(
             }
             loops.push(corners);
         } else {
-            let top = newell(&points).z > 0.0;
+            let top = super::normals::face_normal(&points).z > 0.0;
             let corners: Vec<[f64; 2]> = points
                 .iter()
                 .map(|co| {

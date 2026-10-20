@@ -148,6 +148,8 @@ fn cylinder_and_cone_uvs_match_blender() -> TestResult {
         &cylinder(8, EndFillType::Nothing)?,
         &cases,
     )?;
+    // Four-sided N-gon caps are quads; they must project onto their disc, not unwrap as sides.
+    assert_uv("cylinder_4_ngon", &cylinder(4, EndFillType::Ngon)?, &cases)?;
     let cone = |vertices, radius1, radius2, end_fill_type| {
         Mesh::cone(ConeParams {
             vertices,
@@ -186,6 +188,11 @@ fn cylinder_and_cone_uvs_match_blender() -> TestResult {
     assert_uv(
         "cone_inverted_32",
         &cone(32, 0.0, 1.0, EndFillType::Ngon)?,
+        &cases,
+    )?;
+    assert_uv(
+        "cone_trunc_4_ngon",
+        &cone(4, 1.0, 0.5, EndFillType::Ngon)?,
         &cases,
     )
 }

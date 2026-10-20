@@ -447,17 +447,25 @@ fn split_edge(mesh: &mut Mesh, edge_id: u32) -> Result<bool> {
         .ok_or_else(|| invalid("dyntopo edge disappeared during subdivision"))?;
     original_edge.vertices = [a, midpoint_id];
     let edge_key = if a < b { [a, b] } else { [b, a] };
-    let uv_store = uv_layers::read(mesh);
+    let corner_store = read_corner_data(mesh);
     let mut sources = Vec::with_capacity(mesh.faces.len());
     for face in &mut mesh.faces {
-        let mut vertices = Vec::with_capacity(face.vertices.len() + 1);
-        let mut face_sources = Vec::with_capacity(face.vertices.len() + 1);
-        for index in 0..face.vertices.len() {
+        let face_len = face.vertices.len();
+        let contains_edge = (0..face_len).any(|index| {
             let current = face.vertices[index];
-            let next_index = (index + 1) % face.vertices.len();
-            let next = face.vertices[next_index];
+            let next = face.vertices[(index + 1) % face_len];
+            let key = if current < next {
+                [current, next]
+            } else {
+                [next, current]
+            };
+            key == edge_key
+        });
+        let mut vertices = Vec::with_capacity(face_len + 1);
+        for index in 0..face_len {
+            let current = face.vertices[index];
+            let next = face.vertices[(index + 1) % face_len];
             vertices.push(current);
-            face_sources.push(CornerSource::Kept(index));
             let key = if current < next {
                 [current, next]
             } else {
@@ -465,13 +473,18 @@ fn split_edge(mesh: &mut Mesh, edge_id: u32) -> Result<bool> {
             };
             if key == edge_key {
                 vertices.push(midpoint_id);
-                face_sources.push(CornerSource::Created);
             }
         }
+        let face_sources = if contains_edge {
+            // Blender rebuilds every face on the split edge as new triangles with default loops.
+            vec![CornerSource::Created; vertices.len()]
+        } else {
+            (0..face_len).map(CornerSource::Kept).collect()
+        };
         face.vertices = vertices;
-        sources.push(Some(face_sources));
+        sources.push((face.id, Some(face_sources)));
     }
-    remap_uv_store(mesh, &uv_store, &sources)?;
+    remap_corner_data(mesh, &corner_store, &sources);
     for (name, value) in vertex_values {
         set_attribute_value(mesh, &name, format!("v{midpoint_id}"), value);
     }
@@ -609,12 +622,13 @@ fn collapse_edge(mesh: &mut Mesh, endpoints: [u32; 2]) -> Result<()> {
             .ok_or_else(|| invalid("dyntopo edge references a missing vertex"))?;
         keep_position.lerp(remove_position, 0.5)
     };
-    let uv_store = uv_layers::read(mesh);
+    let corner_store = read_corner_data(mesh);
     let mut sources = Vec::with_capacity(mesh.faces.len());
     let mut removed_faces = std::collections::BTreeSet::new();
     for face in &mut mesh.faces {
+        let touches_removed = face.vertices.contains(&remove);
         // Each corner carries the old corner index it came from, through the same remap, dedup and
-        // closing-corner pop as the vertex list, so every surviving corner keeps its UV.
+        // closing-corner pop as the vertex list.
         let mut corners = face
             .vertices
             .iter()
@@ -627,19 +641,24 @@ fn collapse_edge(mesh: &mut Mesh, endpoints: [u32; 2]) -> Result<()> {
         }
         if corners.len() < 3 {
             removed_faces.insert(face.id);
-            sources.push(None);
+            sources.push((face.id, None));
             continue;
         }
-        face.vertices = corners.iter().map(|corner| corner.0).collect();
-        sources.push(Some(
+        // A face around the removed vertex is rebuilt by Blender with default loops; any other
+        // face keeps each surviving corner's value.
+        let face_sources = if touches_removed {
+            vec![CornerSource::Created; corners.len()]
+        } else {
             corners
                 .iter()
                 .map(|corner| CornerSource::Kept(corner.1))
-                .collect(),
-        ));
+                .collect()
+        };
+        face.vertices = corners.iter().map(|corner| corner.0).collect();
+        sources.push((face.id, Some(face_sources)));
     }
     mesh.faces.retain(|face| !removed_faces.contains(&face.id));
-    remap_uv_store(mesh, &uv_store, &sources)?;
+    remap_corner_data(mesh, &corner_store, &sources);
     let mut used_edges = std::collections::BTreeSet::new();
     let mut removed_edges = std::collections::BTreeSet::new();
     mesh.edges.retain_mut(|edge| {
@@ -964,6 +983,9 @@ fn read_scalar_attribute(mesh: &Mesh, name: &str) -> Result<std::collections::BT
         )
 }
 
+/// Blender's default layer value `(0, 0)` in Potter's stored convention, where v points down.
+const UV_DEFAULT: [f64; 2] = [0.0, 1.0];
+
 /// Where one corner of a face after a dyntopo edit comes from.
 #[derive(Clone, Copy)]
 enum CornerSource {
@@ -971,23 +993,46 @@ enum CornerSource {
     Kept(usize),
     /// A corner that dyntopo creates. Blender's dyntopo rebuilds faces with `BM_face_create`, whose
     /// new loops take the default layer values (`bm_loop_create`), and the operator warns that it
-    /// does not preserve UVs (`sculpt_dyntopo.cc`). Its UV is therefore the default `[0, 0]`.
+    /// does not preserve UVs (`sculpt_dyntopo.cc`). Its UV is therefore Blender's default `(0, 0)`,
+    /// stored as `[0, 1]` because Potter's UVs point v down.
     Created,
 }
 
-/// Rebuilds the UV store of `mesh` after a dyntopo edit. `before` is the store read before the edit;
-/// `sources` has one entry per face before the edit (`None` for a face the edit removed), giving
-/// each surviving face's corners in its new order.
-fn remap_uv_store(
+/// The corner data of a mesh before a dyntopo edit: its UV store, and every corner-domain attribute
+/// (keyed by face ID, one row of corner values per face).
+struct CornerData {
+    uv_store: uv_layers::UvStore,
+}
+
+fn read_corner_data(mesh: &Mesh) -> CornerData {
+    CornerData {
+        uv_store: uv_layers::read(mesh),
+    }
+}
+
+/// A corner value of the same shape as `template`, all zero (Blender's default layer value).
+fn zero_like(template: &Value) -> Value {
+    match template {
+        Value::Array(items) => Value::Array(items.iter().map(zero_like).collect()),
+        Value::Number(_) => json!(0),
+        Value::Bool(_) => json!(false),
+        _ => Value::Null,
+    }
+}
+
+/// Rebuilds the corner data of `mesh` after a dyntopo edit. `sources` has one entry per face before
+/// the edit, `(face ID, None)` for a face the edit removed, else the source of each corner of the
+/// face in its new order. A `Created` corner takes the default value.
+fn remap_corner_data(
     mesh: &mut Mesh,
-    before: &uv_layers::UvStore,
-    sources: &[Option<Vec<CornerSource>>],
-) -> Result<()> {
-    let mut store = before.clone();
+    before: &CornerData,
+    sources: &[(u32, Option<Vec<CornerSource>>)],
+) {
+    let mut store = before.uv_store.clone();
     for layer in &mut store.layers {
         let mut faces = Vec::new();
         let mut pinned = Vec::new();
-        for (old_index, source) in sources.iter().enumerate() {
+        for (old_index, (_, source)) in sources.iter().enumerate() {
             let Some(source) = source else {
                 continue;
             };
@@ -1003,16 +1048,14 @@ fn remap_uv_store(
             for corner in source {
                 match *corner {
                     CornerSource::Kept(index) => {
-                        new_values.push(*values.get(index).ok_or_else(|| {
-                            invalid("dyntopo UV corner is missing from its face")
-                        })?);
+                        new_values.push(values.get(index).copied().unwrap_or(UV_DEFAULT));
                         new_pins.push(
                             pins.and_then(|pins| pins.get(index).copied())
                                 .unwrap_or(false),
                         );
                     }
                     CornerSource::Created => {
-                        new_values.push([0.0, 0.0]);
+                        new_values.push(UV_DEFAULT);
                         new_pins.push(false);
                     }
                 }
@@ -1024,7 +1067,40 @@ fn remap_uv_store(
         layer.pinned = pinned;
     }
     uv_layers::write(mesh, &store);
-    Ok(())
+
+    for (name, attribute) in &mut mesh.attributes {
+        if name == uv_layers::ATTRIBUTE {
+            continue;
+        }
+        let Some(object) = attribute.as_object_mut() else {
+            continue;
+        };
+        if object.get("domain").and_then(Value::as_str) != Some("corner") {
+            continue;
+        }
+        let Some(values) = object.get_mut("values").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        for (face_id, source) in sources {
+            let key = format!("f{face_id}");
+            let Some(source) = source else {
+                values.remove(&key);
+                continue;
+            };
+            let Some(row) = values.get(&key).and_then(Value::as_array).cloned() else {
+                continue;
+            };
+            let template = row.first().cloned().unwrap_or(Value::Null);
+            let new_row = source
+                .iter()
+                .map(|corner| match *corner {
+                    CornerSource::Kept(index) => row.get(index).cloned().unwrap_or(Value::Null),
+                    CornerSource::Created => zero_like(&template),
+                })
+                .collect::<Vec<_>>();
+            values.insert(key, Value::Array(new_row));
+        }
+    }
 }
 
 pub(super) fn invalid(message: impl Into<String>) -> PotError {
@@ -1335,7 +1411,7 @@ mod tests {
                 face.vertices.len(),
                 "face {index} corner count"
             );
-            created.extend(corners.iter().copied().filter(|uv| *uv == [0.0, 0.0]));
+            created.extend(corners.iter().copied().filter(|uv| *uv == UV_DEFAULT));
         }
         created
     }
@@ -1355,7 +1431,7 @@ mod tests {
         assert!(dyntopo_under_brush(&mut mesh, &stroke, 1.0).unwrap());
         let created = assert_uv_in_step(&mesh);
         // Blender's dyntopo rebuilds faces with default loop data and warns that it does not keep
-        // UVs; the corners it creates are the `[0, 0]` default.
+        // UVs; the corners it creates are Blender's `(0, 0)`, stored as `[0, 1]`.
         assert!(!created.is_empty(), "the split must create corners");
         // A corner that existed before keeps its UV in the face it still belongs to.
         let after = uv_layers::read(&mesh).layers[0].faces.clone();
@@ -1363,7 +1439,7 @@ mod tests {
             .iter()
             .flatten()
             .flatten()
-            .filter(|uv| **uv != [0.0, 0.0])
+            .filter(|uv| **uv != UV_DEFAULT)
             .collect();
         let before_values: Vec<_> = before.iter().flatten().flatten().collect();
         assert!(kept.iter().all(|uv| before_values.contains(uv)));
