@@ -34,9 +34,8 @@ pub(crate) fn dielectric_f0(ior: f64, level: f64) -> f64 {
 /// as `(feature_id, Blender input)` pairs in a fixed array, so checking a hit allocates nothing.
 pub(crate) fn unevaluated_principled_inputs(
     params: &BsdfParams,
-) -> [Option<(&'static str, &'static str)>; 7] {
+) -> [Option<(&'static str, &'static str)>; 6] {
     [
-        (params.sheen_weight > 0.0).then_some(("shader.principled.sheen", "Sheen Weight")),
         (params.subsurface_weight > 0.0)
             .then_some(("shader.principled.subsurface", "Subsurface Weight")),
         (params.anisotropic_ior > 0.0).then_some(("shader.principled.anisotropic", "Anisotropic")),
@@ -251,7 +250,7 @@ impl BsdfParams {
             coat_roughness: 0.03,
             coat_ior: 1.5,
             sheen_weight: 0.0,
-            sheen_roughness: 0.3,
+            sheen_roughness: 0.5,
             sheen_tint: [1.0; 3],
             specular_ior_level: DEFAULT_SPECULAR_IOR_LEVEL,
             specular_tint: [1.0; 3],
@@ -286,6 +285,17 @@ impl BsdfParams {
             tint: self.coat_tint,
             roughness: self.coat_roughness,
             normal: self.coat_normal_or_shading(),
+        }
+    }
+
+    /// The sheen as one layered closure, for `combine_layers`. Sheen has no normal of its own: the
+    /// combined normal is the coat's, so this normal is never read.
+    fn sheen_layer(&self) -> LayerSide {
+        LayerSide {
+            weight: self.sheen_weight,
+            tint: self.sheen_tint,
+            roughness: self.sheen_roughness,
+            normal: self.normal,
         }
     }
 
@@ -329,9 +339,15 @@ impl BsdfParams {
             mix_scalar(first.base_color[2], second.base_color[2]),
             mix_scalar(first.base_color[3], second.base_color[3]),
         ];
-        // The coat is shading like every other field, so it takes the same share of the hits (`shade`), not the raw
-        // factor: a Transparent arm then adds no coat, as it adds no colour.
+        // The coat and sheen are shading like every other field, so they take the same share of the hits
+        // (`shade`), not the raw factor: a Transparent arm then adds no coat or sheen, as it adds no colour.
         let coat = combine_layers(first.coat_layer(), 1.0 - shade, second.coat_layer(), shade);
+        let sheen = combine_layers(
+            first.sheen_layer(),
+            1.0 - shade,
+            second.sheen_layer(),
+            shade,
+        );
         Self {
             base_color,
             metallic: mix_scalar(first.metallic, second.metallic),
@@ -349,9 +365,9 @@ impl BsdfParams {
             coat_weight: coat.weight,
             coat_roughness: coat.roughness,
             coat_ior: mix_scalar(first.coat_ior, second.coat_ior),
-            sheen_weight: mix_scalar(first.sheen_weight, second.sheen_weight),
-            sheen_roughness: mix_scalar(first.sheen_roughness, second.sheen_roughness),
-            sheen_tint: mix3(first.sheen_tint, second.sheen_tint),
+            sheen_weight: sheen.weight,
+            sheen_roughness: sheen.roughness,
+            sheen_tint: sheen.tint,
             specular_ior_level: mix_scalar(first.specular_ior_level, second.specular_ior_level),
             specular_tint: mix3(first.specular_tint, second.specular_tint),
             anisotropic_ior: mix_scalar(first.anisotropic_ior, second.anisotropic_ior),
@@ -378,6 +394,7 @@ impl BsdfParams {
     fn add(first: Self, second: Self) -> Self {
         let add3 = |a: [f64; 3], b: [f64; 3]| [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
         let coat = combine_layers(first.coat_layer(), 1.0, second.coat_layer(), 1.0);
+        let sheen = combine_layers(first.sheen_layer(), 1.0, second.sheen_layer(), 1.0);
         Self {
             base_color: [
                 first.base_color[0] + second.base_color[0],
@@ -409,9 +426,9 @@ impl BsdfParams {
             coat_weight: coat.weight,
             coat_roughness: coat.roughness,
             coat_ior: first.coat_ior,
-            sheen_weight: first.sheen_weight.max(second.sheen_weight),
-            sheen_roughness: first.sheen_roughness.min(second.sheen_roughness),
-            sheen_tint: add3(first.sheen_tint, second.sheen_tint),
+            sheen_weight: sheen.weight,
+            sheen_roughness: sheen.roughness,
+            sheen_tint: sheen.tint,
             specular_ior_level: first.specular_ior_level.max(second.specular_ior_level),
             specular_tint: add3(first.specular_tint, second.specular_tint),
             anisotropic_ior: first.anisotropic_ior.max(second.anisotropic_ior),
@@ -1325,7 +1342,7 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
             .try_into()
             .map_err(|_| invalid("invalid coat tint"))?;
         params.sheen_weight = self.scalar_input(id, &["Sheen Weight", "Sheen"], 0.0)?;
-        params.sheen_roughness = self.scalar_input(id, &["Sheen Roughness"], 0.3)?;
+        params.sheen_roughness = self.scalar_input(id, &["Sheen Roughness"], 0.5)?;
         params.sheen_tint = self.color_input(id, &["Sheen Tint"], [1.0, 1.0, 1.0, 1.0])?[..3]
             .try_into()
             .map_err(|_| invalid("invalid sheen tint"))?;

@@ -27,6 +27,18 @@ TABLES = [
     ("table_ggx_E", "GGX_E", 1024),
     ("table_ggx_Eavg", "GGX_E_AVG", 32),
     ("table_ggx_gen_schlick_ior_s", "GGX_GEN_SCHLICK_IOR_S", 4096),
+    ("table_sheen_ltc", "SHEEN_LTC", 3072),
+]
+
+# Statics whose Cycles literals include a value that clippy's `approx_constant` lint reads as a math
+# constant: the sheen table holds ln 2 as 0.69314. The literal stays verbatim, and the expectation is
+# explicit, so a table that stops containing it fails the build rather than hiding the lint.
+APPROX_CONSTANT_TABLES = {"SHEEN_LTC"}
+APPROX_CONSTANT_EXPECT = [
+    "#[expect(",
+    "    clippy::approx_constant,",
+    '    reason = "Cycles\' sheen table holds ln 2 as 0.69314 verbatim"',
+    ")]",
 ]
 
 # Float literal as written in the Cycles source, with the C `f` suffix already removed.
@@ -105,8 +117,11 @@ def group_fraction_digits(literal):
 
 
 def render_static(rust_name, values):
+    attributes = ["#[rustfmt::skip]"]
+    if rust_name in APPROX_CONSTANT_TABLES:
+        attributes = [*APPROX_CONSTANT_EXPECT, *attributes]
     lines = [
-        "#[rustfmt::skip]",
+        *attributes,
         f"pub(crate) static {rust_name}: [f32; {len(values)}] = [",
         *wrap_values([group_fraction_digits(value) for value in values]),
         "];",

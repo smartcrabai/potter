@@ -32,7 +32,8 @@ use super::{
     },
     path::object_for_index,
     principled_bsdf::{
-        coat_coefficient, coat_lower_factor, diffuse_coefficient, specular_coefficient,
+        Layers, coat_coefficient, diffuse_coefficient, layers as principled_layers,
+        sheen_coefficient, specular_coefficient,
     },
     raster::{
         AlphaMode, Line, Mode, SurfaceHit, SurfaceShader, Triangle, blend_color,
@@ -1942,7 +1943,11 @@ fn shade(
         })
         .filter(|direction| direction.length_squared() > f64::EPSILON)
         .unwrap_or(normal);
+    // The lobes' layers are set up once here for the camera view, shared by every light below.
+    let shading = principled_layers(&lobe, normal, view);
     if matches!(mode, Mode::Solid) {
+        // Solid shades its fixed lights against the normal, so its layers take the normal as view.
+        let solid_shading = principled_layers(&lobe, normal, normal);
         result += albedo * 0.30;
         for (direction, intensity, color) in [
             (
@@ -1956,7 +1961,7 @@ fn shade(
                 DVec3::new(0.72, 0.82, 1.0),
             ),
         ] {
-            result += punctual_radiance(&lobe, normal, normal, -direction, color, intensity);
+            result += punctual_radiance(&lobe, &solid_shading, -direction, color, intensity);
         }
     } else {
         if let Some(world) = scene
@@ -1968,7 +1973,7 @@ fn shade(
             let metallic = params.metallic.clamp(0.0, 1.0);
             let roughness = params.roughness.clamp(0.0, 1.0);
             // The coat attenuates every layer below it, including the environment terms.
-            let lower = coat_lower_factor(params, view);
+            let lower = shading.lower();
             result += albedo * diffuse_environment * (1.0 - metallic) * lower;
             let reflection = (-view + normal * (2.0 * normal.dot(view))).normalize_or_zero();
             let specular_environment =
@@ -1998,8 +2003,8 @@ fn shade(
                 shadow_point,
                 normal,
                 geometric,
-                view,
                 &lobe,
+                &shading,
                 shadow,
                 point_shadow,
             );
@@ -2020,9 +2025,7 @@ fn shade(
     // EEVEE nor Cycles clamps the strength (gpu_shader_material_principled.glsl:179,
     // intern/cycles/kernel/svm/closure.h:206-207).
     let emission = if matches!(mode, Mode::Beauty) {
-        DVec3::from_array(params.emission_color)
-            * params.emission_strength
-            * coat_lower_factor(params, view)
+        DVec3::from_array(params.emission_color) * params.emission_strength * shading.lower()
     } else {
         DVec3::ZERO
     };
@@ -2070,8 +2073,8 @@ fn light_contribution(
     shadow_point: DVec3,
     normal: DVec3,
     geometric: DVec3,
-    view: DVec3,
     params: &BsdfParams,
+    shading: &Layers,
     shadow: ShadowContext<'_>,
     point_shadow: Option<&PointShadowMap>,
 ) -> DVec3 {
@@ -2081,7 +2084,7 @@ fn light_contribution(
     match light.light_type {
         crate::model::LightType::Sun => {
             let toward_light = matrix.transform_vector3(DVec3::Z).normalize_or_zero();
-            punctual_radiance(params, normal, view, toward_light, color, energy)
+            punctual_radiance(params, shading, toward_light, color, energy)
                 * visibility_for_light(
                     shadow,
                     point_shadow,
@@ -2097,8 +2100,7 @@ fn light_contribution(
             let toward_light = delta.normalize_or_zero();
             punctual_radiance(
                 params,
-                normal,
-                view,
+                shading,
                 toward_light,
                 color,
                 point_intensity(energy) / distance_squared,
@@ -2123,8 +2125,7 @@ fn light_contribution(
             }
             punctual_radiance(
                 params,
-                normal,
-                view,
+                shading,
                 toward_light,
                 color,
                 (point_intensity(energy) / distance_squared) * falloff,
@@ -2169,11 +2170,12 @@ fn light_contribution(
                 return DVec3::ZERO;
             }
             // Integrated Lambert irradiance is exact for rectangles and the visibility weight
-            // scales it. The specular lobe is evaluated towards the emitter centre.
+            // scales it. The specular, sheen and coat lobes are evaluated towards the emitter centre.
             let toward_centre = (position - point).normalize_or_zero();
-            (diffuse_coefficient(params, normal, view)
-                + specular_coefficient(params, normal, view, toward_centre)
-                + coat_coefficient(params, view, toward_centre))
+            (diffuse_coefficient(params, shading)
+                + specular_coefficient(params, shading, toward_centre)
+                + sheen_coefficient(params, shading, toward_centre)
+                + coat_coefficient(params, shading, toward_centre))
                 * color
                 * (irradiance * visible_weight / total_weight)
         }
@@ -2268,23 +2270,24 @@ fn shadow_visibility(
     visible / 9.0
 }
 
-/// Radiance a point, spot or sun light reflects toward `view`: the Principled diffuse and specular
-/// lobes along `light`, times the light colour and `intensity` weighted by the receiver cosine.
+/// Radiance a point, spot or sun light reflects toward the view of `shading`: the Principled
+/// diffuse, specular, sheen and coat lobes along `light`, times the light colour and `intensity`
+/// weighted by the receiver cosine.
 fn punctual_radiance(
     params: &BsdfParams,
-    normal: DVec3,
-    view: DVec3,
+    shading: &Layers,
     light: DVec3,
     color: DVec3,
     intensity: f64,
 ) -> DVec3 {
-    let normal_light_cosine = normal.dot(light).max(0.0);
+    let normal_light_cosine = shading.normal.dot(light).max(0.0);
     if normal_light_cosine <= 0.0 {
         return DVec3::ZERO;
     }
-    (diffuse_coefficient(params, normal, view)
-        + specular_coefficient(params, normal, view, light)
-        + coat_coefficient(params, view, light))
+    (diffuse_coefficient(params, shading)
+        + specular_coefficient(params, shading, light)
+        + sheen_coefficient(params, shading, light)
+        + coat_coefficient(params, shading, light))
         * color
         * (intensity * normal_light_cosine)
 }
@@ -2305,7 +2308,9 @@ mod shading_normal_tests {
         extract_geometry, source_has_color_layer, subdivide_displaced, surface_shader,
         triangle_corners, triangle_layer_colors, triangle_layer_uvs, world_face_normals,
     };
-    use crate::render::principled_bsdf::{diffuse_coefficient, specular_coefficient};
+    use crate::render::principled_bsdf::{
+        diffuse_coefficient, layers as principled_layers, specular_coefficient,
+    };
     use crate::shader::BsdfParams;
     use crate::{
         eval::{EvaluationContext, Snapshot},
@@ -2997,11 +3002,16 @@ mod shading_normal_tests {
         let centre_direction = (centre - point).normalize_or_zero();
         assert!(centre_direction.dot(normal) < 0.0);
         assert_eq!(
-            specular_coefficient(&params, normal, normal, centre_direction),
+            specular_coefficient(
+                &params,
+                &principled_layers(&params, normal, normal),
+                centre_direction
+            ),
             DVec3::ZERO,
             "the specular lobe towards a below-horizon centre is zero"
         );
-        let output = diffuse_coefficient(&params, normal, normal) * irradiance;
+        let output =
+            diffuse_coefficient(&params, &principled_layers(&params, normal, normal)) * irradiance;
         assert!(
             output.x > 0.0,
             "visible upper strip must retain diffuse light: {output:?}"
