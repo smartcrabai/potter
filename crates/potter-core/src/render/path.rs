@@ -14,7 +14,9 @@ use crate::{
     },
 };
 
-use super::principled_bsdf::{continuous_density, evaluate as evaluate_bsdf, lobe_probabilities};
+use super::principled_bsdf::{
+    coat_lower_factor, continuous_density, evaluate as evaluate_bsdf, lobe_probabilities,
+};
 use super::{
     bvh::{Bvh, BvhHit},
     light_model::{
@@ -960,7 +962,8 @@ fn trace_path(
             // Cycles shades the surface for emission, then ends the path (`integrate_surface_terminate`).
             radiance += throughput
                 * DVec3::from_array(surface.params.emission_color)
-                * surface.params.emission_strength;
+                * surface.params.emission_strength
+                * coat_lower_factor(&surface.params, -direction);
             break;
         }
         if rng.next_f64() >= surface.params.alpha.clamp(0.0, 1.0) {
@@ -971,7 +974,8 @@ fn trace_path(
         }
         radiance += throughput
             * DVec3::from_array(surface.params.emission_color)
-            * surface.params.emission_strength;
+            * surface.params.emission_strength
+            * coat_lower_factor(&surface.params, -direction);
         radiance += throughput
             * direct_lighting(
                 doc,
@@ -1120,10 +1124,14 @@ fn write_center_passes(
                 1.0,
             ));
             output.albedo[index] = surface.params.base_color.map(finite_f32);
+            // The emission pass is the beauty's emission term: the coat attenuates it per channel.
+            let emission = DVec3::from_array(surface.params.emission_color)
+                * surface.params.emission_strength
+                * coat_lower_factor(&surface.params, -direction);
             output.emission[index] = [
-                finite_f32(surface.params.emission_color[0] * surface.params.emission_strength),
-                finite_f32(surface.params.emission_color[1] * surface.params.emission_strength),
-                finite_f32(surface.params.emission_color[2] * surface.params.emission_strength),
+                finite_f32(emission.x),
+                finite_f32(emission.y),
+                finite_f32(emission.z),
                 1.0,
             ];
             if film_transparent {
@@ -2014,7 +2022,7 @@ enum BsdfSample {
 }
 
 fn sample_bsdf(params: &BsdfParams, normal: DVec3, view: DVec3, rng: &mut Pcg32) -> BsdfSample {
-    let probabilities = lobe_probabilities(params);
+    let probabilities = lobe_probabilities(params, view);
     let choice = rng.next_f64();
     if choice < probabilities.transmission {
         let direction = refract(-view, normal, 1.0 / params.ior.max(1.0e-3))
@@ -2026,14 +2034,21 @@ fn sample_bsdf(params: &BsdfParams, normal: DVec3, view: DVec3, rng: &mut Pcg32)
         );
         let weight = tint
             * (params.reflectance.clamp(0.0, 1.0) * params.transmission.clamp(0.0, 1.0)
-                / probabilities.transmission.max(1.0e-8));
+                / probabilities.transmission.max(1.0e-8))
+            * coat_lower_factor(params, view);
         return BsdfSample::Delta { direction, weight };
     }
-    let direction = if choice >= probabilities.transmission + probabilities.diffuse {
-        let half_vector = sample_ggx_half(normal, params.roughness, rng);
+    let diffuse_end = probabilities.transmission + probabilities.diffuse;
+    let coat_end = diffuse_end + probabilities.coat;
+    let direction = if choice < diffuse_end {
+        sample_cosine_hemisphere(normal, rng).0
+    } else if choice < coat_end {
+        let half_vector =
+            sample_ggx_half(params.coat_normal_or_shading(), params.coat_roughness, rng);
         reflect(-view, half_vector).normalize_or_zero()
     } else {
-        sample_cosine_hemisphere(normal, rng).0
+        let half_vector = sample_ggx_half(normal, params.roughness, rng);
+        reflect(-view, half_vector).normalize_or_zero()
     };
     // Estimator `f cos / p_mix`: the density is the lobe mixture, not the branch's own lobe.
     let pdf = continuous_density(params, normal, view, direction);
