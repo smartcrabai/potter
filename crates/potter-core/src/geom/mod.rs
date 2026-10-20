@@ -1610,6 +1610,7 @@ mod tests {
         assert!(matches!(sphere, Err(MeshError::IdExhausted)));
     }
 
+    #[test]
     fn cone_supports_zero_radius_at_either_end() {
         let inverted = Mesh::cone(ConeParams {
             radius1: 0.0,
