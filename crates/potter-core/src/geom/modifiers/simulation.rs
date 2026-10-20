@@ -1208,11 +1208,13 @@ mod tests {
         )?;
         assert_eq!(result.vertices.len(), mesh.vertices.len());
         assert_eq!(result.faces.len(), mesh.faces.len());
+        // Blender's plane vertices (`plane_size_2`: (-1,-1), (1,-1), (-1,1), (1,1)), rotated by the
+        // test's quaternion: local (x, y, 0) lands at world (2, y, x).
         let expected = [
             DVec3::new(2.0, -1.0, -1.0),
             DVec3::new(2.0, -1.0, 1.0),
-            DVec3::new(2.0, 1.0, 1.0),
             DVec3::new(2.0, 1.0, -1.0),
+            DVec3::new(2.0, 1.0, 1.0),
         ];
         for (vertex, expected) in result.vertices.iter().zip(expected) {
             assert!(
