@@ -385,6 +385,19 @@ fn assemble_cone(
     result.into_mesh()
 }
 
+/// Polygons built face by face in BMesh order (`BM_face_create_verts` with `create_edges`), for
+/// primitives whose edges follow their faces: the closing edge of each face is created first.
+pub(super) fn polygons(positions: Vec<DVec3>, polygons: &[Vec<usize>]) -> Result<Mesh, MeshError> {
+    let mut elements = Elements::default();
+    for position in positions {
+        elements.vertex(position);
+    }
+    for polygon in polygons {
+        elements.face(polygon);
+    }
+    elements.into_mesh()
+}
+
 /// A torus (`add_torus` in `scripts/startup/bl_operators/add_mesh_torus.py`): its vertices and faces
 /// are given, and its edges follow the closing-first face walk, each stored lower vertex first.
 pub(super) fn torus(positions: Vec<DVec3>, polygons: &[Vec<usize>]) -> Result<Mesh, MeshError> {

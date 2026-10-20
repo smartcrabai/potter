@@ -1138,7 +1138,7 @@ impl Mesh {
         for added in added_faces.into_iter().rev() {
             polygons.extend(added);
         }
-        Self::from_positions_and_faces(positions, polygons)
+        primitive_order::polygons(positions, &polygons)
     }
 
     /// Create a Blender-default or customized XY circle with optional fill.

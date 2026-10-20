@@ -9,7 +9,7 @@ use std::error::Error;
 use glam::DVec3;
 use potter_core::geom::{
     BoxParams, CircleFillType, CircleParams, ConeParams, CylinderParams, EndFillType, GridParams,
-    Mesh, PlaneParams, TorusParams,
+    IcosphereParams, Mesh, PlaneParams, TorusParams,
 };
 use serde_json::Value;
 
@@ -251,4 +251,14 @@ fn torus_storage_order_matches_blender() -> TestResult {
     };
     assert_matches("torus_8x4", &torus(8, 4)?, &cases)?;
     assert_matches("torus_default", &torus(48, 12)?, &cases)
+}
+
+#[test]
+fn icosphere_level_one_storage_order_matches_blender() -> TestResult {
+    let cases = oracle()?;
+    let icosphere = Mesh::icosphere(IcosphereParams {
+        subdivisions: 1,
+        radius: 1.0,
+    })?;
+    assert_matches("ico_sphere_1", &icosphere, &cases)
 }
