@@ -34,9 +34,8 @@ pub(crate) fn dielectric_f0(ior: f64, level: f64) -> f64 {
 /// as `(feature_id, Blender input)` pairs in a fixed array, so checking a hit allocates nothing.
 pub(crate) fn unevaluated_principled_inputs(
     params: &BsdfParams,
-) -> [Option<(&'static str, &'static str)>; 8] {
+) -> [Option<(&'static str, &'static str)>; 7] {
     [
-        (params.coat_weight > 0.0).then_some(("shader.principled.coat", "Coat Weight")),
         (params.sheen_weight > 0.0).then_some(("shader.principled.sheen", "Sheen Weight")),
         (params.subsurface_weight > 0.0)
             .then_some(("shader.principled.subsurface", "Subsurface Weight")),
@@ -156,6 +155,11 @@ pub struct BsdfParams {
     pub coat_weight: f64,
     pub coat_roughness: f64,
     pub coat_ior: f64,
+    /// Coat Tint: the colour the coat absorbs on the way in and out (Cycles' coat tint).
+    pub coat_tint: [f64; 3],
+    /// Coat Normal, which the coat lobe and its tint use. `None` (unlinked) follows the final
+    /// shading normal, so a bump or a flip applies to the coat too, as Cycles' `sd->N` does.
+    pub coat_normal: Option<DVec3>,
     pub sheen_weight: f64,
     pub sheen_roughness: f64,
     pub sheen_tint: [f64; 3],
@@ -182,6 +186,47 @@ pub struct BsdfParams {
     pub volume_emission: [f64; 3],
     pub displacement_height: f64,
     pub normal: DVec3,
+}
+
+/// One layered closure's parameters, as Mix and Add combine them.
+#[derive(Clone, Copy)]
+struct LayerSide {
+    weight: f64,
+    tint: [f64; 3],
+    roughness: f64,
+    normal: DVec3,
+}
+
+/// The one rule for layered-lobe parameters under Mix and Add. Each side's layer enters with its
+/// share (`1 - f` and `f` for Mix, 1 and 1 for Add). The combined weight is the sum of the scaled
+/// weights, so `weight · tint` adds as the closures do. The tint, roughness and normal are averages
+/// weighted by the same scaled weights. With no weight on either side, the first side's values stand.
+fn combine_layers(
+    first: LayerSide,
+    first_share: f64,
+    second: LayerSide,
+    second_share: f64,
+) -> LayerSide {
+    let first_term = first_share * first.weight.max(0.0);
+    let second_term = second_share * second.weight.max(0.0);
+    let weight = first_term + second_term;
+    if weight <= 0.0 {
+        return LayerSide { weight, ..first };
+    }
+    let average = |a: f64, b: f64| (first_term * a + second_term * b) / weight;
+    LayerSide {
+        weight,
+        tint: [
+            average(first.tint[0], second.tint[0]),
+            average(first.tint[1], second.tint[1]),
+            average(first.tint[2], second.tint[2]),
+        ],
+        roughness: average(first.roughness, second.roughness),
+        normal: normalize_or(
+            first.normal * first_term + second.normal * second_term,
+            first.normal,
+        ),
+    }
 }
 
 impl BsdfParams {
@@ -224,6 +269,23 @@ impl BsdfParams {
                 .map(|channel| channel * material.emission_strength.max(0.0) * density),
             displacement_height: 0.0,
             normal: normalize_or(normal, DVec3::Z),
+            coat_tint: [1.0; 3],
+            coat_normal: None,
+        }
+    }
+
+    /// The coat's normal: the linked Coat Normal, or the final shading normal when unlinked.
+    pub(crate) fn coat_normal_or_shading(&self) -> DVec3 {
+        self.coat_normal.unwrap_or(self.normal)
+    }
+
+    /// The coat as one layered closure, for `combine_layers`.
+    fn coat_layer(&self) -> LayerSide {
+        LayerSide {
+            weight: self.coat_weight,
+            tint: self.coat_tint,
+            roughness: self.coat_roughness,
+            normal: self.coat_normal_or_shading(),
         }
     }
 
@@ -267,6 +329,9 @@ impl BsdfParams {
             mix_scalar(first.base_color[2], second.base_color[2]),
             mix_scalar(first.base_color[3], second.base_color[3]),
         ];
+        // The coat is shading like every other field, so it takes the same share of the hits (`shade`), not the raw
+        // factor: a Transparent arm then adds no coat, as it adds no colour.
+        let coat = combine_layers(first.coat_layer(), 1.0 - shade, second.coat_layer(), shade);
         Self {
             base_color,
             metallic: mix_scalar(first.metallic, second.metallic),
@@ -281,8 +346,8 @@ impl BsdfParams {
             subsurface_weight: mix_scalar(first.subsurface_weight, second.subsurface_weight),
             subsurface_radius: mix3(first.subsurface_radius, second.subsurface_radius),
             subsurface_scale: mix_scalar(first.subsurface_scale, second.subsurface_scale),
-            coat_weight: mix_scalar(first.coat_weight, second.coat_weight),
-            coat_roughness: mix_scalar(first.coat_roughness, second.coat_roughness),
+            coat_weight: coat.weight,
+            coat_roughness: coat.roughness,
             coat_ior: mix_scalar(first.coat_ior, second.coat_ior),
             sheen_weight: mix_scalar(first.sheen_weight, second.sheen_weight),
             sheen_roughness: mix_scalar(first.sheen_roughness, second.sheen_roughness),
@@ -304,11 +369,15 @@ impl BsdfParams {
             volume_emission: mix3(first.volume_emission, second.volume_emission),
             displacement_height: mix_scalar(first.displacement_height, second.displacement_height),
             normal: normalize_or(first.normal.lerp(second.normal, shade), first.normal),
+            coat_tint: coat.tint,
+            coat_normal: (first.coat_normal.is_some() || second.coat_normal.is_some())
+                .then_some(coat.normal),
         }
     }
 
     fn add(first: Self, second: Self) -> Self {
         let add3 = |a: [f64; 3], b: [f64; 3]| [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
+        let coat = combine_layers(first.coat_layer(), 1.0, second.coat_layer(), 1.0);
         Self {
             base_color: [
                 first.base_color[0] + second.base_color[0],
@@ -337,8 +406,8 @@ impl BsdfParams {
             subsurface_weight: first.subsurface_weight.max(second.subsurface_weight),
             subsurface_radius: add3(first.subsurface_radius, second.subsurface_radius),
             subsurface_scale: first.subsurface_scale.max(second.subsurface_scale),
-            coat_weight: first.coat_weight.max(second.coat_weight),
-            coat_roughness: first.coat_roughness.min(second.coat_roughness),
+            coat_weight: coat.weight,
+            coat_roughness: coat.roughness,
             coat_ior: first.coat_ior,
             sheen_weight: first.sheen_weight.max(second.sheen_weight),
             sheen_roughness: first.sheen_roughness.min(second.sheen_roughness),
@@ -357,6 +426,9 @@ impl BsdfParams {
             volume_emission: add3(first.volume_emission, second.volume_emission),
             displacement_height: first.displacement_height + second.displacement_height,
             normal: normalize_or(first.normal + second.normal, first.normal),
+            coat_tint: coat.tint,
+            coat_normal: (first.coat_normal.is_some() || second.coat_normal.is_some())
+                .then_some(coat.normal),
         }
     }
 }
@@ -1249,6 +1321,9 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
         params.coat_roughness =
             self.scalar_input(id, &["Coat Roughness", "Clearcoat Roughness"], 0.03)?;
         params.coat_ior = self.scalar_input(id, &["Coat IOR"], 1.5)?;
+        params.coat_tint = self.color_input(id, &["Coat Tint"], [1.0, 1.0, 1.0, 1.0])?[..3]
+            .try_into()
+            .map_err(|_| invalid("invalid coat tint"))?;
         params.sheen_weight = self.scalar_input(id, &["Sheen Weight", "Sheen"], 0.0)?;
         params.sheen_roughness = self.scalar_input(id, &["Sheen Roughness"], 0.3)?;
         params.sheen_tint = self.color_input(id, &["Sheen Tint"], [1.0, 1.0, 1.0, 1.0])?[..3]
@@ -1278,6 +1353,10 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
             self.vector_input(id, &["Normal"], self.hit_ctx.normal)?,
             self.hit_ctx.normal,
         );
+        // An unlinked socket has no vector (zero or non-finite), so the coat follows the final normal.
+        let coat_normal = self.vector_input(id, &["Coat Normal"], DVec3::ZERO)?;
+        params.coat_normal =
+            (coat_normal.length_squared() > f64::EPSILON).then(|| coat_normal.normalize());
         record_unevaluated_inputs(
             self.hit_ctx.warnings,
             &self.material.name,
@@ -2980,14 +3059,15 @@ mod tests {
         evaluate_surface(&native, &context).unwrap();
         evaluate_surface(&native, &context).unwrap();
 
-        // A graph material sets coat and rough transmission on its Principled node.
+        // A graph material sets subsurface and rough transmission on its Principled node. Coat is
+        // evaluated, so it must not warn.
         let mut graph = NodeGroup::new("Graph", GraphKind::Shader);
         insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
         insert_node(
             &mut graph,
             "principled",
             "ShaderNodeBsdfPrincipled",
-            json!({"Coat Weight":0.5,"Transmission Weight":0.5,"Roughness":0.3}),
+            json!({"Subsurface Weight":0.5,"Transmission Weight":0.5,"Roughness":0.3}),
         );
         link(&mut graph, "principled", "BSDF", "output", "Surface");
         let graph_id = Id::new("graph_shader".to_owned()).unwrap();
@@ -3013,15 +3093,41 @@ mod tests {
                 .count()
         };
         assert_eq!(count("Native", "Transmission Weight"), 1);
-        assert_eq!(count("Graph", "Coat Weight"), 1);
+        assert_eq!(count("Graph", "Subsurface Weight"), 1);
+        assert_eq!(count("Graph", "Coat Weight"), 0);
         assert_eq!(count("Graph", "Transmission Weight"), 1);
         let native_warning = warnings.iter().find(|w| w["material"] == "Native").unwrap();
         assert!(native_warning.get("node_id").is_none());
-        let coat_warning = warnings
+        let subsurface_warning = warnings
             .iter()
-            .find(|w| w["input"] == "Coat Weight")
+            .find(|w| w["input"] == "Subsurface Weight")
             .unwrap();
-        assert_eq!(coat_warning["node_id"], "principled");
+        assert_eq!(subsurface_warning["node_id"], "principled");
+    }
+
+    #[test]
+    fn add_of_two_coats_adds_weight_times_tint_and_averages_the_rest() {
+        let close = |a: [f64; 3], b: [f64; 3]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-12);
+        let mut first = BsdfParams::from_material(&Material::default(), DVec3::Z);
+        first.coat_weight = 0.5;
+        first.coat_tint = [1.0, 0.5, 0.25];
+        first.coat_roughness = 0.1;
+        let mut second = BsdfParams::from_material(&Material::default(), DVec3::Z);
+        second.coat_weight = 0.2;
+        second.coat_tint = [0.2, 0.2, 0.2];
+        second.coat_roughness = 0.3;
+        // weight · tint adds: 0.5·[1, 0.5, 0.25] + 0.2·[0.2, 0.2, 0.2], over the summed weight 0.7.
+        let sum = BsdfParams::add(first, second);
+        assert!((sum.coat_weight - 0.7).abs() < 1e-12);
+        assert!(close(sum.coat_tint, [0.54 / 0.7, 0.29 / 0.7, 0.165 / 0.7]));
+        assert!((sum.coat_roughness - (0.05 + 0.06) / 0.7).abs() < 1e-12);
+        // Unlinked on both sides, the coat keeps following the shading normal.
+        assert_eq!(sum.coat_normal, None);
+        // A linked normal on one side enters the average with that side's weight.
+        second.coat_normal = Some(DVec3::X);
+        let sum = BsdfParams::add(first, second);
+        let expected = (DVec3::Z * 0.5 + DVec3::X * 0.2).normalize();
+        assert!((sum.coat_normal.unwrap_or(DVec3::ZERO) - expected).length() < 1e-12);
     }
 
     #[test]

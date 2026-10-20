@@ -1,0 +1,32 @@
+{
+  "provenance": {
+    "blender": "5.2.2",
+    "engine": "CYCLES",
+    "device": "CPU",
+    "threads": 1,
+    "samples": 4096,
+    "seeds": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+    "resolution": 16,
+    "patch": "central 8x8",
+    "generator": "tests/fixtures/native_oracle/principled/single_bounce_probe.py with PROBE_DIAMETER=2.4 (16 seeds; variants coat_r024 and coat_tint_diffuse)",
+    "geometry": {
+      "receiver": "plane at origin, normal +Z",
+      "view_theta_deg": 45.0,
+      "view_distance": 6.0,
+      "light_distance": 4.0,
+      "light_diameter": 2.4,
+      "power": 1000.0,
+      "world": "black"
+    }
+  },
+  "variants": {
+    "coat_r024": {
+      "mean": [3.1925355992279947, 3.1925355992279947, 3.1925355992279947],
+      "stderr": [3.107007194890755e-4, 3.107007194890755e-4, 3.107007194890755e-4]
+    },
+    "coat_tint_diffuse": {
+      "mean": [5.929943926632404, 4.795929251704365, 4.279176461044699],
+      "stderr": [8.170508334674762e-4, 8.176943583903099e-4, 8.181972915078506e-4]
+    }
+  }
+}
