@@ -56,8 +56,8 @@ pub(crate) fn vertex_size() -> f64 {
     (3.0 * std::f64::consts::SQRT_2 / 2.0).max(1.0)
 }
 
-/// A point of the wireframe overlay: a loose vertex (`radius` is `None`, drawn at `2 · vert` pixels) or a
-/// point-cloud point (`radius` in world units, drawn `2 · radius` pixels across).
+/// A point of the wireframe overlay: a loose vertex or a point-cloud point, each drawn as a `2 · vert` pixel
+/// square. `radius` (world units, `None` for a loose vertex) is recorded but does not change the square.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct WirePoint {
     pub(crate) position: DVec3,

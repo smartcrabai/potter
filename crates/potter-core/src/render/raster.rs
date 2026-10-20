@@ -1087,11 +1087,10 @@ pub(crate) fn rasterize_wireframe(
         let Some(projected) = project_world(camera, &frame, width, height, point.position) else {
             continue;
         };
-        // A loose vertex is `2 · vert` pixels across; a point-cloud point is `2 · radius` in pixels.
-        let side = match point.radius {
-            None => 2.0 * wireframe::vertex_size(),
-            Some(radius) => 2.0 * radius * projected.pixel_scale,
-        };
+        // Every point is a square of `2 · vert` pixels: measured on the Metal capture of point clouds of
+        // four radii (0.05 to 0.2), the square does not grow with the radius, and the partial outline
+        // around larger dots has no radius rule that fits (a ring fit is worse than the square alone).
+        let side = 2.0 * wireframe::vertex_size();
         squares.push(PointSquare {
             centre_x: projected.x + 0.5,
             centre_y: projected.y + 0.5,
