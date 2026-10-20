@@ -20,7 +20,8 @@ use super::principled_bsdf::{
 use super::{
     bvh::{Bvh, BvhHit},
     light_model::{
-        AreaShape, area_radiance, area_shape, emitter_radiance, point_intensity, spot_attenuation,
+        AreaShape, Spread, area_radiance, area_shape, emitter_radiance, inside_emitter,
+        point_intensity, spot_attenuation, spread_attenuation, spread_region,
     },
     raster::{
         Camera, Mode, RasterOutput, StereoMode, blend_corner_normals, camera_eye,
@@ -51,18 +52,24 @@ struct PointLight {
     spot_blend: f64,
     /// The emitting shape of an area light; `None` for every other light type.
     area: Option<AreaShape>,
+    /// Blender's area `spread` below π, as a cone about the emitting normal; `None` at the default.
+    spread: Option<Spread>,
     /// Blender's `use_multiple_importance_sampling`: a BSDF-sampled ray may hit this light.
     use_mis: bool,
 }
 
 impl PointLight {
     /// Whether a BSDF-sampled ray can hit this light (Cycles' `SHADER_USE_MIS`, set by
-    /// `AreaLight::copy_to_kernel` for an emitter with area and by `PointLight::copy_to_kernel` for
-    /// a radius). Zero-radius point and spot lights are delta lights, and the sun is never hit.
+    /// `AreaLight::copy_to_kernel` for an emitter with area and a spread above zero, and by
+    /// `PointLight::copy_to_kernel` for a radius). Zero-radius point and spot lights are delta
+    /// lights, and the sun is never hit.
     fn hittable(&self) -> bool {
         self.use_mis
             && match self.kind {
-                LightType::Area => self.area.is_some_and(|shape| shape.area > 0.0),
+                LightType::Area => {
+                    self.area.is_some_and(|shape| shape.area > 0.0)
+                        && self.spread.is_none_or(|spread| !spread.is_zero())
+                }
                 LightType::Point | LightType::Spot => self.radius > 0.0,
                 LightType::Sun => false,
             }
@@ -1804,29 +1811,45 @@ fn sample_light(light: &PointLight, point: DVec3, rng: &mut Pcg32) -> Option<Lig
     })
 }
 
-/// Samples a point uniformly over an area light and returns its direct-light estimator.
+/// Samples a point over an area light's region and returns its direct-light estimator.
 ///
-/// Blender's area light has radiance `L = strength * invarea / π`, with `invarea = 1 / area` for
+/// Blender's area light has radiance `L = strength · invarea / π`, with `invarea = 1 / area` for
 /// a non-normalised area (`intern/cycles/scene/light.cpp`, `AreaLight::copy_to_kernel`), and its
 /// kernel evaluates `eval_fac = M_1_PI_F * invarea` (`intern/cycles/kernel/light/area.h`,
 /// `area_light_eval`). The light emits from its front side only (`area_light_sample` rejects
 /// points behind the plane). Uniform area sampling has pdf `1 / area`, and converting to solid
 /// angle gives pdf `d² / (area · cos_light)`, so the estimator is `L · area · cos_light / d²`.
+///
+/// A spread draws the point from the region the cone reaches (`spread_region`) and scales `L` by
+/// `spread_attenuation`, as `area_light_eval` does. The pdf is over that region, the one a
+/// BSDF-sampled ray is weighted with in `light_hit`.
 fn sample_area_light(light: &PointLight, point: DVec3, rng: &mut Pcg32) -> Option<LightSample> {
     let shape = light.area?;
     if shape.area <= 0.0 {
         return None;
     }
-    let (local_u, local_v) = if shape.ellipse {
+    let (centre, region) = match light.spread {
+        None => (light.position, shape),
+        Some(spread) if spread.is_zero() => return sample_spread_line(light, &shape, point),
+        Some(spread) => spread_region(&shape, light.position, light.direction, spread, point)?,
+    };
+    if region.area <= 0.0 {
+        return None;
+    }
+    let (local_u, local_v) = if region.ellipse {
         let radius = rng.next_f64().sqrt();
         let angle = rng.next_f64() * std::f64::consts::TAU;
         (radius * angle.cos(), radius * angle.sin())
     } else {
         (2.0 * rng.next_f64() - 1.0, 2.0 * rng.next_f64() - 1.0)
     };
-    let target = light.position
-        + shape.axis_u * (shape.half_u * local_u)
-        + shape.axis_v * (shape.half_v * local_v);
+    let target = centre
+        + region.axis_u * (region.half_u * local_u)
+        + region.axis_v * (region.half_v * local_v);
+    // A disk region may overhang the emitter, which emits nothing outside its shape.
+    if !inside_emitter(&shape, light.position, target) {
+        return None;
+    }
     let offset = target - point;
     let distance_squared = offset.length_squared();
     if distance_squared <= f64::EPSILON || !distance_squared.is_finite() {
@@ -1838,12 +1861,40 @@ fn sample_area_light(light: &PointLight, point: DVec3, rng: &mut Pcg32) -> Optio
     if cos_light <= 0.0 {
         return None;
     }
-    let emitted = light.color * area_radiance(light.energy, shape.area);
+    let attenuation = light.spread.map_or(1.0, |spread| {
+        spread_attenuation(spread, -direction, light.direction)
+    });
+    if attenuation <= 0.0 {
+        return None;
+    }
+    let emitted = light.color * (area_radiance(light.energy, shape.area) * attenuation);
     Some(LightSample {
         direction,
         distance,
-        radiance: emitted * (shape.area * cos_light / distance_squared),
-        pdf: distance_squared / (shape.area * cos_light),
+        radiance: emitted * (region.area * cos_light / distance_squared),
+        pdf: distance_squared / (region.area * cos_light),
+    })
+}
+
+/// A zero spread emits along the normal alone, so a receiver sees the emitter only at its foot on
+/// the emitter's plane, if that foot is on the emitter. Cycles samples that point with pdf 1
+/// (`area_light_eval`, `tan_half_spread == 0`), so it is a delta here, as the sun is, weighted by
+/// Cycles' `eval_fac` on the normal: `π` times the radiance. A Blender render of a zero spread
+/// lights exactly the receivers under the emitter.
+fn sample_spread_line(light: &PointLight, shape: &AreaShape, point: DVec3) -> Option<LightSample> {
+    let distance = light.direction.dot(point - light.position);
+    if distance <= 0.0 {
+        return None;
+    }
+    let foot = point - distance * light.direction;
+    if !inside_emitter(shape, light.position, foot) {
+        return None;
+    }
+    Some(LightSample {
+        direction: -light.direction,
+        distance,
+        radiance: light.color * (area_radiance(light.energy, shape.area) * std::f64::consts::PI),
+        pdf: 0.0,
     })
 }
 
@@ -1917,21 +1968,35 @@ fn light_hit(
         if !(distance > RAY_EPSILON && distance < limit) {
             return None;
         }
-        let offset = origin + direction * distance - light.position;
-        let u = offset.dot(shape.axis_u) / shape.half_u;
-        let v = offset.dot(shape.axis_v) / shape.half_v;
-        let inside = if shape.ellipse {
-            u * u + v * v <= 1.0
-        } else {
-            u.abs() <= 1.0 && v.abs() <= 1.0
-        };
-        if !inside {
+        let hit = origin + direction * distance;
+        if !inside_emitter(&shape, light.position, hit) {
             return None;
         }
-        let radiance = light.color * area_radiance(light.energy, shape.area);
+        // The region that light sampling draws from for `receiver`, and the spread factor towards it.
+        let (region_area, attenuation) = match light.spread {
+            None => (shape.area, 1.0),
+            Some(spread) => {
+                match spread_region(&shape, light.position, light.direction, spread, receiver) {
+                    Some((_, region)) => (
+                        region.area,
+                        spread_attenuation(
+                            spread,
+                            (receiver - hit).normalize_or_zero(),
+                            light.direction,
+                        ),
+                    ),
+                    None => (0.0, 0.0),
+                }
+            }
+        };
+        if region_area <= 0.0 || attenuation <= 0.0 {
+            // The cone does not reach the receiver, so the crossing emits nothing. It is still a
+            // pass: Cycles finds an emitter by its shape, not by what it emits.
+            return Some((distance, DVec3::ZERO, 0.0));
+        }
+        let radiance = light.color * (area_radiance(light.energy, shape.area) * attenuation);
         // The sampling density is per solid angle from the receiver, not from the advanced origin.
-        let pdf =
-            (origin + direction * distance - receiver).length_squared() / (shape.area * cos_light);
+        let pdf = (hit - receiver).length_squared() / (region_area * cos_light);
         return Some((distance, radiance, pdf));
     }
     let radius = light.radius;
@@ -2156,6 +2221,7 @@ fn collect_lights(doc: &SceneDoc, snapshot: &Snapshot) -> Vec<PointLight> {
                 spot_size: data.spot_size,
                 spot_blend: data.spot_blend,
                 area: (data.light_type == LightType::Area).then(|| area_shape(data, &matrix)),
+                spread: Spread::new(data.spread),
                 use_mis: data.use_multiple_importance_sampling,
             })
         })
@@ -2929,6 +2995,7 @@ mod volume_extinction_tests {
             radius: 0.0,
             soft_falloff: false,
             use_mis: false,
+            spread: None,
             spot_size: 0.0,
             spot_blend: 0.0,
             area: Some(AreaShape {
@@ -2970,6 +3037,7 @@ mod volume_extinction_tests {
             radius: 1.0e-6,
             soft_falloff: false,
             use_mis: false,
+            spread: None,
             spot_size: std::f64::consts::FRAC_PI_4,
             spot_blend: 0.15,
             area: None,
@@ -2998,6 +3066,7 @@ mod volume_extinction_tests {
             radius: 1.0,
             soft_falloff: false,
             use_mis: false,
+            spread: None,
             spot_size: std::f64::consts::FRAC_PI_4,
             spot_blend: 0.15,
             area: None,
@@ -3123,6 +3192,7 @@ mod sampling_tests {
                 spot_blend: 0.3,
                 area: None,
                 use_mis: true,
+                spread: None,
             };
         let above = DVec3::new(0.2, -0.1, 3.0);
         let cases = [
@@ -3137,6 +3207,22 @@ mod sampling_tests {
                 "ellipse",
                 PointLight {
                     area: Some(area(0.6, 0.3, true)),
+                    ..light(LightType::Area, above, 0.0, false)
+                },
+            ),
+            (
+                "spread rectangle",
+                PointLight {
+                    area: Some(area(0.6, 0.3, false)),
+                    spread: Spread::new(0.3),
+                    ..light(LightType::Area, above, 0.0, false)
+                },
+            ),
+            (
+                "spread disk",
+                PointLight {
+                    area: Some(area(0.6, 0.6, true)),
+                    spread: Spread::new(1.0),
                     ..light(LightType::Area, above, 0.0, false)
                 },
             ),
@@ -3186,6 +3272,127 @@ mod sampling_tests {
         }
     }
 
+    /// Light sampling over a spread light reaches every point the cone lights: its mean irradiance
+    /// matches a brute-force grid over the whole emitter, on and off the cone's axis.
+    #[test]
+    fn spread_light_samples_match_the_brute_force_irradiance() {
+        let centre = DVec3::new(0.0, 0.0, 2.0);
+        let half = 0.5;
+        let normal = -DVec3::Z;
+        for spread_value in [0.3, 1.0] {
+            let Some(spread) = Spread::new(spread_value) else {
+                panic!("a spread of {spread_value} is below π");
+            };
+            for ellipse in [false, true] {
+                let shape = AreaShape::new(DVec3::X, DVec3::Y, half, half, ellipse);
+                let light = PointLight {
+                    position: centre,
+                    direction: normal,
+                    kind: LightType::Area,
+                    color: DVec3::ONE,
+                    energy: std::f64::consts::PI * shape.area,
+                    radius: 0.0,
+                    soft_falloff: false,
+                    spot_size: 0.0,
+                    spot_blend: 0.0,
+                    area: Some(shape),
+                    spread: Some(spread),
+                    use_mis: true,
+                };
+                for receiver in [
+                    DVec3::ZERO,
+                    DVec3::new(0.25, 0.1, 0.0),
+                    DVec3::new(0.7, -0.2, 0.0),
+                ] {
+                    let label =
+                        format!("spread {spread_value}, ellipse {ellipse}, receiver {receiver:?}");
+                    // Midpoint grid over the emitter, with the receiver's cosine on the floor (+Z).
+                    let cells: u32 = 400;
+                    let step = 2.0 * half / f64::from(cells);
+                    let mut brute = 0.0;
+                    for i in 0..cells {
+                        for j in 0..cells {
+                            let x = -half + (f64::from(i) + 0.5) * step;
+                            let y = -half + (f64::from(j) + 0.5) * step;
+                            if ellipse && x * x + y * y > half * half {
+                                continue;
+                            }
+                            let to_light = centre + DVec3::new(x, y, 0.0) - receiver;
+                            let distance_squared = to_light.length_squared();
+                            let direction = to_light / distance_squared.sqrt();
+                            let cos_light = normal.dot(-direction);
+                            let cos_receiver = DVec3::Z.dot(direction);
+                            if cos_light <= 0.0 || cos_receiver <= 0.0 {
+                                continue;
+                            }
+                            brute += spread_attenuation(spread, -direction, normal)
+                                * cos_light
+                                * cos_receiver
+                                / distance_squared
+                                * step
+                                * step;
+                        }
+                    }
+                    let mut rng = Pcg32::for_sample(0x5be, 0, 0, 0);
+                    let samples: u32 = 200_000;
+                    let (mut sum, mut sum_squares) = (0.0, 0.0);
+                    for _ in 0..samples {
+                        let weight = sample_light(&light, receiver, &mut rng)
+                            .map_or(0.0, |sample| {
+                                sample.radiance.x * DVec3::Z.dot(sample.direction).max(0.0)
+                            });
+                        sum += weight;
+                        sum_squares += weight * weight;
+                    }
+                    let count = f64::from(samples);
+                    let mean = sum / count;
+                    let stderr = ((sum_squares / count - mean * mean).max(0.0) / count).sqrt();
+                    assert!(brute > 0.0, "{label}: the emitter must light the receiver");
+                    assert!(
+                        (mean - brute).abs() <= 4.0 * stderr + 0.01 * brute,
+                        "{label}: sampled irradiance {mean} against brute force {brute} \
+                         (standard error {stderr})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A zero spread emits along its normal alone: a receiver in front sees the emitter at the
+    /// point straight above it, as a delta light with Cycles' radiance on the normal.
+    #[test]
+    fn zero_spread_emits_along_the_normal_only() {
+        let shape = AreaShape::new(DVec3::X, DVec3::Y, 0.5, 0.5, false);
+        let light = PointLight {
+            position: DVec3::new(0.0, 0.0, 2.0),
+            direction: -DVec3::Z,
+            kind: LightType::Area,
+            color: DVec3::ONE,
+            energy: std::f64::consts::PI * shape.area,
+            radius: 0.0,
+            soft_falloff: false,
+            spot_size: 0.0,
+            spot_blend: 0.0,
+            area: Some(shape),
+            spread: Spread::new(0.0),
+            use_mis: true,
+        };
+        let mut rng = Pcg32::for_sample(0x5e0, 0, 0, 0);
+        let Some(sample) = sample_light(&light, DVec3::new(0.4, -0.3, 0.5), &mut rng) else {
+            panic!("a receiver in front is lit");
+        };
+        assert!((sample.direction - DVec3::Z).length() <= 1.0e-12);
+        assert!((sample.distance - 1.5).abs() <= 1.0e-12);
+        assert_eq!(sample.pdf, 0.0);
+        assert!((sample.radiance.x - std::f64::consts::PI).abs() <= 1.0e-12);
+        assert!(
+            !light.hittable(),
+            "a zero spread is never hit by a BSDF ray"
+        );
+        // Past the emitter's edge, the foot of the receiver is off the emitter, which emits nothing there.
+        assert!(sample_light(&light, DVec3::new(0.8, 0.0, 0.5), &mut rng).is_none());
+    }
+
     /// A light the path has just crossed is never found again: the origin is advanced past it, so
     /// each shape's crossing lies behind the origin. Covers the one-sided disk, the one-sided
     /// rectangle, a sphere seen from outside, and a receiver inside a sphere.
@@ -3204,6 +3411,7 @@ mod sampling_tests {
                 spot_blend: 0.0,
                 area,
                 use_mis: true,
+                spread: None,
             }
         };
         let rectangle = AreaShape {
@@ -3273,6 +3481,7 @@ mod sampling_tests {
                 area: 1.0,
             }),
             use_mis: true,
+            spread: None,
         };
         let receiver = DVec3::ZERO;
         let origin = DVec3::new(0.0, 0.0, 1.0);

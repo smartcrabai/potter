@@ -418,6 +418,7 @@ fn create_light(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resu
             "radius",
             "soft_falloff",
             "use_multiple_importance_sampling",
+            "spread",
             "spot_size",
             "spot_blend",
         ],
@@ -437,6 +438,7 @@ fn create_light(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resu
             "radius",
             "soft_falloff",
             "use_multiple_importance_sampling",
+            "spread",
             "spot_size",
             "spot_blend",
         ],
@@ -503,6 +505,7 @@ fn apply_light_values(
             "radius",
             "soft_falloff",
             "use_multiple_importance_sampling",
+            "spread",
             "spot_size",
             "spot_blend",
         ],
@@ -559,6 +562,34 @@ fn apply_light_values(
                 ),
             )
         })?;
+    }
+    if let Some(value) = values.get("spread") {
+        if light.light_type != LightType::Area {
+            return Err(engine.error(
+                ErrorCode::InvalidOperation,
+                "spread applies only to area lights",
+                &operation_pointer(engine.operation_index, &format!("{prefix}spread")),
+            ));
+        }
+        let spread = super::finite_number(
+            engine,
+            Some(value),
+            &format!("{prefix}spread"),
+            super::FiniteNumberMessage::Field,
+        )?;
+        // Blender stores spread as a float32, so its π arrives rounded; accept it as the import does.
+        light.spread = if (spread - std::f64::consts::PI).abs() <= 1.0e-6 {
+            std::f64::consts::PI
+        } else {
+            spread
+        };
+        if !(0.0..=std::f64::consts::PI).contains(&light.spread) {
+            return Err(engine.error(
+                ErrorCode::InvalidOperation,
+                "spread must be between 0 and π radians",
+                &operation_pointer(engine.operation_index, &format!("{prefix}spread")),
+            ));
+        }
     }
     if let Some(value) = values.get("spot_size") {
         light.spot_size = super::finite_number(

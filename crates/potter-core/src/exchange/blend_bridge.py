@@ -6682,6 +6682,7 @@ def export_doc(doc, target, pack, scene_hash, context):
                 light.shape = raw.get("area_shape", "SQUARE")
                 light.size = float(raw.get("area_size", 0.25))
                 light.size_y = float(raw.get("area_size_y", light.size))
+                light.spread = float(raw.get("spread", math.pi))
             if raw.get("light_type") == "spot":
                 light.spot_size = raw.get("spot_size", math.pi / 4)
                 light.spot_blend = raw.get("spot_blend", 0.15)
