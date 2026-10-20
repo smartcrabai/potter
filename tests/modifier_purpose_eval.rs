@@ -5,8 +5,11 @@
 //! `DAG_EVAL_VIEWPORT` OBJ export give 26 vertices, `DAG_EVAL_RENDER` gives 98. With
 //! `show_render=False` the render export gives the base 8 vertices; with `show_viewport=False` the
 //! viewport gives 8 and the render gives 98.
+//!
+//! The Boolean, Decimate, and union counts and volumes are Blender 5.2.2 results committed in
+//! `tests/fixtures/purpose_eval/expected.json`, written by `generate_purpose_eval_expectations.py`.
 
-use std::{collections::HashMap, error::Error, fmt::Debug};
+use std::{collections::HashMap, error::Error, fmt::Debug, fs, path::Path};
 
 use glam::DVec3;
 use potter_core::{
@@ -24,7 +27,11 @@ const SCENE_ID: &str = "00000000-0000-4000-8000-000000000000";
 const BASE_VERTICES: usize = 8;
 const LEVEL_ONE_VERTICES: usize = 26;
 const LEVEL_TWO_VERTICES: usize = 98;
-const VOLUME_TOLERANCE: f64 = 1.0e-9;
+const EXPECTATIONS: &str = "tests/fixtures/purpose_eval/expected.json";
+// Mirror `VOLUME_RELATIVE_TOLERANCE` and `VOLUME_ABSOLUTE_TOLERANCE` in
+// `fixtures/boolean_parity/comparator.rs`; keep the values equal.
+const VOLUME_RELATIVE_TOLERANCE: f64 = 1.0e-6;
+const VOLUME_ABSOLUTE_TOLERANCE: f64 = 1.0e-9;
 
 fn ensure_eq<T: PartialEq + Debug>(actual: &T, expected: &T, what: &str) -> TestResult {
     if actual == expected {
@@ -93,11 +100,29 @@ fn ensure(condition: bool, what: &str) -> TestResult {
     if condition { Ok(()) } else { Err(what.into()) }
 }
 
+/// The Boolean comparator's volume rule: relative tolerance, or absolute for an expected zero.
 fn ensure_volume(actual: f64, expected: f64, what: &str) -> TestResult {
+    let matches = if expected.abs() <= VOLUME_ABSOLUTE_TOLERANCE {
+        actual.abs() <= VOLUME_ABSOLUTE_TOLERANCE
+    } else {
+        ((actual - expected) / expected).abs() <= VOLUME_RELATIVE_TOLERANCE
+    };
     ensure(
-        (actual - expected).abs() <= VOLUME_TOLERANCE,
+        matches,
         &format!("{what}: expected {expected}, got {actual}"),
     )
+}
+
+/// Blender's per-purpose numbers, written by the generator in `fixtures/purpose_eval`.
+fn expectations() -> TestResult<Value> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(EXPECTATIONS);
+    let bytes = fs::read(&path).map_err(|error| {
+        format!(
+            "{}: {error}; run the purpose_eval generator",
+            path.display()
+        )
+    })?;
+    Ok(serde_json::from_slice(&bytes)?)
 }
 
 fn evaluated_mesh<'a>(snapshot: &'a Snapshot, id: &Id) -> TestResult<&'a Mesh> {
@@ -107,9 +132,17 @@ fn evaluated_mesh<'a>(snapshot: &'a Snapshot, id: &Id) -> TestResult<&'a Mesh> {
         .ok_or_else(|| "evaluated mesh is missing".into())
 }
 
-/// Vertex count, face count and signed volume by the divergence theorem over the tessellation.
-/// The volume is positive for a closed mesh with outward winding.
-fn summary(mesh: &Mesh) -> TestResult<(usize, usize, f64)> {
+/// Blender-comparable counts and signed volume of one evaluated mesh.
+struct Counts {
+    vertices: usize,
+    edges: usize,
+    faces: usize,
+    volume: f64,
+}
+
+/// Counts, and signed volume by the divergence theorem over the tessellation. The volume is
+/// positive for a closed mesh with outward winding.
+fn summary(mesh: &Mesh) -> TestResult<Counts> {
     let positions: HashMap<u32, DVec3> = mesh
         .vertices
         .iter()
@@ -125,7 +158,50 @@ fn summary(mesh: &Mesh) -> TestResult<(usize, usize, f64)> {
     for [a, b, c] in mesh.tessellate()? {
         six_volume += corner(a)?.dot(corner(b)?.cross(corner(c)?));
     }
-    Ok((mesh.vertices.len(), mesh.faces.len(), six_volume / 6.0))
+    Ok(Counts {
+        vertices: mesh.vertices.len(),
+        edges: mesh.edges.len(),
+        faces: mesh.faces.len(),
+        volume: six_volume / 6.0,
+    })
+}
+
+/// Reads one `{vertices, edges, faces, volume}` entry from the Blender expectations.
+fn expected_counts(entry: &Value) -> TestResult<Counts> {
+    let count = |key: &str| -> TestResult<usize> {
+        let raw = entry[key]
+            .as_u64()
+            .ok_or_else(|| format!("expected `{key}` is not a count"))?;
+        Ok(usize::try_from(raw)?)
+    };
+    Ok(Counts {
+        vertices: count("vertices")?,
+        edges: count("edges")?,
+        faces: count("faces")?,
+        volume: entry["volume"]
+            .as_f64()
+            .ok_or("expected `volume` is not a number")?,
+    })
+}
+
+/// Counts must match exactly; the volume uses the Boolean comparator's tolerance.
+fn ensure_counts(actual: &Counts, expected: &Counts, what: &str) -> TestResult {
+    ensure_eq(
+        &actual.vertices,
+        &expected.vertices,
+        &format!("{what} vertex count"),
+    )?;
+    ensure_eq(
+        &actual.edges,
+        &expected.edges,
+        &format!("{what} edge count"),
+    )?;
+    ensure_eq(
+        &actual.faces,
+        &expected.faces,
+        &format!("{what} face count"),
+    )?;
+    ensure_volume(actual.volume, expected.volume, &format!("{what} volume"))
 }
 
 #[test]
@@ -418,8 +494,9 @@ fn boolean_results_feed_dependent_modifiers_for_both_purposes() -> TestResult {
     let host = Id::new("host")?;
     let follower = Id::new("follower")?;
     let cutter = Id::new("cutter")?;
+    let expected = expectations()?;
 
-    // The same host without its Decimate, so the Boolean's own output can be checked in closed form.
+    // The same host without its Decimate: the Boolean's own output, as Blender computes it.
     let mut boolean_only = doc.clone();
     let host_node = boolean_only
         .nodes
@@ -431,8 +508,11 @@ fn boolean_results_feed_dependent_modifiers_for_both_purposes() -> TestResult {
         }
     }
 
-    let mut outcomes = Vec::new();
-    for purpose in [EvaluationPurpose::Preview, EvaluationPurpose::Render] {
+    for (purpose, key) in [
+        (EvaluationPurpose::Preview, "preview"),
+        (EvaluationPurpose::Render, "render"),
+    ] {
+        let blender = &expected[key];
         let (snapshot, node_errors) =
             Snapshot::evaluate_available_with_cache(&doc, &purpose_context(purpose), None, None)?;
         ensure_eq(&node_errors.is_empty(), &true, "no node evaluation errors")?;
@@ -444,51 +524,26 @@ fn boolean_results_feed_dependent_modifiers_for_both_purposes() -> TestResult {
             ensure_eq(&snapshot.meshes.contains_key(id), &true, name)?;
         }
 
-        // Unmodified box of edge length 1: 8 corners, 6 quads, volume 1^3.
-        let (vertices, faces, volume) = summary(evaluated_mesh(&snapshot, &cutter)?)?;
-        ensure_eq(&vertices, &8, "cutter vertex count")?;
-        ensure_eq(&faces, &6, "cutter face count")?;
-        ensure_volume(volume, 1.0, "cutter volume")?;
-
-        // Edge-2 box minus an enclosed edge-1 box: no faces intersect, so the output keeps the 8
-        // outer corners and adds the 8 cavity corners; the volume is 2^3 - 1^3.
         let boolean_snapshot = Snapshot::evaluate(&boolean_only, &purpose_context(purpose))?;
-        let (vertices, _, volume) = summary(evaluated_mesh(&boolean_snapshot, &host)?)?;
-        ensure_eq(&vertices, &16, "Boolean host vertex count")?;
-        ensure_volume(volume, 7.0, "Boolean host volume")?;
-
-        // Decimate has no closed form here; the decimated host only has to enclose positive volume.
-        let host_summary = summary(evaluated_mesh(&snapshot, &host)?)?;
-        let host_volume = host_summary.2;
-        ensure(host_volume > 0.0, "decimated host encloses positive volume")?;
-
-        // The FLOAT union contains the host and a box of edge 1 that fills the cavity, and is at
-        // most their volumes added together.
-        let follower_summary = summary(evaluated_mesh(&snapshot, &follower)?)?;
-        let follower_volume = follower_summary.2;
-        ensure(
-            follower_volume >= host_volume.max(1.0) - VOLUME_TOLERANCE,
-            &format!(
-                "follower union volume {follower_volume} is smaller than an operand (decimated host {host_volume}, follower 1)"
+        let checks = [
+            ("cutter", summary(evaluated_mesh(&snapshot, &cutter)?)?),
+            (
+                "boolean_host",
+                summary(evaluated_mesh(&boolean_snapshot, &host)?)?,
             ),
-        )?;
-        ensure(
-            follower_volume <= host_volume + 1.0 + VOLUME_TOLERANCE,
-            &format!(
-                "follower union volume {follower_volume} is larger than the operands' sum (decimated host {host_volume}, follower 1)"
+            (
+                "decimated_host",
+                summary(evaluated_mesh(&snapshot, &host)?)?,
             ),
-        )?;
-        outcomes.push((host_summary, follower_summary));
-    }
-
-    // Boolean, Decimate and union have no purpose-dependent settings here, so both purposes agree.
-    for (name, preview, render) in [
-        ("host", outcomes[0].0, outcomes[1].0),
-        ("follower", outcomes[0].1, outcomes[1].1),
-    ] {
-        ensure_eq(&preview.0, &render.0, &format!("{name} vertex count"))?;
-        ensure_eq(&preview.1, &render.1, &format!("{name} face count"))?;
-        ensure_volume(preview.2, render.2, &format!("{name} volume"))?;
+            ("follower", summary(evaluated_mesh(&snapshot, &follower)?)?),
+        ];
+        for (name, actual) in &checks {
+            ensure_counts(
+                actual,
+                &expected_counts(&blender[*name])?,
+                &format!("{key} {name}"),
+            )?;
+        }
     }
     Ok(())
 }
