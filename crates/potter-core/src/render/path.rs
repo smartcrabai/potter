@@ -2168,17 +2168,17 @@ fn shadow_transmittance(
                 transmittance *= medium_transmittance(&medium.params, hit.distance);
             }
             if surface.params.has_medium() {
-                // A medium surface passes the shadow ray and changes the stack, as it does for a path. It is
-                // not a transparent surface, so it does not count against the budget.
+                // A medium boundary passes the shadow ray and changes the volume stack, as it does for a path. It is not a
+                // transparent surface, so it does not count against the budget, and its opaque alpha does not block.
                 toggle_mesh_medium(&mut shadow_media, surface.object_index, &surface.params);
-            } else {
-                // Cycles counts each transparent surface a shadow ray crosses against the path's remaining
-                // budget and blocks the ray past it (`intern/cycles/kernel/bvh/intersect_filter.h`).
-                transparent_hits += 1;
-                if transparent_hits > transparent_budget {
-                    blocked = true;
-                    return false;
-                }
+                return true;
+            }
+            // Cycles counts each transparent surface a shadow ray crosses against the path's remaining budget and blocks
+            // the ray past it (`intern/cycles/kernel/bvh/intersect_filter.h`).
+            transparent_hits += 1;
+            if transparent_hits > transparent_budget {
+                blocked = true;
+                return false;
             }
             // Cycles' shadow transparency is the Transparent closure's extinction, `(1 - alpha) · tint`
             // (`kernel/integrator/surface_shader.h`, `surface_shader_transparency`). A glass or other transmissive
