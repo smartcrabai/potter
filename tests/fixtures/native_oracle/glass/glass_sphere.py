@@ -1,13 +1,13 @@
 """Rough glass sphere under a point light and a disk light, rendered by Blender's Cycles (v5.2.2).
 
-A unit sphere with a Principled BSDF (Base Color white, Transmission Weight 1, IOR 1.5) sits on the origin in
-an empty black world. A point light and a disk light (radius 0.75) sit above and in front of it; an
-orthographic camera looks along +Y at the sphere. `max_bounces` is 3: camera, front surface, back surface,
+A unit sphere with a Principled BSDF (Base Color white, Transmission Weight 1, IOR 1.5, Roughness 0.2) sits on
+the origin in an empty black world. A point light and a disk light (radius 0.75) sit above and in front of it;
+an orthographic camera looks along +Y at the sphere. `max_bounces` is 3: camera, front surface, back surface,
 then the exit ray can reach a light. Shadow rays from inside the sphere are blocked by the glass, as Cycles
 blocks every closure without transparency (`kernel/integrator/surface_shader.h`, `surface_shader_transparency`).
 
-The scene is rendered at each roughness in ROUGHNESSES, with the same seeds, and each render's whole-frame mean
-is written per seed, so the Potter test can take the seed-to-seed spread as the Monte Carlo error.
+Eight seeds are rendered, and each whole-frame mean is written per seed, so the Potter test can take the
+seed-to-seed spread as the Monte Carlo error.
 
 Arguments after `--`: blend_out, json_out.
 """
@@ -21,7 +21,7 @@ import bpy
 from mathutils import Vector
 
 blend_out, json_out = sys.argv[sys.argv.index("--") + 1:][:2]
-ROUGHNESSES = [0.2, 0.5]
+ROUGHNESS = 0.2
 SEEDS = list(range(8))
 RESOLUTION = 16
 SAMPLES = 256
@@ -69,7 +69,7 @@ glass.use_nodes = True
 shader = glass.node_tree.nodes["Principled BSDF"]
 shader.inputs["Base Color"].default_value = (1.0, 1.0, 1.0, 1.0)
 shader.inputs["Metallic"].default_value = 0.0
-shader.inputs["Roughness"].default_value = ROUGHNESSES[0]
+shader.inputs["Roughness"].default_value = ROUGHNESS
 shader.inputs["IOR"].default_value = 1.5
 shader.inputs["Transmission Weight"].default_value = 1.0
 sphere.data.materials.append(glass)
@@ -116,17 +116,13 @@ def frame_mean(path):
     return [total / (width * height) for total in totals]
 
 
-runs = []
-for roughness in ROUGHNESSES:
-    shader.inputs["Roughness"].default_value = roughness
-    seed_means = []
-    for seed in SEEDS:
-        scene.cycles.seed = seed
-        scene.render.filepath = os.path.join(work, f"r{roughness}_seed_{seed}.exr")
-        bpy.ops.render.render(write_still=True)
-        seed_means.append(frame_mean(scene.render.filepath))
-    runs.append({"roughness": roughness, "seed_means": seed_means})
+seed_means = []
+for seed in SEEDS:
+    scene.cycles.seed = seed
+    scene.render.filepath = os.path.join(work, f"seed_{seed}.exr")
+    bpy.ops.render.render(write_still=True)
+    seed_means.append(frame_mean(scene.render.filepath))
 
 with open(json_out, "w") as handle:
-    json.dump({"samples": SAMPLES, "runs": runs}, handle, indent=2)
+    json.dump({"roughness": ROUGHNESS, "samples": SAMPLES, "seed_means": seed_means}, handle, indent=2)
 print("DONE", flush=True)

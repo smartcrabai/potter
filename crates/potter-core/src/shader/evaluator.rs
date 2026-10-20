@@ -147,9 +147,6 @@ pub struct BsdfParams {
     /// for transmission (`kernel/svm/closure.h`); the Glass BSDF node takes its Color for both.
     pub glass_reflection_tint: [f64; 3],
     pub glass_transmission_tint: [f64; 3],
-    /// Whether `glass_transmission_tint` is the square root of the base colour (Principled). A base texture then
-    /// re-derives it; a Glass node's Color is not re-derived.
-    pub glass_tint_follows_base: bool,
     /// The view is on the back of the geometric normal (Cycles' `SD_BACKFACING`), where a glass closure uses `1 / ior`.
     pub back_facing: bool,
     pub alpha: f64,
@@ -255,7 +252,6 @@ impl BsdfParams {
             ior: material.ior,
             glass_reflection_tint: [1.0; 3],
             glass_transmission_tint: principled_glass_tint(material.base_color),
-            glass_tint_follows_base: true,
             back_facing: false,
             alpha: material.base_color[3],
             transparent_tint: [1.0; 3],
@@ -400,8 +396,6 @@ impl BsdfParams {
             ior: mix_scalar(first.ior, second.ior),
             glass_reflection_tint: reflection.tint,
             glass_transmission_tint: refraction.tint,
-            glass_tint_follows_base: first.glass_tint_follows_base
-                || second.glass_tint_follows_base,
             back_facing: first.back_facing,
             alpha,
             transparent_tint,
@@ -470,8 +464,6 @@ impl BsdfParams {
             ior: first.ior,
             glass_reflection_tint: reflection.tint,
             glass_transmission_tint: refraction.tint,
-            glass_tint_follows_base: first.glass_tint_follows_base
-                || second.glass_tint_follows_base,
             back_facing: first.back_facing,
             // Add keeps alpha as the larger opacity (its shading is Potter's one-scalar blend), and sums the arms'
             // transparent weights as Cycles sums closures. A fully opaque arm leaves no pass chance, so a transparent
@@ -764,6 +756,9 @@ fn evaluate_surface_inner(
     let Some(graph_id) = &material.node_tree else {
         let mut params = BsdfParams::from_material(material, hit_ctx.normal);
         record_unevaluated_inputs(hit_ctx.warnings, &material.name, None, &params);
+        // The material is its own one arm, so its glass tint follows its textured base colour here.
+        params.base_color = textured_base(material, hit_ctx, params.base_color)?;
+        params.glass_transmission_tint = principled_glass_tint(params.base_color);
         apply_material_textures(material, hit_ctx, &mut params)?;
         return Ok(params);
     };
@@ -942,6 +937,31 @@ fn evaluate_displacement_inner(
     }
 }
 
+/// The material-level base colour texture multiplied into a Principled arm's base colour. The arm derives its
+/// glass tint from the result (Cycles' `clamped_base_color`). Blender's exporter links the texture's Alpha only for
+/// a non-opaque material, and Cycles' colour read depends on that link (`apply_material_textures`).
+fn textured_base(
+    material: &Material,
+    hit_ctx: &HitContext<'_>,
+    base: [f64; 4],
+) -> Result<[f64; 4]> {
+    let Some(texture) = &material.base_color_texture else {
+        return Ok(base);
+    };
+    let alpha_linked = material.alpha_mode != "opaque";
+    let pixel = sample_material_texture(
+        texture,
+        hit_ctx,
+        texture_layer(hit_ctx, texture),
+        alpha_linked,
+    )?;
+    let mut textured = base;
+    for (channel, texel) in textured[..3].iter_mut().zip(pixel) {
+        *channel *= texel;
+    }
+    Ok(textured)
+}
+
 fn apply_material_textures(
     material: &Material,
     hit_ctx: &HitContext<'_>,
@@ -954,26 +974,14 @@ fn apply_material_textures(
     if !has_textures {
         return Ok(());
     }
-    // Blender's exporter links a base texture's Alpha only for a non-opaque material, and wires roughness, metallic,
-    // and normal from the texture's Color with Alpha unlinked. Cycles' colour read depends on that link.
-    if let Some(texture) = &material.base_color_texture {
-        let alpha_linked = material.alpha_mode != "opaque";
-        let pixel = sample_material_texture(
-            texture,
-            hit_ctx,
-            texture_layer(hit_ctx, texture),
-            alpha_linked,
-        )?;
-        for (channel, texel) in params.base_color[..3].iter_mut().zip(pixel) {
-            *channel *= texel;
-        }
-        if alpha_linked {
-            params.alpha *= pixel[3];
-        }
-        // The Principled glass tint is the square root of the textured base colour (Cycles' `clamped_base_color`).
-        if params.glass_tint_follows_base {
-            params.glass_transmission_tint = principled_glass_tint(params.base_color);
-        }
+    // The base colour is multiplied into each Principled arm (`textured_base`), where its glass tint follows it. The
+    // texture's Alpha is multiplied here, and only for a non-opaque material (Blender's exporter links it only then).
+    if let Some(texture) = &material.base_color_texture
+        && material.alpha_mode != "opaque"
+    {
+        let pixel =
+            sample_material_texture(texture, hit_ctx, texture_layer(hit_ctx, texture), true)?;
+        params.alpha *= pixel[3];
     }
     if let Some(texture) = &material.roughness_texture {
         let layer = texture_layer(hit_ctx, texture);
@@ -1376,6 +1384,8 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
         {
             let mut params = self.closure_params();
             params.transmission = self.material.transmission;
+            params.base_color = textured_base(self.material, &self.hit_ctx, params.base_color)?;
+            params.glass_transmission_tint = principled_glass_tint(params.base_color);
             // A simple-material graph holds no Alpha input unless the overlay wrote one (`write_principled_inputs`, for a
             // non-opaque material). Without it the material's own alpha applies, as before the closure change: its base
             // colour alpha, or 1 for an OPAQUE material, whose graph carries no transparency.
@@ -1394,7 +1404,11 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
             return Ok(params);
         }
         let mut params = self.closure_params();
-        params.base_color = self.color_input(id, &["Base Color"], [0.8, 0.8, 0.8, 1.0])?;
+        params.base_color = textured_base(
+            self.material,
+            &self.hit_ctx,
+            self.color_input(id, &["Base Color"], [0.8, 0.8, 0.8, 1.0])?,
+        )?;
         params.glass_transmission_tint = principled_glass_tint(params.base_color);
         params.metallic = self.scalar_input(id, &["Metallic"], 0.0)?;
         params.roughness = self.scalar_input(id, &["Roughness"], 0.5)?;
@@ -1554,7 +1568,6 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
     fn glass(&mut self, id: &Id) -> Result<BsdfParams> {
         let mut params = self.diffuse(id)?;
         params.transmission = 1.0;
-        params.glass_tint_follows_base = false;
         params.ior = self.scalar_input(id, &["IOR"], 1.5)?;
         params.roughness = self.scalar_input(id, &["Roughness"], 0.0)?;
         // Cycles' Glass closure takes its Color as both the reflection and the transmission tint.

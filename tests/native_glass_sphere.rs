@@ -1,21 +1,26 @@
 //! A rough glass sphere under a point and a disk light, against Blender 5.2.2's Cycles render
-//! (`fixtures/native_oracle/glass/glass_sphere.py`).
+//! (`fixtures/native_oracle/glass/glass_sphere.py`, roughness 0.2).
 //!
-//! One Blender run renders the sphere at roughness 0.2 and 0.5, eight seeds each, at 256 samples per pixel.
-//! Potter imports that scene once and sets the Principled Roughness of its node between the two roughnesses
-//! (`node.update`), rendering eight seeds at 32 samples per pixel for each. Each side's frame mean is taken over
-//! the whole frame, so both estimate the same expectation.
+//! Blender renders the sphere at 256 samples per pixel, eight seeds. Potter imports the same scene and renders
+//! eight seeds at 32 samples per pixel on a 16 × 16 frame. Each side's frame mean is taken over the whole frame,
+//! so both estimate the same expectation.
 //!
 //! The tolerance is `T · √(s_B² / n + s_P² / n)`, with `s` the seed-to-seed sample standard deviations of each
 //! side and `T` the two-sided 99.9% t quantile at 7 degrees of freedom (5.408). Welch's degrees of freedom for
 //! two 8-seed samples are at least 7, and the quantile falls as they grow, so `T` is conservative.
 //!
+//! Budget: about 30 k sphere-hitting paths (16 × 16 pixels, 119 of them on the sphere, × 32 samples × 8 seeds).
+//! At the measured debug cost of roughly 1 ms per such path, the estimate is about 35 s. This is an estimate until
+//! the lane run measures it.
+//!
 //! What the test must detect, as a margin per case (effect over tolerance, in frame-mean units). The figures are
-//! from Blender 5.2.2 renders of the same scene, with Potter's noise at 32 samples taken as Blender's at 32
-//! samples, so they are estimates until the lane run measures Potter's noise:
+//! Blender 5.2.2 renders of the same scene, with Potter's noise at 32 samples taken as Blender's at 32 samples, so
+//! they are estimates until the lane run measures Potter's noise:
 //!   - the old pass-through shadow rule, where the interior glass is lit through the sphere (Blender with the
 //!     sphere casting no shadow): 0.0438 over a tolerance of 0.0085, a margin of 5.1×;
-//!   - a roughness swap (the reference at 0.2, Potter at 0.5): 0.0238 over 0.0074, a margin of 3.2×.
+//!   - a roughness error in Potter's lobe (Potter at 0.5 where the reference is 0.2, the roughness swap of the
+//!     two oracle roughnesses): 0.0238 over 0.0074, a margin of 3.2×. The plane oracle checks both roughnesses
+//!     exactly.
 //! The sqrt(base) transmission tint is not checked here: at this noise its difference per channel (0.0013 to
 //! 0.0018 at 64 samples) is below the tolerance. The plane oracle in `render/principled_bsdf.rs` (`glass_tests`)
 //! checks the tint at 4 standard errors of Cycles' 16-seed plane means, where a base colour used directly in
@@ -81,30 +86,10 @@ fn frame_mean(data: &ImageData) -> [f64; 3] {
     total.map(|sum| sum / count)
 }
 
-/// The graph of the imported material `material`: its node-tree ID, its Principled node's ID and inputs.
-fn principled_node(scene: &Value, material: &str) -> TestResult<(String, String, Value)> {
-    let tree = scene["materials"]
-        .as_object()
-        .ok_or("the materials are missing")?
-        .values()
-        .find(|item| item["name"].as_str() == Some(material))
-        .and_then(|item| item["node_tree"].as_str())
-        .ok_or("the material has no node tree")?
-        .to_owned();
-    let nodes = scene["node_groups"][&tree]["nodes"]
-        .as_object()
-        .ok_or("the node tree has no nodes")?;
-    let (node_id, node) = nodes
-        .iter()
-        .find(|(_, node)| node["node_type"].as_str() == Some("ShaderNodeBsdfPrincipled"))
-        .ok_or("the material has no Principled node")?;
-    Ok((tree, node_id.clone(), node["inputs"].clone()))
-}
-
-/// The per-seed frame means of one Blender run, as RGB channel vectors.
-fn blender_channels(run: &Value) -> TestResult<[Vec<f64>; 3]> {
+/// The per-seed frame means of the Blender run, as RGB channel vectors.
+fn blender_channels(expected: &Value) -> TestResult<[Vec<f64>; 3]> {
     let mut channels = [Vec::new(), Vec::new(), Vec::new()];
-    for seed in run["seed_means"]
+    for seed in expected["seed_means"]
         .as_array()
         .ok_or("the Blender seed means are missing")?
     {
@@ -121,7 +106,7 @@ fn blender_channels(run: &Value) -> TestResult<[Vec<f64>; 3]> {
 }
 
 #[test]
-fn rough_glass_sphere_matches_cycles_at_roughness_0_2_and_0_5() -> TestResult {
+fn rough_glass_sphere_matches_cycles_at_roughness_0_2() -> TestResult {
     let Some(blender) = blender_checked::blender_executable() else {
         return Ok(());
     };
@@ -131,11 +116,8 @@ fn rough_glass_sphere_matches_cycles_at_roughness_0_2_and_0_5() -> TestResult {
     let json_path = root.path().join("blender.json");
     let arguments: [&Path; 2] = [&blend, &json_path];
     run_blender_arguments(&blender, &script, None, &arguments)?;
-
     let expected: Value = serde_json::from_slice(&fs::read(&json_path)?)?;
-    let runs = expected["runs"]
-        .as_array()
-        .ok_or("the Blender runs are missing")?;
+    let wanted = blender_channels(&expected)?;
 
     let (project, _) = import_blend(&blender, root.path(), "project", &blend)?;
     let scene = read_scene(&project)?;
@@ -143,77 +125,65 @@ fn rough_glass_sphere_matches_cycles_at_roughness_0_2_and_0_5() -> TestResult {
         .as_str()
         .ok_or("active scene is missing")?
         .to_owned();
-    let (tree, node_id, inputs) = principled_node(&scene, "Glass")?;
+    let applied = apply_operations(
+        &project,
+        root.path(),
+        json!([
+            {"op": "render.update", "target": {"id": active}, "set": {"resolution_x": RESOLUTION, "resolution_y": RESOLUTION, "samples": SAMPLES, "max_bounces": 3}}
+        ]),
+    )?;
+    assert_eq!(applied["ok"], true, "{applied}");
 
-    for (index, run) in runs.iter().enumerate() {
-        let roughness = run["roughness"]
-            .as_f64()
-            .ok_or("a Blender roughness is not a number")?;
-        // `node.update` replaces the node's whole inputs map, so the map is sent back with Roughness changed.
-        let mut set = inputs.clone();
-        set["Roughness"] = json!(roughness);
+    let mut potter = [Vec::new(), Vec::new(), Vec::new()];
+    for seed in 0..SEEDS {
         let applied = apply_operations(
             &project,
             root.path(),
-            json!([{"op": "node.update", "graph": tree, "node_id": node_id, "set": {"inputs": set}}]),
+            json!([
+                {"op": "render.update", "target": {"id": active}, "set": {"seed": seed}}
+            ]),
         )?;
         assert_eq!(applied["ok"], true, "{applied}");
 
-        let mut potter = [Vec::new(), Vec::new(), Vec::new()];
-        for seed in 0..SEEDS {
-            let applied = apply_operations(
-                &project,
-                root.path(),
-                json!([
-                    {"op": "render.update", "target": {"id": active}, "set": {"resolution_x": RESOLUTION, "resolution_y": RESOLUTION, "samples": SAMPLES, "seed": seed, "max_bounces": 3}}
-                ]),
-            )?;
-            assert_eq!(applied["ok"], true, "{applied}");
+        let frames = root.path().join(format!("frames_{seed}"));
+        let rendered = pot()
+            .arg("render")
+            .arg(&project)
+            .args(["--format", "exr", "--out"])
+            .arg(&frames)
+            .arg("--json")
+            .output()?;
+        assert!(
+            rendered.status.success(),
+            "render failed: {}",
+            String::from_utf8_lossy(&rendered.stdout)
+        );
+        let id = format!("render_{seed}");
+        let loaded = apply_operations(
+            &project,
+            root.path(),
+            json!([{"op": "image.load", "id": id, "path": frames.join("frame_0001.exr").to_string_lossy()}]),
+        )?;
+        assert_eq!(loaded["ok"], true, "{loaded}");
 
-            let frames = root.path().join(format!("frames_{index}_{seed}"));
-            let rendered = pot()
-                .arg("render")
-                .arg(&project)
-                .args(["--format", "exr", "--out"])
-                .arg(&frames)
-                .arg("--json")
-                .output()?;
-            assert!(
-                rendered.status.success(),
-                "render failed: {}",
-                String::from_utf8_lossy(&rendered.stdout)
-            );
-            let id = format!("render_{index}_{seed}");
-            let loaded = apply_operations(
-                &project,
-                root.path(),
-                json!([{"op": "image.load", "id": id, "path": frames.join("frame_0001.exr").to_string_lossy()}]),
-            )?;
-            assert_eq!(loaded["ok"], true, "{loaded}");
-
-            let scene = read_scene(&project)?;
-            let image: Image = serde_json::from_value(scene["images"][&id].clone())?;
-            let data = load_image_data(&image, &project, ImageInterpolation::Closest)?;
-            let mean = frame_mean(&data);
-            for (channel, values) in potter.iter_mut().enumerate() {
-                values.push(mean[channel]);
-            }
+        let scene = read_scene(&project)?;
+        let image: Image = serde_json::from_value(scene["images"][&id].clone())?;
+        let data = load_image_data(&image, &project, ImageInterpolation::Closest)?;
+        let mean = frame_mean(&data);
+        for (channel, values) in potter.iter_mut().enumerate() {
+            values.push(mean[channel]);
         }
+    }
 
-        let wanted = blender_channels(run)?;
-        for channel in 0..3 {
-            let (wanted_mean, wanted_stderr) = mean_and_stderr(&wanted[channel]);
-            let (actual_mean, actual_stderr) = mean_and_stderr(&potter[channel]);
-            assert!(
-                wanted_mean > 0.0,
-                "roughness {roughness}: the Blender frame mean is empty"
-            );
-            let tolerance = T_QUANTILE * wanted_stderr.hypot(actual_stderr);
-            assert!(
-                (actual_mean - wanted_mean).abs() <= tolerance,
-                "roughness {roughness} channel {channel}: Potter {actual_mean} differs from Cycles {wanted_mean} by more than {tolerance}"
-            );
-        }
+    for channel in 0..3 {
+        let (wanted_mean, wanted_stderr) = mean_and_stderr(&wanted[channel]);
+        let (actual_mean, actual_stderr) = mean_and_stderr(&potter[channel]);
+        assert!(wanted_mean > 0.0, "the Blender frame mean is empty");
+        let tolerance = T_QUANTILE * wanted_stderr.hypot(actual_stderr);
+        assert!(
+            (actual_mean - wanted_mean).abs() <= tolerance,
+            "channel {channel}: Potter {actual_mean} differs from Cycles {wanted_mean} by more than {tolerance}"
+        );
     }
     Ok(())
 }
