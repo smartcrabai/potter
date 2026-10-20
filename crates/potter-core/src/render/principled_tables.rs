@@ -7,7 +7,10 @@
 //! onto the table's index range, and linearly interpolates between neighbouring entries. Layout is
 //! `table[z][y][x]` with `x` fastest.
 
-use super::principled_tables_data::{GGX_E, GGX_E_AVG, GGX_GEN_SCHLICK_IOR_S, SHEEN_LTC};
+use super::principled_tables_data::{
+    GGX_E, GGX_E_AVG, GGX_GEN_SCHLICK_IOR_S, GGX_GLASS_E, GGX_GLASS_E_AVG, GGX_GLASS_INV_E,
+    GGX_GLASS_INV_E_AVG, SHEEN_LTC,
+};
 
 /// Port of `lookup_table_read` (`lookup_1d`) over a table of `n` entries.
 fn lookup_1d(table: &[f32], n: usize, x: f64) -> f64 {
@@ -76,6 +79,27 @@ pub(crate) fn ggx_energy_average(rough: f64) -> f64 {
 /// `z = sqrt(|(ior - 1) / (ior + 1)|)` (`ggx_gen_schlick_ior_s`).
 pub(crate) fn ggx_gen_schlick_ior_s(rough: f64, cos_ni: f64, z: f64) -> f64 {
     lookup_3d(&GGX_GEN_SCHLICK_IOR_S, 16, 16, 16, rough, cos_ni, z)
+}
+
+/// GGX glass energy `E(rough, mu, z)` with `mu = dot(N, view)` and `z = sqrt(|(ior - 1) / (ior + 1)|)`
+/// for an IOR of at least 1 (`ggx_glass_E`, `kernel/closure/bsdf_microfacet.h`).
+pub(crate) fn ggx_glass_energy(rough: f64, mu: f64, z: f64) -> f64 {
+    lookup_3d(&GGX_GLASS_E, 16, 16, 16, rough, mu, z)
+}
+
+/// GGX glass average energy `E_avg(rough, z)` (`ggx_glass_Eavg`) for an IOR of at least 1.
+pub(crate) fn ggx_glass_energy_average(rough: f64, z: f64) -> f64 {
+    lookup_2d(&GGX_GLASS_E_AVG, 16, 16, rough, z)
+}
+
+/// GGX glass energy for an IOR below 1, read at `1 / ior` (`ggx_glass_inv_E`).
+pub(crate) fn ggx_glass_inverse_energy(rough: f64, mu: f64, z: f64) -> f64 {
+    lookup_3d(&GGX_GLASS_INV_E, 16, 16, 16, rough, mu, z)
+}
+
+/// GGX glass average energy for an IOR below 1 (`ggx_glass_inv_Eavg`).
+pub(crate) fn ggx_glass_inverse_energy_average(rough: f64, z: f64) -> f64 {
+    lookup_2d(&GGX_GLASS_INV_E_AVG, 16, 16, rough, z)
 }
 
 /// The three sheen coefficients of Cycles' `bsdf_sheen_setup`: the LTC `transformA` and

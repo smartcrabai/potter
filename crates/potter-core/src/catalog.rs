@@ -111,13 +111,6 @@ pub fn feature_catalog() -> Value {
             "Potter does not evaluate Thin Wall; a render with Thin Wall enabled reports UNSUPPORTED_FEATURE.",
         ),
         unsupported(
-            "shader.principled.transmission_ggx",
-            "Principled rough transmission",
-            "ShaderNodeBsdfPrincipled",
-            &["material.create", "material.update"],
-            "Potter's transmission is a sharp refraction; Cycles' rough GGX glass lobe is not evaluated, so a render with Transmission Weight and Roughness above zero reports UNSUPPORTED_FEATURE.",
-        ),
-        unsupported(
             "shader.advanced",
             "Other Blender shader nodes",
             "ShaderNodeTree",
@@ -575,17 +568,10 @@ pub fn feature_catalog() -> Value {
                 [true, true, true, true, true, false, false],
             );
             row["reason"] = json!(
-                "EXACT is the default solver and ports Blender 5.2 Mesh Arrangements: closed and open operands; one N-ary call over an object or collection operand, in Blender's order; use_self; use_hole_tolerant; material INDEX or TRANSFER with empty slots kept as null slots; attributes per Blender (FACE, EDGE and CORNER from the source operand, cut corners interpolated, POINT as in modifier.boolean.exact_point_attribute_local_index, new points take the default value). Open operands and results that are not PWN after intersection use Blender's non-PWN ray fallback, where use_hole_tolerant selects per-triangle or per-patch classification. An unset OBJECT operand is a no-op, and an empty COLLECTION only removes self-intersections. Still limited: MANIFOLD is refused (modifier.boolean.solver_manifold); FLOAT is the pre-PR17 BSP shortcut until PR17b (modifier.boolean.solver_float); the downstream topology refusal (modifier.boolean.downstream_topology) applies to every solver until PR17b; double_threshold is FLOAT-only; debug_options are not read (Blender reads them only under its G.debug flag)."
+                "EXACT is the default solver and ports Blender 5.2 Mesh Arrangements: closed and open operands; one N-ary call over an object or collection operand, in Blender's order; use_self; use_hole_tolerant; material INDEX or TRANSFER with empty slots kept as null slots; attributes per Blender (FACE, EDGE and CORNER from the source operand, cut corners interpolated, POINT as in modifier.boolean.exact_point_attribute_local_index, new points take the default value). Open operands and results that are not PWN after intersection use Blender's non-PWN ray fallback, where use_hole_tolerant selects per-triangle or per-patch classification. An unset OBJECT operand is a no-op, and an empty COLLECTION only removes self-intersections. Still limited: MANIFOLD is refused (modifier.boolean.solver_manifold); FLOAT is a separate solver (modifier.boolean.solver_float); double_threshold is FLOAT-only; debug_options are not read (Blender reads them only under its G.debug flag)."
             );
             row
         },
-        unsupported(
-            "modifier.boolean.downstream_topology",
-            "Boolean output followed by a topology-dependent modifier",
-            "BOOLEAN",
-            &[],
-            "Refused for every Boolean solver (EXACT and FLOAT) until PR17b. A topology-dependent modifier after a Boolean, or a Boolean applied ahead of one, reports this feature. FLOAT output topology still differs from Blender's FLOAT solver, and the refusal is lifted only together with the FLOAT port, so the EXACT solver alone does not lift it.",
-        ),
         unsupported(
             "modifier.boolean.solver_manifold",
             "Boolean MANIFOLD solver",
@@ -593,13 +579,19 @@ pub fn feature_catalog() -> Value {
             &["modifier.create", "modifier.apply"],
             "Blender's MANIFOLD solver is not implemented; the modifier refuses it with UnsupportedFeature.",
         ),
-        unsupported(
-            "modifier.boolean.solver_float",
-            "Boolean FLOAT solver parity",
-            "BOOLEAN",
-            &["modifier.create", "modifier.apply"],
-            "FLOAT runs the pre-PR17 BSP shortcut, not Blender's float path. Touching, coplanar, and self-overlapping operands, and INTERSECT with a collection, differ from Blender in topology and volume until PR17b. double_threshold is FLOAT-only, as in Blender's float path.",
-        ),
+        {
+            let mut row = supported(
+                "modifier.boolean.solver_float",
+                "Boolean FLOAT solver parity",
+                "BOOLEAN",
+                &["modifier.create", "modifier.apply"],
+                [true, true, true, true, true, false, false],
+            );
+            row["reason"] = json!(
+                "FLOAT ports Blender's float32 BMesh intersection solver (`geom/boolean/float.rs`) and evaluates the Boolean, reading `double_threshold` as Blender's float path does. Collection INTERSECT and empty collection operands are refused, as in Blender. Gated against Blender 5.2.2 by blend_boolean_parity (the FLOAT corpus rows), blend_boolean_float_regressions (boundary, attribute, and double_threshold cases), blend_boolean_array (FLOAT array layouts, applying one, and reopening), and blend_boolean_stack (FLOAT Boolean followed by Decimate and Solidify). Topology after other modifiers is not verified against Blender."
+            );
+            row
+        },
         unsupported(
             "modifier.boolean.exact_point_attribute_local_index",
             "Boolean EXACT point attributes read the local vertex index",

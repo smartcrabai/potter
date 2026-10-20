@@ -117,6 +117,47 @@ impl Bvh {
         self.closest_hit_mode(triangles, origin, direction, t_min, t_max, true, accepts)
     }
 
+    /// Walks the surfaces a ray of kind `ray` meets, nearest first, while `remaining` is left along it. `visit`
+    /// receives each hit and the origin the ray left from, and returns whether the walk goes on. The ray restarts
+    /// `epsilon` past each hit, and the walk ends when the distance is spent. Triangles whose object is hidden from
+    /// `ray` are passed through. Returns the origin and the distance where the walk stopped.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the walk carries the ray's kind and its extent through the callback"
+    )]
+    pub(crate) fn walk_hits(
+        &self,
+        triangles: &[Triangle],
+        mut origin: DVec3,
+        direction: DVec3,
+        epsilon: f64,
+        mut remaining: f64,
+        ray: crate::model::RayKind,
+        mut visit: impl FnMut(BvhHit, DVec3) -> bool,
+    ) -> (DVec3, f64) {
+        while let Some(hit) = self.closest_hit_where(
+            triangles,
+            origin,
+            direction,
+            epsilon,
+            remaining,
+            &|triangle| triangle.ray_mask & ray.bit() != 0,
+        ) {
+            if !visit(hit, origin) {
+                break;
+            }
+            let advance = hit.distance + epsilon;
+            origin += direction * advance;
+            if remaining.is_finite() {
+                remaining = (remaining - advance).max(0.0);
+                if remaining <= epsilon {
+                    break;
+                }
+            }
+        }
+        (origin, remaining)
+    }
+
     /// Clears `out` and fills it with the index of every primitive whose leaf bounds the ray
     /// `origin + t * direction` (t >= 0) may cross. Every primitive the ray hits is among them.
     pub(crate) fn overlapping(&self, origin: DVec3, direction: DVec3, out: &mut Vec<usize>) {

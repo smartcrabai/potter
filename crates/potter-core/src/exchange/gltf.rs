@@ -2843,7 +2843,7 @@ pub(crate) fn resolve_material_surfaces(doc: &SceneDoc) -> Result<BTreeMap<Id, R
     resolve_material_surfaces_using(doc, |id| material_is_used(doc, id))
 }
 
-fn resolve_material_surfaces_with_snapshot(
+pub(crate) fn resolve_material_surfaces_with_snapshot(
     doc: &SceneDoc,
     snapshot: &Snapshot,
 ) -> Result<BTreeMap<Id, ResolvedSurface>> {
@@ -13803,7 +13803,7 @@ mod tests {
             {"op":"node.update","target":{"id":"grid"},"set":{"materials":["jacket","skin"]}},
             {"op":"mesh.set_attribute","target":{"id":"grid"},"elements":{"domain":"face","ids":["f0","f1","f2"]},"material_index":0},
             {"op":"mesh.set_attribute","target":{"id":"grid"},"elements":{"domain":"face","ids":["f3"]},"material_index":1},
-            {"op":"mesh.dissolve","target":{"id":"grid"},"elements":{"domain":"edge","ids":["e1","e2"]}}
+            {"op":"mesh.dissolve","target":{"id":"grid"},"elements":{"domain":"edge","ids":["e2","e3"]}}
         ]))?;
         let directory = tempfile::tempdir()?;
         let (imported, _) = round_trip_in(&doc, directory.path())?;

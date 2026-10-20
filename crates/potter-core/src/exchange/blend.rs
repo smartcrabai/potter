@@ -32,7 +32,7 @@ use crate::{
         NlaStrip, NlaTrack, Node, ParentType, Profile, RayVisibility, Registry, RenderSettings,
         RigidBody, RigidBodyShape, RigidBodyType, RigidBodyWorld, Scene, SceneDoc, ShapeKey,
         ShapeKeyData, SurfaceData, SurfacePoint, TextObjectData, TimelineMarker, Transform,
-        UnitSettings, VertexGroup, ViewLayer, ViewportDisplay, World,
+        UnitSettings, VertexGroup, ViewLayer, ViewportDisplay, World, is_identity_matrix,
     },
     sequencer::{
         EffectType as SequenceEffectType, RetimingKey, Strip as SequenceStrip, StripBlendType,
@@ -139,6 +139,7 @@ pub fn export_blend(
     fs::create_dir_all(parent).map_err(|error| PotError::io(&error))?;
     let mut document = serde_json::to_value(doc).map_err(PotError::internal_json)?;
     let scene_hash = crate::hash::sha256(&crate::hash::canonicalize(&document)?);
+    add_blender_matrix_basis_fields(doc, &mut document)?;
     add_blender_uv_fields(doc, &mut document)?;
     add_blender_mesh_fields(doc, &mut document)?;
     add_blender_material_slot_fields(doc, &mut document);
@@ -258,6 +259,28 @@ pub fn export_blend(
             .collect(),
         losses,
     })
+}
+
+/// Supplies only validated local authoring matrices to the bridge. The serialized model capture
+/// remains internal; the bridge receives a flat column-major `matrix_basis` only when current.
+fn add_blender_matrix_basis_fields(doc: &SceneDoc, document: &mut Value) -> Result<()> {
+    let nodes = document
+        .get_mut("nodes")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| PotError::new(ErrorCode::InternalError, "serialized scene has no nodes"))?;
+    for serialized in nodes.values_mut().filter_map(Value::as_object_mut) {
+        serialized.remove("blender_matrix_basis");
+        serialized.remove("matrix_basis");
+    }
+    for (id, node) in &doc.nodes {
+        let Some(serialized) = nodes.get_mut(id.as_str()).and_then(Value::as_object_mut) else {
+            continue;
+        };
+        if let Some(matrix_basis) = node.captured_matrix_basis(&node.transform)? {
+            serialized.insert("matrix_basis".to_owned(), json!(matrix_basis));
+        }
+    }
+    Ok(())
 }
 
 /// Writes the Blender-convention UV fields of every mesh data-block into the document sent to the
@@ -3341,6 +3364,10 @@ fn build_imported_graph(
                     .get("double_sided")
                     .and_then(Value::as_bool)
                     .unwrap_or(true),
+                use_transparent_shadow: item
+                    .get("use_transparent_shadow")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
                 displacement_method: displacement_method_field(name, item)?,
                 displacement_scale: number_field(item, "displacement_scale", 1.0),
                 displacement_midlevel: number_field(item, "displacement_midlevel", 0.5),
@@ -4000,11 +4027,22 @@ fn build_imported_graph(
             scale: vec3_field(item, "scale", [1.0; 3]),
             rotation_mode,
         };
+        let root_override = root_matrix_override(item);
+        let has_root_override = root_override.is_some();
         let mut parent_inverse = matrix_column_major(item.get("matrix_parent_inverse"));
-        if let Some((stored_transform, stored_parent_inverse)) = root_matrix_override(item) {
+        let mut blender_parent_inverse = None;
+        if let Some((stored_transform, stored_parent_inverse)) = root_override {
             transform = stored_transform;
             parent_inverse = Some(stored_parent_inverse);
+        } else if item.get("parent").is_none_or(Value::is_null)
+            && let Some(matrix) = parent_inverse.filter(|matrix| !is_identity_matrix(matrix))
+        {
+            // Blender ignores matrix_parent_inverse without a parent, so the evaluated transform
+            // stays the basis. The inverse is kept as round-trip data for export.
+            blender_parent_inverse = Some(matrix);
+            parent_inverse = None;
         }
+        transform.rotation = crate::model::normalize_rotation(transform.rotation)?;
         let mut constraints = parse_constraints(
             item,
             &id,
@@ -4083,7 +4121,7 @@ fn build_imported_graph(
                 },
             );
         }
-        let node = Node {
+        let mut node = Node {
             name: name.to_owned(),
             kind: kind.to_owned(),
             primitive: None,
@@ -4134,8 +4172,20 @@ fn build_imported_graph(
             force_field,
             constraints,
             drivers,
+            blender_matrix_basis: None,
+            blender_parent_inverse,
             pose,
         };
+        if !has_root_override
+            && let Some(matrix_basis) = matrix_column_major(item.get("matrix_basis"))
+                .filter(|matrix| matrix.iter().all(|value| value.is_finite()))
+        {
+            let fingerprint = node.matrix_basis_fingerprint(&node.transform)?;
+            node.blender_matrix_basis = Some(crate::model::CapturedMatrixBasis {
+                matrix_basis,
+                fingerprint,
+            });
+        }
         doc.nodes.insert(id.clone(), node);
         if let Some(mesh_id) = data_name.and_then(|name| mesh_ids.get(name)) {
             let mut group_ids = BTreeMap::new();
@@ -8232,6 +8282,10 @@ fn matrix_rows_equal(left: &Value, right: &Value) -> bool {
 }
 
 fn root_matrix_requires_approximation(node: &Node) -> bool {
+    // A current captured basis is exported as the exact world transform, so nothing is baked.
+    if matches!(node.captured_matrix_basis(&node.transform), Ok(Some(_))) {
+        return false;
+    }
     if node.parent.is_some() {
         return false;
     }
@@ -8540,6 +8594,19 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
                 "blender.material.displacement_method",
                 material.get("name").and_then(Value::as_str),
                 "Blender's combined displacement and bump mode has no Potter equivalent; the material imports as bump",
+            ));
+        }
+        // EEVEE's `use_backface_culling_shadow` drops back faces from the shadow pass (`eevee_pipeline.cc`, MA_BL_CULL_BACKFACE_SHADOW);
+        // Potter's shadow rays hit both sides.
+        if material
+            .get("use_backface_culling_shadow")
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            losses.push(loss(
+                "blender.material.backface_culling_shadow",
+                material.get("name").and_then(Value::as_str),
+                "Blender's EEVEE shadow backface culling is not imported; the material casts shadows from both sides",
             ));
         }
     }
@@ -17711,6 +17778,18 @@ mod camera_import_tests {
     fn area_light_spread_imports_without_a_loss() {
         let area = json!({"name": "Area", "type": "AREA", "spread": 0.5});
         assert!(import_losses(&json!({ "lights": [area] })).is_empty());
+    }
+
+    #[test]
+    fn shadow_backface_culling_imports_with_its_loss() {
+        let culled = json!({"name": "Culled", "use_backface_culling_shadow": true});
+        let features: Vec<String> = import_losses(&json!({"materials": [culled]}))
+            .into_iter()
+            .map(|loss| loss.feature_id)
+            .collect();
+        assert_eq!(features, ["blender.material.backface_culling_shadow"]);
+        let plain = json!({"name": "Plain", "use_backface_culling_shadow": false});
+        assert!(import_losses(&json!({"materials": [plain]})).is_empty());
     }
 
     #[test]

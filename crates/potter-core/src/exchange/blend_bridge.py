@@ -1346,7 +1346,10 @@ def _attribute_item_value(item, data_type):
         return _quaternion_to_native(item.value)
     if hasattr(item, "vector"):
         return plain(item.vector)
-    return plain(item.value)
+    value = item.value
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return plain(value)
 
 
 def _set_attribute_item(item, data_type, value):
@@ -2256,6 +2259,8 @@ def material_dump(material):
             "emission_color": emission_color, "emission_strength": emission_strength,
             "transmission": transmission, "ior": ior,
             "double_sided": not bool(getattr(material, "use_backface_culling", False)),
+            "use_transparent_shadow": bool(getattr(material, "use_transparent_shadow", True)),
+            "use_backface_culling_shadow": bool(getattr(material, "use_backface_culling_shadow", False)),
             "alpha_mode": _alpha_mode_of(material),
             "alpha_threshold": float(material.alpha_threshold),
             "nodes": tree_dump(material.node_tree),
@@ -6756,6 +6761,7 @@ def export_doc(doc, target, pack, scene_hash, context):
         mat.roughness = viewport["roughness"] if viewport else item["roughness"]
         mat.metallic = viewport["metallic"] if viewport else item["metallic"]
         mat.use_backface_culling = not bool(item.get("double_sided", True))
+        mat.use_transparent_shadow = bool(item.get("use_transparent_shadow", True))
         mat.displacement_method = "DISPLACEMENT" if item.get("displacement_method") == "displacement" else "BUMP"
         set_id(mat, material_id)
         source = compatibility_block(doc, "materials", "Material", material_id)
@@ -6784,6 +6790,8 @@ def export_doc(doc, target, pack, scene_hash, context):
     native_bind_copies, preserved_native_binds = _source_modifier_object_copies(
         doc, mesh_map)
     object_map = dict(linked_maps["nodes"])
+    # Nodes whose Blender rotation was restored from the source Euler/quaternion values exactly.
+    exact_rotation_nodes = set()
     for node_id, item in doc.get("nodes", {}).items():
         if node_id in linked_maps["nodes"]:
             continue
@@ -6881,6 +6889,8 @@ def export_doc(doc, target, pack, scene_hash, context):
                 and source_rotation_mode == obj.rotation_mode
                 and abs(abs(source_quaternion.dot(quaternion)) - 1.0) <= 1.0e-14
             )
+            if source_rotation_unchanged:
+                exact_rotation_nodes.add(node_id)
             if source_rotation_unchanged and obj.rotation_mode == "QUATERNION":
                 obj.rotation_quaternion = source_rotation_values
             elif source_rotation_unchanged and obj.rotation_mode == "AXIS_ANGLE":
@@ -7120,6 +7130,7 @@ def export_doc(doc, target, pack, scene_hash, context):
         obj = object_map[node_id]
         is_linked = node_id in linked_maps["nodes"]
         root_parent_inverse = None
+        has_captured_basis = False
         if not is_linked:
             parent = object_map.get(item.get("parent"))
             if parent:
@@ -7148,6 +7159,23 @@ def export_doc(doc, target, pack, scene_hash, context):
                 rows = [[values[column * 4 + row] for column in range(4)]
                         for row in range(4)]
                 root_parent_inverse = Matrix(rows)
+            elif item.get("blender_parent_inverse"):
+                # Round-trip of a Blender root's inverse: Blender ignores it without a parent, so it is
+                # written as is and the basis stays the evaluated transform.
+                values = item["blender_parent_inverse"]
+                rows = [[values[column * 4 + row] for column in range(4)]
+                        for row in range(4)]
+                obj.matrix_parent_inverse = Matrix(rows)
+            basis = item.get("matrix_basis")
+            if isinstance(basis, (list, tuple)) and len(basis) == 16:
+                has_captured_basis = True
+                # Assigning a matrix decomposes it into loc/rot/scale and moves rotation and scale by an
+                # ulp. A rotation restored exactly above (Blender's own Euler values) is already the
+                # Blender basis, so only the other captured nodes take the matrix.
+                if node_id not in exact_rotation_nodes:
+                    rows = [[basis[column * 4 + row] for column in range(4)]
+                            for row in range(4)]
+                    obj.matrix_basis = Matrix(rows)
         memberships = 0
         for collection_id, collection_item in collections_raw.items():
             if node_id not in collection_item.get("objects", []):
@@ -7169,16 +7197,19 @@ def export_doc(doc, target, pack, scene_hash, context):
                           if obj.name_full in candidate.objects), bpy.context.scene)
             _restore_object_material_slots(obj, item, material_map, scene)
         if root_parent_inverse is not None and root_parent_inverse != Matrix.Identity(4):
-            combined = root_parent_inverse @ obj.matrix_basis.copy()
-            # Without a parent Blender ignores matrix_parent_inverse. Bake its
-            # offset into the linked root's basis and world matrix instead.
-            obj.matrix_basis = combined
-            obj.matrix_world = combined
-            obj["potter.root_matrix_json"] = json.dumps({
-                "parent_inverse": values,
-                "transform": item["transform"],
-                "baked_basis": matrix_rows(obj.matrix_basis),
-            }, sort_keys=True)
+            if has_captured_basis:
+                obj.matrix_parent_inverse = root_parent_inverse
+            else:
+                combined = root_parent_inverse @ obj.matrix_basis.copy()
+                # Without a parent Blender ignores matrix_parent_inverse. Bake its
+                # offset into the linked root's basis and world matrix instead.
+                obj.matrix_basis = combined
+                obj.matrix_world = combined
+                obj["potter.root_matrix_json"] = json.dumps({
+                    "parent_inverse": values,
+                    "transform": item["transform"],
+                    "baked_basis": matrix_rows(obj.matrix_basis),
+                }, sort_keys=True)
         if obj.type == "MESH":
             mesh_source = compatibility_block(doc, "meshes", "Mesh", item.get("data"))
             _restore_skin_vertices(obj, mesh_source.get("skin_vertices", []))

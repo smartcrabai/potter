@@ -32,12 +32,30 @@ pub(crate) struct Operand<'a> {
     pub transform: DMat4,
 }
 
+/// Input face loops of the operands, indexed by joined face index (Blender `imesh_in` faces): arena
+/// vertex ids and edge origins in loop order, after the operand flips.
+#[derive(Default)]
+pub(crate) struct InputLoops {
+    pub(crate) verts: Vec<Vec<u32>>,
+    pub(crate) edges: Vec<Vec<i32>>,
+}
+
+/// [`meshes_to_tris_and_loops`] without the input loops.
+#[cfg(test)]
+pub(crate) fn meshes_to_tris(operands: &[Operand<'_>], arena: &mut Arena) -> Result<Vec<Tri>> {
+    meshes_to_tris_and_loops(operands, arena).map(|(tris, _)| tris)
+}
+
 /// Blender `meshes_to_imesh`: interns every operand's vertices in `arena` and returns the
-/// triangulated faces of all operands, in operand then face order.
+/// triangulated faces of all operands, in operand then face order, and each input face's loop for
+/// the output dissolve.
 ///
 /// Operands whose transform has a negative determinant have their faces reversed when operand 0
 /// is not negative (Blender `need_face_flip`), so every operand keeps operand 0's orientation.
-pub(crate) fn meshes_to_tris(operands: &[Operand<'_>], arena: &mut Arena) -> Result<Vec<Tri>> {
+pub(crate) fn meshes_to_tris_and_loops(
+    operands: &[Operand<'_>],
+    arena: &mut Arena,
+) -> Result<(Vec<Tri>, InputLoops)> {
     let prepared: Vec<(Mat4, bool)> = operands
         .iter()
         .map(|operand| {
@@ -52,6 +70,7 @@ pub(crate) fn meshes_to_tris(operands: &[Operand<'_>], arena: &mut Arena) -> Res
     };
 
     let mut tris = Vec::new();
+    let mut loops = InputLoops::default();
     let mut edge_base = 0_usize;
     let mut face_base = 0_usize;
     for (mi, (operand, &(transform, negative))) in operands.iter().zip(&prepared).enumerate() {
@@ -98,12 +117,14 @@ pub(crate) fn meshes_to_tris(operands: &[Operand<'_>], arena: &mut Arena) -> Res
             };
             let face_index = to_index(face_base + fi)?;
             tris.extend(triangulate_face(arena, &verts, face_index, &edges));
+            loops.verts.push(verts);
+            loops.edges.push(edges);
         }
 
         edge_base += mesh.edges.len();
         face_base += mesh.faces.len();
     }
-    Ok(tris)
+    Ok((tris, loops))
 }
 
 /// Blender's vertex loop in `meshes_to_imesh`: each position is rounded to `f32`, transformed in

@@ -1,6 +1,6 @@
 //! Deterministic, attribute-aware sculpt stroke evaluation over persistent meshes.
 
-use glam::{DQuat, DVec3};
+use glam::DVec3;
 use serde_json::{Value, json};
 
 use crate::{
@@ -8,15 +8,8 @@ use crate::{
     geom::{Mesh, normals, sculpt_dabs},
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Brush {
-    /// Brushes that apply one dab per sample, in order (`sculpt_dabs`), instead of evaluating each
-    /// vertex once against the whole stroke.
-    Dab(DabBrush),
-    /// Brushes that evaluate each vertex against the whole stroke.
-    Vertex(VertexBrush),
-}
-
+/// A sculpt brush. Every brush applies one dab per sample, in order (`sculpt_dabs`), as Blender's
+/// DOTS strokes do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DabBrush {
     ClayStrips,
@@ -37,14 +30,35 @@ pub enum DabBrush {
     Thumb,
     Rotate,
     Elastic,
+    /// Blender's Pose brush: an inverse-kinematics chain rotates or scales the region around the
+    /// stroke's topological origin.
+    Pose(PoseDeform),
+    /// Blender's Boundary brush: the mesh boundary nearest the stroke is deformed and its falloff
+    /// runs into the mesh.
+    Boundary(BoundaryDeform),
 }
 
-/// Brushes that still evaluate each vertex against the whole stroke, not Blender's dab sequence.
-/// Their Blender counterparts are not matched yet.
+/// Blender's `pose_deform_type`. Potter has no invert input, so each variant is the non-inverted
+/// branch of the matching Blender mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum VertexBrush {
-    PoseLite,
-    BoundaryLite,
+pub enum PoseDeform {
+    /// `BRUSH_POSE_DEFORM_ROTATE_TWIST`, non-inverted: rotate the chain toward the grab target.
+    RotateTwist,
+    /// `BRUSH_POSE_DEFORM_SCALE_TRANSLATE`, non-inverted: rotate, then scale along the chain.
+    ScaleTranslate,
+    /// `BRUSH_POSE_DEFORM_SQUASH_STRETCH`: scale the segment along its own axis, uniform in x and y.
+    SquashStretch,
+}
+
+/// Blender's `boundary_deform_type`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoundaryDeform {
+    Bend,
+    Expand,
+    Inflate,
+    Grab,
+    Twist,
+    Smooth,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,7 +86,7 @@ pub struct StrokeSample {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Stroke {
-    pub brush: Brush,
+    pub brush: DabBrush,
     pub samples: Vec<StrokeSample>,
     pub falloff: Falloff,
     pub symmetry: Vec<String>,
@@ -104,22 +118,15 @@ pub fn apply_stroke_with_dyntopo(
     validate_stroke(stroke)?;
     let accepts_delta = matches!(
         stroke.brush,
-        Brush::Dab(
-            DabBrush::Grab
-                | DabBrush::SnakeHook
-                | DabBrush::Thumb
-                | DabBrush::Nudge
-                | DabBrush::Elastic,
-        ) | Brush::Vertex(VertexBrush::PoseLite | VertexBrush::BoundaryLite)
+        DabBrush::Grab
+            | DabBrush::SnakeHook
+            | DabBrush::Thumb
+            | DabBrush::Nudge
+            | DabBrush::Elastic,
     );
     if !accepts_delta && stroke.delta.is_some() {
         return Err(invalid(
-            "delta is supported only by grab, snake_hook, thumb, nudge, elastic_deform, pose_lite, and boundary_lite brushes",
-        ));
-    }
-    if stroke.view.is_some() && matches!(stroke.brush, Brush::Vertex(_)) {
-        return Err(invalid(
-            "view is supported only by dab brushes; pose_lite and boundary_lite do not take a view yet",
+            "delta is supported only by grab, snake_hook, thumb, nudge, and elastic_deform brushes",
         ));
     }
     if let Some(edge_length) = dyntopo_edge_length
@@ -129,92 +136,11 @@ pub fn apply_stroke_with_dyntopo(
     }
     let normals = vertex_normals(mesh);
     let mask_values = read_scalar_attribute(mesh, "sculpt.mask")?;
-    let brush = match stroke.brush {
-        Brush::Dab(dab) => {
-            let changed = sculpt_dabs::apply_dabs(mesh, stroke, dab, &normals, &mask_values);
-            return Ok(match dyntopo_edge_length {
-                Some(edge_length) => {
-                    changed | dyntopo_edges_under_brush(mesh, stroke, edge_length)?
-                }
-                None => changed,
-            });
-        }
-        Brush::Vertex(brush) => brush,
-    };
-    let positions = vertex_positions(mesh);
-    let boundary_adjacency = boundary_adjacency(mesh);
-    let mirrors = mirrored_samples(stroke)?;
-    let (first_sample, last_sample) = stroke
-        .samples
-        .first()
-        .zip(stroke.samples.last())
-        .ok_or_else(|| invalid("sculpt stroke must contain at least one sample"))?;
-    let trajectory = last_sample.position - first_sample.position;
-    let mut next_positions = Vec::with_capacity(mesh.vertices.len());
-    let mut changed = false;
-
-    for (vertex, normal) in mesh.vertices.iter().zip(&normals) {
-        let mut influence = 0.0_f64;
-        let mut center = DVec3::ZERO;
-        let mut delta = DVec3::ZERO;
-        let mut motion = trajectory;
-        let mut radius = 0.0;
-        for sample in &mirrors {
-            let (closest, pressure, sample_radius, sample_strength, sample_delta) =
-                sample_influence(vertex.co, sample);
-            if sample_radius <= 0.0 {
-                continue;
-            }
-            let distance = vertex.co.distance(closest);
-            if distance > sample_radius {
-                continue;
-            }
-            let amount =
-                stroke.falloff.weight(distance / sample_radius) * pressure * sample_strength;
-            if amount > influence {
-                influence = amount;
-                center = closest;
-                delta = sample_delta;
-                motion = sample.to - sample.from;
-                radius = sample_radius;
-            }
-        }
-        let mask = mask_values
-            .get(&vertex.id)
-            .copied()
-            .unwrap_or(0.0)
-            .clamp(0.0, 1.0);
-        influence *= 1.0 - mask;
-        let position = if influence <= 0.0 {
-            vertex.co
-        } else {
-            deform_vertex(
-                stroke,
-                brush,
-                vertex.co,
-                *normal,
-                center,
-                delta,
-                motion,
-                radius,
-                influence,
-                boundary_adjacency.get(&vertex.id).map(Vec::as_slice),
-                &positions,
-            )
-        };
-        changed |= position != vertex.co;
-        next_positions.push((vertex.id, position));
-    }
-    if changed {
-        for (vertex, (id, position)) in mesh.vertices.iter_mut().zip(next_positions) {
-            debug_assert_eq!(vertex.id, id);
-            vertex.co = position;
-        }
-    }
-    if let Some(edge_length) = dyntopo_edge_length {
-        changed |= dyntopo_edges_under_brush(mesh, stroke, edge_length)?;
-    }
-    Ok(changed)
+    let changed = sculpt_dabs::apply_dabs(mesh, stroke, stroke.brush, &normals, &mask_values);
+    Ok(match dyntopo_edge_length {
+        Some(edge_length) => changed | dyntopo_edges_under_brush(mesh, stroke, edge_length)?,
+        None => changed,
+    })
 }
 
 /// Subdivide long edges and collapse short local edges inside a sculpt brush.
@@ -234,96 +160,6 @@ fn dyntopo_edges_under_brush(mesh: &mut Mesh, stroke: &Stroke, edge_length: f64)
     let subdivided = split_long_edges(mesh, stroke, edge_length)?;
     let collapsed = collapse_short_edges(mesh, stroke, edge_length * 0.5)?;
     Ok(subdivided || collapsed)
-}
-
-fn deform_vertex(
-    stroke: &Stroke,
-    brush: VertexBrush,
-    point: DVec3,
-    normal: DVec3,
-    center: DVec3,
-    sample_delta: DVec3,
-    stroke_motion: DVec3,
-    radius: f64,
-    influence: f64,
-    boundary_neighbors: Option<&[u32]>,
-    positions: &std::collections::BTreeMap<u32, DVec3>,
-) -> DVec3 {
-    let motion = if stroke.delta.is_some() {
-        sample_delta
-    } else {
-        stroke_motion
-    };
-    match brush {
-        VertexBrush::PoseLite => {
-            let angle = if stroke.delta.is_some() {
-                sample_delta.length()
-            } else {
-                (motion.length() / radius.max(f64::EPSILON)).min(1.0) * std::f64::consts::FRAC_PI_4
-            };
-            let axis = if stroke.delta.is_some() && sample_delta.length_squared() > 0.0 {
-                sample_delta.normalize()
-            } else {
-                normal
-            };
-            let rotated =
-                (DQuat::from_axis_angle(axis, angle * influence) * (point - center)) + center;
-            rotated + motion * influence
-        }
-        VertexBrush::BoundaryLite => {
-            let Some(neighbors) = boundary_neighbors.filter(|neighbors| neighbors.len() == 2)
-            else {
-                return point;
-            };
-            let (Some(before), Some(after)) =
-                (positions.get(&neighbors[0]), positions.get(&neighbors[1]))
-            else {
-                return point;
-            };
-            let tangent = *after - *before;
-            if tangent.length_squared() == 0.0 || motion.length_squared() == 0.0 {
-                point
-            } else {
-                let tangent = tangent.normalize();
-                point + tangent * (motion.dot(tangent) * influence)
-            }
-        }
-    }
-}
-
-fn boundary_adjacency(mesh: &Mesh) -> std::collections::BTreeMap<u32, Vec<u32>> {
-    let mut edge_face_count = std::collections::BTreeMap::<[u32; 2], usize>::new();
-    for face in &mesh.faces {
-        for index in 0..face.vertices.len() {
-            let a = face.vertices[index];
-            let b = face.vertices[(index + 1) % face.vertices.len()];
-            let key = if a < b { [a, b] } else { [b, a] };
-            *edge_face_count.entry(key).or_default() += 1;
-        }
-    }
-    let mut adjacency = std::collections::BTreeMap::<u32, Vec<u32>>::new();
-    for edge in &mesh.edges {
-        let key = if edge.vertices[0] < edge.vertices[1] {
-            edge.vertices
-        } else {
-            [edge.vertices[1], edge.vertices[0]]
-        };
-        if edge_face_count.get(&key) == Some(&1) {
-            adjacency
-                .entry(edge.vertices[0])
-                .or_default()
-                .push(edge.vertices[1]);
-            adjacency
-                .entry(edge.vertices[1])
-                .or_default()
-                .push(edge.vertices[0]);
-        }
-    }
-    for neighbors in adjacency.values_mut() {
-        neighbors.sort_unstable();
-        neighbors.dedup();
-    }
-    adjacency
 }
 
 fn split_long_edges(mesh: &mut Mesh, stroke: &Stroke, edge_length: f64) -> Result<bool> {
@@ -988,8 +824,8 @@ mod tests {
     /// Smooth moves only interior vertices: Blender's `calc_vert_neighbors_interior` clears the
     /// neighbors of a boundary corner (two neighbors), so a lone triangle has nothing to average.
     /// A four-triangle fan around an interior center vertex gives Smooth something to move.
-    fn test_mesh_for(brush: Brush) -> Mesh {
-        if brush != Brush::Dab(DabBrush::Smooth) {
+    fn test_mesh_for(brush: DabBrush) -> Mesh {
+        if brush != DabBrush::Smooth {
             return test_mesh();
         }
         Mesh::from_positions_and_faces(
@@ -1015,23 +851,23 @@ mod tests {
         }
     }
 
-    fn test_stroke(brush: Brush) -> Stroke {
+    fn test_stroke(brush: DabBrush) -> Stroke {
         let center_z = match brush {
-            Brush::Dab(DabBrush::Scrape | DabBrush::Flatten) => -0.25,
-            Brush::Dab(DabBrush::Fill) => 0.25,
+            DabBrush::Scrape | DabBrush::Flatten => -0.25,
+            DabBrush::Fill => 0.25,
             _ => 0.0,
         };
         let delta = match brush {
-            Brush::Dab(DabBrush::Grab | DabBrush::Thumb | DabBrush::Nudge | DabBrush::Elastic)
-            | Brush::Vertex(VertexBrush::BoundaryLite) => Some(DVec3::new(0.25, 0.0, 0.0)),
-            Brush::Vertex(VertexBrush::PoseLite) => Some(DVec3::new(0.0, 0.0, 0.25)),
+            DabBrush::Grab | DabBrush::Thumb | DabBrush::Nudge | DabBrush::Elastic => {
+                Some(DVec3::new(0.25, 0.0, 0.0))
+            }
             _ => None,
         };
         let mut samples = vec![
             sample(DVec3::new(0.0, 0.0, center_z)),
             sample(DVec3::new(0.5, 0.0, center_z)),
         ];
-        if brush == Brush::Dab(DabBrush::Rotate) {
+        if brush == DabBrush::Rotate {
             // Twist turns by the dial angle of the path, so the path must leave its first direction.
             samples.push(sample(DVec3::new(0.0, 0.5, center_z)));
         }
@@ -1046,43 +882,26 @@ mod tests {
     }
 
     #[test]
-    fn vertex_brushes_reject_a_view() {
+    fn every_dab_brush_deforms_covered_geometry_deterministically() {
         for brush in [
-            Brush::Vertex(VertexBrush::PoseLite),
-            Brush::Vertex(VertexBrush::BoundaryLite),
-        ] {
-            let stroke = Stroke {
-                view: Some(DVec3::Z),
-                ..test_stroke(brush)
-            };
-            let mut mesh = test_mesh_for(brush);
-            assert!(apply_stroke(&mut mesh, &stroke).is_err(), "{brush:?}");
-        }
-    }
-
-    #[test]
-    fn every_brush_deforms_covered_geometry_deterministically() {
-        for brush in [
-            Brush::Dab(DabBrush::Draw),
-            Brush::Dab(DabBrush::ClayStrips),
-            Brush::Dab(DabBrush::Inflate),
-            Brush::Dab(DabBrush::Grab),
-            Brush::Dab(DabBrush::Smooth),
-            Brush::Dab(DabBrush::Flatten),
-            Brush::Dab(DabBrush::Pinch),
-            Brush::Dab(DabBrush::Crease),
-            Brush::Dab(DabBrush::Layer),
-            Brush::Dab(DabBrush::SnakeHook),
-            Brush::Dab(DabBrush::Thumb),
-            Brush::Dab(DabBrush::Rotate),
-            Brush::Dab(DabBrush::Nudge),
-            Brush::Dab(DabBrush::Blob),
-            Brush::Dab(DabBrush::Scrape),
-            Brush::Dab(DabBrush::Fill),
-            Brush::Dab(DabBrush::DrawSharp),
-            Brush::Dab(DabBrush::Elastic),
-            Brush::Vertex(VertexBrush::PoseLite),
-            Brush::Vertex(VertexBrush::BoundaryLite),
+            DabBrush::Draw,
+            DabBrush::ClayStrips,
+            DabBrush::Inflate,
+            DabBrush::Grab,
+            DabBrush::Smooth,
+            DabBrush::Flatten,
+            DabBrush::Pinch,
+            DabBrush::Crease,
+            DabBrush::Layer,
+            DabBrush::SnakeHook,
+            DabBrush::Thumb,
+            DabBrush::Rotate,
+            DabBrush::Nudge,
+            DabBrush::Blob,
+            DabBrush::Scrape,
+            DabBrush::Fill,
+            DabBrush::DrawSharp,
+            DabBrush::Elastic,
         ] {
             let stroke = test_stroke(brush);
             let base = test_mesh_for(brush);
@@ -1106,7 +925,7 @@ mod tests {
         let strength = 0.5;
         let pressure = 1.0;
         let stroke = Stroke {
-            brush: Brush::Dab(DabBrush::Draw),
+            brush: DabBrush::Draw,
             samples: vec![StrokeSample {
                 position: DVec3::ZERO,
                 pressure,
@@ -1153,7 +972,7 @@ mod tests {
             json!({"domain":"faces","values":{"f0":3}}),
         );
         let mut stroke = Stroke {
-            brush: Brush::Dab(DabBrush::Draw),
+            brush: DabBrush::Draw,
             samples: vec![sample(DVec3::new(0.1, 0.0, 0.0))],
             falloff: Falloff::Smooth,
             symmetry: Vec::new(),
@@ -1198,7 +1017,7 @@ mod tests {
             json!({"domain":"edges","values":{"e0":2.0,"e1":4.0,"e2":6.0}}),
         );
         let stroke = Stroke {
-            brush: Brush::Dab(DabBrush::Draw),
+            brush: DabBrush::Draw,
             samples: vec![sample(DVec3::ZERO)],
             falloff: Falloff::Smooth,
             symmetry: Vec::new(),

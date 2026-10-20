@@ -6,6 +6,12 @@
 # corners, vertex-group weights) and the Blender 5.2.2 evaluated result of the Decimate modifier.
 # `tests/modifier_decimate_parity.rs` rebuilds the input in Potter and asserts the same output.
 # Pass `--only <substring>` before the output directory to regenerate a subset.
+#
+# `inputs/float1_edge_potter_order.json` is hand-committed and no generator writes it. Its positions and
+# faces are Blender 5.2.2's Boolean FLOAT-1 result; its edge list is in the order Potter's FLOAT output
+# emits (the `note` field in the file). The Potter command or commit that produced that edge order is not
+# recorded in the repository. The case `float1_edge_potter_r0.6` decimates this mesh in Blender, so its
+# expected output is Blender's. This script only reads the file.
 import json
 import math
 import os
@@ -117,7 +123,17 @@ def build_base(spec):
         return cylinder_mesh(spec.get("segments", 16), spec.get("rings", 6), spec.get("caps", True))
     if kind == "subdivided_cube":
         return subdivided_cube(spec["levels"])
+    if kind == "explicit":
+        data = explicit_mesh(spec)
+        return [tuple(v) for v in data["positions"]], [tuple(f) for f in data["faces"]]
     raise ValueError(kind)
+
+
+def explicit_mesh(spec):
+    # Mesh data from a committed JSON file; edges keep the file's order.
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), spec["file"])
+    with open(path, encoding="utf-8") as handle:
+        return json.load(handle)
 
 
 # ---------------------------------------------------------------- mesh decoration
@@ -172,12 +188,34 @@ def decorate(me, obj, spec):
                 vg.add([vertex.index], weight, "REPLACE")
 
 
+def boolean_cube_object(name):
+    # A size-2 cube minus a size-1 cube inside it (EXACT solver, DIFFERENCE), applied. The result is a
+    # hollow cube made of two closed shells: 16 vertices, 24 edges, 12 quads (Blender 5.2.2 V16 E24 F12).
+    bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0.0, 0.0, 0.0))
+    cutter = bpy.context.active_object
+    bpy.ops.mesh.primitive_cube_add(size=2.0, location=(0.0, 0.0, 0.0))
+    host = bpy.context.active_object
+    host.name = name
+    boolean = host.modifiers.new("Boolean", "BOOLEAN")
+    boolean.operation = "DIFFERENCE"
+    boolean.solver = "EXACT"
+    boolean.operand_type = "OBJECT"
+    boolean.object = cutter
+    bpy.context.view_layer.objects.active = host
+    bpy.ops.object.modifier_apply(modifier="Boolean")
+    bpy.data.objects.remove(cutter)
+    return host
+
+
 def make_object(name, spec):
+    if spec.get("boolean"):
+        return boolean_cube_object(name)
     verts, faces = build_base(spec)
     # Vertices no face uses: Blender's BMesh keeps them through every decimate mode.
     verts = verts + [(5.0, 5.0, 5.0), (-6.0, 4.0, 2.0)] if spec.get("isolated") else verts
     me = bpy.data.meshes.new(name + "_mesh")
-    me.from_pydata(verts, [], faces)
+    edges = explicit_mesh(spec)["edges"] if spec["mesh"] == "explicit" else []
+    me.from_pydata(verts, [tuple(e) for e in edges], faces)
     me.update()
     obj = bpy.data.objects.new(name, me)
     bpy.context.scene.collection.objects.link(obj)
@@ -376,7 +414,13 @@ def all_cases():
     cases = ratio_cases()
     # COLLAPSE: cube, UV and continuous-UV grids, symmetry per axis, vertex groups, triangulation.
     cases["cube_r0.5"] = (dict(mesh="cube"), {"decimate_type": "COLLAPSE", "ratio": 0.5})
+    # Boolean FLOAT stack FLOAT-1 with Potter's edge order: Blender's COLLAPSE rings depend on edge order.
+    cases["float1_edge_potter_r0.6"] = (dict(mesh="explicit", file="inputs/float1_edge_potter_order.json"),
+                                        {"decimate_type": "COLLAPSE", "ratio": 0.6})
     cases["cube_r0.7"] = (dict(mesh="cube"), {"decimate_type": "COLLAPSE", "ratio": 0.7})
+    # Boolean-applied hollow cube (two closed shells). Its inner shell triangulates and joins back into a
+    # face that doubles one already made; Blender keeps the existing face (`bm_decim_triangulate_end`).
+    cases["boolean_cube_r0.6"] = (dict(boolean=True), {"decimate_type": "COLLAPSE", "ratio": 0.6})
     cases["subcube2_r0.4"] = (dict(mesh="subdivided_cube", levels=2), {"decimate_type": "COLLAPSE", "ratio": 0.4})
     cases["cube_uv_r0.5"] = (dict(mesh="cube", uv="random", uv_layers=2),
                              {"decimate_type": "COLLAPSE", "ratio": 0.5})

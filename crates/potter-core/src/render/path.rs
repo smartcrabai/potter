@@ -7,7 +7,7 @@ use crate::{
     eval::Snapshot,
     geom::volume::{VolumeData, sample_density, sample_density_checked},
     image::{ImageData, ImageInterpolation},
-    model::{Id, LightType, RayKind, SceneDoc},
+    model::{Id, LightType, Material, RayKind, SceneDoc},
     shader::{
         BsdfParams, EvaluatorWorkspace, HitContext, HitUvLayers, PreparedMaterial,
         equirectangular_uv, evaluate_surface_with_workspace, height_gradient,
@@ -15,8 +15,8 @@ use crate::{
 };
 
 use super::principled_bsdf::{
-    Layers, continuous_density, evaluate as evaluate_bsdf, layers, light_lobes_coefficient,
-    lobe_probabilities,
+    GlassSample, Layers, continuous_density, evaluate as evaluate_bsdf, layers,
+    light_lobes_coefficient, lobe_probabilities, sample_glass,
 };
 use super::{
     bvh::{Bvh, BvhHit},
@@ -25,7 +25,7 @@ use super::{
         point_intensity, spot_attenuation, spread_attenuation, spread_region,
     },
     raster::{
-        Camera, Mode, RasterOutput, StereoMode, blend_corner_normals, camera_eye,
+        Camera, Mode, RasterOutput, StereoMode, Triangle, blend_corner_normals, camera_eye,
         rasterize_with_lines, ray_for_sample, smooth_shadow_origin,
     },
     scene::{Geometry, HitPose, LayerTables, ObjectRecord, layered_context, object_space},
@@ -142,7 +142,6 @@ struct Surface {
     layers: Layers,
     object_index: u32,
     element_index: u32,
-    distance: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -1054,7 +1053,12 @@ fn trace_path(
         if bounce == max_bounces {
             break;
         }
-        let (next_direction, weight) = match sample_bsdf(&surface.params, &surface.layers, rng) {
+        let (next_direction, weight) = match sample_bsdf(
+            &surface.params,
+            &surface.layers,
+            surface.geometric_normal,
+            rng,
+        ) {
             BsdfSample::Continuous {
                 direction,
                 weight,
@@ -1078,6 +1082,8 @@ fn trace_path(
                 ray = lobe;
                 (direction, weight)
             }
+            // Cycles' `LABEL_NONE`: a rejected draw ends the path.
+            BsdfSample::Absorbed => break,
         };
         if !next_direction.is_finite() || !weight.is_finite() {
             break;
@@ -1349,7 +1355,10 @@ fn closest_hit(
     )
 }
 
-fn make_surface(
+/// The shading parameters at one hit, for the transparent pass of a realtime shadow ray (`render/scene.rs`). They
+/// are the path tracer's, so a realtime shadow and a path-traced one read the same alpha and tint. The pass reads
+/// neither the displacement gradient nor the coat layers, so only the material evaluation runs.
+pub(super) fn hit_params(
     doc: &SceneDoc,
     snapshot: &Snapshot,
     geometry: &Geometry,
@@ -1358,7 +1367,54 @@ fn make_surface(
     direction: DVec3,
     images: &BTreeMap<String, ImageData>,
     evaluator_workspace: &mut EvaluatorWorkspace,
-) -> Result<Surface> {
+) -> Result<BsdfParams> {
+    with_hit_frame(
+        doc,
+        snapshot,
+        geometry,
+        hit,
+        origin,
+        direction,
+        images,
+        |frame| {
+            let mut params = evaluate_surface_with_workspace(
+                frame.material,
+                frame.prepared,
+                &frame.context,
+                evaluator_workspace,
+            )?;
+            apply_hit_alpha(frame.material, &mut params);
+            params.back_facing = frame.back_facing;
+            Ok(params)
+        },
+    )
+}
+
+/// A hit's position, normals, and the evaluation context of its material. The context borrows its layer tables, so a
+/// frame exists only inside [`with_hit_frame`].
+struct HitFrame<'a> {
+    point: DVec3,
+    shadow_point: DVec3,
+    back_facing: bool,
+    geometric_normal: DVec3,
+    normal: DVec3,
+    triangle: &'a Triangle,
+    material: &'a Material,
+    prepared: &'a PreparedMaterial,
+    context: HitContext<'a>,
+}
+
+/// Builds the frame of `hit` and calls `body` with it: the one place a hit's geometry, UVs and context are set up.
+fn with_hit_frame<T>(
+    doc: &SceneDoc,
+    snapshot: &Snapshot,
+    geometry: &Geometry,
+    hit: BvhHit,
+    origin: DVec3,
+    direction: DVec3,
+    images: &BTreeMap<String, ImageData>,
+    body: impl FnOnce(&HitFrame<'_>) -> Result<T>,
+) -> Result<T> {
     let triangle = geometry.triangles.get(hit.triangle_index).ok_or_else(|| {
         PotError::new(
             ErrorCode::EvaluationFailed,
@@ -1370,7 +1426,9 @@ fn make_surface(
     let mut geometric_normal = (triangle.positions[1] - triangle.positions[0])
         .cross(triangle.positions[2] - triangle.positions[0])
         .normalize_or_zero();
-    if geometric_normal.dot(-direction) < 0.0 {
+    // Cycles' `SD_BACKFACING`: the geometric normal faces away from the ray.
+    let back_facing = geometric_normal.dot(-direction) < 0.0;
+    if back_facing {
         geometric_normal = -geometric_normal;
     }
     // Smooth triangles light with the blended corner normal on the geometric normal's side.
@@ -1441,9 +1499,22 @@ fn make_surface(
         uv_layers,
         &mut tables,
     )?;
-    let mut params =
-        evaluate_surface_with_workspace(material, prepared, &context, evaluator_workspace)?;
-    // The graph is the only source of transparency for a material with one (Cycles ignores the render method).
+    body(&HitFrame {
+        point,
+        shadow_point,
+        back_facing,
+        geometric_normal,
+        normal,
+        triangle,
+        material,
+        prepared,
+        context,
+    })
+}
+
+/// The alpha of a surface after its material's alpha mode. The graph is the only source of transparency for a material
+/// with one (Cycles ignores the render method).
+fn apply_hit_alpha(material: &Material, params: &mut BsdfParams) {
     params.alpha = match material.alpha_mode.as_str() {
         "opaque" if material.node_tree.is_none() => 1.0,
         "clip" => {
@@ -1455,33 +1526,71 @@ fn make_surface(
         }
         _ => params.alpha.clamp(0.0, 1.0),
     };
-    if params.displacement_height != 0.0 && material.displacement_method != "displacement" {
-        let gradient = height_gradient(&context, normal, |sample| {
-            evaluate_surface_with_workspace(material, prepared, sample, evaluator_workspace)
-                .map(|surface| surface.displacement_height)
-        })?;
-        params.normal = normal - gradient;
-    }
-    params.normal = if params.normal.is_finite() {
-        params.normal.normalize_or_zero()
-    } else {
-        normal
-    };
-    if params.normal.dot(-direction) < 0.0 {
-        params.normal = -params.normal;
-    }
-    let hit_layers = layers(&params, params.normal, -direction);
-    Ok(Surface {
-        point,
-        normal: params.normal,
-        geometric_normal,
-        shadow_point,
-        params,
-        layers: hit_layers,
-        object_index: triangle.object_index,
-        element_index: triangle.element_index,
-        distance: hit.distance,
-    })
+}
+
+fn make_surface(
+    doc: &SceneDoc,
+    snapshot: &Snapshot,
+    geometry: &Geometry,
+    hit: BvhHit,
+    origin: DVec3,
+    direction: DVec3,
+    images: &BTreeMap<String, ImageData>,
+    evaluator_workspace: &mut EvaluatorWorkspace,
+) -> Result<Surface> {
+    with_hit_frame(
+        doc,
+        snapshot,
+        geometry,
+        hit,
+        origin,
+        direction,
+        images,
+        |frame| {
+            let mut params = evaluate_surface_with_workspace(
+                frame.material,
+                frame.prepared,
+                &frame.context,
+                evaluator_workspace,
+            )?;
+            apply_hit_alpha(frame.material, &mut params);
+            params.back_facing = frame.back_facing;
+            let normal = frame.normal;
+            if params.displacement_height != 0.0
+                && frame.material.displacement_method != "displacement"
+            {
+                let gradient = height_gradient(&frame.context, normal, |sample| {
+                    evaluate_surface_with_workspace(
+                        frame.material,
+                        frame.prepared,
+                        sample,
+                        evaluator_workspace,
+                    )
+                    .map(|surface| surface.displacement_height)
+                })?;
+                params.normal = normal - gradient;
+            }
+            params.normal = if params.normal.is_finite() {
+                params.normal.normalize_or_zero()
+            } else {
+                normal
+            };
+            if params.normal.dot(-direction) < 0.0 {
+                params.normal = -params.normal;
+            }
+            let hit_layers = layers(&params, params.normal, -direction);
+            Ok(Surface {
+                point: frame.point,
+                normal: params.normal,
+                geometric_normal: frame.geometric_normal,
+                shadow_point: frame.shadow_point,
+                params,
+                layers: hit_layers,
+                object_index: frame.triangle.object_index,
+                element_index: frame.triangle.element_index,
+            })
+        },
+    )
 }
 
 pub(super) fn object_for_index(
@@ -1523,8 +1632,13 @@ fn direct_lighting(
         let Some(sample) = sample_light(light, surface.point, rng) else {
             continue;
         };
-        let cosine = normal.dot(sample.direction).max(0.0);
-        if cosine <= 0.0 || sample.radiance.max_element() <= 0.0 {
+        let facing = normal.dot(sample.direction);
+        let cosine = facing.abs();
+        // Below the surface only a glass lobe contributes, so other surfaces skip the shadow ray.
+        if cosine <= 0.0
+            || (facing < 0.0 && !surface.layers.transmits())
+            || sample.radiance.max_element() <= 0.0
+        {
             continue;
         }
         let visibility = shadow_transmittance(
@@ -1567,9 +1681,11 @@ fn direct_lighting(
         Some(sampler) if rng.next_f64() >= 0.5 => sampler.sample(rng).0,
         _ => sample_cosine_hemisphere(normal, rng).0,
     };
-    let cosine = normal.dot(direction).max(0.0);
+    let facing = normal.dot(direction);
+    let cosine = facing.abs();
     let light_pdf = environment_light_pdf(normal, direction, importance);
-    if cosine > 0.0 && light_pdf > 0.0 {
+    // The importance sampler can draw below the surface, which only a glass lobe reaches.
+    if cosine > 0.0 && (facing > 0.0 || surface.layers.transmits()) && light_pdf > 0.0 {
         let environment_sample =
             world_radiance(doc, &snapshot.scene_id, images, direction, environment)?;
         let visibility = shadow_transmittance(
@@ -1715,67 +1831,69 @@ fn shadow_transmittance(
 ) -> Result<DVec3> {
     let mut transmittance = DVec3::ONE;
     let mut transparent_hits = 0u32;
-    let mut origin = offset_origin(point, direction, normal);
-    let mut remaining = if distance.is_finite() {
+    let mut blocked = false;
+    let mut failure = None;
+    let remaining = if distance.is_finite() {
         (distance - RAY_EPSILON).max(0.0)
     } else {
         f64::INFINITY
     };
-    while let Some(hit) = closest_hit(
-        geometry,
-        bvh,
-        origin,
+    let (origin, remaining) = bvh.walk_hits(
+        &geometry.triangles,
+        offset_origin(point, direction, normal),
         direction,
         RAY_EPSILON,
         remaining,
         RayKind::Shadow,
-    ) {
-        let surface = make_surface(
-            doc,
-            snapshot,
-            geometry,
-            hit,
-            origin,
-            direction,
-            images,
-            evaluator_workspace,
-        )?;
-        // Cycles counts each transparent surface a shadow ray crosses against the path's remaining
-        // budget and blocks the ray past it (`intern/cycles/kernel/bvh/intersect_filter.h`);
-        // volume-bounds surfaces are not counted (`SD_HAS_ONLY_VOLUME`).
-        if !surface.params.has_medium() {
-            transparent_hits += 1;
-            if transparent_hits > transparent_budget {
-                return Ok(DVec3::ZERO);
+        |hit, origin| {
+            let surface = match make_surface(
+                doc,
+                snapshot,
+                geometry,
+                hit,
+                origin,
+                direction,
+                images,
+                evaluator_workspace,
+            ) {
+                Ok(surface) => surface,
+                Err(error) => {
+                    failure = Some(error);
+                    return false;
+                }
+            };
+            // Cycles counts each transparent surface a shadow ray crosses against the path's remaining
+            // budget and blocks the ray past it (`intern/cycles/kernel/bvh/intersect_filter.h`);
+            // volume-bounds surfaces are not counted (`SD_HAS_ONLY_VOLUME`).
+            if !surface.params.has_medium() {
+                transparent_hits += 1;
+                if transparent_hits > transparent_budget {
+                    blocked = true;
+                    return false;
+                }
             }
-        }
-        let alpha = surface.params.alpha.clamp(0.0, 1.0);
-        let transmission = surface.params.transmission.clamp(0.0, 1.0);
-        if alpha >= 1.0 && transmission <= 0.0 {
-            return Ok(DVec3::ZERO);
-        }
-        // Each transparent share passes its Transparent colour, `(1 - alpha) * tint` as Cycles' closure weight
-        // (`bsdf_transparent.h`). A glass share passes its transmission, tinted by the base colour as before.
-        let base_tint = DVec3::new(
-            surface.params.base_color[0],
-            surface.params.base_color[1],
-            surface.params.base_color[2],
-        )
-        .max_element()
-        .clamp(0.0, 1.0);
-        transmittance *= DVec3::from_array(surface.params.transparent_tint) * (1.0 - alpha)
-            + DVec3::splat(alpha * transmission * base_tint);
-        if transmittance.max_element() <= 1.0e-5 {
-            return Ok(DVec3::ZERO);
-        }
-        let advance = surface.distance + RAY_EPSILON;
-        origin += direction * advance;
-        if remaining.is_finite() {
-            remaining = (remaining - advance).max(0.0);
-            if remaining <= RAY_EPSILON {
-                break;
+            // Cycles' shadow transparency is the Transparent closure's extinction, `(1 - alpha) · tint`
+            // (`kernel/integrator/surface_shader.h`, `surface_shader_transparency`). A glass or other transmissive
+            // closure has none, so it blocks the shadow ray: its shader lacks `SD_HAS_TRANSPARENT_SHADOW`
+            // (`scene/shader.cpp`, `kernel/bvh/intersect_filter.h`).
+            let alpha = surface.params.alpha.clamp(0.0, 1.0);
+            if alpha >= 1.0 {
+                blocked = true;
+                return false;
             }
-        }
+            transmittance *= DVec3::from_array(surface.params.transparent_tint) * (1.0 - alpha);
+            if transmittance.max_element() <= 1.0e-5 {
+                blocked = true;
+                return false;
+            }
+            true
+        },
+    );
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    if blocked {
+        return Ok(DVec3::ZERO);
     }
     let volume_transmittance = march_volumes(
         volumes,
@@ -2171,7 +2289,7 @@ struct MisVertex {
 enum Scatter {
     /// The camera ray. Lights are not visible to camera rays.
     Camera,
-    /// A delta (specular transmission) bounce at `point`: light sampling cannot reach it, so a
+    /// A delta (sharp glass reflection or refraction) bounce at `point`: light sampling cannot reach it, so a
     /// light hit is unweighted. The light is evaluated from `point`, as Cycles uses the segment's
     /// `ray_P`.
     Delta(DVec3),
@@ -2182,9 +2300,9 @@ enum Scatter {
     Volume,
 }
 
-/// Outcome of sampling the Principled BSDF. `Continuous` carries the exact lobe-mixture density
-/// that MIS needs. `Delta` is a specular bounce that light sampling cannot reach: a transmitted
-/// direction, or the reflection that total internal reflection takes instead.
+/// Outcome of sampling the Principled BSDF. `Continuous` carries the exact lobe-mixture density that MIS
+/// needs. `Delta` is a singular glass reflection or refraction, which light sampling cannot reach.
+/// `Absorbed` is a draw Cycles rejects (`LABEL_NONE`), so the path ends.
 enum BsdfSample {
     Continuous {
         direction: DVec3,
@@ -2197,32 +2315,32 @@ enum BsdfSample {
         weight: DVec3,
         ray: RayKind,
     },
+    Absorbed,
 }
 
-fn sample_bsdf(params: &BsdfParams, layers: &Layers, rng: &mut Pcg32) -> BsdfSample {
-    let (normal, view) = (layers.normal, layers.view);
+fn sample_bsdf(
+    params: &BsdfParams,
+    layers: &Layers,
+    geometric: DVec3,
+    rng: &mut Pcg32,
+) -> BsdfSample {
+    let normal = layers.normal;
+    let view = layers.view;
     let probabilities = lobe_probabilities(params, layers);
     let choice = rng.next_f64();
     if choice < probabilities.transmission {
-        // Total internal reflection is a singular reflection, which Cycles gives the glossy ray kind
-        // (`integrator/path_state.h`, `path_state_next`: singular labels take `PATH_RAY_VISIBILITY_GLOSSY`).
-        let (direction, ray) = match refract(-view, normal, 1.0 / params.ior.max(1.0e-3)) {
-            Some(direction) => (direction, RayKind::Transmission),
-            None => (reflect(-view, normal), RayKind::Glossy),
-        };
-        let tint = DVec3::new(
-            params.base_color[0],
-            params.base_color[1],
-            params.base_color[2],
-        );
-        let weight = tint
-            * (params.reflectance.clamp(0.0, 1.0) * params.transmission.clamp(0.0, 1.0)
-                / probabilities.transmission.max(1.0e-8))
-            * layers.lower();
-        return BsdfSample::Delta {
-            direction,
-            weight,
-            ray,
+        let rands = [rng.next_f64(), rng.next_f64(), rng.next_f64()];
+        let glass = sample_glass(params, layers, geometric, probabilities.transmission, rands);
+        return match glass {
+            GlassSample::Absorbed => BsdfSample::Absorbed,
+            GlassSample::Singular { direction, weight } => BsdfSample::Delta {
+                direction,
+                weight,
+                ray: glass_ray(normal, direction),
+            },
+            GlassSample::Rough { direction } => {
+                continuous_sample(params, layers, direction, glass_ray(normal, direction))
+            }
         };
     }
     let diffuse_end = probabilities.transmission + probabilities.diffuse;
@@ -2249,9 +2367,31 @@ fn sample_bsdf(params: &BsdfParams, layers: &Layers, rng: &mut Pcg32) -> BsdfSam
             RayKind::Glossy,
         )
     };
-    // Estimator `f cos / p_mix`: the density is the lobe mixture, not the branch's own lobe.
+    continuous_sample(params, layers, direction, ray)
+}
+
+/// The ray kind of a glass draw, by the side of the surface it leaves to. A transmitted draw is a
+/// transmission; a reflection, including the total internal reflection that `sample_glass` returns as a
+/// singular reflection, is a glossy draw (`integrator/path_state.h`, singular labels take the glossy kind).
+fn glass_ray(normal: DVec3, direction: DVec3) -> RayKind {
+    if normal.dot(direction) < 0.0 {
+        RayKind::Transmission
+    } else {
+        RayKind::Glossy
+    }
+}
+
+/// The estimator `f cos / p_mix` of a continuous direction. The density is the lobe mixture, not the
+/// branch's own lobe, and `|cos|` admits the glass lobe's transmission below the surface. `ray` is the
+/// kind of the lobe the draw came from.
+fn continuous_sample(
+    params: &BsdfParams,
+    layers: &Layers,
+    direction: DVec3,
+    ray: RayKind,
+) -> BsdfSample {
     let pdf = continuous_density(params, layers, direction);
-    let cosine = normal.dot(direction).max(0.0);
+    let cosine = layers.normal.dot(direction).abs();
     let weight = evaluate_bsdf(params, layers, direction) * (cosine / pdf.max(1.0e-8));
     BsdfSample::Continuous {
         direction,
@@ -2315,12 +2455,6 @@ fn basis(normal: DVec3) -> (DVec3, DVec3) {
 
 fn reflect(direction: DVec3, normal: DVec3) -> DVec3 {
     direction - 2.0 * direction.dot(normal) * normal
-}
-
-fn refract(direction: DVec3, normal: DVec3, eta: f64) -> Option<DVec3> {
-    let cosine = (-direction).dot(normal).clamp(-1.0, 1.0);
-    let discriminant = 1.0 - eta * eta * (1.0 - cosine * cosine);
-    (discriminant >= 0.0).then(|| eta * direction + (eta * cosine - discriminant.sqrt()) * normal)
 }
 
 fn collect_lights(doc: &SceneDoc, snapshot: &Snapshot) -> Vec<PointLight> {
@@ -3284,9 +3418,13 @@ mod sampling_tests {
         let mut sum = DVec3::ZERO;
         let mut sum_squares = DVec3::ZERO;
         for _ in 0..samples {
-            let weight = match sample_bsdf(&params, &layers(&params, normal, view), &mut rng) {
-                BsdfSample::Continuous { weight, .. } | BsdfSample::Delta { weight, .. } => weight,
-            };
+            let weight =
+                match sample_bsdf(&params, &layers(&params, normal, view), normal, &mut rng) {
+                    BsdfSample::Continuous { weight, .. } | BsdfSample::Delta { weight, .. } => {
+                        weight
+                    }
+                    BsdfSample::Absorbed => DVec3::ZERO,
+                };
             sum += weight;
             sum_squares += weight * weight;
         }

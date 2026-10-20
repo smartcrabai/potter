@@ -15,16 +15,24 @@
 //! - `node_shader_bsdf_principled.cc`: the default distribution is `SHD_GLOSSY_MULTI_GGX`, so
 //!   energy preservation is enabled for the specular and metallic lobes.
 //!
-//! Estimator contract: `evaluate` is the continuous BSDF (diffuse + specular lobes, reflectance
-//! applied). `continuous_density` is the exact density with which `path.rs` draws continuous
-//! directions (lobe mixture), so `evaluate / density` is unbiased for the mixture. The transmission
-//! lobe stays a delta, handled by `path.rs`.
+//! Estimator contract: `evaluate` is the continuous BSDF times reflectance: the diffuse, specular,
+//! sheen and coat lobes above the surface, and the glass lobe on both sides (its reflection above,
+//! its transmission below). `continuous_density` is the density with which `path.rs` draws continuous
+//! directions (lobe mixture), so `evaluate / density` is unbiased for the mixture over the sampler's
+//! domain. The glass lobe's eval and density follow Cycles' `bsdf_microfacet_eval`, which also covers
+//! half vectors the VNDF sampler never draws, so MIS on glass matches Cycles' eval/pdf and is not an
+//! exact density. A singular glass lobe (roughness zero) is a delta that `sample_glass` draws; light
+//! sampling cannot reach it.
 
 use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI};
 
 use glam::DVec3;
 
-use super::principled_tables::{ggx_energy, ggx_energy_average, ggx_gen_schlick_ior_s, sheen_ltc};
+use super::principled_tables::{
+    ggx_energy, ggx_energy_average, ggx_gen_schlick_ior_s, ggx_glass_energy,
+    ggx_glass_energy_average, ggx_glass_inverse_energy, ggx_glass_inverse_energy_average,
+    sheen_ltc,
+};
 use crate::model::RayKind;
 use crate::shader::{BsdfParams, dielectric_f0};
 
@@ -46,25 +54,38 @@ pub(crate) fn lobe_probabilities(params: &BsdfParams, layers: &Layers) -> LobePr
     let metallic = params.metallic.clamp(0.0, 1.0);
     let transmission = params.transmission.clamp(0.0, 1.0);
     let diffuse_weight = ((1.0 - metallic) * (1.0 - transmission)).max(0.0);
+    // The glass closure is weighted `(1 - metallic) · transmission`: Cycles takes the metallic weight
+    // first (`kernel/svm/closure.h`). A view below the surface has no glass lobe.
+    let glass_weight = if layers.glass.is_some() {
+        (1.0 - metallic) * transmission
+    } else {
+        0.0
+    };
     // Each layer's selection weight is its layering albedo: Cycles' sample weight of the closure.
     let sheen_weight = layers.sheen.selection_weight();
     let coat_weight = layers.coat.map_or(0.0, |coat| coat.albedo);
+    // The dielectric specular layer is weighted `(1 - metallic) · (1 - transmission)`, as `specular_lobe`
+    // evaluates it.
     let specular_weight = (metallic
-        + dielectric_f0(params.ior, params.specular_ior_level) * (1.0 - metallic))
+        + dielectric_f0(params.ior, params.specular_ior_level)
+            * (1.0 - metallic)
+            * (1.0 - transmission))
         .max(1.0e-4);
-    let total = diffuse_weight + sheen_weight + coat_weight + transmission + specular_weight;
+    let total = diffuse_weight + sheen_weight + coat_weight + glass_weight + specular_weight;
     LobeProbabilities {
         diffuse: diffuse_weight / total,
         sheen: sheen_weight / total,
         coat: coat_weight / total,
         specular: specular_weight / total,
-        transmission: transmission / total,
+        transmission: glass_weight / total,
     }
 }
 
-/// Exact density of the continuous (diffuse, sheen, coat and specular) directions drawn by
-/// `path.rs`, in solid angle. Diffuse is cosine-distributed; sheen is the LTC distribution; the coat
-/// and specular lobes are the GGX half-vector distribution D·cosθh mapped to the reflected direction.
+/// Density of the continuous (diffuse, sheen, coat and specular) directions drawn by `path.rs`, in solid
+/// angle, with the glass lobe's density as Cycles' eval and pdf define it. Diffuse is cosine-distributed;
+/// sheen is the LTC distribution; the coat and specular lobes are the GGX half-vector distribution D·cosθh
+/// mapped to the reflected direction. The glass lobe's density is its reflection above the surface and its
+/// refraction below it.
 pub(crate) fn continuous_density(params: &BsdfParams, layers: &Layers, light: DVec3) -> f64 {
     let (normal, view) = (layers.normal, layers.view);
     let probabilities = lobe_probabilities(params, layers);
@@ -73,7 +94,11 @@ pub(crate) fn continuous_density(params: &BsdfParams, layers: &Layers, light: DV
     if let Some(coat) = layers.coat {
         density += probabilities.coat * half_vector_pdf(coat.normal, coat.roughness, view, light);
     }
-    density + probabilities.specular * half_vector_pdf(normal, params.roughness, view, light)
+    density += probabilities.specular * half_vector_pdf(normal, params.roughness, view, light);
+    if let Some(glass) = &layers.glass {
+        density += probabilities.transmission * glass_eval(glass, normal, view, light).1;
+    }
+    density
 }
 
 /// Density in solid angle of the reflection of `view` about the half vector drawn with
@@ -163,10 +188,8 @@ fn specular_lobe(
 
     if let Some(layer) = specular_layer(params) {
         let f0 = layer.f0_tinted;
-        let real_f0 = dielectric_f0(layer.eta, 0.5);
         let real_f = fresnel_dielectric(v_dot_h, layer.eta);
-        let remap = saturate(inverse_lerp(real_f0, 1.0, real_f));
-        let fresnel = f0.lerp(DVec3::ONE, remap);
+        let fresnel = remapped_fresnel(f0, layer.eta, real_f);
         let gain = multiscatter_gain(dielectric_fss(&layer), energy_average, missing);
         reflected += gain * fresnel * dielectric_weight;
     }
@@ -198,13 +221,16 @@ const COAT_WEIGHT_CUTOFF: f64 = 1.0e-5;
 
 /// Continuous Principled BSDF times reflectance, the `evaluate / density` estimator's numerator.
 pub(crate) fn evaluate(params: &BsdfParams, layers: &Layers, light: DVec3) -> DVec3 {
-    if layers.normal.dot(light) <= 0.0 {
-        return DVec3::ZERO;
-    }
-    diffuse_lobe(params, layers.normal, layers.view, layers.lower)
-        + specular_lobe(params, layers.normal, layers.view, light, layers.lower)
-        + sheen_coefficient(params, layers, light)
-        + coat_coefficient(params, layers, light)
+    // The reflective lobes sit above the surface; the glass lobe takes both sides.
+    let reflective = if layers.normal.dot(light) > 0.0 {
+        diffuse_lobe(params, layers.normal, layers.view, layers.lower)
+            + specular_lobe(params, layers.normal, layers.view, light, layers.lower)
+            + sheen_coefficient(params, layers, light)
+            + coat_coefficient(params, layers, light)
+    } else {
+        DVec3::ZERO
+    };
+    reflective + glass_coefficient(params, layers, light)
 }
 
 /// The sheen lobe along `light`, times reflectance. It depends on the light, so an area light is
@@ -279,6 +305,7 @@ pub(crate) struct Layers {
     coat: Option<CoatLayer>,
     sheen: SheenLobe,
     lower: DVec3,
+    glass: Option<GlassLobe>,
 }
 
 /// Sets up the sheen and coat layers of a shading point with normal `normal`, seen along `view`.
@@ -295,12 +322,14 @@ pub(crate) fn layers(params: &BsdfParams, normal: DVec3, view: DVec3) -> Layers 
     };
     let sheen = sheen_lobe(params, sheen_normal, view);
     let lower = coat_lower_factor_of(params, coat.as_ref()) * sheen.layer_weight();
+    let glass = glass_lobe(params, normal, view);
     Layers {
         normal,
         view,
         coat,
         sheen,
         lower,
+        glass,
     }
 }
 
@@ -313,6 +342,12 @@ impl Layers {
     /// Sheen direction for the square sample `(u, v)` in `[0, 1)²`, drawn from the LTC distribution.
     pub(crate) fn sample_sheen(&self, u: f64, v: f64) -> DVec3 {
         self.sheen.direction(u, v)
+    }
+
+    /// Whether a light below the surface can reach it through the glass lobe. A singular lobe is drawn only as a
+    /// delta, which light sampling cannot reach, so it does not count.
+    pub(crate) fn transmits(&self) -> bool {
+        self.glass.is_some_and(|glass| !glass.singular)
     }
 }
 
@@ -525,7 +560,9 @@ fn make_orthonormals(normal: DVec3) -> (DVec3, DVec3) {
 /// The lobes of `params` towards `light` that a light emits through, each kept only where the light's
 /// ray mask admits its ray kind. Cycles drops a closure from a light's direct lighting when that light
 /// excludes its kind (`surface_shader.h`, `_surface_shader_exclude`). Sheen is a diffuse-class closure
-/// (`CLOSURE_IS_BSDF_DIFFUSE`, `svm/types.h`), and the coat is a glossy GGX closure.
+/// (`CLOSURE_IS_BSDF_DIFFUSE`, `svm/types.h`), and the coat is a glossy GGX closure. A glass closure is
+/// both glossy and transmissive, so it is dropped only when the light excludes both kinds
+/// (`exclude_glass`, the same function).
 pub(crate) fn light_lobes_coefficient(
     params: &BsdfParams,
     layers: &Layers,
@@ -542,8 +579,14 @@ pub(crate) fn light_lobes_coefficient(
     } else {
         DVec3::ZERO
     };
-    diffuse + specular
+    let glass = if ray_mask & (RayKind::Glossy.bit() | RayKind::Transmission.bit()) != 0 {
+        glass_coefficient(params, layers, light)
+    } else {
+        DVec3::ZERO
+    };
+    diffuse + specular + glass
 }
+
 /// The base colour clamped to 1 (Cycles' `clamped_base_color`, used by the F82 metal lobe).
 fn base_color(params: &BsdfParams) -> DVec3 {
     diffuse_albedo(params).min(DVec3::ONE)
@@ -660,26 +703,39 @@ fn inverse_lerp(a: f64, b: f64, x: f64) -> f64 {
     (x - a) / (b - a)
 }
 
+/// Cycles' `generalized_schlick_fresnel` remap (`exponent < 0`): the real dielectric Fresnel `real` at the IOR
+/// `eta` is rescaled from `F0(eta)..1` onto `f0..1`.
+fn remapped_fresnel(f0: DVec3, eta: f64, real: f64) -> DVec3 {
+    let remap = saturate(inverse_lerp(dielectric_f0(eta, 0.5), 1.0, real));
+    f0.lerp(DVec3::ONE, remap)
+}
+
 fn ior_from_f0(f0: f64) -> f64 {
     let root = f0.clamp(0.0, 0.99).sqrt();
     (1.0 + root) / (1.0 - root)
 }
 
-/// Unpolarised dielectric Fresnel reflectance (`fresnel_dielectric`, average of s and p).
+/// Cycles' `fresnel_dielectric_polarized` averaged over the two polarisations: the reflectance, and the
+/// cosine of the refracted angle (negative, as Cycles gives it; zero under total internal reflection).
 #[expect(
     clippy::manual_midpoint,
     reason = "Cycles averages the s and p reflectances as 0.5 * (s + p), so the same expression is kept"
 )]
-fn fresnel_dielectric(cosine_incident: f64, eta: f64) -> f64 {
+fn dielectric_fresnel(cosine_incident: f64, eta: f64) -> (f64, f64) {
     let cos_i = cosine_incident.abs();
     let eta_cos_t_squared = eta * eta - (1.0 - cos_i * cos_i);
     if eta_cos_t_squared <= 0.0 {
-        return 1.0;
+        return (1.0, 0.0);
     }
     let cos_t = -eta_cos_t_squared.sqrt() / eta;
     let r_s = (cos_i + eta * cos_t) / (cos_i - eta * cos_t);
     let r_p = (cos_t + eta * cos_i) / (eta * cos_i - cos_t);
-    0.5 * (r_s * r_s + r_p * r_p)
+    (0.5 * (r_s * r_s + r_p * r_p), cos_t)
+}
+
+/// Unpolarised dielectric Fresnel reflectance (`fresnel_dielectric`, average of s and p).
+fn fresnel_dielectric(cosine_incident: f64, eta: f64) -> f64 {
+    dielectric_fresnel(cosine_incident, eta).0
 }
 
 /// Kulla-Conty fit of the average single-scattering dielectric Fresnel (`fresnel_dielectric_Fss`).
@@ -710,6 +766,265 @@ fn f82_tint_b(f0: DVec3, tint: DVec3) -> DVec3 {
 /// `fresnel_f82_Fss`: average single-scattering Fresnel of the F82 lobe.
 fn f82_fss(f0: DVec3, b: DVec3) -> DVec3 {
     f0.lerp(DVec3::ONE, 1.0 / 21.0) - b * (1.0 / 126.0)
+}
+
+/// Cycles' `bsdf_microfacet_setup` threshold for a delta lobe: `alpha_x · alpha_y <= 2e-10`
+/// (`roughness_is_almost_specular`, `kernel/closure/bsdf_microfacet.h`).
+const GLASS_SINGULAR_ALPHA_SQUARED: f64 = 2.0e-10;
+
+/// Cycles' GGX glass closure: one closure with a reflection lobe and a transmission lobe, set up as
+/// `bsdf_microfacet_ggx_glass_setup` and `generalized_schlick_setup` (`kernel/closure/bsdf_microfacet.h`),
+/// with the multiscatter energy compensation of `microfacet_ggx_preserve_energy`. The Principled BSDF's
+/// Transmission Weight (`kernel/svm/closure.h`) and the Glass BSDF node both build it.
+#[derive(Clone, Copy, Debug)]
+struct GlassLobe {
+    /// Cycles' `bsdf->ior`: the closure's IOR, inverted at a back face.
+    ior: f64,
+    /// GGX `alpha`, the roughness squared (Cycles' `alpha_x`).
+    alpha: f64,
+    /// Reflectance at normal incidence, tinted and saturated (`generalized_schlick_setup`'s `f0`).
+    f0: DVec3,
+    reflection_tint: DVec3,
+    transmission_tint: DVec3,
+    /// Multiscatter gain `1 + Fms · (1 - E) / E` per channel, from the view. It scales the eval and not
+    /// the density, as Cycles' `energy_scale` and the darkening of the weight together do.
+    gain: DVec3,
+    /// Roughness below Cycles' almost-specular threshold: the eval is zero and `sample_glass` draws a delta.
+    singular: bool,
+    /// An IOR of 1. Cycles' `bsdf_microfacet_sample` makes a refraction there a delta (the straight-through
+    /// direction), while `bsdf_microfacet_eval` keeps the roughness-only flag, so the eval stays rough.
+    straight: bool,
+}
+
+/// The glass lobe at a shading point with normal `normal` seen along `view`, or `None` when its weight
+/// `(1 - metallic) · transmission` is zero or the view is below the normal.
+fn glass_lobe(params: &BsdfParams, normal: DVec3, view: DVec3) -> Option<GlassLobe> {
+    let metallic = params.metallic.clamp(0.0, 1.0);
+    let transmission = params.transmission.clamp(0.0, 1.0);
+    let cos_ni = normal.dot(view);
+    if (1.0 - metallic) * transmission <= 0.0 || cos_ni <= 0.0 {
+        return None;
+    }
+    let roughness = params.roughness.clamp(0.0, 1.0);
+    let alpha = roughness * roughness;
+    let input_ior = params.ior.max(1.0e-5);
+    let ior = if params.back_facing {
+        1.0 / input_ior
+    } else {
+        input_ior
+    };
+    // `generalized_schlick_setup` tints F0 of the closure's own IOR, which a back face does not invert.
+    let f0 = (DVec3::from_array(params.specular_tint).max(DVec3::ZERO)
+        * dielectric_f0(input_ior, 0.5))
+    .clamp(DVec3::ZERO, DVec3::ONE);
+    let reflection_tint = DVec3::from_array(params.glass_reflection_tint).max(DVec3::ZERO);
+    let transmission_tint = DVec3::from_array(params.glass_transmission_tint).max(DVec3::ZERO);
+    let singular = alpha * alpha <= GLASS_SINGULAR_ALPHA_SQUARED;
+    let straight = (ior - 1.0).abs() < 1.0e-4;
+
+    // `microfacet_ggx_preserve_energy`: the GGX_GLASS tables at the view, the inverse ones below an IOR of 1.
+    let inverse = ior < 1.0;
+    let table_ior = if inverse { 1.0 / ior } else { ior };
+    let z = ((table_ior - 1.0) / (table_ior + 1.0)).abs().sqrt();
+    let (energy, energy_average) = if inverse {
+        (
+            ggx_glass_inverse_energy(roughness, cos_ni, z),
+            ggx_glass_inverse_energy_average(roughness, z),
+        )
+    } else {
+        (
+            ggx_glass_energy(roughness, cos_ni, z),
+            ggx_glass_energy_average(roughness, z),
+        )
+    };
+    let energy = energy.max(1.0e-6);
+    let missing = (1.0 - energy) / energy;
+    let fss = if transmission_tint.max_element() <= 0.0 {
+        // The reflective Fss: the dielectric's average single-scattering Fresnel, on the reflection tint.
+        dielectric_fss(&SpecularLayer {
+            eta: ior,
+            f0_tinted: f0,
+        }) * reflection_tint
+    } else {
+        transmission_tint
+    };
+    let gain = multiscatter_gain(fss, energy_average, missing);
+    Some(GlassLobe {
+        ior,
+        alpha,
+        f0,
+        reflection_tint,
+        transmission_tint,
+        gain,
+        singular,
+        straight,
+    })
+}
+
+impl GlassLobe {
+    /// Cycles' `generalized_schlick_fresnel` with the real dielectric remap: the reflectance and the
+    /// transmittance at the cosine `cos_hi` between the half vector and the view, and the cosine of the
+    /// refracted angle.
+    fn fresnel(&self, cos_hi: f64) -> (DVec3, DVec3, f64) {
+        let (real, cos_ht) = dielectric_fresnel(cos_hi, self.ior);
+        let fresnel = remapped_fresnel(self.f0, self.ior, real);
+        (
+            fresnel * self.reflection_tint,
+            (DVec3::ONE - fresnel) * self.transmission_tint,
+            cos_ht,
+        )
+    }
+}
+
+/// Cycles' `bsdf_microfacet_eval` for the glass lobe. The value carries the cosine of the light direction,
+/// as Cycles' eval does, so `value / |N·light|` is the BSDF. The density is in solid angle of `light`. The
+/// reflection is taken above the normal and the transmission below it; both are zero for an invalid pair.
+fn glass_eval(lobe: &GlassLobe, normal: DVec3, view: DVec3, light: DVec3) -> (DVec3, f64) {
+    let cos_ni = normal.dot(view);
+    let cos_no = normal.dot(light);
+    if lobe.singular || cos_ni <= 0.0 || cos_no.abs() <= 1.0e-12 {
+        return (DVec3::ZERO, 0.0);
+    }
+    let transmits = cos_no < 0.0;
+    // Cycles' half vector: `-(ior · wo + wi)` for a transmission, `wi + wo` for a reflection.
+    let unnormalised = if transmits {
+        -(view + light * lobe.ior)
+    } else {
+        view + light
+    };
+    let length = unnormalised.length();
+    if length <= 1.0e-12 {
+        return (DVec3::ZERO, 0.0);
+    }
+    let half = unnormalised / length;
+    let (reflectance, transmittance, _) = lobe.fresnel(half.dot(view));
+    let total = (reflectance + transmittance).element_sum();
+    if total <= 0.0 {
+        return (DVec3::ZERO, 0.0);
+    }
+    let pdf_reflect = reflectance.element_sum() / total;
+    let alpha_squared = lobe.alpha * lobe.alpha;
+    let distribution = ggx_distribution(alpha_squared, normal.dot(half));
+    let lambda_i = ggx_lambda(alpha_squared, cos_ni);
+    let lambda_o = ggx_lambda(alpha_squared, cos_no.abs());
+    let masking = 1.0 / (1.0 + lambda_i + lambda_o);
+    if transmits {
+        let ior_over_length = lobe.ior / length;
+        let common = distribution / cos_ni
+            * ior_over_length
+            * ior_over_length
+            * (half.dot(view) * half.dot(light)).abs();
+        (
+            transmittance * (common * masking) * lobe.gain,
+            (1.0 - pdf_reflect) * common / (1.0 + lambda_i),
+        )
+    } else {
+        let common = 0.25 * distribution / cos_ni;
+        (
+            reflectance * (common * masking) * lobe.gain,
+            pdf_reflect * common / (1.0 + lambda_i),
+        )
+    }
+}
+
+/// The glass lobe along `light`, times reflectance and the layers above it: its reflection above the
+/// surface and its transmission below. A delta lobe is zero here, since `sample_glass` draws it.
+pub(crate) fn glass_coefficient(params: &BsdfParams, layers: &Layers, light: DVec3) -> DVec3 {
+    let Some(lobe) = layers.glass.as_ref() else {
+        return DVec3::ZERO;
+    };
+    let cosine = layers.normal.dot(light).abs();
+    if cosine <= 0.0 {
+        return DVec3::ZERO;
+    }
+    let (value, _) = glass_eval(lobe, layers.normal, layers.view, light);
+    value / cosine * (params.reflectance.clamp(0.0, 1.0) * layers.lower)
+}
+
+/// A draw from the glass closure, as Cycles' `bsdf_microfacet_sample` makes it.
+pub(crate) enum GlassSample {
+    /// A delta reflection or refraction. `weight` is the Fresnel share over the branch probability (`branch`,
+    /// the glass probability in the lobe mixture), times the energy gain, the reflectance and the layers.
+    Singular { direction: DVec3, weight: DVec3 },
+    /// A rough draw, which the caller weights by the lobe mixture's density.
+    Rough { direction: DVec3 },
+    /// A draw on the wrong side of the normal or the geometric normal: Cycles' `LABEL_NONE`.
+    Absorbed,
+}
+
+/// Draws the glass closure from three uniform numbers: a visible-normal half vector (the normal for a
+/// delta lobe), then reflection or refraction, refraction with probability `1 - reflectance`.
+pub(crate) fn sample_glass(
+    params: &BsdfParams,
+    layers: &Layers,
+    geometric: DVec3,
+    branch: f64,
+    rands: [f64; 3],
+) -> GlassSample {
+    let Some(lobe) = layers.glass.as_ref() else {
+        return GlassSample::Absorbed;
+    };
+    let (normal, view) = (layers.normal, layers.view);
+    let half = if lobe.singular {
+        normal
+    } else {
+        let (tangent, bitangent) = make_orthonormals(normal);
+        let local_view = DVec3::new(view.dot(tangent), view.dot(bitangent), normal.dot(view));
+        let local_half = sample_visible_normal(local_view, lobe.alpha, rands[0], rands[1]);
+        tangent * local_half.x + bitangent * local_half.y + normal * local_half.z
+    };
+    let cos_hi = half.dot(view);
+    let (reflectance, transmittance, cos_ht) = lobe.fresnel(cos_hi);
+    let total = (reflectance + transmittance).element_sum();
+    if total <= 0.0 {
+        return GlassSample::Absorbed;
+    }
+    let pdf_reflect = reflectance.element_sum() / total;
+    let refracts = rands[2] >= pdf_reflect;
+    // Cycles' `refract_angle` for a refraction, and the mirror of the view for a reflection.
+    let direction = if refracts {
+        (half * (cos_hi / lobe.ior + cos_ht) - view / lobe.ior).normalize_or_zero()
+    } else {
+        (half * (2.0 * cos_hi) - view).normalize_or_zero()
+    };
+    if (geometric.dot(direction) < 0.0) != refracts || (normal.dot(direction) < 0.0) != refracts {
+        return GlassSample::Absorbed;
+    }
+    // Cycles' `m_singular` also covers a refraction at an IOR of 1 (`|eta - 1| < 1e-4`).
+    if !(lobe.singular || (refracts && lobe.straight)) {
+        return GlassSample::Rough { direction };
+    }
+    let (value, share) = if refracts {
+        (transmittance, 1.0 - pdf_reflect)
+    } else {
+        (reflectance, pdf_reflect)
+    };
+    let scale = params.reflectance.clamp(0.0, 1.0) * layers.lower;
+    GlassSample::Singular {
+        direction,
+        weight: value * lobe.gain * scale / (branch * share),
+    }
+}
+
+/// Cycles' `microfacet_ggx_sample_vndf` (Heitz 2018): the half vector visible from the local view `wi`
+/// (`z` up) for the isotropic GGX `alpha`, from the uniform pair `(u, v)`.
+fn sample_visible_normal(wi: DVec3, alpha: f64, u: f64, v: f64) -> DVec3 {
+    let stretched = DVec3::new(alpha * wi.x, alpha * wi.y, wi.z).normalize_or_zero();
+    let length_squared = stretched.x * stretched.x + stretched.y * stretched.y;
+    let (t1, t2) = if length_squared > 1.0e-7 {
+        let t1 = DVec3::new(-stretched.y, stretched.x, 0.0) / length_squared.sqrt();
+        (t1, stretched.cross(t1))
+    } else {
+        (DVec3::X, DVec3::Y)
+    };
+    // Section 4.2: the parameterisation of the projected area.
+    let (x, disk_y) = concentric_disk(u, v);
+    let s = f64::midpoint(1.0, stretched.z);
+    let y = (1.0 - s) * (1.0 - x * x).max(0.0).sqrt() + s * disk_y;
+    // Section 4.3: the reprojection onto the hemisphere, then back to the ellipsoid.
+    let hemisphere = DVec3::new(x, y, (1.0 - x * x - y * y).max(0.0).sqrt());
+    let half = t1 * hemisphere.x + t2 * hemisphere.y + stretched * hemisphere.z;
+    DVec3::new(alpha * half.x, alpha * half.y, half.z.max(0.0)).normalize_or_zero()
 }
 
 #[cfg(test)]
@@ -899,6 +1214,498 @@ mod tests {
         params.coat_weight = 0.0;
         let shading = layers(&params, DVec3::Z, view);
         assert!((shading.sheen.normal - DVec3::Z).length() < 1.0e-12);
+    }
+}
+
+#[cfg(test)]
+mod glass_tests {
+    use super::*;
+    use crate::model::Material;
+
+    // Geometry of tests/fixtures/native_oracle/glass/glass_plane_probe.py: a glass plane at z = 0 seen
+    // from 45° through a 16 × 16 orthographic image of 0.2 units, with the central 8 × 8 pixels
+    // averaged. A disk emitter of radius 1.2 and power 1000 W lies 4 units away: the front light on the
+    // mirror of the view, the back light on the refraction of the view below the plane.
+    const VIEW_THETA: f64 = FRAC_PI_4;
+    const LIGHT_DISTANCE: f64 = 4.0;
+    const RADIUS: f64 = 1.2;
+    const POWER: f64 = 1000.0;
+    const ORTHO_SCALE: f64 = 0.2;
+    /// Quadrature of the disk used for the oracle comparisons: radial and angular midpoints. The midpoint rule is
+    /// second order and the lobe is narrow, so the grid was chosen by a convergence run (a numpy port of this
+    /// integral, the same receivers, grids 64 × 128, 128 × 256, 256 × 512, 512 × 1024): at roughness 0.2 the back
+    /// patch mean is 66.847, 66.681, 66.640, 66.630, the error dropping by about 4 per doubling. At 256 × 512 it is
+    /// 0.0103 from 512 × 1024, 0.68 of the Cycles stderr (0.0152), and each rough oracle case is within 1 stderr.
+    const RADIAL: usize = 256;
+    const ANGULAR: usize = 512;
+
+    fn view() -> DVec3 {
+        DVec3::new(VIEW_THETA.sin(), 0.0, VIEW_THETA.cos())
+    }
+
+    /// A Principled glass (Transmission Weight 1, white base) as `BsdfParams::from_material` builds it.
+    fn principled_glass(ior: f64, roughness: f64) -> BsdfParams {
+        let material = Material {
+            base_color: [1.0, 1.0, 1.0, 1.0],
+            roughness,
+            ior,
+            transmission: 1.0,
+            ..Material::default()
+        };
+        BsdfParams::from_material(&material, DVec3::Z)
+    }
+
+    /// The Glass BSDF node: its Color is both the reflection and the transmission tint.
+    fn glass_node(color: [f64; 3], ior: f64, roughness: f64) -> BsdfParams {
+        let mut params = principled_glass(ior, roughness);
+        params.base_color = [color[0], color[1], color[2], 1.0];
+        params.glass_reflection_tint = color;
+        params.glass_transmission_tint = color;
+        params
+    }
+
+    /// The light centre of the probe: 4 units along the mirror of the view (front), or along the
+    /// refraction of the view below the plane for a relative IOR `ior` (back).
+    fn light_centre(ior: f64, back: bool) -> DVec3 {
+        if !back {
+            return LIGHT_DISTANCE * DVec3::new(-VIEW_THETA.sin(), 0.0, VIEW_THETA.cos());
+        }
+        let sin_t = VIEW_THETA.sin() / ior;
+        LIGHT_DISTANCE * DVec3::new(-sin_t, 0.0, -(1.0 - sin_t * sin_t).sqrt())
+    }
+
+    /// Midpoint quadrature of `f` over the unit sphere, `Σ f(ω) dω`.
+    fn sphere_integral(n_theta: usize, n_phi: usize, mut f: impl FnMut(DVec3) -> f64) -> f64 {
+        let d_theta = PI / n_theta as f64;
+        let d_phi = std::f64::consts::TAU / n_phi as f64;
+        let mut total = 0.0;
+        for i in 0..n_theta {
+            let theta = (i as f64 + 0.5) * d_theta;
+            let (sin_t, cos_t) = theta.sin_cos();
+            for j in 0..n_phi {
+                let phi = (j as f64 + 0.5) * d_phi;
+                let direction = DVec3::new(sin_t * phi.cos(), sin_t * phi.sin(), cos_t);
+                total += f(direction) * sin_t * d_theta * d_phi;
+            }
+        }
+        total
+    }
+
+    /// A deterministic uniform stream on `[0, 1)` for the Monte Carlo checks.
+    fn uniform_stream(seed: u64) -> impl FnMut() -> f64 {
+        let mut state = seed;
+        move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 11) as f64 / (1_u64 << 53) as f64
+        }
+    }
+
+    /// Cycles' single-precision disk emitter radiance: `P / (π · area)`.
+    fn disk_radiance() -> f64 {
+        POWER / (PI * PI * RADIUS * RADIUS)
+    }
+
+    /// Whether `light` lies in the domain the VNDF sampler draws: its half vector on the normal's side
+    /// (`n · H >= 0`) and visible from the view (`H · wi >= 0`). Cycles' eval also carries half vectors
+    /// outside it (`bsdf_D` squares `cos_NH` and `microfacet_eval` takes `fabs(cos_HI)`), which the
+    /// sampler's `max(0, h.z)` and visibility never produce, so an integral over the sphere is not the
+    /// sampler's.
+    fn sampler_domain(lobe: &GlassLobe, normal: DVec3, view: DVec3, light: DVec3) -> bool {
+        let unnormalised = if normal.dot(light) < 0.0 {
+            -(view + light * lobe.ior)
+        } else {
+            view + light
+        };
+        let half = unnormalised.normalize_or_zero();
+        normal.dot(half) >= 0.0 && view.dot(half) >= 0.0
+    }
+
+    #[test]
+    fn glass_density_integrates_to_the_accepted_draws() {
+        let params = principled_glass(1.5, 0.5);
+        let shading = layers(&params, DVec3::Z, view());
+        let Some(lobe) = glass_lobe(&params, DVec3::Z, view()) else {
+            panic!("a glass plane has a glass lobe");
+        };
+        // Over the sampler's domain the density is the density of the accepted rough draws.
+        let density = sphere_integral(400, 800, |light| {
+            if sampler_domain(&lobe, DVec3::Z, view(), light) {
+                glass_eval(&lobe, DVec3::Z, view(), light).1
+            } else {
+                0.0
+            }
+        });
+        let mut next = uniform_stream(7);
+        let draws = 200_000_usize;
+        let mut accepted = 0_usize;
+        for _ in 0..draws {
+            let rands = [next(), next(), next()];
+            if matches!(
+                sample_glass(&params, &shading, DVec3::Z, 1.0, rands),
+                GlassSample::Rough { .. }
+            ) {
+                accepted += 1;
+            }
+        }
+        let share = accepted as f64 / draws as f64;
+        let stderr = (share * (1.0 - share) / draws as f64).sqrt();
+        assert!(
+            (density - share).abs() <= 4.0 * stderr + 1.0e-3,
+            "density integrates to {density}, accepted share {share}"
+        );
+    }
+
+    #[test]
+    fn white_glass_visible_albedo_matches_the_ggx_glass_energy_table() {
+        // The GGX_GLASS tables are Cycles' `average(eval) / pdf` over its sampler, so E is the eval's
+        // integral over the sampler's domain. At a table node (roughness 6/15, cos 11/15, z 8/15) the
+        // two agree to 1e-4, and the gain 1 / E then makes white glass integrate to 1 over that domain.
+        let (roughness, mu, z): (f64, f64, f64) = (6.0 / 15.0, 11.0 / 15.0, 8.0 / 15.0);
+        let ior = (1.0 + z * z) / (1.0 - z * z);
+        let view = DVec3::new((1.0 - mu * mu).sqrt(), 0.0, mu);
+        let params = principled_glass(ior, roughness);
+        let Some(lobe) = glass_lobe(&params, DVec3::Z, view) else {
+            panic!("a glass plane has a glass lobe");
+        };
+        let albedo = sphere_integral(400, 800, |light| {
+            if sampler_domain(&lobe, DVec3::Z, view, light) {
+                glass_eval(&lobe, DVec3::Z, view, light).0.element_sum() / 3.0
+            } else {
+                0.0
+            }
+        });
+        let energy = ggx_glass_energy(roughness, mu, z);
+        assert!(
+            (albedo / lobe.gain.x - energy).abs() < 2.0e-3,
+            "eval integral {} vs GGX_GLASS_E {energy}",
+            albedo / lobe.gain.x
+        );
+        assert!((albedo - 1.0).abs() < 2.0e-3, "white glass albedo {albedo}");
+    }
+
+    #[test]
+    fn glass_transmission_is_reciprocal_up_to_the_squared_ior() {
+        // Walter's reciprocity f(wi, wo) / η_o² = f(wo, wi) / η_i², with the gain set to one (the gain
+        // follows the view, so it is not reciprocal). The back lobe is the front one seen from below.
+        let ior = 1.5;
+        let front = GlassLobe {
+            ior,
+            alpha: 0.25,
+            f0: DVec3::splat(dielectric_f0(ior, 0.5)),
+            reflection_tint: DVec3::ONE,
+            transmission_tint: DVec3::ONE,
+            gain: DVec3::ONE,
+            singular: false,
+            straight: false,
+        };
+        let back = GlassLobe {
+            ior: 1.0 / ior,
+            ..front
+        };
+        let directions = [
+            (DVec3::new(0.3, 0.1, 0.95), DVec3::new(-0.3, 0.1, -0.9)),
+            (DVec3::new(0.7, 0.0, 0.7), DVec3::new(-0.5, 0.2, -0.8)),
+            (DVec3::new(0.9, -0.2, 0.4), DVec3::new(-0.2, -0.1, -1.0)),
+        ];
+        for (view, light) in directions {
+            let view = view.normalize();
+            let light = light.normalize();
+            let (value_front, _) = glass_eval(&front, DVec3::Z, view, light);
+            let f_front = value_front / DVec3::Z.dot(light).abs();
+            let (value_back, _) = glass_eval(&back, -DVec3::Z, light, view);
+            let f_back = value_back / (-DVec3::Z).dot(view).abs();
+            assert!(f_back.max_element() > 0.0);
+            let difference = (f_front / (ior * ior) - f_back).abs().max_element();
+            assert!(
+                difference <= 1.0e-9 * f_back.max_element(),
+                "view {view:?} light {light:?}: {f_front:?} vs {f_back:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sharp_glass_draws_the_fresnel_split_with_unit_weight() {
+        let params = principled_glass(1.5, 0.0);
+        let shading = layers(&params, DVec3::Z, view());
+        let fresnel = dielectric_fresnel(view().z, 1.5).0;
+        let draws = 10_000_usize;
+        let mut reflected = 0_usize;
+        for k in 0..draws {
+            let u = (k as f64 + 0.5) / draws as f64;
+            let GlassSample::Singular { direction, weight } =
+                sample_glass(&params, &shading, DVec3::Z, 1.0, [0.5, 0.5, u])
+            else {
+                panic!("a sharp glass draw is singular");
+            };
+            // Reflection divides R by its share, refraction T by its share: both weigh one.
+            assert!(
+                (weight - DVec3::ONE).abs().max_element() < 1.0e-3,
+                "{weight:?}"
+            );
+            if direction.z > 0.0 {
+                reflected += 1;
+            } else {
+                // Snell: the tangential part of the refracted direction is sin θ / η.
+                let tangential = (direction - DVec3::Z * direction.z).length();
+                assert!((tangential - view().x / 1.5).abs() < 1.0e-9);
+            }
+        }
+        let share = reflected as f64 / draws as f64;
+        assert!(
+            (share - fresnel).abs() < 1.0e-3,
+            "reflected {share} vs Fresnel {fresnel}"
+        );
+    }
+
+    /// Patch receivers of the probe: the central 8 × 8 pixels, mirror symmetric in y, so the
+    /// lower four rows stand for their mirror images (`2 ×`).
+    fn patch_receivers() -> Vec<DVec3> {
+        let pixel = ORTHO_SCALE / 16.0;
+        let x_step = pixel / VIEW_THETA.cos();
+        let mut receivers = Vec::with_capacity(32);
+        for i in 0..8 {
+            for j in 0..4 {
+                let x = (f64::from(i) - 3.5) * x_step;
+                let y = (f64::from(j) - 3.5) * pixel;
+                receivers.push(DVec3::new(x, y, 0.0));
+            }
+        }
+        receivers
+    }
+
+    /// Radiance from the disk at `centre` that a delta lobe along `direction` from `receiver` sees.
+    fn disk_hit(receiver: DVec3, direction: DVec3, centre: DVec3) -> f64 {
+        let normal = -centre.normalize();
+        let facing = direction.dot(normal);
+        if facing >= 0.0 {
+            return 0.0;
+        }
+        let t = (centre - receiver).dot(normal) / facing;
+        if t <= 0.0 || (receiver + direction * t - centre).length() > RADIUS {
+            return 0.0;
+        }
+        disk_radiance()
+    }
+
+    /// The probe's pixel mean of a sharp glass plane: each receiver's delta lobe toward the light
+    /// centre, weighted by `weight` (the Fresnel reflectance or transmittance) and the lobe's tint.
+    fn sharp_patch_mean(tint: DVec3, weight: f64, centre: DVec3) -> DVec3 {
+        let direction = centre.normalize();
+        let total = patch_receivers().iter().fold(DVec3::ZERO, |sum, receiver| {
+            sum + 2.0 * tint * weight * disk_hit(*receiver, direction, centre)
+        });
+        total / 64.0
+    }
+
+    /// Single-bounce integral over the disk at `centre` for a receiver, with `|cos|` on both sides.
+    fn disk_integral(
+        params: &BsdfParams,
+        shading: &Layers,
+        receiver: DVec3,
+        centre: DVec3,
+        radial: usize,
+        angular: usize,
+    ) -> DVec3 {
+        let toward_receiver = -centre.normalize();
+        let u = toward_receiver.cross(DVec3::Y).normalize();
+        let w = toward_receiver.cross(u);
+        let radiance = disk_radiance();
+        let mut total = DVec3::ZERO;
+        for i in 0..radial {
+            let r = (i as f64 + 0.5) / radial as f64;
+            for j in 0..angular {
+                let phi = (j as f64 + 0.5) / angular as f64 * std::f64::consts::TAU;
+                let point = centre + RADIUS * (r * phi.cos() * u + r * phi.sin() * w);
+                let offset = point - receiver;
+                let distance = offset.length();
+                let direction = offset / distance;
+                let cos_receiver = direction.dot(DVec3::Z).abs();
+                let cos_emitter = (-direction).dot(toward_receiver).max(0.0);
+                let area =
+                    r / radial as f64 * (std::f64::consts::TAU / angular as f64) * RADIUS * RADIUS;
+                let weight = area * cos_emitter / (distance * distance) * radiance * cos_receiver;
+                total += glass_coefficient(params, shading, direction) * weight;
+            }
+        }
+        total
+    }
+
+    /// The probe's pixel mean of a rough glass plane (the lobe is integrated over the disk).
+    fn rough_patch_mean(
+        params: &BsdfParams,
+        centre: DVec3,
+        radial: usize,
+        angular: usize,
+    ) -> DVec3 {
+        let shading = layers(params, DVec3::Z, view());
+        let total = patch_receivers().iter().fold(DVec3::ZERO, |sum, receiver| {
+            sum + 2.0 * disk_integral(params, &shading, *receiver, centre, radial, angular)
+        });
+        total / 64.0
+    }
+
+    /// The Fresnel reflectance and transmittance of the sharp glass at the probe's view.
+    fn sharp_split(ior: f64) -> (f64, f64) {
+        let reflectance = dielectric_fresnel(view().z, ior).0;
+        (reflectance, 1.0 - reflectance)
+    }
+
+    fn assert_matches_cycles(name: &str, potter: DVec3, mean: [f64; 3], stderr: [f64; 3]) {
+        for channel in 0..3 {
+            let tolerance = 4.0 * stderr[channel];
+            assert!(
+                (potter[channel] - mean[channel]).abs() <= tolerance,
+                "{name} channel {channel}: Potter {} vs Cycles {} (tolerance {tolerance})",
+                potter[channel],
+                mean[channel]
+            );
+        }
+    }
+
+    #[test]
+    fn sharp_glass_plane_matches_cycles() {
+        // tests/fixtures/native_oracle/glass/glass_plane_means.json, roughness 0.
+        let white = DVec3::ONE;
+        let (front, back) = sharp_split(1.5);
+        assert_matches_cycles(
+            "P_r0_ior150 front",
+            sharp_patch_mean(white, front, light_centre(1.5, false)),
+            [3.535_039_4; 3],
+            [4.709_511_6e-05; 3],
+        );
+        assert_matches_cycles(
+            "P_r0_ior150 back",
+            sharp_patch_mean(white, back, light_centre(1.5, true)),
+            [66.859_555; 3],
+            [0.015_682_058; 3],
+        );
+        let (front, back) = sharp_split(1.45);
+        assert_matches_cycles(
+            "P_r0_ior145 front",
+            sharp_patch_mean(white, front, light_centre(1.45, false)),
+            [3.048_357_2; 3],
+            [8.431_144_8e-05; 3],
+        );
+        assert_matches_cycles(
+            "P_r0_ior145 back",
+            sharp_patch_mean(white, back, light_centre(1.45, true)),
+            [67.344_936; 3],
+            [0.017_525_662; 3],
+        );
+    }
+
+    #[test]
+    fn rough_glass_plane_matches_cycles_at_roughness_0_2() {
+        // tests/fixtures/native_oracle/glass/glass_plane_means.json, roughness 0.2.
+        let white = principled_glass(1.5, 0.2);
+        assert_matches_cycles(
+            "P_r02_ior150 front",
+            rough_patch_mean(&white, light_centre(1.5, false), RADIAL, ANGULAR),
+            [3.365_433_6; 3],
+            [2.087_910_2e-04; 3],
+        );
+        assert_matches_cycles(
+            "P_r02_ior150 back",
+            rough_patch_mean(&white, light_centre(1.5, true), RADIAL, ANGULAR),
+            [66.64674; 3],
+            [0.015_211_354; 3],
+        );
+        let mut tinted = principled_glass(1.5, 0.2);
+        tinted.base_color = [0.8, 0.5, 0.3, 1.0];
+        tinted.glass_transmission_tint = [0.8_f64, 0.5, 0.3].map(f64::sqrt);
+        assert_matches_cycles(
+            "P_r02_ior150_tint front",
+            rough_patch_mean(&tinted, light_centre(1.5, false), RADIAL, ANGULAR),
+            [3.365_523_7, 3.365_215_8, 3.364_953_5],
+            [3.020_351_7e-04, 3.016_969_7e-04, 3.014_383_9e-04],
+        );
+        assert_matches_cycles(
+            "P_r02_ior150_tint back",
+            rough_patch_mean(&tinted, light_centre(1.5, true), RADIAL, ANGULAR),
+            [59.604_277, 47.117_035, 36.493_874],
+            [0.013_510_868, 0.010_680_354, 0.008_272_250_2],
+        );
+        let node = glass_node([0.8, 0.5, 0.3], 1.5, 0.2);
+        assert_matches_cycles(
+            "G_r02_ior150_tint front",
+            rough_patch_mean(&node, light_centre(1.5, false), RADIAL, ANGULAR),
+            [2.692_091_6, 1.682_310_6, 1.009_287_9],
+            [1.648_273_9e-04, 1.030_548_6e-04, 6.184_239_8e-05],
+        );
+        assert_matches_cycles(
+            "G_r02_ior150_tint back",
+            rough_patch_mean(&node, light_centre(1.5, true), RADIAL, ANGULAR),
+            [53.31221, 33.31528, 19.987_229],
+            [0.012_167_949, 0.007_603_780_5, 0.004_561_878_2],
+        );
+    }
+
+    #[test]
+    fn rough_glass_plane_matches_cycles_at_roughness_0_2_ior_1_45() {
+        // tests/fixtures/native_oracle/glass/glass_plane_means.json, roughness 0.2, IOR 1.45.
+        let params = principled_glass(1.45, 0.2);
+        assert_matches_cycles(
+            "P_r02_ior145 front",
+            rough_patch_mean(&params, light_centre(1.45, false), RADIAL, ANGULAR),
+            [2.904_385_7; 3],
+            [2.292_719_1e-04; 3],
+        );
+        assert_matches_cycles(
+            "P_r02_ior145 back",
+            rough_patch_mean(&params, light_centre(1.45, true), RADIAL, ANGULAR),
+            [67.166_565; 3],
+            [0.018_860_988; 3],
+        );
+    }
+
+    #[test]
+    fn rough_glass_plane_matches_cycles_at_roughness_0_5() {
+        // tests/fixtures/native_oracle/glass/glass_plane_means.json, roughness 0.5.
+        let params = principled_glass(1.5, 0.5);
+        assert_matches_cycles(
+            "P_r05_ior150 front",
+            rough_patch_mean(&params, light_centre(1.5, false), RADIAL, ANGULAR),
+            [1.155_500_4; 3],
+            [8.010_481_1e-05; 3],
+        );
+        assert_matches_cycles(
+            "P_r05_ior150 back",
+            rough_patch_mean(&params, light_centre(1.5, true), RADIAL, ANGULAR),
+            [60.844_538; 3],
+            [0.007_913_841_4; 3],
+        );
+        let params = principled_glass(1.45, 0.5);
+        assert_matches_cycles(
+            "P_r05_ior145 front",
+            rough_patch_mean(&params, light_centre(1.45, false), RADIAL, ANGULAR),
+            [0.997_729_09; 3],
+            [6.755_766_3e-05; 3],
+        );
+        assert_matches_cycles(
+            "P_r05_ior145 back",
+            rough_patch_mean(&params, light_centre(1.45, true), RADIAL, ANGULAR),
+            [62.097_119; 3],
+            [0.012_259_179; 3],
+        );
+    }
+
+    #[test]
+    fn glass_at_ior_one_refracts_straight_through_as_a_delta() {
+        // Cycles' `bsdf_microfacet_sample` makes a refraction at |eta - 1| < 1e-4 singular, and its direction
+        // is -wi whatever the half vector: the reflectance is zero, so every draw refracts.
+        let params = principled_glass(1.0, 0.5);
+        let shading = layers(&params, DVec3::Z, view());
+        for u in [0.1, 0.5, 0.9] {
+            let GlassSample::Singular { direction, weight } =
+                sample_glass(&params, &shading, DVec3::Z, 1.0, [0.3, 0.7, u])
+            else {
+                panic!("a refraction at an IOR of 1 is a delta");
+            };
+            assert!((direction + view()).length() < 1.0e-9, "{direction:?}");
+            assert!(weight.x.is_finite() && weight.x > 0.0, "{weight:?}");
+        }
     }
 }
 

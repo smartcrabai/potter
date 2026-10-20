@@ -30,19 +30,22 @@ pub(crate) fn dielectric_f0(ior: f64, level: f64) -> f64 {
     (fresnel * 2.0 * level.max(0.0)).min(1.0)
 }
 
+/// Cycles' Principled glass tint, `sqrt(clamped base colour)` (`kernel/svm/closure.h`, `clamped_base_color`).
+pub(crate) fn principled_glass_tint(base: [f64; 4]) -> [f64; 3] {
+    std::array::from_fn(|channel| base[channel].clamp(0.0, 1.0).sqrt())
+}
+
 /// The Principled inputs that change Cycles' result but that Potter's lobe model does not evaluate,
 /// as `(feature_id, Blender input)` pairs in a fixed array, so checking a hit allocates nothing.
 pub(crate) fn unevaluated_principled_inputs(
     params: &BsdfParams,
-) -> [Option<(&'static str, &'static str)>; 6] {
+) -> [Option<(&'static str, &'static str)>; 5] {
     [
         (params.subsurface_weight > 0.0)
             .then_some(("shader.principled.subsurface", "Subsurface Weight")),
         (params.anisotropic_ior > 0.0).then_some(("shader.principled.anisotropic", "Anisotropic")),
         (params.thin_film_thickness > 0.0)
             .then_some(("shader.principled.thin_film", "Thin Film Thickness")),
-        (params.transmission > 0.0 && params.roughness > 0.0)
-            .then_some(("shader.principled.transmission_ggx", "Transmission Weight")),
         (params.diffuse_roughness > 0.0)
             .then_some(("shader.principled.diffuse_roughness", "Diffuse Roughness")),
         params
@@ -139,6 +142,13 @@ pub struct BsdfParams {
     pub emission_strength: f64,
     pub transmission: f64,
     pub ior: f64,
+    /// Tints of the rough glass lobe (Cycles' `generalized_schlick_setup`): the reflection tint and the
+    /// transmission tint. The Principled BSDF takes white reflection and the square root of its base colour
+    /// for transmission (`kernel/svm/closure.h`); the Glass BSDF node takes its Color for both.
+    pub glass_reflection_tint: [f64; 3],
+    pub glass_transmission_tint: [f64; 3],
+    /// The view is on the back of the geometric normal (Cycles' `SD_BACKFACING`), where a glass closure uses `1 / ior`.
+    pub back_facing: bool,
     pub alpha: f64,
     /// Tint of the transparent share, Cycles' Transparent BSDF colour. The share is `1 - alpha`, so a camera
     /// pass-through multiplies by this tint and a shadow ray's transmittance is `(1 - alpha) * tint`
@@ -240,6 +250,9 @@ impl BsdfParams {
             emission_strength: material.emission_strength,
             transmission: material.transmission,
             ior: material.ior,
+            glass_reflection_tint: [1.0; 3],
+            glass_transmission_tint: principled_glass_tint(material.base_color),
+            back_facing: false,
             alpha: material.base_color[3],
             transparent_tint: [1.0; 3],
             reflectance: 1.0,
@@ -299,6 +312,17 @@ impl BsdfParams {
         }
     }
 
+    /// The glass tint as one layered closure, weighted by the arm's transmission, for `combine_layers`. A
+    /// non-glass arm has transmission 0 and so adds no tint.
+    fn glass_layer(&self, tint: [f64; 3]) -> LayerSide {
+        LayerSide {
+            weight: self.transmission,
+            tint,
+            roughness: self.roughness,
+            normal: self.normal,
+        }
+    }
+
     /// Whether the volume coefficients put a medium on the surface's path.
     pub(crate) fn has_medium(&self) -> bool {
         self.volume_scatter
@@ -348,6 +372,20 @@ impl BsdfParams {
             second.sheen_layer(),
             shade,
         );
+        // The glass tints take the coat's and sheen's weights: each arm's share of the hits times its transmission,
+        // so Mix(Glass, Glossy) keeps the glass tint at full strength (as Cycles' closure weights do).
+        let reflection = combine_layers(
+            first.glass_layer(first.glass_reflection_tint),
+            1.0 - shade,
+            second.glass_layer(second.glass_reflection_tint),
+            shade,
+        );
+        let refraction = combine_layers(
+            first.glass_layer(first.glass_transmission_tint),
+            1.0 - shade,
+            second.glass_layer(second.glass_transmission_tint),
+            shade,
+        );
         Self {
             base_color,
             metallic: mix_scalar(first.metallic, second.metallic),
@@ -356,6 +394,9 @@ impl BsdfParams {
             emission_strength: mix_scalar(first.emission_strength, second.emission_strength),
             transmission: mix_scalar(first.transmission, second.transmission),
             ior: mix_scalar(first.ior, second.ior),
+            glass_reflection_tint: reflection.tint,
+            glass_transmission_tint: refraction.tint,
+            back_facing: first.back_facing,
             alpha,
             transparent_tint,
             reflectance: mix_scalar(first.reflectance, second.reflectance),
@@ -393,6 +434,19 @@ impl BsdfParams {
 
     fn add(first: Self, second: Self) -> Self {
         let add3 = |a: [f64; 3], b: [f64; 3]| [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
+        // The glass tints are summed with unit shares, weighted by transmission, as Add sums the closures' weights.
+        let reflection = combine_layers(
+            first.glass_layer(first.glass_reflection_tint),
+            1.0,
+            second.glass_layer(second.glass_reflection_tint),
+            1.0,
+        );
+        let refraction = combine_layers(
+            first.glass_layer(first.glass_transmission_tint),
+            1.0,
+            second.glass_layer(second.glass_transmission_tint),
+            1.0,
+        );
         let coat = combine_layers(first.coat_layer(), 1.0, second.coat_layer(), 1.0);
         let sheen = combine_layers(first.sheen_layer(), 1.0, second.sheen_layer(), 1.0);
         Self {
@@ -408,6 +462,9 @@ impl BsdfParams {
             emission_strength: first.emission_strength.max(second.emission_strength),
             transmission: first.transmission.max(second.transmission),
             ior: first.ior,
+            glass_reflection_tint: reflection.tint,
+            glass_transmission_tint: refraction.tint,
+            back_facing: first.back_facing,
             // Add keeps alpha as the larger opacity (its shading is Potter's one-scalar blend), and sums the arms'
             // transparent weights as Cycles sums closures. A fully opaque arm leaves no pass chance, so a transparent
             // share beside it is dropped: the deviation the CHANGELOG records.
@@ -699,6 +756,9 @@ fn evaluate_surface_inner(
     let Some(graph_id) = &material.node_tree else {
         let mut params = BsdfParams::from_material(material, hit_ctx.normal);
         record_unevaluated_inputs(hit_ctx.warnings, &material.name, None, &params);
+        // The material is its own one arm, so its glass tint follows its textured base colour here.
+        params.base_color = textured_base(material, hit_ctx, params.base_color)?;
+        params.glass_transmission_tint = principled_glass_tint(params.base_color);
         apply_material_textures(material, hit_ctx, &mut params)?;
         return Ok(params);
     };
@@ -877,6 +937,31 @@ fn evaluate_displacement_inner(
     }
 }
 
+/// The material-level base colour texture multiplied into a Principled arm's base colour. The arm derives its
+/// glass tint from the result (Cycles' `clamped_base_color`). Blender's exporter links the texture's Alpha only for
+/// a non-opaque material, and Cycles' colour read depends on that link (`apply_material_textures`).
+fn textured_base(
+    material: &Material,
+    hit_ctx: &HitContext<'_>,
+    base: [f64; 4],
+) -> Result<[f64; 4]> {
+    let Some(texture) = &material.base_color_texture else {
+        return Ok(base);
+    };
+    let alpha_linked = material.alpha_mode != "opaque";
+    let pixel = sample_material_texture(
+        texture,
+        hit_ctx,
+        texture_layer(hit_ctx, texture),
+        alpha_linked,
+    )?;
+    let mut textured = base;
+    for (channel, texel) in textured[..3].iter_mut().zip(pixel) {
+        *channel *= texel;
+    }
+    Ok(textured)
+}
+
 fn apply_material_textures(
     material: &Material,
     hit_ctx: &HitContext<'_>,
@@ -889,22 +974,14 @@ fn apply_material_textures(
     if !has_textures {
         return Ok(());
     }
-    // Blender's exporter links a base texture's Alpha only for a non-opaque material, and wires roughness, metallic,
-    // and normal from the texture's Color with Alpha unlinked. Cycles' colour read depends on that link.
-    if let Some(texture) = &material.base_color_texture {
-        let alpha_linked = material.alpha_mode != "opaque";
-        let pixel = sample_material_texture(
-            texture,
-            hit_ctx,
-            texture_layer(hit_ctx, texture),
-            alpha_linked,
-        )?;
-        for (channel, texel) in params.base_color[..3].iter_mut().zip(pixel) {
-            *channel *= texel;
-        }
-        if alpha_linked {
-            params.alpha *= pixel[3];
-        }
+    // The base colour is multiplied into each Principled arm (`textured_base`), where its glass tint follows it. The
+    // texture's Alpha is multiplied here, and only for a non-opaque material (Blender's exporter links it only then).
+    if let Some(texture) = &material.base_color_texture
+        && material.alpha_mode != "opaque"
+    {
+        let pixel =
+            sample_material_texture(texture, hit_ctx, texture_layer(hit_ctx, texture), true)?;
+        params.alpha *= pixel[3];
     }
     if let Some(texture) = &material.roughness_texture {
         let layer = texture_layer(hit_ctx, texture);
@@ -1055,11 +1132,15 @@ pub struct EvaluatorWorkspace {
 pub struct PreparedMaterial {
     /// The Image Texture nodes whose Alpha output reaches the graph's output (see [`linked_alpha_image_nodes`]).
     alpha_linked_images: BTreeSet<Id>,
+    /// Whether EEVEE would compile the material as transparent (`GPU_MATFLAG_TRANSPARENT`), which decides whether its
+    /// surfaces cast transparent shadows (see [`graph_is_transparent`]).
+    transparent: bool,
 }
 
 impl PreparedMaterial {
     /// Prepares `material` against the node groups its graph is looked up in. A material without a shader graph prepares
-    /// to nothing, since its surface is its PBR fields.
+    /// to its own PBR fields: its export is a Principled whose Alpha is the base colour alpha for a non-opaque material
+    /// (`blend_bridge.py` `_set_principled_values`), so it is transparent when that alpha is below one.
     #[must_use]
     pub fn new(material: &Material, node_groups: &Registry<NodeGroup>) -> Self {
         let Some(group) = material
@@ -1067,7 +1148,10 @@ impl PreparedMaterial {
             .as_ref()
             .and_then(|graph_id| node_groups.get(graph_id))
         else {
-            return Self::default();
+            return Self {
+                transparent: material.alpha_mode != "opaque" && material.base_color[3] < 1.0,
+                ..Self::default()
+            };
         };
         let Some(output) = Self::active_output(group) else {
             return Self::default();
@@ -1077,7 +1161,13 @@ impl PreparedMaterial {
                 .into_iter()
                 .cloned()
                 .collect(),
+            transparent: graph_is_transparent(group, output),
         }
+    }
+
+    /// Whether a surface of this material casts a transparent shadow, as EEVEE's static transparency decides it.
+    pub(crate) fn is_transparent(&self) -> bool {
+        self.transparent
     }
 
     /// The output node a surface evaluates from: the active one, else the first `OutputMaterial`.
@@ -1290,6 +1380,9 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
     fn closure_params(&self) -> BsdfParams {
         BsdfParams {
             alpha: 1.0,
+            // A closure is not glass: only Glass and Principled set transmission. The material's own value
+            // belongs to the simple material's Principled (set there).
+            transmission: 0.0,
             ..BsdfParams::from_material(self.material, self.hit_ctx.normal)
         }
     }
@@ -1303,6 +1396,9 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
             == Some(true)
         {
             let mut params = self.closure_params();
+            params.transmission = self.material.transmission;
+            params.base_color = textured_base(self.material, &self.hit_ctx, params.base_color)?;
+            params.glass_transmission_tint = principled_glass_tint(params.base_color);
             // A simple-material graph holds no Alpha input unless the overlay wrote one (`write_principled_inputs`, for a
             // non-opaque material). Without it the material's own alpha applies, as before the closure change: its base
             // colour alpha, or 1 for an OPAQUE material, whose graph carries no transparency.
@@ -1321,7 +1417,9 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
             return Ok(params);
         }
         let mut params = self.closure_params();
-        params.base_color = self.color_input(id, &["Base Color"], [0.8, 0.8, 0.8, 1.0])?;
+        let base = self.color_input(id, &["Base Color"], [0.8, 0.8, 0.8, 1.0])?;
+        params.base_color = textured_base(self.material, &self.hit_ctx, base)?;
+        params.glass_transmission_tint = principled_glass_tint(params.base_color);
         params.metallic = self.scalar_input(id, &["Metallic"], 0.0)?;
         params.roughness = self.scalar_input(id, &["Roughness"], 0.5)?;
         params.ior = self.scalar_input(id, &["IOR"], 1.5)?;
@@ -1482,6 +1580,14 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
         params.transmission = 1.0;
         params.ior = self.scalar_input(id, &["IOR"], 1.5)?;
         params.roughness = self.scalar_input(id, &["Roughness"], 0.0)?;
+        // Cycles' Glass closure takes its Color as both the reflection and the transmission tint.
+        let color = [
+            params.base_color[0],
+            params.base_color[1],
+            params.base_color[2],
+        ];
+        params.glass_reflection_tint = color;
+        params.glass_transmission_tint = color;
         Ok(params)
     }
 
@@ -1493,7 +1599,6 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
         params.base_color = [tint[0], tint[1], tint[2], 0.0];
         params.alpha = 0.0;
         params.transparent_tint = [tint[0], tint[1], tint[2]];
-        params.transmission = 1.0;
         Ok(params)
     }
 
@@ -2336,6 +2441,23 @@ fn linked_alpha_image_nodes<'graph>(
     group: &'graph NodeGroup,
     output: &'graph Id,
 ) -> BTreeSet<&'graph Id> {
+    let reachable = reachable_nodes(group, output);
+    group
+        .links
+        .iter()
+        .filter(|link| link.from_socket == "Alpha" && reachable.contains(&link.to_node))
+        .map(|link| &link.from_node)
+        .filter(|from| {
+            group
+                .nodes
+                .get(*from)
+                .is_some_and(|node| node.node_type == "ShaderNodeTexImage")
+        })
+        .collect()
+}
+
+/// The nodes that feed `output`, `output` included. Blender's shader compile keeps only these (see the Alpha visit above).
+fn reachable_nodes<'graph>(group: &'graph NodeGroup, output: &'graph Id) -> BTreeSet<&'graph Id> {
     let mut reachable: BTreeSet<&'graph Id> = BTreeSet::new();
     let mut pending = vec![output];
     while let Some(node) = pending.pop() {
@@ -2349,18 +2471,44 @@ fn linked_alpha_image_nodes<'graph>(
             );
         }
     }
-    group
-        .links
-        .iter()
-        .filter(|link| link.from_socket == "Alpha" && reachable.contains(&link.to_node))
-        .map(|link| &link.from_node)
-        .filter(|from| {
-            group
-                .nodes
-                .get(*from)
-                .is_some_and(|node| node.node_type == "ShaderNodeTexImage")
-        })
-        .collect()
+    reachable
+}
+
+/// Whether EEVEE compiles the graph as transparent, `GPU_MATFLAG_TRANSPARENT`, which is set statically per node:
+/// a Transparent BSDF whose Color is linked or not black (`node_shader_bsdf_transparent.cc:30`), and a Principled
+/// whose Alpha is linked or not one (`node_shader_bsdf_principled.cc:400`). Only the nodes that feed the output count.
+/// Specular and Ray Portal set the same flag in Blender, but Potter's evaluator rejects both node types, so a material
+/// with one never evaluates and needs no rule.
+fn graph_is_transparent(group: &NodeGroup, output: &Id) -> bool {
+    let reachable = reachable_nodes(group, output);
+    let linked = |node: &Id, socket: &str| {
+        group
+            .links
+            .iter()
+            .any(|link| link.to_node == *node && link.to_socket == socket)
+    };
+    group.nodes.iter().any(|(id, node)| {
+        if !reachable.contains(id) {
+            return false;
+        }
+        match node.node_type.as_str() {
+            "ShaderNodeBsdfTransparent" => {
+                linked(id, "Color")
+                    || node
+                        .inputs
+                        .get("Color")
+                        .is_none_or(|value| color(value, [1.0; 4])[..3].iter().any(|c| *c != 0.0))
+            }
+            "ShaderNodeBsdfPrincipled" => {
+                linked(id, "Alpha")
+                    || node.inputs.get("Alpha").is_some_and(|value| {
+                        // Blender's `alpha != 1.0`. `number` never yields a NaN, and `total_cmp` is exact for 1.0.
+                        number(value, 1.0).total_cmp(&1.0).is_ne()
+                    })
+            }
+            _ => false,
+        }
+    })
 }
 
 fn number(value: &JsonValue, default: f64) -> f64 {
@@ -2766,8 +2914,8 @@ mod tests {
     };
 
     use super::{
-        BsdfParams, HitContext, HitUvLayers, color_lerp, evaluate_displacement, evaluate_surface,
-        layer_index, layer_uv,
+        BsdfParams, HitContext, HitUvLayers, PreparedMaterial, color_lerp, evaluate_displacement,
+        evaluate_surface, layer_index, layer_uv,
     };
 
     fn set_properties(group: &mut NodeGroup, id: &str, properties: Value) {
@@ -2913,6 +3061,58 @@ mod tests {
     }
 
     #[test]
+    fn textured_base_sets_the_principled_glass_tint() {
+        // Cycles' Principled glass tint is the square root of the clamped base colour. A base texture of 0.25 gives
+        // 0.5; an untextured base colour of 1.0 would give 1.0, so the tint must follow the texture.
+        let material = Material {
+            base_color: [1.0; 4],
+            roughness: 0.2,
+            transmission: 1.0,
+            base_color_texture: Some(TextureRef {
+                image: Id::new("image".to_owned()).unwrap(),
+                uv_layer: None,
+                interpolation: ImageInterpolation::Closest,
+                extension: ImageExtension::Repeat,
+            }),
+            ..Material::default()
+        };
+        let names = vec!["UVMap".to_owned()];
+        let corners = vec![[[0.5, 0.5]; 3]];
+        let groups = Registry::new();
+        let context = HitContext::new(&groups).with_uv_layers(HitUvLayers {
+            names: &names,
+            corners: &corners,
+            positions: [DVec3::ZERO, DVec3::X, DVec3::Y],
+            barycentric: [1.0 / 3.0; 3],
+            render: Some(0),
+            available_mask: None,
+        });
+        let images = BTreeMap::from([(
+            "image".to_owned(),
+            ImageData {
+                colour: crate::image::ColourCache::default(),
+                storage: crate::image::ImageStorage::default(),
+                width: 8,
+                height: 8,
+                pixels: vec![[0.25, 0.25, 0.25, 1.0]; 64],
+                tiles: BTreeMap::new(),
+                interpolation: ImageInterpolation::Closest,
+                srgb: false,
+                udim: false,
+            },
+        )]);
+        let context = context.with_images(&images);
+        let params = evaluate_surface(&material, &context).unwrap();
+        for channel in params.glass_transmission_tint {
+            assert!(
+                (channel - 0.5).abs() < 1.0e-9,
+                "glass tint {:?} should be sqrt(0.25) per channel",
+                params.glass_transmission_tint
+            );
+        }
+    }
+
+    #[test]
     fn material_field_extension_sets_the_sample_past_its_edge() {
         // Blender's Image Texture: extend holds the edge texel past the UV edge, repeat wraps around.
         let edge = field_red_at(ImageExtension::Extend, 0.99);
@@ -2944,6 +3144,105 @@ mod tests {
             to_node: Id::new(to.to_owned()).unwrap(),
             to_socket: input.to_owned(),
         });
+    }
+
+    /// A graph whose Principled BSDF feeds the output with the given inputs.
+    fn principled_output(principled_inputs: Value) -> NodeGroup {
+        let mut graph = NodeGroup::new("Principled", GraphKind::Shader);
+        insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
+        insert_node(
+            &mut graph,
+            "principled",
+            "ShaderNodeBsdfPrincipled",
+            principled_inputs,
+        );
+        link(&mut graph, "principled", "BSDF", "output", "Surface");
+        graph
+    }
+
+    fn is_transparent(graph: NodeGroup) -> bool {
+        let id = Id::new("transparency_graph").unwrap();
+        let mut groups = Registry::new();
+        groups.insert(id.clone(), graph);
+        let material = Material {
+            node_tree: Some(id),
+            ..Material::default()
+        };
+        PreparedMaterial::new(&material, &groups).is_transparent()
+    }
+
+    #[test]
+    fn a_principled_is_transparent_only_when_its_alpha_is_linked_or_below_one() {
+        assert!(!is_transparent(principled_output(json!({}))));
+        assert!(!is_transparent(principled_output(json!({"Alpha": 1.0}))));
+        assert!(is_transparent(principled_output(json!({"Alpha": 0.5}))));
+
+        let mut linked = principled_output(json!({}));
+        insert_node(&mut linked, "texture", "ShaderNodeTexImage", json!({}));
+        link(&mut linked, "texture", "Alpha", "principled", "Alpha");
+        assert!(is_transparent(linked));
+    }
+
+    #[test]
+    fn a_transparent_bsdf_is_transparent_unless_its_color_is_black() {
+        let transparent = |color: Value| {
+            let mut graph = NodeGroup::new("Transparent", GraphKind::Shader);
+            insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
+            insert_node(
+                &mut graph,
+                "transparent",
+                "ShaderNodeBsdfTransparent",
+                color,
+            );
+            link(&mut graph, "transparent", "BSDF", "output", "Surface");
+            graph
+        };
+        assert!(is_transparent(transparent(json!({}))));
+        assert!(is_transparent(transparent(
+            json!({"Color": [0.9, 0.4, 0.2, 1.0]})
+        )));
+        assert!(!is_transparent(transparent(
+            json!({"Color": [0.0, 0.0, 0.0, 1.0]})
+        )));
+    }
+
+    #[test]
+    fn only_a_node_that_feeds_the_output_makes_a_graph_transparent() {
+        // A Transparent BSDF behind a Mix that reaches the output is transparent.
+        let mut mixed = NodeGroup::new("Mix", GraphKind::Shader);
+        insert_node(&mut mixed, "output", "ShaderNodeOutputMaterial", json!({}));
+        insert_node(
+            &mut mixed,
+            "principled",
+            "ShaderNodeBsdfPrincipled",
+            json!({}),
+        );
+        insert_node(
+            &mut mixed,
+            "transparent",
+            "ShaderNodeBsdfTransparent",
+            json!({}),
+        );
+        insert_node(
+            &mut mixed,
+            "mix",
+            "ShaderNodeMixShader",
+            json!({"Fac": 0.5}),
+        );
+        link(&mut mixed, "principled", "BSDF", "mix", "Shader");
+        link(&mut mixed, "transparent", "BSDF", "mix", "Shader_001");
+        link(&mut mixed, "mix", "Shader", "output", "Surface");
+        assert!(is_transparent(mixed));
+
+        // The same Transparent BSDF, left unconnected, feeds nothing and does not make the graph transparent.
+        let mut dangling = principled_output(json!({}));
+        insert_node(
+            &mut dangling,
+            "transparent",
+            "ShaderNodeBsdfTransparent",
+            json!({}),
+        );
+        assert!(!is_transparent(dangling));
     }
 
     #[test]
@@ -3065,7 +3364,7 @@ mod tests {
 
         let sink = RefCell::new(Vec::new());
         let mut groups = Registry::new();
-        // A native material sets rough transmission on the material itself.
+        // A native material sets rough transmission on the material itself. The glass lobe evaluates it, so it does not warn.
         let native = Material {
             name: "Native".to_owned(),
             transmission: 0.5,
@@ -3076,8 +3375,8 @@ mod tests {
         evaluate_surface(&native, &context).unwrap();
         evaluate_surface(&native, &context).unwrap();
 
-        // A graph material sets subsurface and rough transmission on its Principled node. Coat is
-        // evaluated, so it must not warn.
+        // A graph material sets subsurface and rough transmission on its Principled node. Subsurface is not
+        // evaluated and warns; rough transmission and coat are evaluated, so they must not warn.
         let mut graph = NodeGroup::new("Graph", GraphKind::Shader);
         insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
         insert_node(
@@ -3099,7 +3398,7 @@ mod tests {
         evaluate_surface(&graph_material, &graph_context).unwrap();
 
         let warnings = sink.borrow();
-        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
         let count = |material: &str, input: &str| {
             warnings
                 .iter()
@@ -3109,12 +3408,10 @@ mod tests {
                 })
                 .count()
         };
-        assert_eq!(count("Native", "Transmission Weight"), 1);
+        assert_eq!(count("Native", "Transmission Weight"), 0);
         assert_eq!(count("Graph", "Subsurface Weight"), 1);
         assert_eq!(count("Graph", "Coat Weight"), 0);
-        assert_eq!(count("Graph", "Transmission Weight"), 1);
-        let native_warning = warnings.iter().find(|w| w["material"] == "Native").unwrap();
-        assert!(native_warning.get("node_id").is_none());
+        assert_eq!(count("Graph", "Transmission Weight"), 0);
         let subsurface_warning = warnings
             .iter()
             .find(|w| w["input"] == "Subsurface Weight")

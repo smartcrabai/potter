@@ -15,7 +15,11 @@ use serde_json::{Value, json};
 use crate::{
     error::{ErrorCode, PotError, Result},
     eval::animation::animated_transform,
-    geom::{Mesh, uv_layers},
+    geom::{
+        Mesh,
+        blender_matrix::{blender_matrix_from_f64, blender_mul_m4, dmat4_from_blender},
+        uv_layers,
+    },
     model::{
         ArmatureData, Constraint, ConstraintType, DataBlock, Driver, DriverType, DriverVariable,
         DriverVariableType, Id, Modifier, Node, ParentType, PoseBone, SceneDoc, ShapeKeyData,
@@ -2865,7 +2869,12 @@ fn evaluate_world_matrices_with_meshes(
             }
         }
         let animated = animated_transform(node, doc, frame)?;
-        let local = apply_transform_drivers(id, animated, driver_values)?.matrix();
+        let effective_transform = apply_transform_drivers(id, animated, driver_values)?;
+        let captured_matrix_basis = node.captured_matrix_basis(&effective_transform)?;
+        let local = captured_matrix_basis.map_or_else(
+            || effective_transform.matrix(),
+            |matrix| DMat4::from_cols_array(&matrix),
+        );
         let parent_inverse = node
             .parent_inverse
             .map_or(DMat4::IDENTITY, |array| DMat4::from_cols_array(&array));
@@ -2910,7 +2919,19 @@ fn evaluate_world_matrices_with_meshes(
             } else {
                 parent_world
             };
-            parent_space * parent_inverse * local
+            if captured_matrix_basis.is_some() {
+                let parent_space_and_inverse = blender_mul_m4(
+                    &blender_matrix_from_f64(parent_space),
+                    &blender_matrix_from_f64(parent_inverse),
+                );
+                let world =
+                    blender_mul_m4(&parent_space_and_inverse, &blender_matrix_from_f64(local));
+                dmat4_from_blender(&world)
+            } else {
+                parent_space * parent_inverse * local
+            }
+        } else if captured_matrix_basis.is_some() {
+            local
         } else {
             parent_inverse * local
         };
