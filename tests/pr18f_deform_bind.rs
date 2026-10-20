@@ -904,15 +904,16 @@ fn asymmetric_mesh_operations(precision: u64, dynamic: bool, invert: bool) -> Va
         [2.0, 2.0, -2.0],
         [2.0, 2.0, 2.0],
     ];
+    // Same corner order as `base`: index i is the nudged version of base[i].
     let asymmetric = [
         [-2.2, -1.8, -2.0],
-        [2.1, -1.7, -2.1],
-        [2.1, 1.9, -2.2],
-        [-2.0, 1.7, -1.8],
         [-1.8, -1.9, 2.0],
-        [2.1, -1.7, 2.2],
-        [2.2, 1.8, 2.3],
+        [-2.0, 1.7, -1.8],
         [-2.1, 1.6, 1.7],
+        [2.1, -1.7, -2.1],
+        [2.1, -1.7, 2.2],
+        [2.1, 1.9, -2.2],
+        [2.2, 1.8, 2.3],
     ];
     for (index, (from, to)) in base.iter().zip(asymmetric).enumerate() {
         operations.push(vertex_move(
@@ -932,8 +933,8 @@ fn asymmetric_mesh_operations(precision: u64, dynamic: bool, invert: bool) -> Va
             "invert_vertex_group": invert}}));
     operations.push(bind("deform"));
     operations.push(vertex_move("cage", 0, [0.0, 0.0, 0.12]));
-    operations.push(vertex_move("cage", 2, [0.1, -0.03, 0.0]));
-    operations.push(vertex_move("cage", 6, [-0.04, 0.08, -0.06]));
+    operations.push(vertex_move("cage", 6, [0.1, -0.03, 0.0]));
+    operations.push(vertex_move("cage", 7, [-0.04, 0.08, -0.06]));
     Value::Array(operations)
 }
 
