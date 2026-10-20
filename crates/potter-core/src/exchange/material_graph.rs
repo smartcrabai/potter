@@ -584,8 +584,9 @@ fn constant_alpha(material: &Material) -> f64 {
 }
 
 /// Blender's glTF MASK clip stage (`pbrMetallicRoughness.py` 668-700), as the importer builds it: `{name}_clip` is a
-/// LESS_THAN against `cutoff`, and `{name}_clip_invert` is SUBTRACT(1, that), feeding `to`. The socket is 1 where the
-/// compared alpha reaches the cutoff, else 0. Returns the LESS_THAN node; link the alpha source into its `Value` input.
+/// `LESS_THAN` against `cutoff`, and `{name}_clip_invert` is `SUBTRACT(1, that)`, feeding `to`. The socket is 1 where
+/// the compared alpha reaches the cutoff, else 0. Returns the `LESS_THAN` node; link the alpha source into its `Value`
+/// input.
 fn insert_clip(
     graph: &mut NodeGroup,
     name: &str,

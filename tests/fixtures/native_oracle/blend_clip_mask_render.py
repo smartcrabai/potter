@@ -1,36 +1,42 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
-#
 # Blender 5.2.2 oracle for the binary alpha clip that Potter's .blend export writes.
 #
 # A glTF MASK material imports as DITHERED with Principled Alpha = 1 - (x < cutoff) (Math LESS_THAN, then Math
 # SUBTRACT(1, .); `io_scene_gltf2/blender/imp/pbrMetallicRoughness.py` 668-700). Here x is a gradient, so the
-# surface is a hard cutout: each pixel is fully opaque or fully transparent, except the pixels that straddle the
-# cutoff edge. The window statistics below are recorded in `blend_clip_mask_render.json`; Potter's render of the same
-# graph is not compared against them yet (see the report for the render gate).
+# surface is a hard cutout: each pixel of the plane is fully opaque or fully transparent, except the pixels that
+# straddle the cutoff edge.
 #
-# Run in background mode, from the repository root:
-#   /Applications/Blender.app/Contents/MacOS/Blender -b --factory-startup \
-#       --python tests/fixtures/native_oracle/blend_clip_mask_render.py -- <output_dir>
+# The scene is saved to `blend_out` (Potter imports it), then rendered at eight Cycles seeds. For each seed the
+# script writes the window statistics of the alpha channel: the fractions of pixels that are opaque (alpha at least
+# 0.99), transparent (at most 0.01), or in between. The Potter test compares those seed means with its own.
 #
-# The camera looks straight down at the plane, so the window (pixels 16..48) sits inside the plane's silhouette.
+# Arguments after `--`: blend_out, json_out.
 
+import json
 import os
 import sys
+import tempfile
 
 import bpy
 
-OUTPUT_DIR = sys.argv[sys.argv.index("--") + 1] if "--" in sys.argv else "."
+blend_out, json_out = sys.argv[sys.argv.index("--") + 1:][:2]
+
 RESOLUTION = 64
 WINDOW = range(16, 48)
 CUTOFF = 0.5
+SAMPLES = 16
+SEEDS = range(8)
 
 scene = bpy.context.scene
 scene.render.engine = "CYCLES"
-scene.cycles.samples = 8
+scene.cycles.samples = SAMPLES
 scene.cycles.device = "CPU"
 scene.render.film_transparent = True
 scene.render.resolution_x = scene.render.resolution_y = RESOLUTION
 scene.render.resolution_percentage = 100
+scene.render.image_settings.file_format = "OPEN_EXR"
+scene.render.image_settings.color_depth = "32"
+scene.render.image_settings.color_mode = "RGBA"
 
 for obj in list(bpy.data.objects):
     bpy.data.objects.remove(obj, do_unlink=True)
@@ -52,7 +58,8 @@ tree.links.new(principled.outputs["BSDF"], output.inputs["Surface"])
 coord = tree.nodes.new("ShaderNodeTexCoord")
 gradient = tree.nodes.new("ShaderNodeTexGradient")
 gradient.gradient_type = "LINEAR"
-tree.links.new(coord.outputs["Generated"], gradient.inputs["Vector"])
+# The gradient runs along U (0 to 1 across the plane), so the cutoff falls on the plane's middle column.
+tree.links.new(coord.outputs["UV"], gradient.inputs["Vector"])
 
 # The importer's clip stage: Alpha = SUBTRACT(1, LESS_THAN(x, cutoff)).
 compare = tree.nodes.new("ShaderNodeMath")
@@ -76,24 +83,30 @@ light_data = bpy.data.lights.new("sun", "SUN")
 light = bpy.data.objects.new("sun", light_data)
 bpy.context.collection.objects.link(light)
 
-image_path = os.path.join(OUTPUT_DIR, "clip_mask_cutout.png")
-scene.render.filepath = image_path
-bpy.ops.render.render(write_still=True)
+bpy.ops.wm.save_as_mainfile(filepath=blend_out)
 
-image = bpy.data.images.load(image_path)
-pixels = image.pixels[:]
+work = tempfile.mkdtemp()
 
 
-def alpha(x, y):
-    return pixels[(y * RESOLUTION + x) * 4 + 3]
+def window_fractions(path):
+    image = bpy.data.images.load(path, check_existing=False)
+    width, height = image.size
+    pixels = list(image.pixels)
+    bpy.data.images.remove(image)
+    alphas = [pixels[(y * width + x) * 4 + 3] for y in WINDOW for x in WINDOW]
+    count = float(len(alphas))
+    opaque = sum(1 for value in alphas if value >= 0.99) / count
+    transparent = sum(1 for value in alphas if value <= 0.01) / count
+    return {"opaque": opaque, "transparent": transparent, "fractional": 1.0 - opaque - transparent}
 
 
-window = [alpha(x, y) for y in WINDOW for x in WINDOW]
-fractional = [value for value in window if 0.01 < value < 0.99]
-opaque = sum(1 for value in window if value >= 0.99)
-transparent = sum(1 for value in window if value <= 0.01)
-print("ORACLE window_pixels", len(window))
-print("ORACLE window_opaque", opaque)
-print("ORACLE window_transparent", transparent)
-print("ORACLE window_fractional", len(fractional))
-print("ORACLE window_fraction_fractional", round(len(fractional) / len(window), 4))
+seeds = []
+for seed in SEEDS:
+    scene.cycles.seed = seed
+    scene.render.filepath = os.path.join(work, f"seed_{seed}.exr")
+    bpy.ops.render.render(write_still=True)
+    seeds.append(window_fractions(scene.render.filepath))
+
+with open(json_out, "w") as handle:
+    json.dump({"samples": SAMPLES, "resolution": RESOLUTION, "window": [WINDOW[0], WINDOW[-1] + 1],
+               "seeds": seeds}, handle, indent=2)
