@@ -1427,8 +1427,8 @@ fn with_hit_frame<T>(
     body(&HitFrame {
         point,
         shadow_point,
-        geometric_normal,
         back_facing,
+        geometric_normal,
         normal,
         triangle,
         material,

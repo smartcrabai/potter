@@ -3061,6 +3061,58 @@ mod tests {
     }
 
     #[test]
+    fn textured_base_sets_the_principled_glass_tint() {
+        // Cycles' Principled glass tint is the square root of the clamped base colour. A base texture of 0.25 gives
+        // 0.5; an untextured base colour of 1.0 would give 1.0, so the tint must follow the texture.
+        let material = Material {
+            base_color: [1.0; 4],
+            roughness: 0.2,
+            transmission: 1.0,
+            base_color_texture: Some(TextureRef {
+                image: Id::new("image".to_owned()).unwrap(),
+                uv_layer: None,
+                interpolation: ImageInterpolation::Closest,
+                extension: ImageExtension::Repeat,
+            }),
+            ..Material::default()
+        };
+        let names = vec!["UVMap".to_owned()];
+        let corners = vec![[[0.5, 0.5]; 3]];
+        let groups = Registry::new();
+        let context = HitContext::new(&groups).with_uv_layers(HitUvLayers {
+            names: &names,
+            corners: &corners,
+            positions: [DVec3::ZERO, DVec3::X, DVec3::Y],
+            barycentric: [1.0 / 3.0; 3],
+            render: Some(0),
+            available_mask: None,
+        });
+        let images = BTreeMap::from([(
+            "image".to_owned(),
+            ImageData {
+                colour: crate::image::ColourCache::default(),
+                storage: crate::image::ImageStorage::default(),
+                width: 8,
+                height: 8,
+                pixels: vec![[0.25, 0.25, 0.25, 1.0]; 64],
+                tiles: BTreeMap::new(),
+                interpolation: ImageInterpolation::Closest,
+                srgb: false,
+                udim: false,
+            },
+        )]);
+        let context = context.with_images(&images);
+        let params = evaluate_surface(&material, &context).unwrap();
+        for channel in params.glass_transmission_tint {
+            assert!(
+                (channel - 0.5).abs() < 1.0e-9,
+                "glass tint {:?} should be sqrt(0.25) per channel",
+                params.glass_transmission_tint
+            );
+        }
+    }
+
+    #[test]
     fn material_field_extension_sets_the_sample_past_its_edge() {
         // Blender's Image Texture: extend holds the edge texel past the UV edge, repeat wraps around.
         let edge = field_red_at(ImageExtension::Extend, 0.99);
