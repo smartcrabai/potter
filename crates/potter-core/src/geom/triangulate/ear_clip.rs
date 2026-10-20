@@ -1,17 +1,19 @@
-//! Decimate's kd-tree variant of Blender's ear-clipping polyfill (`BLI_polyfill_calc_arena`,
-//! `blenlib/intern/polyfill_2d.cc`, `coords_sign == 1`). The edge-flip pass is the shared
-//! `BLI_polyfill_beautify` of `geom/triangulate.rs`, which is bit-identical to Decimate's old copy.
+//! Blender's ear-clipping polyfill, the kd-tree variant (`BLI_polyfill_calc_arena`,
+//! `blenlib/intern/polyfill_2d.cc`, `coords_sign == 1`), the one routine behind every polygon
+//! triangulation in Potter: Mesh tessellation (`mesh_tessellate.cc:116`, `BLI_polyfill_calc_arena`),
+//! Boolean EXACT and FLOAT n-gon triangulation (`mesh_intersect.cc:1953`, `BLI_polyfill_calc`), and
+//! Decimate's COLLAPSE n-gon fill.
 //!
-//! Blender's build enables `USE_CLIP_EVEN`, `USE_CLIP_SWEEP`, `USE_CONVEX_SKIP` (which implies
-//! `USE_KDTREE`), `USE_KDTREE_INDEX_CACHE` and `USE_PRECOMPUTED_ISECT`; only those paths are kept.
-//! Float operation order and tie-breaking follow the original, since the triangle order feeds
-//! Decimate's collapse order.
+//! Blender 5.2.2 compiles that file with `USE_CLIP_EVEN`, `USE_CONVEX_SKIP` and `USE_CLIP_SWEEP`
+//! defined unconditionally (`polyfill_2d.cc:54-57`). `USE_CONVEX_SKIP` implies `USE_KDTREE`
+//! (`:60-62`), which implies `USE_KDTREE_INDEX_CACHE` (`:66`) and `USE_PRECOMPUTED_ISECT` (`:71`).
+//! The kd-tree is built only when a corner is concave (`polyfill_2d.cc:1050-1056`), and the index
+//! cache keeps the last blocking vertex. Only those paths are kept.
 //!
-//! This variant differs from the brute-force `geom::triangulate::polyfill` on degenerate rings
-//! (duplicate points), where it agrees with Blender's `BMesh` ear clip; see the note on that
-//! function. Both stay until the deviation is decided.
-
-use crate::geom::triangulate::beautify;
+//! Float operation order and tie-breaking follow the original, since the triangle order feeds the
+//! Mesh tessellation and Decimate's collapse order. On degenerate rings (duplicate points) the
+//! brute-force candidate search this replaced disagreed with Blender's `loop_triangles`; this
+//! variant agrees on all clockwise rings with five or more corners (`tests/fixtures/polyfill`).
 
 /// Stands in for Blender's `UINT_MAX` / `KDNODE_UNSET` sentinels.
 const NONE: usize = usize::MAX;
@@ -21,17 +23,6 @@ type Sign = i8;
 const CONCAVE: Sign = -1;
 const TANGENTIAL: Sign = 0;
 const CONVEX: Sign = 1;
-
-/// Triangulates a simple polygon given by `coords` (either winding) and beautifies the result.
-/// Returns `coords.len() - 2` triangles; degenerate input (fewer than 3 points) yields none.
-pub(super) fn triangulate_ngon(coords: &[[f32; 2]]) -> Vec<[usize; 3]> {
-    if coords.len() < 3 {
-        return Vec::new();
-    }
-    let mut tris = polyfill_calc(coords);
-    beautify(coords, &mut tris);
-    tris
-}
 
 /// Blender's `signum_enum`.
 fn signum_enum(a: f32) -> Sign {
@@ -527,8 +518,10 @@ impl PolyFill<'_> {
     }
 }
 
-/// Blender's `polyfill_calc_arena` path for `coords_sign == 1`: `polyfill_prepare`, `polyfill_calc`.
-fn polyfill_calc(coords: &[[f32; 2]]) -> Vec<[usize; 3]> {
+/// Blender `BLI_polyfill_calc` (`coords_sign == 1`), with the kd-tree search of `polyfill_2d.cc`:
+/// `polyfill_prepare`, then `polyfill_calc`. Returns `n - 2` triangles as indices into `coords`, each
+/// keeping the ring winding. Callers pass clockwise projected coordinates.
+pub(in crate::geom) fn polyfill(coords: &[[f32; 2]]) -> Vec<[usize; 3]> {
     let n = coords.len();
     let pis = (0..n)
         .map(|i| PolyIndex {

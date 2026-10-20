@@ -32,6 +32,13 @@ impl Heap {
         self.tree.is_empty()
     }
 
+    /// Empties the heap and forgets every node, keeping the allocations.
+    pub(super) fn clear(&mut self) {
+        self.tree.clear();
+        self.nodes.clear();
+        self.free.clear();
+    }
+
     /// Value of the minimum node. The heap must not be empty.
     pub(super) fn top_value(&self) -> f32 {
         self.nodes[self.tree[0]].value

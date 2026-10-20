@@ -23,11 +23,9 @@ use super::{
 use crate::geom::pool_slots::PoolSlots;
 use crate::geom::triangulate::ortho_basis;
 mod collapse;
-mod heap;
 mod interp;
 mod kdtree;
 mod normals;
-mod polyfill;
 mod quad;
 
 pub(super) use collapse::decimate_collapse;

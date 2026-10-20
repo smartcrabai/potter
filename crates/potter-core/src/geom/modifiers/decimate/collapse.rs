@@ -10,18 +10,18 @@ use serde_json::{Value, json};
 
 use super::{
     CornerUv, PoolSlots,
-    heap::{Heap, NodeId},
     interp::{float2_equal, interp_float2},
     kdtree::KdTree,
     normals::{face_center_median, face_normal, project_axis_dominant, vertex_normals},
-    polyfill::triangulate_ngon,
     quad::{is_quad_convex, quad_split_24},
 };
 use crate::{
     error::{ErrorCode, PotError, Result},
     geom::{
         Mesh, color_layers,
+        heap::{Heap, NodeId},
         provenance::{Origin, default_value},
+        triangulate::polyfill_beauty,
     },
     model::Modifier,
 };
@@ -740,7 +740,7 @@ impl BMesh {
         } else {
             let points = self.face_points(f);
             let projected = project_axis_dominant(self.faces[f].no, &points);
-            (triangulate_ngon(&projected), loops.clone())
+            (polyfill_beauty(&projected), loops.clone())
         };
         let origin = self.faces[f].origin;
         let Some(last) = tris.len().checked_sub(1) else {

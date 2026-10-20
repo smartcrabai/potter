@@ -15,8 +15,9 @@
 //! `BLI_heap` (`blenlib/intern/BLI_heap.cc`). Diagonal choice, tie-breaking and output winding all
 //! follow from exact `float` comparisons, so every expression keeps Blender's operand order.
 //!
-//! The ear search is the brute-force form of Blender's KD-tree search. The tree only prunes
-//! subtrees outside the candidate triangle's bounds, so both report the same blocking vertices.
+//! The ear search is the kd-tree search of `polyfill_2d.cc` (`triangulate/ear_clip.rs`, the only
+//! polyfill in Potter); the kd-tree is built only for rings with a concave corner, as Blender does.
+//! The `BLI_heap` port is `geom/heap.rs`, shared with Decimate's COLLAPSE heap.
 
 const NONE: usize = usize::MAX;
 
@@ -45,6 +46,11 @@ pub(crate) struct Polygon {
     pub(crate) face: usize,
     pub(crate) corners: Vec<usize>,
 }
+
+use super::heap::Heap;
+
+mod ear_clip;
+pub(super) use ear_clip::polyfill;
 
 type Vec2 = [f32; 2];
 type Vec3 = [f32; 3];
@@ -348,6 +354,19 @@ pub(super) fn triangulate_ngon(
     triangles
 }
 
+/// Blender `BLI_polyfill_calc` then `BLI_polyfill_beautify` on clockwise projected coordinates: the
+/// n-gon fill of Decimate's COLLAPSE (`BM_mesh_decimate_collapse`, called from
+/// `modifiers/intern/MOD_decimate.cc:177`).
+/// Returns no triangles below three points.
+pub(super) fn polyfill_beauty(coords: &[Vec2]) -> Vec<[usize; 3]> {
+    if coords.len() < 3 {
+        return Vec::new();
+    }
+    let mut tris = polyfill(coords);
+    beautify(coords, &mut tris);
+    tris
+}
+
 /// Blender's `Mesh::loop_triangles` tessellation: f32 quad flip predicate and f32 `Clip` polyfill.
 /// `corners` are face-local positions rounded to Blender's float vertex storage; each result triple
 /// indexes the input corner array in Blender's loop-triangle order.
@@ -371,338 +390,6 @@ pub(crate) fn loop_triangles(corners: &[[f32; 3]]) -> Vec<[usize; 3]> {
             let normal = face_normal(corners).unwrap_or([0.0, 0.0, 1.0]);
             triangulate_ngon(corners, normal, NgonMethod::Clip)
         }
-    }
-}
-
-const CONCAVE: i8 = -1;
-const TANGENTIAL: i8 = 0;
-const CONVEX: i8 = 1;
-
-fn signum_enum(a: f32) -> i8 {
-    if a > 0.0 {
-        CONVEX
-    } else if a == 0.0 {
-        TANGENTIAL
-    } else {
-        CONCAVE
-    }
-}
-
-/// `span_tri_v2_sign`: the turn direction of `v1 -> v2 -> v3`.
-fn span_sign(v1: Vec2, v2: Vec2, v3: Vec2) -> i8 {
-    let d2 = [v2[0] - v3[0], v2[1] - v3[1]];
-    let d3 = [v1[0] - v3[0], v1[1] - v3[1]];
-    signum_enum(d2[0] * d3[1] - d3[0] * d2[1])
-}
-
-/// `tri_isect_precomputed_*`: the inclusive point-in-triangle test Blender's ear search uses.
-struct TriangleTest {
-    edge: [Vec2; 3],
-    c: [f32; 3],
-}
-
-impl TriangleTest {
-    fn new(vs: [Vec2; 3]) -> Self {
-        let edge = [
-            [vs[1][0] - vs[0][0], vs[1][1] - vs[0][1]],
-            [vs[2][0] - vs[1][0], vs[2][1] - vs[1][1]],
-            [vs[0][0] - vs[2][0], vs[0][1] - vs[2][1]],
-        ];
-        let c = [0, 1, 2].map(|i| edge[i][0] * vs[i][1] - vs[i][0] * edge[i][1]);
-        Self { edge, c }
-    }
-
-    fn contains(&self, co: Vec2) -> bool {
-        let side = |i: usize| self.edge[i][1] * co[0] - self.edge[i][0] * co[1] + self.c[i] >= 0.0;
-        side(1) && side(2) && side(0)
-    }
-}
-
-#[derive(Clone, Copy)]
-struct PolyNode {
-    next: usize,
-    prev: usize,
-    sign: i8,
-}
-
-/// Ear clipping over a clockwise polygon, as `BLI_polyfill_calc_arena` with `coords_sign == 1`.
-/// Node ids are coordinate indices.
-struct PolyFill<'a> {
-    coords: &'a [Vec2],
-    nodes: Vec<PolyNode>,
-    head: usize,
-    coords_num: usize,
-    concave_num: usize,
-    tris: Vec<[usize; 3]>,
-}
-
-/// Blender `BLI_polyfill_calc` (`blenlib/intern/polyfill_2d.cc`, `coords_sign == 1`): ear clipping of
-/// a clockwise projected ring, brute-force candidate search. Returns `n - 2` triangles as indices
-/// into `coords`. Shared by Mesh Triangulate (`triangulate_ngon`, Clip), the Boolean FLOAT and
-/// EXACT n-gon triangulation (`geom/boolean/triangulate.rs`). Decimate keeps its own kd-tree
-/// variant, `modifiers/decimate/polyfill.rs`: it differs on degenerate rings (duplicate points).
-pub(super) fn polyfill(coords: &[Vec2]) -> Vec<[usize; 3]> {
-    let n = coords.len();
-    let nodes = (0..n)
-        .map(|i| PolyNode {
-            next: (i + 1) % n,
-            prev: (i + n - 1) % n,
-            sign: CONVEX,
-        })
-        .collect();
-    let mut pf = PolyFill {
-        coords,
-        nodes,
-        head: 0,
-        coords_num: n,
-        concave_num: 0,
-        tris: Vec::with_capacity(n.saturating_sub(2)),
-    };
-    for i in 0..n {
-        pf.sign_calc(i);
-        if pf.nodes[i].sign != CONVEX {
-            pf.concave_num += 1;
-        }
-    }
-    pf.triangulate();
-    pf.tris
-}
-
-impl PolyFill<'_> {
-    fn sign_calc(&mut self, i: usize) {
-        let node = self.nodes[i];
-        self.nodes[i].sign = span_sign(
-            self.coords[node.prev],
-            self.coords[i],
-            self.coords[node.next],
-        );
-    }
-
-    fn triangulate(&mut self) {
-        let mut ear_init = self.head;
-        let mut reverse = false;
-        while self.coords_num > 3 {
-            let ear = self.ear_tip_find(ear_init, reverse);
-            if self.nodes[ear].sign != CONVEX {
-                self.concave_num -= 1;
-            }
-            let prev = self.nodes[ear].prev;
-            let next = self.nodes[ear].next;
-            self.ear_tip_cut(ear);
-
-            let sign_prev = self.nodes[prev].sign;
-            let sign_next = self.nodes[next].sign;
-            if sign_prev != CONVEX {
-                self.sign_calc(prev);
-                if self.nodes[prev].sign == CONVEX {
-                    self.concave_num -= 1;
-                }
-            }
-            if sign_next != CONVEX {
-                self.sign_calc(next);
-                if self.nodes[next].sign == CONVEX {
-                    self.concave_num -= 1;
-                }
-            }
-
-            ear_init = if reverse {
-                self.nodes[prev].prev
-            } else {
-                self.nodes[next].next
-            };
-            if self.nodes[ear_init].sign != CONVEX {
-                ear_init = if reverse {
-                    self.nodes[ear_init].prev
-                } else {
-                    self.nodes[ear_init].next
-                };
-                reverse = !reverse;
-            }
-        }
-        let a = self.head;
-        let b = self.nodes[a].next;
-        let c = self.nodes[b].next;
-        self.tris.push([a, b, c]);
-    }
-
-    fn ear_tip_find(&self, ear_init: usize, reverse: bool) -> usize {
-        for sign_accept in [CONVEX, TANGENTIAL] {
-            let mut ear = ear_init;
-            for _ in 0..self.coords_num {
-                if self.ear_tip_check(ear, sign_accept) {
-                    return ear;
-                }
-                ear = if reverse {
-                    self.nodes[ear].prev
-                } else {
-                    self.nodes[ear].next
-                };
-            }
-        }
-
-        // Degenerate polygon: no ear passes, so take the first vertex that is not concave.
-        let mut ear = ear_init;
-        for _ in 0..self.coords_num {
-            if self.nodes[ear].sign != CONCAVE {
-                return ear;
-            }
-            ear = self.nodes[ear].next;
-        }
-        ear
-    }
-
-    fn ear_tip_check(&self, tip: usize, sign_accept: i8) -> bool {
-        if self.concave_num == 0 {
-            return true;
-        }
-        if self.nodes[tip].sign != sign_accept {
-            return false;
-        }
-        let next = self.nodes[tip].next;
-        let prev = self.nodes[tip].prev;
-        let test = TriangleTest::new([self.coords[tip], self.coords[next], self.coords[prev]]);
-        let mut node_id = self.head;
-        loop {
-            let node = self.nodes[node_id];
-            if node.sign != CONVEX
-                && node_id != tip
-                && node_id != next
-                && node_id != prev
-                && test.contains(self.coords[node_id])
-            {
-                return false;
-            }
-            node_id = node.next;
-            if node_id == self.head {
-                return true;
-            }
-        }
-    }
-
-    fn ear_tip_cut(&mut self, tip: usize) {
-        let prev = self.nodes[tip].prev;
-        let next = self.nodes[tip].next;
-        self.tris.push([prev, tip, next]);
-        self.nodes[prev].next = next;
-        self.nodes[next].prev = prev;
-        if self.head == tip {
-            self.head = next;
-        }
-        self.coords_num -= 1;
-    }
-}
-
-/// `BLI_heap` node: the value orders the heap, `index` is the node's slot in the tree.
-#[derive(Clone, Copy)]
-struct HeapNode {
-    value: f32,
-    index: usize,
-    ptr: usize,
-}
-
-/// Binary min-heap with Blender's sift rules, so equal costs pop in Blender's order.
-#[derive(Default)]
-struct Heap {
-    nodes: Vec<HeapNode>,
-    tree: Vec<usize>,
-}
-
-impl Heap {
-    fn is_empty(&self) -> bool {
-        self.tree.is_empty()
-    }
-
-    fn value(&self, slot: usize) -> f32 {
-        self.nodes[self.tree[slot]].value
-    }
-
-    fn swap(&mut self, i: usize, j: usize) {
-        self.tree.swap(i, j);
-        self.nodes[self.tree[i]].index = i;
-        self.nodes[self.tree[j]].index = j;
-    }
-
-    fn sift_up(&mut self, mut i: usize) {
-        while i > 0 {
-            let parent = (i - 1) >> 1;
-            if self.value(parent) < self.value(i) {
-                break;
-            }
-            self.swap(parent, i);
-            i = parent;
-        }
-    }
-
-    fn sift_down(&mut self, mut i: usize) {
-        let size = self.tree.len();
-        loop {
-            let left = 2 * i + 1;
-            let right = 2 * i + 2;
-            let mut smallest = i;
-            if left < size && self.value(left) < self.value(smallest) {
-                smallest = left;
-            }
-            if right < size && self.value(right) < self.value(smallest) {
-                smallest = right;
-            }
-            if smallest == i {
-                break;
-            }
-            self.swap(i, smallest);
-            i = smallest;
-        }
-    }
-
-    fn insert(&mut self, value: f32, ptr: usize) -> usize {
-        let node = self.nodes.len();
-        self.nodes.push(HeapNode {
-            value,
-            index: self.tree.len(),
-            ptr,
-        });
-        self.tree.push(node);
-        self.sift_up(self.tree.len() - 1);
-        node
-    }
-
-    /// `BLI_heap_insert_or_update`.
-    fn insert_or_update(&mut self, slot: &mut Option<usize>, value: f32, ptr: usize) {
-        match *slot {
-            None => *slot = Some(self.insert(value, ptr)),
-            Some(node) => {
-                self.nodes[node].ptr = ptr;
-                let current = self.nodes[node].value;
-                if value < current {
-                    self.nodes[node].value = value;
-                    self.sift_up(self.nodes[node].index);
-                } else if value > current {
-                    self.nodes[node].value = value;
-                    self.sift_down(self.nodes[node].index);
-                }
-            }
-        }
-    }
-
-    /// `BLI_heap_remove`.
-    fn remove(&mut self, node: usize) {
-        let mut i = self.nodes[node].index;
-        while i > 0 {
-            let parent = (i - 1) >> 1;
-            self.swap(parent, i);
-            i = parent;
-        }
-        self.pop_min();
-    }
-
-    fn pop_min(&mut self) -> usize {
-        let ptr = self.nodes[self.tree[0]].ptr;
-        let last = self.tree.len() - 1;
-        self.swap(0, last);
-        self.tree.pop();
-        if !self.tree.is_empty() {
-            self.sift_down(0);
-        }
-        ptr
     }
 }
 
@@ -790,8 +477,7 @@ pub(super) fn beautify_with_scratch(
         half[*b].base = base;
     }
 
-    heap.nodes.clear();
-    heap.tree.clear();
+    heap.clear();
     for i in 0..half_len {
         if half[i].e_radial < i {
             let (cost, _) = rotate_cost(coords, half, i);
@@ -803,8 +489,7 @@ pub(super) fn beautify_with_scratch(
         }
     }
 
-    while !heap.is_empty() {
-        let e = heap.pop_min();
+    while let Some(e) = heap.pop_min() {
         eheap_table[half[e].base] = None;
         rotate_edge(half, e);
         let e_next = half[e].e_next;
@@ -1050,5 +735,85 @@ mod tests {
                 corners: vec![0, 1, 2, 3],
             }]
         );
+    }
+
+    /// The committed Blender 5.2.2 oracle, `tests/fixtures/polyfill/generate_polyfill_rings.py`: 240
+    /// clockwise n-gons (n >= 5), 53 of them with duplicate points.
+    fn blender_rings() -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+        let oracle: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../tests/fixtures/polyfill/degenerate_rings.json"
+        ))?;
+        let rings = oracle["rings"].as_array().ok_or("oracle has no rings")?;
+        Ok(rings.clone())
+    }
+
+    fn json_triangles(
+        value: &serde_json::Value,
+    ) -> Result<Vec<[usize; 3]>, Box<dyn std::error::Error>> {
+        let mut out = Vec::new();
+        for triple in value.as_array().ok_or("triangles are not an array")? {
+            let mut tri = [0usize; 3];
+            for (slot, index) in tri.iter_mut().zip(triple.as_array().ok_or("triangle")?) {
+                *slot = usize::try_from(index.as_u64().ok_or("corner index")?)?;
+            }
+            out.push(tri);
+        }
+        Ok(out)
+    }
+
+    /// Blender `Mesh::calc_loop_triangles` (`mesh_tessellate.cc:116`, `BLI_polyfill_calc_arena`) gives
+    /// the same triangles in the same order as `loop_triangles`, on every degenerate ring of the oracle.
+    #[test]
+    fn loop_triangles_match_blender_on_degenerate_rings() -> Result<(), Box<dyn std::error::Error>>
+    {
+        for (index, ring) in blender_rings()?.iter().enumerate() {
+            let coords: Vec<[f32; 3]> = ring["coords"]
+                .as_array()
+                .ok_or("ring coords")?
+                .iter()
+                .map(|p| -> Result<[f32; 3], Box<dyn std::error::Error>> {
+                    let x = p[0].as_f64().ok_or("x")? as f32;
+                    let y = p[1].as_f64().ok_or("y")? as f32;
+                    Ok([x, y, 0.0])
+                })
+                .collect::<Result<_, _>>()?;
+            let expected = json_triangles(&ring["loop_triangles"])?;
+            assert_eq!(loop_triangles(&coords), expected, "ring {index}");
+        }
+        Ok(())
+    }
+
+    /// Blender `bmesh.ops.triangulate` with `ngon_method='BEAUTY'` (`BLI_polyfill_beautify` after the
+    /// polyfill) gives the same triangle set as `polyfill_beauty` on every degenerate ring of the oracle.
+    #[test]
+    fn polyfill_beauty_matches_blender_bmesh_beauty_on_degenerate_rings()
+    -> Result<(), Box<dyn std::error::Error>> {
+        fn sorted_set(mut tris: Vec<[usize; 3]>) -> Vec<[usize; 3]> {
+            for tri in &mut tris {
+                tri.sort_unstable();
+            }
+            tris.sort_unstable();
+            tris
+        }
+        for (index, ring) in blender_rings()?.iter().enumerate() {
+            let coords: Vec<[f32; 2]> = ring["coords"]
+                .as_array()
+                .ok_or("ring coords")?
+                .iter()
+                .map(|p| -> Result<[f32; 2], Box<dyn std::error::Error>> {
+                    Ok([
+                        p[0].as_f64().ok_or("x")? as f32,
+                        p[1].as_f64().ok_or("y")? as f32,
+                    ])
+                })
+                .collect::<Result<_, _>>()?;
+            let expected = sorted_set(json_triangles(&ring["beauty_triangles"])?);
+            assert_eq!(
+                sorted_set(polyfill_beauty(&coords)),
+                expected,
+                "ring {index}"
+            );
+        }
+        Ok(())
     }
 }
