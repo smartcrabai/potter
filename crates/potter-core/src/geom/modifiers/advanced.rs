@@ -3524,9 +3524,11 @@ mod tests {
             radius: 2.0,
         })
         .unwrap();
+        // The 32 x 16 unit sphere is the `uv_sphere_default` oracle, whose largest radius error in
+        // Blender's f32 output is 1.2177e-6 (`primitive_uv_oracle.json`); the bound below covers it.
         let target = Mesh::uv_sphere(UvSphereParams {
-            segments: 24,
-            ring_count: 12,
+            segments: 32,
+            ring_count: 16,
             radius: 1.0,
         })
         .unwrap();
@@ -3536,11 +3538,13 @@ mod tests {
             target,
         );
         let result = shrinkwrap(&source, &modifier).unwrap();
+        // Blender stores UV sphere vertices as f32: its own radius-1 sphere output is off by up to
+        // 1.22e-6 (`tests/fixtures/primitive_uvs/primitive_uv_oracle.json`, `uv_sphere_default`).
         assert!(
             result
                 .vertices
                 .iter()
-                .all(|vertex| (vertex.co.length() - 1.0).abs() < 1.0e-8)
+                .all(|vertex| (vertex.co.length() - 1.0).abs() < 2.0e-6)
         );
     }
 
