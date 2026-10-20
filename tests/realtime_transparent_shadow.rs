@@ -126,7 +126,8 @@ fn import_scene(blender: &Path, root: &Path, blend: &Path) -> TestResult<(PathBu
         ]),
     )?;
     assert_eq!(applied["ok"], true, "{applied}");
-    Ok((project, read_scene(&project)?))
+    let scene = read_scene(&project)?;
+    Ok((project, scene))
 }
 
 /// Renders `project` in the realtime engine to a linear EXR and loads the frame.
