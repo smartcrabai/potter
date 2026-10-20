@@ -18,6 +18,23 @@ fn polygon(points: [[f64; 2]; 4]) -> serde_json::Value {
     })
 }
 
+/// A view curve in the `color.update` form: identity R, G, B, and combined curves with AUTO handles.
+fn identity_view_curve() -> serde_json::Value {
+    let identity = json!({"points": [
+        {"location": [0.0, 0.0], "handle": "auto"},
+        {"location": [1.0, 1.0], "handle": "auto"}
+    ]});
+    json!({
+        "tone": "standard",
+        "extend": "extrapolated",
+        "use_clip": true,
+        "clip": [0.0, 0.0, 1.0, 1.0],
+        "black": [0.0, 0.0, 0.0],
+        "white": [1.0, 1.0, 1.0],
+        "curves": [identity, identity, identity, identity]
+    })
+}
+
 #[test]
 fn mask_update_changes_raster_coverage_and_delete_removes_the_mask() -> Result<(), Box<dyn Error>> {
     let document = SceneDoc::default();
@@ -126,7 +143,7 @@ fn color_operations_apply_transform_settings_and_validate_gamma_and_curve()
                     "view_transform": "raw",
                     "exposure": 1.0,
                     "gamma": 2.0,
-                    "curve": [[0.0, 0.0], [1.0, 1.0]]
+                    "curve": identity_view_curve()
                 }
             }]
         }),
@@ -155,6 +172,11 @@ fn color_operations_apply_transform_settings_and_validate_gamma_and_curve()
     );
     assert_eq!(invalid_gamma.unwrap_err().code, ErrorCode::InvalidOperation);
 
+    let mut unsorted_curve = identity_view_curve();
+    unsorted_curve["curves"][3]["points"] = json!([
+        {"location": [1.0, 0.0], "handle": "auto"},
+        {"location": [0.0, 1.0], "handle": "auto"}
+    ]);
     let invalid_curve = apply_batch(
         &updated.doc,
         &json!({
@@ -163,7 +185,7 @@ fn color_operations_apply_transform_settings_and_validate_gamma_and_curve()
             "operations": [{
                 "op": "color.update",
                 "target": {"id": "scene_main"},
-                "set": {"curve": [[1.0, 0.0], [0.0, 1.0]]}
+                "set": {"curve": unsorted_curve}
             }]
         }),
     );

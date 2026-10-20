@@ -13,10 +13,7 @@ use super::util::parse_id;
 use crate::{
     cli::{BakeArgs, BakeKind, NodeBakeMode, NodeBakeUnpackMethod},
     error::{ErrorCode, PotError, Result},
-    eval::{
-        EvaluationContext, EvaluationPurpose, EvaluationSceneContext, ModifierEvaluationContext,
-        Snapshot,
-    },
+    eval::{EvaluationContext, EvaluationPurpose, Snapshot},
     geom::Mesh,
     graph::{NodeBakeFrame, NodeBakePayloadTransaction, NodeBakeRecord},
     model::{Id, SceneDoc},
@@ -91,6 +88,7 @@ pub fn run(args: BakeArgs) -> Result<(Option<SceneInfo>, Value)> {
             .map(parse_id)
             .transpose()?,
         frame: None,
+        adaptive_render: None,
         purpose: EvaluationPurpose::Render,
     };
     let cache_directory = project.cache_directory();
@@ -462,22 +460,20 @@ fn run_node_bake(args: BakeArgs) -> Result<(Option<SceneInfo>, Value)> {
         .transpose()?;
     let project_root = project.path();
     let cache_directory = project.cache_directory();
-    let modifier_context = ModifierEvaluationContext {
-        purpose: EvaluationPurpose::Bake,
-        project_root: Some(project_root),
-        cache_directory: Some(cache_directory),
-    };
     let mut captured_frames = Vec::with_capacity(frames.len());
     for frame in &frames {
-        let scene_context = EvaluationSceneContext {
-            scene_id: Some(&selected_scene_id),
-            view_layer: selected_view_layer.as_ref(),
+        let context = EvaluationContext {
+            scene_id: Some(selected_scene_id.clone()),
+            view_layer: selected_view_layer.clone(),
             frame: Some(*frame),
+            adaptive_render: None,
+            purpose: EvaluationPurpose::Bake,
         };
         let snapshot = Snapshot::evaluate_with_node_bake_capture(
             doc,
-            &scene_context,
-            modifier_context,
+            &context,
+            Some(project_root),
+            Some(cache_directory),
             &target,
             &modifier_id,
             node_id.as_str(),

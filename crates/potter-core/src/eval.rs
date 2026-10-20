@@ -14,12 +14,15 @@ use crate::{
     error::{ErrorCode, PotError, Result},
     geom::{
         Aabb, CylinderParams, IcosphereParams, Mesh,
-        concat::{Part, concatenate},
+        concat::{Part, concatenate, concatenate_with_normals},
+        modifiers::{AdaptiveRenderCamera, AdaptiveRenderContext},
         normals::SHADING_ATTRIBUTES,
         uv_layers::{self, UvLayer},
     },
     hash,
-    model::{ConstraintType, DataBlock, Id, Modifier, Node, SceneDoc, VertexGroup},
+    model::{
+        CameraData, ConstraintType, DataBlock, Id, Modifier, Node, Scene, SceneDoc, VertexGroup,
+    },
     params::{self, ParameterFamily},
 };
 
@@ -36,7 +39,26 @@ fn mesh_to_volume_default(parameter: &str) -> Result<&'static Value> {
 pub mod animation;
 mod ik_solver;
 pub mod rig;
-const EVALUATION_ENGINE: &str = "potter-eval-4";
+const EVALUATION_ENGINE: &str = "potter-eval-5";
+
+/// A render camera explicitly chosen by a preview view rather than a scene camera node.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdaptiveCameraOverride {
+    pub data: CameraData,
+    pub world_to_camera: [f64; 16],
+}
+
+/// Camera-dependent dicing inputs attached only to native path render requests.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdaptiveRenderRequest {
+    pub camera_id: Option<Id>,
+    pub camera_override: Option<AdaptiveCameraOverride>,
+    pub resolution: [u32; 2],
+    /// Preview or final-render dicing rate, selected at the existing render boundary.
+    pub dicing_rate: f64,
+}
 
 /// Which stack an evaluation serves, following Blender's depsgraph modes: viewport previews use
 /// `show_viewport`, and saved renders use `show_render`. Each export format chooses its purpose
@@ -61,27 +83,11 @@ pub struct EvaluationContext {
     pub view_layer: Option<Id>,
     #[serde(default)]
     pub frame: Option<f64>,
+    #[serde(default)]
+    pub adaptive_render: Option<AdaptiveRenderRequest>,
     /// Modifier stack to evaluate; the viewport preview stack when omitted.
     #[serde(default)]
     pub purpose: EvaluationPurpose,
-}
-
-/// Borrowed scene selection and frame, separate from modifier purpose and resources.
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct EvaluationSceneContext<'a> {
-    pub(crate) scene_id: Option<&'a Id>,
-    pub(crate) view_layer: Option<&'a Id>,
-    pub(crate) frame: Option<f64>,
-}
-
-impl<'a> From<&'a EvaluationContext> for EvaluationSceneContext<'a> {
-    fn from(context: &'a EvaluationContext) -> Self {
-        Self {
-            scene_id: context.scene_id.as_ref(),
-            view_layer: context.view_layer.as_ref(),
-            frame: context.frame,
-        }
-    }
 }
 
 /// Borrowed project resources for one modifier evaluation.
@@ -90,6 +96,87 @@ pub(crate) struct ModifierEvaluationContext<'a> {
     pub(crate) purpose: EvaluationPurpose,
     pub(crate) project_root: Option<&'a Path>,
     pub(crate) cache_directory: Option<&'a Path>,
+    /// The owning object's material slot count (`Node::material_slot_count`); `None` when there is
+    /// no scene object, in which case consumers fall back to the mesh's own face material indices.
+    pub(crate) material_slot_count: Option<usize>,
+}
+fn adaptive_render_context<'a>(
+    doc: &'a SceneDoc,
+    scene: &'a Scene,
+    matrices: &BTreeMap<Id, DMat4>,
+    request: &'a AdaptiveRenderRequest,
+) -> Result<AdaptiveRenderContext<'a>> {
+    if request.resolution.contains(&0)
+        || !request.dicing_rate.is_finite()
+        || request.dicing_rate <= 0.0
+    {
+        return Err(PotError::invalid_argument(
+            "adaptive render raster size and dicing rate must be positive and finite",
+        ));
+    }
+    let camera = if let Some(camera_id) = scene
+        .render
+        .dicing_camera
+        .as_ref()
+        .or(request.camera_id.as_ref())
+    {
+        let node = doc
+            .nodes
+            .get(camera_id)
+            .filter(|node| node.kind == "camera")
+            .ok_or_else(|| {
+                PotError::with_details(
+                    ErrorCode::TargetNotFound,
+                    "adaptive dicing camera object does not exist",
+                    json!({"camera_id": camera_id}),
+                )
+            })?;
+        let data = node
+            .data
+            .as_ref()
+            .and_then(|data_id| doc.data_blocks.get(data_id))
+            .and_then(|data_block| data_block.camera.as_ref())
+            .ok_or_else(|| {
+                PotError::with_details(
+                    ErrorCode::TargetNotFound,
+                    "adaptive dicing camera has no camera data",
+                    json!({"camera_id": camera_id}),
+                )
+            })?;
+        let world = matrices.get(camera_id).copied().ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::TargetNotFound,
+                "adaptive dicing camera has no evaluated world transform",
+                json!({"camera_id": camera_id}),
+            )
+        })?;
+        let world_to_camera = world.inverse();
+        if !world_to_camera.is_finite() {
+            return Err(PotError::with_details(
+                ErrorCode::EvaluationFailed,
+                "adaptive dicing camera transform is singular",
+                json!({"camera_id": camera_id}),
+            ));
+        }
+        Some(AdaptiveRenderCamera {
+            data,
+            world_to_camera,
+        })
+    } else {
+        request
+            .camera_override
+            .as_ref()
+            .map(|camera| AdaptiveRenderCamera {
+                data: &camera.data,
+                world_to_camera: DMat4::from_cols_array(&camera.world_to_camera),
+            })
+    };
+    Ok(AdaptiveRenderContext {
+        settings: &scene.render,
+        resolution: request.resolution,
+        dicing_rate: request.dicing_rate,
+        camera,
+    })
 }
 
 /// Evaluated node state for the selected scene and frame.
@@ -108,6 +195,11 @@ pub struct EvaluatedNode {
     /// empty slots. Not serialized.
     #[serde(skip)]
     pub materials: Vec<Option<Id>>,
+    /// Blender `me->mat` after the modifier stack: the evaluated mesh's own material array, padded to
+    /// the evaluated count. Apply writes it back to DATA, and a quick Boolean operand hands it to its
+    /// subject. Not serialized.
+    #[serde(skip)]
+    pub mesh_materials: Vec<Option<Id>>,
 }
 
 /// Evaluated world-space Grease Pencil stroke used by vector exporters and preview.
@@ -164,6 +256,9 @@ pub struct Snapshot {
     /// Local-space geometry after the node's enabled modifier stack.
     #[serde(skip)]
     pub meshes: BTreeMap<Id, Mesh>,
+    /// Ephemeral local-space adaptive surface normals, aligned with each evaluated mesh's vertices.
+    #[serde(skip)]
+    pub(crate) adaptive_normals: BTreeMap<Id, Vec<Option<DVec3>>>,
     /// Evaluated armature bone-head matrices in world space.
     #[serde(skip)]
     pub bone_matrices: BTreeMap<Id, BTreeMap<Id, [f64; 16]>>,
@@ -173,10 +268,10 @@ pub struct Snapshot {
     /// Member material slots and UV/color layer bindings for evaluated collection instances.
     #[serde(skip)]
     pub slot_bindings: BTreeMap<Id, Vec<SlotBinding>>,
-    /// Bake-node values captured by an explicit bake action.
+    /// Bake-node values captured by an explicit bake action, keyed by object, modifier and node.
     #[serde(skip)]
     pub(crate) node_bake_captures: BTreeMap<(Id, Id, String), crate::graph::NodeBakeFrame>,
-    /// Material references restored from cached geometry items.
+    /// Material references of captured Bake geometry, keyed like `node_bake_captures`.
     #[serde(skip)]
     pub(crate) node_bake_material_refs: BTreeMap<(Id, Id, String), Vec<Id>>,
     /// World-space Grease Pencil strokes held at the selected frame.
@@ -279,15 +374,13 @@ impl Snapshot {
         project_root: Option<&Path>,
         cache_directory: Option<&Path>,
     ) -> Result<Self> {
-        let scene_context = EvaluationSceneContext::from(context);
         Self::evaluate_internal(
             doc,
-            &scene_context,
-            ModifierEvaluationContext {
-                purpose: context.purpose,
-                project_root,
-                cache_directory,
-            },
+            context,
+            project_root,
+            cache_directory,
+            None,
+            None,
             None,
             None,
         )
@@ -310,16 +403,14 @@ impl Snapshot {
                 ));
             }
         }
-        let scene_context = EvaluationSceneContext::from(context);
         Self::evaluate_internal(
             doc,
-            &scene_context,
-            ModifierEvaluationContext {
-                purpose: context.purpose,
-                project_root,
-                cache_directory,
-            },
+            context,
+            project_root,
+            cache_directory,
             Some(node_ids),
+            None,
+            None,
             None,
         )
     }
@@ -327,22 +418,73 @@ impl Snapshot {
     /// Evaluate the document and capture the Bake node selected by an explicit bake action.
     pub(crate) fn evaluate_with_node_bake_capture(
         doc: &SceneDoc,
-        scene_context: &EvaluationSceneContext<'_>,
-        modifier_context: ModifierEvaluationContext<'_>,
+        context: &EvaluationContext,
+        project_root: Option<&Path>,
+        cache_directory: Option<&Path>,
         object_id: &Id,
         modifier_id: &Id,
         bake_node_id: &str,
     ) -> Result<Self> {
         Self::evaluate_internal(
             doc,
-            scene_context,
-            modifier_context,
+            context,
+            project_root,
+            cache_directory,
             None,
-            Some((
+            None,
+            None,
+            Some(&(
                 object_id.clone(),
                 modifier_id.clone(),
                 bake_node_id.to_owned(),
             )),
+        )
+    }
+
+    /// Evaluate selected nodes with one node's modifier stack limited to a prefix.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "bounded Snapshot evaluation keeps its inputs explicit"
+    )]
+    pub(crate) fn evaluate_nodes_with_modifier_prefix_with_cache(
+        doc: &SceneDoc,
+        context: &EvaluationContext,
+        project_root: Option<&Path>,
+        cache_directory: Option<&Path>,
+        node_ids: &BTreeSet<Id>,
+        prefix_node_id: &Id,
+        keep: usize,
+        driver_values: &BTreeMap<(Id, String, u32), f64>,
+    ) -> Result<Self> {
+        for node_id in node_ids {
+            if !doc.nodes.contains_key(node_id) {
+                return Err(PotError::with_details(
+                    ErrorCode::TargetNotFound,
+                    "selected evaluation node was not found",
+                    json!({"node_id":node_id}),
+                ));
+            }
+        }
+        let prefix_node = doc.nodes.get(prefix_node_id).ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::TargetNotFound,
+                "modifier prefix node was not found",
+                json!({"node_id":prefix_node_id}),
+            )
+        })?;
+        Self::evaluate_internal(
+            doc,
+            context,
+            project_root,
+            cache_directory,
+            Some(node_ids),
+            Some(ModifierPrefix {
+                node_id: prefix_node_id,
+                modifiers: &prefix_node.modifiers,
+                keep,
+            }),
+            Some(driver_values),
+            None,
         )
     }
 
@@ -359,6 +501,7 @@ impl Snapshot {
             purpose: context.purpose,
             project_root,
             cache_directory,
+            material_slot_count: None,
         };
         let suppressed = BTreeSet::new();
         let mut world_matrix_ids = BTreeSet::from([target_id.clone()]);
@@ -367,6 +510,7 @@ impl Snapshot {
             ModifierGate {
                 context: modifier_context,
                 suppressed: &suppressed,
+                modifier_prefix: None,
             },
             Some((target_id, modifier_id)),
         )?;
@@ -409,17 +553,18 @@ impl Snapshot {
         doc.validate()?;
         crate::library::validate_linked_assets(doc, modifier_context.project_root)?;
         let scene_hash = source_scene_hash(doc)?;
-        let scene_context = EvaluationSceneContext::from(context);
         Self::evaluate_gated(
             doc,
             &scene_hash,
-            &scene_context,
+            &scene_hash,
+            context,
             modifier_context,
             Some(&selected_nodes),
-            None,
             &suppressed,
             &mesh_dependencies,
             Some(&world_matrix_ids),
+            None,
+            None,
         )
     }
 
@@ -435,8 +580,8 @@ impl Snapshot {
             purpose: context.purpose,
             project_root,
             cache_directory,
+            material_slot_count: None,
         };
-        let scene_context = EvaluationSceneContext::from(context);
         crate::library::validate_linked_assets(doc, modifier_context.project_root)?;
         let scene_hash = source_scene_hash(doc)?;
         let mut suppressed = BTreeSet::new();
@@ -445,6 +590,7 @@ impl Snapshot {
             ModifierGate {
                 context: modifier_context,
                 suppressed: &suppressed,
+                modifier_prefix: None,
             },
             None,
         )?;
@@ -453,12 +599,14 @@ impl Snapshot {
             let evaluation = Self::evaluate_gated(
                 doc,
                 &scene_hash,
-                &scene_context,
+                &scene_hash,
+                context,
                 modifier_context,
-                None,
                 None,
                 &suppressed,
                 &mesh_dependencies,
+                None,
+                None,
                 None,
             );
             match evaluation {
@@ -469,12 +617,14 @@ impl Snapshot {
                     snapshot.scene_hash.clone_from(&scene_hash);
                     let evaluation_key = json!({
                         "engine": EVALUATION_ENGINE,
+                        "build_identity": crate::BUILD_IDENTITY,
                         "simulation_engine": crate::sim::SOLVER_VERSION,
                         "scene_hash": scene_hash,
                         "scene_id": snapshot.scene_id,
                         "view_layer": snapshot.view_layer,
                         "purpose": snapshot.purpose,
                         "frame": snapshot.frame,
+                        "adaptive_render": context.adaptive_render,
                         "simulation_cache_key": snapshot.simulation_cache_key,
                     });
                     snapshot.evaluation_hash = hash::sha256(&hash::canonicalize(&evaluation_key)?);
@@ -482,6 +632,7 @@ impl Snapshot {
                         snapshot.meshes.remove(node_id);
                         snapshot.instance_paths.remove(node_id);
                         snapshot.slot_bindings.remove(node_id);
+                        snapshot.adaptive_normals.remove(node_id);
                         snapshot.strokes.remove(node_id);
                     }
                     return Ok((snapshot, node_errors));
@@ -559,12 +710,21 @@ impl Snapshot {
 
     fn evaluate_internal(
         source: &SceneDoc,
-        scene_context: &EvaluationSceneContext<'_>,
-        modifier_context: ModifierEvaluationContext<'_>,
+        context: &EvaluationContext,
+        project_root: Option<&Path>,
+        cache_directory: Option<&Path>,
         selected_nodes: Option<&BTreeSet<Id>>,
-        bake_capture: Option<(Id, Id, String)>,
+        modifier_prefix: Option<ModifierPrefix<'_>>,
+        driver_values: Option<&BTreeMap<(Id, String, u32), f64>>,
+        bake_capture: Option<&(Id, Id, String)>,
     ) -> Result<Self> {
         source.validate()?;
+        let modifier_context = ModifierEvaluationContext {
+            purpose: context.purpose,
+            project_root,
+            cache_directory,
+            material_slot_count: None,
+        };
         crate::library::validate_linked_assets(source, modifier_context.project_root)?;
         let scene_hash = source_scene_hash(source)?;
         let suppressed = BTreeSet::new();
@@ -573,46 +733,110 @@ impl Snapshot {
             ModifierGate {
                 context: modifier_context,
                 suppressed: &suppressed,
+                modifier_prefix,
             },
             None,
         )?;
+        let mut selected_nodes_with_prefix = None;
+        let mut world_matrix_ids = None;
+        if let Some(prefix) = modifier_prefix {
+            let mut selected = selected_nodes.cloned().unwrap_or_default();
+            let mut world_ids = selected.clone();
+            let target = source.nodes.get(prefix.node_id).ok_or_else(|| {
+                PotError::with_details(
+                    ErrorCode::TargetNotFound,
+                    "modifier prefix node was not found",
+                    json!({"node_id":prefix.node_id}),
+                )
+            })?;
+            let prefix_gate = ModifierGate {
+                context: modifier_context,
+                suppressed: &suppressed,
+                modifier_prefix,
+            };
+            for modifier in target.modifiers.iter().take(prefix.keep) {
+                if !prefix_gate.is_active(prefix.node_id, modifier) {
+                    continue;
+                }
+                for reference_id in modifier_transform_references(modifier) {
+                    world_ids.insert(reference_id.clone());
+                    let Some(reference) = source.nodes.get(&reference_id) else {
+                        continue;
+                    };
+                    if reference.kind == "armature" {
+                        selected.insert(reference_id.clone());
+                    }
+                    for constraint in &reference.constraints {
+                        if constraint.enabled
+                            && constraint.influence != 0.0
+                            && matches!(
+                                constraint.constraint_type,
+                                ConstraintType::Shrinkwrap | ConstraintType::GeometryAttribute
+                            )
+                            && let Some(dependency_id) = &constraint.target
+                            && mesh_dependencies
+                                .other
+                                .get(&reference_id)
+                                .is_some_and(|dependencies| dependencies.contains(dependency_id))
+                        {
+                            selected.insert(dependency_id.clone());
+                        }
+                    }
+                }
+            }
+            selected_nodes_with_prefix = Some(selected);
+            world_matrix_ids = Some(world_ids);
+        }
+        let selected_nodes = selected_nodes_with_prefix.as_ref().or(selected_nodes);
+        let world_matrix_ids = world_matrix_ids.as_ref();
+        let simulation_scene_hash = if let Some(prefix) = modifier_prefix {
+            hash::sha256(&hash::canonicalize(&json!({
+                "scene_hash": scene_hash,
+                "modifier_prefix": {"node_id":prefix.node_id,"keep":prefix.keep},
+            }))?)
+        } else {
+            scene_hash.clone()
+        };
         Self::evaluate_gated(
             source,
             &scene_hash,
-            scene_context,
+            &simulation_scene_hash,
+            context,
             modifier_context,
             selected_nodes,
-            bake_capture,
             &suppressed,
             &mesh_dependencies,
-            None,
+            world_matrix_ids,
+            modifier_prefix,
+            driver_values,
+            bake_capture,
         )
     }
 
     /// Evaluates `doc` with the `suppressed` nodes' modifiers inactive. `scene_hash` addresses
     /// the authored source, not the document itself.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "gated evaluation takes each independent evaluation input explicitly"
-    )]
     fn evaluate_gated(
         doc: &SceneDoc,
         scene_hash: &str,
-        scene_context: &EvaluationSceneContext<'_>,
+        simulation_scene_hash: &str,
+        context: &EvaluationContext,
         modifier_context: ModifierEvaluationContext<'_>,
         selected_nodes: Option<&BTreeSet<Id>>,
-        bake_capture: Option<(Id, Id, String)>,
         suppressed: &BTreeSet<Id>,
         mesh_dependencies: &ObjectMeshDependencies,
         world_matrix_ids: Option<&BTreeSet<Id>>,
+        modifier_prefix: Option<ModifierPrefix<'_>>,
+        driver_values: Option<&BTreeMap<(Id, String, u32), f64>>,
+        bake_capture: Option<&(Id, Id, String)>,
     ) -> Result<Self> {
         let gate = ModifierGate {
             context: modifier_context,
             suppressed,
+            modifier_prefix,
         };
-        let scene_id = scene_context
+        let scene_id = context
             .scene_id
-            .cloned()
+            .clone()
             .unwrap_or_else(|| doc.active_scene.clone());
         let scene = doc.scenes.get(&scene_id).ok_or_else(|| {
             PotError::with_details(
@@ -621,7 +845,7 @@ impl Snapshot {
                 json!({ "scene_id": scene_id }),
             )
         })?;
-        let view_layer = match scene_context.view_layer {
+        let view_layer = match &context.view_layer {
             Some(view_layer) if scene.view_layers.contains_key(view_layer) => {
                 Some(view_layer.clone())
             }
@@ -629,12 +853,12 @@ impl Snapshot {
                 return Err(PotError::with_details(
                     ErrorCode::TargetNotFound,
                     "view layer context not found",
-                    json!({"view_layer":view_layer}),
+                    json!({ "view_layer": view_layer }),
                 ));
             }
             None => scene.view_layers.keys().next().cloned(),
         };
-        let frame = scene_context.frame.unwrap_or(scene.frame_current);
+        let frame = context.frame.unwrap_or(scene.frame_current);
         if !frame.is_finite() {
             return Err(PotError::new(
                 ErrorCode::InvalidArgument,
@@ -645,15 +869,26 @@ impl Snapshot {
             object_mesh_evaluation_order(doc, selected_nodes, gate, mesh_dependencies)?;
         let evaluated_node_ids: BTreeSet<Id> = mesh_evaluation_order.iter().cloned().collect();
 
-        let driver_values = rig::evaluate_drivers(doc, frame)?;
+        let computed_driver_values;
+        let driver_values = if let Some(driver_values) = driver_values {
+            driver_values
+        } else {
+            computed_driver_values = rig::evaluate_drivers(doc, frame)?;
+            &computed_driver_values
+        };
         let mut matrices = rig::evaluate_world_matrices_with_resources(
             doc,
             frame,
-            &driver_values,
+            driver_values,
             modifier_context.project_root,
             scene.fps,
             scene.fps_base,
         )?;
+        let adaptive_render = context
+            .adaptive_render
+            .as_ref()
+            .map(|request| adaptive_render_context(doc, scene, &matrices, request))
+            .transpose()?;
         let object_meshes: BTreeMap<_, _> = doc
             .nodes
             .iter()
@@ -686,7 +921,14 @@ impl Snapshot {
                 }
             }
         }
-        let simulation = crate::sim::evaluate(doc, &scene_id, frame, &matrices, scene_hash, gate)?;
+        let simulation = crate::sim::evaluate(
+            doc,
+            &scene_id,
+            frame,
+            &matrices,
+            simulation_scene_hash,
+            gate,
+        )?;
         let mut simulated_velocities = BTreeMap::new();
         let mut deformed_vertices = BTreeMap::new();
         let mut fluid_surfaces = BTreeMap::new();
@@ -761,7 +1003,7 @@ impl Snapshot {
                     frame,
                     armature_world,
                     &matrices,
-                    &driver_values,
+                    driver_values,
                     modifier_context.project_root,
                     scene.fps,
                     scene.fps_base,
@@ -775,16 +1017,22 @@ impl Snapshot {
                 );
             }
         }
-        let evaluation_key = json!({
+        let mut evaluation_key = json!({
             "engine": EVALUATION_ENGINE,
+            "build_identity": crate::BUILD_IDENTITY,
             "simulation_engine": crate::sim::SOLVER_VERSION,
             "scene_hash": scene_hash,
             "scene_id": scene_id,
             "view_layer": view_layer,
-            "purpose": modifier_context.purpose,
+            "purpose": context.purpose,
             "frame": frame,
+            "adaptive_render": context.adaptive_render,
             "simulation_cache_key": simulation_cache_key,
         });
+        if let Some(prefix) = modifier_prefix {
+            evaluation_key["modifier_prefix"] =
+                json!({"node_id":prefix.node_id,"keep":prefix.keep});
+        }
         let evaluation_hash = hash::sha256(&hash::canonicalize(&evaluation_key)?);
         let mut volume_data = if mesh_evaluation_order.is_empty() {
             BTreeMap::new()
@@ -794,11 +1042,12 @@ impl Snapshot {
 
         let mut nodes = BTreeMap::new();
         let mut meshes = BTreeMap::new();
+        let mut adaptive_normals = BTreeMap::new();
         let mut instance_paths = BTreeMap::new();
         let mut slot_bindings = BTreeMap::new();
+        let mut strokes = BTreeMap::new();
         let mut node_bake_captures = BTreeMap::new();
         let mut node_bake_material_refs = BTreeMap::new();
-        let mut strokes = BTreeMap::new();
         let mut modifier_warnings = Vec::new();
         for id in &mesh_evaluation_order {
             let node = doc.nodes.get(id).ok_or_else(|| {
@@ -843,7 +1092,7 @@ impl Snapshot {
                             shape_keys,
                             doc,
                             frame,
-                            &driver_values,
+                            driver_values,
                         )?;
                         rig::apply_shape_keys_with_values(
                             &mut rigged_source,
@@ -852,8 +1101,8 @@ impl Snapshot {
                             &values,
                         )?;
                     }
-                    if !has_stack_modifier(node, "cloth")
-                        && !has_stack_modifier(node, "soft_body")
+                    if !has_stack_modifier(gate, id, node, "cloth")
+                        && !has_stack_modifier(gate, id, node, "soft_body")
                         && let Some(positions) = deformed_vertices.get(id)
                     {
                         if positions.len() != rigged_source.vertices.len() {
@@ -867,7 +1116,7 @@ impl Snapshot {
                             vertex.co = DVec3::from_array(*position);
                         }
                     }
-                    if !has_stack_modifier(node, "dynamic_paint")
+                    if !has_stack_modifier(gate, id, node, "dynamic_paint")
                         && let Some(colors) = paint_colors.get(id)
                     {
                         if colors.len() != rigged_source.vertices.len() {
@@ -879,7 +1128,7 @@ impl Snapshot {
                         }
                         inject_dynamic_paint_colors(&mut rigged_source, colors);
                     }
-                    if !has_stack_modifier(node, "dynamic_paint")
+                    if !has_stack_modifier(gate, id, node, "dynamic_paint")
                         && let Some(weights) = paint_weights.get(id)
                     {
                         if weights.len() != rigged_source.vertices.len()
@@ -906,144 +1155,163 @@ impl Snapshot {
                     let evaluation_modifiers = prepare_node_bake_modifiers(
                         doc,
                         id,
-                        gated_modifiers.as_ref(),
+                        &node.modifiers,
                         modifier_context,
-                        bake_capture.as_ref(),
+                        bake_capture,
                     )?;
-                    let evaluated = crate::geom::modifiers::evaluate_modifiers_with_scene_context(
-                        rigged_source,
-                        &evaluation_modifiers,
-                        &doc.node_groups,
-                        frame,
-                        matrix,
-                        &matrices,
-                        &object_meshes,
-                        &meshes,
-                        &curve_path_lengths,
-                        gate.context,
-                        |_, modifier| gate.is_active(id, modifier),
-                        |mesh, modifier, modifier_warnings| match modifier.modifier_type.as_str() {
-                            "armature" => rig::apply_armature_modifier_with_drivers(
-                                mesh,
-                                data_block,
-                                modifier,
-                                matrix,
-                                doc,
-                                frame,
-                                &matrices,
-                                &driver_values,
-                                modifier_context.project_root,
-                                scene.fps,
-                                scene.fps_base,
-                                &meshes,
-                            ),
-                            "lattice" => apply_lattice_modifier(
-                                mesh, modifier, id, data_block, doc, &matrices,
-                            ),
-                            "volume_to_mesh" => apply_volume_to_mesh_modifier(
-                                mesh,
-                                modifier,
-                                id,
-                                doc,
-                                &matrices,
-                                &volume_data,
-                            ),
-                            "boolean" | "shrinkwrap" | "curve" | "hook" | "warp" => {
-                                apply_scene_operand_modifier(
-                                    mesh,
-                                    modifier,
-                                    id,
-                                    doc,
-                                    &matrices,
-                                    &meshes,
-                                    &nodes,
-                                    &mut node_materials,
-                                )
-                            }
-                            "vertex_weight_edit"
-                            | "vertex_weight_mix"
-                            | "vertex_weight_proximity"
-                            | "normal_edit"
-                            | "uv_project"
-                            | "uv_warp"
-                            | "data_transfer" => apply_scene_attribute_modifier(
-                                mesh,
-                                modifier,
-                                id,
-                                doc,
-                                &matrices,
-                                &meshes,
-                                modifier_context.project_root,
-                            ),
-                            "surface_deform" | "mesh_deform" => apply_scene_deform_modifier(
-                                mesh,
-                                modifier,
-                                id,
-                                doc,
-                                &matrices,
-                                &meshes,
-                                modifier_warnings,
-                            ),
-                            "mesh_sequence_cache" => apply_mesh_sequence_cache_modifier(
-                                mesh,
-                                modifier,
-                                doc,
-                                modifier_context.project_root,
-                                frame,
-                                scene.fps,
-                                scene.fps_base,
-                            )
-                            .map(|warnings| modifier_warnings.extend(warnings)),
-                            "mesh_cache" => apply_mesh_cache_modifier(
-                                mesh,
-                                modifier,
-                                doc,
-                                modifier_context.project_root,
-                                frame,
-                                scene.fps,
-                                scene.fps_base,
-                            ),
-                            "cloth" | "soft_body" | "collision" | "dynamic_paint" | "fluid"
-                            | "particle_system" => apply_stack_physics_modifier(
-                                mesh,
-                                modifier,
-                                id,
-                                doc,
-                                scene_hash,
-                                gate,
-                                &scene_id,
-                                frame,
-                                &matrices,
-                                &mut simulated_particles,
-                            ),
-                            "particle_instance" => apply_particle_instance_modifier(
-                                mesh,
-                                modifier,
-                                id,
-                                doc,
-                                gate,
-                                frame,
-                                f64::from(scene.fps) / scene.fps_base,
-                                &matrices,
-                                &simulated_particles,
-                            ),
-                            "explode" => apply_explode_modifier(
-                                mesh,
-                                modifier,
-                                id,
-                                doc,
-                                gate,
-                                frame,
-                                &matrices,
-                                &simulated_particles,
-                            ),
-                            _ => Err(PotError::new(
-                                ErrorCode::InternalError,
-                                "unexpected custom modifier callback",
-                            )),
-                        },
-                    )
-                    .map_err(|error| attach_node_owner(error, id))?;
+                    // Shape keys are applied above before modifiers, so adaptive derivatives use the same
+                    // evaluated coordinates as the render mesh.
+                    let mut stack_context = gate.context;
+                    stack_context.material_slot_count = Some(crate::model::material_slot_count(
+                        node.materials.len(),
+                        node_materials.len(),
+                    ));
+                    let (evaluated, mesh_normals) =
+                        crate::geom::modifiers::evaluate_modifiers_with_scene_context_and_normals(
+                            rigged_source,
+                            &evaluation_modifiers,
+                            &doc.node_groups,
+                            frame,
+                            matrix,
+                            &matrices,
+                            &object_meshes,
+                            &meshes,
+                            &curve_path_lengths,
+                            stack_context,
+                            |_, modifier| gate.is_active(id, modifier),
+                            adaptive_render.as_ref(),
+                            |mesh, modifier, modifier_warnings| {
+                                let result = match modifier.modifier_type.as_str() {
+                                    "armature" => rig::apply_armature_modifier_with_drivers(
+                                        mesh,
+                                        data_block,
+                                        modifier,
+                                        matrix,
+                                        doc,
+                                        frame,
+                                        &matrices,
+                                        driver_values,
+                                        modifier_context.project_root,
+                                        scene.fps,
+                                        scene.fps_base,
+                                        &meshes,
+                                    ),
+                                    "lattice" => apply_lattice_modifier(
+                                        mesh, modifier, id, data_block, doc, &matrices,
+                                    ),
+                                    "volume_to_mesh" => apply_volume_to_mesh_modifier(
+                                        mesh,
+                                        modifier,
+                                        id,
+                                        doc,
+                                        &matrices,
+                                        &volume_data,
+                                    ),
+                                    "boolean" | "shrinkwrap" | "curve" | "hook" | "warp" => {
+                                        apply_scene_operand_modifier(
+                                            mesh,
+                                            modifier,
+                                            id,
+                                            doc,
+                                            &matrices,
+                                            &meshes,
+                                            &nodes,
+                                            &mut node_materials,
+                                        )
+                                    }
+                                    "vertex_weight_edit"
+                                    | "vertex_weight_mix"
+                                    | "vertex_weight_proximity"
+                                    | "normal_edit"
+                                    | "uv_project"
+                                    | "uv_warp"
+                                    | "data_transfer" => apply_scene_attribute_modifier(
+                                        mesh,
+                                        modifier,
+                                        id,
+                                        doc,
+                                        &matrices,
+                                        &meshes,
+                                        modifier_context.project_root,
+                                    ),
+                                    "surface_deform" | "mesh_deform" => {
+                                        apply_scene_deform_modifier(
+                                            mesh,
+                                            modifier,
+                                            id,
+                                            doc,
+                                            &matrices,
+                                            &meshes,
+                                            modifier_warnings,
+                                        )
+                                    }
+                                    "mesh_sequence_cache" => apply_mesh_sequence_cache_modifier(
+                                        mesh,
+                                        modifier,
+                                        doc,
+                                        modifier_context.project_root,
+                                        frame,
+                                        scene.fps,
+                                        scene.fps_base,
+                                    )
+                                    .map(|warnings| modifier_warnings.extend(warnings)),
+                                    "mesh_cache" => apply_mesh_cache_modifier(
+                                        mesh,
+                                        modifier,
+                                        doc,
+                                        modifier_context.project_root,
+                                        frame,
+                                        scene.fps,
+                                        scene.fps_base,
+                                    ),
+                                    "cloth" | "soft_body" | "collision" | "dynamic_paint"
+                                    | "fluid" | "particle_system" => apply_stack_physics_modifier(
+                                        mesh,
+                                        modifier,
+                                        id,
+                                        doc,
+                                        simulation_scene_hash,
+                                        gate,
+                                        &scene_id,
+                                        frame,
+                                        &matrices,
+                                        &mut simulated_particles,
+                                    ),
+                                    "particle_instance" => apply_particle_instance_modifier(
+                                        mesh,
+                                        modifier,
+                                        id,
+                                        doc,
+                                        gate,
+                                        frame,
+                                        f64::from(scene.fps) / scene.fps_base,
+                                        &matrices,
+                                        &simulated_particles,
+                                    ),
+                                    "explode" => apply_explode_modifier(
+                                        mesh,
+                                        modifier,
+                                        id,
+                                        doc,
+                                        gate,
+                                        frame,
+                                        &matrices,
+                                        &simulated_particles,
+                                    ),
+                                    _ => Err(PotError::new(
+                                        ErrorCode::InternalError,
+                                        "unexpected custom modifier callback",
+                                    )),
+                                };
+                                result.map(|()| {
+                                    Some(crate::model::material_slot_count(
+                                        node.materials.len(),
+                                        node_materials.len(),
+                                    ))
+                                })
+                            },
+                        )
+                        .map_err(|error| attach_node_owner(error, id))?;
                     node_bake_captures.extend(evaluated.bake_captures.into_iter().map(
                         |((modifier_id, node_id), frame)| {
                             (
@@ -1066,13 +1334,18 @@ impl Snapshot {
                             .into_iter()
                             .map(|warning| attach_node_owner(warning, id)),
                     );
-                    let evaluated_mesh = if has_stack_modifier(node, "fluid") {
+                    let uses_fluid_surface = !has_stack_modifier(gate, id, node, "fluid")
+                        && fluid_surfaces.contains_key(id);
+                    let evaluated_mesh = if has_stack_modifier(gate, id, node, "fluid") {
                         evaluated.mesh
                     } else {
                         fluid_surfaces.get(id).cloned().unwrap_or(evaluated.mesh)
                     };
                     let bounds = mesh_bounds(&evaluated_mesh, matrix)?;
                     meshes.insert(id.clone(), evaluated_mesh);
+                    if !uses_fluid_surface && let Some(normals) = mesh_normals {
+                        adaptive_normals.insert(id.clone(), normals);
+                    }
                     if !evaluated.instance_paths.is_empty() {
                         instance_paths.insert(id.clone(), evaluated.instance_paths);
                     }
@@ -1212,144 +1485,161 @@ impl Snapshot {
                     let evaluation_modifiers = prepare_node_bake_modifiers(
                         doc,
                         id,
-                        gated_modifiers.as_ref(),
+                        &node.modifiers,
                         modifier_context,
-                        bake_capture.as_ref(),
+                        bake_capture,
                     )?;
-                    let evaluated = crate::geom::modifiers::evaluate_modifiers_with_scene_context(
-                        source_mesh,
-                        &evaluation_modifiers,
-                        &doc.node_groups,
-                        frame,
-                        matrix,
-                        &matrices,
-                        &object_meshes,
-                        &meshes,
-                        &curve_path_lengths,
-                        gate.context,
-                        |_, modifier| gate.is_active(id, modifier),
-                        |mesh, modifier, modifier_warnings| match modifier.modifier_type.as_str() {
-                            "armature" => rig::apply_armature_modifier_with_drivers(
-                                mesh,
-                                data_block,
-                                modifier,
-                                matrix,
-                                doc,
-                                frame,
-                                &matrices,
-                                &driver_values,
-                                modifier_context.project_root,
-                                scene.fps,
-                                scene.fps_base,
-                                &meshes,
-                            ),
-                            "lattice" => apply_lattice_modifier(
-                                mesh, modifier, id, data_block, doc, &matrices,
-                            ),
-                            "volume_to_mesh" => apply_volume_to_mesh_modifier(
-                                mesh,
-                                modifier,
-                                id,
-                                doc,
-                                &matrices,
-                                &volume_data,
-                            ),
-                            "boolean" | "shrinkwrap" | "curve" | "hook" | "warp" => {
-                                apply_scene_operand_modifier(
-                                    mesh,
-                                    modifier,
-                                    id,
-                                    doc,
-                                    &matrices,
-                                    &meshes,
-                                    &nodes,
-                                    &mut node_materials,
-                                )
-                            }
-                            "vertex_weight_edit"
-                            | "vertex_weight_mix"
-                            | "vertex_weight_proximity"
-                            | "normal_edit"
-                            | "uv_project"
-                            | "uv_warp"
-                            | "data_transfer" => apply_scene_attribute_modifier(
-                                mesh,
-                                modifier,
-                                id,
-                                doc,
-                                &matrices,
-                                &meshes,
-                                modifier_context.project_root,
-                            ),
-                            "surface_deform" | "mesh_deform" => apply_scene_deform_modifier(
-                                mesh,
-                                modifier,
-                                id,
-                                doc,
-                                &matrices,
-                                &meshes,
-                                modifier_warnings,
-                            ),
-                            "mesh_sequence_cache" => apply_mesh_sequence_cache_modifier(
-                                mesh,
-                                modifier,
-                                doc,
-                                modifier_context.project_root,
-                                frame,
-                                scene.fps,
-                                scene.fps_base,
-                            )
-                            .map(|warnings| modifier_warnings.extend(warnings)),
-                            "mesh_cache" => apply_mesh_cache_modifier(
-                                mesh,
-                                modifier,
-                                doc,
-                                modifier_context.project_root,
-                                frame,
-                                scene.fps,
-                                scene.fps_base,
-                            ),
-                            "cloth" | "soft_body" | "collision" | "dynamic_paint" | "fluid"
-                            | "particle_system" => apply_stack_physics_modifier(
-                                mesh,
-                                modifier,
-                                id,
-                                doc,
-                                scene_hash,
-                                gate,
-                                &scene_id,
-                                frame,
-                                &matrices,
-                                &mut simulated_particles,
-                            ),
-                            "particle_instance" => apply_particle_instance_modifier(
-                                mesh,
-                                modifier,
-                                id,
-                                doc,
-                                gate,
-                                frame,
-                                f64::from(scene.fps) / scene.fps_base,
-                                &matrices,
-                                &simulated_particles,
-                            ),
-                            "explode" => apply_explode_modifier(
-                                mesh,
-                                modifier,
-                                id,
-                                doc,
-                                gate,
-                                frame,
-                                &matrices,
-                                &simulated_particles,
-                            ),
-                            _ => Err(PotError::new(
-                                ErrorCode::InternalError,
-                                "unexpected custom modifier callback",
-                            )),
-                        },
-                    )
-                    .map_err(|error| attach_node_owner(error, id))?;
+                    let mut stack_context = gate.context;
+                    stack_context.material_slot_count = Some(crate::model::material_slot_count(
+                        node.materials.len(),
+                        node_materials.len(),
+                    ));
+                    let (evaluated, evaluated_normals) =
+                        crate::geom::modifiers::evaluate_modifiers_with_scene_context_and_normals(
+                            source_mesh,
+                            &evaluation_modifiers,
+                            &doc.node_groups,
+                            frame,
+                            matrix,
+                            &matrices,
+                            &object_meshes,
+                            &meshes,
+                            &curve_path_lengths,
+                            stack_context,
+                            |_, modifier| gate.is_active(id, modifier),
+                            adaptive_render.as_ref(),
+                            |mesh, modifier, modifier_warnings| {
+                                let result = match modifier.modifier_type.as_str() {
+                                    "armature" => rig::apply_armature_modifier_with_drivers(
+                                        mesh,
+                                        data_block,
+                                        modifier,
+                                        matrix,
+                                        doc,
+                                        frame,
+                                        &matrices,
+                                        driver_values,
+                                        modifier_context.project_root,
+                                        scene.fps,
+                                        scene.fps_base,
+                                        &meshes,
+                                    ),
+                                    "lattice" => apply_lattice_modifier(
+                                        mesh, modifier, id, data_block, doc, &matrices,
+                                    ),
+                                    "volume_to_mesh" => apply_volume_to_mesh_modifier(
+                                        mesh,
+                                        modifier,
+                                        id,
+                                        doc,
+                                        &matrices,
+                                        &volume_data,
+                                    ),
+                                    "boolean" | "shrinkwrap" | "curve" | "hook" | "warp" => {
+                                        apply_scene_operand_modifier(
+                                            mesh,
+                                            modifier,
+                                            id,
+                                            doc,
+                                            &matrices,
+                                            &meshes,
+                                            &nodes,
+                                            &mut node_materials,
+                                        )
+                                    }
+                                    "vertex_weight_edit"
+                                    | "vertex_weight_mix"
+                                    | "vertex_weight_proximity"
+                                    | "normal_edit"
+                                    | "uv_project"
+                                    | "uv_warp"
+                                    | "data_transfer" => apply_scene_attribute_modifier(
+                                        mesh,
+                                        modifier,
+                                        id,
+                                        doc,
+                                        &matrices,
+                                        &meshes,
+                                        modifier_context.project_root,
+                                    ),
+                                    "surface_deform" | "mesh_deform" => {
+                                        apply_scene_deform_modifier(
+                                            mesh,
+                                            modifier,
+                                            id,
+                                            doc,
+                                            &matrices,
+                                            &meshes,
+                                            modifier_warnings,
+                                        )
+                                    }
+                                    "mesh_sequence_cache" => apply_mesh_sequence_cache_modifier(
+                                        mesh,
+                                        modifier,
+                                        doc,
+                                        modifier_context.project_root,
+                                        frame,
+                                        scene.fps,
+                                        scene.fps_base,
+                                    )
+                                    .map(|warnings| modifier_warnings.extend(warnings)),
+                                    "mesh_cache" => apply_mesh_cache_modifier(
+                                        mesh,
+                                        modifier,
+                                        doc,
+                                        modifier_context.project_root,
+                                        frame,
+                                        scene.fps,
+                                        scene.fps_base,
+                                    ),
+                                    "cloth" | "soft_body" | "collision" | "dynamic_paint"
+                                    | "fluid" | "particle_system" => apply_stack_physics_modifier(
+                                        mesh,
+                                        modifier,
+                                        id,
+                                        doc,
+                                        simulation_scene_hash,
+                                        gate,
+                                        &scene_id,
+                                        frame,
+                                        &matrices,
+                                        &mut simulated_particles,
+                                    ),
+                                    "particle_instance" => apply_particle_instance_modifier(
+                                        mesh,
+                                        modifier,
+                                        id,
+                                        doc,
+                                        gate,
+                                        frame,
+                                        f64::from(scene.fps) / scene.fps_base,
+                                        &matrices,
+                                        &simulated_particles,
+                                    ),
+                                    "explode" => apply_explode_modifier(
+                                        mesh,
+                                        modifier,
+                                        id,
+                                        doc,
+                                        gate,
+                                        frame,
+                                        &matrices,
+                                        &simulated_particles,
+                                    ),
+                                    _ => Err(PotError::new(
+                                        ErrorCode::InternalError,
+                                        "unexpected custom modifier callback",
+                                    )),
+                                };
+                                result.map(|()| {
+                                    Some(crate::model::material_slot_count(
+                                        node.materials.len(),
+                                        node_materials.len(),
+                                    ))
+                                })
+                            },
+                        )
+                        .map_err(|error| attach_node_owner(error, id))?;
                     node_bake_captures.extend(evaluated.bake_captures.into_iter().map(
                         |((modifier_id, node_id), frame)| {
                             (
@@ -1372,6 +1662,9 @@ impl Snapshot {
                             .into_iter()
                             .map(|warning| attach_node_owner(warning, id)),
                     );
+                    if let Some(normals) = evaluated_normals {
+                        adaptive_normals.insert(id.clone(), normals);
+                    }
                     let bounds = mesh_bounds(&evaluated.mesh, matrix)?;
                     meshes.insert(id.clone(), evaluated.mesh);
                     if !evaluated.instance_paths.is_empty() {
@@ -1553,6 +1846,7 @@ impl Snapshot {
                     bounds,
                     dimensions,
                     materials: effective_material_slots(node, &node_materials),
+                    mesh_materials: node_materials,
                 },
             );
         }
@@ -1572,7 +1866,7 @@ impl Snapshot {
             matrices = rig::evaluate_world_matrices_with_evaluated_meshes(
                 doc,
                 frame,
-                &driver_values,
+                driver_values,
                 modifier_context.project_root,
                 scene.fps,
                 scene.fps_base,
@@ -1607,7 +1901,7 @@ impl Snapshot {
                         frame,
                         armature_world,
                         &matrices,
-                        &driver_values,
+                        driver_values,
                         modifier_context.project_root,
                         scene.fps,
                         scene.fps_base,
@@ -1631,6 +1925,7 @@ impl Snapshot {
             &mut meshes,
             &mut nodes,
             &evaluated_node_ids,
+            &mut adaptive_normals,
         )?;
         for (id, node) in &doc.nodes {
             if !nodes.contains_key(id)
@@ -1649,6 +1944,7 @@ impl Snapshot {
                 mesh,
                 paths,
                 bindings,
+                adaptive_normals: member_normals,
                 ..
             } = evaluate_collection_instance(
                 doc,
@@ -1656,12 +1952,16 @@ impl Snapshot {
                 &matrices,
                 &meshes,
                 &nodes,
+                &adaptive_normals,
                 &mut BTreeSet::new(),
             )?;
             let bounds = mesh_bounds(&mesh, matrix)?;
             if !mesh.vertices.is_empty() {
                 slot_bindings.insert(id.clone(), bindings);
                 meshes.insert(id.clone(), mesh);
+                if let Some(normals) = member_normals {
+                    adaptive_normals.insert(id.clone(), normals);
+                }
             }
             if !paths.is_empty() {
                 instance_paths.insert(id.clone(), paths);
@@ -1685,7 +1985,7 @@ impl Snapshot {
             scene_id,
             view_layer,
             frame,
-            purpose: modifier_context.purpose,
+            purpose: context.purpose,
             revision: doc.revision,
             scene_hash: scene_hash.to_owned(),
             evaluation_hash,
@@ -1696,6 +1996,7 @@ impl Snapshot {
             node_bake_captures,
             node_bake_material_refs,
             meshes,
+            adaptive_normals,
             strokes,
             volume_data,
             bone_matrices,
@@ -1743,7 +2044,8 @@ fn modifier_transform_references(modifier: &Modifier) -> BTreeSet<Id> {
     }
 
     let parameters: &[&str] = match modifier.modifier_type.as_str() {
-        "hook" => &["object"],
+        "armature" | "hook" | "lattice" | "screw" => &["object"],
+        "mirror" => &["mirror_object"],
         "uv_project" => &["projectors"],
         "uv_warp" | "warp" => &["object_from", "object_to"],
         "vertex_weight_edit" | "vertex_weight_mix" | "vertex_weight_proximity" => {
@@ -1779,14 +2081,6 @@ fn modifier_transform_references(modifier: &Modifier) -> BTreeSet<Id> {
         {
             add_reference(&mut references, modifier.params.get("offset_object"));
         }
-    } else if modifier.modifier_type == "screw"
-        && modifier
-            .params
-            .get("use_object_screw_offset")
-            .and_then(Value::as_bool)
-            == Some(true)
-    {
-        add_reference(&mut references, modifier.params.get("object"));
     }
     references
 }
@@ -1843,6 +2137,13 @@ pub(crate) fn evaluated_array_curve_path_length(
     Ok(Some((curve_id, length)))
 }
 
+#[derive(Clone, Copy)]
+struct ModifierPrefix<'a> {
+    node_id: &'a Id,
+    modifiers: &'a [Modifier],
+    keep: usize,
+}
+
 /// Modifier state for one evaluation. `purpose` selects the viewport or render stack, and
 /// `suppressed` nodes lost their modifiers to an unsupported-feature error. Every consumer asks
 /// this type whether a modifier is active, so Preview and Render cannot diverge.
@@ -1850,12 +2151,30 @@ pub(crate) fn evaluated_array_curve_path_length(
 pub(crate) struct ModifierGate<'a> {
     pub(crate) context: ModifierEvaluationContext<'a>,
     pub(crate) suppressed: &'a BTreeSet<Id>,
+    modifier_prefix: Option<ModifierPrefix<'a>>,
 }
 
 impl ModifierGate<'_> {
+    fn stack_modifiers<'m>(&self, node_id: &Id, modifiers: &'m [Modifier]) -> &'m [Modifier] {
+        match self.modifier_prefix {
+            Some(prefix) if prefix.node_id == node_id => {
+                &modifiers[..prefix.keep.min(modifiers.len())]
+            }
+            _ => modifiers,
+        }
+    }
+
     /// Whether `modifier` on `node_id` takes part in this evaluation.
     pub(crate) fn is_active(&self, node_id: &Id, modifier: &Modifier) -> bool {
-        !self.suppressed.contains(node_id) && modifier.is_active(self.context.purpose)
+        let in_prefix = match self.modifier_prefix {
+            Some(prefix) if prefix.node_id == node_id => prefix
+                .modifiers
+                .iter()
+                .position(|candidate| candidate.id == modifier.id)
+                .is_some_and(|index| index < prefix.keep),
+            _ => true,
+        };
+        in_prefix && !self.suppressed.contains(node_id) && modifier.is_active(self.context.purpose)
     }
 
     /// Whether a legacy physics property has an active stack modifier linked to its settings.
@@ -2197,6 +2516,7 @@ fn prepare_node_bake_modifiers<'a>(
     }
     Ok(resolved.map_or(Cow::Borrowed(modifiers), Cow::Owned))
 }
+
 /// Read and verify a cache resource from the scene's asset registry.
 ///
 /// # Errors
@@ -3048,6 +3368,7 @@ fn render_simulated_particles(
     meshes: &mut BTreeMap<Id, Mesh>,
     nodes: &mut BTreeMap<Id, EvaluatedNode>,
     evaluated_node_ids: &BTreeSet<Id>,
+    adaptive_normals: &mut BTreeMap<Id, Vec<Option<DVec3>>>,
 ) -> Result<()> {
     for (emitter_id, states) in particles {
         if !evaluated_node_ids.contains(emitter_id) {
@@ -3077,7 +3398,7 @@ fn render_simulated_particles(
             .filter(|state| state.life_state == crate::sim::ParticleLifeState::Alive)
         {
             let system_modifier = usize::try_from(state.system_index).ok().and_then(|index| {
-                node.modifiers
+                gate.stack_modifiers(emitter_id, &node.modifiers)
                     .iter()
                     .filter(|modifier| modifier.modifier_type == "particle_system")
                     .nth(index)
@@ -3123,14 +3444,14 @@ fn render_simulated_particles(
         }
         for (system_index, visible_states) in visible_states_by_system {
             let has_stack_system = usize::try_from(system_index).is_ok_and(|index| {
-                node.modifiers
+                gate.stack_modifiers(emitter_id, &node.modifiers)
                     .iter()
                     .filter(|modifier| modifier.modifier_type == "particle_system")
                     .nth(index)
                     .is_some()
             });
             let settings = (if has_stack_system {
-                particle_system_for_index(doc, emitter_id, system_index)?.1
+                particle_system_for_index(doc, emitter_id, system_index, gate)?.1
             } else {
                 node.properties
                     .get("physics_particle_emitter")
@@ -3306,6 +3627,7 @@ fn render_simulated_particles(
                 .and_then(serde_json::Value::as_f64)
                 .filter(|value| value.is_finite() && *value > 0.0)
                 .unwrap_or(0.1);
+            adaptive_normals.remove(emitter_id);
             for particle in visible_states {
                 let position = DVec3::from_array(particle.position);
                 let world_transform = if let Some(object_world) = object_world {
@@ -3345,8 +3667,13 @@ fn render_simulated_particles(
     Ok(())
 }
 
-fn has_stack_modifier(node: &Node, modifier_type: &str) -> bool {
-    node.modifiers
+fn has_stack_modifier(
+    gate: ModifierGate<'_>,
+    node_id: &Id,
+    node: &Node,
+    modifier_type: &str,
+) -> bool {
+    gate.stack_modifiers(node_id, &node.modifiers)
         .iter()
         .any(|modifier| modifier.modifier_type == modifier_type)
 }
@@ -3379,7 +3706,7 @@ fn apply_stack_physics_modifier(
             .nodes
             .get(node_id)
             .into_iter()
-            .flat_map(|node| node.modifiers.iter())
+            .flat_map(|node| gate.stack_modifiers(node_id, &node.modifiers).iter())
             .filter(|candidate| candidate.modifier_type == "particle_system")
             .position(|candidate| candidate.id == modifier.id)
             .and_then(|index| u32::try_from(index).ok())
@@ -3425,7 +3752,7 @@ fn apply_particle_instance_modifier(
         )
     })?;
     let index = particle_system_index(modifier)?;
-    let (system_modifier, _) = particle_system_for_index(doc, &object_id, index)?;
+    let (system_modifier, _) = particle_system_for_index(doc, &object_id, index, gate)?;
     let particle_states = if gate.is_active(&object_id, system_modifier) {
         select_particle_states(particles.get(&object_id), index)
     } else {
@@ -3468,7 +3795,7 @@ fn apply_explode_modifier(
     particles: &BTreeMap<Id, Vec<crate::sim::ParticleState>>,
 ) -> Result<()> {
     let index = particle_system_index(modifier)?;
-    let (system_modifier, _) = particle_system_for_index(doc, node_id, index)?;
+    let (system_modifier, _) = particle_system_for_index(doc, node_id, index, gate)?;
     let particle_states = if gate.is_active(node_id, system_modifier) {
         select_particle_states(particles.get(node_id), index)
     } else {
@@ -3513,6 +3840,7 @@ fn particle_system_for_index<'a>(
     doc: &'a SceneDoc,
     node_id: &Id,
     index: u32,
+    gate: ModifierGate<'_>,
 ) -> Result<(&'a Modifier, &'a serde_json::Value)> {
     let node = doc.nodes.get(node_id).ok_or_else(|| {
         PotError::new(
@@ -3520,8 +3848,8 @@ fn particle_system_for_index<'a>(
             format!("particle system object `{node_id}` was not found"),
         )
     })?;
-    let system_modifier = node
-        .modifiers
+    let system_modifier = gate
+        .stack_modifiers(node_id, &node.modifiers)
         .iter()
         .filter(|modifier| modifier.modifier_type == "particle_system")
         .nth(
@@ -3686,9 +4014,7 @@ fn apply_generic_scene_mesh_operand_modifier(
         }
         combined = Some(match combined {
             None => transformed,
-            Some(existing) => {
-                combine_scene_operand_meshes(&existing, &transformed, &modifier.modifier_type)?
-            }
+            Some(existing) => combine_scene_operand_meshes(&existing, &transformed)?,
         });
     }
     let mut resolved = modifier.clone();
@@ -3704,11 +4030,7 @@ fn apply_generic_scene_mesh_operand_modifier(
     let operand = serde_json::to_value(operand).map_err(|error| {
         PotError::invalid_argument(format!("modifier operand serialization failed: {error}"))
     })?;
-    if matches!(modifier.modifier_type.as_str(), "shrinkwrap" | "curve") {
-        resolved.runtime.target_mesh = Some(operand);
-    } else {
-        resolved.runtime.operand_mesh = Some(operand);
-    }
+    resolved.runtime.target_mesh = Some(operand);
     *mesh = crate::geom::modifiers::evaluate_modifiers(mesh, &[resolved])?;
     Ok(())
 }
@@ -3729,10 +4051,7 @@ pub(crate) fn apply_scene_operand_modifier(
     if modifier.modifier_type == "hook" {
         return apply_scene_hook_modifier(mesh, modifier, subject_id, doc, world_matrices);
     }
-    if modifier.modifier_type == "boolean"
-        && crate::geom::modifiers::BooleanSettings::parse(modifier)?.solver
-            != crate::geom::modifiers::BooleanSolver::Float
-    {
+    if modifier.modifier_type == "boolean" {
         *material_slots = apply_boolean_operands_modifier(
             mesh,
             modifier,
@@ -3745,16 +4064,8 @@ pub(crate) fn apply_scene_operand_modifier(
         )?;
         return Ok(());
     }
-    // Blender's FLOAT Boolean never takes its own object as an operand: a self operand leaves the subject as it is.
-    if modifier.modifier_type == "boolean"
-        && modifier.params.get("object").and_then(Value::as_str) == Some(subject_id.as_str())
-    {
-        return Ok(());
-    }
-    if matches!(
-        modifier.modifier_type.as_str(),
-        "boolean" | "shrinkwrap" | "curve"
-    ) && !modifier.params.contains_key("collection")
+    if matches!(modifier.modifier_type.as_str(), "shrinkwrap" | "curve")
+        && !modifier.params.contains_key("collection")
     {
         return apply_generic_scene_mesh_operand_modifier(
             mesh,
@@ -3816,10 +4127,6 @@ pub(crate) fn apply_scene_operand_modifier(
             &mut BTreeSet::new(),
             &mut object_ids,
         )?;
-    }
-    if modifier.modifier_type == "boolean" && object_ids.remove(subject_id) && object_ids.is_empty()
-    {
-        return Ok(());
     }
     if object_ids.is_empty() {
         return Err(PotError::with_details(
@@ -3914,9 +4221,7 @@ pub(crate) fn apply_scene_operand_modifier(
         }
         combined = Some(match combined {
             None => operand,
-            Some(existing) => {
-                combine_scene_operand_meshes(&existing, &operand, &modifier.modifier_type)?
-            }
+            Some(existing) => combine_scene_operand_meshes(&existing, &operand)?,
         });
     }
     let mut resolved = modifier.clone();
@@ -3928,11 +4233,7 @@ pub(crate) fn apply_scene_operand_modifier(
     let operand = serde_json::to_value(operand).map_err(|error| {
         PotError::invalid_argument(format!("modifier operand serialization failed: {error}"))
     })?;
-    if matches!(modifier.modifier_type.as_str(), "shrinkwrap" | "curve") {
-        resolved.runtime.target_mesh = Some(operand);
-    } else {
-        resolved.runtime.operand_mesh = Some(operand);
-    }
+    resolved.runtime.target_mesh = Some(operand);
     *mesh = crate::geom::modifiers::evaluate_modifiers(mesh, &[resolved])?;
     Ok(())
 }
@@ -4153,19 +4454,28 @@ fn world_matrix_f32(matrix: DMat4) -> glam::Mat4 {
     glam::Mat4::from_cols_array(&matrix.to_cols_array().map(|value| value as f32))
 }
 
+type BooleanOperandParts<'d> = (
+    crate::geom::boolean::BooleanOperand,
+    Vec<Option<Id>>,
+    Vec<Option<Id>>,
+    &'d [VertexGroup],
+);
+
 /// One Boolean operand object: its mesh (the evaluated mesh when present, else the data mesh with
 /// its vertex groups) and its transform into the subject's space: Blender's f32 product from
-/// `geom::blender_matrix` when it applies, else the f64 fallback. Also returns its material slots.
-fn boolean_operand(
+/// `geom::blender_matrix` when it applies, else the f64 fallback. Also returns its effective and
+/// mesh-level material slots, and its DATA vertex groups.
+fn boolean_operand<'d>(
     modifier: &Modifier,
-    doc: &SceneDoc,
+    doc: &'d SceneDoc,
     object_id: &Id,
     subject_inverse: glam::Mat4,
     subject_id: &Id,
+    subject_negative: bool,
     world_matrices: &BTreeMap<Id, DMat4>,
     evaluated_meshes: &BTreeMap<Id, Mesh>,
     evaluated_nodes: &BTreeMap<Id, EvaluatedNode>,
-) -> Result<(crate::geom::boolean::BooleanOperand, Vec<Option<Id>>)> {
+) -> Result<BooleanOperandParts<'d>> {
     let object = doc.nodes.get(object_id).ok_or_else(|| {
         PotError::with_details(
             ErrorCode::TargetNotFound,
@@ -4227,24 +4537,63 @@ fn boolean_operand(
     let operand = crate::geom::boolean::BooleanOperand {
         mesh,
         to_subject,
+        float_flip: Some(
+            subject_negative != crate::geom::blender_matrix::is_negative_m4(object_world),
+        ),
         material_remap: Vec::new(),
     };
-    // An evaluated operand contributes its evaluated table (after its own modifiers, e.g. a TRANSFER
-    // pool); an operand without one contributes its effective authoring slots.
-    let slots = match evaluated_meshes.get(object_id) {
-        Some(_) => evaluated_nodes.get(object_id).map_or_else(
-            || effective_material_slots(object, &data.materials),
-            |node| node.materials.clone(),
+    // An evaluated operand contributes its evaluated tables (after its own modifiers, e.g. a TRANSFER
+    // pool). `slots` are effective, which its face material indices resolve through (remap); `mesh_slots`
+    // is its mesh array, which a quick UNION copies. An operand without an evaluated mesh contributes
+    // its authoring tables.
+    let (slots, mesh_slots) = match evaluated_nodes.get(object_id) {
+        Some(node) if evaluated_meshes.contains_key(object_id) => {
+            (node.materials.clone(), node.mesh_materials.clone())
+        }
+        _ => (
+            effective_material_slots(object, &data.materials),
+            data.materials.clone(),
         ),
-        None => effective_material_slots(object, &data.materials),
     };
-    Ok((operand, slots))
+    Ok((operand, slots, mesh_slots, data.vertex_groups.as_slice()))
 }
 
-/// The Boolean operands of an EXACT (or MANIFOLD, refused by the modifier) solver. The subject is
-/// operand 0 and is not listed; each operand object keeps its own mesh and transform, and the
-/// modifier combines them in one N-ary call, so a collection is never folded pairwise. Returns the
-/// output material slots: the subject's own slots for INDEX, or the pool for TRANSFER.
+/// Re-keys an operand's vertex-group weights from the operand's group names to the subject's, by
+/// group position. Operand groups without a subject counterpart are dropped.
+fn remap_float_operand_vertex_groups(
+    mesh: &mut Mesh,
+    operand_groups: &[VertexGroup],
+    subject_groups: &[VertexGroup],
+) {
+    let Some(by_name) = mesh
+        .attributes
+        .get_mut("vertex_groups")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    let mut source = std::mem::take(by_name);
+    let mut remapped = Map::new();
+    for (index, operand_group) in operand_groups.iter().enumerate() {
+        let Some(subject_group) = subject_groups.get(index) else {
+            break;
+        };
+        if let Some(weights) = source.remove(&operand_group.name) {
+            remapped.insert(subject_group.name.clone(), weights);
+        }
+    }
+    *by_name = remapped;
+}
+
+/// The Boolean operands of one modifier in Blender's order. The subject is operand 0 and is not
+/// listed; each operand object keeps its own mesh and transform, and the modifier combines them in
+/// one N-ary call, so a collection is never folded pairwise. Returns the output material slots.
+///
+/// EXACT returns the subject's DATA slots for INDEX, or the TRANSFER pool. FLOAT always remaps by
+/// INDEX against the subject's effective (OBJECT-resolved) slots, and returns the subject's DATA
+/// slots unchanged: the effective table of the result is the one it remapped against. A FLOAT
+/// object shortcut that adopts the operand's mesh returns the operand's effective slots, which its
+/// face indices refer to.
 fn apply_boolean_operands_modifier(
     mesh: &mut Mesh,
     modifier: &Modifier,
@@ -4255,13 +4604,20 @@ fn apply_boolean_operands_modifier(
     evaluated_nodes: &BTreeMap<Id, EvaluatedNode>,
     subject_slots: &[Option<Id>],
 ) -> Result<Vec<Option<Id>>> {
+    use crate::geom::modifiers::{BooleanOperandType, BooleanSolver};
+
     let settings = crate::geom::modifiers::BooleanSettings::parse(modifier)?;
+    let float = settings.solver == BooleanSolver::Float;
+    crate::geom::modifiers::validate_boolean_float_collection(modifier, settings, false)?;
     let object_ids = boolean_operand_object_ids(modifier, doc, settings.operand_type)?;
+    crate::geom::modifiers::validate_boolean_float_collection(
+        modifier,
+        settings,
+        object_ids.is_empty(),
+    )?;
     // Blender `non_float_boolean_mesh` returns the mesh unchanged for an OBJECT operand that is
     // unset (MOD_boolean.cc:406), so neither geometry nor material slots change.
-    if settings.operand_type == crate::geom::modifiers::BooleanOperandType::Object
-        && object_ids.is_empty()
-    {
+    if settings.operand_type == BooleanOperandType::Object && object_ids.is_empty() {
         return Ok(subject_slots.to_vec());
     }
     let subject_world = world_matrices.get(subject_id).copied().ok_or_else(|| {
@@ -4277,37 +4633,88 @@ fn apply_boolean_operands_modifier(
             "modifier subject transform must be invertible",
         ));
     }
+    let subject_node = doc.nodes.get(subject_id).ok_or_else(|| {
+        PotError::new(ErrorCode::InternalError, "modifier subject node is missing")
+    })?;
+    let subject_negative = crate::geom::blender_matrix::is_negative_m4(subject_world);
+    let subject_groups = subject_node
+        .data
+        .as_ref()
+        .and_then(|data_id| doc.data_blocks.get(data_id))
+        .map_or(&[][..], |data| data.vertex_groups.as_slice());
     let mut operands = Vec::new();
     let mut operand_slots = Vec::new();
+    let mut operand_mesh_slots = Vec::new();
     for object_id in object_ids
         .iter()
         .filter(|object_id| *object_id != subject_id)
     {
-        let (operand, slots) = boolean_operand(
+        let (mut operand, slots, mesh_slots, operand_groups) = boolean_operand(
             modifier,
             doc,
             object_id,
             subject_inverse,
             subject_id,
+            subject_negative,
             world_matrices,
             evaluated_meshes,
             evaluated_nodes,
         )?;
+        if float {
+            remap_float_operand_vertex_groups(&mut operand.mesh, operand_groups, subject_groups);
+        }
         operands.push(operand);
         operand_slots.push(slots);
+        operand_mesh_slots.push(mesh_slots);
     }
+    // FLOAT leaves the mesh unchanged when the subject is the only member of a collection.
+    if float && settings.operand_type == BooleanOperandType::Collection && operands.is_empty() {
+        return Ok(subject_slots.to_vec());
+    }
+    if float
+        && settings.operand_type == BooleanOperandType::Object
+        && let [operand] = operands.as_slice()
+        && let Some(quick) =
+            crate::geom::boolean::float_object_quick_mesh(mesh, operand, settings.operation)
+    {
+        return Ok(match quick {
+            crate::geom::boolean::FloatObjectQuickMesh::Subject => subject_slots.to_vec(),
+            crate::geom::boolean::FloatObjectQuickMesh::Empty => {
+                *mesh = Mesh::new();
+                Vec::new()
+            }
+            crate::geom::boolean::FloatObjectQuickMesh::Operand(result) => {
+                *mesh = result;
+                // Blender copies the operand's mesh, so its own material array (not its effective
+                // OBJECT-resolved table) becomes the result's.
+                operand_mesh_slots.first().cloned().unwrap_or_default()
+            }
+        });
+    }
+    let material_mode = if float {
+        crate::geom::boolean::MaterialMode::Index
+    } else {
+        settings.material_mode
+    };
+    let effective_subject;
+    let subject_table = if float {
+        effective_subject = effective_material_slots(subject_node, subject_slots);
+        effective_subject.as_slice()
+    } else {
+        subject_slots
+    };
     // Blender `non_float_boolean_mesh` (source/blender/modifiers/intern/MOD_boolean.cc, v5.2.2):
     // the TRANSFER pool starts from the subject mesh's own material array (`mesh->mat`, the DATA
     // slots, here `subject_slots`), and each operand's slots come from `get_material_remap_transfer`,
     // which reads `BKE_object_material_get_eval` (blenkernel/intern/material.cc:772), i.e. the
     // effective slots `operand_slots` holds. The subject keeps its own indices in both modes.
-    let subject_refs: Vec<Option<&Id>> = subject_slots.iter().map(Option::as_ref).collect();
+    let subject_refs: Vec<Option<&Id>> = subject_table.iter().map(Option::as_ref).collect();
     let operand_refs: Vec<Vec<Option<&Id>>> = operand_slots
         .iter()
         .map(|slots| slots.iter().map(Option::as_ref).collect())
         .collect();
     let (remaps, pool) =
-        crate::geom::boolean::material_remaps(settings.material_mode, &subject_refs, &operand_refs);
+        crate::geom::boolean::material_remaps(material_mode, &subject_refs, &operand_refs);
     for (operand, remap) in operands.iter_mut().zip(remaps.into_iter().skip(1)) {
         operand.material_remap = remap;
     }
@@ -4317,14 +4724,10 @@ fn apply_boolean_operands_modifier(
     }
     resolved.runtime.boolean_operands = operands;
     *mesh = crate::geom::modifiers::evaluate_modifiers(mesh, &[resolved])?;
-    Ok(pool)
+    Ok(if float { subject_slots.to_vec() } else { pool })
 }
 
-fn combine_scene_operand_meshes(first: &Mesh, second: &Mesh, modifier_type: &str) -> Result<Mesh> {
-    // shortcut: FLOAT folds collection members pairwise until PR17b; EXACT never reaches here.
-    if modifier_type == "boolean" {
-        return crate::geom::boolean::boolean_mesh(first, second, "UNION");
-    }
+fn combine_scene_operand_meshes(first: &Mesh, second: &Mesh) -> Result<Mesh> {
     let mut result = Mesh::new();
     for source in [first, second] {
         let mut vertex_ids = std::collections::HashMap::with_capacity(source.vertices.len());
@@ -4805,6 +5208,7 @@ struct CollectionMember<'a> {
     mesh: Cow<'a, Mesh>,
     matrix: DMat4,
     slots: Vec<SlotBinding>,
+    adaptive_normals: Option<Cow<'a, [Option<DVec3>]>>,
     uv_names: Vec<String>,
     uv_coverage: Vec<u8>,
     color_names: Vec<String>,
@@ -4816,6 +5220,7 @@ struct CollectionEvaluation {
     paths: Vec<Vec<Id>>,
     bindings: Vec<SlotBinding>,
     uv_coverage: Vec<u8>,
+    adaptive_normals: Option<Vec<Option<DVec3>>>,
 }
 
 struct JoinedMemberBindings {
@@ -4998,12 +5403,13 @@ fn remap_slot_binding(
 }
 
 /// Joins a collection instance's members and nested instances into one mesh.
-fn evaluate_collection_instance(
+fn evaluate_collection_instance<'a>(
     doc: &SceneDoc,
     instance_id: &Id,
     matrices: &BTreeMap<Id, DMat4>,
-    meshes: &BTreeMap<Id, Mesh>,
+    meshes: &'a BTreeMap<Id, Mesh>,
     nodes: &BTreeMap<Id, EvaluatedNode>,
+    adaptive_normals: &'a BTreeMap<Id, Vec<Option<DVec3>>>,
     active_instances: &mut BTreeSet<Id>,
 ) -> Result<CollectionEvaluation> {
     let instance_node = doc.nodes.get(instance_id).ok_or_else(|| {
@@ -5033,6 +5439,7 @@ fn evaluate_collection_instance(
         &target,
         matrices,
         meshes,
+        adaptive_normals,
         nodes,
         active_instances,
         &mut BTreeSet::new(),
@@ -5057,6 +5464,7 @@ fn evaluate_collection_instance(
             matrix: member.matrix,
             material_offset,
             slot_count,
+            adaptive_normals: member.adaptive_normals,
         });
         member_bindings.push(JoinedMemberBindings {
             slots: member.slots,
@@ -5072,7 +5480,13 @@ fn evaluate_collection_instance(
             )
         })?;
     }
-    let mesh = concatenate(parts).map_err(|error| instance_join_error(error, instance_id))?;
+    let include_normals = parts.iter().any(|part| part.adaptive_normals.is_some());
+    let (mesh, adaptive_normals) = if include_normals {
+        concatenate_with_normals(parts)
+    } else {
+        concatenate(parts).map(|mesh| (mesh, None))
+    }
+    .map_err(|error| instance_join_error(error, instance_id))?;
     let joined_uv_names = uv_layers::read_layers(&mesh)
         .into_iter()
         .map(|layer| layer.name)
@@ -5121,6 +5535,7 @@ fn evaluate_collection_instance(
         paths,
         bindings,
         uv_coverage,
+        adaptive_normals,
     })
 }
 
@@ -5153,6 +5568,7 @@ fn append_collection_geometry<'a>(
     collection_id: &Id,
     matrices: &BTreeMap<Id, DMat4>,
     meshes: &'a BTreeMap<Id, Mesh>,
+    adaptive_normals: &'a BTreeMap<Id, Vec<Option<DVec3>>>,
     nodes: &BTreeMap<Id, EvaluatedNode>,
     active_instances: &mut BTreeSet<Id>,
     visited_collections: &mut BTreeSet<Id>,
@@ -5196,6 +5612,7 @@ fn append_collection_geometry<'a>(
                 matrices,
                 meshes,
                 nodes,
+                adaptive_normals,
                 active_instances,
             )?;
             let uv_names = uv_layers::read_layers(&nested.mesh)
@@ -5207,6 +5624,7 @@ fn append_collection_geometry<'a>(
                 Cow::Owned(nested.mesh),
                 nested.paths,
                 nested.bindings,
+                nested.adaptive_normals.map(Cow::Owned),
                 uv_names,
                 nested.uv_coverage,
                 color_names,
@@ -5239,13 +5657,24 @@ fn append_collection_geometry<'a>(
                     Cow::Borrowed(source_mesh),
                     vec![vec![object_id.clone()]],
                     slots,
+                    adaptive_normals
+                        .get(object_id)
+                        .map(|normals| Cow::Borrowed(normals.as_slice())),
                     uv_names,
                     uv_coverage,
                     color_names,
                 )
             })
         };
-        let Some((nested_mesh, nested_paths, slots, uv_names, uv_coverage, color_names)) = member
+        let Some((
+            nested_mesh,
+            nested_paths,
+            slots,
+            member_normals,
+            uv_names,
+            uv_coverage,
+            color_names,
+        )) = member
         else {
             continue;
         };
@@ -5260,6 +5689,7 @@ fn append_collection_geometry<'a>(
                 mesh: nested_mesh,
                 matrix: source_matrix,
                 slots,
+                adaptive_normals: member_normals,
                 uv_names,
                 uv_coverage,
                 color_names,
@@ -5279,6 +5709,7 @@ fn append_collection_geometry<'a>(
             child_id,
             matrices,
             meshes,
+            adaptive_normals,
             nodes,
             active_instances,
             visited_collections,
@@ -5653,8 +6084,10 @@ mod tests {
                 purpose: super::EvaluationPurpose::Preview,
                 project_root: None,
                 cache_directory: None,
+                material_slot_count: None,
             },
             suppressed: &suppressed,
+            modifier_prefix: None,
         };
         let evaluated_nodes = std::collections::BTreeSet::from([emitter_id.clone()]);
         let Err(error) = super::render_simulated_particles(
@@ -5665,6 +6098,7 @@ mod tests {
             &mut std::collections::BTreeMap::new(),
             &mut std::collections::BTreeMap::new(),
             &evaluated_nodes,
+            &mut std::collections::BTreeMap::new(),
         ) else {
             return Err("combined visible systems must exceed the per-emitter limit");
         };
@@ -6221,6 +6655,7 @@ mod tests {
             &outer_instance_id,
             &matrices,
             &meshes,
+            &BTreeMap::new(),
             &BTreeMap::new(),
             &mut BTreeSet::new(),
         )

@@ -1,11 +1,16 @@
 pub mod raster;
 
 mod bvh;
+mod light_model;
 mod path;
 mod pick;
 mod preview;
+mod principled_bsdf;
+mod principled_tables;
+mod principled_tables_data;
 mod scene;
 mod sequence;
+mod studio;
 
 pub use pick::pick;
 pub use preview::{PreviewRequest, render_previews};
@@ -36,7 +41,7 @@ mod tests {
             };
             let ray = ray_for_pixel(&camera, 128, 128, x, y);
             prop_assert!(ray.is_ok());
-            let Ok((origin, direction)) = ray else {
+            let Ok(Some((origin, direction))) = ray else {
                 return Ok(());
             };
             let forward = (camera.target - camera.position).normalize();

@@ -23,8 +23,10 @@ use crate::{
     },
 };
 
-use super::gltf::resolve_material_surfaces;
-use super::gltf::{TextureExport, VrmWriterMappings, unsupported_export};
+use super::gltf::{
+    TextureExport, VrmWriterMappings, resolve_material_surfaces,
+    resolve_material_surfaces_with_snapshot, unsupported_export,
+};
 use super::material_surface::{ResolvedSurface, reference_sampled};
 
 pub fn export(
@@ -134,7 +136,7 @@ fn validate_output_with_frames(
     snapshot: &crate::eval::Snapshot,
     version: AvatarVersion,
 ) -> Result<super::gltf::VrmFrameMaps> {
-    let surfaces = resolve_material_surfaces(doc)?;
+    let surfaces = resolve_material_surfaces_with_snapshot(doc, snapshot)?;
     validate_settings_with(doc, version, &surfaces)?;
     let avatar = required_avatar(doc)?;
     let frames = super::gltf::vrm_frame_maps(doc, snapshot, avatar, version)?;
@@ -1947,6 +1949,7 @@ fn vrm0_meta(
             image: thumbnail.clone(),
             uv_layer: None,
             interpolation: ImageInterpolation::Linear,
+            extension: crate::image::ImageExtension::Repeat,
         };
         let index = texture_export.sampled_index(
             &reference_sampled(&texture),

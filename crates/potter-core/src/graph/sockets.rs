@@ -367,6 +367,7 @@ pub(super) fn node_sockets(group: &NodeGroup, node_id: &Id) -> Option<SocketPair
                 ("Color", "color"),
                 ("Density", "float"),
                 ("Anisotropy", "float"),
+                ("Absorption Color", "color"),
                 ("Emission Color", "color"),
                 ("Emission Strength", "float"),
             ]),

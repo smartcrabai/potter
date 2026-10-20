@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, BTreeSet},
+};
 
 use glam::{DMat3, DMat4, DQuat, DVec3};
 use serde_json::{Map, Value, json};
@@ -576,6 +579,8 @@ pub fn displace_volume(
 struct VolumeDisplacement<'a> {
     texture_type: &'a str,
     image: Option<&'a ImageData>,
+    /// Straight colour of `image`, converted once here rather than for every sampled voxel.
+    image_pixels: Option<Cow<'a, [[f64; 4]]>>,
     mapping: DMat4,
     strength: f64,
     mid_level: [f64; 3],
@@ -632,6 +637,7 @@ impl<'a> VolumeDisplacement<'a> {
         Ok(Self {
             texture_type,
             image,
+            image_pixels: image.map(ImageData::straight_pixels),
             mapping,
             strength,
             mid_level: vector_param("volume_displace", params, "texture_mid_level")?,
@@ -650,13 +656,17 @@ impl<'a> VolumeDisplacement<'a> {
                 let image = self
                     .image
                     .ok_or_else(|| invalid("image texture source disappeared"))?;
+                let pixels = self
+                    .image_pixels
+                    .as_deref()
+                    .ok_or_else(|| invalid("image texture source disappeared"))?;
                 // Blender's flat Image Texture projection maps object coordinates from
                 // [-1, 1] to UVs and repeats outside the unit square.
                 let uv = [
                     (texture_position.x * 0.5 + 0.5).rem_euclid(1.0),
                     (texture_position.y * 0.5 + 0.5).rem_euclid(1.0),
                 ];
-                let rgba = sample_repeated_image(image, uv)?;
+                let rgba = sample_repeated_image(image, pixels, uv)?;
                 [rgba[0], rgba[1], rgba[2]]
             }
             _ => {
@@ -673,7 +683,7 @@ impl<'a> VolumeDisplacement<'a> {
         ) * self.strength)
     }
 }
-fn sample_repeated_image(image: &ImageData, uv: [f64; 2]) -> Result<[f64; 4]> {
+fn sample_repeated_image(image: &ImageData, pixels: &[[f64; 4]], uv: [f64; 2]) -> Result<[f64; 4]> {
     let width = usize::try_from(image.width)
         .map_err(|_| limit("image texture width exceeds addressable memory"))?;
     let height = usize::try_from(image.height)
@@ -706,7 +716,7 @@ fn sample_repeated_image(image: &ImageData, uv: [f64; 2]) -> Result<[f64; 4]> {
             .map_err(|_| invalid("image texture x coordinate is invalid"))?;
         let y = usize::try_from(y.rem_euclid(height_i64))
             .map_err(|_| invalid("image texture y coordinate is invalid"))?;
-        return Ok(image.pixels[y * width + x]);
+        return Ok(pixels[y * width + x]);
     }
     let x = uv[0].rem_euclid(1.0) * width_f64 - 0.5;
     let y = uv[1].rem_euclid(1.0) * height_f64 - 0.5;
@@ -733,13 +743,13 @@ fn sample_repeated_image(image: &ImageData, uv: [f64; 2]) -> Result<[f64; 4]> {
     let fraction_x = x - x_floor;
     let fraction_y = y - y_floor;
     let top: [f64; 4] = std::array::from_fn(|channel| {
-        let first = image.pixels[y0 * width + x0][channel];
-        let second = image.pixels[y0 * width + x1][channel];
+        let first = pixels[y0 * width + x0][channel];
+        let second = pixels[y0 * width + x1][channel];
         first + (second - first) * fraction_x
     });
     let bottom: [f64; 4] = std::array::from_fn(|channel| {
-        let first = image.pixels[y1 * width + x0][channel];
-        let second = image.pixels[y1 * width + x1][channel];
+        let first = pixels[y1 * width + x0][channel];
+        let second = pixels[y1 * width + x1][channel];
         first + (second - first) * fraction_x
     });
     Ok(std::array::from_fn(|channel| {
@@ -1357,11 +1367,13 @@ mod tests {
         )?;
         assert_eq!(result.vertices.len(), mesh.vertices.len());
         assert_eq!(result.faces.len(), mesh.faces.len());
+        // Blender's plane vertices (`plane_size_2`: (-1,-1), (1,-1), (-1,1), (1,1)), rotated by the
+        // test's quaternion: local (x, y, 0) lands at world (2, y, x).
         let expected = [
             DVec3::new(2.0, -1.0, -1.0),
             DVec3::new(2.0, -1.0, 1.0),
-            DVec3::new(2.0, 1.0, 1.0),
             DVec3::new(2.0, 1.0, -1.0),
+            DVec3::new(2.0, 1.0, 1.0),
         ];
         for (vertex, expected) in result.vertices.iter().zip(expected) {
             assert!(
@@ -1448,11 +1460,15 @@ mod tests {
         );
 
         let image = crate::image::ImageData {
+            colour: crate::image::ColourCache::default(),
+            storage: crate::image::ImageStorage::default(),
             width: 1,
             height: 1,
             pixels: vec![[1.0, 0.5, 0.5, 1.0]],
             tiles: std::collections::BTreeMap::new(),
             interpolation: crate::image::ImageInterpolation::Linear,
+            srgb: false,
+            udim: false,
         };
         let displaced = displace_volume(
             &volume,
