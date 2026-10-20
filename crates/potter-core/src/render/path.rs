@@ -5,7 +5,7 @@ use glam::{DMat4, DVec3};
 use crate::{
     error::{ErrorCode, PotError, Result},
     eval::Snapshot,
-    geom::volume::{VolumeData, sample_density, sample_density_checked},
+    geom::volume::{VolumeData, sample_density_checked_with, sample_density_with},
     image::{ImageData, ImageInterpolation},
     model::{Id, LightType, SceneDoc},
     shader::{
@@ -90,6 +90,8 @@ struct VolumeInstance<'a> {
     extinction_scale: f64,
     /// Blender's `cycles.volume_sampling` of the volume's material.
     sampling: crate::model::VolumeSampling,
+    /// Blender's `cycles.volume_interpolation` of the volume's material.
+    interpolation: crate::model::VolumeInterpolation,
 }
 
 #[derive(Clone, Copy)]
@@ -2801,6 +2803,9 @@ fn collect_volumes<'a>(
             sampling: params.map_or(crate::model::VolumeSampling::default(), |params| {
                 params.volume_sampling
             }),
+            interpolation: params.map_or(crate::model::VolumeInterpolation::default(), |params| {
+                params.volume_interpolation
+            }),
         });
     }
     Ok(volumes)
@@ -3201,9 +3206,9 @@ fn trace_volume_segment(
 
 fn volume_density_at(instance: &VolumeInstance<'_>, world_position: DVec3) -> Result<f64> {
     let local_position = instance.world_to_local.transform_point3(world_position);
-    let density = sample_density(local_position, instance.volume);
+    let density = sample_density_with(local_position, instance.volume, instance.interpolation);
     if !density.is_finite() {
-        sample_density_checked(local_position, instance.volume)?;
+        sample_density_checked_with(local_position, instance.volume, instance.interpolation)?;
         return Err(PotError::new(
             ErrorCode::EvaluationFailed,
             "volume density is not finite",
@@ -3282,9 +3287,17 @@ fn march_volumes_with_budget(
                         break;
                     }
                     let local_position = local_origin + local_direction * distance;
-                    let density = sample_density(local_position, instance.volume);
+                    let density = sample_density_with(
+                        local_position,
+                        instance.volume,
+                        instance.interpolation,
+                    );
                     if !density.is_finite() {
-                        sample_density_checked(local_position, instance.volume)?;
+                        sample_density_checked_with(
+                            local_position,
+                            instance.volume,
+                            instance.interpolation,
+                        )?;
                         return Err(PotError::new(
                             ErrorCode::EvaluationFailed,
                             "volume density is not finite",
@@ -3314,9 +3327,14 @@ fn march_volumes_with_budget(
         for sample_index in 0..steps {
             let distance = entry + (sample_index as f64 + 0.5) * step;
             let local_position = local_origin + local_direction * distance;
-            let density = sample_density(local_position, instance.volume);
+            let density =
+                sample_density_with(local_position, instance.volume, instance.interpolation);
             if !density.is_finite() {
-                sample_density_checked(local_position, instance.volume)?;
+                sample_density_checked_with(
+                    local_position,
+                    instance.volume,
+                    instance.interpolation,
+                )?;
                 return Err(PotError::new(
                     ErrorCode::EvaluationFailed,
                     "volume density is not finite",
@@ -3534,6 +3552,7 @@ mod volume_extinction_tests {
             scattering: false,
             extinction_scale: 1.0,
             sampling: crate::model::VolumeSampling::MultipleImportance,
+            interpolation: crate::model::VolumeInterpolation::Linear,
         };
         let mut rng = Pcg32::for_sample(0, 0, 0, 0);
         let transmittance = march_volumes(

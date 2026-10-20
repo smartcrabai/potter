@@ -1491,6 +1491,20 @@ pub enum VolumeSampling {
 fn is_default_volume_sampling(value: &VolumeSampling) -> bool {
     *value == VolumeSampling::default()
 }
+
+/// Blender's `cycles.volume_interpolation` for a material: trilinear (Blender's default) or the cubic B-spline of
+/// Cycles' `kernel_image_interp_tricubic_nanovdb`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VolumeInterpolation {
+    #[default]
+    Linear,
+    Cubic,
+}
+
+fn is_default_volume_interpolation(value: &VolumeInterpolation) -> bool {
+    *value == VolumeInterpolation::default()
+}
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct World {
@@ -2400,6 +2414,9 @@ pub struct Material {
     /// Blender's `cycles.volume_sampling`: how a volume's direct light is sampled (Cycles' `volume_stack_sample_method`).
     #[serde(default, skip_serializing_if = "is_default_volume_sampling")]
     pub volume_sampling: VolumeSampling,
+    /// Blender's `cycles.volume_interpolation`: how a voxel volume's density is interpolated between its samples.
+    #[serde(default, skip_serializing_if = "is_default_volume_interpolation")]
+    pub volume_interpolation: VolumeInterpolation,
     /// Blender's viewport display values, which Solid shading reads. Set by `.blend` import; omitted when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub viewport_display: Option<ViewportDisplay>,
@@ -2430,6 +2447,7 @@ impl Default for Material {
             volume_color: default_volume_color(),
             volume_anisotropy: 0.0,
             volume_sampling: VolumeSampling::default(),
+            volume_interpolation: VolumeInterpolation::default(),
             viewport_display: None,
         }
     }

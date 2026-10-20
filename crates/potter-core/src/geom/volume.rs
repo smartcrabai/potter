@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     error::{ErrorCode, PotError, Result},
     geom::{Mesh, MeshError},
+    model::VolumeInterpolation,
 };
 
 use super::edge_key;
@@ -195,6 +196,16 @@ pub fn sample_density(position: DVec3, volume: &VolumeData) -> f64 {
 /// Returns `UnsupportedFeature` for preserve-only file inputs and `InvalidArgument`
 /// for malformed grids or sample positions.
 pub fn sample_density_checked(position: DVec3, volume: &VolumeData) -> Result<f64> {
+    sample_density_checked_with(position, volume, VolumeInterpolation::Linear)
+}
+
+/// The density at `position` with the material's interpolation, as [`sample_density_checked`] samples it with the
+/// trilinear default.
+pub fn sample_density_checked_with(
+    position: DVec3,
+    volume: &VolumeData,
+    interpolation: VolumeInterpolation,
+) -> Result<f64> {
     ensure_evaluable_source(volume)?;
     if !position.is_finite() {
         return Err(invalid_volume("sample position must be finite"));
@@ -207,7 +218,10 @@ pub fn sample_density_checked(position: DVec3, volume: &VolumeData) -> Result<f6
         let grid = decoded
             .density_grid()
             .ok_or_else(|| invalid_volume("VDB archive contains no density grid"))?;
-        return Ok(grid.sample_world(position));
+        return Ok(match interpolation {
+            VolumeInterpolation::Linear => grid.sample_world(position),
+            VolumeInterpolation::Cubic => grid.sample_world_cubic(position),
+        });
     }
     let grid = first_grid(volume)?;
     let values = validate_grid(grid)?;
@@ -223,6 +237,9 @@ pub fn sample_density_checked(position: DVec3, volume: &VolumeData) -> Result<f6
     );
     if coordinate.cmpgt(maximum).any() {
         return Ok(0.0);
+    }
+    if interpolation == VolumeInterpolation::Cubic {
+        return sample_inline_cubic(coordinate, grid, &values);
     }
 
     let lower = [
@@ -277,6 +294,71 @@ pub fn sample_density_checked(position: DVec3, volume: &VolumeData) -> Result<f6
         }
     }
     Ok(result)
+}
+
+/// Cycles' cubic B-spline weights for the fraction `t` of a cell, for the samples at offsets -1, 0, 1, 2
+/// (`fill_cubic_weights`, `intern/cycles/kernel/util/image_3d.h`). The weights are non-negative and sum to one.
+#[must_use]
+pub fn cubic_weights(t: f64) -> [f64; 4] {
+    [
+        ((-t / 6.0 + 0.5) * t - 0.5) * t + 1.0 / 6.0,
+        ((0.5 * t - 1.0) * t) * t + 2.0 / 3.0,
+        ((-0.5 * t + 0.5) * t + 0.5) * t + 1.0 / 6.0,
+        t * t * t / 6.0,
+    ]
+}
+
+/// The cubic B-spline sample of an inline grid at `coordinate` in index space, as Cycles' tricubic sampler reads it
+/// (`kernel_image_interp_tricubic_nanovdb`). Neighbours outside the grid are background, zero, as its inactive
+/// voxels are.
+fn sample_inline_cubic(
+    coordinate: DVec3,
+    grid: &VolumeGrid,
+    values: &GridSamples<'_>,
+) -> Result<f64> {
+    let lower = coordinate.floor();
+    let fraction = coordinate - lower;
+    let base = [lower.x as i64, lower.y as i64, lower.z as i64];
+    let weight_x = cubic_weights(fraction.x);
+    let weight_y = cubic_weights(fraction.y);
+    let weight_z = cubic_weights(fraction.z);
+    let mut result = 0.0;
+    for (k, wz) in weight_z.iter().enumerate() {
+        for (j, wy) in weight_y.iter().enumerate() {
+            for (i, wx) in weight_x.iter().enumerate() {
+                let x = base[0] + i as i64 - 1;
+                let y = base[1] + j as i64 - 1;
+                let z = base[2] + k as i64 - 1;
+                if x < 0
+                    || y < 0
+                    || z < 0
+                    || x >= i64::from(grid.dims[0])
+                    || y >= i64::from(grid.dims[1])
+                    || z >= i64::from(grid.dims[2])
+                {
+                    continue;
+                }
+                let index = (z as usize * grid.dims[1] as usize + y as usize)
+                    * grid.dims[0] as usize
+                    + x as usize;
+                let sample = values
+                    .get(index)
+                    .ok_or_else(|| invalid_volume("volume sample index is out of range"))?;
+                result += f64::from(sample) * wx * wy * wz;
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// The density with the material's interpolation, as a `NaN` where [`sample_density_checked_with`] errors.
+#[must_use]
+pub fn sample_density_with(
+    position: DVec3,
+    volume: &VolumeData,
+    interpolation: VolumeInterpolation,
+) -> f64 {
+    sample_density_checked_with(position, volume, interpolation).unwrap_or(f64::NAN)
 }
 
 /// Extract the zero/iso surface of the first scalar grid using marching tetrahedra.

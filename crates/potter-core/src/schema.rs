@@ -301,6 +301,7 @@ fn complete_scene_schema(root: &mut Value) {
     material["properties"]["displacement_method"] = json!({"enum":["bump","displacement"]});
     material["properties"]["volume_sampling"] =
         json!({"enum":["distance","equiangular","multiple_importance"]});
+    material["properties"]["volume_interpolation"] = json!({"enum":["linear","cubic"]});
     material["properties"]["displacement_scale"] = json!({"type":"number"});
     material["properties"]["displacement_midlevel"] =
         json!({"type":"number","minimum":0,"maximum":1});
@@ -914,6 +915,7 @@ fn operation_contract(name: &str) -> OperationContract {
                 "volume_color",
                 "volume_anisotropy",
                 "volume_sampling",
+                "volume_interpolation",
                 "displacement_scale",
                 "displacement_midlevel",
             ],
@@ -2064,6 +2066,7 @@ fn field_schema(operation: &str, field: &str) -> Value {
             }
             "displacement_method" => json!({"enum":["bump","displacement"]}),
             "volume_sampling" => json!({"enum":["distance","equiangular","multiple_importance"]}),
+            "volume_interpolation" => json!({"enum":["linear","cubic"]}),
             "volume_density" => json!({"type":"number","minimum":0}),
             "volume_color" => {
                 json!({"type":"array","items":{"type":"number","minimum":0},"minItems":3,"maxItems":3})
@@ -2518,6 +2521,7 @@ fn material_set_properties() -> Value {
         "normal_texture":nullable_texture_ref_schema(),
         "displacement_method":{"enum":["bump","displacement"]},
         "volume_sampling":{"enum":["distance","equiangular","multiple_importance"]},
+        "volume_interpolation":{"enum":["linear","cubic"]},
         "volume_density":{"type":"number","minimum":0},
         "volume_color":{"type":"array","items":{"type":"number","minimum":0},"minItems":3,"maxItems":3},
         "volume_anisotropy":{"type":"number","minimum":-0.999,"maximum":0.999},

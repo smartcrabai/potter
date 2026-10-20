@@ -2109,6 +2109,7 @@ def dump_scene(scene):
                 "seed": seed,
                 "max_bounces": int(getattr(getattr(scene, "cycles", None), "max_bounces", 4)),
                 "transparent_max_bounces": int(getattr(getattr(scene, "cycles", None), "transparent_max_bounces", 8)),
+                "volume_biased": bool(getattr(getattr(scene, "cycles", None), "volume_biased", False)),
                 "use_sequencer": bool(getattr(scene.render, "use_sequencer", False)),
                 "audio_codec": potter_audio_codec(getattr(getattr(scene.render, "ffmpeg", None),
                                                           "audio_codec", "PCM")),
@@ -5997,6 +5998,8 @@ def _material_field_values(material):
                             "MULTIPLE_IMPORTANCE": "multiple_importance"}.get(
             getattr(getattr(material, "cycles", None), "volume_sampling", "MULTIPLE_IMPORTANCE"),
             "multiple_importance"),
+        "volume_interpolation": {"LINEAR": "linear", "CUBIC": "cubic"}.get(
+            getattr(getattr(material, "cycles", None), "volume_interpolation", "LINEAR"), "linear"),
     }
     output = _material_output(material.node_tree) if material.node_tree is not None else None
     if output is None:
@@ -6763,6 +6766,8 @@ def export_doc(doc, target, pack, scene_hash, context):
         mat.displacement_method = "DISPLACEMENT" if item.get("displacement_method") == "displacement" else "BUMP"
         mat.cycles.volume_sampling = {"distance": "DISTANCE", "equiangular": "EQUIANGULAR"}.get(
             item.get("volume_sampling"), "MULTIPLE_IMPORTANCE")
+        mat.cycles.volume_interpolation = {"linear": "LINEAR", "cubic": "CUBIC"}.get(
+            item.get("volume_interpolation"), "LINEAR")
         set_id(mat, material_id)
         source = compatibility_block(doc, "materials", "Material", material_id)
         set_props(mat, source.get("custom_properties", {}))

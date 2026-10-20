@@ -32,7 +32,7 @@ use crate::{
         NlaStrip, NlaTrack, Node, ParentType, Profile, Registry, RenderSettings, RigidBody,
         RigidBodyShape, RigidBodyType, RigidBodyWorld, Scene, SceneDoc, ShapeKey, ShapeKeyData,
         SurfaceData, SurfacePoint, TextObjectData, TimelineMarker, Transform, UnitSettings,
-        VertexGroup, ViewLayer, ViewportDisplay, VolumeSampling, World,
+        VertexGroup, ViewLayer, ViewportDisplay, VolumeInterpolation, VolumeSampling, World,
     },
     sequencer::{
         EffectType as SequenceEffectType, RetimingKey, Strip as SequenceStrip, StripBlendType,
@@ -3348,6 +3348,7 @@ fn build_imported_graph(
                 volume_color: vec3_field(item, "volume_color", [0.5; 3]),
                 volume_anisotropy: number_field(item, "volume_anisotropy", 0.0),
                 volume_sampling: volume_sampling_field(name, item)?,
+                volume_interpolation: volume_interpolation_field(name, item)?,
                 ..Material::default()
             },
         );
@@ -6353,6 +6354,22 @@ fn volume_sampling_field(name: &str, item: &Value) -> Result<VolumeSampling> {
     }
 }
 
+/// Potter's volume interpolation from a bridge material (Blender's `cycles.volume_interpolation`). Absent means
+/// Blender's default, linear.
+fn volume_interpolation_field(name: &str, item: &Value) -> Result<VolumeInterpolation> {
+    match item
+        .get("volume_interpolation")
+        .and_then(Value::as_str)
+        .unwrap_or("linear")
+    {
+        "linear" => Ok(VolumeInterpolation::Linear),
+        "cubic" => Ok(VolumeInterpolation::Cubic),
+        other => Err(invalid_intermediate(&format!(
+            "material `{name}` has unknown volume_interpolation `{other}`"
+        ))),
+    }
+}
+
 fn number_field(value: &Value, key: &str, fallback: f64) -> f64 {
     value
         .get(key)
@@ -8436,6 +8453,11 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
         let on = |key: &str| shading[key].as_bool() == Some(true);
         let off = |key: &str| shading[key].as_bool() == Some(false);
         let unsupported = [
+            (
+                scene["render"]["volume_biased"].as_bool() == Some(true),
+                "blender.scene.volume_biased",
+                "Blender's biased volume rendering (ray marching, `volume_biased`) is not implemented; Potter renders the unbiased null-scattering result, which Blender's default renders, and ignores the step rate of its volume materials",
+            ),
             (
                 shading["light"] != "STUDIO",
                 "blender.scene.display_light",

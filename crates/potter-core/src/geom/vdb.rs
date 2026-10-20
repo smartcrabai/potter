@@ -177,6 +177,46 @@ impl VdbGrid {
         result
     }
 
+    /// Cubic B-spline sample of the grid in world coordinates, Cycles' tricubic interpolation over the four samples
+    /// per axis at offsets -1 to 2 (`kernel_image_interp_tricubic_nanovdb`). Inactive voxels are background.
+    #[must_use]
+    pub fn sample_world_cubic(&self, position: DVec3) -> f64 {
+        if !position.is_finite() {
+            return f64::from(self.tree.background);
+        }
+        let index = self.transform.world_to_index.transform_point3(position);
+        if !index.is_finite() {
+            return f64::from(self.tree.background);
+        }
+        let lower = index.floor();
+        if lower
+            .to_array()
+            .iter()
+            .any(|value| *value < f64::from(i32::MIN) + 1.0 || *value >= f64::from(i32::MAX) - 2.0)
+        {
+            return f64::from(self.tree.background);
+        }
+        let base = lower.as_ivec3();
+        let fraction = index - lower;
+        let weight_x = super::volume::cubic_weights(fraction.x);
+        let weight_y = super::volume::cubic_weights(fraction.y);
+        let weight_z = super::volume::cubic_weights(fraction.z);
+        let mut result = 0.0_f64;
+        for (k, wz) in weight_z.iter().enumerate() {
+            for (j, wy) in weight_y.iter().enumerate() {
+                for (i, wx) in weight_x.iter().enumerate() {
+                    let point = [
+                        base.x + i as i32 - 1,
+                        base.y + j as i32 - 1,
+                        base.z + k as i32 - 1,
+                    ];
+                    result += f64::from(self.sample_index(point)) * wx * wy * wz;
+                }
+            }
+        }
+        result
+    }
+
     /// Return the world-space AABB enclosing the active index-space bounds.
     #[must_use]
     pub fn active_bbox_world(&self) -> Option<(DVec3, DVec3)> {
