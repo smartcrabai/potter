@@ -947,7 +947,7 @@ fn trace_path(
         )?;
         if std::mem::take(&mut exit_pending) {
             // The exit of a Burley entry is a diffuse surface (`subsurface_shader_data_setup`), not its material.
-            surface.params = exit_params(surface.params);
+            surface.params = exit_params(&surface.params);
             surface.layers = layers(&surface.params, surface.normal, -direction);
         } else if diffuse_ancestor {
             // A Burley closure falls back to diffuse after a diffuse bounce (Cycles' `PATH_RAY_DIFFUSE_ANCESTOR`).

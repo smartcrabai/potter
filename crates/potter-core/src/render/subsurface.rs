@@ -24,7 +24,7 @@ const TRUNCATE_CDF: f64 = 0.996_379_009_370_832_8;
 
 /// The closure a Burley exit is shaded with (`subsurface_shader_data_setup`): a Lambert lobe of weight one, with no
 /// other closure, emission or transparency. The exit keeps the entry's normal and geometry only.
-pub(crate) fn exit_params(params: BsdfParams) -> BsdfParams {
+pub(crate) fn exit_params(params: &BsdfParams) -> BsdfParams {
     BsdfParams {
         base_color: [1.0; 4],
         metallic: 0.0,
@@ -45,7 +45,7 @@ pub(crate) fn exit_params(params: BsdfParams) -> BsdfParams {
         volume_scatter: [0.0; 3],
         volume_absorption: [0.0; 3],
         volume_emission: [0.0; 3],
-        ..params
+        ..*params
     }
 }
 
@@ -188,7 +188,12 @@ impl<T> ProbeHits<T> {
 
     /// Records a hit at distance `t` along the probe.
     pub(crate) fn record(&mut self, t: f64, item: T) {
-        if self.hits.iter().any(|(stored, _)| *stored == t) {
+        // Cycles' duplicate test is exact equality of the distance (`local_intersect_get_record_index`); bit equality is that test.
+        if self
+            .hits
+            .iter()
+            .any(|(stored, _)| stored.to_bits() == t.to_bits())
+        {
             return;
         }
         self.seen += 1;
@@ -286,7 +291,7 @@ mod tests {
         assert_eq!(channel, Some(2));
         assert_eq!(eval(radius, mask, 0.1).y, 0.0);
         assert!(
-            (pdf_mean(radius, mask, 0.1) - (pdf(0.5, 0.1) + pdf(0.25, 0.1)) / 2.0).abs() < 1.0e-12
+            (pdf_mean(radius, mask, 0.1) - pdf(0.5, 0.1).midpoint(pdf(0.25, 0.1))).abs() < 1.0e-12
         );
         assert_eq!(pick_channel([false; 3], 0.5), None);
     }

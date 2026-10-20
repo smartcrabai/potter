@@ -1470,6 +1470,13 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
 
     fn principled(&mut self, id: &Id) -> Result<BsdfParams> {
         let node = self.node(id)?;
+        // Blender's default is random walk; a node without the property (an authored graph) is that default.
+        let method_token = node
+            .properties
+            .get("subsurface_method")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("RANDOM_WALK")
+            .to_owned();
         if node
             .properties
             .get("potter_simple_material")
@@ -1513,12 +1520,7 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
             .vector_input(id, &["Subsurface Radius"], DVec3::new(1.0, 0.2, 0.1))?
             .to_array();
         params.subsurface_scale = self.scalar_input(id, &["Subsurface Scale"], 0.005)?;
-        // Blender's default is random walk; a node without the property (an authored graph) is that default.
-        let method = node
-            .properties
-            .get("subsurface_method")
-            .and_then(JsonValue::as_str)
-            .unwrap_or("RANDOM_WALK");
+        let method = method_token.as_str();
         params.subsurface_method = SubsurfaceMethod::parse(method)
             .ok_or_else(|| invalid(format!("unknown Principled subsurface method `{method}`")))?;
         params.subsurface_ior = self.scalar_input(id, &["Subsurface IOR"], 1.4)?;

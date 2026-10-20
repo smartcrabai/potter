@@ -12,7 +12,7 @@
 //! Blender's frame means (red) are: Burley 0.15974, no subsurface 0.19963, random walk 0.04077, random walk skin 0.19571,
 //! random walk legacy 0.17539. Burley against no subsurface differs by 0.0399 in red, and against random walk by 0.119.
 //! So a Burley lobe that is absent or wrongly scaled is detected at any noise this test can reach. The random walk
-//! methods are not evaluated yet: their cases report UNSUPPORTED_FEATURE and render without subsurface scattering, and
+//! methods are not evaluated yet: their cases report `UNSUPPORTED_FEATURE` and render without subsurface scattering, and
 //! they are not tested here.
 //!
 //! Cost: `SAMPLES` is a starting point. The lane measures the run time and Potter's seed spread, and the figures belong

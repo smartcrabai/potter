@@ -34,6 +34,7 @@ use super::principled_tables::{
     sheen_ltc,
 };
 use super::subsurface::{burley_active, burley_radius, channel_mask};
+use crate::shader::{BsdfParams, dielectric_f0};
 
 /// Roughness floor shared with the sampler; Cycles treats roughness below ~1e-5 as delta.
 const MIN_ROUGHNESS: f64 = 0.02;
@@ -382,7 +383,7 @@ pub(crate) struct Layers {
     pub(crate) view: DVec3,
     coat: Option<CoatLayer>,
     sheen: SheenLobe,
-    lower: DVec3,
+    pub(crate) lower: DVec3,
     glass: Option<GlassLobe>,
 }
 
