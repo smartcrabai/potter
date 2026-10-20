@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use glam::DVec3;
 
 use super::imesh::{Arena, NO_INDEX, Tri};
+use super::input::InputLoops;
 
 /// An output polygon: a region of one input face, bounded by input edges and cut segments.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -33,7 +34,7 @@ impl Poly {
 /// `tris` is the intersected triangle mesh in Blender's `tm_out` order. The result keeps Blender's
 /// order: input faces ascending, then the merge order inside each input face.
 #[must_use]
-pub(crate) fn polymesh_from_tris(arena: &Arena, tris: &[Tri]) -> Vec<Poly> {
+pub(crate) fn polymesh_from_tris(arena: &Arena, tris: &[Tri], loops: &InputLoops) -> Vec<Poly> {
     // Blender `face_output_tris`: group by input face, keeping triangle order within a group.
     let mut by_orig: BTreeMap<i32, Vec<Tri>> = BTreeMap::new();
     for tri in tris {
@@ -41,7 +42,7 @@ pub(crate) fn polymesh_from_tris(arena: &Arena, tris: &[Tri]) -> Vec<Poly> {
     }
     let mut polys = Vec::new();
     for group in by_orig.values() {
-        polys.extend(merge_tris_for_face(arena, group));
+        polys.extend(merge_tris_for_face(arena, group, loops));
     }
     dissolve_vertices(arena, polys)
 }
@@ -113,11 +114,11 @@ fn find_tris_common_edge(t1: &Tri, t2: &Tri) -> Option<(usize, usize)> {
 
 /// Blender's "quad with one diagonal remained unchanged" case of `merge_tris_for_face`.
 ///
-/// shortcut: Blender checks the candidate ring against the input face (`cyclic_equal`), which
-/// this API does not carry. All four boundary edges being input edges identifies the same quad,
-/// but the ring starts at the first triangle's corner rather than at the input face's start.
-/// Upgrade when output corner/UV attributes must match the input loop start exactly.
-fn recover_quad(tri1: &Tri, tri2: &Tri) -> Option<Poly> {
+/// Blender returns the input face itself when the two triangles rebuild it: the candidate ring must
+/// be a rotation of the input loop (`Face::cyclic_equal`, which never matches a reversal), and the
+/// output then starts where the input face starts. `input` is that loop (vertices and edge origins).
+/// Any other ring returns `None`, and the caller dissolves the triangles, as Blender does.
+fn recover_quad(tri1: &Tri, tri2: &Tri, input: Option<(&[u32], &[i32])>) -> Option<Poly> {
     let (i0, j) = find_tris_common_edge(tri1, tri2)?;
     if tri1.edge_orig[i0] != NO_INDEX {
         return None;
@@ -128,19 +129,28 @@ fn recover_quad(tri1: &Tri, tri2: &Tri) -> Option<Poly> {
     let j2 = (j + 2) % 3;
     // Ring: tri1[i1] -> tri1[i2] -> tri1[i0] -> tri2[j2]; its edges are tri1 edge i1, tri1 edge
     // i2, tri2 edge j1 and tri2 edge j2.
-    let edge_orig = vec![
+    let ring_edges = [
         tri1.edge_orig[i1],
         tri1.edge_orig[i2],
         tri2.edge_orig[j1],
         tri2.edge_orig[j2],
     ];
-    if edge_orig.contains(&NO_INDEX) {
+    if ring_edges.contains(&NO_INDEX) {
+        return None;
+    }
+    let ring = [tri1.v[i1], tri1.v[i2], tri1.v[i0], tri2.v[j2]];
+    let (in_verts, in_edges) = input?;
+    if in_verts.len() != 4 || in_edges.len() != 4 {
+        return None;
+    }
+    let rotation_of_input = (0..4).any(|r| (0..4).all(|k| ring[k] == in_verts[(k + r) % 4]));
+    if !rotation_of_input {
         return None;
     }
     Some(Poly {
-        verts: vec![tri1.v[i1], tri1.v[i2], tri1.v[i0], tri2.v[j2]],
+        verts: in_verts.to_vec(),
         orig: tri1.orig,
-        edge_orig,
+        edge_orig: in_edges.to_vec(),
     })
 }
 
@@ -279,6 +289,276 @@ fn splice_faces(fms: &mut FaceMergeState, me_index: usize, left: usize, right: u
     fms.edge[me_index].right_face = None;
 }
 
+/// libstdc++ `_S_threshold`: ranges up to this length are finished by insertion sort.
+const SORT_THRESHOLD: usize = 16;
+
+/// Sorts `a` as libstdc++'s `std::sort` does (GCC 14, `bits/stl_algo.h`, `bits/stl_heap.h`).
+/// Blender's `do_dissolve` uses `std::ranges::sort`, which is unstable; on Linux (Blender 5.2.2)
+/// that is this algorithm, so equal lengths keep Blender's order. `less(x, y)`: `x` sorts first.
+/// Verified against the real libstdc++ `std::ranges::sort`, including the heap fallback.
+fn libstdcxx_sort_by<T: Copy, F: Fn(T, T) -> bool>(a: &mut [T], less: &F) {
+    if a.is_empty() {
+        return;
+    }
+    let len = a.len();
+    introsort_loop(a, 0, len, 2 * lg(len), less);
+    final_insertion_sort(a, 0, len, less);
+}
+
+/// `__lg`: floor(log2(n)) for n >= 1.
+fn lg(n: usize) -> usize {
+    (usize::BITS - 1 - n.leading_zeros()) as usize
+}
+
+/// `__introsort_loop`: quicksort partitions until a range is at most `SORT_THRESHOLD` long, or
+/// falls back to a heap sort once `depth` runs out.
+fn introsort_loop<T: Copy, F: Fn(T, T) -> bool>(
+    a: &mut [T],
+    first: usize,
+    mut last: usize,
+    mut depth: usize,
+    less: &F,
+) {
+    while last - first > SORT_THRESHOLD {
+        if depth == 0 {
+            partial_sort(a, first, last, last, less);
+            return;
+        }
+        depth -= 1;
+        let cut = unguarded_partition_pivot(a, first, last, less);
+        introsort_loop(a, cut, last, depth, less);
+        last = cut;
+    }
+}
+
+/// `__unguarded_partition_pivot`: median-of-three pivot moved to `first`, then partition the rest.
+fn unguarded_partition_pivot<T: Copy, F: Fn(T, T) -> bool>(
+    a: &mut [T],
+    first: usize,
+    last: usize,
+    less: &F,
+) -> usize {
+    let mid = first + (last - first) / 2;
+    move_median_to_first(a, first, first + 1, mid, last - 1, less);
+    unguarded_partition(a, first + 1, last, first, less)
+}
+
+/// `__move_median_to_first`: swaps the median of `a[x]`, `a[y]`, `a[z]` into `a[result]`.
+fn move_median_to_first<T: Copy, F: Fn(T, T) -> bool>(
+    a: &mut [T],
+    result: usize,
+    x: usize,
+    y: usize,
+    z: usize,
+    less: &F,
+) {
+    let median = if less(a[x], a[y]) {
+        if less(a[y], a[z]) {
+            y
+        } else if less(a[x], a[z]) {
+            z
+        } else {
+            x
+        }
+    } else if less(a[x], a[z]) {
+        x
+    } else if less(a[y], a[z]) {
+        z
+    } else {
+        y
+    };
+    a.swap(result, median);
+}
+
+/// `__unguarded_partition`: Hoare-style partition of `[first, last)` around `a[pivot]`.
+fn unguarded_partition<T: Copy, F: Fn(T, T) -> bool>(
+    a: &mut [T],
+    mut first: usize,
+    mut last: usize,
+    pivot: usize,
+    less: &F,
+) -> usize {
+    loop {
+        while less(a[first], a[pivot]) {
+            first += 1;
+        }
+        last -= 1;
+        while less(a[pivot], a[last]) {
+            last -= 1;
+        }
+        if first >= last {
+            return first;
+        }
+        a.swap(first, last);
+        first += 1;
+    }
+}
+
+/// `__final_insertion_sort`.
+fn final_insertion_sort<T: Copy, F: Fn(T, T) -> bool>(
+    a: &mut [T],
+    first: usize,
+    last: usize,
+    less: &F,
+) {
+    if last - first > SORT_THRESHOLD {
+        insertion_sort(a, first, first + SORT_THRESHOLD, less);
+        unguarded_insertion_sort(a, first + SORT_THRESHOLD, last, less);
+    } else {
+        insertion_sort(a, first, last, less);
+    }
+}
+
+/// `__insertion_sort`.
+fn insertion_sort<T: Copy, F: Fn(T, T) -> bool>(a: &mut [T], first: usize, last: usize, less: &F) {
+    for i in first + 1..last {
+        if less(a[i], a[first]) {
+            let value = a[i];
+            a.copy_within(first..i, first + 1);
+            a[first] = value;
+        } else {
+            unguarded_linear_insert(a, i, less);
+        }
+    }
+}
+
+/// `__unguarded_insertion_sort`.
+fn unguarded_insertion_sort<T: Copy, F: Fn(T, T) -> bool>(
+    a: &mut [T],
+    first: usize,
+    last: usize,
+    less: &F,
+) {
+    for i in first..last {
+        unguarded_linear_insert(a, i, less);
+    }
+}
+
+/// `__unguarded_linear_insert`: libstdc++ relies on an element at or before `last` that stops the
+/// backward scan, so the scan never passes index 0.
+fn unguarded_linear_insert<T: Copy, F: Fn(T, T) -> bool>(a: &mut [T], mut last: usize, less: &F) {
+    let value = a[last];
+    let mut next = last - 1;
+    while less(value, a[next]) {
+        a[last] = a[next];
+        last = next;
+        next -= 1;
+    }
+    a[last] = value;
+}
+
+/// `__partial_sort`: the heap fallback used when `__introsort_loop` runs out of depth.
+fn partial_sort<T: Copy, F: Fn(T, T) -> bool>(
+    a: &mut [T],
+    first: usize,
+    middle: usize,
+    last: usize,
+    less: &F,
+) {
+    heap_select(a, first, middle, last, less);
+    sort_heap(a, first, middle, less);
+}
+
+/// `__heap_select`.
+fn heap_select<T: Copy, F: Fn(T, T) -> bool>(
+    a: &mut [T],
+    first: usize,
+    middle: usize,
+    last: usize,
+    less: &F,
+) {
+    make_heap(a, first, middle, less);
+    for i in middle..last {
+        if less(a[i], a[first]) {
+            pop_heap(a, first, middle, i, less);
+        }
+    }
+}
+
+/// `__make_heap`.
+fn make_heap<T: Copy, F: Fn(T, T) -> bool>(a: &mut [T], first: usize, last: usize, less: &F) {
+    if last - first < 2 {
+        return;
+    }
+    let len = last - first;
+    let mut parent = (len - 2) / 2;
+    loop {
+        let value = a[first + parent];
+        adjust_heap(a, first, parent, len, value, less);
+        if parent == 0 {
+            return;
+        }
+        parent -= 1;
+    }
+}
+
+/// `__adjust_heap`: sifts `value` down from `hole`, then pushes it back up.
+fn adjust_heap<T: Copy, F: Fn(T, T) -> bool>(
+    a: &mut [T],
+    first: usize,
+    mut hole: usize,
+    len: usize,
+    value: T,
+    less: &F,
+) {
+    let top = hole;
+    let mut second = hole;
+    while second < (len - 1) / 2 {
+        second = 2 * (second + 1);
+        if less(a[first + second], a[first + second - 1]) {
+            second -= 1;
+        }
+        a[first + hole] = a[first + second];
+        hole = second;
+    }
+    if len.is_multiple_of(2) && second == (len - 2) / 2 {
+        second = 2 * (second + 1);
+        a[first + hole] = a[first + second - 1];
+        hole = second - 1;
+    }
+    push_heap(a, first, hole, top, value, less);
+}
+
+/// `__push_heap`.
+fn push_heap<T: Copy, F: Fn(T, T) -> bool>(
+    a: &mut [T],
+    first: usize,
+    mut hole: usize,
+    top: usize,
+    value: T,
+    less: &F,
+) {
+    let parent_of = |index: usize| if index == 0 { 0 } else { (index - 1) / 2 };
+    let mut parent = parent_of(hole);
+    while hole > top && less(a[first + parent], value) {
+        a[first + hole] = a[first + parent];
+        hole = parent;
+        parent = parent_of(hole);
+    }
+    a[first + hole] = value;
+}
+
+/// `__pop_heap`: moves the top of the heap `[first, last)` to `a[result]`.
+fn pop_heap<T: Copy, F: Fn(T, T) -> bool>(
+    a: &mut [T],
+    first: usize,
+    last: usize,
+    result: usize,
+    less: &F,
+) {
+    let value = a[result];
+    a[result] = a[first];
+    adjust_heap(a, first, 0, last - first, value, less);
+}
+
+/// `__sort_heap`.
+fn sort_heap<T: Copy, F: Fn(T, T) -> bool>(a: &mut [T], first: usize, mut last: usize, less: &F) {
+    while last - first > 1 {
+        last -= 1;
+        pop_heap(a, first, last, last, less);
+    }
+}
+
 /// Blender `do_dissolve`: dissolves dissolvable edges, longest first, while the result stays a
 /// valid polygon set.
 fn do_dissolve(fms: &mut FaceMergeState) {
@@ -289,8 +569,11 @@ fn do_dissolve(fms: &mut FaceMergeState) {
         .filter(|(_, me)| me.dissolvable)
         .map(|(e, _)| e)
         .collect();
-    // Blender uses `std::ranges::sort`, which is unstable; equal lengths keep creation order here.
-    dissolve_edges.sort_by(|&a, &b| fms.edge[b].len_squared.total_cmp(&fms.edge[a].len_squared));
+    // Blender's `std::ranges::sort` is unstable; `libstdcxx_sort_by` reproduces its tie order
+    // for equal lengths on Linux (Blender 5.2.2).
+    libstdcxx_sort_by(&mut dissolve_edges, &|a: usize, b: usize| {
+        fms.edge[a].len_squared > fms.edge[b].len_squared
+    });
     for me_index in dissolve_edges {
         let me = fms.edge[me_index];
         let (Some(left), Some(right)) = (me.left_face, me.right_face) else {
@@ -306,14 +589,14 @@ fn do_dissolve(fms: &mut FaceMergeState) {
 /// Blender `merge_tris_for_face`: merges the triangles of one input face into output polygons.
 /// Triangles that face opposite to the first one are merged in a second pass (Blender tries both
 /// normal signs).
-fn merge_tris_for_face(arena: &Arena, tris: &[Tri]) -> Vec<Poly> {
+fn merge_tris_for_face(arena: &Arena, tris: &[Tri], loops: &InputLoops) -> Vec<Poly> {
     let Some(first) = tris.first() else {
         return Vec::new();
     };
     if let [tri] = tris {
         return vec![poly_from_tri(tri)];
     }
-    if let Some(poly) = same_side_quad(arena, tris) {
+    if let Some(poly) = same_side_quad(arena, tris, loops) {
         return vec![poly];
     }
     let first_normal = tri_normal(arena, first);
@@ -336,14 +619,20 @@ fn merge_tris_for_face(arena: &Arena, tris: &[Tri]) -> Vec<Poly> {
 }
 
 /// The two-triangle quad recovery, applied only when both triangles face the same way.
-fn same_side_quad(arena: &Arena, tris: &[Tri]) -> Option<Poly> {
+fn same_side_quad(arena: &Arena, tris: &[Tri], loops: &InputLoops) -> Option<Poly> {
     let [tri1, tri2] = tris else {
         return None;
     };
     if tri_normal(arena, tri1).dot(tri_normal(arena, tri2)) <= 0.0 {
         return None;
     }
-    recover_quad(tri1, tri2)
+    let input = usize::try_from(tri1.orig).ok().and_then(|face| {
+        Some((
+            loops.verts.get(face)?.as_slice(),
+            loops.edges.get(face)?.as_slice(),
+        ))
+    });
+    recover_quad(tri1, tri2, input)
 }
 
 /// Blender `approx_in_line`: whether `b` lies on the ray `a -> c` direction, to within 1e-4 in
@@ -460,13 +749,66 @@ mod tests {
             Tri::new([a, b, c], 0, [0, 1, NO_INDEX]),
             Tri::new([a, c, d], 0, [NO_INDEX, 2, 3]),
         ];
+        let loops = InputLoops {
+            verts: vec![vec![a, b, c, d]],
+            edges: vec![vec![0, 1, 2, 3]],
+        };
         assert_eq!(
-            polymesh_from_tris(&arena, &tris),
+            polymesh_from_tris(&arena, &tris, &loops),
             vec![Poly {
                 verts: vec![a, b, c, d],
                 orig: 0,
                 edge_orig: vec![0, 1, 2, 3],
             }]
+        );
+    }
+
+    /// The input loop starts at `c`, so the recovered quad starts there too (`cyclic_equal`).
+    #[test]
+    fn quad_recovery_returns_the_input_loop_start() {
+        let mut arena = Arena::new();
+        let a = vert(&mut arena, 0.0, 0.0, 0);
+        let b = vert(&mut arena, 2.0, 0.0, 1);
+        let c = vert(&mut arena, 2.0, 2.0, 2);
+        let d = vert(&mut arena, 0.0, 2.0, 3);
+        let tris = [
+            Tri::new([a, b, c], 0, [0, 1, NO_INDEX]),
+            Tri::new([a, c, d], 0, [NO_INDEX, 2, 3]),
+        ];
+        let loops = InputLoops {
+            verts: vec![vec![c, d, a, b]],
+            edges: vec![vec![2, 3, 0, 1]],
+        };
+        assert_eq!(
+            polymesh_from_tris(&arena, &tris, &loops),
+            vec![Poly {
+                verts: vec![c, d, a, b],
+                orig: 0,
+                edge_orig: vec![2, 3, 0, 1],
+            }]
+        );
+    }
+
+    /// A reversed input loop is not a rotation of the rebuilt quad, so the triangles are dissolved
+    /// exactly as when no input loop is known.
+    #[test]
+    fn reversed_input_loop_takes_the_dissolve_path() {
+        let mut arena = Arena::new();
+        let a = vert(&mut arena, 0.0, 0.0, 0);
+        let b = vert(&mut arena, 2.0, 0.0, 1);
+        let c = vert(&mut arena, 2.0, 2.0, 2);
+        let d = vert(&mut arena, 0.0, 2.0, 3);
+        let tris = [
+            Tri::new([a, b, c], 0, [0, 1, NO_INDEX]),
+            Tri::new([a, c, d], 0, [NO_INDEX, 2, 3]),
+        ];
+        let reversed = InputLoops {
+            verts: vec![vec![a, d, c, b]],
+            edges: vec![vec![3, 2, 1, 0]],
+        };
+        assert_eq!(
+            polymesh_from_tris(&arena, &tris, &reversed),
+            polymesh_from_tris(&arena, &tris, &InputLoops::default()),
         );
     }
 
@@ -488,7 +830,7 @@ mod tests {
         // order). O-C and O-D stay: removing O-D would repeat C in the merged face. The centre has
         // neighbours D and C, which are not collinear with it, so it survives.
         assert_eq!(
-            polymesh_from_tris(&arena, &tris),
+            polymesh_from_tris(&arena, &tris, &InputLoops::default()),
             vec![
                 Poly {
                     verts: vec![o, c, d],
@@ -518,7 +860,7 @@ mod tests {
             Tri::new([m, b, c], 0, [0, 1, NO_INDEX]),
         ];
         assert_eq!(
-            polymesh_from_tris(&arena, &tris),
+            polymesh_from_tris(&arena, &tris, &InputLoops::default()),
             vec![Poly {
                 verts: vec![b, c, d, a],
                 orig: 0,
@@ -541,7 +883,7 @@ mod tests {
             Tri::new([a, b, c], 0, [0, 1, NO_INDEX]),
         ];
         assert_eq!(
-            polymesh_from_tris(&arena, &tris),
+            polymesh_from_tris(&arena, &tris, &InputLoops::default()),
             vec![
                 Poly {
                     verts: vec![a, b, c],
@@ -582,7 +924,7 @@ mod tests {
                 is_intersect: [false, false, true],
             },
         ];
-        let polys = polymesh_from_tris(&arena, &tris);
+        let polys = polymesh_from_tris(&arena, &tris, &InputLoops::default());
         assert_eq!(
             polys,
             vec![

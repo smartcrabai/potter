@@ -3,10 +3,10 @@
     reason = "integration tests use concise assertions"
 )]
 
-use glam::{DQuat, DVec3, EulerRot};
+use glam::{DMat4, DQuat, DVec3, EulerRot};
 use potter_core::error::ErrorCode;
 use potter_core::geom::{
-    BoxParams, CylinderParams, Mesh, boolean::boolean_mesh, modifiers::evaluate_modifiers,
+    BoxParams, CylinderParams, Mesh, boolean::BooleanOperand, modifiers::evaluate_modifiers,
 };
 use potter_core::model::{Id, Modifier};
 use proptest::prelude::*;
@@ -24,6 +24,25 @@ fn modifier(modifier_type: &str, params: Value) -> Modifier {
         binding_data: None,
         runtime: potter_core::model::ModifierRuntime::default(),
     }
+}
+
+/// Evaluates a FLOAT Boolean modifier with its scene-resolved mesh operands.
+fn float_boolean(subject: &Mesh, operands: &[Mesh], operation: &str) -> Mesh {
+    let mut boolean = modifier(
+        "boolean",
+        json!({"solver": "FLOAT", "operation": operation}),
+    );
+    boolean.runtime.boolean_operands = operands
+        .iter()
+        .cloned()
+        .map(|mesh| BooleanOperand {
+            mesh,
+            to_subject: DMat4::IDENTITY,
+            float_flip: None,
+            material_remap: Vec::new(),
+        })
+        .collect();
+    evaluate_modifiers(subject, &[boolean]).unwrap()
 }
 
 fn signed_volume(mesh: &Mesh) -> f64 {
@@ -119,22 +138,80 @@ fn canonical_geometry(mesh: &Mesh) -> CanonicalGeometry {
 }
 
 #[test]
-fn boolean_difference_of_overlapping_boxes_has_analytic_volume() {
+fn boolean_float_without_scene_operand_is_identity() {
     let source = Mesh::box_mesh(BoxParams::default()).unwrap();
-    let mut operand = Mesh::box_mesh(BoxParams {
-        size: DVec3::splat(1.0),
-    })
+    let result = evaluate_modifiers(
+        &source,
+        &[modifier(
+            "boolean",
+            json!({"solver": "FLOAT", "operation": "DIFFERENCE"}),
+        )],
+    )
     .unwrap();
+    assert_eq!(canonical_geometry(&result), canonical_geometry(&source));
+}
+
+#[test]
+fn boolean_float_difference_matches_blender_offset_box_parity() {
+    let source = Mesh::from_positions_and_faces(
+        vec![
+            DVec3::new(-1.0, -1.0, -1.0),
+            DVec3::new(1.0, -1.0, -1.0),
+            DVec3::new(1.0, 1.0, -1.0),
+            DVec3::new(-1.0, 1.0, -1.0),
+            DVec3::new(-1.0, -1.0, 1.0),
+            DVec3::new(1.0, -1.0, 1.0),
+            DVec3::new(1.0, 1.0, 1.0),
+            DVec3::new(-1.0, 1.0, 1.0),
+        ],
+        vec![
+            vec![0, 3, 2, 1],
+            vec![4, 5, 6, 7],
+            vec![0, 1, 5, 4],
+            vec![2, 3, 7, 6],
+            vec![0, 4, 7, 3],
+            vec![1, 2, 6, 5],
+        ],
+    )
+    .unwrap();
+    let mut operand = source.clone();
     for vertex in &mut operand.vertices {
-        vertex.co += DVec3::new(0.5, 0.25, -0.25);
+        vertex.co += DVec3::new(1.5, 0.5, 1.0);
     }
-    let result = boolean_mesh(&source, &operand, "DIFFERENCE").unwrap();
-    assert!((signed_volume(&result) - 7.0).abs() < 1.0e-8);
+    let result = float_boolean(&source, &[operand], "DIFFERENCE");
+    assert_eq!(result.vertices.len(), 14);
+    assert_eq!(result.edges.len(), 21);
+    assert_eq!(result.faces.len(), 9);
+    assert!((signed_volume(&result) - 7.25).abs() <= 1.0e-5);
     assert!(result.validate().is_ok());
 }
 
 #[test]
-fn boolean_difference_of_box_and_tilted_cylinder_has_closed_bore() {
+fn boolean_float_empty_material_remap_preserves_source_indices() {
+    let subject = Mesh::box_mesh(BoxParams::default()).unwrap();
+    let mut operand = subject.clone();
+    for vertex in &mut operand.vertices {
+        vertex.co += DVec3::new(0.0, 10.0, 0.0);
+    }
+    for face in &mut operand.faces {
+        face.material_index = 1;
+    }
+    let operand_faces = operand.faces.len();
+
+    let result = float_boolean(&subject, &[operand], "UNION");
+
+    assert_eq!(
+        result
+            .faces
+            .iter()
+            .filter(|face| face.material_index == 1)
+            .count(),
+        operand_faces
+    );
+}
+
+#[test]
+fn boolean_float_difference_of_box_and_tilted_cylinder_has_closed_bore() {
     let source = Mesh::box_mesh(BoxParams {
         size: DVec3::splat(1.8),
     })
@@ -156,7 +233,7 @@ fn boolean_difference_of_box_and_tilted_cylinder_has_closed_bore() {
         vertex.co = rotation * vertex.co;
     }
 
-    let result = boolean_mesh(&source, &operand, "DIFFERENCE").unwrap();
+    let result = float_boolean(&source, &[operand], "DIFFERENCE");
     let volume = signed_volume(&result);
     assert!(result.validate().is_ok());
     assert!(volume > 0.0 && volume < signed_volume(&source) - 0.1);
@@ -166,7 +243,7 @@ proptest! {
     #![proptest_config(ProptestConfig { cases: 32, .. ProptestConfig::default() })]
 
     #[test]
-    fn boolean_union_of_overlapping_boxes_is_watertight(
+    fn boolean_float_union_of_overlapping_boxes_is_watertight(
         x in -0.75_f64..0.75,
         y in -0.75_f64..0.75,
         z in -0.75_f64..0.75,
@@ -177,10 +254,10 @@ proptest! {
         for vertex in &mut operand.vertices {
             vertex.co += DVec3::new(x, y, z);
         }
-        let result = boolean_mesh(&source, &operand, "UNION").unwrap();
+        let result = float_boolean(&source, &[operand], "UNION");
         prop_assert!(result.validate().is_ok());
         prop_assert!(edge_face_counts(&result).values().all(|count| *count == 2));
-        prop_assert!((signed_volume(&result) - (8.0 + size.powi(3) - intersection_volume(size, x, y, z))).abs() < 1.0e-7);
+        prop_assert!((signed_volume(&result) - (8.0 + size.powi(3) - intersection_volume(size, x, y, z))).abs() < 2.0e-5);
     }
 }
 

@@ -18,10 +18,9 @@ use super::{
     quad::{is_quad_convex, quad_split_24},
 };
 use crate::{
-    color::{linear_to_srgb_f32, srgb_to_linear},
     error::{ErrorCode, PotError, Result},
     geom::{
-        Mesh,
+        Mesh, color_layers,
         provenance::{Origin, default_value},
     },
     model::Modifier,
@@ -1396,39 +1395,26 @@ fn round_to_byte(value: f32) -> f32 {
     (value.clamp(0.0, 255.0) + 0.5).floor()
 }
 
-/// Stored `BYTE_COLOR` bytes of a serialized linear RGBA value: RGB is sRGB-encoded, alpha is a linear byte.
+/// Stored `BYTE_COLOR` channels of serialized linear RGBA.
 fn byte_color_bytes(value: &Value) -> Option<[f32; 4]> {
-    let linear = value
+    let components = value
         .as_array()
         .filter(|components| components.len() == 4)?;
-    let mut bytes = [0.0_f32; 4];
-    for (index, component) in linear.iter().enumerate() {
-        let channel = component.as_f64()?.clamp(0.0, 1.0) as f32;
-        let stored = if index < 3 {
-            linear_to_srgb_f32(channel)
-        } else {
-            channel
-        };
-        bytes[index] = round_to_byte(stored * 255.0);
-    }
-    Some(bytes)
+    let linear = [
+        components[0].as_f64()?,
+        components[1].as_f64()?,
+        components[2].as_f64()?,
+        components[3].as_f64()?,
+    ];
+    Some(color_layers::byte_color_encoded_components(linear).map(round_to_byte))
 }
 
-/// Serialized linear RGBA of stored `BYTE_COLOR` bytes; the inverse of [`byte_color_bytes`].
+/// Serialized linear RGBA of stored `BYTE_COLOR` channels; the inverse of [`byte_color_bytes`].
 fn byte_color_linear(bytes: [f32; 4]) -> Value {
     Value::Array(
-        bytes
-            .iter()
-            .enumerate()
-            .map(|(index, byte)| {
-                let encoded = f64::from(*byte) / 255.0;
-                json!(if index < 3 {
-                    srgb_to_linear(encoded)
-                } else {
-                    encoded
-                })
-            })
-            .collect(),
+        color_layers::byte_color_decoded_components(bytes)
+            .map(|channel| json!(channel))
+            .into(),
     )
 }
 

@@ -889,7 +889,7 @@ fn sculpt_shared_data_requires_scope_and_single_user_isolates_stroke() -> Result
 fn sculpt_symmetry_and_repeat_strokes_are_deterministic() -> Result<(), Box<dyn Error>> {
     let base = Mesh::box_mesh(potter_core::geom::BoxParams::default())?;
     let stroke = |symmetry: &[&str]| sculpt::Stroke {
-        brush: sculpt::Brush::Dab(sculpt::DabBrush::Draw),
+        brush: sculpt::DabBrush::Draw,
         samples: vec![sculpt::StrokeSample {
             position: DVec3::new(1.0, -1.0, 1.0),
             pressure: 1.0,
@@ -900,7 +900,8 @@ fn sculpt_symmetry_and_repeat_strokes_are_deterministic() -> Result<(), Box<dyn 
         falloff: sculpt::Falloff::Linear,
         symmetry: symmetry.iter().map(|axis| (*axis).to_owned()).collect(),
         delta: None,
-        view: None,
+        // The top-view viewer at +Z, as the Blender oracles are generated (see sculpt_brush_parity.rs).
+        view: Some(DVec3::Z),
     };
     let mut mirrored = base.clone();
     sculpt::apply_stroke(&mut mirrored, &stroke(&["x"]))?;

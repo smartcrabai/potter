@@ -39,7 +39,16 @@ fn apply_stroke(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resu
         engine,
         operation,
         &[
-            "op", "target", "scope", "brush", "samples", "falloff", "symmetry", "delta", "view",
+            "op",
+            "target",
+            "scope",
+            "brush",
+            "deform_type",
+            "samples",
+            "falloff",
+            "symmetry",
+            "delta",
+            "view",
             "dyntopo",
         ],
         &["target", "brush", "samples"],
@@ -668,27 +677,40 @@ pub(super) fn parse_stroke(
     engine: &Engine<'_>,
     operation: &Map<String, Value>,
 ) -> Result<sculpt_geom::Stroke> {
-    let brush = match string_field(engine, operation, "brush")?.as_str() {
-        "draw" => sculpt_geom::Brush::Dab(sculpt_geom::DabBrush::Draw),
-        "clay_strips" => sculpt_geom::Brush::Dab(sculpt_geom::DabBrush::ClayStrips),
-        "inflate" => sculpt_geom::Brush::Dab(sculpt_geom::DabBrush::Inflate),
-        "grab" => sculpt_geom::Brush::Dab(sculpt_geom::DabBrush::Grab),
-        "smooth" => sculpt_geom::Brush::Dab(sculpt_geom::DabBrush::Smooth),
-        "flatten" => sculpt_geom::Brush::Dab(sculpt_geom::DabBrush::Flatten),
-        "pinch" => sculpt_geom::Brush::Dab(sculpt_geom::DabBrush::Pinch),
-        "crease" => sculpt_geom::Brush::Dab(sculpt_geom::DabBrush::Crease),
-        "layer" => sculpt_geom::Brush::Dab(sculpt_geom::DabBrush::Layer),
-        "snake_hook" => sculpt_geom::Brush::Dab(sculpt_geom::DabBrush::SnakeHook),
-        "thumb" => sculpt_geom::Brush::Dab(sculpt_geom::DabBrush::Thumb),
-        "rotate" => sculpt_geom::Brush::Dab(sculpt_geom::DabBrush::Rotate),
-        "nudge" => sculpt_geom::Brush::Dab(sculpt_geom::DabBrush::Nudge),
-        "blob" => sculpt_geom::Brush::Dab(sculpt_geom::DabBrush::Blob),
-        "scrape" => sculpt_geom::Brush::Dab(sculpt_geom::DabBrush::Scrape),
-        "fill" => sculpt_geom::Brush::Dab(sculpt_geom::DabBrush::Fill),
-        "draw_sharp" => sculpt_geom::Brush::Dab(sculpt_geom::DabBrush::DrawSharp),
-        "elastic_deform" => sculpt_geom::Brush::Dab(sculpt_geom::DabBrush::Elastic),
-        "pose_lite" => sculpt_geom::Brush::Vertex(sculpt_geom::VertexBrush::PoseLite),
-        "boundary_lite" => sculpt_geom::Brush::Vertex(sculpt_geom::VertexBrush::BoundaryLite),
+    let name = string_field(engine, operation, "brush")?;
+    let deform_type = deform_type_field(engine, operation)?;
+    let brush = match name.as_str() {
+        "pose" => {
+            sculpt_geom::DabBrush::Pose(pose_deform(engine, deform_type.unwrap_or("rotate_twist"))?)
+        }
+        "boundary" => {
+            sculpt_geom::DabBrush::Boundary(boundary_deform(engine, deform_type.unwrap_or("bend"))?)
+        }
+        _ if deform_type.is_some() => {
+            return Err(engine.error(
+                ErrorCode::InvalidOperation,
+                "deform_type is supported only by pose and boundary brushes",
+                "/deform_type",
+            ));
+        }
+        "draw" => sculpt_geom::DabBrush::Draw,
+        "clay_strips" => sculpt_geom::DabBrush::ClayStrips,
+        "inflate" => sculpt_geom::DabBrush::Inflate,
+        "grab" => sculpt_geom::DabBrush::Grab,
+        "smooth" => sculpt_geom::DabBrush::Smooth,
+        "flatten" => sculpt_geom::DabBrush::Flatten,
+        "pinch" => sculpt_geom::DabBrush::Pinch,
+        "crease" => sculpt_geom::DabBrush::Crease,
+        "layer" => sculpt_geom::DabBrush::Layer,
+        "snake_hook" => sculpt_geom::DabBrush::SnakeHook,
+        "thumb" => sculpt_geom::DabBrush::Thumb,
+        "rotate" => sculpt_geom::DabBrush::Rotate,
+        "nudge" => sculpt_geom::DabBrush::Nudge,
+        "blob" => sculpt_geom::DabBrush::Blob,
+        "scrape" => sculpt_geom::DabBrush::Scrape,
+        "fill" => sculpt_geom::DabBrush::Fill,
+        "draw_sharp" => sculpt_geom::DabBrush::DrawSharp,
+        "elastic_deform" => sculpt_geom::DabBrush::Elastic,
         other => {
             return Err(engine.error(
                 ErrorCode::InvalidOperation,
@@ -697,15 +719,24 @@ pub(super) fn parse_stroke(
             ));
         }
     };
-    if brush == sculpt_geom::Brush::Dab(sculpt_geom::DabBrush::Elastic)
+    // Blender's Elastic Grab, pose, and boundary brushes apply no falloff curve: the Kelvinlet fade
+    // or the constant factor is their only spatial term.
+    let falloff_refusal = match brush {
+        sculpt_geom::DabBrush::Elastic => {
+            Some("elastic_deform has no falloff; Blender's Elastic Grab uses its Kelvinlet fade")
+        }
+        sculpt_geom::DabBrush::Pose(_) => {
+            Some("pose has no falloff; Blender's pose brush uses no falloff curve")
+        }
+        sculpt_geom::DabBrush::Boundary(_) => Some(
+            "boundary has no falloff; Potter uses the constant falloff curve of Blender's essentials boundary asset, and the curve is not configurable here",
+        ),
+        _ => None,
+    };
+    if let Some(message) = falloff_refusal
         && operation.contains_key("falloff")
     {
-        // Blender's Elastic Grab has no falloff: its Kelvinlet fade is the only spatial factor.
-        return Err(engine.error(
-            ErrorCode::InvalidOperation,
-            "elastic_deform has no falloff; Blender's Elastic Grab uses its Kelvinlet fade",
-            "/falloff",
-        ));
+        return Err(engine.error(ErrorCode::InvalidOperation, message, "/falloff"));
     }
     if operation
         .get("falloff")
@@ -721,8 +752,8 @@ pub(super) fn parse_stroke(
     // other dab brushes use SMOOTH. Potter's stroke carries no brush curve, so the default follows
     // the brush.
     let default_falloff = match brush {
-        sculpt_geom::Brush::Dab(sculpt_geom::DabBrush::ClayStrips) => "smoother",
-        sculpt_geom::Brush::Dab(sculpt_geom::DabBrush::DrawSharp) => "pow4",
+        sculpt_geom::DabBrush::ClayStrips => "smoother",
+        sculpt_geom::DabBrush::DrawSharp => "pow4",
         _ => "smooth",
     };
     let falloff = match operation
@@ -843,6 +874,68 @@ pub(super) fn parse_stroke(
         symmetry,
         delta,
         view,
+    })
+}
+
+/// Reads the optional `deform_type` of a pose or boundary stroke.
+fn deform_type_field<'a>(
+    engine: &Engine<'_>,
+    operation: &'a Map<String, Value>,
+) -> Result<Option<&'a str>> {
+    operation
+        .get("deform_type")
+        .map(|value| {
+            value.as_str().ok_or_else(|| {
+                engine.error(
+                    ErrorCode::InvalidOperation,
+                    "deform_type must be a string",
+                    "/deform_type",
+                )
+            })
+        })
+        .transpose()
+}
+
+/// Blender's `pose_deform_type` names; `rotate_twist` is the default. Blender's pose twist turns by
+/// the screen-space mouse delta, which a Potter stroke does not carry, so it is refused.
+fn pose_deform(engine: &Engine<'_>, name: &str) -> Result<sculpt_geom::PoseDeform> {
+    Ok(match name {
+        "rotate_twist" => sculpt_geom::PoseDeform::RotateTwist,
+        "scale_translate" => sculpt_geom::PoseDeform::ScaleTranslate,
+        "squash_stretch" => sculpt_geom::PoseDeform::SquashStretch,
+        "twist" => {
+            return Err(engine.error(
+                ErrorCode::InvalidOperation,
+                "pose deform_type `twist` is refused: Blender's pose twist turns by the screen-space mouse delta in pixels (`calc_twist_deform`: roll = (initial_mouse.x - mouse.x) * bstrength * 0.02), and Potter strokes carry no screen-pixel samples, so the twist branch cannot be reproduced",
+                "/deform_type",
+            ));
+        }
+        other => {
+            return Err(engine.error(
+                ErrorCode::InvalidOperation,
+                format!("unknown pose deform_type `{other}`"),
+                "/deform_type",
+            ));
+        }
+    })
+}
+
+/// Blender's `boundary_deform_type` names; `bend` is the default.
+fn boundary_deform(engine: &Engine<'_>, name: &str) -> Result<sculpt_geom::BoundaryDeform> {
+    Ok(match name {
+        "bend" => sculpt_geom::BoundaryDeform::Bend,
+        "expand" => sculpt_geom::BoundaryDeform::Expand,
+        "inflate" => sculpt_geom::BoundaryDeform::Inflate,
+        "grab" => sculpt_geom::BoundaryDeform::Grab,
+        "twist" => sculpt_geom::BoundaryDeform::Twist,
+        "smooth" => sculpt_geom::BoundaryDeform::Smooth,
+        other => {
+            return Err(engine.error(
+                ErrorCode::InvalidOperation,
+                format!("unknown boundary deform_type `{other}`"),
+                "/deform_type",
+            ));
+        }
     })
 }
 

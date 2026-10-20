@@ -1,5 +1,5 @@
-//! Blender 5.2.2 parity for the dab-sequential sculpt brushes (`geom/sculpt_dabs.rs` and its family
-//! modules).
+//! Blender 5.2.2 parity for the sculpt brushes: the dab-sequential brushes (`geom/sculpt_dabs.rs`
+//! and its family modules) and the Pose and Boundary brushes (`geom/sculpt_dabs/`).
 //!
 //! The fixtures come from `tests/fixtures/sculpt_brushes/generate_oracle.py`, which drives Blender
 //! in a session with a display (the script's header explains why). Each fixture holds the base mesh,
@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 
 use potter_core::geom::{
     Mesh,
-    sculpt::{self, Brush, DabBrush, Falloff, Stroke, StrokeSample},
+    sculpt::{self, BoundaryDeform, DabBrush, Falloff, PoseDeform, Stroke, StrokeSample},
 };
 
 const TOLERANCE: f64 = 5e-6;
@@ -143,6 +143,58 @@ const FIXTURES: &[(&str, &str)] = &[
         "elastic_grab_grid",
         include_str!("fixtures/sculpt_brushes/elastic_grab_grid.json"),
     ),
+    (
+        "pose_grid",
+        include_str!("fixtures/sculpt_brushes/pose_grid.json"),
+    ),
+    (
+        "pose_grid_scale_translate",
+        include_str!("fixtures/sculpt_brushes/pose_grid_scale_translate.json"),
+    ),
+    (
+        "pose_grid_squash_stretch",
+        include_str!("fixtures/sculpt_brushes/pose_grid_squash_stretch.json"),
+    ),
+    (
+        "pose_grid_mirror",
+        include_str!("fixtures/sculpt_brushes/pose_grid_mirror.json"),
+    ),
+    (
+        "pose_grid_scale_translate_mirror",
+        include_str!("fixtures/sculpt_brushes/pose_grid_scale_translate_mirror.json"),
+    ),
+    (
+        "boundary_grid_bend",
+        include_str!("fixtures/sculpt_brushes/boundary_grid_bend.json"),
+    ),
+    (
+        "boundary_grid_grab",
+        include_str!("fixtures/sculpt_brushes/boundary_grid_grab.json"),
+    ),
+    (
+        "boundary_grid_expand",
+        include_str!("fixtures/sculpt_brushes/boundary_grid_expand.json"),
+    ),
+    (
+        "boundary_grid_inflate",
+        include_str!("fixtures/sculpt_brushes/boundary_grid_inflate.json"),
+    ),
+    (
+        "boundary_grid_twist",
+        include_str!("fixtures/sculpt_brushes/boundary_grid_twist.json"),
+    ),
+    (
+        "boundary_grid_smooth",
+        include_str!("fixtures/sculpt_brushes/boundary_grid_smooth.json"),
+    ),
+    (
+        "boundary_grid_bend_mirror",
+        include_str!("fixtures/sculpt_brushes/boundary_grid_bend_mirror.json"),
+    ),
+    (
+        "boundary_grid_grab_mirror",
+        include_str!("fixtures/sculpt_brushes/boundary_grid_grab_mirror.json"),
+    ),
 ];
 
 fn number(value: &Value) -> Result<f64, Box<dyn Error>> {
@@ -175,30 +227,45 @@ fn array<T>(
 fn max_error_against_blender(name: &str, text: &str) -> Result<f64, Box<dyn Error>> {
     let document: Value = serde_json::from_str(text)?;
     let brush = match document["brush"].as_str() {
-        Some("clay_strips") => Brush::Dab(DabBrush::ClayStrips),
-        Some("inflate") => Brush::Dab(DabBrush::Inflate),
-        Some("layer") => Brush::Dab(DabBrush::Layer),
-        Some("draw") => Brush::Dab(DabBrush::Draw),
-        Some("draw_sharp") => Brush::Dab(DabBrush::DrawSharp),
-        Some("blob") => Brush::Dab(DabBrush::Blob),
-        Some("nudge") => Brush::Dab(DabBrush::Nudge),
-        Some("crease") => Brush::Dab(DabBrush::Crease),
-        Some("pinch") => Brush::Dab(DabBrush::Pinch),
-        Some("smooth") => Brush::Dab(DabBrush::Smooth),
-        Some("flatten") => Brush::Dab(DabBrush::Flatten),
-        Some("fill") => Brush::Dab(DabBrush::Fill),
-        Some("scrape") => Brush::Dab(DabBrush::Scrape),
-        Some("grab") => Brush::Dab(DabBrush::Grab),
-        Some("snake_hook") => Brush::Dab(DabBrush::SnakeHook),
-        Some("thumb") => Brush::Dab(DabBrush::Thumb),
-        Some("rotate") => Brush::Dab(DabBrush::Rotate),
-        Some("elastic_deform") => Brush::Dab(DabBrush::Elastic),
+        Some("clay_strips") => DabBrush::ClayStrips,
+        Some("inflate") => DabBrush::Inflate,
+        Some("layer") => DabBrush::Layer,
+        Some("draw") => DabBrush::Draw,
+        Some("draw_sharp") => DabBrush::DrawSharp,
+        Some("blob") => DabBrush::Blob,
+        Some("nudge") => DabBrush::Nudge,
+        Some("crease") => DabBrush::Crease,
+        Some("pinch") => DabBrush::Pinch,
+        Some("smooth") => DabBrush::Smooth,
+        Some("flatten") => DabBrush::Flatten,
+        Some("fill") => DabBrush::Fill,
+        Some("scrape") => DabBrush::Scrape,
+        Some("grab") => DabBrush::Grab,
+        Some("snake_hook") => DabBrush::SnakeHook,
+        Some("thumb") => DabBrush::Thumb,
+        Some("rotate") => DabBrush::Rotate,
+        Some("elastic_deform") => DabBrush::Elastic,
+        Some("pose") => DabBrush::Pose(match document["deform"].as_str() {
+            Some("ROTATE_TWIST") => PoseDeform::RotateTwist,
+            Some("SCALE_TRANSLATE") => PoseDeform::ScaleTranslate,
+            Some("SQUASH_STRETCH") => PoseDeform::SquashStretch,
+            other => return Err(format!("{name}: unknown pose deform {other:?}").into()),
+        }),
+        Some("boundary") => DabBrush::Boundary(match document["deform"].as_str() {
+            Some("BEND") => BoundaryDeform::Bend,
+            Some("EXPAND") => BoundaryDeform::Expand,
+            Some("INFLATE") => BoundaryDeform::Inflate,
+            Some("GRAB") => BoundaryDeform::Grab,
+            Some("TWIST") => BoundaryDeform::Twist,
+            Some("SMOOTH") => BoundaryDeform::Smooth,
+            other => return Err(format!("{name}: unknown boundary deform {other:?}").into()),
+        }),
         other => return Err(format!("{name}: unknown brush {other:?}").into()),
     };
     // Blender's essentials falloff presets: Clay Strips SMOOTHER, Draw Sharp POW4, the rest SMOOTH.
     let falloff = match brush {
-        Brush::Dab(DabBrush::ClayStrips) => Falloff::Smoother,
-        Brush::Dab(DabBrush::DrawSharp) => Falloff::Pow4,
+        DabBrush::ClayStrips => Falloff::Smoother,
+        DabBrush::DrawSharp => Falloff::Pow4,
         _ => Falloff::Smooth,
     };
     let symmetry = if document["mirror"].as_bool() == Some(true) {

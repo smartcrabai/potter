@@ -1059,7 +1059,7 @@ mod tests {
 
         let (loaded, warnings) = super::read_history_blob(directory.path(), &digest).unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
-        assert_eq!(loaded.snapshot.schema_version, 6);
+        assert_eq!(loaded.snapshot.schema_version, 7);
         assert_eq!(fs::read(&path).unwrap(), bytes);
 
         let mut corrupted = bytes;
