@@ -58,6 +58,8 @@ struct Face {
     loops: Vec<FaceLoop>,
     side: u8,
     source: usize,
+    /// `BMesh` face pool slot of this `BMFace`, set by `State::push_face` and kept through splits.
+    slot: usize,
 }
 
 /// Loop data of one face corner, in the two forms Blender's loop passes write.
@@ -105,6 +107,7 @@ impl Face {
             loops,
             side,
             source,
+            slot: 0,
         }
     }
 }
@@ -139,6 +142,8 @@ struct State {
     disk: Vec<Vec<EdgeKey>>,
     /// `BMesh` vertex pool: slots of every live and freed `BMVert`, in creation order.
     vertex_slots: PoolSlots,
+    /// `BMesh` face pool: slots of every live and freed `BMFace`, in creation order.
+    face_slots: PoolSlots,
 }
 
 impl State {
@@ -160,6 +165,7 @@ impl State {
             dangling_edges: HashSet::new(),
             disk: Vec::new(),
             vertex_slots: PoolSlots::default(),
+            face_slots: PoolSlots::default(),
         }
     }
 
@@ -169,6 +175,12 @@ impl State {
         self.verts.push(Vertex { co, source, slot });
         self.disk.push(Vec::new());
         id
+    }
+
+    /// Blender `BMesh` face creation: the new face takes the next `BMFace` pool slot.
+    fn push_face(&mut self, mut face: Face) {
+        face.slot = self.face_slots.alloc();
+        self.faces.push(face);
     }
 
     /// Blender `bmesh_disk_edge_append` at `at`: `key` joins the disk unless it is already listed.
@@ -439,6 +451,7 @@ fn build_float_output(subject: &Mesh, operand: &Mesh, state: &State) -> Result<F
             })
             .collect();
         polygons.push((
+            face.slot,
             Poly {
                 verts: face
                     .verts
@@ -457,12 +470,14 @@ fn build_float_output(subject: &Mesh, operand: &Mesh, state: &State) -> Result<F
             face.loops.clone(),
         ));
     }
-    // Blender's output follows BMesh slot order, and `mesh_bm_concat` creates subject faces first
-    // (`geometry_mesh_boolean.cc:1000`), so surviving subject faces precede operand faces. Slot reuse
-    // after a kill is not modelled for faces (vertices use `Vertex::slot`); this is the observed order.
-    let subject_face_count = i32::try_from(subject.faces.len()).unwrap_or(i32::MAX);
-    polygons.sort_by_key(|(polygon, _)| polygon.orig >= subject_face_count);
-    let (polygons, loops): (Vec<Poly>, Vec<Vec<FaceLoop>>) = polygons.into_iter().unzip();
+    // Blender writes faces in `BMesh` pool order (`BM_mesh_bm_to_me`, `BM_FACES_OF_MESH`), which
+    // `Face::slot` models: input faces take slots in build order, split faces follow
+    // `split_face_slots`.
+    polygons.sort_by_key(|(slot, _, _)| *slot);
+    let (polygons, loops): (Vec<Poly>, Vec<Vec<FaceLoop>>) = polygons
+        .into_iter()
+        .map(|(_, polygon, loops)| (polygon, loops))
+        .unzip();
     let mut mesh = Mesh::new();
     let mut state_vertex_ids = vec![None; state.verts.len()];
     let mut referenced = vec![false; state.verts.len()];
@@ -2263,7 +2278,7 @@ fn build_state(
             .collect::<Result<Vec<_>>>()?;
         let source_face = subject.faces.len() + fi;
         face_vertex_rings.push(verts.clone());
-        state.faces.push(Face::input(verts, 1, source_face));
+        state.push_face(Face::input(verts, 1, source_face));
     }
     for (fi, face) in subject.faces.iter().enumerate() {
         let verts = face
@@ -2280,7 +2295,7 @@ fn build_state(
             .collect::<Result<Vec<_>>>()?;
         let source_face = fi;
         face_vertex_rings.push(verts.clone());
-        state.faces.push(Face::input(verts, 0, source_face));
+        state.push_face(Face::input(verts, 0, source_face));
     }
 
     for (face_index, ring) in face_vertex_rings.iter().enumerate() {
@@ -3003,6 +3018,19 @@ fn split_input_edges(state: &mut State) {
     }
 }
 
+/// Blender `BM_face_split_edgenet` (`bmesh_polygon_edgenet.cc` 575, 690) creates one `BMFace` per
+/// emitted ring, in ring order. Ring 0 is then swapped into the split face (`bmesh_face_swap_data`)
+/// and the spare it was created in is killed. So ring 0 keeps the split face's slot, the other rings
+/// take their new slots, and only ring 0's spare returns to the pool free list.
+fn split_face_slots(pool: &mut PoolSlots, split_slot: usize, rings: &mut [Face]) {
+    let created: Vec<usize> = rings.iter().map(|_| pool.alloc()).collect();
+    rings[0].slot = split_slot;
+    for (ring, &slot) in rings.iter_mut().zip(&created).skip(1) {
+        ring.slot = slot;
+    }
+    pool.release(created[0]);
+}
+
 fn split_faces(state: &mut State) {
     let old_faces = std::mem::take(&mut state.faces);
     let old_cuts = std::mem::take(&mut state.face_cuts);
@@ -3068,7 +3096,8 @@ fn split_faces(state: &mut State) {
                 state.disk[v].rotate_left(at);
             }
         }
-        let produced: Vec<Face> = if split.faces.is_empty() {
+        let split_made = !split.faces.is_empty();
+        let mut produced: Vec<Face> = if split.faces.is_empty() {
             dangling.extend(edge_net.iter().map(|&(a, b)| edge_key_usize(a, b)));
             vec![face.clone()]
         } else {
@@ -3105,10 +3134,14 @@ fn split_faces(state: &mut State) {
                         loops,
                         side: face.side,
                         source: face.source,
+                        slot: 0,
                     }
                 })
                 .collect()
         };
+        if split_made {
+            split_face_slots(&mut state.face_slots, face.slot, &mut produced);
+        }
         emitted[index] = Some(produced);
     }
     // Output keeps face index order; only the split sequence follows Blender's hash order.
@@ -4147,7 +4180,7 @@ mod dangling_edge_tests {
         ] {
             state.add_vertex(co, NO_INDEX);
         }
-        state.faces.push(Face::input(vec![0, 1, 2, 3], 0, 0));
+        state.push_face(Face::input(vec![0, 1, 2, 3], 0, 0));
         state
     }
 
