@@ -3,7 +3,7 @@ use std::f64::consts::TAU;
 use glam::DVec3;
 use serde::{Deserialize, Serialize};
 
-use super::wireframe::{self, ScreenPoint, WireEdge, WireSegment};
+use super::wireframe::{self, PointSquare, ScreenPoint, WireEdge, WirePoint, WireSegment};
 use crate::error::{ErrorCode, PotError, Result};
 use crate::float::equal_f64;
 use crate::model::{CameraData, CameraProjection};
@@ -986,6 +986,7 @@ pub(crate) fn rasterize_with_lines(
 /// nearest-line and anti-aliasing rules. The background is the theme's interior colour.
 pub(crate) fn rasterize_wireframe(
     edges: &[WireEdge],
+    points: &[WirePoint],
     camera: &Camera,
     width: u32,
     height: u32,
@@ -1075,7 +1076,29 @@ pub(crate) fn rasterize_wireframe(
             colour_b,
         });
     }
-    let linear = wireframe::composite(&segments, width_usize, height_usize);
+    let mut squares = Vec::with_capacity(points.len());
+    for point in points {
+        if !is_finite_vec3(point.position) {
+            return Err(PotError::new(
+                ErrorCode::EvaluationFailed,
+                "wireframe point contains invalid geometry",
+            ));
+        }
+        let Some(projected) = project_world(camera, &frame, width, height, point.position) else {
+            continue;
+        };
+        // A loose vertex is `2 · vert` pixels across; a point-cloud point is `2 · radius` in pixels.
+        let side = match point.radius {
+            None => 2.0 * wireframe::vertex_size(),
+            Some(radius) => 2.0 * radius * projected.pixel_scale,
+        };
+        squares.push(PointSquare {
+            centre_x: projected.x + 0.5,
+            centre_y: projected.y + 0.5,
+            side,
+        });
+    }
+    let linear = wireframe::composite(&segments, &squares, width_usize, height_usize);
     for (index, colour) in linear.iter().enumerate() {
         let encoded = [
             wireframe::display_byte(colour[0]),

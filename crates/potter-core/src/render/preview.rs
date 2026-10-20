@@ -23,7 +23,7 @@ use super::{
         SurfaceShader, ViewBasis, projection_for_camera, rasterize_wireframe, rasterize_with_lines,
     },
     scene::{Geometry, extract_geometry, surface_shader},
-    wireframe::{self, WireEdge},
+    wireframe::{self, WireEdge, WirePoint},
 };
 
 const MIN_SIZE: u32 = 64;
@@ -672,16 +672,27 @@ fn rasterize_view(
             shader,
         );
     }
-    // Strokes keep their own colour: they are not facing-shaded surfaces, and have no edge factor.
+    // Curves and strokes are wire lines in the theme wire colour (black), with no facing; a zero-length
+    // stroke is a point-cloud point, drawn at its radius.
     let mut edges: Vec<WireEdge> = geometry.wire_edges.clone();
-    edges.extend(geometry.lines.iter().map(|line| WireEdge {
-        start: line.start,
-        end: line.end,
-        normals: None,
-        colour: [line.color[0], line.color[1], line.color[2]],
-        wd: 0.0,
-    }));
-    rasterize_wireframe(&edges, camera, width, height)
+    let mut points: Vec<WirePoint> = geometry.wire_points.clone();
+    for line in &geometry.lines {
+        if line.start == line.end {
+            points.push(WirePoint {
+                position: line.start,
+                radius: Some(line.radius_start),
+            });
+        } else {
+            edges.push(WireEdge {
+                start: line.start,
+                end: line.end,
+                normals: None,
+                colour: [0.0; 3],
+                wd: 0.0,
+            });
+        }
+    }
+    rasterize_wireframe(&edges, &points, camera, width, height)
 }
 
 fn background_color(doc: &SceneDoc, snapshot: &Snapshot, mode: Mode, transparent: bool) -> [u8; 4] {

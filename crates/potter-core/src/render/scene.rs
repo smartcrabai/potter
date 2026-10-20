@@ -40,7 +40,7 @@ use super::{
         blend_corner_normals, blend_uv,
     },
     studio,
-    wireframe::{WireEdge, WireEdgeBuilder},
+    wireframe::{WireEdge, WireEdgeBuilder, WirePoint},
 };
 
 /// Most color layers one object carries, and one hit can read (Blender's per-mesh limit).
@@ -91,6 +91,8 @@ pub(super) struct Geometry {
     pub lines: Vec<Line>,
     /// Mesh edges for the wireframe preview, each once; empty outside Wire.
     pub wire_edges: Vec<WireEdge>,
+    /// Loose vertices of a mesh with no edges or faces, and point-cloud points, for the wireframe preview.
+    pub wire_points: Vec<WirePoint>,
     pub materials: Vec<Material>,
     pub prepared: Vec<PreparedMaterial>,
     pub objects: Vec<ObjectRecord>,
@@ -363,6 +365,7 @@ pub(super) fn extract_geometry(
     let mut triangles = Vec::new();
     let mut lines = Vec::new();
     let mut wire_edges = Vec::new();
+    let mut wire_points = Vec::new();
     let mut objects = Vec::new();
     let mut elements = Vec::new();
     let mut bounds: Option<(DVec3, DVec3)> = None;
@@ -833,6 +836,33 @@ pub(super) fn extract_geometry(
                 }
                 triangle_offset = face_triangle_end;
             }
+            if matches!(mode, Mode::Wire) {
+                // Loose edges: edges no polygon uses. Blender draws them with the wire colour (no facing).
+                for edge in &mesh.edges {
+                    let [a, b] = edge.vertices;
+                    if wire_builder.contains(a, b) {
+                        continue;
+                    }
+                    if let (Some(local_a), Some(local_b)) =
+                        (vertex_positions.get(&a), vertex_positions.get(&b))
+                    {
+                        wire_edges.push(WireEdge {
+                            start: matrix.transform_point3(*local_a),
+                            end: matrix.transform_point3(*local_b),
+                            normals: None,
+                            colour: [0.0; 3],
+                            wd: 0.0,
+                        });
+                    }
+                }
+                // A mesh with no edges or faces is drawn as its vertices, as Blender's overlay does.
+                if mesh.edges.is_empty() && mesh.faces.is_empty() {
+                    wire_points.extend(mesh.vertices.iter().map(|vertex| WirePoint {
+                        position: matrix.transform_point3(vertex.co),
+                        radius: None,
+                    }));
+                }
+            }
             wire_edges.extend(wire_builder.finish());
             let used_vertices: HashSet<u32> = mesh
                 .faces
@@ -1093,6 +1123,7 @@ pub(super) fn extract_geometry(
         triangles,
         lines,
         wire_edges,
+        wire_points,
         materials,
         prepared,
         objects,

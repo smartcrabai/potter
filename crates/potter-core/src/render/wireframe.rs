@@ -50,6 +50,20 @@ const OVERLAY_GAMMA: f64 = 2.2;
 /// edge factor is stored up to `254/255`.
 const WD_STEP: f64 = 254.0 / 255.0;
 
+/// `theme.sizes.vert` (`overlay_private.hh`, `vertex_size_get`): the theme vertex size (3 in the factory
+/// theme, `space_view3d`) times √2/2, at least 1. A loose vertex is drawn as a square of `2 · vert` pixels.
+pub(crate) fn vertex_size() -> f64 {
+    (3.0 * std::f64::consts::SQRT_2 / 2.0).max(1.0)
+}
+
+/// A point of the wireframe overlay: a loose vertex (`radius` is `None`, drawn at `2 · vert` pixels) or a
+/// point-cloud point (`radius` in world units, drawn `2 · radius` pixels across).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WirePoint {
+    pub(crate) position: DVec3,
+    pub(crate) radius: Option<f64>,
+}
+
 /// A mesh edge or a stroke, in world space.
 #[derive(Clone, Debug)]
 pub(crate) struct WireEdge {
@@ -114,6 +128,11 @@ impl WireEdgeBuilder {
                 faces: vec![face_normal],
             });
         }
+    }
+
+    /// Whether the edge between two vertex ids is already on a polygon.
+    pub(crate) fn contains(&self, a: u32, b: u32) -> bool {
+        self.index.contains_key(&(a.min(b), a.max(b)))
     }
 
     /// The edges in insertion order, with their `wd`.
@@ -219,6 +238,28 @@ pub(crate) fn background_rgba() -> [u8; 4] {
     [value, value, value, 255]
 }
 
+/// The colour of a point's pixel at `fac` (`overlay_wireframe_frag.glsl`, POINTS): the rim and interior
+/// are taken to their square roots, mixed by 0.35 for the front colour, mixed with the rim by
+/// `fac = 4 · dist²` (dist is the distance to the centre in units of the point size), and squared.
+pub(crate) fn point_colour(fac: f64, rim: [f64; 3], interior: [f64; 3]) -> [f64; 3] {
+    let fac = fac.clamp(0.0, 1.0);
+    std::array::from_fn(|channel| {
+        let rim_root = rim[channel].sqrt();
+        let interior_root = interior[channel].sqrt();
+        let front = rim_root + (interior_root - rim_root) * 0.35;
+        let mixed = front + (rim_root - front) * fac;
+        mixed * mixed
+    })
+}
+
+/// A point square on the screen: its centre (continuous pixel coordinates) and its side in pixels.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PointSquare {
+    pub(crate) centre_x: f64,
+    pub(crate) centre_y: f64,
+    pub(crate) side: f64,
+}
+
 /// A projected point: pixel coordinates (row 0 at the top) and its depth, which orders lines.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ScreenPoint {
@@ -249,8 +290,13 @@ struct Record {
 }
 
 /// Rasterises the segments and returns each pixel's linear colour, background included.
-pub(crate) fn composite(segments: &[WireSegment], width: usize, height: usize) -> Vec<[f64; 3]> {
-    let (_, background) = theme_linear();
+pub(crate) fn composite(
+    segments: &[WireSegment],
+    points: &[PointSquare],
+    width: usize,
+    height: usize,
+) -> Vec<[f64; 3]> {
+    let (rim, background) = theme_linear();
     let mut records: Vec<Option<Record>> = vec![None; width * height];
     for segment in segments {
         draw_segment(&mut records, width, height, segment);
@@ -263,6 +309,28 @@ pub(crate) fn composite(segments: &[WireSegment], width: usize, height: usize) -
             continue;
         }
         *pixel = anti_alias(&records[index], &neighbours, background);
+    }
+    // Points are opaque squares written over the lines (no line records, so no anti-aliasing).
+    for point in points {
+        let half = point.side * 0.5;
+        let min_x = (point.centre_x - half).floor().max(0.0) as usize;
+        let max_x = ((point.centre_x + half).ceil().max(0.0) as usize).min(width.saturating_sub(1));
+        let min_y = (point.centre_y - half).floor().max(0.0) as usize;
+        let max_y =
+            ((point.centre_y + half).ceil().max(0.0) as usize).min(height.saturating_sub(1));
+        for py in min_y..=max_y {
+            for px in min_x..=max_x {
+                let (dx, dy) = (
+                    px as f64 + 0.5 - point.centre_x,
+                    py as f64 + 0.5 - point.centre_y,
+                );
+                if dx.abs() > half || dy.abs() > half {
+                    continue;
+                }
+                let dist = dx.abs().max(dy.abs()) / point.side;
+                out[py * width + px] = point_colour(4.0 * dist * dist, rim, background);
+            }
+        }
     }
     out
 }
@@ -474,6 +542,15 @@ mod tests {
     }
 
     #[test]
+    fn point_rim_is_black_and_the_centre_is_the_interior_front_colour() {
+        let (rim, interior) = theme_linear();
+        // A point's rim (fac 1) is the theme wire colour, black; its centre is the front colour, a little
+        // lighter than the interior (the capture shows 19 to 23 across a point's interior).
+        assert_eq!(display_byte(point_colour(1.0, rim, interior)[0]), 0);
+        assert!(display_byte(point_colour(0.0, rim, interior)[0]) > 15);
+    }
+
+    #[test]
     fn facing_colour_is_black_edge_on_and_front_colour_facing_the_viewer() {
         let (rim, interior) = theme_linear();
         let edge_on = facing_colour(0.0, rim, interior);
@@ -634,7 +711,7 @@ mod oracle_tests {
     fn wireframe_matches_the_blender_viewport_capture() -> TestResult {
         let edges = load_edges()?;
         let capture = load_capture()?;
-        let output = rasterize_wireframe(&edges, &camera(), WIDTH, HEIGHT)?;
+        let output = rasterize_wireframe(&edges, &[], &camera(), WIDTH, HEIGHT)?;
         let width = WIDTH as usize;
         let height = HEIGHT as usize;
         let model = |index: usize| -> [u8; 3] {
