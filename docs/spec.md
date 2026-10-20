@@ -329,6 +329,7 @@ Implement all families below in the first release. Each variant MUST cover every
 - An ID collision yields ID_EXISTS; do not rename automatically. For Blender name collisions, also create a name mapping report and manage by ID.
 - A stroke is a sequence of world-space samples with time, pressure, radius, strength, falloff, and symmetry. Convert screen input from the Snapshot, camera, and depth, and record the resulting world-space sequence.
 - Clay Strips, Inflate, and Layer treat each sample as one Blender DOTS dab, applied in order to the positions earlier dabs left, with the vertex normals of the stroke start. Each dab runs once per symmetry pass (x, y, z combinations in Blender's order) and its strength is scaled by Blender's symmetry feather. The default falloff is `smoother` for Clay Strips and `smooth` for the others.
+- Smooth treats each sample as one DOTS dab. Each pass with a vertex in range is one `do_smooth_brush` call: the first call of a stroke reads the call-start positions for every iteration and accumulates the translations, and later calls read each iteration's result (the Blender 5.2.2 oracles in `tests/fixtures/sculpt_brushes/`). Smooth's default falloff is `smooth`.
 - Validate attribute, material, UV, weight, shape key, and rig mappings after topology changes. If preservation is impossible, return an error; do not save corrupted creation data based on guesses.
 
 ## 6. Atomic Editing and Retries
