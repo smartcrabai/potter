@@ -1,0 +1,586 @@
+{
+  "provenance": {
+    "blender": "5.2.2 LTS",
+    "engine": {
+      "cycles": "CYCLES, device CPU, threads 1, max_bounces 4, denoising off",
+      "eevee": "BLENDER_EEVEE",
+      "eevee_samples": "default"
+    },
+    "samples": 4096,
+    "seeds": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15
+    ],
+    "resolution": [
+      16,
+      16
+    ],
+    "patch": "central 8x8 pixels (rows and columns 4..11 of 16x16), per-channel mean",
+    "stderr": "sample std (ddof=1) of the 16 per-seed patch means / sqrt(16)",
+    "view": {
+      "transform": "Standard",
+      "look": "None",
+      "exposure": 0.0,
+      "gamma": 1.0,
+      "film_transparent": false,
+      "file": "OPEN_EXR 32-bit"
+    },
+    "geometry": {
+      "receiver": "plane size 40 at z=0, normal +Z, double-sided (default)",
+      "camera": "ORTHO ortho_scale 0.2 at 6 units along (sin45, 0, cos45), aimed at origin"
+    },
+    "light": {
+      "type": "AREA DISK",
+      "size": 2.4,
+      "radius": 1.2,
+      "power_W": 1000.0,
+      "aim": "-Z toward origin",
+      "front_centre": "4 * (-sin45, 0, cos45): mirror direction of the view",
+      "back_centre": "4 * t, t = (-sin(th_t), 0, -cos(th_t)), sin(th_t) = sin45 / ior (Snell from air into glass; t is the refracted continuation of -view)"
+    },
+    "variant_notes": {
+      "principled": "Principled BSDF, Transmission Weight 1.0; only Base Color, Roughness, IOR set; Cycles uses sqrt(base) as the transmission tint",
+      "glass": "Glass BSDF node -> Material Output; distribution Multiscatter GGX (default); transmission tinted by Color directly (no sqrt)"
+    },
+    "generator": "tests/fixtures/native_oracle/glass/glass_plane_probe.py",
+    "run": "Blender -b --factory-startup --threads 1 --python glass_plane_probe.py -- OUT_DIR"
+  },
+  "light_centres": {
+    "ior_1.5": {
+      "front": [
+        -2.8284271,
+        0.0,
+        2.8284271
+      ],
+      "back": [
+        -1.8856181,
+        0.0,
+        -3.5276685
+      ]
+    },
+    "ior_1.45": {
+      "front": [
+        -2.8284271,
+        0.0,
+        2.8284271
+      ],
+      "back": [
+        -1.9506394,
+        0.0,
+        -3.4921348
+      ]
+    }
+  },
+  "results": {
+    "P_r0_ior150": {
+      "front": {
+        "cycles": {
+          "mean": [
+            3.5350394,
+            3.5350394,
+            3.5350394
+          ],
+          "stderr": [
+            4.7095116e-05,
+            4.7095116e-05,
+            4.7095116e-05
+          ]
+        },
+        "eevee": {
+          "mean": [
+            2.9580383,
+            2.9580383,
+            2.9580383
+          ]
+        },
+        "ior": 1.5,
+        "roughness": 0.0,
+        "base": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "node": "principled"
+      },
+      "back": {
+        "cycles": {
+          "mean": [
+            66.859555,
+            66.859555,
+            66.859555
+          ],
+          "stderr": [
+            0.015682058,
+            0.015682058,
+            0.015682058
+          ]
+        },
+        "eevee": {
+          "mean": [
+            26.073919,
+            26.073919,
+            26.073919
+          ]
+        },
+        "ior": 1.5,
+        "roughness": 0.0,
+        "base": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "node": "principled"
+      }
+    },
+    "P_r0_ior145": {
+      "front": {
+        "cycles": {
+          "mean": [
+            3.0483572,
+            3.0483572,
+            3.0483572
+          ],
+          "stderr": [
+            8.4311448e-05,
+            8.4311448e-05,
+            8.4311448e-05
+          ]
+        },
+        "eevee": {
+          "mean": [
+            2.5133362,
+            2.5133362,
+            2.5133362
+          ]
+        },
+        "ior": 1.45,
+        "roughness": 0.0,
+        "base": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "node": "principled"
+      },
+      "back": {
+        "cycles": {
+          "mean": [
+            67.344936,
+            67.344936,
+            67.344936
+          ],
+          "stderr": [
+            0.017525662,
+            0.017525662,
+            0.017525662
+          ]
+        },
+        "eevee": {
+          "mean": [
+            62.557617,
+            62.557617,
+            62.557617
+          ]
+        },
+        "ior": 1.45,
+        "roughness": 0.0,
+        "base": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "node": "principled"
+      }
+    },
+    "P_r02_ior150": {
+      "front": {
+        "cycles": {
+          "mean": [
+            3.3654336,
+            3.3654336,
+            3.3654336
+          ],
+          "stderr": [
+            0.00020879102,
+            0.00020879102,
+            0.00020879102
+          ]
+        },
+        "eevee": {
+          "mean": [
+            2.8334656,
+            2.8334656,
+            2.8334656
+          ]
+        },
+        "ior": 1.5,
+        "roughness": 0.2,
+        "base": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "node": "principled"
+      },
+      "back": {
+        "cycles": {
+          "mean": [
+            66.64674,
+            66.64674,
+            66.64674
+          ],
+          "stderr": [
+            0.015211354,
+            0.015211354,
+            0.015211354
+          ]
+        },
+        "eevee": {
+          "mean": [
+            28.040894,
+            28.040894,
+            28.040894
+          ]
+        },
+        "ior": 1.5,
+        "roughness": 0.2,
+        "base": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "node": "principled"
+      }
+    },
+    "P_r02_ior145": {
+      "front": {
+        "cycles": {
+          "mean": [
+            2.9043857,
+            2.9043857,
+            2.9043857
+          ],
+          "stderr": [
+            0.00022927191,
+            0.00022927191,
+            0.00022927191
+          ]
+        },
+        "eevee": {
+          "mean": [
+            2.4163818,
+            2.4163818,
+            2.4163818
+          ]
+        },
+        "ior": 1.45,
+        "roughness": 0.2,
+        "base": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "node": "principled"
+      },
+      "back": {
+        "cycles": {
+          "mean": [
+            67.166565,
+            67.166565,
+            67.166565
+          ],
+          "stderr": [
+            0.018860988,
+            0.018860988,
+            0.018860988
+          ]
+        },
+        "eevee": {
+          "mean": [
+            47.187012,
+            47.187012,
+            47.187012
+          ]
+        },
+        "ior": 1.45,
+        "roughness": 0.2,
+        "base": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "node": "principled"
+      }
+    },
+    "P_r05_ior150": {
+      "front": {
+        "cycles": {
+          "mean": [
+            1.1555004,
+            1.1555004,
+            1.1555004
+          ],
+          "stderr": [
+            8.0104811e-05,
+            8.0104811e-05,
+            8.0104811e-05
+          ]
+        },
+        "eevee": {
+          "mean": [
+            1.0275726,
+            1.0275726,
+            1.0275726
+          ]
+        },
+        "ior": 1.5,
+        "roughness": 0.5,
+        "base": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "node": "principled"
+      },
+      "back": {
+        "cycles": {
+          "mean": [
+            60.844538,
+            60.844538,
+            60.844538
+          ],
+          "stderr": [
+            0.0079138414,
+            0.0079138414,
+            0.0079138414
+          ]
+        },
+        "eevee": {
+          "mean": [
+            25.802734,
+            25.802734,
+            25.802734
+          ]
+        },
+        "ior": 1.5,
+        "roughness": 0.5,
+        "base": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "node": "principled"
+      }
+    },
+    "P_r05_ior145": {
+      "front": {
+        "cycles": {
+          "mean": [
+            0.99772909,
+            0.99772909,
+            0.99772909
+          ],
+          "stderr": [
+            6.7557663e-05,
+            6.7557663e-05,
+            6.7557663e-05
+          ]
+        },
+        "eevee": {
+          "mean": [
+            0.88666534,
+            0.88666534,
+            0.88666534
+          ]
+        },
+        "ior": 1.45,
+        "roughness": 0.5,
+        "base": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "node": "principled"
+      },
+      "back": {
+        "cycles": {
+          "mean": [
+            62.097119,
+            62.097119,
+            62.097119
+          ],
+          "stderr": [
+            0.012259179,
+            0.012259179,
+            0.012259179
+          ]
+        },
+        "eevee": {
+          "mean": [
+            29.992676,
+            29.992676,
+            29.992676
+          ]
+        },
+        "ior": 1.45,
+        "roughness": 0.5,
+        "base": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "node": "principled"
+      }
+    },
+    "P_r02_ior150_tint": {
+      "front": {
+        "cycles": {
+          "mean": [
+            3.3655237,
+            3.3652158,
+            3.3649535
+          ],
+          "stderr": [
+            0.00030203517,
+            0.00030169697,
+            0.00030143839
+          ]
+        },
+        "eevee": {
+          "mean": [
+            2.83255,
+            2.8325195,
+            2.8323975
+          ]
+        },
+        "ior": 1.5,
+        "roughness": 0.2,
+        "base": [
+          0.8,
+          0.5,
+          0.3,
+          1.0
+        ],
+        "node": "principled"
+      },
+      "back": {
+        "cycles": {
+          "mean": [
+            59.604277,
+            47.117035,
+            36.493874
+          ],
+          "stderr": [
+            0.013510868,
+            0.010680354,
+            0.0082722502
+          ]
+        },
+        "eevee": {
+          "mean": [
+            21.192871,
+            13.249817,
+            7.9516296
+          ]
+        },
+        "ior": 1.5,
+        "roughness": 0.2,
+        "base": [
+          0.8,
+          0.5,
+          0.3,
+          1.0
+        ],
+        "node": "principled"
+      }
+    },
+    "G_r02_ior150_tint": {
+      "front": {
+        "cycles": {
+          "mean": [
+            2.6920916,
+            1.6823106,
+            1.0092879
+          ],
+          "stderr": [
+            0.00016482739,
+            0.00010305486,
+            6.1842398e-05
+          ]
+        },
+        "eevee": {
+          "mean": [
+            2.2630615,
+            1.4128265,
+            0.85067749
+          ]
+        },
+        "ior": 1.5,
+        "roughness": 0.2,
+        "base": [
+          0.8,
+          0.5,
+          0.3,
+          1.0
+        ],
+        "node": "glass"
+      },
+      "back": {
+        "cycles": {
+          "mean": [
+            53.31221,
+            33.31528,
+            19.987229
+          ],
+          "stderr": [
+            0.012167949,
+            0.0076037805,
+            0.0045618782
+          ]
+        },
+        "eevee": {
+          "mean": [
+            16.948486,
+            6.6217041,
+            2.3838654
+          ]
+        },
+        "ior": 1.5,
+        "roughness": 0.2,
+        "base": [
+          0.8,
+          0.5,
+          0.3,
+          1.0
+        ],
+        "node": "glass"
+      }
+    }
+  }
+}

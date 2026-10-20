@@ -18,8 +18,8 @@ use crate::{
     error::{PotError, Result},
     geom::{
         Mesh,
-        bvh::{KdopTree, NearestHit, Ray, RayHit},
         blender_matrix::blender_invert_m4,
+        bvh::{KdopTree, NearestHit, Ray, RayHit},
         normals,
     },
     model::Modifier,
@@ -325,9 +325,8 @@ fn space_from_runtime(
     modifier: &Modifier,
     parameter: &str,
 ) -> Result<Space> {
-    let target_to_subject = to_mat(matrix.map_or(DMat4::IDENTITY, |matrix| {
-        DMat4::from_cols_array(&matrix)
-    }));
+    let target_to_subject =
+        to_mat(matrix.map_or(DMat4::IDENTITY, |matrix| DMat4::from_cols_array(&matrix)));
     let finite = |matrix: &Mat| matrix.iter().flatten().all(|value| value.is_finite());
     match blender_invert_m4(&target_to_subject) {
         Some(subject_to_target) if finite(&target_to_subject) && finite(&subject_to_target) => {
@@ -481,9 +480,9 @@ fn build_surface(mesh: &Mesh) -> Result<Surface> {
     let mut corner_offset = 0;
     for (face_index, face) in mesh.faces.iter().enumerate() {
         for _ in 0..face.vertices.len().saturating_sub(2) {
-            let ids = *tessellation.get(tri_index).ok_or_else(|| {
-                PotError::invalid_argument("target tessellation ended early")
-            })?;
+            let ids = *tessellation
+                .get(tri_index)
+                .ok_or_else(|| PotError::invalid_argument("target tessellation ended early"))?;
             tri_index += 1;
             let mut vertices = [0; 3];
             let mut corners = [0; 3];

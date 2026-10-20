@@ -678,7 +678,7 @@ fn prepare_geometry(mesh: &Mesh) -> Result<(Vec<Triangle>, Vec<DVec3>)> {
     let mut vertex_normals = vec![DVec3::ZERO; mesh.vertices.len()];
     let mut cumulative_area = 0.0_f64;
     let mesh_triangles = mesh
-        .triangulate()
+        .tessellate()
         .map_err(|error| invalid(&format!("particle emitter mesh is invalid: {error}")))?;
     for triangle in mesh_triangles {
         let indices = triangle.map(|id| vertex_indices.get(&id).copied());

@@ -154,6 +154,7 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             source_path: None,
             source_hash: None,
             alpha_mode,
+            tiled: false,
         },
     );
     engine.mark("images", &id, ChangeKind::Created);
@@ -215,6 +216,7 @@ fn load(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bool>
         ));
     }
     let source_hash = hash::sha256(&bytes);
+    let alpha_mode = crate::image::storage::default_alpha_mode(&bytes);
     let (image_source, blob, image_source_path, registered_hash) = if asset_policy == "copy" {
         let blob = stage_blob(engine, bytes);
         (ImageSource::Packed, Some(blob), None, Some(source_hash))
@@ -249,7 +251,8 @@ fn load(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bool>
             blob,
             source_path: image_source_path,
             source_hash: registered_hash,
-            alpha_mode: ImageAlphaMode::Straight,
+            alpha_mode,
+            tiled: false,
         },
     );
     engine.mark("images", &id, ChangeKind::Created);
@@ -313,6 +316,8 @@ fn set_pixels(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result
                 width,
                 height,
                 pixels: vec![[0.0; 4]; pixel_count],
+                precision: crate::image::Precision::Float,
+                colour: crate::image::ColourCache::default(),
             },
         );
         (width, height)
@@ -426,24 +431,28 @@ fn set_pixels(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result
         {
             metadata.width = tile.width;
             metadata.height = tile.height;
-            metadata.blob = blob;
+            metadata.blob = Some(blob);
         } else {
             updated.tiles.push(ImageTile {
                 number: tile_number,
                 width: tile.width,
                 height: tile.height,
-                blob,
+                blob: Some(blob),
+                label: String::new(),
             });
             updated.tiles.sort_by_key(|tile| tile.number);
         }
     }
-    if updated.blob.is_none() {
-        let bytes = encode_pixels(data.width, data.height, &data.pixels)?;
-        updated.blob = Some(stage_blob(engine, bytes));
+    // A missing base has no pixels to encode, so the edit stores only the tile and the image stays missing at its base.
+    if !updated.base_is_missing() {
+        if updated.blob.is_none() {
+            let bytes = encode_pixels(data.width, data.height, &data.pixels)?;
+            updated.blob = Some(stage_blob(engine, bytes));
+        }
+        updated.source = ImageSource::Packed;
+        updated.source_path = None;
+        updated.source_hash = None;
     }
-    updated.source = ImageSource::Packed;
-    updated.source_path = None;
-    updated.source_hash = None;
     engine.doc.images.insert(id.clone(), updated);
     engine.mark("images", &id, ChangeKind::Updated);
     Ok(true)

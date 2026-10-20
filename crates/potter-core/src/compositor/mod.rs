@@ -145,7 +145,7 @@ fn evaluate_graph(
             }
             let image = input_image(node, &inputs, base)?;
             let output = match node.node_type.as_str() {
-                "CompositorNodeComposite" | "Composite" => {
+                "CompositorNodeComposite" | "Composite" | "NodeGroupOutput" => {
                     composite = Some(image.clone());
                     image
                 }
@@ -852,7 +852,14 @@ pub(crate) fn write_multilayer_exr(
                             output
                                 .linear_rgba
                                 .iter()
-                                .map(|pixel| pixel[index])
+                                .map(|pixel| {
+                                    // Associated alpha, as Blender's EXR reader expects: colour times alpha, alpha as is.
+                                    if index < 3 {
+                                        pixel[index] * pixel[3]
+                                    } else {
+                                        pixel[index]
+                                    }
+                                })
                                 .collect(),
                         ),
                     )
@@ -1015,7 +1022,13 @@ fn write_file_output(node: &GraphNode, image: &Image) -> Result<()> {
             image.height as usize,
             |x, y| {
                 let pixel = image.pixels[y * image.width as usize + x];
-                (pixel[0], pixel[1], pixel[2], pixel[3])
+                // Associated alpha, as Blender's EXR reader expects (the colour is multiplied by alpha).
+                (
+                    pixel[0] * pixel[3],
+                    pixel[1] * pixel[3],
+                    pixel[2] * pixel[3],
+                    pixel[3],
+                )
             },
         )
         .map_err(|error| {
@@ -1050,6 +1063,16 @@ fn write_file_output(node: &GraphNode, image: &Image) -> Result<()> {
     })
 }
 
+/// Display-encodes a raster's linear pixels through the scene's view transform and look, without
+/// running its compositor graph. Solid previews use it, as Blender's Workbench output goes through the
+/// view transform.
+pub(crate) fn encode_display_output(
+    output: &mut RasterOutput,
+    settings: &ColorManagement,
+) -> Result<()> {
+    encode_display(&mut output.rgba, &output.linear_rgba, settings)
+}
+
 /// Applies scene color management and returns the image's display-encoded RGBA8 pixels.
 pub(crate) fn encode_image_display(image: &Image, settings: &ColorManagement) -> Result<Vec<u8>> {
     let length = image.pixels.len().checked_mul(4).ok_or_else(|| {
@@ -1077,8 +1100,9 @@ fn encode_display(bytes: &mut [u8], pixels: &[[f32; 4]], settings: &ColorManagem
             "display image buffer dimensions do not match",
         ));
     }
+    let encoder = settings.display_encoder()?;
     for (pixel, linear) in encoded_pixels.iter_mut().zip(pixels) {
-        let display = settings.display_encode([linear[0], linear[1], linear[2]])?;
+        let display = encoder.encode([linear[0], linear[1], linear[2]])?;
         for channel in 0..3 {
             pixel[channel] = (display[channel] * 255.0).round() as u8;
         }

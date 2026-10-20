@@ -681,3 +681,58 @@ fn shrinkwrap_scene_operand_reaches_modifier_apply_and_persistence() -> Result<(
     }
     Ok(())
 }
+
+#[test]
+fn mirror_object_apply_uses_owner_and_mirror_world_matrices() -> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let scene = directory.path().join("scene");
+    let batch = directory.path().join("operations.json");
+    let init = Command::new(env!("CARGO_BIN_EXE_pot"))
+        .arg("init")
+        .arg(&scene)
+        .arg("--json")
+        .output()?;
+    assert!(init.status.success());
+
+    fs::write(
+        &batch,
+        serde_json::to_vec(&json!({
+            "schema_version":1,
+            "base_revision":0,
+            "operations":[
+                {"op":"node.create","id":"body","kind":"box","params":{"size":2.0},"transform":{"translation":[3.0,0.0,0.0]}},
+                {"op":"node.create","id":"pivot","kind":"empty","transform":{"translation":[1.0,0.0,0.0]}},
+                {"op":"modifier.create","target":{"id":"body"},"id":"mirror","type":"mirror","params":{"use_axis":[true,false,false],"mirror_object":"pivot"}},
+                {"op":"modifier.apply","target":{"id":"body"},"modifier_id":"mirror"}
+            ]
+        }))?,
+    )?;
+    let applied = Command::new(env!("CARGO_BIN_EXE_pot"))
+        .arg("apply")
+        .arg(&scene)
+        .arg("--file")
+        .arg(&batch)
+        .arg("--json")
+        .output()?;
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stdout)
+    );
+
+    let inspect = Command::new(env!("CARGO_BIN_EXE_pot"))
+        .arg("inspect")
+        .arg(&scene)
+        .arg("--id")
+        .arg("body")
+        .arg("--json")
+        .output()?;
+    assert!(inspect.status.success());
+    let envelope: Value = serde_json::from_slice(&inspect.stdout)?;
+    let item = &envelope["result"]["items"][0];
+    assert_eq!(item["modifiers"], json!([]));
+    assert_eq!(item["evaluated_geometry"]["vertex_count"], 16);
+    assert_eq!(item["bounds"]["min"], json!([-2.0, -1.0, -1.0]));
+    assert_eq!(item["bounds"]["max"], json!([4.0, 1.0, 1.0]));
+    Ok(())
+}

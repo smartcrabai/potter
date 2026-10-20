@@ -7,7 +7,7 @@
 //!
 //! The public [`Mesh`] stores stable `u32` IDs independently for vertices, edges, and
 //! polygon faces. References in edges/faces use vertex IDs, never vector positions.
-//! [`Mesh::validate`] checks this invariant and [`Mesh::triangulate`] returns vertex
+//! [`Mesh::validate`] checks this invariant and [`Mesh::tessellate`] returns vertex
 //! IDs while preserving each polygon's winding. Primitive parameter structs implement
 //! [`Default`] with Blender's standard add-primitive settings; override only the fields
 //! that differ. [`Mesh::bounds`] includes loose vertices and returns `None` for an
@@ -19,7 +19,7 @@ use std::{
     fmt,
 };
 
-use glam::{DVec2, DVec3};
+use glam::DVec3;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
 
@@ -32,19 +32,27 @@ pub(crate) mod color_layers;
 pub(crate) mod concat;
 pub mod curve;
 pub mod edit;
+mod heap;
 pub(crate) mod heap_simple;
+pub(crate) mod interpolation;
 pub mod lattice;
 pub mod mesh_cache;
 pub mod metaball;
 pub mod modifiers;
+pub(crate) mod multires_external;
 pub(crate) mod normals;
 pub mod pointcloud;
+pub(crate) mod pool_slots;
+mod primitive_order;
+mod primitive_uv;
 pub(crate) mod provenance;
 pub mod remesh;
 pub mod sculpt;
+mod sculpt_dabs;
 pub mod text;
 pub(crate) mod triangulate;
 pub(crate) mod uv_layers;
+mod uv_sphere;
 pub mod vdb;
 pub mod volume;
 
@@ -61,6 +69,8 @@ pub fn corner_normal_vectors(mesh: &Mesh) -> crate::error::Result<Vec<DVec3>> {
     normals::corner_normals(mesh, &positions)
 }
 
+#[cfg(test)]
+mod mirror_oracle;
 #[cfg(test)]
 mod shading_oracle;
 
@@ -163,8 +173,6 @@ pub enum MeshError {
     InvalidTopology(&'static str),
     /// The next ID cannot be incremented without overflowing `u32`.
     IdExhausted,
-    /// Polygon could not be triangulated (usually because it is degenerate).
-    TriangulationFailed(u32),
 }
 
 impl fmt::Display for MeshError {
@@ -175,7 +183,6 @@ impl fmt::Display for MeshError {
             }
             Self::InvalidTopology(message) => write!(formatter, "invalid mesh topology: {message}"),
             Self::IdExhausted => formatter.write_str("mesh element ID space exhausted"),
-            Self::TriangulationFailed(id) => write!(formatter, "could not triangulate face {id}"),
         }
     }
 }
@@ -425,6 +432,9 @@ impl Default for GridParams {
         }
     }
 }
+
+/// The largest UV sphere ring count: `uv_sphere::topology` computes `2 * rings * 8` in an `i32`.
+const MAX_UV_SPHERE_RINGS: u64 = (i32::MAX / 16) as u64;
 
 impl Mesh {
     /// Construct an empty mesh with all next IDs set to zero.
@@ -732,30 +742,17 @@ impl Mesh {
         Some(Aabb { min, max })
     }
 
-    /// Triangulate polygons into vertex-ID triples, preserving face winding.
-    ///
-    /// Each simple, non-degenerate polygon produces exactly `n - 2` triangles.
-    /// Loose vertices and edges do not appear in the result.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for invalid mesh topology, degenerate polygons, or ID exhaustion.
-    pub fn triangulate(&self) -> Result<Vec<[u32; 3]>, MeshError> {
-        self.triangulate_with(false)
-    }
-
-    /// Triangulate as Blender's tessellation does (`mesh_tessellate.cc`): a quad splits along its
-    /// 0-2 diagonal from its first corner, flipped to 1-3 when that split folds. Use this where
-    /// Blender's looptris define the surface, such as a Shrinkwrap target.
+    /// Triangulate every face as Blender's `Mesh::corner_tris` does (`mesh_tessellate.cc`): a
+    /// quad splits along its 0-2 diagonal, flipped to 1-3 when that split folds; any other face
+    /// uses Blender's clip ear-clipper (`BLI_polyfill_calc`), which accepts self-intersecting and
+    /// zero-area input. Each face yields `n - 2` triangles in its winding; loose vertices and edges
+    /// do not appear. Render, preview, exports, and modifiers that need Blender's looptris use this
+    /// one implementation, so their diagonals match Blender.
     ///
     /// # Errors
     ///
-    /// Returns the errors of [`Mesh::triangulate`].
+    /// Returns an error only for invalid mesh topology or ID exhaustion.
     pub fn tessellate(&self) -> Result<Vec<[u32; 3]>, MeshError> {
-        self.triangulate_with(true)
-    }
-
-    fn triangulate_with(&self, blender_quads: bool) -> Result<Vec<[u32; 3]>, MeshError> {
         self.validate()?;
         let capacity = self.faces.iter().try_fold(0_usize, |capacity, face| {
             capacity
@@ -769,7 +766,7 @@ impl Mesh {
             .collect();
         let mut result = Vec::with_capacity(capacity);
         for face in &self.faces {
-            result.extend(triangulate_face(face, &positions, blender_quads)?);
+            result.extend(tessellate_face(face, &positions)?);
         }
         Ok(result)
     }
@@ -785,39 +782,19 @@ impl Mesh {
                 "box dimensions must be finite and positive",
             ));
         }
-        let half = params.size * 0.5;
-        let positions = vec![
-            DVec3::new(-half.x, -half.y, -half.z),
-            DVec3::new(half.x, -half.y, -half.z),
-            DVec3::new(half.x, half.y, -half.z),
-            DVec3::new(-half.x, half.y, -half.z),
-            DVec3::new(-half.x, -half.y, half.z),
-            DVec3::new(half.x, -half.y, half.z),
-            DVec3::new(half.x, half.y, half.z),
-            DVec3::new(-half.x, half.y, half.z),
-        ];
-        Self::from_positions_and_faces(
-            positions,
-            vec![
-                vec![0, 3, 2, 1],
-                vec![4, 5, 6, 7],
-                vec![0, 1, 5, 4],
-                vec![1, 2, 6, 5],
-                vec![2, 3, 7, 6],
-                vec![3, 0, 4, 7],
-            ],
-        )
+        let mut mesh = primitive_order::cube(params.size * 0.5)?;
+        primitive_uv::cube(&mut mesh);
+        Ok(mesh)
     }
 
-    /// Create a Blender-default or customized UV sphere.
+    /// Create a Blender-default or customized UV sphere in Blender 5.2.2 storage order.
+    ///
+    /// Vertex order and positions match Blender bit for bit; see [`uv_sphere`] for the edge
+    /// and face order.
     ///
     /// # Errors
     ///
     /// Returns an error for invalid radii/ring counts or exhausted mesh IDs.
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "indices derive from u32 counts and are exactly representable in f64"
-    )]
     pub fn uv_sphere(params: UvSphereParams) -> Result<Self, MeshError> {
         validate_radial_count(params.segments, "UV sphere segments")?;
         if params.ring_count < 3 {
@@ -826,127 +803,48 @@ impl Mesh {
             ));
         }
         positive(params.radius, "UV sphere radius")?;
-        let segments = usize::try_from(params.segments).map_err(|_| MeshError::IdExhausted)?;
-        let rings = usize::try_from(params.ring_count).map_err(|_| MeshError::IdExhausted)?;
-        let intermediate_rings = rings.checked_sub(1).ok_or(MeshError::IdExhausted)?;
-        let vertex_count = segments
-            .checked_mul(intermediate_rings)
-            .and_then(|n| n.checked_add(2))
-            .ok_or(MeshError::IdExhausted)?;
-        if vertex_count > u32::MAX as usize {
+        // Faces are segments x rings and vertices segments x (rings - 1) + 2; each takes a u32 ID.
+        // `uv_sphere::topology` multiplies the ring count by 16 inside an i32, so rings are bounded.
+        let (segments, rings) = (u64::from(params.segments), u64::from(params.ring_count));
+        let faces = segments * rings;
+        let vertices = segments * (rings - 1) + 2;
+        let edges = faces + vertices - 2;
+        if [faces, vertices, edges]
+            .iter()
+            .any(|count| *count > u64::from(u32::MAX))
+            || rings > MAX_UV_SPHERE_RINGS
+        {
             return Err(MeshError::IdExhausted);
         }
-        let mut positions = Vec::with_capacity(vertex_count);
-        positions.push(DVec3::new(0.0, 0.0, params.radius));
-        for ring in 1..rings {
-            let latitude = std::f64::consts::PI * ring as f64 / rings as f64;
-            let z = params.radius * latitude.cos();
-            let radial = params.radius * latitude.sin();
-            for segment in 0..segments {
-                let longitude = std::f64::consts::FRAC_PI_2
-                    - std::f64::consts::TAU * segment as f64 / segments as f64;
-                positions.push(DVec3::new(
-                    radial * longitude.cos(),
-                    radial * longitude.sin(),
-                    z,
-                ));
-            }
-        }
-        let bottom = positions.len();
-        positions.push(DVec3::new(0.0, 0.0, -params.radius));
-        let ring_id = |ring: usize, segment: usize| 1 + ring * segments + segment % segments;
-        let mut polygons = Vec::with_capacity(segments * rings);
-        for segment in 0..segments {
-            polygons.push(vec![0, ring_id(0, segment + 1), ring_id(0, segment)]);
-        }
-        for ring in 0..rings - 2 {
-            for segment in 0..segments {
-                polygons.push(vec![
-                    ring_id(ring, segment),
-                    ring_id(ring, segment + 1),
-                    ring_id(ring + 1, segment + 1),
-                    ring_id(ring + 1, segment),
-                ]);
-            }
-        }
-        for segment in 0..segments {
-            polygons.push(vec![
-                ring_id(rings - 2, segment),
-                ring_id(rings - 2, segment + 1),
-                bottom,
-            ]);
-        }
-        Self::from_positions_and_faces(positions, polygons)
+        let mut mesh = uv_sphere::build(params)?;
+        primitive_uv::uv_sphere(&mut mesh);
+        Ok(mesh)
     }
     /// Create a Blender-default or customized capped cylinder.
     ///
     /// # Errors
     ///
     /// Returns an error for invalid dimensions/vertex counts or exhausted mesh IDs.
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "indices derive from u32 counts and are exactly representable in f64"
-    )]
     pub fn cylinder(params: CylinderParams) -> Result<Self, MeshError> {
         validate_radial_count(params.vertices, "cylinder vertices")?;
         positive(params.radius, "cylinder radius")?;
         positive(params.depth, "cylinder depth")?;
         let count = params.vertices as usize;
-        let fan_caps = params.end_fill_type == EndFillType::TriFan;
-        let mut positions = Vec::with_capacity(count * 2 + if fan_caps { 2 } else { 0 });
-        let bottom_center = if fan_caps {
-            let center = positions.len();
-            positions.push(DVec3::new(0.0, 0.0, -params.depth * 0.5));
-            Some(center)
-        } else {
-            None
-        };
-        let top_center = if fan_caps {
-            let center = positions.len();
-            positions.push(DVec3::new(0.0, 0.0, params.depth * 0.5));
-            Some(center)
-        } else {
-            None
-        };
-        let bottom_start = positions.len();
-        for z in [-params.depth * 0.5, params.depth * 0.5] {
-            for index in 0..count {
-                let angle = std::f64::consts::FRAC_PI_2
-                    - std::f64::consts::TAU * index as f64 / count as f64;
-                positions.push(DVec3::new(
-                    params.radius * angle.cos(),
-                    params.radius * angle.sin(),
-                    z,
-                ));
-            }
-        }
-        let top_start = bottom_start + count;
-        let mut polygons = Vec::with_capacity(count * 3 + 2);
-        for index in 0..count {
-            let next = (index + 1) % count;
-            polygons.push(vec![
-                bottom_start + index,
-                top_start + index,
-                top_start + next,
-                bottom_start + next,
-            ]);
-            match params.end_fill_type {
-                EndFillType::Nothing | EndFillType::Ngon => {}
-                EndFillType::TriFan => {
-                    if let Some(center) = bottom_center {
-                        polygons.push(vec![center, bottom_start + index, bottom_start + next]);
-                    }
-                    if let Some(center) = top_center {
-                        polygons.push(vec![center, top_start + next, top_start + index]);
-                    }
-                }
-            }
-        }
-        if params.end_fill_type == EndFillType::Ngon {
-            polygons.push((bottom_start..top_start).collect());
-            polygons.push((top_start..top_start + count).rev().collect());
-        }
-        Self::from_positions_and_faces(positions, polygons)
+        let mut mesh = primitive_order::cone(
+            count,
+            params.radius,
+            params.radius,
+            params.depth,
+            params.end_fill_type,
+        )?;
+        primitive_uv::cone(
+            &mut mesh,
+            params.radius,
+            params.radius,
+            count,
+            params.end_fill_type,
+        );
+        Ok(mesh)
     }
 
     /// Create a Blender-default or customized XY plane.
@@ -956,16 +854,9 @@ impl Mesh {
     /// Returns an error when the plane size is not finite and positive.
     pub fn plane(params: PlaneParams) -> Result<Self, MeshError> {
         positive(params.size, "plane size")?;
-        let half = params.size * 0.5;
-        Self::from_positions_and_faces(
-            vec![
-                DVec3::new(-half, -half, 0.0),
-                DVec3::new(half, -half, 0.0),
-                DVec3::new(half, half, 0.0),
-                DVec3::new(-half, half, 0.0),
-            ],
-            vec![vec![0, 1, 2, 3]],
-        )
+        let mut mesh = primitive_order::grid(2, 2, params.size, params.size)?;
+        primitive_uv::grid(&mut mesh, 1, 1);
+        Ok(mesh)
     }
 
     /// Create a Blender-default or customized cone/truncated cone with capped ends.
@@ -973,10 +864,6 @@ impl Mesh {
     /// # Errors
     ///
     /// Returns an error for invalid radii, depth, vertex count, or exhausted mesh IDs.
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "indices derive from u32 counts and are exactly representable in f64"
-    )]
     pub fn cone(params: ConeParams) -> Result<Self, MeshError> {
         validate_radial_count(params.vertices, "cone vertices")?;
         positive(params.depth, "cone depth")?;
@@ -988,98 +875,21 @@ impl Mesh {
             ));
         }
         let count = params.vertices as usize;
-        let fan_caps = params.end_fill_type == EndFillType::TriFan;
-        let has_bottom = params.radius1 > 0.0;
-        let has_top = params.radius2 > 0.0;
-        let cap_count = usize::from(fan_caps && has_bottom) + usize::from(fan_caps && has_top);
-        let mut positions = Vec::with_capacity(count * 2 + cap_count + 2);
-        let bottom_center = if fan_caps && has_bottom {
-            let center = positions.len();
-            positions.push(DVec3::new(0.0, 0.0, -params.depth * 0.5));
-            Some(center)
-        } else {
-            None
-        };
-        let top_center = if fan_caps && has_top {
-            let center = positions.len();
-            positions.push(DVec3::new(0.0, 0.0, params.depth * 0.5));
-            Some(center)
-        } else {
-            None
-        };
-        let ring = |positions: &mut Vec<DVec3>, radius: f64, z: f64| {
-            let start = positions.len();
-            for index in 0..count {
-                let angle = std::f64::consts::FRAC_PI_2
-                    - std::f64::consts::TAU * index as f64 / count as f64;
-                positions.push(DVec3::new(radius * angle.cos(), radius * angle.sin(), z));
-            }
-            start
-        };
-        let bottom_start =
-            has_bottom.then(|| ring(&mut positions, params.radius1, -params.depth * 0.5));
-        let bottom_apex = if has_bottom {
-            None
-        } else {
-            let apex = positions.len();
-            positions.push(DVec3::new(0.0, 0.0, -params.depth * 0.5));
-            Some(apex)
-        };
-        let top_start = has_top.then(|| ring(&mut positions, params.radius2, params.depth * 0.5));
-        let top_apex = if has_top {
-            None
-        } else {
-            let apex = positions.len();
-            positions.push(DVec3::new(0.0, 0.0, params.depth * 0.5));
-            Some(apex)
-        };
-        let mut polygons = Vec::with_capacity(count * 3 + 2);
-        for index in 0..count {
-            let next = (index + 1) % count;
-            match (bottom_start, top_start) {
-                (Some(bottom), Some(top)) => {
-                    polygons.push(vec![bottom + index, top + index, top + next, bottom + next]);
-                }
-                (Some(bottom), None) => {
-                    let apex =
-                        top_apex.ok_or(MeshError::InvalidTopology("cone top apex is missing"))?;
-                    polygons.push(vec![bottom + index, apex, bottom + next]);
-                }
-                (None, Some(top)) => {
-                    let apex = bottom_apex
-                        .ok_or(MeshError::InvalidTopology("cone bottom apex is missing"))?;
-                    polygons.push(vec![apex, top + next, top + index]);
-                }
-                (None, None) => {
-                    return Err(MeshError::InvalidParameter(
-                        "at least one cone radius must be positive",
-                    ));
-                }
-            }
-        }
-        match params.end_fill_type {
-            EndFillType::Nothing => {}
-            EndFillType::Ngon => {
-                if let Some(bottom) = bottom_start {
-                    polygons.push((bottom..bottom + count).collect());
-                }
-                if let Some(top) = top_start {
-                    polygons.push((top..top + count).rev().collect());
-                }
-            }
-            EndFillType::TriFan => {
-                for index in 0..count {
-                    let next = (index + 1) % count;
-                    if let (Some(center), Some(bottom)) = (bottom_center, bottom_start) {
-                        polygons.push(vec![center, bottom + index, bottom + next]);
-                    }
-                    if let (Some(center), Some(top)) = (top_center, top_start) {
-                        polygons.push(vec![center, top + next, top + index]);
-                    }
-                }
-            }
-        }
-        Self::from_positions_and_faces(positions, polygons)
+        let mut mesh = primitive_order::cone(
+            count,
+            params.radius1,
+            params.radius2,
+            params.depth,
+            params.end_fill_type,
+        )?;
+        primitive_uv::cone(
+            &mut mesh,
+            params.radius2,
+            params.radius1,
+            count,
+            params.end_fill_type,
+        );
+        Ok(mesh)
     }
 
     /// Create a Blender-default or customized torus.
@@ -1147,7 +957,9 @@ impl Mesh {
                 ]);
             }
         }
-        Self::from_positions_and_faces(positions, polygons)
+        let mut mesh = primitive_order::torus(positions, &polygons)?;
+        primitive_uv::torus(&mut mesh, major, minor);
+        Ok(mesh)
     }
 
     /// Create a Blender-default or customized recursively subdivided icosphere.
@@ -1211,13 +1023,10 @@ impl Mesh {
             [10, 9, 11],
         ];
         if params.subdivisions == 1 {
-            return Self::from_positions_and_faces(
-                positions,
-                base_faces
-                    .into_iter()
-                    .map(|face| face.into_iter().collect())
-                    .collect(),
-            );
+            let polygons: Vec<Vec<usize>> = base_faces.iter().map(|face| face.to_vec()).collect();
+            let mut mesh = primitive_order::polygons(positions, &polygons)?;
+            primitive_uv::icosphere_level_one(&mut mesh);
+            return Ok(mesh);
         }
 
         // Blender subdivides the original edges once with all cuts for the
@@ -1297,7 +1106,43 @@ impl Mesh {
             grids[face_index] = rows;
         }
 
+        // Blender's subdivide_edges (bmo_subdivide.cc): each original edge keeps its slot, now
+        // holding its last cut point and end vertex. Then each edge's first half and cut edges are
+        // appended in edge order. Then each face's grid is filled, last face first (the operator's
+        // stack), with the diagonal and its splits, and the grid's connecting edges.
+        let mut edge_pairs: Vec<[usize; 2]> =
+            Vec::with_capacity(edges.len() * (cuts + 1) + base_faces.len() * 3 * cuts * cuts);
+        for (endpoints, points) in &edges {
+            edge_pairs.push([points[cuts - 1], endpoints[1]]);
+        }
+        for (endpoints, points) in &edges {
+            let mut previous = endpoints[0];
+            for &point in points {
+                edge_pairs.push([previous, point]);
+                previous = point;
+            }
+        }
+        for rows in grids.iter().rev() {
+            for row in 0..cuts {
+                let diagonal = edge_pairs.len();
+                edge_pairs.push([rows[row + 1][0], rows[row + 1][row + 1]]);
+                for split in 0..row {
+                    edge_pairs.push([rows[row + 1][split], rows[row + 1][split + 1]]);
+                }
+                if row > 0 {
+                    edge_pairs[diagonal] = [rows[row + 1][row], rows[row + 1][row + 1]];
+                }
+            }
+            for row in 1..=cuts {
+                for column in 0..row {
+                    edge_pairs.push([rows[row][column], rows[row + 1][column + 1]]);
+                    edge_pairs.push([rows[row][column + 1], rows[row + 1][column + 1]]);
+                }
+            }
+        }
+
         let face_count = base_faces.len() * (cuts + 1).pow(2);
+        let uv_table = primitive_uv::icosphere_uv_table(&base_faces, &edges, &grids);
         let mut polygons = Vec::with_capacity(face_count);
         let mut retained_faces = Vec::with_capacity(base_faces.len());
         let mut added_faces = Vec::with_capacity(base_faces.len());
@@ -1327,7 +1172,18 @@ impl Mesh {
         for added in added_faces.into_iter().rev() {
             polygons.extend(added);
         }
-        Self::from_positions_and_faces(positions, polygons)
+        // Polygons come retained faces first, then each base face's cut faces last face first; every
+        // polygon's origin is the base face it was cut from.
+        let mut origins: Vec<usize> = (0..base_faces.len()).collect();
+        let cut_faces = (cuts + 1).pow(2) - 1;
+        origins.extend(
+            (0..base_faces.len())
+                .rev()
+                .flat_map(|face| std::iter::repeat_n(face, cut_faces)),
+        );
+        let mut mesh = primitive_order::explicit_edges(positions, &edge_pairs, &polygons)?;
+        primitive_uv::attach_by_origin(&mut mesh, &polygons, &origins, &uv_table)?;
+        Ok(mesh)
     }
 
     /// Create a Blender-default or customized XY circle with optional fill.
@@ -1335,45 +1191,12 @@ impl Mesh {
     /// # Errors
     ///
     /// Returns an error for invalid circle radii/counts or exhausted mesh IDs.
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "indices derive from u32 counts and are exactly representable in f64"
-    )]
     pub fn circle(params: CircleParams) -> Result<Self, MeshError> {
         validate_radial_count(params.vertices, "circle vertices")?;
         positive(params.radius, "circle radius")?;
-        let count = params.vertices as usize;
-        let fan = params.fill_type == CircleFillType::TriFan;
-        let mut positions = Vec::with_capacity(count + usize::from(fan));
-        if fan {
-            positions.push(DVec3::ZERO);
-        }
-        let ring_start = positions.len();
-        for index in 0..count {
-            let angle =
-                std::f64::consts::FRAC_PI_2 - std::f64::consts::TAU * index as f64 / count as f64;
-            positions.push(DVec3::new(
-                params.radius * angle.cos(),
-                params.radius * angle.sin(),
-                0.0,
-            ));
-        }
-        let polygons = match params.fill_type {
-            CircleFillType::Nothing => Vec::new(),
-            CircleFillType::Ngon => vec![(ring_start..ring_start + count).rev().collect()],
-            CircleFillType::TriFan => (0..count)
-                .map(|index| vec![0, ring_start + (index + 1) % count, ring_start + index])
-                .collect(),
-        };
-        let mut mesh = Self::from_positions_and_faces(positions, polygons)?;
-        if params.fill_type == CircleFillType::Nothing {
-            for index in 0..count {
-                let first = u32::try_from(index).map_err(|_| MeshError::IdExhausted)?;
-                let next =
-                    u32::try_from((index + 1) % count).map_err(|_| MeshError::IdExhausted)?;
-                mesh.insert_edge([first, next])?;
-            }
-        }
+        let mut mesh =
+            primitive_order::circle(params.vertices as usize, params.radius, params.fill_type)?;
+        primitive_uv::circle(&mut mesh, params.radius);
         Ok(mesh)
     }
 
@@ -1382,10 +1205,6 @@ impl Mesh {
     /// # Errors
     ///
     /// Returns an error for non-positive sizes, invalid subdivision counts, or exhausted IDs.
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "indices derive from u32 counts and are exactly representable in f64"
-    )]
     pub fn grid(params: GridParams) -> Result<Self, MeshError> {
         positive(params.size_x, "grid X size")?;
         positive(params.size_y, "grid Y size")?;
@@ -1394,33 +1213,27 @@ impl Mesh {
                 "grid subdivisions must be at least two per axis",
             ));
         }
-        let nx = params.x_subdivisions as usize;
-        let ny = params.y_subdivisions as usize;
-        let vertex_count = nx.checked_mul(ny).ok_or(MeshError::IdExhausted)?;
-        if vertex_count > u32::MAX as usize {
+        // Vertices, edges and faces each take a u32 ID; refuse before anything is allocated.
+        let (x, y) = (
+            u64::from(params.x_subdivisions),
+            u64::from(params.y_subdivisions),
+        );
+        let vertices = x * y;
+        let edges = x * (y - 1) + y * (x - 1);
+        let faces = (x - 1) * (y - 1);
+        if [vertices, edges, faces]
+            .iter()
+            .any(|count| *count > u64::from(u32::MAX))
+        {
             return Err(MeshError::IdExhausted);
         }
-        let mut positions = Vec::with_capacity(vertex_count);
-        for y in 0..ny {
-            for x in 0..nx {
-                let px = -params.size_x * 0.5 + params.size_x * x as f64 / (nx - 1) as f64;
-                let py = -params.size_y * 0.5 + params.size_y * y as f64 / (ny - 1) as f64;
-                positions.push(DVec3::new(px, py, 0.0));
-            }
-        }
-        let mut polygons = Vec::with_capacity((nx - 1) * (ny - 1));
-        for y in 0..ny - 1 {
-            for x in 0..nx - 1 {
-                let lower_left = y * nx + x;
-                polygons.push(vec![
-                    lower_left,
-                    lower_left + 1,
-                    lower_left + nx + 1,
-                    lower_left + nx,
-                ]);
-            }
-        }
-        Self::from_positions_and_faces(positions, polygons)
+        let (nx, ny) = (
+            params.x_subdivisions as usize,
+            params.y_subdivisions as usize,
+        );
+        let mut mesh = primitive_order::grid(nx, ny, params.size_x, params.size_y)?;
+        primitive_uv::grid(&mut mesh, nx - 1, ny - 1);
+        Ok(mesh)
     }
 }
 /// Create a Blender-style primitive by lowercase kind and optional JSON parameters.
@@ -1634,139 +1447,25 @@ fn normalize_sphere_point(mut point: [f32; 3], radius: f32) -> [f32; 3] {
     point
 }
 
-fn triangulate_face(
+/// One face's triangles as `mesh_tessellate.cc` lays them out (see [`Mesh::tessellate`]).
+fn tessellate_face(
     face: &Face,
     vertex_positions: &HashMap<u32, DVec3>,
-    blender_quads: bool,
 ) -> Result<Vec<[u32; 3]>, MeshError> {
-    let points: Vec<DVec3> = face
+    let corners = face
         .vertices
         .iter()
         .map(|id| {
-            vertex_positions
-                .get(id)
-                .copied()
-                .ok_or(MeshError::InvalidTopology(
-                    "face references a missing vertex",
-                ))
+            let point = vertex_positions.get(id).ok_or(MeshError::InvalidTopology(
+                "face references a missing vertex",
+            ))?;
+            Ok([point.x as f32, point.y as f32, point.z as f32])
         })
-        .collect::<Result<_, _>>()?;
-    if blender_quads {
-        let corners: Vec<[f32; 3]> = points
-            .iter()
-            .map(|point| [point.x as f32, point.y as f32, point.z as f32])
-            .collect();
-        return Ok(triangulate::loop_triangles(&corners)
-            .into_iter()
-            .map(|[a, b, c]| [face.vertices[a], face.vertices[b], face.vertices[c]])
-            .collect());
-    }
-    let normal = points
-        .iter()
-        .zip(points.iter().cycle().skip(1))
-        .take(points.len())
-        .fold(DVec3::ZERO, |sum, (current, next)| {
-            sum + DVec3::new(
-                (current.y - next.y) * (current.z + next.z),
-                (current.z - next.z) * (current.x + next.x),
-                (current.x - next.x) * (current.y + next.y),
-            )
-        });
-    let absolute = normal.abs();
-    let axis = if absolute.x >= absolute.y && absolute.x >= absolute.z {
-        0
-    } else if absolute.y >= absolute.z {
-        1
-    } else {
-        2
-    };
-    let projected: Vec<DVec2> = points
-        .iter()
-        .map(|point| match axis {
-            0 => DVec2::new(point.y, point.z),
-            1 => DVec2::new(point.x, point.z),
-            _ => DVec2::new(point.x, point.y),
-        })
-        .collect();
-    let twice_area = projected
-        .iter()
-        .zip(projected.iter().cycle().skip(1))
-        .take(projected.len())
-        .map(|(a, b)| a.x * b.y - b.x * a.y)
-        .sum::<f64>();
-    let scale = projected
-        .iter()
-        .fold(1.0_f64, |scale, point| scale.max(point.abs().max_element()));
-    let epsilon = f64::EPSILON * scale * scale * 32.0;
-    if !twice_area.is_finite() || twice_area.abs() <= epsilon {
-        return Err(MeshError::TriangulationFailed(face.id));
-    }
-    let orientation = twice_area.signum();
-    let mut remaining: Vec<usize> = (0..face.vertices.len()).collect();
-    let mut triangles = Vec::with_capacity(remaining.len() - 2);
-    while remaining.len() > 3 {
-        let mut ear = None;
-        for cursor in 0..remaining.len() {
-            let previous = remaining[(cursor + remaining.len() - 1) % remaining.len()];
-            let current = remaining[cursor];
-            let next = remaining[(cursor + 1) % remaining.len()];
-            let a = projected[previous];
-            let b = projected[current];
-            let c = projected[next];
-            if cross2(b - a, c - b) * orientation <= epsilon {
-                continue;
-            }
-            if remaining
-                .iter()
-                .copied()
-                .filter(|candidate| {
-                    *candidate != previous && *candidate != current && *candidate != next
-                })
-                .any(|candidate| {
-                    point_in_triangle_2d(projected[candidate], a, b, c, orientation, epsilon)
-                })
-            {
-                continue;
-            }
-            ear = Some((
-                cursor,
-                [
-                    face.vertices[previous],
-                    face.vertices[current],
-                    face.vertices[next],
-                ],
-            ));
-            break;
-        }
-        let Some((cursor, triangle)) = ear else {
-            return Err(MeshError::TriangulationFailed(face.id));
-        };
-        triangles.push(triangle);
-        remaining.remove(cursor);
-    }
-    triangles.push([
-        face.vertices[remaining[0]],
-        face.vertices[remaining[1]],
-        face.vertices[remaining[2]],
-    ]);
-    Ok(triangles)
-}
-
-fn cross2(a: DVec2, b: DVec2) -> f64 {
-    a.x * b.y - a.y * b.x
-}
-
-fn point_in_triangle_2d(
-    point: DVec2,
-    a: DVec2,
-    b: DVec2,
-    c: DVec2,
-    orientation: f64,
-    epsilon: f64,
-) -> bool {
-    cross2(b - a, point - a) * orientation >= -epsilon
-        && cross2(c - b, point - b) * orientation >= -epsilon
-        && cross2(a - c, point - c) * orientation >= -epsilon
+        .collect::<Result<Vec<[f32; 3]>, MeshError>>()?;
+    Ok(triangulate::loop_triangles(&corners)
+        .into_iter()
+        .map(|[a, b, c]| [face.vertices[a], face.vertices[b], face.vertices[c]])
+        .collect())
 }
 
 #[must_use]
@@ -1809,34 +1508,34 @@ mod tests {
             (cube.vertices.len(), cube.edges.len(), cube.faces.len()),
             (8, 12, 6)
         );
-        assert_eq!(cube.triangulate().unwrap().len(), 12);
+        assert_eq!(cube.tessellate().unwrap().len(), 12);
 
         let sphere = Mesh::uv_sphere(UvSphereParams::default()).unwrap();
         assert_eq!((sphere.vertices.len(), sphere.faces.len()), (482, 512));
-        assert_eq!(sphere.triangulate().unwrap().len(), 960);
+        assert_eq!(sphere.tessellate().unwrap().len(), 960);
 
         let cylinder = Mesh::cylinder(CylinderParams::default()).unwrap();
         assert_eq!((cylinder.vertices.len(), cylinder.faces.len()), (64, 34));
-        assert_eq!(cylinder.triangulate().unwrap().len(), 124);
+        assert_eq!(cylinder.tessellate().unwrap().len(), 124);
 
         let plane = Mesh::plane(PlaneParams::default()).unwrap();
         assert_eq!(
             (plane.vertices.len(), plane.edges.len(), plane.faces.len()),
             (4, 4, 1)
         );
-        assert_eq!(plane.triangulate().unwrap().len(), 2);
+        assert_eq!(plane.tessellate().unwrap().len(), 2);
 
         let cone = Mesh::cone(ConeParams::default()).unwrap();
         assert_eq!((cone.vertices.len(), cone.faces.len()), (33, 33));
-        assert_eq!(cone.triangulate().unwrap().len(), 62);
+        assert_eq!(cone.tessellate().unwrap().len(), 62);
 
         let torus = Mesh::torus(TorusParams::default()).unwrap();
         assert_eq!((torus.vertices.len(), torus.faces.len()), (576, 576));
-        assert_eq!(torus.triangulate().unwrap().len(), 1_152);
+        assert_eq!(torus.tessellate().unwrap().len(), 1_152);
 
         let ico = Mesh::icosphere(IcosphereParams::default()).unwrap();
         assert_eq!((ico.vertices.len(), ico.faces.len()), (42, 80));
-        assert_eq!(ico.triangulate().unwrap().len(), 80);
+        assert_eq!(ico.tessellate().unwrap().len(), 80);
 
         let circle = Mesh::circle(CircleParams::default()).unwrap();
         assert_eq!(
@@ -1853,7 +1552,7 @@ mod tests {
             (grid.vertices.len(), grid.edges.len(), grid.faces.len()),
             (100, 180, 81)
         );
-        assert_eq!(grid.triangulate().unwrap().len(), 162);
+        assert_eq!(grid.tessellate().unwrap().len(), 162);
     }
 
     #[test]
@@ -1900,28 +1599,12 @@ mod tests {
             vec![vec![0, 1, 2, 3, 4]],
         )
         .unwrap();
-        let triangles = mesh.triangulate().unwrap();
+        let triangles = mesh.tessellate().unwrap();
         assert_eq!(triangles.len(), 3);
         for [a, b, c] in triangles {
             let points = [a, b, c].map(|id| mesh.vertex(id).unwrap().co);
             assert!((points[1] - points[0]).cross(points[2] - points[0]).z > 0.0);
         }
-    }
-
-    #[test]
-    fn triangulation_retains_collinear_boundary_vertices() {
-        let mesh = Mesh::from_positions_and_faces(
-            vec![
-                DVec3::new(0.0, 0.0, 0.0),
-                DVec3::new(1.0, 0.0, 0.0),
-                DVec3::new(2.0, 0.0, 0.0),
-                DVec3::new(2.0, 2.0, 0.0),
-                DVec3::new(0.0, 2.0, 0.0),
-            ],
-            vec![vec![0, 1, 2, 3, 4]],
-        )
-        .unwrap();
-        assert_eq!(mesh.triangulate().unwrap().len(), 3);
     }
 
     #[test]
@@ -1962,6 +1645,25 @@ mod tests {
     }
 
     #[test]
+    fn oversized_grid_and_uv_sphere_are_refused_before_allocation() {
+        // 100000 x 100000 vertices exceed u32 IDs; the check runs before any allocation.
+        let grid = Mesh::grid(GridParams {
+            size_x: 2.0,
+            size_y: 2.0,
+            x_subdivisions: 100_000,
+            y_subdivisions: 100_000,
+        });
+        assert!(matches!(grid, Err(MeshError::IdExhausted)));
+        // Ring counts past the i32 bound of the UV sphere's angle arithmetic are refused too.
+        let sphere = Mesh::uv_sphere(UvSphereParams {
+            segments: 3,
+            ring_count: u32::MAX,
+            radius: 1.0,
+        });
+        assert!(matches!(sphere, Err(MeshError::IdExhausted)));
+    }
+
+    #[test]
     fn cone_supports_zero_radius_at_either_end() {
         let inverted = Mesh::cone(ConeParams {
             radius1: 0.0,
@@ -1970,7 +1672,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!((inverted.vertices.len(), inverted.faces.len()), (33, 33));
-        assert_eq!(inverted.triangulate().unwrap().len(), 62);
+        assert_eq!(inverted.tessellate().unwrap().len(), 62);
         let truncated = Mesh::cone(ConeParams {
             radius1: 0.5,
             radius2: 1.0,
@@ -1978,7 +1680,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(truncated.vertices.len(), 64);
-        assert_eq!(truncated.triangulate().unwrap().len(), 124);
+        assert_eq!(truncated.tessellate().unwrap().len(), 124);
     }
 
     fn triangle_mesh() -> Mesh {
@@ -2050,7 +1752,7 @@ mod tests {
         let empty = Mesh::new();
         assert!(empty.bounds().is_none());
         assert!(
-            empty.triangulate().unwrap().is_empty(),
+            empty.tessellate().unwrap().is_empty(),
             "an empty mesh has no triangles"
         );
 
@@ -2059,10 +1761,7 @@ mod tests {
             vec![vec![0, 1, 2]],
         )
         .unwrap();
-        assert_eq!(
-            collinear.triangulate(),
-            Err(MeshError::TriangulationFailed(0))
-        );
+        assert_eq!(collinear.tessellate().unwrap(), vec![[0, 1, 2]]);
     }
 
     #[test]
@@ -2122,7 +1821,7 @@ mod tests {
                 .collect();
             let polygon = (0..count).collect();
             let mesh = Mesh::from_positions_and_faces(positions, vec![polygon]).unwrap();
-            prop_assert_eq!(mesh.triangulate().unwrap().len(), count - 2);
+            prop_assert_eq!(mesh.tessellate().unwrap().len(), count - 2);
         }
     }
 }

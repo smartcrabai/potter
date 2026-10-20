@@ -1,0 +1,146 @@
+{
+  "blender_uniform_level2": {
+    "expected_bytes_for_uniform_top_level": 2704,
+    "file": "probe_uniform_level2.btx",
+    "file_bytes": 2704,
+    "header": {
+      "endian": 0,
+      "file_header_size": 20,
+      "file_type": 1,
+      "layer_count": 1,
+      "layer_data_size": 2592,
+      "layer_datatype": 0,
+      "layer_header_size": 88,
+      "layer_type": 19,
+      "magic": "BCDF",
+      "mesh_header_size": 4,
+      "subversion": 0,
+      "version": 0
+    },
+    "per_corner_offsets_first_4": [
+      112,
+      220,
+      328,
+      436
+    ],
+    "per_corner_stride": 108
+  },
+  "blender_version": "5.2.2 LTS",
+  "python_mixed_levels_total2": {
+    "expected_bytes_for_uniform_top_level": 2704,
+    "file": "probe_mixed_levels_total2.btx",
+    "file_bytes": 1984,
+    "header": {
+      "endian": 0,
+      "file_header_size": 20,
+      "file_type": 1,
+      "layer_count": 1,
+      "layer_data_size": 1872,
+      "layer_datatype": 0,
+      "layer_header_size": 88,
+      "layer_type": 19,
+      "magic": "BCDF",
+      "mesh_header_size": 4,
+      "subversion": 0,
+      "version": 0
+    },
+    "levels": [
+      2,
+      1,
+      2,
+      1,
+      2,
+      1,
+      2,
+      1,
+      2,
+      1,
+      2,
+      1,
+      2,
+      1,
+      2,
+      1,
+      2,
+      1,
+      2,
+      1,
+      2,
+      1,
+      2,
+      1
+    ],
+    "per_corner_offsets": [
+      112,
+      220,
+      268,
+      376,
+      424,
+      532,
+      580,
+      688,
+      736,
+      844,
+      892,
+      1000,
+      1048,
+      1156,
+      1204,
+      1312,
+      1360,
+      1468,
+      1516,
+      1624,
+      1672,
+      1780,
+      1828,
+      1936
+    ],
+    "per_corner_offsets_first_4": [
+      112,
+      220,
+      268,
+      376
+    ]
+  },
+  "python_uniform_level1_total2": {
+    "expected_bytes_for_uniform_top_level": 2704,
+    "file": "probe_uniform_level1_total2.btx",
+    "file_bytes": 1264,
+    "header": {
+      "endian": 0,
+      "file_header_size": 20,
+      "file_type": 1,
+      "layer_count": 1,
+      "layer_data_size": 1152,
+      "layer_datatype": 0,
+      "layer_header_size": 88,
+      "layer_type": 19,
+      "magic": "BCDF",
+      "mesh_header_size": 4,
+      "subversion": 0,
+      "version": 0
+    },
+    "per_corner_offsets_first_4": [
+      112,
+      160,
+      208,
+      256
+    ]
+  },
+  "reload": {
+    "blender_uniform_level2": {
+      "evaluated_vertices": 98,
+      "is_external": true
+    },
+    "python_mixed_levels_total2": {
+      "evaluated_vertices": 98,
+      "is_external": true
+    },
+    "python_uniform_level1_total2": {
+      "evaluated_vertices": 98,
+      "is_external": true
+    }
+  },
+  "total_levels": 2
+}

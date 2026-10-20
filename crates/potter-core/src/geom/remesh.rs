@@ -106,7 +106,7 @@ pub fn remesh(mesh: &Mesh, voxel_size: f64) -> Result<Mesh> {
         return Err(resource_error());
     }
     let triangles = mesh
-        .triangulate()
+        .tessellate()
         .map_err(|error| mesh_input_error(&error))?;
     let positions: HashMap<_, _> = mesh
         .vertices

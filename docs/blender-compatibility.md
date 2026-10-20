@@ -22,7 +22,7 @@ The following are potter requirements derived from Blender's official feature ca
 | Curves and surfaces | Bézier, poly, NURBS, surface, hair curves | Handles, knots, weights, resolution, tilt, radius, bevel/taper, cyclic, attributes |
 | Other shapes | metaball, text, lattice, point cloud, volume, empty | Font, text layout, basis/resolution, point attributes, OpenVDB grid, display and instance settings |
 | Geometry Nodes | All standard nodes and sockets, node groups, fields, instances, named attributes | Interface, default values, link order, capture, repeat/simulation zones, bake, dependencies, provenance of generated data |
-| Sculpting | All standard brushes, masks, face sets, symmetry, Dyntopo, voxel remesh, Multiresolution | Brush assets, sample sequence, pressure/radius/falloff/seed, sculpt layers, base/high-resolution shapes |
+| Sculpting | All standard brushes, masks, face sets, symmetry, Dyntopo, voxel remesh, Multiresolution | Brush assets, sample sequence, pressure/radius/falloff, sculpt layers, base/high-resolution shapes |
 | Paint | Texture/vertex/weight paint, clone, stencil, projection | Brush, stroke, paint mask, UV, image pixels, named linear color layers with FLOAT_COLOR/BYTE_COLOR source metadata, vertex group weights, normalization/lock |
 | UV and texture | Multiple UV layers (order, names, active and render), unwrap, seam, pin, island pack, UDIM | Loop/corner UVs, images/video/sequences, color space, mapping, sampling, packed/external assets; OBJ and PLY export only the active UV layer; STL has no UVs |
 | Material and shader | All standard shader nodes, Principled BSDF, surface/volume/displacement, node groups | Emission, transmission, SSS, coat, alpha, normal/bump, texture links, all sockets/flags/material slots |
@@ -32,7 +32,7 @@ The following are potter requirements derived from Blender's official feature ca
 | Animation | Action/slot/channel, F-Curve, keyframe, NLA, timeline marker, retiming | Interpolation, handle, extrapolation, curve Modifier, blend/strip, subframe, fps/fps_base |
 | Physics | Rigid body, cloth, soft body, fluid, particle/hair, force field, collision, dynamic paint, simulation nodes | System settings, solver/seed, frame range, dependencies, initial state, bake/point cache |
 | Grease Pencil | Stroke/fill/layer/frame/attribute, draw/sculpt/paint, animation | Material, pressure/opacity/curve type, mask, Modifier, visual effect, geometry/line style |
-| Camera, light, and world | Perspective/orthographic/panorama, DOF, stereo, all light types, probe, HDRI | Focal length/sensor/shift/clip, energy/color/shape/shadow, world nodes, unit |
+| Camera, light, and world | Perspective/orthographic, panorama (equirectangular with longitude and latitude limits, fisheye equidistant and equisolid), DOF, stereo, all light types, probe, HDRI | Focal length/sensor/shift/clip, energy/color/shape/shadow, world nodes, unit |
 | Rendering | PBR, path tracing, real-time rendering, volume, hair, motion blur, denoise, Freestyle | Scene render settings, sample/seed/device, pass/AOV, Cryptomatte, render layer, transparent film |
 | Color and output | OpenColorIO view transforms matching Blender 5.2.2 on the sRGB display with look `none`: Standard, AgX Base Rec.1886, Filmic sRGB, Raw (Non-Color), and AgX False Color Rec.709; exposure, gamma, image/sequence/video/audio. Not supported (refused): OCIO looks, non-sRGB displays, arbitrary OCIO configs, and Khronos PBR Neutral | View transform, display sRGB, look `none`, linear HDR, PNG/JPEG/TIFF/OpenEXR, alpha/bit depth |
 | Compositor | All standard compositing nodes, node groups, masks, multi-layer/pass compositing | Socket, link, Scene/View Layer reference, color/depth/normal/motion, file output |
@@ -119,7 +119,7 @@ Prepare "create," "edit," "evaluate," and "round trip" fixtures for each feature
 5. Restore in a separate directory a bundle containing links, relative paths, packed textures, UDIM, fonts, sounds, Movie Clips, VDB, and caches.
 6. Compare evaluated world matrices, meshes, normals, UVs, bone poses, skinning, shape keys, drivers, and Constraints across multiple frames/subframes.
 7. Verify textures, metal, transmission, SSS, hair, volumes, motion blur, color management, and render passes with CPU rendering.
-8. Reproduce sculpting, paint, and weight results by replaying the Brush world-space sample sequence and seed.
+8. Reproduce sculpting, paint, and weight results by replaying the Brush world-space sample sequence.
 9. Reproduce bakes with fixed physics initial state, seed, and solver version. Invalidate old caches when settings change.
 10. Verify editing and output of Grease Pencil, tracking, masks, compositor, and VSE, including audio synchronization.
 11. Compare supported features, axes, units, and loss reports for GLB/glTF, VRM 0.x/1.0, USD/USDZ, Alembic, FBX, OBJ, PLY, STL, BVH, SVG, and PDF.

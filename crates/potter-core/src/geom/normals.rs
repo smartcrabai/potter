@@ -315,10 +315,18 @@ fn point_domain_shading(
         })
         .collect();
     Ok(Shading {
-        corners: normals.corners.into_iter().map(|normal| normal.as_dvec3()).collect(),
+        corners: normals
+            .corners
+            .into_iter()
+            .map(|normal| normal.as_dvec3())
+            .collect(),
         smooth,
         data_smooth,
-        vertices: normals.vertices.into_iter().map(|normal| normal.as_dvec3()).collect(),
+        vertices: normals
+            .vertices
+            .into_iter()
+            .map(|normal| normal.as_dvec3())
+            .collect(),
     })
 }
 
@@ -376,7 +384,10 @@ fn float_normals(
         .zip(&points)
         .map(|((sum, has_face), point)| float_normalize(if has_face { sum } else { *point }))
         .collect();
-    let corners = corner_vertices.iter().map(|vertex| vertices[*vertex]).collect();
+    let corners = corner_vertices
+        .iter()
+        .map(|vertex| vertices[*vertex])
+        .collect();
     Ok(FloatNormals {
         faces,
         corners,
@@ -595,6 +606,28 @@ pub(crate) fn corner_angle(points: &[DVec3], corner: usize) -> f64 {
     safe_acos_approx(previous.dot(next))
 }
 
+/// Blender's `normals_calc_verts` (`mesh_normals.cc`): the unit face normal of each polygon, weighted
+/// at every vertex by `corner_angle`, summed and normalized. A vertex with no polygon takes the
+/// direction of its position, which is Blender's loose-vertex rule.
+pub(crate) fn vertex_normals(points: &[DVec3], faces: &[&[usize]]) -> Vec<DVec3> {
+    let mut sums = vec![None::<DVec3>; points.len()];
+    for face in faces.iter().filter(|face| face.len() >= 3) {
+        let corners: Vec<DVec3> = face.iter().map(|&vertex| points[vertex]).collect();
+        let normal = face_normal(&corners);
+        for (corner, &vertex) in face.iter().enumerate() {
+            *sums[vertex].get_or_insert(DVec3::ZERO) += normal * corner_angle(&corners, corner);
+        }
+    }
+    points
+        .iter()
+        .zip(sums)
+        .map(|(point, sum)| match sum {
+            Some(sum) => sum.normalize_or_zero(),
+            None => point.normalize_or_zero(),
+        })
+        .collect()
+}
+
 /// Values of a named attribute, if present. A present attribute must have the expected
 /// domain and type, so a mislabeled attribute is an error rather than silently flat.
 fn attribute_values<'a>(
@@ -663,14 +696,6 @@ fn find(parent: &mut [usize], mut index: usize) -> usize {
         index = parent[index];
     }
     index
-}
-
-pub(crate) fn vector3(value: &Value) -> Option<DVec3> {
-    let [x, y, z] = value.as_array()?.as_slice() else {
-        return None;
-    };
-    let vector = DVec3::new(x.as_f64()?, y.as_f64()?, z.as_f64()?);
-    vector.is_finite().then_some(vector)
 }
 
 fn mesh_error(error: &MeshError) -> PotError {
