@@ -17,24 +17,24 @@
  ],
  "cases": {
   "diffuse": {
-   "mean": 0.337081,
-   "stderr": 0.034213
+   "mean": 0.337047,
+   "stderr": 0.034108
   },
   "homogeneous_g0": {
-   "mean": 0.008488,
-   "stderr": 0.000605
+   "mean": 0.008317,
+   "stderr": 0.000595
   },
   "homogeneous_g05": {
-   "mean": 0.002951,
-   "stderr": 0.000169
+   "mean": 0.002845,
+   "stderr": 0.000168
   },
   "gradient_g0": {
-   "mean": 0.004854,
-   "stderr": 0.000936
+   "mean": 0.004761,
+   "stderr": 0.000904
   },
   "gradient_g05": {
-   "mean": 0.001639,
-   "stderr": 0.0003
+   "mean": 0.001594,
+   "stderr": 0.00029
   }
  }
 }

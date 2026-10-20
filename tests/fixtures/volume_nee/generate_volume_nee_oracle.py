@@ -1,13 +1,16 @@
 """Blender 5.2.2 single-scatter oracle for volume direct lighting under a point light.
 
-Every case is rendered with `volume_bounces = 1` and `max_bounces = 1`. The density is low (optical depth
+Every case is rendered with `volume_bounces = 0` and `max_bounces = 0`, a single scatter. At one bounce Cycles also
+adds the direct light of a second scatter vertex (about 12 % more at density 0.25 for a sun, measured with
+Blender 5.2.2), so a bounce budget of 1 would not be single scatter; the budget of 0 is the integral the analytic
+and Potter's tests compute. The density is low (optical depth
 0.05 across the cube), so multiple scattering is about 0.2 % and the render is the single-scatter integral
 that `analytic_volume_nee.py` evaluates. At density 2 Blender's render exceeds single scatter by 60 %
 (multiple scattering), so a high-density oracle would not test the single-scatter estimator.
 
 Scene: a unit cube at the origin (its extent is [-0.5, 0.5]^3) with a volume-only material, an
-orthographic camera at (0, 0, 3) looking down -Z (ortho scale 2), a point light of radius 0 at
-POSITION, and a black world. The measured value is the mean over the 4 x 4 pixels at the image centre.
+orthographic camera at (0, 0, 3) looking down -Z (ortho scale 1, so the frame is the unit cube), a point light of radius 0 at
+POSITION, and a black world. The measured value is the mean over the whole 4 x 4 frame, whose pixel centres are at +-0.125 and +-0.375 with footprints of +-0.25 about them, all inside the cube.
 
 Cases:
 - diffuse: a white Diffuse plane at z = 0 with no cube. It calibrates the light unit, since the diffuse
@@ -17,7 +20,7 @@ Cases:
 - gradient_g0 / gradient_g05: Density = GRADIENT_SCALE * x, where x is the Generated coordinate (0 at
   the cube's -X face, 1 at +X), from a Linear Gradient texture.
 
-The frame is 8 x 8 (SIZE) and the measured block is its central 4 x 4 pixels (indices 2..5), so the cube fills the
+The frame is 4 x 4 (SIZE) and the measured block is all of it (indices 0..3), so the cube fills the
 block. The pixel filter is a one-pixel BOX (see the comment in reset()), which is Potter's sampling, so the Blender
 mean is the pixel-averaged value that Potter renders.
 
@@ -37,14 +40,14 @@ import bpy
 argv = sys.argv[sys.argv.index("--") + 1 :]
 out_path = os.path.abspath(argv[0])
 work = tempfile.mkdtemp(prefix="volume_nee_")
-SIZE = 8
+SIZE = 4
 SAMPLES = 65536
-BLOCK = range(2, 6)
+BLOCK = range(0, 4)
 ENERGY = 100.0
 POSITION = (1.6, 0.6, 0.9)
 DENSITY = 0.05
 GRADIENT_SCALE = 0.05
-PIXEL_CENTRES = [-1.0 + (index + 0.5) * 2.0 / SIZE for index in BLOCK]
+PIXEL_CENTRES = [-0.5 + (index + 0.5) / SIZE for index in BLOCK]
 
 
 def reset():
@@ -59,18 +62,18 @@ def reset():
     scene.cycles.device = "CPU"
     scene.cycles.samples = SAMPLES
     # Potter integrates each pixel uniformly over its whole footprint (render/path.rs draws the sub-pixel offset
-    # uniformly in [0, 1)^2, a box filter of one pixel). Cycles' BOX filter of width 1 px is the same box. The 8 px
-    # frame's central 4 x 4 block has footprints of +-0.25 about centres at +-0.125 and +-0.375, all inside the unit cube
-    # (edge at +-0.5), so each box lies in the cube and the outside-cube zero of Cycles' default 1.5 px Blackman-Harris
-    # filter cannot enter the block. A point filter (filter_width 0.01) would average the pixel centre only.
+    # uniformly in [0, 1)^2, a box filter of one pixel). Cycles' BOX filter of width 1 px is the same box. The 4 px frame
+    # spans the unit cube (ortho scale 1), so every pixel (width 0.25, centres at +-0.125 and +-0.375) lies
+    # inside the cube, and the outside-cube zero of Cycles' default 1.5 px Blackman-Harris filter cannot enter any pixel.
+    # A point filter (filter_width 0.01) would average the pixel centre only.
     if hasattr(scene.cycles, "pixel_filter_type"):
         scene.cycles.pixel_filter_type = "BOX"
     else:
         scene.cycles.filter_type = "BOX"
     scene.cycles.filter_width = 1.0
     scene.cycles.use_denoising = False
-    scene.cycles.max_bounces = 1
-    scene.cycles.volume_bounces = 1
+    scene.cycles.max_bounces = 0
+    scene.cycles.volume_bounces = 0
     scene.cycles.transparent_max_bounces = 64
     scene.view_settings.view_transform = "Raw"
     scene.view_settings.look = "None"
@@ -89,7 +92,7 @@ def reset():
     background.inputs["Strength"].default_value = 0.0
     camera_data = bpy.data.cameras.new("camera")
     camera_data.type = "ORTHO"
-    camera_data.ortho_scale = 2.0
+    camera_data.ortho_scale = 1.0
     camera = bpy.data.objects.new("camera", camera_data)
     scene.collection.objects.link(camera)
     camera.location = (0.0, 0.0, 3.0)

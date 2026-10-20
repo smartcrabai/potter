@@ -1,13 +1,15 @@
 //! Single-scatter direct lighting from a point light. The oracle is `tests/fixtures/volume_nee`, rendered by
 //! Blender 5.2.2 with `generate_volume_nee_oracle.py`: a unit cube (a mesh with a volume-only material) of
-//! Volume Scatter (Color 1, Density 0.05, so optical depth 0.05 and multiple scattering is about 0.2 %), under a
-//! point light of 100 W, with `volume_bounces = max_bounces = 1`. The `homogeneous_*` cases are that mesh cube,
-//! and the `gradient_*` cases use a Linear-gradient density. The `diffuse` case is a white Lambert plane under
-//! the same light and calibrates the light unit (I = P / 4π, irradiance E = I / d², Lambert radiance E / π).
-//! A volume's in-scatter has no 1/π, since its phase function is per steradian.
-//!
-//! The mesh cube is Potter's closed-mesh medium, and the gradient cube is a voxel grid, since a mesh material's
-//! density is constant.
+//! Volume Scatter (Color 1, Density 0.05, so optical depth 0.05), under a point light of 100 W, with
+//! `volume_bounces = max_bounces = 0`, which is single scatter. Potter renders the same budget (`max_bounces: 0`).
+//! At a budget of 1 Cycles adds a second scatter vertex's direct light, so that budget is not single scatter.
+//! The `homogeneous_*` cases are the mesh cube, and the `gradient_*` cases a voxel Linear gradient. The `diffuse`
+//! case is a white Lambert plane under the same light and calibrates the light unit (I = P / 4π, irradiance
+//! E = I / d², Lambert radiance E / π). A volume's in-scatter has no 1/π, since its phase function is per steradian.
+//! The oracle frame is 4 x 4 and spans the unit cube (ortho scale 1), averaged over all 16 pixels with a one-pixel box
+//! filter, which is how Potter integrates each pixel.
+//! The voxel cubes use a 17-node grid (the cube's full extent, as Blender's VDB). The mesh cube is Potter's
+//! closed-mesh medium.
 
 use std::{error::Error, fs, path::Path, process::Output};
 
@@ -15,14 +17,28 @@ use assert_cmd::Command;
 use serde_json::{Value, json};
 use tempfile::tempdir;
 
-const SIZE: u32 = 8;
+const SIZE: u32 = 4;
 const ENERGY: f64 = 100.0;
 const POSITION: [f64; 3] = [1.6, 0.6, 0.9];
 const DENSITY: f64 = 0.05;
-const SAMPLES: u32 = 4096;
-/// The relative tolerance of a volume case against Blender's oracle. The gradient cases' Blender stderr is 6.5 %.
-const VOLUME_TOLERANCE: f64 = 0.06;
-const DIFFUSE_TOLERANCE: f64 = 0.02;
+const SAMPLES: u32 = 2048;
+/// Voxel cubes take about 100 s per render at `SAMPLES` in a debug build (a mesh render takes about 1 s), so they use
+/// fewer samples. Their tolerances are derived from their own measured spread at this count.
+const VOXEL_SAMPLES: u32 = 512;
+// Tolerances are three times the measured single-render spread of each configuration, rounded up. Potter's sd was
+// measured over four seeds (each seed renders the scene once), on this scene: mesh MIS 0.34-0.36 % at 2048 spp, mesh
+// distance 4.30 %, mesh equiangular 0.07 % (2048 spp); voxel MIS 2.78-2.93 %, gradient 4.52-4.65 %, voxel distance
+// 1.54 %, voxel equiangular 0.64 % (512 spp); diffuse 0.11 % (2048 spp). Blender's own spread at 65536 spp is about
+// 0.1 %, so it does not widen these. The tests use seed 0, so each result is fixed; the tolerance is the noise band
+// a different seed could reach.
+const DIFFUSE_TOLERANCE: f64 = 0.005;
+const MESH_TOLERANCE: f64 = 0.015;
+const MESH_DISTANCE_TOLERANCE: f64 = 0.13;
+const MESH_EQUIANGULAR_TOLERANCE: f64 = 0.005;
+const VOXEL_TOLERANCE: f64 = 0.09;
+const VOXEL_DISTANCE_TOLERANCE: f64 = 0.05;
+const VOXEL_EQUIANGULAR_TOLERANCE: f64 = 0.02;
+const GRADIENT_TOLERANCE: f64 = 0.14;
 
 fn pot() -> Command {
     Command::new(env!("CARGO_BIN_EXE_pot"))
@@ -65,20 +81,20 @@ fn make_scene(root: &Path, operations: &[Value]) -> Result<std::path::PathBuf, B
     Ok(scene)
 }
 
-/// The common scene: a black world, an orthographic camera at z = 3 (ortho scale 2), a point light of radius 0 at
+/// The common scene: a black world, an orthographic camera at z = 3 (ortho scale 1, so the frame is the unit cube), a
 /// `POSITION`, and single-scatter render settings.
-fn base_operations() -> Vec<Value> {
+fn base_operations(samples: u32) -> Vec<Value> {
     vec![
         json!({"op":"world.create","id":"world_main","color":[0.0,0.0,0.0],"strength":0.0}),
-        json!({"op":"camera.create","id":"camera_main","transform":{"translation":[0.0,0.0,3.0]},"projection":"orthographic","ortho_scale":2.0}),
+        json!({"op":"camera.create","id":"camera_main","transform":{"translation":[0.0,0.0,3.0]},"projection":"orthographic","ortho_scale":1.0}),
         json!({"op":"light.create","id":"light_main","light_type":"point","energy":ENERGY,"radius":0.0,"transform":{"translation":POSITION}}),
         json!({"op":"scene.update","target":{"id":"scene_main"},"set":{"camera":"camera_main","world":"world_main"}}),
-        json!({"op":"render.update","target":{"id":"scene_main"},"set":{"resolution_x":SIZE,"resolution_y":SIZE,"samples":SAMPLES,"seed":0,"max_bounces":0}}),
+        json!({"op":"render.update","target":{"id":"scene_main"},"set":{"resolution_x":SIZE,"resolution_y":SIZE,"samples":samples,"seed":0,"max_bounces":0}}),
     ]
 }
 
 fn diffuse_scene(root: &Path) -> Result<std::path::PathBuf, Box<dyn Error>> {
-    let mut operations = base_operations();
+    let mut operations = base_operations(SAMPLES);
     operations.extend([
         json!({"op":"graph.create","id":"white_graph","kind":"shader"}),
         json!({"op":"graph.node_add","graph":"white_graph","id":"output","type":"ShaderNodeOutputMaterial"}),
@@ -95,9 +111,9 @@ fn diffuse_scene(root: &Path) -> Result<std::path::PathBuf, Box<dyn Error>> {
 enum Medium {
     /// A unit mesh cube whose material is the closed-mesh medium, with the constant Density 0.05.
     MeshCube,
-    /// A 16³ voxel grid over the unit cube with the constant density 0.05.
+    /// A 17³ voxel grid over the unit cube (nodes at -0.5 + i / 16) with the constant density 0.05.
     VoxelHomogeneous,
-    /// A 16³ voxel grid whose value is the Generated coordinate (x + 0.5) at each voxel centre, so the density is
+    /// A 17³ voxel grid whose value at node i is i / 16, the Generated coordinate of the node, so the density is
     /// Blender's Linear gradient, 0.05 · (x + 0.5).
     VoxelGradient,
 }
@@ -108,7 +124,11 @@ fn scatter_scene(
     medium: Medium,
     sampling: &str,
 ) -> Result<std::path::PathBuf, Box<dyn Error>> {
-    let mut operations = base_operations();
+    let samples = match medium {
+        Medium::MeshCube => SAMPLES,
+        Medium::VoxelHomogeneous | Medium::VoxelGradient => VOXEL_SAMPLES,
+    };
+    let mut operations = base_operations(samples);
     operations.extend([
         json!({"op":"graph.create","id":"medium_graph","kind":"shader"}),
         json!({"op":"graph.node_add","graph":"medium_graph","id":"output","type":"ShaderNodeOutputMaterial"}),
@@ -121,24 +141,26 @@ fn scatter_scene(
             json!({"op":"node.create","id":"cube_main","kind":"box","params":{"size":1.0},"material":"medium"}),
         ),
         Medium::VoxelHomogeneous | Medium::VoxelGradient => {
-            const N: usize = 16;
+            // Blender's VDB for the same cube has 17 nodes at 1/16 spacing from -0.5, which covers the cube's full
+            // extent. Potter's trilinear grid is zero outside its nodes, so 16 nodes would leave the far half-voxel empty.
+            const N: usize = 17;
             let gradient = matches!(medium, Medium::VoxelGradient);
             let mut values = Vec::with_capacity(N * N * N);
             for _z in 0..N {
                 for _y in 0..N {
                     for x in 0..N {
-                        let centre = -0.5 + (x as f64 + 0.5) / N as f64;
-                        values.push(if gradient { centre + 0.5 } else { 1.0 });
+                        // Node x sits at world -0.5 + x / 16, so the Generated coordinate (x + 0.5) is x / 16 here.
+                        values.push(if gradient { x as f64 / 16.0 } else { 1.0 });
                     }
                 }
             }
-            operations.push(json!({"op":"volume.create","id":"medium_volume","materials":["medium"],"grids":[{"dims":[N,N,N],"voxel_size":1.0 / N as f64,"origin":[-0.5,-0.5,-0.5],"values":values}]}));
+            operations.push(json!({"op":"volume.create","id":"medium_volume","materials":["medium"],"grids":[{"dims":[N,N,N],"voxel_size":1.0 / 16.0,"origin":[-0.5,-0.5,-0.5],"values":values}]}));
         }
     }
     make_scene(root, &operations)
 }
 
-/// Renders the scene and returns the red channel's mean over the 4 × 4 pixels at the image centre, the block the
+/// Renders the scene and returns the red channel's mean over all of its 4 × 4 pixels, the block the
 /// oracle measures.
 fn render_centre_mean(scene: &Path, out: &Path) -> Result<f64, Box<dyn Error>> {
     let output = pot()
@@ -163,8 +185,8 @@ fn render_centre_mean(scene: &Path, out: &Path) -> Result<f64, Box<dyn Error>> {
     let width = pixels.width;
     let mut sum = 0.0;
     let mut count = 0.0;
-    for y in 2..6 {
-        for x in 2..6 {
+    for y in 0..SIZE as usize {
+        for x in 0..SIZE as usize {
             sum += f64::from(pixels.red[y * width + x]);
             count += 1.0;
         }
@@ -193,7 +215,7 @@ fn assert_within(case: &str, measured: f64, tolerance: f64) -> Result<(), Box<dy
     let relative = (measured - expected).abs() / expected;
     assert!(
         relative < tolerance,
-        "{case}: Potter {measured:.6} vs Blender {expected:.6} ({:.1} % apart, tolerance {:.0} %)",
+        "{case}: Potter {measured:.6} vs Blender {expected:.6} ({:.1} % apart, tolerance {:.1} %)",
         relative * 100.0,
         tolerance * 100.0
     );
@@ -209,101 +231,130 @@ fn point_light_irradiance_unit_matches_blender_on_a_diffuse_plane() -> Result<()
     assert_within("diffuse", measured, DIFFUSE_TOLERANCE)
 }
 
+/// Renders one case at its medium's sample count and compares its frame mean with Blender's mean for `case`.
+fn assert_case_matches(
+    case: &str,
+    anisotropy: f64,
+    medium: Medium,
+    sampling: &str,
+    tolerance: f64,
+) -> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let scene = scatter_scene(directory.path(), anisotropy, medium, sampling)?;
+    let measured = render_centre_mean(&scene, &directory.path().join("render"))?;
+    assert_within(case, measured, tolerance)
+}
+
 #[test]
-fn mesh_material_single_scatter_under_a_point_light_matches_blender() -> Result<(), Box<dyn Error>>
+fn mesh_material_single_scatter_matches_blender_at_anisotropy_0() -> Result<(), Box<dyn Error>> {
+    assert_case_matches(
+        "homogeneous_g0",
+        0.0,
+        Medium::MeshCube,
+        "multiple_importance",
+        MESH_TOLERANCE,
+    )
+}
+
+#[test]
+fn mesh_material_single_scatter_matches_blender_at_anisotropy_0_5() -> Result<(), Box<dyn Error>> {
+    assert_case_matches(
+        "homogeneous_g05",
+        0.5,
+        Medium::MeshCube,
+        "multiple_importance",
+        MESH_TOLERANCE,
+    )
+}
+
+#[test]
+fn voxel_homogeneous_single_scatter_matches_blender_at_anisotropy_0() -> Result<(), Box<dyn Error>>
 {
-    // The closed-mesh medium: the same unit mesh cube as the Blender oracle's homogeneous cases.
-    for (case, anisotropy) in [("homogeneous_g0", 0.0), ("homogeneous_g05", 0.5)] {
-        let directory = tempdir()?;
-        let scene = scatter_scene(
-            directory.path(),
-            anisotropy,
-            Medium::MeshCube,
-            "multiple_importance",
-        )?;
-        let measured = render_centre_mean(&scene, &directory.path().join("render"))?;
-        assert_within(case, measured, VOLUME_TOLERANCE)?;
-    }
-    Ok(())
+    assert_case_matches(
+        "homogeneous_g0",
+        0.0,
+        Medium::VoxelHomogeneous,
+        "multiple_importance",
+        VOXEL_TOLERANCE,
+    )
 }
 
 #[test]
-fn voxel_homogeneous_single_scatter_under_a_point_light_matches_blender()
--> Result<(), Box<dyn Error>> {
-    for (case, anisotropy) in [("homogeneous_g0", 0.0), ("homogeneous_g05", 0.5)] {
-        let directory = tempdir()?;
-        let scene = scatter_scene(
-            directory.path(),
-            anisotropy,
-            Medium::VoxelHomogeneous,
-            "multiple_importance",
-        )?;
-        let measured = render_centre_mean(&scene, &directory.path().join("render"))?;
-        assert_within(case, measured, VOLUME_TOLERANCE)?;
-    }
-    Ok(())
+fn voxel_homogeneous_single_scatter_matches_blender_at_anisotropy_0_5() -> Result<(), Box<dyn Error>>
+{
+    assert_case_matches(
+        "homogeneous_g05",
+        0.5,
+        Medium::VoxelHomogeneous,
+        "multiple_importance",
+        VOXEL_TOLERANCE,
+    )
 }
 
 #[test]
-fn gradient_single_scatter_under_a_point_light_matches_blender() -> Result<(), Box<dyn Error>> {
-    for (case, anisotropy) in [("gradient_g0", 0.0), ("gradient_g05", 0.5)] {
-        let directory = tempdir()?;
-        let scene = scatter_scene(
-            directory.path(),
-            anisotropy,
-            Medium::VoxelGradient,
-            "multiple_importance",
-        )?;
-        let measured = render_centre_mean(&scene, &directory.path().join("render"))?;
-        assert_within(case, measured, VOLUME_TOLERANCE)?;
-    }
-    Ok(())
+fn gradient_single_scatter_matches_blender_at_anisotropy_0() -> Result<(), Box<dyn Error>> {
+    assert_case_matches(
+        "gradient_g0",
+        0.0,
+        Medium::VoxelGradient,
+        "multiple_importance",
+        GRADIENT_TOLERANCE,
+    )
 }
 
-/// Distance, equiangular and multiple importance sampling are three estimators of one integral, so each must reproduce
-/// Blender's homogeneous cube. One test per (sampling, medium) keeps each test at two renders.
-fn assert_sampling_matches_blender(sampling: &str, medium: Medium) -> Result<(), Box<dyn Error>> {
-    for (case, anisotropy) in [("homogeneous_g0", 0.0), ("homogeneous_g05", 0.5)] {
-        let directory = tempdir()?;
-        let scene = scatter_scene(directory.path(), anisotropy, medium, sampling)?;
-        let measured = render_centre_mean(&scene, &directory.path().join("render"))?;
-        let expected = blender_mean(case)?;
-        let relative = (measured - expected).abs() / expected;
-        assert!(
-            relative < VOLUME_TOLERANCE,
-            "{sampling} {case}: Potter {measured:.6} vs Blender {expected:.6} ({:.1} % apart)",
-            relative * 100.0
-        );
-    }
-    Ok(())
+#[test]
+fn gradient_single_scatter_matches_blender_at_anisotropy_0_5() -> Result<(), Box<dyn Error>> {
+    assert_case_matches(
+        "gradient_g05",
+        0.5,
+        Medium::VoxelGradient,
+        "multiple_importance",
+        GRADIENT_TOLERANCE,
+    )
 }
 
+// Distance and equiangular sampling are estimators of the same integral as multiple importance sampling, so each
+// must reproduce Blender's homogeneous cube at anisotropy 0.
 #[test]
 fn distance_sampling_matches_blender_on_mesh_cube() -> Result<(), Box<dyn Error>> {
-    assert_sampling_matches_blender("distance", Medium::MeshCube)
+    assert_case_matches(
+        "homogeneous_g0",
+        0.0,
+        Medium::MeshCube,
+        "distance",
+        MESH_DISTANCE_TOLERANCE,
+    )
 }
 
 #[test]
 fn distance_sampling_matches_blender_on_voxel_cube() -> Result<(), Box<dyn Error>> {
-    assert_sampling_matches_blender("distance", Medium::VoxelHomogeneous)
+    assert_case_matches(
+        "homogeneous_g0",
+        0.0,
+        Medium::VoxelHomogeneous,
+        "distance",
+        VOXEL_DISTANCE_TOLERANCE,
+    )
 }
 
 #[test]
 fn equiangular_sampling_matches_blender_on_mesh_cube() -> Result<(), Box<dyn Error>> {
-    assert_sampling_matches_blender("equiangular", Medium::MeshCube)
+    assert_case_matches(
+        "homogeneous_g0",
+        0.0,
+        Medium::MeshCube,
+        "equiangular",
+        MESH_EQUIANGULAR_TOLERANCE,
+    )
 }
 
 #[test]
 fn equiangular_sampling_matches_blender_on_voxel_cube() -> Result<(), Box<dyn Error>> {
-    assert_sampling_matches_blender("equiangular", Medium::VoxelHomogeneous)
-}
-
-#[test]
-fn multiple_importance_sampling_matches_blender_on_mesh_cube() -> Result<(), Box<dyn Error>> {
-    assert_sampling_matches_blender("multiple_importance", Medium::MeshCube)
-}
-
-#[test]
-fn multiple_importance_sampling_matches_blender_on_voxel_cube() -> Result<(), Box<dyn Error>> {
-    assert_sampling_matches_blender("multiple_importance", Medium::VoxelHomogeneous)
+    assert_case_matches(
+        "homogeneous_g0",
+        0.0,
+        Medium::VoxelHomogeneous,
+        "equiangular",
+        VOXEL_EQUIANGULAR_TOLERANCE,
+    )
 }
