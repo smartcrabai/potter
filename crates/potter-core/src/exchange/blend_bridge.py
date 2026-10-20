@@ -7356,7 +7356,7 @@ def export_doc(doc, target, pack, scene_hash, context):
                 if isinstance(source_axis_angle, (list, tuple)) and len(source_axis_angle) == 4:
                     obj.rotation_axis_angle = source_axis_angle
                 else:
-                    angle, axis = quaternion.to_axis_angle()
+                    axis, angle = quaternion.to_axis_angle()
                     obj.rotation_axis_angle = (angle, axis.x, axis.y, axis.z)
             elif source_rotation_unchanged:
                 source_euler = source_object.get("rotation_euler")
@@ -7367,7 +7367,7 @@ def export_doc(doc, target, pack, scene_hash, context):
             elif obj.rotation_mode == "QUATERNION":
                 obj.rotation_quaternion = quaternion
             elif obj.rotation_mode == "AXIS_ANGLE":
-                angle, axis = quaternion.to_axis_angle()
+                axis, angle = quaternion.to_axis_angle()
                 obj.rotation_axis_angle = (angle, axis.x, axis.y, axis.z)
             else:
                 obj.rotation_euler = quaternion.to_euler(obj.rotation_mode)

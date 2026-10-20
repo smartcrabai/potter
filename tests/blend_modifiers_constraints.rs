@@ -707,18 +707,42 @@ def matrix_values(matrix):
 
 expected = {
     name: {
+        "rotation_mode": obj.rotation_mode,
         "local": matrix_values(obj.matrix_basis),
         "world": matrix_values(obj.matrix_world),
     }
     for name, obj in objects.items()
 }
 expected["A_TransformParent"] = {
+    "rotation_mode": parent.rotation_mode,
     "local": matrix_values(parent.matrix_basis),
     "world": matrix_values(parent.matrix_world),
 }
 with open(os.path.join(root, "transform_expected.json"), "w", encoding="utf-8") as handle:
     json.dump(expected, handle)
 bpy.ops.wm.save_as_mainfile(filepath=os.path.join(root, "transform_source.blend"))
+"#;
+
+const TRANSFORM_REOPEN: &str = r#"
+import bpy
+import json
+import sys
+
+output = sys.argv[sys.argv.index("--") + 1]
+
+def matrix_values(matrix):
+    return [float(matrix[row][column])
+            for column in range(4) for row in range(4)]
+
+result = {
+    obj.name: {
+        "rotation_mode": obj.rotation_mode,
+        "local": matrix_values(obj.matrix_basis),
+    }
+    for obj in bpy.data.objects
+}
+with open(output, "w", encoding="utf-8") as handle:
+    json.dump(result, handle)
 "#;
 
 const MODIFIER_REOPEN: &str = r#"
@@ -2038,6 +2062,47 @@ fn blender_transform_import_parity_across_rotation_modes() -> Result<(), Box<dyn
             node["transform"]["world"]["matrix"].as_array().unwrap(),
             matrices["world"].as_array().unwrap(),
             &format!("{name} world"),
+        );
+    }
+    let exported = root.join("transform_roundtrip.blend");
+    pot_json(&[
+        "export",
+        project.to_str().unwrap(),
+        "--format",
+        "blend",
+        "--out",
+        exported.to_str().unwrap(),
+        "--blender",
+        blender.to_str().unwrap(),
+    ])?;
+    let reopened_path = root.join("transform_after.json");
+    let script_path = root.join("reopen_transform.py");
+    fs::write(&script_path, TRANSFORM_REOPEN)?;
+    let mut command = Command::new(&blender);
+    command
+        .args(["--background"])
+        .arg(&exported)
+        .arg("--python")
+        .arg(&script_path)
+        .arg("--")
+        .arg(&reopened_path);
+    let output = run_guarded(command)?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && !stdout.contains("Traceback") && !stderr.contains("Traceback"),
+        "Blender transform reopen failed: stdout={stdout} stderr={stderr}",
+    );
+    let after: Value = serde_json::from_slice(&fs::read(reopened_path)?)?;
+    for (name, matrices) in expected.as_object().unwrap() {
+        assert_eq!(
+            after[name]["rotation_mode"], matrices["rotation_mode"],
+            "{name} rotation mode after reopen"
+        );
+        assert_matrix_parity(
+            after[name]["local"].as_array().unwrap(),
+            matrices["local"].as_array().unwrap(),
+            &format!("{name} local after reopen"),
         );
     }
     Ok(())
