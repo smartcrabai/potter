@@ -74,13 +74,14 @@ fn selectors_resolve_geometry_attributes_connectivity_and_materials() {
         ),
         ["e0"]
     );
+    // Blender's primitive_cube_add order: f4 = [2, 6, 4, 0] is the -Z face, f5 = [7, 3, 1, 5] the +Z face.
     assert_eq!(
         selected_ids(
             &cube,
             "face",
             &json!({"type":"position_box","min":[-1,-1,-1],"max":[1,1,-0.999_999]})
         ),
-        ["f0"]
+        ["f4"]
     );
     assert_eq!(
         selected_ids(
@@ -88,7 +89,7 @@ fn selectors_resolve_geometry_attributes_connectivity_and_materials() {
             "face",
             &json!({"type":"normal_cone","axis":[0,0,1],"angle":0})
         ),
-        ["f1"]
+        ["f5"]
     );
 
     let mut attributed = cube.clone();
@@ -1009,11 +1010,12 @@ fn topology_edits_match_blender_522_when_available() {
         "subdivide",
     );
 
+    // The Blender oracle splits the face with z < -0.99, the -Z face; in Blender's cube order that is f4.
     let mut split = Mesh::box_mesh(BoxParams::default()).unwrap();
     edit::apply(
         &mut split,
         "split",
-        &json!({"elements":{"domain":"face","ids":["f0"]}}),
+        &json!({"elements":{"domain":"face","ids":["f4"]}}),
     )
     .unwrap();
     assert_signatures_match(

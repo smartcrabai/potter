@@ -663,14 +663,15 @@ fn draw_respects_radius_and_mask_and_vertex_paint_updates_touched_corners()
     assert!(drawn_document["data_blocks"]["body_mesh"]["descriptor"].is_null());
     assert!(drawn_document["nodes"]["body"]["primitive"].is_null());
     let original = Mesh::box_mesh(potter_core::geom::BoxParams::default())?;
-    let original_v6 = original
+    // Vertex 7 is the (+1, +1, +1) corner in Blender's primitive_cube_add order.
+    let original_v7 = original
         .vertices
         .iter()
-        .find(|vertex| vertex.id == 6)
+        .find(|vertex| vertex.id == 7)
         .unwrap()
         .co;
-    let drawn_v6: [f64; 3] = serde_json::from_value(after_draw["vertices"][6]["co"].clone())?;
-    let displacement = DVec3::from_array(drawn_v6) - original_v6;
+    let drawn_v7: [f64; 3] = serde_json::from_value(after_draw["vertices"][7]["co"].clone())?;
+    let displacement = DVec3::from_array(drawn_v7) - original_v7;
     assert!(displacement.length() > 0.0);
     assert!(displacement.dot(DVec3::ONE.normalize()) > 0.0);
     let drawn_v0 = after_draw["vertices"][0]["co"].clone();
@@ -682,7 +683,7 @@ fn draw_respects_radius_and_mask_and_vertex_paint_updates_touched_corners()
         &json!([
             {"op":"node.create", "id":"body", "kind":"box", "params":{}},
             {"op":"sculpt.mask", "target":{"id":"body"}, "scope":"shared", "action":"set",
-             "elements":{"domain":"vertex","ids":["v6"]}, "value":1.0},
+             "elements":{"domain":"vertex","ids":["v7"]}, "value":1.0},
             {"op":"sculpt.stroke", "target":{"id":"body"}, "brush":"draw", "scope":"shared",
              "samples":[{"position":[1.0,1.0,1.0],"pressure":1.0,"radius":0.25,"strength":0.5,"time":0.0}],
              "falloff":"linear"}
@@ -690,11 +691,11 @@ fn draw_respects_radius_and_mask_and_vertex_paint_updates_touched_corners()
     )?;
     let masked = stored_mesh(&masked_scene)?;
     assert_eq!(
-        masked["vertices"][6]["co"],
-        json!(original.vertices[6].co.to_array())
+        masked["vertices"][7]["co"],
+        json!(original.vertices[7].co.to_array())
     );
     assert_eq!(
-        masked["attributes"]["sculpt.mask"]["values"]["v6"],
+        masked["attributes"]["sculpt.mask"]["values"]["v7"],
         json!(1.0)
     );
 
@@ -723,7 +724,7 @@ fn draw_respects_radius_and_mask_and_vertex_paint_updates_touched_corners()
         painted["attributes"]["color_layers"],
         json!({"layers": ["color"], "active": "color", "render": "color"})
     );
-    let painted_at_v6 = painted["faces"].as_array().unwrap().iter().any(|face| {
+    let painted_at_v7 = painted["faces"].as_array().unwrap().iter().any(|face| {
         let row = &color["values"][format!("f{}", face["id"]).as_str()];
         face["v"]
             .as_array()
@@ -731,18 +732,18 @@ fn draw_respects_radius_and_mask_and_vertex_paint_updates_touched_corners()
             .iter()
             .enumerate()
             .any(|(corner, vertex)| {
-                *vertex == json!(6) && row[corner] == json!([0.1, 0.2, 0.3, 1.0])
+                *vertex == json!(7) && row[corner] == json!([0.1, 0.2, 0.3, 1.0])
             })
     });
-    assert!(painted_at_v6);
+    assert!(painted_at_v7);
     assert_eq!(
-        painted["attributes"]["weight:skin"]["values"]["v6"],
+        painted["attributes"]["weight:skin"]["values"]["v7"],
         json!(0.75)
     );
     let painted_document: Value =
         serde_json::from_slice(&fs::read(paint_scene.join("scene.json"))?)?;
     assert_eq!(
-        painted_document["data_blocks"]["body_mesh"]["vertex_weights"]["6"]["bone"],
+        painted_document["data_blocks"]["body_mesh"]["vertex_weights"]["7"]["bone"],
         json!(0.25)
     );
     Ok(())
@@ -877,8 +878,8 @@ fn sculpt_shared_data_requires_scope_and_single_user_isolates_stroke() -> Result
     let original_data = document["nodes"]["body"]["data"].as_str().unwrap();
     let isolated_data = document["nodes"]["body_copy"]["data"].as_str().unwrap();
     assert_ne!(original_data, isolated_data);
-    let original_vertex = &document["data_blocks"][original_data]["mesh"]["vertices"][6]["co"];
-    let edited_vertex = &document["data_blocks"][isolated_data]["mesh"]["vertices"][6]["co"];
+    let original_vertex = &document["data_blocks"][original_data]["mesh"]["vertices"][7]["co"];
+    let edited_vertex = &document["data_blocks"][isolated_data]["mesh"]["vertices"][7]["co"];
     assert_eq!(original_vertex, &json!([1.0, 1.0, 1.0]));
     assert_ne!(edited_vertex, original_vertex);
     Ok(())
@@ -918,8 +919,9 @@ fn sculpt_symmetry_and_repeat_strokes_are_deterministic() -> Result<(), Box<dyn 
             .co;
         current.z - original.z
     };
-    assert!(movement(&mirrored, 4) > 0.0);
-    assert!((movement(&mirrored, 4) - movement(&mirrored, 5)).abs() < 1.0e-12);
+    // Vertices 1 (-1, -1, 1) and 5 (+1, -1, 1) are the mirrored pair in Blender's primitive_cube_add order.
+    assert!(movement(&mirrored, 1) > 0.0);
+    assert!((movement(&mirrored, 1) - movement(&mirrored, 5)).abs() < 1.0e-12);
 
     let mut first = base.clone();
     let mut second = base;
