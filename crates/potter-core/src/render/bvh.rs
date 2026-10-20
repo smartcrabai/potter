@@ -13,6 +13,17 @@ pub(crate) struct BvhHit {
     pub barycentric: [f64; 3],
 }
 
+/// The ray a [`Bvh::walk_hits`] walk follows: where it starts, its direction, the offset it restarts past each
+/// hit, the distance left along it, and its kind (which decides the triangles it passes through).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WalkRay {
+    pub origin: DVec3,
+    pub direction: DVec3,
+    pub epsilon: f64,
+    pub remaining: f64,
+    pub kind: crate::model::RayKind,
+}
+
 #[derive(Debug)]
 pub(crate) struct Bvh {
     nodes: Vec<Node>,
@@ -117,31 +128,30 @@ impl Bvh {
         self.closest_hit_mode(triangles, origin, direction, t_min, t_max, true, accepts)
     }
 
-    /// Walks the surfaces a ray of kind `ray` meets, nearest first, while `remaining` is left along it. `visit`
-    /// receives each hit and the origin the ray left from, and returns whether the walk goes on. The ray restarts
-    /// `epsilon` past each hit, and the walk ends when the distance is spent. Triangles whose object is hidden from
-    /// `ray` are passed through. Returns the origin and the distance where the walk stopped.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the walk carries the ray's kind and its extent through the callback"
-    )]
+    /// Walks the surfaces `walk` meets, nearest first, while `walk.remaining` is left along it. `visit` receives each
+    /// hit and the origin the ray left from, and returns whether the walk goes on. The ray restarts `walk.epsilon`
+    /// past each hit, and the walk ends when the distance is spent. Triangles whose object is hidden from the ray's
+    /// kind are passed through. Returns the origin and the distance where the walk stopped.
     pub(crate) fn walk_hits(
         &self,
         triangles: &[Triangle],
-        mut origin: DVec3,
-        direction: DVec3,
-        epsilon: f64,
-        mut remaining: f64,
-        ray: crate::model::RayKind,
+        walk: WalkRay,
         mut visit: impl FnMut(BvhHit, DVec3) -> bool,
     ) -> (DVec3, f64) {
+        let WalkRay {
+            mut origin,
+            direction,
+            epsilon,
+            mut remaining,
+            kind,
+        } = walk;
         while let Some(hit) = self.closest_hit_where(
             triangles,
             origin,
             direction,
             epsilon,
             remaining,
-            &|triangle| triangle.ray_mask & ray.bit() != 0,
+            &|triangle| triangle.ray_mask & kind.bit() != 0,
         ) {
             if !visit(hit, origin) {
                 break;

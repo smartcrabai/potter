@@ -25,7 +25,7 @@ use crate::{
 };
 
 use super::{
-    bvh::{Bvh, BvhHit},
+    bvh::{Bvh, BvhHit, WalkRay},
     light_model::{
         area_irradiance_per_radiance, area_radiance, area_shape, area_visibility_samples,
         point_intensity, spot_attenuation,
@@ -274,11 +274,13 @@ fn ray_transmittance(
     let mut transmittance = 1.0;
     shadow.bvh.walk_hits(
         shadow.triangles,
-        origin,
-        direction,
-        SHADOW_EPSILON,
-        distance,
-        RayKind::Shadow,
+        WalkRay {
+            origin,
+            direction,
+            epsilon: SHADOW_EPSILON,
+            remaining: distance,
+            kind: RayKind::Shadow,
+        },
         |hit, origin| {
             match shadow
                 .occluders

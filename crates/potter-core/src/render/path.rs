@@ -19,7 +19,7 @@ use super::principled_bsdf::{
     light_lobes_coefficient, lobe_probabilities, sample_glass,
 };
 use super::{
-    bvh::{Bvh, BvhHit},
+    bvh::{Bvh, BvhHit, WalkRay},
     light_model::{
         AreaShape, Spread, area_radiance, area_shape, emitter_radiance, inside_emitter,
         point_intensity, spot_attenuation, spread_attenuation, spread_region,
@@ -1840,11 +1840,13 @@ fn shadow_transmittance(
     };
     let (origin, remaining) = bvh.walk_hits(
         &geometry.triangles,
-        offset_origin(point, direction, normal),
-        direction,
-        RAY_EPSILON,
-        remaining,
-        RayKind::Shadow,
+        WalkRay {
+            origin: offset_origin(point, direction, normal),
+            direction,
+            epsilon: RAY_EPSILON,
+            remaining,
+            kind: RayKind::Shadow,
+        },
         |hit, origin| {
             let surface = match make_surface(
                 doc,
