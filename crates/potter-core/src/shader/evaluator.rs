@@ -342,7 +342,12 @@ impl BsdfParams {
         // The coat and sheen are shading like every other field, so they take the same share of the hits
         // (`shade`), not the raw factor: a Transparent arm then adds no coat or sheen, as it adds no colour.
         let coat = combine_layers(first.coat_layer(), 1.0 - shade, second.coat_layer(), shade);
-        let sheen = combine_layers(first.sheen_layer(), 1.0 - shade, second.sheen_layer(), shade);
+        let sheen = combine_layers(
+            first.sheen_layer(),
+            1.0 - shade,
+            second.sheen_layer(),
+            shade,
+        );
         Self {
             base_color,
             metallic: mix_scalar(first.metallic, second.metallic),
