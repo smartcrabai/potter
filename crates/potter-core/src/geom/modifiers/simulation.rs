@@ -1000,9 +1000,9 @@ fn displace_vdb_grid(grid: &VdbGrid, texture: &VolumeDisplacement<'_>) -> Result
 /// set as expanding the whole set, because the neighbours of older voxels are already present.
 fn dilate_face_edge(seeds: Vec<IVec3>, rounds: i32) -> Result<HashSet<IVec3>> {
     let mut offsets = Vec::with_capacity(18);
-    for z in -1..=1 {
-        for y in -1..=1 {
-            for x in -1..=1 {
+    for z in -1_i32..=1 {
+        for y in -1_i32..=1 {
+            for x in -1_i32..=1 {
                 if (1..=2).contains(&(x.abs() + y.abs() + z.abs())) {
                     offsets.push(IVec3::new(x, y, z));
                 }

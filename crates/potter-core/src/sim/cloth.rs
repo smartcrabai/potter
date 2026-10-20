@@ -104,10 +104,13 @@ pub fn simulate(
         .enumerate()
         .map(|(index, vertex)| (vertex.id, index))
         .collect::<BTreeMap<_, _>>();
-    let pinned = pinned_vertices(mesh, config.pin_group.as_deref(), &ids)?;
+    // The start frame returns the input unchanged. Blender's goal springs pull toward the per-frame
+    // input, which equals the current state there, so partial pins need no goal force until a
+    // solved frame.
     if positions.is_empty() || frame == 0.0 {
         return Ok(positions);
     }
+    let pinned = pinned_vertices(mesh, config.pin_group.as_deref(), &ids)?;
 
     let mut structural_keys = BTreeSet::new();
     for edge in &mesh.edges {

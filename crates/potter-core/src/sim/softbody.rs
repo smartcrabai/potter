@@ -156,8 +156,8 @@ pub fn simulate(
     for _ in 0..steps {
         std::mem::swap(&mut current, &mut previous);
         for index in 0..current.len() {
-            current[index] = previous[index] + velocity[index] * dt + gravity * (dt * dt);
-            current[index] += (rest[index] - current[index]) * goal_blend[index];
+            let predicted = previous[index] + velocity[index] * dt + gravity * (dt * dt);
+            current[index] = predicted + (rest[index] - predicted) * goal_blend[index];
         }
         for edge in &mut edges {
             edge.lambda = 0.0;

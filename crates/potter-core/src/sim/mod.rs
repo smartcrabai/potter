@@ -493,26 +493,23 @@ fn normalize_solver_settings(settings: &Value, system: &str) -> Value {
     let Some(properties) = normalized.as_object_mut() else {
         return normalized;
     };
-    match system {
-        "particle_system" => {
-            if !properties.contains_key("random_velocity")
-                && let Some(value) = settings.get("factor_random")
-            {
-                properties.insert("random_velocity".to_owned(), value.clone());
-            }
-            if !properties.contains_key("source")
-                && let Some(source) = settings.get("emit_from").and_then(Value::as_str)
-            {
-                let source = match source {
-                    "VERT" => "vertices",
-                    "FACE" => "faces",
-                    "VOLUME" => "volume",
-                    _ => source,
-                };
-                properties.insert("source".to_owned(), Value::String(source.to_owned()));
-            }
+    if system == "particle_system" {
+        if !properties.contains_key("random_velocity")
+            && let Some(value) = settings.get("factor_random")
+        {
+            properties.insert("random_velocity".to_owned(), value.clone());
         }
-        _ => {}
+        if !properties.contains_key("source")
+            && let Some(source) = settings.get("emit_from").and_then(Value::as_str)
+        {
+            let source = match source {
+                "VERT" => "vertices",
+                "FACE" => "faces",
+                "VOLUME" => "volume",
+                _ => source,
+            };
+            properties.insert("source".to_owned(), Value::String(source.to_owned()));
+        }
     }
     normalized
 }
@@ -1136,7 +1133,7 @@ fn collection_filter(
     let collection = value
         .as_str()
         .and_then(|name| Id::new(name.to_owned()).ok())
-        .filter(|id| doc.collections.get(id).is_some());
+        .filter(|id| doc.collections.contains_key(id));
     let Some(collection) = collection else {
         return Err(PotError::with_details(
             ErrorCode::UnsupportedFeature,

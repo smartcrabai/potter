@@ -18317,7 +18317,10 @@ mod volume_and_physics_loss_tests {
             features(&json!({"objects": [object(json!({"id_type": "Texture", "name": "Tex"}))]})),
             ["blender.modifier.volume_displace.texture"]
         );
-        assert!(features(&json!({"objects": [object(Value::Null)]})).is_empty());
+        assert_eq!(
+            features(&json!({"objects": [object(Value::Null)]})),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
@@ -18341,7 +18344,7 @@ mod volume_and_physics_loss_tests {
             "name": "Collision", "type": "COLLISION",
             "physics_settings": {"thickness_outer": 0.02, "use_culling": true}
         }]}]});
-        assert!(features(&raw).is_empty());
+        assert_eq!(features(&raw), Vec::<String>::new());
     }
 
     #[test]
@@ -18401,7 +18404,7 @@ mod volume_and_physics_loss_tests {
             "name": "Cloth", "type": "CLOTH",
             "physics_settings": {"collision_settings": {"collection": {"id_type": "Collection", "name": "Col"}}}
         }]}]});
-        assert!(features(&raw).is_empty());
+        assert_eq!(features(&raw), Vec::<String>::new());
     }
 
     #[test]

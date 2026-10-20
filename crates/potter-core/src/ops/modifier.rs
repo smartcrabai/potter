@@ -31,7 +31,7 @@ pub(super) fn apply(
         _ => Err(engine.error(
             ErrorCode::InvalidOperation,
             format!("unsupported modifier operation `{name}`"),
-            "/op",
+            &operation_pointer(engine.operation_index, "op"),
         )),
     }
 }
@@ -323,7 +323,7 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                 engine.error(
                     ErrorCode::InvalidOperation,
                     "name must be a string",
-                    "/name",
+                    &operation_pointer(engine.operation_index, "name"),
                 )
             })?
             .to_owned(),
@@ -339,13 +339,23 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
         ParameterFamily::Modifier,
         &modifier_type,
         &params,
-        "/params",
+        &operation_pointer(engine.operation_index, "params"),
     )?;
-    validate_modifier_resource(engine, &modifier_type, &params, "/params")?;
+    validate_modifier_resource(
+        engine,
+        &modifier_type,
+        &params,
+        &operation_pointer(engine.operation_index, "params"),
+    )?;
     if modifier_type == "volume_displace" {
         validate_volume_displace_params(engine, &params)?;
     } else if is_attribute_modifier_type(&modifier_type) {
-        validate_attribute_modifier_params(engine, &modifier_type, &params, "/params")?;
+        validate_attribute_modifier_params(
+            engine,
+            &modifier_type,
+            &params,
+            &operation_pointer(engine.operation_index, "params"),
+        )?;
     }
     validate_particle_modifier_params(engine, &modifier_type, &params)?;
     let mut changed = false;
@@ -354,7 +364,7 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             return Err(engine.error(
                 ErrorCode::TargetNotFound,
                 format!("node `{target}` was not found"),
-                "/target",
+                &operation_pointer(engine.operation_index, "target"),
             ));
         }
         validate_volume_object_type(engine, &modifier_type, &target)?;
@@ -367,7 +377,7 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             return Err(engine.error(
                 ErrorCode::IdExists,
                 format!("modifier ID `{id}` already exists on node `{target}`"),
-                "/id",
+                &operation_pointer(engine.operation_index, "id"),
             ));
         }
         let modifier_params = super::physics::create_linked_modifier_settings(
@@ -420,7 +430,11 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
         .get("set")
         .and_then(Value::as_object)
         .ok_or_else(|| {
-            engine.error(ErrorCode::InvalidOperation, "set must be an object", "/set")
+            engine.error(
+                ErrorCode::InvalidOperation,
+                "set must be an object",
+                &operation_pointer(engine.operation_index, "set"),
+            )
         })?;
     for key in set.keys() {
         if ![
@@ -436,7 +450,7 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             return Err(engine.error(
                 ErrorCode::InvalidOperation,
                 format!("unknown modifier set field `{key}`"),
-                "/set",
+                &operation_pointer(engine.operation_index, "set"),
             ));
         }
     }
@@ -517,9 +531,14 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                 ParameterFamily::Modifier,
                 modifier_type,
                 &candidate,
-                "/set/params",
+                &operation_pointer(engine.operation_index, "set/params"),
             )?;
-            validate_modifier_resource(engine, modifier_type, &candidate, "/set/params")?;
+            validate_modifier_resource(
+                engine,
+                modifier_type,
+                &candidate,
+                &operation_pointer(engine.operation_index, "set/params"),
+            )?;
             if modifier_type == "volume_displace" {
                 validate_volume_displace_params(engine, &candidate)?;
             } else if is_attribute_modifier_type(modifier_type) {
@@ -527,7 +546,7 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                     engine,
                     modifier_type,
                     &candidate,
-                    "/set/params",
+                    &operation_pointer(engine.operation_index, "set/params"),
                 )?;
             }
             validate_particle_modifier_params(engine, modifier_type, &candidate)?;
@@ -657,7 +676,7 @@ fn synchronize_rna_aliases(
                     "{} are one Blender value; set one value",
                     group.join(" and ")
                 ),
-                "/set/params",
+                &operation_pointer(engine.operation_index, "set/params"),
             ));
         }
         let value = touched[0].clone();
@@ -689,7 +708,7 @@ fn delete(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                 engine.error(
                     ErrorCode::TargetNotFound,
                     format!("modifier `{id}` was not found on node `{target}`"),
-                    "/modifier_id",
+                    &operation_pointer(engine.operation_index, "modifier_id"),
                 )
             })?;
         super::physics::delete_linked_modifier_settings(engine, &target, &existing)?;
@@ -725,7 +744,7 @@ fn reorder(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bo
             return Err(engine.error(
                 ErrorCode::InvalidOperation,
                 "provide exactly one of index or to_index",
-                "/index",
+                &operation_pointer(engine.operation_index, "index"),
             ));
         }
     };
@@ -737,7 +756,7 @@ fn reorder(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bo
             engine.error(
                 ErrorCode::InvalidOperation,
                 "index must be a non-negative integer",
-                &format!("/{index_field}"),
+                &operation_pointer(engine.operation_index, index_field),
             )
         })?;
     let mut changed = false;
@@ -752,14 +771,14 @@ fn reorder(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bo
             return Err(engine.error(
                 ErrorCode::TargetNotFound,
                 format!("modifier `{id}` was not found"),
-                "/modifier_id",
+                &operation_pointer(engine.operation_index, "modifier_id"),
             ));
         };
         if index >= node.modifiers.len() {
             return Err(engine.error(
                 ErrorCode::InvalidOperation,
                 "modifier index is outside the stack",
-                "/index",
+                &operation_pointer(engine.operation_index, "index"),
             ));
         }
         if current != index {
@@ -770,7 +789,7 @@ fn reorder(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bo
                     format!(
                         "modifier `{id}` cannot move to index {index}: pin-to-last or original-data order stops it at index {reached}"
                     ),
-                    "/index",
+                    &operation_pointer(engine.operation_index, "index"),
                 ));
             }
             move_modifier(&mut node.modifiers, current, index);
@@ -925,7 +944,7 @@ fn ensure_single_user_data(engine: &mut Engine<'_>, targets: &[Id]) -> Result<()
                 engine.error(
                     ErrorCode::InvalidOperation,
                     format!("node `{target}` has no geometry data"),
-                    "/target",
+                    &operation_pointer(engine.operation_index, "target"),
                 )
             })?;
         if super::data_user_count(engine, &data_id) <= 1 {
@@ -976,7 +995,7 @@ fn apply_modifier(
     let scope = super::parse_scope(
         engine,
         operation.get("scope"),
-        "/scope",
+        &operation_pointer(engine.operation_index, "scope"),
         "scope must be a string",
         "scope must be shared or single_user",
         true,
@@ -992,7 +1011,7 @@ fn apply_modifier(
                 engine.error(
                     ErrorCode::InvalidOperation,
                     format!("node `{target}` has no geometry data"),
-                    "/target",
+                    &operation_pointer(engine.operation_index, "target"),
                 )
             })?;
         data_targets.push((target.clone(), data_id));
@@ -1004,7 +1023,7 @@ fn apply_modifier(
         return Err(engine.error(
             ErrorCode::SharedDataRequiresScope,
             "shared geometry updates require scope",
-            "/scope",
+            &operation_pointer(engine.operation_index, "scope"),
         ));
     }
     if scope == Some("single_user") {
@@ -1555,7 +1574,7 @@ fn apply_modifier_as_shape_key(
                 engine.error(
                     ErrorCode::InvalidOperation,
                     "name must be a string",
-                    "/name",
+                    &operation_pointer(engine.operation_index, "name"),
                 )
             })
         })
@@ -1563,7 +1582,7 @@ fn apply_modifier_as_shape_key(
     let scope = super::parse_scope(
         engine,
         operation.get("scope"),
-        "/scope",
+        &operation_pointer(engine.operation_index, "scope"),
         "scope must be a string",
         "scope must be shared or single_user",
         true,
@@ -1579,7 +1598,7 @@ fn apply_modifier_as_shape_key(
                 engine.error(
                     ErrorCode::InvalidOperation,
                     format!("node `{target}` has no geometry data"),
-                    "/target",
+                    &operation_pointer(engine.operation_index, "target"),
                 )
             })?;
         data_targets.push((target.clone(), data_id));
@@ -1591,7 +1610,7 @@ fn apply_modifier_as_shape_key(
         return Err(engine.error(
             ErrorCode::SharedDataRequiresScope,
             "shared geometry updates require scope",
-            "/scope",
+            &operation_pointer(engine.operation_index, "scope"),
         ));
     }
     if scope == Some("single_user") {
@@ -1608,7 +1627,7 @@ fn apply_modifier_as_shape_key(
                 engine.error(
                     ErrorCode::InvalidOperation,
                     "target has no mesh data",
-                    "/target",
+                    &operation_pointer(engine.operation_index, "target"),
                 )
             })?;
         let cache_shared = shared && scope == Some("shared");
@@ -1654,7 +1673,7 @@ fn apply_modifier_as_shape_key(
             return Err(engine.error(
                 ErrorCode::IdExists,
                 format!("shape key ID `{key_id}` already exists"),
-                "/id",
+                &operation_pointer(engine.operation_index, "id"),
             ));
         }
         let positions = evaluated
@@ -1852,7 +1871,11 @@ fn apply_lattice_modifier(
 
 fn targets(engine: &Engine<'_>, operation: &Map<String, Value>) -> Result<Vec<Id>> {
     let target = operation.get("target").ok_or_else(|| {
-        engine.error(ErrorCode::InvalidOperation, "target is required", "/target")
+        engine.error(
+            ErrorCode::InvalidOperation,
+            "target is required",
+            &operation_pointer(engine.operation_index, "target"),
+        )
     })?;
     resolve_node_targets(engine, target, true)
 }
@@ -1863,7 +1886,7 @@ fn read_id(engine: &Engine<'_>, operation: &Map<String, Value>, field: &str) -> 
         engine.error(
             ErrorCode::InvalidOperation,
             "invalid ID",
-            &format!("/{field}"),
+            &operation_pointer(engine.operation_index, field),
         )
     })
 }
@@ -1873,7 +1896,7 @@ fn read_modifier_id(engine: &Engine<'_>, operation: &Map<String, Value>) -> Resu
         return Err(engine.error(
             ErrorCode::InvalidOperation,
             "provide either id or modifier_id, not both",
-            "/modifier_id",
+            &operation_pointer(engine.operation_index, "modifier_id"),
         ));
     }
     let field = if operation.contains_key("modifier_id") {
@@ -1894,7 +1917,7 @@ fn read_params(
         Some(_) => Err(engine.error(
             ErrorCode::InvalidOperation,
             "params must be an object",
-            &format!("/{field}"),
+            &operation_pointer(engine.operation_index, field),
         )),
     }
 }
@@ -2422,7 +2445,7 @@ fn validate_volume_object_type(
     Err(engine.error(
         ErrorCode::InvalidOperation,
         format!("{modifier_type} modifiers require a {expected_kind} Object"),
-        "/target",
+        &operation_pointer(engine.operation_index, "target"),
     ))
 }
 
@@ -2442,7 +2465,7 @@ fn validate_volume_displace_params(engine: &Engine<'_>, params: &Map<String, Val
             return Err(engine.error(
                 ErrorCode::InvalidOperation,
                 format!("Volume Displace `{field}` must be finite"),
-                &format!("/params/{field}"),
+                &operation_pointer(engine.operation_index, &format!("params/{field}")),
             ));
         }
     }
@@ -2457,7 +2480,7 @@ fn validate_volume_displace_params(engine: &Engine<'_>, params: &Map<String, Val
         return Err(engine.error(
             ErrorCode::InvalidOperation,
             "Volume Displace texture_mid_level must contain three finite values",
-            "/params/texture_mid_level",
+            &operation_pointer(engine.operation_index, "params/texture_mid_level"),
         ));
     }
     if params
@@ -2468,7 +2491,7 @@ fn validate_volume_displace_params(engine: &Engine<'_>, params: &Map<String, Val
         return Err(engine.error(
             ErrorCode::InvalidOperation,
             "Volume Displace texture_sample_radius must be non-negative",
-            "/params/texture_sample_radius",
+            &operation_pointer(engine.operation_index, "params/texture_sample_radius"),
         ));
     }
     if let Some(mode) = params.get("texture_map_mode")
@@ -2477,7 +2500,7 @@ fn validate_volume_displace_params(engine: &Engine<'_>, params: &Map<String, Val
         return Err(engine.error(
             ErrorCode::InvalidOperation,
             "Volume Displace texture_map_mode must be LOCAL, GLOBAL, or OBJECT",
-            "/params/texture_map_mode",
+            &operation_pointer(engine.operation_index, "params/texture_map_mode"),
         ));
     }
     // Blender reads `texture_map_object` only in OBJECT mapping, so LOCAL and GLOBAL ignore it.
@@ -2490,21 +2513,21 @@ fn validate_volume_displace_params(engine: &Engine<'_>, params: &Map<String, Val
             return Err(engine.error(
                 ErrorCode::InvalidOperation,
                 "Volume Displace texture_map_object must be an object ID",
-                "/params/texture_map_object",
+                &operation_pointer(engine.operation_index, "params/texture_map_object"),
             ));
         };
         let object_id = Id::new(object_text.to_owned()).map_err(|error| {
             engine.error(
                 ErrorCode::InvalidOperation,
                 error.message,
-                "/params/texture_map_object",
+                &operation_pointer(engine.operation_index, "params/texture_map_object"),
             )
         })?;
         if !engine.doc.nodes.contains_key(&object_id) {
             return Err(engine.error(
                 ErrorCode::TargetNotFound,
                 "Volume Displace texture_map_object was not found",
-                "/params/texture_map_object",
+                &operation_pointer(engine.operation_index, "params/texture_map_object"),
             ));
         }
     }
@@ -2552,24 +2575,28 @@ fn validate_particle_modifier_params(
                 engine.error(
                     ErrorCode::InvalidOperation,
                     "particle_instance requires an object ID",
-                    "/params/object",
+                    &operation_pointer(engine.operation_index, "params/object"),
                 )
             })?;
         let object_id = Id::new(object.to_owned()).map_err(|error| {
-            engine.error(ErrorCode::InvalidOperation, error.message, "/params/object")
+            engine.error(
+                ErrorCode::InvalidOperation,
+                error.message,
+                &operation_pointer(engine.operation_index, "params/object"),
+            )
         })?;
         let source = engine.doc.nodes.get(&object_id).ok_or_else(|| {
             engine.error(
                 ErrorCode::TargetNotFound,
                 "particle system object was not found",
-                "/params/object",
+                &operation_pointer(engine.operation_index, "params/object"),
             )
         })?;
         if !source.properties.contains_key("physics_particle_emitter") {
             return Err(engine.error(
                 ErrorCode::InvalidOperation,
                 "particle_instance object has no particle system settings",
-                "/params/object",
+                &operation_pointer(engine.operation_index, "params/object"),
             ));
         }
     }
@@ -2578,7 +2605,7 @@ fn validate_particle_modifier_params(
             engine.error(
                 ErrorCode::InvalidOperation,
                 "particle_system_index must be a positive integer",
-                "/params/particle_system_index",
+                &operation_pointer(engine.operation_index, "params/particle_system_index"),
             )
         })?;
         if modifier_type == "particle_instance" {
@@ -2590,7 +2617,7 @@ fn validate_particle_modifier_params(
                     engine.error(
                         ErrorCode::InvalidOperation,
                         "particle_instance requires an object ID",
-                        "/params/object",
+                        &operation_pointer(engine.operation_index, "params/object"),
                     )
                 })?;
             let system_count = engine.doc.nodes.get(&object_id).map_or(0, |node| {
@@ -2603,7 +2630,7 @@ fn validate_particle_modifier_params(
                 return Err(engine.error(
                     ErrorCode::TargetNotFound,
                     "particle system index does not exist on the referenced object",
-                    "/params/particle_system_index",
+                    &operation_pointer(engine.operation_index, "params/particle_system_index"),
                 ));
             }
         }
@@ -2622,7 +2649,7 @@ fn validate_particle_modifier_params(
             return Err(engine.error(
                 ErrorCode::InvalidOperation,
                 format!("{modifier_type} `{field}` must be a boolean"),
-                &format!("/params/{field}"),
+                &operation_pointer(engine.operation_index, &format!("params/{field}")),
             ));
         }
     }
@@ -2640,7 +2667,7 @@ fn validate_particle_modifier_params(
             return Err(engine.error(
                 ErrorCode::InvalidOperation,
                 format!("{modifier_type} `{field}` must be finite"),
-                &format!("/params/{field}"),
+                &operation_pointer(engine.operation_index, &format!("params/{field}")),
             ));
         }
     }
@@ -2652,7 +2679,7 @@ fn validate_particle_modifier_params(
         return Err(engine.error(
             ErrorCode::InvalidOperation,
             "particle_instance random_position must be in [0, 1]",
-            "/params/random_position",
+            &operation_pointer(engine.operation_index, "params/random_position"),
         ));
     }
     if params
@@ -2663,7 +2690,7 @@ fn validate_particle_modifier_params(
         return Err(engine.error(
             ErrorCode::InvalidOperation,
             "particle_instance random_rotation must be in [0, 1]",
-            "/params/random_rotation",
+            &operation_pointer(engine.operation_index, "params/random_rotation"),
         ));
     }
     if params
@@ -2674,7 +2701,7 @@ fn validate_particle_modifier_params(
         return Err(engine.error(
             ErrorCode::InvalidOperation,
             "explode protect must be in [0, 1]",
-            "/params/protect",
+            &operation_pointer(engine.operation_index, "params/protect"),
         ));
     }
     if let Some(axis) = params.get("axis")
@@ -2683,7 +2710,7 @@ fn validate_particle_modifier_params(
         return Err(engine.error(
             ErrorCode::InvalidOperation,
             "particle_instance axis must be X, Y, or Z",
-            "/params/axis",
+            &operation_pointer(engine.operation_index, "params/axis"),
         ));
     }
     if let Some(space) = params.get("space")
@@ -2692,7 +2719,7 @@ fn validate_particle_modifier_params(
         return Err(engine.error(
             ErrorCode::InvalidOperation,
             "particle_instance space must be WORLD or LOCAL",
-            "/params/space",
+            &operation_pointer(engine.operation_index, "params/space"),
         ));
     }
     if params
@@ -2702,7 +2729,7 @@ fn validate_particle_modifier_params(
         return Err(engine.error(
             ErrorCode::InvalidOperation,
             format!("{modifier_type} `vertex_group` must be a non-empty group name"),
-            "/params/vertex_group",
+            &operation_pointer(engine.operation_index, "params/vertex_group"),
         ));
     }
     Ok(())

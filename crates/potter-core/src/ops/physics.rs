@@ -62,8 +62,12 @@ fn update_world(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resu
         &["op", "target", "set"],
         &["target", "set"],
     )?;
-    let scene_id =
-        super::target_id_value(engine, operation.get("target"), "/target", TARGET_ID_POLICY)?;
+    let scene_id = super::target_id_value(
+        engine,
+        operation.get("target"),
+        &operation_pointer(engine.operation_index, "target"),
+        TARGET_ID_POLICY,
+    )?;
     let updates = set_object(engine, operation)?;
     check_physics_set_fields(
         engine,
@@ -83,7 +87,7 @@ fn update_world(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resu
         engine.error(
             ErrorCode::TargetNotFound,
             "physics Scene was not found",
-            "/target/id",
+            &operation_pointer(engine.operation_index, "target/id"),
         )
     })?;
     let before = scene.rigid_body_world.clone();
@@ -101,7 +105,7 @@ fn update_world(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resu
             engine.error(
                 ErrorCode::InvalidOperation,
                 format!("invalid rigid body world settings: {error}"),
-                "/set",
+                &operation_pointer(engine.operation_index, "set"),
             )
         },
     )?;
@@ -134,14 +138,23 @@ fn create_rigid_body(engine: &mut Engine<'_>, operation: &Map<String, Value>) ->
         "initial_velocity",
     ];
     check_fields(engine, operation, FIELDS, &["target", "type"])?;
-    let node_id =
-        super::target_id_value(engine, operation.get("target"), "/target", TARGET_ID_POLICY)?;
-    let node = physics_node(engine, &node_id, "rigid body", "/target/id")?;
+    let node_id = super::target_id_value(
+        engine,
+        operation.get("target"),
+        &operation_pointer(engine.operation_index, "target"),
+        TARGET_ID_POLICY,
+    )?;
+    let node = physics_node(
+        engine,
+        &node_id,
+        "rigid body",
+        &operation_pointer(engine.operation_index, "target/id"),
+    )?;
     if node.rigid_body.is_some() {
         return Err(engine.error(
             ErrorCode::IdExists,
             "Object already has a rigid body",
-            "/target/id",
+            &operation_pointer(engine.operation_index, "target/id"),
         ));
     }
     validate_rigid_body_node(engine, &node_id, &node)?;
@@ -171,14 +184,23 @@ fn update_rigid_body(engine: &mut Engine<'_>, operation: &Map<String, Value>) ->
         &["op", "target", "set"],
         &["target", "set"],
     )?;
-    let node_id =
-        super::target_id_value(engine, operation.get("target"), "/target", TARGET_ID_POLICY)?;
-    let node = physics_node(engine, &node_id, "rigid body", "/target/id")?;
+    let node_id = super::target_id_value(
+        engine,
+        operation.get("target"),
+        &operation_pointer(engine.operation_index, "target"),
+        TARGET_ID_POLICY,
+    )?;
+    let node = physics_node(
+        engine,
+        &node_id,
+        "rigid body",
+        &operation_pointer(engine.operation_index, "target/id"),
+    )?;
     let before = node.rigid_body.clone().ok_or_else(|| {
         engine.error(
             ErrorCode::TargetNotFound,
             "Object has no rigid body",
-            "/target/id",
+            &operation_pointer(engine.operation_index, "target/id"),
         )
     })?;
     let updates = set_object(engine, operation)?;
@@ -197,14 +219,23 @@ fn update_rigid_body(engine: &mut Engine<'_>, operation: &Map<String, Value>) ->
 
 fn delete_rigid_body(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bool> {
     check_fields(engine, operation, &["op", "target"], &["target"])?;
-    let node_id =
-        super::target_id_value(engine, operation.get("target"), "/target", TARGET_ID_POLICY)?;
-    let node = physics_node(engine, &node_id, "rigid body", "/target/id")?;
+    let node_id = super::target_id_value(
+        engine,
+        operation.get("target"),
+        &operation_pointer(engine.operation_index, "target"),
+        TARGET_ID_POLICY,
+    )?;
+    let node = physics_node(
+        engine,
+        &node_id,
+        "rigid body",
+        &operation_pointer(engine.operation_index, "target/id"),
+    )?;
     if node.rigid_body.is_none() {
         return Err(engine.error(
             ErrorCode::TargetNotFound,
             "Object has no rigid body",
-            "/target/id",
+            &operation_pointer(engine.operation_index, "target/id"),
         ));
     }
     if let Some(node) = engine.doc.nodes.get_mut(&node_id) {
@@ -217,21 +248,30 @@ fn delete_rigid_body(engine: &mut Engine<'_>, operation: &Map<String, Value>) ->
 fn create_force_field(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bool> {
     const FIELDS: &[&str] = &["op", "target", "type", "strength", "falloff"];
     check_fields(engine, operation, FIELDS, &["target", "type"])?;
-    let node_id =
-        super::target_id_value(engine, operation.get("target"), "/target", TARGET_ID_POLICY)?;
-    let node = physics_node(engine, &node_id, "force field", "/target/id")?;
+    let node_id = super::target_id_value(
+        engine,
+        operation.get("target"),
+        &operation_pointer(engine.operation_index, "target"),
+        TARGET_ID_POLICY,
+    )?;
+    let node = physics_node(
+        engine,
+        &node_id,
+        "force field",
+        &operation_pointer(engine.operation_index, "target/id"),
+    )?;
     if node.kind != "empty" {
         return Err(engine.error(
             ErrorCode::InvalidOperation,
             "force fields require an Empty Object",
-            "/target/id",
+            &operation_pointer(engine.operation_index, "target/id"),
         ));
     }
     if node.force_field.is_some() {
         return Err(engine.error(
             ErrorCode::IdExists,
             "Object already has a force field",
-            "/target/id",
+            &operation_pointer(engine.operation_index, "target/id"),
         ));
     }
     let field = decode_force_field(engine, ForceField::default(), operation, FIELDS)?;
@@ -251,21 +291,30 @@ fn update_force_field(engine: &mut Engine<'_>, operation: &Map<String, Value>) -
         &["op", "target", "set"],
         &["target", "set"],
     )?;
-    let node_id =
-        super::target_id_value(engine, operation.get("target"), "/target", TARGET_ID_POLICY)?;
-    let node = physics_node(engine, &node_id, "force field", "/target/id")?;
+    let node_id = super::target_id_value(
+        engine,
+        operation.get("target"),
+        &operation_pointer(engine.operation_index, "target"),
+        TARGET_ID_POLICY,
+    )?;
+    let node = physics_node(
+        engine,
+        &node_id,
+        "force field",
+        &operation_pointer(engine.operation_index, "target/id"),
+    )?;
     if node.kind != "empty" {
         return Err(engine.error(
             ErrorCode::InvalidOperation,
             "force fields require an Empty Object",
-            "/target/id",
+            &operation_pointer(engine.operation_index, "target/id"),
         ));
     }
     let before = node.force_field.clone().ok_or_else(|| {
         engine.error(
             ErrorCode::TargetNotFound,
             "Object has no force field",
-            "/target/id",
+            &operation_pointer(engine.operation_index, "target/id"),
         )
     })?;
     let updates = set_object(engine, operation)?;
@@ -284,14 +333,23 @@ fn update_force_field(engine: &mut Engine<'_>, operation: &Map<String, Value>) -
 
 fn delete_force_field(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bool> {
     check_fields(engine, operation, &["op", "target"], &["target"])?;
-    let node_id =
-        super::target_id_value(engine, operation.get("target"), "/target", TARGET_ID_POLICY)?;
-    let node = physics_node(engine, &node_id, "force field", "/target/id")?;
+    let node_id = super::target_id_value(
+        engine,
+        operation.get("target"),
+        &operation_pointer(engine.operation_index, "target"),
+        TARGET_ID_POLICY,
+    )?;
+    let node = physics_node(
+        engine,
+        &node_id,
+        "force field",
+        &operation_pointer(engine.operation_index, "target/id"),
+    )?;
     if node.force_field.is_none() {
         return Err(engine.error(
             ErrorCode::TargetNotFound,
             "Object has no force field",
-            "/target/id",
+            &operation_pointer(engine.operation_index, "target/id"),
         ));
     }
     if let Some(node) = engine.doc.nodes.get_mut(&node_id) {
@@ -327,7 +385,7 @@ fn decode_rigid_body(
         engine.error(
             ErrorCode::InvalidOperation,
             format!("invalid rigid body settings: {error}"),
-            "/set",
+            &operation_pointer(engine.operation_index, "set"),
         )
     })?;
     Ok(body)
@@ -359,7 +417,7 @@ fn decode_force_field(
         engine.error(
             ErrorCode::InvalidOperation,
             format!("invalid force field settings: {error}"),
-            "/set",
+            &operation_pointer(engine.operation_index, "set"),
         )
     })?;
     Ok(field)
@@ -376,7 +434,7 @@ fn validate_world(engine: &Engine<'_>, world: &RigidBodyWorld) -> Result<()> {
         return Err(engine.error(
             ErrorCode::InvalidOperation,
             "rigid body world settings are outside supported ranges",
-            "/set",
+            &operation_pointer(engine.operation_index, "set"),
         ));
     }
     Ok(())
@@ -399,7 +457,7 @@ fn validate_body(engine: &Engine<'_>, body: &RigidBody) -> Result<()> {
         return Err(engine.error(
             ErrorCode::InvalidOperation,
             "rigid body values are invalid",
-            "/set",
+            &operation_pointer(engine.operation_index, "set"),
         ));
     }
     Ok(())
@@ -410,7 +468,7 @@ fn validate_force_field(engine: &Engine<'_>, field: &ForceField) -> Result<()> {
         return Err(engine.error(
             ErrorCode::InvalidOperation,
             "force field values must be finite and falloff non-negative",
-            "/set",
+            &operation_pointer(engine.operation_index, "set"),
         ));
     }
     Ok(())
@@ -450,7 +508,13 @@ fn set_object<'a>(
     operation
         .get("set")
         .and_then(Value::as_object)
-        .ok_or_else(|| engine.error(ErrorCode::InvalidOperation, "set must be an object", "/set"))
+        .ok_or_else(|| {
+            engine.error(
+                ErrorCode::InvalidOperation,
+                "set must be an object",
+                &operation_pointer(engine.operation_index, "set"),
+            )
+        })
 }
 
 fn check_physics_set_fields(
@@ -463,14 +527,14 @@ fn check_physics_set_fields(
         engine.error(
             ErrorCode::InvalidOperation,
             format!("unknown physics set field `{field}`"),
-            &format!("/{prefix}/{field}"),
+            &operation_pointer(engine.operation_index, &format!("{prefix}/{field}")),
         )
     })?;
     if set.is_empty() {
         return Err(engine.error(
             ErrorCode::InvalidOperation,
             "set must not be empty",
-            &format!("/{prefix}"),
+            &operation_pointer(engine.operation_index, prefix),
         ));
     }
     Ok(())
@@ -487,7 +551,7 @@ fn apply_physics_system(
             engine.error(
                 ErrorCode::InvalidOperation,
                 "invalid physics operation",
-                "/op",
+                &operation_pointer(engine.operation_index, "op"),
             )
         })?;
     let (property, canonical_system) = match system {
@@ -501,13 +565,22 @@ fn apply_physics_system(
             return Err(engine.error(
                 ErrorCode::InvalidOperation,
                 format!("unsupported physics system `{system}`"),
-                "/op",
+                &operation_pointer(engine.operation_index, "op"),
             ));
         }
     };
-    let target =
-        super::target_id_value(engine, operation.get("target"), "/target", TARGET_ID_POLICY)?;
-    let node = physics_node(engine, &target, "physics", "/target/id")?;
+    let target = super::target_id_value(
+        engine,
+        operation.get("target"),
+        &operation_pointer(engine.operation_index, "target"),
+        TARGET_ID_POLICY,
+    )?;
+    let node = physics_node(
+        engine,
+        &target,
+        "physics",
+        &operation_pointer(engine.operation_index, "target/id"),
+    )?;
     validate_system_target(engine, &target, &node)?;
     let current = node.properties.get(property);
 
@@ -523,7 +596,7 @@ fn apply_physics_system(
                 return Err(engine.error(
                     ErrorCode::IdExists,
                     format!("{system} is already configured on this Object"),
-                    "/target/id",
+                    &operation_pointer(engine.operation_index, "target/id"),
                 ));
             }
             let mut settings = operation
@@ -533,7 +606,7 @@ fn apply_physics_system(
                         engine.error(
                             ErrorCode::InvalidOperation,
                             "settings must be an object",
-                            "/settings",
+                            &operation_pointer(engine.operation_index, "settings"),
                         )
                     })
                 })
@@ -562,7 +635,7 @@ fn apply_physics_system(
             })?;
             node.properties
                 .insert(property.to_owned(), Value::Object(settings));
-            ensure_physics_stack_modifier(engine, &target, canonical_system)?;
+            ensure_physics_stack_modifier(engine, &target, canonical_system, "DOMAIN")?;
             engine.mark("nodes", &target, ChangeKind::Updated);
             Ok(true)
         }
@@ -578,14 +651,14 @@ fn apply_physics_system(
                 return Err(engine.error(
                     ErrorCode::InvalidOperation,
                     "set must not be empty",
-                    "/set",
+                    &operation_pointer(engine.operation_index, "set"),
                 ));
             }
             let mut settings = current.and_then(Value::as_object).cloned().ok_or_else(|| {
                 engine.error(
                     ErrorCode::TargetNotFound,
                     format!("{system} is not configured on this Object"),
-                    "/target/id",
+                    &operation_pointer(engine.operation_index, "target/id"),
                 )
             })?;
             let previous_dynamic_role = if canonical_system == "dynamic_paint" {
@@ -608,16 +681,16 @@ fn apply_physics_system(
             }
             settings.extend(updates.clone());
             if canonical_system == "fluid" {
-                validate_fluid_settings_role(engine, fluid_modifier_role(&node), &updates)?;
+                validate_fluid_settings_role(engine, fluid_modifier_role(&node), updates)?;
             }
             if canonical_system == "dynamic_paint" {
-                validate_dynamic_paint_settings_role(engine, &dynamic_role, &updates)?;
+                validate_dynamic_paint_settings_role(engine, &dynamic_role, updates)?;
             }
             validate_physics_settings(
                 engine,
                 canonical_system,
                 if matches!(canonical_system, "dynamic_paint" | "fluid") {
-                    &updates
+                    updates
                 } else {
                     &settings
                 },
@@ -631,7 +704,7 @@ fn apply_physics_system(
                 node.properties
                     .insert(property.to_owned(), Value::Object(settings));
             }
-            changed |= ensure_physics_stack_modifier(engine, &target, canonical_system)?;
+            changed |= ensure_physics_stack_modifier(engine, &target, canonical_system, "NONE")?;
             if !changed {
                 return Ok(false);
             }
@@ -644,7 +717,7 @@ fn apply_physics_system(
                 return Err(engine.error(
                     ErrorCode::TargetNotFound,
                     format!("{system} is not configured on this Object"),
-                    "/target/id",
+                    &operation_pointer(engine.operation_index, "target/id"),
                 ));
             }
             let node = engine.doc.nodes.get_mut(&target).ok_or_else(|| {
@@ -665,7 +738,7 @@ fn apply_physics_system(
         _ => Err(engine.error(
             ErrorCode::InvalidOperation,
             format!("unsupported physics operation `{name}`"),
-            "/op",
+            &operation_pointer(engine.operation_index, "op"),
         )),
     }
 }
@@ -747,7 +820,7 @@ pub(super) fn create_linked_modifier_settings(
         return Err(engine.error(
             ErrorCode::InvalidOperation,
             "physics modifier settings_id must equal the modifier ID",
-            "/params/settings_id",
+            &operation_pointer(engine.operation_index, "params/settings_id"),
         ));
     }
     let mut modifier_flags = split_modifier_flags(modifier_type, &mut settings);
@@ -770,7 +843,12 @@ pub(super) fn create_linked_modifier_settings(
             .entry("fluid_type".to_owned())
             .or_insert_with(|| Value::String("NONE".to_owned()));
     }
-    let node = physics_node(engine, target, "modifier physics", "/target/id")?;
+    let node = physics_node(
+        engine,
+        target,
+        "modifier physics",
+        &operation_pointer(engine.operation_index, "target/id"),
+    )?;
     validate_system_target(engine, target, &node)?;
     validate_physics_settings(engine, system, &settings)?;
     if system == "fluid" {
@@ -804,7 +882,7 @@ pub(super) fn create_linked_modifier_settings(
             return Err(engine.error(
                 ErrorCode::IdExists,
                 "particle system settings ID already exists",
-                "/id",
+                &operation_pointer(engine.operation_index, "id"),
             ));
         }
         registry.insert(modifier_id.to_string(), Value::Object(settings));
@@ -813,7 +891,7 @@ pub(super) fn create_linked_modifier_settings(
             return Err(engine.error(
                 ErrorCode::IdExists,
                 format!("{system} is already configured on this Object"),
-                "/target/id",
+                &operation_pointer(engine.operation_index, "target/id"),
             ));
         }
         node.properties
@@ -850,14 +928,19 @@ pub(super) fn update_linked_modifier_settings(
         return Err(engine.error(
             ErrorCode::InvalidOperation,
             "physics modifier settings_id cannot be changed",
-            "/set/params/settings_id",
+            &operation_pointer(engine.operation_index, "set/params/settings_id"),
         ));
     }
     let mut settings = params.clone();
     settings.remove("settings_id");
     let mut modifier_flags = split_modifier_flags(modifier_type, &mut settings);
     let property = physics_property(system);
-    let node = physics_node(engine, target, "modifier physics", "/target/id")?;
+    let node = physics_node(
+        engine,
+        target,
+        "modifier physics",
+        &operation_pointer(engine.operation_index, "target/id"),
+    )?;
     let is_particle_registry_entry = system == "particle_emitter"
         && node
             .properties
@@ -873,7 +956,7 @@ pub(super) fn update_linked_modifier_settings(
         return Err(engine.error(
             ErrorCode::TargetNotFound,
             format!("{system} has no linked physics settings"),
-            "/modifier_id",
+            &operation_pointer(engine.operation_index, "modifier_id"),
         ));
     }
     let (previous_dynamic_role, dynamic_role) = if system == "dynamic_paint" {
@@ -1012,7 +1095,7 @@ pub(super) fn delete_linked_modifier_settings(
         return Err(engine.error(
             ErrorCode::SceneInvalid,
             "physics modifier settings_id does not match its modifier ID",
-            "/modifier_id",
+            &operation_pointer(engine.operation_index, "modifier_id"),
         ));
     }
     let node = engine.doc.nodes.get_mut(target).ok_or_else(|| {
@@ -1046,10 +1129,14 @@ pub(super) fn delete_linked_modifier_settings(
     Ok(())
 }
 
+/// Ensures the stack modifier for `system` exists on `target`. A new fluid modifier takes
+/// `fluid_type`: `physics.fluid.create` makes a DOMAIN, while an update that finds no modifier keeps
+/// Blender's NONE.
 fn ensure_physics_stack_modifier(
     engine: &mut Engine<'_>,
     target: &Id,
     system: &str,
+    fluid_type: &str,
 ) -> Result<bool> {
     let modifier_type = physics_modifier_type(system);
     let node = engine
@@ -1146,7 +1233,10 @@ fn ensure_physics_stack_modifier(
         );
     }
     if system == "fluid" {
-        params.insert("fluid_type".to_owned(), Value::String("NONE".to_owned()));
+        params.insert(
+            "fluid_type".to_owned(),
+            Value::String(fluid_type.to_owned()),
+        );
     }
     let index = super::modifier::insertion_index(&node.modifiers, modifier_type);
     node.modifiers.insert(
@@ -1207,28 +1297,28 @@ fn validate_physics_references(
                 engine.error(
                     ErrorCode::InvalidOperation,
                     "object particle rendering requires instance_object",
-                    "/settings/instance_object",
+                    &operation_pointer(engine.operation_index, "settings/instance_object"),
                 )
             })?;
         let instance_id = Id::new(value.to_owned()).map_err(|error| {
             engine.error(
                 ErrorCode::InvalidOperation,
                 error.message,
-                "/settings/instance_object",
+                &operation_pointer(engine.operation_index, "settings/instance_object"),
             )
         })?;
         if &instance_id == target {
             return Err(engine.error(
                 ErrorCode::InvalidOperation,
                 "particle instances cannot reference their own emitter",
-                "/settings/instance_object",
+                &operation_pointer(engine.operation_index, "settings/instance_object"),
             ));
         }
         let instance = physics_node(
             engine,
             &instance_id,
             "particle instance",
-            "/settings/instance_object",
+            &operation_pointer(engine.operation_index, "settings/instance_object"),
         )?;
         validate_system_target(engine, &instance_id, &instance)?;
     }
@@ -1242,21 +1332,21 @@ fn validate_physics_references(
                 engine.error(
                     ErrorCode::InvalidOperation,
                     "collection particle rendering requires instance_collection",
-                    "/settings/instance_collection",
+                    &operation_pointer(engine.operation_index, "settings/instance_collection"),
                 )
             })?;
         let collection_id = Id::new(collection_text.to_owned()).map_err(|error| {
             engine.error(
                 ErrorCode::InvalidOperation,
                 error.message,
-                "/settings/instance_collection",
+                &operation_pointer(engine.operation_index, "settings/instance_collection"),
             )
         })?;
         if !engine.doc.collections.contains_key(&collection_id) {
             return Err(engine.error(
                 ErrorCode::TargetNotFound,
                 "particle instance collection was not found",
-                "/settings/instance_collection",
+                &operation_pointer(engine.operation_index, "settings/instance_collection"),
             ));
         }
     }
@@ -1268,28 +1358,37 @@ fn validate_physics_references(
                 engine.error(
                     ErrorCode::InvalidOperation,
                     "dynamic-paint brush IDs must be strings",
-                    &format!("/settings/brushes/{index}"),
+                    &operation_pointer(
+                        engine.operation_index,
+                        &format!("settings/brushes/{index}"),
+                    ),
                 )
             })?;
             let brush_id = Id::new(value.to_owned()).map_err(|error| {
                 engine.error(
                     ErrorCode::InvalidOperation,
                     error.message,
-                    &format!("/settings/brushes/{index}"),
+                    &operation_pointer(
+                        engine.operation_index,
+                        &format!("settings/brushes/{index}"),
+                    ),
                 )
             })?;
             if &brush_id == target {
                 return Err(engine.error(
                     ErrorCode::InvalidOperation,
                     "dynamic-paint canvas cannot also be one of its brushes",
-                    &format!("/settings/brushes/{index}"),
+                    &operation_pointer(
+                        engine.operation_index,
+                        &format!("settings/brushes/{index}"),
+                    ),
                 ));
             }
             let brush = physics_node(
                 engine,
                 &brush_id,
                 "dynamic-paint brush",
-                &format!("/settings/brushes/{index}"),
+                &operation_pointer(engine.operation_index, &format!("settings/brushes/{index}")),
             )?;
             if brush
                 .properties
@@ -1301,7 +1400,10 @@ fn validate_physics_references(
                 return Err(engine.error(
                     ErrorCode::InvalidOperation,
                     "dynamic-paint brush target is not configured as a brush",
-                    &format!("/settings/brushes/{index}"),
+                    &operation_pointer(
+                        engine.operation_index,
+                        &format!("settings/brushes/{index}"),
+                    ),
                 ));
             }
         }
@@ -1419,7 +1521,7 @@ fn validate_dynamic_paint_settings_role(
             return Err(engine.error(
                 ErrorCode::InvalidOperation,
                 format!("invalid dynamic-paint role `{role}`"),
-                "/settings/role",
+                &operation_pointer(engine.operation_index, "settings/role"),
             ));
         }
     };
@@ -1430,7 +1532,7 @@ fn validate_dynamic_paint_settings_role(
         return Err(engine.error(
             ErrorCode::InvalidOperation,
             format!("dynamic-paint setting `{field}` is not applicable to role `{role}`"),
-            &format!("/settings/{field}"),
+            &operation_pointer(engine.operation_index, &format!("settings/{field}")),
         ));
     }
     if role == "brush" {
@@ -1488,7 +1590,7 @@ fn validate_fluid_settings_role(
         return Err(engine.error(
             ErrorCode::InvalidOperation,
             format!("invalid fluid_type `{role}`"),
-            "/settings",
+            &operation_pointer(engine.operation_index, "settings"),
         ));
     }
     if let Some(field) = settings
@@ -1498,7 +1600,7 @@ fn validate_fluid_settings_role(
         return Err(engine.error(
             ErrorCode::InvalidOperation,
             format!("fluid setting `{field}` is not applicable to fluid_type `{role}`"),
-            &format!("/settings/{field}"),
+            &operation_pointer(engine.operation_index, &format!("settings/{field}")),
         ));
     }
     let (system, value) = match role {
@@ -1746,7 +1848,7 @@ fn validate_physics_settings(
             return Err(engine.error(
                 ErrorCode::InvalidOperation,
                 format!("unknown {system} setting `{field}`"),
-                &format!("/settings/{field}"),
+                &operation_pointer(engine.operation_index, &format!("settings/{field}")),
             ));
         }
         let valid = if blender {
@@ -1758,7 +1860,7 @@ fn validate_physics_settings(
             return Err(engine.error(
                 ErrorCode::InvalidOperation,
                 format!("invalid value for {system} setting `{field}`"),
-                &format!("/settings/{field}"),
+                &operation_pointer(engine.operation_index, &format!("settings/{field}")),
             ));
         }
     }
@@ -1783,7 +1885,7 @@ fn validate_cloth_collision_settings(engine: &Engine<'_>, collision: &Value) -> 
         return Err(engine.error(
             ErrorCode::InvalidOperation,
             "cloth collision_settings must be an object",
-            "/settings/collision_settings",
+            &operation_pointer(engine.operation_index, "settings/collision_settings"),
         ));
     };
     for (field, value) in collision {
@@ -1791,14 +1893,20 @@ fn validate_cloth_collision_settings(engine: &Engine<'_>, collision: &Value) -> 
             return Err(engine.error(
                 ErrorCode::InvalidOperation,
                 format!("unknown cloth_collision setting `{field}`"),
-                &format!("/settings/collision_settings/{field}"),
+                &operation_pointer(
+                    engine.operation_index,
+                    &format!("settings/collision_settings/{field}"),
+                ),
             ));
         }
         if !blender_setting_valid(field, value) {
             return Err(engine.error(
                 ErrorCode::InvalidOperation,
                 format!("invalid value for cloth_collision setting `{field}`"),
-                &format!("/settings/collision_settings/{field}"),
+                &operation_pointer(
+                    engine.operation_index,
+                    &format!("settings/collision_settings/{field}"),
+                ),
             ));
         }
     }

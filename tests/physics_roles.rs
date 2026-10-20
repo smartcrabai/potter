@@ -374,11 +374,9 @@ fn flow_emits_into_domains_and_effectors_only_affect_domain_output() {
     // Blender 5.2.2 gives the size-1 FLOW at z=1.5 a 432V/860F domain surface at frame 1;
     // the size-0.3 effector at z=0.95 changes that oracle to 434V/864F. Potter compares role
     // behavior and relative native output, not Mantaflow's tessellation.
-    assert!(
-        !plain_frame["fluid_particles"]["domain"]
-            .as_array()
-            .unwrap()
-            .is_empty()
+    assert_ne!(
+        plain_frame["fluid_particles"]["domain"].as_array().unwrap(),
+        &Vec::<Value>::new()
     );
     assert_ne!(
         mesh_counts(&plain_frame["deformed_meshes"]["domain"]),
@@ -423,17 +421,16 @@ fn imported_liquid_flow_emits_only_at_a_native_rate_and_other_modes_stay_unsuppo
     // An imported LIQUID flow emits only at an explicit Potter inflow_rate; without one the bake is refused (see the mode loop).
     let native = directory.path().join("native-flow-rate");
     setup_flow_scene(&native, false);
+    // Emission starts on the second frame: the first frame has no particles yet.
     let frame = bake(
         &native,
         &directory.path().join("native-flow-rate-bake"),
-        "1:1",
-        0,
+        "1:2",
+        1,
     );
-    assert!(
-        !frame["fluid_particles"]["domain"]
-            .as_array()
-            .unwrap()
-            .is_empty()
+    assert_ne!(
+        frame["fluid_particles"]["domain"].as_array().unwrap(),
+        &Vec::<Value>::new()
     );
 
     let native_override = directory.path().join("imported-flow-native-rate");
@@ -450,8 +447,8 @@ fn imported_liquid_flow_emits_only_at_a_native_rate_and_other_modes_stay_unsuppo
     let native_override_frame = bake(
         &native_override,
         &directory.path().join("imported-flow-native-rate-bake"),
-        "1:1",
-        0,
+        "1:2",
+        1,
     );
     assert_eq!(
         native_override_frame["fluid_particles"]["domain"],
@@ -612,7 +609,7 @@ fn volume_modifier_object_types_reject_create_and_set_operations() {
     apply_ok(
         &volume,
         0,
-        &json!([{"op":"node.create","id":"volume","kind":"volume"}]),
+        &json!([{"op":"volume.create","id":"volume","grids":[{"dims":[1,1,1],"voxel_size":1.0,"origin":[0.0,0.0,0.0],"values":[0.0]}]}]),
     );
     assert_operation_error(
         &apply(
@@ -629,7 +626,7 @@ fn volume_modifier_object_types_reject_create_and_set_operations() {
         &set_type,
         0,
         &json!([
-            {"op":"node.create","id":"volume","kind":"volume"},
+            {"op":"volume.create","id":"volume","grids":[{"dims":[1,1,1],"voxel_size":1.0,"origin":[0.0,0.0,0.0],"values":[0.0]}]},
             {"op":"modifier.create","target":{"id":"volume"},"id":"displace","type":"volume_displace"}
         ]),
     );

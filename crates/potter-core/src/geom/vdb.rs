@@ -521,6 +521,10 @@ impl<'a> Parser<'a> {
                 active_bbox: parent.active_bbox,
             });
         }
+        // OpenVDB keeps grid descriptors in a name-keyed map, so `readAllGridMetadata` (which Blender
+        // loads through) yields grids in name order, not file order. Stable, so duplicate names keep
+        // their file order.
+        grids.sort_by(|first, second| first.name.cmp(&second.name));
         Ok(VdbVolume {
             grids,
             uuid: self.uuid,

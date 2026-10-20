@@ -91,11 +91,11 @@ fn physics_operations_create_stack_entries_linked_to_their_settings() -> Result<
         &json!([
             {"op":"node.create","id":"body","kind":"box","params":{}},
             {"op":"physics.cloth.create","target":{"id":"body"},"settings":{"tension_stiffness":12.0}},
-            {"op":"physics.soft_body.create","target":{"id":"body"},"settings":{"goal_strength":0.7}},
+            {"op":"physics.soft_body.create","target":{"id":"body"},"settings":{"goal_default":0.7}},
             {"op":"physics.dynamic_paint.create","target":{"id":"body"},"settings":{"role":"canvas"}},
-            {"op":"physics.fluid.create","target":{"id":"body"},"settings":{"type":"liquid","resolution":4}},
+            {"op":"physics.fluid.create","target":{"id":"body"},"settings":{"domain_type":"LIQUID","resolution_max":4}},
             {"op":"physics.particle_emitter.create","target":{"id":"body"},"settings":{"rate":1.0,"lifetime":12.0}},
-            {"op":"physics.collision.create","target":{"id":"body"},"settings":{"thickness":0.01}}
+            {"op":"physics.collision.create","target":{"id":"body"},"settings":{"thickness_outer":0.01}}
         ]),
         0,
     )?;

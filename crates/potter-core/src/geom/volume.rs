@@ -1627,8 +1627,12 @@ pub fn mesh_to_fog_volume(
     let density = density as f32;
     let (bounds_min, bounds_max, triangles) = fog_mesh_geometry(mesh, voxel_size)?;
     let voxel_size_f64 = f64::from(voxel_size);
-    let minimum_index = (bounds_min / voxel_size_f64).floor() - DVec3::ONE;
-    let maximum_index = (bounds_max / voxel_size_f64).ceil() + DVec3::ONE;
+    // Blender's grid is the union of OpenVDB leaves (8 voxels per axis) that hold active voxels, so
+    // the index box is rounded out to whole leaves (`BKE_volume_grid_bounds`, evalLeafBoundingBox).
+    let band_minimum = (bounds_min / voxel_size_f64).floor() - DVec3::ONE;
+    let band_maximum = (bounds_max / voxel_size_f64).ceil() + DVec3::ONE;
+    let minimum_index = (band_minimum / 8.0).floor() * 8.0;
+    let maximum_index = (band_maximum / 8.0).floor() * 8.0 + DVec3::splat(7.0);
     let dimensions_f64 = [
         maximum_index.x - minimum_index.x + 1.0,
         maximum_index.y - minimum_index.y + 1.0,

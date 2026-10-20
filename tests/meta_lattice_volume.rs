@@ -104,9 +104,10 @@ fn mesh_volume_round_trip_stays_within_one_voxel_of_source_bounds() {
     // object cannot take it (BKE_object_support_modifier_type_check, object.cc:1464-1482). The Blender
     // fixtures in tests/volume_parity.rs cover the modifier itself.
     let voxel_size = 0.2;
-    // One interior voxel of band and unit density: the fog grid's zero background bounds the surface.
+    // One interior voxel of band and unit density: the fog grid is 1 inside and 0 outside, so the
+    // surface sits at the 0.5 iso-level between them (the Volume To Mesh default is 0.1, Blender's).
     let volume = volume::mesh_to_fog_volume(&source, voxel_size, voxel_size, 1.0).unwrap();
-    let round_trip = volume::volume_to_mesh(&volume, 0.0).unwrap();
+    let round_trip = volume::volume_to_mesh(&volume, 0.5).unwrap();
     let source_bounds = source.bounds().unwrap();
     let result_bounds = round_trip.bounds().unwrap();
     for axis in 0..3 {

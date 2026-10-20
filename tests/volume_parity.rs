@@ -180,7 +180,7 @@ fn canonical_actual(mesh: &Mesh) -> (Vec<[f64; 3]>, Vec<Vec<usize>>) {
                 .iter()
                 .map(|vertex| *vertex_indices.get(vertex).expect("valid mesh face vertex"))
                 .collect::<Vec<_>>();
-            canonical_rotation(vertices)
+            canonical_rotation(&vertices)
         })
         .collect::<Vec<_>>();
     polygons.sort();
@@ -194,7 +194,7 @@ fn compare_positions(first: [f64; 3], second: [f64; 3]) -> Ordering {
         .then_with(|| first[2].total_cmp(&second[2]))
 }
 
-fn canonical_rotation(vertices: Vec<usize>) -> Vec<usize> {
+fn canonical_rotation(vertices: &[usize]) -> Vec<usize> {
     (0..vertices.len())
         .map(|offset| {
             vertices[offset..]
@@ -291,7 +291,7 @@ fn check_fixture(file: OracleFile, shape: &str) {
             "VOXEL_SIZE" => case.voxel_size,
             "VOXEL_AMOUNT" => {
                 let denominator = (case.voxel_amount as f32).max(1.0);
-                f64::from((file.source.amount_diagonal as f32 / denominator) as f32)
+                f64::from(file.source.amount_diagonal as f32 / denominator)
             }
             mode => panic!("{shape}: unexpected resolution mode {mode}"),
         };
@@ -344,7 +344,7 @@ fn invalid_voxel_size_produces_no_mesh_to_volume_grid() {
     let mesh = Mesh::box_mesh(BoxParams::default()).expect("valid cube");
     let result = volume::mesh_to_fog_volume(&mesh, 1.0e-6, 0.2, 1.0)
         .expect("invalid modifier voxel size creates no grid");
-    assert!(result.grids.is_empty());
+    assert_eq!(result.grids.len(), 0);
 }
 
 fn volume_modifier_doc(resolution_mode: &str, size: f64, amount: f64) -> (SceneDoc, Id, Id) {
@@ -493,7 +493,7 @@ fn mesh_nodes_reject_volume_only_modifiers() {
     assert_eq!(error.code, ErrorCode::InvalidOperation);
     assert_eq!(
         error.message,
-        "volume_displace modifier can only be used on volume objects"
+        "volume_displace requires a volume Object; Blender cannot add it to a mesh Object"
     );
 }
 
@@ -1161,7 +1161,7 @@ fn blender_multigrid_vdb_displacement_preserves_named_grid_types_and_samples() {
     let mut expected_sample = [0.0; 3];
     for axis in 0..3 {
         let texture_value = oracle.velocity_probe.texture_value[axis];
-        let texture_reference = [0.9, 0.9, 0.5][axis];
+        let texture_reference = [0.9_f64, 0.9, 0.5][axis];
         let tolerance = F32_POSITION_TOLERANCE_ULPS
             * f64::from(f32::EPSILON)
             * texture_reference.abs().max(1.0);

@@ -21,16 +21,15 @@ use blender_script_guarded::run_blender_script;
 use pot_json_guarded::pot_json;
 use process::run_guarded;
 
-/// Loss ids the physics fixture imports with, sorted: one per Blender setting that Potter keeps but does not evaluate and that
-/// the fixture leaves away from its Blender default (values Blender derives from those settings included). Dynamic Paint
-/// surfaces are reported per surface, not as one canvas_surfaces id.
+/// Loss ids the physics fixture imports with, sorted: one per Blender setting that Potter keeps but
+/// does not evaluate and that the fixture leaves away from its Blender default (values Blender
+/// derives from those settings included). Dynamic Paint surfaces are reported per surface, not as
+/// one `canvas_surfaces` id.
 const EXPECTED_PHYSICS_LOSSES: &[&str] = &[
     "blender.physics.cloth.goal_default",
     "blender.physics.cloth.goal_friction",
     "blender.physics.cloth.goal_spring",
     "blender.physics.cloth.pin_stiffness",
-    "blender.physics.cloth.shear_stiffness_max",
-    "blender.physics.cloth.tension_stiffness_max",
     "blender.physics.cloth.use_dynamic_mesh",
     "blender.physics.cloth.use_sewing_springs",
     "blender.physics.cloth_collision.collision_quality",
@@ -55,11 +54,11 @@ const EXPECTED_PHYSICS_LOSSES: &[&str] = &[
     "blender.physics.dynamic_paint_surface.dissolve_speed",
     "blender.physics.dynamic_paint_surface.dry_speed",
     "blender.physics.dynamic_paint_surface.use_dissolve",
-    "blender.physics.fluid_domain.cache_data_format",
-    "blender.physics.fluid_domain.cache_frame_offset",
-    "blender.physics.fluid_domain.cache_mesh_format",
-    "blender.physics.fluid_domain.time_scale",
-    "blender.physics.fluid_domain.use_adaptive_domain",
+    "blender.physics.fluid_domain_liquid.cache_data_format",
+    "blender.physics.fluid_domain_liquid.cache_frame_offset",
+    "blender.physics.fluid_domain_liquid.cache_mesh_format",
+    "blender.physics.fluid_domain_liquid.time_scale",
+    "blender.physics.fluid_domain_liquid.use_adaptive_domain",
     "blender.physics.fluid_effector.subframes",
     "blender.physics.fluid_effector.surface_distance",
     "blender.physics.fluid_effector.use_plane_init",

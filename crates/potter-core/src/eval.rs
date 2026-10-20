@@ -1593,6 +1593,18 @@ impl Snapshot {
                             json!({ "data": data_id }),
                         )
                     })?;
+                    // Volume To Mesh is a Mesh-only modifier: Blender's OB_VOLUME accepts only
+                    // modifiers with a geometry-set hook, and MOD_volume_to_mesh has none
+                    // (object.cc BKE_object_support_modifier_type_check).
+                    if let Some(modifier) = node.modifiers.iter().find(|modifier| {
+                        gate.is_active(id, modifier) && modifier.modifier_type == "volume_to_mesh"
+                    }) {
+                        return Err(PotError::with_details(
+                            ErrorCode::InvalidOperation,
+                            "volume_to_mesh modifier can only be used on mesh objects",
+                            json!({"node_id":id,"modifier_id":modifier.id}),
+                        ));
+                    }
                     // Blender runs the Volume modifiers in stack order, each consuming the previous
                     // result. A Mesh to Volume that changes the volume replaces its grids
                     // (`BKE_volume_new_for_eval` copies none); a no-op keeps the input grids.

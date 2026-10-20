@@ -604,7 +604,7 @@ mod tests {
 
     use crate::geom::{Mesh, Vertex};
 
-    use super::simulate;
+    use super::{FlowSource, simulate, simulate_with_sources};
 
     #[test]
     fn liquid_is_deterministic_bounded_and_falls_under_gravity() {
@@ -793,7 +793,7 @@ mod tests {
             &[outside],
         )
         .expect("outside flow succeeds");
-        assert!(!baseline.is_empty());
-        assert!(ignored.is_empty());
+        assert_ne!(baseline, Vec::<DVec3>::new());
+        assert_eq!(ignored, Vec::<DVec3>::new());
     }
 }
