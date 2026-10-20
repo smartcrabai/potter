@@ -8839,13 +8839,45 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
 }
 
 /// Facts the bridge reports for a Geometry Nodes modifier's Blender bakes. Data-blocks are not remapped by Potter, and a bake
-/// node without a Potter id has no node to carry its settings.
+/// node without a Potter id has no node to carry its settings. Blender 5.2.2 exposes no RNA for a bake's packed payload
+/// (`NodesModifierBake` has no `packed`, `bake_size`, or baked-state property), so every bake whose effective target is
+/// PACKED is reported: it may carry a packed payload Potter cannot read.
 fn nodes_bake_import_losses(modifier: &Value) -> Vec<Loss> {
-    let Some(bake_losses) = modifier.get("bake_losses") else {
-        return Vec::new();
-    };
     let name = modifier.get("name").and_then(Value::as_str);
+    let properties = modifier.get("properties");
     let mut losses = Vec::new();
+    let modifier_target = properties
+        .and_then(|properties| properties.get("bake_target"))
+        .and_then(Value::as_str)
+        .unwrap_or("PACKED");
+    for (bake, entry) in properties
+        .and_then(|properties| properties.get("bakes"))
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+    {
+        let node_target = entry
+            .get("bake_target")
+            .and_then(Value::as_str)
+            .unwrap_or("INHERIT");
+        let target = if node_target == "INHERIT" {
+            modifier_target
+        } else {
+            node_target
+        };
+        if target == "PACKED" {
+            losses.push(loss(
+                "blender.modifier.nodes_bake_packed",
+                name,
+                &format!(
+                    "Blender bake {bake} targets PACKED and may carry a packed payload; Blender exposes no RNA for packed bake data, so Potter cannot read it and the bake is re-evaluated live"
+                ),
+            ));
+        }
+    }
+    let Some(bake_losses) = modifier.get("bake_losses") else {
+        return losses;
+    };
     for bake in bake_losses
         .get("data_blocks")
         .and_then(Value::as_array)
@@ -17371,14 +17403,17 @@ print("UNSUPPORTED_POSE " + json.dumps({
     }
 
     #[test]
-    fn import_losses_report_nodes_bake_data_blocks_and_unmapped_bakes() {
+    fn import_losses_report_nodes_bake_packed_data_blocks_and_unmapped_bakes() {
         let raw = json!({"objects": [{
             "name": "Cube",
             "type": "MESH",
             "modifiers": [{
                 "name": "Geo",
                 "type": "NODES",
-                "properties": {"node_group": "Geometry", "bakes": {"bake_main": {"bake_mode": "STILL"}}},
+                "properties": {"node_group": "Geometry", "bakes": {
+                    "bake_main": {"bake_mode": "STILL"},
+                    "bake_disk": {"bake_target": "DISK"}
+                }},
                 "bake_losses": {"data_blocks": ["bake_main"], "unmapped": ["Bake.001"]}
             }, {
                 "name": "Plain",
@@ -17394,6 +17429,10 @@ print("UNSUPPORTED_POSE " + json.dumps({
         assert_eq!(
             bake_losses,
             [
+                (
+                    "blender.modifier.nodes_bake_packed".to_owned(),
+                    Some("Geo".to_owned())
+                ),
                 (
                     "blender.modifier.nodes_bake_data_blocks".to_owned(),
                     Some("Geo".to_owned())

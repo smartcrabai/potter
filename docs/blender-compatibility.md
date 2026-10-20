@@ -116,7 +116,7 @@ Each bake node of a Geometry Nodes modifier's node group maps to one entry of th
 - Export loss `blender.modifier.nodes_bake_unmapped`: a `bakes` entry whose key names no `GeometryNodeBake` node of the modifier's node group. Its settings are not written.
 - Import loss `blender.modifier.nodes_bake_data_blocks`: a Blender bake carries data-blocks (`NodesModifierBake.data_blocks`). Potter does not remap data-block references, so they are not kept.
 - Import loss `blender.modifier.nodes_bake_unmapped`: a Blender bake whose node has no `potter.id`. Its settings are not kept.
-- Not detectable on import: Blender 5.2.2 exposes no RNA property for packed bake data (`NodesModifierBake.packed`). A .blend with packed bakes imports with its settings and without its packed payload, and no loss is reported for it.
+- Import loss `blender.modifier.nodes_bake_packed`: every Blender bake whose effective target is PACKED (its own `bake_target`, or the modifier's when it is INHERIT). Blender 5.2.2 exposes no RNA property for packed bake data (`NodesModifierBake` has no `packed`, `bake_size`, or baked-state property; the pack, unpack, and delete operators poll only for an editable active object, `object_bake_simulation.cc:1204-1281`), so the payload cannot be detected from Python. The loss is conservative: a PACKED bake that holds no payload is reported too. Potter does not read the packed payload, so the bake is re-evaluated live.
 - Directory semantics: the stored `directory` is written as given. A Blender relative path (`//`) resolves against the saved .blend, not against the Potter project root.
 
 ## 4. Import and Export Verification Fixtures
