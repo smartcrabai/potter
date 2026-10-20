@@ -30,6 +30,9 @@ SEEDS = range(8)
 scene = bpy.context.scene
 scene.render.engine = "CYCLES"
 scene.cycles.samples = SAMPLES
+# Potter samples each pixel with a one-pixel box, so the oracle uses Cycles' box filter of width 1.
+scene.cycles.pixel_filter_type = "BOX"
+scene.cycles.filter_width = 1.0
 scene.cycles.device = "CPU"
 scene.render.film_transparent = True
 scene.render.resolution_x = scene.render.resolution_y = RESOLUTION

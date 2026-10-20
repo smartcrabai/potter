@@ -10,18 +10,16 @@
 //! at least 0.99), transparent (at most 0.01), or in between. Potter imports the same `.blend`, renders the same
 //! eight seeds in process at 16 samples, and reads the same window from the alpha channel.
 //!
-//! The tolerance has two parts, both derived from the setup:
-//!   - Monte Carlo: `T · √(s_B² / n + s_P² / n)`, with `s` the seed-to-seed sample standard deviation of each side,
-//!     `n = 8`, and `T` the two-sided 99.9% t quantile at 7 degrees of freedom (5.408), as the glass tests use.
-//!   - Filter: the cutoff lies exactly on the boundary between two pixel columns, so each renderer's classification
-//!     of the column beside the edge depends on its reconstruction filter. Potter's filter is a box one pixel wide,
-//!     so it classifies each column whole. Blender's default filter is Blackman-Harris 1.5 px wide, so its samples
-//!     reach across the boundary and the two columns beside the edge are both in-between. The window has 32 columns,
-//!     so one column is `1/32` of the opaque or transparent fraction and two columns are `2/32` of the in-between
-//!     fraction. Those bounds are the filter's support, not fitted values.
+//! Both renderers sample each pixel with a box filter one pixel wide: Blender's scene is set to `BOX` with width 1
+//! (`pixel_filter_type`, `filter_width`), matching Potter's sampling. So the cutoff, which lies on a pixel boundary,
+//! classifies whole columns on both sides, and the only difference left is Monte Carlo noise.
+//!
+//! The tolerance is `T · √(s_B² / n + s_P² / n)`, with `s` the seed-to-seed sample standard deviation of each side,
+//! `n = 8`, and `T` the two-sided 99.9% t quantile at 7 degrees of freedom (5.408), as the glass tests use. When both
+//! sides are deterministic at this edge the tolerance is zero, and the check is an exact comparison of the fractions.
 //!
 //! What the test must detect: a lost clip. Without the clip stage the alpha is the base alpha, a constant, so the
-//! window would be all one value, and the opaque fraction would be 0 or 1, far outside the bounds above.
+//! window would be all one value, and the opaque fraction would be 0 or 1, far outside the tolerance.
 
 #[path = "common/blender_checked.rs"]
 mod blender_checked;
@@ -55,13 +53,6 @@ const SAMPLES: u32 = 16;
 const WINDOW: std::ops::Range<usize> = 16..48;
 /// The two-sided 99.9% Student t quantile at 7 degrees of freedom.
 const T_QUANTILE: f64 = 5.408;
-/// Columns in the window, which the filter bounds below are counted in.
-const WINDOW_COLUMNS: f64 = 32.0;
-/// Columns that may classify differently at the cutoff edge: the column beside it, per renderer's filter.
-const EDGE_COLUMNS: f64 = 1.0;
-/// Columns that are in between at the cutoff edge under Blender's Blackman-Harris 1.5 px filter (the two columns
-/// the edge falls between).
-const FILTER_BAND_COLUMNS: f64 = 2.0;
 /// The opaque, transparent and in-between fractions, in that order.
 const METRICS: [&str; 3] = ["opaque", "transparent", "fractional"];
 
@@ -174,13 +165,7 @@ fn clip_mask_cutout_matches_cycles_window_statistics() -> TestResult {
     for (index, name) in METRICS.iter().enumerate() {
         let (wanted_mean, wanted_stderr) = mean_and_stderr(&wanted[index]);
         let (actual_mean, actual_stderr) = mean_and_stderr(&potter[index]);
-        let filter_columns = if *name == "fractional" {
-            FILTER_BAND_COLUMNS
-        } else {
-            EDGE_COLUMNS
-        };
-        let tolerance =
-            filter_columns / WINDOW_COLUMNS + T_QUANTILE * wanted_stderr.hypot(actual_stderr);
+        let tolerance = T_QUANTILE * wanted_stderr.hypot(actual_stderr);
         assert!(
             (actual_mean - wanted_mean).abs() <= tolerance,
             "{name}: Potter {actual_mean} differs from Cycles {wanted_mean} by more than {tolerance}"
