@@ -151,14 +151,12 @@ type ShadowContext<'a> = Option<ShadowScene<'a>>;
 /// Tolerance of shadow rays along their own surface and at a hit (the epsilon of the realtime shadow code).
 const SHADOW_EPSILON: f64 = 1.0e-5;
 
-/// Whether a material can cast a transparent shadow: EEVEE compiles the transparent shadow pass only for a material
-/// with a transparent closure (a Transparent BSDF, or a Principled Alpha that is not one) and transparent shadows
-/// on (`eevee_shader.cc` `transparent_shadows`, `eevee_material.cc` `has_transparent_shadows`). A material without a
-/// graph is transparent only through its alpha, which Blender writes as the Principled Alpha of a non-opaque material
-/// (`blend_bridge.py` `_set_principled_values`).
-fn may_cast_transparent_shadow(material: &Material) -> bool {
-    material.use_transparent_shadow
-        && (material.node_tree.is_some() || material.alpha_mode != "opaque")
+/// Whether a surface casts a transparent shadow. EEVEE's pass needs the material compiled as transparent, a static
+/// property of its graph (`PreparedMaterial::is_transparent`: `GPU_MATFLAG_TRANSPARENT`), and transparent shadows on
+/// (`eevee_shader.cc` `transparent_shadows`, `eevee_material.cc` `has_transparent_shadows`). A material whose graph is
+/// opaque, such as a plain Principled, casts an ordinary shadow whatever its render method.
+fn casts_transparent_shadow(material: &Material, prepared: &PreparedMaterial) -> bool {
+    material.use_transparent_shadow && prepared.is_transparent()
 }
 
 /// EEVEE's transparent shadow pass for one hit (`eevee_surf_shadow.bsl.hh`): a fragment is kept with probability
@@ -240,7 +238,8 @@ impl<'a> ShadowOccluders<'a> {
                     "triangle references an unmapped material",
                 )
             })?;
-        if !may_cast_transparent_shadow(material) {
+        let prepared = self.geometry.prepared.get(triangle.material_index);
+        if !prepared.is_some_and(|prepared| casts_transparent_shadow(material, prepared)) {
             return Ok(None);
         }
         let params = hit_params(
@@ -276,36 +275,32 @@ fn ray_transmittance(
     opaque_blocks: bool,
 ) -> f64 {
     let mut transmittance = 1.0;
-    let mut origin = origin;
-    let mut remaining = distance;
-    while let Some(hit) = shadow.bvh.closest_hit_two_sided(
+    shadow.bvh.walk_hits(
         shadow.triangles,
         origin,
         direction,
         SHADOW_EPSILON,
-        remaining,
-    ) {
-        match shadow
-            .occluders
-            .and_then(|occluders| occluders.pass(hit, origin, direction))
-        {
-            Some(pass) => transmittance *= pass,
-            None if opaque_blocks => return 0.0,
-            None => {}
-        }
-        if transmittance <= 1.0e-5 {
-            return 0.0;
-        }
-        let advance = hit.distance + SHADOW_EPSILON;
-        origin += direction * advance;
-        if remaining.is_finite() {
-            remaining = (remaining - advance).max(0.0);
-            if remaining <= SHADOW_EPSILON {
-                break;
+        distance,
+        |hit, origin| {
+            match shadow
+                .occluders
+                .and_then(|occluders| occluders.pass(hit, origin, direction))
+            {
+                Some(pass) => transmittance *= pass,
+                None if opaque_blocks => {
+                    transmittance = 0.0;
+                    return false;
+                }
+                None => {}
             }
-        }
+            transmittance > 1.0e-5
+        },
+    );
+    if transmittance <= 1.0e-5 {
+        0.0
+    } else {
+        transmittance
     }
-    transmittance
 }
 
 /// The origin of a shadow ray leaving `point`, lifted to the side of `normal` that `direction` points to.
@@ -1088,14 +1083,21 @@ pub(super) fn extract_geometry(
     };
     if !path_traced && matches!(mode, Mode::Beauty) && !geometry.triangles.is_empty() {
         geometry.triangles = subdivide_realtime_triangles(&geometry.triangles)?;
+        // Per material: whether its surfaces cast transparent shadows, which EEVEE decides once at compile time.
+        let caster_materials: Vec<bool> = geometry
+            .materials
+            .iter()
+            .zip(&geometry.prepared)
+            .map(|(material, prepared)| casts_transparent_shadow(material, prepared))
+            .collect();
         let shadow_maps =
-            build_point_shadow_maps(doc, snapshot, &geometry.triangles, &geometry.materials)?;
+            build_point_shadow_maps(doc, snapshot, &geometry.triangles, &caster_materials)?;
         let bvh = Bvh::build(&geometry.triangles)?;
         let transparent_casters = geometry.triangles.iter().any(|triangle| {
-            geometry
-                .materials
+            caster_materials
                 .get(triangle.material_index)
-                .is_some_and(may_cast_transparent_shadow)
+                .copied()
+                .unwrap_or(false)
         });
         let workspace = RefCell::new(EvaluatorWorkspace::default());
         let occluders = ShadowOccluders::new(doc, snapshot, &geometry, images, &workspace);
@@ -1159,15 +1161,16 @@ fn build_point_shadow_maps(
     doc: &SceneDoc,
     snapshot: &Snapshot,
     triangles: &[Triangle],
-    materials: &[Material],
+    caster_materials: &[bool],
 ) -> Result<BTreeMap<Id, PointShadowMap>> {
     // A triangle that casts a transparent shadow is left out: its occlusion is the ray pass of `ray_transmittance`.
     let opaque: Vec<&Triangle> = triangles
         .iter()
         .filter(|triangle| {
-            !materials
+            !caster_materials
                 .get(triangle.material_index)
-                .is_some_and(may_cast_transparent_shadow)
+                .copied()
+                .unwrap_or(false)
         })
         .collect();
     let mut maps = BTreeMap::new();
@@ -3383,51 +3386,43 @@ mod shading_normal_tests {
 
 #[cfg(test)]
 mod transparent_shadow_tests {
-    use glam::DVec3;
+    use crate::model::{Material, Registry};
+    use crate::shader::PreparedMaterial;
 
-    use crate::model::Material;
-    use crate::shader::BsdfParams;
+    use super::casts_transparent_shadow;
 
-    use super::{may_cast_transparent_shadow, transparent_shadow_pass};
-
-    fn params(alpha: f64, tint: [f64; 3]) -> BsdfParams {
-        BsdfParams {
-            alpha,
-            transparent_tint: tint,
-            ..BsdfParams::from_material(&Material::default(), DVec3::Z)
-        }
+    fn casts(material: &Material) -> bool {
+        casts_transparent_shadow(material, &PreparedMaterial::new(material, &Registry::new()))
     }
 
     #[test]
-    fn principled_alpha_passes_one_minus_alpha() {
-        assert!((transparent_shadow_pass(&params(0.4, [1.0; 3])) - 0.6).abs() < 1.0e-12);
+    fn an_opaque_material_casts_no_transparent_shadow() {
+        assert!(!casts(&Material::default()));
     }
 
     #[test]
-    fn transparent_bsdf_passes_its_tint_on_average() {
-        // A Transparent BSDF has alpha 0 and its colour as tint: the average of (0.9, 0.3, 0.6) is 0.6.
-        let pass = transparent_shadow_pass(&params(0.0, [0.9, 0.3, 0.6]));
-        assert!((pass - 0.6).abs() < 1.0e-12, "{pass}");
-    }
-
-    #[test]
-    fn an_opaque_surface_passes_nothing() {
-        assert_eq!(transparent_shadow_pass(&params(1.0, [1.0; 3])), 0.0);
-    }
-
-    #[test]
-    fn only_a_non_opaque_material_with_shadows_on_may_cast_one() {
-        let opaque = Material::default();
-        assert!(!may_cast_transparent_shadow(&opaque));
+    fn a_non_opaque_material_with_opaque_base_alpha_casts_no_transparent_shadow() {
+        // Its export is a Principled with Alpha 1, which EEVEE compiles as opaque.
         let blend = Material {
             alpha_mode: "blend".to_owned(),
+            base_color: [0.6, 0.6, 0.6, 1.0],
             ..Material::default()
         };
-        assert!(may_cast_transparent_shadow(&blend));
+        assert!(!casts(&blend));
+    }
+
+    #[test]
+    fn a_non_opaque_material_casts_only_when_shadows_are_on() {
+        let blend = Material {
+            alpha_mode: "blend".to_owned(),
+            base_color: [0.6, 0.6, 0.6, 0.5],
+            ..Material::default()
+        };
+        assert!(casts(&blend));
         let blend_off = Material {
             use_transparent_shadow: false,
-            ..blend.clone()
+            ..blend
         };
-        assert!(!may_cast_transparent_shadow(&blend_off));
+        assert!(!casts(&blend_off));
     }
 }
