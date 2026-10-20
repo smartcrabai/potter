@@ -3343,6 +3343,10 @@ fn build_imported_graph(
                     .get("double_sided")
                     .and_then(Value::as_bool)
                     .unwrap_or(true),
+                use_transparent_shadow: item
+                    .get("use_transparent_shadow")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
                 displacement_method: displacement_method_field(name, item)?,
                 displacement_scale: number_field(item, "displacement_scale", 1.0),
                 displacement_midlevel: number_field(item, "displacement_midlevel", 0.5),
@@ -8641,6 +8645,19 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
                 "blender.material.displacement_method",
                 material.get("name").and_then(Value::as_str),
                 "Blender's combined displacement and bump mode has no Potter equivalent; the material imports as bump",
+            ));
+        }
+        // EEVEE's `use_backface_culling_shadow` drops back faces from the shadow pass (`eevee_pipeline.cc`, MA_BL_CULL_BACKFACE_SHADOW);
+        // Potter's shadow rays hit both sides.
+        if material
+            .get("use_backface_culling_shadow")
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            losses.push(loss(
+                "blender.material.backface_culling_shadow",
+                material.get("name").and_then(Value::as_str),
+                "Blender's EEVEE shadow backface culling is not imported; the material casts shadows from both sides",
             ));
         }
     }
@@ -17913,6 +17930,18 @@ mod camera_import_tests {
     fn area_light_spread_imports_without_a_loss() {
         let area = json!({"name": "Area", "type": "AREA", "spread": 0.5});
         assert!(import_losses(&json!({ "lights": [area] })).is_empty());
+    }
+
+    #[test]
+    fn shadow_backface_culling_imports_with_its_loss() {
+        let culled = json!({"name": "Culled", "use_backface_culling_shadow": true});
+        let features: Vec<String> = import_losses(&json!({"materials": [culled]}))
+            .into_iter()
+            .map(|loss| loss.feature_id)
+            .collect();
+        assert_eq!(features, ["blender.material.backface_culling_shadow"]);
+        let plain = json!({"name": "Plain", "use_backface_culling_shadow": false});
+        assert!(import_losses(&json!({"materials": [plain]})).is_empty());
     }
 
     #[test]

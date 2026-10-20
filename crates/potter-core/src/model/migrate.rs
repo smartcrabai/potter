@@ -109,6 +109,7 @@ pub(crate) fn parse_history_record(
     };
     if let Some(operations) = value.get_mut("operations") {
         warnings.extend(retire_operation_seed(operations));
+        warnings.extend(report_retired_brushes(operations));
     }
     let mut record: HistoryRecord =
         serde_json::from_value(value).map_err(|error| json_error(&error))?;
@@ -157,6 +158,35 @@ fn retire_operation_seed(operations: &mut Value) -> Vec<Value> {
         }
     }
     warnings
+}
+
+/// Reports recorded `sculpt.stroke` operations that name a brush the schema no longer has. The
+/// record is not rewritten: `pose_lite` and `boundary_lite` were replaced by algorithms with
+/// different results, so renaming them to `pose` or `boundary` would replay a different stroke. The
+/// record stays as recorded, and its replay fails with `unknown sculpt brush`, which this explains.
+fn report_retired_brushes(operations: &Value) -> Vec<Value> {
+    let Some(operations) = operations.as_array() else {
+        return Vec::new();
+    };
+    operations
+        .iter()
+        .enumerate()
+        .filter_map(|(index, operation)| {
+            if operation.get("op").and_then(Value::as_str) != Some("sculpt.stroke") {
+                return None;
+            }
+            let brush = operation.get("brush").and_then(Value::as_str)?;
+            matches!(brush, "pose_lite" | "boundary_lite").then(|| {
+                json!({
+                    "code": "operation.brush_retired",
+                    "message": "brush was removed; this stroke will not replay with the same result",
+                    "operation_index": index,
+                    "op": "sculpt.stroke",
+                    "brush": brush,
+                })
+            })
+        })
+        .collect()
 }
 
 fn parse_value(bytes: &[u8]) -> Result<Value> {
@@ -2579,6 +2609,35 @@ mod tests {
         )?;
         assert!(!parsed.legacy);
         assert_eq!(parsed.warnings, Vec::<Value>::new());
+        Ok(())
+    }
+
+    #[test]
+    fn history_retired_sculpt_brush_is_reported_at_load_and_kept() -> TestResult {
+        let snapshot = serde_json::to_value(SceneDoc::new(uuid::Uuid::new_v4().to_string()))?;
+        let mut source = history_record(&snapshot);
+        source["operations"] = json!([
+            {"op":"node.create","id":"body","kind":"box","params":{"size":2.0}},
+            {"op":"sculpt.stroke","target":{"id":"body"},"scope":"shared","brush":"pose_lite",
+             "samples":[{"position":[1.0,1.0,1.0],"pressure":1.0,"radius":0.25,"strength":0.5,"time":0.0}],
+             "falloff":"linear"}
+        ]);
+        let (record, warnings) = parse_history_record(&serde_json::to_vec(&source)?, no_assets())?;
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(warnings[0]["code"], "operation.brush_retired");
+        assert_eq!(warnings[0]["operation_index"], 1);
+        assert_eq!(warnings[0]["brush"], "pose_lite");
+        assert_eq!(record.operations[1]["brush"], "pose_lite");
+
+        let replay = json!({
+            "schema_version": 1,
+            "base_revision": 0,
+            "operations": [record.operations[0], record.operations[1]]
+        });
+        let error = crate::ops::apply_batch(&record.snapshot, &replay)
+            .err()
+            .ok_or("a retired brush replayed")?;
+        assert_eq!(error.code, ErrorCode::InvalidOperation);
         Ok(())
     }
 
