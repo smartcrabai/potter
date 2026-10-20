@@ -31,7 +31,9 @@ use super::{
         point_intensity, spot_attenuation,
     },
     path::object_for_index,
-    principled_bsdf::{diffuse_coefficient, specular_coefficient},
+    principled_bsdf::{
+        coat_coefficient, coat_lower_factor, diffuse_coefficient, specular_coefficient,
+    },
     raster::{
         AlphaMode, Line, Mode, SurfaceHit, SurfaceShader, Triangle, ViewBasis, blend_color,
         blend_corner_normals, blend_uv,
@@ -2014,13 +2016,15 @@ fn shade(
         let diffuse_environment = prefiltered_world(world, &doc.node_groups, images, normal, 1.0)?;
         let metallic = params.metallic.clamp(0.0, 1.0);
         let roughness = params.roughness.clamp(0.0, 1.0);
-        result += albedo * diffuse_environment * (1.0 - metallic);
+        // The coat attenuates every layer below it, including the environment terms.
+        let lower = coat_lower_factor(params, view);
+        result += albedo * diffuse_environment * (1.0 - metallic) * lower;
         let reflection = (-view + normal * (2.0 * normal.dot(view))).normalize_or_zero();
         let specular_environment =
             prefiltered_world(world, &doc.node_groups, images, reflection, roughness)?;
         let specular_f0 = dielectric_f0(params.ior, params.specular_ior_level);
         let f0 = albedo * metallic + DVec3::splat(specular_f0 * (1.0 - metallic));
-        result += specular_environment * f0 * (1.0 - roughness).powi(2);
+        result += specular_environment * f0 * (1.0 - roughness).powi(2) * lower;
     }
     for (id, light_node) in &doc.nodes {
         let Some(light) = light_node
@@ -2056,7 +2060,9 @@ fn shade(
     // NODE_CLOSURE_EMISSION unscaled (intern/cycles/scene/shader_nodes.cpp:3071-3098), and neither
     // EEVEE nor Cycles clamps the strength (gpu_shader_material_principled.glsl:179,
     // intern/cycles/kernel/svm/closure.h:206-207).
-    let emission = DVec3::from_array(params.emission_color) * params.emission_strength;
+    let emission = DVec3::from_array(params.emission_color)
+        * params.emission_strength
+        * coat_lower_factor(params, view);
     let result = result + emission;
     Ok([result.x, result.y, result.z, alpha])
 }
@@ -2203,7 +2209,8 @@ fn light_contribution(
             // scales it. The specular lobe is evaluated towards the emitter centre.
             let toward_centre = (position - point).normalize_or_zero();
             (diffuse_coefficient(params, normal, view)
-                + specular_coefficient(params, normal, view, toward_centre))
+                + specular_coefficient(params, normal, view, toward_centre)
+                + coat_coefficient(params, view, toward_centre))
                 * color
                 * (irradiance * visible_weight / total_weight)
         }
@@ -2312,7 +2319,9 @@ fn punctual_radiance(
     if normal_light_cosine <= 0.0 {
         return DVec3::ZERO;
     }
-    (diffuse_coefficient(params, normal, view) + specular_coefficient(params, normal, view, light))
+    (diffuse_coefficient(params, normal, view)
+        + specular_coefficient(params, normal, view, light)
+        + coat_coefficient(params, view, light))
         * color
         * (intensity * normal_light_cosine)
 }
