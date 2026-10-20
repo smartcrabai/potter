@@ -39,7 +39,7 @@ use crate::{
 use classify::{BoolOp, boolean_tris};
 use dissolve::polymesh_from_tris;
 use imesh::Arena;
-use input::{Operand, meshes_to_tris};
+use input::{Operand, meshes_to_tris_and_loops};
 use output::{OutputMaterials, polys_to_mesh};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -138,7 +138,7 @@ pub(crate) fn exact_boolean(
     };
 
     let mut arena = Arena::new();
-    let tris = meshes_to_tris(&joined, &mut arena)?;
+    let (tris, loops) = meshes_to_tris_and_loops(&joined, &mut arena)?;
     let intersected = boolean_tris(
         &mut arena,
         &tris,
@@ -148,7 +148,7 @@ pub(crate) fn exact_boolean(
         use_self,
         hole_tolerant,
     )?;
-    let polys = polymesh_from_tris(&arena, &intersected);
+    let polys = polymesh_from_tris(&arena, &intersected, &loops);
     polys_to_mesh(&polys, &arena, &joined, &OutputMaterials { remap: &remap })
 }
 

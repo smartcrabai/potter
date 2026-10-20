@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use glam::DVec3;
 
 use super::imesh::{Arena, NO_INDEX, Tri};
+use super::input::InputLoops;
 
 /// An output polygon: a region of one input face, bounded by input edges and cut segments.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -33,7 +34,7 @@ impl Poly {
 /// `tris` is the intersected triangle mesh in Blender's `tm_out` order. The result keeps Blender's
 /// order: input faces ascending, then the merge order inside each input face.
 #[must_use]
-pub(crate) fn polymesh_from_tris(arena: &Arena, tris: &[Tri]) -> Vec<Poly> {
+pub(crate) fn polymesh_from_tris(arena: &Arena, tris: &[Tri], loops: &InputLoops) -> Vec<Poly> {
     // Blender `face_output_tris`: group by input face, keeping triangle order within a group.
     let mut by_orig: BTreeMap<i32, Vec<Tri>> = BTreeMap::new();
     for tri in tris {
@@ -41,7 +42,7 @@ pub(crate) fn polymesh_from_tris(arena: &Arena, tris: &[Tri]) -> Vec<Poly> {
     }
     let mut polys = Vec::new();
     for group in by_orig.values() {
-        polys.extend(merge_tris_for_face(arena, group));
+        polys.extend(merge_tris_for_face(arena, group, loops));
     }
     dissolve_vertices(arena, polys)
 }
@@ -113,11 +114,10 @@ fn find_tris_common_edge(t1: &Tri, t2: &Tri) -> Option<(usize, usize)> {
 
 /// Blender's "quad with one diagonal remained unchanged" case of `merge_tris_for_face`.
 ///
-/// shortcut: Blender checks the candidate ring against the input face (`cyclic_equal`), which
-/// this API does not carry. All four boundary edges being input edges identifies the same quad,
-/// but the ring starts at the first triangle's corner rather than at the input face's start.
-/// Upgrade when output corner/UV attributes must match the input loop start exactly.
-fn recover_quad(tri1: &Tri, tri2: &Tri) -> Option<Poly> {
+/// Blender builds the candidate ring and returns the input face itself when the ring is a rotation of
+/// it (`cyclic_equal`), so the output loop starts where the input face starts. `input` is that
+/// input loop (vertices and edge origins); the candidate is returned unchanged otherwise.
+fn recover_quad(tri1: &Tri, tri2: &Tri, input: Option<(&[u32], &[i32])>) -> Option<Poly> {
     let (i0, j) = find_tris_common_edge(tri1, tri2)?;
     if tri1.edge_orig[i0] != NO_INDEX {
         return None;
@@ -137,8 +137,33 @@ fn recover_quad(tri1: &Tri, tri2: &Tri) -> Option<Poly> {
     if edge_orig.contains(&NO_INDEX) {
         return None;
     }
+    let verts = vec![tri1.v[i1], tri1.v[i2], tri1.v[i0], tri2.v[j2]];
+    if let Some((in_verts, in_edges)) = input
+        && in_verts.len() == 4
+        && in_edges.len() == 4
+    {
+        // The triangles may run against the input loop (Blender's operand B of a difference), so
+        // the loop is tried reversed too; the reversed loop starts at the input's first corner.
+        let reversed_verts = [in_verts[0], in_verts[3], in_verts[2], in_verts[1]];
+        let reversed_edges = [in_edges[3], in_edges[2], in_edges[1], in_edges[0]];
+        let same = |ring: &[u32]| (0..4).any(|r| (0..4).all(|k| verts[k] == ring[(k + r) % 4]));
+        if same(in_verts) {
+            return Some(Poly {
+                verts: in_verts.to_vec(),
+                orig: tri1.orig,
+                edge_orig: in_edges.to_vec(),
+            });
+        }
+        if same(&reversed_verts) {
+            return Some(Poly {
+                verts: reversed_verts.to_vec(),
+                orig: tri1.orig,
+                edge_orig: reversed_edges.to_vec(),
+            });
+        }
+    }
     Some(Poly {
-        verts: vec![tri1.v[i1], tri1.v[i2], tri1.v[i0], tri2.v[j2]],
+        verts,
         orig: tri1.orig,
         edge_orig,
     })
@@ -579,14 +604,14 @@ fn do_dissolve(fms: &mut FaceMergeState) {
 /// Blender `merge_tris_for_face`: merges the triangles of one input face into output polygons.
 /// Triangles that face opposite to the first one are merged in a second pass (Blender tries both
 /// normal signs).
-fn merge_tris_for_face(arena: &Arena, tris: &[Tri]) -> Vec<Poly> {
+fn merge_tris_for_face(arena: &Arena, tris: &[Tri], loops: &InputLoops) -> Vec<Poly> {
     let Some(first) = tris.first() else {
         return Vec::new();
     };
     if let [tri] = tris {
         return vec![poly_from_tri(tri)];
     }
-    if let Some(poly) = same_side_quad(arena, tris) {
+    if let Some(poly) = same_side_quad(arena, tris, loops) {
         return vec![poly];
     }
     let first_normal = tri_normal(arena, first);
@@ -609,14 +634,20 @@ fn merge_tris_for_face(arena: &Arena, tris: &[Tri]) -> Vec<Poly> {
 }
 
 /// The two-triangle quad recovery, applied only when both triangles face the same way.
-fn same_side_quad(arena: &Arena, tris: &[Tri]) -> Option<Poly> {
+fn same_side_quad(arena: &Arena, tris: &[Tri], loops: &InputLoops) -> Option<Poly> {
     let [tri1, tri2] = tris else {
         return None;
     };
     if tri_normal(arena, tri1).dot(tri_normal(arena, tri2)) <= 0.0 {
         return None;
     }
-    recover_quad(tri1, tri2)
+    let input = usize::try_from(tri1.orig).ok().and_then(|face| {
+        Some((
+            loops.verts.get(face)?.as_slice(),
+            loops.edges.get(face)?.as_slice(),
+        ))
+    });
+    recover_quad(tri1, tri2, input)
 }
 
 /// Blender `approx_in_line`: whether `b` lies on the ray `a -> c` direction, to within 1e-4 in
@@ -734,7 +765,7 @@ mod tests {
             Tri::new([a, c, d], 0, [NO_INDEX, 2, 3]),
         ];
         assert_eq!(
-            polymesh_from_tris(&arena, &tris),
+            polymesh_from_tris(&arena, &tris, &InputLoops::default()),
             vec![Poly {
                 verts: vec![a, b, c, d],
                 orig: 0,
@@ -761,7 +792,7 @@ mod tests {
         // order). O-C and O-D stay: removing O-D would repeat C in the merged face. The centre has
         // neighbours D and C, which are not collinear with it, so it survives.
         assert_eq!(
-            polymesh_from_tris(&arena, &tris),
+            polymesh_from_tris(&arena, &tris, &InputLoops::default()),
             vec![
                 Poly {
                     verts: vec![o, c, d],
@@ -791,7 +822,7 @@ mod tests {
             Tri::new([m, b, c], 0, [0, 1, NO_INDEX]),
         ];
         assert_eq!(
-            polymesh_from_tris(&arena, &tris),
+            polymesh_from_tris(&arena, &tris, &InputLoops::default()),
             vec![Poly {
                 verts: vec![b, c, d, a],
                 orig: 0,
@@ -814,7 +845,7 @@ mod tests {
             Tri::new([a, b, c], 0, [0, 1, NO_INDEX]),
         ];
         assert_eq!(
-            polymesh_from_tris(&arena, &tris),
+            polymesh_from_tris(&arena, &tris, &InputLoops::default()),
             vec![
                 Poly {
                     verts: vec![a, b, c],
@@ -855,7 +886,7 @@ mod tests {
                 is_intersect: [false, false, true],
             },
         ];
-        let polys = polymesh_from_tris(&arena, &tris);
+        let polys = polymesh_from_tris(&arena, &tris, &InputLoops::default());
         assert_eq!(
             polys,
             vec![
