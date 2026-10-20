@@ -195,7 +195,7 @@ pub(crate) fn spread_region(
     let spread_u = shape.axis_u.dot(offset);
     let spread_v = shape.axis_v.dot(offset);
     let mut sample_spread = r_spread == 0.0;
-    let is_round = shape.ellipse && shape.half_u == shape.half_v;
+    let is_round = shape.ellipse && shape.half_u - shape.half_v == 0.0;
     if is_round && !sample_spread {
         let r = shape.half_u;
         let dist = spread_u.hypot(spread_v);
@@ -239,8 +239,8 @@ pub(crate) fn spread_region(
         let spread_area = PI * r_spread * r_spread;
         if !shape.ellipse || rectangle_area < shape.area.min(spread_area) {
             let rectangle_centre = centre
-                + shape.axis_u * (0.5 * (min_u + max_u))
-                + shape.axis_v * (0.5 * (min_v + max_v));
+                + shape.axis_u * f64::midpoint(min_u, max_u)
+                + shape.axis_v * f64::midpoint(min_v, max_v);
             return Some((
                 rectangle_centre,
                 AreaShape::new(

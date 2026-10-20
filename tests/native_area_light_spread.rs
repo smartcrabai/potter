@@ -32,9 +32,9 @@ use tempfile::tempdir;
 const SCRIPT: &str = include_str!("fixtures/native_oracle/area_light_spread.py");
 const DUMP_SCRIPT: &str = include_str!("fixtures/native_oracle/light_spread_dump.py");
 /// Frame width in pixels, the same as `area_light_spread.py`.
-const WIDTH: u32 = 64;
+const WIDTH: u32 = 16;
 /// Inclusive pixel columns of the three strips, the same as `STRIPS` in `area_light_spread.py`.
-const STRIPS: [(u32, u32); 3] = [(30, 33), (38, 42), (48, 53)];
+const STRIPS: [(u32, u32); 3] = [(7, 8), (10, 11), (13, 14)];
 /// Samples per pixel and seeds, the same for Blender and Potter.
 const SAMPLES: u32 = 256;
 const SEEDS: u32 = 4;

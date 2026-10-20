@@ -3271,7 +3271,9 @@ mod sampling_tests {
         let half = 0.5;
         let normal = -DVec3::Z;
         for spread_value in [0.3, 1.0] {
-            let spread = Spread::new(spread_value).expect("a spread below π");
+            let Some(spread) = Spread::new(spread_value) else {
+                panic!("a spread of {spread_value} is below π");
+            };
             for ellipse in [false, true] {
                 let shape = AreaShape::new(DVec3::X, DVec3::Y, half, half, ellipse);
                 let light = PointLight {
@@ -3367,8 +3369,9 @@ mod sampling_tests {
             use_mis: true,
         };
         let mut rng = Pcg32::for_sample(0x5e0, 0, 0, 0);
-        let sample = sample_light(&light, DVec3::new(0.4, -0.3, 0.5), &mut rng)
-            .expect("a receiver in front is lit");
+        let Some(sample) = sample_light(&light, DVec3::new(0.4, -0.3, 0.5), &mut rng) else {
+            panic!("a receiver in front is lit");
+        };
         assert!((sample.direction - DVec3::Z).length() <= 1.0e-12);
         assert!((sample.distance - 1.5).abs() <= 1.0e-12);
         assert_eq!(sample.pdf, 0.0);

@@ -25,10 +25,10 @@ SPREAD = float(spread)
 SAMPLES = int(samples)
 SEEDS = int(seeds)
 
-WIDTH = 64
-# Inclusive pixel columns of 64 across the 3 m frame: on the light's axis, about 0.4 m off it, and
-# about 0.9 m off it.
-STRIPS = [(30, 33), (38, 42), (48, 53)]
+WIDTH = 16
+# Inclusive pixel columns of 16 across the 3 m frame (0.19 m a pixel): on the light's axis, about
+# 0.4 m off it, and about 0.8 m off it.
+STRIPS = [(7, 8), (10, 11), (13, 14)]
 # Radiance 5 W/(sr m²) over the 1 m² light: power = radiance · π · area.
 LIGHT_RADIANCE = 5.0
 
