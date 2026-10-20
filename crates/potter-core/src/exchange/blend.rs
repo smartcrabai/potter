@@ -3332,6 +3332,10 @@ fn build_imported_graph(
                     .get("double_sided")
                     .and_then(Value::as_bool)
                     .unwrap_or(true),
+                use_transparent_shadow: item
+                    .get("use_transparent_shadow")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
                 displacement_method: displacement_method_field(name, item)?,
                 displacement_scale: number_field(item, "displacement_scale", 1.0),
                 displacement_midlevel: number_field(item, "displacement_midlevel", 0.5),
@@ -8421,6 +8425,19 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
                 "blender.material.displacement_method",
                 material.get("name").and_then(Value::as_str),
                 "Blender's combined displacement and bump mode has no Potter equivalent; the material imports as bump",
+            ));
+        }
+        // EEVEE's `use_backface_culling_shadow` drops back faces from the shadow pass (`eevee_pipeline.cc`, MA_BL_CULL_BACKFACE_SHADOW);
+        // Potter's shadow rays hit both sides.
+        if material
+            .get("use_backface_culling_shadow")
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            losses.push(loss(
+                "blender.material.backface_culling_shadow",
+                material.get("name").and_then(Value::as_str),
+                "Blender's EEVEE shadow backface culling is not imported; the material casts shadows from both sides",
             ));
         }
     }

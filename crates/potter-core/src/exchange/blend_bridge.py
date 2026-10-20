@@ -2225,6 +2225,8 @@ def material_dump(material):
             "emission_color": emission_color, "emission_strength": emission_strength,
             "transmission": transmission, "ior": ior,
             "double_sided": not bool(getattr(material, "use_backface_culling", False)),
+            "use_transparent_shadow": bool(getattr(material, "use_transparent_shadow", True)),
+            "use_backface_culling_shadow": bool(getattr(material, "use_backface_culling_shadow", False)),
             "alpha_mode": _alpha_mode_of(material),
             "alpha_threshold": float(material.alpha_threshold),
             "nodes": tree_dump(material.node_tree),
@@ -6722,6 +6724,7 @@ def export_doc(doc, target, pack, scene_hash, context):
         set_id(mat.node_tree, item.get("node_tree"))
         _set_principled_values(mat, item)
         mat.use_backface_culling = not bool(item.get("double_sided", True))
+        mat.use_transparent_shadow = bool(item.get("use_transparent_shadow", True))
         mat.displacement_method = "DISPLACEMENT" if item.get("displacement_method") == "displacement" else "BUMP"
         set_id(mat, material_id)
         source = compatibility_block(doc, "materials", "Material", material_id)
