@@ -33,6 +33,7 @@ pub(crate) mod concat;
 pub mod curve;
 pub mod edit;
 pub(crate) mod heap_simple;
+mod heap;
 pub(crate) mod interpolation;
 pub mod lattice;
 pub(crate) mod legacy_texture;

@@ -41,15 +41,25 @@ use serde_json::{Value, json};
 use tempfile::tempdir;
 
 const SCRIPT: &str = include_str!("fixtures/native_oracle/transparent_cap.py");
-/// Patch grid of the Blender oracle (`transparent_cap.py`): fractions of the frame.
-const PATCH: [f64; 9] = [
-    0.25, 0.3125, 0.375, 0.4375, 0.5, 0.5625, 0.625, 0.6875, 0.75,
-];
-/// Render-to-stored-value tolerance (linear units). The lit cases are about 0.06 and 0.23 and the
-/// patch has 81 pixels of 256 samples; each mean's sampling error is about 0.002, so this bound is
-/// several sigma for the difference of two estimators, and a dropped shadow budget (the floor
-/// lit through all planes) is far outside it.
+/// Frame edge in pixels of both renders (`transparent_cap.py`). The planes fill the orthographic
+/// frame, so the image is spatially smooth and a smaller frame gives the same expectation for less
+/// work.
+const RESOLUTION: u32 = 16;
+/// Pixel rows and columns of the patch (`transparent_cap.py`): the central 12 x 12 of 16 x 16.
+const PATCH: std::ops::Range<u32> = 2..14;
+/// Render-to-stored-value tolerance (linear units). Blender's seed-to-seed spread of each patch mean
+/// at these settings (256 samples per pixel, 32 seeds, `transparent_cap.py`) is 1e-5 to 4e-4, so the
+/// tolerance is at least 17 times the spread of the difference of two estimators. Potter's patch
+/// sums 144 pixels x 256 samples; the previous 81-pixel grid summed 81 x 256, so even a Bernoulli
+/// model of each sample (stderr 0.0029 for n1c2 before, 0.0022 now) gets tighter, not looser. A
+/// dropped shadow budget (`n2c3` with the budget ignored renders 0.055 where Cycles gives 0) is far
+/// outside the tolerance.
 const PIXEL_TOLERANCE: f64 = 0.01;
+
+/// The fraction of the frame at which the centre of pixel `index` lies.
+fn pixel_centre(index: u32) -> f64 {
+    (f64::from(index) + 0.5) / f64::from(RESOLUTION)
+}
 
 /// Renders `kind` in Blender and in Potter, compares their patch means, and returns Blender's JSON.
 fn check_scenario(kind: &str) -> TestResult<Value> {
@@ -82,7 +92,7 @@ fn check_scenario(kind: &str) -> TestResult<Value> {
         &project,
         root.path(),
         json!([
-            {"op": "render.update", "target": {"id": active}, "set": {"resolution_x": 32, "resolution_y": 32, "samples": 256, "seed": 0, "max_bounces": 4}}
+            {"op": "render.update", "target": {"id": active}, "set": {"resolution_x": RESOLUTION, "resolution_y": RESOLUTION, "samples": 256, "seed": 0, "max_bounces": 4}}
         ]),
     )?;
     assert_eq!(applied["ok"], true, "{applied}");
@@ -111,9 +121,9 @@ fn check_scenario(kind: &str) -> TestResult<Value> {
     let image: Image = serde_json::from_value(scene["images"]["render"].clone())?;
     let data = load_image_data(&image, &project, ImageInterpolation::Closest)?;
     let mut total = [0.0_f64; 4];
-    for v in PATCH {
-        for u in PATCH {
-            let pixel = sample(&data, [u, v], false);
+    for y in PATCH {
+        for x in PATCH {
+            let pixel = sample(&data, [pixel_centre(x), pixel_centre(y)], false);
             for (sum, value) in total.iter_mut().zip(pixel.iter()) {
                 *sum += value;
             }

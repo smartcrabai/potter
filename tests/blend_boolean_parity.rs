@@ -29,8 +29,8 @@ use blender_file::blender_executable;
 #[path = "fixtures/boolean_parity/comparator.rs"]
 mod comparator;
 use comparator::{
-    TestResult, evaluate_boolean, expected_canonical, find_node, import_blend_scene, mismatches,
-    run_generator,
+    TestResult, evaluate_booleans_together, expected_canonical, find_node, import_blend_scene,
+    mismatches, run_generator,
 };
 
 use std::{fs, path::Path};
@@ -113,7 +113,7 @@ fn boolean_matches_blender_parity_corpus() -> TestResult {
             .into());
         }
         let node_id = find_node(&document, &case)?;
-        match evaluate_boolean(&document, &node_id) {
+        match evaluate_booleans_together(&document, std::slice::from_ref(&node_id)).remove(0) {
             Ok(actual) => {
                 let expected = expected_canonical(&expected_json)?;
                 failures.extend(
