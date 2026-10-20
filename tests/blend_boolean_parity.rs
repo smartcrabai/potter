@@ -1,4 +1,4 @@
-//! Blender-gated parity for the EXACT Boolean against the committed corpus in
+//! Blender-gated parity for EXACT and FLOAT Booleans against the committed corpus in
 //! `tests/fixtures/boolean_parity`.
 //!
 //! The corpus holds one Blender 5.2 expectation per case in `expected/<case>.json`, produced by
@@ -14,14 +14,13 @@
 //! Commit the regenerated `expected/*.json`. `scene.blend` is written next to them and is git-ignored.
 //!
 //! Driver: the test regenerates `scene.blend` (every case in one scene) in a temporary directory and
-//! imports it with `pot import`, which must report no losses. Each EXACT case evaluates its host with
-//! only its own Boolean enabled. The result is compared with the committed expectation by the shared
-//! canonical comparator (`fixtures/boolean_parity/comparator.rs`): world-space rings, per-face
-//! material, `fid`, UV corners, custom normals where recorded, vertex-group weights, V/E/F, and volume.
+//! imports it with `pot import`, which must report no losses. Each case evaluates its host with only
+//! its own Boolean enabled. The committed expectations assert the recorded rings and payloads;
+//! same-run Blender expectations provide complete edge endpoints and point/edge associations,
+//! face-corner point values, all named UV layers and pins, attributes, colors, and derived normal vectors.
 //!
-//! All 53 EXACT rows are asserted, with no partial pass: any mismatch fails. The 11 FLOAT rows hold
-//! Blender's defective outputs (research §3.3, §3.4, §3.7). They are recorded for the `PR17b` FAST port
-//! and are not asserted here. A missing Blender executable fails the test.
+//! All 53 EXACT and 11 FLOAT rows are asserted, including Blender FLOAT's defective outputs
+//! (research §3.3, §3.4, §3.7). A missing Blender executable fails the test.
 
 #[path = "common/blender_file.rs"]
 mod blender_file;
@@ -53,9 +52,11 @@ const REVIEWED_CASES: [&str; 6] = [
 
 /// Corpus rows with `solver == "EXACT"`.
 const EXACT_ROWS: usize = 53;
+/// Corpus rows with `solver == "FLOAT"`.
+const FLOAT_ROWS: usize = 11;
 
 #[test]
-fn exact_boolean_matches_blender_parity_corpus() -> TestResult {
+fn boolean_matches_blender_parity_corpus() -> TestResult {
     let blender = blender_executable().ok_or(BLENDER_REQUIRED)?;
     let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/boolean_parity");
     let directory = tempdir()?;
@@ -79,18 +80,38 @@ fn exact_boolean_matches_blender_parity_corpus() -> TestResult {
     }
     paths.sort();
 
-    let mut asserted = Vec::new();
+    let mut asserted_exact = Vec::new();
+    let mut asserted_float = Vec::new();
     let mut failures = Vec::new();
     for path in paths {
         let expected_json: Value = serde_json::from_slice(&fs::read(&path)?)?;
-        // FLOAT rows are PR17b targets and are recorded only.
-        if expected_json["solver"] != "EXACT" {
-            continue;
+        let solver = expected_json["solver"]
+            .as_str()
+            .ok_or("Boolean case solver is missing")?;
+        if solver != "EXACT" && solver != "FLOAT" {
+            return Err(
+                format!("unexpected Boolean solver `{solver}` in {}", path.display()).into(),
+            );
         }
         let case = expected_json["case"]
             .as_str()
             .ok_or("Blender case name is missing")?
             .to_owned();
+        let generated_path = root.join("expected").join(format!("{case}.json"));
+        let generated_json: Value = serde_json::from_slice(&fs::read(&generated_path)?)?;
+        if generated_json["case"].as_str() != Some(case.as_str()) {
+            return Err(format!(
+                "generated Blender expectation `{}` does not describe case `{case}`",
+                generated_path.display()
+            )
+            .into());
+        }
+        if !expected_json["faces"].is_array() || !expected_json["vertex_groups"].is_object() {
+            return Err(format!(
+                "{solver} case `{case}` must record faces and vertex groups, including empty payloads"
+            )
+            .into());
+        }
         let node_id = find_node(&document, &case)?;
         match evaluate_booleans_together(&document, std::slice::from_ref(&node_id)).remove(0) {
             Ok(actual) => {
@@ -100,20 +121,34 @@ fn exact_boolean_matches_blender_parity_corpus() -> TestResult {
                         .into_iter()
                         .map(|difference| format!("{case}: {difference}")),
                 );
+                let runtime_expected = expected_canonical(&generated_json)?;
+                failures.extend(
+                    mismatches(&actual, &runtime_expected)
+                        .into_iter()
+                        .map(|difference| format!("{case}: runtime Blender record: {difference}")),
+                );
             }
             Err(error) => failures.push(format!("{case}: {error}")),
         }
-        asserted.push(case);
+        match solver {
+            "EXACT" => asserted_exact.push(case),
+            "FLOAT" => asserted_float.push(case),
+            _ => unreachable!("solver was checked above"),
+        }
     }
-
     assert_eq!(
-        asserted.len(),
+        asserted_exact.len(),
         EXACT_ROWS,
         "every EXACT corpus row must be asserted"
     );
+    assert_eq!(
+        asserted_float.len(),
+        FLOAT_ROWS,
+        "every FLOAT corpus row must be asserted"
+    );
     for case in REVIEWED_CASES {
         assert!(
-            asserted.iter().any(|name| name.as_str() == case),
+            asserted_exact.iter().any(|name| name.as_str() == case),
             "reviewed case `{case}` is not asserted"
         );
     }

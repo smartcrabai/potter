@@ -1346,7 +1346,10 @@ def _attribute_item_value(item, data_type):
         return _quaternion_to_native(item.value)
     if hasattr(item, "vector"):
         return plain(item.vector)
-    return plain(item.value)
+    value = item.value
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return plain(value)
 
 
 def _set_attribute_item(item, data_type, value):
@@ -2127,13 +2130,42 @@ def dump_scene(scene):
             "compositor": _scene_compositor(scene),
             "color_management": _color_management_dump(scene),
             "view_layers": layers,
-            "display_backface_culling": bool(scene.display.shading.show_backface_culling),
+            "display_shading": _display_shading_dump(scene),
             "markers": [{"name": marker.name, "frame": int(marker.frame)} for marker in scene.timeline_markers],
             "rigid_body_world": _rigid_body_world_dump(scene),
             "sequencer": _sequencer_dump(scene),
             "root_collection": scene.get("potter.root_collection", scene.collection.get("potter.name", scene.collection.name_full)),
             "world": world_info, "custom_properties": custom_props(scene),
             "rna_properties": rna_props(scene, ("objects", "collection", "view_layers", "world", "camera", "render", "tool_settings", "unit_settings"))}
+
+
+def _camera_dof_enabled(camera):
+    """Whether a camera has depth of field on, which Workbench's DoF pass reads from the scene camera."""
+    dof = getattr(getattr(camera, "data", None), "dof", None)
+    return bool(dof is not None and dof.use_dof)
+
+
+def _display_shading_dump(scene):
+    """The viewport shading options a Workbench render reads (`scene.display.shading`), with the scene
+    camera's depth of field, which the DoF option needs in order to draw anything."""
+    shading = scene.display.shading
+    return {
+        "type": shading.type,
+        "light": shading.light,
+        "studio_light": shading.studio_light,
+        "color_type": shading.color_type,
+        "use_world_space_lighting": bool(shading.use_world_space_lighting),
+        "show_specular_highlight": bool(shading.show_specular_highlight),
+        "show_cavity": bool(shading.show_cavity),
+        "show_shadows": bool(shading.show_shadows),
+        "show_object_outline": bool(shading.show_object_outline),
+        "show_backface_culling": bool(shading.show_backface_culling),
+        "show_xray": bool(shading.show_xray),
+        "xray_alpha": float(shading.xray_alpha),
+        "use_dof": bool(shading.use_dof),
+        "camera_dof": _camera_dof_enabled(scene.camera),
+        "background_type": shading.background_type,
+    }
 
 
 def _startup_metadata_datablock(collection_name, block):
@@ -2221,10 +2253,14 @@ def material_dump(material):
     return {"name": material.name_full, "potter_id": material.get("potter.id"),
             "library": library_reference(material),
             "base_color": base_color,
+            "viewport_display": {"diffuse_color": [float(c) for c in material.diffuse_color],
+                                 "roughness": float(material.roughness), "metallic": float(material.metallic)},
             "metallic": metallic, "roughness": roughness,
             "emission_color": emission_color, "emission_strength": emission_strength,
             "transmission": transmission, "ior": ior,
             "double_sided": not bool(getattr(material, "use_backface_culling", False)),
+            "use_transparent_shadow": bool(getattr(material, "use_transparent_shadow", True)),
+            "use_backface_culling_shadow": bool(getattr(material, "use_backface_culling_shadow", False)),
             "alpha_mode": _alpha_mode_of(material),
             "alpha_threshold": float(material.alpha_threshold),
             "nodes": tree_dump(material.node_tree),
@@ -6717,11 +6753,15 @@ def export_doc(doc, target, pack, scene_hash, context):
         if material_id in material_map:
             continue
         mat = bpy.data.materials.new(item["name"])
-        mat.diffuse_color = item["base_color"]
+        viewport = item.get("viewport_display")
+        mat.diffuse_color = viewport["diffuse_color"] if viewport else item["base_color"]
         mat.use_nodes = True
         set_id(mat.node_tree, item.get("node_tree"))
         _set_principled_values(mat, item)
+        mat.roughness = viewport["roughness"] if viewport else item["roughness"]
+        mat.metallic = viewport["metallic"] if viewport else item["metallic"]
         mat.use_backface_culling = not bool(item.get("double_sided", True))
+        mat.use_transparent_shadow = bool(item.get("use_transparent_shadow", True))
         mat.displacement_method = "DISPLACEMENT" if item.get("displacement_method") == "displacement" else "BUMP"
         set_id(mat, material_id)
         source = compatibility_block(doc, "materials", "Material", material_id)
@@ -6750,6 +6790,8 @@ def export_doc(doc, target, pack, scene_hash, context):
     native_bind_copies, preserved_native_binds = _source_modifier_object_copies(
         doc, mesh_map)
     object_map = dict(linked_maps["nodes"])
+    # Nodes whose Blender rotation was restored from the source Euler/quaternion values exactly.
+    exact_rotation_nodes = set()
     for node_id, item in doc.get("nodes", {}).items():
         if node_id in linked_maps["nodes"]:
             continue
@@ -6847,6 +6889,8 @@ def export_doc(doc, target, pack, scene_hash, context):
                 and source_rotation_mode == obj.rotation_mode
                 and abs(abs(source_quaternion.dot(quaternion)) - 1.0) <= 1.0e-14
             )
+            if source_rotation_unchanged:
+                exact_rotation_nodes.add(node_id)
             if source_rotation_unchanged and obj.rotation_mode == "QUATERNION":
                 obj.rotation_quaternion = source_rotation_values
             elif source_rotation_unchanged and obj.rotation_mode == "AXIS_ANGLE":
@@ -7080,6 +7124,7 @@ def export_doc(doc, target, pack, scene_hash, context):
         obj = object_map[node_id]
         is_linked = node_id in linked_maps["nodes"]
         root_parent_inverse = None
+        has_captured_basis = False
         if not is_linked:
             parent = object_map.get(item.get("parent"))
             if parent:
@@ -7108,6 +7153,23 @@ def export_doc(doc, target, pack, scene_hash, context):
                 rows = [[values[column * 4 + row] for column in range(4)]
                         for row in range(4)]
                 root_parent_inverse = Matrix(rows)
+            elif item.get("blender_parent_inverse"):
+                # Round-trip of a Blender root's inverse: Blender ignores it without a parent, so it is
+                # written as is and the basis stays the evaluated transform.
+                values = item["blender_parent_inverse"]
+                rows = [[values[column * 4 + row] for column in range(4)]
+                        for row in range(4)]
+                obj.matrix_parent_inverse = Matrix(rows)
+            basis = item.get("matrix_basis")
+            if isinstance(basis, (list, tuple)) and len(basis) == 16:
+                has_captured_basis = True
+                # Assigning a matrix decomposes it into loc/rot/scale and moves rotation and scale by an
+                # ulp. A rotation restored exactly above (Blender's own Euler values) is already the
+                # Blender basis, so only the other captured nodes take the matrix.
+                if node_id not in exact_rotation_nodes:
+                    rows = [[basis[column * 4 + row] for column in range(4)]
+                            for row in range(4)]
+                    obj.matrix_basis = Matrix(rows)
         memberships = 0
         for collection_id, collection_item in collections_raw.items():
             if node_id not in collection_item.get("objects", []):
@@ -7129,16 +7191,19 @@ def export_doc(doc, target, pack, scene_hash, context):
                           if obj.name_full in candidate.objects), bpy.context.scene)
             _restore_object_material_slots(obj, item, material_map, scene)
         if root_parent_inverse is not None and root_parent_inverse != Matrix.Identity(4):
-            combined = root_parent_inverse @ obj.matrix_basis.copy()
-            # Without a parent Blender ignores matrix_parent_inverse. Bake its
-            # offset into the linked root's basis and world matrix instead.
-            obj.matrix_basis = combined
-            obj.matrix_world = combined
-            obj["potter.root_matrix_json"] = json.dumps({
-                "parent_inverse": values,
-                "transform": item["transform"],
-                "baked_basis": matrix_rows(obj.matrix_basis),
-            }, sort_keys=True)
+            if has_captured_basis:
+                obj.matrix_parent_inverse = root_parent_inverse
+            else:
+                combined = root_parent_inverse @ obj.matrix_basis.copy()
+                # Without a parent Blender ignores matrix_parent_inverse. Bake its
+                # offset into the linked root's basis and world matrix instead.
+                obj.matrix_basis = combined
+                obj.matrix_world = combined
+                obj["potter.root_matrix_json"] = json.dumps({
+                    "parent_inverse": values,
+                    "transform": item["transform"],
+                    "baked_basis": matrix_rows(obj.matrix_basis),
+                }, sort_keys=True)
         if obj.type == "MESH":
             mesh_source = compatibility_block(doc, "meshes", "Mesh", item.get("data"))
             _restore_skin_vertices(obj, mesh_source.get("skin_vertices", []))

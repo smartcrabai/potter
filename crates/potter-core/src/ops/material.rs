@@ -42,6 +42,7 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             "metallic",
             "roughness",
             "double_sided",
+            "use_transparent_shadow",
             "emission_color",
             "emission_strength",
             "transmission",
@@ -149,6 +150,10 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
     if operation.contains_key("double_sided") {
         material.double_sided = read_bool(engine, operation, "double_sided", false)?;
     }
+    if operation.contains_key("use_transparent_shadow") {
+        material.use_transparent_shadow =
+            read_bool(engine, operation, "use_transparent_shadow", true)?;
+    }
     if let Some(value) = operation.get("emission_color") {
         material.emission_color = read_emission_color(
             engine,
@@ -246,6 +251,7 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             "metallic",
             "roughness",
             "double_sided",
+            "use_transparent_shadow",
             "emission_color",
             "emission_strength",
             "transmission",
@@ -347,6 +353,18 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                     ErrorCode::InvalidOperation,
                     "double_sided must be a boolean",
                     &operation_pointer(engine.operation_index, "set/double_sided"),
+                )
+            })
+        })
+        .transpose()?;
+    let use_transparent_shadow = set
+        .get("use_transparent_shadow")
+        .map(|value| {
+            value.as_bool().ok_or_else(|| {
+                engine.error(
+                    ErrorCode::InvalidOperation,
+                    "use_transparent_shadow must be a boolean",
+                    &operation_pointer(engine.operation_index, "set/use_transparent_shadow"),
                 )
             })
         })
@@ -505,6 +523,12 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                 && material.double_sided != value
             {
                 material.double_sided = value;
+                item_changed = true;
+            }
+            if let Some(value) = use_transparent_shadow
+                && material.use_transparent_shadow != value
+            {
+                material.use_transparent_shadow = value;
                 item_changed = true;
             }
             if let Some(value) = &base_color_texture

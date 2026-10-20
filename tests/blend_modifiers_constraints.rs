@@ -1258,9 +1258,8 @@ fn directed_surface_distance(source: &[[DVec3; 3]], target: &[[DVec3; 3]]) -> f6
 }
 
 fn assert_boolean_geometry(actual: &Value, expected: &Value, context: &str) -> (f64, f64) {
-    // Blender's exact BMesh solver and Potter's BSP retain different redundant boundary
-    // vertices (the original UNION fixture had 34 Potter edges versus Blender's 28).
-    // Compare the resulting closed surfaces instead of requiring solver-specific topology.
+    // Different solvers can retain different redundant boundary vertices. This round-trip check
+    // compares the closed surface and volume; solver-specific parity tests assert full topology.
     let (actual_watertight, actual_components) = geometry_topology(actual);
     let (expected_watertight, expected_components) = geometry_topology(expected);
     assert!(

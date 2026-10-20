@@ -13,9 +13,9 @@ Outputs under the directory given after `--`:
 
 Cases reproduce research/§3 of the PR17 design: §3.1 offset, §3.2 nested, §3.3 coplanar,
 §3.4 face-touching and holes, §3.5 open operands, §3.6 self-overlapping operand, §3.7
-collection operand, attributes, vertex groups, and material INDEX/TRANSFER. EXACT cases are
-the parity oracle. FLOAT cases of §3.3, §3.4, and the §3.7 INDEX material row are recorded
-as Blender's defective outputs for PR17b; the Rust driver skips them.
+collection operand, attributes, vertex groups, and material INDEX/TRANSFER. EXACT is asserted for
+the standard cases; every recorded FLOAT row is compared to Blender's own output, including its
+source-specific coplanar, touching, and material-index results.
 
 Each case is a Boolean modifier on a host object named after the case. Every object keeps
 the identity transform, so object-local and world coordinates coincide. All cases share one
@@ -23,10 +23,12 @@ scene, and the Rust driver evaluates each host with only its own Boolean enabled
 evaluation is independent per host, so the shared scene gives the same result as one scene
 per case.
 
-Expectations are canonical: each face ring is rotated to start at its minimum vertex
-(coordinates rounded to 1e-6), faces are sorted by (ring, material_index), and vertex groups
-are sorted by rounded coordinates. Object-index order is not part of the contract, because
-FLOAT vertex numbering varies between runs.
+Expectations are canonical: face rings are rotated to start at their minimum vertex
+(coordinates rounded to 1e-6), faces are sorted by (ring, material_index), and each
+edge stores its world-space endpoints in `edge.vertices` order. Point, edge, face, and corner attributes retain
+position/ring association, including face-local point payloads and every named UV layer/pin; Blender
+element indices are not comparison keys.
+Material fields keep four distinct sources: raw OBJECT assignments (`object_materials`, null for DATA links), effective slot materials (`effective_materials`), raw DATA slots (`data_materials`), and per-slot link modes (`material_links`).
 """
 
 import json
@@ -96,7 +98,59 @@ def face_center(verts, face):
 
 
 def canonical(co):
-    return tuple(round(c, 6) + 0.0 for c in co)
+    # Nine significant figures resolve f32 coordinates at any scale the corpus uses (Blender stores
+    # f32); six decimal places collapsed the 2^-30-scale tiny cases to zero.
+    return tuple(float(f"{c:.9g}") + 0.0 for c in co)
+
+def attribute_value(item, data_type):
+    if data_type == "QUATERNION":
+        value = item.value
+        if hasattr(value, "x"):
+            return [float(value.x), float(value.y), float(value.z), float(value.w)]
+        # Blender 5.2 returns a plain (w, x, y, z) array for quaternion attributes.
+        return [float(value[1]), float(value[2]), float(value[3]), float(value[0])]
+    if data_type == "FLOAT4X4":
+        return [[float(component) for component in row] for row in item.value]
+    if data_type in ("FLOAT_COLOR", "BYTE_COLOR"):
+        value = item.color
+    elif hasattr(item, "vector"):
+        value = item.vector
+    else:
+        value = item.value
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    if isinstance(value, (tuple, list)) or hasattr(value, "__iter__") and not isinstance(value, str):
+        return list(value)
+    return value
+
+
+def domain_attribute_values(mesh, domain):
+    uv_names = {layer.name for layer in mesh.uv_layers}
+    values = {}
+    for attribute in mesh.attributes:
+        if (attribute.domain != domain or attribute.name.startswith(".")
+                or attribute.name in {"position", "material_index", "sharp_face", "sharp_edge",
+                                      "uv_seam", "custom_normal"}
+                or (domain == "FACE" and attribute.name == "fid")
+                or attribute.name in uv_names):
+            continue
+        values[attribute.name] = [
+            attribute_value(item, attribute.data_type) for item in attribute.data
+        ]
+    for attribute in mesh.color_attributes:
+        if attribute.domain == domain:
+            values[attribute.name] = [
+                attribute_value(item, attribute.data_type) for item in attribute.data
+            ]
+    return values
+
+
+def smooth_faces(mesh):
+    # Blender stores flat faces in `sharp_face`; without that attribute every face is smooth.
+    sharp = mesh.attributes.get("sharp_face")
+    if sharp is None:
+        return [True] * len(mesh.polygons)
+    return [not item.value for item in sharp.data]
 
 
 def dot(a, b):
@@ -296,9 +350,84 @@ def describe(host, spec):
 def describe_mesh(evaluated, mesh, spec):
     matrix = evaluated.matrix_world
     raw = [tuple(float(c) for c in matrix @ vertex.co) for vertex in mesh.vertices]
-    group_names = {group.index: group.name for group in evaluated.vertex_groups}
+    edges = sorted(
+        [canonical(raw[index]) for index in edge.vertices]
+        for edge in mesh.edges
+    )
+    point_values = domain_attribute_values(mesh, "POINT")
+    edge_values = domain_attribute_values(mesh, "EDGE")
+    face_values = domain_attribute_values(mesh, "FACE")
+    corner_values = domain_attribute_values(mesh, "CORNER")
+    if any(edge.use_edge_sharp for edge in mesh.edges):
+        edge_values["sharp"] = [bool(edge.use_edge_sharp) for edge in mesh.edges]
+    if any(edge.use_seam for edge in mesh.edges):
+        edge_values["seam"] = [bool(edge.use_seam) for edge in mesh.edges]
+
+    point_attributes = []
+    for index, co in enumerate(raw):
+        point_attributes.append({
+            "co": canonical(co),
+            "values": {name: values[index] for name, values in point_values.items()},
+        })
+    point_attributes.sort(key=lambda row: (row["co"], json.dumps(row["values"], sort_keys=True)))
+
+    edge_attributes = []
+    for index, edge in enumerate(mesh.edges):
+        edge_attributes.append({
+            "edge": [canonical(raw[vertex]) for vertex in edge.vertices],
+            "values": {name: values[index] for name, values in edge_values.items()},
+        })
+    edge_attributes.sort(key=lambda row: (
+        row["edge"], json.dumps(row["values"], sort_keys=True)
+    ))
+    edge_points = []
+    for edge in mesh.edges:
+        edge_points.append({
+            "edge": [canonical(raw[index]) for index in edge.vertices],
+            "endpoints": [
+                {
+                    "co": canonical(raw[index]),
+                    "values": {name: values[index] for name, values in point_values.items()},
+                }
+                for index in edge.vertices
+            ],
+        })
+    edge_points.sort(key=lambda row: (
+        row["edge"], json.dumps(row["endpoints"], sort_keys=True)
+    ))
+
+
+    color_attributes = mesh.color_attributes
+    color_names = [attribute.name for attribute in color_attributes]
+    color_layers = None
+    if color_names:
+        active = color_attributes.active_color_index
+        render = color_attributes.render_color_index
+        color_layers = {
+            "active": color_names[active] if 0 <= active < len(color_names) else None,
+            "render": color_names[render] if 0 <= render < len(color_names) else None,
+            "layers": [
+                {
+                    "name": attribute.name,
+                    "domain": attribute.domain,
+                    "data_type": attribute.data_type,
+                }
+                for attribute in color_attributes
+            ],
+        }
+
+    uv_layer_names = [layer.name for layer in mesh.uv_layers]
+    uv_active_index = mesh.uv_layers.active_index
+    uv_render_index = mesh.uv_layers.active_render_index
+    uv_layer_metadata = {
+        "layers": uv_layer_names,
+        "active": uv_layer_names[uv_active_index] if 0 <= uv_active_index < len(uv_layer_names) else None,
+        "render": uv_layer_names[uv_render_index] if 0 <= uv_render_index < len(uv_layer_names) else None,
+    }
+
     uv_data = mesh.uv_layers["UVMap"].data if "UVMap" in mesh.uv_layers else None
-    has_fid = "fid" in mesh.attributes
+    normal_layer = mesh.attributes.get("custom_normal")
+    smooth = smooth_faces(mesh)
     faces = []
     sizes = {}
     volume = 0.0
@@ -310,20 +439,80 @@ def describe_mesh(evaluated, mesh, spec):
         if uv_data is not None:
             loops = [[round(uv_data[li].uv[0], 6) + 0.0, round(uv_data[li].uv[1], 6) + 0.0]
                      for li in polygon.loop_indices]
+        named_uv_layers = {
+            layer.name: {
+                "uv": [
+                    [round(layer.data[loop_index].uv[0], 6) + 0.0,
+                     round(layer.data[loop_index].uv[1], 6) + 0.0]
+                    for loop_index in polygon.loop_indices
+                ],
+                "pins": [bool(layer.data[loop_index].pin_uv) for loop_index in polygon.loop_indices],
+            }
+            for layer in mesh.uv_layers
+        }
+        corner_attributes = {
+            name: [values[loop_index] for loop_index in polygon.loop_indices]
+            for name, values in corner_values.items()
+        }
+        normal_codes = None
+        normal_vectors = None
+        if normal_layer is not None:
+            normal_codes = [
+                [int(component) for component in normal_layer.data[loop_index].value]
+                for loop_index in polygon.loop_indices
+            ]
+            normal_vectors = [
+                [float(component) for component in mesh.corner_normals[loop_index].vector]
+                for loop_index in polygon.loop_indices
+            ]
+        face_attributes = {
+            name: values[polygon.index] for name, values in face_values.items()
+        }
+        face_attributes["shade_smooth"] = smooth[polygon.index]
+        point_attribute_rows = [
+            {name: values[index] for name, values in point_values.items()}
+            for index in indices
+        ]
+        uv_pins = (
+            [bool(uv_data[loop_index].pin_uv) for loop_index in polygon.loop_indices]
+            if uv_data is not None else None
+        )
         start = min(range(len(ring)), key=ring.__getitem__)
         ring = ring[start:] + ring[:start]
         record = {"ring": ring, "material_index": polygon.material_index}
         if loops is not None:
-            loops = loops[start:] + loops[:start]
-            record["uv"] = loops
-        if has_fid:
+            record["uv"] = loops[start:] + loops[:start]
+        record["uv_layers"] = {
+            name: {
+                "uv": values["uv"][start:] + values["uv"][:start],
+                "pins": values["pins"][start:] + values["pins"][:start],
+            }
+            for name, values in named_uv_layers.items()
+        }
+        record["face_attributes"] = face_attributes
+        if corner_attributes:
+            record["corner_attributes"] = {
+                name: values[start:] + values[:start]
+                for name, values in corner_attributes.items()
+            }
+        if normal_codes is not None:
+            record["custom_normal_codes"] = normal_codes[start:] + normal_codes[:start]
+        if normal_vectors is not None:
+            record["custom_normals"] = normal_vectors[start:] + normal_vectors[:start]
+        if "fid" in mesh.attributes:
             record["fid"] = mesh.attributes["fid"].data[polygon.index].value
+        record["point_attributes"] = (
+            point_attribute_rows[start:] + point_attribute_rows[:start]
+        )
+        if uv_pins is not None:
+            record["uv_pins"] = uv_pins[start:] + uv_pins[:start]
         faces.append(record)
         p0 = raw[indices[0]]
         for k in range(1, len(indices) - 1):
             volume += dot(p0, cross(raw[indices[k]], raw[indices[k + 1]])) / 6.0
     faces.sort(key=lambda face: (face["ring"], face["material_index"]))
 
+    group_names = {group.index: group.name for group in evaluated.vertex_groups}
     groups = {name: [] for name in group_names.values()}
     for vertex, co in zip(mesh.vertices, raw):
         weights = {group_names[group.group]: round(group.weight, 6) for group in vertex.groups}
@@ -332,6 +521,35 @@ def describe_mesh(evaluated, mesh, spec):
     for entries in groups.values():
         entries.sort(key=lambda entry: entry["co"])
 
+    # Blender `BKE_object_material_get_eval` resolves an OBJECT-null slot through DATA; compute the
+    # effective table explicitly from the raw object table, links, and evaluated mesh's DATA table.
+    source = bpy.data.objects[spec["id"]]
+    source_slots = list(source.material_slots)
+    object_materials = []
+    material_links = []
+    for index in range(len(evaluated.material_slots)):
+        if index < len(source_slots):
+            slot = source_slots[index]
+            object_materials.append(
+                slot.material.name if slot.link == "OBJECT" and slot.material is not None else None
+            )
+            material_links.append(slot.link.lower())
+        else:
+            object_materials.append(None)
+            material_links.append("data")
+
+    data_materials = [
+        material.name if material is not None else None
+        for material in mesh.materials
+    ]
+    # Effective names are Blender's evaluated resolution (BKE_object_material_get_eval on the
+    # evaluated object), not a Python re-derivation from raw tables. The OBJECT-null-over-DATA
+    # case falls through to the DATA slot here and is the source witness for that resolution.
+    effective_materials = [
+        slot.material.name if slot.material is not None else None
+        for slot in evaluated.material_slots
+    ]
+
     result = {
         "case": spec["id"],
         "research_section": spec["research_section"],
@@ -339,6 +557,10 @@ def describe_mesh(evaluated, mesh, spec):
         "operation": spec["operation"],
         "use_self": spec["use_self"],
         "material_mode": spec["material_mode"],
+        "object_materials": object_materials,
+        "effective_materials": effective_materials,
+        "data_materials": data_materials,
+        "material_links": material_links,
         "counts": {
             "vertices": len(mesh.vertices),
             "edges": len(mesh.edges),
@@ -346,10 +568,17 @@ def describe_mesh(evaluated, mesh, spec):
         },
         "face_sizes": {str(size): count for size, count in sorted(sizes.items())},
         "volume": volume,
+        "edges": edges,
+        "edge_points": edge_points,
         "faces": faces,
+        "uv_layers": uv_layer_metadata,
         "vertex_groups": groups,
         "blender_version": bpy.app.version_string,
     }
+    # Always written: null means this mesh has no data in that domain, not an omitted section.
+    result["edge_attributes"] = edge_attributes if edge_values else None
+    result["point_attributes"] = point_attributes if point_values else None
+    result["color_layers"] = color_layers
     if "hole_tolerant" in spec:
         result["hole_tolerant"] = spec["hole_tolerant"]
         result["input_geometry"] = {
