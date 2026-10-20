@@ -69,8 +69,6 @@ pub enum EvaluationPurpose {
     #[default]
     Preview,
     Render,
-    /// Explicit node-bake capture: the viewport stack, never a saved render.
-    Bake,
 }
 
 /// Scene context used to produce one immutable evaluated snapshot.
@@ -2283,12 +2281,10 @@ fn prepare_node_bake_modifiers<'a>(
                 PotError::new(ErrorCode::SceneInvalid, "node-bake node ID is invalid")
             })?;
             crate::graph::validate_node_bake_config(config)?;
-            let storage = config
-                .get("storage")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    PotError::new(ErrorCode::SceneInvalid, "node-bake storage is missing")
-                })?;
+            // A settings-only entry carries no baked data; its bake node evaluates live.
+            let Some(storage) = config.get("storage").and_then(Value::as_str) else {
+                continue;
+            };
             let modifier_target = modifier
                 .params
                 .get("bake_target")
@@ -2387,14 +2383,10 @@ fn prepare_node_bake_modifiers<'a>(
                         .and_then(Value::as_bool)
                         .unwrap_or(false)
                     {
-                        let Some(directory) = config
+                        config
                             .get("directory")
                             .and_then(Value::as_str)
-                            .filter(|directory| !directory.is_empty())
-                        else {
-                            continue;
-                        };
-                        directory
+                            .unwrap_or_default()
                     } else {
                         modifier
                             .params
@@ -2402,6 +2394,11 @@ fn prepare_node_bake_modifiers<'a>(
                             .and_then(Value::as_str)
                             .unwrap_or_default()
                     };
+                    // An empty directory names no location, so the payload is missing and the
+                    // bake node evaluates live.
+                    if bake_directory.is_empty() {
+                        continue;
+                    }
                     let mut frames: Vec<crate::graph::NodeBakeFrame> =
                         Vec::with_capacity(frame_entries.len());
                     let mut retained_bytes = frames
@@ -6893,5 +6890,13 @@ mod tests {
         assert_eq!(legacy.material_slot(Some(&data), 0), Some(&object_override));
         assert_eq!(legacy.material_slot(Some(&data), 1), None);
         assert_eq!(legacy.material_slot(Some(&data), 2), Some(&data_last));
+    }
+
+    #[test]
+    fn bake_is_not_an_evaluation_purpose() {
+        let bake = json!({"purpose": "bake"});
+        assert!(serde_json::from_value::<crate::eval::EvaluationContext>(bake).is_err());
+        let preview = json!({"purpose": "preview"});
+        assert!(serde_json::from_value::<crate::eval::EvaluationContext>(preview).is_ok());
     }
 }

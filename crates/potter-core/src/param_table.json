@@ -2098,10 +2098,10 @@
                 "type": "boolean"
               },
               "frame_start": {
-                "type": "number"
+                "type": "integer"
               },
               "frame_end": {
-                "type": "number"
+                "type": "integer"
               },
               "use_custom_path": {
                 "type": "boolean"
@@ -2113,10 +2113,33 @@
                 "type": "string"
               }
             },
-            "required": [
-              "storage"
-            ],
             "oneOf": [
+              {
+                "not": {
+                  "anyOf": [
+                    {
+                      "required": [
+                        "storage"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "resource_id"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "frames"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "cache_directory"
+                      ]
+                    }
+                  ]
+                }
+              },
               {
                 "properties": {
                   "storage": {

@@ -207,6 +207,17 @@ pub(crate) fn validate_node_bake_frame(frame: &NodeBakeFrame) -> Result<()> {
     Ok(())
 }
 
+/// Keys of a settings-only bake entry: Blender bake settings with no baked data.
+const NODE_BAKE_SETTINGS_KEYS: [&str; 7] = [
+    "bake_mode",
+    "bake_target",
+    "use_custom_simulation_frame_range",
+    "frame_start",
+    "frame_end",
+    "use_custom_path",
+    "directory",
+];
+
 pub(crate) fn validate_node_bake_config(value: &Value) -> Result<()> {
     let invalid = || {
         PotError::new(
@@ -215,6 +226,16 @@ pub(crate) fn validate_node_bake_config(value: &Value) -> Result<()> {
         )
     };
     let config = value.as_object().ok_or_else(invalid)?;
+    if !config.contains_key("storage") {
+        // A settings-only entry carries no baked data, so it has no payload keys.
+        if config
+            .keys()
+            .any(|key| !NODE_BAKE_SETTINGS_KEYS.contains(&key.as_str()))
+        {
+            return Err(invalid());
+        }
+        return validate_node_bake_settings(value);
+    }
     let allowed = [
         "storage",
         "resource_id",
@@ -307,26 +328,17 @@ pub(crate) fn validate_node_bake_settings(value: &Value) -> Result<()> {
         Some(Value::Bool(value)) => *value,
         _ => return Err(invalid()),
     };
-    let frame_start = config
-        .get("frame_start")
-        .map(|value| {
-            value
-                .as_f64()
-                .filter(|frame| frame.is_finite())
-                .ok_or_else(invalid)
-        })
-        .transpose()?;
-    let frame_end = config
-        .get("frame_end")
-        .map(|value| {
-            value
-                .as_f64()
-                .filter(|frame| frame.is_finite())
-                .ok_or_else(invalid)
-        })
-        .transpose()?;
-    if custom_range && !matches!((frame_start, frame_end), (Some(start), Some(end)) if start <= end)
-    {
+    // Blender frame bounds are ints (rna_modifier.cc:8163-8170). An end before the start is not
+    // clamped by Blender; `fix_frame_range` collapses it to the start frame.
+    for key in ["frame_start", "frame_end"] {
+        if let Some(frame) = config.get(key) {
+            frame
+                .as_i64()
+                .and_then(|frame| i32::try_from(frame).ok())
+                .ok_or_else(invalid)?;
+        }
+    }
+    if custom_range && !(config.contains_key("frame_start") && config.contains_key("frame_end")) {
         return Err(invalid());
     }
     if config
@@ -1887,5 +1899,35 @@ mod tests {
             ErrorCode::SceneInvalid
         );
         assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn settings_only_bake_entries_are_valid_without_payload() {
+        let digest = format!("sha256:{}", "0".repeat(64));
+        let custom_range = json!({
+            "bake_mode": "ANIMATION",
+            "bake_target": "DISK",
+            "use_custom_simulation_frame_range": true,
+            "frame_start": 4,
+            "frame_end": 2,
+            "use_custom_path": false,
+            "directory": ""
+        });
+        assert!(validate_node_bake_config(&custom_range).is_ok());
+        assert!(validate_node_bake_config(&json!({"bake_mode": "STILL"})).is_ok());
+        let packed = json!({"storage": "packed", "resource_id": "bake_a"});
+        assert!(validate_node_bake_config(&packed).is_ok());
+        let with_resource = json!({"bake_mode": "STILL", "resource_id": "bake_a"});
+        assert!(validate_node_bake_config(&with_resource).is_err());
+        let with_frames = json!({"frames": [{"frame": 1.0, "digest": digest}]});
+        assert!(validate_node_bake_config(&with_frames).is_err());
+        let float_start = json!({
+            "use_custom_simulation_frame_range": true,
+            "frame_start": 1.5,
+            "frame_end": 4
+        });
+        assert!(validate_node_bake_config(&float_start).is_err());
+        let missing_end = json!({"use_custom_simulation_frame_range": true, "frame_start": 1});
+        assert!(validate_node_bake_config(&missing_end).is_err());
     }
 }

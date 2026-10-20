@@ -450,8 +450,22 @@ fn run_node_bake(args: BakeArgs) -> Result<(Option<SceneInfo>, Value)> {
         current_frame,
         Some(&bake_settings),
     )?;
-    let bake_target = effective_node_bake_target(modifier, Some(&bake_settings))?;
-    let bake_directory = effective_node_bake_directory(modifier, Some(&bake_settings))?;
+    let requested_bake_target = effective_node_bake_target(modifier, Some(&bake_settings))?;
+    let mut bake_target = requested_bake_target;
+    let mut bake_directory = effective_node_bake_directory(modifier, Some(&bake_settings))?;
+    // Blender `bake_simulation_validate_paths` fills an empty modifier directory with its default
+    // before a DISK bake. Without a location the bake is packed instead
+    // (object_bake_simulation.cc:1005-1009).
+    let mut default_directory = None;
+    if bake_target == "DISK" && bake_directory.is_empty() {
+        match default_modifier_bake_directory(project.path(), &object.name, &modifier.name) {
+            Some(directory) => {
+                bake_directory.clone_from(&directory);
+                default_directory = Some(directory);
+            }
+            None => bake_target = "PACKED",
+        }
+    }
     let selected_view_layer = args
         .context
         .view_layer
@@ -467,7 +481,7 @@ fn run_node_bake(args: BakeArgs) -> Result<(Option<SceneInfo>, Value)> {
             view_layer: selected_view_layer.clone(),
             frame: Some(*frame),
             adaptive_render: None,
-            purpose: EvaluationPurpose::Bake,
+            purpose: EvaluationPurpose::Preview,
         };
         let snapshot = Snapshot::evaluate_with_node_bake_capture(
             doc,
@@ -567,10 +581,17 @@ fn run_node_bake(args: BakeArgs) -> Result<(Option<SceneInfo>, Value)> {
         config
             .entry("bake_target".to_owned())
             .or_insert_with(|| json!("INHERIT"));
+        if bake_target != requested_bake_target {
+            // Packed fallback: the stored target must match the packed storage.
+            config.insert("bake_target".to_owned(), json!(bake_target));
+        }
         if mode == NodeBakeMode::Animation && args.frames.is_some() {
             config.insert("use_custom_simulation_frame_range".to_owned(), json!(true));
-            config.insert("frame_start".to_owned(), json!(frames[0]));
-            config.insert("frame_end".to_owned(), json!(frames[frames.len() - 1]));
+            config.insert("frame_start".to_owned(), json!(whole_frame(frames[0])?));
+            config.insert(
+                "frame_end".to_owned(),
+                json!(whole_frame(frames[frames.len() - 1])?),
+            );
         } else if mode == NodeBakeMode::Animation {
             config
                 .entry("use_custom_simulation_frame_range".to_owned())
@@ -612,6 +633,11 @@ fn run_node_bake(args: BakeArgs) -> Result<(Option<SceneInfo>, Value)> {
                 .ok_or_else(|| {
                     PotError::new(ErrorCode::InternalError, "node-bake modifier disappeared")
                 })?;
+            if let Some(directory) = &default_directory {
+                modifier
+                    .params
+                    .insert("bake_directory".to_owned(), json!(directory));
+            }
             let bakes = modifier
                 .params
                 .entry("bakes".to_owned())
@@ -1133,27 +1159,85 @@ fn node_bake_frames(
             if let Some(range) = range {
                 return parse_frames(Some(range), current_frame);
             }
-            if config
+            // Blender `get_node_bake_frame_range`: the bake's own range, then the scene's custom
+            // simulation range, then the scene frame range.
+            let (start, end) = if config
                 .and_then(|config| config.get("use_custom_simulation_frame_range"))
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
             {
-                let start = config
-                    .and_then(|config| config.get("frame_start"))
-                    .and_then(Value::as_f64)
-                    .unwrap_or(1.0);
-                let end = config
-                    .and_then(|config| config.get("frame_end"))
-                    .and_then(Value::as_f64)
-                    .unwrap_or(100.0);
-                return parse_frames(Some(&format!("{start}:{end}")), current_frame);
-            }
-            parse_frames(
-                Some(&format!("{}:{}", scene.frame_start, scene.frame_end)),
-                current_frame,
-            )
+                (
+                    node_bake_config_frame(config, "frame_start")?,
+                    node_bake_config_frame(config, "frame_end")?,
+                )
+            } else if scene.use_custom_simulation_range {
+                (scene.simulation_frame_start, scene.simulation_frame_end)
+            } else {
+                (scene.frame_start, scene.frame_end)
+            };
+            let (start, end) = fix_frame_range(start, end);
+            parse_frames(Some(&format!("{start}:{end}")), current_frame)
         }
     }
+}
+
+/// Blender `fix_frame_range` (bake_geometry_nodes_modifier.cc): a range that ends before it starts
+/// bakes only its start frame.
+fn fix_frame_range(start: i32, end: i32) -> (i32, i32) {
+    (start, end.max(start))
+}
+
+fn node_bake_config_frame(config: Option<&Value>, key: &str) -> Result<i32> {
+    config
+        .and_then(|config| config.get(key))
+        .and_then(Value::as_i64)
+        .and_then(|frame| i32::try_from(frame).ok())
+        .ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "node-bake frame range is invalid",
+                json!({"key":key}),
+            )
+        })
+}
+
+/// Blender stores bake frame bounds as 32-bit ints (rna_modifier.cc).
+fn whole_frame(frame: f64) -> Result<i32> {
+    match i32::try_from(frame as i64) {
+        Ok(whole) if frame.fract() == 0.0 => Ok(whole),
+        _ => Err(PotError::invalid_argument(
+            "an animation node-bake frame range must use whole frames",
+        )),
+    }
+}
+
+/// Blender `get_default_modifier_bake_directory` (bake_geometry_nodes_modifier.cc). The project
+/// directory stands in for the `.blend` file; `None` when it has no usable file stem.
+fn default_modifier_bake_directory(
+    project_root: &Path,
+    object_name: &str,
+    modifier_name: &str,
+) -> Option<String> {
+    let stem = project_root.file_stem()?.to_str()?;
+    Some(format!(
+        "//blendcache_{stem}/{}_{}",
+        escape_bake_name(object_name),
+        escape_bake_name(modifier_name)
+    ))
+}
+
+/// Blender `escape_name`: ASCII letters are kept and every other UTF-8 byte is written as its
+/// signed decimal value.
+fn escape_bake_name(name: &str) -> String {
+    name.bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphabetic() {
+                char::from(byte).to_string()
+            } else {
+                i8::from_ne_bytes([byte]).to_string()
+            }
+        })
+        .collect()
 }
 
 fn effective_node_bake_target(
@@ -1376,6 +1460,15 @@ fn remove_unreferenced_node_bake_resource(doc: &mut SceneDoc, config: Option<&Va
     }
 }
 
+/// The settings that survive a payload delete (Blender `try_delete_bake` keeps the bake settings).
+fn node_bake_settings_only(config: &Value) -> Value {
+    let mut settings = config.as_object().cloned().unwrap_or_default();
+    for key in ["storage", "resource_id", "frames", "cache_directory"] {
+        settings.remove(key);
+    }
+    Value::Object(settings)
+}
+
 fn delete_node_bake(
     project: &mut Project,
     target: &Id,
@@ -1399,34 +1492,34 @@ fn delete_node_bake(
                 json!({"target":target,"modifier":modifier_id}),
             )
         })?;
-    let (removed, remove_map) = {
-        let Some(bakes) = modifier.params.get_mut("bakes") else {
-            let scene = project.info()?;
-            return Ok((
-                Some(scene),
-                json!({"kind":"node-bake","action":"delete","target":target,"modifier":modifier_id,"node":node_id,"scene_modified":false}),
-            ));
-        };
-        let bakes = bakes.as_object_mut().ok_or_else(|| {
-            PotError::new(
-                ErrorCode::SceneInvalid,
-                "node-bake settings must be an object",
-            )
-        })?;
-        let removed = bakes.remove(node_id.as_str());
-        (removed, bakes.is_empty())
+    // Blender `try_delete_bake` clears only the payload and keeps the NodesModifierBake settings.
+    let payload = match modifier.params.get_mut("bakes") {
+        None => None,
+        Some(bakes) => {
+            let bakes = bakes.as_object_mut().ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::SceneInvalid,
+                    "node-bake settings must be an object",
+                )
+            })?;
+            let payload = bakes
+                .get(node_id.as_str())
+                .filter(|config| config.get("storage").is_some())
+                .cloned();
+            if let Some(config) = &payload {
+                bakes.insert(node_id.to_string(), node_bake_settings_only(config));
+            }
+            payload
+        }
     };
-    if removed.is_none() {
+    let Some(payload) = payload else {
         let scene = project.info()?;
         return Ok((
             Some(scene),
             json!({"kind":"node-bake","action":"delete","target":target,"modifier":modifier_id,"node":node_id,"scene_modified":false}),
         ));
-    }
-    if remove_map {
-        modifier.params.remove("bakes");
-    }
-    remove_unreferenced_node_bake_resource(&mut candidate, removed.as_ref());
+    };
+    remove_unreferenced_node_bake_resource(&mut candidate, Some(&payload));
     candidate.validate()?;
 
     let mut transaction = NodeBakePayloadTransaction::new(project.path())?;
@@ -1436,7 +1529,7 @@ fn delete_node_bake(
         target,
         modifier_id,
         node_id,
-        removed.as_ref(),
+        Some(&payload),
         None,
     ) {
         return abort_node_bake_transaction(transaction, error);
@@ -1495,10 +1588,10 @@ fn stage_delete_node_bake_payloads(
         return Ok(());
     };
     crate::graph::validate_node_bake_config(config)?;
-    let storage = config
-        .get("storage")
-        .and_then(Value::as_str)
-        .ok_or_else(|| PotError::new(ErrorCode::SceneInvalid, "node-bake storage is missing"))?;
+    // A settings-only entry has no payload to delete.
+    let Some(storage) = config.get("storage").and_then(Value::as_str) else {
+        return Ok(());
+    };
     if !matches!(storage, "disk" | "packed") {
         return Ok(());
     }
@@ -1867,5 +1960,107 @@ fn remove_path(path: &Path) -> Result<()> {
         fs::remove_dir_all(path).map_err(|error| PotError::io(&error))
     } else {
         fs::remove_file(path).map_err(|error| PotError::io(&error))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use serde_json::{Value, json};
+
+    use super::{
+        default_modifier_bake_directory, escape_bake_name, fix_frame_range, node_bake_frames,
+        whole_frame,
+    };
+    use crate::{
+        cli::NodeBakeMode,
+        error::{ErrorCode, PotError, Result},
+        model::{Scene, SceneDoc},
+    };
+
+    fn scene_doc(edit: impl FnOnce(&mut Scene)) -> Result<SceneDoc> {
+        let mut doc = SceneDoc::new(String::new());
+        let active = doc.active_scene.clone();
+        let scene = doc
+            .scenes
+            .get_mut(&active)
+            .ok_or_else(|| PotError::new(ErrorCode::InternalError, "active scene is missing"))?;
+        edit(scene);
+        Ok(doc)
+    }
+
+    fn animation_frames(doc: &SceneDoc, config: Option<&Value>) -> Result<Vec<f64>> {
+        let scene = doc
+            .scenes
+            .get(&doc.active_scene)
+            .ok_or_else(|| PotError::new(ErrorCode::InternalError, "active scene is missing"))?;
+        node_bake_frames(None, NodeBakeMode::Animation, scene, 1.0, config)
+    }
+
+    #[test]
+    fn animation_range_ending_before_its_start_bakes_only_the_start_frame() -> Result<()> {
+        assert_eq!(fix_frame_range(10, 3), (10, 10));
+        assert_eq!(fix_frame_range(2, 5), (2, 5));
+        let doc = scene_doc(|scene| {
+            scene.frame_start = 10;
+            scene.frame_end = 3;
+        })?;
+        assert_eq!(animation_frames(&doc, None)?, vec![10.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn animation_range_prefers_bake_then_simulation_then_scene_range() -> Result<()> {
+        let custom_bake = json!({
+            "use_custom_simulation_frame_range": true,
+            "frame_start": 2,
+            "frame_end": 4
+        });
+        let doc = scene_doc(|scene| {
+            scene.frame_start = 1;
+            scene.frame_end = 10;
+            scene.use_custom_simulation_range = true;
+            scene.simulation_frame_start = 5;
+            scene.simulation_frame_end = 7;
+        })?;
+        assert_eq!(
+            animation_frames(&doc, Some(&custom_bake))?,
+            vec![2.0, 3.0, 4.0]
+        );
+        assert_eq!(animation_frames(&doc, None)?, vec![5.0, 6.0, 7.0]);
+        let doc = scene_doc(|scene| {
+            scene.frame_start = 1;
+            scene.frame_end = 3;
+        })?;
+        assert_eq!(animation_frames(&doc, None)?, vec![1.0, 2.0, 3.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn default_bake_directory_uses_blender_escaped_names() -> Result<()> {
+        assert_eq!(escape_bake_name("Cube"), "Cube");
+        assert_eq!(escape_bake_name("Cube.001"), "Cube46484849");
+        assert_eq!(escape_bake_name("\u{e9}"), "-61-87");
+        assert_eq!(
+            default_modifier_bake_directory(
+                Path::new("/projects/shot_a"),
+                "Cube",
+                "Geometry Nodes",
+            ),
+            Some("//blendcache_shot_a/Cube_Geometry32Nodes".to_owned())
+        );
+        assert_eq!(
+            default_modifier_bake_directory(Path::new("/"), "Cube", "Nodes"),
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn animation_frame_bounds_must_be_whole_frames() {
+        assert_eq!(whole_frame(4.0).ok(), Some(4));
+        assert!(whole_frame(1.5).is_err());
+        assert!(whole_frame(1e12).is_err());
     }
 }

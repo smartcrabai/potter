@@ -381,6 +381,8 @@ def modifier_params(modifier):
     )
     if modifier.type == "PARTICLE_INSTANCE":
         omitted += ("particle_system",)
+    if modifier.type == "NODES":
+        omitted += ("bakes",)
     if modifier.type in ("VERTEX_WEIGHT_EDIT", "VERTEX_WEIGHT_PROXIMITY"):
         omitted += ("map_curve",)
     params = rna_props(modifier, omitted)
@@ -1317,6 +1319,68 @@ def _modifier_node_inputs(modifier):
     return result
 
 
+# Settings Potter keeps on a Geometry Nodes bake entry. The payload (storage, resource_id, frames) is Potter's own
+# store and is never written to Blender.
+NODES_BAKE_SETTINGS = (
+    "bake_mode", "bake_target", "use_custom_path", "directory",
+    "use_custom_simulation_frame_range", "frame_start", "frame_end",
+)
+
+
+def _nodes_bake_potter_id(bake):
+    potter_id = bake.node.get("potter.id") if bake.node is not None else None
+    return potter_id if isinstance(potter_id, str) else None
+
+
+def _nodes_bakes_dump(modifier):
+    """Settings of every Blender bake entry keyed by the Potter id of its bake node, and the facts Potter cannot keep."""
+    bakes = {}
+    data_blocks = []
+    unmapped = []
+    for bake in modifier.bakes:
+        potter_id = _nodes_bake_potter_id(bake)
+        if potter_id is None:
+            unmapped.append(bake.node.name if bake.node is not None else "bake %d" % bake.bake_id)
+            continue
+        bakes[potter_id] = {
+            "bake_mode": bake.bake_mode,
+            "bake_target": bake.bake_target,
+            "use_custom_path": bool(bake.use_custom_path),
+            "directory": bake.directory,
+            "use_custom_simulation_frame_range": bool(bake.use_custom_simulation_frame_range),
+            "frame_start": int(bake.frame_start),
+            "frame_end": int(bake.frame_end),
+        }
+        if len(bake.data_blocks):
+            data_blocks.append(potter_id)
+    return bakes, {"data_blocks": data_blocks, "unmapped": unmapped}
+
+
+def _apply_nodes_bakes(modifier, bakes):
+    """Writes Potter's settings onto the bake entries of the assigned node group.
+
+    Blender creates one entry per bake node as soon as the node group is assigned, and keeps it when the tree changes.
+    A key that matches no bake node is the exporter's nodes_bake_unmapped loss and is not written."""
+    entries = {}
+    for bake in modifier.bakes:
+        potter_id = _nodes_bake_potter_id(bake)
+        if potter_id is not None:
+            entries[potter_id] = bake
+    for potter_id, settings in bakes.items():
+        bake = entries.get(potter_id)
+        if bake is None:
+            continue
+        for key in NODES_BAKE_SETTINGS:
+            if key not in settings:
+                continue
+            value = settings[key]
+            if key in ("frame_start", "frame_end"):
+                value = int(value)
+            elif key in ("use_custom_path", "use_custom_simulation_frame_range"):
+                value = bool(value)
+            setattr(bake, key, value)
+
+
 def _uv_layer_index(layers, attribute):
     index = getattr(layers, attribute, None)
     if index is None or not 0 <= index < len(layers):
@@ -1581,9 +1645,11 @@ def object_dump(obj):
     modifiers = []
     for modifier in obj.modifiers:
         properties = modifier_params(modifier)
+        bake_losses = None
         if modifier.type == "NODES":
             properties["node_group"] = modifier.node_group.name_full if modifier.node_group else None
             properties["inputs"] = _modifier_node_inputs(modifier)
+            properties["bakes"], bake_losses = _nodes_bakes_dump(modifier)
         if modifier.type == "MESH_SEQUENCE_CACHE":
             cache_file = getattr(modifier, "cache_file", None)
             properties["cache_filepath"] = (
@@ -1607,16 +1673,19 @@ def object_dump(obj):
             metadata = {"id": metadata, "name": modifier.name}
         if not isinstance(metadata, dict):
             metadata = {}
-        modifiers.append({"name": metadata.get("name", modifier.name),
-                          "blender_name": modifier.name, "type": modifier.type,
-                          "potter_id": metadata.get("id"),
-                          "enabled": True,  # Blender has no global switch; always on.
-                          "show_viewport": bool(modifier.show_viewport),
-                          "show_render": bool(modifier.show_render),
-                          "properties": properties,
-                          "native_target_mesh": native_target_mesh,
-                          "physics_settings": _physics_modifier_settings(obj, modifier),
-                          "custom_properties": custom_props(modifier)})
+        record = {"name": metadata.get("name", modifier.name),
+                  "blender_name": modifier.name, "type": modifier.type,
+                  "potter_id": metadata.get("id"),
+                  "enabled": True,  # Blender has no global switch; always on.
+                  "show_viewport": bool(modifier.show_viewport),
+                  "show_render": bool(modifier.show_render),
+                  "properties": properties,
+                  "native_target_mesh": native_target_mesh,
+                  "physics_settings": _physics_modifier_settings(obj, modifier),
+                  "custom_properties": custom_props(modifier)}
+        if bake_losses is not None:
+            record["bake_losses"] = bake_losses
+        modifiers.append(record)
     inverse_map = _object_solver_inverse_map(obj).get("objects", {})
     constraints = [
         _constraint_dump(constraint, inverse_map.get(constraint.name))
@@ -2118,6 +2187,9 @@ def dump_scene(scene):
     return {"name": scene.name_full, "potter_id": scene.get("potter.id"),
             "frame_current": float(scene.frame_current) + float(getattr(scene, "frame_subframe", 0.0)),
             "frame_start": int(scene.frame_start), "frame_end": int(scene.frame_end), "fps": int(scene.render.fps),
+            "use_custom_simulation_range": bool(scene.use_custom_simulation_range),
+            "simulation_frame_start": int(scene.simulation_frame_start),
+            "simulation_frame_end": int(scene.simulation_frame_end),
             "fps_base": float(scene.render.fps_base), "camera": camera,
             "active_clip": (scene.active_clip.name_full
                             if getattr(scene, "active_clip", None) else None),
@@ -2989,7 +3061,7 @@ def set_modifier_params(modifier, item, id_lookup, doc, target, node_id, obj, pa
         dynamic_paint_temporary_link = _ensure_dynamic_paint_role(
             modifier, obj, settings["role"])
     rna_params = dict(params)
-    for parameter in ("projectors", "resource", "is_bound", "cache_filepath", "map_curve"):
+    for parameter in ("projectors", "resource", "is_bound", "cache_filepath", "map_curve", "bakes"):
         rna_params.pop(parameter, None)
     if kind == "multires":
         for parameter in (
@@ -6423,6 +6495,9 @@ def export_doc(doc, target, pack, scene_hash, context):
         set_scene_frame(scene, item["frame_current"])
         scene.frame_start = item["frame_start"]
         scene.frame_end = item["frame_end"]
+        scene.use_custom_simulation_range = item["use_custom_simulation_range"]
+        scene.simulation_frame_start = item["simulation_frame_start"]
+        scene.simulation_frame_end = item["simulation_frame_end"]
         for marker in source.get("markers", []):
             scene.timeline_markers.new(marker["name"], frame=int(marker["frame"]))
         scene.render.fps = item["fps"]
@@ -7132,6 +7207,7 @@ def export_doc(doc, target, pack, scene_hash, context):
                             modifier[target_id] = _resolve_compat_value(value, id_lookup)
                         except Exception as error:
                             raise ValueError("cannot restore Geometry Nodes modifier input %s" % socket_id) from error
+                    _apply_nodes_bakes(modifier, model_params.get("bakes", {}))
                 set_props(modifier, source_modifier.get("custom_properties", {}))
             except Exception as error:
                 raise RuntimeError(

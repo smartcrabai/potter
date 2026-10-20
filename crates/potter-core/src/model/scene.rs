@@ -95,6 +95,9 @@ impl SceneDoc {
                 frame_current: 1.0,
                 frame_start: 1,
                 frame_end: 250,
+                use_custom_simulation_range: false,
+                simulation_frame_start: 1,
+                simulation_frame_end: 250,
                 fps: 24,
                 fps_base: 1.0,
                 sequencer: Sequencer::default(),
@@ -595,6 +598,14 @@ pub struct Scene {
     pub frame_current: f64,
     pub frame_start: i32,
     pub frame_end: i32,
+    /// Blender `SCE_CUSTOM_SIMULATION_RANGE`: bakes without their own range use
+    /// `simulation_frame_start..=simulation_frame_end` instead of the scene frame range.
+    #[serde(default)]
+    pub use_custom_simulation_range: bool,
+    #[serde(default = "default_simulation_frame_start")]
+    pub simulation_frame_start: i32,
+    #[serde(default = "default_simulation_frame_end")]
+    pub simulation_frame_end: i32,
     pub fps: u32,
     pub fps_base: f64,
     pub camera: Option<Id>,
@@ -1650,7 +1661,6 @@ impl Modifier {
             && match purpose {
                 crate::eval::EvaluationPurpose::Preview => self.show_viewport,
                 crate::eval::EvaluationPurpose::Render => self.show_render,
-                crate::eval::EvaluationPurpose::Bake => self.show_viewport,
             }
     }
 
@@ -2111,6 +2121,14 @@ fn matrix_basis_fingerprint_matches(fingerprint: &str, digest: &[u8; 32]) -> boo
 
 fn default_true() -> bool {
     true
+}
+
+fn default_simulation_frame_start() -> i32 {
+    1
+}
+
+fn default_simulation_frame_end() -> i32 {
+    250
 }
 
 #[expect(

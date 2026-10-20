@@ -1270,6 +1270,10 @@ fn deleting_packed_disk_node_bake_cleans_payloads_and_uses_live_geometry()
     assert_eq!(deleted["result"]["scene_modified"], true);
     let deleted_scene = document(&project)?;
     assert!(deleted_scene["resources"].get(&resource_id).is_none());
+    let settings = &deleted_scene["nodes"]["body"]["modifiers"][0]["params"]["bakes"]["bake"];
+    assert!(settings.get("storage").is_none());
+    assert!(settings.get("resource_id").is_none());
+    assert_eq!(settings["bake_target"], "PACKED");
     assert!(files_below(&cache_directory)?.is_empty());
     assert!(disk_files.iter().all(|path| !path.exists()));
     assert_dimensions(&inspect(&project, 1.0)?, [4.0, 4.0, 4.0])?;
