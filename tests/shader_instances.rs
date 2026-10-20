@@ -509,7 +509,10 @@ fn material_texture_refs_sample_uv_and_override_pbr_fields_for_graphs() {
         .with_uv_layers(layers);
     context.uv = [0.25, 0.5];
     let simple = evaluate_surface(&material, &context).unwrap();
-    assert_eq!(simple.base_color, [0.0, 0.25, 0.0, 1.0]);
+    // The sampled texel is (0, 1, 0) at alpha 0.5. A non-opaque material links the texture's Alpha output, so Cycles
+    // unassociates the colour: it divides by alpha (`intern/cycles/kernel/svm/image.h`, NODE_IMAGE_ALPHA_UNASSOCIATE),
+    // giving green 2.0, and the factor 0.25 makes 0.5. The Base Color is not clamped before the BSDF.
+    assert_eq!(simple.base_color, [0.0, 0.5, 0.0, 1.0]);
     assert_eq!(simple.alpha, 0.5);
     assert_eq!(simple.roughness, 0.2);
     assert_eq!(simple.metallic, 0.2);
@@ -540,6 +543,8 @@ fn material_texture_refs_sample_uv_and_override_pbr_fields_for_graphs() {
     material.base_color_texture.as_mut().unwrap().uv_layer = Some("UVMap".to_owned());
     let opaque = evaluate_surface(&material, &context).unwrap();
     assert_eq!(opaque.alpha, 1.0);
+    // Unlinked, the colour is the stored texel (0, 1, 0), so the factor 0.25 gives 0.25.
+    assert_eq!(opaque.base_color, [0.0, 0.25, 0.0, 1.0]);
 }
 
 fn uv_map_material(layer: &str) -> (Material, Registry<NodeGroup>) {
