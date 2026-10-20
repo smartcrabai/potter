@@ -565,14 +565,10 @@ fn profile_fracs(profile: &Profile, ns: usize) -> Vec<f64> {
 }
 
 /// Blender's single-precision `==` (`bmesh_bevel.cc` `interp_range`: `rest == 0` at line 4573 and
-/// `*r_rest == 1.0f` at line 4580). Both operands are compared exactly, as C compares floats: a
-/// fraction that is not bit-equal to 0 or 1 stays a fraction, so the test is intentionally exact.
-#[expect(
-    clippy::float_cmp,
-    reason = "Blender's interp_range compares its fraction with exact == (bmesh_bevel.cc:4573, 4580)"
-)]
+/// `*r_rest == 1.0f` at line 4580). `partial_cmp` gives C's `==` on `float`: +0 and -0 are equal,
+/// and NaN is unequal to everything.
 fn is_exactly(value: f32, target: f32) -> bool {
-    value == target
+    value.partial_cmp(&target) == Some(std::cmp::Ordering::Equal)
 }
 
 /// Blender's `interp_range`: the `i` with `frac[i] <= f <= frac[i + 1]`, and the fraction of the
