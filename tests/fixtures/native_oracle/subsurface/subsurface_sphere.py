@@ -37,12 +37,15 @@ POINT_POWER = 120.0
 DISK_LOCATION = Vector((2.5, -2.5, 3.5))
 DISK_SIZE = 1.5
 DISK_POWER = 300.0
+# (name, subsurface method, subsurface weight, max_bounces). `burley_bounce0` is the Burley sphere with a zero budget:
+# Cycles still enters the surface and shades its exit (the extra vertex beyond the budget), so the result is not black.
 CASES = [
-    ("burley", "BURLEY", 1.0),
-    ("random_walk", "RANDOM_WALK", 1.0),
-    ("random_walk_skin", "RANDOM_WALK_SKIN", 1.0),
-    ("random_walk_legacy", "RANDOM_WALK_LEGACY", 1.0),
-    ("no_subsurface", "RANDOM_WALK", 0.0),
+    ("burley", "BURLEY", 1.0, MAX_BOUNCES),
+    ("burley_bounce0", "BURLEY", 1.0, 0),
+    ("random_walk", "RANDOM_WALK", 1.0, MAX_BOUNCES),
+    ("random_walk_skin", "RANDOM_WALK_SKIN", 1.0, MAX_BOUNCES),
+    ("random_walk_legacy", "RANDOM_WALK_LEGACY", 1.0, MAX_BOUNCES),
+    ("no_subsurface", "RANDOM_WALK", 0.0, MAX_BOUNCES),
 ]
 
 
@@ -139,16 +142,22 @@ def frame_mean(path):
 
 
 results = {}
-for name, method, weight in CASES:
+for name, method, weight, budget in CASES:
     shader.subsurface_method = method
     shader.inputs["Subsurface Weight"].default_value = weight
+    scene.cycles.max_bounces = budget
     seed_means = []
     for seed in SEEDS:
         scene.cycles.seed = seed
         scene.render.filepath = os.path.join(work, f"{name}_seed_{seed}.exr")
         bpy.ops.render.render(write_still=True)
         seed_means.append(frame_mean(scene.render.filepath))
-    results[name] = {"method": method, "subsurface_weight": weight, "seed_means": seed_means}
+    results[name] = {
+        "method": method,
+        "subsurface_weight": weight,
+        "max_bounces": budget,
+        "seed_means": seed_means,
+    }
     print("CASE", name, flush=True)
 
 with open(json_out, "w") as handle:

@@ -46,8 +46,6 @@ const SEEDS: u32 = 8;
 const RESOLUTION: u32 = 16;
 /// Potter's samples per pixel. Blender renders at 256 (see `subsurface_sphere.py`).
 const SAMPLES: u32 = 64;
-/// Blender's `max_bounces` for the sphere (see `subsurface_sphere.py`).
-const MAX_BOUNCES: u32 = 8;
 /// The two-sided 99.9% Student t quantile at 7 degrees of freedom (see the module docs).
 const T_QUANTILE: f64 = 5.408;
 
@@ -80,6 +78,19 @@ fn blender_channels(case: &Value) -> TestResult<[Vec<f64>; 3]> {
 
 #[test]
 fn burley_subsurface_sphere_matches_cycles() -> TestResult {
+    matches_cycles("burley")
+}
+
+/// The Burley sphere with a zero bounce budget: Cycles still enters the surface and shades the exit, so the result
+/// matches the full-budget render, and Potter must not cut the entry at the budget.
+#[test]
+fn burley_bounce0_subsurface_sphere_matches_cycles() -> TestResult {
+    matches_cycles("burley_bounce0")
+}
+
+/// Renders the sphere of `case` (a case of `subsurface_sphere.py`) in Blender and in Potter at the case's bounce
+/// budget, and compares the channel means of the seeds with the tolerance of the module docs.
+fn matches_cycles(case: &str) -> TestResult {
     let Some(blender) = blender_checked::blender_executable() else {
         return Ok(());
     };
@@ -87,10 +98,15 @@ fn burley_subsurface_sphere_matches_cycles() -> TestResult {
     let script = write_script(root.path(), "subsurface_sphere.py", SCRIPT)?;
     let blend = root.path().join("scene.blend");
     let json_path = root.path().join("blender.json");
-    let arguments: [&Path; 3] = [&blend, &json_path, Path::new("burley")];
+    let arguments: [&Path; 3] = [&blend, &json_path, Path::new(case)];
     run_blender_arguments(&blender, &script, None, &arguments)?;
     let expected: Value = serde_json::from_slice(&fs::read(&json_path)?)?;
-    let wanted = blender_channels(&expected["cases"]["burley"])?;
+    let wanted = blender_channels(&expected["cases"][case])?;
+    let budget = u32::try_from(
+        expected["cases"][case]["max_bounces"]
+            .as_u64()
+            .ok_or("the Blender case has no max_bounces")?,
+    )?;
 
     let (project_path, _) = import_blend(&blender, root.path(), "project", &blend)?;
     let project = Project::open(&project_path)?;
@@ -105,7 +121,7 @@ fn burley_subsurface_sphere_matches_cycles() -> TestResult {
         scene.render.resolution_y = RESOLUTION;
         scene.render.resolution_percentage = 100;
         scene.render.samples = SAMPLES;
-        scene.render.max_bounces = MAX_BOUNCES;
+        scene.render.max_bounces = budget;
         (
             scene.camera.clone(),
             scene.frame_current,

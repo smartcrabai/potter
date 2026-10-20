@@ -19,8 +19,8 @@ use super::principled_bsdf::{
     make_orthonormals, sample_glass, subsurface_closure_weight,
 };
 use super::subsurface::{
-    MAX_HITS, ProbeHits, burley_radius, channel_mask, eval as burley_eval, exit_params, pdf_mean,
-    pick_channel, sample_radius,
+    MAX_HITS, ProbeHits, burley_active, burley_radius, channel_mask, eval as burley_eval,
+    exit_params, pdf_mean, pick_channel, sample_radius,
 };
 use super::{
     bvh::{Bvh, BvhHit},
@@ -1036,7 +1036,10 @@ fn trace_path(
                 rng,
                 evaluator_workspace,
             )?;
-        if bounce == max_bounces {
+        // Cycles schedules the next segment with the budget flag set, and that segment's vertex still gets its direct
+        // light before the path ends. A Burley entry at the last bounce is sampled, and its exit is that extra vertex;
+        // any other scatter at the budget ends the path (`shade_surface.h`, `PATH_RAY_TERMINATE_AFTER_TRANSPARENT`).
+        if bounce > max_bounces || (bounce == max_bounces && !burley_active(&surface.params)) {
             break;
         }
         let sampled = sample_bsdf(
@@ -1061,6 +1064,9 @@ fn trace_path(
             exit_pending = true;
             previous = Scatter::Camera;
             continue;
+        }
+        if bounce >= max_bounces {
+            break;
         }
         let (next_direction, weight) = match sampled {
             BsdfSample::Continuous {
