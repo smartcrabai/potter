@@ -77,7 +77,7 @@ impl PointLight {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct VolumeInstance<'a> {
     volume: &'a VolumeData,
     world_to_local: DMat4,
@@ -87,8 +87,8 @@ struct VolumeInstance<'a> {
     meters_per_unit: f64,
     density_range: Option<(f64, f64)>,
     albedo: DVec3,
-    /// The instance's one phase, a single-closure list.
-    phase: PhaseClosure,
+    /// The volume closures' phases, one per scattering closure (`Medium::phases`), sampled per event.
+    phases: Vec<PhaseClosure>,
     emission: DVec3,
     scattering: bool,
     /// Channel-mean σt per unit grid density (absolute, as `BsdfParams`'s coefficients).
@@ -99,7 +99,8 @@ struct VolumeInstance<'a> {
 struct VolumeEvent {
     point: DVec3,
     albedo: DVec3,
-    phase: PhaseClosure,
+    /// Index of the instance the event is in, into the `volumes` slice: its phases are sampled at the event.
+    instance: usize,
 }
 
 struct VolumeSegment {
@@ -331,16 +332,6 @@ struct PhaseClosure {
     anisotropy: f64,
 }
 
-impl PhaseClosure {
-    /// The one phase of an instance medium: a single-closure list, so picking it takes no draw.
-    fn single(anisotropy: f64) -> Self {
-        Self {
-            weight: 1.0,
-            anisotropy,
-        }
-    }
-}
-
 /// Cycles' `volume_shader_phase_pick` (`intern/cycles/kernel/integrator/volume_shader.h:161-187`): a scatter event picks
 /// one closure with probability `weight_i / Σ weight`, then samples that closure's own phase. A single closure is picked
 /// without a draw, as Cycles does.
@@ -412,15 +403,6 @@ impl Medium {
     /// The medium's phase at `cosine` for the in-scatter against the environment (`phase_eval` over its closures).
     fn phase(&self, cosine: f64) -> f64 {
         phase_eval(&self.phases, cosine)
-    }
-
-    /// The anisotropy of the heaviest scattering closure. A voxel instance keeps one phase, so it takes this one:
-    /// its voxel transport is scalar, and this is its single-phase approximation.
-    fn dominant_anisotropy(&self) -> Option<f64> {
-        self.phases
-            .iter()
-            .max_by(|first, second| first.weight.total_cmp(&second.weight))
-            .map(|phase| phase.anisotropy)
     }
 
     /// Whether the medium scatters or absorbs light, so a path crossing its boundary takes a segment through it.
@@ -1117,10 +1099,7 @@ fn realtime_volume_integral(
                         Some(rng),
                         16,
                     )?;
-                    let phase = phase_eval(
-                        std::slice::from_ref(&instance.phase),
-                        direction.dot(sample.direction),
-                    );
+                    let phase = phase_eval(&instance.phases, direction.dot(sample.direction));
                     source += instance.albedo
                         * sample.radiance
                         * (scattering_coefficient * phase * visibility);
@@ -1239,7 +1218,7 @@ fn trace_path(
                 break;
             }
             // Cycles picks one phase closure by its scatter weight, then samples that closure's own Henyey-Greenstein lobe.
-            let Some(phase) = pick_phase(std::slice::from_ref(&event.phase), rng) else {
+            let Some(phase) = pick_phase(&volumes[event.instance].phases, rng) else {
                 break;
             };
             direction = sample_henyey_greenstein_direction(direction, phase.anisotropy, rng);
@@ -2050,7 +2029,7 @@ fn direct_volume_lighting(
             evaluator_workspace,
         )?;
         let phase = phase_eval(
-            std::slice::from_ref(&event.phase),
+            &volumes[event.instance].phases,
             incoming_direction.dot(sample.direction),
         );
         contribution += sample.radiance * (phase * visibility * VOLUME_DIRECT_LIGHT_SCALE);
@@ -2078,7 +2057,7 @@ fn direct_volume_lighting(
             evaluator_workspace,
         )?;
         let phase = phase_eval(
-            std::slice::from_ref(&event.phase),
+            &volumes[event.instance].phases,
             incoming_direction.dot(direction),
         );
         contribution += incoming * (phase * visibility * 0.5 / pdf);
@@ -2879,12 +2858,7 @@ fn collect_volumes<'a>(
             meters_per_unit,
             density_range,
             albedo,
-            phase: PhaseClosure::single(
-                medium
-                    .as_ref()
-                    .and_then(|medium| medium.dominant_anisotropy())
-                    .unwrap_or(0.0),
-            ),
+            phases: medium.map_or_else(Vec::new, |medium| medium.phases),
             emission,
             scattering,
             extinction_scale,
@@ -3024,28 +2998,29 @@ fn trace_volume_segment(
             let selected = rng.next_f64() * extinction;
             let mut weight = 0.0;
             let mut chosen = None;
-            for instance in volumes {
+            for (index, instance) in volumes.iter().enumerate() {
                 let density = volume_density_at(instance, point)?;
                 weight += volume_extinction_density(instance, density);
                 if selected <= weight {
-                    chosen = Some(instance);
+                    chosen = Some((index, instance));
                     break;
                 }
             }
+            // The fallback event has zero albedo, so the path ends before any phase lookup reads its index.
             let event = chosen.map_or(
                 VolumeEvent {
                     point: event_point,
                     albedo: DVec3::ZERO,
-                    phase: PhaseClosure::single(0.0),
+                    instance: 0,
                 },
-                |instance| VolumeEvent {
+                |(index, instance)| VolumeEvent {
                     point: event_point,
                     albedo: if instance.scattering {
                         instance.albedo
                     } else {
                         DVec3::ZERO
                     },
-                    phase: instance.phase,
+                    instance: index,
                 },
             );
             return Ok(VolumeSegment {
@@ -3394,7 +3369,7 @@ mod volume_extinction_tests {
             meters_per_unit: 0.5,
             density_range: Some((1.0, 1.0)),
             albedo: DVec3::ZERO,
-            phase: PhaseClosure::single(0.0),
+            phases: Vec::new(),
             emission: DVec3::ZERO,
             scattering: false,
             extinction_scale: 1.0,
