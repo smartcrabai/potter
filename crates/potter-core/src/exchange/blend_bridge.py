@@ -5226,12 +5226,13 @@ def _restore_pose(obj, pose, id_lookup, doc, target):
         if bone.rotation_mode == "QUATERNION":
             bone.rotation_quaternion = rotation
         elif bone.rotation_mode == "AXIS_ANGLE":
-            angle, axis = Quaternion((rotation[0], rotation[1], rotation[2], rotation[3])).to_axis_angle()
+            axis, angle = Quaternion((rotation[0], rotation[1], rotation[2], rotation[3])).to_axis_angle()
             bone.rotation_axis_angle = (angle, axis.x, axis.y, axis.z)
         else:
             bone.rotation_euler = Quaternion(
                 (rotation[0], rotation[1], rotation[2], rotation[3])).to_euler(
                     bone.rotation_mode)
+        bone.location = item.get("location", (0.0, 0.0, 0.0))
         bone.scale = item.get("scale", (1.0, 1.0, 1.0))
         bone.bbone_curveinx = item.get("bbone_curveinx", 0.0)
         bone.bbone_curveinz = item.get("bbone_curveinz", 0.0)

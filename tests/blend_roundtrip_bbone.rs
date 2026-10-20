@@ -98,7 +98,7 @@ elif case == "armature_modifier":
     if mode not in (
         "curved_linear", "curved_preserve_volume", "straight_linear", "curved_envelopes",
         "straight_preserve_volume",
-        "curved_envelope_multiply",
+        "curved_envelope_multiply", "curved_zyx", "curved_axis_angle",
     ):
         raise ValueError("unknown B-Bone deformation mode: " + mode)
     bone.bbone_mapping_mode = (
@@ -123,6 +123,13 @@ elif case == "armature_modifier":
     bendy_pose.location = (0.07, 0.11, -0.05)
     bendy_pose.scale = (1.08, 0.93, 1.12)
     bendy_pose.bbone_rollin = 0.27
+    if mode == "curved_zyx":
+        bendy_pose.rotation_mode = "ZYX"
+    elif mode == "curved_axis_angle":
+        from mathutils import Euler
+        bendy_pose.rotation_mode = "AXIS_ANGLE"
+        axis, angle = Euler((0.19, -0.23, 0.14), "XYZ").to_quaternion().to_axis_angle()
+        bendy_pose.rotation_axis_angle = (angle, axis.x, axis.y, axis.z)
     start_handle_pose = rig.pose.bones["StartHandle"]
     start_handle_pose.rotation_mode = "XYZ"
     start_handle_pose.rotation_euler = (0.12, -0.18, 0.09)
@@ -165,8 +172,13 @@ elif case == "armature_modifier":
     positions = [[float(vertex.co.x), float(vertex.co.y), float(vertex.co.z)]
                  for vertex in evaluated_mesh.vertices]
     evaluated.to_mesh_clear()
+    pose_basis = {}
+    for name in ("Root", "Bendy", "StartHandle", "EndHandle"):
+        pose_bone = rig.pose.bones[name]
+        pose_basis[name] = {"rotation_mode": pose_bone.rotation_mode,
+                            "matrix_basis": [list(row) for row in pose_bone.matrix_basis]}
     with open(os.path.join(root, "blender_geometry.json"), "w", encoding="utf-8") as handle:
-        json.dump({"input_positions": vertices, "positions": positions}, handle)
+        json.dump({"input_positions": vertices, "positions": positions, "pose": pose_basis}, handle)
 elif case == "armature_constraint":
     owner = bpy.data.objects.new("CaseOwner", None)
     scene.collection.objects.link(owner)
@@ -232,6 +244,11 @@ if case == "target_shape":
         "target": constraint.target.name if constraint.target else None,
         "subtarget": constraint.subtarget,
     }
+result["pose"] = {}
+for name in ("Root", "Bendy", "StartHandle", "EndHandle"):
+    pose_bone = rig.pose.bones[name]
+    result["pose"][name] = {"rotation_mode": pose_bone.rotation_mode,
+                            "matrix_basis": [list(row) for row in pose_bone.matrix_basis]}
 with open(output_path, "w", encoding="utf-8") as handle:
     json.dump(result, handle)
 "#;
@@ -291,6 +308,40 @@ fn assert_json_approximately_equal(actual: &Value, expected: &Value, context: &s
         _ => assert_eq!(actual, expected, "{context}"),
     }
 }
+
+/// Pose-bone rotation modes and local transforms must survive export and reopen in Blender.
+fn assert_reopened_pose(reopened: &Value, original: &Value, mode: &str) {
+    let expected_bendy_mode = match mode {
+        "curved_zyx" => "ZYX",
+        "curved_axis_angle" => "AXIS_ANGLE",
+        _ => "XYZ",
+    };
+    assert_eq!(
+        original["Bendy"]["rotation_mode"], expected_bendy_mode,
+        "{mode}: fixture pose mode"
+    );
+    for bone in ["Root", "Bendy", "StartHandle", "EndHandle"] {
+        assert_eq!(
+            reopened[bone]["rotation_mode"], original[bone]["rotation_mode"],
+            "{mode}: {bone} rotation mode after reopen"
+        );
+        let actual = reopened[bone]["matrix_basis"].as_array().unwrap();
+        let expected = original[bone]["matrix_basis"].as_array().unwrap();
+        assert_eq!(actual.len(), 4, "{mode}: {bone} matrix rows");
+        for (row, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            let actual = actual.as_array().unwrap();
+            let expected = expected.as_array().unwrap();
+            for (column, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+                let (actual, expected) = (actual.as_f64().unwrap(), expected.as_f64().unwrap());
+                assert!(
+                    (actual - expected).abs() <= 1.0e-5,
+                    "{mode}: {bone} matrix_basis[{row}][{column}]: {actual} != {expected}"
+                );
+            }
+        }
+    }
+}
+
 fn assert_positions_close(actual: &Value, expected: &Value, context: &str) {
     let actual = actual.as_array().unwrap();
     let expected = expected.as_array().unwrap();
@@ -525,6 +576,8 @@ fn armature_modifier_bbone_gate_and_blend_round_trip() -> TestResult {
         "straight_preserve_volume",
         "curved_envelopes",
         "curved_envelope_multiply",
+        "curved_zyx",
+        "curved_axis_angle",
     ] {
         let root = directory.path().join(mode);
         fs::create_dir(&root)?;
@@ -601,19 +654,20 @@ fn armature_modifier_bbone_gate_and_blend_round_trip() -> TestResult {
             mode,
         );
 
+        let exported = root.join("roundtrip.blend");
+        pot_json(&[
+            "export",
+            project.to_str().unwrap(),
+            "--format",
+            "blend",
+            "--out",
+            exported.to_str().unwrap(),
+            "--blender",
+            blender.to_str().unwrap(),
+        ])?;
+        let reopened = run_reopen(&blender, &root, &exported, "armature_modifier")?;
+        assert_reopened_pose(&reopened["pose"], &oracle["pose"], mode);
         if mode == "curved_linear" {
-            let exported = root.join("roundtrip.blend");
-            pot_json(&[
-                "export",
-                project.to_str().unwrap(),
-                "--format",
-                "blend",
-                "--out",
-                exported.to_str().unwrap(),
-                "--blender",
-                blender.to_str().unwrap(),
-            ])?;
-            let reopened = run_reopen(&blender, &root, &exported, "armature_modifier")?;
             assert_json_approximately_equal(
                 &reopened["settings"],
                 &expected_settings(),
