@@ -39,6 +39,22 @@ CASES = [
     ("torus_8x4", "torus", bpy.ops.mesh.primitive_torus_add,
      {"major_segments": 8, "minor_segments": 4, "major_radius": 1.0, "minor_radius": 0.25, "generate_uvs": True}),
     ("torus_default", "torus", bpy.ops.mesh.primitive_torus_add, {}),
+    ("circle_trifan_5", "circle", bpy.ops.mesh.primitive_circle_add,
+     {"vertices": 5, "radius": 0.75, "fill_type": "TRIFAN"}),
+    ("cylinder_8_trifan", "cylinder", bpy.ops.mesh.primitive_cylinder_add,
+     {"vertices": 8, "radius": 1.0, "depth": 2.0, "end_fill_type": "TRIFAN"}),
+    ("cylinder_8_nothing", "cylinder", bpy.ops.mesh.primitive_cylinder_add,
+     {"vertices": 8, "radius": 1.0, "depth": 2.0, "end_fill_type": "NOTHING"}),
+    ("cone_trunc_8", "cone", bpy.ops.mesh.primitive_cone_add,
+     {"vertices": 8, "radius1": 1.0, "radius2": 0.5, "depth": 2.0, "end_fill_type": "NGON"}),
+    ("cone_8_trifan", "cone", bpy.ops.mesh.primitive_cone_add,
+     {"vertices": 8, "radius1": 1.0, "radius2": 0.0, "depth": 2.0, "end_fill_type": "TRIFAN"}),
+    ("cone_8_nothing", "cone", bpy.ops.mesh.primitive_cone_add,
+     {"vertices": 8, "radius1": 1.0, "radius2": 0.0, "depth": 2.0, "end_fill_type": "NOTHING"}),
+    ("cone_inverted_32", "cone", bpy.ops.mesh.primitive_cone_add,
+     {"vertices": 32, "radius1": 0.0, "radius2": 1.0, "depth": 2.0, "end_fill_type": "NGON"}),
+    ("cone_inverted_8", "cone", bpy.ops.mesh.primitive_cone_add,
+     {"vertices": 8, "radius1": 0.0, "radius2": 1.0, "depth": 2.0, "end_fill_type": "NGON"}),
 ]
 
 
