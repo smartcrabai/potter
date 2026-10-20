@@ -1,12 +1,13 @@
-//! Interpolated lookups into the Cycles GGX albedo tables, ported from
+//! Interpolated lookups into the Cycles GGX and sheen tables, ported from
 //! `intern/cycles/kernel/util/lookup_table.h` at Blender v5.2.2.
 //!
-//! The data comes from `table_ggx_E`, `table_ggx_Eavg` and `table_ggx_gen_schlick_ior_s` in
-//! `intern/cycles/scene/shader.tables`, held in [`super::principled_tables_data`]. Each lookup
-//! clamps its coordinates to `[0, 1]`, maps them onto the table's index range, and linearly
-//! interpolates between neighbouring entries. Layout is `table[z][y][x]` with `x` fastest.
+//! The data comes from `table_ggx_E`, `table_ggx_Eavg`, `table_ggx_gen_schlick_ior_s` and
+//! `table_sheen_ltc` in `intern/cycles/scene/shader.tables`, held in
+//! [`super::principled_tables_data`]. Each lookup clamps its coordinates to `[0, 1]`, maps them
+//! onto the table's index range, and linearly interpolates between neighbouring entries. Layout is
+//! `table[z][y][x]` with `x` fastest.
 
-use super::principled_tables_data::{GGX_E, GGX_E_AVG, GGX_GEN_SCHLICK_IOR_S};
+use super::principled_tables_data::{GGX_E, GGX_E_AVG, GGX_GEN_SCHLICK_IOR_S, SHEEN_LTC};
 
 /// Port of `lookup_table_read` (`lookup_1d`) over a table of `n` entries.
 fn lookup_1d(table: &[f32], n: usize, x: f64) -> f64 {
@@ -77,6 +78,34 @@ pub(crate) fn ggx_gen_schlick_ior_s(rough: f64, cos_ni: f64, z: f64) -> f64 {
     lookup_3d(&GGX_GEN_SCHLICK_IOR_S, 16, 16, 16, rough, cos_ni, z)
 }
 
+/// The three sheen coefficients of Cycles' `bsdf_sheen_setup`: the LTC `transformA` and
+/// `transformB` and the directional `albedo`, read from `table_sheen_ltc` at `cos_ni` and
+/// `roughness`. The table holds the three 32 × 32 planes in that order.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SheenLtc {
+    pub(crate) transform_a: f64,
+    pub(crate) transform_b: f64,
+    pub(crate) albedo: f64,
+}
+
+pub(crate) fn sheen_ltc(roughness: f64, cos_ni: f64) -> SheenLtc {
+    const PLANE: usize = 32 * 32;
+    let plane = |index: usize| {
+        lookup_2d(
+            &SHEEN_LTC[index * PLANE..(index + 1) * PLANE],
+            32,
+            32,
+            cos_ni,
+            roughness,
+        )
+    };
+    SheenLtc {
+        transform_a: plane(0),
+        transform_b: plane(1),
+        albedo: plane(2),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,5 +146,22 @@ mod tests {
             ggx_gen_schlick_ior_s(1.0, 0.0, 0.0),
             f64::from(GGX_GEN_SCHLICK_IOR_S[15])
         );
+    }
+
+    #[test]
+    fn sheen_ltc_at_origin_reads_the_first_entry_of_each_plane() {
+        let coefficients = sheen_ltc(0.0, 0.0);
+        assert_eq!(coefficients.transform_a, f64::from(SHEEN_LTC[0]));
+        assert_eq!(coefficients.transform_b, f64::from(SHEEN_LTC[1024]));
+        assert_eq!(coefficients.albedo, f64::from(SHEEN_LTC[2048]));
+    }
+
+    #[test]
+    fn sheen_ltc_at_far_corner_reads_the_last_entry_of_each_plane() {
+        // Cosine 1 is `x = 31` and roughness 1 is `y = 31`: the last entry of each 32 × 32 plane.
+        let coefficients = sheen_ltc(1.0, 1.0);
+        assert_eq!(coefficients.transform_a, f64::from(SHEEN_LTC[1023]));
+        assert_eq!(coefficients.transform_b, f64::from(SHEEN_LTC[2047]));
+        assert_eq!(coefficients.albedo, f64::from(SHEEN_LTC[3071]));
     }
 }
