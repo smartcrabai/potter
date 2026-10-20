@@ -2399,7 +2399,7 @@ mod tests {
             }
         }
         // Each refusal names its JSON pointer when the operation parser raises it. A geometry-level
-        // refusal raised after parsing carries no pointer.
+        // refusal, raised after parsing, is reported at the operation's batch position instead.
         let refusals: [(serde_json::Value, Option<&str>, &str); 8] = [
             (
                 json!({"brush": "pose", "deform_type": "twist"}),
@@ -2433,7 +2433,7 @@ mod tests {
             ),
             (
                 json!({"brush": "boundary", "delta": [0.1, 0.0, 0.0]}),
-                None,
+                Some("/operations/0"),
                 "delta is supported only by",
             ),
             (
