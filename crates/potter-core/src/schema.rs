@@ -1020,7 +1020,15 @@ fn operation_contract(name: &str) -> OperationContract {
         ),
         "sculpt.stroke" => (
             vec![
-                "target", "scope", "brush", "samples", "falloff", "symmetry", "delta", "view",
+                "target",
+                "scope",
+                "brush",
+                "deform_type",
+                "samples",
+                "falloff",
+                "symmetry",
+                "delta",
+                "view",
                 "dyntopo",
             ],
             vec!["op", "target", "brush", "samples"],
@@ -1999,10 +2007,13 @@ fn field_schema(operation: &str, field: &str) -> Value {
         return match field {
             "scope" => json!({"enum":["shared","single_user"]}),
             "brush" => {
-                json!({"enum":["draw","clay_strips","inflate","grab","smooth","flatten","pinch","crease","layer","snake_hook","thumb","rotate","nudge","blob","scrape","fill","draw_sharp","elastic_deform","pose_lite","boundary_lite"]})
+                json!({"enum":["draw","clay_strips","inflate","grab","smooth","flatten","pinch","crease","layer","snake_hook","thumb","rotate","nudge","blob","scrape","fill","draw_sharp","elastic_deform","pose","boundary"]})
             }
             "falloff" => {
                 json!({"enum":["smooth","smoother","sphere","root","sharp","linear","constant","pow4"],"description":"Falloff curve. Defaults to smoother for clay_strips, pow4 for draw_sharp, and smooth for other brushes."})
+            }
+            "deform_type" => {
+                json!({"enum":["rotate_twist","scale_translate","squash_stretch","bend","expand","inflate","grab","twist","smooth"],"description":"Deform type of the pose or boundary brush. Pose: rotate_twist (default), scale_translate, or squash_stretch; pose twist is refused. Boundary: bend (default), expand, inflate, grab, twist, or smooth. Other brushes refuse it."})
             }
             "samples" => {
                 json!({"type":"array","minItems":1,"items":{"type":"object","required":["position","pressure","radius","strength","time"],"properties":{"position":vec_schema(3),"pressure":{"type":"number","minimum":0,"maximum":1},"radius":{"type":"number","minimum":0},"strength":{"type":"number"},"time":{"type":"number"}},"additionalProperties":false}})

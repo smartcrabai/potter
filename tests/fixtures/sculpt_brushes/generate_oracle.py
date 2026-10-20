@@ -60,6 +60,8 @@ BRUSH_NAMES = {
     "thumb": "Thumb",
     "rotate": "Twist",
     "elastic_deform": "Elastic Grab",
+    "pose": "Pose",
+    "boundary": "Boundary",
 }
 STRIP_DIRECTION = Vector((0.8, 0.6, 0.0)).normalized()
 
@@ -160,7 +162,7 @@ def make_object(kind):
     return ob
 
 
-def run_case(name, brush_key, kind, dabs, strength, radius, mirror=False, mask=None):
+def run_case(name, brush_key, kind, dabs, strength, radius, mirror=False, mask=None, deform=None):
     window, area, region, rv3d = view_context()
     ob = make_object(kind)
     bpy.context.view_layer.objects.active = ob
@@ -192,6 +194,11 @@ def run_case(name, brush_key, kind, dabs, strength, radius, mirror=False, mask=N
         brush.use_locked_size = "SCENE"
         brush.unprojected_size = 2.0 * radius
         brush.strength = strength
+        # Pose and Boundary keep their deform type in the brush, so every case sets it explicitly.
+        if brush_key == "pose":
+            brush.pose_deform_type = deform or "ROTATE_TWIST"
+        if brush_key == "boundary":
+            brush.boundary_deform_type = deform or "BEND"
         items = []
         for index, dab in enumerate(dabs):
             location = Vector(dab["position"])
@@ -223,6 +230,7 @@ def run_case(name, brush_key, kind, dabs, strength, radius, mirror=False, mask=N
         "strength": strength,
         "radius": radius,
         "mirror": mirror,
+        "deform": deform,
         "dabs": dabs,
         "base": base,
         "faces": faces,
@@ -293,10 +301,47 @@ def cases():
     ]
 
 
+def all_cases():
+    # Pose and Boundary cases carry an explicit deform type; the other brushes carry None.
+    return [(*case, None) for case in cases()] + deform_cases()
+
+
+def path_dabs(points, radius, strength):
+    # Dabs along a planar path on the z = 0 plane, one per (x, y) point.
+    return [
+        {"position": (x, y, 0.0), "radius": radius, "strength": strength, "pressure": 1.0}
+        for x, y in points
+    ]
+
+
+def deform_cases():
+    # Pose and Boundary are measured on the flat grid, so the top view's ray hits z = 0 at each
+    # dab location. Blender's Pose origin comes from the stroke's topology.
+    pose_path = [(0.85, 0.0), (0.9, 0.05), (0.95, 0.1), (0.97, 0.15)]
+    # Boundary's bend reads Blender's cursor location at stroke start (`cache->initial_location`). A
+    # fresh headless session leaves the cursor at the origin, so the first dab sits there.
+    boundary_path = [(0.0, 0.0), (0.05, 0.0), (0.1, 0.02), (0.12, 0.04)]
+    return [
+        ("pose_grid", "pose", "grid", path_dabs(pose_path, 0.45, 0.5), 0.5, 0.45, False, "ROTATE_TWIST"),
+        ("pose_grid_scale_translate", "pose", "grid", path_dabs(pose_path, 0.45, 0.5), 0.5, 0.45, False, "SCALE_TRANSLATE"),
+        ("pose_grid_squash_stretch", "pose", "grid", path_dabs(pose_path, 0.45, 0.5), 0.5, 0.45, False, "SQUASH_STRETCH"),
+        ("boundary_grid_bend", "boundary", "grid", path_dabs(boundary_path, 1.05, 0.5), 0.5, 1.05, False, "BEND"),
+        ("boundary_grid_grab", "boundary", "grid", path_dabs(boundary_path, 1.05, 0.5), 0.5, 1.05, False, "GRAB"),
+        ("boundary_grid_expand", "boundary", "grid", path_dabs(boundary_path, 1.05, 0.5), 0.5, 1.05, False, "EXPAND"),
+        ("boundary_grid_inflate", "boundary", "grid", path_dabs(boundary_path, 1.05, 0.5), 0.5, 1.05, False, "INFLATE"),
+        ("boundary_grid_twist", "boundary", "grid", path_dabs(boundary_path, 1.05, 0.5), 0.5, 1.05, False, "TWIST"),
+        ("boundary_grid_smooth", "boundary", "grid", path_dabs(boundary_path, 1.05, 0.5), 0.5, 1.05, False, "SMOOTH"),
+        ("pose_grid_mirror", "pose", "grid", path_dabs(pose_path, 0.45, 0.5), 0.5, 0.45, True, "ROTATE_TWIST"),
+        ("pose_grid_scale_translate_mirror", "pose", "grid", path_dabs(pose_path, 0.45, 0.5), 0.5, 0.45, True, "SCALE_TRANSLATE"),
+        ("boundary_grid_bend_mirror", "boundary", "grid", path_dabs(boundary_path, 1.05, 0.5), 0.5, 1.05, True, "BEND"),
+        ("boundary_grid_grab_mirror", "boundary", "grid", path_dabs(boundary_path, 1.05, 0.5), 0.5, 1.05, True, "GRAB"),
+    ]
+
+
 def generate(output_dir):
     with bpy.data.libraries.load(ESSENTIALS, link=False) as (source, target):
         target.brushes = list(source.brushes)
-    for name, brush_key, kind, dabs, strength, radius, mirror in cases():
+    for name, brush_key, kind, dabs, strength, radius, mirror, deform in all_cases():
         if name in OBLIQUE_VIEWS:
             region, rv3d = set_view(OBLIQUE_VIEWS[name])
         else:
@@ -304,7 +349,15 @@ def generate(output_dir):
         # A failing case is recorded in its own error file, so the other brushes still generate.
         try:
             case = run_case(
-                name, brush_key, kind, dabs, strength, radius, mirror, mask=MASKS.get(name)
+                name,
+                brush_key,
+                kind,
+                dabs,
+                strength,
+                radius,
+                mirror,
+                mask=MASKS.get(name),
+                deform=deform,
             )
             case["view"] = view_normal(rv3d)
         except AssertionError:
