@@ -1811,10 +1811,21 @@ impl GraphReducer<'_> {
             "ShaderNodeBsdfPrincipled" => self.principled(source, depth),
             "ShaderNodeEmission" => self.emission_shade(source, node, depth),
             "ShaderNodeBackground" => self.background_shade(source, node, depth),
-            "ShaderNodeBsdfTransparent" => Ok(Shade {
-                transparent: true,
-                ..Shade::default()
-            }),
+            "ShaderNodeBsdfTransparent" => {
+                // glTF alpha is a scalar, so a Transparent BSDF's tint (its Color) has no representation.
+                let tint = self.color_input(source, "Color", [1.0; 3], depth)?;
+                if tint.tex.is_some() || !crate::float::equal_f64_array(&tint.factor, &[1.0; 3]) {
+                    self.loss(
+                        feature_id::UNSUPPORTED_INPUT,
+                        format!("Transparent BSDF `{source}` tints the light it passes; glTF alpha is a scalar, so its Color is not expressed"),
+                        None,
+                    );
+                }
+                Ok(Shade {
+                    transparent: true,
+                    ..Shade::default()
+                })
+            }
             "ShaderNodeMixShader" => self.mix_shader(source, depth),
             "ShaderNodeAddShader" => self.add_shader(source, depth),
             other if other.starts_with("ShaderNodeBsdf") => self.other_bsdf(source, node, depth),

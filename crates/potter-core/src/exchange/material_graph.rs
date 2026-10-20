@@ -246,8 +246,12 @@ fn write_principled_inputs(node: &mut GraphNode, material: &Material) {
         "Emission Strength".to_owned(),
         json!(material.emission_strength),
     );
-    node.inputs
-        .insert("Alpha".to_owned(), json!(material.base_color[3]));
+    // An OPAQUE material has no transparency, so its base colour alpha (a glTF factor, say) stays out of the graph and
+    // the Alpha input's default of one applies.
+    if material.alpha_mode != "opaque" {
+        node.inputs
+            .insert("Alpha".to_owned(), json!(material.base_color[3]));
+    }
     node.inputs
         .insert("Base Color".to_owned(), json!(material.base_color));
     node.inputs

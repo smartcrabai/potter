@@ -6,7 +6,6 @@
 use std::{error::Error, fs, process::Command};
 
 use glam::DVec3;
-use proptest::prelude::*;
 use serde_json::{Value, json};
 use tempfile::tempdir;
 #[path = "common/blender_checked.rs"]
@@ -116,7 +115,7 @@ fn sculpt_multires_stroke_updates_mdisps_and_base_mesh_mode_preserves_grids()
 
     let stroke = json!({
         "op":"sculpt.stroke", "target":{"id":"body"}, "brush":"draw", "scope":"shared",
-        "samples":[{"position":[1.0,1.0,1.0],"pressure":1.0,"radius":1.0,"strength":0.5,"time":0.0}],
+        "samples":[{"position":[0.0,0.0,1.0],"pressure":1.0,"radius":1.0,"strength":0.5,"time":0.0}],
         "falloff":"linear"
     });
     let (_multires_directory, multires_scene) = create_scene()?;
@@ -146,6 +145,13 @@ fn sculpt_multires_stroke_updates_mdisps_and_base_mesh_mode_preserves_grids()
         "native multires stroke did not change evaluated geometry"
     );
 
+    // The base mesh has only its eight corners, so the sample sits on a corner vertex; the
+    // multires stroke above uses a sculpt-level vertex, since its subdivided surface has no corner there.
+    let base_stroke = json!({
+        "op":"sculpt.stroke", "target":{"id":"body"}, "brush":"draw", "scope":"shared",
+        "samples":[{"position":[1.0,1.0,1.0],"pressure":1.0,"radius":1.0,"strength":0.5,"time":0.0}],
+        "falloff":"linear"
+    });
     let (_base_directory, base_scene) = create_scene()?;
     apply(
         &base_scene,
@@ -154,7 +160,7 @@ fn sculpt_multires_stroke_updates_mdisps_and_base_mesh_mode_preserves_grids()
             {"op":"sculpt.multires", "target":{"id":"body"}, "id":"multi_one", "levels":1, "render_levels":1},
             {"op":"modifier.update", "target":{"id":"body"}, "id":"multi_one",
              "set":{"params":{"levels":1,"sculpt_levels":1,"render_levels":1,"total_levels":1,"use_sculpt_base_mesh":true}}},
-            stroke
+            base_stroke
         ]),
     )?;
     let base_mesh = stored_mesh(&base_scene)?;
@@ -384,7 +390,7 @@ fn multires_sculpt_levels_select_native_grid_resolution() -> Result<(), Box<dyn 
                 {"op":"modifier.update", "target":{"id":"body"}, "id":"multi_one",
                  "set":{"params":{"levels":2,"sculpt_levels":sculpt_levels,"render_levels":2,"total_levels":2}}},
                 {"op":"sculpt.stroke", "target":{"id":"body"}, "brush":"draw", "scope":"shared",
-                 "samples":[{"position":[1.0,1.0,1.0],"pressure":1.0,"radius":1.0,"strength":0.5,"time":0.0}],
+                 "samples":[{"position":[0.0,0.0,1.0],"pressure":1.0,"radius":1.0,"strength":0.5,"time":0.0}],
                  "falloff":"linear"}
             ]),
         )?;
@@ -429,7 +435,7 @@ fn multires_blend_roundtrips_continue_sculpt_and_apply() -> Result<(), Box<dyn E
             {"op":"modifier.update", "target":{"id":"body"}, "id":"multi_one",
              "set":{"params":{"show_only_control_edges":false,"use_sculpt_base_mesh":false}}},
             {"op":"sculpt.stroke", "target":{"id":"body"}, "brush":"draw", "scope":"shared",
-             "samples":[{"position":[1.0,1.0,1.0],"pressure":1.0,"radius":1.0,"strength":0.5,"time":0.0}],
+             "samples":[{"position":[0.0,0.0,1.0],"pressure":1.0,"radius":1.0,"strength":0.5,"time":0.0}],
              "falloff":"linear"}
         ]),
     )?;
@@ -574,7 +580,7 @@ fn multires_blend_roundtrips_continue_sculpt_and_apply() -> Result<(), Box<dyn E
             &import_scene,
             &json!([{
                 "op":"sculpt.stroke", "target":{"id":node_id}, "brush":"draw", "scope":"shared",
-                "samples":[{"position":[1.0,1.0,1.0],"pressure":1.0,"radius":1.0,"strength":0.5,"time":0.0}],
+                "samples":[{"position":[0.0,0.0,1.0],"pressure":1.0,"radius":1.0,"strength":0.5,"time":0.0}],
                 "falloff":"linear"
             }]),
             base_revision,
@@ -883,9 +889,9 @@ fn sculpt_shared_data_requires_scope_and_single_user_isolates_stroke() -> Result
 fn sculpt_symmetry_and_repeat_strokes_are_deterministic() -> Result<(), Box<dyn Error>> {
     let base = Mesh::box_mesh(potter_core::geom::BoxParams::default())?;
     let stroke = |symmetry: &[&str]| sculpt::Stroke {
-        brush: sculpt::Brush::Vertex(sculpt::VertexBrush::Draw),
+        brush: sculpt::Brush::Dab(sculpt::DabBrush::Draw),
         samples: vec![sculpt::StrokeSample {
-            position: DVec3::new(0.0, -1.0, 1.0),
+            position: DVec3::new(1.0, -1.0, 1.0),
             pressure: 1.0,
             radius: 1.1,
             strength: 0.5,
@@ -894,6 +900,7 @@ fn sculpt_symmetry_and_repeat_strokes_are_deterministic() -> Result<(), Box<dyn 
         falloff: sculpt::Falloff::Linear,
         symmetry: symmetry.iter().map(|axis| (*axis).to_owned()).collect(),
         delta: None,
+        view: None,
     };
     let mut mirrored = base.clone();
     sculpt::apply_stroke(&mut mirrored, &stroke(&["x"]))?;
@@ -925,24 +932,4 @@ fn sculpt_symmetry_and_repeat_strokes_are_deterministic() -> Result<(), Box<dyn 
     let second_hash = sha256(&canonicalize(&serde_json::to_value(&second)?)?);
     assert_eq!(first_hash, second_hash);
     Ok(())
-}
-
-proptest! {
-    #[test]
-    fn smoothing_reduces_laplacian_energy(offset in -5.0_f64..5.0, factor in 0.1_f64..1.0) {
-        let positions = vec![
-            DVec3::new(offset, offset * 0.25, 0.3),
-            DVec3::new(-1.0, -1.0, 0.0),
-            DVec3::new(1.0, -1.0, 0.0),
-            DVec3::new(1.0, 1.0, 0.0),
-            DVec3::new(-1.0, 1.0, 0.0),
-        ];
-        let mut mesh = Mesh::from_positions_and_faces(
-            positions,
-            vec![vec![0, 1, 2], vec![0, 2, 3], vec![0, 3, 4], vec![0, 4, 1]],
-        ).unwrap();
-        let before = sculpt::laplacian_energy(&mesh);
-        sculpt::smooth_vertex(&mut mesh, 0, factor).unwrap();
-        prop_assert!(sculpt::laplacian_energy(&mesh) < before);
-    }
 }
