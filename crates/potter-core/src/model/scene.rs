@@ -1170,24 +1170,18 @@ fn default_pixel_filter_type() -> PixelFilterType {
     PixelFilterType::BlackmanHarris
 }
 
-#[expect(
-    clippy::trivially_copy_pass_by_ref,
-    reason = "serde skip_serializing_if passes a reference"
-)]
-fn is_default_pixel_filter_type(value: &PixelFilterType) -> bool {
-    *value == PixelFilterType::BlackmanHarris
+/// serde's `skip_serializing_if` passes a reference. The predicates are generic so that the
+/// by-reference signature needs no lint suppression for a small `Copy` type.
+fn is_default_pixel_filter_type<T: PartialEq<PixelFilterType>>(value: &T) -> bool {
+    PartialEq::eq(value, &PixelFilterType::BlackmanHarris)
 }
 
 fn default_filter_width() -> f64 {
     DEFAULT_FILTER_WIDTH
 }
 
-#[expect(
-    clippy::trivially_copy_pass_by_ref,
-    reason = "serde skip_serializing_if passes a reference"
-)]
-fn is_default_filter_width(value: &f64) -> bool {
-    equal_f64(*value, DEFAULT_FILTER_WIDTH)
+fn is_default_filter_width<T: Copy + Into<f64>>(value: &T) -> bool {
+    equal_f64((*value).into(), DEFAULT_FILTER_WIDTH)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

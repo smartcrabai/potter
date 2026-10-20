@@ -12,35 +12,34 @@
 //!
 //! The standard error of `alpha` is computed from the measured noise of both images:
 //! `sqrt(sum (sigma_p^2 + sigma_b^2) d^2) / sum d^2`, where `d` is the difference of the two
-//! references and `sigma_p` is Potter's per-pixel noise, scaled from Blender's measured per-seed
-//! deviation to 1024 samples. At these settings the standard error is 0.01 to 0.03, so the
-//! threshold 0.5 is 15 to 40 standard errors from either hypothesis. Potter-vs-Blender is an
-//! assertion, not a tolerance on a measured value; the threshold is not loosened to pass.
+//! references, `sigma_b` is Blender's per-pixel standard error, and `sigma_p` is Potter's
+//! per-pixel noise, scaled from Blender's measured per-seed deviation to 1024 samples. At these
+//! settings the standard error is 0.01 to 0.03, so the threshold 0.5 is 15 to 40 standard errors
+//! from either hypothesis. The threshold is not loosened to pass.
 //!
 //! Alternatives: the Potter box filter (what Potter did before this filter existed) is an
 //! alternative for both kinds; the Blackman-Harris filter is one for the Gaussian.
 
 #[path = "common/blender_checked.rs"]
 mod blender_checked;
-#[path = "common/native_oracle.rs"]
-#[expect(
-    dead_code,
-    reason = "each test binary uses a subset of the shared oracle helpers"
-)]
-mod native_oracle;
+#[path = "common/pot_json.rs"]
+mod pot_json;
 #[path = "common/process.rs"]
 mod process;
 
-use std::{fs, path::Path, process::Command};
-
-use native_oracle::{
-    TestResult, apply_operations, export, import_blend, pot, read_scene, run_blender_arguments,
-    write_script,
+use std::{
+    error::Error,
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
 };
+
 use potter_core::image::{ImageInterpolation, load_image_data, sample};
 use potter_core::model::Image;
 use serde_json::{Value, json};
 use tempfile::tempdir;
+
+type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 const SCRIPT: &str = include_str!("fixtures/native_oracle/pixel_filter.py");
 /// Frame edge in pixels of the oracle scene (`pixel_filter.py`).
@@ -60,6 +59,33 @@ const MAX_ALPHA_STANDARD_ERROR: f64 = 0.1;
 struct Reference {
     mean: Vec<f64>,
     stderr: Vec<f64>,
+}
+
+fn text(path: &Path) -> TestResult<&str> {
+    Ok(path.to_str().ok_or("path is not UTF-8")?)
+}
+
+fn read_scene(project: &Path) -> TestResult<Value> {
+    Ok(serde_json::from_slice(&fs::read(
+        project.join("scene.json"),
+    )?)?)
+}
+
+/// Applies `operations` to `project` atomically, against the project's current revision.
+fn apply(project: &Path, root: &Path, operations: Value) -> TestResult<Value> {
+    let revision = read_scene(project)?["revision"]
+        .as_u64()
+        .ok_or("scene revision is missing")?;
+    let batch = root.join("batch.json");
+    fs::write(
+        &batch,
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "base_revision": revision,
+            "operations": operations,
+        }))?,
+    )?;
+    pot_json::pot_json(&["apply", text(project)?, "--file", text(&batch)?])
 }
 
 /// The numbers under `key` in a Blender reference JSON.
@@ -83,17 +109,31 @@ fn blender_reference(
     root: &Path,
     script: &Path,
     kind: &str,
-) -> TestResult<(std::path::PathBuf, Reference)> {
+) -> TestResult<(PathBuf, Reference)> {
     let blend = root.join(format!("{kind}.blend"));
     let json_path = root.join(format!("{kind}.json"));
-    let seeds = BLENDER_SEEDS.to_string();
-    let arguments: [&Path; 4] = [
-        &blend,
-        &json_path,
-        Path::new(kind),
-        Path::new(seeds.as_str()),
-    ];
-    run_blender_arguments(blender, script, None, &arguments)?;
+    let output = Command::new(blender)
+        .args([
+            "--background",
+            "--factory-startup",
+            "--disable-autoexec",
+            "--python-exit-code",
+            "3",
+            "--python",
+        ])
+        .arg(script)
+        .arg("--")
+        .arg(&blend)
+        .arg(&json_path)
+        .arg(kind)
+        .arg(BLENDER_SEEDS.to_string())
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Blender {kind} reference failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     let value: Value = serde_json::from_slice(&fs::read(&json_path)?)?;
     let reference = Reference {
         mean: reference_numbers(&value, kind, "mean")?,
@@ -133,16 +173,33 @@ fn fit_alpha(potter: &[f64], own: &Reference, alternative: &Reference) -> (f64, 
     )
 }
 
-/// Renders the `.blend` at `blend` in Potter at `POTTER_SAMPLES` and returns the pixels, row by row.
+/// Imports `blend` into a fresh project, renders it in Potter at `POTTER_SAMPLES`, and returns the
+/// pixels, row by row.
 fn potter_pixels(blender: &Path, root: &Path, blend: &Path) -> TestResult<Vec<f64>> {
-    let (project, envelope) = import_blend(blender, root, "project", blend)?;
+    let project = root.join("project");
+    pot_json::pot_json(&["init", text(&project)?])?;
+    let envelope = pot_json::pot_json(&[
+        "import",
+        text(&project)?,
+        "--file",
+        text(blend)?,
+        "--format",
+        "blend",
+        "--mode",
+        "replace",
+        "--base-revision",
+        "0",
+        "--blender",
+        text(blender)?,
+    ])?;
     assert_eq!(envelope["result"]["losses"], json!([]), "{envelope}");
+
     let scene = read_scene(&project)?;
     let active = scene["active_scene"]
         .as_str()
         .ok_or("active scene is missing")?
         .to_owned();
-    let applied = apply_operations(
+    let applied = apply(
         &project,
         root,
         json!([
@@ -150,25 +207,23 @@ fn potter_pixels(blender: &Path, root: &Path, blend: &Path) -> TestResult<Vec<f6
         ]),
     )?;
     assert_eq!(applied["ok"], true, "{applied}");
+
     let frames = root.join("frames");
-    let rendered = pot()
-        .arg("render")
-        .arg(&project)
-        .args(["--format", "exr", "--out"])
-        .arg(&frames)
-        .arg("--json")
-        .output()?;
-    assert!(
-        rendered.status.success(),
-        "render failed: {}",
-        String::from_utf8_lossy(&rendered.stdout)
-    );
-    let loaded = apply_operations(
+    pot_json::pot_json(&[
+        "render",
+        text(&project)?,
+        "--format",
+        "exr",
+        "--out",
+        text(&frames)?,
+    ])?;
+    let loaded = apply(
         &project,
         root,
         json!([{"op": "image.load", "id": "render", "path": frames.join("frame_0001.exr").to_string_lossy()}]),
     )?;
     assert_eq!(loaded["ok"], true, "{loaded}");
+
     let scene = read_scene(&project)?;
     let image: Image = serde_json::from_value(scene["images"]["render"].clone())?;
     let data = load_image_data(&image, &project, ImageInterpolation::Closest)?;
@@ -189,7 +244,8 @@ fn check_kind(kind: &str, alternatives: &[&str]) -> TestResult {
         return Ok(());
     };
     let root = tempdir()?;
-    let script = write_script(root.path(), "pixel_filter.py", SCRIPT)?;
+    let script = root.path().join("pixel_filter.py");
+    fs::write(&script, SCRIPT)?;
     let (blend, own) = blender_reference(&blender, root.path(), &script, kind)?;
     let mut references = Vec::new();
     for alternative in alternatives {
@@ -229,16 +285,33 @@ fn pixel_filter_settings_round_trip_through_blend() -> TestResult {
         return Ok(());
     };
     let root = tempdir()?;
-    let script = write_script(root.path(), "pixel_filter.py", SCRIPT)?;
+    let script = root.path().join("pixel_filter.py");
+    fs::write(&script, SCRIPT)?;
     let (blend, _) = blender_reference(&blender, root.path(), &script, "blackman_harris")?;
-    let (project, envelope) = import_blend(&blender, root.path(), "project", &blend)?;
+
+    let project = root.path().join("project");
+    pot_json::pot_json(&["init", text(&project)?])?;
+    let envelope = pot_json::pot_json(&[
+        "import",
+        text(&project)?,
+        "--file",
+        text(&blend)?,
+        "--format",
+        "blend",
+        "--mode",
+        "replace",
+        "--base-revision",
+        "0",
+        "--blender",
+        text(&blender)?,
+    ])?;
     assert_eq!(envelope["result"]["losses"], json!([]), "{envelope}");
     let scene = read_scene(&project)?;
     let active = scene["active_scene"]
         .as_str()
         .ok_or("active scene is missing")?
         .to_owned();
-    let applied = apply_operations(
+    let applied = apply(
         &project,
         root.path(),
         json!([
@@ -248,7 +321,16 @@ fn pixel_filter_settings_round_trip_through_blend() -> TestResult {
     assert_eq!(applied["ok"], true, "{applied}");
 
     let out = root.path().join("round_trip.blend");
-    export(&blender, &project, "blend", &out)?;
+    pot_json::pot_json(&[
+        "export",
+        text(&project)?,
+        "--format",
+        "blend",
+        "--out",
+        text(&out)?,
+        "--blender",
+        text(&blender)?,
+    ])?;
     let expression = "import bpy; cycles = bpy.context.scene.cycles; \
         assert cycles.pixel_filter_type == 'GAUSSIAN', cycles.pixel_filter_type; \
         assert abs(cycles.filter_width - 2.5) < 1e-6, cycles.filter_width";
