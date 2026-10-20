@@ -100,7 +100,7 @@ fn alembic_import_restores_smooth_and_custom_shading() -> TestResult {
             ]),
     )?;
 
-    // Each of the three boxes has f0 flat and f1..f5 smooth, and f2 carries custom normals.
+    // Each of the three boxes has f4 flat and f0..f3 and f5 smooth, and f3 carries custom normals.
     let document: Value = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
     let blocks = document["data_blocks"]
         .as_object()
