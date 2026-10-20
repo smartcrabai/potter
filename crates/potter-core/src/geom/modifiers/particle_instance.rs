@@ -279,7 +279,16 @@ pub fn particle_instance(
             DQuat::IDENTITY
         };
         let particle_translation = DVec3::from_array(state.position);
-        let scale = if use_size { state.size } else { 1.0 };
+        // Blender scales by `size[p]`, one array filled with parent sizes (if used) then child sizes
+        // (if used). Without parents that array starts at child 0, so child number p reads the
+        // size of child p, while the instanced state is child p - totpart.
+        let scale = if !use_size {
+            1.0
+        } else if use_parents {
+            state.size
+        } else {
+            particles[total_parents + number].size
+        };
         let random_position_offset = if has_path && random_position != 0.0 {
             random_position * hash_frand(system_seed.wrapping_add(number as u32))
         } else {
