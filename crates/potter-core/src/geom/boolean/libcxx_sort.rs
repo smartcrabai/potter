@@ -156,7 +156,6 @@ fn tbb_median_of_three<T: Copy>(
     }
 }
 
-
 struct Sorter<'a, T, F> {
     v: &'a mut [T],
     less: F,
@@ -757,40 +756,49 @@ mod tests {
         );
     }
 
+    type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
+
     /// Parses a `keys ...` or `order ...` line of a recording (`testdata/tbb/record_tbb_sort.cpp`).
-    fn record_values<T: std::str::FromStr>(line: Option<&str>, tag: &str) -> Vec<T>
+    fn record_values<T>(line: Option<&str>, tag: &str) -> TestResult<Vec<T>>
     where
-        T::Err: std::fmt::Debug,
+        T: std::str::FromStr,
+        T::Err: std::error::Error + 'static,
     {
-        let mut fields = line.expect("recording line").split_whitespace();
-        assert_eq!(fields.next(), Some(tag));
-        fields
-            .map(|field| field.parse().expect("recorded integer"))
-            .collect()
+        let mut fields = line.ok_or("recording line is missing")?.split_whitespace();
+        if fields.next() != Some(tag) {
+            return Err(format!("recording line does not start with `{tag}`").into());
+        }
+        fields.map(|field| Ok(field.parse::<T>()?)).collect()
     }
 
     /// Sorts each recorded case with `parallel_sort_by` and compares the element order with the
     /// `tbb::parallel_sort` run of oneTBB v2022.3.0 against Blender's `libtbb`. Five cases give a
     /// different order under oneTBB master's `parallel_sort`, so the test rejects that version.
     #[test]
-    fn parallel_sort_matches_recorded_tbb_v2022_3_0_order() {
+    fn parallel_sort_matches_recorded_tbb_v2022_3_0_order() -> TestResult {
         let text = include_str!("testdata/tbb/tbb_sort_v2022_3_0.txt");
         let mut lines = text.lines().filter(|line| !line.starts_with('#'));
         let mut cases = 0;
         while let Some(header) = lines.next() {
             let mut fields = header.split_whitespace();
-            assert_eq!(fields.next(), Some("case"));
-            let name = fields.next().expect("case name").to_owned();
-            let n: usize = fields.next().expect("case size").parse().expect("case size");
-            let keys: Vec<i64> = record_values(lines.next(), "keys");
-            let order: Vec<usize> = record_values(lines.next(), "order");
+            if fields.next() != Some("case") {
+                return Err("recording header does not start with `case`".into());
+            }
+            let name = fields.next().ok_or("case name is missing")?.to_owned();
+            let n: usize = fields.next().ok_or("case size is missing")?.parse()?;
+            let keys: Vec<i64> = record_values(lines.next(), "keys")?;
+            let order: Vec<usize> = record_values(lines.next(), "order")?;
             assert_eq!(keys.len(), n, "{name}: key count");
             assert_eq!(order.len(), n, "{name}: order count");
             let mut sorted: Vec<usize> = (0..n).collect();
             parallel_sort_by(&mut sorted, |&a, &b| keys[a] < keys[b]);
-            assert_eq!(sorted, order, "{name}: order differs from tbb::parallel_sort v2022.3.0");
+            assert_eq!(
+                sorted, order,
+                "{name}: order differs from tbb::parallel_sort v2022.3.0"
+            );
             cases += 1;
         }
         assert_eq!(cases, 9, "the recording holds nine cases");
+        Ok(())
     }
 }
