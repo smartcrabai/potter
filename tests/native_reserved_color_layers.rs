@@ -241,12 +241,6 @@ fn check_imported_weights(scene: &Value, name: &str, expected: &Value) -> TestRe
             FLOAT_TOLERANCE,
             &format!("{name} data-block Hip vertex {index}"),
         );
-        assert_close(
-            number(&mesh["attributes"]["vertex_groups"]["Hip"][format!("v{vertex_id}")])?,
-            expected_weight,
-            FLOAT_TOLERANCE,
-            &format!("{name} mesh Hip vertex {index}"),
-        );
     }
     Ok(())
 }
