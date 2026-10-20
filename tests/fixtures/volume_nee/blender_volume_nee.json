@@ -10,31 +10,31 @@
  "density": 0.05,
  "gradient_scale": 0.05,
  "pixel_centres": [
+  -0.375,
   -0.125,
-  -0.04166666666666663,
-  0.04166666666666674,
-  0.125
+  0.125,
+  0.375
  ],
  "cases": {
   "diffuse": {
-   "mean": 0.318869,
-   "stderr": 0.010542
+   "mean": 0.337081,
+   "stderr": 0.034213
   },
   "homogeneous_g0": {
-   "mean": 0.008296,
-   "stderr": 0.000193
+   "mean": 0.008488,
+   "stderr": 0.000605
   },
   "homogeneous_g05": {
-   "mean": 0.002925,
-   "stderr": 5.4e-05
+   "mean": 0.002951,
+   "stderr": 0.000169
   },
   "gradient_g0": {
-   "mean": 0.004254,
-   "stderr": 0.00029
+   "mean": 0.004854,
+   "stderr": 0.000936
   },
   "gradient_g05": {
-   "mean": 0.001487,
-   "stderr": 9.7e-05
+   "mean": 0.001639,
+   "stderr": 0.0003
   }
  }
 }

@@ -15,11 +15,11 @@ use assert_cmd::Command;
 use serde_json::{Value, json};
 use tempfile::tempdir;
 
-const SIZE: u32 = 24;
+const SIZE: u32 = 8;
 const ENERGY: f64 = 100.0;
 const POSITION: [f64; 3] = [1.6, 0.6, 0.9];
 const DENSITY: f64 = 0.05;
-const SAMPLES: u32 = 1024;
+const SAMPLES: u32 = 4096;
 /// The relative tolerance of a volume case against Blender's oracle. The gradient cases' Blender stderr is 6.5 %.
 const VOLUME_TOLERANCE: f64 = 0.06;
 const DIFFUSE_TOLERANCE: f64 = 0.02;
@@ -163,8 +163,8 @@ fn render_centre_mean(scene: &Path, out: &Path) -> Result<f64, Box<dyn Error>> {
     let width = pixels.width;
     let mut sum = 0.0;
     let mut count = 0.0;
-    for y in 10..14 {
-        for x in 10..14 {
+    for y in 2..6 {
+        for x in 2..6 {
             sum += f64::from(pixels.red[y * width + x]);
             count += 1.0;
         }
@@ -260,26 +260,50 @@ fn gradient_single_scatter_under_a_point_light_matches_blender() -> Result<(), B
     Ok(())
 }
 
-#[test]
-fn every_volume_sampling_strategy_matches_blender_on_mesh_and_voxel_cubes()
--> Result<(), Box<dyn Error>> {
-    // Distance, equiangular and multiple importance sampling are three estimators of one integral, so each must
-    // reproduce Blender's homogeneous cube.
-    for sampling in ["distance", "equiangular", "multiple_importance"] {
-        for (case, anisotropy) in [("homogeneous_g0", 0.0), ("homogeneous_g05", 0.5)] {
-            for medium in [Medium::MeshCube, Medium::VoxelHomogeneous] {
-                let directory = tempdir()?;
-                let scene = scatter_scene(directory.path(), anisotropy, medium, sampling)?;
-                let measured = render_centre_mean(&scene, &directory.path().join("render"))?;
-                let expected = blender_mean(case)?;
-                let relative = (measured - expected).abs() / expected;
-                assert!(
-                    relative < VOLUME_TOLERANCE,
-                    "{sampling} {case}: Potter {measured:.6} vs Blender {expected:.6} ({:.1} % apart)",
-                    relative * 100.0
-                );
-            }
-        }
+/// Distance, equiangular and multiple importance sampling are three estimators of one integral, so each must reproduce
+/// Blender's homogeneous cube. One test per (sampling, medium) keeps each test at two renders.
+fn assert_sampling_matches_blender(sampling: &str, medium: Medium) -> Result<(), Box<dyn Error>> {
+    for (case, anisotropy) in [("homogeneous_g0", 0.0), ("homogeneous_g05", 0.5)] {
+        let directory = tempdir()?;
+        let scene = scatter_scene(directory.path(), anisotropy, medium, sampling)?;
+        let measured = render_centre_mean(&scene, &directory.path().join("render"))?;
+        let expected = blender_mean(case)?;
+        let relative = (measured - expected).abs() / expected;
+        assert!(
+            relative < VOLUME_TOLERANCE,
+            "{sampling} {case}: Potter {measured:.6} vs Blender {expected:.6} ({:.1} % apart)",
+            relative * 100.0
+        );
     }
     Ok(())
+}
+
+#[test]
+fn distance_sampling_matches_blender_on_mesh_cube() -> Result<(), Box<dyn Error>> {
+    assert_sampling_matches_blender("distance", Medium::MeshCube)
+}
+
+#[test]
+fn distance_sampling_matches_blender_on_voxel_cube() -> Result<(), Box<dyn Error>> {
+    assert_sampling_matches_blender("distance", Medium::VoxelHomogeneous)
+}
+
+#[test]
+fn equiangular_sampling_matches_blender_on_mesh_cube() -> Result<(), Box<dyn Error>> {
+    assert_sampling_matches_blender("equiangular", Medium::MeshCube)
+}
+
+#[test]
+fn equiangular_sampling_matches_blender_on_voxel_cube() -> Result<(), Box<dyn Error>> {
+    assert_sampling_matches_blender("equiangular", Medium::VoxelHomogeneous)
+}
+
+#[test]
+fn multiple_importance_sampling_matches_blender_on_mesh_cube() -> Result<(), Box<dyn Error>> {
+    assert_sampling_matches_blender("multiple_importance", Medium::MeshCube)
+}
+
+#[test]
+fn multiple_importance_sampling_matches_blender_on_voxel_cube() -> Result<(), Box<dyn Error>> {
+    assert_sampling_matches_blender("multiple_importance", Medium::VoxelHomogeneous)
 }

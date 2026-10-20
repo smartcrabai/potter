@@ -17,6 +17,10 @@ Cases:
 - gradient_g0 / gradient_g05: Density = GRADIENT_SCALE * x, where x is the Generated coordinate (0 at
   the cube's -X face, 1 at +X), from a Linear Gradient texture.
 
+The frame is 8 x 8 (SIZE) and the measured block is its central 4 x 4 pixels (indices 2..5), so the cube fills the
+block. The pixel filter is a one-pixel BOX (see the comment in reset()), which is Potter's sampling, so the Blender
+mean is the pixel-averaged value that Potter renders.
+
 Regenerate from this directory with Blender 5.2.2, one thread, one run:
 
     Blender -b --factory-startup --threads 1 -P generate_volume_nee_oracle.py -- OUT.json
@@ -33,9 +37,9 @@ import bpy
 argv = sys.argv[sys.argv.index("--") + 1 :]
 out_path = os.path.abspath(argv[0])
 work = tempfile.mkdtemp(prefix="volume_nee_")
-SIZE = 24
+SIZE = 8
 SAMPLES = 65536
-BLOCK = range(10, 14)
+BLOCK = range(2, 6)
 ENERGY = 100.0
 POSITION = (1.6, 0.6, 0.9)
 DENSITY = 0.05
@@ -54,6 +58,16 @@ def reset():
     render.film_transparent = False
     scene.cycles.device = "CPU"
     scene.cycles.samples = SAMPLES
+    # Potter integrates each pixel uniformly over its whole footprint (render/path.rs draws the sub-pixel offset
+    # uniformly in [0, 1)^2, a box filter of one pixel). Cycles' BOX filter of width 1 px is the same box. The 8 px
+    # frame's central 4 x 4 block has footprints of +-0.25 about centres at +-0.125 and +-0.375, all inside the unit cube
+    # (edge at +-0.5), so each box lies in the cube and the outside-cube zero of Cycles' default 1.5 px Blackman-Harris
+    # filter cannot enter the block. A point filter (filter_width 0.01) would average the pixel centre only.
+    if hasattr(scene.cycles, "pixel_filter_type"):
+        scene.cycles.pixel_filter_type = "BOX"
+    else:
+        scene.cycles.filter_type = "BOX"
+    scene.cycles.filter_width = 1.0
     scene.cycles.use_denoising = False
     scene.cycles.max_bounces = 1
     scene.cycles.volume_bounces = 1
