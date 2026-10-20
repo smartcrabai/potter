@@ -1448,6 +1448,11 @@ pub struct LightData {
     pub area_shape: String,
     pub area_size: f64,
     pub area_size_y: f64,
+    /// Blender's area light `spread` (Cycles `AreaLight::spread`), in radians within [0, π]: the
+    /// emission is confined to the cone of half-angle `spread / 2` about the emitting normal. The
+    /// default π is the whole hemisphere and is not stored.
+    #[serde(default = "default_spread", skip_serializing_if = "is_default_spread")]
+    pub spread: f64,
     /// Blender's `cycles.use_multiple_importance_sampling` (Cycles `SHADER_USE_MIS`). When `true`,
     /// a BSDF-sampled ray can hit an area light, or a point or spot light with a radius, and that
     /// hit is weighted against light sampling. When `false`, the light is only light-sampled.
@@ -1468,6 +1473,7 @@ impl Default for LightData {
             area_shape: "SQUARE".to_owned(),
             area_size: 0.25,
             area_size_y: 0.25,
+            spread: std::f64::consts::PI,
             use_multiple_importance_sampling: true,
         }
     }
@@ -2105,6 +2111,18 @@ fn default_true() -> bool {
 )]
 fn is_true(value: &bool) -> bool {
     *value
+}
+
+fn default_spread() -> f64 {
+    std::f64::consts::PI
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if passes a reference"
+)]
+fn is_default_spread(value: &f64) -> bool {
+    *value >= std::f64::consts::PI
 }
 
 #[expect(
