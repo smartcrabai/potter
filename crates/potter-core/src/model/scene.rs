@@ -1999,12 +1999,13 @@ fn update_matrix_basis_transform(hasher: &mut sha2::Sha256, transform: &Transfor
     Ok(())
 }
 
+/// Whether a column-major matrix is the identity, within 1e-12 per element.
 pub(crate) fn is_identity_matrix(matrix: &[f64; 16]) -> bool {
-    // Column-major: the diagonal is indices 0, 5, 10 and 15.
-    matrix
-        .iter()
-        .enumerate()
-        .all(|(index, &value)| value == if index % 5 == 0 { 1.0 } else { 0.0 })
+    // The diagonal is indices 0, 5, 10 and 15 of a column-major matrix.
+    matrix.iter().enumerate().all(|(index, &value)| {
+        let expected = if index % 5 == 0 { 1.0 } else { 0.0 };
+        (value - expected).abs() <= 1.0e-12
+    })
 }
 
 fn update_matrix_basis_values(hasher: &mut sha2::Sha256, values: &[f64; 16]) {

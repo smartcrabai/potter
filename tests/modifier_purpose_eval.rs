@@ -468,11 +468,15 @@ fn boolean_results_feed_dependent_modifiers_for_both_purposes() -> TestResult {
         let follower_volume = follower_summary.2;
         ensure(
             follower_volume >= host_volume.max(1.0) - VOLUME_TOLERANCE,
-            "follower union is smaller than one of its operands",
+            &format!(
+                "follower union volume {follower_volume} is smaller than an operand (decimated host {host_volume}, follower 1)"
+            ),
         )?;
         ensure(
             follower_volume <= host_volume + 1.0 + VOLUME_TOLERANCE,
-            "follower union is larger than the sum of its operands",
+            &format!(
+                "follower union volume {follower_volume} is larger than the operands' sum (decimated host {host_volume}, follower 1)"
+            ),
         )?;
         outcomes.push((host_summary, follower_summary));
     }

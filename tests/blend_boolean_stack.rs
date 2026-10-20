@@ -404,10 +404,21 @@ fn assert_vertex_group_weights_match(
             .ok_or_else(|| format!("Potter {group} weight of {key} is invalid"))?;
         potter_entries.push((position, weight));
     }
-    assert_eq!(
+    let potter_only: Vec<String> = potter_entries
+        .iter()
+        .filter(|(actual_position, actual_weight)| {
+            !blender_entries.iter().any(|(position, weight)| {
+                actual_position.distance(*position) <= POSITION_TOLERANCE
+                    && (actual_weight - weight).abs() <= WEIGHT_TOLERANCE
+            })
+        })
+        .map(|(position, weight)| format!("{position:?}={weight}"))
+        .collect();
+    assert!(
+        potter_entries.len() == blender_entries.len() && potter_only.is_empty(),
+        "Potter weights for group {group} differ from Blender: {} against {}, Potter-only entries {potter_only:?}",
         potter_entries.len(),
-        blender_entries.len(),
-        "Potter weights for group {group} differ in vertex count from Blender"
+        blender_entries.len()
     );
     for (position, weight) in blender_entries {
         let matched = potter_entries
