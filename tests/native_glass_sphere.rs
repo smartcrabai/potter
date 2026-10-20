@@ -1,11 +1,23 @@
 //! A rough glass sphere under a point and a disk light, against Blender 5.2.2's Cycles render
 //! (`fixtures/native_oracle/glass/glass_sphere.py`).
 //!
-//! Blender and Potter each render the same scene with four seeds. Each side's frame mean is the
-//! average over the whole frame, so the two estimators share their expectation. The tolerance is four
-//! times the standard error of the difference of the two four-seed means, the standard errors taken
-//! from each side's seed-to-seed spread, so it is the Monte Carlo noise of the comparison and nothing
-//! looser.
+//! Blender renders at 1024 samples (its mean is nearly exact); Potter renders at 32 samples per pixel
+//! with four seeds. The tolerance is four times the standard error of the difference of the two
+//! four-seed means, the standard errors taken from each side's seed-to-seed spread, so it is the Monte
+//! Carlo noise of the comparison and nothing looser.
+//!
+//! What the test must detect, and the margin for each case (effect over tolerance, in frame-mean units,
+//! from Blender 5.2.2 renders of the same scene; Potter's noise at 32 samples is taken as Blender's at 32
+//! samples, so these are estimates until the lane run):
+//!   - the old pass-through shadow rule, where the interior glass is lit through the sphere: Blender with
+//!     the sphere casting no shadow gives 0.0587 against the correct 0.0149, a difference of 0.0438 over a
+//!     tolerance of 0.0083, a margin of 5.2×;
+//!   - a roughness swap (roughness 0.2 rendered as 0.5, or the reverse): 0.0234 over 0.0071, a margin of 3.3×.
+//! The sqrt(base) transmission tint is not checked here: at this noise the tint difference per channel
+//! (about 0.0013 to 0.0018 at 64 samples) is below the tolerance, which is about 0.008 at 32 samples. The
+//! plane oracle in `render/principled_bsdf.rs` (`glass_tests`) checks the tint at 4 standard errors of
+//! Cycles' 16-seed plane means, where a base colour used directly in place of its square root misses by
+//! 6 to 16 radiance units.
 //!
 //! The sphere's interior shadow rays are blocked by the glass, as Cycles blocks them
 //! (`kernel/integrator/surface_shader.h`), so light reaches the camera through the front reflection,
@@ -37,7 +49,7 @@ const SCRIPT: &str = include_str!("fixtures/native_oracle/glass/glass_sphere.py"
 /// Seeds of both renders. Four gives a usable seed-to-seed spread per side.
 const SEEDS: [u32; 4] = [0, 1, 2, 3];
 const RESOLUTION: u32 = 16;
-const SAMPLES: u32 = 256;
+const SAMPLES: u32 = 32;
 
 /// Mean and standard error of the mean of `values` (sample standard deviation over `√n`).
 fn mean_and_stderr(values: &[f64]) -> (f64, f64) {
