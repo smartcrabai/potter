@@ -875,6 +875,7 @@ fn trace_path(
                     geometry,
                     bvh,
                     lights,
+                    &[],
                     volumes,
                     &media,
                     images,
@@ -900,10 +901,50 @@ fn trace_path(
             bounce += 1;
             continue;
         }
-        // The stack changes only at surfaces, so the top medium spans this whole segment. Its free flight
-        // is spectral ratio tracking (`trace_mesh_medium`), and a scatter takes the same light sampling and
-        // phase step as a voxel event.
+        // The stack changes only at surfaces, so the top medium spans this whole segment. Each point light's
+        // direct light is Cycles' multiple importance sampling between equiangular and distance sampling
+        // (`volume_direct_sample_method`, `volume_ray_marching_state_init`): an equiangular-capable light is
+        // sampled along the segment with probability one half, and its other half is the scatter event below.
+        // Free flight is spectral ratio tracking (`trace_mesh_medium`).
         if let Some(medium) = media.last().map(|medium| medium.params) {
+            let budget = transparent_max_bounces.saturating_sub(transparent_bounce);
+            let mut equiangular = Vec::with_capacity(lights.len());
+            for light in lights {
+                equiangular.push(equiangular_capable(light) && rng.next_f64() < 0.5);
+            }
+            for (light, &sampled) in lights.iter().zip(&equiangular) {
+                if !sampled {
+                    continue;
+                }
+                let Some((distance, pdf)) = equiangular_sample(
+                    light.position,
+                    origin,
+                    direction,
+                    segment_limit,
+                    rng.next_f64(),
+                ) else {
+                    continue;
+                };
+                let point = origin + direction * distance;
+                let nee = volume_light_nee(
+                    doc,
+                    snapshot,
+                    geometry,
+                    bvh,
+                    volumes,
+                    &media,
+                    images,
+                    light,
+                    point,
+                    direction,
+                    medium.volume_anisotropy,
+                    budget,
+                    rng,
+                    evaluator_workspace,
+                )?;
+                let mis = 2.0 * power_heuristic(pdf, distance_scatter_pdf(&medium, distance));
+                radiance += throughput * camera_scatter(&medium, distance) * nee * (mis / pdf);
+            }
             match trace_mesh_medium(&medium, segment_limit, &mut throughput, rng) {
                 MediumOutcome::Scatter(distance) => {
                     let event = VolumeEvent {
@@ -911,6 +952,32 @@ fn trace_path(
                         albedo: DVec3::ZERO,
                         anisotropy: medium.volume_anisotropy,
                     };
+                    // A light sampled equiangularly takes no weight at the scatter event. Any other
+                    // equiangular-capable light is weighted against its equiangular pdf at this point
+                    // (`volume_direct_scatter_mis`), and a light with no equiangular sample takes it in full.
+                    let weights: Vec<f64> = lights
+                        .iter()
+                        .zip(&equiangular)
+                        .map(|(light, &sampled)| {
+                            if sampled {
+                                0.0
+                            } else if equiangular_capable(light) {
+                                let equiangular_density = equiangular_pdf(
+                                    light.position,
+                                    origin,
+                                    direction,
+                                    segment_limit,
+                                    distance,
+                                );
+                                2.0 * power_heuristic(
+                                    distance_scatter_pdf(&medium, distance),
+                                    equiangular_density,
+                                )
+                            } else {
+                                1.0
+                            }
+                        })
+                        .collect();
                     radiance += throughput
                         * direct_volume_lighting(
                             doc,
@@ -918,6 +985,7 @@ fn trace_path(
                             geometry,
                             bvh,
                             lights,
+                            &weights,
                             volumes,
                             &media,
                             images,
@@ -925,7 +993,7 @@ fn trace_path(
                             event,
                             direction,
                             environment,
-                            transparent_max_bounces.saturating_sub(transparent_bounce),
+                            budget,
                             rng,
                             evaluator_workspace,
                         )?;
@@ -1568,6 +1636,7 @@ fn direct_volume_lighting(
     geometry: &Geometry,
     bvh: &Bvh,
     lights: &[PointLight],
+    light_weights: &[f64],
     volumes: &[VolumeInstance<'_>],
     media: &[MeshMedium],
     images: &BTreeMap<String, ImageData>,
@@ -1580,14 +1649,12 @@ fn direct_volume_lighting(
     evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<DVec3> {
     let mut contribution = DVec3::ZERO;
-    for light in lights {
-        let Some(sample) = sample_light(light, event.point, rng) else {
-            continue;
-        };
-        if sample.radiance.max_element() <= 0.0 {
+    for (index, light) in lights.iter().enumerate() {
+        let weight = light_weights.get(index).copied().unwrap_or(1.0);
+        if weight <= 0.0 {
             continue;
         }
-        let visibility = shadow_transmittance(
+        contribution += volume_light_nee(
             doc,
             snapshot,
             geometry,
@@ -1595,16 +1662,14 @@ fn direct_volume_lighting(
             volumes,
             media,
             images,
+            light,
             event.point,
-            DVec3::ZERO,
-            sample.direction,
-            sample.distance,
+            incoming_direction,
+            event.anisotropy,
             transparent_budget,
             rng,
             evaluator_workspace,
-        )?;
-        let phase = henyey_greenstein(incoming_direction.dot(sample.direction), event.anisotropy);
-        contribution += sample.radiance * (phase * visibility);
+        )? * weight;
     }
     let (direction, pdf) = if let Some(sampler) = importance {
         sampler.sample(rng)
@@ -1658,6 +1723,150 @@ fn volume_sampling_pdf(direction: DVec3, importance: Option<&WorldImportanceSamp
     importance.map_or(1.0 / (4.0 * std::f64::consts::PI), |sampler| {
         sampler.pdf(direction)
     })
+}
+
+/// Whether a light's direct light has an equiangular sample. Cycles samples a point light's distance from the
+/// light's position; a sun has none (`volume_valid_direct_ray_segment`), and spot and area lights are not
+/// ported, so they take distance sampling only.
+fn equiangular_capable(light: &PointLight) -> bool {
+    light.kind == LightType::Point && light.radius <= 0.0
+}
+
+/// The geometry of Cycles' equiangular sampling (`volume_equiangular_sample`): the light's offset along the ray,
+/// its distance from the ray, and the angle that the segment `[0, distance]` subtends at the light.
+struct Equiangular {
+    delta: f64,
+    perpendicular: f64,
+    theta_a: f64,
+    theta_span: f64,
+}
+
+fn equiangular_geometry(
+    light: DVec3,
+    origin: DVec3,
+    direction: DVec3,
+    distance: f64,
+) -> Option<Equiangular> {
+    let delta = (light - origin).dot(direction);
+    let perpendicular = (light - origin - direction * delta).length();
+    if perpendicular <= 0.0 || !perpendicular.is_finite() {
+        return None;
+    }
+    let theta_a = (-delta).atan2(perpendicular);
+    let theta_b = (distance - delta).atan2(perpendicular);
+    Some(Equiangular {
+        delta,
+        perpendicular,
+        theta_a,
+        theta_span: theta_b - theta_a,
+    })
+}
+
+/// Cycles' equiangular sample of `[0, distance]` (`volume_equiangular_sample`): a distance along the ray and its
+/// density per unit distance. `None` when the light lies on the ray.
+fn equiangular_sample(
+    light: DVec3,
+    origin: DVec3,
+    direction: DVec3,
+    distance: f64,
+    xi: f64,
+) -> Option<(f64, f64)> {
+    let geometry = equiangular_geometry(light, origin, direction, distance)?;
+    if geometry.theta_span < 1.0e-6 {
+        // Cycles samples uniformly when the segment subtends almost no angle.
+        if distance <= 0.0 || !distance.is_finite() {
+            return None;
+        }
+        return Some((xi * distance, 1.0 / distance));
+    }
+    let offset = geometry.perpendicular * (geometry.theta_a + xi * geometry.theta_span).tan();
+    let pdf = geometry.perpendicular
+        / (geometry.theta_span
+            * (geometry.perpendicular * geometry.perpendicular + offset * offset));
+    Some(((geometry.delta + offset).clamp(0.0, distance), pdf))
+}
+
+/// The density per unit distance of `equiangular_sample` at `t` (`volume_equiangular_pdf`).
+fn equiangular_pdf(light: DVec3, origin: DVec3, direction: DVec3, distance: f64, t: f64) -> f64 {
+    let Some(geometry) = equiangular_geometry(light, origin, direction, distance) else {
+        return 0.0;
+    };
+    if geometry.theta_span < 1.0e-6 {
+        return if distance <= 0.0 || !distance.is_finite() {
+            0.0
+        } else {
+            1.0 / distance
+        };
+    }
+    let offset = t - geometry.delta;
+    geometry.perpendicular
+        / (geometry.theta_span
+            * (geometry.perpendicular * geometry.perpendicular + offset * offset))
+}
+
+/// The density per unit distance of the first real event of `trace_mesh_medium` being a scatter at `t`: the
+/// channel-mean scatter rate times the survival at the channel-mean extinction. Its weight in the MIS of
+/// `volume_direct_scatter_mis` needs only to be a positive function of `t`; the scatter's estimator is already
+/// weighted by the path, so the MIS stays unbiased for any such function.
+fn distance_scatter_pdf(medium: &BsdfParams, t: f64) -> f64 {
+    let scatter = DVec3::from_array(medium.volume_scatter);
+    let extinction = scatter + DVec3::from_array(medium.volume_absorption);
+    scatter.element_sum() / 3.0 * (-extinction.element_sum() / 3.0 * t).exp()
+}
+
+/// The camera-side scattered throughput of a homogeneous medium at `t`, per channel: σs · exp(-σt · t).
+fn camera_scatter(medium: &BsdfParams, t: f64) -> DVec3 {
+    let scatter = DVec3::from_array(medium.volume_scatter);
+    let extinction = scatter + DVec3::from_array(medium.volume_absorption);
+    scatter * DVec3::from_array(extinction.to_array().map(|sigma| (-sigma * t).exp()))
+}
+
+/// One point light's next-event estimate at `point` for an incoming travel direction: the sample's radiance, the
+/// Henyey-Greenstein phase and the shadow transmittance, without any MIS weight.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a light's estimate needs the scene, the medium stack, and the sampling state"
+)]
+fn volume_light_nee(
+    doc: &SceneDoc,
+    snapshot: &Snapshot,
+    geometry: &Geometry,
+    bvh: &Bvh,
+    volumes: &[VolumeInstance<'_>],
+    media: &[MeshMedium],
+    images: &BTreeMap<String, ImageData>,
+    light: &PointLight,
+    point: DVec3,
+    incoming_direction: DVec3,
+    anisotropy: f64,
+    transparent_budget: u32,
+    rng: &mut Pcg32,
+    evaluator_workspace: &mut EvaluatorWorkspace,
+) -> Result<DVec3> {
+    let Some(sample) = sample_light(light, point, rng) else {
+        return Ok(DVec3::ZERO);
+    };
+    if sample.radiance.max_element() <= 0.0 {
+        return Ok(DVec3::ZERO);
+    }
+    let visibility = shadow_transmittance(
+        doc,
+        snapshot,
+        geometry,
+        bvh,
+        volumes,
+        media,
+        images,
+        point,
+        DVec3::ZERO,
+        sample.direction,
+        sample.distance,
+        transparent_budget,
+        rng,
+        evaluator_workspace,
+    )?;
+    let phase = henyey_greenstein(incoming_direction.dot(sample.direction), anisotropy);
+    Ok(sample.radiance * (phase * visibility))
 }
 
 #[expect(
