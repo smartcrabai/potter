@@ -29,6 +29,156 @@ pub(super) fn libcxx_sort_by<T: Copy, F: Fn(&T, &T) -> bool>(v: &mut [T], less: 
     Sorter { v, less }.introsort(0, n, depth, true);
 }
 
+/// Blender `parallel_sort` for `IMesh::populate_vert` in a TBB build: `tbb::parallel_sort`
+/// (`BLI_sort.hh:11-20`). oneTBB (`include/oneapi/tbb/parallel_sort.h`) sorts fewer than 500
+/// elements with `std::sort` (libc++ on macOS, [`libcxx_sort_by`]). For 500 or more it runs
+/// `parallel_quick_sort`, whose tie order is not libc++'s. Blender's populate sort of the sphere
+/// boolean (1921 vertices, equal origins across operands) matched this model at every position.
+pub(super) fn parallel_sort_by<T: Copy, F: Fn(&T, &T) -> bool>(v: &mut [T], less: F) {
+    if v.len() < TBB_MIN_PARALLEL_SIZE {
+        libcxx_sort_by(v, less);
+        return;
+    }
+    let lt = |a: &T, b: &T| less(a, b);
+    // `parallel_quick_sort`: a pretest over the first elements, then over the rest. An already
+    // sorted input is left unchanged.
+    let mut unsorted = (0..TBB_SERIAL_CUTOFF).any(|k| lt(&v[k + 1], &v[k]));
+    if !unsorted {
+        unsorted = (TBB_SERIAL_CUTOFF + 1..v.len()).any(|k| lt(&v[k], &v[k - 1]));
+    }
+    if unsorted {
+        tbb_quick_sort_range(v, 0, v.len(), true, &lt);
+    }
+}
+
+/// oneTBB `parallel_sort` threshold (`min_parallel_size`, `parallel_sort.h`).
+const TBB_MIN_PARALLEL_SIZE: usize = 500;
+/// oneTBB `parallel_quick_sort` pretest cutoff (`serial_cutoff`, `parallel_sort.h`).
+const TBB_SERIAL_CUTOFF: usize = 9;
+/// oneTBB `quick_sort_range::grainsize`: ranges below this are sorted by `std::sort` as leaves.
+const TBB_GRAINSIZE: usize = 500;
+
+/// oneTBB `quick_sort_range::split_unchecked` (`parallel_sort.h`) on `v[first..last]`, depth-first.
+/// The partition is serial `std::partition`, which oneTBB uses below `500 * max_concurrency`
+/// elements (`_parallel_partition.h`); the leaves are libc++ `std::sort`.
+fn tbb_quick_sort_range<T: Copy>(
+    v: &mut [T],
+    mut first: usize,
+    mut last: usize,
+    mut leftmost: bool,
+    lt: &dyn Fn(&T, &T) -> bool,
+) {
+    loop {
+        if last - first < TBB_GRAINSIZE {
+            libcxx_sort_by(&mut v[first..last], |a, b| lt(a, b));
+            return;
+        }
+        // `pseudo_median_of_nine`
+        let n = last - first;
+        let offset = n / 8;
+        let med =
+            |v: &[T], l: usize, m: usize, r: usize| tbb_median_of_three(v, first, l, m, r, lt);
+        let p = med(
+            v,
+            med(v, 0, offset, offset * 2),
+            med(v, offset * 3, offset * 4, offset * 5),
+            med(v, offset * 6, offset * 7, n - 1),
+        );
+        if p != 0 {
+            v.swap(first, first + p);
+        }
+        // `value_type pivot = std::move(*m_first)`
+        let pivot = v[first];
+        if !leftmost && !lt(&v[first - 1], &pivot) {
+            // Equal to the previous pivot: partition the equal elements to the front.
+            let equal_end = tbb_partition(v, first + 1, last, |x| !lt(&pivot, x));
+            v[first] = pivot;
+            first = equal_end;
+            continue;
+        }
+        let it = tbb_partition(v, first + 1, last, |x| lt(x, &pivot));
+        v[first] = pivot;
+        let pivot_pos = if it == first + 1 {
+            first
+        } else {
+            v.swap(first, it - 1);
+            it - 1
+        };
+        let left_size = pivot_pos - first;
+        let right_size = last - (pivot_pos + 1);
+        if left_size == 0 {
+            first = pivot_pos + 1;
+            leftmost = false;
+        } else if right_size == 0 {
+            last = pivot_pos;
+        } else {
+            tbb_quick_sort_range(v, first, pivot_pos, leftmost, lt);
+            first = pivot_pos + 1;
+            leftmost = false;
+        }
+    }
+}
+
+/// oneTBB `pseudo_median_of_nine` helper: index (relative to `first`) of the median of three.
+fn tbb_median_of_three<T: Copy>(
+    v: &[T],
+    first: usize,
+    l: usize,
+    m: usize,
+    r: usize,
+    lt: &dyn Fn(&T, &T) -> bool,
+) -> usize {
+    let (vl, vm, vr) = (v[first + l], v[first + m], v[first + r]);
+    if lt(&vl, &vm) {
+        if lt(&vm, &vr) {
+            m
+        } else if lt(&vl, &vr) {
+            r
+        } else {
+            l
+        }
+    } else if lt(&vr, &vm) {
+        m
+    } else if lt(&vr, &vl) {
+        r
+    } else {
+        l
+    }
+}
+
+/// libc++ `std::partition` (bidirectional form) on `v[first..last]`: returns the first element
+/// for which `pred` is false.
+fn tbb_partition<T: Copy>(
+    v: &mut [T],
+    mut first: usize,
+    mut last: usize,
+    pred: impl Fn(&T) -> bool,
+) -> usize {
+    loop {
+        loop {
+            if first == last {
+                return first;
+            }
+            if pred(&v[first]) {
+                first += 1;
+            } else {
+                break;
+            }
+        }
+        loop {
+            last -= 1;
+            if first == last {
+                return first;
+            }
+            if pred(&v[last]) {
+                break;
+            }
+        }
+        v.swap(first, last);
+        first += 1;
+    }
+}
+
 struct Sorter<'a, T, F> {
     v: &'a mut [T],
     less: F,
@@ -627,5 +777,45 @@ mod tests {
                 1, 16, 34, 7, 31, 14, 29, 26, 2, 5, 11, 23, 20, 38, 8, 17, 35, 32
             ]
         );
+    }
+
+    /// Parses one `created sort-value position` row of the recorded Blender populate order.
+    fn parse_populate_row(line: &str) -> Option<(bool, i64, usize)> {
+        let mut fields = line.split_whitespace();
+        let created = fields.next()?.parse::<u8>().ok()?;
+        let value = fields.next()?.parse::<i64>().ok()?;
+        let position = fields.next()?.parse::<usize>().ok()?;
+        Some((created == 1, value, position))
+    }
+
+    /// Blender 5.2.2 populate order of the `sphere_closed64_hole_tolerant_on` EXACT boolean: 1921
+    /// vertices, so `parallel_sort` takes the oneTBB quicksort path (500 or more). Each line is
+    /// `created sort-value position`, in first-seen order over the output faces.
+    #[test]
+    fn parallel_sort_matches_recorded_blender_tbb_order() {
+        let text = include_str!("testdata/populate_sphere_closed64.txt");
+        let rows: Vec<(bool, i64, usize)> = text
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .filter_map(parse_populate_row)
+            .collect();
+        assert_eq!(rows.len(), 1921);
+        // Potter's populate key: input (false, origin, 0), created (true, 0, id).
+        let key = |s: usize| {
+            let (created, value, _) = rows[s];
+            if created {
+                (true, 0i64, value)
+            } else {
+                (false, value, 0i64)
+            }
+        };
+        let mut order: Vec<usize> = (0..rows.len()).collect();
+        parallel_sort_by(&mut order, |&a, &b| key(a) < key(b));
+        let mut position = vec![0usize; rows.len()];
+        for (index, &slot) in order.iter().enumerate() {
+            position[slot] = index;
+        }
+        let recorded: Vec<usize> = rows.iter().map(|row| row.2).collect();
+        assert_eq!(position, recorded);
     }
 }

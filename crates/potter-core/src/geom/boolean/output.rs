@@ -333,7 +333,8 @@ struct PlannedFace {
 /// `vert_[index] = item.key`) and sorts it with the comparator at `mesh_intersect.cc:583-594`: input
 /// vertices by ascending origin, created vertices after them by id. Two input vertices with the same
 /// local origin (different operands) tie in that sort, and the tie order sets the stored direction of
-/// an edge joining them. `libcxx_sort::libcxx_sort_by` reproduces the libc++ order for ties.
+/// an edge joining them. `libcxx_sort::parallel_sort_by` reproduces the tie order: libc++ below 500
+/// vertices, and oneTBB's quicksort at 500 or more (Blender's TBB `parallel_sort`).
 fn plan(polys: &[Poly], arena: &Arena, layout: &Layout) -> Result<(Vec<u32>, Vec<PlannedFace>)> {
     let mut seen_ids: Vec<u32> = Vec::new();
     let mut seen_slot: HashMap<u32, usize> = HashMap::new();
@@ -373,7 +374,7 @@ fn plan(polys: &[Poly], arena: &Arena, layout: &Layout) -> Result<(Vec<u32>, Vec
             (false, orig, 0)
         }
     };
-    super::libcxx_sort::libcxx_sort_by(&mut order, |&a, &b| key(a) < key(b));
+    super::libcxx_sort::parallel_sort_by(&mut order, |&a, &b| key(a) < key(b));
     let mut position = vec![0; seen_ids.len()];
     for (index, &slot) in order.iter().enumerate() {
         position[slot] = index;
