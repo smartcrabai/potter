@@ -9047,10 +9047,11 @@ fn collect_physics_import_losses(
             continue;
         }
         let default = crate::physics_support::blender_default(system, key);
-        let unchanged = default.map_or_else(
-            || value.is_null(),
-            |default| same_physics_value(value, default),
-        );
+        let unchanged = if default.is_some() {
+            crate::physics_support::is_default_value(system, key, value)
+        } else {
+            value.is_null()
+        };
         if unchanged {
             continue;
         }
@@ -9183,33 +9184,6 @@ fn nested_physics_system(system: &str, key: &str) -> Option<&'static str> {
         ("dynamic_paint_canvas", "canvas_surfaces") => Some("dynamic_paint_surface"),
         (_, "point_cache") => Some("point_cache"),
         _ => None,
-    }
-}
-
-/// Equality of two physics values. JSON numbers compare as numbers, so `1` and `1.0` are the same value, and floats compare
-/// within the precision Blender stores.
-fn same_physics_value(left: &Value, right: &Value) -> bool {
-    match (left, right) {
-        (Value::Number(left), Value::Number(right)) => match (left.as_f64(), right.as_f64()) {
-            (Some(left), Some(right)) => (left - right).abs() <= 1.0e-6,
-            _ => left == right,
-        },
-        (Value::Array(left), Value::Array(right)) => {
-            left.len() == right.len()
-                && left
-                    .iter()
-                    .zip(right)
-                    .all(|(left, right)| same_physics_value(left, right))
-        }
-        (Value::Object(left), Value::Object(right)) => {
-            left.len() == right.len()
-                && left.iter().all(|(key, value)| {
-                    right
-                        .get(key)
-                        .is_some_and(|other| same_physics_value(value, other))
-                })
-        }
-        _ => left == right,
     }
 }
 

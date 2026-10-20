@@ -888,14 +888,13 @@ pub(super) fn update_linked_modifier_settings(
         let role = modifier_flags
             .get("ui_type")
             .and_then(Value::as_str)
-            .map(|ui_type| {
+            .map_or(current_role.as_str(), |ui_type| {
                 if ui_type == "BRUSH" {
                     "brush"
                 } else {
                     "canvas"
                 }
             })
-            .unwrap_or(current_role.as_str())
             .to_owned();
         settings.insert("role".to_owned(), Value::String(role.clone()));
         modifier_flags.insert(

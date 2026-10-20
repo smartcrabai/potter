@@ -220,7 +220,7 @@ impl VdbGrid {
     #[must_use]
     pub fn sample_world(&self, position: DVec3) -> f64 {
         let index = self.transform.world_to_index.transform_point3(position);
-        self.trilinear_index(index, self.tree.background, |point| {
+        Self::trilinear_index(index, self.tree.background, |point| {
             self.sample_value(IVec3::from_array(point)).scalar()
         })
     }
@@ -234,7 +234,7 @@ impl VdbGrid {
             .background_value
             .component(component)
             .unwrap_or(0.0);
-        self.trilinear_index(index, background, |point| {
+        Self::trilinear_index(index, background, |point| {
             self.sample_index_component(point, component)
                 .unwrap_or(background)
         })
@@ -251,18 +251,13 @@ impl VdbGrid {
     #[must_use]
     pub(crate) fn sample_index_scalar_linear(&self, index: DVec3) -> Option<f64> {
         self.is_scalar().then(|| {
-            self.trilinear_index(index, self.tree.background, |point| {
+            Self::trilinear_index(index, self.tree.background, |point| {
                 self.sample_value(IVec3::from_array(point)).scalar()
             })
         })
     }
 
-    fn trilinear_index(
-        &self,
-        index: DVec3,
-        background: f64,
-        sample: impl Fn([i32; 3]) -> f64,
-    ) -> f64 {
+    fn trilinear_index(index: DVec3, background: f64, sample: impl Fn([i32; 3]) -> f64) -> f64 {
         if !index.is_finite() {
             return background;
         }

@@ -423,7 +423,7 @@ fn project_collisions(
             }
             let side = if start_signed > 0.0 {
                 1.0
-            } else if start_signed < 0.0 || end_signed > 0.0 {
+            } else if start_signed < 0.0 {
                 -1.0
             } else if end_signed < 0.0 {
                 1.0

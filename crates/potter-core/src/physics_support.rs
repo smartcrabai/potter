@@ -15,6 +15,7 @@ use crate::error::{ErrorCode, PotError, Result};
 ///
 /// `fluid_domain` is the GAS table and `fluid_domain_liquid` the LIQUID table, because Blender's
 /// domain defaults depend on `domain_type`. Use [`fluid_domain_system`] to pick one.
+#[cfg(test)]
 pub(crate) const PHYSICS_SYSTEMS: [&str; 12] = [
     "cloth",
     "cloth_collision",
@@ -111,6 +112,11 @@ pub(crate) fn honoured_properties(system: &str) -> &'static [&'static str] {
 /// Blender 5.2.2 default for `property` of `system`, as generated from a fresh instance.
 pub(crate) fn blender_default(system: &str, property: &str) -> Option<&'static Value> {
     DEFAULTS.get("systems")?.get(system)?.get(property)
+}
+
+/// Blender 5.2.2 property names and defaults of `system`, or `None` when the system is not generated.
+pub(crate) fn blender_properties(system: &str) -> Option<&'static Map<String, Value>> {
+    DEFAULTS.get("systems")?.get(system)?.as_object()
 }
 
 /// True when `property` is a Blender 5.2.2 writable RNA property of `system`.

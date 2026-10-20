@@ -348,7 +348,7 @@ fn project_collisions(
             }
             let side = if start_signed > 0.0 {
                 1.0
-            } else if start_signed < 0.0 || end_signed > 0.0 {
+            } else if start_signed < 0.0 {
                 -1.0
             } else if end_signed < 0.0 {
                 1.0
@@ -532,8 +532,9 @@ fn check_work(
     iterations: usize,
     steps: usize,
 ) -> Result<()> {
-    let iteration_work = edges
-        .checked_add(vertices.checked_mul(3)?)
+    let iteration_work = vertices
+        .checked_mul(3)
+        .and_then(|work| work.checked_add(edges))
         .and_then(|work| work.checked_mul(iterations))
         .and_then(|work| work.checked_add(vertices))
         .and_then(|work| work.checked_add(vertices.checked_mul(collider_triangles)?))

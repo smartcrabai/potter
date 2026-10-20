@@ -879,7 +879,7 @@ fn displace_inline_grid(grid: &mut VolumeGrid, texture: &VolumeDisplacement<'_>)
     Ok(())
 }
 
-/// Largest voxel side of an index-to-local transform (OpenVDB's `voxelSize().max()`).
+/// Largest voxel side of an index-to-local transform (`OpenVDB`'s `voxelSize().max()`).
 fn max_voxel_side_length(index_to_local: DMat4) -> f64 {
     [
         index_to_local.x_axis,

@@ -56,7 +56,6 @@ const EXPECTED_PHYSICS_LOSSES: &[&str] = &[
     "blender.physics.dynamic_paint_surface.dry_speed",
     "blender.physics.dynamic_paint_surface.use_dissolve",
     "blender.physics.fluid_domain.cache_data_format",
-    "blender.physics.fluid_domain.cache_directory",
     "blender.physics.fluid_domain.cache_frame_offset",
     "blender.physics.fluid_domain.cache_mesh_format",
     "blender.physics.fluid_domain.time_scale",

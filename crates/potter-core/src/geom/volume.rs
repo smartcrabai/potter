@@ -97,7 +97,7 @@ impl VolumeGrid {
         let is_affine = matrix.x_axis.w == 0.0
             && matrix.y_axis.w == 0.0
             && matrix.z_axis.w == 0.0
-            && matrix.w_axis.w == 1.0;
+            && matrix.w_axis.w.to_bits() == 1.0_f64.to_bits();
         let determinant = matrix.determinant();
         if !matrix.is_finite()
             || !is_affine
@@ -372,7 +372,7 @@ pub(crate) fn sample_density_checked_with_inverse(
     Ok(result)
 }
 
-/// Extract an iso-surface of the first scalar grid using OpenVDB-style dual contouring.
+/// Extract an iso-surface of the first scalar grid using `OpenVDB`-style dual contouring.
 ///
 /// Each intersected cell contributes a feature point per connected contour component. Intersected
 /// grid edges connect those points, while adaptivity merges regions into quads or triangles.
@@ -381,12 +381,12 @@ pub(crate) fn sample_density_checked_with_inverse(
 ///
 /// Returns a typed error for unsupported file formats, unresolved VDB resources, invalid grid
 /// data or iso-levels, and resource-limit violations. A field that does not cross the iso-level
-/// yields an empty mesh, as OpenVDB and Blender do.
+/// yields an empty mesh, as `OpenVDB` and Blender do.
 pub fn volume_to_mesh(volume: &VolumeData, iso_level: f64) -> Result<Mesh> {
     volume_to_mesh_for_grid(volume, iso_level, None, 0.0)
 }
 
-/// Extract a named volume grid with OpenVDB's adaptive merging threshold (`0.0..=1.0`).
+/// Extract a named volume grid with `OpenVDB`'s adaptive merging threshold (`0.0..=1.0`).
 pub fn volume_to_mesh_named_adaptive(
     volume: &VolumeData,
     iso_level: f64,
@@ -766,7 +766,7 @@ fn dual_contour_grid_to_mesh(
                             face_edges[crossed_edges[1]],
                         ),
                         4 => {
-                            let pairs = if f64::from(cube_values[face_corners[0]]) < iso_level {
+                            let pairs = if cube_values[face_corners[0]] < iso_level {
                                 [
                                     (face_edges[crossed_edges[0]], face_edges[crossed_edges[3]]),
                                     (face_edges[crossed_edges[1]], face_edges[crossed_edges[2]]),
@@ -853,7 +853,7 @@ fn dual_contour_grid_to_mesh(
             for x in 0..nx - 1 {
                 let first = grid_sample(values, x, y, z, nx, ny)?;
                 let second = grid_sample(values, x + 1, y, z, nx, ny)?;
-                if (f64::from(first) < iso_level) == (f64::from(second) < iso_level) {
+                if (first < iso_level) == (second < iso_level) {
                     continue;
                 }
                 append_dual_face(
@@ -866,7 +866,7 @@ fn dual_contour_grid_to_mesh(
                         ((x, y, z), 0),
                         ((x, y - 1, z), 2),
                     ],
-                    f64::from(first) < iso_level,
+                    first < iso_level,
                     inside_is_low,
                     adaptive,
                 )?;
@@ -878,7 +878,7 @@ fn dual_contour_grid_to_mesh(
             for x in 1..nx - 1 {
                 let first = grid_sample(values, x, y, z, nx, ny)?;
                 let second = grid_sample(values, x, y + 1, z, nx, ny)?;
-                if (f64::from(first) < iso_level) == (f64::from(second) < iso_level) {
+                if (first < iso_level) == (second < iso_level) {
                     continue;
                 }
                 append_dual_face(
@@ -891,7 +891,7 @@ fn dual_contour_grid_to_mesh(
                         ((x, y, z), 3),
                         ((x, y, z - 1), 7),
                     ],
-                    f64::from(first) < iso_level,
+                    first < iso_level,
                     inside_is_low,
                     adaptive,
                 )?;
@@ -903,7 +903,7 @@ fn dual_contour_grid_to_mesh(
             for x in 1..nx - 1 {
                 let first = grid_sample(values, x, y, z, nx, ny)?;
                 let second = grid_sample(values, x, y, z + 1, nx, ny)?;
-                if (f64::from(first) < iso_level) == (f64::from(second) < iso_level) {
+                if (first < iso_level) == (second < iso_level) {
                     continue;
                 }
                 append_dual_face(
@@ -916,7 +916,7 @@ fn dual_contour_grid_to_mesh(
                         ((x, y, z), 8),
                         ((x - 1, y, z), 9),
                     ],
-                    f64::from(first) < iso_level,
+                    first < iso_level,
                     inside_is_low,
                     adaptive,
                 )?;
@@ -1060,7 +1060,7 @@ fn adaptable_signs(signs: [bool; 8]) -> bool {
         .iter()
         .enumerate()
         .fold(0_usize, |mask, (bit, corner)| {
-            mask | ((if signs[*corner] { 1 } else { 0 }) << bit)
+            mask | (usize::from(signs[*corner]) << bit)
         });
     OPENVDB_ADAPTABLE[mask] != 0
 }
@@ -1258,7 +1258,7 @@ fn merge_adaptive_regions(
     let normal_to_local = grid.checked_index_to_local_matrix()?.inverse().transpose();
     let mut leaves = HashSet::new();
     let mut blocked = HashSet::<([i64; 3], i64)>::new();
-    for (cell, edges) in cell_edges {
+    for (cell, edges) in &*cell_edges {
         let coordinate = global_cell_coordinates(*cell, cell_dims, grid_origin);
         let leaf = coordinate.map(|axis| axis.div_euclid(8) * 8);
         leaves.insert(leaf);
@@ -1589,9 +1589,9 @@ fn vdb_resource_unavailable() -> PotError {
 ///
 /// The dense inline representation stores integer-index samples over the source bounds plus one
 /// zero-background sample outside each side. This makes the inline grid read identically through
-/// [`sample_density`] and [`volume_to_mesh`] without exposing OpenVDB's sparse leaf topology.
+/// [`sample_density`] and [`volume_to_mesh`] without exposing `OpenVDB`'s sparse leaf topology.
 ///
-/// A voxel cube below OpenVDB's determinant tolerance, or an empty mesh, creates no grid: the
+/// A voxel cube below `OpenVDB`'s determinant tolerance, or an empty mesh, creates no grid: the
 /// result is the empty volume (see [`VolumeData`] with zero grids), as Blender's conversion does.
 ///
 /// # Errors
@@ -1809,10 +1809,10 @@ fn renormalize_signed_distances(
         let shifted = *value - offset;
         *value = shifted.min(renormalized[index]) + offset - epsilon;
         if *value < 0.0 {
-            if !(*value > -interior_distance) {
+            if *value <= -interior_distance || value.is_nan() {
                 *value = -interior_distance;
             }
-        } else if !(*value < voxel_size) {
+        } else if *value >= voxel_size || value.is_nan() {
             *value = voxel_size;
         }
     }

@@ -1124,6 +1124,47 @@ fn modifier_to_apply(engine: &Engine<'_>, target: &Id, modifier_id: &Id) -> Resu
     Ok(stack[index].clone())
 }
 
+/// Refuses applying a Volume To Mesh whose referenced Volume node carries an enabled Mesh To Volume
+/// or Volume Displace modifier. The apply path reads only the referenced volume's base grids, while
+/// preview and render evaluate that stack first, so the applied mesh would differ from the preview.
+fn refuse_unevaluated_volume_stack(doc: &SceneDoc, modifier_stack: &[Modifier]) -> Result<()> {
+    for modifier in modifier_stack
+        .iter()
+        .filter(|modifier| modifier.enabled && modifier.modifier_type == "volume_to_mesh")
+    {
+        let Some(volume_id) = modifier
+            .params
+            .get("object")
+            .and_then(Value::as_str)
+            .and_then(|text| Id::new(text).ok())
+        else {
+            continue;
+        };
+        let Some(volume_node) = doc.nodes.get(&volume_id) else {
+            continue;
+        };
+        let evaluates_stack = volume_node.modifiers.iter().any(|volume_modifier| {
+            volume_modifier.enabled
+                && matches!(
+                    volume_modifier.modifier_type.as_str(),
+                    "mesh_to_volume" | "volume_displace"
+                )
+        });
+        if evaluates_stack {
+            return Err(PotError::with_details(
+                ErrorCode::UnsupportedFeature,
+                "applying Volume To Mesh does not evaluate the referenced volume's modifier stack yet",
+                json!({
+                    "feature_id":"modifier.volume_to_mesh.apply_volume_stack",
+                    "modifier_id":modifier.id,
+                    "object":volume_id,
+                }),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn evaluate_modifier_output(
     engine: &mut Engine<'_>,
     target: &Id,
@@ -1169,6 +1210,7 @@ fn evaluate_modifier_output(
         let uses_volume_node = modifier_stack
             .iter()
             .any(|modifier| modifier.enabled && modifier.modifier_type == "volume_to_mesh");
+        refuse_unevaluated_volume_stack(engine.doc, modifier_stack)?;
         let uses_scene_context = modifier_stack.iter().any(|modifier| {
             if !modifier.enabled {
                 return false;

@@ -2362,7 +2362,9 @@ fn object_mesh_dependencies(
                 continue;
             }
             let parameters: &[&str] = match modifier.modifier_type.as_str() {
-                "data_transfer" | "mesh_deform" | "curve" | "mesh_to_volume" => &["object"],
+                "data_transfer" | "mesh_deform" | "curve" | "mesh_to_volume" | "volume_to_mesh" => {
+                    &["object"]
+                }
                 "shrinkwrap" => {
                     if modifier
                         .params

@@ -1,15 +1,18 @@
+#![expect(clippy::expect_used, reason = "integration test fixtures")]
+
 use std::{cmp::Ordering, collections::HashMap, fs};
 
 use glam::DVec3;
 use potter_core::{
     error::ErrorCode,
     eval::{EvaluationContext, Snapshot},
-    geom::{Aabb, BoxParams, Mesh, VolumeData, VolumeFileSource, VolumeGrid, VolumeSource, volume},
+    geom::{Aabb, BoxParams, Mesh, volume},
     hash,
     image::encode_pixels,
     model::{
         DataBlock, Id, Image, ImageAlphaMode, ImageColorspace, ImageSource, Modifier,
-        ModifierRuntime, Node, SceneDoc, Transform,
+        ModifierRuntime, Node, SceneDoc, Transform, VolumeData, VolumeFileSource, VolumeGrid,
+        VolumeSource,
     },
 };
 use serde::Deserialize;
@@ -110,7 +113,6 @@ struct MultiGridVdbOracle {
 struct VdbGridOracle {
     name: String,
     value_type: String,
-    background: Option<[f64; 3]>,
     grid_class: Option<String>,
     stored_class: Option<String>,
 }
@@ -339,7 +341,7 @@ fn blender_5_2_2_volume_modifier_meshes_match_fixtures() {
 
 #[test]
 fn invalid_voxel_size_produces_no_mesh_to_volume_grid() {
-    let mesh = Mesh::box_mesh(Default::default()).expect("valid cube");
+    let mesh = Mesh::box_mesh(BoxParams::default()).expect("valid cube");
     let result = volume::mesh_to_fog_volume(&mesh, 1.0e-6, 0.2, 1.0)
         .expect("invalid modifier voxel size creates no grid");
     assert!(result.grids.is_empty());
@@ -516,6 +518,7 @@ fn image_displace_scene(case: &DisplaceCase, image_id: &Id, image_blob: &str) ->
             source_path: None,
             source_hash: None,
             alpha_mode: ImageAlphaMode::Straight,
+            tiled: false,
         },
     );
     doc.data_blocks.insert(
@@ -814,6 +817,7 @@ fn blender_multigrid_vdb_displacement_preserves_named_grid_types_and_samples() {
             source_path: None,
             source_hash: None,
             alpha_mode: ImageAlphaMode::Straight,
+            tiled: false,
         },
     );
 
@@ -1183,7 +1187,7 @@ fn blender_multigrid_vdb_displacement_preserves_named_grid_types_and_samples() {
             .sample_index_component(oracle.velocity_probe.index, axis)
             .expect("typed vector sample component");
         assert!(
-            (f64::from(actual) - expected_sample[axis]).abs() <= tolerance,
+            (actual - expected_sample[axis]).abs() <= tolerance,
             "velocity component {axis}: got {actual}, expected {}",
             expected_sample[axis]
         );

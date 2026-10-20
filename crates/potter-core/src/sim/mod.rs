@@ -396,7 +396,7 @@ pub(crate) fn evaluate_stack_modifier(
                 birth_frame: particle.birth_frame,
                 death_frame: particle.death_frame,
                 life_state: particle.life_state,
-                system_index: 0,
+                system_index,
                 is_child: particle.is_child,
                 size: particle.size,
                 mass: particle.mass,
@@ -446,8 +446,7 @@ pub(crate) fn evaluate_stack_modifier(
                 );
             }
         }
-        "dynamic_paint" => {}
-        "collision" => {}
+        "dynamic_paint" | "collision" => {}
         _ => {
             return Err(PotError::new(
                 ErrorCode::InternalError,
@@ -856,7 +855,7 @@ fn fluid_mesh_triangles(
         .iter()
         .map(|vertex| (vertex.id, matrix.transform_point3(vertex.co)))
         .collect::<BTreeMap<_, _>>();
-    let mesh_triangles = mesh.triangulate().map_err(|error| {
+    let mesh_triangles = mesh.tessellate().map_err(|error| {
         PotError::with_details(
             ErrorCode::SceneInvalid,
             format!("fluid mesh `{node_id}` is invalid: {error}"),
@@ -1202,12 +1201,10 @@ fn collider_triangles(
             continue;
         }
         physics_support::reject_unhonoured("collision", settings, honoured)?;
-        let thickness_outer =
-            super::nonnegative_setting(settings, "thickness_outer", 0.02, "collision")?;
-        let thickness_inner =
-            super::nonnegative_setting(settings, "thickness_inner", 0.2, "collision")?;
+        let thickness_outer = nonnegative_setting(settings, "thickness_outer", 0.02, "collision")?;
+        let thickness_inner = nonnegative_setting(settings, "thickness_inner", 0.2, "collision")?;
         let culling = bool_setting(settings, "use_culling", true, "collision")?;
-        let friction = super::nonnegative_setting(settings, "cloth_friction", 5.0, "collision")?;
+        let friction = nonnegative_setting(settings, "cloth_friction", 5.0, "collision")?;
         let mesh = mesh_for_node(doc, node, id)?;
         let matrix = matrices.get(id).copied().ok_or_else(|| {
             PotError::with_details(
@@ -1461,9 +1458,9 @@ fn fluid_particle_radius(settings: &Value, domain: &Mesh, matrix: DMat4) -> Resu
     if settings.get("domain_type").is_none() {
         return Ok(setting_f64(settings, "particle_radius").unwrap_or(0.15));
     }
-    let factor = super::nonnegative_setting(settings, "particle_radius", 1.0, "fluid")?;
+    let factor = nonnegative_setting(settings, "particle_radius", 1.0, "fluid")?;
     let resolution_max =
-        super::setting_number(settings, "resolution_max", 32.0, "fluid", "a finite number")?;
+        setting_number(settings, "resolution_max", 32.0, "fluid", "a finite number")?;
     if resolution_max < 1.0 {
         return Err(PotError::invalid_argument(
             "fluid resolution_max must be at least 1",
@@ -1566,7 +1563,7 @@ fn flow_inflow_rate(settings: &Value) -> Result<f64> {
             ));
         }
     }
-    super::nonnegative_setting(settings, "inflow_rate", 0.0, "fluid")
+    nonnegative_setting(settings, "inflow_rate", 0.0, "fluid")
 }
 
 /// Liquid obstacle triangles from the fluid effector objects in `collection`.

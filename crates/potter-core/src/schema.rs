@@ -2402,7 +2402,67 @@ fn set_schema(operation: &str) -> Value {
 
 fn physics_settings_schema(operation: &str) -> Value {
     let properties = physics_settings_properties(operation);
-    json!({"type":"object","properties":properties,"additionalProperties":true})
+    json!({"type":"object","properties":properties,"additionalProperties":false})
+}
+
+/// Blender RNA settings that operation `system` accepts, typed from their generated defaults.
+///
+/// Every Blender name is listed, so a non-honoured value reaches ops, which refuses it with
+/// `UnsupportedFeature`. A type comes from the defaults only when every table that holds the name
+/// agrees on it. A `null` default says nothing about the type.
+fn blender_schema_properties(system: &str) -> Map<String, Value> {
+    const ROLE_TABLES: [&str; 8] = [
+        "fluid_domain",
+        "fluid_domain_liquid",
+        "fluid_flow",
+        "fluid_effector",
+        "dynamic_paint_canvas",
+        "dynamic_paint_surface",
+        "dynamic_paint_brush",
+        "point_cache",
+    ];
+    let tables: &[&str] = match system {
+        "cloth" => &["cloth"],
+        "soft_body" => &["soft_body"],
+        "collision" => &["collision"],
+        // Ops accepts any fluid or dynamic-paint role's Blender names and checks the role there.
+        "fluid" | "dynamic_paint" => &ROLE_TABLES,
+        _ => &[],
+    };
+    let mut names = std::collections::BTreeSet::new();
+    let mut kinds = std::collections::BTreeMap::<&str, std::collections::BTreeSet<&str>>::new();
+    for table in tables {
+        for (name, default) in crate::physics_support::blender_properties(table)
+            .into_iter()
+            .flatten()
+        {
+            names.insert(name.as_str());
+            if let Some(kind) = json_type(default) {
+                kinds.entry(name.as_str()).or_default().insert(kind);
+            }
+        }
+    }
+    names
+        .into_iter()
+        .map(|name| {
+            let schema = match kinds.get(name) {
+                Some(types) if types.len() == 1 => json!({"type": types.iter().next().copied()}),
+                _ => json!({}),
+            };
+            (name.to_owned(), schema)
+        })
+        .collect()
+}
+
+fn json_type(value: &Value) -> Option<&'static str> {
+    match value {
+        Value::Bool(_) => Some("boolean"),
+        Value::Number(_) => Some("number"),
+        Value::String(_) => Some("string"),
+        Value::Array(_) => Some("array"),
+        Value::Object(_) => Some("object"),
+        Value::Null => None,
+    }
 }
 
 fn physics_settings_properties(operation: &str) -> Value {
@@ -2411,6 +2471,15 @@ fn physics_settings_properties(operation: &str) -> Value {
         .and_then(|name| name.split_once('.'))
         .map(|(system, _)| system)
         .unwrap_or_default();
+    let mut properties = blender_schema_properties(system);
+    if let Value::Object(native) = physics_native_properties(system) {
+        properties.extend(native);
+    }
+    Value::Object(properties)
+}
+
+/// Potter-native and explicitly ranged settings of a physics system. They override the Blender names.
+fn physics_native_properties(system: &str) -> Value {
     match system {
         "cloth" => json!({
             "quality":{"type":"integer","minimum":1,"maximum":32},
@@ -2468,7 +2537,15 @@ fn physics_settings_properties(operation: &str) -> Value {
             "child_radius":{"type":"number","minimum":0},
             "child_type":{"enum":["NONE","SIMPLE","INTERPOLATED"]},
             "frame_start":{"type":"number"},
-            "frame_end":{"type":"number"}
+            "frame_end":{"type":"number"},
+            "source":{"enum":["faces","vertices"]},
+            "velocity":vec_schema(3),
+            "normal_velocity":{"type":"number","minimum":0},
+            "render_as":{"enum":["points","object","hair_curves"]},
+            "instance_object":{"type":"string","minLength":1},
+            "hair_length":{"type":"number","exclusiveMinimum":0},
+            "start_frame":{"type":"number"},
+            "end_frame":{"type":"number"}
         }),
         "fluid" => json!({
             "domain_type":{"enum":["LIQUID","GAS"]},
