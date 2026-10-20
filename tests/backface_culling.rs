@@ -16,7 +16,7 @@ mod native_oracle;
 #[path = "common/process.rs"]
 mod process;
 
-use std::{fs, io::BufReader, path::Path, process::Command};
+use std::{fs, io::BufReader, path::Path, process::Command, sync::OnceLock};
 
 use blender_checked::blender_executable;
 use native_oracle::{
@@ -63,6 +63,21 @@ fn blender_coverage(blender: &Path, root: &Path) -> TestResult<Value> {
     Ok(serde_json::from_slice(&fs::read(&expected_json)?)?)
 }
 
+/// The oracle's coverage, rendered once per test binary: the three tests read different cases
+/// of the same Blender run, which takes seconds to render (EEVEE included).
+static COVERAGE: OnceLock<Result<Value, String>> = OnceLock::new();
+
+/// The oracle's coverage, shared by every test in this binary.
+fn shared_coverage(blender: &Path) -> TestResult<Value> {
+    COVERAGE
+        .get_or_init(|| {
+            let root = tempdir().map_err(|error| error.to_string())?;
+            blender_coverage(blender, root.path()).map_err(|error| error.to_string())
+        })
+        .clone()
+        .map_err(Into::into)
+}
+
 #[test]
 fn solid_preview_draws_back_faces_as_workbench_does() -> TestResult {
     let Some(blender) = blender_executable() else {
@@ -70,7 +85,7 @@ fn solid_preview_draws_back_faces_as_workbench_does() -> TestResult {
         return Ok(());
     };
     let root = tempdir()?;
-    let expected = blender_coverage(&blender, root.path())?;
+    let expected = shared_coverage(&blender)?;
 
     let scene = root.path().join("scene");
     pot_json(|command| {
@@ -120,7 +135,7 @@ fn realtime_beauty_culls_single_sided_back_faces_as_eevee_does() -> TestResult {
         return Ok(());
     };
     let root = tempdir()?;
-    let expected = blender_coverage(&blender, root.path())?;
+    let expected = shared_coverage(&blender)?;
 
     let scene = root.path().join("scene");
     pot_json(|command| {
@@ -197,7 +212,7 @@ fn blender_scene_backface_culling_imports_as_a_reported_loss() -> TestResult {
     let root = tempdir()?;
     // The oracle's scene-culling case must hide the back face in Workbench. The import loss below
     // reports exactly this setting, so the two checks describe the same behaviour.
-    let expected = blender_coverage(&blender, root.path())?;
+    let expected = shared_coverage(&blender)?;
     let culled = expected["bottom_scene_culling"]
         .as_f64()
         .ok_or("oracle has no scene-culling coverage")?;

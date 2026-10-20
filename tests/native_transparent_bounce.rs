@@ -34,15 +34,22 @@ use serde_json::{Value, json};
 use tempfile::tempdir;
 
 const SCRIPT: &str = include_str!("fixtures/native_oracle/transparent_bounce.py");
-/// Patch grid of the Blender oracle (`transparent_bounce.py`): fractions of the frame.
-const PATCH: [f64; 9] = [
-    0.25, 0.3125, 0.375, 0.4375, 0.5, 0.5625, 0.625, 0.6875, 0.75,
-];
-/// Render-to-stored-value tolerance (linear units), the same bound as `native_point_spot_light`.
-/// The patch mean is about 0.0156 (1/64 of the world) and the two independent estimators (81 patch
-/// pixels x 64 samples each) differ with a standard deviation of about 0.0024, so this is a 4-sigma
-/// band; a budget-consuming pass-through renders the patch black.
+/// Frame edge in pixels of the render (`transparent_bounce.py`). The planes fill the orthographic
+/// frame, so the world is uniform behind them and a smaller frame gives the same expectation.
+const RESOLUTION: u32 = 32;
+/// Pixel rows and columns of the patch (`transparent_bounce.py`): the central 16 x 16 of 32 x 32.
+const PATCH: std::ops::Range<u32> = 8..24;
+/// Render-to-stored-value tolerance (linear units), the same bound as `native_transparent_cap`. The
+/// patch mean is about 0.0157 (1/64 of the world). Each of its 256 pixels averages 64 Bernoulli
+/// passes, so the difference of the two estimators has a standard deviation of about 0.0014 (the
+/// previous 81-pixel patch gave 0.0024); the tolerance is about 7 of those. A budget-consuming
+/// pass-through renders the patch black, an error of 0.0157, outside the tolerance.
 const PIXEL_TOLERANCE: f64 = 0.01;
+
+/// The fraction of the frame at which the centre of pixel `index` lies.
+fn pixel_centre(index: u32) -> f64 {
+    (f64::from(index) + 0.5) / f64::from(RESOLUTION)
+}
 
 /// Runs `expression` in Blender on `blend`; a Python exception (a failed assertion) fails the check.
 fn blender_python(blender: &Path, blend: &Path, expression: &str) -> Result<(), Box<dyn Error>> {
@@ -101,7 +108,7 @@ fn stacked_transparent_planes_keep_the_world_behind_the_regular_bounce_budget() 
         &project,
         root.path(),
         json!([
-            {"op": "render.update", "target": {"id": active}, "set": {"resolution_x": 64, "resolution_y": 64, "samples": 64, "seed": 0, "max_bounces": 4}}
+            {"op": "render.update", "target": {"id": active}, "set": {"resolution_x": RESOLUTION, "resolution_y": RESOLUTION, "samples": 64, "seed": 0, "max_bounces": 4}}
         ]),
     )?;
     assert_eq!(applied["ok"], true, "{applied}");
@@ -130,9 +137,9 @@ fn stacked_transparent_planes_keep_the_world_behind_the_regular_bounce_budget() 
     let image: Image = serde_json::from_value(scene["images"]["render"].clone())?;
     let data = load_image_data(&image, &project, ImageInterpolation::Closest)?;
     let mut total = [0.0_f64; 3];
-    for v in PATCH {
-        for u in PATCH {
-            let pixel = sample(&data, [u, v], false);
+    for y in PATCH {
+        for x in PATCH {
+            let pixel = sample(&data, [pixel_centre(x), pixel_centre(y)], false);
             for (sum, value) in total.iter_mut().zip(pixel.iter().take(3)) {
                 *sum += value;
             }

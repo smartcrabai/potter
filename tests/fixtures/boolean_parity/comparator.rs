@@ -2813,16 +2813,61 @@ fn optional_material_name(
         .transpose()
 }
 
-/// Evaluates `node_id` with its Boolean as the only enabled modifier, in world space.
-pub fn evaluate_boolean(document: &SceneDoc, node_id: &Id) -> TestResult<Canonical> {
-    let mut boolean_only = document.clone();
-    for (id, node) in &mut boolean_only.nodes {
+/// Evaluates each host in `node_ids` with its Boolean enabled and every other modifier disabled, in
+/// one snapshot, and returns each host's canonical result in the order given. Every Potter snapshot
+/// hashes the whole document, so one snapshot for many hosts costs far less than one per host.
+/// Regression hosts of one scene evaluate independently (`generate_regression_expectations.py`), so
+/// each result equals the one from evaluating that host alone. If the shared snapshot fails, its
+/// error names no host, so each host is then evaluated alone and every failing case is reported
+/// with its own id.
+pub fn evaluate_booleans_together(
+    document: &SceneDoc,
+    node_ids: &[Id],
+) -> Vec<TestResult<Canonical>> {
+    match snapshot_booleans(document, node_ids) {
+        Ok(results) => results,
+        Err(_) => node_ids
+            .iter()
+            .map(|node_id| {
+                snapshot_booleans(document, std::slice::from_ref(node_id))
+                    .map_or_else(Err, |mut results| results.remove(0))
+            })
+            .collect(),
+    }
+    .into_iter()
+    .map(|result| result.map_err(Into::into))
+    .collect()
+}
+
+/// One snapshot with the Boolean of each host in `node_ids` enabled. Errors name the host ids.
+fn snapshot_booleans(
+    document: &SceneDoc,
+    node_ids: &[Id],
+) -> Result<Vec<Result<Canonical, String>>, String> {
+    let names = node_ids
+        .iter()
+        .map(Id::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut all = document.clone();
+    for (id, node) in &mut all.nodes {
         for modifier in &mut node.modifiers {
-            modifier.enabled = id == node_id && modifier.modifier_type == "boolean";
+            modifier.enabled = node_ids.contains(id) && modifier.modifier_type == "boolean";
         }
     }
-    let snapshot = Snapshot::evaluate(&boolean_only, &EvaluationContext::default())
-        .map_err(|error| format!("{}: {error}", node_id.as_str()))?;
+    let snapshot = Snapshot::evaluate(&all, &EvaluationContext::default())
+        .map_err(|error| format!("{names}: {error}"))?;
+    Ok(node_ids
+        .iter()
+        .map(|node_id| {
+            host_canonical(&all, &snapshot, node_id)
+                .map_err(|error| format!("{}: {error}", node_id.as_str()))
+        })
+        .collect())
+}
+
+/// Canonical form of one host's evaluated Boolean, with the material names of its slots.
+fn host_canonical(document: &SceneDoc, snapshot: &Snapshot, node_id: &Id) -> TestResult<Canonical> {
     let mesh = snapshot
         .meshes
         .get(node_id)
@@ -2831,7 +2876,7 @@ pub fn evaluate_boolean(document: &SceneDoc, node_id: &Id) -> TestResult<Canonic
         .nodes
         .get(node_id)
         .ok_or_else(|| format!("Potter has no evaluated node `{}`", node_id.as_str()))?;
-    let model_node = boolean_only
+    let model_node = document
         .nodes
         .get(node_id)
         .ok_or_else(|| format!("Potter has no model node `{}`", node_id.as_str()))?;
@@ -2842,18 +2887,18 @@ pub fn evaluate_boolean(document: &SceneDoc, node_id: &Id) -> TestResult<Canonic
                 MaterialLink::Object => model_node.materials.get(slot).and_then(Option::as_ref),
                 MaterialLink::Data => None,
             };
-            optional_material_name(&boolean_only, node_id, material)
+            optional_material_name(document, node_id, material)
         })
         .collect::<TestResult<Vec<_>>>()?;
     let effective_materials = node
         .materials
         .iter()
-        .map(|material| optional_material_name(&boolean_only, node_id, material.as_ref()))
+        .map(|material| optional_material_name(document, node_id, material.as_ref()))
         .collect::<TestResult<Vec<_>>>()?;
     let data_materials = node
         .mesh_materials
         .iter()
-        .map(|material| optional_material_name(&boolean_only, node_id, material.as_ref()))
+        .map(|material| optional_material_name(document, node_id, material.as_ref()))
         .collect::<TestResult<Vec<_>>>()?;
     let material_links = (0..slot_count)
         .map(|slot| model_node.material_link(slot))
