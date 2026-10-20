@@ -131,7 +131,11 @@ fn usda_export_writes_face_varying_blender_normals() -> TestResult {
         3
     );
     assert_eq!(text.matches("normal3f[] normals = [").count(), 3);
-    assert_eq!(text.matches("(interpolation = \"faceVarying\")").count(), 3);
+    // Each cube's default `UVMap` is a `primvars:st` (Blender's USD writer makes UV primvars
+    // `TexCoord2fArray` with `faceVarying`, `usd_writer_mesh.cc`), so the faceVarying primvars are the
+    // three normal sets and the three UV sets.
+    assert_eq!(text.matches("texCoord2f[] primvars:st").count(), 3);
+    assert_eq!(text.matches("(interpolation = \"faceVarying\")").count(), 6);
     assert_matches_reference(&usd_world_corners(&text)?)?;
     Ok(())
 }
