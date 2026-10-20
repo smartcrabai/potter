@@ -424,6 +424,9 @@ impl Default for GridParams {
     }
 }
 
+/// The largest UV sphere ring count: `uv_sphere::topology` computes `2 * rings * 8` in an `i32`.
+const MAX_UV_SPHERE_RINGS: u64 = (i32::MAX / 16) as u64;
+
 impl Mesh {
     /// Construct an empty mesh with all next IDs set to zero.
     #[must_use]
@@ -789,6 +792,19 @@ impl Mesh {
             ));
         }
         positive(params.radius, "UV sphere radius")?;
+        // Faces are segments x rings and vertices segments x (rings - 1) + 2; each takes a u32 ID.
+        // `uv_sphere::topology` multiplies the ring count by 16 inside an i32, so rings are bounded.
+        let (segments, rings) = (u64::from(params.segments), u64::from(params.ring_count));
+        let faces = segments * rings;
+        let vertices = segments * (rings - 1) + 2;
+        let edges = faces + vertices - 2;
+        if [faces, vertices, edges]
+            .iter()
+            .any(|count| *count > u64::from(u32::MAX))
+            || rings > MAX_UV_SPHERE_RINGS
+        {
+            return Err(MeshError::IdExhausted);
+        }
         uv_sphere::build(params)
     }
     /// Create a Blender-default or customized capped cylinder.
@@ -1144,6 +1160,20 @@ impl Mesh {
             return Err(MeshError::InvalidParameter(
                 "grid subdivisions must be at least two per axis",
             ));
+        }
+        // Vertices, edges and faces each take a u32 ID; refuse before anything is allocated.
+        let (nx, ny) = (
+            u64::from(params.x_subdivisions),
+            u64::from(params.y_subdivisions),
+        );
+        let vertices = nx * ny;
+        let edges = nx * (ny - 1) + ny * (nx - 1);
+        let faces = (nx - 1) * (ny - 1);
+        if [vertices, edges, faces]
+            .iter()
+            .any(|count| *count > u64::from(u32::MAX))
+        {
+            return Err(MeshError::IdExhausted);
         }
         primitive_order::grid(
             params.x_subdivisions as usize,
@@ -1562,6 +1592,24 @@ mod tests {
     }
 
     #[test]
+    fn oversized_grid_and_uv_sphere_are_refused_before_allocation() {
+        // 100000 x 100000 vertices exceed u32 IDs; the check runs before any allocation.
+        let grid = Mesh::grid(GridParams {
+            size_x: 2.0,
+            size_y: 2.0,
+            x_subdivisions: 100_000,
+            y_subdivisions: 100_000,
+        });
+        assert!(matches!(grid, Err(MeshError::IdExhausted)));
+        // Ring counts past the i32 bound of the UV sphere's angle arithmetic are refused too.
+        let sphere = Mesh::uv_sphere(UvSphereParams {
+            segments: 3,
+            ring_count: u32::MAX,
+            radius: 1.0,
+        });
+        assert!(matches!(sphere, Err(MeshError::IdExhausted)));
+    }
+
     fn cone_supports_zero_radius_at_either_end() {
         let inverted = Mesh::cone(ConeParams {
             radius1: 0.0,

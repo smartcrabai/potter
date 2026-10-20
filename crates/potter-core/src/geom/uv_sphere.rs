@@ -30,7 +30,7 @@ use std::collections::HashMap;
 
 use glam::DVec3;
 
-use super::{Edge, Face, Mesh, MeshError, UvSphereParams, allocate};
+use super::{Mesh, MeshError, UvSphereParams, primitive_order};
 
 /// `NONE` marks a missing link or an unassigned duplicate slot.
 const NONE: usize = usize::MAX;
@@ -39,17 +39,17 @@ type Vec3 = [f32; 3];
 type Mat3 = [[f32; 3]; 3];
 type Mat4 = [[f32; 4]; 4];
 
-/// `sin_cos_from_fraction` (`math_rotation_c.cc:995`): sine and cosine of `2π·numer/denom`,
-/// evaluated in the first octant and mapped back by symmetry for exact symmetric circles.
 /// Compacted vertex and edge indices of a welded cluster.
 type Compacted = (Vec<usize>, Vec<usize>);
 
-/// Bit-exact equality of two non-negative squared distances: the tie-break compares computed values, so
-/// equal bits are the intended test.
+/// Bit-exact equality of two non-negative squared distances: the tie-break compares computed values,
+/// so equal bits are the intended test.
 fn same_distance(first: f32, second: f32) -> bool {
     first.to_bits() == second.to_bits()
 }
 
+/// `sin_cos_from_fraction` (`math_rotation_c.cc:995`): sine and cosine of `2π·numer/denom`,
+/// evaluated in the first octant and mapped back by symmetry for exact symmetric circles.
 fn sin_cos_from_fraction(numerator: i32, denominator: i32) -> (f32, f32) {
     let mut numerator = numerator * 8;
     let octant = numerator / denominator;
@@ -150,11 +150,6 @@ fn squared_distance(a: Vec3, b: Vec3) -> f32 {
     d[0] * d[0] + d[1] * d[1] + d[2] * d[2]
 }
 
-/// Edge key with endpoints in ascending order.
-fn pair_key(a: usize, b: usize) -> (usize, usize) {
-    (a.min(b), a.max(b))
-}
-
 #[derive(Clone, Copy)]
 struct KdNode {
     index: usize,
@@ -211,12 +206,20 @@ fn kd_balance(nodes: &mut [KdNode], axis: usize, offset: usize) -> usize {
 }
 
 /// `kdtree_range_search_cb`: every node within `range` of `co`, search origin included.
-fn kd_range(nodes: &[KdNode], root: usize, co: Vec3, range: f32, found: &mut Vec<usize>) {
+fn kd_range(
+    nodes: &[KdNode],
+    root: usize,
+    co: Vec3,
+    range: f32,
+    found: &mut Vec<usize>,
+    stack: &mut Vec<usize>,
+) {
     if root == NONE {
         return;
     }
     let range_sq = range * range;
-    let mut stack = vec![root];
+    stack.clear();
+    stack.push(root);
     while let Some(position) = stack.pop() {
         let node = &nodes[position];
         let axis = node.d;
@@ -291,23 +294,27 @@ fn find_duplicates(coords: &[Vec3], range: f32) -> Vec<usize> {
     let order: Vec<(usize, Vec3)> = nodes.iter().map(|node| (node.index, node.co)).collect();
     let mut duplicates = vec![NONE; coords.len()];
     let mut found = Vec::new();
+    let mut stack = Vec::new();
+    let mut cluster = Vec::new();
     for (origin, co) in order {
         if duplicates[origin] != NONE {
             continue;
         }
         found.clear();
-        kd_range(&nodes, root, co, range, &mut found);
-        let mut cluster: Vec<usize> = found
-            .iter()
-            .copied()
-            .filter(|&vertex| duplicates[vertex] == NONE)
-            .collect();
+        kd_range(&nodes, root, co, range, &mut found, &mut stack);
+        cluster.clear();
+        cluster.extend(
+            found
+                .iter()
+                .copied()
+                .filter(|&vertex| duplicates[vertex] == NONE),
+        );
         if cluster.is_empty() {
             continue;
         }
         cluster.push(origin);
         let target = cluster[cluster_target(&cluster, coords)];
-        for vertex in cluster {
+        for &vertex in &cluster {
             duplicates[vertex] = target;
         }
     }
@@ -346,7 +353,7 @@ impl BMesh {
     }
 
     fn edge_find(&self, a: usize, b: usize) -> Option<usize> {
-        self.by_pair.get(&pair_key(a, b)).copied()
+        self.by_pair.get(&super::edge_key(a, b)).copied()
     }
 
     /// `BM_edge_create` without the duplicate check.
@@ -358,7 +365,7 @@ impl BMesh {
             dead: false,
             collapsed: false,
         });
-        self.by_pair.insert(pair_key(a, b), id);
+        self.by_pair.insert(super::edge_key(a, b), id);
         id
     }
 
@@ -613,29 +620,7 @@ pub(super) fn build(params: UvSphereParams) -> Result<Mesh, MeshError> {
     let rings = i32::try_from(params.ring_count).map_err(|_| MeshError::IdExhausted)?;
     let radius = params.radius as f32;
     let topology = topology(segments, rings, radius)?;
-    let mut mesh = Mesh::new();
-    let mut ids = Vec::with_capacity(topology.positions.len());
-    for position in topology.positions {
-        ids.push(mesh.insert_vertex(position)?);
-    }
-    for [a, b] in topology.edges {
-        let (id, next) = allocate(mesh.next_id.edge)?;
-        mesh.edges.push(Edge {
-            id,
-            vertices: [ids[a], ids[b]],
-        });
-        mesh.next_id.edge = next;
-    }
-    for face in topology.faces {
-        let (id, next) = allocate(mesh.next_id.face)?;
-        mesh.faces.push(Face {
-            id,
-            vertices: face.iter().map(|&vertex| ids[vertex]).collect(),
-            material_index: 0,
-        });
-        mesh.next_id.face = next;
-    }
-    Ok(mesh)
+    primitive_order::explicit_edges(topology.positions, &topology.edges, &topology.faces)
 }
 
 fn topology(segments: i32, rings: i32, radius: f32) -> Result<Topology, MeshError> {

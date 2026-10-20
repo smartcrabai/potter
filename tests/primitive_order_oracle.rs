@@ -189,7 +189,8 @@ fn cylinder_storage_order_matches_blender() -> TestResult {
         "cylinder_8_nothing",
         &cylinder(8, EndFillType::Nothing)?,
         &cases,
-    )
+    )?;
+    assert_matches("cylinder_4_ngon", &cylinder(4, EndFillType::Ngon)?, &cases)
 }
 
 #[test]
@@ -234,6 +235,23 @@ fn cone_storage_order_matches_blender() -> TestResult {
         "cone_inverted_32",
         &cone(32, 0.0, 1.0, EndFillType::Ngon)?,
         &cases,
+    )?;
+    assert_matches(
+        "cone_trunc_4_ngon",
+        &cone(4, 1.0, 0.5, EndFillType::Ngon)?,
+        &cases,
+    )?;
+    // A zero bottom radius collapses the bottom ring to its first vertex; the fan and open-end
+    // variants keep that apex in its own place (there is no N-gon cap to dissolve).
+    assert_matches(
+        "cone_inverted_8_trifan",
+        &cone(8, 0.0, 1.0, EndFillType::TriFan)?,
+        &cases,
+    )?;
+    assert_matches(
+        "cone_inverted_8_nothing",
+        &cone(8, 0.0, 1.0, EndFillType::Nothing)?,
+        &cases,
     )
 }
 
@@ -269,4 +287,23 @@ fn icosphere_storage_order_matches_blender() -> TestResult {
         assert_matches(name, &icosphere, &cases)?;
     }
     Ok(())
+}
+
+/// Blender's torus at 1152 faces, built with one edge hash map (`--threads 1`, see
+/// `generate_torus_single_map_oracle.py`). Above 1000 faces Blender's edge order follows its thread
+/// count, so this is the case the single-map rule is checked against.
+#[test]
+fn torus_single_map_edge_order_matches_blender() -> TestResult {
+    const SINGLE_MAP: &str = include_str!("fixtures/primitive_uvs/torus_single_map_oracle.json");
+    let root: Value = serde_json::from_str(SINGLE_MAP)?;
+    assert_eq!(root["blender_version"], "5.2.2");
+    let cases = root["cases"].clone();
+    let torus = Mesh::torus(TorusParams {
+        major_segments: 48,
+        minor_segments: 24,
+        major_radius: 1.0,
+        minor_radius: 0.25,
+        ..TorusParams::default()
+    })?;
+    assert_matches("torus_48x24_single_map", &torus, &cases)
 }
