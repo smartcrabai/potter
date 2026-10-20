@@ -1669,16 +1669,20 @@ def _vertex_groups_dump(obj):
 
 
 def _rotation_quaternion(source):
-    """A bone's or object's rotation as (w, x, y, z), read from the field its rotation mode uses."""
+    """A bone's or object's rotation as a Quaternion, read from the field its rotation mode uses."""
     mode = source.rotation_mode
     if mode == "QUATERNION":
-        rotation = source.rotation_quaternion
-    elif mode == "AXIS_ANGLE":
+        return source.rotation_quaternion.copy()
+    if mode == "AXIS_ANGLE":
         angle, *axis = source.rotation_axis_angle
-        rotation = Quaternion(axis, angle)
-    else:
-        rotation = source.rotation_euler.to_quaternion()
-    return [rotation.w, rotation.x, rotation.y, rotation.z]
+        return Quaternion(axis, angle)
+    return source.rotation_euler.to_quaternion()
+
+
+def _xyzw_to_wxyz(values):
+    """Blender's (w, x, y, z) order for a Potter (x, y, z, w) quaternion."""
+    x, y, z, w = values
+    return (w, x, y, z)
 
 
 def _pose_dump(obj):
@@ -1690,7 +1694,7 @@ def _pose_dump(obj):
         constraints = inverse_map.get(bone.name, {})
         result.append({"bone": bone.name, "location": plain(bone.location),
                        "rotation_mode": bone.rotation_mode,
-                       "rotation_quaternion": _rotation_quaternion(bone),
+                       "rotation_quaternion": list(_rotation_quaternion(bone)),
                        "scale": plain(bone.scale),
                        "lock_ik": [bool(bone.lock_ik_x), bool(bone.lock_ik_y),
                                   bool(bone.lock_ik_z)],
@@ -1763,7 +1767,7 @@ def _override_dump(obj):
             if mapped is None:
                 continue
             if path in ("rotation_euler", "rotation_quaternion"):
-                value = _rotation_quaternion(obj)
+                value = plain(_rotation_quaternion(obj))
             else:
                 value = getattr(obj, mapped[1])
             for operation in property_override.operations:
@@ -7358,7 +7362,7 @@ def export_doc(doc, target, pack, scene_hash, context):
             source_axis_angle = source_object.get("rotation_axis_angle")
             if source_rotation_mode == "QUATERNION":
                 source_quaternion = (
-                    Quaternion(source_rotation_values)
+                    Quaternion(_xyzw_to_wxyz(source_rotation_values))
                     if isinstance(source_rotation_values, (list, tuple))
                     and len(source_rotation_values) == 4
                     else None
@@ -7384,7 +7388,7 @@ def export_doc(doc, target, pack, scene_hash, context):
                 and abs(abs(source_quaternion.dot(quaternion)) - 1.0) <= 1.0e-14
             )
             if source_rotation_unchanged and obj.rotation_mode == "QUATERNION":
-                obj.rotation_quaternion = source_rotation_values
+                obj.rotation_quaternion = source_quaternion
             elif source_rotation_unchanged and obj.rotation_mode == "AXIS_ANGLE":
                 source_axis_angle = source_object.get("rotation_axis_angle")
                 if isinstance(source_axis_angle, (list, tuple)) and len(source_axis_angle) == 4:
@@ -7421,7 +7425,8 @@ def export_doc(doc, target, pack, scene_hash, context):
         delta_rotation_quaternion = metadata.get("delta_rotation_quaternion")
         if (isinstance(delta_rotation_quaternion, (list, tuple))
                 and len(delta_rotation_quaternion) == 4):
-            obj.delta_rotation_quaternion = [float(value) for value in delta_rotation_quaternion]
+            obj.delta_rotation_quaternion = _xyzw_to_wxyz(
+                [float(value) for value in delta_rotation_quaternion])
         obj.hide_viewport = not item.get("visible", True)
         obj.hide_render = not item.get("render_visible", True)
         obj.hide_select = not item.get("selectable", True)
