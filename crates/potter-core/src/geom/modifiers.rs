@@ -27,7 +27,7 @@ use super::color_layers::{self, ColorDomain};
 use super::triangulate::{NgonMethod, QuadMethod, triangulate_mesh};
 use super::{
     Edge, Face, Mesh, MeshError, ORIGINDEX_ATTRIBUTE, Vertex, clear_origindex, edge_key,
-    normals::{corner_normals, face_normal, safe_acos_approx, sharp_edge_flags},
+    normals::{corner_normals, safe_acos_approx, sharp_edge_flags},
     origindex_values,
     provenance::{
         Origin, edge_flags, mean_value_corners, remap_attributes_staged,

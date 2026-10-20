@@ -123,6 +123,7 @@ fn bind_modifier(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Res
             &bind_nodes,
             &subject_id,
             keep,
+            &crate::eval::rig::evaluate_drivers(engine.doc, engine.evaluation_frame)?,
         )?;
         let source_bind_mesh = bind_snapshot
             .meshes
@@ -1507,8 +1508,7 @@ fn evaluate_modifier_output(
                                 modifier,
                                 target,
                                 engine.doc,
-                                &world_matrices,
-                                evaluated_operand_meshes,
+                                &references,
                                 evaluated_operand_nodes,
                                 &mut material_slots,
                             )
