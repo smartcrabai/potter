@@ -989,7 +989,6 @@ fn trace_path(
                 images,
                 importance,
                 &surface,
-                direction,
                 environment,
                 bounce < max_bounces,
                 transparent_max_bounces.saturating_sub(transparent_bounce),
@@ -1422,7 +1421,6 @@ fn direct_lighting(
     images: &BTreeMap<String, ImageData>,
     importance: Option<&WorldImportanceSampler>,
     surface: &Surface,
-    incoming_direction: DVec3,
     environment: DVec3,
     // Whether the path samples a BSDF continuation here. Only then does a BSDF ray pair with the
     // light sample for MIS; at the last vertex the light sample is unweighted.
@@ -1433,7 +1431,6 @@ fn direct_lighting(
 ) -> Result<DVec3> {
     let normal = surface.normal;
     let geometric = surface.geometric_normal;
-    let view = -incoming_direction;
     let mut contribution = DVec3::ZERO;
     for light in lights {
         let Some(sample) = sample_light(light, surface.point, rng) else {

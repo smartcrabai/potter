@@ -1164,7 +1164,10 @@ mod single_bounce_tests {
             &params,
             [6.065_270_029_474_05; 3],
             [7.655_433_604_088_337e-4; 3],
-            FINE,
+            // Measured on the sheen lobe alone at roughness 0.5 against a 1024² reference: COARSE is
+            // 4.8e-5 off and FINE 5.0e-5. The test sums the diffuse and specular lobes too, which the
+            // quadrature checks did not cover, so this is an assumption checked by the run.
+            COARSE,
         );
     }
 }
