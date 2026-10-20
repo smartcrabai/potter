@@ -1,14 +1,14 @@
 //! Voxel `volume_interpolation`. The oracle is `tests/fixtures/volume_interpolation`, rendered by Blender 5.2.2 with
 //! `generate_volume_interpolation_oracle.py`: a 16³ hashed binary grid (`node_value` below) at density 2.0, single scatter
-//! (`max_bounces = volume_bounces = 0`), a 4 × 4 frame spanning the unit cube, a one-pixel box filter, four seeds at 4096 spp.
+//! (`max_bounces = volume_bounces = 0`), a 4 × 4 frame spanning the unit cube, a one-pixel box filter, eight seeds at 8192 spp.
 //!
-//! The comparison is the frame mean (all 16 pixels). At this density the cubic and linear frame means differ by about 8.8 %
-//! in Blender, far above Blender's noise on the mean (about 1.4 %). The per-pixel comparison is too noisy for the budget.
+//! The compared quantities are frame means (all 16 pixels). The discriminating quantity is the cubic-minus-linear delta,
+//! `(cubic - linear) / cubic`. Blender's delta is 5.2 % ± 1.5 % over the eight seeds. The earlier 8.8 % came from four seeds
+//! and is within noise of that. The analytic single-scatter quadrature for this grid gives 2.0 % (Potter's boundary cut) to
+//! 2.6 % (Cycles' background fade), so a Potter delta far from 5 % would be a real difference.
 //!
-//! Thresholds are noise floors. A single Potter render has a frame-mean spread of `POTTER_SD_CUBIC` or `POTTER_SD_LINEAR`
-//! (measured over four seeds at `SAMPLES`, see the constants). Blender's frame-mean noise is its per-pixel sigma over the
-//! four seeds divided by √16. A match is within three floors, and the discrimination check requires LINEAR against Blender's
-//! CUBIC to exceed the midpoint between the cross floor and the expected separation.
+//! Each tolerance is three noise floors. A Potter render's relative spread is `POTTER_SD_*`, measured over four seeds at
+//! `SAMPLES`. Blender's spreads are the standard errors of its eight-seed means, read from the oracle.
 
 use std::{error::Error, fs, path::Path, process::Output};
 
@@ -23,7 +23,7 @@ const POSITION: [f64; 3] = [1.6, 0.6, 0.9];
 const DENSITY_SCALE: f64 = 2.0;
 /// Samples per pixel. A voxel render takes about 16 s at this count in a debug build.
 const SAMPLES: u32 = 512;
-/// Potter's single-render frame-mean spread, relative, measured over four seeds at `SAMPLES` on this scene.
+/// Potter's single-render frame-mean spread, relative to the mode's mean, over four seeds at `SAMPLES` on this scene.
 const POTTER_SD_CUBIC: f64 = 0.0132;
 const POTTER_SD_LINEAR: f64 = 0.0135;
 const MATCH_FLOORS: f64 = 3.0;
@@ -51,12 +51,8 @@ fn node_value(i: i64, j: i64, k: i64) -> f64 {
     if hash >= 512 { 1.0 } else { 0.0 }
 }
 
-fn make_scene(
-    root: &Path,
-    interpolation: &str,
-    seed: u32,
-) -> Result<std::path::PathBuf, Box<dyn Error>> {
-    fs::create_dir_all(root)?;
+fn make_scene(root: &Path, interpolation: &str, seed: u32) -> Result<std::path::PathBuf, Box<dyn Error>> {
+    std::fs::create_dir_all(root)?;
     let mut values = Vec::with_capacity(N * N * N);
     for k in 0..N {
         for j in 0..N {
@@ -83,19 +79,9 @@ fn make_scene(
     let batch = root.join("operations.json");
     fs::write(
         &batch,
-        serde_json::to_vec(
-            &json!({"schema_version": 1, "base_revision": 0, "operations": operations}),
-        )?,
+        serde_json::to_vec(&json!({"schema_version": 1, "base_revision": 0, "operations": operations}))?,
     )?;
-    assert_cli_success(
-        &pot()
-            .arg("apply")
-            .arg(&scene)
-            .arg("--file")
-            .arg(&batch)
-            .arg("--json")
-            .output()?,
-    )?;
+    assert_cli_success(&pot().arg("apply").arg(&scene).arg("--file").arg(&batch).arg("--json").output()?)?;
     Ok(scene)
 }
 
@@ -104,7 +90,7 @@ struct Pixels {
     red: Vec<f32>,
 }
 
-/// The mean red value over the whole 4 × 4 frame of one render at `seed`.
+/// The mean red value over the whole 4 × 4 frame of one render of `interpolation` at `seed`.
 fn frame_mean(interpolation: &str, seed: u32) -> Result<f64, Box<dyn Error>> {
     let directory = tempdir()?;
     let scene = make_scene(&directory.path().join("scene_root"), interpolation, seed)?;
@@ -132,41 +118,50 @@ fn frame_mean(interpolation: &str, seed: u32) -> Result<f64, Box<dyn Error>> {
     Ok(red.iter().map(|value| f64::from(*value)).sum::<f64>() / red.len() as f64)
 }
 
-/// Blender's frame means and frame-mean noise from the oracle: `(cubic, linear, sigma_cubic, sigma_linear)`. The frame
-/// mean's noise is the four-seed per-pixel sigma divided by √16, since the sixteen pixels' noise is independent.
-fn blender_frame() -> Result<(f64, f64, f64, f64), Box<dyn Error>> {
+/// Blender's frame means and their standard errors over the oracle's seeds, for CUBIC and LINEAR.
+struct BlenderFrames {
+    cubic: f64,
+    cubic_se: f64,
+    linear: f64,
+    linear_se: f64,
+}
+
+fn blender_frames() -> Result<BlenderFrames, Box<dyn Error>> {
     let oracle: Value = serde_json::from_slice(&fs::read(
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/volume_interpolation/blender_volume_interpolation.json"),
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/volume_interpolation/blender_volume_interpolation.json"),
     )?)?;
-    let mean = |case: &str| {
-        oracle["cases"][case]["mean"]
-            .as_f64()
-            .ok_or_else(|| format!("oracle mean for {case} is missing"))
+    let frames_of = |case: &str| -> Result<(f64, f64), Box<dyn Error>> {
+        let seeds = oracle["cases"][case]["seed_pixels"]
+            .as_array()
+            .ok_or("oracle seed pixels are missing")?;
+        let mut frames = Vec::with_capacity(seeds.len());
+        for seed in seeds {
+            let pixels = seed.as_array().ok_or("oracle seed is not an array")?;
+            let mut sum = 0.0;
+            for pixel in pixels {
+                sum += pixel.as_f64().ok_or("oracle pixel is not a number")?;
+            }
+            frames.push(sum / pixels.len() as f64);
+        }
+        let mean = frames.iter().sum::<f64>() / frames.len() as f64;
+        let variance = frames.iter().map(|frame| (frame - mean).powi(2)).sum::<f64>() / (frames.len() - 1) as f64;
+        Ok((mean, (variance / frames.len() as f64).sqrt()))
     };
-    let sigma = |case: &str| {
-        oracle["noise"]["sigma_blender"][case]
-            .as_f64()
-            .map(|pixel| pixel / 4.0)
-            .ok_or_else(|| format!("oracle sigma for {case} is missing"))
-    };
-    Ok((
-        mean("cubic_noise")?,
-        mean("linear_noise")?,
-        sigma("cubic_noise")?,
-        sigma("linear_noise")?,
-    ))
+    let (cubic, cubic_se) = frames_of("cubic_noise")?;
+    let (linear, linear_se) = frames_of("linear_noise")?;
+    Ok(BlenderFrames { cubic, cubic_se, linear, linear_se })
 }
 
 #[test]
 fn cubic_frame_mean_matches_blender() -> Result<(), Box<dyn Error>> {
-    let (cubic, _linear, sigma_cubic, _sigma_linear) = blender_frame()?;
+    let blender = blender_frames()?;
     let measured = frame_mean("cubic", 0)?;
-    let floor = (POTTER_SD_CUBIC.powi(2) + sigma_cubic.powi(2)).sqrt();
-    let error = (measured - cubic).abs() / cubic;
+    let floor = (POTTER_SD_CUBIC.powi(2) + (blender.cubic_se / blender.cubic).powi(2)).sqrt();
+    let error = (measured - blender.cubic).abs() / blender.cubic;
     assert!(
         error < MATCH_FLOORS * floor,
-        "CUBIC frame mean {measured:.6} vs Blender {cubic:.6}: {:.2} % apart, over {:.2} % (three floors)",
+        "CUBIC frame mean {measured:.6} vs Blender {:.6}: {:.2} % apart, over {:.2} % (three floors)",
+        blender.cubic,
         error * 100.0,
         MATCH_FLOORS * floor * 100.0
     );
@@ -175,39 +170,45 @@ fn cubic_frame_mean_matches_blender() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn linear_frame_mean_matches_blender() -> Result<(), Box<dyn Error>> {
-    let (_cubic, linear, _sigma_cubic, sigma_linear) = blender_frame()?;
+    let blender = blender_frames()?;
     let measured = frame_mean("linear", 0)?;
-    let floor = (POTTER_SD_LINEAR.powi(2) + sigma_linear.powi(2)).sqrt();
-    let error = (measured - linear).abs() / linear;
+    let floor = (POTTER_SD_LINEAR.powi(2) + (blender.linear_se / blender.linear).powi(2)).sqrt();
+    let error = (measured - blender.linear).abs() / blender.linear;
     assert!(
         error < MATCH_FLOORS * floor,
-        "LINEAR frame mean {measured:.6} vs Blender {linear:.6}: {:.2} % apart, over {:.2} % (three floors)",
+        "LINEAR frame mean {measured:.6} vs Blender {:.6}: {:.2} % apart, over {:.2} % (three floors)",
+        blender.linear,
         error * 100.0,
         MATCH_FLOORS * floor * 100.0
     );
     Ok(())
 }
 
-/// The modes must be distinguishable in the frame mean: Potter's LINEAR render must sit further from Blender's CUBIC mean than
-/// the midpoint between the cross noise floor and the expected separation. The expected separation is the Blender
-/// cubic-to-linear difference (`delta`), with its noise removed, combined with the cross floor.
+/// The cubic-minus-linear delta `(cubic - linear) / cubic` of Potter against Blender. Each side's delta has the error
+/// propagated from its two means, `d(delta) = sqrt((l / c² · σ_c)² + (σ_l / c)²)`. Potter's σ are its single-render spreads
+/// (relative, times the mean); Blender's are the standard errors of its seed means. The tolerance is three floors of the
+/// two deltas' combined spread.
 #[test]
-fn linear_frame_mean_is_distinguishable_from_blender_cubic() -> Result<(), Box<dyn Error>> {
-    let (cubic, linear, sigma_cubic, sigma_linear) = blender_frame()?;
-    let delta = (cubic - linear).abs() / cubic;
-    let signal = (delta.powi(2) - sigma_cubic.powi(2) - sigma_linear.powi(2))
-        .max(0.0)
-        .sqrt();
-    let cross_floor = (POTTER_SD_LINEAR.powi(2) + sigma_cubic.powi(2)).sqrt();
-    let expected_separation = (cross_floor.powi(2) + signal.powi(2)).sqrt();
-    let threshold = (cross_floor + expected_separation) / 2.0;
-    let measured = frame_mean("linear", 0)?;
-    let separation = (measured - cubic).abs() / cubic;
+fn cubic_minus_linear_delta_matches_blender() -> Result<(), Box<dyn Error>> {
+    let blender = blender_frames()?;
+    let cubic = frame_mean("cubic", 0)?;
+    let linear = frame_mean("linear", 0)?;
+    let potter_delta = (cubic - linear) / cubic;
+    let blender_delta = (blender.cubic - blender.linear) / blender.cubic;
+    let delta_spread = |c: f64, l: f64, sigma_c: f64, sigma_l: f64| {
+        ((l / (c * c) * sigma_c).powi(2) + (sigma_l / c).powi(2)).sqrt()
+    };
+    let potter_spread = delta_spread(cubic, linear, POTTER_SD_CUBIC * cubic, POTTER_SD_LINEAR * linear);
+    let blender_spread = delta_spread(blender.cubic, blender.linear, blender.cubic_se, blender.linear_se);
+    let tolerance = MATCH_FLOORS * (potter_spread.powi(2) + blender_spread.powi(2)).sqrt();
+    let difference = (potter_delta - blender_delta).abs();
     assert!(
-        separation > threshold,
-        "LINEAR frame mean {measured:.6} is {:.2} % from Blender's CUBIC {cubic:.6}; the modes separate beyond {:.2} %",
-        separation * 100.0,
-        threshold * 100.0
+        difference < tolerance,
+        "cubic-minus-linear delta: Potter {:.2} % vs Blender {:.2} %, {:.2} % apart, over {:.2} % (three floors)",
+        potter_delta * 100.0,
+        blender_delta * 100.0,
+        difference * 100.0,
+        tolerance * 100.0
     );
     Ok(())
 }

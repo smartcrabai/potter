@@ -48,8 +48,8 @@ argv = sys.argv[sys.argv.index("--") + 1 :]
 out_path = os.path.abspath(argv[0])
 work = tempfile.mkdtemp(prefix="volume_interpolation_")
 SIZE = 4
-SAMPLES = 4096
-SEEDS = (0, 1, 2, 3)
+SAMPLES = 8192
+SEEDS = (0, 1, 2, 3, 4, 5, 6, 7)
 ENERGY = 100.0
 POSITION = (1.6, 0.6, 0.9)
 DENSITY_SCALE = 2.0
