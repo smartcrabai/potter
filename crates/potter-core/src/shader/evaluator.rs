@@ -30,6 +30,11 @@ pub(crate) fn dielectric_f0(ior: f64, level: f64) -> f64 {
     (fresnel * 2.0 * level.max(0.0)).min(1.0)
 }
 
+/// Cycles' Principled glass tint, `sqrt(clamped base colour)` (`kernel/svm/closure.h`, `clamped_base_color`).
+pub(crate) fn principled_glass_tint(base: [f64; 4]) -> [f64; 3] {
+    std::array::from_fn(|channel| base[channel].clamp(0.0, 1.0).sqrt())
+}
+
 /// The Principled inputs that change Cycles' result but that Potter's lobe model does not evaluate,
 /// as `(feature_id, Blender input)` pairs in a fixed array, so checking a hit allocates nothing.
 pub(crate) fn unevaluated_principled_inputs(
@@ -142,6 +147,9 @@ pub struct BsdfParams {
     /// for transmission (`kernel/svm/closure.h`); the Glass BSDF node takes its Color for both.
     pub glass_reflection_tint: [f64; 3],
     pub glass_transmission_tint: [f64; 3],
+    /// Whether `glass_transmission_tint` is the square root of the base colour (Principled). A base texture then
+    /// re-derives it; a Glass node's Color is not re-derived.
+    pub glass_tint_follows_base: bool,
     /// The view is on the back of the geometric normal (Cycles' `SD_BACKFACING`), where a glass closure uses `1 / ior`.
     pub back_facing: bool,
     pub alpha: f64,
@@ -246,9 +254,8 @@ impl BsdfParams {
             transmission: material.transmission,
             ior: material.ior,
             glass_reflection_tint: [1.0; 3],
-            glass_transmission_tint: std::array::from_fn(|channel| {
-                material.base_color[channel].clamp(0.0, 1.0).sqrt()
-            }),
+            glass_transmission_tint: principled_glass_tint(material.base_color),
+            glass_tint_follows_base: true,
             back_facing: false,
             alpha: material.base_color[3],
             transparent_tint: [1.0; 3],
@@ -309,6 +316,17 @@ impl BsdfParams {
         }
     }
 
+    /// The glass tint as one layered closure, weighted by the arm's transmission, for `combine_layers`. A
+    /// non-glass arm has transmission 0 and so adds no tint.
+    fn glass_layer(&self, tint: [f64; 3]) -> LayerSide {
+        LayerSide {
+            weight: self.transmission,
+            tint,
+            roughness: self.roughness,
+            normal: self.normal,
+        }
+    }
+
     /// Whether the volume coefficients put a medium on the surface's path.
     pub(crate) fn has_medium(&self) -> bool {
         self.volume_scatter
@@ -358,6 +376,20 @@ impl BsdfParams {
             second.sheen_layer(),
             shade,
         );
+        // The glass tints take the coat's and sheen's weights: each arm's share of the hits times its transmission,
+        // so Mix(Glass, Glossy) keeps the glass tint at full strength (as Cycles' closure weights do).
+        let reflection = combine_layers(
+            first.glass_layer(first.glass_reflection_tint),
+            1.0 - shade,
+            second.glass_layer(second.glass_reflection_tint),
+            shade,
+        );
+        let refraction = combine_layers(
+            first.glass_layer(first.glass_transmission_tint),
+            1.0 - shade,
+            second.glass_layer(second.glass_transmission_tint),
+            shade,
+        );
         Self {
             base_color,
             metallic: mix_scalar(first.metallic, second.metallic),
@@ -366,11 +398,10 @@ impl BsdfParams {
             emission_strength: mix_scalar(first.emission_strength, second.emission_strength),
             transmission: mix_scalar(first.transmission, second.transmission),
             ior: mix_scalar(first.ior, second.ior),
-            glass_reflection_tint: mix3(first.glass_reflection_tint, second.glass_reflection_tint),
-            glass_transmission_tint: mix3(
-                first.glass_transmission_tint,
-                second.glass_transmission_tint,
-            ),
+            glass_reflection_tint: reflection.tint,
+            glass_transmission_tint: refraction.tint,
+            glass_tint_follows_base: first.glass_tint_follows_base
+                || second.glass_tint_follows_base,
             back_facing: first.back_facing,
             alpha,
             transparent_tint,
@@ -409,7 +440,19 @@ impl BsdfParams {
 
     fn add(first: Self, second: Self) -> Self {
         let add3 = |a: [f64; 3], b: [f64; 3]| [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
-        let max3 = |a: [f64; 3], b: [f64; 3]| [a[0].max(b[0]), a[1].max(b[1]), a[2].max(b[2])];
+        // The glass tints are summed with unit shares, weighted by transmission, as Add sums the closures' weights.
+        let reflection = combine_layers(
+            first.glass_layer(first.glass_reflection_tint),
+            1.0,
+            second.glass_layer(second.glass_reflection_tint),
+            1.0,
+        );
+        let refraction = combine_layers(
+            first.glass_layer(first.glass_transmission_tint),
+            1.0,
+            second.glass_layer(second.glass_transmission_tint),
+            1.0,
+        );
         let coat = combine_layers(first.coat_layer(), 1.0, second.coat_layer(), 1.0);
         let sheen = combine_layers(first.sheen_layer(), 1.0, second.sheen_layer(), 1.0);
         Self {
@@ -425,11 +468,10 @@ impl BsdfParams {
             emission_strength: first.emission_strength.max(second.emission_strength),
             transmission: first.transmission.max(second.transmission),
             ior: first.ior,
-            glass_reflection_tint: max3(first.glass_reflection_tint, second.glass_reflection_tint),
-            glass_transmission_tint: max3(
-                first.glass_transmission_tint,
-                second.glass_transmission_tint,
-            ),
+            glass_reflection_tint: reflection.tint,
+            glass_transmission_tint: refraction.tint,
+            glass_tint_follows_base: first.glass_tint_follows_base
+                || second.glass_tint_follows_base,
             back_facing: first.back_facing,
             // Add keeps alpha as the larger opacity (its shading is Potter's one-scalar blend), and sums the arms'
             // transparent weights as Cycles sums closures. A fully opaque arm leaves no pass chance, so a transparent
@@ -928,6 +970,10 @@ fn apply_material_textures(
         if alpha_linked {
             params.alpha *= pixel[3];
         }
+        // The Principled glass tint is the square root of the textured base colour (Cycles' `clamped_base_color`).
+        if params.glass_tint_follows_base {
+            params.glass_transmission_tint = principled_glass_tint(params.base_color);
+        }
     }
     if let Some(texture) = &material.roughness_texture {
         let layer = texture_layer(hit_ctx, texture);
@@ -1313,6 +1359,9 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
     fn closure_params(&self) -> BsdfParams {
         BsdfParams {
             alpha: 1.0,
+            // A closure is not glass: only Glass and Principled set transmission. The material's own value
+            // belongs to the simple material's Principled (set there).
+            transmission: 0.0,
             ..BsdfParams::from_material(self.material, self.hit_ctx.normal)
         }
     }
@@ -1326,6 +1375,7 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
             == Some(true)
         {
             let mut params = self.closure_params();
+            params.transmission = self.material.transmission;
             // A simple-material graph holds no Alpha input unless the overlay wrote one (`write_principled_inputs`, for a
             // non-opaque material). Without it the material's own alpha applies, as before the closure change: its base
             // colour alpha, or 1 for an OPAQUE material, whose graph carries no transparency.
@@ -1345,8 +1395,7 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
         }
         let mut params = self.closure_params();
         params.base_color = self.color_input(id, &["Base Color"], [0.8, 0.8, 0.8, 1.0])?;
-        params.glass_transmission_tint =
-            std::array::from_fn(|channel| params.base_color[channel].clamp(0.0, 1.0).sqrt());
+        params.glass_transmission_tint = principled_glass_tint(params.base_color);
         params.metallic = self.scalar_input(id, &["Metallic"], 0.0)?;
         params.roughness = self.scalar_input(id, &["Roughness"], 0.5)?;
         params.ior = self.scalar_input(id, &["IOR"], 1.5)?;
@@ -1505,6 +1554,7 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
     fn glass(&mut self, id: &Id) -> Result<BsdfParams> {
         let mut params = self.diffuse(id)?;
         params.transmission = 1.0;
+        params.glass_tint_follows_base = false;
         params.ior = self.scalar_input(id, &["IOR"], 1.5)?;
         params.roughness = self.scalar_input(id, &["Roughness"], 0.0)?;
         // Cycles' Glass closure takes its Color as both the reflection and the transmission tint.
@@ -1526,7 +1576,6 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
         params.base_color = [tint[0], tint[1], tint[2], 0.0];
         params.alpha = 0.0;
         params.transparent_tint = [tint[0], tint[1], tint[2]];
-        params.transmission = 1.0;
         Ok(params)
     }
 

@@ -2081,7 +2081,7 @@ struct MisVertex {
 enum Scatter {
     /// The camera ray. Lights are not visible to camera rays.
     Camera,
-    /// A delta (specular transmission) bounce at `point`: light sampling cannot reach it, so a
+    /// A delta (sharp glass reflection or refraction) bounce at `point`: light sampling cannot reach it, so a
     /// light hit is unweighted. The light is evaluated from `point`, as Cycles uses the segment's
     /// `ray_P`.
     Delta(DVec3),

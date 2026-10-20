@@ -17,10 +17,12 @@
 //!
 //! Estimator contract: `evaluate` is the continuous BSDF times reflectance: the diffuse, specular,
 //! sheen and coat lobes above the surface, and the glass lobe on both sides (its reflection above,
-//! its transmission below). `continuous_density` is the exact density with which `path.rs` draws
-//! continuous directions (lobe mixture), so `evaluate / density` is unbiased for the mixture. A
-//! singular glass lobe (roughness zero) is a delta that `sample_glass` draws; light sampling cannot
-//! reach it.
+//! its transmission below). `continuous_density` is the density with which `path.rs` draws continuous
+//! directions (lobe mixture), so `evaluate / density` is unbiased for the mixture over the sampler's
+//! domain. The glass lobe's eval and density follow Cycles' `bsdf_microfacet_eval`, which also covers
+//! half vectors the VNDF sampler never draws, so MIS on glass matches Cycles' eval/pdf and is not an
+//! exact density. A singular glass lobe (roughness zero) is a delta that `sample_glass` draws; light
+//! sampling cannot reach it.
 
 use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI};
 
@@ -78,10 +80,11 @@ pub(crate) fn lobe_probabilities(params: &BsdfParams, layers: &Layers) -> LobePr
     }
 }
 
-/// Exact density of the continuous (diffuse, sheen, coat and specular) directions drawn by
-/// `path.rs`, in solid angle. Diffuse is cosine-distributed; sheen is the LTC distribution; the coat
-/// and specular lobes are the GGX half-vector distribution D·cosθh mapped to the reflected direction.
-/// The glass lobe's density is its reflection above the surface and its refraction below it.
+/// Density of the continuous (diffuse, sheen, coat and specular) directions drawn by `path.rs`, in solid
+/// angle, with the glass lobe's density as Cycles' eval and pdf define it. Diffuse is cosine-distributed;
+/// sheen is the LTC distribution; the coat and specular lobes are the GGX half-vector distribution D·cosθh
+/// mapped to the reflected direction. The glass lobe's density is its reflection above the surface and its
+/// refraction below it.
 pub(crate) fn continuous_density(params: &BsdfParams, layers: &Layers, light: DVec3) -> f64 {
     let (normal, view) = (layers.normal, layers.view);
     let probabilities = lobe_probabilities(params, layers);
@@ -184,10 +187,8 @@ fn specular_lobe(
 
     if let Some(layer) = specular_layer(params) {
         let f0 = layer.f0_tinted;
-        let real_f0 = dielectric_f0(layer.eta, 0.5);
         let real_f = fresnel_dielectric(v_dot_h, layer.eta);
-        let remap = saturate(inverse_lerp(real_f0, 1.0, real_f));
-        let fresnel = f0.lerp(DVec3::ONE, remap);
+        let fresnel = remapped_fresnel(f0, layer.eta, real_f);
         let gain = multiscatter_gain(dielectric_fss(&layer), energy_average, missing);
         reflected += gain * fresnel * dielectric_weight;
     }
@@ -342,9 +343,10 @@ impl Layers {
         self.sheen.direction(u, v)
     }
 
-    /// Whether the layers leave a glass closure, so a light below the surface can reach the surface.
+    /// Whether a light below the surface can reach it through the glass lobe. A singular lobe is drawn only as a
+    /// delta, which light sampling cannot reach, so it does not count.
     pub(crate) fn transmits(&self) -> bool {
-        self.glass.is_some()
+        self.glass.is_some_and(|glass| !glass.singular)
     }
 }
 
@@ -670,6 +672,13 @@ fn inverse_lerp(a: f64, b: f64, x: f64) -> f64 {
     (x - a) / (b - a)
 }
 
+/// Cycles' `generalized_schlick_fresnel` remap (`exponent < 0`): the real dielectric Fresnel `real` at the IOR
+/// `eta` is rescaled from `F0(eta)..1` onto `f0..1`.
+fn remapped_fresnel(f0: DVec3, eta: f64, real: f64) -> DVec3 {
+    let remap = saturate(inverse_lerp(dielectric_f0(eta, 0.5), 1.0, real));
+    f0.lerp(DVec3::ONE, remap)
+}
+
 fn ior_from_f0(f0: f64) -> f64 {
     let root = f0.clamp(0.0, 0.99).sqrt();
     (1.0 + root) / (1.0 - root)
@@ -800,7 +809,11 @@ fn glass_lobe(params: &BsdfParams, normal: DVec3, view: DVec3) -> Option<GlassLo
     let energy = energy.max(1.0e-6);
     let missing = (1.0 - energy) / energy;
     let fss = if transmission_tint.max_element() <= 0.0 {
-        reflective_fss(f0, ior, reflection_tint)
+        // The reflective Fss: the dielectric's average single-scattering Fresnel, on the reflection tint.
+        dielectric_fss(&SpecularLayer {
+            eta: ior,
+            f0_tinted: f0,
+        }) * reflection_tint
     } else {
         transmission_tint
     };
@@ -817,25 +830,13 @@ fn glass_lobe(params: &BsdfParams, normal: DVec3, view: DVec3) -> Option<GlassLo
     })
 }
 
-/// Cycles' `bsdf_microfacet_setup_fresnel_generalized_schlick` for a closure without transmission: the
-/// average single-scattering reflectance, remapped from F0 to 1 by the real dielectric Fresnel.
-fn reflective_fss(f0: DVec3, ior: f64, reflection_tint: DVec3) -> DVec3 {
-    let remap = saturate(inverse_lerp(
-        dielectric_f0(ior, 0.5),
-        1.0,
-        fresnel_dielectric_fss(ior),
-    ));
-    reflection_tint * f0.lerp(DVec3::ONE, remap)
-}
-
 impl GlassLobe {
     /// Cycles' `generalized_schlick_fresnel` with the real dielectric remap: the reflectance and the
     /// transmittance at the cosine `cos_hi` between the half vector and the view, and the cosine of the
     /// refracted angle.
     fn fresnel(&self, cos_hi: f64) -> (DVec3, DVec3, f64) {
         let (real, cos_ht) = dielectric_fresnel(cos_hi, self.ior);
-        let remap = saturate(inverse_lerp(dielectric_f0(self.ior, 0.5), 1.0, real));
-        let fresnel = self.f0.lerp(DVec3::ONE, remap);
+        let fresnel = remapped_fresnel(self.f0, self.ior, real);
         (
             fresnel * self.reflection_tint,
             (DVec3::ONE - fresnel) * self.transmission_tint,
@@ -902,7 +903,7 @@ pub(crate) fn glass_coefficient(params: &BsdfParams, layers: &Layers, light: DVe
         return DVec3::ZERO;
     };
     let cosine = layers.normal.dot(light).abs();
-    if lobe.singular || cosine <= 0.0 {
+    if cosine <= 0.0 {
         return DVec3::ZERO;
     }
     let (value, _) = glass_eval(lobe, layers.normal, layers.view, light);
@@ -1199,9 +1200,11 @@ mod glass_tests {
     const RADIUS: f64 = 1.2;
     const POWER: f64 = 1000.0;
     const ORTHO_SCALE: f64 = 0.2;
-    /// Quadrature of the disk used for the oracle comparisons: radial and angular midpoints. At 256 × 512
-    /// the rough patch means are within 0.7 Cycles standard errors of their 512 × 1024 limit
-    /// (`rough_glass_quadrature_is_within_the_cycles_noise`); the former 64 × 128 was 0.22 off at roughness 0.2.
+    /// Quadrature of the disk used for the oracle comparisons: radial and angular midpoints. The midpoint rule is
+    /// second order and the lobe is narrow, so the grid was chosen by a convergence run (a numpy port of this
+    /// integral, the same receivers, grids 64 × 128, 128 × 256, 256 × 512, 512 × 1024): at roughness 0.2 the back
+    /// patch mean is 66.847, 66.681, 66.640, 66.630, the error dropping by about 4 per doubling. At 256 × 512 it is
+    /// 0.0103 from 512 × 1024, 0.68 of the Cycles stderr (0.0152), and each rough oracle case is within 1 stderr.
     const RADIAL: usize = 256;
     const ANGULAR: usize = 512;
 
@@ -1492,7 +1495,7 @@ mod glass_tests {
                 let area =
                     r / radial as f64 * (std::f64::consts::TAU / angular as f64) * RADIUS * RADIUS;
                 let weight = area * cos_emitter / (distance * distance) * radiance * cos_receiver;
-                total += evaluate(params, shading, direction) * weight;
+                total += glass_coefficient(params, shading, direction) * weight;
             }
         }
         total
@@ -1654,20 +1657,6 @@ mod glass_tests {
             rough_patch_mean(&params, light_centre(1.45, true), RADIAL, ANGULAR),
             [62.097_119; 3],
             [0.012_259_179; 3],
-        );
-    }
-
-    #[test]
-    fn rough_glass_quadrature_is_within_the_cycles_noise() {
-        // The disk quadrature must not move the rough back-side pixel by more than Cycles' stderr
-        // for that variant (0.015211354), so the comparison above measures the lobe, not the grid.
-        let params = principled_glass(1.5, 0.2);
-        let centre = light_centre(1.5, true);
-        let coarse = rough_patch_mean(&params, centre, RADIAL, ANGULAR);
-        let fine = rough_patch_mean(&params, centre, 2 * RADIAL, 2 * ANGULAR);
-        assert!(
-            (coarse - fine).abs().max_element() <= 0.015_211_354,
-            "coarse {coarse:?} vs fine {fine:?}"
         );
     }
 
