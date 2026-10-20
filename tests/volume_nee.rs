@@ -106,6 +106,7 @@ fn scatter_scene(
     root: &Path,
     anisotropy: f64,
     medium: Medium,
+    sampling: &str,
 ) -> Result<std::path::PathBuf, Box<dyn Error>> {
     let mut operations = base_operations();
     operations.extend([
@@ -113,7 +114,7 @@ fn scatter_scene(
         json!({"op":"graph.node_add","graph":"medium_graph","id":"output","type":"ShaderNodeOutputMaterial"}),
         json!({"op":"graph.node_add","graph":"medium_graph","id":"scatter","type":"ShaderNodeVolumeScatter","inputs":{"Color":[1.0,1.0,1.0,1.0],"Density":DENSITY,"Anisotropy":anisotropy}}),
         json!({"op":"graph.link","graph":"medium_graph","from_node":"scatter","from_socket":"Volume","to_node":"output","to_socket":"Volume"}),
-        json!({"op":"material.create","id":"medium","graph":"medium_graph"}),
+        json!({"op":"material.create","id":"medium","graph":"medium_graph","volume_sampling":sampling}),
     ]);
     match medium {
         Medium::MeshCube => operations.push(
@@ -214,7 +215,12 @@ fn mesh_material_single_scatter_under_a_point_light_matches_blender() -> Result<
     // The closed-mesh medium: the same unit mesh cube as the Blender oracle's homogeneous cases.
     for (case, anisotropy) in [("homogeneous_g0", 0.0), ("homogeneous_g05", 0.5)] {
         let directory = tempdir()?;
-        let scene = scatter_scene(directory.path(), anisotropy, Medium::MeshCube)?;
+        let scene = scatter_scene(
+            directory.path(),
+            anisotropy,
+            Medium::MeshCube,
+            "multiple_importance",
+        )?;
         let measured = render_centre_mean(&scene, &directory.path().join("render"))?;
         assert_within(case, measured, VOLUME_TOLERANCE)?;
     }
@@ -226,7 +232,12 @@ fn voxel_homogeneous_single_scatter_under_a_point_light_matches_blender()
 -> Result<(), Box<dyn Error>> {
     for (case, anisotropy) in [("homogeneous_g0", 0.0), ("homogeneous_g05", 0.5)] {
         let directory = tempdir()?;
-        let scene = scatter_scene(directory.path(), anisotropy, Medium::VoxelHomogeneous)?;
+        let scene = scatter_scene(
+            directory.path(),
+            anisotropy,
+            Medium::VoxelHomogeneous,
+            "multiple_importance",
+        )?;
         let measured = render_centre_mean(&scene, &directory.path().join("render"))?;
         assert_within(case, measured, VOLUME_TOLERANCE)?;
     }
@@ -237,9 +248,38 @@ fn voxel_homogeneous_single_scatter_under_a_point_light_matches_blender()
 fn gradient_single_scatter_under_a_point_light_matches_blender() -> Result<(), Box<dyn Error>> {
     for (case, anisotropy) in [("gradient_g0", 0.0), ("gradient_g05", 0.5)] {
         let directory = tempdir()?;
-        let scene = scatter_scene(directory.path(), anisotropy, Medium::VoxelGradient)?;
+        let scene = scatter_scene(
+            directory.path(),
+            anisotropy,
+            Medium::VoxelGradient,
+            "multiple_importance",
+        )?;
         let measured = render_centre_mean(&scene, &directory.path().join("render"))?;
         assert_within(case, measured, VOLUME_TOLERANCE)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn every_volume_sampling_strategy_matches_blender_on_mesh_and_voxel_cubes()
+-> Result<(), Box<dyn Error>> {
+    // Distance, equiangular and multiple importance sampling are three estimators of one integral, so each must
+    // reproduce Blender's homogeneous cube.
+    for sampling in ["distance", "equiangular", "multiple_importance"] {
+        for (case, anisotropy) in [("homogeneous_g0", 0.0), ("homogeneous_g05", 0.5)] {
+            for medium in [Medium::MeshCube, Medium::VoxelHomogeneous] {
+                let directory = tempdir()?;
+                let scene = scatter_scene(directory.path(), anisotropy, medium, sampling)?;
+                let measured = render_centre_mean(&scene, &directory.path().join("render"))?;
+                let expected = blender_mean(case)?;
+                let relative = (measured - expected).abs() / expected;
+                assert!(
+                    relative < VOLUME_TOLERANCE,
+                    "{sampling} {case}: Potter {measured:.6} vs Blender {expected:.6} ({:.1} % apart)",
+                    relative * 100.0
+                );
+            }
+        }
     }
     Ok(())
 }

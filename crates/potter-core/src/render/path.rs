@@ -856,7 +856,56 @@ fn trace_path(
         });
         let segment_limit = light.map_or(surface_distance, |light| light.distance);
         let environment = world_radiance(doc, &snapshot.scene_id, images, direction, environment)?;
-        let volume_segment = trace_volume_segment(volumes, origin, direction, segment_limit, rng)?;
+        // Voxel volumes sample their grid by free flight. Under their material's `volume_sampling` their direct light is
+        // equiangular about each light's point, as the mesh medium's is, unless a mesh medium is on top: its direct light
+        // covers the whole segment, so voxel events then take distance sampling in full.
+        use crate::model::VolumeSampling;
+        let grid = voxel_grid(volumes, origin, direction, segment_limit)?;
+        let voxel_method = match (&grid, media.is_empty()) {
+            (Some(grid), true) => segment_sampling(grid.samplings.iter().copied()),
+            _ => None,
+        };
+        let budget = transparent_max_bounces.saturating_sub(transparent_bounce);
+        let choices = equiangular_choices(lights, origin, voxel_method, rng);
+        if let (Some(method), Some(grid)) = (voxel_method, grid.as_ref()) {
+            for (light, &(point, sampled)) in lights.iter().zip(&choices) {
+                let Some(point) = point.filter(|_| sampled) else {
+                    continue;
+                };
+                let Some((distance, pdf)) =
+                    equiangular_sample(point, origin, direction, segment_limit, rng.next_f64())
+                else {
+                    continue;
+                };
+                let transmitted = grid.meters_per_unit * (-grid_depth(grid, distance)).exp();
+                let mis = match method {
+                    VolumeSampling::Equiangular => 1.0,
+                    _ => 2.0 * power_heuristic(pdf, grid_scatter_pdf(grid, distance)),
+                };
+                let sample_point = origin + direction * distance;
+                for group in &grid.groups {
+                    let camera = grid_scatter_at(grid, &group.scatter, distance) * transmitted;
+                    let nee = volume_light_nee(
+                        doc,
+                        snapshot,
+                        geometry,
+                        bvh,
+                        volumes,
+                        &media,
+                        images,
+                        light,
+                        sample_point,
+                        direction,
+                        group.anisotropy,
+                        budget,
+                        rng,
+                        evaluator_workspace,
+                    )?;
+                    radiance += throughput * camera * nee * (mis / pdf);
+                }
+            }
+        }
+        let volume_segment = trace_volume_segment(grid.as_ref(), volumes, origin, direction, rng)?;
         radiance += throughput * volume_segment.emission;
         if !volume_segment.stochastic {
             throughput *= volume_segment.transmittance;
@@ -870,6 +919,22 @@ fn trace_path(
                 break;
             }
             throughput *= event.albedo / scatter_probability;
+            let event_distance = (event.point - origin).dot(direction);
+            let (event_method, scatter_pdf) = match (voxel_method, grid.as_ref()) {
+                (Some(method), Some(grid)) => {
+                    (Some(method), grid_scatter_pdf(grid, event_distance))
+                }
+                _ => (None, 0.0),
+            };
+            let weights = event_weights(
+                &choices,
+                event_method,
+                origin,
+                direction,
+                segment_limit,
+                event_distance,
+                scatter_pdf,
+            );
             radiance += throughput
                 * direct_volume_lighting(
                     doc,
@@ -877,7 +942,7 @@ fn trace_path(
                     geometry,
                     bvh,
                     lights,
-                    &[],
+                    &weights,
                     volumes,
                     &media,
                     images,
@@ -885,7 +950,7 @@ fn trace_path(
                     event,
                     direction,
                     environment,
-                    transparent_max_bounces.saturating_sub(transparent_bounce),
+                    budget,
                     rng,
                     evaluator_workspace,
                 )?;
@@ -2859,17 +2924,70 @@ fn volume_extinction_density(instance: &VolumeInstance<'_>, density: f64) -> f64
     density.max(0.0) * instance.extinction_scale
 }
 
-fn trace_volume_segment(
+/// The weight of each light's direct light at a distance-sampled scatter event (`volume_direct_scatter_mis`): zero
+/// for a light sampled equiangularly, the multiple importance sampling weight against its equiangular pdf under
+/// multiple importance sampling, and one otherwise.
+fn event_weights(
+    choices: &[(Option<DVec3>, bool)],
+    method: Option<crate::model::VolumeSampling>,
+    origin: DVec3,
+    direction: DVec3,
+    segment_limit: f64,
+    distance: f64,
+    scatter_pdf: f64,
+) -> Vec<f64> {
+    use crate::model::VolumeSampling;
+    choices
+        .iter()
+        .map(|&(point, sampled)| match (sampled, method, point) {
+            (true, _, _) => 0.0,
+            (false, Some(VolumeSampling::MultipleImportance), Some(point)) => {
+                2.0 * power_heuristic(
+                    scatter_pdf,
+                    equiangular_pdf(point, origin, direction, segment_limit, distance),
+                )
+            }
+            _ => 1.0,
+        })
+        .collect()
+}
+/// One voxel segment's sampling grid, as `trace_volume_segment` samples it: the steps across the volumes' bounds
+/// along the ray, with each step's grey extinction, emission and scatter per channel at its midpoint. The
+/// equiangular direct light reads the same grid, so its transmittance and scatter densities are the sampler's own.
+struct VoxelGrid {
+    entry: f64,
+    step: f64,
+    meters_per_unit: f64,
+    /// Grey extinction per meter of each step.
+    extinction: Vec<f64>,
+    /// Emission per meter of each step.
+    emission: Vec<DVec3>,
+    /// Scatter per meter and channel of each step, summed over the volumes.
+    scatter: Vec<DVec3>,
+    /// The scatter of the volumes with each anisotropy, so every phase is evaluated with its own volumes.
+    groups: Vec<ScatterGroup>,
+    stochastic: bool,
+    /// Blender's `cycles.volume_sampling` of each volume that the segment crosses.
+    samplings: Vec<crate::model::VolumeSampling>,
+}
+
+/// The scatter per meter and channel of the volumes with one anisotropy, per step of a [`VoxelGrid`].
+struct ScatterGroup {
+    anisotropy: f64,
+    scatter: Vec<DVec3>,
+}
+
+fn voxel_grid(
     volumes: &[VolumeInstance<'_>],
     origin: DVec3,
     direction: DVec3,
     max_distance: f64,
-    rng: &mut Pcg32,
-) -> Result<VolumeSegment> {
+) -> Result<Option<VoxelGrid>> {
     let mut entry = f64::INFINITY;
     let mut exit = 0.0_f64;
     let mut minimum_step = f64::INFINITY;
     let mut stochastic = false;
+    let mut samplings = Vec::new();
     for instance in volumes {
         if !instance.voxel_size.is_finite()
             || instance.voxel_size <= 0.0
@@ -2897,15 +3015,11 @@ fn trace_volume_segment(
             stochastic |= instance.scattering
                 && instance.albedo.max_element() > 0.0
                 && instance.extinction_scale > 0.0;
+            samplings.push(instance.sampling);
         }
     }
     if !entry.is_finite() || exit <= entry {
-        return Ok(VolumeSegment {
-            transmittance: 1.0,
-            emission: DVec3::ZERO,
-            event: None,
-            stochastic: false,
-        });
+        return Ok(None);
     }
     let segment_length = exit - entry;
     let steps = (segment_length / minimum_step)
@@ -2915,27 +3029,120 @@ fn trace_volume_segment(
     let meters_per_unit = volumes
         .first()
         .map_or(1.0, |instance| instance.meters_per_unit);
-    let free_flight = if stochastic {
+    let mut groups: Vec<ScatterGroup> = Vec::new();
+    for instance in volumes {
+        if !groups
+            .iter()
+            .any(|group| crate::float::equal_f64(group.anisotropy, instance.anisotropy))
+        {
+            groups.push(ScatterGroup {
+                anisotropy: instance.anisotropy,
+                scatter: vec![DVec3::ZERO; steps],
+            });
+        }
+    }
+    let mut extinction = Vec::with_capacity(steps);
+    let mut emission = Vec::with_capacity(steps);
+    let mut scatter = vec![DVec3::ZERO; steps];
+    for index in 0..steps {
+        let point = origin + direction * (entry + (index as f64 + 0.5) * step);
+        let mut step_extinction = 0.0;
+        let mut step_emission = DVec3::ZERO;
+        for instance in volumes {
+            let density = volume_density_at(instance, point)?;
+            let coefficient = volume_extinction_density(instance, density);
+            let step_scatter = instance.albedo * coefficient;
+            step_extinction += coefficient;
+            step_emission += instance.emission * density;
+            scatter[index] += step_scatter;
+            if let Some(group) = groups
+                .iter_mut()
+                .find(|group| crate::float::equal_f64(group.anisotropy, instance.anisotropy))
+            {
+                group.scatter[index] += step_scatter;
+            }
+        }
+        extinction.push(step_extinction);
+        emission.push(step_emission);
+    }
+    Ok(Some(VoxelGrid {
+        entry,
+        step,
+        meters_per_unit,
+        extinction,
+        emission,
+        scatter,
+        groups,
+        stochastic,
+        samplings,
+    }))
+}
+
+/// The optical depth, in meters, from the segment origin to `distance` along the grid's steps. Each step is
+/// linear in its own distance, as the sampler accumulates it.
+fn grid_depth(grid: &VoxelGrid, distance: f64) -> f64 {
+    let mut depth = 0.0;
+    for (index, extinction) in grid.extinction.iter().enumerate() {
+        let start = grid.entry + index as f64 * grid.step;
+        if distance <= start {
+            break;
+        }
+        let covered = distance.min(start + grid.step) - start;
+        depth += extinction * covered * grid.meters_per_unit;
+    }
+    depth
+}
+
+/// The grid step containing `distance`, or `None` off the grid.
+fn grid_step_index(grid: &VoxelGrid, distance: f64) -> Option<usize> {
+    let offset = (distance - grid.entry) / grid.step;
+    (offset >= 0.0 && offset < grid.extinction.len() as f64).then(|| offset as usize)
+}
+
+/// The scatter per meter and channel of a per-step table at `distance`, zero off the grid.
+fn grid_scatter_at(grid: &VoxelGrid, values: &[DVec3], distance: f64) -> DVec3 {
+    grid_step_index(grid, distance).map_or(DVec3::ZERO, |index| values[index])
+}
+
+/// The density per unit distance, of the scatter events of the grid at `distance`, that the distance sampler
+/// realises: the channel-mean scatter per meter, transmitted over the depth to `distance`. It is a positive
+/// function of `distance` for the MIS weights, and the estimator is unbiased for any such function.
+fn grid_scatter_pdf(grid: &VoxelGrid, distance: f64) -> f64 {
+    let scatter = grid_scatter_at(grid, &grid.scatter, distance).element_sum() / 3.0;
+    scatter * grid.meters_per_unit * (-grid_depth(grid, distance)).exp()
+}
+
+/// Trace one voxel segment's free flight on its grid, with the distance sampler's events and emission
+/// (`volume_integrate_heterogeneous`, with the grid's grey transport).
+fn trace_volume_segment(
+    grid: Option<&VoxelGrid>,
+    volumes: &[VolumeInstance<'_>],
+    origin: DVec3,
+    direction: DVec3,
+    rng: &mut Pcg32,
+) -> Result<VolumeSegment> {
+    let Some(grid) = grid else {
+        return Ok(VolumeSegment {
+            transmittance: 1.0,
+            emission: DVec3::ZERO,
+            event: None,
+            stochastic: false,
+        });
+    };
+    let free_flight = if grid.stochastic {
         -rng.next_f64().max(f64::MIN_POSITIVE).ln()
     } else {
         f64::INFINITY
     };
+    let step_in_meters = grid.step * grid.meters_per_unit;
     let mut accumulated_depth = 0.0;
     let mut emitted = DVec3::ZERO;
-    for sample_index in 0..steps {
-        let distance = entry + (sample_index as f64 + 0.5) * step;
-        let point = origin + direction * distance;
-        let mut extinction = 0.0;
-        let mut source = DVec3::ZERO;
-        for instance in volumes {
-            let density = volume_density_at(instance, point)?;
-            extinction += volume_extinction_density(instance, density);
-            source += instance.emission * density;
-        }
+    for (index, &extinction) in grid.extinction.iter().enumerate() {
         if extinction <= 0.0 {
             continue;
         }
-        let step_in_meters = step * meters_per_unit;
+        let start = grid.entry + index as f64 * grid.step;
+        let source = grid.emission[index];
         let step_depth = extinction * step_in_meters;
         let event_in_step = free_flight <= accumulated_depth + step_depth;
         let traveled_meters = if event_in_step {
@@ -2947,13 +3154,13 @@ fn trace_volume_segment(
         emitted += source * (-accumulated_depth).exp() * source_distance;
         accumulated_depth += extinction * traveled_meters;
         if event_in_step {
-            let event_world_distance = distance - step * 0.5 + traveled_meters / meters_per_unit;
-            let event_point = origin + direction * event_world_distance;
+            let event_point = origin + direction * (start + traveled_meters / grid.meters_per_unit);
+            let midpoint = origin + direction * (start + grid.step * 0.5);
             let selected = rng.next_f64() * extinction;
             let mut weight = 0.0;
             let mut chosen = None;
             for instance in volumes {
-                let density = volume_density_at(instance, point)?;
+                let density = volume_density_at(instance, midpoint)?;
                 weight += volume_extinction_density(instance, density);
                 if selected <= weight {
                     chosen = Some(instance);
@@ -2980,7 +3187,7 @@ fn trace_volume_segment(
                 transmittance: (-accumulated_depth).exp(),
                 emission: emitted,
                 event: Some(event),
-                stochastic,
+                stochastic: grid.stochastic,
             });
         }
     }
@@ -2988,7 +3195,7 @@ fn trace_volume_segment(
         transmittance: (-accumulated_depth).exp(),
         emission: emitted,
         event: None,
-        stochastic,
+        stochastic: grid.stochastic,
     })
 }
 
