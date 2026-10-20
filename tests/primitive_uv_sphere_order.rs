@@ -69,7 +69,6 @@ fn uv_sphere_storage_order_matches_blender_primitive_uv_sphere_add() -> TestResu
             segments: u32::try_from(integer(kwargs, "segments", 32)?)?,
             ring_count: u32::try_from(integer(kwargs, "ring_count", 16)?)?,
             radius: radius(kwargs)?,
-            ..UvSphereParams::default()
         };
         let mesh = Mesh::uv_sphere(params)?;
         compare_with_oracle(name, &mesh, case)?;

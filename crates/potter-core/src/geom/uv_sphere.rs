@@ -4,7 +4,7 @@
 //! meridian of `rings + 1` vertices and `rings` edges, then `segments` rounds of
 //! `extrude_edge_only` followed by a rotation of the new vertices about the sphere axis, then
 //! `remove_doubles` at a third of the shortest segment. This module replays that pipeline on a
-//! minimal BMesh model, so the vertex, edge, face and loop order follow from the same rules:
+//! minimal `BMesh` model, so the vertex, edge, face and loop order follow from the same rules:
 //!
 //! - Positions are computed in f32 with Blender's operation order (`sin_cos_from_fraction`,
 //!   `axis_angle_normalized_to_mat3_ex`, `mul_m4_m4m4` C fallback, `mul_m4_v3`). The f32 rounding
@@ -41,6 +41,15 @@ type Mat4 = [[f32; 4]; 4];
 
 /// `sin_cos_from_fraction` (`math_rotation_c.cc:995`): sine and cosine of `2π·numer/denom`,
 /// evaluated in the first octant and mapped back by symmetry for exact symmetric circles.
+/// Compacted vertex and edge indices of a welded cluster.
+type Compacted = (Vec<usize>, Vec<usize>);
+
+/// Bit-exact equality of two non-negative squared distances: the tie-break compares computed values, so
+/// equal bits are the intended test.
+fn same_distance(first: f32, second: f32) -> bool {
+    first.to_bits() == second.to_bits()
+}
+
 fn sin_cos_from_fraction(numerator: i32, denominator: i32) -> (f32, f32) {
     let mut numerator = numerator * 8;
     let octant = numerator / denominator;
@@ -256,7 +265,7 @@ fn cluster_target(cluster: &[usize], coords: &[Vec3]) -> usize {
         if distance > best {
             continue;
         }
-        if distance == best && vertex > cluster[best_index] {
+        if same_distance(distance, best) && vertex > cluster[best_index] {
             continue;
         }
         best_index = index;
@@ -321,7 +330,7 @@ struct BFace {
     dead: bool,
 }
 
-/// Minimal BMesh: vertices, edges and faces in creation (mempool) order.
+/// Minimal `BMesh`: vertices, edges and faces in creation (mempool) order.
 #[derive(Default)]
 struct BMesh {
     co: Vec<Vec3>,
@@ -434,7 +443,7 @@ fn recreate_face(
     verts: &[usize],
     edges: &[usize],
     target: &[usize],
-) -> Result<Option<(Vec<usize>, Vec<usize>)>, MeshError> {
+) -> Result<Option<Compacted>, MeshError> {
     let n = verts.len();
     let mut out_verts = Vec::with_capacity(n);
     let mut out_edges = Vec::with_capacity(n);
@@ -479,7 +488,7 @@ struct Topology {
     faces: Vec<Vec<usize>>,
 }
 
-/// `remove_doubles` followed by `weld_verts` (`bmo_removedoubles.cc`) and the BMesh compaction.
+/// `remove_doubles` followed by `weld_verts` (`bmo_removedoubles.cc`) and the `BMesh` compaction.
 fn weld(bm: &mut BMesh, duplicates: &[usize]) -> Result<Topology, MeshError> {
     let vertex_count = bm.co.len();
     let target: Vec<usize> = duplicates
