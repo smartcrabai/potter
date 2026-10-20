@@ -646,38 +646,38 @@ fn assert_plane(label: &str, mesh: &Mesh, expected: &[[f64; 3]; 4]) {
 const SCENE_TEX_LOCAL_X: [[f64; 3]; 4] = [
     [-1.255_555_511, -1.0, 0.0],
     [0.744_444_489, -1.0, 0.0],
-    [0.744_444_489, 1.0, 0.0],
     [-1.255_555_511, 1.0, 0.0],
+    [0.744_444_489, 1.0, 0.0],
 ];
 const SCENE_TEX_LOCAL_RGB: [[f64; 3]; 4] = [
     [-1.119_607_806, -1.034_313_679, -0.229_411_781],
     [0.880_392_194, -1.034_313_679, -0.229_411_781],
-    [0.880_392_194, 0.965_686_321, -0.229_411_781],
     [-1.119_607_806, 0.965_686_321, -0.229_411_781],
+    [0.880_392_194, 0.965_686_321, -0.229_411_781],
 ];
 const SCENE_TEX_GLOBAL_X_TRANSFORM: [[f64; 3]; 4] = [
     [-1.372_565_031, -0.946_224_868, 0.0],
     [0.729_355_395, -0.960_935_831, 0.0],
-    [0.487_294_734, 1.074_002_624, 0.0],
     [-1.614_625_692, 1.088_713_646, 0.0],
+    [0.487_294_734, 1.074_002_624, 0.0],
 ];
 const SCENE_TEX_OBJECT_X_TRANSFORM: [[f64; 3]; 4] = [
     [-1.286_264_300, -1.0, 0.0],
     [0.726_361_394, -1.0, 0.0],
-    [0.875_387_669, 1.0, 0.0],
     [-1.307_304_144, 1.0, 0.0],
+    [0.875_387_669, 1.0, 0.0],
 ];
 const SCENE_WARP_TEX_LOCAL: [[f64; 3]; 4] = [
     [-1.170_758_367, -0.647_514_105, 0.0],
     [0.975_437_999, -0.769_736_409, 0.0],
-    [1.342_104_673, 0.953_069_687, 0.0],
     [-0.804_091_692, 1.075_292_110, 0.0],
+    [1.342_104_673, 0.953_069_687, 0.0],
 ];
 const SCENE_WAVE_TEX_LOCAL: [[f64; 3]; 4] = [
     [-1.0, -1.0, 0.062_329_289],
     [1.0, -1.0, 0.062_329_289],
-    [1.0, 1.0, 0.062_329_289],
     [-1.0, 1.0, 0.062_329_289],
+    [1.0, 1.0, 0.062_329_289],
 ];
 
 /// The subject transform of the transformed-texture cases (translation, Euler Z 30 degrees, scale).
@@ -759,14 +759,13 @@ fn displace_texture_uses_named_native_uv_layer() -> Result<(), Box<dyn std::erro
     // Blender 5.2.2 output of tests/fixtures/pr18f_displacement/generate_named_uv_exact_oracle.py
     // (uv.cube_project corner UVs with the uv.transform applied to Potter's stored UVs; primitive UV
     // layer removed first).
-    // Blender's primitive plane orders its corners (-1,-1), (1,-1), (-1,1), (1,1); Potter orders them
-    // (-1,-1), (1,-1), (1,1), (-1,1). The Blender values below are reindexed to Potter's order by rest
-    // position (Blender vertices 2 and 3 swap), so each position's displacement is unchanged.
+    // Blender's primitive plane and Potter's plane share the storage order (-1,-1), (1,-1), (-1,1), (1,1),
+    // so the oracle's positions are compared by index.
     let expected = [
         [-1.25, -1.0, 0.0],
         [0.5, -1.0, 0.0],
-        [0.75, 1.0, 0.0],
         [-1.0, 1.0, 0.0],
+        [0.75, 1.0, 0.0],
     ];
     assert_plane("displace texture named UV layer", &mesh, &expected);
     Ok(())
@@ -787,8 +786,8 @@ fn warp_texture_factor_matches_blender() -> Result<(), Box<dyn std::error::Error
 const WARP_CURVE_VERTICES: [[f64; 3]; 4] = [
     [-1.0, -1.0, 0.0],
     [1.0, -1.0, 0.0],
-    [1.0, 1.0, 0.0],
     [-1.0, 1.0, 0.0],
+    [1.0, 1.0, 0.0],
 ];
 const WARP_CURVE_FROM: [f64; 3] = [-0.8, -0.4, 0.0];
 const WARP_CURVE_TO: [f64; 3] = [0.0, 0.0, 2.0];
@@ -928,7 +927,7 @@ fn assert_warp_curve_matches_blender_522(
         &input_path,
         serde_json::to_vec(&json!({
             "vertices": WARP_CURVE_VERTICES,
-            "faces": [[0, 1, 2, 3]],
+            "faces": [[0, 1, 3, 2]],
             "from": WARP_CURVE_FROM,
             "to": WARP_CURVE_TO,
             "radius": WARP_CURVE_RADIUS,
@@ -1244,8 +1243,8 @@ fn inline_blend_texture_diagonal_matches_blender() -> Result<(), Box<dyn std::er
     let expected = [
         [-1.5, -1.0, 0.0],
         [1.0, -1.0, 0.0],
-        [1.5, 1.0, 0.0],
         [-1.0, 1.0, 0.0],
+        [1.5, 1.0, 0.0],
     ];
     assert_plane("inline Blend diagonal", &mesh, &expected);
     Ok(())
@@ -1515,8 +1514,8 @@ fn legacy_noise_texture_follows_the_documented_modifier_stream()
     const PLANE_CORNERS: [[f64; 3]; 4] = [
         [-1.0, -1.0, 0.0],
         [1.0, -1.0, 0.0],
-        [1.0, 1.0, 0.0],
         [-1.0, 1.0, 0.0],
+        [1.0, 1.0, 0.0],
     ];
     let operations = [
         json!({"op":"node.create","id":"subject","kind":"plane","params":{"size":2.0}}),
