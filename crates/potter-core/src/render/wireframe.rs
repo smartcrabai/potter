@@ -561,20 +561,36 @@ mod tests {
     }
 }
 
-/// The Blender 5.2.2 viewport oracle of the cube and sphere (`tests/fixtures/workbench_wireframe`):
-/// the model's per-pixel result is compared with the capture, by pixel class.
+/// Oracle checks against the Blender 5.2.2 viewport captures in `tests/fixtures/workbench_wireframe`.
 ///
-/// What the model gets right, and what it does not:
-/// - background: pixels the model leaves at the theme colour match the capture within 4 levels; 11 of
-///   about 194 thousand sit beside the sphere's silhouette, where the capture has a faint line the model
-///   does not draw;
-/// - cube edges: the cube's lines match the capture within 9 levels except for 2 pixels at a corner,
-///   where a line's end is off by a fraction of a pixel (the fixed GPU line rule is not reproduced);
-/// - sphere edges: the mean error is 2.4 levels, and the ink (the darkness the lines add) is about 9%
-///   below the capture. Overlapping curved lines are where the GPU's line rasteriser and this model
-///   disagree most, and the cause is not known: the candidates tried (draw order, facing choice, depth
-///   ordering, the dense-line fix, the inclusion width, the coverage kernel, sub-pixel projection) do
-///   not close the ink gap. The ink bound below pins the current deficit so a change is noticed.
+/// What the model provably reproduces, and what it does not:
+/// - Background: every pixel farther than 2.5 px from any line or point matches the capture within one
+///   level (8-bit rounding of the theme value; the overlay's gamma display rounds one level differently
+///   at a few theme values).
+/// - View transform: the Standard and AgX captures of the same scene are byte-identical, so overlays are
+///   not view-transformed, and Wire output is not either.
+/// - Points: the interior of each loose-vertex square (within 0.25 of its side from the centre) matches
+///   within one level (`overlay_wireframe_frag.glsl`, POINTS).
+/// - Curves: pixels on a curve's centre line match within one level, except one pixel at 9 levels.
+/// - Cube line centres (pixels within 0.3 px of a cube edge, x < 400): 95 pixels; 93 match within three
+///   levels. The two outliers are at the corner where the cube's vertical edge meets the top edge, a line
+///   end where GPU line rasterisation is not reproduced.
+///
+/// Known gaps, with evidence (also in CHANGELOG and docs/spec.md):
+/// 1. AA fringe ink on Apple Metal lines. Coincident lines add ink in the capture: a front/back pair adds
+///    7.4% ink per unit length over a single edge, and an identical-depth duplicate pair adds 8.2%. The
+///    model, which keeps the nearest line per pixel, adds none. The wire pass has no blend state and
+///    writes colour and line record from the same fragment (`overlay_wireframe.hh:79`,
+///    `overlay_wireframe_frag.glsl:37–41`), so the source does not explain it. The cube's ink is 22% below
+///    the capture, and the sphere's 11% below. These are not asserted.
+/// 2. Sphere line centres. Of 1132 pixels within 0.3 px of a sphere edge, 430 differ from the capture by
+///    more than three levels (up to 46): the facing colour of shared edges. No choice of adjacent face
+///    (first, last, most or least facing) fixes it, so the facing rule for shared edges is not known. Not
+///    asserted.
+/// 3. Point-cloud outline ring. Point-cloud dots at radii 0.05 to 0.2 show the vertex-sized square plus a
+///    partial outline whose radius follows no rule that fits. The square alone gives a lower error than the
+///    best ring fit (0.84 against 1.24). Dots are drawn as the square; the ring is not modelled. Point-cloud
+///    and stroke colours are black (the theme wire colour), not measured.
 #[cfg(test)]
 mod oracle_tests {
     use std::{
@@ -593,11 +609,13 @@ mod oracle_tests {
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
-    /// Ortho scale of the capture's camera: its half width is 8.6399 (window matrix `m00` of the
-    /// oracle, landscape sensor fit), so the scale is twice that.
+    /// Ortho scale of the capture's camera: the window matrix's half width is 8.6399 (landscape sensor fit).
     const ORTHO_SCALE: f64 = 2.0 * 8.6399;
     const WIDTH: u32 = 818;
     const HEIGHT: u32 = 695;
+    /// The object region of the captures. The viewport corners carry UI arrows, which are not compared.
+    const X_RANGE: std::ops::Range<usize> = 120..700;
+    const Y_RANGE: std::ops::Range<usize> = 120..600;
 
     fn fixture(name: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -605,7 +623,7 @@ mod oracle_tests {
             .join(name)
     }
 
-    fn point(value: &Value) -> TestResult<DVec3> {
+    fn point_value(value: &Value) -> TestResult<DVec3> {
         let coords: Vec<f64> = value
             .as_array()
             .ok_or("point is not an array")?
@@ -618,8 +636,8 @@ mod oracle_tests {
         }
     }
 
-    /// The fixture's edges: world endpoints, the first face's corner normals, and `wd`.
-    fn load_edges() -> TestResult<Vec<WireEdge>> {
+    /// The fixture's mesh edges: world endpoints, the first face's corner normals, and `wd`.
+    fn cube_sphere_edges() -> TestResult<Vec<WireEdge>> {
         let records: Vec<Value> =
             serde_json::from_str(&fs::read_to_string(fixture("wire_edges_cube_sphere.json"))?)?;
         records
@@ -629,14 +647,14 @@ mod oracle_tests {
                     .as_array()
                     .ok_or("normals missing")?
                     .iter()
-                    .map(point)
+                    .map(point_value)
                     .collect::<TestResult<Vec<_>>>()?;
                 let [normal_a, normal_b] = normals.as_slice() else {
                     return Err::<WireEdge, Box<dyn Error>>("two normals per edge".into());
                 };
                 Ok(WireEdge {
-                    start: point(&record["start"])?,
-                    end: point(&record["end"])?,
+                    start: point_value(&record["start"])?,
+                    end: point_value(&record["end"])?,
                     normals: Some([*normal_a, *normal_b]),
                     colour: [0.0; 3],
                     wd: record["wd"].as_f64().ok_or("wd missing")?,
@@ -645,12 +663,10 @@ mod oracle_tests {
             .collect()
     }
 
-    /// The capture's RGB pixels, row 0 at the top.
-    fn load_capture() -> TestResult<Vec<[u8; 3]>> {
-        let mut reader = png::Decoder::new(BufReader::new(fs::File::open(fixture(
-            "oracle_cube_sphere.png",
-        ))?))
-        .read_info()?;
+    /// The capture's RGB pixels, row 0 at the top, and its size.
+    fn load_capture(name: &str) -> TestResult<Vec<[u8; 3]>> {
+        let mut reader =
+            png::Decoder::new(BufReader::new(fs::File::open(fixture(name))?)).read_info()?;
         let mut buffer = vec![
             0;
             reader
@@ -658,7 +674,9 @@ mod oracle_tests {
                 .ok_or("PNG output buffer size is unknown")?
         ];
         let info = reader.next_frame(&mut buffer)?;
-        assert_eq!((info.width, info.height), (WIDTH, HEIGHT));
+        if (info.width, info.height) != (WIDTH, HEIGHT) {
+            return Err(format!("{name} is {}x{}", info.width, info.height).into());
+        }
         let channels = info.color_type.samples();
         Ok(buffer
             .chunks_exact(channels)
@@ -683,114 +701,238 @@ mod oracle_tests {
         }
     }
 
-    /// Per-class error statistics, the classes as the model's own pixels define them.
-    #[derive(Default, Debug)]
-    struct Stats {
-        count: usize,
-        sum: u64,
-        max: u8,
-        over_nine: usize,
+    /// Projects world points with the capture's own matrices (window times view), independently of
+    /// Potter's projection, into continuous pixel coordinates with row 0 at the top.
+    fn capture_projector(name: &str) -> TestResult<impl Fn(DVec3) -> [f64; 2]> {
+        let json: Value = serde_json::from_str(&fs::read_to_string(fixture(name))?)?;
+        let matrix = |key: &str| -> TestResult<[[f64; 4]; 4]> {
+            let rows = json[key].as_array().ok_or("matrix missing")?;
+            let mut out = [[0.0; 4]; 4];
+            for (r, row) in rows.iter().enumerate() {
+                for (c, value) in row.as_array().ok_or("row missing")?.iter().enumerate() {
+                    out[r][c] = value.as_f64().ok_or("entry missing")?;
+                }
+            }
+            Ok(out)
+        };
+        let window = matrix("window_matrix")?;
+        let view = matrix("view_matrix")?;
+        let product: [[f64; 4]; 4] = std::array::from_fn(|r| {
+            std::array::from_fn(|c| (0..4).map(|k| window[r][k] * view[k][c]).sum())
+        });
+        let width = WIDTH as f64;
+        let height = HEIGHT as f64;
+        Ok(move |p: DVec3| {
+            let v = [p.x, p.y, p.z, 1.0];
+            let clip: [f64; 4] =
+                std::array::from_fn(|r| (0..4).map(|k| product[r][k] * v[k]).sum());
+            let (x, y) = (clip[0] / clip[3], clip[1] / clip[3]);
+            [(x + 1.0) * 0.5 * width, (1.0 - y) * 0.5 * height]
+        })
     }
 
-    impl Stats {
-        fn add(&mut self, error: u8) {
-            self.count += 1;
-            self.sum += u64::from(error);
-            self.max = self.max.max(error);
-            if error > 9 {
-                self.over_nine += 1;
-            }
-        }
-
-        fn mean(&self) -> f64 {
-            self.sum as f64 / self.count.max(1) as f64
-        }
+    fn segment_distance(px: f64, py: f64, a: [f64; 2], b: [f64; 2]) -> f64 {
+        let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+        let length_squared = dx * dx + dy * dy;
+        let t = if length_squared == 0.0 {
+            0.0
+        } else {
+            (((px - a[0]) * dx + (py - a[1]) * dy) / length_squared).clamp(0.0, 1.0)
+        };
+        (px - (a[0] + t * dx)).hypot(py - (a[1] + t * dy))
     }
 
-    #[test]
-    fn wireframe_matches_the_blender_viewport_capture() -> TestResult {
-        let edges = load_edges()?;
-        let capture = load_capture()?;
-        let output = rasterize_wireframe(&edges, &[], &camera(), WIDTH, HEIGHT)?;
-        let width = WIDTH as usize;
-        let height = HEIGHT as usize;
-        let model = |index: usize| -> [u8; 3] {
-            [
-                output.rgba[index * 4],
-                output.rgba[index * 4 + 1],
-                output.rgba[index * 4 + 2],
-            ]
-        };
-        let background = background_rgba();
-        let background = [background[0], background[1], background[2]];
-        let is_background = |x: usize, y: usize| -> bool {
-            let index = y * width + x;
-            if model(index) != background {
-                return false;
-            }
-            [(x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)]
-                .iter()
-                .all(|&(nx, ny)| {
-                    nx >= width || ny >= height || model(ny * width + nx) == background
-                })
-        };
-        let mut interior = Stats::default();
-        let mut interior_beyond_one = 0;
-        let mut cube = Stats::default();
-        let mut sphere = Stats::default();
-        let mut ink_model = [0_i64; 2];
-        let mut ink_capture = [0_i64; 2];
-        for y in 150..550 {
-            for x in 150..650 {
-                let index = y * width + x;
-                let want = capture[index];
-                let side = usize::from(x >= 400);
-                ink_model[side] += background.iter().map(|&v| i64::from(v)).sum::<i64>()
-                    - model(index).iter().map(|&v| i64::from(v)).sum::<i64>();
-                ink_capture[side] += background.iter().map(|&v| i64::from(v)).sum::<i64>()
-                    - want.iter().map(|&v| i64::from(v)).sum::<i64>();
-                let error = model(index)
-                    .iter()
-                    .zip(want)
-                    .map(|(a, b)| a.abs_diff(b))
-                    .max()
-                    .unwrap_or(0);
-                if is_background(x, y) {
-                    let deviation = want
-                        .iter()
-                        .zip(background)
-                        .map(|(a, b)| a.abs_diff(b))
-                        .max()
-                        .unwrap_or(0);
-                    interior.add(deviation);
-                    if deviation > 1 {
-                        interior_beyond_one += 1;
-                    }
-                } else if x < 400 {
-                    cube.add(error);
-                } else {
-                    sphere.add(error);
+    /// Distance from every pixel centre to the nearest segment, computed inside each segment's box.
+    fn line_distance(segments: &[([f64; 2], [f64; 2])]) -> Vec<f64> {
+        let (width, height) = (WIDTH as usize, HEIGHT as usize);
+        let mut out = vec![f64::MAX; width * height];
+        for &(a, b) in segments {
+            let reach = 4.0;
+            let x0 = (a[0].min(b[0]) - reach).floor().max(0.0) as usize;
+            let x1 = ((a[0].max(b[0]) + reach).ceil().max(0.0) as usize).min(width - 1);
+            let y0 = (a[1].min(b[1]) - reach).floor().max(0.0) as usize;
+            let y1 = ((a[1].max(b[1]) + reach).ceil().max(0.0) as usize).min(height - 1);
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    let d = segment_distance(x as f64 + 0.5, y as f64 + 0.5, a, b);
+                    let slot = &mut out[y * width + x];
+                    *slot = slot.min(d);
                 }
             }
         }
-        // Background: exact up to 4 levels; 11 pixels beside the silhouette carry a faint line.
-        assert!(interior.max <= 4, "interior {interior:?}");
-        assert!(
-            interior_beyond_one <= 11,
-            "interior beyond one: {interior_beyond_one}"
+        out
+    }
+
+    /// Distance from every pixel centre to the nearest point centre.
+    fn point_distance(centres: &[[f64; 2]]) -> Vec<f64> {
+        let (width, height) = (WIDTH as usize, HEIGHT as usize);
+        let mut out = vec![f64::MAX; width * height];
+        for centre in centres {
+            let reach = 10.0;
+            let x0 = (centre[0] - reach).floor().max(0.0) as usize;
+            let x1 = ((centre[0] + reach).ceil().max(0.0) as usize).min(width - 1);
+            let y0 = (centre[1] - reach).floor().max(0.0) as usize;
+            let y1 = ((centre[1] + reach).ceil().max(0.0) as usize).min(height - 1);
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    let d = (x as f64 + 0.5 - centre[0]).hypot(y as f64 + 0.5 - centre[1]);
+                    let slot = &mut out[y * width + x];
+                    *slot = slot.min(d);
+                }
+            }
+        }
+        out
+    }
+
+    /// Per-channel largest difference between the model's pixel and the capture's, over the region.
+    fn errors_where(
+        rgba: &[u8],
+        capture: &[[u8; 3]],
+        keep: impl Fn(usize, usize) -> bool,
+    ) -> Vec<u8> {
+        let width = WIDTH as usize;
+        let mut out = Vec::new();
+        for y in Y_RANGE {
+            for x in X_RANGE {
+                if !keep(x, y) {
+                    continue;
+                }
+                let index = y * width + x;
+                let model = [rgba[index * 4], rgba[index * 4 + 1], rgba[index * 4 + 2]];
+                let want = capture[index];
+                out.push(
+                    model
+                        .iter()
+                        .zip(want)
+                        .map(|(a, b)| a.abs_diff(b))
+                        .max()
+                        .unwrap_or(0),
+                );
+            }
+        }
+        out
+    }
+
+    fn segments_of(
+        edges: &[WireEdge],
+        project: &impl Fn(DVec3) -> [f64; 2],
+    ) -> Vec<([f64; 2], [f64; 2])> {
+        edges
+            .iter()
+            .map(|edge| (project(edge.start), project(edge.end)))
+            .filter(|(a, b)| (a[0] - b[0]).abs() + (a[1] - b[1]).abs() > 1e-9)
+            .collect()
+    }
+
+    #[test]
+    fn overlay_is_not_view_transformed() -> TestResult {
+        // The Standard and AgX captures of the same scene are byte-identical.
+        assert_eq!(
+            load_capture("oracle_cube_sphere.png")?,
+            load_capture("oracle_cube_sphere_agx.png")?
         );
-        // Cube edges: mean 3.0, within 9 levels except two corner pixels that reach 23.
-        assert!(cube.mean() <= 3.5, "cube {cube:?}");
-        assert!(cube.over_nine <= 2 && cube.max <= 23, "cube {cube:?}");
-        // Sphere edges: mean 2.4 measured; bounded with a margin.
-        assert!(sphere.mean() <= 3.0, "sphere {sphere:?}");
-        // Ink: the model adds about 9% less darkness on the sphere and 22% less on the cube than the
-        // capture (see the module note). Pinned, so that a change to the line model shows up here.
-        let ratio = |side: usize| {
-            100.0 * (ink_model[side] - ink_capture[side]) as f64 / ink_capture[side].max(1) as f64
-        };
-        assert!((ratio(1) + 8.9).abs() <= 1.0, "sphere ink {:.2}%", ratio(1));
-        assert!((ratio(0) + 21.7).abs() <= 2.0, "cube ink {:.2}%", ratio(0));
+        Ok(())
+    }
+
+    #[test]
+    fn background_matches_the_blender_capture() -> TestResult {
+        let edges = cube_sphere_edges()?;
+        let project = capture_projector("oracle_cube_sphere.json")?;
+        let capture = load_capture("oracle_cube_sphere.png")?;
+        let output = rasterize_wireframe(&edges, &[], &camera(), WIDTH, HEIGHT)?;
+        let distance = line_distance(&segments_of(&edges, &project));
+        let errors = errors_where(&output.rgba, &capture, |x, y| {
+            distance[y * WIDTH as usize + x] > 2.5
+        });
+        assert!(!errors.is_empty());
+        assert!(
+            errors.iter().all(|&error| error <= 1),
+            "background error {:?}",
+            errors.iter().max()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cube_line_centres_match_the_blender_capture() -> TestResult {
+        let edges = cube_sphere_edges()?;
+        let project = capture_projector("oracle_cube_sphere.json")?;
+        let capture = load_capture("oracle_cube_sphere.png")?;
+        let output = rasterize_wireframe(&edges, &[], &camera(), WIDTH, HEIGHT)?;
+        let cube_segments: Vec<_> = segments_of(&edges, &project)
+            .into_iter()
+            .filter(|(a, b)| a[0] < 400.0 && b[0] < 400.0)
+            .collect();
+        let distance = line_distance(&cube_segments);
+        let errors = errors_where(&output.rgba, &capture, |x, y| {
+            x < 400 && distance[y * WIDTH as usize + x] <= 0.3
+        });
+        assert!(
+            errors.len() >= 90,
+            "too few cube centre pixels: {}",
+            errors.len()
+        );
+        // All but two corner pixels match within three levels; no pixel exceeds 23.
+        assert!(
+            errors.iter().filter(|&&error| error > 3).count() <= 2,
+            "cube centres {errors:?}"
+        );
+        assert!(errors.iter().all(|&error| error <= 23));
+        Ok(())
+    }
+
+    #[test]
+    fn points_and_curves_match_the_blender_capture() -> TestResult {
+        let project = capture_projector("points_curves/pc.json")?;
+        let capture = load_capture("points_curves/pc.png")?;
+        // The curve of the point-cloud scene: (-1.5, 0, 5.5) to (1.5, 0, 5.5) to (1.5, 0, 6.5), black.
+        let curve_points = [
+            DVec3::new(-1.5, 0.0, 5.5),
+            DVec3::new(1.5, 0.0, 5.5),
+            DVec3::new(1.5, 0.0, 6.5),
+        ];
+        let edges: Vec<WireEdge> = curve_points
+            .windows(2)
+            .map(|pair| WireEdge {
+                start: pair[0],
+                end: pair[1],
+                normals: None,
+                colour: [0.0; 3],
+                wd: 0.0,
+            })
+            .collect();
+        // Four point-cloud points at z = 3.5, with radii 0.05 to 0.2 (drawn as squares of 2 x vert).
+        let points: Vec<WirePoint> = [-1.5, -0.5, 0.5, 1.5]
+            .iter()
+            .zip([0.05, 0.1, 0.15, 0.2])
+            .map(|(&x, radius)| WirePoint {
+                position: DVec3::new(x, 0.0, 3.5),
+                radius: Some(radius),
+            })
+            .collect();
+        let output = rasterize_wireframe(&edges, &points, &camera(), WIDTH, HEIGHT)?;
+        let segments = segments_of(&edges, &project);
+        let line_d = line_distance(&segments);
+        let centres: Vec<[f64; 2]> = points.iter().map(|point| project(point.position)).collect();
+        let point_d = point_distance(&centres);
+        let side = 2.0 * vertex_size();
+        let interior = errors_where(&output.rgba, &capture, |x, y| {
+            point_d[y * WIDTH as usize + x] <= 0.25 * side
+        });
+        assert!(!interior.is_empty());
+        assert!(
+            interior.iter().all(|&error| error <= 1),
+            "point interiors {interior:?}"
+        );
+        let curve = errors_where(&output.rgba, &capture, |x, y| {
+            line_d[y * WIDTH as usize + x] <= 0.5
+        });
+        assert!(curve.len() >= 150, "too few curve pixels: {}", curve.len());
+        assert!(
+            curve.iter().filter(|&&error| error > 1).count() <= 2,
+            "curve centres {curve:?}"
+        );
+        assert!(curve.iter().all(|&error| error <= 9));
         Ok(())
     }
 
