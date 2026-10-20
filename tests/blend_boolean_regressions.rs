@@ -51,7 +51,7 @@ use tempfile::tempdir;
 const BLENDER_REQUIRED: &str = "Blender is required for the Boolean regression expectations: install Blender 5.2.2, or set POTTER_BLENDER to its executable";
 
 /// The regression cases, one expectation file each.
-const REGRESSION_CASES: [&str; 23] = [
+const REGRESSION_CASES: [&str; 25] = [
     "unset_object_monkey",
     "unset_object_cube",
     "empty_collection_no_self",
@@ -75,6 +75,8 @@ const REGRESSION_CASES: [&str; 23] = [
     "sphere_open64_hole_tolerant_off",
     "sphere_open128_hole_tolerant_on",
     "sphere_closed64_hole_tolerant_on",
+    "sphere_closed64_raw_1",
+    "sphere_closed64_raw_2",
 ];
 
 /// Hosts whose custom normals are authored in Potter before evaluation.

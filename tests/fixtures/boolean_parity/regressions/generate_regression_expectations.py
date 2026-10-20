@@ -78,10 +78,12 @@ def new_collection(name, parent):
     return collection
 
 
-def mesh_object(name, collection, geometry, *, slots=(), slot_of_face=None, custom_normals=False):
+def mesh_object(
+    name, collection, geometry, *, slots=(), slot_of_face=None, custom_normals=False, edges=(),
+):
     verts, faces = geometry
     mesh = bpy.data.meshes.new(name)
-    mesh.from_pydata(verts, [], faces)
+    mesh.from_pydata(verts, edges, faces)
     mesh.update()
     for slot in slots:
         mesh.materials.append(None if slot is None else material(slot))
@@ -407,6 +409,24 @@ def build_scene(scene):
             bpy.ops.mesh.primitive_cube_add, case + ".cutter", size=1.0, location=(0.9, 0.0, 0.0)
         )
         boolean(host, "DIFFERENCE", "EXACT", operand=cutter, hole_tolerant=hole_tolerant)
+        add(case, "i", host, rings=False)
+    # Raw Blender sphere orders (dump_sphere_input.py): one case per committed input file.
+    inputs = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inputs")
+    for name in sorted(os.listdir(inputs)):
+        if not name.endswith(".json"):
+            continue
+        case = name[: -len(".json")]
+        with open(os.path.join(inputs, name)) as handle:
+            data = json.load(handle)
+        host = mesh_object(
+            case, scene, ([tuple(vertex) for vertex in data["verts"]],
+                          [tuple(face) for face in data["faces"]]),
+            edges=[tuple(edge) for edge in data["edges"]],
+        )
+        cutter = primitive(
+            bpy.ops.mesh.primitive_cube_add, case + ".cutter", size=1.0, location=(0.9, 0.0, 0.0)
+        )
+        boolean(host, "DIFFERENCE", "EXACT", operand=cutter, hole_tolerant=True)
         add(case, "i", host, rings=False)
     return cases
 
