@@ -1001,7 +1001,8 @@ fn operation_contract(name: &str) -> OperationContract {
         ),
         "sculpt.stroke" => (
             vec![
-                "target", "scope", "brush", "samples", "falloff", "symmetry", "delta", "dyntopo",
+                "target", "scope", "brush", "samples", "falloff", "symmetry", "delta", "view",
+                "dyntopo",
             ],
             vec!["op", "target", "brush", "samples"],
             "mesh object and stroke samples",
@@ -1981,13 +1982,13 @@ fn field_schema(operation: &str, field: &str) -> Value {
                 json!({"enum":["draw","clay_strips","inflate","grab","smooth","flatten","pinch","crease","layer","snake_hook","thumb","rotate","nudge","blob","scrape","fill","draw_sharp","elastic_deform","pose_lite","boundary_lite"]})
             }
             "falloff" => {
-                json!({"enum":["smooth","smoother","sphere","root","sharp","linear","constant"],"description":"Falloff curve. Defaults to smoother for clay_strips and smooth for other brushes."})
+                json!({"enum":["smooth","smoother","sphere","root","sharp","linear","constant","pow4"],"description":"Falloff curve. Defaults to smoother for clay_strips, pow4 for draw_sharp, and smooth for other brushes."})
             }
             "samples" => {
                 json!({"type":"array","minItems":1,"items":{"type":"object","required":["position","pressure","radius","strength","time"],"properties":{"position":vec_schema(3),"pressure":{"type":"number","minimum":0,"maximum":1},"radius":{"type":"number","minimum":0},"strength":{"type":"number"},"time":{"type":"number"}},"additionalProperties":false}})
             }
             "symmetry" => json!({"type":"array","items":{"enum":["x","y","z"]},"uniqueItems":true}),
-            "delta" => vec_schema(3),
+            "delta" | "view" => vec_schema(3),
             "dyntopo" => {
                 json!({"type":"object","required":["edge_length"],"properties":{"edge_length":{"type":"number","exclusiveMinimum":0}},"additionalProperties":false})
             }

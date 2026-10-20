@@ -22,25 +22,27 @@ pub enum DabBrush {
     ClayStrips,
     Inflate,
     Layer,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum VertexBrush {
     Draw,
-    Grab,
+    DrawSharp,
+    Blob,
+    Nudge,
+    Crease,
+    Pinch,
     Smooth,
     Flatten,
-    Pinch,
-    Crease,
+    Fill,
+    Scrape,
+    Grab,
     SnakeHook,
     Thumb,
     Rotate,
-    Nudge,
-    Blob,
-    Scrape,
-    Fill,
-    DrawSharp,
     Elastic,
+}
+
+/// Brushes that still evaluate each vertex against the whole stroke, not Blender's dab sequence.
+/// Their Blender counterparts are not matched yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VertexBrush {
     PoseLite,
     BoundaryLite,
 }
@@ -55,6 +57,8 @@ pub enum Falloff {
     Constant,
     /// Blender's `BRUSH_CURVE_SMOOTHER` (Clay Strips default): smootherstep of `1 - t`.
     Smoother,
+    /// Blender's `BRUSH_CURVE_POW4` (Draw Sharp default): `(1 - t)^4` (`brush.cc` 1581).
+    Pow4,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -73,6 +77,9 @@ pub struct Stroke {
     pub falloff: Falloff,
     pub symmetry: Vec<String>,
     pub delta: Option<DVec3>,
+    /// Direction toward the viewer in mesh space. Blender's brushes read the view for the area
+    /// normal's facing groups and for the grab delta's plane. `None` means no view.
+    pub view: Option<DVec3>,
 }
 
 /// Apply a stroke in the mesh coordinate space. Symmetry planes pass through the origin.
@@ -95,32 +102,24 @@ pub fn apply_stroke_with_dyntopo(
     dyntopo_edge_length: Option<f64>,
 ) -> Result<bool> {
     validate_stroke(stroke)?;
-    if stroke.brush == Brush::Vertex(VertexBrush::Grab) && stroke.delta.is_none() {
-        return Err(invalid("grab brush requires delta"));
-    }
-    if stroke.brush == Brush::Vertex(VertexBrush::Rotate)
-        && stroke.delta.is_some_and(|delta| delta.length() == 0.0)
-    {
-        return Err(invalid(
-            "rotate brush delta must be a nonzero axis-angle vector",
-        ));
-    }
     let accepts_delta = matches!(
         stroke.brush,
-        Brush::Vertex(
-            VertexBrush::Grab
-                | VertexBrush::SnakeHook
-                | VertexBrush::Thumb
-                | VertexBrush::Rotate
-                | VertexBrush::Nudge
-                | VertexBrush::Elastic
-                | VertexBrush::PoseLite
-                | VertexBrush::BoundaryLite,
-        )
+        Brush::Dab(
+            DabBrush::Grab
+                | DabBrush::SnakeHook
+                | DabBrush::Thumb
+                | DabBrush::Nudge
+                | DabBrush::Elastic,
+        ) | Brush::Vertex(VertexBrush::PoseLite | VertexBrush::BoundaryLite)
     );
     if !accepts_delta && stroke.delta.is_some() {
         return Err(invalid(
-            "delta is supported only by grab, snake_hook, thumb, rotate, nudge, elastic_deform, pose_lite, and boundary_lite brushes",
+            "delta is supported only by grab, snake_hook, thumb, nudge, elastic_deform, pose_lite, and boundary_lite brushes",
+        ));
+    }
+    if stroke.view.is_some() && matches!(stroke.brush, Brush::Vertex(_)) {
+        return Err(invalid(
+            "view is supported only by dab brushes; pose_lite and boundary_lite do not take a view yet",
         ));
     }
     if let Some(edge_length) = dyntopo_edge_length
@@ -143,7 +142,6 @@ pub fn apply_stroke_with_dyntopo(
         Brush::Vertex(brush) => brush,
     };
     let positions = vertex_positions(mesh);
-    let adjacency = vertex_adjacency(mesh);
     let boundary_adjacency = boundary_adjacency(mesh);
     let mirrors = mirrored_samples(stroke)?;
     let (first_sample, last_sample) = stroke
@@ -161,7 +159,6 @@ pub fn apply_stroke_with_dyntopo(
         let mut delta = DVec3::ZERO;
         let mut motion = trajectory;
         let mut radius = 0.0;
-        let mut strength = 0.0_f64;
         for sample in &mirrors {
             let (closest, pressure, sample_radius, sample_strength, sample_delta) =
                 sample_influence(vertex.co, sample);
@@ -180,7 +177,6 @@ pub fn apply_stroke_with_dyntopo(
                 delta = sample_delta;
                 motion = sample.to - sample.from;
                 radius = sample_radius;
-                strength = sample_strength;
             }
         }
         let mask = mask_values
@@ -202,8 +198,6 @@ pub fn apply_stroke_with_dyntopo(
                 motion,
                 radius,
                 influence,
-                strength,
-                adjacency.get(&vertex.id).map(Vec::as_slice),
                 boundary_adjacency.get(&vertex.id).map(Vec::as_slice),
                 &positions,
             )
@@ -252,8 +246,6 @@ fn deform_vertex(
     stroke_motion: DVec3,
     radius: f64,
     influence: f64,
-    strength: f64,
-    neighbors: Option<&[u32]>,
     boundary_neighbors: Option<&[u32]>,
     positions: &std::collections::BTreeMap<u32, DVec3>,
 ) -> DVec3 {
@@ -263,70 +255,6 @@ fn deform_vertex(
         stroke_motion
     };
     match brush {
-        VertexBrush::Draw => {
-            // Blender 5.2.2 Draw (draw.cc:196-197): offset = normal * radius * scale * bstrength, with
-            // scale = 1 (Potter has no stroke aspect scale). bstrength = alpha * pressure * overlap *
-            // flip * feather (sculpt.cc:2360), alpha = strength^2 (sculpt.cc:2338-2339).
-            // `influence` holds falloff * pressure * strength, so radius * strength * influence is
-            // Blender's offset for one unmasked dab, taking overlap, flip and feather as 1.
-            // Blender has no per-vertex jitter, so none is applied here.
-            point + normal * (radius * strength * influence)
-        }
-        VertexBrush::Grab => point + sample_delta * influence,
-        VertexBrush::Smooth => {
-            let Some(neighbors) = neighbors.filter(|neighbors| !neighbors.is_empty()) else {
-                return point;
-            };
-            let average = average_neighbor_position(positions, neighbors);
-            point.lerp(average, influence)
-        }
-        VertexBrush::Flatten => {
-            let signed_distance = (point - center).dot(normal);
-            point - normal * signed_distance * influence
-        }
-        VertexBrush::Pinch => point.lerp(center, influence),
-        VertexBrush::Crease => {
-            let toward = center - point;
-            point + toward * influence + normal * (influence * 0.1)
-        }
-        VertexBrush::SnakeHook => point + motion * influence,
-        VertexBrush::Thumb => {
-            let tangent = motion - normal * motion.dot(normal);
-            if tangent.length_squared() > 0.0 {
-                point + tangent.normalize() * (motion.length() * influence)
-            } else {
-                point
-            }
-        }
-        VertexBrush::Rotate => {
-            let rotation = stroke.delta.unwrap_or(normal * std::f64::consts::FRAC_PI_2);
-            let angle = rotation.length() * influence;
-            if angle == 0.0 {
-                point
-            } else {
-                (DQuat::from_axis_angle(rotation.normalize(), angle) * (point - center)) + center
-            }
-        }
-        VertexBrush::Nudge => {
-            let direction = if motion.length_squared() > 0.0 {
-                motion.normalize()
-            } else {
-                return point;
-            };
-            point + direction * (radius * 0.25 * influence)
-        }
-        VertexBrush::Blob => point + normal * (2.0 * influence - influence.powi(2)),
-        VertexBrush::Scrape | VertexBrush::Fill => {
-            let signed_distance = (point - center).dot(normal);
-            let amount = if brush == VertexBrush::Scrape {
-                signed_distance.max(0.0)
-            } else {
-                signed_distance.min(0.0)
-            };
-            point - normal * (amount * influence)
-        }
-        VertexBrush::DrawSharp => point + normal * influence.powf(1.5),
-        VertexBrush::Elastic => point + motion * influence.powi(2),
         VertexBrush::PoseLite => {
             let angle = if stroke.delta.is_some() {
                 sample_delta.length()
@@ -798,49 +726,6 @@ pub fn influences(mesh: &Mesh, stroke: &Stroke) -> Result<Vec<(u32, f64)>> {
         .collect())
 }
 
-/// Smooth one persistent vertex toward its one-ring neighbor average.
-pub fn smooth_vertex(mesh: &mut Mesh, vertex_id: u32, factor: f64) -> Result<bool> {
-    if !factor.is_finite() || !(0.0..=1.0).contains(&factor) {
-        return Err(invalid(
-            "smooth factor must be finite and between zero and one",
-        ));
-    }
-    let adjacency = vertex_adjacency(mesh);
-    let neighbors = adjacency
-        .get(&vertex_id)
-        .filter(|neighbors| !neighbors.is_empty())
-        .ok_or_else(|| invalid("smooth vertex has no adjacent vertices"))?;
-    let positions = vertex_positions(mesh);
-    let average = average_neighbor_position(&positions, neighbors);
-    let vertex = mesh
-        .vertices
-        .iter_mut()
-        .find(|vertex| vertex.id == vertex_id)
-        .ok_or_else(|| invalid("smooth vertex ID does not exist"))?;
-    let position = vertex.co.lerp(average, factor);
-    let changed = position != vertex.co;
-    vertex.co = position;
-    Ok(changed)
-}
-
-/// Sum squared distances from vertices to the average of their adjacent vertices.
-#[must_use]
-pub fn laplacian_energy(mesh: &Mesh) -> f64 {
-    let positions = vertex_positions(mesh);
-    let adjacency = vertex_adjacency(mesh);
-    mesh.vertices
-        .iter()
-        .filter_map(|vertex| {
-            let neighbors = adjacency.get(&vertex.id)?;
-            if neighbors.is_empty() {
-                return None;
-            }
-            let average = average_neighbor_position(&positions, neighbors);
-            Some(vertex.co.distance_squared(average))
-        })
-        .sum()
-}
-
 fn validate_stroke(stroke: &Stroke) -> Result<()> {
     if stroke.samples.is_empty() {
         return Err(invalid("stroke requires at least one sample"));
@@ -865,6 +750,11 @@ fn validate_stroke(stroke: &Stroke) -> Result<()> {
         if !["x", "y", "z"].contains(&axis.as_str()) {
             return Err(invalid("symmetry axes must be x, y, or z"));
         }
+    }
+    if let Some(view) = stroke.view
+        && (!view.is_finite() || view.length_squared() == 0.0)
+    {
+        return Err(invalid("view must be a finite, nonzero vector"));
     }
     Ok(())
 }
@@ -993,25 +883,6 @@ fn vertex_positions(mesh: &Mesh) -> std::collections::BTreeMap<u32, DVec3> {
         .collect()
 }
 
-fn average_neighbor_position(
-    positions: &std::collections::BTreeMap<u32, DVec3>,
-    neighbors: &[u32],
-) -> DVec3 {
-    let mut sum = DVec3::ZERO;
-    let mut count = 0.0_f64;
-    for neighbor in neighbors {
-        if let Some(position) = positions.get(neighbor) {
-            sum += *position;
-            count += 1.0;
-        }
-    }
-    if count > 0.0 {
-        sum / count
-    } else {
-        DVec3::ZERO
-    }
-}
-
 /// Blender's vertex normals (`normals_calc_verts`) in `mesh.vertices` order, via the shared
 /// `normals::vertex_normals`. Faces that name a missing vertex are skipped.
 fn vertex_normals(mesh: &Mesh) -> Vec<DVec3> {
@@ -1093,6 +964,10 @@ impl Falloff {
                 let p = 1.0 - t;
                 p * p * p * (p * (6.0 * p - 15.0) + 10.0)
             }
+            Self::Pow4 => {
+                let p = 1.0 - t;
+                p * p * p * p
+            }
         }
     }
 }
@@ -1110,6 +985,26 @@ mod tests {
             .unwrap()
     }
 
+    /// Smooth moves only interior vertices: Blender's `calc_vert_neighbors_interior` clears the
+    /// neighbors of a boundary corner (two neighbors), so a lone triangle has nothing to average.
+    /// A four-triangle fan around an interior center vertex gives Smooth something to move.
+    fn test_mesh_for(brush: Brush) -> Mesh {
+        if brush != Brush::Dab(DabBrush::Smooth) {
+            return test_mesh();
+        }
+        Mesh::from_positions_and_faces(
+            vec![
+                DVec3::new(0.25, 0.25, 0.0),
+                DVec3::new(0.0, 0.0, 0.0),
+                DVec3::new(1.0, 0.0, 0.0),
+                DVec3::new(1.0, 1.0, 0.0),
+                DVec3::new(0.0, 1.0, 0.0),
+            ],
+            vec![vec![0, 1, 2], vec![0, 2, 3], vec![0, 3, 4], vec![0, 4, 1]],
+        )
+        .unwrap()
+    }
+
     fn sample(position: DVec3) -> StrokeSample {
         StrokeSample {
             position,
@@ -1122,65 +1017,80 @@ mod tests {
 
     fn test_stroke(brush: Brush) -> Stroke {
         let center_z = match brush {
-            Brush::Vertex(VertexBrush::Scrape | VertexBrush::Flatten) => -0.25,
-            Brush::Vertex(VertexBrush::Fill) => 0.25,
+            Brush::Dab(DabBrush::Scrape | DabBrush::Flatten) => -0.25,
+            Brush::Dab(DabBrush::Fill) => 0.25,
             _ => 0.0,
         };
         let delta = match brush {
-            Brush::Vertex(
-                VertexBrush::Grab
-                | VertexBrush::Thumb
-                | VertexBrush::Nudge
-                | VertexBrush::Elastic
-                | VertexBrush::BoundaryLite,
-            ) => Some(DVec3::new(0.25, 0.0, 0.0)),
-            Brush::Vertex(VertexBrush::Rotate | VertexBrush::PoseLite) => {
-                Some(DVec3::new(0.0, 0.0, 0.25))
-            }
+            Brush::Dab(DabBrush::Grab | DabBrush::Thumb | DabBrush::Nudge | DabBrush::Elastic)
+            | Brush::Vertex(VertexBrush::BoundaryLite) => Some(DVec3::new(0.25, 0.0, 0.0)),
+            Brush::Vertex(VertexBrush::PoseLite) => Some(DVec3::new(0.0, 0.0, 0.25)),
             _ => None,
         };
+        let mut samples = vec![
+            sample(DVec3::new(0.0, 0.0, center_z)),
+            sample(DVec3::new(0.5, 0.0, center_z)),
+        ];
+        if brush == Brush::Dab(DabBrush::Rotate) {
+            // Twist turns by the dial angle of the path, so the path must leave its first direction.
+            samples.push(sample(DVec3::new(0.0, 0.5, center_z)));
+        }
         Stroke {
             brush,
-            samples: vec![
-                sample(DVec3::new(0.0, 0.0, center_z)),
-                sample(DVec3::new(0.5, 0.0, center_z)),
-            ],
+            samples,
             falloff: Falloff::Smooth,
             symmetry: Vec::new(),
             delta,
+            view: None,
+        }
+    }
+
+    #[test]
+    fn vertex_brushes_reject_a_view() {
+        for brush in [
+            Brush::Vertex(VertexBrush::PoseLite),
+            Brush::Vertex(VertexBrush::BoundaryLite),
+        ] {
+            let stroke = Stroke {
+                view: Some(DVec3::Z),
+                ..test_stroke(brush)
+            };
+            let mut mesh = test_mesh_for(brush);
+            assert!(apply_stroke(&mut mesh, &stroke).is_err(), "{brush:?}");
         }
     }
 
     #[test]
     fn every_brush_deforms_covered_geometry_deterministically() {
         for brush in [
-            Brush::Vertex(VertexBrush::Draw),
+            Brush::Dab(DabBrush::Draw),
             Brush::Dab(DabBrush::ClayStrips),
             Brush::Dab(DabBrush::Inflate),
-            Brush::Vertex(VertexBrush::Grab),
-            Brush::Vertex(VertexBrush::Smooth),
-            Brush::Vertex(VertexBrush::Flatten),
-            Brush::Vertex(VertexBrush::Pinch),
-            Brush::Vertex(VertexBrush::Crease),
+            Brush::Dab(DabBrush::Grab),
+            Brush::Dab(DabBrush::Smooth),
+            Brush::Dab(DabBrush::Flatten),
+            Brush::Dab(DabBrush::Pinch),
+            Brush::Dab(DabBrush::Crease),
             Brush::Dab(DabBrush::Layer),
-            Brush::Vertex(VertexBrush::SnakeHook),
-            Brush::Vertex(VertexBrush::Thumb),
-            Brush::Vertex(VertexBrush::Rotate),
-            Brush::Vertex(VertexBrush::Nudge),
-            Brush::Vertex(VertexBrush::Blob),
-            Brush::Vertex(VertexBrush::Scrape),
-            Brush::Vertex(VertexBrush::Fill),
-            Brush::Vertex(VertexBrush::DrawSharp),
-            Brush::Vertex(VertexBrush::Elastic),
+            Brush::Dab(DabBrush::SnakeHook),
+            Brush::Dab(DabBrush::Thumb),
+            Brush::Dab(DabBrush::Rotate),
+            Brush::Dab(DabBrush::Nudge),
+            Brush::Dab(DabBrush::Blob),
+            Brush::Dab(DabBrush::Scrape),
+            Brush::Dab(DabBrush::Fill),
+            Brush::Dab(DabBrush::DrawSharp),
+            Brush::Dab(DabBrush::Elastic),
             Brush::Vertex(VertexBrush::PoseLite),
             Brush::Vertex(VertexBrush::BoundaryLite),
         ] {
             let stroke = test_stroke(brush);
-            let mut first = test_mesh();
-            let mut second = test_mesh();
+            let base = test_mesh_for(brush);
+            let mut first = base.clone();
+            let mut second = base.clone();
             assert!(apply_stroke(&mut first, &stroke).unwrap(), "{brush:?}");
             assert!(apply_stroke(&mut second, &stroke).unwrap(), "{brush:?}");
-            assert_ne!(first, test_mesh(), "{brush:?}");
+            assert_ne!(first, base, "{brush:?}");
             assert_eq!(first, second, "{brush:?}");
             first.validate().unwrap();
         }
@@ -1196,7 +1106,7 @@ mod tests {
         let strength = 0.5;
         let pressure = 1.0;
         let stroke = Stroke {
-            brush: Brush::Vertex(VertexBrush::Draw),
+            brush: Brush::Dab(DabBrush::Draw),
             samples: vec![StrokeSample {
                 position: DVec3::ZERO,
                 pressure,
@@ -1207,6 +1117,7 @@ mod tests {
             falloff: Falloff::Linear,
             symmetry: Vec::new(),
             delta: None,
+            view: None,
         };
         // The sample sits on vertex 0 (distance 0) and 1 unit from vertices 1 and 2, so linear falloff
         // at distance / radius gives weights 1, 1 - 1/3, 1 - 1/3. The triangle's normal is +Z.
@@ -1242,11 +1153,12 @@ mod tests {
             json!({"domain":"faces","values":{"f0":3}}),
         );
         let mut stroke = Stroke {
-            brush: Brush::Vertex(VertexBrush::Draw),
+            brush: Brush::Dab(DabBrush::Draw),
             samples: vec![sample(DVec3::new(0.1, 0.0, 0.0))],
             falloff: Falloff::Smooth,
             symmetry: Vec::new(),
             delta: None,
+            view: None,
         };
 
         assert!(apply_stroke_with_dyntopo(&mut mesh, &stroke, Some(2.0)).unwrap());
@@ -1286,11 +1198,12 @@ mod tests {
             json!({"domain":"edges","values":{"e0":2.0,"e1":4.0,"e2":6.0}}),
         );
         let stroke = Stroke {
-            brush: Brush::Vertex(VertexBrush::Draw),
+            brush: Brush::Dab(DabBrush::Draw),
             samples: vec![sample(DVec3::ZERO)],
             falloff: Falloff::Smooth,
             symmetry: Vec::new(),
             delta: None,
+            view: None,
         };
 
         assert!(dyntopo_under_brush(&mut mesh, &stroke, 0.5).unwrap());
