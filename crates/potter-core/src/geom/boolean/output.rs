@@ -329,13 +329,11 @@ struct PlannedFace {
 }
 
 /// Distinct arena vertices used by `polys`, sorted as Blender's `IMesh::populate_vert` sorts them,
-/// and the polygons over them. Blender takes the vertices in a pointer-hashed map order and sorts
-/// them with an unstable sort: input vertices by ascending origin, created vertices after them by
-/// creation order. Two input vertices with the same local origin (different operands) tie in that
-/// sort. Headless Blender 5.2.2 gave one order for every tie edge in the Boolean corpus over 11 runs
-/// on macOS and Linux, so the tie order is fixed for these inputs, but the source does not guarantee
-/// it. First-seen order stands in for it, and that order sets the stored direction of an edge joining
-/// such a pair.
+/// and the polygons over them. Blender fills `vert_` in first-seen order (`mesh_intersect.cc:571-577`,
+/// `vert_[index] = item.key`) and sorts it with the comparator at `mesh_intersect.cc:583-594`: input
+/// vertices by ascending origin, created vertices after them by id. Two input vertices with the same
+/// local origin (different operands) tie in that sort, and the tie order sets the stored direction of
+/// an edge joining them. `libcxx_sort::libcxx_sort_by` reproduces the libc++ order for ties.
 fn plan(polys: &[Poly], arena: &Arena, layout: &Layout) -> Result<(Vec<u32>, Vec<PlannedFace>)> {
     let mut seen_ids: Vec<u32> = Vec::new();
     let mut seen_slot: HashMap<u32, usize> = HashMap::new();
@@ -366,7 +364,7 @@ fn plan(polys: &[Poly], arena: &Arena, layout: &Layout) -> Result<(Vec<u32>, Vec
         });
     }
     let mut order: Vec<usize> = (0..seen_ids.len()).collect();
-    order.sort_by_key(|&slot| {
+    let key = |slot: usize| {
         let id = seen_ids[slot];
         let orig = arena.vert(id).orig;
         if orig == NO_INDEX {
@@ -374,7 +372,8 @@ fn plan(polys: &[Poly], arena: &Arena, layout: &Layout) -> Result<(Vec<u32>, Vec
         } else {
             (false, orig, 0)
         }
-    });
+    };
+    super::libcxx_sort::libcxx_sort_by(&mut order, |&a, &b| key(a) < key(b));
     let mut position = vec![0; seen_ids.len()];
     for (index, &slot) in order.iter().enumerate() {
         position[slot] = index;
