@@ -1404,11 +1404,8 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
             return Ok(params);
         }
         let mut params = self.closure_params();
-        params.base_color = textured_base(
-            self.material,
-            &self.hit_ctx,
-            self.color_input(id, &["Base Color"], [0.8, 0.8, 0.8, 1.0])?,
-        )?;
+        let base = self.color_input(id, &["Base Color"], [0.8, 0.8, 0.8, 1.0])?;
+        params.base_color = textured_base(self.material, &self.hit_ctx, base)?;
         params.glass_transmission_tint = principled_glass_tint(params.base_color);
         params.metallic = self.scalar_input(id, &["Metallic"], 0.0)?;
         params.roughness = self.scalar_input(id, &["Roughness"], 0.5)?;
