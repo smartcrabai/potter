@@ -1,12 +1,13 @@
-//! Single-scatter direct lighting from a point light. The oracle is `tests/fixtures/volume_nee`, rendered
-//! by Blender 5.2.2 with `generate_volume_nee_oracle.py`: a unit cube of Volume Scatter (Color 1, Density
-//! 0.05, so optical depth 0.05 and multiple scattering is about 0.2 %), homogeneous or Linear-gradient
-//! density, under a point light of 100 W, with `volume_bounces = max_bounces = 1`. The `diffuse` case is a
-//! white Lambert plane under the same light and calibrates the light unit (I = P / 4π, irradiance E = I / d²,
-//! Lambert radiance E / π). A volume's in-scatter has no 1/π, since its phase function is per steradian.
+//! Single-scatter direct lighting from a point light. The oracle is `tests/fixtures/volume_nee`, rendered by
+//! Blender 5.2.2 with `generate_volume_nee_oracle.py`: a unit cube (a mesh with a volume-only material) of
+//! Volume Scatter (Color 1, Density 0.05, so optical depth 0.05 and multiple scattering is about 0.2 %), under a
+//! point light of 100 W, with `volume_bounces = max_bounces = 1`. The `homogeneous_*` cases are that mesh cube,
+//! and the `gradient_*` cases use a Linear-gradient density. The `diffuse` case is a white Lambert plane under
+//! the same light and calibrates the light unit (I = P / 4π, irradiance E = I / d², Lambert radiance E / π).
+//! A volume's in-scatter has no 1/π, since its phase function is per steradian.
 //!
-//! Voxel volumes carry the density, because a mesh material's medium is not a stochastic medium and gets no
-//! light sampling (see the CHANGELOG).
+//! The mesh cube is Potter's closed-mesh medium, and the gradient cube is a voxel grid, since a mesh material's
+//! density is constant.
 
 use std::{error::Error, fs, path::Path, process::Output};
 
@@ -19,8 +20,7 @@ const ENERGY: f64 = 100.0;
 const POSITION: [f64; 3] = [1.6, 0.6, 0.9];
 const DENSITY: f64 = 0.05;
 const SAMPLES: u32 = 1024;
-/// The relative tolerance of a volume case against Blender's oracle, which the Blender stderr of the
-/// gradient cases (6.5 %) bounds from below.
+/// The relative tolerance of a volume case against Blender's oracle. The gradient cases' Blender stderr is 6.5 %.
 const VOLUME_TOLERANCE: f64 = 0.06;
 const DIFFUSE_TOLERANCE: f64 = 0.02;
 
@@ -65,8 +65,8 @@ fn make_scene(root: &Path, operations: &[Value]) -> Result<std::path::PathBuf, B
     Ok(scene)
 }
 
-/// The common scene: a black world, an orthographic camera at z = 3 (ortho scale 2), a point light of
-/// radius 0 at `POSITION`, and single-scatter render settings.
+/// The common scene: a black world, an orthographic camera at z = 3 (ortho scale 2), a point light of radius 0 at
+/// `POSITION`, and single-scatter render settings.
 fn base_operations() -> Vec<Value> {
     vec![
         json!({"op":"world.create","id":"world_main","color":[0.0,0.0,0.0],"strength":0.0}),
@@ -90,23 +90,23 @@ fn diffuse_scene(root: &Path) -> Result<std::path::PathBuf, Box<dyn Error>> {
     make_scene(root, &operations)
 }
 
-/// A 16³ voxel grid over the unit cube. `gradient` sets the value to the Generated coordinate
-/// (x + 0.5) at each voxel centre, so with Density 0.05 the density is Blender's Linear gradient.
+/// How the scatter cube's density is represented.
+#[derive(Clone, Copy)]
+enum Medium {
+    /// A unit mesh cube whose material is the closed-mesh medium, with the constant Density 0.05.
+    MeshCube,
+    /// A 16³ voxel grid over the unit cube with the constant density 0.05.
+    VoxelHomogeneous,
+    /// A 16³ voxel grid whose value is the Generated coordinate (x + 0.5) at each voxel centre, so the density is
+    /// Blender's Linear gradient, 0.05 · (x + 0.5).
+    VoxelGradient,
+}
+
 fn scatter_scene(
     root: &Path,
     anisotropy: f64,
-    gradient: bool,
+    medium: Medium,
 ) -> Result<std::path::PathBuf, Box<dyn Error>> {
-    const N: usize = 16;
-    let mut values = Vec::with_capacity(N * N * N);
-    for _z in 0..N {
-        for _y in 0..N {
-            for x in 0..N {
-                let centre = -0.5 + (x as f64 + 0.5) / N as f64;
-                values.push(if gradient { centre + 0.5 } else { 1.0 });
-            }
-        }
-    }
     let mut operations = base_operations();
     operations.extend([
         json!({"op":"graph.create","id":"medium_graph","kind":"shader"}),
@@ -114,13 +114,31 @@ fn scatter_scene(
         json!({"op":"graph.node_add","graph":"medium_graph","id":"scatter","type":"ShaderNodeVolumeScatter","inputs":{"Color":[1.0,1.0,1.0,1.0],"Density":DENSITY,"Anisotropy":anisotropy}}),
         json!({"op":"graph.link","graph":"medium_graph","from_node":"scatter","from_socket":"Volume","to_node":"output","to_socket":"Volume"}),
         json!({"op":"material.create","id":"medium","graph":"medium_graph"}),
-        json!({"op":"volume.create","id":"medium_volume","materials":["medium"],"grids":[{"dims":[N,N,N],"voxel_size":1.0 / N as f64,"origin":[-0.5,-0.5,-0.5],"values":values}]}),
     ]);
+    match medium {
+        Medium::MeshCube => operations.push(
+            json!({"op":"node.create","id":"cube_main","kind":"box","params":{"size":1.0},"material":"medium"}),
+        ),
+        Medium::VoxelHomogeneous | Medium::VoxelGradient => {
+            const N: usize = 16;
+            let gradient = matches!(medium, Medium::VoxelGradient);
+            let mut values = Vec::with_capacity(N * N * N);
+            for _z in 0..N {
+                for _y in 0..N {
+                    for x in 0..N {
+                        let centre = -0.5 + (x as f64 + 0.5) / N as f64;
+                        values.push(if gradient { centre + 0.5 } else { 1.0 });
+                    }
+                }
+            }
+            operations.push(json!({"op":"volume.create","id":"medium_volume","materials":["medium"],"grids":[{"dims":[N,N,N],"voxel_size":1.0 / N as f64,"origin":[-0.5,-0.5,-0.5],"values":values}]}));
+        }
+    }
     make_scene(root, &operations)
 }
 
-/// Renders the scene and returns the red channel's mean over the 4 × 4 pixels at the image centre, the
-/// block that the oracle measures.
+/// Renders the scene and returns the red channel's mean over the 4 × 4 pixels at the image centre, the block the
+/// oracle measures.
 fn render_centre_mean(scene: &Path, out: &Path) -> Result<f64, Box<dyn Error>> {
     let output = pot()
         .arg("render")
@@ -191,10 +209,24 @@ fn point_light_irradiance_unit_matches_blender_on_a_diffuse_plane() -> Result<()
 }
 
 #[test]
-fn homogeneous_single_scatter_under_a_point_light_matches_blender() -> Result<(), Box<dyn Error>> {
+fn mesh_material_single_scatter_under_a_point_light_matches_blender() -> Result<(), Box<dyn Error>>
+{
+    // The closed-mesh medium: the same unit mesh cube as the Blender oracle's homogeneous cases.
     for (case, anisotropy) in [("homogeneous_g0", 0.0), ("homogeneous_g05", 0.5)] {
         let directory = tempdir()?;
-        let scene = scatter_scene(directory.path(), anisotropy, false)?;
+        let scene = scatter_scene(directory.path(), anisotropy, Medium::MeshCube)?;
+        let measured = render_centre_mean(&scene, &directory.path().join("render"))?;
+        assert_within(case, measured, VOLUME_TOLERANCE)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn voxel_homogeneous_single_scatter_under_a_point_light_matches_blender()
+-> Result<(), Box<dyn Error>> {
+    for (case, anisotropy) in [("homogeneous_g0", 0.0), ("homogeneous_g05", 0.5)] {
+        let directory = tempdir()?;
+        let scene = scatter_scene(directory.path(), anisotropy, Medium::VoxelHomogeneous)?;
         let measured = render_centre_mean(&scene, &directory.path().join("render"))?;
         assert_within(case, measured, VOLUME_TOLERANCE)?;
     }
@@ -205,7 +237,7 @@ fn homogeneous_single_scatter_under_a_point_light_matches_blender() -> Result<()
 fn gradient_single_scatter_under_a_point_light_matches_blender() -> Result<(), Box<dyn Error>> {
     for (case, anisotropy) in [("gradient_g0", 0.0), ("gradient_g05", 0.5)] {
         let directory = tempdir()?;
-        let scene = scatter_scene(directory.path(), anisotropy, true)?;
+        let scene = scatter_scene(directory.path(), anisotropy, Medium::VoxelGradient)?;
         let measured = render_centre_mean(&scene, &directory.path().join("render"))?;
         assert_within(case, measured, VOLUME_TOLERANCE)?;
     }

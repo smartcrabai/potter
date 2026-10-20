@@ -836,6 +836,8 @@ fn trace_path(
     // Set by the pass that reaches the cap: the next surface is shaded for emission and ends the
     // path (`PATH_RAY_TERMINATE_ON_NEXT_SURFACE`, `integrate_surface_terminate`).
     let mut terminate_on_next_surface = false;
+    // The volume stack: the media the path is inside, innermost last (Cycles' object volume stack).
+    let mut media: Vec<MeshMedium> = Vec::new();
     loop {
         let hit = closest_hit(geometry, bvh, origin, direction, RAY_EPSILON, f64::INFINITY);
         let surface_distance = hit.map_or(f64::INFINITY, |hit| hit.distance);
@@ -874,6 +876,7 @@ fn trace_path(
                     bvh,
                     lights,
                     volumes,
+                    &media,
                     images,
                     importance,
                     event,
@@ -896,6 +899,56 @@ fn trace_path(
             previous = Scatter::Volume(phase_pdf);
             bounce += 1;
             continue;
+        }
+        // The stack changes only at surfaces, so the top medium spans this whole segment. Its free flight
+        // is spectral ratio tracking (`trace_mesh_medium`), and a scatter takes the same light sampling and
+        // phase step as a voxel event.
+        if let Some(medium) = media.last().map(|medium| medium.params) {
+            match trace_mesh_medium(&medium, segment_limit, &mut throughput, rng) {
+                MediumOutcome::Scatter(distance) => {
+                    let event = VolumeEvent {
+                        point: origin + direction * distance,
+                        albedo: DVec3::ZERO,
+                        anisotropy: medium.volume_anisotropy,
+                    };
+                    radiance += throughput
+                        * direct_volume_lighting(
+                            doc,
+                            snapshot,
+                            geometry,
+                            bvh,
+                            lights,
+                            volumes,
+                            &media,
+                            images,
+                            importance,
+                            event,
+                            direction,
+                            environment,
+                            transparent_max_bounces.saturating_sub(transparent_bounce),
+                            rng,
+                            evaluator_workspace,
+                        )?;
+                    if bounce == max_bounces {
+                        break;
+                    }
+                    let incoming = direction;
+                    direction = sample_henyey_greenstein_direction(incoming, event.anisotropy, rng);
+                    let phase_pdf = henyey_greenstein(
+                        incoming.normalize_or_zero().dot(direction),
+                        event.anisotropy,
+                    );
+                    origin = event.point + direction * RAY_EPSILON;
+                    previous = Scatter::Volume(phase_pdf);
+                    bounce += 1;
+                    continue;
+                }
+                MediumOutcome::Survive => {}
+                MediumOutcome::Absorb => break,
+            }
+            if throughput.max_element() <= 1.0e-8 {
+                break;
+            }
         }
         if let Some(light) = light {
             let weight = match previous {
@@ -937,38 +990,15 @@ fn trace_path(
             images,
             evaluator_workspace,
         )?;
-        if surface.params.has_medium()
-            && let Some(boundary) = closest_hit(
-                geometry,
-                bvh,
-                surface.point + direction * RAY_EPSILON,
-                direction,
-                RAY_EPSILON,
-                f64::INFINITY,
-            )
-        {
-            let exits_medium = geometry
-                .triangles
-                .get(boundary.triangle_index)
-                .is_some_and(|triangle| triangle.object_index == surface.object_index);
-            let distance = boundary.distance.max(0.0);
-            let (transmittance, in_scatter) = homogeneous_medium_segment(&surface.params, distance);
-            let phase = henyey_greenstein(-1.0, surface.params.volume_anisotropy)
-                * (4.0 * std::f64::consts::PI);
-            radiance += throughput * environment * in_scatter * phase;
-            throughput *= transmittance;
-            if exits_medium {
-                origin = surface.point + direction * (distance + 2.0 * RAY_EPSILON);
-            } else {
-                origin = surface.point + direction * (distance - 2.0 * RAY_EPSILON);
-            }
-            if throughput.max_element() <= 1.0e-8 {
-                break;
-            }
+        if surface.params.has_medium() {
+            // A medium surface passes the path and changes the volume stack: it enters the medium of its
+            // object, or leaves the one it entered.
+            toggle_mesh_medium(&mut media, surface.object_index, surface.params);
             volume_bounds += 1;
             if volume_bounds > VOLUME_BOUNDS_MAX {
                 break;
             }
+            origin = offset_origin(surface.point, direction, surface.geometric_normal);
             continue;
         }
         if terminate_on_next_surface {
@@ -1000,6 +1030,7 @@ fn trace_path(
                 bvh,
                 lights,
                 volumes,
+                &media,
                 images,
                 importance,
                 &surface,
@@ -1433,6 +1464,7 @@ fn direct_lighting(
     bvh: &Bvh,
     lights: &[PointLight],
     volumes: &[VolumeInstance<'_>],
+    media: &[MeshMedium],
     images: &BTreeMap<String, ImageData>,
     importance: Option<&WorldImportanceSampler>,
     surface: &Surface,
@@ -1461,6 +1493,7 @@ fn direct_lighting(
             geometry,
             bvh,
             volumes,
+            media,
             images,
             surface.shadow_point,
             geometric,
@@ -1502,6 +1535,7 @@ fn direct_lighting(
             geometry,
             bvh,
             volumes,
+            media,
             images,
             surface.shadow_point,
             geometric,
@@ -1535,6 +1569,7 @@ fn direct_volume_lighting(
     bvh: &Bvh,
     lights: &[PointLight],
     volumes: &[VolumeInstance<'_>],
+    media: &[MeshMedium],
     images: &BTreeMap<String, ImageData>,
     importance: Option<&WorldImportanceSampler>,
     event: VolumeEvent,
@@ -1558,6 +1593,7 @@ fn direct_volume_lighting(
             geometry,
             bvh,
             volumes,
+            media,
             images,
             event.point,
             DVec3::ZERO,
@@ -1583,6 +1619,7 @@ fn direct_volume_lighting(
             geometry,
             bvh,
             volumes,
+            media,
             images,
             event.point,
             DVec3::ZERO,
@@ -1633,6 +1670,7 @@ fn shadow_transmittance(
     geometry: &Geometry,
     bvh: &Bvh,
     volumes: &[VolumeInstance<'_>],
+    media: &[MeshMedium],
     images: &BTreeMap<String, ImageData>,
     point: DVec3,
     normal: DVec3,
@@ -1644,6 +1682,8 @@ fn shadow_transmittance(
 ) -> Result<DVec3> {
     let mut transmittance = DVec3::ONE;
     let mut transparent_hits = 0u32;
+    // The shadow ray starts in the receiver's volume stack and crosses each medium by its transmittance.
+    let mut shadow_media = media.to_vec();
     let mut origin = offset_origin(point, direction, normal);
     let mut remaining = if distance.is_finite() {
         (distance - RAY_EPSILON).max(0.0)
@@ -1661,31 +1701,37 @@ fn shadow_transmittance(
             images,
             evaluator_workspace,
         )?;
-        // Cycles counts each transparent surface a shadow ray crosses against the path's remaining
-        // budget and blocks the ray past it (`intern/cycles/kernel/bvh/intersect_filter.h`);
-        // volume-bounds surfaces are not counted (`SD_HAS_ONLY_VOLUME`).
-        if !surface.params.has_medium() {
+        if let Some(medium) = shadow_media.last() {
+            transmittance *= medium_transmittance(&medium.params, surface.distance);
+        }
+        if surface.params.has_medium() {
+            // A medium surface passes the shadow ray and changes the stack, as it does for a path. It is
+            // not a transparent surface, so it does not count against the budget.
+            toggle_mesh_medium(&mut shadow_media, surface.object_index, surface.params);
+        } else {
+            // Cycles counts each transparent surface a shadow ray crosses against the path's remaining
+            // budget and blocks the ray past it (`intern/cycles/kernel/bvh/intersect_filter.h`).
             transparent_hits += 1;
             if transparent_hits > transparent_budget {
                 return Ok(DVec3::ZERO);
             }
+            let alpha = surface.params.alpha.clamp(0.0, 1.0);
+            let transmission = surface.params.transmission.clamp(0.0, 1.0);
+            if alpha >= 1.0 && transmission <= 0.0 {
+                return Ok(DVec3::ZERO);
+            }
+            // Each transparent share passes its Transparent colour, `(1 - alpha) * tint` as Cycles' closure
+            // weight (`bsdf_transparent.h`). A glass share passes its transmission, tinted by the base colour.
+            let base_tint = DVec3::new(
+                surface.params.base_color[0],
+                surface.params.base_color[1],
+                surface.params.base_color[2],
+            )
+            .max_element()
+            .clamp(0.0, 1.0);
+            transmittance *= DVec3::from_array(surface.params.transparent_tint) * (1.0 - alpha)
+                + DVec3::splat(alpha * transmission * base_tint);
         }
-        let alpha = surface.params.alpha.clamp(0.0, 1.0);
-        let transmission = surface.params.transmission.clamp(0.0, 1.0);
-        if alpha >= 1.0 && transmission <= 0.0 {
-            return Ok(DVec3::ZERO);
-        }
-        // Each transparent share passes its Transparent colour, `(1 - alpha) * tint` as Cycles' closure weight
-        // (`bsdf_transparent.h`). A glass share passes its transmission, tinted by the base colour as before.
-        let base_tint = DVec3::new(
-            surface.params.base_color[0],
-            surface.params.base_color[1],
-            surface.params.base_color[2],
-        )
-        .max_element()
-        .clamp(0.0, 1.0);
-        transmittance *= DVec3::from_array(surface.params.transparent_tint) * (1.0 - alpha)
-            + DVec3::splat(alpha * transmission * base_tint);
         if transmittance.max_element() <= 1.0e-5 {
             return Ok(DVec3::ZERO);
         }
@@ -1697,6 +1743,10 @@ fn shadow_transmittance(
                 break;
             }
         }
+    }
+    // The last segment, to the light or to infinity, lies in the top medium of the stack.
+    if let Some(medium) = shadow_media.last() {
+        transmittance *= medium_transmittance(&medium.params, remaining);
     }
     let volume_transmittance = march_volumes(volumes, origin, direction, remaining, Some(rng))?;
     Ok(transmittance.clamp(DVec3::ZERO, DVec3::ONE) * volume_transmittance)
@@ -2433,21 +2483,106 @@ fn homogeneous_segment_integral(extinction: f64, distance: f64) -> (f64, f64) {
     (transmittance, source_distance)
 }
 
-/// Cycles' homogeneous medium over `distance` for a material volume on a mesh: per-channel
-/// transmittance `exp(-σt·d)` and the in-scatter `∫ σs·exp(-σt·s) ds` against constant environment
-/// light, with σt = σs + σa from the absolute coefficients of `BsdfParams`.
-fn homogeneous_medium_segment(params: &BsdfParams, distance: f64) -> (DVec3, DVec3) {
-    let channels: [(f64, f64); 3] = std::array::from_fn(|channel| {
-        let scattering = params.volume_scatter[channel];
-        let extinction = scattering + params.volume_absorption[channel];
-        let (transmittance, source_distance) = homogeneous_segment_integral(extinction, distance);
-        (transmittance, scattering * source_distance)
-    });
-    let [red, green, blue] = channels;
-    (
-        DVec3::new(red.0, green.0, blue.0),
-        DVec3::new(red.1, green.1, blue.1),
-    )
+/// A closed mesh's medium on the path's volume stack, as Cycles' object volume stack: the coefficients of the
+/// surface that entered it. A surface of the same object leaves it.
+#[derive(Clone, Copy)]
+struct MeshMedium {
+    object_index: u32,
+    params: BsdfParams,
+}
+
+/// How a path leaves one segment of a mesh medium (`trace_mesh_medium`).
+enum MediumOutcome {
+    /// A real scattering event at this distance along the ray.
+    Scatter(f64),
+    /// The path crosses the segment, its throughput carrying the transmittance.
+    Survive,
+    /// The path is absorbed in the medium, or exhausts its tentative collisions.
+    Absorb,
+}
+
+/// The tentative-collision budget of one medium segment. Exhausting it absorbs the path; the tail of the
+/// null-collision chain that this cuts off is negligible for the densities a rendered medium has.
+const MAX_MEDIUM_EVENTS: u32 = 4096;
+
+/// Spectral ratio tracking over a homogeneous medium segment of length `distance`
+/// (`intern/cycles/kernel/integrator/shade_volume.h`, `volume_integrate_heterogeneous`). Tentative collisions
+/// come at the majorant `max_c σt_c`. Each is a scatter, a null collision or an absorption, chosen with the
+/// channel-mean probabilities, and the throughput takes each channel's own branch weight. Every channel's
+/// transmittance and single-scatter integral is then exact in expectation.
+fn trace_mesh_medium(
+    medium: &BsdfParams,
+    distance: f64,
+    throughput: &mut DVec3,
+    rng: &mut Pcg32,
+) -> MediumOutcome {
+    let scatter = DVec3::from_array(medium.volume_scatter);
+    let absorption = DVec3::from_array(medium.volume_absorption);
+    let extinction = scatter + absorption;
+    let majorant = extinction.max_element();
+    if majorant <= 0.0 {
+        return MediumOutcome::Survive;
+    }
+    let null = DVec3::splat(majorant) - extinction;
+    // The channel means of the three branch weights sum to the majorant, so they are the branch probabilities
+    // over it.
+    let mean_scatter = scatter.element_sum() / 3.0;
+    let mean_null = null.element_sum() / 3.0;
+    let mut position = 0.0;
+    for _ in 0..MAX_MEDIUM_EVENTS {
+        position += -rng.next_f64().max(f64::MIN_POSITIVE).ln() / majorant;
+        if position >= distance {
+            // No tentative collision before the boundary: each channel carries exp(-σt·d) over the probability
+            // exp(-σm·d) of that event, which is exp((σm - σt)·d).
+            *throughput *=
+                DVec3::from_array(null.to_array().map(|weight| (weight * distance).exp()));
+            return MediumOutcome::Survive;
+        }
+        let choice = rng.next_f64() * majorant;
+        if choice < mean_scatter {
+            *throughput *= scatter / mean_scatter;
+            return MediumOutcome::Scatter(position);
+        }
+        if choice < mean_scatter + mean_null {
+            *throughput *= null / mean_null;
+            continue;
+        }
+        *throughput = DVec3::ZERO;
+        return MediumOutcome::Absorb;
+    }
+    *throughput = DVec3::ZERO;
+    MediumOutcome::Absorb
+}
+
+/// Pushes the medium of `object_index` when the path enters it, or pops it when the path leaves it.
+fn toggle_mesh_medium(media: &mut Vec<MeshMedium>, object_index: u32, params: BsdfParams) {
+    if let Some(position) = media
+        .iter()
+        .rposition(|medium| medium.object_index == object_index)
+    {
+        media.remove(position);
+    } else {
+        media.push(MeshMedium {
+            object_index,
+            params,
+        });
+    }
+}
+
+/// The per-channel transmittance `exp(-σt·length)` of a homogeneous medium. An infinite length is zero wherever
+/// the medium has extinction.
+fn medium_transmittance(params: &BsdfParams, length: f64) -> DVec3 {
+    let extinction =
+        DVec3::from_array(params.volume_scatter) + DVec3::from_array(params.volume_absorption);
+    DVec3::from_array(extinction.to_array().map(|sigma| {
+        if sigma <= 0.0 {
+            1.0
+        } else if length.is_finite() {
+            (-sigma * length.max(0.0)).exp()
+        } else {
+            0.0
+        }
+    }))
 }
 
 fn volume_extinction_density(instance: &VolumeInstance<'_>, density: f64) -> f64 {
