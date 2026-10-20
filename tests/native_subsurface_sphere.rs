@@ -1,5 +1,5 @@
-//! A sphere with Burley subsurface scattering under a point and a disk light, against Blender 5.2.2's Cycles render
-//! (`fixtures/native_oracle/subsurface/subsurface_sphere.py`, case `burley`).
+//! A sphere with Burley and random walk subsurface scattering under a point and a disk light, against Blender 5.2.2's
+//! Cycles render (`fixtures/native_oracle/subsurface/subsurface_sphere.py`, cases `burley` and `random_walk`).
 //!
 //! Blender renders the sphere at 256 samples per pixel, eight seeds. Potter imports the same scene and renders eight
 //! seeds on a 16 × 16 frame at `SAMPLES` samples per pixel, in-process with the scene's seed set in memory. Each side's
@@ -8,12 +8,11 @@
 //! The tolerance is `T · √(s_B² / n + s_P² / n)`, with `s` the seed-to-seed sample standard deviations of each side and
 //! `T` the two-sided 99.9% t quantile at 7 degrees of freedom (5.408).
 //!
-//! What the test detects. The oracle's subsurface scale is 6.0, so the Burley profile spreads light across the sphere.
+//! What the test detects. The oracle's subsurface scale is 6.0, so both profiles spread light across the sphere.
 //! Blender's frame means (red) are: Burley 0.15974, no subsurface 0.19963, random walk 0.04077, random walk skin 0.19571,
-//! random walk legacy 0.17539. Burley against no subsurface differs by 0.0399 in red, and against random walk by 0.119.
-//! So a Burley lobe that is absent or wrongly scaled is detected at any noise this test can reach. The random walk
-//! methods are not evaluated yet: their cases report UNSUPPORTED_FEATURE and render without subsurface scattering, and
-//! they are not tested here.
+//! random walk legacy 0.17539. Burley against no subsurface differs by 0.0399 in red, and random walk against Burley by
+//! 0.119. So an absent or wrongly scaled closure of either method is detected at any noise this test can reach. The skin
+//! and legacy methods are not evaluated yet: their cases report UNSUPPORTED_FEATURE and are not tested here.
 //!
 //! Cost: `SAMPLES` is a starting point. The lane measures the run time and Potter's seed spread, and the figures belong
 //! in the commit message and here before the PR is closed.
@@ -80,6 +79,17 @@ fn blender_channels(case: &Value) -> TestResult<[Vec<f64>; 3]> {
 
 #[test]
 fn burley_subsurface_sphere_matches_cycles() -> TestResult {
+    matches_cycles("burley")
+}
+
+#[test]
+fn random_walk_subsurface_sphere_matches_cycles() -> TestResult {
+    matches_cycles("random_walk")
+}
+
+/// Renders the sphere of `case` (a case of `subsurface_sphere.py`) in Blender and in Potter, and compares the channel
+/// means of the seeds with the tolerance of the module docs.
+fn matches_cycles(case: &str) -> TestResult {
     let Some(blender) = blender_checked::blender_executable() else {
         return Ok(());
     };
@@ -87,10 +97,10 @@ fn burley_subsurface_sphere_matches_cycles() -> TestResult {
     let script = write_script(root.path(), "subsurface_sphere.py", SCRIPT)?;
     let blend = root.path().join("scene.blend");
     let json_path = root.path().join("blender.json");
-    let arguments: [&Path; 3] = [&blend, &json_path, Path::new("burley")];
+    let arguments: [&Path; 3] = [&blend, &json_path, Path::new(case)];
     run_blender_arguments(&blender, &script, None, &arguments)?;
     let expected: Value = serde_json::from_slice(&fs::read(&json_path)?)?;
-    let wanted = blender_channels(&expected["cases"]["burley"])?;
+    let wanted = blender_channels(&expected["cases"][case])?;
 
     let (project_path, _) = import_blend(&blender, root.path(), "project", &blend)?;
     let project = Project::open(&project_path)?;

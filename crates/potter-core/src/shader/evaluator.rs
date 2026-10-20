@@ -163,8 +163,7 @@ impl SubsurfaceMethod {
     /// The feature id Potter reports for a method it does not evaluate, or `None` for a method it evaluates.
     pub(crate) fn unsupported_feature(self) -> Option<&'static str> {
         match self {
-            Self::Burley => None,
-            Self::RandomWalk => Some("shader.principled.subsurface_method.random_walk"),
+            Self::Burley | Self::RandomWalk => None,
             Self::RandomWalkSkin => Some("shader.principled.subsurface_method.random_walk_skin"),
             Self::RandomWalkLegacy => {
                 Some("shader.principled.subsurface_method.random_walk_legacy")

@@ -76,13 +76,6 @@ pub fn feature_catalog() -> Value {
             [true, false, true, true, false, false, true],
         ),
         unsupported(
-            "shader.principled.subsurface_method.random_walk",
-            "Principled subsurface random walk (default method)",
-            "ShaderNodeBsdfPrincipled",
-            &["material.create", "material.update"],
-            "Potter evaluates the Burley subsurface method only. A Principled node with the random walk method and Subsurface Weight above zero reports UNSUPPORTED_FEATURE and renders without subsurface scattering, which Potter never substitutes with another method.",
-        ),
-        unsupported(
             "shader.principled.subsurface_method.random_walk_skin",
             "Principled subsurface random walk skin",
             "ShaderNodeBsdfPrincipled",

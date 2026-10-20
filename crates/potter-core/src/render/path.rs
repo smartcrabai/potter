@@ -10,18 +10,19 @@ use crate::{
     model::{Id, LightType, Material, SceneDoc},
     shader::{
         BsdfParams, EvaluatorWorkspace, HitContext, HitUvLayers, PreparedMaterial,
-        equirectangular_uv, evaluate_surface_with_workspace, height_gradient,
+        SubsurfaceMethod, equirectangular_uv, evaluate_surface_with_workspace, height_gradient,
     },
 };
 
 use super::principled_bsdf::{
-    GlassSample, Layers, continuous_density, evaluate as evaluate_bsdf, layers, lobe_probabilities,
-    sample_glass, subsurface_closure_weight,
+    GlassSample, Layers, base_color, continuous_density, evaluate as evaluate_bsdf, layers,
+    lobe_probabilities, sample_glass, subsurface_closure_weight,
 };
 use super::subsurface::{
-    MAX_HITS, ProbeHits, burley_radius, channel_mask, eval as burley_eval, exit_params, pdf_mean,
-    pick_channel, sample_radius,
+    MAX_HITS, ProbeHits, SubsurfaceExit, channel_mask, closure_radius, eval as burley_eval,
+    exit_params, pdf_mean, pick_channel, sample_radius,
 };
+use super::subsurface_walk::{WalkEntry, entry_direction, walk};
 use super::{
     bvh::{Bvh, BvhHit},
     light_model::{
@@ -949,8 +950,9 @@ fn trace_path(
             // The exit of a Burley entry is a diffuse surface (`subsurface_shader_data_setup`), not its material.
             surface.params = exit_params(surface.params);
             surface.layers = layers(&surface.params, surface.normal, -direction);
-        } else if diffuse_ancestor {
-            // A Burley closure falls back to diffuse after a diffuse bounce (Cycles' `PATH_RAY_DIFFUSE_ANCESTOR`).
+        } else if diffuse_ancestor && surface.params.subsurface_method == SubsurfaceMethod::Burley {
+            // A Burley closure falls back to diffuse after a diffuse bounce (Cycles' `bssrdf_setup` with
+            // `PATH_RAY_DIFFUSE_ANCESTOR`). The random walk keeps its closure.
             surface.params.subsurface_weight = 0.0;
         }
         if surface.params.has_medium()
@@ -1035,12 +1037,13 @@ fn trace_path(
             rng,
         );
         if let BsdfSample::Subsurface { weight: entry } = sampled {
-            // The path enters the surface and leaves at a probed exit, which is shaded as diffuse next (Cycles'
-            // `subsurface_bounce` and `subsurface_scatter`). The entry is one bounce; the probe is no light's path.
-            let Some(exit) = burley_exit(geometry, bvh, &surface, rng) else {
+            // The path enters the surface and leaves at the exit of its method, shaded as diffuse next (Cycles'
+            // `subsurface_bounce` and `subsurface_scatter`). The entry is one bounce; the probe or walk is no light's path.
+            let Some(exit) = subsurface_exit(geometry, bvh, &surface, throughput, entry, rng)
+            else {
                 break;
             };
-            throughput *= entry * exit.weight;
+            throughput = exit.throughput;
             bounce += 1;
             origin = exit.origin;
             direction = exit.direction;
@@ -2333,27 +2336,92 @@ fn continuous_sample(
     }
 }
 
-/// A Burley subsurface exit: the ray it leaves along, the hit it leaves at, and the exit's weight relative to the
-/// entry (Cycles' `subsurface_disk` with its resampled weight).
-struct BurleyExit {
-    origin: DVec3,
-    direction: DVec3,
-    hit: BvhHit,
-    weight: DVec3,
+/// The exit of a subsurface entry, by the surface's method (Cycles' `subsurface_bounce` and `subsurface_scatter`).
+/// `throughput` is the path throughput before the entry and `entry` the entry weight. Only the methods that
+/// `subsurface_evaluated` admits are sampled, since the others carry no subsurface closure.
+fn subsurface_exit(
+    geometry: &Geometry,
+    bvh: &Bvh,
+    surface: &Surface,
+    throughput: DVec3,
+    entry: DVec3,
+    rng: &mut Pcg32,
+) -> Option<SubsurfaceExit> {
+    let throughput = throughput * entry;
+    match surface.params.subsurface_method {
+        SubsurfaceMethod::Burley => burley_exit(geometry, bvh, surface, throughput, rng),
+        SubsurfaceMethod::RandomWalk => random_walk_exit(geometry, bvh, surface, throughput, rng),
+        SubsurfaceMethod::RandomWalkSkin
+        | SubsurfaceMethod::RandomWalkLegacy
+        | SubsurfaceMethod::Mixed => {
+            unreachable!("the subsurface closure is only sampled for the methods Potter evaluates")
+        }
+    }
+}
+
+/// Cycles' random walk from a refracted entry (`subsurface_entry_bounce`, `subsurface_random_walk`): the entry point is
+/// the surface point, the walk starts a ray epsilon inside the object, and it ends at the object's surface, which is
+/// shaded as the diffuse exit. The radius of a channel below the minimum is zero, as `bssrdf_setup` sets it.
+fn random_walk_exit(
+    geometry: &Geometry,
+    bvh: &Bvh,
+    surface: &Surface,
+    throughput: DVec3,
+    rng: &mut Pcg32,
+) -> Option<SubsurfaceExit> {
+    let params = &surface.params;
+    let (u, v) = (rng.next_f64(), rng.next_f64());
+    // The entry's GGX interface has the surface's roughness squared (`bssrdf->alpha = sqr(roughness)`).
+    let direction = entry_direction(
+        surface.normal,
+        surface.layers.view,
+        params.roughness * params.roughness,
+        params.ior,
+        u,
+        v,
+    )?;
+    if surface.geometric_normal.dot(direction) >= 0.0 {
+        return None;
+    }
+    let radius = closure_radius(params);
+    let mask = channel_mask(radius);
+    let radius = DVec3::from_array(std::array::from_fn(|channel| {
+        if mask[channel] { radius[channel] } else { 0.0 }
+    }));
+    let entry = WalkEntry {
+        point: surface.point,
+        origin: surface.point - surface.geometric_normal * RAY_EPSILON,
+        normal: surface.normal,
+        direction,
+        albedo: base_color(params),
+        radius,
+        anisotropy: params.subsurface_anisotropy,
+        throughput,
+        epsilon: RAY_EPSILON,
+    };
+    let mut draw = || rng.next_f64();
+    walk(
+        &geometry.triangles,
+        bvh,
+        surface.object_index,
+        &entry,
+        &mut draw,
+    )
 }
 
 /// Probes the object of `surface` for the exit of the Burley profile, as Cycles' `subsurface_disk` does: a disk
 /// sample of the profile on one of the three axes of the surface, a ray through the object along that axis, and an
 /// importance resample among the hits of the ray on the object. At most `MAX_HITS` hits are kept, by Cycles'
 /// reservoir (`subsurface_disk.h`, `scene_intersect_local` with `max_hits`), and the weight of a probe that saw more
-/// is scaled by `num_hits / max_hits`.
+/// is scaled by `num_hits / max_hits`. `throughput` includes the entry weight.
 fn burley_exit(
     geometry: &Geometry,
     bvh: &Bvh,
     surface: &Surface,
+    throughput: DVec3,
     rng: &mut Pcg32,
-) -> Option<BurleyExit> {
-    let radius = burley_radius(&surface.params);
+) -> Option<SubsurfaceExit> {
+    let radius = closure_radius(&surface.params);
     let mask = channel_mask(radius);
     // One draw picks the channel and, remapped, the radius (`bssrdf_sample`).
     let (channel, xi_radius) = pick_channel(mask, rng.next_f64())?;
@@ -2464,11 +2532,11 @@ fn burley_exit(
         let average = weight.abs().element_sum() / 3.0;
         partial += average;
         if average > 0.0 && target < partial {
-            return Some(BurleyExit {
+            return Some(SubsurfaceExit {
                 origin: from,
                 direction,
                 hit,
-                weight: weight * (total / average),
+                throughput: throughput * (weight * (total / average)),
             });
         }
     }

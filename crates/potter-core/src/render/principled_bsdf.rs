@@ -33,7 +33,7 @@ use super::principled_tables::{
     ggx_glass_energy_average, ggx_glass_inverse_energy, ggx_glass_inverse_energy_average,
     sheen_ltc,
 };
-use super::subsurface::{burley_active, burley_radius, channel_mask};
+use super::subsurface::{channel_mask, closure_radius, subsurface_evaluated};
 
 /// Roughness floor shared with the sampler; Cycles treats roughness below ~1e-5 as delta.
 const MIN_ROUGHNESS: f64 = 0.02;
@@ -53,9 +53,9 @@ pub(crate) struct LobeProbabilities {
 pub(crate) fn lobe_probabilities(params: &BsdfParams, layers: &Layers) -> LobeProbabilities {
     let metallic = params.metallic.clamp(0.0, 1.0);
     let transmission = params.transmission.clamp(0.0, 1.0);
-    // The Burley subsurface closure takes its Subsurface Weight from the diffuse share (Cycles' diffuse weight is
+    // The subsurface closure takes its Subsurface Weight from the diffuse share (Cycles' diffuse weight is
     // `base × (1 - subsurface weight) × weight`, `svm/closure.h`).
-    let subsurface_share = if burley_active(params) {
+    let subsurface_share = if subsurface_evaluated(params) {
         params.subsurface_weight.clamp(0.0, 1.0)
     } else {
         0.0
@@ -64,7 +64,7 @@ pub(crate) fn lobe_probabilities(params: &BsdfParams, layers: &Layers) -> LobePr
         ((1.0 - metallic) * (1.0 - transmission) * (1.0 - subsurface_share)).max(0.0);
     // The subsurface closure's sample weight is its mean channel weight times the channels it covers
     // (`bssrdf_setup`, `sample_weight = |average(weight)| * channels`).
-    let covered_channels = channel_mask(burley_radius(params))
+    let covered_channels = channel_mask(closure_radius(params))
         .iter()
         .filter(|&&on| on)
         .count() as f64;
@@ -174,32 +174,32 @@ fn diffuse_layer_weight(params: &BsdfParams, normal: DVec3, view: DVec3) -> f64 
     }
 }
 
-/// The per-channel share of the diffuse base that the Burley subsurface closure leaves to diffuse: `1 - Subsurface
-/// Weight` on the channels with a radius, and `1` on the others, which fall back to diffuse (`bssrdf_setup`).
+/// The per-channel share of the diffuse base that the subsurface closure leaves to diffuse: `1 - Subsurface Weight` on
+/// the channels with a radius, and `1` on the others, which fall back to diffuse (`bssrdf_setup`).
 fn subsurface_share(params: &BsdfParams) -> DVec3 {
-    if !burley_active(params) {
+    if !subsurface_evaluated(params) {
         return DVec3::ONE;
     }
     let sss = params.subsurface_weight.clamp(0.0, 1.0);
-    let mask = channel_mask(burley_radius(params));
+    let mask = channel_mask(closure_radius(params));
     DVec3::from_array(std::array::from_fn(|channel| {
         if mask[channel] { 1.0 - sss } else { 1.0 }
     }))
 }
 
-/// The Burley subsurface closure's weight per channel, `clamped base × subsurface weight × diffuse layer weight ×
-/// reflectance × lower`, zero on channels without a radius (Cycles' `closure_weight` of the BSSRDF, `svm/closure.h`).
-/// It is the weight the path tracer divides by the branch's probability to enter the surface.
+/// The subsurface closure's weight per channel, `clamped base × subsurface weight × diffuse layer weight × reflectance
+/// × lower`, zero on channels without a radius (Cycles' `closure_weight` of the BSSRDF, `svm/closure.h`). It is the
+/// weight the path tracer divides by the branch's probability to enter the surface.
 pub(crate) fn subsurface_closure_weight(
     params: &BsdfParams,
     normal: DVec3,
     view: DVec3,
     lower: DVec3,
 ) -> DVec3 {
-    if !burley_active(params) || normal.dot(view) <= 0.0 {
+    if !subsurface_evaluated(params) || normal.dot(view) <= 0.0 {
         return DVec3::ZERO;
     }
-    let mask = channel_mask(burley_radius(params));
+    let mask = channel_mask(closure_radius(params));
     let covered = DVec3::from_array(mask.map(|on| if on { 1.0 } else { 0.0 }));
     base_color(params)
         * covered
@@ -617,7 +617,7 @@ fn sheen_frame(normal: DVec3, view: DVec3) -> (DVec3, DVec3) {
     clippy::float_cmp,
     reason = "Cycles selects the tangent basis by exact component equality of the normal"
 )]
-fn make_orthonormals(normal: DVec3) -> (DVec3, DVec3) {
+pub(super) fn make_orthonormals(normal: DVec3) -> (DVec3, DVec3) {
     let tangent = if normal.x != normal.y || normal.x != normal.z {
         DVec3::new(
             normal.z - normal.y,
@@ -636,7 +636,7 @@ fn make_orthonormals(normal: DVec3) -> (DVec3, DVec3) {
 }
 
 /// The base colour clamped to 1 (Cycles' `clamped_base_color`, used by the F82 metal lobe).
-fn base_color(params: &BsdfParams) -> DVec3 {
+pub(super) fn base_color(params: &BsdfParams) -> DVec3 {
     diffuse_albedo(params).min(DVec3::ONE)
 }
 
@@ -1056,7 +1056,7 @@ pub(crate) fn sample_glass(
 
 /// Cycles' `microfacet_ggx_sample_vndf` (Heitz 2018): the half vector visible from the local view `wi`
 /// (`z` up) for the isotropic GGX `alpha`, from the uniform pair `(u, v)`.
-fn sample_visible_normal(wi: DVec3, alpha: f64, u: f64, v: f64) -> DVec3 {
+pub(super) fn sample_visible_normal(wi: DVec3, alpha: f64, u: f64, v: f64) -> DVec3 {
     let stretched = DVec3::new(alpha * wi.x, alpha * wi.y, wi.z).normalize_or_zero();
     let length_squared = stretched.x * stretched.x + stretched.y * stretched.y;
     let (t1, t2) = if length_squared > 1.0e-7 {
