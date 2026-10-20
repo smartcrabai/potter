@@ -19,8 +19,8 @@ use super::principled_bsdf::{
     sample_glass, subsurface_closure_weight,
 };
 use super::subsurface::{
-    burley_radius, channel_mask, eval as burley_eval, exit_params, pdf_mean, pick_channel,
-    sample_radius,
+    MAX_HITS, ProbeHits, burley_radius, channel_mask, eval as burley_eval, exit_params, pdf_mean,
+    pick_channel, sample_radius,
 };
 use super::{
     bvh::{Bvh, BvhHit},
@@ -2344,8 +2344,9 @@ struct BurleyExit {
 
 /// Probes the object of `surface` for the exit of the Burley profile, as Cycles' `subsurface_disk` does: a disk
 /// sample of the profile on one of the three axes of the surface, a ray through the object along that axis, and an
-/// importance resample among every hit of the ray on the object. Cycles caps the hits at `BSSRDF_MAX_HITS` with a
-/// random subset; Potter keeps them all, which has the same expectation.
+/// importance resample among the hits of the ray on the object. At most `MAX_HITS` hits are kept, by Cycles'
+/// reservoir (`subsurface_disk.h`, `scene_intersect_local` with `max_hits`), and the weight of a probe that saw more
+/// is scaled by `num_hits / max_hits`.
 fn burley_exit(
     geometry: &Geometry,
     bvh: &Bvh,
@@ -2393,7 +2394,9 @@ fn burley_exit(
         (disk_radius * phase.cos()) * disk_tangent + (disk_radius * phase.sin()) * disk_bitangent;
     let origin = surface.point + disk_normal * height + disk_point;
     let direction = -disk_normal;
-    let mut found: Vec<(BvhHit, DVec3)> = Vec::new();
+    // Cycles records at most `MAX_HITS` hits of the object as a reservoir (`scene_intersect_local`, `kernel/bvh/local.h`),
+    // with a generator seeded from the path's random numbers (`lcg_state_init` in `subsurface_disk`).
+    let mut probe = ProbeHits::new(rng.next_u32());
     bvh.walk_hits(
         &geometry.triangles,
         origin,
@@ -2406,18 +2409,29 @@ fn burley_exit(
                 .get(hit.triangle_index)
                 .is_some_and(|triangle| triangle.object_index == surface.object_index)
             {
-                found.push((hit, from));
+                // The hit's distance along the probe: the key of Cycles' duplicate test and of its sort.
+                let t = (from - origin).dot(direction) + hit.distance;
+                probe.record(t, (hit, from));
             }
             true
         },
     );
+    let (seen, mut found) = probe.finish();
+    // The recorded hits are sorted by distance (`sort_intersections_and_normals`), so the resample has a fixed order.
+    found.sort_by(|a, b| a.0.total_cmp(&b.0));
+    // Hits the reservoir replaced still count: `w *= num_hits / max_hits` (`subsurface_disk`).
+    let reservoir_scale = if seen > MAX_HITS {
+        seen as f64 / MAX_HITS as f64
+    } else {
+        1.0
+    };
     let disk_pdf = pdf_mean(radius, mask, disk_radius);
     if disk_pdf <= 0.0 || found.is_empty() {
         return None;
     }
     let mut weighted: Vec<(BvhHit, DVec3, DVec3)> = Vec::with_capacity(found.len());
     let mut total = 0.0;
-    for (hit, from) in found {
+    for (_, (hit, from)) in found {
         let Some(triangle) = geometry.triangles.get(hit.triangle_index) else {
             continue;
         };
@@ -2436,7 +2450,7 @@ fn burley_exit(
             0.0
         };
         let distance = (point - surface.point).length();
-        let weight = burley_eval(radius, mask, distance) / disk_pdf * mis;
+        let weight = burley_eval(radius, mask, distance) / disk_pdf * mis * reservoir_scale;
         total += weight.abs().element_sum() / 3.0;
         weighted.push((hit, from, weight));
     }

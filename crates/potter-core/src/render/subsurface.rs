@@ -157,6 +157,57 @@ pub(crate) fn pdf_mean(radius: DVec3, mask: [bool; 3], r: f64) -> f64 {
     eval(radius, mask, r).element_sum() / active as f64
 }
 
+/// Cycles' `BSSRDF_MAX_HITS` (`kernel/types.h`): a disk probe records at most this many hits on its object.
+pub(crate) const MAX_HITS: usize = 4;
+
+/// Cycles' `lcg_step_uint` (`kernel/sample/lcg.h`): one step of the generator that picks a reservoir slot.
+pub(crate) fn lcg_step(state: &mut u32) -> u32 {
+    *state = 1_103_515_245_u32.wrapping_mul(*state).wrapping_add(12_345);
+    *state
+}
+
+/// The hits of one disk probe, recorded as Cycles' local intersection does (`kernel/bvh/local.h`,
+/// `kernel/geom/geom_intersect.h`, `local_intersect_get_record_index`): a hit whose distance repeats a stored hit's
+/// is skipped; the first `MAX_HITS` are stored; a later hit replaces the stored hit at slot `lcg_step % seen` when
+/// that slot is below `MAX_HITS`, so each hit is kept with probability `MAX_HITS / seen`. `seen` counts every hit.
+pub(crate) struct ProbeHits<T> {
+    hits: Vec<(f64, T)>,
+    seen: usize,
+    lcg: u32,
+}
+
+impl<T> ProbeHits<T> {
+    /// A probe whose reservoir generator starts from `seed`.
+    pub(crate) fn new(seed: u32) -> Self {
+        Self {
+            hits: Vec::with_capacity(MAX_HITS),
+            seen: 0,
+            lcg: seed,
+        }
+    }
+
+    /// Records a hit at distance `t` along the probe.
+    pub(crate) fn record(&mut self, t: f64, item: T) {
+        if self.hits.iter().any(|(stored, _)| *stored == t) {
+            return;
+        }
+        self.seen += 1;
+        if self.seen <= MAX_HITS {
+            self.hits.push((t, item));
+            return;
+        }
+        let slot = lcg_step(&mut self.lcg) % self.seen as u32;
+        if (slot as usize) < MAX_HITS {
+            self.hits[slot as usize] = (t, item);
+        }
+    }
+
+    /// The number of hits seen and the stored hits, in the order they were stored.
+    pub(crate) fn finish(self) -> (usize, Vec<(f64, T)>) {
+        (self.seen, self.hits)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,5 +332,55 @@ mod tests {
         assert!((radius.x - factor).abs() < 1.0e-15, "{radius:?}");
         assert!((radius.y - 0.2 * factor).abs() < 1.0e-15, "{radius:?}");
         assert!((radius.z - 0.1 * factor).abs() < 1.0e-15, "{radius:?}");
+    }
+
+    #[test]
+    fn lcg_step_is_the_linear_congruence_of_cycles() {
+        // `kernel/sample/lcg.h`: state = 1103515245 · state + 12345 (mod 2³²), and the new state is returned.
+        let mut state = 1;
+        assert_eq!(lcg_step(&mut state), 1_103_527_590);
+        assert_eq!(state, 1_103_527_590);
+    }
+
+    #[test]
+    fn probe_keeps_four_hits_and_skips_a_repeated_distance() {
+        let mut probe = ProbeHits::new(7);
+        for index in 0..10 {
+            probe.record(f64::from(index), index);
+        }
+        // A repeated distance is skipped and not counted, as Cycles' `local_intersect_get_record_index` does.
+        probe.record(3.0, 99);
+        let (seen, hits) = probe.finish();
+        assert_eq!(seen, 10);
+        assert_eq!(hits.len(), MAX_HITS);
+        assert!(
+            hits.iter()
+                .all(|(t, index)| *t == *index as f64 && *index != 99)
+        );
+    }
+
+    #[test]
+    fn probe_reservoir_keeps_each_hit_with_probability_four_in_n() {
+        // The reservoir is uniform: each of N hits is kept with probability 4/N, over many seeds.
+        let n = 12;
+        let trials: u32 = 20_000;
+        let mut kept = vec![0usize; n];
+        for seed in 0..trials {
+            let mut probe = ProbeHits::new(seed.wrapping_mul(2_654_435_761).wrapping_add(1));
+            for index in 0..n {
+                probe.record(index as f64, index);
+            }
+            for (_, index) in probe.finish().1 {
+                kept[index] += 1;
+            }
+        }
+        let expected = f64::from(trials) * MAX_HITS as f64 / n as f64;
+        for (index, count) in kept.iter().enumerate() {
+            let deviation = (*count as f64 - expected).abs() / expected;
+            assert!(
+                deviation < 0.05,
+                "hit {index}: kept {count}, expected {expected}"
+            );
+        }
     }
 }
