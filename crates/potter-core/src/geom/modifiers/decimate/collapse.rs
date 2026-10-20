@@ -830,7 +830,7 @@ impl BMesh {
                 && mark == bm.loops[l].mark
                 && mark == bm.loops[bm.loops[l].radial_next].mark
         };
-        // Creation order; Blender's BM_ITER_MESH walks the edge pool (slot order) instead.
+        // BM_ITER_MESH order: edge slots equal arena indices here, no edge is created after a kill.
         for e in 0..self.edges.len() {
             if !self.edges[e].alive {
                 continue;
