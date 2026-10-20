@@ -16,7 +16,15 @@ use glam::DVec3;
 use super::Polygon;
 use super::bevel_profile::CurveProfile;
 use super::bevel_vmesh::{even_chords, power_of_two_at_least};
+use crate::error::{ErrorCode, PotError, Result};
 use crate::geom::edge_key;
+
+/// Builds the error for a broken internal invariant of the front end. Reaching it means the
+/// front end's own bookkeeping is inconsistent, so it surfaces as an `InternalError`.
+#[must_use]
+pub(super) fn internal_invariant(message: &'static str) -> PotError {
+    PotError::new(ErrorCode::InternalError, message)
+}
 
 /// Blender's `BEVEL_EPSILON`.
 const EPSILON: f64 = 1.0e-6_f32 as f64;
@@ -159,7 +167,6 @@ pub(super) struct BoundProfile {
 /// Blender's `ProfileSpacing`: unit-profile sample coordinates for `seg` and `seg_2` segments.
 #[derive(Clone, Debug, Default)]
 pub(super) struct ProfileSpacing {
-    pub seg: usize,
     pub seg_2: usize,
     pub xvals: Vec<f64>,
     pub yvals: Vec<f64>,
@@ -182,7 +189,6 @@ impl ProfileSpacing {
             samples(seg_2, super_r, custom)
         };
         Self {
-            seg,
             seg_2,
             xvals,
             yvals,
@@ -288,7 +294,6 @@ impl BoundVert {
 /// Blender's `BevVert`: a beveled input vertex with its edge halves and boundary ring.
 #[derive(Clone, Debug)]
 pub(super) struct BevVert {
-    pub vertex: usize,
     /// Arena ids of the edge halves in CCW order.
     pub edges: Vec<usize>,
     pub selcount: usize,
@@ -494,7 +499,7 @@ impl Front {
     /// Blender's `BM_mesh_bevel` front end, in its order: construct every beveled vertex, clamp
     /// the offset if requested, build every boundary, adjust widths, orient custom profiles, and
     /// compute the profile points.
-    pub(super) fn build(p: Params, geo: Geometry) -> Self {
+    pub(super) fn build(p: Params, geo: Geometry) -> Result<Self> {
         let mut front = Self::new(p, geo);
         let mut beveled: Vec<usize> = if front.p.affect_vertices {
             front.geo.selected_vertices.iter().copied().collect()
@@ -509,7 +514,7 @@ impl Front {
         beveled.sort_unstable();
         beveled.dedup();
         for vertex in &beveled {
-            front.construct_vert(*vertex);
+            front.construct_vert(*vertex)?;
         }
         let vertices: Vec<usize> = front
             .verts
@@ -518,19 +523,19 @@ impl Front {
             .filter_map(|(index, bv)| bv.as_ref().map(|_| index))
             .collect();
         if front.p.limit_offset {
-            front.limit_offset(&vertices);
+            front.limit_offset(&vertices)?;
         }
-        front.build_all(&vertices, true);
+        front.build_all(&vertices, true)?;
         if front.p.offset_adjust {
-            front.adjust_offsets(&vertices);
+            front.adjust_offsets(&vertices)?;
         }
         if front.p.custom.is_some() {
-            front.regularize_profiles();
+            front.regularize_profiles()?;
         }
         for vertex in &vertices {
-            front.calculate_vm_profiles(*vertex);
+            front.calculate_vm_profiles(*vertex)?;
         }
-        front
+        Ok(front)
     }
     fn new(mut p: Params, mut geo: Geometry) -> Self {
         for point in &mut geo.points {
@@ -614,8 +619,8 @@ impl Front {
 
     /// Blender's `set_bound_vert_seams`: preserve UV seam representatives and, when requested,
     /// calculate the marked input-edge spans extended over the output boundary.
-    fn set_bound_vert_seams(&mut self, vertex: usize) {
-        let ring = self.bev(vertex).ring.clone();
+    fn set_bound_vert_seams(&mut self, vertex: usize) -> Result<()> {
+        let ring = self.bev(vertex)?.ring.clone();
         let mut any = false;
         for id in ring {
             let mut flag = false;
@@ -635,31 +640,33 @@ impl Front {
             self.bounds[id].sharp_len = 0;
             any |= flag;
         }
-        if self.p.affect_vertices_odd && !any {
-            if let Some(seam_vertices) = &self.geo.seam_vertices {
-                any = seam_vertices[vertex];
-            }
+        if self.p.affect_vertices_odd
+            && !any
+            && let Some(seam_vertices) = &self.geo.seam_vertices
+        {
+            any = seam_vertices[vertex];
         }
-        self.bev_mut(vertex).any_seam = any;
+        self.bev_mut(vertex)?.any_seam = any;
         if self.p.mark_seam {
-            self.check_edge_data_seam_sharp_edges(vertex, true);
+            self.check_edge_data_seam_sharp_edges(vertex, true)?;
         }
         if self.p.mark_sharp {
-            self.check_edge_data_seam_sharp_edges(vertex, false);
+            self.check_edge_data_seam_sharp_edges(vertex, false)?;
         }
+        Ok(())
     }
 
     /// Blender's `check_edge_data_seam_sharp_edges`: count intervening beveled edges after each
     /// marked input edge, storing that span on the edge's right boundary vertex.
-    fn check_edge_data_seam_sharp_edges(&mut self, vertex: usize, seam: bool) {
-        let Some(mut edge) = self.bev(vertex).edges.first().copied() else {
-            return;
+    fn check_edge_data_seam_sharp_edges(&mut self, vertex: usize, seam: bool) -> Result<()> {
+        let Some(mut edge) = self.bev(vertex)?.edges.first().copied() else {
+            return Ok(());
         };
         let start = edge;
         while !self.edge_has_mark(edge, seam) {
             edge = self.edges[edge].next;
             if edge == start {
-                return;
+                return Ok(());
             }
         }
         let first_marked = edge;
@@ -687,6 +694,7 @@ impl Front {
                 break;
             }
         }
+        Ok(())
     }
 
     fn edge_has_mark(&self, edge: usize, seam: bool) -> bool {
@@ -717,10 +725,10 @@ impl Front {
                 } else {
                     edge_key(vertex, vertices[(index + 2) % count])
                 };
-                if let Some(&successor) = self.edge_ids.get(&next) {
-                    if !tagged.contains(&successor) {
-                        successors.push(successor);
-                    }
+                if let Some(&successor) = self.edge_ids.get(&next)
+                    && !tagged.contains(&successor)
+                {
+                    successors.push(successor);
                 }
                 break;
             }
@@ -786,7 +794,7 @@ impl Front {
     }
 
     /// Blender's `fast_bevel_edge_order` followed by `find_bevel_edge_order`.
-    fn bevel_edge_order(&self, vertex: usize, incident: &[usize]) -> Vec<usize> {
+    fn bevel_edge_order(&self, vertex: usize, incident: &[usize]) -> Result<Vec<usize>> {
         let mut first = None;
         for &edge_id in incident {
             if first.is_none() && {
@@ -823,7 +831,8 @@ impl Front {
                     }
                 }
                 if shared_count == 1 || (index == 1 && shared_count == 2) {
-                    let successor = first_successor.expect("shared face has a successor");
+                    let successor = first_successor
+                        .ok_or_else(|| internal_invariant("shared face has a successor"))?;
                     tagged.insert(successor);
                     order.push(successor);
                 } else {
@@ -833,7 +842,7 @@ impl Front {
             }
         }
         if fast {
-            return order;
+            return Ok(order);
         }
 
         order.truncate(1);
@@ -859,12 +868,12 @@ impl Front {
                         .copied()
                         .find(|edge_id| !tagged.contains(edge_id))
                 })
-                .expect("remaining incident edge");
+                .ok_or_else(|| internal_invariant("remaining incident edge"))?;
             tagged.insert(next);
             order.push(next);
         }
 
-        order
+        Ok(order)
     }
 
     fn shared_face(&self, first: usize, second: usize, vertex: usize) -> Option<usize> {
@@ -880,10 +889,10 @@ impl Front {
                 }
                 let previous = edge_key(vertices[(index + count - 1) % count], vertices[index]);
                 let next = edge_key(vertices[(index + 1) % count], vertices[(index + 2) % count]);
-                if previous == second_key || next == second_key {
-                    if best.is_none() || vertices[index] == vertex {
-                        best = Some(face);
-                    }
+                if (previous == second_key || next == second_key)
+                    && (best.is_none() || vertices[index] == vertex)
+                {
+                    best = Some(face);
                 }
                 break;
             }
@@ -907,8 +916,8 @@ impl Front {
         }
     }
 
-    /// Creates Blender's circular EdgeHalf order and its fnext/fprev links at one vertex.
-    fn construct_edgehalves(&mut self, vertex: usize) -> Option<Vec<usize>> {
+    /// Creates Blender's circular `EdgeHalf` order and its fnext/fprev links at one vertex.
+    fn construct_edgehalves(&mut self, vertex: usize) -> Result<Option<Vec<usize>>> {
         let affect_vertices = self.p.affect_vertices;
         let incident: Vec<usize> = self.incident_edges[vertex]
             .iter()
@@ -922,10 +931,10 @@ impl Front {
                     self.is_selected(a, b)
                 }))
         {
-            return None;
+            return Ok(None);
         }
 
-        let mut edge_ids = self.bevel_edge_order(vertex, &incident);
+        let mut edge_ids = self.bevel_edge_order(vertex, &incident)?;
         let count = edge_ids.len();
         let mut gaps = vec![None; count];
         let mut previous_faces = vec![None; count];
@@ -983,7 +992,7 @@ impl Front {
                 visited_rpo: false,
             });
         }
-        Some((first_id..first_id + count).collect())
+        Ok(Some((first_id..first_id + count).collect()))
     }
 
     fn point(&self, vertex: usize) -> DVec3 {
@@ -994,12 +1003,16 @@ impl Front {
         self.geo.face_normals[face]
     }
 
-    fn bev(&self, vertex: usize) -> &BevVert {
-        self.verts[vertex].as_ref().expect("beveled vertex")
+    fn bev(&self, vertex: usize) -> Result<&BevVert> {
+        self.verts[vertex]
+            .as_ref()
+            .ok_or_else(|| internal_invariant("beveled vertex"))
     }
 
-    fn bev_mut(&mut self, vertex: usize) -> &mut BevVert {
-        self.verts[vertex].as_mut().expect("beveled vertex")
+    fn bev_mut(&mut self, vertex: usize) -> Result<&mut BevVert> {
+        self.verts[vertex]
+            .as_mut()
+            .ok_or_else(|| internal_invariant("beveled vertex"))
     }
 
     fn is_selected(&self, a: usize, b: usize) -> bool {
@@ -1274,9 +1287,8 @@ impl Front {
             let v = self.point(vertex);
             let v2 = self.point(self.edges[emid].other);
             let meetco = if self.p.offset_type == OffsetType::Percent {
-                let wt = f64::from(
-                    0.5_f32 * (self.edge_weight_of(e1) as f32 + self.edge_weight_of(e2) as f32),
-                );
+                let sum = self.edge_weight_of(e1) as f32 + self.edge_weight_of(e2) as f32;
+                let wt = f64::from(0.5_f32 * sum);
                 f32_lerp(v, v2, f32_div(f32_mul_scalar(wt, self.p.offset), 100.0))
             } else {
                 f32_add(v, f32_mul(f32_normalize(f32_sub(v2, v)), self.p.offset))
@@ -1321,17 +1333,17 @@ impl Front {
     }
 
     /// The vertices around `vertex` in `face`: `(previous, next)`.
-    fn face_neighbors(&self, face: usize, vertex: usize) -> (usize, usize) {
+    fn face_neighbors(&self, face: usize, vertex: usize) -> Result<(usize, usize)> {
         let vertices = &self.geo.polygons[face].0;
         let count = vertices.len();
         let position = vertices
             .iter()
             .position(|value| *value == vertex)
-            .expect("vertex in face");
-        (
+            .ok_or_else(|| internal_invariant("vertex in face"))?;
+        Ok((
             vertices[(position + count - 1) % count],
             vertices[(position + 1) % count],
-        )
+        ))
     }
 
     /// Blender's `offset_meet_lines_percent_or_absolute`: the lines `(l1a, l1b)` and `(l2a, l2b)`
@@ -1341,20 +1353,20 @@ impl Front {
         e1: usize,
         e2: usize,
         vertex: usize,
-    ) -> [DVec3; 4] {
+    ) -> Result<[DVec3; 4]> {
         let v = self.point(vertex);
         let v1 = self.edges[e1].other;
         let v2 = self.edges[e2].other;
         let plain = [v, self.point(v1), v, self.point(v2)];
         let (Some(f1), Some(f2)) = (self.edges[e1].fnext, self.edges[e2].fprev) else {
-            return plain;
+            return Ok(plain);
         };
         // e0: the edge after v1 around f1. e4: the edge before v around f1.
-        let (_, after_v1) = self.face_neighbors(f1, v1);
-        let (before_v, _) = self.face_neighbors(f1, vertex);
+        let (_, after_v1) = self.face_neighbors(f1, v1)?;
+        let (before_v, _) = self.face_neighbors(f1, vertex)?;
         // e3: the edge before v2 around f2. e5: the edge after v around f2.
-        let (before_v2, _) = self.face_neighbors(f2, v2);
-        let (_, after_v) = self.face_neighbors(f2, vertex);
+        let (before_v2, _) = self.face_neighbors(f2, v2)?;
+        let (_, after_v) = self.face_neighbors(f2, vertex)?;
         let e0 = edge_key(v1, after_v1);
         let e3 = edge_key(before_v2, v2);
         let e4 = edge_key(before_v, vertex);
@@ -1366,7 +1378,7 @@ impl Front {
             || !self.edge_edge_angle_less_than_180(e2_key, e3, f2)
             || !self.edge_edge_angle_less_than_180(e5, e2_key, f1);
         if no_offsets {
-            return plain;
+            return Ok(plain);
         }
         let (d0, d3, d4, d5) = if self.p.offset_type == OffsetType::Absolute {
             (self.p.offset, self.p.offset, self.p.offset, self.p.offset)
@@ -1392,12 +1404,12 @@ impl Front {
         };
         let e1_wt = self.edge_weight_of(e1);
         let e2_wt = self.edge_weight_of(e2);
-        [
+        Ok([
             self.slide_key(e4.0, e4.1, vertex, f32_mul_scalar(d4, e1_wt)),
             self.slide_key(e0.0, e0.1, v1, f32_mul_scalar(d0, e1_wt)),
             self.slide_key(e5.0, e5.1, vertex, f32_mul_scalar(d5, e2_wt)),
             self.slide_key(e3.0, e3.1, v2, f32_mul_scalar(d3, e2_wt)),
-        ]
+        ])
     }
 
     /// Blender's `offset_meet`: where the offset lines of `e1` and `e2` meet at `vertex`. `face`
@@ -1411,7 +1423,7 @@ impl Front {
         face: Option<usize>,
         edges_between: bool,
         e_in_plane: Option<usize>,
-    ) -> DVec3 {
+    ) -> Result<DVec3> {
         let v = self.point(vertex);
         let v1 = self.edges[e1].other;
         let v2 = self.edges[e2].other;
@@ -1429,24 +1441,23 @@ impl Front {
         };
         let ang = angle_f32(dir1, dir2);
         if ang < EPSILON_ANG {
-            let norm_v = match face {
-                Some(face) => self.face_normal(face),
-                None => {
-                    let mut sum = DVec3::ZERO;
-                    let mut count = 0;
-                    let mut eloop = e1;
-                    while eloop != e2 {
-                        if let Some(next) = self.edges[eloop].fnext {
-                            sum = f32_add(sum, self.face_normal(next));
-                            count += 1;
-                        }
-                        eloop = self.edges[eloop].next;
+            let norm_v = if let Some(face) = face {
+                self.face_normal(face)
+            } else {
+                let mut sum = DVec3::ZERO;
+                let mut count = 0;
+                let mut eloop = e1;
+                while eloop != e2 {
+                    if let Some(next) = self.edges[eloop].fnext {
+                        sum = f32_add(sum, self.face_normal(next));
+                        count += 1;
                     }
-                    if count == 0 {
-                        self.vertex_normals[vertex]
-                    } else {
-                        f32_mul(sum, f32_div(1.0, count as f64))
-                    }
+                    eloop = self.edges[eloop].next;
+                }
+                if count == 0 {
+                    self.vertex_normals[vertex]
+                } else {
+                    f32_mul(sum, f32_div(1.0, count as f64))
                 }
             };
             dir1 = f32_add(dir1, dir2);
@@ -1455,11 +1466,11 @@ impl Front {
                 self.edges[e1].offset_r.max(self.edges[e2].offset_l),
                 f32_cos(f32_div(ang, 2.0)),
             );
-            return f32_add(v, f32_mul(norm_perp1, d));
+            return Ok(f32_add(v, f32_mul(norm_perp1, d)));
         }
         if f32_sub_scalar(ang, std::f32::consts::PI as f64).abs() < EPSILON_ANG {
             let d = self.edges[e1].offset_r.max(self.edges[e2].offset_l);
-            return self.slide_dist(e2, d);
+            return Ok(self.slide_dist(e2, d));
         }
         let reference = |face: Option<usize>| match face {
             Some(f) => self.face_normal(f),
@@ -1490,7 +1501,7 @@ impl Front {
             self.p.offset_type,
             OffsetType::Percent | OffsetType::Absolute
         ) {
-            let [a, b, c, d] = self.offset_meet_lines_percent_or_absolute(e1, e2, vertex);
+            let [a, b, c, d] = self.offset_meet_lines_percent_or_absolute(e1, e2, vertex)?;
             (a, b, c, d)
         } else {
             let off1a = f32_add(v, f32_mul(norm_perp1, self.edges[e1].offset_r));
@@ -1499,18 +1510,18 @@ impl Front {
         };
         let (kind, meet, isect2) = isect_line_line(off1a, off1b, off2a, off2b);
         if kind == 0 {
-            return off1a;
+            return Ok(off1a);
         }
         let mut meetco = meet;
-        if self.edges[e1].offset_r == 0.0 {
-            if let Some(closer) = self.is_outside_edge(v1, vertex, meetco) {
-                meetco = self.point(closer);
-            }
+        if self.edges[e1].offset_r == 0.0
+            && let Some(closer) = self.is_outside_edge(v1, vertex, meetco)
+        {
+            meetco = self.point(closer);
         }
-        if self.edges[e2].offset_l == 0.0 {
-            if let Some(closer) = self.is_outside_edge(vertex, v2, meetco) {
-                meetco = self.point(closer);
-            }
+        if self.edges[e2].offset_l == 0.0
+            && let Some(closer) = self.is_outside_edge(vertex, v2, meetco)
+        {
+            meetco = self.point(closer);
         }
         if edges_between && self.edges[e1].offset_r > 0.0 && self.edges[e2].offset_l > 0.0 {
             if kind == 2 {
@@ -1539,23 +1550,20 @@ impl Front {
                 e = self.edges[e].next;
             }
         }
-        meetco
+        Ok(meetco)
     }
 
-    fn construct_vert(&mut self, vertex: usize) {
-        let Some(ids) = self.construct_edgehalves(vertex) else {
-            return;
+    fn construct_vert(&mut self, vertex: usize) -> Result<()> {
+        let Some(ids) = self.construct_edgehalves(vertex)? else {
+            return Ok(());
         };
         let affect_vertices = self.p.affect_vertices;
         let selcount = ids.iter().filter(|id| self.edges[**id].is_bev).count();
         let mut offset = self.p.offset;
-        if affect_vertices {
-            if let Some(weights) = &self.geo.vertex_weight {
-                offset = f32_mul_scalar(offset, weights.get(&vertex).copied().unwrap_or(0.0));
-            }
+        if affect_vertices && let Some(weights) = &self.geo.vertex_weight {
+            offset = f32_mul_scalar(offset, weights.get(&vertex).copied().unwrap_or(0.0));
         }
         self.verts[vertex] = Some(BevVert {
-            vertex,
             edges: ids.clone(),
             selcount,
             offset,
@@ -1563,14 +1571,14 @@ impl Front {
             mesh_kind: MeshKind::None,
             any_seam: false,
         });
-        self.set_edge_offsets(vertex, &ids);
+        self.set_edge_offsets(vertex, &ids)
     }
 
     /// Blender's width specs in `bevel_vert_construct`: how the user width becomes the left and
     /// right offsets of each edge half, by offset type.
-    fn set_edge_offsets(&mut self, vertex: usize, ids: &[usize]) {
+    fn set_edge_offsets(&mut self, vertex: usize, ids: &[usize]) -> Result<()> {
         let v = self.point(vertex);
-        let bv_offset = self.bev(vertex).offset;
+        let bv_offset = self.bev(vertex)?.offset;
         let vertices = self.p.affect_vertices;
         let mut vert_axis = DVec3::ZERO;
         if vertices && matches!(self.p.offset_type, OffsetType::Width | OffsetType::Depth) {
@@ -1657,6 +1665,7 @@ impl Front {
             e.offset_l = e.offset_l_spec;
             e.offset_r = e.offset_r_spec;
         }
+        Ok(())
     }
 
     /// Appends a boundary vertex at `co` to `ring` and returns its arena id.
@@ -1672,13 +1681,13 @@ impl Front {
         ring: &mut Vec<usize>,
         existing: Option<usize>,
         co: DVec3,
-    ) -> usize {
+    ) -> Result<usize> {
         if construct {
-            self.add_bound(ring, co)
+            Ok(self.add_bound(ring, co))
         } else {
-            let bound = existing.expect("existing boundary vertex");
+            let bound = existing.ok_or_else(|| internal_invariant("existing boundary vertex"))?;
             self.bounds[bound].co = co;
-            bound
+            Ok(bound)
         }
     }
 
@@ -1693,29 +1702,27 @@ impl Front {
     }
 
     /// Records the finished boundary ring of `vertex` and its vertex-mesh kind.
-    fn store_ring(&mut self, vertex: usize, ring: Vec<usize>, mesh_kind: MeshKind) {
-        self.bev_mut(vertex).ring = ring;
-        self.bev_mut(vertex).mesh_kind = mesh_kind;
-        self.set_bound_vert_seams(vertex);
+    fn store_ring(&mut self, vertex: usize, ring: Vec<usize>, mesh_kind: MeshKind) -> Result<()> {
+        self.bev_mut(vertex)?.ring = ring;
+        self.bev_mut(vertex)?.mesh_kind = mesh_kind;
+        self.set_bound_vert_seams(vertex)
     }
 
     /// Blender's `build_boundary`: the boundary ring of the beveled vertex `vertex`, from its edge
     /// halves and current widths.
-    fn build_boundary(&mut self, vertex: usize, construct: bool) {
-        let bv = self.bev(vertex).clone();
+    fn build_boundary(&mut self, vertex: usize, construct: bool) -> Result<()> {
+        let bv = self.bev(vertex)?.clone();
         if bv.edges.len() <= 1 {
-            return;
+            return Ok(());
         }
         if self.p.affect_vertices {
-            self.build_boundary_vertex_only(vertex, construct);
-            return;
+            return self.build_boundary_vertex_only(vertex, construct);
         }
         let Some(efirst) = self.next_bev(&bv) else {
-            return;
+            return Ok(());
         };
         if bv.selcount == 1 {
-            self.build_boundary_terminal_edge(vertex, efirst, construct);
-            return;
+            return self.build_boundary_terminal_edge(vertex, efirst, construct);
         }
 
         let miter_outer = if bv.selcount >= 3 {
@@ -1747,7 +1754,7 @@ impl Front {
             let mut eon = None;
             let mut sinratio = 1.0;
             let co = if in_plane == 0 && not_in_plane == 0 {
-                self.offset_meet(e, e2, vertex, self.edges[e].fnext, false, None)
+                self.offset_meet(e, e2, vertex, self.edges[e].fnext, false, None)?
             } else if not_in_plane > 0 {
                 match enip {
                     Some(mid)
@@ -1762,7 +1769,7 @@ impl Front {
                         }
                         co
                     }
-                    _ => self.offset_meet(e, e2, vertex, None, true, eip),
+                    _ => self.offset_meet(e, e2, vertex, None, true, eip)?,
                 }
             } else {
                 match eip {
@@ -1778,14 +1785,16 @@ impl Front {
                         }
                         co
                     }
-                    _ => self.offset_meet(e, e2, vertex, self.edges[e].fnext, false, None),
+                    _ => self.offset_meet(e, e2, vertex, self.edges[e].fnext, false, None)?,
                 }
             };
 
             let v = if construct {
                 self.add_bound(&mut ring, co)
             } else {
-                let v = self.edges[e].rightv.expect("existing boundary vertex");
+                let v = self.edges[e]
+                    .rightv
+                    .ok_or_else(|| internal_invariant("existing boundary vertex"))?;
                 self.bounds[v].co = co;
                 v
             };
@@ -1830,52 +1839,49 @@ impl Front {
                         bound.eon = None;
                     }
                     self.edges[e2].leftv = Some(v3);
-                    match v2 {
-                        Some(v2) => {
-                            self.bounds[v].is_patch_start = true;
-                            self.bounds[v2].eon = self.bounds[v].eon;
-                            self.bounds[v2].sinratio = self.bounds[v].sinratio;
-                            self.bounds[v2].ebev = None;
-                            self.bounds[v].eon = None;
-                            self.bounds[v].sinratio = 1.0;
-                            self.bounds[v].elast = Some(e);
-                            if self.edges[e].next == e2 {
-                                self.bounds[v2].efirst = None;
-                                self.bounds[v2].elast = None;
-                            } else {
-                                let mut e3 = self.edges[e].next;
-                                self.bounds[v2].efirst = Some(e3);
-                                while e3 != e2 {
-                                    self.edges[e3].leftv = Some(v2);
-                                    self.edges[e3].rightv = Some(v2);
-                                    self.bounds[v2].elast = Some(e3);
-                                    e3 = self.edges[e3].next;
-                                }
+                    if let Some(v2) = v2 {
+                        self.bounds[v].is_patch_start = true;
+                        self.bounds[v2].eon = self.bounds[v].eon;
+                        self.bounds[v2].sinratio = self.bounds[v].sinratio;
+                        self.bounds[v2].ebev = None;
+                        self.bounds[v].eon = None;
+                        self.bounds[v].sinratio = 1.0;
+                        self.bounds[v].elast = Some(e);
+                        if self.edges[e].next == e2 {
+                            self.bounds[v2].efirst = None;
+                            self.bounds[v2].elast = None;
+                        } else {
+                            let mut e3 = self.edges[e].next;
+                            self.bounds[v2].efirst = Some(e3);
+                            while e3 != e2 {
+                                self.edges[e3].leftv = Some(v2);
+                                self.edges[e3].rightv = Some(v2);
+                                self.bounds[v2].elast = Some(e3);
+                                e3 = self.edges[e3].next;
                             }
                         }
-                        None => {
-                            self.bounds[v].is_arc_start = true;
-                            self.bounds[v].profile.middle = co;
-                            if self.edges[e].next == e2 {
-                                self.bounds[v].elast = self.bounds[v].efirst;
-                            } else {
-                                let between = in_plane + not_in_plane;
-                                let half = between / 2;
-                                let odd = between % 2 == 1;
-                                let mut index = 0;
-                                let mut e3 = self.edges[e].next;
-                                while e3 != e2 {
-                                    self.bounds[v].elast = Some(e3);
-                                    self.edges[e3].profile_index = if index < half {
-                                        0
-                                    } else if odd && index == half {
-                                        self.p.seg / 2
-                                    } else {
-                                        self.p.seg
-                                    };
-                                    index += 1;
-                                    e3 = self.edges[e3].next;
-                                }
+                    } else {
+                        self.bounds[v].is_arc_start = true;
+                        self.bounds[v].profile.middle = co;
+                        if self.edges[e].next == e2 {
+                            self.bounds[v].elast = self.bounds[v].efirst;
+                        } else {
+                            let between = in_plane + not_in_plane;
+                            let half = between / 2;
+                            let odd = between % 2 == 1;
+                            let mut index = 0;
+                            let mut e3 = self.edges[e].next;
+                            while e3 != e2 {
+                                self.bounds[v].elast = Some(e3);
+                                self.edges[e3].profile_index = if index < half {
+                                    0
+                                } else if odd && index == half {
+                                    self.p.seg / 2
+                                } else {
+                                    self.p.seg
+                                };
+                                index += 1;
+                                e3 = self.edges[e3].next;
                             }
                         }
                     }
@@ -1901,13 +1907,13 @@ impl Front {
 
         if construct {
             self.link_ring(&ring);
-            self.bev_mut(vertex).ring = ring.clone();
+            self.bev_mut(vertex)?.ring.clone_from(&ring);
         }
         if miter_inner != MiterKind::Sharp {
-            self.adjust_miter_inner_coords(vertex, emiter);
+            self.adjust_miter_inner_coords(vertex, emiter)?;
         }
         if let Some(emiter) = emiter {
-            self.adjust_miter_coords(vertex, emiter);
+            self.adjust_miter_coords(vertex, emiter)?;
         }
         if construct {
             let mesh_kind = if ring.len() == 2 {
@@ -1920,14 +1926,15 @@ impl Front {
                     VmeshMethod::Cutoff => MeshKind::Cutoff,
                 }
             };
-            self.store_ring(vertex, ring, mesh_kind);
+            self.store_ring(vertex, ring, mesh_kind)?;
         }
+        Ok(())
     }
 
     /// Blender's `build_boundary_vertex_only`: the boundary of a VERTICES bevel, one point per edge
     /// half, slid along that edge by its width.
-    fn build_boundary_vertex_only(&mut self, vertex: usize, construct: bool) {
-        let efirst = self.bev(vertex).edges[0];
+    fn build_boundary_vertex_only(&mut self, vertex: usize, construct: bool) -> Result<()> {
+        let efirst = self.bev(vertex)?.edges[0];
         let mut ring = Vec::new();
         let mut e = efirst;
         loop {
@@ -1939,7 +1946,9 @@ impl Front {
                 self.edges[e].leftv = Some(bound);
                 self.edges[e].rightv = Some(bound);
             } else {
-                let bound = self.edges[e].leftv.expect("existing vertex boundary");
+                let bound = self.edges[e]
+                    .leftv
+                    .ok_or_else(|| internal_invariant("existing vertex boundary"))?;
                 self.bounds[bound].co = co;
             }
             e = self.edges[e].next;
@@ -1956,13 +1965,19 @@ impl Front {
             } else {
                 MeshKind::Adj
             };
-            self.store_ring(vertex, ring, mesh_kind);
+            self.store_ring(vertex, ring, mesh_kind)?;
         }
+        Ok(())
     }
 
     /// Blender's `build_boundary_terminal_edge`: the boundary of a vertex with one beveled edge.
-    fn build_boundary_terminal_edge(&mut self, vertex: usize, efirst: usize, construct: bool) {
-        let edgecount = self.bev(vertex).edges.len();
+    fn build_boundary_terminal_edge(
+        &mut self,
+        vertex: usize,
+        efirst: usize,
+        construct: bool,
+    ) -> Result<()> {
+        let edgecount = self.bev(vertex)?.edges.len();
         let mut ring = Vec::new();
         let mut e = efirst;
         if edgecount == 2 {
@@ -1972,7 +1987,7 @@ impl Front {
                 .map(|f| self.face_normal(f));
             let co = self.offset_in_plane(e, no, true);
             let existing = self.edges[e].leftv;
-            let left = self.add_or_update_bound(construct, &mut ring, existing, co);
+            let left = self.add_or_update_bound(construct, &mut ring, existing, co)?;
             if construct {
                 self.bounds[left].efirst = Some(e);
                 self.bounds[left].elast = Some(e);
@@ -1985,7 +2000,7 @@ impl Front {
                 .map(|f| self.face_normal(f));
             let co = self.offset_in_plane(e, no, false);
             let existing = self.edges[e].rightv;
-            let right = self.add_or_update_bound(construct, &mut ring, existing, co);
+            let right = self.add_or_update_bound(construct, &mut ring, existing, co)?;
             if construct {
                 self.bounds[right].efirst = Some(e);
                 self.bounds[right].elast = Some(e);
@@ -1994,7 +2009,7 @@ impl Front {
             let next = self.edges[e].next;
             let co = self.slide_dist(next, self.edges[e].offset_l);
             let existing = self.edges[next].leftv;
-            let far = self.add_or_update_bound(construct, &mut ring, existing, co);
+            let far = self.add_or_update_bound(construct, &mut ring, existing, co)?;
             if construct {
                 self.bounds[far].efirst = Some(next);
                 self.bounds[far].elast = Some(next);
@@ -2010,10 +2025,10 @@ impl Front {
             let co = if leg_slide {
                 self.slide_dist(prev, self.edges[e].offset_l)
             } else {
-                self.offset_meet(prev, e, vertex, self.edges[e].fprev, false, None)
+                self.offset_meet(prev, e, vertex, self.edges[e].fprev, false, None)?
             };
             let existing = self.edges[e].leftv;
-            let left = self.add_or_update_bound(construct, &mut ring, existing, co);
+            let left = self.add_or_update_bound(construct, &mut ring, existing, co)?;
             if construct {
                 self.bounds[left].efirst = Some(prev);
                 self.bounds[left].elast = Some(e);
@@ -2027,10 +2042,10 @@ impl Front {
             let co = if leg_slide {
                 self.slide_dist(e, self.edges[beveled].offset_r)
             } else {
-                self.offset_meet(beveled, e, vertex, self.edges[e].fprev, false, None)
+                self.offset_meet(beveled, e, vertex, self.edges[e].fprev, false, None)?
             };
             let existing = self.edges[e].leftv;
-            let second = self.add_or_update_bound(construct, &mut ring, existing, co);
+            let second = self.add_or_update_bound(construct, &mut ring, existing, co)?;
             if construct {
                 self.bounds[second].efirst = Some(beveled);
                 self.bounds[second].elast = Some(e);
@@ -2046,7 +2061,7 @@ impl Front {
             while self.edges[e].next != efirst {
                 let co = self.slide_dist(e, d);
                 let existing = self.edges[e].leftv;
-                let id = self.add_or_update_bound(construct, &mut ring, existing, co);
+                let id = self.add_or_update_bound(construct, &mut ring, existing, co)?;
                 if construct {
                     self.bounds[id].efirst = Some(e);
                     self.bounds[id].elast = Some(e);
@@ -2063,9 +2078,9 @@ impl Front {
             let bndv = if construct {
                 ring[0]
             } else {
-                self.bev(vertex).ring[0]
+                self.bev(vertex)?.ring[0]
             };
-            self.set_profile_params(vertex, bndv);
+            self.set_profile_params(vertex, bndv)?;
             self.move_profile_plane(bndv, self.point(vertex));
         }
         if construct {
@@ -2074,12 +2089,14 @@ impl Front {
             } else if ring.len() == 3 {
                 let mut use_tri_fan = true;
                 if self.p.custom.is_some() {
-                    let left = self.bounds[self.edges[efirst].leftv.expect("leftv")]
-                        .profile
-                        .clone();
-                    let right_next = self.bounds
-                        [self.bounds[self.edges[efirst].rightv.expect("rightv")].next]
-                        .co;
+                    let left_id = self.edges[efirst]
+                        .leftv
+                        .ok_or_else(|| internal_invariant("leftv"))?;
+                    let left = self.bounds[left_id].profile.clone();
+                    let right_id = self.edges[efirst]
+                        .rightv
+                        .ok_or_else(|| internal_invariant("rightv"))?;
+                    let right_next = self.bounds[self.bounds[right_id].next].co;
                     if dist_squared_to_plane(right_next, left.plane_co, left.plane_no) < EPSILON_BIG
                     {
                         use_tri_fan = false;
@@ -2093,14 +2110,17 @@ impl Front {
             } else {
                 MeshKind::Poly
             };
-            self.store_ring(vertex, ring, mesh_kind);
+            self.store_ring(vertex, ring, mesh_kind)?;
         }
+        Ok(())
     }
 
     /// Blender's `adjust_miter_coords`: moves the outer miter's boundary points onto the lines
     /// through the miter edge, offset by the miter distance.
-    fn adjust_miter_coords(&mut self, vertex: usize, emiter: usize) {
-        let v1 = self.edges[emiter].rightv.expect("miter right vertex");
+    fn adjust_miter_coords(&mut self, vertex: usize, emiter: usize) -> Result<()> {
+        let v1 = self.edges[emiter]
+            .rightv
+            .ok_or_else(|| internal_invariant("miter right vertex"))?;
         let v3 = if self.p.miter_outer == MiterKind::Patch {
             let v2 = self.bounds[v1].next;
             self.bounds[v2].next
@@ -2121,17 +2141,20 @@ impl Front {
         let co1 = isect_line_plane(co2, line_p, self.bounds[v1prev].co, edge_dir).unwrap_or(line_p);
         self.bounds[v1].co = co1;
         // Blender leaves co3 unset if the plane intersection fails; line_p is the defined fallback.
-        let emiter_other = self.bounds[v3].elast.expect("miter other edge");
+        let emiter_other = self.bounds[v3]
+            .elast
+            .ok_or_else(|| internal_invariant("miter other edge"))?;
         let edge_dir = f32_normalize(f32_sub(v, self.point(self.edges[emiter_other].other)));
         let line_p = f32_add(co2, f32_mul(edge_dir, d));
         let co3 = isect_line_plane(co2, line_p, self.bounds[v3next].co, edge_dir).unwrap_or(line_p);
         self.bounds[v3].co = co3;
+        Ok(())
     }
 
     /// Blender's `adjust_miter_inner_coords`: moves the inner miter's arc boundary points along
     /// their edges by `spread`.
-    fn adjust_miter_inner_coords(&mut self, vertex: usize, emiter: Option<usize>) {
-        let ring = self.bev(vertex).ring.clone();
+    fn adjust_miter_inner_coords(&mut self, vertex: usize, emiter: Option<usize>) -> Result<()> {
+        let ring = self.bev(vertex)?.ring.clone();
         let start = ring[0];
         let v_point = self.point(vertex);
         let mut v = start;
@@ -2156,11 +2179,12 @@ impl Front {
                 break;
             }
         }
+        Ok(())
     }
 
     /// Blender's `set_profile_params`: the profile of boundary vertex `bndv`, from its beveled edge
     /// (if it has one) or from the vertex.
-    fn set_profile_params(&mut self, vertex: usize, bndv: usize) {
+    fn set_profile_params(&mut self, vertex: usize, bndv: usize) -> Result<()> {
         let mut do_linear_interp = true;
         let edge = self.bounds[bndv].ebev;
         let start = self.bounds[bndv].co;
@@ -2184,7 +2208,7 @@ impl Front {
                 let next_edge = self.edges[e].next;
                 if self.edges[prev_edge].is_bev
                     && self.edges[next_edge].is_bev
-                    && self.bev(vertex).selcount >= 3
+                    && self.bev(vertex)?.selcount >= 3
                 {
                     let (prev_a, prev_b) = self.geo.edge_order[self.edges[prev_edge].edge_id];
                     let (next_a, next_b) = self.geo.edge_order[self.edges[next_edge].edge_id];
@@ -2244,6 +2268,7 @@ impl Front {
             pro.proj_dir = DVec3::ZERO;
         }
         self.bounds[bndv].profile = pro;
+        Ok(())
     }
 
     /// Blender's `move_profile_plane`: moves a terminal boundary vertex's profile plane to the
@@ -2276,11 +2301,11 @@ impl Front {
     }
 
     /// Blender's `calculate_vm_profiles`: the profile of every boundary vertex of `vertex`.
-    fn calculate_vm_profiles(&mut self, vertex: usize) {
-        let ring = self.bev(vertex).ring.clone();
+    fn calculate_vm_profiles(&mut self, vertex: usize) -> Result<()> {
+        let ring = self.bev(vertex)?.ring.clone();
         for bndv in ring {
             if !self.bounds[bndv].profile.special_params {
-                self.set_profile_params(vertex, bndv);
+                self.set_profile_params(vertex, bndv)?;
             }
             let mut miter_profile = false;
             let mut reverse_profile = false;
@@ -2290,6 +2315,7 @@ impl Front {
             }
             self.calculate_profile(bndv, reverse_profile, miter_profile);
         }
+        Ok(())
     }
 
     /// Blender's `calculate_profile`: the profile points of one boundary vertex, for `seg` and
@@ -2306,11 +2332,11 @@ impl Front {
         } else {
             unit_square_map(pro.start, pro.middle, pro.end)
         };
-        if self.p.vmesh_method == VmeshMethod::Cutoff {
-            if let Some([c0, c1, _]) = map {
-                // The profile's height is the distance between its two unit-square corners.
-                pro.height = (c0 + c1).length();
-            }
+        if self.p.vmesh_method == VmeshMethod::Cutoff
+            && let Some([c0, c1, _]) = map
+        {
+            // The profile's height is the distance between its two unit-square corners.
+            pro.height = (c0 + c1).length();
         }
         let spacing = if miter {
             self.pro_spacing_miter.as_ref().unwrap_or(&self.pro_spacing)
@@ -2415,7 +2441,7 @@ impl Front {
         let th1 = angle3(self.point(va), self.point(vb), self.point(vc));
         let th2 = angle3(self.point(vb), self.point(vc), self.point(vd));
         let (sin1, sin2, cos1, cos2) = (f32_sin(th1), f32_sin(th2), f32_cos(th1), f32_cos(th2));
-        let safe_divide = |a: f64, b: f64| if b != 0.0 { f32_div(a, b) } else { 0.0 };
+        let safe_divide = |a: f64, b: f64| if b == 0.0 { 0.0 } else { f32_div(a, b) };
         let projected = f32_add_scalar(
             safe_divide(f32_add_scalar(ka, f32_mul_scalar(cos1, kb)), sin1),
             safe_divide(f32_add_scalar(kc, f32_mul_scalar(cos2, kb)), sin2),
@@ -2433,23 +2459,23 @@ impl Front {
                 return limit;
             };
             let face_vertices = &self.geo.polygons[face].0;
-            if ka == 0.0 {
-                if let Some(i) = loop_index(face_vertices, vb, va) {
-                    let a_side = slide_side(self, face_vertices, i, th1, true);
-                    limit = limit.min(f32_mul_scalar(a_side, kb));
-                }
+            if ka == 0.0
+                && let Some(i) = loop_index(face_vertices, vb, va)
+            {
+                let a_side = slide_side(self, face_vertices, i, th1, true);
+                limit = limit.min(f32_mul_scalar(a_side, kb));
             }
-            if kc == 0.0 {
-                if let Some(i) = loop_index(face_vertices, vb, vc) {
-                    let c_side = slide_side(
-                        self,
-                        face_vertices,
-                        (i + 1) % face_vertices.len(),
-                        th2,
-                        false,
-                    );
-                    limit = limit.min(f32_mul_scalar(c_side, kb));
-                }
+            if kc == 0.0
+                && let Some(i) = loop_index(face_vertices, vb, vc)
+            {
+                let c_side = slide_side(
+                    self,
+                    face_vertices,
+                    (i + 1) % face_vertices.len(),
+                    th2,
+                    false,
+                );
+                limit = limit.min(f32_mul_scalar(c_side, kb));
             }
         }
         limit
@@ -2474,10 +2500,10 @@ impl Front {
     }
 
     /// Blender's `bevel_limit_offset`: clamps the offset to avoid collisions and scales all specs.
-    fn limit_offset(&mut self, vertices: &[usize]) {
+    fn limit_offset(&mut self, vertices: &[usize]) -> Result<()> {
         let mut limited = self.p.offset;
         for vertex in vertices {
-            for id in self.bev(*vertex).edges.clone() {
+            for id in self.bev(*vertex)?.edges.clone() {
                 let collision = if self.p.affect_vertices {
                     self.vertex_collide_offset(id)
                 } else {
@@ -2489,7 +2515,7 @@ impl Front {
         if limited < self.p.offset {
             let factor = f32_div(limited, self.p.offset);
             for vertex in vertices {
-                for id in self.bev(*vertex).edges.clone() {
+                for id in self.bev(*vertex)?.edges.clone() {
                     let e = &mut self.edges[id];
                     e.offset_l_spec = f32_mul_scalar(e.offset_l_spec, factor);
                     e.offset_r_spec = f32_mul_scalar(e.offset_r_spec, factor);
@@ -2499,24 +2525,26 @@ impl Front {
             }
             self.p.offset = limited;
         }
+        Ok(())
     }
 
     /// Rebuilds every boundary from the current widths.
-    fn build_all(&mut self, vertices: &[usize], construct: bool) {
+    fn build_all(&mut self, vertices: &[usize], construct: bool) -> Result<()> {
         for vertex in vertices {
-            self.build_boundary(*vertex, construct);
+            self.build_boundary(*vertex, construct)?;
         }
+        Ok(())
     }
 
     /// Blender's `adjust_offsets`: groups the boundary vertices that depend on one another into
     /// chains and cycles, and solves each for widths that match their specs as closely as possible.
-    fn adjust_offsets(&mut self, vertices: &[usize]) {
+    fn adjust_offsets(&mut self, vertices: &[usize]) -> Result<()> {
         for vertex in vertices {
-            let start = self.bev(*vertex).ring[0];
+            let start = self.bev(*vertex)?.ring[0];
             let mut anchor = start;
             loop {
                 if !self.bounds[anchor].visited && self.bounds[anchor].eon.is_some() {
-                    self.adjust_chain_from(anchor);
+                    self.adjust_chain_from(anchor)?;
                 }
                 anchor = self.bounds[anchor].next;
                 if anchor == start {
@@ -2524,11 +2552,12 @@ impl Front {
                 }
             }
         }
-        self.build_all(vertices, false);
+        self.build_all(vertices, false)?;
+        Ok(())
     }
 
     /// One anchor's step of `adjust_offsets`: find the chain or cycle through `anchor` and solve it.
-    fn adjust_chain_from(&mut self, anchor: usize) {
+    fn adjust_chain_from(&mut self, anchor: usize) -> Result<()> {
         let mut v = anchor;
         let mut vchainstart = anchor;
         let mut vchainend = anchor;
@@ -2553,13 +2582,13 @@ impl Front {
                 if vnext != vchainstart {
                     break;
                 }
-                self.adjust_cycle_or_chain(vchainstart, true);
+                self.adjust_cycle_or_chain(vchainstart, true)?;
                 iscycle = true;
             }
             v = vnext;
         }
         if iscycle {
-            return;
+            return Ok(());
         }
         // Then right to left, moving the chain start at each step.
         self.bounds[v].adjchain = None;
@@ -2587,13 +2616,14 @@ impl Front {
             && self.bounds[vchainstart].eon.is_none()
             && self.bounds[vchainend].eon.is_none()
         {
-            self.adjust_cycle_or_chain(vchainstart, false);
+            self.adjust_cycle_or_chain(vchainstart, false)?;
         }
+        Ok(())
     }
 
     /// Blender's `adjust_the_cycle_or_chain`: least-squares widths for one chain or cycle of
     /// boundary vertices linked through `adjchain`.
-    fn adjust_cycle_or_chain(&mut self, vstart: usize, iscycle: bool) {
+    fn adjust_cycle_or_chain(&mut self, vstart: usize, iscycle: bool) -> Result<()> {
         let mut chain = Vec::new();
         let mut current = Some(vstart);
         while let Some(id) = current {
@@ -2609,9 +2639,15 @@ impl Front {
         let weight = MATCH_SPEC_WEIGHT;
         for (i, &v) in chain.iter().enumerate() {
             if iscycle || i < np - 1 {
-                let link = self.bounds[v].adjchain.expect("chain link");
-                let eright = self.bounds[v].efirst.expect("chain efirst");
-                let enextleft = self.bounds[link].elast.expect("chain elast");
+                let link = self.bounds[v]
+                    .adjchain
+                    .ok_or_else(|| internal_invariant("chain link"))?;
+                let eright = self.bounds[v]
+                    .efirst
+                    .ok_or_else(|| internal_invariant("chain efirst"))?;
+                let enextleft = self.bounds[link]
+                    .elast
+                    .ok_or_else(|| internal_invariant("chain elast"))?;
                 let sinratio = self.bounds[v].sinratio;
                 // Residue i: width difference between eright and the next vertex's eleft.
                 rows[i].0.push((i, 1.0));
@@ -2640,22 +2676,29 @@ impl Front {
         for (i, &v) in chain.iter().enumerate() {
             let val = solution[i];
             if iscycle || i < np - 1 {
-                let eright = self.bounds[v].efirst.expect("chain efirst");
-                let eleft = self.bounds[v].elast.expect("chain elast");
+                let eright = self.bounds[v]
+                    .efirst
+                    .ok_or_else(|| internal_invariant("chain efirst"))?;
+                let eleft = self.bounds[v]
+                    .elast
+                    .ok_or_else(|| internal_invariant("chain elast"))?;
                 self.edges[eright].offset_r = f64::from(val as f32);
                 if iscycle || i > 0 {
                     self.edges[eleft].offset_l = f64::from((self.bounds[v].sinratio * val) as f32);
                 }
             } else {
-                let eleft = self.bounds[v].elast.expect("chain elast");
+                let eleft = self.bounds[v]
+                    .elast
+                    .ok_or_else(|| internal_invariant("chain elast"))?;
                 self.edges[eleft].offset_l = f64::from(val as f32);
             }
         }
+        Ok(())
     }
 
     /// Blender's `regularize_profile_orientation` over every beveled edge, in mesh edge order:
     /// marks which boundary vertex of each custom profile is its start, consistently along chains.
-    fn regularize_profiles(&mut self) {
+    fn regularize_profiles(&mut self) -> Result<()> {
         for index in 0..self.geo.edge_order.len() {
             let (a, b) = self.geo.edge_order[index];
             let Some(start) = self.find_edge_half(a, edge_key(a, b)) else {
@@ -2665,20 +2708,26 @@ impl Front {
                 continue;
             }
             // Start from the boundary vertex highest on Z: any consistent rule works.
-            let left = self.edges[start].leftv.expect("leftv");
-            let right = self.edges[start].rightv.expect("rightv");
+            let left = self.edges[start]
+                .leftv
+                .ok_or_else(|| internal_invariant("leftv"))?;
+            let right = self.edges[start]
+                .rightv
+                .ok_or_else(|| internal_invariant("rightv"))?;
             let right_highest = self.bounds[left].co.z < self.bounds[right].co.z;
             self.bounds[left].is_profile_start = right_highest;
             self.edges[start].visited_rpo = true;
             for direction in 0..2 {
                 let mut toward_bv = direction == 0;
                 let mut bv = a;
-                let mut current = self.next_edgehalf_bev(start, toward_bv, &mut bv);
+                let mut current = self.next_edgehalf_bev(start, toward_bv, &mut bv)?;
                 while let Some(edge) = current {
                     if self.edges[edge].visited_rpo {
                         break;
                     }
-                    let leftv = self.edges[edge].leftv.expect("leftv");
+                    let leftv = self.edges[edge]
+                        .leftv
+                        .ok_or_else(|| internal_invariant("leftv"))?;
                     self.bounds[leftv].is_profile_start = if direction == 0 {
                         toward_bv ^ right_highest
                     } else {
@@ -2686,30 +2735,38 @@ impl Front {
                     };
                     toward_bv = !toward_bv;
                     self.edges[edge].visited_rpo = true;
-                    current = self.next_edgehalf_bev(edge, toward_bv, &mut bv);
+                    current = self.next_edgehalf_bev(edge, toward_bv, &mut bv)?;
                 }
             }
         }
+        Ok(())
     }
 
     /// Blender's `next_edgehalf_bev`: the next beveled edge half along a chain or cycle. Stepping
     /// `toward_bv` stays at the same vertex and moves to the most parallel beveled edge.
-    fn next_edgehalf_bev(&self, start: usize, toward_bv: bool, bv: &mut usize) -> Option<usize> {
+    fn next_edgehalf_bev(
+        &self,
+        start: usize,
+        toward_bv: bool,
+        bv: &mut usize,
+    ) -> Result<Option<usize>> {
         if !toward_bv {
-            let (half, vertex) = self.find_other_end(start)?;
+            let Some((half, vertex)) = self.find_other_end(start) else {
+                return Ok(None);
+            };
             *bv = vertex;
-            return Some(half);
+            return Ok(Some(half));
         }
-        let selcount = self.bev(*bv).selcount;
+        let selcount = self.bev(*bv)?.selcount;
         if selcount == 1 {
-            return None;
+            return Ok(None);
         }
         if selcount == 2 {
             let mut new_edge = self.edges[start].next;
             while !self.edges[new_edge].is_bev {
                 new_edge = self.edges[new_edge].next;
             }
-            return Some(new_edge);
+            return Ok(Some(new_edge));
         }
         let vertex = *bv;
         let v = self.point(vertex);
@@ -2736,9 +2793,9 @@ impl Front {
         }
         let small_ang_dot = f64::from(1.0_f32 - (SMALL_ANG as f32).cos());
         if next_edge.is_some() && f32_sub_scalar(best_dot, second_best_dot).abs() < small_ang_dot {
-            return None;
+            return Ok(None);
         }
-        next_edge
+        Ok(next_edge)
     }
 }
 
@@ -2833,11 +2890,11 @@ fn profile_points(
                 let factor = f32_div(k as f64, ns as f64);
                 f32_add(pro.start, f32_mul(f32_sub(pro.end, pro.start), factor))
             };
-            if pro.proj_dir != DVec3::ZERO {
+            if pro.proj_dir == DVec3::ZERO {
+                co
+            } else {
                 let co2 = f32_add(co, pro.proj_dir);
                 isect_line_plane(co, co2, pro.plane_co, pro.plane_no).unwrap_or(co)
-            } else {
-                co
             }
         })
         .collect()
@@ -2864,19 +2921,21 @@ fn solve_least_squares(n: usize, rows: &[(Vec<(usize, f64)>, f64)]) -> Vec<f64> 
         if divisor.abs() < 1.0e-300 {
             continue;
         }
-        for row in 0..n {
+        // Row `pivot` is read while the other rows change, so it is taken out for the loop.
+        let pivot_row = std::mem::take(&mut normal[pivot]);
+        for (row, target_row) in normal.iter_mut().enumerate() {
             if row == pivot {
                 continue;
             }
-            let factor = normal[row][pivot] / divisor;
+            let factor = target_row[pivot] / divisor;
             if factor == 0.0 {
                 continue;
             }
-            for column in pivot..=n {
-                let value = normal[pivot][column];
-                normal[row][column] -= factor * value;
+            for (target, value) in target_row[pivot..=n].iter_mut().zip(&pivot_row[pivot..=n]) {
+                *target -= factor * value;
             }
         }
+        normal[pivot] = pivot_row;
     }
     (0..n)
         .map(|i| {
@@ -2898,10 +2957,10 @@ fn safe_acos_approx(value: f32) -> f32 {
         1.0
     };
     let angle = (1.0 - magnitude).sqrt()
-        * (1.570_796_326_7_f32
+        * (std::f32::consts::FRAC_PI_2
             + magnitude
-                * (-0.213_300_989_f32
-                    + magnitude * (0.077_980_478_f32 + magnitude * -0.021_640_95_f32)));
+                * (-0.213_300_99_f32
+                    + magnitude * (0.077_980_48_f32 + magnitude * -0.021_640_95_f32)));
     if value < 0.0 {
         std::f32::consts::PI - angle
     } else {

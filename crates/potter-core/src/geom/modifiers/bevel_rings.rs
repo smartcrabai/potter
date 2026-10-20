@@ -10,13 +10,16 @@ use std::collections::HashSet;
 use glam::DVec3;
 
 use super::Polygon;
-use super::bevel_boundary::{EdgeHalf, Front, MeshKind, PRO_SQUARE_IN_R, PRO_SQUARE_R};
+use super::bevel_boundary::{
+    EdgeHalf, Front, MeshKind, PRO_LINE_R, PRO_SQUARE_IN_R, PRO_SQUARE_R, internal_invariant,
+};
 use super::bevel_shading::Kind;
 use super::bevel_vmesh::{
-    Emission, PRO_LINE_R, Profile, ProfileSpacing, VMesh, bounds_center, closest_on_segment,
-    cube_corner_vmesh, general_vmesh, pipe_adj_vmesh, point_strictly_inside, profile_fullness,
-    project_to_face, square_out_adj_vmesh, two_edge_vertex_samples, weld_profile_samples,
+    Emission, Profile, ProfileSpacing, VMesh, bounds_center, closest_on_segment, cube_corner_vmesh,
+    general_vmesh, pipe_adj_vmesh, point_strictly_inside, profile_fullness, project_to_face,
+    square_out_adj_vmesh, two_edge_vertex_samples, weld_profile_samples,
 };
+use crate::error::Result;
 use crate::geom::edge_key;
 
 /// Blender's `BEVEL_EPSILON`.
@@ -113,10 +116,8 @@ fn boundvert_rep_face(front: &Front, b: usize) -> Option<usize> {
         return last.and_then(|last| last.fprev);
     }
     let prev = &front.bounds[bound.prev];
+    prev.elast?;
     let prev_elast = prev.elast.and_then(|id| edges[id].fnext);
-    if prev.elast.is_none() {
-        return None;
-    }
     prev_elast.or_else(|| {
         front.bounds[bound.next]
             .efirst
@@ -156,7 +157,7 @@ fn choose_rep_face(
         ];
     }
     let mut best: Option<usize> = None;
-    for value_index in 0..5 {
+    for value_index in [0_usize, 1, 2, 3, 4] {
         if num_viable <= 1 {
             break;
         }
@@ -250,10 +251,6 @@ fn snap_edge_for_center(
 /// Blender's `snap_edges_for_vmesh_vert`: the edges (`b1`, `b2`, `b3` are the seam edges before,
 /// at, and after boundary vertex `i`) that the four corners of quad `(i, j, k)` snap to, for odd
 /// segment counts.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "mirrors Blender's snap_edges_for_vmesh_vert parameter list"
-)]
 fn snap_edges_for_vmesh_vert(
     i: usize,
     j: usize,
@@ -300,21 +297,22 @@ impl<'a> Builder<'a> {
     /// Blender's `bevel_vert_two_edges`: a vertex bevel with two boundary vertices has no vertex
     /// polygon; its profile is the only topology, and without faces at the vertex that profile chain
     /// is made of wire edges.
-    fn emit_two_edge(&mut self, vertex: usize) {
+    fn emit_two_edge(&mut self, vertex: usize) -> Result<()> {
         if !self.front.p.affect_vertices || self.vertex_has_face[vertex] {
-            return;
+            return Ok(());
         }
         let seg = self.front.p.seg;
         let mut previous = self
-            .id(vertex, 0, 0, 0)
-            .expect("two-edge profile start defined");
+            .id(vertex, 0, 0, 0)?
+            .ok_or_else(|| internal_invariant("two-edge profile start defined"))?;
         for k in 1..=seg {
             let current = self
-                .id(vertex, 0, 0, k)
-                .expect("two-edge profile point defined");
+                .id(vertex, 0, 0, k)?
+                .ok_or_else(|| internal_invariant("two-edge profile point defined"))?;
             self.loose.push([previous, current]);
             previous = current;
         }
+        Ok(())
     }
 
     fn new(
@@ -369,35 +367,42 @@ impl<'a> Builder<'a> {
         }
     }
 
-    fn bev(&self, vertex: usize) -> &super::bevel_boundary::BevVert {
-        self.front.verts[vertex].as_ref().expect("beveled vertex")
+    fn bev(&self, vertex: usize) -> Result<&super::bevel_boundary::BevVert> {
+        self.front.verts[vertex]
+            .as_ref()
+            .ok_or_else(|| internal_invariant("beveled vertex"))
     }
 
-    fn grid(&self, vertex: usize) -> &Grid {
-        self.grids[vertex].as_ref().expect("vertex mesh built")
+    fn grid(&self, vertex: usize) -> Result<&Grid> {
+        self.grids[vertex]
+            .as_ref()
+            .ok_or_else(|| internal_invariant("vertex mesh built"))
     }
 
-    fn grid_mut(&mut self, vertex: usize) -> &mut Grid {
-        self.grids[vertex].as_mut().expect("vertex mesh built")
+    fn grid_mut(&mut self, vertex: usize) -> Result<&mut Grid> {
+        self.grids[vertex]
+            .as_mut()
+            .ok_or_else(|| internal_invariant("vertex mesh built"))
     }
 
     /// The output point of grid position `(i, j, k)` of `vertex`, created on first use.
-    fn id(&mut self, vertex: usize, i: usize, j: usize, k: usize) -> Option<usize> {
-        let index = self.grid(vertex).slot(i, j, k)?;
-        if let Some(id) = self.grid(vertex).ids[index] {
-            return Some(id);
+    fn id(&mut self, vertex: usize, i: usize, j: usize, k: usize) -> Result<Option<usize>> {
+        let Some(index) = self.grid(vertex)?.slot(i, j, k) else {
+            return Ok(None);
+        };
+        if let Some(id) = self.grid(vertex)?.ids[index] {
+            return Ok(Some(id));
         }
-        let co = self.grid(vertex).vm.co[index];
+        let co = self.grid(vertex)?.vm.co[index];
         let id = self.emission.push_point(co, vertex);
-        self.grid_mut(vertex).ids[index] = Some(id);
-        Some(id)
+        self.grid_mut(vertex)?.ids[index] = Some(id);
+        Ok(Some(id))
     }
 
     /// The coordinates of a defined grid position.
-    fn grid_point(&self, vertex: usize, i: usize, j: usize, k: usize) -> Option<DVec3> {
-        let grid = self.grid(vertex);
-        let index = grid.slot(i, j, k)?;
-        Some(grid.vm.co[index])
+    fn grid_point(&self, vertex: usize, i: usize, j: usize, k: usize) -> Result<Option<DVec3>> {
+        let grid = self.grid(vertex)?;
+        Ok(grid.slot(i, j, k).map(|index| grid.vm.co[index]))
     }
 
     /// The boundary position `i` of a boundary vertex in its vertex's ring.
@@ -425,9 +430,9 @@ impl<'a> Builder<'a> {
     }
 
     /// The face used when a corner has no representative face: the first face at the vertex.
-    fn fallback_face(&self, vertex: usize) -> usize {
-        let e = &self.front.edges[self.bev(vertex).edges[0]];
-        e.fprev.or(e.fnext).unwrap_or(0)
+    fn fallback_face(&self, vertex: usize) -> Result<usize> {
+        let e = &self.front.edges[self.bev(vertex)?.edges[0]];
+        Ok(e.fprev.or(e.fnext).unwrap_or(0))
     }
 
     fn emit_polygon(
@@ -449,20 +454,20 @@ impl<'a> Builder<'a> {
     }
 
     /// Blender's `build_vmesh` before its kind dispatch: the vertex mesh of `vertex`.
-    fn build_grid(&mut self, vertex: usize) {
+    fn build_grid(&mut self, vertex: usize) -> Result<()> {
         let (count, selcount, front_kind) = {
-            let bev = self.bev(vertex);
+            let bev = self.bev(vertex)?;
             (bev.ring.len(), bev.selcount, bev.mesh_kind)
         };
         let weld = selcount == 2 && count == 2;
         if weld {
-            let grid = self.profile_grid(vertex, true);
+            let grid = self.profile_grid(vertex, true)?;
             self.grids[vertex] = Some(grid);
             self.mesh_kinds[vertex] = Some(MeshKind::None);
-            return;
+            return Ok(());
         }
 
-        let pipe = self.pipe_test(vertex);
+        let pipe = self.pipe_test(vertex)?;
         let kind = if pipe.is_some() {
             MeshKind::Adj
         } else {
@@ -470,23 +475,23 @@ impl<'a> Builder<'a> {
         };
         self.mesh_kinds[vertex] = Some(kind);
         if kind != MeshKind::Adj {
-            let grid = self.profile_grid(vertex, false);
+            let grid = self.profile_grid(vertex, false)?;
             self.grids[vertex] = Some(grid);
-            return;
+            return Ok(());
         }
 
         let square_out = self.front.p.pro_super_r == PRO_SQUARE_R
             && selcount >= 3
-            && self.front.p.seg % 2 == 0
+            && self.front.p.seg.is_multiple_of(2)
             && self.front.p.custom.is_none();
         let square_in = pipe.is_none()
             && self.front.p.pro_super_r == PRO_SQUARE_IN_R
-            && self.tri_corner_test(vertex) == 1
+            && self.tri_corner_test(vertex)? == 1
             && self.front.p.custom.is_none();
         let vm = if square_out {
-            square_out_adj_vmesh(self.front, vertex)
+            square_out_adj_vmesh(self.front, vertex)?
         } else if square_in {
-            let ring = &self.bev(vertex).ring;
+            let ring = &self.bev(vertex)?.ring;
             let spacing = ProfileSpacing::new(self.front.p.seg, self.front.p.pro_super_r);
             cube_corner_vmesh(
                 &spacing,
@@ -498,9 +503,9 @@ impl<'a> Builder<'a> {
                 self.points[vertex],
             )
         } else {
-            let vm = self.adj_vmesh(vertex);
+            let vm = self.adj_vmesh(vertex)?;
             if let Some(vpipe) = pipe {
-                pipe_adj_vmesh(vm, self.front, vertex, vpipe)
+                pipe_adj_vmesh(vm, self.front, vertex, vpipe)?
             } else {
                 vm
             }
@@ -508,18 +513,19 @@ impl<'a> Builder<'a> {
         let mut grid = Grid::new(vm, !square_in);
         if square_in {
             self.square_in[vertex] = true;
-            self.share_square_in_cells(vertex, &mut grid);
+            self.share_square_in_cells(vertex, &mut grid)?;
         }
         self.grids[vertex] = Some(grid);
+        Ok(())
     }
 
     /// Blender's `pipe_test`: identifies a straight beveled three-edge sequence whose incident
     /// face normals are perpendicular to the pipe direction.
-    fn pipe_test(&self, vertex: usize) -> Option<usize> {
-        let bev = self.bev(vertex);
+    fn pipe_test(&self, vertex: usize) -> Result<Option<usize>> {
+        let bev = self.bev(vertex)?;
         let count = bev.ring.len();
         if !(3..=4).contains(&count) || !(3..=4).contains(&bev.selcount) || self.front.p.seg <= 1 {
-            return None;
+            return Ok(None);
         }
         let point = self.points[vertex].as_vec3();
         for index in 0..count {
@@ -556,15 +562,15 @@ impl<'a> Builder<'a> {
             }) {
                 continue;
             }
-            return Some(bev.ring[index]);
+            return Ok(Some(bev.ring[index]));
         }
-        None
+        Ok(None)
     }
 
     /// Blender's `build_square_in_vmesh`: only profile cells remain, with the inward-square
     /// boundary sharing pattern and, for odd segment counts, the center polygon cells.
-    fn share_square_in_cells(&self, vertex: usize, grid: &mut Grid) {
-        let count = self.bev(vertex).ring.len();
+    fn share_square_in_cells(&self, vertex: usize, grid: &mut Grid) -> Result<()> {
+        let count = self.bev(vertex)?.ring.len();
         let seg = self.front.p.seg;
         let half = seg / 2;
         for i in 0..count {
@@ -592,12 +598,13 @@ impl<'a> Builder<'a> {
                 grid.representative[center] = grid.representative[profile];
             }
         }
+        Ok(())
     }
 
     /// The boundary and profile points of `vertex`'s ring, as Blender's `build_vmesh` lays them out
     /// before the kind-specific mesh is built.
-    fn profile_grid(&self, vertex: usize, weld: bool) -> Grid {
-        let ring = &self.bev(vertex).ring;
+    fn profile_grid(&self, vertex: usize, weld: bool) -> Result<Grid> {
+        let ring = &self.bev(vertex)?.ring;
         let count = ring.len();
         let seg = self.front.p.seg;
         let mut vm = VMesh::new(count, seg);
@@ -636,13 +643,16 @@ impl<'a> Builder<'a> {
             // Blender's two-edge vertex bevel recalculates one projection-free profile between the
             // boundary points and mirrors its samples onto the second boundary.
             let profile = two_edge_vertex_samples(self.front, vertex)
-                .expect("two-edge vertex profile is available");
+                .ok_or_else(|| internal_invariant("two-edge vertex profile is available"))?;
             for k in 1..seg {
+                let sample = *profile
+                    .get(k)
+                    .ok_or_else(|| internal_invariant("two-edge vertex profile sample defined"))?;
                 let index = vm.index(0, 0, k);
-                vm.co[index] = profile[k];
+                vm.co[index] = sample;
                 defined[index] = true;
                 let mirror = vm.index(1, 0, seg - k);
-                vm.co[mirror] = profile[k];
+                vm.co[mirror] = sample;
                 defined[mirror] = true;
                 copies.push((mirror, index));
             }
@@ -655,7 +665,7 @@ impl<'a> Builder<'a> {
         if weld && !self.front.p.affect_vertices {
             self.share_weld_profiles(vertex, &mut grid);
         }
-        grid
+        Ok(grid)
     }
 
     /// Blender's two-boundary weld uses one profile chain at both ends of the shared boundary.
@@ -689,28 +699,28 @@ impl<'a> Builder<'a> {
 
     /// Blender's `adj_vmesh`: the three-edge tri-corner mesh when `tri_corner_test` allows it,
     /// otherwise the general ADJ mesh subdivided from its boundary profiles.
-    fn adj_vmesh(&self, vertex: usize) -> VMesh {
+    fn adj_vmesh(&self, vertex: usize) -> Result<VMesh> {
         let seg = self.front.p.seg;
         let bounds: Vec<DVec3> = self
-            .bev(vertex)
+            .bev(vertex)?
             .ring
             .iter()
             .map(|id| self.front.bounds[*id].co)
             .collect();
         if bounds.len() == 3
-            && self.tri_corner_test(vertex) != -1
+            && self.tri_corner_test(vertex)? != -1
             && self.front.p.pro_super_r != PRO_SQUARE_IN_R
         {
             let spacing = ProfileSpacing::new(seg, self.front.p.pro_super_r);
-            return cube_corner_vmesh(
+            return Ok(cube_corner_vmesh(
                 &spacing,
                 [bounds[0], bounds[1], bounds[2]],
                 self.points[vertex],
-            );
+            ));
         }
         let seg_2 = self.front.pro_spacing.seg_2;
         let profiles: Vec<Profile> = self
-            .bev(vertex)
+            .bev(vertex)?
             .ring
             .iter()
             .map(|id| Profile::from_bound(&self.front.bounds[*id].profile, seg, seg_2))
@@ -728,13 +738,13 @@ impl<'a> Builder<'a> {
         } else {
             profile_fullness(seg, self.front.p.profile, self.front.p.pro_super_r)
         };
-        general_vmesh(
+        Ok(general_vmesh(
             seg,
             fullness,
             self.front.p.custom.is_some(),
             &profiles,
             self.points[vertex],
-        )
+        ))
     }
 
     /// Blender's `BM_edge_calc_face_angle_signed_ex`, including the convexity sign convention.
@@ -763,13 +773,13 @@ impl<'a> Builder<'a> {
     /// Blender's `tri_corner_test`: 1 when a three-edge corner is a cube corner (every edge beveled,
     /// right dihedral angles, equal offsets), 0 when the tri-corner mesh applies without that shape,
     /// and -1 when it does not apply.
-    fn tri_corner_test(&self, vertex: usize) -> i32 {
+    fn tri_corner_test(&self, vertex: usize) -> Result<i32> {
         if self.front.p.affect_vertices || self.front.p.custom.is_some() {
-            return -1;
+            return Ok(-1);
         }
-        let bev = self.bev(vertex);
+        let bev = self.bev(vertex)?;
         if bev.ring.len() != 3 {
-            return 0;
+            return Ok(0);
         }
         let offset = self.front.edges[bev.edges[0]].offset_l as f32;
         let mut in_plane_e = 0_usize;
@@ -781,32 +791,32 @@ impl<'a> Builder<'a> {
             if absang <= std::f32::consts::FRAC_PI_4 {
                 in_plane_e += 1;
             } else if absang >= 3.0_f32 * std::f32::consts::FRAC_PI_4 {
-                return -1;
+                return Ok(-1);
             }
             if edge.is_bev && (edge.offset_l as f32 - offset).abs() > EPSILON as f32 {
-                return -1;
+                return Ok(-1);
             }
             totang += ang;
         }
         if in_plane_e != bev.edges.len() - 3 {
-            return -1;
+            return Ok(-1);
         }
         let angdiff = (totang.abs() - 3.0_f32 * std::f32::consts::FRAC_PI_2).abs();
         if (self.front.p.pro_super_r == PRO_SQUARE_R && angdiff > std::f32::consts::PI / 16.0_f32)
             || angdiff > std::f32::consts::FRAC_PI_4
         {
-            return -1;
+            return Ok(-1);
         }
         if bev.edges.len() != 3 || bev.selcount != 3 {
-            return 0;
+            return Ok(0);
         }
-        1
+        Ok(1)
     }
 
     /// Blender's `frep_for_center_poly`: the face whose UVs interpolate the center of `vertex`'s
     /// vertex mesh, chosen among the representative faces of the vertex's edges.
-    fn frep_for_center_poly(&self, vertex: usize) -> Option<usize> {
-        let bev = self.bev(vertex);
+    fn frep_for_center_poly(&self, vertex: usize) -> Result<Option<usize>> {
+        let bev = self.bev(vertex)?;
         let consider_all =
             bev.selcount == 1 || (self.front.p.affect_vertices && self.front.p.seg % 2 == 1);
         let mut fchoices: Vec<usize> = Vec::new();
@@ -830,26 +840,31 @@ impl<'a> Builder<'a> {
             }
             // A face whose UV polygon would have no area cannot represent the center.
             if self.context.has_math_layers
-                && self.projected_boundary_area(vertex, face) < EPSILON_BIG
+                && self.projected_boundary_area(vertex, face)? < EPSILON_BIG
             {
                 continue;
             }
             fchoices.push(face);
         }
         if fchoices.is_empty() {
-            return any;
+            return Ok(any);
         }
         let options: Vec<Option<usize>> = fchoices.into_iter().map(Some).collect();
-        choose_rep_face(&options, self.context, self.polygons, self.points)
+        Ok(choose_rep_face(
+            &options,
+            self.context,
+            self.polygons,
+            self.points,
+        ))
     }
 
     /// Blender's `find_face_internal_boundverts`: up to three boundary vertices of `vertex` inside
     /// or on `face`, in ring order.
-    fn face_internal_boundverts(&self, vertex: usize, face: usize) -> Vec<usize> {
+    fn face_internal_boundverts(&self, vertex: usize, face: usize) -> Result<Vec<usize>> {
         let normal = self.front.geo.face_normals[face];
         let face_points = &self.polygons[face].0;
         let mut found = Vec::new();
-        for id in &self.bev(vertex).ring {
+        for id in &self.bev(vertex)?.ring {
             if point_strictly_inside(self.points, face_points, normal, self.front.bounds[*id].co) {
                 found.push(*id);
                 if found.len() == 3 {
@@ -857,20 +872,20 @@ impl<'a> Builder<'a> {
                 }
             }
         }
-        found
+        Ok(found)
     }
 
     /// Blender's `projected_boundary_area`: the area of `vertex`'s boundary seen from `face`, with
     /// each boundary point outside the face snapped to the nearer of the face's two edges there.
-    fn projected_boundary_area(&self, vertex: usize, face: usize) -> f64 {
+    fn projected_boundary_area(&self, vertex: usize, face: usize) -> Result<f64> {
         let Some((n1, n2)) = incident_neighbors(self.polygons, face, vertex) else {
-            return 0.0;
+            return Ok(0.0);
         };
         let normal = self.front.geo.face_normals[face];
-        let internal = self.face_internal_boundverts(vertex, face);
+        let internal = self.face_internal_boundverts(vertex, face)?;
         let v = self.points[vertex];
         let projected: Vec<(f64, f64)> = self
-            .bev(vertex)
+            .bev(vertex)?
             .ring
             .iter()
             .map(|id| {
@@ -896,26 +911,26 @@ impl<'a> Builder<'a> {
                 x0 * y1 - x1 * y0
             })
             .sum();
-        0.5 * twice_area.abs()
+        Ok(0.5 * twice_area.abs())
     }
 
     /// Blender's `bevel_build_rings` for an ADJ vertex mesh on edge bevels: the quads of each
     /// boundary strip, and for odd segment counts the center polygon.
-    fn emit_adj(&mut self, vertex: usize) {
+    fn emit_adj(&mut self, vertex: usize) -> Result<()> {
         let affect_vertices = self.front.p.affect_vertices;
         if self.square_in[vertex] {
             if self.front.p.seg % 2 == 1 {
                 let half = self.front.p.seg / 2;
-                self.emit_center_ngon(vertex, half, half);
+                self.emit_center_ngon(vertex, half, half)?;
             }
-            return;
+            return Ok(());
         }
-        let ring = self.bev(vertex).ring.clone();
+        let ring = self.bev(vertex)?.ring.clone();
         let count = ring.len();
         let seg = self.front.p.seg;
         let ns2 = seg / 2;
         let odd = seg % 2 == 1;
-        let any_seam = self.bev(vertex).any_seam;
+        let any_seam = self.bev(vertex)?.any_seam;
         let reps: Vec<Option<usize>> = ring
             .iter()
             .map(|id| boundvert_rep_face(self.front, *id))
@@ -924,7 +939,7 @@ impl<'a> Builder<'a> {
         let mut center_frep = None;
         let mut frep_beats_next = Vec::new();
         if edge_center {
-            center_frep = self.frep_for_center_poly(vertex);
+            center_frep = self.frep_for_center_poly(vertex)?;
             frep_beats_next = vec![false; count];
             for (i, beats) in frep_beats_next.iter_mut().enumerate() {
                 let inext = (i + 1) % count;
@@ -978,10 +993,10 @@ impl<'a> Builder<'a> {
             for j in 0..ns2 {
                 for k in 0..(ns2 + usize::from(odd)) {
                     let ids = [
-                        self.id(vertex, i, j, k),
-                        self.id(vertex, i, j, k + 1),
-                        self.id(vertex, i, j + 1, k + 1),
-                        self.id(vertex, i, j + 1, k),
+                        self.id(vertex, i, j, k)?,
+                        self.id(vertex, i, j, k + 1)?,
+                        self.id(vertex, i, j + 1, k + 1)?,
+                        self.id(vertex, i, j + 1, k)?,
                     ];
                     let mut fr = [f; 4];
                     let mut se: [Option<usize>; 4] = [None; 4];
@@ -1040,55 +1055,61 @@ impl<'a> Builder<'a> {
                         .iter()
                         .map(|edge| edge.map(|id| self.edge_points(id)))
                         .collect();
-                    let face = fr[0].unwrap_or_else(|| self.fallback_face(vertex));
+                    let face = match fr[0] {
+                        Some(face) => face,
+                        None => self.fallback_face(vertex)?,
+                    };
                     self.emit_polygon(vertices, corners, fr.to_vec(), face, Kind::Corner);
                 }
             }
         }
         if odd {
             if affect_vertices {
-                self.emit_center_ngon(vertex, ns2, ns2);
-                return;
+                self.emit_center_ngon(vertex, ns2, ns2)?;
+                return Ok(());
             }
             let Some(vertices) = center_verts.iter().copied().collect::<Option<Vec<usize>>>()
             else {
-                return;
+                return Ok(());
             };
             let corners = center_snaps
                 .iter()
                 .map(|edge| edge.map(|id| self.edge_points(id)))
                 .collect();
-            let face = (if any_seam { center_frep } else { None })
-                .or(center_interps[0])
-                .unwrap_or_else(|| self.fallback_face(vertex));
+            let face = match (if any_seam { center_frep } else { None }).or(center_interps[0]) {
+                Some(face) => face,
+                None => self.fallback_face(vertex)?,
+            };
             self.emit_polygon(vertices, corners, center_interps, face, Kind::Corner);
         }
+        Ok(())
     }
 
     /// Blender's `build_center_ngon`, used for odd vertex meshes and inward-square tri-corners.
-    fn emit_center_ngon(&mut self, vertex: usize, j: usize, k: usize) {
-        let ring = self.bev(vertex).ring.clone();
-        let repface = if self.bev(vertex).any_seam {
-            self.frep_for_center_poly(vertex)
+    fn emit_center_ngon(&mut self, vertex: usize, j: usize, k: usize) -> Result<()> {
+        let ring = self.bev(vertex)?.ring.clone();
+        let repface = if self.bev(vertex)?.any_seam {
+            self.frep_for_center_poly(vertex)?
         } else {
             None
         };
         let neighbors = repface.and_then(|face| incident_neighbors(self.polygons, face, vertex));
-        let unsnapped = repface
-            .map(|face| self.face_internal_boundverts(vertex, face))
-            .unwrap_or_default();
+        let unsnapped = match repface {
+            Some(face) => self.face_internal_boundverts(vertex, face)?,
+            None => Vec::new(),
+        };
         let mut vertices = Vec::with_capacity(ring.len());
         let mut sources = Vec::with_capacity(ring.len());
         let mut snaps = Vec::with_capacity(ring.len());
         for (i, bound) in ring.iter().enumerate() {
-            let Some(id) = self.id(vertex, i, j, k) else {
-                return;
+            let Some(id) = self.id(vertex, i, j, k)? else {
+                return Ok(());
             };
             let source = repface.or_else(|| boundvert_rep_face(self.front, *bound));
             let snap = match (neighbors, repface) {
                 (Some((first, second)), Some(_)) if !unsnapped.contains(bound) => {
                     let co = self
-                        .grid_point(vertex, i, j, k)
+                        .grid_point(vertex, i, j, k)?
                         .unwrap_or(self.points[vertex]);
                     Some(closer_edge(self.points, co, vertex, first, second))
                 }
@@ -1099,27 +1120,30 @@ impl<'a> Builder<'a> {
             snaps.push(snap);
         }
         if vertices.len() <= 2 {
-            return;
+            return Ok(());
         }
-        let face = repface
-            .or(sources.first().copied().flatten())
-            .unwrap_or_else(|| self.fallback_face(vertex));
+        let face = match repface.or(sources.first().copied().flatten()) {
+            Some(face) => face,
+            None => self.fallback_face(vertex)?,
+        };
         self.emit_polygon(vertices, snaps, sources, face, Kind::Corner);
+        Ok(())
     }
 
     /// The corners of `vertex`'s single ngon (Blender's `bevel_build_poly`): the boundary point and
     /// each profile point of every boundary vertex, with the seam-aware center representative.
-    fn poly_corners(&mut self, vertex: usize) -> (Vec<Corner>, Option<usize>) {
-        let ring = self.bev(vertex).ring.clone();
-        let repface = if self.bev(vertex).any_seam {
-            self.frep_for_center_poly(vertex)
+    fn poly_corners(&mut self, vertex: usize) -> Result<(Vec<Corner>, Option<usize>)> {
+        let ring = self.bev(vertex)?.ring.clone();
+        let repface = if self.bev(vertex)?.any_seam {
+            self.frep_for_center_poly(vertex)?
         } else {
             None
         };
         let neighbors = repface.and_then(|face| incident_neighbors(self.polygons, face, vertex));
-        let unsnapped = repface
-            .map(|face| self.face_internal_boundverts(vertex, face))
-            .unwrap_or_default();
+        let unsnapped = match repface {
+            Some(face) => self.face_internal_boundverts(vertex, face)?,
+            None => Vec::new(),
+        };
         let mut corners = Vec::new();
         for bound in ring {
             let i = self.position(bound);
@@ -1131,7 +1155,7 @@ impl<'a> Builder<'a> {
                 }
                 _ => None,
             };
-            if let Some(id) = self.id(vertex, i, 0, 0) {
+            if let Some(id) = self.id(vertex, i, 0, 0)? {
                 corners.push((id, snap, source));
             }
             let Some(ebev) = self.front.bounds[bound].ebev else {
@@ -1139,12 +1163,12 @@ impl<'a> Builder<'a> {
             };
             let edge_seg = self.front.edges[ebev].seg;
             for k in 1..edge_seg {
-                let Some(id) = self.id(vertex, i, 0, k) else {
+                let Some(id) = self.id(vertex, i, 0, k)? else {
                     continue;
                 };
                 let snap = match neighbors {
                     Some((first, second)) if k >= edge_seg / 2 => {
-                        let co = self.grid_point(vertex, i, 0, k).unwrap_or(co);
+                        let co = self.grid_point(vertex, i, 0, k)?.unwrap_or(co);
                         Some(closer_edge(self.points, co, vertex, first, second))
                     }
                     _ => None,
@@ -1152,25 +1176,25 @@ impl<'a> Builder<'a> {
                 corners.push((id, snap, source));
             }
         }
-        (corners, repface)
+        Ok((corners, repface))
     }
 
     /// Blender's `bevel_build_poly`, and for TRIFAN its `bevel_build_trifan` split of the ngon from
     /// its last corner into the fan `(last, k, k + 1)`.
-    fn emit_vertex_ngon(&mut self, vertex: usize, fan: bool) {
-        let (corners, repface) = self.poly_corners(vertex);
+    fn emit_vertex_ngon(&mut self, vertex: usize, fan: bool) -> Result<()> {
+        let (corners, repface) = self.poly_corners(vertex)?;
         let count = corners.len();
         if count <= 2 {
-            return;
+            return Ok(());
         }
-        let fallback = self.fallback_face(vertex);
+        let fallback = self.fallback_face(vertex)?;
         let face = repface.or(corners[0].2).unwrap_or(fallback);
         if !fan {
             let vertices = corners.iter().map(|c| c.0).collect();
             let snaps = corners.iter().map(|c| c.1).collect();
             let sources = corners.iter().map(|c| c.2).collect();
             self.emit_polygon(vertices, snaps, sources, face, Kind::Corner);
-            return;
+            return Ok(());
         }
         let last = corners[count - 1];
         for k in 0..count - 2 {
@@ -1186,14 +1210,15 @@ impl<'a> Builder<'a> {
             } else {
                 0
             };
-            self.emission.set_last_uv_registration(uv_mask);
+            self.emission.set_last_uv_registration(uv_mask)?;
         }
+        Ok(())
     }
 
     /// Blender's `bevel_build_cutoff`: the corner points below each boundary vertex, a face closing
     /// each profile, and a bottom face through the corner points when they are distinct.
-    fn emit_cutoff(&mut self, vertex: usize) {
-        let ring = self.bev(vertex).ring.clone();
+    fn emit_cutoff(&mut self, vertex: usize) -> Result<()> {
+        let ring = self.bev(vertex)?.ring.clone();
         let count = ring.len();
         let seg = self.front.p.seg;
         let sqrt2 = 2.0_f32.sqrt();
@@ -1209,13 +1234,13 @@ impl<'a> Builder<'a> {
             if down.dot(normal) > 0.0 {
                 down = -down;
             }
-            let length = (self.front.bounds[*bound].profile.height as f32 / sqrt2
-                + self.front.bounds[prev].profile.height as f32 / sqrt2)
-                / 2.0_f32;
+            let sum = self.front.bounds[*bound].profile.height as f32 / sqrt2
+                + self.front.bounds[prev].profile.height as f32 / sqrt2;
+            let length = 0.5_f32 * sum;
             corner_co.push((self.front.bounds[*bound].co.as_vec3() + down * length).as_dvec3());
         }
         {
-            let grid = self.grid_mut(vertex);
+            let grid = self.grid_mut(vertex)?;
             for (i, co) in corner_co.iter().enumerate() {
                 let index = grid.vm.index(i, 1, 0);
                 grid.vm.co[index] = *co;
@@ -1236,26 +1261,37 @@ impl<'a> Builder<'a> {
         let corner_ids: Vec<usize> = if build_center {
             let mut ids = Vec::with_capacity(count);
             for i in 0..count {
-                ids.push(self.id(vertex, i, 1, 0).expect("corner point defined"));
+                ids.push(
+                    self.id(vertex, i, 1, 0)?
+                        .ok_or_else(|| internal_invariant("corner point defined"))?,
+                );
             }
             // Blender: `mesh_vert(prev, 1, 1)->v = mesh_vert(i, 1, 0)->v`, the second corner of each
             // profile being the next profile's first corner.
             for (i, id) in ids.iter().enumerate() {
-                self.share_id(vertex, (i + count - 1) % count, 1, 1, *id);
+                self.share_id(vertex, (i + count - 1) % count, 1, 1, *id)?;
             }
             ids
         } else {
-            let shared = self.id(vertex, 0, 1, 0).expect("corner point defined");
+            let shared = self
+                .id(vertex, 0, 1, 0)?
+                .ok_or_else(|| internal_invariant("corner point defined"))?;
             vec![shared; count]
         };
-        let material_face = self.fallback_face(vertex);
-        for i in 0..count {
-            let mut vertices = vec![corner_ids[i]];
+        let material_face = self.fallback_face(vertex)?;
+        for (i, corner_id) in corner_ids.iter().enumerate().take(count) {
+            let mut vertices = vec![*corner_id];
             for k in 0..=seg {
-                vertices.push(self.id(vertex, i, 0, k).expect("profile point defined"));
+                vertices.push(
+                    self.id(vertex, i, 0, k)?
+                        .ok_or_else(|| internal_invariant("profile point defined"))?,
+                );
             }
             if build_center {
-                vertices.push(self.id(vertex, i, 1, 1).expect("corner point defined"));
+                vertices.push(
+                    self.id(vertex, i, 1, 1)?
+                        .ok_or_else(|| internal_invariant("corner point defined"))?,
+                );
             }
             let n = vertices.len();
             self.emit_polygon(
@@ -1275,30 +1311,33 @@ impl<'a> Builder<'a> {
                 Kind::Corner,
             );
         }
+        Ok(())
     }
 
     /// Blender's `mesh_vert(...)->v = ...`: the cell `(i, j, k)` of `vertex` takes the output point `id`.
-    fn share_id(&mut self, vertex: usize, i: usize, j: usize, k: usize, id: usize) {
-        if let Some(index) = self.grid(vertex).slot(i, j, k) {
-            self.grid_mut(vertex).ids[index] = Some(id);
+    fn share_id(&mut self, vertex: usize, i: usize, j: usize, k: usize, id: usize) -> Result<()> {
+        if let Some(index) = self.grid(vertex)?.slot(i, j, k) {
+            self.grid_mut(vertex)?.ids[index] = Some(id);
         }
+        Ok(())
     }
 
     /// Blender's `bevel_extend_edge_data_ex`: extend each marked input-edge run over the outer
     /// profile boundary of this vertex mesh.
-    fn extend_edge_data(&mut self, vertex: usize) {
-        if self.mesh_kinds[vertex] == Some(MeshKind::TriFan) || self.bev(vertex).selcount < 2 {
-            return;
+    fn extend_edge_data(&mut self, vertex: usize) -> Result<()> {
+        if self.mesh_kinds[vertex] == Some(MeshKind::TriFan) || self.bev(vertex)?.selcount < 2 {
+            return Ok(());
         }
-        let ring = self.bev(vertex).ring.clone();
+        let ring = self.bev(vertex)?.ring.clone();
         for (start, bound) in ring.iter().enumerate() {
             let (seam_len, sharp_len) = (
                 self.front.bounds[*bound].seam_len,
                 self.front.bounds[*bound].sharp_len,
             );
-            self.extend_edge_data_run(vertex, start, seam_len, false, true);
-            self.extend_edge_data_run(vertex, start, sharp_len, true, false);
+            self.extend_edge_data_run(vertex, start, seam_len, false, true)?;
+            self.extend_edge_data_run(vertex, start, sharp_len, true, false)?;
         }
+        Ok(())
     }
 
     fn extend_edge_data_run(
@@ -1308,21 +1347,21 @@ impl<'a> Builder<'a> {
         extend_len: usize,
         sharp: bool,
         seam: bool,
-    ) {
-        let count = self.bev(vertex).ring.len();
+    ) -> Result<()> {
+        let count = self.bev(vertex)?.ring.len();
         if count == 0 {
-            return;
+            return Ok(());
         }
         let seg = self.front.p.seg;
         for step in 0..extend_len {
             let i = (start + step) % count;
             let next_i = (i + 1) % count;
-            let Some(mut previous) = self.id(vertex, i, 0, 0) else {
+            let Some(mut previous) = self.id(vertex, i, 0, 0)? else {
                 continue;
             };
             let mut complete = true;
             for k in 1..seg {
-                let Some(current) = self.id(vertex, i, 0, k) else {
+                let Some(current) = self.id(vertex, i, 0, k)? else {
                     complete = false;
                     break;
                 };
@@ -1335,42 +1374,43 @@ impl<'a> Builder<'a> {
             if !complete {
                 continue;
             }
-            if let Some(next) = self.id(vertex, next_i, 0, 0) {
-                if previous != next {
-                    self.emission.record_edge_flags(previous, next, sharp, seam);
-                }
+            if let Some(next) = self.id(vertex, next_i, 0, 0)?
+                && previous != next
+            {
+                self.emission.record_edge_flags(previous, next, sharp, seam);
             }
         }
+        Ok(())
     }
 
     /// Blender's `bevel_build_edge_polygons`: the strip of quads along the beveled edge `(a, b)`.
-    fn emit_strip(&mut self, a: usize, b: usize) {
+    fn emit_strip(&mut self, a: usize, b: usize) -> Result<()> {
         let key = edge_key(a, b);
         if !self.front.geo.selected_edges.contains(&key)
             || self.front.verts[a].is_none()
             || self.front.verts[b].is_none()
         {
-            return;
+            return Ok(());
         }
         let (Some(e1_id), Some(e2_id)) = (self.edge_half(a, key), self.edge_half(b, key)) else {
-            return;
+            return Ok(());
         };
         let e1 = self.front.edges[e1_id].clone();
         let e2 = self.front.edges[e2_id].clone();
         if !e1.is_bev || !e2.is_bev {
-            return;
+            return Ok(());
         }
         let nseg = e1.seg;
         let (Some(left1), Some(right2), Some(left2)) = (e1.leftv, e2.rightv, e2.leftv) else {
-            return;
+            return Ok(());
         };
         let (f1, f2) = (e1.fprev, e1.fnext);
         let faces = [f1, f1, f2, f2];
         let i1 = self.position(left1);
         let i2 = self.position(left2);
         let mut verts = [
-            self.id(a, i1, 0, 0),
-            self.id(b, self.position(right2), 0, 0),
+            self.id(a, i1, 0, 0)?,
+            self.id(b, self.position(right2), 0, 0)?,
         ];
         let odd = nseg % 2 == 1;
         let mid = nseg / 2;
@@ -1388,10 +1428,10 @@ impl<'a> Builder<'a> {
         let rung_first = (verts[0], verts[1]);
         let edge = Some(self.edge_points(e1_id));
         for k in 1..=nseg {
-            let top = [self.id(a, i1, 0, k), self.id(b, i2, 0, nseg - k)];
+            let top = [self.id(a, i1, 0, k)?, self.id(b, i2, 0, nseg - k)?];
             let (Some(v0), Some(v1), Some(v2), Some(v3)) = (verts[0], verts[1], top[1], top[0])
             else {
-                return;
+                return Ok(());
             };
             let (sources, snaps, face) = if odd && k == mid + 1 {
                 if seam {
@@ -1418,7 +1458,10 @@ impl<'a> Builder<'a> {
                 let f = if k <= mid { f1 } else { f2 };
                 ([f; 4], [None; 4], f)
             };
-            let face = face.unwrap_or_else(|| self.fallback_face(a));
+            let face = match face {
+                Some(face) => face,
+                None => self.fallback_face(a)?,
+            };
             self.emit_polygon(
                 vec![v0, v1, v2, v3],
                 snaps.to_vec(),
@@ -1441,9 +1484,10 @@ impl<'a> Builder<'a> {
                 }
             }
         }
+        Ok(())
     }
     /// Blender's `bevel_reattach_wires`: connect each wire to the nearest new boundary points.
-    fn reattach_wires(&mut self) {
+    fn reattach_wires(&mut self) -> Result<()> {
         let mut created = HashSet::new();
         for vertex in 0..self.front.verts.len() {
             if self.front.verts[vertex].is_none() {
@@ -1457,8 +1501,8 @@ impl<'a> Builder<'a> {
                 }
                 let (first, second) = if self.front.verts[other].is_some() {
                     let mut closest = (f32::MAX, None);
-                    for first_bound in &self.bev(vertex).ring {
-                        for second_bound in &self.bev(other).ring {
+                    for first_bound in &self.bev(vertex)?.ring {
+                        for second_bound in &self.bev(other)?.ring {
                             let distance = self.front.bounds[*first_bound]
                                 .co
                                 .as_vec3()
@@ -1474,8 +1518,8 @@ impl<'a> Builder<'a> {
                     let first_index = self.position(first_bound);
                     let second_index = self.position(second_bound);
                     let (Some(first), Some(second)) = (
-                        self.id(vertex, first_index, 0, 0),
-                        self.id(other, second_index, 0, 0),
+                        self.id(vertex, first_index, 0, 0)?,
+                        self.id(other, second_index, 0, 0)?,
                     ) else {
                         continue;
                     };
@@ -1483,7 +1527,7 @@ impl<'a> Builder<'a> {
                 } else {
                     let other_co = self.points[other].as_vec3();
                     let mut closest = (f32::MAX, None);
-                    for bound in &self.bev(vertex).ring {
+                    for bound in &self.bev(vertex)?.ring {
                         let distance = self.front.bounds[*bound]
                             .co
                             .as_vec3()
@@ -1496,7 +1540,7 @@ impl<'a> Builder<'a> {
                         continue;
                     };
                     let index = self.position(bound);
-                    let Some(first) = self.id(vertex, index, 0, 0) else {
+                    let Some(first) = self.id(vertex, index, 0, 0)? else {
                         continue;
                     };
                     (first, other)
@@ -1512,11 +1556,12 @@ impl<'a> Builder<'a> {
                 self.loose.push([first, second]);
             }
         }
+        Ok(())
     }
 
     /// Blender's `bev_rebuild_polygon`: `face` with each beveled corner replaced by the boundary and
     /// profile points around its vertex, interpolated from the face itself.
-    fn emit_rebuilt_face(&mut self, face: usize) {
+    fn emit_rebuilt_face(&mut self, face: usize) -> Result<()> {
         let vertices = self.polygons[face].0.clone();
         let count = vertices.len();
         let mut out: Vec<usize> = Vec::new();
@@ -1534,10 +1579,11 @@ impl<'a> Builder<'a> {
             ) else {
                 continue;
             };
-            out.extend(self.corner_points(v, face, e_id, eprev_id));
+            out.extend(self.corner_points(v, face, e_id, eprev_id)?);
         }
         let n = out.len();
         self.emit_polygon(out, vec![None; n], vec![Some(face); n], face, Kind::Source);
+        Ok(())
     }
 
     /// Blender's loop walk of `bev_rebuild_polygon` for one beveled corner of `face` at `vertex`,
@@ -1548,7 +1594,7 @@ impl<'a> Builder<'a> {
         face: usize,
         e_id: usize,
         eprev_id: usize,
-    ) -> Vec<usize> {
+    ) -> Result<Vec<usize>> {
         let seg = self.front.p.seg;
         let e = self.front.edges[e_id].clone();
         let eprev = self.front.edges[eprev_id].clone();
@@ -1581,13 +1627,11 @@ impl<'a> Builder<'a> {
             (start, e.rightv)
         };
         let (Some(mut current), Some(end)) = (start, end) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let mut out = Vec::new();
-        if !on_profile_start {
-            if let Some(id) = self.id(vertex, self.position(current), 0, 0) {
-                out.push(id);
-            }
+        if !on_profile_start && let Some(id) = self.id(vertex, self.position(current), 0, 0)? {
+            out.push(id);
         }
         while current != end {
             if go_ccw {
@@ -1600,7 +1644,7 @@ impl<'a> Builder<'a> {
                     seg
                 };
                 for k in kstart..=kend {
-                    if let Some(id) = self.id(vertex, i, 0, k) {
+                    if let Some(id) = self.id(vertex, i, 0, k)? {
                         out.push(id);
                     }
                 }
@@ -1621,7 +1665,7 @@ impl<'a> Builder<'a> {
                 };
                 let mut k = kstart as isize;
                 while k >= kend as isize {
-                    if let Some(id) = self.id(vertex, i, 0, k as usize) {
+                    if let Some(id) = self.id(vertex, i, 0, k as usize)? {
                         out.push(id);
                     }
                     k -= 1;
@@ -1629,7 +1673,7 @@ impl<'a> Builder<'a> {
                 current = previous;
             }
         }
-        out
+        Ok(out)
     }
 
     /// Blender's `count_ccw_edges_between`: how many steps around `vertex` from `from` to `to`.
@@ -1656,36 +1700,36 @@ pub(super) fn bevel_output(
     points: &[DVec3],
     polygons: &[Polygon],
     context: &Context,
-) -> (Emission, Vec<[usize; 2]>) {
+) -> Result<(Emission, Vec<[usize; 2]>)> {
     let mut builder = Builder::new(front, points, polygons, context);
     let beveled: Vec<usize> = (0..front.verts.len())
         .filter(|vertex| front.verts[*vertex].is_some())
         .collect();
     for vertex in &beveled {
-        builder.build_grid(*vertex);
+        builder.build_grid(*vertex)?;
     }
     for vertex in &beveled {
         let vertex = *vertex;
         match builder.mesh_kinds[vertex] {
-            Some(MeshKind::Poly) => builder.emit_vertex_ngon(vertex, false),
-            Some(MeshKind::TriFan) => builder.emit_vertex_ngon(vertex, true),
-            Some(MeshKind::Adj) => builder.emit_adj(vertex),
-            Some(MeshKind::Cutoff) => builder.emit_cutoff(vertex),
-            Some(MeshKind::None) => builder.emit_two_edge(vertex),
+            Some(MeshKind::Poly) => builder.emit_vertex_ngon(vertex, false)?,
+            Some(MeshKind::TriFan) => builder.emit_vertex_ngon(vertex, true)?,
+            Some(MeshKind::Adj) => builder.emit_adj(vertex)?,
+            Some(MeshKind::Cutoff) => builder.emit_cutoff(vertex)?,
+            Some(MeshKind::None) => builder.emit_two_edge(vertex)?,
             None => {}
         }
     }
     if !front.p.affect_vertices {
         for (a, b) in &front.geo.edge_order {
-            builder.emit_strip(*a, *b);
+            builder.emit_strip(*a, *b)?;
         }
     }
     for vertex in &beveled {
-        builder.extend_edge_data(*vertex);
+        builder.extend_edge_data(*vertex)?;
     }
     for (face, (vertices, _)) in polygons.iter().enumerate() {
         if vertices.iter().any(|v| front.verts[*v].is_some()) {
-            builder.emit_rebuilt_face(face);
+            builder.emit_rebuilt_face(face)?;
         } else {
             let n = vertices.len();
             builder.emit_polygon(
@@ -1698,7 +1742,7 @@ pub(super) fn bevel_output(
         }
     }
     if !front.p.affect_vertices {
-        builder.reattach_wires();
+        builder.reattach_wires()?;
     }
-    (builder.emission, builder.loose)
+    Ok((builder.emission, builder.loose))
 }

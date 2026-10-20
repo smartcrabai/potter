@@ -94,8 +94,8 @@ fn run_case(oracle: &Value, case: &Value) -> CaseReport {
     let name = case["name"].as_str().unwrap_or("<unnamed>").to_owned();
     match catch_unwind(AssertUnwindSafe(|| compare_case(oracle, case, &name))) {
         Ok(Ok(report)) => report,
-        Ok(Err(error)) => CaseReport::errored(name, error.to_string()),
-        Err(payload) => CaseReport::errored(name, panic_message(payload.as_ref())),
+        Ok(Err(error)) => CaseReport::errored(&name, error.to_string()),
+        Err(payload) => CaseReport::errored(&name, panic_message(payload.as_ref())),
     }
 }
 
@@ -121,7 +121,7 @@ fn compare_case(oracle: &Value, case: &Value, name: &str) -> TestResult<CaseRepo
     let expected = expected_mesh(&case["output"])?;
     let actual = actual_mesh(&evaluated, &expected.group_names)?;
 
-    Ok(compare(name, &canonicalize(&expected), &actual))
+    compare(name, &canonicalize(&expected), &actual)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -437,11 +437,15 @@ fn keyed_float(mesh: &Mesh, name: &str, key: &str, domain: &str) -> TestResult<O
     {
         return Err(format!("evaluated {name} must be a {domain} float attribute").into());
     }
-    let value = attribute
+    // Potter writes no entry for an element without a source; a reader takes the FLOAT default, 0.0
+    // (`provenance::default_value`), which Blender also holds for the new edges.
+    let Some(value) = attribute
         .get("values")
         .and_then(Value::as_object)
         .and_then(|values| values.get(key))
-        .ok_or_else(|| format!("evaluated {name} value {key} is missing"))?;
+    else {
+        return Ok(Some(0.0));
+    };
     Ok(Some(value.as_f64().ok_or_else(|| {
         format!("evaluated {name} value {key} is not numeric")
     })?))
@@ -728,10 +732,10 @@ impl CaseReport {
         }
     }
 
-    fn errored(name: String, error: String) -> Self {
+    fn errored(name: &str, error: String) -> Self {
         Self {
             error: Some(error),
-            ..Self::new(&name, 0, 0)
+            ..Self::new(name, 0, 0)
         }
     }
 
@@ -766,9 +770,9 @@ fn group_by<'a, T, K: Ord + Clone>(
 }
 
 /// An evaluated vertex is a candidate for every expected vertex within this distance. The radius is
-/// looser than POSITION_TOLERANCE so that a vertex a little off is reported as a deviation (its
+/// looser than `POSITION_TOLERANCE` so that a vertex a little off is reported as a deviation (its
 /// `position_max`) rather than as a missing vertex; the comparison itself still uses
-/// POSITION_TOLERANCE.
+/// `POSITION_TOLERANCE`.
 const POSITION_MATCH_RADIUS: f64 = 1.0e-5;
 /// Sentinel vertex ID for an evaluated vertex that matches no expected vertex. Rows that use it
 /// never equal an expected row, so each such row counts once in the length difference.
@@ -947,7 +951,7 @@ fn topology_colors(
     expected_incidence: &Incidence,
     actual_incidence: &Incidence,
     candidates: &[Vec<Candidate>],
-) -> (Vec<usize>, Vec<usize>) {
+) -> TestResult<(Vec<usize>, Vec<usize>)> {
     let uncolored = usize::MAX;
     let mut expected_colors = vec![uncolored; expected.vertices.len()];
     let mut actual_colors = vec![uncolored; actual.vertices.len()];
@@ -1014,27 +1018,30 @@ fn topology_colors(
         all_signatures.dedup();
         let next_expected: Vec<usize> = expected_signatures
             .iter()
-            .map(|signature| {
-                all_signatures
-                    .binary_search(signature)
-                    .expect("signature was collected")
-            })
-            .collect();
+            .map(|signature| signature_rank(&all_signatures, signature))
+            .collect::<TestResult<_>>()?;
         let next_actual: Vec<usize> = actual_signatures
             .iter()
-            .map(|signature| {
-                all_signatures
-                    .binary_search(signature)
-                    .expect("signature was collected")
-            })
-            .collect();
+            .map(|signature| signature_rank(&all_signatures, signature))
+            .collect::<TestResult<_>>()?;
         if all_signatures.len() == next_color {
-            return (next_expected, next_actual);
+            return Ok((next_expected, next_actual));
         }
         next_color = all_signatures.len();
         expected_colors = next_expected;
         actual_colors = next_actual;
     }
+}
+
+/// Position of `signature` in the sorted, deduplicated `signatures`; every signature was collected
+/// into that list, so a miss is a broken invariant.
+fn signature_rank(
+    signatures: &[VertexTopologySignature],
+    signature: &VertexTopologySignature,
+) -> TestResult<usize> {
+    signatures
+        .binary_search(signature)
+        .map_err(|_| "signature was collected".into())
 }
 
 /// Additive lexicographic score for a valid position pair: exact refined color, then local
@@ -1094,11 +1101,7 @@ fn association_score(
     );
     let weight_penalty = (candidate.weight_deviation / WEIGHT_TOLERANCE).round() as i64;
     AssociationScore([
-        if expected_signature.previous == actual_signature.previous {
-            1
-        } else {
-            0
-        },
+        i64::from(expected_signature.previous == actual_signature.previous),
         neighbour_overlap as i64,
         face_overlap as i64,
         -(neighbour_gap as i64),
@@ -1148,17 +1151,17 @@ fn solve_component(
     candidates: &[Vec<(usize, AssociationScore)>],
     forced: Option<(usize, usize)>,
     excluded_actual: Option<usize>,
-) -> ComponentMatching {
+) -> TestResult<ComponentMatching> {
     let mut expected_for_actual = vec![None; actuals.len()];
     if let Some((actual, expected)) = forced {
         let local_actual = actuals
             .iter()
             .position(|&index| index == actual)
-            .expect("forced actual is in component");
+            .ok_or("forced actual is in component")?;
         candidates[actual]
             .iter()
             .find(|(index, _)| *index == expected)
-            .expect("forced pair is a candidate");
+            .ok_or("forced pair is a candidate")?;
         expected_for_actual[local_actual] = Some(expected);
     }
     let remaining_actuals: Vec<usize> = actuals
@@ -1236,7 +1239,7 @@ fn solve_component(
         let mut node = sink;
         while node != source {
             let (from, edge_index) =
-                previous[node].expect("augmenting path predecessor is present");
+                previous[node].ok_or("augmenting path predecessor is present")?;
             let reverse = graph[from][edge_index].reverse;
             graph[from][edge_index].available = false;
             graph[node][reverse].available = true;
@@ -1250,8 +1253,11 @@ fn solve_component(
             .iter()
             .find(|edge| !edge.available && (expected_start..sink).contains(&edge.to))
         {
-            expected_for_actual[actuals.iter().position(|&index| index == actual).unwrap()] =
-                Some(remaining_expecteds[edge.to - expected_start]);
+            let local_actual = actuals
+                .iter()
+                .position(|&index| index == actual)
+                .ok_or("remaining actual is in component")?;
+            expected_for_actual[local_actual] = Some(remaining_expecteds[edge.to - expected_start]);
         }
     }
     let mut cardinality = 0;
@@ -1264,15 +1270,15 @@ fn solve_component(
             candidates[actual]
                 .iter()
                 .find(|(candidate, _)| candidate == expected)
-                .expect("matched pair is a candidate")
+                .ok_or("matched pair is a candidate")?
                 .1,
         );
     }
-    ComponentMatching {
+    Ok(ComponentMatching {
         cardinality,
         score,
         expected_for_actual,
-    }
+    })
 }
 
 fn candidate_components(
@@ -1356,6 +1362,15 @@ fn weight_deviation(expected: &[f64], actual: &[f64]) -> f64 {
         .fold(0.0, f64::max)
 }
 
+/// Component-wise `==` with IEEE semantics (`+0.0 == -0.0`, `NaN != NaN`) via `partial_cmp`.
+fn components_equal(left: &[f64], right: &[f64]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| left.partial_cmp(right) == Some(Ordering::Equal))
+}
+
 /// Two face rows agree when their attributes match and their corners carry the same vertex, UV and
 /// normal in the same order.
 fn same_face(left: &CanonFace, right: &CanonFace) -> bool {
@@ -1364,7 +1379,9 @@ fn same_face(left: &CanonFace, right: &CanonFace) -> bool {
         && left.strength == right.strength
         && left.ring.len() == right.ring.len()
         && left.ring.iter().zip(&right.ring).all(|(left, right)| {
-            left.vertex == right.vertex && left.uv == right.uv && left.normal == right.normal
+            left.vertex == right.vertex
+                && components_equal(&left.uv, &right.uv)
+                && left.normal == right.normal
         })
 }
 
@@ -1388,7 +1405,7 @@ fn interchangeable(expected: &CanonMesh, first: usize, second: usize) -> bool {
         .edges
         .iter()
         .map(|edge| {
-            let [a, b] = edge.vertices.map(|label| swap(label));
+            let [a, b] = edge.vertices.map(&swap);
             edge_order(&CanonEdge {
                 vertices: [a.min(b), a.max(b)],
                 seam: edge.seam,
@@ -1437,7 +1454,11 @@ fn interchangeable(expected: &CanonMesh, first: usize, second: usize) -> bool {
 /// Associates evaluated vertices with expected vertices by maximum-cardinality position matching.
 /// Refined topology and local structural signatures outrank edge/group data. Any equally optimal
 /// non-interchangeable mapping is reported as ambiguous rather than selected by storage order.
-fn match_vertices(expected: &CanonMesh, actual: &RawMesh, report: &mut CaseReport) -> Matching {
+fn match_vertices(
+    expected: &CanonMesh,
+    actual: &RawMesh,
+    report: &mut CaseReport,
+) -> TestResult<Matching> {
     let expected_incidence = Incidence::new(
         expected.vertices.len(),
         expected.edges.iter().map(|edge| {
@@ -1488,7 +1509,7 @@ fn match_vertices(expected: &CanonMesh, actual: &RawMesh, report: &mut CaseRepor
         &expected_incidence,
         &actual_incidence,
         &candidates,
-    );
+    )?;
     let expected_signatures =
         expected_topology_signatures(expected, &expected_incidence, &expected_colors);
     let actual_signatures = actual_topology_signatures(actual, &actual_incidence, &actual_colors);
@@ -1524,7 +1545,7 @@ fn match_vertices(expected: &CanonMesh, actual: &RawMesh, report: &mut CaseRepor
             &scored_candidates,
             None,
             None,
-        );
+        )?;
         for (local_actual, expected_index) in best.expected_for_actual.iter().enumerate() {
             if let Some(expected_index) = expected_index {
                 matching[actuals[local_actual]] = *expected_index;
@@ -1542,7 +1563,7 @@ fn match_vertices(expected: &CanonMesh, actual: &RawMesh, report: &mut CaseRepor
                 &scored_candidates,
                 None,
                 Some(actual_index),
-            );
+            )?;
             if without_actual.cardinality == best.cardinality && without_actual.score == best.score
             {
                 mark_noninterchangeable_changes(
@@ -1553,13 +1574,12 @@ fn match_vertices(expected: &CanonMesh, actual: &RawMesh, report: &mut CaseRepor
                     &mut ambiguous,
                 );
             }
+            let local_actual = actuals
+                .iter()
+                .position(|&index| index == actual_index)
+                .ok_or("actual is in component")?;
             for &(expected_index, _) in &scored_candidates[actual_index] {
-                if best.expected_for_actual[actuals
-                    .iter()
-                    .position(|&index| index == actual_index)
-                    .unwrap()]
-                    == Some(expected_index)
-                {
+                if best.expected_for_actual[local_actual] == Some(expected_index) {
                     continue;
                 }
                 let alternative = solve_component(
@@ -1569,7 +1589,7 @@ fn match_vertices(expected: &CanonMesh, actual: &RawMesh, report: &mut CaseRepor
                     &scored_candidates,
                     Some((actual_index, expected_index)),
                     None,
-                );
+                )?;
                 if alternative.cardinality == best.cardinality && alternative.score == best.score {
                     mark_noninterchangeable_changes(
                         expected,
@@ -1637,12 +1657,12 @@ fn match_vertices(expected: &CanonMesh, actual: &RawMesh, report: &mut CaseRepor
             .unwrap_or(f64::INFINITY);
         report.position_max = report.position_max.max(nearest);
     }
-    matching
+    Ok(matching)
 }
 
-fn compare(name: &str, expected: &CanonMesh, actual: &RawMesh) -> CaseReport {
+fn compare(name: &str, expected: &CanonMesh, actual: &RawMesh) -> TestResult<CaseReport> {
     let mut report = CaseReport::new(name, expected.vertices.len(), actual.vertices.len());
-    let matching = match_vertices(expected, actual, &mut report);
+    let matching = match_vertices(expected, actual, &mut report)?;
 
     let mut actual_edges = Vec::with_capacity(actual.edges.len());
     for edge in &actual.edges {
@@ -1755,7 +1775,7 @@ fn compare(name: &str, expected: &CanonMesh, actual: &RawMesh) -> CaseReport {
         }
         report.ring_bad += expected_rows.len().abs_diff(actual_rows.len());
     }
-    report
+    Ok(report)
 }
 
 fn print_table(reports: &[CaseReport]) {

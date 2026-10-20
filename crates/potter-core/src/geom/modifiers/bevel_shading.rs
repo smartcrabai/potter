@@ -12,7 +12,7 @@
 //! Bevel loops do not carry the input custom-normal codes: each loop starts at the zero code, which
 //! decodes to its fan normal. Hardening writes a code only on the strip and corner loops that have a
 //! rule, and each fan then averages its codes (zeros included) in the fan's own space, as
-//! `normals_calc_corners` does. Blender's rule normals come from the BMesh face and vertex normals,
+//! `normals_calc_corners` does. Blender's rule normals come from the `BMesh` face and vertex normals,
 //! which this module recomputes from the output geometry.
 
 use std::collections::{HashMap, HashSet};

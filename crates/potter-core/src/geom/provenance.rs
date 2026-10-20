@@ -24,12 +24,12 @@ use super::interpolation::interp_weights_poly_v2;
 use super::uv_layers::{self, UvLayer};
 use super::{Mesh, edge_key};
 
-/// One ordered BMesh point-data interpolation callback during Bevel.
+/// One ordered `BMesh` point-data interpolation callback during Bevel.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct PointInterpolationEvent {
     /// Output vertex written by the callback.
     pub output_vertex: usize,
-    /// Input vertex also updated when the callback target is an original BMesh vertex.
+    /// Input vertex also updated when the callback target is an original `BMesh` vertex.
     pub mutated_source_vertex: Option<usize>,
     /// Input point values and weights read from the source face's loops.
     pub sources: Vec<(usize, f64)>,

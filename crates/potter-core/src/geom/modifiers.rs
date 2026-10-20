@@ -5543,17 +5543,18 @@ fn bevel(mesh: &Mesh, modifier: &Modifier, context: ModifierEvaluationContext<'_
         mark_sharp,
         limit_offset: clamp_overlap,
     };
-    let front = bevel_boundary::Front::build(params, geometry);
+    let front = bevel_boundary::Front::build(params, geometry)?;
     let material_override = (material >= 0).then_some(material as u32);
     let components = (!float2_layers.is_empty() && segments % 2 == 1)
-        .then(|| bevel_vmesh::face_components(&source_points, &source_polygons, &loop_math_layers));
+        .then(|| bevel_vmesh::face_components(&source_points, &source_polygons, &loop_math_layers))
+        .transpose()?;
     let context = bevel_rings::Context {
         components,
         has_math_layers: !float2_layers.is_empty(),
         material: material_override,
     };
     let (emission, created_edges) =
-        bevel_rings::bevel_output(&front, &source_points, &source_polygons, &context);
+        bevel_rings::bevel_output(&front, &source_points, &source_polygons, &context)?;
     let mut loose = loose_edges(mesh)?;
     if !affect_vertices {
         loose.retain(|[first, second]| {
@@ -5616,10 +5617,12 @@ fn apply_bevel_face_strength(
             json!({"domain":"face","type":"int","values":{}}),
         );
     }
-    let attribute = mesh
-        .attributes
-        .get_mut(name)
-        .expect("face strength attribute was just inserted or already exists");
+    let attribute = mesh.attributes.get_mut(name).ok_or_else(|| {
+        PotError::new(
+            ErrorCode::InternalError,
+            "face strength attribute was just inserted or already exists",
+        )
+    })?;
     let values = attribute
         .get_mut("values")
         .and_then(Value::as_object_mut)
@@ -6554,7 +6557,7 @@ mod tests {
     use serde_json::json;
 
     use crate::{
-        error::{ErrorCode, PotError},
+        error::ErrorCode,
         eval::ModifierEvaluationContext,
         geom::{
             BoxParams, Mesh,
@@ -7489,13 +7492,6 @@ mod tests {
                 "screw loose-edge corner codes must be Auto"
             );
         }
-    }
-
-    fn refused_feature(error: &PotError) -> Option<&str> {
-        error
-            .details
-            .get("feature_id")
-            .and_then(serde_json::Value::as_str)
     }
 
     /// `mirror bisect` is refused only on a mirrored axis, where Blender acts. On an unmirrored

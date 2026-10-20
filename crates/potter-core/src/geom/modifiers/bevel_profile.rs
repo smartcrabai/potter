@@ -269,24 +269,22 @@ fn apply_point_handles(
     let previous = index.checked_sub(1).map(|i| locations[i]);
     let next = locations.get(index + 1).copied();
     // `a` points from the previous point to `p`; a missing previous point mirrors the next one.
-    let (ax, ay) = match previous {
-        Some(q) => (p[0] - q[0], p[1] - q[1]),
-        None => {
-            let n = next.unwrap_or(p);
-            let vx = p[0] + p[0] - n[0];
-            let vy = p[1] + p[1] - n[1];
-            (p[0] - vx, p[1] - vy)
-        }
+    let (ax, ay) = if let Some(q) = previous {
+        (p[0] - q[0], p[1] - q[1])
+    } else {
+        let n = next.unwrap_or(p);
+        let vx = p[0] + p[0] - n[0];
+        let vy = p[1] + p[1] - n[1];
+        (p[0] - vx, p[1] - vy)
     };
     // `b` points from `p` to the next point; a missing next point mirrors the previous one.
-    let (bx, by) = match next {
-        Some(n) => (n[0] - p[0], n[1] - p[1]),
-        None => {
-            let q = previous.unwrap_or(p);
-            let vx = p[0] + p[0] - q[0];
-            let vy = p[1] + p[1] - q[1];
-            (vx - p[0], vy - p[1])
-        }
+    let (bx, by) = if let Some(n) = next {
+        (n[0] - p[0], n[1] - p[1])
+    } else {
+        let q = previous.unwrap_or(p);
+        let vx = p[0] + p[0] - q[0];
+        let vy = p[1] + p[1] - q[1];
+        (vx - p[0], vy - p[1])
     };
     let la = (ax * ax + ay * ay).sqrt();
     let lb = (bx * bx + by * by).sqrt();
@@ -352,10 +350,10 @@ fn forward_diff(q0: f32, q1: f32, q2: f32, q3: f32, it: usize) -> Vec<f32> {
     let mut value = q0;
     let mut out = Vec::with_capacity(it + 1);
     for _ in 0..=it {
-        second = third + second;
+        second += third;
         out.push(value);
-        value = first + value;
-        first = first + second;
+        value += first;
+        first += second;
     }
     out
 }
@@ -480,13 +478,10 @@ fn arc_length_samples(points: &[ProfilePoint], handles: &[Pair], n: usize) -> Ve
     let mut chord_remaining = chords[0];
     let mut travelled = 0.0_f32;
     for sample in out.iter_mut().take(n).skip(1) {
-        let advance;
-        let fraction;
-        if chord_remaining >= step {
-            advance = step;
+        let (advance, fraction) = if chord_remaining >= step {
             let span = travelled + chord_remaining;
-            travelled += advance;
-            fraction = travelled / span;
+            travelled += step;
+            (step, travelled / span)
         } else {
             let mut needed = step - chord_remaining;
             chord_index += 1;
@@ -496,10 +491,9 @@ fn arc_length_samples(points: &[ProfilePoint], handles: &[Pair], n: usize) -> Ve
                 chord_index += 1;
                 chord_remaining = chords[chord_index];
             }
-            advance = needed;
-            travelled = 0.0 + advance;
-            fraction = travelled / (0.0 + chord_remaining);
-        }
+            travelled = 0.0 + needed;
+            (needed, travelled / (0.0 + chord_remaining))
+        };
         let one_minus = 1.0 - fraction;
         let a = table[chord_index];
         let b = table[chord_index + 1];
@@ -826,11 +820,9 @@ mod tests {
 
     #[test]
     fn zero_segments_yield_no_samples() {
-        assert!(
-            CurveProfile::from_param(None)
-                .expect("LINE")
-                .sample(0)
-                .is_empty()
+        assert_eq!(
+            CurveProfile::from_param(None).expect("LINE").sample(0),
+            Vec::<(f64, f64)>::new()
         );
     }
 

@@ -309,6 +309,7 @@ fn param_table_defaults_match_blender_fixture() {
     assert_eq!(
         actual_exceptions,
         vec![
+            "bevel.custom_profile",
             "mesh_sequence_cache.frame_offset",
             "mesh_sequence_cache.override_frame",
             "mesh_sequence_cache.scale",
