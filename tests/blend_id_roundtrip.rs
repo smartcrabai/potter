@@ -543,7 +543,16 @@ bpy.ops.wm.save_as_mainfile(filepath=__OUTPUT__)
         .find(|(_, node)| node.name == "SlotOwner")
         .map(|(id, _)| id.clone())
         .ok_or("imported material-slot object is missing")?;
-    let material_slots = &scene.nodes[&node_id].materials;
+    let slot_owner = &scene.nodes[&node_id];
+    let slot_data = slot_owner
+        .data
+        .as_ref()
+        .and_then(|data_id| scene.data_blocks.get(data_id));
+    // DATA-linked slots keep the object-level entry empty; the mesh owns the material.
+    // Blender resolves them the same way (material.cc: slot lookup falls back to data).
+    let material_slots: Vec<Option<Id>> = (0..slot_owner.material_slot_count(slot_data))
+        .map(|index| slot_owner.material_slot(slot_data, index).cloned())
+        .collect();
     assert_eq!(material_slots.len(), 3);
     assert!(
         material_slots[1].is_none(),
