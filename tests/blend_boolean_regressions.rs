@@ -30,8 +30,8 @@ use blender_file::blender_executable;
 #[path = "fixtures/boolean_parity/comparator.rs"]
 mod comparator;
 use comparator::{
-    TestResult, evaluate_boolean, expected_canonical, find_node, import_blend_scene, mismatches,
-    read_scene, run_generator, run_pot,
+    TestResult, evaluate_booleans_together, expected_canonical, find_node, import_blend_scene,
+    mismatches, read_scene, run_generator, run_pot,
 };
 
 use std::{
@@ -273,11 +273,15 @@ fn check_regression_cases(cases: &[&str]) -> TestResult {
         document = read_scene(&project)?;
     }
 
-    for case in cases {
+    let hosts = cases
+        .iter()
+        .map(|case| find_node(&document, case))
+        .collect::<TestResult<Vec<Id>>>()?;
+    let evaluated = evaluate_booleans_together(&document, &hosts)?;
+    for (case, (node_id, result)) in cases.iter().zip(hosts.into_iter().zip(evaluated)) {
         let Some(expected_json) = expectations.get(*case) else {
             continue;
         };
-        let node_id = find_node(&document, case)?;
         if expected_json["kind"] == "applied" {
             // Blender's `slot.material` is the effective material: a DATA-linked slot shows the mesh's
             // material, so read through the node's slot resolution, not its object-level list.
@@ -297,7 +301,7 @@ fn check_regression_cases(cases: &[&str]) -> TestResult {
                 ));
             }
         }
-        match evaluate_boolean(&document, &node_id) {
+        match result {
             Ok(actual) => {
                 let expected = expected_canonical(expected_json)?;
                 failures.extend(

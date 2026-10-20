@@ -1219,7 +1219,9 @@ fn collection_instance_cases_match_blenders_exporter() -> TestResult {
             .map(|(&(case, _), handle)| {
                 (
                     case,
-                    handle.join().expect("a collection instance case panicked"),
+                    handle
+                        .join()
+                        .unwrap_or_else(|_| Err("the case thread panicked".to_owned())),
                 )
             })
             .collect()
