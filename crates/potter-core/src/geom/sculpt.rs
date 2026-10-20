@@ -1240,7 +1240,7 @@ mod tests {
         let mut mesh = uv_box();
         let before = uv_layers::read(&mesh).layers[0].faces.clone();
         let stroke = Stroke {
-            brush: Brush::Dab(DabBrush::Draw),
+            brush: DabBrush::Draw,
             samples: vec![sample(DVec3::ZERO)],
             falloff: Falloff::Smooth,
             symmetry: Vec::new(),
