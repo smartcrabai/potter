@@ -370,6 +370,22 @@ if bpy.app.version != (5, 2, 2):
 cases_path = sys.argv[sys.argv.index("--") + 1]
 cases = json.load(open(cases_path, encoding="utf-8"))
 results = []
+
+def add_particle_emitter(obj):
+    bpy.context.view_layer.objects.active = obj
+    obj.select_set(True)
+    bpy.ops.object.particle_system_add()
+    system = obj.particle_systems[-1]
+    system.seed = 3
+    settings = system.settings
+    settings.count = 2
+    settings.frame_start = 1
+    settings.frame_end = 1
+    settings.lifetime = 12
+    settings.emit_from = 'VERT'
+    settings.physics_type = 'NEWTON'
+    settings.normal_factor = 0.8
+    settings.particle_size = 0.5
 for case in cases:
     bpy.ops.wm.read_factory_settings(use_empty=True)
     if case["primitive"] == "plane":
@@ -377,8 +393,19 @@ for case in cases:
     else:
         bpy.ops.mesh.primitive_cube_add(size=2.0)
     obj = bpy.context.object
+    setup = case.get("setup")
+    if setup == "particle_emitter":
+        add_particle_emitter(obj)
+    elif setup == "particle_instance_emitter":
+        bpy.ops.mesh.primitive_cube_add(size=2.0, location=(3.0, -1.0, 0.5))
+        emitter = bpy.context.object
+        emitter.name = "emitter"
+        add_particle_emitter(emitter)
+        bpy.context.view_layer.objects.active = obj
     modifier = obj.modifiers.new(name=case["id"], type=case["modifier"].upper())
     for name, value in case["params"].items():
+        if name == "object":
+            value = bpy.data.objects[value]
         setattr(modifier, name, tuple(value) if isinstance(value, list) else value)
     depsgraph = bpy.context.evaluated_depsgraph_get()
     evaluated = obj.evaluated_get(depsgraph)
@@ -414,6 +441,7 @@ fn blender_scenario_results(scenarios: &Value) -> Option<BTreeMap<String, String
                 "primitive": scenario["primitive"],
                 "modifier": scenario["modifier"],
                 "params": scenario[key],
+                "setup": scenario.get("setup").cloned().unwrap_or(Value::Null),
             }));
         }
     }
@@ -515,14 +543,35 @@ fn geometry_signature(geometry: &Value) -> String {
     hex::encode(Sha256::digest(serde_json::to_vec(&canonical).unwrap()))
 }
 
-fn potter_scenario_geometry(primitive: &str, modifier: &str, params: &Value) -> String {
+fn potter_scenario_geometry(
+    primitive: &str,
+    modifier: &str,
+    setup: &Value,
+    params: &Value,
+) -> String {
     let directory = tempdir().unwrap();
     let scene = directory.path().join("scene");
     init_scene(&scene);
-    let operations = [
-        json!({"op":"node.create","id":"body","kind":primitive,"params":{"size":2.0}}),
-        json!({"op":"modifier.create","target":{"id":"body"},"id":"under_test","type":modifier,"params":params}),
-    ];
+    // Same emitter as the Blender runner's `add_particle_emitter`; `particle_size` is explicit because Blender's default is 0.05.
+    let emitter = json!({"emit_from":"VERT","count":2,"frame_start":1.0,"frame_end":1.0,"lifetime":12.0,"physics_type":"NEWTON","normal_factor":0.8,"seed":3,"particle_size":0.5});
+    let operations = match setup.as_str() {
+        None => vec![
+            json!({"op":"node.create","id":"body","kind":primitive,"params":{"size":2.0}}),
+            json!({"op":"modifier.create","target":{"id":"body"},"id":"under_test","type":modifier,"params":params}),
+        ],
+        Some("particle_emitter") => vec![
+            json!({"op":"node.create","id":"body","kind":primitive,"params":{"size":2.0}}),
+            json!({"op":"physics.particle_emitter.create","target":{"id":"body"},"settings":emitter}),
+            json!({"op":"modifier.create","target":{"id":"body"},"id":"under_test","type":modifier,"params":params}),
+        ],
+        Some("particle_instance_emitter") => vec![
+            json!({"op":"node.create","id":"body","kind":primitive,"params":{"size":2.0}}),
+            json!({"op":"node.create","id":"emitter","kind":"box","params":{"size":2.0},"transform":{"translation":[3.0,-1.0,0.5]}}),
+            json!({"op":"physics.particle_emitter.create","target":{"id":"emitter"},"settings":emitter}),
+            json!({"op":"modifier.create","target":{"id":"body"},"id":"under_test","type":modifier,"params":params}),
+        ],
+        Some(other) => panic!("unknown scenario setup `{other}`"),
+    };
     let applied = apply_operations(&scene, &operations);
     assert!(
         applied.status.success(),
@@ -565,9 +614,18 @@ fn modifier_parameter_scenarios_match_blender_or_record_real_gaps() {
         let modifier = scenario["modifier"].as_str().unwrap();
         let blender_baseline = scenario_signature(&blender, id, "baseline");
         let blender_case = scenario_signature(&blender, id, "case");
-        let potter_baseline =
-            potter_scenario_geometry(primitive, modifier, &scenario["baseline_params"]);
-        let potter_case = potter_scenario_geometry(primitive, modifier, &scenario["case_params"]);
+        let potter_baseline = potter_scenario_geometry(
+            primitive,
+            modifier,
+            &scenario["setup"],
+            &scenario["baseline_params"],
+        );
+        let potter_case = potter_scenario_geometry(
+            primitive,
+            modifier,
+            &scenario["setup"],
+            &scenario["case_params"],
+        );
         match scenario["expectation"].as_str().unwrap() {
             "equal_active" => {
                 assert_ne!(

@@ -8426,6 +8426,47 @@ fn imported_fisheye_lens(item: &Value) -> Option<f64> {
 
 fn import_losses(raw: &Value) -> Vec<Loss> {
     let mut losses = Vec::new();
+    // Blender evaluates a particle texture slot (`psys_get_texture`) for exist, time, size, life, and the other
+    // particle settings it maps. Potter does not evaluate particle textures, so each such slot is reported.
+    for object in raw
+        .get("objects")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let name = object.get("name").and_then(Value::as_str);
+        for modifier in object
+            .get("modifiers")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            for slot in modifier
+                .get("particle_texture_slots")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let index = slot.get("slot").and_then(Value::as_u64).unwrap_or(0);
+                let texture = slot.get("texture").and_then(Value::as_str).unwrap_or("");
+                let maps = slot
+                    .get("maps")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                losses.push(loss(
+                    "blender.particle_system.texture_slot",
+                    name,
+                    &format!(
+                        "Blender's particle texture slot {index} (texture `{texture}`) drives {maps}; Potter does not evaluate particle textures, so the slot is not kept and the particle settings stay constant"
+                    ),
+                ));
+            }
+        }
+    }
     // Blender stores every panorama setting on every camera, so a value Potter cannot hold is reported whatever the camera's
     // type: the import never changes a camera silently.
     for camera in raw

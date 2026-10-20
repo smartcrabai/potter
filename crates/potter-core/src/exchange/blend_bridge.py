@@ -633,6 +633,26 @@ def _physics_modifier_settings(obj, modifier):
     if point_cache is not None:
         result["point_cache"] = point_cache
     return result
+
+
+def _particle_texture_slots(modifier):
+    """Texture slots that drive a particle setting: Blender applies a slot with a texture and a use_map_* flag (`psys_get_texture`)."""
+    if modifier.type != "PARTICLE_SYSTEM":
+        return []
+    particle_system = getattr(modifier, "particle_system", None)
+    settings = getattr(particle_system, "settings", None) if particle_system else None
+    if settings is None:
+        return []
+    slots = []
+    for index, slot in enumerate(settings.texture_slots):
+        if slot is None or slot.texture is None:
+            continue
+        maps = [prop.identifier for prop in slot.bl_rna.properties
+                if prop.identifier.startswith("use_map_") and getattr(slot, prop.identifier)]
+        if maps:
+            slots.append({"slot": index, "texture": slot.texture.name, "maps": maps})
+    return slots
+
 def modifier_params(modifier):
     omitted = (
         "type", "name", "execution_time", "persistent_uid", "show_viewport", "show_render",
@@ -1857,6 +1877,7 @@ def object_dump(obj):
                           "properties": properties,
                           "native_target_mesh": native_target_mesh,
                           "physics_settings": _physics_modifier_settings(obj, modifier),
+                          "particle_texture_slots": _particle_texture_slots(modifier),
                           "custom_properties": custom_props(modifier)})
     inverse_map = _object_solver_inverse_map(obj).get("objects", {})
     constraints = [
