@@ -1,6 +1,8 @@
-//! Port of Blender's `BLI_heap` (`blenlib/intern/heap.cc`): a binary min-heap whose tie order depends
-//! on its exact sift rules, which Decimate's collapse order relies on. Nodes are addressed by
-//! [`NodeId`]; a node keeps its `ptr` (an element index for the caller) until it is popped or removed.
+//! Port of Blender's `BLI_heap` (`blenlib/intern/BLI_heap.cc`, `heap_up`, `heap_down`,
+//! `BLI_heap_remove`, `BLI_heap_node_value_update`): a binary min-heap whose tie order depends on its
+//! exact sift rules, which Decimate's collapse order and the edge-flip pass rely on. Nodes are
+//! addressed by [`NodeId`]; a node keeps its `ptr` (an element index for the caller) until it is
+//! popped or removed.
 
 /// Handle of a live heap node. Stale handles are the caller's bug, as with Blender's `HeapNode *`.
 pub(super) type NodeId = usize;
@@ -35,6 +37,16 @@ impl Heap {
     /// Value of the minimum node. The heap must not be empty.
     pub(super) fn top_value(&self) -> f32 {
         self.nodes[self.tree[0]].value
+    }
+
+    /// Element pointer of the minimum node. The heap must not be empty.
+    pub(super) fn top_ptr(&self) -> usize {
+        self.nodes[self.tree[0]].ptr
+    }
+
+    /// Value of `node`, which must be live.
+    pub(super) fn value(&self, node: NodeId) -> f32 {
+        self.nodes[node].value
     }
 
     pub(super) fn insert(&mut self, value: f32, ptr: usize) -> NodeId {

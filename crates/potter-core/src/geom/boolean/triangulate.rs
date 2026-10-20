@@ -2,13 +2,11 @@
 //!
 //! Ports Blender's `triangulate_poly` chain from `blenlib/intern/mesh_intersect.cc`
 //! (`is_quad_flip_first_third`, `polyfill_triangulate_poly`, `exact_triangulate_poly`,
-//! `any_degenerate_tris_fast`, `triangulate_poly`) and the float ear clipper behind
-//! `BLI_polyfill_calc` (`blenlib/intern/polyfill_2d.cc`).
+//! `any_degenerate_tris_fast`, `triangulate_poly`). The ear clipper behind `BLI_polyfill_calc`
+//! (`blenlib/intern/polyfill_2d.cc`) is the shared [`polyfill`] of `geom/triangulate.rs`, and the
+//! projection frame is `ortho_basis` of the same module.
 //!
 //! Deviations from Blender:
-//! - `polyfill_2d.cc` finds blocking vertices through a KD-tree with an index cache. Both only
-//!   accelerate the search: the ear accepted at each step is the same. This port tests the
-//!   non-convex ring vertices directly, using the KD-tree's precomputed-edge predicate.
 //! - `face_is_degenerate` has no caller in Blender 5.2 and is not ported.
 //! - Only the clockwise-projection branch of `BLI_polyfill_calc` is ported, because
 //!   `polyfill_triangulate_poly` always passes `coords_sign == 1`.
@@ -17,16 +15,14 @@ use std::collections::HashMap;
 
 use glam::DVec3;
 
-use crate::geom::edge_key;
+use crate::geom::{
+    edge_key,
+    triangulate::{ortho_basis, polyfill},
+};
 
 use super::cdt::{CdtInput, delaunay_2d_calc_inside};
 use super::exact::Rat2;
 use super::imesh::{Arena, NO_INDEX, Tri};
-
-/// Blender `CONCAVE`, `TANGENTIAL`, `CONVEX` ear classes of `polyfill_2d.cc`.
-const CONCAVE: i8 = -1;
-const TANGENTIAL: i8 = 0;
-const CONVEX: i8 = 1;
 
 /// Triangulate one input face (Blender `triangulate_poly` for faces of any length).
 ///
@@ -90,7 +86,7 @@ fn polyfill_triangulate_poly(
         .iter()
         .map(|&v| project(arena.vert(v).co_f, basis0, basis1))
         .collect();
-    polyfill_calc(&projected)
+    polyfill(&projected)
         .into_iter()
         .map(|tri| {
             let mut eo = [NO_INDEX; 3];
@@ -275,20 +271,6 @@ fn projection_axes(normal: DVec3) -> ([f32; 3], [f32; 3]) {
     ortho_basis(n.map(|c| -c))
 }
 
-/// Blender `ortho_basis_v3v3_v3`.
-fn ortho_basis(n: [f32; 3]) -> ([f32; 3], [f32; 3]) {
-    let f = n[0] * n[0] + n[1] * n[1];
-    if f > f32::EPSILON {
-        let d = 1.0 / f.sqrt();
-        let b0 = [n[1] * d, -n[0] * d, 0.0];
-        let b1 = [-n[2] * b0[1], n[2] * b0[0], n[0] * b0[1] - n[1] * b0[0]];
-        (b0, b1)
-    } else {
-        let b0 = [if n[2] < 0.0 { -1.0 } else { 1.0 }, 0.0, 0.0];
-        (b0, [0.0, 1.0, 0.0])
-    }
-}
-
 /// Blender `mul_v2_m3v3` against the projection basis, in float.
 fn project(co: DVec3, basis0: [f32; 3], basis1: [f32; 3]) -> [f32; 2] {
     let p = [co.x as f32, co.y as f32, co.z as f32];
@@ -297,223 +279,6 @@ fn project(co: DVec3, basis0: [f32; 3], basis1: [f32; 3]) -> [f32; 2] {
 
 fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-}
-
-fn sub2(a: [f32; 2], b: [f32; 2]) -> [f32; 2] {
-    [a[0] - b[0], a[1] - b[1]]
-}
-
-/// Blender `signum_enum`: sign of the doubled signed area, with NaN treated as concave.
-fn signum_enum(area2: f32) -> i8 {
-    if area2 > 0.0 {
-        CONVEX
-    } else if area2 >= 0.0 {
-        TANGENTIAL
-    } else {
-        CONCAVE
-    }
-}
-
-/// Blender `span_tri_v2_sign`: orientation class of the corner `v2` formed by `v1`, `v2`, `v3`.
-fn span_tri_sign(v1: [f32; 2], v2: [f32; 2], v3: [f32; 2]) -> i8 {
-    // Blender `area_tri_signed_v2_alt_2x(v3, v2, v1)`.
-    let d2 = sub2(v2, v3);
-    let d3 = sub2(v1, v3);
-    signum_enum(d2[0] * d3[1] - d3[0] * d2[1])
-}
-
-/// Blender `pf_coord_sign_calc` for ring corner `cur`.
-fn corner_sign(coords: &[[f32; 2]], prev: usize, cur: usize, next: usize) -> i8 {
-    span_tri_sign(coords[prev], coords[cur], coords[next])
-}
-
-/// Blender `TriIsectPrecomputed`: inside-or-on test of a triangle with precomputed edge vectors.
-struct EarTest {
-    edge: [[f32; 2]; 3],
-    c: [f32; 3],
-}
-
-impl EarTest {
-    fn new(v: [[f32; 2]; 3]) -> Self {
-        let edge = [sub2(v[1], v[0]), sub2(v[2], v[1]), sub2(v[0], v[2])];
-        let c = [0, 1, 2].map(|i| edge[i][0] * v[i][1] - v[i][0] * edge[i][1]);
-        Self { edge, c }
-    }
-
-    fn contains(&self, co: [f32; 2]) -> bool {
-        // Edge 1 fails most often; check it first as Blender does.
-        let side = |k: usize| self.edge[k][1] * co[0] - self.edge[k][0] * co[1] + self.c[k] >= 0.0;
-        side(1) && side(2) && side(0)
-    }
-}
-
-#[derive(Clone, Copy)]
-struct Corner {
-    prev: usize,
-    next: usize,
-    sign: i8,
-}
-
-/// Circular ear-clipping state of Blender's `PolyFill`. Corner `i` is coordinate `i`.
-struct EarClipper<'a> {
-    coords: &'a [[f32; 2]],
-    corners: Vec<Corner>,
-    head: usize,
-    count: usize,
-    /// Corners whose sign is not `CONVEX`.
-    concave: usize,
-    tris: Vec<[usize; 3]>,
-}
-
-/// Blender `BLI_polyfill_calc` for clockwise projected coordinates (`coords_sign == 1`). Returns
-/// `n - 2` triangles as indices into `coords`, each keeping the ring winding.
-fn polyfill_calc(coords: &[[f32; 2]]) -> Vec<[usize; 3]> {
-    let n = coords.len();
-    let mut corners: Vec<Corner> = (0..n)
-        .map(|i| Corner {
-            prev: (i + n - 1) % n,
-            next: (i + 1) % n,
-            sign: CONVEX,
-        })
-        .collect();
-    let signs: Vec<i8> = corners
-        .iter()
-        .enumerate()
-        .map(|(i, c)| corner_sign(coords, c.prev, i, c.next))
-        .collect();
-    for (corner, sign) in corners.iter_mut().zip(signs) {
-        corner.sign = sign;
-    }
-    let concave = corners.iter().filter(|c| c.sign != CONVEX).count();
-    let mut clipper = EarClipper {
-        coords,
-        corners,
-        head: 0,
-        count: n,
-        concave,
-        tris: Vec::with_capacity(n.saturating_sub(2)),
-    };
-    clipper.clip_all();
-    clipper.tris
-}
-
-impl EarClipper<'_> {
-    /// Blender `pf_coord_sign_calc` stored on the corner.
-    fn recompute_sign(&mut self, i: usize) {
-        let c = self.corners[i];
-        self.corners[i].sign = corner_sign(self.coords, c.prev, i, c.next);
-    }
-
-    /// Blender `pf_ear_tip_check` with the KD-tree's predicate: `tip` is an ear of class
-    /// `sign_accept` when no other non-convex corner lies inside or on its triangle.
-    fn is_ear(&self, tip: usize, sign_accept: i8) -> bool {
-        if self.concave == 0 {
-            return true;
-        }
-        let c = self.corners[tip];
-        if c.sign != sign_accept {
-            return false;
-        }
-        let (next, prev) = (c.next, c.prev);
-        let triangle = EarTest::new([self.coords[tip], self.coords[next], self.coords[prev]]);
-        let mut checked = 0;
-        let mut curr = self.corners[next].next;
-        while curr != prev {
-            if self.corners[curr].sign != CONVEX {
-                if triangle.contains(self.coords[curr]) {
-                    return false;
-                }
-                checked += 1;
-                if checked == self.concave {
-                    break;
-                }
-            }
-            curr = self.corners[curr].next;
-        }
-        true
-    }
-
-    /// Blender `pf_ear_tip_find`: two passes for proper ears, then the desperate fallback.
-    fn find_ear(&self, init: usize, reverse: bool) -> usize {
-        for sign_accept in [CONVEX, TANGENTIAL] {
-            let mut ear = init;
-            for _ in 0..self.count {
-                if self.is_ear(ear, sign_accept) {
-                    return ear;
-                }
-                ear = self.step(ear, reverse);
-            }
-        }
-        let mut ear = init;
-        for _ in 0..self.count {
-            if self.corners[ear].sign != CONCAVE {
-                return ear;
-            }
-            ear = self.corners[ear].next;
-        }
-        ear
-    }
-
-    fn step(&self, i: usize, reverse: bool) -> usize {
-        if reverse {
-            self.corners[i].prev
-        } else {
-            self.corners[i].next
-        }
-    }
-
-    /// Blender `pf_ear_tip_cut`: emit `(prev, ear, next)` and unlink `ear`.
-    fn cut(&mut self, ear: usize) {
-        let Corner { prev, next, .. } = self.corners[ear];
-        self.tris.push([prev, ear, next]);
-        self.corners[next].prev = prev;
-        self.corners[prev].next = next;
-        if self.head == ear {
-            self.head = next;
-        }
-        self.count -= 1;
-    }
-
-    /// Blender `pf_triangulate`.
-    fn clip_all(&mut self) {
-        let mut ear_init = self.head;
-        let mut reverse = false;
-        while self.count > 3 {
-            let ear = self.find_ear(ear_init, reverse);
-            if self.corners[ear].sign != CONVEX {
-                self.concave -= 1;
-            }
-            let Corner { prev, next, .. } = self.corners[ear];
-            self.cut(ear);
-
-            for neighbor in [prev, next] {
-                if self.corners[neighbor].sign != CONVEX {
-                    self.recompute_sign(neighbor);
-                    if self.corners[neighbor].sign == CONVEX {
-                        self.concave -= 1;
-                    }
-                }
-            }
-
-            // Clip-even sweep: start the next search past the ear just clipped, and step once more
-            // when that corner is not convex. The direction alternates (Blender USE_CLIP_SWEEP).
-            ear_init = if reverse {
-                self.corners[prev].prev
-            } else {
-                self.corners[next].next
-            };
-            if self.corners[ear_init].sign != CONVEX {
-                ear_init = self.step(ear_init, reverse);
-                reverse = !reverse;
-            }
-        }
-        if self.count == 3 {
-            let a = self.head;
-            let b = self.corners[a].next;
-            let c = self.corners[b].next;
-            self.tris.push([a, b, c]);
-        }
-    }
 }
 
 #[cfg(test)]

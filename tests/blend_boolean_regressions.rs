@@ -37,8 +37,8 @@ use blender_file::blender_executable;
 #[path = "fixtures/boolean_parity/comparator.rs"]
 mod comparator;
 use comparator::{
-    TestResult, evaluate_boolean, expected_canonical, find_node, import_blend_scene, mismatches,
-    read_scene, run_generator, run_pot,
+    TestResult, evaluate_booleans_together, expected_canonical, find_node, import_blend_scene,
+    mismatches, read_scene, run_generator, run_pot,
 };
 
 use std::{
@@ -78,6 +78,18 @@ const REGRESSION_CASES: [&str; 25] = [
     "rotated_touch_53",
     "rotated_touch_61",
     "cavity_wall_normal",
+    "sphere_open64_hole_tolerant_on",
+    "sphere_open64_hole_tolerant_off",
+    "sphere_open128_hole_tolerant_on",
+    "sphere_closed64_hole_tolerant_on",
+    "sphere_closed64_raw_1",
+    "sphere_closed64_raw_2",
+];
+
+/// The sphere cases: EXACT Booleans on UV spheres, the heaviest of the corpus. They run in their own
+/// test so each test stays under the per-test budget; together with the rest they are exactly
+/// `REGRESSION_CASES`.
+const SPHERE_CASES: [&str; 6] = [
     "sphere_open64_hole_tolerant_on",
     "sphere_open64_hole_tolerant_off",
     "sphere_open128_hole_tolerant_on",
@@ -248,8 +260,13 @@ fn assert_rotated_matrix_capture(document: &SceneDoc) -> TestResult {
     Ok(())
 }
 
-#[test]
-fn exact_boolean_regressions_match_blender() -> TestResult {
+/// Runs `cases` against Blender's expectations: one generator run, one import, `checks_after_import`
+/// on the imported scene, one Potter batch for the operations those cases need, then each case
+/// compared with its expectation.
+fn check_regression_cases(
+    cases: &[&str],
+    checks_after_import: fn(&SceneDoc) -> TestResult,
+) -> TestResult {
     let blender = blender_executable().ok_or(BLENDER_REQUIRED)?;
     let fixture =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/boolean_parity/regressions");
@@ -262,7 +279,7 @@ fn exact_boolean_regressions_match_blender() -> TestResult {
     )?;
     let project = root.join("project");
     let mut document = import_blend_scene(&blender, &root.join("scene.blend"), &project)?;
-    assert_rotated_matrix_capture(&document)?;
+    checks_after_import(&document)?;
 
     let expectations = read_expectations(&fixture.join("expected"))?;
     assert_eq!(
@@ -272,8 +289,8 @@ fn exact_boolean_regressions_match_blender() -> TestResult {
         REGRESSION_CASES.len()
     );
     let mut failures = Vec::new();
-    for case in REGRESSION_CASES {
-        if !expectations.contains_key(case) {
+    for case in cases {
+        if !expectations.contains_key(*case) {
             failures.push(format!("{case}: Blender expectation is missing"));
         }
     }
@@ -311,8 +328,15 @@ fn exact_boolean_regressions_match_blender() -> TestResult {
     run_pot(&["apply", project_path, "--file", batch_path, "--json"])?;
     document = read_scene(&project)?;
 
-    for (case, expected_json) in &expectations {
-        let node_id = find_node(&document, case)?;
+    let hosts = cases
+        .iter()
+        .map(|case| find_node(&document, case))
+        .collect::<TestResult<Vec<Id>>>()?;
+    let evaluated = evaluate_booleans_together(&document, &hosts);
+    for (case, (node_id, result)) in cases.iter().zip(hosts.into_iter().zip(evaluated)) {
+        let Some(expected_json) = expectations.get(*case) else {
+            continue;
+        };
         if expected_json["kind"] == "applied" {
             let node = document
                 .nodes
@@ -371,7 +395,7 @@ fn exact_boolean_regressions_match_blender() -> TestResult {
                 ));
             }
         }
-        match evaluate_boolean(&document, &node_id) {
+        match result {
             Ok(actual) => {
                 let expected = expected_canonical(expected_json)?;
                 failures.extend(
@@ -390,4 +414,18 @@ fn exact_boolean_regressions_match_blender() -> TestResult {
         failures.join("\n")
     );
     Ok(())
+}
+
+#[test]
+fn exact_boolean_regressions_match_blender() -> TestResult {
+    let cases: Vec<&str> = REGRESSION_CASES
+        .into_iter()
+        .filter(|case| !SPHERE_CASES.contains(case))
+        .collect();
+    check_regression_cases(&cases, assert_rotated_matrix_capture)
+}
+
+#[test]
+fn exact_boolean_sphere_regressions_match_blender() -> TestResult {
+    check_regression_cases(&SPHERE_CASES, |_| Ok(()))
 }

@@ -89,7 +89,7 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
-use super::float_connect::ortho_basis;
+use crate::geom::triangulate::ortho_basis;
 
 type P2 = [f32; 2];
 type P3 = [f32; 3];

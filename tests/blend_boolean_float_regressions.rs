@@ -7,8 +7,8 @@ use blender_file::blender_executable;
 #[path = "fixtures/boolean_parity/comparator.rs"]
 mod comparator;
 use comparator::{
-    TestResult, evaluate_boolean, expected_canonical, find_node, import_blend_scene, mismatches,
-    run_generator,
+    TestResult, evaluate_booleans_together, expected_canonical, find_node, import_blend_scene,
+    mismatches, run_generator,
 };
 
 use std::{fs, path::Path};
@@ -681,7 +681,7 @@ fn boolean_float_boundaries_match_blender() -> TestResult {
             .get(case)
             .ok_or_else(|| format!("Blender FLOAT expectation `{case}` is missing"))?;
         let node_id = find_node(&scene, case)?;
-        match evaluate_boolean(&scene, &node_id) {
+        match evaluate_booleans_together(&scene, std::slice::from_ref(&node_id)).remove(0) {
             Ok(actual) => {
                 let canonical = expected_canonical(expected_json)?;
                 failures.extend(
@@ -741,7 +741,7 @@ fn boolean_float_boundaries_match_blender() -> TestResult {
             .ok_or_else(|| format!("Boolean host `{case}` is missing"))?
             .modifiers
             .retain(|modifier| modifier.modifier_type != "boolean");
-        match evaluate_boolean(&input_only, &node_id) {
+        match evaluate_booleans_together(&input_only, std::slice::from_ref(&node_id)).remove(0) {
             Ok(actual) => {
                 let expected = expected_canonical(expected_json)?;
                 failures.extend(
