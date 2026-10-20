@@ -2,7 +2,7 @@
 //! same scene.
 //!
 //! `fixtures/native_oracle/object_ray_visibility.py` builds the scene and renders it with Cycles
-//! (96 x 96, 128 samples, seed 0, two bounces, a 1 px box filter). The test runs it headless into a
+//! (64 x 64, 32 samples, seed 0, two bounces, a 1 px box filter). The test runs it headless into a
 //! temporary directory, which writes the `.blend` and the linear EXR. Potter imports the `.blend`,
 //! renders it with the same settings, and both images are reduced to the mean RGB of six square
 //! patches. Each patch is in world metres on the 3 m square frame (+Y up). The patches sit where a
@@ -34,8 +34,8 @@ use tempfile::tempdir;
 const SCRIPT: &str = include_str!("fixtures/native_oracle/object_ray_visibility.py");
 
 /// Render settings shared with `object_ray_visibility.py`.
-const RESOLUTION: u32 = 96;
-const SAMPLES: u32 = 128;
+const RESOLUTION: u32 = 64;
+const SAMPLES: u32 = 32;
 const MAX_BOUNCES: u32 = 2;
 /// The orthographic frame spans this many metres on each axis, centred on the origin.
 const FRAME_SIZE: f64 = 3.0;

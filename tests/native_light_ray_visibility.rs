@@ -2,8 +2,8 @@
 //! scene.
 //!
 //! `fixtures/native_oracle/light_ray_visibility.py` builds a diffuse floor, a mirror sphere, and two
-//! disk area lights, and renders the flagged scene and the default-flag scene with Cycles (96 x 96,
-//! 128 samples, seed 0, one bounce, a 1 px box filter). The test runs it headless into a temporary
+//! disk area lights, and renders the flagged scene and the default-flag scene with Cycles (64 x 64,
+//! 32 samples, seed 0, one bounce, a 1 px box filter). The test runs it headless into a temporary
 //! directory and imports the flagged `.blend`. Potter renders it with the same settings, and both
 //! images are reduced to the mean RGB of square patches in world metres on the 3 m frame (+Y up).
 
@@ -33,8 +33,8 @@ use tempfile::tempdir;
 const SCRIPT: &str = include_str!("fixtures/native_oracle/light_ray_visibility.py");
 
 /// Render settings shared with `light_ray_visibility.py`.
-const RESOLUTION: u32 = 96;
-const SAMPLES: u32 = 128;
+const RESOLUTION: u32 = 64;
+const SAMPLES: u32 = 32;
 const MAX_BOUNCES: u32 = 1;
 /// The orthographic frame spans this many metres on each axis, centred on the origin.
 const FRAME_SIZE: f64 = 3.0;

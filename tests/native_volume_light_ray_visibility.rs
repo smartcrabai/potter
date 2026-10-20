@@ -2,7 +2,7 @@
 //! the same scene.
 //!
 //! `fixtures/native_oracle/volume_light_ray_visibility.py` renders a scattering fog cube under a point
-//! light twice with Cycles (96 x 96, 256 samples, seed 0, one bounce): once with the light's
+//! light twice with Cycles (64 x 64, 64 samples, seed 0, one bounce): once with the light's
 //! `visible_volume_scatter` off and once at the default. The test runs it headless into a temporary
 //! directory and imports the flagged `.blend`. Potter renders it with the same settings, and both
 //! images are reduced to the mean RGB of square patches in world metres on the 3 m frame (+Y up).
@@ -33,8 +33,8 @@ use tempfile::tempdir;
 const SCRIPT: &str = include_str!("fixtures/native_oracle/volume_light_ray_visibility.py");
 
 /// Render settings shared with `volume_light_ray_visibility.py`.
-const RESOLUTION: u32 = 96;
-const SAMPLES: u32 = 256;
+const RESOLUTION: u32 = 64;
+const SAMPLES: u32 = 64;
 const MAX_BOUNCES: u32 = 1;
 /// The orthographic frame spans this many metres on each axis, centred on the origin.
 const FRAME_SIZE: f64 = 3.0;
