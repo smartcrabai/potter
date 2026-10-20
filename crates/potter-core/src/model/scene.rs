@@ -1477,6 +1477,20 @@ fn default_volume_color() -> [f64; 3] {
     [0.5; 3]
 }
 
+/// Blender's `cycles.volume_sampling` for a material: distance, equiangular, or multiple importance sampling of
+/// both (Blender's default). A volume's direct light is sampled along its ray in the chosen way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VolumeSampling {
+    Distance,
+    Equiangular,
+    #[default]
+    MultipleImportance,
+}
+
+fn is_default_volume_sampling(value: &VolumeSampling) -> bool {
+    *value == VolumeSampling::default()
+}
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct World {
@@ -2383,6 +2397,9 @@ pub struct Material {
     pub volume_color: [f64; 3],
     #[serde(default)]
     pub volume_anisotropy: f64,
+    /// Blender's `cycles.volume_sampling`: how a volume's direct light is sampled (Cycles' `volume_stack_sample_method`).
+    #[serde(default, skip_serializing_if = "is_default_volume_sampling")]
+    pub volume_sampling: VolumeSampling,
     /// Blender's viewport display values, which Solid shading reads. Set by `.blend` import; omitted when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub viewport_display: Option<ViewportDisplay>,
@@ -2412,6 +2429,7 @@ impl Default for Material {
             volume_density: 0.0,
             volume_color: default_volume_color(),
             volume_anisotropy: 0.0,
+            volume_sampling: VolumeSampling::default(),
             viewport_display: None,
         }
     }

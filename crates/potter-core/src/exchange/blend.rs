@@ -32,7 +32,7 @@ use crate::{
         NlaStrip, NlaTrack, Node, ParentType, Profile, Registry, RenderSettings, RigidBody,
         RigidBodyShape, RigidBodyType, RigidBodyWorld, Scene, SceneDoc, ShapeKey, ShapeKeyData,
         SurfaceData, SurfacePoint, TextObjectData, TimelineMarker, Transform, UnitSettings,
-        VertexGroup, ViewLayer, ViewportDisplay, World,
+        VertexGroup, ViewLayer, ViewportDisplay, VolumeSampling, World,
     },
     sequencer::{
         EffectType as SequenceEffectType, RetimingKey, Strip as SequenceStrip, StripBlendType,
@@ -3347,6 +3347,7 @@ fn build_imported_graph(
                 volume_density: number_field(item, "volume_density", 0.0),
                 volume_color: vec3_field(item, "volume_color", [0.5; 3]),
                 volume_anisotropy: number_field(item, "volume_anisotropy", 0.0),
+                volume_sampling: volume_sampling_field(name, item)?,
                 ..Material::default()
             },
         );
@@ -6331,6 +6332,23 @@ fn displacement_method_field(name: &str, item: &Value) -> Result<String> {
         "both" => Ok("bump".to_owned()),
         other => Err(invalid_intermediate(&format!(
             "material `{name}` has unknown displacement_method `{other}`"
+        ))),
+    }
+}
+
+/// Potter's volume sampling from a bridge material (Blender's `cycles.volume_sampling`). Absent means Blender's
+/// default, multiple importance sampling.
+fn volume_sampling_field(name: &str, item: &Value) -> Result<VolumeSampling> {
+    match item
+        .get("volume_sampling")
+        .and_then(Value::as_str)
+        .unwrap_or("multiple_importance")
+    {
+        "distance" => Ok(VolumeSampling::Distance),
+        "equiangular" => Ok(VolumeSampling::Equiangular),
+        "multiple_importance" => Ok(VolumeSampling::MultipleImportance),
+        other => Err(invalid_intermediate(&format!(
+            "material `{name}` has unknown volume_sampling `{other}`"
         ))),
     }
 }

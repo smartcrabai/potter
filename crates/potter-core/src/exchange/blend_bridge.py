@@ -5993,6 +5993,10 @@ def _material_field_values(material):
         "volume_density": 0.0,
         "volume_color": [0.5, 0.5, 0.5],
         "volume_anisotropy": 0.0,
+        "volume_sampling": {"DISTANCE": "distance", "EQUIANGULAR": "equiangular",
+                            "MULTIPLE_IMPORTANCE": "multiple_importance"}.get(
+            getattr(getattr(material, "cycles", None), "volume_sampling", "MULTIPLE_IMPORTANCE"),
+            "multiple_importance"),
     }
     output = _material_output(material.node_tree) if material.node_tree is not None else None
     if output is None:
@@ -6757,6 +6761,8 @@ def export_doc(doc, target, pack, scene_hash, context):
         mat.metallic = viewport["metallic"] if viewport else item["metallic"]
         mat.use_backface_culling = not bool(item.get("double_sided", True))
         mat.displacement_method = "DISPLACEMENT" if item.get("displacement_method") == "displacement" else "BUMP"
+        mat.cycles.volume_sampling = {"distance": "DISTANCE", "equiangular": "EQUIANGULAR"}.get(
+            item.get("volume_sampling"), "MULTIPLE_IMPORTANCE")
         set_id(mat, material_id)
         source = compatibility_block(doc, "materials", "Material", material_id)
         set_props(mat, source.get("custom_properties", {}))
