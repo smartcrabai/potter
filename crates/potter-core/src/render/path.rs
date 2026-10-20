@@ -2956,11 +2956,13 @@ enum MediumOutcome {
 /// null-collision chain that this cuts off is negligible for the densities a rendered medium has.
 const MAX_MEDIUM_EVENTS: u32 = 4096;
 
-/// Spectral ratio tracking over a homogeneous medium segment of length `distance`
-/// (`intern/cycles/kernel/integrator/shade_volume.h`, `volume_integrate_heterogeneous`). Tentative collisions
-/// come at the majorant `max_c σt_c`. Each is a scatter, a null collision or an absorption, chosen with the
-/// channel-mean probabilities, and the throughput takes each channel's own branch weight. Every channel's
-/// transmittance and single-scatter integral is then exact in expectation.
+/// Spectral ratio tracking over a medium segment of length `distance`
+/// (`intern/cycles/kernel/integrator/shade_volume.h`, `volume_integrate_heterogeneous`). A medium with no
+/// scattering is attenuated deterministically, as Cycles does (`Absorption only`): each channel takes
+/// `exp(-σa·distance)` and no event is drawn. Otherwise tentative collisions come at the majorant `max_c σt_c`.
+/// Each is a scatter, a null collision or an absorption, chosen with the channel-mean probabilities, and the
+/// throughput takes each channel's own branch weight. Every channel's transmittance and single-scatter integral
+/// is then exact in expectation.
 fn trace_mesh_medium(
     medium: &BsdfParams,
     distance: f64,
@@ -2969,6 +2971,17 @@ fn trace_mesh_medium(
 ) -> MediumOutcome {
     let scatter = DVec3::from_array(medium.volume_scatter);
     let absorption = DVec3::from_array(medium.volume_absorption);
+    if scatter == DVec3::ZERO {
+        // A channel with no absorption stays at one, which keeps an infinite segment from giving 0 · ∞.
+        *throughput *= DVec3::from_array(absorption.to_array().map(|sigma| {
+            if sigma > 0.0 {
+                (-sigma * distance).exp()
+            } else {
+                1.0
+            }
+        }));
+        return MediumOutcome::Survive;
+    }
     let extinction = scatter + absorption;
     let majorant = extinction.max_element();
     if majorant <= 0.0 {

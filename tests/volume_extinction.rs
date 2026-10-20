@@ -12,6 +12,9 @@ use serde_json::{Value, json};
 use tempfile::tempdir;
 
 const SIZE: u32 = 24;
+/// The pixels on each side of the centre that are averaged. The slab fills the centre of the frame, so every
+/// averaged pixel has the same expectation, and the block mean reduces the sampling noise of a stochastic render.
+const BLOCK: u32 = 4;
 const GRAPH: &str = "volume_graph";
 const ABSORPTION: &str = "ShaderNodeVolumeAbsorption";
 
@@ -93,8 +96,8 @@ fn graph_operations(nodes: Vec<Value>, links: Vec<Value>) -> Vec<Value> {
     operations
 }
 
-/// Renders the centre pixel of the scene in linear RGB.
-fn render_center_pixel(scene: &Path, output_directory: &Path) -> Result<[f64; 3], Box<dyn Error>> {
+/// Renders the frame and returns the mean of the central `BLOCK` × `BLOCK` pixels in linear RGB.
+fn render_center_block(scene: &Path, output_directory: &Path) -> Result<[f64; 3], Box<dyn Error>> {
     let output = pot()
         .arg("render")
         .arg(scene)
@@ -115,13 +118,29 @@ fn render_center_pixel(scene: &Path, output_directory: &Path) -> Result<[f64; 3]
     if info.color_type != png::ColorType::Rgba || info.width != SIZE {
         return Err("renderer PNG is not the expected RGBA image".into());
     }
-    let offset = ((SIZE / 2) * SIZE + SIZE / 2) as usize * 4;
-    Ok([0_usize, 1, 2].map(|channel| srgb_to_linear(f64::from(pixels[offset + channel]) / 255.0)))
+    let mut sum = [0.0; 3];
+    let first = SIZE / 2 - BLOCK / 2;
+    for y in first..first + BLOCK {
+        for x in first..first + BLOCK {
+            let offset = ((y * SIZE + x) as usize) * 4;
+            for (channel, total) in sum.iter_mut().enumerate() {
+                *total += srgb_to_linear(f64::from(pixels[offset + channel]) / 255.0);
+            }
+        }
+    }
+    let count = f64::from(BLOCK * BLOCK);
+    Ok(sum.map(|total| total / count))
 }
 
-/// Renders one unit slab with a volume-only material in front of a white world of strength 1. The
-/// graph is `nodes` and `links`; the caller links the final closure to the output's Volume socket.
-fn render_slab(nodes: Vec<Value>, links: Vec<Value>) -> Result<[f64; 3], Box<dyn Error>> {
+/// Renders one unit slab with a volume-only material in front of a white world of strength 1, at `samples` per
+/// pixel and `max_bounces`. The graph is `nodes` and `links`; the caller links the final closure to the output's
+/// Volume socket.
+fn render_slab_at(
+    nodes: Vec<Value>,
+    links: Vec<Value>,
+    samples: u32,
+    max_bounces: u32,
+) -> Result<[f64; 3], Box<dyn Error>> {
     let directory = tempdir()?;
     let scene = directory.path().join("scene");
     let mut operations = graph_operations(nodes, links);
@@ -131,10 +150,16 @@ fn render_slab(nodes: Vec<Value>, links: Vec<Value>) -> Result<[f64; 3], Box<dyn
         json!({"op":"world.create","id":"world_main","color":[1.0,1.0,1.0],"strength":1.0}),
         json!({"op":"camera.create","id":"camera_main","transform":{"translation":[0.0,0.0,3.0]},"projection":"orthographic","ortho_scale":2.0}),
         json!({"op":"scene.update","target":{"id":"scene_main"},"set":{"camera":"camera_main","world":"world_main"}}),
-        json!({"op":"render.update","target":{"id":"scene_main"},"set":{"resolution_x":SIZE,"resolution_y":SIZE,"samples":1,"seed":0,"max_bounces":2}}),
+        json!({"op":"render.update","target":{"id":"scene_main"},"set":{"resolution_x":SIZE,"resolution_y":SIZE,"samples":samples,"seed":0,"max_bounces":max_bounces}}),
     ]);
     make_scene(&scene, &operations)?;
-    render_center_pixel(&scene, &directory.path().join("render"))
+    render_center_block(&scene, &directory.path().join("render"))
+}
+
+/// Renders the slab for an absorption-only graph. Cycles attenuates such a slab deterministically
+/// (`volume_integrate_heterogeneous`, "Absorption only"), so one sample per pixel is exact.
+fn render_slab(nodes: Vec<Value>, links: Vec<Value>) -> Result<[f64; 3], Box<dyn Error>> {
+    render_slab_at(nodes, links, 1, 2)
 }
 
 /// Renders the slab with one volume node of `node_type` and `inputs` feeding the output.
@@ -165,7 +190,7 @@ fn oracle_case(name: &str) -> Result<([f64; 3], [f64; 3]), Box<dyn Error>> {
     Ok((triple("mean")?, triple("stderr")?))
 }
 
-/// Checks Potter's centre pixel against the analytic value (within 0.01) and against Blender's oracle
+/// Checks Potter's centre block against the analytic value (within 0.01) and against Blender's oracle
 /// (within 0.01 plus four Blender standard errors).
 fn assert_matches(
     name: &str,
@@ -226,11 +251,19 @@ fn principled_absorption_colour_transmits_exp_of_one_minus_sqrt_per_channel()
 
 #[test]
 fn volume_scatter_conserves_a_white_environment() -> Result<(), Box<dyn Error>> {
-    // Albedo 1 in a uniform white world: every path ends in the environment, so the radiance is 1.
-    // The former grey model (extinction Density, albedo Color) gave 0.68 for Color 0.5.
-    let measured = render_single_volume(
-        "ShaderNodeVolumeScatter",
-        json!({"Color": [0.2, 0.5, 0.8, 1.0], "Density": 1.0}),
+    // Albedo 1 in a uniform white world: every path ends in the environment, so the radiance is 1. Blender's oracle
+    // runs with 64 bounces (`generate_volume_extinction_oracle.py`): a path that scatters more than twice is cut off
+    // at the 2-bounce budget of the absorption slabs, so this case uses the oracle's budget. A scattering path is
+    // stochastic, so the block is rendered at 512 samples per pixel.
+    let measured = render_slab_at(
+        vec![node(
+            "volume",
+            "ShaderNodeVolumeScatter",
+            json!({"Color": [0.2, 0.5, 0.8, 1.0], "Density": 1.0}),
+        )],
+        vec![link("volume", "Volume", "output", "Volume")],
+        512,
+        64,
     )?;
     assert_matches("volume_scatter_white", measured, [1.0; 3])
 }
