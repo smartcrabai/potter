@@ -36,8 +36,8 @@ def out_path():
 
 
 BASE = [
-    (-2.0, -2.0, -2.0), (2.0, -2.0, -2.0), (2.0, 2.0, -2.0), (-2.0, 2.0, -2.0),
-    (-2.0, -2.0, 2.0), (2.0, -2.0, 2.0), (2.0, 2.0, 2.0), (-2.0, 2.0, 2.0),
+    (-2.0, -2.0, -2.0), (-2.0, -2.0, 2.0), (-2.0, 2.0, -2.0), (-2.0, 2.0, 2.0),
+    (2.0, -2.0, -2.0), (2.0, -2.0, 2.0), (2.0, 2.0, -2.0), (2.0, 2.0, 2.0),
 ]
 ASYMMETRIC = [
     (-2.2, -1.8, -2.0), (2.1, -1.7, -2.1), (2.1, 1.9, -2.2), (-2.0, 1.7, -1.8),
@@ -86,14 +86,15 @@ def subject_grid(name, transform=True):
 
 
 def cage_box(name, corners, transform=True):
-    # The face list is Potter's `Mesh::box_mesh` list exactly, including each polygon's starting corner:
-    # Blender's corner-triangle diagonal depends on it. Its winding is outward (normals point away from the
-    # box), which Mesh Deform's inside test requires.
-    faces = [(0, 3, 2, 1), (4, 5, 6, 7), (0, 1, 5, 4), (1, 2, 6, 5), (2, 3, 7, 6), (3, 0, 4, 7)]
-    mesh = bpy.data.meshes.new(name + "Mesh")
-    mesh.from_pydata(list(corners), [], faces)
-    obj = bpy.data.objects.new(name, mesh)
-    bpy.context.scene.collection.objects.link(obj)
+    # Blender's own cube (`primitive_cube_add`) gives the vertex order and face list Potter's
+    # `Mesh::box_mesh` follows. Mesh Deform's index-based cage moves and corner triangulation depend on
+    # that order, so the corners are assigned by index onto Blender's primitive.
+    bpy.ops.mesh.primitive_cube_add(size=2.0)
+    obj = bpy.context.active_object
+    obj.name = name
+    obj.data.name = name + "Mesh"
+    for vertex, corner in zip(obj.data.vertices, corners):
+        vertex.co = corner
     if transform:
         set_transform(obj, CAGE_TRANSLATION, CAGE_ROTATION, CAGE_SCALE)
     return obj
