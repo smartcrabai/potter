@@ -106,9 +106,6 @@ fn boolean_matches_blender_parity_corpus() -> TestResult {
             )
             .into());
         }
-        let generated_edges = generated_json
-            .get("edges")
-            .ok_or_else(|| format!("generated Blender expectation for `{case}` has no edges"))?;
         if !expected_json["faces"].is_array() || !expected_json["vertex_groups"].is_object() {
             return Err(format!(
                 "{solver} case `{case}` must record faces and vertex groups, including empty payloads"
@@ -118,12 +115,7 @@ fn boolean_matches_blender_parity_corpus() -> TestResult {
         let node_id = find_node(&document, &case)?;
         match evaluate_boolean(&document, &node_id) {
             Ok(actual) => {
-                let mut comparison_json = expected_json.clone();
-                comparison_json
-                    .as_object_mut()
-                    .ok_or("Boolean expectation is not an object")?
-                    .insert("edges".to_owned(), generated_edges.clone());
-                let expected = expected_canonical(&comparison_json)?;
+                let expected = expected_canonical(&expected_json)?;
                 failures.extend(
                     mismatches(&actual, &expected)
                         .into_iter()
