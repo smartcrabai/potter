@@ -7,7 +7,7 @@ use crate::{
     eval::Snapshot,
     geom::volume::{VolumeData, sample_density_checked_with, sample_density_with},
     image::{ImageData, ImageInterpolation},
-    model::{Id, LightType, SceneDoc},
+    model::{Id, LightType, SceneDoc, VolumeSampling},
     shader::{
         BsdfParams, EvaluatorWorkspace, HitContext, HitUvLayers, PreparedMaterial,
         equirectangular_uv, evaluate_surface_with_workspace, height_gradient,
@@ -861,7 +861,6 @@ fn trace_path(
         // Voxel volumes sample their grid by free flight. Under their material's `volume_sampling` their direct light is
         // equiangular about each light's point, as the mesh medium's is, unless a mesh medium is on top: its direct light
         // covers the whole segment, so voxel events then take distance sampling in full.
-        use crate::model::VolumeSampling;
         let grid = voxel_grid(volumes, origin, direction, segment_limit)?;
         let voxel_method = match (&grid, media.is_empty()) {
             (Some(grid), true) => segment_sampling(grid.samplings.iter().copied()),
@@ -1125,7 +1124,7 @@ fn trace_path(
         if surface.params.has_medium() {
             // A medium surface passes the path and changes the volume stack: it enters the medium of its
             // object, or leaves the one it entered.
-            toggle_mesh_medium(&mut media, surface.object_index, surface.params);
+            toggle_mesh_medium(&mut media, surface.object_index, &surface.params);
             volume_bounds += 1;
             if volume_bounds > VOLUME_BOUNDS_MAX {
                 break;
@@ -2041,7 +2040,7 @@ fn shadow_transmittance(
         if surface.params.has_medium() {
             // A medium surface passes the shadow ray and changes the stack, as it does for a path. It is
             // not a transparent surface, so it does not count against the budget.
-            toggle_mesh_medium(&mut shadow_media, surface.object_index, surface.params);
+            toggle_mesh_medium(&mut shadow_media, surface.object_index, &surface.params);
         } else {
             // Cycles counts each transparent surface a shadow ray crosses against the path's remaining
             // budget and blocks the ray past it (`intern/cycles/kernel/bvh/intersect_filter.h`).
@@ -2895,7 +2894,7 @@ fn trace_mesh_medium(
 }
 
 /// Pushes the medium of `object_index` when the path enters it, or pops it when the path leaves it.
-fn toggle_mesh_medium(media: &mut Vec<MeshMedium>, object_index: u32, params: BsdfParams) {
+fn toggle_mesh_medium(media: &mut Vec<MeshMedium>, object_index: u32, params: &BsdfParams) {
     if let Some(position) = media
         .iter()
         .rposition(|medium| medium.object_index == object_index)
@@ -2904,7 +2903,7 @@ fn toggle_mesh_medium(media: &mut Vec<MeshMedium>, object_index: u32, params: Bs
     } else {
         media.push(MeshMedium {
             object_index,
-            params,
+            params: *params,
         });
     }
 }
@@ -3049,7 +3048,7 @@ fn voxel_grid(
     let mut extinction = Vec::with_capacity(steps);
     let mut emission = Vec::with_capacity(steps);
     let mut scatter = vec![DVec3::ZERO; steps];
-    for index in 0..steps {
+    for (index, step_total) in scatter.iter_mut().enumerate() {
         let point = origin + direction * (entry + (index as f64 + 0.5) * step);
         let mut step_extinction = 0.0;
         let mut step_emission = DVec3::ZERO;
@@ -3059,7 +3058,7 @@ fn voxel_grid(
             let step_scatter = instance.albedo * coefficient;
             step_extinction += coefficient;
             step_emission += instance.emission * density;
-            scatter[index] += step_scatter;
+            *step_total += step_scatter;
             if let Some(group) = groups
                 .iter_mut()
                 .find(|group| crate::float::equal_f64(group.anisotropy, instance.anisotropy))
@@ -3101,7 +3100,7 @@ fn grid_depth(grid: &VoxelGrid, distance: f64) -> f64 {
 /// The grid step containing `distance`, or `None` off the grid.
 fn grid_step_index(grid: &VoxelGrid, distance: f64) -> Option<usize> {
     let offset = (distance - grid.entry) / grid.step;
-    (offset >= 0.0 && offset < grid.extinction.len() as f64).then(|| offset as usize)
+    (offset >= 0.0 && offset < grid.extinction.len() as f64).then_some(offset as usize)
 }
 
 /// The scatter per meter and channel of a per-step table at `distance`, zero off the grid.

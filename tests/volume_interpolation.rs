@@ -4,9 +4,9 @@
 //! Cycles' CUBIC is the B-spline of `kernel_image_interp_tricubic_nanovdb`, which Potter's `cubic_weights` follows.
 //!
 //! Thresholds come from noise, not from a fixed tolerance. Each image is compared over the whole 24×24 frame. The
-//! noise floor of a comparison is sqrt(σ_potter² + σ_blender²), where σ is the per-pixel RMS of an image's mean
-//! about its expectation, relative to the image mean. σ_blender is the oracle's (`noise.sigma_blender`, four seeds).
-//! σ_potter is measured here from two seeds per mode, σ_single / √2.
+//! noise floor of a comparison is `sqrt(sigma_potter^2 + sigma_blender^2)`, where `sigma` is the per-pixel RMS of an
+//! image's mean about its expectation, relative to the image mean. `sigma_blender` is the oracle's
+//! (`noise.sigma_blender`, four seeds). `sigma_potter` is measured here from two seeds per mode, `sigma_single / sqrt(2)`.
 
 use std::{error::Error, fs, path::Path, process::Output};
 
@@ -20,7 +20,7 @@ const ENERGY: f64 = 100.0;
 const POSITION: [f64; 3] = [1.6, 0.6, 0.9];
 const DENSITY_SCALE: f64 = 0.2;
 const SAMPLES: u32 = 32768;
-/// Potter seeds per mode. The mean of the two has noise σ_single / √2.
+/// Potter seeds per mode. The mean of the two has noise `sigma_single / sqrt(2)`.
 const SEEDS: [u32; 2] = [0, 1];
 /// A match is within this many noise floors (three RMS deviations of noise alone).
 const MATCH_BANDS: f64 = 3.0;
@@ -167,7 +167,7 @@ fn relative_rms(measured: &[f64], reference: &[f64]) -> f64 {
 }
 
 /// The per-render noise of two independent renders of one scene, relative to the mean of the first: the RMS of one
-/// render about its expectation, since the difference of two has variance 2σ².
+/// render about its expectation, since the difference of two has variance `2 * sigma^2`.
 fn single_render_noise(first: &[f64], second: &[f64]) -> f64 {
     let squares: f64 = first
         .iter()
@@ -185,7 +185,8 @@ fn average(first: &[f64], second: &[f64]) -> Vec<f64> {
         .collect()
 }
 
-/// Renders the scene at each of `SEEDS` for one interpolation mode. Returns the seed mean and its noise, σ_single / √2.
+/// Renders the scene at each of `SEEDS` for one interpolation mode. Returns the seed mean and its noise,
+/// `sigma_single / sqrt(2)`.
 fn render_mode(directory: &Path, interpolation: &str) -> Result<(Vec<f64>, f64), Box<dyn Error>> {
     let mut runs = Vec::new();
     for seed in SEEDS {
@@ -233,7 +234,7 @@ fn cubic_and_linear_voxel_interpolation_match_blender_per_pixel() -> Result<(), 
     // and, if the modes differ, the Blender LINEAR-to-CUBIC signal on top. The threshold is halfway between the two.
     let cross_floor = (sigma_potter_linear.powi(2) + sigma_blender_cubic.powi(2)).sqrt();
     let expected_separation = (cross_floor.powi(2) + signal.powi(2)).sqrt();
-    let threshold = (cross_floor + expected_separation) / 2.0;
+    let threshold = cross_floor.midpoint(expected_separation);
     let linear_against_cubic = relative_rms(&linear, &blender_cubic);
     assert!(
         linear_against_cubic > threshold,

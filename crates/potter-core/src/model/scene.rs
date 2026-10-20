@@ -1488,8 +1488,9 @@ pub enum VolumeSampling {
     MultipleImportance,
 }
 
-fn is_default_volume_sampling(value: &VolumeSampling) -> bool {
-    *value == VolumeSampling::default()
+/// Skips a volume setting in serde output when it is at its default, which is then read back as the default.
+fn is_serialised_default<T: Default + PartialEq>(value: &T) -> bool {
+    *value == T::default()
 }
 
 /// Blender's `cycles.volume_interpolation` for a material: trilinear (Blender's default) or the cubic B-spline of
@@ -1502,9 +1503,6 @@ pub enum VolumeInterpolation {
     Cubic,
 }
 
-fn is_default_volume_interpolation(value: &VolumeInterpolation) -> bool {
-    *value == VolumeInterpolation::default()
-}
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct World {
@@ -2412,10 +2410,10 @@ pub struct Material {
     #[serde(default)]
     pub volume_anisotropy: f64,
     /// Blender's `cycles.volume_sampling`: how a volume's direct light is sampled (Cycles' `volume_stack_sample_method`).
-    #[serde(default, skip_serializing_if = "is_default_volume_sampling")]
+    #[serde(default, skip_serializing_if = "is_serialised_default")]
     pub volume_sampling: VolumeSampling,
     /// Blender's `cycles.volume_interpolation`: how a voxel volume's density is interpolated between its samples.
-    #[serde(default, skip_serializing_if = "is_default_volume_interpolation")]
+    #[serde(default, skip_serializing_if = "is_serialised_default")]
     pub volume_interpolation: VolumeInterpolation,
     /// Blender's viewport display values, which Solid shading reads. Set by `.blend` import; omitted when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]

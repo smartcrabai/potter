@@ -44,7 +44,8 @@ pub use scene::{
     Profile, ReconstructedPoint, Reconstruction, RenderSettings, RigidBody, RigidBodyShape,
     RigidBodyType, RigidBodyWorld, Scene, SceneDoc, SolvedCamera, SurfaceData, SurfacePoint,
     TextObjectData, TextureRef, TimelineMarker, TrackingMarker, TrackingObject, TrackingObjectPose,
-    TrackingTrack, UnitSettings, ViewLayer, ViewportDisplay, World,
+    TrackingTrack, UnitSettings, ViewLayer, ViewportDisplay, VolumeInterpolation, VolumeSampling,
+    World,
 };
 pub(crate) use scene::{material_link_at, material_slot_count, resolve_material_slot};
 pub use transform::{Transform, canonicalize_quaternion, normalize_rotation};
