@@ -100,6 +100,9 @@ fn mesh_volume_round_trip_stays_within_one_voxel_of_source_bounds() {
         size: DVec3::new(1.7, 2.2, 2.5),
     })
     .unwrap();
+    // Mesh to Volume is Volume-object-only: its flags are 0 (MOD_mesh_to_volume.cc:194), so a mesh
+    // object cannot take it (BKE_object_support_modifier_type_check, object.cc:1464-1482). The Blender
+    // fixtures in tests/volume_parity.rs cover the modifier itself.
     let voxel_size = 0.2;
     // One interior voxel of band and unit density: the fog grid's zero background bounds the surface.
     let volume = volume::mesh_to_fog_volume(&source, voxel_size, voxel_size, 1.0).unwrap();
