@@ -1177,19 +1177,6 @@ fn modifier_to_apply(
                 format!("modifier `{modifier_id}` was not found on node `{target}`"),
             )
         })?;
-    if stack[index].modifier_type == "boolean" {
-        crate::geom::modifiers::validate_boolean_topology_suffix(
-            stack,
-            index,
-            &|position, modifier| {
-                if position == index {
-                    modifier.enabled
-                } else {
-                    modifier.is_active(EvaluationPurpose::Preview)
-                }
-            },
-        )?;
-    }
     Ok((stack[index].clone(), index))
 }
 

@@ -43,6 +43,7 @@ pub mod modifiers;
 pub(crate) mod multires_external;
 pub(crate) mod normals;
 pub mod pointcloud;
+pub(crate) mod pool_slots;
 pub(crate) mod provenance;
 pub mod remesh;
 pub mod sculpt;

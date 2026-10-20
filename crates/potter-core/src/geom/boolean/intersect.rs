@@ -623,7 +623,7 @@ pub(crate) fn trimesh_nary_intersect(
     let bbs = calc_face_bounding_boxes(arena, &clean);
     let ov = TriOverlaps::new(&clean, &bbs, nshapes, shape_fn, use_self);
     let itts = calc_overlap_itts(arena, &clean, &ov);
-    let clinfo = find_clusters(arena, &clean, &bbs, &itts);
+    let clinfo = find_clusters(arena, &clean, &bbs, &itts, ov.pairs.len());
     let mut subdivided: Vec<Vec<Tri>> = vec![Vec::new(); clean.len()];
     calc_subdivided_non_cluster_tris(arena, &mut subdivided, &clean, &itts, &clinfo, &ov);
     let cluster_cd: Vec<CdtData> = {
@@ -744,7 +744,10 @@ mod tests {
         let bbs = calc_face_bounding_boxes(&arena, &tris);
         let ov = TriOverlaps::new(&tris, &bbs, 2, &shape, false);
         let itts = calc_overlap_itts(&arena, &tris, &ov);
-        assert_eq!(find_clusters(&arena, &tris, &bbs, &itts).tot_cluster(), 1);
+        assert_eq!(
+            find_clusters(&arena, &tris, &bbs, &itts, ov.pairs.len()).tot_cluster(),
+            1
+        );
 
         let out = trimesh_nary_intersect(&mut arena, &tris, 2, &shape, false);
         // Each square's pieces cover exactly that square once: 2 * area = 8 each.
