@@ -3,6 +3,7 @@ use std::f64::consts::TAU;
 use glam::DVec3;
 use serde::{Deserialize, Serialize};
 
+use super::wireframe::{self, ScreenPoint, WireEdge, WireSegment};
 use crate::error::{ErrorCode, PotError, Result};
 use crate::float::equal_f64;
 use crate::model::{CameraData, CameraProjection};
@@ -977,6 +978,113 @@ pub(crate) fn rasterize_with_lines(
                 output.elements[pixel_index] = line.element_index;
             }
         }
+    }
+    Ok(output)
+}
+/// The wireframe preview of `edges` (`render/wireframe.rs`): each line is projected, coloured by the
+/// facing of its corner normals (or by its own colour, for a stroke), and rasterised with the overlay's
+/// nearest-line and anti-aliasing rules. The background is the theme's interior colour.
+pub(crate) fn rasterize_wireframe(
+    edges: &[WireEdge],
+    camera: &Camera,
+    width: u32,
+    height: u32,
+) -> Result<RasterOutput> {
+    let mut output = rasterize_with_samples(
+        &[],
+        camera,
+        width,
+        height,
+        Mode::Wire,
+        wireframe::background_rgba(),
+        1,
+        0,
+        None,
+    )?;
+    let frame = camera_frame(camera, width, height)?;
+    let width_usize = usize::try_from(width).map_err(|_| {
+        PotError::new(
+            ErrorCode::LimitExceeded,
+            "image width exceeds platform limits",
+        )
+    })?;
+    let height_usize = usize::try_from(height).map_err(|_| {
+        PotError::new(
+            ErrorCode::LimitExceeded,
+            "image height exceeds platform limits",
+        )
+    })?;
+    let orthographic = matches!(frame.projection, ProjectionFrame::Orthographic { .. });
+    let (rim, interior) = wireframe::theme_linear();
+    let facing = |normal: DVec3, point: DVec3| {
+        // An orthographic view has one direction; a perspective view looks from the eye to the point.
+        let toward_viewer = if orthographic {
+            -frame.forward
+        } else {
+            (camera.position - point).normalize_or_zero()
+        };
+        normal.dot(toward_viewer)
+    };
+    // Window depth in [0, 1], where the cleared buffer is 1.
+    let window_depth = |point: DVec3| {
+        ((frame_depth(&frame, camera.position, point) - camera.near) / (camera.far - camera.near))
+            .clamp(0.0, 1.0)
+    };
+    let mut segments = Vec::with_capacity(edges.len());
+    for edge in edges {
+        if !is_finite_vec3(edge.start)
+            || !is_finite_vec3(edge.end)
+            || !edge.wd.is_finite()
+            || !edge.colour.iter().all(|channel| channel.is_finite())
+        {
+            return Err(PotError::new(
+                ErrorCode::EvaluationFailed,
+                "wireframe edge contains invalid geometry or color",
+            ));
+        }
+        if !wireframe::edge_visible(edge.wd, wireframe::WIRE_THRESHOLD) {
+            continue;
+        }
+        let Some(start) = project_world(camera, &frame, width, height, edge.start) else {
+            continue;
+        };
+        let Some(end) = project_world(camera, &frame, width, height, edge.end) else {
+            continue;
+        };
+        let (colour_a, colour_b) = match edge.normals {
+            Some([normal_a, normal_b]) => (
+                wireframe::facing_colour(facing(normal_a, edge.start), rim, interior),
+                wireframe::facing_colour(facing(normal_b, edge.end), rim, interior),
+            ),
+            None => (edge.colour, edge.colour),
+        };
+        segments.push(WireSegment {
+            // `project_world` puts pixel centres on integers; the overlay model takes pixel `i` as
+            // `[i, i + 1)`, so its centres sit at `i + 0.5`.
+            a: ScreenPoint {
+                x: start.x + 0.5,
+                y: start.y + 0.5,
+                depth: window_depth(edge.start),
+            },
+            b: ScreenPoint {
+                x: end.x + 0.5,
+                y: end.y + 0.5,
+                depth: window_depth(edge.end),
+            },
+            colour_a,
+            colour_b,
+        });
+    }
+    let linear = wireframe::composite(&segments, width_usize, height_usize);
+    for (index, colour) in linear.iter().enumerate() {
+        let encoded = [
+            wireframe::display_byte(colour[0]),
+            wireframe::display_byte(colour[1]),
+            wireframe::display_byte(colour[2]),
+            255,
+        ];
+        output.rgba[index * 4..index * 4 + 4].copy_from_slice(&encoded);
+        output.linear_rgba[index] = [colour[0] as f32, colour[1] as f32, colour[2] as f32, 1.0];
     }
     Ok(output)
 }

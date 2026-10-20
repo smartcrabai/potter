@@ -15,6 +15,9 @@ from wire_model import (DISC_RADIUS, LINE_SMOOTH_END, LINE_SMOOTH_START, clamp01
                         mix, smoothstep, srgb_to_linear, wire_rgb_linear)
 
 
+LINE_SPAN = 0.5
+
+
 def cov(dist):
     # line_coverage(dist, kernel 0, smooth) = smoothstep(END, START, |dist|).
     return smoothstep(LINE_SMOOTH_END, LINE_SMOOTH_START, abs(dist))
@@ -87,7 +90,7 @@ def draw(records, width, height, p0, p1, c0, c1):
         for px in range(minx, maxx + 1):
             rx, ry = px + 0.5 - x0, py + 0.5 - y0
             t = rx * ux + ry * uy
-            if t < -0.5 or t > length + 0.5:
+            if t < -LINE_SPAN or t > length + LINE_SPAN:
                 continue
             d = rx * perp[0] + ry * perp[1]  # signed distance to the infinite line
             if abs(d) > 0.5:
@@ -96,7 +99,13 @@ def draw(records, width, height, p0, p1, c0, c1):
             colour = [mix(a, b, f) for a, b in zip(c0, c1)]
             depth = z0 + (z1 - z0) * f
             # The fragment's `line_output` (perp, dist) and colour; the last drawn fragment wins.
-            records[py * width + px] = {"colour": colour, "dist": d, "dir": perp, "depth": depth}
+            # Depth test LESS_EQUAL against the cleared depth buffer (window depth, 1.0 when empty): the nearest
+            # line wins a pixel, and an equal depth goes to the later fragment.
+            window_depth = (depth + 1.0) * 0.5
+            current = records.get(py * width + px)
+            if current is not None and window_depth > current["depth"]:
+                continue
+            records[py * width + px] = {"colour": colour, "dist": d, "dir": perp, "depth": window_depth}
 
 
 def antialias(records, width, height, bg):
@@ -141,7 +150,8 @@ def antialias(records, width, height, bg):
             nc = [c * k for c in n["colour"]]
             na = k
             if n["depth"] < c_depth:
-                c_color = [a + b * (1 - c_alpha) for a, b in zip(nc, c_color)]
+                # alpha over: target = neighbour + target * (1 - neighbour.a)
+                c_color = [a + b * (1 - na) for a, b in zip(nc, c_color)]
                 c_alpha = na + c_alpha * (1 - na)
                 c_depth = n["depth"]
             else:
