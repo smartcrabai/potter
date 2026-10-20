@@ -132,7 +132,7 @@ elif case == "armature_modifier":
         bendy_pose.rotation_axis_angle = (angle, axis.x, axis.y, axis.z)
     start_handle_pose = rig.pose.bones["StartHandle"]
     start_handle_pose.rotation_mode = "XYZ"
-    start_handle_pose.rotation_euler = (0.12, -0.18, 0.09)
+    start_handle_pose.rotation_euler = (0.12, -0.18, 4.0)
     end_handle_pose = rig.pose.bones["EndHandle"]
     end_handle_pose.rotation_mode = "XYZ"
     end_handle_pose.rotation_euler = (-0.14, 0.1, -0.12)
@@ -176,6 +176,7 @@ elif case == "armature_modifier":
     for name in ("Root", "Bendy", "StartHandle", "EndHandle"):
         pose_bone = rig.pose.bones[name]
         pose_basis[name] = {"rotation_mode": pose_bone.rotation_mode,
+                            "rotation_euler": [float(value) for value in pose_bone.rotation_euler],
                             "matrix_basis": [list(row) for row in pose_bone.matrix_basis]}
     with open(os.path.join(root, "blender_geometry.json"), "w", encoding="utf-8") as handle:
         json.dump({"input_positions": vertices, "positions": positions, "pose": pose_basis}, handle)
@@ -248,6 +249,7 @@ result["pose"] = {}
 for name in ("Root", "Bendy", "StartHandle", "EndHandle"):
     pose_bone = rig.pose.bones[name]
     result["pose"][name] = {"rotation_mode": pose_bone.rotation_mode,
+                            "rotation_euler": [float(value) for value in pose_bone.rotation_euler],
                             "matrix_basis": [list(row) for row in pose_bone.matrix_basis]}
 with open(output_path, "w", encoding="utf-8") as handle:
     json.dump(result, handle)
@@ -339,7 +341,28 @@ fn assert_reopened_pose(reopened: &Value, original: &Value, mode: &str) {
                 );
             }
         }
+        if original[bone]["rotation_mode"] != "QUATERNION"
+            && original[bone]["rotation_mode"] != "AXIS_ANGLE"
+        {
+            // A no-op round trip writes the source Euler values back unchanged: no 2*pi wrapping.
+            let actual = reopened[bone]["rotation_euler"].as_array().unwrap();
+            let expected = original[bone]["rotation_euler"].as_array().unwrap();
+            for (axis, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+                let (actual, expected) = (actual.as_f64().unwrap(), expected.as_f64().unwrap());
+                assert!(
+                    (actual - expected).abs() <= 1.0e-5,
+                    "{mode}: {bone} rotation_euler[{axis}]: {actual} != {expected}"
+                );
+            }
+        }
     }
+    let start_handle_z = reopened["StartHandle"]["rotation_euler"][2]
+        .as_f64()
+        .unwrap();
+    assert!(
+        (start_handle_z - 4.0).abs() <= 1.0e-5,
+        "{mode}: StartHandle rotation_euler z must survive a no-op round trip as 4.0 rad, got {start_handle_z}"
+    );
 }
 
 fn assert_positions_close(actual: &Value, expected: &Value, context: &str) {
