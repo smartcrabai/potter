@@ -15,8 +15,7 @@ use crate::{
 };
 
 use super::principled_bsdf::{
-    continuous_density, evaluate as evaluate_bsdf, lobe_probabilities, sample_sheen,
-    sheen_layer_weight,
+    Layers, continuous_density, evaluate as evaluate_bsdf, layers, lobe_probabilities,
 };
 use super::{
     bvh::{Bvh, BvhHit},
@@ -110,6 +109,8 @@ struct Surface {
     /// Origin of shadow rays: `point` on flat triangles, lifted onto the smooth surface otherwise.
     shadow_point: DVec3,
     params: BsdfParams,
+    /// The sheen and coat layers at this hit, set up once for the hit's view direction.
+    layers: Layers,
     object_index: u32,
     element_index: u32,
     distance: f64,
@@ -452,70 +453,79 @@ pub(super) fn render(
                 let (radiance, alpha) = if camera.stereo_mode == StereoMode::Anaglyph {
                     let left_camera = camera_eye(camera, -1.0);
                     let right_camera = camera_eye(camera, 1.0);
-                    let (left_origin, left_direction) =
+                    let left_ray =
                         ray_for_sample(&left_camera, width, height, x, y, sample_x, sample_y)?;
-                    let (right_origin, right_direction) =
+                    let right_ray =
                         ray_for_sample(&right_camera, width, height, x, y, sample_x, sample_y)?;
                     let mut left_rng = rng.clone();
                     let mut right_rng = rng.clone();
-                    let (left, left_alpha) = trace_path(
-                        doc,
-                        snapshot,
-                        geometry,
-                        &bvh,
-                        &lights,
-                        &volumes,
-                        images,
-                        world_importance.as_ref(),
-                        left_origin,
-                        left_direction,
-                        environment,
-                        max_bounces,
-                        transparent_max_bounces,
-                        &mut left_rng,
-                        &mut evaluator_workspace,
-                    )?;
-                    let (right, right_alpha) = trace_path(
-                        doc,
-                        snapshot,
-                        geometry,
-                        &bvh,
-                        &lights,
-                        &volumes,
-                        images,
-                        world_importance.as_ref(),
-                        right_origin,
-                        right_direction,
-                        environment,
-                        max_bounces,
-                        transparent_max_bounces,
-                        &mut right_rng,
-                        &mut evaluator_workspace,
-                    )?;
+                    // A sample with no ray (outside a fisheye's circle, or past its field of view) is opaque black: Blender's
+                    // film writes a pixel with no ray as black with alpha 1 under either film (`probe_transparent_film_fisheye.py`).
+                    let (left, left_alpha) = match left_ray {
+                        Some((left_origin, left_direction)) => trace_path(
+                            doc,
+                            snapshot,
+                            geometry,
+                            &bvh,
+                            &lights,
+                            &volumes,
+                            images,
+                            world_importance.as_ref(),
+                            left_origin,
+                            left_direction,
+                            environment,
+                            max_bounces,
+                            transparent_max_bounces,
+                            &mut left_rng,
+                            &mut evaluator_workspace,
+                        )?,
+                        None => (DVec3::ZERO, 1.0),
+                    };
+                    let (right, right_alpha) = match right_ray {
+                        Some((right_origin, right_direction)) => trace_path(
+                            doc,
+                            snapshot,
+                            geometry,
+                            &bvh,
+                            &lights,
+                            &volumes,
+                            images,
+                            world_importance.as_ref(),
+                            right_origin,
+                            right_direction,
+                            environment,
+                            max_bounces,
+                            transparent_max_bounces,
+                            &mut right_rng,
+                            &mut evaluator_workspace,
+                        )?,
+                        None => (DVec3::ZERO, 1.0),
+                    };
                     (
                         DVec3::new(left.x, right.y, right.z),
                         f64::midpoint(left_alpha, right_alpha),
                     )
                 } else {
-                    let (origin, direction) =
-                        ray_for_sample(camera, width, height, x, y, sample_x, sample_y)?;
-                    trace_path(
-                        doc,
-                        snapshot,
-                        geometry,
-                        &bvh,
-                        &lights,
-                        &volumes,
-                        images,
-                        world_importance.as_ref(),
-                        origin,
-                        direction,
-                        environment,
-                        max_bounces,
-                        transparent_max_bounces,
-                        &mut rng,
-                        &mut evaluator_workspace,
-                    )?
+                    match ray_for_sample(camera, width, height, x, y, sample_x, sample_y)? {
+                        Some((origin, direction)) => trace_path(
+                            doc,
+                            snapshot,
+                            geometry,
+                            &bvh,
+                            &lights,
+                            &volumes,
+                            images,
+                            world_importance.as_ref(),
+                            origin,
+                            direction,
+                            environment,
+                            max_bounces,
+                            transparent_max_bounces,
+                            &mut rng,
+                            &mut evaluator_workspace,
+                        )?,
+                        None => (DVec3::ZERO, 1.0),
+                    }
                 };
                 sum += radiance;
                 alpha_sum += alpha;
@@ -601,7 +611,6 @@ pub(super) fn composite_realtime_volumes(
             "image width exceeds platform limits",
         )
     })?;
-    let camera_forward = (camera.target - camera.position).normalize_or_zero();
     for y in 0..height {
         let row = usize::try_from(y)
             .ok()
@@ -625,12 +634,15 @@ pub(super) fn composite_realtime_volumes(
                     "pixel index exceeds platform limits",
                 )
             })?;
-            let (origin, direction) = ray_for_sample(camera, width, height, x, y, 0.5, 0.5)?;
+            let Some((origin, direction)) = ray_for_sample(camera, width, height, x, y, 0.5, 0.5)?
+            else {
+                continue;
+            };
             let max_distance = if output.ids[index] == 0 {
                 f64::INFINITY
             } else {
                 let projected_depth = f64::from(output.depths[index]);
-                projected_depth / direction.dot(camera_forward).max(f64::MIN_POSITIVE)
+                camera.ray_distance_for_depth(direction, projected_depth)
             };
             let mut rng = Pcg32::for_sample(seed, x, y, 0);
             let (volume_radiance, transmittance) = realtime_volume_integral(
@@ -952,7 +964,8 @@ fn trace_path(
             // Cycles shades the surface for emission, then ends the path (`integrate_surface_terminate`).
             radiance += throughput
                 * DVec3::from_array(surface.params.emission_color)
-                * surface.params.emission_strength;
+                * surface.params.emission_strength
+                * surface.layers.lower();
             break;
         }
         if rng.next_f64() >= surface.params.alpha.clamp(0.0, 1.0) {
@@ -963,7 +976,8 @@ fn trace_path(
         }
         radiance += throughput
             * DVec3::from_array(surface.params.emission_color)
-            * surface.params.emission_strength;
+            * surface.params.emission_strength
+            * surface.layers.lower();
         radiance += throughput
             * direct_lighting(
                 doc,
@@ -986,7 +1000,7 @@ fn trace_path(
             break;
         }
         let (next_direction, weight) =
-            match sample_bsdf(&surface.params, surface.normal, -direction, rng) {
+            match sample_bsdf(&surface.params, &surface.layers, rng) {
                 BsdfSample::Continuous {
                     direction,
                     weight,
@@ -1054,7 +1068,6 @@ fn write_center_passes(
     output: &mut RasterOutput,
     evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<()> {
-    let camera_forward = (camera.target - camera.position).normalize_or_zero();
     for y in 0..height {
         for x in 0..width {
             let index = usize::try_from(y)
@@ -1067,7 +1080,11 @@ fn write_center_passes(
                         "pixel index exceeds platform limits",
                     )
                 })?;
-            let (origin, direction) = ray_for_sample(camera, width, height, x, y, 0.5, 0.5)?;
+            // A pixel with no ray has no volume to attenuate, so its path-pass value stands.
+            let Some((origin, direction)) = ray_for_sample(camera, width, height, x, y, 0.5, 0.5)?
+            else {
+                continue;
+            };
             let hit = closest_hit(geometry, bvh, origin, direction, RAY_EPSILON, f64::INFINITY);
             let segment_limit = hit.map_or(f64::INFINITY, |hit| hit.distance);
             let volume_transmittance =
@@ -1098,8 +1115,7 @@ fn write_center_passes(
             }
             output.ids[index] = surface.object_index;
             output.elements[index] = surface.element_index;
-            output.depths[index] =
-                finite_f32((surface.point - camera.position).dot(camera_forward));
+            output.depths[index] = finite_f32(camera.depth_of(surface.point));
             output.normals[index] = surface.normal.to_array().map(finite_f32);
             output.ambient_occlusion[index] = finite_f32(super::raster::ambient_visibility(
                 bvh,
@@ -1110,10 +1126,14 @@ fn write_center_passes(
                 1.0,
             ));
             output.albedo[index] = surface.params.base_color.map(finite_f32);
+            // The emission pass is the beauty's emission term: the coat attenuates it per channel.
+            let emission = DVec3::from_array(surface.params.emission_color)
+                * surface.params.emission_strength
+                * surface.layers.lower();
             output.emission[index] = [
-                finite_f32(surface.params.emission_color[0] * surface.params.emission_strength),
-                finite_f32(surface.params.emission_color[1] * surface.params.emission_strength),
-                finite_f32(surface.params.emission_color[2] * surface.params.emission_strength),
+                finite_f32(emission.x),
+                finite_f32(emission.y),
+                finite_f32(emission.z),
                 1.0,
             ];
             if film_transparent {
@@ -1365,12 +1385,14 @@ fn make_surface(
     if params.normal.dot(-direction) < 0.0 {
         params.normal = -params.normal;
     }
+    let hit_layers = layers(&params, params.normal, -direction);
     Ok(Surface {
         point,
         normal: params.normal,
         geometric_normal,
         shadow_point,
         params,
+        layers: hit_layers,
         object_index: triangle.object_index,
         element_index: triangle.element_index,
         distance: hit.distance,
@@ -1445,12 +1467,12 @@ fn direct_lighting(
         let mis = if scatters && volumes.is_empty() && light.hittable() {
             power_heuristic(
                 sample.pdf,
-                continuous_density(&surface.params, normal, view, sample.direction),
+                continuous_density(&surface.params, &surface.layers, sample.direction),
             )
         } else {
             1.0
         };
-        contribution += evaluate_bsdf(&surface.params, normal, view, sample.direction)
+        contribution += evaluate_bsdf(&surface.params, &surface.layers, sample.direction)
             * sample.radiance
             * (cosine * visibility * mis);
     }
@@ -1478,13 +1500,13 @@ fn direct_lighting(
             rng,
             evaluator_workspace,
         )?;
-        let bsdf_pdf = continuous_density(&surface.params, normal, view, direction);
+        let bsdf_pdf = continuous_density(&surface.params, &surface.layers, direction);
         let weight = if scatters {
             power_heuristic(light_pdf, bsdf_pdf)
         } else {
             1.0
         };
-        contribution += evaluate_bsdf(&surface.params, normal, view, direction)
+        contribution += evaluate_bsdf(&surface.params, &surface.layers, direction)
             * environment_sample
             * (cosine * visibility * weight / light_pdf);
     }
@@ -2003,8 +2025,9 @@ enum BsdfSample {
     },
 }
 
-fn sample_bsdf(params: &BsdfParams, normal: DVec3, view: DVec3, rng: &mut Pcg32) -> BsdfSample {
-    let probabilities = lobe_probabilities(params, normal, view);
+fn sample_bsdf(params: &BsdfParams, layers: &Layers, rng: &mut Pcg32) -> BsdfSample {
+    let (normal, view) = (layers.normal, layers.view);
+    let probabilities = lobe_probabilities(params, layers);
     let choice = rng.next_f64();
     if choice < probabilities.transmission {
         let direction = refract(-view, normal, 1.0 / params.ior.max(1.0e-3))
@@ -2014,27 +2037,33 @@ fn sample_bsdf(params: &BsdfParams, normal: DVec3, view: DVec3, rng: &mut Pcg32)
             params.base_color[1],
             params.base_color[2],
         );
-        let layer = sheen_layer_weight(params, normal, view);
         let weight = tint
-            * (params.reflectance.clamp(0.0, 1.0) * params.transmission.clamp(0.0, 1.0) * layer
-                / probabilities.transmission.max(1.0e-8));
+            * (params.reflectance.clamp(0.0, 1.0) * params.transmission.clamp(0.0, 1.0)
+                / probabilities.transmission.max(1.0e-8))
+            * layers.lower();
         return BsdfSample::Delta { direction, weight };
     }
     let diffuse_end = probabilities.transmission + probabilities.diffuse;
+    let sheen_end = diffuse_end + probabilities.sheen;
+    let coat_end = sheen_end + probabilities.coat;
     let direction = if choice < diffuse_end {
         sample_cosine_hemisphere(normal, rng).0
-    } else if choice < diffuse_end + probabilities.sheen {
+    } else if choice < sheen_end {
         let first = rng.next_f64();
         let second = rng.next_f64();
-        sample_sheen(params, normal, view, first, second)
+        layers.sample_sheen(first, second)
+    } else if choice < coat_end {
+        let half_vector =
+            sample_ggx_half(params.coat_normal_or_shading(), params.coat_roughness, rng);
+        reflect(-view, half_vector).normalize_or_zero()
     } else {
         let half_vector = sample_ggx_half(normal, params.roughness, rng);
         reflect(-view, half_vector).normalize_or_zero()
     };
     // Estimator `f cos / p_mix`: the density is the lobe mixture, not the branch's own lobe.
-    let pdf = continuous_density(params, normal, view, direction);
+    let pdf = continuous_density(params, layers, direction);
     let cosine = normal.dot(direction).max(0.0);
-    let weight = evaluate_bsdf(params, normal, view, direction) * (cosine / pdf.max(1.0e-8));
+    let weight = evaluate_bsdf(params, layers, direction) * (cosine / pdf.max(1.0e-8));
     BsdfSample::Continuous {
         direction,
         weight,
@@ -3030,7 +3059,7 @@ mod sampling_tests {
                         theta.cos(),
                     );
                     let cosine = light.dot(normal);
-                    total += evaluate_bsdf(&params, normal, view, light)
+                    total += evaluate_bsdf(&params, &layers(&params, normal, view), light)
                         * (cosine * theta.sin() * d_theta * d_phi);
                 }
             }
@@ -3044,7 +3073,7 @@ mod sampling_tests {
         let mut sum = DVec3::ZERO;
         let mut sum_squares = DVec3::ZERO;
         for _ in 0..samples {
-            let weight = match sample_bsdf(&params, normal, view, &mut rng) {
+            let weight = match sample_bsdf(&params, &layers(&params, normal, view), &mut rng) {
                 BsdfSample::Continuous { weight, .. } | BsdfSample::Delta { weight, .. } => weight,
             };
             sum += weight;

@@ -76,13 +76,6 @@ pub fn feature_catalog() -> Value {
             [true, false, true, true, false, false, true],
         ),
         unsupported(
-            "shader.principled.coat",
-            "Principled coat layer",
-            "ShaderNodeBsdfPrincipled",
-            &["material.create", "material.update"],
-            "Potter's lobe model does not evaluate the Coat layer; a render with Coat Weight above zero reports UNSUPPORTED_FEATURE and omits its Cycles contribution.",
-        ),
-        unsupported(
             "shader.principled.subsurface",
             "Principled subsurface scattering",
             "ShaderNodeBsdfPrincipled",
@@ -1776,7 +1769,7 @@ pub fn feature_catalog() -> Value {
         ),
         supported(
             "camera.data",
-            "Perspective, orthographic, panorama, and fisheye camera data",
+            "Perspective, orthographic, and panorama camera data",
             "Camera",
             &["camera.create", "camera.update"],
             [true, true, true, true, true, false, false],
@@ -1790,7 +1783,7 @@ pub fn feature_catalog() -> Value {
         ),
         supported(
             "camera.panorama",
-            "Equirectangular and equidistant fisheye projections",
+            "Equirectangular panoramas with longitude and latitude limits, and fisheye equidistant and equisolid projections",
             "Camera",
             &["camera.create", "camera.update"],
             [true, true, true, true, true, false, false],

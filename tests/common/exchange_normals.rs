@@ -2,7 +2,7 @@
 //!
 //! The scene has three boxes with identical topology and shading: `Mixed` at the origin,
 //! `Mirror` with a negative X scale, and `NonUni` with a non-uniform scale. Shading is
-//! `f0` flat, `f1`..`f5` smooth, edge `e0` sharp, and face `f2` with custom normals. Blender
+//! `f4` flat (the -Z face), `f0`..`f3` and `f5` smooth, edge `e0` sharp, and face `f3` (-Y) with custom normals. Blender
 //! 5.2.2 computed the reference corner normals for exactly this scene
 //! (`tests/fixtures/exchange_normals/reference_corners.json`, one entry per face corner in
 //! world space).
@@ -33,7 +33,7 @@ pub const BLENDER_NORMAL_TOLERANCE: f64 = 2.0e-4;
 /// Corners per face and faces per box in the reference order (`Mixed`, `Mirror`, `NonUni` by box).
 const CORNERS_PER_FACE: usize = 4;
 const FACES_PER_BOX: usize = 6;
-/// The face (`f2`) of each box that carries custom normals in this fixture.
+/// The reference's third face group (-Y, `f3` in Potter's Blender-order box) carries custom normals.
 const CUSTOM_NORMAL_FACE: usize = 2;
 
 /// The one corner-normal bound for a comparison. `passes_custom_codes` is true when the compared
@@ -247,7 +247,7 @@ fn fixture_operations() -> Value {
     for object in ["mixed", "mirror", "nonuni"] {
         operations.push(json!({
             "op": "mesh.shade_smooth", "target": {"id": object},
-            "elements": {"domain": "face", "ids": ["f1", "f2", "f3", "f4", "f5"]}
+            "elements": {"domain": "face", "ids": ["f0", "f1", "f2", "f3", "f5"]}
         }));
         operations.push(json!({
             "op": "mesh.mark_sharp_by_angle", "target": {"id": object},
@@ -255,8 +255,8 @@ fn fixture_operations() -> Value {
         }));
         operations.push(json!({
             "op": "mesh.set_custom_normals", "target": {"id": object},
-            "elements": {"domain": "face", "ids": ["f2"]},
-            "normals": {"f2": [[0.6, 0.6, 0.0], [0.6, 0.6, 0.0], [0.6, 0.6, 0.0], [0.6, 0.6, 0.0]]}
+            "elements": {"domain": "face", "ids": ["f3"]},
+            "normals": {"f3": [[0.6, 0.6, 0.0], [0.6, 0.6, 0.0], [0.6, 0.6, 0.0], [0.6, 0.6, 0.0]]}
         }));
     }
     Value::Array(operations)

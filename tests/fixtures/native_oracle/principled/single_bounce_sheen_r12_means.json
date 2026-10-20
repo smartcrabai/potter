@@ -8,7 +8,7 @@
     "seeds": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
     "resolution": 16,
     "patch": "central 8x8",
-    "generator": "tests/fixtures/native_oracle/principled/single_bounce_probe.py with PROBE_DIAMETER=2.4 PROBE_VARIANTS=sheen_r050,sheen_r030_tint (16 seeds, 2 variants)",
+    "generator": "tests/fixtures/native_oracle/principled/single_bounce_probe.py with PROBE_DIAMETER=2.4 PROBE_VARIANTS=sheen_r050,sheen_r030_tint,sheen_r050_base08 (16 seeds, 3 variants)",
     "geometry": {
       "receiver": "plane at origin, normal +Z",
       "view_theta_deg": 45.0,
@@ -22,11 +22,15 @@
   "variants": {
     "sheen_r050": {
       "mean": [0.17817549932806287, 0.17817549932806287, 0.17817549932806287],
-      "stderr": [5.081926241668168e-06, 5.081926241668168e-06, 5.081926241668168e-06]
+      "stderr": [5.081926241668168e-6, 5.081926241668168e-6, 5.081926241668168e-6]
     },
     "sheen_r030_tint": {
       "mean": [0.004087217123924347, 0.0020436085619621736, 0.0010218042809810868],
-      "stderr": [2.6757491139633797e-07, 1.3378745569816899e-07, 6.689372784908449e-08]
+      "stderr": [2.6757491139633797e-7, 1.3378745569816899e-7, 6.689372784908449e-8]
+    },
+    "sheen_r050_base08": {
+      "mean": [6.06527002947405, 6.06527002947405, 6.06527002947405],
+      "stderr": [7.655433604088337e-4, 7.655433604088337e-4, 7.655433604088337e-4]
     }
   }
 }
