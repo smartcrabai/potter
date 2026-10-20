@@ -22,6 +22,13 @@ VARIANTS = {
     "diffuse_white": dict(metallic=0.0, roughness=0.5, base=(0.8, 0.8, 0.8, 1.0), spec=0.0),
     "spec_only_r024": dict(metallic=0.0, roughness=0.24, base=(0.0, 0.0, 0.0, 1.0)),
     "dielectric_white": dict(metallic=0.0, roughness=0.24, base=(0.8, 0.8, 0.8, 1.0)),
+    # Coat alone: no base diffuse and no base dielectric layer (Specular IOR Level 0).
+    "coat_r024": dict(metallic=0.0, roughness=0.24, base=(0.0, 0.0, 0.0, 1.0), spec=0.0,
+                      coat=1.0, coat_roughness=0.24, coat_ior=1.5, coat_tint=(1.0, 1.0, 1.0)),
+    # Coat over a white diffuse base with a tinted coat: exercises the layering and the tint.
+    "coat_tint_diffuse": dict(metallic=0.0, roughness=0.5, base=(0.8, 0.8, 0.8, 1.0),
+                              coat=0.5, coat_roughness=0.1, coat_ior=1.5,
+                              coat_tint=(1.0, 0.5, 0.25)),
 }
 
 def aim(obj, target):
@@ -59,6 +66,11 @@ def make(v, seed):
     b.inputs['IOR'].default_value = 1.5
     if 'spec' in v:
         b.inputs['Specular IOR Level'].default_value = v['spec']
+    if 'coat' in v:
+        b.inputs['Coat Weight'].default_value = v['coat']
+        b.inputs['Coat Roughness'].default_value = v['coat_roughness']
+        b.inputs['Coat IOR'].default_value = v['coat_ior']
+        b.inputs['Coat Tint'].default_value = (*v['coat_tint'], 1.0)
     plane.data.materials.append(mat)
     ld = bpy.data.lights.new('Disk', 'AREA')
     ld.shape = 'DISK'
