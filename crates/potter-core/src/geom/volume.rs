@@ -1279,9 +1279,10 @@ mod tests {
     };
 
     use super::{
-        VolumeData, VolumeGrid, mesh_to_volume, sample_density, sample_density_checked,
-        volume_to_mesh,
+        VolumeData, VolumeGrid, cubic_weights, mesh_to_volume, sample_density, sample_density_checked,
+        sample_density_with, volume_to_mesh,
     };
+    use crate::model::VolumeInterpolation;
 
     #[test]
     fn density_sampling_is_trilinear_and_zero_outside() {
@@ -1361,5 +1362,99 @@ mod tests {
             let expected = x + 2.0 * y + 3.0 * z;
             prop_assert!((actual - expected).abs() <= 1.0e-12);
         }
+    }
+
+    /// The uniform cubic B-spline `B3(u)` from its truncated-power definition, `(1/6) Σ_j (-1)^j C(4, j) (u + 2 - j)_+^3`,
+    /// which is not the Horner form `cubic_weights` evaluates.
+    fn truncated_power_cubic(u: f64) -> f64 {
+        let positive = |x: f64| x.max(0.0).powi(3);
+        (positive(u + 2.0) - 4.0 * positive(u + 1.0) + 6.0 * positive(u) - 4.0 * positive(u - 1.0)
+            + positive(u - 2.0))
+            / 6.0
+    }
+
+    #[test]
+    fn cubic_weights_are_the_truncated_power_b_spline_at_each_offset() {
+        for t in [0.0, 0.125, 0.25, 0.5, 0.75, 0.9375] {
+            let weights = cubic_weights(t);
+            // The sample at offset k from the floor gets B3(t - k), for k = -1, 0, 1, 2.
+            for (index, offset) in [-1.0, 0.0, 1.0, 2.0].into_iter().enumerate() {
+                let expected = truncated_power_cubic(t - offset);
+                assert!(
+                    (weights[index] - expected).abs() <= 1.0e-12,
+                    "t {t}, offset {offset}: {} vs {expected}",
+                    weights[index]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cubic_weights_sum_to_one_and_put_the_centroid_at_the_fraction() {
+        for t in [0.0, 0.125, 0.25, 0.5, 0.75, 0.9375] {
+            let weights = cubic_weights(t);
+            let total: f64 = weights.iter().sum();
+            let centroid: f64 = weights
+                .iter()
+                .zip([-1.0, 0.0, 1.0, 2.0])
+                .map(|(weight, offset)| weight * offset)
+                .sum();
+            assert!((total - 1.0).abs() <= 1.0e-12, "t {t}: sum {total}");
+            assert!((centroid - t).abs() <= 1.0e-12, "t {t}: centroid {centroid}");
+        }
+    }
+
+    /// A cubic B-spline with the grid values as its coefficients reproduces any linear function of the index
+    /// coordinate (its centroid is the coordinate), so the cubic sample of `1 + 0.1 x + 0.2 y + 0.05 z` is that function.
+    #[test]
+    fn cubic_sampling_reproduces_a_linear_field_in_the_interior() {
+        let dims = [8_u32, 8, 8];
+        let mut values = Vec::new();
+        for z in 0..dims[2] {
+            for y in 0..dims[1] {
+                for x in 0..dims[0] {
+                    values.push((1.0 + 0.1 * f64::from(x) + 0.2 * f64::from(y) + 0.05 * f64::from(z)) as f32);
+                }
+            }
+        }
+        let volume = VolumeData {
+            grids: vec![VolumeGrid {
+                dims,
+                voxel_size: 1.0,
+                origin: DVec3::ZERO,
+                values: Some(values),
+                blob_f32: None,
+                content_ref: None,
+            }],
+            ..VolumeData::default()
+        };
+        for coordinate in [DVec3::new(3.25, 4.5, 2.75), DVec3::new(2.5, 2.5, 5.9), DVec3::new(4.0, 3.0, 3.0)] {
+            let expected = 1.0 + 0.1 * coordinate.x + 0.2 * coordinate.y + 0.05 * coordinate.z;
+            let actual = sample_density_with(coordinate, &volume, VolumeInterpolation::Cubic);
+            // f32 storage of the samples bounds the error at about 1e-7 relative.
+            assert!((actual - expected).abs() <= 1.0e-6, "{coordinate:?}: {actual} vs {expected}");
+        }
+    }
+
+    /// Outside the grid's neighbours the background is zero: at x = 0.5 the node at x = -1 has weight
+    /// B3(1.5) = 1/48, so a constant grid of ones samples to 1 - 1/48 there and to 1 in the interior.
+    #[test]
+    fn cubic_sampling_of_a_constant_grid_loses_the_outside_neighbour_weight() {
+        let dims = [8_u32, 8, 8];
+        let volume = VolumeData {
+            grids: vec![VolumeGrid {
+                dims,
+                voxel_size: 1.0,
+                origin: DVec3::ZERO,
+                values: Some(vec![1.0; 512]),
+                blob_f32: None,
+                content_ref: None,
+            }],
+            ..VolumeData::default()
+        };
+        let edge = sample_density_with(DVec3::new(0.5, 3.5, 3.5), &volume, VolumeInterpolation::Cubic);
+        let interior = sample_density_with(DVec3::new(3.5, 3.5, 3.5), &volume, VolumeInterpolation::Cubic);
+        assert!((edge - (1.0 - 1.0 / 48.0)).abs() <= 1.0e-6, "edge {edge}");
+        assert!((interior - 1.0).abs() <= 1.0e-6, "interior {interior}");
     }
 }

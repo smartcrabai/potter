@@ -5,9 +5,11 @@ h = ((i * 73856093) ^ (j * 19349663) ^ (k * 83492791)) & 1023: a hashed binary g
 CUBIC differ far more than a smooth noise field does. It is written to a VDB named "density" (background 0, every node active),
 imported as a Volume object placed so that index (i, j, k) sits at world origin + (i, j, k) / 16, with origin
 (-0.5, -0.5, -0.5), the same node convention as Potter's inline grids. The material is a Volume Scatter (Color 1,
-Anisotropy 0) with Density = 0.2 * Volume Info density, so the render is single scatter, with enough scattering events per
-sample for the seed-to-seed noise to fall below the LINEAR-to-CUBIC difference: volume_bounces = max_bounces = 1, a point light of 100 W at (1.6, 0.6, 0.9), an orthographic camera at
-(0, 0, 3) with ortho scale 2, and a black world.
+Anisotropy 0) with Density = DENSITY_SCALE * Volume Info density. At a bounce budget of 0 Blender renders exact single
+scatter at any density (`volume_bounces = max_bounces = 0`, verified against physics for a uniform cube), so the density
+is raised for signal: at 0.2 the LINEAR-to-CUBIC difference is about 1 %, below the seed noise, and at 2.0 it is about 12 %.
+A point light of 100 W at (1.6, 0.6, 0.9), an orthographic camera at (0, 0, 3) with ortho scale 1, so the 4 x 4 frame is the
+unit cube, a black world, and a one-pixel BOX filter. Every pixel is averaged.
 
 Pixels are written top-down, the row order of the Potter test's EXR reader (`position.y()` from the top). Blender's
 `image.pixels` is bottom-up, so Blender row r is top row SIZE - 1 - r, the same convention as the panorama oracle
@@ -45,12 +47,12 @@ import openvdb
 argv = sys.argv[sys.argv.index("--") + 1 :]
 out_path = os.path.abspath(argv[0])
 work = tempfile.mkdtemp(prefix="volume_interpolation_")
-SIZE = 24
-SAMPLES = 32768
+SIZE = 4
+SAMPLES = 4096
 SEEDS = (0, 1, 2, 3)
 ENERGY = 100.0
 POSITION = (1.6, 0.6, 0.9)
-DENSITY_SCALE = 0.2
+DENSITY_SCALE = 2.0
 N = 16
 ORIGIN = -0.5
 VOXEL = 1.0 / N
@@ -86,10 +88,18 @@ def reset(interpolation, seed):
     render.film_transparent = False
     scene.cycles.device = "CPU"
     scene.cycles.samples = SAMPLES
+    # Potter integrates each pixel uniformly over its footprint (a one-pixel box). Cycles' BOX filter of width 1 px is
+    # that box. The frame spans the unit cube, so every pixel footprint lies inside it and the default 1.5 px filter's
+    # outside-cube zeros cannot enter a pixel.
+    if hasattr(scene.cycles, "pixel_filter_type"):
+        scene.cycles.pixel_filter_type = "BOX"
+    else:
+        scene.cycles.filter_type = "BOX"
+    scene.cycles.filter_width = 1.0
     scene.cycles.seed = seed
     scene.cycles.use_denoising = False
-    scene.cycles.max_bounces = 1
-    scene.cycles.volume_bounces = 1
+    scene.cycles.max_bounces = 0
+    scene.cycles.volume_bounces = 0
     scene.cycles.transparent_max_bounces = 64
     scene.view_settings.view_transform = "Raw"
     scene.view_settings.look = "None"
@@ -108,7 +118,7 @@ def reset(interpolation, seed):
     background.inputs["Strength"].default_value = 0.0
     camera_data = bpy.data.cameras.new("camera")
     camera_data.type = "ORTHO"
-    camera_data.ortho_scale = 2.0
+    camera_data.ortho_scale = 1.0
     camera = bpy.data.objects.new("camera", camera_data)
     scene.collection.objects.link(camera)
     camera.location = (0.0, 0.0, 3.0)
