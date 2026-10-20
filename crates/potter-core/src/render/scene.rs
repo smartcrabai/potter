@@ -720,7 +720,7 @@ pub(super) fn extract_geometry(
                     let lit_per_pixel = !path_traced
                         && matches!(mode, Mode::Beauty)
                         && (face_reads_colors || face_requires_hit_shading);
-                    // Beauty and Solid shade every hit from its view ray, and the path tracer shades its own hits,
+                    // Beauty shades each hit at its own point with its normal, Solid from its view ray, and the path tracer shades its own hits,
                     // so their triangles keep the base colour, flat faces included (EEVEE decides shadows per pixel).
                     // Other passes take a flat face's colour from its material.
                     let color = if corner_normals.is_some()
