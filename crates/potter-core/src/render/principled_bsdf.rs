@@ -812,6 +812,7 @@ fn glass_lobe(params: &BsdfParams, normal: DVec3, view: DVec3) -> Option<GlassLo
         reflection_tint,
         transmission_tint,
         gain,
+        singular,
         straight,
     })
 }
@@ -986,7 +987,7 @@ fn sample_visible_normal(wi: DVec3, alpha: f64, u: f64, v: f64) -> DVec3 {
     };
     // Section 4.2: the parameterisation of the projected area.
     let (x, disk_y) = concentric_disk(u, v);
-    let s = 0.5 * (1.0 + stretched.z);
+    let s = f64::midpoint(1.0, stretched.z);
     let y = (1.0 - s) * (1.0 - x * x).max(0.0).sqrt() + s * disk_y;
     // Section 4.3: the reprojection onto the hemisphere, then back to the ellipsoid.
     let hemisphere = DVec3::new(x, y, (1.0 - x * x - y * y).max(0.0).sqrt());
@@ -1198,9 +1199,11 @@ mod glass_tests {
     const RADIUS: f64 = 1.2;
     const POWER: f64 = 1000.0;
     const ORTHO_SCALE: f64 = 0.2;
-    /// Quadrature of the disk used for the oracle comparisons: radial and angular midpoints.
-    const RADIAL: usize = 64;
-    const ANGULAR: usize = 128;
+    /// Quadrature of the disk used for the oracle comparisons: radial and angular midpoints. At 256 × 512
+    /// the rough patch means are within 0.7 Cycles standard errors of their 512 × 1024 limit
+    /// (`rough_glass_quadrature_is_within_the_cycles_noise`); the former 64 × 128 was 0.22 off at roughness 0.2.
+    const RADIAL: usize = 256;
+    const ANGULAR: usize = 512;
 
     fn view() -> DVec3 {
         DVec3::new(VIEW_THETA.sin(), 0.0, VIEW_THETA.cos())
@@ -1270,6 +1273,21 @@ mod glass_tests {
         POWER / (PI * PI * RADIUS * RADIUS)
     }
 
+    /// Whether `light` lies in the domain the VNDF sampler draws: its half vector on the normal's side
+    /// (`n · H >= 0`) and visible from the view (`H · wi >= 0`). Cycles' eval also carries half vectors
+    /// outside it (`bsdf_D` squares `cos_NH` and `microfacet_eval` takes `fabs(cos_HI)`), which the
+    /// sampler's `max(0, h.z)` and visibility never produce, so an integral over the sphere is not the
+    /// sampler's.
+    fn sampler_domain(lobe: &GlassLobe, normal: DVec3, view: DVec3, light: DVec3) -> bool {
+        let unnormalised = if normal.dot(light) < 0.0 {
+            -(view + light * lobe.ior)
+        } else {
+            view + light
+        };
+        let half = unnormalised.normalize_or_zero();
+        normal.dot(half) >= 0.0 && view.dot(half) >= 0.0
+    }
+
     #[test]
     fn glass_density_integrates_to_the_accepted_draws() {
         let params = principled_glass(1.5, 0.5);
@@ -1277,10 +1295,13 @@ mod glass_tests {
         let Some(lobe) = glass_lobe(&params, DVec3::Z, view()) else {
             panic!("a glass plane has a glass lobe");
         };
-        // A rough draw is accepted when it falls on its own side of the normal. Those are exactly the
-        // directions whose density `glass_eval` reports, so the density integrates to the accepted share.
+        // Over the sampler's domain the density is the density of the accepted rough draws.
         let density = sphere_integral(400, 800, |light| {
-            glass_eval(&lobe, DVec3::Z, view(), light).1
+            if sampler_domain(&lobe, DVec3::Z, view(), light) {
+                glass_eval(&lobe, DVec3::Z, view(), light).1
+            } else {
+                0.0
+            }
         });
         let mut next = uniform_stream(7);
         let draws = 200_000_usize;
@@ -1303,22 +1324,31 @@ mod glass_tests {
     }
 
     #[test]
-    fn white_glass_albedo_is_one_as_the_ggx_glass_energy_table_gives() {
-        // White glass has reflectance + transmittance 1 at every half vector, so its single-scatter
-        // albedo is the GGX_GLASS energy E, and the multiscatter gain 1 / E restores it to 1.
-        for roughness in [0.35, 0.5] {
-            let params = principled_glass(1.5, roughness);
-            let Some(lobe) = glass_lobe(&params, DVec3::Z, view()) else {
-                panic!("a glass plane has a glass lobe");
-            };
-            let albedo = sphere_integral(800, 1600, |light| {
-                glass_eval(&lobe, DVec3::Z, view(), light).0.element_sum() / 3.0
-            });
-            assert!(
-                (albedo - 1.0).abs() < 0.01,
-                "roughness {roughness}: albedo {albedo}"
-            );
-        }
+    fn white_glass_visible_albedo_matches_the_ggx_glass_energy_table() {
+        // The GGX_GLASS tables are Cycles' `average(eval) / pdf` over its sampler, so E is the eval's
+        // integral over the sampler's domain. At a table node (roughness 6/15, cos 11/15, z 8/15) the
+        // two agree to 1e-4, and the gain 1 / E then makes white glass integrate to 1 over that domain.
+        let (roughness, mu, z): (f64, f64, f64) = (6.0 / 15.0, 11.0 / 15.0, 8.0 / 15.0);
+        let ior = (1.0 + z * z) / (1.0 - z * z);
+        let view = DVec3::new((1.0 - mu * mu).sqrt(), 0.0, mu);
+        let params = principled_glass(ior, roughness);
+        let Some(lobe) = glass_lobe(&params, DVec3::Z, view) else {
+            panic!("a glass plane has a glass lobe");
+        };
+        let albedo = sphere_integral(400, 800, |light| {
+            if sampler_domain(&lobe, DVec3::Z, view, light) {
+                glass_eval(&lobe, DVec3::Z, view, light).0.element_sum() / 3.0
+            } else {
+                0.0
+            }
+        });
+        let energy = ggx_glass_energy(roughness, mu, z);
+        assert!(
+            (albedo / lobe.gain.x - energy).abs() < 2.0e-3,
+            "eval integral {} vs GGX_GLASS_E {energy}",
+            albedo / lobe.gain.x
+        );
+        assert!((albedo - 1.0).abs() < 2.0e-3, "white glass albedo {albedo}");
     }
 
     #[test]
@@ -1333,6 +1363,7 @@ mod glass_tests {
             reflection_tint: DVec3::ONE,
             transmission_tint: DVec3::ONE,
             gain: DVec3::ONE,
+            singular: false,
             straight: false,
         };
         let back = GlassLobe {
@@ -1507,27 +1538,27 @@ mod glass_tests {
         assert_matches_cycles(
             "P_r0_ior150 front",
             sharp_patch_mean(white, front, light_centre(1.5, false)),
-            [3.5350394; 3],
-            [4.7095116e-05; 3],
+            [3.535_039_4; 3],
+            [4.709_511_6e-05; 3],
         );
         assert_matches_cycles(
             "P_r0_ior150 back",
             sharp_patch_mean(white, back, light_centre(1.5, true)),
-            [66.859555; 3],
-            [0.015682058; 3],
+            [66.859_555; 3],
+            [0.015_682_058; 3],
         );
         let (front, back) = sharp_split(1.45);
         assert_matches_cycles(
             "P_r0_ior145 front",
             sharp_patch_mean(white, front, light_centre(1.45, false)),
-            [3.0483572; 3],
-            [8.4311448e-05; 3],
+            [3.048_357_2; 3],
+            [8.431_144_8e-05; 3],
         );
         assert_matches_cycles(
             "P_r0_ior145 back",
             sharp_patch_mean(white, back, light_centre(1.45, true)),
-            [67.344936; 3],
-            [0.017525662; 3],
+            [67.344_936; 3],
+            [0.017_525_662; 3],
         );
     }
 
@@ -1538,14 +1569,14 @@ mod glass_tests {
         assert_matches_cycles(
             "P_r02_ior150 front",
             rough_patch_mean(&white, light_centre(1.5, false), RADIAL, ANGULAR),
-            [3.3654336; 3],
-            [2.0879102e-04; 3],
+            [3.365_433_6; 3],
+            [2.087_910_2e-04; 3],
         );
         assert_matches_cycles(
             "P_r02_ior150 back",
             rough_patch_mean(&white, light_centre(1.5, true), RADIAL, ANGULAR),
             [66.64674; 3],
-            [0.015211354; 3],
+            [0.015_211_354; 3],
         );
         let mut tinted = principled_glass(1.5, 0.2);
         tinted.base_color = [0.8, 0.5, 0.3, 1.0];
@@ -1553,27 +1584,27 @@ mod glass_tests {
         assert_matches_cycles(
             "P_r02_ior150_tint front",
             rough_patch_mean(&tinted, light_centre(1.5, false), RADIAL, ANGULAR),
-            [3.3655237, 3.3652158, 3.3649535],
-            [3.0203517e-04, 3.0169697e-04, 3.0143839e-04],
+            [3.365_523_7, 3.365_215_8, 3.364_953_5],
+            [3.020_351_7e-04, 3.016_969_7e-04, 3.014_383_9e-04],
         );
         assert_matches_cycles(
             "P_r02_ior150_tint back",
             rough_patch_mean(&tinted, light_centre(1.5, true), RADIAL, ANGULAR),
-            [59.604277, 47.117035, 36.493874],
-            [0.013510868, 0.010680354, 0.0082722502],
+            [59.604_277, 47.117_035, 36.493_874],
+            [0.013_510_868, 0.010_680_354, 0.008_272_250_2],
         );
         let node = glass_node([0.8, 0.5, 0.3], 1.5, 0.2);
         assert_matches_cycles(
             "G_r02_ior150_tint front",
             rough_patch_mean(&node, light_centre(1.5, false), RADIAL, ANGULAR),
-            [2.6920916, 1.6823106, 1.0092879],
-            [1.6482739e-04, 1.0305486e-04, 6.1842398e-05],
+            [2.692_091_6, 1.682_310_6, 1.009_287_9],
+            [1.648_273_9e-04, 1.030_548_6e-04, 6.184_239_8e-05],
         );
         assert_matches_cycles(
             "G_r02_ior150_tint back",
             rough_patch_mean(&node, light_centre(1.5, true), RADIAL, ANGULAR),
-            [53.31221, 33.31528, 19.987229],
-            [0.012167949, 0.0076037805, 0.0045618782],
+            [53.31221, 33.31528, 19.987_229],
+            [0.012_167_949, 0.007_603_780_5, 0.004_561_878_2],
         );
     }
 
@@ -1584,14 +1615,14 @@ mod glass_tests {
         assert_matches_cycles(
             "P_r02_ior145 front",
             rough_patch_mean(&params, light_centre(1.45, false), RADIAL, ANGULAR),
-            [2.9043857; 3],
-            [2.2927191e-04; 3],
+            [2.904_385_7; 3],
+            [2.292_719_1e-04; 3],
         );
         assert_matches_cycles(
             "P_r02_ior145 back",
             rough_patch_mean(&params, light_centre(1.45, true), RADIAL, ANGULAR),
-            [67.166565; 3],
-            [0.018860988; 3],
+            [67.166_565; 3],
+            [0.018_860_988; 3],
         );
     }
 
@@ -1602,27 +1633,27 @@ mod glass_tests {
         assert_matches_cycles(
             "P_r05_ior150 front",
             rough_patch_mean(&params, light_centre(1.5, false), RADIAL, ANGULAR),
-            [1.1555004; 3],
-            [8.0104811e-05; 3],
+            [1.155_500_4; 3],
+            [8.010_481_1e-05; 3],
         );
         assert_matches_cycles(
             "P_r05_ior150 back",
             rough_patch_mean(&params, light_centre(1.5, true), RADIAL, ANGULAR),
-            [60.844538; 3],
-            [0.0079138414; 3],
+            [60.844_538; 3],
+            [0.007_913_841_4; 3],
         );
         let params = principled_glass(1.45, 0.5);
         assert_matches_cycles(
             "P_r05_ior145 front",
             rough_patch_mean(&params, light_centre(1.45, false), RADIAL, ANGULAR),
-            [0.99772909; 3],
-            [6.7557663e-05; 3],
+            [0.997_729_09; 3],
+            [6.755_766_3e-05; 3],
         );
         assert_matches_cycles(
             "P_r05_ior145 back",
             rough_patch_mean(&params, light_centre(1.45, true), RADIAL, ANGULAR),
-            [62.097119; 3],
-            [0.012259179; 3],
+            [62.097_119; 3],
+            [0.012_259_179; 3],
         );
     }
 
