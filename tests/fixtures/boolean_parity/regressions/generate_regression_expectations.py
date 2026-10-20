@@ -106,11 +106,35 @@ def primitive(operator, name, **arguments):
     return obj
 
 
+def canonical_order(obj):
+    """Renumber a mesh so its order does not depend on the Blender process.
+
+    Blender 5.2.2's UV sphere primitive keeps the same vertex positions in every process but emits
+    them, and its faces, in an order that changes from run to run. Vertices are sorted by exact
+    position, each face starts at its lowest vertex index, and faces are sorted, so the Boolean
+    input (and the edge order Blender builds from it) is one fixed mesh per run.
+    """
+    mesh = obj.data
+    coords = [tuple(vertex.co) for vertex in mesh.vertices]
+    order = sorted(range(len(coords)), key=lambda index: coords[index])
+    renumber = {old: new for new, old in enumerate(order)}
+    faces = []
+    for polygon in mesh.polygons:
+        ring = [renumber[index] for index in polygon.vertices]
+        start = ring.index(min(ring))
+        faces.append(tuple(ring[start:] + ring[:start]))
+    faces.sort()
+    mesh.clear_geometry()
+    mesh.from_pydata([coords[index] for index in order], [], faces)
+    mesh.update()
+
+
 def uv_sphere(name, segments, open_top):
     obj = primitive(
         bpy.ops.mesh.primitive_uv_sphere_add, name,
         segments=segments, ring_count=segments // 2, radius=1.0,
     )
+    canonical_order(obj)
     if open_top:
         # Same cut as the probes: faces with every vertex above z = 0.95 are removed.
         bm = bmesh.new()
