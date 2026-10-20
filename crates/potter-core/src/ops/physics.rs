@@ -1526,19 +1526,41 @@ fn retain_fluid_settings_for_role(settings: &mut Map<String, Value>, role: &str)
     settings.retain(|field, _| fluid_setting_allowed(role, field.as_str()));
 }
 
-/// Blender-named settings that a system of any Potter kind might carry.
-fn is_blender_setting_of_any_role(field: &str) -> bool {
-    [
-        "fluid_domain",
-        "fluid_flow",
-        "fluid_effector",
-        "dynamic_paint_canvas",
-        "dynamic_paint_surface",
-        "dynamic_paint_brush",
-        "point_cache",
-    ]
-    .iter()
-    .any(|system| physics_support::is_blender_property(system, field))
+/// Blender RNA systems whose names a fluid object's settings may carry, across every role.
+const FLUID_AND_PAINT_SYSTEMS: [&str; 7] = [
+    "fluid_domain",
+    "fluid_flow",
+    "fluid_effector",
+    "dynamic_paint_canvas",
+    "dynamic_paint_surface",
+    "dynamic_paint_brush",
+    "point_cache",
+];
+
+/// Blender RNA systems whose names a dynamic-paint object's settings may carry.
+const DYNAMIC_PAINT_SYSTEMS: [&str; 3] = [
+    "dynamic_paint_canvas",
+    "dynamic_paint_surface",
+    "dynamic_paint_brush",
+];
+
+/// Whether `field` is a Blender RNA name of one of `systems`.
+fn is_blender_setting_in(systems: &[&str], field: &str) -> bool {
+    systems
+        .iter()
+        .any(|system| physics_support::is_blender_property(system, field))
+}
+
+/// Potter-native keys that a role-checked system accepts. Dynamic paint takes only its own keys;
+/// fluid also takes the dynamic-paint keys, as before.
+fn is_role_native(system: &str, field: &str) -> bool {
+    if system == "dynamic_paint" {
+        DYNAMIC_PAINT_NATIVE_SETTINGS.contains(&field)
+    } else {
+        FLUID_DOMAIN_NATIVE_SETTINGS.contains(&field)
+            || FLUID_FLOW_NATIVE_SETTINGS.contains(&field)
+            || DYNAMIC_PAINT_NATIVE_SETTINGS.contains(&field)
+    }
 }
 
 /// Value check for a Blender RNA setting. Honoured numeric settings are range-checked; other
@@ -1707,18 +1729,20 @@ fn validate_physics_settings(
         _ => (None, &[]),
     };
     let role_checked = matches!(system, "fluid" | "dynamic_paint");
+    let role_systems: &[&str] = if system == "dynamic_paint" {
+        &DYNAMIC_PAINT_SYSTEMS
+    } else {
+        &FLUID_AND_PAINT_SYSTEMS
+    };
     for (field, value) in settings {
         let potter_native = native.contains(&field.as_str())
-            || (role_checked
-                && (FLUID_DOMAIN_NATIVE_SETTINGS.contains(&field.as_str())
-                    || FLUID_FLOW_NATIVE_SETTINGS.contains(&field.as_str())
-                    || DYNAMIC_PAINT_NATIVE_SETTINGS.contains(&field.as_str())));
+            || (role_checked && is_role_native(system, field.as_str()));
         let blender = if role_checked {
-            !potter_native && is_blender_setting_of_any_role(field)
+            !potter_native && is_blender_setting_in(role_systems, field.as_str())
         } else {
             blender_system.is_some_and(|name| physics_support::is_blender_property(name, field))
         };
-        if !blender && !potter_native && !role_checked {
+        if !blender && !potter_native {
             return Err(engine.error(
                 ErrorCode::InvalidOperation,
                 format!("unknown {system} setting `{field}`"),

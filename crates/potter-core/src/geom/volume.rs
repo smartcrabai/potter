@@ -1809,7 +1809,7 @@ fn renormalize_signed_distances(
         let shifted = *value - offset;
         *value = shifted.min(renormalized[index]) + offset - epsilon;
         if *value < 0.0 {
-            if *value <= -interior_distance || value.is_nan() {
+            if *value <= -interior_distance {
                 *value = -interior_distance;
             }
         } else if *value >= voxel_size || value.is_nan() {

@@ -2421,12 +2421,18 @@ fn blender_schema_properties(system: &str) -> Map<String, Value> {
         "dynamic_paint_brush",
         "point_cache",
     ];
+    const DYNAMIC_PAINT_TABLES: [&str; 3] = [
+        "dynamic_paint_canvas",
+        "dynamic_paint_surface",
+        "dynamic_paint_brush",
+    ];
     let tables: &[&str] = match system {
         "cloth" => &["cloth"],
         "soft_body" => &["soft_body"],
         "collision" => &["collision"],
-        // Ops accepts any fluid or dynamic-paint role's Blender names and checks the role there.
-        "fluid" | "dynamic_paint" => &ROLE_TABLES,
+        // Fluid takes every role's Blender names, as ops does. Dynamic paint takes only its own roles.
+        "fluid" => &ROLE_TABLES,
+        "dynamic_paint" => &DYNAMIC_PAINT_TABLES,
         _ => &[],
     };
     let mut names = std::collections::BTreeSet::new();
