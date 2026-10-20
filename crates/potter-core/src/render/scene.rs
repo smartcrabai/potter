@@ -565,7 +565,9 @@ pub(super) fn extract_geometry(
                             match (mode, &material.viewport_display) {
                                 // Workbench draws a viewport-displayed material through its transparent pass only
                                 // below full alpha (`Material::is_transparent`).
-                                (Mode::Solid, Some(viewport)) if viewport.diffuse_color[3] < 1.0 => {
+                                (Mode::Solid, Some(viewport))
+                                    if viewport.diffuse_color[3] < 1.0 =>
+                                {
                                     AlphaMode::Blend
                                 }
                                 (Mode::Solid, Some(_)) => AlphaMode::Opaque,
