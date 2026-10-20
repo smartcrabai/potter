@@ -571,12 +571,18 @@ fn apply_light_values(
                 &operation_pointer(engine.operation_index, &format!("{prefix}spread")),
             ));
         }
-        light.spread = super::finite_number(
+        let spread = super::finite_number(
             engine,
             Some(value),
             &format!("{prefix}spread"),
             super::FiniteNumberMessage::Field,
         )?;
+        // Blender stores spread as a float32, so its π arrives rounded; accept it as the import does.
+        light.spread = if (spread - std::f64::consts::PI).abs() <= 1.0e-6 {
+            std::f64::consts::PI
+        } else {
+            spread
+        };
         if !(0.0..=std::f64::consts::PI).contains(&light.spread) {
             return Err(engine.error(
                 ErrorCode::InvalidOperation,

@@ -119,40 +119,41 @@ pub(crate) fn area_shape(data: &LightData, matrix: &DMat4) -> AreaShape {
 }
 
 /// A Blender area light's `spread` (Cycles' `AreaLight::spread`): the emission is confined to the
-/// cone of half-angle `spread / 2` about the emitting normal.
+/// cone of half-angle `spread / 2` about the emitting normal. The trigonometry is computed once.
 #[derive(Clone, Copy)]
 pub(crate) struct Spread {
     /// Half the spread, in radians.
     half: f64,
+    /// `tan(spread / 2)`.
+    tan_half: f64,
+    /// Cycles' normalisation in `spread_attenuation`: `1 / (tan a − a)` for the half-angle `a`, with
+    /// its third-order form at small angles. Unused for a zero spread.
+    normalize: f64,
 }
 
 impl Spread {
     /// The spread of a light with `spread` radians, or `None` at the default π, which leaves the
     /// emission and the sampling unchanged.
     pub(crate) fn new(spread: f64) -> Option<Self> {
-        (spread < PI).then(|| Self {
-            half: 0.5 * spread.max(0.0),
+        (spread < PI).then(|| {
+            let half = 0.5 * spread.max(0.0);
+            let tan_half = half.tan();
+            let normalize = if half > 0.05 {
+                1.0 / (tan_half - half)
+            } else {
+                3.0 / half.powi(3)
+            };
+            Self {
+                half,
+                tan_half,
+                normalize,
+            }
         })
     }
 
     /// Whether the cone is a line (`spread` 0), which Cycles samples as a delta.
     pub(crate) fn is_zero(self) -> bool {
         self.half == 0.0
-    }
-
-    /// `tan(spread / 2)`.
-    fn tan_half(self) -> f64 {
-        self.half.tan()
-    }
-
-    /// Cycles' normalisation in `spread_attenuation`: `1 / (tan a − a)` for the half-angle `a`, with
-    /// its third-order form at small angles.
-    fn normalize(self) -> f64 {
-        if self.half > 0.05 {
-            1.0 / (self.tan_half() - self.half)
-        } else {
-            3.0 / self.half.powi(3)
-        }
     }
 }
 
@@ -168,7 +169,7 @@ pub(crate) fn spread_attenuation(spread: Spread, to_receiver: DVec3, normal: DVe
         // Emission along the normal alone; π is the hemisphere integral that Cycles folds in.
         return if tan_angle > 1.0e-5 { 0.0 } else { PI };
     }
-    ((spread.tan_half() - tan_angle) * spread.normalize()).max(0.0)
+    ((spread.tan_half - tan_angle) * spread.normalize).max(0.0)
 }
 
 /// The part of an area light that light sampling draws from for `receiver`, as Cycles'
@@ -190,7 +191,7 @@ pub(crate) fn spread_region(
     // The foot of the receiver on the emitter's plane, and the radius of the disk on that plane
     // that the cone reaches.
     let closest = receiver - height * normal;
-    let r_spread = height * spread.tan_half();
+    let r_spread = height * spread.tan_half;
     let offset = closest - centre;
     let spread_u = shape.axis_u.dot(offset);
     let spread_v = shape.axis_v.dot(offset);
