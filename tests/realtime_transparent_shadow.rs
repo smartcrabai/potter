@@ -108,7 +108,14 @@ fn blender_render(
 
 /// Imports the Blender scene and returns the project, its active scene, and the imported scene JSON.
 fn import_scene(blender: &Path, root: &Path, blend: &Path) -> TestResult<(PathBuf, String, Value)> {
-    let (project, _) = import_blend(blender, root, "project", blend)?;
+    // Each blend has its own directory, so each import gets its own project: `pot init` refuses a non-empty one.
+    let name = blend
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .ok_or("the blend has no directory name")?
+        .to_owned();
+    let (project, _) = import_blend(blender, root, &format!("project_{name}"), blend)?;
     let scene = read_scene(&project)?;
     let active = scene["active_scene"]
         .as_str()
