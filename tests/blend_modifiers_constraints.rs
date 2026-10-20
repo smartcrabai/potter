@@ -689,7 +689,7 @@ for name, mode, use_parent, use_modifier in cases:
     obj.scale = (1.4, 0.65, 1.1)
     obj.rotation_mode = mode
     if mode in ("XYZ", "XZY", "YXZ", "YZX", "ZXY", "ZYX"):
-        obj.rotation_euler = (0.37, -0.21, math.pi / 2.0)
+        obj.rotation_euler = (0.37, -0.21, 4.0 if name == "EulerRoot" else math.pi / 2.0)
     elif mode == "QUATERNION":
         obj.rotation_quaternion = Quaternion((1.0, 2.0, -1.0), 0.91)
     else:
@@ -708,6 +708,7 @@ def matrix_values(matrix):
 expected = {
     name: {
         "rotation_mode": obj.rotation_mode,
+        "rotation_euler": [float(value) for value in obj.rotation_euler],
         "local": matrix_values(obj.matrix_basis),
         "world": matrix_values(obj.matrix_world),
     }
@@ -715,6 +716,7 @@ expected = {
 }
 expected["A_TransformParent"] = {
     "rotation_mode": parent.rotation_mode,
+    "rotation_euler": [float(value) for value in parent.rotation_euler],
     "local": matrix_values(parent.matrix_basis),
     "world": matrix_values(parent.matrix_world),
 }
@@ -737,6 +739,7 @@ def matrix_values(matrix):
 result = {
     obj.name: {
         "rotation_mode": obj.rotation_mode,
+        "rotation_euler": [float(value) for value in obj.rotation_euler],
         "local": matrix_values(obj.matrix_basis),
     }
     for obj in bpy.data.objects
@@ -2104,6 +2107,19 @@ fn blender_transform_import_parity_across_rotation_modes() -> Result<(), Box<dyn
             matrices["local"].as_array().unwrap(),
             &format!("{name} local after reopen"),
         );
+        if matrices["rotation_mode"] != "QUATERNION" && matrices["rotation_mode"] != "AXIS_ANGLE" {
+            // A no-op round trip writes the source Euler values back unchanged: no 2*pi wrapping.
+            assert_matrix_parity(
+                after[name]["rotation_euler"].as_array().unwrap(),
+                matrices["rotation_euler"].as_array().unwrap(),
+                &format!("{name} rotation_euler after reopen"),
+            );
+        }
     }
+    let euler_root_z = after["EulerRoot"]["rotation_euler"][2].as_f64().unwrap();
+    assert!(
+        (euler_root_z - 4.0).abs() <= 1.0e-6,
+        "EulerRoot rotation_euler z must survive a no-op round trip as 4.0 rad, got {euler_root_z}"
+    );
     Ok(())
 }
