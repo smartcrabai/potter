@@ -2325,6 +2325,17 @@ pub struct TextureRef {
     pub extension: ImageExtension,
 }
 
+/// Blender's viewport display values for a `.blend` material: `Material.diffuse_color` (RGBA), `roughness`, and
+/// `metallic`. Workbench's Solid shading reads these in place of the material's own values
+/// (`workbench_engine.cc` `get_material`); Beauty never does.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewportDisplay {
+    pub diffuse_color: [f64; 4],
+    pub roughness: f64,
+    pub metallic: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Material {
@@ -2376,6 +2387,9 @@ pub struct Material {
     pub volume_color: [f64; 3],
     #[serde(default)]
     pub volume_anisotropy: f64,
+    /// Blender's viewport display values, which Solid shading reads. Set by `.blend` import; omitted when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub viewport_display: Option<ViewportDisplay>,
 }
 impl Default for Material {
     fn default() -> Self {
@@ -2403,6 +2417,7 @@ impl Default for Material {
             volume_density: 0.0,
             volume_color: default_volume_color(),
             volume_anisotropy: 0.0,
+            viewport_display: None,
         }
     }
 }

@@ -36,9 +36,10 @@ use super::{
         sheen_coefficient, specular_coefficient,
     },
     raster::{
-        AlphaMode, Line, Mode, SurfaceHit, SurfaceShader, Triangle, blend_color,
+        AlphaMode, Line, Mode, SurfaceHit, SurfaceShader, Triangle, ViewBasis, blend_color,
         blend_corner_normals, blend_uv,
     },
+    studio,
 };
 
 /// Most color layers one object carries, and one hit can read (Blender's per-mesh limit).
@@ -165,6 +166,10 @@ fn may_cast_transparent_shadow(material: &Material) -> bool {
 /// `(1 - alpha) * tint` (a Transparent BSDF's colour, or a Principled Alpha's `1 - alpha`), so the shadow ray passes
 /// with the same average. Refraction is no transparent closure (`closure_eval(ClosureTransparency)` is the only writer
 /// of `g_transmittance`), so glass casts an opaque shadow.
+/// A clip material passes the binarised alpha of `params`, as its visible surface does. This is a divergence, not
+/// parity: `blend_bridge.py` `_set_principled_values` exports a clip material as a DITHERED Principled with Alpha equal
+/// to its base alpha, so EEVEE's pass on that file is fractional (`1 - alpha` per fragment, stochastically), where
+/// Potter's realtime shadow is 0 or 1 per hit.
 fn transparent_shadow_pass(params: &BsdfParams) -> f64 {
     let tint = params.transparent_tint;
     ((1.0 - params.alpha.clamp(0.0, 1.0)) * (tint[0] + tint[1] + tint[2]) / 3.0).clamp(0.0, 1.0)
@@ -341,7 +346,19 @@ pub(super) fn extract_geometry(
         &mut visible_nodes,
     );
 
-    let mut materials = vec![Material::default()];
+    // Workbench's Solid shades faces with no material as Blender's empty default material:
+    // colour 0.8, roughness 0.4, metallic 0 (`DNA_material_types.h`; `BKE_material_default_empty`
+    // via `workbench_engine.cc` `get_material`). Beauty keeps Potter's default material.
+    let default_surface = if matches!(mode, Mode::Solid) {
+        Material {
+            base_color: [0.8, 0.8, 0.8, 1.0],
+            roughness: 0.4,
+            ..Material::default()
+        }
+    } else {
+        Material::default()
+    };
+    let mut materials = vec![default_surface];
     let mut prepared = vec![PreparedMaterial::default()];
     let mut material_indices =
         std::collections::BTreeMap::<(Id, Option<usize>, Option<Arc<[u64]>>), usize>::new();
@@ -709,9 +726,11 @@ pub(super) fn extract_geometry(
                         && matches!(mode, Mode::Beauty)
                         && (face_reads_colors || face_requires_hit_shading);
                     // Smooth triangles take lighting per pixel (raster) or per hit (path tracer).
+                    // Solid lights every hit from its view ray, so it keeps the base colour too.
                     let color = if corner_normals.is_some()
                         || (path_traced && matches!(mode, Mode::Beauty))
                         || lit_per_pixel
+                        || matches!(mode, Mode::Solid)
                     {
                         base_color
                     } else {
@@ -727,18 +746,28 @@ pub(super) fn extract_geometry(
                         element_index,
                         color,
                         alpha_mode: material.map_or(AlphaMode::Opaque, |material| {
-                            match material.alpha_mode.as_str() {
-                                "blend" => AlphaMode::Blend,
-                                "clip" => AlphaMode::Clip,
-                                // EEVEE dithers a DITHERED graph's transparency; blending its alpha matches the dither's
-                                // expectation. Potter's raster has no per-sample dither, so the blend stands in for it.
-                                "opaque"
-                                    if matches!(mode, Mode::Beauty)
-                                        && material.node_tree.is_some() =>
+                            match (mode, &material.viewport_display) {
+                                // Workbench draws a viewport-displayed material through its transparent pass only
+                                // below full alpha (`Material::is_transparent`).
+                                (Mode::Solid, Some(viewport))
+                                    if viewport.diffuse_color[3] < 1.0 =>
                                 {
                                     AlphaMode::Blend
                                 }
-                                _ => AlphaMode::Opaque,
+                                (Mode::Solid, Some(_)) => AlphaMode::Opaque,
+                                _ => match material.alpha_mode.as_str() {
+                                    "blend" => AlphaMode::Blend,
+                                    "clip" => AlphaMode::Clip,
+                                    // EEVEE dithers a DITHERED graph's transparency; blending its alpha matches the dither's
+                                    // expectation. Potter's raster has no per-sample dither, so the blend stands in for it.
+                                    "opaque"
+                                        if matches!(mode, Mode::Beauty)
+                                            && material.node_tree.is_some() =>
+                                    {
+                                        AlphaMode::Blend
+                                    }
+                                    _ => AlphaMode::Opaque,
+                                },
                             }
                         }),
                         alpha_threshold: material.map_or(0.5, |material| material.alpha_threshold),
@@ -1702,25 +1731,29 @@ fn shading_params(
     params
 }
 
-/// Per-pixel lighting for smooth triangles in raster Solid and realtime Beauty output. Flat
-/// triangles keep the lighting baked into `Triangle::color`, which equals per-pixel lighting
-/// for a constant normal.
+/// Per-pixel lighting for raster Solid, which lights every hit in the camera's view space, and for
+/// smooth triangles in realtime Beauty output. Flat Beauty triangles keep the lighting baked into
+/// `Triangle::color`, which equals per-pixel lighting for a constant normal.
 pub(super) struct SceneShader<'a> {
     doc: &'a SceneDoc,
     snapshot: &'a Snapshot,
     images: &'a BTreeMap<String, ImageData>,
     geometry: &'a Geometry,
     mode: Mode,
+    /// The camera's view space, in which Solid's studio lights are fixed.
+    view: ViewBasis,
     evaluator_workspace: RefCell<EvaluatorWorkspace>,
 }
 
 /// The per-pixel shader for `mode`, or `None` when the raster outputs unlit or per-triangle colour.
+/// Beauty shades in world space and ignores `view`.
 pub(super) fn surface_shader<'a>(
     doc: &'a SceneDoc,
     snapshot: &'a Snapshot,
     images: &'a BTreeMap<String, ImageData>,
     geometry: &'a Geometry,
     mode: Mode,
+    view: ViewBasis,
 ) -> Option<Box<dyn SurfaceShader + 'a>> {
     match mode {
         Mode::Solid => {}
@@ -1733,11 +1766,16 @@ pub(super) fn surface_shader<'a>(
         images,
         geometry,
         mode,
+        view,
         evaluator_workspace: RefCell::new(EvaluatorWorkspace::default()),
     }))
 }
 
 impl SurfaceShader for SceneShader<'_> {
+    fn shades_every_hit(&self) -> bool {
+        matches!(self.mode, Mode::Solid)
+    }
+
     fn shade(&self, triangle: &Triangle, hit: &SurfaceHit) -> Result<[f64; 4]> {
         let material = self.geometry.materials.get(triangle.material_index);
         let prepared = self.geometry.prepared.get(triangle.material_index);
@@ -1759,6 +1797,49 @@ impl SurfaceShader for SceneShader<'_> {
             ];
             shading_params(material, base, hit.normal, &self.geometry.shader_warnings)
         });
+        if matches!(self.mode, Mode::Solid) {
+            // A back face is lit as its front: Workbench turns the normal toward the viewer
+            // before it encodes it (`workbench_normal_encode`, `front_face`).
+            let facing = if hit.view.dot(hit.geometric) < 0.0 {
+                -hit.normal
+            } else {
+                hit.normal
+            };
+            // Workbench shades a material with its viewport display values when it has them; Potter-native
+            // materials have none and keep their own (`workbench_engine.cc` `get_material`).
+            let viewport = material.and_then(|material| material.viewport_display.as_ref());
+            let (albedo, roughness, metallic) = match viewport {
+                Some(viewport) => (
+                    DVec3::new(
+                        viewport.diffuse_color[0],
+                        viewport.diffuse_color[1],
+                        viewport.diffuse_color[2],
+                    ),
+                    viewport.roughness,
+                    viewport.metallic,
+                ),
+                None => (
+                    DVec3::new(
+                        params.base_color[0],
+                        params.base_color[1],
+                        params.base_color[2],
+                    ),
+                    params.roughness,
+                    params.metallic,
+                ),
+            };
+            // Workbench's transparency reads the viewport alpha (`workbench_private.hh`, `Material::is_transparent`),
+            // not the node tree's; a Potter-native material has no viewport values and keeps its base alpha.
+            let alpha = viewport.map_or(params.alpha, |viewport| viewport.diffuse_color[3]);
+            let lit = studio::shade(
+                albedo,
+                roughness,
+                metallic,
+                self.view.to_view(facing),
+                self.view.to_view(hit.view),
+            );
+            return Ok([lit.x, lit.y, lit.z, alpha]);
+        }
         let occluders = ShadowOccluders::new(
             self.doc,
             self.snapshot,
@@ -2139,7 +2220,7 @@ fn shade(
         params.base_color[2],
     );
     let alpha = params.alpha;
-    if !matches!(mode, Mode::Solid | Mode::Beauty) {
+    if !matches!(mode, Mode::Beauty) {
         return Ok([albedo.x, albedo.y, albedo.z, alpha]);
     }
     let scene = doc.scenes.get(&snapshot.scene_id);
@@ -2161,90 +2242,59 @@ fn shade(
         .unwrap_or(normal);
     // The lobes' layers are set up once here for the camera view, shared by every light below.
     let shading = principled_layers(&lobe, normal, view);
-    if matches!(mode, Mode::Solid) {
-        // Solid shades its fixed lights against the normal, so its layers take the normal as view.
-        let solid_shading = principled_layers(&lobe, normal, normal);
-        result += albedo * 0.30;
-        for (direction, intensity, color) in [
-            (
-                DVec3::new(-0.45, -0.55, 0.70).normalize(),
-                1.05,
-                DVec3::splat(1.0),
-            ),
-            (
-                DVec3::new(0.65, 0.35, 0.55).normalize(),
-                0.45,
-                DVec3::new(0.72, 0.82, 1.0),
-            ),
-        ] {
-            result += punctual_radiance(&lobe, &solid_shading, -direction, color, intensity);
-        }
-    } else {
-        if let Some(world) = scene
-            .and_then(|value| value.world.as_ref())
-            .and_then(|id| doc.worlds.get(id))
-        {
-            let diffuse_environment =
-                prefiltered_world(world, &doc.node_groups, images, normal, 1.0)?;
-            let metallic = params.metallic.clamp(0.0, 1.0);
-            let roughness = params.roughness.clamp(0.0, 1.0);
-            // The coat attenuates every layer below it, including the environment terms.
-            let lower = shading.lower();
-            result += albedo * diffuse_environment * (1.0 - metallic) * lower;
-            let reflection = (-view + normal * (2.0 * normal.dot(view))).normalize_or_zero();
-            let specular_environment =
-                prefiltered_world(world, &doc.node_groups, images, reflection, roughness)?;
-            let specular_f0 = dielectric_f0(params.ior, params.specular_ior_level);
-            let f0 = albedo * metallic + DVec3::splat(specular_f0 * (1.0 - metallic));
-            result += specular_environment * f0 * (1.0 - roughness).powi(2) * lower;
-        }
-        for (id, light_node) in &doc.nodes {
-            let Some(light) = light_node
-                .data
-                .as_ref()
-                .and_then(|data_id| doc.data_blocks.get(data_id))
-                .and_then(|block| block.light.as_ref())
-            else {
-                continue;
-            };
-            let Some(evaluated) = snapshot.nodes.get(id) else {
-                continue;
-            };
-            let matrix = DMat4::from_cols_array(&evaluated.world_matrix);
-            let point_shadow = shadow.and_then(|scene| scene.point_maps.get(id));
-            result += light_contribution(
-                light,
-                matrix,
-                point,
-                shadow_point,
-                normal,
-                geometric,
-                &lobe,
-                &shading,
-                shadow,
-                point_shadow,
-            );
-        }
+    if let Some(world) = scene
+        .and_then(|value| value.world.as_ref())
+        .and_then(|id| doc.worlds.get(id))
+    {
+        let diffuse_environment = prefiltered_world(world, &doc.node_groups, images, normal, 1.0)?;
+        let metallic = params.metallic.clamp(0.0, 1.0);
+        let roughness = params.roughness.clamp(0.0, 1.0);
+        // The coat attenuates every layer below it, including the environment terms.
+        let lower = shading.lower();
+        result += albedo * diffuse_environment * (1.0 - metallic) * lower;
+        let reflection = (-view + normal * (2.0 * normal.dot(view))).normalize_or_zero();
+        let specular_environment =
+            prefiltered_world(world, &doc.node_groups, images, reflection, roughness)?;
+        let specular_f0 = dielectric_f0(params.ior, params.specular_ior_level);
+        let f0 = albedo * metallic + DVec3::splat(specular_f0 * (1.0 - metallic));
+        result += specular_environment * f0 * (1.0 - roughness).powi(2) * lower;
     }
-    // Beauty only: Solid/preview keeps Blender Solid's viewport-colour rule and ignores the closure
-    // weight. In Beauty, reflectance weights every reflective closure (ambient, direct,
-    // environment).
-    let reflectance = if matches!(mode, Mode::Beauty) {
-        params.reflectance.clamp(0.0, 1.0)
-    } else {
-        1.0
-    };
-    let result = result * reflectance;
+    for (id, light_node) in &doc.nodes {
+        let Some(light) = light_node
+            .data
+            .as_ref()
+            .and_then(|data_id| doc.data_blocks.get(data_id))
+            .and_then(|block| block.light.as_ref())
+        else {
+            continue;
+        };
+        let Some(evaluated) = snapshot.nodes.get(id) else {
+            continue;
+        };
+        let matrix = DMat4::from_cols_array(&evaluated.world_matrix);
+        let point_shadow = shadow.and_then(|scene| scene.point_maps.get(id));
+        result += light_contribution(
+            light,
+            matrix,
+            point,
+            shadow_point,
+            normal,
+            geometric,
+            &lobe,
+            &shading,
+            shadow,
+            point_shadow,
+        );
+    }
+    // In Beauty, reflectance weights every reflective closure (ambient, direct, environment).
+    let result = result * params.reflectance.clamp(0.0, 1.0);
     let result = result.max(DVec3::ZERO).min(DVec3::splat(1.0));
     // Emission sits outside the reflectance weight and the clamp: Cycles' `EmissionNode` emits
     // NODE_CLOSURE_EMISSION unscaled (intern/cycles/scene/shader_nodes.cpp:3071-3098), and neither
     // EEVEE nor Cycles clamps the strength (gpu_shader_material_principled.glsl:179,
     // intern/cycles/kernel/svm/closure.h:206-207).
-    let emission = if matches!(mode, Mode::Beauty) {
-        DVec3::from_array(params.emission_color) * params.emission_strength * shading.lower()
-    } else {
-        DVec3::ZERO
-    };
+    let emission =
+        DVec3::from_array(params.emission_color) * params.emission_strength * shading.lower();
     let result = result + emission;
     Ok([result.x, result.y, result.z, alpha])
 }
@@ -2542,6 +2592,7 @@ mod shading_normal_tests {
     use crate::render::principled_bsdf::{
         diffuse_coefficient, layers as principled_layers, specular_coefficient,
     };
+    use crate::render::raster::{Camera, Projection, StereoMode, ViewBasis};
     use crate::shader::BsdfParams;
     use crate::{
         eval::{EvaluationContext, Snapshot},
@@ -2552,7 +2603,7 @@ mod shading_normal_tests {
         },
         graph::{GraphKind, GraphNode, NodeGroup},
         image::{ImageData, ImageInterpolation},
-        model::{Id, Material, MaterialLink, SceneDoc},
+        model::{Id, Material, MaterialLink, SceneDoc, ViewportDisplay},
         render::{
             light_model::{
                 AreaShape, area_irradiance_per_radiance, area_radiance, area_visibility_samples,
@@ -2905,8 +2956,27 @@ mod shading_normal_tests {
             triangle.lit_per_pixel,
             "flat graph materials must be evaluated per hit"
         );
-        let shader = surface_shader(&doc, &snapshot, &images, &geometry, Mode::Beauty)
-            .ok_or_else(|| PotError::new(ErrorCode::InternalError, "Beauty shader is missing"))?;
+        let shader = surface_shader(
+            &doc,
+            &snapshot,
+            &images,
+            &geometry,
+            Mode::Beauty,
+            // Beauty shades in world space and ignores the view; any valid camera supplies the basis.
+            ViewBasis::from_camera(&Camera {
+                position: DVec3::new(0.0, 0.0, 2.5),
+                target: DVec3::ZERO,
+                up: DVec3::Y,
+                near: 0.1,
+                far: 100.0,
+                projection: Projection::Orthographic { height: 2.0 },
+                shift: [0.0; 2],
+                depth_of_field: None,
+                stereo_mode: StereoMode::None,
+                interocular_distance: 0.065,
+            })?,
+        )
+        .ok_or_else(|| PotError::new(ErrorCode::InternalError, "Beauty shader is missing"))?;
         let point = triangle.positions.iter().copied().sum::<DVec3>() / 3.0;
         let color = shader.shade(
             triangle,
@@ -3063,6 +3133,65 @@ mod shading_normal_tests {
     }
 
     #[test]
+    fn solid_blends_a_viewport_material_only_below_full_viewport_alpha() -> crate::error::Result<()>
+    {
+        let initial = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        let mut doc = crate::ops::apply_batch(
+            &initial,
+            &json!({
+                "schema_version": 1,
+                "base_revision": 0,
+                "operations": [
+                    {"op":"node.create","id":"body","kind":"plane","params":{"size":2.0}}
+                ]
+            }),
+        )?
+        .doc;
+        let body_id = Id::new("body")?;
+        let material_id = Id::new("glass")?;
+        let data_id = doc.nodes[&body_id]
+            .data
+            .clone()
+            .expect("plane has mesh data");
+        doc.data_blocks
+            .get_mut(&data_id)
+            .expect("plane data block exists")
+            .materials = vec![Some(material_id.clone())];
+        let body = doc.nodes.get_mut(&body_id).expect("body exists");
+        body.materials = vec![None];
+        body.material_links = vec![MaterialLink::Data];
+        // Solid reads the viewport alpha; Beauty keeps the node tree's alpha mode ("opaque" here).
+        for (alpha, transparent) in [(0.5, true), (1.0, false)] {
+            doc.materials.insert(
+                material_id.clone(),
+                Material {
+                    name: "Glass".to_owned(),
+                    base_color: [0.1, 0.6, 0.9, 1.0],
+                    viewport_display: Some(ViewportDisplay {
+                        diffuse_color: [0.8, 0.3, 0.2, alpha],
+                        roughness: 0.25,
+                        metallic: 0.5,
+                    }),
+                    ..Material::default()
+                },
+            );
+            for (mode, expected) in [(Mode::Solid, transparent), (Mode::Beauty, false)] {
+                let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
+                let geometry = extract_geometry(&doc, &snapshot, mode, false, &BTreeMap::new())?;
+                assert!(!geometry.triangles.is_empty(), "the plane has triangles");
+                for triangle in &geometry.triangles {
+                    assert_eq!(
+                        matches!(triangle.alpha_mode, AlphaMode::Blend),
+                        expected,
+                        "alpha {alpha} in {mode:?} must blend only when Solid's alpha is below one"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn renderer_resolves_shared_data_slots_and_object_overrides() -> crate::error::Result<()> {
         let initial = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
         let mut doc = crate::ops::apply_batch(
@@ -3169,7 +3298,8 @@ mod shading_normal_tests {
             colors_for(&body_id),
             vec![
                 [0.0, 0.0, 1.0, 1.0],
-                Material::default().base_color,
+                // Solid's no-material face takes Blender's empty default surface, not Potter's Beauty default.
+                [0.8, 0.8, 0.8, 1.0],
                 [1.0, 0.7, 0.0, 1.0],
                 [1.0, 0.7, 0.0, 1.0],
             ]
@@ -3178,7 +3308,8 @@ mod shading_normal_tests {
             colors_for(&linked_id),
             vec![
                 [0.0, 0.0, 1.0, 1.0],
-                Material::default().base_color,
+                // Solid's no-material face takes Blender's empty default surface, not Potter's Beauty default.
+                [0.8, 0.8, 0.8, 1.0],
                 [1.0, 0.0, 0.0, 1.0],
                 [1.0, 0.7, 0.0, 1.0],
             ]

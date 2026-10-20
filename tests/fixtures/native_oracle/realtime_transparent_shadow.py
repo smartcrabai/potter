@@ -12,7 +12,11 @@ unit above the floor, whose shadow lands inside it:
 - `alpha_off`: the same material with `use_transparent_shadow` off. EEVEE casts an opaque shadow.
 - `none`: no occluder, the lit floor alone.
 
-Arguments after `--`: blend_out, image_out, json_out, light (SUN or POINT), occluder (ALPHA, ALPHA_OFF or NONE).
+Arguments after `--`: blend_out, image_out, json_out, light (SUN or POINT), occluder (ALPHA, ALPHA_OFF or NONE), and an
+optional shift (default 0). EEVEE has no seed; its transparent-shadow noise is hashed from world position (`pcg4d(P, ...)`
+in `eevee_surf_shadow.bsl.hh`), so shifting the whole scene along y by a sub-millimetre amount gives an independent noise
+realisation of the same expectation. `tests/fixtures/native_oracle/measure_realtime_transparent_shadow_spread.py` runs
+several shifts and records their spread.
 """
 
 import json
@@ -21,6 +25,8 @@ import sys
 import bpy
 
 blend_out, image_out, json_out, light_kind, occluder = sys.argv[sys.argv.index("--") + 1:][:5]
+args = sys.argv[sys.argv.index("--") + 1:]
+SHIFT_Y = float(args[5]) if len(args) > 5 else 0.0
 
 WIDTH = 64
 HEIGHT = 64
@@ -55,8 +61,12 @@ principled = floor.node_tree.nodes["Principled BSDF"]
 principled.inputs["Base Color"].default_value = (ALBEDO, ALBEDO, ALBEDO, 1.0)
 principled.inputs["Roughness"].default_value = 1.0
 principled.inputs["Specular IOR Level"].default_value = 0.0
-bpy.ops.mesh.primitive_plane_add(size=20.0, location=(0.0, 0.0, 0.0))
+bpy.ops.mesh.primitive_plane_add(size=20.0, location=(0.0, SHIFT_Y, 0.0))
 bpy.context.object.data.materials.append(floor)
+# Smooth shading gives Potter corner normals, so it shades the floor per pixel. Flat faces are baked once per
+# subdivided triangle (`render/scene.rs` `subdivide_realtime_triangles`), which would decide each shadow per cell.
+# A flat plane has the same normals either way, so EEVEE's render is unchanged.
+bpy.ops.object.shade_smooth()
 
 if occluder != "NONE":
     glass = bpy.data.materials.new("Occluder")
@@ -66,7 +76,7 @@ if occluder != "NONE":
     shader = glass.node_tree.nodes["Principled BSDF"]
     shader.inputs["Base Color"].default_value = (0.8, 0.8, 0.8, 1.0)
     shader.inputs["Alpha"].default_value = OCCLUDER_ALPHA
-    bpy.ops.mesh.primitive_plane_add(size=0.9, location=(-3.0, 0.0, 1.0))
+    bpy.ops.mesh.primitive_plane_add(size=0.9, location=(-3.0, SHIFT_Y, 1.0))
     bpy.context.object.data.materials.append(glass)
 
 if light_kind == "SUN":
@@ -84,7 +94,7 @@ elif light_kind == "POINT":
     light = bpy.data.objects.new("Point", light_data)
     scene.collection.objects.link(light)
     # Above and to the left of the occluder, so its shadow falls inside the frame toward +x.
-    light.location = (-4.0, 0.0, 2.5)
+    light.location = (-4.0, SHIFT_Y, 2.5)
 else:
     raise SystemExit("unknown light " + light_kind)
 
@@ -93,7 +103,7 @@ camera_data.type = "ORTHO"
 camera_data.ortho_scale = 2.0
 camera = bpy.data.objects.new("Camera", camera_data)
 scene.collection.objects.link(camera)
-camera.location = (-1.5, 0.0, 6.0)
+camera.location = (-1.5, SHIFT_Y, 6.0)
 scene.camera = camera
 
 bpy.ops.wm.save_as_mainfile(filepath=blend_out)
@@ -116,4 +126,4 @@ for v in PATCH:
         count += 1
 
 with open(json_out, "w", encoding="utf-8") as handle:
-    json.dump({"patch_mean": [value / count for value in sums]}, handle)
+    json.dump({"patch_mean": [value / count for value in sums], "shift_y": SHIFT_Y}, handle)

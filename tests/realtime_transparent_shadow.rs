@@ -36,9 +36,18 @@ const SCRIPT: &str = include_str!("fixtures/native_oracle/realtime_transparent_s
 const PATCH: [f64; 9] = [
     0.25, 0.3125, 0.375, 0.4375, 0.5, 0.5625, 0.625, 0.6875, 0.75,
 ];
-/// Tolerance on a shadowed-to-lit ratio. Both renderers soften the shadow edge differently, so the ratio of the
-/// transparent shadow to the lit floor and of the opaque shadow to it are compared, not the absolute levels.
-const RATIO_TOLERANCE: f64 = 0.05;
+/// The measured tolerances (`measure_realtime_transparent_shadow_spread.py` writes the file and derives each term): per
+/// light and ratio, four times EEVEE's noise over independent realisations, plus EEVEE's bias against the exact ratio of
+/// the occluder geometry, plus Potter's edge-placement bound (the largest change of the exact ratio when the shadow
+/// edges move by the bound on Potter's own placement error: 0.003 rad PCF for a sun, half a 64-texel depth-map texel for
+/// a point light).
+const SPREAD: &str = include_str!("fixtures/native_oracle/realtime_transparent_shadow_spread.json");
+fn tolerance(light: &str, ratio: &str) -> TestResult<f64> {
+    let spread: Value = serde_json::from_str(SPREAD)?;
+    spread["lights"][light][ratio]["tolerance"]
+        .as_f64()
+        .ok_or_else(|| format!("no tolerance for {light} {ratio}").into())
+}
 
 /// The occluder states of the oracle: a transparent shadow, an opaque one, and no occluder.
 #[derive(Clone, Copy)]
@@ -186,14 +195,17 @@ fn assert_shadow_ratios_match(light: &str) -> TestResult {
     let potter_none = potter[0];
     let potter_alpha = potter[1] / potter_none;
     let potter_off = potter[2] / potter_none;
+    let alpha_tolerance = tolerance(light, "alpha_ratio")?;
+    let off_tolerance = tolerance(light, "alpha_off_ratio")?;
     assert!(
-        (potter_alpha - eevee_alpha).abs() <= RATIO_TOLERANCE,
-        "{light}: Potter's transparent shadow ratio {potter_alpha:.4} differs from EEVEE's {eevee_alpha:.4} \
-         (lit: Potter {potter_none:.4}, EEVEE {eevee_none:.4})"
+        (potter_alpha - eevee_alpha).abs() <= alpha_tolerance,
+        "{light}: Potter's transparent shadow ratio {potter_alpha:.4} differs from EEVEE's {eevee_alpha:.4} by more \
+         than {alpha_tolerance:.4} (lit: Potter {potter_none:.4}, EEVEE {eevee_none:.4})"
     );
     assert!(
-        (potter_off - eevee_off).abs() <= RATIO_TOLERANCE,
-        "{light}: Potter's opaque shadow ratio {potter_off:.4} differs from EEVEE's {eevee_off:.4}"
+        (potter_off - eevee_off).abs() <= off_tolerance,
+        "{light}: Potter's opaque shadow ratio {potter_off:.4} differs from EEVEE's {eevee_off:.4} by more than \
+         {off_tolerance:.4}"
     );
     Ok(())
 }

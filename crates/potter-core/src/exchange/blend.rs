@@ -32,7 +32,7 @@ use crate::{
         NlaStrip, NlaTrack, Node, ParentType, Profile, Registry, RenderSettings, RigidBody,
         RigidBodyShape, RigidBodyType, RigidBodyWorld, Scene, SceneDoc, ShapeKey, ShapeKeyData,
         SurfaceData, SurfacePoint, TextObjectData, TimelineMarker, Transform, UnitSettings,
-        VertexGroup, ViewLayer, World,
+        VertexGroup, ViewLayer, ViewportDisplay, World,
     },
     sequencer::{
         EffectType as SequenceEffectType, RetimingKey, Strip as SequenceStrip, StripBlendType,
@@ -3303,6 +3303,14 @@ fn build_imported_graph(
             "Material",
         )?;
         let color = vec4_field(item, "base_color", [0.6, 0.6, 0.6, 1.0]);
+        let viewport_display = item
+            .get("viewport_display")
+            .filter(|value| value.is_object())
+            .map(|viewport| ViewportDisplay {
+                diffuse_color: vec4_field(viewport, "diffuse_color", [0.8, 0.8, 0.8, 1.0]),
+                roughness: number_field(viewport, "roughness", 0.4),
+                metallic: number_field(viewport, "metallic", 0.0),
+            });
         let alpha_mode = match item
             .get("alpha_mode")
             .and_then(Value::as_str)
@@ -3320,6 +3328,7 @@ fn build_imported_graph(
             Material {
                 name: name.to_owned(),
                 base_color: color,
+                viewport_display,
                 alpha_mode,
                 alpha_threshold: number_field(item, "alpha_threshold", 0.5),
                 metallic: number_field(item, "metallic", 0.0),
@@ -8400,19 +8409,93 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
             ));
         }
     }
-    // Workbench draws back faces unless the scene's viewport shading culls them; Potter's raster has no such setting.
+    // Workbench's viewport shading changes what its render draws. Potter's solid preview models the
+    // factory studio light with material colours, and none of the other options below.
     for scene in raw
         .get("scenes")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter(|scene| scene["display_backface_culling"].as_bool() == Some(true))
     {
-        losses.push(loss(
-            "blender.scene.display_backface_culling",
-            scene.get("name").and_then(Value::as_str),
-            "Blender's Workbench backface culling is not imported; Potter's solid preview draws back faces",
-        ));
+        let name = scene.get("name").and_then(Value::as_str);
+        let shading = &scene["display_shading"];
+        let on = |key: &str| shading[key].as_bool() == Some(true);
+        let off = |key: &str| shading[key].as_bool() == Some(false);
+        let unsupported = [
+            (
+                shading["light"] != "STUDIO",
+                "blender.scene.display_light",
+                "Blender's Workbench lighting is not STUDIO; Potter's solid preview is studio-lit only",
+            ),
+            (
+                matches!(shading["type"].as_str(), None | Some("WIREFRAME")),
+                "blender.scene.display_type",
+                "Blender's viewport shading is wireframe, below Solid; Potter's solid preview is the Workbench solid render",
+            ),
+            (
+                !matches!(shading["studio_light"].as_str(), Some("" | "Default")),
+                "blender.scene.display_studio_light",
+                "Blender's studio light is not Default; Potter's solid preview uses the Default studio light",
+            ),
+            (
+                shading["color_type"] != "MATERIAL",
+                "blender.scene.display_color_type",
+                "Blender's Workbench colour source is not MATERIAL; Potter's solid preview draws material colours",
+            ),
+            (
+                on("use_world_space_lighting"),
+                "blender.scene.display_world_space_lighting",
+                "Blender's world-space studio lighting is not imported; Potter's solid preview lights in view space",
+            ),
+            (
+                off("show_specular_highlight"),
+                "blender.scene.display_specular_highlight",
+                "Blender's Workbench specular highlight is off; Potter's solid preview always shows it",
+            ),
+            (
+                on("show_cavity"),
+                "blender.scene.display_cavity",
+                "Blender's Workbench cavity is not imported; Potter's solid preview draws no cavity",
+            ),
+            (
+                on("show_shadows"),
+                "blender.scene.display_shadows",
+                "Blender's Workbench shadows are not imported; Potter's solid preview draws no shadows",
+            ),
+            (
+                on("show_object_outline"),
+                "blender.scene.display_object_outline",
+                "Blender's Workbench object outline is not imported; Potter's solid preview draws no outline",
+            ),
+            (
+                on("show_backface_culling"),
+                "blender.scene.display_backface_culling",
+                "Blender's Workbench backface culling is not imported; Potter's solid preview draws back faces",
+            ),
+            (
+                on("show_xray")
+                    && shading["xray_alpha"]
+                        .as_f64()
+                        .is_none_or(|alpha| alpha < 1.0),
+                "blender.scene.display_xray",
+                "Blender's Workbench X-ray is not imported; Potter's solid preview is opaque",
+            ),
+            (
+                on("use_dof") && shading["camera_dof"].as_bool() != Some(false),
+                "blender.scene.display_dof",
+                "Blender's Workbench depth of field is not imported; Potter's solid preview has no depth of field",
+            ),
+            (
+                shading["background_type"] == "VIEWPORT",
+                "blender.scene.display_background",
+                "Blender's Workbench background is the viewport colour, which is not imported; Potter's solid preview uses the world's colour",
+            ),
+        ];
+        for (is_unsupported, feature, reason) in unsupported {
+            if is_unsupported {
+                losses.push(loss(feature, name, reason));
+            }
+        }
     }
     for material in raw
         .get("materials")
@@ -10295,6 +10378,7 @@ mod tests {
                     "nodes": {"nodes": [{"name":"Background","type":"ShaderNodeBackground"}, {"name":"World Output","type":"ShaderNodeOutputWorld"}]},
                     "custom_properties": {}},
                 "unit": {"system": "metric", "scale_length": 1.0},
+                "display_shading": {"type": "SOLID", "light": "STUDIO", "studio_light": "Default", "color_type": "MATERIAL", "use_world_space_lighting": false, "show_specular_highlight": true, "show_cavity": false, "show_shadows": false, "show_object_outline": false, "show_backface_culling": false, "show_xray": false, "xray_alpha": 0.5, "use_dof": false, "camera_dof": false, "background_type": "THEME"},
                 "render": {"resolution_x": 640, "resolution_y": 360, "resolution_percentage": 100,
                            "samples": 12, "seed": 5, "film_transparent": false, "engine": "path",
                            "engine_native": "CYCLES"},
@@ -10464,6 +10548,7 @@ mod tests {
                 "name":"Scene","potter_id":"scene_main","root_collection":"Collection",
                 "frame_current":1.0,"frame_start":1,"frame_end":250,"fps":24,"fps_base":1.0,
                 "camera":null,"world":null,"unit":{"system":"METRIC","scale_length":1.0},
+                "display_shading":{"type":"SOLID","light":"STUDIO","studio_light":"Default","color_type":"MATERIAL","use_world_space_lighting":false,"show_specular_highlight":true,"show_cavity":false,"show_shadows":false,"show_object_outline":false,"show_backface_culling":false,"show_xray":false,"xray_alpha":0.5,"use_dof":false,"camera_dof":false,"background_type":"THEME"},
                 "render":{},"view_layers":[{"name":"View Layer","excluded_collections":[]}],
                 "markers":[{"name":"Marker","frame":12.0}],
                 "rigid_body_world":{"enabled":true,"gravity":[0.0,0.0,-9.81],
@@ -13686,6 +13771,112 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
             Some(&smoke_id)
         );
         assert_eq!(imported_node.material_slot(Some(imported_data), 1), None);
+        Ok(())
+    }
+
+    #[test]
+    fn blender_viewport_display_roundtrips_beside_the_principled_values() -> Result<()> {
+        let Some(blender) = optional_blender() else {
+            return Ok(());
+        };
+        let directory = tempfile::tempdir().map_err(|error| PotError::io(&error))?;
+        let project = Project::init(directory.path().join("project"))?;
+        let script_path = directory.path().join("make_viewport_fixture.py");
+        let blend_path = directory.path().join("viewport-fixture.blend");
+        fs::write(
+            &script_path,
+            r#"
+import bpy, sys
+path = sys.argv[sys.argv.index("--") + 1]
+material = bpy.data.materials.new("Viewport")
+material.use_nodes = True
+principled = next(node for node in material.node_tree.nodes if node.type == "BSDF_PRINCIPLED")
+principled.inputs["Base Color"].default_value = (0.25, 0.5, 0.75, 1.0)
+principled.inputs["Metallic"].default_value = 0.125
+principled.inputs["Roughness"].default_value = 0.75
+material.diffuse_color = (0.875, 0.125, 0.25, 1.0)
+material.metallic = 0.5
+material.roughness = 0.25
+bpy.ops.mesh.primitive_plane_add()
+bpy.context.object.data.materials.append(material)
+bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
+"#,
+        )
+        .map_err(|error| PotError::io(&error))?;
+        let generated = Command::new(&blender)
+            .arg("--background")
+            .arg("--factory-startup")
+            .arg("--disable-depsgraph-on-file-load")
+            .arg("--disable-autoexec")
+            .arg("--python-exit-code")
+            .arg("3")
+            .arg("--python")
+            .arg(&script_path)
+            .arg("--")
+            .arg(&blend_path)
+            .output()
+            .map_err(|error| PotError::io(&error))?;
+        if !generated.status.success() {
+            return Err(PotError::with_details(
+                ErrorCode::ImportFailed,
+                "Blender viewport fixture creation failed",
+                child_details(&generated),
+            ));
+        }
+        let find = |doc: &SceneDoc| -> Result<Material> {
+            doc.materials
+                .values()
+                .find(|material| material.name == "Viewport")
+                .cloned()
+                .ok_or_else(|| invalid_intermediate("viewport fixture material was not imported"))
+        };
+        let imported = import_blend(&blend_path, Some(&blender))?;
+        assert!(
+            imported.losses.is_empty(),
+            "viewport fixture import reported losses: {:?}",
+            imported.losses
+        );
+        let first = find(&imported.doc)?;
+        let viewport = first
+            .viewport_display
+            .as_ref()
+            .ok_or_else(|| invalid_intermediate("viewport display was not imported"))?;
+        assert_eq!(first.base_color, [0.25, 0.5, 0.75, 1.0]);
+        assert_eq!(first.metallic, 0.125);
+        assert_eq!(first.roughness, 0.75);
+        assert_eq!(viewport.diffuse_color, [0.875, 0.125, 0.25, 1.0]);
+        assert_eq!(viewport.metallic, 0.5);
+        assert_eq!(viewport.roughness, 0.25);
+        let output = directory.path().join("viewport-roundtrip.blend");
+        let context = export_context();
+        export_blend(
+            &imported.doc,
+            &project,
+            &output,
+            &ExportOptions {
+                allow_lossy: false,
+                pack: false,
+                blender: Some(&blender),
+                context: &context,
+            },
+        )?;
+        let reimported = import_blend(&output, Some(&blender))?;
+        assert!(
+            reimported.losses.is_empty(),
+            "viewport round-trip reported losses: {:?}",
+            reimported.losses
+        );
+        let again = find(&reimported.doc)?;
+        let viewport = again
+            .viewport_display
+            .as_ref()
+            .ok_or_else(|| invalid_intermediate("viewport display did not survive export"))?;
+        assert_eq!(again.base_color, [0.25, 0.5, 0.75, 1.0]);
+        assert_eq!(again.metallic, 0.125);
+        assert_eq!(again.roughness, 0.75);
+        assert_eq!(viewport.diffuse_color, [0.875, 0.125, 0.25, 1.0]);
+        assert_eq!(viewport.metallic, 0.5);
+        assert_eq!(viewport.roughness, 0.25);
         Ok(())
     }
 
@@ -17604,5 +17795,76 @@ mod camera_import_tests {
         let mirror = panorama("MIRRORBALL", (-PI, PI), (-FRAC_PI_2, FRAC_PI_2));
         assert_eq!(imported(&mirror).projection, CameraProjection::Perspective);
         assert_eq!(features(&mirror), ["blender.camera.panorama_type"]);
+    }
+}
+
+#[cfg(test)]
+mod workbench_display_loss_tests {
+    use super::*;
+
+    /// Blender 5.2.2's factory `scene.display.shading`, as the bridge writes it.
+    fn factory_shading() -> Value {
+        json!({"type": "SOLID", "light": "STUDIO", "studio_light": "Default", "color_type": "MATERIAL",
+               "use_world_space_lighting": false, "show_specular_highlight": true, "show_cavity": false,
+               "show_shadows": false, "show_object_outline": false, "show_backface_culling": false,
+               "show_xray": false, "xray_alpha": 0.5, "use_dof": false, "camera_dof": false,
+               "background_type": "THEME"})
+    }
+
+    /// The loss features of a scene whose shading is the factory one with `edits` applied.
+    fn losses(edits: &[(&str, Value)]) -> Vec<String> {
+        let mut shading = factory_shading();
+        for (key, value) in edits {
+            shading[*key] = value.clone();
+        }
+        import_losses(&json!({"scenes": [{"name": "Scene", "display_shading": shading}]}))
+            .into_iter()
+            .map(|loss| loss.feature_id)
+            .collect()
+    }
+
+    #[test]
+    fn factory_shading_reports_nothing() {
+        assert_eq!(losses(&[]), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn xray_is_reported_only_when_translucent() {
+        assert_eq!(
+            losses(&[("show_xray", json!(true))]),
+            ["blender.scene.display_xray"]
+        );
+        assert_eq!(
+            losses(&[("show_xray", json!(true)), ("xray_alpha", json!(1.0))]),
+            Vec::<&str>::new()
+        );
+    }
+
+    #[test]
+    fn depth_of_field_is_reported_only_when_the_camera_has_it() {
+        assert_eq!(losses(&[("use_dof", json!(true))]), Vec::<&str>::new());
+        assert_eq!(
+            losses(&[("use_dof", json!(true)), ("camera_dof", json!(true))]),
+            ["blender.scene.display_dof"]
+        );
+    }
+
+    #[test]
+    fn only_wireframe_is_below_solid_and_only_viewport_is_an_unimported_background() {
+        assert_eq!(
+            losses(&[("type", json!("WIREFRAME"))]),
+            ["blender.scene.display_type"]
+        );
+        for shading_type in ["SOLID", "MATERIAL", "RENDERED"] {
+            assert_eq!(losses(&[("type", json!(shading_type))]), Vec::<&str>::new());
+        }
+        assert_eq!(
+            losses(&[("background_type", json!("WORLD"))]),
+            Vec::<&str>::new()
+        );
+        assert_eq!(
+            losses(&[("background_type", json!("VIEWPORT"))]),
+            ["blender.scene.display_background"]
+        );
     }
 }
