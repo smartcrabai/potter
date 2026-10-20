@@ -956,7 +956,7 @@ impl BMesh {
         }
         let joined = self.face_create(&verts, &edges, faces[0]);
         // `BM_faces_join` checks for a double before it kills the joined faces.
-        let double = self.face_find_double(joined).is_some();
+        let double = face_find_double(self, joined).is_some();
         let first_new = self.faces[joined].first;
         for (k, &source) in sources.iter().enumerate() {
             for layer in 0..self.uv_stride {
@@ -988,43 +988,92 @@ impl BMesh {
         }
         count
     }
+}
 
-    /// `BM_face_find_double`: an existing face with the same corners, in either winding, found on the
-    /// radial cycle of the first loop of `f`.
-    fn face_find_double(&self, f: usize) -> Option<usize> {
-        let l_first = self.faces[f].first;
-        let len = self.faces[f].len;
-        let mut l_iter = self.loops[l_first].radial_next;
-        while l_iter != l_first {
-            let other = self.loops[l_iter].f;
-            if self.faces[other].len == len {
-                let same_winding = self.loops[l_iter].v == self.loops[l_first].v;
-                let mut a = l_first;
-                let mut b = l_iter;
-                let mut same = true;
-                loop {
-                    if self.loops[a].e != self.loops[b].e {
-                        same = false;
-                        break;
-                    }
-                    a = if same_winding {
-                        self.loops[a].next
-                    } else {
-                        self.loops[a].prev
-                    };
-                    b = self.loops[b].next;
-                    if b == l_iter {
-                        break;
-                    }
+/// The ring accessors of [`face_find_double`]. The `BMesh` of COLLAPSE and the `BMesh` of DISSOLVE both
+/// implement it, so `BM_face_find_double` exists once.
+pub(super) trait FaceRings {
+    /// `BM_FACE_FIRST_LOOP` of face `f`.
+    fn face_first(&self, f: usize) -> usize;
+    /// Corner count of face `f`.
+    fn face_len(&self, f: usize) -> usize;
+    fn loop_radial_next(&self, l: usize) -> usize;
+    fn loop_next(&self, l: usize) -> usize;
+    fn loop_prev(&self, l: usize) -> usize;
+    fn loop_vert(&self, l: usize) -> usize;
+    fn loop_edge(&self, l: usize) -> usize;
+    fn loop_face(&self, l: usize) -> usize;
+}
+
+impl FaceRings for BMesh {
+    fn face_first(&self, f: usize) -> usize {
+        self.faces[f].first
+    }
+
+    fn face_len(&self, f: usize) -> usize {
+        self.faces[f].len
+    }
+
+    fn loop_radial_next(&self, l: usize) -> usize {
+        self.loops[l].radial_next
+    }
+
+    fn loop_next(&self, l: usize) -> usize {
+        self.loops[l].next
+    }
+
+    fn loop_prev(&self, l: usize) -> usize {
+        self.loops[l].prev
+    }
+
+    fn loop_vert(&self, l: usize) -> usize {
+        self.loops[l].v
+    }
+
+    fn loop_edge(&self, l: usize) -> usize {
+        self.loops[l].e
+    }
+
+    fn loop_face(&self, l: usize) -> usize {
+        self.loops[l].f
+    }
+}
+
+/// `BM_face_find_double`: an existing face with the same corners, in either winding, found on the
+/// radial cycle of the first loop of `f`.
+pub(super) fn face_find_double<B: FaceRings>(bm: &B, f: usize) -> Option<usize> {
+    let l_first = bm.face_first(f);
+    let len = bm.face_len(f);
+    let mut l_iter = bm.loop_radial_next(l_first);
+    while l_iter != l_first {
+        let other = bm.loop_face(l_iter);
+        if bm.face_len(other) == len {
+            let same_winding = bm.loop_vert(l_iter) == bm.loop_vert(l_first);
+            let mut a = l_first;
+            let mut b = l_iter;
+            let mut same = true;
+            loop {
+                if bm.loop_edge(a) != bm.loop_edge(b) {
+                    same = false;
+                    break;
                 }
-                if same {
-                    return Some(other);
+                a = if same_winding {
+                    bm.loop_next(a)
+                } else {
+                    bm.loop_prev(a)
+                };
+                b = bm.loop_next(b);
+                if b == l_iter {
+                    break;
                 }
             }
-            l_iter = self.loops[l_iter].radial_next;
+            if same {
+                return Some(other);
+            }
         }
-        None
+        l_iter = bm.loop_radial_next(l_iter);
     }
+    None
 }
 
 fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {

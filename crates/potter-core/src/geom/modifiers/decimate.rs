@@ -960,41 +960,39 @@ impl BMesh {
             UNIT_TO_ANGLE
         }
     }
+}
 
-    /// `BM_face_find_double`: an existing face with the same loops, in either winding.
-    fn face_find_double(&self, f: usize) -> Option<usize> {
-        let l_first = self.faces[f].first;
-        let len = self.faces[f].len;
-        let mut l_iter = self.loops[l_first].radial_next;
-        while l_iter != l_first {
-            let other = self.loops[l_iter].f;
-            if self.faces[other].len == len {
-                let same_vertex = self.loops[l_iter].v == self.loops[l_first].v;
-                let mut a = l_first;
-                let mut b = l_iter;
-                let mut same = true;
-                loop {
-                    if self.loops[a].e != self.loops[b].e {
-                        same = false;
-                        break;
-                    }
-                    a = if same_vertex {
-                        self.loops[a].next
-                    } else {
-                        self.loops[a].prev
-                    };
-                    b = self.loops[b].next;
-                    if b == l_iter {
-                        break;
-                    }
-                }
-                if same {
-                    return Some(other);
-                }
-            }
-            l_iter = self.loops[l_iter].radial_next;
-        }
-        None
+impl collapse::FaceRings for BMesh {
+    fn face_first(&self, f: usize) -> usize {
+        self.faces[f].first
+    }
+
+    fn face_len(&self, f: usize) -> usize {
+        self.faces[f].len
+    }
+
+    fn loop_radial_next(&self, l: usize) -> usize {
+        self.loops[l].radial_next
+    }
+
+    fn loop_next(&self, l: usize) -> usize {
+        self.loops[l].next
+    }
+
+    fn loop_prev(&self, l: usize) -> usize {
+        self.loops[l].prev
+    }
+
+    fn loop_vert(&self, l: usize) -> usize {
+        self.loops[l].v
+    }
+
+    fn loop_edge(&self, l: usize) -> usize {
+        self.loops[l].e
+    }
+
+    fn loop_face(&self, l: usize) -> usize {
+        self.loops[l].f
     }
 }
 
@@ -1202,7 +1200,7 @@ impl BMesh {
         };
         let mut double = None;
         let mut reused = false;
-        if let Some(existing) = self.face_find_double(f_new) {
+        if let Some(existing) = collapse::face_find_double(self, f_new) {
             if want_double {
                 double = Some(existing);
             } else {
@@ -1471,7 +1469,7 @@ impl BMesh {
             }
         }
         while let Some(f) = duplicate_candidates.pop() {
-            if self.faces[f].alive && self.face_find_double(f).is_some() {
+            if self.faces[f].alive && collapse::face_find_double(self, f).is_some() {
                 self.face_kill(f);
             }
         }
