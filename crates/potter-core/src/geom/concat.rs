@@ -1257,9 +1257,18 @@ mod tests {
             .iter()
             .map(|layer| layer.name.as_str())
             .collect();
-        assert_eq!(names, ["A", "Extra"]);
+        // The fourth member is a box, which carries Blender's default `UVMap`; joining appends it
+        // after the layers the first members named.
+        assert_eq!(names, ["A", "Extra", "UVMap"]);
         assert_eq!(store.active.as_deref(), Some("A"));
         assert_eq!(store.render.as_deref(), Some("A"));
+        // Blender's `primitive_cube_add` face 0 UVs (`box_order` oracle), stored with v down.
+        let default_uv = store.layers[2].faces[18].as_ref().unwrap();
+        let blender_face0 = [[0.375, 1.0], [0.625, 1.0], [0.625, 0.75], [0.375, 0.75]];
+        for (actual, expected) in default_uv.iter().zip(blender_face0) {
+            assert!((actual[0] - expected[0]).abs() <= 1.0e-12);
+            assert!((actual[1] - expected[1]).abs() <= 1.0e-12);
+        }
 
         let a = &store.layers[0];
         assert_uv_rows(a, 0..6, [0.1, 0.2]);

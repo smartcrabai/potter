@@ -21,6 +21,8 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
+use crate::geom::triangulate::ortho_basis;
+
 type P2 = [f32; 2];
 type P3 = [f32; 3];
 /// Slab bounds of one box, Blender `bv` for `BLI_bvhtree_new(…, axis = 8)`: `[min, max]` for `x`, `y`,
@@ -933,20 +935,6 @@ fn axis_pt_cmp(a: P2, b: P2) -> Ordering {
         Ordering::Greater
     } else {
         Ordering::Equal
-    }
-}
-
-/// Blender `ortho_basis_v3v3_v3`: the two tangents of `n`, in the order used by `axis_dominant_v3_to_m3`.
-pub(super) fn ortho_basis(n: P3) -> (P3, P3) {
-    let f = n[0] * n[0] + n[1] * n[1];
-    if f > f32::EPSILON {
-        let d = 1.0 / f.sqrt();
-        let n1 = [n[1] * d, -n[0] * d, 0.0];
-        let n2 = [-n[2] * n1[1], n[2] * n1[0], n[0] * n1[1] - n[1] * n1[0]];
-        (n1, n2)
-    } else {
-        let n1 = [if n[2] < 0.0 { -1.0 } else { 1.0 }, 0.0, 0.0];
-        (n1, [0.0, 1.0, 0.0])
     }
 }
 

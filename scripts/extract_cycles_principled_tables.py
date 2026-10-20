@@ -28,6 +28,10 @@ TABLES = [
     ("table_ggx_Eavg", "GGX_E_AVG", 32),
     ("table_ggx_gen_schlick_ior_s", "GGX_GEN_SCHLICK_IOR_S", 4096),
     ("table_sheen_ltc", "SHEEN_LTC", 3072),
+    ("table_ggx_glass_E", "GGX_GLASS_E", 4096),
+    ("table_ggx_glass_Eavg", "GGX_GLASS_E_AVG", 256),
+    ("table_ggx_glass_inv_E", "GGX_GLASS_INV_E", 4096),
+    ("table_ggx_glass_inv_Eavg", "GGX_GLASS_INV_E_AVG", 256),
 ]
 
 # Statics whose Cycles literals include a value that clippy's `approx_constant` lint reads as a math
