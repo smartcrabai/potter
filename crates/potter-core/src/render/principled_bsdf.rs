@@ -283,7 +283,16 @@ pub(crate) struct Layers {
 /// Sets up the sheen and coat layers of a shading point with normal `normal`, seen along `view`.
 pub(crate) fn layers(params: &BsdfParams, normal: DVec3, view: DVec3) -> Layers {
     let coat = coat_layer(params, view);
-    let sheen = sheen_lobe(params, normal, view);
+    // Cycles sets the sheen's normal to `safe_normalize(mix(N, coat normal, saturate(coat weight)))`
+    // (`kernel/svm/closure.h`, `principled_bsdf_emission`), so the sheen frame and LTC follow the coat.
+    let coat_weight = params.coat_weight.clamp(0.0, 1.0);
+    let mixed = normal.lerp(params.coat_normal_or_shading(), coat_weight);
+    let sheen_normal = if mixed.length_squared() > f64::EPSILON {
+        mixed.normalize()
+    } else {
+        normal
+    };
+    let sheen = sheen_lobe(params, sheen_normal, view);
     let lower = coat_lower_factor_of(params, coat.as_ref()) * sheen.layer_weight();
     Layers {
         normal,
@@ -851,6 +860,22 @@ mod tests {
             sheen_coefficient(&off, &layers(&off, DVec3::Z, view), view),
             DVec3::ZERO
         );
+    }
+
+    #[test]
+    fn sheen_normal_mixes_toward_the_coat_normal_by_coat_weight() {
+        let view = DVec3::new(0.5, 0.0, 0.5_f64.sqrt());
+        let mut params = sheen_params(1.0, 0.5, [1.0; 3]);
+        params.coat_normal = Some(DVec3::X);
+        params.coat_weight = 0.5;
+        // normalize(mix(N, coat normal, 0.5)) with N = +Z, as Cycles' sheen N.
+        let expected = DVec3::Z.lerp(DVec3::X, 0.5).normalize();
+        let shading = layers(&params, DVec3::Z, view);
+        assert!((shading.sheen.normal - expected).length() < 1.0e-12);
+        // Without a coat the sheen keeps the shading normal.
+        params.coat_weight = 0.0;
+        let shading = layers(&params, DVec3::Z, view);
+        assert!((shading.sheen.normal - DVec3::Z).length() < 1.0e-12);
     }
 }
 
