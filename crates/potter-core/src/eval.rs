@@ -4461,18 +4461,13 @@ pub(crate) fn apply_lattice_modifier(
     }
     // The kernel maps lattice-space offsets through inv(subject) * lattice, as Blender's latmat does.
     let lattice_to_mesh = source_inverse * lattice_world;
-    // An absent strength is the schema default 1.0; a present value must still be a finite number.
-    let strength = match modifier.params.get("strength") {
-        None | Some(Value::Null) => 1.0,
-        Some(_) => modifier_number_param(modifier, "strength")?,
-    };
+    let strength = modifier_number_param(modifier, "strength")?;
     let weights = lattice_vertex_group_weights(mesh, modifier, source_data)?
         .unwrap_or_else(|| vec![1.0; mesh.vertices.len()]);
     let fully_deformed =
-        crate::geom::lattice::deform_mesh_with_transform(mesh, lattice, None, lattice_to_mesh)?;
+        crate::geom::lattice::deform_mesh_with_transform(mesh, lattice, lattice_to_mesh)?;
     // The full-weight result scaled by strength * weight is Blender's per-vertex blend.
-    let mut result = mesh.clone();
-    for ((vertex, deformed), weight) in result
+    for ((vertex, deformed), weight) in mesh
         .vertices
         .iter_mut()
         .zip(&fully_deformed.vertices)
@@ -4480,7 +4475,6 @@ pub(crate) fn apply_lattice_modifier(
     {
         vertex.co += (deformed.co - vertex.co) * (strength * weight);
     }
-    *mesh = result;
     Ok(())
 }
 
@@ -5568,23 +5562,6 @@ fn reference_object_id(modifier: &Modifier, parameter: &str, doc: &SceneDoc) -> 
     Ok(Some(object_id))
 }
 
-/// A bone-name parameter; an absent or empty value names no bone.
-fn reference_bone_id(modifier: &Modifier, parameter: &str) -> Result<Option<Id>> {
-    let text = match modifier.params.get(parameter) {
-        None | Some(Value::Null) => return Ok(None),
-        Some(Value::String(text)) if text.is_empty() => return Ok(None),
-        Some(Value::String(text)) => text.as_str(),
-        Some(_) => return Err(invalid_reference(modifier, parameter, "a bone name")),
-    };
-    Id::new(text).map(Some).map_err(|error| {
-        PotError::with_details(
-            ErrorCode::InvalidArgument,
-            error.message,
-            json!({"modifier_id":modifier.id,"pointer":format!("/params/{parameter}")}),
-        )
-    })
-}
-
 fn modifier_str_param<'a>(modifier: &'a Modifier, name: &str) -> Result<&'a str> {
     modifier
         .params
@@ -5597,6 +5574,7 @@ fn modifier_number_param(modifier: &Modifier, name: &str) -> Result<f64> {
     modifier
         .params
         .get(name)
+        .or_else(|| params::default_value(ParameterFamily::Modifier, &modifier.modifier_type, name))
         .and_then(Value::as_f64)
         .filter(|value| value.is_finite())
         .ok_or_else(|| invalid_reference(modifier, name, "a finite number"))
@@ -5704,7 +5682,6 @@ fn add_modifier_pose_armature_references(
             ("texture_coords_object", "texture_coords_bone"),
         ],
         "displace" | "wave" => &[("texture_coords_object", "texture_coords_bone")],
-        "volume_displace" => &[("texture_map_object", "texture_map_bone")],
         _ => &[],
     };
     for (object_parameter, bone_parameter) in pose_reference_parameters {
@@ -5804,11 +5781,12 @@ fn apply_scene_single_reference_modifier(
     let mut resolved = modifier.clone();
     resolved.params.remove(parameter);
     if let Some(object_id) = reference_object_id(modifier, parameter, doc)? {
-        let bone = match bone_parameter {
-            Some(name) => reference_bone_id(modifier, name)?,
+        let bone_name = match bone_parameter {
+            Some(name) => reference_bone_name(modifier, name)?,
             None => None,
         };
-        let reference = reference_world_matrix(modifier, &object_id, bone.as_ref(), references)?;
+        let reference =
+            warp_reference_world_matrix(modifier, &object_id, bone_name, doc, references)?;
         let inverse = subject_inverse_matrix(modifier, subject_id, references)?;
         resolved.runtime.object_matrix = Some((inverse * reference).to_cols_array());
     }
@@ -5842,9 +5820,9 @@ fn warp_reference_matrices(
     Ok(Some((inverse * from_world, inverse * to_world)))
 }
 
-/// Warp's bone reference is a pose-bone name, matched as `armature_bone_id_by_name` does. A name
-/// that resolves to no bone uses the object's world matrix, as Blender's `matrix_from_obj_pchan`
-/// does when the pose channel is missing.
+/// A bone name (Warp's `bone_from`/`bone_to`, Hook's `subtarget`) is matched as
+/// `armature_bone_id_by_name` does. A name that resolves to no bone uses the object's world
+/// matrix, as Blender's `matrix_from_obj_pchan` (Warp) and the Hook fallback do.
 fn warp_reference_world_matrix(
     modifier: &Modifier,
     object_id: &Id,
@@ -5961,7 +5939,7 @@ fn texture_coordinate_mapping(
         references.bone_pose_matrices,
         "texture_coords",
         "texture_coords_object",
-        "texture_coords_bone",
+        Some("texture_coords_bone"),
     )
 }
 
@@ -5973,7 +5951,7 @@ pub(crate) fn texture_coordinate_mapping_with_parameters(
     bone_pose_matrices: &BTreeMap<Id, BTreeMap<Id, [f64; 16]>>,
     mapping_parameter: &str,
     object_parameter: &str,
-    bone_parameter: &str,
+    bone_parameter: Option<&str>,
 ) -> Result<Option<TextureCoordinateMapping>> {
     let mut mapping = TextureCoordinateMapping::for_subject_world(subject_world);
     match modifier_str_param(modifier, mapping_parameter)? {
@@ -6016,7 +5994,7 @@ pub(crate) fn texture_coordinate_mapping_with_parameters(
 fn reference_world_matrix_f32_with_bone_fallback(
     modifier: &Modifier,
     object_id: &Id,
-    bone_parameter: &str,
+    bone_parameter: Option<&str>,
     doc: &SceneDoc,
     world_matrices: &BTreeMap<Id, DMat4>,
     bone_pose_matrices: &BTreeMap<Id, BTreeMap<Id, [f64; 16]>>,
@@ -6028,9 +6006,8 @@ fn reference_world_matrix_f32_with_bone_fallback(
             json!({"modifier_id":modifier.id,"object":object_id}),
         )
     })?;
-    let bone_name = modifier
-        .params
-        .get(bone_parameter)
+    let bone_name = bone_parameter
+        .and_then(|parameter| modifier.params.get(parameter))
         .and_then(Value::as_str)
         .filter(|name| !name.is_empty());
     let bone_id = bone_name.and_then(|name| armature_bone_id_by_name(doc, object_id, name));
@@ -6175,7 +6152,7 @@ fn apply_volume_displace_modifier(
             bone_pose_matrices,
             "texture_map_mode",
             "texture_map_object",
-            "texture_map_bone",
+            None,
         )?
     } else {
         None

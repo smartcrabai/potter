@@ -89,7 +89,7 @@ proptest! {
                 .collect(),
             Vec::new(),
         ).unwrap();
-        let output = lattice::deform_mesh(&mesh, &LatticeData::default(), None).unwrap();
+        let output = lattice::deform_mesh(&mesh, &LatticeData::default()).unwrap();
         prop_assert_eq!(output, mesh);
     }
 }

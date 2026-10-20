@@ -103,22 +103,17 @@ fn axis_position(min: f64, max: f64, index: usize, count: usize) -> f64 {
     min + (max - min) * (index as f64 / (count - 1) as f64)
 }
 
-/// Deform a mesh through the lattice, optionally blending each result by a vertex weight.
+/// Deform a mesh through the lattice.
 ///
-/// Weights must be finite values in `[0, 1]`; zero leaves a vertex unchanged and one
-/// applies the full lattice displacement. Vertices beyond the cage are extrapolated with the same
-/// basis as Blender, not snapped to the nearest cage point.
+/// Vertices beyond the cage are extrapolated with the same basis as Blender, not snapped to the
+/// nearest cage point.
 ///
 /// # Errors
 ///
-/// Returns `InvalidArgument` for malformed lattice data, weights, or mesh topology, and
-/// `LimitExceeded` when the lattice or mesh exceeds supported dimensions/counts.
-pub fn deform_mesh(
-    mesh: &Mesh,
-    lattice: &LatticeData,
-    vertex_weights: Option<&[f64]>,
-) -> Result<Mesh> {
-    deform_mesh_with_transform(mesh, lattice, vertex_weights, DMat4::IDENTITY)
+/// Returns `InvalidArgument` for malformed lattice data or mesh topology, and `LimitExceeded`
+/// when the lattice or mesh exceeds supported dimensions/counts.
+pub fn deform_mesh(mesh: &Mesh, lattice: &LatticeData) -> Result<Mesh> {
+    deform_mesh_with_transform(mesh, lattice, DMat4::IDENTITY)
 }
 
 /// Deform a mesh using a lattice-to-mesh-local transform.
@@ -133,7 +128,6 @@ pub fn deform_mesh(
 pub fn deform_mesh_with_transform(
     mesh: &Mesh,
     lattice: &LatticeData,
-    vertex_weights: Option<&[f64]>,
     lattice_to_mesh: DMat4,
 ) -> Result<Mesh> {
     let point_count = validate_lattice(lattice)?;
@@ -149,21 +143,6 @@ pub fn deform_mesh_with_transform(
             ErrorCode::LimitExceeded,
             "mesh element count exceeds the lattice deformation limit",
         ));
-    }
-    if let Some(weights) = vertex_weights {
-        if weights.len() != mesh.vertices.len() {
-            return Err(PotError::invalid_argument(
-                "vertex weight count must match mesh vertex count",
-            ));
-        }
-        if weights
-            .iter()
-            .any(|weight| !weight.is_finite() || !(0.0..=1.0).contains(weight))
-        {
-            return Err(PotError::invalid_argument(
-                "vertex weights must be finite values in [0, 1]",
-            ));
-        }
     }
     if !lattice_to_mesh.is_finite() {
         return Err(PotError::invalid_argument(
@@ -184,15 +163,11 @@ pub fn deform_mesh_with_transform(
     }
 
     let mut output = mesh.clone();
-    for (index, vertex) in output.vertices.iter_mut().enumerate() {
-        let weight = vertex_weights.map_or(1.0, |weights| weights[index]);
-        if weight == 0.0 {
-            continue;
-        }
+    for vertex in &mut output.vertices {
         let lattice_position = mesh_to_lattice.transform_point3(vertex.co);
         let lattice_displacement = sample_displacement(lattice_position, lattice);
         let mesh_displacement = lattice_to_mesh.transform_vector3(lattice_displacement);
-        let deformed_position = vertex.co + mesh_displacement * weight;
+        let deformed_position = vertex.co + mesh_displacement;
         if !deformed_position.is_finite() {
             return Err(PotError::invalid_argument(
                 "lattice deformation produced non-finite vertex coordinates",
@@ -401,7 +376,7 @@ mod tests {
             DVec3::new(0.0, 0.0, 0.0),
         ];
         let mesh = Mesh::from_positions_and_faces(positions.clone(), vec![])?;
-        let result = deform_mesh(&mesh, &lattice, None)?;
+        let result = deform_mesh(&mesh, &lattice)?;
 
         assert_eq!(result.vertices[0].co, positions[0] + DVec3::X);
         assert_eq!(result.vertices[1].co, positions[1]);
@@ -409,20 +384,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn per_vertex_weights_blend_original_and_deformed_positions()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let mut lattice = LatticeData::default();
-        lattice.points[0] += DVec3::X;
-        let original = DVec3::new(-1.0, -1.0, -1.0);
-        let mesh = Mesh::from_positions_and_faces(vec![original; 3], vec![])?;
-        let result = deform_mesh(&mesh, &lattice, Some(&[0.0, 0.5, 1.0]))?;
-
-        assert_eq!(result.vertices[0].co, original);
-        assert_eq!(result.vertices[1].co, original + DVec3::X * 0.5);
-        assert_eq!(result.vertices[2].co, original + DVec3::X);
-        Ok(())
-    }
     proptest! {
         #[test]
         fn identity_lattice_preserves_arbitrary_mesh_positions(
@@ -448,7 +409,7 @@ mod tests {
                 ..LatticeData::default()
             };
 
-            let deformed = deform_mesh(&mesh, &lattice, None)
+            let deformed = deform_mesh(&mesh, &lattice)
                 .unwrap_or_else(|error| panic!("identity lattice deformation is valid: {error}"));
             prop_assert_eq!(deformed, mesh);
         }

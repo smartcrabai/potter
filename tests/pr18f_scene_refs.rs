@@ -408,6 +408,51 @@ fn warp_bone_name_on_a_non_armature_uses_the_object_matrix() {
     );
 }
 
+/// A hook that follows a Blender bone name, which Potter ids cannot hold when it has uppercase.
+fn hook_bone_scene(subtarget: Option<&str>) -> SceneDoc {
+    let mut params = json!({
+        "object": "rig",
+        "vertex_group": "H",
+        "falloff_type": "NONE",
+        "strength": 1.0,
+        "matrix_inverse": [1.0,0.0,0.0,0.0, 0.0,1.0,0.0,0.0, 0.0,0.0,1.0,0.0, 0.0,0.0,0.0,1.0]
+    });
+    if let Some(bone) = subtarget {
+        params["subtarget"] = json!(bone);
+    }
+    let staged = apply(
+        &base_scene(),
+        &json!([
+            {"op":"node.create","id":"subj","kind":"box","params":{"size":1.0},
+             "transform":{"translation":[1.0,2.0,3.0],"rotation_deg":[0.0,0.0,30.0],"scale":[2.0,1.0,0.5]}},
+            {"op":"node.create","id":"rig","kind":"armature","transform":{"translation":[1.0,0.0,0.0]}},
+            {"op":"bone.create","target":{"id":"rig"},"id":"bone_1","name":"Bone",
+             "head":[0.0,0.0,0.0],"tail":[0.0,1.0,0.0]},
+            {"op":"pose.set","target":{"id":"rig"},"bone_id":"bone_1","set":{"translation":[0.0,0.5,0.25]}},
+            {"op":"vertex_group.create","target":{"id":"subj"},"id":"h","name":"H"}
+        ]),
+    );
+    apply(
+        &staged,
+        &json!([
+            {"op":"vertex_group.assign","target":{"id":"subj"},"group_id":"h",
+             "weights":group_assignments(source_mesh(&staged, "subj"))},
+            {"op":"modifier.create","target":{"id":"subj"},"id":"hook","type":"hook","params":params}
+        ]),
+    )
+}
+
+#[test]
+fn hook_follows_imported_bone_name_with_object_fallback() {
+    let object = warp_positions(&hook_bone_scene(None));
+    let by_id = warp_positions(&hook_bone_scene(Some("bone_1")));
+    let by_name = warp_positions(&hook_bone_scene(Some("Bone")));
+    let missing = warp_positions(&hook_bone_scene(Some("Missing")));
+    assert_same_positions(&by_name, &by_id);
+    assert_differs_from(&by_name, &object);
+    assert_same_positions(&missing, &object);
+}
+
 #[test]
 fn wave_start_position_object_uses_the_subject_relative_object_location() {
     let doc = apply(
