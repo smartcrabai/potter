@@ -167,8 +167,11 @@ fn normalize3(v: Vec3) -> (Vec3, f32) {
     }
 }
 
-/// `ortho_basis_v3v3_v3`: two unit vectors spanning the plane of `n`.
-fn ortho_basis(n: Vec3) -> (Vec3, Vec3) {
+/// Blender `ortho_basis_v3v3_v3` (`blenlib/intern/math_vector.cc`): two unit vectors spanning the
+/// plane of `n`, in the order `axis_dominant_v3_to_m3` uses. The shared copy of the f32 routine that
+/// Mesh Triangulate, Decimate, Boolean FLOAT and the polyfill frame call; `bevel_vmesh.rs` keeps an
+/// f64 variant on purpose.
+pub(in crate::geom) fn ortho_basis(n: Vec3) -> (Vec3, Vec3) {
     let f = n[0] * n[0] + n[1] * n[1];
     if f > f32::EPSILON {
         let d = 1.0 / f.sqrt();
@@ -433,7 +436,12 @@ struct PolyFill<'a> {
     tris: Vec<[usize; 3]>,
 }
 
-fn polyfill(coords: &[Vec2]) -> Vec<[usize; 3]> {
+/// Blender `BLI_polyfill_calc` (`blenlib/intern/polyfill_2d.cc`, `coords_sign == 1`): ear clipping of
+/// a clockwise projected ring, brute-force candidate search. Returns `n - 2` triangles as indices
+/// into `coords`. Shared by Mesh Triangulate (`triangulate_ngon`, Clip), the Boolean FLOAT and
+/// EXACT n-gon triangulation (`geom/boolean/triangulate.rs`). Decimate keeps its own kd-tree
+/// variant, `modifiers/decimate/polyfill.rs`: it differs on degenerate rings (duplicate points).
+pub(super) fn polyfill(coords: &[Vec2]) -> Vec<[usize; 3]> {
     let n = coords.len();
     let nodes = (0..n)
         .map(|i| PolyNode {

@@ -5,6 +5,8 @@
 //! The Mesh vertex normals come from `normals_calc_verts`, which uses the Mesh face normals
 //! (`normal_calc_ngon`), not the `BMesh` ones.
 
+use crate::geom::triangulate::ortho_basis;
+
 type Vec3 = [f32; 3];
 type Mat3 = [[f32; 3]; 3];
 
@@ -178,20 +180,6 @@ pub(super) fn face_center_median(points: &[[f32; 3]]) -> [f32; 3] {
     }
     let scale = 1.0 / points.len() as f32;
     [c[0] * scale, c[1] * scale, c[2] * scale]
-}
-
-/// `ortho_basis_v3v3_v3` (`math_vector.cc`).
-fn ortho_basis(n: Vec3) -> (Vec3, Vec3) {
-    let f = n[0] * n[0] + n[1] * n[1];
-    if f > f32::EPSILON {
-        let d = 1.0 / f.sqrt();
-        let r1 = [n[1] * d, -n[0] * d, 0.0];
-        let r2 = [-n[2] * r1[1], n[2] * r1[0], n[0] * r1[1] - n[1] * r1[0]];
-        (r1, r2)
-    } else {
-        let r1 = [if n[2] < 0.0 { -1.0 } else { 1.0 }, 0.0, 0.0];
-        (r1, [0.0, 1.0, 0.0])
-    }
 }
 
 /// `axis_dominant_v3_to_m3` body (`math_geom.cc`) given the third row, which is already negated for

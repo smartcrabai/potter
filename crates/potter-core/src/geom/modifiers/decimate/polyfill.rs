@@ -1,16 +1,18 @@
-//! Port of Blender's ear-clipping polyfill (`BLI_polyfill_calc_arena`, `blenlib/intern/polyfill_2d.cc`)
-//! followed by the edge-flip pass (`BLI_polyfill_beautify`, `blenlib/intern/polyfill_2d_beautify.cc`)
-//! for `coords_sign == 1`.
+//! Decimate's kd-tree variant of Blender's ear-clipping polyfill (`BLI_polyfill_calc_arena`,
+//! `blenlib/intern/polyfill_2d.cc`, `coords_sign == 1`). The edge-flip pass is the shared
+//! `BLI_polyfill_beautify` of `geom/triangulate.rs`, which is bit-identical to Decimate's old copy.
 //!
 //! Blender's build enables `USE_CLIP_EVEN`, `USE_CLIP_SWEEP`, `USE_CONVEX_SKIP` (which implies
 //! `USE_KDTREE`), `USE_KDTREE_INDEX_CACHE` and `USE_PRECOMPUTED_ISECT`; only those paths are kept.
 //! Float operation order and tie-breaking follow the original, since the triangle order feeds
 //! Decimate's collapse order.
+//!
+//! This variant differs from the brute-force `geom::triangulate::polyfill` on degenerate rings
+//! (duplicate points), where it agrees with Blender's `BMesh` ear clip; see the note on that
+//! function. Both stay until the deviation is decided.
 
-use super::heap::{Heap, NodeId};
+use crate::geom::triangulate::beautify;
 
-/// Blender's `BLI_POLYFILL_ALLOC_NGON_RESERVE`.
-const HEAP_RESERVE: usize = 64;
 /// Stands in for Blender's `UINT_MAX` / `KDNODE_UNSET` sentinels.
 const NONE: usize = usize::MAX;
 
@@ -27,8 +29,7 @@ pub(super) fn triangulate_ngon(coords: &[[f32; 2]]) -> Vec<[usize; 3]> {
         return Vec::new();
     }
     let mut tris = polyfill_calc(coords);
-    let mut heap = Heap::with_capacity(HEAP_RESERVE);
-    beautify(coords, &mut tris, &mut heap);
+    beautify(coords, &mut tris);
     tris
 }
 
@@ -53,23 +54,6 @@ fn area_tri_signed_alt_2x(v1: [f32; 2], v2: [f32; 2], v3: [f32; 2]) -> f32 {
 /// Blender's `span_tri_v2_sign`.
 fn span_tri_sign(v1: [f32; 2], v2: [f32; 2], v3: [f32; 2]) -> Sign {
     signum_enum(area_tri_signed_alt_2x(v3, v2, v1))
-}
-
-/// Blender's `cross_tri_v2` (`math_geom_inline.cc`).
-fn cross_tri_v2(v1: [f32; 2], v2: [f32; 2], v3: [f32; 2]) -> f32 {
-    (v1[0] - v2[0]) * (v2[1] - v3[1]) + (v1[1] - v2[1]) * (v3[0] - v2[0])
-}
-
-/// Blender's `len_v2v2`.
-fn len_v2v2(a: [f32; 2], b: [f32; 2]) -> f32 {
-    let x = a[0] - b[0];
-    let y = a[1] - b[1];
-    (x * x + y * y).sqrt()
-}
-
-/// Blender's `max_ff`.
-fn max_ff(a: f32, b: f32) -> f32 {
-    if a > b { a } else { b }
 }
 
 /// `std::min` over three values, keeping the first on ties.
@@ -121,49 +105,6 @@ impl TriIsect {
             && ((e[2][1] * co[0]) - (e[2][0] * co[1]) + self.c[2] >= 0.0)
             && ((e[0][1] * co[0]) - (e[0][0] * co[1]) + self.c[0] >= 0.0)
     }
-}
-
-/// Blender's `BLI_polyfill_beautify_quad_rotate_calc_ex` with `lock_degenerate == false`.
-/// Returns the rotation cost (negative: the (1-3) diagonal is better) and the quad area.
-fn quad_rotate_calc(v1: [f32; 2], v2: [f32; 2], v3: [f32; 2], v4: [f32; 2]) -> (f32, f32) {
-    const EPS_ZERO_AREA: f32 = 1e-12;
-
-    let area_2x_234 = cross_tri_v2(v2, v3, v4);
-    let area_2x_241 = cross_tri_v2(v2, v4, v1);
-    let area_2x_123 = cross_tri_v2(v1, v2, v3);
-    let area_2x_134 = cross_tri_v2(v1, v3, v4);
-    let area =
-        (area_2x_234.abs() + area_2x_241.abs() + area_2x_123.abs() + area_2x_134.abs()) / 8.0;
-
-    // Unusable (1-3) state: faces point in opposite directions, or one is near zero area.
-    if (area_2x_123 >= 0.0) != (area_2x_134 >= 0.0)
-        || area_2x_123.abs() <= EPS_ZERO_AREA
-        || area_2x_134.abs() <= EPS_ZERO_AREA
-    {
-        return (f32::MAX, area);
-    }
-    // Unusable (2-4) state: always rotate.
-    if (area_2x_234 >= 0.0) != (area_2x_241 >= 0.0)
-        || area_2x_234.abs() <= EPS_ZERO_AREA
-        || area_2x_241.abs() <= EPS_ZERO_AREA
-    {
-        return (-f32::MAX, area);
-    }
-
-    let len_12 = len_v2v2(v1, v2);
-    let len_23 = len_v2v2(v2, v3);
-    let len_34 = len_v2v2(v3, v4);
-    let len_41 = len_v2v2(v4, v1);
-    let len_13 = len_v2v2(v1, v3);
-    let len_24 = len_v2v2(v2, v4);
-
-    // Current (2-4) state, then the (1-3) candidate; area is 2x, which is fine for ratios.
-    let fac_24 = (area_2x_234.abs() / (len_23 + len_34 + len_24))
-        + (area_2x_241.abs() / (len_41 + len_12 + len_24));
-    let fac_13 = (area_2x_123.abs() / (len_12 + len_23 + len_13))
-        + (area_2x_134.abs() / (len_34 + len_41 + len_13));
-
-    (fac_24 - fac_13, area)
 }
 
 /// Blender's `Range` (`KDRange2D`).
@@ -622,172 +563,4 @@ fn polyfill_calc(coords: &[[f32; 2]]) -> Vec<[usize; 3]> {
 
     pf.triangulate();
     pf.tris
-}
-
-/// Blender's `OrderEdge`: an internal edge's sorted vertex pair and one of its half-edges.
-#[derive(Clone, Copy)]
-struct OrderEdge {
-    verts: [usize; 2],
-    e_half: usize,
-}
-
-/// Blender's `HalfEdge`: `v` is the origin; `base_index` names the undirected edge.
-#[derive(Clone, Copy)]
-struct HalfEdge {
-    v: usize,
-    e_next: usize,
-    e_radial: usize,
-    base_index: usize,
-}
-
-/// Blender's `polyedge_rotate_beauty_calc`: rotation cost and quad area for internal edge `e_a`.
-fn rotate_beauty_cost(coords: &[[f32; 2]], edges: &[HalfEdge], e_a: usize) -> (f32, f32) {
-    let e_b = edges[e_a].e_radial;
-    let e_a_other = edges[edges[e_a].e_next].e_next;
-    let e_b_other = edges[edges[e_b].e_next].e_next;
-    quad_rotate_calc(
-        coords[edges[e_a_other].v],
-        coords[edges[e_a].v],
-        coords[edges[e_b_other].v],
-        coords[edges[e_b].v],
-    )
-}
-
-/// Blender's `polyedge_beauty_cost_update_single`.
-fn cost_update_single(
-    coords: &[[f32; 2]],
-    edges: &[HalfEdge],
-    e: usize,
-    heap: &mut Heap,
-    table: &mut [Option<NodeId>],
-) {
-    let i = edges[e].base_index;
-    let (cost, area) = rotate_beauty_cost(coords, edges, e);
-    // Relative epsilon: an absolute one loops forever on large faces (#56532).
-    if cost < -1e-6_f32 * max_ff(area, 1.0) {
-        heap.insert_or_update(&mut table[i], cost, e);
-    } else if let Some(node) = table[i].take() {
-        heap.remove(node);
-    }
-}
-
-/// Blender's `polyedge_beauty_cost_update`: re-costs the four edges around the rotated edge `e`.
-fn cost_update(
-    coords: &[[f32; 2]],
-    edges: &[HalfEdge],
-    e: usize,
-    heap: &mut Heap,
-    table: &mut [Option<NodeId>],
-) {
-    let a0 = edges[e].e_next;
-    let a1 = edges[a0].e_next;
-    let b0 = edges[edges[e].e_radial].e_next;
-    let b1 = edges[b0].e_next;
-    for x in [a0, a1, b0, b1] {
-        if edges[x].base_index != NONE {
-            cost_update_single(coords, edges, x, heap, table);
-        }
-    }
-}
-
-/// Blender's `polyedge_rotate`: turns the internal edge `e` into the (1-3) diagonal.
-fn rotate_edge(edges: &mut [HalfEdge], e: usize) {
-    let e0 = e;
-    let e1 = edges[e0].e_next;
-    let e2 = edges[e1].e_next;
-    let e3 = edges[e0].e_radial;
-    let e4 = edges[e3].e_next;
-    let e5 = edges[e4].e_next;
-
-    edges[e0].e_next = e2;
-    edges[e1].e_next = e3;
-    edges[e2].e_next = e4;
-    edges[e3].e_next = e5;
-    edges[e4].e_next = e0;
-    edges[e5].e_next = e1;
-
-    edges[e0].v = edges[e5].v;
-    edges[e3].v = edges[e2].v;
-}
-
-/// Blender's `BLI_polyfill_beautify`: repeatedly flips the cheapest improving internal edge,
-/// then rewrites `tris` from the half-edge cycles in half-edge order.
-fn beautify(coords: &[[f32; 2]], tris: &mut [[usize; 3]], heap: &mut Heap) {
-    let coord_last = coords.len() - 1;
-    let tris_len = tris.len();
-    let edges_len = tris_len - 1;
-    let half_edges_len = 3 * tris_len;
-
-    let mut half = vec![
-        HalfEdge {
-            v: NONE,
-            e_next: NONE,
-            e_radial: NONE,
-            base_index: NONE,
-        };
-        half_edges_len
-    ];
-    let mut order: Vec<OrderEdge> = Vec::with_capacity(2 * edges_len);
-    for (i, tri) in tris.iter().enumerate() {
-        for (j_curr, j_prev) in [(0, 2), (1, 0), (2, 1)] {
-            let e_prev = i * 3 + j_prev;
-            let e_curr = i * 3 + j_curr;
-            half[e_prev] = HalfEdge {
-                v: tri[j_prev],
-                e_next: e_curr,
-                e_radial: NONE,
-                base_index: NONE,
-            };
-
-            let a = tri[j_prev].min(tri[j_curr]);
-            let b = tri[j_prev].max(tri[j_curr]);
-            // Boundary edges (contiguous, or the wrap-around) have no second face.
-            if !(a + 1 == b || (a == 0 && b == coord_last)) {
-                order.push(OrderEdge {
-                    verts: [a, b],
-                    e_half: e_prev,
-                });
-            }
-        }
-    }
-
-    order.sort_unstable_by_key(|oe| (oe.verts[0], oe.verts[1], oe.e_half));
-    for (base_index, pair) in order.as_chunks::<2>().0.iter().enumerate() {
-        let (a, b) = (pair[0], pair[1]);
-        half[a.e_half].e_radial = b.e_half;
-        half[b.e_half].e_radial = a.e_half;
-        half[a.e_half].base_index = base_index;
-        half[b.e_half].base_index = base_index;
-    }
-
-    let mut table: Vec<Option<NodeId>> = vec![None; edges_len];
-    for i in 0..half_edges_len {
-        if half[i].e_radial < i {
-            let cost = rotate_beauty_cost(coords, &half, i).0;
-            table[half[i].base_index] = if cost < 0.0 {
-                Some(heap.insert(cost, i))
-            } else {
-                None
-            };
-        }
-    }
-
-    while let Some(e) = heap.pop_min() {
-        table[half[e].base_index] = None;
-        rotate_edge(&mut half, e);
-        cost_update(coords, &half, e, heap, &mut table);
-    }
-
-    let mut tri_index = 0;
-    for i in 0..half_edges_len {
-        if half[i].v != NONE {
-            let e1 = half[i].e_next;
-            let e2 = half[e1].e_next;
-            tris[tri_index] = [half[i].v, half[e1].v, half[e2].v];
-            half[i].v = NONE;
-            half[e1].v = NONE;
-            half[e2].v = NONE;
-            tri_index += 1;
-        }
-    }
 }

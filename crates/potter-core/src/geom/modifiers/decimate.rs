@@ -21,6 +21,7 @@ use super::{
     invalid_parameter, number_param, positions, schema_value,
 };
 use crate::geom::pool_slots::PoolSlots;
+use crate::geom::triangulate::ortho_basis;
 mod collapse;
 mod heap;
 mod interp;
@@ -2830,22 +2831,6 @@ fn face_normal(cos: &[[f32; 3]]) -> [f32; 3] {
             }
             normalize(normal)
         }
-    }
-}
-
-/// `ortho_basis_v3v3_v3`: two unit vectors orthogonal to `n` and to each other.
-fn ortho_basis(n: [f32; 3]) -> ([f32; 3], [f32; 3]) {
-    let f = n[0] * n[0] + n[1] * n[1];
-    if f > f32::EPSILON {
-        let d = 1.0 / f.sqrt();
-        let n1 = [n[1] * d, -n[0] * d, 0.0];
-        let n2 = [-n[2] * n1[1], n[2] * n1[0], n[0] * n1[1] - n[1] * n1[0]];
-        (n1, n2)
-    } else {
-        (
-            [if n[2] < 0.0 { -1.0 } else { 1.0 }, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
-        )
     }
 }
 
