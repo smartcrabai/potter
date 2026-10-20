@@ -87,6 +87,9 @@ struct VolumeInstance<'a> {
     scattering: bool,
     /// Channel-mean σt per unit grid density (absolute, as `BsdfParams`'s coefficients).
     extinction_scale: f64,
+    /// The owning object's ray mask: a ray kind it excludes passes the volume by, as Cycles'
+    /// volume bounds are not intersected by such rays.
+    ray_mask: u8,
 }
 
 #[derive(Clone, Copy)]
@@ -127,12 +130,15 @@ struct LightSample {
 }
 
 /// A BSDF-sampled ray's meeting with an emitter, as Cycles' `lights_intersect` with
-/// `light_eval_from_intersection`. `radiance` is before the MIS weight.
+/// `light_eval_from_intersection`. `radiance` is before the MIS weight. `visible` is whether the
+/// light's ray mask admits this ray's kind: a hidden light still ends the segment and spends the
+/// transparent budget, but emits nothing (`integrate_light_forward`, `is_light_shader_visible_to_path`).
 #[derive(Clone, Copy)]
 struct LightHit {
     distance: f64,
     radiance: DVec3,
     pdf: f64,
+    visible: bool,
 }
 
 #[derive(Clone)]
@@ -704,10 +710,15 @@ fn realtime_volume_integral(
     environment: DVec3,
     rng: &mut Pcg32,
 ) -> Result<(DVec3, f64)> {
+    let camera_volumes: Vec<VolumeInstance<'_>> = volumes
+        .iter()
+        .copied()
+        .filter(|volume| volume.ray_mask & RayKind::Camera.bit() != 0)
+        .collect();
     let mut entry = f64::INFINITY;
     let mut exit = 0.0_f64;
     let mut minimum_step = f64::INFINITY;
-    for instance in volumes {
+    for instance in &camera_volumes {
         let local_origin = instance.world_to_local.transform_point3(origin);
         let local_direction = instance.world_to_local.transform_vector3(direction);
         if let Some((volume_entry, volume_exit)) = intersect_volume_bounds(
@@ -740,7 +751,7 @@ fn realtime_volume_integral(
         let point = origin + direction * distance;
         let mut extinction = 0.0;
         let mut source = DVec3::ZERO;
-        for instance in volumes {
+        for instance in &camera_volumes {
             let density = volume_density_at(instance, point)?;
             let extinction_coefficient = volume_extinction_density(instance, density);
             let scattering_coefficient = if instance.scattering {
@@ -763,6 +774,7 @@ fn realtime_volume_integral(
                         sample.distance,
                         Some(rng),
                         16,
+                        RayKind::Shadow,
                     )?;
                     let phase =
                         henyey_greenstein(direction.dot(sample.direction), instance.anisotropy);
@@ -858,7 +870,8 @@ fn trace_path(
         });
         let segment_limit = light.map_or(surface_distance, |light| light.distance);
         let environment = world_radiance(doc, &snapshot.scene_id, images, direction, environment)?;
-        let volume_segment = trace_volume_segment(volumes, origin, direction, segment_limit, rng)?;
+        let volume_segment =
+            trace_volume_segment(volumes, origin, direction, segment_limit, rng, ray)?;
         radiance += throughput * volume_segment.emission;
         if !volume_segment.stochastic {
             throughput *= volume_segment.transmittance;
@@ -904,7 +917,9 @@ fn trace_path(
                 Scatter::Surface(vertex) => power_heuristic(vertex.bsdf_pdf, light.pdf),
                 Scatter::Camera | Scatter::Delta(_) | Scatter::Volume => 1.0,
             };
-            radiance += throughput * light.radiance * weight;
+            if light.visible {
+                radiance += throughput * light.radiance * weight;
+            }
             origin += direction * (light.distance + RAY_EPSILON);
             // A light is a transparent pass in Cycles (`integrate_light_forward`): it spends the
             // transparent budget, and the path ends at the cap, after the emission above.
@@ -1027,9 +1042,13 @@ fn trace_path(
                     ray = lobe;
                     (direction, weight)
                 }
-                BsdfSample::Delta { direction, weight } => {
+                BsdfSample::Delta {
+                    direction,
+                    weight,
+                    ray: lobe,
+                } => {
                     previous = Scatter::Delta(surface.point);
-                    ray = RayKind::Transmission;
+                    ray = lobe;
                     (direction, weight)
                 }
             };
@@ -1110,8 +1129,14 @@ fn write_center_passes(
                 RayKind::Camera,
             );
             let segment_limit = hit.map_or(f64::INFINITY, |hit| hit.distance);
-            let volume_transmittance =
-                march_volumes(volumes, origin, direction, segment_limit, None)?;
+            let volume_transmittance = march_volumes(
+                volumes,
+                origin,
+                direction,
+                segment_limit,
+                None,
+                RayKind::Camera,
+            )?;
             let Some(hit) = hit else {
                 if film_transparent {
                     let alpha = 1.0 - volume_transmittance;
@@ -1722,7 +1747,14 @@ fn shadow_transmittance(
             }
         }
     }
-    let volume_transmittance = march_volumes(volumes, origin, direction, remaining, Some(rng))?;
+    let volume_transmittance = march_volumes(
+        volumes,
+        origin,
+        direction,
+        remaining,
+        Some(rng),
+        RayKind::Shadow,
+    )?;
     Ok((transmittance * volume_transmittance).clamp(0.0, 1.0))
 }
 
@@ -1926,10 +1958,7 @@ fn nearest_light_hit(
     ray: RayKind,
 ) -> Option<LightHit> {
     let mut nearest: Option<LightHit> = None;
-    for light in lights
-        .iter()
-        .filter(|light| light.hittable() && light.ray_mask & ray.bit() != 0)
-    {
+    for light in lights.iter().filter(|light| light.hittable()) {
         let closest = nearest.map_or(limit, |hit| hit.distance);
         if let Some((distance, radiance, pdf)) =
             light_hit(light, origin, direction, receiver, closest)
@@ -1938,6 +1967,7 @@ fn nearest_light_hit(
                 distance,
                 radiance,
                 pdf,
+                visible: light.ray_mask & ray.bit() != 0,
             });
         }
     }
@@ -2065,7 +2095,8 @@ enum Scatter {
 }
 
 /// Outcome of sampling the Principled BSDF. `Continuous` carries the exact lobe-mixture density
-/// that MIS needs; `Delta` is the specular transmission lobe, which light sampling cannot reach.
+/// that MIS needs. `Delta` is a specular bounce that light sampling cannot reach: a transmitted
+/// direction, or the reflection that total internal reflection takes instead.
 enum BsdfSample {
     Continuous {
         direction: DVec3,
@@ -2076,6 +2107,7 @@ enum BsdfSample {
     Delta {
         direction: DVec3,
         weight: DVec3,
+        ray: RayKind,
     },
 }
 
@@ -2083,8 +2115,12 @@ fn sample_bsdf(params: &BsdfParams, normal: DVec3, view: DVec3, rng: &mut Pcg32)
     let probabilities = lobe_probabilities(params, view);
     let choice = rng.next_f64();
     if choice < probabilities.transmission {
-        let direction = refract(-view, normal, 1.0 / params.ior.max(1.0e-3))
-            .unwrap_or_else(|| reflect(-view, normal));
+        // Total internal reflection is a singular reflection, which Cycles gives the glossy ray kind
+        // (`integrator/path_state.h`, `path_state_next`: singular labels take `PATH_RAY_VISIBILITY_GLOSSY`).
+        let (direction, ray) = match refract(-view, normal, 1.0 / params.ior.max(1.0e-3)) {
+            Some(direction) => (direction, RayKind::Transmission),
+            None => (reflect(-view, normal), RayKind::Glossy),
+        };
         let tint = DVec3::new(
             params.base_color[0],
             params.base_color[1],
@@ -2094,7 +2130,11 @@ fn sample_bsdf(params: &BsdfParams, normal: DVec3, view: DVec3, rng: &mut Pcg32)
             * (params.reflectance.clamp(0.0, 1.0) * params.transmission.clamp(0.0, 1.0)
                 / probabilities.transmission.max(1.0e-8))
             * coat_lower_factor(params, view);
-        return BsdfSample::Delta { direction, weight };
+        return BsdfSample::Delta {
+            direction,
+            weight,
+            ray,
+        };
     }
     let diffuse_end = probabilities.transmission + probabilities.diffuse;
     let coat_end = diffuse_end + probabilities.coat;
@@ -2386,6 +2426,7 @@ fn collect_volumes<'a>(
             emission,
             scattering,
             extinction_scale,
+            ray_mask: node.resolved_ray_visibility().mask(),
         });
     }
     Ok(volumes)
@@ -2430,12 +2471,16 @@ fn trace_volume_segment(
     direction: DVec3,
     max_distance: f64,
     rng: &mut Pcg32,
+    ray: RayKind,
 ) -> Result<VolumeSegment> {
     let mut entry = f64::INFINITY;
     let mut exit = 0.0_f64;
     let mut minimum_step = f64::INFINITY;
     let mut stochastic = false;
     for instance in volumes {
+        if instance.ray_mask & ray.bit() == 0 {
+            continue;
+        }
         if !instance.voxel_size.is_finite()
             || instance.voxel_size <= 0.0
             || !instance.meters_per_unit.is_finite()
@@ -2576,6 +2621,7 @@ fn march_volumes(
     direction: DVec3,
     max_distance: f64,
     rng: Option<&mut Pcg32>,
+    ray: RayKind,
 ) -> Result<f64> {
     march_volumes_with_budget(
         volumes,
@@ -2584,6 +2630,7 @@ fn march_volumes(
         max_distance,
         rng,
         MAX_VOLUME_STEPS,
+        ray,
     )
 }
 
@@ -2594,10 +2641,14 @@ fn march_volumes_with_budget(
     max_distance: f64,
     mut rng: Option<&mut Pcg32>,
     step_budget: usize,
+    ray: RayKind,
 ) -> Result<f64> {
     let step_budget = step_budget.max(1);
     let mut transmittance = 1.0;
     for instance in volumes {
+        if instance.ray_mask & ray.bit() == 0 {
+            continue;
+        }
         if !instance.voxel_size.is_finite() || instance.voxel_size <= 0.0 {
             return Err(PotError::new(
                 ErrorCode::EvaluationFailed,
@@ -2891,6 +2942,7 @@ mod volume_extinction_tests {
             emission: DVec3::ZERO,
             scattering: false,
             extinction_scale: 1.0,
+            ray_mask: crate::model::RayVisibility::default().mask(),
         };
         let mut rng = Pcg32::for_sample(0, 0, 0, 0);
         let transmittance = march_volumes(
@@ -2899,6 +2951,7 @@ mod volume_extinction_tests {
             DVec3::X,
             f64::INFINITY,
             Some(&mut rng),
+            RayKind::Shadow,
         )?;
 
         assert!(

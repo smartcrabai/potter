@@ -1474,34 +1474,31 @@ fn world_face_normals(
 }
 
 /// Ray-visibility flags that a Beauty engine does not honour, one warning per flag switched away
-/// from Blender's default for the node kind. A light's `visible_shadow` is stored and round-trips
-/// without a warning: Blender reads it nowhere (Cycles' `light_object_visibility_flags`, EEVEE's
-/// `eevee_light.cc`), so no engine loses it. Realtime Beauty honours mesh camera and shadow flags
-/// and light diffuse and glossy flags, as EEVEE does. The path tracer honours every mesh flag and
-/// every light flag but camera: it draws no light emitter to the camera.
+/// from Blender's default. Blender's panel shows the flags each engine exposes
+/// (`scripts/startup/bl_ui/properties_object.py`, `OBJECT_PT_visibility`, EEVEE branch): a mesh has
+/// Camera, Shadow and Raycast, and a light has Camera, Diffuse, Glossy, Transmission and Volume
+/// Scatter. EEVEE has no mesh diffuse, glossy, transmission or volume flag, so realtime Beauty warns
+/// about none of those. EEVEE does honour a light's transmission and volume scatter
+/// (`draw/engines/eevee/eevee_light.cc`, `transmission_visibility` and `volume_visibility`), and
+/// realtime Beauty does not, so those two warn. The path tracer honours every mesh flag and every
+/// light flag except camera, because it draws no light emitter to the camera. A light's
+/// `visible_shadow` is stored without a warning: Blender reads it nowhere (Cycles'
+/// `light_object_visibility_flags`, EEVEE's `eevee_light.cc`).
 fn ray_visibility_warnings(
     node_id: &Id,
     node: &Node,
     path_traced: bool,
     warnings: &mut Vec<serde_json::Value>,
 ) {
-    const REALTIME_MESH: [(&str, RayKind); 4] = [
-        ("diffuse", RayKind::Diffuse),
-        ("glossy", RayKind::Glossy),
-        ("transmission", RayKind::Transmission),
-        ("volume_scatter", RayKind::VolumeScatter),
-    ];
-    const REALTIME_LIGHT: [(&str, RayKind); 3] = [
-        ("camera", RayKind::Camera),
+    const REALTIME_LIGHT: [(&str, RayKind); 2] = [
         ("transmission", RayKind::Transmission),
         ("volume_scatter", RayKind::VolumeScatter),
     ];
     const PATH_LIGHT: [(&str, RayKind); 1] = [("camera", RayKind::Camera)];
     let flags: &[(&str, RayKind)] = match (path_traced, node.kind == "light") {
         (true, true) => &PATH_LIGHT,
-        (true, false) => &[],
         (false, true) => &REALTIME_LIGHT,
-        (false, false) => &REALTIME_MESH,
+        (_, false) => &[],
     };
     let engine = if path_traced {
         "the path tracer"

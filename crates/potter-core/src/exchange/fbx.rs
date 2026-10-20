@@ -132,18 +132,6 @@ pub(crate) fn export_with_root_allow_lossy(
     let mut next_id = 1_000_001_i64;
     let mut ids = BTreeMap::<Id, ObjectIds>::new();
     for (node_id, node) in &doc.nodes {
-        let ray_flags = super::ray_visibility_differences(node);
-        if !allow_lossy && !ray_flags.is_empty() {
-            return Err(PotError::with_details(
-                ErrorCode::UnrepresentableFeature,
-                "FBX adapter does not represent Blender ray visibility",
-                json!({
-                    "feature_id": "object.ray_visibility",
-                    "node_id": node_id,
-                    "flags": ray_flags,
-                }),
-            ));
-        }
         let geometry_id = match &node.data {
             Some(data_id) => {
                 let data = doc.data_blocks.get(data_id).ok_or_else(|| {
