@@ -41,6 +41,7 @@ pub(crate) mod multires_external;
 pub(crate) mod normals;
 pub mod pointcloud;
 pub(crate) mod pool_slots;
+mod primitive_order;
 pub(crate) mod provenance;
 pub mod remesh;
 pub mod sculpt;
@@ -48,6 +49,7 @@ mod sculpt_dabs;
 pub mod text;
 pub(crate) mod triangulate;
 pub(crate) mod uv_layers;
+mod uv_sphere;
 pub mod vdb;
 pub mod volume;
 
@@ -63,28 +65,6 @@ pub fn corner_normal_vectors(mesh: &Mesh) -> crate::error::Result<Vec<DVec3>> {
     let positions: Vec<DVec3> = mesh.vertices.iter().map(|vertex| vertex.co).collect();
     normals::corner_normals(mesh, &positions)
 }
-
-/// Corner signs of Blender's `primitive_cube_add` (`bmo_create_cube_exec`, `bmesh/operators/bmo_primitive.cc`):
-/// corners enumerate x, then y, then z, each from -1 to +1.
-const BOX_CORNER_SIGNS: [[f64; 3]; 8] = [
-    [-1.0, -1.0, -1.0],
-    [-1.0, -1.0, 1.0],
-    [-1.0, 1.0, -1.0],
-    [-1.0, 1.0, 1.0],
-    [1.0, -1.0, -1.0],
-    [1.0, -1.0, 1.0],
-    [1.0, 1.0, -1.0],
-    [1.0, 1.0, 1.0],
-];
-/// Face corner indices into [`BOX_CORNER_SIGNS`], Blender's `bmo_create_cube_exec` table.
-const BOX_FACES: [[usize; 4]; 6] = [
-    [0, 1, 3, 2],
-    [2, 3, 7, 6],
-    [6, 7, 5, 4],
-    [4, 5, 1, 0],
-    [2, 6, 4, 0],
-    [7, 3, 1, 5],
-];
 
 #[cfg(test)]
 mod mirror_oracle;
@@ -447,6 +427,9 @@ impl Default for GridParams {
     }
 }
 
+/// The largest UV sphere ring count: `uv_sphere::topology` computes `2 * rings * 8` in an `i32`.
+const MAX_UV_SPHERE_RINGS: u64 = (i32::MAX / 16) as u64;
+
 impl Mesh {
     /// Construct an empty mesh with all next IDs set to zero.
     #[must_use]
@@ -793,45 +776,17 @@ impl Mesh {
                 "box dimensions must be finite and positive",
             ));
         }
-        // Blender's `primitive_cube_add` order (`bmo_create_cube_exec`); see `BOX_CORNER_SIGNS`.
-        let half = params.size * 0.5;
-        let mut mesh = Self::new();
-        let mut ids = [0_u32; 8];
-        for (id, sign) in ids.iter_mut().zip(BOX_CORNER_SIGNS) {
-            *id = mesh.insert_vertex(DVec3::new(
-                sign[0] * half.x,
-                sign[1] * half.y,
-                sign[2] * half.z,
-            ))?;
-        }
-        for face in BOX_FACES {
-            // BM_edges_from_verts_ensure (via BM_face_create_verts with create_edges) creates each
-            // boundary edge from the previous corner to the next, so the closing edge (last to first)
-            // comes first. Existing edges are reused.
-            let mut previous = face[3];
-            for corner in face {
-                let (first, second) = (ids[previous], ids[corner]);
-                if !mesh.edges.iter().any(|edge| {
-                    edge_key(edge.vertices[0], edge.vertices[1]) == edge_key(first, second)
-                }) {
-                    mesh.insert_edge([first, second])?;
-                }
-                previous = corner;
-            }
-            mesh.insert_face(face.iter().map(|&corner| ids[corner]).collect(), 0)?;
-        }
-        Ok(mesh)
+        primitive_order::cube(params.size * 0.5)
     }
 
-    /// Create a Blender-default or customized UV sphere.
+    /// Create a Blender-default or customized UV sphere in Blender 5.2.2 storage order.
+    ///
+    /// Vertex order and positions match Blender bit for bit; see [`uv_sphere`] for the edge
+    /// and face order.
     ///
     /// # Errors
     ///
     /// Returns an error for invalid radii/ring counts or exhausted mesh IDs.
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "indices derive from u32 counts and are exactly representable in f64"
-    )]
     pub fn uv_sphere(params: UvSphereParams) -> Result<Self, MeshError> {
         validate_radial_count(params.segments, "UV sphere segments")?;
         if params.ring_count < 3 {
@@ -840,127 +795,37 @@ impl Mesh {
             ));
         }
         positive(params.radius, "UV sphere radius")?;
-        let segments = usize::try_from(params.segments).map_err(|_| MeshError::IdExhausted)?;
-        let rings = usize::try_from(params.ring_count).map_err(|_| MeshError::IdExhausted)?;
-        let intermediate_rings = rings.checked_sub(1).ok_or(MeshError::IdExhausted)?;
-        let vertex_count = segments
-            .checked_mul(intermediate_rings)
-            .and_then(|n| n.checked_add(2))
-            .ok_or(MeshError::IdExhausted)?;
-        if vertex_count > u32::MAX as usize {
+        // Faces are segments x rings and vertices segments x (rings - 1) + 2; each takes a u32 ID.
+        // `uv_sphere::topology` multiplies the ring count by 16 inside an i32, so rings are bounded.
+        let (segments, rings) = (u64::from(params.segments), u64::from(params.ring_count));
+        let faces = segments * rings;
+        let vertices = segments * (rings - 1) + 2;
+        let edges = faces + vertices - 2;
+        if [faces, vertices, edges]
+            .iter()
+            .any(|count| *count > u64::from(u32::MAX))
+            || rings > MAX_UV_SPHERE_RINGS
+        {
             return Err(MeshError::IdExhausted);
         }
-        let mut positions = Vec::with_capacity(vertex_count);
-        positions.push(DVec3::new(0.0, 0.0, params.radius));
-        for ring in 1..rings {
-            let latitude = std::f64::consts::PI * ring as f64 / rings as f64;
-            let z = params.radius * latitude.cos();
-            let radial = params.radius * latitude.sin();
-            for segment in 0..segments {
-                let longitude = std::f64::consts::FRAC_PI_2
-                    - std::f64::consts::TAU * segment as f64 / segments as f64;
-                positions.push(DVec3::new(
-                    radial * longitude.cos(),
-                    radial * longitude.sin(),
-                    z,
-                ));
-            }
-        }
-        let bottom = positions.len();
-        positions.push(DVec3::new(0.0, 0.0, -params.radius));
-        let ring_id = |ring: usize, segment: usize| 1 + ring * segments + segment % segments;
-        let mut polygons = Vec::with_capacity(segments * rings);
-        for segment in 0..segments {
-            polygons.push(vec![0, ring_id(0, segment + 1), ring_id(0, segment)]);
-        }
-        for ring in 0..rings - 2 {
-            for segment in 0..segments {
-                polygons.push(vec![
-                    ring_id(ring, segment),
-                    ring_id(ring, segment + 1),
-                    ring_id(ring + 1, segment + 1),
-                    ring_id(ring + 1, segment),
-                ]);
-            }
-        }
-        for segment in 0..segments {
-            polygons.push(vec![
-                ring_id(rings - 2, segment),
-                ring_id(rings - 2, segment + 1),
-                bottom,
-            ]);
-        }
-        Self::from_positions_and_faces(positions, polygons)
+        uv_sphere::build(params)
     }
     /// Create a Blender-default or customized capped cylinder.
     ///
     /// # Errors
     ///
     /// Returns an error for invalid dimensions/vertex counts or exhausted mesh IDs.
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "indices derive from u32 counts and are exactly representable in f64"
-    )]
     pub fn cylinder(params: CylinderParams) -> Result<Self, MeshError> {
         validate_radial_count(params.vertices, "cylinder vertices")?;
         positive(params.radius, "cylinder radius")?;
         positive(params.depth, "cylinder depth")?;
-        let count = params.vertices as usize;
-        let fan_caps = params.end_fill_type == EndFillType::TriFan;
-        let mut positions = Vec::with_capacity(count * 2 + if fan_caps { 2 } else { 0 });
-        let bottom_center = if fan_caps {
-            let center = positions.len();
-            positions.push(DVec3::new(0.0, 0.0, -params.depth * 0.5));
-            Some(center)
-        } else {
-            None
-        };
-        let top_center = if fan_caps {
-            let center = positions.len();
-            positions.push(DVec3::new(0.0, 0.0, params.depth * 0.5));
-            Some(center)
-        } else {
-            None
-        };
-        let bottom_start = positions.len();
-        for z in [-params.depth * 0.5, params.depth * 0.5] {
-            for index in 0..count {
-                let angle = std::f64::consts::FRAC_PI_2
-                    - std::f64::consts::TAU * index as f64 / count as f64;
-                positions.push(DVec3::new(
-                    params.radius * angle.cos(),
-                    params.radius * angle.sin(),
-                    z,
-                ));
-            }
-        }
-        let top_start = bottom_start + count;
-        let mut polygons = Vec::with_capacity(count * 3 + 2);
-        for index in 0..count {
-            let next = (index + 1) % count;
-            polygons.push(vec![
-                bottom_start + index,
-                top_start + index,
-                top_start + next,
-                bottom_start + next,
-            ]);
-            match params.end_fill_type {
-                EndFillType::Nothing | EndFillType::Ngon => {}
-                EndFillType::TriFan => {
-                    if let Some(center) = bottom_center {
-                        polygons.push(vec![center, bottom_start + index, bottom_start + next]);
-                    }
-                    if let Some(center) = top_center {
-                        polygons.push(vec![center, top_start + next, top_start + index]);
-                    }
-                }
-            }
-        }
-        if params.end_fill_type == EndFillType::Ngon {
-            polygons.push((bottom_start..top_start).collect());
-            polygons.push((top_start..top_start + count).rev().collect());
-        }
-        Self::from_positions_and_faces(positions, polygons)
+        primitive_order::cone(
+            params.vertices as usize,
+            params.radius,
+            params.radius,
+            params.depth,
+            params.end_fill_type,
+        )
     }
 
     /// Create a Blender-default or customized XY plane.
@@ -970,16 +835,7 @@ impl Mesh {
     /// Returns an error when the plane size is not finite and positive.
     pub fn plane(params: PlaneParams) -> Result<Self, MeshError> {
         positive(params.size, "plane size")?;
-        let half = params.size * 0.5;
-        Self::from_positions_and_faces(
-            vec![
-                DVec3::new(-half, -half, 0.0),
-                DVec3::new(half, -half, 0.0),
-                DVec3::new(half, half, 0.0),
-                DVec3::new(-half, half, 0.0),
-            ],
-            vec![vec![0, 1, 2, 3]],
-        )
+        primitive_order::grid(2, 2, params.size, params.size)
     }
 
     /// Create a Blender-default or customized cone/truncated cone with capped ends.
@@ -987,10 +843,6 @@ impl Mesh {
     /// # Errors
     ///
     /// Returns an error for invalid radii, depth, vertex count, or exhausted mesh IDs.
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "indices derive from u32 counts and are exactly representable in f64"
-    )]
     pub fn cone(params: ConeParams) -> Result<Self, MeshError> {
         validate_radial_count(params.vertices, "cone vertices")?;
         positive(params.depth, "cone depth")?;
@@ -1001,99 +853,13 @@ impl Mesh {
                 "at least one cone radius must be positive",
             ));
         }
-        let count = params.vertices as usize;
-        let fan_caps = params.end_fill_type == EndFillType::TriFan;
-        let has_bottom = params.radius1 > 0.0;
-        let has_top = params.radius2 > 0.0;
-        let cap_count = usize::from(fan_caps && has_bottom) + usize::from(fan_caps && has_top);
-        let mut positions = Vec::with_capacity(count * 2 + cap_count + 2);
-        let bottom_center = if fan_caps && has_bottom {
-            let center = positions.len();
-            positions.push(DVec3::new(0.0, 0.0, -params.depth * 0.5));
-            Some(center)
-        } else {
-            None
-        };
-        let top_center = if fan_caps && has_top {
-            let center = positions.len();
-            positions.push(DVec3::new(0.0, 0.0, params.depth * 0.5));
-            Some(center)
-        } else {
-            None
-        };
-        let ring = |positions: &mut Vec<DVec3>, radius: f64, z: f64| {
-            let start = positions.len();
-            for index in 0..count {
-                let angle = std::f64::consts::FRAC_PI_2
-                    - std::f64::consts::TAU * index as f64 / count as f64;
-                positions.push(DVec3::new(radius * angle.cos(), radius * angle.sin(), z));
-            }
-            start
-        };
-        let bottom_start =
-            has_bottom.then(|| ring(&mut positions, params.radius1, -params.depth * 0.5));
-        let bottom_apex = if has_bottom {
-            None
-        } else {
-            let apex = positions.len();
-            positions.push(DVec3::new(0.0, 0.0, -params.depth * 0.5));
-            Some(apex)
-        };
-        let top_start = has_top.then(|| ring(&mut positions, params.radius2, params.depth * 0.5));
-        let top_apex = if has_top {
-            None
-        } else {
-            let apex = positions.len();
-            positions.push(DVec3::new(0.0, 0.0, params.depth * 0.5));
-            Some(apex)
-        };
-        let mut polygons = Vec::with_capacity(count * 3 + 2);
-        for index in 0..count {
-            let next = (index + 1) % count;
-            match (bottom_start, top_start) {
-                (Some(bottom), Some(top)) => {
-                    polygons.push(vec![bottom + index, top + index, top + next, bottom + next]);
-                }
-                (Some(bottom), None) => {
-                    let apex =
-                        top_apex.ok_or(MeshError::InvalidTopology("cone top apex is missing"))?;
-                    polygons.push(vec![bottom + index, apex, bottom + next]);
-                }
-                (None, Some(top)) => {
-                    let apex = bottom_apex
-                        .ok_or(MeshError::InvalidTopology("cone bottom apex is missing"))?;
-                    polygons.push(vec![apex, top + next, top + index]);
-                }
-                (None, None) => {
-                    return Err(MeshError::InvalidParameter(
-                        "at least one cone radius must be positive",
-                    ));
-                }
-            }
-        }
-        match params.end_fill_type {
-            EndFillType::Nothing => {}
-            EndFillType::Ngon => {
-                if let Some(bottom) = bottom_start {
-                    polygons.push((bottom..bottom + count).collect());
-                }
-                if let Some(top) = top_start {
-                    polygons.push((top..top + count).rev().collect());
-                }
-            }
-            EndFillType::TriFan => {
-                for index in 0..count {
-                    let next = (index + 1) % count;
-                    if let (Some(center), Some(bottom)) = (bottom_center, bottom_start) {
-                        polygons.push(vec![center, bottom + index, bottom + next]);
-                    }
-                    if let (Some(center), Some(top)) = (top_center, top_start) {
-                        polygons.push(vec![center, top + next, top + index]);
-                    }
-                }
-            }
-        }
-        Self::from_positions_and_faces(positions, polygons)
+        primitive_order::cone(
+            params.vertices as usize,
+            params.radius1,
+            params.radius2,
+            params.depth,
+            params.end_fill_type,
+        )
     }
 
     /// Create a Blender-default or customized torus.
@@ -1161,7 +927,7 @@ impl Mesh {
                 ]);
             }
         }
-        Self::from_positions_and_faces(positions, polygons)
+        primitive_order::torus(positions, &polygons)
     }
 
     /// Create a Blender-default or customized recursively subdivided icosphere.
@@ -1225,13 +991,8 @@ impl Mesh {
             [10, 9, 11],
         ];
         if params.subdivisions == 1 {
-            return Self::from_positions_and_faces(
-                positions,
-                base_faces
-                    .into_iter()
-                    .map(|face| face.into_iter().collect())
-                    .collect(),
-            );
+            let polygons: Vec<Vec<usize>> = base_faces.iter().map(|face| face.to_vec()).collect();
+            return primitive_order::polygons(positions, &polygons);
         }
 
         // Blender subdivides the original edges once with all cuts for the
@@ -1311,6 +1072,41 @@ impl Mesh {
             grids[face_index] = rows;
         }
 
+        // Blender's subdivide_edges (bmo_subdivide.cc): each original edge keeps its slot, now
+        // holding its last cut point and end vertex. Then each edge's first half and cut edges are
+        // appended in edge order. Then each face's grid is filled, last face first (the operator's
+        // stack), with the diagonal and its splits, and the grid's connecting edges.
+        let mut edge_pairs: Vec<[usize; 2]> =
+            Vec::with_capacity(edges.len() * (cuts + 1) + base_faces.len() * 3 * cuts * cuts);
+        for (endpoints, points) in &edges {
+            edge_pairs.push([points[cuts - 1], endpoints[1]]);
+        }
+        for (endpoints, points) in &edges {
+            let mut previous = endpoints[0];
+            for &point in points {
+                edge_pairs.push([previous, point]);
+                previous = point;
+            }
+        }
+        for rows in grids.iter().rev() {
+            for row in 0..cuts {
+                let diagonal = edge_pairs.len();
+                edge_pairs.push([rows[row + 1][0], rows[row + 1][row + 1]]);
+                for split in 0..row {
+                    edge_pairs.push([rows[row + 1][split], rows[row + 1][split + 1]]);
+                }
+                if row > 0 {
+                    edge_pairs[diagonal] = [rows[row + 1][row], rows[row + 1][row + 1]];
+                }
+            }
+            for row in 1..=cuts {
+                for column in 0..row {
+                    edge_pairs.push([rows[row][column], rows[row + 1][column + 1]]);
+                    edge_pairs.push([rows[row][column + 1], rows[row + 1][column + 1]]);
+                }
+            }
+        }
+
         let face_count = base_faces.len() * (cuts + 1).pow(2);
         let mut polygons = Vec::with_capacity(face_count);
         let mut retained_faces = Vec::with_capacity(base_faces.len());
@@ -1341,7 +1137,7 @@ impl Mesh {
         for added in added_faces.into_iter().rev() {
             polygons.extend(added);
         }
-        Self::from_positions_and_faces(positions, polygons)
+        primitive_order::explicit_edges(positions, &edge_pairs, &polygons)
     }
 
     /// Create a Blender-default or customized XY circle with optional fill.
@@ -1349,46 +1145,10 @@ impl Mesh {
     /// # Errors
     ///
     /// Returns an error for invalid circle radii/counts or exhausted mesh IDs.
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "indices derive from u32 counts and are exactly representable in f64"
-    )]
     pub fn circle(params: CircleParams) -> Result<Self, MeshError> {
         validate_radial_count(params.vertices, "circle vertices")?;
         positive(params.radius, "circle radius")?;
-        let count = params.vertices as usize;
-        let fan = params.fill_type == CircleFillType::TriFan;
-        let mut positions = Vec::with_capacity(count + usize::from(fan));
-        if fan {
-            positions.push(DVec3::ZERO);
-        }
-        let ring_start = positions.len();
-        for index in 0..count {
-            let angle =
-                std::f64::consts::FRAC_PI_2 - std::f64::consts::TAU * index as f64 / count as f64;
-            positions.push(DVec3::new(
-                params.radius * angle.cos(),
-                params.radius * angle.sin(),
-                0.0,
-            ));
-        }
-        let polygons = match params.fill_type {
-            CircleFillType::Nothing => Vec::new(),
-            CircleFillType::Ngon => vec![(ring_start..ring_start + count).rev().collect()],
-            CircleFillType::TriFan => (0..count)
-                .map(|index| vec![0, ring_start + (index + 1) % count, ring_start + index])
-                .collect(),
-        };
-        let mut mesh = Self::from_positions_and_faces(positions, polygons)?;
-        if params.fill_type == CircleFillType::Nothing {
-            for index in 0..count {
-                let first = u32::try_from(index).map_err(|_| MeshError::IdExhausted)?;
-                let next =
-                    u32::try_from((index + 1) % count).map_err(|_| MeshError::IdExhausted)?;
-                mesh.insert_edge([first, next])?;
-            }
-        }
-        Ok(mesh)
+        primitive_order::circle(params.vertices as usize, params.radius, params.fill_type)
     }
 
     /// Create a Blender-default or customized subdivided XY grid.
@@ -1396,10 +1156,6 @@ impl Mesh {
     /// # Errors
     ///
     /// Returns an error for non-positive sizes, invalid subdivision counts, or exhausted IDs.
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "indices derive from u32 counts and are exactly representable in f64"
-    )]
     pub fn grid(params: GridParams) -> Result<Self, MeshError> {
         positive(params.size_x, "grid X size")?;
         positive(params.size_y, "grid Y size")?;
@@ -1408,33 +1164,26 @@ impl Mesh {
                 "grid subdivisions must be at least two per axis",
             ));
         }
-        let nx = params.x_subdivisions as usize;
-        let ny = params.y_subdivisions as usize;
-        let vertex_count = nx.checked_mul(ny).ok_or(MeshError::IdExhausted)?;
-        if vertex_count > u32::MAX as usize {
+        // Vertices, edges and faces each take a u32 ID; refuse before anything is allocated.
+        let (nx, ny) = (
+            u64::from(params.x_subdivisions),
+            u64::from(params.y_subdivisions),
+        );
+        let vertices = nx * ny;
+        let edges = nx * (ny - 1) + ny * (nx - 1);
+        let faces = (nx - 1) * (ny - 1);
+        if [vertices, edges, faces]
+            .iter()
+            .any(|count| *count > u64::from(u32::MAX))
+        {
             return Err(MeshError::IdExhausted);
         }
-        let mut positions = Vec::with_capacity(vertex_count);
-        for y in 0..ny {
-            for x in 0..nx {
-                let px = -params.size_x * 0.5 + params.size_x * x as f64 / (nx - 1) as f64;
-                let py = -params.size_y * 0.5 + params.size_y * y as f64 / (ny - 1) as f64;
-                positions.push(DVec3::new(px, py, 0.0));
-            }
-        }
-        let mut polygons = Vec::with_capacity((nx - 1) * (ny - 1));
-        for y in 0..ny - 1 {
-            for x in 0..nx - 1 {
-                let lower_left = y * nx + x;
-                polygons.push(vec![
-                    lower_left,
-                    lower_left + 1,
-                    lower_left + nx + 1,
-                    lower_left + nx,
-                ]);
-            }
-        }
-        Self::from_positions_and_faces(positions, polygons)
+        primitive_order::grid(
+            params.x_subdivisions as usize,
+            params.y_subdivisions as usize,
+            params.size_x,
+            params.size_y,
+        )
     }
 }
 /// Create a Blender-style primitive by lowercase kind and optional JSON parameters.
@@ -1843,6 +1592,25 @@ mod tests {
         assert!(value["edges"][0].get("vertices").is_none());
         let decoded: Mesh = serde_json::from_value(value).unwrap();
         assert_eq!(decoded, plane);
+    }
+
+    #[test]
+    fn oversized_grid_and_uv_sphere_are_refused_before_allocation() {
+        // 100000 x 100000 vertices exceed u32 IDs; the check runs before any allocation.
+        let grid = Mesh::grid(GridParams {
+            size_x: 2.0,
+            size_y: 2.0,
+            x_subdivisions: 100_000,
+            y_subdivisions: 100_000,
+        });
+        assert!(matches!(grid, Err(MeshError::IdExhausted)));
+        // Ring counts past the i32 bound of the UV sphere's angle arithmetic are refused too.
+        let sphere = Mesh::uv_sphere(UvSphereParams {
+            segments: 3,
+            ring_count: u32::MAX,
+            radius: 1.0,
+        });
+        assert!(matches!(sphere, Err(MeshError::IdExhausted)));
     }
 
     #[test]
