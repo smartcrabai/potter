@@ -1063,6 +1063,16 @@ fn write_file_output(node: &GraphNode, image: &Image) -> Result<()> {
     })
 }
 
+/// Display-encodes a raster's linear pixels through the scene's view transform and look, without
+/// running its compositor graph. Solid previews use it, as Blender's Workbench output goes through the
+/// view transform.
+pub(crate) fn encode_display_output(
+    output: &mut RasterOutput,
+    settings: &ColorManagement,
+) -> Result<()> {
+    encode_display(&mut output.rgba, &output.linear_rgba, settings)
+}
+
 /// Applies scene color management and returns the image's display-encoded RGBA8 pixels.
 pub(crate) fn encode_image_display(image: &Image, settings: &ColorManagement) -> Result<Vec<u8>> {
     let length = image.pixels.len().checked_mul(4).ok_or_else(|| {

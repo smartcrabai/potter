@@ -188,7 +188,28 @@ def decorate(me, obj, spec):
                 vg.add([vertex.index], weight, "REPLACE")
 
 
+def boolean_cube_object(name):
+    # A size-2 cube minus a size-1 cube inside it (EXACT solver, DIFFERENCE), applied. The result is a
+    # hollow cube made of two closed shells: 16 vertices, 24 edges, 12 quads (Blender 5.2.2 V16 E24 F12).
+    bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0.0, 0.0, 0.0))
+    cutter = bpy.context.active_object
+    bpy.ops.mesh.primitive_cube_add(size=2.0, location=(0.0, 0.0, 0.0))
+    host = bpy.context.active_object
+    host.name = name
+    boolean = host.modifiers.new("Boolean", "BOOLEAN")
+    boolean.operation = "DIFFERENCE"
+    boolean.solver = "EXACT"
+    boolean.operand_type = "OBJECT"
+    boolean.object = cutter
+    bpy.context.view_layer.objects.active = host
+    bpy.ops.object.modifier_apply(modifier="Boolean")
+    bpy.data.objects.remove(cutter)
+    return host
+
+
 def make_object(name, spec):
+    if spec.get("boolean"):
+        return boolean_cube_object(name)
     verts, faces = build_base(spec)
     # Vertices no face uses: Blender's BMesh keeps them through every decimate mode.
     verts = verts + [(5.0, 5.0, 5.0), (-6.0, 4.0, 2.0)] if spec.get("isolated") else verts
@@ -397,6 +418,9 @@ def all_cases():
     cases["float1_edge_potter_r0.6"] = (dict(mesh="explicit", file="inputs/float1_edge_potter_order.json"),
                                         {"decimate_type": "COLLAPSE", "ratio": 0.6})
     cases["cube_r0.7"] = (dict(mesh="cube"), {"decimate_type": "COLLAPSE", "ratio": 0.7})
+    # Boolean-applied hollow cube (two closed shells). Its inner shell triangulates and joins back into a
+    # face that doubles one already made; Blender keeps the existing face (`bm_decim_triangulate_end`).
+    cases["boolean_cube_r0.6"] = (dict(boolean=True), {"decimate_type": "COLLAPSE", "ratio": 0.6})
     cases["subcube2_r0.4"] = (dict(mesh="subdivided_cube", levels=2), {"decimate_type": "COLLAPSE", "ratio": 0.4})
     cases["cube_uv_r0.5"] = (dict(mesh="cube", uv="random", uv_layers=2),
                              {"decimate_type": "COLLAPSE", "ratio": 0.5})

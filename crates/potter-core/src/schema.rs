@@ -190,6 +190,12 @@ fn scene_schema() -> Value {
     root["$defs"]["node"]["properties"]["blender_matrix_basis"] =
         json!({"oneOf":[{"$ref":"#/$defs/captured_matrix_basis"},{"type":"null"}]});
     root["$defs"]["data_block"]["properties"]["materials"] = nullable_id_array_schema();
+    root["$defs"]["material"]["properties"]["viewport_display"] = json!({
+        "type":"object",
+        "required":["diffuse_color","roughness","metallic"],
+        "properties":{"diffuse_color":vec_schema(4),"roughness":{"type":"number","minimum":0,"maximum":1},"metallic":{"type":"number","minimum":0,"maximum":1}},
+        "additionalProperties":false
+    });
     complete_scene_schema(&mut root);
     root
 }

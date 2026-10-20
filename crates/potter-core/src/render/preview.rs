@@ -19,7 +19,7 @@ use crate::{
 
 use super::{
     raster::{
-        Camera, CameraEngine, DepthOfField, Mode, Projection, RasterOutput, StereoMode,
+        Camera, CameraEngine, DepthOfField, Mode, Projection, RasterOutput, StereoMode, ViewBasis,
         projection_for_camera, rasterize_with_lines,
     },
     scene::{Geometry, extract_geometry, surface_shader},
@@ -27,7 +27,7 @@ use super::{
 
 const MIN_SIZE: u32 = 64;
 const MAX_SIZE: u32 = 16_384;
-pub(super) const ENGINE: &str = "potter-cpu-path-2";
+pub(super) const ENGINE: &str = "potter-cpu-path-4";
 const VALID_VIEWS: [&str; 7] = ["front", "back", "right", "left", "top", "bottom", "iso"];
 
 #[derive(Clone, Debug)]
@@ -203,7 +203,8 @@ pub fn render_previews(
                 )
             })?
         };
-        let shader = surface_shader(doc, snapshot, &images, geometry, mode);
+        let view = ViewBasis::from_camera(&prepared.camera)?;
+        let shader = surface_shader(doc, snapshot, &images, geometry, mode, view);
         let background = background_color(doc, snapshot, mode, false);
         let mut raster = if matches!(mode, Mode::Beauty) {
             super::path::render(
@@ -234,15 +235,20 @@ pub fn render_previews(
                 shader.as_deref(),
             )?
         };
-        if matches!(mode, Mode::Beauty) {
-            crate::compositor::apply(
+        match mode {
+            Mode::Beauty => crate::compositor::apply(
                 &mut raster,
                 doc,
                 scene,
                 request.size,
                 request.size,
                 request.context.frame.unwrap_or(scene.frame_current),
-            )?;
+            )?,
+            // Solid is display-encoded through the scene's view transform and look, as Beauty is.
+            Mode::Solid => {
+                crate::compositor::encode_display_output(&mut raster, &scene.color_management)?;
+            }
+            _ => {}
         }
         let (manifest, files) = manifest_value(
             doc,
@@ -341,13 +347,20 @@ pub(crate) fn render_camera_frame(
         engine == "path" && matches!(mode, Mode::Beauty),
         &images,
     )?;
-    let shader = surface_shader(doc, &snapshot, &images, &geometry, mode);
     let engine_for_camera = if engine == "path" && matches!(mode, Mode::Beauty) {
         CameraEngine::Path
     } else {
         CameraEngine::Raster
     };
     let camera = stored_camera(doc, &snapshot, camera_id, engine_for_camera)?;
+    let shader = surface_shader(
+        doc,
+        &snapshot,
+        &images,
+        &geometry,
+        mode,
+        ViewBasis::from_camera(&camera.camera)?,
+    );
     let scene = doc
         .scenes
         .get(&snapshot.scene_id)
@@ -636,7 +649,21 @@ fn adaptive_camera_override(camera: &PreparedCamera) -> AdaptiveCameraOverride {
 fn background_color(doc: &SceneDoc, snapshot: &Snapshot, mode: Mode, transparent: bool) -> [u8; 4] {
     let alpha = if transparent { 0 } else { 255 };
     if matches!(mode, Mode::Solid) {
-        return [242, 242, 242, alpha];
+        // Workbench's render background is the scene world's horizon colour (`World.color`, not
+        // scaled by strength), and black with no world (`workbench_state.cc`, `background_color`).
+        let world = doc
+            .scenes
+            .get(&snapshot.scene_id)
+            .and_then(|value| value.world.as_ref())
+            .and_then(|id| doc.worlds.get(id));
+        return world.map_or([0, 0, 0, alpha], |value| {
+            [
+                linear_to_byte(value.color[0]),
+                linear_to_byte(value.color[1]),
+                linear_to_byte(value.color[2]),
+                alpha,
+            ]
+        });
     }
     let scene = doc.scenes.get(&snapshot.scene_id);
     let world = scene
@@ -747,7 +774,12 @@ fn manifest_value(
         "ambient": if ambient { json!({ "color": [0.08, 0.08, 0.08], "source": "default_no_lights_or_world" }) } else { Value::Null },
         "engine": "cpu",
         "device": "cpu",
-        "view_transform": "sRGB standard",
+        // Beauty and Solid are display-encoded through the scene's view transform; data passes are not.
+        "view_transform": if matches!(mode, Mode::Beauty | Mode::Solid) {
+            json!(scene.color_management.view_transform)
+        } else {
+            json!("sRGB standard")
+        },
         "ocio": Value::Null,
     });
     let pick_policy = json!({
