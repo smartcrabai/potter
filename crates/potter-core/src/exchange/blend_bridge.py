@@ -2257,6 +2257,8 @@ def material_dump(material):
             "emission_color": emission_color, "emission_strength": emission_strength,
             "transmission": transmission, "ior": ior,
             "double_sided": not bool(getattr(material, "use_backface_culling", False)),
+            "use_transparent_shadow": bool(getattr(material, "use_transparent_shadow", True)),
+            "use_backface_culling_shadow": bool(getattr(material, "use_backface_culling_shadow", False)),
             "alpha_mode": _alpha_mode_of(material),
             "alpha_threshold": float(material.alpha_threshold),
             "nodes": tree_dump(material.node_tree),
@@ -6763,6 +6765,7 @@ def export_doc(doc, target, pack, scene_hash, context):
         mat.roughness = viewport["roughness"] if viewport else item["roughness"]
         mat.metallic = viewport["metallic"] if viewport else item["metallic"]
         mat.use_backface_culling = not bool(item.get("double_sided", True))
+        mat.use_transparent_shadow = bool(item.get("use_transparent_shadow", True))
         mat.displacement_method = "DISPLACEMENT" if item.get("displacement_method") == "displacement" else "BUMP"
         mat.cycles.volume_sampling = {"distance": "DISTANCE", "equiangular": "EQUIANGULAR"}.get(
             item.get("volume_sampling"), "MULTIPLE_IMPORTANCE")

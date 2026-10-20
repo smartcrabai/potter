@@ -7,7 +7,7 @@ use crate::{
     eval::Snapshot,
     geom::volume::{VolumeData, sample_density_checked_with, sample_density_with},
     image::{ImageData, ImageInterpolation},
-    model::{Id, LightType, SceneDoc, VolumeSampling},
+    model::{Id, LightType, Material, SceneDoc, VolumeSampling},
     shader::{
         BsdfParams, EvaluatorWorkspace, HitContext, HitUvLayers, PreparedMaterial,
         equirectangular_uv, evaluate_surface_with_workspace, height_gradient,
@@ -24,7 +24,7 @@ use super::{
         point_intensity, spot_attenuation, spread_attenuation, spread_region,
     },
     raster::{
-        Camera, Mode, RasterOutput, StereoMode, blend_corner_normals, camera_eye,
+        Camera, Mode, RasterOutput, StereoMode, Triangle, blend_corner_normals, camera_eye,
         rasterize_with_lines, ray_for_sample, smooth_shadow_origin,
     },
     scene::{Geometry, HitPose, LayerTables, ObjectRecord, layered_context, object_space},
@@ -121,7 +121,6 @@ struct Surface {
     layers: Layers,
     object_index: u32,
     element_index: u32,
-    distance: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -1439,7 +1438,10 @@ fn closest_hit(
     bvh.closest_hit_two_sided(&geometry.triangles, origin, direction, t_min, t_max)
 }
 
-fn make_surface(
+/// The shading parameters at one hit, for the transparent pass of a realtime shadow ray (`render/scene.rs`). They
+/// are the path tracer's, so a realtime shadow and a path-traced one read the same alpha and tint. The pass reads
+/// neither the displacement gradient nor the coat layers, so only the material evaluation runs.
+pub(super) fn hit_params(
     doc: &SceneDoc,
     snapshot: &Snapshot,
     geometry: &Geometry,
@@ -1448,7 +1450,52 @@ fn make_surface(
     direction: DVec3,
     images: &BTreeMap<String, ImageData>,
     evaluator_workspace: &mut EvaluatorWorkspace,
-) -> Result<Surface> {
+) -> Result<BsdfParams> {
+    with_hit_frame(
+        doc,
+        snapshot,
+        geometry,
+        hit,
+        origin,
+        direction,
+        images,
+        |frame| {
+            let mut params = evaluate_surface_with_workspace(
+                frame.material,
+                frame.prepared,
+                &frame.context,
+                evaluator_workspace,
+            )?;
+            apply_hit_alpha(frame.material, &mut params);
+            Ok(params)
+        },
+    )
+}
+
+/// A hit's position, normals, and the evaluation context of its material. The context borrows its layer tables, so a
+/// frame exists only inside [`with_hit_frame`].
+struct HitFrame<'a> {
+    point: DVec3,
+    shadow_point: DVec3,
+    geometric_normal: DVec3,
+    normal: DVec3,
+    triangle: &'a Triangle,
+    material: &'a Material,
+    prepared: &'a PreparedMaterial,
+    context: HitContext<'a>,
+}
+
+/// Builds the frame of `hit` and calls `body` with it: the one place a hit's geometry, UVs and context are set up.
+fn with_hit_frame<T>(
+    doc: &SceneDoc,
+    snapshot: &Snapshot,
+    geometry: &Geometry,
+    hit: BvhHit,
+    origin: DVec3,
+    direction: DVec3,
+    images: &BTreeMap<String, ImageData>,
+    body: impl FnOnce(&HitFrame<'_>) -> Result<T>,
+) -> Result<T> {
     let triangle = geometry.triangles.get(hit.triangle_index).ok_or_else(|| {
         PotError::new(
             ErrorCode::EvaluationFailed,
@@ -1531,9 +1578,21 @@ fn make_surface(
         uv_layers,
         &mut tables,
     )?;
-    let mut params =
-        evaluate_surface_with_workspace(material, prepared, &context, evaluator_workspace)?;
-    // The graph is the only source of transparency for a material with one (Cycles ignores the render method).
+    body(&HitFrame {
+        point,
+        shadow_point,
+        geometric_normal,
+        normal,
+        triangle,
+        material,
+        prepared,
+        context,
+    })
+}
+
+/// The alpha of a surface after its material's alpha mode. The graph is the only source of transparency for a material
+/// with one (Cycles ignores the render method).
+fn apply_hit_alpha(material: &Material, params: &mut BsdfParams) {
     params.alpha = match material.alpha_mode.as_str() {
         "opaque" if material.node_tree.is_none() => 1.0,
         "clip" => {
@@ -1545,33 +1604,70 @@ fn make_surface(
         }
         _ => params.alpha.clamp(0.0, 1.0),
     };
-    if params.displacement_height != 0.0 && material.displacement_method != "displacement" {
-        let gradient = height_gradient(&context, normal, |sample| {
-            evaluate_surface_with_workspace(material, prepared, sample, evaluator_workspace)
-                .map(|surface| surface.displacement_height)
-        })?;
-        params.normal = normal - gradient;
-    }
-    params.normal = if params.normal.is_finite() {
-        params.normal.normalize_or_zero()
-    } else {
-        normal
-    };
-    if params.normal.dot(-direction) < 0.0 {
-        params.normal = -params.normal;
-    }
-    let hit_layers = layers(&params, params.normal, -direction);
-    Ok(Surface {
-        point,
-        normal: params.normal,
-        geometric_normal,
-        shadow_point,
-        params,
-        layers: hit_layers,
-        object_index: triangle.object_index,
-        element_index: triangle.element_index,
-        distance: hit.distance,
-    })
+}
+
+fn make_surface(
+    doc: &SceneDoc,
+    snapshot: &Snapshot,
+    geometry: &Geometry,
+    hit: BvhHit,
+    origin: DVec3,
+    direction: DVec3,
+    images: &BTreeMap<String, ImageData>,
+    evaluator_workspace: &mut EvaluatorWorkspace,
+) -> Result<Surface> {
+    with_hit_frame(
+        doc,
+        snapshot,
+        geometry,
+        hit,
+        origin,
+        direction,
+        images,
+        |frame| {
+            let mut params = evaluate_surface_with_workspace(
+                frame.material,
+                frame.prepared,
+                &frame.context,
+                evaluator_workspace,
+            )?;
+            apply_hit_alpha(frame.material, &mut params);
+            let normal = frame.normal;
+            if params.displacement_height != 0.0
+                && frame.material.displacement_method != "displacement"
+            {
+                let gradient = height_gradient(&frame.context, normal, |sample| {
+                    evaluate_surface_with_workspace(
+                        frame.material,
+                        frame.prepared,
+                        sample,
+                        evaluator_workspace,
+                    )
+                    .map(|surface| surface.displacement_height)
+                })?;
+                params.normal = normal - gradient;
+            }
+            params.normal = if params.normal.is_finite() {
+                params.normal.normalize_or_zero()
+            } else {
+                normal
+            };
+            if params.normal.dot(-direction) < 0.0 {
+                params.normal = -params.normal;
+            }
+            let hit_layers = layers(&params, params.normal, -direction);
+            Ok(Surface {
+                point: frame.point,
+                normal: params.normal,
+                geometric_normal: frame.geometric_normal,
+                shadow_point: frame.shadow_point,
+                params,
+                layers: hit_layers,
+                object_index: frame.triangle.object_index,
+                element_index: frame.triangle.element_index,
+            })
+        },
+    )
 }
 
 pub(super) fn object_for_index(
@@ -2013,69 +2109,85 @@ fn shadow_transmittance(
     rng: &mut Pcg32,
     evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<DVec3> {
-    let mut transmittance = DVec3::ONE;
     let mut transparent_hits = 0u32;
+    let mut blocked = false;
+    let mut failure = None;
     // The shadow ray starts in the receiver's volume stack and crosses each medium by its transmittance.
     let mut shadow_media = media.to_vec();
-    let mut origin = offset_origin(point, direction, normal);
-    let mut remaining = if distance.is_finite() {
+    let mut transmittance = DVec3::ONE;
+    let remaining = if distance.is_finite() {
         (distance - RAY_EPSILON).max(0.0)
     } else {
         f64::INFINITY
     };
-    while let Some(hit) = closest_hit(geometry, bvh, origin, direction, RAY_EPSILON, remaining) {
-        let surface = make_surface(
-            doc,
-            snapshot,
-            geometry,
-            hit,
-            origin,
-            direction,
-            images,
-            evaluator_workspace,
-        )?;
-        if let Some(medium) = shadow_media.last() {
-            transmittance *= medium_transmittance(&medium.params, surface.distance);
-        }
-        if surface.params.has_medium() {
-            // A medium surface passes the shadow ray and changes the stack, as it does for a path. It is
-            // not a transparent surface, so it does not count against the budget.
-            toggle_mesh_medium(&mut shadow_media, surface.object_index, &surface.params);
-        } else {
-            // Cycles counts each transparent surface a shadow ray crosses against the path's remaining
-            // budget and blocks the ray past it (`intern/cycles/kernel/bvh/intersect_filter.h`).
-            transparent_hits += 1;
-            if transparent_hits > transparent_budget {
-                return Ok(DVec3::ZERO);
+    let (origin, remaining) = bvh.walk_hits(
+        &geometry.triangles,
+        offset_origin(point, direction, normal),
+        direction,
+        RAY_EPSILON,
+        remaining,
+        |hit, origin| {
+            let surface = match make_surface(
+                doc,
+                snapshot,
+                geometry,
+                hit,
+                origin,
+                direction,
+                images,
+                evaluator_workspace,
+            ) {
+                Ok(surface) => surface,
+                Err(error) => {
+                    failure = Some(error);
+                    return false;
+                }
+            };
+            if let Some(medium) = shadow_media.last() {
+                transmittance *= medium_transmittance(&medium.params, hit.distance);
             }
-            let alpha = surface.params.alpha.clamp(0.0, 1.0);
-            let transmission = surface.params.transmission.clamp(0.0, 1.0);
-            if alpha >= 1.0 && transmission <= 0.0 {
-                return Ok(DVec3::ZERO);
+            if surface.params.has_medium() {
+                // A medium surface passes the shadow ray and changes the stack, as it does for a path. It is
+                // not a transparent surface, so it does not count against the budget.
+                toggle_mesh_medium(&mut shadow_media, surface.object_index, &surface.params);
+            } else {
+                // Cycles counts each transparent surface a shadow ray crosses against the path's remaining
+                // budget and blocks the ray past it (`intern/cycles/kernel/bvh/intersect_filter.h`).
+                transparent_hits += 1;
+                if transparent_hits > transparent_budget {
+                    blocked = true;
+                    return false;
+                }
+                let alpha = surface.params.alpha.clamp(0.0, 1.0);
+                let transmission = surface.params.transmission.clamp(0.0, 1.0);
+                if alpha >= 1.0 && transmission <= 0.0 {
+                    blocked = true;
+                    return false;
+                }
+                // Each transparent share passes its Transparent colour, `(1 - alpha) * tint` as Cycles' closure
+                // weight (`bsdf_transparent.h`). A glass share passes its transmission, tinted by the base colour.
+                let base_tint = DVec3::new(
+                    surface.params.base_color[0],
+                    surface.params.base_color[1],
+                    surface.params.base_color[2],
+                )
+                .max_element()
+                .clamp(0.0, 1.0);
+                transmittance *= DVec3::from_array(surface.params.transparent_tint) * (1.0 - alpha)
+                    + DVec3::splat(alpha * transmission * base_tint);
             }
-            // Each transparent share passes its Transparent colour, `(1 - alpha) * tint` as Cycles' closure
-            // weight (`bsdf_transparent.h`). A glass share passes its transmission, tinted by the base colour.
-            let base_tint = DVec3::new(
-                surface.params.base_color[0],
-                surface.params.base_color[1],
-                surface.params.base_color[2],
-            )
-            .max_element()
-            .clamp(0.0, 1.0);
-            transmittance *= DVec3::from_array(surface.params.transparent_tint) * (1.0 - alpha)
-                + DVec3::splat(alpha * transmission * base_tint);
-        }
-        if transmittance.max_element() <= 1.0e-5 {
-            return Ok(DVec3::ZERO);
-        }
-        let advance = surface.distance + RAY_EPSILON;
-        origin += direction * advance;
-        if remaining.is_finite() {
-            remaining = (remaining - advance).max(0.0);
-            if remaining <= RAY_EPSILON {
-                break;
+            if transmittance.max_element() <= 1.0e-5 {
+                blocked = true;
+                return false;
             }
-        }
+            true
+        },
+    );
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    if blocked {
+        return Ok(DVec3::ZERO);
     }
     // The last segment, to the light or to infinity, lies in the top medium of the stack.
     if let Some(medium) = shadow_media.last() {
