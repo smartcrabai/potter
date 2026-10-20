@@ -28,7 +28,7 @@ use std::f64::consts::PI;
 use glam::DVec3;
 
 use super::topology::Topology;
-use super::{DabInput, Field, nearest_vertex};
+use super::{DabInput, Field, nearest_in_sphere, nearest_vertex, pivot_symmetry};
 use crate::geom::sculpt::BoundaryDeform;
 
 mod bend;
@@ -90,6 +90,9 @@ enum DeformData {
 /// Apply one Boundary dab, once per symmetry pass in `Field::passes` order. Each pass's loop is
 /// found on the stroke's first dab only.
 pub(super) fn apply(field: &mut Field, deform: BoundaryDeform, input: &DabInput) {
+    if field.positions.is_empty() {
+        return;
+    }
     let mut state = std::mem::take(&mut field.boundary);
     if state.passes.is_empty() {
         state.passes = init_passes(field, deform, input);
@@ -168,9 +171,9 @@ fn find(
         radius,
     );
     // `filter_verts_outside_symmetry_area`, against the loop's initial vertex.
-    let mirror = mirror_axes(&field.passes);
+    let mirror = field.mirror;
     for (index, factor) in edit.factor.iter_mut().enumerate() {
-        if !in_symmetry_area(field.original[index], field.original[closest], mirror) {
+        if !pivot_symmetry(field.original[index], field.original[closest], mirror) {
             *factor = 0.0;
         }
     }
@@ -210,7 +213,13 @@ fn init_passes(
             let initial = if pass == 0 {
                 Some(active)
             } else {
-                nearest_within(&field.original, sign * field.original[active], input.radius)
+                // `init_boundary_mesh` passes `cache->radius_squared` as the maximum distance
+                // (`sculpt_boundary.cc` 3121), which `nearest_vert_calc_mesh` squares again.
+                nearest_in_sphere(
+                    &field.original,
+                    sign * field.original[active],
+                    input.radius * input.radius,
+                )
             };
             let dab = mirrored(input, sign);
             initial
@@ -229,28 +238,6 @@ fn mirrored(input: &DabInput, sign: DVec3) -> DabInput {
         grab: input.grab * sign,
         ..*input
     }
-}
-
-/// Blender's `nearest_vert_calc_mesh`: the vertex nearest `location` when it lies within `radius`
-/// of it. Blender tests the mesh nodes the sphere touches; testing the vertex itself agrees with it
-/// whenever the nearest vertex is inside the sphere.
-fn nearest_within(positions: &[DVec3], location: DVec3, radius: f64) -> Option<usize> {
-    let vertex = nearest_vertex(positions, location);
-    (positions[vertex].distance(location) <= radius).then_some(vertex)
-}
-
-/// The mirror axes of a stroke's symmetry passes: an axis is mirrored when some pass flips it.
-fn mirror_axes(passes: &[DVec3]) -> [bool; 3] {
-    std::array::from_fn(|axis| passes.iter().any(|sign| sign[axis] < 0.0))
-}
-
-/// Blender's `check_vertex_pivot_symmetry` (`sculpt.cc` 671): on each mirror axis, a vertex must
-/// lie on the pivot's side. A pivot on the mirror plane admits only vertices at or below it.
-fn in_symmetry_area(vertex: DVec3, pivot: DVec3, mirror: [bool; 3]) -> bool {
-    (0..3).all(|axis| {
-        let (co, pv) = (vertex[axis], pivot[axis]);
-        !mirror[axis] || (!(pv == 0.0 && co > 0.0) && co * pv >= 0.0)
-    })
 }
 
 /// Blender's `check_counts` with `is_vert_in_editable_boundary_mesh`: a vertex can grow the loop

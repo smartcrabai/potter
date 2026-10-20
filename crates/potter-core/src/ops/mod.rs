@@ -2364,4 +2364,96 @@ mod tests {
             crate::model::LightType::Point
         );
     }
+    #[test]
+    fn pose_and_boundary_stroke_fields_are_accepted_or_refused_at_the_op_level() {
+        let doc = SceneDoc::new("scene-test".to_owned());
+        let created = apply_batch(
+            &doc,
+            &batch(json!([{"op":"node.create","id":"body","kind":"box","params":{"size":2.0}}])),
+        )
+        .unwrap();
+        let run = |fields: serde_json::Value| {
+            let mut operation = json!({
+                "op": "sculpt.stroke",
+                "target": {"id": "body"},
+                "scope": "shared",
+                "samples": [{"position": [1.0, 1.0, 1.0], "pressure": 1.0, "radius": 0.5, "strength": 0.5, "time": 0.0}],
+            });
+            operation
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            apply_batch(&created.doc, &batch(json!([operation])))
+        };
+        for fields in [
+            json!({"brush": "pose"}),
+            json!({"brush": "pose", "deform_type": "squash_stretch"}),
+            json!({"brush": "boundary"}),
+            json!({"brush": "boundary", "deform_type": "twist"}),
+            json!({"brush": "boundary", "deform_type": "smooth"}),
+        ] {
+            assert!(run(fields.clone()).is_ok(), "{fields}");
+        }
+        // Each refusal names its JSON pointer when the operation parser raises it. A geometry-level
+        // refusal raised after parsing carries no pointer.
+        let refusals: [(serde_json::Value, Option<&str>, &str); 8] = [
+            (
+                json!({"brush": "pose", "deform_type": "twist"}),
+                Some("/deform_type"),
+                "screen-space mouse delta",
+            ),
+            (
+                json!({"brush": "pose", "deform_type": "bend"}),
+                Some("/deform_type"),
+                "unknown pose deform_type",
+            ),
+            (
+                json!({"brush": "boundary", "deform_type": "rotate_twist"}),
+                Some("/deform_type"),
+                "unknown boundary deform_type",
+            ),
+            (
+                json!({"brush": "draw", "deform_type": "bend"}),
+                Some("/deform_type"),
+                "supported only by pose and boundary",
+            ),
+            (
+                json!({"brush": "pose", "falloff": "smooth"}),
+                Some("/falloff"),
+                "pose has no falloff",
+            ),
+            (
+                json!({"brush": "boundary", "falloff": "smooth"}),
+                Some("/falloff"),
+                "boundary has no falloff",
+            ),
+            (
+                json!({"brush": "boundary", "delta": [0.1, 0.0, 0.0]}),
+                None,
+                "delta is supported only by",
+            ),
+            (
+                json!({"brush": "pose_lite"}),
+                Some("/brush"),
+                "unknown sculpt brush",
+            ),
+        ];
+        for (fields, pointer, fragment) in refusals {
+            let error = run(fields.clone()).err().unwrap();
+            assert_eq!(error.code, ErrorCode::InvalidOperation, "{fields}");
+            assert!(
+                error.message.contains(fragment),
+                "{fields}: {}",
+                error.message
+            );
+            assert_eq!(
+                error
+                    .details
+                    .get("pointer")
+                    .and_then(serde_json::Value::as_str),
+                pointer,
+                "{fields}"
+            );
+        }
+    }
 }

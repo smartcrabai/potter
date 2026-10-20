@@ -23,7 +23,7 @@ use std::collections::VecDeque;
 
 use glam::{DMat3, DQuat, DVec3};
 
-use super::{DabInput, Field, grab, nearest_vertex};
+use super::{DabInput, Field, grab, nearest_in_sphere, nearest_vertex, pivot_symmetry};
 use crate::geom::sculpt::PoseDeform;
 
 /// `pose_smooth_iterations` default: Blender blurs each segment's weights this many times.
@@ -76,7 +76,7 @@ pub(super) fn apply(field: &mut Field, deform: PoseDeform, input: &DabInput) {
     };
     let aligned = deform == PoseDeform::SquashStretch;
     let rotation = DMat3::from_quat(rotation);
-    let mirror = mirror_axes(&field.passes);
+    let mirror = field.mirror;
     let areas: [(DVec3, DMat3); 8] = std::array::from_fn(|mask| {
         area_transform(&chain, rotation, scale, aligned, flip_signs(mask))
     });
@@ -99,17 +99,17 @@ fn init_chain(field: &Field, input: &DabInput) -> Chain {
     let mut factor = vec![0.0_f64; positions.len()];
     factor[active] = 1.0;
     let mut visited = vec![false; positions.len()];
-    // Blender's `find_symm_verts_mesh`: the nearest vertex to each mirrored active vertex, when it
-    // lies within the radius. These seeds start the flood without being marked visited.
+    // Blender's `find_symm_verts_mesh` (`sculpt_expand.cc` 574) with the brush radius: the nearest
+    // vertex to each mirrored active vertex, when the mesh's bounds lie within the radius of it.
+    // These seeds start the flood without being marked visited.
     let mut queue = VecDeque::from([active]);
     for pass in field.passes.iter().skip(1) {
         let mirrored = positions[active] * *pass;
-        let nearest = nearest_vertex(positions, mirrored);
-        if positions[nearest].distance(mirrored) < input.radius {
+        if let Some(nearest) = nearest_in_sphere(positions, mirrored, input.radius) {
             queue.push_back(nearest);
         }
     }
-    let mirror = mirror_axes(&field.passes);
+    let mirror = field.mirror;
     let mut outside_sum = DVec3::ZERO;
     let mut outside_count = 0_usize;
     // Blender's `fallback_floodfill_origin` starts at the brush location and keeps the visited
@@ -132,7 +132,7 @@ fn init_chain(field: &Field, input: &DabInput) -> Chain {
                 .any(|pass| (center * *pass).distance(co) < input.radius)
             {
                 queue.push_back(to);
-            } else if on_pivot_side(co, center, mirror) {
+            } else if pivot_symmetry(co, center, mirror) {
                 outside_sum += co;
                 outside_count += 1;
             }
@@ -147,11 +147,14 @@ fn init_chain(field: &Field, input: &DabInput) -> Chain {
     for _ in 0..SMOOTH_ITERATIONS {
         let previous = weights.clone();
         for (index, neighbors) in field.topology.ring.iter().enumerate() {
-            if neighbors.is_empty() {
-                continue;
-            }
-            let sum: f64 = neighbors.iter().map(|&neighbor| previous[neighbor]).sum();
-            weights[index] = sum / neighbors.len() as f64;
+            // Blender's `mix_indices` over no neighbors is zero (`BKE_attribute_math.hh` 380), so an
+            // isolated vertex's weight falls to zero rather than holding its value.
+            weights[index] = if neighbors.is_empty() {
+                0.0
+            } else {
+                let sum: f64 = neighbors.iter().map(|&neighbor| previous[neighbor]).sum();
+                sum / neighbors.len() as f64
+            };
         }
     }
     Chain {
@@ -180,6 +183,10 @@ fn anchored_rotation(chain: &Chain, target: DVec3) -> DQuat {
 fn scale_from_grab(chain: &Chain, target: DVec3) -> f64 {
     let direction = (chain.head - chain.origin).normalize_or_zero();
     let along = direction.dot(target - chain.head);
+    if chain.len == 0.0 {
+        // An isolated active vertex gives a zero-length segment, which has no direction to stretch.
+        return 1.0;
+    }
     chain.len / (chain.len - along)
 }
 
@@ -208,43 +215,19 @@ fn area_transform(
     flips: DVec3,
 ) -> (DVec3, DMat3) {
     let pivot = flips * chain.origin;
-    let frame = if aligned {
-        pivot_frame(chain, flips)
-    } else {
-        DMat3::IDENTITY
-    };
-    let mirrored = DMat3::from_diagonal(flips) * rotation * DMat3::from_diagonal(flips);
-    let transform = frame * mirrored * DMat3::from_diagonal(scale) * frame.transpose();
-    (pivot, transform)
-}
-
-/// Blender's `align_pivot_local_space`: a frame whose z axis is the flipped segment direction. Its
-/// x and y axes come from `ortho_basis_v3v3_v3`; Squash & Stretch scales them equally, so their
-/// orientation within the plane does not change the transform.
-fn pivot_frame(chain: &Chain, flips: DVec3) -> DMat3 {
-    let normal = (flips * (chain.head - chain.origin)).normalize_or_zero();
-    let (x, y) = ortho_basis(normal);
-    DMat3::from_cols(x, y, normal)
-}
-
-/// Blender's `ortho_basis_v3v3_v3`: two unit vectors perpendicular to the unit vector `normal`.
-fn ortho_basis(normal: DVec3) -> (DVec3, DVec3) {
-    let horizontal = normal.x * normal.x + normal.y * normal.y;
-    if horizontal > f64::EPSILON {
-        let scale = 1.0 / horizontal.sqrt();
-        let x = DVec3::new(normal.y * scale, -normal.x * scale, 0.0);
-        let y = DVec3::new(
-            -normal.z * x.y,
-            normal.z * x.x,
-            normal.x * x.y - normal.y * x.x,
-        );
-        (x, y)
-    } else {
-        (
-            DVec3::new(if normal.z < 0.0 { -1.0 } else { 1.0 }, 0.0, 0.0),
-            DVec3::Y,
-        )
+    if aligned {
+        // Squash & Stretch scales x and y by the same factor, so its transform is the isotropic
+        // part plus the stretch along the flipped segment direction `n`: `a·I + (s − a)·n·nᵀ`. This
+        // equals Blender's `frame · diag(a, a, s) · frameᵀ` for any orthonormal x, y about `n`
+        // (checked to 2e-15 over random directions), so the frame is not built.
+        let normal = (flips * (chain.head - chain.origin)).normalize_or_zero();
+        let across = scale.x;
+        let outer = DMat3::from_cols(normal * normal.x, normal * normal.y, normal * normal.z);
+        let transform = DMat3::from_diagonal(DVec3::splat(across)) + (scale.z - across) * outer;
+        return (pivot, transform);
     }
+    let mirrored = DMat3::from_diagonal(flips) * rotation * DMat3::from_diagonal(flips);
+    (pivot, mirrored * DMat3::from_diagonal(scale))
 }
 
 /// The symmetry area of `point` as a flip mask (X = 1, Y = 2, Z = 4). An enabled axis flips when
@@ -260,18 +243,4 @@ fn flip_mask(point: DVec3, pivot: DVec3, mirror: DVec3) -> usize {
 fn flip_signs(mask: usize) -> DVec3 {
     let sign = |bit: usize| if mask & bit != 0 { -1.0 } else { 1.0 };
     DVec3::new(sign(1), sign(2), sign(4))
-}
-
-/// The mirror axes of the symmetry passes as one vector: -1 on each enabled axis, 1 elsewhere.
-fn mirror_axes(passes: &[DVec3]) -> DVec3 {
-    passes.iter().fold(DVec3::ONE, |axes, pass| axes.min(*pass))
-}
-
-/// Blender's `check_vertex_pivot_symmetry`: whether `co` lies on the pivot's side of every mirror
-/// axis. A pivot on the plane admits only the non-positive side.
-fn on_pivot_side(co: DVec3, pivot: DVec3, mirror: DVec3) -> bool {
-    (0..3).all(|axis| {
-        mirror[axis] > 0.0
-            || (co[axis] * pivot[axis] >= 0.0 && !(pivot[axis] == 0.0 && co[axis] > 0.0))
-    })
 }

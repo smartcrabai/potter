@@ -704,9 +704,9 @@ pub(super) fn parse_stroke(
         sculpt_geom::DabBrush::Pose(_) => {
             Some("pose has no falloff; Blender's pose brush uses no falloff curve")
         }
-        sculpt_geom::DabBrush::Boundary(_) => {
-            Some("boundary has no falloff; Blender's boundary brush applies a constant falloff")
-        }
+        sculpt_geom::DabBrush::Boundary(_) => Some(
+            "boundary has no falloff; Potter uses the constant falloff curve of Blender's essentials boundary asset, and the curve is not configurable here",
+        ),
         _ => None,
     };
     if let Some(message) = falloff_refusal
@@ -839,18 +839,6 @@ pub(super) fn parse_stroke(
         .get("delta")
         .map(|value| vector3(engine, Some(value), "/delta"))
         .transpose()?;
-    if delta.is_some()
-        && matches!(
-            brush,
-            sculpt_geom::DabBrush::Pose(_) | sculpt_geom::DabBrush::Boundary(_)
-        )
-    {
-        return Err(engine.error(
-            ErrorCode::InvalidOperation,
-            "delta is supported only by grab, snake_hook, thumb, nudge, and elastic_deform brushes",
-            "/delta",
-        ));
-    }
     let view = operation
         .get("view")
         .map(|value| vector3(engine, Some(value), "/view"))
