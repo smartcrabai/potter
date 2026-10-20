@@ -14,7 +14,10 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::f64::consts::{FRAC_PI_2, PI, SQRT_2};
 
-use super::bevel_boundary::{AngleKind, BoundProfile, Front, isect_line_line};
+use super::bevel_boundary::{
+    AngleKind, BoundProfile, Front, PRO_CIRCLE_R, PRO_LINE_R, PRO_SQUARE_IN_R, PRO_SQUARE_R,
+    isect_line_line,
+};
 use super::bevel_shading::Kind;
 use super::{Mesh, Polygon, build_mesh_with_edge_identity};
 use crate::error::Result;
@@ -28,15 +31,6 @@ use crate::geom::{
         mean_value_corners,
     },
 };
-
-/// Superellipse exponent of a square profile (Blender `PRO_SQUARE_R`).
-pub(super) const PRO_SQUARE_R: f64 = 1.0e4;
-/// Superellipse exponent of a circular profile (Blender `PRO_CIRCLE_R`).
-pub(super) const PRO_CIRCLE_R: f64 = 2.0;
-/// Superellipse exponent of a linear profile (Blender `PRO_LINE_R`).
-pub(super) const PRO_LINE_R: f64 = 1.0;
-/// Superellipse exponent of an inward square profile (Blender `PRO_SQUARE_IN_R`).
-pub(super) const PRO_SQUARE_IN_R: f64 = 0.0;
 
 const BEVEL_EPSILON: f64 = 1.0e-6;
 const BEVEL_EPSILON_SQ: f64 = 1.0e-12;
