@@ -234,8 +234,8 @@ def describe_mesh(case, regression, owner, mesh, *, rings):
         "vertex_groups": groups,
         "blender_version": bpy.app.version_string,
     }
-    if rings:
-        result["faces"] = faces
+    # Always written: the sphere cases (rings=False) record counts, face sizes, and volume only.
+    result["faces"] = faces if rings else None
     result["edges"] = edges
     return result
 

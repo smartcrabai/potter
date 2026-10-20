@@ -575,12 +575,10 @@ def describe_mesh(evaluated, mesh, spec):
         "vertex_groups": groups,
         "blender_version": bpy.app.version_string,
     }
-    if edge_values:
-        result["edge_attributes"] = edge_attributes
-    if point_values:
-        result["point_attributes"] = point_attributes
-    if color_layers is not None:
-        result["color_layers"] = color_layers
+    # Always written: null means this mesh has no data in that domain, not an omitted section.
+    result["edge_attributes"] = edge_attributes if edge_values else None
+    result["point_attributes"] = point_attributes if point_values else None
+    result["color_layers"] = color_layers
     if "hole_tolerant" in spec:
         result["hole_tolerant"] = spec["hole_tolerant"]
         result["input_geometry"] = {

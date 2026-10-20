@@ -12,7 +12,8 @@
 //! Per face: ring, material, `fid`, UVs/pins/named UV layers, FACE/CORNER attributes, per-corner point attributes,
 //! and custom-normal vectors/codes. Edge points retain per-endpoint point payloads; global point and
 //! edge attributes remain associated with canonical positions/endpoints and are matched as multisets.
-//! Missing association fields in historical expectations are unrecorded. Color-layer order/domain/type
+//! Every key a generator always writes is required; a missing key fails its case by name. `null` marks a
+//! domain or layer table with no data; regression records omit the Blender-only sections. Color-layer order/domain/type
 //! and active/render names are exact; RGBA values are linear.
 //! Raw OBJECT assignments (aligned to slot count, `None` for DATA-linked slots), effective slot materials, raw DATA slots, and link modes are exact.
 //! Vertex groups are matched by position and weight. Counts, topology and payload presence are exact;
@@ -240,24 +241,6 @@ fn same_edge(left: [[f64; 3]; 2], right: [[f64; 3]; 2]) -> bool {
     point_matches(left[0], right[0]) && point_matches(left[1], right[1])
 }
 
-fn expected_edge_topology(faces: &[CanonicalFace]) -> Vec<[[f64; 3]; 2]> {
-    let mut edges: Vec<[[f64; 3]; 2]> = Vec::new();
-    for face in faces {
-        for index in 0..face.ring.len() {
-            let edge = [face.ring[index], face.ring[(index + 1) % face.ring.len()]];
-            // Ring edges follow the face winding, so a shared edge appears once in each direction.
-            let reversed = [edge[1], edge[0]];
-            if !edges
-                .iter()
-                .any(|existing| same_edge(*existing, edge) || same_edge(*existing, reversed))
-            {
-                edges.push(edge);
-            }
-        }
-    }
-    edges
-}
-
 fn signed_volume(rings: &[Vec<DVec3>]) -> f64 {
     rings
         .iter()
@@ -269,6 +252,38 @@ fn signed_volume(rings: &[Vec<DVec3>]) -> f64 {
             })
         })
         .sum()
+}
+
+/// The generator that wrote an expectation. The Blender record carries every section; the regression
+/// record carries only what its tests assert.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Schema {
+    Blender,
+    Regression,
+}
+
+/// Follows a dotted `path` (for example `counts.vertices`) from `value`. A missing key is an error,
+/// so a stale corpus cannot silently skip the comparison that key feeds.
+fn required<'a>(value: &'a Value, path: &str) -> TestResult<&'a Value> {
+    let mut current = value;
+    for key in path.split('.') {
+        current = current
+            .get(key)
+            .ok_or_else(|| format!("missing `{path}`"))?;
+    }
+    Ok(current)
+}
+
+/// A required section that is `null` when its mesh has no data for it.
+fn nullable<T>(
+    value: &Value,
+    parse: impl FnOnce(&Value) -> TestResult<T>,
+) -> TestResult<Option<T>> {
+    if value.is_null() {
+        Ok(None)
+    } else {
+        parse(value).map(Some)
+    }
 }
 
 fn number(value: &Value) -> TestResult<f64> {
@@ -1044,11 +1059,17 @@ fn expected_face_sizes(value: &Value) -> TestResult<BTreeMap<usize, usize>> {
     Ok(sizes)
 }
 
-fn expected_faces(value: &Value) -> TestResult<Vec<CanonicalFace>> {
+/// A per-face key the generator always writes; the error names the face.
+fn face_field<'a>(face: &'a Value, index: usize, key: &str) -> TestResult<&'a Value> {
+    required(face, key).map_err(|error| format!("face #{index}: {error}").into())
+}
+
+fn expected_faces(value: &Value, schema: Schema) -> TestResult<Vec<CanonicalFace>> {
     let mut faces = Vec::new();
-    for face in value.as_array().ok_or("Blender faces are missing")? {
-        let ring = points_from_json(&face["ring"])?;
-        let material = face["material_index"]
+    let records = value.as_array().ok_or("Boolean faces must be an array")?;
+    for (index, face) in records.iter().enumerate() {
+        let ring = points_from_json(face_field(face, index, "ring")?)?;
+        let material = face_field(face, index, "material_index")?
             .as_u64()
             .ok_or("Blender material index is invalid")?;
         let fid = match face.get("fid") {
@@ -1057,10 +1078,14 @@ fn expected_faces(value: &Value) -> TestResult<Vec<CanonicalFace>> {
         };
         let uv = face.get("uv").map(uv_pairs).transpose()?;
         let uv_pins = face.get("uv_pins").map(bools_from_json).transpose()?;
-        let uv_layers = face
-            .get("uv_layers")
-            .map(|value| expected_uv_layers(value, ring.len()))
-            .transpose()?;
+        // The regression generator writes neither per-face UV layers nor point attributes.
+        let uv_layers = match schema {
+            Schema::Blender => Some(expected_uv_layers(
+                face_field(face, index, "uv_layers")?,
+                ring.len(),
+            )?),
+            Schema::Regression => None,
+        };
         if let Some(pins) = &uv_pins
             && pins.len() != ring.len()
         {
@@ -1071,19 +1096,19 @@ fn expected_faces(value: &Value) -> TestResult<Vec<CanonicalFace>> {
             )
             .into());
         }
-        let point_attributes = face
-            .get("point_attributes")
-            .map(|value| expected_face_point_attributes(value, ring.len()))
-            .transpose()?
-            .flatten();
+        let point_attributes = match schema {
+            Schema::Blender => expected_face_point_attributes(
+                face_field(face, index, "point_attributes")?,
+                ring.len(),
+            )?,
+            Schema::Regression => None,
+        };
         let normals = face
             .get("custom_normals")
             .map(points_from_json)
             .transpose()?;
-        let face_attributes = face
-            .get("face_attributes")
-            .map(expected_attribute_values)
-            .transpose()?;
+        let face_attributes =
+            expected_attribute_values(face_field(face, index, "face_attributes")?)?;
         let corner_attributes = face
             .get("corner_attributes")
             .map(expected_corner_attributes)
@@ -1125,7 +1150,7 @@ fn expected_faces(value: &Value) -> TestResult<Vec<CanonicalFace>> {
                 point_attributes,
                 custom_normals: normals
                     .map(|values| values.into_iter().map(|normal| normal.to_array()).collect()),
-                face_attributes,
+                face_attributes: Some(face_attributes),
                 corner_attributes,
                 custom_normal_codes,
             },
@@ -1272,6 +1297,7 @@ fn expected_edge_attributes(value: &Value) -> TestResult<Vec<EdgeAttribute>> {
         .collect()
 }
 
+/// An active or render layer name: the key is required, and its value is a name or `null` for none.
 fn optional_layer_name(value: &Value, key: &str, owner: &str) -> TestResult<Option<String>> {
     let field = value
         .get(key)
@@ -1286,10 +1312,7 @@ fn optional_layer_name(value: &Value, key: &str, owner: &str) -> TestResult<Opti
     }
 }
 
-fn expected_color_layers(value: &Value) -> TestResult<Option<ColorLayers>> {
-    let Some(value) = value.get("color_layers") else {
-        return Ok(None);
-    };
+fn expected_color_layers(value: &Value) -> TestResult<ColorLayers> {
     let layers = value
         .get("layers")
         .and_then(Value::as_array)
@@ -1312,16 +1335,14 @@ fn expected_color_layers(value: &Value) -> TestResult<Option<ColorLayers>> {
             })
         })
         .collect::<TestResult<Vec<_>>>()?;
-    Ok(Some(ColorLayers {
+    Ok(ColorLayers {
         layers,
         active: optional_layer_name(value, "active", "Blender color-layer")?,
         render: optional_layer_name(value, "render", "Blender color-layer")?,
-    }))
+    })
 }
-fn expected_uv_layer_metadata(value: &Value) -> TestResult<Option<UvLayerMetadata>> {
-    let Some(value) = value.get("uv_layers") else {
-        return Ok(None);
-    };
+
+fn expected_uv_layer_metadata(value: &Value) -> TestResult<UvLayerMetadata> {
     let layers = value
         .get("layers")
         .and_then(Value::as_array)
@@ -1332,11 +1353,11 @@ fn expected_uv_layer_metadata(value: &Value) -> TestResult<Option<UvLayerMetadat
             Ok(name.to_owned())
         })
         .collect::<TestResult<Vec<_>>>()?;
-    Ok(Some(UvLayerMetadata {
+    Ok(UvLayerMetadata {
         layers,
         active: optional_layer_name(value, "active", "Blender UV-layer")?,
         render: optional_layer_name(value, "render", "Blender UV-layer")?,
-    }))
+    })
 }
 
 fn potter_uv_layer_metadata(mesh: &Mesh) -> TestResult<UvLayerMetadata> {
@@ -1467,71 +1488,85 @@ fn expected_material_links(links: &Value) -> TestResult<Vec<MaterialLink>> {
         .collect()
 }
 
-/// The canonical form of a Blender expectation (`expected/<case>.json`).
+/// The canonical form of a Boolean expectation: a Blender record (`expected/<case>.json`) or a
+/// regression record (`regressions/expected/<case>.json`). Every key a generator always writes is
+/// required, so a stale corpus fails the case by name instead of skipping the comparison.
 pub fn expected_canonical(expected: &Value) -> TestResult<Canonical> {
-    let faces = match expected.get("faces") {
-        Some(faces) => Some(expected_faces(faces)?),
-        None => None,
+    let case = expected
+        .get("case")
+        .and_then(Value::as_str)
+        .unwrap_or("<unnamed>");
+    // Only the regression generator writes `regression`; its records omit the Blender-only sections.
+    let schema = if expected.get("regression").is_some() {
+        Schema::Regression
+    } else {
+        Schema::Blender
     };
-    let vertex_groups = match expected.get("vertex_groups") {
-        Some(groups) => expected_vertex_groups(groups)?,
-        None => BTreeMap::new(),
+    expected_with_schema(expected, schema)
+        .map_err(|error| format!("Boolean expectation `{case}`: {error}").into())
+}
+
+fn expected_with_schema(expected: &Value, schema: Schema) -> TestResult<Canonical> {
+    let faces = required(expected, "faces")?;
+    let faces = match schema {
+        Schema::Regression if faces.is_null() => None,
+        _ => Some(expected_faces(faces, schema)?),
     };
-    let point_attributes = expected
-        .get("point_attributes")
-        .map(expected_point_attributes)
-        .transpose()?;
-    let edge_points = expected
-        .get("edge_points")
-        .map(expected_edge_points)
-        .transpose()?;
-    let edge_attributes = expected
-        .get("edge_attributes")
-        .map(expected_edge_attributes)
-        .transpose()?;
-    let color_layers = expected_color_layers(expected)?;
-    let uv_layers = expected_uv_layer_metadata(expected)?;
-    let edge_topology = match expected.get("edges") {
-        Some(edges) => Some(expected_edges(edges)?),
-        None => faces.as_deref().map(expected_edge_topology),
-    };
-    let object_materials = expected
-        .get("object_materials")
-        .map(|materials| expected_material_names(materials, "object materials"))
-        .transpose()?;
-    let effective_materials = expected
-        .get("effective_materials")
-        .map(|materials| expected_material_names(materials, "effective materials"))
-        .transpose()?;
-    let data_materials = expected
-        .get("data_materials")
-        .map(|materials| expected_material_names(materials, "data materials"))
-        .transpose()?;
-    let material_links = expected
-        .get("material_links")
-        .map(expected_material_links)
-        .transpose()?;
-    Ok(Canonical {
-        vertices: count(&expected["counts"]["vertices"], "vertex")?,
-        face_count: count(&expected["counts"]["faces"], "face")?,
-        edges: count(&expected["counts"]["edges"], "edge")?,
-        edge_topology,
-        edge_points,
-        face_sizes: expected_face_sizes(&expected["face_sizes"])?,
+    let mut canonical = Canonical {
+        vertices: count(required(expected, "counts.vertices")?, "vertex")?,
+        edges: count(required(expected, "counts.edges")?, "edge")?,
+        face_count: count(required(expected, "counts.faces")?, "face")?,
+        edge_topology: Some(expected_edges(required(expected, "edges")?)?),
+        edge_points: None,
+        face_sizes: expected_face_sizes(required(expected, "face_sizes")?)?,
         faces,
-        vertex_groups,
-        point_attributes,
-        edge_attributes,
-        color_layers,
-        object_materials,
-        effective_materials,
-        data_materials,
-        material_links,
-        uv_layers,
-        volume: expected["volume"]
+        vertex_groups: expected_vertex_groups(required(expected, "vertex_groups")?)?,
+        point_attributes: None,
+        edge_attributes: None,
+        color_layers: None,
+        uv_layers: None,
+        object_materials: None,
+        effective_materials: None,
+        data_materials: None,
+        material_links: None,
+        volume: required(expected, "volume")?
             .as_f64()
-            .ok_or("Blender volume is missing")?,
-    })
+            .ok_or("Boolean volume is not a number")?,
+    };
+    if schema == Schema::Blender {
+        canonical.edge_points = Some(expected_edge_points(required(expected, "edge_points")?)?);
+        canonical.point_attributes = nullable(
+            required(expected, "point_attributes")?,
+            expected_point_attributes,
+        )?;
+        canonical.edge_attributes = nullable(
+            required(expected, "edge_attributes")?,
+            expected_edge_attributes,
+        )?;
+        canonical.color_layers =
+            nullable(required(expected, "color_layers")?, expected_color_layers)?;
+        canonical.uv_layers = Some(expected_uv_layer_metadata(required(
+            expected,
+            "uv_layers",
+        )?)?);
+        canonical.object_materials = Some(expected_material_names(
+            required(expected, "object_materials")?,
+            "object materials",
+        )?);
+        canonical.effective_materials = Some(expected_material_names(
+            required(expected, "effective_materials")?,
+            "effective materials",
+        )?);
+        canonical.data_materials = Some(expected_material_names(
+            required(expected, "data_materials")?,
+            "data materials",
+        )?);
+        canonical.material_links = Some(expected_material_links(required(
+            expected,
+            "material_links",
+        )?)?);
+    }
+    Ok(canonical)
 }
 
 fn volume_matches(actual: f64, expected: f64) -> bool {
@@ -2305,6 +2340,27 @@ fn pair_edges(
     (pairs, used)
 }
 
+/// Index in `edges` of the edge whose endpoints are `edge`'s swapped, if one exists.
+fn reversed_edge(
+    lookup: &EdgeIndex,
+    edges: &[[[f64; 3]; 2]],
+    edge: [[f64; 3]; 2],
+) -> Option<usize> {
+    let reversed = [edge[1], edge[0]];
+    lookup
+        .candidates(reversed[0])
+        .filter(|&index| same_edge(edges[index], reversed))
+        .min()
+}
+
+/// Names the reversed partner of an unmatched edge; `noun` says which side the index belongs to.
+fn reversed_note(noun: &str, reversed: Option<usize>) -> String {
+    match reversed {
+        Some(index) => format!("reversed: {noun} #{index}"),
+        None => "reversed: none".to_owned(),
+    }
+}
+
 fn compare_edges(actual: &[[[f64; 3]; 2]], expected: &[[[f64; 3]; 2]]) -> Vec<String> {
     let mut differences = Vec::new();
     if actual.len() != expected.len() {
@@ -2315,16 +2371,24 @@ fn compare_edges(actual: &[[[f64; 3]; 2]], expected: &[[[f64; 3]; 2]]) -> Vec<St
         ));
     }
     let (pairs, used) = pair_edges(actual, expected, |_, _| true);
-    for (expected_index, (expected_edge, pair)) in expected.iter().zip(&pairs).enumerate() {
+    let actual_lookup = EdgeIndex::new(actual);
+    let expected_lookup = EdgeIndex::new(expected);
+    for (expected_position, (expected_edge, pair)) in expected.iter().zip(&pairs).enumerate() {
         if pair.is_none() {
+            let reversed = reversed_edge(&actual_lookup, actual, *expected_edge);
             differences.push(format!(
-                "Blender edge #{expected_index} {expected_edge:?} has no matching Potter edge; Potter edges: {actual:?}"
+                "Blender edge #{expected_position} {expected_edge:?} has no matching Potter edge; {}",
+                reversed_note("Potter edge", reversed)
             ));
         }
     }
     for (index, edge) in actual.iter().enumerate() {
         if !used[index] {
-            differences.push(format!("unexpected Potter edge #{index} {edge:?}"));
+            let reversed = reversed_edge(&expected_lookup, expected, *edge);
+            differences.push(format!(
+                "unexpected Potter edge #{index} {edge:?}; {}",
+                reversed_note("Blender edge", reversed)
+            ));
         }
     }
     differences
@@ -2373,19 +2437,29 @@ fn compare_edge_points(
                     edge_point_payloads_match(&actual[actual_index], &expected[expected_index])
                 },
             );
-            for (expected_index, (expected_entry, pair)) in expected.iter().zip(&pairs).enumerate()
+            let actual_lookup = EdgeIndex::new(&actual_edges);
+            let expected_lookup = EdgeIndex::new(&expected_edges);
+            for (expected_position, (expected_entry, pair)) in
+                expected.iter().zip(&pairs).enumerate()
             {
                 if pair.is_none() {
+                    let reversed =
+                        reversed_edge(&actual_lookup, &actual_edges, expected_entry.edge);
                     differences.push(format!(
-                        "Blender edge-point row #{expected_index} {:?} has no matching Potter row",
+                        "Blender edge-point row #{expected_position} edge {:?} has no matching Potter row; {}; endpoints {:?}",
+                        expected_entry.edge,
+                        reversed_note("Potter row", reversed),
                         expected_entry.endpoints
                     ));
                 }
             }
             for (index, entry) in actual.iter().enumerate() {
                 if !used[index] {
+                    let reversed = reversed_edge(&expected_lookup, &expected_edges, entry.edge);
                     differences.push(format!(
-                        "unexpected Potter edge-point row #{index} {:?}",
+                        "unexpected Potter edge-point row #{index} edge {:?}; {}; endpoints {:?}",
+                        entry.edge,
+                        reversed_note("Blender row", reversed),
                         entry.endpoints
                     ));
                 }
@@ -2471,28 +2545,45 @@ fn compare_edge_attributes(
                     )
                 },
             );
-            for (expected_entry, pair) in expected.iter().zip(&pairs) {
+            let actual_lookup = EdgeIndex::new(&actual_edges);
+            let expected_lookup = EdgeIndex::new(&expected_edges);
+            for (expected_position, (expected_entry, pair)) in
+                expected.iter().zip(&pairs).enumerate()
+            {
                 if pair.is_none() {
+                    let reversed =
+                        reversed_edge(&actual_lookup, &actual_edges, expected_entry.edge);
                     differences.push(format!(
-                        "missing Blender edge attributes on {:?}: {:?}",
-                        expected_entry.edge, expected_entry.values
+                        "Blender edge-attribute row #{expected_position} on {:?}: {:?}; {}",
+                        expected_entry.edge,
+                        expected_entry.values,
+                        reversed_note("Potter edge", reversed)
                     ));
                 }
             }
             for (index, entry) in actual.iter().enumerate() {
                 if !used[index] {
+                    let reversed = reversed_edge(&expected_lookup, &expected_edges, entry.edge);
                     differences.push(format!(
-                        "unexpected Potter edge attributes on {:?}: {:?}",
-                        entry.edge, entry.values
+                        "unexpected Potter edge-attribute row #{index} on {:?}: {:?}; {}",
+                        entry.edge,
+                        entry.values,
+                        reversed_note("Blender edge", reversed)
                     ));
                 }
             }
         }
         (Some(actual), None) => {
-            differences.push(format!("unexpected Potter edge attributes {actual:?}"));
+            differences.push(format!(
+                "unexpected Potter edge attributes on {} rows; Blender records none",
+                actual.len()
+            ));
         }
         (None, Some(expected)) => {
-            differences.push(format!("missing Blender edge attributes {expected:?}"));
+            differences.push(format!(
+                "missing Blender edge attributes on {} rows; Potter has none",
+                expected.len()
+            ));
         }
         (None, None) => {}
     }
