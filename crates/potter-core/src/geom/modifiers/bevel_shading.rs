@@ -144,7 +144,9 @@ fn harden_loop(topology: &Topology, loop_: Loop) -> Option<DVec3> {
     let own = topology.kinds[polygon];
     let normal = |other: Loop| topology.face_normals[other.0];
     let prev_loop = topology.previous(loop_);
-    // BM_vert_step_fan_loop crosses the outgoing edge for Blender's `lprev` walk.
+    // `BM_vert_step_fan_loop` (bmesh_query.cc:473-490) steps across the edge *other* than `e_step`:
+    // Blender's `lprev` (`estep = l->prev->e`) is the face across the outgoing edge `l->e`, and
+    // `lnext` (`estep = l->e`) the face across the incoming edge (bmesh_bevel.cc:3051-3053).
     let lprev = topology.neighbour(loop_, true);
     let lnext = topology.neighbour(loop_, false);
     let (kprev, knext) = (topology.kind(lprev), topology.kind(lnext));
@@ -180,6 +182,8 @@ fn harden_loop(topology: &Topology, loop_: Loop) -> Option<DVec3> {
             } else if let Some(next) = lnext.filter(|_| knext == Some(Kind::Source)) {
                 Some(normal(next))
             } else {
+                // Blender: `lprevprev` is across `lprev->e` and `lnextnext` across `lnext->prev->e`
+                // (bmesh_bevel.cc:3092-3093, 3099; bmesh_query.cc:473-490).
                 let lprevprev = lprev.and_then(|prev| topology.neighbour(prev, true));
                 let lnextnext = lnext.and_then(|next| topology.neighbour(next, false));
                 let kprevprev = topology.kind(lprevprev);
@@ -385,11 +389,16 @@ mod tests {
             rules[0].iter().all(Option::is_none),
             "source loops keep their fan normal"
         );
+        // Blender's `bevel_harden_normals` on this topology (bmesh_bevel.cc:3060-3075). Loop 0 is
+        // LONG with a RECON face across its outgoing edge (branch 3). Loop 1 follows LONG loop 0 and
+        // its incoming edge borders the RECON square (branch 4), so it takes the square's normal.
+        // Loop 2 has no neighbours. Loop 3 is not LONG and its RECON face is across its outgoing
+        // edge, which neither branch reads, so it keeps its fan normal.
         let up = Some(DVec3::Z);
         assert_rule(rules[1][0], up);
-        assert_rule(rules[1][1], None);
+        assert_rule(rules[1][1], up);
         assert_rule(rules[1][2], None);
-        assert_rule(rules[1][3], up);
+        assert_rule(rules[1][3], None);
     }
 
     #[test]
