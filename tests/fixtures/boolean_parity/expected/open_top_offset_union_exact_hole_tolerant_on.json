@@ -1817,6 +1817,9 @@
  },
  "vertex_groups": {},
  "blender_version": "5.2.2 LTS",
+ "edge_attributes": null,
+ "point_attributes": null,
+ "color_layers": null,
  "hole_tolerant": true,
  "input_geometry": {
   "host": {
