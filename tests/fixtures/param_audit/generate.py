@@ -47,13 +47,24 @@ EXCEPTIONS = {
         "Blender's MeshSequenceCacheModifier does not expose frame_offset as an RNA "
         "property, so the table default cannot be sampled at runtime."
     ),
-    "mesh_sequence_cache.scale": (
-        "Blender's MeshSequenceCacheModifier does not expose scale as an RNA "
-        "property, so the table default cannot be sampled at runtime."
+    "mesh_sequence_cache.is_sequence": (
+        "Blender's MeshSequenceCacheModifier does not expose is_sequence as an RNA property; "
+        "it is a CacheFile setting that Potter mirrors onto the modifier, so the table default "
+        "cannot be sampled at runtime."
     ),
     "mesh_sequence_cache.override_frame": (
         "Blender's MeshSequenceCacheModifier does not expose override_frame as an RNA "
         "property, so the table default cannot be sampled at runtime."
+    ),
+    "mesh_sequence_cache.velocity_name": (
+        "Blender's MeshSequenceCacheModifier does not expose velocity_name as an RNA property; "
+        "it is a CacheFile setting that Potter mirrors onto the modifier, so the table default "
+        "cannot be sampled at runtime."
+    ),
+    "mesh_sequence_cache.velocity_unit": (
+        "Blender's MeshSequenceCacheModifier does not expose velocity_unit as an RNA property; "
+        "it is a CacheFile setting that Potter mirrors onto the modifier, so the table default "
+        "cannot be sampled at runtime."
     ),
     "nodes.inputs": (
         "Blender's NodesModifier does not expose an inputs RNA attribute on the "
@@ -169,6 +180,90 @@ def probe_volume_type(key, identifier, properties):
     return record_properties(key, mod, properties)
 
 
+ALIAS_FLOAT_SENTINEL = 0.0371
+ALIAS_INT_SENTINEL = 7
+ALIAS_KINDS = ("FLOAT", "INT", "BOOLEAN", "ENUM")
+
+
+def make_modifier_factory(key, identifier):
+    """Returns a function that builds a fresh modifier of this type on a factory-fresh object."""
+    volume = key in VOLUME_TYPES
+
+    def make():
+        bpy.ops.wm.read_factory_settings(use_empty=True)
+        if volume:
+            owner = bpy.data.objects.new("vo", bpy.data.volumes.new("v"))
+            bpy.context.collection.objects.link(owner)
+        else:
+            bpy.ops.mesh.primitive_cube_add()
+            owner = bpy.context.active_object
+        return new_modifier(owner, key, identifier)
+
+    return make
+
+
+def alias_probe_properties(mod):
+    """Settable scalar RNA properties of a modifier, with their RNA type."""
+    props = {}
+    for prop in mod.bl_rna.properties:
+        if prop.identifier in ("rna_type", "name", "type") or prop.is_readonly:
+            continue
+        if getattr(prop, "is_array", False) or prop.type not in ALIAS_KINDS:
+            continue
+        props[prop.identifier] = prop.type
+    return props
+
+
+def alias_read(mod, name):
+    try:
+        return getattr(mod, name)
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def alias_sentinel(mod, name, kind, current):
+    if kind == "FLOAT":
+        return ALIAS_FLOAT_SENTINEL
+    if kind == "INT":
+        return ALIAS_INT_SENTINEL
+    if kind == "BOOLEAN":
+        return not current
+    items = [item.identifier for item in mod.bl_rna.properties[name].enum_items]
+    return next((item for item in items if item != current), None)
+
+
+def discover_aliases(make):
+    """Pairs of same-typed RNA properties that read and write one stored value, as sorted lists.
+
+    Each property is set to a sentinel on a fresh modifier. A property of the same type that then reads
+    the sentinel, and did not before, is its alias. A value Blender clamps or refuses yields no pair, so the
+    search can miss an alias but cannot report one that does not exist. Returns None if Blender cannot create
+    the modifier.
+    """
+    mod = make()
+    if mod is None:
+        return None
+    props = alias_probe_properties(mod)
+    pairs = set()
+    for name, kind in props.items():
+        mod = make()
+        before = {other: alias_read(mod, other) for other in props}
+        value = alias_sentinel(mod, name, kind, before[name])
+        if value is None:
+            continue
+        try:
+            setattr(mod, name, value)
+        except (TypeError, ValueError, RuntimeError):
+            continue
+        after = {other: alias_read(mod, other) for other in props}
+        for other, other_kind in props.items():
+            if other == name or other_kind != kind:
+                continue
+            if same(after[other], value) and not same(before[other], value):
+                pairs.add(tuple(sorted((name, other))))
+    return sorted([list(pair) for pair in pairs])
+
+
 def main():
     argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
     unknown = [arg for arg in argv if arg != "--check"]
@@ -235,13 +330,38 @@ def main():
             elif not same(expected, actual):
                 mismatches += 1
                 print(f"{name} table={expected} blender={actual}")
+    alias_mismatches = 0
+    aliases_checked = 0
+    for key, spec in table["modifiers"].items():
+        identifier = blender_identifier(key)
+        found = discover_aliases(make_modifier_factory(key, identifier))
+        if found is None:
+            continue
+        declared = sorted(sorted(pair) for pair in spec.get("aliases", []))
+        aliases_checked += 1
+        if found != declared:
+            alias_mismatches += 1
+            print(f"ALIAS {key} table={declared} blender={found}")
+        for first, second in declared:
+            for prop in (first, second):
+                if prop not in spec["properties"]:
+                    alias_mismatches += 1
+                    print(f"ALIAS {key}.{prop} is not a table property")
+            first_spec = spec["properties"].get(first, {})
+            second_spec = spec["properties"].get(second, {})
+            if "default" in first_spec and "default" in second_spec and not same(
+                    first_spec["default"], second_spec["default"]):
+                alias_mismatches += 1
+                print(f"ALIAS {key}.{first}/{second} defaults differ: "
+                      f"{first_spec['default']} vs {second_spec['default']}")
 
     print(
         f"blender {bpy.app.version_string}: checked {checked} defaults, "
         f"{mismatches} mismatches, {excepted} exceptions, "
-        f"{creation_failures} modifier types not created"
+        f"{creation_failures} modifier types not created; "
+        f"checked {aliases_checked} modifier types for aliases, {alias_mismatches} alias mismatches"
     )
-    sys.exit(1 if mismatches or creation_failures else 0)
+    sys.exit(1 if mismatches or creation_failures or alias_mismatches else 0)
 
 
 if __name__ == "__main__":

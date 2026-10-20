@@ -99,7 +99,13 @@ pub(crate) fn evaluate(
         ));
     }
     let cache_frame = override_frame.unwrap_or(frame);
-    let time_seconds = (cache_frame - frame_offset) / rate;
+    // Blender's file-sequence time is the frame itself (BKE_cachefile_time_offset); a single file
+    // takes seconds with the frame offset removed.
+    let time_seconds = if is_sequence {
+        cache_frame
+    } else {
+        (cache_frame - frame_offset) / rate
+    };
     if !time_seconds.is_finite() {
         return Err(PotError::with_details(
             ErrorCode::EvaluationFailed,

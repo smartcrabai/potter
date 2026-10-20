@@ -89,7 +89,7 @@ fn scene_schema() -> Value {
     let mut root = base("Potter scene document");
     root["required"] = json!(["schema_version", "scene_id", "revision", "active_scene"]);
     root["properties"] = json!({
-        "schema_version":{"const":3},
+        "schema_version":{"const":7},
         "scene_id":{"type":"string","format":"uuid"},
         "revision":{"type":"integer","minimum":0,"maximum":9_007_199_254_740_991_u64},
         "active_scene":{"$ref":"#/$defs/id"},
@@ -109,6 +109,9 @@ fn scene_schema() -> Value {
         "history":{"$ref":"#/$defs/history"}
     });
     root["additionalProperties"] = json!(false);
+    // The scene document requires `interpolation`; the operation schema defaults it to linear.
+    let mut texture_ref = texture_ref_schema();
+    texture_ref["required"] = json!(["image", "interpolation"]);
     root["$defs"] = json!({
         "id":id_schema(),
         "vec2":vec_schema(2),
@@ -117,7 +120,7 @@ fn scene_schema() -> Value {
         "unit":{"type":"object","required":["system","scale_length"],"properties":{"system":{"type":"string"},"scale_length":{"type":"number","exclusiveMinimum":0}},"additionalProperties":false},
         "view_layer":{"type":"object","required":["name","excluded_collections"],"properties":{"name":{"type":"string"},"excluded_collections":{"type":"array","items":{"$ref":"#/$defs/id"}}},"additionalProperties":false},
         "scene":{"type":"object","required":["name","root_collection","view_layers","frame_current","frame_start","frame_end","fps","fps_base","camera","world","unit","markers","render","rigid_body_world"],"properties":{"name":{"type":"string"},"root_collection":{"$ref":"#/$defs/id"},"view_layers":registry_schema("view_layer"),"frame_current":{"type":"number"},"frame_start":{"type":"integer"},"frame_end":{"type":"integer"},"fps":{"type":"integer","minimum":1},"fps_base":{"type":"number","exclusiveMinimum":0},"camera":{"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]},"world":{"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]},"unit":{"$ref":"#/$defs/unit"},"render":{"$ref":"#/$defs/render_settings"},"markers":{"type":"array","items":{"$ref":"#/$defs/marker"}},"rigid_body_world":{"oneOf":[{"$ref":"#/$defs/rigid_body_world"},{"type":"null"}]}},"additionalProperties":false},
-        "render_settings":{"type":"object","required":["resolution_x","resolution_y","resolution_percentage","samples","seed","max_bounces","film_transparent","engine","use_sequencer","audio_codec","passes"],"properties":{"resolution_x":{"type":"integer","minimum":1,"maximum":16384},"resolution_y":{"type":"integer","minimum":1,"maximum":16384},"resolution_percentage":{"type":"integer","minimum":1,"maximum":100},"samples":{"type":"integer","minimum":1,"maximum":1_000_000},"seed":{"type":"integer","minimum":0,"maximum":u32::MAX},"max_bounces":{"type":"integer","minimum":0,"maximum":1024},"film_transparent":{"type":"boolean"},"engine":{"enum":["path","realtime"]},"use_sequencer":{"type":"boolean"},"audio_codec":{"enum":["wav","flac"]},"passes":{"type":"array","items":{"type":"string"}},"cryptomatte_accurate":{"type":"boolean"}},"additionalProperties":false},
+        "render_settings":{"type":"object","required":["resolution_x","resolution_y","resolution_percentage","samples","seed","max_bounces","film_transparent","engine","use_sequencer","audio_codec","passes"],"properties":{"resolution_x":{"type":"integer","minimum":1,"maximum":16384},"resolution_y":{"type":"integer","minimum":1,"maximum":16384},"resolution_percentage":{"type":"integer","minimum":1,"maximum":100},"samples":{"type":"integer","minimum":1,"maximum":1_000_000},"seed":{"type":"integer","minimum":0,"maximum":u32::MAX},"max_bounces":{"type":"integer","minimum":0,"maximum":1024},"transparent_max_bounces":{"type":"integer","minimum":0,"maximum":1024,"default":8},"film_transparent":{"type":"boolean"},"engine":{"enum":["path","realtime"]},"use_sequencer":{"type":"boolean"},"audio_codec":{"enum":["wav","flac"]},"passes":{"type":"array","items":{"type":"string"}},"cryptomatte_accurate":{"type":"boolean"}},"additionalProperties":false},
         "marker":{"type":"object","required":["id","name","frame"],"properties":{"id":{"$ref":"#/$defs/id"},"name":{"type":"string"},"frame":{"type":"number"}},"additionalProperties":false},
         "rigid_body_world":{"type":"object","properties":{"enabled":{"type":"boolean"},"gravity":{"$ref":"#/$defs/vec3"},"substeps":{"type":"integer","minimum":1,"maximum":128},"solver_iterations":{"type":"integer","minimum":1,"maximum":128},"frame_start":{"type":"integer","minimum":i32::MIN,"maximum":i32::MAX},"frame_end":{"type":"integer","minimum":i32::MIN,"maximum":i32::MAX},"seed":{"type":"integer","minimum":0,"maximum":u32::MAX}},"additionalProperties":false},
         "rigid_body":{"type":"object","properties":{"type":{"enum":["active","passive"]},"mass":{"type":"number","minimum":0},"friction":{"type":"number","minimum":0},"restitution":{"type":"number","minimum":0,"maximum":1},"shape":{"enum":["box","sphere","convex_hull","mesh"]},"linear_damping":{"type":"number","minimum":0},"angular_damping":{"type":"number","minimum":0},"initial_velocity":{"$ref":"#/$defs/vec3"}},"additionalProperties":false},
@@ -134,10 +137,10 @@ fn scene_schema() -> Value {
         "face":{"type":"object","required":["id","v","material_index"],"properties":{"id":{"type":"integer","minimum":0,"maximum":u32::MAX},"v":{"type":"array","items":{"type":"integer","minimum":0,"maximum":u32::MAX},"minItems":3},"material_index":{"type":"integer","minimum":0,"maximum":u32::MAX}},"additionalProperties":false},
         "mesh":{"type":"object","required":["vertices","edges","faces","attributes","next_id"],"properties":{"vertices":{"type":"array","items":{"$ref":"#/$defs/vertex"}},"edges":{"type":"array","items":{"$ref":"#/$defs/edge"}},"faces":{"type":"array","items":{"$ref":"#/$defs/face"}},"attributes":{"type":"object"},"next_id":{"type":"object","properties":{"vertex":{"type":"integer","minimum":0},"edge":{"type":"integer","minimum":0},"face":{"type":"integer","minimum":0}},"required":["vertex","edge","face"],"additionalProperties":false}},"additionalProperties":false},
         "data_block":{"type":"object","required":["type"],"properties":{"type":{"type":"string"},"descriptor":{"type":["object","null"]},"mesh":{"oneOf":[{"$ref":"#/$defs/mesh"},{"type":"null"}]},"camera":{"oneOf":[{"$ref":"#/$defs/camera"},{"type":"null"}]},"light":{"oneOf":[{"$ref":"#/$defs/light"},{"type":"null"}]},"grease_pencil":{"type":["object","null"]},"armature":{"type":["object","null"]},"shape_keys":{"type":["object","null"]},"vertex_groups":{"type":"array","items":{"type":"object"}},"vertex_weights":{"type":"object"}},"additionalProperties":false},
-        "camera":{"type":"object","required":["projection","lens_mm","sensor_width_mm","ortho_scale","clip_start","clip_end","shift"],"properties":{"projection":{"enum":["perspective","orthographic"]},"lens_mm":{"type":"number"},"sensor_width_mm":{"type":"number"},"ortho_scale":{"type":"number"},"clip_start":{"type":"number"},"clip_end":{"type":"number"},"shift":{"$ref":"#/$defs/vec2"}},"additionalProperties":false},
-        "light":{"type":"object","required":["light_type","color","energy","radius","spot_size","spot_blend"],"properties":{"light_type":{"enum":["point","sun","spot","area"]},"color":{"$ref":"#/$defs/vec3"},"energy":{"type":"number"},"radius":{"type":"number"},"spot_size":{"type":"number"},"spot_blend":{"type":"number"}},"additionalProperties":false},
+        "camera": camera_data_schema(),
+        "light":{"type":"object","required":["light_type","color","energy","radius","spot_size","spot_blend"],"properties":{"light_type":{"enum":["point","sun","spot","area"]},"color":{"$ref":"#/$defs/vec3"},"energy":{"type":"number"},"radius":{"type":"number"},"soft_falloff":{"type":"boolean"},"use_multiple_importance_sampling":{"type":"boolean"},"spread":{"type":"number","minimum":0,"maximum":std::f64::consts::PI},"spot_size":{"type":"number"},"spot_blend":{"type":"number"}},"additionalProperties":false},
         "material":{"type":"object","required":["name","base_color","metallic","roughness","emission_color","emission_strength","transmission","ior","double_sided","node_tree","base_color_texture","roughness_texture","metallic_texture","normal_texture"],"properties":{"name":{"type":"string"},"base_color":{"type":"array","items":{"type":"number","minimum":0,"maximum":1},"minItems":4,"maxItems":4},"metallic":{"type":"number","minimum":0,"maximum":1},"roughness":{"type":"number","minimum":0,"maximum":1},"emission_color":{"$ref":"#/$defs/vec3"},"emission_strength":{"type":"number","minimum":0},"transmission":{"type":"number","minimum":0,"maximum":1},"ior":{"type":"number","exclusiveMinimum":0},"double_sided":{"type":"boolean"},"node_tree":{"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]},"base_color_texture":{"oneOf":[{"$ref":"#/$defs/texture_ref"},{"type":"null"}]},"roughness_texture":{"oneOf":[{"$ref":"#/$defs/texture_ref"},{"type":"null"}]},"metallic_texture":{"oneOf":[{"$ref":"#/$defs/texture_ref"},{"type":"null"}]},"normal_texture":{"oneOf":[{"$ref":"#/$defs/texture_ref"},{"type":"null"}]}},"additionalProperties":false},
-        "texture_ref":{"type":"object","required":["image","interpolation"],"properties":{"image":{"$ref":"#/$defs/id"},"uv_layer":{"type":["string","null"],"minLength":1,"default":null},"interpolation":{"enum":["linear","closest"]}},"additionalProperties":false},
+        "texture_ref":texture_ref,
         "world":{"type":"object","required":["color","strength"],"properties":{"color":{"$ref":"#/$defs/vec3"},"strength":{"type":"number","minimum":0}},"additionalProperties":false},
         "keyframe":keyframe_schema(),
         "fcurve":fcurve_schema(),
@@ -175,7 +178,24 @@ fn scene_schema() -> Value {
         "type":"array",
         "items":{"enum":["data","object"]}
     });
+    root["$defs"]["captured_matrix_basis"] = json!({
+        "type":"object",
+        "required":["matrix_basis","fingerprint"],
+        "properties":{
+            "matrix_basis":{"type":"array","items":{"type":"number"},"minItems":16,"maxItems":16},
+            "fingerprint":{"type":"string"}
+        },
+        "additionalProperties":false
+    });
+    root["$defs"]["node"]["properties"]["blender_matrix_basis"] =
+        json!({"oneOf":[{"$ref":"#/$defs/captured_matrix_basis"},{"type":"null"}]});
     root["$defs"]["data_block"]["properties"]["materials"] = nullable_id_array_schema();
+    root["$defs"]["material"]["properties"]["viewport_display"] = json!({
+        "type":"object",
+        "required":["diffuse_color","roughness","metallic"],
+        "properties":{"diffuse_color":vec_schema(4),"roughness":{"type":"number","minimum":0,"maximum":1},"metallic":{"type":"number","minimum":0,"maximum":1}},
+        "additionalProperties":false
+    });
     complete_scene_schema(&mut root);
     root
 }
@@ -186,8 +206,8 @@ fn complete_scene_schema(root: &mut Value) {
     root["properties"]["masks"] = registry_schema("mask");
     let defs = &mut root["$defs"];
 
-    defs["image_tile"] = json!({"type":"object","required":["number","width","height","blob"],"properties":{"number":{"type":"integer","minimum":1,"maximum":u32::MAX},"width":{"type":"integer","minimum":0,"maximum":u32::MAX},"height":{"type":"integer","minimum":0,"maximum":u32::MAX},"blob":{"type":"string"}},"additionalProperties":false});
-    defs["image"] = json!({"type":"object","required":["name","source","colorspace","width","height","tiles","blob","source_path","source_hash","alpha_mode"],"properties":{"name":{"type":"string"},"source":{"enum":["generated","file","packed"]},"colorspace":{"enum":["srgb","linear","non_color"]},"width":{"type":"integer","minimum":0,"maximum":u32::MAX},"height":{"type":"integer","minimum":0,"maximum":u32::MAX},"tiles":{"type":"array","items":{"$ref":"#/$defs/image_tile"}},"blob":{"type":["string","null"]},"source_path":{"type":["string","null"]},"source_hash":{"type":["string","null"]},"alpha_mode":{"enum":["straight","premultiplied","none"]}},"additionalProperties":false});
+    defs["image_tile"] = json!({"type":"object","required":["number","width","height","blob"],"properties":{"number":{"type":"integer","minimum":1,"maximum":u32::MAX},"width":{"type":"integer","minimum":0,"maximum":u32::MAX},"height":{"type":"integer","minimum":0,"maximum":u32::MAX},"blob":{"type":["string","null"]},"label":{"type":"string"}},"additionalProperties":false});
+    defs["image"] = json!({"type":"object","required":["name","source","colorspace","width","height","tiles","blob","source_path","source_hash","alpha_mode"],"properties":{"name":{"type":"string"},"source":{"enum":["generated","file","packed"]},"colorspace":{"enum":["srgb","linear","non_color"]},"width":{"type":"integer","minimum":0,"maximum":u32::MAX},"height":{"type":"integer","minimum":0,"maximum":u32::MAX},"tiles":{"type":"array","items":{"$ref":"#/$defs/image_tile"}},"blob":{"type":["string","null"]},"source_path":{"type":["string","null"]},"source_hash":{"type":["string","null"]},"alpha_mode":{"enum":["straight","premultiplied","none"]},"tiled":{"type":"boolean"}},"additionalProperties":false});
     defs["mask"] = json!({"type":"object","required":["splines"],"properties":{"splines":{"type":"array","items":{"$ref":"#/$defs/mask_spline"}}},"additionalProperties":false});
     defs["mask_spline"] = json!({"type":"object","required":["points","feather"],"properties":{"points":{"type":"array","minItems":3,"items":{"$ref":"#/$defs/mask_control_point"}},"feather":{"type":"number","minimum":0}},"additionalProperties":false});
     defs["mask_control_point"] = json!({"type":"object","required":["position","keyframes"],"properties":{"position":{"$ref":"#/$defs/vec2"},"keyframes":{"type":"array","items":{"type":"object","required":["frame","position"],"properties":{"frame":{"type":"number"},"position":{"$ref":"#/$defs/vec2"}},"additionalProperties":false}}},"additionalProperties":false});
@@ -195,7 +215,8 @@ fn complete_scene_schema(root: &mut Value) {
     defs["movie_tracking"] = json!({"type":"object","required":["tracks","plane_tracks","camera","reconstruction","objects"],"properties":{"tracks":{"type":"array","items":{"type":"object","required":["id","name","markers"],"properties":{"id":{"type":"string"},"name":{"type":"string"},"markers":{"type":"array","items":{"type":"object","required":["frame","co","pattern_corners","search_area","disabled"],"properties":{"frame":{"type":"number"},"co":{"$ref":"#/$defs/vec2"},"pattern_corners":{"type":"array","items":{"$ref":"#/$defs/vec2"},"minItems":4,"maxItems":4},"search_area":{"type":"array","items":{"$ref":"#/$defs/vec2"},"minItems":4,"maxItems":4},"disabled":{"type":"boolean"}},"additionalProperties":false}}},"additionalProperties":false}},"plane_tracks":{"type":"array","items":{"type":"object","required":["id","name","track_ids","reference_frame","homographies"],"properties":{"id":{"type":"string"},"name":{"type":"string"},"track_ids":{"type":"array","items":{"type":"string"}},"reference_frame":{"type":"number"},"homographies":{"type":"array","items":{"type":"object","required":["frame","matrix"],"properties":{"frame":{"type":"number"},"matrix":{"type":"array","items":{"$ref":"#/$defs/vec3"},"minItems":3,"maxItems":3}},"additionalProperties":false}}},"additionalProperties":false}},"camera":{"type":"object","required":["focal_mm","sensor_width_mm","principal","units","pixel_aspect","distortion_model","k1","k2","k3","division_k1","division_k2","nuke_k1","nuke_k2","nuke_p1","nuke_p2","brown_k1","brown_k2","brown_k3","brown_k4","brown_p1","brown_p2"],"properties":{"focal_mm":{"type":"number"},"sensor_width_mm":{"type":"number"},"principal":{"$ref":"#/$defs/vec2"},"units":{"enum":["PIXELS","MILLIMETERS"]},"pixel_aspect":{"type":"number"},"distortion_model":{"enum":["POLYNOMIAL","DIVISION","NUKE","BROWN"]},"k1":{"type":"number"},"k2":{"type":"number"},"k3":{"type":"number"},"division_k1":{"type":"number"},"division_k2":{"type":"number"},"nuke_k1":{"type":"number"},"nuke_k2":{"type":"number"},"nuke_p1":{"type":"number"},"nuke_p2":{"type":"number"},"brown_k1":{"type":"number"},"brown_k2":{"type":"number"},"brown_k3":{"type":"number"},"brown_k4":{"type":"number"},"brown_p1":{"type":"number"},"brown_p2":{"type":"number"}},"additionalProperties":false},"reconstruction":{"type":"object","required":["cameras","points","is_valid","average_error"],"properties":{"cameras":{"type":"array","items":{"type":"object","required":["frame","matrix","average_error","matrix_is_camera_to_world"],"properties":{"frame":{"type":"integer","minimum":i32::MIN,"maximum":i32::MAX},"matrix":{"type":"array","items":{"type":"array","items":{"type":"number"},"minItems":4,"maxItems":4},"minItems":3,"maxItems":3},"average_error":{"type":"number"},"matrix_is_camera_to_world":{"type":"boolean"}},"additionalProperties":false}},"points":{"type":"array","items":{"type":"object","required":["track","co"],"properties":{"track":{"type":"string"},"co":{"$ref":"#/$defs/vec3"}},"additionalProperties":false}},"is_valid":{"type":"boolean"},"average_error":{"type":"number"}},"additionalProperties":false},"objects":{"type":"array"}},"additionalProperties":false});
     defs["movie_tracking"]["properties"]["objects"]["items"] = json!({"type":"object","required":["id","name","tracks","reconstruction","reconstruction_is_valid","reconstruction_average_error","scale"],"properties":{"id":{"type":"string"},"name":{"type":"string"},"tracks":{"type":"array","items":{"type":"string"}},"reconstruction":{"type":"array","items":{"type":"object","required":["frame","matrix","average_error","matrix_is_camera_to_world"],"properties":{"frame":{"type":"number"},"matrix":{"type":"array","items":{"type":"number"},"minItems":16,"maxItems":16},"average_error":{"type":"number"},"matrix_is_camera_to_world":{"type":"boolean"}},"additionalProperties":false}},"reconstruction_is_valid":{"type":"boolean"},"reconstruction_average_error":{"type":"number"},"scale":{"type":"number"}},"additionalProperties":false});
 
-    defs["color_management"] = json!({"type":"object","required":["display_device","view_transform","look","exposure","gamma","curve"],"properties":{"display_device":{"type":"string"},"view_transform":{"enum":["standard","ag_x","filmic","raw","false_color"]},"look":{"type":"string"},"exposure":{"type":"number"},"gamma":{"type":"number"},"curve":{"type":"array","items":{"$ref":"#/$defs/vec2"}}},"additionalProperties":false});
+    defs["color_management"] = json!({"type":"object","required":["display_device","view_transform","look","exposure","gamma","curve"],"properties":{"display_device":{"type":"string"},"view_transform":{"enum":["standard","ag_x","filmic","raw","false_color"]},"look":{"type":"string"},"exposure":{"type":"number"},"gamma":{"type":"number"},"curve":{"anyOf":[{"type":"null"},{"$ref":"#/$defs/curve_mapping"}]}},"additionalProperties":false});
+    defs["curve_mapping"] = json!({"type":"object","required":["tone","extend_extrapolate","use_clip","clip","black","white","curves"],"properties":{"tone":{"enum":["standard","film_like"]},"extend_extrapolate":{"type":"boolean"},"use_clip":{"type":"boolean"},"clip":{"type":"array","items":{"type":"number"},"minItems":4,"maxItems":4},"black":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},"white":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},"curves":{"type":"array","items":{"type":"object","required":["points"],"properties":{"points":{"type":"array","minItems":2,"items":{"type":"object","required":["location","handle"],"properties":{"location":{"$ref":"#/$defs/vec2"},"handle":{"enum":["auto","auto_clamped","vector"]}},"additionalProperties":false}}},"additionalProperties":false},"minItems":4,"maxItems":4}},"additionalProperties":false});
     defs["sequencer"] = json!({"type":"object","required":["channels","strips"],"properties":{"channels":{"type":"integer","minimum":0,"maximum":u32::MAX},"strips":{"type":"array","items":{"type":"object","required":["id","name","type","channel","frame_start","frame_offset_start","frame_offset_end","length","blend_type","opacity","mute","retiming_keys","modifiers","sound_volume","sound_pan","sound_pitch","source","color","text","transition","inputs","effect"],"properties":{"id":{"type":"string"},"name":{"type":"string"},"type":{"enum":["image","image_sequence","movie","sound","scene","color","text","meta","transition","effect"]},"channel":{"type":"integer","minimum":0,"maximum":u32::MAX},"frame_start":{"type":"number"},"frame_offset_start":{"type":"number"},"frame_offset_end":{"type":"number"},"length":{"type":"number"},"blend_type":{"enum":["replace","alpha_over","add","subtract","multiply"]},"opacity":{"type":"number","minimum":0,"maximum":1},"mute":{"type":"boolean"},"retiming_keys":{"type":"array","items":{"type":"object","required":["frame","source_frame"],"properties":{"frame":{"type":"number"},"source_frame":{"type":"number"}},"additionalProperties":false}},"modifiers":{"type":"array","items":{"type":"object","required":["brightness","contrast","color_balance","curves"],"properties":{"brightness":{"type":"number"},"contrast":{"type":"number"},"color_balance":{"$ref":"#/$defs/vec3"},"curves":{"type":"array","items":{"$ref":"#/$defs/vec2"}}},"additionalProperties":false}},"sound_volume":{"type":"number","minimum":0},"sound_pan":{"type":"number","minimum":-1,"maximum":1},"sound_pitch":{"type":"number","exclusiveMinimum":0},"source":{"type":["string","null"]},"color":{"type":"array","items":{"type":"number"},"minItems":4,"maxItems":4},"text":{"type":["string","null"]},"transition":{"enum":["cross","gamma_cross","wipe",null]},"inputs":{"type":"array","items":{"type":"string"}},"effect":{"enum":["add","subtract","multiply","alpha_over","transform","speed","glow","gaussian_blur",null]}},"additionalProperties":false}}},"additionalProperties":false});
     defs["sequencer"]["properties"]["strips"]["items"]["properties"]["channel"]["minimum"] =
         json!(1);
@@ -241,16 +262,28 @@ fn complete_scene_schema(root: &mut Value) {
         "passes",
         "motion_blur",
         "shutter",
-        "motion_blur_samples"
+        "motion_blur_samples",
+        "dicing_rate",
+        "preview_dicing_rate",
+        "max_subdivisions",
+        "offscreen_dicing_scale"
     ]);
     render["properties"]["motion_blur"] = json!({"type":"boolean"});
     render["properties"]["shutter"] = json!({"type":"number"});
     render["properties"]["motion_blur_samples"] =
         json!({"type":"integer","minimum":0,"maximum":u32::MAX});
+    render["properties"]["dicing_rate"] = json!({"type":"number","minimum":0.1,"maximum":1000.0});
+    render["properties"]["preview_dicing_rate"] =
+        json!({"type":"number","minimum":0.1,"maximum":1000.0});
+    render["properties"]["max_subdivisions"] = json!({"type":"integer","minimum":0,"maximum":16});
+    render["properties"]["offscreen_dicing_scale"] =
+        json!({"type":"number","minimum":1.0,"maximum":f32::MAX});
+    render["properties"]["dicing_camera"] = json!({"oneOf":[id_schema(),{"type":"null"}]});
 
     defs["node"]["properties"]["kind"]["enum"] =
         json!(["empty", "mesh", "camera", "light", "armature"]);
     let material = &mut defs["material"];
+    material["properties"]["use_transparent_shadow"] = json!({"type":"boolean"});
     material["required"] = json!([
         "name",
         "base_color",
@@ -326,7 +359,7 @@ fn complete_data_block_schemas(defs: &mut Value) {
 /// A texture reference: an image, an optional UV layer name (`null` is the render layer), and the
 /// sampler interpolation.
 fn texture_ref_schema() -> Value {
-    json!({"type":"object","required":["image"],"properties":{"image":id_schema(),"uv_layer":{"type":["string","null"],"minLength":1,"default":null},"interpolation":{"enum":["linear","closest"],"default":"linear"}},"additionalProperties":false})
+    json!({"type":"object","required":["image"],"properties":{"image":id_schema(),"uv_layer":{"type":["string","null"],"minLength":1,"default":null},"interpolation":{"enum":["linear","closest"],"default":"linear"},"extension":{"enum":["repeat","extend","clip","mirror"],"default":"repeat"}},"additionalProperties":false})
 }
 
 fn nullable_texture_ref_schema() -> Value {
@@ -884,6 +917,7 @@ fn operation_contract(name: &str) -> OperationContract {
                 "metallic",
                 "roughness",
                 "double_sided",
+                "use_transparent_shadow",
                 "emission_color",
                 "emission_strength",
                 "transmission",
@@ -992,13 +1026,21 @@ fn operation_contract(name: &str) -> OperationContract {
         ),
         "sculpt.stroke" => (
             vec![
-                "target", "scope", "brush", "samples", "falloff", "symmetry", "seed", "delta",
+                "target",
+                "scope",
+                "brush",
+                "deform_type",
+                "samples",
+                "falloff",
+                "symmetry",
+                "delta",
+                "view",
                 "dyntopo",
             ],
             vec!["op", "target", "brush", "samples"],
             "mesh object and stroke samples",
             "shared|single_user for shared data",
-            json!({"falloff":"smooth","symmetry":[],"seed":0}),
+            json!({"symmetry":[]}),
         ),
         "sculpt.dyntopo" => (
             vec![
@@ -1007,13 +1049,12 @@ fn operation_contract(name: &str) -> OperationContract {
                 "samples",
                 "falloff",
                 "symmetry",
-                "seed",
                 "edge_length",
             ],
             vec!["op", "target", "samples", "edge_length"],
             "mesh object and stroke samples",
             "shared|single_user for shared data",
-            json!({"falloff":"smooth","symmetry":[],"seed":0}),
+            json!({"falloff":"smooth","symmetry":[]}),
         ),
         "mesh.transform_elements" => (
             vec![
@@ -1319,8 +1360,8 @@ fn operation_contract(name: &str) -> OperationContract {
         ),
         "paint.texture" => (
             vec![
-                "target", "scope", "image", "uv_layer", "samples", "falloff", "symmetry", "seed",
-                "color", "blend",
+                "target", "scope", "image", "uv_layer", "samples", "falloff", "symmetry", "color",
+                "blend",
             ],
             vec!["op", "target", "image", "samples", "color"],
             "mesh object and UV corners",
@@ -1548,6 +1589,12 @@ fn operation_contract(name: &str) -> OperationContract {
                 "clip_end",
                 "shift",
                 "panorama_type",
+                "longitude_min",
+                "longitude_max",
+                "latitude_min",
+                "latitude_max",
+                "fisheye_fov",
+                "fisheye_lens",
                 "dof_enabled",
                 "focus_distance",
                 "f_stop",
@@ -1583,6 +1630,9 @@ fn operation_contract(name: &str) -> OperationContract {
                 "color",
                 "energy",
                 "radius",
+                "soft_falloff",
+                "use_multiple_importance_sampling",
+                "spread",
                 "spot_size",
                 "spot_blend",
             ],
@@ -1999,17 +2049,19 @@ fn field_schema(operation: &str, field: &str) -> Value {
         return match field {
             "scope" => json!({"enum":["shared","single_user"]}),
             "brush" => {
-                json!({"enum":["draw","clay_strips","inflate","grab","smooth","flatten","pinch","crease","layer","snake_hook","thumb","rotate","nudge","blob","scrape","fill","draw_sharp","elastic_deform","pose_lite","boundary_lite"]})
+                json!({"enum":["draw","clay_strips","inflate","grab","smooth","flatten","pinch","crease","layer","snake_hook","thumb","rotate","nudge","blob","scrape","fill","draw_sharp","elastic_deform","pose","boundary"]})
             }
             "falloff" => {
-                json!({"enum":["smooth","sphere","root","sharp","linear","constant"],"default":"smooth"})
+                json!({"enum":["smooth","smoother","sphere","root","sharp","linear","constant","pow4"],"description":"Falloff curve. Defaults to smoother for clay_strips, pow4 for draw_sharp, and smooth for other brushes."})
+            }
+            "deform_type" => {
+                json!({"enum":["rotate_twist","scale_translate","squash_stretch","bend","expand","inflate","grab","twist","smooth"],"description":"Deform type of the pose or boundary brush. Pose: rotate_twist (default), scale_translate, or squash_stretch; pose twist is refused. Boundary: bend (default), expand, inflate, grab, twist, or smooth. Other brushes refuse it."})
             }
             "samples" => {
                 json!({"type":"array","minItems":1,"items":{"type":"object","required":["position","pressure","radius","strength","time"],"properties":{"position":vec_schema(3),"pressure":{"type":"number","minimum":0,"maximum":1},"radius":{"type":"number","minimum":0},"strength":{"type":"number"},"time":{"type":"number"}},"additionalProperties":false}})
             }
             "symmetry" => json!({"type":"array","items":{"enum":["x","y","z"]},"uniqueItems":true}),
-            "seed" => json!({"type":"integer","minimum":0,"maximum":u64::MAX}),
-            "delta" => vec_schema(3),
+            "delta" | "view" => vec_schema(3),
             "dyntopo" => {
                 json!({"type":"object","required":["edge_length"],"properties":{"edge_length":{"type":"number","exclusiveMinimum":0}},"additionalProperties":false})
             }
@@ -2036,8 +2088,20 @@ fn field_schema(operation: &str, field: &str) -> Value {
     }
     if ["camera.create", "camera.update"].contains(&operation) {
         return match field {
-            "projection" => json!({"enum":["perspective","orthographic","panorama","fisheye"]}),
-            "panorama_type" => json!({"enum":["equirectangular","fisheye_equidistant"]}),
+            "projection" => json!({"enum":["perspective","orthographic","panorama"]}),
+            "panorama_type" => {
+                json!({"enum":["equirectangular","fisheye_equidistant","fisheye_equisolid"]})
+            }
+            "longitude_min" | "longitude_max" => json!({"type":"number"}),
+            "latitude_min" | "latitude_max" => {
+                json!({"type":"number","minimum":-crate::model::BLENDER_RIGHT_ANGLE,"maximum":crate::model::BLENDER_RIGHT_ANGLE})
+            }
+            "fisheye_fov" => {
+                json!({"type":"number","minimum":crate::model::FISHEYE_FOV_MIN,"maximum":crate::model::FISHEYE_FOV_MAX})
+            }
+            "fisheye_lens" => {
+                json!({"type":"number","minimum":crate::model::FISHEYE_LENS_MIN,"maximum":crate::model::FISHEYE_LENS_MAX})
+            }
             "stereo_mode" => json!({"enum":["none","side_by_side","anaglyph"]}),
             "dof_enabled" => json!({"type":"boolean"}),
             "focus_distance" | "f_stop" | "interocular_distance" => {
@@ -2359,6 +2423,7 @@ fn set_schema(operation: &str) -> Value {
             "samples":{"type":"integer","minimum":1,"maximum":1_000_000},
             "seed":{"type":"integer","minimum":0,"maximum":u32::MAX},
             "max_bounces":{"type":"integer","minimum":0,"maximum":1024},
+            "transparent_max_bounces":{"type":"integer","minimum":0,"maximum":1024},
             "film_transparent":{"type":"boolean"},
             "engine":{"enum":["path","realtime"]},
             "use_sequencer":{"type":"boolean"},
@@ -2505,6 +2570,7 @@ fn material_set_properties() -> Value {
         "metallic":{"type":"number","minimum":0,"maximum":1},
         "roughness":{"type":"number","minimum":0,"maximum":1},
         "double_sided":{"type":"boolean"},
+        "use_transparent_shadow":{"type":"boolean"},
         "emission_color":{"type":"array","items":{"type":"number","minimum":0},"minItems":3,"maxItems":3},
         "emission_strength":{"type":"number","minimum":0},
         "transmission":{"type":"number","minimum":0,"maximum":1},
@@ -2524,14 +2590,20 @@ fn material_set_properties() -> Value {
 
 fn camera_set_properties() -> Value {
     json!({
-        "projection":{"enum":["perspective","orthographic","panorama","fisheye"]},
+        "projection":{"enum":["perspective","orthographic","panorama"]},
         "lens_mm":{"type":"number","exclusiveMinimum":0},
         "sensor_width_mm":{"type":"number","exclusiveMinimum":0},
         "ortho_scale":{"type":"number","exclusiveMinimum":0},
         "clip_start":{"type":"number","exclusiveMinimum":0},
         "clip_end":{"type":"number","exclusiveMinimum":0},
         "shift":vec_schema(2),
-        "panorama_type":{"enum":["equirectangular","fisheye_equidistant"]},
+        "panorama_type":{"enum":["equirectangular","fisheye_equidistant","fisheye_equisolid"]},
+        "longitude_min":{"type":"number"},
+        "longitude_max":{"type":"number"},
+        "latitude_min":{"type":"number","minimum":-crate::model::BLENDER_RIGHT_ANGLE,"maximum":crate::model::BLENDER_RIGHT_ANGLE},
+        "latitude_max":{"type":"number","minimum":-crate::model::BLENDER_RIGHT_ANGLE,"maximum":crate::model::BLENDER_RIGHT_ANGLE},
+        "fisheye_fov":{"type":"number","minimum":crate::model::FISHEYE_FOV_MIN,"maximum":crate::model::FISHEYE_FOV_MAX},
+        "fisheye_lens":{"type":"number","minimum":crate::model::FISHEYE_LENS_MIN,"maximum":crate::model::FISHEYE_LENS_MAX},
         "dof_enabled":{"type":"boolean"},
         "focus_distance":{"type":"number","exclusiveMinimum":0},
         "f_stop":{"type":"number","exclusiveMinimum":0},
@@ -2541,8 +2613,17 @@ fn camera_set_properties() -> Value {
     })
 }
 
+/// The schema of camera data as a scene document stores it: every field `CameraData` serialises, with the ranges the camera
+/// operations accept.
+fn camera_data_schema() -> Value {
+    let mut properties = camera_set_properties();
+    properties["sensor_height_mm"] = json!({"type":"number","exclusiveMinimum":0});
+    properties["sensor_fit"] = json!({"enum":["AUTO","HORIZONTAL","VERTICAL"]});
+    json!({"type":"object","properties":properties,"additionalProperties":false})
+}
+
 fn light_set_properties() -> Value {
-    json!({"light_type":{"enum":["point","sun","spot","area"]},"color":{"type":"array","items":{"type":"number","minimum":0},"minItems":3,"maxItems":3},"energy":{"type":"number","minimum":0},"radius":{"type":"number","minimum":0},"spot_size":{"type":"number","exclusiveMinimum":0,"maximum":std::f64::consts::TAU},"spot_blend":{"type":"number","minimum":0,"maximum":1}})
+    json!({"light_type":{"enum":["point","sun","spot","area"]},"color":{"type":"array","items":{"type":"number","minimum":0},"minItems":3,"maxItems":3},"energy":{"type":"number","minimum":0},"radius":{"type":"number","minimum":0},"soft_falloff":{"type":"boolean"},"use_multiple_importance_sampling":{"type":"boolean"},"spread":{"type":"number","minimum":0,"maximum":std::f64::consts::PI},"spot_size":{"type":"number","exclusiveMinimum":0,"maximum":std::f64::consts::TAU},"spot_blend":{"type":"number","minimum":0,"maximum":1}})
 }
 
 fn world_set_properties() -> Value {
@@ -2611,7 +2692,6 @@ mod tests {
         );
         Ok(())
     }
-
     #[test]
     fn modifier_and_constraint_schemas_use_rna_parameter_tables() -> crate::error::Result<()> {
         let modifier_create = schema("operations", Some("modifier.create"))?;

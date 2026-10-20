@@ -539,12 +539,9 @@ fn oracle_cache_params(oracle_case: &Value) -> Result<Value, Box<dyn Error>> {
     params.insert("resource".to_owned(), json!("oracle_cache"));
     for field in [
         "frame_offset",
-        "scale",
         "is_sequence",
         "velocity_name",
         "velocity_unit",
-        "forward_axis",
-        "up_axis",
     ] {
         params.insert(field.to_owned(), cache_file[field].clone());
     }
@@ -554,14 +551,6 @@ fn oracle_cache_params(oracle_case: &Value) -> Result<Value, Box<dyn Error>> {
             cache_file["frame"].clone()
         } else {
             Value::Null
-        },
-    );
-    params.insert(
-        "cache_frame".to_owned(),
-        if cache_file["override_frame"] == true {
-            json!(0.0)
-        } else {
-            cache_file["frame"].clone()
         },
     );
     Ok(Value::Object(params))
@@ -1051,12 +1040,8 @@ fn add_oracle_cache(
         "velocity_name",
         "velocity_unit",
         "frame_offset",
-        "scale",
         "override_frame",
-        "cache_frame",
         "is_sequence",
-        "forward_axis",
-        "up_axis",
     ] {
         assert_eq!(params[field], expected_params[field], "persisted {field}");
     }
@@ -1251,12 +1236,8 @@ fn round_trip_sequence_cache_blend(
         "velocity_name",
         "velocity_unit",
         "frame_offset",
-        "scale",
         "override_frame",
-        "cache_frame",
         "is_sequence",
-        "forward_axis",
-        "up_axis",
     ] {
         assert_eq!(
             modifier.params[field], expected_params[field],

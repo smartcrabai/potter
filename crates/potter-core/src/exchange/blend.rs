@@ -11,7 +11,7 @@ use glam::{DMat4, DQuat, DVec3, EulerRot};
 use serde_json::{Map, Value, json};
 
 use crate::{
-    color::{ColorManagement, ViewTransform},
+    color::{ColorManagement, ViewTransform, curve::CurveMapping},
     error::{ErrorCode, PotError, Result},
     float::{equal_f64, equal_f64_array},
     geom::{
@@ -26,13 +26,13 @@ use crate::{
         CurvePoint, CurveSpline, CurveSplineType, DataBlock, Driver, DriverType, DriverVariable,
         DriverVariableType, Extrapolation, FCurve, ForceField, ForceFieldType, GreasePencilData,
         GreasePencilFrame, GreasePencilLayer, GreasePencilPoint, GreasePencilStroke, Id, Image,
-        ImageAlphaMode, ImageColorspace, ImageSource, Interpolation, Keyframe, Library,
+        ImageAlphaMode, ImageColorspace, ImageSource, ImageTile, Interpolation, Keyframe, Library,
         LibraryKind, LibraryOverride, LibraryOverrideProperty, LibraryStatus, LightData, LightType,
         Material, MaterialLink, Modifier, MovieClip, MovieTracking, NlaBlendType, NlaExtrapolation,
         NlaStrip, NlaTrack, Node, ParentType, Profile, Registry, RenderSettings, RigidBody,
         RigidBodyShape, RigidBodyType, RigidBodyWorld, Scene, SceneDoc, ShapeKey, ShapeKeyData,
         SurfaceData, SurfacePoint, TextObjectData, TimelineMarker, Transform, UnitSettings,
-        VertexGroup, ViewLayer, World,
+        VertexGroup, ViewLayer, ViewportDisplay, World, is_identity_matrix,
     },
     sequencer::{
         EffectType as SequenceEffectType, RetimingKey, Strip as SequenceStrip, StripBlendType,
@@ -44,6 +44,9 @@ use crate::{
 use super::{ExportOptions, ExportReport, ImportedGraph, Loss, is_default_material_graph};
 
 type ImportedResourceAssets = (BTreeMap<String, String>, Vec<(String, Vec<u8>)>);
+
+type PreparedBlendExportResources = (Value, Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>);
+type MultiresGridExport = (Vec<Vec<[f32; 3]>>, Vec<u32>, Vec<usize>);
 
 const BRIDGE: &str = include_str!("blend_bridge.py");
 const MAX_BLEND_VERSION: u32 = 502;
@@ -114,6 +117,7 @@ pub fn export_blend(
     opts: &ExportOptions<'_>,
 ) -> Result<ExportReport> {
     doc.validate()?;
+    check_multires_export_memory(doc, 512 * 1024 * 1024)?;
     let blender = resolve_blender(opts.blender)?;
     check_blender_version(&blender)?;
     let mut losses = export_losses(doc);
@@ -135,16 +139,24 @@ pub fn export_blend(
     fs::create_dir_all(parent).map_err(|error| PotError::io(&error))?;
     let mut document = serde_json::to_value(doc).map_err(PotError::internal_json)?;
     let scene_hash = crate::hash::sha256(&crate::hash::canonicalize(&document)?);
+    add_blender_matrix_basis_fields(doc, &mut document)?;
     add_blender_uv_fields(doc, &mut document)?;
     add_blender_mesh_fields(doc, &mut document)?;
     add_blender_material_slot_fields(doc, &mut document);
     texture_edits.apply(&mut document)?;
     add_blender_shader_graph_ownership(doc, &mut document);
-    let (document, asset_files) = prepare_blend_export_resources(document, project, out)?;
     let input = temporary_path("blend-export-input.json")?;
     let script = temporary_path("blend-bridge.py")?;
     let blend_temp = temporary_blend_path(parent)?;
     let validation = temporary_path("blend-export-validation.json")?;
+    let (document, mut asset_files, multires_sidecars, created_multires_sidecars) =
+        match prepare_blend_export_resources(document, project, out, opts.pack) {
+            Ok(resources) => resources,
+            Err(error) => {
+                cleanup(&[input, script, blend_temp, validation]);
+                return Err(error);
+            }
+        };
     let operation = (|| {
         write_new(
             &input,
@@ -158,6 +170,7 @@ pub fn export_blend(
         )?;
         write_new(&script, BRIDGE.as_bytes())?;
         let exported = run_bridge(&blender, &script, "export", &input, &blend_temp, false)?;
+        patch_exported_multires(&input, &blend_temp)?;
         let validation_child =
             match run_bridge(&blender, &script, "import", &blend_temp, &validation, true) {
                 Ok(output) => output,
@@ -207,7 +220,14 @@ pub fn export_blend(
         Ok(())
     })();
     cleanup(&[input, script, blend_temp, validation]);
-    operation?;
+    if let Err(error) = operation {
+        let _ = remove_multires_sidecars(&created_multires_sidecars);
+        return Err(error);
+    }
+    if opts.pack {
+        remove_multires_sidecars(&created_multires_sidecars)?;
+        asset_files.retain(|file| !multires_sidecars.contains(file));
+    }
 
     let (scene_count, object_count, mesh_count, material_count, action_count) = (
         doc.scenes.len(),
@@ -239,6 +259,28 @@ pub fn export_blend(
             .collect(),
         losses,
     })
+}
+
+/// Supplies only validated local authoring matrices to the bridge. The serialized model capture
+/// remains internal; the bridge receives a flat column-major `matrix_basis` only when current.
+fn add_blender_matrix_basis_fields(doc: &SceneDoc, document: &mut Value) -> Result<()> {
+    let nodes = document
+        .get_mut("nodes")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| PotError::new(ErrorCode::InternalError, "serialized scene has no nodes"))?;
+    for serialized in nodes.values_mut().filter_map(Value::as_object_mut) {
+        serialized.remove("blender_matrix_basis");
+        serialized.remove("matrix_basis");
+    }
+    for (id, node) in &doc.nodes {
+        let Some(serialized) = nodes.get_mut(id.as_str()).and_then(Value::as_object_mut) else {
+            continue;
+        };
+        if let Some(matrix_basis) = node.captured_matrix_basis(&node.transform)? {
+            serialized.insert("matrix_basis".to_owned(), json!(matrix_basis));
+        }
+    }
+    Ok(())
 }
 
 /// Writes the Blender-convention UV fields of every mesh data-block into the document sent to the
@@ -581,7 +623,8 @@ fn prepare_blend_export_resources(
     mut document: Value,
     project: &Project,
     out: &Path,
-) -> Result<(Value, Vec<PathBuf>)> {
+    pack: bool,
+) -> Result<PreparedBlendExportResources> {
     let original_blend_path = document
         .get("compatibility")
         .and_then(Value::as_object)
@@ -620,6 +663,8 @@ fn prepare_blend_export_resources(
     let sidecar = parent.join(format!("{stem}_assets"));
     let mut sidecar_created = false;
     let mut files = Vec::new();
+    let mut multires_sidecars = Vec::new();
+    let mut created_multires_sidecars = Vec::new();
     let library_base = library_layout_base(&document);
     for id in resource_ids {
         let resource = document
@@ -742,7 +787,660 @@ fn prepare_blend_export_resources(
         }
     }
     add_blender_image_pixels(&mut document, project)?;
-    Ok((document, files))
+
+    prepare_multires_external_sidecars(
+        &mut document,
+        out,
+        &sidecar,
+        &mut files,
+        &mut multires_sidecars,
+        &mut created_multires_sidecars,
+        pack,
+    )?;
+    Ok((
+        document,
+        files,
+        multires_sidecars,
+        created_multires_sidecars,
+    ))
+}
+
+fn remove_multires_sidecars(files: &[PathBuf]) -> Result<()> {
+    let mut parents = BTreeSet::new();
+    for file in files.iter().cloned().collect::<BTreeSet<_>>() {
+        fs::remove_file(&file).map_err(|error| PotError::io(&error))?;
+        if let Some(parent) = file.parent() {
+            parents.insert(parent.to_path_buf());
+        }
+    }
+    for parent in parents {
+        let mut entries = fs::read_dir(&parent).map_err(|error| PotError::io(&error))?;
+        match entries.next() {
+            None => fs::remove_dir(&parent).map_err(|error| PotError::io(&error))?,
+            Some(Ok(_)) => {}
+            Some(Err(error)) => return Err(PotError::io(&error)),
+        }
+    }
+    Ok(())
+}
+
+fn prepare_multires_external_sidecars(
+    document: &mut Value,
+    out: &Path,
+    sidecar: &Path,
+    files: &mut Vec<PathBuf>,
+    multires_sidecars: &mut Vec<PathBuf>,
+    created_multires_sidecars: &mut Vec<PathBuf>,
+    pack: bool,
+) -> Result<()> {
+    let sidecar_existed = sidecar.exists();
+    let result = prepare_multires_external_sidecars_inner(
+        document,
+        out,
+        sidecar,
+        files,
+        multires_sidecars,
+        created_multires_sidecars,
+        pack,
+    );
+    if result.is_err() {
+        let _ = remove_multires_sidecars(created_multires_sidecars);
+        created_multires_sidecars.clear();
+        if !sidecar_existed {
+            let _ = fs::remove_dir(sidecar);
+        }
+    }
+    result
+}
+
+fn prepare_multires_external_sidecars_inner(
+    document: &mut Value,
+    out: &Path,
+    sidecar: &Path,
+    files: &mut Vec<PathBuf>,
+    multires_sidecars: &mut Vec<PathBuf>,
+    created_multires_sidecars: &mut Vec<PathBuf>,
+    pack: bool,
+) -> Result<()> {
+    let mut exports = Vec::new();
+    if let Some(data_blocks) = document.get("data_blocks").and_then(Value::as_object) {
+        for (data_id, data) in data_blocks {
+            let Some(mesh) = data.get("mesh").filter(|mesh| mesh.is_object()) else {
+                continue;
+            };
+            let Some(record) = mesh
+                .get("attributes")
+                .and_then(Value::as_object)
+                .and_then(|attributes| attributes.get("multires_displacement"))
+            else {
+                continue;
+            };
+            let has_multires_modifier = document
+                .get("nodes")
+                .and_then(Value::as_object)
+                .is_some_and(|nodes| {
+                    nodes.values().any(|node| {
+                        node.get("data").and_then(Value::as_str) == Some(data_id)
+                            && node.get("modifiers").and_then(Value::as_array).is_some_and(
+                                |modifiers| {
+                                    modifiers.iter().any(|modifier| {
+                                        modifier.get("type").and_then(Value::as_str)
+                                            == Some("multires")
+                                    })
+                                },
+                            )
+                    })
+                });
+            if !has_multires_modifier {
+                continue;
+            }
+            let total_levels = record
+                .get("total_levels")
+                .and_then(Value::as_u64)
+                .and_then(|levels| u32::try_from(levels).ok())
+                .filter(|levels| (1..=13).contains(levels))
+                .ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::SceneInvalid,
+                        "multires_displacement.total_levels must be between 1 and 13",
+                    )
+                })?;
+            let Some(values) = record.get("values") else {
+                if let Some(filepath) = record
+                    .get("external")
+                    .and_then(|external| external.get("filepath"))
+                    .and_then(Value::as_str)
+                {
+                    return Err(PotError::with_details(
+                        ErrorCode::FileNotFound,
+                        "multires external grid values are unavailable for export",
+                        json!({"data_block": data_id, "filepath": filepath}),
+                    ));
+                }
+                continue;
+            };
+            let auxiliary_bytes = multires_auxiliary_memory_bytes(record)?;
+            let (grids, loop_levels, _) = multires_grids_for_export(
+                mesh,
+                values,
+                total_levels,
+                record.get("grid_levels"),
+                auxiliary_bytes,
+            )?;
+            if pack {
+                // Packed exports embed these grids in the .blend; no sidecar is written.
+                continue;
+            }
+            crate::geom::multires_external::require_top_level_corners(
+                &loop_levels,
+                total_levels,
+                ErrorCode::UnrepresentableFeature,
+            )?;
+            let bytes = crate::geom::multires_external::write_external_grids(&grids, total_levels)?;
+            let filename = record
+                .get("external")
+                .and_then(|external| external.get("filepath"))
+                .and_then(Value::as_str)
+                .and_then(|filepath| {
+                    Path::new(filepath.strip_prefix("//").unwrap_or(filepath))
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                })
+                .filter(|name| {
+                    *name != "."
+                        && *name != ".."
+                        && Path::new(name).file_name().and_then(|value| value.to_str())
+                            == Some(*name)
+                })
+                .unwrap_or("multires.btx")
+                .to_owned();
+            let digest = crate::hash::sha256(&bytes);
+            exports.push((data_id.clone(), total_levels, filename, bytes, digest));
+        }
+    }
+    if exports.is_empty() {
+        return Ok(());
+    }
+    fs::create_dir_all(sidecar).map_err(|error| PotError::io(&error))?;
+    let output_parent = out
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    for (data_id, total_levels, filename, bytes, digest) in exports {
+        let destination = sidecar_destination(sidecar, &filename, &digest, &bytes)?;
+        let created = !destination.is_file();
+        if created {
+            write_asset_sidecar(&destination, &bytes)?;
+            created_multires_sidecars.push(destination.clone());
+        }
+        let relative_path = destination.strip_prefix(output_parent).map_err(|_| {
+            PotError::new(
+                ErrorCode::ExportFailed,
+                "multires external sidecar is outside the Blender output directory",
+            )
+        })?;
+        let blender_filepath = format!("//{}", relative_path.to_string_lossy().replace('\\', "/"));
+        if !files.contains(&destination) {
+            files.push(destination.clone());
+        }
+        if !multires_sidecars.contains(&destination) {
+            multires_sidecars.push(destination.clone());
+        }
+
+        if let Some(record) = document
+            .get_mut("data_blocks")
+            .and_then(Value::as_object_mut)
+            .and_then(|data_blocks| data_blocks.get_mut(&data_id))
+            .and_then(|data| data.get_mut("mesh"))
+            .and_then(|mesh| mesh.get_mut("attributes"))
+            .and_then(Value::as_object_mut)
+            .and_then(|attributes| attributes.get_mut("multires_displacement"))
+            .and_then(Value::as_object_mut)
+        {
+            record.insert("external".to_owned(), json!({"filepath": blender_filepath}));
+        }
+        if let Some(nodes) = document.get_mut("nodes").and_then(Value::as_object_mut) {
+            for node in nodes.values_mut() {
+                if node.get("data").and_then(Value::as_str) != Some(data_id.as_str()) {
+                    continue;
+                }
+                let Some(modifiers) = node.get_mut("modifiers").and_then(Value::as_array_mut)
+                else {
+                    continue;
+                };
+                for modifier in modifiers {
+                    if modifier.get("type").and_then(Value::as_str) != Some("multires") {
+                        continue;
+                    }
+                    let params = modifier
+                        .as_object_mut()
+                        .ok_or_else(|| {
+                            PotError::new(
+                                ErrorCode::SceneInvalid,
+                                "multires modifier record must be an object",
+                            )
+                        })?
+                        .entry("params")
+                        .or_insert_with(|| Value::Object(Map::new()))
+                        .as_object_mut()
+                        .ok_or_else(|| {
+                            PotError::new(
+                                ErrorCode::SceneInvalid,
+                                "multires modifier params must be an object",
+                            )
+                        })?;
+                    params.insert("filepath".to_owned(), json!(blender_filepath));
+                    params.insert("is_external".to_owned(), Value::Bool(true));
+                    params.insert("total_levels".to_owned(), Value::from(total_levels));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn multires_grids_for_export(
+    mesh: &Value,
+    values: &Value,
+    total_levels: u32,
+    grid_levels: Option<&Value>,
+    auxiliary_bytes: u64,
+) -> Result<MultiresGridExport> {
+    let faces = mesh
+        .get("faces")
+        .and_then(Value::as_array)
+        .ok_or_else(|| PotError::new(ErrorCode::SceneInvalid, "multires mesh faces are invalid"))?;
+    let values = values.as_object().ok_or_else(|| {
+        PotError::new(
+            ErrorCode::SceneInvalid,
+            "multires_displacement.values must be keyed by face ID",
+        )
+    })?;
+    if values.len() != faces.len() {
+        return Err(PotError::new(
+            ErrorCode::SceneInvalid,
+            "multires_displacement.values must contain every mesh face",
+        ));
+    }
+    let corner_count = faces.iter().try_fold(0_usize, |count, face| {
+        count.checked_add(face.get("v")?.as_array()?.len())
+    });
+    let corner_count = corner_count.ok_or_else(|| {
+        PotError::new(
+            ErrorCode::SceneInvalid,
+            "multires mesh corner count is invalid or overflows",
+        )
+    })?;
+    let levels = match grid_levels {
+        Some(grid_levels) => {
+            let grid_levels = grid_levels
+                .as_array()
+                .filter(|levels| levels.len() == corner_count)
+                .ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::SceneInvalid,
+                        "multires_displacement.grid_levels must match mesh corners",
+                    )
+                })?;
+            grid_levels
+                .iter()
+                .map(|level| {
+                    level
+                        .as_u64()
+                        .and_then(|level| u32::try_from(level).ok())
+                        .filter(|level| (1..=total_levels).contains(level))
+                        .ok_or_else(|| {
+                            PotError::new(
+                                ErrorCode::SceneInvalid,
+                                "multires_displacement.grid_levels contains an invalid level",
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?
+        }
+        None => vec![total_levels; corner_count],
+    };
+    let grid_vectors = levels
+        .iter()
+        .map(|&level| crate::geom::multires_external::grid_vector_count(level))
+        .collect::<Result<Vec<_>>>()?;
+    let external_size =
+        crate::geom::multires_external::expected_external_file_size(total_levels, corner_count)?;
+    let samples = grid_vectors
+        .iter()
+        .try_fold(0_u128, |count, &length| {
+            count.checked_add(u128::try_from(length).ok()?)
+        })
+        .ok_or_else(|| {
+            PotError::new(
+                ErrorCode::LimitExceeded,
+                "multires export sample count overflows",
+            )
+        })?;
+    let serialized_json = u64::try_from(samples.checked_mul(80).ok_or_else(|| {
+        PotError::new(
+            ErrorCode::LimitExceeded,
+            "multires JSON output size overflows",
+        )
+    })?)
+    .map_err(|_| {
+        PotError::new(
+            ErrorCode::LimitExceeded,
+            "multires JSON output size exceeds u64",
+        )
+    })?;
+    let additional_bytes = external_size
+        .checked_add(auxiliary_bytes)
+        .and_then(|bytes| bytes.checked_add(serialized_json))
+        .ok_or_else(|| {
+            PotError::new(
+                ErrorCode::LimitExceeded,
+                "multires export memory estimate overflows",
+            )
+        })?;
+    crate::geom::modifiers::multires::check_grid_capacity_for_grids(
+        &grid_vectors,
+        None,
+        None,
+        additional_bytes,
+    )?;
+
+    let mut source_corner_for_loop = vec![usize::MAX; corner_count];
+    if let Some(order_value) = mesh
+        .get("attributes")
+        .and_then(Value::as_object)
+        .and_then(|attributes| attributes.get("custom_normal"))
+        .and_then(Value::as_object)
+        .and_then(|normal| normal.get("corner_order"))
+    {
+        let order = order_value.as_object().ok_or_else(|| {
+            PotError::new(
+                ErrorCode::SceneInvalid,
+                "custom_normal.corner_order must be face-keyed",
+            )
+        })?;
+        let mut source_corner = 0_usize;
+        for face in faces {
+            let face_id = face.get("id").and_then(Value::as_u64).ok_or_else(|| {
+                PotError::new(ErrorCode::SceneInvalid, "multires face ID is invalid")
+            })?;
+            let face_corners = face.get("v").and_then(Value::as_array).ok_or_else(|| {
+                PotError::new(ErrorCode::SceneInvalid, "multires face corners are invalid")
+            })?;
+            let ordinals = order
+                .get(&format!("f{face_id}"))
+                .and_then(Value::as_array)
+                .filter(|ordinals| ordinals.len() == face_corners.len())
+                .ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::SceneInvalid,
+                        format!("custom_normal.corner_order of f{face_id} has invalid corners"),
+                    )
+                })?;
+            for ordinal in ordinals {
+                let loop_index = ordinal
+                    .as_u64()
+                    .and_then(|index| usize::try_from(index).ok())
+                    .filter(|index| *index < corner_count)
+                    .ok_or_else(|| {
+                        PotError::new(
+                            ErrorCode::SceneInvalid,
+                            "custom_normal.corner_order entries must be valid loop ordinals",
+                        )
+                    })?;
+                if source_corner_for_loop[loop_index] != usize::MAX {
+                    return Err(PotError::new(
+                        ErrorCode::SceneInvalid,
+                        "custom_normal.corner_order must be a loop ordinal permutation",
+                    ));
+                }
+                source_corner_for_loop[loop_index] = source_corner;
+                source_corner += 1;
+            }
+        }
+        if source_corner != corner_count {
+            return Err(PotError::new(
+                ErrorCode::SceneInvalid,
+                "custom_normal.corner_order must cover every mesh corner",
+            ));
+        }
+    } else {
+        source_corner_for_loop
+            .iter_mut()
+            .enumerate()
+            .for_each(|(index, source_corner)| *source_corner = index);
+    }
+
+    let mut grids = Vec::with_capacity(corner_count);
+    let mut storage_corner = 0_usize;
+    for face in faces {
+        let face_id = face
+            .get("id")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| PotError::new(ErrorCode::SceneInvalid, "multires face ID is invalid"))?;
+        let face_corners = face.get("v").and_then(Value::as_array).ok_or_else(|| {
+            PotError::new(ErrorCode::SceneInvalid, "multires face corners are invalid")
+        })?;
+        let face_values = values
+            .get(&format!("f{face_id}"))
+            .and_then(Value::as_array)
+            .filter(|corners| corners.len() == face_corners.len())
+            .ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::SceneInvalid,
+                    format!("multires face f{face_id} has invalid corner grids"),
+                )
+            })?;
+        for (corner, raw_grid) in face_values.iter().enumerate() {
+            let grid_vectors = grid_vectors[storage_corner];
+            let raw_grid = raw_grid
+                .as_array()
+                .filter(|grid| grid.len() == grid_vectors)
+                .ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::SceneInvalid,
+                        format!("multires grid f{face_id}[{corner}] has an invalid size"),
+                    )
+                })?;
+            let mut grid = Vec::with_capacity(grid_vectors);
+            for (sample, raw_vector) in raw_grid.iter().enumerate() {
+                let components = raw_vector
+                    .as_array()
+                    .filter(|components| components.len() == 3)
+                    .ok_or_else(|| {
+                        PotError::new(
+                            ErrorCode::SceneInvalid,
+                            format!("multires vector f{face_id}[{corner}][{sample}] is invalid"),
+                        )
+                    })?;
+                let mut vector = [0.0_f32; 3];
+                for (axis, component) in components.iter().enumerate() {
+                    let value = component
+                        .as_f64()
+                        .filter(|value| value.is_finite())
+                        .ok_or_else(|| {
+                            PotError::new(
+                                ErrorCode::SceneInvalid,
+                                "multires displacement components must be finite numbers",
+                            )
+                        })?;
+                    vector[axis] = value as f32;
+                    if !vector[axis].is_finite() {
+                        return Err(PotError::new(
+                            ErrorCode::SceneInvalid,
+                            "multires displacement component exceeds the f32 range",
+                        ));
+                    }
+                }
+                grid.push(vector);
+            }
+            grids.push(grid);
+            storage_corner += 1;
+        }
+    }
+    let loop_levels = source_corner_for_loop
+        .iter()
+        .map(|&source_corner| levels[source_corner])
+        .collect::<Vec<_>>();
+    if source_corner_for_loop
+        .iter()
+        .enumerate()
+        .any(|(loop_index, source_corner)| loop_index != *source_corner)
+    {
+        let mut loop_grids = Vec::with_capacity(corner_count);
+        for source_corner in &source_corner_for_loop {
+            loop_grids.push(std::mem::take(&mut grids[*source_corner]));
+        }
+        grids = loop_grids;
+    }
+    Ok((grids, loop_levels, source_corner_for_loop))
+}
+
+fn reorder_multires_loop_values(
+    raw: &Value,
+    source_corners: &[usize],
+    field: &str,
+) -> Result<Value> {
+    let values = raw
+        .as_array()
+        .filter(|values| values.len() == source_corners.len())
+        .ok_or_else(|| {
+            PotError::new(
+                ErrorCode::SceneInvalid,
+                format!("multires {field} grids are invalid"),
+            )
+        })?;
+    Ok(Value::Array(
+        source_corners
+            .iter()
+            .map(|&source| values[source].clone())
+            .collect(),
+    ))
+}
+
+/// Blender mesh datablock name the bridge gives a Potter mesh, mirroring
+/// `compatibility_name` in `blend_bridge.py`: the `Mesh:<name>` compatibility mapping whose
+/// value is the data ID, otherwise the data ID itself.
+fn blender_mesh_name(doc: &Value, data_id: &str) -> String {
+    doc.get("compatibility")
+        .and_then(|compat| compat.get("blender_adapter"))
+        .and_then(|adapter| adapter.get("id_mappings"))
+        .and_then(Value::as_object)
+        .and_then(|mappings| {
+            mappings.iter().find_map(|(key, value)| {
+                (value.as_str() == Some(data_id))
+                    .then(|| key.strip_prefix("Mesh:"))
+                    .flatten()
+                    .map(str::to_owned)
+            })
+        })
+        .unwrap_or_else(|| data_id.to_owned())
+}
+
+fn patch_exported_multires(input: &Path, blend_file: &Path) -> Result<()> {
+    let payload: Value =
+        serde_json::from_reader(fs::File::open(input).map_err(|error| PotError::io(&error))?)
+            .map_err(PotError::internal_json)?;
+    let doc = payload
+        .get("doc")
+        .ok_or_else(|| invalid_intermediate("multires export input has no document"))?;
+    let data_ids = doc
+        .get("nodes")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|nodes| nodes.values())
+        .filter(|node| {
+            node.get("modifiers")
+                .and_then(Value::as_array)
+                .is_some_and(|modifiers| {
+                    modifiers.iter().any(|modifier| {
+                        modifier.get("type").and_then(Value::as_str) == Some("multires")
+                    })
+                })
+        })
+        .filter_map(|node| node.get("data").and_then(Value::as_str).map(str::to_owned))
+        .collect::<BTreeSet<_>>();
+    if data_ids.is_empty() {
+        return Ok(());
+    }
+    let output_bytes = fs::metadata(blend_file)
+        .map_err(|error| PotError::io(&error))?
+        .len();
+    let mut blend_bytes = fs::read(blend_file).map_err(|error| PotError::io(&error))?;
+    for data_id in data_ids {
+        let Some(data) = doc
+            .get("data_blocks")
+            .and_then(Value::as_object)
+            .and_then(|blocks| blocks.get(&data_id))
+        else {
+            continue;
+        };
+        let Some(mesh) = data.get("mesh").filter(|mesh| mesh.is_object()) else {
+            continue;
+        };
+        let Some(record) = mesh
+            .get("attributes")
+            .and_then(Value::as_object)
+            .and_then(|attributes| attributes.get("multires_displacement"))
+        else {
+            continue;
+        };
+        let Some(values) = record.get("values") else {
+            continue;
+        };
+        let total_levels = record
+            .get("total_levels")
+            .and_then(Value::as_u64)
+            .and_then(|levels| u32::try_from(levels).ok())
+            .filter(|levels| (1..=13).contains(levels))
+            .ok_or_else(|| {
+                PotError::new(ErrorCode::SceneInvalid, "multires total_levels is invalid")
+            })?;
+        let auxiliary_bytes = multires_auxiliary_memory_bytes(record)?
+            .checked_add(output_bytes)
+            .ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::LimitExceeded,
+                    "multires patch memory estimate overflows",
+                )
+            })?;
+        let (grids, grid_levels, source_corners) = multires_grids_for_export(
+            mesh,
+            values,
+            total_levels,
+            record.get("grid_levels"),
+            auxiliary_bytes,
+        )?;
+        let mesh_name = blender_mesh_name(doc, &data_id);
+        let mut patch = Map::new();
+        patch.insert("total_levels".to_owned(), Value::from(total_levels));
+        patch.insert("grid_levels".to_owned(), json!(grid_levels));
+        patch.insert(
+            "values".to_owned(),
+            serde_json::to_value(grids).map_err(PotError::internal_json)?,
+        );
+        for field in ["paint_mask", "hidden"] {
+            if let Some(raw) = record.get(field) {
+                patch.insert(
+                    field.to_owned(),
+                    reorder_multires_loop_values(raw, &source_corners, field)?,
+                );
+            }
+        }
+        super::blend_dna::patch_multires_export_data(
+            &mut blend_bytes,
+            &mesh_name,
+            &Value::Object(patch),
+        )
+        .map_err(|error| {
+            PotError::with_details(
+                ErrorCode::ExportFailed,
+                format!("could not restore native multires data in Blender output: {error}"),
+                json!({"mesh":mesh_name}),
+            )
+        })?;
+    }
+    fs::write(blend_file, blend_bytes).map_err(|error| PotError::io(&error))
 }
 
 /// Libraries reference each other with paths relative to their own file, so
@@ -772,7 +1470,10 @@ fn add_blender_image_pixels(document: &mut Value, project: &Project) -> Result<(
     for image_json in images.values_mut() {
         let image: Image =
             serde_json::from_value(image_json.clone()).map_err(PotError::internal_json)?;
-        if image.blob.is_none() && image.source_path.as_deref().is_none_or(str::is_empty) {
+        if image.blob.is_none()
+            && image.source_path.as_deref().is_none_or(str::is_empty)
+            && !image.base_is_missing()
+        {
             continue;
         }
         let data = crate::image::load_image_data(
@@ -780,10 +1481,22 @@ fn add_blender_image_pixels(document: &mut Value, project: &Project) -> Result<(
             project.path(),
             crate::image::ImageInterpolation::Linear,
         )?;
-        image_json["pixels"] = json!(blender_image_pixels(&image, data.width, &data.pixels));
-        if let Some(png) = eight_bit_png_bytes(&image, project)? {
-            image_json["png_bytes"] = json!(png);
+        // The stored values, with the alpha mode the Blender datablock gets: a premultiplied EXR stays associated, and a
+        // straight image is straight, so Blender's packed file and its alpha mode agree (`_pack_image`). A UDIM image is
+        // sent as its tiles only: the base is tile 1001 among them, so its pixels are not sent twice.
+        if image.is_udim() {
+            image_json["udim_tiles"] = udim_export_tiles(&image, &data, project)?;
+        } else {
+            image_json["pixels"] = json!(blender_image_pixels(&image, data.width, &data.pixels));
+            if let Some(png) = eight_bit_png_bytes(&image, project)? {
+                image_json["png_bytes"] = json!(png);
+            }
         }
+        image_json["alpha_mode"] = json!(match image.alpha_mode {
+            crate::model::ImageAlphaMode::Straight => "straight",
+            crate::model::ImageAlphaMode::Premultiplied => "premultiplied",
+            crate::model::ImageAlphaMode::None => "none",
+        });
     }
     Ok(())
 }
@@ -792,11 +1505,14 @@ fn add_blender_image_pixels(document: &mut Value, project: &Project) -> Result<(
 /// unchanged, so the reopened values are the file's own 8-bit values; a float save would convert them. Only the
 /// PNG signature and the IHDR bit depth (byte 24, after 8 signature, 4 length, 4 type, 8 size bytes) decide.
 fn eight_bit_png_bytes(image: &Image, project: &Project) -> Result<Option<Vec<u8>>> {
-    let Some(hex) = image
+    image
         .blob
         .as_deref()
-        .and_then(|blob| blob.strip_prefix("sha256:"))
-    else {
+        .map_or(Ok(None), |blob| eight_bit_png_blob(blob, project))
+}
+
+fn eight_bit_png_blob(blob: &str, project: &Project) -> Result<Option<Vec<u8>>> {
+    let Some(hex) = blob.strip_prefix("sha256:") else {
         return Ok(None);
     };
     let path = project
@@ -808,6 +1524,81 @@ fn eight_bit_png_bytes(image: &Image, project: &Project) -> Result<Option<Vec<u8
     let bytes = fs::read(&path).map_err(|error| PotError::io(&error))?;
     let is_png = bytes.starts_with(b"\x89PNG\r\n\x1a\n");
     Ok((is_png && bytes.get(24) == Some(&8)).then_some(bytes))
+}
+
+/// The UDIM tiles of an image for Blender's packed TILED image, base tile 1001 included. When every tile is an 8-bit
+/// PNG, each carries its original bytes, so Blender samples the same byte path as the source. Otherwise every tile
+/// carries its float pixels and is written as EXR.
+// shortcut: a set with any non-PNG tile re-encodes every tile as EXR, since one TILED image has one file extension,
+// and a linked base without a blob is not packed as PNG; upgrade when Blender tiles carry per-tile formats.
+fn udim_export_tiles(
+    image: &Image,
+    data: &crate::image::ImageData,
+    project: &Project,
+) -> Result<Value> {
+    let mut sources = Vec::with_capacity(image.tiles.len() + 1);
+    // A missing base has no size and no pixels to pack; Blender then samples tile 1001 as unlisted, as it does here.
+    if data.width != 0 && data.height != 0 {
+        sources.push((
+            1001,
+            data.width,
+            data.height,
+            data.pixels.as_slice(),
+            eight_bit_png_bytes(image, project)?,
+        ));
+    }
+    for tile in &image.tiles {
+        // A missing tile has no pixels to pack, and Blender samples its number as unlisted, which renders the same
+        // missing colour; `export_losses` reports the tile.
+        let Some(decoded) = data.tiles.get(&tile.number) else {
+            continue;
+        };
+        let png = match tile.blob.as_deref() {
+            Some(blob) => eight_bit_png_blob(blob, project)?,
+            None => None,
+        };
+        sources.push((
+            tile.number,
+            decoded.width,
+            decoded.height,
+            decoded.pixels.as_slice(),
+            png,
+        ));
+    }
+    // A UDIM image with no loadable tile is written as a TILED placeholder with no files. Blender holds such an image
+    // (its `<UDIM>` filepath names nothing), and the missing base and tiles are reported as export losses.
+    if sources.is_empty() {
+        return Ok(json!({"format": "placeholder", "tiles": []}));
+    }
+    let all_png = sources.iter().all(|source| source.4.is_some());
+    let mut tiles = sources
+        .into_iter()
+        .map(|(number, width, height, pixels, png)| match png {
+            Some(bytes) if all_png => {
+                json!({"number": number, "width": width, "height": height, "png_bytes": bytes})
+            }
+            _ => json!({
+                "number": number,
+                "width": width,
+                "height": height,
+                "pixels": blender_image_pixels(image, width, pixels),
+            }),
+        })
+        .collect::<Vec<_>>();
+    // A tile's label goes with its record. The base tile has no record, so it carries no label.
+    for tile_json in &mut tiles {
+        let number = tile_json["number"].as_u64();
+        let label = image
+            .tiles
+            .iter()
+            .find(|tile| Some(u64::from(tile.number)) == number)
+            .map(|tile| tile.label.as_str())
+            .filter(|label| !label.is_empty());
+        if let Some(label) = label {
+            tile_json["label"] = json!(label);
+        }
+    }
+    Ok(json!({"format": if all_png { "png" } else { "exr" }, "tiles": tiles}))
 }
 
 /// Potter's decoded pixels in Blender's image layout. Potter stores rows top-down and scene-linear values; Blender's
@@ -825,7 +1616,6 @@ fn blender_image_pixels(image: &Image, width: u32, pixels: &[[f64; 4]]) -> Vec<[
     }
     rows
 }
-
 fn resolve_export_resource_path(project: &Project, uri: &str) -> Option<PathBuf> {
     if uri.is_empty() || (uri.contains("://") && !uri.starts_with("file://")) {
         return None;
@@ -907,7 +1697,20 @@ pub fn import_blend(file: &Path, blender: Option<&Path>) -> Result<ImportedGraph
     let output = temporary_path("blend-import-output.json")?;
     let operation = (|| {
         write_new(&script, BRIDGE.as_bytes())?;
-        let child = run_bridge(&blender, &script, "import", file, &output, true)?;
+        let child = match run_bridge(&blender, &script, "import", file, &output, true) {
+            Ok(child) => child,
+            Err(error) if error.code == ErrorCode::ImportFailed => {
+                let missing_sidecar = fs::read(file)
+                    .ok()
+                    .and_then(|bytes| super::blend_dna::read_multires_displacements(&bytes).ok())
+                    .and_then(|native_multires| {
+                        missing_adjacent_multires_sidecar(file, &native_multires)
+                    });
+                return Err(missing_sidecar.unwrap_or(error));
+            }
+            Err(error) => return Err(error),
+        };
+
         let bytes = match fs::read(&output) {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -946,6 +1749,16 @@ pub fn import_blend(file: &Path, blender: Option<&Path>) -> Result<ImportedGraph
                     json!({"file": file.display().to_string()}),
                 )
             })?;
+        let mut native_multires = super::blend_dna::read_multires_displacements(&original)
+            .map_err(|error| {
+                PotError::with_details(
+                    ErrorCode::ImportFailed,
+                    format!("could not read native Blender multires data: {error}"),
+                    json!({"file": file.display().to_string()}),
+                )
+            })?;
+        load_external_multires(&raw, &mut native_multires, file)?;
+        attach_native_multires(&mut raw, &mut native_multires)?;
         attach_native_target_vertices(&mut raw, &mut native_bindings)?;
         build_imported_graph(&raw, file, original, &native_bindings)
     })();
@@ -1006,8 +1819,598 @@ fn attach_native_target_vertices(
             }
         }
     }
+
     Ok(())
 }
+fn attach_native_multires(
+    raw: &mut Value,
+    native_multires: &mut BTreeMap<String, Value>,
+) -> Result<()> {
+    let mut modifier_data = BTreeMap::<String, (Value, Option<String>)>::new();
+    if let Some(meshes) = raw.get_mut("meshes").and_then(Value::as_array_mut) {
+        for mesh in meshes {
+            let Some(name) = mesh.get("name").and_then(Value::as_str).map(str::to_owned) else {
+                continue;
+            };
+            let Some(record) = native_multires.remove(&name) else {
+                continue;
+            };
+            let total_levels = record.get("total_levels").cloned().ok_or_else(|| {
+                invalid_intermediate("native multires record has no total_levels")
+            })?;
+            let filepath = record
+                .get("external")
+                .and_then(|external| external.get("filepath"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            modifier_data.insert(name, (total_levels, filepath));
+            let properties = mesh.as_object_mut().ok_or_else(|| {
+                invalid_intermediate("native multires mesh record target is invalid")
+            })?;
+            properties.insert("native_multires_displacement".to_owned(), record);
+        }
+    }
+
+    if let Some(objects) = raw.get_mut("objects").and_then(Value::as_array_mut) {
+        for object in objects {
+            let Some(mesh_name) = object
+                .get("data_name")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            let Some((total_levels, filepath)) = modifier_data.get(&mesh_name) else {
+                continue;
+            };
+            let Some(modifiers) = object.get_mut("modifiers").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            for modifier in modifiers {
+                if modifier.get("type").and_then(Value::as_str) != Some("MULTIRES") {
+                    continue;
+                }
+                let properties = modifier
+                    .get_mut("properties")
+                    .and_then(Value::as_object_mut)
+                    .ok_or_else(|| {
+                        invalid_intermediate("Blender multires modifier properties are invalid")
+                    })?;
+                properties
+                    .entry("total_levels".to_owned())
+                    .or_insert_with(|| total_levels.clone());
+                properties
+                    .entry("is_external".to_owned())
+                    .or_insert_with(|| Value::Bool(filepath.is_some()));
+                if let Some(filepath) = filepath {
+                    properties
+                        .entry("filepath".to_owned())
+                        .or_insert_with(|| json!(filepath));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+fn load_external_multires(
+    raw: &Value,
+    native_multires: &mut BTreeMap<String, Value>,
+    blend_file: &Path,
+) -> Result<()> {
+    let Some(meshes) = raw.get("meshes").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for mesh in meshes {
+        let Some(name) = mesh.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(record) = native_multires.get_mut(name) else {
+            continue;
+        };
+        let Some(filepath) = record
+            .get("external")
+            .and_then(|external| external.get("filepath"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        let external_path = resolve_blender_external_path(filepath, blend_file, raw)?;
+        let total_levels = record
+            .get("total_levels")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| invalid_intermediate("native multires total_levels is invalid"))?;
+        if !(1..=13).contains(&total_levels) {
+            return Err(invalid_intermediate(
+                "native multires total_levels must be between 1 and 13",
+            ));
+        }
+        let metadata = match fs::metadata(&external_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(PotError::with_details(
+                    ErrorCode::FileNotFound,
+                    "Blender multires external grid file is missing",
+                    json!({
+                        "mesh": name,
+                        "filepath": filepath,
+                        "resolved_path": external_path.display().to_string(),
+                    }),
+                ));
+            }
+            Err(error) => return Err(PotError::io(&error)),
+        };
+        let polygons = mesh
+            .get("polygons")
+            .and_then(Value::as_array)
+            .ok_or_else(|| invalid_intermediate("external multires mesh polygons are invalid"))?;
+        let mut face_corner_counts = Vec::with_capacity(polygons.len());
+        let mut corner_count = 0_usize;
+        for polygon in polygons {
+            let face_corner_count = polygon
+                .get("v")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    invalid_intermediate("external multires polygon corners are invalid")
+                })?
+                .len();
+            corner_count = corner_count
+                .checked_add(face_corner_count)
+                .ok_or_else(|| invalid_intermediate("external multires corner count overflows"))?;
+            face_corner_counts.push(face_corner_count);
+        }
+        let grid_levels = match record.get("grid_levels") {
+            Some(raw) => {
+                let levels = raw
+                    .as_array()
+                    .filter(|levels| levels.len() == corner_count)
+                    .ok_or_else(|| {
+                        invalid_intermediate("external multires grid_levels are invalid")
+                    })?;
+                levels
+                    .iter()
+                    .map(|level| {
+                        level
+                            .as_u64()
+                            .and_then(|level| u32::try_from(level).ok())
+                            .filter(|level| (1..=total_levels).contains(level))
+                            .ok_or_else(|| {
+                                invalid_intermediate("external multires grid level is invalid")
+                            })
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            }
+            None => vec![total_levels; corner_count],
+        };
+        crate::geom::multires_external::require_top_level_corners(
+            &grid_levels,
+            total_levels,
+            ErrorCode::ImportFailed,
+        )?;
+        let grid_vectors = grid_levels
+            .iter()
+            .map(|&level| crate::geom::multires_external::grid_vector_count(level))
+            .collect::<Result<Vec<_>>>()?;
+        let expected_file_size = crate::geom::multires_external::expected_external_file_size(
+            total_levels,
+            corner_count,
+        )?;
+        let source_bytes = fs::metadata(blend_file)
+            .map_err(|error| PotError::io(&error))?
+            .len();
+        let auxiliary_bytes = multires_auxiliary_memory_bytes(record)?;
+        let additional_bytes = expected_file_size
+            .checked_add(source_bytes)
+            .and_then(|bytes| bytes.checked_add(auxiliary_bytes))
+            .ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::LimitExceeded,
+                    "multires import memory estimate overflows",
+                )
+            })?;
+        crate::geom::modifiers::multires::check_grid_capacity_for_grids(
+            &grid_vectors,
+            None,
+            None,
+            additional_bytes,
+        )?;
+        if metadata.len() != expected_file_size {
+            return Err(PotError::with_details(
+                ErrorCode::ImportFailed,
+                "Blender multires external grid file has an invalid size",
+                json!({
+                    "mesh": name,
+                    "filepath": filepath,
+                    "expected_bytes": expected_file_size,
+                    "actual_bytes": metadata.len(),
+                }),
+            ));
+        }
+        let read_limit = expected_file_size.checked_add(1).ok_or_else(|| {
+            PotError::new(ErrorCode::LimitExceeded, "multires sidecar size overflows")
+        })?;
+        let mut bytes = Vec::with_capacity(usize::try_from(expected_file_size).map_err(|_| {
+            PotError::new(
+                ErrorCode::LimitExceeded,
+                "multires sidecar exceeds this platform's address space",
+            )
+        })?);
+        fs::File::open(&external_path)
+            .map_err(|error| PotError::io(&error))?
+            .take(read_limit)
+            .read_to_end(&mut bytes)
+            .map_err(|error| PotError::io(&error))?;
+        if u64::try_from(bytes.len()).ok() != Some(expected_file_size) {
+            return Err(PotError::new(
+                ErrorCode::ImportFailed,
+                "Blender multires external grid file changed size while reading",
+            ));
+        }
+        let grids = crate::geom::multires_external::read_external_grids(
+            &bytes,
+            total_levels,
+            corner_count,
+        )?;
+        let mut values = Map::new();
+        let mut first_corner = 0_usize;
+        for (face_index, face_corner_count) in face_corner_counts.into_iter().enumerate() {
+            let end_corner = first_corner
+                .checked_add(face_corner_count)
+                .ok_or_else(|| invalid_intermediate("external multires corner range overflows"))?;
+            let face_grids = grids.get(first_corner..end_corner).ok_or_else(|| {
+                invalid_intermediate("external multires grids do not cover mesh polygons")
+            })?;
+            let corners = face_grids
+                .iter()
+                .map(|grid| {
+                    Value::Array(
+                        grid.iter()
+                            .map(|[x, y, z]| json!([f64::from(*x), f64::from(*y), f64::from(*z)]))
+                            .collect(),
+                    )
+                })
+                .collect();
+            let face_id = face_index
+                .checked_add(1)
+                .ok_or_else(|| invalid_intermediate("external multires face ID overflows"))?;
+            values.insert(format!("f{face_id}"), Value::Array(corners));
+            first_corner = end_corner;
+        }
+        if first_corner != grids.len() {
+            return Err(invalid_intermediate(
+                "external multires grids do not match mesh polygon corners",
+            ));
+        }
+        let record = record
+            .as_object_mut()
+            .ok_or_else(|| invalid_intermediate("native multires record is invalid"))?;
+        record.insert("values".to_owned(), Value::Object(values));
+        record
+            .entry("grid_levels".to_owned())
+            .or_insert_with(|| json!(grid_levels));
+    }
+    Ok(())
+}
+
+fn missing_adjacent_multires_sidecar(
+    blend_file: &Path,
+    native_multires: &BTreeMap<String, Value>,
+) -> Option<PotError> {
+    let no_resources = json!({"resources": []});
+    for (mesh, record) in native_multires {
+        let Some(filepath) = record
+            .get("external")
+            .and_then(|external| external.get("filepath"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        let Ok(external_path) = resolve_blender_external_path(filepath, blend_file, &no_resources)
+        else {
+            continue;
+        };
+        if let Err(error) = fs::metadata(&external_path)
+            && error.kind() == std::io::ErrorKind::NotFound
+        {
+            return Some(PotError::with_details(
+                ErrorCode::FileNotFound,
+                "Blender multires external grid file is missing",
+                json!({
+                    "mesh": mesh,
+                    "filepath": filepath,
+                    "resolved_path": external_path.display().to_string(),
+                }),
+            ));
+        }
+    }
+    None
+}
+
+fn normalize_blend_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn canonical_or_normalized(path: &Path) -> Result<PathBuf> {
+    match fs::canonicalize(path) {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(normalize_blend_path(path))
+        }
+        Err(error) => Err(PotError::io(&error)),
+    }
+}
+
+fn resolve_blender_external_path(
+    filepath: &str,
+    blend_file: &Path,
+    raw: &Value,
+) -> Result<PathBuf> {
+    let source_file = fs::canonicalize(blend_file).map_err(|error| PotError::io(&error))?;
+    let source_directory = source_file
+        .parent()
+        .ok_or_else(|| invalid_intermediate("Blender source file has no parent directory"))?;
+    let stored_path = Path::new(filepath.strip_prefix("//").unwrap_or(filepath));
+    let candidate = if stored_path.is_absolute() {
+        stored_path.to_path_buf()
+    } else {
+        source_directory.join(stored_path)
+    };
+    let resolved = canonical_or_normalized(&candidate)?;
+    if resolved.starts_with(source_directory) {
+        return Ok(resolved);
+    }
+    let registered = raw
+        .get("resources")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|resource| resource.get("path").and_then(Value::as_str))
+        .map(|path| {
+            let candidate = resolve_blend_resource_path(path, blend_file);
+            canonical_or_normalized(&candidate)
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    if registered.contains(&resolved) {
+        return Ok(resolved);
+    }
+    Err(PotError::with_details(
+        ErrorCode::DependencyMissing,
+        "Blender multires sidecar is outside the source directory and is not a registered dependency",
+        json!({"filepath":filepath,"resolved_path":resolved}),
+    ))
+}
+
+fn multires_auxiliary_memory_bytes(record: &Value) -> Result<u64> {
+    let paint_mask_samples = record
+        .get("paint_mask")
+        .map(|raw| {
+            raw.as_array()
+                .ok_or_else(|| invalid_intermediate("multires paint-mask grids must be an array"))?
+                .iter()
+                .try_fold(0_u128, |count, grid| {
+                    let values = grid
+                        .get("values")
+                        .and_then(Value::as_array)
+                        .ok_or_else(|| {
+                            invalid_intermediate("multires paint-mask grid values are invalid")
+                        })?;
+                    count
+                        .checked_add(u128::try_from(values.len()).map_err(|_| {
+                            invalid_intermediate("multires paint-mask sample count is excessive")
+                        })?)
+                        .ok_or_else(|| {
+                            invalid_intermediate("multires paint-mask sample count overflows")
+                        })
+                })
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let hidden_samples = record
+        .get("hidden")
+        .map(|raw| {
+            raw.as_array()
+                .ok_or_else(|| invalid_intermediate("multires hidden grids must be an array"))?
+                .iter()
+                .try_fold(0_u128, |count, grid| {
+                    let values = grid.as_array().ok_or_else(|| {
+                        invalid_intermediate("multires hidden grid must be an array")
+                    })?;
+                    count
+                        .checked_add(u128::try_from(values.len()).map_err(|_| {
+                            invalid_intermediate("multires hidden sample count is excessive")
+                        })?)
+                        .ok_or_else(|| {
+                            invalid_intermediate("multires hidden sample count overflows")
+                        })
+                })
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let mask_descriptors = record
+        .get("paint_mask")
+        .and_then(Value::as_array)
+        .map_or(0_u128, |grids| grids.len() as u128)
+        .checked_mul(std::mem::size_of::<Vec<f32>>() as u128)
+        .ok_or_else(|| {
+            PotError::new(
+                ErrorCode::LimitExceeded,
+                "paint-mask descriptor estimate overflows",
+            )
+        })?;
+    let hidden_descriptors = record
+        .get("hidden")
+        .and_then(Value::as_array)
+        .map_or(0_u128, |grids| grids.len() as u128)
+        .checked_mul(std::mem::size_of::<Vec<bool>>() as u128)
+        .ok_or_else(|| {
+            PotError::new(
+                ErrorCode::LimitExceeded,
+                "hidden descriptor estimate overflows",
+            )
+        })?;
+    let json_bytes = (std::mem::size_of::<Value>() as u128)
+        .checked_mul(4)
+        .and_then(|bytes| bytes.checked_add(24))
+        .ok_or_else(|| {
+            PotError::new(ErrorCode::LimitExceeded, "multires JSON estimate overflows")
+        })?;
+    let bytes = paint_mask_samples
+        .checked_mul(std::mem::size_of::<f32>() as u128 + json_bytes)
+        .and_then(|mask| {
+            hidden_samples
+                .checked_mul(std::mem::size_of::<bool>() as u128 + json_bytes)
+                .and_then(|hidden| mask.checked_add(hidden))
+        })
+        .ok_or_else(|| {
+            PotError::new(
+                ErrorCode::LimitExceeded,
+                "multires auxiliary estimate overflows",
+            )
+        })?;
+    let bytes = bytes
+        .checked_add(mask_descriptors)
+        .and_then(|bytes| bytes.checked_add(hidden_descriptors))
+        .ok_or_else(|| {
+            PotError::new(
+                ErrorCode::LimitExceeded,
+                "multires descriptor estimate overflows",
+            )
+        })?;
+    u64::try_from(bytes).map_err(|_| {
+        PotError::new(
+            ErrorCode::LimitExceeded,
+            "multires auxiliary estimate exceeds u64",
+        )
+    })
+}
+
+fn check_multires_export_memory(doc: &SceneDoc, additional_output_bytes: u64) -> Result<()> {
+    let data_ids = doc
+        .nodes
+        .values()
+        .filter(|node| {
+            node.modifiers
+                .iter()
+                .any(|modifier| modifier.modifier_type == "multires")
+        })
+        .filter_map(|node| node.data.clone())
+        .collect::<BTreeSet<_>>();
+    let mut all_grid_vectors = Vec::new();
+    let mut additional_bytes = u128::from(additional_output_bytes);
+    for data_id in data_ids {
+        let Some(mesh) = doc
+            .data_blocks
+            .get(&data_id)
+            .and_then(|data| data.mesh.as_ref())
+        else {
+            continue;
+        };
+        let Some(record) = mesh.attributes.get("multires_displacement") else {
+            continue;
+        };
+        if record.get("values").is_none() {
+            continue;
+        }
+        let total_levels = record
+            .get("total_levels")
+            .and_then(Value::as_u64)
+            .and_then(|level| u32::try_from(level).ok())
+            .filter(|level| (1..=13).contains(level))
+            .ok_or_else(|| {
+                PotError::new(ErrorCode::SceneInvalid, "multires total_levels is invalid")
+            })?;
+        let corner_count = mesh
+            .faces
+            .iter()
+            .try_fold(0_usize, |count, face| {
+                count.checked_add(face.vertices.len())
+            })
+            .ok_or_else(|| {
+                PotError::new(ErrorCode::LimitExceeded, "multires corner count overflows")
+            })?;
+        let grid_levels = match record.get("grid_levels") {
+            Some(raw) => {
+                let levels = raw
+                    .as_array()
+                    .filter(|levels| levels.len() == corner_count)
+                    .ok_or_else(|| invalid_intermediate("multires grid_levels are invalid"))?;
+                levels
+                    .iter()
+                    .map(|level| {
+                        level
+                            .as_u64()
+                            .and_then(|level| u32::try_from(level).ok())
+                            .filter(|level| (1..=total_levels).contains(level))
+                            .ok_or_else(|| invalid_intermediate("multires grid level is invalid"))
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            }
+            None => vec![total_levels; corner_count],
+        };
+        let grid_vectors = grid_levels
+            .iter()
+            .map(|&level| crate::geom::multires_external::grid_vector_count(level))
+            .collect::<Result<Vec<_>>>()?;
+        let samples = grid_vectors
+            .iter()
+            .try_fold(0_u128, |count, &length| {
+                count.checked_add(u128::try_from(length).ok()?)
+            })
+            .ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::LimitExceeded,
+                    "multires export sample count overflows",
+                )
+            })?;
+        let serialized_json = samples.checked_mul(80).ok_or_else(|| {
+            PotError::new(
+                ErrorCode::LimitExceeded,
+                "multires JSON output size overflows",
+            )
+        })?;
+        let sidecar_bytes = crate::geom::multires_external::expected_external_file_size(
+            total_levels,
+            corner_count,
+        )?;
+        let auxiliary_bytes = multires_auxiliary_memory_bytes(record)?;
+        additional_bytes = additional_bytes
+            .checked_add(u128::from(sidecar_bytes))
+            .and_then(|bytes| bytes.checked_add(u128::from(auxiliary_bytes)))
+            .and_then(|bytes| bytes.checked_add(serialized_json))
+            .ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::LimitExceeded,
+                    "multires export memory estimate overflows",
+                )
+            })?;
+        all_grid_vectors.extend(grid_vectors);
+    }
+    let additional_bytes = u64::try_from(additional_bytes).map_err(|_| {
+        PotError::new(
+            ErrorCode::LimitExceeded,
+            "multires export memory estimate exceeds u64",
+        )
+    })?;
+    crate::geom::modifiers::multires::check_grid_capacity_for_grids(
+        &all_grid_vectors,
+        None,
+        None,
+        additional_bytes,
+    )
+}
+
 fn check_blender_version(blender: &Path) -> Result<()> {
     let output = Command::new(blender)
         .arg("--version")
@@ -1561,6 +2964,18 @@ fn build_imported_graph(
                 .map_err(|_| invalid_intermediate("render seed is out of range"))?,
             max_bounces: u32::try_from(integer_field(&render, "max_bounces", 4))
                 .map_err(|_| invalid_intermediate("render max_bounces is out of range"))?,
+            transparent_max_bounces: u32::try_from(integer_field(
+                &render,
+                "transparent_max_bounces",
+                8,
+            ))
+            .map_err(|_| invalid_intermediate("render transparent_max_bounces is out of range"))?,
+            dicing_rate: number_field(&render, "dicing_rate", 1.0),
+            preview_dicing_rate: number_field(&render, "preview_dicing_rate", 8.0),
+            max_subdivisions: u32::try_from(integer_field(&render, "max_subdivisions", 12))
+                .map_err(|_| invalid_intermediate("render max_subdivisions is out of range"))?,
+            offscreen_dicing_scale: number_field(&render, "offscreen_dicing_scale", 4.0),
+            dicing_camera: None,
             film_transparent: render
                 .get("film_transparent")
                 .and_then(Value::as_bool)
@@ -1803,36 +3218,32 @@ fn build_imported_graph(
             &mut mappings,
             "Camera",
         )?;
-        let projection = if item.get("type").and_then(Value::as_str) == Some("ORTHO") {
-            CameraProjection::Orthographic
-        } else {
-            CameraProjection::Perspective
+        let mut camera = CameraData {
+            lens_mm: number_field(item, "lens", 50.0),
+            sensor_height_mm: number_field(item, "sensor_height", 24.0),
+            sensor_fit: item
+                .get("sensor_fit")
+                .and_then(Value::as_str)
+                .unwrap_or("AUTO")
+                .to_owned(),
+            sensor_width_mm: number_field(item, "sensor_width", 36.0),
+            ortho_scale: number_field(item, "ortho_scale", 6.0),
+            clip_start: number_field(item, "clip_start", 0.1),
+            clip_end: number_field(item, "clip_end", 1000.0),
+            shift: [
+                number_field(item, "shift_x", 0.0),
+                number_field(item, "shift_y", 0.0),
+            ],
+            ..CameraData::default()
         };
+        imported_camera_projection(item, &mut camera);
         doc.data_blocks.insert(
             id,
             DataBlock {
                 data_type: "camera".to_owned(),
                 descriptor: None,
                 mesh: None,
-                camera: Some(CameraData {
-                    projection,
-                    lens_mm: number_field(item, "lens", 50.0),
-                    sensor_height_mm: number_field(item, "sensor_height", 24.0),
-                    sensor_fit: item
-                        .get("sensor_fit")
-                        .and_then(Value::as_str)
-                        .unwrap_or("AUTO")
-                        .to_owned(),
-                    sensor_width_mm: number_field(item, "sensor_width", 36.0),
-                    ortho_scale: number_field(item, "ortho_scale", 6.0),
-                    clip_start: number_field(item, "clip_start", 0.1),
-                    clip_end: number_field(item, "clip_end", 1000.0),
-                    shift: [
-                        number_field(item, "shift_x", 0.0),
-                        number_field(item, "shift_y", 0.0),
-                    ],
-                    ..CameraData::default()
-                }),
+                camera: Some(camera),
                 grease_pencil: None,
                 ..DataBlock::default()
             },
@@ -1867,6 +3278,10 @@ fn build_imported_graph(
                     color: vec3_field(item, "color", [1.0; 3]),
                     energy: number_field(item, "energy", 1000.0),
                     radius: number_field(item, "shadow_soft_size", 0.1),
+                    soft_falloff: item
+                        .get("soft_falloff")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true),
                     spot_size: number_field(item, "spot_size", std::f64::consts::FRAC_PI_4),
                     spot_blend: number_field(item, "spot_blend", 0.15),
                     area_shape: item
@@ -1876,6 +3291,19 @@ fn build_imported_graph(
                         .to_owned(),
                     area_size: number_field(item, "size", 0.25),
                     area_size_y: number_field(item, "size_y", 0.25),
+                    use_multiple_importance_sampling: item
+                        .get("use_multiple_importance_sampling")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true),
+                    spread: {
+                        let spread = number_field(item, "spread", std::f64::consts::PI);
+                        // Blender stores the spread as a float32, so its π default arrives rounded.
+                        if (spread - std::f64::consts::PI).abs() <= 1.0e-6 {
+                            std::f64::consts::PI
+                        } else {
+                            spread
+                        }
+                    },
                 }),
                 grease_pencil: None,
                 ..DataBlock::default()
@@ -1898,6 +3326,14 @@ fn build_imported_graph(
             "Material",
         )?;
         let color = vec4_field(item, "base_color", [0.6, 0.6, 0.6, 1.0]);
+        let viewport_display = item
+            .get("viewport_display")
+            .filter(|value| value.is_object())
+            .map(|viewport| ViewportDisplay {
+                diffuse_color: vec4_field(viewport, "diffuse_color", [0.8, 0.8, 0.8, 1.0]),
+                roughness: number_field(viewport, "roughness", 0.4),
+                metallic: number_field(viewport, "metallic", 0.0),
+            });
         let alpha_mode = match item
             .get("alpha_mode")
             .and_then(Value::as_str)
@@ -1915,6 +3351,7 @@ fn build_imported_graph(
             Material {
                 name: name.to_owned(),
                 base_color: color,
+                viewport_display,
                 alpha_mode,
                 alpha_threshold: number_field(item, "alpha_threshold", 0.5),
                 metallic: number_field(item, "metallic", 0.0),
@@ -1926,7 +3363,11 @@ fn build_imported_graph(
                 double_sided: item
                     .get("double_sided")
                     .and_then(Value::as_bool)
-                    .unwrap_or(false),
+                    .unwrap_or(true),
+                use_transparent_shadow: item
+                    .get("use_transparent_shadow")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
                 displacement_method: displacement_method_field(name, item)?,
                 displacement_scale: number_field(item, "displacement_scale", 1.0),
                 displacement_midlevel: number_field(item, "displacement_midlevel", 0.5),
@@ -1965,12 +3406,22 @@ fn build_imported_graph(
                 .map_err(|_| invalid_intermediate("image metadata is invalid"))?;
             // The Blender image carries its own packed pixels; they are the only asset that exists after reopen,
             // so they replace the blob recorded for the source image (a generated image's stored pixels).
-            if image.source != ImageSource::File
+            let tiled = is_tiled_image(item);
+            image.tiled = tiled;
+            if (image.source != ImageSource::File || tiled)
                 && let Some(packed) =
                     imported_image_from_resource(item, &resource_ids, &resource_assets, &doc)?
             {
                 image.blob = packed.blob;
                 image.source_hash = packed.source_hash;
+                image.tiles = packed.tiles;
+                image.width = packed.width;
+                image.height = packed.height;
+                if tiled {
+                    image.source = packed.source;
+                    image.source_path = None;
+                }
+                image.alpha_mode = packed.alpha_mode;
             }
             // A linked image reopens from the sidecar copy that its Blender filepath names, when that copy is the image.
             if image.source == ImageSource::File
@@ -2576,11 +4027,22 @@ fn build_imported_graph(
             scale: vec3_field(item, "scale", [1.0; 3]),
             rotation_mode,
         };
+        let root_override = root_matrix_override(item);
+        let has_root_override = root_override.is_some();
         let mut parent_inverse = matrix_column_major(item.get("matrix_parent_inverse"));
-        if let Some((stored_transform, stored_parent_inverse)) = root_matrix_override(item) {
+        let mut blender_parent_inverse = None;
+        if let Some((stored_transform, stored_parent_inverse)) = root_override {
             transform = stored_transform;
             parent_inverse = Some(stored_parent_inverse);
+        } else if item.get("parent").is_none_or(Value::is_null)
+            && let Some(matrix) = parent_inverse.filter(|matrix| !is_identity_matrix(matrix))
+        {
+            // Blender ignores matrix_parent_inverse without a parent, so the evaluated transform
+            // stays the basis. The inverse is kept as round-trip data for export.
+            blender_parent_inverse = Some(matrix);
+            parent_inverse = None;
         }
+        transform.rotation = crate::model::normalize_rotation(transform.rotation)?;
         let mut constraints = parse_constraints(
             item,
             &id,
@@ -2659,7 +4121,7 @@ fn build_imported_graph(
                 },
             );
         }
-        let node = Node {
+        let mut node = Node {
             name: name.to_owned(),
             kind: kind.to_owned(),
             primitive: None,
@@ -2709,8 +4171,20 @@ fn build_imported_graph(
             force_field,
             constraints,
             drivers,
+            blender_matrix_basis: None,
+            blender_parent_inverse,
             pose,
         };
+        if !has_root_override
+            && let Some(matrix_basis) = matrix_column_major(item.get("matrix_basis"))
+                .filter(|matrix| matrix.iter().all(|value| value.is_finite()))
+        {
+            let fingerprint = node.matrix_basis_fingerprint(&node.transform)?;
+            node.blender_matrix_basis = Some(crate::model::CapturedMatrixBasis {
+                matrix_basis,
+                fingerprint,
+            });
+        }
         doc.nodes.insert(id.clone(), node);
         if let Some(mesh_id) = data_name.and_then(|name| mesh_ids.get(name)) {
             let mut group_ids = BTreeMap::new();
@@ -2803,6 +4277,22 @@ fn build_imported_graph(
                 .and_then(Value::as_str)
                 .and_then(|camera_name| object_ids.get(camera_name))
                 .cloned();
+            scene.render.dicing_camera = match item
+                .get("render")
+                .and_then(|render| render.get("dicing_camera"))
+            {
+                None | Some(Value::Null) => None,
+                Some(Value::String(camera_name)) => {
+                    Some(object_ids.get(camera_name).cloned().ok_or_else(|| {
+                        invalid_intermediate("render dicing_camera references a missing object")
+                    })?)
+                }
+                Some(_) => {
+                    return Err(invalid_intermediate(
+                        "render dicing_camera must be an object name or null",
+                    ));
+                }
+            };
         }
     }
     let mut generic_ids = BTreeMap::<String, BTreeMap<String, Id>>::new();
@@ -2872,7 +4362,8 @@ fn build_imported_graph(
             .unwrap_or("5.2.0")
             .to_owned(),
     };
-    let losses = import_losses(raw);
+    let mut losses = import_losses(raw);
+    losses.extend(missing_udim_tile_losses(images, &resource_ids, &doc)?);
     let id_mappings = serde_json::to_value(&mappings).map_err(PotError::internal_json)?;
     let source = json!({
         "format": "blend",
@@ -2929,35 +4420,92 @@ fn imported_image_from_resource(
     doc: &SceneDoc,
 ) -> Result<Option<Image>> {
     let name = string_field(item, "name")?;
-    let resource_id = item
-        .get("filepath")
-        .and_then(Value::as_str)
-        .filter(|path| !path.is_empty())
-        .and_then(|path| resource_ids.get(path))
-        .or_else(|| resource_ids.get(name));
-    let Some(resource_id) = resource_id else {
-        return Ok(None);
+    let tiled = is_tiled_image(item);
+    let resource_id = if tiled {
+        resource_ids.get(&blend_tile_key(name, 1001))
+    } else {
+        item.get("filepath")
+            .and_then(Value::as_str)
+            .filter(|path| !path.is_empty())
+            .and_then(|path| resource_ids.get(path))
+            .or_else(|| resource_ids.get(name))
     };
-    let resource_id = Id::new(resource_id.clone())?;
-    let Some(resource) = doc.resources.get(&resource_id) else {
-        return Ok(None);
+    let declared = declared_colorspace(item);
+    let Some((source_hash, bytes)) = resource_source(resource_id, resource_assets, doc)? else {
+        // Blender keeps a UDIM image whose base file is missing and renders the base as its missing colour, so the
+        // record keeps its listed tiles with the base in the missing state.
+        if !tiled {
+            return Ok(None);
+        }
+        let tiles = imported_image_tiles(item, name, resource_ids, resource_assets, doc, declared)?;
+        // A TILED source keeps the image even with no listed tile: Blender still routes its lookups.
+        return Ok(Some(Image {
+            name: name.to_owned(),
+            source: ImageSource::File,
+            colorspace: declared.unwrap_or_default(),
+            width: 0,
+            height: 0,
+            tiles,
+            blob: None,
+            source_path: None,
+            source_hash: None,
+            tiled,
+            alpha_mode: imported_alpha_mode(name, item, None)?,
+        }));
     };
-    let Some(source_hash) = resource.get("hash").and_then(Value::as_str) else {
-        return Ok(None);
+    let (colorspace, width, height, _) =
+        crate::image::storage::decode_pixels_with_default_colorspace(bytes, declared)?;
+    let tiles = if tiled {
+        imported_image_tiles(
+            item,
+            name,
+            resource_ids,
+            resource_assets,
+            doc,
+            Some(colorspace),
+        )?
+    } else {
+        Vec::new()
     };
-    let Some((_, bytes)) = resource_assets
-        .iter()
-        .find(|(digest, _)| digest.as_str() == source_hash)
-    else {
-        return Ok(None);
-    };
-    // The document's image record declares the colour space; Blender's name is the fallback for records without one.
-    // A reloaded packed EXR takes its colour space from the file header, which the record does not depend on.
+    Ok(Some(Image {
+        name: name.to_owned(),
+        source: ImageSource::Packed,
+        colorspace,
+        width,
+        height,
+        tiles,
+        blob: Some(source_hash.to_owned()),
+        source_path: None,
+        source_hash: Some(source_hash.to_owned()),
+        tiled,
+        alpha_mode: imported_alpha_mode(name, item, Some(bytes))?,
+    }))
+}
+
+/// The alpha mode an imported image takes: the mode the bridge names for the Blender datablock, or the encoding's
+/// default when the record has none. A missing base has no bytes, so without a named mode it is straight.
+fn imported_alpha_mode(name: &str, item: &Value, bytes: Option<&[u8]>) -> Result<ImageAlphaMode> {
+    match item.get("alpha_mode").and_then(Value::as_str) {
+        None => Ok(bytes.map_or(
+            ImageAlphaMode::Straight,
+            crate::image::storage::default_alpha_mode,
+        )),
+        Some("straight") => Ok(ImageAlphaMode::Straight),
+        Some("premultiplied") => Ok(ImageAlphaMode::Premultiplied),
+        Some("none") => Ok(ImageAlphaMode::None),
+        Some(other) => Err(invalid_intermediate(&format!(
+            "image `{name}` has unknown alpha_mode `{other}`"
+        ))),
+    }
+}
+
+/// The colour space an imported image declares: its document record first, Blender's colour-space name as the fallback.
+fn declared_colorspace(item: &Value) -> Option<ImageColorspace> {
     let record_colorspace = item
         .get("potter_image")
         .and_then(|image| image.get("colorspace"))
         .and_then(|value| serde_json::from_value::<ImageColorspace>(value.clone()).ok());
-    let colorspace = record_colorspace.or_else(|| {
+    record_colorspace.or_else(|| {
         match item
             .get("colorspace")
             .and_then(Value::as_str)
@@ -2974,21 +4522,144 @@ fn imported_image_from_resource(
             Some(_) => Some(ImageColorspace::Srgb),
             None => None,
         }
-    });
-    let (colorspace, width, height, _) =
-        crate::image::storage::decode_pixels_with_default_colorspace(bytes, colorspace)?;
-    Ok(Some(Image {
-        name: name.to_owned(),
-        source: ImageSource::Packed,
-        colorspace,
-        width,
-        height,
-        tiles: Vec::new(),
-        blob: Some(source_hash.to_owned()),
-        source_path: None,
-        source_hash: Some(source_hash.to_owned()),
-        alpha_mode: ImageAlphaMode::Straight,
-    }))
+    })
+}
+
+/// The content hash and bytes of an imported resource, or `None` when it has no resource, no recorded hash, or no bytes
+/// (its file was missing at import).
+fn resource_source<'a>(
+    resource_id: Option<&String>,
+    resource_assets: &'a [(String, Vec<u8>)],
+    doc: &'a SceneDoc,
+) -> Result<Option<(&'a str, &'a [u8])>> {
+    let Some(resource_id) = resource_id else {
+        return Ok(None);
+    };
+    let resource_id = Id::new(resource_id.clone())?;
+    let Some(hash) = doc
+        .resources
+        .get(&resource_id)
+        .and_then(|resource| resource.get("hash"))
+        .and_then(Value::as_str)
+    else {
+        return Ok(None);
+    };
+    let Some((_, bytes)) = resource_assets
+        .iter()
+        .find(|(digest, _)| digest.as_str() == hash)
+    else {
+        return Ok(None);
+    };
+    Ok(Some((hash, bytes.as_slice())))
+}
+
+fn is_tiled_image(item: &Value) -> bool {
+    item.get("source").and_then(Value::as_str) == Some("TILED")
+}
+
+/// The resource key of one UDIM tile of a Blender image: its owner name and tile number.
+fn blend_tile_key(owner: &str, number: u32) -> String {
+    format!("{owner}\0tile\0{number}")
+}
+
+/// The UDIM tiles above 1001 of a TILED Blender image, each an immutable blob decoded in the base's colour space (the
+/// declared one when the base is missing). A tile whose file was missing at import keeps its number with no size or
+/// blob: the missing state. `missing_udim_tile_losses` reports it.
+fn imported_image_tiles(
+    item: &Value,
+    name: &str,
+    resource_ids: &BTreeMap<String, String>,
+    resource_assets: &[(String, Vec<u8>)],
+    doc: &SceneDoc,
+    colorspace: Option<ImageColorspace>,
+) -> Result<Vec<ImageTile>> {
+    let mut tiles = Vec::new();
+    for number in tiled_image_numbers(item)? {
+        if number <= 1001 {
+            continue;
+        }
+        let label = tile_label(item, number);
+        let Some((hash, bytes)) = resource_source(
+            resource_ids.get(&blend_tile_key(name, number)),
+            resource_assets,
+            doc,
+        )?
+        else {
+            tiles.push(ImageTile {
+                number,
+                width: 0,
+                height: 0,
+                blob: None,
+                label,
+            });
+            continue;
+        };
+        let (_, width, height, _) =
+            crate::image::storage::decode_pixels_with_default_colorspace(bytes, colorspace)?;
+        tiles.push(ImageTile {
+            number,
+            width,
+            height,
+            blob: Some(hash.to_owned()),
+            label,
+        });
+    }
+    Ok(tiles)
+}
+
+/// The label Blender gives a UDIM tile, from the bridge's `tile_labels`; empty when the tile has none.
+fn tile_label(item: &Value, number: u32) -> String {
+    item.get("tile_labels")
+        .and_then(|labels| labels.get(number.to_string()))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// The tile numbers a TILED Blender image lists, in Blender's order.
+fn tiled_image_numbers(item: &Value) -> Result<Vec<u32>> {
+    optional_array(item, "tile_numbers")?
+        .iter()
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|number| u32::try_from(number).ok())
+                .ok_or_else(|| invalid_intermediate("image tile number is invalid"))
+        })
+        .collect()
+}
+
+/// The tiles of TILED Blender images whose file was missing at import. Blender draws such a tile as opaque magenta
+/// (`IMAGE_MISSING_RGBA`, Blender 5.2.2 `intern/cycles/util/types_image.h`, returned by the CPU kernel when a tile
+/// load fails), so the loss names that render result; Potter imports no bytes for the tile.
+fn missing_udim_tile_losses(
+    images: &[Value],
+    resource_ids: &BTreeMap<String, String>,
+    doc: &SceneDoc,
+) -> Result<Vec<Loss>> {
+    let mut losses = Vec::new();
+    for item in images.iter().filter(|item| is_tiled_image(item)) {
+        let name = string_field(item, "name")?;
+        for number in tiled_image_numbers(item)? {
+            let available = resource_ids
+                .get(&blend_tile_key(name, number))
+                .and_then(|resource_id| Id::new(resource_id.clone()).ok())
+                .and_then(|resource_id| doc.resources.get(&resource_id))
+                .and_then(|resource| resource.get("status"))
+                .and_then(Value::as_str)
+                == Some("available");
+            if !available {
+                losses.push(loss(
+                    "blender.image.udim_tile_missing",
+                    Some(name),
+                    &format!(
+                        "UDIM tile {number} of image {name} has no file at import; Blender renders that tile as opaque magenta (IMAGE_MISSING_RGBA, intern/cycles/util/types_image.h), and Potter imports no bytes for it"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(losses)
 }
 
 /// The sidecar copy a linked image reopens from: the imported resource that the image's Blender filepath names, when that
@@ -3620,34 +5291,13 @@ fn parse_color_management(value: Option<&Value>) -> Result<ColorManagement> {
             )));
         }
     };
-    let curve = value
-        .get("curve")
-        .map(|curve| {
-            curve
-                .as_array()
-                .ok_or_else(|| invalid_intermediate("color curve must be an array"))?
-                .iter()
-                .map(|pair| {
-                    let values = pair
-                        .as_array()
-                        .filter(|values| values.len() == 2)
-                        .ok_or_else(|| {
-                            invalid_intermediate("color curve point must have two values")
-                        })?;
-                    let x = values[0]
-                        .as_f64()
-                        .filter(|number| number.is_finite())
-                        .ok_or_else(|| invalid_intermediate("color curve input is invalid"))?;
-                    let y = values[1]
-                        .as_f64()
-                        .filter(|number| number.is_finite())
-                        .ok_or_else(|| invalid_intermediate("color curve output is invalid"))?;
-                    Ok([x, y])
-                })
-                .collect::<Result<Vec<_>>>()
-        })
-        .transpose()?
-        .unwrap_or_default();
+    let curve = match value.get("curve") {
+        None | Some(Value::Null) => None,
+        Some(curve) => Some(
+            CurveMapping::from_json(curve)
+                .map_err(|message| invalid_intermediate(&format!("color curve {message}")))?,
+        ),
+    };
     Ok(ColorManagement {
         display_device: value
             .get("display_device")
@@ -4323,10 +5973,18 @@ fn import_blender_resources(
             .get("owner")
             .and_then(Value::as_str)
             .unwrap_or("Blender resource");
+        let tile_number = source
+            .get("tile_number")
+            .and_then(Value::as_u64)
+            .and_then(|number| u32::try_from(number).ok());
         let identity = resolved_path.as_ref().map_or_else(
             || owner.to_owned(),
             |path| path.to_string_lossy().into_owned(),
         );
+        let identity = match tile_number {
+            Some(number) => format!("{identity}\0{number}"),
+            None => identity,
+        };
         let seed = format!(
             "resource_{}",
             &crate::hash::sha256(format!("{kind}:{identity}").as_bytes())[7..19]
@@ -4381,6 +6039,9 @@ fn import_blender_resources(
             path_ids
                 .entry(owner.to_owned())
                 .or_insert_with(|| id.as_str().to_owned());
+        }
+        if let Some(number) = tile_number {
+            path_ids.insert(blend_tile_key(owner, number), id.as_str().to_owned());
         }
         if let (Some(digest), Some(bytes)) = (digest, bytes) {
             assets.push((digest, bytes));
@@ -5086,7 +6747,13 @@ fn convert_mesh(item: &Value) -> Result<Mesh> {
             Value::Array(blender_attributes),
         );
     }
-
+    if let Some(native_multires) = item
+        .get("native_multires_displacement")
+        .filter(|value| value.is_object())
+    {
+        mesh.attributes
+            .insert("multires_displacement".to_owned(), native_multires.clone());
+    }
     if let Some(skin_vertices) = item
         .get("skin_vertices")
         .and_then(Value::as_array)
@@ -5231,13 +6898,14 @@ fn is_blender_managed_attribute(name: &str, domain: &str, data_type: &str) -> bo
 }
 
 /// Mesh-level keys that the `.blend` writer recreates or restores itself.
-const BLENDER_HANDLED_MESH_KEYS: [&str; 11] = [
+const BLENDER_HANDLED_MESH_KEYS: [&str; 12] = [
     "uv_layers",
     "color_layers",
     "shade_smooth",
     "sharp",
     "seam",
     "custom_normal",
+    "multires_displacement",
     "blender_metadata",
     "blender_attributes",
     "blender_skin_vertices",
@@ -5624,14 +7292,28 @@ fn blend_attribute_refusal(
         format!("blend does not write attribute `{name}`: {reason}"),
     ))
 }
-
 fn parse_shape_keys(
     item: &Value,
     mesh: &Mesh,
     mesh_name: &str,
     mappings: &mut BTreeMap<String, String>,
 ) -> Result<(Option<ShapeKeyData>, BTreeMap<Id, String>)> {
-    let Some(raw) = item.get("shape_keys").filter(|value| !value.is_null()) else {
+    // The bridge reports an empty record for a mesh without a Blender Key; that is no shape keys.
+    let Some(raw) = item
+        .get("shape_keys")
+        .filter(|value| !value.is_null())
+        .filter(|value| {
+            let has_basis = value
+                .get("basis")
+                .and_then(Value::as_array)
+                .is_some_and(|basis| !basis.is_empty());
+            let has_keys = value
+                .get("keys")
+                .and_then(Value::as_array)
+                .is_some_and(|keys| !keys.is_empty());
+            has_basis || has_keys
+        })
+    else {
         return Ok((None, BTreeMap::new()));
     };
     let key_items = optional_array(raw, "keys")?;
@@ -6008,6 +7690,32 @@ fn parse_mesh_sequence_cache_params(
     params.insert("resource".to_owned(), json!(resource));
     params.insert("object_path".to_owned(), json!(object_path));
     insert_cache_settings_params(&mut params, cache_settings);
+    // The Alembic reader takes these from the CacheFile, so they are mirrored onto the modifier.
+    let setting = |name: &str| cache_settings.and_then(|settings| settings.get(name));
+    params.insert(
+        "is_sequence".to_owned(),
+        json!(
+            setting("is_sequence")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        ),
+    );
+    params.insert(
+        "velocity_name".to_owned(),
+        json!(
+            setting("velocity_name")
+                .and_then(Value::as_str)
+                .unwrap_or(".velocities")
+        ),
+    );
+    params.insert(
+        "velocity_unit".to_owned(),
+        json!(
+            setting("velocity_unit")
+                .and_then(Value::as_str)
+                .unwrap_or("SECOND")
+        ),
+    );
     Ok(params)
 }
 
@@ -6022,15 +7730,6 @@ fn insert_cache_settings_params(
                 .and_then(|settings| settings.get("frame_offset"))
                 .and_then(Value::as_f64)
                 .unwrap_or(0.0)
-        ),
-    );
-    params.insert(
-        "scale".to_owned(),
-        json!(
-            settings
-                .and_then(|settings| settings.get("scale"))
-                .and_then(Value::as_f64)
-                .unwrap_or(1.0)
         ),
     );
     params.insert(
@@ -6172,6 +7871,16 @@ fn parse_transform_cache_params(
     params.insert("resource".to_owned(), json!(resource));
     params.insert("object_path".to_owned(), json!(object_path));
     insert_cache_settings_params(&mut params, settings);
+    // Blender applies CacheFile.scale only through a Transform Cache constraint.
+    params.insert(
+        "scale".to_owned(),
+        json!(
+            settings
+                .and_then(|settings| settings.get("scale"))
+                .and_then(Value::as_f64)
+                .unwrap_or(1.0)
+        ),
+    );
     Ok(params)
 }
 
@@ -6599,6 +8308,10 @@ fn matrix_rows_equal(left: &Value, right: &Value) -> bool {
 }
 
 fn root_matrix_requires_approximation(node: &Node) -> bool {
+    // A current captured basis is exported as the exact world transform, so nothing is baked.
+    if matches!(node.captured_matrix_basis(&node.transform), Ok(Some(_))) {
+        return false;
+    }
     if node.parent.is_some() {
         return false;
     }
@@ -6644,8 +8357,223 @@ fn object_properties(item: &Value) -> Map<String, Value> {
     props
 }
 
+/// Blender's panorama type as Potter's `panorama_type`, when Potter has a projection for it. Blender's other panorama types
+/// (mirror ball, equiangular cubemap, and the rest) have none.
+fn imported_panorama_type(item: &Value) -> Option<&'static str> {
+    match item.get("panorama_type").and_then(Value::as_str) {
+        None | Some("EQUIRECTANGULAR") => Some("equirectangular"),
+        Some("FISHEYE_EQUIDISTANT") => Some("fisheye_equidistant"),
+        Some("FISHEYE_EQUISOLID") => Some("fisheye_equisolid"),
+        Some(_) => None,
+    }
+}
+
+/// Imports a Blender camera's type and the panorama settings Blender stores on every camera. The camera type picks the
+/// projection, and a PANO camera of a panorama type Potter has no projection for stays perspective. Each setting is kept
+/// whatever the projection, so it round-trips; a value Potter cannot hold keeps its default, and `import_losses` reports it.
+fn imported_camera_projection(item: &Value, camera: &mut CameraData) {
+    let panorama = imported_panorama_type(item);
+    camera.projection = match item.get("type").and_then(Value::as_str) {
+        Some("ORTHO") => CameraProjection::Orthographic,
+        Some("PANO") if panorama.is_some() => CameraProjection::Panorama,
+        _ => CameraProjection::Perspective,
+    };
+    if let Some(panorama) = panorama {
+        panorama.clone_into(&mut camera.panorama_type);
+    }
+    if let Some([longitude_min, longitude_max, latitude_min, latitude_max]) =
+        imported_panorama_range(item)
+    {
+        camera.longitude_min = longitude_min;
+        camera.longitude_max = longitude_max;
+        camera.latitude_min = latitude_min;
+        camera.latitude_max = latitude_max;
+    }
+    if let Some(fov) = imported_fisheye_fov(item) {
+        camera.fisheye_fov = fov;
+    }
+    if let Some(lens) = imported_fisheye_lens(item) {
+        camera.fisheye_lens = lens;
+    }
+}
+
+/// Blender's equirectangular limits `[longitude_min, longitude_max, latitude_min, latitude_max]`, when Potter's camera can
+/// hold them: each a finite number, the longitudes increasing across at most a turn, and the latitudes increasing within
+/// ±π/2. A key Blender's dump omits is Blender's default.
+fn imported_panorama_range(item: &Value) -> Option<[f64; 4]> {
+    let limit = |key: &str, default: f64| match item.get(key) {
+        None => Some(default),
+        Some(value) => value.as_f64().filter(|value| value.is_finite()),
+    };
+    let range = [
+        limit("longitude_min", -crate::model::BLENDER_PI)?,
+        limit("longitude_max", crate::model::BLENDER_PI)?,
+        limit("latitude_min", -crate::model::BLENDER_RIGHT_ANGLE)?,
+        limit("latitude_max", crate::model::BLENDER_RIGHT_ANGLE)?,
+    ];
+    let [longitude_min, longitude_max, latitude_min, latitude_max] = range;
+    (longitude_max > longitude_min
+        && longitude_max - longitude_min <= crate::model::BLENDER_TURN
+        && latitude_max > latitude_min
+        && latitude_min >= -crate::model::BLENDER_RIGHT_ANGLE
+        && latitude_max <= crate::model::BLENDER_RIGHT_ANGLE)
+        .then_some(range)
+}
+
+/// Blender's fisheye field of view, when Potter holds it: within Blender's hard range, 10 degrees to 10π. Absent is π.
+fn imported_fisheye_fov(item: &Value) -> Option<f64> {
+    match item.get("fisheye_fov") {
+        None => Some(crate::model::BLENDER_PI),
+        Some(value) => value.as_f64().filter(|fov| {
+            (crate::model::FISHEYE_FOV_MIN..=crate::model::FISHEYE_FOV_MAX).contains(fov)
+        }),
+    }
+}
+
+/// Blender's `fisheye_lens` in millimetres, when Potter holds it: within Blender's hard range, 0.01 to 100. Absent is 10.5.
+fn imported_fisheye_lens(item: &Value) -> Option<f64> {
+    match item.get("fisheye_lens") {
+        None => Some(10.5),
+        Some(value) => value.as_f64().filter(|lens| {
+            (crate::model::FISHEYE_LENS_MIN..=crate::model::FISHEYE_LENS_MAX).contains(lens)
+        }),
+    }
+}
+
 fn import_losses(raw: &Value) -> Vec<Loss> {
     let mut losses = Vec::new();
+    // Blender stores every panorama setting on every camera, so a value Potter cannot hold is reported whatever the camera's
+    // type: the import never changes a camera silently.
+    for camera in raw
+        .get("cameras")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let name = camera.get("name").and_then(Value::as_str);
+        if imported_panorama_type(camera).is_none() {
+            let other = camera
+                .get("panorama_type")
+                .and_then(Value::as_str)
+                .unwrap_or("EQUIRECTANGULAR");
+            losses.push(loss(
+                "blender.camera.panorama_type",
+                name,
+                &format!(
+                    "Blender's {other} panorama type has no Potter projection, so the camera's panorama type is not kept; a PANO camera of that type imports as a perspective camera"
+                ),
+            ));
+        }
+        if imported_panorama_range(camera).is_none() {
+            losses.push(loss(
+                "blender.camera.panorama_range",
+                name,
+                "Blender's equirectangular longitude and latitude limits are not representable in Potter (the longitudes must increase across at most a turn, and the latitudes must increase within ±π/2); the camera keeps the full sphere",
+            ));
+        }
+        if imported_fisheye_fov(camera).is_none() {
+            losses.push(loss(
+                "blender.camera.fisheye_fov",
+                name,
+                "Blender's fisheye field of view is outside the 10 degree to 10π range that Potter's fisheye cameras hold; the camera keeps 180 degrees",
+            ));
+        }
+        if imported_fisheye_lens(camera).is_none() {
+            losses.push(loss(
+                "blender.camera.fisheye_lens",
+                name,
+                "Blender's fisheye lens is outside the 0.01 to 100 mm range that Potter holds; the camera keeps 10.5 mm",
+            ));
+        }
+    }
+    // Workbench's viewport shading changes what its render draws. Potter's solid preview models the
+    // factory studio light with material colours, and none of the other options below.
+    for scene in raw
+        .get("scenes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let name = scene.get("name").and_then(Value::as_str);
+        let shading = &scene["display_shading"];
+        let on = |key: &str| shading[key].as_bool() == Some(true);
+        let off = |key: &str| shading[key].as_bool() == Some(false);
+        let unsupported = [
+            (
+                shading["light"] != "STUDIO",
+                "blender.scene.display_light",
+                "Blender's Workbench lighting is not STUDIO; Potter's solid preview is studio-lit only",
+            ),
+            (
+                matches!(shading["type"].as_str(), None | Some("WIREFRAME")),
+                "blender.scene.display_type",
+                "Blender's viewport shading is wireframe, below Solid; Potter's solid preview is the Workbench solid render",
+            ),
+            (
+                !matches!(shading["studio_light"].as_str(), Some("" | "Default")),
+                "blender.scene.display_studio_light",
+                "Blender's studio light is not Default; Potter's solid preview uses the Default studio light",
+            ),
+            (
+                shading["color_type"] != "MATERIAL",
+                "blender.scene.display_color_type",
+                "Blender's Workbench colour source is not MATERIAL; Potter's solid preview draws material colours",
+            ),
+            (
+                on("use_world_space_lighting"),
+                "blender.scene.display_world_space_lighting",
+                "Blender's world-space studio lighting is not imported; Potter's solid preview lights in view space",
+            ),
+            (
+                off("show_specular_highlight"),
+                "blender.scene.display_specular_highlight",
+                "Blender's Workbench specular highlight is off; Potter's solid preview always shows it",
+            ),
+            (
+                on("show_cavity"),
+                "blender.scene.display_cavity",
+                "Blender's Workbench cavity is not imported; Potter's solid preview draws no cavity",
+            ),
+            (
+                on("show_shadows"),
+                "blender.scene.display_shadows",
+                "Blender's Workbench shadows are not imported; Potter's solid preview draws no shadows",
+            ),
+            (
+                on("show_object_outline"),
+                "blender.scene.display_object_outline",
+                "Blender's Workbench object outline is not imported; Potter's solid preview draws no outline",
+            ),
+            (
+                on("show_backface_culling"),
+                "blender.scene.display_backface_culling",
+                "Blender's Workbench backface culling is not imported; Potter's solid preview draws back faces",
+            ),
+            (
+                on("show_xray")
+                    && shading["xray_alpha"]
+                        .as_f64()
+                        .is_none_or(|alpha| alpha < 1.0),
+                "blender.scene.display_xray",
+                "Blender's Workbench X-ray is not imported; Potter's solid preview is opaque",
+            ),
+            (
+                on("use_dof") && shading["camera_dof"].as_bool() != Some(false),
+                "blender.scene.display_dof",
+                "Blender's Workbench depth of field is not imported; Potter's solid preview has no depth of field",
+            ),
+            (
+                shading["background_type"] == "VIEWPORT",
+                "blender.scene.display_background",
+                "Blender's Workbench background is the viewport colour, which is not imported; Potter's solid preview uses the world's colour",
+            ),
+        ];
+        for (is_unsupported, feature, reason) in unsupported {
+            if is_unsupported {
+                losses.push(loss(feature, name, reason));
+            }
+        }
+    }
     for material in raw
         .get("materials")
         .and_then(Value::as_array)
@@ -6657,6 +8585,19 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
                 "blender.material.displacement_method",
                 material.get("name").and_then(Value::as_str),
                 "Blender's combined displacement and bump mode has no Potter equivalent; the material imports as bump",
+            ));
+        }
+        // EEVEE's `use_backface_culling_shadow` drops back faces from the shadow pass (`eevee_pipeline.cc`, MA_BL_CULL_BACKFACE_SHADOW);
+        // Potter's shadow rays hit both sides.
+        if material
+            .get("use_backface_culling_shadow")
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            losses.push(loss(
+                "blender.material.backface_culling_shadow",
+                material.get("name").and_then(Value::as_str),
+                "Blender's EEVEE shadow backface culling is not imported; the material casts shadows from both sides",
             ));
         }
     }
@@ -7172,6 +9113,28 @@ fn socket_rgb(
 /// they are never a loss. Any other mesh attribute is a loss.
 pub(crate) fn export_losses(doc: &SceneDoc) -> Vec<Loss> {
     let mut losses = Vec::new();
+    for (image_id, image) in &doc.images {
+        if image.base_is_missing() {
+            losses.push(loss(
+                "blender.image.udim_tile_missing",
+                Some(image_id.as_str()),
+                &format!(
+                    "UDIM base tile 1001 of image {} is missing, so it has no pixels and is not exported; Blender renders the base as the missing colour",
+                    image.name
+                ),
+            ));
+        }
+        for tile in image.tiles.iter().filter(|tile| tile.blob.is_none()) {
+            losses.push(loss(
+                "blender.image.udim_tile_missing",
+                Some(image_id.as_str()),
+                &format!(
+                    "UDIM tile {} of image {} is missing, so Blender cannot pack it and it is not exported; Blender samples its number as unlisted, which renders as the missing colour",
+                    tile.number, image.name
+                ),
+            ));
+        }
+    }
     let mut fill_by_material = BTreeMap::<Id, [f64; 4]>::new();
     let mut unfilled_by_material = BTreeSet::<Id>::new();
     for (clip_id, clip) in &doc.movie_clips {
@@ -7253,6 +9216,18 @@ pub(crate) fn export_losses(doc: &SceneDoc) -> Vec<Loss> {
                 "blender.world",
                 Some(scene_id.as_str()),
                 "the scene references a world missing from the world registry",
+            ));
+        }
+        if scene.color_management.curve.as_ref().is_some_and(|curve| {
+            curve
+                .clip
+                .iter()
+                .any(|value| !(-100.0..=100.0).contains(value))
+        }) {
+            losses.push(loss(
+                "blender.color_management.curve_clip",
+                Some(scene_id.as_str()),
+                "Blender clamps view-curve clip values to [-100, 100]; this clip rectangle cannot be restored exactly",
             ));
         }
         if !matches!(scene.render.engine.as_str(), "path" | "realtime") {
@@ -7889,7 +9864,44 @@ fn loss(feature: impl Into<String>, data_id: Option<&str>, reason: &str) -> Loss
 
 #[cfg(test)]
 mod tests {
+    #![expect(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
     use super::*;
+
+    #[test]
+    fn color_curve_extension_serializes_as_bridge_boolean() -> Result<()> {
+        let mut curve = CurveMapping::default();
+        let extrapolated = serde_json::to_value(&curve).map_err(PotError::internal_json)?;
+        assert_eq!(extrapolated["extend_extrapolate"], json!(true));
+        assert!(extrapolated.get("extend").is_none());
+
+        curve.extend_extrapolate = false;
+        let horizontal = serde_json::to_value(curve).map_err(PotError::internal_json)?;
+        assert_eq!(horizontal["extend_extrapolate"], json!(false));
+        Ok(())
+    }
+
+    #[test]
+    fn color_curve_clip_outside_blender_rna_bounds_is_reported_as_export_loss() -> Result<()> {
+        let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+        let scene_id = doc.active_scene.clone();
+        let scene = doc
+            .scenes
+            .get_mut(&scene_id)
+            .ok_or_else(|| PotError::new(ErrorCode::SceneInvalid, "active scene missing"))?;
+        let curve = CurveMapping {
+            clip: [0.0, 0.0, 101.0, 1.0],
+            ..CurveMapping::default()
+        };
+        scene.color_management.curve = Some(curve);
+
+        let losses = export_losses(&doc);
+        assert!(losses.iter().any(|loss| {
+            loss.feature_id == "blender.color_management.curve_clip"
+                && loss.data_id.as_deref() == Some(scene_id.as_str())
+                && loss.reason.contains("[-100, 100]")
+        }));
+        Ok(())
+    }
     #[test]
     fn modifier_type_mapping_covers_the_potter_schema() {
         let mappings = [
@@ -8443,6 +10455,7 @@ mod tests {
                     "nodes": {"nodes": [{"name":"Background","type":"ShaderNodeBackground"}, {"name":"World Output","type":"ShaderNodeOutputWorld"}]},
                     "custom_properties": {}},
                 "unit": {"system": "metric", "scale_length": 1.0},
+                "display_shading": {"type": "SOLID", "light": "STUDIO", "studio_light": "Default", "color_type": "MATERIAL", "use_world_space_lighting": false, "show_specular_highlight": true, "show_cavity": false, "show_shadows": false, "show_object_outline": false, "show_backface_culling": false, "show_xray": false, "xray_alpha": 0.5, "use_dof": false, "camera_dof": false, "background_type": "THEME"},
                 "render": {"resolution_x": 640, "resolution_y": 360, "resolution_percentage": 100,
                            "samples": 12, "seed": 5, "film_transparent": false, "engine": "path",
                            "engine_native": "CYCLES"},
@@ -8612,6 +10625,7 @@ mod tests {
                 "name":"Scene","potter_id":"scene_main","root_collection":"Collection",
                 "frame_current":1.0,"frame_start":1,"frame_end":250,"fps":24,"fps_base":1.0,
                 "camera":null,"world":null,"unit":{"system":"METRIC","scale_length":1.0},
+                "display_shading":{"type":"SOLID","light":"STUDIO","studio_light":"Default","color_type":"MATERIAL","use_world_space_lighting":false,"show_specular_highlight":true,"show_cavity":false,"show_shadows":false,"show_object_outline":false,"show_backface_culling":false,"show_xray":false,"xray_alpha":0.5,"use_dof":false,"camera_dof":false,"background_type":"THEME"},
                 "render":{},"view_layers":[{"name":"View Layer","excluded_collections":[]}],
                 "markers":[{"name":"Marker","frame":12.0}],
                 "rigid_body_world":{"enabled":true,"gravity":[0.0,0.0,-9.81],
@@ -10589,6 +12603,7 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
                 source_path: Some(normal_path.to_string_lossy().into_owned()),
                 source_hash: Some(crate::hash::sha256(&normal_bytes)),
                 alpha_mode: ImageAlphaMode::Straight,
+                tiled: false,
             },
         );
         doc.images.insert(
@@ -10604,12 +12619,14 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
                 source_path: Some(emissive_path.to_string_lossy().into_owned()),
                 source_hash: Some(crate::hash::sha256(&emissive_bytes)),
                 alpha_mode: ImageAlphaMode::Straight,
+                tiled: false,
             },
         );
         let texture = |image: &Id, uv_layer: &str| crate::model::TextureRef {
             image: image.clone(),
             uv_layer: Some(uv_layer.to_owned()),
             interpolation: crate::image::ImageInterpolation::Linear,
+            extension: crate::image::ImageExtension::Repeat,
         };
         crate::exchange::material_graph::move_textures_to_graph(
             &mut doc,
@@ -10620,12 +12637,14 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
                 roughness: None,
                 metallic: None,
                 normal: Some(crate::exchange::material_graph::SlotTexture {
+                    wrap: [crate::image::ImageExtension::Repeat; 2],
                     texture: texture(&normal_image_id, "Detail"),
                     transform: None,
                 }),
                 // Blender stores this Normal Map socket at float32 precision.
                 normal_scale: f64::from(0.65_f32),
                 emissive: Some(crate::exchange::material_graph::SlotTexture {
+                    wrap: [crate::image::ImageExtension::Repeat; 2],
                     texture: texture(&emissive_image_id, "UVMap"),
                     transform: Some(crate::exchange::material_surface::TextureTransform {
                         offset: [0.25, 0.5],
@@ -10641,21 +12660,29 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
             (
                 normal_image_id.as_str().to_owned(),
                 crate::image::ImageData {
+                    colour: crate::image::ColourCache::default(),
+                    storage: crate::image::ImageStorage::default(),
                     width: 1,
                     height: 1,
                     pixels: vec![[128.0 / 255.0, 192.0 / 255.0, 230.0 / 255.0, 1.0]],
                     tiles: BTreeMap::new(),
                     interpolation: crate::image::ImageInterpolation::Linear,
+                    srgb: false,
+                    udim: false,
                 },
             ),
             (
                 emissive_image_id.as_str().to_owned(),
                 crate::image::ImageData {
+                    colour: crate::image::ColourCache::default(),
+                    storage: crate::image::ImageStorage::default(),
                     width: 1,
                     height: 1,
                     pixels: vec![[64.0 / 255.0, 128.0 / 255.0, 1.0, 1.0]],
                     tiles: BTreeMap::new(),
                     interpolation: crate::image::ImageInterpolation::Linear,
+                    srgb: false,
+                    udim: false,
                 },
             ),
         ]);
@@ -10879,6 +12906,7 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
                     source_path: Some(path.to_string_lossy().into_owned()),
                     source_hash: Some(crate::hash::sha256(bytes)),
                     alpha_mode: ImageAlphaMode::Straight,
+                    tiled: false,
                 }
             };
         let shared_id = Id::new("shared_texture")?;
@@ -10920,6 +12948,7 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
                 image: image.clone(),
                 uv_layer: Some("Lightmap".to_owned()),
                 interpolation,
+                extension: crate::image::ImageExtension::Repeat,
             }
         };
         // An authored graph: a Principled BSDF with a default Base Color and a Roughness linked from a Math node. Its
@@ -11163,13 +13192,6 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
             imported.losses
         );
 
-        let srgb = |value: f64| {
-            if value <= 0.04045 {
-                value / 12.92
-            } else {
-                ((value + 0.055) / 1.055).powf(2.4)
-            }
-        };
         let mut reopened_image_data = BTreeMap::new();
         for (image_id, reopened_image) in &imported.doc.images {
             let source_image = doc
@@ -11277,46 +13299,49 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
             [LIGHTMAP[0], LIGHTMAP[1], LIGHTMAP[2]],
         ];
         let close = |left: f64, right: f64| (left - right).abs() < 1.0e-3;
-        // Per pixel, as the evaluator decodes it: sRGB red, green and blue for the shared image; raw for the others.
-        let shared_rgb = [
-            [srgb(128.0 / 255.0), srgb(40.0 / 255.0), 0.0],
-            [srgb(64.0 / 255.0), 0.0, 1.0],
-        ];
-        let shared_alpha = [128.0 / 255.0, 1.0];
-        let metal_red = [128.0 / 255.0, 200.0 / 255.0];
-        // Hit 2 extrapolates the Lightmap u to 1.06. It clamps to the edge pixel 1, where a repeat would read pixel 0.
+        // Blender 5.2.2 expectations, derived from the alpha oracle set (tests/fixtures/alpha_texture): the Image Texture
+        // colour model that reproduces the oracle to 6e-7, evaluated at each hit's Lightmap UV. Each hit blends the
+        // Lightmap corners with `barycentrics`, giving u = 0.1, 0.9, and 1.06. The field's extension is Repeat, so at
+        // u = 1.06 Closest reads texel 0 and Linear mixes texels 0 and 1. Pixel 0 has alpha 128, which Blender
+        // premultiplies at load. A colour read whose Alpha output is linked is unassociated, and an unlinked one keeps
+        // the premultiplied value. The field's base has its Alpha linked (non-opaque); its roughness and metallic, and
+        // the simple and authored textures, are unlinked. Metallic is Non-Color, so it is read as stored.
         let barycentrics = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [-0.2, 1.2, 0.0]];
-        let pixel_of_hit = [0_usize, 1, 1];
-        let hits = [0_usize, 1, 2];
-        let texel = |hit: usize| shared_rgb[pixel_of_hit[hit]];
-        let metal = |hit: usize| metal_red[pixel_of_hit[hit]];
-        let alpha = |hit: usize| shared_alpha[pixel_of_hit[hit]];
         // (label, material, base, roughness, metallic, alpha), each per hit.
         let cases = [
             (
                 "field",
                 &field_id,
-                hits.map(texel),
-                hits.map(|hit| 0.5 * texel(hit)[0]),
-                hits.map(|hit| 0.75 * metal(hit)),
-                hits.map(|hit| 0.5 * alpha(hit)),
+                [
+                    [0.214_041, 0.021_072, 0.0],
+                    [0.051_269, 0.0, 1.0],
+                    [0.214_041, 0.021_072, 0.0],
+                ],
+                [0.025_635; 3],
+                [0.376_471, 0.588_235, 0.376_471],
+                [0.250_980, 0.5, 0.250_980],
             ),
             (
                 "simple",
                 &simple_id,
-                hits.map(|hit| texel(hit).map(|value| 0.6 * value)),
-                hits.map(|hit| 0.75 * texel(hit)[0]),
+                [
+                    [0.030_762, 0.004_197, 0.0],
+                    [0.030_762, 0.0, 0.6],
+                    [0.030_762, 0.004_197, 0.0],
+                ],
+                [0.038_452; 3],
                 [0.25; 3],
                 [1.0; 3],
             ),
             (
                 "authored",
                 &authored_id,
-                hits.map(|hit| {
-                    let rgb = texel(hit);
-                    [0.5 * rgb[0], 0.25 * rgb[1], 0.125 * rgb[2]]
-                }),
-                hits.map(|hit| 0.25 * texel(hit)[0]),
+                [
+                    [0.025_635, 0.001_749, 0.0],
+                    [0.025_635, 0.0, 0.125],
+                    [0.025_635, 0.001_749, 0.0],
+                ],
+                [0.012_817; 3],
                 [0.0; 3],
                 [1.0; 3],
             ),
@@ -11434,6 +13459,7 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
                 source_path: Some(normal_path.to_string_lossy().into_owned()),
                 source_hash: Some(crate::hash::sha256(&bytes)),
                 alpha_mode: ImageAlphaMode::Straight,
+                tiled: false,
             },
         );
         // An authored Normal link: the native normal perturbs this vector, so the export must refuse it.
@@ -11482,6 +13508,7 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
                     image: normal_id,
                     uv_layer: None,
                     interpolation: crate::image::ImageInterpolation::Linear,
+                    extension: crate::image::ImageExtension::Repeat,
                 }),
                 node_tree: Some(graph_id),
                 ..Material::default()
@@ -11821,6 +13848,112 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
             Some(&smoke_id)
         );
         assert_eq!(imported_node.material_slot(Some(imported_data), 1), None);
+        Ok(())
+    }
+
+    #[test]
+    fn blender_viewport_display_roundtrips_beside_the_principled_values() -> Result<()> {
+        let Some(blender) = optional_blender() else {
+            return Ok(());
+        };
+        let directory = tempfile::tempdir().map_err(|error| PotError::io(&error))?;
+        let project = Project::init(directory.path().join("project"))?;
+        let script_path = directory.path().join("make_viewport_fixture.py");
+        let blend_path = directory.path().join("viewport-fixture.blend");
+        fs::write(
+            &script_path,
+            r#"
+import bpy, sys
+path = sys.argv[sys.argv.index("--") + 1]
+material = bpy.data.materials.new("Viewport")
+material.use_nodes = True
+principled = next(node for node in material.node_tree.nodes if node.type == "BSDF_PRINCIPLED")
+principled.inputs["Base Color"].default_value = (0.25, 0.5, 0.75, 1.0)
+principled.inputs["Metallic"].default_value = 0.125
+principled.inputs["Roughness"].default_value = 0.75
+material.diffuse_color = (0.875, 0.125, 0.25, 1.0)
+material.metallic = 0.5
+material.roughness = 0.25
+bpy.ops.mesh.primitive_plane_add()
+bpy.context.object.data.materials.append(material)
+bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
+"#,
+        )
+        .map_err(|error| PotError::io(&error))?;
+        let generated = Command::new(&blender)
+            .arg("--background")
+            .arg("--factory-startup")
+            .arg("--disable-depsgraph-on-file-load")
+            .arg("--disable-autoexec")
+            .arg("--python-exit-code")
+            .arg("3")
+            .arg("--python")
+            .arg(&script_path)
+            .arg("--")
+            .arg(&blend_path)
+            .output()
+            .map_err(|error| PotError::io(&error))?;
+        if !generated.status.success() {
+            return Err(PotError::with_details(
+                ErrorCode::ImportFailed,
+                "Blender viewport fixture creation failed",
+                child_details(&generated),
+            ));
+        }
+        let find = |doc: &SceneDoc| -> Result<Material> {
+            doc.materials
+                .values()
+                .find(|material| material.name == "Viewport")
+                .cloned()
+                .ok_or_else(|| invalid_intermediate("viewport fixture material was not imported"))
+        };
+        let imported = import_blend(&blend_path, Some(&blender))?;
+        assert!(
+            imported.losses.is_empty(),
+            "viewport fixture import reported losses: {:?}",
+            imported.losses
+        );
+        let first = find(&imported.doc)?;
+        let viewport = first
+            .viewport_display
+            .as_ref()
+            .ok_or_else(|| invalid_intermediate("viewport display was not imported"))?;
+        assert_eq!(first.base_color, [0.25, 0.5, 0.75, 1.0]);
+        assert_eq!(first.metallic, 0.125);
+        assert_eq!(first.roughness, 0.75);
+        assert_eq!(viewport.diffuse_color, [0.875, 0.125, 0.25, 1.0]);
+        assert_eq!(viewport.metallic, 0.5);
+        assert_eq!(viewport.roughness, 0.25);
+        let output = directory.path().join("viewport-roundtrip.blend");
+        let context = export_context();
+        export_blend(
+            &imported.doc,
+            &project,
+            &output,
+            &ExportOptions {
+                allow_lossy: false,
+                pack: false,
+                blender: Some(&blender),
+                context: &context,
+            },
+        )?;
+        let reimported = import_blend(&output, Some(&blender))?;
+        assert!(
+            reimported.losses.is_empty(),
+            "viewport round-trip reported losses: {:?}",
+            reimported.losses
+        );
+        let again = find(&reimported.doc)?;
+        let viewport = again
+            .viewport_display
+            .as_ref()
+            .ok_or_else(|| invalid_intermediate("viewport display did not survive export"))?;
+        assert_eq!(again.base_color, [0.25, 0.5, 0.75, 1.0]);
+        assert_eq!(again.metallic, 0.125);
+        assert_eq!(again.roughness, 0.75);
+        assert_eq!(viewport.diffuse_color, [0.875, 0.125, 0.25, 1.0]);
+        assert_eq!(viewport.metallic, 0.5);
+        assert_eq!(viewport.roughness, 0.25);
         Ok(())
     }
 
@@ -14388,6 +16521,555 @@ print("UNSUPPORTED_POSE " + json.dumps({
         assert!(!reopened_clip.tracking.reconstruction.is_valid);
         Ok(())
     }
+    fn tiny_multires_export_document(params: &Value) -> Value {
+        let grid = vec![[0.0_f32; 3]; 4];
+        json!({
+            "data_blocks": {
+                "data": {
+                    "mesh": {
+                        "faces": [{"id": 1, "v": [0, 1, 2]}],
+                        "attributes": {
+                            "multires_displacement": {
+                                "total_levels": 1,
+                                "values": {"f1": [grid.clone(), grid.clone(), grid]},
+                            },
+                        },
+                    },
+                },
+            },
+            "nodes": {
+                "object": {
+                    "data": "data",
+                    "modifiers": [{"type": "multires", "params": params}],
+                },
+            },
+        })
+    }
+
+    #[test]
+    fn multires_sidecar_preparation_rolls_back_new_files_after_failure() -> Result<()> {
+        let directory = tempfile::tempdir().map_err(|error| PotError::io(&error))?;
+        let output = directory.path().join("failed.blend");
+        let sidecar = directory.path().join("failed_assets");
+        let mut document = tiny_multires_export_document(&json!("invalid params"));
+        let mut files = Vec::new();
+        let mut multires_sidecars = Vec::new();
+        let mut created_multires_sidecars = Vec::new();
+        let error = prepare_multires_external_sidecars(
+            &mut document,
+            &output,
+            &sidecar,
+            &mut files,
+            &mut multires_sidecars,
+            &mut created_multires_sidecars,
+            false,
+        )
+        .expect_err("invalid modifier params should fail after sidecar creation");
+        assert_eq!(error.code, ErrorCode::SceneInvalid);
+        assert!(!sidecar.join("multires.btx").exists());
+        assert!(!sidecar.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn external_export_refuses_mixed_corner_levels_without_writing_a_sidecar() -> Result<()> {
+        let directory = tempfile::tempdir().map_err(|error| PotError::io(&error))?;
+        let output = directory.path().join("mixed.blend");
+        let sidecar = directory.path().join("mixed_assets");
+        fs::create_dir(&sidecar).map_err(|error| PotError::io(&error))?;
+        let level_two = vec![[0.0_f32; 3]; 9];
+        let level_one = vec![[0.0_f32; 3]; 4];
+        let mut document = json!({
+            "data_blocks": {"data": {"mesh": {
+                "faces": [{"id": 1, "v": [0, 1, 2]}],
+                "attributes": {"multires_displacement": {
+                    "total_levels": 2,
+                    "grid_levels": [2, 1, 2],
+                    "values": {"f1": [level_two.clone(), level_one, level_two]},
+                }},
+            }}},
+            "nodes": {"object": {"data": "data", "modifiers": [{"type": "multires", "params": {}}]}},
+        });
+        let mut files = Vec::new();
+        let mut multires_sidecars = Vec::new();
+        let mut created_multires_sidecars = Vec::new();
+        let error = prepare_multires_external_sidecars(
+            &mut document,
+            &output,
+            &sidecar,
+            &mut files,
+            &mut multires_sidecars,
+            &mut created_multires_sidecars,
+            false,
+        )
+        .expect_err("mixed corner levels cannot be stored in an external sidecar");
+        assert_eq!(error.code, ErrorCode::UnrepresentableFeature);
+        assert!(error.message.contains("corner 1 is at level 1"));
+        assert!(
+            fs::read_dir(&sidecar)
+                .map_err(|error| PotError::io(&error))?
+                .next()
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn external_multires_reuse_does_not_delete_identical_preexisting_sidecar() -> Result<()> {
+        let directory = tempfile::tempdir().map_err(|error| PotError::io(&error))?;
+        let output = directory.path().join("packed.blend");
+        let sidecar = directory.path().join("packed_assets");
+        fs::create_dir(&sidecar).map_err(|error| PotError::io(&error))?;
+        let sidecar_file = sidecar.join("multires.btx");
+        let bytes = crate::geom::multires_external::write_external_grids(
+            &vec![vec![[0.0_f32; 3]; 4]; 3],
+            1,
+        )?;
+        fs::write(&sidecar_file, &bytes).map_err(|error| PotError::io(&error))?;
+        let mut document = tiny_multires_export_document(&json!({}));
+        let mut files = Vec::new();
+        let mut multires_sidecars = Vec::new();
+        let mut created_multires_sidecars = Vec::new();
+        prepare_multires_external_sidecars(
+            &mut document,
+            &output,
+            &sidecar,
+            &mut files,
+            &mut multires_sidecars,
+            &mut created_multires_sidecars,
+            false,
+        )?;
+        assert_eq!(multires_sidecars, std::slice::from_ref(&sidecar_file));
+        assert_eq!(created_multires_sidecars, Vec::<std::path::PathBuf>::new());
+        remove_multires_sidecars(&created_multires_sidecars)?;
+        assert_eq!(
+            fs::read(sidecar_file).map_err(|error| PotError::io(&error))?,
+            bytes
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn multires_grids_follow_custom_loop_order() -> Result<()> {
+        let mesh = json!({
+            "faces": [{"id": 1, "v": [0, 1, 2]}],
+            "attributes": {
+                "custom_normal": {"corner_order": {"f1": [2, 0, 1]}},
+            },
+        });
+        let corner_grid = |corner| {
+            (0..4)
+                .map(|sample| [(corner * 10 + sample) as f32, sample as f32, corner as f32])
+                .collect::<Vec<_>>()
+        };
+        let values = json!({"f1": [corner_grid(0), corner_grid(1), corner_grid(2)]});
+        let (grids, levels, source_corners) =
+            multires_grids_for_export(&mesh, &values, 1, None, 0)?;
+        assert_eq!(levels, [1, 1, 1]);
+        assert_eq!(source_corners, [1, 2, 0]);
+        assert_eq!(
+            grids.iter().map(|grid| grid[0][0]).collect::<Vec<_>>(),
+            [10.0, 20.0, 0.0]
+        );
+        assert_eq!(
+            [grids[0][3][0], grids[1][2][1], grids[2][1][2]],
+            [13.0, 2.0, 0.0]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn multires_external_paths_follow_source_dependency_boundary() -> Result<()> {
+        let directory = tempfile::tempdir().map_err(|error| PotError::io(&error))?;
+        let source_directory = directory.path().join("source");
+        let outside_directory = directory.path().join("outside");
+        fs::create_dir(&source_directory).map_err(|error| PotError::io(&error))?;
+        fs::create_dir(&outside_directory).map_err(|error| PotError::io(&error))?;
+        let blend_file = source_directory.join("scene.blend");
+        fs::write(&blend_file, b"blend").map_err(|error| PotError::io(&error))?;
+        let adjacent = source_directory.join("adjacent.btx");
+        fs::write(&adjacent, b"adjacent").map_err(|error| PotError::io(&error))?;
+        let external = outside_directory.join("registered.btx");
+        fs::write(&external, b"registered").map_err(|error| PotError::io(&error))?;
+        let adjacent_path =
+            resolve_blender_external_path("//adjacent.btx", &blend_file, &json!({"resources":[]}))?;
+        assert_eq!(
+            adjacent_path,
+            fs::canonicalize(&adjacent).map_err(|error| PotError::io(&error))?
+        );
+        let external_text = external.to_string_lossy().into_owned();
+        let registered = resolve_blender_external_path(
+            &external_text,
+            &blend_file,
+            &json!({"resources":[{"path":external_text.clone()}]}),
+        )?;
+        assert_eq!(
+            registered,
+            fs::canonicalize(external).map_err(|error| PotError::io(&error))?
+        );
+        let traversal = resolve_blender_external_path(
+            "//../outside/registered.btx",
+            &blend_file,
+            &json!({"resources":[]}),
+        );
+        assert_eq!(traversal.unwrap_err().code, ErrorCode::DependencyMissing);
+        Ok(())
+    }
+
+    #[test]
+    fn missing_multires_preflight_only_classifies_trusted_adjacent_files() -> Result<()> {
+        let directory = tempfile::tempdir().map_err(|error| PotError::io(&error))?;
+        let source_directory = directory.path().join("source");
+        let outside_directory = directory.path().join("outside");
+        fs::create_dir(&source_directory).map_err(|error| PotError::io(&error))?;
+        fs::create_dir(&outside_directory).map_err(|error| PotError::io(&error))?;
+        let blend_file = source_directory.join("scene.blend");
+        fs::write(&blend_file, b"blend").map_err(|error| PotError::io(&error))?;
+        let adjacent = BTreeMap::from([(
+            "Mesh".to_owned(),
+            json!({"external":{"filepath":"//missing.btx"}}),
+        )]);
+        let error = missing_adjacent_multires_sidecar(&blend_file, &adjacent)
+            .expect("missing adjacent MDisps sidecar should be reported");
+        assert_eq!(error.code, ErrorCode::FileNotFound);
+
+        fs::write(source_directory.join("present.btx"), b"sidecar")
+            .map_err(|error| PotError::io(&error))?;
+        let present = BTreeMap::from([(
+            "Mesh".to_owned(),
+            json!({"external":{"filepath":"//present.btx"}}),
+        )]);
+        assert!(missing_adjacent_multires_sidecar(&blend_file, &present).is_none());
+
+        let outside = BTreeMap::from([(
+            "Mesh".to_owned(),
+            json!({"external":{"filepath":outside_directory.join("missing.btx").to_string_lossy().into_owned()}}),
+        )]);
+        assert!(missing_adjacent_multires_sidecar(&blend_file, &outside).is_none());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn multires_external_path_rejects_symlink_escape() -> Result<()> {
+        let directory = tempfile::tempdir().map_err(|error| PotError::io(&error))?;
+        let source_directory = directory.path().join("source");
+        let outside = directory.path().join("outside.btx");
+        fs::create_dir(&source_directory).map_err(|error| PotError::io(&error))?;
+        let blend_file = source_directory.join("scene.blend");
+        fs::write(&blend_file, b"blend").map_err(|error| PotError::io(&error))?;
+        fs::write(&outside, b"outside").map_err(|error| PotError::io(&error))?;
+        std::os::unix::fs::symlink(&outside, source_directory.join("escape.btx"))
+            .map_err(|error| PotError::io(&error))?;
+        let error =
+            resolve_blender_external_path("//escape.btx", &blend_file, &json!({"resources":[]}))
+                .expect_err("unregistered symlink escape should fail");
+        assert_eq!(error.code, ErrorCode::DependencyMissing);
+        Ok(())
+    }
+
+    #[test]
+    fn multires_import_fails_when_external_grid_file_is_missing() -> Result<()> {
+        let directory = tempfile::tempdir().map_err(|error| PotError::io(&error))?;
+        let blend_file = directory.path().join("scene.blend");
+        fs::write(&blend_file, b"blend").map_err(|error| PotError::io(&error))?;
+        let raw = json!({"meshes":[{"name":"Mesh"}]});
+        let mut native_multires = BTreeMap::from([(
+            "Mesh".to_owned(),
+            json!({"total_levels":2,"external":{"filepath":"//missing.btx"}}),
+        )]);
+        let error = load_external_multires(&raw, &mut native_multires, &blend_file)
+            .expect_err("missing external displacement data must fail import");
+        assert_eq!(error.code, ErrorCode::FileNotFound);
+        Ok(())
+    }
+
+    #[test]
+    fn multires_dna_imports_inline_and_external_corner_grids() -> Result<()> {
+        fn record(imported: &ImportedGraph) -> Value {
+            imported
+                .doc
+                .data_blocks
+                .values()
+                .filter_map(|data| data.mesh.as_ref())
+                .find_map(|mesh| mesh.attributes.get("multires_displacement"))
+                .cloned()
+                .expect("imported mesh has no multires_displacement record")
+        }
+
+        fn check_grids(record: &Value) -> (usize, f64, bool) {
+            assert_eq!(record.get("total_levels").and_then(Value::as_u64), Some(2));
+            let values = record
+                .get("values")
+                .and_then(Value::as_object)
+                .expect("multires record has no values");
+            assert_eq!(values.len(), 6);
+            let mut corner_count = 0;
+            let mut z_sum = 0.0;
+            let mut nonzero = false;
+            for face_index in 1..=6 {
+                let corners = values
+                    .get(&format!("f{face_index}"))
+                    .and_then(Value::as_array)
+                    .expect("multires face is missing or invalid");
+                assert_eq!(corners.len(), 4);
+                corner_count += corners.len();
+                for grid in corners {
+                    let samples = grid.as_array().expect("multires corner grid is invalid");
+                    assert_eq!(samples.len(), 9);
+                    for sample in samples {
+                        let vector = sample.as_array().expect("multires vector is invalid");
+                        assert_eq!(vector.len(), 3);
+                        let components = vector
+                            .iter()
+                            .map(|component| component.as_f64().unwrap())
+                            .collect::<Vec<_>>();
+                        assert!(components.iter().all(|component| component.is_finite()));
+                        z_sum += components[2];
+                        nonzero |= components.iter().any(|component| component.abs() > 1.0e-7);
+                    }
+                }
+            }
+            assert_eq!(corner_count, 24);
+            assert!(z_sum.is_finite());
+            (corner_count, z_sum, nonzero)
+        }
+        let Some(blender) = optional_blender() else {
+            return Ok(());
+        };
+        let fixture_dir =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/multires");
+        let inline_path = fixture_dir.join("mr_inline.blend");
+        let external_path = fixture_dir.join("mr_external.blend");
+        assert!(inline_path.is_file(), "inline multires fixture is missing");
+        assert!(
+            external_path.is_file(),
+            "external multires fixture is missing"
+        );
+
+        let inline = import_blend(&inline_path, Some(&blender))?;
+        let inline_record = record(&inline);
+        assert!(inline_record.get("external").is_none());
+        let (_, inline_z_sum, inline_nonzero) = check_grids(&inline_record);
+        assert!(inline_nonzero, "reshaped multires grids are all zero");
+        assert!(
+            inline_z_sum.abs() < 100.0,
+            "inline tangent-space z sum is inconsistent with the small reference offsets: {inline_z_sum}"
+        );
+        let inline_modifier = inline
+            .doc
+            .nodes
+            .values()
+            .flat_map(|node| &node.modifiers)
+            .find(|modifier| modifier.modifier_type == "multires")
+            .expect("inline Multires modifier was not imported");
+        assert_eq!(
+            inline_modifier
+                .params
+                .get("total_levels")
+                .and_then(Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            inline_modifier
+                .params
+                .get("is_external")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+
+        let roundtrip_directory = tempfile::tempdir().map_err(|error| PotError::io(&error))?;
+        let project = Project::init(roundtrip_directory.path().join("project"))?;
+        let context = crate::eval::EvaluationContext::default();
+        for (stem, pack) in [("external", false), ("packed", true)] {
+            let output = roundtrip_directory
+                .path()
+                .join(format!("multires-{stem}.blend"));
+            let options = ExportOptions {
+                allow_lossy: false,
+                pack,
+                blender: Some(&blender),
+                context: &context,
+            };
+            let report = export_blend(&inline.doc, &project, &output, &options)?;
+            let sidecar = roundtrip_directory
+                .path()
+                .join(format!("multires-{stem}_assets"));
+            let has_displacement_sidecar = report.files.iter().any(|file| {
+                file.extension().is_some_and(|ext| ext == "btx") && file.starts_with(&sidecar)
+            });
+            assert_eq!(
+                has_displacement_sidecar, !pack,
+                "only external MDisps exports should report a displacement sidecar"
+            );
+            assert!(report.files.iter().any(|file| file == &output));
+            assert_eq!(sidecar.exists(), !pack);
+
+            let moved_directory = roundtrip_directory.path().join(format!("moved-{stem}"));
+            fs::create_dir(&moved_directory).map_err(|error| PotError::io(&error))?;
+            let moved_output = moved_directory.join(output.file_name().unwrap());
+            fs::rename(&output, &moved_output).map_err(|error| PotError::io(&error))?;
+            if !pack {
+                let moved_sidecar = moved_directory.join(sidecar.file_name().unwrap());
+                fs::rename(&sidecar, moved_sidecar).map_err(|error| PotError::io(&error))?;
+            }
+
+            let roundtrip = import_blend(&moved_output, Some(&blender))?;
+            let roundtrip_record = record(&roundtrip);
+            assert_eq!(
+                roundtrip_record.get("values"),
+                inline_record.get("values"),
+                "{stem} .blend round trip changed the MDisps grids"
+            );
+            let multires_modifier = roundtrip
+                .doc
+                .nodes
+                .values()
+                .flat_map(|node| &node.modifiers)
+                .find(|modifier| modifier.modifier_type == "multires")
+                .expect("round-tripped Multires modifier was not imported");
+            assert_eq!(
+                multires_modifier
+                    .params
+                    .get("is_external")
+                    .and_then(Value::as_bool),
+                Some(!pack)
+            );
+            if pack {
+                assert!(roundtrip_record.get("external").is_none());
+            } else {
+                let filepath = roundtrip_record
+                    .get("external")
+                    .and_then(|value| value.get("filepath"))
+                    .and_then(Value::as_str)
+                    .expect("external multires filepath was not imported");
+                assert!(
+                    filepath.starts_with(&format!("//multires-{stem}_assets/")),
+                    "external filepath must be relative to the output and its _assets folder: {filepath}"
+                );
+            }
+            let (_, _, nonzero) = check_grids(&roundtrip_record);
+            assert!(nonzero, "{stem} MDisps grids became zero");
+        }
+        let external = import_blend(&external_path, Some(&blender))?;
+        let external_record = record(&external);
+        let filepath = external_record
+            .get("external")
+            .and_then(|value| value.get("filepath"))
+            .and_then(Value::as_str)
+            .expect("external multires filepath was not imported");
+        assert!(
+            filepath.contains("ext_probe.btx"),
+            "unexpected Blender external filepath: {filepath}"
+        );
+        assert!(filepath.starts_with("//"));
+        check_grids(&external_record);
+        let external_modifier = external
+            .doc
+            .nodes
+            .values()
+            .flat_map(|node| &node.modifiers)
+            .find(|modifier| modifier.modifier_type == "multires")
+            .expect("external Multires modifier was not imported");
+        assert_eq!(
+            external_modifier
+                .params
+                .get("is_external")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            external_modifier
+                .params
+                .get("filepath")
+                .and_then(Value::as_str)
+                .map(|value| value.contains("ext_probe.btx")),
+            Some(true)
+        );
+
+        let missing_sidecar_directory =
+            tempfile::tempdir().map_err(|error| PotError::io(&error))?;
+        let missing_sidecar_blend = missing_sidecar_directory.path().join("external.blend");
+        fs::copy(external_path, &missing_sidecar_blend).map_err(|error| PotError::io(&error))?;
+        let Err(missing_sidecar_error) = import_blend(&missing_sidecar_blend, Some(&blender))
+        else {
+            panic!("importing a blend with a missing multires sidecar should fail");
+        };
+        assert_eq!(missing_sidecar_error.code, ErrorCode::FileNotFound);
+        eprintln!(
+            "multires oracle: inline corners=24 grid=9 z_sum={inline_z_sum}; external filepath={filepath}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn packed_variable_level_multires_export_reimports_per_loop_levels() -> Result<()> {
+        let Some(blender) = optional_blender() else {
+            return Ok(());
+        };
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/multires/mr_inline.blend");
+        let mut imported = import_blend(&fixture, Some(&blender))?;
+        let record = imported
+            .doc
+            .data_blocks
+            .values_mut()
+            .filter_map(|data| data.mesh.as_mut())
+            .find_map(|mesh| mesh.attributes.get_mut("multires_displacement"))
+            .expect("inline fixture has a multires record");
+        // Alternate level-2 and level-1 loops; level-1 grids keep their first four samples.
+        let mut loop_index = 0_usize;
+        let mut levels = Vec::new();
+        let values = record
+            .get_mut("values")
+            .and_then(Value::as_object_mut)
+            .expect("fixture multires values");
+        for corners in values.values_mut() {
+            for corner in corners.as_array_mut().expect("fixture face corners") {
+                let level = if loop_index.is_multiple_of(2) {
+                    2_u64
+                } else {
+                    1_u64
+                };
+                if level == 1 {
+                    corner
+                        .as_array_mut()
+                        .expect("fixture corner grid")
+                        .truncate(4);
+                }
+                levels.push(Value::from(level));
+                loop_index += 1;
+            }
+        }
+        assert_eq!(loop_index, 24);
+        let expected_levels = Value::Array(levels);
+        record["grid_levels"] = expected_levels.clone();
+        let expected_values = record["values"].clone();
+
+        let directory = tempfile::tempdir().map_err(|error| PotError::io(&error))?;
+        let project = Project::init(directory.path().join("project"))?;
+        let context = crate::eval::EvaluationContext::default();
+        let output = directory.path().join("variable-packed.blend");
+        let options = ExportOptions {
+            allow_lossy: false,
+            pack: true,
+            blender: Some(&blender),
+            context: &context,
+        };
+        export_blend(&imported.doc, &project, &output, &options)?;
+        let roundtrip = import_blend(&output, Some(&blender))?;
+        let roundtrip_record = roundtrip
+            .doc
+            .data_blocks
+            .values()
+            .filter_map(|data| data.mesh.as_ref())
+            .find_map(|mesh| mesh.attributes.get("multires_displacement"))
+            .expect("round-tripped mesh has no multires record");
+        assert_eq!(roundtrip_record.get("grid_levels"), Some(&expected_levels));
+        assert_eq!(roundtrip_record.get("values"), Some(&expected_values));
+        assert!(roundtrip_record.get("external").is_none());
+        Ok(())
+    }
 
     #[test]
     fn import_volume_data_material_slots_preserves_nullable_bindings() -> Result<()> {
@@ -14744,23 +17426,22 @@ print("UNSUPPORTED_POSE " + json.dumps({
         let reopened_hit = crate::shader::HitContext::new(&imported.doc.node_groups);
         let source_params = crate::shader::evaluate_surface(source, &source_hit)?;
         let reopened_params = crate::shader::evaluate_surface(reopened, &reopened_hit)?;
-        assert_eq!(
-            reopened_params.volume_scattering,
-            source_params.volume_scattering
-        );
-        assert!(close(
-            reopened_params.volume_density,
-            source_params.volume_density
-        ));
         assert!(close(
             reopened_params.volume_anisotropy,
             source_params.volume_anisotropy
         ));
         assert!(
             reopened_params
-                .volume_color
+                .volume_scatter
                 .iter()
-                .zip(source_params.volume_color)
+                .zip(source_params.volume_scatter)
+                .all(|(actual, expected)| close(*actual, expected))
+        );
+        assert!(
+            reopened_params
+                .volume_absorption
+                .iter()
+                .zip(source_params.volume_absorption)
                 .all(|(actual, expected)| close(*actual, expected))
         );
         assert!(
@@ -15056,5 +17737,223 @@ print("UNSUPPORTED_POSE " + json.dumps({
             "a stored-nothing Density must read as Blender's default of 1.0"
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod camera_import_tests {
+    use super::*;
+    use std::f64::consts::{FRAC_PI_2, PI};
+
+    fn panorama(panorama_type: &str, longitude: (f64, f64), latitude: (f64, f64)) -> Value {
+        json!({"name": "pano", "type": "PANO", "panorama_type": panorama_type,
+               "longitude_min": longitude.0, "longitude_max": longitude.1,
+               "latitude_min": latitude.0, "latitude_max": latitude.1,
+               "fisheye_fov": PI, "fisheye_lens": 12.0})
+    }
+
+    fn imported(camera: &Value) -> CameraData {
+        let mut data = CameraData::default();
+        imported_camera_projection(camera, &mut data);
+        data
+    }
+
+    fn features(camera: &Value) -> Vec<String> {
+        import_losses(&json!({"cameras": [camera]}))
+            .into_iter()
+            .map(|loss| loss.feature_id)
+            .collect()
+    }
+
+    #[test]
+    fn area_light_spread_imports_without_a_loss() {
+        let area = json!({"name": "Area", "type": "AREA", "spread": 0.5});
+        assert!(import_losses(&json!({ "lights": [area] })).is_empty());
+    }
+
+    #[test]
+    fn shadow_backface_culling_imports_with_its_loss() {
+        let culled = json!({"name": "Culled", "use_backface_culling_shadow": true});
+        let features: Vec<String> = import_losses(&json!({"materials": [culled]}))
+            .into_iter()
+            .map(|loss| loss.feature_id)
+            .collect();
+        assert_eq!(features, ["blender.material.backface_culling_shadow"]);
+        let plain = json!({"name": "Plain", "use_backface_culling_shadow": false});
+        assert!(import_losses(&json!({"materials": [plain]})).is_empty());
+    }
+
+    #[test]
+    fn full_sphere_equirectangular_imports_at_blenders_defaults() -> Result<(), serde_json::Error> {
+        let full = f64::from(std::f32::consts::PI);
+        let camera = panorama("EQUIRECTANGULAR", (-full, full), (-0.5 * full, 0.5 * full));
+        let data = imported(&camera);
+        assert_eq!(data.projection, CameraProjection::Panorama);
+        assert_eq!(data.panorama_type, "equirectangular");
+        assert_eq!(features(&camera), Vec::<String>::new());
+        // Blender's defaults are omitted from the scene, so an imported default camera stores no limits.
+        let stored = serde_json::to_value(&data)?;
+        assert!(stored.get("longitude_min").is_none() && stored.get("latitude_max").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn ranged_equirectangular_panoramas_import_their_limits_without_loss() {
+        let camera = panorama("EQUIRECTANGULAR", (-1.2, 2.0), (-0.7, 1.1));
+        let data = imported(&camera);
+        assert_eq!(data.projection, CameraProjection::Panorama);
+        assert!((data.longitude_min + 1.2).abs() <= 1.0e-12);
+        assert!((data.longitude_max - 2.0).abs() <= 1.0e-12);
+        assert!((data.latitude_min + 0.7).abs() <= 1.0e-12);
+        assert!((data.latitude_max - 1.1).abs() <= 1.0e-12);
+        assert_eq!(features(&camera), Vec::<String>::new());
+    }
+
+    #[test]
+    fn equirectangular_limits_potter_cannot_hold_report_a_loss() {
+        // A longitude span beyond a turn would map one direction to two pixels, which the projection cannot represent.
+        let wide = panorama("EQUIRECTANGULAR", (0.0, 7.0), (-FRAC_PI_2, FRAC_PI_2));
+        assert_eq!(features(&wide), ["blender.camera.panorama_range"]);
+        let inverted = panorama("EQUIRECTANGULAR", (2.0, -2.0), (-FRAC_PI_2, FRAC_PI_2));
+        assert_eq!(features(&inverted), ["blender.camera.panorama_range"]);
+        let beyond_pole = panorama("EQUIRECTANGULAR", (-PI, PI), (-FRAC_PI_2, 2.0));
+        assert_eq!(features(&beyond_pole), ["blender.camera.panorama_range"]);
+    }
+
+    #[test]
+    fn fisheye_equidistant_imports_its_field_of_view_without_loss() {
+        let camera = panorama("FISHEYE_EQUIDISTANT", (-PI, PI), (-FRAC_PI_2, FRAC_PI_2));
+        let data = imported(&camera);
+        assert_eq!(data.projection, CameraProjection::Panorama);
+        assert_eq!(data.panorama_type, "fisheye_equidistant");
+        assert!((data.fisheye_fov - PI).abs() <= 1.0e-12);
+        assert_eq!(features(&camera), Vec::<String>::new());
+
+        let narrow = json!({"name": "pano", "type": "PANO", "panorama_type": "FISHEYE_EQUIDISTANT", "fisheye_fov": 2.0});
+        assert!((imported(&narrow).fisheye_fov - 2.0).abs() <= 1.0e-12);
+    }
+
+    #[test]
+    fn fisheye_equisolid_imports_its_lens_and_field_of_view_without_loss() {
+        let camera = panorama("FISHEYE_EQUISOLID", (-PI, PI), (-FRAC_PI_2, FRAC_PI_2));
+        let data = imported(&camera);
+        assert_eq!(data.projection, CameraProjection::Panorama);
+        assert_eq!(data.panorama_type, "fisheye_equisolid");
+        // Blender's `fisheye_lens` is its own setting: the perspective `lens_mm` is not touched by the import.
+        assert!((data.fisheye_lens - 12.0).abs() <= 1.0e-12);
+        assert_eq!(data.lens_mm, CameraData::default().lens_mm);
+        assert_eq!(features(&camera), Vec::<String>::new());
+    }
+
+    #[test]
+    fn fisheye_fields_of_view_are_held_across_blenders_range_and_reported_beyond_it() {
+        // Blender's hard range tops out at 10π in float32, which is a little below the f64 value of 10π, so the test uses the
+        // constant itself: that maximum is held, and a value beyond it is reported.
+        let wide = json!({"name": "pano", "type": "PANO", "panorama_type": "FISHEYE_EQUIDISTANT", "fisheye_fov": crate::model::FISHEYE_FOV_MAX});
+        assert!((imported(&wide).fisheye_fov - crate::model::FISHEYE_FOV_MAX).abs() <= 1.0e-12);
+        assert_eq!(features(&wide), Vec::<String>::new());
+        let beyond_range = json!({"name": "pano", "type": "PANO", "panorama_type": "FISHEYE_EQUIDISTANT", "fisheye_fov": 11.0 * PI});
+        assert_eq!(features(&beyond_range), ["blender.camera.fisheye_fov"]);
+        let too_narrow = json!({"name": "pano", "type": "PANO", "panorama_type": "FISHEYE_EQUISOLID", "fisheye_fov": 0.1});
+        assert_eq!(features(&too_narrow), ["blender.camera.fisheye_fov"]);
+    }
+
+    #[test]
+    fn fisheye_lens_outside_blenders_range_is_reported() {
+        let beyond = json!({"name": "pano", "type": "PANO", "panorama_type": "FISHEYE_EQUISOLID", "fisheye_lens": 150.0});
+        assert_eq!(features(&beyond), ["blender.camera.fisheye_lens"]);
+    }
+
+    #[test]
+    fn settings_a_camera_ignores_are_still_kept_and_reported_only_when_unrepresentable() {
+        // A perspective camera stores the panorama settings Blender holds on it, so they round-trip with no loss.
+        let perspective = json!({"name": "cam", "type": "PERSP", "panorama_type": "FISHEYE_EQUISOLID",
+            "fisheye_lens": 12.0, "fisheye_fov": 3.0, "longitude_min": -1.2, "longitude_max": 2.0,
+            "latitude_min": -0.7, "latitude_max": 1.1});
+        let data = imported(&perspective);
+        assert_eq!(data.projection, CameraProjection::Perspective);
+        assert_eq!(data.panorama_type, "fisheye_equisolid");
+        assert!((data.fisheye_lens - 12.0).abs() <= 1.0e-12);
+        assert!((data.fisheye_fov - 3.0).abs() <= 1.0e-12);
+        assert!((data.longitude_min + 1.2).abs() <= 1.0e-12);
+        assert_eq!(features(&perspective), Vec::<String>::new());
+    }
+
+    #[test]
+    fn other_panorama_types_import_as_perspective_and_report_what_potter_lacks() {
+        let mirror = panorama("MIRRORBALL", (-PI, PI), (-FRAC_PI_2, FRAC_PI_2));
+        assert_eq!(imported(&mirror).projection, CameraProjection::Perspective);
+        assert_eq!(features(&mirror), ["blender.camera.panorama_type"]);
+    }
+}
+
+#[cfg(test)]
+mod workbench_display_loss_tests {
+    use super::*;
+
+    /// Blender 5.2.2's factory `scene.display.shading`, as the bridge writes it.
+    fn factory_shading() -> Value {
+        json!({"type": "SOLID", "light": "STUDIO", "studio_light": "Default", "color_type": "MATERIAL",
+               "use_world_space_lighting": false, "show_specular_highlight": true, "show_cavity": false,
+               "show_shadows": false, "show_object_outline": false, "show_backface_culling": false,
+               "show_xray": false, "xray_alpha": 0.5, "use_dof": false, "camera_dof": false,
+               "background_type": "THEME"})
+    }
+
+    /// The loss features of a scene whose shading is the factory one with `edits` applied.
+    fn losses(edits: &[(&str, Value)]) -> Vec<String> {
+        let mut shading = factory_shading();
+        for (key, value) in edits {
+            shading[*key] = value.clone();
+        }
+        import_losses(&json!({"scenes": [{"name": "Scene", "display_shading": shading}]}))
+            .into_iter()
+            .map(|loss| loss.feature_id)
+            .collect()
+    }
+
+    #[test]
+    fn factory_shading_reports_nothing() {
+        assert_eq!(losses(&[]), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn xray_is_reported_only_when_translucent() {
+        assert_eq!(
+            losses(&[("show_xray", json!(true))]),
+            ["blender.scene.display_xray"]
+        );
+        assert_eq!(
+            losses(&[("show_xray", json!(true)), ("xray_alpha", json!(1.0))]),
+            Vec::<&str>::new()
+        );
+    }
+
+    #[test]
+    fn depth_of_field_is_reported_only_when_the_camera_has_it() {
+        assert_eq!(losses(&[("use_dof", json!(true))]), Vec::<&str>::new());
+        assert_eq!(
+            losses(&[("use_dof", json!(true)), ("camera_dof", json!(true))]),
+            ["blender.scene.display_dof"]
+        );
+    }
+
+    #[test]
+    fn only_wireframe_is_below_solid_and_only_viewport_is_an_unimported_background() {
+        assert_eq!(
+            losses(&[("type", json!("WIREFRAME"))]),
+            ["blender.scene.display_type"]
+        );
+        for shading_type in ["SOLID", "MATERIAL", "RENDERED"] {
+            assert_eq!(losses(&[("type", json!(shading_type))]), Vec::<&str>::new());
+        }
+        assert_eq!(
+            losses(&[("background_type", json!("WORLD"))]),
+            Vec::<&str>::new()
+        );
+        assert_eq!(
+            losses(&[("background_type", json!("VIEWPORT"))]),
+            ["blender.scene.display_background"]
+        );
     }
 }

@@ -180,8 +180,18 @@ fn texture_mask_weights(
         let mut texture_uv = (mapping_coordinates + DVec2::ONE) * 0.5;
         texture_uv.x = repeat_texture_coordinate(texture_uv.x);
         texture_uv.y = repeat_texture_coordinate(texture_uv.y);
-        let sample = crate::image::sample(image, texture_uv.to_array(), 0);
-        weights.insert(vertex.id, texture_channel(sample, channel));
+        // Blender's intensity is the mean of the stored RGB, read with colour management off. The colour channels
+        // come from the decoded sample (`BKE_texture_get_value`, `MOD_weightvg_util.cc`).
+        let weight = if channel == "INT" {
+            let encoded = crate::image::sample_encoded(image, texture_uv.to_array(), false);
+            (encoded[0] + encoded[1] + encoded[2]) / 3.0
+        } else {
+            texture_channel(
+                crate::image::sample(image, texture_uv.to_array(), false),
+                channel,
+            )
+        };
+        weights.insert(vertex.id, weight);
     }
     Ok(Some(weights))
 }
@@ -238,8 +248,8 @@ fn texture_channel(color: [f64; 4], channel: &str) -> f64 {
             }
         }
         "VAL" => maximum,
-        "ALPHA" => alpha,
-        _ => 0.2126_f64.mul_add(red, 0.7152_f64.mul_add(green, 0.0722 * blue)),
+        // "ALPHA"; the caller validates the channel and reads "INT" through `sample_encoded`.
+        _ => alpha,
     }
 }
 
@@ -1654,7 +1664,7 @@ fn project_uv_point(
                     - 2.0 * shift_y * view_factor / ycor,
             )
         }
-        crate::model::CameraProjection::Panorama | crate::model::CameraProjection::Fisheye => {
+        crate::model::CameraProjection::Panorama => {
             return Err(PotError::with_details(
                 ErrorCode::UnsupportedFeature,
                 "UV Project does not model panoramic or fisheye camera projections",

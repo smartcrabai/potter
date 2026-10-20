@@ -29,7 +29,7 @@ use crate::{
         uv_layers::{self, UvStore},
     },
     graph::{GraphKind, GraphLink, GraphNode, GraphSocket, NodeGroup},
-    image::ImageInterpolation,
+    image::{ImageExtension, ImageInterpolation},
     model::{Id, Material, SceneDoc, TextureRef},
 };
 
@@ -38,11 +38,42 @@ const OUTPUT_GROUP_NAME: &str = "glTF Material Output";
 /// Potter ID of the group that holds the `Occlusion` input.
 const OUTPUT_GROUP_ID: &str = "gltf_material_output";
 
-/// A texture of one glTF slot and its `KHR_texture_transform`.
+/// A texture of one glTF slot, its `KHR_texture_transform`, and the wrap of each UV axis (S, T).
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct SlotTexture {
     pub(crate) texture: TextureRef,
     pub(crate) transform: Option<TextureTransform>,
+    pub(crate) wrap: [ImageExtension; 2],
+}
+
+impl SlotTexture {
+    /// Whether the two UV axes wrap differently, which a single extension cannot express. A field cannot hold it, so
+    /// the slot needs a graph with per-axis UV nodes, as Blender's importer builds it.
+    pub(crate) fn has_mixed_wrap(&self) -> bool {
+        self.wrap[0] != self.wrap[1]
+    }
+}
+
+/// The extension a texture field or node carries for a wrap pair: the shared extension of both axes, or EXTEND for a
+/// mixed pair, as Blender's importer sets it (the per-axis nodes then do the wrapping).
+pub(crate) fn uniform_extension(wrap: [ImageExtension; 2]) -> ImageExtension {
+    if wrap[0] == wrap[1] {
+        wrap[0]
+    } else {
+        ImageExtension::Extend
+    }
+}
+
+/// The Image Texture `extension` of a slot, or `None` for REPEAT, which Blender defaults to. A mixed wrap is EXTEND on
+/// the node, and the per-axis nodes do the rest.
+fn slot_extension_name(slot: &SlotTexture) -> Option<&'static str> {
+    let node_extension = uniform_extension(slot.wrap);
+    match node_extension {
+        ImageExtension::Repeat => None,
+        ImageExtension::Extend => Some("EXTEND"),
+        ImageExtension::Clip => Some("CLIP"),
+        ImageExtension::Mirror => Some("MIRROR"),
+    }
 }
 
 /// Every texture slot of one material that a graph can hold.
@@ -72,6 +103,7 @@ impl GraphTextures {
     ) -> Self {
         let plain = |texture: Option<TextureRef>| {
             texture.map(|texture| SlotTexture {
+                wrap: [texture.extension; 2],
                 texture,
                 transform: None,
             })
@@ -88,13 +120,26 @@ impl GraphTextures {
         }
     }
 
-    /// Whether any slot needs a graph: a transform, a packed metallic-roughness, emissive or occlusion
-    /// texture, or a normal scale that a Potter texture field cannot hold. A Potter field reads the
-    /// Red channel, while glTF packs roughness in Green and metallic in Blue.
+    /// Whether any slot needs a graph: a transform, a mixed per-axis wrap, a packed metallic-roughness, emissive or
+    /// occlusion texture, or a normal scale that a Potter texture field cannot hold. A Potter field reads the Red
+    /// channel, while glTF packs roughness in Green and metallic in Blue.
     pub(crate) fn needs_graph(&self) -> bool {
         let transformed =
             |slot: &Option<SlotTexture>| slot.as_ref().is_some_and(|slot| slot.transform.is_some());
-        transformed(&self.base_color)
+        let mixed = [
+            &self.base_color,
+            &self.metallic_roughness,
+            &self.roughness,
+            &self.metallic,
+            &self.normal,
+            &self.emissive,
+            &self.occlusion,
+        ]
+        .into_iter()
+        .flatten()
+        .any(SlotTexture::has_mixed_wrap);
+        mixed
+            || transformed(&self.base_color)
             || self.metallic_roughness.is_some()
             || transformed(&self.normal)
             || transformed(&self.emissive)
@@ -201,8 +246,12 @@ fn write_principled_inputs(node: &mut GraphNode, material: &Material) {
         "Emission Strength".to_owned(),
         json!(material.emission_strength),
     );
-    node.inputs
-        .insert("Alpha".to_owned(), json!(material.base_color[3]));
+    // An OPAQUE material has no transparency, so its base colour alpha (a glTF factor, say) stays out of the graph and
+    // the Alpha input's default of one applies.
+    if material.alpha_mode != "opaque" {
+        node.inputs
+            .insert("Alpha".to_owned(), json!(material.base_color[3]));
+    }
     node.inputs
         .insert("Base Color".to_owned(), json!(material.base_color));
     node.inputs
@@ -399,6 +448,39 @@ fn texture_node(graph: &mut NodeGroup, name: &str, slot: &SlotTexture) -> Result
         connect(graph, &source.0, &source.1, &map, "Vector")?;
         source = (map, "Vector".to_owned());
     }
+    if slot.has_mixed_wrap() {
+        // Blender's importer splits the UV per axis: [Separate XYZ] => [Wrap S] and [Wrap T] => [Combine XYZ].
+        // REPEAT is WRAP into [0, 1) and MIRRORED_REPEAT is PINGPONG; a CLAMP axis passes through, as the
+        // node's EXTEND makes it clamp.
+        let split = format!("{name}_split_uv");
+        insert(graph, &split, GraphNode::new("ShaderNodeSeparateXYZ"))?;
+        connect(graph, &source.0, &source.1, &split, "Vector")?;
+        let combine = format!("{name}_combine_uv");
+        insert(graph, &combine, GraphNode::new("ShaderNodeCombineXYZ"))?;
+        for (index, axis) in ["X", "Y"].into_iter().enumerate() {
+            match slot.wrap[index] {
+                ImageExtension::Repeat | ImageExtension::Mirror => {
+                    let wrap = format!("{name}_wrap_{}", axis.to_ascii_lowercase());
+                    let mut math = GraphNode::new("ShaderNodeMath");
+                    if slot.wrap[index] == ImageExtension::Repeat {
+                        math.properties
+                            .insert("operation".to_owned(), json!("WRAP"));
+                        math.inputs.insert("Value_001".to_owned(), json!(0.0));
+                        math.inputs.insert("Value_002".to_owned(), json!(1.0));
+                    } else {
+                        math.properties
+                            .insert("operation".to_owned(), json!("PINGPONG"));
+                        math.inputs.insert("Value_001".to_owned(), json!(1.0));
+                    }
+                    insert(graph, &wrap, math)?;
+                    connect(graph, &split, axis, &wrap, "Value")?;
+                    connect(graph, &wrap, "Value", &combine, axis)?;
+                }
+                _ => connect(graph, &split, axis, &combine, axis)?,
+            }
+        }
+        source = (combine, "Vector".to_owned());
+    }
     let mut image = GraphNode::new("ShaderNodeTexImage");
     image
         .properties
@@ -410,6 +492,11 @@ fn texture_node(graph: &mut NodeGroup, name: &str, slot: &SlotTexture) -> Result
     image
         .properties
         .insert("interpolation".to_owned(), json!(interpolation));
+    if let Some(extension) = slot_extension_name(slot) {
+        image
+            .properties
+            .insert("extension".to_owned(), json!(extension));
+    }
     insert(graph, &tex, image)?;
     connect(graph, &source.0, &source.1, &tex, "Vector")?;
     Ok(tex)
@@ -723,8 +810,7 @@ pub(crate) fn plan_blend_textures(doc: &SceneDoc) -> Result<(Vec<Loss>, BlendTex
                 if let Some(previous) = previous.filter(|previous| !replaced.contains(previous)) {
                     replaced.push(previous.clone());
                 }
-                let mut graph = build_graph(material, &textures, false)?;
-                clamp_texture_nodes(&mut graph, "");
+                let graph = build_graph(material, &textures, false)?;
                 (graph, generated_graph_id("blend-texture", material_id)?)
             }
         };
@@ -911,18 +997,6 @@ fn normal_map_node(slot: &SlotTexture, strength: f64) -> GraphNode {
     normal_map
 }
 
-/// Sets the Image Texture nodes whose IDs start with `prefix` to the Extend extension. Potter's native material textures
-/// clamp the UV to the image edge (`sample_with_interpolation`), while Blender's Image Texture repeats by default, so
-/// the export clamps the nodes it generates. Authored nodes never start with a generated prefix (`fresh_prefix`).
-fn clamp_texture_nodes(graph: &mut NodeGroup, prefix: &str) {
-    for (id, node) in &mut graph.nodes {
-        if node.node_type == "ShaderNodeTexImage" && id.as_str().starts_with(prefix) {
-            node.properties
-                .insert("extension".to_owned(), json!("EXTEND"));
-        }
-    }
-}
-
 /// The authored graph of a material with native texture fields, copied for export with the fields overlaid on its
 /// Principled BSDF, as Potter's evaluator applies them after the graph. Base Color multiplies its RGB, Roughness and
 /// Metallic multiply their Red channel, and Alpha multiplies its alpha on a non-opaque material (the renderer ignores
@@ -1041,7 +1115,6 @@ fn overlay_authored(
             )?;
         }
     }
-    clamp_texture_nodes(&mut graph, &prefix);
     Ok(Some(graph))
 }
 
@@ -1233,10 +1306,12 @@ mod tests {
             roughness: None,
             metallic: None,
             normal: Some(SlotTexture {
+                wrap: [ImageExtension::Repeat; 2],
                 texture: TextureRef {
                     image: Id::new("normal_image")?,
                     uv_layer: uv_layer.map(str::to_owned),
                     interpolation: ImageInterpolation::Linear,
+                    extension: ImageExtension::Repeat,
                 },
                 transform: None,
             }),
@@ -1272,6 +1347,7 @@ mod tests {
             image: Id::new(image)?,
             uv_layer: uv_layer.map(str::to_owned),
             interpolation: ImageInterpolation::Linear,
+            extension: ImageExtension::Repeat,
         })
     }
 

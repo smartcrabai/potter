@@ -307,11 +307,6 @@ fn surface_to_mesh(surface: adaptive::Surface, smooth_shade: bool) -> Result<Mes
 }
 
 fn mesh_triangles(mesh: &Mesh, voxel_size: f32) -> Result<Vec<Triangle>> {
-    let world_vertices = mesh
-        .vertices
-        .iter()
-        .map(|vertex| vertex.co.as_vec3())
-        .collect::<Vec<_>>();
     let vertices = mesh
         .vertices
         .iter()
@@ -330,67 +325,25 @@ fn mesh_triangles(mesh: &Mesh, voxel_size: f32) -> Result<Vec<Triangle>> {
         .enumerate()
         .map(|(index, vertex)| (vertex.id, index))
         .collect::<std::collections::HashMap<_, _>>();
-    let fallback = mesh.triangulate().map_err(|error| {
+    // Blender's remesh reads `corner_tris`, so quads take the same diagonal as the tessellation.
+    let tessellation = mesh.tessellate().map_err(|error| {
         PotError::with_details(
             ErrorCode::InvalidArgument,
             format!("voxel remesh could not triangulate the input mesh: {error}"),
             json!({"mesh_error": error.to_string()}),
         )
     })?;
-    let mut fallback_offset = 0;
-    let mut triangles = Vec::new();
-    for face in &mesh.faces {
-        let triangle_count = face.vertices.len().saturating_sub(2);
-        if face.vertices.len() == 3 {
-            let points = face
-                .vertices
+    tessellation
+        .iter()
+        .map(|triangle| {
+            let points = triangle
                 .iter()
                 .map(|id| vertex_index.get(id).map(|index| vertices[*index]))
                 .collect::<Option<Vec<_>>>()
-                .ok_or_else(|| invalid_mesh("face references a missing vertex"))?;
-            triangles.push(make_triangle([points[0], points[1], points[2]]));
-        } else if face.vertices.len() == 4 {
-            let points = face
-                .vertices
-                .iter()
-                .map(|id| vertex_index.get(id).map(|index| vertices[*index]))
-                .collect::<Option<Vec<_>>>()
-                .ok_or_else(|| invalid_mesh("face references a missing vertex"))?;
-            let world_points = face
-                .vertices
-                .iter()
-                .map(|id| vertex_index.get(id).map(|index| world_vertices[*index]))
-                .collect::<Option<Vec<_>>>()
-                .ok_or_else(|| invalid_mesh("face references a missing vertex"))?;
-            let p = [points[0], points[1], points[2], points[3]];
-            let world = [
-                world_points[0],
-                world_points[1],
-                world_points[2],
-                world_points[3],
-            ];
-            let first_cross = (world[1] - world[0]).cross(world[2] - world[0]);
-            let second_cross = (world[3] - world[0]).cross(world[2] - world[0]);
-            if first_cross.dot(second_cross) > 0.0 {
-                triangles.push(make_triangle([p[0], p[1], p[3]]));
-                triangles.push(make_triangle([p[1], p[2], p[3]]));
-            } else {
-                triangles.push(make_triangle([p[0], p[1], p[2]]));
-                triangles.push(make_triangle([p[0], p[2], p[3]]));
-            }
-        } else if face.vertices.len() > 4 {
-            for triangle in &fallback[fallback_offset..fallback_offset + triangle_count] {
-                let points = triangle
-                    .iter()
-                    .map(|id| vertex_index.get(id).map(|index| vertices[*index]))
-                    .collect::<Option<Vec<_>>>()
-                    .ok_or_else(|| invalid_mesh("triangulation references a missing vertex"))?;
-                triangles.push(make_triangle([points[0], points[1], points[2]]));
-            }
-        }
-        fallback_offset += triangle_count;
-    }
-    Ok(triangles)
+                .ok_or_else(|| invalid_mesh("triangulation references a missing vertex"))?;
+            Ok(make_triangle([points[0], points[1], points[2]]))
+        })
+        .collect()
 }
 
 fn make_triangle(points: [DVec3; 3]) -> Triangle {

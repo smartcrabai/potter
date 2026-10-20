@@ -32,7 +32,7 @@ mod blender_checked;
 mod process;
 
 /// Owners of the measured Blender divergences in `behavior_scenarios.json`.
-const KNOWN_GAP_OWNERS: &[&str] = &["D", "PR15"];
+const KNOWN_GAP_OWNERS: &[&str] = &[];
 
 const GUARD_TARGET: &str = "guard_target";
 const GUARD_TARGET_ALT: &str = "guard_target_alt";
@@ -310,8 +310,10 @@ fn param_table_defaults_match_blender_fixture() {
         actual_exceptions,
         vec![
             "mesh_sequence_cache.frame_offset",
+            "mesh_sequence_cache.is_sequence",
             "mesh_sequence_cache.override_frame",
-            "mesh_sequence_cache.scale",
+            "mesh_sequence_cache.velocity_name",
+            "mesh_sequence_cache.velocity_unit",
             "nodes.inputs",
             "ocean.filepath",
             "uv_project.projectors",

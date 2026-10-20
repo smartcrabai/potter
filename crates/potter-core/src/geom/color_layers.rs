@@ -113,6 +113,136 @@ fn color_value(value: &Value) -> Option<[f64; 4]> {
     }
 }
 
+/// Encoded `BYTE_COLOR` channels scaled to `[0, 255]`, before integer quantization.
+///
+/// RGB is sRGB encoded and alpha stays linear, matching Blender's `BLI_color::encode`.
+pub(crate) fn byte_color_encoded_components(linear: [f64; 4]) -> [f32; 4] {
+    std::array::from_fn(|index| {
+        let channel = linear[index].clamp(0.0, 1.0) as f32;
+        let encoded = if index < 3 {
+            blender_linear_to_srgb_f32(channel)
+        } else {
+            channel
+        };
+        encoded * 255.0
+    })
+}
+
+// Blender's fastpow approximation affects which byte an encoded channel rounds to.
+fn blender_linear_to_srgb_f32(value: f32) -> f32 {
+    if value < 0.003_130_8 {
+        if value < 0.0 { 0.0 } else { value * 12.92 }
+    } else {
+        1.055 * blender_fastpow512(value) - 0.055
+    }
+}
+
+fn blender_fastpow512(arg: f32) -> f32 {
+    fn fastpow(exp: i32, e2coeff: i32, arg: f32) -> f32 {
+        let mut value = arg * f32::from_bits(e2coeff as u32);
+        value = (value.to_bits() as i32) as f32;
+        value *= f32::from_bits(exp as u32);
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+        let value = value.round_ties_even() as i32;
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        let value = value as i32;
+        f32::from_bits(value as u32)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn rsqrt(value: f32) -> f32 {
+        use std::arch::aarch64::{vdup_n_f32, vget_lane_f32, vmul_f32, vrsqrte_f32, vrsqrts_f32};
+
+        // SAFETY: this fast-power path calls rsqrt only with positive finite scalars.
+        unsafe {
+            let input = vdup_n_f32(value);
+            let mut estimate = vrsqrte_f32(input);
+            estimate = vmul_f32(estimate, vrsqrts_f32(vmul_f32(input, estimate), estimate));
+            estimate = vmul_f32(estimate, vrsqrts_f32(vmul_f32(input, estimate), estimate));
+            vget_lane_f32::<0>(estimate)
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn rsqrt(value: f32) -> f32 {
+        use std::arch::x86_64::{_mm_add_ps, _mm_cvtss_f32, _mm_mul_ps, _mm_rsqrt_ps, _mm_set1_ps};
+
+        // SAFETY: this fast-power path calls rsqrt only with positive finite scalars.
+        unsafe {
+            let input = _mm_set1_ps(value);
+            let mut estimate = _mm_rsqrt_ps(input);
+            estimate = _mm_add_ps(
+                _mm_mul_ps(_mm_set1_ps(1.5), estimate),
+                _mm_mul_ps(
+                    _mm_mul_ps(_mm_mul_ps(input, _mm_set1_ps(-0.5)), estimate),
+                    _mm_mul_ps(estimate, estimate),
+                ),
+            );
+            _mm_cvtss_f32(estimate)
+        }
+    }
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    fn rsqrt(value: f32) -> f32 {
+        1.0 / value.sqrt()
+    }
+
+    let xf = fastpow(0x3f2a_aaab, 0x5eb5_04f3, arg);
+    let xover = arg * xf;
+    let xfm1 = rsqrt(xf);
+    let x2 = arg * arg;
+    let xunder = x2 * xfm1;
+    let mut xavg = (1.0 / (3.0 * 0.629_960_54) * 0.999_852) * (xover + xunder);
+    xavg *= rsqrt(xavg);
+    xavg *= rsqrt(xavg);
+    xavg
+}
+
+/// Decodes stored `BYTE_COLOR` channels scaled to `[0, 255]` into canonical linear RGBA.
+pub(crate) fn byte_color_decoded_components(bytes: [f32; 4]) -> [f64; 4] {
+    const BYTE_TO_UNIT: f32 = 1.0 / 255.0;
+    std::array::from_fn(|index| {
+        let encoded = bytes[index] * BYTE_TO_UNIT;
+        let decoded = if index < 3 {
+            if encoded <= 0.04045 {
+                encoded * (1.0 / 12.92)
+            } else {
+                ((encoded + 0.055) * (1.0 / 1.055)).powf(2.4)
+            }
+        } else {
+            encoded
+        };
+        f64::from(decoded)
+    })
+}
+
+/// Mix canonical linear colors with Blender's `ColorGeometry4bMixer`: encode and quantize source
+/// channels to stored bytes, accumulate the bytes by weight in `f32`, truncate the normalized result
+/// to bytes, then decode to canonical linear RGBA.
+pub(crate) fn mix_byte_color(values: &[[f64; 4]], sources: &[(usize, f64)]) -> [f64; 4] {
+    let mut sums = [0.0_f32; 4];
+    let mut total = 0.0_f32;
+    let mut found = false;
+    for (index, weight) in sources {
+        let Some(color) = values.get(*index) else {
+            continue;
+        };
+        found = true;
+        let channels =
+            byte_color_encoded_components(*color).map(|channel| channel.round().clamp(0.0, 255.0));
+        let weight = *weight as f32;
+        total += weight;
+        for (sum, channel) in sums.iter_mut().zip(channels) {
+            *sum += channel * weight;
+        }
+    }
+    if !found || total <= 0.0 || total.is_nan() {
+        return [0.0, 0.0, 0.0, 1.0];
+    }
+    let weight_inv = 1.0_f32 / total;
+    let bytes = sums.map(|sum| (sum * weight_inv).trunc().clamp(0.0, 255.0));
+    byte_color_decoded_components(bytes)
+}
 fn corner_key(face_id: u32) -> String {
     format!("f{face_id}")
 }
