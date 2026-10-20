@@ -2,8 +2,10 @@
 //!
 //! A transparent occluder (a BLENDED Principled with Alpha 0.5) casts a shadow half as dense as an opaque one, as
 //! EEVEE's transparent shadow pass gives (`eevee_surf_shadow.bsl.hh`). With `use_transparent_shadow` off the occluder
-//! casts an opaque shadow. Each render is reduced to the mean RGB of a 9 by 9 grid over the frame. The test compares
-//! the shadowed-to-lit ratio of each occluder, which does not depend on the light's absolute scale, against EEVEE's.
+//! casts an opaque shadow. Each render is reduced to the mean RGB of a 9 by 9 grid over the frame, and the test compares
+//! the shadowed-to-lit ratio of each occluder with EEVEE's. EEVEE's ratios and their tolerances are committed in
+//! `realtime_transparent_shadow_spread.json`, which `measure_realtime_transparent_shadow_spread.py` derives from its
+//! renders, so this test writes each scene with Blender and renders only Potter.
 
 #[path = "common/blender_checked.rs"]
 mod blender_checked;
@@ -36,17 +38,23 @@ const SCRIPT: &str = include_str!("fixtures/native_oracle/realtime_transparent_s
 const PATCH: [f64; 9] = [
     0.25, 0.3125, 0.375, 0.4375, 0.5, 0.5625, 0.625, 0.6875, 0.75,
 ];
-/// The measured tolerances (`measure_realtime_transparent_shadow_spread.py` writes the file and derives each term): per
-/// light and ratio, four times EEVEE's noise over independent realisations, plus EEVEE's bias against the exact ratio of
-/// the occluder geometry, plus Potter's edge-placement bound (the largest change of the exact ratio when the shadow
-/// edges move by the bound on Potter's own placement error: 0.003 rad PCF for a sun, half a 64-texel depth-map texel for
-/// a point light).
+/// EEVEE's ratios and the tolerances of each (`measure_realtime_transparent_shadow_spread.py` derives them): per light
+/// and ratio, four times EEVEE's noise over independent realisations, plus EEVEE's bias against the exact ratio over the
+/// pixel footprints, plus Potter's edge-placement bound. The point light's transparent bound is zero, since Potter traces
+/// that occluder exactly; its opaque bound is one depth-map edge error, which can flip a pixel of the 81-pixel patch.
 const SPREAD: &str = include_str!("fixtures/native_oracle/realtime_transparent_shadow_spread.json");
-fn tolerance(light: &str, ratio: &str) -> TestResult<f64> {
+
+/// The committed EEVEE mean ratio and tolerance of `ratio` (`alpha_ratio` or `alpha_off_ratio`) for `light`.
+fn eevee(light: &str, ratio: &str) -> TestResult<(f64, f64)> {
     let spread: Value = serde_json::from_str(SPREAD)?;
-    spread["lights"][light][ratio]["tolerance"]
+    let entry = &spread["lights"][light][ratio];
+    let mean = entry["mean"]
         .as_f64()
-        .ok_or_else(|| format!("no tolerance for {light} {ratio}").into())
+        .ok_or_else(|| format!("no EEVEE mean for {light} {ratio}"))?;
+    let tolerance = entry["tolerance"]
+        .as_f64()
+        .ok_or_else(|| format!("no tolerance for {light} {ratio}"))?;
+    Ok((mean, tolerance))
 }
 
 /// The occluder states of the oracle: a transparent shadow, an opaque one, and no occluder.
@@ -67,61 +75,58 @@ impl Occluder {
     }
 }
 
-/// The patch mean of Blender's EEVEE render of `light` with `occluder`, and the scene it wrote.
-fn blender_render(
+/// Writes the Blender scene of `light` with `occluder` as a .blend, without rendering it, and returns its path.
+fn blender_scene(
     blender: &Path,
     root: &Path,
     light: &str,
     occluder: Occluder,
-) -> TestResult<(PathBuf, Vec<f64>)> {
+) -> TestResult<PathBuf> {
     let dir = root.join(format!("{light}_{}", occluder.name()));
     fs::create_dir_all(&dir)?;
     let script = write_script(&dir, "realtime_transparent_shadow.py", SCRIPT)?;
     let blend = dir.join("scene.blend");
-    let image = dir.join("blender.exr");
-    let json_path = dir.join("blender.json");
+    // The render flag `0` stops the generator after saving the .blend, so the image and JSON paths are not written.
     run_blender_arguments(
         blender,
         &script,
         None,
         &[
             blend.as_path(),
-            image.as_path(),
-            json_path.as_path(),
+            dir.join("unused.exr").as_path(),
+            dir.join("unused.json").as_path(),
             Path::new(light),
             Path::new(occluder.name()),
+            Path::new("0"),
+            Path::new("0"),
         ],
     )?;
-    let reference: Value = serde_json::from_slice(&fs::read(&json_path)?)?;
-    let mean = reference["patch_mean"]
-        .as_array()
-        .ok_or("the Blender patch mean is missing")?
-        .iter()
-        .map(|value| {
-            value
-                .as_f64()
-                .ok_or_else(|| "the Blender patch mean is not a number".into())
-        })
-        .collect::<TestResult<Vec<f64>>>()?;
-    Ok((blend, mean))
+    Ok(blend)
 }
 
-/// Imports the Blender scene and returns the project, its active scene, and the imported scene JSON.
-fn import_scene(blender: &Path, root: &Path, blend: &Path) -> TestResult<(PathBuf, String, Value)> {
-    // Each blend has its own directory, so each import gets its own project: `pot init` refuses a non-empty one.
+/// Imports the Blender scene into its own project, since `pot init` refuses a non-empty directory, and returns the
+/// project and the imported scene JSON.
+fn import_scene(blender: &Path, root: &Path, blend: &Path) -> TestResult<(PathBuf, Value)> {
     let name = blend
         .parent()
         .and_then(Path::file_name)
         .and_then(|name| name.to_str())
-        .ok_or("the blend has no directory name")?
-        .to_owned();
+        .ok_or("the blend has no directory name")?;
     let (project, _) = import_blend(blender, root, &format!("project_{name}"), blend)?;
     let scene = read_scene(&project)?;
     let active = scene["active_scene"]
         .as_str()
         .ok_or("active scene is missing")?
         .to_owned();
-    Ok((project, active, scene))
+    let applied = apply_operations(
+        &project,
+        root,
+        json!([
+            {"op": "render.update", "target": {"id": active}, "set": {"resolution_x": 64, "resolution_y": 64, "samples": 64, "seed": 0, "max_bounces": 4}}
+        ]),
+    )?;
+    assert_eq!(applied["ok"], true, "{applied}");
+    Ok((project, read_scene(&project)?))
 }
 
 /// Renders `project` in the realtime engine to a linear EXR and loads the frame.
@@ -162,12 +167,8 @@ fn patch_mean(data: &ImageData) -> f64 {
     total / (PATCH.len() * PATCH.len()) as f64
 }
 
-/// The patch mean of Blender's EEVEE render, averaged over its channels.
-fn reference_mean(mean: &[f64]) -> f64 {
-    mean.iter().sum::<f64>() / mean.len() as f64
-}
-
-/// Runs one light through the three occluder states in both renderers and compares their shadow ratios.
+/// Checks Potter's realtime shadowed-to-lit ratios of the transparent and the opaque occluder against EEVEE's, and that
+/// each imported occluder carries its `use_transparent_shadow` setting.
 fn assert_shadow_ratios_match(light: &str) -> TestResult {
     let Some(blender) = blender_executable() else {
         eprintln!(
@@ -177,37 +178,47 @@ fn assert_shadow_ratios_match(light: &str) -> TestResult {
     };
     let root = tempdir()?;
 
-    let (blender_none, none_mean) = blender_render(&blender, root.path(), light, Occluder::Absent)?;
-    let (blender_alpha, alpha_mean) =
-        blender_render(&blender, root.path(), light, Occluder::Alpha)?;
-    let (blender_off, off_mean) = blender_render(&blender, root.path(), light, Occluder::AlphaOff)?;
-    let eevee_none = reference_mean(&none_mean);
-    let eevee_alpha = reference_mean(&alpha_mean) / eevee_none;
-    let eevee_off = reference_mean(&off_mean) / eevee_none;
-    assert!(
-        eevee_alpha > eevee_off,
-        "EEVEE's transparent shadow must be lighter than its opaque one: {eevee_alpha} vs {eevee_off}"
-    );
-
+    let mut lit = 0.0;
     let mut potter = Vec::new();
-    for (name, blend) in [
-        (Occluder::Absent, blender_none),
-        (Occluder::Alpha, blender_alpha),
-        (Occluder::AlphaOff, blender_off),
-    ] {
-        let (project, _, _) = import_scene(&blender, root.path(), &blend)?;
-        let frame = potter_realtime_frame(&project, root.path(), &name.name().to_lowercase())?;
-        potter.push(patch_mean(&frame));
+    for occluder in [Occluder::Absent, Occluder::Alpha, Occluder::AlphaOff] {
+        let blend = blender_scene(&blender, root.path(), light, occluder)?;
+        let (project, scene) = import_scene(&blender, root.path(), &blend)?;
+        let expected = match occluder {
+            Occluder::Alpha => Some(true),
+            Occluder::AlphaOff => Some(false),
+            Occluder::Absent => None,
+        };
+        if let Some(expected) = expected {
+            let imported = scene["materials"]
+                .as_object()
+                .and_then(|materials| {
+                    materials
+                        .values()
+                        .find(|material| material["name"] == "Occluder")
+                })
+                .ok_or("the occluder material is missing")?;
+            assert_eq!(
+                imported["use_transparent_shadow"],
+                expected,
+                "{light} {}: use_transparent_shadow must import from the .blend: {imported}",
+                occluder.name()
+            );
+        }
+        let frame = potter_realtime_frame(&project, root.path(), &occluder.name().to_lowercase())?;
+        let mean = patch_mean(&frame);
+        match occluder {
+            Occluder::Absent => lit = mean,
+            Occluder::Alpha | Occluder::AlphaOff => potter.push(mean / lit),
+        }
     }
-    let potter_none = potter[0];
-    let potter_alpha = potter[1] / potter_none;
-    let potter_off = potter[2] / potter_none;
-    let alpha_tolerance = tolerance(light, "alpha_ratio")?;
-    let off_tolerance = tolerance(light, "alpha_off_ratio")?;
+    let (potter_alpha, potter_off) = (potter[0], potter[1]);
+
+    let (eevee_alpha, alpha_tolerance) = eevee(light, "alpha_ratio")?;
+    let (eevee_off, off_tolerance) = eevee(light, "alpha_off_ratio")?;
     assert!(
         (potter_alpha - eevee_alpha).abs() <= alpha_tolerance,
         "{light}: Potter's transparent shadow ratio {potter_alpha:.4} differs from EEVEE's {eevee_alpha:.4} by more \
-         than {alpha_tolerance:.4} (lit: Potter {potter_none:.4}, EEVEE {eevee_none:.4})"
+         than {alpha_tolerance:.4} (lit: Potter {lit:.4})"
     );
     assert!(
         (potter_off - eevee_off).abs() <= off_tolerance,
@@ -225,33 +236,4 @@ fn sun_transparent_shadow_matches_eevee_in_realtime() -> TestResult {
 #[test]
 fn point_transparent_shadow_matches_eevee_in_realtime() -> TestResult {
     assert_shadow_ratios_match("POINT")
-}
-
-#[test]
-fn use_transparent_shadow_round_trips_through_blend() -> TestResult {
-    let Some(blender) = blender_executable() else {
-        eprintln!(
-            "skipping the use_transparent_shadow round trip; no executable Blender was found"
-        );
-        return Ok(());
-    };
-    let root = tempdir()?;
-    let (alpha_blend, _) = blender_render(&blender, root.path(), "SUN", Occluder::Alpha)?;
-    let (off_blend, _) = blender_render(&blender, root.path(), "SUN", Occluder::AlphaOff)?;
-    for (blend, expected) in [(alpha_blend, true), (off_blend, false)] {
-        let (_, _, scene) = import_scene(&blender, root.path(), &blend)?;
-        let occluder = scene["materials"]
-            .as_object()
-            .and_then(|materials| {
-                materials
-                    .values()
-                    .find(|material| material["name"] == "Occluder")
-            })
-            .ok_or("the occluder material is missing")?;
-        assert_eq!(
-            occluder["use_transparent_shadow"], expected,
-            "use_transparent_shadow must import from the .blend: {occluder}"
-        );
-    }
-    Ok(())
 }

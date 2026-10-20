@@ -6,17 +6,24 @@ ratio, so the tolerance is the sum of three terms, per light and per occluder st
 1. EEVEE's noise: four times the sample standard deviation of the ratio over independent noise realisations. EEVEE has
    no seed, so each realisation is the generator at a different y shift of the whole scene (a sub-millimetre move that
    leaves the expectation unchanged and redraws its world-position hashed transparency noise).
-2. EEVEE's bias: the absolute difference between EEVEE's mean ratio and the exact ratio, computed here from the
-   occluder geometry on the 81 sampled pixel centres (a weighted average of the shadow factor, weighted by the lit
-   radiance of each floor point for the point light).
-3. Potter's edge placement: the largest change of the exact ratio when the occluder's shadow edges move by the
-   bound on Potter's placement error. For a sun the PCF jitter is 0.003 rad at 1 unit from the floor. For a point light
-   the depth map has 64 texels per 90-degree face, and nearest-texel lookup misplaces an edge by at most half a texel,
-   taken at the occluder plane and scaled to the floor.
+2. EEVEE's bias: the absolute difference between EEVEE's mean ratio and the exact ratio. The exact ratio averages the
+   shadow over each pixel's footprint (a 6 by 6 subsample per pixel), as both renderers antialias a pixel. It is
+   weighted by the lit radiance of each floor point for the point light.
+3. Potter's edge placement: the largest change of the exact ratio when the occluder's shadow edges move by the bound on
+   Potter's placement error, measured in the occluder plane where the occluder is defined:
+   - Sun: the PCF jitter is 0.003 rad at the floor's distance from the occluder (1 unit), so the edge moves 0.003.
+   - Point, transparent occluder: none. Potter traces that occluder with an exact ray to the light
+     (`point_light_transparency`), and the depth map leaves it out, so no texel places its edge.
+   - Point, opaque occluder: the depth map has 64 texels per 90-degree face at the occluder plane, and its 3 by 3 PCF
+     spreads an edge over one texel either side, plus half a texel of rounding: 1.5 texels of the occluder plane.
 
 The shift sweep takes the worst case over every shift in the bound's square, not the nominal geometry alone.
 
+Two modes. The default renders the generator at every shift and then derives the tolerances. `--analyse-only` takes the
+runs already in the output file and only re-derives the analysis, so the bounds can change without rendering again.
+
 Usage: python3 measure_realtime_transparent_shadow_spread.py BLENDER OUT_JSON
+       python3 measure_realtime_transparent_shadow_spread.py --analyse-only OUT_JSON
 """
 
 import json
@@ -37,56 +44,63 @@ OCCLUDER = (-3.45, -2.55, -0.45, 0.45)
 # The 9 by 9 grid over the 64 by 64 frame, and the ortho camera at x = -1.5 with ortho scale 2.
 PATCH = [0.25 + 0.5 * index / 8 for index in range(9)]
 RESOLUTION = 64
+SUBSAMPLES = 6
 POINT_LIGHT = (-4.0, 0.0, 2.5)
 SUN_BOUND = 0.003
 POINT_DEPTH_TO_OCCLUDER = POINT_LIGHT[2] - 1.0
-POINT_DEPTH_TO_FLOOR = POINT_LIGHT[2]
+# The 3 by 3 PCF's edge spread plus rounding, in depth-map texels.
+POINT_EDGE_TEXELS = 1.5
 
 
-def sample_points():
-    points = []
+def pixel_subsamples():
+    """For each of the 81 patch pixels, a SUBSAMPLES by SUBSAMPLES grid of floor points across its footprint."""
+    pixels = []
     for v in PATCH:
         for u in PATCH:
             px = min(RESOLUTION - 1, int(u * RESOLUTION))
             py = min(RESOLUTION - 1, int(v * RESOLUTION))
-            points.append((-2.5 + 2.0 * (px + 0.5) / RESOLUTION, 1.0 - 2.0 * (py + 0.5) / RESOLUTION))
-    return points
+            points = []
+            for i in range(SUBSAMPLES):
+                for j in range(SUBSAMPLES):
+                    fx = px + (i + 0.5) / SUBSAMPLES
+                    fy = py + (j + 0.5) / SUBSAMPLES
+                    points.append((-2.5 + 2.0 * fx / RESOLUTION, 1.0 - 2.0 * fy / RESOLUTION))
+            pixels.append(points)
+    return pixels
+
+
+PIXELS = pixel_subsamples()
 
 
 def inside(square, x, y):
     return square[0] <= x <= square[1] and square[2] <= y <= square[3]
 
 
-def sun_factors(square):
-    # The sun travels along (+x, -z)/sqrt(2); a floor point (x, y) reaches the occluder plane at (x - 1, y).
-    return [0.0 if inside(square, x - 1.0, y) else 1.0 for x, y in sample_points()], [1.0] * 81
-
-
-def point_factors(square):
-    factors, weights = [], []
-    for x, y in sample_points():
-        d = (POINT_LIGHT[0] - x, POINT_LIGHT[1] - y, POINT_LIGHT[2])
-        distance_squared = d[0] ** 2 + d[1] ** 2 + d[2] ** 2
-        distance = math.sqrt(distance_squared)
-        weights.append((d[2] / distance) / distance_squared)
-        t = 1.0 / d[2]
-        factors.append(0.0 if inside(square, x + t * d[0], y + t * d[1]) else 1.0)
-    return factors, weights
-
-
 def ratios(light, square):
-    """Exact shadowed-to-lit ratios: weighted means of the shadow factor, for the alpha and the opaque occluder."""
-    factors, weights = sun_factors(square) if light == "SUN" else point_factors(square)
-    total = sum(weights)
-    transparent = sum(w * (1.0 if f else OCCLUDER_ALPHA_PASS) for w, f in zip(weights, factors)) / total
-    opaque = sum(w * (1.0 if f else 0.0) for w, f in zip(weights, factors)) / total
-    return transparent, opaque
+    """Exact shadowed-to-lit ratios over the patch: the lit-weighted mean of the shadow pass, for the transparent
+    occluder and for the opaque one. A floor point is shadowed by the occluder when its ray to the light crosses the
+    occluder square on the occluder plane."""
+    transparent_sum = opaque_sum = weight_sum = 0.0
+    for points in PIXELS:
+        for x, y in points:
+            if light == "SUN":
+                # The sun travels along (+x, -z)/sqrt(2); a floor point reaches the occluder plane at (x - 1, y).
+                weight = 1.0
+                hit = inside(square, x - 1.0, y)
+            else:
+                d = (POINT_LIGHT[0] - x, POINT_LIGHT[1] - y, POINT_LIGHT[2])
+                distance_squared = d[0] ** 2 + d[1] ** 2 + d[2] ** 2
+                weight = (d[2] / math.sqrt(distance_squared)) / distance_squared
+                t = 1.0 / d[2]
+                hit = inside(square, x + t * d[0], y + t * d[1])
+            weight_sum += weight
+            # A crossed transparent occluder passes its `1 - alpha` of the light; an opaque one passes none.
+            transparent_sum += weight * ((1.0 - OCCLUDER_ALPHA) if hit else 1.0)
+            opaque_sum += weight * (0.0 if hit else 1.0)
+    return transparent_sum / weight_sum, opaque_sum / weight_sum
 
 
-OCCLUDER_ALPHA_PASS = 1.0 - OCCLUDER_ALPHA
-
-
-def potter_bound(light, delta, steps=41):
+def potter_bound(light, delta, steps=21):
     """The largest change of the exact ratios when the occluder square moves by up to `delta` in each direction."""
     nominal_alpha, nominal_off = ratios(light, OCCLUDER)
     worst_alpha = worst_off = 0.0
@@ -102,11 +116,41 @@ def potter_bound(light, delta, steps=41):
 
 
 def potter_edge_bound(light):
+    """Potter's edge-placement bound for the transparent and the opaque ratio of `light`."""
     if light == "SUN":
         return potter_bound(light, SUN_BOUND)
-    texel_at_occluder = 2.0 * POINT_DEPTH_TO_OCCLUDER / RESOLUTION
-    half_texel_on_floor = 0.5 * texel_at_occluder * POINT_DEPTH_TO_FLOOR / POINT_DEPTH_TO_OCCLUDER
-    return potter_bound(light, half_texel_on_floor)
+    texel_on_occluder = 2.0 * POINT_DEPTH_TO_OCCLUDER / RESOLUTION
+    _, bound_off = potter_bound(light, POINT_EDGE_TEXELS * texel_on_occluder)
+    # The transparent occluder is traced exactly, so its edge has no placement error.
+    return 0.0, bound_off
+
+
+def derive(light, runs):
+    """The analysis of one light's runs: the exact ratios, EEVEE's mean and spread, its bias and the tolerances."""
+    exact_alpha, exact_off = ratios(light, OCCLUDER)
+    bound_alpha, bound_off = potter_edge_bound(light)
+    entry = {
+        "runs": runs,
+        "exact": {"alpha_ratio": exact_alpha, "alpha_off_ratio": exact_off},
+        "potter_edge_bound": {"alpha_ratio": bound_alpha, "alpha_off_ratio": bound_off},
+    }
+    for key, exact, bound in (
+        ("alpha_ratio", exact_alpha, bound_alpha),
+        ("alpha_off_ratio", exact_off, bound_off),
+    ):
+        values = [run[key] for run in runs]
+        stdev = statistics.stdev(values)
+        mean = statistics.mean(values)
+        bias = abs(mean - exact)
+        entry[key] = {
+            "mean": mean,
+            "stdev": stdev,
+            "eevee_bias": bias,
+            "tolerance": 4.0 * stdev + bias + bound,
+        }
+    if not entry["alpha_ratio"]["mean"] > entry["alpha_off_ratio"]["mean"]:
+        raise SystemExit(f"{light}: EEVEE's transparent shadow must be lighter than its opaque one")
+    return entry
 
 
 def render(blender, directory, light, occluder, shift):
@@ -129,9 +173,9 @@ def render(blender, directory, light, occluder, shift):
     return sum(values) / len(values)
 
 
-def main():
-    blender, out_json = sys.argv[1], sys.argv[2]
-    report = {"shifts_y": SHIFTS, "lights": {}}
+def collect(blender):
+    """Renders every light at every shift, and returns the runs per light."""
+    runs_by_light = {}
     with tempfile.TemporaryDirectory() as directory:
         for light in LIGHTS:
             runs = []
@@ -144,23 +188,22 @@ def main():
                     "alpha_ratio": alpha / none,
                     "alpha_off_ratio": alpha_off / none,
                 })
-            exact_alpha, exact_off = ratios(light, OCCLUDER)
-            bound_alpha, bound_off = potter_edge_bound(light)
-            entry = {"runs": runs, "exact": {"alpha_ratio": exact_alpha, "alpha_off_ratio": exact_off},
-                     "potter_edge_bound": {"alpha_ratio": bound_alpha, "alpha_off_ratio": bound_off}}
-            for key, exact, bound in (("alpha_ratio", exact_alpha, bound_alpha),
-                                      ("alpha_off_ratio", exact_off, bound_off)):
-                values = [run[key] for run in runs]
-                stdev = statistics.stdev(values)
-                mean = statistics.mean(values)
-                bias = abs(mean - exact)
-                entry[key] = {
-                    "mean": mean,
-                    "stdev": stdev,
-                    "eevee_bias": bias,
-                    "tolerance": 4.0 * stdev + bias + bound,
-                }
-            report["lights"][light] = entry
+            runs_by_light[light] = runs
+    return runs_by_light
+
+
+def main():
+    if sys.argv[1] == "--analyse-only":
+        out_json = sys.argv[2]
+        with open(out_json, encoding="utf-8") as handle:
+            previous = json.load(handle)
+        runs_by_light = {light: previous["lights"][light]["runs"] for light in LIGHTS}
+    else:
+        blender, out_json = sys.argv[1], sys.argv[2]
+        runs_by_light = collect(blender)
+    report = {"shifts_y": SHIFTS, "lights": {}}
+    for light in LIGHTS:
+        report["lights"][light] = derive(light, runs_by_light[light])
     with open(out_json, "w", encoding="utf-8") as handle:
         json.dump(report, handle, indent=2)
         handle.write("\n")

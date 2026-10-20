@@ -85,24 +85,24 @@
         }
       ],
       "exact": {
-        "alpha_ratio": 0.7364990196662214,
-        "alpha_off_ratio": 0.472998039332443
+        "alpha_ratio": 0.736499556016712,
+        "alpha_off_ratio": 0.4729991120334222
       },
       "potter_edge_bound": {
-        "alpha_ratio": 0.058771390061691964,
-        "alpha_off_ratio": 0.11754278012338393
+        "alpha_ratio": 0.0,
+        "alpha_off_ratio": 0.11754278139959712
       },
       "alpha_ratio": {
         "mean": 0.74572301194423,
         "stdev": 0.004377775379575336,
-        "eevee_bias": 0.00922399227800852,
-        "tolerance": 0.08550648385800183
+        "eevee_bias": 0.009223455927517943,
+        "tolerance": 0.026734557445819287
       },
       "alpha_off_ratio": {
         "mean": 0.4864009491802535,
         "stdev": 0.0,
-        "eevee_bias": 0.013402909847810507,
-        "tolerance": 0.13094568997119443
+        "eevee_bias": 0.013401837146831297,
+        "tolerance": 0.13094461854642842
       }
     }
   }

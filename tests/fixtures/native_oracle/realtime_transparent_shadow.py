@@ -12,11 +12,13 @@ unit above the floor, whose shadow lands inside it:
 - `alpha_off`: the same material with `use_transparent_shadow` off. EEVEE casts an opaque shadow.
 - `none`: no occluder, the lit floor alone.
 
-Arguments after `--`: blend_out, image_out, json_out, light (SUN or POINT), occluder (ALPHA, ALPHA_OFF or NONE), and an
-optional shift (default 0). EEVEE has no seed; its transparent-shadow noise is hashed from world position (`pcg4d(P, ...)`
-in `eevee_surf_shadow.bsl.hh`), so shifting the whole scene along y by a sub-millimetre amount gives an independent noise
-realisation of the same expectation. `tests/fixtures/native_oracle/measure_realtime_transparent_shadow_spread.py` runs
-several shifts and records their spread.
+Arguments after `--`: blend_out, image_out, json_out, light (SUN or POINT), occluder (ALPHA, ALPHA_OFF or NONE), an
+optional shift (default 0), and an optional render flag (default 1). EEVEE has no seed; its transparent-shadow noise is
+hashed from world position (`pcg4d(P, ...)` in `eevee_surf_shadow.bsl.hh`), so shifting the whole scene along y by a
+sub-millimetre amount gives an independent noise realisation of the same expectation.
+`tests/fixtures/native_oracle/measure_realtime_transparent_shadow_spread.py` renders several shifts and records their
+spread. With the render flag 0 the generator only writes the .blend: the test takes the committed means for EEVEE's
+values and needs no render.
 """
 
 import json
@@ -24,9 +26,10 @@ import sys
 
 import bpy
 
-blend_out, image_out, json_out, light_kind, occluder = sys.argv[sys.argv.index("--") + 1:][:5]
-args = sys.argv[sys.argv.index("--") + 1:]
-SHIFT_Y = float(args[5]) if len(args) > 5 else 0.0
+ARGS = sys.argv[sys.argv.index("--") + 1:]
+blend_out, image_out, json_out, light_kind, occluder = ARGS[:5]
+SHIFT_Y = float(ARGS[5]) if len(ARGS) > 5 else 0.0
+RENDER = ARGS[6] != "0" if len(ARGS) > 6 else True
 
 WIDTH = 64
 HEIGHT = 64
@@ -107,6 +110,8 @@ camera.location = (-1.5, SHIFT_Y, 6.0)
 scene.camera = camera
 
 bpy.ops.wm.save_as_mainfile(filepath=blend_out)
+if not RENDER:
+    raise SystemExit(0)
 
 scene.render.filepath = image_out
 bpy.ops.render.render(write_still=True)

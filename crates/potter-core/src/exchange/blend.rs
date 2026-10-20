@@ -17695,6 +17695,18 @@ mod camera_import_tests {
     }
 
     #[test]
+    fn shadow_backface_culling_imports_with_its_loss() {
+        let culled = json!({"name": "Culled", "use_backface_culling_shadow": true});
+        let features: Vec<String> = import_losses(&json!({"materials": [culled]}))
+            .into_iter()
+            .map(|loss| loss.feature_id)
+            .collect();
+        assert_eq!(features, ["blender.material.backface_culling_shadow"]);
+        let plain = json!({"name": "Plain", "use_backface_culling_shadow": false});
+        assert!(import_losses(&json!({"materials": [plain]})).is_empty());
+    }
+
+    #[test]
     fn full_sphere_equirectangular_imports_at_blenders_defaults() -> Result<(), serde_json::Error> {
         let full = f64::from(std::f32::consts::PI);
         let camera = panorama("EQUIRECTANGULAR", (-full, full), (-0.5 * full, 0.5 * full));
