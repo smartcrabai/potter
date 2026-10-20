@@ -517,14 +517,20 @@ fn empty_geometry_exports_are_legal_and_reread() -> TestResult {
         let out_directory = directory.path().join(format);
         fs::create_dir_all(&out_directory)?;
         let out = out_directory.join(file_name);
-        run_ok(&[
+        let mut arguments = vec![
             "export",
             text(&scene)?,
             "--format",
             format,
             "--out",
             text(&out)?,
-        ])?;
+        ];
+        // The box's default `UVMap` is a layer STL cannot store, so STL reports it as lost and needs
+        // `--allow-lossy` (the STL writer in Blender drops UVs the same way).
+        if format == "stl" {
+            arguments.push("--allow-lossy");
+        }
+        run_ok(&arguments)?;
         let bytes = fs::read(&out)?;
         check_empty_export(format, &bytes)?;
         if let Ok(text) = std::str::from_utf8(&bytes) {
