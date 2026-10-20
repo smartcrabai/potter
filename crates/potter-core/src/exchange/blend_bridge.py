@@ -2170,30 +2170,19 @@ def other_datablocks_dump():
     return result
 
 
-def _principled_alpha_socket(material):
-    if not material.use_nodes or material.node_tree is None:
-        return None
-    shader = next((node for node in material.node_tree.nodes if node.type == "BSDF_PRINCIPLED"), None)
-    return None if shader is None else shader.inputs.get("Alpha")
-
-
-def _alpha_mode_of(material, base_color):
+def _alpha_mode_of(material):
     """Potter alpha mode of a Blender material.
 
     The `potter.alpha_mode` marker is used while it agrees with `surface_render_method` (`blend` is
-    BLENDED; `opaque` and `clip` are DITHERED). Without a usable marker, Blender's state decides:
-    BLENDED is `blend`; DITHERED is `clip` when alpha is authored below one (a linked or sub-one
-    Principled Alpha, or a base color alpha below one), and `opaque` otherwise.
+    BLENDED; `opaque` and `clip` are DITHERED). Without a usable marker, BLENDED is `blend`, and DITHERED is
+    `opaque`: Blender 5.2 never thresholds alpha (`alpha_threshold` is read only by the 4.2 versioning,
+    `versioning_420.cc`), so a DITHERED material's transparency is its graph's, which `opaque` leaves to the graph.
     """
     blended = material.surface_render_method == "BLENDED"
     marker = material.get(ALPHA_MODE_PROPERTY)
     if marker in ALPHA_MODES and (marker == "blend") == blended:
         return marker
-    if blended:
-        return "blend"
-    alpha = _principled_alpha_socket(material)
-    authored = alpha is not None and (alpha.is_linked or float(alpha.default_value) < 1.0)
-    return "clip" if authored or float(base_color[3]) < 1.0 else "opaque"
+    return "blend" if blended else "opaque"
 
 
 def material_dump(material):
@@ -2236,7 +2225,7 @@ def material_dump(material):
             "emission_color": emission_color, "emission_strength": emission_strength,
             "transmission": transmission, "ior": ior,
             "double_sided": not bool(getattr(material, "use_backface_culling", False)),
-            "alpha_mode": _alpha_mode_of(material, base_color),
+            "alpha_mode": _alpha_mode_of(material),
             "alpha_threshold": float(material.alpha_threshold),
             "nodes": tree_dump(material.node_tree),
             "custom_properties": {key: value for key, value in custom_props(material).items()
@@ -6693,6 +6682,7 @@ def export_doc(doc, target, pack, scene_hash, context):
                 light.shape = raw.get("area_shape", "SQUARE")
                 light.size = float(raw.get("area_size", 0.25))
                 light.size_y = float(raw.get("area_size_y", light.size))
+                light.spread = float(raw.get("spread", math.pi))
             if raw.get("light_type") == "spot":
                 light.spot_size = raw.get("spot_size", math.pi / 4)
                 light.spot_blend = raw.get("spot_blend", 0.15)

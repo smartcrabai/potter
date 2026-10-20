@@ -141,6 +141,10 @@ pub struct BsdfParams {
     pub transmission: f64,
     pub ior: f64,
     pub alpha: f64,
+    /// Tint of the transparent share, Cycles' Transparent BSDF colour. The share is `1 - alpha`, so a camera
+    /// pass-through multiplies by this tint and a shadow ray's transmittance is `(1 - alpha) * tint`
+    /// (`render/path.rs`). Non-transparent closures keep white.
+    pub transparent_tint: [f64; 3],
     /// Weight of the reflective closures (diffuse, specular, transmission, environment). Emission
     /// contributes no reflection, so an Emission shader sets this to 0. Mix lerps it and Add sums
     /// it, clamped to 1.
@@ -238,6 +242,7 @@ impl BsdfParams {
             transmission: material.transmission,
             ior: material.ior,
             alpha: material.base_color[3],
+            transparent_tint: [1.0; 3],
             reflectance: 1.0,
             subsurface_weight: 0.0,
             subsurface_radius: [1.0; 3],
@@ -294,7 +299,23 @@ impl BsdfParams {
 
     fn mix(first: Self, second: Self, factor: f64) -> Self {
         let factor = bounded_factor(factor);
-        let mix_scalar = |a: f64, b: f64| a + (b - a) * factor;
+        // Alpha is the share of rays that reach the surface's own shading (Cycles' Transparent closure carries only
+        // that share). The shading mixes the arms by their share of the hits, so a Transparent arm adds no colour,
+        // reflectance, or transmission.
+        let alpha = (1.0 - factor) * first.alpha + factor * second.alpha;
+        let shade = if alpha > 0.0 {
+            factor * second.alpha / alpha
+        } else {
+            factor
+        };
+        // Cycles weights each closure by its factor and its transparent weight is `(1 - alpha) * tint`, so the mixed
+        // transparency is the factor-weighted sum of the arms' transparencies (`tint_for_transparency`).
+        let transparency = std::array::from_fn(|channel| {
+            (1.0 - factor) * (1.0 - first.alpha) * first.transparent_tint[channel]
+                + factor * (1.0 - second.alpha) * second.transparent_tint[channel]
+        });
+        let transparent_tint = tint_for_transparency(alpha, transparency);
+        let mix_scalar = |a: f64, b: f64| a + (b - a) * shade;
         let mix3 = |a: [f64; 3], b: [f64; 3]| {
             [
                 mix_scalar(a[0], b[0]),
@@ -308,12 +329,9 @@ impl BsdfParams {
             mix_scalar(first.base_color[2], second.base_color[2]),
             mix_scalar(first.base_color[3], second.base_color[3]),
         ];
-        let coat = combine_layers(
-            first.coat_layer(),
-            1.0 - factor,
-            second.coat_layer(),
-            factor,
-        );
+        // The coat is shading like every other field, so it takes the same share of the hits (`shade`), not the raw
+        // factor: a Transparent arm then adds no coat, as it adds no colour.
+        let coat = combine_layers(first.coat_layer(), 1.0 - shade, second.coat_layer(), shade);
         Self {
             base_color,
             metallic: mix_scalar(first.metallic, second.metallic),
@@ -322,7 +340,8 @@ impl BsdfParams {
             emission_strength: mix_scalar(first.emission_strength, second.emission_strength),
             transmission: mix_scalar(first.transmission, second.transmission),
             ior: mix_scalar(first.ior, second.ior),
-            alpha: mix_scalar(first.alpha, second.alpha),
+            alpha,
+            transparent_tint,
             reflectance: mix_scalar(first.reflectance, second.reflectance),
             subsurface_weight: mix_scalar(first.subsurface_weight, second.subsurface_weight),
             subsurface_radius: mix3(first.subsurface_radius, second.subsurface_radius),
@@ -349,7 +368,7 @@ impl BsdfParams {
             volume_anisotropy: mix_scalar(first.volume_anisotropy, second.volume_anisotropy),
             volume_emission: mix3(first.volume_emission, second.volume_emission),
             displacement_height: mix_scalar(first.displacement_height, second.displacement_height),
-            normal: normalize_or(first.normal.lerp(second.normal, factor), first.normal),
+            normal: normalize_or(first.normal.lerp(second.normal, shade), first.normal),
             coat_tint: coat.tint,
             coat_normal: (first.coat_normal.is_some() || second.coat_normal.is_some())
                 .then_some(coat.normal),
@@ -372,7 +391,17 @@ impl BsdfParams {
             emission_strength: first.emission_strength.max(second.emission_strength),
             transmission: first.transmission.max(second.transmission),
             ior: first.ior,
+            // Add keeps alpha as the larger opacity (its shading is Potter's one-scalar blend), and sums the arms'
+            // transparent weights as Cycles sums closures. A fully opaque arm leaves no pass chance, so a transparent
+            // share beside it is dropped: the deviation the CHANGELOG records.
             alpha: first.alpha.max(second.alpha),
+            transparent_tint: tint_for_transparency(
+                first.alpha.max(second.alpha),
+                std::array::from_fn(|channel| {
+                    (1.0 - first.alpha) * first.transparent_tint[channel]
+                        + (1.0 - second.alpha) * second.transparent_tint[channel]
+                }),
+            ),
             reflectance: (first.reflectance + second.reflectance).min(1.0),
             subsurface_weight: first.subsurface_weight.max(second.subsurface_weight),
             subsurface_radius: add3(first.subsurface_radius, second.subsurface_radius),
@@ -402,6 +431,17 @@ impl BsdfParams {
                 .then_some(coat.normal),
         }
     }
+}
+
+/// The transparent tint that gives a pass chance `1 - alpha` the expected throughput `transparency` (Cycles' summed
+/// transparent weight): `(1 - alpha) * tint = transparency`. A surface with no pass chance (`alpha` 1) cannot pass,
+/// so the tint is white and the transparency is dropped.
+fn tint_for_transparency(alpha: f64, transparency: [f64; 3]) -> [f64; 3] {
+    let chance = 1.0 - alpha;
+    if chance <= 0.0 {
+        return [1.0; 3];
+    }
+    transparency.map(|weight| weight / chance)
 }
 
 /// The UV layers of the triangle a hit lies on, borrowed from the render geometry.
@@ -845,7 +885,9 @@ fn apply_material_textures(
         for (channel, texel) in params.base_color[..3].iter_mut().zip(pixel) {
             *channel *= texel;
         }
-        params.alpha *= pixel[3];
+        if alpha_linked {
+            params.alpha *= pixel[3];
+        }
     }
     if let Some(texture) = &material.roughness_texture {
         let layer = texture_layer(hit_ctx, texture);
@@ -1086,10 +1128,7 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
             }
             ValueKind::Shader => match raw {
                 Some(_) => Err(invalid("a shader socket cannot use a literal value")),
-                None => Ok(Value::Shader(BsdfParams::from_material(
-                    self.material,
-                    self.hit_ctx.normal,
-                ))),
+                None => Ok(Value::Shader(self.closure_params())),
             },
         }
     }
@@ -1192,7 +1231,14 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
             NodeKind::Displacement => self.displacement(node_id, socket),
             NodeKind::ImageTexture => self.image_texture(node_id, socket),
             NodeKind::Emission => Ok(Value::Shader(self.emission(node_id)?)),
-            NodeKind::Diffuse => Ok(Value::Shader(self.diffuse(node_id)?)),
+            NodeKind::Diffuse => {
+                // Blender's Diffuse BSDF is a Lambert lobe with no specular. Its Roughness input is Oren-Nayar, which
+                // Potter does not evaluate, so the default dielectric layer must not come from it: keeping it made a
+                // roughness-0 floor under a sun a 1600x GGX spike (`source/blender/nodes/shader/nodes/node_shader_bsdf_diffuse.cc`).
+                let mut params = self.diffuse(node_id)?;
+                params.specular_ior_level = 0.0;
+                Ok(Value::Shader(params))
+            }
             NodeKind::Glossy => Ok(Value::Shader(self.glossy(node_id)?)),
             NodeKind::Glass => Ok(Value::Shader(self.glass(node_id)?)),
             NodeKind::Transparent => Ok(Value::Shader(self.transparent(node_id)?)),
@@ -1221,6 +1267,16 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
         }
     }
 
+    /// The parameters of a closure that adds no transparency of its own: alpha 1. A graph's material base colour
+    /// alpha is not the surface's opacity (Cycles reads only Transparent BSDF, Principled Alpha and Mix through
+    /// them), so only those closures set alpha. The non-graph path keeps `from_material`'s base colour alpha.
+    fn closure_params(&self) -> BsdfParams {
+        BsdfParams {
+            alpha: 1.0,
+            ..BsdfParams::from_material(self.material, self.hit_ctx.normal)
+        }
+    }
+
     fn principled(&mut self, id: &Id) -> Result<BsdfParams> {
         let node = self.node(id)?;
         if node
@@ -1229,7 +1285,16 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
             .and_then(JsonValue::as_bool)
             == Some(true)
         {
-            let params = BsdfParams::from_material(self.material, self.hit_ctx.normal);
+            let mut params = self.closure_params();
+            // A simple-material graph holds no Alpha input unless the overlay wrote one (`write_principled_inputs`, for a
+            // non-opaque material). Without it the material's own alpha applies, as before the closure change: its base
+            // colour alpha, or 1 for an OPAQUE material, whose graph carries no transparency.
+            let default_alpha = if self.material.alpha_mode == "opaque" {
+                1.0
+            } else {
+                self.material.base_color[3]
+            };
+            params.alpha = self.scalar_input(id, &["Alpha"], default_alpha)?;
             record_unevaluated_inputs(
                 self.hit_ctx.warnings,
                 &self.material.name,
@@ -1238,7 +1303,7 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
             );
             return Ok(params);
         }
-        let mut params = BsdfParams::from_material(self.material, self.hit_ctx.normal);
+        let mut params = self.closure_params();
         params.base_color = self.color_input(id, &["Base Color"], [0.8, 0.8, 0.8, 1.0])?;
         params.metallic = self.scalar_input(id, &["Metallic"], 0.0)?;
         params.roughness = self.scalar_input(id, &["Roughness"], 0.5)?;
@@ -1302,7 +1367,7 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
     }
 
     fn volume(&mut self, id: &Id, closure: VolumeClosure) -> Result<BsdfParams> {
-        let mut params = BsdfParams::from_material(self.material, self.hit_ctx.normal);
+        let mut params = self.closure_params();
         let density = self.scalar_input(id, &["Density"], 1.0)?.max(0.0);
         // Blender's node defaults: Principled Volume 0.5; Volume Absorption and Scatter 0.8.
         let default_color = match closure {
@@ -1366,7 +1431,7 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
 
     fn emission(&mut self, id: &Id) -> Result<BsdfParams> {
         let color = self.color_input(id, &["Color", "Emission"], [1.0, 1.0, 1.0, 1.0])?;
-        let mut params = BsdfParams::from_material(self.material, self.hit_ctx.normal);
+        let mut params = self.closure_params();
         params.base_color = color;
         params.emission_color = [color[0], color[1], color[2]];
         params.emission_strength = self.scalar_input(id, &["Strength"], 1.0)?;
@@ -1378,7 +1443,7 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
     }
 
     fn diffuse(&mut self, id: &Id) -> Result<BsdfParams> {
-        let mut params = BsdfParams::from_material(self.material, self.hit_ctx.normal);
+        let mut params = self.closure_params();
         params.base_color = self.color_input(id, &["Color"], [0.8, 0.8, 0.8, 1.0])?;
         params.roughness = self.scalar_input(id, &["Roughness"], 0.0)?;
         params.normal = normalize_or(
@@ -1404,9 +1469,13 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
     }
 
     fn transparent(&mut self, id: &Id) -> Result<BsdfParams> {
+        // Blender's Transparent BSDF defaults to white. Its Color is the closure weight that a pass-through carries
+        // (`intern/cycles/kernel/closure/bsdf_transparent.h`), so it is the transparent tint, not a surface colour.
+        let tint = self.color_input(id, &["Color"], [1.0; 4])?;
         let mut params = self.diffuse(id)?;
-        params.base_color[3] = 0.0;
+        params.base_color = [tint[0], tint[1], tint[2], 0.0];
         params.alpha = 0.0;
+        params.transparent_tint = [tint[0], tint[1], tint[2]];
         params.transmission = 1.0;
         Ok(params)
     }

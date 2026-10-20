@@ -1,10 +1,10 @@
-//! Blender 5.2.2 parity for the dab-sequential sculpt brushes: Clay Strips, Inflate, and Layer.
+//! Blender 5.2.2 parity for the dab-sequential sculpt brushes (`geom/sculpt_dabs.rs` and its family
+//! modules).
 //!
 //! The fixtures come from `tests/fixtures/sculpt_brushes/generate_oracle.py`, which drives Blender
 //! in a session with a display (the script's header explains why). Each fixture holds the base mesh,
-//! the stroke's dabs, and Blender's resulting vertex positions. Blender computes in single precision;
-//! the largest difference measured against these fixtures is 7.1e-7 (Clay Strips), so the tolerance
-//! of 5e-6 leaves about a sevenfold margin.
+//! the stroke's dabs, and Blender's resulting vertex positions. Blender computes in single precision.
+//! The tolerance of 5e-6 is set from that float32 noise, not fitted to Potter's output.
 
 use std::{error::Error, fs, path::Path, process::Command};
 
@@ -44,6 +44,10 @@ const FIXTURES: &[(&str, &str)] = &[
         include_str!("fixtures/sculpt_brushes/layer_sphere_mirror.json"),
     ),
     (
+        "layer_sphere_masked",
+        include_str!("fixtures/sculpt_brushes/layer_sphere_masked.json"),
+    ),
+    (
         "clay_strips_grid",
         include_str!("fixtures/sculpt_brushes/clay_strips_grid.json"),
     ),
@@ -56,8 +60,88 @@ const FIXTURES: &[(&str, &str)] = &[
         include_str!("fixtures/sculpt_brushes/clay_strips_grid_pressure.json"),
     ),
     (
-        "layer_sphere_masked",
-        include_str!("fixtures/sculpt_brushes/layer_sphere_masked.json"),
+        "draw_sphere",
+        include_str!("fixtures/sculpt_brushes/draw_sphere.json"),
+    ),
+    (
+        "draw_sphere_mirror",
+        include_str!("fixtures/sculpt_brushes/draw_sphere_mirror.json"),
+    ),
+    (
+        "draw_sharp_sphere",
+        include_str!("fixtures/sculpt_brushes/draw_sharp_sphere.json"),
+    ),
+    (
+        "blob_sphere",
+        include_str!("fixtures/sculpt_brushes/blob_sphere.json"),
+    ),
+    (
+        "nudge_grid",
+        include_str!("fixtures/sculpt_brushes/nudge_grid.json"),
+    ),
+    (
+        "crease_sphere",
+        include_str!("fixtures/sculpt_brushes/crease_sphere.json"),
+    ),
+    (
+        "pinch_sphere",
+        include_str!("fixtures/sculpt_brushes/pinch_sphere.json"),
+    ),
+    (
+        "smooth_sphere",
+        include_str!("fixtures/sculpt_brushes/smooth_sphere.json"),
+    ),
+    (
+        "smooth_sphere_four_dabs",
+        include_str!("fixtures/sculpt_brushes/smooth_sphere_four_dabs.json"),
+    ),
+    (
+        "smooth_sphere_mirror",
+        include_str!("fixtures/sculpt_brushes/smooth_sphere_mirror.json"),
+    ),
+    (
+        "smooth_sphere_mirror_two",
+        include_str!("fixtures/sculpt_brushes/smooth_sphere_mirror_two.json"),
+    ),
+    (
+        "flatten_sphere",
+        include_str!("fixtures/sculpt_brushes/flatten_sphere.json"),
+    ),
+    (
+        "fill_sphere",
+        include_str!("fixtures/sculpt_brushes/fill_sphere.json"),
+    ),
+    (
+        "scrape_sphere",
+        include_str!("fixtures/sculpt_brushes/scrape_sphere.json"),
+    ),
+    (
+        "grab_grid",
+        include_str!("fixtures/sculpt_brushes/grab_grid.json"),
+    ),
+    (
+        "snake_hook_grid",
+        include_str!("fixtures/sculpt_brushes/snake_hook_grid.json"),
+    ),
+    (
+        "thumb_grid",
+        include_str!("fixtures/sculpt_brushes/thumb_grid.json"),
+    ),
+    (
+        "thumb_grid_pressure",
+        include_str!("fixtures/sculpt_brushes/thumb_grid_pressure.json"),
+    ),
+    (
+        "rotate_sphere",
+        include_str!("fixtures/sculpt_brushes/rotate_sphere.json"),
+    ),
+    (
+        "rotate_sphere_oblique",
+        include_str!("fixtures/sculpt_brushes/rotate_sphere_oblique.json"),
+    ),
+    (
+        "elastic_grab_grid",
+        include_str!("fixtures/sculpt_brushes/elastic_grab_grid.json"),
     ),
 ];
 
@@ -94,13 +178,28 @@ fn max_error_against_blender(name: &str, text: &str) -> Result<f64, Box<dyn Erro
         Some("clay_strips") => Brush::Dab(DabBrush::ClayStrips),
         Some("inflate") => Brush::Dab(DabBrush::Inflate),
         Some("layer") => Brush::Dab(DabBrush::Layer),
+        Some("draw") => Brush::Dab(DabBrush::Draw),
+        Some("draw_sharp") => Brush::Dab(DabBrush::DrawSharp),
+        Some("blob") => Brush::Dab(DabBrush::Blob),
+        Some("nudge") => Brush::Dab(DabBrush::Nudge),
+        Some("crease") => Brush::Dab(DabBrush::Crease),
+        Some("pinch") => Brush::Dab(DabBrush::Pinch),
+        Some("smooth") => Brush::Dab(DabBrush::Smooth),
+        Some("flatten") => Brush::Dab(DabBrush::Flatten),
+        Some("fill") => Brush::Dab(DabBrush::Fill),
+        Some("scrape") => Brush::Dab(DabBrush::Scrape),
+        Some("grab") => Brush::Dab(DabBrush::Grab),
+        Some("snake_hook") => Brush::Dab(DabBrush::SnakeHook),
+        Some("thumb") => Brush::Dab(DabBrush::Thumb),
+        Some("rotate") => Brush::Dab(DabBrush::Rotate),
+        Some("elastic_deform") => Brush::Dab(DabBrush::Elastic),
         other => return Err(format!("{name}: unknown brush {other:?}").into()),
     };
-    // Blender's Clay Strips brush uses the smoother falloff preset; the others use smooth.
-    let falloff = if matches!(brush, Brush::Dab(DabBrush::ClayStrips)) {
-        Falloff::Smoother
-    } else {
-        Falloff::Smooth
+    // Blender's essentials falloff presets: Clay Strips SMOOTHER, Draw Sharp POW4, the rest SMOOTH.
+    let falloff = match brush {
+        Brush::Dab(DabBrush::ClayStrips) => Falloff::Smoother,
+        Brush::Dab(DabBrush::DrawSharp) => Falloff::Pow4,
+        _ => Falloff::Smooth,
     };
     let symmetry = if document["mirror"].as_bool() == Some(true) {
         vec!["x".to_owned()]
@@ -139,12 +238,21 @@ fn max_error_against_blender(name: &str, text: &str) -> Result<f64, Box<dyn Erro
             },
         )
         .collect();
+    let view = if document["view"].is_array() {
+        vec3(&document["view"])?
+    } else {
+        DVec3::Z
+    };
     let stroke = Stroke {
         brush,
         samples,
         falloff,
         symmetry,
         delta: None,
+        // Each fixture records the view it was stroked from. Fixtures without one come from
+        // Blender's TOP orthographic view (`generate_oracle.py` `set_top_ortho_view`), whose viewer
+        // sits at +Z.
+        view: Some(view),
     };
     let mut mesh = Mesh::from_positions_and_faces(base.clone(), faces)?;
     if document["mask"].is_array() {

@@ -63,7 +63,14 @@ fn material_texture_images() -> BTreeMap<String, ImageData> {
     BTreeMap::from([
         (
             "base_image".to_owned(),
-            image_data(2, 1, vec![[1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 0.5]]),
+            ImageData {
+                // Straight alpha, as a straight PNG stores it: Blender premultiplies it at load (sampling.rs).
+                storage: potter_core::image::ImageStorage {
+                    straight_alpha: true,
+                    ..potter_core::image::ImageStorage::default()
+                },
+                ..image_data(2, 1, vec![[1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 0.5]])
+            },
         ),
         (
             "roughness_image".to_owned(),
@@ -485,6 +492,8 @@ fn material_texture_refs_sample_uv_and_override_pbr_fields_for_graphs() {
     let (mut material, groups) = material_with_graph(graph);
     let graph_id = material.node_tree.clone().unwrap();
     material.node_tree = None;
+    // Texture alpha is part of a non-opaque material's alpha (Blender links the base texture's Alpha only then).
+    material.alpha_mode = "blend".to_owned();
     material.base_color = [0.5, 0.25, 0.75, 1.0];
     material.metallic = 0.5;
     material.roughness = 0.8;
@@ -507,6 +516,8 @@ fn material_texture_refs_sample_uv_and_override_pbr_fields_for_graphs() {
         .with_uv_layers(layers);
     context.uv = [0.25, 0.5];
     let simple = evaluate_surface(&material, &context).unwrap();
+    // Blender 5.2.2 (Cycles, straight texel (0, 1, 0) at alpha 0.5, Emission under the same factor): Alpha linked
+    // unassociates the colour to (0, 1, 0), so the 0.25 green factor gives 0.25.
     assert_eq!(simple.base_color, [0.0, 0.25, 0.0, 1.0]);
     assert_eq!(simple.alpha, 0.5);
     assert_eq!(simple.roughness, 0.2);
@@ -532,6 +543,14 @@ fn material_texture_refs_sample_uv_and_override_pbr_fields_for_graphs() {
     assert_eq!(warnings.borrow().len(), 1);
     assert_eq!(warnings.borrow()[0]["code"], json!("uv.layer_missing"));
     assert_eq!(warnings.borrow()[0]["layer"], json!("missing_uv"));
+    // An opaque material leaves its base texture's alpha unlinked, so Cycles renders it opaque
+    // (probed in Blender 5.2.2: an unlinked RGBA texture gives alpha 1, linked gives 0.5).
+    material.alpha_mode = "opaque".to_owned();
+    material.base_color_texture.as_mut().unwrap().uv_layer = Some("UVMap".to_owned());
+    let opaque = evaluate_surface(&material, &context).unwrap();
+    assert_eq!(opaque.alpha, 1.0);
+    // Blender 5.2.2: Alpha unlinked keeps the premultiplied colour (0, 0.5, 0), so the factor gives 0.125.
+    assert_eq!(opaque.base_color, [0.0, 0.125, 0.0, 1.0]);
 }
 
 fn uv_map_material(layer: &str) -> (Material, Registry<NodeGroup>) {
