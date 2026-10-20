@@ -651,8 +651,18 @@ bpy.ops.wm.save_as_mainfile(filepath=__OUTPUT__)
         .arg(&project)
         .args(["--format", "glb", "--out"])
         .arg(&glb)
+        .arg("--allow-lossy")
         .arg("--json");
-    run_ok(&mut export, "exporting the imported empty-slot mesh")?;
+    // glb cannot hold the test's area light (export.rs refuses it without --allow-lossy). The slot
+    // checks below are about materials, so the light is the only loss the export may report.
+    let exported_envelope: Value = serde_json::from_slice(
+        &run_ok(&mut export, "exporting the imported empty-slot mesh")?.stdout,
+    )?;
+    let losses = exported_envelope["result"]["losses"]
+        .as_array()
+        .ok_or("export losses are missing")?;
+    assert_eq!(losses.len(), 1, "unexpected export losses: {losses:?}");
+    assert_eq!(losses[0]["feature_id"], "light.area");
     let exported = glb_json(&glb)?;
     let primitives = exported["meshes"][0]["primitives"]
         .as_array()
