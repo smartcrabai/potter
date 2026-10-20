@@ -88,6 +88,8 @@ struct VolumeInstance<'a> {
     scattering: bool,
     /// Channel-mean σt per unit grid density (absolute, as `BsdfParams`'s coefficients).
     extinction_scale: f64,
+    /// Blender's `cycles.volume_sampling` of the volume's material.
+    sampling: crate::model::VolumeSampling,
 }
 
 #[derive(Clone, Copy)]
@@ -901,31 +903,24 @@ fn trace_path(
             bounce += 1;
             continue;
         }
-        // The stack changes only at surfaces, so the top medium spans this whole segment. Each point light's
-        // direct light is Cycles' multiple importance sampling between equiangular and distance sampling
-        // (`volume_direct_sample_method`, `volume_ray_marching_state_init`): an equiangular-capable light is
-        // sampled along the segment with probability one half, and its other half is the scatter event below.
-        // Free flight is spectral ratio tracking (`trace_mesh_medium`).
+        // The stack changes only at surfaces, so the top medium spans this whole segment. Its direct light follows
+        // its material's `volume_sampling` (Cycles' `volume_direct_sample_method`): equiangular sampling about each
+        // light's point, distance sampling at the scatter event, or both as multiple importance sampling. Free flight
+        // is spectral ratio tracking (`trace_mesh_medium`).
         if let Some(medium) = media.last().map(|medium| medium.params) {
+            use crate::model::VolumeSampling;
             let budget = transparent_max_bounces.saturating_sub(transparent_bounce);
-            let mut equiangular = Vec::with_capacity(lights.len());
-            for light in lights {
-                equiangular.push(equiangular_capable(light) && rng.next_f64() < 0.5);
-            }
-            for (light, &sampled) in lights.iter().zip(&equiangular) {
-                if !sampled {
-                    continue;
-                }
-                let Some((distance, pdf)) = equiangular_sample(
-                    light.position,
-                    origin,
-                    direction,
-                    segment_limit,
-                    rng.next_f64(),
-                ) else {
+            let method = segment_sampling([medium.volume_sampling]);
+            let choices = equiangular_choices(lights, origin, method, rng);
+            for (light, &(point, sampled)) in lights.iter().zip(&choices) {
+                let Some(point) = point.filter(|_| sampled) else {
                     continue;
                 };
-                let point = origin + direction * distance;
+                let Some((distance, pdf)) =
+                    equiangular_sample(point, origin, direction, segment_limit, rng.next_f64())
+                else {
+                    continue;
+                };
                 let nee = volume_light_nee(
                     doc,
                     snapshot,
@@ -935,14 +930,19 @@ fn trace_path(
                     &media,
                     images,
                     light,
-                    point,
+                    origin + direction * distance,
                     direction,
                     medium.volume_anisotropy,
                     budget,
                     rng,
                     evaluator_workspace,
                 )?;
-                let mis = 2.0 * power_heuristic(pdf, distance_scatter_pdf(&medium, distance));
+                // Multiple importance sampling weights this sample against the distance strategy's density at
+                // the same point (`volume_direct_scatter_mis`); equiangular sampling alone takes no weight.
+                let mis = match method {
+                    Some(VolumeSampling::Equiangular) => 1.0,
+                    _ => 2.0 * power_heuristic(pdf, distance_scatter_pdf(&medium, distance)),
+                };
                 radiance += throughput * camera_scatter(&medium, distance) * nee * (mis / pdf);
             }
             match trace_mesh_medium(&medium, segment_limit, &mut throughput, rng) {
@@ -952,30 +952,27 @@ fn trace_path(
                         albedo: DVec3::ZERO,
                         anisotropy: medium.volume_anisotropy,
                     };
-                    // A light sampled equiangularly takes no weight at the scatter event. Any other
-                    // equiangular-capable light is weighted against its equiangular pdf at this point
-                    // (`volume_direct_scatter_mis`), and a light with no equiangular sample takes it in full.
+                    // A light sampled equiangularly takes no weight here. Under multiple importance sampling, a
+                    // light with an equiangular point is weighted against its equiangular pdf at the event, and
+                    // every other light takes the event in full.
                     let weights: Vec<f64> = lights
                         .iter()
-                        .zip(&equiangular)
-                        .map(|(light, &sampled)| {
-                            if sampled {
-                                0.0
-                            } else if equiangular_capable(light) {
-                                let equiangular_density = equiangular_pdf(
-                                    light.position,
-                                    origin,
-                                    direction,
-                                    segment_limit,
-                                    distance,
-                                );
+                        .zip(&choices)
+                        .map(|(_, &(point, sampled))| match (sampled, method, point) {
+                            (true, _, _) => 0.0,
+                            (false, Some(VolumeSampling::MultipleImportance), Some(point)) => {
                                 2.0 * power_heuristic(
                                     distance_scatter_pdf(&medium, distance),
-                                    equiangular_density,
+                                    equiangular_pdf(
+                                        point,
+                                        origin,
+                                        direction,
+                                        segment_limit,
+                                        distance,
+                                    ),
                                 )
-                            } else {
-                                1.0
                             }
+                            _ => 1.0,
                         })
                         .collect();
                     radiance += throughput
@@ -1725,11 +1722,72 @@ fn volume_sampling_pdf(direction: DVec3, importance: Option<&WorldImportanceSamp
     })
 }
 
-/// Whether a light's direct light has an equiangular sample. Cycles samples a point light's distance from the
-/// light's position; a sun has none (`volume_valid_direct_ray_segment`), and spot and area lights are not
-/// ported, so they take distance sampling only.
-fn equiangular_capable(light: &PointLight) -> bool {
-    light.kind == LightType::Point && light.radius <= 0.0
+/// Blender's `cycles.volume_sampling` for a segment, from the volumes it crosses, as Cycles'
+/// `volume_stack_sample_method` combines them: multiple importance sampling if a volume asks for it or asks for
+/// both distance and equiangular, else the one strategy they share. `None` when no volume is crossed.
+fn segment_sampling(
+    samplings: impl IntoIterator<Item = crate::model::VolumeSampling>,
+) -> Option<crate::model::VolumeSampling> {
+    use crate::model::VolumeSampling;
+    let mut distance = false;
+    let mut equiangular = false;
+    for sampling in samplings {
+        match sampling {
+            VolumeSampling::MultipleImportance => return Some(VolumeSampling::MultipleImportance),
+            VolumeSampling::Distance => distance = true,
+            VolumeSampling::Equiangular => equiangular = true,
+        }
+    }
+    match (distance, equiangular) {
+        (true, true) => Some(VolumeSampling::MultipleImportance),
+        (false, true) => Some(VolumeSampling::Equiangular),
+        (true, false) => Some(VolumeSampling::Distance),
+        (false, false) => None,
+    }
+}
+
+/// The point that a light's equiangular sampling aims at (Cycles' `light_sample_from_volume_segment`): a light
+/// sample from the segment's origin, so the sampled light position along its direction. A sun has no position
+/// and takes distance sampling only.
+fn equiangular_point(light: &PointLight, origin: DVec3, rng: &mut Pcg32) -> Option<DVec3> {
+    if light.kind == LightType::Sun {
+        return None;
+    }
+    let sample = sample_light(light, origin, rng)?;
+    sample
+        .distance
+        .is_finite()
+        .then(|| origin + sample.direction * sample.distance)
+}
+
+/// The equiangular point and sampling choice of each light for one segment (Cycles'
+/// `volume_direct_sample_method`): under equiangular sampling every light with a point is sampled equiangularly, under
+/// multiple importance sampling each is with probability one half, and under distance sampling none is. A light with
+/// no point (a sun, or no sample) takes distance sampling only.
+fn equiangular_choices(
+    lights: &[PointLight],
+    origin: DVec3,
+    method: Option<crate::model::VolumeSampling>,
+    rng: &mut Pcg32,
+) -> Vec<(Option<DVec3>, bool)> {
+    use crate::model::VolumeSampling;
+    lights
+        .iter()
+        .map(|light| {
+            let point = match method {
+                Some(VolumeSampling::Equiangular | VolumeSampling::MultipleImportance) => {
+                    equiangular_point(light, origin, rng)
+                }
+                Some(VolumeSampling::Distance) | None => None,
+            };
+            let sampled = match (method, point) {
+                (Some(VolumeSampling::Equiangular), Some(_)) => true,
+                (Some(VolumeSampling::MultipleImportance), Some(_)) => rng.next_f64() < 0.5,
+                _ => false,
+            };
+            (point, sampled)
+        })
+        .collect()
 }
 
 /// The geometry of Cycles' equiangular sampling (`volume_equiangular_sample`): the light's offset along the ray,
@@ -2675,6 +2733,9 @@ fn collect_volumes<'a>(
             emission,
             scattering,
             extinction_scale,
+            sampling: params.map_or(crate::model::VolumeSampling::default(), |params| {
+                params.volume_sampling
+            }),
         });
     }
     Ok(volumes)
@@ -3265,6 +3326,7 @@ mod volume_extinction_tests {
             emission: DVec3::ZERO,
             scattering: false,
             extinction_scale: 1.0,
+            sampling: crate::model::VolumeSampling::MultipleImportance,
         };
         let mut rng = Pcg32::for_sample(0, 0, 0, 0);
         let transmittance = march_volumes(
