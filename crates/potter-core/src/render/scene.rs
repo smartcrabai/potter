@@ -565,7 +565,9 @@ pub(super) fn extract_geometry(
                             match (mode, &material.viewport_display) {
                                 // Workbench draws a viewport-displayed material through its transparent pass only
                                 // below full alpha (`Material::is_transparent`).
-                                (Mode::Solid, Some(viewport)) if viewport.diffuse_color[3] < 1.0 => {
+                                (Mode::Solid, Some(viewport))
+                                    if viewport.diffuse_color[3] < 1.0 =>
+                                {
                                     AlphaMode::Blend
                                 }
                                 (Mode::Solid, Some(_)) => AlphaMode::Opaque,
@@ -2884,7 +2886,8 @@ mod shading_normal_tests {
     }
 
     #[test]
-    fn solid_blends_a_viewport_material_only_below_full_viewport_alpha() -> crate::error::Result<()> {
+    fn solid_blends_a_viewport_material_only_below_full_viewport_alpha() -> crate::error::Result<()>
+    {
         let initial = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
         let mut doc = crate::ops::apply_batch(
             &initial,

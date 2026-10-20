@@ -8460,7 +8460,10 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
                 "Blender's Workbench backface culling is not imported; Potter's solid preview draws back faces",
             ),
             (
-                on("show_xray") && shading["xray_alpha"].as_f64().is_none_or(|alpha| alpha < 1.0),
+                on("show_xray")
+                    && shading["xray_alpha"]
+                        .as_f64()
+                        .is_none_or(|alpha| alpha < 1.0),
                 "blender.scene.display_xray",
                 "Blender's Workbench X-ray is not imported; Potter's solid preview is opaque",
             ),
@@ -17836,7 +17839,10 @@ mod workbench_display_loss_tests {
 
     #[test]
     fn xray_is_reported_only_when_translucent() {
-        assert_eq!(losses(&[("show_xray", json!(true))]), ["blender.scene.display_xray"]);
+        assert_eq!(
+            losses(&[("show_xray", json!(true))]),
+            ["blender.scene.display_xray"]
+        );
         assert!(losses(&[("show_xray", json!(true)), ("xray_alpha", json!(1.0))]).is_empty());
     }
 
@@ -17851,7 +17857,10 @@ mod workbench_display_loss_tests {
 
     #[test]
     fn only_wireframe_is_below_solid_and_only_viewport_is_an_unimported_background() {
-        assert_eq!(losses(&[("type", json!("WIREFRAME"))]), ["blender.scene.display_type"]);
+        assert_eq!(
+            losses(&[("type", json!("WIREFRAME"))]),
+            ["blender.scene.display_type"]
+        );
         for shading_type in ["SOLID", "MATERIAL", "RENDERED"] {
             assert!(losses(&[("type", json!(shading_type))]).is_empty());
         }

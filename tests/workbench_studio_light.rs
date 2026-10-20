@@ -306,16 +306,16 @@ fn blend_solid_preview_shades_with_viewport_display_under_the_scene_view_transfo
         let oracle = root.path().join("oracle");
         fs::create_dir(&oracle)?;
         let blend = root.path().join("viewport-display.blend");
-        let script = write_script(root.path(), "workbench_viewport_display.py", VIEWPORT_SCRIPT)?;
+        let script = write_script(
+            root.path(),
+            "workbench_viewport_display.py",
+            VIEWPORT_SCRIPT,
+        )?;
         run_blender_arguments(
             &blender,
             &script,
             None,
-            &[
-                oracle.as_path(),
-                blend.as_path(),
-                Path::new(view_transform),
-            ],
+            &[oracle.as_path(), blend.as_path(), Path::new(view_transform)],
         )?;
 
         let project = root.path().join("project");
