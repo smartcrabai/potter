@@ -3023,12 +3023,13 @@ fn split_input_edges(state: &mut State) {
 /// and the spare it was created in is killed. So ring 0 keeps the split face's slot, the other rings
 /// take their new slots, and only ring 0's spare returns to the pool free list.
 fn split_face_slots(pool: &mut PoolSlots, split_slot: usize, rings: &mut [Face]) {
-    let created: Vec<usize> = rings.iter().map(|_| pool.alloc()).collect();
+    // Allocation order is ring order: ring 0's spare first, then one slot per other ring.
+    let spare = pool.alloc();
     rings[0].slot = split_slot;
-    for (ring, &slot) in rings.iter_mut().zip(&created).skip(1) {
-        ring.slot = slot;
+    for ring in rings.iter_mut().skip(1) {
+        ring.slot = pool.alloc();
     }
-    pool.release(created[0]);
+    pool.release(spare);
 }
 
 fn split_faces(state: &mut State) {

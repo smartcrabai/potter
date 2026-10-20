@@ -19,6 +19,11 @@
 //!
 //! Not modelled: removal. None of the maps emulated here are ever shrunk, so no slot is ever
 //! marked removed.
+//!
+//! Not modelled: the inline-buffer minimum. Blender takes `max(total, inline_buffer_capacity)` slots
+//! (`BLI_memory_utils.hh`), and that capacity is 8 when key plus value is under 100 bytes. The
+//! emulation is valid only for maps whose `InlineBufferCapacity` is 0. Both maps here hold `mpq3`
+//! values, which exceed 100 bytes, so the minimum never applies to them.
 
 /// Blender `blenlib_detail::default_hash_factors[0]`, the multiplier for the second element of a
 /// pair (`BLI_hash.hh`).

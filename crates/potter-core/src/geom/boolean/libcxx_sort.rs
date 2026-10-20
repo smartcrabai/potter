@@ -30,10 +30,12 @@ pub(super) fn libcxx_sort_by<T: Copy, F: Fn(&T, &T) -> bool>(v: &mut [T], less: 
 }
 
 /// Blender `parallel_sort` for `IMesh::populate_vert` in a TBB build: `tbb::parallel_sort`
-/// (`BLI_sort.hh:11-20`). oneTBB (`include/oneapi/tbb/parallel_sort.h`) sorts fewer than 500
-/// elements with `std::sort` (libc++ on macOS, [`libcxx_sort_by`]). For 500 or more it runs
-/// `parallel_quick_sort`, whose tie order is not libc++'s. Blender's populate sort of the sphere
-/// boolean (1921 vertices, equal origins across operands) matched this model at every position.
+/// (`BLI_sort.hh:11-20`) from oneTBB v2022.3.0, the version Blender 5.2.2 ships (`versions.cmake`).
+/// It sorts fewer than 500 elements with `std::sort` (libc++ on macOS, [`libcxx_sort_by`]). For 500
+/// or more it runs `parallel_quick_sort`: a pretest, then a recursive split of `quick_sort_range`.
+/// The tie order is recorded by `testdata/tbb/record_tbb_sort.cpp` against the v2022.3.0 headers and
+/// Blender's `libtbb`. Blender's order depends on the auto partitioner above about 12k elements,
+/// which this model does not reproduce.
 pub(super) fn parallel_sort_by<T: Copy, F: Fn(&T, &T) -> bool>(v: &mut [T], less: F) {
     if v.len() < TBB_MIN_PARALLEL_SIZE {
         libcxx_sort_by(v, less);
@@ -47,7 +49,7 @@ pub(super) fn parallel_sort_by<T: Copy, F: Fn(&T, &T) -> bool>(v: &mut [T], less
         unsorted = (TBB_SERIAL_CUTOFF + 1..v.len()).any(|k| lt(&v[k], &v[k - 1]));
     }
     if unsorted {
-        tbb_quick_sort_range(v, 0, v.len(), true, &lt);
+        tbb_quick_sort_range(v, 0, v.len(), &lt);
     }
 }
 
@@ -58,65 +60,73 @@ const TBB_SERIAL_CUTOFF: usize = 9;
 /// oneTBB `quick_sort_range::grainsize`: ranges below this are sorted by `std::sort` as leaves.
 const TBB_GRAINSIZE: usize = 500;
 
-/// oneTBB `quick_sort_range::split_unchecked` (`parallel_sort.h`) on `v[first..last]`, depth-first.
-/// The partition is serial `std::partition`, which oneTBB uses below `500 * max_concurrency`
-/// elements (`_parallel_partition.h`); the leaves are libc++ `std::sort`.
+/// oneTBB v2022.3.0 `quick_sort_range` on `v[first..first+size]`, depth-first: `split_range` until a
+/// range is below `grainsize`, then libc++ `std::sort` on the leaf. The recursion is complete, so
+/// the order does not depend on how many threads ran it.
 fn tbb_quick_sort_range<T: Copy>(
     v: &mut [T],
-    mut first: usize,
-    mut last: usize,
-    mut leftmost: bool,
+    first: usize,
+    size: usize,
     lt: &dyn Fn(&T, &T) -> bool,
 ) {
-    loop {
-        if last - first < TBB_GRAINSIZE {
-            libcxx_sort_by(&mut v[first..last], |a, b| lt(a, b));
-            return;
-        }
-        // `pseudo_median_of_nine`
-        let n = last - first;
-        let offset = n / 8;
-        let med =
-            |v: &[T], l: usize, m: usize, r: usize| tbb_median_of_three(v, first, l, m, r, lt);
-        let p = med(
-            v,
-            med(v, 0, offset, offset * 2),
-            med(v, offset * 3, offset * 4, offset * 5),
-            med(v, offset * 6, offset * 7, n - 1),
-        );
-        if p != 0 {
-            v.swap(first, first + p);
-        }
-        // `value_type pivot = std::move(*m_first)`
-        let pivot = v[first];
-        if !leftmost && !lt(&v[first - 1], &pivot) {
-            // Equal to the previous pivot: partition the equal elements to the front.
-            let equal_end = tbb_partition(v, first + 1, last, |x| !lt(&pivot, x));
-            v[first] = pivot;
-            first = equal_end;
-            continue;
-        }
-        let it = tbb_partition(v, first + 1, last, |x| lt(x, &pivot));
-        v[first] = pivot;
-        let pivot_pos = if it == first + 1 {
-            first
-        } else {
-            v.swap(first, it - 1);
-            it - 1
-        };
-        let left_size = pivot_pos - first;
-        let right_size = last - (pivot_pos + 1);
-        if left_size == 0 {
-            first = pivot_pos + 1;
-            leftmost = false;
-        } else if right_size == 0 {
-            last = pivot_pos;
-        } else {
-            tbb_quick_sort_range(v, first, pivot_pos, leftmost, lt);
-            first = pivot_pos + 1;
-            leftmost = false;
-        }
+    if size < TBB_GRAINSIZE {
+        libcxx_sort_by(&mut v[first..first + size], |a, b| lt(a, b));
+        return;
     }
+    let (left, right_first, right_size) = tbb_split_range(v, first, size, lt);
+    tbb_quick_sort_range(v, first, left, lt);
+    tbb_quick_sort_range(v, right_first, right_size, lt);
+}
+
+/// oneTBB v2022.3.0 `quick_sort_range::split_range`: a two-sided Hoare partition around the
+/// pseudo-median of nine. The pivot stays at the range start while the scans run, then moves to its
+/// final index `j`. Returns the left size, and the first index and size of the right range. The
+/// pivot at `j` belongs to neither range.
+fn tbb_split_range<T: Copy>(
+    v: &mut [T],
+    first: usize,
+    size: usize,
+    lt: &dyn Fn(&T, &T) -> bool,
+) -> (usize, usize, usize) {
+    // `pseudo_median_of_nine`
+    let offset = size / 8;
+    let a = tbb_median_of_three(v, first, 0, offset, offset * 2, lt);
+    let b = tbb_median_of_three(v, first, offset * 3, offset * 4, offset * 5, lt);
+    let c = tbb_median_of_three(v, first, offset * 6, offset * 7, size - 1, lt);
+    let m = tbb_median_of_three(v, first, a, b, c, lt);
+    if m != 0 {
+        v.swap(first, first + m);
+    }
+    // `first_element`: index `first` is only written by the final pivot move below.
+    let pivot = v[first];
+    let mut i = 0usize;
+    let mut j = size;
+    let pivot_index = 'partition: loop {
+        // `do { --j; } while (comp(*first_element, array[j]))`
+        loop {
+            j -= 1;
+            if !lt(&pivot, &v[first + j]) {
+                break;
+            }
+        }
+        // `do { if (i == j) goto partition; ++i; } while (comp(array[i], *first_element))`
+        loop {
+            if i == j {
+                break 'partition j;
+            }
+            i += 1;
+            if !lt(&v[first + i], &pivot) {
+                break;
+            }
+        }
+        if i == j {
+            break 'partition j;
+        }
+        v.swap(first + i, first + j);
+    };
+    // `iter_swap(array + j, first_element)`: the pivot takes its final index.
+    v.swap(first, first + pivot_index);
+    (pivot_index, first + pivot_index + 1, size - pivot_index - 1)
 }
 
 /// oneTBB `pseudo_median_of_nine` helper: index (relative to `first`) of the median of three.
@@ -146,38 +156,6 @@ fn tbb_median_of_three<T: Copy>(
     }
 }
 
-/// libc++ `std::partition` (bidirectional form) on `v[first..last]`: returns the first element
-/// for which `pred` is false.
-fn tbb_partition<T: Copy>(
-    v: &mut [T],
-    mut first: usize,
-    mut last: usize,
-    pred: impl Fn(&T) -> bool,
-) -> usize {
-    loop {
-        loop {
-            if first == last {
-                return first;
-            }
-            if pred(&v[first]) {
-                first += 1;
-            } else {
-                break;
-            }
-        }
-        loop {
-            last -= 1;
-            if first == last {
-                return first;
-            }
-            if pred(&v[last]) {
-                break;
-            }
-        }
-        v.swap(first, last);
-        first += 1;
-    }
-}
 
 struct Sorter<'a, T, F> {
     v: &'a mut [T],
@@ -779,43 +757,40 @@ mod tests {
         );
     }
 
-    /// Parses one `created sort-value position` row of the recorded Blender populate order.
-    fn parse_populate_row(line: &str) -> Option<(bool, i64, usize)> {
-        let mut fields = line.split_whitespace();
-        let created = fields.next()?.parse::<u8>().ok()?;
-        let value = fields.next()?.parse::<i64>().ok()?;
-        let position = fields.next()?.parse::<usize>().ok()?;
-        Some((created == 1, value, position))
+    /// Parses a `keys ...` or `order ...` line of a recording (`testdata/tbb/record_tbb_sort.cpp`).
+    fn record_values<T: std::str::FromStr>(line: Option<&str>, tag: &str) -> Vec<T>
+    where
+        T::Err: std::fmt::Debug,
+    {
+        let mut fields = line.expect("recording line").split_whitespace();
+        assert_eq!(fields.next(), Some(tag));
+        fields
+            .map(|field| field.parse().expect("recorded integer"))
+            .collect()
     }
 
-    /// Blender 5.2.2 populate order of the `sphere_closed64_hole_tolerant_on` EXACT boolean: 1921
-    /// vertices, so `parallel_sort` takes the oneTBB quicksort path (500 or more). Each line is
-    /// `created sort-value position`, in first-seen order over the output faces.
+    /// Sorts each recorded case with `parallel_sort_by` and compares the element order with the
+    /// `tbb::parallel_sort` run of oneTBB v2022.3.0 against Blender's `libtbb`. Five cases give a
+    /// different order under oneTBB master's `parallel_sort`, so the test rejects that version.
     #[test]
-    fn parallel_sort_matches_recorded_blender_tbb_order() {
-        let text = include_str!("testdata/populate_sphere_closed64.txt");
-        let rows: Vec<(bool, i64, usize)> = text
-            .lines()
-            .filter(|line| !line.starts_with('#'))
-            .filter_map(parse_populate_row)
-            .collect();
-        assert_eq!(rows.len(), 1921);
-        // Potter's populate key: input (false, origin, 0), created (true, 0, id).
-        let key = |s: usize| {
-            let (created, value, _) = rows[s];
-            if created {
-                (true, 0i64, value)
-            } else {
-                (false, value, 0i64)
-            }
-        };
-        let mut order: Vec<usize> = (0..rows.len()).collect();
-        parallel_sort_by(&mut order, |&a, &b| key(a) < key(b));
-        let mut position = vec![0usize; rows.len()];
-        for (index, &slot) in order.iter().enumerate() {
-            position[slot] = index;
+    fn parallel_sort_matches_recorded_tbb_v2022_3_0_order() {
+        let text = include_str!("testdata/tbb/tbb_sort_v2022_3_0.txt");
+        let mut lines = text.lines().filter(|line| !line.starts_with('#'));
+        let mut cases = 0;
+        while let Some(header) = lines.next() {
+            let mut fields = header.split_whitespace();
+            assert_eq!(fields.next(), Some("case"));
+            let name = fields.next().expect("case name").to_owned();
+            let n: usize = fields.next().expect("case size").parse().expect("case size");
+            let keys: Vec<i64> = record_values(lines.next(), "keys");
+            let order: Vec<usize> = record_values(lines.next(), "order");
+            assert_eq!(keys.len(), n, "{name}: key count");
+            assert_eq!(order.len(), n, "{name}: order count");
+            let mut sorted: Vec<usize> = (0..n).collect();
+            parallel_sort_by(&mut sorted, |&a, &b| keys[a] < keys[b]);
+            assert_eq!(sorted, order, "{name}: order differs from tbb::parallel_sort v2022.3.0");
+            cases += 1;
         }
-        let recorded: Vec<usize> = rows.iter().map(|row| row.2).collect();
-        assert_eq!(position, recorded);
+        assert_eq!(cases, 9, "the recording holds nine cases");
     }
 }

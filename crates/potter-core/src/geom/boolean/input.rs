@@ -32,11 +32,6 @@ pub(crate) struct Operand<'a> {
     pub transform: DMat4,
 }
 
-/// Blender `meshes_to_imesh`: interns every operand's vertices in `arena` and returns the
-/// triangulated faces of all operands, in operand then face order.
-///
-/// Operands whose transform has a negative determinant have their faces reversed when operand 0
-/// is not negative (Blender `need_face_flip`), so every operand keeps operand 0's orientation.
 /// Input face loops of the operands, indexed by joined face index (Blender `imesh_in` faces): arena
 /// vertex ids and edge origins in loop order, after the operand flips.
 #[derive(Default)]
@@ -51,7 +46,12 @@ pub(crate) fn meshes_to_tris(operands: &[Operand<'_>], arena: &mut Arena) -> Res
     meshes_to_tris_and_loops(operands, arena).map(|(tris, _)| tris)
 }
 
-/// [`meshes_to_tris`], also returning each input face's loop for the output dissolve.
+/// Blender `meshes_to_imesh`: interns every operand's vertices in `arena` and returns the
+/// triangulated faces of all operands, in operand then face order, and each input face's loop for
+/// the output dissolve.
+///
+/// Operands whose transform has a negative determinant have their faces reversed when operand 0
+/// is not negative (Blender `need_face_flip`), so every operand keeps operand 0's orientation.
 pub(crate) fn meshes_to_tris_and_loops(
     operands: &[Operand<'_>],
     arena: &mut Arena,
@@ -115,10 +115,10 @@ pub(crate) fn meshes_to_tris_and_loops(
             } else {
                 (verts, edges)
             };
-            loops.verts.push(verts.clone());
-            loops.edges.push(edges.clone());
             let face_index = to_index(face_base + fi)?;
             tris.extend(triangulate_face(arena, &verts, face_index, &edges));
+            loops.verts.push(verts);
+            loops.edges.push(edges);
         }
 
         edge_base += mesh.edges.len();

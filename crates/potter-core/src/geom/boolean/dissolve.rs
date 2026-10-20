@@ -114,9 +114,10 @@ fn find_tris_common_edge(t1: &Tri, t2: &Tri) -> Option<(usize, usize)> {
 
 /// Blender's "quad with one diagonal remained unchanged" case of `merge_tris_for_face`.
 ///
-/// Blender builds the candidate ring and returns the input face itself when the ring is a rotation of
-/// it (`cyclic_equal`), so the output loop starts where the input face starts. `input` is that
-/// input loop (vertices and edge origins); the candidate is returned unchanged otherwise.
+/// Blender returns the input face itself when the two triangles rebuild it: the candidate ring must
+/// be a rotation of the input loop (`Face::cyclic_equal`, which never matches a reversal), and the
+/// output then starts where the input face starts. `input` is that loop (vertices and edge origins).
+/// Any other ring returns `None`, and the caller dissolves the triangles, as Blender does.
 fn recover_quad(tri1: &Tri, tri2: &Tri, input: Option<(&[u32], &[i32])>) -> Option<Poly> {
     let (i0, j) = find_tris_common_edge(tri1, tri2)?;
     if tri1.edge_orig[i0] != NO_INDEX {
@@ -128,44 +129,28 @@ fn recover_quad(tri1: &Tri, tri2: &Tri, input: Option<(&[u32], &[i32])>) -> Opti
     let j2 = (j + 2) % 3;
     // Ring: tri1[i1] -> tri1[i2] -> tri1[i0] -> tri2[j2]; its edges are tri1 edge i1, tri1 edge
     // i2, tri2 edge j1 and tri2 edge j2.
-    let edge_orig = vec![
+    let ring_edges = [
         tri1.edge_orig[i1],
         tri1.edge_orig[i2],
         tri2.edge_orig[j1],
         tri2.edge_orig[j2],
     ];
-    if edge_orig.contains(&NO_INDEX) {
+    if ring_edges.contains(&NO_INDEX) {
         return None;
     }
-    let verts = vec![tri1.v[i1], tri1.v[i2], tri1.v[i0], tri2.v[j2]];
-    if let Some((in_verts, in_edges)) = input
-        && in_verts.len() == 4
-        && in_edges.len() == 4
-    {
-        // The triangles may run against the input loop (Blender's operand B of a difference), so
-        // the loop is tried reversed too; the reversed loop starts at the input's first corner.
-        let reversed_verts = [in_verts[0], in_verts[3], in_verts[2], in_verts[1]];
-        let reversed_edges = [in_edges[3], in_edges[2], in_edges[1], in_edges[0]];
-        let same = |ring: &[u32]| (0..4).any(|r| (0..4).all(|k| verts[k] == ring[(k + r) % 4]));
-        if same(in_verts) {
-            return Some(Poly {
-                verts: in_verts.to_vec(),
-                orig: tri1.orig,
-                edge_orig: in_edges.to_vec(),
-            });
-        }
-        if same(&reversed_verts) {
-            return Some(Poly {
-                verts: reversed_verts.to_vec(),
-                orig: tri1.orig,
-                edge_orig: reversed_edges.to_vec(),
-            });
-        }
+    let ring = [tri1.v[i1], tri1.v[i2], tri1.v[i0], tri2.v[j2]];
+    let (in_verts, in_edges) = input?;
+    if in_verts.len() != 4 || in_edges.len() != 4 {
+        return None;
+    }
+    let rotation_of_input = (0..4).any(|r| (0..4).all(|k| ring[k] == in_verts[(k + r) % 4]));
+    if !rotation_of_input {
+        return None;
     }
     Some(Poly {
-        verts,
+        verts: in_verts.to_vec(),
         orig: tri1.orig,
-        edge_orig,
+        edge_orig: in_edges.to_vec(),
     })
 }
 
@@ -764,13 +749,66 @@ mod tests {
             Tri::new([a, b, c], 0, [0, 1, NO_INDEX]),
             Tri::new([a, c, d], 0, [NO_INDEX, 2, 3]),
         ];
+        let loops = InputLoops {
+            verts: vec![vec![a, b, c, d]],
+            edges: vec![vec![0, 1, 2, 3]],
+        };
         assert_eq!(
-            polymesh_from_tris(&arena, &tris, &InputLoops::default()),
+            polymesh_from_tris(&arena, &tris, &loops),
             vec![Poly {
                 verts: vec![a, b, c, d],
                 orig: 0,
                 edge_orig: vec![0, 1, 2, 3],
             }]
+        );
+    }
+
+    /// The input loop starts at `c`, so the recovered quad starts there too (`cyclic_equal`).
+    #[test]
+    fn quad_recovery_returns_the_input_loop_start() {
+        let mut arena = Arena::new();
+        let a = vert(&mut arena, 0.0, 0.0, 0);
+        let b = vert(&mut arena, 2.0, 0.0, 1);
+        let c = vert(&mut arena, 2.0, 2.0, 2);
+        let d = vert(&mut arena, 0.0, 2.0, 3);
+        let tris = [
+            Tri::new([a, b, c], 0, [0, 1, NO_INDEX]),
+            Tri::new([a, c, d], 0, [NO_INDEX, 2, 3]),
+        ];
+        let loops = InputLoops {
+            verts: vec![vec![c, d, a, b]],
+            edges: vec![vec![2, 3, 0, 1]],
+        };
+        assert_eq!(
+            polymesh_from_tris(&arena, &tris, &loops),
+            vec![Poly {
+                verts: vec![c, d, a, b],
+                orig: 0,
+                edge_orig: vec![2, 3, 0, 1],
+            }]
+        );
+    }
+
+    /// A reversed input loop is not a rotation of the rebuilt quad, so the triangles are dissolved
+    /// exactly as when no input loop is known.
+    #[test]
+    fn reversed_input_loop_takes_the_dissolve_path() {
+        let mut arena = Arena::new();
+        let a = vert(&mut arena, 0.0, 0.0, 0);
+        let b = vert(&mut arena, 2.0, 0.0, 1);
+        let c = vert(&mut arena, 2.0, 2.0, 2);
+        let d = vert(&mut arena, 0.0, 2.0, 3);
+        let tris = [
+            Tri::new([a, b, c], 0, [0, 1, NO_INDEX]),
+            Tri::new([a, c, d], 0, [NO_INDEX, 2, 3]),
+        ];
+        let reversed = InputLoops {
+            verts: vec![vec![a, d, c, b]],
+            edges: vec![vec![3, 2, 1, 0]],
+        };
+        assert_eq!(
+            polymesh_from_tris(&arena, &tris, &reversed),
+            polymesh_from_tris(&arena, &tris, &InputLoops::default()),
         );
     }
 
