@@ -309,7 +309,8 @@ fn simulate_with_lifecycle(
                 .unwrap_or(false));
     let has_frame_start =
         settings.get("frame_start").is_some() || settings.get("start_frame").is_some();
-    let frame_start = setting_alias_number(settings, &["frame_start", "start_frame"], 0.0)?;
+    // Blender's `ParticleSettings.sta` default is 1 (`DNA_particle_types.h:600`).
+    let frame_start = setting_alias_number(settings, &["frame_start", "start_frame"], 1.0)?;
     let count = settings.get("count").and_then(Value::as_f64);
     let frame_end = setting_alias_number(
         settings,
@@ -444,7 +445,8 @@ fn simulate_with_lifecycle(
             "particle output exceeds the one-million particle limit",
         ));
     }
-    let particle_size = setting_alias_number(settings, &["particle_size", "size"], 1.0)?;
+    // Blender's `ParticleSettings.size` default is 0.05 (`DNA_particle_types.h:613`).
+    let particle_size = setting_alias_number(settings, &["particle_size", "size"], 0.05)?;
     let size_random = setting_alias_number(settings, &["size_random", "randsize"], 0.0)?;
     if particle_size < 0.0 || !(0.0..=1.0).contains(&size_random) {
         return Err(invalid(
