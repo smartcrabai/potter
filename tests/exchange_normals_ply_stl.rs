@@ -12,7 +12,7 @@ mod exchange_normals;
 use std::{fs, path::Path, process::Output};
 
 use exchange_normals::{
-    BLENDER_NORMAL_TOLERANCE, NORMAL_TOLERANCE, TestResult, export, export_strict, init, near, pot,
+    BLENDER_NORMAL_TOLERANCE, TestResult, export, export_strict, init, near, pot,
     reference_corners, write_fixture_scene,
 };
 use serde_json::{Value, json};
@@ -555,8 +555,10 @@ fn ply_round_trip_keeps_per_vertex_normals() -> TestResult {
             .find(|candidate| near(candidate.position, vertex.position))
             .ok_or("re-exported PLY lost a vertex")?;
         let error = max_error(vertex.normal, other.normal);
+        // Both exports store the custom-normal layer as int16 codes, so the round trip re-quantizes
+        // it; the bound is the custom-code class bound (`BLENDER_NORMAL_TOLERANCE`), not a per-output one.
         assert!(
-            error <= NORMAL_TOLERANCE,
+            error <= BLENDER_NORMAL_TOLERANCE,
             "vertex {:?}: normal {:?} became {:?} after round trip (error {error})",
             vertex.position,
             vertex.normal,
