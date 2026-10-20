@@ -1,13 +1,16 @@
 """Light ray visibility, rendered by Blender's Cycles (v5.2.2) as the oracle for Potter.
 
 A top-down orthographic view of a diffuse floor and a roughness-0 metal sphere, lit by two disk
-area lights above them. The lights' `visible_*` flags change what the camera sees:
+area lights above them, with a third disk that the camera can see. The lights' `visible_*` flags change
+what the camera sees:
 
   GlossyOff   visible_glossy=False. Its disk is absent from the sphere's mirror image, so the
               sphere's centre, where the mirror reflects it straight back up, is dark.
   DiffuseOff  visible_diffuse=False and visible_glossy=False. Cycles drops the diffuse closure from
               the disk's direct lighting as well as from diffuse bounce hits, so the floor under it
               receives no light from the disk. It is not reflected in the sphere.
+  CameraLight visible_camera=True. Turned to face the camera, it is seen as a disk of radiance
+              RADIANCE. The default flags hide it, so the camera sees the floor where it is.
 
 Each light is also drawn with default flags into a second render. The test checks that the flags
 change the reference, so a reference that lost the scene cannot pass by matching a broken render.
@@ -16,6 +19,7 @@ bit), so the flagged scene sets none.
 
 The disks emit radiance RADIANCE in W/(sr m²): power is radiance · π · area, with area π r².
 The patch centres in `tests/native_light_ray_visibility.rs` must match the layout below.
+The test's patch for CameraLight is centred at its world position, (-1, -0.9), as for the other lights.
 
 Arguments after `--`: blend_out, flagged_exr_out, default_exr_out.
 """
@@ -36,14 +40,17 @@ LIGHT_HEIGHT = 2.0
 DISK_SIZE = 1.0
 RADIANCE = 4.0
 
-# Light name, location, and the flags applied in the flagged scene only.
+# Light name, location, rotation, and the flags applied in the flagged scene only. The disks emit down
+# (local -Z), except CameraLight, turned to emit up towards the camera.
 LIGHTS = [
-    ("GlossyOff", (0.0, 0.0, LIGHT_HEIGHT), {"visible_glossy": False}),
+    ("GlossyOff", (0.0, 0.0, LIGHT_HEIGHT), (0.0, 0.0, 0.0), {"visible_glossy": False}),
     (
         "DiffuseOff",
         (1.0, -0.9, LIGHT_HEIGHT),
+        (0.0, 0.0, 0.0),
         {"visible_diffuse": False, "visible_glossy": False},
     ),
+    ("CameraLight", (-1.0, -0.9, LIGHT_HEIGHT), (math.pi, 0.0, 0.0), {"visible_camera": True}),
 ]
 
 
@@ -104,7 +111,7 @@ def build_scene(flagged):
     sphere.data.materials.append(principled("Mirror", (1.0, 1.0, 1.0, 1.0), 1.0, 0.0, 0.5))
     smooth(sphere)
 
-    for name, location, flags in LIGHTS:
+    for name, location, rotation, flags in LIGHTS:
         data = bpy.data.lights.new(name, "AREA")
         data.shape = "DISK"
         data.size = DISK_SIZE
@@ -115,6 +122,7 @@ def build_scene(flagged):
         scene.collection.objects.link(light)
         # An area light emits along its local -Z, which is -Z in world space at the default rotation.
         light.location = location
+        light.rotation_euler = rotation
         if flagged:
             for flag, value in flags.items():
                 setattr(light, flag, value)

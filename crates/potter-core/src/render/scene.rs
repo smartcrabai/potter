@@ -183,8 +183,8 @@ pub(super) fn extract_geometry(
             continue;
         }
         let ray_visibility = node.resolved_ray_visibility();
-        if matches!(mode, Mode::Beauty) {
-            ray_visibility_warnings(node_id, node, path_traced, &mut warnings);
+        if !path_traced && matches!(mode, Mode::Beauty) {
+            ray_visibility_warnings(node_id, node, &mut warnings);
         }
         let data_block = node
             .data
@@ -1473,41 +1473,29 @@ fn world_face_normals(
     faces
 }
 
-/// Ray-visibility flags that a Beauty engine does not honour, one warning per flag switched away
-/// from Blender's default. Blender's panel shows the flags each engine exposes
+/// Ray-visibility flags that realtime Beauty does not honour, one warning per flag switched away from
+/// Blender's default for a light. Blender's panel shows the flags each engine exposes
 /// (`scripts/startup/bl_ui/properties_object.py`, `OBJECT_PT_visibility`, EEVEE branch): a mesh has
-/// Camera, Shadow and Raycast, and a light has Camera, Diffuse, Glossy, Transmission and Volume
-/// Scatter. EEVEE has no mesh diffuse, glossy, transmission or volume flag, so realtime Beauty warns
-/// about none of those. EEVEE does honour a light's transmission and volume scatter
-/// (`draw/engines/eevee/eevee_light.cc`, `transmission_visibility` and `volume_visibility`), and
-/// realtime Beauty does not, so those two warn. The path tracer honours every mesh flag and every
-/// light flag except camera, because it draws no light emitter to the camera. A light's
-/// `visible_shadow` is stored without a warning: Blender reads it nowhere (Cycles'
-/// `light_object_visibility_flags`, EEVEE's `eevee_light.cc`).
-fn ray_visibility_warnings(
-    node_id: &Id,
-    node: &Node,
-    path_traced: bool,
-    warnings: &mut Vec<serde_json::Value>,
-) {
-    const REALTIME_LIGHT: [(&str, RayKind); 2] = [
+/// Camera, Shadow and Raycast, and a light has Camera, Diffuse, Glossy, Transmission and Volume Scatter.
+/// EEVEE has no mesh diffuse, glossy, transmission or volume flag, so realtime warns about none of
+/// those. A light's camera visibility shows its emitter in EEVEE (`eevee_light_shape_display`, which
+/// returns unless `visible_camera`; a headless EEVEE render shows the disc), and realtime draws no
+/// emitters. EEVEE applies a light's transmission and volume scatter to its power (`eevee_light.cc`,
+/// `transmission_visibility` and `volume_visibility`), and realtime does not. The path tracer honours
+/// every flag. A light's `visible_shadow` is stored without a warning: Blender reads it nowhere
+/// (Cycles' `light_object_visibility_flags`, EEVEE's `eevee_light.cc`).
+fn ray_visibility_warnings(node_id: &Id, node: &Node, warnings: &mut Vec<serde_json::Value>) {
+    const REALTIME_LIGHT: [(&str, RayKind); 3] = [
+        ("camera", RayKind::Camera),
         ("transmission", RayKind::Transmission),
         ("volume_scatter", RayKind::VolumeScatter),
     ];
-    const PATH_LIGHT: [(&str, RayKind); 1] = [("camera", RayKind::Camera)];
-    let flags: &[(&str, RayKind)] = match (path_traced, node.kind == "light") {
-        (true, true) => &PATH_LIGHT,
-        (false, true) => &REALTIME_LIGHT,
-        (_, false) => &[],
-    };
-    let engine = if path_traced {
-        "the path tracer"
-    } else {
-        "realtime Beauty"
-    };
+    if node.kind != "light" {
+        return;
+    }
     let visibility = node.resolved_ray_visibility();
     let default = RayVisibility::default_for_kind(&node.kind);
-    for &(name, ray) in flags {
+    for &(name, ray) in &REALTIME_LIGHT {
         let value = visibility.allows(ray);
         let expected = default.allows(ray);
         if value == expected {
@@ -1518,7 +1506,7 @@ fn ray_visibility_warnings(
             "feature_id": format!("object.ray_visibility.{name}"),
             "node_id": node_id,
             "message": format!(
-                "visible_{name} is {value}, which {engine} does not honour for this {}; it renders as if visible_{name} were {expected}",
+                "visible_{name} is {value}, which realtime Beauty does not honour for this {}; it renders as if visible_{name} were {expected}",
                 node.kind,
             ),
         }));

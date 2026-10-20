@@ -59,16 +59,26 @@ struct PointLight {
 }
 
 impl PointLight {
-    /// Whether a BSDF-sampled ray can hit this light (Cycles' `SHADER_USE_MIS`, set by
-    /// `AreaLight::copy_to_kernel` for an emitter with area and by `PointLight::copy_to_kernel` for
-    /// a radius). Zero-radius point and spot lights are delta lights, and the sun is never hit.
-    fn hittable(&self) -> bool {
-        self.use_mis
-            && match self.kind {
-                LightType::Area => self.area.is_some_and(|shape| shape.area > 0.0),
-                LightType::Point | LightType::Spot => self.radius > 0.0,
-                LightType::Sun => false,
-            }
+    /// Whether this light has an emitter shape a ray can meet: an area light with area, or a point or
+    /// spot light with a radius. A zero-radius point or spot light is a delta light, and the sun has
+    /// no shape.
+    fn has_shape(&self) -> bool {
+        match self.kind {
+            LightType::Area => self.area.is_some_and(|shape| shape.area > 0.0),
+            LightType::Point | LightType::Spot => self.radius > 0.0,
+            LightType::Sun => false,
+        }
+    }
+
+    /// Whether a ray of kind `ray` can intersect this light, as Cycles' `lights_intersect` decides. A
+    /// camera ray meets any shaped light whose camera visibility is on. A BSDF ray meets a shaped light
+    /// only if it samples lights with MIS (`SHADER_USE_MIS`).
+    fn intersects(&self, ray: RayKind) -> bool {
+        if ray == RayKind::Camera {
+            self.has_shape() && self.ray_mask & RayKind::Camera.bit() != 0
+        } else {
+            self.use_mis && self.has_shape()
+        }
     }
 }
 
@@ -857,13 +867,14 @@ fn trace_path(
             ray,
         );
         let surface_distance = hit.map_or(f64::INFINITY, |hit| hit.distance);
-        // Camera rays do not see lights, and a volume scatter is light-sampled only. A surface
-        // vertex's light hit needs its light sample as MIS partner, which a volume scatter on the
-        // way would drop, so a scene with volumes does not count those hits.
+        // Camera rays see the lights that are visible to camera, and a volume scatter is light-sampled
+        // only. A surface vertex's light hit needs its light sample as MIS partner, which a volume
+        // scatter on the way would drop, so a scene with volumes does not count those hits.
         let receiver = match previous {
+            Scatter::Camera => Some(origin),
             Scatter::Surface(vertex) if volumes.is_empty() => Some(vertex.point),
             Scatter::Delta(point) => Some(point),
-            Scatter::Camera | Scatter::Surface(_) | Scatter::Volume => None,
+            Scatter::Surface(_) | Scatter::Volume => None,
         };
         let light = receiver.and_then(|receiver| {
             nearest_light_hit(lights, origin, direction, receiver, surface_distance, ray)
@@ -1958,7 +1969,7 @@ fn nearest_light_hit(
     ray: RayKind,
 ) -> Option<LightHit> {
     let mut nearest: Option<LightHit> = None;
-    for light in lights.iter().filter(|light| light.hittable()) {
+    for light in lights.iter().filter(|light| light.intersects(ray)) {
         let closest = nearest.map_or(limit, |hit| hit.distance);
         if let Some((distance, radiance, pdf)) =
             light_hit(light, origin, direction, receiver, closest)

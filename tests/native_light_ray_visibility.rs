@@ -51,10 +51,13 @@ const PIXEL_TOLERANCE: f64 = 0.01;
 ///   diffuse light, so the reference is much darker than the default render.
 /// - `floor_far`: a floor point that both lights reach directly, away from the sphere. `DiffuseOff`'s
 ///   share of it is dropped as well, so it is darker than the default render too.
-const PATCHES: [(&str, [f64; 2], f64); 3] = [
+/// - `camera_light`: the `CameraLight` disk, turned to face the camera with `visible_camera=True`. The
+///   camera sees its emitter, which is radiance 4 in the flagged render; by default it is hidden.
+const PATCHES: [(&str, [f64; 2], f64); 4] = [
     ("highlight", [0.0, 0.0], 0.03),
     ("floor_diffuse", [1.0, -0.9], 0.15),
     ("floor_far", [-1.0, 1.0], 0.1),
+    ("camera_light", [-1.0, -0.9], 0.2),
 ];
 
 /// The mean RGB of the patch centred on `centre` (metres) with half width `half`.
@@ -185,6 +188,14 @@ fn light_ray_visibility_render_matches_cycles_patch_means() -> TestResult {
     assert!(
         diffuse_on - diffuse_off > 0.1,
         "DiffuseOff must darken the floor under it: flagged {diffuse_off}, default {diffuse_on}"
+    );
+
+    let (camera_light, half) = patch_centre("camera_light")?;
+    let visible = patch_mean(&reference, camera_light, half)[0];
+    let hidden = patch_mean(&default, camera_light, half)[0];
+    assert!(
+        visible > 1.0 && hidden < 0.5,
+        "CameraLight must show as a bright disk with visible_camera and the floor without it: flagged {visible}, default {hidden}"
     );
 
     for (name, centre, half) in PATCHES {
