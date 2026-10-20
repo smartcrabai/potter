@@ -128,22 +128,22 @@ fn sin_cos_fraction(index: usize, count: usize) -> (f64, f64) {
 )]
 pub(super) fn grid(nx: usize, ny: usize, size_x: f64, size_y: f64) -> Result<Mesh, MeshError> {
     let mut elements = Elements::default();
-    let mut index = vec![0; nx * ny];
+    // Vertices are appended row by row, so the vertex at (x, y) has index `y * nx + x`.
     for y in 0..ny {
         for x in 0..nx {
             let px = -size_x * 0.5 + size_x * x as f64 / (nx - 1) as f64;
             let py = -size_y * 0.5 + size_y * y as f64 / (ny - 1) as f64;
-            index[y * nx + x] = elements.vertex(DVec3::new(px, py, 0.0));
+            elements.vertex(DVec3::new(px, py, 0.0));
         }
     }
     for y in 0..ny - 1 {
         for x in 0..nx - 1 {
             let lower_left = y * nx + x;
             elements.face(&[
-                index[lower_left],
-                index[lower_left + 1],
-                index[lower_left + nx + 1],
-                index[lower_left + nx],
+                lower_left,
+                lower_left + 1,
+                lower_left + nx + 1,
+                lower_left + nx,
             ]);
         }
     }
@@ -295,9 +295,14 @@ fn assemble_cone(
         Collapse::Top => &rings.tops,
         Collapse::Bottom | Collapse::None => &rings.bottoms,
     };
+    let mut collapsed = vec![false; rings.elements.vertices.len()];
+    if collapse != Collapse::None {
+        for &vertex in collapsed_ring {
+            collapsed[vertex] = true;
+        }
+    }
     let apex = collapsed_ring[0];
-    let is_collapsed =
-        |vertex: usize| collapse != Collapse::None && collapsed_ring.contains(&vertex);
+    let is_collapsed = |vertex: usize| collapsed[vertex];
     let target = |vertex: usize| if is_collapsed(vertex) { apex } else { vertex };
 
     // Survivors keep creation order. A collapsed top's apex moves to the end; a collapsed bottom's
@@ -428,6 +433,11 @@ pub(super) fn explicit_edges(
 
 /// A torus (`add_torus` in `scripts/startup/bl_operators/add_mesh_torus.py`): its vertices and faces
 /// are given, and its edges follow the closing-first face walk, each stored lower vertex first.
+///
+/// Blender creates these edges in `mesh_calc_edges`. Below 1000 faces that is one hash map, and
+/// Blender's order is this walk. From 1000 faces Blender uses up to 8 maps, chosen by the host's
+/// thread count, so its order differs between hosts; this builder keeps the single-map order, which
+/// Blender produces with `--threads 1` (`tests/fixtures/primitive_uvs/torus_single_map_oracle.json`).
 pub(super) fn torus(positions: Vec<DVec3>, polygons: &[Vec<usize>]) -> Result<Mesh, MeshError> {
     let mut elements = Elements::default();
     for position in positions {
