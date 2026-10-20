@@ -2112,6 +2112,9 @@ def dump_scene(scene):
                 "seed": seed,
                 "max_bounces": int(getattr(getattr(scene, "cycles", None), "max_bounces", 4)),
                 "transparent_max_bounces": int(getattr(getattr(scene, "cycles", None), "transparent_max_bounces", 8)),
+                "pixel_filter_type": str(getattr(getattr(scene, "cycles", None), "pixel_filter_type", "BLACKMAN_HARRIS")),
+                "filter_width": float(getattr(getattr(scene, "cycles", None), "filter_width", 1.5)),
+                "filter_size": float(scene.render.filter_size),
                 "use_sequencer": bool(getattr(scene.render, "use_sequencer", False)),
                 "audio_codec": potter_audio_codec(getattr(getattr(scene.render, "ffmpeg", None),
                                                           "audio_codec", "PCM")),
@@ -6442,6 +6445,8 @@ def export_doc(doc, target, pack, scene_hash, context):
             scene.cycles.preview_dicing_rate = float(render.get("preview_dicing_rate", 8.0))
             scene.cycles.max_subdivisions = int(render.get("max_subdivisions", 12))
             scene.cycles.offscreen_dicing_scale = float(render.get("offscreen_dicing_scale", 4.0))
+            scene.cycles.pixel_filter_type = str(render.get("pixel_filter_type", "BLACKMAN_HARRIS"))
+            scene.cycles.filter_width = float(render.get("filter_width", 1.5))
         if engine == "CYCLES" and hasattr(scene, "cycles"):
             scene.cycles.samples = int(render.get("samples", 64))
             scene.cycles.seed = int(render.get("seed", 0))

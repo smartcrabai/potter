@@ -23,16 +23,17 @@ use crate::{
     model::{
         Action, ActionSlot, ArmatureData, Bone, CameraData, CameraProjection, Collection,
         Constraint, ConstraintType, CurveData, CurveDimensions, CurveFillMode, CurveHandleType,
-        CurvePoint, CurveSpline, CurveSplineType, DataBlock, Driver, DriverType, DriverVariable,
-        DriverVariableType, Extrapolation, FCurve, ForceField, ForceFieldType, GreasePencilData,
-        GreasePencilFrame, GreasePencilLayer, GreasePencilPoint, GreasePencilStroke, Id, Image,
-        ImageAlphaMode, ImageColorspace, ImageSource, ImageTile, Interpolation, Keyframe, Library,
-        LibraryKind, LibraryOverride, LibraryOverrideProperty, LibraryStatus, LightData, LightType,
-        Material, MaterialLink, Modifier, MovieClip, MovieTracking, NlaBlendType, NlaExtrapolation,
-        NlaStrip, NlaTrack, Node, ParentType, Profile, Registry, RenderSettings, RigidBody,
-        RigidBodyShape, RigidBodyType, RigidBodyWorld, Scene, SceneDoc, ShapeKey, ShapeKeyData,
-        SurfaceData, SurfacePoint, TextObjectData, TimelineMarker, Transform, UnitSettings,
-        VertexGroup, ViewLayer, ViewportDisplay, World, is_identity_matrix,
+        CurvePoint, CurveSpline, CurveSplineType, DEFAULT_FILTER_WIDTH, DataBlock, Driver,
+        DriverType, DriverVariable, DriverVariableType, Extrapolation, FCurve, ForceField,
+        ForceFieldType, GreasePencilData, GreasePencilFrame, GreasePencilLayer, GreasePencilPoint,
+        GreasePencilStroke, Id, Image, ImageAlphaMode, ImageColorspace, ImageSource, ImageTile,
+        Interpolation, Keyframe, Library, LibraryKind, LibraryOverride, LibraryOverrideProperty,
+        LibraryStatus, LightData, LightType, Material, MaterialLink, Modifier, MovieClip,
+        MovieTracking, NlaBlendType, NlaExtrapolation, NlaStrip, NlaTrack, Node, ParentType,
+        PixelFilterType, Profile, Registry, RenderSettings, RigidBody, RigidBodyShape,
+        RigidBodyType, RigidBodyWorld, Scene, SceneDoc, ShapeKey, ShapeKeyData, SurfaceData,
+        SurfacePoint, TextObjectData, TimelineMarker, Transform, UnitSettings, VertexGroup,
+        ViewLayer, ViewportDisplay, World, is_identity_matrix,
     },
     sequencer::{
         EffectType as SequenceEffectType, RetimingKey, Strip as SequenceStrip, StripBlendType,
@@ -2970,6 +2971,17 @@ fn build_imported_graph(
                 8,
             ))
             .map_err(|_| invalid_intermediate("render transparent_max_bounces is out of range"))?,
+            pixel_filter_type: match render
+                .get("pixel_filter_type")
+                .and_then(Value::as_str)
+                .unwrap_or("BLACKMAN_HARRIS")
+            {
+                "BOX" => PixelFilterType::Box,
+                "GAUSSIAN" => PixelFilterType::Gaussian,
+                "BLACKMAN_HARRIS" => PixelFilterType::BlackmanHarris,
+                _ => return Err(invalid_intermediate("render pixel_filter_type is unknown")),
+            },
+            filter_width: number_field(&render, "filter_width", DEFAULT_FILTER_WIDTH),
             dicing_rate: number_field(&render, "dicing_rate", 1.0),
             preview_dicing_rate: number_field(&render, "preview_dicing_rate", 8.0),
             max_subdivisions: u32::try_from(integer_field(&render, "max_subdivisions", 12))
@@ -8545,6 +8557,25 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
             if is_unsupported {
                 losses.push(loss(feature, name, reason));
             }
+        }
+    }
+    // Cycles' pixel filter is imported (`pixel_filter_type`, `filter_width`). EEVEE's `scene.render.filter_size`
+    // (`r.gauss`, `eevee_film.cc` `filter_radius`) is not: Potter's real-time engine has no filter of its own.
+    for scene in raw
+        .get("scenes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let render = &scene["render"];
+        if render["engine_native"].as_str() != Some("CYCLES")
+            && render["filter_size"].as_f64() != Some(1.5)
+        {
+            losses.push(loss(
+                "blender.render.filter_size",
+                scene.get("name").and_then(Value::as_str),
+                "Blender's EEVEE filter size is not imported; Potter's real-time engine draws no filter, so the image is not filtered as in EEVEE",
+            ));
         }
     }
     for material in raw

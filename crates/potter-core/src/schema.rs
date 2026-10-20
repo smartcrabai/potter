@@ -279,6 +279,10 @@ fn complete_scene_schema(root: &mut Value) {
     render["properties"]["offscreen_dicing_scale"] =
         json!({"type":"number","minimum":1.0,"maximum":f32::MAX});
     render["properties"]["dicing_camera"] = json!({"oneOf":[id_schema(),{"type":"null"}]});
+    render["properties"]["pixel_filter_type"] =
+        json!({"enum":["BOX","GAUSSIAN","BLACKMAN_HARRIS"],"default":"BLACKMAN_HARRIS"});
+    render["properties"]["filter_width"] =
+        json!({"type":"number","minimum":0.01,"maximum":10.0,"default":1.5});
 
     defs["node"]["properties"]["kind"]["enum"] =
         json!(["empty", "mesh", "camera", "light", "armature"]);
@@ -2382,6 +2386,8 @@ fn set_schema(operation: &str) -> Value {
             "seed":{"type":"integer","minimum":0,"maximum":u32::MAX},
             "max_bounces":{"type":"integer","minimum":0,"maximum":1024},
             "transparent_max_bounces":{"type":"integer","minimum":0,"maximum":1024},
+            "pixel_filter_type":{"enum":["BOX","GAUSSIAN","BLACKMAN_HARRIS"]},
+            "filter_width":{"type":"number","minimum":0.01,"maximum":10.0},
             "film_transparent":{"type":"boolean"},
             "engine":{"enum":["path","realtime"]},
             "use_sequencer":{"type":"boolean"},

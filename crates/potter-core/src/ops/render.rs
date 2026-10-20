@@ -1,6 +1,9 @@
 use serde_json::{Map, Value};
 
-use crate::error::{ErrorCode, Result};
+use crate::{
+    error::{ErrorCode, Result},
+    model::PixelFilterType,
+};
 
 use super::{ChangeKind, Engine, check_fields, operation_pointer, parse_id, pointer_escape};
 
@@ -12,6 +15,8 @@ const SET_FIELDS: &[&str] = &[
     "seed",
     "max_bounces",
     "transparent_max_bounces",
+    "pixel_filter_type",
+    "filter_width",
     "film_transparent",
     "engine",
     "use_sequencer",
@@ -114,6 +119,29 @@ pub(super) fn apply(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> 
     let seed = optional_u32(engine, set, "seed", 0, u32::MAX)?;
     let max_bounces = optional_u32(engine, set, "max_bounces", 0, 1024)?;
     let transparent_max_bounces = optional_u32(engine, set, "transparent_max_bounces", 0, 1024)?;
+    let pixel_filter_type = set
+        .get("pixel_filter_type")
+        .map(|value| {
+            let name = value.as_str().ok_or_else(|| {
+                engine.error(
+                    ErrorCode::InvalidOperation,
+                    "pixel_filter_type must be a string",
+                    &operation_pointer(engine.operation_index, "set/pixel_filter_type"),
+                )
+            })?;
+            match name {
+                "BOX" => Ok(PixelFilterType::Box),
+                "GAUSSIAN" => Ok(PixelFilterType::Gaussian),
+                "BLACKMAN_HARRIS" => Ok(PixelFilterType::BlackmanHarris),
+                _ => Err(engine.error(
+                    ErrorCode::InvalidOperation,
+                    "pixel_filter_type must be BOX, GAUSSIAN, or BLACKMAN_HARRIS",
+                    &operation_pointer(engine.operation_index, "set/pixel_filter_type"),
+                )),
+            }
+        })
+        .transpose()?;
+    let filter_width = optional_f64(engine, set, "filter_width", 0.01, 10.0)?;
     let motion_blur_samples = optional_u32(engine, set, "motion_blur_samples", 1, 64)?;
     let dicing_rate = optional_f64(engine, set, "dicing_rate", 0.1, 1000.0)?;
     let preview_dicing_rate = optional_f64(engine, set, "preview_dicing_rate", 0.1, 1000.0)?;
@@ -267,6 +295,12 @@ pub(super) fn apply(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> 
         }
         if let Some(value) = transparent_max_bounces {
             scene.render.transparent_max_bounces = value;
+        }
+        if let Some(value) = pixel_filter_type {
+            scene.render.pixel_filter_type = value;
+        }
+        if let Some(value) = filter_width {
+            scene.render.filter_width = value;
         }
         if let Some(value) = film_transparent {
             scene.render.film_transparent = value;

@@ -24,6 +24,7 @@ use super::{
         AreaShape, Spread, area_radiance, area_shape, emitter_radiance, inside_emitter,
         point_intensity, spot_attenuation, spread_attenuation, spread_region,
     },
+    pixel_filter::PixelFilter,
     raster::{
         Camera, Mode, RasterOutput, StereoMode, Triangle, blend_corner_normals, camera_eye,
         rasterize_with_lines, ray_for_sample, smooth_shadow_origin,
@@ -360,6 +361,7 @@ pub(super) fn render(
     max_bounces: u32,
     transparent_max_bounces: u32,
     film_transparent: bool,
+    pixel_filter: &PixelFilter,
     images: &BTreeMap<String, ImageData>,
 ) -> Result<RasterOutput> {
     if samples == 0 {
@@ -455,8 +457,9 @@ pub(super) fn render(
             let mut alpha_sum = 0.0;
             for sample_index in 0..samples {
                 let mut rng = Pcg32::for_sample(seed, x, y, sample_index);
-                let sample_x = rng.next_f64();
-                let sample_y = rng.next_f64();
+                let filter_u = rng.next_f64();
+                let filter_v = rng.next_f64();
+                let (sample_x, sample_y) = pixel_filter.sample(sample_index, filter_u, filter_v);
                 let (radiance, alpha) = if camera.stereo_mode == StereoMode::Anaglyph {
                     let left_camera = camera_eye(camera, -1.0);
                     let right_camera = camera_eye(camera, 1.0);

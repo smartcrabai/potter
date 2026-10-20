@@ -1151,6 +1151,45 @@ pub struct GreasePencilPoint {
     pub time: f64,
 }
 
+/// Cycles' film pixel filter (`intern/cycles/scene/film.h`, `FilterType`). Blender's default is
+/// Blackman-Harris, serialized as Blender's enum identifiers (`BOX`, `GAUSSIAN`, `BLACKMAN_HARRIS`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PixelFilterType {
+    #[serde(rename = "BOX")]
+    Box,
+    #[serde(rename = "GAUSSIAN")]
+    Gaussian,
+    #[serde(rename = "BLACKMAN_HARRIS")]
+    BlackmanHarris,
+}
+
+/// Blender's `filter_width` default (`properties.py`): 1.5 pixels.
+pub const DEFAULT_FILTER_WIDTH: f64 = 1.5;
+
+fn default_pixel_filter_type() -> PixelFilterType {
+    PixelFilterType::BlackmanHarris
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if passes a reference"
+)]
+fn is_default_pixel_filter_type(value: &PixelFilterType) -> bool {
+    *value == PixelFilterType::BlackmanHarris
+}
+
+fn default_filter_width() -> f64 {
+    DEFAULT_FILTER_WIDTH
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if passes a reference"
+)]
+fn is_default_filter_width(value: &f64) -> bool {
+    equal_f64(*value, DEFAULT_FILTER_WIDTH)
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RenderSettings {
@@ -1166,6 +1205,18 @@ pub struct RenderSettings {
         skip_serializing_if = "is_default_transparent_max_bounces"
     )]
     pub transparent_max_bounces: u32,
+    /// Cycles' `pixel_filter_type` (`scene/film.h`). Omitted when equal to Blender's default.
+    #[serde(
+        default = "default_pixel_filter_type",
+        skip_serializing_if = "is_default_pixel_filter_type"
+    )]
+    pub pixel_filter_type: PixelFilterType,
+    /// Cycles' `filter_width` in pixels, Blender's RNA range 0.01..=10. Omitted at Blender's default.
+    #[serde(
+        default = "default_filter_width",
+        skip_serializing_if = "is_default_filter_width"
+    )]
+    pub filter_width: f64,
     pub film_transparent: bool,
     pub engine: String,
     pub use_sequencer: bool,
@@ -1205,6 +1256,12 @@ impl RenderSettings {
                 "Cycles adaptive dicing settings are outside Blender RNA ranges",
             ));
         }
+        if !(0.01..=10.0).contains(&self.filter_width) {
+            return Err(PotError::new(
+                ErrorCode::SceneInvalid,
+                "Cycles filter_width is outside Blender RNA range 0.01..=10",
+            ));
+        }
         Ok(())
     }
 }
@@ -1219,6 +1276,8 @@ impl Default for RenderSettings {
             seed: 0,
             max_bounces: 4,
             transparent_max_bounces: 8,
+            pixel_filter_type: PixelFilterType::BlackmanHarris,
+            filter_width: DEFAULT_FILTER_WIDTH,
             film_transparent: false,
             engine: "path".to_owned(),
             use_sequencer: false,
