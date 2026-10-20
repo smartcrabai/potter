@@ -963,36 +963,20 @@ impl BMesh {
 }
 
 impl collapse::FaceRings for BMesh {
-    fn face_first(&self, f: usize) -> usize {
-        self.faces[f].first
+    fn face_first_len(&self, f: usize) -> (usize, usize) {
+        (self.faces[f].first, self.faces[f].len)
     }
 
-    fn face_len(&self, f: usize) -> usize {
-        self.faces[f].len
-    }
-
-    fn loop_radial_next(&self, l: usize) -> usize {
-        self.loops[l].radial_next
-    }
-
-    fn loop_next(&self, l: usize) -> usize {
-        self.loops[l].next
-    }
-
-    fn loop_prev(&self, l: usize) -> usize {
-        self.loops[l].prev
-    }
-
-    fn loop_vert(&self, l: usize) -> usize {
-        self.loops[l].v
-    }
-
-    fn loop_edge(&self, l: usize) -> usize {
-        self.loops[l].e
-    }
-
-    fn loop_face(&self, l: usize) -> usize {
-        self.loops[l].f
+    fn loop_ring(&self, l: usize) -> collapse::Ring {
+        let lp = &self.loops[l];
+        collapse::Ring {
+            radial_next: lp.radial_next,
+            next: lp.next,
+            prev: lp.prev,
+            v: lp.v,
+            e: lp.e,
+            f: lp.f,
+        }
     }
 }
 

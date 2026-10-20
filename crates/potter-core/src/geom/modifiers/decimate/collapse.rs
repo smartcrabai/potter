@@ -821,7 +821,7 @@ impl BMesh {
     }
 
     /// `bm_decim_triangulate_end`: the edges whose two triangles came from the same input face and
-    /// merge into a convex quad (or a flat one) are joined back; returns them in edge pool order.
+    /// merge into a convex quad (or a flat one) are joined back; returns them in edge order.
     fn join_edges(&self) -> Vec<usize> {
         let mut join = Vec::new();
         let can_merge = |bm: &Self, l: usize, mark: isize| {
@@ -830,12 +830,11 @@ impl BMesh {
                 && mark == bm.loops[l].mark
                 && mark == bm.loops[bm.loops[l].radial_next].mark
         };
-        // `BM_ITER_MESH` walks the edge pool in slot order, and the joins run in that order.
-        let mut pool: Vec<usize> = (0..self.edges.len())
-            .filter(|&e| self.edges[e].alive)
-            .collect();
-        pool.sort_by_key(|&e| self.edges[e].slot);
-        for e in pool {
+        // Creation order; Blender's BM_ITER_MESH walks the edge pool (slot order) instead.
+        for e in 0..self.edges.len() {
+            if !self.edges[e].alive {
+                continue;
+            }
             let Some((la, lb)) = self.edge_loop_pair(e) else {
                 continue;
             };
@@ -990,88 +989,73 @@ impl BMesh {
     }
 }
 
-/// The ring accessors of [`face_find_double`]. The `BMesh` of COLLAPSE and the `BMesh` of DISSOLVE both
+/// The fields of a loop that [`face_find_double`] reads.
+#[derive(Clone, Copy)]
+pub(super) struct Ring {
+    pub(super) radial_next: usize,
+    pub(super) next: usize,
+    pub(super) prev: usize,
+    pub(super) v: usize,
+    pub(super) e: usize,
+    pub(super) f: usize,
+}
+
+/// The ring queries of [`face_find_double`]. The `BMesh` of COLLAPSE and the `BMesh` of DISSOLVE both
 /// implement it, so `BM_face_find_double` exists once.
 pub(super) trait FaceRings {
-    /// `BM_FACE_FIRST_LOOP` of face `f`.
-    fn face_first(&self, f: usize) -> usize;
-    /// Corner count of face `f`.
-    fn face_len(&self, f: usize) -> usize;
-    fn loop_radial_next(&self, l: usize) -> usize;
-    fn loop_next(&self, l: usize) -> usize;
-    fn loop_prev(&self, l: usize) -> usize;
-    fn loop_vert(&self, l: usize) -> usize;
-    fn loop_edge(&self, l: usize) -> usize;
-    fn loop_face(&self, l: usize) -> usize;
+    /// `BM_FACE_FIRST_LOOP` and the corner count of face `f`.
+    fn face_first_len(&self, f: usize) -> (usize, usize);
+    fn loop_ring(&self, l: usize) -> Ring;
 }
 
 impl FaceRings for BMesh {
-    fn face_first(&self, f: usize) -> usize {
-        self.faces[f].first
+    fn face_first_len(&self, f: usize) -> (usize, usize) {
+        (self.faces[f].first, self.faces[f].len)
     }
 
-    fn face_len(&self, f: usize) -> usize {
-        self.faces[f].len
-    }
-
-    fn loop_radial_next(&self, l: usize) -> usize {
-        self.loops[l].radial_next
-    }
-
-    fn loop_next(&self, l: usize) -> usize {
-        self.loops[l].next
-    }
-
-    fn loop_prev(&self, l: usize) -> usize {
-        self.loops[l].prev
-    }
-
-    fn loop_vert(&self, l: usize) -> usize {
-        self.loops[l].v
-    }
-
-    fn loop_edge(&self, l: usize) -> usize {
-        self.loops[l].e
-    }
-
-    fn loop_face(&self, l: usize) -> usize {
-        self.loops[l].f
+    fn loop_ring(&self, l: usize) -> Ring {
+        let lp = &self.loops[l];
+        Ring {
+            radial_next: lp.radial_next,
+            next: lp.next,
+            prev: lp.prev,
+            v: lp.v,
+            e: lp.e,
+            f: lp.f,
+        }
     }
 }
 
 /// `BM_face_find_double`: an existing face with the same corners, in either winding, found on the
 /// radial cycle of the first loop of `f`.
 pub(super) fn face_find_double<B: FaceRings>(bm: &B, f: usize) -> Option<usize> {
-    let l_first = bm.face_first(f);
-    let len = bm.face_len(f);
-    let mut l_iter = bm.loop_radial_next(l_first);
+    let (l_first, len) = bm.face_first_len(f);
+    let first = bm.loop_ring(l_first);
+    let mut l_iter = first.radial_next;
     while l_iter != l_first {
-        let other = bm.loop_face(l_iter);
-        if bm.face_len(other) == len {
-            let same_winding = bm.loop_vert(l_iter) == bm.loop_vert(l_first);
+        let iter = bm.loop_ring(l_iter);
+        if bm.face_first_len(iter.f).1 == len {
+            let same_winding = iter.v == first.v;
             let mut a = l_first;
             let mut b = l_iter;
             let mut same = true;
             loop {
-                if bm.loop_edge(a) != bm.loop_edge(b) {
+                let (ra, rb) = (bm.loop_ring(a), bm.loop_ring(b));
+                if ra.e != rb.e {
                     same = false;
                     break;
                 }
-                a = if same_winding {
-                    bm.loop_next(a)
-                } else {
-                    bm.loop_prev(a)
-                };
-                b = bm.loop_next(b);
+                a = if same_winding { ra.next } else { ra.prev };
+                b = rb.next;
                 if b == l_iter {
                     break;
                 }
             }
             if same {
-                return Some(other);
+                return Some(iter.f);
             }
         }
-        l_iter = bm.loop_radial_next(l_iter);
+        l_iter = iter.radial_next;
     }
     None
 }
