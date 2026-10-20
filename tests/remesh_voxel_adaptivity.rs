@@ -362,7 +362,7 @@ fn voxel_remesh_cases_match_blender_counts_positions_and_polygon_cycles()
             "mode":"VOXEL","voxel_size":voxel_size,"adaptivity":adaptivity,
             "use_smooth_shade":false,"use_remove_disconnected":false,"threshold":0.15
         });
-        let native = evaluate_modifiers(&source, &[remesh_modifier(params)?])?;
+        let native = evaluate_modifiers(&source, &[remesh_modifier(params)?], "Cube")?;
         assert_matches_blender(&native, case, &context)?;
     }
     Ok(())
@@ -384,7 +384,7 @@ fn voxel_remesh_without_a_surface_passes_the_input_through() -> Result<(), Box<d
             "mode":"VOXEL","voxel_size":entry["voxel_size"],"adaptivity":entry["adaptivity"],
             "use_smooth_shade":false,"use_remove_disconnected":false,"threshold":0.15
         });
-        let native = evaluate_modifiers(&source, &[remesh_modifier(params)?])?;
+        let native = evaluate_modifiers(&source, &[remesh_modifier(params)?], "Cube")?;
         assert!(
             native.faces.is_empty(),
             "Blender returns nullptr without faces; the input passes through"

@@ -5,12 +5,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::{
     color::ColorManagement,
     error::{ErrorCode, PotError, Result},
+    float::equal_f64,
     geom::{
         Mesh, lattice::LatticeData, metaball::MetaballData, pointcloud::PointCloudData,
         volume::VolumeData,
     },
     graph::NodeGroup,
-    image::ImageInterpolation,
+    image::{ImageExtension, ImageInterpolation},
     mask::Mask,
     sequencer::Sequencer,
 };
@@ -118,7 +119,7 @@ impl SceneDoc {
             },
         )]);
         Self {
-            schema_version: 3,
+            schema_version: 7,
             scene_id,
             revision: 0,
             active_scene,
@@ -145,7 +146,7 @@ impl SceneDoc {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.schema_version != 3 {
+        if self.schema_version != 7 {
             return Err(PotError::with_details(
                 ErrorCode::UnsupportedVersion,
                 format!("unsupported scene schema_version {}", self.schema_version),
@@ -183,6 +184,19 @@ impl SceneDoc {
             }
         }
         for (scene_id, scene) in &self.scenes {
+            scene.render.validate()?;
+            if let Some(camera_id) = &scene.render.dicing_camera
+                && !self.is_camera_object(camera_id)
+            {
+                return Err(PotError::with_details(
+                    ErrorCode::SceneInvalid,
+                    "render dicing_camera must reference a camera object",
+                    json!({"scene_id":scene_id,"camera_id":camera_id}),
+                ));
+            }
+            if let Some(curve) = &scene.color_management.curve {
+                curve.validate()?;
+            }
             if let Some(world) = &scene.rigid_body_world
                 && (!world.gravity.iter().all(|value| value.is_finite())
                     || world.substeps == 0
@@ -212,6 +226,15 @@ impl SceneDoc {
                         json!({"node_id":node_id,"active_vertex_group_index":index}),
                     ));
                 }
+            }
+            if let Some(captured) = &node.blender_matrix_basis
+                && !captured.matrix_basis.iter().all(|value| value.is_finite())
+            {
+                return Err(PotError::with_details(
+                    ErrorCode::SceneInvalid,
+                    "captured Blender matrix_basis values must be finite",
+                    json!({"node_id":node_id}),
+                ));
             }
             if let Some(body) = &node.rigid_body
                 && (!body.mass.is_finite()
@@ -373,32 +396,42 @@ impl SceneDoc {
                     hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
                 })
             };
-            if !dimensions_valid(image.width, image.height) {
-                return Err(PotError::with_details(
-                    ErrorCode::SceneInvalid,
-                    "image dimensions are invalid or exceed the pixel limit",
-                    json!({"image_id":image_id,"width":image.width,"height":image.height}),
-                ));
-            }
-            match image.source {
-                ImageSource::Generated | ImageSource::Packed if image.blob.is_none() => {
+            if image.base_is_missing() {
+                if (image.width, image.height) != (0, 0) {
                     return Err(PotError::with_details(
                         ErrorCode::SceneInvalid,
-                        "generated or packed image requires a content-addressed blob",
-                        json!({"image_id":image_id}),
+                        "a missing image base has no size",
+                        json!({"image_id":image_id,"width":image.width,"height":image.height}),
                     ));
                 }
-                ImageSource::File
-                    if image.blob.is_none()
-                        && (image.source_path.is_none() || image.source_hash.is_none()) =>
-                {
+            } else {
+                if !dimensions_valid(image.width, image.height) {
                     return Err(PotError::with_details(
                         ErrorCode::SceneInvalid,
-                        "linked image requires source_path and source_hash",
-                        json!({"image_id":image_id}),
+                        "image dimensions are invalid or exceed the pixel limit",
+                        json!({"image_id":image_id,"width":image.width,"height":image.height}),
                     ));
                 }
-                _ => {}
+                match image.source {
+                    ImageSource::Generated | ImageSource::Packed if image.blob.is_none() => {
+                        return Err(PotError::with_details(
+                            ErrorCode::SceneInvalid,
+                            "generated or packed image requires a content-addressed blob",
+                            json!({"image_id":image_id}),
+                        ));
+                    }
+                    ImageSource::File
+                        if image.blob.is_none()
+                            && (image.source_path.is_none() || image.source_hash.is_none()) =>
+                    {
+                        return Err(PotError::with_details(
+                            ErrorCode::SceneInvalid,
+                            "linked image requires source_path and source_hash",
+                            json!({"image_id":image_id}),
+                        ));
+                    }
+                    _ => {}
+                }
             }
             if image
                 .blob
@@ -417,11 +450,11 @@ impl SceneDoc {
             }
             let mut tile_numbers = std::collections::BTreeSet::new();
             for tile in &image.tiles {
-                if tile.number <= 1001
-                    || !tile_numbers.insert(tile.number)
-                    || !dimensions_valid(tile.width, tile.height)
-                    || !valid_hash(&tile.blob)
-                {
+                let content_valid = match tile.blob.as_deref() {
+                    Some(blob) => dimensions_valid(tile.width, tile.height) && valid_hash(blob),
+                    None => tile.width == 0 && tile.height == 0,
+                };
+                if tile.number <= 1001 || !tile_numbers.insert(tile.number) || !content_valid {
                     return Err(PotError::with_details(
                         ErrorCode::SceneInvalid,
                         "UDIM tile metadata is invalid",
@@ -455,6 +488,15 @@ impl SceneDoc {
             })?;
         }
         Ok(())
+    }
+
+    pub(crate) fn is_camera_object(&self, camera_id: &Id) -> bool {
+        self.nodes
+            .get(camera_id)
+            .filter(|node| node.kind == "camera")
+            .and_then(|node| node.data.as_ref())
+            .and_then(|data_id| self.data_blocks.get(data_id))
+            .is_some_and(|data| data.camera.is_some())
     }
 }
 
@@ -1132,6 +1174,12 @@ pub struct RenderSettings {
     pub samples: u32,
     pub seed: u32,
     pub max_bounces: u32,
+    /// Cycles' `transparent_max_bounces`. Omitted when equal to Blender's default of 8.
+    #[serde(
+        default = "default_transparent_max_bounces",
+        skip_serializing_if = "is_default_transparent_max_bounces"
+    )]
+    pub transparent_max_bounces: u32,
     pub film_transparent: bool,
     pub engine: String,
     pub use_sequencer: bool,
@@ -1148,6 +1196,31 @@ pub struct RenderSettings {
     pub shutter: f64,
     #[serde(default = "default_motion_blur_samples")]
     pub motion_blur_samples: u32,
+    pub dicing_rate: f64,
+    pub preview_dicing_rate: f64,
+    pub max_subdivisions: u32,
+    pub offscreen_dicing_scale: f64,
+    #[serde(default)]
+    pub dicing_camera: Option<Id>,
+}
+
+impl RenderSettings {
+    fn validate(&self) -> Result<()> {
+        if !self.dicing_rate.is_finite()
+            || !(0.1..=1000.0).contains(&self.dicing_rate)
+            || !self.preview_dicing_rate.is_finite()
+            || !(0.1..=1000.0).contains(&self.preview_dicing_rate)
+            || self.max_subdivisions > 16
+            || !self.offscreen_dicing_scale.is_finite()
+            || !(1.0..=f32::MAX as f64).contains(&self.offscreen_dicing_scale)
+        {
+            return Err(PotError::new(
+                ErrorCode::SceneInvalid,
+                "Cycles adaptive dicing settings are outside Blender RNA ranges",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Default for RenderSettings {
@@ -1159,6 +1232,7 @@ impl Default for RenderSettings {
             samples: 64,
             seed: 0,
             max_bounces: 4,
+            transparent_max_bounces: 8,
             film_transparent: false,
             engine: "path".to_owned(),
             use_sequencer: false,
@@ -1168,6 +1242,11 @@ impl Default for RenderSettings {
             motion_blur: false,
             shutter: default_shutter(),
             motion_blur_samples: default_motion_blur_samples(),
+            dicing_rate: 1.0,
+            preview_dicing_rate: 8.0,
+            max_subdivisions: 12,
+            offscreen_dicing_scale: 4.0,
+            dicing_camera: None,
         }
     }
 }
@@ -1221,13 +1300,80 @@ pub enum CameraProjection {
     Perspective,
     Orthographic,
     Panorama,
-    Fisheye,
+}
+
+/// Blender's `M_PI_F` (`rna_camera.cc`): the float32 π that Blender's panorama limits and fisheye field of view are built
+/// from. Doubling and halving are exact in float32, so the derived constants below are the values Blender holds.
+pub const BLENDER_PI: f64 = std::f32::consts::PI as f64;
+/// A full turn, Blender's float32 longitude span. Blender's full-sphere default is ±π, so its span is this turn, a hair
+/// beyond the f64 `TAU`; the bounds Potter checks use it so Blender's own defaults validate.
+pub const BLENDER_TURN: f64 = 2.0 * BLENDER_PI;
+/// A right angle, Blender's float32 latitude limit.
+pub const BLENDER_RIGHT_ANGLE: f64 = 0.5 * BLENDER_PI;
+/// Blender's fisheye field of view hard range (`rna_camera.cc`): 10 degrees to 10π. Blender clamps a value outside it, so
+/// Potter refuses one rather than store a field of view its Blender camera would not keep. The soft limit is 2π.
+pub const FISHEYE_FOV_MIN: f64 = 0.1745;
+pub const FISHEYE_FOV_MAX: f64 = 31.415_925_979_614_258;
+/// Blender's `fisheye_lens` hard range (`rna_camera.cc`): 0.01 to 100 mm. Blender clamps a value outside it.
+pub const FISHEYE_LENS_MIN: f64 = 0.01;
+pub const FISHEYE_LENS_MAX: f64 = 100.0;
+/// Blender's default `fisheye_lens`, in millimetres.
+const FISHEYE_LENS_DEFAULT: f64 = 10.5;
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if passes a reference"
+)]
+fn is_default_longitude_min(value: &f64) -> bool {
+    equal_f64(*value, -BLENDER_PI)
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if passes a reference"
+)]
+fn is_default_longitude_max(value: &f64) -> bool {
+    equal_f64(*value, BLENDER_PI)
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if passes a reference"
+)]
+fn is_default_latitude_min(value: &f64) -> bool {
+    equal_f64(*value, -BLENDER_RIGHT_ANGLE)
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if passes a reference"
+)]
+fn is_default_latitude_max(value: &f64) -> bool {
+    equal_f64(*value, BLENDER_RIGHT_ANGLE)
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if passes a reference"
+)]
+fn is_default_fisheye_fov(value: &f64) -> bool {
+    equal_f64(*value, BLENDER_PI)
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if passes a reference"
+)]
+fn is_default_fisheye_lens(value: &f64) -> bool {
+    equal_f64(*value, FISHEYE_LENS_DEFAULT)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CameraData {
     pub projection: CameraProjection,
+    /// Blender's `lens` in millimetres, the perspective focal length. A perspective camera uses it, and so does a panorama
+    /// camera in the engines that draw it as perspective (EEVEE and Workbench); the path tracer ignores it for panoramas.
     pub lens_mm: f64,
     pub sensor_height_mm: f64,
     pub sensor_fit: String,
@@ -1237,6 +1383,21 @@ pub struct CameraData {
     pub clip_end: f64,
     pub shift: [f64; 2],
     pub panorama_type: String,
+    /// Blender's equirectangular longitude and latitude limits, in radians; the full sphere by default.
+    #[serde(skip_serializing_if = "is_default_longitude_min")]
+    pub longitude_min: f64,
+    #[serde(skip_serializing_if = "is_default_longitude_max")]
+    pub longitude_max: f64,
+    #[serde(skip_serializing_if = "is_default_latitude_min")]
+    pub latitude_min: f64,
+    #[serde(skip_serializing_if = "is_default_latitude_max")]
+    pub latitude_max: f64,
+    /// The fisheye field of view in radians, for the fisheye panoramas; Blender's default is 180 degrees.
+    #[serde(skip_serializing_if = "is_default_fisheye_fov")]
+    pub fisheye_fov: f64,
+    /// Blender's `fisheye_lens` in millimetres: the focal length of an equisolid fisheye, separate from `lens_mm`.
+    #[serde(skip_serializing_if = "is_default_fisheye_lens")]
+    pub fisheye_lens: f64,
     pub dof_enabled: bool,
     pub focus_distance: f64,
     pub f_stop: f64,
@@ -1258,6 +1419,12 @@ impl Default for CameraData {
             clip_end: 1000.0,
             shift: [0.0, 0.0],
             panorama_type: "equirectangular".to_owned(),
+            longitude_min: -BLENDER_PI,
+            longitude_max: BLENDER_PI,
+            latitude_min: -BLENDER_RIGHT_ANGLE,
+            latitude_max: BLENDER_RIGHT_ANGLE,
+            fisheye_fov: BLENDER_PI,
+            fisheye_lens: FISHEYE_LENS_DEFAULT,
             dof_enabled: false,
             focus_distance: 10.0,
             f_stop: 2.8,
@@ -1286,11 +1453,25 @@ pub struct LightData {
     pub color: [f64; 3],
     pub energy: f64,
     pub radius: f64,
+    /// Blender's `use_soft_falloff` (Cycles `is_sphere = !soft_falloff`). When `true`, a point or
+    /// spot light with a radius is a disk oriented to the receiver; when `false`, a sphere.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub soft_falloff: bool,
     pub spot_size: f64,
     pub spot_blend: f64,
     pub area_shape: String,
     pub area_size: f64,
     pub area_size_y: f64,
+    /// Blender's area light `spread` (Cycles `AreaLight::spread`), in radians within [0, π]: the
+    /// emission is confined to the cone of half-angle `spread / 2` about the emitting normal. The
+    /// default π is the whole hemisphere and is not stored.
+    #[serde(default = "default_spread", skip_serializing_if = "is_default_spread")]
+    pub spread: f64,
+    /// Blender's `cycles.use_multiple_importance_sampling` (Cycles `SHADER_USE_MIS`). When `true`,
+    /// a BSDF-sampled ray can hit an area light, or a point or spot light with a radius, and that
+    /// hit is weighted against light sampling. When `false`, the light is only light-sampled.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub use_multiple_importance_sampling: bool,
 }
 
 impl Default for LightData {
@@ -1300,11 +1481,14 @@ impl Default for LightData {
             color: white_rgb(),
             energy: 1000.0,
             radius: 0.1,
+            soft_falloff: true,
             spot_size: std::f64::consts::FRAC_PI_4,
             spot_blend: 0.15,
             area_shape: "SQUARE".to_owned(),
             area_size: 0.25,
             area_size_y: 0.25,
+            spread: std::f64::consts::PI,
+            use_multiple_importance_sampling: true,
         }
     }
 }
@@ -1494,8 +1678,7 @@ pub struct ModifierRuntime {
     pub target_mesh: Option<Value>,
     #[doc(hidden)]
     pub target_to_subject: Option<[f64; 16]>,
-    pub operand_mesh: Option<Value>,
-    /// Operands of the EXACT Boolean in the subject's space (subject excluded), in Blender order.
+    /// Boolean operands in the subject's space (subject excluded), in Blender order.
     pub boolean_operands: Vec<crate::geom::boolean::BooleanOperand>,
     pub warp_from: Option<[f64; 3]>,
     pub warp_to: Option<[f64; 3]>,
@@ -1556,6 +1739,16 @@ pub struct Keyframe {
     pub handle_right: Option<[f64; 2]>,
 }
 
+/// Blender-authored local `matrix_basis` and the fingerprint of the static state it was read from.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapturedMatrixBasis {
+    /// Column-major local Blender `matrix_basis` values.
+    pub matrix_basis: [f64; 16],
+    /// SHA-256 fingerprint of the static authoring state used to capture the matrix.
+    pub fingerprint: String,
+}
+
 /// Source of a node material slot, matching Blender's per-slot material link setting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1579,6 +1772,14 @@ pub struct Node {
     pub parent_inverse: Option<[f64; 16]>,
     #[serde(default)]
     pub transform: Transform,
+    /// Blender-authored local basis; omitted for ordinary Potter-authored nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blender_matrix_basis: Option<CapturedMatrixBasis>,
+    /// Blender's `matrix_parent_inverse` for a root that came from Blender. Blender ignores it without a
+    /// parent, so evaluation and the captured basis never apply it; it is round-trip data that export
+    /// writes back unchanged. Omitted when identity or when the node is parented.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blender_parent_inverse: Option<[f64; 16]>,
     #[serde(default)]
     pub data: Option<Id>,
     /// Blender's active vertex-group index; must name one of the data block's vertex groups.
@@ -1632,6 +1833,8 @@ impl Default for Node {
             parent: None,
             parent_inverse: None,
             transform: Transform::default(),
+            blender_matrix_basis: None,
+            blender_parent_inverse: None,
             data: None,
             active_vertex_group_index: None,
             materials: Vec::new(),
@@ -1720,7 +1923,205 @@ impl Node {
             index,
         )
     }
+
+    /// Fingerprints the fixed authoring fields that determine a captured Blender local basis.
+    pub fn matrix_basis_fingerprint(&self, effective_transform: &Transform) -> Result<String> {
+        let digest = self.matrix_basis_fingerprint_digest(effective_transform)?;
+        Ok(format_matrix_basis_fingerprint(&digest))
+    }
+
+    fn matrix_basis_fingerprint_digest(&self, effective_transform: &Transform) -> Result<[u8; 32]> {
+        use sha2::Digest as _;
+
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(b"potter-captured-matrix-basis-v2\0");
+        update_matrix_basis_transform(&mut hasher, effective_transform)?;
+        // Only whether a parent exists is hashed: a parent id changes on import remap or duplicate
+        // without changing the local basis. A root's parent_inverse, parent_type and parent_bone do
+        // not change the captured basis, so they are hashed only under a parent (bone parents
+        // change the world matrix). A root with a non-identity parent_inverse never uses the capture
+        // (see `captured_matrix_basis`).
+        hasher.update([u8::from(self.parent.is_some())]);
+        if self.parent.is_some() {
+            match &self.parent_inverse {
+                Some(matrix) => {
+                    hasher.update([1]);
+                    update_matrix_basis_values(&mut hasher, matrix);
+                }
+                None => hasher.update([0]),
+            }
+            hasher.update([match self.parent_type {
+                ParentType::Object => 0,
+                ParentType::Bone => 1,
+            }]);
+            update_matrix_basis_optional_id(&mut hasher, self.parent_bone.as_ref());
+        }
+        update_matrix_basis_delta_transforms(&mut hasher, &self.properties);
+        // Dynamic state is part of the fingerprint, so removing it leaves a capture stale.
+        hasher.update([
+            u8::from(self.action.is_some()),
+            u8::from(!self.nla_tracks.is_empty()),
+            u8::from(!self.drivers.is_empty()),
+            u8::from(self.rigid_body.is_some()),
+        ]);
+        let digest = hasher.finalize();
+        let mut result = [0; 32];
+        result.copy_from_slice(&digest);
+        Ok(result)
+    }
+
+    /// Returns the captured local basis only while its authoring and dynamic state remain current.
+    pub fn captured_matrix_basis(
+        &self,
+        effective_transform: &Transform,
+    ) -> Result<Option<[f64; 16]>> {
+        let Some(captured) = &self.blender_matrix_basis else {
+            return Ok(None);
+        };
+        if !captured.matrix_basis.iter().all(|value| value.is_finite()) {
+            return Err(PotError::new(
+                ErrorCode::SceneInvalid,
+                "captured Blender matrix_basis values must be finite",
+            ));
+        }
+        if self.action.is_some()
+            || !self.nla_tracks.is_empty()
+            || !self.drivers.is_empty()
+            || self.rigid_body.is_some()
+        {
+            return Ok(None);
+        }
+        // The transform path applies a root's parent_inverse (keep-world unparenting keeps shear,
+        // spec.md). Blender's captured basis is local and ignores it for a root, so such a root
+        // takes the transform path in both states and its world does not jump after an edit.
+        if self.parent.is_none()
+            && self
+                .parent_inverse
+                .is_some_and(|matrix| !is_identity_matrix(&matrix))
+        {
+            return Ok(None);
+        }
+        let digest = self.matrix_basis_fingerprint_digest(effective_transform)?;
+        Ok(
+            matrix_basis_fingerprint_matches(&captured.fingerprint, &digest)
+                .then_some(captured.matrix_basis),
+        )
+    }
 }
+
+fn update_matrix_basis_transform(hasher: &mut sha2::Sha256, transform: &Transform) -> Result<()> {
+    use sha2::Digest as _;
+
+    for value in &transform.translation {
+        hasher.update(value.to_bits().to_le_bytes());
+    }
+    let rotation = crate::model::normalize_rotation(transform.rotation)?;
+    for value in rotation {
+        hasher.update(value.to_bits().to_le_bytes());
+    }
+    for value in &transform.scale {
+        hasher.update(value.to_bits().to_le_bytes());
+    }
+    update_matrix_basis_string(hasher, &transform.rotation_mode);
+    Ok(())
+}
+
+/// Whether a column-major matrix is the identity, within 1e-12 per element.
+pub(crate) fn is_identity_matrix(matrix: &[f64; 16]) -> bool {
+    // The diagonal is indices 0, 5, 10 and 15 of a column-major matrix.
+    matrix.iter().enumerate().all(|(index, &value)| {
+        let expected = if index % 5 == 0 { 1.0 } else { 0.0 };
+        (value - expected).abs() <= 1.0e-12
+    })
+}
+
+fn update_matrix_basis_values(hasher: &mut sha2::Sha256, values: &[f64; 16]) {
+    use sha2::Digest as _;
+
+    for value in values {
+        hasher.update(value.to_bits().to_le_bytes());
+    }
+}
+
+fn update_matrix_basis_optional_id(hasher: &mut sha2::Sha256, id: Option<&Id>) {
+    use sha2::Digest as _;
+
+    if let Some(id) = id {
+        hasher.update([1]);
+        update_matrix_basis_string(hasher, id.as_str());
+    } else {
+        hasher.update([0]);
+    }
+}
+
+fn update_matrix_basis_delta_transforms(
+    hasher: &mut sha2::Sha256,
+    properties: &Map<String, Value>,
+) {
+    use sha2::Digest as _;
+
+    let metadata = properties
+        .get("blender_object_metadata")
+        .and_then(Value::as_object);
+    for (name, length) in [
+        ("delta_location", 3),
+        ("delta_rotation_euler", 3),
+        ("delta_rotation_quaternion", 4),
+        ("delta_scale", 3),
+    ] {
+        match metadata.and_then(|metadata| metadata.get(name)) {
+            None | Some(Value::Null) => hasher.update([0]),
+            Some(Value::Array(values)) if values.len() == length => {
+                hasher.update([1]);
+                for value in values {
+                    if let Some(value) = value.as_f64() {
+                        hasher.update([1]);
+                        hasher.update(value.to_bits().to_le_bytes());
+                    } else {
+                        hasher.update([0]);
+                    }
+                }
+            }
+            Some(Value::Array(values)) => {
+                hasher.update([2]);
+                hasher.update((values.len() as u64).to_le_bytes());
+            }
+            Some(_) => hasher.update([3]),
+        }
+    }
+}
+
+fn update_matrix_basis_string(hasher: &mut sha2::Sha256, value: &str) {
+    use sha2::Digest as _;
+
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value.as_bytes());
+}
+
+fn format_matrix_basis_fingerprint(digest: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut result = String::with_capacity(71);
+    result.push_str("sha256:");
+    for &byte in digest {
+        result.push(char::from(HEX[usize::from(byte >> 4)]));
+        result.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    result
+}
+
+fn matrix_basis_fingerprint_matches(fingerprint: &str, digest: &[u8; 32]) -> bool {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let Some(hex) = fingerprint.strip_prefix("sha256:") else {
+        return false;
+    };
+    let hex = hex.as_bytes();
+    hex.len() == 64
+        && digest.iter().enumerate().all(|(index, byte)| {
+            hex[index * 2] == HEX[usize::from(byte >> 4)]
+                && hex[index * 2 + 1] == HEX[usize::from(byte & 0x0f)]
+        })
+}
+
 fn default_true() -> bool {
     true
 }
@@ -1731,6 +2132,30 @@ fn default_true() -> bool {
 )]
 fn is_true(value: &bool) -> bool {
     *value
+}
+
+fn default_spread() -> f64 {
+    std::f64::consts::PI
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if passes a reference"
+)]
+fn is_default_spread(value: &f64) -> bool {
+    *value >= std::f64::consts::PI
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if passes a reference"
+)]
+fn is_default_transparent_max_bounces(value: &u32) -> bool {
+    *value == 8
+}
+
+fn default_transparent_max_bounces() -> u32 {
+    8
 }
 
 #[expect(
@@ -2078,7 +2503,13 @@ pub struct ImageTile {
     pub number: u32,
     pub width: u32,
     pub height: u32,
-    pub blob: String,
+    /// `None` is the missing state: the tile stays listed, as Blender keeps it, but its file was not found, so it has
+    /// no size or pixels and samples as Blender's missing colour.
+    #[serde(default)]
+    pub blob: Option<String>,
+    /// Blender's tile label, carried through import and export. Omitted when empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub label: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2101,6 +2532,30 @@ pub struct Image {
     pub source_hash: Option<String>,
     #[serde(default)]
     pub alpha_mode: ImageAlphaMode,
+    /// Blender's TILED source: the image routes UDIM lookups even when only its base tile 1001 is stored, so a lookup
+    /// into any other tile is missing, as Blender renders it. Omitted when false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub tiled: bool,
+}
+
+impl Image {
+    /// A UDIM image routes its lookups by tile: a TILED source, or any stored tile beyond the base.
+    #[must_use]
+    pub fn is_udim(&self) -> bool {
+        self.tiled || !self.tiles.is_empty()
+    }
+
+    /// A UDIM file image whose base tile (1001) file was missing at import: no blob and no source, with its listed tiles
+    /// kept. Blender keeps such an image and renders the base's lookups as its missing colour, so Potter keeps the record.
+    /// A packed or generated image with no blob is still invalid.
+    #[must_use]
+    pub fn base_is_missing(&self) -> bool {
+        self.source == ImageSource::File
+            && self.blob.is_none()
+            && self.source_path.is_none()
+            && self.source_hash.is_none()
+            && self.is_udim()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2111,6 +2566,21 @@ pub struct TextureRef {
     pub uv_layer: Option<String>,
     #[serde(default)]
     pub interpolation: ImageInterpolation,
+    /// Blender's Image Texture `extension`: how a lookup past the edge repeats, extends, or mirrors. Omitted when
+    /// REPEAT, which is the default for scene JSON written before this field existed.
+    #[serde(default, skip_serializing_if = "ImageExtension::is_repeat")]
+    pub extension: ImageExtension,
+}
+
+/// Blender's viewport display values for a `.blend` material: `Material.diffuse_color` (RGBA), `roughness`, and
+/// `metallic`. Workbench's Solid shading reads these in place of the material's own values
+/// (`workbench_engine.cc` `get_material`); Beauty never does.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewportDisplay {
+    pub diffuse_color: [f64; 4],
+    pub roughness: f64,
+    pub metallic: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2135,8 +2605,13 @@ pub struct Material {
     pub transmission: f64,
     #[serde(default = "default_ior")]
     pub ior: f64,
-    #[serde(default)]
+    /// Blender's `use_backface_culling` is off for new materials (`MA_BL_CULL_BACKFACE` unset in `DNA_material_types.h`).
+    #[serde(default = "default_true")]
     pub double_sided: bool,
+    /// Blender's `use_transparent_shadow` (`MA_BL_TRANSPARENT_SHADOW`, on by default): a transparent surface casts a
+    /// partly transparent shadow, as EEVEE's shadow pass does (`eevee_surf_shadow.bsl.hh`). Off, it casts an opaque one.
+    #[serde(default = "default_true")]
+    pub use_transparent_shadow: bool,
     #[serde(default)]
     pub node_tree: Option<Id>,
     #[serde(default)]
@@ -2159,6 +2634,9 @@ pub struct Material {
     pub volume_color: [f64; 3],
     #[serde(default)]
     pub volume_anisotropy: f64,
+    /// Blender's viewport display values, which Solid shading reads. Set by `.blend` import; omitted when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub viewport_display: Option<ViewportDisplay>,
 }
 impl Default for Material {
     fn default() -> Self {
@@ -2173,7 +2651,8 @@ impl Default for Material {
             emission_strength: 0.0,
             transmission: 0.0,
             ior: default_ior(),
-            double_sided: false,
+            double_sided: default_true(),
+            use_transparent_shadow: default_true(),
             node_tree: None,
             base_color_texture: None,
             roughness_texture: None,
@@ -2185,6 +2664,7 @@ impl Default for Material {
             volume_density: 0.0,
             volume_color: default_volume_color(),
             volume_anisotropy: 0.0,
+            viewport_display: None,
         }
     }
 }
@@ -2254,6 +2734,25 @@ mod tests {
     }
 
     #[test]
+    fn document_validation_rejects_deserialized_malformed_color_curve() {
+        let mut value = serde_json::to_value(SceneDoc::new(
+            "00000000-0000-4000-8000-000000000000".to_owned(),
+        ))
+        .unwrap();
+        let mut curve = serde_json::to_value(crate::color::curve::CurveMapping::default()).unwrap();
+        curve["curves"][0]["points"] = serde_json::json!([{
+            "location": [0.0, 0.0],
+            "handle": "auto"
+        }]);
+        value["scenes"]["scene_main"]["color_management"]["curve"] = curve;
+        let doc: SceneDoc = serde_json::from_value(value).unwrap();
+
+        let error = doc.validate().unwrap_err();
+        assert_eq!(error.code, crate::error::ErrorCode::InvalidArgument);
+        assert!(error.message.contains("curve 0 needs at least two points"));
+    }
+
+    #[test]
     fn scene_id_must_be_uuid_v4_and_revision_must_fit_safe_integer() {
         let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
         doc.validate().unwrap();
@@ -2310,6 +2809,128 @@ mod tests {
             action.fcurves[0].keyframes[0].interpolation,
             Interpolation::Linear
         );
+    }
+
+    #[test]
+    fn captured_matrix_basis_tracks_static_state_and_rejects_dynamic_state() {
+        let effective = super::Transform::default();
+        let mut node = super::Node::default();
+        assert!(
+            serde_json::to_value(&node)
+                .unwrap()
+                .get("blender_matrix_basis")
+                .is_none()
+        );
+        let fingerprint = node.matrix_basis_fingerprint(&effective).unwrap();
+        let identity = [
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ];
+        node.blender_matrix_basis = Some(super::CapturedMatrixBasis {
+            matrix_basis: identity,
+            fingerprint,
+        });
+        assert_eq!(
+            node.captured_matrix_basis(&effective).unwrap(),
+            Some(identity)
+        );
+        let changed_transform = super::Transform {
+            translation: [1.0, 0.0, 0.0],
+            ..effective.clone()
+        };
+        assert_eq!(
+            node.captured_matrix_basis(&changed_transform).unwrap(),
+            None
+        );
+        node.properties
+            .insert("custom".to_owned(), serde_json::json!(1));
+        node.pose
+            .insert(super::Id::from_static("bone"), super::PoseBone::default());
+        node.constraints.push(super::Constraint::default());
+        assert_eq!(
+            node.captured_matrix_basis(&effective).unwrap(),
+            Some(identity)
+        );
+        node.properties.clear();
+        node.pose.clear();
+        node.constraints.clear();
+        node.properties.insert(
+            "blender_object_metadata".to_owned(),
+            serde_json::json!({"delta_location": [1.0, 0.0, 0.0]}),
+        );
+        assert_eq!(node.captured_matrix_basis(&effective).unwrap(), None);
+        node.properties.clear();
+        // Without a parent, parent_inverse, parent_type and parent_bone do not affect the capture.
+        node.parent_inverse = Some(identity);
+        node.parent_type = super::ParentType::Bone;
+        node.parent_bone = Some(super::Id::from_static("bone"));
+        assert_eq!(
+            node.captured_matrix_basis(&effective).unwrap(),
+            Some(identity)
+        );
+        node.parent_inverse = None;
+        node.parent_type = super::ParentType::Object;
+        node.parent_bone = None;
+        node.parent = Some(super::Id::from_static("parent"));
+        assert_eq!(node.captured_matrix_basis(&effective).unwrap(), None);
+        let fingerprint = node.matrix_basis_fingerprint(&effective).unwrap();
+        node.blender_matrix_basis = Some(super::CapturedMatrixBasis {
+            matrix_basis: identity,
+            fingerprint,
+        });
+        assert_eq!(
+            node.captured_matrix_basis(&effective).unwrap(),
+            Some(identity)
+        );
+        // A parent id change keeps the capture; parent_inverse under a parent does not.
+        node.parent = Some(super::Id::from_static("remapped_parent"));
+        assert_eq!(
+            node.captured_matrix_basis(&effective).unwrap(),
+            Some(identity)
+        );
+        node.parent_inverse = Some(identity);
+        assert_eq!(node.captured_matrix_basis(&effective).unwrap(), None);
+        node.parent_inverse = None;
+        node.parent_type = super::ParentType::Bone;
+        assert_eq!(node.captured_matrix_basis(&effective).unwrap(), None);
+        node.parent_type = super::ParentType::Object;
+        node.parent_bone = Some(super::Id::from_static("bone"));
+        assert_eq!(node.captured_matrix_basis(&effective).unwrap(), None);
+        node.parent_bone = None;
+        node.transform.translation[0] = 1.0;
+        assert_eq!(node.captured_matrix_basis(&node.transform).unwrap(), None);
+        node.transform.translation[0] = 0.0;
+        node.action = Some(super::Id::from_static("action"));
+        assert_eq!(node.captured_matrix_basis(&effective).unwrap(), None);
+        node.action = None;
+        node.nla_tracks =
+            vec![serde_json::from_value(serde_json::json!({"id":"track","name":"Track"})).unwrap()];
+        assert_eq!(node.captured_matrix_basis(&effective).unwrap(), None);
+        node.nla_tracks.clear();
+        node.drivers = vec![
+            serde_json::from_value(serde_json::json!({
+                "id":"driver","path":"transform.translation","index":0,"type":"scripted_expression"
+            }))
+            .unwrap(),
+        ];
+        assert_eq!(node.captured_matrix_basis(&effective).unwrap(), None);
+        node.drivers.clear();
+        node.rigid_body = Some(super::RigidBody::default());
+        assert_eq!(node.captured_matrix_basis(&effective).unwrap(), None);
+        node.rigid_body = None;
+        let mut animated = super::Node {
+            action: Some(super::Id::from_static("action")),
+            ..super::Node::default()
+        };
+        let fingerprint = animated.matrix_basis_fingerprint(&effective).unwrap();
+        animated.blender_matrix_basis = Some(super::CapturedMatrixBasis {
+            matrix_basis: identity,
+            fingerprint,
+        });
+        assert_eq!(animated.captured_matrix_basis(&effective).unwrap(), None);
+        animated.action = None;
+        assert_eq!(animated.captured_matrix_basis(&effective).unwrap(), None);
+        node.blender_matrix_basis.as_mut().unwrap().matrix_basis[0] = f64::INFINITY;
+        assert!(node.captured_matrix_basis(&effective).is_err());
     }
 
     #[test]

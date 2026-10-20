@@ -397,7 +397,7 @@ fn remesh_octree_modes_return_valid_closed_meshes_and_support_smooth_shading()
             "use_remove_disconnected":false,"threshold":1.0,
             "use_smooth_shade":smooth_shade
         });
-        let output = evaluate_modifiers(&source, &[modifier("remesh", params)?])?;
+        let output = evaluate_modifiers(&source, &[modifier("remesh", params)?], "Cube")?;
         assert!(output.validate().is_ok(), "{mode} output is invalid");
         assert!(!output.faces.is_empty(), "{mode} output is empty");
         for face in &output.faces {
@@ -554,8 +554,11 @@ fn blender_remesh_supported_modes_match_exact_geometry_and_voxel_adaptivity_is_g
         "mode":"VOXEL","voxel_size":0.3,"adaptivity":0.1,
         "use_smooth_shade":false,"use_remove_disconnected":false,"threshold":0.15
     });
-    let voxel_adaptive_mesh =
-        evaluate_modifiers(&source, &[modifier("remesh", voxel_adaptivity_params)?])?;
+    let voxel_adaptive_mesh = evaluate_modifiers(
+        &source,
+        &[modifier("remesh", voxel_adaptivity_params)?],
+        "Cube",
+    )?;
     assert!(
         !voxel_adaptive_mesh.faces.is_empty(),
         "nonzero VOXEL adaptivity must produce a remeshed surface"
@@ -644,7 +647,7 @@ with open(sys.argv[-1], 'w', encoding='utf-8') as output:
                 "use_remove_disconnected":true,"threshold":0.15
             })
         };
-        let native = evaluate_modifiers(&source, &[modifier("remesh", params)?])?;
+        let native = evaluate_modifiers(&source, &[modifier("remesh", params)?], "Cube")?;
         let reference = &references[mode];
         let blender_positions = points(&reference["positions"])?;
         let blender_polygons = reference["polygons"]
@@ -1051,7 +1054,7 @@ with open(sys.argv[-1], 'w', encoding='utf-8') as output:
                 "threshold":case.threshold,
                 "use_smooth_shade":false
             });
-            let native = evaluate_modifiers(&input, &[modifier("remesh", params)?])?;
+            let native = evaluate_modifiers(&input, &[modifier("remesh", params)?], "Cube")?;
             let expected = &reference["modes"][mode];
             let expected_positions = points(&expected["positions"])?;
             let expected_polygons = parse_polygons(&expected["polygons"])?;
@@ -1132,10 +1135,10 @@ fn ocean_fft_is_seeded_and_choppiness_changes_the_surface() -> Result<(), Box<dy
             }),
         )
     };
-    let first = evaluate_modifiers(&source, &[create(0.0)?])?;
-    let again = evaluate_modifiers(&source, &[create(0.0)?])?;
+    let first = evaluate_modifiers(&source, &[create(0.0)?], "Cube")?;
+    let again = evaluate_modifiers(&source, &[create(0.0)?], "Cube")?;
     assert_eq!(first, again);
-    let chopped = evaluate_modifiers(&source, &[create(2.0)?])?;
+    let chopped = evaluate_modifiers(&source, &[create(2.0)?], "Cube")?;
     assert!(
         first
             .vertices
@@ -1166,6 +1169,7 @@ fn ocean_fft_is_seeded_and_choppiness_changes_the_surface() -> Result<(), Box<dy
                 "use_normals":true,"use_foam":true,"foam_layer_name":"foam","choppiness":0.0
             }),
         )?],
+        "Cube",
     )?;
     assert_eq!(generated.vertices.len(), 33 * 17);
     assert_eq!(generated.faces.len(), 32 * 16);
@@ -1377,14 +1381,17 @@ with open(sys.argv[-1], 'w', encoding='utf-8') as output:
             {"op":"vertex_group.assign","target":{"id":"subject"},"group_id":"influence","weights":weights},
             {"op":"modifier.create","target":{"id":"subject"},"id":"deform","type":"mesh_deform","params":{"object":"cage","precision":precision,"use_dynamic_bind":dynamic,"vertex_group":"Influence","invert_vertex_group":invert}},
             {"op":"modifier.bind","target":{"id":"subject"},"modifier_id":"deform"},
+            // Ids follow Blender's primitive_cube_add corner order: 0 (-,-,-), 1 (-,-,+), 2 (-,+,-), 3 (-,+,+),
+            // 4 (+,-,-), 5 (+,-,+), 6 (+,+,-), 7 (+,+,+). Each translation is the Blender oracle's
+            // (x + 0.12y, y + 0.08x, 1.5z) displacement of that corner on a size-4 cube.
             {"op":"mesh.transform_elements","target":{"id":"cage","elements":{"domain":"vertex","ids":["v0"]}},"translation":[-0.24,-0.16,-1.0]},
-            {"op":"mesh.transform_elements","target":{"id":"cage","elements":{"domain":"vertex","ids":["v1"]}},"translation":[-0.24,0.16,-1.0]},
-            {"op":"mesh.transform_elements","target":{"id":"cage","elements":{"domain":"vertex","ids":["v2"]}},"translation":[0.24,0.16,-1.0]},
-            {"op":"mesh.transform_elements","target":{"id":"cage","elements":{"domain":"vertex","ids":["v3"]}},"translation":[0.24,-0.16,-1.0]},
-            {"op":"mesh.transform_elements","target":{"id":"cage","elements":{"domain":"vertex","ids":["v4"]}},"translation":[-0.24,-0.16,1.0]},
+            {"op":"mesh.transform_elements","target":{"id":"cage","elements":{"domain":"vertex","ids":["v4"]}},"translation":[-0.24,0.16,-1.0]},
+            {"op":"mesh.transform_elements","target":{"id":"cage","elements":{"domain":"vertex","ids":["v6"]}},"translation":[0.24,0.16,-1.0]},
+            {"op":"mesh.transform_elements","target":{"id":"cage","elements":{"domain":"vertex","ids":["v2"]}},"translation":[0.24,-0.16,-1.0]},
+            {"op":"mesh.transform_elements","target":{"id":"cage","elements":{"domain":"vertex","ids":["v1"]}},"translation":[-0.24,-0.16,1.0]},
             {"op":"mesh.transform_elements","target":{"id":"cage","elements":{"domain":"vertex","ids":["v5"]}},"translation":[-0.24,0.16,1.0]},
-            {"op":"mesh.transform_elements","target":{"id":"cage","elements":{"domain":"vertex","ids":["v6"]}},"translation":[0.24,0.16,1.0]},
-            {"op":"mesh.transform_elements","target":{"id":"cage","elements":{"domain":"vertex","ids":["v7"]}},"translation":[0.24,-0.16,1.0]}
+            {"op":"mesh.transform_elements","target":{"id":"cage","elements":{"domain":"vertex","ids":["v7"]}},"translation":[0.24,0.16,1.0]},
+            {"op":"mesh.transform_elements","target":{"id":"cage","elements":{"domain":"vertex","ids":["v3"]}},"translation":[0.24,-0.16,1.0]}
         ]);
         cases.push((name, operations, if dynamic { "dynamic" } else { "static" }));
     }
@@ -1823,7 +1830,7 @@ with open(sys.argv[-1], 'w', encoding='utf-8') as output:
             binding_data: None,
             runtime: potter_core::model::ModifierRuntime::default(),
         };
-        let output = evaluate_modifiers(&source, &[modifier])?;
+        let output = evaluate_modifiers(&source, &[modifier], "Cube")?;
         Ok(output.vertices.iter().map(|vertex| vertex.co).collect())
     };
     let native_still = native_positions(0.0)?;
@@ -2146,6 +2153,7 @@ with open(sys.argv[-1], 'w', encoding='utf-8') as output:
                     "use_smooth_shade":smooth_shade
                 }),
             )?],
+            "Cube",
         )?;
         assert_voxel_remesh_geometry(
             &native,

@@ -96,6 +96,7 @@ fn vertex_weight_mix_applies_blender_operation_to_selected_vertices() -> Result<
                 "normalize":false
             }),
         )?],
+        "Cube",
     )?;
     assert_eq!(weights(&result, "A")?, [0.75, 1.0]);
     Ok(())
@@ -123,6 +124,7 @@ fn vertex_weight_edit_supports_curve_mapping_and_threshold_removal() -> Result<(
                 "normalize":false
             }),
         )?],
+        "Cube",
     )?;
     assert_eq!(weights(&result, "A")?, [0.0, 0.75]);
     Ok(())
@@ -138,6 +140,7 @@ fn weighted_normal_writes_unit_corner_normals() -> Result<(), Box<dyn Error>> {
             "weighted_normal",
             json!({"mode":"FACE_AREA","weight":50}),
         )?],
+        "Cube",
     )?;
     let evaluated = evaluated_face_normals(&result, "f0")?;
     let normals = evaluated
@@ -183,6 +186,7 @@ fn uv_warp_preserves_unknown_attributes_and_updates_named_uv_layer() -> Result<(
                 "uv_layer":"UVMap"
             }),
         )?],
+        "Cube",
     )?;
     assert_eq!(result.attributes["marker"], json!(true));
     assert_eq!(
@@ -213,6 +217,7 @@ fn uv_warp_empty_layer_writes_the_active_layer() -> Result<(), Box<dyn Error>> {
             "uv_warp",
             json!({"center":[0.0,0.0],"offset":[0.25,-0.5],"uv_layer":""}),
         )?],
+        "Cube",
     )?;
     let layers = &result.attributes["uv_layers"]["layers"];
     assert_eq!(
@@ -236,6 +241,7 @@ fn uv_warp_empty_layer_on_mesh_without_layers_creates_uvmap() -> Result<(), Box<
             "uv_warp",
             json!({"center":[0.0,0.0],"offset":[0.25,-0.5],"uv_layer":""}),
         )?],
+        "Cube",
     )?;
     assert_eq!(result.attributes["uv_layers"]["active"], json!("UVMap"));
     assert_eq!(result.attributes["uv_layers"]["render"], json!("UVMap"));
@@ -262,8 +268,11 @@ fn uv_warp_named_layer_the_mesh_lacks_is_an_error() -> Result<(), Box<dyn Error>
             "render": "UVMap"
         }),
     );
-    let Err(error) = evaluate_modifiers(&mesh, &[modifier("uv_warp", json!({"uv_layer":"Nope"}))?])
-    else {
+    let Err(error) = evaluate_modifiers(
+        &mesh,
+        &[modifier("uv_warp", json!({"uv_layer":"Nope"}))?],
+        "Cube",
+    ) else {
         return Err("a named layer the mesh lacks must be an error".into());
     };
     assert_eq!(error.code, potter_core::error::ErrorCode::InvalidArgument);
@@ -281,6 +290,7 @@ fn attribute_modifiers_do_not_mutate_the_source_mesh() -> Result<(), Box<dyn Err
             "vertex_weight_mix",
             json!({"vertex_group_a":"A","vertex_group_b":"B","mix_mode":"SUB","normalize":false}),
         )?],
+        "Cube",
     )?;
     assert_ne!(result, source);
     assert_eq!(source, original);
@@ -459,11 +469,15 @@ fn mesh_cache_mdd_interpolates_resource_frames() -> Result<(), Box<dyn Error>> {
 fn vertex_weight_edit_blends_with_image_mask_channel() -> Result<(), Box<dyn Error>> {
     let source = weighted_line()?;
     let image = ImageData {
+        colour: potter_core::image::ColourCache::default(),
+        storage: potter_core::image::ImageStorage::default(),
         width: 1,
         height: 1,
         pixels: vec![[0.0, 0.0, 0.0, 1.0]],
         tiles: BTreeMap::new(),
         interpolation: ImageInterpolation::Closest,
+        srgb: false,
+        udim: false,
     };
     let edit = modifier(
         "vertex_weight_edit",
@@ -1685,6 +1699,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
             "vertex_weight_edit",
             json!({"vertex_group":"A","falloff_type":"SHARP","normalize":false}),
         )?],
+        "Cube",
     )?;
     assert_material_change(
         "vertex_weight_edit",
@@ -1705,6 +1720,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
             "vertex_weight_mix",
             json!({"vertex_group_a":"A","vertex_group_b":"B","mix_mode":"ADD","mix_set":"ALL","normalize":false}),
         )?],
+        "Cube",
     )?;
     assert_material_change(
         "vertex_weight_mix",
@@ -1734,6 +1750,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
                 "vertex_weight_edit",
                 json!({"vertex_group":"A","falloff_type":falloff,"normalize":false}),
             )?],
+            "Cube",
         )?;
         let actual = json!(vertex_weights(&falloff_result, "A")?);
         if falloff != "LINEAR" {
@@ -1765,6 +1782,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
                     "mix_mode":mix_mode,"mix_set":"ALL","normalize":false
                 }),
             )?],
+            "Cube",
         )?;
         let actual = json!(vertex_weights(&mix_result, "A")?);
         assert_material_change(
@@ -1933,6 +1951,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
             "weighted_normal",
             json!({"mode":"FACE_AREA","weight":50,"keep_sharp":false}),
         )?],
+        "Cube",
     )?;
     let weighted_corners = blender_quantize_loop_normals(
         &blender,
@@ -1960,6 +1979,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
             "weighted_normal",
             json!({"mode":"FACE_AREA","weight":50,"keep_sharp":true}),
         )?],
+        "Cube",
     )?;
     assert_normal_stimulus(
         "weighted_normal keep_sharp",
@@ -1990,6 +2010,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
             "weighted_normal",
             json!({"mode":"FACE_AREA","weight":50,"keep_sharp":false,"use_face_influence":true}),
         )?],
+        "Cube",
     )?;
     assert_normal_stimulus(
         "weighted_normal use_face_influence",
@@ -2214,6 +2235,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
             "uv_warp",
             json!({"center":[0.5,0.5],"axis_u":"X","axis_v":"Y","offset":[0.25,-0.5],"scale":[1.25,0.75],"rotation":0.35,"uv_layer":"UVMap"}),
         )?],
+        "Cube",
     )?;
     assert_material_change(
         "uv_warp scale/rotation",
@@ -2462,6 +2484,8 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         1.0e-4,
     )?;
     let image = ImageData {
+        colour: potter_core::image::ColourCache::default(),
+        storage: potter_core::image::ImageStorage::default(),
         width: 2,
         height: 2,
         pixels: vec![
@@ -2472,6 +2496,8 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         ],
         tiles: BTreeMap::new(),
         interpolation: ImageInterpolation::Closest,
+        srgb: false,
+        udim: false,
     };
     let subject_world = DMat4::from_scale_rotation_translation(
         DVec3::new(0.8, 0.7, 1.0),
@@ -3193,6 +3219,8 @@ fn vertex_weight_mix_uv_mask_samples_blender_v_up_rows() -> Result<(), Box<dyn E
         }),
     );
     let image = ImageData {
+        colour: potter_core::image::ColourCache::default(),
+        storage: potter_core::image::ImageStorage::default(),
         width: 1,
         height: 4,
         pixels: vec![
@@ -3203,6 +3231,8 @@ fn vertex_weight_mix_uv_mask_samples_blender_v_up_rows() -> Result<(), Box<dyn E
         ],
         tiles: BTreeMap::new(),
         interpolation: ImageInterpolation::Closest,
+        srgb: false,
+        udim: false,
     };
     let mix = modifier(
         "vertex_weight_mix",

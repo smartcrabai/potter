@@ -27,6 +27,8 @@ pub(super) fn uv_project(
     let scale_y = (number(modifier, "scale_y")? as f32).max(0.0);
     let scale_x = if scale_x == 0.0 { 1.0 } else { scale_x };
     let scale_y = if scale_y == 0.0 { 1.0 } else { scale_y };
+    // `projectors_num` (MOD_uvproject.cc) limits which projector slots are read; later slots are ignored.
+    let projector_count = number(modifier, "projector_count")?.max(1.0) as usize;
 
     let requested_layer = string(modifier, "uv_layer")?;
     let mut store = crate::geom::uv_layers::read(mesh);
@@ -65,6 +67,7 @@ pub(super) fn uv_project(
         .collect::<Vec<_>>();
     let projector_data = projectors
         .iter()
+        .take(projector_count)
         .map(|projector| {
             make_projector_f32(
                 projector,
@@ -207,10 +210,7 @@ fn make_projector_f32(
         });
     };
 
-    if matches!(
-        camera.projection,
-        crate::model::CameraProjection::Panorama | crate::model::CameraProjection::Fisheye
-    ) {
+    if matches!(camera.projection, crate::model::CameraProjection::Panorama) {
         let normalized_world = normalize_camera_world_f32(world);
         let world_to_camera = crate::geom::blender_matrix::blender_inverse_m4(normalized_world);
         if matrix_is_zero(&world_to_camera) {

@@ -113,6 +113,7 @@ fn bind_modifier(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Res
                 scene_id: None,
                 view_layer: None,
                 frame: Some(engine.evaluation_frame),
+                adaptive_render: None,
                 purpose: EvaluationPurpose::Preview,
             },
             engine.asset_root,
@@ -330,7 +331,9 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
     let enabled = read_bool(engine, operation, "enabled", true)?;
     let show_viewport = read_bool(engine, operation, "show_viewport", true)?;
     let show_render = read_bool(engine, operation, "show_render", true)?;
-    let params = read_params(engine, operation.get("params"), "params")?;
+    let raw_params = read_params(engine, operation.get("params"), "params")?;
+    let mut params = raw_params.clone();
+    synchronize_rna_aliases(engine, &modifier_type, &raw_params, &mut params)?;
     validate_parameter_map(
         engine,
         ParameterFamily::Modifier,
@@ -487,28 +490,58 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                 })
             })
             .transpose()?;
-        let modifier_params = if let Some(params) = params {
+        let modifier_params = if let Some(raw) = params {
+            // The same type merges into the current params (RNA property semantics). A type change
+            // replaces them, because the old params do not belong to the new type. A JSON null
+            // removes its key. Validation runs on the complete merged result, not the changed keys,
+            // so a partial update is judged the way the modifier will actually evaluate.
+            let mut candidate = if modifier_type == existing.modifier_type {
+                existing.params.clone()
+            } else {
+                Map::new()
+            };
+            for (key, value) in &raw {
+                if value.is_null() {
+                    candidate.remove(key);
+                } else {
+                    candidate.insert(key.clone(), value.clone());
+                }
+            }
+            synchronize_rna_aliases(engine, modifier_type, &raw, &mut candidate)?;
             validate_parameter_map(
                 engine,
                 ParameterFamily::Modifier,
                 modifier_type,
-                &params,
+                &candidate,
                 "/set/params",
             )?;
-            validate_modifier_resource(engine, modifier_type, &params, "/set/params")?;
+            validate_modifier_resource(engine, modifier_type, &candidate, "/set/params")?;
             if modifier_type == "volume_displace" {
-                validate_volume_displace_params(engine, &params)?;
+                validate_volume_displace_params(engine, &candidate)?;
             } else if is_attribute_modifier_type(modifier_type) {
-                validate_attribute_modifier_params(engine, modifier_type, &params, "/set/params")?;
+                validate_attribute_modifier_params(
+                    engine,
+                    modifier_type,
+                    &candidate,
+                    "/set/params",
+                )?;
             }
-            validate_particle_modifier_params(engine, modifier_type, &params)?;
-            Some(super::physics::update_linked_modifier_settings(
+            validate_particle_modifier_params(engine, modifier_type, &candidate)?;
+            let assigned: Map<String, Value> = raw
+                .iter()
+                .filter(|(_, value)| !value.is_null())
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            let linked = super::physics::update_linked_modifier_settings(
                 engine,
                 &target,
                 &id,
                 modifier_type,
-                &params,
-            )?)
+                &assigned,
+            )?;
+            let mut merged = candidate;
+            merged.extend(linked);
+            Some(merged)
         } else {
             None
         };
@@ -587,6 +620,47 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
         }
     }
     Ok(changed)
+}
+
+/// Keeps every RNA alias group of a modifier type equal. The members of a group read and write one stored
+/// Blender value (`rna_modifier.cc`; the table's `aliases` are found from Blender by
+/// `tests/fixtures/param_audit/generate.py`). The graph keeps every key from import, so an update that names
+/// one member sets the rest of its group to the same value. Otherwise the exporter writes the keys in sorted
+/// order and a stale member wins. A JSON null for any member restores the default for the group. Two different
+/// values for one group in one update are refused, because Blender holds one value.
+fn synchronize_rna_aliases(
+    engine: &Engine<'_>,
+    modifier_type: &str,
+    raw: &Map<String, Value>,
+    candidate: &mut Map<String, Value>,
+) -> Result<()> {
+    for group in params::rna_aliases(ParameterFamily::Modifier, modifier_type) {
+        let touched: Vec<&Value> = group.iter().filter_map(|key| raw.get(*key)).collect();
+        if touched.is_empty() {
+            continue;
+        }
+        if touched.iter().any(|value| value.is_null()) {
+            for key in &group {
+                candidate.remove(*key);
+            }
+            continue;
+        }
+        if touched.iter().any(|value| *value != touched[0]) {
+            return Err(engine.error(
+                ErrorCode::InvalidOperation,
+                format!(
+                    "{} are one Blender value; set one value",
+                    group.join(" and ")
+                ),
+                "/set/params",
+            ));
+        }
+        let value = touched[0].clone();
+        for key in &group {
+            candidate.insert((*key).to_owned(), value.clone());
+        }
+    }
+    Ok(())
 }
 
 fn delete(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bool> {
@@ -703,7 +777,7 @@ fn reorder(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bo
 }
 
 /// Blender's `ModifierTypeType::OnlyDeform` for each Potter modifier type.
-fn only_deform(modifier_type: &str) -> bool {
+pub(crate) fn only_deform(modifier_type: &str) -> bool {
     matches!(
         modifier_type,
         "armature"
@@ -824,10 +898,15 @@ fn settle_pin(stack: &mut Vec<Modifier>, index: usize) {
     }
 }
 
-/// `modifier.attribute_dropped` reports output that was applied with attributes lost, so it is
-/// surfaced as a warning on every apply path instead of failing the operation.
-fn is_attribute_dropped(warning: &PotError) -> bool {
+/// Attribute loss and explicitly marked modifier diagnostics accompany successfully applied output,
+/// so each is surfaced as a warning on every apply path instead of failing the operation.
+fn is_apply_warning(warning: &PotError) -> bool {
     warning.details.get("feature_id").and_then(Value::as_str) == Some("modifier.attribute_dropped")
+        || warning
+            .details
+            .get("modifier_warning")
+            .and_then(Value::as_bool)
+            == Some(true)
 }
 
 fn ensure_single_user_data(engine: &mut Engine<'_>, targets: &[Id]) -> Result<()> {
@@ -1037,19 +1116,6 @@ fn modifier_to_apply(engine: &Engine<'_>, target: &Id, modifier_id: &Id) -> Resu
                 format!("modifier `{modifier_id}` was not found on node `{target}`"),
             )
         })?;
-    if stack[index].modifier_type == "boolean" {
-        crate::geom::modifiers::validate_boolean_topology_suffix(
-            stack,
-            index,
-            &|position, modifier| {
-                if position == index {
-                    modifier.enabled
-                } else {
-                    modifier.is_active(EvaluationPurpose::Preview)
-                }
-            },
-        )?;
-    }
     Ok(stack[index].clone())
 }
 
@@ -1078,6 +1144,15 @@ fn evaluate_modifier_output(
         .data_blocks
         .get(data_id)
         .map_or_else(Vec::new, |data| data.materials.clone());
+    let object_material_count = engine
+        .doc
+        .nodes
+        .get(target)
+        .map_or(0, |node| node.materials.len());
+    let material_slot_count = Some(crate::model::material_slot_count(
+        object_material_count,
+        material_slots.len(),
+    ));
     let evaluated = {
         let data_block = engine.doc.data_blocks.get(data_id).ok_or_else(|| {
             PotError::new(
@@ -1138,6 +1213,10 @@ fn evaluate_modifier_output(
                 "warp" => ["object_from", "object_to"]
                     .iter()
                     .any(|key| modifier.params.get(*key).is_some_and(Value::is_string)),
+                "mirror" => modifier
+                    .params
+                    .get("mirror_object")
+                    .is_some_and(Value::is_string),
                 "vertex_weight_edit" | "vertex_weight_mix" => modifier
                     .params
                     .get("mask_tex_map_object")
@@ -1191,12 +1270,13 @@ fn evaluate_modifier_output(
                 &engine.doc.node_groups,
                 engine.evaluation_frame,
                 &subject_name,
+                material_slot_count,
             )?;
             engine.warnings.extend(
                 evaluation
                     .warnings
                     .into_iter()
-                    .filter(is_attribute_dropped)
+                    .filter(is_apply_warning)
                     .map(|warning| crate::eval::attach_node_owner(warning, target)),
             );
             evaluation.mesh
@@ -1317,100 +1397,113 @@ fn evaluate_modifier_output(
                     purpose: crate::eval::EvaluationPurpose::Preview,
                     project_root: engine.asset_root,
                     cache_directory: engine.cache_directory,
+                    material_slot_count: Some(crate::model::material_slot_count(
+                        object_material_count,
+                        material_slots.len(),
+                    )),
                 },
                 |_, modifier| modifier.enabled,
-                |mesh, modifier, modifier_warnings| match modifier.modifier_type.as_str() {
-                    "armature" => crate::eval::rig::apply_armature_modifier_with_drivers(
-                        mesh,
-                        data_block,
-                        modifier,
-                        object_world,
-                        engine.doc,
-                        frame,
-                        &world_matrices,
-                        &driver_values,
-                        engine.asset_root,
-                        engine
-                            .doc
-                            .scenes
-                            .get(&engine.doc.active_scene)
-                            .map_or(24, |scene| scene.fps),
-                        engine
-                            .doc
-                            .scenes
-                            .get(&engine.doc.active_scene)
-                            .map_or(1.0, |scene| scene.fps_base),
-                        evaluated_operand_meshes,
-                    ),
-                    "lattice" => apply_lattice_modifier(
-                        mesh,
-                        data_block,
-                        target,
-                        modifier,
-                        engine.doc,
-                        &world_matrices,
-                    ),
-                    "volume_to_mesh" => crate::eval::apply_volume_to_mesh_modifier(
-                        mesh,
-                        modifier,
-                        target,
-                        engine.doc,
-                        &world_matrices,
-                        &volume_data,
-                    ),
-                    "surface_deform" | "mesh_deform" => crate::eval::apply_scene_deform_modifier(
-                        mesh,
-                        modifier,
-                        target,
-                        engine.doc,
-                        &world_matrices,
-                        evaluated_operand_meshes,
-                        modifier_warnings,
-                    ),
-                    "boolean" | "shrinkwrap" | "curve" | "hook" | "warp" => {
-                        crate::eval::apply_scene_operand_modifier(
+                None,
+                |mesh, modifier, modifier_warnings| {
+                    let result = match modifier.modifier_type.as_str() {
+                        "armature" => crate::eval::rig::apply_armature_modifier_with_drivers(
+                            mesh,
+                            data_block,
+                            modifier,
+                            object_world,
+                            engine.doc,
+                            frame,
+                            &world_matrices,
+                            &driver_values,
+                            engine.asset_root,
+                            engine
+                                .doc
+                                .scenes
+                                .get(&engine.doc.active_scene)
+                                .map_or(24, |scene| scene.fps),
+                            engine
+                                .doc
+                                .scenes
+                                .get(&engine.doc.active_scene)
+                                .map_or(1.0, |scene| scene.fps_base),
+                            evaluated_operand_meshes,
+                        ),
+                        "lattice" => apply_lattice_modifier(
+                            mesh,
+                            data_block,
+                            target,
+                            modifier,
+                            engine.doc,
+                            &world_matrices,
+                        ),
+                        "volume_to_mesh" => crate::eval::apply_volume_to_mesh_modifier(
+                            mesh,
+                            modifier,
+                            target,
+                            engine.doc,
+                            &world_matrices,
+                            &volume_data,
+                        ),
+                        "surface_deform" | "mesh_deform" => {
+                            crate::eval::apply_scene_deform_modifier(
+                                mesh,
+                                modifier,
+                                target,
+                                engine.doc,
+                                &world_matrices,
+                                evaluated_operand_meshes,
+                                modifier_warnings,
+                            )
+                        }
+                        "boolean" | "shrinkwrap" | "curve" | "hook" | "warp" => {
+                            crate::eval::apply_scene_operand_modifier(
+                                mesh,
+                                modifier,
+                                target,
+                                engine.doc,
+                                &world_matrices,
+                                evaluated_operand_meshes,
+                                evaluated_operand_nodes,
+                                &mut material_slots,
+                            )
+                        }
+                        "vertex_weight_edit"
+                        | "vertex_weight_mix"
+                        | "vertex_weight_proximity"
+                        | "normal_edit"
+                        | "uv_project"
+                        | "uv_warp"
+                        | "data_transfer"
+                        | "mask" => crate::eval::apply_scene_attribute_modifier(
                             mesh,
                             modifier,
                             target,
                             engine.doc,
                             &world_matrices,
                             evaluated_operand_meshes,
-                            evaluated_operand_nodes,
-                            &mut material_slots,
-                        )
-                    }
-                    "vertex_weight_edit"
-                    | "vertex_weight_mix"
-                    | "vertex_weight_proximity"
-                    | "normal_edit"
-                    | "uv_project"
-                    | "uv_warp"
-                    | "data_transfer"
-                    | "mask" => crate::eval::apply_scene_attribute_modifier(
-                        mesh,
-                        modifier,
-                        target,
-                        engine.doc,
-                        &world_matrices,
-                        evaluated_operand_meshes,
-                        &attribute_bone_matrices,
-                        engine.asset_root,
-                    ),
-                    _ => Err(PotError::new(
-                        ErrorCode::InternalError,
-                        "custom modifier callback received an unexpected type",
-                    )),
+                            &attribute_bone_matrices,
+                            engine.asset_root,
+                        ),
+                        _ => Err(PotError::new(
+                            ErrorCode::InternalError,
+                            "custom modifier callback received an unexpected type",
+                        )),
+                    };
+                    result.map(|()| {
+                        Some(crate::model::material_slot_count(
+                            object_material_count,
+                            material_slots.len(),
+                        ))
+                    })
                 },
             )?;
-            let (dropped, blocking): (Vec<PotError>, Vec<PotError>) = evaluation
-                .warnings
-                .into_iter()
-                .partition(is_attribute_dropped);
+            let (forwarded, blocking): (Vec<PotError>, Vec<PotError>) =
+                evaluation.warnings.into_iter().partition(is_apply_warning);
             if let Some(warning) = blocking.into_iter().next() {
                 return Err(warning);
             }
             engine.warnings.extend(
-                dropped
+                forwarded
                     .into_iter()
                     .map(|warning| crate::eval::attach_node_owner(warning, target)),
             );

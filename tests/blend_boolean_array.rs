@@ -4,13 +4,13 @@ use std::{collections::HashMap, error::Error, fs, process::Command};
 mod blender_file;
 use blender_file::blender_executable;
 
-use glam::DVec3;
+use glam::{DMat4, DVec3};
 use potter_core::{
     eval::{EvaluationContext, Snapshot},
     geom::Mesh,
     model::SceneDoc,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use tempfile::tempdir;
 
 type TestResult<T> = Result<T, Box<dyn Error>>;
@@ -22,6 +22,7 @@ import bpy
 import json
 import os
 import sys
+from mathutils import Vector
 
 root = os.path.realpath(sys.argv[sys.argv.index("--") + 1])
 bpy.ops.wm.read_factory_settings(use_empty=True)
@@ -39,11 +40,20 @@ def sample(owner):
     evaluated = owner.evaluated_get(bpy.context.evaluated_depsgraph_get())
     mesh = evaluated.to_mesh()
     try:
-        mesh.calc_loop_triangles()
+        matrix = evaluated.matrix_world
+        positions = [[float(value) for value in matrix @ vertex.co] for vertex in mesh.vertices]
+        edges = [[positions[index] for index in edge.vertices] for edge in mesh.edges]
+        faces = [[positions[index] for index in polygon.vertices] for polygon in mesh.polygons]
+        volume = 0.0
+        for face in faces:
+            first = Vector(face[0])
+            for index in range(1, len(face) - 1):
+                volume += first.dot(Vector(face[index]).cross(Vector(face[index + 1]))) / 6.0
         return {
-            "positions": [[float(vertex.co.x), float(vertex.co.y), float(vertex.co.z)]
-                          for vertex in mesh.vertices],
-            "triangles": [list(triangle.vertices) for triangle in mesh.loop_triangles],
+            "vertices": positions,
+            "edges": edges,
+            "faces": faces,
+            "signed_volume": volume,
         }
     finally:
         evaluated.to_mesh_clear()
@@ -67,15 +77,35 @@ for label, count, spacing, cutter_height, cutter_width, cutter_z, start_x, start
         boolean.operation = "DIFFERENCE"
         boolean.solver = solver
         boolean.object = cutter
-        if solver == "FLOAT" and label in ("Touching", "TopCoplanar"):
-            # Blender FLOAT emits a nonmanifold mesh for exact face contacts; use the
-            # mathematically equivalent strict EXACT surface as the parity oracle.
-            expected[host.name] = expected["ArrayHost" + label + "EXACT"]
-        else:
-            expected[host.name] = sample(host)
+        expected[host.name] = sample(host)
 
 with open(os.path.join(root, "expected.json"), "w", encoding="utf-8") as output:
     json.dump(expected, output, separators=(",", ":"))
+
+for obj in bpy.data.objects:
+    for modifier in obj.modifiers:
+        if modifier.type == "BOOLEAN":
+            enabled = obj.name == "ArrayHostSeparatedFLOAT"
+            modifier.show_viewport = enabled
+            modifier.show_render = enabled
+
+# The CLI acceptance flow renders this imported scene after applying one FLOAT Boolean.
+bpy.ops.object.camera_add(location=(8.0, -10.0, 8.0))
+camera = bpy.context.object
+camera.name = "BooleanArrayCamera"
+camera.rotation_euler = (Vector((0.0, 0.0, 0.0)) - camera.location).to_track_quat("-Z", "Y").to_euler()
+bpy.context.scene.camera = camera
+bpy.ops.object.light_add(type="AREA", location=(4.0, -4.0, 7.0))
+bpy.context.object.data.energy = 1200.0
+# The test checks that the frame file exists, not its pixels, so the frame stays small.
+scene = bpy.context.scene
+scene.render.resolution_x = 64
+scene.render.resolution_y = 36
+scene.eevee.taa_render_samples = 1
+try:
+    scene.cycles.samples = 1
+except AttributeError:
+    pass
 bpy.ops.wm.save_as_mainfile(filepath=os.path.join(root, "source.blend"))
 "#;
 
@@ -93,246 +123,490 @@ fn run_pot(args: &[&str]) -> TestResult<Value> {
     Ok(serde_json::from_slice(&output.stdout)?)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Surface {
-    positions: Vec<DVec3>,
-    triangles: Vec<[usize; 3]>,
+    vertices: Vec<DVec3>,
+    edges: Vec<[DVec3; 2]>,
+    faces: Vec<Vec<DVec3>>,
+    signed_volume: f64,
+}
+
+fn point_from_json(value: &Value) -> TestResult<DVec3> {
+    let coordinates = value
+        .as_array()
+        .filter(|coordinates| coordinates.len() == 3)
+        .ok_or("Blender vertex must have three coordinates")?;
+    let coordinate = |index: usize| {
+        coordinates[index]
+            .as_f64()
+            .ok_or("Blender vertex coordinate is invalid")
+    };
+    Ok(DVec3::new(coordinate(0)?, coordinate(1)?, coordinate(2)?))
 }
 
 fn surface_from_blender(value: &Value) -> TestResult<Surface> {
-    let positions = value["positions"]
+    let vertices = value["vertices"]
         .as_array()
-        .ok_or("Blender vertex positions are missing")?
+        .ok_or("Blender vertices are missing")?
         .iter()
-        .map(|point| {
-            let coordinates = point
+        .map(point_from_json)
+        .collect::<TestResult<Vec<_>>>()?;
+    let edges = value["edges"]
+        .as_array()
+        .ok_or("Blender edges are missing")?
+        .iter()
+        .map(|edge| {
+            let points = edge
                 .as_array()
-                .filter(|coordinates| coordinates.len() == 3)
-                .ok_or("Blender vertex must have three coordinates")?;
-            let coordinate = |index: usize| {
-                coordinates[index]
-                    .as_f64()
-                    .ok_or("Blender vertex coordinate is invalid")
-            };
-            Ok(DVec3::new(coordinate(0)?, coordinate(1)?, coordinate(2)?))
+                .filter(|points| points.len() == 2)
+                .ok_or("Blender edge must have two endpoints")?;
+            Ok([point_from_json(&points[0])?, point_from_json(&points[1])?])
         })
         .collect::<TestResult<Vec<_>>>()?;
-    let triangles = value["triangles"]
+    let faces = value["faces"]
         .as_array()
-        .ok_or("Blender triangles are missing")?
+        .ok_or("Blender faces are missing")?
         .iter()
-        .map(|triangle| {
-            let indices = triangle
-                .as_array()
-                .filter(|indices| indices.len() == 3)
-                .ok_or("Blender triangle must have three indices")?;
-            Ok([
-                triangle_index(&indices[0])?,
-                triangle_index(&indices[1])?,
-                triangle_index(&indices[2])?,
-            ])
+        .map(|face| {
+            face.as_array()
+                .ok_or("Blender face ring is missing")?
+                .iter()
+                .map(point_from_json)
+                .collect::<TestResult<Vec<_>>>()
         })
         .collect::<TestResult<Vec<_>>>()?;
     Ok(Surface {
-        positions,
-        triangles,
+        vertices,
+        edges,
+        faces,
+        signed_volume: value["signed_volume"]
+            .as_f64()
+            .ok_or("Blender signed volume is missing")?,
     })
 }
 
-fn triangle_index(value: &Value) -> TestResult<usize> {
-    let index = value.as_u64().ok_or("Blender triangle index is invalid")?;
-    Ok(usize::try_from(index)?)
+fn signed_volume(faces: &[Vec<DVec3>]) -> f64 {
+    faces
+        .iter()
+        .map(|face| {
+            let Some(first) = face.first() else {
+                return 0.0;
+            };
+            (1..face.len() - 1)
+                .map(|index| first.dot(face[index].cross(face[index + 1])) / 6.0)
+                .sum::<f64>()
+        })
+        .sum()
 }
 
-fn surface_from_mesh(mesh: &Mesh) -> TestResult<Surface> {
-    let positions: Vec<_> = mesh.vertices.iter().map(|vertex| vertex.co).collect();
-    let indices: HashMap<_, _> = mesh
+fn surface_from_mesh(mesh: &Mesh, world: DMat4) -> TestResult<Surface> {
+    let vertices: Vec<_> = mesh
         .vertices
         .iter()
-        .enumerate()
-        .map(|(index, vertex)| (vertex.id, index))
+        .map(|vertex| world.transform_point3(vertex.co))
         .collect();
-    let triangles = mesh
-        .triangulate()?
-        .into_iter()
-        .map(|triangle| {
+    let positions: HashMap<_, _> = mesh
+        .vertices
+        .iter()
+        .zip(&vertices)
+        .map(|(vertex, position)| (vertex.id, *position))
+        .collect();
+    let edges = mesh
+        .edges
+        .iter()
+        .map(|edge| {
             Ok([
-                *indices
-                    .get(&triangle[0])
-                    .ok_or("Mesh triangle vertex is missing")?,
-                *indices
-                    .get(&triangle[1])
-                    .ok_or("Mesh triangle vertex is missing")?,
-                *indices
-                    .get(&triangle[2])
-                    .ok_or("Mesh triangle vertex is missing")?,
+                positions
+                    .get(&edge.vertices[0])
+                    .copied()
+                    .ok_or("Mesh edge vertex is missing")?,
+                positions
+                    .get(&edge.vertices[1])
+                    .copied()
+                    .ok_or("Mesh edge vertex is missing")?,
             ])
         })
         .collect::<TestResult<Vec<_>>>()?;
+    let faces = mesh
+        .faces
+        .iter()
+        .map(|face| {
+            face.vertices
+                .iter()
+                .map(|id| {
+                    positions
+                        .get(id)
+                        .copied()
+                        .ok_or_else(|| "Mesh face vertex is missing".into())
+                })
+                .collect::<TestResult<Vec<_>>>()
+        })
+        .collect::<TestResult<Vec<_>>>()?;
     Ok(Surface {
-        positions,
-        triangles,
+        vertices,
+        edges,
+        signed_volume: signed_volume(&faces),
+        faces,
     })
 }
 
-fn topology(surface: &Surface) -> (bool, usize) {
-    let mut edge_owners = HashMap::<(usize, usize), Vec<usize>>::new();
-    for (triangle_index, triangle) in surface.triangles.iter().enumerate() {
-        for edge_index in 0..3 {
-            let first = triangle[edge_index];
-            let second = triangle[(edge_index + 1) % 3];
-            edge_owners
-                .entry((first.min(second), first.max(second)))
-                .or_default()
-                .push(triangle_index);
-        }
-    }
-    let manifold =
-        !surface.triangles.is_empty() && edge_owners.values().all(|owners| owners.len() == 2);
-    let mut adjacency = vec![Vec::new(); surface.triangles.len()];
-    for owners in edge_owners.values().filter(|owners| owners.len() == 2) {
-        adjacency[owners[0]].push(owners[1]);
-        adjacency[owners[1]].push(owners[0]);
-    }
-    let mut visited = vec![false; surface.triangles.len()];
-    let mut components = 0;
-    for start in 0..surface.triangles.len() {
-        if visited[start] {
-            continue;
-        }
-        components += 1;
-        visited[start] = true;
-        let mut pending = vec![start];
-        while let Some(face) = pending.pop() {
-            for neighbor in &adjacency[face] {
-                if !visited[*neighbor] {
-                    visited[*neighbor] = true;
-                    pending.push(*neighbor);
-                }
-            }
-        }
-    }
-    (manifold, components)
+fn same_point(first: DVec3, second: DVec3) -> bool {
+    first.distance(second) <= 1.0e-5
 }
 
-fn volume(surface: &Surface) -> f64 {
-    surface
-        .triangles
+// Touching, 5 boxes, EXACT: the top and bottom faces each keep two keyhole bridges, chosen from four
+// candidates of exactly equal squared length. Blender 5.2.2 orders those ties with an unstable
+// `std::ranges::sort` (blenlib_mesh_boolean.cc:3226), so the bridge choice depends on the platform's
+// C++ standard library. Both observed results are accepted; they share vertices and volume and
+// differ only in the bottom face. Bridges: A=(2,1)-(0.75,0.275), B=(2,-1)-(0.75,-0.275),
+// C=(-2,-1)-(-0.75,-0.275), D=(-2,1)-(-0.75,0.275).
+//   macOS arm64, /Applications/Blender.app (libc++): top {B,C}, bottom {C,D}
+//   Linux amd64, potter-blender-linux:ready (libstdc++, GCC 14): top {B,C}, bottom {A,B}
+// Each result came from the ARRAY_BOOLEAN_FIXTURE generator and repeated identically across runs.
+// Potter's dissolve sorts with libstdc++'s algorithm (dissolve.rs `libstdcxx_sort_by`).
+const TOUCHING_EXACT_VERTICES: [[f64; 3]; 32] = [
+    [-2.0, -1.0, -0.5],
+    [-2.0, -1.0, 0.5],
+    [-2.0, 1.0, -0.5],
+    [-2.0, 1.0, 0.5],
+    [2.0, -1.0, -0.5],
+    [2.0, -1.0, 0.5],
+    [2.0, 1.0, -0.5],
+    [2.0, 1.0, 0.5],
+    [-0.450_000_017_881_393_43, 0.275_000_005_960_464_5, -0.5],
+    [0.149_999_976_158_142_1, 0.275_000_005_960_464_5, -0.5],
+    [-0.150_000_005_960_464_48, 0.275_000_005_960_464_5, -0.5],
+    [0.450_000_047_683_715_8, 0.275_000_005_960_464_5, -0.5],
+    [0.75, 0.275_000_005_960_464_5, -0.5],
+    [0.75, -0.275_000_005_960_464_5, -0.5],
+    [-0.75, 0.275_000_005_960_464_5, -0.5],
+    [-0.75, -0.275_000_005_960_464_5, -0.5],
+    [-0.450_000_017_881_393_43, -0.275_000_005_960_464_5, -0.5],
+    [-0.150_000_005_960_464_48, -0.275_000_005_960_464_5, -0.5],
+    [0.149_999_976_158_142_1, -0.275_000_005_960_464_5, -0.5],
+    [0.450_000_047_683_715_8, -0.275_000_005_960_464_5, -0.5],
+    [-0.75, -0.275_000_005_960_464_5, 0.5],
+    [-0.75, 0.275_000_005_960_464_5, 0.5],
+    [-0.450_000_017_881_393_43, 0.275_000_005_960_464_5, 0.5],
+    [-0.150_000_005_960_464_48, 0.275_000_005_960_464_5, 0.5],
+    [0.149_999_976_158_142_1, 0.275_000_005_960_464_5, 0.5],
+    [0.450_000_047_683_715_8, 0.275_000_005_960_464_5, 0.5],
+    [-0.450_000_017_881_393_43, -0.275_000_005_960_464_5, 0.5],
+    [-0.150_000_005_960_464_48, -0.275_000_005_960_464_5, 0.5],
+    [0.149_999_976_158_142_1, -0.275_000_005_960_464_5, 0.5],
+    [0.450_000_047_683_715_8, -0.275_000_005_960_464_5, 0.5],
+    [0.75, 0.275_000_005_960_464_5, 0.5],
+    [0.75, -0.275_000_005_960_464_5, 0.5],
+];
+const TOUCHING_EXACT_MACOS_EDGES: [[usize; 2]; 52] = [
+    [0, 1],
+    [0, 2],
+    [0, 4],
+    [0, 15],
+    [1, 3],
+    [1, 5],
+    [1, 20],
+    [2, 3],
+    [2, 6],
+    [2, 14],
+    [3, 7],
+    [4, 5],
+    [4, 6],
+    [5, 7],
+    [5, 31],
+    [6, 7],
+    [8, 10],
+    [8, 14],
+    [8, 22],
+    [9, 10],
+    [9, 11],
+    [9, 24],
+    [10, 23],
+    [11, 12],
+    [11, 25],
+    [12, 13],
+    [12, 30],
+    [13, 19],
+    [13, 31],
+    [14, 15],
+    [14, 21],
+    [15, 16],
+    [15, 20],
+    [16, 17],
+    [16, 26],
+    [17, 18],
+    [17, 27],
+    [18, 19],
+    [18, 28],
+    [19, 29],
+    [20, 21],
+    [20, 26],
+    [21, 22],
+    [22, 23],
+    [23, 24],
+    [24, 25],
+    [25, 30],
+    [26, 27],
+    [27, 28],
+    [28, 29],
+    [29, 31],
+    [30, 31],
+];
+const TOUCHING_EXACT_MACOS_FACES: [&[usize]; 20] = [
+    &[0, 1, 3, 2],
+    &[2, 3, 7, 6],
+    &[6, 7, 5, 4],
+    &[4, 5, 1, 0],
+    &[0, 2, 14, 15],
+    &[14, 2, 6, 4, 0, 15, 16, 17, 18, 19, 13, 12, 11, 9, 10, 8],
+    &[20, 1, 5, 31, 29, 28, 27, 26],
+    &[5, 7, 3, 1, 20, 21, 22, 23, 24, 25, 30, 31],
+    &[20, 15, 14, 21],
+    &[21, 14, 8, 22],
+    &[16, 15, 20, 26],
+    &[22, 8, 10, 23],
+    &[17, 16, 26, 27],
+    &[23, 10, 9, 24],
+    &[18, 17, 27, 28],
+    &[24, 9, 11, 25],
+    &[19, 18, 28, 29],
+    &[25, 11, 12, 30],
+    &[12, 13, 31, 30],
+    &[13, 19, 29, 31],
+];
+const TOUCHING_EXACT_LINUX_EDGES: [[usize; 2]; 52] = [
+    [0, 1],
+    [0, 2],
+    [0, 4],
+    [1, 3],
+    [1, 5],
+    [1, 20],
+    [2, 3],
+    [2, 6],
+    [3, 7],
+    [4, 5],
+    [4, 6],
+    [4, 13],
+    [5, 7],
+    [5, 31],
+    [6, 7],
+    [6, 12],
+    [8, 10],
+    [8, 14],
+    [8, 22],
+    [9, 10],
+    [9, 11],
+    [9, 24],
+    [10, 23],
+    [11, 12],
+    [11, 25],
+    [12, 13],
+    [12, 30],
+    [13, 19],
+    [13, 31],
+    [14, 15],
+    [14, 21],
+    [15, 16],
+    [15, 20],
+    [16, 17],
+    [16, 26],
+    [17, 18],
+    [17, 27],
+    [18, 19],
+    [18, 28],
+    [19, 29],
+    [20, 21],
+    [20, 26],
+    [21, 22],
+    [22, 23],
+    [23, 24],
+    [24, 25],
+    [25, 30],
+    [26, 27],
+    [27, 28],
+    [28, 29],
+    [29, 31],
+    [30, 31],
+];
+const TOUCHING_EXACT_LINUX_FACES: [&[usize]; 20] = [
+    &[0, 1, 3, 2],
+    &[2, 3, 7, 6],
+    &[6, 7, 5, 4],
+    &[4, 5, 1, 0],
+    &[12, 6, 4, 13],
+    &[13, 4, 0, 2, 6, 12, 11, 9, 10, 8, 14, 15, 16, 17, 18, 19],
+    &[20, 1, 5, 31, 29, 28, 27, 26],
+    &[5, 7, 3, 1, 20, 21, 22, 23, 24, 25, 30, 31],
+    &[20, 15, 14, 21],
+    &[21, 14, 8, 22],
+    &[16, 15, 20, 26],
+    &[22, 8, 10, 23],
+    &[17, 16, 26, 27],
+    &[23, 10, 9, 24],
+    &[18, 17, 27, 28],
+    &[24, 9, 11, 25],
+    &[19, 18, 28, 29],
+    &[25, 11, 12, 30],
+    &[12, 13, 31, 30],
+    &[13, 19, 29, 31],
+];
+const TOUCHING_EXACT_SIGNED_VOLUME: f64 = 7.174_999_951_695_4;
+
+/// The Blender results accepted for Touching, 5 boxes, EXACT: exactly the macOS and Linux results.
+fn touching_exact_observed_surfaces() -> Vec<Surface> {
+    let vertices: Vec<DVec3> = TOUCHING_EXACT_VERTICES
         .iter()
-        .map(|triangle| {
-            let first = surface.positions[triangle[0]];
-            let second = surface.positions[triangle[1]];
-            let third = surface.positions[triangle[2]];
-            first.dot(second.cross(third)) / 6.0
-        })
-        .sum::<f64>()
-        .abs()
+        .map(|point| DVec3::new(point[0], point[1], point[2]))
+        .collect();
+    [
+        (
+            TOUCHING_EXACT_MACOS_EDGES.as_slice(),
+            TOUCHING_EXACT_MACOS_FACES.as_slice(),
+        ),
+        (
+            TOUCHING_EXACT_LINUX_EDGES.as_slice(),
+            TOUCHING_EXACT_LINUX_FACES.as_slice(),
+        ),
+    ]
+    .into_iter()
+    .map(|(edges, faces)| Surface {
+        vertices: vertices.clone(),
+        edges: edges
+            .iter()
+            .map(|&[first, second]| [vertices[first], vertices[second]])
+            .collect(),
+        faces: faces
+            .iter()
+            .map(|ring| ring.iter().map(|&index| vertices[index]).collect())
+            .collect(),
+        signed_volume: TOUCHING_EXACT_SIGNED_VOLUME,
+    })
+    .collect()
 }
 
-fn point_triangle_distance_squared(point: DVec3, triangle: &[DVec3; 3]) -> f64 {
-    fn segment_distance_squared(point: DVec3, first: DVec3, second: DVec3) -> f64 {
-        let edge = second - first;
-        let length_squared = edge.length_squared();
-        let parameter = if length_squared > f64::MIN_POSITIVE {
-            ((point - first).dot(edge) / length_squared).clamp(0.0, 1.0)
-        } else {
-            0.0
+/// Recorded Blender results of the case whose result depends on the platform's sort (see the note
+/// above `TOUCHING_EXACT_VERTICES`). Empty for every other case.
+fn recorded_blender_variants(name: &str) -> Vec<Surface> {
+    if name == "ArrayHostTouchingEXACT" {
+        touching_exact_observed_surfaces()
+    } else {
+        Vec::new()
+    }
+}
+
+fn check_vertices(actual: &[DVec3], expected: &[DVec3], context: &str) -> Result<(), String> {
+    if actual.len() != expected.len() {
+        return Err(format!("{context}: vertex count"));
+    }
+    let mut unmatched = expected.to_vec();
+    for vertex in actual {
+        let Some(index) = unmatched
+            .iter()
+            .position(|candidate| same_point(*vertex, *candidate))
+        else {
+            return Err(format!("{context}: no Blender vertex matches {vertex:?}"));
         };
-        point.distance_squared(first + edge * parameter)
+        unmatched.swap_remove(index);
     }
-    let [a, b, c] = *triangle;
-    let ab = b - a;
-    let ac = c - a;
-    let normal = ab.cross(ac);
-    let normal_squared = normal.length_squared();
-    if normal_squared > f64::MIN_POSITIVE {
-        let projection = point - normal * (normal.dot(point - a) / normal_squared);
-        let projected = projection - a;
-        let d00 = ab.dot(ab);
-        let d01 = ab.dot(ac);
-        let d11 = ac.dot(ac);
-        let d20 = projected.dot(ab);
-        let d21 = projected.dot(ac);
-        let denominator = d00 * d11 - d01 * d01;
-        if denominator > f64::MIN_POSITIVE {
-            let u = (d11 * d20 - d01 * d21) / denominator;
-            let v = (d00 * d21 - d01 * d20) / denominator;
-            if u >= 0.0 && v >= 0.0 && u + v <= 1.0 {
-                return point.distance_squared(projection);
-            }
-        }
+    if unmatched.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("{context}: Blender has unmatched vertices"))
     }
-    segment_distance_squared(point, a, b)
-        .min(segment_distance_squared(point, b, c))
-        .min(segment_distance_squared(point, c, a))
 }
 
-fn triangles(surface: &Surface) -> Vec<[DVec3; 3]> {
-    surface
-        .triangles
-        .iter()
-        .map(|triangle| {
-            [
-                surface.positions[triangle[0]],
-                surface.positions[triangle[1]],
-                surface.positions[triangle[2]],
-            ]
+/// Edges match as ordered pairs: Blender's edge direction (v1 to v2) is part of the result.
+fn same_edge(actual: [DVec3; 2], expected: [DVec3; 2]) -> bool {
+    same_point(actual[0], expected[0]) && same_point(actual[1], expected[1])
+}
+
+fn check_edges(
+    actual: &[[DVec3; 2]],
+    expected: &[[DVec3; 2]],
+    context: &str,
+) -> Result<(), String> {
+    if actual.len() != expected.len() {
+        return Err(format!("{context}: edge count"));
+    }
+    let mut unmatched = expected.to_vec();
+    for edge in actual {
+        let Some(index) = unmatched
+            .iter()
+            .position(|candidate| same_edge(*edge, *candidate))
+        else {
+            return Err(format!("{context}: no Blender edge matches {edge:?}"));
+        };
+        unmatched.swap_remove(index);
+    }
+    if unmatched.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("{context}: Blender has unmatched edges"))
+    }
+}
+
+fn same_oriented_ring(actual: &[DVec3], expected: &[DVec3]) -> bool {
+    actual.len() == expected.len()
+        && (0..actual.len()).any(|start| {
+            (0..actual.len())
+                .all(|index| same_point(actual[index], expected[(start + index) % expected.len()]))
         })
-        .collect()
 }
 
-fn directed_surface_distance(source: &[[DVec3; 3]], target: &[[DVec3; 3]]) -> f64 {
-    const DIVISIONS: usize = 16;
-    let mut maximum = 0.0_f64;
-    for triangle in source {
-        for first_weight in 0..=DIVISIONS {
-            for second_weight in 0..=DIVISIONS - first_weight {
-                let first_weight = first_weight as f64 / DIVISIONS as f64;
-                let second_weight = second_weight as f64 / DIVISIONS as f64;
-                let point = triangle[0] * (1.0 - first_weight - second_weight)
-                    + triangle[1] * first_weight
-                    + triangle[2] * second_weight;
-                let nearest_squared = target
-                    .iter()
-                    .map(|candidate| point_triangle_distance_squared(point, candidate))
-                    .fold(f64::INFINITY, f64::min);
-                maximum = maximum.max(nearest_squared.sqrt());
-            }
-        }
+fn check_boolean_geometry(
+    actual: &Surface,
+    expected: &Surface,
+    context: &str,
+) -> Result<(), String> {
+    check_vertices(&actual.vertices, &expected.vertices, context)?;
+    check_edges(&actual.edges, &expected.edges, context)?;
+    if actual.faces.len() != expected.faces.len() {
+        return Err(format!("{context}: face count"));
     }
-    maximum
+
+    let mut unmatched = expected.faces.clone();
+    for face in &actual.faces {
+        let Some(index) = unmatched
+            .iter()
+            .position(|candidate| same_oriented_ring(face, candidate))
+        else {
+            return Err(format!(
+                "{context}: no Blender face matches oriented ring {face:?}"
+            ));
+        };
+        unmatched.swap_remove(index);
+    }
+    if !unmatched.is_empty() {
+        return Err(format!("{context}: Blender has unmatched faces"));
+    }
+
+    let volume_error = (actual.signed_volume - expected.signed_volume).abs();
+    let volume_tolerance = if expected.signed_volume.abs() <= 1.0e-9 {
+        1.0e-9
+    } else {
+        expected.signed_volume.abs() * 1.0e-6
+    };
+    if volume_error > volume_tolerance {
+        return Err(format!(
+            "{context}: signed volume {} differs from Blender {}",
+            actual.signed_volume, expected.signed_volume
+        ));
+    }
+    Ok(())
+}
+
+/// Accepts `actual` when it matches at least one entry of `expected`. Each entry is a complete
+/// Blender result, so the list is exactly the set of results accepted for the case.
+fn assert_boolean_geometry_any(actual: &Surface, expected: &[Surface], context: &str) {
+    let errors: Vec<String> = expected
+        .iter()
+        .filter_map(|candidate| check_boolean_geometry(actual, candidate, context).err())
+        .collect();
+    assert!(errors.len() < expected.len(), "{}", errors.join("\n"));
 }
 
 fn assert_boolean_geometry(actual: &Surface, expected: &Surface, context: &str) {
-    let (actual_manifold, actual_components) = topology(actual);
-    let (expected_manifold, expected_components) = topology(expected);
-    assert!(
-        actual_manifold,
-        "{context}: Potter result is not a closed oriented 2-manifold"
-    );
-    assert!(
-        expected_manifold,
-        "{context}: Blender result is not a closed oriented 2-manifold"
-    );
-    assert_eq!(
-        actual_components, expected_components,
-        "{context}: connected components"
-    );
-    let expected_volume = volume(expected);
-    let relative_volume_error = (volume(actual) - expected_volume).abs() / expected_volume;
-    assert!(
-        relative_volume_error <= 1.0e-6,
-        "{context}: relative volume error {relative_volume_error:.9e}"
-    );
-    let actual_triangles = triangles(actual);
-    let expected_triangles = triangles(expected);
-    let surface_error = directed_surface_distance(&actual_triangles, &expected_triangles).max(
-        directed_surface_distance(&expected_triangles, &actual_triangles),
-    );
-    assert!(
-        surface_error <= 1.0e-5,
-        "{context}: two-way surface distance {surface_error:.9e}"
-    );
+    assert_boolean_geometry_any(actual, std::slice::from_ref(expected), context);
 }
 
 #[test]
@@ -382,7 +656,7 @@ fn boolean_array_box_cutter_layouts_match_blender_for_exact_and_float() -> TestR
         "--blender",
         &blender_path,
     ])?;
-    assert_eq!(imported["result"]["losses"], serde_json::json!([]));
+    assert_eq!(imported["result"]["losses"], json!([]));
     let document: SceneDoc = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
 
     for (layout, count) in [("Separated", 2), ("Touching", 5), ("TopCoplanar", 6)] {
@@ -400,25 +674,200 @@ fn boolean_array_box_cutter_layouts_match_blender_for_exact_and_float() -> TestR
             for (id, node) in &mut boolean_only.nodes {
                 for modifier in &mut node.modifiers {
                     if modifier.modifier_type == "boolean" {
+                        // The fixture clears `show_viewport`/`show_render` on the EXACT hosts after
+                        // sampling Blender's expectation, so the target is restored to the state it was sampled in.
                         modifier.enabled = id == node_id;
+                        if id == node_id {
+                            modifier.show_viewport = true;
+                            modifier.show_render = true;
+                        }
                     }
                 }
             }
             let snapshot = Snapshot::evaluate(&boolean_only, &EvaluationContext::default())
                 .map_err(|error| std::io::Error::other(format!("{name}: {error}")))?;
+            let world = DMat4::from_cols_array(
+                &snapshot
+                    .nodes
+                    .get(node_id)
+                    .ok_or_else(|| format!("Potter has no evaluated node `{name}`"))?
+                    .world_matrix,
+            );
             let actual = surface_from_mesh(
                 snapshot
                     .meshes
                     .get(node_id)
                     .ok_or_else(|| format!("Potter did not evaluate `{name}`"))?,
+                world,
             )?;
-
-            assert_boolean_geometry(
+            // The live Blender sample is always a candidate. Recorded platform variants join it only
+            // when the live sample reproduces one of them.
+            let variants = recorded_blender_variants(&name);
+            let mut candidates = vec![expected_surface.clone()];
+            if !variants.is_empty() {
+                assert_boolean_geometry_any(
+                    &expected_surface,
+                    &variants,
+                    &format!("{layout}, {count} boxes, {solver}: live Blender sample"),
+                );
+                candidates.extend(variants);
+            }
+            assert_boolean_geometry_any(
                 &actual,
-                &expected_surface,
+                &candidates,
                 &format!("{layout}, {count} boxes, {solver}"),
             );
         }
     }
+
+    let float_name = "ArrayHostSeparatedFLOAT";
+    let float_id = document
+        .nodes
+        .iter()
+        .find(|(_, node)| node.name == float_name)
+        .map(|(id, _)| id)
+        .ok_or("Blender separated FLOAT host is missing")?;
+    let boolean_id = document.nodes[float_id]
+        .modifiers
+        .iter()
+        .find(|modifier| modifier.modifier_type == "boolean")
+        .map(|modifier| modifier.id.as_str().to_owned())
+        .ok_or("Blender separated FLOAT Boolean modifier is missing")?;
+    let batch = root.join("apply_float_boolean.json");
+    fs::write(
+        &batch,
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "base_revision": document.revision,
+            "operations": [{
+                "op": "modifier.apply",
+                "target": {"id": float_id.as_str()},
+                "modifier_id": boolean_id,
+            }]
+        }))?,
+    )?;
+    let batch_path = batch.to_str().ok_or("Apply batch path is not UTF-8")?;
+    run_pot(&["apply", project_path, "--file", batch_path])?;
+
+    let expected_surface = surface_from_blender(&expected[float_name])?;
+    let applied: SceneDoc = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
+    assert!(
+        applied.nodes[float_id]
+            .modifiers
+            .iter()
+            .all(|modifier| modifier.modifier_type != "boolean"),
+        "applying the FLOAT Boolean must remove its modifier"
+    );
+    let applied_snapshot = Snapshot::evaluate(&applied, &EvaluationContext::default())?;
+    let applied_world = DMat4::from_cols_array(
+        &applied_snapshot
+            .nodes
+            .get(float_id)
+            .ok_or("applied FLOAT host is missing from the evaluated scene")?
+            .world_matrix,
+    );
+    let applied_surface = surface_from_mesh(
+        applied_snapshot
+            .meshes
+            .get(float_id)
+            .ok_or("applied FLOAT host has no evaluated mesh")?,
+        applied_world,
+    )?;
+    assert_boolean_geometry(&applied_surface, &expected_surface, "applied FLOAT Boolean");
+
+    let preview = root.join("preview");
+    let preview_path = preview.to_str().ok_or("Preview path is not UTF-8")?;
+    run_pot(&[
+        "preview",
+        project_path,
+        "--views",
+        "top",
+        "--size",
+        "64",
+        "--out",
+        preview_path,
+    ])?;
+    assert!(
+        preview.join("top.png").is_file(),
+        "preview image was not written"
+    );
+
+    let render_dir = root.join("render");
+    let render_path = render_dir.to_str().ok_or("Render path is not UTF-8")?;
+    let rendered = run_pot(&[
+        "render",
+        project_path,
+        "--engine",
+        "path",
+        "--format",
+        "png",
+        "--out",
+        render_path,
+    ])?;
+    let frame_path = rendered["result"]["frames"][0]["path"]
+        .as_str()
+        .ok_or("rendered frame path is missing")?;
+    assert!(std::path::Path::new(frame_path).is_file());
+
+    let exported_blend = root.join("applied_float.blend");
+    let exported_blend_path = exported_blend.to_str().ok_or("Export path is not UTF-8")?;
+    run_pot(&[
+        "export",
+        project_path,
+        "--format",
+        "blend",
+        "--out",
+        exported_blend_path,
+        "--blender",
+        &blender_path,
+    ])?;
+    let reopened_project = root.join("reopened");
+    let reopened_path = reopened_project
+        .to_str()
+        .ok_or("Reopened project path is not UTF-8")?;
+    run_pot(&["init", reopened_path])?;
+    let reopened = run_pot(&[
+        "import",
+        reopened_path,
+        "--file",
+        exported_blend_path,
+        "--format",
+        "blend",
+        "--mode",
+        "replace",
+        "--base-revision",
+        "0",
+        "--blender",
+        &blender_path,
+    ])?;
+    assert_eq!(reopened["result"]["losses"], json!([]));
+    let reopened_doc: SceneDoc =
+        serde_json::from_slice(&fs::read(reopened_project.join("scene.json"))?)?;
+    let reopened_id = reopened_doc
+        .nodes
+        .iter()
+        .find(|(_, node)| node.name == float_name)
+        .map(|(id, _)| id)
+        .ok_or("reopened FLOAT host is missing")?;
+    let reopened_snapshot = Snapshot::evaluate(&reopened_doc, &EvaluationContext::default())?;
+    let reopened_world = DMat4::from_cols_array(
+        &reopened_snapshot
+            .nodes
+            .get(reopened_id)
+            .ok_or("reopened FLOAT host is missing from the evaluated scene")?
+            .world_matrix,
+    );
+    let reopened_surface = surface_from_mesh(
+        reopened_snapshot
+            .meshes
+            .get(reopened_id)
+            .ok_or("reopened FLOAT host has no evaluated mesh")?,
+        reopened_world,
+    )?;
+    assert_boolean_geometry(
+        &reopened_surface,
+        &expected_surface,
+        "reopened FLOAT export",
+    );
     Ok(())
 }

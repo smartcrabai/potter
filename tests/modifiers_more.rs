@@ -3,9 +3,10 @@
     reason = "integration tests use concise assertions"
 )]
 
-use glam::{DQuat, DVec3, EulerRot};
+use glam::{DMat4, DQuat, DVec3, EulerRot};
+use potter_core::error::ErrorCode;
 use potter_core::geom::{
-    BoxParams, CylinderParams, Mesh, boolean::boolean_mesh, modifiers::evaluate_modifiers,
+    BoxParams, CylinderParams, Mesh, boolean::BooleanOperand, modifiers::evaluate_modifiers,
 };
 use potter_core::model::{Id, Modifier};
 use proptest::prelude::*;
@@ -23,6 +24,25 @@ fn modifier(modifier_type: &str, params: Value) -> Modifier {
         binding_data: None,
         runtime: potter_core::model::ModifierRuntime::default(),
     }
+}
+
+/// Evaluates a FLOAT Boolean modifier with its scene-resolved mesh operands.
+fn float_boolean(subject: &Mesh, operands: &[Mesh], operation: &str) -> Mesh {
+    let mut boolean = modifier(
+        "boolean",
+        json!({"solver": "FLOAT", "operation": operation}),
+    );
+    boolean.runtime.boolean_operands = operands
+        .iter()
+        .cloned()
+        .map(|mesh| BooleanOperand {
+            mesh,
+            to_subject: DMat4::IDENTITY,
+            float_flip: None,
+            material_remap: Vec::new(),
+        })
+        .collect();
+    evaluate_modifiers(subject, &[boolean], "Cube").unwrap()
 }
 
 fn signed_volume(mesh: &Mesh) -> f64 {
@@ -118,22 +138,81 @@ fn canonical_geometry(mesh: &Mesh) -> CanonicalGeometry {
 }
 
 #[test]
-fn boolean_difference_of_overlapping_boxes_has_analytic_volume() {
+fn boolean_float_without_scene_operand_is_identity() {
     let source = Mesh::box_mesh(BoxParams::default()).unwrap();
-    let mut operand = Mesh::box_mesh(BoxParams {
-        size: DVec3::splat(1.0),
-    })
+    let result = evaluate_modifiers(
+        &source,
+        &[modifier(
+            "boolean",
+            json!({"solver": "FLOAT", "operation": "DIFFERENCE"}),
+        )],
+        "Cube",
+    )
     .unwrap();
+    assert_eq!(canonical_geometry(&result), canonical_geometry(&source));
+}
+
+#[test]
+fn boolean_float_difference_matches_blender_offset_box_parity() {
+    let source = Mesh::from_positions_and_faces(
+        vec![
+            DVec3::new(-1.0, -1.0, -1.0),
+            DVec3::new(1.0, -1.0, -1.0),
+            DVec3::new(1.0, 1.0, -1.0),
+            DVec3::new(-1.0, 1.0, -1.0),
+            DVec3::new(-1.0, -1.0, 1.0),
+            DVec3::new(1.0, -1.0, 1.0),
+            DVec3::new(1.0, 1.0, 1.0),
+            DVec3::new(-1.0, 1.0, 1.0),
+        ],
+        vec![
+            vec![0, 3, 2, 1],
+            vec![4, 5, 6, 7],
+            vec![0, 1, 5, 4],
+            vec![2, 3, 7, 6],
+            vec![0, 4, 7, 3],
+            vec![1, 2, 6, 5],
+        ],
+    )
+    .unwrap();
+    let mut operand = source.clone();
     for vertex in &mut operand.vertices {
-        vertex.co += DVec3::new(0.5, 0.25, -0.25);
+        vertex.co += DVec3::new(1.5, 0.5, 1.0);
     }
-    let result = boolean_mesh(&source, &operand, "DIFFERENCE").unwrap();
-    assert!((signed_volume(&result) - 7.0).abs() < 1.0e-8);
+    let result = float_boolean(&source, &[operand], "DIFFERENCE");
+    assert_eq!(result.vertices.len(), 14);
+    assert_eq!(result.edges.len(), 21);
+    assert_eq!(result.faces.len(), 9);
+    assert!((signed_volume(&result) - 7.25).abs() <= 1.0e-5);
     assert!(result.validate().is_ok());
 }
 
 #[test]
-fn boolean_difference_of_box_and_tilted_cylinder_has_closed_bore() {
+fn boolean_float_empty_material_remap_preserves_source_indices() {
+    let subject = Mesh::box_mesh(BoxParams::default()).unwrap();
+    let mut operand = subject.clone();
+    for vertex in &mut operand.vertices {
+        vertex.co += DVec3::new(0.0, 10.0, 0.0);
+    }
+    for face in &mut operand.faces {
+        face.material_index = 1;
+    }
+    let operand_faces = operand.faces.len();
+
+    let result = float_boolean(&subject, &[operand], "UNION");
+
+    assert_eq!(
+        result
+            .faces
+            .iter()
+            .filter(|face| face.material_index == 1)
+            .count(),
+        operand_faces
+    );
+}
+
+#[test]
+fn boolean_float_difference_of_box_and_tilted_cylinder_has_closed_bore() {
     let source = Mesh::box_mesh(BoxParams {
         size: DVec3::splat(1.8),
     })
@@ -155,7 +234,7 @@ fn boolean_difference_of_box_and_tilted_cylinder_has_closed_bore() {
         vertex.co = rotation * vertex.co;
     }
 
-    let result = boolean_mesh(&source, &operand, "DIFFERENCE").unwrap();
+    let result = float_boolean(&source, &[operand], "DIFFERENCE");
     let volume = signed_volume(&result);
     assert!(result.validate().is_ok());
     assert!(volume > 0.0 && volume < signed_volume(&source) - 0.1);
@@ -165,7 +244,7 @@ proptest! {
     #![proptest_config(ProptestConfig { cases: 32, .. ProptestConfig::default() })]
 
     #[test]
-    fn boolean_union_of_overlapping_boxes_is_watertight(
+    fn boolean_float_union_of_overlapping_boxes_is_watertight(
         x in -0.75_f64..0.75,
         y in -0.75_f64..0.75,
         z in -0.75_f64..0.75,
@@ -176,10 +255,10 @@ proptest! {
         for vertex in &mut operand.vertices {
             vertex.co += DVec3::new(x, y, z);
         }
-        let result = boolean_mesh(&source, &operand, "UNION").unwrap();
+        let result = float_boolean(&source, &[operand], "UNION");
         prop_assert!(result.validate().is_ok());
         prop_assert!(edge_face_counts(&result).values().all(|count| *count == 2));
-        prop_assert!((signed_volume(&result) - (8.0 + size.powi(3) - intersection_volume(size, x, y, z))).abs() < 1.0e-7);
+        prop_assert!((signed_volume(&result) - (8.0 + size.powi(3) - intersection_volume(size, x, y, z))).abs() < 2.0e-5);
     }
 }
 
@@ -210,6 +289,7 @@ fn screw_revolves_a_profile_into_a_closed_cylinder() {
                 "axis": "Z",
             }),
         )],
+        "Cube",
     )
     .unwrap();
     assert_eq!(result.vertices.len(), 32);
@@ -229,6 +309,7 @@ fn simple_deform_zero_angle_is_identity() {
                 "angle": 0.0,
             }),
         )],
+        "Cube",
     )
     .unwrap();
     assert_eq!(result, source);
@@ -316,7 +397,7 @@ fn cast_defaults_and_limits_match_blender_on_uneven_and_zero_geometry() {
     ];
     let uneven = cast_uneven_cube();
     // `{}` is the schema default: SPHERE, factor 0.5, radius 0, size 0, use_radius_as_size true.
-    let sphere = evaluate_modifiers(&uneven, &[modifier("cast", json!({}))]).unwrap();
+    let sphere = evaluate_modifiers(&uneven, &[modifier("cast", json!({}))], "Cube").unwrap();
     assert_cast_positions(&sphere, UNEVEN_SPHERE_DEFAULT, "uneven sphere default");
     let cuboid = evaluate_modifiers(
         &uneven,
@@ -324,12 +405,14 @@ fn cast_defaults_and_limits_match_blender_on_uneven_and_zero_geometry() {
             "cast",
             json!({"cast_type": "CUBOID", "use_radius_as_size": false, "size": 1.5}),
         )],
+        "Cube",
     )
     .unwrap();
     assert_cast_positions(&cuboid, UNEVEN_CUBOID_SIZE, "uneven cuboid size 1.5");
     let cylinder = evaluate_modifiers(
         &uneven,
         &[modifier("cast", json!({"cast_type": "CYLINDER"}))],
+        "Cube",
     )
     .unwrap();
     assert_cast_positions(
@@ -341,15 +424,19 @@ fn cast_defaults_and_limits_match_blender_on_uneven_and_zero_geometry() {
     let limited = evaluate_modifiers(
         &uneven,
         &[modifier("cast", json!({"factor": 0.5, "radius": 1.2}))],
+        "Cube",
     )
     .unwrap();
     assert_cast_positions(&limited, UNEVEN_SOURCE, "uneven radius limit");
     // All-zero geometry: the automatic sphere/cylinder size is 10 and the cuboid bounds are zero.
     let zero = Mesh::from_positions_and_faces(vec![DVec3::ZERO; 8], cast_cube_faces()).unwrap();
     for cast_type in ["SPHERE", "CUBOID", "CYLINDER"] {
-        let result =
-            evaluate_modifiers(&zero, &[modifier("cast", json!({"cast_type": cast_type}))])
-                .unwrap();
+        let result = evaluate_modifiers(
+            &zero,
+            &[modifier("cast", json!({"cast_type": cast_type}))],
+            "Cube",
+        )
+        .unwrap();
         assert_cast_positions(&result, [[0.0; 3]; 8], cast_type);
     }
 }
@@ -360,6 +447,7 @@ fn modifier_parameter_errors_include_a_json_pointer() {
     let error = evaluate_modifiers(
         &source,
         &[modifier("simple_deform", json!({"angle": "invalid"}))],
+        "Cube",
     )
     .unwrap_err();
     assert_eq!(error.details["pointer"], "/params/angle");
@@ -378,6 +466,7 @@ fn mask_drops_faces_that_use_vertices_outside_the_group() {
     let result = evaluate_modifiers(
         &source,
         &[modifier("mask", json!({"vertex_group":"handle"}))],
+        "Cube",
     )
     .unwrap();
     assert!(result.faces.is_empty(), "{:?}", result.faces);
@@ -443,13 +532,158 @@ fn boolean_modifier_apply_resolves_scene_object_operand() -> Result<(), Box<dyn 
     );
     Ok(())
 }
+
+#[test]
+fn multires_levels_are_bounded_by_the_stored_top_level_and_budget() {
+    let source = Mesh::box_mesh(BoxParams::default()).unwrap();
+    let clamped = evaluate_modifiers(
+        &source,
+        &[modifier(
+            "multires",
+            json!({"levels": 6, "total_levels": 1}),
+        )],
+        "Cube",
+    )
+    .unwrap();
+    assert_eq!(clamped.faces.len(), 24);
+    assert_eq!(clamped.vertices.len(), 26);
+    let multires_level_six = evaluate_modifiers(
+        &source,
+        &[modifier(
+            "multires",
+            json!({"levels": 6, "total_levels": 6}),
+        )],
+        "Cube",
+    )
+    .unwrap();
+    assert_eq!(multires_level_six.faces.len(), 24_576);
+    assert_eq!(multires_level_six.vertices.len(), 24_578);
+    let resource_limited = evaluate_modifiers(
+        &source,
+        &[modifier(
+            "multires",
+            json!({"levels": 11, "total_levels": 11}),
+        )],
+        "Cube",
+    )
+    .unwrap_err();
+    assert_eq!(resource_limited.code, ErrorCode::LimitExceeded);
+}
+
+#[test]
+fn custom_normals_follow_blender_per_modifier_type() {
+    let source = Mesh::box_mesh(BoxParams::default()).unwrap();
+    let mut sharp_only = source.clone();
+    sharp_only.attributes.insert(
+        "blender_edge_flags".to_owned(),
+        Value::Array(
+            (0..sharp_only.edges.len())
+                .map(|_| json!({"sharp": true, "seam": false}))
+                .collect(),
+        ),
+    );
+
+    let mut mixed_sharp = source.clone();
+    let mut edge_flags = (0..mixed_sharp.edges.len())
+        .map(|_| json!({"sharp": false, "seam": false}))
+        .collect::<Vec<_>>();
+    edge_flags[0] = json!({"sharp": true, "seam": false});
+    mixed_sharp
+        .attributes
+        .insert("blender_edge_flags".to_owned(), Value::Array(edge_flags));
+    let mixed_result = evaluate_modifiers(
+        &mixed_sharp,
+        &[modifier(
+            "multires",
+            json!({"levels": 1, "use_custom_normals": true}),
+        )],
+        "Cube",
+    )
+    .unwrap();
+    // Blender 5.2.2 (tests/fixtures/custom_normal_presence): Multires with Use Custom Normals on writes a layer
+    // only when the input has one, so sharp edges alone leave it out.
+    assert!(
+        !mixed_result.attributes.contains_key("custom_normal"),
+        "multires with mixed sharp inputs and no custom-normal layer writes no custom normals, as Blender does"
+    );
+    // Blender 5.2.2: a Subdivision Surface with Use Custom Normals on writes a layer even with no input layer.
+    let subdivision_mixed = evaluate_modifiers(
+        &mixed_sharp,
+        &[modifier(
+            "subdivision",
+            json!({"levels": 1, "use_custom_normals": true}),
+        )],
+        "Cube",
+    )
+    .unwrap();
+    assert!(
+        subdivision_mixed.attributes.contains_key("custom_normal"),
+        "subdivision with Use Custom Normals on writes custom normals, as Blender does"
+    );
+    let subdivision_off = evaluate_modifiers(
+        &mixed_sharp,
+        &[modifier(
+            "subdivision",
+            json!({"levels": 1, "use_custom_normals": false}),
+        )],
+        "Cube",
+    )
+    .unwrap();
+    assert!(!subdivision_off.attributes.contains_key("custom_normal"));
+    let sharp_result = evaluate_modifiers(
+        &sharp_only,
+        &[modifier(
+            "multires",
+            json!({"levels": 1, "use_custom_normals": true}),
+        )],
+        "Cube",
+    )
+    .unwrap();
+    assert!(!sharp_result.attributes.contains_key("custom_normal"));
+
+    let mut with_layer = source;
+    let values = with_layer
+        .faces
+        .iter()
+        .map(|face| {
+            (
+                format!("f{}", face.id),
+                json!(vec![[8192_i32, 0]; face.vertices.len()]),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    with_layer.attributes.insert(
+        "custom_normal".to_owned(),
+        json!({"domain": "corner", "type": "normal_code", "values": values}),
+    );
+    let enabled = evaluate_modifiers(
+        &with_layer,
+        &[modifier(
+            "multires",
+            json!({"levels": 1, "use_custom_normals": true}),
+        )],
+        "Cube",
+    )
+    .unwrap();
+    assert!(enabled.attributes.contains_key("custom_normal"));
+    let disabled = evaluate_modifiers(
+        &with_layer,
+        &[modifier(
+            "multires",
+            json!({"levels": 1, "use_custom_normals": false}),
+        )],
+        "Cube",
+    )
+    .unwrap();
+    assert!(!disabled.attributes.contains_key("custom_normal"));
+}
 #[test]
 fn skin_modifier_builds_a_closed_profile_around_skeleton_edges() {
     let mut line = Mesh::new();
     let first = line.insert_vertex(DVec3::ZERO).unwrap();
     let second = line.insert_vertex(DVec3::Z).unwrap();
     line.insert_edge([first, second]).unwrap();
-    let result = evaluate_modifiers(&line, &[modifier("skin", json!({}))]).unwrap();
+    let result = evaluate_modifiers(&line, &[modifier("skin", json!({}))], "Cube").unwrap();
     assert_eq!(result.vertices.len(), 16);
     assert_eq!(result.faces.len(), 14);
     assert!(edge_face_counts(&result).values().all(|count| *count == 2));
@@ -482,7 +716,8 @@ fn numeric_identity_settings_preserve_mesh_topology_and_positions() {
     ];
 
     for (modifier_type, params) in cases {
-        let result = evaluate_modifiers(&source, &[modifier(modifier_type, params)]).unwrap();
+        let result =
+            evaluate_modifiers(&source, &[modifier(modifier_type, params)], "Cube").unwrap();
         assert_eq!(
             canonical_geometry(&result),
             source_geometry,
@@ -490,8 +725,12 @@ fn numeric_identity_settings_preserve_mesh_topology_and_positions() {
         );
     }
 
-    let zero_thickness_solidify =
-        evaluate_modifiers(&source, &[modifier("solidify", json!({"thickness":0.0}))]).unwrap();
+    let zero_thickness_solidify = evaluate_modifiers(
+        &source,
+        &[modifier("solidify", json!({"thickness":0.0}))],
+        "Cube",
+    )
+    .unwrap();
     let solidified_geometry = canonical_geometry(&zero_thickness_solidify);
     assert_eq!(zero_thickness_solidify.vertices.len(), 16);
     assert_eq!(zero_thickness_solidify.edges.len(), 24);
@@ -517,6 +756,7 @@ fn mask_threshold_uses_a_strict_weight_cutoff() {
             "mask",
             json!({"vertex_group":"region","threshold":0.5}),
         )],
+        "Cube",
     )
     .unwrap();
     let excluded = evaluate_modifiers(
@@ -525,6 +765,7 @@ fn mask_threshold_uses_a_strict_weight_cutoff() {
             "mask",
             json!({"vertex_group":"region","threshold":0.75}),
         )],
+        "Cube",
     )
     .unwrap();
     assert_eq!(retained.faces.len(), 1);
@@ -548,6 +789,7 @@ fn mirror_merge_threshold_merges_vertices_within_tolerance() {
             "mirror",
             json!({"use_axis":[true,false,false],"use_mirror_merge":true,"merge_threshold":0.001}),
         )],
+        "Cube",
     )
     .unwrap();
 
@@ -557,6 +799,7 @@ fn mirror_merge_threshold_merges_vertices_within_tolerance() {
             "mirror",
             json!({"use_axis":[true,false,false],"use_mirror_merge":true,"merge_threshold":0.0005}),
         )],
+        "Cube",
     )
     .unwrap();
     assert_eq!(outside.vertices.len(), 6);
@@ -566,6 +809,7 @@ fn mirror_merge_threshold_merges_vertices_within_tolerance() {
             "mirror",
             json!({"use_axis":[true,false,false],"use_mirror_merge":false,"merge_threshold":0.001}),
         )],
+        "Cube",
     )
     .unwrap();
     assert_eq!(merged.vertices.len(), 5);
@@ -585,7 +829,7 @@ fn skin_vertex_radii_set_cross_section_bounds() {
             "1":[0.5,0.25]
         }),
     );
-    let result = evaluate_modifiers(&line, &[modifier("skin", json!({}))]).unwrap();
+    let result = evaluate_modifiers(&line, &[modifier("skin", json!({}))], "Cube").unwrap();
     let bounds = result.bounds().unwrap();
     assert!((bounds.min.x + 0.5).abs() < 1.0e-12);
     assert!((bounds.max.x - 0.5).abs() < 1.0e-12);
@@ -655,7 +899,8 @@ fn simple_deform_methods_match_blender_vertex_positions() {
     ];
 
     for (method, params, expected) in cases {
-        let result = evaluate_modifiers(&source, &[modifier("simple_deform", params)]).unwrap();
+        let result =
+            evaluate_modifiers(&source, &[modifier("simple_deform", params)], "Cube").unwrap();
         for (vertex_id, position) in [
             (origin, expected[0]),
             (end, expected[1]),
@@ -687,6 +932,7 @@ fn screw_offset_extends_the_profile_along_its_axis() {
                 "axis":"Z"
             }),
         )],
+        "Cube",
     )
     .unwrap();
     assert_eq!(result.vertices.len(), 10);

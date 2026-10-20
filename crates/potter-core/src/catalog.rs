@@ -76,6 +76,41 @@ pub fn feature_catalog() -> Value {
             [true, false, true, true, false, false, true],
         ),
         unsupported(
+            "shader.principled.subsurface",
+            "Principled subsurface scattering",
+            "ShaderNodeBsdfPrincipled",
+            &["material.create", "material.update"],
+            "Potter's lobe model does not evaluate subsurface scattering; a render with Subsurface Weight above zero reports UNSUPPORTED_FEATURE.",
+        ),
+        unsupported(
+            "shader.principled.anisotropic",
+            "Principled anisotropic highlight",
+            "ShaderNodeBsdfPrincipled",
+            &["material.create", "material.update"],
+            "Potter's GGX lobe is isotropic; a render with Anisotropic above zero reports UNSUPPORTED_FEATURE.",
+        ),
+        unsupported(
+            "shader.principled.thin_film",
+            "Principled thin film",
+            "ShaderNodeBsdfPrincipled",
+            &["material.create", "material.update"],
+            "Potter does not evaluate thin-film interference; a render with Thin Film Thickness above zero reports UNSUPPORTED_FEATURE.",
+        ),
+        unsupported(
+            "shader.principled.diffuse_roughness",
+            "Principled diffuse roughness",
+            "ShaderNodeBsdfPrincipled",
+            &["material.create", "material.update"],
+            "Potter's diffuse lobe is Lambert; Cycles' Oren-Nayar roughness is not evaluated, so a render with Diffuse Roughness above zero reports UNSUPPORTED_FEATURE.",
+        ),
+        unsupported(
+            "shader.principled.thin_wall",
+            "Principled thin wall",
+            "ShaderNodeBsdfPrincipled",
+            &["material.create", "material.update"],
+            "Potter does not evaluate Thin Wall; a render with Thin Wall enabled reports UNSUPPORTED_FEATURE.",
+        ),
+        unsupported(
             "shader.advanced",
             "Other Blender shader nodes",
             "ShaderNodeTree",
@@ -94,6 +129,21 @@ pub fn feature_catalog() -> Value {
                 "material.update",
             ],
             [true, true, true, true, true, false, false],
+        ),
+        unsupported(
+            "shader.volume.spectral_extinction",
+            "Voxel volume with per-channel extinction",
+            "ShaderNodeVolumeAbsorption, ShaderNodeVolumeScatter, ShaderNodeVolumePrincipled",
+            &[
+                "volume.create",
+                "volume.update",
+                "material.create",
+                "material.update",
+                "graph.create",
+                "graph.node_add",
+                "graph.link",
+            ],
+            "Voxel volumes transport a grey extinction (the channel mean of the material's per-channel extinction) with a per-channel albedo, so a Volume whose Absorption or Scatter colour is not grey reports UNSUPPORTED_FEATURE and its colour is approximated. Material volumes on closed meshes transmit each channel exactly; their in-scatter is a single-scatter approximation.",
         ),
         supported(
             "render.volume.scattering",
@@ -481,13 +531,6 @@ pub fn feature_catalog() -> Value {
             &["modifier.create"],
             "harden_normals (any input) and mark_sharp on an input with sharp edges are evaluated only for one-segment EDGES bevels; other segment counts or VERTICES bevels with those settings are refused.",
         ),
-        unsupported(
-            "modifier.mirror.bisect",
-            "Mirror bisect on a mirrored axis",
-            "MIRROR",
-            &["modifier.create"],
-            "Blender cuts a mirrored axis at its plane when use_bisect_axis is set on that axis; Potter does not build the cut, so such a mirror is refused. Bisect on an unmirrored axis changes nothing in Blender and is evaluated.",
-        ),
         supported(
             "modifier.decimate",
             "Decimate modifier",
@@ -525,17 +568,10 @@ pub fn feature_catalog() -> Value {
                 [true, true, true, true, true, false, false],
             );
             row["reason"] = json!(
-                "EXACT is the default solver and ports Blender 5.2 Mesh Arrangements: closed and open operands; one N-ary call over an object or collection operand, in Blender's order; use_self; use_hole_tolerant; material INDEX or TRANSFER with empty slots kept as null slots; attributes per Blender (FACE, EDGE and CORNER from the source operand, cut corners interpolated, POINT as in modifier.boolean.exact_point_attribute_local_index, new points take the default value). Open operands and results that are not PWN after intersection use Blender's non-PWN ray fallback, where use_hole_tolerant selects per-triangle or per-patch classification. An unset OBJECT operand is a no-op, and an empty COLLECTION only removes self-intersections. Still limited: MANIFOLD is refused (modifier.boolean.solver_manifold); FLOAT is the pre-PR17 BSP shortcut until PR17b (modifier.boolean.solver_float); the downstream topology refusal (modifier.boolean.downstream_topology) applies to every solver until PR17b; double_threshold is FLOAT-only; debug_options are not read (Blender reads them only under its G.debug flag)."
+                "EXACT is the default solver and ports Blender 5.2 Mesh Arrangements: closed and open operands; one N-ary call over an object or collection operand, in Blender's order; use_self; use_hole_tolerant; material INDEX or TRANSFER with empty slots kept as null slots; attributes per Blender (FACE, EDGE and CORNER from the source operand, cut corners interpolated, POINT as in modifier.boolean.exact_point_attribute_local_index, new points take the default value). Open operands and results that are not PWN after intersection use Blender's non-PWN ray fallback, where use_hole_tolerant selects per-triangle or per-patch classification. An unset OBJECT operand is a no-op, and an empty COLLECTION only removes self-intersections. Still limited: MANIFOLD is refused (modifier.boolean.solver_manifold); FLOAT is a separate solver (modifier.boolean.solver_float); double_threshold is FLOAT-only; debug_options are not read (Blender reads them only under its G.debug flag)."
             );
             row
         },
-        unsupported(
-            "modifier.boolean.downstream_topology",
-            "Boolean output followed by a topology-dependent modifier",
-            "BOOLEAN",
-            &[],
-            "Refused for every Boolean solver (EXACT and FLOAT) until PR17b. A topology-dependent modifier after a Boolean, or a Boolean applied ahead of one, reports this feature. FLOAT output topology still differs from Blender's FLOAT solver, and the refusal is lifted only together with the FLOAT port, so the EXACT solver alone does not lift it.",
-        ),
         unsupported(
             "modifier.boolean.solver_manifold",
             "Boolean MANIFOLD solver",
@@ -543,13 +579,19 @@ pub fn feature_catalog() -> Value {
             &["modifier.create", "modifier.apply"],
             "Blender's MANIFOLD solver is not implemented; the modifier refuses it with UnsupportedFeature.",
         ),
-        unsupported(
-            "modifier.boolean.solver_float",
-            "Boolean FLOAT solver parity",
-            "BOOLEAN",
-            &["modifier.create", "modifier.apply"],
-            "FLOAT runs the pre-PR17 BSP shortcut, not Blender's float path. Touching, coplanar, and self-overlapping operands, and INTERSECT with a collection, differ from Blender in topology and volume until PR17b. double_threshold is FLOAT-only, as in Blender's float path.",
-        ),
+        {
+            let mut row = supported(
+                "modifier.boolean.solver_float",
+                "Boolean FLOAT solver parity",
+                "BOOLEAN",
+                &["modifier.create", "modifier.apply"],
+                [true, true, true, true, true, false, false],
+            );
+            row["reason"] = json!(
+                "FLOAT ports Blender's float32 BMesh intersection solver (`geom/boolean/float.rs`) and evaluates the Boolean, reading `double_threshold` as Blender's float path does. Collection INTERSECT and empty collection operands are refused, as in Blender. Gated against Blender 5.2.2 by blend_boolean_parity (the FLOAT corpus rows), blend_boolean_float_regressions (boundary, attribute, and double_threshold cases), blend_boolean_array (FLOAT array layouts, applying one, and reopening), and blend_boolean_stack (FLOAT Boolean followed by Decimate and Solidify). Topology after other modifiers is not verified against Blender."
+            );
+            row
+        },
         unsupported(
             "modifier.boolean.exact_point_attribute_local_index",
             "Boolean EXACT point attributes read the local vertex index",
@@ -1721,7 +1763,7 @@ pub fn feature_catalog() -> Value {
         ),
         supported(
             "camera.data",
-            "Perspective, orthographic, panorama, and fisheye camera data",
+            "Perspective, orthographic, and panorama camera data",
             "Camera",
             &["camera.create", "camera.update"],
             [true, true, true, true, true, false, false],
@@ -1735,7 +1777,7 @@ pub fn feature_catalog() -> Value {
         ),
         supported(
             "camera.panorama",
-            "Equirectangular and equidistant fisheye projections",
+            "Equirectangular panoramas with longitude and latitude limits, and fisheye equidistant and equisolid projections",
             "Camera",
             &["camera.create", "camera.update"],
             [true, true, true, true, true, false, false],
@@ -1854,7 +1896,7 @@ pub fn feature_catalog() -> Value {
         ),
         supported(
             "color_management",
-            "Standard, AgX, Filmic, Raw, and False Color scene display transforms matching Blender 5.2.2 OCIO on sRGB",
+            "Standard, AgX, Filmic, Raw, and False Color scene display transforms matching Blender 5.2.2 OCIO on sRGB, with an optional view curve (Blender's CurveMapping: point handles, extend, clip, black and white levels, tone, and per-channel R, G, B curves)",
             "ColorManagement",
             &["color.update"],
             [false, true, true, true, true, false, false],
@@ -1864,7 +1906,7 @@ pub fn feature_catalog() -> Value {
             "Arbitrary OpenColorIO configurations, displays, and views",
             "ColorManagement",
             &[],
-            "The renderer supports only the five fixed built-in transforms on the sRGB display, not arbitrary OCIO profiles, other displays, or looks.",
+            "The renderer supports Blender 5.2.2's five built-in views on the sRGB display and their compatible looks (the AgX, False Color, and Filmic looks). Arbitrary OCIO profiles, other displays, and ACES views and looks are not supported.",
         ),
         supported(
             "tracking",

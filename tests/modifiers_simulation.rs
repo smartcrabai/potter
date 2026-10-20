@@ -1925,16 +1925,16 @@ with open(os.path.join(root, 'cloth_stack.json'), 'w', encoding='utf-8') as outp
         &json!([
             {"op":"node.create","id":"a_subdivision_first","kind":"plane","params":{}},
             {"op":"mesh.transform_elements","target":{"id":"a_subdivision_first"},"elements":{"domain":"vertex","ids":["v1"]},"translation":[0.0,0.0,0.4]},
-            {"op":"mesh.transform_elements","target":{"id":"a_subdivision_first"},"elements":{"domain":"vertex","ids":["v2"]},"translation":[0.0,0.0,-0.2]},
+            {"op":"mesh.transform_elements","target":{"id":"a_subdivision_first"},"elements":{"domain":"vertex","ids":["v3"]},"translation":[0.0,0.0,-0.2]},
             {"op":"vertex_group.create","target":{"id":"a_subdivision_first"},"id":"pin","name":"Pin"},
-            {"op":"vertex_group.assign","target":{"id":"a_subdivision_first"},"group_id":"pin","weights":[{"vertex_id":0,"weight":1.0},{"vertex_id":3,"weight":1.0}]},
+            {"op":"vertex_group.assign","target":{"id":"a_subdivision_first"},"group_id":"pin","weights":[{"vertex_id":0,"weight":1.0},{"vertex_id":2,"weight":1.0}]},
             {"op":"modifier.create","target":{"id":"a_subdivision_first"},"id":"subd","type":"subdivision","params":{"levels":1}},
             {"op":"physics.cloth.create","target":{"id":"a_subdivision_first"},"settings":{"vertex_group_mass":"Pin","quality":1,"tension_stiffness":12.0,"compression_stiffness":12.0,"mass":1.0,"air_damping":0.01,"shear_stiffness":5.0,"bending_stiffness":0.5}},
             {"op":"node.create","id":"b_cloth_first","kind":"plane","params":{}},
             {"op":"mesh.transform_elements","target":{"id":"b_cloth_first"},"elements":{"domain":"vertex","ids":["v1"]},"translation":[0.0,0.0,0.4]},
-            {"op":"mesh.transform_elements","target":{"id":"b_cloth_first"},"elements":{"domain":"vertex","ids":["v2"]},"translation":[0.0,0.0,-0.2]},
+            {"op":"mesh.transform_elements","target":{"id":"b_cloth_first"},"elements":{"domain":"vertex","ids":["v3"]},"translation":[0.0,0.0,-0.2]},
             {"op":"vertex_group.create","target":{"id":"b_cloth_first"},"id":"pin","name":"Pin"},
-            {"op":"vertex_group.assign","target":{"id":"b_cloth_first"},"group_id":"pin","weights":[{"vertex_id":0,"weight":1.0},{"vertex_id":3,"weight":1.0}]},
+            {"op":"vertex_group.assign","target":{"id":"b_cloth_first"},"group_id":"pin","weights":[{"vertex_id":0,"weight":1.0},{"vertex_id":2,"weight":1.0}]},
             {"op":"physics.cloth.create","target":{"id":"b_cloth_first"},"settings":{"vertex_group_mass":"Pin","quality":1,"tension_stiffness":12.0,"compression_stiffness":12.0,"mass":1.0,"air_damping":0.01,"shear_stiffness":5.0,"bending_stiffness":0.5}},
             {"op":"modifier.create","target":{"id":"b_cloth_first"},"id":"subd","type":"subdivision","params":{"levels":1}}
         ]),
@@ -2418,11 +2418,15 @@ baseline_evaluated.to_mesh_clear()
         })
         .collect::<Vec<_>>();
     let image = potter_core::image::ImageData {
+        colour: potter_core::image::ColourCache::default(),
+        storage: potter_core::image::ImageStorage::default(),
         width: 4,
         height: 3,
         pixels,
         tiles: std::collections::BTreeMap::new(),
         interpolation: potter_core::image::ImageInterpolation::Linear,
+        srgb: false,
+        udim: false,
     };
     let mapping_columns: [f64; 16] =
         serde_json::from_value(blender_expected["mapping_world"].clone())?;

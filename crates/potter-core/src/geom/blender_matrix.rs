@@ -173,7 +173,7 @@ fn blender_mul_m3(a: &BlenderMat3, b: &BlenderMat3) -> BlenderMat3 {
 /// `b[j][2] * a[2][k]` and `b[j][3] * a[3][k]`. The four products are summed in pairs,
 /// `(p0 + p1) + (p2 + p3)`: the association the Blender arm64 build produces, checked bit for bit
 /// against the parent-inverse products of `BKE_object_where_is_calc`.
-fn blender_mul_m4(a: &BlenderMat4, b: &BlenderMat4) -> BlenderMat4 {
+pub(crate) fn blender_mul_m4(a: &BlenderMat4, b: &BlenderMat4) -> BlenderMat4 {
     let mut result = [[0.0_f32; 4]; 4];
     for (j, column) in result.iter_mut().enumerate() {
         for (k, value) in column.iter_mut().enumerate() {
@@ -254,16 +254,43 @@ fn object_to_world(
     let parent_inverse = node
         .parent_inverse
         .map_or(DMat4::IDENTITY, |values| DMat4::from_cols_array(&values));
-    let local = node.transform.matrix();
-    // The composition `rig::evaluate_world_matrices` uses for this node.
-    let expected = match &node.parent {
-        Some(parent_id) => *world_matrices.get(parent_id)? * parent_inverse * local,
-        None => parent_inverse * local,
+    let world = *world_matrices.get(node_id)?;
+    let parent_space = match &node.parent {
+        Some(parent_id) => Some(*world_matrices.get(parent_id)?),
+        None => None,
     };
-    if !same_matrix(expected, *world_matrices.get(node_id)?, 1e-9) {
+    // A current captured `matrix_basis` is the local matrix the rig composes (`rig.rs`), in f32.
+    // Without it the local matrix is the f64 TRS, compared at f64 precision.
+    let captured_basis = node.captured_matrix_basis(&node.transform).ok()?;
+    let (expected, own, captured) = if let Some(basis) = captured_basis {
+        let local = blender_matrix_from_f64(DMat4::from_cols_array(&basis));
+        let composed = match parent_space {
+            Some(parent) => blender_mul_m4(
+                &blender_mul_m4(
+                    &blender_matrix_from_f64(parent),
+                    &blender_matrix_from_f64(parent_inverse),
+                ),
+                &local,
+            ),
+            None => local,
+        };
+        (dmat4_from_blender(&composed), local, true)
+    } else {
+        let local = node.transform.matrix();
+        let expected = match parent_space {
+            Some(parent) => parent * parent_inverse * local,
+            None => parent_inverse * local,
+        };
+        if !same_matrix(expected, world, 1e-9) {
+            return None;
+        }
+        (world, blender_transform_matrix(&node.transform)?, false)
+    };
+    // The captured composition is the rig's own f32 arithmetic on the same operands, so it must be
+    // bit-identical to the evaluated world matrix; any constraint or animation breaks that.
+    if !same_matrix(expected, world, 0.0) {
         return None;
     }
-    let own = blender_transform_matrix(&node.transform)?;
     match &node.parent {
         Some(parent_id) => {
             let parent = object_to_world(doc, parent_id, world_matrices, depth + 1)?;
@@ -272,8 +299,8 @@ fn object_to_world(
             Some(blender_mul_m4(&blender_mul_m4(&parent, &inverse), &own))
         }
         // Blender ignores the parent inverse of an unparented object, so keep the f64 path if one
-        // is set.
-        None => (parent_inverse == DMat4::IDENTITY).then_some(own),
+        // is set. A captured root is composed without it, as the rig does.
+        None => (parent_inverse == DMat4::IDENTITY || captured).then_some(own),
     }
 }
 
@@ -423,12 +450,12 @@ fn blender_invert_m4(matrix: &BlenderMat4) -> Option<BlenderMat4> {
 }
 
 /// Quantizes an f64 matrix to Blender's f32 `float[4][4]`.
-fn blender_matrix_from_f64(matrix: DMat4) -> BlenderMat4 {
+pub(crate) fn blender_matrix_from_f64(matrix: DMat4) -> BlenderMat4 {
     std::array::from_fn(|column| std::array::from_fn(|row| matrix.col(column)[row] as f32))
 }
 
 /// Blender's f32 matrix as an f64 matrix; every entry is exact.
-fn dmat4_from_blender(matrix: &BlenderMat4) -> DMat4 {
+pub(crate) fn dmat4_from_blender(matrix: &BlenderMat4) -> DMat4 {
     let columns: [f64; 16] = std::array::from_fn(|index| f64::from(matrix[index / 4][index % 4]));
     DMat4::from_cols_array(&columns)
 }
@@ -458,12 +485,22 @@ pub(crate) fn operand_to_subject(
     Some(dmat4_from_blender(&blender_mul_m4(&inverse, &object)))
 }
 
-/// Blender `mul_m4_v3` on a column-major f32 matrix: transforms `point` as a position.
-pub(crate) fn blender_transform_point_f32(matrix: &[f32; 16], point: glam::Vec3) -> glam::Vec3 {
+/// Blender `is_negative_m4`: sign of the upper 3x3 determinant after the f32 matrix boundary.
+pub(crate) fn is_negative_m4(matrix: DMat4) -> bool {
+    let matrix = matrix.to_cols_array().map(|value| value as f32);
+    let determinant = matrix[0] * (matrix[5] * matrix[10] - matrix[6] * matrix[9])
+        - matrix[4] * (matrix[1] * matrix[10] - matrix[2] * matrix[9])
+        + matrix[8] * (matrix[1] * matrix[6] - matrix[2] * matrix[5]);
+    determinant < 0.0
+}
+
+/// Blender `mul_m4_v3` on an f32 `float[4][4]` stored column-major: transforms `point` as a
+/// position, with the translation in the fourth column.
+pub(crate) fn blender_transform_point_f32(transform: &[f32; 16], point: glam::Vec3) -> glam::Vec3 {
     glam::Vec3::new(
-        point.x * matrix[0] + point.y * matrix[4] + matrix[8] * point.z + matrix[12],
-        point.x * matrix[1] + point.y * matrix[5] + matrix[9] * point.z + matrix[13],
-        point.x * matrix[2] + point.y * matrix[6] + matrix[10] * point.z + matrix[14],
+        point.x * transform[0] + point.y * transform[4] + transform[8] * point.z + transform[12],
+        point.x * transform[1] + point.y * transform[5] + transform[9] * point.z + transform[13],
+        point.x * transform[2] + point.y * transform[6] + transform[10] * point.z + transform[14],
     )
 }
 
