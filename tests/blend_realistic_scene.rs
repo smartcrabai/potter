@@ -15,10 +15,7 @@ use tempfile::tempdir;
 const SCENE_BUILDER: &str = include_str!("fixtures/blend_realistic_scene.py");
 const SCENE_DUMPER: &str = include_str!("fixtures/blend_realistic_scene_dump.py");
 const FRAME_TOLERANCE: f64 = 1.0e-5;
-const GATED_OBJECTS: [&str; 2] = [
-    "Gear_Array_Bevel_Subdivision_Normal",
-    "Housing_Boolean_Decimate_Solidify",
-];
+const GATED_OBJECTS: [&str; 1] = ["Gear_Array_Bevel_Subdivision_Normal"];
 
 fn checked_output(mut command: Command, label: &str) -> Result<Output, Box<dyn Error>> {
     let output = command.output()?;
@@ -72,19 +69,17 @@ fn import_blend(
     Ok(serde_json::from_slice(&output.stdout)?)
 }
 
-fn inspect_node(project: &Path, id: &str, frame: u32) -> Result<Value, Box<dyn Error>> {
+fn inspect_scene(project: &Path, frame: u32) -> Result<Value, Box<dyn Error>> {
     let output = Command::new(env!("CARGO_BIN_EXE_pot"))
         .arg("inspect")
         .arg(project)
-        .args(["--id"])
-        .arg(id)
-        .args(["--frame"])
+        .arg("--frame")
         .arg(frame.to_string())
         .arg("--json")
         .output()?;
     if !output.status.success() {
         return Err(io::Error::other(format!(
-            "inspecting `{id}` at frame {frame} failed: stdout={} stderr={}",
+            "inspecting frame {frame} failed: stdout={} stderr={}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         ))
@@ -384,17 +379,26 @@ fn assert_import_inspection(
         .collect::<Vec<_>>();
     let actual_names = ids.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>();
     assert_eq!(actual_names, expected_names, "imported object set differs");
-    for (name, id) in ids {
-        if GATED_OBJECTS.contains(&name.as_str()) {
-            continue;
-        }
-        for frame in [1_u32, 5, 10] {
-            let inspected = inspect_node(project, &id, frame)?;
-            let item = inspected["result"]["items"]
-                .as_array()
-                .and_then(|items| items.first())
+    for frame in [1_u32, 5, 10] {
+        let inspected = inspect_scene(project, frame)?;
+        let items = inspected["result"]["items"]
+            .as_array()
+            .ok_or_else(|| io::Error::other(format!("frame {frame}: inspect items missing")))?;
+        for (name, id) in &ids {
+            if GATED_OBJECTS.contains(&name.as_str()) {
+                continue;
+            }
+            let item = items
+                .iter()
+                .find(|candidate| candidate["id"].as_str() == Some(id.as_str()))
                 .ok_or_else(|| io::Error::other(format!("{name}: inspect item missing")))?;
-            let frame_data = &source["frames"][frame.to_string()][&name];
+            if let Some(error) = item.get("evaluation_error") {
+                return Err(io::Error::other(format!(
+                    "{name} frame {frame}: evaluation failed: {error}"
+                ))
+                .into());
+            }
+            let frame_data = &source["frames"][frame.to_string()][name.as_str()];
             let expected_matrix = matrix_from_blender(&frame_data["matrix_world"])?;
             let actual_matrix = item["transform"]["world"]["matrix"]
                 .as_array()
@@ -606,7 +610,6 @@ fn realistic_blender_scene_import_export_reopen_preserves_settings_and_evaluatio
         .ok_or("render error lacks feature_id")?;
     let expected_object = match feature {
         "modifier.bevel.high_valence_vertex_mesh" => GATED_OBJECTS[0],
-        "modifier.boolean.downstream_topology" => GATED_OBJECTS[1],
         _ => return Err(format!("unexpected render feature {feature}").into()),
     };
     let node_id = details["node_id"]
@@ -629,7 +632,7 @@ fn realistic_blender_scene_import_export_reopen_preserves_settings_and_evaluatio
     )?;
     assert_modifier_reference(
         &document,
-        GATED_OBJECTS[1],
+        "Housing_Boolean_Decimate_Solidify",
         "01 | exact through-bore",
         "object",
         "Housing_Bore_Cutter",
@@ -649,12 +652,6 @@ fn realistic_blender_scene_import_export_reopen_preserves_settings_and_evaluatio
         &document,
         GATED_OBJECTS[0],
         "modifier.bevel.high_valence_vertex_mesh",
-    )?;
-    assert_gated_feature_error(
-        &project,
-        &document,
-        GATED_OBJECTS[1],
-        "modifier.boolean.downstream_topology",
     )?;
 
     let lossy_project = root.join("allow-lossy-project");
@@ -779,5 +776,6 @@ fn realistic_blender_scene_import_export_reopen_preserves_settings_and_evaluatio
             }
         }
     }
+
     Ok(())
 }

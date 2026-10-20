@@ -105,7 +105,7 @@ impl Rake {
 
 /// Blender's `math::AxisAngle(from, to)` for unit vectors: the axis and angle that turn `from`
 /// onto `to`.
-fn between(from: DVec3, to: DVec3) -> (DVec3, f64) {
+pub(super) fn between(from: DVec3, to: DVec3) -> (DVec3, f64) {
     let cos = from.dot(to);
     let cross = from.cross(to);
     let sin = cross.length();
