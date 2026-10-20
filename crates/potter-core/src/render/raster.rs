@@ -319,6 +319,41 @@ pub(crate) struct SurfaceHit {
 /// Linear RGBA at `hit` on `triangle`.
 pub(crate) trait SurfaceShader {
     fn shade(&self, triangle: &Triangle, hit: &SurfaceHit) -> Result<[f64; 4]>;
+
+    /// Whether every hit is shaded, flat triangles included. Workbench's studio lighting depends
+    /// on the view ray at each pixel, so flat faces cannot take a colour baked per triangle.
+    fn shades_every_hit(&self) -> bool {
+        false
+    }
+}
+
+/// The camera's view axes in world space, in Blender's view-space order: `right`, `up`, and
+/// `backward` (toward the viewer). Workbench's studio lights are fixed in this space.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ViewBasis {
+    right: DVec3,
+    up: DVec3,
+    backward: DVec3,
+}
+
+impl ViewBasis {
+    pub(crate) fn from_camera(camera: &Camera) -> Result<Self> {
+        let (forward, right, up) = view_axes(camera)?;
+        Ok(Self {
+            right,
+            up,
+            backward: -forward,
+        })
+    }
+
+    /// `direction`, given in world space, expressed in view space.
+    pub(crate) fn to_view(self, direction: DVec3) -> DVec3 {
+        DVec3::new(
+            direction.dot(self.right),
+            direction.dot(self.up),
+            direction.dot(self.backward),
+        )
+    }
 }
 
 /// Shadow-ray origin for a hit on a smooth triangle, after Hanika's shadow-terminator offset
@@ -1108,6 +1143,21 @@ fn pixel_in_bounds(width: u32, height: u32, x: u32, y: u32) -> bool {
     width != 0 && height != 0 && x < width && y < height
 }
 
+/// The camera's `forward`, `right`, and `up` directions in world space, from its position, target
+/// and up hint.
+fn view_axes(camera: &Camera) -> Result<(DVec3, DVec3, DVec3)> {
+    let forward = safe_normalize(camera.target - camera.position)
+        .ok_or_else(|| PotError::invalid_argument("camera position and target must differ"))?;
+    let up_hint = safe_normalize(camera.up)
+        .ok_or_else(|| PotError::invalid_argument("camera up vector must be non-zero"))?;
+    let right = safe_normalize(forward.cross(up_hint)).ok_or_else(|| {
+        PotError::invalid_argument("camera up vector must not be parallel to its view direction")
+    })?;
+    let up = safe_normalize(right.cross(forward))
+        .ok_or_else(|| PotError::invalid_argument("camera orientation is invalid"))?;
+    Ok((forward, right, up))
+}
+
 fn camera_frame(camera: &Camera, width: u32, height: u32) -> Result<CameraFrame> {
     if width == 0 || height == 0 {
         return Err(PotError::invalid_argument(
@@ -1140,15 +1190,7 @@ fn camera_frame(camera: &Camera, width: u32, height: u32) -> Result<CameraFrame>
         return Err(PotError::invalid_argument("camera parameters are invalid"));
     }
 
-    let forward = safe_normalize(camera.target - camera.position)
-        .ok_or_else(|| PotError::invalid_argument("camera position and target must differ"))?;
-    let up_hint = safe_normalize(camera.up)
-        .ok_or_else(|| PotError::invalid_argument("camera up vector must be non-zero"))?;
-    let right = safe_normalize(forward.cross(up_hint)).ok_or_else(|| {
-        PotError::invalid_argument("camera up vector must not be parallel to its view direction")
-    })?;
-    let up = safe_normalize(right.cross(forward))
-        .ok_or_else(|| PotError::invalid_argument("camera orientation is invalid"))?;
+    let (forward, right, up) = view_axes(camera)?;
 
     let projection = match camera.projection {
         Projection::Orthographic {
@@ -1544,7 +1586,11 @@ fn hit_color(
     shader: Option<&dyn SurfaceShader>,
 ) -> Result<[f64; 4]> {
     match shader {
-        Some(shader) if triangle.source.normals.is_some() || triangle.source.lit_per_pixel => {
+        Some(shader)
+            if shader.shades_every_hit()
+                || triangle.source.normals.is_some()
+                || triangle.source.lit_per_pixel =>
+        {
             let point = ray.origin + ray.direction * hit.distance;
             let surface = SurfaceHit {
                 point,
