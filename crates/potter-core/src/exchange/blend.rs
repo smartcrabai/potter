@@ -17834,7 +17834,7 @@ mod workbench_display_loss_tests {
 
     #[test]
     fn factory_shading_reports_nothing() {
-        assert!(losses(&[]).is_empty());
+        assert_eq!(losses(&[]), Vec::<&str>::new());
     }
 
     #[test]
@@ -17843,12 +17843,15 @@ mod workbench_display_loss_tests {
             losses(&[("show_xray", json!(true))]),
             ["blender.scene.display_xray"]
         );
-        assert!(losses(&[("show_xray", json!(true)), ("xray_alpha", json!(1.0))]).is_empty());
+        assert_eq!(
+            losses(&[("show_xray", json!(true)), ("xray_alpha", json!(1.0))]),
+            Vec::<&str>::new()
+        );
     }
 
     #[test]
     fn depth_of_field_is_reported_only_when_the_camera_has_it() {
-        assert!(losses(&[("use_dof", json!(true))]).is_empty());
+        assert_eq!(losses(&[("use_dof", json!(true))]), Vec::<&str>::new());
         assert_eq!(
             losses(&[("use_dof", json!(true)), ("camera_dof", json!(true))]),
             ["blender.scene.display_dof"]
@@ -17862,9 +17865,12 @@ mod workbench_display_loss_tests {
             ["blender.scene.display_type"]
         );
         for shading_type in ["SOLID", "MATERIAL", "RENDERED"] {
-            assert!(losses(&[("type", json!(shading_type))]).is_empty());
+            assert_eq!(losses(&[("type", json!(shading_type))]), Vec::<&str>::new());
         }
-        assert!(losses(&[("background_type", json!("WORLD"))]).is_empty());
+        assert_eq!(
+            losses(&[("background_type", json!("WORLD"))]),
+            Vec::<&str>::new()
+        );
         assert_eq!(
             losses(&[("background_type", json!("VIEWPORT"))]),
             ["blender.scene.display_background"]
