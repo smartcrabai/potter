@@ -2410,9 +2410,8 @@ fn graph_is_transparent(group: &NodeGroup, output: &Id) -> bool {
             "ShaderNodeBsdfPrincipled" => {
                 linked(id, "Alpha")
                     || node.inputs.get("Alpha").is_some_and(|value| {
-                        // Blender's `alpha != 1.0`, written as the two strict tests the exact-float lint allows.
-                        let alpha = number(value, 1.0);
-                        alpha < 1.0 || alpha > 1.0
+                        // Blender's `alpha != 1.0`. `number` never yields a NaN, and `total_cmp` is exact for 1.0.
+                        number(value, 1.0).total_cmp(&1.0).is_ne()
                     })
             }
             _ => false,
