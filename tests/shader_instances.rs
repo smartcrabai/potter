@@ -485,6 +485,8 @@ fn material_texture_refs_sample_uv_and_override_pbr_fields_for_graphs() {
     let (mut material, groups) = material_with_graph(graph);
     let graph_id = material.node_tree.clone().unwrap();
     material.node_tree = None;
+    // Texture alpha is part of a non-opaque material's alpha (Blender links the base texture's Alpha only then).
+    material.alpha_mode = "blend".to_owned();
     material.base_color = [0.5, 0.25, 0.75, 1.0];
     material.metallic = 0.5;
     material.roughness = 0.8;
@@ -532,6 +534,12 @@ fn material_texture_refs_sample_uv_and_override_pbr_fields_for_graphs() {
     assert_eq!(warnings.borrow().len(), 1);
     assert_eq!(warnings.borrow()[0]["code"], json!("uv.layer_missing"));
     assert_eq!(warnings.borrow()[0]["layer"], json!("missing_uv"));
+    // An opaque material leaves its base texture's alpha unlinked, so Cycles renders it opaque
+    // (probed in Blender 5.2.2: an unlinked RGBA texture gives alpha 1, linked gives 0.5).
+    material.alpha_mode = "opaque".to_owned();
+    material.base_color_texture.as_mut().unwrap().uv_layer = Some("UVMap".to_owned());
+    let opaque = evaluate_surface(&material, &context).unwrap();
+    assert_eq!(opaque.alpha, 1.0);
 }
 
 fn uv_map_material(layer: &str) -> (Material, Registry<NodeGroup>) {
