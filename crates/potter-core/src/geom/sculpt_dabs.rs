@@ -24,12 +24,17 @@ use glam::{DVec2, DVec3};
 use super::sculpt::{DabBrush, Falloff, Stroke, StrokeSample};
 use crate::geom::Mesh;
 
+mod boundary;
 mod crease_pinch;
 mod elastic;
 mod grab;
 mod offset;
 mod plane;
+mod pose;
 mod smooth;
+mod topology;
+
+use topology::Topology;
 
 /// Clay Strips `plane_offset` default: the plane sits this many radii above the area center.
 const CLAY_STRIPS_PLANE_OFFSET: f64 = 0.15;
@@ -55,13 +60,13 @@ struct Field {
     normals: Vec<DVec3>,
     /// `1 - mask` per vertex (Blender's `fill_factor_from_hide_and_mask`).
     mask_factors: Vec<f64>,
-    /// Blender's interior neighbors per vertex (`vertex_neighbors`), sorted; empty when Blender has none.
-    neighbors: Vec<Vec<usize>>,
     /// Layer's per-vertex displacement factor, accumulated across the stroke.
     displacement: Vec<f64>,
     falloff: Falloff,
     /// Blender's symmetry passes as per-axis sign vectors; pass 0 is the unflipped brush.
     passes: Vec<DVec3>,
+    /// The passes' mirror axes: -1 on each mirrored axis, 1 elsewhere (see `mirror_axes`).
+    mirror: DVec3,
     /// Unit vector toward the viewer. Blender's area normal groups normals by it, and the grab
     /// delta lies on the plane perpendicular to it. `None` means Potter has no view.
     view: Option<DVec3>,
@@ -70,6 +75,12 @@ struct Field {
     /// Whether a Smooth call has already run this stroke (`smooth::smooth_dab` reads the first call
     /// from its start positions).
     smooth_started: bool,
+    /// Blender's vertex rings and boundary flags, in Blender's order, for Pose and Boundary.
+    topology: Topology,
+    /// Pose's inverse-kinematics chain, built by the stroke's first dab.
+    pose: pose::State,
+    /// Boundary's loop and its propagation, found by the stroke's first dab.
+    boundary: boundary::State,
 }
 
 /// One dab's values as Blender's `StrokeCache` holds them, before any symmetry pass.
@@ -108,6 +119,7 @@ pub(super) fn apply_dabs(
     masks: &BTreeMap<u32, f64>,
 ) -> bool {
     let passes = symmetry_passes(symmetry_mask(&stroke.symmetry));
+    let mirror = mirror_axes(&passes);
     let original: Vec<DVec3> = mesh.vertices.iter().map(|vertex| vertex.co).collect();
     let index: BTreeMap<u32, usize> = mesh
         .vertices
@@ -131,13 +143,16 @@ pub(super) fn apply_dabs(
                     .clamp(0.0, 1.0)
             })
             .collect(),
-        neighbors: vertex_neighbors(mesh, &index),
+        topology: Topology::new(mesh, &index),
         displacement: vec![0.0; mesh.vertices.len()],
         falloff: stroke.falloff,
         passes,
+        mirror,
         view: stroke.view.map(DVec3::normalize),
         grab: grab::State::default(),
         smooth_started: false,
+        pose: pose::State::default(),
+        boundary: boundary::State::default(),
     };
     // Blender's `need_delta_from_anchored_origin` brushes measure every dab from the stroke's
     // first dab, which also becomes the dab center (`brush_delta_update`, sculpt.cc 4277-4312).
@@ -200,6 +215,8 @@ fn apply_dab(field: &mut Field, dab: DabBrush, input: &DabInput) {
             grab::apply(field, dab, input);
         }
         DabBrush::Elastic => elastic::apply(field, dab, input),
+        DabBrush::Pose(deform) => pose::apply(field, deform, input),
+        DabBrush::Boundary(deform) => boundary::apply(field, deform, input),
     }
 }
 
@@ -237,7 +254,11 @@ fn brush_strength(brush: DabBrush, sample: &StrokeSample, feather: f64) -> f64 {
         | DabBrush::Scrape
         | DabBrush::Rotate
         | DabBrush::Thumb => alpha * pressure * feather,
-        DabBrush::Grab | DabBrush::SnakeHook | DabBrush::Elastic => root_alpha * feather,
+        DabBrush::Grab
+        | DabBrush::SnakeHook
+        | DabBrush::Elastic
+        | DabBrush::Pose(_)
+        | DabBrush::Boundary(_) => root_alpha * feather,
     }
 }
 
@@ -255,16 +276,28 @@ fn brush_flip(brush: DabBrush) -> f64 {
 /// Whether the brush's `use_pressure_strength` is on in the Blender 5.2.2 essentials asset. When it
 /// is off, Blender's `brush_strength` sees pressure 1.
 fn uses_pressure_strength(brush: DabBrush) -> bool {
-    !matches!(brush, DabBrush::Grab | DabBrush::Thumb | DabBrush::Elastic)
+    !matches!(
+        brush,
+        DabBrush::Grab
+            | DabBrush::Thumb
+            | DabBrush::Elastic
+            | DabBrush::Pose(_)
+            | DabBrush::Boundary(_)
+    )
 }
 
 /// Brushes whose dabs measure from the stroke's first dab (`need_delta_from_anchored_origin`,
 /// sculpt.cc 4170-4190; Rotate's `cache->location` stays pinned to the first dab, sculpt.cc
-/// 5831-5837). Pose and Boundary, which share the first rule, are not dab brushes here.
+/// 5831-5837). Pose and Boundary share this rule (sculpt.cc 4180-4181).
 fn anchors_to_stroke_start(brush: DabBrush) -> bool {
     matches!(
         brush,
-        DabBrush::Grab | DabBrush::Thumb | DabBrush::Elastic | DabBrush::Rotate
+        DabBrush::Grab
+            | DabBrush::Thumb
+            | DabBrush::Elastic
+            | DabBrush::Rotate
+            | DabBrush::Pose(_)
+            | DabBrush::Boundary(_)
     )
 }
 
@@ -284,6 +317,55 @@ fn grab_on_view_plane(delta: DVec3, view: Option<DVec3>) -> DVec3 {
         Some(view) => delta - view * delta.dot(view),
         None => delta,
     }
+}
+
+/// The vertex nearest `point`, the lowest index winning ties. Blender takes the active vertex from
+/// the ray cast under the cursor, which is this vertex when the stroke starts on the mesh.
+fn nearest_vertex(positions: &[DVec3], point: DVec3) -> usize {
+    let mut best = 0;
+    let mut best_distance = f64::INFINITY;
+    for (index, position) in positions.iter().enumerate() {
+        let distance = position.distance_squared(point);
+        if distance < best_distance {
+            best = index;
+            best_distance = distance;
+        }
+    }
+    best
+}
+
+/// Blender's `nearest_vert_calc_mesh` (`sculpt.cc` 729) for a mesh that is one PBVH leaf: the
+/// nearest vertex, provided the mesh's bounds lie within `max_distance` of `location`. Blender tests
+/// the nodes the sphere touches (`node_in_sphere`: the squared distance to the clamped bounds is
+/// below `max_distance²`) and takes the nearest vertex among them, with no per-vertex distance
+/// test. A leaf holds at most 2500 faces (`pbvh.cc` 316), so this is Blender's result for meshes up
+/// to that size. Larger meshes split into several leaves that Potter does not model; see the
+/// known gaps in `docs/spec.md`.
+fn nearest_in_sphere(positions: &[DVec3], location: DVec3, max_distance: f64) -> Option<usize> {
+    if positions.is_empty() {
+        return None;
+    }
+    let (min, max) = positions
+        .iter()
+        .fold((DVec3::INFINITY, DVec3::NEG_INFINITY), |(low, high), p| {
+            (low.min(*p), high.max(*p))
+        });
+    let bounds_distance_sq = location.distance_squared(location.clamp(min, max));
+    (bounds_distance_sq < max_distance * max_distance).then(|| nearest_vertex(positions, location))
+}
+
+/// The mirror axes of the symmetry passes as one vector: -1 on each mirrored axis, 1 elsewhere.
+fn mirror_axes(passes: &[DVec3]) -> DVec3 {
+    passes.iter().fold(DVec3::ONE, |axes, pass| axes.min(*pass))
+}
+
+/// Blender's `check_vertex_pivot_symmetry` (`sculpt.cc` 671) over the mirror axes: `co` lies on the
+/// pivot's side of every mirrored axis. A pivot on the plane admits only the non-positive side.
+pub(super) fn pivot_symmetry(co: DVec3, pivot: DVec3, mirror: DVec3) -> bool {
+    (0..3).all(|axis| {
+        mirror[axis] > 0.0
+            || (co[axis] * pivot[axis] >= 0.0 && !(pivot[axis] == 0.0 && co[axis] > 0.0))
+    })
 }
 
 /// Blender's `symm` bit mask for the stroke's mirror axes: X = 1, Y = 2, Z = 4. `validate_stroke`
@@ -330,69 +412,6 @@ fn symmetry_feather(center: DVec3, radius: f64, passes: &[DVec3]) -> f64 {
         })
         .sum();
     1.0 / overlap
-}
-
-/// Blender's `calc_vert_neighbors_interior` (`sculpt.cc` 8092) over the whole mesh: the two corners
-/// next to a vertex in each face (`append_neighbors_to_vector`, `sculpt.cc` 554). Boundary
-/// vertices (endpoints of edges used by fewer than two faces, loose edges included;
-/// `create_boundary_info`, `sculpt.cc` 598) keep only boundary-edge neighbors, and none when they
-/// have exactly two (a corner).
-fn vertex_neighbors(mesh: &Mesh, index: &BTreeMap<u32, usize>) -> Vec<Vec<usize>> {
-    let key = |a: u32, b: u32| if a <= b { (a, b) } else { (b, a) };
-    let mut face_uses: BTreeMap<(u32, u32), usize> = mesh
-        .edges
-        .iter()
-        .map(|edge| (key(edge.vertices[0], edge.vertices[1]), 0))
-        .collect();
-    let mut around: Vec<Vec<u32>> = vec![Vec::new(); mesh.vertices.len()];
-    for face in &mesh.faces {
-        let corners = &face.vertices;
-        let count = corners.len();
-        for corner in 0..count {
-            let vert = corners[corner];
-            let next = corners[(corner + 1) % count];
-            let prev = corners[(corner + count - 1) % count];
-            *face_uses.entry(key(vert, next)).or_insert(0) += 1;
-            if let Some(&i) = index.get(&vert) {
-                around[i].extend([prev, next]);
-            }
-        }
-    }
-    let mut boundary = vec![false; mesh.vertices.len()];
-    for edge in &mesh.edges {
-        if face_uses
-            .get(&key(edge.vertices[0], edge.vertices[1]))
-            .is_some_and(|&uses| uses < 2)
-        {
-            for id in edge.vertices {
-                if let Some(&i) = index.get(&id) {
-                    boundary[i] = true;
-                }
-            }
-        }
-    }
-    let mut neighbors = vec![Vec::new(); mesh.vertices.len()];
-    for (i, vertex) in mesh.vertices.iter().enumerate() {
-        let mut ids = std::mem::take(&mut around[i]);
-        ids.sort_unstable();
-        ids.dedup();
-        if boundary[i] && ids.len() == 2 {
-            continue;
-        }
-        let mut list: Vec<usize> = ids
-            .iter()
-            .filter(|&&id| {
-                !boundary[i]
-                    || face_uses
-                        .get(&key(vertex.id, id))
-                        .is_some_and(|&uses| uses < 2)
-            })
-            .filter_map(|id| index.get(id).copied())
-            .collect();
-        list.sort_unstable();
-        neighbors[i] = list;
-    }
-    neighbors
 }
 
 /// Blender's `calc_area_normal` for the AREA plane: the area normal within `normal_radius` of

@@ -1,4 +1,9 @@
-use std::{collections::HashMap, error::Error, fs, process::Command};
+use std::{
+    collections::{HashMap, HashSet},
+    error::Error,
+    fs,
+    process::Command,
+};
 
 #[path = "common/blender_file.rs"]
 mod blender_file;
@@ -6,17 +11,19 @@ use blender_file::blender_executable;
 
 use glam::DVec3;
 use potter_core::{
-    error::ErrorCode,
     eval::{EvaluationContext, Snapshot},
     geom::Mesh,
     model::{Id, SceneDoc},
 };
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tempfile::tempdir;
 
 type TestResult<T> = Result<T, Box<dyn Error>>;
 
 const BLENDER_REQUIRED: &str = "Blender is required for the Boolean stack parity test: install Blender 5.2, or set POTTER_BLENDER to its executable";
+
+const WEIGHT_TOLERANCE: f64 = 1.0e-6;
+const POSITION_TOLERANCE: f64 = 1.0e-5;
 
 const BOOLEAN_STACK_FIXTURE: &str = r#"
 import bpy
@@ -38,6 +45,16 @@ def sample(owner):
             "positions": [[float(vertex.co.x), float(vertex.co.y), float(vertex.co.z)]
                           for vertex in mesh.vertices],
             "triangles": [list(triangle.vertices) for triangle in mesh.loop_triangles],
+            "vertex_groups": {
+                group.name: {
+                    str(vertex.index): float(weight.weight)
+                    for vertex in mesh.vertices
+                    for weight in vertex.groups
+                    if weight.group < len(owner.vertex_groups)
+                    and owner.vertex_groups[weight.group].name == group.name
+                }
+                for group in owner.vertex_groups
+            },
         }
     finally:
         evaluated.to_mesh_clear()
@@ -77,6 +94,29 @@ for solver, host_name in (("EXACT", "HousingExact"), ("FLOAT", "HousingFloat")):
 
 
 
+
+bpy.ops.mesh.primitive_cube_add(size=2.0, location=(10.0, 0.0, 0.0))
+group_host = bpy.context.object
+group_host.name = "FloatGroupHost"
+host_group = group_host.vertex_groups.new(name="Host")
+host_group.add(list(range(len(group_host.data.vertices))), 0.2, "REPLACE")
+# The operand sits off the host's coplanar faces. At (11.5, 0, 0) the operand shares faces with the
+# host, and Blender's FLOAT union is process-nondeterministic there: 10 headless runs gave 27 or 32
+# output vertices and 0 to 4 vertices at x = 2.5. At (11.3, 0.3, 0.2) 6 of 6 runs gave 20 vertices
+# and no vertex at x = 2.5, so the expectation is a single Blender result.
+bpy.ops.mesh.primitive_cube_add(size=2.0, location=(11.3, 0.3, 0.2))
+group_operand = bpy.context.object
+group_operand.name = "FloatGroupOperand"
+cutter_group = group_operand.vertex_groups.new(name="Cutter")
+extra_group = group_operand.vertex_groups.new(name="ExtraCutter")
+vertices = list(range(len(group_operand.data.vertices)))
+cutter_group.add(vertices, 0.75, "REPLACE")
+extra_group.add(vertices, 0.95, "REPLACE")
+group_boolean = group_host.modifiers.new("Float group order probe", "BOOLEAN")
+group_boolean.operation = "UNION"
+group_boolean.solver = "FLOAT"
+group_boolean.object = group_operand
+prefixes["FloatGroupMapping"] = sample(group_host)
 
 with open(os.path.join(root, "blender_prefixes.json"), "w", encoding="utf-8") as output:
     json.dump(prefixes, output, separators=(",", ":"))
@@ -249,6 +289,156 @@ fn find_node(document: &SceneDoc, name: &str) -> TestResult<Id> {
         .map(|(id, _)| id.clone())
         .ok_or_else(|| format!("imported node `{name}` is missing").into())
 }
+fn assert_float_operand_group_remap(document: &SceneDoc, expected: &Value) -> TestResult<()> {
+    let host_id = find_node(document, "FloatGroupHost")?;
+    let operand_id = find_node(document, "FloatGroupOperand")?;
+    let data_block = |node_id: &Id| {
+        document
+            .nodes
+            .get(node_id)
+            .and_then(|node| node.data.as_ref())
+            .and_then(|data_id| document.data_blocks.get(data_id))
+    };
+    let subject_groups = &data_block(&host_id)
+        .ok_or("FLOAT group subject data is missing")?
+        .vertex_groups;
+    let operand_groups = &data_block(&operand_id)
+        .ok_or("FLOAT group operand data is missing")?
+        .vertex_groups;
+    assert_eq!(subject_groups.len(), 1);
+    assert_eq!(subject_groups[0].name, "Host");
+    assert_eq!(operand_groups.len(), 2);
+    assert_eq!(operand_groups[0].name, "Cutter");
+    assert_eq!(operand_groups[1].name, "ExtraCutter");
+
+    let mut boolean_only = document.clone();
+    disable_other_modifier_stacks(&mut boolean_only, &host_id);
+    let snapshot = Snapshot::evaluate(&boolean_only, &EvaluationContext::default())?;
+    let mesh = snapshot
+        .meshes
+        .get(&host_id)
+        .ok_or("FLOAT group Boolean did not evaluate")?;
+    let actual_groups = mesh
+        .attributes
+        .get("vertex_groups")
+        .and_then(Value::as_object)
+        .ok_or("FLOAT group Boolean output lost vertex groups")?;
+    assert_eq!(
+        actual_groups.len(),
+        1,
+        "operand-only groups must be ignored"
+    );
+    let expected_positions = points_from_json(&expected["positions"])?;
+    let expected_groups = expected["vertex_groups"]
+        .as_object()
+        .ok_or("Blender FLOAT group output is missing vertex groups")?;
+    let expected_names: HashSet<&String> = expected_groups.keys().collect();
+    let actual_names: HashSet<&String> = actual_groups.keys().collect();
+    assert_eq!(
+        actual_names, expected_names,
+        "FLOAT group names differ from Blender"
+    );
+    let expected_host_weights = expected_groups
+        .get("Host")
+        .and_then(Value::as_object)
+        .ok_or("Blender FLOAT group output is missing Host weights")?;
+    let retains_operand_weight = expected_host_weights.values().any(|weight| {
+        weight
+            .as_f64()
+            .is_some_and(|weight| (weight - 0.75).abs() <= WEIGHT_TOLERANCE)
+    });
+    assert!(
+        retains_operand_weight,
+        "Blender FLOAT union did not retain a weighted operand vertex"
+    );
+    for (name, expected_weights) in expected_groups {
+        let expected_weights = expected_weights
+            .as_object()
+            .ok_or("Blender FLOAT group weights are invalid")?;
+        let actual_weights = actual_groups
+            .get(name)
+            .and_then(Value::as_object)
+            .ok_or_else(|| format!("FLOAT group `{name}` output is missing"))?;
+        assert_vertex_group_weights_match(
+            name,
+            &expected_positions,
+            expected_weights,
+            mesh,
+            actual_weights,
+        )?;
+    }
+    Ok(())
+}
+
+/// Compares one vertex group in both directions. Each Blender (vertex index, weight) entry must
+/// match a distinct Potter entry at the same position and weight, and the counts must be equal so
+/// Potter holds no extra entries. Potter keys are vertex IDs, so positions bridge the two sides.
+fn assert_vertex_group_weights_match(
+    group: &str,
+    expected_positions: &[DVec3],
+    expected_weights: &Map<String, Value>,
+    mesh: &Mesh,
+    actual_weights: &Map<String, Value>,
+) -> TestResult<()> {
+    let positions_by_key: HashMap<String, DVec3> = mesh
+        .vertices
+        .iter()
+        .map(|vertex| (format!("v{}", vertex.id), vertex.co))
+        .collect();
+    let mut blender_entries = Vec::with_capacity(expected_weights.len());
+    for (index, weight) in expected_weights {
+        let index = index
+            .parse::<usize>()
+            .map_err(|_| format!("Blender {group} vertex index is invalid"))?;
+        let position = *expected_positions
+            .get(index)
+            .ok_or_else(|| format!("Blender {group} vertex {index} has no position"))?;
+        let weight = weight
+            .as_f64()
+            .ok_or_else(|| format!("Blender {group} weight of vertex {index} is invalid"))?;
+        blender_entries.push((position, weight));
+    }
+    let mut potter_entries = Vec::with_capacity(actual_weights.len());
+    for (key, weight) in actual_weights {
+        let position = *positions_by_key
+            .get(key)
+            .ok_or_else(|| format!("Potter {group} weight names missing vertex {key}"))?;
+        let weight = weight
+            .as_f64()
+            .ok_or_else(|| format!("Potter {group} weight of {key} is invalid"))?;
+        potter_entries.push((position, weight));
+    }
+    let potter_only: Vec<String> = potter_entries
+        .iter()
+        .filter(|(actual_position, actual_weight)| {
+            !blender_entries.iter().any(|(position, weight)| {
+                actual_position.distance(*position) <= POSITION_TOLERANCE
+                    && (actual_weight - weight).abs() <= WEIGHT_TOLERANCE
+            })
+        })
+        .map(|(position, weight)| format!("{position:?}={weight}"))
+        .collect();
+    assert!(
+        potter_entries.len() == blender_entries.len() && potter_only.is_empty(),
+        "Potter weights for group {group} differ from Blender: {} against {}, Potter-only entries {potter_only:?}",
+        potter_entries.len(),
+        blender_entries.len()
+    );
+    for (position, weight) in blender_entries {
+        let matched = potter_entries
+            .iter()
+            .position(|(actual_position, actual_weight)| {
+                actual_position.distance(position) <= POSITION_TOLERANCE
+                    && (actual_weight - weight).abs() <= WEIGHT_TOLERANCE
+            })
+            .ok_or_else(|| {
+                format!("Blender {group} weight {weight} at {position:?} has no Potter entry")
+            })?;
+        potter_entries.swap_remove(matched);
+    }
+    Ok(())
+}
+
 fn disable_other_modifier_stacks(document: &mut SceneDoc, enabled_node: &Id) {
     for (node_id, node) in &mut document.nodes {
         if node_id != enabled_node {
@@ -259,23 +449,8 @@ fn disable_other_modifier_stacks(document: &mut SceneDoc, enabled_node: &Id) {
     }
 }
 
-fn assert_catalog_gate() -> TestResult<()> {
-    let catalog = potter_core::catalog::feature_catalog();
-    let row = catalog["features"]
-        .as_array()
-        .and_then(|features| {
-            features
-                .iter()
-                .find(|feature| feature["feature_id"] == "modifier.boolean.downstream_topology")
-        })
-        .ok_or("Boolean topology limitation is missing from the feature catalog")?;
-    assert_eq!(row["status"], "not_supported");
-    assert_eq!(row["capabilities"]["evaluate"], false);
-    Ok(())
-}
-
 #[test]
-fn boolean_decimate_solidify_topology_divergence_is_gated_for_exact_and_float() -> TestResult<()> {
+fn boolean_decimate_solidify_stack_matches_blender_for_exact_and_float() -> TestResult<()> {
     const TOLERANCE: f64 = 1.0e-5;
     let blender = blender_executable().ok_or(BLENDER_REQUIRED)?;
     let directory = tempdir()?;
@@ -325,7 +500,7 @@ fn boolean_decimate_solidify_topology_divergence_is_gated_for_exact_and_float() 
     ])?;
     assert_eq!(imported["result"]["losses"], serde_json::json!([]));
     let document: SceneDoc = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
-    assert_catalog_gate()?;
+    assert_float_operand_group_remap(&document, &blender_prefixes["FloatGroupMapping"])?;
 
     for (solver, name) in [("EXACT", "HousingExact"), ("FLOAT", "HousingFloat")] {
         let node_id = find_node(&document, name)?;
@@ -340,68 +515,34 @@ fn boolean_decimate_solidify_topology_divergence_is_gated_for_exact_and_float() 
             );
         }
 
-        let mut boolean_only = document.clone();
-        disable_other_modifier_stacks(&mut boolean_only, &node_id);
-        let node = boolean_only
-            .nodes
-            .get_mut(&node_id)
-            .ok_or("Boolean host node is missing")?;
-        assert_eq!(node.modifiers.len(), 3);
-        for (index, modifier) in node.modifiers.iter_mut().enumerate() {
-            modifier.show_viewport = index == 0;
+        for (prefix_index, expected) in expected_prefixes.iter().enumerate() {
+            let prefix_count = prefix_index + 1;
+            let mut prefix_document = document.clone();
+            disable_other_modifier_stacks(&mut prefix_document, &node_id);
+            let node = prefix_document
+                .nodes
+                .get_mut(&node_id)
+                .ok_or("Boolean host node is missing")?;
+            assert_eq!(node.modifiers.len(), expected_prefixes.len());
+            for (index, modifier) in node.modifiers.iter_mut().enumerate() {
+                modifier.show_viewport = index < prefix_count;
+            }
+            let snapshot = Snapshot::evaluate(&prefix_document, &EvaluationContext::default())?;
+            let potter_mesh = snapshot
+                .meshes
+                .get(&node_id)
+                .ok_or("Potter did not evaluate the Boolean modifier stack")?;
+            let potter_triangles = potter_triangles(potter_mesh)?;
+            let blender_triangles = blender_triangles(expected)?;
+            let surface_error = symmetric_surface_distance(&potter_triangles, &blender_triangles);
+            assert!(
+                surface_error <= TOLERANCE,
+                "{solver} modifier prefix {prefix_count} differs from Blender by \
+                 {surface_error:.9e}, over {TOLERANCE:.1e}"
+            );
         }
-        let snapshot = Snapshot::evaluate(&boolean_only, &EvaluationContext::default())?;
-        let potter_mesh = snapshot
-            .meshes
-            .get(&node_id)
-            .ok_or("Potter did not evaluate the Boolean-only mesh")?;
-        let potter_triangles = potter_triangles(potter_mesh)?;
-        let blender_triangles = blender_triangles(&expected_prefixes[0])?;
-        let surface_error = symmetric_surface_distance(&potter_triangles, &blender_triangles);
-        assert!(
-            surface_error <= TOLERANCE,
-            "{solver} Boolean surface differs from Blender by {surface_error:.9e}, over {TOLERANCE:.1e}"
-        );
-
-        let mut full_stack = document.clone();
-        disable_other_modifier_stacks(&mut full_stack, &node_id);
-        let full_stack_error = Snapshot::evaluate(&full_stack, &EvaluationContext::default())
-            .err()
-            .ok_or("Boolean followed by Decimate and Solidify must be gated")?;
-        assert_eq!(full_stack_error.code, ErrorCode::UnsupportedFeature);
-        assert_eq!(
-            full_stack_error.details["feature_id"],
-            "modifier.boolean.downstream_topology"
-        );
-        assert_eq!(full_stack_error.details["solver"], solver);
-        assert_eq!(
-            full_stack_error.details["downstream_modifier_type"],
-            "decimate"
-        );
-
-        let mut solidify_only = document.clone();
-        disable_other_modifier_stacks(&mut solidify_only, &node_id);
-        let node = solidify_only
-            .nodes
-            .get_mut(&node_id)
-            .ok_or("Boolean host node is missing")?;
-        for modifier in &mut node.modifiers {
-            modifier.enabled =
-                modifier.modifier_type == "boolean" || modifier.modifier_type == "solidify";
-        }
-        let solidify_error = Snapshot::evaluate(&solidify_only, &EvaluationContext::default())
-            .err()
-            .ok_or("Boolean followed by Solidify must be gated")?;
-        assert_eq!(solidify_error.code, ErrorCode::UnsupportedFeature);
-        assert_eq!(
-            solidify_error.details["feature_id"],
-            "modifier.boolean.downstream_topology"
-        );
-        assert_eq!(
-            solidify_error.details["downstream_modifier_type"],
-            "solidify"
-        );
     }
+
     let exact_node_id = find_node(&document, "HousingExact")?;
     let exact_boolean_id = &document.nodes[&exact_node_id].modifiers[0].id;
     let apply_batch = root.join("apply_boolean.json");
@@ -425,14 +566,80 @@ fn boolean_decimate_solidify_topology_divergence_is_gated_for_exact_and_float() 
         .arg("--json")
         .output()?;
     assert!(
-        !apply_output.status.success(),
-        "applying a Boolean before topology-dependent modifiers must be rejected"
+        apply_output.status.success(),
+        "applying a Boolean before topology-dependent modifiers must succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&apply_output.stdout),
+        String::from_utf8_lossy(&apply_output.stderr)
     );
-    let apply_error: Value = serde_json::from_slice(&apply_output.stdout)?;
-    assert_eq!(apply_error["error"]["code"], "UNSUPPORTED_FEATURE");
-    assert_eq!(
-        apply_error["error"]["details"]["feature_id"],
-        "modifier.boolean.downstream_topology"
+    let applied: SceneDoc = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
+    assert!(
+        applied.nodes[&exact_node_id]
+            .modifiers
+            .iter()
+            .all(|modifier| modifier.modifier_type != "boolean"),
+        "applying the Boolean must remove it while preserving the downstream stack"
+    );
+    let applied_snapshot = Snapshot::evaluate(&applied, &EvaluationContext::default())?;
+    let applied_mesh = applied_snapshot
+        .meshes
+        .get(&exact_node_id)
+        .ok_or("applied Boolean host has no evaluated mesh")?;
+    let applied_triangles = potter_triangles(applied_mesh)?;
+    let expected_triangles = blender_triangles(&blender_prefixes["HousingExact"][2])?;
+    let surface_error = symmetric_surface_distance(&applied_triangles, &expected_triangles);
+    assert!(
+        surface_error <= TOLERANCE,
+        "applied EXACT Boolean stack differs from Blender by {surface_error:.9e}, \
+         over {TOLERANCE:.1e}"
+    );
+    let float_node_id = find_node(&applied, "HousingFloat")?;
+    let float_boolean_id = &applied.nodes[&float_node_id].modifiers[0].id;
+    let apply_float_batch = root.join("apply_float_boolean.json");
+    fs::write(
+        &apply_float_batch,
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "base_revision": applied.revision,
+            "operations": [{
+                "op": "modifier.apply",
+                "target": {"id": float_node_id.as_str()},
+                "modifier_id": float_boolean_id.as_str()
+            }]
+        }))?,
+    )?;
+    let apply_float_output = Command::new(env!("CARGO_BIN_EXE_pot"))
+        .arg("apply")
+        .arg(project_path)
+        .arg("--file")
+        .arg(&apply_float_batch)
+        .arg("--json")
+        .output()?;
+    assert!(
+        apply_float_output.status.success(),
+        "applying a FLOAT Boolean before topology-dependent modifiers must succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&apply_float_output.stdout),
+        String::from_utf8_lossy(&apply_float_output.stderr)
+    );
+    let applied_float: SceneDoc = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
+    assert!(
+        applied_float.nodes[&float_node_id]
+            .modifiers
+            .iter()
+            .all(|modifier| modifier.modifier_type != "boolean"),
+        "applying the FLOAT Boolean must preserve the downstream stack"
+    );
+    let applied_float_snapshot = Snapshot::evaluate(&applied_float, &EvaluationContext::default())?;
+    let applied_float_mesh = applied_float_snapshot
+        .meshes
+        .get(&float_node_id)
+        .ok_or("applied FLOAT Boolean host has no evaluated mesh")?;
+    let applied_float_triangles = potter_triangles(applied_float_mesh)?;
+    let expected_float_triangles = blender_triangles(&blender_prefixes["HousingFloat"][2])?;
+    let float_surface_error =
+        symmetric_surface_distance(&applied_float_triangles, &expected_float_triangles);
+    assert!(
+        float_surface_error <= TOLERANCE,
+        "applied FLOAT Boolean stack differs from Blender by {float_surface_error:.9e}, over {TOLERANCE:.1e}"
     );
     Ok(())
 }
