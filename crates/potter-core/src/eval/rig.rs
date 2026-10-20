@@ -5083,7 +5083,8 @@ fn sample_constraint_action(
                     .ok_or_else(|| {
                         evaluation_error("Action constraint rotation index is invalid")
                     })?;
-                quaternion[[3, 0, 1, 2][component]] = value;
+                // Potter component order (x, y, z, w); importers map Blender's indices to it.
+                quaternion[component] = value;
                 quaternion_modified = true;
             }
             "transform.rotation_euler" | "rotation_euler" => {

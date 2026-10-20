@@ -7622,6 +7622,7 @@ fn fcurve_handle(value: &Value, field: &str) -> Result<Option<[f64; 2]>> {
 fn convert_fcurve(value: &Value, mappings: &BTreeMap<String, String>) -> Result<FCurve> {
     let path = potter_fcurve_path(string_field(value, "path")?, mappings);
     let blender_index = integer_field(value, "index", 0);
+    // Potter stores quaternion F-Curve indices as (x, y, z, w); Blender's are (w, x, y, z).
     let index =
         if path == "transform.rotation_quaternion" || path.ends_with(".rotation_quaternion") {
             match blender_index {
@@ -8275,14 +8276,17 @@ fn blender_rotation(item: &Value, mode: &str) -> [f64; 4] {
     } else if mode == "AXIS_ANGLE" {
         let raw = item.get("rotation_axis_angle").and_then(Value::as_array);
         raw.and_then(|values| {
-            Some(DQuat::from_axis_angle(
-                glam::DVec3::new(
-                    values[1].as_f64()?,
-                    values[2].as_f64()?,
-                    values[3].as_f64()?,
-                ),
-                values[0].as_f64()?,
-            ))
+            let axis = glam::DVec3::new(
+                values[1].as_f64()?,
+                values[2].as_f64()?,
+                values[3].as_f64()?,
+            );
+            // Blender normalizes the axis; a zero axis gives the identity rotation.
+            Some(if axis == glam::DVec3::ZERO {
+                DQuat::IDENTITY
+            } else {
+                DQuat::from_axis_angle(axis.normalize(), values[0].as_f64()?)
+            })
         })
     } else {
         let euler = vec3_field(item, "rotation_euler", [0.0; 3]);
@@ -10138,12 +10142,19 @@ mod tests {
 
     #[test]
     fn blender_quaternion_components_convert_to_potter_xyzw() -> Result<()> {
+        // Object and bone `rotation_quaternion` values reach this function already in Potter's
+        // (x, y, z, w) order, so they must come back unchanged. Each input is a unit quaternion
+        // with asymmetric components: swapping any two positions would change the result.
+        let first = [0.6, 0.0, 0.8, 0.0];
         assert_eq!(
-            blender_rotation(
-                &json!({"rotation_quaternion": [1.0, 0.0, 0.0, 0.0]}),
-                "QUATERNION",
-            ),
-            [1.0, 0.0, 0.0, 0.0],
+            blender_rotation(&json!({"rotation_quaternion": first}), "QUATERNION"),
+            first,
+        );
+        let norm = 0.95_f64.sqrt();
+        let second = [0.1 / norm, 0.2 / norm, 0.3 / norm, 0.9 / norm];
+        assert_eq!(
+            blender_rotation(&json!({"rotation_quaternion": second}), "QUATERNION"),
+            second,
         );
         for (blender_index, potter_index) in [(0_i64, 3_u32), (1, 0), (2, 1), (3, 2)] {
             let curve = convert_fcurve(
@@ -10154,6 +10165,23 @@ mod tests {
             assert_eq!(curve.index, potter_index);
         }
         Ok(())
+    }
+
+    #[test]
+    fn blender_axis_angle_axis_is_normalized() {
+        // Blender normalizes `rotation_axis_angle`'s axis, so a Z axis of length 2 is a plain turn.
+        let angle = std::f64::consts::FRAC_PI_2;
+        let rotation = blender_rotation(
+            &json!({"rotation_axis_angle": [angle, 0.0, 0.0, 2.0]}),
+            "AXIS_ANGLE",
+        );
+        let expected = DQuat::from_axis_angle(glam::DVec3::Z, angle).to_array();
+        for (actual, expected) in rotation.into_iter().zip(expected) {
+            assert!(
+                (actual - expected).abs() <= 1.0e-12,
+                "expected {expected}, got {actual}"
+            );
+        }
     }
     #[test]
     fn every_evaluated_modifier_maps_to_a_blender_modifier_type() {
