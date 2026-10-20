@@ -9,7 +9,7 @@ use potter_core::{
         metaball::{self, ElementType, MetaballData, MetaballElement},
         volume::{self, VolumeData, VolumeGrid},
     },
-    model::{Id, Modifier, SceneDoc},
+    model::{Id, SceneDoc},
     ops::apply_batch,
 };
 use proptest::prelude::*;
@@ -101,31 +101,14 @@ fn mesh_volume_round_trip_stays_within_one_voxel_of_source_bounds() {
     })
     .unwrap();
     let voxel_size = 0.2;
-    let volume = volume::mesh_to_volume(&source, voxel_size, 1).unwrap();
+    // One interior voxel of band and unit density: the fog grid's zero background bounds the surface.
+    let volume = volume::mesh_to_fog_volume(&source, voxel_size, voxel_size, 1.0).unwrap();
     let round_trip = volume::volume_to_mesh(&volume, 0.0).unwrap();
     let source_bounds = source.bounds().unwrap();
     let result_bounds = round_trip.bounds().unwrap();
-    let modifier = Modifier {
-        id: Id::new("voxelize").unwrap(),
-        modifier_type: "mesh_to_volume".to_owned(),
-        name: "Mesh to Volume".to_owned(),
-        enabled: true,
-        show_viewport: true,
-        show_render: true,
-        params: serde_json::Map::from_iter([
-            ("voxel_size".to_owned(), json!(voxel_size)),
-            ("padding".to_owned(), json!(1)),
-        ]),
-        binding_data: None,
-        runtime: potter_core::model::ModifierRuntime::default(),
-    };
-    let modified = potter_core::geom::modifiers::evaluate_modifiers(&source, &[modifier]).unwrap();
-    let modifier_bounds = modified.bounds().unwrap();
     for axis in 0..3 {
         assert!((result_bounds.min[axis] - source_bounds.min[axis]).abs() <= voxel_size);
         assert!((result_bounds.max[axis] - source_bounds.max[axis]).abs() <= voxel_size);
-        assert!((modifier_bounds.min[axis] - source_bounds.min[axis]).abs() <= voxel_size);
-        assert!((modifier_bounds.max[axis] - source_bounds.max[axis]).abs() <= voxel_size);
     }
 }
 

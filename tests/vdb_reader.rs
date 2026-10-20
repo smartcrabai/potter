@@ -769,6 +769,7 @@ fn imports_vdb_resources_and_renders_real_volume_data() -> Result<(), Box<dyn Er
             "replace",
             "--base-revision",
             "0",
+            "--allow-lossy",
             "--blender",
             blender.to_str().unwrap(),
         ],

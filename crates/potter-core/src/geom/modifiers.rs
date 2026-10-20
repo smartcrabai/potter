@@ -311,8 +311,7 @@ pub(crate) fn evaluate_modifiers_with_scene_context_and_normals(
                     | "particle_instance"
                     | "explode"
             )
-            || (modifier.modifier_type == "volume_to_mesh"
-                && modifier.params.get("object").is_some_and(Value::is_string))
+            || modifier.modifier_type == "volume_to_mesh"
             || scene_operand_modifier
         {
             adaptive_normals = None;

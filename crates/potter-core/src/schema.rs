@@ -2402,7 +2402,7 @@ fn set_schema(operation: &str) -> Value {
 
 fn physics_settings_schema(operation: &str) -> Value {
     let properties = physics_settings_properties(operation);
-    json!({"type":"object","properties":properties,"additionalProperties":false})
+    json!({"type":"object","properties":properties,"additionalProperties":true})
 }
 
 fn physics_settings_properties(operation: &str) -> Value {
@@ -2413,52 +2413,38 @@ fn physics_settings_properties(operation: &str) -> Value {
         .unwrap_or_default();
     match system {
         "cloth" => json!({
-            "stiffness":{"type":"number","minimum":0,"maximum":1},
-            "structural_stiffness":{"type":"number","minimum":0,"maximum":1},
-            "shear_stiffness":{"type":"number","minimum":0,"maximum":1},
-            "bend_stiffness":{"type":"number","minimum":0,"maximum":1},
-            "air_drag":{"type":"number","minimum":0},"drag":{"type":"number","minimum":0},
-            "damping":{"type":"number","minimum":0},
-            "substeps":{"type":"integer","minimum":1,"maximum":32},
-            "iterations":{"type":"integer","minimum":1,"maximum":64},
             "quality":{"type":"integer","minimum":1,"maximum":32},
-            "pin_group":{"type":"string","minLength":1},
-            "tension_stiffness":{"type":"number","minimum":0,"maximum":1},
-            "compression_stiffness":{"type":"number","minimum":0,"maximum":1},
-            "bending_stiffness":{"type":"number","minimum":0,"maximum":1},
+            "iterations":{"type":"integer","minimum":1,"maximum":64},
             "mass":{"type":"number","exclusiveMinimum":0},
             "air_damping":{"type":"number","minimum":0},
-            "vertex_group_mass":{"type":"string","minLength":1},
-            "use_collision":{"type":"boolean"},
-            "collision_distance":{"type":"number","minimum":0},
-            "use_self_collision":{"type":"boolean"},
-            "self_collision_distance":{"type":"number","minimum":0},
-            "distance_min":{"type":"number","minimum":0},
+            "tension_stiffness":{"type":"number","minimum":0},
+            "compression_stiffness":{"type":"number","minimum":0},
+            "shear_stiffness":{"type":"number","minimum":0},
+            "bending_stiffness":{"type":"number","minimum":0},
+            "bending_model":{"enum":["ANGULAR","LINEAR"]},
+            "vertex_group_mass":{"type":"string"},
+            "collision_settings":{"type":"object","properties":{
+                "use_collision":{"type":"boolean"},
+                "distance_min":{"type":"number","minimum":0},
+                "use_self_collision":{"type":"boolean"},
+                "self_distance_min":{"type":"number","minimum":0},
+                "collection":{"type":["string","null"]}
+            }}
         }),
         "soft_body" => json!({
-            "stiffness":{"type":"number","minimum":0,"maximum":1},
-            "edge_stiffness":{"type":"number","minimum":0,"maximum":1},
-            "volume_stiffness":{"type":"number","minimum":0,"maximum":1},
-            "goal_group":{"type":"string","minLength":1},
-            "vertex_group_goal":{"type":"string","minLength":1},
-            "goal_strength":{"type":"number","minimum":0,"maximum":1},
-            "goal_stiffness":{"type":"number","minimum":0,"maximum":1},
             "substeps":{"type":"integer","minimum":1,"maximum":32},
             "iterations":{"type":"integer","minimum":1,"maximum":64},
-            "quality":{"type":"integer","minimum":1,"maximum":32},
-            "air_drag":{"type":"number","minimum":0},"drag":{"type":"number","minimum":0},
-            "damping":{"type":"number","minimum":0},
-            "restitution":{"type":"number","minimum":0,"maximum":1},
-            "goal_spring":{"type":"number","minimum":0,"maximum":1},
-            "goal_friction":{"type":"number","minimum":0,"maximum":1},
-            "goal_default":{"type":"number","minimum":0,"maximum":1},
-            "goal_min":{"type":"number"},
-            "goal_max":{"type":"number"},
             "mass":{"type":"number","exclusiveMinimum":0},
             "friction":{"type":"number","minimum":0},
             "speed":{"type":"number","minimum":0},
-            "plastic":{"type":"number","minimum":0,"maximum":1},
-            "bend":{"type":"number","minimum":0,"maximum":1},
+            "goal_spring":{"type":"number","minimum":0,"maximum":1},
+            "goal_default":{"type":"number","minimum":0,"maximum":1},
+            "goal_min":{"type":"number"},
+            "goal_max":{"type":"number"},
+            "use_goal":{"type":"boolean"},
+            "use_edges":{"type":"boolean"},
+            "vertex_group_goal":{"type":"string"},
+            "collision_collection":{"type":["string","null"]}
         }),
         "particle_emitter" => json!({
             "seed":{"type":"integer","minimum":0,"maximum":u32::MAX},
@@ -2485,37 +2471,43 @@ fn physics_settings_properties(operation: &str) -> Value {
             "frame_end":{"type":"number"}
         }),
         "fluid" => json!({
-            "type":{"enum":["liquid","smoke","fire"]},
+            "domain_type":{"enum":["LIQUID","GAS"]},
+            "particle_radius":{"type":"number","minimum":0},
+            "resolution_max":{"type":"integer","minimum":1},
+            "cache_frame_start":{"type":"number"},
+            "cache_frame_end":{"type":"number"},
+            "effector_group":{"type":["string","null"]},
             "resolution":{"type":"integer","minimum":1,"maximum":10},
-            "particle_radius":{"type":"number","exclusiveMinimum":0},
             "smoothing_length":{"type":"number","exclusiveMinimum":0},
             "pressure_stiffness":{"type":"number","minimum":0},
             "viscosity":{"type":"number","minimum":0},
+            "seed":{"type":"integer","minimum":0,"maximum":u32::MAX},
+            "flow_type":{"enum":["SMOKE","LIQUID","FIRE","BOTH"]},
+            "flow_behavior":{"enum":["GEOMETRY","INFLOW","OUTFLOW"]},
+            "flow_source":{"enum":["PARTICLES","MESH"]},
+            "density":{"type":"number","minimum":0,"maximum":10},
             "inflow_rate":{"type":"number","minimum":0},
-            "seed":{"type":"integer","minimum":0,"maximum":u32::MAX}
+            "effector_type":{"enum":["COLLISION","GUIDE"]},
+            "use_effector":{"type":"boolean"}
         }),
         "dynamic_paint" => json!({
             "role":{"enum":["canvas","brush"]},
             "radius":{"type":"number","exclusiveMinimum":0},
             "color":{"type":"array","items":{"type":"number"},"minItems":4,"maxItems":4},
-            "strength":{"type":"number","minimum":0,"maximum":1},
+            "strength":{"type":"number","minimum":0},
             "brushes":{"type":"array","items":id_schema()},
-            "surface_format":{"enum":["color","weight"]}
+            "surface_format":{"enum":["color","weight"]},
+            "paint_color":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":4},
+            "paint_alpha":{"type":"number","minimum":0},
+            "paint_distance":{"type":"number","minimum":0}
         }),
         "collision" => json!({
-            "thickness":{"type":"number","minimum":0},
+            "use":{"type":"boolean"},
             "thickness_outer":{"type":"number","minimum":0},
             "thickness_inner":{"type":"number","minimum":0},
-            "damping":{"type":"number","minimum":0},
-            "damping_factor":{"type":"number","minimum":0,"maximum":1},
-            "damping_random":{"type":"number","minimum":0,"maximum":1},
-            "permeability":{"type":"number","minimum":0,"maximum":1},
-            "stickiness":{"type":"number","minimum":0,"maximum":1},
-            "friction_factor":{"type":"number","minimum":0,"maximum":1},
-            "friction_random":{"type":"number","minimum":0,"maximum":1},
             "use_culling":{"type":"boolean"},
             "use_normal":{"type":"boolean"},
-            "use_particle_kill":{"type":"boolean"}
+            "cloth_friction":{"type":"number","minimum":0,"maximum":80}
         }),
         _ => json!({}),
     }

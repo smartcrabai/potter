@@ -2476,25 +2476,41 @@ baseline_evaluated.to_mesh_clear()
         );
     };
     assert_eq!(
-        displaced.source,
-        potter_core::geom::volume::VolumeSource::Generated(
-            potter_core::geom::volume::VolumeGeneratedSource {
-                algorithm: "volume_displace_vdb".to_owned(),
-            },
-        )
+        displaced.source, volume.source,
+        "VDB displacement keeps the file-backed source"
     );
-    let vdb_grid = displaced
+    let source_grid = volume
+        .decoded_vdb
+        .as_ref()
+        .and_then(|decoded| decoded.grids.first())
+        .ok_or("source VDB grid is missing")?;
+    let displaced_vdb = displaced
+        .decoded_vdb
+        .as_ref()
+        .ok_or("displaced VDB archive is missing")?;
+    let displaced_grid = displaced_vdb
         .grids
         .first()
         .ok_or("displaced VDB grid is missing")?;
-    assert_eq!(vdb_grid.dims, [8, 7, 7]);
-    compare_density_samples(
-        "decoded VDB",
-        vdb_grid
-            .values
-            .as_deref()
-            .ok_or("displaced VDB samples are missing")?,
+    assert_eq!(displaced_grid.name, source_grid.name);
+    assert_eq!(displaced_grid.value_type, source_grid.value_type);
+    assert_eq!(displaced_grid.class, source_grid.class);
+    assert_eq!(displaced_grid.transform, source_grid.transform);
+    assert_eq!(
+        displaced_grid.tree.background.to_bits(),
+        source_grid.tree.background.to_bits(),
+        "VDB displacement keeps the tree background"
     );
+    // Blender's 8x7x7 evaluation box is x in -2..=5 and y, z in -2..=4, with x fastest.
+    let mut displaced_samples = Vec::with_capacity(8 * 7 * 7);
+    for z in -2..5 {
+        for y in -2..5 {
+            for x in -2..6 {
+                displaced_samples.push(displaced_grid.sample_index([x, y, z]));
+            }
+        }
+    }
+    compare_density_samples("decoded VDB", displaced_samples.as_slice());
     let mut inline_values = Vec::with_capacity(36);
     for z in 0_u8..3 {
         for y in 0_u8..3 {

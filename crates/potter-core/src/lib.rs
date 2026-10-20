@@ -28,6 +28,7 @@ pub mod media;
 pub mod model;
 pub mod ops;
 mod params;
+mod physics_support;
 pub mod render;
 pub mod response;
 pub mod schema;

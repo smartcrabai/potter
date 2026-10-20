@@ -1157,6 +1157,7 @@ impl Snapshot {
                                         doc,
                                         &matrices,
                                         &volume_data,
+                                        modifier_warnings,
                                     ),
                                     "boolean" | "shrinkwrap" | "curve" | "hook" | "warp" => {
                                         apply_scene_operand_modifier(
@@ -1462,6 +1463,7 @@ impl Snapshot {
                                         doc,
                                         &matrices,
                                         &volume_data,
+                                        modifier_warnings,
                                     ),
                                     "boolean" | "shrinkwrap" | "curve" | "hook" | "warp" => {
                                         apply_scene_operand_modifier(
@@ -1591,142 +1593,46 @@ impl Snapshot {
                             json!({ "data": data_id }),
                         )
                     })?;
-                    let mut generated = None;
+                    // Blender runs the Volume modifiers in stack order, each consuming the previous
+                    // result. A Mesh to Volume that changes the volume replaces its grids
+                    // (`BKE_volume_new_for_eval` copies none); a no-op keeps the input grids.
+                    let mut evaluated: Option<crate::geom::volume::VolumeData> = None;
                     for modifier in node.modifiers.iter().filter(|modifier| {
-                        gate.is_active(id, modifier) && modifier.modifier_type == "mesh_to_volume"
-                    }) {
-                        let object_text = modifier
-                            .params
-                            .get("object")
-                            .and_then(serde_json::Value::as_str)
-                            .ok_or_else(|| {
-                                PotError::with_details(
-                                    ErrorCode::InvalidArgument,
-                                    "mesh-to-volume modifier requires an object operand",
-                                    json!({"modifier_id":modifier.id,"parameter":"object"}),
-                                )
-                            })?;
-                        let object_id = Id::new(object_text.to_owned()).map_err(|_| {
-                            PotError::with_details(
-                                ErrorCode::InvalidArgument,
-                                "mesh-to-volume object operand is not a valid object ID",
-                                json!({"modifier_id":modifier.id,"object":object_text}),
+                        gate.is_active(id, modifier)
+                            && matches!(
+                                modifier.modifier_type.as_str(),
+                                "mesh_to_volume" | "volume_displace"
                             )
-                        })?;
-                        let operand_mesh = meshes
-                            .get(&object_id)
-                            .or_else(|| object_meshes.get(&object_id).copied())
-                            .ok_or_else(|| {
-                                PotError::with_details(
-                                    ErrorCode::InvalidArgument,
-                                    "mesh-to-volume object operand has no mesh geometry",
-                                    json!({"modifier_id":modifier.id,"object":object_id}),
-                                )
-                            })?;
-                        let operand_matrix =
-                            matrices.get(&object_id).copied().ok_or_else(|| {
-                                PotError::with_details(
-                                    ErrorCode::EvaluationFailed,
-                                    "mesh-to-volume object world matrix is missing",
-                                    json!({"modifier_id":modifier.id,"object":object_id}),
-                                )
-                            })?;
-                        let owner_inverse = matrix.inverse();
-                        if !owner_inverse.is_finite() {
-                            return Err(PotError::with_details(
-                                ErrorCode::InvalidArgument,
-                                "mesh-to-volume owner transform is singular",
-                                json!({"modifier_id":modifier.id,"owner":id}),
-                            ));
-                        }
-                        let operand_to_owner = owner_inverse * operand_matrix;
-                        let mut transformed = (*operand_mesh).clone();
-                        for vertex in &mut transformed.vertices {
-                            vertex.co = operand_to_owner.transform_point3(vertex.co);
-                        }
-                        // A parameter the modifier does not store takes its Blender default from the schema table.
-                        let number = |parameter: &str| -> Result<f64> {
-                            match modifier.params.get(parameter).and_then(Value::as_f64) {
-                                Some(value) => Ok(value),
-                                None => mesh_to_volume_default(parameter)?.as_f64().ok_or_else(|| {
-                                    PotError::new(
-                                        ErrorCode::InternalError,
-                                        format!("mesh_to_volume default `{parameter}` is not a number"),
-                                    )
-                                }),
-                            }
-                        };
-                        let resolution_mode = match modifier
-                            .params
-                            .get("resolution_mode")
-                            .and_then(Value::as_str)
-                        {
-                            Some(mode) => mode,
-                            None => mesh_to_volume_default("resolution_mode")?
-                                .as_str()
-                                .ok_or_else(|| {
-                                    PotError::new(
-                                        ErrorCode::InternalError,
-                                        "mesh_to_volume default `resolution_mode` is not a string",
-                                    )
-                                })?,
-                        };
-                        let voxel_size = match resolution_mode {
-                            "VOXEL_SIZE" => number("voxel_size")?,
-                            "VOXEL_AMOUNT" => {
-                                let amount = number("voxel_amount")?;
-                                let bounds = transformed.bounds().ok_or_else(|| {
-                                    PotError::with_details(
-                                        ErrorCode::InvalidArgument,
-                                        "mesh-to-volume operand mesh is empty",
-                                        json!({"modifier_id":modifier.id}),
-                                    )
-                                })?;
-                                if !amount.is_finite() || amount <= 0.0 {
-                                    return Err(PotError::with_details(
-                                        ErrorCode::InvalidArgument,
-                                        "mesh-to-volume voxel_amount must be positive",
-                                        json!({"modifier_id":modifier.id,"parameter":"voxel_amount"}),
-                                    ));
-                                }
-                                (bounds.size().length() / amount) as f32 as f64
-                            }
-                            _ => {
-                                return Err(PotError::with_details(
-                                    ErrorCode::InvalidArgument,
-                                    "mesh-to-volume resolution_mode must be VOXEL_SIZE or VOXEL_AMOUNT",
-                                    json!({"modifier_id":modifier.id,"parameter":"resolution_mode"}),
-                                ));
-                            }
-                        };
-                        generated = Some(crate::geom::volume::mesh_to_fog_volume(
-                            &transformed,
-                            voxel_size as f32 as f64,
-                            number("interior_band_width")?,
-                            number("density")?,
-                            true,
-                        )?);
-                    }
-                    if let Some(generated) = generated {
-                        volume_data.insert(data_id.clone(), generated);
-                    }
-                    let base_volume = volume_data.get(data_id).unwrap_or(volume);
-                    let mut displaced = None;
-                    for modifier in node.modifiers.iter().filter(|modifier| {
-                        gate.is_active(id, modifier) && modifier.modifier_type == "volume_displace"
                     }) {
-                        let current = displaced.take().unwrap_or_else(|| base_volume.clone());
-                        displaced = Some(apply_volume_displace_modifier(
-                            &current,
-                            modifier,
-                            doc,
-                            modifier_context.project_root,
-                            &matrices,
-                            id,
-                        )?);
+                        let current = evaluated
+                            .as_ref()
+                            .or_else(|| volume_data.get(data_id))
+                            .unwrap_or(volume);
+                        let next = if modifier.modifier_type == "mesh_to_volume" {
+                            apply_mesh_to_volume_modifier(
+                                modifier,
+                                id,
+                                matrix,
+                                &matrices,
+                                &meshes,
+                                &object_meshes,
+                            )?
+                        } else {
+                            Some(apply_volume_displace_modifier(
+                                current,
+                                modifier,
+                                doc,
+                                modifier_context.project_root,
+                                &matrices,
+                                id,
+                            )?)
+                        };
+                        if let Some(next) = next {
+                            evaluated = Some(next);
+                        }
                     }
-                    if let Some(displaced) = displaced {
-                        volume_data.insert(data_id.clone(), displaced);
+                    if let Some(evaluated) = evaluated {
+                        volume_data.insert(data_id.clone(), evaluated);
                     }
                     let evaluated_volume = volume_data.get(data_id).unwrap_or(volume);
                     volume_bounds(evaluated_volume, matrix)?
@@ -3513,6 +3419,135 @@ fn select_particle_states(
         .collect()
 }
 
+/// Blender's `MOD_mesh_to_volume.cc` `mesh_to_volume`. Returns `None` where Blender returns the
+/// input volume unchanged: a null object, an operand without evaluated vertices, a voxel amount
+/// below 1, or a voxel size below 1e-5.
+fn apply_mesh_to_volume_modifier(
+    modifier: &Modifier,
+    owner_id: &Id,
+    owner_matrix: DMat4,
+    matrices: &BTreeMap<Id, DMat4>,
+    meshes: &BTreeMap<Id, Mesh>,
+    object_meshes: &BTreeMap<Id, &Mesh>,
+) -> Result<Option<crate::geom::volume::VolumeData>> {
+    let object_text = match modifier.params.get("object") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(value) => value.as_str().ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::InvalidArgument,
+                "mesh-to-volume object operand must be an object ID",
+                json!({"modifier_id":modifier.id,"parameter":"object"}),
+            )
+        })?,
+    };
+    let object_id = Id::new(object_text.to_owned()).map_err(|_| {
+        PotError::with_details(
+            ErrorCode::InvalidArgument,
+            "mesh-to-volume object operand is not a valid object ID",
+            json!({"modifier_id":modifier.id,"object":object_text}),
+        )
+    })?;
+    let Some(operand_mesh) = meshes
+        .get(&object_id)
+        .or_else(|| object_meshes.get(&object_id).copied())
+    else {
+        return Ok(None);
+    };
+    if operand_mesh.vertices.is_empty() {
+        return Ok(None);
+    }
+    let operand_matrix = matrices.get(&object_id).copied().ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::EvaluationFailed,
+            "mesh-to-volume object world matrix is missing",
+            json!({"modifier_id":modifier.id,"object":object_id}),
+        )
+    })?;
+    let owner_inverse = owner_matrix.inverse();
+    if !owner_inverse.is_finite() {
+        return Err(PotError::with_details(
+            ErrorCode::InvalidArgument,
+            "mesh-to-volume owner transform is singular",
+            json!({"modifier_id":modifier.id,"owner":owner_id}),
+        ));
+    }
+    // Blender's `mesh_to_own_object_space_transform`: operand space into the volume's object space.
+    let operand_to_owner = owner_inverse * operand_matrix;
+    // A parameter the modifier does not store takes its Blender default from the schema table.
+    let number = |parameter: &str| -> Result<f64> {
+        match modifier.params.get(parameter).and_then(Value::as_f64) {
+            Some(value) => Ok(value),
+            None => mesh_to_volume_default(parameter)?.as_f64().ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::InternalError,
+                    format!("mesh_to_volume default `{parameter}` is not a number"),
+                )
+            }),
+        }
+    };
+    let resolution_mode = match modifier
+        .params
+        .get("resolution_mode")
+        .and_then(Value::as_str)
+    {
+        Some(mode) => mode,
+        None => mesh_to_volume_default("resolution_mode")?
+            .as_str()
+            .ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::InternalError,
+                    "mesh_to_volume default `resolution_mode` is not a string",
+                )
+            })?,
+    };
+    let voxel_size = match resolution_mode {
+        "VOXEL_SIZE" => {
+            let voxel_size = number("voxel_size")?;
+            if voxel_size < 1.0e-5 {
+                return Ok(None);
+            }
+            voxel_size
+        }
+        "VOXEL_AMOUNT" => {
+            let amount = number("voxel_amount")?;
+            if amount < 1.0 {
+                return Ok(None);
+            }
+            // Blender measures the diagonal of the operand's local bounds under the operand-to-owner
+            // transform (`volume_compute_voxel_size`), then divides by the amount.
+            let bounds = operand_mesh.bounds().ok_or_else(|| {
+                PotError::with_details(
+                    ErrorCode::InvalidArgument,
+                    "mesh-to-volume operand mesh has no bounds",
+                    json!({"modifier_id":modifier.id,"object":object_id}),
+                )
+            })?;
+            let diagonal = operand_to_owner
+                .transform_point3(bounds.min)
+                .distance(operand_to_owner.transform_point3(bounds.max));
+            (diagonal / amount.max(1.0)) as f32 as f64
+        }
+        _ => {
+            return Err(PotError::with_details(
+                ErrorCode::InvalidArgument,
+                "mesh-to-volume resolution_mode must be VOXEL_SIZE or VOXEL_AMOUNT",
+                json!({"modifier_id":modifier.id,"parameter":"resolution_mode"}),
+            ));
+        }
+    };
+    let mut transformed = operand_mesh.clone();
+    for vertex in &mut transformed.vertices {
+        vertex.co = operand_to_owner.transform_point3(vertex.co);
+    }
+    crate::geom::volume::mesh_to_fog_volume(
+        &transformed,
+        voxel_size as f32 as f64,
+        number("interior_band_width")?,
+        number("density")?,
+    )
+    .map(Some)
+}
+
 fn apply_volume_displace_modifier(
     volume: &crate::geom::volume::VolumeData,
     modifier: &Modifier,
@@ -3522,7 +3557,19 @@ fn apply_volume_displace_modifier(
     volume_id: &Id,
 ) -> Result<crate::geom::volume::VolumeData> {
     let params = &modifier.params;
-    let texture = params.get("texture").and_then(serde_json::Value::as_str);
+    // Blender's `texture` pointer is a Tex datablock; Potter accepts an image ID or `noise`. Any
+    // other value is refused rather than silently treated as no texture.
+    let texture = match params.get("texture") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(texture)) => Some(texture.as_str()),
+        Some(_) => {
+            return Err(PotError::with_details(
+                ErrorCode::InvalidArgument,
+                "Volume Displace texture must be an image ID, `noise`, or unset",
+                json!({"modifier_id":modifier.id,"parameter":"texture"}),
+            ));
+        }
+    };
     let (texture_type, image) = if let Some(texture) = texture {
         if texture == "noise" {
             ("NOISE", None)
@@ -3565,9 +3612,15 @@ fn apply_volume_displace_modifier(
             json!({"node_id":volume_id}),
         )
     })?;
+    // Blender reads `texture_map_object` only in OBJECT mapping; LOCAL and GLOBAL ignore it.
+    let texture_map_mode = params
+        .get("texture_map_mode")
+        .and_then(Value::as_str)
+        .unwrap_or("LOCAL");
     let texture_map_object_world = params
         .get("texture_map_object")
         .and_then(serde_json::Value::as_str)
+        .filter(|_| texture_map_mode == "OBJECT")
         .map(|object_text| {
             let object_id = Id::new(object_text.to_owned()).map_err(|error| {
                 PotError::with_details(
@@ -4656,6 +4709,10 @@ fn apply_lattice_modifier(
     Ok(())
 }
 
+/// Blender's `MOD_volume_to_mesh.cc` `modify_mesh`. A null object, a non-volume object, or a zero
+/// `VOXEL_SIZE`/`VOXEL_AMOUNT` yields an empty mesh. A missing grid is a modifier warning and also
+/// yields an empty mesh. `VOXEL_SIZE`/`VOXEL_AMOUNT` with a non-zero value resamples the grid in
+/// Blender, which Potter does not implement, so it is refused unless the grid has no active voxels.
 pub(crate) fn apply_volume_to_mesh_modifier(
     mesh: &mut Mesh,
     modifier: &Modifier,
@@ -4663,18 +4720,21 @@ pub(crate) fn apply_volume_to_mesh_modifier(
     doc: &SceneDoc,
     matrices: &BTreeMap<Id, DMat4>,
     volume_data: &BTreeMap<Id, crate::geom::volume::VolumeData>,
+    modifier_warnings: &mut Vec<PotError>,
 ) -> Result<()> {
-    let volume_text = modifier
-        .params
-        .get("object")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
+    let volume_text = match modifier.params.get("object") {
+        None | Some(Value::Null) => {
+            *mesh = Mesh::default();
+            return Ok(());
+        }
+        Some(value) => value.as_str().ok_or_else(|| {
             PotError::with_details(
                 ErrorCode::InvalidArgument,
                 "volume_to_mesh modifier requires a volume node ID",
                 json!({"modifier_id":modifier.id,"parameter":"object"}),
             )
-        })?;
+        })?,
+    };
     let volume_id = Id::new(volume_text.to_owned()).map_err(|_| {
         PotError::with_details(
             ErrorCode::InvalidArgument,
@@ -4690,11 +4750,46 @@ pub(crate) fn apply_volume_to_mesh_modifier(
         )
     })?;
     if node.kind != "volume" {
-        return Err(PotError::with_details(
-            ErrorCode::InvalidArgument,
-            "volume_to_mesh target must be a volume node",
-            json!({"modifier_id":modifier.id,"object":volume_id}),
-        ));
+        *mesh = Mesh::default();
+        return Ok(());
+    }
+    let schema_value = |name: &str| {
+        modifier.params.get(name).or_else(|| {
+            crate::params::default_value(
+                crate::params::ParameterFamily::Modifier,
+                "volume_to_mesh",
+                name,
+            )
+        })
+    };
+    let resolution_mode = schema_value("resolution_mode")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::InvalidArgument,
+                "volume_to_mesh resolution_mode must be a string",
+                json!({"modifier_id":modifier.id,"parameter":"resolution_mode"}),
+            )
+        })?;
+    let zero_voxel_setting = match resolution_mode {
+        "GRID" => false,
+        "VOXEL_SIZE" => schema_value("voxel_size")
+            .and_then(Value::as_f64)
+            .is_some_and(|size| size == 0.0),
+        "VOXEL_AMOUNT" => schema_value("voxel_amount")
+            .and_then(Value::as_f64)
+            .is_some_and(|amount| amount == 0.0),
+        _ => {
+            return Err(PotError::with_details(
+                ErrorCode::InvalidArgument,
+                "volume_to_mesh resolution_mode must be GRID, VOXEL_SIZE, or VOXEL_AMOUNT",
+                json!({"modifier_id":modifier.id,"parameter":"resolution_mode"}),
+            ));
+        }
+    };
+    if zero_voxel_setting {
+        *mesh = Mesh::default();
+        return Ok(());
     }
     let data_id = node
         .data
@@ -4782,6 +4877,15 @@ pub(crate) fn apply_volume_to_mesh_modifier(
                 json!({"modifier_id":modifier.id,"parameter":"grid_name"}),
             )
         })?;
+    // Blender stores the grid name in a char[64] buffer, so a name holds at most 63 bytes. A longer
+    // name cannot come from Blender and is refused rather than truncated.
+    if grid_name.len() > 63 {
+        return Err(PotError::with_details(
+            ErrorCode::InvalidArgument,
+            "volume_to_mesh grid_name must be at most 63 bytes",
+            json!({"modifier_id":modifier.id,"parameter":"grid_name"}),
+        ));
+    }
     let use_smooth_shade = modifier
         .params
         .get("use_smooth_shade")
@@ -4817,9 +4921,41 @@ pub(crate) fn apply_volume_to_mesh_modifier(
         ));
     }
     let volume_to_mesh = source_inverse * volume_world;
-    let mut extracted = crate::geom::volume::volume_to_mesh_named_adaptive(
-        volume, threshold, grid_name, adaptivity,
-    )?;
+    let extracted = match resolution_mode {
+        "GRID" => crate::geom::volume::volume_to_mesh_named_adaptive(
+            volume, threshold, grid_name, adaptivity,
+        ),
+        // Blender resamples the grid to the requested voxel size, which Potter does not implement.
+        // A grid without active voxels still gives Blender's empty mesh.
+        _ => match crate::geom::volume::named_grid_has_active_voxels(volume, grid_name) {
+            Ok(true) => Err(PotError::with_details(
+                ErrorCode::UnsupportedFeature,
+                "volume_to_mesh VOXEL_SIZE and VOXEL_AMOUNT resampling is not supported",
+                json!({
+                    "modifier_id": modifier.id,
+                    "feature_id": "modifier.volume_to_mesh.resolution_mode",
+                    "resolution_mode": resolution_mode,
+                }),
+            )),
+            Ok(false) => Ok(Mesh::default()),
+            Err(error) => Err(error),
+        },
+    };
+    let mut extracted = match extracted {
+        Ok(extracted) => extracted,
+        // A missing grid is Blender's modifier error: the warning is kept and the mesh is empty.
+        Err(error)
+            if error
+                .details
+                .get("modifier_warning")
+                .and_then(Value::as_bool)
+                == Some(true) =>
+        {
+            modifier_warnings.push(error);
+            Mesh::default()
+        }
+        Err(error) => return Err(error),
+    };
     if use_smooth_shade {
         crate::geom::normals::shade_faces_smooth(&mut extracted);
     }

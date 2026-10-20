@@ -4,6 +4,7 @@ use crate::{
     error::{ErrorCode, PotError, Result},
     model::{ForceField, Id, Modifier, Node, RigidBody, RigidBodyWorld},
     params::{self, ParameterFamily},
+    physics_support,
 };
 
 use super::{ChangeKind, Engine, check_fields, operation_pointer};
@@ -913,20 +914,20 @@ pub(super) fn update_linked_modifier_settings(
             .find(|modifier| modifier.id == *modifier_id)
             .and_then(|modifier| modifier.params.get("fluid_type"))
             .cloned()
-            .unwrap_or_else(|| Value::String("DOMAIN".to_owned()));
+            .unwrap_or_else(|| Value::String("NONE".to_owned()));
         modifier_flags.insert("fluid_type".to_owned(), fluid_type);
     }
     let fluid_role = modifier_flags
         .get("fluid_type")
         .and_then(Value::as_str)
-        .unwrap_or("DOMAIN");
+        .unwrap_or("NONE");
     let previous_fluid_role = node
         .modifiers
         .iter()
         .find(|modifier| modifier.id == *modifier_id)
         .and_then(|modifier| modifier.params.get("fluid_type"))
         .and_then(Value::as_str)
-        .unwrap_or("DOMAIN");
+        .unwrap_or("NONE");
     let fluid_role_changed = system == "fluid" && fluid_role != previous_fluid_role;
     if fluid_role_changed {
         settings = node
@@ -1089,7 +1090,7 @@ fn ensure_physics_stack_modifier(
         if system == "fluid" && !modifier.params.contains_key("fluid_type") {
             modifier
                 .params
-                .insert("fluid_type".to_owned(), Value::String("DOMAIN".to_owned()));
+                .insert("fluid_type".to_owned(), Value::String("NONE".to_owned()));
             changed = true;
         }
         if system == "particle_emitter"
@@ -1146,7 +1147,7 @@ fn ensure_physics_stack_modifier(
         );
     }
     if system == "fluid" {
-        params.insert("fluid_type".to_owned(), Value::String("DOMAIN".to_owned()));
+        params.insert("fluid_type".to_owned(), Value::String("NONE".to_owned()));
     }
     let index = super::modifier::insertion_index(&node.modifiers, modifier_type);
     node.modifiers.insert(
@@ -1340,7 +1341,72 @@ const DYNAMIC_PAINT_BRUSH_SETTINGS: &[&str] = &[
     "velocity_ramp",
 ];
 
-const DYNAMIC_PAINT_CANVAS_SETTINGS: &[&str] = &["brushes", "surface_format", "canvas_surfaces"];
+/// Canvas-only settings. `radius`, `color`, and `strength` are the Potter-native fallback paint
+/// that a canvas uses when it has no brush; they have no Blender counterpart.
+const DYNAMIC_PAINT_CANVAS_SETTINGS: &[&str] = &[
+    "brushes",
+    "surface_format",
+    "canvas_surfaces",
+    "radius",
+    "color",
+    "strength",
+];
+
+/// Potter-native dynamic-paint settings accepted at the top level of a canvas or brush.
+const DYNAMIC_PAINT_NATIVE_SETTINGS: &[&str] = &[
+    "role",
+    "radius",
+    "color",
+    "strength",
+    "brushes",
+    "surface_format",
+];
+
+/// Potter-native fluid domain settings, beside the Blender `fluid_domain` names.
+const FLUID_DOMAIN_NATIVE_SETTINGS: &[&str] = &[
+    "resolution",
+    "smoothing_length",
+    "pressure_stiffness",
+    "viscosity",
+    "seed",
+];
+
+/// Potter-native fluid flow settings, beside the Blender `fluid_flow` names.
+const FLUID_FLOW_NATIVE_SETTINGS: &[&str] = &["inflow_rate"];
+
+/// Potter-native particle emitter settings, beside the Blender names the emitter reads.
+const PARTICLE_SETTINGS: &[&str] = &[
+    "seed",
+    "count",
+    "rate",
+    "emission_rate",
+    "lifetime",
+    "lifetime_random",
+    "speed",
+    "normal_factor",
+    "factor_random",
+    "random_velocity",
+    "source",
+    "emit_from",
+    "velocity",
+    "normal_velocity",
+    "physics_type",
+    "mass",
+    "render_as",
+    "render_type",
+    "instance_object",
+    "hair_length",
+    "particle_size",
+    "size_random",
+    "child_nbr",
+    "child_radius",
+    "child_type",
+    "start_frame",
+    "end_frame",
+    "frame_start",
+    "frame_end",
+    "instance_collection",
+];
 
 fn validate_dynamic_paint_settings_role(
     engine: &Engine<'_>,
@@ -1368,6 +1434,13 @@ fn validate_dynamic_paint_settings_role(
             &format!("/settings/{field}"),
         ));
     }
+    if role == "brush" {
+        physics_support::reject_unhonoured(
+            "dynamic_paint_brush",
+            &Value::Object(settings.clone()),
+            physics_support::honoured_properties("dynamic_paint_brush"),
+        )?;
+    }
     Ok(())
 }
 
@@ -1387,23 +1460,23 @@ fn fluid_modifier_role(node: &Node) -> &str {
         .find(|modifier| modifier.modifier_type == "fluid")
         .and_then(|modifier| modifier.params.get("fluid_type"))
         .and_then(Value::as_str)
-        .unwrap_or("DOMAIN")
+        .unwrap_or("NONE")
 }
 
-fn fluid_settings_for_role(role: &str) -> Option<&'static [&'static str]> {
+/// Whether a fluid role accepts a setting: its Blender RNA names plus the Potter-native names.
+fn fluid_setting_allowed(role: &str, field: &str) -> bool {
     match role {
-        "DOMAIN" => Some(&[
-            "type",
-            "resolution",
-            "particle_radius",
-            "smoothing_length",
-            "pressure_stiffness",
-            "viscosity",
-            "seed",
-        ]),
-        "FLOW" => Some(&["type", "inflow_rate"]),
-        "NONE" | "EFFECTOR" => Some(&[]),
-        _ => None,
+        "DOMAIN" => {
+            physics_support::is_blender_property("fluid_domain", field)
+                || physics_support::is_blender_property("fluid_domain_liquid", field)
+                || FLUID_DOMAIN_NATIVE_SETTINGS.contains(&field)
+        }
+        "FLOW" => {
+            physics_support::is_blender_property("fluid_flow", field)
+                || FLUID_FLOW_NATIVE_SETTINGS.contains(&field)
+        }
+        "EFFECTOR" => physics_support::is_blender_property("fluid_effector", field),
+        _ => false,
     }
 }
 
@@ -1412,16 +1485,16 @@ fn validate_fluid_settings_role(
     role: &str,
     settings: &Map<String, Value>,
 ) -> Result<()> {
-    let allowed = fluid_settings_for_role(role).ok_or_else(|| {
-        engine.error(
+    if !matches!(role, "NONE" | "DOMAIN" | "FLOW" | "EFFECTOR") {
+        return Err(engine.error(
             ErrorCode::InvalidOperation,
             format!("invalid fluid_type `{role}`"),
             "/settings",
-        )
-    })?;
+        ));
+    }
     if let Some(field) = settings
         .keys()
-        .find(|field| !allowed.contains(&field.as_str()))
+        .find(|field| !fluid_setting_allowed(role, field.as_str()))
     {
         return Err(engine.error(
             ErrorCode::InvalidOperation,
@@ -1429,12 +1502,195 @@ fn validate_fluid_settings_role(
             &format!("/settings/{field}"),
         ));
     }
-    Ok(())
+    let (system, value) = match role {
+        "DOMAIN" => (
+            settings
+                .get("domain_type")
+                .and_then(Value::as_str)
+                .map_or("fluid_domain", physics_support::fluid_domain_system),
+            Value::Object(settings.clone()),
+        ),
+        "FLOW" => ("fluid_flow", Value::Object(settings.clone())),
+        "EFFECTOR" => ("fluid_effector", Value::Object(settings.clone())),
+        _ => return Ok(()),
+    };
+    if settings.get("domain_type").and_then(Value::as_str) == Some("GAS") {
+        return Err(unsupported_physics(
+            "physics.fluid.smoke_fire",
+            "gas (smoke and fire) domains are not supported; only liquid SPH simulation is",
+        ));
+    }
+    physics_support::reject_unhonoured(system, &value, physics_support::honoured_properties(system))
 }
 
 fn retain_fluid_settings_for_role(settings: &mut Map<String, Value>, role: &str) {
-    if let Some(allowed) = fluid_settings_for_role(role) {
-        settings.retain(|field, _| allowed.contains(&field.as_str()));
+    settings.retain(|field, _| fluid_setting_allowed(role, field.as_str()));
+}
+
+/// Blender-named settings that a system of any Potter kind might carry.
+fn is_blender_setting_of_any_role(field: &str) -> bool {
+    [
+        "fluid_domain",
+        "fluid_flow",
+        "fluid_effector",
+        "dynamic_paint_canvas",
+        "dynamic_paint_surface",
+        "dynamic_paint_brush",
+        "point_cache",
+    ]
+    .iter()
+    .any(|system| physics_support::is_blender_property(system, field))
+}
+
+/// Value check for a Blender RNA setting. Honoured numeric settings are range-checked; other
+/// Blender settings are accepted here and rejected later unless they stay at their default.
+fn blender_setting_valid(field: &str, value: &Value) -> bool {
+    let number = value.as_f64().filter(|number| number.is_finite());
+    match field {
+        "mass" => number.is_some_and(|mass| mass > 0.0),
+        "air_damping"
+        | "tension_stiffness"
+        | "compression_stiffness"
+        | "shear_stiffness"
+        | "bending_stiffness"
+        | "distance_min"
+        | "self_distance_min"
+        | "friction"
+        | "speed"
+        | "thickness_outer"
+        | "thickness_inner"
+        | "particle_radius"
+        | "density"
+        | "paint_distance"
+        | "paint_alpha" => number.is_some_and(|number| number >= 0.0),
+        "goal_min" | "goal_max" | "cache_frame_start" | "cache_frame_end" => number.is_some(),
+        "goal_spring" | "goal_default" => {
+            number.is_some_and(|number| (0.0..=1.0).contains(&number))
+        }
+        "cloth_friction" => number.is_some_and(|number| (0.0..=80.0).contains(&number)),
+        "quality" => value
+            .as_u64()
+            .is_some_and(|quality| (1..=32).contains(&quality)),
+        "resolution_max" => value.as_u64().is_some_and(|resolution| resolution >= 1),
+        "use_goal" | "use_edges" | "use_collision" | "use_self_collision" | "use_culling"
+        | "use_normal" | "use_effector" => value.is_boolean(),
+        "bending_model" => value
+            .as_str()
+            .is_some_and(|model| matches!(model, "ANGULAR" | "LINEAR")),
+        "domain_type" => value
+            .as_str()
+            .is_some_and(|kind| matches!(kind, "LIQUID" | "GAS")),
+        "flow_type" => value
+            .as_str()
+            .is_some_and(|kind| matches!(kind, "SMOKE" | "LIQUID" | "FIRE" | "BOTH")),
+        "flow_behavior" => value
+            .as_str()
+            .is_some_and(|kind| matches!(kind, "GEOMETRY" | "INFLOW" | "OUTFLOW")),
+        "flow_source" => value
+            .as_str()
+            .is_some_and(|source| matches!(source, "PARTICLES" | "MESH")),
+        "effector_type" => value
+            .as_str()
+            .is_some_and(|kind| matches!(kind, "COLLISION" | "GUIDE")),
+        "surface_type" => value
+            .as_str()
+            .is_some_and(|kind| matches!(kind, "PAINT" | "DISPLACE" | "WAVE" | "WEIGHT")),
+        "paint_color" => value.as_array().is_some_and(|color| {
+            matches!(color.len(), 3 | 4)
+                && color
+                    .iter()
+                    .all(|channel| channel.as_f64().is_some_and(f64::is_finite))
+        }),
+        // A null collection reference clears it, so every collider applies again.
+        "collection" | "collision_collection" | "effector_group" => {
+            value.is_null() || value.as_str().is_some()
+        }
+        "vertex_group_mass" | "vertex_group_goal" | "goal_group" => value.as_str().is_some(),
+        _ => true,
+    }
+}
+
+/// Value check for a Potter-native setting, including the particle emitter's names.
+fn native_setting_valid(field: &str, value: &Value) -> bool {
+    let number = value.as_f64().filter(|number| number.is_finite());
+    match field {
+        "seed" => value
+            .as_u64()
+            .is_some_and(|seed| u32::try_from(seed).is_ok()),
+        "iterations" => value
+            .as_u64()
+            .is_some_and(|count| (1..=64).contains(&count)),
+        "substeps" => value
+            .as_u64()
+            .is_some_and(|count| (1..=32).contains(&count)),
+        "resolution" => value
+            .as_u64()
+            .is_some_and(|count| (1..=10).contains(&count)),
+        "count" | "child_nbr" => value.as_u64().is_some_and(|count| count <= 1_000_000),
+        "rate" | "emission_rate" => number.is_some_and(|rate| (0.0..=1_000_000.0).contains(&rate)),
+        "lifetime" => number.is_some_and(|number| number > 0.0 && number <= 1_000_000.0),
+        "start_frame" | "end_frame" | "frame_start" | "frame_end" => number.is_some(),
+        "smoothing_length" | "radius" | "hair_length" | "particle_size" | "mass" => {
+            number.is_some_and(|number| number > 0.0)
+        }
+        "pressure_stiffness" | "viscosity" | "inflow_rate" | "strength" | "speed"
+        | "normal_factor" | "factor_random" | "normal_velocity" | "lifetime_random"
+        | "size_random" | "child_radius" => number.is_some_and(|number| number >= 0.0),
+        "color" => value.as_array().is_some_and(|color| {
+            color.len() == 4
+                && color
+                    .iter()
+                    .all(|channel| channel.as_f64().is_some_and(f64::is_finite))
+        }),
+        "velocity" => value.as_array().is_some_and(|velocity| {
+            velocity.len() == 3
+                && velocity
+                    .iter()
+                    .all(|component| component.as_f64().is_some_and(f64::is_finite))
+        }),
+        "random_velocity" => {
+            number.is_some_and(|number| number >= 0.0)
+                || value.as_array().is_some_and(|values| {
+                    values.len() == 3
+                        && values.iter().all(|component| {
+                            component
+                                .as_f64()
+                                .is_some_and(|number| number.is_finite() && number >= 0.0)
+                        })
+                })
+        }
+        "source" => value
+            .as_str()
+            .is_some_and(|source| matches!(source, "faces" | "vertices")),
+        "emit_from" => value
+            .as_str()
+            .is_some_and(|source| matches!(source, "VERT" | "FACE" | "VOLUME")),
+        "render_as" => value
+            .as_str()
+            .is_some_and(|mode| matches!(mode, "points" | "object" | "hair_curves")),
+        "render_type" => value
+            .as_str()
+            .is_some_and(|mode| matches!(mode, "HALO" | "PATH" | "OBJECT" | "COLLECTION")),
+        "physics_type" => value
+            .as_str()
+            .is_some_and(|kind| matches!(kind, "NEWTON" | "NO")),
+        "child_type" => value
+            .as_str()
+            .is_some_and(|kind| matches!(kind, "NONE" | "SIMPLE" | "INTERPOLATED")),
+        "instance_object" | "instance_collection" => {
+            value.as_str().is_some_and(|name| !name.is_empty())
+        }
+        "role" => value
+            .as_str()
+            .is_some_and(|role| matches!(role, "canvas" | "brush")),
+        "surface_format" => value
+            .as_str()
+            .is_some_and(|format| matches!(format, "color" | "weight")),
+        "brushes" => value
+            .as_array()
+            .is_some_and(|brushes| brushes.iter().all(|brush| brush.as_str().is_some())),
+        "collision_settings" => value.is_object(),
+        _ => false,
     }
 }
 
@@ -1443,270 +1699,37 @@ fn validate_physics_settings(
     system: &str,
     settings: &Map<String, Value>,
 ) -> Result<()> {
-    let allowed: &[&str] = match system {
-        "cloth" => &[
-            "stiffness",
-            "structural_stiffness",
-            "tension_stiffness",
-            "compression_stiffness",
-            "shear_stiffness",
-            "bend_stiffness",
-            "bending_stiffness",
-            "mass",
-            "air_drag",
-            "air_damping",
-            "drag",
-            "damping",
-            "substeps",
-            "iterations",
-            "quality",
-            "pin_group",
-            "vertex_group_mass",
-            "collision_enabled",
-            "use_collision",
-            "collision_distance",
-            "distance_min",
-            "use_self_collision",
-            "self_collision_distance",
-        ],
-        "soft_body" => &[
-            "stiffness",
-            "edge_stiffness",
-            "volume_stiffness",
-            "goal_group",
-            "vertex_group_goal",
-            "goal_strength",
-            "goal_stiffness",
-            "goal_spring",
-            "goal_friction",
-            "goal_default",
-            "goal_min",
-            "goal_max",
-            "mass",
-            "friction",
-            "speed",
-            "plastic",
-            "bend",
-            "substeps",
-            "iterations",
-            "quality",
-            "air_drag",
-            "drag",
-            "damping",
-            "restitution",
-        ],
-        "particle_emitter" => &[
-            "seed",
-            "count",
-            "rate",
-            "emission_rate",
-            "lifetime",
-            "lifetime_random",
-            "speed",
-            "normal_factor",
-            "factor_random",
-            "random_velocity",
-            "source",
-            "emit_from",
-            "velocity",
-            "normal_velocity",
-            "physics_type",
-            "mass",
-            "render_as",
-            "render_type",
-            "instance_object",
-            "hair_length",
-            "particle_size",
-            "size_random",
-            "child_nbr",
-            "child_radius",
-            "child_type",
-            "start_frame",
-            "end_frame",
-            "frame_start",
-            "frame_end",
-            "instance_collection",
-        ],
-        "fluid" => &[
-            "type",
-            "resolution",
-            "particle_radius",
-            "smoothing_length",
-            "pressure_stiffness",
-            "viscosity",
-            "inflow_rate",
-            "seed",
-        ],
-        "dynamic_paint" => &[
-            "role",
-            "radius",
-            "color",
-            "strength",
-            "brushes",
-            "surface_format",
-        ],
-        "collision" => &[
-            "thickness",
-            "thickness_outer",
-            "thickness_inner",
-            "damping",
-            "damping_factor",
-            "damping_random",
-            "permeability",
-            "stickiness",
-            "friction_factor",
-            "friction_random",
-            "use_culling",
-            "use_normal",
-            "use_particle_kill",
-        ],
-        _ => &[],
+    let (blender_system, native): (Option<&str>, &[&str]) = match system {
+        "cloth" => (Some("cloth"), &["iterations", "collision_settings"]),
+        "soft_body" => (Some("soft_body"), &["substeps", "iterations"]),
+        "collision" => (Some("collision"), &[]),
+        "particle_emitter" => (None, PARTICLE_SETTINGS),
+        // Fluid and Dynamic Paint names depend on the role, which the role validators check first.
+        _ => (None, &[]),
     };
+    let role_checked = matches!(system, "fluid" | "dynamic_paint");
     for (field, value) in settings {
-        if !allowed.contains(&field.as_str()) {
+        let potter_native = native.contains(&field.as_str())
+            || (role_checked
+                && (FLUID_DOMAIN_NATIVE_SETTINGS.contains(&field.as_str())
+                    || FLUID_FLOW_NATIVE_SETTINGS.contains(&field.as_str())
+                    || DYNAMIC_PAINT_NATIVE_SETTINGS.contains(&field.as_str())));
+        let blender = if role_checked {
+            !potter_native && is_blender_setting_of_any_role(field)
+        } else {
+            blender_system.is_some_and(|name| physics_support::is_blender_property(name, field))
+        };
+        if !blender && !potter_native && !role_checked {
             return Err(engine.error(
                 ErrorCode::InvalidOperation,
                 format!("unknown {system} setting `{field}`"),
                 &format!("/settings/{field}"),
             ));
         }
-        let valid = match field.as_str() {
-            "thickness"
-            | "thickness_outer"
-            | "thickness_inner"
-            | "collision_distance"
-            | "self_collision_distance"
-            | "distance_min"
-            | "child_radius" => value
-                .as_f64()
-                .is_some_and(|number| number.is_finite() && number >= 0.0),
-            "permeability" | "stickiness" | "damping_factor" | "damping_random"
-            | "friction_factor" | "friction_random" | "lifetime_random" | "size_random"
-            | "restitution" => value
-                .as_f64()
-                .is_some_and(|number| number.is_finite() && (0.0..=1.0).contains(&number)),
-            "use_particle_kill" | "collision_enabled" | "use_collision" | "use_self_collision"
-            | "use_culling" | "use_normal" => value.is_boolean(),
-            "seed" => value
-                .as_u64()
-                .is_some_and(|seed| u32::try_from(seed).is_ok()),
-            "substeps" | "quality" | "collision_quality" => value
-                .as_u64()
-                .is_some_and(|count| (1..=32).contains(&count)),
-            "iterations" => value
-                .as_u64()
-                .is_some_and(|count| (1..=64).contains(&count)),
-            "resolution" => value
-                .as_u64()
-                .is_some_and(|count| (1..=10).contains(&count)),
-            "count" | "child_nbr" => value.as_u64().is_some_and(|count| count <= 1_000_000),
-            "rate" | "emission_rate" => value
-                .as_f64()
-                .is_some_and(|rate| rate.is_finite() && (0.0..=1_000_000.0).contains(&rate)),
-            "lifetime" => value
-                .as_f64()
-                .is_some_and(|number| number.is_finite() && number > 0.0 && number <= 1_000_000.0),
-            "start_frame" | "end_frame" | "frame_start" | "frame_end" | "goal_min" | "goal_max" => {
-                value.as_f64().is_some_and(f64::is_finite)
-            }
-            "particle_radius" | "smoothing_length" | "radius" | "hair_length" | "particle_size"
-            | "mass" => value
-                .as_f64()
-                .is_some_and(|number| number.is_finite() && number > 0.0),
-            "stiffness"
-            | "structural_stiffness"
-            | "tension_stiffness"
-            | "compression_stiffness"
-            | "shear_stiffness"
-            | "bend_stiffness"
-            | "bending_stiffness"
-            | "edge_stiffness"
-            | "volume_stiffness"
-            | "goal_strength"
-            | "goal_stiffness"
-            | "goal_spring"
-            | "goal_friction"
-            | "goal_default"
-            | "air_drag"
-            | "air_damping"
-            | "drag"
-            | "damping"
-            | "pressure_stiffness"
-            | "viscosity"
-            | "inflow_rate"
-            | "strength"
-            | "speed"
-            | "normal_factor"
-            | "normal_velocity"
-            | "factor_random"
-            | "friction"
-            | "plastic"
-            | "bend" => value
-                .as_f64()
-                .is_some_and(|number| number.is_finite() && number >= 0.0),
-            "pin_group"
-            | "vertex_group_mass"
-            | "goal_group"
-            | "vertex_group"
-            | "instance_object"
-            | "vertex_group_goal"
-            | "instance_collection" => value.as_str().is_some_and(|name| !name.is_empty()),
-            "source" => value
-                .as_str()
-                .is_some_and(|source| matches!(source, "faces" | "vertices")),
-            "emit_from" => value
-                .as_str()
-                .is_some_and(|source| matches!(source, "VERT" | "FACE" | "VOLUME")),
-            "render_as" => value
-                .as_str()
-                .is_some_and(|mode| matches!(mode, "points" | "object" | "hair_curves")),
-            "render_type" => value
-                .as_str()
-                .is_some_and(|mode| matches!(mode, "HALO" | "PATH" | "OBJECT" | "COLLECTION")),
-            "physics_type" => value
-                .as_str()
-                .is_some_and(|kind| matches!(kind, "NEWTON" | "NO")),
-            "child_type" => value
-                .as_str()
-                .is_some_and(|kind| matches!(kind, "NONE" | "SIMPLE" | "INTERPOLATED")),
-            "type" => value
-                .as_str()
-                .is_some_and(|kind| matches!(kind, "liquid" | "smoke" | "fire")),
-            "role" => value
-                .as_str()
-                .is_some_and(|role| matches!(role, "canvas" | "brush")),
-            "surface_format" => value
-                .as_str()
-                .is_some_and(|format| matches!(format, "color" | "weight")),
-            "color" => value.as_array().is_some_and(|color| {
-                color.len() == 4
-                    && color
-                        .iter()
-                        .all(|channel| channel.as_f64().is_some_and(f64::is_finite))
-            }),
-            "velocity" => value.as_array().is_some_and(|velocity| {
-                velocity.len() == 3
-                    && velocity
-                        .iter()
-                        .all(|component| component.as_f64().is_some_and(f64::is_finite))
-            }),
-            "random_velocity" => {
-                value
-                    .as_f64()
-                    .is_some_and(|number| number.is_finite() && number >= 0.0)
-                    || value.as_array().is_some_and(|values| {
-                        values.len() == 3
-                            && values.iter().all(|component| {
-                                component
-                                    .as_f64()
-                                    .is_some_and(|number| number.is_finite() && number >= 0.0)
-                            })
-                    })
-            }
-            "brushes" => value
-                .as_array()
-                .is_some_and(|brushes| brushes.iter().all(|brush| brush.as_str().is_some())),
-            _ => false,
+        let valid = if blender {
+            blender_setting_valid(field, value)
+        } else {
+            native_setting_valid(field, value)
         };
         if !valid {
             return Err(engine.error(
@@ -1716,18 +1739,51 @@ fn validate_physics_settings(
             ));
         }
     }
-    if system == "fluid"
-        && settings
-            .get("type")
-            .and_then(Value::as_str)
-            .is_some_and(|kind| kind != "liquid")
+    if let Some(name) = blender_system {
+        physics_support::reject_unhonoured(
+            name,
+            &Value::Object(settings.clone()),
+            physics_support::honoured_properties(name),
+        )?;
+    }
+    if system == "cloth"
+        && let Some(collision) = settings.get("collision_settings")
     {
-        return Err(unsupported_physics(
-            "physics.fluid.smoke_fire",
-            "only liquid SPH simulation is supported; smoke and fire are not supported",
-        ));
+        validate_cloth_collision_settings(engine, collision)?;
     }
     Ok(())
+}
+
+/// Validates the nested `ClothCollisionSettings` block that the cloth solver reads.
+fn validate_cloth_collision_settings(engine: &Engine<'_>, collision: &Value) -> Result<()> {
+    let Some(collision) = collision.as_object() else {
+        return Err(engine.error(
+            ErrorCode::InvalidOperation,
+            "cloth collision_settings must be an object",
+            "/settings/collision_settings",
+        ));
+    };
+    for (field, value) in collision {
+        if !physics_support::is_blender_property("cloth_collision", field) {
+            return Err(engine.error(
+                ErrorCode::InvalidOperation,
+                format!("unknown cloth_collision setting `{field}`"),
+                &format!("/settings/collision_settings/{field}"),
+            ));
+        }
+        if !blender_setting_valid(field, value) {
+            return Err(engine.error(
+                ErrorCode::InvalidOperation,
+                format!("invalid value for cloth_collision setting `{field}`"),
+                &format!("/settings/collision_settings/{field}"),
+            ));
+        }
+    }
+    physics_support::reject_unhonoured(
+        "cloth_collision",
+        &Value::Object(collision.clone()),
+        physics_support::honoured_properties("cloth_collision"),
+    )
 }
 
 fn unsupported_physics(feature_id: &str, reason: &str) -> PotError {

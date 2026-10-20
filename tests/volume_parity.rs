@@ -293,14 +293,9 @@ fn check_fixture(file: OracleFile, shape: &str) {
             }
             mode => panic!("{shape}: unexpected resolution mode {mode}"),
         };
-        let volume = volume::mesh_to_fog_volume(
-            &mesh,
-            voxel_size,
-            case.interior_band_width,
-            case.density,
-            true,
-        )
-        .expect("Potter mesh-to-volume conversion");
+        let volume =
+            volume::mesh_to_fog_volume(&mesh, voxel_size, case.interior_band_width, case.density)
+                .expect("Potter mesh-to-volume conversion");
         for oracle in &case.volume_to_mesh {
             assert_eq!(oracle.smooth_flags.len(), oracle.polygon_count);
             assert!(oracle.smooth_flags.iter().all(|smooth| *smooth));
@@ -345,7 +340,7 @@ fn blender_5_2_2_volume_modifier_meshes_match_fixtures() {
 #[test]
 fn invalid_voxel_size_produces_no_mesh_to_volume_grid() {
     let mesh = Mesh::box_mesh(Default::default()).expect("valid cube");
-    let result = volume::mesh_to_fog_volume(&mesh, 1.0e-6, 0.2, 1.0, true)
+    let result = volume::mesh_to_fog_volume(&mesh, 1.0e-6, 0.2, 1.0)
         .expect("invalid modifier voxel size creates no grid");
     assert!(result.grids.is_empty());
 }

@@ -2125,6 +2125,8 @@ def dump_scene(scene):
                 "dicing_camera": dicing_camera.name_full if dicing_camera else None,
                 "passes": _render_passes(scene),
                 "cryptomatte_accurate": _cryptomatte_accurate(scene),
+                "use_simplify": bool(scene.render.use_simplify),
+                "simplify_volumes": float(scene.render.simplify_volumes),
             },
             "use_compositing": bool(getattr(scene.render, "use_compositing", False)),
             "compositor": _scene_compositor(scene),
@@ -2133,6 +2135,10 @@ def dump_scene(scene):
             "display_shading": _display_shading_dump(scene),
             "markers": [{"name": marker.name, "frame": int(marker.frame)} for marker in scene.timeline_markers],
             "rigid_body_world": _rigid_body_world_dump(scene),
+            "volume_modifier_objects": [
+                obj.name_full for obj in scene.objects
+                if any(modifier.type in ("MESH_TO_VOLUME", "VOLUME_DISPLACE", "VOLUME_TO_MESH")
+                       for modifier in obj.modifiers)],
             "sequencer": _sequencer_dump(scene),
             "root_collection": scene.get("potter.root_collection", scene.collection.get("potter.name", scene.collection.name_full)),
             "world": world_info, "custom_properties": custom_props(scene),
@@ -2379,6 +2385,16 @@ def _blender_id_pointer_type(block, key, current):
     except Exception:
         return None
     return None
+
+
+def _rna_writable(block, values):
+    # Potter's physics settings can hold keys that are not writable RNA properties of their block (`stiffness`,
+    # `use_collision`). Only the writable properties are set; the exporter reports the rest as losses.
+    if block is None:
+        return {}
+    properties = block.bl_rna.properties
+    return {key: value for key, value in values.items()
+            if properties.get(key) is not None and not properties[key].is_readonly}
 
 
 def set_rna(block, values, id_lookup=None, *, strict=False, owner=None):
@@ -3050,12 +3066,12 @@ def set_modifier_params(modifier, item, id_lookup, doc, target, node_id, obj, pa
             particle_system = getattr(modifier, "particle_system", None)
             settings_block = getattr(particle_system, "settings", None) if particle_system else None
         if settings_block is not None:
-            set_rna(settings_block, settings, id_lookup)
+            set_rna(settings_block, _rna_writable(settings_block, settings), id_lookup)
         if particle_system is not None and particle_seed is not None:
             particle_system.seed = int(particle_seed)
         if collision_settings is not None:
-            set_rna(getattr(modifier, "collision_settings", None),
-                    collision_settings, id_lookup)
+            collision_block = getattr(modifier, "collision_settings", None)
+            set_rna(collision_block, _rna_writable(collision_block, collision_settings), id_lookup)
         if canvas_surfaces:
             if kind != "dynamic_paint" or dynamic_paint_role != "canvas":
                 raise ValueError("Dynamic Paint canvas surfaces require canvas role")
@@ -3077,10 +3093,10 @@ def set_modifier_params(modifier, item, id_lookup, doc, target, node_id, obj, pa
                     surface_values = dict(surface_values)
                     surface_cache = surface_values.pop("point_cache", None)
                     surface = canvas_settings.canvas_surfaces[index]
-                    set_rna(surface, surface_values, id_lookup)
+                    set_rna(surface, _rna_writable(surface, surface_values), id_lookup)
                     if surface_cache:
                         cache_block = getattr(surface, "point_cache", None)
-                        set_rna(cache_block, surface_cache, id_lookup)
+                        set_rna(cache_block, _rna_writable(cache_block, surface_cache), id_lookup)
                         if surface_cache.get("is_baked"):
                             _bake_point_cache(obj, cache_block)
             finally:
@@ -3092,7 +3108,7 @@ def set_modifier_params(modifier, item, id_lookup, doc, target, node_id, obj, pa
         else:
             cache_block = getattr(modifier, "point_cache", None)
         if point_cache is not None:
-            set_rna(cache_block, point_cache, id_lookup)
+            set_rna(cache_block, _rna_writable(cache_block, point_cache), id_lookup)
             if point_cache.get("is_baked"):
                 _bake_point_cache(obj, cache_block)
     if dynamic_paint_temporary_link:

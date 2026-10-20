@@ -307,10 +307,10 @@ fn physics_system_operations_persist_update_and_delete_settings() {
             "schema_version":1,
             "base_revision":1,
             "operations":[
-                {"op":"physics.cloth.create","target":{"id":"body"},"settings":{"pin_group":"pinned","quality":4}},
-                {"op":"physics.soft_body.create","target":{"id":"body"},"settings":{"goal_group":"goal","volume_stiffness":0.9}},
+                {"op":"physics.cloth.create","target":{"id":"body"},"settings":{"vertex_group_mass":"pinned","quality":4}},
+                {"op":"physics.soft_body.create","target":{"id":"body"},"settings":{"vertex_group_goal":"goal","friction":0.4}},
                 {"op":"physics.particle_emitter.create","target":{"id":"body"},"settings":{"rate":3,"lifetime":20},"seed":17},
-                {"op":"physics.fluid.create","target":{"id":"body"},"settings":{"type":"liquid","resolution":8}},
+                {"op":"physics.fluid.create","target":{"id":"body"},"settings":{"domain_type":"LIQUID","resolution":8}},
                 {"op":"physics.dynamic_paint.create","target":{"id":"body"},"settings":{"role":"canvas","radius":0.5,"color":[0.2,0.4,0.8,1.0]}}
             ]
         }),
@@ -318,20 +318,20 @@ fn physics_system_operations_persist_update_and_delete_settings() {
     let stored: Value =
         serde_json::from_slice(&fs::read(scene.join("scene.json")).unwrap()).unwrap();
     assert_eq!(
-        stored["nodes"]["body"]["properties"]["physics_cloth"]["pin_group"],
+        stored["nodes"]["body"]["properties"]["physics_cloth"]["vertex_group_mass"],
         "pinned"
     );
     assert_eq!(
-        stored["nodes"]["body"]["properties"]["physics_soft_body"]["volume_stiffness"],
-        0.9
+        stored["nodes"]["body"]["properties"]["physics_soft_body"]["friction"],
+        0.4
     );
     assert_eq!(
         stored["nodes"]["body"]["properties"]["physics_particle_emitter"]["seed"],
         17
     );
     assert_eq!(
-        stored["nodes"]["body"]["properties"]["physics_fluid"]["type"],
-        "liquid"
+        stored["nodes"]["body"]["properties"]["physics_fluid"]["domain_type"],
+        "LIQUID"
     );
     assert_eq!(
         stored["nodes"]["body"]["properties"]["physics_dynamic_paint"]["role"],
@@ -359,8 +359,8 @@ fn physics_system_operations_persist_update_and_delete_settings() {
             "schema_version":1,
             "base_revision":2,
             "operations":[
-                {"op":"physics.cloth.update","target":{"id":"body"},"set":{"stiffness":0.7}},
-                {"op":"physics.soft_body.update","target":{"id":"body"},"set":{"volume_stiffness":0.8}},
+                {"op":"physics.cloth.update","target":{"id":"body"},"set":{"tension_stiffness":0.7}},
+                {"op":"physics.soft_body.update","target":{"id":"body"},"set":{"friction":0.8}},
                 {"op":"physics.particle_emitter.update","target":{"id":"body"},"set":{"rate":6}},
                 {"op":"physics.fluid.update","target":{"id":"body"},"set":{"viscosity":0.1}},
                 {"op":"physics.dynamic_paint.update","target":{"id":"body"},"set":{"strength":0.5}}
@@ -370,11 +370,11 @@ fn physics_system_operations_persist_update_and_delete_settings() {
     let updated: Value =
         serde_json::from_slice(&fs::read(scene.join("scene.json")).unwrap()).unwrap();
     assert_eq!(
-        updated["nodes"]["body"]["properties"]["physics_cloth"]["stiffness"],
+        updated["nodes"]["body"]["properties"]["physics_cloth"]["tension_stiffness"],
         0.7
     );
     assert_eq!(
-        updated["nodes"]["body"]["properties"]["physics_soft_body"]["volume_stiffness"],
+        updated["nodes"]["body"]["properties"]["physics_soft_body"]["friction"],
         0.8
     );
     assert_eq!(
@@ -456,7 +456,7 @@ fn fluid_smoke_and_fire_remain_honestly_unsupported() {
             "schema_version":1,
             "base_revision":1,
             "operations":[
-                {"op":"physics.fluid.create","target":{"id":"domain"},"settings":{"type":kind}}
+                {"op":"physics.fluid.create","target":{"id":"domain"},"settings":{"domain_type":"GAS"}}
             ]
         });
         let operations = directory.path().join(format!("unsupported_{kind}.json"));
@@ -502,7 +502,7 @@ fn cloth_keeps_a_pinned_corner_and_bounds_spring_lengths() {
         .collect::<Vec<_>>();
     let output = potter_core::sim::cloth::simulate(
         &mesh,
-        &json!({"pin_group":"pin","substeps":4,"iterations":12}),
+        &json!({"vertex_group_mass":"pin","quality":4,"iterations":12}),
         8.0,
         24.0,
         DVec3::new(0.0, 0.0, -9.81),
@@ -522,31 +522,10 @@ fn cloth_keeps_a_pinned_corner_and_bounds_spring_lengths() {
 }
 
 #[test]
-fn soft_body_sphere_rebounds_while_preserving_volume() {
+fn soft_body_sphere_stops_on_collider_without_penetrating() {
     use glam::DVec3;
     use potter_core::geom::{Mesh, UvSphereParams};
-
-    fn volume(mesh: &Mesh, positions: &[DVec3]) -> f64 {
-        let indices = mesh
-            .vertices
-            .iter()
-            .enumerate()
-            .map(|(index, vertex)| (vertex.id, index))
-            .collect::<std::collections::BTreeMap<_, _>>();
-        mesh.faces
-            .iter()
-            .map(|face| {
-                let first = positions[indices[&face.vertices[0]]];
-                (1..face.vertices.len() - 1)
-                    .map(|index| {
-                        let second = positions[indices[&face.vertices[index]]];
-                        let third = positions[indices[&face.vertices[index + 1]]];
-                        first.dot(second.cross(third)) / 6.0
-                    })
-                    .sum::<f64>()
-            })
-            .sum::<f64>()
-    }
+    use potter_core::sim::ColliderTriangle;
 
     let sphere = Mesh::uv_sphere(UvSphereParams {
         segments: 8,
@@ -554,18 +533,19 @@ fn soft_body_sphere_rebounds_while_preserving_volume() {
         radius: 1.0,
     })
     .unwrap();
-    let rest = sphere
-        .vertices
-        .iter()
-        .map(|vertex| vertex.co)
-        .collect::<Vec<_>>();
-    let rest_volume = volume(&sphere, &rest).abs();
-    let collider = [[
-        DVec3::new(-10.0, -10.0, -2.0),
-        DVec3::new(10.0, -10.0, -2.0),
-        DVec3::new(0.0, 10.0, -2.0),
-    ]];
-    let settings = json!({"substeps":4,"iterations":12,"volume_stiffness":0.9,"restitution":0.4});
+    let plane_height = -0.5;
+    let collider = [ColliderTriangle {
+        points: [
+            DVec3::new(-10.0, -10.0, plane_height),
+            DVec3::new(10.0, -10.0, plane_height),
+            DVec3::new(0.0, 10.0, plane_height),
+        ],
+        thickness_outer: 0.0,
+        thickness_inner: 0.0,
+        culling: false,
+        friction: 0.0,
+    }];
+    let settings = json!({"substeps":4,"iterations":12});
     let frame_12 = potter_core::sim::softbody::simulate(
         &sphere,
         &settings,
@@ -584,15 +564,29 @@ fn soft_body_sphere_rebounds_while_preserving_volume() {
         &collider,
     )
     .unwrap();
-    let frame_12_volume = volume(&sphere, &frame_12).abs();
-    assert!(((frame_12_volume / rest_volume) - 1.0).abs() <= 0.1);
+    let lowest = |positions: &[DVec3]| {
+        positions
+            .iter()
+            .map(|position| position.z)
+            .fold(f64::INFINITY, f64::min)
+    };
+    assert!(
+        lowest(&frame_12) >= plane_height - 1.0e-9,
+        "soft body penetrated the collider at frame 12: {}",
+        lowest(&frame_12)
+    );
+    assert!(
+        lowest(&frame_13) >= plane_height - 1.0e-9,
+        "soft body penetrated the collider at frame 13: {}",
+        lowest(&frame_13)
+    );
     let center_z = |positions: &[DVec3]| {
         positions.iter().map(|position| position.z).sum::<f64>()
             / f64::from(u32::try_from(positions.len()).unwrap())
     };
     assert!(
-        center_z(&frame_13) > center_z(&frame_12),
-        "soft-body sphere did not rebound: {} -> {}",
+        center_z(&frame_13) <= center_z(&frame_12) + 1.0e-9,
+        "soft-body sphere rose after contact: {} -> {}",
         center_z(&frame_12),
         center_z(&frame_13)
     );
@@ -743,11 +737,11 @@ fn simulation_bake_contains_deformed_meshes_particles_liquid_and_paint() {
                 {"op":"node.create","id":"brush","kind":"box","params":{"size":0.1}},
                 {"op":"physics.cloth.create","target":{"id":"cloth"}},
                 {"op":"physics.particle_emitter.create","target":{"id":"emitter"},"settings":{"rate":2,"lifetime":10,"speed":0.5},"seed":17},
-                {"op":"physics.fluid.create","target":{"id":"domain"},"settings":{"type":"liquid","resolution":4}},
-                {"op":"physics.fluid.create","target":{"id":"flow"},"settings":{"type":"liquid"}},
+                {"op":"physics.fluid.create","target":{"id":"domain"},"settings":{"domain_type":"LIQUID","resolution":4}},
+                {"op":"physics.fluid.create","target":{"id":"flow"},"settings":{}},
                 {"op":"modifier.update","target":{"id":"flow"},"modifier_id":"physics_fluid","set":{"params":{"fluid_type":"FLOW"}}},
                 {"op":"physics.fluid.update","target":{"id":"flow"},"set":{"inflow_rate":2.0}},
-                {"op":"physics.dynamic_paint.create","target":{"id":"brush"},"settings":{"role":"brush","radius":1.0,"color":[0.1,0.8,0.3,1.0]}},
+                {"op":"physics.dynamic_paint.create","target":{"id":"brush"},"settings":{"role":"brush","paint_distance":1.0,"paint_color":[0.1,0.8,0.3],"paint_alpha":1.0}},
                 {"op":"physics.dynamic_paint.create","target":{"id":"canvas"},"settings":{"role":"canvas","brushes":["brush"]}},
                 {"op":"physics.dynamic_paint.create","target":{"id":"weight_canvas"},"settings":{"role":"canvas","surface_format":"weight","brushes":["brush"]}}
             ]

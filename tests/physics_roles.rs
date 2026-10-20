@@ -286,7 +286,7 @@ fn none_and_domain_without_flows_preserve_their_input_meshes() {
         &json!([
             {"op":"node.create","id":"domain","kind":"box","params":{"size":4.0}},
             {"op":"node.create","id":"none","kind":"box","params":{"size":1.0}},
-            {"op":"physics.fluid.create","target":{"id":"domain"},"settings":{"type":"liquid","resolution":4}},
+            {"op":"physics.fluid.create","target":{"id":"domain"},"settings":{"domain_type":"LIQUID","resolution":4}},
             {"op":"modifier.create","target":{"id":"none"},"id":"none_fluid","type":"fluid"}
         ]),
     );
@@ -319,15 +319,16 @@ fn setup_flow_scene(scene: &Path, with_effector: bool) {
         json!({"op":"node.create","id":"domain","kind":"box","params":{"size":4.0}}),
         json!({"op":"node.create","id":"flow","kind":"box","params":{"size":1.0},"transform":{"translation":[0.0,0.0,1.5]}}),
         json!({"op":"node.create","id":"none","kind":"box","params":{"size":0.5}}),
-        json!({"op":"physics.fluid.create","target":{"id":"domain"},"settings":{"type":"liquid","resolution":4}}),
-        json!({"op":"physics.fluid.create","target":{"id":"flow"},"settings":{"type":"liquid"}}),
+        json!({"op":"physics.fluid.create","target":{"id":"domain"},"settings":{"domain_type":"LIQUID","resolution":4}}),
+        json!({"op":"physics.fluid.create","target":{"id":"flow"},"settings":{}}),
         json!({"op":"modifier.update","target":{"id":"flow"},"modifier_id":"physics_fluid","set":{"params":{"fluid_type":"FLOW"}}}),
         json!({"op":"physics.fluid.update","target":{"id":"flow"},"set":{"inflow_rate":8.0}}),
         json!({"op":"modifier.create","target":{"id":"none"},"id":"none_fluid","type":"fluid"}),
     ];
     if with_effector {
         operations.push(json!({"op":"node.create","id":"effector","kind":"box","params":{"size":0.3},"transform":{"translation":[0.0,0.0,0.95]}}));
-        operations.push(json!({"op":"physics.fluid.create","target":{"id":"effector"},"settings":{"type":"liquid"}}));
+        operations
+            .push(json!({"op":"physics.fluid.create","target":{"id":"effector"},"settings":{}}));
         operations.push(json!({"op":"modifier.update","target":{"id":"effector"},"modifier_id":"physics_fluid","set":{"params":{"fluid_type":"EFFECTOR"}}}));
     }
     apply_ok(scene, 0, &Value::Array(operations));
@@ -339,7 +340,6 @@ fn set_imported_flow_settings(scene: &Path, flow_type: &str, flow_behavior: &str
     let settings = document["nodes"]["flow"]["properties"]["physics_fluid"]
         .as_object_mut()
         .unwrap();
-    settings.remove("type");
     settings.remove("inflow_rate");
     settings.insert("flow_type".to_owned(), json!(flow_type));
     settings.insert("flow_behavior".to_owned(), json!(flow_behavior));
@@ -408,7 +408,7 @@ fn flow_emits_into_domains_and_effectors_only_affect_domain_output() {
 }
 
 #[test]
-fn imported_liquid_inflow_emits_without_native_rate_and_other_modes_stay_unsupported() {
+fn imported_liquid_flow_emits_only_at_a_native_rate_and_other_modes_stay_unsupported() {
     let directory = tempdir().unwrap();
     let liquid = directory.path().join("imported-liquid-flow");
     setup_flow_scene(&liquid, false);
@@ -420,9 +420,12 @@ fn imported_liquid_inflow_emits_without_native_rate_and_other_modes_stay_unsuppo
     assert_eq!(flow_settings["flow_behavior"], "INFLOW");
     assert_eq!(flow_settings["density"], 8.0);
 
+    // An imported LIQUID flow emits only at an explicit Potter inflow_rate; without one the bake is refused (see the mode loop).
+    let native = directory.path().join("native-flow-rate");
+    setup_flow_scene(&native, false);
     let frame = bake(
-        &liquid,
-        &directory.path().join("imported-liquid-flow-bake"),
+        &native,
+        &directory.path().join("native-flow-rate-bake"),
         "1:1",
         0,
     );
@@ -458,6 +461,7 @@ fn imported_liquid_inflow_emits_without_native_rate_and_other_modes_stay_unsuppo
     for (flow_type, flow_behavior, feature_id) in [
         ("SMOKE", "INFLOW", "physics.fluid.smoke_fire"),
         ("LIQUID", "GEOMETRY", "physics.fluid.flow_behavior"),
+        ("LIQUID", "INFLOW", "physics.fluid.emission"),
     ] {
         let scene = directory
             .path()
@@ -535,8 +539,8 @@ fn fluid_settings_follow_modifier_role_and_role_changes_drop_inapplicable_values
             .is_none()
     );
     assert_eq!(
-        document["nodes"]["flow"]["properties"]["physics_fluid"]["type"],
-        "liquid"
+        document["nodes"]["flow"]["modifiers"][0]["params"]["fluid_type"],
+        "DOMAIN"
     );
 
     assert_operation_error(

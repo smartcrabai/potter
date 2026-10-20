@@ -1166,11 +1166,9 @@ fn evaluate_modifier_output(
         let uses_lattice = modifier_stack
             .iter()
             .any(|modifier| modifier.enabled && modifier.modifier_type == "lattice");
-        let uses_volume_node = modifier_stack.iter().any(|modifier| {
-            modifier.enabled
-                && modifier.modifier_type == "volume_to_mesh"
-                && modifier.params.get("object").is_some_and(Value::is_string)
-        });
+        let uses_volume_node = modifier_stack
+            .iter()
+            .any(|modifier| modifier.enabled && modifier.modifier_type == "volume_to_mesh");
         let uses_scene_context = modifier_stack.iter().any(|modifier| {
             if !modifier.enabled {
                 return false;
@@ -1418,6 +1416,7 @@ fn evaluate_modifier_output(
                             engine.doc,
                             &world_matrices,
                             &volume_data,
+                            modifier_warnings,
                         ),
                         "surface_deform" | "mesh_deform" => {
                             crate::eval::apply_scene_deform_modifier(
@@ -2439,9 +2438,11 @@ fn validate_volume_displace_params(engine: &Engine<'_>, params: &Map<String, Val
             "/params/texture_map_mode",
         ));
     }
+    // Blender reads `texture_map_object` only in OBJECT mapping, so LOCAL and GLOBAL ignore it.
     if let Some(object) = params
         .get("texture_map_object")
         .filter(|value| !value.is_null())
+        && params.get("texture_map_mode").and_then(Value::as_str) == Some("OBJECT")
     {
         let Some(object_text) = object.as_str() else {
             return Err(engine.error(
