@@ -1679,12 +1679,6 @@ def _rotation_quaternion(source):
     return source.rotation_euler.to_quaternion()
 
 
-def _xyzw_to_wxyz(values):
-    """Blender's (w, x, y, z) order for a Potter (x, y, z, w) quaternion."""
-    x, y, z, w = values
-    return (w, x, y, z)
-
-
 def _pose_dump(obj):
     result = []
     if obj.type != "ARMATURE" or obj.pose is None:
@@ -1695,6 +1689,8 @@ def _pose_dump(obj):
         result.append({"bone": bone.name, "location": plain(bone.location),
                        "rotation_mode": bone.rotation_mode,
                        "rotation_quaternion": list(_rotation_quaternion(bone)),
+                       "rotation_euler": plain(bone.rotation_euler),
+                       "rotation_axis_angle": plain(bone.rotation_axis_angle),
                        "scale": plain(bone.scale),
                        "lock_ik": [bool(bone.lock_ik_x), bool(bone.lock_ik_y),
                                   bool(bone.lock_ik_z)],
@@ -5251,22 +5247,49 @@ def _set_object_solver_inverse(owner, constraint, owner_type, pose_bone=None,
             scene.frame_set(previous_frame, subframe=previous_subframe)
 
 
+def _pose_source_quaternion(item, mode):
+    """Blender quaternion of the source Euler or axis-angle values stored on a pose item, or None.
+
+    Only the field matching the source rotation mode is read, as the object path does.
+    """
+    if mode == "AXIS_ANGLE":
+        values = item.get("rotation_axis_angle")
+        if isinstance(values, (list, tuple)) and len(values) == 4:
+            return Quaternion(values[1:4], values[0])
+    elif mode != "QUATERNION":
+        values = item.get("rotation_euler")
+        if isinstance(values, (list, tuple)) and len(values) == 3:
+            return Euler(values, mode).to_quaternion()
+    return None
+
+
 def _restore_pose(obj, pose, id_lookup, doc, target):
     for item in pose or []:
         bone = obj.pose.bones.get(item.get("bone"))
         if bone is None:
             raise ValueError("pose references missing armature bone %s" % item.get("bone"))
+        # Source mode and new mode are the same payload field: the pose path has no separate model mode.
         bone.rotation_mode = item.get("rotation_mode", "QUATERNION")
         rotation = item.get("rotation_quaternion", (1.0, 0.0, 0.0, 0.0))
+        quaternion = Quaternion(rotation)
+        # Reuse stored Euler/axis-angle values when the rotation is unchanged, mirroring the object path.
+        source_quaternion = _pose_source_quaternion(item, bone.rotation_mode)
+        source_rotation_unchanged = (
+            source_quaternion is not None
+            and abs(abs(source_quaternion.dot(quaternion)) - 1.0) <= 1.0e-14
+        )
         if bone.rotation_mode == "QUATERNION":
             bone.rotation_quaternion = rotation
         elif bone.rotation_mode == "AXIS_ANGLE":
-            axis, angle = Quaternion((rotation[0], rotation[1], rotation[2], rotation[3])).to_axis_angle()
-            bone.rotation_axis_angle = (angle, axis.x, axis.y, axis.z)
+            if source_rotation_unchanged:
+                bone.rotation_axis_angle = item["rotation_axis_angle"]
+            else:
+                axis, angle = quaternion.to_axis_angle()
+                bone.rotation_axis_angle = (angle, axis.x, axis.y, axis.z)
+        elif source_rotation_unchanged:
+            bone.rotation_euler = item["rotation_euler"]
         else:
-            bone.rotation_euler = Quaternion(
-                (rotation[0], rotation[1], rotation[2], rotation[3])).to_euler(
-                    bone.rotation_mode)
+            bone.rotation_euler = quaternion.to_euler(bone.rotation_mode)
         bone.location = item.get("location", (0.0, 0.0, 0.0))
         bone.scale = item.get("scale", (1.0, 1.0, 1.0))
         bone.bbone_curveinx = item.get("bbone_curveinx", 0.0)
@@ -5392,7 +5415,7 @@ def _pose_from_model(doc, node):
         result.append({
             "bone": bone.get("name", bone_id),
             "location": pose.get("translation", [0.0, 0.0, 0.0]),
-            "rotation_quaternion": [rotation[3], rotation[0], rotation[1], rotation[2]],
+            "rotation_quaternion": list(_quaternion_from_native(rotation)),
             "scale": pose.get("scale", [1.0, 1.0, 1.0]),
             "lock_ik": pose.get("lock_ik", [False, False, False]),
             "use_ik_limit": pose.get("use_ik_limit", [False, False, False]),
@@ -7362,7 +7385,7 @@ def export_doc(doc, target, pack, scene_hash, context):
             source_axis_angle = source_object.get("rotation_axis_angle")
             if source_rotation_mode == "QUATERNION":
                 source_quaternion = (
-                    Quaternion(_xyzw_to_wxyz(source_rotation_values))
+                    Quaternion(_quaternion_from_native(source_rotation_values))
                     if isinstance(source_rotation_values, (list, tuple))
                     and len(source_rotation_values) == 4
                     else None
@@ -7425,8 +7448,7 @@ def export_doc(doc, target, pack, scene_hash, context):
         delta_rotation_quaternion = metadata.get("delta_rotation_quaternion")
         if (isinstance(delta_rotation_quaternion, (list, tuple))
                 and len(delta_rotation_quaternion) == 4):
-            obj.delta_rotation_quaternion = _xyzw_to_wxyz(
-                [float(value) for value in delta_rotation_quaternion])
+            obj.delta_rotation_quaternion = _quaternion_from_native(delta_rotation_quaternion)
         obj.hide_viewport = not item.get("visible", True)
         obj.hide_render = not item.get("render_visible", True)
         obj.hide_select = not item.get("selectable", True)
