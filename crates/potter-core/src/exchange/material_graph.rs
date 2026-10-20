@@ -250,7 +250,7 @@ fn write_principled_inputs(node: &mut GraphNode, material: &Material) {
     // the Alpha input's default of one applies.
     if material.alpha_mode != "opaque" {
         node.inputs
-            .insert("Alpha".to_owned(), json!(material.base_color[3]));
+            .insert("Alpha".to_owned(), json!(constant_alpha(material)));
     }
     node.inputs
         .insert("Base Color".to_owned(), json!(material.base_color));
@@ -292,7 +292,24 @@ fn build_graph(
                 ("principled", "Base Color"),
             )?;
         }
-        if material.alpha_mode != "opaque" {
+        if material.alpha_mode == "clip" {
+            let compare = insert_clip(
+                &mut graph,
+                "base_alpha",
+                material.alpha_threshold,
+                "principled",
+                "Alpha",
+            )?;
+            multiply_channel(
+                &mut graph,
+                &color,
+                "Alpha",
+                "base_alpha",
+                material.base_color[3],
+                &compare,
+                "Value",
+            )?;
+        } else if material.alpha_mode != "opaque" {
             multiply_channel(
                 &mut graph,
                 &color,
@@ -549,6 +566,52 @@ fn multiply_channel(
     insert(graph, &math, node)?;
     connect(graph, split, channel, &math, "Value")?;
     connect(graph, &math, "Value", to, to_socket)
+}
+
+/// The Principled Alpha of a material whose alpha is not linked. A clip material's alpha is binary, as Blender's glTF
+/// importer sets a factor-only MASK (`pbrMetallicRoughness.py` 630-640): one where the base alpha reaches the cutoff.
+fn constant_alpha(material: &Material) -> f64 {
+    let alpha = material.base_color[3];
+    if material.alpha_mode == "clip" {
+        if alpha >= material.alpha_threshold {
+            1.0
+        } else {
+            0.0
+        }
+    } else {
+        alpha
+    }
+}
+
+/// Blender's glTF MASK clip stage (`pbrMetallicRoughness.py` 668-700), as the importer builds it: `{name}_clip` is a
+/// LESS_THAN against `cutoff`, and `{name}_clip_invert` is SUBTRACT(1, that), feeding `to`. The socket is 1 where the
+/// compared alpha reaches the cutoff, else 0. Returns the LESS_THAN node; link the alpha source into its `Value` input.
+fn insert_clip(
+    graph: &mut NodeGroup,
+    name: &str,
+    cutoff: f64,
+    to: &str,
+    to_socket: &str,
+) -> Result<String> {
+    let compare = format!("{name}_clip");
+    let mut compare_node = GraphNode::new("ShaderNodeMath");
+    compare_node
+        .properties
+        .insert("operation".to_owned(), json!("LESS_THAN"));
+    compare_node
+        .inputs
+        .insert("Value_001".to_owned(), json!(cutoff));
+    insert(graph, &compare, compare_node)?;
+    let invert = format!("{name}_clip_invert");
+    let mut invert_node = GraphNode::new("ShaderNodeMath");
+    invert_node
+        .properties
+        .insert("operation".to_owned(), json!("SUBTRACT"));
+    invert_node.inputs.insert("Value".to_owned(), json!(1.0));
+    insert(graph, &invert, invert_node)?;
+    connect(graph, &compare, "Value", &invert, "Value_001")?;
+    connect(graph, &invert, "Value", to, to_socket)?;
+    Ok(compare)
 }
 
 fn insert(graph: &mut NodeGroup, name: &str, node: GraphNode) -> Result<()> {
@@ -1051,7 +1114,25 @@ fn overlay_authored(
             (texel.as_str(), "Color"),
             (principled.as_str(), "Base Color"),
         )?;
-        if material.alpha_mode != "opaque" {
+        if material.alpha_mode == "clip" {
+            let source = take_input_link(&mut graph, &principled, "Alpha");
+            let compare = insert_clip(
+                &mut graph,
+                &format!("{prefix}_alpha"),
+                material.alpha_threshold,
+                principled.as_str(),
+                "Alpha",
+            )?;
+            let value = input_scalar(&inputs, "Alpha", 1.0);
+            multiply_input(
+                &mut graph,
+                source,
+                value,
+                (texel.as_str(), "Alpha"),
+                &format!("{prefix}_alpha"),
+                (compare.as_str(), "Value"),
+            )?;
+        } else if material.alpha_mode != "opaque" {
             let source = take_input_link(&mut graph, &principled, "Alpha");
             let value = input_scalar(&inputs, "Alpha", 1.0);
             multiply_input(
@@ -1487,6 +1568,66 @@ mod tests {
         let (losses, edits) = plan_blend_textures(&doc)?;
         assert!(losses.is_empty(), "{losses:?}");
         assert_eq!(edits.removed_graphs, vec![Id::new("default_graph")?]);
+        Ok(())
+    }
+    #[test]
+    fn clip_alpha_is_binary_and_other_modes_keep_the_base_alpha() {
+        let mut material = Material {
+            alpha_mode: "clip".to_owned(),
+            alpha_threshold: 0.37,
+            base_color: [0.8, 0.2, 0.1, 0.8],
+            ..Material::default()
+        };
+        // Blender's importer sets a factor-only MASK to 1 where the factor reaches the cutoff, else 0.
+        assert!(crate::float::equal_f64(constant_alpha(&material), 1.0));
+        material.base_color[3] = 0.2;
+        assert!(crate::float::equal_f64(constant_alpha(&material), 0.0));
+        material.alpha_mode = "blend".to_owned();
+        assert!(crate::float::equal_f64(constant_alpha(&material), 0.2));
+        material.alpha_mode = "opaque".to_owned();
+        let mut node = GraphNode::new("ShaderNodeBsdfPrincipled");
+        write_principled_inputs(&mut node, &material);
+        // An opaque material leaves the Alpha input at its default of one.
+        assert!(!node.inputs.contains_key("Alpha"));
+    }
+
+    #[test]
+    fn clip_stage_is_the_importers_less_than_then_subtract_mask() -> Result<()> {
+        let mut graph = NodeGroup::new("shader".to_owned(), GraphKind::Shader);
+        insert(
+            &mut graph,
+            "principled",
+            GraphNode::new("ShaderNodeBsdfPrincipled"),
+        )?;
+        let compare = insert_clip(&mut graph, "base_alpha", 0.37, "principled", "Alpha")?;
+        assert_eq!(compare, "base_alpha_clip");
+        let compare_node = &graph.nodes[&Id::new("base_alpha_clip")?];
+        assert_eq!(compare_node.properties["operation"], json!("LESS_THAN"));
+        assert_eq!(compare_node.inputs["Value_001"], json!(0.37));
+        let invert_node = &graph.nodes[&Id::new("base_alpha_clip_invert")?];
+        assert_eq!(invert_node.properties["operation"], json!("SUBTRACT"));
+        assert_eq!(invert_node.inputs["Value"], json!(1.0));
+        let has_link = |from: &str, from_socket: &str, to: &str, to_socket: &str| {
+            graph.links.iter().any(|link| {
+                link.from_node.as_str() == from
+                    && link.from_socket == from_socket
+                    && link.to_node.as_str() == to
+                    && link.to_socket == to_socket
+            })
+        };
+        // The compared alpha feeds SUBTRACT's second input, and the inverted result drives Alpha.
+        assert!(has_link(
+            "base_alpha_clip",
+            "Value",
+            "base_alpha_clip_invert",
+            "Value_001"
+        ));
+        assert!(has_link(
+            "base_alpha_clip_invert",
+            "Value",
+            "principled",
+            "Alpha"
+        ));
         Ok(())
     }
 }

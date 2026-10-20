@@ -1,0 +1,14 @@
+{
+  "generator": "tests/fixtures/native_oracle/blend_clip_mask_render.py",
+  "blender": "5.2.2",
+  "engine": "CYCLES",
+  "samples": 8,
+  "resolution": 64,
+  "window": [16, 48],
+  "window_pixels": 1024,
+  "window_opaque": 485,
+  "window_transparent": 486,
+  "window_fractional": 53,
+  "window_fraction_fractional": 0.0518,
+  "fractional_band": [0.01, 0.99]
+}
