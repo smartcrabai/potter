@@ -36,9 +36,6 @@ const MAX_VOLUME_STEPS: usize = 2048;
 /// have their own counter, and the path ends past this many.
 const VOLUME_BOUNDS_MAX: u32 = 1024;
 
-// Calibrated against the Blender-gated Cycles VDB comparison; surface lighting uses its own energy convention.
-const VOLUME_DIRECT_LIGHT_SCALE: f64 = 0.75;
-
 #[derive(Clone, Copy)]
 struct PointLight {
     position: DVec3,
@@ -848,7 +845,7 @@ fn trace_path(
         let receiver = match previous {
             Scatter::Surface(vertex) if volumes.is_empty() => Some(vertex.point),
             Scatter::Delta(point) => Some(point),
-            Scatter::Camera | Scatter::Surface(_) | Scatter::Volume => None,
+            Scatter::Camera | Scatter::Surface(_) | Scatter::Volume(_) => None,
         };
         let light = receiver.and_then(|receiver| {
             nearest_light_hit(lights, origin, direction, receiver, surface_distance)
@@ -889,16 +886,21 @@ fn trace_path(
             if bounce == max_bounces {
                 break;
             }
-            direction = sample_henyey_greenstein_direction(direction, event.anisotropy, rng);
+            let incoming = direction;
+            direction = sample_henyey_greenstein_direction(incoming, event.anisotropy, rng);
+            let phase_pdf = henyey_greenstein(
+                incoming.normalize_or_zero().dot(direction),
+                event.anisotropy,
+            );
             origin = event.point + direction * RAY_EPSILON;
-            previous = Scatter::Volume;
+            previous = Scatter::Volume(phase_pdf);
             bounce += 1;
             continue;
         }
         if let Some(light) = light {
             let weight = match previous {
                 Scatter::Surface(vertex) => power_heuristic(vertex.bsdf_pdf, light.pdf),
-                Scatter::Camera | Scatter::Delta(_) | Scatter::Volume => 1.0,
+                Scatter::Camera | Scatter::Delta(_) | Scatter::Volume(_) => 1.0,
             };
             radiance += throughput * light.radiance * weight;
             origin += direction * (light.distance + RAY_EPSILON);
@@ -917,7 +919,9 @@ fn trace_path(
                     vertex.bsdf_pdf,
                     environment_light_pdf(vertex.normal, direction, importance),
                 ),
-                Scatter::Volume => 0.5,
+                Scatter::Volume(phase_pdf) => {
+                    power_heuristic(phase_pdf, volume_sampling_pdf(direction, importance))
+                }
             };
             radiance += throughput * environment * environment_weight;
             escaped = true;
@@ -1564,7 +1568,7 @@ fn direct_volume_lighting(
             evaluator_workspace,
         )?;
         let phase = henyey_greenstein(incoming_direction.dot(sample.direction), event.anisotropy);
-        contribution += sample.radiance * (phase * visibility * VOLUME_DIRECT_LIGHT_SCALE);
+        contribution += sample.radiance * (phase * visibility);
     }
     let (direction, pdf) = if let Some(sampler) = importance {
         sampler.sample(rng)
@@ -1589,7 +1593,8 @@ fn direct_volume_lighting(
             evaluator_workspace,
         )?;
         let phase = henyey_greenstein(incoming_direction.dot(direction), event.anisotropy);
-        contribution += incoming * (phase * visibility * 0.5 / pdf);
+        let weight = power_heuristic(pdf, phase);
+        contribution += incoming * (phase * visibility * weight / pdf);
     }
     Ok(contribution)
 }
@@ -1608,6 +1613,14 @@ fn power_heuristic(first_pdf: f64, second_pdf: f64) -> f64 {
     let first_squared = first_pdf * first_pdf;
     let second_squared = second_pdf * second_pdf;
     first_squared / (first_squared + second_squared).max(f64::MIN_POSITIVE)
+}
+
+/// The density with which `direct_volume_lighting` and the environment miss sample a direction: the
+/// importance map's density, or the uniform sphere's when there is no map.
+fn volume_sampling_pdf(direction: DVec3, importance: Option<&WorldImportanceSampler>) -> f64 {
+    importance.map_or(1.0 / (4.0 * std::f64::consts::PI), |sampler| {
+        sampler.pdf(direction)
+    })
 }
 
 #[expect(
@@ -2076,9 +2089,10 @@ enum Scatter {
     Delta(DVec3),
     /// A continuous surface bounce, weighted against light sampling by its lobe-mixture density.
     Surface(MisVertex),
-    /// A volume phase bounce. Its environment weight stays the fixed value of the volume path, and
-    /// its lights are light-sampled only.
-    Volume,
+    /// A volume phase bounce. `phase_pdf` is the Henyey-Greenstein density of the direction it
+    /// scattered into, for the MIS weight of an environment hit (`direct_volume_lighting` weighs the
+    /// same direction against the environment sampling density). Lights are light-sampled only.
+    Volume(f64),
 }
 
 /// Outcome of sampling the Principled BSDF. `Continuous` carries the exact lobe-mixture density
