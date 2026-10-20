@@ -749,8 +749,11 @@ struct GlassLobe {
     /// Multiscatter gain `1 + Fms · (1 - E) / E` per channel, from the view. It scales the eval and not
     /// the density, as Cycles' `energy_scale` and the darkening of the weight together do.
     gain: DVec3,
-    /// A delta lobe: light sampling cannot reach it, and `sample_glass` draws it alone.
+    /// Roughness below Cycles' almost-specular threshold: the eval is zero and `sample_glass` draws a delta.
     singular: bool,
+    /// An IOR of 1. Cycles' `bsdf_microfacet_sample` makes a refraction there a delta (the straight-through
+    /// direction), while `bsdf_microfacet_eval` keeps the roughness-only flag, so the eval stays rough.
+    straight: bool,
 }
 
 /// The glass lobe at a shading point with normal `normal` seen along `view`, or `None` when its weight
@@ -776,7 +779,8 @@ fn glass_lobe(params: &BsdfParams, normal: DVec3, view: DVec3) -> Option<GlassLo
     .clamp(DVec3::ZERO, DVec3::ONE);
     let reflection_tint = DVec3::from_array(params.glass_reflection_tint).max(DVec3::ZERO);
     let transmission_tint = DVec3::from_array(params.glass_transmission_tint).max(DVec3::ZERO);
-    let singular = alpha * alpha <= GLASS_SINGULAR_ALPHA_SQUARED || (ior - 1.0).abs() < 1.0e-4;
+    let singular = alpha * alpha <= GLASS_SINGULAR_ALPHA_SQUARED;
+    let straight = (ior - 1.0).abs() < 1.0e-4;
 
     // `microfacet_ggx_preserve_energy`: the GGX_GLASS tables at the view, the inverse ones below an IOR of 1.
     let inverse = ior < 1.0;
@@ -808,7 +812,7 @@ fn glass_lobe(params: &BsdfParams, normal: DVec3, view: DVec3) -> Option<GlassLo
         reflection_tint,
         transmission_tint,
         gain,
-        singular,
+        straight,
     })
 }
 
@@ -953,7 +957,8 @@ pub(crate) fn sample_glass(
     if (geometric.dot(direction) < 0.0) != refracts || (normal.dot(direction) < 0.0) != refracts {
         return GlassSample::Absorbed;
     }
-    if !lobe.singular {
+    // Cycles' `m_singular` also covers a refraction at an IOR of 1 (`|eta - 1| < 1e-4`).
+    if !(lobe.singular || (refracts && lobe.straight)) {
         return GlassSample::Rough { direction };
     }
     let (value, share) = if refracts {
@@ -1328,7 +1333,7 @@ mod glass_tests {
             reflection_tint: DVec3::ONE,
             transmission_tint: DVec3::ONE,
             gain: DVec3::ONE,
-            singular: false,
+            straight: false,
         };
         let back = GlassLobe {
             ior: 1.0 / ior,
@@ -1633,6 +1638,23 @@ mod glass_tests {
             (coarse - fine).abs().max_element() <= 0.015_211_354,
             "coarse {coarse:?} vs fine {fine:?}"
         );
+    }
+
+    #[test]
+    fn glass_at_ior_one_refracts_straight_through_as_a_delta() {
+        // Cycles' `bsdf_microfacet_sample` makes a refraction at |eta - 1| < 1e-4 singular, and its direction
+        // is -wi whatever the half vector: the reflectance is zero, so every draw refracts.
+        let params = principled_glass(1.0, 0.5);
+        let shading = layers(&params, DVec3::Z, view());
+        for u in [0.1, 0.5, 0.9] {
+            let GlassSample::Singular { direction, weight } =
+                sample_glass(&params, &shading, DVec3::Z, 1.0, [0.3, 0.7, u])
+            else {
+                panic!("a refraction at an IOR of 1 is a delta");
+            };
+            assert!((direction + view()).length() < 1.0e-9, "{direction:?}");
+            assert!(weight.x.is_finite() && weight.x > 0.0, "{weight:?}");
+        }
     }
 }
 

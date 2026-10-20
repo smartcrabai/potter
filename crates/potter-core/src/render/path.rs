@@ -1675,22 +1675,15 @@ fn shadow_transmittance(
                 return Ok(DVec3::ZERO);
             }
         }
+        // Cycles' shadow transparency is the Transparent closure's extinction, `(1 - alpha) · tint`
+        // (`kernel/integrator/surface_shader.h`, `surface_shader_transparency`). A glass or other transmissive
+        // closure has none, so it blocks the shadow ray: its shader lacks `SD_HAS_TRANSPARENT_SHADOW`
+        // (`scene/shader.cpp`, `kernel/bvh/intersect_filter.h`).
         let alpha = surface.params.alpha.clamp(0.0, 1.0);
-        let transmission = surface.params.transmission.clamp(0.0, 1.0);
-        if alpha >= 1.0 && transmission <= 0.0 {
+        if alpha >= 1.0 {
             return Ok(DVec3::ZERO);
         }
-        // Each transparent share passes its Transparent colour, `(1 - alpha) * tint` as Cycles' closure weight
-        // (`bsdf_transparent.h`). A glass share passes its transmission, tinted by the base colour as before.
-        let base_tint = DVec3::new(
-            surface.params.base_color[0],
-            surface.params.base_color[1],
-            surface.params.base_color[2],
-        )
-        .max_element()
-        .clamp(0.0, 1.0);
-        transmittance *= DVec3::from_array(surface.params.transparent_tint) * (1.0 - alpha)
-            + DVec3::splat(alpha * transmission * base_tint);
+        transmittance *= DVec3::from_array(surface.params.transparent_tint) * (1.0 - alpha);
         if transmittance.max_element() <= 1.0e-5 {
             return Ok(DVec3::ZERO);
         }
