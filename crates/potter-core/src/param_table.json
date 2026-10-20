@@ -1515,6 +1515,7 @@
       "required": []
     },
     "bevel": {
+      "aliases": [["width", "width_pct"]],
       "properties": {
         "show_in_editmode": {
           "type": "boolean",
@@ -2421,6 +2422,16 @@
           "default": 0,
           "minimum": 0,
           "maximum": 255
+        },
+        "total_levels": {
+          "type": "integer",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 13
+        },
+        "is_external": {
+          "type": "boolean",
+          "default": false
         },
         "filepath": {
           "type": "string",
@@ -3951,6 +3962,7 @@
       "required": []
     },
     "simple_deform": {
+      "aliases": [["angle", "factor"]],
       "properties": {
         "show_in_editmode": {
           "type": "boolean",

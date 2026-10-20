@@ -1098,8 +1098,16 @@ fn load_strip_image(
     let (image_width, image_height, pixels) =
         storage::decode_pixels(&bytes, ImageColorspace::Srgb)?;
     let data = ImageData {
+        colour: crate::image::ColourCache::default(),
+        storage: crate::image::ImageStorage {
+            straight_alpha: storage::default_alpha_mode(&bytes)
+                == crate::model::ImageAlphaMode::Straight,
+            ..crate::image::ImageStorage::default()
+        },
         width: image_width,
         height: image_height,
+        srgb: storage::decodes_srgb(ImageColorspace::Srgb),
+        udim: false,
         pixels,
         tiles: std::collections::BTreeMap::new(),
         interpolation: ImageInterpolation::Linear,
@@ -1113,6 +1121,28 @@ fn resize_image_data(data: &ImageData, width: u32, height: u32) -> Result<RgbaFr
             "image strip source and output dimensions must be non-zero",
         ));
     }
+    // Resizing samples straight colour. A straight or data image is sampled as stored, so it is not copied. A
+    // premultiplied image is unpremultiplied into a new buffer, which the temporary image owns.
+    match data.straight_pixels() {
+        std::borrow::Cow::Borrowed(_) => resample_image(data, width, height),
+        std::borrow::Cow::Owned(pixels) => {
+            let straight = ImageData {
+                width: data.width,
+                height: data.height,
+                pixels,
+                tiles: std::collections::BTreeMap::new(),
+                interpolation: data.interpolation,
+                srgb: data.srgb,
+                udim: data.udim,
+                colour: crate::image::ColourCache::default(),
+                storage: crate::image::ImageStorage::default(),
+            };
+            resample_image(&straight, width, height)
+        }
+    }
+}
+
+fn resample_image(source: &ImageData, width: u32, height: u32) -> Result<RgbaFrame> {
     let count = usize::try_from(width)
         .ok()
         .and_then(|width| {
@@ -1130,12 +1160,12 @@ fn resize_image_data(data: &ImageData, width: u32, height: u32) -> Result<RgbaFr
     for y in 0..height {
         for x in 0..width {
             let sampled = sample(
-                data,
+                source,
                 [
                     (f64::from(x) + 0.5) / f64::from(width),
                     (f64::from(y) + 0.5) / f64::from(height),
                 ],
-                0,
+                false,
             );
             pixels.push([
                 finite_f64_to_f32(sampled[0])?,
@@ -1461,7 +1491,14 @@ fn write_exr(path: &Path, rgba: &[[f32; 4]], width: u32, height: u32) -> Result<
     }
     exr::prelude::write_rgba_file(path, width_usize, height_usize, |x, y| {
         let pixel = rgba[y * width_usize + x];
-        (pixel[0], pixel[1], pixel[2], pixel[3])
+        // EXR stores associated alpha: Blender reads an EXR as premultiplied (its default `alpha_mode` for a file
+        // without `oiio:UnassociatedAlpha`), so the colour is multiplied by alpha, as its OpenEXR writer expects.
+        (
+            pixel[0] * pixel[3],
+            pixel[1] * pixel[3],
+            pixel[2] * pixel[3],
+            pixel[3],
+        )
     })
     .map_err(|error| {
         PotError::new(

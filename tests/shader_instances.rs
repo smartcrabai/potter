@@ -38,11 +38,15 @@ fn link(group: &mut NodeGroup, from: &str, from_socket: &str, to: &str, to_socke
 
 fn image_data(width: u32, height: u32, pixels: Vec<[f64; 4]>) -> ImageData {
     ImageData {
+        colour: potter_core::image::ColourCache::default(),
+        storage: potter_core::image::ImageStorage::default(),
         width,
         height,
         pixels,
         tiles: BTreeMap::new(),
         interpolation: ImageInterpolation::Linear,
+        srgb: false,
+        udim: false,
     }
 }
 
@@ -51,6 +55,7 @@ fn texture_ref(image: &str, uv_layer: Option<&str>) -> TextureRef {
         image: Id::new(image).unwrap(),
         uv_layer: uv_layer.map(str::to_owned),
         interpolation: ImageInterpolation::Closest,
+        extension: potter_core::image::ImageExtension::Repeat,
     }
 }
 
@@ -58,7 +63,14 @@ fn material_texture_images() -> BTreeMap<String, ImageData> {
     BTreeMap::from([
         (
             "base_image".to_owned(),
-            image_data(2, 1, vec![[1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 0.5]]),
+            ImageData {
+                // Straight alpha, as a straight PNG stores it: Blender premultiplies it at load (sampling.rs).
+                storage: potter_core::image::ImageStorage {
+                    straight_alpha: true,
+                    ..potter_core::image::ImageStorage::default()
+                },
+                ..image_data(2, 1, vec![[1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 0.5]])
+            },
         ),
         (
             "roughness_image".to_owned(),
@@ -295,6 +307,8 @@ fn image_texture_samples_resolved_pixels_using_hit_uvs() {
     let image_data = BTreeMap::from([(
         "test_image".to_owned(),
         ImageData {
+            colour: potter_core::image::ColourCache::default(),
+            storage: potter_core::image::ImageStorage::default(),
             width: 2,
             height: 1,
             pixels: vec![[1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0]],
@@ -304,9 +318,13 @@ fn image_texture_samples_resolved_pixels_using_hit_uvs() {
                     width: 1,
                     height: 1,
                     pixels: vec![[0.0, 0.0, 1.0, 1.0]],
+                    precision: potter_core::image::Precision::Float,
+                    colour: potter_core::image::ColourCache::default(),
                 },
             )]),
             interpolation: ImageInterpolation::Linear,
+            srgb: false,
+            udim: true,
         },
     )]);
     let mut context = HitContext::new(&groups).with_images(&image_data);
@@ -327,6 +345,8 @@ fn image_texture_routes_blender_v_up_udims_and_flips_local_v() {
     let images = BTreeMap::from([(
         "test_image".to_owned(),
         ImageData {
+            colour: potter_core::image::ColourCache::default(),
+            storage: potter_core::image::ImageStorage::default(),
             width: 1,
             height: 1,
             pixels: vec![[0.25, 0.25, 0.25, 1.0]],
@@ -337,6 +357,8 @@ fn image_texture_routes_blender_v_up_udims_and_flips_local_v() {
                         width: 1,
                         height: 1,
                         pixels: vec![[0.0, 1.0, 0.0, 1.0]],
+                        precision: potter_core::image::Precision::Float,
+                        colour: potter_core::image::ColourCache::default(),
                     },
                 ),
                 (
@@ -345,10 +367,14 @@ fn image_texture_routes_blender_v_up_udims_and_flips_local_v() {
                         width: 1,
                         height: 2,
                         pixels: vec![[1.0, 0.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]],
+                        precision: potter_core::image::Precision::Float,
+                        colour: potter_core::image::ColourCache::default(),
                     },
                 ),
             ]),
             interpolation: ImageInterpolation::Closest,
+            srgb: false,
+            udim: true,
         },
     )]);
     let make_material = |mapped: bool, vector: [f64; 3]| {
@@ -387,7 +413,8 @@ fn image_texture_routes_blender_v_up_udims_and_flips_local_v() {
     let cases = [
         ([0.25, 1.25, 0.0], [0.0, 0.0, 1.0, 1.0]),
         ([1.25, 0.25, 0.0], [0.0, 1.0, 0.0, 1.0]),
-        ([0.25, 2.25, 0.0], [0.0; 4]),
+        // Tile 1021 is not stored. Cycles returns its missing colour, magenta, not transparent black.
+        ([0.25, 2.25, 0.0], [1.0, 0.0, 1.0, 1.0]),
     ];
     for mapped in [false, true] {
         for (vector, expected) in cases {
@@ -441,10 +468,14 @@ fn material_volume_output_evaluates_volume_properties() {
     link(&mut graph, "volume", "Volume", "out", "Volume");
     let (material, groups) = material_with_graph(graph);
     let params = evaluate_surface(&material, &HitContext::new(&groups)).unwrap();
-    assert_eq!(params.volume_density, 0.7);
-    assert_eq!(params.volume_color, [0.2, 0.4, 0.6]);
+    // Principled Volume at Density 0.7: σs = Color · 0.7 and σa = (1 - Color) · 0.7, absolute.
+    for (actual, expected) in params.volume_scatter.iter().zip([0.14, 0.28, 0.42]) {
+        assert!((actual - expected).abs() < 1e-12);
+    }
+    for (actual, expected) in params.volume_absorption.iter().zip([0.56, 0.42, 0.28]) {
+        assert!((actual - expected).abs() < 1e-12);
+    }
     assert_eq!(params.volume_anisotropy, 0.35);
-    assert!(params.volume_scattering);
 }
 #[test]
 fn material_texture_refs_sample_uv_and_override_pbr_fields_for_graphs() {
@@ -461,6 +492,8 @@ fn material_texture_refs_sample_uv_and_override_pbr_fields_for_graphs() {
     let (mut material, groups) = material_with_graph(graph);
     let graph_id = material.node_tree.clone().unwrap();
     material.node_tree = None;
+    // Texture alpha is part of a non-opaque material's alpha (Blender links the base texture's Alpha only then).
+    material.alpha_mode = "blend".to_owned();
     material.base_color = [0.5, 0.25, 0.75, 1.0];
     material.metallic = 0.5;
     material.roughness = 0.8;
@@ -483,6 +516,8 @@ fn material_texture_refs_sample_uv_and_override_pbr_fields_for_graphs() {
         .with_uv_layers(layers);
     context.uv = [0.25, 0.5];
     let simple = evaluate_surface(&material, &context).unwrap();
+    // Blender 5.2.2 (Cycles, straight texel (0, 1, 0) at alpha 0.5, Emission under the same factor): Alpha linked
+    // unassociates the colour to (0, 1, 0), so the 0.25 green factor gives 0.25.
     assert_eq!(simple.base_color, [0.0, 0.25, 0.0, 1.0]);
     assert_eq!(simple.alpha, 0.5);
     assert_eq!(simple.roughness, 0.2);
@@ -508,6 +543,14 @@ fn material_texture_refs_sample_uv_and_override_pbr_fields_for_graphs() {
     assert_eq!(warnings.borrow().len(), 1);
     assert_eq!(warnings.borrow()[0]["code"], json!("uv.layer_missing"));
     assert_eq!(warnings.borrow()[0]["layer"], json!("missing_uv"));
+    // An opaque material leaves its base texture's alpha unlinked, so Cycles renders it opaque
+    // (probed in Blender 5.2.2: an unlinked RGBA texture gives alpha 1, linked gives 0.5).
+    material.alpha_mode = "opaque".to_owned();
+    material.base_color_texture.as_mut().unwrap().uv_layer = Some("UVMap".to_owned());
+    let opaque = evaluate_surface(&material, &context).unwrap();
+    assert_eq!(opaque.alpha, 1.0);
+    // Blender 5.2.2: Alpha unlinked keeps the premultiplied colour (0, 0.5, 0), so the factor gives 0.125.
+    assert_eq!(opaque.base_color, [0.0, 0.125, 0.0, 1.0]);
 }
 
 fn uv_map_material(layer: &str) -> (Material, Registry<NodeGroup>) {

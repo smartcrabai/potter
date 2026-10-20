@@ -27,9 +27,9 @@ use potter_core::{
     cli::{ApplyArgs, Context, InspectArgs, UndoArgs},
     commands::{apply, inspect, redo, undo},
     hash,
-    model::{Modifier, SceneDoc},
+    model::{DataBlock, Id, LightData, Modifier, Node, SceneDoc},
     ops,
-    store::{HistoryRecord, Project},
+    store::Project,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -84,9 +84,9 @@ fn history_blob_paths(scene: &Path) -> TestResult<Vec<PathBuf>> {
     Ok(paths)
 }
 
-/// Checks each history blob against its content address and checks that re-serializing the
-/// record with the current code reproduces the stored bytes exactly.
-fn verify_history_blobs(scene: &Path) -> TestResult<usize> {
+/// Checks stored history blobs against their raw content addresses and canonical JSON bytes. Historical
+/// snapshots are then read through `Project::history_records`, which applies the normal schema upgrades.
+fn verify_history_blobs(scene: &Path, project: &Project) -> TestResult<usize> {
     let paths = history_blob_paths(scene)?;
     for path in &paths {
         let raw = fs::read(path)?;
@@ -97,10 +97,11 @@ fn verify_history_blobs(scene: &Path) -> TestResult<usize> {
             .ok_or("history blob directory must be named by its digest")?;
         let digest = format!("sha256:{hex}");
         assert_eq!(hash::sha256(&raw), digest, "{}", path.display());
-        let record: HistoryRecord = serde_json::from_slice(&raw)?;
-        let reserialized = hash::canonicalize(&serde_json::to_value(&record)?)?;
-        assert_eq!(reserialized, raw, "{}", path.display());
+        let value: Value = serde_json::from_slice(&raw)?;
+        assert_eq!(hash::canonicalize(&value)?, raw, "{}", path.display());
     }
+    let (records, _) = project.history_records()?;
+    assert_eq!(records.len(), paths.len());
     Ok(paths.len())
 }
 
@@ -164,7 +165,7 @@ fn old_project_loads_with_its_recorded_hashes() -> TestResult {
     assert_eq!(records.len(), OLD_BLOB_COUNT);
     assert_eq!(records[0].0, OLD_HEAD_ID);
     assert_eq!(records[0].1.scene_hash, OLD_HEAD_SCENE_HASH);
-    assert_eq!(verify_history_blobs(&scene)?, OLD_BLOB_COUNT);
+    assert_eq!(verify_history_blobs(&scene, &project)?, OLD_BLOB_COUNT);
     Ok(())
 }
 
@@ -218,7 +219,10 @@ fn apply_undo_redo_keep_old_project_hashes_verifiable() -> TestResult {
     let applied = applied.ok_or("apply must commit")?;
     assert_eq!(applied.revision, 3);
     assert_eq!(applied.hash, Project::open(&scene)?.info()?.hash);
-    assert_eq!(verify_history_blobs(&scene)?, OLD_BLOB_COUNT + 1);
+    assert_eq!(
+        verify_history_blobs(&scene, &Project::open(&scene)?)?,
+        OLD_BLOB_COUNT + 1
+    );
     assert_no_visibility_keys(&scene)?;
     assert_eq!(array_count(&scene)?, 4);
     let applied_doc = serde_json::to_value(Project::open(&scene)?.doc())?;
@@ -232,7 +236,10 @@ fn apply_undo_redo_keep_old_project_hashes_verifiable() -> TestResult {
     assert_eq!(undone.revision, 4);
     assert_eq!(undone.hash, Project::open(&scene)?.info()?.hash);
     assert_eq!(array_count(&scene)?, 3);
-    assert_eq!(verify_history_blobs(&scene)?, OLD_BLOB_COUNT + 2);
+    assert_eq!(
+        verify_history_blobs(&scene, &Project::open(&scene)?)?,
+        OLD_BLOB_COUNT + 2
+    );
 
     let (redone, _) = redo::run(UndoArgs {
         scene: scene.clone(),
@@ -243,7 +250,10 @@ fn apply_undo_redo_keep_old_project_hashes_verifiable() -> TestResult {
     assert_eq!(redone.revision, 5);
     assert_eq!(redone.hash, Project::open(&scene)?.info()?.hash);
     assert_eq!(array_count(&scene)?, 4);
-    assert_eq!(verify_history_blobs(&scene)?, OLD_BLOB_COUNT + 3);
+    assert_eq!(
+        verify_history_blobs(&scene, &Project::open(&scene)?)?,
+        OLD_BLOB_COUNT + 3
+    );
     assert_no_visibility_keys(&scene)?;
 
     let redone_doc = serde_json::to_value(Project::open(&scene)?.doc())?;
@@ -304,5 +314,73 @@ fn default_visibility_flags_are_omitted_and_read_as_true() -> TestResult {
     let value = serde_json::to_value(&modifier)?;
     assert!(value.get("show_viewport").is_none());
     assert!(value.get("show_render").is_none());
+    Ok(())
+}
+
+#[test]
+fn legacy_light_without_soft_falloff_keeps_its_canonical_hash() -> TestResult {
+    let mut document = SceneDoc::new(SCENE_ID.to_owned());
+    let data_id = Id::new("light_data")?;
+    let node_id = Id::new("light_node")?;
+    document.data_blocks.insert(
+        data_id.clone(),
+        DataBlock {
+            data_type: "light".to_owned(),
+            mesh: None,
+            light: Some(LightData::default()),
+            ..DataBlock::default()
+        },
+    );
+    document.nodes.insert(
+        node_id.clone(),
+        Node {
+            name: "Light".to_owned(),
+            kind: "light".to_owned(),
+            data: Some(data_id.clone()),
+            ..Node::default()
+        },
+    );
+    let root = document.scenes[&document.active_scene]
+        .root_collection
+        .clone();
+    document
+        .collections
+        .get_mut(&root)
+        .ok_or("root collection is missing")?
+        .objects
+        .push(node_id);
+
+    // A schema-2 document has an actual light but predates this field.
+    let mut legacy = serde_json::to_value(&document)?;
+    legacy["data_blocks"][data_id.as_str()]["light"]
+        .as_object_mut()
+        .ok_or("light data is missing")?
+        .remove("soft_falloff");
+    let old_bytes = hash::canonicalize(&legacy)?;
+    let old_hash = hash::sha256(&old_bytes);
+
+    let loaded: SceneDoc = serde_json::from_value(legacy)?;
+    assert!(
+        loaded.data_blocks[&data_id]
+            .light
+            .as_ref()
+            .is_some_and(|light| light.soft_falloff)
+    );
+    let current_bytes = hash::canonicalize(&serde_json::to_value(&loaded)?)?;
+    assert_eq!(current_bytes, old_bytes);
+    assert_eq!(hash::sha256(&current_bytes), old_hash);
+
+    let mut disabled = loaded;
+    disabled
+        .data_blocks
+        .get_mut(&data_id)
+        .and_then(|data| data.light.as_mut())
+        .ok_or("light data is missing")?
+        .soft_falloff = false;
+    let serialized = serde_json::to_value(disabled)?;
+    assert_eq!(
+        serialized["data_blocks"][data_id.as_str()]["light"]["soft_falloff"],
+        false
+    );
     Ok(())
 }

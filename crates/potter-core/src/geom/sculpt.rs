@@ -1,35 +1,64 @@
 //! Deterministic, attribute-aware sculpt stroke evaluation over persistent meshes.
 
-use glam::{DQuat, DVec3};
+use glam::DVec3;
 use serde_json::{Value, json};
 
 use crate::{
     error::{PotError, Result},
-    geom::Mesh,
+    geom::{Mesh, normals, sculpt_dabs, uv_layers},
 };
 
+/// A sculpt brush. Every brush applies one dab per sample, in order (`sculpt_dabs`), as Blender's
+/// DOTS strokes do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Brush {
-    Draw,
+pub enum DabBrush {
     ClayStrips,
     Inflate,
-    Grab,
+    Layer,
+    Draw,
+    DrawSharp,
+    Blob,
+    Nudge,
+    Crease,
+    Pinch,
     Smooth,
     Flatten,
-    Pinch,
-    Crease,
-    Layer,
+    Fill,
+    Scrape,
+    Grab,
     SnakeHook,
     Thumb,
     Rotate,
-    Nudge,
-    Blob,
-    Scrape,
-    Fill,
-    DrawSharp,
     Elastic,
-    PoseLite,
-    BoundaryLite,
+    /// Blender's Pose brush: an inverse-kinematics chain rotates or scales the region around the
+    /// stroke's topological origin.
+    Pose(PoseDeform),
+    /// Blender's Boundary brush: the mesh boundary nearest the stroke is deformed and its falloff
+    /// runs into the mesh.
+    Boundary(BoundaryDeform),
+}
+
+/// Blender's `pose_deform_type`. Potter has no invert input, so each variant is the non-inverted
+/// branch of the matching Blender mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PoseDeform {
+    /// `BRUSH_POSE_DEFORM_ROTATE_TWIST`, non-inverted: rotate the chain toward the grab target.
+    RotateTwist,
+    /// `BRUSH_POSE_DEFORM_SCALE_TRANSLATE`, non-inverted: rotate, then scale along the chain.
+    ScaleTranslate,
+    /// `BRUSH_POSE_DEFORM_SQUASH_STRETCH`: scale the segment along its own axis, uniform in x and y.
+    SquashStretch,
+}
+
+/// Blender's `boundary_deform_type`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoundaryDeform {
+    Bend,
+    Expand,
+    Inflate,
+    Grab,
+    Twist,
+    Smooth,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,6 +69,10 @@ pub enum Falloff {
     Sharp,
     Linear,
     Constant,
+    /// Blender's `BRUSH_CURVE_SMOOTHER` (Clay Strips default): smootherstep of `1 - t`.
+    Smoother,
+    /// Blender's `BRUSH_CURVE_POW4` (Draw Sharp default): `(1 - t)^4` (`brush.cc` 1581).
+    Pow4,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -53,12 +86,14 @@ pub struct StrokeSample {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Stroke {
-    pub brush: Brush,
+    pub brush: DabBrush,
     pub samples: Vec<StrokeSample>,
     pub falloff: Falloff,
     pub symmetry: Vec<String>,
-    pub seed: u64,
     pub delta: Option<DVec3>,
+    /// Direction toward the viewer in mesh space. Blender's brushes read the view for the area
+    /// normal's facing groups and for the grab delta's plane. `None` means no view.
+    pub view: Option<DVec3>,
 }
 
 /// Apply a stroke in the mesh coordinate space. Symmetry planes pass through the origin.
@@ -81,26 +116,17 @@ pub fn apply_stroke_with_dyntopo(
     dyntopo_edge_length: Option<f64>,
 ) -> Result<bool> {
     validate_stroke(stroke)?;
-    if stroke.brush == Brush::Grab && stroke.delta.is_none() {
-        return Err(invalid("grab brush requires delta"));
-    }
-    if stroke.brush == Brush::Rotate && stroke.delta.is_some_and(|delta| delta.length() == 0.0) {
+    let accepts_delta = matches!(
+        stroke.brush,
+        DabBrush::Grab
+            | DabBrush::SnakeHook
+            | DabBrush::Thumb
+            | DabBrush::Nudge
+            | DabBrush::Elastic,
+    );
+    if !accepts_delta && stroke.delta.is_some() {
         return Err(invalid(
-            "rotate brush delta must be a nonzero axis-angle vector",
-        ));
-    }
-    if stroke.brush != Brush::Grab
-        && stroke.brush != Brush::SnakeHook
-        && stroke.brush != Brush::Thumb
-        && stroke.brush != Brush::Rotate
-        && stroke.brush != Brush::Nudge
-        && stroke.brush != Brush::Elastic
-        && stroke.brush != Brush::PoseLite
-        && stroke.brush != Brush::BoundaryLite
-        && stroke.delta.is_some()
-    {
-        return Err(invalid(
-            "delta is supported only by grab, snake_hook, thumb, rotate, nudge, elastic_deform, pose_lite, and boundary_lite brushes",
+            "delta is supported only by grab, snake_hook, thumb, nudge, and elastic_deform brushes",
         ));
     }
     if let Some(edge_length) = dyntopo_edge_length
@@ -108,83 +134,13 @@ pub fn apply_stroke_with_dyntopo(
     {
         return Err(invalid("dyntopo edge length must be finite and positive"));
     }
-    let positions = vertex_positions(mesh);
-    let normals = vertex_normals(mesh, &positions);
-    let adjacency = vertex_adjacency(mesh);
-    let boundary_adjacency = boundary_adjacency(mesh);
+    let normals = vertex_normals(mesh);
     let mask_values = read_scalar_attribute(mesh, "sculpt.mask")?;
-    let mirrors = mirrored_samples(stroke)?;
-    let (first_sample, last_sample) = stroke
-        .samples
-        .first()
-        .zip(stroke.samples.last())
-        .ok_or_else(|| invalid("sculpt stroke must contain at least one sample"))?;
-    let trajectory = last_sample.position - first_sample.position;
-    let mut next_positions = Vec::with_capacity(mesh.vertices.len());
-    let mut changed = false;
-
-    for vertex in &mesh.vertices {
-        let normal = normals.get(&vertex.id).copied().unwrap_or(DVec3::Z);
-        let mut influence = 0.0_f64;
-        let mut center = DVec3::ZERO;
-        let mut delta = DVec3::ZERO;
-        let mut motion = trajectory;
-        let mut radius = 0.0;
-        for sample in &mirrors {
-            let (closest, pressure, sample_radius, strength, sample_delta) =
-                sample_influence(vertex.co, sample);
-            if sample_radius <= 0.0 {
-                continue;
-            }
-            let distance = vertex.co.distance(closest);
-            if distance > sample_radius {
-                continue;
-            }
-            let amount = stroke.falloff.weight(distance / sample_radius) * pressure * strength;
-            if amount > influence {
-                influence = amount;
-                center = closest;
-                delta = sample_delta;
-                motion = sample.to - sample.from;
-                radius = sample_radius;
-            }
-        }
-        let mask = mask_values
-            .get(&vertex.id)
-            .copied()
-            .unwrap_or(0.0)
-            .clamp(0.0, 1.0);
-        influence *= 1.0 - mask;
-        let position = if influence <= 0.0 {
-            vertex.co
-        } else {
-            deform_vertex(
-                stroke,
-                vertex.co,
-                normal,
-                center,
-                delta,
-                motion,
-                radius,
-                influence,
-                adjacency.get(&vertex.id).map(Vec::as_slice),
-                boundary_adjacency.get(&vertex.id).map(Vec::as_slice),
-                &positions,
-            )
-        };
-        changed |= position != vertex.co;
-        next_positions.push((vertex.id, position));
-    }
-    if changed {
-        for (vertex, (id, position)) in mesh.vertices.iter_mut().zip(next_positions) {
-            debug_assert_eq!(vertex.id, id);
-            vertex.co = position;
-        }
-    }
-    if let Some(edge_length) = dyntopo_edge_length {
-        changed |= dyntopo_edges_under_brush(mesh, stroke, edge_length)?;
-    }
-    Ok(changed)
+    let changed = sculpt_dabs::apply_dabs(mesh, stroke, stroke.brush, &normals, &mask_values);
+    Ok(match dyntopo_edge_length {
+        Some(edge_length) => changed | dyntopo_edges_under_brush(mesh, stroke, edge_length)?,
+        None => changed,
+    })
 }
 
 /// Subdivide long edges and collapse short local edges inside a sculpt brush.
@@ -204,160 +160,6 @@ fn dyntopo_edges_under_brush(mesh: &mut Mesh, stroke: &Stroke, edge_length: f64)
     let subdivided = split_long_edges(mesh, stroke, edge_length)?;
     let collapsed = collapse_short_edges(mesh, stroke, edge_length * 0.5)?;
     Ok(subdivided || collapsed)
-}
-
-fn deform_vertex(
-    stroke: &Stroke,
-    point: DVec3,
-    normal: DVec3,
-    center: DVec3,
-    sample_delta: DVec3,
-    stroke_motion: DVec3,
-    radius: f64,
-    influence: f64,
-    neighbors: Option<&[u32]>,
-    boundary_neighbors: Option<&[u32]>,
-    positions: &std::collections::BTreeMap<u32, DVec3>,
-) -> DVec3 {
-    let motion = if stroke.delta.is_some() {
-        sample_delta
-    } else {
-        stroke_motion
-    };
-    match stroke.brush {
-        Brush::Draw | Brush::ClayStrips | Brush::Inflate | Brush::Layer => {
-            let multiplier = if stroke.brush == Brush::ClayStrips {
-                0.75
-            } else {
-                1.0
-            };
-            let deterministic = deterministic_scale(stroke.seed, point, &stroke.symmetry);
-            point + normal * (influence * multiplier * deterministic)
-        }
-        Brush::Grab => point + sample_delta * influence,
-        Brush::Smooth => {
-            let Some(neighbors) = neighbors.filter(|neighbors| !neighbors.is_empty()) else {
-                return point;
-            };
-            let average = average_neighbor_position(positions, neighbors);
-            point.lerp(average, influence)
-        }
-        Brush::Flatten => {
-            let signed_distance = (point - center).dot(normal);
-            point - normal * signed_distance * influence
-        }
-        Brush::Pinch => point.lerp(center, influence),
-        Brush::Crease => {
-            let toward = center - point;
-            point + toward * influence + normal * (influence * 0.1)
-        }
-        Brush::SnakeHook => point + motion * influence,
-        Brush::Thumb => {
-            let tangent = motion - normal * motion.dot(normal);
-            if tangent.length_squared() > 0.0 {
-                point + tangent.normalize() * (motion.length() * influence)
-            } else {
-                point
-            }
-        }
-        Brush::Rotate => {
-            let rotation = stroke.delta.unwrap_or(normal * std::f64::consts::FRAC_PI_2);
-            let angle = rotation.length() * influence;
-            if angle == 0.0 {
-                point
-            } else {
-                (DQuat::from_axis_angle(rotation.normalize(), angle) * (point - center)) + center
-            }
-        }
-        Brush::Nudge => {
-            let direction = if motion.length_squared() > 0.0 {
-                motion.normalize()
-            } else {
-                return point;
-            };
-            point + direction * (radius * 0.25 * influence)
-        }
-        Brush::Blob => point + normal * (2.0 * influence - influence.powi(2)),
-        Brush::Scrape | Brush::Fill => {
-            let signed_distance = (point - center).dot(normal);
-            let amount = if stroke.brush == Brush::Scrape {
-                signed_distance.max(0.0)
-            } else {
-                signed_distance.min(0.0)
-            };
-            point - normal * (amount * influence)
-        }
-        Brush::DrawSharp => point + normal * influence.powf(1.5),
-        Brush::Elastic => point + motion * influence.powi(2),
-        Brush::PoseLite => {
-            let angle = if stroke.delta.is_some() {
-                sample_delta.length()
-            } else {
-                (motion.length() / radius.max(f64::EPSILON)).min(1.0) * std::f64::consts::FRAC_PI_4
-            };
-            let axis = if stroke.delta.is_some() && sample_delta.length_squared() > 0.0 {
-                sample_delta.normalize()
-            } else {
-                normal
-            };
-            let rotated =
-                (DQuat::from_axis_angle(axis, angle * influence) * (point - center)) + center;
-            rotated + motion * influence
-        }
-        Brush::BoundaryLite => {
-            let Some(neighbors) = boundary_neighbors.filter(|neighbors| neighbors.len() == 2)
-            else {
-                return point;
-            };
-            let (Some(before), Some(after)) =
-                (positions.get(&neighbors[0]), positions.get(&neighbors[1]))
-            else {
-                return point;
-            };
-            let tangent = *after - *before;
-            if tangent.length_squared() == 0.0 || motion.length_squared() == 0.0 {
-                point
-            } else {
-                let tangent = tangent.normalize();
-                point + tangent * (motion.dot(tangent) * influence)
-            }
-        }
-    }
-}
-
-fn boundary_adjacency(mesh: &Mesh) -> std::collections::BTreeMap<u32, Vec<u32>> {
-    let mut edge_face_count = std::collections::BTreeMap::<[u32; 2], usize>::new();
-    for face in &mesh.faces {
-        for index in 0..face.vertices.len() {
-            let a = face.vertices[index];
-            let b = face.vertices[(index + 1) % face.vertices.len()];
-            let key = if a < b { [a, b] } else { [b, a] };
-            *edge_face_count.entry(key).or_default() += 1;
-        }
-    }
-    let mut adjacency = std::collections::BTreeMap::<u32, Vec<u32>>::new();
-    for edge in &mesh.edges {
-        let key = if edge.vertices[0] < edge.vertices[1] {
-            edge.vertices
-        } else {
-            [edge.vertices[1], edge.vertices[0]]
-        };
-        if edge_face_count.get(&key) == Some(&1) {
-            adjacency
-                .entry(edge.vertices[0])
-                .or_default()
-                .push(edge.vertices[1]);
-            adjacency
-                .entry(edge.vertices[1])
-                .or_default()
-                .push(edge.vertices[0]);
-        }
-    }
-    for neighbors in adjacency.values_mut() {
-        neighbors.sort_unstable();
-        neighbors.dedup();
-    }
-    adjacency
 }
 
 fn split_long_edges(mesh: &mut Mesh, stroke: &Stroke, edge_length: f64) -> Result<bool> {
@@ -481,11 +283,24 @@ fn split_edge(mesh: &mut Mesh, edge_id: u32) -> Result<bool> {
         .ok_or_else(|| invalid("dyntopo edge disappeared during subdivision"))?;
     original_edge.vertices = [a, midpoint_id];
     let edge_key = if a < b { [a, b] } else { [b, a] };
+    let corner_store = read_corner_data(mesh);
+    let mut sources = Vec::with_capacity(mesh.faces.len());
     for face in &mut mesh.faces {
-        let mut vertices = Vec::with_capacity(face.vertices.len() + 1);
-        for index in 0..face.vertices.len() {
+        let face_len = face.vertices.len();
+        let contains_edge = (0..face_len).any(|index| {
             let current = face.vertices[index];
-            let next = face.vertices[(index + 1) % face.vertices.len()];
+            let next = face.vertices[(index + 1) % face_len];
+            let key = if current < next {
+                [current, next]
+            } else {
+                [next, current]
+            };
+            key == edge_key
+        });
+        let mut vertices = Vec::with_capacity(face_len + 1);
+        for index in 0..face_len {
+            let current = face.vertices[index];
+            let next = face.vertices[(index + 1) % face_len];
             vertices.push(current);
             let key = if current < next {
                 [current, next]
@@ -496,8 +311,16 @@ fn split_edge(mesh: &mut Mesh, edge_id: u32) -> Result<bool> {
                 vertices.push(midpoint_id);
             }
         }
+        let face_sources = if contains_edge {
+            // Blender rebuilds every face on the split edge as new triangles with default loops.
+            vec![CornerSource::Created; vertices.len()]
+        } else {
+            (0..face_len).map(CornerSource::Kept).collect()
+        };
         face.vertices = vertices;
+        sources.push((face.id, Some(face_sources)));
     }
+    remap_corner_data(mesh, &corner_store, &sources);
     for (name, value) in vertex_values {
         set_attribute_value(mesh, &name, format!("v{midpoint_id}"), value);
     }
@@ -635,22 +458,43 @@ fn collapse_edge(mesh: &mut Mesh, endpoints: [u32; 2]) -> Result<()> {
             .ok_or_else(|| invalid("dyntopo edge references a missing vertex"))?;
         keep_position.lerp(remove_position, 0.5)
     };
+    let corner_store = read_corner_data(mesh);
+    let mut sources = Vec::with_capacity(mesh.faces.len());
     let mut removed_faces = std::collections::BTreeSet::new();
     for face in &mut mesh.faces {
-        for vertex in &mut face.vertices {
-            if *vertex == remove {
-                *vertex = keep;
-            }
+        let touches_removed = face.vertices.contains(&remove);
+        // Each corner carries the old corner index it came from, through the same remap, dedup and
+        // closing-corner pop as the vertex list.
+        let mut corners = face
+            .vertices
+            .iter()
+            .enumerate()
+            .map(|(index, &vertex)| (if vertex == remove { keep } else { vertex }, index))
+            .collect::<Vec<_>>();
+        corners.dedup_by_key(|corner| corner.0);
+        if corners.len() > 1 && corners.first().map(|c| c.0) == corners.last().map(|c| c.0) {
+            corners.pop();
         }
-        face.vertices.dedup();
-        if face.vertices.len() > 1 && face.vertices.first() == face.vertices.last() {
-            face.vertices.pop();
-        }
-        if face.vertices.len() < 3 {
+        if corners.len() < 3 {
             removed_faces.insert(face.id);
+            sources.push((face.id, None));
+            continue;
         }
+        // A face around the removed vertex is rebuilt by Blender with default loops; any other
+        // face keeps each surviving corner's value.
+        let face_sources = if touches_removed {
+            vec![CornerSource::Created; corners.len()]
+        } else {
+            corners
+                .iter()
+                .map(|corner| CornerSource::Kept(corner.1))
+                .collect()
+        };
+        face.vertices = corners.iter().map(|corner| corner.0).collect();
+        sources.push((face.id, Some(face_sources)));
     }
     mesh.faces.retain(|face| !removed_faces.contains(&face.id));
+    remap_corner_data(mesh, &corner_store, &sources);
     let mut used_edges = std::collections::BTreeSet::new();
     let mut removed_edges = std::collections::BTreeSet::new();
     mesh.edges.retain_mut(|edge| {
@@ -760,49 +604,6 @@ pub fn influences(mesh: &Mesh, stroke: &Stroke) -> Result<Vec<(u32, f64)>> {
         .collect())
 }
 
-/// Smooth one persistent vertex toward its one-ring neighbor average.
-pub fn smooth_vertex(mesh: &mut Mesh, vertex_id: u32, factor: f64) -> Result<bool> {
-    if !factor.is_finite() || !(0.0..=1.0).contains(&factor) {
-        return Err(invalid(
-            "smooth factor must be finite and between zero and one",
-        ));
-    }
-    let adjacency = vertex_adjacency(mesh);
-    let neighbors = adjacency
-        .get(&vertex_id)
-        .filter(|neighbors| !neighbors.is_empty())
-        .ok_or_else(|| invalid("smooth vertex has no adjacent vertices"))?;
-    let positions = vertex_positions(mesh);
-    let average = average_neighbor_position(&positions, neighbors);
-    let vertex = mesh
-        .vertices
-        .iter_mut()
-        .find(|vertex| vertex.id == vertex_id)
-        .ok_or_else(|| invalid("smooth vertex ID does not exist"))?;
-    let position = vertex.co.lerp(average, factor);
-    let changed = position != vertex.co;
-    vertex.co = position;
-    Ok(changed)
-}
-
-/// Sum squared distances from vertices to the average of their adjacent vertices.
-#[must_use]
-pub fn laplacian_energy(mesh: &Mesh) -> f64 {
-    let positions = vertex_positions(mesh);
-    let adjacency = vertex_adjacency(mesh);
-    mesh.vertices
-        .iter()
-        .filter_map(|vertex| {
-            let neighbors = adjacency.get(&vertex.id)?;
-            if neighbors.is_empty() {
-                return None;
-            }
-            let average = average_neighbor_position(&positions, neighbors);
-            Some(vertex.co.distance_squared(average))
-        })
-        .sum()
-}
-
 fn validate_stroke(stroke: &Stroke) -> Result<()> {
     if stroke.samples.is_empty() {
         return Err(invalid("stroke requires at least one sample"));
@@ -827,6 +628,11 @@ fn validate_stroke(stroke: &Stroke) -> Result<()> {
         if !["x", "y", "z"].contains(&axis.as_str()) {
             return Err(invalid("symmetry axes must be x, y, or z"));
         }
+    }
+    if let Some(view) = stroke.view
+        && (!view.is_finite() || view.length_squared() == 0.0)
+    {
+        return Err(invalid("view must be a finite, nonzero vector"));
     }
     Ok(())
 }
@@ -955,59 +761,28 @@ fn vertex_positions(mesh: &Mesh) -> std::collections::BTreeMap<u32, DVec3> {
         .collect()
 }
 
-fn average_neighbor_position(
-    positions: &std::collections::BTreeMap<u32, DVec3>,
-    neighbors: &[u32],
-) -> DVec3 {
-    let mut sum = DVec3::ZERO;
-    let mut count = 0.0_f64;
-    for neighbor in neighbors {
-        if let Some(position) = positions.get(neighbor) {
-            sum += *position;
-            count += 1.0;
-        }
-    }
-    if count > 0.0 {
-        sum / count
-    } else {
-        DVec3::ZERO
-    }
-}
-
-fn vertex_normals(
-    mesh: &Mesh,
-    positions: &std::collections::BTreeMap<u32, DVec3>,
-) -> std::collections::BTreeMap<u32, DVec3> {
-    let mut normals = std::collections::BTreeMap::<u32, DVec3>::new();
-    for face in &mesh.faces {
-        if face.vertices.len() < 3 {
-            continue;
-        }
-        let Some(a) = positions.get(&face.vertices[0]).copied() else {
-            continue;
-        };
-        let Some(b) = positions.get(&face.vertices[1]).copied() else {
-            continue;
-        };
-        let Some(c) = positions.get(&face.vertices[2]).copied() else {
-            continue;
-        };
-        let normal = (b - a).cross(c - a);
-        for id in &face.vertices {
-            *normals.entry(*id).or_default() += normal;
-        }
-    }
-    for normal in normals.values_mut() {
-        *normal = if normal.length_squared() > 0.0 {
-            normal.normalize()
-        } else {
-            DVec3::Z
-        };
-    }
-    for vertex in &mesh.vertices {
-        normals.entry(vertex.id).or_insert(DVec3::Z);
-    }
-    normals
+/// Blender's vertex normals (`normals_calc_verts`) in `mesh.vertices` order, via the shared
+/// `normals::vertex_normals`. Faces that name a missing vertex are skipped.
+fn vertex_normals(mesh: &Mesh) -> Vec<DVec3> {
+    let index: std::collections::BTreeMap<u32, usize> = mesh
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(index, vertex)| (vertex.id, index))
+        .collect();
+    let points: Vec<DVec3> = mesh.vertices.iter().map(|vertex| vertex.co).collect();
+    let faces: Vec<Vec<usize>> = mesh
+        .faces
+        .iter()
+        .filter_map(|face| {
+            face.vertices
+                .iter()
+                .map(|id| index.get(id).copied())
+                .collect::<Option<Vec<usize>>>()
+        })
+        .collect();
+    let slices: Vec<&[usize]> = faces.iter().map(Vec::as_slice).collect();
+    normals::vertex_normals(&points, &slices)
 }
 
 fn read_scalar_attribute(mesh: &Mesh, name: &str) -> Result<std::collections::BTreeMap<u32, f64>> {
@@ -1044,27 +819,127 @@ fn read_scalar_attribute(mesh: &Mesh, name: &str) -> Result<std::collections::BT
         )
 }
 
-fn deterministic_scale(seed: u64, position: DVec3, symmetry: &[String]) -> f64 {
-    let mut value = seed;
-    for (component, axis) in ["x", "y", "z"].iter().enumerate() {
-        let coordinate = position[component];
-        let coordinate = if symmetry.iter().any(|candidate| candidate == axis) {
-            coordinate.abs()
-        } else {
-            coordinate
-        };
-        value ^= coordinate.to_bits().wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    }
-    value ^= value >> 31;
-    let bytes = value.to_le_bytes();
-    let unit = f64::from(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-        / f64::from(u32::MAX);
-    0.98 + unit * 0.02
+/// Blender's default layer value `(0, 0)` in Potter's stored convention, where v points down.
+const UV_DEFAULT: [f64; 2] = [0.0, 1.0];
+
+/// Where one corner of a face after a dyntopo edit comes from.
+#[derive(Clone, Copy)]
+enum CornerSource {
+    /// The old corner at this index, which keeps its UV and pin.
+    Kept(usize),
+    /// A corner that dyntopo creates. Blender's dyntopo rebuilds faces with `BM_face_create`, whose
+    /// new loops take the default layer values (`bm_loop_create`), and the operator warns that it
+    /// does not preserve UVs (`sculpt_dyntopo.cc`). Its UV is therefore Blender's default `(0, 0)`,
+    /// stored as `[0, 1]` because Potter's UVs point v down.
+    Created,
 }
 
-fn invalid(message: impl Into<String>) -> PotError {
+/// The corner data of a mesh before a dyntopo edit: its UV store, and every corner-domain attribute
+/// (keyed by face ID, one row of corner values per face).
+struct CornerData {
+    uv_store: uv_layers::UvStore,
+}
+
+fn read_corner_data(mesh: &Mesh) -> CornerData {
+    CornerData {
+        uv_store: uv_layers::read(mesh),
+    }
+}
+
+/// A corner value of the same shape as `template`, all zero (Blender's default layer value).
+fn zero_like(template: &Value) -> Value {
+    match template {
+        Value::Array(items) => Value::Array(items.iter().map(zero_like).collect()),
+        Value::Number(_) => json!(0),
+        Value::Bool(_) => json!(false),
+        _ => Value::Null,
+    }
+}
+
+/// Rebuilds the corner data of `mesh` after a dyntopo edit. `sources` has one entry per face before
+/// the edit, `(face ID, None)` for a face the edit removed, else the source of each corner of the
+/// face in its new order. A `Created` corner takes the default value.
+fn remap_corner_data(
+    mesh: &mut Mesh,
+    before: &CornerData,
+    sources: &[(u32, Option<Vec<CornerSource>>)],
+) {
+    let mut store = before.uv_store.clone();
+    for layer in &mut store.layers {
+        let mut faces = Vec::new();
+        let mut pinned = Vec::new();
+        for (old_index, (_, source)) in sources.iter().enumerate() {
+            let Some(source) = source else {
+                continue;
+            };
+            let values = layer.faces.get(old_index).and_then(Option::as_ref);
+            let pins = layer.pinned.get(old_index).and_then(Option::as_ref);
+            let Some(values) = values else {
+                faces.push(None);
+                pinned.push(None);
+                continue;
+            };
+            let mut new_values = Vec::with_capacity(source.len());
+            let mut new_pins = Vec::with_capacity(source.len());
+            for corner in source {
+                match *corner {
+                    CornerSource::Kept(index) => {
+                        new_values.push(values.get(index).copied().unwrap_or(UV_DEFAULT));
+                        new_pins.push(
+                            pins.and_then(|pins| pins.get(index).copied())
+                                .unwrap_or(false),
+                        );
+                    }
+                    CornerSource::Created => {
+                        new_values.push(UV_DEFAULT);
+                        new_pins.push(false);
+                    }
+                }
+            }
+            faces.push(Some(new_values));
+            pinned.push(pins.map(|_| new_pins));
+        }
+        layer.faces = faces;
+        layer.pinned = pinned;
+    }
+    uv_layers::write(mesh, &store);
+
+    for (name, attribute) in &mut mesh.attributes {
+        if name == uv_layers::ATTRIBUTE {
+            continue;
+        }
+        let Some(object) = attribute.as_object_mut() else {
+            continue;
+        };
+        if object.get("domain").and_then(Value::as_str) != Some("corner") {
+            continue;
+        }
+        let Some(values) = object.get_mut("values").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        for (face_id, source) in sources {
+            let key = format!("f{face_id}");
+            let Some(source) = source else {
+                values.remove(&key);
+                continue;
+            };
+            let Some(row) = values.get(&key).and_then(Value::as_array).cloned() else {
+                continue;
+            };
+            let template = row.first().cloned().unwrap_or(Value::Null);
+            let new_row = source
+                .iter()
+                .map(|corner| match *corner {
+                    CornerSource::Kept(index) => row.get(index).cloned().unwrap_or(Value::Null),
+                    CornerSource::Created => zero_like(&template),
+                })
+                .collect::<Vec<_>>();
+            values.insert(key, Value::Array(new_row));
+        }
+    }
+}
+
+pub(super) fn invalid(message: impl Into<String>) -> PotError {
     PotError::with_details(
         crate::error::ErrorCode::InvalidOperation,
         message,
@@ -1083,6 +958,14 @@ impl Falloff {
             Self::Sharp => (1.0 - t).powi(2),
             Self::Linear => 1.0 - t,
             Self::Constant => 1.0,
+            Self::Smoother => {
+                let p = 1.0 - t;
+                p * p * p * (p * (6.0 * p - 15.0) + 10.0)
+            }
+            Self::Pow4 => {
+                let p = 1.0 - t;
+                p * p * p * p
+            }
         }
     }
 }
@@ -1100,6 +983,26 @@ mod tests {
             .unwrap()
     }
 
+    /// Smooth moves only interior vertices: Blender's `calc_vert_neighbors_interior` clears the
+    /// neighbors of a boundary corner (two neighbors), so a lone triangle has nothing to average.
+    /// A four-triangle fan around an interior center vertex gives Smooth something to move.
+    fn test_mesh_for(brush: DabBrush) -> Mesh {
+        if brush != DabBrush::Smooth {
+            return test_mesh();
+        }
+        Mesh::from_positions_and_faces(
+            vec![
+                DVec3::new(0.25, 0.25, 0.0),
+                DVec3::new(0.0, 0.0, 0.0),
+                DVec3::new(1.0, 0.0, 0.0),
+                DVec3::new(1.0, 1.0, 0.0),
+                DVec3::new(0.0, 1.0, 0.0),
+            ],
+            vec![vec![0, 1, 2], vec![0, 2, 3], vec![0, 3, 4], vec![0, 4, 1]],
+        )
+        .unwrap()
+    }
+
     fn sample(position: DVec3) -> StrokeSample {
         StrokeSample {
             position,
@@ -1110,64 +1013,107 @@ mod tests {
         }
     }
 
-    fn test_stroke(brush: Brush) -> Stroke {
+    fn test_stroke(brush: DabBrush) -> Stroke {
         let center_z = match brush {
-            Brush::Scrape | Brush::Flatten => -0.25,
-            Brush::Fill => 0.25,
+            DabBrush::Scrape | DabBrush::Flatten => -0.25,
+            DabBrush::Fill => 0.25,
             _ => 0.0,
         };
         let delta = match brush {
-            Brush::Grab | Brush::Thumb | Brush::Nudge | Brush::Elastic | Brush::BoundaryLite => {
+            DabBrush::Grab | DabBrush::Thumb | DabBrush::Nudge | DabBrush::Elastic => {
                 Some(DVec3::new(0.25, 0.0, 0.0))
             }
-            Brush::Rotate | Brush::PoseLite => Some(DVec3::new(0.0, 0.0, 0.25)),
             _ => None,
         };
+        let mut samples = vec![
+            sample(DVec3::new(0.0, 0.0, center_z)),
+            sample(DVec3::new(0.5, 0.0, center_z)),
+        ];
+        if brush == DabBrush::Rotate {
+            // Twist turns by the dial angle of the path, so the path must leave its first direction.
+            samples.push(sample(DVec3::new(0.0, 0.5, center_z)));
+        }
         Stroke {
             brush,
-            samples: vec![
-                sample(DVec3::new(0.0, 0.0, center_z)),
-                sample(DVec3::new(0.5, 0.0, center_z)),
-            ],
+            samples,
             falloff: Falloff::Smooth,
             symmetry: Vec::new(),
-            seed: 17,
             delta,
+            view: None,
         }
     }
 
     #[test]
-    fn every_brush_deforms_covered_geometry_deterministically() {
+    fn every_dab_brush_deforms_covered_geometry_deterministically() {
         for brush in [
-            Brush::Draw,
-            Brush::ClayStrips,
-            Brush::Inflate,
-            Brush::Grab,
-            Brush::Smooth,
-            Brush::Flatten,
-            Brush::Pinch,
-            Brush::Crease,
-            Brush::Layer,
-            Brush::SnakeHook,
-            Brush::Thumb,
-            Brush::Rotate,
-            Brush::Nudge,
-            Brush::Blob,
-            Brush::Scrape,
-            Brush::Fill,
-            Brush::DrawSharp,
-            Brush::Elastic,
-            Brush::PoseLite,
-            Brush::BoundaryLite,
+            DabBrush::Draw,
+            DabBrush::ClayStrips,
+            DabBrush::Inflate,
+            DabBrush::Grab,
+            DabBrush::Smooth,
+            DabBrush::Flatten,
+            DabBrush::Pinch,
+            DabBrush::Crease,
+            DabBrush::Layer,
+            DabBrush::SnakeHook,
+            DabBrush::Thumb,
+            DabBrush::Rotate,
+            DabBrush::Nudge,
+            DabBrush::Blob,
+            DabBrush::Scrape,
+            DabBrush::Fill,
+            DabBrush::DrawSharp,
+            DabBrush::Elastic,
         ] {
             let stroke = test_stroke(brush);
-            let mut first = test_mesh();
-            let mut second = test_mesh();
+            let base = test_mesh_for(brush);
+            let mut first = base.clone();
+            let mut second = base.clone();
             assert!(apply_stroke(&mut first, &stroke).unwrap(), "{brush:?}");
             assert!(apply_stroke(&mut second, &stroke).unwrap(), "{brush:?}");
-            assert_ne!(first, test_mesh(), "{brush:?}");
+            assert_ne!(first, base, "{brush:?}");
             assert_eq!(first, second, "{brush:?}");
             first.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn draw_offset_is_radius_times_strength_times_influence_without_jitter() {
+        // Blender 5.2.2 Draw: offset = normal * radius * scale * bstrength (draw.cc:196-197), with
+        // bstrength = alpha * pressure * overlap * flip * feather and alpha = strength^2
+        // (sculpt.cc:2338-2360). Overlap, flip and feather are 1; the linear falloff is the only
+        // spatial factor. Blender applies no per-vertex random scale.
+        let radius = 3.0;
+        let strength = 0.5;
+        let pressure = 1.0;
+        let stroke = Stroke {
+            brush: DabBrush::Draw,
+            samples: vec![StrokeSample {
+                position: DVec3::ZERO,
+                pressure,
+                radius,
+                strength,
+                time: 0.0,
+            }],
+            falloff: Falloff::Linear,
+            symmetry: Vec::new(),
+            delta: None,
+            view: None,
+        };
+        // The sample sits on vertex 0 (distance 0) and 1 unit from vertices 1 and 2, so linear falloff
+        // at distance / radius gives weights 1, 1 - 1/3, 1 - 1/3. The triangle's normal is +Z.
+        let weights = [1.0, 1.0 - 1.0 / radius, 1.0 - 1.0 / radius];
+        let original = test_mesh();
+        let mut mesh = test_mesh();
+        apply_stroke(&mut mesh, &stroke).unwrap();
+        for (index, (vertex, start)) in mesh.vertices.iter().zip(&original.vertices).enumerate() {
+            let expected =
+                start.co + DVec3::Z * (radius * strength * (weights[index] * pressure * strength));
+            assert!(
+                vertex.co.distance(expected) < 1.0e-12,
+                "vertex {index}: {:?} != {expected:?}",
+                vertex.co
+            );
         }
     }
 
@@ -1188,12 +1134,12 @@ mod tests {
             json!({"domain":"faces","values":{"f0":3}}),
         );
         let mut stroke = Stroke {
-            brush: Brush::Draw,
+            brush: DabBrush::Draw,
             samples: vec![sample(DVec3::new(0.1, 0.0, 0.0))],
             falloff: Falloff::Smooth,
             symmetry: Vec::new(),
-            seed: 0,
             delta: None,
+            view: None,
         };
 
         assert!(apply_stroke_with_dyntopo(&mut mesh, &stroke, Some(2.0)).unwrap());
@@ -1233,12 +1179,12 @@ mod tests {
             json!({"domain":"edges","values":{"e0":2.0,"e1":4.0,"e2":6.0}}),
         );
         let stroke = Stroke {
-            brush: Brush::Draw,
+            brush: DabBrush::Draw,
             samples: vec![sample(DVec3::ZERO)],
             falloff: Falloff::Smooth,
             symmetry: Vec::new(),
-            seed: 0,
             delta: None,
+            view: None,
         };
 
         assert!(dyntopo_under_brush(&mut mesh, &stroke, 0.5).unwrap());
@@ -1247,6 +1193,75 @@ mod tests {
         assert_eq!(mesh.faces[0].vertices.len(), 6);
         assert_eq!(mesh.attributes["test.weights"]["values"]["v3"], json!(1.5));
         assert_eq!(mesh.attributes["test.edges"]["values"]["e3"], json!(4.0));
+        mesh.validate().unwrap();
+    }
+
+    /// A box with a `UVMap` whose every corner value is distinct, so each corner can be traced.
+    fn uv_box() -> Mesh {
+        let mut mesh = Mesh::box_mesh(crate::geom::BoxParams {
+            size: DVec3::splat(2.0),
+        })
+        .unwrap();
+        let faces = mesh
+            .faces
+            .iter()
+            .enumerate()
+            .map(|(face, corners)| {
+                Some(
+                    (0..corners.vertices.len())
+                        .map(|corner| [face as f64 + 0.25, corner as f64 + 0.5])
+                        .collect(),
+                )
+            })
+            .collect();
+        uv_layers::write_layers(&mut mesh, &[uv_layers::UvLayer::new("UVMap", faces)]);
+        mesh
+    }
+
+    /// Every face's UV corners match its vertex count, and corners that dyntopo kept keep their UV.
+    fn assert_uv_in_step(mesh: &Mesh) -> Vec<[f64; 2]> {
+        let store = uv_layers::read(mesh);
+        let layer = &store.layers[0];
+        let mut created = Vec::new();
+        for (index, face) in mesh.faces.iter().enumerate() {
+            let corners = layer.faces[index].as_ref().unwrap();
+            assert_eq!(
+                corners.len(),
+                face.vertices.len(),
+                "face {index} corner count"
+            );
+            created.extend(corners.iter().copied().filter(|uv| *uv == UV_DEFAULT));
+        }
+        created
+    }
+
+    #[test]
+    fn dyntopo_split_gives_new_corners_blenders_default_uv_and_keeps_the_rest() {
+        let mut mesh = uv_box();
+        let before = uv_layers::read(&mesh).layers[0].faces.clone();
+        let stroke = Stroke {
+            brush: DabBrush::Draw,
+            samples: vec![sample(DVec3::ZERO)],
+            falloff: Falloff::Smooth,
+            symmetry: Vec::new(),
+            delta: None,
+            view: None,
+        };
+        assert!(dyntopo_under_brush(&mut mesh, &stroke, 1.0).unwrap());
+        let created = assert_uv_in_step(&mesh);
+        // Blender's dyntopo rebuilds faces with default loop data and warns that it does not keep
+        // UVs; the corners it creates are Blender's `(0, 0)`, stored as `[0, 1]`.
+        assert!(!created.is_empty(), "the split must create corners");
+        // A corner that existed before keeps its UV in the face it still belongs to.
+        let after = uv_layers::read(&mesh).layers[0].faces.clone();
+        let kept: Vec<_> = after
+            .iter()
+            .flatten()
+            .flatten()
+            .filter(|uv| **uv != UV_DEFAULT)
+            .collect();
+        let before_values: Vec<_> = before.iter().flatten().flatten().collect();
+        assert!(kept.iter().all(|uv| before_values.contains(uv)));
         mesh.validate().unwrap();
     }
 }

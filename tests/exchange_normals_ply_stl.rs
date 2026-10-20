@@ -12,7 +12,7 @@ mod exchange_normals;
 use std::{fs, path::Path, process::Output};
 
 use exchange_normals::{
-    BLENDER_NORMAL_TOLERANCE, NORMAL_TOLERANCE, TestResult, export, export_strict, init, near, pot,
+    BLENDER_NORMAL_TOLERANCE, TestResult, export, export_strict, init, near, pot,
     reference_corners, write_fixture_scene,
 };
 use serde_json::{Value, json};
@@ -277,7 +277,13 @@ fn ply_fixture_vertex_normals_are_blender_per_vertex_sums() -> TestResult {
     let file = export(&scene, "ply", &directory.path().join("fixture.ply"))?;
     let ply = parse_ply(&fs::read(&file)?)?;
     assert!(ply.has_normals, "shaded fixture must write nx ny nz");
-    assert_eq!(ply.vertices.len(), 24, "one PLY vertex per object vertex");
+    // Blender's PLY export writes one vertex per unique (vertex, UV) pair (`export_uv` defaults on).
+    // Each of the three default cubes has 14 such pairs (`box_size_2` in the primitive UV oracle).
+    assert_eq!(
+        ply.vertices.len(),
+        3 * 14,
+        "one PLY vertex per (vertex, UV) pair"
+    );
 
     let reference = reference_corners()?;
     for vertex in &ply.vertices {
@@ -459,17 +465,28 @@ fn fixture_stl_export_is_refused_without_allow_lossy() -> TestResult {
 }
 
 #[test]
-fn flat_box_stl_export_reports_no_loss() -> TestResult {
+fn flat_box_stl_export_reports_only_its_uv_layer_as_lost() -> TestResult {
+    // The box's default `UVMap` (Blender's `primitive_cube_add` writes it) is the only thing STL
+    // cannot store, so it is the only loss; the flat shading is representable and not reported.
     let directory = tempdir()?;
     let scene = directory.path().join("flat");
     apply_operations(&scene, &flat_box_operations())?;
-    let output = export_strict(&scene, "stl", &directory.path().join("flat.stl"))?;
+    let refused_path = directory.path().join("flat.stl");
+    let refused = export_strict(&scene, "stl", &refused_path)?;
+    assert_eq!(refused.status.code(), Some(4));
+    let body = envelope(&refused)?;
+    let found = losses(&body);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0]["feature_id"], "mesh.uv_layer");
     assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stdout)
+        found[0]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("UVMap"))
     );
-    assert_eq!(envelope(&output)?["result"]["losses"], json!([]));
+    assert!(!refused_path.exists(), "refused export must not write");
+    let allowed_path = directory.path().join("flat-allowed.stl");
+    let allowed = export(&scene, "stl", &allowed_path)?;
+    assert!(allowed.exists());
     Ok(())
 }
 
@@ -555,8 +572,10 @@ fn ply_round_trip_keeps_per_vertex_normals() -> TestResult {
             .find(|candidate| near(candidate.position, vertex.position))
             .ok_or("re-exported PLY lost a vertex")?;
         let error = max_error(vertex.normal, other.normal);
+        // Both exports store the custom-normal layer as int16 codes, so the round trip re-quantizes
+        // it; the bound is the custom-code class bound (`BLENDER_NORMAL_TOLERANCE`), not a per-output one.
         assert!(
-            error <= NORMAL_TOLERANCE,
+            error <= BLENDER_NORMAL_TOLERANCE,
             "vertex {:?}: normal {:?} became {:?} after round trip (error {error})",
             vertex.position,
             vertex.normal,

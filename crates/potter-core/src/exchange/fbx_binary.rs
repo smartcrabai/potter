@@ -38,14 +38,14 @@ struct Node {
     children: Vec<Node>,
 }
 
-/// Export an FBX 7.4 binary file, optionally dropping attributes reported by the lossy-export gate.
+/// Export an FBX 7.4 binary file under `project_root`, optionally dropping attributes reported by the lossy-export gate.
 pub(crate) fn export_allow_lossy(
     doc: &SceneDoc,
     snapshot: &Snapshot,
     allow_lossy: bool,
+    project_root: &Path,
 ) -> Result<Vec<u8>> {
-    let ascii =
-        super::fbx::export_with_root_allow_lossy(doc, snapshot, Path::new("."), allow_lossy)?;
+    let ascii = super::fbx::export_with_root_allow_lossy(doc, snapshot, project_root, allow_lossy)?;
     let text = std::str::from_utf8(&ascii)
         .map_err(|error| PotError::new(ErrorCode::InternalError, error.to_string()))?;
     let roots = parse_ascii(text)?;
@@ -545,8 +545,8 @@ fn property_kind(node: &Node, index: usize, parent: Option<&str>) -> Result<char
 
 fn array_type(parent: &str) -> char {
     match parent {
-        "PolygonVertexIndex" | "NormalsIndex" | "UVIndex" | "Materials" | "Indexes"
-        | "KeyAttrFlags" | "KeyAttrRefCount" => 'i',
+        "PolygonVertexIndex" | "NormalsIndex" | "UVIndex" | "ColorIndex" | "Materials"
+        | "Indexes" | "KeyAttrFlags" | "KeyAttrRefCount" => 'i',
         "KeyTime" => 'l',
         "KeyValueFloat" | "KeyAttrDataFloat" => 'f',
         _ => 'd',
@@ -714,13 +714,21 @@ fn decode_property(bytes: &[u8], cursor: &mut usize, end: usize) -> Result<Arg> 
             if string_end > end {
                 return Err(import_error("FBX string property is truncated"));
             }
-            let value = std::str::from_utf8(&bytes[*cursor..string_end])
-                .map_err(|_| import_error("FBX string property is not UTF-8"))?
-                .to_owned();
+            let payload = &bytes[*cursor..string_end];
             *cursor = string_end;
-            Arg {
-                value,
-                is_string: true,
+            // `'S'` is text; `'R'` is raw binary data, such as Blender's `FileId`, and is never text.
+            if kind == 'R' {
+                Arg {
+                    value: String::from_utf8_lossy(payload).into_owned(),
+                    is_string: false,
+                }
+            } else {
+                Arg {
+                    value: std::str::from_utf8(payload)
+                        .map_err(|_| import_error("FBX string property is not UTF-8"))?
+                        .to_owned(),
+                    is_string: true,
+                }
             }
         }
         'Y' => {

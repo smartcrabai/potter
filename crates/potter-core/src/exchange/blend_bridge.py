@@ -10,15 +10,20 @@ import bpy
 import json
 import math
 import os
+import shutil
 import sys
-import traceback
 import tempfile
+import traceback
 from mathutils import Euler, Matrix, Quaternion, Vector
 DEFERRED_ID_ASSIGNMENTS = []
 DEFERRED_HAIR_KEY_RESTORATIONS = []
 CACHE_FILES_BY_IDENTITY = {}
 ALPHA_MODE_PROPERTY = "potter.alpha_mode"
 ALPHA_MODES = ("opaque", "clip", "blend")
+DEFERRED_MDISPS_FILEPATHS = {}
+RESTORED_MDISPS_MESHES = {}
+MULTIRES_MASK_LEVEL_BY_MESH = {}
+MULTIRES_HIDDEN_MESHES = set()
 POTTER_TO_BLENDER_ANIMATION_PATH = {
     "transform.translation": "location",
     "transform.rotation_euler": "rotation_euler",
@@ -649,6 +654,9 @@ def modifier_params(modifier):
             {"object": plain(projector.object) if projector.object else None}
             for projector in modifier.projectors
         ]
+    if modifier.type == "MULTIRES":
+        params["total_levels"] = int(modifier.total_levels)
+        params["is_external"] = bool(modifier.is_external)
     return params
 def _curve_mapping_points(mapping):
     if mapping is None or not mapping.curves:
@@ -755,6 +763,43 @@ def _id_map(block, property_name):
     return value if isinstance(value, dict) else {}
 
 
+def _image_filepath(image):
+    try:
+        return bpy.path.abspath(image.filepath, library=image.library)
+    except TypeError:
+        return bpy.path.abspath(image.filepath)
+
+
+def _tile_path(template, number):
+    # Blender's tile tokens, 1-based: <UDIM> is the tile number, <UVTILE> is u<column>_v<row> (BKE_image_set_filepath_from_tile_number).
+    if "<UVTILE>" in template:
+        offset = number - 1001
+        return template.replace("<UVTILE>", "u%d_v%d" % (offset % 10 + 1, offset // 10 + 1))
+    return template.replace("<UDIM>", str(number))
+
+
+def _tile_numbers(image):
+    # The UDIM tile numbers of a TILED image in ascending order; a single-tile image has none.
+    if image.source != "TILED":
+        return []
+    return sorted(tile.number for tile in image.tiles)
+
+def _tile_labels(image):
+    # The labels a TILED image's tiles carry, keyed by tile number as a string. Blender labels every loaded tile with its
+    # number, so only a label that differs from that default is kept.
+    if image.source != "TILED":
+        return {}
+    return {str(tile.number): tile.label for tile in image.tiles if tile.label != str(tile.number)}
+
+
+def _image_alpha_mode(image):
+    # Blender's alpha mode under the names the .blend importer reads. CHANNEL_PACKED holds straight colour.
+    if image.alpha_mode == "PREMUL":
+        return "premultiplied"
+    if image.alpha_mode == "NONE":
+        return "none"
+    return "straight"
+
 def images_dump():
     result = []
     for image in bpy.data.images:
@@ -764,10 +809,7 @@ def images_dump():
             image_model = json.loads(image.get("potter.image_json", "null"))
         except Exception:
             image_model = None
-        try:
-            filepath = bpy.path.abspath(image.filepath, library=image.library)
-        except TypeError:
-            filepath = bpy.path.abspath(image.filepath)
+        filepath = _image_filepath(image)
         try:
             colorspace = image.colorspace_settings.name
         except Exception:
@@ -775,6 +817,8 @@ def images_dump():
         result.append({"name": image.name_full, "potter_id": image.get("potter.id"),
                        "library": library_reference(image), "filepath": filepath,
                        "source": image.source, "colorspace": colorspace,
+                       "tile_numbers": _tile_numbers(image), "tile_labels": _tile_labels(image),
+                       "alpha_mode": _image_alpha_mode(image),
                        "potter_image": image_model})
     return result
 
@@ -885,17 +929,30 @@ def volume_filepath(volume):
     filepath = bpy.path.abspath(volume.filepath) if volume.filepath else ""
     return "" if filepath and os.path.isdir(filepath) else filepath
 
+def _tiled_image_records(image):
+    # One resource per UDIM tile: its packed bytes, or the file that the tile token (<UDIM> or <UVTILE>) names for it.
+    packed = {packed_file.tile_number: packed_file.packed_file for packed_file in image.packed_files}
+    template = _image_filepath(image)
+    records = []
+    for number in sorted(tile.number for tile in image.tiles):
+        record = _resource_record("image", image.name_full, _tile_path(template, number),
+                                  packed.get(number))
+        record["tile_number"] = number
+        if record["path"] or record["packed"]:
+            records.append(record)
+    return records
+
+
 def resources_dump():
     result = []
     for image in bpy.data.images:
         if _startup_metadata_datablock("images", image):
             continue
-        try:
-            filepath = bpy.path.abspath(image.filepath, library=image.library)
-        except TypeError:
-            filepath = bpy.path.abspath(image.filepath)
-        record = _resource_record("image", image.name_full, filepath,
-                                 getattr(image, "packed_file", None))
+        if image.source == "TILED":
+            result.extend(_tiled_image_records(image))
+            continue
+        record = _resource_record("image", image.name_full, _image_filepath(image),
+                                  getattr(image, "packed_file", None))
         if record["path"] or record["packed"]:
             result.append(record)
     for curve in bpy.data.curves:
@@ -1512,6 +1569,7 @@ def _uv_layer_index(layers, attribute):
 MESH_HANDLED_KEYS = frozenset((
     "alembic_normals", "alembic_time_samples", "alembic_velocity", "blender_attributes", "blender_metadata", "blender_skin_vertices",
     "color_layers", "crease_edge", "custom_normal", "seam", "sharp", "shade_smooth", "skin_radii", "skin_roots",
+    "multires_displacement",
     "uv_layers",
     "vertex_groups",
 ))
@@ -1528,17 +1586,35 @@ MESH_RESTORE_SKIP = frozenset((
 ))
 
 
+def _quaternion_to_native(value):
+    """Blender stores a quaternion as w, x, y, z; Potter's native quaternion values are x, y, z, w (spec)."""
+    w, x, y, z = (float(component) for component in value)
+    return [x, y, z, w]
+
+
+def _quaternion_from_native(value):
+    x, y, z, w = (float(component) for component in value)
+    return (w, x, y, z)
+
+
 def _attribute_item_value(item, data_type):
     if data_type in MESH_COLOR_TYPES:
         return plain(item.color)
+    if data_type == "QUATERNION":
+        return _quaternion_to_native(item.value)
     if hasattr(item, "vector"):
         return plain(item.vector)
-    return plain(item.value)
+    value = item.value
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return plain(value)
 
 
 def _set_attribute_item(item, data_type, value):
     if data_type in MESH_COLOR_TYPES:
         item.color = value
+    elif data_type == "QUATERNION":
+        item.value = _quaternion_from_native(value)
     elif hasattr(item, "vector"):
         item.vector = value
     else:
@@ -1944,18 +2020,115 @@ def _view_transform_name(value):
     return aliases.get(token, token)
 
 
+_CURVE_TONE_TO_POTTER = {"STANDARD": "standard", "FILMLIKE": "film_like"}
+_CURVE_TONE_TO_BLENDER = {"standard": "STANDARD", "film_like": "FILMLIKE"}
+_CURVE_EXTEND_TO_POTTER = {"HORIZONTAL": "horizontal", "EXTRAPOLATED": "extrapolated"}
+_CURVE_HANDLE_TO_POTTER = {"AUTO": "auto", "AUTO_CLAMPED": "auto_clamped", "VECTOR": "vector"}
+_CURVE_HANDLE_TO_BLENDER = {"auto": "AUTO", "auto_clamped": "AUTO_CLAMPED", "vector": "VECTOR"}
+
+
+def _color_curve_dump(view):
+    """The view CurveMapping (colortools.cc), or None when use_curve_mapping is off.
+
+    All four curves are read, with their handle types. Free and aligned handles are refused rather
+    than reshaped, since Potter cannot represent them.
+    """
+    if not bool(getattr(view, "use_curve_mapping", False)):
+        return None
+    mapping = getattr(view, "curve_mapping", None)
+    if mapping is None or len(mapping.curves) < 4:
+        raise ValueError("Blender color-management curve mapping is unavailable")
+    tone = _CURVE_TONE_TO_POTTER.get(mapping.tone)
+    extend = _CURVE_EXTEND_TO_POTTER.get(mapping.extend)
+    if tone is None or extend is None:
+        raise ValueError(f"Blender color-management curve has tone {mapping.tone} and extend {mapping.extend}, which Potter cannot represent")
+    curves = []
+    for curve_index, curve in enumerate(mapping.curves):
+        points = []
+        for point_index, point in enumerate(curve.points):
+            handle = _CURVE_HANDLE_TO_POTTER.get(point.handle_type)
+            if handle is None:
+                raise ValueError(
+                    f"Blender color-management curve {curve_index} point {point_index} uses the "
+                    f"{point.handle_type} handle, which Potter cannot represent")
+            points.append({"location": [float(point.location[0]), float(point.location[1])],
+                           "handle": handle})
+        curves.append({"points": points})
+    return {"tone": tone, "extend": extend, "use_clip": bool(mapping.use_clip),
+            "clip": [float(mapping.clip_min_x), float(mapping.clip_min_y),
+                     float(mapping.clip_max_x), float(mapping.clip_max_y)],
+            "black": [float(value) for value in mapping.black_level],
+            "white": [float(value) for value in mapping.white_level],
+            "curves": curves}
+
+
+def _curve_extend_to_blender(curve):
+    return "EXTRAPOLATED" if curve["extend_extrapolate"] else "HORIZONTAL"
+
+
+def _restore_color_curve_clip(mapping, clip):
+    for minimum_name, maximum_name, minimum, maximum in (
+            ("clip_min_x", "clip_max_x", clip[0], clip[2]),
+            ("clip_min_y", "clip_max_y", clip[1], clip[3])):
+        # Blender clamps each minimum against the current maximum.
+        if minimum > getattr(mapping, maximum_name):
+            setattr(mapping, maximum_name, maximum)
+            setattr(mapping, minimum_name, minimum)
+        else:
+            setattr(mapping, minimum_name, minimum)
+            setattr(mapping, maximum_name, maximum)
+
+
+def _restore_color_curve(view, curve):
+    """Writes Potter's view curve onto a scene: the inverse of `_color_curve_dump`.
+
+    `update()` rebuilds the tables. Each point's select flag is cleared first, because update()
+    clamps selected points to the clip rectangle and the stored points must survive unchanged.
+    """
+    if curve is None:
+        view.use_curve_mapping = False
+        return
+    view.use_curve_mapping = True
+    mapping = view.curve_mapping
+    if mapping is None or len(mapping.curves) < 4:
+        raise ValueError("Blender did not create the color-management curve mapping")
+    mapping.tone = _CURVE_TONE_TO_BLENDER[curve["tone"]]
+    mapping.extend = _curve_extend_to_blender(curve)
+    mapping.use_clip = bool(curve["use_clip"])
+    _restore_color_curve_clip(mapping, curve["clip"])
+    mapping.black_level = curve["black"]
+    mapping.white_level = curve["white"]
+    for index, source in enumerate(curve["curves"]):
+        _restore_curve_points(mapping.curves[index], source["points"], index)
+    mapping.update()
+
+
+def _restore_curve_points(target, points, index):
+    collection = target.points
+    while len(collection) < len(points):
+        before = len(collection)
+        # A distinct x keeps the insert from merging with an existing point; locations are
+        # overwritten below in order.
+        collection.new(1000.0 + before, 0.0)
+        if len(collection) == before:
+            raise ValueError(f"Blender refused a point for color-management curve {index}")
+    while len(collection) > len(points):
+        before = len(collection)
+        collection.remove(collection[before - 1])
+        if len(collection) == before:
+            raise ValueError(f"Blender refused to remove a point from color-management curve {index}")
+    for point, source in zip(collection, points):
+        point.location = source["location"]
+        point.handle_type = _CURVE_HANDLE_TO_BLENDER[source["handle"]]
+        point.select = False
+
+
 def _color_management_dump(scene):
     view = scene.view_settings
-    curve = []
-    if bool(getattr(view, "use_curve_mapping", False)):
-        mapping = getattr(view, "curve_mapping", None)
-        if mapping is None or len(mapping.curves) < 4:
-            raise ValueError("Blender color-management curve mapping is unavailable")
-        curve = [plain(point.location)[:2] for point in mapping.curves[3].points]
     return {"display_device": scene.display_settings.display_device,
             "view_transform": _view_transform_name(view.view_transform),
             "look": potter_color_look(view.look), "exposure": float(view.exposure),
-            "gamma": float(view.gamma), "curve": curve}
+            "gamma": float(view.gamma), "curve": _color_curve_dump(view)}
 
 
 # ViewLayer.use_pass_cryptomatte_accurate is an accuracy flag, not a pass (rna_scene.cc,
@@ -2096,31 +2269,46 @@ def blender_audio_codec(value):
     return "PCM" if codec == "WAV" else codec
 
 
+# Blender look name (RNA identifier, as in config.ocio) to Potter's token, for the looks Potter
+# implements. An unknown Blender look is kept as its raw name, so the render refuses it explicitly.
+_LOOK_TOKENS = (
+    ("None", "none"),
+    ("Very High Contrast", "very_high_contrast"),
+    ("High Contrast", "high_contrast"),
+    ("Medium High Contrast", "medium_high_contrast"),
+    ("Medium Contrast", "medium_contrast"),
+    ("Medium Low Contrast", "medium_low_contrast"),
+    ("Low Contrast", "low_contrast"),
+    ("Very Low Contrast", "very_low_contrast"),
+    ("AgX - Punchy", "agx_punchy"),
+    ("AgX - Greyscale", "agx_greyscale"),
+    ("AgX - Very High Contrast", "agx_very_high_contrast"),
+    ("AgX - High Contrast", "agx_high_contrast"),
+    ("AgX - Medium High Contrast", "agx_medium_high_contrast"),
+    ("AgX - Base Contrast", "agx_base_contrast"),
+    ("AgX - Medium Low Contrast", "agx_medium_low_contrast"),
+    ("AgX - Low Contrast", "agx_low_contrast"),
+    ("AgX - Very Low Contrast", "agx_very_low_contrast"),
+    ("False Color - Punchy", "false_color_punchy"),
+    ("False Color - Greyscale", "false_color_greyscale"),
+    ("False Color - Very High Contrast", "false_color_very_high_contrast"),
+    ("False Color - High Contrast", "false_color_high_contrast"),
+    ("False Color - Medium High Contrast", "false_color_medium_high_contrast"),
+    ("False Color - Base Contrast", "false_color_base_contrast"),
+    ("False Color - Medium Low Contrast", "false_color_medium_low_contrast"),
+    ("False Color - Low Contrast", "false_color_low_contrast"),
+    ("False Color - Very Low Contrast", "false_color_very_low_contrast"),
+)
+_POTTER_LOOK_BY_BLENDER = dict(_LOOK_TOKENS)
+_BLENDER_LOOK_BY_POTTER = {token: name for name, token in _LOOK_TOKENS}
+
+
 def potter_color_look(value):
-    normalized = str(value).strip().casefold()
-    return {
-        "none": "none",
-        "very high contrast": "very_high_contrast",
-        "high contrast": "high_contrast",
-        "medium high contrast": "medium_high_contrast",
-        "medium contrast": "medium_contrast",
-        "medium low contrast": "medium_low_contrast",
-        "low contrast": "low_contrast",
-        "very low contrast": "very_low_contrast",
-    }.get(normalized, str(value))
+    return _POTTER_LOOK_BY_BLENDER.get(str(value), str(value))
 
 
 def blender_color_look(value):
-    return {
-        "none": "None",
-        "very_high_contrast": "Very High Contrast",
-        "high_contrast": "High Contrast",
-        "medium_high_contrast": "Medium High Contrast",
-        "medium_contrast": "Medium Contrast",
-        "medium_low_contrast": "Medium Low Contrast",
-        "low_contrast": "Low Contrast",
-        "very_low_contrast": "Very Low Contrast",
-    }.get(str(value).strip().casefold(), value)
+    return _BLENDER_LOOK_BY_POTTER.get(str(value), value)
 
 
 def dump_scene(scene):
@@ -2167,6 +2355,8 @@ def dump_scene(scene):
         seed = int(scene.cycles.seed)
     elif render_engine in ("BLENDER_EEVEE", "BLENDER_EEVEE_NEXT") and hasattr(scene, "eevee"):
         samples = int(scene.eevee.taa_render_samples)
+    cycles = getattr(scene, "cycles", None)
+    dicing_camera = getattr(cycles, "dicing_camera", None)
     return {"name": scene.name_full, "potter_id": scene.get("potter.id"),
             "frame_current": float(scene.frame_current) + float(getattr(scene, "frame_subframe", 0.0)),
             "frame_start": int(scene.frame_start), "frame_end": int(scene.frame_end), "fps": int(scene.render.fps),
@@ -2180,12 +2370,18 @@ def dump_scene(scene):
                 "samples": samples,
                 "seed": seed,
                 "max_bounces": int(getattr(getattr(scene, "cycles", None), "max_bounces", 4)),
+                "transparent_max_bounces": int(getattr(getattr(scene, "cycles", None), "transparent_max_bounces", 8)),
                 "use_sequencer": bool(getattr(scene.render, "use_sequencer", False)),
                 "audio_codec": potter_audio_codec(getattr(getattr(scene.render, "ffmpeg", None),
                                                           "audio_codec", "PCM")),
                 "film_transparent": bool(scene.render.film_transparent),
                 "engine": "path" if render_engine == "CYCLES" else "realtime",
                 "engine_native": render_engine,
+                "dicing_rate": float(getattr(cycles, "dicing_rate", 1.0)),
+                "preview_dicing_rate": float(getattr(cycles, "preview_dicing_rate", 8.0)),
+                "max_subdivisions": int(getattr(cycles, "max_subdivisions", 12)),
+                "offscreen_dicing_scale": float(getattr(cycles, "offscreen_dicing_scale", 4.0)),
+                "dicing_camera": dicing_camera.name_full if dicing_camera else None,
                 "passes": _render_passes(scene),
                 "cryptomatte_accurate": _cryptomatte_accurate(scene),
             },
@@ -2193,12 +2389,42 @@ def dump_scene(scene):
             "compositor": _scene_compositor(scene),
             "color_management": _color_management_dump(scene),
             "view_layers": layers,
+            "display_shading": _display_shading_dump(scene),
             "markers": [{"name": marker.name, "frame": int(marker.frame)} for marker in scene.timeline_markers],
             "rigid_body_world": _rigid_body_world_dump(scene),
             "sequencer": _sequencer_dump(scene),
             "root_collection": scene.get("potter.root_collection", scene.collection.get("potter.name", scene.collection.name_full)),
             "world": world_info, "custom_properties": custom_props(scene),
             "rna_properties": rna_props(scene, ("objects", "collection", "view_layers", "world", "camera", "render", "tool_settings", "unit_settings"))}
+
+
+def _camera_dof_enabled(camera):
+    """Whether a camera has depth of field on, which Workbench's DoF pass reads from the scene camera."""
+    dof = getattr(getattr(camera, "data", None), "dof", None)
+    return bool(dof is not None and dof.use_dof)
+
+
+def _display_shading_dump(scene):
+    """The viewport shading options a Workbench render reads (`scene.display.shading`), with the scene
+    camera's depth of field, which the DoF option needs in order to draw anything."""
+    shading = scene.display.shading
+    return {
+        "type": shading.type,
+        "light": shading.light,
+        "studio_light": shading.studio_light,
+        "color_type": shading.color_type,
+        "use_world_space_lighting": bool(shading.use_world_space_lighting),
+        "show_specular_highlight": bool(shading.show_specular_highlight),
+        "show_cavity": bool(shading.show_cavity),
+        "show_shadows": bool(shading.show_shadows),
+        "show_object_outline": bool(shading.show_object_outline),
+        "show_backface_culling": bool(shading.show_backface_culling),
+        "show_xray": bool(shading.show_xray),
+        "xray_alpha": float(shading.xray_alpha),
+        "use_dof": bool(shading.use_dof),
+        "camera_dof": _camera_dof_enabled(scene.camera),
+        "background_type": shading.background_type,
+    }
 
 
 def _startup_metadata_datablock(collection_name, block):
@@ -2235,30 +2461,19 @@ def other_datablocks_dump():
     return result
 
 
-def _principled_alpha_socket(material):
-    if not material.use_nodes or material.node_tree is None:
-        return None
-    shader = next((node for node in material.node_tree.nodes if node.type == "BSDF_PRINCIPLED"), None)
-    return None if shader is None else shader.inputs.get("Alpha")
-
-
-def _alpha_mode_of(material, base_color):
+def _alpha_mode_of(material):
     """Potter alpha mode of a Blender material.
 
     The `potter.alpha_mode` marker is used while it agrees with `surface_render_method` (`blend` is
-    BLENDED; `opaque` and `clip` are DITHERED). Without a usable marker, Blender's state decides:
-    BLENDED is `blend`; DITHERED is `clip` when alpha is authored below one (a linked or sub-one
-    Principled Alpha, or a base color alpha below one), and `opaque` otherwise.
+    BLENDED; `opaque` and `clip` are DITHERED). Without a usable marker, BLENDED is `blend`, and DITHERED is
+    `opaque`: Blender 5.2 never thresholds alpha (`alpha_threshold` is read only by the 4.2 versioning,
+    `versioning_420.cc`), so a DITHERED material's transparency is its graph's, which `opaque` leaves to the graph.
     """
     blended = material.surface_render_method == "BLENDED"
     marker = material.get(ALPHA_MODE_PROPERTY)
     if marker in ALPHA_MODES and (marker == "blend") == blended:
         return marker
-    if blended:
-        return "blend"
-    alpha = _principled_alpha_socket(material)
-    authored = alpha is not None and (alpha.is_linked or float(alpha.default_value) < 1.0)
-    return "clip" if authored or float(base_color[3]) < 1.0 else "opaque"
+    return "blend" if blended else "opaque"
 
 
 def material_dump(material):
@@ -2297,11 +2512,15 @@ def material_dump(material):
     return {"name": material.name_full, "potter_id": material.get("potter.id"),
             "library": library_reference(material),
             "base_color": base_color,
+            "viewport_display": {"diffuse_color": [float(c) for c in material.diffuse_color],
+                                 "roughness": float(material.roughness), "metallic": float(material.metallic)},
             "metallic": metallic, "roughness": roughness,
             "emission_color": emission_color, "emission_strength": emission_strength,
             "transmission": transmission, "ior": ior,
             "double_sided": not bool(getattr(material, "use_backface_culling", False)),
-            "alpha_mode": _alpha_mode_of(material, base_color),
+            "use_transparent_shadow": bool(getattr(material, "use_transparent_shadow", True)),
+            "use_backface_culling_shadow": bool(getattr(material, "use_backface_culling_shadow", False)),
+            "alpha_mode": _alpha_mode_of(material),
             "alpha_threshold": float(material.alpha_threshold),
             "nodes": tree_dump(material.node_tree),
             "custom_properties": {key: value for key, value in custom_props(material).items()
@@ -2344,15 +2563,22 @@ def dump_all():
                          "ortho_scale": float(x.ortho_scale),
                          "clip_start": float(x.clip_start), "clip_end": float(x.clip_end),
                          "shift_x": float(x.shift_x), "shift_y": float(x.shift_y), "custom_properties": custom_props(x),
+                         "panorama_type": x.panorama_type, "longitude_min": float(x.longitude_min),
+                         "longitude_max": float(x.longitude_max), "latitude_min": float(x.latitude_min),
+                         "latitude_max": float(x.latitude_max),
+                         "fisheye_fov": float(x.fisheye_fov), "fisheye_lens": float(x.fisheye_lens),
                          "fake_user": bool(x.use_fake_user), "users": int(x.users)} for x in bpy.data.cameras],
             "lights": [{"name": x.name_full, "potter_id": x.get("potter.id"),
                         "library": library_reference(x), "type": x.type,
                         "color": plain(x.color), "energy": float(x.energy), "shadow_soft_size": float(x.shadow_soft_size),
+                        "soft_falloff": bool(getattr(x, "use_soft_falloff", True)),
+                        "use_multiple_importance_sampling": bool(x.cycles.use_multiple_importance_sampling),
                         "spot_size": float(getattr(x, "spot_size", math.pi / 4)),
                         "spot_blend": float(getattr(x, "spot_blend", 0.15)),
                         "shape": getattr(x, "shape", None), "custom_properties": custom_props(x),
                         "size": float(getattr(x, "size", 0.25)),
                         "size_y": float(getattr(x, "size_y", 0.25)),
+                        "spread": float(getattr(x, "spread", math.pi)),
                         "fake_user": bool(x.use_fake_user), "users": int(x.users)} for x in bpy.data.lights],
             "actions": [action_dump(x) for x in bpy.data.actions],
             "texts": [{"name": x.name_full, "potter_id": x.get("potter.id"),
@@ -2391,8 +2617,8 @@ def set_props(block, values):
             continue
         try:
             block[key] = value
-        except Exception:
-            pass
+        except Exception as error:
+            raise ValueError("cannot set custom property %s" % key) from error
 
 
 def _blender_id_pointer_type(block, key, current):
@@ -2953,7 +3179,90 @@ def _restore_deferred_particle_hair_key_data():
         _restore_particle_hair_key_data(obj, particle_system, hair_key_data)
     DEFERRED_HAIR_KEY_RESTORATIONS.clear()
 
-def set_modifier_params(modifier, item, id_lookup, doc, target, node_id, obj):
+
+def _owning_scene(obj, default=None):
+    scenes = obj.users_scene
+    return scenes[0] if scenes else default
+
+
+def _force_multires_external_read(obj, modifier):
+    scene = _owning_scene(obj, bpy.context.scene)
+    view_layer = scene.view_layers[0]
+    levels = int(modifier.levels)
+    show_viewport = bool(modifier.show_viewport)
+    modifier.levels = max(levels, 1)
+    modifier.show_viewport = True
+    try:
+        with bpy.context.temp_override(
+                scene=scene, view_layer=view_layer, object=obj, active_object=obj,
+                selected_objects=[obj], selected_editable_objects=[obj]):
+            bpy.context.view_layer.update()
+            obj.evaluated_get(bpy.context.evaluated_depsgraph_get()).data
+    finally:
+        modifier.levels = levels
+        modifier.show_viewport = show_viewport
+
+
+# Blender exposes MDisps through its native external-layer loader, not mesh.attributes.
+def _restore_multires_displacement(modifier, obj, doc, target, node_id, pack):
+    node = doc.get("nodes", {}).get(node_id, {})
+    data_id = node.get("data")
+    data = doc.get("data_blocks", {}).get(data_id, {})
+    mesh = data.get("mesh", {})
+    record = mesh.get("attributes", {}).get("multires_displacement")
+    if not isinstance(record, dict):
+        return False
+    if not record.get("values") and not record.get("external"):
+        return False
+    if int(record.get("total_levels", 0)) != int(modifier.total_levels):
+        raise ValueError("multires displacement level does not match the modifier")
+    if pack:
+        # Packed layers keep the full-size grids that multires_subdivide allocated; Potter fills
+        # them in place after the save, so no external sidecar is read or packed here.
+        return True
+    external = record.get("external") or {}
+    filepath = external.get("filepath")
+    if not isinstance(filepath, str) or not filepath:
+        raise ValueError("multires displacement grids have no external filepath")
+    target_directory = os.path.dirname(os.path.abspath(target))
+    external_path = os.path.abspath(
+        os.path.join(target_directory, filepath[2:] if filepath.startswith("//") else filepath))
+    if not os.path.isfile(external_path):
+        raise FileNotFoundError("multires displacement sidecar is missing: " + external_path)
+    mesh_key = obj.data.as_pointer()
+    restored = RESTORED_MDISPS_MESHES.get(mesh_key)
+    if restored is not None:
+        if restored != filepath:
+            raise ValueError("shared multires mesh has conflicting displacement state")
+        return True
+    seed_path = None
+    try:
+        if not modifier.is_external:
+            seed_fd, seed_path = tempfile.mkstemp(suffix=".btx")
+            os.close(seed_fd)
+            os.unlink(seed_path)
+            scene = _owning_scene(obj, bpy.context.scene)
+            with bpy.context.temp_override(
+                    scene=scene, view_layer=scene.view_layers[0], object=obj,
+                    active_object=obj, selected_objects=[obj],
+                    selected_editable_objects=[obj]):
+                result = bpy.ops.object.multires_external_save(
+                    modifier=modifier.name, filepath=seed_path, relative_path=False)
+            if "FINISHED" not in result:
+                raise ValueError("Blender could not initialize external multires grids")
+        modifier.filepath = external_path
+        if not modifier.is_external:
+            raise ValueError("Blender did not mark multires grids as external")
+        _force_multires_external_read(obj, modifier)
+        DEFERRED_MDISPS_FILEPATHS[mesh_key] = (modifier, obj, filepath)
+        RESTORED_MDISPS_MESHES[mesh_key] = filepath
+        return True
+    finally:
+        if seed_path and os.path.exists(seed_path):
+            os.unlink(seed_path)
+
+
+def set_modifier_params(modifier, item, id_lookup, doc, target, node_id, obj, pack):
     params = item.get("params", {})
     kind = item.get("type")
     physics_property = {
@@ -2980,8 +3289,32 @@ def set_modifier_params(modifier, item, id_lookup, doc, target, node_id, obj):
     rna_params = dict(params)
     for parameter in ("projectors", "resource", "is_bound", "cache_filepath", "map_curve"):
         rna_params.pop(parameter, None)
+    if kind == "multires":
+        for parameter in (
+            "total_levels", "is_external", "levels", "sculpt_levels", "render_levels", "filepath",
+        ):
+            rna_params.pop(parameter, None)
     set_rna(modifier, rna_params, id_lookup)
     _restore_modifier_id_references(modifier, rna_params, id_lookup)
+    if kind == "multires":
+        total_levels = int(params.get("total_levels", modifier.total_levels))
+        if not 0 <= total_levels <= 13:
+            raise ValueError("Multires total_levels must be between 0 and 13")
+        with bpy.context.temp_override(
+                object=obj, active_object=obj,
+                selected_objects=[obj], selected_editable_objects=[obj]):
+            if total_levels < modifier.total_levels:
+                modifier.levels = total_levels
+                bpy.ops.object.multires_higher_levels_delete(modifier=modifier.name)
+            while modifier.total_levels < total_levels:
+                bpy.ops.object.multires_subdivide(
+                    modifier=modifier.name, mode="CATMULL_CLARK")
+        modifier.levels = min(int(params.get("levels", 0)), total_levels)
+        modifier.sculpt_levels = min(int(params.get("sculpt_levels", 0)), total_levels)
+        modifier.render_levels = min(int(params.get("render_levels", 0)), total_levels)
+        if not _restore_multires_displacement(modifier, obj, doc, target, node_id, pack):
+            if "filepath" in params:
+                modifier.filepath = params["filepath"]
     if kind in ("vertex_weight_edit", "vertex_weight_proximity") and "map_curve" in params:
         _set_curve_mapping(modifier, params["map_curve"])
     if kind == "mesh_cache" and params.get("resource"):
@@ -3405,11 +3738,12 @@ def _custom_normal_pair(entry):
 
 
 def _attribute_default(data_type):
-    """Blender's value for an element Potter stores no entry for: zero, or opaque black for colours."""
+    """Blender's value for an element Potter stores no entry for: zero, opaque black for colours, and the
+    identity quaternion in Potter's x, y, z, w order (the setter converts it to Blender's order)."""
     if data_type in MESH_COLOR_TYPES:
         return (0.0, 0.0, 0.0, 1.0)
     return {"BOOLEAN": False, "INT": 0, "FLOAT": 0.0, "FLOAT2": (0.0, 0.0),
-            "FLOAT_VECTOR": (0.0, 0.0, 0.0), "QUATERNION": (0.0, 0.0, 0.0, 0.0)}[data_type]
+            "FLOAT_VECTOR": (0.0, 0.0, 0.0), "QUATERNION": (0.0, 0.0, 0.0, 1.0)}[data_type]
 
 
 def _flatten_face_rows(rows, face_items, owner, default):
@@ -3626,6 +3960,134 @@ def _apply_blender_attributes(mesh, attributes, layer_names, layout, edge_of):
             _set_attribute_item(attribute.data[index], source["data_type"], value)
 
 
+def _apply_multires_control_data(mesh, attributes, face_items, layout):
+    record = attributes.get("multires_displacement")
+    if not isinstance(record, dict):
+        return
+    corner_count = sum(len(face.get("v", [])) for face in face_items)
+    grid_levels = record.get("grid_levels")
+    if grid_levels is None:
+        grid_levels = [int(record.get("total_levels", 0))] * corner_count
+    if len(grid_levels) != corner_count:
+        raise ValueError("multires grid_levels do not match mesh corners")
+    mesh_key = mesh.as_pointer()
+    paint_masks = record.get("paint_mask")
+    if paint_masks:
+        MULTIRES_MASK_LEVEL_BY_MESH[mesh_key] = max(
+            1, max(int(mask.get("level", 0)) for mask in paint_masks))
+    if record.get("hidden") is not None:
+        MULTIRES_HIDDEN_MESHES.add(mesh_key)
+    for field, name, data_type in (("paint_mask", ".sculpt_mask", "FLOAT"),
+                                   ("hidden", ".hide_vert", "BOOLEAN")):
+        grids = record.get(field)
+        if grids is None:
+            continue
+        if len(grids) != corner_count:
+            raise ValueError("multires %s grids do not match mesh corners" % field)
+        corner_values = []
+        # Blender recreates GridPaintMask from its fourth control-vertex sample when sculpt data is ensured.
+        for index, grid in enumerate(grids):
+            if field == "paint_mask":
+                level = int(grid.get("level", 0))
+                values = grid.get("values", [])
+            else:
+                level = int(grid_levels[index])
+                values = grid
+            if level == 0:
+                if values:
+                    raise ValueError("multires %s grid %d has samples at level zero" % (field, index))
+                corner_values.append(0.0 if field == "paint_mask" else False)
+                continue
+            side = (1 << (level - 1)) + 1
+            if len(values) != side * side:
+                raise ValueError("multires %s grid %d has an invalid size" % (field, index))
+            corner_values.append(values[3] if field == "paint_mask" else values[-1])
+        attribute = mesh.attributes.get(name)
+        if attribute is None:
+            corner_values = layout.loops(corner_values, "multires %s control values" % field)
+            point_values = [None] * len(mesh.vertices)
+            for loop_index, value in enumerate(corner_values):
+                point_index = mesh.loops[loop_index].vertex_index
+                previous = point_values[point_index]
+                if previous is not None and previous != value:
+                    raise ValueError("multires %s control values disagree at a shared vertex" % field)
+                point_values[point_index] = value
+            attribute = mesh.attributes.new(name=name, type=data_type, domain="POINT")
+            for index, value in enumerate(point_values):
+                _set_attribute_item(attribute.data[index], data_type,
+                                    value if value is not None else (0.0 if field == "paint_mask" else False))
+        elif attribute.data_type != data_type or attribute.domain != "POINT":
+            raise ValueError("Blender %s attribute has the wrong domain or type" % name)
+
+
+def _ensure_multires_sculpt_layers(obj):
+    if obj.type != "MESH" or obj.library is not None:
+        return
+    multires = next((modifier for modifier in obj.modifiers if modifier.type == "MULTIRES"), None)
+    if multires is None:
+        return
+    mesh = obj.data
+    mesh_key = mesh.as_pointer()
+    if not any(mesh.attributes.get(name) is not None
+               for name in (".sculpt_mask", ".hide_vert", ".hide_poly")):
+        return
+    scene = _owning_scene(obj)
+    if scene is None or not scene.view_layers:
+        return
+    view_layer = scene.view_layers[0]
+    previous_active = view_layer.objects.active
+    was_selected = obj.select_get(view_layer=view_layer)
+    previous_sculpt_level = int(multires.sculpt_levels)
+    previous_show_viewport = bool(multires.show_viewport)
+    multires.show_viewport = True
+    requested_mask_level = MULTIRES_MASK_LEVEL_BY_MESH.get(mesh_key)
+    if requested_mask_level is not None:
+        if requested_mask_level > int(multires.total_levels):
+            raise ValueError("GridPaintMask level exceeds the Multires modifier total level")
+        multires.sculpt_levels = requested_mask_level
+    hide_attribute = mesh.attributes.get(".hide_vert")
+    previous_hide_values = None
+    if mesh_key in MULTIRES_HIDDEN_MESHES:
+        if hide_attribute is None or hide_attribute.domain != "POINT" or hide_attribute.data_type != "BOOLEAN":
+            raise ValueError("multires hidden samples need a point hide attribute")
+        previous_hide_values = [bool(item.value) for item in hide_attribute.data]
+        for item in hide_attribute.data:
+            item.value = True
+    try:
+        with bpy.context.temp_override(
+                scene=scene, view_layer=view_layer, object=obj, active_object=obj,
+                selected_objects=[obj], selected_editable_objects=[obj]):
+            obj.select_set(True, view_layer=view_layer)
+            view_layer.objects.active = obj
+            if obj.mode != "OBJECT":
+                bpy.ops.object.mode_set(mode="OBJECT")
+            if requested_mask_level is not None:
+                # Blender keeps the per-grid GridPaintMask layer only while some mask value is
+                # nonzero, so an all-zero flood fill allocates nothing. Fill with 1.0; the export's
+                # per-grid patch then overwrites every grid value with the real mask. Headless Blender
+                # aborts in the sculpt undo push unless an undo step exists first.
+                bpy.ops.ed.undo_push(message="Potter multires mask allocation")
+            bpy.ops.object.mode_set(mode="SCULPT")
+            if requested_mask_level is not None:
+                bpy.ops.paint.mask_flood_fill(mode="VALUE", value=1.0)
+            bpy.context.view_layer.update()
+            bpy.ops.object.mode_set(mode="OBJECT")
+    finally:
+        if obj.mode == "SCULPT":
+            with bpy.context.temp_override(
+                    scene=scene, view_layer=view_layer, object=obj, active_object=obj,
+                    selected_objects=[obj], selected_editable_objects=[obj]):
+                bpy.ops.object.mode_set(mode="OBJECT")
+        if previous_hide_values is not None:
+            hide_attribute = mesh.attributes.get(".hide_vert")
+            for index, value in enumerate(previous_hide_values):
+                hide_attribute.data[index].value = value
+        multires.sculpt_levels = previous_sculpt_level
+        multires.show_viewport = previous_show_viewport
+        obj.select_set(was_selected, view_layer=view_layer)
+        view_layer.objects.active = previous_active
+
+
 def _apply_color_designation(mesh, attributes):
     """Set Blender color designations after native and Blender-only attributes exist."""
     store = attributes.get("color_layers") or {}
@@ -3642,7 +4104,6 @@ def _apply_color_designation(mesh, attributes):
             raise ValueError("color layer %s is designated %s but mesh %s has no such layer"
                              % (reference, key, mesh.name))
         setattr(mesh.color_attributes, field, layer_names.index(reference))
-
 def mesh_create(name, raw, block_id):
     mesh = bpy.data.meshes.new(name)
     attributes = raw.get("attributes", {})
@@ -3703,6 +4164,7 @@ def mesh_create(name, raw, block_id):
     _apply_native_attributes(mesh, attributes, names, vertex_items, edge_items, face_items, edge_of, layout,
                              layer_names)
     _apply_blender_attributes(mesh, attributes, layer_names, layout, edge_of)
+    _apply_multires_control_data(mesh, attributes, face_items, layout)
     _apply_color_designation(mesh, attributes)
     metadata = attributes.get("blender_metadata", {})
     set_props(mesh, metadata.get("custom_properties", {}))
@@ -6078,7 +6540,6 @@ def _set_alpha_mode(material, item):
     material.alpha_threshold = float(item.get("alpha_threshold", 0.5))
     material[ALPHA_MODE_PROPERTY] = mode
 
-
 def _text_from_string(name, body):
     text = bpy.data.texts.new(name)
     text.from_string(body)
@@ -6172,10 +6633,71 @@ def _pack_image(image, channels):
         os.remove(path)
 
 
+def _pack_udim_image(colorspace, udim, record_alpha_mode):
+    # Every tile is a file that the loader groups by its tile token into one TILED image; packing that image stores
+    # every tile. A PNG set packs each tile's original bytes (PR9: the byte path Blender samples for 8-bit PNG); a set
+    # with any other tile packs each tile as the float EXR that `_pack_image` writes.
+    extension = udim["format"]
+    directory = tempfile.mkdtemp(prefix="potter-udim-")
+    try:
+        for tile in udim["tiles"]:
+            path = os.path.join(directory, "tile.%d.%s" % (int(tile["number"]), extension))
+            if extension == "png":
+                with open(path, "wb") as handle:
+                    handle.write(bytes(tile["png_bytes"]))
+                continue
+            temp = bpy.data.images.new("potter-udim-tile", width=int(tile["width"]),
+                                       height=int(tile["height"]), alpha=True, float_buffer=True)
+            try:
+                temp.alpha_mode = {"straight": "STRAIGHT", "premultiplied": "PREMUL", "none": "NONE"}[
+                    record_alpha_mode]
+                if colorspace is not None:
+                    temp.colorspace_settings.name = colorspace
+                _pack_image(temp, [channel for pixel in tile["pixels"] for channel in pixel])
+                data = temp.packed_file.data
+            finally:
+                bpy.data.images.remove(temp)
+            with open(path, "wb") as handle:
+                handle.write(data)
+        # The first listed tile starts the TILED image; its tile token then groups the set, base 1001 or not.
+        first = int(udim["tiles"][0]["number"])
+        image = bpy.data.images.load(os.path.join(directory, "tile.%d.%s" % (first, extension)), check_existing=False)
+        image.source = "TILED"
+        image.filepath = os.path.join(directory, "tile.<UDIM>.%s" % extension)
+        image.reload()
+        labels = {int(tile["number"]): tile["label"] for tile in udim["tiles"] if tile.get("label")}
+        for tile in image.tiles:
+            if tile.number in labels:
+                tile.label = labels[tile.number]
+        if extension == "exr":
+            image.alpha_mode = {"straight": "STRAIGHT", "premultiplied": "PREMUL", "none": "NONE"}[
+                record_alpha_mode]
+        if colorspace is not None:
+            image.colorspace_settings.name = colorspace
+        image.pack()
+        return image
+    finally:
+        shutil.rmtree(directory)
+
+
+def _placeholder_udim_image(name):
+    # A TILED image whose `<UDIM>` filepath names no file: Blender holds it with no loadable tile, so the image and its
+    # filepath survive a save and reopen (probed). Its tiles and base are reported as losses by the exporter.
+    image = bpy.data.images.new("potter-udim-placeholder", width=1, height=1, alpha=True)
+    image.source = "TILED"
+    image.filepath = "//%s.<UDIM>.exr" % name
+    image.reload()
+    return image
+
+
 def export_doc(doc, target, pack, scene_hash, context):
     CACHE_FILES_BY_IDENTITY.clear()
     DEFERRED_ID_ASSIGNMENTS.clear()
     DEFERRED_HAIR_KEY_RESTORATIONS.clear()
+    DEFERRED_MDISPS_FILEPATHS.clear()
+    RESTORED_MDISPS_MESHES.clear()
+    MULTIRES_MASK_LEVEL_BY_MESH.clear()
+    MULTIRES_HIDDEN_MESHES.clear()
     # Factory startup is already clean, but remove all scene objects to make this robust
     # when invoked by Blender builds that ignore the startup flag.
     for scene in bpy.data.scenes:
@@ -6246,7 +6768,14 @@ def export_doc(doc, target, pack, scene_hash, context):
             scene.render.ffmpeg.audio_codec = blender_audio_codec(render.get("audio_codec", "wav"))
         if engine == "CYCLES" and hasattr(scene, "cycles"):
             scene.cycles.max_bounces = int(render.get("max_bounces", 4))
+            if "transparent_max_bounces" in render:
+                scene.cycles.transparent_max_bounces = int(render["transparent_max_bounces"])
         scene.render.engine = engine
+        if hasattr(scene, "cycles"):
+            scene.cycles.dicing_rate = float(render.get("dicing_rate", 1.0))
+            scene.cycles.preview_dicing_rate = float(render.get("preview_dicing_rate", 8.0))
+            scene.cycles.max_subdivisions = int(render.get("max_subdivisions", 12))
+            scene.cycles.offscreen_dicing_scale = float(render.get("offscreen_dicing_scale", 4.0))
         if engine == "CYCLES" and hasattr(scene, "cycles"):
             scene.cycles.samples = int(render.get("samples", 64))
             scene.cycles.seed = int(render.get("seed", 0))
@@ -6321,13 +6850,21 @@ def export_doc(doc, target, pack, scene_hash, context):
     image_map = {}
     for image_id, item in doc.get("images", {}).items():
         png_bytes = item.get("png_bytes")
-        sidecar = _export_sidecar_path(doc, item.get("source_path"))
+        udim = item.get("udim_tiles")
+        sidecar = None if udim else _export_sidecar_path(doc, item.get("source_path"))
         colorspace = {
             "srgb": "sRGB",
             "linear": "Linear Rec.709",
             "non_color": "Non-Color",
         }.get(item.get("colorspace"))
-        if sidecar is None and png_bytes is not None:
+        if udim and udim["format"] == "placeholder":
+            image = _placeholder_udim_image(item["name"])
+            image.name = item["name"]
+        elif udim:
+            # A UDIM image packs every listed tile, the base tile 1001 included, into one TILED image.
+            image = _pack_udim_image(colorspace, udim, item.get("alpha_mode", "straight"))
+            image.name = item["name"]
+        elif sidecar is None and png_bytes is not None:
             # An 8-bit PNG loads from its own file bytes, as the fixture's texture does: source FILE, packed PNG.
             # The temp file is packed while it exists: Blender reads the source path when packing.
             descriptor, png_path = tempfile.mkstemp(
@@ -6352,12 +6889,16 @@ def export_doc(doc, target, pack, scene_hash, context):
         if colorspace is not None:
             image.colorspace_settings.name = colorspace
         pixels = item.get("pixels")
-        if sidecar is None and png_bytes is None and pixels is not None:
+        if not udim and sidecar is None and png_bytes is None and pixels is not None:
+            image.alpha_mode = {"straight": "STRAIGHT", "premultiplied": "PREMUL", "none": "NONE"}[
+                item.get("alpha_mode", "straight")
+            ]
             _pack_image(image, [channel for pixel in pixels for channel in pixel])
-        if item.get("source") == "packed" and image.packed_file is None:
+        if not udim and item.get("source") == "packed" and image.packed_file is None:
             image.pack()
         set_id(image, image_id)
-        image_metadata = {key: value for key, value in item.items() if key not in ("pixels", "png_bytes")}
+        image_metadata = {key: value for key, value in item.items()
+                          if key not in ("pixels", "png_bytes", "udim_tiles")}
         image["potter.image_json"] = json.dumps(image_metadata, sort_keys=True)
         image_map[image_id] = image
         image.use_fake_user = True
@@ -6469,6 +7010,9 @@ def export_doc(doc, target, pack, scene_hash, context):
             raw = item.get("camera") or {}
             source = compatibility_block(doc, "cameras", "Camera", data_id)
             camera = bpy.data.cameras.new(compatibility_name(doc, "Camera", data_id, data_id))
+            # Blender stores `lens` and every panorama setting on every camera, and Potter keeps them all, so each is written
+            # from Potter's camera data whatever the projection: a setting the projection ignores still round-trips. The camera
+            # type alone picks the projection that Blender draws.
             camera.lens = raw.get("lens_mm", 50.0)
             camera.sensor_width = raw.get("sensor_width_mm", 36.0)
             camera.sensor_height = raw.get("sensor_height_mm", 24.0)
@@ -6477,8 +7021,18 @@ def export_doc(doc, target, pack, scene_hash, context):
             camera.clip_start = raw.get("clip_start", 0.1)
             camera.clip_end = raw.get("clip_end", 1000.0)
             camera.shift_x, camera.shift_y = raw.get("shift", [0.0, 0.0])
-            if raw.get("projection") == "orthographic":
-                camera.type = "ORTHO"
+            camera.panorama_type = {
+                "equirectangular": "EQUIRECTANGULAR",
+                "fisheye_equidistant": "FISHEYE_EQUIDISTANT",
+                "fisheye_equisolid": "FISHEYE_EQUISOLID",
+            }[raw.get("panorama_type", "equirectangular")]
+            camera.longitude_min = raw.get("longitude_min", -math.pi)
+            camera.longitude_max = raw.get("longitude_max", math.pi)
+            camera.latitude_min = raw.get("latitude_min", -0.5 * math.pi)
+            camera.latitude_max = raw.get("latitude_max", 0.5 * math.pi)
+            camera.fisheye_fov = raw.get("fisheye_fov", math.pi)
+            camera.fisheye_lens = raw.get("fisheye_lens", 10.5)
+            camera.type = {"orthographic": "ORTHO", "panorama": "PANO"}.get(raw.get("projection"), "PERSP")
             set_id(camera, data_id)
             set_props(camera, source.get("custom_properties", {}))
             if source.get("fake_user"):
@@ -6492,13 +7046,18 @@ def export_doc(doc, target, pack, scene_hash, context):
             light.color = raw.get("color", [1.0, 1.0, 1.0])
             light.energy = raw.get("energy", 1000.0)
             light.shadow_soft_size = raw.get("radius", 0.1)
+            if raw.get("light_type") in ("point", "spot"):
+                light.use_soft_falloff = bool(raw.get("soft_falloff", True))
             if raw.get("light_type") == "area":
                 light.shape = raw.get("area_shape", "SQUARE")
                 light.size = float(raw.get("area_size", 0.25))
                 light.size_y = float(raw.get("area_size_y", light.size))
+                light.spread = float(raw.get("spread", math.pi))
             if raw.get("light_type") == "spot":
                 light.spot_size = raw.get("spot_size", math.pi / 4)
                 light.spot_blend = raw.get("spot_blend", 0.15)
+            light.cycles.use_multiple_importance_sampling = bool(
+                raw.get("use_multiple_importance_sampling", True))
             set_id(light, data_id)
             set_props(light, source.get("custom_properties", {}))
             if source.get("fake_user"):
@@ -6528,11 +7087,15 @@ def export_doc(doc, target, pack, scene_hash, context):
         if material_id in material_map:
             continue
         mat = bpy.data.materials.new(item["name"])
-        mat.diffuse_color = item["base_color"]
+        viewport = item.get("viewport_display")
+        mat.diffuse_color = viewport["diffuse_color"] if viewport else item["base_color"]
         mat.use_nodes = True
         set_id(mat.node_tree, item.get("node_tree"))
         _set_principled_values(mat, item)
-        mat.use_backface_culling = not bool(item.get("double_sided", False))
+        mat.roughness = viewport["roughness"] if viewport else item["roughness"]
+        mat.metallic = viewport["metallic"] if viewport else item["metallic"]
+        mat.use_backface_culling = not bool(item.get("double_sided", True))
+        mat.use_transparent_shadow = bool(item.get("use_transparent_shadow", True))
         mat.displacement_method = "DISPLACEMENT" if item.get("displacement_method") == "displacement" else "BUMP"
         set_id(mat, material_id)
         source = compatibility_block(doc, "materials", "Material", material_id)
@@ -6561,6 +7124,8 @@ def export_doc(doc, target, pack, scene_hash, context):
     native_bind_copies, preserved_native_binds = _source_modifier_object_copies(
         doc, mesh_map)
     object_map = dict(linked_maps["nodes"])
+    # Nodes whose Blender rotation was restored from the source Euler/quaternion values exactly.
+    exact_rotation_nodes = set()
     for node_id, item in doc.get("nodes", {}).items():
         if node_id in linked_maps["nodes"]:
             continue
@@ -6658,6 +7223,8 @@ def export_doc(doc, target, pack, scene_hash, context):
                 and source_rotation_mode == obj.rotation_mode
                 and abs(abs(source_quaternion.dot(quaternion)) - 1.0) <= 1.0e-14
             )
+            if source_rotation_unchanged:
+                exact_rotation_nodes.add(node_id)
             if source_rotation_unchanged and obj.rotation_mode == "QUATERNION":
                 obj.rotation_quaternion = source_rotation_values
             elif source_rotation_unchanged and obj.rotation_mode == "AXIS_ANGLE":
@@ -6821,6 +7388,7 @@ def export_doc(doc, target, pack, scene_hash, context):
         view.look = blender_color_look(color.get("look", "none"))
         view.exposure = float(color.get("exposure", 0.0))
         view.gamma = float(color.get("gamma", 1.0))
+        _restore_color_curve(view, color.get("curve"))
         _restore_sequencer(scene, item.get("sequencer"), scene_map, doc, target)
     for node_id, item in doc.get("nodes", {}).items():
         if (node_id in linked_maps["nodes"]
@@ -6849,7 +7417,7 @@ def export_doc(doc, target, pack, scene_hash, context):
                 rna_item = dict(modifier_item, params={
                     key: value for key, value in params.items() if key != "use_pin_to_last"})
                 set_modifier_params(
-                    modifier, rna_item, id_lookup, doc, target, node_id, obj)
+                    modifier, rna_item, id_lookup, doc, target, node_id, obj, pack)
                 if modifier_item.get("type") == "mesh_sequence_cache":
                     cache_file = _cache_file_for_resource(
                         doc, params["resource"], target, params)
@@ -6892,6 +7460,7 @@ def export_doc(doc, target, pack, scene_hash, context):
         obj = object_map[node_id]
         is_linked = node_id in linked_maps["nodes"]
         root_parent_inverse = None
+        has_captured_basis = False
         if not is_linked:
             parent = object_map.get(item.get("parent"))
             if parent:
@@ -6920,6 +7489,23 @@ def export_doc(doc, target, pack, scene_hash, context):
                 rows = [[values[column * 4 + row] for column in range(4)]
                         for row in range(4)]
                 root_parent_inverse = Matrix(rows)
+            elif item.get("blender_parent_inverse"):
+                # Round-trip of a Blender root's inverse: Blender ignores it without a parent, so it is
+                # written as is and the basis stays the evaluated transform.
+                values = item["blender_parent_inverse"]
+                rows = [[values[column * 4 + row] for column in range(4)]
+                        for row in range(4)]
+                obj.matrix_parent_inverse = Matrix(rows)
+            basis = item.get("matrix_basis")
+            if isinstance(basis, (list, tuple)) and len(basis) == 16:
+                has_captured_basis = True
+                # Assigning a matrix decomposes it into loc/rot/scale and moves rotation and scale by an
+                # ulp. A rotation restored exactly above (Blender's own Euler values) is already the
+                # Blender basis, so only the other captured nodes take the matrix.
+                if node_id not in exact_rotation_nodes:
+                    rows = [[basis[column * 4 + row] for column in range(4)]
+                            for row in range(4)]
+                    obj.matrix_basis = Matrix(rows)
         memberships = 0
         for collection_id, collection_item in collections_raw.items():
             if node_id not in collection_item.get("objects", []):
@@ -6941,16 +7527,19 @@ def export_doc(doc, target, pack, scene_hash, context):
                           if obj.name_full in candidate.objects), bpy.context.scene)
             _restore_object_material_slots(obj, item, material_map, scene)
         if root_parent_inverse is not None and root_parent_inverse != Matrix.Identity(4):
-            combined = root_parent_inverse @ obj.matrix_basis.copy()
-            # Without a parent Blender ignores matrix_parent_inverse. Bake its
-            # offset into the linked root's basis and world matrix instead.
-            obj.matrix_basis = combined
-            obj.matrix_world = combined
-            obj["potter.root_matrix_json"] = json.dumps({
-                "parent_inverse": values,
-                "transform": item["transform"],
-                "baked_basis": matrix_rows(obj.matrix_basis),
-            }, sort_keys=True)
+            if has_captured_basis:
+                obj.matrix_parent_inverse = root_parent_inverse
+            else:
+                combined = root_parent_inverse @ obj.matrix_basis.copy()
+                # Without a parent Blender ignores matrix_parent_inverse. Bake its
+                # offset into the linked root's basis and world matrix instead.
+                obj.matrix_basis = combined
+                obj.matrix_world = combined
+                obj["potter.root_matrix_json"] = json.dumps({
+                    "parent_inverse": values,
+                    "transform": item["transform"],
+                    "baked_basis": matrix_rows(obj.matrix_basis),
+                }, sort_keys=True)
         if obj.type == "MESH":
             mesh_source = compatibility_block(doc, "meshes", "Mesh", item.get("data"))
             _restore_skin_vertices(obj, mesh_source.get("skin_vertices", []))
@@ -7121,6 +7710,17 @@ def export_doc(doc, target, pack, scene_hash, context):
             scene.camera = object_map[item["camera"]]
         if item.get("world") in world_map:
             scene.world = world_map[item["world"]]
+        dicing_camera_id = item.get("render", {}).get("dicing_camera")
+        if hasattr(scene, "cycles"):
+            if dicing_camera_id is None:
+                scene.cycles.dicing_camera = None
+            else:
+                dicing_camera = object_map.get(dicing_camera_id)
+                if dicing_camera is None or dicing_camera.type != "CAMERA":
+                    raise ValueError("adaptive subdivision dicing camera is missing or invalid")
+                scene.cycles.dicing_camera = dicing_camera
+        elif dicing_camera_id is not None:
+            raise ValueError("Blender build cannot restore the Cycles dicing camera")
     context_scene_id = context.get("scene_id") or doc.get("active_scene")
     active_scene = scene_map.get(context_scene_id)
     if active_scene:
@@ -7151,17 +7751,28 @@ def export_doc(doc, target, pack, scene_hash, context):
         text = _text_from_string(item.get("name", "Imported Text"), item.get("body", ""))
         set_id(text, item.get("potter_id"))
         set_props(text, item.get("custom_properties", {}))
+    for obj in object_map.values():
+        _ensure_multires_sculpt_layers(obj)
+
     output_dir = os.path.dirname(os.path.abspath(target))
     os.makedirs(output_dir, exist_ok=True)
     if pack:
         bpy.ops.file.pack_all()
+    # Resolve `//` MDisps paths after Blender knows the saved .blend path.
     bpy.ops.wm.save_as_mainfile(filepath=target, check_existing=False,
                                 relative_remap=False)
+    needs_resave = bool(DEFERRED_MDISPS_FILEPATHS or bpy.data.movieclips)
+    for modifier, obj, filepath in DEFERRED_MDISPS_FILEPATHS.values():
+        modifier.filepath = filepath
+        if not modifier.is_external:
+            raise ValueError("Blender did not retain external multires grid state")
+        _force_multires_external_read(obj, modifier)
     if bpy.data.movieclips:
         for clip in bpy.data.movieclips:
             if clip.filepath:
                 clip.filepath = _relative_blend_path(
                     bpy.path.abspath(clip.filepath), target)
+    if needs_resave:
         bpy.ops.wm.save_as_mainfile(filepath=target, check_existing=False,
                                     relative_remap=False)
 

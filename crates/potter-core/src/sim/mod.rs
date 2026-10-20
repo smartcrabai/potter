@@ -1236,7 +1236,7 @@ fn collider_triangles(
             .iter()
             .map(|vertex| (vertex.id, matrix.transform_point3(vertex.co)))
             .collect::<BTreeMap<_, _>>();
-        for triangle in mesh.triangulate().map_err(|error| {
+        for triangle in mesh.tessellate().map_err(|error| {
             PotError::with_details(
                 ErrorCode::SceneInvalid,
                 format!("collision mesh `{id}` is invalid: {error}"),

@@ -79,6 +79,7 @@ struct UsdProperty {
     custom: bool,
     uniform: bool,
     interpolation: Option<String>,
+    color_space: Option<String>,
     time_samples: Option<(Vec<f64>, Vec<ValueData>)>,
     raw_value: String,
 }
@@ -167,6 +168,7 @@ fn parse_usda_subset(text: &str) -> Result<Vec<UsdPrim>> {
                     custom,
                     uniform,
                     interpolation: None,
+                    color_space: None,
                     time_samples: Some((times, samples)),
                     raw_value: String::new(),
                 });
@@ -177,15 +179,23 @@ fn parse_usda_subset(text: &str) -> Result<Vec<UsdPrim>> {
             .split_once("(interpolation = ")
             .and_then(|(_, suffix)| parse_quoted_strings(suffix).ok())
             .and_then(|values| values.into_iter().next());
-        let Some(raw_value) = raw.split(" (interpolation =").next() else {
-            continue;
-        };
+        let color_space = raw
+            .split_once("colorSpace = ")
+            .and_then(|(_, suffix)| parse_quoted_strings(suffix).ok())
+            .and_then(|values| values.into_iter().next());
+        // The value ends at the first metadata group, `(interpolation = …)` or `(colorSpace = …)`.
+        let metadata_start = raw
+            .find(" (interpolation =")
+            .or_else(|| raw.find(" (colorSpace ="))
+            .unwrap_or(raw.len());
+        let raw_value = &raw[..metadata_start];
         current.properties.push(UsdProperty {
             name,
             type_name,
             custom,
             uniform,
             interpolation,
+            color_space,
             time_samples: None,
             raw_value: raw_value.trim().to_owned(),
         });
@@ -532,6 +542,12 @@ fn append_prim_specs(prims: &[UsdPrim], parent: &str, specs: &mut Vec<CrateSpec>
                     value: ValueData::Token(interpolation.clone()),
                 });
             }
+            if let Some(color_space) = &property.color_space {
+                fields.push(CrateField {
+                    name: "colorSpace".to_owned(),
+                    value: ValueData::Token(color_space.clone()),
+                });
+            }
             fields.sort_by(|a, b| a.name.cmp(&b.name));
             specs.push(CrateSpec {
                 path: attribute_path,
@@ -585,6 +601,21 @@ fn parse_value(type_name: &str, raw: &str) -> Result<Option<ValueData>> {
                 return Ok(Some(ValueData::NumericArray {
                     type_code: 24,
                     bytes: numbers(raw)
+                        .into_iter()
+                        .flat_map(|value| (value as f32).to_le_bytes())
+                        .collect(),
+                }));
+            }
+            "color4f" => {
+                let values = numbers(raw);
+                if !values.len().is_multiple_of(4) {
+                    return Err(export_error(
+                        "USDA color4f array has an invalid component count",
+                    ));
+                }
+                return Ok(Some(ValueData::NumericArray {
+                    type_code: 28,
+                    bytes: values
                         .into_iter()
                         .flat_map(|value| (value as f32).to_le_bytes())
                         .collect(),
@@ -1060,6 +1091,7 @@ fn encode_value(
                 3 | 4 | 8 | 10 | 11 => 4,
                 24 => 12,
                 23 => 24,
+                28 => 16,
                 20 | 9 => 8,
                 _ => return Err(export_error("unsupported USD array element type")),
             };
@@ -1928,9 +1960,18 @@ fn layer_from_specs(
         let custom = matches!(values.get("custom"), Some(DecodedValue::Bool(true)));
         let uniform = matches!(values.get("variability"), Some(DecodedValue::I32(1)));
         let interpolation = values.get("interpolation").and_then(DecodedValue::as_text);
-        let metadata = interpolation
-            .map(|value| format!(" (interpolation = \"{}\")", escape(value)))
-            .unwrap_or_default();
+        let mut metadata_entries = Vec::new();
+        if let Some(value) = interpolation {
+            metadata_entries.push(format!("interpolation = \"{}\"", escape(value)));
+        }
+        if let Some(value) = values.get("colorSpace").and_then(DecodedValue::as_text) {
+            metadata_entries.push(format!("colorSpace = \"{}\"", escape(value)));
+        }
+        let metadata = if metadata_entries.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", metadata_entries.join(", "))
+        };
         if let Some(value) = default {
             let rendered = value.to_usda(type_name)?;
             prim.properties.push(format!(
@@ -2032,7 +2073,7 @@ impl DecodedValue {
                     let width = match type_code {
                         20 => 2,
                         23 | 24 | 26 => 3,
-                        27 => 4,
+                        27 | 28 => 4,
                         _ => 1,
                     };
                     let items = values
@@ -2177,12 +2218,12 @@ fn decode_value(
         let component_count = match code {
             20 => 2,
             23 | 24 | 26 => 3,
-            27 => 4,
+            27 | 28 => 4,
             _ => 1,
         };
         let component_size = match code {
             1 | 2 => 1,
-            3 | 4 | 8 | 20 | 24 | 26 => 4,
+            3 | 4 | 8 | 20 | 24 | 26 | 28 => 4,
             5 | 6 | 9 | 23 | 27 => 8,
             _ => return Err(import_error("USD crate array value type is unsupported")),
         };
@@ -2228,7 +2269,7 @@ fn decode_value(
                 .collect::<Result<Vec<_>>>()?
         } else if code == 1 {
             data.iter().map(|value| f64::from(*value != 0)).collect()
-        } else if code == 8 || code == 20 || code == 24 {
+        } else if code == 8 || code == 20 || code == 24 || code == 28 {
             decode_f32_components(&data)?
         } else {
             decode_f64_components(&data)?

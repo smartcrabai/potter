@@ -138,7 +138,8 @@ pub(super) fn cache_key(
 
     let input = json!({
         "solver_version": SOLVER_VERSION,
-        "particle_state_version": PARTICLE_STATE_VERSION,
+    "particle_state_version": PARTICLE_STATE_VERSION,
+    "build_identity": crate::BUILD_IDENTITY,
         "scene_id": scene_id.as_str(),
         "frame": frame,
         "purpose": gate.context.purpose,

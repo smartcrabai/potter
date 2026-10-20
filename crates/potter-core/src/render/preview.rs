@@ -9,21 +9,25 @@ use serde_json::{Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
-    eval::{EvaluationContext, EvaluationPurpose, Snapshot},
+    eval::{
+        AdaptiveCameraOverride, AdaptiveRenderRequest, EvaluationContext, EvaluationPurpose,
+        Snapshot,
+    },
     hash,
-    model::{CameraProjection, Id, SceneDoc},
+    model::{CameraData, CameraProjection, Id, SceneDoc},
 };
 
 use super::{
     raster::{
-        Camera, DepthOfField, Mode, Projection, RasterOutput, StereoMode, rasterize_with_lines,
+        Camera, CameraEngine, DepthOfField, Mode, Projection, RasterOutput, StereoMode, ViewBasis,
+        projection_for_camera, rasterize_with_lines,
     },
     scene::{Geometry, extract_geometry, surface_shader},
 };
 
 const MIN_SIZE: u32 = 64;
 const MAX_SIZE: u32 = 16_384;
-pub(super) const ENGINE: &str = "potter-cpu-path-2";
+pub(super) const ENGINE: &str = "potter-cpu-path-4";
 const VALID_VIEWS: [&str; 7] = ["front", "back", "right", "left", "top", "bottom", "iso"];
 
 #[derive(Clone, Debug)]
@@ -41,11 +45,10 @@ pub struct PreviewRequest<'a> {
 #[derive(Clone, Debug)]
 struct PreparedCamera {
     camera: Camera,
+    /// The camera data the render was prepared from, which adaptive dicing reads so its pixel estimate matches the render.
+    data: CameraData,
     projection_name: &'static str,
     matrix: [f64; 16],
-    ortho_height: Option<f64>,
-    lens_mm: Option<f64>,
-    sensor_width_mm: Option<f64>,
 }
 
 struct RenderFiles {
@@ -88,53 +91,133 @@ pub fn render_previews(
     }
     let mode = parse_mode(request.mode)?;
     let labels = resolve_views(request.views, request.camera_id)?;
-    let (snapshot, node_errors) = Snapshot::evaluate_available_with_cache(
-        doc,
-        request.context,
-        Some(project_root),
-        Some(cache_directory),
-    )?;
+    let scene_id = request
+        .context
+        .scene_id
+        .as_ref()
+        .unwrap_or(&doc.active_scene);
+    let scene = doc
+        .scenes
+        .get(scene_id)
+        .ok_or_else(|| PotError::new(ErrorCode::TargetNotFound, "selected scene does not exist"))?;
+    let adaptive_enabled =
+        matches!(mode, Mode::Beauty) && scene.render.engine == "path" && has_adaptive_subsurf(doc);
     let images = if matches!(mode, Mode::Beauty) {
         super::path::load_images(doc, project_root, request.staged_assets)?
     } else {
         BTreeMap::new()
     };
-    let mut geometry =
-        extract_geometry(doc, &snapshot, mode, matches!(mode, Mode::Beauty), &images)?;
-    for (node_id, error) in &node_errors {
-        geometry.warnings.push(json!({
-            "code": "UNSUPPORTED_FEATURE",
-            "feature_id": error.details.get("feature_id"),
-            "node_id": node_id,
-            "message": error.message,
-        }));
-    }
-    geometry
-        .warnings
-        .extend(snapshot.warnings.iter().map(|warning| json!(warning)));
-    let shader = surface_shader(doc, &snapshot, &images, &geometry, mode);
+    let (base_snapshot, base_geometry) = if request.camera_id.is_none() || !adaptive_enabled {
+        let (snapshot, node_errors) = Snapshot::evaluate_available_with_cache(
+            doc,
+            request.context,
+            Some(project_root),
+            Some(cache_directory),
+        )?;
+        let mut geometry =
+            extract_geometry(doc, &snapshot, mode, matches!(mode, Mode::Beauty), &images)?;
+        for (node_id, error) in &node_errors {
+            geometry.warnings.push(json!({
+                "code": "UNSUPPORTED_FEATURE",
+                "feature_id": error.details.get("feature_id"),
+                "node_id": node_id,
+                "message": error.message,
+            }));
+        }
+        geometry
+            .warnings
+            .extend(snapshot.warnings.iter().map(|warning| json!(warning)));
+        (Some(snapshot), Some(geometry))
+    } else {
+        (None, None)
+    };
     let mut pending = Vec::with_capacity(labels.len());
     for label in labels {
-        let prepared = if let Some(camera_id) = request.camera_id {
-            stored_camera(doc, &snapshot, camera_id)?
+        let prepared_from_base = if request.camera_id.is_none() {
+            let geometry = base_geometry.as_ref().ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::InternalError,
+                    "automatic preview camera requires an evaluated control surface",
+                )
+            })?;
+            Some(preset_camera(geometry, &label)?)
         } else {
-            preset_camera(&geometry, &label)?
+            None
         };
-        let background = background_color(doc, &snapshot, mode, false);
-        let scene = doc.scenes.get(&snapshot.scene_id).ok_or_else(|| {
-            PotError::new(ErrorCode::TargetNotFound, "selected scene does not exist")
-        })?;
+        let camera_id = request
+            .camera_id
+            .map(|camera| Id::new(camera.to_owned()))
+            .transpose()?;
+        let adaptive_render = adaptive_enabled.then(|| AdaptiveRenderRequest {
+            camera_id: camera_id.clone(),
+            camera_override: prepared_from_base.as_ref().map(adaptive_camera_override),
+            resolution: [request.size, request.size],
+            dicing_rate: scene.render.preview_dicing_rate,
+        });
+        let mut adaptive_snapshot = None;
+        let mut adaptive_geometry = None;
+        if let Some(adaptive_render) = &adaptive_render {
+            let mut adaptive_context = request.context.clone();
+            adaptive_context.adaptive_render = Some(adaptive_render.clone());
+            let snapshot = Snapshot::evaluate_with_cache(
+                doc,
+                &adaptive_context,
+                Some(project_root),
+                Some(cache_directory),
+            )?;
+            let mut geometry = extract_geometry(doc, &snapshot, mode, true, &images)?;
+            geometry
+                .warnings
+                .extend(snapshot.warnings.iter().map(|warning| json!(warning)));
+            adaptive_snapshot = Some(snapshot);
+            adaptive_geometry = Some(geometry);
+        }
+        let snapshot = adaptive_snapshot
+            .as_ref()
+            .or(base_snapshot.as_ref())
+            .ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::InternalError,
+                    "preview evaluation snapshot is missing",
+                )
+            })?;
+        let geometry = adaptive_geometry
+            .as_ref()
+            .or(base_geometry.as_ref())
+            .ok_or_else(|| {
+                PotError::new(ErrorCode::InternalError, "preview geometry is missing")
+            })?;
+        let prepared = if let Some(camera_id) = request.camera_id {
+            // Beauty is path-traced here, as Cycles draws a panorama camera; the other modes are rasterized.
+            let engine = if matches!(mode, Mode::Beauty) {
+                CameraEngine::Path
+            } else {
+                CameraEngine::Raster
+            };
+            stored_camera(doc, snapshot, camera_id, engine)?
+        } else {
+            prepared_from_base.ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::InternalError,
+                    "automatic preview camera is missing",
+                )
+            })?
+        };
+        let view = ViewBasis::from_camera(&prepared.camera)?;
+        let shader = surface_shader(doc, snapshot, &images, geometry, mode, view);
+        let background = background_color(doc, snapshot, mode, false);
         let mut raster = if matches!(mode, Mode::Beauty) {
             super::path::render(
                 doc,
-                &snapshot,
-                &geometry,
+                snapshot,
+                geometry,
                 &prepared.camera,
                 request.size,
                 request.size,
                 scene.render.samples,
                 scene.render.seed,
                 scene.render.max_bounces,
+                scene.render.transparent_max_bounces,
                 false,
                 &images,
             )?
@@ -152,25 +235,31 @@ pub fn render_previews(
                 shader.as_deref(),
             )?
         };
-        if matches!(mode, Mode::Beauty) {
-            crate::compositor::apply(
+        match mode {
+            Mode::Beauty => crate::compositor::apply(
                 &mut raster,
                 doc,
                 scene,
                 request.size,
                 request.size,
                 request.context.frame.unwrap_or(scene.frame_current),
-            )?;
+            )?,
+            // Solid is display-encoded through the scene's view transform and look, as Beauty is.
+            Mode::Solid => {
+                crate::compositor::encode_display_output(&mut raster, &scene.color_management)?;
+            }
+            _ => {}
         }
         let (manifest, files) = manifest_value(
             doc,
-            &snapshot,
-            &geometry,
+            snapshot,
+            geometry,
             &prepared,
             &label,
             mode,
             request.size,
             background,
+            adaptive_render.as_ref(),
             &raster,
         )?;
         let render_key = manifest
@@ -231,8 +320,25 @@ pub(crate) fn render_camera_frame(
         ));
     }
     let mode = parse_mode(mode_name)?;
-    let snapshot =
-        Snapshot::evaluate_with_cache(doc, context, Some(project_root), Some(cache_directory))?;
+    let mut evaluation_context = context.clone();
+    if engine == "path" && has_adaptive_subsurf(doc) {
+        let scene_id = context.scene_id.as_ref().unwrap_or(&doc.active_scene);
+        let scene = doc.scenes.get(scene_id).ok_or_else(|| {
+            PotError::new(ErrorCode::TargetNotFound, "selected scene does not exist")
+        })?;
+        evaluation_context.adaptive_render = Some(crate::eval::AdaptiveRenderRequest {
+            camera_id: Some(Id::new(camera_id.to_owned())?),
+            camera_override: None,
+            resolution: [width, height],
+            dicing_rate: scene.render.dicing_rate,
+        });
+    }
+    let snapshot = Snapshot::evaluate_with_cache(
+        doc,
+        &evaluation_context,
+        Some(project_root),
+        Some(cache_directory),
+    )?;
     let images = super::path::load_images(doc, project_root, None)?;
     let geometry = extract_geometry(
         doc,
@@ -241,8 +347,20 @@ pub(crate) fn render_camera_frame(
         engine == "path" && matches!(mode, Mode::Beauty),
         &images,
     )?;
-    let shader = surface_shader(doc, &snapshot, &images, &geometry, mode);
-    let camera = stored_camera(doc, &snapshot, camera_id)?;
+    let engine_for_camera = if engine == "path" && matches!(mode, Mode::Beauty) {
+        CameraEngine::Path
+    } else {
+        CameraEngine::Raster
+    };
+    let camera = stored_camera(doc, &snapshot, camera_id, engine_for_camera)?;
+    let shader = surface_shader(
+        doc,
+        &snapshot,
+        &images,
+        &geometry,
+        mode,
+        ViewBasis::from_camera(&camera.camera)?,
+    );
     let scene = doc
         .scenes
         .get(&snapshot.scene_id)
@@ -259,6 +377,7 @@ pub(crate) fn render_camera_frame(
             samples,
             seed,
             scene.render.max_bounces,
+            scene.render.transparent_max_bounces,
             film_transparent,
             &images,
         )?
@@ -300,6 +419,19 @@ pub(crate) fn render_camera_frame(
         context.frame.unwrap_or(scene.frame_current),
     )?;
     Ok((snapshot, raster, geometry.all_warnings()))
+}
+
+fn has_adaptive_subsurf(doc: &SceneDoc) -> bool {
+    doc.nodes.values().any(|node| {
+        node.modifiers.iter().any(|modifier| {
+            modifier.modifier_type == "subdivision"
+                && modifier
+                    .params
+                    .get("use_adaptive_subdivision")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+        })
+    })
 }
 
 fn parse_mode(value: &str) -> Result<Mode> {
@@ -402,15 +534,22 @@ fn preset_camera(geometry: &Geometry, view: &str) -> Result<PreparedCamera> {
     let matrix = camera_matrix(position, target, up_hint);
     Ok(PreparedCamera {
         camera,
+        data: CameraData {
+            projection: CameraProjection::Orthographic,
+            ortho_scale: ortho_height,
+            ..CameraData::default()
+        },
         projection_name: "orthographic",
         matrix,
-        ortho_height: Some(ortho_height),
-        lens_mm: None,
-        sensor_width_mm: None,
     })
 }
 
-fn stored_camera(doc: &SceneDoc, snapshot: &Snapshot, camera_id: &str) -> Result<PreparedCamera> {
+fn stored_camera(
+    doc: &SceneDoc,
+    snapshot: &Snapshot,
+    camera_id: &str,
+    engine: CameraEngine,
+) -> Result<PreparedCamera> {
     let id = Id::new(camera_id.to_owned())?;
     let node = doc.nodes.get(&id).ok_or_else(|| {
         PotError::with_details(
@@ -448,24 +587,12 @@ fn stored_camera(doc: &SceneDoc, snapshot: &Snapshot, camera_id: &str) -> Result
         ));
     }
     let target = position + forward;
-    let projection = match camera_data.projection {
-        CameraProjection::Orthographic => Projection::Orthographic {
-            height: camera_data.ortho_scale,
-        },
-        CameraProjection::Perspective => Projection::Perspective {
-            lens_mm: camera_data.lens_mm,
-            sensor_width_mm: camera_data.sensor_width_mm,
-        },
-        CameraProjection::Panorama => Projection::Panorama {
-            fisheye: camera_data.panorama_type == "fisheye_equidistant",
-        },
-        CameraProjection::Fisheye => Projection::Panorama { fisheye: true },
-    };
-    let projection_name = match camera_data.projection {
-        CameraProjection::Orthographic => "orthographic",
-        CameraProjection::Perspective => "perspective",
-        CameraProjection::Panorama => "panorama",
-        CameraProjection::Fisheye => "fisheye",
+    let projection = projection_for_camera(camera_data, engine)?;
+    // The manifest names the projection the render used, so a rasterized panorama camera is "perspective".
+    let projection_name = match projection {
+        Projection::Orthographic { .. } => "orthographic",
+        Projection::Perspective { .. } => "perspective",
+        _ => "panorama",
     };
     let depth_of_field = camera_data.dof_enabled.then_some(DepthOfField {
         focus_distance: camera_data.focus_distance,
@@ -491,14 +618,9 @@ fn stored_camera(doc: &SceneDoc, snapshot: &Snapshot, camera_id: &str) -> Result
     };
     Ok(PreparedCamera {
         camera,
+        data: camera_data.clone(),
         projection_name,
         matrix: evaluated.world_matrix,
-        ortho_height: (camera_data.projection == CameraProjection::Orthographic)
-            .then_some(camera_data.ortho_scale),
-        lens_mm: (camera_data.projection == CameraProjection::Perspective)
-            .then_some(camera_data.lens_mm),
-        sensor_width_mm: (camera_data.projection == CameraProjection::Perspective)
-            .then_some(camera_data.sensor_width_mm),
     })
 }
 
@@ -515,10 +637,33 @@ fn camera_matrix(position: DVec3, target: DVec3, up_hint: DVec3) -> [f64; 16] {
     .to_cols_array()
 }
 
+fn adaptive_camera_override(camera: &PreparedCamera) -> AdaptiveCameraOverride {
+    AdaptiveCameraOverride {
+        data: camera.data.clone(),
+        world_to_camera: DMat4::from_cols_array(&camera.matrix)
+            .inverse()
+            .to_cols_array(),
+    }
+}
+
 fn background_color(doc: &SceneDoc, snapshot: &Snapshot, mode: Mode, transparent: bool) -> [u8; 4] {
     let alpha = if transparent { 0 } else { 255 };
     if matches!(mode, Mode::Solid) {
-        return [242, 242, 242, alpha];
+        // Workbench's render background is the scene world's horizon colour (`World.color`, not
+        // scaled by strength), and black with no world (`workbench_state.cc`, `background_color`).
+        let world = doc
+            .scenes
+            .get(&snapshot.scene_id)
+            .and_then(|value| value.world.as_ref())
+            .and_then(|id| doc.worlds.get(id));
+        return world.map_or([0, 0, 0, alpha], |value| {
+            [
+                linear_to_byte(value.color[0]),
+                linear_to_byte(value.color[1]),
+                linear_to_byte(value.color[2]),
+                alpha,
+            ]
+        });
     }
     let scene = doc.scenes.get(&snapshot.scene_id);
     let world = scene
@@ -570,6 +715,7 @@ fn manifest_value(
     mode: Mode,
     size: u32,
     background: [u8; 4],
+    adaptive_render: Option<&AdaptiveRenderRequest>,
     raster: &RasterOutput,
 ) -> Result<(Value, RenderFiles)> {
     let scene = doc
@@ -592,15 +738,8 @@ fn manifest_value(
         "near": prepared.camera.near,
         "far": prepared.camera.far,
         "matrix": prepared.matrix,
-        "ortho_height": prepared.ortho_height,
-        "lens_mm": prepared.lens_mm,
-        "sensor_width_mm": prepared.sensor_width_mm,
+        "projection_params": prepared.camera.projection,
         "shift": prepared.camera.shift,
-        "panorama_type": match prepared.camera.projection {
-            Projection::Panorama { fisheye: true } => "fisheye_equidistant",
-            Projection::Panorama { fisheye: false } => "equirectangular",
-            _ => Value::Null.as_str().unwrap_or(""),
-        },
         "depth_of_field": prepared.camera.depth_of_field.map(|dof| json!({
             "focus_distance": dof.focus_distance,
             "aperture_radius": dof.aperture_radius,
@@ -635,7 +774,12 @@ fn manifest_value(
         "ambient": if ambient { json!({ "color": [0.08, 0.08, 0.08], "source": "default_no_lights_or_world" }) } else { Value::Null },
         "engine": "cpu",
         "device": "cpu",
-        "view_transform": "sRGB standard",
+        // Beauty and Solid are display-encoded through the scene's view transform; data passes are not.
+        "view_transform": if matches!(mode, Mode::Beauty | Mode::Solid) {
+            json!(scene.color_management.view_transform)
+        } else {
+            json!("sRGB standard")
+        },
         "ocio": Value::Null,
     });
     let pick_policy = json!({
@@ -669,6 +813,7 @@ fn manifest_value(
         "camera": camera,
         "units": units,
         "settings": settings,
+        "adaptive_render": adaptive_render,
         "pick_policy": pick_policy,
         "objects": geometry.objects,
         "elements": geometry.elements,
@@ -697,6 +842,7 @@ fn manifest_value(
         "camera": camera,
         "units": units,
         "settings": settings,
+        "adaptive_render": adaptive_render,
         "pick_policy": pick_policy,
         "image": {
             "path": format!("{view}.png"),
