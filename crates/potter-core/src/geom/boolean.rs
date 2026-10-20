@@ -11,6 +11,7 @@
 //! operand leaves the mesh unchanged, and `material_remaps` gives the INDEX and TRANSFER slot maps.
 //! FLOAT always remaps by INDEX, from the effective (OBJECT-resolved) slots.
 
+mod blender_map;
 mod cdt;
 mod classify;
 mod dissolve;
