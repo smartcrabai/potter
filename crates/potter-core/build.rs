@@ -162,7 +162,6 @@ fn build_native(manifest_dir: &Path) -> io::Result<()> {
     eigen
         .cpp(true)
         .std("c++14")
-        .file(manifest_dir.join("native/blender_inverse_m4.cc"))
         .file(manifest_dir.join("native/meshdeform_harmonic_solve.cc"))
         .include(&eigen_dir);
     eigen.opt_level(2);
@@ -188,8 +187,7 @@ fn build_native(manifest_dir: &Path) -> io::Result<()> {
             .flag("-fno-strict-aliasing")
             .flag("-ffp-contract=off");
     }
-    eigen.compile("potter_blender_inverse");
-    println!("cargo:rerun-if-changed=native/blender_inverse_m4.cc");
+    eigen.compile("potter_eigen_native");
     println!("cargo:rerun-if-changed=native/meshdeform_harmonic_solve.cc");
     println!("cargo:rerun-if-changed=vendor/eigen/Eigen/SparseLU");
     println!("cargo:rerun-if-changed=vendor/eigen/Eigen/LU");
