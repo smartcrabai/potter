@@ -14656,7 +14656,8 @@ mod tests {
             &json!([
                 {"op":"image.create","id":"paint","width":1,"height":1,"colorspace":"srgb","fill_color":[0.25,0.5,0.75,1.0]},
                 {"op":"material.create","id":"paint_mat","base_color_texture":{"image":"paint"}},
-                {"op":"node.create","id":"quad","kind":"plane","params":{"size":2.0},"material":"paint_mat"}
+                {"op":"node.create","id":"quad","kind":"plane","params":{"size":2.0},"material":"paint_mat"},
+                {"op":"uv.layer_delete","target":{"id":"quad"},"name":"UVMap"}
             ]),
         )?;
         let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
@@ -15874,6 +15875,7 @@ mod tests {
                 {"op":"material.create","id":"shared","base_color_texture":{"image":"paint"}},
                 {"op":"collection.create","id":"source"},
                 {"op":"node.create","id":"a_member","kind":"plane","collection":"source","params":{"size":2.0}},
+                {"op":"uv.layer_delete","target":{"id":"a_member"},"name":"UVMap"},
                 {"op":"node.update","target":{"id":"a_member"},"set":{"materials":["shared"]}},
                 {"op":"node.create","id":"b_member","kind":"plane","collection":"source","params":{"size":2.0}},
                 {"op":"node.update","target":{"id":"b_member"},"set":{"materials":["shared"]}},
