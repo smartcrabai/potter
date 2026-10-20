@@ -1585,7 +1585,6 @@ def _same_rotation(first, second):
     return first == second or first == [-value for value in second]
 
 
-
 def _attribute_item_value(item, data_type):
     if data_type in MESH_COLOR_TYPES:
         return plain(item.color)
