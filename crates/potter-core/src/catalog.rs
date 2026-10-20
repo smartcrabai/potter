@@ -76,13 +76,6 @@ pub fn feature_catalog() -> Value {
             [true, false, true, true, false, false, true],
         ),
         unsupported(
-            "shader.principled.sheen",
-            "Principled sheen layer",
-            "ShaderNodeBsdfPrincipled",
-            &["material.create", "material.update"],
-            "Potter's lobe model does not evaluate the Sheen layer; a render with Sheen Weight above zero reports UNSUPPORTED_FEATURE and omits its Cycles contribution.",
-        ),
-        unsupported(
             "shader.principled.subsurface",
             "Principled subsurface scattering",
             "ShaderNodeBsdfPrincipled",
