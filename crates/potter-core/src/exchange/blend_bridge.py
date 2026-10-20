@@ -5092,6 +5092,8 @@ def _canonical_pose(doc, node, source_pose):
         source = by_bone.get(bone) or {}
         merged = dict(source)
         merged["bone"] = bone
+        # The imported Blender rotation, kept beside the model rotation so _restore_pose can compare exactly.
+        merged["source_rotation_quaternion"] = source.get("rotation_quaternion")
         merged.update({key: model_item[key] for key in
                        ("location", "rotation_quaternion", "scale", "lock_ik",
                         "use_ik_limit", "ik_min", "ik_max", "ik_stiffness",
@@ -5247,22 +5249,6 @@ def _set_object_solver_inverse(owner, constraint, owner_type, pose_bone=None,
             scene.frame_set(previous_frame, subframe=previous_subframe)
 
 
-def _pose_source_quaternion(item, mode):
-    """Blender quaternion of the source Euler or axis-angle values stored on a pose item, or None.
-
-    Only the field matching the source rotation mode is read, as the object path does.
-    """
-    if mode == "AXIS_ANGLE":
-        values = item.get("rotation_axis_angle")
-        if isinstance(values, (list, tuple)) and len(values) == 4:
-            return Quaternion(values[1:4], values[0])
-    elif mode != "QUATERNION":
-        values = item.get("rotation_euler")
-        if isinstance(values, (list, tuple)) and len(values) == 3:
-            return Euler(values, mode).to_quaternion()
-    return None
-
-
 def _restore_pose(obj, pose, id_lookup, doc, target):
     for item in pose or []:
         bone = obj.pose.bones.get(item.get("bone"))
@@ -5272,22 +5258,25 @@ def _restore_pose(obj, pose, id_lookup, doc, target):
         bone.rotation_mode = item.get("rotation_mode", "QUATERNION")
         rotation = item.get("rotation_quaternion", (1.0, 0.0, 0.0, 0.0))
         quaternion = Quaternion(rotation)
-        # Reuse stored Euler/axis-angle values when the rotation is unchanged, mirroring the object path.
-        source_quaternion = _pose_source_quaternion(item, bone.rotation_mode)
+        # The imported rotation (source_rotation_quaternion, set by _canonical_pose) is compared exactly; the
+        # stored Euler or axis-angle values are written back only while the rotation is still identical to it.
+        stored_rotation = item.get("source_rotation_quaternion")
         source_rotation_unchanged = (
-            source_quaternion is not None
-            and abs(abs(source_quaternion.dot(quaternion)) - 1.0) <= 1.0e-14
+            isinstance(stored_rotation, (list, tuple)) and len(stored_rotation) == 4
+            and [float(value) for value in stored_rotation] == [float(value) for value in rotation]
         )
+        axis_angle = item.get("rotation_axis_angle")
+        euler = item.get("rotation_euler")
         if bone.rotation_mode == "QUATERNION":
             bone.rotation_quaternion = rotation
         elif bone.rotation_mode == "AXIS_ANGLE":
-            if source_rotation_unchanged:
-                bone.rotation_axis_angle = item["rotation_axis_angle"]
+            if source_rotation_unchanged and isinstance(axis_angle, (list, tuple)) and len(axis_angle) == 4:
+                bone.rotation_axis_angle = axis_angle
             else:
                 axis, angle = quaternion.to_axis_angle()
                 bone.rotation_axis_angle = (angle, axis.x, axis.y, axis.z)
-        elif source_rotation_unchanged:
-            bone.rotation_euler = item["rotation_euler"]
+        elif source_rotation_unchanged and isinstance(euler, (list, tuple)) and len(euler) == 3:
+            bone.rotation_euler = euler
         else:
             bone.rotation_euler = quaternion.to_euler(bone.rotation_mode)
         bone.location = item.get("location", (0.0, 0.0, 0.0))
@@ -7380,51 +7369,27 @@ def export_doc(doc, target, pack, scene_hash, context):
             x, y, z, w = transform["rotation"]
             quaternion = Quaternion((w, x, y, z))
             source_rotation_mode = source_object.get("rotation_mode", "XYZ").upper()
-            source_rotation_values = source_object.get("rotation_quaternion")
             source_euler_values = source_object.get("rotation_euler")
             source_axis_angle = source_object.get("rotation_axis_angle")
-            if source_rotation_mode == "QUATERNION":
-                source_quaternion = (
-                    Quaternion(_quaternion_from_native(source_rotation_values))
-                    if isinstance(source_rotation_values, (list, tuple))
-                    and len(source_rotation_values) == 4
-                    else None
-                )
-            elif source_rotation_mode == "AXIS_ANGLE":
-                source_quaternion = (
-                    Quaternion(
-                        source_axis_angle[1:4], source_axis_angle[0])
-                    if isinstance(source_axis_angle, (list, tuple))
-                    and len(source_axis_angle) == 4
-                    else None
-                )
-            else:
-                source_quaternion = (
-                    Euler(source_euler_values, source_rotation_mode).to_quaternion()
-                    if isinstance(source_euler_values, (list, tuple))
-                    and len(source_euler_values) == 3
-                    else None
-                )
+            # The imported Potter rotation, stored at import. Source Euler and axis-angle values are reused only
+            # while the current rotation is bit-identical to it and the modes match; no tolerance.
+            stored_rotation = (item.get("properties", {}).get("blender_object_metadata") or {}).get(
+                "source_rotation")
             source_rotation_unchanged = (
-                source_quaternion is not None
+                isinstance(stored_rotation, (list, tuple)) and len(stored_rotation) == 4
+                and [float(value) for value in stored_rotation]
+                == [float(value) for value in transform["rotation"]]
                 and source_rotation_mode == obj.rotation_mode
-                and abs(abs(source_quaternion.dot(quaternion)) - 1.0) <= 1.0e-14
             )
+            axis_angle_source = isinstance(source_axis_angle, (list, tuple)) and len(source_axis_angle) == 4
+            euler_source = isinstance(source_euler_values, (list, tuple)) and len(source_euler_values) == 3
             if source_rotation_unchanged and obj.rotation_mode == "QUATERNION":
-                obj.rotation_quaternion = source_quaternion
-            elif source_rotation_unchanged and obj.rotation_mode == "AXIS_ANGLE":
-                source_axis_angle = source_object.get("rotation_axis_angle")
-                if isinstance(source_axis_angle, (list, tuple)) and len(source_axis_angle) == 4:
-                    obj.rotation_axis_angle = source_axis_angle
-                else:
-                    axis, angle = quaternion.to_axis_angle()
-                    obj.rotation_axis_angle = (angle, axis.x, axis.y, axis.z)
-            elif source_rotation_unchanged:
-                source_euler = source_object.get("rotation_euler")
-                if isinstance(source_euler, (list, tuple)) and len(source_euler) == 3:
-                    obj.rotation_euler = source_euler
-                else:
-                    obj.rotation_euler = quaternion.to_euler(obj.rotation_mode)
+                obj.rotation_quaternion = _quaternion_from_native(stored_rotation)
+            elif source_rotation_unchanged and obj.rotation_mode == "AXIS_ANGLE" and axis_angle_source:
+                obj.rotation_axis_angle = source_axis_angle
+            elif source_rotation_unchanged and obj.rotation_mode not in ("QUATERNION", "AXIS_ANGLE") \
+                    and euler_source:
+                obj.rotation_euler = source_euler_values
             elif obj.rotation_mode == "QUATERNION":
                 obj.rotation_quaternion = quaternion
             elif obj.rotation_mode == "AXIS_ANGLE":
