@@ -519,7 +519,7 @@ fn build_mesh_body(
             "sphere collision mesh must have positive radius",
         ));
     }
-    let triangulated = mesh.triangulate().map_err(|error| {
+    let triangulated = mesh.tessellate().map_err(|error| {
         PotError::with_details(
             ErrorCode::SceneInvalid,
             format!("could not triangulate collision mesh for `{id}`"),

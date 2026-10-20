@@ -138,6 +138,36 @@ impl CornerNormalCode {
     }
 }
 
+/// Blender's `DefaultMixer<short2>` over raw fan codes (`BKE_attribute_math`'s
+/// `SimpleMixerWithAccumulationType<short2, float2>` with `short2_to_float2` and `float2_to_short2`).
+/// Each sample's pair is weighted in `f32` and summed; the sum is scaled by the reciprocal of the
+/// total weight and rounded per component to `i16`. Automatic and explicit-zero codes hold the raw
+/// `(0, 0)` pair, and a total weight that is not positive gives the default value, `Auto`.
+pub(crate) fn mix_codes(
+    samples: impl IntoIterator<Item = (CornerNormalCode, f32)>,
+) -> CornerNormalCode {
+    let mut sum = [0.0_f32; 2];
+    let mut total = 0.0_f32;
+    for (code, weight) in samples {
+        let pair = match code {
+            CornerNormalCode::Authored(pair) => pair,
+            CornerNormalCode::Auto | CornerNormalCode::ExplicitZero => [0, 0],
+        };
+        sum[0] += f32::from(pair[0]) * weight;
+        sum[1] += f32::from(pair[1]) * weight;
+        total += weight;
+    }
+    if total <= 0.0 || total.is_nan() {
+        return CornerNormalCode::Auto;
+    }
+    let weight_inv = 1.0_f32 / total;
+    // `as i16` saturates at the i16 bounds, which is the clamp.
+    CornerNormalCode::from_pair([
+        (sum[0] * weight_inv).round() as i16,
+        (sum[1] * weight_inv).round() as i16,
+    ])
+}
+
 /// Which Blender custom-normal setter boundary supplied a vector buffer.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum SetterInput {
@@ -896,6 +926,15 @@ pub(crate) fn evaluate_codes(
     evaluate_code_buffer(mesh, codes, positions, options.corner_order)
 }
 
+/// Converts a vector in one already-computed fan space to its canonical stored code.
+pub(crate) fn encode_vector_in_space(space: &Space, vector: DVec3) -> CornerNormalCode {
+    if vector == DVec3::ZERO {
+        return CornerNormalCode::ExplicitZero;
+    }
+    let [first, second] = space.encode(vector.as_vec3());
+    CornerNormalCode::from_pair([short(first), short(second)])
+}
+
 /// Authored/Auto view of the canonical code state; automatic entries remain `None`.
 pub(crate) fn corner_custom_normals(
     mesh: &Mesh,
@@ -1361,6 +1400,11 @@ pub(crate) fn transfer_custom_normals(
 #[cfg(test)]
 mod tests {
     #![expect(clippy::expect_used, reason = "small mesh fixtures")]
+    #![expect(
+        clippy::unreadable_literal,
+        clippy::excessive_precision,
+        reason = "Blender 5.2.2 EXACT oracle values kept verbatim"
+    )]
 
     use glam::{DVec3, Vec3};
     use serde_json::{Map, Value, json};
@@ -1377,6 +1421,172 @@ mod tests {
 
     /// Authored vectors round-trip through 16-bit codes, so they match to this measured precision.
     const CODEC_TOLERANCE: f64 = 1.0e-3;
+
+    type WeightedCode = ([i16; 2], f32);
+
+    /// Blender 5.2.2 EXACT oracle: probe `exact_clnor4` (subject cube, cutter translated by
+    /// (0.5, 0.5, 0.5), subject and cutter authored normals). Each row is one output corner: the raw
+    /// input codes of the source face's corners with Blender's weights (vertex one-hot, edge linear,
+    /// mean-value interior), then the stored output code. Probes `exact_rot90` (cutter rotated 90
+    /// degrees) and `exact_scale2` (cutter scaled 2x along x) also match with raw, untransformed codes.
+    const BLENDER_EXACT_CORNERS: &[(&[WeightedCode], [i16; 2])] = &[
+        (&[([27123, -6834], 1.0)], [27123, -6834]),
+        (&[([28649, -15397], 1.0)], [28649, -15397]),
+        (&[([27803, -20142], 1.0)], [27803, -20142]),
+        (&[([23994, -29543], 1.0)], [23994, -29543]),
+        (&[([25677, -27306], 1.0)], [25677, -27306]),
+        (&[([23994, -3224], 1.0)], [23994, -3224]),
+        (&[([27803, -12626], 1.0)], [27803, -12626]),
+        (
+            &[
+                ([27803, -12626], 0.649999976),
+                ([28178, -18621], 0.349999994),
+            ],
+            [27934, -14724],
+        ),
+        (
+            &[
+                ([23994, -3224], 0.427400589),
+                ([27803, -12626], 0.222599402),
+                ([28178, -18621], 0.127400592),
+                ([25677, -27306], 0.222599402),
+            ],
+            [25750, -12639],
+        ),
+        (
+            &[
+                ([28178, -18621], 0.349999994),
+                ([25677, -27306], 0.649999976),
+            ],
+            [26552, -24266],
+        ),
+        (&[([24829, -17370], 1.0)], [24829, -17370]),
+        (&[([22202, -25933], 1.0)], [22202, -25933]),
+        (&[([17546, -3224], 1.0)], [17546, -3224]),
+        (
+            &[
+                ([17546, -3224], 0.649999976),
+                ([23345, -12626], 0.349999994),
+            ],
+            [19576, -6515],
+        ),
+        (
+            &[
+                ([17546, -3224], 0.222599402),
+                ([23345, -12626], 0.127400592),
+                ([24829, -17370], 0.222599402),
+                ([22202, -25933], 0.427400589),
+            ],
+            [21896, -17277],
+        ),
+        (
+            &[
+                ([23345, -12626], 0.349999994),
+                ([24829, -17370], 0.649999976),
+            ],
+            [24310, -15710],
+        ),
+        (&[([15771, -5461], 1.0)], [15771, -5461]),
+        (&[([20441, -14146], 1.0)], [20441, -14146]),
+        (&[([19646, -20142], 1.0)], [19646, -20142]),
+        (&[([13362, -29543], 1.0)], [13362, -29543]),
+        (&[([-26125, -16383], 1.0)], [-26125, -16383]),
+        (&[([-27693, -14146], 1.0)], [-27693, -14146]),
+        (&[([-29245, -15011], 1.0)], [-29245, -15011]),
+        (&[([-28846, -19608], 1.0)], [-28846, -19608]),
+        (
+            &[
+                ([10633, -18621], 0.127400592),
+                ([7088, -16383], 0.222599402),
+                ([13955, -13160], 0.427400589),
+                ([15304, -17756], 0.222599402),
+            ],
+            [12303, -15596],
+        ),
+        (
+            &[
+                ([10633, -18621], 0.349999994),
+                ([7088, -16383], 0.649999976),
+            ],
+            [8329, -17166],
+        ),
+        (&[([7088, -16383], 1.0)], [7088, -16383]),
+        (&[([13955, -13160], 1.0)], [13955, -13160]),
+        (&[([15304, -17756], 1.0)], [15304, -17756]),
+        (
+            &[
+                ([10633, -18621], 0.349999994),
+                ([15304, -17756], 0.649999976),
+            ],
+            [13669, -18059],
+        ),
+        (
+            &[([-31292, -7666], 0.1875), ([-31517, -16852], 0.8125)],
+            [-31475, -15130],
+        ),
+        (&[([-31292, -7666], 1.0)], [-31292, -7666]),
+        (
+            &[([-31292, -7666], 0.1875), ([-29984, 22719], 0.8125)],
+            [-30229, 17022],
+        ),
+        (
+            &[
+                ([-31292, -7666], 0.0476868413),
+                ([-31517, -16852], 0.139813155),
+                ([-30969, -23888], 0.672686815),
+                ([-29984, 22719], 0.139813155),
+            ],
+            [-30923, -15614],
+        ),
+        (
+            &[([15747, -6975], 0.8125), ([10655, 23477], 0.1875)],
+            [14792, -1265],
+        ),
+        (&[([10655, 23477], 1.0)], [10655, 23477]),
+        (
+            &[([15360, -23719], 0.8125), ([10655, 23477], 0.1875)],
+            [14478, -14870],
+        ),
+        (
+            &[
+                ([15747, -6975], 0.139813155),
+                ([18102, -16048], 0.672686815),
+                ([15360, -23719], 0.139813155),
+                ([10655, 23477], 0.0476868413),
+            ],
+            [17034, -13967],
+        ),
+        (
+            &[
+                ([-26128, 17332], 0.139813155),
+                ([-28984, -8685], 0.672686815),
+                ([-30143, -15585], 0.139813155),
+                ([-29590, -23491], 0.0476868413),
+            ],
+            [-28776, -6718],
+        ),
+        (
+            &[([-26128, 17332], 0.8125), ([-29590, -23491], 0.1875)],
+            [-26777, 9678],
+        ),
+        (&[([-29590, -23491], 1.0)], [-29590, -23491]),
+        (
+            &[([-30143, -15585], 0.8125), ([-29590, -23491], 0.1875)],
+            [-30039, -17067],
+        ),
+    ];
+
+    #[test]
+    fn mix_codes_reproduces_every_blender_exact_corner() {
+        for (sources, expected) in BLENDER_EXACT_CORNERS {
+            let mixed = super::mix_codes(
+                sources
+                    .iter()
+                    .map(|&(pair, weight)| (CornerNormalCode::Authored(pair), weight)),
+            );
+            assert_eq!(mixed, CornerNormalCode::Authored(*expected));
+        }
+    }
 
     fn smooth_cube() -> Mesh {
         let mut mesh = Mesh::box_mesh(BoxParams::default()).expect("cube");

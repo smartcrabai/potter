@@ -11,6 +11,9 @@ use crate::{
 
 use super::{ChangeKind, Engine, check_fields, resolve_node_targets};
 
+/// Blender's subdivision/multires level range (`rna_modifier.cc` `levels` hard maximum).
+const MAX_MULTIRES_LEVELS: u64 = 11;
+
 pub(super) fn apply(
     engine: &mut Engine<'_>,
     name: &str,
@@ -36,7 +39,16 @@ fn apply_stroke(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resu
         engine,
         operation,
         &[
-            "op", "target", "scope", "brush", "samples", "falloff", "symmetry", "seed", "delta",
+            "op",
+            "target",
+            "scope",
+            "brush",
+            "deform_type",
+            "samples",
+            "falloff",
+            "symmetry",
+            "delta",
+            "view",
             "dyntopo",
         ],
         &["target", "brush", "samples"],
@@ -68,20 +80,53 @@ fn apply_stroke(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resu
                     "/target",
                 )
             })?;
-        let mut world_mesh = before.clone();
-        for vertex in &mut world_mesh.vertices {
-            vertex.co = world.transform_point3(vertex.co);
+        if dyntopo_edge_length.is_some() && has_multires_detail(engine, &node_id, &before) {
+            return Err(engine.error(
+                ErrorCode::InvalidOperation,
+                "dynamic topology is unavailable on a mesh with Multires detail",
+                "/dyntopo",
+            ));
         }
-        let mesh_changed =
-            sculpt_geom::apply_stroke_with_dyntopo(&mut world_mesh, &stroke, dyntopo_edge_length)?;
-        if mesh_changed {
+        let multires_modifier = engine
+            .doc
+            .nodes
+            .get(&node_id)
+            .and_then(|node| active_multires_modifier(&node.modifiers, dyntopo_edge_length))
+            .map(|(index, modifier)| (index, modifier.clone()));
+        let (sculpted_mesh, mesh_changed) = if let Some((modifier_index, modifier)) =
+            multires_modifier
+        {
+            let deformed_base = multires_deformed_base(engine, &node_id, &before, modifier_index)?;
+            crate::geom::modifiers::sculpt_multires(
+                &before,
+                deformed_base.as_ref().unwrap_or(&before),
+                &modifier,
+                &stroke,
+                world,
+            )?
+        } else {
+            let mut world_mesh = before;
             for vertex in &mut world_mesh.vertices {
-                vertex.co = inverse.transform_point3(vertex.co);
+                vertex.co = world.transform_point3(vertex.co);
             }
+            let mesh_changed = sculpt_geom::apply_stroke_with_dyntopo(
+                &mut world_mesh,
+                &stroke,
+                dyntopo_edge_length,
+            )?;
+            if mesh_changed {
+                for vertex in &mut world_mesh.vertices {
+                    vertex.co = inverse.transform_point3(vertex.co);
+                }
+            }
+            (world_mesh, mesh_changed)
+        };
+
+        if mesh_changed {
             let block = engine.doc.data_blocks.get_mut(&data_id).ok_or_else(|| {
                 PotError::new(ErrorCode::TargetNotFound, "mesh data block disappeared")
             })?;
-            block.mesh = Some(world_mesh);
+            block.mesh = Some(sculpted_mesh);
             block.descriptor = None;
             engine.mark("data_blocks", &data_id, ChangeKind::Updated);
             super::clear_primitive_metadata(engine, &data_id);
@@ -89,6 +134,133 @@ fn apply_stroke(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resu
         }
     }
     Ok(changed)
+}
+
+/// Whether the node carries Multires detail: a Multires modifier or stored `multires_displacement`.
+/// Dynamic topology would change the corner count those rows are keyed to, so it is refused.
+fn has_multires_detail(engine: &Engine<'_>, node_id: &Id, mesh: &Mesh) -> bool {
+    mesh.attributes.contains_key("multires_displacement")
+        || engine.doc.nodes.get(node_id).is_some_and(|node| {
+            node.modifiers
+                .iter()
+                .any(|modifier| modifier.modifier_type == "multires")
+        })
+}
+
+fn active_multires_modifier(
+    modifiers: &[Modifier],
+    dyntopo_edge_length: Option<f64>,
+) -> Option<(usize, &Modifier)> {
+    if dyntopo_edge_length.is_some() {
+        return None;
+    }
+    let (index, modifier) = modifiers.iter().enumerate().find(|(_, modifier)| {
+        modifier.is_active(crate::eval::EvaluationPurpose::Preview)
+            && modifier.modifier_type == "multires"
+    })?;
+    (modifier
+        .params
+        .get("sculpt_levels")
+        .and_then(Value::as_u64)
+        .is_some_and(|levels| levels > 0)
+        && !modifier
+            .params
+            .get("use_sculpt_base_mesh")
+            .and_then(Value::as_bool)
+            .unwrap_or(false))
+    .then_some((index, modifier))
+}
+
+fn same_mesh_topology(left: &Mesh, right: &Mesh) -> bool {
+    left.vertices
+        .iter()
+        .map(|vertex| vertex.id)
+        .eq(right.vertices.iter().map(|vertex| vertex.id))
+        && left
+            .edges
+            .iter()
+            .map(|edge| (edge.id, edge.vertices))
+            .eq(right.edges.iter().map(|edge| (edge.id, edge.vertices)))
+        && left
+            .faces
+            .iter()
+            .map(|face| (face.id, &face.vertices))
+            .eq(right.faces.iter().map(|face| (face.id, &face.vertices)))
+}
+
+fn multires_deformed_base(
+    engine: &Engine<'_>,
+    node_id: &Id,
+    source: &Mesh,
+    multires_index: usize,
+) -> Result<Option<Mesh>> {
+    let node = engine
+        .doc
+        .nodes
+        .get(node_id)
+        .ok_or_else(|| PotError::new(ErrorCode::TargetNotFound, "sculpt node was not found"))?;
+    let preceding = node.modifiers.get(..multires_index).ok_or_else(|| {
+        PotError::new(
+            ErrorCode::InternalError,
+            "multires modifier index is out of range",
+        )
+    })?;
+    let keep = preceding
+        .iter()
+        .enumerate()
+        .find(|(_, modifier)| {
+            modifier.is_active(crate::eval::EvaluationPurpose::Preview)
+                && !super::modifier::only_deform(&modifier.modifier_type)
+        })
+        .map_or(preceding.len(), |(index, _)| index);
+    if !preceding[..keep]
+        .iter()
+        .any(|modifier| modifier.is_active(crate::eval::EvaluationPurpose::Preview))
+    {
+        return Ok(None);
+    }
+
+    let frame = engine.evaluation_frame;
+    let driver_values = crate::eval::rig::evaluate_drivers(engine.doc, frame)?;
+    let node_ids = BTreeSet::from([node_id.clone()]);
+    let mut snapshot = crate::eval::Snapshot::evaluate_nodes_with_modifier_prefix_with_cache(
+        engine.doc,
+        &crate::eval::EvaluationContext {
+            frame: Some(frame),
+            purpose: crate::eval::EvaluationPurpose::Preview,
+            ..crate::eval::EvaluationContext::default()
+        },
+        engine.asset_root,
+        engine.cache_directory,
+        &node_ids,
+        node_id,
+        keep,
+        &driver_values,
+    )?;
+    let deformed = snapshot.meshes.remove(node_id).ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::EvaluationFailed,
+            "bounded modifier prefix snapshot omitted the sculpt target mesh",
+            json!({"node_id":node_id}),
+        )
+    })?;
+    if !same_mesh_topology(source, &deformed) {
+        return Err(PotError::new(
+            ErrorCode::EvaluationFailed,
+            "OnlyDeform modifier changed multires base topology",
+        ));
+    }
+    Ok(Some(deformed))
+}
+
+/// Whether `mesh` stores per-face-corner data (a UV layer, or a corner-domain attribute such as a
+/// corner colour), which dynamic topology cannot keep.
+fn has_face_corner_data(mesh: &Mesh) -> bool {
+    !crate::geom::uv_layers::read(mesh).layers.is_empty()
+        || mesh.attributes.iter().any(|(name, attribute)| {
+            name != crate::geom::uv_layers::ATTRIBUTE
+                && attribute.get("domain").and_then(Value::as_str) == Some("corner")
+        })
 }
 
 fn apply_dyntopo(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bool> {
@@ -102,7 +274,6 @@ fn apply_dyntopo(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Res
             "samples",
             "falloff",
             "symmetry",
-            "seed",
             "edge_length",
         ],
         &["target", "samples", "edge_length"],
@@ -154,6 +325,27 @@ fn apply_dyntopo(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Res
                     "/target",
                 )
             })?;
+        if has_multires_detail(engine, &node_id, &before) {
+            return Err(engine.error(
+                ErrorCode::InvalidOperation,
+                "dynamic topology is unavailable on a mesh with Multires detail",
+                "/dyntopo",
+            ));
+        }
+        if has_face_corner_data(&before) {
+            // Blender's dynamic topology warns this at enable time (`check_attribute_warning`,
+            // `sculpt_dyntopo.cc`): its rebuilt faces take default loop data.
+            engine.warnings.push(PotError::with_details(
+                ErrorCode::UnrepresentableFeature,
+                "Dyntopo will not preserve face sets, colors, UVs, or other attributes",
+                json!({
+                    "feature_id": "sculpt.dyntopo.face_data_lost",
+                    "operation_index": engine.operation_index,
+                    "pointer": "/dyntopo",
+                    "data_id": data_id.as_str(),
+                }),
+            ));
+        }
         let mut world_mesh = before;
         for vertex in &mut world_mesh.vertices {
             vertex.co = world.transform_point3(vertex.co);
@@ -377,11 +569,11 @@ fn apply_multires(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Re
     let levels = operation
         .get("levels")
         .and_then(Value::as_u64)
-        .filter(|value| (1..=5).contains(value))
+        .filter(|value| (1..=MAX_MULTIRES_LEVELS).contains(value))
         .ok_or_else(|| {
             engine.error(
                 ErrorCode::InvalidOperation,
-                "levels must be between 1 and 5",
+                "levels must be between 1 and 11",
                 "/levels",
             )
         })?;
@@ -395,10 +587,10 @@ fn apply_multires(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Re
             )
         })?,
     };
-    if render_levels > 5 {
+    if render_levels > MAX_MULTIRES_LEVELS {
         return Err(engine.error(
             ErrorCode::InvalidOperation,
-            "render_levels must not exceed 5",
+            "render_levels must not exceed 11",
             "/render_levels",
         ));
     }
@@ -415,6 +607,41 @@ fn apply_multires(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Re
                 "/id",
             ));
         }
+        let data_id = engine
+            .doc
+            .nodes
+            .get(&node_id)
+            .and_then(|node| node.data.clone());
+        let mut total_levels = levels;
+        let mut data_changed = false;
+        if let Some(data_id) = &data_id
+            && let Some(data) = engine.doc.data_blocks.get_mut(data_id)
+            && let Some(mesh) = data.mesh.as_mut()
+        {
+            if let Some(record) = mesh.attributes.get("multires_displacement") {
+                total_levels = record
+                    .get("total_levels")
+                    .and_then(Value::as_u64)
+                    .filter(|value| (1..=13).contains(value))
+                    .ok_or_else(|| {
+                        PotError::new(
+                            ErrorCode::InvalidOperation,
+                            "existing multires_displacement has an invalid total_levels",
+                        )
+                    })?;
+            } else {
+                mesh.attributes.insert(
+                    "multires_displacement".to_owned(),
+                    json!({"total_levels": levels}),
+                );
+                data_changed = true;
+            }
+        }
+        if data_changed && let Some(data_id) = &data_id {
+            engine.mark("data_blocks", data_id, ChangeKind::Updated);
+        }
+        let levels = levels.min(total_levels);
+        let render_levels = render_levels.min(total_levels);
         let node = engine
             .doc
             .nodes
@@ -432,7 +659,9 @@ fn apply_multires(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Re
                 show_render: true,
                 params: Map::from_iter([
                     ("levels".to_owned(), json!(levels)),
+                    ("sculpt_levels".to_owned(), json!(levels)),
                     ("render_levels".to_owned(), json!(render_levels)),
+                    ("total_levels".to_owned(), json!(total_levels)),
                 ]),
                 binding_data: None,
                 baked_ocean_cache: None,
@@ -449,27 +678,40 @@ pub(super) fn parse_stroke(
     engine: &Engine<'_>,
     operation: &Map<String, Value>,
 ) -> Result<sculpt_geom::Stroke> {
-    let brush = match string_field(engine, operation, "brush")?.as_str() {
-        "draw" => sculpt_geom::Brush::Draw,
-        "clay_strips" => sculpt_geom::Brush::ClayStrips,
-        "inflate" => sculpt_geom::Brush::Inflate,
-        "grab" => sculpt_geom::Brush::Grab,
-        "smooth" => sculpt_geom::Brush::Smooth,
-        "flatten" => sculpt_geom::Brush::Flatten,
-        "pinch" => sculpt_geom::Brush::Pinch,
-        "crease" => sculpt_geom::Brush::Crease,
-        "layer" => sculpt_geom::Brush::Layer,
-        "snake_hook" => sculpt_geom::Brush::SnakeHook,
-        "thumb" => sculpt_geom::Brush::Thumb,
-        "rotate" => sculpt_geom::Brush::Rotate,
-        "nudge" => sculpt_geom::Brush::Nudge,
-        "blob" => sculpt_geom::Brush::Blob,
-        "scrape" => sculpt_geom::Brush::Scrape,
-        "fill" => sculpt_geom::Brush::Fill,
-        "draw_sharp" => sculpt_geom::Brush::DrawSharp,
-        "elastic_deform" => sculpt_geom::Brush::Elastic,
-        "pose_lite" => sculpt_geom::Brush::PoseLite,
-        "boundary_lite" => sculpt_geom::Brush::BoundaryLite,
+    let name = string_field(engine, operation, "brush")?;
+    let deform_type = deform_type_field(engine, operation)?;
+    let brush = match name.as_str() {
+        "pose" => {
+            sculpt_geom::DabBrush::Pose(pose_deform(engine, deform_type.unwrap_or("rotate_twist"))?)
+        }
+        "boundary" => {
+            sculpt_geom::DabBrush::Boundary(boundary_deform(engine, deform_type.unwrap_or("bend"))?)
+        }
+        _ if deform_type.is_some() => {
+            return Err(engine.error(
+                ErrorCode::InvalidOperation,
+                "deform_type is supported only by pose and boundary brushes",
+                "/deform_type",
+            ));
+        }
+        "draw" => sculpt_geom::DabBrush::Draw,
+        "clay_strips" => sculpt_geom::DabBrush::ClayStrips,
+        "inflate" => sculpt_geom::DabBrush::Inflate,
+        "grab" => sculpt_geom::DabBrush::Grab,
+        "smooth" => sculpt_geom::DabBrush::Smooth,
+        "flatten" => sculpt_geom::DabBrush::Flatten,
+        "pinch" => sculpt_geom::DabBrush::Pinch,
+        "crease" => sculpt_geom::DabBrush::Crease,
+        "layer" => sculpt_geom::DabBrush::Layer,
+        "snake_hook" => sculpt_geom::DabBrush::SnakeHook,
+        "thumb" => sculpt_geom::DabBrush::Thumb,
+        "rotate" => sculpt_geom::DabBrush::Rotate,
+        "nudge" => sculpt_geom::DabBrush::Nudge,
+        "blob" => sculpt_geom::DabBrush::Blob,
+        "scrape" => sculpt_geom::DabBrush::Scrape,
+        "fill" => sculpt_geom::DabBrush::Fill,
+        "draw_sharp" => sculpt_geom::DabBrush::DrawSharp,
+        "elastic_deform" => sculpt_geom::DabBrush::Elastic,
         other => {
             return Err(engine.error(
                 ErrorCode::InvalidOperation,
@@ -478,6 +720,25 @@ pub(super) fn parse_stroke(
             ));
         }
     };
+    // Blender's Elastic Grab, pose, and boundary brushes apply no falloff curve: the Kelvinlet fade
+    // or the constant factor is their only spatial term.
+    let falloff_refusal = match brush {
+        sculpt_geom::DabBrush::Elastic => {
+            Some("elastic_deform has no falloff; Blender's Elastic Grab uses its Kelvinlet fade")
+        }
+        sculpt_geom::DabBrush::Pose(_) => {
+            Some("pose has no falloff; Blender's pose brush uses no falloff curve")
+        }
+        sculpt_geom::DabBrush::Boundary(_) => Some(
+            "boundary has no falloff; Potter uses the constant falloff curve of Blender's essentials boundary asset, and the curve is not configurable here",
+        ),
+        _ => None,
+    };
+    if let Some(message) = falloff_refusal
+        && operation.contains_key("falloff")
+    {
+        return Err(engine.error(ErrorCode::InvalidOperation, message, "/falloff"));
+    }
     if operation
         .get("falloff")
         .is_some_and(|value| !value.is_string())
@@ -488,12 +749,22 @@ pub(super) fn parse_stroke(
             "/falloff",
         ));
     }
+    // Blender 5.2.2's essentials presets: Clay Strips uses SMOOTHER, Draw Sharp uses POW4, and the
+    // other dab brushes use SMOOTH. Potter's stroke carries no brush curve, so the default follows
+    // the brush.
+    let default_falloff = match brush {
+        sculpt_geom::DabBrush::ClayStrips => "smoother",
+        sculpt_geom::DabBrush::DrawSharp => "pow4",
+        _ => "smooth",
+    };
     let falloff = match operation
         .get("falloff")
         .and_then(Value::as_str)
-        .unwrap_or("smooth")
+        .unwrap_or(default_falloff)
     {
         "smooth" => sculpt_geom::Falloff::Smooth,
+        "smoother" => sculpt_geom::Falloff::Smoother,
+        "pow4" => sculpt_geom::Falloff::Pow4,
         "sphere" => sculpt_geom::Falloff::Sphere,
         "root" => sculpt_geom::Falloff::Root,
         "sharp" => sculpt_geom::Falloff::Sharp,
@@ -593,22 +864,79 @@ pub(super) fn parse_stroke(
         .get("delta")
         .map(|value| vector3(engine, Some(value), "/delta"))
         .transpose()?;
-    let seed = operation.get("seed").map_or(Ok(0), |value| {
-        value.as_u64().ok_or_else(|| {
-            engine.error(
-                ErrorCode::InvalidOperation,
-                "seed must be a nonnegative integer",
-                "/seed",
-            )
-        })
-    })?;
+    let view = operation
+        .get("view")
+        .map(|value| vector3(engine, Some(value), "/view"))
+        .transpose()?;
     Ok(sculpt_geom::Stroke {
         brush,
         samples,
         falloff,
         symmetry,
-        seed,
         delta,
+        view,
+    })
+}
+
+/// Reads the optional `deform_type` of a pose or boundary stroke.
+fn deform_type_field<'a>(
+    engine: &Engine<'_>,
+    operation: &'a Map<String, Value>,
+) -> Result<Option<&'a str>> {
+    operation
+        .get("deform_type")
+        .map(|value| {
+            value.as_str().ok_or_else(|| {
+                engine.error(
+                    ErrorCode::InvalidOperation,
+                    "deform_type must be a string",
+                    "/deform_type",
+                )
+            })
+        })
+        .transpose()
+}
+
+/// Blender's `pose_deform_type` names; `rotate_twist` is the default. Blender's pose twist turns by
+/// the screen-space mouse delta, which a Potter stroke does not carry, so it is refused.
+fn pose_deform(engine: &Engine<'_>, name: &str) -> Result<sculpt_geom::PoseDeform> {
+    Ok(match name {
+        "rotate_twist" => sculpt_geom::PoseDeform::RotateTwist,
+        "scale_translate" => sculpt_geom::PoseDeform::ScaleTranslate,
+        "squash_stretch" => sculpt_geom::PoseDeform::SquashStretch,
+        "twist" => {
+            return Err(engine.error(
+                ErrorCode::InvalidOperation,
+                "pose deform_type `twist` is refused: Blender's pose twist turns by the screen-space mouse delta in pixels (`calc_twist_deform`: roll = (initial_mouse.x - mouse.x) * bstrength * 0.02), and Potter strokes carry no screen-pixel samples, so the twist branch cannot be reproduced",
+                "/deform_type",
+            ));
+        }
+        other => {
+            return Err(engine.error(
+                ErrorCode::InvalidOperation,
+                format!("unknown pose deform_type `{other}`"),
+                "/deform_type",
+            ));
+        }
+    })
+}
+
+/// Blender's `boundary_deform_type` names; `bend` is the default.
+fn boundary_deform(engine: &Engine<'_>, name: &str) -> Result<sculpt_geom::BoundaryDeform> {
+    Ok(match name {
+        "bend" => sculpt_geom::BoundaryDeform::Bend,
+        "expand" => sculpt_geom::BoundaryDeform::Expand,
+        "inflate" => sculpt_geom::BoundaryDeform::Inflate,
+        "grab" => sculpt_geom::BoundaryDeform::Grab,
+        "twist" => sculpt_geom::BoundaryDeform::Twist,
+        "smooth" => sculpt_geom::BoundaryDeform::Smooth,
+        other => {
+            return Err(engine.error(
+                ErrorCode::InvalidOperation,
+                format!("unknown boundary deform_type `{other}`"),
+                "/deform_type",
+            ));
+        }
     })
 }
 
@@ -934,4 +1262,38 @@ fn vector3(engine: &Engine<'_>, value: Option<&Value>, pointer: &str) -> Result<
         )?,
     ];
     Ok(DVec3::new(x, y, z))
+}
+
+#[cfg(test)]
+mod multires_selection_tests {
+    #![expect(clippy::unwrap_used, reason = "tests")]
+    use super::*;
+
+    fn multires_modifier(id: &str, show_viewport: bool) -> Modifier {
+        Modifier {
+            id: Id::new(id).unwrap(),
+            modifier_type: "multires".to_owned(),
+            name: "Multires".to_owned(),
+            enabled: true,
+            show_viewport,
+            show_render: true,
+            params: Map::from_iter([("sculpt_levels".to_owned(), serde_json::json!(1))]),
+            binding_data: None,
+            runtime: crate::model::ModifierRuntime::default(),
+        }
+    }
+
+    #[test]
+    fn multires_sculpt_uses_preview_active_slot() {
+        let modifiers = [
+            multires_modifier("hidden_multires", false),
+            multires_modifier("active_multires", true),
+        ];
+        assert_eq!(
+            active_multires_modifier(&modifiers, None).map(|(index, _)| index),
+            Some(1)
+        );
+        let hidden_only = [multires_modifier("hidden_multires", false)];
+        assert!(active_multires_modifier(&hidden_only, None).is_none());
+    }
 }

@@ -14,13 +14,13 @@ use crate::{
     error::{ErrorCode, PotError, Result},
     eval::{EvaluationPurpose, Snapshot, mesh_vertex_weights},
     geom::{
-        Mesh, MeshError, attribute_keys, clnor,
+        Mesh, attribute_keys, clnor,
         color_layers::{self, ColorDomain, ColorLayer, ColorStore},
         edge_key,
         normals::{close, corner_normals, sharp_edge_flags, smooth_face_flags},
         uv_layers::{self, UvLayer, UvStore},
     },
-    image::{ImageData, ImageInterpolation, load_image_data},
+    image::{ImageData, ImageExtension, ImageInterpolation, load_image_data},
     model::{
         Action, ArmatureData, AvatarSettings, AvatarVersion, Bone, CameraData, CameraProjection,
         DataBlock, Extrapolation, FCurve, Id, Image, ImageAlphaMode, ImageColorspace, ImageSource,
@@ -331,9 +331,9 @@ fn color_layer_storage_key(mesh: &Mesh, key: &str) -> bool {
 }
 
 /// A derived glTF image: its pixels plus the Potter images it was packed from.
-struct PackedImage {
+pub(super) struct PackedImage {
     name: String,
-    pixels: ImageData,
+    pub(super) pixels: ImageData,
     sources: Vec<Id>,
 }
 
@@ -342,7 +342,7 @@ struct PackedImage {
 /// Each source contributes its raw glTF value: sRGB color channels are re-encoded from the loaded
 /// linear values. The output has the largest source's size; smaller or larger sources are sampled
 /// nearest.
-fn pack_channels(
+pub(super) fn pack_channels(
     channels: &[Option<ChannelSource>; 4],
     interpolation: ImageInterpolation,
     doc: &SceneDoc,
@@ -359,6 +359,11 @@ fn pack_channels(
         let image = texture_image_for_export(doc, id)?;
         inputs.push((image, load_image_data(image, root_path, interpolation)?));
     }
+    // One straight-colour conversion per input, shared by every output texel that samples it.
+    let straight_inputs = inputs
+        .iter()
+        .map(|(_, input)| input.straight_pixels())
+        .collect::<Vec<_>>();
     let name = match inputs.first() {
         Some((image, _)) => format!("{}_packed", image.name),
         None => {
@@ -408,8 +413,7 @@ fn pack_channels(
                     let source_image = &inputs[input].1;
                     let sample_x = nearest_index(x, width, source_image.width);
                     let sample_y = nearest_index(y, height, source_image.height);
-                    let raw = source_image
-                        .pixels
+                    let raw = straight_inputs[input]
                         .get(sample_y * source_image.width as usize + sample_x)
                         .ok_or_else(|| {
                             PotError::new(
@@ -430,11 +434,18 @@ fn pack_channels(
     Ok(PackedImage {
         name,
         pixels: ImageData {
+            colour: crate::image::ColourCache::default(),
+            storage: crate::image::ImageStorage {
+                straight_alpha: true,
+                ..crate::image::ImageStorage::default()
+            },
             width,
             height,
             pixels,
             tiles: BTreeMap::new(),
             interpolation,
+            srgb: false,
+            udim: false,
         },
         sources,
     })
@@ -472,7 +483,10 @@ fn encode_png(image: &Image, pixels: &ImageData) -> Result<Vec<u8>> {
     encode_png_with_colorspace(image.colorspace, pixels)
 }
 
-fn encode_png_with_colorspace(colorspace: ImageColorspace, pixels: &ImageData) -> Result<Vec<u8>> {
+pub(super) fn encode_png_with_colorspace(
+    colorspace: ImageColorspace,
+    pixels: &ImageData,
+) -> Result<Vec<u8>> {
     let pixel_count = usize::try_from(pixels.width)
         .ok()
         .and_then(|width| {
@@ -488,7 +502,8 @@ fn encode_png_with_colorspace(colorspace: ImageColorspace, pixels: &ImageData) -
         ));
     }
     let mut raw = Vec::with_capacity(pixel_count.saturating_mul(4));
-    for pixel in &pixels.pixels {
+    let straight = pixels.straight_pixels();
+    for pixel in straight.iter() {
         for (index, component) in pixel.iter().copied().enumerate() {
             if !component.is_finite() {
                 return Err(PotError::new(
@@ -547,7 +562,7 @@ fn texture_image_for_export<'a>(doc: &'a SceneDoc, image_id: &Id) -> Result<&'a 
             json!({ "image": image_id }),
         )
     })?;
-    if !image.tiles.is_empty() {
+    if image.is_udim() {
         return Err(unsupported_export(
             "material.texture_udim",
             "glTF export does not represent Potter UDIM image tiles",
@@ -1323,40 +1338,6 @@ fn export_vertex_layout(
     })
 }
 
-/// Triangles for glTF export, `len - 2` per face in `mesh.faces` order. A face without area has no
-/// ear to clip, so it fans into degenerate triangles, as Blender's glTF exporter writes it.
-fn export_triangles(mesh: &Mesh) -> std::result::Result<Vec<[u32; 3]>, MeshError> {
-    if let Ok(triangles) = mesh.triangulate() {
-        return Ok(triangles);
-    }
-    let mut subset = mesh.clone();
-    let mut degenerate = BTreeSet::<u32>::new();
-    let triangles = loop {
-        match subset.triangulate() {
-            Ok(triangles) => break triangles,
-            Err(MeshError::TriangulationFailed(id))
-                if subset.faces.iter().any(|face| face.id == id) =>
-            {
-                degenerate.insert(id);
-                subset.faces.retain(|face| face.id != id);
-            }
-            Err(error) => return Err(error),
-        }
-    };
-    let mut regular = triangles.into_iter();
-    let mut output = Vec::new();
-    for face in &mesh.faces {
-        if degenerate.contains(&face.id) {
-            for pair in face.vertices[1..].windows(2) {
-                output.push([face.vertices[0], pair[0], pair[1]]);
-            }
-        } else {
-            output.extend(regular.by_ref().take(face.vertices.len().saturating_sub(2)));
-        }
-    }
-    Ok(output)
-}
-
 /// Bytes per element of a packed `extras.potter.polygons` field whose values stay at or below
 /// `limit`. The reader derives the same width from the same limit, so the record needs no type tags.
 fn packed_width(limit: usize) -> usize {
@@ -1595,23 +1576,81 @@ struct MeshExportLayout {
     key_deltas: Vec<Vec<DVec3>>,
 }
 
+fn adaptive_export_normals<'a>(
+    snapshot: &'a Snapshot,
+    node_id: &Id,
+    data_block: Option<&DataBlock>,
+) -> Option<&'a [Option<DVec3>]> {
+    if data_block
+        .and_then(|data| data.shape_keys.as_ref())
+        .is_some_and(|shape_keys| !shape_keys.keys.is_empty())
+    {
+        // VRM's shape-key layout uses the authored base mesh, not this evaluated render surface.
+        None
+    } else {
+        snapshot.adaptive_normals.get(node_id).map(Vec::as_slice)
+    }
+}
+
+fn adaptive_corner_normals(
+    mesh: &Mesh,
+    positions: &[DVec3],
+    adaptive_normals: &[Option<DVec3>],
+) -> Result<Vec<DVec3>> {
+    if adaptive_normals.len() != mesh.vertices.len() {
+        return Err(PotError::new(
+            ErrorCode::InternalError,
+            "adaptive normal count does not match exported mesh vertices",
+        ));
+    }
+    let mut corners = corner_normals(mesh, positions)?;
+    let smooth = smooth_face_flags(mesh)?;
+    if !smooth.iter().any(|smooth| *smooth) {
+        return Ok(corners);
+    }
+    let vertex_indices: BTreeMap<u32, usize> = mesh
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(index, vertex)| (vertex.id, index))
+        .collect();
+    let mut corner = 0;
+    for (face, smooth) in mesh.faces.iter().zip(smooth) {
+        for vertex_id in &face.vertices {
+            if smooth
+                && let Some(normal) = vertex_indices
+                    .get(vertex_id)
+                    .and_then(|index| adaptive_normals.get(*index))
+                    .copied()
+                    .flatten()
+            {
+                corners[corner] = normal;
+            }
+            corner += 1;
+        }
+    }
+    Ok(corners)
+}
+
 fn mesh_export_layout(
     mesh: &Mesh,
     data_block: Option<&DataBlock>,
     geometry_scale: DVec3,
     basis: DMat4,
     carried_color_layers: &[usize],
+    adaptive_normals: Option<&[Option<DVec3>]>,
 ) -> Result<MeshExportLayout> {
     let key_deltas = match data_block {
         Some(block) => shape_key_deltas(mesh, block)?,
         None => Vec::new(),
     };
     let base = shape_key_base_positions(mesh, data_block);
-    let mut layers = vec![output_normals(
-        &corner_normals(mesh, &base)?,
-        geometry_scale,
-        basis,
-    )];
+    let base_normals = if let Some(normals) = adaptive_normals {
+        adaptive_corner_normals(mesh, &base, normals)?
+    } else {
+        corner_normals(mesh, &base)?
+    };
+    let mut layers = vec![output_normals(&base_normals, geometry_scale, basis)];
     for deltas in &key_deltas {
         let morphed = base
             .iter()
@@ -1740,6 +1779,7 @@ fn blender_attribute_exportable(entry: &Value) -> bool {
     let name = entry["name"].as_str().unwrap_or_default();
     BLENDER_BOOKKEEPING_ATTRIBUTES.contains(&name) || is_color_attribute(entry)
 }
+
 fn validate_mesh_export_attributes(mesh: &Mesh, data_block: Option<&DataBlock>) -> Result<()> {
     for (name, value) in &mesh.attributes {
         let supported = match name.as_str() {
@@ -2803,7 +2843,7 @@ pub(crate) fn resolve_material_surfaces(doc: &SceneDoc) -> Result<BTreeMap<Id, R
     resolve_material_surfaces_using(doc, |id| material_is_used(doc, id))
 }
 
-fn resolve_material_surfaces_with_snapshot(
+pub(crate) fn resolve_material_surfaces_with_snapshot(
     doc: &SceneDoc,
     snapshot: &Snapshot,
 ) -> Result<BTreeMap<Id, ResolvedSurface>> {
@@ -4347,7 +4387,14 @@ pub(crate) fn validate_vrm_mesh_references(
             .get(node_id)
             .copied()
             .unwrap_or(DVec3::ONE);
-        let export = mesh_export_layout(mesh, data_block, scale, avatar_basis(version), &[])?;
+        let export = mesh_export_layout(
+            mesh,
+            data_block,
+            scale,
+            avatar_basis(version),
+            &[],
+            adaptive_export_normals(snapshot, node_id, data_block),
+        )?;
         if let (Some(data_id), Some(data_block)) = (node.data.as_ref(), data_block)
             && let Some(binding) = data_skin_bindings.get(data_id)
         {
@@ -4609,6 +4656,8 @@ fn export_with_root_inner(
             geometry_scale,
             geometry_basis,
             &carried_color_layers,
+            vrm.as_ref()
+                .and_then(|_| adaptive_export_normals(snapshot, node_id, data_block)),
         )?;
         let uv_sets = &layout.uvs;
         if let Some(shape_keys) = data_block
@@ -4755,7 +4804,7 @@ fn export_with_root_inner(
             }
         }
         let mirrored = geometry_scale.x * geometry_scale.y * geometry_scale.z < 0.0;
-        let triangles = export_triangles(mesh).map_err(|error| {
+        let triangles = mesh.tessellate().map_err(|error| {
             PotError::with_details(
                 ErrorCode::ExportFailed,
                 "mesh triangulation failed",
@@ -5423,7 +5472,7 @@ fn camera_definitions(doc: &SceneDoc) -> (Vec<Value>, BTreeMap<Id, usize>) {
                     "zfar": camera.clip_end
                 }
             }),
-            CameraProjection::Panorama | CameraProjection::Fisheye => {
+            CameraProjection::Panorama => {
                 let field_of_view = (camera.sensor_width_mm / (2.0 * camera.lens_mm)).atan() * 2.0;
                 json!({
                     "name": data_id,
@@ -5952,6 +6001,7 @@ fn import_images(
                 source_path: None,
                 source_hash: None,
                 alpha_mode: ImageAlphaMode::Straight,
+                tiled: false,
             },
         );
         image_ids.push(id);
@@ -6019,8 +6069,17 @@ fn material_textures(
 ) -> Result<material_graph::GraphTextures> {
     let slot = |info: &Value| -> Result<Option<material_graph::SlotTexture>> {
         let transform = texture_transform(info)?;
-        Ok(import_texture_ref(info, root, image_ids)?
-            .map(|texture| material_graph::SlotTexture { texture, transform }))
+        let wrap = texture_wrap(info, root);
+        Ok(
+            import_texture_ref(info, root, image_ids)?.map(|mut texture| {
+                texture.extension = material_graph::uniform_extension(wrap);
+                material_graph::SlotTexture {
+                    texture,
+                    transform,
+                    wrap,
+                }
+            }),
+        )
     };
     let pbr = &material["pbrMetallicRoughness"];
     Ok(material_graph::GraphTextures {
@@ -6043,6 +6102,49 @@ fn uv_set_layer_name(set: usize) -> String {
     } else {
         format!("UVMap.{set:03}")
     }
+}
+
+/// The wrap of each UV axis (S, T) of a glTF texture reference, as Blender's importer reads its sampler (`texture.py`).
+/// An absent wrap is REPEAT, `CLAMP_TO_EDGE` is EXTEND, and `MIRRORED_REPEAT` is MIRROR.
+fn texture_wrap(info: &Value, root: &Value) -> [ImageExtension; 2] {
+    match info["index"]
+        .as_u64()
+        .and_then(|index| usize::try_from(index).ok())
+    {
+        Some(index) => texture_wrap_at(root, index),
+        None => [ImageExtension::Repeat; 2],
+    }
+}
+
+/// The wrap of each UV axis of glTF texture `texture_index`, read from its sampler.
+pub(crate) fn texture_wrap_at(root: &Value, texture_index: usize) -> [ImageExtension; 2] {
+    let sampler = root["textures"]
+        .get(texture_index)
+        .and_then(|texture| texture["sampler"].as_u64())
+        .and_then(|index| usize::try_from(index).ok())
+        .and_then(|index| root["samplers"].get(index));
+    let Some(sampler) = sampler else {
+        return [ImageExtension::Repeat; 2];
+    };
+    [
+        sampler_wrap_axis(&sampler["wrapS"]),
+        sampler_wrap_axis(&sampler["wrapT"]),
+    ]
+}
+
+/// One axis's wrap. A value that is neither REPEAT nor `MIRRORED_REPEAT` matches none of Blender's importer branches, so
+/// the axis passes through under EXTEND and clamps; `gltf_import_losses` reports the value.
+fn sampler_wrap_axis(value: &Value) -> ImageExtension {
+    match value.as_u64() {
+        Some(33648) => ImageExtension::Mirror,
+        Some(10497) => ImageExtension::Repeat,
+        _ if value.is_null() => ImageExtension::Repeat,
+        // CLAMP_TO_EDGE, and any unknown value Blender's importer clamps.
+        _ => ImageExtension::Extend,
+    }
+}
+fn is_known_sampler_wrap(value: &Value) -> bool {
+    value.is_null() || matches!(value.as_u64(), Some(10497 | 33071 | 33648))
 }
 
 fn import_texture_ref(info: &Value, root: &Value, image_ids: &[Id]) -> Result<Option<TextureRef>> {
@@ -6089,6 +6191,7 @@ fn import_texture_ref(info: &Value, root: &Value, image_ids: &[Id]) -> Result<Op
         image,
         uv_layer,
         interpolation,
+        extension: ImageExtension::Repeat,
     }))
 }
 
@@ -8629,7 +8732,6 @@ fn imported_color_material(
     variants.insert(key, variant_id.clone());
     Ok(variant_id)
 }
-
 /// Groups glTF vertices that are copies of one Potter vertex. Returns each glTF vertex's welded
 /// index and the first glTF copy of each welded vertex; without IDs every vertex stays separate.
 fn weld_copies(
@@ -9710,6 +9812,27 @@ fn texcoord_past_limit(name: &str) -> bool {
 
 fn gltf_import_losses(root: &Value) -> Vec<crate::exchange::Loss> {
     let mut losses = Vec::new();
+    let unknown_wrap = root["textures"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|texture| {
+            texture["sampler"]
+                .as_u64()
+                .and_then(|index| usize::try_from(index).ok())
+                .and_then(|index| root["samplers"].get(index))
+        })
+        .any(|sampler| {
+            !is_known_sampler_wrap(&sampler["wrapS"]) || !is_known_sampler_wrap(&sampler["wrapT"])
+        });
+    if unknown_wrap {
+        losses.push(crate::exchange::Loss {
+            feature_id: feature_id::SAMPLER.to_owned(),
+            data_id: None,
+            reason: "glTF texture sampler has an unknown wrap value; that axis is imported as clamp to edge, as Blender does".to_owned(),
+            suggestion: Some("use REPEAT (10497), CLAMP_TO_EDGE (33071), or MIRRORED_REPEAT (33648)".to_owned()),
+        });
+    }
     if root["nodes"].as_array().is_some_and(|nodes| {
         nodes.iter().any(|node| {
             let Some(node_weights) = node["weights"].as_array() else {
@@ -10044,7 +10167,6 @@ fn read_color(root: &Value, buffers: &[Vec<u8>], accessor_index: usize) -> Resul
     }
     Ok(colors)
 }
-
 fn read_joint_indices(
     root: &Value,
     buffers: &[Vec<u8>],
@@ -10621,7 +10743,7 @@ mod tests {
             };
 
             let fbx_path = directory.path().join("scene.fbx");
-            let fbx_bytes = as_case(crate::exchange::fbx::export(&source, &snapshot))?;
+            let fbx_bytes = as_case(crate::exchange::fbx::export_with_root_allow_lossy(&source, &snapshot, std::path::Path::new("."), false))?;
             std::fs::write(&fbx_path, fbx_bytes).map_err(|error| TestCaseError::fail(error.to_string()))?;
             let fbx = as_case(crate::exchange::fbx::import(&fbx_path, uuid::Uuid::new_v4().to_string()))?;
             let mut fbx_positions = as_case(mesh_positions(&fbx.doc))?;
@@ -13682,7 +13804,7 @@ mod tests {
             {"op":"node.update","target":{"id":"grid"},"set":{"materials":["jacket","skin"]}},
             {"op":"mesh.set_attribute","target":{"id":"grid"},"elements":{"domain":"face","ids":["f0","f1","f2"]},"material_index":0},
             {"op":"mesh.set_attribute","target":{"id":"grid"},"elements":{"domain":"face","ids":["f3"]},"material_index":1},
-            {"op":"mesh.dissolve","target":{"id":"grid"},"elements":{"domain":"edge","ids":["e1","e2"]}}
+            {"op":"mesh.dissolve","target":{"id":"grid"},"elements":{"domain":"edge","ids":["e2","e3"]}}
         ]))?;
         let directory = tempfile::tempdir()?;
         let (imported, _) = round_trip_in(&doc, directory.path())?;
@@ -14535,7 +14657,8 @@ mod tests {
             &json!([
                 {"op":"image.create","id":"paint","width":1,"height":1,"colorspace":"srgb","fill_color":[0.25,0.5,0.75,1.0]},
                 {"op":"material.create","id":"paint_mat","base_color_texture":{"image":"paint"}},
-                {"op":"node.create","id":"quad","kind":"plane","params":{"size":2.0},"material":"paint_mat"}
+                {"op":"node.create","id":"quad","kind":"plane","params":{"size":2.0},"material":"paint_mat"},
+                {"op":"uv.layer_delete","target":{"id":"quad"},"name":"UVMap"}
             ]),
         )?;
         let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
@@ -14910,11 +15033,15 @@ mod tests {
         let images = BTreeMap::from([(
             image_id,
             crate::image::ImageData {
+                colour: crate::image::ColourCache::default(),
+                storage: crate::image::ImageStorage::default(),
                 width: 2,
                 height: 1,
                 pixels: vec![[0.5, 0.25, 0.75, 1.0], [0.5, 0.9, 0.1, 1.0]],
                 tiles: BTreeMap::new(),
                 interpolation: crate::image::ImageInterpolation::Closest,
+                srgb: false,
+                udim: false,
             },
         )]);
         let names = ["UVMap".to_owned()];
@@ -15118,6 +15245,532 @@ mod tests {
     }
 
     #[test]
+    fn packed_metallic_roughness_graph_samples_like_the_authored_fields_everywhere() -> TestResult {
+        // The authored material samples its native fields and the imported one samples the packed graph. Both go
+        // through one Image Texture sampler, so they agree across the whole UV square, including the band where
+        // Blender's REPEAT wraps the texture edge. The packed PNG keeps each 8-bit channel, so the values can
+        // differ by one 8-bit step at most.
+        let root = tempfile::tempdir()?;
+        let doc = scene_with_asset_root(
+            root.path(),
+            &json!([
+                {"op":"image.create","id":"rough","width":4,"height":4,"colorspace":"linear","generator":"checker","checker_colors":[[0.1,0.6,0.9,1.0],[0.9,0.2,0.4,1.0]],"checker_size":2},
+                {"op":"image.create","id":"metal","width":4,"height":4,"colorspace":"linear","generator":"checker","checker_colors":[[0.8,0.3,0.1,1.0],[0.2,0.7,0.5,1.0]],"checker_size":2},
+                {"op":"material.create","id":"mr_box","metallic":1.0,"roughness":1.0,"roughness_texture":{"image":"rough"},"metallic_texture":{"image":"metal"}},
+                {"op":"node.create","id":"cube","kind":"box","params":{"size":2.0},"material":"mr_box"},
+                {"op":"uv.unwrap","target":{"id":"cube"},"method":"box"}
+            ]),
+        )?;
+        let names = ["UVMap".to_owned()];
+        let sample_at = |material: &crate::model::Material,
+                         groups: &BTreeMap<crate::model::Id, crate::graph::NodeGroup>,
+                         images: &BTreeMap<String, crate::image::ImageData>,
+                         u: f64,
+                         v: f64|
+         -> TestResult<(f64, f64)> {
+            let corners = [[[u, v]; 3]];
+            let layers = crate::shader::HitUvLayers {
+                names: &names,
+                corners: &corners,
+                positions: [DVec3::ZERO; 3],
+                barycentric: [1.0 / 3.0; 3],
+                render: Some(0),
+                available_mask: None,
+            };
+            let mut context = crate::shader::HitContext::new(groups)
+                .with_images(images)
+                .with_uv_layers(layers);
+            // A graph texture on the render layer reads `TexCoord.UV`, the hit's render `uv`, as the renderer sets it.
+            context.uv = [u, v];
+            let params = crate::shader::evaluate_surface(material, &context)?;
+            Ok((params.roughness, params.metallic))
+        };
+        let mut native_images = BTreeMap::new();
+        for name in ["rough", "metal"] {
+            let image = doc
+                .images
+                .get(&crate::model::Id::new(name)?)
+                .ok_or("image missing")?;
+            native_images.insert(
+                name.to_owned(),
+                crate::image::load_image_data(
+                    image,
+                    root.path(),
+                    crate::image::ImageInterpolation::Linear,
+                )?,
+            );
+        }
+        let native_material = doc
+            .materials
+            .get(&crate::model::Id::new("mr_box")?)
+            .ok_or("material missing")?;
+        let (document, binary) = export_root_and_binary_at_root(&doc, root.path())?;
+        std::fs::write(root.path().join("scene.bin"), &binary)?;
+        let path = root.path().join("packed.gltf");
+        std::fs::write(&path, serde_json::to_vec(&document)?)?;
+        let imported = import(&path, uuid::Uuid::new_v4().to_string())?;
+        export_imported_again(&imported, root.path())?;
+        let graph_material = imported
+            .doc
+            .materials
+            .get(&crate::model::Id::new("mr_box")?)
+            .ok_or("imported material missing")?;
+        let graph_id = graph_material
+            .node_tree
+            .as_ref()
+            .ok_or("imported material has no graph")?;
+        let graph = imported
+            .doc
+            .node_groups
+            .get(graph_id)
+            .ok_or("imported graph is missing")?;
+        let packed_id = graph
+            .nodes
+            .values()
+            .find(|node| node.node_type == "ShaderNodeTexImage")
+            .and_then(|node| node.properties.get("image"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or("packed texture node is missing")?
+            .to_owned();
+        let packed_image = imported
+            .doc
+            .images
+            .get(&crate::model::Id::new(&packed_id)?)
+            .ok_or("packed image is missing")?;
+        let mut graph_images = BTreeMap::new();
+        graph_images.insert(
+            packed_id,
+            crate::image::load_image_data(
+                packed_image,
+                root.path(),
+                crate::image::ImageInterpolation::Linear,
+            )?,
+        );
+        // 40 x 40 samples cover the interior and the wrap band at every edge of the texture.
+        let mut worst = 0.0_f64;
+        for vi in 0..40 {
+            for ui in 0..40 {
+                let u = (f64::from(ui) + 0.5) / 40.0;
+                let v = (f64::from(vi) + 0.5) / 40.0;
+                let (native_roughness, native_metallic) =
+                    sample_at(native_material, &doc.node_groups, &native_images, u, v)?;
+                let (graph_roughness, graph_metallic) = sample_at(
+                    graph_material,
+                    &imported.doc.node_groups,
+                    &graph_images,
+                    u,
+                    v,
+                )?;
+                worst = worst
+                    .max((native_roughness - graph_roughness).abs())
+                    .max((native_metallic - graph_metallic).abs());
+            }
+        }
+        assert!(
+            worst <= 1.0 / 255.0 + 1e-9,
+            "the authored field and the imported graph differ by {worst} at some UV"
+        );
+        Ok(())
+    }
+
+    /// The texel of `coordinate` in `[0, 1]` on an axis of `size` texels: the last texel edge at or below it.
+    fn texel_index(coordinate: f64, size: usize) -> TestResult<usize> {
+        let size_f = f64::from(u32::try_from(size)?);
+        let mut index = 0_usize;
+        for edge in 1..=size {
+            if coordinate >= f64::from(u32::try_from(edge)?) / size_f {
+                index = edge;
+            }
+        }
+        Ok(index.min(size - 1))
+    }
+
+    /// One axis of a glTF sampler wrap: `REPEAT` (10497) takes the fraction, `CLAMP_TO_EDGE` (33071) clamps, and
+    /// `MIRRORED_REPEAT` (33648) reflects. Blender also clamps unknown wrap values in its mixed-wrap branch.
+    fn gltf_wrapped(wrap: u64, coordinate: f64) -> f64 {
+        match wrap {
+            10497 => coordinate.rem_euclid(1.0),
+            33648 => {
+                let period = coordinate.rem_euclid(2.0);
+                if period > 1.0 { 2.0 - period } else { period }
+            }
+            // Explicit clamp and unknown values both pass through under Blender's EXTEND node.
+            _ => coordinate.clamp(0.0, 1.0),
+        }
+    }
+
+    #[test]
+    fn sampler_wrap_samples_each_axis_as_the_gltf_sampler_says() -> TestResult {
+        const REPEAT: u64 = 10497;
+        const CLAMP: u64 = 33071;
+        const MIRRORED: u64 = 33648;
+        const UNKNOWN: u64 = 42;
+        // Each wrap pair is a glTF sampler, and its S and T axes must sample the texel the glTF specification gives. The
+        // uniform pairs import as fields and the mixed pairs as a graph, so both routes are checked against the same
+        // expectation. The image is 4 x 4 with a distinct texel at every position.
+        let root = tempfile::tempdir()?;
+        let png = root.path().join("texels.png");
+        let texel =
+            |value: u32| -> u8 { [0_u8, 85, 170, 255][usize::try_from(value).unwrap_or(0).min(3)] };
+        ::image::RgbaImage::from_fn(4, 4, |x, y| ::image::Rgba([texel(x), texel(y), 128, 255]))
+            .save(&png)?;
+        let png_path = png.to_string_lossy().into_owned();
+        let doc = scene_with_asset_root(
+            root.path(),
+            &json!([
+                {"op":"image.load","id":"tex","path":png_path,"colorspace":"non_color"},
+                {"op":"material.create","id":"wrapped","base_color":[1.0,1.0,1.0,1.0],"base_color_texture":{"image":"tex","interpolation":"closest"}},
+                {"op":"node.create","id":"sheet","kind":"plane","params":{"size":1.0},"material":"wrapped"},
+                {"op":"uv.unwrap","target":{"id":"sheet"},"method":"box"}
+            ]),
+        )?;
+        let (document, binary) = export_root_and_binary_at_root(&doc, root.path())?;
+        std::fs::write(root.path().join("scene.bin"), &binary)?;
+        // Coordinates off the texel edges, below 0 and above 1, so every wrap mode is exercised.
+        let grid = [-0.4, -0.1, 0.1, 0.35, 0.6, 0.9, 1.2, 1.6];
+        let names = ["UVMap".to_owned()];
+        for (wrap_s, wrap_t) in [
+            (CLAMP, CLAMP),
+            (MIRRORED, MIRRORED),
+            (REPEAT, REPEAT),
+            (CLAMP, REPEAT),
+            (MIRRORED, CLAMP),
+            (REPEAT, MIRRORED),
+            (UNKNOWN, REPEAT),
+            (REPEAT, UNKNOWN),
+        ] {
+            let mut edited = document.clone();
+            edited["samplers"] =
+                json!([{"magFilter": 9728, "minFilter": 9728, "wrapS": wrap_s, "wrapT": wrap_t}]);
+            edited["textures"][0]["sampler"] = json!(0);
+            let path = root.path().join("wrap.gltf");
+            std::fs::write(&path, serde_json::to_vec(&edited)?)?;
+            let imported = import(&path, uuid::Uuid::new_v4().to_string())?;
+            if wrap_s == UNKNOWN || wrap_t == UNKNOWN {
+                assert!(
+                    imported
+                        .losses
+                        .iter()
+                        .any(|loss| loss.feature_id == "material.shader_graph.sampler"),
+                    "an unknown sampler wrap must be reported as a loss"
+                );
+            }
+            export_imported_again(&imported, root.path())?;
+            let mut images = BTreeMap::new();
+            for (id, image) in &imported.doc.images {
+                images.insert(
+                    id.as_str().to_owned(),
+                    crate::image::load_image_data(
+                        image,
+                        root.path(),
+                        crate::image::ImageInterpolation::Linear,
+                    )?,
+                );
+            }
+            let data = images.values().next().ok_or("the image is missing")?;
+            let width = usize::try_from(data.width)?;
+            let height = usize::try_from(data.height)?;
+            let material = imported
+                .doc
+                .materials
+                .get(&crate::model::Id::new("wrapped")?)
+                .ok_or("the material is missing")?;
+            let base_colour = |s_u: f64, s_v: f64| -> TestResult<[f64; 4]> {
+                let corners = [[[s_u, s_v]; 3]];
+                let layers = crate::shader::HitUvLayers {
+                    names: &names,
+                    corners: &corners,
+                    positions: [DVec3::ZERO; 3],
+                    barycentric: [1.0 / 3.0; 3],
+                    render: Some(0),
+                    available_mask: None,
+                };
+                let mut context = crate::shader::HitContext::new(&imported.doc.node_groups)
+                    .with_images(&images)
+                    .with_uv_layers(layers);
+                context.uv = [s_u, s_v];
+                Ok(crate::shader::evaluate_surface(material, &context)?.base_color)
+            };
+            for s_u in grid {
+                for s_v in grid {
+                    let actual = base_colour(s_u, s_v)?;
+                    let texel_x = texel_index(gltf_wrapped(wrap_s, s_u), width)?;
+                    let texel_y = texel_index(gltf_wrapped(wrap_t, s_v), height)?;
+                    let encoded = [
+                        f64::from(texel(u32::try_from(texel_x)?)) / 255.0,
+                        f64::from(texel(u32::try_from(texel_y)?)) / 255.0,
+                        128.0 / 255.0,
+                    ];
+                    let expected = encoded
+                        .map(|value| f64::from(crate::color::cycles_srgb_to_linear(value as f32)));
+                    for channel in 0..3 {
+                        assert!(
+                            (actual[channel] - expected[channel]).abs() < 1e-9,
+                            "wrap ({wrap_s}, {wrap_t}) at ({s_u}, {s_v}) samples {actual:?}, expected texel ({texel_x}, {texel_y}) {expected:?}"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The largest channel difference between Potter's base colour and a Blender render oracle, and the Blender UV
+    /// where it occurs. The oracle's ramp covers -0.5..1.5, so integer boundaries and texel edges are sampled. A
+    /// non-colour image is read as raw values on both sides; otherwise the image is sRGB, as glTF imports it.
+    fn blender_render_worst_difference(
+        oracle_path: &std::path::Path,
+        gltf_path: &std::path::Path,
+        non_color: bool,
+    ) -> TestResult<(f64, (f64, f64))> {
+        let names = ["UVMap".to_owned()];
+        let oracle: Value = serde_json::from_slice(&std::fs::read(oracle_path)?)?;
+        let imported = import(gltf_path, uuid::Uuid::new_v4().to_string())?;
+        let assets = tempfile::tempdir()?;
+        for (digest, bytes) in &imported.assets {
+            let hex = digest
+                .strip_prefix("sha256:")
+                .ok_or("image blob digest is malformed")?;
+            let blob = assets
+                .path()
+                .join("assets")
+                .join("sha256")
+                .join(hex)
+                .join("blob");
+            std::fs::create_dir_all(blob.parent().ok_or("image blob parent path is missing")?)?;
+            std::fs::write(blob, bytes)?;
+        }
+        let mut images = BTreeMap::new();
+        for (id, image) in &imported.doc.images {
+            let mut loaded = image.clone();
+            if non_color {
+                loaded.colorspace = crate::model::ImageColorspace::NonColor;
+            }
+            images.insert(
+                id.as_str().to_owned(),
+                crate::image::load_image_data(
+                    &loaded,
+                    assets.path(),
+                    crate::image::ImageInterpolation::Linear,
+                )?,
+            );
+        }
+        let material = imported
+            .doc
+            .materials
+            .values()
+            .next()
+            .ok_or("the glTF imported no material")?;
+        let mut worst = 0.0_f64;
+        let mut worst_at = (0.0, 0.0);
+        for record in oracle["records"].as_array().ok_or("records missing")? {
+            let r = record.as_array().ok_or("record is not an array")?;
+            // Blender read the texture at its sample UV (entries 5 and 6), which sits about 3e-5 from the grid
+            // position (entries 0 and 1) the ramp was built on. Potter is evaluated at the point Blender sampled.
+            let (u, v) = if r.len() >= 7 {
+                (
+                    r[5].as_f64().ok_or("sample u")?,
+                    r[6].as_f64().ok_or("sample v")?,
+                )
+            } else {
+                (r[0].as_f64().ok_or("u")?, r[1].as_f64().ok_or("v")?)
+            };
+            // The oracle is in Blender's V-up UV; Potter's storage UV is glTF's V-down.
+            let storage = [u, 1.0 - v];
+            let corners = [[storage; 3]];
+            let layers = crate::shader::HitUvLayers {
+                names: &names,
+                corners: &corners,
+                positions: [DVec3::ZERO; 3],
+                barycentric: [1.0 / 3.0; 3],
+                render: Some(0),
+                available_mask: None,
+            };
+            let mut context = crate::shader::HitContext::new(&imported.doc.node_groups)
+                .with_images(&images)
+                .with_uv_layers(layers);
+            context.uv = storage;
+            let actual = crate::shader::evaluate_surface(material, &context)?.base_color;
+            for channel in 0..3 {
+                let expected = r[2 + channel].as_f64().ok_or("colour is not a number")?;
+                let diff = (actual[channel] - expected).abs();
+                if diff > worst {
+                    worst = diff;
+                    worst_at = (u, v);
+                }
+            }
+        }
+        Ok((worst, worst_at))
+    }
+
+    /// Mixed-wrap glTF textures sample as Blender 5.2.2 renders them. Each fixture's per-axis UV graph is rendered over
+    /// a UV ramp from -0.5 to 1.5 (`tests/fixtures/texture_wrap/generate_wrap_oracle.py`). Each record is evaluated at
+    /// the ray UV that Blender's UV Map node supplies to the wrap graph. Both sides interpolate raw values, so this
+    /// isolates wrap semantics from the sRGB decode order. The bound is the oracle's six-decimal colour rounding: an f64
+    /// emulation of the graph at those UVs leaves a worst residual of 5.3e-7 on the three oracles, so 1e-6 is about
+    /// twice that.
+    #[test]
+    fn mixed_wrap_samples_match_blenders_render() -> TestResult {
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/texture_wrap");
+        for pair in ["clamp_repeat", "mirror_clamp", "repeat_mirror"] {
+            let (worst, worst_at) = blender_render_worst_difference(
+                &fixtures.join(format!("blender_{pair}.json")),
+                &fixtures.join(format!("wrap_{pair}.gltf")),
+                true,
+            )?;
+            assert!(
+                worst <= 1e-6,
+                "{pair}: Potter differs from Blender's render by {worst} at Blender uv {worst_at:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// sRGB textures sample as Cycles' image texture does: Blender interpolates the encoded texels, decodes the result
+    /// with `color_srgb_to_linear_sse2`, and Potter does the same (`tests/fixtures/srgb_texture/generate_srgb_oracle.py`).
+    /// The fixtures are sRGB base colours with Linear or Closest filtering, and clamp or repeat wrapping. Each record is
+    /// evaluated at Blender's sample UV. The bound is f32 rounding: an f32 emulation of the Cycles path, run at those
+    /// sample UVs on the oracles, leaves a worst residual of 9.4e-7, and Potter's f64 mix adds a few ulps at most.
+    /// The 2e-6 bound is about 16 ulps of f32 at 1.0.
+    #[test]
+    fn srgb_texture_samples_match_blenders_render() -> TestResult {
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/srgb_texture");
+        for pair in ["linear_clamp", "closest_clamp", "linear_repeat"] {
+            let (worst, worst_at) = blender_render_worst_difference(
+                &fixtures.join(format!("blender_{pair}.json")),
+                &fixtures.join(format!("srgb_{pair}.gltf")),
+                false,
+            )?;
+            assert!(
+                worst <= 2e-6,
+                "{pair}: Potter differs from Blender's render by {worst} at Blender uv {worst_at:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_wrap_round_trips_through_the_exporters_per_axis_pattern() -> TestResult {
+        // A sampler whose axes wrap differently imports as Blender's per-axis UV graph. The exporter recognises that
+        // graph and writes the same sampler back, so the sampler is identical after the round trip.
+        for (wrap_s, wrap_t) in [(33071_u64, 10497_u64), (33648, 33071), (10497, 33648)] {
+            let root = tempfile::tempdir()?;
+            let png = root.path().join("texels.png");
+            ::image::RgbaImage::from_pixel(2, 2, ::image::Rgba([10, 20, 30, 255])).save(&png)?;
+            let png_path = png.to_string_lossy().into_owned();
+            let doc = scene_with_asset_root(
+                root.path(),
+                &json!([
+                    {"op":"image.load","id":"tex","path":png_path,"colorspace":"non_color"},
+                    {"op":"material.create","id":"wrapped","base_color":[1.0,1.0,1.0,1.0],"base_color_texture":{"image":"tex","interpolation":"closest"}},
+                    {"op":"node.create","id":"sheet","kind":"plane","params":{"size":1.0},"material":"wrapped"},
+                    {"op":"uv.unwrap","target":{"id":"sheet"},"method":"box"}
+                ]),
+            )?;
+            let (document, binary) = export_root_and_binary_at_root(&doc, root.path())?;
+            std::fs::write(root.path().join("scene.bin"), &binary)?;
+            let sampler =
+                json!({"magFilter": 9728, "minFilter": 9984, "wrapS": wrap_s, "wrapT": wrap_t});
+            let mut edited = document.clone();
+            edited["samplers"] = json!([sampler.clone()]);
+            edited["textures"][0]["sampler"] = json!(0);
+            let path = root.path().join("mixed.gltf");
+            std::fs::write(&path, serde_json::to_vec(&edited)?)?;
+            let imported = import(&path, uuid::Uuid::new_v4().to_string())?;
+            let material = imported
+                .doc
+                .materials
+                .get(&crate::model::Id::new("wrapped")?)
+                .ok_or("the material is missing")?;
+            assert!(
+                material.node_tree.is_some(),
+                "a mixed wrap imports as a material graph"
+            );
+            export_imported_again(&imported, root.path())?;
+            let (reexport, _) = export_root_and_binary_at_root(&imported.doc, root.path())?;
+            let texture =
+                reexport["materials"][0]["pbrMetallicRoughness"]["baseColorTexture"]["index"]
+                    .as_u64()
+                    .ok_or("the base colour texture is missing")?;
+            let sampler_index = reexport["textures"][usize::try_from(texture)?]["sampler"]
+                .as_u64()
+                .ok_or("the texture has no sampler")?;
+            assert_eq!(
+                reexport["samplers"][usize::try_from(sampler_index)?],
+                sampler,
+                "the exported sampler differs from the imported one for wrap ({wrap_s}, {wrap_t})"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn texture_extension_round_trips_through_the_gltf_sampler() -> TestResult {
+        // An extension exports as its glTF sampler wrap, and the sampler imports back as the same extension.
+        let root = tempfile::tempdir()?;
+        let doc = scene_with_asset_root(
+            root.path(),
+            &json!([
+                {"op":"image.create","id":"tex","width":2,"height":2,"colorspace":"linear","fill_color":[0.5,0.5,0.5,1.0]},
+                {"op":"material.create","id":"clamped","base_color_texture":{"image":"tex","extension":"extend"}},
+                {"op":"material.create","id":"mirrored","base_color_texture":{"image":"tex","extension":"mirror"}},
+                {"op":"node.create","id":"a","kind":"plane","params":{"size":1.0},"material":"clamped"},
+                {"op":"node.create","id":"b","kind":"plane","params":{"size":1.0},"material":"mirrored"},
+                {"op":"uv.unwrap","target":{"id":"a"},"method":"box"},
+                {"op":"uv.unwrap","target":{"id":"b"},"method":"box"}
+            ]),
+        )?;
+        let (document, binary) = export_root_and_binary_at_root(&doc, root.path())?;
+        let wrap_of = |name: &str| -> TestResult<u64> {
+            let material = document["materials"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|material| material["extras"]["potter"]["id"] == name)
+                .ok_or("the material is missing")?;
+            let texture = usize::try_from(
+                material["pbrMetallicRoughness"]["baseColorTexture"]["index"]
+                    .as_u64()
+                    .ok_or("the texture index is missing")?,
+            )?;
+            let sampler = usize::try_from(
+                document["textures"][texture]["sampler"]
+                    .as_u64()
+                    .ok_or("the sampler is missing")?,
+            )?;
+            document["samplers"][sampler]["wrapS"]
+                .as_u64()
+                .ok_or_else(|| "the wrap is missing".into())
+        };
+        assert_eq!(wrap_of("clamped")?, 33071, "extend writes CLAMP_TO_EDGE");
+        assert_eq!(wrap_of("mirrored")?, 33648, "mirror writes MIRRORED_REPEAT");
+        std::fs::write(root.path().join("scene.bin"), &binary)?;
+        let path = root.path().join("extension.gltf");
+        std::fs::write(&path, serde_json::to_vec(&document)?)?;
+        let imported = import(&path, uuid::Uuid::new_v4().to_string())?;
+        let extension_of = |name: &str| -> TestResult<crate::image::ImageExtension> {
+            imported
+                .doc
+                .materials
+                .get(&crate::model::Id::new(name)?)
+                .and_then(|material| material.base_color_texture.as_ref())
+                .map(|texture| texture.extension)
+                .ok_or_else(|| "the imported texture is missing".into())
+        };
+        assert_eq!(
+            extension_of("clamped")?,
+            crate::image::ImageExtension::Extend
+        );
+        assert_eq!(
+            extension_of("mirrored")?,
+            crate::image::ImageExtension::Mirror
+        );
+        Ok(())
+    }
+
+    #[test]
     fn main_texture_transform_reaches_the_colour_variant_graph() -> TestResult {
         // The base color texture carries a VRM 0.x MToon main texture transform, set as the glTF import
         // sets it. Its graph is built with the same `move_textures_to_graph` call the import makes.
@@ -15132,10 +15785,12 @@ mod tests {
         );
         let textures = super::material_graph::GraphTextures {
             base_color: Some(super::material_graph::SlotTexture {
+                wrap: [crate::image::ImageExtension::Repeat; 2],
                 texture: crate::model::TextureRef {
                     image: crate::model::Id::new("paint_img")?,
                     uv_layer: None,
                     interpolation: crate::image::ImageInterpolation::Linear,
+                    extension: crate::image::ImageExtension::Repeat,
                 },
                 transform: Some(crate::exchange::material_surface::TextureTransform {
                     offset: [0.25, -2.1],
@@ -15221,6 +15876,7 @@ mod tests {
                 {"op":"material.create","id":"shared","base_color_texture":{"image":"paint"}},
                 {"op":"collection.create","id":"source"},
                 {"op":"node.create","id":"a_member","kind":"plane","collection":"source","params":{"size":2.0}},
+                {"op":"uv.layer_delete","target":{"id":"a_member"},"name":"UVMap"},
                 {"op":"node.update","target":{"id":"a_member"},"set":{"materials":["shared"]}},
                 {"op":"node.create","id":"b_member","kind":"plane","collection":"source","params":{"size":2.0}},
                 {"op":"node.update","target":{"id":"b_member"},"set":{"materials":["shared"]}},

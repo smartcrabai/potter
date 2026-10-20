@@ -3,14 +3,13 @@
 //!
 //! A cluster is a set of coplanar triangles that intersect one another, chained by overlapping
 //! boxes. Planes are compared in canonical form, so coplanar triangles that face opposite ways
-//! share a plane group. Plane groups and their clusters follow first-seen order, where Blender
-//! iterates a hash map.
+//! share a plane group. Cluster ids follow the slot order of Blender's `plane_cls` map, and the
+//! coplanar candidates follow the slot order of its `itt_map` (see `blender_map`).
 
-use std::collections::HashMap;
+use num_traits::{One, Signed, Zero};
 
-use num_traits::{One, Zero};
-
-use super::super::exact::{Rat, Rat3};
+use super::super::blender_map::{BlenderMap, pair_hash};
+use super::super::exact::{Rat, Rat3, rat_from_f64, rat_to_f64};
 use super::super::imesh::{Arena, Tri};
 use super::tri_tri::IttKind;
 use super::{Aabb, IttMap, tri_plane};
@@ -107,24 +106,70 @@ fn canonical_plane(normal: &Rat3, d: &Rat) -> (Rat3, Rat) {
     }
 }
 
+/// Blender `mpq_class::get_d`: the double nearest to `value` in magnitude toward zero, so an
+/// exact rational that is not representable is truncated, not rounded. Zero is `+0.0`.
+fn rat_get_d(value: &Rat) -> f64 {
+    let nearest = rat_to_f64(value);
+    if !nearest.is_finite() || nearest == 0.0 {
+        return 0.0;
+    }
+    if rat_from_f64(nearest).abs() > value.abs() {
+        // Rounded away from zero: step one ulp toward zero (same sign, smaller magnitude).
+        f64::from_bits(nearest.to_bits() - 1)
+    } else {
+        nearest
+    }
+}
+
+/// Blender `Plane::hash()` (`mesh_intersect.cc`): mixes the bit patterns of the canonical normal
+/// and offset, which are the doubles of `Plane::make_canonical`.
+fn plane_hash(key: &(Rat3, Rat)) -> u64 {
+    let (norm, d) = key;
+    let mut x = rat_get_d(&norm[0]).to_bits();
+    let mut y = rat_get_d(&norm[1]).to_bits();
+    let mut z = rat_get_d(&norm[2]).to_bits();
+    let mut dd = rat_get_d(d).to_bits();
+    x = (x >> 56) ^ (x >> 46) ^ x;
+    y = (y >> 55) ^ (y >> 45) ^ y;
+    z = (z >> 54) ^ (z >> 44) ^ z;
+    dd = (dd >> 53) ^ (dd >> 43) ^ dd;
+    x ^ y ^ z ^ dd
+}
+
 /// Blender `find_clusters`: groups the triangles that take part in a coplanar intersection into
 /// clusters, keeping those with more than one triangle.
+///
+/// `overlap_count` is the size of Blender's overlap list (`tri_ov.overlap().size()`), which sizes
+/// `itt_map` before its inserts. Cluster ids follow the slot order of Blender's maps, so the
+/// output order matches Blender exactly.
 pub(super) fn find_clusters(
     arena: &Arena,
     tris: &[Tri],
     bbs: &[Aabb],
     itts: &IttMap,
+    overlap_count: usize,
 ) -> CoplanarClusterInfo {
     let mut ans = CoplanarClusterInfo::new(tris.len());
+
+    // Blender `itt_map`: keys are inserted in overlap order, and the coplanar pairs are read back
+    // in slot order.
+    let mut itt_slots: BlenderMap<(usize, usize), ()> = BlenderMap::new();
+    itt_slots.reserve(overlap_count);
+    for &((t1, t2), _) in &itts.entries {
+        itt_slots.add_new((t1, t2), pair_hash(t1, t2), ());
+    }
 
     // Candidate triangles of the coplanar pairs, in first-seen order (Blender `VectorSet`).
     let mut maybe: Vec<usize> = Vec::new();
     let mut seen = vec![false; tris.len()];
-    for ((t1, t2), entry) in &itts.entries {
-        if !matches!(entry.itt.kind, IttKind::Coplanar) {
+    for ((t1, t2), ()) in itt_slots.into_items() {
+        let coplanar = itts
+            .get((t1, t2))
+            .is_some_and(|entry| matches!(entry.itt.kind, IttKind::Coplanar));
+        if !coplanar {
             continue;
         }
-        for t in [*t1, *t2] {
+        for t in [t1, t2] {
             if let Some(s) = seen.get_mut(t)
                 && !*s
             {
@@ -137,55 +182,53 @@ pub(super) fn find_clusters(
         return ans;
     }
 
-    // Each plane group holds the clusters lying in one canonical plane, in creation order.
-    let mut group_of: HashMap<(Rat3, Rat), usize> = HashMap::new();
-    let mut groups: Vec<Vec<CoplanarCluster>> = Vec::new();
+    // Blender `plane_cls`: one plane group per canonical plane, in a map sized to the candidates.
+    // Each group holds the clusters lying in one plane, in creation order.
+    let mut plane_cls: BlenderMap<(Rat3, Rat), Vec<CoplanarCluster>> = BlenderMap::new();
+    plane_cls.reserve(maybe.len());
     for &t in &maybe {
         let (normal, d) = tri_plane(arena, &tris[t]);
         let key = canonical_plane(&normal, &d);
-        let g = if let Some(&g) = group_of.get(&key) {
-            g
-        } else {
-            let g = groups.len();
-            group_of.insert(key, g);
-            groups.push(Vec::new());
-            g
-        };
+        let hash = plane_hash(&key);
 
         let t_bb = &bbs[t];
-        let curcls = &mut groups[g];
-        let int_idx: Vec<usize> = curcls
-            .iter()
-            .enumerate()
-            .filter(|(_, cl)| cl.bounding_box().overlaps(t_bb))
-            .map(|(i, _)| i)
-            .collect();
-        match int_idx.as_slice() {
-            // `t` meets no existing cluster in its plane: it starts one of its own.
-            [] => curcls.push(CoplanarCluster::new(t, t_bb)),
-            [i] => curcls[*i].add_tri(t, t_bb),
-            // `t` bridges several clusters: merge them, keeping the merged cluster first.
-            _ => {
-                let mut merged = CoplanarCluster::new(t, t_bb);
-                for &i in &int_idx {
-                    for &u in curcls[i].tris() {
-                        merged.add_tri(u, &bbs[u]);
+        if let Some(curcls) = plane_cls.get_mut(&key, hash) {
+            let int_idx: Vec<usize> = curcls
+                .iter()
+                .enumerate()
+                .filter(|(_, cl)| cl.bounding_box().overlaps(t_bb))
+                .map(|(i, _)| i)
+                .collect();
+            match int_idx.as_slice() {
+                // `t` meets no existing cluster in its plane: it starts one of its own.
+                [] => curcls.push(CoplanarCluster::new(t, t_bb)),
+                [i] => curcls[*i].add_tri(t, t_bb),
+                // `t` bridges several clusters: merge them, keeping the merged cluster first.
+                _ => {
+                    let mut merged = CoplanarCluster::new(t, t_bb);
+                    for &i in &int_idx {
+                        for &u in curcls[i].tris() {
+                            merged.add_tri(u, &bbs[u]);
+                        }
                     }
+                    let old = std::mem::take(curcls);
+                    let mut rebuilt = vec![merged];
+                    rebuilt.extend(
+                        old.into_iter()
+                            .enumerate()
+                            .filter(|(i, _)| !int_idx.contains(i))
+                            .map(|(_, cl)| cl),
+                    );
+                    *curcls = rebuilt;
                 }
-                let old = std::mem::take(curcls);
-                let mut rebuilt = vec![merged];
-                rebuilt.extend(
-                    old.into_iter()
-                        .enumerate()
-                        .filter(|(i, _)| !int_idx.contains(i))
-                        .map(|(_, cl)| cl),
-                );
-                *curcls = rebuilt;
             }
+        } else {
+            plane_cls.add_new(key, hash, vec![CoplanarCluster::new(t, t_bb)]);
         }
     }
 
-    for group in groups {
+    // Blender numbers clusters by `plane_cls.items()`.
+    for (_, group) in plane_cls.into_items() {
         for cl in group {
             if cl.tris.len() > 1 {
                 ans.add_cluster(cl);

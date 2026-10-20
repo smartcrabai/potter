@@ -2881,6 +2881,7 @@ mod tests {
                 image: Id::new("paint").unwrap(),
                 uv_layer: Some("Mid".to_owned()),
                 interpolation: crate::image::ImageInterpolation::Linear,
+                extension: crate::image::ImageExtension::Repeat,
             });
         run_uv(
             &mut doc,

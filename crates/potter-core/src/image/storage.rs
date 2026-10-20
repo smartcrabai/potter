@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     error::{ErrorCode, PotError, Result},
     hash,
-    image::{ImageData, ImageInterpolation, ImageTileData},
-    model::{Image, ImageColorspace},
+    image::{ColourCache, ImageData, ImageInterpolation, ImageStorage, ImageTileData, Precision},
+    model::{Image, ImageAlphaMode, ImageColorspace},
 };
 
 const PIXEL_FORMAT: &str = "potter.rgba_f64.v1";
@@ -63,18 +63,29 @@ pub fn load_image_data_with_staged(
     interpolation: ImageInterpolation,
     staged: &BTreeMap<String, Vec<u8>>,
 ) -> Result<ImageData> {
-    let base_bytes = image_blob_bytes(image.blob.as_deref(), image, root, staged)?;
-    let (width, height, pixels) = decode_pixels(&base_bytes, image.colorspace)?;
-    if width != image.width || height != image.height {
-        return Err(PotError::with_details(
-            ErrorCode::SceneInvalid,
-            "image blob dimensions do not match its registry entry",
-            serde_json::json!({"image":image.name,"expected":[image.width,image.height],"actual":[width,height]}),
-        ));
-    }
+    let srgb = decodes_srgb(image.colorspace);
+    // A UDIM image whose base file is missing keeps its listed tiles and no base pixels, so the base samples as missing.
+    let (width, height, pixels, storage) = if image.base_is_missing() {
+        (0, 0, Vec::new(), ImageStorage::default())
+    } else {
+        let base_bytes = image_blob_bytes(image.blob.as_deref(), image, root, staged)?;
+        let (width, height, pixels) = decode_pixels(&base_bytes, image.colorspace)?;
+        if width != image.width || height != image.height {
+            return Err(PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "image blob dimensions do not match its registry entry",
+                serde_json::json!({"image":image.name,"expected":[image.width,image.height],"actual":[width,height]}),
+            ));
+        }
+        (width, height, pixels, image_storage(image, &base_bytes))
+    };
     let mut tiles = BTreeMap::new();
     for tile in &image.tiles {
-        let bytes = blob_bytes(&tile.blob, root, staged)?;
+        // A listed tile without a blob is missing: it has no pixels, so it is left out and samples as the missing colour.
+        let Some(blob) = tile.blob.as_deref() else {
+            continue;
+        };
+        let bytes = blob_bytes(blob, root, staged)?;
         let (tile_width, tile_height, tile_pixels) = decode_pixels(&bytes, image.colorspace)?;
         if tile_width != tile.width || tile_height != tile.height {
             return Err(PotError::with_details(
@@ -89,6 +100,8 @@ pub fn load_image_data_with_staged(
                 width: tile_width,
                 height: tile_height,
                 pixels: tile_pixels,
+                precision: source_precision(&bytes),
+                colour: ColourCache::default(),
             },
         );
     }
@@ -98,15 +111,124 @@ pub fn load_image_data_with_staged(
         pixels,
         tiles,
         interpolation,
+        srgb,
+        storage,
+        udim: image.is_udim(),
+        colour: ColourCache::default(),
     })
+}
+
+/// Whether an image's stored values are sRGB-encoded: an sRGB colour space on any source. Cycles keeps such an image
+/// encoded and decodes after it interpolates (`ImageMetaData::is_compressible_as_srgb`). Potter's stored pixel format
+/// returns its values as stored, so the label alone decides here, as it does for the `.blend` and glTF exports that
+/// encode an sRGB-labelled image before Blender reads it.
+pub(crate) fn decodes_srgb(colorspace: ImageColorspace) -> bool {
+    colorspace == ImageColorspace::Srgb
+}
+
+/// The alpha mode Blender gives a loaded image of this encoding when the file says nothing else. Blender reads an EXR
+/// with the `OpenEXR` convention, associated (premultiplied) alpha, because `oiio:UnassociatedAlpha` is absent: a loaded
+/// EXR reports `alpha_mode` PREMUL (`image_metadata.cpp` `ImageMetaData`, and the `alpha_texture` readback oracle).
+/// Every other encoding is straight.
+pub(crate) fn default_alpha_mode(bytes: &[u8]) -> ImageAlphaMode {
+    if bytes.starts_with(&[0x76, 0x2f, 0x31, 0x01]) {
+        ImageAlphaMode::Premultiplied
+    } else {
+        ImageAlphaMode::Straight
+    }
+}
+
+/// How Blender stores a loaded image for Image Texture colour reads: a non-colour image is read as stored, and
+/// straight alpha is premultiplied at load for any other colour space (Cycles' image manager).
+fn image_storage(image: &Image, bytes: &[u8]) -> ImageStorage {
+    ImageStorage {
+        data: image.colorspace == ImageColorspace::NonColor,
+        straight_alpha: image.alpha_mode == ImageAlphaMode::Straight,
+        // Blender's `IMA_ALPHA_IGNORE` is the None alpha mode: the alpha of the file is ignored (`image_metadata.cpp`).
+        ignore_alpha: image.alpha_mode == ImageAlphaMode::None,
+        precision: source_precision(bytes),
+    }
+}
+
+/// The precision a stored image is quantised to, which sets the precision of Blender's premultiply at load: a 16-bit
+/// PNG or any 16-bit decoder output is 16-bit; an EXR whose colour channels are all half is half; an EXR with float
+/// channels, Radiance HDR, float decoder output, and Potter's stored pixel format are float; other encodings are 8-bit.
+fn source_precision(bytes: &[u8]) -> Precision {
+    if bytes.first() == Some(&b'{') {
+        return Precision::Float;
+    }
+    if bytes.starts_with(&[0x76, 0x2f, 0x31, 0x01]) {
+        return exr_precision(bytes);
+    }
+    if bytes.starts_with(b"#?") {
+        return Precision::Float;
+    }
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return if bytes.get(24) == Some(&16) {
+            Precision::Short
+        } else {
+            Precision::Byte
+        };
+    }
+    decoded_precision(bytes)
+}
+
+/// Half when every colour channel of the EXR is F16, float otherwise (`exr::meta::attribute::SampleType`).
+fn exr_precision(bytes: &[u8]) -> Precision {
+    let Ok(metadata) = exr::meta::MetaData::read_from_buffered(Cursor::new(bytes), false) else {
+        return Precision::Float;
+    };
+    let colour_types: Vec<exr::meta::attribute::SampleType> = metadata
+        .headers
+        .iter()
+        .flat_map(|header| header.channels.list.iter())
+        .filter(|channel| {
+            let name = channel.name.to_string().to_ascii_lowercase();
+            let suffix = name.rsplit('.').next().unwrap_or("");
+            matches!(
+                suffix,
+                "r" | "g" | "b" | "a" | "red" | "green" | "blue" | "alpha"
+            )
+        })
+        .map(|channel| channel.sample_type)
+        .collect();
+    if !colour_types.is_empty()
+        && colour_types
+            .iter()
+            .all(|sample| *sample == exr::meta::attribute::SampleType::F16)
+    {
+        Precision::Half
+    } else {
+        Precision::Float
+    }
+}
+
+/// The precision of a decoder's colour output, for formats the image crate decodes (TIFF, JPEG, and others).
+fn decoded_precision(bytes: &[u8]) -> Precision {
+    use ::image::ImageDecoder as _;
+    let color_type = ::image::ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()
+        .and_then(|reader| reader.into_decoder().ok())
+        .map(|decoder| decoder.color_type());
+    match color_type {
+        Some(::image::ColorType::Rgb32F | ::image::ColorType::Rgba32F) => Precision::Float,
+        Some(
+            ::image::ColorType::L16
+            | ::image::ColorType::La16
+            | ::image::ColorType::Rgb16
+            | ::image::ColorType::Rgba16,
+        ) => Precision::Short,
+        _ => Precision::Byte,
+    }
 }
 
 /// Decodes supported image encodings into linear RGBA pixels.
 ///
 /// Eight-bit rasters default to sRGB; EXR, Radiance HDR, and floating-point TIFF default
 /// to linear. EXR layers named `Combined` or `RGBA` are preferred over the first RGBA
-/// layer. EXR RGB values are unpremultiplied when alpha is nonzero so the internal
-/// representation uses the straight-alpha convention shared with PNG.
+/// layer. EXR values are returned as stored, straight or premultiplied as the image's alpha mode says; the image
+/// sampler applies that (`ImageStorage`), and `ImageData::straight_pixels` gives straight colour for direct readers.
 pub fn decode_pixels(
     bytes: &[u8],
     colorspace: ImageColorspace,
@@ -543,21 +665,14 @@ fn decode_exr_with_finite_validation(
     let alpha = exr_channel(layer, &["a", "alpha"]);
     let mut pixels = Vec::with_capacity(pixel_count);
     for index in 0..pixel_count {
-        let mut pixel = [
+        // The stored values, as Blender reads them: the alpha mode of the image says whether they are straight or
+        // premultiplied, so no unpremultiply happens here (`ImageData::straight_pixels` does it for direct readers).
+        pixels.push([
             exr_sample(red, index)?,
             exr_sample(green, index)?,
             exr_sample(blue, index)?,
             alpha.map_or(Ok(1.0), |channel| exr_sample(channel, index))?,
-        ];
-        let alpha_value = pixel[3];
-        if alpha_value == 0.0 {
-            pixel[..3].fill(0.0);
-        } else {
-            for component in &mut pixel[..3] {
-                *component /= alpha_value;
-            }
-        }
-        pixels.push(pixel);
+        ]);
     }
     if validate_finite {
         validate_pixels(width, height, &pixels)?;
@@ -655,6 +770,13 @@ fn image_blob_bytes<'a>(
         ));
     }
     Ok(Cow::Owned(bytes))
+}
+
+/// The encoded bytes an image is loaded from, read as the loader reads them: its packed blob, or its linked source file,
+/// with the same hash checks. Scene upgrades read an image's format through this.
+pub(crate) fn image_source_bytes(image: &Image, root: &Path) -> Result<Vec<u8>> {
+    let staged = BTreeMap::new();
+    image_blob_bytes(image.blob.as_deref(), image, root, &staged).map(Cow::into_owned)
 }
 
 fn blob_bytes<'a>(

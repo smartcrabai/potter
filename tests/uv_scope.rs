@@ -124,6 +124,7 @@ fn textured_material(doc: &mut SceneDoc, material: &str, layer: &str) {
         image: Id::new("paint").unwrap(),
         uv_layer: Some(layer.to_owned()),
         interpolation: ImageInterpolation::Linear,
+        extension: potter_core::image::ImageExtension::Repeat,
     });
 }
 
@@ -264,8 +265,8 @@ fn rename_touches_only_items_the_edited_mesh_reaches() {
         json!([{"op":"uv.layer_rename","target":{"id":"a"},"name":"Light","to":"Bake"}]),
     )
     .unwrap();
-    assert_eq!(layer_names(&renamed, "a"), ["Bake"]);
-    assert_eq!(layer_names(&renamed, "b"), ["Light"]);
+    assert_eq!(layer_names(&renamed, "a"), ["UVMap", "Bake"]);
+    assert_eq!(layer_names(&renamed, "b"), ["UVMap", "Light"]);
     assert_eq!(texture_layer(&renamed, "hair").as_deref(), Some("Bake"));
     assert_eq!(texture_layer(&renamed, "surface").as_deref(), Some("Light"));
     assert_eq!(modifier_param(&renamed, "a", "uv_layer"), json!("Bake"));
@@ -318,8 +319,8 @@ fn delete_is_refused_only_by_referrers_the_mesh_reaches() {
         json!([{"op":"uv.layer_delete","target":{"id":"a"},"name":"Light"}]),
     )
     .unwrap();
-    assert_eq!(layer_names(&deleted, "a"), Vec::<String>::new());
-    assert_eq!(layer_names(&deleted, "b"), ["Light"]);
+    assert_eq!(layer_names(&deleted, "a"), ["UVMap"]);
+    assert_eq!(layer_names(&deleted, "b"), ["UVMap", "Light"]);
     assert_eq!(texture_layer(&deleted, "surface").as_deref(), Some("Light"));
 }
 
@@ -349,7 +350,7 @@ fn rename_of_a_material_shared_with_an_unedited_node_is_rejected_atomically() {
     );
     assert_eq!(
         layer_names(&doc, "a"),
-        ["Light"],
+        ["UVMap", "Light"],
         "the source document is untouched"
     );
 
@@ -364,7 +365,7 @@ fn rename_of_a_material_shared_with_an_unedited_node_is_rejected_atomically() {
     )
     .unwrap();
     assert_eq!(texture_layer(&renamed, "shared").as_deref(), Some("Bake"));
-    assert_eq!(layer_names(&renamed, "b"), ["Light"]);
+    assert_eq!(layer_names(&renamed, "b"), ["UVMap", "Light"]);
 }
 
 #[test]
@@ -380,8 +381,8 @@ fn shared_scope_rename_reaches_every_user_of_the_mesh() {
         json!([{"op":"uv.layer_rename","target":{"id":"a"},"scope":"shared","name":"Light","to":"Bake"}]),
     )
     .unwrap();
-    assert_eq!(layer_names(&renamed, "a_copy"), ["Bake"]);
-    assert_eq!(layer_names(&renamed, "b"), ["Light"]);
+    assert_eq!(layer_names(&renamed, "a_copy"), ["UVMap", "Bake"]);
+    assert_eq!(layer_names(&renamed, "b"), ["UVMap", "Light"]);
 }
 
 #[test]
@@ -390,7 +391,6 @@ fn layer_named_active_is_not_a_modifier_selector() {
         &empty_scene(),
         json!([
             {"op":"node.create","id":"a","kind":"box","params":{"size":1}},
-            {"op":"uv.layer_create","target":{"id":"a"},"name":"UVMap"},
             {"op":"uv.layer_create","target":{"id":"a"},"name":"ACTIVE"}
         ]),
     )
@@ -477,8 +477,7 @@ fn paint_operation(uv_layer: Option<&str>) -> Value {
         "samples":[{"position":[0.0,0.0,1.0],"radius":0.2,"pressure":1.0,"strength":1.0,"time":0.0}],
         "color":[1.0,0.0,0.0,1.0],
         "blend":"mix",
-        "falloff":"linear",
-        "seed":7
+        "falloff":"linear"
     });
     if let Some(uv_layer) = uv_layer {
         operation["uv_layer"] = json!(uv_layer);

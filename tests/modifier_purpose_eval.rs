@@ -5,13 +5,17 @@
 //! `DAG_EVAL_VIEWPORT` OBJ export give 26 vertices, `DAG_EVAL_RENDER` gives 98. With
 //! `show_render=False` the render export gives the base 8 vertices; with `show_viewport=False` the
 //! viewport gives 8 and the render gives 98.
+//!
+//! The Boolean, Decimate, and union counts and volumes are Blender 5.2.2 results committed in
+//! `tests/fixtures/purpose_eval/expected.json`, written by `generate_purpose_eval_expectations.py`.
 
-use std::{collections::BTreeMap, error::Error, fmt::Debug};
+use std::{collections::HashMap, error::Error, fmt::Debug, fs, path::Path};
 
 use glam::DVec3;
 use potter_core::{
     error::{ErrorCode, PotError},
     eval::{EvaluationContext, EvaluationPurpose, Snapshot},
+    geom::Mesh,
     model::{Id, SceneDoc},
     ops,
 };
@@ -23,6 +27,11 @@ const SCENE_ID: &str = "00000000-0000-4000-8000-000000000000";
 const BASE_VERTICES: usize = 8;
 const LEVEL_ONE_VERTICES: usize = 26;
 const LEVEL_TWO_VERTICES: usize = 98;
+const EXPECTATIONS: &str = "tests/fixtures/purpose_eval/expected.json";
+// Mirror `VOLUME_RELATIVE_TOLERANCE` and `VOLUME_ABSOLUTE_TOLERANCE` in
+// `fixtures/boolean_parity/comparator.rs`; keep the values equal.
+const VOLUME_RELATIVE_TOLERANCE: f64 = 1.0e-6;
+const VOLUME_ABSOLUTE_TOLERANCE: f64 = 1.0e-9;
 
 fn ensure_eq<T: PartialEq + Debug>(actual: &T, expected: &T, what: &str) -> TestResult {
     if actual == expected {
@@ -85,6 +94,114 @@ fn cube_vertices(doc: &SceneDoc, purpose: EvaluationPurpose) -> TestResult<Vec<D
         .get(&Id::new("cube")?)
         .ok_or("evaluated cube mesh is missing")?;
     Ok(mesh.vertices.iter().map(|vertex| vertex.co).collect())
+}
+
+fn ensure(condition: bool, what: &str) -> TestResult {
+    if condition { Ok(()) } else { Err(what.into()) }
+}
+
+/// The Boolean comparator's volume rule: relative tolerance, or absolute for an expected zero.
+fn ensure_volume(actual: f64, expected: f64, what: &str) -> TestResult {
+    let matches = if expected.abs() <= VOLUME_ABSOLUTE_TOLERANCE {
+        actual.abs() <= VOLUME_ABSOLUTE_TOLERANCE
+    } else {
+        ((actual - expected) / expected).abs() <= VOLUME_RELATIVE_TOLERANCE
+    };
+    ensure(
+        matches,
+        &format!("{what}: expected {expected}, got {actual}"),
+    )
+}
+
+/// Blender's per-purpose numbers, written by the generator in `fixtures/purpose_eval`.
+fn expectations() -> TestResult<Value> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(EXPECTATIONS);
+    let bytes = fs::read(&path).map_err(|error| {
+        format!(
+            "{}: {error}; run the purpose_eval generator",
+            path.display()
+        )
+    })?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn evaluated_mesh<'a>(snapshot: &'a Snapshot, id: &Id) -> TestResult<&'a Mesh> {
+    snapshot
+        .meshes
+        .get(id)
+        .ok_or_else(|| "evaluated mesh is missing".into())
+}
+
+/// Blender-comparable counts and signed volume of one evaluated mesh.
+struct Counts {
+    vertices: usize,
+    edges: usize,
+    faces: usize,
+    volume: f64,
+}
+
+/// Counts, and signed volume by the divergence theorem over the tessellation. The volume is
+/// positive for a closed mesh with outward winding.
+fn summary(mesh: &Mesh) -> TestResult<Counts> {
+    let positions: HashMap<u32, DVec3> = mesh
+        .vertices
+        .iter()
+        .map(|vertex| (vertex.id, vertex.co))
+        .collect();
+    let corner = |id: u32| {
+        positions
+            .get(&id)
+            .copied()
+            .ok_or("tessellated vertex is missing")
+    };
+    let mut six_volume = 0.0;
+    for [a, b, c] in mesh.tessellate()? {
+        six_volume += corner(a)?.dot(corner(b)?.cross(corner(c)?));
+    }
+    Ok(Counts {
+        vertices: mesh.vertices.len(),
+        edges: mesh.edges.len(),
+        faces: mesh.faces.len(),
+        volume: six_volume / 6.0,
+    })
+}
+
+/// Reads one `{vertices, edges, faces, volume}` entry from the Blender expectations.
+fn expected_counts(entry: &Value) -> TestResult<Counts> {
+    let count = |key: &str| -> TestResult<usize> {
+        let raw = entry[key]
+            .as_u64()
+            .ok_or_else(|| format!("expected `{key}` is not a count"))?;
+        Ok(usize::try_from(raw)?)
+    };
+    Ok(Counts {
+        vertices: count("vertices")?,
+        edges: count("edges")?,
+        faces: count("faces")?,
+        volume: entry["volume"]
+            .as_f64()
+            .ok_or("expected `volume` is not a number")?,
+    })
+}
+
+/// Counts must match exactly; the volume uses the Boolean comparator's tolerance.
+fn ensure_counts(actual: &Counts, expected: &Counts, what: &str) -> TestResult {
+    ensure_eq(
+        &actual.vertices,
+        &expected.vertices,
+        &format!("{what} vertex count"),
+    )?;
+    ensure_eq(
+        &actual.edges,
+        &expected.edges,
+        &format!("{what} edge count"),
+    )?;
+    ensure_eq(
+        &actual.faces,
+        &expected.faces,
+        &format!("{what} face count"),
+    )?;
+    ensure_volume(actual.volume, expected.volume, &format!("{what} volume"))
 }
 
 #[test]
@@ -343,9 +460,8 @@ fn hidden_physics_sources_respect_purpose_and_legacy_properties() -> TestResult 
 }
 
 #[test]
-fn failing_node_and_dependents_are_reported_for_both_purposes() -> TestResult {
-    // `host` gets Boolean followed by Decimate, which is refused as an unsupported topology
-    // combination. `follower` uses `host` as its Boolean operand, so it depends on the failure.
+fn boolean_results_feed_dependent_modifiers_for_both_purposes() -> TestResult {
+    // `host` runs Boolean then Decimate; `follower` consumes its evaluated output.
     let doc = apply(
         &SceneDoc::new(SCENE_ID.to_owned()),
         &[
@@ -378,53 +494,56 @@ fn failing_node_and_dependents_are_reported_for_both_purposes() -> TestResult {
     let host = Id::new("host")?;
     let follower = Id::new("follower")?;
     let cutter = Id::new("cutter")?;
+    let expected = expectations()?;
 
-    for purpose in [EvaluationPurpose::Preview, EvaluationPurpose::Render] {
-        let (snapshot, node_errors): (Snapshot, BTreeMap<Id, PotError>) =
+    // The same host without its Decimate: the Boolean's own output, as Blender computes it.
+    let mut boolean_only = doc.clone();
+    let host_node = boolean_only
+        .nodes
+        .get_mut(&host)
+        .ok_or("host node is missing")?;
+    for modifier in &mut host_node.modifiers {
+        if modifier.modifier_type == "decimate" {
+            modifier.enabled = false;
+        }
+    }
+
+    for (purpose, key) in [
+        (EvaluationPurpose::Preview, "preview"),
+        (EvaluationPurpose::Render, "render"),
+    ] {
+        let blender = &expected[key];
+        let (snapshot, node_errors) =
             Snapshot::evaluate_available_with_cache(&doc, &purpose_context(purpose), None, None)?;
-        ensure_eq(&node_errors.len(), &2, "failing and dependent node count")?;
+        ensure_eq(&node_errors.is_empty(), &true, "no node evaluation errors")?;
+        for (id, name) in [
+            (&host, "host"),
+            (&follower, "follower"),
+            (&cutter, "cutter"),
+        ] {
+            ensure_eq(&snapshot.meshes.contains_key(id), &true, name)?;
+        }
 
-        let host_error = node_errors.get(&host).ok_or("host error is missing")?;
-        ensure_eq(
-            &host_error.code,
-            &ErrorCode::UnsupportedFeature,
-            "host error code",
-        )?;
-        ensure_eq(
-            &host_error.details["feature_id"],
-            &json!("modifier.boolean.downstream_topology"),
-            "host feature id",
-        )?;
-
-        let follower_error = node_errors
-            .get(&follower)
-            .ok_or("follower error is missing")?;
-        ensure_eq(
-            &follower_error.code,
-            &ErrorCode::UnsupportedFeature,
-            "follower error code",
-        )?;
-        ensure_eq(
-            &follower_error.details["dependency_node_id"],
-            &json!("host"),
-            "follower dependency",
-        )?;
-
-        ensure_eq(
-            &snapshot.meshes.contains_key(&host),
-            &false,
-            "failed host mesh is withheld",
-        )?;
-        ensure_eq(
-            &snapshot.meshes.contains_key(&follower),
-            &false,
-            "dependent mesh is withheld",
-        )?;
-        ensure_eq(
-            &snapshot.meshes.contains_key(&cutter),
-            &true,
-            "independent mesh is kept",
-        )?;
+        let boolean_snapshot = Snapshot::evaluate(&boolean_only, &purpose_context(purpose))?;
+        let checks = [
+            ("cutter", summary(evaluated_mesh(&snapshot, &cutter)?)?),
+            (
+                "boolean_host",
+                summary(evaluated_mesh(&boolean_snapshot, &host)?)?,
+            ),
+            (
+                "decimated_host",
+                summary(evaluated_mesh(&snapshot, &host)?)?,
+            ),
+            ("follower", summary(evaluated_mesh(&snapshot, &follower)?)?),
+        ];
+        for (name, actual) in &checks {
+            ensure_counts(
+                actual,
+                &expected_counts(&blender[*name])?,
+                &format!("{key} {name}"),
+            )?;
+        }
     }
     Ok(())
 }

@@ -47,6 +47,7 @@ pub(super) fn apply(
         "mesh.split",
         "mesh.knife",
         "mesh.remesh",
+        "mesh.loop_cut",
         "mesh.symmetrize",
     ]
     .contains(&name)
@@ -253,10 +254,12 @@ pub(super) fn apply(
                 )
             })?;
             let had_descriptor = data.descriptor.is_some();
-            let before = mesh.clone();
-            let mapping = edit::apply(mesh, name, &Value::Object(args.clone()))?;
-            let changed = *mesh != before;
+            let mut edited = mesh.clone();
+            let mapping =
+                edit::apply_with_source(&mut edited, mesh, name, &Value::Object(args.clone()))?;
+            let changed = edited != *mesh;
             if changed {
+                *mesh = edited;
                 data.descriptor = None;
             }
             (changed, had_descriptor, mapping)

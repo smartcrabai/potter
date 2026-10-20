@@ -458,11 +458,15 @@ fn mesh_cache_mdd_interpolates_resource_frames() -> Result<(), Box<dyn Error>> {
 fn vertex_weight_edit_blends_with_image_mask_channel() -> Result<(), Box<dyn Error>> {
     let source = weighted_line()?;
     let image = ImageData {
+        colour: potter_core::image::ColourCache::default(),
+        storage: potter_core::image::ImageStorage::default(),
         width: 1,
         height: 1,
         pixels: vec![[0.0, 0.0, 0.0, 1.0]],
         tiles: BTreeMap::new(),
         interpolation: ImageInterpolation::Closest,
+        srgb: false,
+        udim: false,
     };
     let edit = modifier(
         "vertex_weight_edit",
@@ -2461,6 +2465,8 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         1.0e-4,
     )?;
     let image = ImageData {
+        colour: potter_core::image::ColourCache::default(),
+        storage: potter_core::image::ImageStorage::default(),
         width: 2,
         height: 2,
         pixels: vec![
@@ -2471,6 +2477,8 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         ],
         tiles: BTreeMap::new(),
         interpolation: ImageInterpolation::Closest,
+        srgb: false,
+        udim: false,
     };
     let subject_world = DMat4::from_scale_rotation_translation(
         DVec3::new(0.8, 0.7, 1.0),
@@ -3192,6 +3200,8 @@ fn vertex_weight_mix_uv_mask_samples_blender_v_up_rows() -> Result<(), Box<dyn E
         }),
     );
     let image = ImageData {
+        colour: potter_core::image::ColourCache::default(),
+        storage: potter_core::image::ImageStorage::default(),
         width: 1,
         height: 4,
         pixels: vec![
@@ -3202,6 +3212,8 @@ fn vertex_weight_mix_uv_mask_samples_blender_v_up_rows() -> Result<(), Box<dyn E
         ],
         tiles: BTreeMap::new(),
         interpolation: ImageInterpolation::Closest,
+        srgb: false,
+        udim: false,
     };
     let mix = modifier(
         "vertex_weight_mix",

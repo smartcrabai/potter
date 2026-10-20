@@ -1,0 +1,54 @@
+{
+  "preview": {
+    "cutter": {
+      "vertices": 8,
+      "edges": 12,
+      "faces": 6,
+      "volume": 1.0
+    },
+    "boolean_host": {
+      "vertices": 16,
+      "edges": 24,
+      "faces": 12,
+      "volume": 7.0
+    },
+    "decimated_host": {
+      "vertices": 11,
+      "edges": 15,
+      "faces": 7,
+      "volume": 6.16666667163372
+    },
+    "follower": {
+      "vertices": 23,
+      "edges": 35,
+      "faces": 15,
+      "volume": 6.723958339852591
+    }
+  },
+  "render": {
+    "cutter": {
+      "vertices": 8,
+      "edges": 12,
+      "faces": 6,
+      "volume": 1.0
+    },
+    "boolean_host": {
+      "vertices": 16,
+      "edges": 24,
+      "faces": 12,
+      "volume": 7.0
+    },
+    "decimated_host": {
+      "vertices": 11,
+      "edges": 15,
+      "faces": 7,
+      "volume": 6.16666667163372
+    },
+    "follower": {
+      "vertices": 23,
+      "edges": 35,
+      "faces": 15,
+      "volume": 6.723958339852591
+    }
+  }
+}

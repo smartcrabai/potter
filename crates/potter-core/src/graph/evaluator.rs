@@ -1089,7 +1089,7 @@ impl Evaluator<'_> {
             EvalValue::Scalar(json!(true)),
         )?);
         let triangles = surface
-            .triangulate()
+            .tessellate()
             .map_err(|error| mesh_evaluation_error(&error))?;
         let positions: HashMap<_, _> = surface
             .vertices

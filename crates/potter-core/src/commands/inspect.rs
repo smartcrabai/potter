@@ -181,6 +181,7 @@ fn evaluation_context(
         scene_id,
         view_layer,
         frame,
+        adaptive_render: None,
         purpose: EvaluationPurpose::Preview,
     })
 }
@@ -577,6 +578,7 @@ fn material_item(doc: &SceneDoc, id: &Id, material: &Material) -> Value {
         "metallic":material.metallic,
         "roughness":material.roughness,
         "double_sided":material.double_sided,
+        "use_transparent_shadow":material.use_transparent_shadow,
         "library":linkage["library"],
         "library_name":linkage["library_name"],
         "editable":linkage["editable"],

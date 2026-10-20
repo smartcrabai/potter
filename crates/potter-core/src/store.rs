@@ -129,7 +129,7 @@ impl Project {
     /// digest and compatibility hash are returned only for schema version 1.
     fn read_snapshot(path: &Path) -> Result<SnapshotRead> {
         let bytes = fs::read(path.join("scene.json")).map_err(|error| PotError::io(&error))?;
-        let parsed = crate::model::migrate::parse_scene_with_original_hash(&bytes)?;
+        let parsed = crate::model::migrate::parse_scene_with_original_hash(&bytes, path)?;
         parsed.doc.validate()?;
         let digest = hash::sha256(&bytes);
         let mut warnings = parsed.warnings;
@@ -310,7 +310,10 @@ impl Project {
             });
             let image_uses_blob = candidate.images.values().any(|image| {
                 image.blob.as_deref() == Some(digest.as_str())
-                    || image.tiles.iter().any(|tile| tile.blob == *digest)
+                    || image
+                        .tiles
+                        .iter()
+                        .any(|tile| tile.blob.as_deref() == Some(digest.as_str()))
             });
             if !has_resource_alias || image_uses_blob {
                 let destination = self
@@ -655,7 +658,7 @@ fn read_history_blob(root: &Path, digest: &str) -> Result<(HistoryRecord, Vec<Va
             "history record does not match its content hash",
         ));
     }
-    let (record, mut warnings) = crate::model::migrate::parse_history_record(&bytes)?;
+    let (record, mut warnings) = crate::model::migrate::parse_history_record(&bytes, root)?;
     tag_originals(
         &mut warnings,
         &content_path("history", "blob.json", digest),
@@ -781,6 +784,7 @@ mod tests {
             source_path: None,
             source_hash: None,
             alpha_mode: ImageAlphaMode::Straight,
+            tiled: false,
         }
     }
 
@@ -875,7 +879,8 @@ mod tests {
                     number: 1002,
                     width: 1,
                     height: 1,
-                    blob: digest.clone(),
+                    blob: Some(digest.clone()),
+                    label: String::new(),
                 }],
             )),
         );
@@ -1054,7 +1059,7 @@ mod tests {
 
         let (loaded, warnings) = super::read_history_blob(directory.path(), &digest).unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
-        assert_eq!(loaded.snapshot.schema_version, 3);
+        assert_eq!(loaded.snapshot.schema_version, 7);
         assert_eq!(fs::read(&path).unwrap(), bytes);
 
         let mut corrupted = bytes;

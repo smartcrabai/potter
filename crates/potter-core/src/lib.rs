@@ -7,6 +7,8 @@
     )
 )]
 
+pub(crate) const BUILD_IDENTITY: &str = env!("POTTER_BUILD_IDENTITY");
+
 pub mod catalog;
 pub mod cli;
 pub mod color;

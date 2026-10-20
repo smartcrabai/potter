@@ -17,7 +17,6 @@ use glam::DVec3;
 use serde_json::{Value, json};
 
 use crate::{
-    blender_rng::BlenderRng,
     error::{ErrorCode, PotError, Result},
     eval::{EvaluationPurpose, ModifierEvaluationContext},
     geom::{
@@ -598,6 +597,32 @@ impl OceanBakeSequence {
             });
         }
         Ok(images)
+    }
+}
+
+/// Blender's `BLI_rand` 48-bit LCG, seeded directly (`BLI_rng_seed`).
+struct BlenderRng(u64);
+
+impl BlenderRng {
+    fn seed(seed: u32) -> Self {
+        Self((u64::from(seed) << 16) | 0x330e)
+    }
+
+    fn get_float(&mut self) -> f32 {
+        self.0 =
+            (0x0005_deec_e66d_u64.wrapping_mul(self.0).wrapping_add(0xb)) & 0x0000_ffff_ffff_ffff;
+        (self.0 >> 17) as f32 / 2_147_483_648.0
+    }
+
+    fn gaussian(&mut self) -> f32 {
+        loop {
+            let x = 1.0 - 2.0 * self.get_float();
+            let y = 1.0 - 2.0 * self.get_float();
+            let length_squared = x * x + y * y;
+            if length_squared > 0.0 && length_squared < 1.0 {
+                return x * (-2.0 * length_squared.ln() / length_squared).sqrt();
+            }
+        }
     }
 }
 

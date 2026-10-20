@@ -3,6 +3,7 @@
     reason = "asserting exact identity of the Raw display transform inside the display range"
 )]
 
+use potter_core::color::curve::{CurveMapping, CurvePoint, HandleType};
 use potter_core::color::{ColorManagement, ViewTransform, linear_to_srgb};
 use proptest::prelude::*;
 
@@ -62,9 +63,18 @@ proptest! {
         delta in 0.0_f32..0.1
     ) {
         let upper = (lower + delta).min(1.0);
+        let mut combined = CurveMapping::default();
+        combined.curves[3].points = [
+            ([0.0, 0.0], HandleType::Auto),
+            ([0.5, 0.25], HandleType::Auto),
+            ([1.0, 1.0], HandleType::Auto),
+        ]
+        .into_iter()
+        .map(|(location, handle)| CurvePoint { location, handle })
+        .collect();
         let settings = ColorManagement {
             view_transform: ViewTransform::Raw,
-            curve: vec![[0.0, 0.0], [0.5, 0.25], [1.0, 1.0]],
+            curve: Some(combined),
             ..ColorManagement::default()
         };
         let lower = encode(&settings, [lower; 3]);
