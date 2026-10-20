@@ -21,16 +21,18 @@ Each object is measured under two purposes:
   `render_pre` handler still sees the viewport depsgraph. The exporter is the only Python path that
   evaluates in render mode.
 
-OBJ writes six decimals, so the export is scaled by 1000 and the parser divides it back. That keeps
-1e-9 scene units of resolution. The viewport export's counts are checked against `to_mesh()`, so a
-parser error stops the run instead of reaching the expectations.
+Volume is the divergence-theorem sum over Blender's loop triangles (`Mesh.calc_loop_triangles`),
+Blender's own triangulation. The OBJ export carries no triangulation, and a decimated polygon can be
+non-planar, where a fan of its corners depends on the diagonal chosen. So the render pass takes its
+volume from the viewport loop triangles, after checking that the render export reproduces the viewport
+mesh (same vertices, polygons and edges, within 1e-6 scene units). If the render evaluation differs,
+the generator stops rather than recording a volume for a different mesh.
 
-Volume is the divergence-theorem sum over each polygon's fan from its first corner. That sum is the
-same for every triangulation only when the polygon is planar, and OBJ carries no triangulation, so
-the generator refuses non-planar or zero-area polygons rather than choosing a triangulation.
+OBJ writes six decimals, so the export is scaled by 1000 and the parser divides it back. The viewport
+export's counts are checked against `to_mesh()`, so a parser error stops the run.
 
-Each entry records `vertices`, `edges` (unique undirected edges of the polygons plus loose edges),
-`faces`, and `volume` (positive for outward winding).
+Each entry records `vertices`, `edges` (`Mesh.edges`), `faces` (polygons), and `volume` (positive for
+outward winding).
 """
 
 import json
@@ -45,8 +47,9 @@ VIEWPORT = "DAG_EVAL_VIEWPORT"
 RENDER = "DAG_EVAL_RENDER"
 # OBJ writes coordinates with six decimals; this factor keeps 1e-9 scene units of resolution.
 OBJ_SCALE = 1000.0
-# Scene coordinates are f32; this admits f32 and OBJ rounding and nothing more.
-PLANARITY_TOLERANCE = 1.0e-6
+# Vertex positions must agree within this many scene units between the render export and the
+# viewport mesh. Scene coordinates are f32; the export round trip is well inside this bound.
+GEOMETRY_TOLERANCE = 1.0e-6
 PURPOSES = ("preview", "render")
 
 
@@ -66,50 +69,35 @@ def cross(a, b):
     )
 
 
-def assert_planar(points, polygon):
-    # Newell's normal is robust for n-gons; a zero normal means the polygon has no area.
-    normal = [0.0, 0.0, 0.0]
-    for index, point in enumerate(points):
-        following = points[(index + 1) % len(points)]
-        normal[0] += (point[1] - following[1]) * (point[2] + following[2])
-        normal[1] += (point[2] - following[2]) * (point[0] + following[0])
-        normal[2] += (point[0] - following[0]) * (point[1] + following[1])
-    length = math.sqrt(dot(normal, normal))
-    if length == 0.0:
-        raise RuntimeError(f"polygon {polygon} has zero area; its volume is not defined here")
-    unit = [component / length for component in normal]
-    centroid = [math.fsum(point[axis] for point in points) / len(points) for axis in range(3)]
-    deviation = max(abs(dot(sub(point, centroid), unit)) for point in points)
-    if deviation > PLANARITY_TOLERANCE:
-        raise RuntimeError(f"polygon {polygon} is not planar (deviation {deviation})")
+def volume(vertices, triangles):
+    terms = [dot(vertices[a], cross(vertices[b], vertices[c])) for a, b, c in triangles]
+    return math.fsum(terms) / 6.0
 
 
-def measure_polygons(vertices, polygons, edge_count):
-    terms = []
-    for polygon in polygons:
-        points = [vertices[index] for index in polygon]
-        assert_planar(points, polygon)
-        for k in range(1, len(points) - 1):
-            terms.append(dot(points[0], cross(points[k], points[k + 1])))
+def summarize(geometry):
     return {
-        "vertices": len(vertices),
-        "edges": edge_count,
-        "faces": len(polygons),
-        "volume": math.fsum(terms) / 6.0,
+        "vertices": len(geometry["vertices"]),
+        "edges": geometry["edges"],
+        "faces": len(geometry["polygons"]),
+        "volume": volume(geometry["vertices"], geometry["triangles"]),
     }
 
 
-def measure_viewport(obj):
+def evaluated_geometry(obj):
     bpy.context.view_layer.update()
     evaluated = obj.evaluated_get(bpy.context.evaluated_depsgraph_get())
     mesh = evaluated.to_mesh()
     try:
-        vertices = [tuple(float(c) for c in vertex.co) for vertex in mesh.vertices]
-        polygons = [
-            [mesh.loops[index].vertex_index for index in polygon.loop_indices]
-            for polygon in mesh.polygons
-        ]
-        return measure_polygons(vertices, polygons, len(mesh.edges))
+        mesh.calc_loop_triangles()
+        return {
+            "vertices": [tuple(float(c) for c in vertex.co) for vertex in mesh.vertices],
+            "polygons": [
+                [mesh.loops[index].vertex_index for index in polygon.loop_indices]
+                for polygon in mesh.polygons
+            ],
+            "triangles": [tuple(triangle.vertices) for triangle in mesh.loop_triangles],
+            "edges": len(mesh.edges),
+        }
     finally:
         evaluated.to_mesh_clear()
 
@@ -151,24 +139,72 @@ def read_obj(path):
                 indices = [int(field) - 1 for field in fields[1:]]
                 for a, b in zip(indices, indices[1:]):
                     edges.add((min(a, b), max(a, b)))
-    return measure_polygons(vertices, polygons, len(edges))
+    return {"vertices": vertices, "polygons": polygons, "edges": len(edges)}
+
+
+def ring_points(geometry, ring):
+    return [geometry["vertices"][index] for index in ring]
+
+
+def same_point(p, q):
+    return max(abs(a - b) for a, b in zip(p, q)) <= GEOMETRY_TOLERANCE
+
+
+def same_ring(p, q):
+    # A ring matches another under a cyclic shift and reversal, with each vertex within tolerance.
+    if len(p) != len(q):
+        return False
+    count = len(p)
+    for candidate in (q, q[::-1]):
+        for shift in range(count):
+            if all(same_point(p[i], candidate[(i + shift) % count]) for i in range(count)):
+                return True
+    return False
+
+
+def same_geometry(exported, viewport):
+    if len(exported["vertices"]) != len(viewport["vertices"]):
+        return False
+    if len(exported["polygons"]) != len(viewport["polygons"]):
+        return False
+    if exported["edges"] != viewport["edges"]:
+        return False
+    unmatched = [ring_points(viewport, ring) for ring in viewport["polygons"]]
+    for ring in exported["polygons"]:
+        points = ring_points(exported, ring)
+        for index, candidate in enumerate(unmatched):
+            if same_ring(points, candidate):
+                del unmatched[index]
+                break
+        else:
+            return False
+    return not unmatched
 
 
 def check_export(obj, directory):
     # The OBJ parser must reproduce the depsgraph counts; a mismatch means the parser is wrong.
-    expected = measure_viewport(obj)
+    viewport = evaluated_geometry(obj)
     exported = read_obj(export_obj(obj, VIEWPORT, directory))
-    for key in ("vertices", "edges", "faces"):
-        if expected[key] != exported[key]:
-            raise RuntimeError(
-                f"{obj.name} {key}: depsgraph {expected[key]}, viewport export {exported[key]}"
-            )
+    checks = (
+        ("vertices", len(viewport["vertices"]), len(exported["vertices"])),
+        ("faces", len(viewport["polygons"]), len(exported["polygons"])),
+        ("edges", viewport["edges"], exported["edges"]),
+    )
+    for key, depsgraph, export in checks:
+        if depsgraph != export:
+            raise RuntimeError(f"{obj.name} {key}: depsgraph {depsgraph}, viewport export {export}")
 
 
 def measure(purpose, obj, directory):
-    if purpose == "preview":
-        return measure_viewport(obj)
-    return read_obj(export_obj(obj, RENDER, directory))
+    viewport = evaluated_geometry(obj)
+    if purpose == "render":
+        exported = read_obj(export_obj(obj, RENDER, directory))
+        if not same_geometry(exported, viewport):
+            raise RuntimeError(
+                f"{obj.name}: render evaluation differs from the viewport mesh; "
+                "the render volume would describe a different mesh"
+            )
+    return summarize(viewport)
 
 
 def set_visibility(modifier, enabled):
