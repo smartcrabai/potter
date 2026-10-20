@@ -249,17 +249,30 @@ fn evaluate_case(
         .ok_or_else(|| format!("{name}: evaluated ocean mesh is missing").into())
 }
 
+/// The parameters a corpus case was evaluated with. A bake case's `output` is Blender's evaluation at
+/// `output_frame`, so its `time` is the animated time at that frame when Blender recorded one.
+fn corpus_params(case: &Value, name: &str) -> Result<Value, Box<dyn Error>> {
+    let mut params = case["params"].clone();
+    if name.starts_with('B') {
+        let frame = case["output_frame"]
+            .as_i64()
+            .ok_or_else(|| format!("{name}: output_frame is missing"))?;
+        if let Some(time) =
+            case["observations"]["animated_time"]["modifier_time_by_frame"].get(frame.to_string())
+        {
+            params["time"] = time.clone();
+        }
+    }
+    Ok(params)
+}
+
 #[test]
-fn ocean_live_blender_corpus_matches_geometry_uvs_and_corner_colors() -> Result<(), Box<dyn Error>>
-{
+fn ocean_blender_corpus_matches_geometry_uvs_and_corner_colors() -> Result<(), Box<dyn Error>> {
     let corpus: Value = serde_json::from_str(CORPUS)?;
     let cases = corpus["cases"]
         .as_array()
         .ok_or("Ocean corpus cases are missing")?;
-    for case in cases
-        .iter()
-        .filter(|case| !case["name"].as_str().unwrap_or_default().starts_with('B'))
-    {
+    for case in cases {
         let name = case["name"]
             .as_str()
             .ok_or("Ocean corpus case has no name")?;
@@ -278,7 +291,7 @@ fn ocean_live_blender_corpus_matches_geometry_uvs_and_corner_colors() -> Result<
             enabled: true,
             show_viewport: true,
             show_render: true,
-            params: serde_json::from_value::<Map<String, Value>>(case["params"].clone())?,
+            params: serde_json::from_value::<Map<String, Value>>(corpus_params(case, name)?)?,
             binding_data: None,
             baked_ocean_cache: None,
             runtime: Default::default(),
