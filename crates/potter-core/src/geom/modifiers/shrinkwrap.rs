@@ -144,6 +144,8 @@ enum Source {
     },
 }
 
+/// `use_apply_on_spline` (`eModifierMode_ApplyOnSpline`) only chooses curve control points over the
+/// filled curve, so it has no effect on a mesh Shrinkwrap; Blender ignores it there too.
 pub(super) fn evaluate(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     let method = string_param(modifier, "wrap_method")?.to_ascii_uppercase();
     let Some(target) = modifier.runtime.shrinkwrap_target_mesh.as_ref() else {
@@ -1761,6 +1763,37 @@ mod tests {
             "use_positive_direction":false,"use_negative_direction":true,"use_invert_cull":true
         }));
         assert!(inverted.vertices[0].co.z.abs() < F32_TOLERANCE);
+    }
+
+    #[test]
+    fn nearest_vertex_projects_uv_sphere_vertices_to_radius() {
+        let source = Mesh::uv_sphere(UvSphereParams {
+            segments: 8,
+            ring_count: 4,
+            radius: 2.0,
+        })
+        .test_value();
+        // The 32 x 16 unit sphere is the `uv_sphere_default` oracle, whose largest radius error in
+        // Blender's f32 output is 1.2177e-6 (`primitive_uv_oracle.json`); the bound below covers it.
+        let target = Mesh::uv_sphere(UvSphereParams {
+            segments: 32,
+            ring_count: 16,
+            radius: 1.0,
+        })
+        .test_value();
+        let result = evaluate(
+            &source,
+            &modifier(json!({"wrap_method":"NEAREST_VERTEX"}), target),
+        )
+        .test_value();
+        // Blender stores UV sphere vertices as f32: its own radius-1 sphere output is off by up to
+        // 1.22e-6 (`tests/fixtures/primitive_uvs/primitive_uv_oracle.json`, `uv_sphere_default`).
+        assert!(
+            result
+                .vertices
+                .iter()
+                .all(|vertex| (vertex.co.length() - 1.0).abs() < 2.0e-6)
+        );
     }
 
     #[test]
