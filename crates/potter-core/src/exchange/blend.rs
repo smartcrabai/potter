@@ -3751,8 +3751,16 @@ fn build_imported_graph(
             .and_then(Value::as_str)
             .unwrap_or("XYZ")
             .to_owned();
-        let rotation = blender_rotation(item, &rotation_mode);
+        let rotation = blender_rotation(item, &rotation_mode)?;
         let mut properties = object_properties(item);
+        if let Some(metadata) = properties
+            .get_mut("blender_object_metadata")
+            .and_then(Value::as_object_mut)
+        {
+            // The imported Potter rotation: an export whose rotation is still this value reuses the
+            // Blender source values exactly, instead of recomputing them from the quaternion.
+            metadata.insert("source_rotation".to_owned(), json!(rotation));
+        }
         if let Some(instance_name) = instance_collection_name {
             let collection_id = collection_ids.get(instance_name).ok_or_else(|| {
                 invalid_intermediate("collection instance references an unknown collection")
@@ -8262,31 +8270,39 @@ fn parse_nla_tracks(
         .collect()
 }
 
-fn blender_rotation(item: &Value, mode: &str) -> [f64; 4] {
+/// The numbers of an array field with `count` entries, or `None` when the key is absent or null.
+/// A present field that is not `count` numbers is an import error.
+fn optional_numbers(item: &Value, key: &str, count: usize) -> Result<Option<Vec<f64>>> {
+    let Some(value) = item.get(key).filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    value
+        .as_array()
+        .filter(|values| values.len() == count)
+        .and_then(|values| {
+            values
+                .iter()
+                .map(Value::as_f64)
+                .collect::<Option<Vec<f64>>>()
+        })
+        .map(Some)
+        .ok_or_else(|| invalid_intermediate(&format!("{key} must be {count} numbers")))
+}
+
+fn blender_rotation(item: &Value, mode: &str) -> Result<[f64; 4]> {
     let quat = if mode == "QUATERNION" {
-        let raw = item.get("rotation_quaternion").and_then(Value::as_array);
-        raw.and_then(|values| {
-            Some(DQuat::from_xyzw(
-                values.first()?.as_f64()?,
-                values.get(1)?.as_f64()?,
-                values.get(2)?.as_f64()?,
-                values.get(3)?.as_f64()?,
-            ))
+        optional_numbers(item, "rotation_quaternion", 4)?.map_or(DQuat::IDENTITY, |values| {
+            DQuat::from_xyzw(values[0], values[1], values[2], values[3])
         })
     } else if mode == "AXIS_ANGLE" {
-        let raw = item.get("rotation_axis_angle").and_then(Value::as_array);
-        raw.and_then(|values| {
-            let axis = glam::DVec3::new(
-                values[1].as_f64()?,
-                values[2].as_f64()?,
-                values[3].as_f64()?,
-            );
+        optional_numbers(item, "rotation_axis_angle", 4)?.map_or(DQuat::IDENTITY, |values| {
+            let axis = glam::DVec3::new(values[1], values[2], values[3]);
             // Blender normalizes the axis; a zero axis gives the identity rotation.
-            Some(if axis == glam::DVec3::ZERO {
+            if axis == glam::DVec3::ZERO {
                 DQuat::IDENTITY
             } else {
-                DQuat::from_axis_angle(axis.normalize(), values[0].as_f64()?)
-            })
+                DQuat::from_axis_angle(axis.normalize(), values[0])
+            }
         })
     } else {
         let euler = vec3_field(item, "rotation_euler", [0.0; 3]);
@@ -8299,11 +8315,9 @@ fn blender_rotation(item: &Value, mode: &str) -> [f64; 4] {
             "ZYX" => (EulerRot::ZYXEx, [euler[2], euler[1], euler[0]]),
             _ => (EulerRot::XYZEx, euler),
         };
-        Some(DQuat::from_euler(order, angles[0], angles[1], angles[2]))
+        DQuat::from_euler(order, angles[0], angles[1], angles[2])
     };
-    quat.map_or([0.0, 0.0, 0.0, 1.0], |rotation| {
-        [rotation.x, rotation.y, rotation.z, rotation.w]
-    })
+    Ok([quat.x, quat.y, quat.z, quat.w])
 }
 
 fn root_matrix_override(item: &Value) -> Option<(Transform, [f64; 16])> {
@@ -10147,13 +10161,13 @@ mod tests {
         // with asymmetric components: swapping any two positions would change the result.
         let first = [0.6, 0.0, 0.8, 0.0];
         assert_eq!(
-            blender_rotation(&json!({"rotation_quaternion": first}), "QUATERNION"),
+            blender_rotation(&json!({"rotation_quaternion": first}), "QUATERNION")?,
             first,
         );
         let norm = 0.95_f64.sqrt();
         let second = [0.1 / norm, 0.2 / norm, 0.3 / norm, 0.9 / norm];
         assert_eq!(
-            blender_rotation(&json!({"rotation_quaternion": second}), "QUATERNION"),
+            blender_rotation(&json!({"rotation_quaternion": second}), "QUATERNION")?,
             second,
         );
         for (blender_index, potter_index) in [(0_i64, 3_u32), (1, 0), (2, 1), (3, 2)] {
@@ -10168,13 +10182,13 @@ mod tests {
     }
 
     #[test]
-    fn blender_axis_angle_axis_is_normalized() {
+    fn blender_axis_angle_axis_is_normalized() -> Result<()> {
         // Blender normalizes `rotation_axis_angle`'s axis, so a Z axis of length 2 is a plain turn.
         let angle = std::f64::consts::FRAC_PI_2;
         let rotation = blender_rotation(
             &json!({"rotation_axis_angle": [angle, 0.0, 0.0, 2.0]}),
             "AXIS_ANGLE",
-        );
+        )?;
         let expected = DQuat::from_axis_angle(glam::DVec3::Z, angle).to_array();
         for (actual, expected) in rotation.into_iter().zip(expected) {
             assert!(
@@ -10182,7 +10196,15 @@ mod tests {
                 "expected {expected}, got {actual}"
             );
         }
+        Ok(())
     }
+
+    #[test]
+    fn short_axis_angle_array_is_an_import_error() {
+        let short = json!({"rotation_axis_angle": [1.0, 0.0, 1.0]});
+        assert!(blender_rotation(&short, "AXIS_ANGLE").is_err());
+    }
+
     #[test]
     fn every_evaluated_modifier_maps_to_a_blender_modifier_type() {
         for (blender, potter) in [
