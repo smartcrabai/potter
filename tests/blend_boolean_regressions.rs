@@ -277,7 +277,7 @@ fn check_regression_cases(cases: &[&str]) -> TestResult {
         .iter()
         .map(|case| find_node(&document, case))
         .collect::<TestResult<Vec<Id>>>()?;
-    let evaluated = evaluate_booleans_together(&document, &hosts)?;
+    let evaluated = evaluate_booleans_together(&document, &hosts);
     for (case, (node_id, result)) in cases.iter().zip(hosts.into_iter().zip(evaluated)) {
         let Some(expected_json) = expectations.get(*case) else {
             continue;

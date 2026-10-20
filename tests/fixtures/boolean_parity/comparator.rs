@@ -509,31 +509,60 @@ pub fn mismatches(actual: &Canonical, expected: &Canonical) -> Vec<String> {
 /// one snapshot, and returns each host's canonical result in the order given. Every Potter snapshot
 /// hashes the whole document, so one snapshot for many hosts costs far less than one per host.
 /// Regression hosts of one scene evaluate independently (`generate_regression_expectations.py`), so
-/// each result equals the one from evaluating that host alone; a single-host slice is exactly that
-/// isolated evaluation.
+/// each result equals the one from evaluating that host alone. If the shared snapshot fails, its
+/// error names no host, so each host is then evaluated alone and every failing case is reported
+/// with its own id. A single-host slice is exactly the isolated evaluation.
 pub fn evaluate_booleans_together(
     document: &SceneDoc,
     node_ids: &[Id],
-) -> TestResult<Vec<TestResult<Canonical>>> {
+) -> Vec<TestResult<Canonical>> {
+    let results = match snapshot_booleans(document, node_ids) {
+        Ok(results) => results,
+        Err(_) => node_ids
+            .iter()
+            .map(|node_id| {
+                snapshot_booleans(document, std::slice::from_ref(node_id))
+                    .map_or_else(Err, |mut results| results.remove(0))
+            })
+            .collect(),
+    };
+    results
+        .into_iter()
+        .map(|result| result.map_err(Into::into))
+        .collect()
+}
+
+/// One snapshot with the Boolean of each host in `node_ids` enabled. Errors name the host ids.
+fn snapshot_booleans(
+    document: &SceneDoc,
+    node_ids: &[Id],
+) -> Result<Vec<Result<Canonical, String>>, String> {
+    let names = node_ids
+        .iter()
+        .map(Id::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
     let mut all = document.clone();
     for (id, node) in &mut all.nodes {
         for modifier in &mut node.modifiers {
             modifier.enabled = node_ids.contains(id) && modifier.modifier_type == "boolean";
         }
     }
-    let snapshot = Snapshot::evaluate(&all, &EvaluationContext::default())?;
+    let snapshot = Snapshot::evaluate(&all, &EvaluationContext::default())
+        .map_err(|error| format!("{names}: {error}"))?;
     Ok(node_ids
         .iter()
-        .map(|node_id| -> TestResult<Canonical> {
+        .map(|node_id| {
             let mesh = snapshot
                 .meshes
                 .get(node_id)
-                .ok_or_else(|| format!("Potter did not evaluate `{}`", node_id.as_str()))?;
+                .ok_or_else(|| format!("{}: Potter did not evaluate it", node_id.as_str()))?;
             let node = snapshot
                 .nodes
                 .get(node_id)
-                .ok_or_else(|| format!("Potter has no evaluated node `{}`", node_id.as_str()))?;
+                .ok_or_else(|| format!("{}: Potter has no evaluated node", node_id.as_str()))?;
             potter_canonical(mesh, DMat4::from_cols_array(&node.world_matrix))
+                .map_err(|error| format!("{}: {error}", node_id.as_str()))
         })
         .collect())
 }

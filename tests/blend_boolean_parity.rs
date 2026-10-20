@@ -92,7 +92,7 @@ fn exact_boolean_matches_blender_parity_corpus() -> TestResult {
             .ok_or("Blender case name is missing")?
             .to_owned();
         let node_id = find_node(&document, &case)?;
-        match evaluate_booleans_together(&document, std::slice::from_ref(&node_id))?.remove(0) {
+        match evaluate_booleans_together(&document, std::slice::from_ref(&node_id)).remove(0) {
             Ok(actual) => {
                 let expected = expected_canonical(&expected_json)?;
                 failures.extend(

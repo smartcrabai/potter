@@ -935,6 +935,14 @@ fn inspected_item<'a>(items: &'a [Value], id: &str) -> TestResult<&'a Value> {
         .find(|item| item["id"] == id)
         .ok_or_else(|| format!("inspect has no item {id}").into())
 }
+/// The text of a thread's panic payload: `panic!` yields a `&str` or a `String`.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|text| (*text).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_owned())
+}
 
 fn run_case(
     blender: &Path,
@@ -1219,9 +1227,12 @@ fn collection_instance_cases_match_blenders_exporter() -> TestResult {
             .map(|(&(case, _), handle)| {
                 (
                     case,
-                    handle
-                        .join()
-                        .unwrap_or_else(|_| Err("the case thread panicked".to_owned())),
+                    handle.join().unwrap_or_else(|payload| {
+                        Err(format!(
+                            "the case thread panicked: {}",
+                            panic_message(payload.as_ref())
+                        ))
+                    }),
                 )
             })
             .collect()
