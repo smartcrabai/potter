@@ -2127,13 +2127,42 @@ def dump_scene(scene):
             "compositor": _scene_compositor(scene),
             "color_management": _color_management_dump(scene),
             "view_layers": layers,
-            "display_backface_culling": bool(scene.display.shading.show_backface_culling),
+            "display_shading": _display_shading_dump(scene),
             "markers": [{"name": marker.name, "frame": int(marker.frame)} for marker in scene.timeline_markers],
             "rigid_body_world": _rigid_body_world_dump(scene),
             "sequencer": _sequencer_dump(scene),
             "root_collection": scene.get("potter.root_collection", scene.collection.get("potter.name", scene.collection.name_full)),
             "world": world_info, "custom_properties": custom_props(scene),
             "rna_properties": rna_props(scene, ("objects", "collection", "view_layers", "world", "camera", "render", "tool_settings", "unit_settings"))}
+
+
+def _camera_dof_enabled(camera):
+    """Whether a camera has depth of field on, which Workbench's DoF pass reads from the scene camera."""
+    dof = getattr(getattr(camera, "data", None), "dof", None)
+    return bool(dof is not None and dof.use_dof)
+
+
+def _display_shading_dump(scene):
+    """The viewport shading options a Workbench render reads (`scene.display.shading`), with the scene
+    camera's depth of field, which the DoF option needs in order to draw anything."""
+    shading = scene.display.shading
+    return {
+        "type": shading.type,
+        "light": shading.light,
+        "studio_light": shading.studio_light,
+        "color_type": shading.color_type,
+        "use_world_space_lighting": bool(shading.use_world_space_lighting),
+        "show_specular_highlight": bool(shading.show_specular_highlight),
+        "show_cavity": bool(shading.show_cavity),
+        "show_shadows": bool(shading.show_shadows),
+        "show_object_outline": bool(shading.show_object_outline),
+        "show_backface_culling": bool(shading.show_backface_culling),
+        "show_xray": bool(shading.show_xray),
+        "xray_alpha": float(shading.xray_alpha),
+        "use_dof": bool(shading.use_dof),
+        "camera_dof": _camera_dof_enabled(scene.camera),
+        "background_type": shading.background_type,
+    }
 
 
 def _startup_metadata_datablock(collection_name, block):
@@ -2221,6 +2250,8 @@ def material_dump(material):
     return {"name": material.name_full, "potter_id": material.get("potter.id"),
             "library": library_reference(material),
             "base_color": base_color,
+            "viewport_display": {"diffuse_color": [float(c) for c in material.diffuse_color],
+                                 "roughness": float(material.roughness), "metallic": float(material.metallic)},
             "metallic": metallic, "roughness": roughness,
             "emission_color": emission_color, "emission_strength": emission_strength,
             "transmission": transmission, "ior": ior,
@@ -6717,10 +6748,13 @@ def export_doc(doc, target, pack, scene_hash, context):
         if material_id in material_map:
             continue
         mat = bpy.data.materials.new(item["name"])
-        mat.diffuse_color = item["base_color"]
+        viewport = item.get("viewport_display")
+        mat.diffuse_color = viewport["diffuse_color"] if viewport else item["base_color"]
         mat.use_nodes = True
         set_id(mat.node_tree, item.get("node_tree"))
         _set_principled_values(mat, item)
+        mat.roughness = viewport["roughness"] if viewport else item["roughness"]
+        mat.metallic = viewport["metallic"] if viewport else item["metallic"]
         mat.use_backface_culling = not bool(item.get("double_sided", True))
         mat.displacement_method = "DISPLACEMENT" if item.get("displacement_method") == "displacement" else "BUMP"
         set_id(mat, material_id)
