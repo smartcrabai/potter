@@ -45,6 +45,7 @@ mod sculpt_dabs;
 pub mod text;
 pub(crate) mod triangulate;
 pub(crate) mod uv_layers;
+mod uv_sphere;
 pub mod vdb;
 pub mod volume;
 
@@ -820,15 +821,14 @@ impl Mesh {
         Ok(mesh)
     }
 
-    /// Create a Blender-default or customized UV sphere.
+    /// Create a Blender-default or customized UV sphere in Blender 5.2.2 storage order.
+    ///
+    /// Vertex order and positions match Blender bit for bit; see [`uv_sphere`] for the edge
+    /// and face order.
     ///
     /// # Errors
     ///
     /// Returns an error for invalid radii/ring counts or exhausted mesh IDs.
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "indices derive from u32 counts and are exactly representable in f64"
-    )]
     pub fn uv_sphere(params: UvSphereParams) -> Result<Self, MeshError> {
         validate_radial_count(params.segments, "UV sphere segments")?;
         if params.ring_count < 3 {
@@ -837,57 +837,7 @@ impl Mesh {
             ));
         }
         positive(params.radius, "UV sphere radius")?;
-        let segments = usize::try_from(params.segments).map_err(|_| MeshError::IdExhausted)?;
-        let rings = usize::try_from(params.ring_count).map_err(|_| MeshError::IdExhausted)?;
-        let intermediate_rings = rings.checked_sub(1).ok_or(MeshError::IdExhausted)?;
-        let vertex_count = segments
-            .checked_mul(intermediate_rings)
-            .and_then(|n| n.checked_add(2))
-            .ok_or(MeshError::IdExhausted)?;
-        if vertex_count > u32::MAX as usize {
-            return Err(MeshError::IdExhausted);
-        }
-        let mut positions = Vec::with_capacity(vertex_count);
-        positions.push(DVec3::new(0.0, 0.0, params.radius));
-        for ring in 1..rings {
-            let latitude = std::f64::consts::PI * ring as f64 / rings as f64;
-            let z = params.radius * latitude.cos();
-            let radial = params.radius * latitude.sin();
-            for segment in 0..segments {
-                let longitude = std::f64::consts::FRAC_PI_2
-                    - std::f64::consts::TAU * segment as f64 / segments as f64;
-                positions.push(DVec3::new(
-                    radial * longitude.cos(),
-                    radial * longitude.sin(),
-                    z,
-                ));
-            }
-        }
-        let bottom = positions.len();
-        positions.push(DVec3::new(0.0, 0.0, -params.radius));
-        let ring_id = |ring: usize, segment: usize| 1 + ring * segments + segment % segments;
-        let mut polygons = Vec::with_capacity(segments * rings);
-        for segment in 0..segments {
-            polygons.push(vec![0, ring_id(0, segment + 1), ring_id(0, segment)]);
-        }
-        for ring in 0..rings - 2 {
-            for segment in 0..segments {
-                polygons.push(vec![
-                    ring_id(ring, segment),
-                    ring_id(ring, segment + 1),
-                    ring_id(ring + 1, segment + 1),
-                    ring_id(ring + 1, segment),
-                ]);
-            }
-        }
-        for segment in 0..segments {
-            polygons.push(vec![
-                ring_id(rings - 2, segment),
-                ring_id(rings - 2, segment + 1),
-                bottom,
-            ]);
-        }
-        Self::from_positions_and_faces(positions, polygons)
+        uv_sphere::build(params)
     }
     /// Create a Blender-default or customized capped cylinder.
     ///

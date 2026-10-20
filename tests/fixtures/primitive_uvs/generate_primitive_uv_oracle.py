@@ -55,6 +55,11 @@ def dump(obj):
     }
 
 
+# Blender's extrude_edge_only iterates boundary_map.out, a GHash keyed by BMEdge pointers
+# (bmesh_operators.cc:100 creates the slot; bmo_extrude.cc bmo_extrude_edge_only_exec iterates it).
+# Pointer-hash bucket order varies between processes, so UV sphere edge and face order does too.
+RUN_DEPENDENT_SOURCE = "bmesh_operators.cc:100; bmo_extrude.cc bmo_extrude_edge_only_exec boundary_map.out"
+
 cases = {}
 for name, kind, op, kwargs in CASES:
     bpy.ops.wm.read_factory_settings(use_empty=True)
@@ -64,6 +69,10 @@ for name, kind, op, kwargs in CASES:
     entry["kind"] = kind
     entry["operator"] = op.idname()
     entry["kwargs"] = kwargs
+    if kind == "uv_sphere":
+        # Vertex order is reproducible across processes; edge and face order is not (see RUN_DEPENDENT_SOURCE).
+        entry["edge_face_order"] = "run_dependent"
+        entry["edge_face_order_source"] = RUN_DEPENDENT_SOURCE
     cases[name] = entry
 
 with open(OUT, "w", encoding="utf-8") as destination:
