@@ -33,7 +33,7 @@ use super::principled_tables::{
     ggx_glass_energy_average, ggx_glass_inverse_energy, ggx_glass_inverse_energy_average,
     sheen_ltc,
 };
-use super::subsurface::{channel_mask, closure_radius, subsurface_evaluated};
+use super::subsurface::{channel_mask, raw_radius, subsurface_evaluated};
 
 /// Roughness floor shared with the sampler; Cycles treats roughness below ~1e-5 as delta.
 const MIN_ROUGHNESS: f64 = 0.02;
@@ -64,7 +64,7 @@ pub(crate) fn lobe_probabilities(params: &BsdfParams, layers: &Layers) -> LobePr
         ((1.0 - metallic) * (1.0 - transmission) * (1.0 - subsurface_share)).max(0.0);
     // The subsurface closure's sample weight is its mean channel weight times the channels it covers
     // (`bssrdf_setup`, `sample_weight = |average(weight)| * channels`).
-    let covered_channels = channel_mask(closure_radius(params))
+    let covered_channels = channel_mask(raw_radius(params))
         .iter()
         .filter(|&&on| on)
         .count() as f64;
@@ -181,7 +181,7 @@ fn subsurface_share(params: &BsdfParams) -> DVec3 {
         return DVec3::ONE;
     }
     let sss = params.subsurface_weight.clamp(0.0, 1.0);
-    let mask = channel_mask(closure_radius(params));
+    let mask = channel_mask(raw_radius(params));
     DVec3::from_array(std::array::from_fn(|channel| {
         if mask[channel] { 1.0 - sss } else { 1.0 }
     }))
@@ -199,7 +199,7 @@ pub(crate) fn subsurface_closure_weight(
     if !subsurface_evaluated(params) || normal.dot(view) <= 0.0 {
         return DVec3::ZERO;
     }
-    let mask = channel_mask(closure_radius(params));
+    let mask = channel_mask(raw_radius(params));
     let covered = DVec3::from_array(mask.map(|on| if on { 1.0 } else { 0.0 }));
     base_color(params)
         * covered

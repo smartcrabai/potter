@@ -148,6 +148,17 @@ pub enum SubsurfaceMethod {
     Mixed,
 }
 
+/// A subsurface method Potter evaluates, each with its own Cycles closure. The Principled node's `SubsurfaceMethod`
+/// names one of these, or `Mixed`, which has none. A sampled subsurface closure carries one of these, so the sampler
+/// and the exit cannot meet a method Potter does not evaluate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvaluatedSubsurfaceMethod {
+    Burley,
+    RandomWalk,
+    RandomWalkSkin,
+    RandomWalkLegacy,
+}
+
 impl SubsurfaceMethod {
     /// The Blender enum identifier of a method, as the node property stores it.
     pub(crate) fn parse(token: &str) -> Option<Self> {
@@ -160,15 +171,23 @@ impl SubsurfaceMethod {
         }
     }
 
-    /// The feature id Potter reports for a method it does not evaluate, or `None` for a method it evaluates.
+    /// The evaluated method this one names, or `None` for `Mixed`, which Potter cannot hold in one parameter set.
+    pub(crate) fn evaluated(self) -> Option<EvaluatedSubsurfaceMethod> {
+        match self {
+            Self::Burley => Some(EvaluatedSubsurfaceMethod::Burley),
+            Self::RandomWalk => Some(EvaluatedSubsurfaceMethod::RandomWalk),
+            Self::RandomWalkSkin => Some(EvaluatedSubsurfaceMethod::RandomWalkSkin),
+            Self::RandomWalkLegacy => Some(EvaluatedSubsurfaceMethod::RandomWalkLegacy),
+            Self::Mixed => None,
+        }
+    }
+
+    /// The feature id Potter reports for a method it does not evaluate. Only `Mixed` is reported: the four named
+    /// methods are evaluated.
     pub(crate) fn unsupported_feature(self) -> Option<&'static str> {
         match self {
-            Self::Burley | Self::RandomWalk => None,
-            Self::RandomWalkSkin => Some("shader.principled.subsurface_method.random_walk_skin"),
-            Self::RandomWalkLegacy => {
-                Some("shader.principled.subsurface_method.random_walk_legacy")
-            }
             Self::Mixed => Some("shader.principled.subsurface_method.mixed"),
+            Self::Burley | Self::RandomWalk | Self::RandomWalkSkin | Self::RandomWalkLegacy => None,
         }
     }
 
