@@ -22,7 +22,7 @@ BACKGROUND_LINEAR = 0.887923
 bpy.ops.wm.read_factory_settings(use_empty=True)
 scene = bpy.context.scene
 
-scene.render.engine = "BLENDER_WORKBENCH"
+# The render engine is set before the renders, so the saved .blend keeps the factory engine.
 scene.render.resolution_x = 128
 scene.render.resolution_y = 128
 scene.render.resolution_percentage = 100
@@ -107,6 +107,9 @@ for label, spec in CAMERAS.items():
 
 bpy.ops.wm.save_as_mainfile(filepath=blend_path, check_existing=False)
 
+# The saved file keeps the factory render engine, which Potter imports without a loss; the Workbench engine
+# is set only for the oracle renders, which use the same Solid inputs.
+scene.render.engine = "BLENDER_WORKBENCH"
 for label in CAMERAS:
     scene.camera = bpy.data.objects[label]
     scene.render.filepath = os.path.join(png_dir, f"{label}.png")

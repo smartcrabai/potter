@@ -235,15 +235,20 @@ pub fn render_previews(
                 shader.as_deref(),
             )?
         };
-        if matches!(mode, Mode::Beauty) {
-            crate::compositor::apply(
+        match mode {
+            Mode::Beauty => crate::compositor::apply(
                 &mut raster,
                 doc,
                 scene,
                 request.size,
                 request.size,
                 request.context.frame.unwrap_or(scene.frame_current),
-            )?;
+            )?,
+            // Solid is display-encoded through the scene's view transform and look, as Beauty is.
+            Mode::Solid => {
+                crate::compositor::encode_display_output(&mut raster, &scene.color_management)?;
+            }
+            _ => {}
         }
         let (manifest, files) = manifest_value(
             doc,
@@ -769,7 +774,12 @@ fn manifest_value(
         "ambient": if ambient { json!({ "color": [0.08, 0.08, 0.08], "source": "default_no_lights_or_world" }) } else { Value::Null },
         "engine": "cpu",
         "device": "cpu",
-        "view_transform": scene.color_management.view_transform,
+        // Beauty and Solid are display-encoded through the scene's view transform; data passes are not.
+        "view_transform": if matches!(mode, Mode::Beauty | Mode::Solid) {
+            json!(scene.color_management.view_transform)
+        } else {
+            json!("sRGB standard")
+        },
         "ocio": Value::Null,
     });
     let pick_policy = json!({

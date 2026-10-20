@@ -294,7 +294,7 @@ const VIEWPORT_SCRIPT: &str = include_str!("fixtures/native_oracle/workbench_vie
 
 /// Solid preview of an imported `.blend` shades with the material's viewport display values, not its
 /// node tree, and applies the scene's view transform. Blender's Workbench render is the oracle for both
-/// the Standard and the AgX view, so a view-transform regression shows up as a pixel difference.
+/// the Standard and the `AgX` view, so a view-transform regression shows up as a pixel difference.
 #[test]
 fn blend_solid_preview_shades_with_viewport_display_under_the_scene_view_transform() -> TestResult {
     let Some(blender) = blender_executable() else {
