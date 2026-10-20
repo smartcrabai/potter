@@ -175,25 +175,34 @@ mod tests {
 
     use super::*;
 
-    /// The p2 cage at its asymmetric bind positions, in `Mesh::box_mesh` vertex order.
+    // Corner order is `Mesh::box_mesh` (`geom/mod.rs`, `BOX_CORNER_SIGNS`, `BOX_FACES`): corner `i` has sign
+    // vector `BOX_CORNER_SIGNS[i]` (x, y, z in {-1, +1}) with `i = 4*[x>0] + 2*[y>0] + [z>0]`. Blender's
+    // `primitive_cube_add(size=2)` has the same corner order and face table; checked headless (vertex `b<i>`
+    // at sign vector `i`; its polygons and `calc_loop_triangles()` equal the lists below).
+    //
+    // Derivation without Blender: `ASYMMETRIC` is the cage at its bind positions in corner order, the array of
+    // `asymmetric_mesh_operations` in `tests/pr18f_deform_bind.rs`. `BOX_FACES` below is the `Mesh::box_mesh`
+    // face table. `CORNER_TRIS` applies the quad rule in its doc comment to these positions. Triangle indices
+    // count `CORNER_TRIS` in order.
+    /// The p2 cage at its asymmetric bind positions, in `Mesh::box_mesh` corner order.
     const ASYMMETRIC: [Vec3; 8] = [
         [-2.2, -1.8, -2.0],
-        [2.1, -1.7, -2.1],
-        [2.1, 1.9, -2.2],
-        [-2.0, 1.7, -1.8],
         [-1.8, -1.9, 2.0],
-        [2.1, -1.7, 2.2],
-        [2.2, 1.8, 2.3],
+        [-2.0, 1.7, -1.8],
         [-2.1, 1.6, 1.7],
+        [2.1, -1.7, -2.1],
+        [2.1, -1.7, 2.2],
+        [2.1, 1.9, -2.2],
+        [2.2, 1.8, 2.3],
     ];
-    /// `Mesh::box_mesh` polygons with their starting corners (`geom/mod.rs`).
+    /// `Mesh::box_mesh` polygons (`BOX_FACES` in `geom/mod.rs`): faces x-, y+, x+, y-, z-, z+ in that order.
     const BOX_FACES: [[usize; 4]; 6] = [
-        [0, 3, 2, 1],
-        [4, 5, 6, 7],
-        [0, 1, 5, 4],
-        [1, 2, 6, 5],
+        [0, 1, 3, 2],
         [2, 3, 7, 6],
-        [3, 0, 4, 7],
+        [6, 7, 5, 4],
+        [4, 5, 1, 0],
+        [2, 6, 4, 0],
+        [7, 3, 1, 5],
     ];
     /// The padded grid of that bind in Blender 5.2.2 (precision 2, size 6).
     const GRID_MIN: Vec3 = [-6.975, -6.975, -6.925];
@@ -202,21 +211,31 @@ mod tests {
     const VERTEX0: Vec3 = [0.348_456_95, -2.196_758_7, 0.636_363_6];
     const VERTEX1: Vec3 = [0.652_235_5, -1.927_082, 0.636_363_6];
 
-    /// Blender's loop triangles for `BOX_FACES` in face order. Each quad's diagonal is the split that
-    /// `Mesh::tessellate` (`mesh_tessellate.cc`) chooses, not one made in this module.
+    /// Loop triangles of `BOX_FACES` in face order, at the `ASYMMETRIC` positions. A quad with corners
+    /// `c0..c3` (face order) splits as `loop_triangles` (`geom/triangulate.rs`, Blender `mesh_tessellate.cc`):
+    /// with `s = dot((c1-c0) x (c2-c0), (c3-c0) x (c2-c0))`, `s > 0` gives `[0,1,3], [1,2,3]` (1-3 diagonal),
+    /// otherwise `[0,1,2], [0,2,3]` (0-2 diagonal). At these positions `s` is about -170 to -290 for every face,
+    /// so every face splits on 0-2. Face `f` owns triangles `2f` and `2f+1`:
+    ///
+    /// - face 0 `[0,1,3,2]`: `[0,1,3]` (0), `[0,3,2]` (1)
+    /// - face 1 `[2,3,7,6]`: `[2,3,7]` (2), `[2,7,6]` (3)
+    /// - face 2 `[6,7,5,4]`: `[6,7,5]` (4), `[6,5,4]` (5)
+    /// - face 3 `[4,5,1,0]`: `[4,5,1]` (6), `[4,1,0]` (7)
+    /// - face 4 `[2,6,4,0]`: `[2,6,4]` (8), `[2,4,0]` (9)
+    /// - face 5 `[7,3,1,5]`: `[7,3,1]` (10), `[7,1,5]` (11)
     const CORNER_TRIS: [[usize; 3]; 12] = [
+        [0, 1, 3],
         [0, 3, 2],
-        [0, 2, 1],
-        [4, 5, 6],
-        [4, 6, 7],
-        [0, 1, 5],
-        [0, 5, 4],
-        [1, 2, 6],
-        [1, 6, 5],
         [2, 3, 7],
         [2, 7, 6],
-        [3, 0, 4],
-        [3, 4, 7],
+        [6, 7, 5],
+        [6, 5, 4],
+        [4, 5, 1],
+        [4, 1, 0],
+        [2, 6, 4],
+        [2, 4, 0],
+        [7, 3, 1],
+        [7, 1, 5],
     ];
 
     fn cage() -> CageRayCache {
@@ -227,15 +246,18 @@ mod tests {
 
     #[test]
     fn vertex0_plus_y_ray_is_decided_by_the_exit_face() {
-        // Blender's culling: the entry triangles are pruned by the normalised exit distance, so the first
-        // triangle the bind accepts is the back-facing exit face (triangle 9), and vertex 0 counts as inside.
+        // Blender's culling: the entry triangle is pruned by the normalised exit distance. The root's
+        // children are visited right-first (its main axis is z, orthogonal to the ray), so the right subtree,
+        // which holds triangle 2, records the exit at 0.264 before the left subtree (box entry 0.297) is
+        // tested. The first triangle the bind accepts is the back-facing exit face, triangle 2, and vertex 0
+        // counts as inside.
         let cage = cage();
         let length = GRID_MAX[1] - GRID_MIN[1] + 1.0;
         let outside = [VERTEX0[0], VERTEX0[1] + length, VERTEX0[2]];
         let hit = cage
             .closest_hit(VERTEX0, outside)
             .expect("the +y ray meets the cage");
-        assert_eq!(hit.triangle, 9);
+        assert_eq!(hit.triangle, 2);
         assert!(!hit.facing);
     }
 
@@ -247,7 +269,7 @@ mod tests {
         let hit = cage
             .closest_hit(VERTEX1, outside)
             .expect("the +y ray meets the cage");
-        assert_eq!(hit.triangle, 4);
+        assert_eq!(hit.triangle, 6);
         assert!(hit.facing);
     }
 
