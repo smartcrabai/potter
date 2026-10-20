@@ -1574,6 +1574,18 @@ def _quaternion_from_native(value):
     return (w, x, y, z)
 
 
+def _same_rotation(first, second):
+    """True when two quaternions in the same component order are bit-identical up to overall sign.
+
+    Potter's loader canonicalizes quaternion sign (q and -q are one rotation), so an imported value can
+    come back negated. Components are compared exactly; nothing is tolerated.
+    """
+    first = [float(value) for value in first]
+    second = [float(value) for value in second]
+    return first == second or first == [-value for value in second]
+
+
+
 def _attribute_item_value(item, data_type):
     if data_type in MESH_COLOR_TYPES:
         return plain(item.color)
@@ -5263,7 +5275,7 @@ def _restore_pose(obj, pose, id_lookup, doc, target):
         stored_rotation = item.get("source_rotation_quaternion")
         source_rotation_unchanged = (
             isinstance(stored_rotation, (list, tuple)) and len(stored_rotation) == 4
-            and [float(value) for value in stored_rotation] == [float(value) for value in rotation]
+            and _same_rotation(stored_rotation, rotation)
         )
         axis_angle = item.get("rotation_axis_angle")
         euler = item.get("rotation_euler")
@@ -7377,8 +7389,7 @@ def export_doc(doc, target, pack, scene_hash, context):
                 "source_rotation")
             source_rotation_unchanged = (
                 isinstance(stored_rotation, (list, tuple)) and len(stored_rotation) == 4
-                and [float(value) for value in stored_rotation]
-                == [float(value) for value in transform["rotation"]]
+                and _same_rotation(stored_rotation, transform["rotation"])
                 and source_rotation_mode == obj.rotation_mode
             )
             axis_angle_source = isinstance(source_axis_angle, (list, tuple)) and len(source_axis_angle) == 4
