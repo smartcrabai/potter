@@ -221,10 +221,9 @@ fn torus_and_icosphere_uvs_match_blender() -> TestResult {
 
 /// Per-face UVs keyed by each face's loop list (vertex indices in loop order). Blender's UV sphere
 /// order varies between processes, but a face's loop list and its loop values do not.
-fn keyed_faces(
-    faces: &[Vec<usize>],
-    uv: &[[f64; 2]],
-) -> Result<std::collections::BTreeMap<Vec<usize>, Vec<[f64; 2]>>, Box<dyn Error>> {
+type FaceUvs = std::collections::BTreeMap<Vec<usize>, Vec<[f64; 2]>>;
+
+fn keyed_faces(faces: &[Vec<usize>], uv: &[[f64; 2]]) -> Result<FaceUvs, Box<dyn Error>> {
     let mut result = std::collections::BTreeMap::new();
     let mut offset = 0;
     for face in faces {
