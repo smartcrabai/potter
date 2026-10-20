@@ -234,7 +234,10 @@ impl SurfaceShading {
             return None;
         }
         if total <= 0.0 {
-            return self.closures.first().map(|closure| closure.params.base_color);
+            return self
+                .closures
+                .first()
+                .map(|closure| closure.params.base_color);
         }
         let mut colour = [0.0; 4];
         for closure in &self.closures {
@@ -248,7 +251,10 @@ impl SurfaceShading {
 
 /// The Vec form of a single node closure, for the surface and volume outputs.
 fn single_closure(params: BsdfParams) -> Vec<ShaderClosure> {
-    vec![ShaderClosure { weight: 1.0, params }]
+    vec![ShaderClosure {
+        weight: 1.0,
+        params,
+    }]
 }
 
 impl BsdfParams {
@@ -303,15 +309,6 @@ impl BsdfParams {
     pub(crate) fn coat_normal_or_shading(&self) -> DVec3 {
         self.coat_normal.unwrap_or(self.normal)
     }
-
-    /// Whether the volume coefficients put a medium on the surface's path.
-    pub(crate) fn has_medium(&self) -> bool {
-        self.volume_scatter
-            .iter()
-            .chain(&self.volume_absorption)
-            .any(|weight| *weight > 0.0)
-    }
-
 }
 
 /// The UV layers of the triangle a hit lies on, borrowed from the render geometry.
@@ -970,7 +967,10 @@ impl EvaluatorWorkspace {
     /// A node's single closure at weight 1.
     fn push_single(&mut self, params: BsdfParams) -> ClosureSpan {
         let start = self.closures.len();
-        self.closures.push(ShaderClosure { weight: 1.0, params });
+        self.closures.push(ShaderClosure {
+            weight: 1.0,
+            params,
+        });
         ClosureSpan { start, len: 1 }
     }
 
@@ -2827,8 +2827,8 @@ mod tests {
     };
 
     use super::{
-        BsdfParams, HitContext, HitUvLayers, PreparedMaterial, color_lerp, evaluate_displacement,
-        evaluate_surface, layer_index, layer_uv,
+        BsdfParams, HitContext, HitUvLayers, PreparedMaterial, SurfaceShading, color_lerp,
+        evaluate_displacement, evaluate_surface, layer_index, layer_uv,
     };
 
     fn set_properties(group: &mut NodeGroup, id: &str, properties: Value) {
@@ -2922,7 +2922,11 @@ mod tests {
             },
         )]);
         context = context.with_images(&images);
-        evaluate_surface(&material, &context).unwrap().base_color
+        evaluate_surface(&material, &context)
+            .unwrap()
+            .dominant()
+            .unwrap()
+            .base_color
     }
 
     /// Red at storage U `u` of a plain field (no graph) whose texture uses `extension`. Pixels are 8 columns of
@@ -2970,7 +2974,11 @@ mod tests {
             },
         )]);
         let context = context.with_images(&images);
-        evaluate_surface(&material, &context).unwrap().base_color[0]
+        evaluate_surface(&material, &context)
+            .unwrap()
+            .dominant()
+            .unwrap()
+            .base_color[0]
     }
 
     #[test]
@@ -3015,7 +3023,10 @@ mod tests {
             },
         )]);
         let context = context.with_images(&images);
-        let params = evaluate_surface(&material, &context).unwrap();
+        let params = *evaluate_surface(&material, &context)
+            .unwrap()
+            .dominant()
+            .unwrap();
         for channel in params.glass_transmission_tint {
             assert!(
                 (channel - 0.5).abs() < 1.0e-9,
@@ -3213,11 +3224,17 @@ mod tests {
             node_tree: Some(graph_id),
             ..Material::default()
         };
-        let params = evaluate_surface(&material, &HitContext::new(&groups)).unwrap();
+        let shading = evaluate_surface(&material, &HitContext::new(&groups)).unwrap();
         // Principled Volume at Density 0.7: σs = Color · 0.7 and σa = (1 - Color) · 0.7.
-        assert!(channels_close(params.volume_scatter, [0.14, 0.28, 0.42]));
-        assert!(channels_close(params.volume_absorption, [0.56, 0.42, 0.28]));
-        assert_eq!(params.volume_anisotropy, 0.35);
+        assert!(channels_close(
+            weighted_volume(&shading, |params| params.volume_scatter),
+            [0.14, 0.28, 0.42]
+        ));
+        assert!(channels_close(
+            weighted_volume(&shading, |params| params.volume_absorption),
+            [0.56, 0.42, 0.28]
+        ));
+        assert_eq!(shading.volume[0].params.volume_anisotropy, 0.35);
     }
 
     fn channels_close(actual: [f64; 3], expected: [f64; 3]) -> bool {
@@ -3227,9 +3244,23 @@ mod tests {
             .all(|(actual, expected)| (actual - expected).abs() < 1e-12)
     }
 
+    /// The volume coefficient summed over the Volume output's closures, each scaled by its closure weight.
+    fn weighted_volume(
+        shading: &SurfaceShading,
+        coefficient: fn(&BsdfParams) -> [f64; 3],
+    ) -> [f64; 3] {
+        let mut total = [0.0; 3];
+        for closure in &shading.volume {
+            for (sum, channel) in total.iter_mut().zip(coefficient(&closure.params)) {
+                *sum += closure.weight * channel;
+            }
+        }
+        total
+    }
+
     /// Two Volume Absorption closures (σa = (1 - Color) · Density: (0.8, 0.5, 0.2) and (0.25, 0.25, 0.25))
-    /// joined by `combiner`; returns the evaluated volume coefficients.
-    fn two_absorption_closures(combiner: &str, inputs: Value) -> BsdfParams {
+    /// joined by `combiner`; returns the evaluated shading, whose volume closures carry the coefficients.
+    fn two_absorption_closures(combiner: &str, inputs: Value) -> SurfaceShading {
         let mut graph = NodeGroup::new("Volume", GraphKind::Shader);
         insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
         insert_node(
@@ -3263,10 +3294,16 @@ mod tests {
         // Cycles adds closures' extinctions (Add Shader) and weights each by its mix factor (Mix
         // Shader), so the coefficients sum or mix per closure, not as (Σ weight)(Σ density).
         let added = two_absorption_closures("ShaderNodeAddShader", json!({}));
-        assert!(channels_close(added.volume_absorption, [1.05, 0.75, 0.45]));
-        let mixed = two_absorption_closures("ShaderNodeMixShader", json!({"Fac":0.25}));
+        assert_eq!(added.volume.len(), 2);
         assert!(channels_close(
-            mixed.volume_absorption,
+            weighted_volume(&added, |params| params.volume_absorption),
+            [1.05, 0.75, 0.45]
+        ));
+        let mixed = two_absorption_closures("ShaderNodeMixShader", json!({"Fac":0.25}));
+        let weights: Vec<f64> = mixed.volume.iter().map(|closure| closure.weight).collect();
+        assert_eq!(weights, [0.75, 0.25]);
+        assert!(channels_close(
+            weighted_volume(&mixed, |params| params.volume_absorption),
             [0.6625, 0.4375, 0.2125]
         ));
     }
@@ -3332,29 +3369,83 @@ mod tests {
         assert_eq!(subsurface_warning["node_id"], "principled");
     }
 
+    /// Two Principled BSDFs joined by `combiner` (Mix or Add Shader), evaluated as the surface's closures. The first
+    /// is red with roughness 0.1, normal +X and coat 0.5; the second is blue with roughness 0.9, normal +Z and coat
+    /// 0.2. `inputs` are the combiner's own inputs.
+    fn two_principled_surface(combiner: &str, inputs: Value) -> SurfaceShading {
+        let mut graph = NodeGroup::new("Surface", GraphKind::Shader);
+        insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
+        insert_node(
+            &mut graph,
+            "first",
+            "ShaderNodeBsdfPrincipled",
+            json!({
+                "Base Color":[1.0,0.0,0.0,1.0],"Roughness":0.1,
+                "Normal":[1.0,0.0,0.0],"Coat Weight":0.5
+            }),
+        );
+        insert_node(
+            &mut graph,
+            "second",
+            "ShaderNodeBsdfPrincipled",
+            json!({
+                "Base Color":[0.0,0.0,1.0,1.0],"Roughness":0.9,
+                "Normal":[0.0,0.0,1.0],"Coat Weight":0.2
+            }),
+        );
+        insert_node(&mut graph, "combine", combiner, inputs);
+        link(&mut graph, "first", "BSDF", "combine", "Shader");
+        link(&mut graph, "second", "BSDF", "combine", "Shader_001");
+        link(&mut graph, "combine", "Shader", "output", "Surface");
+        let graph_id = Id::new("surface_shader".to_owned()).unwrap();
+        let mut groups = Registry::new();
+        groups.insert(graph_id.clone(), graph);
+        let material = Material {
+            node_tree: Some(graph_id),
+            ..Material::default()
+        };
+        evaluate_surface(&material, &HitContext::new(&groups)).unwrap()
+    }
+
     #[test]
-    fn add_of_two_coats_adds_weight_times_tint_and_averages_the_rest() {
-        let close = |a: [f64; 3], b: [f64; 3]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-12);
-        let mut first = BsdfParams::from_material(&Material::default(), DVec3::Z);
-        first.coat_weight = 0.5;
-        first.coat_tint = [1.0, 0.5, 0.25];
-        first.coat_roughness = 0.1;
-        let mut second = BsdfParams::from_material(&Material::default(), DVec3::Z);
-        second.coat_weight = 0.2;
-        second.coat_tint = [0.2, 0.2, 0.2];
-        second.coat_roughness = 0.3;
-        // weight · tint adds: 0.5·[1, 0.5, 0.25] + 0.2·[0.2, 0.2, 0.2], over the summed weight 0.7.
-        let sum = BsdfParams::add(first, second);
-        assert!((sum.coat_weight - 0.7).abs() < 1e-12);
-        assert!(close(sum.coat_tint, [0.54 / 0.7, 0.29 / 0.7, 0.165 / 0.7]));
-        assert!((sum.coat_roughness - (0.05 + 0.06) / 0.7).abs() < 1e-12);
-        // Unlinked on both sides, the coat keeps following the shading normal.
-        assert_eq!(sum.coat_normal, None);
-        // A linked normal on one side enters the average with that side's weight.
-        second.coat_normal = Some(DVec3::X);
-        let sum = BsdfParams::add(first, second);
-        let expected = (DVec3::Z * 0.5 + DVec3::X * 0.2).normalize();
-        assert!((sum.coat_normal.unwrap_or(DVec3::ZERO) - expected).length() < 1e-12);
+    fn mix_shader_weights_closures_and_keeps_each_closures_parameters() {
+        // Mix Shader gives the first arm its 1 - Fac share and the second its Fac share. Nothing is averaged: each
+        // closure keeps its own normal, roughness and coat.
+        let shading = two_principled_surface("ShaderNodeMixShader", json!({"Fac":0.25}));
+        assert_eq!(shading.closures.len(), 2);
+        let (first, second) = (shading.closures[0], shading.closures[1]);
+        assert!((first.weight - 0.75).abs() < 1e-12);
+        assert!((second.weight - 0.25).abs() < 1e-12);
+        assert_eq!(first.params.normal, DVec3::X);
+        assert_eq!(second.params.normal, DVec3::Z);
+        assert_eq!(first.params.roughness, 0.1);
+        assert_eq!(second.params.roughness, 0.9);
+        assert_eq!(first.params.coat_weight, 0.5);
+        assert_eq!(second.params.coat_weight, 0.2);
+        // The heavier first arm is the dominant closure, so its normal is the one displacement is measured along.
+        assert_eq!(shading.dominant().unwrap().normal, DVec3::X);
+        // The representative colour is the weight-averaged base colour: 0.75 red and 0.25 blue.
+        assert_eq!(
+            shading.representative_base_color(),
+            Some([0.75, 0.0, 0.25, 1.0])
+        );
+    }
+
+    #[test]
+    fn add_shader_concatenates_closures_with_unit_weight() {
+        // Add Shader keeps both arms' closures whole at weight 1: no coat or normal is merged across them.
+        let shading = two_principled_surface("ShaderNodeAddShader", json!({}));
+        assert_eq!(shading.closures.len(), 2);
+        assert!(shading.closures.iter().all(|closure| closure.weight == 1.0));
+        assert_eq!(shading.closures[0].params.coat_weight, 0.5);
+        assert_eq!(shading.closures[1].params.coat_weight, 0.2);
+        assert_eq!(shading.closures[0].params.coat_normal, None);
+        assert_eq!(shading.closures[1].params.normal, DVec3::Z);
+        // The representative colour averages the two arms: (red + blue) / 2.
+        assert_eq!(
+            shading.representative_base_color(),
+            Some([0.5, 0.0, 0.5, 1.0])
+        );
     }
 
     #[test]
@@ -3383,8 +3474,8 @@ mod tests {
         };
         let mut context = HitContext::new(&groups);
         context.normal = DVec3::Z;
-        let params = evaluate_surface(&material, &context).unwrap();
-        assert!((params.displacement_height - 0.5).abs() < f64::EPSILON);
+        let shading = evaluate_surface(&material, &context).unwrap();
+        assert!((shading.displacement_height - 0.5).abs() < f64::EPSILON);
         assert!((evaluate_displacement(&material, &context).unwrap() - 0.5).abs() < f64::EPSILON);
     }
 
@@ -3426,10 +3517,12 @@ mod tests {
         };
 
         let layers = [("Col", blended)];
-        let params = evaluate_surface(
+        let params = *evaluate_surface(
             &material,
             &HitContext::new(&groups).with_color_layers(&layers, None),
         )
+        .unwrap()
+        .dominant()
         .unwrap();
         for (actual, expected) in params.base_color.iter().zip([0.2, 0.3, 0.5, 0.75]) {
             assert!(
@@ -3441,12 +3534,14 @@ mod tests {
 
         // An explicitly missing Vertex Color layer is transparent black and records a warning.
         let sink = RefCell::new(Vec::new());
-        let params = evaluate_surface(
+        let params = *evaluate_surface(
             &material,
             &HitContext::new(&groups)
                 .with_color_layers(&[], Some([0.91, 0.37, 0.64, 0.22]))
                 .with_warnings(&sink),
         )
+        .unwrap()
+        .dominant()
         .unwrap();
         assert_eq!(params.base_color, [0.0, 0.0, 0.0, 0.0]);
         assert_eq!(sink.borrow()[0]["code"], json!("mesh.color_layer_missing"));
@@ -3469,20 +3564,24 @@ mod tests {
             ..Material::default()
         };
         let render = [0.2, 0.4, 0.8, 0.35];
-        let params = evaluate_surface(
+        let params = *evaluate_surface(
             &material,
             &HitContext::new(&groups).with_color_layers(&[], Some(render)),
         )
+        .unwrap()
+        .dominant()
         .unwrap();
         assert_eq!(params.base_color, render);
 
         let sink = RefCell::new(Vec::new());
-        let params = evaluate_surface(
+        let params = *evaluate_surface(
             &material,
             &HitContext::new(&groups)
                 .with_color_layers(&[], None)
                 .with_warnings(&sink),
         )
+        .unwrap()
+        .dominant()
         .unwrap();
         assert_eq!(params.base_color, [0.0; 4]);
         assert_eq!(sink.borrow()[0]["layer"], json!(""));
@@ -3510,17 +3609,21 @@ mod tests {
         };
         let source = [0.23, 0.71, 0.42, 0.36];
         let found = [("Ghost", source)];
-        let params = evaluate_surface(
+        let params = *evaluate_surface(
             &material,
             &HitContext::new(&groups).with_color_layers(&found, None),
         )
+        .unwrap()
+        .dominant()
         .unwrap();
         assert_eq!(params.base_color, [source[0], source[1], source[2], 1.0]);
 
-        let params = evaluate_surface(
+        let params = *evaluate_surface(
             &material,
             &HitContext::new(&groups).with_color_layers(&[], Some([0.87, 0.54, 0.19, 0.27])),
         )
+        .unwrap()
+        .dominant()
         .unwrap();
         assert_eq!(params.base_color, [0.0, 0.0, 0.0, 1.0]);
     }
@@ -3564,10 +3667,12 @@ mod tests {
         };
 
         let layers = [("Col", [0.2, 0.6, 0.4, 1.0])];
-        let params = evaluate_surface(
+        let params = *evaluate_surface(
             &material,
             &HitContext::new(&groups).with_color_layers(&layers, None),
         )
+        .unwrap()
+        .dominant()
         .unwrap();
         // Multiply: each channel of A times the interpolated vertex color B, at factor 1.
         for (actual, expected) in params.base_color.iter().zip([0.1, 0.15, 0.4, 1.0]) {
@@ -3714,6 +3819,8 @@ mod tests {
             ..Material::default()
         };
         evaluate_surface(&material, &HitContext::new(&groups))
+            .unwrap()
+            .dominant()
             .unwrap()
             .roughness
     }

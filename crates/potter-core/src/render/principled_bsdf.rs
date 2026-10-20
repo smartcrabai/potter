@@ -17,9 +17,9 @@
 //!
 //! Estimator contract: `evaluate` is the continuous BSDF times reflectance: the diffuse, specular,
 //! sheen and coat lobes above the surface, and the glass lobe on both sides (its reflection above,
-//! its transmission below). `continuous_density` is the density with which `path.rs` draws continuous
-//! directions (lobe mixture), so `evaluate / density` is unbiased for the mixture over the sampler's
-//! domain. The glass lobe's eval and density follow Cycles' `bsdf_microfacet_eval`, which also covers
+//! its transmission below). `continuous_density` is the density of one closure's continuous directions, its lobe
+//! mixture, so `evaluate / density` is unbiased for that closure over its sampler's domain. `path.rs` mixes the closures
+//! of a hit by selection weight. The glass lobe's eval and density follow Cycles' `bsdf_microfacet_eval`, which also covers
 //! half vectors the VNDF sampler never draws, so MIS on glass matches Cycles' eval/pdf and is not an
 //! exact density. A singular glass lobe (roughness zero) is a delta that `sample_glass` draws; light
 //! sampling cannot reach it.
@@ -80,8 +80,8 @@ pub(crate) fn lobe_probabilities(params: &BsdfParams, layers: &Layers) -> LobePr
     }
 }
 
-/// Density of the continuous (diffuse, sheen, coat and specular) directions drawn by `path.rs`, in solid
-/// angle, with the glass lobe's density as Cycles' eval and pdf define it. Diffuse is cosine-distributed;
+/// Density, in solid angle, of the continuous (diffuse, sheen, coat and specular) directions that one closure's lobe
+/// sampler draws, with the glass lobe's density as Cycles' eval and pdf define it. Diffuse is cosine-distributed;
 /// sheen is the LTC distribution; the coat and specular lobes are the GGX half-vector distribution D·cosθh
 /// mapped to the reflected direction. The glass lobe's density is its reflection above the surface and its
 /// refraction below it.
@@ -341,12 +341,6 @@ impl Layers {
     /// Sheen direction for the square sample `(u, v)` in `[0, 1)²`, drawn from the LTC distribution.
     pub(crate) fn sample_sheen(&self, u: f64, v: f64) -> DVec3 {
         self.sheen.direction(u, v)
-    }
-
-    /// Whether a light below the surface can reach it through the glass lobe. A singular lobe is drawn only as a
-    /// delta, which light sampling cannot reach, so it does not count.
-    pub(crate) fn transmits(&self) -> bool {
-        self.glass.is_some_and(|glass| !glass.singular)
     }
 }
 

@@ -9,8 +9,8 @@ use crate::{
     image::{ImageData, ImageInterpolation},
     model::{Id, LightType, Material, SceneDoc},
     shader::{
-        BsdfParams, EvaluatorWorkspace, HitContext, HitUvLayers, PreparedMaterial,
-        equirectangular_uv, evaluate_surface_with_workspace, height_gradient,
+        BsdfParams, EvaluatorWorkspace, HitContext, HitUvLayers, PreparedMaterial, ShaderClosure,
+        SurfaceShading, equirectangular_uv, evaluate_surface_with_workspace, height_gradient,
     },
 };
 
@@ -108,19 +108,299 @@ struct VolumeSegment {
     stochastic: bool,
 }
 
+/// One closure of a hit, weighted as Cycles weights closures (`closure_alloc`): `weight` is the share of the hit the
+/// closure takes, and `params` is the closure's own shading, with its alpha after the material's alpha mode, its own
+/// normal, and its layers set up for the hit's view.
 #[derive(Clone, Copy)]
+struct HitClosure {
+    weight: f64,
+    params: BsdfParams,
+    layers: Layers,
+}
+
+impl HitClosure {
+    fn new(weight: f64, params: BsdfParams, view: DVec3) -> Self {
+        let closure_layers = layers(&params, params.normal, view);
+        Self {
+            weight,
+            params,
+            layers: closure_layers,
+        }
+    }
+
+    /// Selection weight of the reflective share, `w · α` (Cycles' sample weight of a BSDF closure). A closure without
+    /// reflectance, such as Emission, takes no share.
+    fn reflect_weight(&self) -> f64 {
+        if self.params.reflectance > 0.0 {
+            self.weight * self.params.alpha
+        } else {
+            0.0
+        }
+    }
+
+    /// Selection weight of the pass-through share, `w · (1 − α) · mean(tint)` (Cycles' sample weight of its Transparent
+    /// closure, `bsdf_transparent_setup`).
+    fn pass_weight(&self) -> f64 {
+        self.weight * (1.0 - self.params.alpha) * transparent_tint(&self.params).element_sum() / 3.0
+    }
+}
+
+/// A closure's transparent tint, clamped at zero: Cycles' Transparent colour.
+fn transparent_tint(params: &BsdfParams) -> DVec3 {
+    DVec3::from_array(params.transparent_tint).max(DVec3::ZERO)
+}
+
+/// The share a surface event takes: a reflective draw from closure `Reflect`, or a camera pass-through whose
+/// `multiplier` is the throughput Cycles' transparent closure gives it.
+enum Pick {
+    Reflect(usize),
+    Pass { multiplier: DVec3 },
+}
+
+/// The closures of one hit with the totals Cycles' closure loops compute: selection, emission, coverage, and shadow
+/// transparency.
+struct Closures {
+    items: Vec<HitClosure>,
+    /// Sum of every share's selection weight, reflective and pass-through: the selection normaliser.
+    selection_total: f64,
+    /// Sum of the reflective selection weights.
+    reflect_total: f64,
+    /// Emitted radiance with each closure's coverage, `Σ w · α · E · λ` (`λ` is the layers' factor): the beauty's
+    /// emission term.
+    emission: DVec3,
+    /// Emitted radiance without coverage, `Σ w · E · λ`: the emission pass.
+    emission_pass: DVec3,
+    /// Weight-averaged base colour: the albedo pass.
+    albedo: [f64; 4],
+    /// Camera coverage, `Σ w · α / Σ w`; zero for a hit without closures.
+    coverage: f64,
+    /// Shadow transparency, `Σ w · (1 − α) · tint` (Cycles' `surface_shader_transparency`); one for a hit without
+    /// closures.
+    transparency: DVec3,
+}
+
+impl Closures {
+    fn new(items: Vec<HitClosure>) -> Self {
+        let mut selection_total = 0.0;
+        let mut reflect_total = 0.0;
+        let mut emission = DVec3::ZERO;
+        let mut emission_pass = DVec3::ZERO;
+        let mut albedo = [0.0; 4];
+        let mut weight_total = 0.0;
+        let mut coverage = 0.0;
+        let mut transparency = DVec3::ZERO;
+        for closure in &items {
+            let (weight, params) = (closure.weight, &closure.params);
+            let reflect = closure.reflect_weight();
+            selection_total += reflect + closure.pass_weight();
+            reflect_total += reflect;
+            let emitted = DVec3::from_array(params.emission_color)
+                * params.emission_strength
+                * closure.layers.lower();
+            emission += emitted * (weight * params.alpha);
+            emission_pass += emitted * weight;
+            for (channel, value) in albedo.iter_mut().zip(params.base_color) {
+                *channel += weight * value;
+            }
+            weight_total += weight;
+            coverage += weight * params.alpha;
+            transparency += transparent_tint(params) * (weight * (1.0 - params.alpha));
+        }
+        if weight_total > 0.0 {
+            albedo = albedo.map(|channel| channel / weight_total);
+            coverage /= weight_total;
+        } else {
+            transparency = DVec3::ONE;
+        }
+        Self {
+            items,
+            selection_total,
+            reflect_total,
+            emission,
+            emission_pass,
+            albedo,
+            coverage,
+            transparency,
+        }
+    }
+
+    /// Chooses one share with probability proportional to its selection weight, as Cycles' `surface_shader_bsdf_sample`
+    /// picks a closure by its sample weight. `None` when nothing is selectable.
+    fn pick(&self, unit: f64) -> Option<Pick> {
+        if self.items.is_empty() {
+            return Some(Pick::Pass {
+                multiplier: DVec3::ONE,
+            });
+        }
+        let target = unit * self.selection_total;
+        let mut cumulative = 0.0;
+        let mut picked = None;
+        for (index, closure) in self.items.iter().enumerate() {
+            let reflect = closure.reflect_weight();
+            if reflect > 0.0 {
+                cumulative += reflect;
+                picked = Some(Pick::Reflect(index));
+                if target < cumulative {
+                    break;
+                }
+            }
+            let pass = closure.pass_weight();
+            if pass > 0.0 {
+                cumulative += pass;
+                picked = Some(Pick::Pass {
+                    multiplier: self.pass_multiplier(closure),
+                });
+                if target < cumulative {
+                    break;
+                }
+            }
+        }
+        picked
+    }
+
+    /// The throughput of a pass through `closure`: its tint times `S / mean(tint)`. The pick probability
+    /// `w·(1−α)·mean(tint) / S` then leaves the expected throughput `w·(1−α)·tint`.
+    fn pass_multiplier(&self, closure: &HitClosure) -> DVec3 {
+        let tint = transparent_tint(&closure.params);
+        tint * (self.selection_total / (tint.element_sum() / 3.0))
+    }
+
+    /// The reflective share at `light`: `Σ w·α·f·|cos|` over the closures, each with its own lobes, normal and cosine
+    /// (Cycles' `surface_shader_bsdf_eval`).
+    fn bsdf_eval(&self, light: DVec3) -> DVec3 {
+        self.items.iter().fold(DVec3::ZERO, |sum, closure| {
+            let reflect = closure.reflect_weight();
+            if reflect <= 0.0 {
+                return sum;
+            }
+            let cosine = closure.layers.normal.dot(light).abs();
+            sum + evaluate_bsdf(&closure.params, &closure.layers, light) * (reflect * cosine)
+        })
+    }
+
+    /// Density of the continuous draws at `light`: each closure's lobe mixture weighted by its selection weight, over
+    /// the whole selection, pass-through included (Cycles' `_surface_shader_bsdf_eval_mis`).
+    fn continuous_pdf(&self, light: DVec3) -> f64 {
+        if self.selection_total <= 0.0 {
+            return 0.0;
+        }
+        let mixed: f64 = self
+            .items
+            .iter()
+            .map(|closure| {
+                let reflect = closure.reflect_weight();
+                if reflect > 0.0 {
+                    reflect * continuous_density(&closure.params, &closure.layers, light)
+                } else {
+                    0.0
+                }
+            })
+            .sum();
+        mixed / self.selection_total
+    }
+
+    /// Draws the reflective share of closure `index`, which `pick` chose, and returns the throughput weight of the
+    /// closure set. A continuous draw carries `Σ w·α·f·|cos| / p_mix` with `p_mix = Σ w·α·p / S`. A delta draw
+    /// carries the lobe weight times `S`, since the picked share's `w·α` over its pick probability `w·α / S` is `S`.
+    fn reflect(&self, index: usize, geometric: DVec3, rng: &mut Pcg32) -> Reflection {
+        let closure = &self.items[index];
+        match sample_lobes(&closure.params, &closure.layers, geometric, rng) {
+            LobeDraw::Absorbed => Reflection::Absorbed,
+            LobeDraw::Delta { direction, weight } => Reflection::Delta {
+                direction,
+                weight: weight * self.selection_total,
+            },
+            LobeDraw::Continuous(direction) => {
+                let pdf = self.continuous_pdf(direction);
+                Reflection::Continuous {
+                    direction,
+                    weight: self.bsdf_eval(direction) / pdf.max(1.0e-8),
+                    pdf,
+                }
+            }
+        }
+    }
+}
+
+/// The medium a surface bounds, from its Volume output's closures. Cycles sums volume closures, so each coefficient is
+/// the closure-weighted sum. `scatter` is σs and `absorption` is σa per channel, and `emission` is the emitted radiance
+/// per unit length, all absolute.
+#[derive(Clone, Copy, Default)]
+struct Medium {
+    scatter: [f64; 3],
+    absorption: [f64; 3],
+    emission: [f64; 3],
+    /// The Henyey-Greenstein anisotropy of the mixed medium. This is the one documented approximation: Cycles keeps a
+    /// phase function per volume closure, while the mixed medium takes the scatter-weighted average of the closures'
+    /// anisotropies.
+    anisotropy: f64,
+}
+
+impl Medium {
+    fn from_closures(volume: &[ShaderClosure]) -> Self {
+        let mut medium = Self::default();
+        let mut phase_weight = 0.0;
+        let mut phase_sum = 0.0;
+        for closure in volume.iter().filter(|closure| closure.weight > 0.0) {
+            let (weight, params) = (closure.weight, &closure.params);
+            add_scaled(&mut medium.scatter, weight, params.volume_scatter);
+            add_scaled(&mut medium.absorption, weight, params.volume_absorption);
+            add_scaled(&mut medium.emission, weight, params.volume_emission);
+            let scatter_mean = weight * params.volume_scatter.iter().sum::<f64>() / 3.0;
+            phase_weight += scatter_mean;
+            phase_sum += scatter_mean * params.volume_anisotropy;
+        }
+        if phase_weight > 0.0 {
+            medium.anisotropy = phase_sum / phase_weight;
+        }
+        medium
+    }
+
+    /// Whether the medium scatters or absorbs light, so a path crossing its boundary takes a segment through it.
+    fn has_medium(&self) -> bool {
+        self.scatter
+            .iter()
+            .chain(&self.absorption)
+            .any(|weight| *weight > 0.0)
+    }
+}
+
+/// `total += weight · values`, channel by channel.
+fn add_scaled(total: &mut [f64; 3], weight: f64, values: [f64; 3]) {
+    for (total, value) in total.iter_mut().zip(values) {
+        *total += weight * value;
+    }
+}
+
+/// A hit's shading: its closures, the medium it bounds, and its geometry.
 struct Surface {
     point: DVec3,
+    /// The shading normal of the dominant closure. It is the reference normal of light and environment sampling, of the
+    /// shadow offsets, and of the normal and occlusion passes.
     normal: DVec3,
     /// Unit normal on the viewer's side of the triangle; offsets ray origins to avoid self-hits.
     geometric_normal: DVec3,
     /// Origin of shadow rays: `point` on flat triangles, lifted onto the smooth surface otherwise.
     shadow_point: DVec3,
-    params: BsdfParams,
-    /// The sheen and coat layers at this hit, set up once for the hit's view direction.
-    layers: Layers,
+    closures: Closures,
+    medium: Medium,
     object_index: u32,
     element_index: u32,
+}
+
+/// The result of a reflective draw of the closure set. `Continuous` carries its throughput weight and the mixture density
+/// that MIS weighs light sampling against. `Delta` is a sharp glass direction. `Absorbed` ends the path.
+enum Reflection {
+    Continuous {
+        direction: DVec3,
+        weight: DVec3,
+        pdf: f64,
+    },
+    Delta {
+        direction: DVec3,
+        weight: DVec3,
+    },
+    Absorbed,
 }
 
 #[derive(Clone, Copy)]
@@ -933,7 +1213,7 @@ fn trace_path(
             images,
             evaluator_workspace,
         )?;
-        if surface.params.has_medium()
+        if surface.medium.has_medium()
             && let Some(boundary) = closest_hit(
                 geometry,
                 bvh,
@@ -948,10 +1228,11 @@ fn trace_path(
                 .get(boundary.triangle_index)
                 .is_some_and(|triangle| triangle.object_index == surface.object_index);
             let distance = boundary.distance.max(0.0);
-            let (transmittance, in_scatter) = homogeneous_medium_segment(&surface.params, distance);
-            let phase = henyey_greenstein(-1.0, surface.params.volume_anisotropy)
-                * (4.0 * std::f64::consts::PI);
-            radiance += throughput * environment * in_scatter * phase;
+            let (transmittance, in_scatter, emitted) =
+                homogeneous_medium_segment(&surface.medium, distance);
+            let phase =
+                henyey_greenstein(-1.0, surface.medium.anisotropy) * (4.0 * std::f64::consts::PI);
+            radiance += throughput * (environment * in_scatter * phase + emitted);
             throughput *= transmittance;
             if exits_medium {
                 origin = surface.point + direction * (distance + 2.0 * RAY_EPSILON);
@@ -967,86 +1248,88 @@ fn trace_path(
             }
             continue;
         }
+        // Emission is the closures' radiance weighted by their coverage, so a path that ends here still shows it.
+        radiance += throughput * surface.closures.emission;
         if terminate_on_next_surface {
             // Cycles shades the surface for emission, then ends the path (`integrate_surface_terminate`).
+            break;
+        }
+        // Light sampling covers every closure's reflective share at this vertex, whichever share is picked below.
+        if surface.closures.reflect_total > 0.0 {
             radiance += throughput
-                * DVec3::from_array(surface.params.emission_color)
-                * surface.params.emission_strength
-                * surface.layers.lower();
-            break;
+                * direct_lighting(
+                    doc,
+                    snapshot,
+                    geometry,
+                    bvh,
+                    lights,
+                    volumes,
+                    images,
+                    importance,
+                    &surface,
+                    environment,
+                    bounce < max_bounces,
+                    transparent_max_bounces.saturating_sub(transparent_bounce),
+                    rng,
+                    evaluator_workspace,
+                )?;
         }
-        if rng.next_f64() >= surface.params.alpha.clamp(0.0, 1.0) {
-            // A pass carries the Transparent closure's colour: the tint is its mean, weighted by the pass chance
-            // `1 - alpha`, so the expected throughput is Cycles' `(1 - alpha) * tint`.
-            throughput *= DVec3::from_array(surface.params.transparent_tint);
-            transparent_bounce += 1;
-            terminate_on_next_surface |= transparent_bounce >= transparent_cap;
-            origin = offset_origin(surface.point, direction, surface.geometric_normal);
-            continue;
-        }
-        radiance += throughput
-            * DVec3::from_array(surface.params.emission_color)
-            * surface.params.emission_strength
-            * surface.layers.lower();
-        radiance += throughput
-            * direct_lighting(
-                doc,
-                snapshot,
-                geometry,
-                bvh,
-                lights,
-                volumes,
-                images,
-                importance,
-                &surface,
-                environment,
-                bounce < max_bounces,
-                transparent_max_bounces.saturating_sub(transparent_bounce),
-                rng,
-                evaluator_workspace,
-            )?;
-        if bounce == max_bounces {
-            break;
-        }
-        let (next_direction, weight) = match sample_bsdf(
-            &surface.params,
-            &surface.layers,
-            surface.geometric_normal,
-            rng,
-        ) {
-            BsdfSample::Continuous {
-                direction,
-                weight,
-                pdf,
-            } => {
-                previous = Scatter::Surface(MisVertex {
-                    bsdf_pdf: pdf,
-                    normal: surface.normal,
-                    point: surface.point,
-                });
-                (direction, weight)
+        match surface.closures.pick(rng.next_f64()) {
+            // Nothing reflects or passes (emission only), so the path ends at this surface.
+            None => break,
+            Some(Pick::Pass { multiplier }) => {
+                // The pass carries the transparent tint scaled by its pick weight, so its expected throughput is
+                // Cycles' `Σ w · (1 − α) · tint`.
+                throughput *= multiplier;
+                transparent_bounce += 1;
+                terminate_on_next_surface |= transparent_bounce >= transparent_cap;
+                origin = offset_origin(surface.point, direction, surface.geometric_normal);
+                continue;
             }
-            BsdfSample::Delta { direction, weight } => {
-                previous = Scatter::Delta(surface.point);
-                (direction, weight)
+            Some(Pick::Reflect(index)) => {
+                if bounce == max_bounces {
+                    break;
+                }
+                let (next_direction, weight) =
+                    match surface
+                        .closures
+                        .reflect(index, surface.geometric_normal, rng)
+                    {
+                        Reflection::Continuous {
+                            direction,
+                            weight,
+                            pdf,
+                        } => {
+                            previous = Scatter::Surface(MisVertex {
+                                bsdf_pdf: pdf,
+                                normal: surface.normal,
+                                point: surface.point,
+                            });
+                            (direction, weight)
+                        }
+                        Reflection::Delta { direction, weight } => {
+                            previous = Scatter::Delta(surface.point);
+                            (direction, weight)
+                        }
+                        // Cycles' `LABEL_NONE`: a rejected draw ends the path.
+                        Reflection::Absorbed => break,
+                    };
+                if !next_direction.is_finite() || !weight.is_finite() {
+                    break;
+                }
+                throughput *= weight;
+                if bounce >= 3 {
+                    let survival = throughput.max_element().clamp(0.05, 0.95);
+                    if rng.next_f64() >= survival {
+                        break;
+                    }
+                    throughput /= survival;
+                }
+                direction = next_direction.normalize_or_zero();
+                origin = offset_origin(surface.point, direction, surface.geometric_normal);
+                bounce += 1;
             }
-            // Cycles' `LABEL_NONE`: a rejected draw ends the path.
-            BsdfSample::Absorbed => break,
-        };
-        if !next_direction.is_finite() || !weight.is_finite() {
-            break;
         }
-        throughput *= weight;
-        if bounce >= 3 {
-            let survival = throughput.max_element().clamp(0.05, 0.95);
-            if rng.next_f64() >= survival {
-                break;
-            }
-            throughput /= survival;
-        }
-        direction = next_direction.normalize_or_zero();
-        origin = offset_origin(surface.point, direction, surface.geometric_normal);
-        bounce += 1;
     }
     if !radiance.is_finite() {
         return Err(PotError::new(
@@ -1125,7 +1408,7 @@ fn write_center_passes(
                 images,
                 evaluator_workspace,
             )?;
-            if surface.params.alpha <= 0.0 {
+            if surface.closures.coverage <= 0.0 {
                 continue;
             }
             output.ids[index] = surface.object_index;
@@ -1140,11 +1423,9 @@ fn write_center_passes(
                 surface.normal,
                 1.0,
             ));
-            output.albedo[index] = surface.params.base_color.map(finite_f32);
+            output.albedo[index] = surface.closures.albedo.map(finite_f32);
             // The emission pass is the beauty's emission term: the coat attenuates it per channel.
-            let emission = DVec3::from_array(surface.params.emission_color)
-                * surface.params.emission_strength
-                * surface.layers.lower();
+            let emission = surface.closures.emission_pass;
             output.emission[index] = [
                 finite_f32(emission.x),
                 finite_f32(emission.y),
@@ -1152,8 +1433,8 @@ fn write_center_passes(
                 1.0,
             ];
             if film_transparent {
-                let alpha = surface.params.alpha
-                    + (1.0 - surface.params.alpha) * (1.0 - volume_transmittance);
+                let coverage = surface.closures.coverage;
+                let alpha = coverage + (1.0 - coverage) * (1.0 - volume_transmittance);
                 output.linear_rgba[index][3] = finite_f32(alpha);
                 output.rgba[index * 4 + 3] = (alpha.clamp(0.0, 1.0) * 255.0).round() as u8;
             }
@@ -1280,9 +1561,10 @@ fn closest_hit(
     bvh.closest_hit_two_sided(&geometry.triangles, origin, direction, t_min, t_max)
 }
 
-/// The shading parameters at one hit, for the transparent pass of a realtime shadow ray (`render/scene.rs`). They
-/// are the path tracer's, so a realtime shadow and a path-traced one read the same alpha and tint. The pass reads
-/// neither the displacement gradient nor the coat layers, so only the material evaluation runs.
+/// The shading of one hit for the transparent pass of a realtime shadow ray (`render/scene.rs`). Each closure carries its
+/// alpha after the material's alpha mode, as the path tracer's closures do, so a realtime shadow and a path-traced one
+/// read the same transparency. The pass reads neither the displacement gradient nor the layers, so only the material
+/// evaluation runs.
 pub(super) fn hit_params(
     doc: &SceneDoc,
     snapshot: &Snapshot,
@@ -1292,7 +1574,7 @@ pub(super) fn hit_params(
     direction: DVec3,
     images: &BTreeMap<String, ImageData>,
     evaluator_workspace: &mut EvaluatorWorkspace,
-) -> Result<BsdfParams> {
+) -> Result<SurfaceShading> {
     with_hit_frame(
         doc,
         snapshot,
@@ -1302,15 +1584,16 @@ pub(super) fn hit_params(
         direction,
         images,
         |frame| {
-            let mut params = evaluate_surface_with_workspace(
+            let mut shading = evaluate_surface_with_workspace(
                 frame.material,
                 frame.prepared,
                 &frame.context,
                 evaluator_workspace,
             )?;
-            apply_hit_alpha(frame.material, &mut params);
-            params.back_facing = frame.back_facing;
-            Ok(params)
+            for closure in &mut shading.closures {
+                apply_hit_alpha(frame.material, &mut closure.params);
+            }
+            Ok(shading)
         },
     )
 }
@@ -1472,45 +1755,62 @@ fn make_surface(
         direction,
         images,
         |frame| {
-            let mut params = evaluate_surface_with_workspace(
+            let shading = evaluate_surface_with_workspace(
                 frame.material,
                 frame.prepared,
                 &frame.context,
                 evaluator_workspace,
             )?;
-            apply_hit_alpha(frame.material, &mut params);
-            params.back_facing = frame.back_facing;
-            let normal = frame.normal;
-            if params.displacement_height != 0.0
+            // A displacement height field perturbs every closure's normal, as Cycles' bump displaces `sd->N` before
+            // the closures are built.
+            let gradient = if shading.displacement_height != 0.0
                 && frame.material.displacement_method != "displacement"
             {
-                let gradient = height_gradient(&frame.context, normal, |sample| {
+                Some(height_gradient(&frame.context, frame.normal, |sample| {
                     evaluate_surface_with_workspace(
                         frame.material,
                         frame.prepared,
                         sample,
                         evaluator_workspace,
                     )
-                    .map(|surface| surface.displacement_height)
-                })?;
-                params.normal = normal - gradient;
-            }
-            params.normal = if params.normal.is_finite() {
-                params.normal.normalize_or_zero()
+                    .map(|sample_shading| sample_shading.displacement_height)
+                })?)
             } else {
-                normal
+                None
             };
-            if params.normal.dot(-direction) < 0.0 {
-                params.normal = -params.normal;
+            let mut items = Vec::with_capacity(shading.closures.len());
+            for closure in shading
+                .closures
+                .iter()
+                .filter(|closure| closure.weight > 0.0)
+            {
+                let mut params = closure.params;
+                apply_hit_alpha(frame.material, &mut params);
+                params.back_facing = frame.back_facing;
+                let perturbed = gradient.map_or(params.normal, |shift| params.normal - shift);
+                let mut normal = if perturbed.is_finite() {
+                    perturbed.normalize_or_zero()
+                } else {
+                    frame.normal
+                };
+                if normal.dot(-direction) < 0.0 {
+                    normal = -normal;
+                }
+                params.normal = normal;
+                items.push(HitClosure::new(closure.weight, params, -direction));
             }
-            let hit_layers = layers(&params, params.normal, -direction);
+            // The dominant closure's normal is the surface's reference normal, for light sampling and the normal pass.
+            let normal = items
+                .iter()
+                .max_by(|first, second| first.weight.total_cmp(&second.weight))
+                .map_or(frame.normal, |closure| closure.params.normal);
             Ok(Surface {
                 point: frame.point,
-                normal: params.normal,
+                normal,
                 geometric_normal: frame.geometric_normal,
                 shadow_point: frame.shadow_point,
-                params,
-                layers: hit_layers,
+                closures: Closures::new(items),
+                medium: Medium::from_closures(&shading.volume),
                 object_index: frame.triangle.object_index,
                 element_index: frame.triangle.element_index,
             })
@@ -1552,18 +1852,16 @@ fn direct_lighting(
 ) -> Result<DVec3> {
     let normal = surface.normal;
     let geometric = surface.geometric_normal;
+    let closures = &surface.closures;
     let mut contribution = DVec3::ZERO;
     for light in lights {
         let Some(sample) = sample_light(light, surface.point, rng) else {
             continue;
         };
-        let facing = normal.dot(sample.direction);
-        let cosine = facing.abs();
-        // Below the surface only a glass lobe contributes, so other surfaces skip the shadow ray.
-        if cosine <= 0.0
-            || (facing < 0.0 && !surface.layers.transmits())
-            || sample.radiance.max_element() <= 0.0
-        {
+        // Every closure's own lobes and cosine (`Closures::bsdf_eval`). Below the surface only a glass lobe
+        // contributes, so a direction that no closure reaches skips the shadow ray.
+        let bsdf = closures.bsdf_eval(sample.direction);
+        if bsdf.max_element() <= 0.0 || sample.radiance.max_element() <= 0.0 {
             continue;
         }
         let visibility = shadow_transmittance(
@@ -1584,29 +1882,28 @@ fn direct_lighting(
         if visibility.max_element() <= 0.0 {
             continue;
         }
-        // A BSDF ray reaches a hittable light only when the path continues past this vertex and
-        // no volume can scatter it first (`trace_path`).
+        // A BSDF ray reaches a hittable light only when the path continues past this vertex and no volume can
+        // scatter it first (`trace_path`).
         let mis = if scatters && volumes.is_empty() && light.hittable() {
-            power_heuristic(
-                sample.pdf,
-                continuous_density(&surface.params, &surface.layers, sample.direction),
-            )
+            power_heuristic(sample.pdf, closures.continuous_pdf(sample.direction))
         } else {
             1.0
         };
-        contribution += evaluate_bsdf(&surface.params, &surface.layers, sample.direction)
-            * sample.radiance
-            * (cosine * visibility * mis);
+        contribution += bsdf * sample.radiance * (visibility * mis);
     }
+    // The environment's cosine strategy follows the dominant closure's normal, as `environment_light_pdf` takes it.
     let direction = match importance {
         Some(sampler) if rng.next_f64() >= 0.5 => sampler.sample(rng).0,
         _ => sample_cosine_hemisphere(normal, rng).0,
     };
-    let facing = normal.dot(direction);
-    let cosine = facing.abs();
     let light_pdf = environment_light_pdf(normal, direction, importance);
     // The importance sampler can draw below the surface, which only a glass lobe reaches.
-    if cosine > 0.0 && (facing > 0.0 || surface.layers.transmits()) && light_pdf > 0.0 {
+    let bsdf = if light_pdf > 0.0 {
+        closures.bsdf_eval(direction)
+    } else {
+        DVec3::ZERO
+    };
+    if bsdf.max_element() > 0.0 {
         let environment_sample =
             world_radiance(doc, &snapshot.scene_id, images, direction, environment)?;
         let visibility = shadow_transmittance(
@@ -1624,15 +1921,12 @@ fn direct_lighting(
             rng,
             evaluator_workspace,
         )?;
-        let bsdf_pdf = continuous_density(&surface.params, &surface.layers, direction);
         let weight = if scatters {
-            power_heuristic(light_pdf, bsdf_pdf)
+            power_heuristic(light_pdf, closures.continuous_pdf(direction))
         } else {
             1.0
         };
-        contribution += evaluate_bsdf(&surface.params, &surface.layers, direction)
-            * environment_sample
-            * (cosine * visibility * weight / light_pdf);
+        contribution += bsdf * environment_sample * (visibility * (weight / light_pdf));
     }
     Ok(contribution)
 }
@@ -1781,23 +2075,18 @@ fn shadow_transmittance(
             // Cycles counts each transparent surface a shadow ray crosses against the path's remaining
             // budget and blocks the ray past it (`intern/cycles/kernel/bvh/intersect_filter.h`);
             // volume-bounds surfaces are not counted (`SD_HAS_ONLY_VOLUME`).
-            if !surface.params.has_medium() {
+            if !surface.medium.has_medium() {
                 transparent_hits += 1;
                 if transparent_hits > transparent_budget {
                     blocked = true;
                     return false;
                 }
             }
-            // Cycles' shadow transparency is the Transparent closure's extinction, `(1 - alpha) · tint`
+            // Cycles' shadow transparency is the closures' transparent extinction, `Σ w · (1 − α) · tint`
             // (`kernel/integrator/surface_shader.h`, `surface_shader_transparency`). A glass or other transmissive
             // closure has none, so it blocks the shadow ray: its shader lacks `SD_HAS_TRANSPARENT_SHADOW`
             // (`scene/shader.cpp`, `kernel/bvh/intersect_filter.h`).
-            let alpha = surface.params.alpha.clamp(0.0, 1.0);
-            if alpha >= 1.0 {
-                blocked = true;
-                return false;
-            }
-            transmittance *= DVec3::from_array(surface.params.transparent_tint) * (1.0 - alpha);
+            transmittance *= surface.closures.transparency;
             if transmittance.max_element() <= 1.0e-5 {
                 blocked = true;
                 return false;
@@ -2207,39 +2496,33 @@ enum Scatter {
     Volume,
 }
 
-/// Outcome of sampling the Principled BSDF. `Continuous` carries the exact lobe-mixture density that MIS
-/// needs. `Delta` is a singular glass reflection or refraction, which light sampling cannot reach.
-/// `Absorbed` is a draw Cycles rejects (`LABEL_NONE`), so the path ends.
-enum BsdfSample {
-    Continuous {
-        direction: DVec3,
-        weight: DVec3,
-        pdf: f64,
-    },
-    Delta {
-        direction: DVec3,
-        weight: DVec3,
-    },
+/// A direction drawn from one closure's own lobes, before the closure set weights it. `Continuous` is a lobe-mixture
+/// draw of that closure. `Delta` is a singular glass direction with its weight over its branch probability.
+/// `Absorbed` is a draw Cycles rejects (`LABEL_NONE`).
+enum LobeDraw {
+    Continuous(DVec3),
+    Delta { direction: DVec3, weight: DVec3 },
     Absorbed,
 }
 
-fn sample_bsdf(
+/// Draws a direction from one closure's lobes, as Cycles' `bsdf_sample` draws its closure: the branch by the closure's
+/// own lobe probabilities, then that lobe's sampler. Only the closure set weights the result.
+fn sample_lobes(
     params: &BsdfParams,
     layers: &Layers,
     geometric: DVec3,
     rng: &mut Pcg32,
-) -> BsdfSample {
+) -> LobeDraw {
     let normal = layers.normal;
     let view = layers.view;
     let probabilities = lobe_probabilities(params, layers);
     let choice = rng.next_f64();
     if choice < probabilities.transmission {
         let rands = [rng.next_f64(), rng.next_f64(), rng.next_f64()];
-        let glass = sample_glass(params, layers, geometric, probabilities.transmission, rands);
-        return match glass {
-            GlassSample::Absorbed => BsdfSample::Absorbed,
-            GlassSample::Singular { direction, weight } => BsdfSample::Delta { direction, weight },
-            GlassSample::Rough { direction } => continuous_sample(params, layers, direction),
+        return match sample_glass(params, layers, geometric, probabilities.transmission, rands) {
+            GlassSample::Absorbed => LobeDraw::Absorbed,
+            GlassSample::Singular { direction, weight } => LobeDraw::Delta { direction, weight },
+            GlassSample::Rough { direction } => LobeDraw::Continuous(direction),
         };
     }
     let diffuse_end = probabilities.transmission + probabilities.diffuse;
@@ -2259,20 +2542,7 @@ fn sample_bsdf(
         let half_vector = sample_ggx_half(normal, params.roughness, rng);
         reflect(-view, half_vector).normalize_or_zero()
     };
-    continuous_sample(params, layers, direction)
-}
-
-/// The estimator `f cos / p_mix` of a continuous direction. The density is the lobe mixture, not the
-/// branch's own lobe, and `|cos|` admits the glass lobe's transmission below the surface.
-fn continuous_sample(params: &BsdfParams, layers: &Layers, direction: DVec3) -> BsdfSample {
-    let pdf = continuous_density(params, layers, direction);
-    let cosine = layers.normal.dot(direction).abs();
-    let weight = evaluate_bsdf(params, layers, direction) * (cosine / pdf.max(1.0e-8));
-    BsdfSample::Continuous {
-        direction,
-        weight,
-        pdf,
-    }
+    LobeDraw::Continuous(direction)
 }
 
 /// Density with which a direction is light-sampled at a surface vertex. The cosine strategy is
@@ -2472,13 +2742,15 @@ fn collect_volumes<'a>(
                 && material.volume_density.is_finite()
                 && material.volume_density > 0.0
         });
-        let params = evaluated_material;
+        let medium = evaluated_material
+            .as_ref()
+            .map(|shading| Medium::from_closures(&shading.volume));
         // Cycles' absolute coefficients (`BsdfParams`): a material volume's σs and σa, or, for a
         // material without a volume output, unit grey absorption. No material is the Principled
         // Volume default (colour 0.5, density 1).
-        let (scatter, absorption) = match params {
-            Some(params) if has_volume_output || simple_volume => {
-                (params.volume_scatter, params.volume_absorption)
+        let (scatter, absorption) = match medium {
+            Some(medium) if has_volume_output || simple_volume => {
+                (medium.scatter, medium.absorption)
             }
             Some(_) => ([0.0; 3], [1.0; 3]),
             None => ([0.5; 3], [0.5; 3]),
@@ -2511,9 +2783,7 @@ fn collect_volumes<'a>(
             }));
         }
         let emission = if has_volume_output || simple_volume {
-            params.map_or(DVec3::ZERO, |params| {
-                DVec3::from_array(params.volume_emission)
-            })
+            medium.map_or(DVec3::ZERO, |medium| DVec3::from_array(medium.emission))
         } else {
             DVec3::ZERO
         };
@@ -2526,7 +2796,7 @@ fn collect_volumes<'a>(
             meters_per_unit,
             density_range,
             albedo,
-            anisotropy: params.map_or(0.0, |params| params.volume_anisotropy),
+            anisotropy: medium.map_or(0.0, |medium| medium.anisotropy),
             emission,
             scattering,
             extinction_scale,
@@ -2547,20 +2817,25 @@ fn homogeneous_segment_integral(extinction: f64, distance: f64) -> (f64, f64) {
     (transmittance, source_distance)
 }
 
-/// Cycles' homogeneous medium over `distance` for a material volume on a mesh: per-channel
-/// transmittance `exp(-σt·d)` and the in-scatter `∫ σs·exp(-σt·s) ds` against constant environment
-/// light, with σt = σs + σa from the absolute coefficients of `BsdfParams`.
-fn homogeneous_medium_segment(params: &BsdfParams, distance: f64) -> (DVec3, DVec3) {
-    let channels: [(f64, f64); 3] = std::array::from_fn(|channel| {
-        let scattering = params.volume_scatter[channel];
-        let extinction = scattering + params.volume_absorption[channel];
+/// Cycles' homogeneous medium over `distance` for the medium a surface bounds: per-channel transmittance
+/// `exp(-σt·d)`, the in-scatter `∫ σs·exp(-σt·s) ds` against constant environment light, and the emission
+/// `∫ σe·exp(-σt·s) ds`, with σt = σs + σa from the medium's absolute coefficients.
+fn homogeneous_medium_segment(medium: &Medium, distance: f64) -> (DVec3, DVec3, DVec3) {
+    let channels: [(f64, f64, f64); 3] = std::array::from_fn(|channel| {
+        let scattering = medium.scatter[channel];
+        let extinction = scattering + medium.absorption[channel];
         let (transmittance, source_distance) = homogeneous_segment_integral(extinction, distance);
-        (transmittance, scattering * source_distance)
+        (
+            transmittance,
+            scattering * source_distance,
+            medium.emission[channel] * source_distance,
+        )
     });
     let [red, green, blue] = channels;
     (
         DVec3::new(red.0, green.0, blue.0),
         DVec3::new(red.1, green.1, blue.1),
+        DVec3::new(red.2, green.2, blue.2),
     )
 }
 
@@ -3230,7 +3505,7 @@ mod sampling_tests {
     use super::*;
     use crate::model::Material;
 
-    /// The mean of `sample_bsdf`'s weight (`f · cos / p_mix`) over the sampler's own directions is the
+    /// The mean of a reflective draw's weight (`f · cos / p_mix`, from `Closures::reflect`) over the sampler's own directions is the
     /// integral of `f · cos` over the hemisphere, if the mixture density the sampler reports matches
     /// how it draws the directions. At metallic 0.5 all three branches contribute, so a wrong
     /// density in any of them biases the mean. The reference is a midpoint quadrature of
@@ -3272,16 +3547,14 @@ mod sampling_tests {
 
         let samples = 400_000_usize;
         let mut rng = Pcg32::for_sample(1, 0, 0, 0);
+        let closures = Closures::new(vec![HitClosure::new(1.0, params, view)]);
         let mut sum = DVec3::ZERO;
         let mut sum_squares = DVec3::ZERO;
         for _ in 0..samples {
-            let weight =
-                match sample_bsdf(&params, &layers(&params, normal, view), normal, &mut rng) {
-                    BsdfSample::Continuous { weight, .. } | BsdfSample::Delta { weight, .. } => {
-                        weight
-                    }
-                    BsdfSample::Absorbed => DVec3::ZERO,
-                };
+            let weight = match closures.reflect(0, normal, &mut rng) {
+                Reflection::Continuous { weight, .. } | Reflection::Delta { weight, .. } => weight,
+                Reflection::Absorbed => DVec3::ZERO,
+            };
             sum += weight;
             sum_squares += weight * weight;
         }

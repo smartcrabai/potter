@@ -73,7 +73,11 @@ fn native_field_decodes_its_image_by_colourspace() -> TestResult {
             .get(&Id::new(material)?)
             .ok_or("material is missing")?;
         let context = HitContext::new(&doc.node_groups).with_images(&images);
-        Ok(evaluate_surface(material, &context)?.roughness)
+        let shading = evaluate_surface(material, &context)?;
+        Ok(shading
+            .dominant()
+            .ok_or("material has no closure")?
+            .roughness)
     };
     let encoded = 128.0 / 255.0;
     let data = roughness("data_mat")?;
