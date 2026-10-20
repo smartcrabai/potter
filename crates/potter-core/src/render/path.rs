@@ -959,7 +959,10 @@ fn trace_path(
                 }
             }
             surface.params = exit_params(&surface.params);
-            surface.layers = layers(&surface.params, surface.normal, -direction);
+            // Cycles' diffuse closure has no view term (`bsdf_diffuse_setup`, `bsdf_diffuse_eval` tests only N·omega), so
+            // the exit's view is its own normal. The probe's travel direction is not a view: a far-side exit has it below
+            // the outward normal, and `diffuse_lobe` would zero the lobe there.
+            surface.layers = layers(&surface.params, surface.normal, surface.normal);
         } else if diffuse_ancestor {
             // A Burley closure falls back to diffuse after a diffuse bounce (Cycles' `PATH_RAY_DIFFUSE_ANCESTOR`).
             surface.params.subsurface_weight = 0.0;
