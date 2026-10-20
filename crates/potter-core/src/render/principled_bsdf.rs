@@ -306,7 +306,6 @@ impl Layers {
     }
 }
 
-
 /// `coat_lower_factor` for a coat layer that is already set up.
 fn coat_lower_factor_of(params: &BsdfParams, coat: Option<&CoatLayer>) -> DVec3 {
     let Some(coat) = coat else {

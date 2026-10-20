@@ -2017,9 +2017,7 @@ fn shade(
     // EEVEE nor Cycles clamps the strength (gpu_shader_material_principled.glsl:179,
     // intern/cycles/kernel/svm/closure.h:206-207).
     let emission = if matches!(mode, Mode::Beauty) {
-        DVec3::from_array(params.emission_color)
-            * params.emission_strength
-            * shading.lower()
+        DVec3::from_array(params.emission_color) * params.emission_strength * shading.lower()
     } else {
         DVec3::ZERO
     };
@@ -2302,7 +2300,9 @@ mod shading_normal_tests {
         extract_geometry, source_has_color_layer, subdivide_displaced, surface_shader,
         triangle_corners, triangle_layer_colors, triangle_layer_uvs, world_face_normals,
     };
-    use crate::render::principled_bsdf::{diffuse_coefficient, layers as principled_layers, specular_coefficient};
+    use crate::render::principled_bsdf::{
+        diffuse_coefficient, layers as principled_layers, specular_coefficient,
+    };
     use crate::shader::BsdfParams;
     use crate::{
         eval::{EvaluationContext, Snapshot},
@@ -2994,11 +2994,16 @@ mod shading_normal_tests {
         let centre_direction = (centre - point).normalize_or_zero();
         assert!(centre_direction.dot(normal) < 0.0);
         assert_eq!(
-            specular_coefficient(&params, &principled_layers(&params, normal, normal), centre_direction),
+            specular_coefficient(
+                &params,
+                &principled_layers(&params, normal, normal),
+                centre_direction
+            ),
             DVec3::ZERO,
             "the specular lobe towards a below-horizon centre is zero"
         );
-        let output = diffuse_coefficient(&params, &principled_layers(&params, normal, normal)) * irradiance;
+        let output =
+            diffuse_coefficient(&params, &principled_layers(&params, normal, normal)) * irradiance;
         assert!(
             output.x > 0.0,
             "visible upper strip must retain diffuse light: {output:?}"

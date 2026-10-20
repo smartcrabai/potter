@@ -999,25 +999,24 @@ fn trace_path(
         if bounce == max_bounces {
             break;
         }
-        let (next_direction, weight) =
-            match sample_bsdf(&surface.params, &surface.layers, rng) {
-                BsdfSample::Continuous {
-                    direction,
-                    weight,
-                    pdf,
-                } => {
-                    previous = Scatter::Surface(MisVertex {
-                        bsdf_pdf: pdf,
-                        normal: surface.normal,
-                        point: surface.point,
-                    });
-                    (direction, weight)
-                }
-                BsdfSample::Delta { direction, weight } => {
-                    previous = Scatter::Delta(surface.point);
-                    (direction, weight)
-                }
-            };
+        let (next_direction, weight) = match sample_bsdf(&surface.params, &surface.layers, rng) {
+            BsdfSample::Continuous {
+                direction,
+                weight,
+                pdf,
+            } => {
+                previous = Scatter::Surface(MisVertex {
+                    bsdf_pdf: pdf,
+                    normal: surface.normal,
+                    point: surface.point,
+                });
+                (direction, weight)
+            }
+            BsdfSample::Delta { direction, weight } => {
+                previous = Scatter::Delta(surface.point);
+                (direction, weight)
+            }
+        };
         if !next_direction.is_finite() || !weight.is_finite() {
             break;
         }
