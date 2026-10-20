@@ -3436,6 +3436,7 @@ mod sampling_tests {
                     spot_blend: 0.0,
                     area: Some(shape),
                     spread: Some(spread),
+                    ray_mask: crate::model::RayVisibility::default().mask(),
                     use_mis: true,
                 };
                 for receiver in [
@@ -3514,6 +3515,7 @@ mod sampling_tests {
             spot_blend: 0.0,
             area: Some(shape),
             spread: Spread::new(0.0),
+            ray_mask: crate::model::RayVisibility::default().mask(),
             use_mis: true,
         };
         let mut rng = Pcg32::for_sample(0x5e0, 0, 0, 0);

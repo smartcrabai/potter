@@ -31,10 +31,7 @@ use super::{
         point_intensity, spot_attenuation,
     },
     path::object_for_index,
-    principled_bsdf::{
-        coat_coefficient, coat_lower_factor, diffuse_coefficient, light_lobes_coefficient,
-        specular_coefficient,
-    },
+    principled_bsdf::{coat_lower_factor, light_lobes_coefficient},
     raster::{
         AlphaMode, Line, Mode, SurfaceHit, SurfaceShader, Triangle, blend_color,
         blend_corner_normals, blend_uv,

@@ -16,8 +16,6 @@
     reason = "each test binary uses a subset of the shared oracle helpers"
 )]
 mod native_oracle;
-#[path = "common/process.rs"]
-mod process;
 
 use native_oracle::{TestResult, apply_operations, checked, pot, pot_json};
 use serde_json::{Value, json};
