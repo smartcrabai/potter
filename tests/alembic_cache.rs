@@ -663,6 +663,61 @@ fn is_oracle_uv_attribute(attribute: &Value) -> bool {
     attribute["domain"] == "CORNER" && attribute["type"] == "FLOAT2"
 }
 
+/// A UV pair within the tolerance of Blender's stored value (Potter stores V flipped, as the caller passes it).
+fn uv_close(actual: &Value, u: f64, v: f64) -> bool {
+    actual.as_array().is_some_and(|pair| {
+        pair.len() == 2
+            && [u, v].iter().zip(pair).all(|(expected, actual)| {
+                actual
+                    .as_f64()
+                    .is_some_and(|actual| (actual - expected).abs() <= 1.0e-6)
+            })
+    })
+}
+
+/// The UV layers of an evaluated mesh: names in store order, and the active and render layers.
+fn uv_layer_summary(mesh: &potter_core::geom::Mesh) -> String {
+    let Some(store) = mesh.attributes.get("uv_layers") else {
+        return "no UV store".to_owned();
+    };
+    let names = store["layers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|layer| layer["name"].as_str())
+        .collect::<Vec<_>>();
+    format!(
+        "layers {names:?}, active {}, render {}",
+        store["active"], store["render"]
+    )
+}
+
+/// The UV layers of the cache file that the oracle case reads, with the layer a read without polygons
+/// leaves unwritten. Reports the reason instead of failing, since it only annotates another failure.
+fn uv_cache_summary(fixture_dir: &Path, oracle_case: &Value) -> String {
+    let archive = oracle_case["cache_file"]["filepath"]
+        .as_str()
+        .and_then(|path| Path::new(path).file_name())
+        .map(|name| fixture_dir.join(name));
+    let (Some(archive), Some(object_path)) =
+        (archive, oracle_case["modifier"]["object_path"].as_str())
+    else {
+        return "cache unavailable: no archive or object path".to_owned();
+    };
+    let summary = fs::read(&archive)
+        .map_err(|error| error.to_string())
+        .and_then(|bytes| {
+            potter_core::exchange::alembic::mesh_cache_uv_layers(&bytes, object_path)
+                .map_err(|error| error.to_string())
+        });
+    match summary {
+        Ok((names, primary)) => {
+            format!("cache layers {names:?}, unwritten without polygons {primary:?}")
+        }
+        Err(error) => format!("cache unavailable: {error}"),
+    }
+}
+
 fn assert_oracle_uv_layers(
     mesh: &potter_core::geom::Mesh,
     expected: &Value,
@@ -764,7 +819,15 @@ fn assert_oracle_uv_layers(
                 let v = oracle_uv[1]
                     .as_f64()
                     .ok_or_else(|| format!("oracle UV layer {name} V is not numeric"))?;
-                assert_numeric_json_close(&actual_row[actual_corner], &json!([u, 1.0 - v]), 1.0e-6);
+                if !uv_close(&actual_row[actual_corner], u, 1.0 - v) {
+                    return Err(format!(
+                        "UV layer {name} on face {}: actual {} expected [{u}, {}]",
+                        actual_face.id,
+                        actual_row[actual_corner],
+                        1.0 - v
+                    )
+                    .into());
+                }
             }
             corner_offset += corner_count;
         }
@@ -1411,6 +1474,7 @@ fn blender_oracle_alembic_cache_matches_all_cases_and_mesh_attributes() -> Resul
             case_id == "sequence_same_size_reordered_connectivity"
                 || case_id == "nonsequence_animated_same_size_reordered_connectivity",
         )?;
+        let receiver_uv = uv_layer_summary(&evaluated_mesh(&target, 0.0)?);
         add_oracle_cache(&target, &fixture_dir, oracle_case)?;
         let frames = oracle_case["frames"]
             .as_array()
@@ -1449,8 +1513,14 @@ fn blender_oracle_alembic_cache_matches_all_cases_and_mesh_attributes() -> Resul
                     .as_f64()
                     .ok_or("Blender oracle frame is not numeric")?,
             )?;
-            assert_oracle_mesh(&actual, expected)
-                .map_err(|error| format!("{case_id} frame {}: {error}", expected["frame"]))?;
+            assert_oracle_mesh(&actual, expected).map_err(|error| {
+                format!(
+                    "{case_id} frame {}: {error}\n  receiver before modifier: {receiver_uv}\n  evaluated: {}\n  {}",
+                    expected["frame"],
+                    uv_layer_summary(&actual),
+                    uv_cache_summary(&fixture_dir, oracle_case),
+                )
+            })?;
             assert_inspect_matches_oracle(&target, expected, missing_sequence)?;
         }
         if case_id == "is_sequence_per_frame_files"

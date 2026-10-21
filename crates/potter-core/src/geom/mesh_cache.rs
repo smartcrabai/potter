@@ -539,7 +539,8 @@ fn write_cache_uvs(
                 continue;
             }
         };
-        if !polygons && primary != Some(cached_layer.name.as_str()) {
+        // Blender's UV-only read keeps the active layer's values (created at zero) and writes the others.
+        if !polygons && primary == Some(cached_layer.name.as_str()) {
             continue;
         }
         let layer = store.layers.get_mut(index).ok_or_else(|| {
