@@ -34,11 +34,51 @@ pub struct FlowSource {
 /// 0.3-unit effector at z = 0.95, the column's lowest liquid descends about 0.012 per frame while it is
 /// inside, against about 0.075 without the effector, and it leaves through the bottom face around frame 8.
 /// Potter has no grid obstacle rule to reproduce that, so this is a reported gap (solver parity).
+#[must_use]
 pub fn emitter_spawns_inside_effector(flows: &[FlowSource], effectors: &[[DVec3; 3]]) -> bool {
+    const SAMPLE_DIVISIONS: usize = 8;
+    let Some((effector_min, effector_max)) = triangle_bounds_all(effectors) else {
+        return false;
+    };
     flows.iter().any(|flow| {
         flow.triangles.iter().any(|triangle| {
-            let centre = (triangle[0] + triangle[1] + triangle[2]) / 3.0;
-            point_inside_closed_surface(centre, effectors)
+            let (minimum, maximum) = triangle_bounds(triangle);
+            // A triangle whose box misses the effector's box cannot have a point inside it.
+            let apart = (0..3).any(|axis| {
+                maximum[axis] < effector_min[axis] || minimum[axis] > effector_max[axis]
+            });
+            !apart
+                && triangle_samples(*triangle, SAMPLE_DIVISIONS)
+                    .any(|point| point_inside_closed_surface(point, effectors))
+        })
+    })
+}
+
+fn triangle_bounds(triangle: &[DVec3; 3]) -> (DVec3, DVec3) {
+    (
+        triangle[0].min(triangle[1]).min(triangle[2]),
+        triangle[0].max(triangle[1]).max(triangle[2]),
+    )
+}
+
+fn triangle_bounds_all(triangles: &[[DVec3; 3]]) -> Option<(DVec3, DVec3)> {
+    triangles
+        .iter()
+        .map(triangle_bounds)
+        .reduce(|(minimum, maximum), (next_min, next_max)| {
+            (minimum.min(next_min), maximum.max(next_max))
+        })
+}
+
+/// Points on a regular barycentric grid over `triangle`, `divisions` steps along each edge.
+fn triangle_samples(triangle: [DVec3; 3], divisions: usize) -> impl Iterator<Item = DVec3> {
+    let [first, second, third] = triangle;
+    let step = divisions as f64;
+    (0..=divisions).flat_map(move |row| {
+        (0..=divisions - row).map(move |column| {
+            let u = column as f64 / step;
+            let v = row as f64 / step;
+            first + (second - first) * u + (third - first) * v
         })
     })
 }

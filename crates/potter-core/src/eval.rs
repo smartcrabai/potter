@@ -1716,6 +1716,18 @@ impl Snapshot {
                             json!({ "data": data_id }),
                         )
                     })?;
+                    // Volume To Mesh is a Mesh-only modifier: Blender's OB_VOLUME accepts only
+                    // modifiers with a geometry-set hook, and MOD_volume_to_mesh has none
+                    // (object.cc BKE_object_support_modifier_type_check).
+                    if let Some(modifier) = node.modifiers.iter().find(|modifier| {
+                        gate.is_active(id, modifier) && modifier.modifier_type == "volume_to_mesh"
+                    }) {
+                        return Err(PotError::with_details(
+                            ErrorCode::InvalidOperation,
+                            "volume_to_mesh modifier can only be used on mesh objects",
+                            json!({"node_id":id,"modifier_id":modifier.id}),
+                        ));
+                    }
                     let mut generated = None;
                     for modifier in node.modifiers.iter().filter(|modifier| {
                         gate.is_active(id, modifier) && modifier.modifier_type == "mesh_to_volume"
@@ -1796,8 +1808,13 @@ impl Snapshot {
                                     )
                                 })?,
                         };
+                        // Blender returns the input volume unchanged when the voxel size is below 1e-5 or
+                        // the voxel amount is below 1 (`MOD_mesh_to_volume.cc`, `mesh_to_volume`).
                         let voxel_size = match resolution_mode {
-                            "VOXEL_SIZE" => number("voxel_size")?,
+                            "VOXEL_SIZE" => {
+                                let voxel_size = number("voxel_size")?;
+                                (voxel_size >= 1.0e-5).then_some(voxel_size)
+                            }
                             "VOXEL_AMOUNT" => {
                                 let amount = number("voxel_amount")?;
                                 let bounds = transformed.bounds().ok_or_else(|| {
@@ -1814,7 +1831,8 @@ impl Snapshot {
                                         json!({"modifier_id":modifier.id,"parameter":"voxel_amount"}),
                                     ));
                                 }
-                                (bounds.size().length() / amount) as f32 as f64
+                                (amount >= 1.0)
+                                    .then(|| (bounds.size().length() / amount) as f32 as f64)
                             }
                             _ => {
                                 return Err(PotError::with_details(
@@ -1824,12 +1842,14 @@ impl Snapshot {
                                 ));
                             }
                         };
-                        generated = Some(crate::geom::volume::mesh_to_fog_volume(
-                            &transformed,
-                            voxel_size as f32 as f64,
-                            number("interior_band_width")?,
-                            number("density")?,
-                        )?);
+                        if let Some(voxel_size) = voxel_size {
+                            generated = Some(crate::geom::volume::mesh_to_fog_volume(
+                                &transformed,
+                                voxel_size as f32 as f64,
+                                number("interior_band_width")?,
+                                number("density")?,
+                            )?);
+                        }
                     }
                     if let Some(generated) = generated {
                         volume_data.insert(data_id.clone(), generated);
@@ -2632,7 +2652,9 @@ fn object_mesh_dependencies(
                 continue;
             }
             let parameters: &[&str] = match modifier.modifier_type.as_str() {
-                "data_transfer" | "mesh_deform" | "curve" | "mesh_to_volume" => &["object"],
+                "data_transfer" | "mesh_deform" | "curve" | "mesh_to_volume" | "volume_to_mesh" => {
+                    &["object"]
+                }
                 "shrinkwrap" => {
                     if modifier
                         .params

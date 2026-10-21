@@ -313,9 +313,10 @@ fn none_and_domain_without_flows_preserve_their_input_meshes() {
     );
 }
 
-/// Effector height for the flow scene: its top (z = 0.75) lies below the flow's bottom face (z = 1.0),
-/// so no particle starts inside it and Potter's collision decides the domain output.
-const EFFECTOR_BELOW_FLOW_Z: f64 = 0.6;
+/// Effector height for the flow scene: its top (z = 0.95) lies below the flow's bottom face (z = 1.0),
+/// so no particle starts inside it, and the falling particles reach it within the baked frames, so
+/// Potter's collision decides the domain output.
+const EFFECTOR_BELOW_FLOW_Z: f64 = 0.8;
 /// Effector height that overlaps the flow's bottom face (z 0.8 to 1.1). Blender's oracle for this
 /// layout is the known gap: the liquid spawned inside the effector is slowed by Blender and not pushed out.
 const EFFECTOR_OVERLAPPING_FLOW_Z: f64 = 0.95;

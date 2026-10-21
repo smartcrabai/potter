@@ -350,7 +350,7 @@ pub fn sample_density_checked(position: DVec3, volume: &VolumeData) -> Result<f6
                 let sample = values
                     .get(index)
                     .ok_or_else(|| invalid_volume("volume sample index is out of range"))?;
-                result += f64::from(sample) * wx * wy * wz;
+                result += sample * wx * wy * wz;
             }
         }
     }
@@ -1932,7 +1932,7 @@ pub fn mesh_to_fog_volume(
     })
 }
 
-/// Squared index-space distance from each voxel to the nearest triangle, for the voxels OpenVDB's
+/// Squared index-space distance from each voxel to the nearest triangle, for the voxels `OpenVDB`'s
 /// voxelizer stores (`VoxelizePolygons::voxelizeTriangle` and `updateDistance`, MeshToVolume.h
 /// 2156-2222).
 ///
@@ -1940,7 +1940,7 @@ pub fn mesh_to_fog_volume(
 /// flooded voxel keeps the smaller of its stored distance and the distance to this triangle. Its
 /// neighbours are flooded further only while that distance is at most `0.75` in squared voxel units
 /// (`!(dist > 0.75)`), so the stored set is one voxel thick around the surface. Voxels no triangle
-/// reached stay `f64::INFINITY`: OpenVDB's background.
+/// reached stay `f64::INFINITY`: `OpenVDB`'s background.
 fn narrow_band_squared_distances(
     triangles: &TriangleBvh,
     origin: DVec3,
@@ -2012,7 +2012,7 @@ fn narrow_band_squared_distances(
     Ok(squared)
 }
 
-/// OpenVDB's renormalisation of the narrow band (`mesh_to_volume_internal::OffsetValues`,
+/// `OpenVDB`'s renormalisation of the narrow band (`mesh_to_volume_internal::OffsetValues`,
 /// `Renormalize`, `MinCombine`, and `InactivateValues`, MeshToVolume.h 2827-3046): every active voxel
 /// moves back by 0.8 voxels, takes one Godunov step on the offset values of its neighbours, keeps the
 /// smaller of the two, and is offset forward again. Voxels outside the band are left as background.

@@ -102,74 +102,7 @@ pub struct VdbTree {
     pub active_bbox: Option<([i32; 3], [i32; 3])>,
 }
 
-impl VdbTree {
-    /// Index coordinates Blender treats as active: stored samples plus every voxel of an active
-    /// tile. Stored inactive non-background samples count as active because the reader keeps no
-    /// per-voxel activity flags.
-    pub(crate) fn active_seeds(&self, limit: usize) -> Result<Vec<IVec3>> {
-        let mut seeds: Vec<IVec3> = self.values.keys().copied().collect();
-        for tile in self.tiles.values().filter(|tile| tile.active) {
-            let count = (0..3)
-                .try_fold(1_usize, |count, axis| {
-                    let extent =
-                        usize::try_from(i64::from(tile.max[axis]) - i64::from(tile.min[axis]) + 1)
-                            .ok()?;
-                    count.checked_mul(extent)
-                })
-                .ok_or_else(|| limit_error("VDB active tile voxel count overflow"))?;
-            if seeds
-                .len()
-                .checked_add(count)
-                .is_none_or(|total| total > limit)
-            {
-                return Err(limit_error(
-                    "VDB active voxels exceed the displacement budget",
-                ));
-            }
-            for z in tile.min[2]..=tile.max[2] {
-                for y in tile.min[1]..=tile.max[1] {
-                    for x in tile.min[0]..=tile.max[0] {
-                        seeds.push(IVec3::new(x, y, z));
-                    }
-                }
-            }
-        }
-        Ok(seeds)
-    }
-
-    /// A tree holding `values` as its stored samples. The background and inactive tiles are kept;
-    /// active tiles are dropped because `values` must already cover their voxels. The active
-    /// bounds are the tight bounds of samples that differ from the background.
-    pub(crate) fn with_samples(&self, values: HashMap<IVec3, VdbValue>) -> Self {
-        let mut active_bbox: Option<([i32; 3], [i32; 3])> = None;
-        for (point, value) in &values {
-            if *value == self.background_value {
-                continue;
-            }
-            let point = point.to_array();
-            active_bbox = Some(match active_bbox {
-                Some((minimum, maximum)) => (
-                    std::array::from_fn(|axis| minimum[axis].min(point[axis])),
-                    std::array::from_fn(|axis| maximum[axis].max(point[axis])),
-                ),
-                None => (point, point),
-            });
-        }
-        let tiles = self
-            .tiles
-            .iter()
-            .filter(|(_, tile)| !tile.active)
-            .map(|(key, tile)| (*key, *tile))
-            .collect();
-        Self {
-            background: self.background,
-            background_value: self.background_value,
-            values,
-            tiles,
-            active_bbox,
-        }
-    }
-}
+impl VdbTree {}
 
 /// An `OpenVDB` tile, whose value is constant over a power-of-two cube.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -222,21 +155,6 @@ impl VdbGrid {
         let index = self.transform.world_to_index.transform_point3(position);
         Self::trilinear_index(index, self.tree.background, |point| {
             self.sample_value(IVec3::from_array(point)).scalar()
-        })
-    }
-
-    /// Trilinearly sample one component of a scalar or vector grid at an index-space position.
-    /// Absent voxels read as that component of the background, as `OpenVDB`'s `BoxSampler` does.
-    #[must_use]
-    pub(crate) fn sample_index_component_trilinear(&self, index: DVec3, component: usize) -> f64 {
-        let background = self
-            .tree
-            .background_value
-            .component(component)
-            .unwrap_or(0.0);
-        Self::trilinear_index(index, background, |point| {
-            self.sample_index_component(point, component)
-                .unwrap_or(background)
         })
     }
 

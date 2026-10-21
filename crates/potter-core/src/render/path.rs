@@ -5,7 +5,7 @@ use glam::{DMat4, DVec3};
 use crate::{
     error::{ErrorCode, PotError, Result},
     eval::Snapshot,
-    geom::volume::{VolumeData, sample_density_checked_with_inverse},
+    geom::volume::{VolumeData, sample_density, sample_density_checked},
     image::{ImageData, ImageInterpolation},
     model::{Id, LightType, Material, SceneDoc},
     shader::{
@@ -2730,12 +2730,9 @@ fn sample_volume_density_local(
     instance: &VolumeInstance<'_>,
     local_position: DVec3,
 ) -> Result<f64> {
-    let density = sample_density_checked_with_inverse(
-        local_position,
-        instance.volume,
-        instance.local_to_index,
-    )?;
+    let density = sample_density(local_position, instance.volume);
     if !density.is_finite() {
+        sample_density_checked(local_position, instance.volume)?;
         return Err(PotError::new(
             ErrorCode::EvaluationFailed,
             "volume density is not finite",

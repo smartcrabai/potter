@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::{
     error::{ErrorCode, PotError, Result},
     eval::EvaluationPurpose,
-    model::{Id, Modifier, ShapeKey, ShapeKeyData},
+    model::{Id, Modifier, SceneDoc, ShapeKey, ShapeKeyData},
     params::{self, ParameterFamily},
 };
 
@@ -1526,7 +1526,6 @@ fn evaluate_modifier_output(
                             engine.doc,
                             &world_matrices,
                             &volume_data,
-                            modifier_warnings,
                         ),
                         "surface_deform" | "mesh_deform" => {
                             crate::eval::apply_scene_deform_modifier(

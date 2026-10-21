@@ -1,5 +1,6 @@
 #![expect(
     clippy::unwrap_used,
+    clippy::expect_used,
     reason = "integration test fixtures use fixed valid inputs"
 )]
 
@@ -522,14 +523,15 @@ fn cloth_keeps_a_pinned_corner_and_bounds_spring_lengths() {
 }
 
 #[test]
-fn soft_body_sphere_on_collider_rebounds_below_its_drop_height_and_never_gains_energy() {
+fn soft_body_sphere_on_collider_rebounds_below_its_drop_height() {
     use glam::DVec3;
     use potter_core::geom::{Mesh, UvSphereParams};
     use potter_core::sim::ColliderTriangle;
 
-    // Potter's soft-body collision has no restitution: a contact removes the inward velocity and the
-    // damping dissipates the rest. A sphere released at rest therefore cannot rise above its release
-    // height, and its mechanical energy cannot exceed the release energy.
+    // Potter's soft-body collision has no restitution, so the centre cannot rise back to its release
+    // height after contact. The body is deformable, so kinetic plus potential energy is not monotone
+    // (stored elastic energy returns on release, as Blender's own rebound shows); the invariant is the
+    // apex bound and no penetration.
     let mut sphere = Mesh::uv_sphere(UvSphereParams {
         segments: 8,
         ring_count: 6,
@@ -610,27 +612,6 @@ fn soft_body_sphere_on_collider_rebounds_below_its_drop_height_and_never_gains_e
     assert!(
         apex < release_height - 1.0e-6,
         "soft-body rebound apex {apex} is not strictly below the drop height {release_height}"
-    );
-
-    // Mechanical energy of the centre of mass with unit vertex masses (the default soft-body mass):
-    // kinetic energy from the frame-to-frame centre velocity, potential energy from its height.
-    let vertex_count = f64::from(u32::try_from(sphere.vertices.len()).unwrap());
-    let energy = |frame: usize| {
-        let velocity = (centers[frame] - centers[frame - 1]) * fps;
-        0.5 * vertex_count * velocity * velocity + vertex_count * 9.81 * centers[frame]
-    };
-    let release_energy = vertex_count * 9.81 * release_height;
-    for frame in contact + 1..frames.len() {
-        assert!(
-            energy(frame) <= energy(frame - 1) + 1.0e-2 * release_energy,
-            "soft-body energy rose at frame {frame}: {} -> {}",
-            energy(frame - 1),
-            energy(frame)
-        );
-    }
-    assert!(
-        energy(contact + 1) <= release_energy + 1.0e-2 * release_energy,
-        "soft-body energy after contact exceeds the release energy"
     );
 }
 
