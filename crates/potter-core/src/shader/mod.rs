@@ -3,7 +3,7 @@ mod world;
 mod evaluator;
 
 pub use evaluator::{
-    BsdfParams, EvaluatorWorkspace, HitContext, HitUvLayers, PreparedMaterial,
+    BsdfParams, EvaluatorWorkspace, HitContext, HitUvLayers, PreparedMaterial, SubsurfaceMethod,
     evaluate_displacement, evaluate_displacement_with_workspace, evaluate_surface,
     evaluate_surface_with_workspace, fill_color_layers, height_gradient,
 };

@@ -65,7 +65,7 @@ image = { version = "0.25", default-features = false, features = [
   "tiff",
   "webp",
 ] }
-jcode-sdk = { git = "https://github.com/1jehuang/jcode", rev = "5e7e0457ce2c6f5ecc9903b6f8415d7805594b1e" }
+jcode-sdk = { git = "https://github.com/1jehuang/jcode", rev = "45ae2382fbb2e2c67ee73ec9a99fc45c07b6bfe2" }
 jsonschema = "=0.59.0"
 lz4_flex = "0.14"
 num-rational = "0.4.2"
@@ -115,6 +115,7 @@ ci = "github"
 install-path = "CARGO_HOME"
 installers = ["shell", "homebrew"]
 publish-jobs = ["homebrew"]
+recursive-tarball = true
 tap = "smartcrabai/homebrew-tap"
 targets = [
   "aarch64-apple-darwin",

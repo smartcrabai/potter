@@ -1024,6 +1024,7 @@ fn assemble(
         .collect();
     let origin = Origin {
         vertices: origin_vertices,
+        source_vertices: None,
         faces: origin_faces,
         corners: None,
         ..Default::default()

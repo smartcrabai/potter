@@ -143,17 +143,16 @@ impl Position {
                 edge_sharp.push(sharpness.get(&key).copied().unwrap_or(0.0));
             }
         };
-        for (poly, _) in polys {
-            for corner in 0..poly.len() {
-                add_edge(edge_key(poly[corner], poly[(corner + 1) % poly.len()]));
-            }
+        // Blender numbers edge points in the order its mesh stores the edges, which
+        // `blender_edge_order` reproduces for polygon edges; loose edges follow.
+        for key in super::bevel_shading::blender_edge_order(polys) {
+            add_edge(key);
         }
         for &[first, second] in loose_edges {
             add_edge(edge_key(first, second));
         }
         let (vertex_starts, vertex_corners) = group(&corner_vertex, vertex_count);
-        let mut edge_order: Vec<usize> = (0..edge_ends.len()).collect();
-        edge_order.sort_unstable_by_key(|edge| edge_ends[*edge]);
+        let edge_order: Vec<usize> = (0..edge_ends.len()).collect();
 
         Self {
             starts,
@@ -447,7 +446,8 @@ pub(super) fn subdivide_simple_once(
 }
 
 /// One subdivision level's mesh from refined points, shared by SIMPLE and Catmull-Clark. `points` holds
-/// the refined vertices, then one point per edge in `edge_points` key order, then one per source face.
+/// the refined vertices, then one point per edge in `Position::edge_order` (Blender's edge order),
+/// then one per source face.
 /// Every source corner becomes one quad `[corner, next edge point, face point, previous edge point]`,
 /// faces in source order. Loose edges split at their edge point, and each output vertex records its
 /// source origin. `output_creases` maps output edge endpoints to Blender's canonical crease value.
@@ -490,10 +490,16 @@ pub(super) fn subdivided_mesh(
     let mut vertex_origins: Vec<Vec<(usize, f64)>> = (0..mesh.vertices.len())
         .map(|vertex| vec![(vertex, 1.0)])
         .collect();
+    // Origins follow point order: edge points are numbered in Blender's edge order, not key order.
+    let mut edges_by_point: Vec<(usize, (usize, usize))> = edge_points
+        .iter()
+        .map(|(&edge, &point)| (point, edge))
+        .collect();
+    edges_by_point.sort_unstable();
     vertex_origins.extend(
-        edge_points
-            .keys()
-            .map(|edge| vec![(edge.0, 0.5), (edge.1, 0.5)]),
+        edges_by_point
+            .into_iter()
+            .map(|(_, edge)| vec![(edge.0, 0.5), (edge.1, 0.5)]),
     );
     vertex_origins.extend(source_polygons.iter().map(|(face, _)| {
         let share = 1.0 / usize_as_f64(face.len());
@@ -501,6 +507,11 @@ pub(super) fn subdivided_mesh(
     }));
     let origin = Origin {
         vertices: vertex_origins,
+        source_vertices: Some(
+            (0..points.len())
+                .map(|index| (index < mesh.vertices.len()).then_some(index))
+                .collect(),
+        ),
         faces: source_polygons
             .iter()
             .enumerate()

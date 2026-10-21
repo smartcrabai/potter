@@ -1061,6 +1061,7 @@ fn float_output_origin(
     }
     Ok(Origin {
         vertices,
+        source_vertices: None,
         faces: polys
             .iter()
             .map(|poly| usize::try_from(poly.orig).ok())

@@ -217,6 +217,22 @@ fn harden_loop(topology: &Topology, loop_: Loop) -> Option<DVec3> {
     }
 }
 
+/// Edges in the order Blender's mesh stores them, each as `(lower, higher)` vertex: the first
+/// occurrence over the face corners, taking each corner's edge to its previous corner.
+pub(super) fn blender_edge_order(polygons: &[super::Polygon]) -> Vec<(usize, usize)> {
+    let mut seen = HashSet::new();
+    let mut order = Vec::new();
+    for (face, _) in polygons {
+        for corner in 0..face.len() {
+            let key = edge_key(face[(corner + face.len() - 1) % face.len()], face[corner]);
+            if seen.insert(key) {
+                order.push(key);
+            }
+        }
+    }
+    order
+}
+
 /// Blender's `bevel_edges_sharp_boundary`, run when the input has no custom normals: an edge of a
 /// smooth rebuilt face that meets a strip or corner polygon is sharp. Point pairs.
 fn sharp_boundary(topology: &Topology, smooth: &[bool]) -> Vec<(usize, usize)> {

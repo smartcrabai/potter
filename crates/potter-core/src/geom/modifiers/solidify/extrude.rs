@@ -593,6 +593,12 @@ pub(super) fn solidify_extrude(mesh: &Mesh, _modifier: &Modifier, params: &Param
             .iter()
             .map(|&vertex| vec![(vertex, 1.0)])
             .collect(),
+        // Blender's offset vertices are new: only the original vertices carry an index.
+        source_vertices: Some(
+            (0..vertex_origin.len())
+                .map(|index| (index < verts_num).then_some(index))
+                .collect(),
+        ),
         faces: face_sources,
         corners: Some(corners.iter().map(|&corner| vec![(corner, 1.0)]).collect()),
         ..Default::default()

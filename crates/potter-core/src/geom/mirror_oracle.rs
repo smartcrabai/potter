@@ -403,6 +403,12 @@ fn mirror_codes_survive_reload_through_bisect_and_deformation() -> TestResult {
             node.data.clone().ok_or("subject data")?,
         )
     };
+    let subject_name = document
+        .nodes
+        .get(&subject)
+        .ok_or("subject node")?
+        .name
+        .clone();
     let base_mesh = document
         .data_blocks
         .get_mut(&data_id)
@@ -434,6 +440,7 @@ fn mirror_codes_survive_reload_through_bisect_and_deformation() -> TestResult {
         std::slice::from_ref(&first_modifier),
         &document.node_groups,
         1.0,
+        &subject_name,
         DMat4::IDENTITY,
         &BTreeMap::new(),
         &BTreeMap::new(),
@@ -441,8 +448,13 @@ fn mirror_codes_survive_reload_through_bisect_and_deformation() -> TestResult {
         &BTreeMap::new(),
         crate::eval::ModifierEvaluationContext::default(),
         |_, modifier| modifier.enabled,
+        crate::geom::modifiers::TextureSeed::new(
+            crate::eval::EvaluationPurpose::Preview,
+            0,
+            &subject_name,
+        ),
         None,
-        |_, _, _| Ok(None),
+        |_, _, _, _, _| Ok(None),
     )?
     .mesh;
     let codes = super::clnor::corner_codes(&baked)?.ok_or("Mirror lost the code layer")?;

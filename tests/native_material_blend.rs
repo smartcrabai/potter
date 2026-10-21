@@ -405,9 +405,11 @@ fn alpha_mode_and_threshold_survive_authoring_through_blend() -> TestResult {
         FLOAT_TOLERANCE,
         "clip threshold",
     );
+    // A clip material's Principled Alpha is binary, as Blender's glTF importer builds a MASK: the base alpha 0.8
+    // reaches the 0.42 cutoff, so the socket is 1 (`io_scene_gltf2/blender/imp/pbrMetallicRoughness.py` 630-640).
     assert_close(
         number(&clip["principled_alpha"])?,
-        0.8,
+        1.0,
         FLOAT_TOLERANCE,
         "clip alpha",
     );

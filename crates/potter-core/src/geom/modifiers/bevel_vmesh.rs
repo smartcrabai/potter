@@ -25,7 +25,7 @@ use crate::geom::clnor::{self, NormalCodeOptions};
 
 use crate::geom::uv_layers;
 use crate::geom::{
-    attribute_keys, edge_key,
+    attribute_keys, clear_origindex, edge_key,
     provenance::{
         CornerFloat2LayerKey, CornerFloat2Sources, Origin, PointInterpolationEvent,
         mean_value_corners,
@@ -3348,6 +3348,7 @@ pub(super) fn finish(
     };
     let origin = Origin {
         vertices: origins,
+        source_vertices: None,
         faces,
         point_interpolation_events,
         corner_interpolated,
@@ -3360,6 +3361,7 @@ pub(super) fn finish(
         .collect();
     let mut result =
         build_mesh_with_edge_identity(points, polygons, loose, &origin, Some(&identities), mesh)?;
+    clear_origindex(&mut result);
     if !emitted_edge_flag_suppressions.is_empty()
         || !emitted_seam_edges.is_empty()
         || !emitted_sharp_edges.is_empty()

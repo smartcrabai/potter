@@ -146,6 +146,7 @@ pub(super) fn build(
         });
     let origin = Origin {
         vertices: vertex_sources,
+        source_vertices: None,
         faces: samples
             .corners
             .iter()

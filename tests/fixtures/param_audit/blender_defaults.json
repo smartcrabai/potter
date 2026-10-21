@@ -325,6 +325,27 @@
       "use_pin_to_last": false
     },
     "hook": {
+      "falloff_curve": [
+        [
+          0.0,
+          0.0
+        ],
+        [
+          1.0,
+          1.0
+        ]
+      ],
+      "falloff_curve_settings": {
+        "use_clip": true,
+        "clip_bounds": [
+          0.0,
+          0.0,
+          1.0,
+          1.0
+        ],
+        "extend": "EXTRAPOLATED"
+      },
+      "vertex_indices": [],
       "center": [
         0.0,
         0.0,
@@ -1051,6 +1072,26 @@
       "voxel_size": 0.10000000149011612
     },
     "warp": {
+      "falloff_curve": [
+        [
+          0.0,
+          0.0
+        ],
+        [
+          1.0,
+          1.0
+        ]
+      ],
+      "falloff_curve_settings": {
+        "use_clip": true,
+        "clip_bounds": [
+          0.0,
+          0.0,
+          1.0,
+          1.0
+        ],
+        "extend": "EXTRAPOLATED"
+      },
       "bone_from": "",
       "bone_to": "",
       "falloff_radius": 1.0,

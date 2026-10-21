@@ -2172,7 +2172,7 @@ fn modifier(params: &Value) -> TestResult<Modifier> {
 }
 
 fn evaluate_bevel(mesh: &Mesh, params: &Value) -> TestResult<Result<Mesh, PotError>> {
-    Ok(evaluate_modifiers(mesh, &[modifier(params)?]))
+    Ok(evaluate_modifiers(mesh, &[modifier(params)?], "TestMesh"))
 }
 
 /// A unit cube with one UV layer, `UVMap`, whose corner values depend only on the corner's vertex.
