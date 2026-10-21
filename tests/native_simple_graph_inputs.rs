@@ -38,8 +38,7 @@ import bpy
 import json
 import sys
 
-blend_path, out_path = sys.argv[sys.argv.index("--") + 1:][:2]
-bpy.ops.wm.open_mainfile(filepath=blend_path)
+out_path = sys.argv[sys.argv.index("--") + 1]
 result = {}
 for material in bpy.data.materials:
     if material.node_tree is None:
@@ -96,6 +95,8 @@ fn authored_graph_inputs_survive_blend_round_trip() -> TestResult {
              "alpha_mode": "opaque"},
             {"op": "material.create", "id": "generated_material", "name": "Generated Material",
              "base_color": MATERIAL_BASE, "roughness": MATERIAL_ROUGHNESS, "alpha_mode": "opaque"},
+            {"op": "node.create", "id": "generated_body", "kind": "box",
+             "params": {"size": 0.5}, "material": "generated_material"},
             {"op": "node.update", "target": {"id": plane},
              "set": {"materials": ["authored_material"]}}
         ]),
@@ -110,6 +111,13 @@ fn authored_graph_inputs_survive_blend_round_trip() -> TestResult {
     );
 
     let read = blender_principled(&blender, root.path(), &exported)?;
+    let generated_node = &read["Generated Material"];
+    assert_close(
+        number(&generated_node["roughness"])?,
+        MATERIAL_ROUGHNESS,
+        FLOAT_TOLERANCE,
+        "generated material roughness after import",
+    );
     let authored_node = &read["Authored Graph"];
     assert_close(
         number(&authored_node["roughness"])?,
