@@ -2648,6 +2648,7 @@ def dump_all():
             "lights": [{"name": x.name_full, "potter_id": x.get("potter.id"),
                         "library": library_reference(x), "type": x.type,
                         "color": plain(x.color), "energy": float(x.energy), "shadow_soft_size": float(x.shadow_soft_size),
+                        "sun_angle": float(getattr(x, "angle", math.radians(0.526))),
                         "soft_falloff": bool(getattr(x, "use_soft_falloff", True)),
                         "use_multiple_importance_sampling": bool(x.cycles.use_multiple_importance_sampling),
                         "spot_size": float(getattr(x, "spot_size", math.pi / 4)),
@@ -7503,6 +7504,8 @@ def export_doc(doc, target, pack, scene_hash, context):
             light.color = raw.get("color", [1.0, 1.0, 1.0])
             light.energy = raw.get("energy", 1000.0)
             light.shadow_soft_size = raw.get("radius", 0.1)
+            if raw.get("light_type") == "sun":
+                light.angle = float(raw.get("sun_angle", math.radians(0.526)))
             if raw.get("light_type") in ("point", "spot"):
                 light.use_soft_falloff = bool(raw.get("soft_falloff", True))
             if raw.get("light_type") == "area":

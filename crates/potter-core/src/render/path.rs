@@ -1494,7 +1494,8 @@ pub(super) fn add_camera_light_shapes(
     output: &mut RasterOutput,
 ) -> Result<()> {
     let lights = collect_lights(doc, snapshot);
-    if !lights.iter().any(|light| light.intersects(RayKind::Camera)) {
+    let suns = camera_sun_discs(doc, snapshot);
+    if !lights.iter().any(|light| light.intersects(RayKind::Camera)) && suns.is_empty() {
         return Ok(());
     }
     let bvh = Bvh::build(&geometry.triangles)?;
@@ -1514,11 +1515,20 @@ pub(super) fn add_camera_light_shapes(
                 RayKind::Camera,
             )
             .map_or(f64::INFINITY, |hit| hit.distance);
-            let Some(light) =
+            let mut radiance =
                 nearest_light_hit(&lights, origin, direction, origin, surface, RayKind::Camera)
-            else {
+                    .map_or(DVec3::ZERO, |light| light.radiance);
+            // A sun is at infinity, so its disc is behind every surface: EEVEE's depth test is against the far plane.
+            if surface.is_infinite() {
+                for sun in &suns {
+                    if direction.dot(sun.to_sun) >= sun.cos_half_angle {
+                        radiance += sun.radiance;
+                    }
+                }
+            }
+            if radiance.max_element() <= 0.0 {
                 continue;
-            };
+            }
             let index = usize::try_from(y)
                 .ok()
                 .and_then(|row| row.checked_mul(usize::try_from(width).ok()?))
@@ -1531,9 +1541,9 @@ pub(super) fn add_camera_light_shapes(
                 })?;
             let [red, green, blue, alpha] = output.linear_rgba[index];
             let linear = [
-                f64::from(red) + light.radiance.x,
-                f64::from(green) + light.radiance.y,
-                f64::from(blue) + light.radiance.z,
+                f64::from(red) + radiance.x,
+                f64::from(green) + radiance.y,
+                f64::from(blue) + radiance.z,
                 f64::from(alpha),
             ];
             output.linear_rgba[index] = linear.map(|value| value as f32);
@@ -1541,6 +1551,55 @@ pub(super) fn add_camera_light_shapes(
         }
     }
     Ok(())
+}
+
+/// A sun light's disc, as EEVEE draws it (`eevee_light_shape_display.bsl.hh`, `shape_display_light_radiance_get`).
+struct SunDisc {
+    /// The unit direction towards the sun.
+    to_sun: DVec3,
+    /// The cosine of the disc's half angle: `1 / sqrt(1 + r²)` for `r = tan(angle / 2)` (`cos_from_tan`).
+    cos_half_angle: f64,
+    /// The disc's radiance, `color · (1 + 1 / r²) / π` (`M_1_PI * inv_sin_sq`), with the colour scaled by energy.
+    radiance: DVec3,
+}
+
+/// The visible sun lights, with the disc EEVEE draws for each: its direction is the light's local +Z
+/// (`l_sun.direction = z_axis`), which points away from the shine, and its radius is clamped to `[0.001, 20]`
+/// (`eevee_light.cc`, `shape_radius`), with the angle capped at 179.9°.
+fn camera_sun_discs(doc: &SceneDoc, snapshot: &Snapshot) -> Vec<SunDisc> {
+    doc.nodes
+        .iter()
+        .filter(|(_, node)| {
+            node.kind == "light"
+                && node.visible
+                && node.render_visible
+                && node.resolved_ray_visibility().allows(RayKind::Camera)
+        })
+        .filter_map(|(node_id, node)| {
+            let data = node
+                .data
+                .as_ref()
+                .and_then(|data_id| doc.data_blocks.get(data_id))?
+                .light
+                .as_ref()?;
+            if data.light_type != LightType::Sun {
+                return None;
+            }
+            let evaluated = snapshot.nodes.get(node_id)?;
+            let matrix = DMat4::from_cols_array(&evaluated.world_matrix);
+            let to_sun = matrix.transform_vector3(DVec3::Z).normalize_or_zero();
+            let half_angle = data.sun_angle.min(179.9_f64.to_radians()) / 2.0;
+            let radius = half_angle.tan().clamp(0.001, 20.0);
+            let cos_half_angle = 1.0 / (1.0 + radius * radius).sqrt();
+            let shape = (1.0 + 1.0 / (radius * radius)) / std::f64::consts::PI;
+            let colour = DVec3::from_array(data.color).max(DVec3::ZERO);
+            Some(SunDisc {
+                to_sun,
+                cos_half_angle,
+                radiance: colour * (data.energy.max(0.0) * shape),
+            })
+        })
+        .collect()
 }
 pub(super) fn composite_realtime_volumes(
     doc: &SceneDoc,
