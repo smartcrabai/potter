@@ -1444,14 +1444,7 @@ const DYNAMIC_PAINT_BRUSH_SETTINGS: &[&str] = &[
 
 /// Canvas-only settings. `radius`, `color`, and `strength` are the Potter-native fallback paint
 /// that a canvas uses when it has no brush; they have no Blender counterpart.
-const DYNAMIC_PAINT_CANVAS_SETTINGS: &[&str] = &[
-    "brushes",
-    "surface_format",
-    "canvas_surfaces",
-    "radius",
-    "color",
-    "strength",
-];
+const DYNAMIC_PAINT_CANVAS_SETTINGS: &[&str] = &["brushes", "surface_format", "canvas_surfaces"];
 
 /// Potter-native dynamic-paint settings accepted at the top level of a canvas or brush.
 const DYNAMIC_PAINT_NATIVE_SETTINGS: &[&str] = &[

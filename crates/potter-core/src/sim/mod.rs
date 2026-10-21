@@ -1742,9 +1742,6 @@ fn dynamic_paint_brush_settings(
                 json!({"brush_id":id}),
             ));
         }
-        if active_modifier(&id, node, "dynamic_paint", gate).is_none() {
-            continue;
-        }
         physics_support::reject_unhonoured(
             "dynamic_paint_brush",
             settings,
@@ -1759,9 +1756,16 @@ fn dynamic_paint_brush_settings(
         })?;
         brushes.push(DynamicPaintBrush {
             position: matrix.transform_point3(DVec3::ZERO),
-            radius: setting_f64(settings, "paint_distance").unwrap_or(canvas_radius),
-            color: color_setting(settings, "paint_color").unwrap_or(canvas_color),
-            strength: setting_f64(settings, "paint_alpha").unwrap_or(canvas_strength),
+            // Blender's brush names take precedence; Potter-native keys fill in when they are absent.
+            radius: setting_f64(settings, "paint_distance")
+                .or_else(|| setting_f64(settings, "radius"))
+                .unwrap_or(canvas_radius),
+            color: color_setting(settings, "paint_color")
+                .or_else(|| color_setting(settings, "color"))
+                .unwrap_or(canvas_color),
+            strength: setting_f64(settings, "paint_alpha")
+                .or_else(|| setting_f64(settings, "strength"))
+                .unwrap_or(canvas_strength),
         });
     }
     Ok(brushes)

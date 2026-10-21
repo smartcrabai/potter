@@ -339,23 +339,13 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
         ParameterFamily::Modifier,
         &modifier_type,
         &params,
-        &operation_pointer(engine.operation_index, "params"),
+        "/params",
     )?;
-    validate_modifier_resource(
-        engine,
-        &modifier_type,
-        &params,
-        &operation_pointer(engine.operation_index, "params"),
-    )?;
+    validate_modifier_resource(engine, &modifier_type, &params, "/params")?;
     if modifier_type == "volume_displace" {
         validate_volume_displace_params(engine, &params)?;
     } else if is_attribute_modifier_type(&modifier_type) {
-        validate_attribute_modifier_params(
-            engine,
-            &modifier_type,
-            &params,
-            &operation_pointer(engine.operation_index, "params"),
-        )?;
+        validate_attribute_modifier_params(engine, &modifier_type, &params, "/params")?;
     }
     validate_particle_modifier_params(engine, &modifier_type, &params)?;
     let mut changed = false;
@@ -531,14 +521,9 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                 ParameterFamily::Modifier,
                 modifier_type,
                 &candidate,
-                &operation_pointer(engine.operation_index, "set/params"),
+                "/set/params",
             )?;
-            validate_modifier_resource(
-                engine,
-                modifier_type,
-                &candidate,
-                &operation_pointer(engine.operation_index, "set/params"),
-            )?;
+            validate_modifier_resource(engine, modifier_type, &candidate, "/set/params")?;
             if modifier_type == "volume_displace" {
                 validate_volume_displace_params(engine, &candidate)?;
             } else if is_attribute_modifier_type(modifier_type) {
@@ -546,7 +531,7 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                     engine,
                     modifier_type,
                     &candidate,
-                    &operation_pointer(engine.operation_index, "set/params"),
+                    "/set/params",
                 )?;
             }
             validate_particle_modifier_params(engine, modifier_type, &candidate)?;

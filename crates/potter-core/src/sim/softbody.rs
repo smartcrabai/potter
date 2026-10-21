@@ -699,7 +699,12 @@ mod tests {
             &colliders,
         )
         .unwrap();
-        assert!(result[0].z > 0.0);
+        // A vertex stops on the surface (thickness 0), so "does not cross" is z >= 0 up to rounding.
+        assert!(
+            result[0].z >= -1.0e-12,
+            "vertex crossed the collider: z={}",
+            result[0].z
+        );
     }
 
     #[test]
