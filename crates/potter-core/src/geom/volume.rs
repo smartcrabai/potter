@@ -1,7 +1,7 @@
 //! Inline scalar volume grids and mesh conversion.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::Arc,
 };
 
@@ -1835,15 +1835,18 @@ pub fn mesh_to_fog_volume(
     if !interior_distance.is_finite() || interior_distance <= 0.0 {
         return Err(invalid_volume("mesh-to-volume interior band is invalid"));
     }
-    let band = narrow_band_squared_distances(&triangles, minimum_index, dims)?;
+    let (band, band_primitives) = narrow_band_squared_distances(&triangles, minimum_index, dims)?;
     let mut signed_distances = Vec::with_capacity(sample_count);
     let mut active = Vec::with_capacity(sample_count);
+    let mut primitives = Vec::with_capacity(sample_count);
     for z in 0..dims[2] {
         for y in 0..dims[1] {
             for x in 0..dims[0] {
                 let index_position = minimum_index + DVec3::new(x as f64, y as f64, z as f64);
                 let inside = triangles.is_inside(index_position);
-                let squared = band[(z * dims[1] + y) * dims[0] + x];
+                let linear_index = (z * dims[1] + y) * dims[0] + x;
+                let squared = band[linear_index];
+                primitives.push(band_primitives[linear_index]);
                 let signed = if squared.is_finite() {
                     let unsigned = (squared as f32).sqrt() * voxel_size;
                     if !unsigned.is_finite() {
@@ -1864,6 +1867,19 @@ pub fn mesh_to_fog_volume(
                 signed_distances.push(signed);
             }
         }
+    }
+    // OpenVDB expands the band only when the interior band is wider than two voxels
+    // (`minBandWidth = 2 * voxelSize`; the exterior band is one voxel).
+    if interior_distance > 2.0 * voxel_size {
+        NarrowBand {
+            triangles: &triangles,
+            origin: minimum_index,
+            dims,
+            voxel_size,
+            exterior_width: voxel_size,
+            interior_width: interior_distance,
+        }
+        .expand(&mut signed_distances, &mut active, &mut primitives);
     }
     renormalize_signed_distances(
         &mut signed_distances,
@@ -1932,20 +1948,21 @@ pub fn mesh_to_fog_volume(
     })
 }
 
-/// Squared index-space distance from each voxel to the nearest triangle, for the voxels `OpenVDB`'s
-/// voxelizer stores (`VoxelizePolygons::voxelizeTriangle` and `updateDistance`, MeshToVolume.h
-/// 2156-2222).
+/// Squared index-space distance from each voxel to the nearest triangle, and that triangle, for the
+/// voxels `OpenVDB`'s voxelizer stores (`VoxelizePolygons::voxelizeTriangle` and `updateDistance`,
+/// MeshToVolume.h 2156-2222).
 ///
 /// Each triangle floods from the voxel holding its first corner through the 26-neighbourhood. A
-/// flooded voxel keeps the smaller of its stored distance and the distance to this triangle. Its
-/// neighbours are flooded further only while that distance is at most `0.75` in squared voxel units
-/// (`!(dist > 0.75)`), so the stored set is one voxel thick around the surface. Voxels no triangle
-/// reached stay `f64::INFINITY`: `OpenVDB`'s background.
+/// flooded voxel keeps the smaller of its stored distance and the distance to this triangle; on a
+/// tie it keeps the smaller triangle index. Its neighbours are flooded further only while that
+/// distance is at most `0.75` in squared voxel units (`!(dist > 0.75)`), so the stored set is one
+/// voxel thick around the surface. Voxels no triangle reached stay `f64::INFINITY` (`OpenVDB`'s
+/// background) with `u32::MAX` as their triangle.
 fn narrow_band_squared_distances(
     triangles: &TriangleBvh,
     origin: DVec3,
     dims: [usize; 3],
-) -> Result<Vec<f64>> {
+) -> Result<(Vec<f64>, Vec<u32>)> {
     const SPREAD_LIMIT_SQUARED: f64 = 0.75;
     let [nx, ny, _] = dims;
     let origin_coord = [origin.x as i64, origin.y as i64, origin.z as i64];
@@ -1962,9 +1979,19 @@ fn narrow_band_squared_distances(
     };
     let sample_count = dims[0] * dims[1] * dims[2];
     let mut squared = vec![f64::INFINITY; sample_count];
+    let mut primitive = vec![u32::MAX; sample_count];
     let mut visited = vec![0_u32; sample_count];
     for (triangle_index, triangle) in triangles.triangles.iter().enumerate() {
         let mark = u32::try_from(triangle_index + 1).map_err(|_| resource_error())?;
+        let prim = u32::try_from(triangle_index).map_err(|_| resource_error())?;
+        // Keeps the nearer triangle, and the smaller triangle index on an exact tie (`updateDistance`).
+        let record = |index: usize, distance: f64, squared: &mut [f64], primitive: &mut [u32]| {
+            if distance < squared[index] || (distance == squared[index] && prim < primitive[index])
+            {
+                squared[index] = distance;
+                primitive[index] = prim;
+            }
+        };
         let corner = triangle.points[0].floor();
         let seed = [corner.x as i64, corner.y as i64, corner.z as i64];
         // OpenVDB stores the seed's distance and expands it whatever that distance is.
@@ -1974,7 +2001,7 @@ fn narrow_band_squared_distances(
                 DVec3::new(seed[0] as f64, seed[1] as f64, seed[2] as f64),
                 triangle.points,
             );
-            squared[index] = squared[index].min(distance);
+            record(index, distance, &mut squared, &mut primitive);
         }
         let mut pending = vec![seed];
         while let Some(current) = pending.pop() {
@@ -2000,7 +2027,7 @@ fn narrow_band_squared_distances(
                             ),
                             triangle.points,
                         );
-                        squared[index] = squared[index].min(distance);
+                        record(index, distance, &mut squared, &mut primitive);
                         if distance <= SPREAD_LIMIT_SQUARED {
                             pending.push(neighbour);
                         }
@@ -2009,7 +2036,214 @@ fn narrow_band_squared_distances(
             }
         }
     }
-    Ok(squared)
+    Ok((squared, primitive))
+}
+
+/// `OpenVDB`'s narrow-band expansion for bands wider than two voxels (`ExpandNarrowband`,
+/// `updateVoxel`, `ConstructVoxelMask`, `expandNarrowband`, MeshToVolume.h 2285-2800).
+///
+/// The active set grows one layer at a time from the inactive face neighbours of the active voxels
+/// (the mask). A candidate takes the distance to the nearest primitive among the active voxels within
+/// a manhattan limit of 5 (first layer) or 6 (second layer), `computeDistance`. It is stored when it
+/// lies inside its band (`!inside && distance < exterior`, `inside && distance < interior`), with the
+/// sign of its background. Its neighbours are queued only when the band has room for one more voxel
+/// (`distance + voxel < band`). The second layer is the 26-neighbourhood of the updated first-layer
+/// voxels within the same 8-voxel leaf, and it runs only in leaves where a first-layer voxel updated.
+struct NarrowBand<'a> {
+    triangles: &'a TriangleBvh,
+    origin: DVec3,
+    dims: [usize; 3],
+    voxel_size: f32,
+    exterior_width: f32,
+    interior_width: f32,
+}
+
+impl NarrowBand<'_> {
+    fn index(&self, coord: [i64; 3]) -> Option<usize> {
+        let mut local = [0_usize; 3];
+        for axis in 0..3 {
+            let value = usize::try_from(coord[axis]).ok()?;
+            if value >= self.dims[axis] {
+                return None;
+            }
+            local[axis] = value;
+        }
+        Some((local[2] * self.dims[1] + local[1]) * self.dims[0] + local[0])
+    }
+
+    fn local(&self, index: usize) -> [usize; 3] {
+        let x = index % self.dims[0];
+        let y = (index / self.dims[0]) % self.dims[1];
+        let z = index / (self.dims[0] * self.dims[1]);
+        [x, y, z]
+    }
+
+    fn leaf(&self, index: usize) -> [usize; 3] {
+        self.local(index).map(|value| value / 8)
+    }
+
+    fn neighbours_face(&self, index: usize) -> Vec<usize> {
+        let [x, y, z] = self.local(index).map(|value| value as i64);
+        [
+            (1, 0, 0),
+            (-1, 0, 0),
+            (0, 1, 0),
+            (0, -1, 0),
+            (0, 0, 1),
+            (0, 0, -1),
+        ]
+        .into_iter()
+        .filter_map(|(dx, dy, dz)| self.index([x + dx, y + dy, z + dz]))
+        .collect()
+    }
+
+    fn neighbours_26(&self, index: usize) -> Vec<usize> {
+        let [x, y, z] = self.local(index).map(|value| value as i64);
+        let mut neighbours = Vec::with_capacity(26);
+        for dz in -1_i64..=1 {
+            for dy in -1_i64..=1 {
+                for dx in -1_i64..=1 {
+                    if (dx, dy, dz) != (0, 0, 0)
+                        && let Some(neighbour) = self.index([x + dx, y + dy, z + dz])
+                    {
+                        neighbours.push(neighbour);
+                    }
+                }
+            }
+        }
+        neighbours
+    }
+
+    /// `computeDistance`: the distance to the nearest primitive of the active voxels (as of the start
+    /// of the round) within `limit` manhattan steps, in world units.
+    fn nearest(
+        &self,
+        index: usize,
+        limit: i64,
+        active: &[bool],
+        primitive: &[u32],
+    ) -> Option<(f32, u32)> {
+        let [x, y, z] = self.local(index).map(|value| value as i64);
+        let mut primitives = BTreeSet::new();
+        for dz in -limit..=limit {
+            let reach_z = limit - dz.abs();
+            for dy in -reach_z..=reach_z {
+                let reach_y = reach_z - dy.abs();
+                for dx in -reach_y..=reach_y {
+                    if let Some(neighbour) = self.index([x + dx, y + dy, z + dz])
+                        && active[neighbour]
+                    {
+                        primitives.insert(primitive[neighbour]);
+                    }
+                }
+            }
+        }
+        let point = self.origin + DVec3::new(x as f64, y as f64, z as f64);
+        let mut best: Option<(f64, u32)> = None;
+        for prim in primitives {
+            let distance = point_triangle_distance_squared(
+                point,
+                self.triangles.triangles[prim as usize].points,
+            );
+            if best.is_none_or(|(current, _)| distance < current) {
+                best = Some((distance, prim));
+            }
+        }
+        best.map(|(squared, prim)| ((squared.sqrt() as f32) * self.voxel_size, prim))
+    }
+
+    /// `updateVoxel`: returns whether the voxel was updated, and whether its neighbours are queued.
+    fn update(
+        &self,
+        index: usize,
+        limit: i64,
+        snapshot: &[bool],
+        values: &mut [f32],
+        active: &mut [bool],
+        primitive: &mut [u32],
+    ) -> (bool, bool) {
+        let Some((distance, prim)) = self.nearest(index, limit, snapshot, primitive) else {
+            return (false, false);
+        };
+        let inside = values[index] < 0.0;
+        if !inside && distance < self.exterior_width {
+            values[index] = distance;
+            active[index] = true;
+            primitive[index] = prim;
+            return (true, distance + self.voxel_size < self.exterior_width);
+        }
+        if inside && distance < self.interior_width {
+            values[index] = -distance;
+            active[index] = true;
+            primitive[index] = prim;
+            return (true, distance + self.voxel_size < self.interior_width);
+        }
+        (false, false)
+    }
+
+    /// `expandNarrowband` over successive masks until no inactive voxel is queued.
+    fn expand(&self, values: &mut [f32], active: &mut [bool], primitive: &mut [u32]) {
+        let mut mask: BTreeSet<usize> = BTreeSet::new();
+        for (index, &is_active) in active.iter().enumerate() {
+            if is_active {
+                for neighbour in self.neighbours_face(index) {
+                    if !active[neighbour] {
+                        mask.insert(neighbour);
+                    }
+                }
+            }
+        }
+        while !mask.is_empty() {
+            let snapshot = active.to_vec();
+            mask.retain(|&index| !snapshot[index]);
+            if mask.is_empty() {
+                break;
+            }
+            let mut next = BTreeSet::new();
+            let mut leaves: BTreeMap<[usize; 3], Vec<usize>> = BTreeMap::new();
+            for &index in &mask {
+                leaves.entry(self.leaf(index)).or_default().push(index);
+            }
+            for (leaf, members) in &leaves {
+                let mut any_updated = false;
+                let mut second_layer = BTreeSet::new();
+                let mut updated_here = BTreeSet::new();
+                for &index in members {
+                    let (updated, activate) =
+                        self.update(index, 5, &snapshot, values, active, primitive);
+                    if updated {
+                        any_updated = true;
+                        updated_here.insert(index);
+                    }
+                    if activate {
+                        for neighbour in self.neighbours_26(index) {
+                            if self.leaf(neighbour) == *leaf {
+                                second_layer.insert(neighbour);
+                            }
+                        }
+                        for neighbour in self.neighbours_face(index) {
+                            if self.leaf(neighbour) != *leaf {
+                                next.insert(neighbour);
+                            }
+                        }
+                    }
+                }
+                if any_updated {
+                    for &index in &second_layer {
+                        if snapshot[index] || updated_here.contains(&index) {
+                            continue;
+                        }
+                        let (updated, activate) =
+                            self.update(index, 6, &snapshot, values, active, primitive);
+                        if updated && activate {
+                            next.extend(self.neighbours_face(index));
+                        }
+                    }
+                }
+            }
+            mask = next.into_iter().filter(|&index| !active[index]).collect();
+        }
+    }
 }
 
 /// `OpenVDB`'s renormalisation of the narrow band (`mesh_to_volume_internal::OffsetValues`,

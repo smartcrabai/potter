@@ -1,6 +1,10 @@
 #![expect(clippy::expect_used, reason = "integration test fixtures")]
 
-use std::{cmp::Ordering, collections::HashMap, fs};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, HashMap},
+    fs,
+};
 
 use glam::DVec3;
 use potter_core::{
@@ -337,6 +341,77 @@ fn blender_5_2_2_volume_modifier_meshes_match_fixtures() {
         fixture(include_str!("fixtures/pr18o_volume/tiny_voxels.json")),
         "tiny_voxels",
     );
+}
+
+#[derive(Deserialize)]
+struct BandExpansionOracle {
+    blender_version: String,
+    voxel_size: f64,
+    operand_local_center: [f64; 3],
+    operand_size: f64,
+    thresholds: Vec<f64>,
+    narrow_band: BandExpansionCase,
+    expanded_band: BandExpansionCase,
+}
+
+#[derive(Deserialize)]
+struct BandExpansionCase {
+    interior_band_width: f64,
+    counts: BTreeMap<String, BandExpansionCounts>,
+}
+
+#[derive(Deserialize)]
+struct BandExpansionCounts {
+    vertex_count: usize,
+    polygon_count: usize,
+}
+
+/// A Mesh to Volume interior band wider than two voxels takes OpenVDB's narrow-band expansion
+/// (`meshToVolume`, `minBandWidth = 2 * voxelSize`). The 0.8 band at voxel 0.25 (3.2 voxels) is
+/// expanded and the 0.2 band (one voxel) is not; Blender's Volume to Mesh counts differ at 0.35
+/// (`tests/fixtures/pr18o_volume/generate_band_expansion.py`).
+#[test]
+fn blender_mesh_to_volume_band_wider_than_two_voxels_matches_expanded_narrow_band() {
+    let oracle: BandExpansionOracle =
+        serde_json::from_str(include_str!("fixtures/pr18o_volume/band_expansion.json"))
+            .expect("valid Blender band-expansion fixture");
+    assert_eq!(oracle.blender_version, "5.2.2 LTS");
+    assert_ne!(
+        oracle.narrow_band.counts["0.35"].vertex_count,
+        oracle.expanded_band.counts["0.35"].vertex_count,
+        "the wide band must change the surface, or the case does not exercise expansion"
+    );
+    let mut mesh = Mesh::box_mesh(BoxParams {
+        size: DVec3::splat(oracle.operand_size),
+    })
+    .expect("valid operand cube");
+    let center = DVec3::from_array(oracle.operand_local_center);
+    for vertex in &mut mesh.vertices {
+        vertex.co += center;
+    }
+    for (label, case) in [
+        ("narrow band", &oracle.narrow_band),
+        ("expanded band", &oracle.expanded_band),
+    ] {
+        let volume =
+            volume::mesh_to_fog_volume(&mesh, oracle.voxel_size, case.interior_band_width, 1.0)
+                .expect("Potter mesh-to-volume conversion");
+        for threshold in &oracle.thresholds {
+            let expected = &case.counts[&threshold.to_string()];
+            let actual = volume::volume_to_mesh_named_adaptive(&volume, *threshold, "density", 0.0)
+                .expect("Potter volume to mesh");
+            assert_eq!(
+                actual.vertices.len(),
+                expected.vertex_count,
+                "{label} threshold {threshold}: vertex count"
+            );
+            assert_eq!(
+                actual.faces.len(),
+                expected.polygon_count,
+                "{label} threshold {threshold}: polygon count"
+            );
+        }
+    }
 }
 
 #[test]
