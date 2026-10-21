@@ -88,31 +88,50 @@ pub(crate) fn spot_cone(matrix: &DMat4, to_light: DVec3, spot_size: f64, spot_bl
     t * t * (3.0 - 2.0 * t)
 }
 
-/// EEVEE's `light_influence_attenuation` for a local light (`eevee_light_lib.bsl.hh`): `(1 - (d / R)⁴)²`, which reaches zero
-/// at the influence radius `R`. `R` is the custom distance when `use_custom_distance` is set (`attenuation_radius_get`,
-/// `LA_CUSTOM_ATTENUATION`), and otherwise `sqrt(power / threshold)`, where the power is the largest colour channel times
-/// `|energy| / 100`, times the larger of the diffuse and specular factors (`eevee_light.cc` `shape_parameters_set`). A
-/// zero radius culls the light, so it contributes nothing.
-pub(crate) fn local_light_influence(
+/// The squared influence radius of a local light for a closure class with multiplier `class_factor`: the custom distance when
+/// `use_custom_distance` is on, else `sqrt(power / threshold)` with `power = max colour · |energy| / 100 · class_factor`
+/// (`eevee_light.cc` `shape_parameters_set` and `attenuation_radius_get`). Surfaces use the larger of the diffuse and
+/// specular factors, and volumes the volume factor.
+pub(crate) fn local_light_influence_radius_squared(
     data: &LightData,
-    distance_squared: f64,
+    class_factor: f64,
     threshold: f64,
 ) -> f64 {
-    let radius_squared = if data.use_custom_distance {
-        data.cutoff_distance * data.cutoff_distance
-    } else {
-        // `surface_max_power = max(diff_fac, spec_fac) · max_power` (`eevee_light.cc` `shape_parameters_set`).
-        let max_power = DVec3::from_array(data.color).max_element().max(0.0)
-            * (data.energy.abs() / 100.0)
-            * data.diffuse_factor.max(data.specular_factor).max(0.0);
-        max_power / threshold
-    };
+    if data.use_custom_distance {
+        return data.cutoff_distance * data.cutoff_distance;
+    }
+    let max_power = DVec3::from_array(data.color).max_element().max(0.0)
+        * (data.energy.abs() / 100.0)
+        * class_factor.max(0.0);
+    max_power / threshold
+}
+
+/// EEVEE's `light_influence_attenuation` (`eevee_light_lib.bsl.hh`): `(1 - (d / R)⁴)²`, which reaches zero at the influence
+/// radius `R`. A zero radius culls the light, so it contributes nothing.
+pub(crate) fn influence_fade(distance_squared: f64, radius_squared: f64) -> f64 {
     if radius_squared <= 0.0 {
         return 0.0;
     }
     let factor = (distance_squared / radius_squared).powi(2);
     let fade = (1.0 - factor).clamp(0.0, 1.0);
     fade * fade
+}
+
+/// The influence of a local light on its surfaces (`light_attenuation_surface`): the fade at `distance_squared` with the
+/// radius of the larger of the diffuse and specular factors.
+pub(crate) fn local_light_influence(
+    data: &LightData,
+    distance_squared: f64,
+    threshold: f64,
+) -> f64 {
+    influence_fade(
+        distance_squared,
+        local_light_influence_radius_squared(
+            data,
+            data.diffuse_factor.max(data.specular_factor),
+            threshold,
+        ),
+    )
 }
 
 /// The radius of a sun's disc in tangent units, EEVEE's `shape_radius` (`eevee_light.cc`): `tan(angle / 2)` for the
@@ -719,6 +738,16 @@ mod realtime_cutoff_tests {
         // The custom distance wins whatever the threshold: R² = 9.
         assert!(local_light_influence(&data, 9.0, 0.1).abs() < 1.0e-12);
         assert!((local_light_influence(&data, 0.0, 0.1) - 1.0).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn the_volume_factor_sets_the_volume_radius() {
+        // volume_factor 0.5 quarters R² relative to 2 (the power halves): R² = 0.2 / 0.01 = 20.
+        let mut data = light(40.0, [1.0; 3]);
+        data.volume_factor = 0.5;
+        let radius_squared = local_light_influence_radius_squared(&data, data.volume_factor, 0.01);
+        assert!((radius_squared - 20.0).abs() < 1.0e-9);
+        assert_eq!(influence_fade(20.0, 0.0), 0.0);
     }
 
     #[test]

@@ -30,8 +30,9 @@ use super::subsurface_walk::{
 use super::{
     bvh::{Bvh, BvhHit},
     light_model::{
-        AreaShape, Spread, area_radiance, area_shape, emitter_radiance, inside_emitter,
-        point_intensity, spot_attenuation, spread_attenuation, spread_region,
+        AreaShape, Spread, area_radiance, area_shape, emitter_radiance, influence_fade,
+        inside_emitter, local_light_influence_radius_squared, point_intensity, spot_attenuation,
+        spread_attenuation, spread_region,
     },
     raster::{
         Camera, Mode, RasterOutput, StereoMode, Triangle, blend_corner_normals, camera_eye,
@@ -66,9 +67,25 @@ struct PointLight {
     spread: Option<Spread>,
     /// Blender's `use_multiple_importance_sampling`: a BSDF-sampled ray may hit this light.
     use_mis: bool,
+    /// Blender's `volume_factor` (`Light.volume_fac`), which EEVEE multiplies the light's volume in-scatter by
+    /// (`eevee_light.cc`, `power[LIGHT_VOLUME]`). The path tracer does not apply it, as Cycles does not.
+    volume_factor: f64,
+    /// The squared radius of the light's volume influence (`light_attenuation_volume`), infinite for a sun. The realtime
+    /// in-scatter fades with it; the path tracer does not.
+    volume_radius_squared: f64,
 }
 
 impl PointLight {
+    /// The fade of this light's volume in-scatter at `point` (`light_attenuation_volume`): one for a sun, and for a local
+    /// light inside its volume influence radius.
+    fn volume_fade(&self, point: DVec3) -> f64 {
+        if self.volume_radius_squared.is_infinite() {
+            return 1.0;
+        }
+        let distance_squared = (self.position - point).length_squared().max(1.0e-6);
+        influence_fade(distance_squared, self.volume_radius_squared)
+    }
+
     /// Whether a BSDF-sampled ray can hit this light (Cycles' `SHADER_USE_MIS`, set by
     /// `AreaLight::copy_to_kernel` for an emitter with area and a spread above zero, and by
     /// `PointLight::copy_to_kernel` for a radius). Zero-radius point and spot lights are delta
@@ -770,6 +787,11 @@ fn realtime_volume_integral(
             if instance.scattering {
                 source += ambient * instance.albedo * scattering_coefficient;
                 for light in lights {
+                    // EEVEE's volume in-scatter of a light is its power per class, `volume_factor`, times its influence.
+                    let gain = light.volume_factor * light.volume_fade(point);
+                    if gain <= 0.0 {
+                        continue;
+                    }
                     let Some(sample) = sample_light(light, point, rng) else {
                         continue;
                     };
@@ -785,7 +807,7 @@ fn realtime_volume_integral(
                         henyey_greenstein(direction.dot(sample.direction), instance.anisotropy);
                     source += instance.albedo
                         * sample.radiance
-                        * (scattering_coefficient * phase * visibility);
+                        * (scattering_coefficient * phase * visibility * gain);
                 }
             }
         }
@@ -2705,6 +2727,11 @@ fn reflect(direction: DVec3, normal: DVec3) -> DVec3 {
 }
 
 fn collect_lights(doc: &SceneDoc, snapshot: &Snapshot) -> Vec<PointLight> {
+    // EEVEE's light threshold sets the volume influence radius of a local light; the path tracer does not read it.
+    let threshold = doc
+        .scenes
+        .get(&snapshot.scene_id)
+        .map_or(0.01, |scene| scene.render.eevee_light_threshold);
     doc.nodes
         .iter()
         .filter(|(_, node)| node.kind == "light" && node.visible && node.render_visible)
@@ -2730,6 +2757,12 @@ fn collect_lights(doc: &SceneDoc, snapshot: &Snapshot) -> Vec<PointLight> {
                 area: (data.light_type == LightType::Area).then(|| area_shape(data, &matrix)),
                 spread: Spread::new(data.spread),
                 use_mis: data.use_multiple_importance_sampling,
+                volume_factor: data.volume_factor.max(0.0),
+                volume_radius_squared: if data.light_type == LightType::Sun {
+                    f64::INFINITY
+                } else {
+                    local_light_influence_radius_squared(data, data.volume_factor, threshold)
+                },
             })
         })
         .collect()
@@ -3502,6 +3535,8 @@ mod volume_extinction_tests {
             radius: 0.0,
             soft_falloff: false,
             use_mis: false,
+            volume_factor: 1.0,
+            volume_radius_squared: f64::INFINITY,
             spread: None,
             spot_size: 0.0,
             spot_blend: 0.0,
@@ -3544,6 +3579,8 @@ mod volume_extinction_tests {
             radius: 1.0e-6,
             soft_falloff: false,
             use_mis: false,
+            volume_factor: 1.0,
+            volume_radius_squared: f64::INFINITY,
             spread: None,
             spot_size: std::f64::consts::FRAC_PI_4,
             spot_blend: 0.15,
@@ -3573,6 +3610,8 @@ mod volume_extinction_tests {
             radius: 1.0,
             soft_falloff: false,
             use_mis: false,
+            volume_factor: 1.0,
+            volume_radius_squared: f64::INFINITY,
             spread: None,
             spot_size: std::f64::consts::FRAC_PI_4,
             spot_blend: 0.15,
@@ -3703,6 +3742,8 @@ mod sampling_tests {
                 spot_blend: 0.3,
                 area: None,
                 use_mis: true,
+                volume_factor: 1.0,
+                volume_radius_squared: f64::INFINITY,
                 spread: None,
             };
         let above = DVec3::new(0.2, -0.1, 3.0);
@@ -3809,6 +3850,8 @@ mod sampling_tests {
                     area: Some(shape),
                     spread: Some(spread),
                     use_mis: true,
+                    volume_factor: 1.0,
+                    volume_radius_squared: f64::INFINITY,
                 };
                 for receiver in [
                     DVec3::ZERO,
@@ -3887,6 +3930,8 @@ mod sampling_tests {
             area: Some(shape),
             spread: Spread::new(0.0),
             use_mis: true,
+            volume_factor: 1.0,
+            volume_radius_squared: f64::INFINITY,
         };
         let mut rng = Pcg32::for_sample(0x5e0, 0, 0, 0);
         let Some(sample) = sample_light(&light, DVec3::new(0.4, -0.3, 0.5), &mut rng) else {
@@ -3922,6 +3967,8 @@ mod sampling_tests {
                 spot_blend: 0.0,
                 area,
                 use_mis: true,
+                volume_factor: 1.0,
+                volume_radius_squared: f64::INFINITY,
                 spread: None,
             }
         };
@@ -3992,6 +4039,8 @@ mod sampling_tests {
                 area: 1.0,
             }),
             use_mis: true,
+            volume_factor: 1.0,
+            volume_radius_squared: f64::INFINITY,
             spread: None,
         };
         let receiver = DVec3::ZERO;
