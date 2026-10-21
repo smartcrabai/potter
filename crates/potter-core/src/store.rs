@@ -44,10 +44,9 @@ pub struct Project {
     doc: SceneDoc,
     /// Diagnostics from upgrading the loaded scene document.
     load_warnings: Vec<Value>,
-    /// Digest of the schema-1 `scene.json` this project opened. Its bytes are kept before the first
-    /// schema-2 write replaces them.
+    /// Digest of the original scene bytes that load-time migration must preserve before the first write.
     legacy_digest: Option<String>,
-    /// Hash reported for the untouched schema-1 scene before migration changes its schema version.
+    /// Canonical hash of the original scene before load-time migration.
     legacy_hash: Option<String>,
 }
 
@@ -126,7 +125,7 @@ impl Project {
     }
 
     /// Reads and upgrades `scene.json`. The diagnostics name the original bytes they describe. The
-    /// digest and compatibility hash are returned only for schema version 1.
+    /// digest and compatibility hash are returned when load-time migration changes the document.
     fn read_snapshot(path: &Path) -> Result<SnapshotRead> {
         let bytes = fs::read(path.join("scene.json")).map_err(|error| PotError::io(&error))?;
         let parsed = crate::model::migrate::parse_scene_with_original_hash(&bytes, path)?;
@@ -142,7 +141,7 @@ impl Project {
         Ok((parsed.doc, warnings, legacy_digest, parsed.legacy_hash))
     }
 
-    /// Keeps the bytes of a schema-1 `scene.json` before a schema-2 write replaces them, under the
+    /// Keeps the original `scene.json` bytes before load-time migration is written back, under the
     /// content-addressed path that the diagnostics name. The file must still hold the bytes this
     /// project opened.
     fn preserve_legacy_scene(&self) -> Result<()> {
@@ -1085,6 +1084,57 @@ mod tests {
         drop(project);
 
         assert!(Project::open_exclusive(&scene).is_ok());
+    }
+
+    #[test]
+    fn history_hash_is_verified_before_legacy_noise_migration() {
+        let directory = tempdir().unwrap();
+        let scene = directory.path().join("scene");
+        let project = Project::init(&scene).unwrap();
+        let mut snapshot = project.doc().clone();
+        let node: crate::model::Node = serde_json::from_value(json!({
+            "name":"Volume",
+            "kind":"empty",
+            "modifiers":[{
+                "id":"volume_displace",
+                "type":"volume_displace",
+                "name":"Volume Displace",
+                "enabled":true,
+                "params":{"texture":"noise"}
+            }]
+        }))
+        .unwrap();
+        snapshot.nodes.insert(Id::from_static("volume"), node);
+        let record = super::HistoryRecord {
+            record_version: 1,
+            parent: None,
+            kind: "commit".to_owned(),
+            revision: snapshot.revision,
+            scene_hash: "sha256:raw-scene".to_owned(),
+            operations: json!([]),
+            changes: json!({}),
+            target: None,
+            snapshot,
+        };
+        let digest = super::write_history_blob(&scene, &record).unwrap();
+        let path = super::blob_path(&scene, "history", &digest).unwrap();
+        let raw = fs::read(&path).unwrap();
+
+        let (loaded, _) = super::read_history_blob(&scene, &digest).unwrap();
+        let volume = &loaded.snapshot.nodes[&Id::from_static("volume")];
+        let texture_id = Id::new(volume.modifiers[0].params["texture"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            loaded.snapshot.resources[&texture_id]["texture_type"],
+            json!("NATIVE_VALUE_NOISE")
+        );
+        assert_eq!(crate::hash::sha256(&raw), digest);
+
+        let mut tampered: Value = serde_json::from_slice(&raw).unwrap();
+        tampered["snapshot"]["nodes"]["volume"]["modifiers"][0]["params"]["texture"] =
+            json!("noise_tampered");
+        fs::write(&path, crate::hash::canonicalize(&tampered).unwrap()).unwrap();
+        let error = super::read_history_blob(&scene, &digest).unwrap_err();
+        assert_eq!(error.code, ErrorCode::InternalError);
     }
 
     // Equivalent/unreachable mutants: sha256 always emits a strict digest, so malformed

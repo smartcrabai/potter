@@ -145,11 +145,12 @@ pub fn export_blend(
     add_blender_material_slot_fields(doc, &mut document);
     texture_edits.apply(&mut document)?;
     add_blender_shader_graph_ownership(doc, &mut document);
+
     let input = temporary_path("blend-export-input.json")?;
     let script = temporary_path("blend-bridge.py")?;
     let blend_temp = temporary_blend_path(parent)?;
     let validation = temporary_path("blend-export-validation.json")?;
-    let (document, mut asset_files, multires_sidecars, created_multires_sidecars) =
+    let (mut document, mut asset_files, multires_sidecars, created_multires_sidecars) =
         match prepare_blend_export_resources(document, project, out, opts.pack) {
             Ok(resources) => resources,
             Err(error) => {
@@ -157,6 +158,7 @@ pub fn export_blend(
                 return Err(error);
             }
         };
+    strip_native_value_noise_texture_links(doc, &mut document);
     let operation = (|| {
         write_new(
             &input,
@@ -3437,6 +3439,43 @@ fn build_imported_graph(
             doc.images.insert(id, image);
         }
     }
+    for resource in doc.resources.values_mut() {
+        if crate::model::migrate::inline_resource_kind(resource)? != Some("legacy_texture")
+            || resource.get("texture_type").and_then(Value::as_str) != Some("IMAGE")
+        {
+            continue;
+        }
+        let Some(image) = resource.get_mut("image") else {
+            continue;
+        };
+        if image.is_null() {
+            continue;
+        }
+        let image_name = match image {
+            Value::String(name) => name.as_str(),
+            Value::Object(reference)
+                if reference.get("id_type").and_then(Value::as_str) == Some("Image") =>
+            {
+                reference
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        invalid_intermediate("legacy Image Texture has an invalid image reference")
+                    })?
+            }
+            _ => {
+                return Err(invalid_intermediate(
+                    "legacy Image Texture has an invalid image reference",
+                ));
+            }
+        };
+        let image_id = image_ids.get(image_name).ok_or_else(|| {
+            invalid_intermediate(&format!(
+                "legacy Image Texture references unknown Image `{image_name}`"
+            ))
+        })?;
+        *image = json!(image_id.as_str());
+    }
     let mut graph_sources = array(raw, "node_groups")?.to_vec();
     let mut graph_names = graph_sources
         .iter()
@@ -3739,8 +3778,16 @@ fn build_imported_graph(
             .and_then(Value::as_str)
             .unwrap_or("XYZ")
             .to_owned();
-        let rotation = blender_rotation(item, &rotation_mode);
+        let rotation = blender_rotation(item, &rotation_mode)?;
         let mut properties = object_properties(item);
+        if let Some(metadata) = properties
+            .get_mut("blender_object_metadata")
+            .and_then(Value::as_object_mut)
+        {
+            // The imported Potter rotation: an export whose rotation is still this value reuses the
+            // Blender source values exactly, instead of recomputing them from the quaternion.
+            metadata.insert("source_rotation".to_owned(), json!(rotation));
+        }
         if let Some(instance_name) = instance_collection_name {
             let collection_id = collection_ids.get(instance_name).ok_or_else(|| {
                 invalid_intermediate("collection instance references an unknown collection")
@@ -3790,6 +3837,40 @@ fn build_imported_graph(
                     .and_then(Value::as_object)
                     .cloned()
                     .unwrap_or_default();
+                if let Some(texture) = params.get_mut("texture")
+                    && let Some(reference) = texture.as_object()
+                    && let (Some(id_type), Some(name)) = (
+                        reference.get("id_type").and_then(Value::as_str),
+                        reference.get("name").and_then(Value::as_str),
+                    )
+                {
+                    let id = match id_type {
+                        "Image" => image_ids.get(name).map(Id::as_str),
+                        "Texture" => match resource_ids.get(name) {
+                            Some(reference) => {
+                                let resource_id = Id::new(reference.clone())?;
+                                match doc.resources.get(&resource_id) {
+                                    Some(resource)
+                                        if crate::model::migrate::inline_resource_kind(
+                                            resource,
+                                        )? == Some("legacy_texture") =>
+                                    {
+                                        Some(reference.as_str())
+                                    }
+                                    _ => None,
+                                }
+                            }
+                            None => None,
+                        },
+                        _ => None,
+                    }
+                    .ok_or_else(|| {
+                        invalid_intermediate(&format!(
+                            "modifier texture references unknown {id_type} `{name}`"
+                        ))
+                    })?;
+                    *texture = json!(id);
+                }
                 if modifier_type == "MESH_SEQUENCE_CACHE" {
                     params = parse_mesh_sequence_cache_params(&params, &resource_ids)?;
                 } else if modifier_type == "MESH_CACHE" {
@@ -4120,6 +4201,16 @@ fn build_imported_graph(
                     ik_max: vec3_field(pose_item, "ik_max", [std::f64::consts::PI; 3]),
                     ik_stiffness: vec3_field(pose_item, "ik_stiffness", [0.0; 3]),
                     ik_stretch: number_field(pose_item, "ik_stretch", 0.0),
+                    bbone_curveinx: number_field(pose_item, "bbone_curveinx", 0.0),
+                    bbone_curveinz: number_field(pose_item, "bbone_curveinz", 0.0),
+                    bbone_curveoutx: number_field(pose_item, "bbone_curveoutx", 0.0),
+                    bbone_curveoutz: number_field(pose_item, "bbone_curveoutz", 0.0),
+                    bbone_rollin: number_field(pose_item, "bbone_rollin", 0.0),
+                    bbone_rollout: number_field(pose_item, "bbone_rollout", 0.0),
+                    bbone_scalein: vec3_field(pose_item, "bbone_scalein", [1.0; 3]),
+                    bbone_scaleout: vec3_field(pose_item, "bbone_scaleout", [1.0; 3]),
+                    bbone_easein: number_field(pose_item, "bbone_easein", 0.0),
+                    bbone_easeout: number_field(pose_item, "bbone_easeout", 0.0),
                 },
             );
         }
@@ -4378,7 +4469,7 @@ fn build_imported_graph(
         &mut doc,
         &mut mappings,
     )?;
-    validate_native_modifier_bindings(&mut doc)?;
+    validate_imported_modifier_bindings(&mut doc)?;
     doc.profile = Profile {
         blender: raw
             .get("blender_version")
@@ -4397,6 +4488,18 @@ fn build_imported_graph(
         "active_scene": active_name,
         "id_mappings": id_mappings.clone(),
     });
+    let mut legacy_texture_names = Map::new();
+    for resource in optional_array(raw, "resources")? {
+        if crate::model::migrate::inline_resource_kind(resource)? != Some("legacy_texture") {
+            continue;
+        }
+        let Some(name) = resource.get("owner").and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some(id) = resource_ids.get(name) {
+            legacy_texture_names.insert(id.clone(), json!(name));
+        }
+    }
     let mut compatibility_intermediate = (*raw).clone();
     if let Some(source_objects) = compatibility_intermediate
         .get_mut("objects")
@@ -4424,7 +4527,8 @@ fn build_imported_graph(
     }
     doc.compatibility.insert(
         "blender_adapter".to_owned(),
-        json!({"intermediate": compatibility_intermediate, "id_mappings": id_mappings.clone()}),
+        json!({"intermediate": compatibility_intermediate, "id_mappings": id_mappings.clone(),
+            "legacy_texture_names": legacy_texture_names}),
     );
     doc.validate()?;
     attach_native_target_vertex_orders(&mut doc);
@@ -5364,6 +5468,7 @@ fn import_armatures(
         let raw_bones = optional_array(item, "bones")?;
         let mut bone_ids = BTreeMap::new();
         let mut bone_id_map = BTreeMap::new();
+        let mut bone_order = Vec::with_capacity(raw_bones.len());
         for raw_bone in raw_bones {
             let bone_name = string_field(raw_bone, "name")?;
             let bone_id = mapped_id(
@@ -5375,7 +5480,8 @@ fn import_armatures(
                 mappings,
                 &format!("Bone:{armature_name}"),
             )?;
-            bone_ids.insert(bone_name.to_owned(), bone_id);
+            bone_ids.insert(bone_name.to_owned(), bone_id.clone());
+            bone_order.push(bone_id);
         }
         let mut bones = Registry::new();
         for raw_bone in raw_bones {
@@ -5425,15 +5531,19 @@ fn import_armatures(
                         .get("use_connect")
                         .and_then(Value::as_bool)
                         .unwrap_or(false),
-                    custom_shape: None,
-                    envelope_distance: 0.25,
-                    envelope_weight: 1.0,
                     select: raw_bone
                         .get("select")
                         .and_then(Value::as_bool)
                         .unwrap_or(false),
-                    head_radius: 0.1,
-                    tail_radius: 0.1,
+                    custom_shape: None,
+                    envelope_distance: number_field(raw_bone, "envelope_distance", 0.25),
+                    envelope_weight: number_field(raw_bone, "envelope_weight", 1.0),
+                    select: raw_bone
+                        .get("select")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    head_radius: number_field(raw_bone, "head_radius", 0.1),
+                    tail_radius: number_field(raw_bone, "tail_radius", 0.1),
                     bbone_settings,
                 },
             );
@@ -5448,6 +5558,7 @@ fn import_armatures(
                 light: None,
                 armature: Some(ArmatureData {
                     bones,
+                    bone_order,
                     ..ArmatureData::default()
                 }),
                 ..DataBlock::default()
@@ -5963,6 +6074,22 @@ fn import_blender_resources(
     let mut assets = Vec::new();
     let mut used_ids = BTreeSet::new();
     for source in optional_array(raw, "resources")? {
+        if crate::model::migrate::inline_resource_kind(source)? == Some("legacy_texture") {
+            let kind = "legacy_texture";
+            let owner = source.get("owner").and_then(Value::as_str).unwrap_or(kind);
+            let seed = format!(
+                "resource_{}",
+                &crate::hash::sha256(format!("{kind}:{owner}").as_bytes())[7..19]
+            );
+            let id = Id::new(unique_id(&seed, "resource", &mut used_ids))?;
+            let mut record = source.clone();
+            if let Some(record) = record.as_object_mut() {
+                record.remove("owner");
+            }
+            doc.resources.insert(id.clone(), record);
+            path_ids.insert(owner.to_owned(), id.as_str().to_owned());
+            continue;
+        }
         let source_path = source
             .get("path")
             .and_then(Value::as_str)
@@ -7581,6 +7708,7 @@ fn fcurve_handle(value: &Value, field: &str) -> Result<Option<[f64; 2]>> {
 fn convert_fcurve(value: &Value, mappings: &BTreeMap<String, String>) -> Result<FCurve> {
     let path = potter_fcurve_path(string_field(value, "path")?, mappings);
     let blender_index = integer_field(value, "index", 0);
+    // Potter stores quaternion F-Curve indices as (x, y, z, w); Blender's are (w, x, y, z).
     let index =
         if path == "transform.rotation_quaternion" || path.ends_with(".rotation_quaternion") {
             match blender_index {
@@ -8220,28 +8348,39 @@ fn parse_nla_tracks(
         .collect()
 }
 
-fn blender_rotation(item: &Value, mode: &str) -> [f64; 4] {
+/// The numbers of an array field with `count` entries, or `None` when the key is absent or null.
+/// A present field that is not `count` numbers is an import error.
+fn optional_numbers(item: &Value, key: &str, count: usize) -> Result<Option<Vec<f64>>> {
+    let Some(value) = item.get(key).filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    value
+        .as_array()
+        .filter(|values| values.len() == count)
+        .and_then(|values| {
+            values
+                .iter()
+                .map(Value::as_f64)
+                .collect::<Option<Vec<f64>>>()
+        })
+        .map(Some)
+        .ok_or_else(|| invalid_intermediate(&format!("{key} must be {count} numbers")))
+}
+
+fn blender_rotation(item: &Value, mode: &str) -> Result<[f64; 4]> {
     let quat = if mode == "QUATERNION" {
-        let raw = item.get("rotation_quaternion").and_then(Value::as_array);
-        raw.and_then(|values| {
-            Some(DQuat::from_xyzw(
-                values.first()?.as_f64()?,
-                values.get(1)?.as_f64()?,
-                values.get(2)?.as_f64()?,
-                values.get(3)?.as_f64()?,
-            ))
+        optional_numbers(item, "rotation_quaternion", 4)?.map_or(DQuat::IDENTITY, |values| {
+            DQuat::from_xyzw(values[0], values[1], values[2], values[3])
         })
     } else if mode == "AXIS_ANGLE" {
-        let raw = item.get("rotation_axis_angle").and_then(Value::as_array);
-        raw.and_then(|values| {
-            Some(DQuat::from_axis_angle(
-                glam::DVec3::new(
-                    values[1].as_f64()?,
-                    values[2].as_f64()?,
-                    values[3].as_f64()?,
-                ),
-                values[0].as_f64()?,
-            ))
+        optional_numbers(item, "rotation_axis_angle", 4)?.map_or(DQuat::IDENTITY, |values| {
+            let axis = glam::DVec3::new(values[1], values[2], values[3]);
+            // Blender normalizes the axis; a zero axis gives the identity rotation.
+            if axis == glam::DVec3::ZERO {
+                DQuat::IDENTITY
+            } else {
+                DQuat::from_axis_angle(axis.normalize(), values[0])
+            }
         })
     } else {
         let euler = vec3_field(item, "rotation_euler", [0.0; 3]);
@@ -8254,11 +8393,9 @@ fn blender_rotation(item: &Value, mode: &str) -> [f64; 4] {
             "ZYX" => (EulerRot::ZYXEx, [euler[2], euler[1], euler[0]]),
             _ => (EulerRot::XYZEx, euler),
         };
-        Some(DQuat::from_euler(order, angles[0], angles[1], angles[2]))
+        DQuat::from_euler(order, angles[0], angles[1], angles[2])
     };
-    quat.map_or([0.0, 0.0, 0.0, 1.0], |rotation| {
-        [rotation.x, rotation.y, rotation.z, rotation.w]
-    })
+    Ok([quat.x, quat.y, quat.z, quat.w])
 }
 
 fn root_matrix_override(item: &Value) -> Option<(Transform, [f64; 16])> {
@@ -9207,6 +9344,16 @@ pub(crate) fn export_losses(doc: &SceneDoc) -> Vec<Loss> {
             }
         }
     }
+    for link in native_value_noise_texture_links(doc) {
+        losses.push(loss(
+            "blender.texture.native_value_noise",
+            Some(link.modifier_id.as_str()),
+            &format!(
+                "modifier `{}` references native Value Noise resource `{}`, which has no Blender legacy Texture type; export omits its texture link",
+                link.modifier_name, link.texture_id
+            ),
+        ));
+    }
     for (scene_id, scene) in &doc.scenes {
         if scene
             .world
@@ -9563,6 +9710,63 @@ fn native_bind_source_topology_matches(doc: &SceneDoc, node_id: &Id, modifier: &
         .is_some_and(|raw| mesh_topology_matches_raw(target_mesh, raw))
 }
 
+/// A modifier texture link to a native Value Noise resource. Blender has no legacy Texture type for
+/// it, so export reports a loss and omits the link.
+struct NativeNoiseLink<'a> {
+    node_id: &'a Id,
+    modifier_id: &'a Id,
+    modifier_name: &'a str,
+    texture_id: &'a str,
+}
+
+fn native_value_noise_texture_links(doc: &SceneDoc) -> Vec<NativeNoiseLink<'_>> {
+    let mut links = Vec::new();
+    for (node_id, node) in &doc.nodes {
+        for modifier in &node.modifiers {
+            let Some(texture_id) = modifier.params.get("texture").and_then(Value::as_str) else {
+                continue;
+            };
+            let native = doc.resources.iter().any(|(resource_id, resource)| {
+                resource_id.as_str() == texture_id
+                    && crate::model::migrate::inline_resource_kind(resource)
+                        .is_ok_and(|kind| kind == Some("legacy_texture"))
+                    && resource.get("texture_type").and_then(Value::as_str)
+                        == Some("NATIVE_VALUE_NOISE")
+            });
+            if native {
+                links.push(NativeNoiseLink {
+                    node_id,
+                    modifier_id: &modifier.id,
+                    modifier_name: &modifier.name,
+                    texture_id,
+                });
+            }
+        }
+    }
+    links
+}
+
+/// Removes the texture link of every native Value Noise modifier from the exported document. It
+/// applies the same decision that `export_losses` reports.
+fn strip_native_value_noise_texture_links(doc: &SceneDoc, document: &mut Value) {
+    for link in native_value_noise_texture_links(doc) {
+        let modifiers = document
+            .get_mut("nodes")
+            .and_then(|nodes| nodes.get_mut(link.node_id.as_str()))
+            .and_then(|node| node.get_mut("modifiers"))
+            .and_then(Value::as_array_mut);
+        let Some(modifier) = modifiers.and_then(|list| {
+            list.iter_mut()
+                .find(|modifier| modifier["id"] == link.modifier_id.as_str())
+        }) else {
+            continue;
+        };
+        if let Some(params) = modifier.get_mut("params").and_then(Value::as_object_mut) {
+            params.remove("texture");
+        }
+    }
+}
+
 fn native_bind_export_losses(doc: &SceneDoc, project: &Project) -> Vec<Loss> {
     let original_blend_exists = original_blend_blob_exists(doc, project);
     let mut losses = Vec::new();
@@ -9818,7 +10022,7 @@ fn target_position_bucket(position: DVec3, tolerance: f64) -> [i64; 3] {
     ]
 }
 
-fn validate_native_modifier_bindings(doc: &mut SceneDoc) -> Result<()> {
+fn validate_imported_modifier_bindings(doc: &mut SceneDoc) -> Result<()> {
     for (node_id, node) in &mut doc.nodes {
         for modifier in &mut node.modifiers {
             let is_bound = modifier
@@ -9835,14 +10039,14 @@ fn validate_native_modifier_bindings(doc: &mut SceneDoc) -> Result<()> {
             if should_bind
                 && matches!(
                     modifier.modifier_type.as_str(),
-                    "surface_deform" | "mesh_deform" | "laplacian_deform"
+                    "surface_deform" | "mesh_deform" | "laplacian_deform" | "corrective_smooth"
                 )
                 && modifier.binding_data.is_none()
             {
                 return Err(PotError::with_details(
                     ErrorCode::ImportFailed,
                     format!(
-                        "bound {} modifier `{}` on `{}` has no native bind payload",
+                        "bound {} modifier `{}` on `{}` has no bind payload",
                         modifier.modifier_type, modifier.name, node.name
                     ),
                     json!({
@@ -10047,12 +10251,19 @@ mod tests {
 
     #[test]
     fn blender_quaternion_components_convert_to_potter_xyzw() -> Result<()> {
+        // Object and bone `rotation_quaternion` values reach this function already in Potter's
+        // (x, y, z, w) order, so they must come back unchanged. Each input is a unit quaternion
+        // with asymmetric components: swapping any two positions would change the result.
+        let first = [0.6, 0.0, 0.8, 0.0];
         assert_eq!(
-            blender_rotation(
-                &json!({"rotation_quaternion": [1.0, 0.0, 0.0, 0.0]}),
-                "QUATERNION",
-            ),
-            [1.0, 0.0, 0.0, 0.0],
+            blender_rotation(&json!({"rotation_quaternion": first}), "QUATERNION")?,
+            first,
+        );
+        let norm = 0.95_f64.sqrt();
+        let second = [0.1 / norm, 0.2 / norm, 0.3 / norm, 0.9 / norm];
+        assert_eq!(
+            blender_rotation(&json!({"rotation_quaternion": second}), "QUATERNION")?,
+            second,
         );
         for (blender_index, potter_index) in [(0_i64, 3_u32), (1, 0), (2, 1), (3, 2)] {
             let curve = convert_fcurve(
@@ -10064,6 +10275,31 @@ mod tests {
         }
         Ok(())
     }
+
+    #[test]
+    fn blender_axis_angle_axis_is_normalized() -> Result<()> {
+        // Blender normalizes `rotation_axis_angle`'s axis, so a Z axis of length 2 is a plain turn.
+        let angle = std::f64::consts::FRAC_PI_2;
+        let rotation = blender_rotation(
+            &json!({"rotation_axis_angle": [angle, 0.0, 0.0, 2.0]}),
+            "AXIS_ANGLE",
+        )?;
+        let expected = DQuat::from_axis_angle(glam::DVec3::Z, angle).to_array();
+        for (actual, expected) in rotation.into_iter().zip(expected) {
+            assert!(
+                (actual - expected).abs() <= 1.0e-12,
+                "expected {expected}, got {actual}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn short_axis_angle_array_is_an_import_error() {
+        let short = json!({"rotation_axis_angle": [1.0, 0.0, 1.0]});
+        assert!(blender_rotation(&short, "AXIS_ANGLE").is_err());
+    }
+
     #[test]
     fn every_evaluated_modifier_maps_to_a_blender_modifier_type() {
         for (blender, potter) in [
@@ -11376,6 +11612,69 @@ mod tests {
             }),
         )?;
         Ok((applied.doc, applied.asset_blobs))
+    }
+
+    #[test]
+    fn blender_clip_material_reopens_as_clip_with_the_importers_mask_stage() -> Result<()> {
+        let Some(blender) = optional_blender() else {
+            return Ok(());
+        };
+        let directory = tempfile::tempdir().map_err(|error| PotError::io(&error))?;
+        let (mut doc, asset_blobs) = native_texture_roundtrip_scene()?;
+        {
+            let material = doc
+                .materials
+                .get_mut(&Id::new("mat_red")?)
+                .ok_or_else(|| invalid_intermediate("native texture material is missing"))?;
+            material.alpha_mode = "clip".to_owned();
+            material.alpha_threshold = 0.37;
+            material.base_color[3] = 0.8;
+        }
+        let mut project = Project::init(directory.path().join("project"))?;
+        project.commit_import_with_assets(
+            doc.clone(),
+            json!({"test": "clip_texture_alpha"}),
+            json!({}),
+            &asset_blobs,
+        )?;
+        let output = directory.path().join("clip-texture-alpha.blend");
+        let context = crate::eval::EvaluationContext::default();
+        export_blend(
+            &doc,
+            &project,
+            &output,
+            &ExportOptions {
+                allow_lossy: false,
+                pack: false,
+                blender: Some(&blender),
+                context: &context,
+            },
+        )?;
+        let imported = import_blend(&output, Some(&blender))?;
+        let material = imported
+            .doc
+            .materials
+            .get(&Id::new("mat_red")?)
+            .ok_or_else(|| invalid_intermediate("clip material is missing"))?;
+        // Blender's glTF importer marks MASK as DITHERED; the marker and the graph read back as clip.
+        assert_eq!(material.alpha_mode, "clip");
+        assert!((material.alpha_threshold - 0.37).abs() <= 1.0e-6);
+        let graph_id = material
+            .node_tree
+            .as_ref()
+            .ok_or_else(|| invalid_intermediate("clip material graph is missing"))?;
+        let graph = imported
+            .doc
+            .node_groups
+            .get(graph_id)
+            .ok_or_else(|| invalid_intermediate("clip material nodes are missing"))?;
+        let compare = graph
+            .nodes
+            .get(&Id::new("base_alpha_clip")?)
+            .ok_or_else(|| invalid_intermediate("the clip stage is missing"))?;
+        assert_eq!(compare.properties["operation"], json!("LESS_THAN"));
+        assert!((compare.inputs["Value_001"].as_f64().unwrap_or(f64::NAN) - 0.37).abs() <= 1.0e-6);
+        Ok(())
     }
 
     #[expect(
@@ -15184,6 +15483,7 @@ print("RIGPROBE " + json.dumps({"groups": groups, "shapes": shape_names,
                                 head_radius: 0.1,
                                 tail_radius: 0.1,
                                 bbone_settings: BTreeMap::new(),
+                                select: false,
                             },
                         ),
                         (
@@ -15204,6 +15504,7 @@ print("RIGPROBE " + json.dumps({"groups": groups, "shapes": shape_names,
                                 head_radius: 0.1,
                                 tail_radius: 0.1,
                                 bbone_settings: BTreeMap::new(),
+                                select: false,
                             },
                         ),
                     ]),

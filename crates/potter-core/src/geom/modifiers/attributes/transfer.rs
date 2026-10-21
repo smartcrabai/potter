@@ -3095,8 +3095,8 @@ fn ray_cast_nearest<T>(
     let max_distance = max_distance.min(f64::from(f32::MAX));
     let mut nearest = None;
     tree.ray_cast(
-        origin.as_vec3().to_array(),
-        direction.as_vec3().to_array(),
+        origin.as_vec3(),
+        direction.as_vec3(),
         &mut RayHit::open(),
         &mut |leaf, _ray, running| {
             let t_max = f64::from(running.dist).min(max_distance);

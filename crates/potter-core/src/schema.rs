@@ -102,7 +102,7 @@ fn scene_schema() -> Value {
         "worlds":registry_schema("world"),
         "node_groups":{"type":"object"},
         "actions":registry_schema("action"),
-        "resources":{"type":"object"},
+        "resources":{"type":"object","additionalProperties":{"type":"object","properties":{"storage":{"const":"inline"},"kind":{"type":"string"}},"allOf":[{"if":{"required":["storage"]},"then":{"required":["kind"],"allOf":[{"if":{"properties":{"kind":{"const":"legacy_texture"}},"required":["kind"]},"then":{"$ref":"#/$defs/legacy_texture_resource"}}]}}]}},
         "libraries":registry_schema("library"),
         "compatibility":{"type":"object"},
         "avatar":avatar_settings_schema(),
@@ -113,6 +113,7 @@ fn scene_schema() -> Value {
     let mut texture_ref = texture_ref_schema();
     texture_ref["required"] = json!(["image", "interpolation"]);
     root["$defs"] = json!({
+        "legacy_texture_resource":{"type":"object","required":["storage","kind","texture_type"],"properties":{"storage":{"const":"inline"},"kind":{"const":"legacy_texture"},"texture_type":{"enum":["CLOUDS","MARBLE","WOOD","MAGIC","BLEND","STUCCI","NOISE","DISTORTED_NOISE","VORONOI","MUSGRAVE","IMAGE"]},"settings":{"type":"object","properties":{"noise_scale":{"type":"number"},"noise_depth":{"type":"integer"},"noise_basis":{"type":"string"},"noise_type":{"type":"string"},"noise_basis_2":{"type":"string"},"turbulence":{"type":"number"},"cloud_type":{"type":"string"},"wood_type":{"type":"string"},"marble_type":{"type":"string"},"stucci_type":{"type":"string"},"distortion":{"type":"number"},"musgrave_type":{"type":"string"},"dimension_max":{"type":"number"},"lacunarity":{"type":"number"},"offset":{"type":"number"},"gain":{"type":"number"},"noise_intensity":{"type":"number"},"weight_1":{"type":"number"},"weight_2":{"type":"number"},"weight_3":{"type":"number"},"weight_4":{"type":"number"},"minkovsky_exponent":{"type":"number"},"distance_metric":{"type":"string"},"color_mode":{"type":"string"},"noise_distortion":{"type":"string"},"progression":{"enum":["LINEAR","QUADRATIC","EASING","DIAGONAL","SPHERICAL","QUADRATIC_SPHERE","RADIAL"]},"use_flip_axis":{"enum":["HORIZONTAL","VERTICAL"]}},"additionalProperties":false}},"additionalProperties":false},
         "id":id_schema(),
         "vec2":vec_schema(2),
         "vec3":vec_schema(3),
@@ -205,6 +206,35 @@ fn complete_scene_schema(root: &mut Value) {
     root["properties"]["movie_clips"] = registry_schema("movie_clip");
     root["properties"]["masks"] = registry_schema("mask");
     let defs = &mut root["$defs"];
+    defs["legacy_texture_resource"]["properties"]["texture_type"]["enum"] = json!([
+        "CLOUDS",
+        "MARBLE",
+        "WOOD",
+        "MAGIC",
+        "BLEND",
+        "STUCCI",
+        "NOISE",
+        "DISTORTED_NOISE",
+        "VORONOI",
+        "MUSGRAVE",
+        "NATIVE_VALUE_NOISE",
+        "IMAGE"
+    ]);
+    defs["legacy_texture_resource"]["properties"]["settings"]["properties"]["octaves"] =
+        json!({"type":"number"});
+    defs["legacy_texture_resource"]["properties"]["settings"]["properties"]["color_mode"] =
+        json!({"enum":["INTENSITY","POSITION","POSITION_OUTLINE","POSITION_OUTLINE_INTENSITY"]});
+    defs["legacy_texture_resource"]["allOf"] = json!([{
+        "if":{"properties":{"texture_type":{"const":"MUSGRAVE"}},"required":["texture_type"]},
+        "then":{"properties":{"settings":{"properties":{
+            "octaves":{"type":"number","minimum":0,"maximum":8},
+            "lacunarity":{"type":"number","minimum":0,"maximum":6},
+            "offset":{"type":"number","minimum":0,"maximum":6},
+            "gain":{"type":"number","minimum":0,"maximum":6},
+            "dimension_max":{"type":"number","minimum":0.0001,"maximum":2},
+            "noise_intensity":{"type":"number","minimum":0,"maximum":10}
+        }}}}
+    }]);
 
     defs["image_tile"] = json!({"type":"object","required":["number","width","height","blob"],"properties":{"number":{"type":"integer","minimum":1,"maximum":u32::MAX},"width":{"type":"integer","minimum":0,"maximum":u32::MAX},"height":{"type":"integer","minimum":0,"maximum":u32::MAX},"blob":{"type":["string","null"]},"label":{"type":"string"}},"additionalProperties":false});
     defs["image"] = json!({"type":"object","required":["name","source","colorspace","width","height","tiles","blob","source_path","source_hash","alpha_mode"],"properties":{"name":{"type":"string"},"source":{"enum":["generated","file","packed"]},"colorspace":{"enum":["srgb","linear","non_color"]},"width":{"type":"integer","minimum":0,"maximum":u32::MAX},"height":{"type":"integer","minimum":0,"maximum":u32::MAX},"tiles":{"type":"array","items":{"$ref":"#/$defs/image_tile"}},"blob":{"type":["string","null"]},"source_path":{"type":["string","null"]},"source_hash":{"type":["string","null"]},"alpha_mode":{"enum":["straight","premultiplied","none"]},"tiled":{"type":"boolean"}},"additionalProperties":false});
@@ -328,9 +358,10 @@ fn complete_data_block_schemas(defs: &mut Value) {
     defs["text_data"] = json!({"type":"object","required":["body","font","font_name","size","align_x","align_y","extrude","bevel_depth","character_spacing","word_spacing","line_spacing","shear","offset_x","offset_y","small_caps_scale"],"properties":{"body":{"type":"string"},"font":{"type":"string"},"font_name":{"type":"string"},"size":{"type":"number"},"align_x":{"type":"string"},"align_y":{"type":"string"},"extrude":{"type":"number"},"bevel_depth":{"type":"number"},"character_spacing":{"type":"number"},"word_spacing":{"type":"number"},"line_spacing":{"type":"number"},"shear":{"type":"number"},"offset_x":{"type":"number"},"offset_y":{"type":"number"},"small_caps_scale":{"type":"number"}},"additionalProperties":false});
     defs["hair_curves_data"] = json!({"type":"object","required":["curves"],"properties":{"curves":{"type":"array","items":{"type":"object","required":["points","radius"],"properties":{"points":{"type":"array","items":{"$ref":"#/$defs/vec3"}},"radius":{"type":"number"}},"additionalProperties":false}}},"additionalProperties":false});
     defs["metaball_data"] = json!({"type":"object","required":["elements","resolution","render_resolution","threshold"],"properties":{"elements":{"type":"array","items":{"type":"object","required":["type","co","radius","stiffness","size","rotation","negative"],"properties":{"type":{"enum":["ball","capsule","plane","ellipsoid","cube"]},"co":{"$ref":"#/$defs/vec3"},"radius":{"type":"number"},"stiffness":{"type":"number"},"size":{"$ref":"#/$defs/vec3"},"rotation":{"$ref":"#/$defs/vec3"},"negative":{"type":"boolean"}},"additionalProperties":false}},"resolution":{"type":"number"},"render_resolution":{"type":"number"},"threshold":{"type":"number"}},"additionalProperties":false});
-    defs["lattice_data"] = json!({"type":"object","required":["points_u","points_v","points_w","interpolation","points","domain"],"properties":{"points_u":{"type":"integer","minimum":0},"points_v":{"type":"integer","minimum":0},"points_w":{"type":"integer","minimum":0},"interpolation":{"enum":["linear","cardinal","bspline"]},"points":{"type":"array","items":{"$ref":"#/$defs/vec3"}},"domain":{"type":"object","required":["min","max"],"properties":{"min":{"$ref":"#/$defs/vec3"},"max":{"$ref":"#/$defs/vec3"}},"additionalProperties":false}},"additionalProperties":false});
+    defs["lattice_data"] = json!({"type":"object","required":["points_u","points_v","points_w","interpolation","points","domain"],"properties":{"points_u":{"type":"integer","minimum":0},"points_v":{"type":"integer","minimum":0},"points_w":{"type":"integer","minimum":0},"interpolation":{"enum":["linear","cardinal","catmull_rom","bspline"]},"points":{"type":"array","items":{"$ref":"#/$defs/vec3"}},"domain":{"type":"object","required":["min","max"],"properties":{"min":{"$ref":"#/$defs/vec3"},"max":{"$ref":"#/$defs/vec3"}},"additionalProperties":false}},"additionalProperties":false});
     defs["point_cloud_data"] = json!({"type":"object","required":["points","attributes","next_id"],"properties":{"points":{"type":"array","items":{"type":"object","required":["id","position","radius"],"properties":{"id":{"type":"integer","minimum":0,"maximum":u32::MAX},"position":{"$ref":"#/$defs/vec3"},"radius":{"type":"number"}},"additionalProperties":false}},"attributes":{"type":"object","additionalProperties":{"type":"object","required":["domain","values"],"properties":{"domain":{"type":"string"},"values":{"type":"object"}},"additionalProperties":false}},"next_id":{"type":"integer","minimum":0,"maximum":u32::MAX}},"additionalProperties":false});
     defs["volume_data"] = json!({"type":"object","required":["grids","source"],"properties":{"grids":{"type":"array","items":{"type":"object","required":["dims","voxel_size","origin","values","blob_f32","content_ref"],"properties":{"dims":{"type":"array","items":{"type":"integer","minimum":0,"maximum":u32::MAX},"minItems":3,"maxItems":3},"voxel_size":{"type":"number"},"origin":{"$ref":"#/$defs/vec3"},"values":{"oneOf":[{"type":"array","items":{"type":"number"}},{"type":"null"}]},"blob_f32":{"oneOf":[{"type":"array","items":{"type":"integer","minimum":0,"maximum":255}},{"type":"null"}]},"content_ref":{"type":["string","null"]}},"additionalProperties":false}},"source":{"oneOf":[{"type":"object","required":["kind","metadata"],"properties":{"kind":{"const":"generated"},"metadata":{"type":"object","required":["algorithm"],"properties":{"algorithm":{"type":"string"}},"additionalProperties":false}},"additionalProperties":false},{"type":"object","required":["kind","metadata"],"properties":{"kind":{"const":"file"},"metadata":{"type":"object","required":["format","content_ref","grid_names","bounds_min","bounds_max"],"properties":{"format":{"type":"string"},"content_ref":{"type":["string","null"]},"grid_names":{"type":"array","items":{"type":"string"}},"bounds_min":{"oneOf":[{"$ref":"#/$defs/vec3"},{"type":"null"}]},"bounds_max":{"oneOf":[{"$ref":"#/$defs/vec3"},{"type":"null"}]}},"additionalProperties":false}},"additionalProperties":false}]}},"additionalProperties":false});
+    defs["volume_data"]["properties"]["grids"]["items"]["properties"]["index_to_local"] = json!({"oneOf":[{"type":"array","items":{"type":"number"},"minItems":16,"maxItems":16},{"type":"null"}],"description":"Optional column-major 4x4 affine matrix mapping grid index coordinates to volume-local space; omitted uses origin and voxel_size."});
     for axis in ["points_u", "points_v", "points_w"] {
         defs["lattice_data"]["properties"][axis]["minimum"] = json!(2);
         defs["lattice_data"]["properties"][axis]["maximum"] = json!(256);
@@ -533,6 +564,13 @@ fn operation_schema(name: &str) -> Value {
             {"if":{"required":["keep_world"]},"then":{"required":["reparent"]}}
         ]);
     }
+    if name == "texture.create" {
+        result["allOf"] = json!([{
+            "if":{"properties":{"texture_type":{"const":"IMAGE"}},"required":["texture_type"]},
+            "then":{"required":["image"],"properties":{"settings":image_texture_settings_schema()}},
+            "else":{"not":{"required":["image"]}}
+        }]);
+    }
     if name == "collection.link" || name == "collection.unlink" {
         result["oneOf"] = json!([{"required":["object"],"not":{"required":["child"]}},{"required":["child"],"not":{"required":["object"]}}]);
     }
@@ -633,6 +671,44 @@ fn operation_schema(name: &str) -> Value {
         }]);
     }
     result
+}
+fn image_texture_settings_schema() -> Value {
+    json!({
+        "type":"object",
+        "properties":{
+            "use_interpolation":{"type":"boolean"},
+            "filter_size":{"type":"number","minimum":0.1,"maximum":50.0},
+            "use_flip_axis":{"type":"boolean"},
+            "use_alpha":{"type":"boolean"},
+            "use_calculate_alpha":{"type":"boolean"},
+            "invert_alpha":{"type":"boolean"},
+            "extension":{"enum":["EXTEND","CLIP","CLIP_CUBE","REPEAT","CHECKER"]},
+            "repeat_x":{"type":"integer","minimum":1,"maximum":512},
+            "repeat_y":{"type":"integer","minimum":1,"maximum":512},
+            "use_mirror_x":{"type":"boolean"},
+            "use_mirror_y":{"type":"boolean"},
+            "use_checker_odd":{"type":"boolean"},
+            "use_checker_even":{"type":"boolean"},
+            "checker_distance":{"type":"number","minimum":0.0,"maximum":0.99},
+            "crop_min_x":{"type":"number","minimum":-10.0,"maximum":10.0},
+            "crop_min_y":{"type":"number","minimum":-10.0,"maximum":10.0},
+            "crop_max_x":{"type":"number","minimum":-10.0,"maximum":10.0},
+            "crop_max_y":{"type":"number","minimum":-10.0,"maximum":10.0},
+            "intensity":{"type":"number","minimum":0.0,"maximum":2.0},
+            "contrast":{"type":"number","minimum":0.0,"maximum":5.0},
+            "saturation":{"type":"number","minimum":0.0,"maximum":2.0},
+            "factor_red":{"type":"number","minimum":0.0,"maximum":2.0},
+            "factor_green":{"type":"number","minimum":0.0,"maximum":2.0},
+            "factor_blue":{"type":"number","minimum":0.0,"maximum":2.0},
+            "use_clamp":{"type":"boolean"},
+            "use_normal_map":{"type":"boolean"},
+            "use_preview_alpha":{"type":"boolean"},
+            "use_color_ramp":{"type":"boolean"},
+            "color_ramp":{"type":"object"},
+            "image_user":{"type":"object"}
+        },
+        "additionalProperties":false
+    })
 }
 
 fn parameter_conditions(family: ParameterFamily, operation: &str) -> Value {
@@ -1352,6 +1428,20 @@ fn operation_contract(name: &str) -> OperationContract {
             "shared|single_user for shared data",
             json!({}),
         ),
+        "texture.create" => (
+            vec!["id", "texture_type", "image", "settings"],
+            vec!["op", "id", "texture_type"],
+            "legacy texture",
+            "none",
+            json!({"image":"required for IMAGE; references a shared doc.images entry","settings":"Blender defaults"}),
+        ),
+        "texture.update" => (
+            vec!["id", "image", "settings"],
+            vec!["op", "id"],
+            "legacy texture",
+            "none",
+            json!({"image":"unchanged unless supplied","settings":"merged over existing settings"}),
+        ),
         "paint.texture" => (
             vec![
                 "target", "scope", "image", "uv_layer", "samples", "falloff", "symmetry", "color",
@@ -1801,6 +1891,17 @@ fn field_schema(operation: &str, field: &str) -> Value {
     if operation == "avatar.update" && field == "set" {
         return avatar_update_set_schema();
     }
+    if matches!(operation, "texture.create" | "texture.update") {
+        return match field {
+            "texture_type" if operation == "texture.create" => json!({"enum":[
+                "CLOUDS","MARBLE","WOOD","MAGIC","BLEND","STUCCI","NOISE",
+                "DISTORTED_NOISE","VORONOI","MUSGRAVE","NATIVE_VALUE_NOISE","IMAGE"
+            ]}),
+            "image" => json!({"oneOf":[id_schema(),{"type":"null"}]}),
+            "settings" => json!({"type":"object"}),
+            _ => common_field_schema(field),
+        };
+    }
     if matches!(
         operation,
         "library.link"
@@ -2222,7 +2323,7 @@ fn field_schema(operation: &str, field: &str) -> Value {
             json!({"type":"number","minimum":0})
         }
         "envelope_weight" if operation.starts_with("bone.") => {
-            json!({"type":"number","minimum":0,"maximum":1})
+            json!({"type":"number","minimum":0,"maximum":1000})
         }
         "shift" => vec_schema(2),
         "strength" if operation == "physics.force_field.create" => json!({"type":"number"}),
@@ -2369,7 +2470,7 @@ fn set_schema(operation: &str) -> Value {
             "use_connect":{"type":"boolean"},
             "custom_shape":{"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]},
             "envelope_distance":{"type":"number","minimum":0},
-            "envelope_weight":{"type":"number","minimum":0,"maximum":1},
+            "envelope_weight":{"type":"number","minimum":0,"maximum":1000},
             "head_radius":{"type":"number","minimum":0},
             "tail_radius":{"type":"number","minimum":0}
         }),
@@ -2742,5 +2843,35 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn texture_image_operations_schema_reference_shared_images() -> crate::error::Result<()> {
+        let create = schema("operations", Some("texture.create"))?;
+        assert_eq!(
+            create["properties"]["image"]["oneOf"][0]["pattern"],
+            "^[a-z][a-z0-9_-]{0,63}$"
+        );
+        assert_eq!(create["properties"]["image"]["oneOf"][1]["type"], "null");
+        assert!(
+            create["properties"]["texture_type"]["enum"]
+                .as_array()
+                .is_some_and(|types| types.iter().any(|texture_type| texture_type == "IMAGE"))
+        );
+        assert!(
+            create["allOf"][0]["then"]["required"]
+                .as_array()
+                .is_some_and(|required| required.iter().any(|field| field == "image"))
+        );
+        assert_eq!(
+            create["allOf"][0]["then"]["properties"]["settings"]["additionalProperties"],
+            false
+        );
+        let update = schema("operations", Some("texture.update"))?;
+        assert_eq!(
+            update["properties"]["image"]["oneOf"][0]["pattern"],
+            "^[a-z][a-z0-9_-]{0,63}$"
+        );
+        assert_eq!(update["properties"]["image"]["oneOf"][1]["type"], "null");
+        Ok(())
+    }
     use serde_json::Value;
 }

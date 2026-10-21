@@ -3,18 +3,23 @@
 // Portions derived from Blender (https://www.blender.org):
 //   source/blender/modifiers/intern/MOD_build.cc, source/blender/modifiers/intern/MOD_laplaciansmooth.cc, SPDX-FileCopyrightText: 2005 Blender Authors, GPL-2.0-or-later.
 //   source/blender/modifiers/intern/MOD_wireframe.cc, source/blender/modifiers/intern/MOD_skin.cc, source/blender/modifiers/intern/MOD_warp.cc, source/blender/blenkernel/intern/mesh_remap.cc, source/blender/modifiers/intern/MOD_mesh_to_volume.cc, source/blender/bmesh/tools/bmesh_wireframe.cc, SPDX-FileCopyrightText: 2023 Blender Authors, GPL-2.0-or-later.
+//   source/blender/modifiers/intern/MOD_simpledeform.cc, MOD_cast.cc, MOD_hook.cc, colortools.cc, curve.cc, SPDX-FileCopyrightText: 2005 Blender Authors, GPL-2.0-or-later.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use glam::{DMat4, DQuat, DVec3, Mat4, Vec3};
+use glam::{DMat3, DMat4, DQuat, DVec3, Mat4, Vec3};
 use serde_json::Value;
 
+use crate::color::curve::{
+    CurveMap, CurveMapping, CurvePoint, CurveTone, HandleType, PreparedCurve,
+};
 use crate::model::{Id, Modifier};
 
+use super::displacement::{VertexGroup, vertex_group};
 use super::{
     MergedGeometry, Polygon, bool_param, build_mesh, closest_point_triangle, cyclic_pairs,
     edge_pairs, id_indices, invalid_parameter, loose_edges, number_param, polygons, positions,
-    schema_value, string_param, uint_param, usize_as_f64, validated, vec3_param, vertex_normals,
+    schema_value, string_param, uint_param, usize_as_f64, validated, vec3_param,
 };
 use crate::{
     error::{ErrorCode, PotError, Result},
@@ -23,6 +28,7 @@ use crate::{
         clnor::{self, NormalCodeOptions},
         color_layers::{self, ColorDomain},
         normals::{corner_angle, corner_normals, face_normal, sharp_edge_flags},
+        origindex_values,
         provenance::Origin,
         uv_layers,
     },
@@ -35,8 +41,11 @@ enum SimpleDeformMethod {
     Taper,
     Stretch,
 }
+
+/// Blender's axis remap: deformations act on the mapped Z axis (X -> Z, Y -> Z in the first two rows).
 const SIMPLE_DEFORM_AXIS_MAP: [[usize; 3]; 3] = [[1, 2, 0], [2, 0, 1], [0, 1, 2]];
 
+/// Blender `MOD_simpledeform.cc`: limits and factor are measured along the deform axis in the origin's space.
 pub(super) fn simple_deform(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     let method = match string_param(modifier, "deform_method")? {
         "TWIST" | "twist" => SimpleDeformMethod::Twist,
@@ -51,39 +60,65 @@ pub(super) fn simple_deform(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             ));
         }
     };
+    let axis = simple_deform_axis(modifier)?;
+    // Blender stores angle and factor in one field: angle drives TWIST and BEND, factor drives TAPER and STRETCH.
     let amount = if matches!(method, SimpleDeformMethod::Twist | SimpleDeformMethod::Bend) {
         number_param(modifier, "angle")?
     } else {
         number_param(modifier, "factor")?
     };
-    let axis = simple_deform_axis(modifier)?;
-    let limits = simple_deform_limits(modifier)?;
+    let fractions = simple_deform_limits(modifier)?;
     let limit_axis = if method == SimpleDeformMethod::Bend {
         if axis == 2 { 0 } else { 2 }
     } else {
         axis
     };
-    let Some(first_vertex) = mesh.vertices.first() else {
-        return Ok(mesh.clone());
+    // Bend has no locks; otherwise the deform axis is never locked, since locking it would flatten the mesh.
+    let lock = if method == SimpleDeformMethod::Bend {
+        [false; 3]
+    } else {
+        let mut lock = [
+            bool_param(modifier, "lock_x")?,
+            bool_param(modifier, "lock_y")?,
+            bool_param(modifier, "lock_z")?,
+        ];
+        lock[axis] = false;
+        lock
     };
-    let mut minimum = first_vertex.co[limit_axis];
-    let mut maximum = minimum;
-    for vertex in mesh.vertices.iter().skip(1) {
-        let value = vertex.co[limit_axis];
-        minimum = minimum.min(value);
-        maximum = maximum.max(value);
-    }
-    let extent = maximum - minimum;
-    let lower = minimum + extent * limits[0];
-    let upper = minimum + extent * limits[1];
-    let factor = amount / (upper - lower).max(f64::from(f32::EPSILON));
-    if factor == 0.0 || (method == SimpleDeformMethod::Bend && factor.abs() < 1.0e-6) {
+    let object = reference_matrix(modifier);
+    let to_origin = object.map(|matrix| matrix.inverse());
+    let origin_points: Vec<DVec3> = mesh
+        .vertices
+        .iter()
+        .map(|vertex| to_origin.map_or(vertex.co, |matrix| matrix.transform_point3(vertex.co)))
+        .collect();
+    if origin_points.is_empty() {
         return Ok(mesh.clone());
     }
-
+    let mut lower = f64::INFINITY;
+    let mut upper = f64::NEG_INFINITY;
+    for point in &origin_points {
+        lower = lower.min(point[limit_axis]);
+        upper = upper.max(point[limit_axis]);
+    }
+    let range = upper - lower;
+    let limits = [lower + range * fractions[0], lower + range * fractions[1]];
+    let factor = amount / (limits[1] - limits[0]).max(f64::from(f32::EPSILON));
+    if method == SimpleDeformMethod::Bend && factor.abs() < 1.0e-6 {
+        return Ok(mesh.clone());
+    }
+    let weights = deform_group_weights(mesh, modifier)?;
     let mut result = mesh.clone();
-    for vertex in &mut result.vertices {
-        vertex.co = simple_deform_point(vertex.co, method, axis, limit_axis, factor, lower, upper);
+    for (index, (vertex, origin_point)) in result.vertices.iter_mut().zip(origin_points).enumerate()
+    {
+        let weight = group_weight(weights.as_deref(), index);
+        if weight == 0.0 {
+            continue;
+        }
+        let deformed =
+            simple_deform_point(origin_point, method, axis, limit_axis, lock, factor, limits);
+        let blended = origin_point.lerp(deformed, weight);
+        vertex.co = object.map_or(blended, |matrix| matrix.transform_point3(blended));
     }
     validated(&result)?;
     Ok(result)
@@ -98,79 +133,79 @@ fn simple_deform_axis(modifier: &Modifier) -> Result<usize> {
     }
 }
 
+/// Blender's limit fractions: both clamp to [0, 1] and the lower one never exceeds the upper one.
 fn simple_deform_limits(modifier: &Modifier) -> Result<[f64; 2]> {
-    let value = schema_value(modifier, "limits")?;
-    let Some(values) = value.as_array().filter(|values| values.len() == 2) else {
-        return Err(invalid_parameter(
-            modifier,
-            "limits",
-            "two normalized values",
-        ));
+    let invalid = || invalid_parameter(modifier, "limits", "two normalized values");
+    let fractions = match schema_value(modifier, "limits")?
+        .as_array()
+        .map(Vec::as_slice)
+    {
+        Some([first, second]) => [first.as_f64(), second.as_f64()],
+        _ => return Err(invalid()),
     };
-    let first = values[0]
-        .as_f64()
-        .ok_or_else(|| invalid_parameter(modifier, "limits", "two normalized values"))?
-        .clamp(0.0, 1.0);
-    let second = values[1]
-        .as_f64()
-        .ok_or_else(|| invalid_parameter(modifier, "limits", "two normalized values"))?
-        .clamp(0.0, 1.0);
-    Ok([first.min(second), first.max(second)])
+    let [Some(first), Some(second)] = fractions else {
+        return Err(invalid());
+    };
+    let upper = second.clamp(0.0, 1.0);
+    Ok([first.clamp(0.0, 1.0).min(upper), upper])
 }
 
+/// Blender's per-vertex deform: locked axes are pinned to zero and restored afterwards, the limit axis is
+/// clamped with the excess restored, and the deformation acts on the mapped coordinates.
 fn simple_deform_point(
     position: DVec3,
     method: SimpleDeformMethod,
     axis: usize,
     limit_axis: usize,
+    lock: [bool; 3],
     factor: f64,
-    lower: f64,
-    upper: f64,
+    limits: [f64; 2],
 ) -> DVec3 {
     let mut coordinates = position.to_array();
     let mut cut = [0.0; 3];
-    let original = coordinates[limit_axis];
-    coordinates[limit_axis] = original.clamp(lower, upper);
-    cut[limit_axis] = original - coordinates[limit_axis];
-
-    if method == SimpleDeformMethod::Bend {
-        return DVec3::from_array(simple_deform_bend(coordinates, cut, axis, factor));
+    for (index, locked) in lock.into_iter().enumerate() {
+        if locked {
+            cut[index] = coordinates[index];
+            coordinates[index] = 0.0;
+        }
     }
+    let original = coordinates[limit_axis];
+    let clamped = original.max(limits[0]).min(limits[1]);
+    cut[limit_axis] = original - clamped;
+    coordinates[limit_axis] = clamped;
 
     let map = SIMPLE_DEFORM_AXIS_MAP[axis];
-    let mut mapped = [
+    let [x, y, z] = [
         coordinates[map[0]],
         coordinates[map[1]],
         coordinates[map[2]],
     ];
-    let mapped_cut = [cut[map[0]], cut[map[1]], cut[map[2]]];
-    let [x, y, z] = mapped;
-    match method {
+    let mut deformed = match method {
         SimpleDeformMethod::Twist => {
-            let angle = z * factor;
-            let (sine, cosine) = angle.sin_cos();
-            mapped[0] = x * cosine - y * sine;
-            mapped[1] = x * sine + y * cosine;
+            let (sine, cosine) = (z * factor).sin_cos();
+            [x * cosine - y * sine, x * sine + y * cosine, z]
         }
         SimpleDeformMethod::Taper => {
             let scale = z * factor;
-            mapped[0] = x + x * scale;
-            mapped[1] = y + y * scale;
+            [x + x * scale, y + y * scale, z]
         }
         SimpleDeformMethod::Stretch => {
             let scale = z * z * factor - factor + 1.0;
-            mapped[0] = x * scale;
-            mapped[1] = y * scale;
-            mapped[2] = z * (1.0 + factor);
+            [x * scale, y * scale, z * (1.0 + factor)]
         }
-        SimpleDeformMethod::Bend => {}
-    }
-    for (coordinate, cut) in mapped.iter_mut().zip(mapped_cut) {
-        *coordinate += cut;
+        SimpleDeformMethod::Bend => {
+            return DVec3::from_array(simple_deform_bend(coordinates, cut, axis, factor));
+        }
+    };
+    for (value, offset) in deformed
+        .iter_mut()
+        .zip([cut[map[0]], cut[map[1]], cut[map[2]]])
+    {
+        *value += offset;
     }
     let mut result = [0.0; 3];
-    for (index, original_axis) in map.into_iter().enumerate() {
-        result[original_axis] = mapped[index];
+    for (original_axis, value) in map.into_iter().zip(deformed) {
+        result[original_axis] = value;
     }
     DVec3::from_array(result)
 }
@@ -692,6 +727,7 @@ pub(super) fn screw(
                     .unwrap_or_default()
             })
             .collect(),
+        source_vertices: None,
         faces: output_face_sources,
         corners: Some(output_corner_sources),
     };
@@ -1007,9 +1043,7 @@ pub(super) fn shrinkwrap(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         .target_mesh
         .as_ref()
         .ok_or_else(|| invalid_parameter(modifier, "target", "a mesh object operand"))?;
-    let target: Mesh = serde_json::from_value(target.clone())
-        .map_err(|_| invalid_parameter(modifier, "target", "a mesh object operand"))?;
-    validated(&target)?;
+    validated(target)?;
     let method = string_param(modifier, "wrap_method")?.to_ascii_uppercase();
     let offset = number_param(modifier, "offset")?;
     let wrap_mode = string_param(modifier, "wrap_mode")?.to_ascii_uppercase();
@@ -1020,7 +1054,7 @@ pub(super) fn shrinkwrap(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         return Ok(mesh.clone());
     }
     let mut result = mesh.clone();
-    let triangles = target_triangles(&target)?;
+    let triangles = target_triangles(target)?;
     for vertex in &mut result.vertices {
         let (point, normal) = match method.as_str() {
             "NEAREST_VERTEX" => {
@@ -1075,24 +1109,90 @@ pub(super) fn shrinkwrap(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     Ok(result)
 }
 
-/// Blender's automatic cast half-extent per axis: the larger of the mesh's absolute extremes.
-fn cast_auto_half_extent(points: &[DVec3]) -> DVec3 {
+/// Subject-local to referenced-object transform the scene resolved for this modifier; `None` without a reference.
+fn reference_matrix(modifier: &Modifier) -> Option<DMat4> {
+    modifier
+        .runtime
+        .object_matrix
+        .map(|matrix| DMat4::from_cols_array(&matrix))
+}
+
+/// Per-vertex weights of the modifier's vertex group, inverted when requested; `None` without a group.
+/// Blender's `MOD_get_vgroup` treats a group missing from the mesh the same as no group.
+fn deform_group_weights(mesh: &Mesh, modifier: &Modifier) -> Result<Option<Vec<f64>>> {
+    let group = string_param(modifier, "vertex_group")?;
+    if group.is_empty() {
+        return Ok(None);
+    }
+    let invert = bool_param(modifier, "invert_vertex_group")?;
+    let Some(weights) = mesh
+        .attributes
+        .get("vertex_groups")
+        .and_then(Value::as_object)
+        .and_then(|groups| groups.get(group))
+        .and_then(Value::as_object)
+    else {
+        return Ok(None);
+    };
+    Ok(Some(
+        mesh.vertices
+            .iter()
+            .map(|vertex| {
+                let weight = weights
+                    .get(&format!("v{}", vertex.id))
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0);
+                if invert { 1.0 - weight } else { weight }
+            })
+            .collect(),
+    ))
+}
+
+/// Per-vertex deform weight: 1 without a vertex group, else the group weight.
+fn group_weight(weights: Option<&[f64]>, index: usize) -> f64 {
+    weights.map_or(1.0, |weights| weights.get(index).copied().unwrap_or(0.0))
+}
+
+/// Cast and Hook per-vertex weights (`MOD_cast.cc`, `MOD_hook.cc`); `None` when every vertex has full influence.
+/// A named group without stored weights is Blender's null `dvert`, which both modifiers skip, so every vertex
+/// keeps full influence, as with an absent group. Simple Deform and Curve keep `deform_group_weights`.
+fn cast_hook_weights(mesh: &Mesh, modifier: &Modifier) -> Result<Option<Vec<f64>>> {
+    let group = vertex_group(mesh, modifier)?;
+    if !matches!(group, VertexGroup::Weighted(_)) {
+        return Ok(None);
+    }
+    let invert = bool_param(modifier, "invert_vertex_group")?;
+    Ok(Some(
+        (0..mesh.vertices.len())
+            .map(|index| group.weight(index, invert))
+            .collect(),
+    ))
+}
+
+/// Blender's automatic cuboid half-extent per axis: the larger of the absolute extremes of the points.
+/// Blender `cuboid_do` takes the points as the centre plus the local coordinates relative to it.
+fn cast_auto_half_extent(points: impl Iterator<Item = DVec3>) -> DVec3 {
     let mut lo = DVec3::splat(f64::INFINITY);
     let mut hi = DVec3::splat(f64::NEG_INFINITY);
     for point in points {
-        lo = lo.min(*point);
-        hi = hi.max(*point);
+        lo = lo.min(point);
+        hi = hi.max(point);
     }
-    let half = |lo: f64, hi: f64| if lo.abs() > hi.abs() { lo.abs() } else { hi };
-    DVec3::new(half(lo.x, hi.x), half(lo.y, hi.y), half(lo.z, hi.z))
+    lo.abs().max(hi.abs())
 }
 
+/// Blender `MOD_cast.cc`: sphere, cylinder and cuboid projection around the reference object's centre,
+/// optionally in the reference object's space (`use_transform`), per axis and weighted by the vertex group.
 pub(super) fn cast(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     let cast_type = string_param(modifier, "cast_type")?.to_ascii_uppercase();
-    let factor = number_param(modifier, "factor")?;
-    if factor == 0.0 {
-        return Ok(mesh.clone());
+    if !matches!(cast_type.as_str(), "SPHERE" | "CYLINDER" | "CUBOID") {
+        return Err(invalid_parameter(
+            modifier,
+            "cast_type",
+            "SPHERE, CYLINDER, or CUBOID",
+        ));
     }
+    let factor = number_param(modifier, "factor")?;
     let radius = number_param(modifier, "radius")?;
     let size = number_param(modifier, "size")?;
     if radius < 0.0 || size < 0.0 {
@@ -1103,723 +1203,127 @@ pub(super) fn cast(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         ));
     }
     let use_radius_as_size = bool_param(modifier, "use_radius_as_size")?;
-    // `origin` is not in the cast schema; an explicit value is honoured, else the zero origin applies.
-    let center = if modifier.params.contains_key("origin") {
-        vec3_param(modifier, "origin")?
-    } else {
-        DVec3::ZERO
-    };
-    // Blender: a radius of zero (within FLT_EPSILON) leaves the cast unbounded.
-    let limit = (radius > f64::from(f32::EPSILON)).then_some(radius);
-    let points: Vec<DVec3> = mesh
-        .vertices
-        .iter()
-        .map(|vertex| vertex.co - center)
-        .collect();
-    let mut result = mesh.clone();
-    match cast_type.as_str() {
-        "SPHERE" | "CYLINDER" => {
-            let mut length = if use_radius_as_size { radius } else { size };
-            if length <= 0.0 {
-                // Blender's automatic size: the mean vertex distance from the centre, 10 when that is zero.
-                let total: f64 = points.iter().map(|point| point.length()).sum();
-                let mean = total / usize_as_f64(points.len());
-                length = if mean > 0.0 { mean } else { 10.0 };
-            }
-            let flatten = cast_type == "CYLINDER";
-            for (vertex, point) in result.vertices.iter_mut().zip(&points) {
-                // Blender clears the Z axis for cylinders (MOD_CAST_Z), so the projection is planar.
-                let direction = if flatten {
-                    DVec3::new(point.x, point.y, 0.0)
-                } else {
-                    *point
-                };
-                if limit.is_some_and(|limit| direction.length() > limit) {
-                    continue;
-                }
-                let mut target = direction.normalize_or_zero() * length;
-                if flatten {
-                    target.z = point.z;
-                }
-                vertex.co = center + point.lerp(target, factor);
-            }
-        }
-        "CUBOID" => {
-            // Blender: an explicit half-extent when one applies, else the mesh's symmetric bounds.
-            let explicit = if use_radius_as_size {
-                limit.map(|_| radius)
-            } else {
-                (size > 0.0).then_some(size)
-            };
-            let half = explicit.map_or_else(|| cast_auto_half_extent(&points), DVec3::splat);
-            for (vertex, point) in result.vertices.iter_mut().zip(&points) {
-                if limit.is_some_and(|limit| point.abs().max_element() > limit) {
-                    continue;
-                }
-                // Blender projects each vertex onto the box wall of its octant along the ray from the centre.
-                let apex = DVec3::new(
-                    if point.x > 0.0 { half.x } else { -half.x },
-                    if point.y > 0.0 { half.y } else { -half.y },
-                    if point.z > 0.0 { half.z } else { -half.z },
-                );
-                let ratio = *point / apex;
-                let mut best = ratio.x;
-                let mut coord = 0;
-                if ratio.y > best {
-                    best = ratio.y;
-                    coord = 1;
-                }
-                if ratio.z > best {
-                    coord = 2;
-                }
-                if point[coord].abs() < f64::from(f32::EPSILON) {
-                    continue;
-                }
-                let target = *point * (apex[coord] / point[coord]);
-                vertex.co = center + point.lerp(target, factor);
-            }
-        }
-        _ => {
-            return Err(invalid_parameter(
-                modifier,
-                "cast_type",
-                "SPHERE, CYLINDER, or CUBOID",
-            ));
-        }
-    }
-    validated(&result)?;
-    Ok(result)
-}
-
-pub(super) fn wave(mesh: &Mesh, modifier: &Modifier, frame: f64) -> Result<Mesh> {
-    let speed = number_param(modifier, "speed")?;
-    let height = number_param(modifier, "height")?;
-    let width = number_param(modifier, "width")?;
-    let narrowness = number_param(modifier, "narrowness")?;
-    let time_offset = number_param(modifier, "time_offset")?;
-    let lifetime = number_param(modifier, "lifetime")?;
-    let mut damping_time = number_param(modifier, "damping_time")?;
-    let falloff_radius = number_param(modifier, "falloff_radius")?;
-    let start_x = number_param(modifier, "start_position_x")?;
-    let start_y = number_param(modifier, "start_position_y")?;
-    let use_x = bool_param(modifier, "use_x")?;
-    let use_y = bool_param(modifier, "use_y")?;
-    let use_cyclic = bool_param(modifier, "use_cyclic")?;
-    if width <= 0.0 || narrowness <= 0.0 || falloff_radius < 0.0 {
-        return Err(invalid_parameter(
-            modifier,
-            "width",
-            "positive width and narrowness with non-negative falloff radius",
-        ));
-    }
-    if damping_time == 0.0 {
-        damping_time = 10.0;
-    }
-    let mut life_factor = height;
-    let time = frame - time_offset;
-    if lifetime != 0.0 && time > lifetime {
-        let elapsed = time - lifetime;
-        life_factor = if elapsed > damping_time {
-            0.0
-        } else {
-            height * (1.0 - (elapsed / damping_time).sqrt())
-        };
-    }
-    if life_factor == 0.0 {
-        return Ok(mesh.clone());
-    }
-    let min_factor = (-(width * narrowness).powi(2)).exp();
-    let use_normal = bool_param(modifier, "use_normal")?;
-    let mut result = mesh.clone();
-    let normals = if use_normal {
-        // Blender's `mesh->vert_normals()` (`MOD_wave.cc`): the angle-weighted face-normal sum
-        // per vertex, the shared `vertex_normals` that Displace and Solidify also use.
-        vertex_normals(&positions(mesh), &polygons(mesh)?)
-    } else {
-        Vec::new()
-    };
-    let use_normal_x = bool_param(modifier, "use_normal_x")?;
-    let use_normal_y = bool_param(modifier, "use_normal_y")?;
-    let use_normal_z = bool_param(modifier, "use_normal_z")?;
-    for (index, vertex) in result.vertices.iter_mut().enumerate() {
-        let x = vertex.co.x - start_x;
-        let y = vertex.co.y - start_y;
-        let distance = match (use_x, use_y) {
-            (true, true) => x.hypot(y),
-            (true, false) => x.abs(),
-            (false, true) => y.abs(),
-            (false, false) => 0.0,
-        };
-        let mut phase = match (use_x, use_y) {
-            (true, true) => distance,
-            (true, false) => x,
-            (false, true) => y,
-            (false, false) => 0.0,
-        } - time * speed;
-        if use_cyclic {
-            phase = (phase - width) % (2.0 * width) + width;
-        }
-        if phase <= -width || phase >= width {
-            continue;
-        }
-        let normalized = phase * narrowness;
-        let mut amplitude = (-normalized * normalized).exp() - min_factor;
-        if falloff_radius > 0.0 {
-            amplitude *= (1.0 - distance / falloff_radius).clamp(0.0, 1.0);
-        }
-        amplitude *= life_factor;
-        if use_normal {
-            let normal = normals[index];
-            if use_normal_x {
-                vertex.co.x += amplitude * normal.x;
-            }
-            if use_normal_y {
-                vertex.co.y += amplitude * normal.y;
-            }
-            if use_normal_z {
-                vertex.co.z += amplitude * normal.z;
-            }
-        } else {
-            vertex.co.z += amplitude;
-        }
-    }
-    validated(&result)?;
-    Ok(result)
-}
-
-pub(super) fn warp(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
-    let from = modifier
-        .runtime
-        .warp_from
-        .map_or(DVec3::ZERO, DVec3::from_array);
-    let to = modifier.runtime.warp_to.map_or(DVec3::Z, DVec3::from_array);
-    let displacement = to - from;
-    let strength = number_param(modifier, "strength")?;
-    let radius = number_param(modifier, "falloff_radius")?;
-    let falloff = string_param(modifier, "falloff_type")?.to_ascii_uppercase();
-    let mut result = mesh.clone();
-    for vertex in &mut result.vertices {
-        let distance = vertex.co.distance(from);
-        let weight = if falloff == "NONE" {
-            1.0
-        } else if radius > 0.0 && distance < radius {
-            let linear = ((radius - distance) / radius).clamp(0.0, 1.0);
-            match falloff.as_str() {
-                "CURVE" | "LINEAR" => linear,
-                "SHARP" => linear * linear,
-                "SMOOTH" => 3.0 * linear * linear - 2.0 * linear * linear * linear,
-                "ROOT" => linear.sqrt(),
-                "CONST" => 1.0,
-                "SPHERE" => (2.0 * linear - linear * linear).sqrt(),
-                "INVSQUARE" => linear * (2.0 - linear),
-                _ => {
-                    return Err(invalid_parameter(
-                        modifier,
-                        "falloff_type",
-                        "NONE, CURVE, SHARP, SMOOTH, ROOT, LINEAR, CONST, SPHERE, or INVSQUARE",
-                    ));
-                }
-            }
-        } else {
-            0.0
-        };
-        vertex.co += displacement * (strength * weight);
-    }
-    validated(&result)?;
-    Ok(result)
-}
-
-pub(super) fn laplacian_smooth(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
-    let iterations = usize::try_from(uint_param(modifier, "iterations")?)
-        .map_err(|_| invalid_parameter(modifier, "iterations", "an integer from 0 to 10000"))?;
-    if iterations > 10000 {
-        return Err(invalid_parameter(
-            modifier,
-            "iterations",
-            "an integer from 0 to 10000",
-        ));
-    }
-    let lambda = number_param(modifier, "lambda_factor")?;
-    let lambda_border = number_param(modifier, "lambda_border")?;
-    let normalized = bool_param(modifier, "use_normalized")?;
-    let preserve_volume = bool_param(modifier, "use_volume_preserve")?;
     let axes = [
         bool_param(modifier, "use_x")?,
         bool_param(modifier, "use_y")?,
         bool_param(modifier, "use_z")?,
     ];
-    laplacian_smooth_mesh(
-        mesh,
-        modifier,
-        LaplacianSmoothSettings {
-            iterations,
-            lambda,
-            lambda_border,
-            normalized,
-            preserve_volume,
-            axes,
-        },
-    )
-}
-
-#[derive(Clone, Copy)]
-struct LaplacianSmoothSettings {
-    iterations: usize,
-    lambda: f64,
-    lambda_border: f64,
-    normalized: bool,
-    preserve_volume: bool,
-    axes: [bool; 3],
-}
-
-#[expect(
-    clippy::too_many_lines,
-    reason = "the modifier's matrix assembly and repeated volume-preserving solves are one algorithm"
-)]
-fn laplacian_smooth_mesh(
-    mesh: &Mesh,
-    modifier: &Modifier,
-    settings: LaplacianSmoothSettings,
-) -> Result<Mesh> {
-    const MIN_AREA: f64 = 1.0e-5;
-    if settings.iterations == 0 || mesh.vertices.is_empty() || mesh.faces.is_empty() {
+    let use_transform = bool_param(modifier, "use_transform")?;
+    // Blender disables the cast without a factor or an enabled axis.
+    if factor == 0.0 || !axes.iter().any(|enabled| *enabled) {
         return Ok(mesh.clone());
     }
-    if !settings.axes.into_iter().any(|enabled| enabled) {
-        return Ok(mesh.clone());
-    }
-
-    let positions = positions(mesh);
-    let index_by_id = id_indices(mesh);
-    let vertex_count = positions.len();
-    let mut edge_counts = vec![0_usize; vertex_count];
-    let mut face_counts = vec![0_usize; vertex_count];
-    let mut zero_laplacian = vec![false; vertex_count];
-    let mut ring_areas = vec![0.0; vertex_count];
-    let mut vertex_weights = vec![0.0; vertex_count];
-    let mut vertex_lengths = vec![0.0; vertex_count];
-    let mut edge_weights = Vec::with_capacity(mesh.edges.len());
-    for edge in &mesh.edges {
-        let first = *index_by_id.get(&edge.vertices[0]).ok_or_else(|| {
-            invalid_parameter(modifier, "mesh", "edges referencing existing vertices")
-        })?;
-        let second = *index_by_id.get(&edge.vertices[1]).ok_or_else(|| {
-            invalid_parameter(modifier, "mesh", "edges referencing existing vertices")
-        })?;
-        edge_counts[first] += 1;
-        edge_counts[second] += 1;
-        let length = positions[first].distance(positions[second]);
-        if length < MIN_AREA {
-            zero_laplacian[first] = true;
-            zero_laplacian[second] = true;
-            edge_weights.push(length);
+    let object = reference_matrix(modifier);
+    let center = object.map_or(DVec3::ZERO, |matrix| matrix.transform_point3(DVec3::ZERO));
+    // Blender works in the reference object's space with `use_transform`, else shifted to its centre.
+    let (forward, backward) = match object {
+        Some(matrix) if use_transform => (matrix.inverse(), matrix),
+        Some(_) => (
+            DMat4::from_translation(-center),
+            DMat4::from_translation(center),
+        ),
+        None => (DMat4::IDENTITY, DMat4::IDENTITY),
+    };
+    let weights = cast_hook_weights(mesh, modifier)?;
+    let has_radius = radius > f64::from(f32::EPSILON);
+    let mut result = mesh.clone();
+    if cast_type == "CUBOID" {
+        let half = if use_radius_as_size && has_radius {
+            DVec3::splat(radius)
+        } else if !use_radius_as_size && size > 0.0 {
+            DVec3::splat(size)
         } else {
-            edge_weights.push(length.recip());
-        }
-    }
-
-    let mut face_indices = Vec::with_capacity(mesh.faces.len());
-    let mut face_offsets = Vec::with_capacity(mesh.faces.len());
-    let mut total_corners = 0;
-    for face in &mesh.faces {
-        let indices = face
-            .vertices
-            .iter()
-            .map(|id| {
-                index_by_id.get(id).copied().ok_or_else(|| {
-                    invalid_parameter(modifier, "mesh", "faces referencing existing vertices")
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        face_offsets.push(total_corners);
-        total_corners += indices.len();
-        face_indices.push(indices);
-    }
-    let mut face_weights = vec![[0.0; 3]; total_corners];
-    for (face_index, indices) in face_indices.iter().enumerate() {
-        if indices.len() < 3 {
-            continue;
-        }
-        let face_start = face_offsets[face_index];
-        for corner in 0..indices.len() {
-            let previous = indices[(corner + indices.len() - 1) % indices.len()];
-            let current = indices[corner];
-            let next = indices[(corner + 1) % indices.len()];
-            face_counts[current] += 1;
-            let previous_position = positions[previous];
-            let current_position = positions[current];
-            let next_position = positions[next];
-            let area = (current_position - previous_position)
-                .cross(next_position - previous_position)
-                .length()
-                * 0.5;
-            if area < MIN_AREA {
-                zero_laplacian[current] = true;
-            }
-            ring_areas[previous] += area;
-            ring_areas[current] += area;
-            ring_areas[next] += area;
-            let w1 = cotangent_weight(current_position, next_position, previous_position) * 0.5;
-            let w2 = cotangent_weight(next_position, previous_position, current_position) * 0.5;
-            let w3 = cotangent_weight(previous_position, current_position, next_position) * 0.5;
-            let weights = &mut face_weights[face_start + corner];
-            weights[0] += w1;
-            weights[1] += w2;
-            weights[2] += w3;
-            vertex_weights[current] += w2 + w3;
-            vertex_weights[next] += w1 + w3;
-            vertex_weights[previous] += w1 + w2;
-        }
-    }
-    for (edge_index, edge) in mesh.edges.iter().enumerate() {
-        let first = index_by_id[&edge.vertices[0]];
-        let second = index_by_id[&edge.vertices[1]];
-        if edge_counts[first] != face_counts[first] && edge_counts[second] != face_counts[second] {
-            vertex_lengths[first] += edge_weights[edge_index];
-            vertex_lengths[second] += edge_weights[edge_index];
-        }
-    }
-
-    let mut rows = vec![Vec::<(usize, f64)>::new(); vertex_count];
-    let mut row_weights = vec![0.0; vertex_count];
-    for index in 0..vertex_count {
-        let interior = edge_counts[index] == face_counts[index];
-        if zero_laplacian[index] {
-            laplacian_matrix_add(&mut rows, index, index, 1.0);
-        } else if interior {
-            let diagonal = if settings.normalized {
-                settings.lambda.abs()
-            } else if ring_areas[index] > 0.0 {
-                settings.lambda.abs() / (4.0 * ring_areas[index])
-            } else {
-                0.0
-            };
-            let denominator = if settings.normalized {
-                vertex_weights[index]
-            } else {
-                4.0 * vertex_weights[index] * ring_areas[index]
-            };
-            row_weights[index] = if denominator == 0.0 {
-                0.0
-            } else {
-                -settings.lambda.abs() / denominator
-            };
-            laplacian_matrix_add(&mut rows, index, index, 1.0 + diagonal);
-        } else {
-            let diagonal = settings.lambda_border.abs() * 2.0;
-            row_weights[index] = if vertex_lengths[index] == 0.0 {
-                0.0
-            } else {
-                -settings.lambda_border.abs() * 2.0 / vertex_lengths[index]
-            };
-            laplacian_matrix_add(&mut rows, index, index, 1.0 + diagonal);
-        }
-    }
-
-    for (face_index, indices) in face_indices.iter().enumerate() {
-        if indices.len() < 3 {
-            continue;
-        }
-        let face_start = face_offsets[face_index];
-        for corner in 0..indices.len() {
-            let previous = indices[(corner + indices.len() - 1) % indices.len()];
-            let current = indices[corner];
-            let next = indices[(corner + 1) % indices.len()];
-            if edge_counts[current] == face_counts[current] && !zero_laplacian[current] {
-                laplacian_matrix_add(
-                    &mut rows,
-                    current,
-                    next,
-                    face_weights[face_start + corner][2] * row_weights[current],
-                );
-                laplacian_matrix_add(
-                    &mut rows,
-                    current,
-                    previous,
-                    face_weights[face_start + corner][1] * row_weights[current],
-                );
-            }
-            if edge_counts[next] == face_counts[next] && !zero_laplacian[next] {
-                laplacian_matrix_add(
-                    &mut rows,
-                    next,
-                    current,
-                    face_weights[face_start + corner][2] * row_weights[next],
-                );
-                laplacian_matrix_add(
-                    &mut rows,
-                    next,
-                    previous,
-                    face_weights[face_start + corner][0] * row_weights[next],
-                );
-            }
-            if edge_counts[previous] == face_counts[previous] && !zero_laplacian[previous] {
-                laplacian_matrix_add(
-                    &mut rows,
-                    previous,
-                    next,
-                    face_weights[face_start + corner][0] * row_weights[previous],
-                );
-                laplacian_matrix_add(
-                    &mut rows,
-                    previous,
-                    current,
-                    face_weights[face_start + corner][1] * row_weights[previous],
-                );
-            }
-        }
-    }
-    for (edge_index, edge) in mesh.edges.iter().enumerate() {
-        let first = index_by_id[&edge.vertices[0]];
-        let second = index_by_id[&edge.vertices[1]];
-        if edge_counts[first] != face_counts[first]
-            && edge_counts[second] != face_counts[second]
-            && !zero_laplacian[first]
-            && !zero_laplacian[second]
-        {
-            laplacian_matrix_add(
-                &mut rows,
-                first,
-                second,
-                edge_weights[edge_index] * row_weights[first],
-            );
-            laplacian_matrix_add(
-                &mut rows,
-                second,
-                first,
-                edge_weights[edge_index] * row_weights[second],
-            );
-        }
-    }
-
-    let centroid = positions.iter().copied().sum::<DVec3>() / vertex_count as f64;
-    let mut result_positions = positions;
-    let mut solver = SparseLaplacianSolver::new(rows, vertex_count);
-    let mut right_hand_side = vec![0.0; vertex_count];
-    for _ in 0..settings.iterations {
-        let initial_volume = if settings.preserve_volume {
-            laplacian_mesh_volume(centroid, &result_positions, &face_indices)
-        } else {
-            0.0
+            // Blender `cuboid_do` bounds the centre and the local coordinates relative to it, whatever
+            // `use_transform` is; the transform applies only to each vertex's projection.
+            let relative = mesh.vertices.iter().map(|vertex| vertex.co - center);
+            cast_auto_half_extent(std::iter::once(center).chain(relative))
         };
-        for axis in 0..3 {
-            for (index, position) in result_positions.iter().enumerate() {
-                right_hand_side[index] = position[axis];
-            }
-            if !solver.solve(&right_hand_side) {
+        for (index, vertex) in result.vertices.iter_mut().enumerate() {
+            let weight = group_weight(weights.as_deref(), index);
+            if weight == 0.0 {
                 continue;
             }
-            for (index, position) in result_positions.iter_mut().enumerate() {
-                if zero_laplacian[index] {
-                    continue;
-                }
-                let lambda = if edge_counts[index] == face_counts[index] {
-                    settings.lambda
-                } else {
-                    settings.lambda_border
-                };
-                let direction = if lambda >= 0.0 { 1.0 } else { -1.0 };
-                if settings.axes[axis] {
-                    position[axis] += direction * (solver.solution[index] - position[axis]);
+            let working = forward.transform_point3(vertex.co);
+            if has_radius && working.abs().max_element() > radius {
+                continue;
+            }
+            let fac = factor * weight;
+            let facm = 1.0 - fac;
+            // Blender projects onto the box wall of the vertex's octant, along the ray from the centre.
+            let apex = DVec3::new(
+                if working.x > 0.0 { half.x } else { -half.x },
+                if working.y > 0.0 { half.y } else { -half.y },
+                if working.z > 0.0 { half.z } else { -half.z },
+            );
+            let ratio = working / apex;
+            let mut best = ratio.x;
+            let mut coord = 0;
+            if ratio.y > best {
+                best = ratio.y;
+                coord = 1;
+            }
+            if ratio.z > best {
+                coord = 2;
+            }
+            if working[coord].abs() < f64::from(f32::EPSILON) {
+                continue;
+            }
+            let fbb = apex[coord] / working[coord];
+            let mut projected = working;
+            for (axis, enabled) in axes.iter().enumerate() {
+                if *enabled {
+                    projected[axis] = facm * working[axis] + fac * working[axis] * fbb;
                 }
             }
+            vertex.co = backward.transform_point3(projected);
         }
-        if settings.preserve_volume {
-            let final_volume = laplacian_mesh_volume(centroid, &result_positions, &face_indices);
-            if final_volume != 0.0 {
-                let scale = (initial_volume / final_volume).cbrt();
-                for position in &mut result_positions {
-                    for axis in 0..3 {
-                        if settings.axes[axis] {
-                            position[axis] =
-                                (position[axis] - centroid[axis]) * scale + centroid[axis];
-                        }
-                    }
+    } else {
+        let flatten = cast_type == "CYLINDER";
+        // Blender clears the Z axis for cylinders, so the projection is planar and Z keeps its value.
+        let axes = if flatten {
+            [axes[0], axes[1], false]
+        } else {
+            axes
+        };
+        let mut length = if use_radius_as_size { radius } else { size };
+        if length <= 0.0 {
+            // Blender's automatic length: the mean distance from the centre, 10 when that is zero.
+            let total: f64 = mesh
+                .vertices
+                .iter()
+                .map(|vertex| (vertex.co - center).length())
+                .sum();
+            let mean = total / usize_as_f64(mesh.vertices.len());
+            length = if mean == 0.0 { 10.0 } else { mean };
+        }
+        for (index, vertex) in result.vertices.iter_mut().enumerate() {
+            let weight = group_weight(weights.as_deref(), index);
+            if weight == 0.0 {
+                continue;
+            }
+            let working = forward.transform_point3(vertex.co);
+            let direction = if flatten {
+                DVec3::new(working.x, working.y, 0.0)
+            } else {
+                working
+            };
+            if has_radius && direction.length() > radius {
+                continue;
+            }
+            let fac = factor * weight;
+            let facm = 1.0 - fac;
+            let unit = direction.normalize_or_zero();
+            let mut projected = working;
+            for (axis, enabled) in axes.iter().enumerate() {
+                if *enabled {
+                    projected[axis] = fac * unit[axis] * length + facm * working[axis];
                 }
             }
+            vertex.co = backward.transform_point3(projected);
         }
-    }
-    let mut result = mesh.clone();
-    for (vertex, position) in result.vertices.iter_mut().zip(result_positions) {
-        vertex.co = position;
     }
     validated(&result)?;
     Ok(result)
-}
-
-fn cotangent_weight(first: DVec3, second: DVec3, third: DVec3) -> f64 {
-    let first_edge = second - first;
-    let second_edge = third - first;
-    let area = first_edge.cross(second_edge).length();
-    if area > f64::from(f32::EPSILON) {
-        first_edge.dot(second_edge) / area
-    } else {
-        0.0
-    }
-}
-
-fn laplacian_matrix_add(rows: &mut [Vec<(usize, f64)>], row: usize, column: usize, value: f64) {
-    if let Some((_, current)) = rows[row].iter_mut().find(|(index, _)| *index == column) {
-        *current += value;
-    } else {
-        rows[row].push((column, value));
-    }
-}
-
-fn laplacian_mesh_volume(center: DVec3, positions: &[DVec3], faces: &[Vec<usize>]) -> f64 {
-    let mut volume = 0.0;
-    for face in faces {
-        if face.len() < 3 {
-            continue;
-        }
-        let first = positions[face[0]] - center;
-        for index in 1..face.len() - 1 {
-            let previous = positions[face[index]] - center;
-            let current = positions[face[index + 1]] - center;
-            volume += first.dot(previous.cross(current)) / 6.0;
-        }
-    }
-    volume.abs()
-}
-
-struct SparseLaplacianSolver {
-    rows: Vec<Vec<(usize, f64)>>,
-    solution: Vec<f64>,
-    residual: Vec<f64>,
-    shadow_residual: Vec<f64>,
-    direction: Vec<f64>,
-    product: Vec<f64>,
-    intermediate: Vec<f64>,
-    second_product: Vec<f64>,
-}
-
-impl SparseLaplacianSolver {
-    fn new(rows: Vec<Vec<(usize, f64)>>, vertex_count: usize) -> Self {
-        Self {
-            rows,
-            solution: vec![0.0; vertex_count],
-            residual: vec![0.0; vertex_count],
-            shadow_residual: vec![0.0; vertex_count],
-            direction: vec![0.0; vertex_count],
-            product: vec![0.0; vertex_count],
-            intermediate: vec![0.0; vertex_count],
-            second_product: vec![0.0; vertex_count],
-        }
-    }
-
-    fn solve(&mut self, right_hand_side: &[f64]) -> bool {
-        self.solution.copy_from_slice(right_hand_side);
-        sparse_matrix_vector(&self.rows, &self.solution, &mut self.product);
-        for (index, &right_hand_side) in right_hand_side.iter().enumerate() {
-            self.residual[index] = right_hand_side - self.product[index];
-            self.shadow_residual[index] = self.residual[index];
-        }
-        let tolerance = 1.0e-11 * sparse_norm(right_hand_side).max(1.0);
-        if sparse_norm(&self.residual) <= tolerance {
-            return true;
-        }
-        let mut previous_rho = 1.0;
-        let mut alpha = 1.0;
-        let mut omega = 1.0;
-        let max_iterations = self.solution.len().saturating_mul(4).max(32);
-        for iteration in 0..max_iterations {
-            let rho = sparse_dot(&self.shadow_residual, &self.residual);
-            if rho.abs() <= f64::EPSILON {
-                return false;
-            }
-            if iteration == 0 {
-                self.direction.copy_from_slice(&self.residual);
-            } else {
-                let beta = (rho / previous_rho) * (alpha / omega);
-                for index in 0..self.direction.len() {
-                    self.direction[index] = self.residual[index]
-                        + beta * (self.direction[index] - omega * self.product[index]);
-                }
-            }
-            sparse_matrix_vector(&self.rows, &self.direction, &mut self.product);
-            let divisor = sparse_dot(&self.shadow_residual, &self.product);
-            if divisor.abs() <= f64::EPSILON {
-                return false;
-            }
-            alpha = rho / divisor;
-            for index in 0..self.intermediate.len() {
-                self.intermediate[index] = self.residual[index] - alpha * self.product[index];
-            }
-            if sparse_norm(&self.intermediate) <= tolerance {
-                for index in 0..self.solution.len() {
-                    self.solution[index] += alpha * self.direction[index];
-                }
-                return true;
-            }
-            sparse_matrix_vector(&self.rows, &self.intermediate, &mut self.second_product);
-            let denominator = sparse_dot(&self.second_product, &self.second_product);
-            if denominator <= f64::EPSILON {
-                return false;
-            }
-            omega = sparse_dot(&self.second_product, &self.intermediate) / denominator;
-            if omega.abs() <= f64::EPSILON {
-                return false;
-            }
-            for index in 0..self.solution.len() {
-                self.solution[index] +=
-                    alpha * self.direction[index] + omega * self.intermediate[index];
-                self.residual[index] =
-                    self.intermediate[index] - omega * self.second_product[index];
-            }
-            if sparse_norm(&self.residual) <= tolerance {
-                return true;
-            }
-            previous_rho = rho;
-        }
-        false
-    }
-}
-
-fn sparse_matrix_vector(rows: &[Vec<(usize, f64)>], input: &[f64], output: &mut [f64]) {
-    for (row_index, row) in rows.iter().enumerate() {
-        output[row_index] = row
-            .iter()
-            .map(|(column, coefficient)| coefficient * input[*column])
-            .sum();
-    }
-}
-
-fn sparse_dot(first: &[f64], second: &[f64]) -> f64 {
-    first
-        .iter()
-        .zip(second)
-        .map(|(first, second)| first * second)
-        .sum()
-}
-
-fn sparse_norm(vector: &[f64]) -> f64 {
-    sparse_dot(vector, vector).sqrt()
-}
-
-pub(super) fn corrective_smooth(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
-    let iterations = usize::try_from(uint_param(modifier, "iterations")?)
-        .map_err(|_| invalid_parameter(modifier, "iterations", "an integer from 0 to 10000"))?;
-    if iterations > 10000 {
-        return Err(invalid_parameter(
-            modifier,
-            "iterations",
-            "an integer from 0 to 10000",
-        ));
-    }
-    let factor = number_param(modifier, "factor")?;
-    let mut smoothed = smooth_positions(mesh, iterations, factor)?;
-    let original: HashMap<_, _> = mesh
-        .vertices
-        .iter()
-        .map(|vertex| (vertex.id, vertex.co))
-        .collect();
-    let scale = number_param(modifier, "scale")?.clamp(0.0, 1.0);
-    for vertex in &mut smoothed.vertices {
-        if let Some(point) = original.get(&vertex.id) {
-            vertex.co = vertex.co.lerp(*point, scale);
-        }
-    }
-    Ok(smoothed)
 }
 
 pub(super) fn build(mesh: &Mesh, modifier: &Modifier, frame: f64) -> Result<Mesh> {
@@ -2093,38 +1597,6 @@ fn find_corner(parent: &mut [usize], mut index: usize) -> usize {
         index = parent[index];
     }
     index
-}
-
-fn smooth_positions(mesh: &Mesh, iterations: usize, factor: f64) -> Result<Mesh> {
-    let index_by_id = id_indices(mesh);
-    let mut neighbors = vec![HashSet::new(); mesh.vertices.len()];
-    for edge in &mesh.edges {
-        let first = *index_by_id.get(&edge.vertices[0]).ok_or_else(|| {
-            PotError::invalid_argument("smooth modifier edge references missing vertex")
-        })?;
-        let second = *index_by_id.get(&edge.vertices[1]).ok_or_else(|| {
-            PotError::invalid_argument("smooth modifier edge references missing vertex")
-        })?;
-        neighbors[first].insert(second);
-        neighbors[second].insert(first);
-    }
-    let mut result = mesh.clone();
-    for _ in 0..iterations {
-        let current: Vec<DVec3> = result.vertices.iter().map(|vertex| vertex.co).collect();
-        for (index, vertex) in result.vertices.iter_mut().enumerate() {
-            if neighbors[index].is_empty() {
-                continue;
-            }
-            let average = neighbors[index]
-                .iter()
-                .map(|neighbor| current[*neighbor])
-                .sum::<DVec3>()
-                / neighbors[index].len() as f64;
-            vertex.co = current[index].lerp(average, factor);
-        }
-    }
-    validated(&result)?;
-    Ok(result)
 }
 
 fn target_triangles(mesh: &Mesh) -> Result<Vec<[DVec3; 3]>> {
@@ -3046,618 +2518,628 @@ fn wireframe_group_data(
     Ok((has_deform_data, Some(weights)))
 }
 
-/// Skin for the modifier stack. Blender reports a skin failure as a modifier error and keeps the
-/// input (`MOD_skin.cc` `modify_mesh`); an error flagged `modifier_warning` becomes a warning here.
-pub(super) fn skin_with_warnings(
-    mesh: &Mesh,
-    modifier: &Modifier,
-    warnings: &mut Vec<PotError>,
-) -> Result<Mesh> {
-    match skin(mesh, modifier) {
-        Err(error)
-            if error
-                .details
-                .get("modifier_warning")
-                .and_then(Value::as_bool)
-                == Some(true) =>
-        {
-            warnings.push(error);
-            Ok(mesh.clone())
-        }
-        result => result,
-    }
-}
-
-#[expect(
-    clippy::manual_midpoint,
-    reason = "matches Blender's float evaluation order for parity"
-)]
-pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
-    let source_positions = positions(mesh);
-    let source_indices = id_indices(mesh);
-    let radii = mesh.attributes.get("skin_radii").and_then(Value::as_object);
-    let roots = mesh.attributes.get("skin_roots").and_then(Value::as_object);
-    // MOD_skin.cc final_skin: without skin-node data the mesh passes through. With data, base_skin
-    // on zero vertices has no valid root: Blender reports that as a modifier error and keeps the
-    // empty result (see skin_with_warnings).
-    if mesh.vertices.is_empty() {
-        if mesh.attributes.get("skin_radii").is_some()
-            || mesh.attributes.get("skin_roots").is_some()
-        {
-            return Err(PotError::with_details(
-                ErrorCode::EvaluationFailed,
-                "No valid root vertex found (you need one per mesh island you want to skin)",
-                serde_json::json!({
-                    "modifier_id": modifier.id,
-                    "modifier_warning": true,
-                }),
-            ));
-        }
-        return Ok(mesh.clone());
-    }
-    if mesh.edges.is_empty() {
-        return Err(invalid_parameter(
-            modifier,
-            "mesh",
-            "a skeleton mesh with at least one edge",
-        ));
-    }
-    let _branch_smoothing = number_param(modifier, "branch_smoothing")?;
-    let smooth_shade = bool_param(modifier, "use_smooth_shade")?;
-    let _symmetry = [
-        bool_param(modifier, "use_x_symmetry")?,
-        bool_param(modifier, "use_y_symmetry")?,
-        bool_param(modifier, "use_z_symmetry")?,
-    ];
-    let mut node_positions = source_positions.clone();
-    let mut node_origins: Vec<Vec<(usize, f64)>> = (0..mesh.vertices.len())
-        .map(|index| vec![(index, 1.0)])
-        .collect();
-    let mut node_radii = Vec::with_capacity(mesh.vertices.len() + mesh.edges.len() * 4);
-    let mut node_roots = Vec::with_capacity(mesh.vertices.len());
-    for vertex_index in 0..mesh.vertices.len() {
-        node_radii.push(skin_radius(radii, vertex_index, modifier)?);
-        node_roots.push(
-            roots
-                .and_then(|roots| roots.get(&vertex_index.to_string()))
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-        );
-    }
-    let mut degrees = vec![0_usize; mesh.vertices.len()];
-    let mut edge_endpoints = Vec::with_capacity(mesh.edges.len());
-    let mut edge_lengths = Vec::with_capacity(mesh.edges.len());
-    for edge in &mesh.edges {
-        let first = *source_indices.get(&edge.vertices[0]).ok_or_else(|| {
-            invalid_parameter(modifier, "mesh", "edges referencing existing vertices")
-        })?;
-        let second = *source_indices.get(&edge.vertices[1]).ok_or_else(|| {
-            invalid_parameter(modifier, "mesh", "edges referencing existing vertices")
-        })?;
-        let length = source_positions[first].distance(source_positions[second]);
-        if length <= f64::EPSILON {
-            return Err(invalid_parameter(
-                modifier,
-                "mesh",
-                "skeleton edges with non-zero length",
-            ));
-        }
-        degrees[first] += 1;
-        degrees[second] += 1;
-        edge_endpoints.push([first, second]);
-        edge_lengths.push(length);
-    }
-    if degrees.iter().any(|degree| *degree > 2) {
-        return Err(PotError::with_details(
-            ErrorCode::UnsupportedFeature,
-            "Skin modifier branch-hull evaluation is not supported",
-            serde_json::json!({"feature_id":"modifier.skin.branch_hull","modifier_id":modifier.id}),
-        ));
-    }
-    let mut edge_chains = Vec::with_capacity(mesh.edges.len());
-    let mut edge_frames = Vec::with_capacity(mesh.edges.len());
-    for (edge_index, [first, second]) in edge_endpoints.iter().copied().enumerate() {
-        let first_radius = node_radii[first];
-        let second_radius = node_radii[second];
-        let average_radius =
-            (first_radius[0] + first_radius[1] + second_radius[0] + second_radius[1]) * 0.5;
-        let subdivisions = if average_radius > 0.0 {
-            (edge_lengths[edge_index] / average_radius).min(128.0) as usize
-        } else {
-            0
-        };
-        let first_half = (first_radius[0] + first_radius[1]) * 0.5;
-        let second_half = (second_radius[0] + second_radius[1]) * 0.5;
-        let radius_ratio = if first_half > 0.0 {
-            (second_half / first_half + 1.0) * 0.5
-        } else {
-            1.0
-        };
-        let mut chain = Vec::with_capacity(subdivisions + 2);
-        chain.push(first);
-        for subdivision in 0..subdivisions {
-            let ratio = (subdivision + 1) as f64 / (subdivisions + 1) as f64;
-            let fraction = ratio.powf(radius_ratio);
-            let index = node_positions.len();
-            node_positions.push(source_positions[first].lerp(source_positions[second], fraction));
-            node_origins.push(vec![(first, 1.0 - fraction), (second, fraction)]);
-            node_radii.push([
-                first_radius[0] + (second_radius[0] - first_radius[0]) * fraction,
-                first_radius[1] + (second_radius[1] - first_radius[1]) * fraction,
-            ]);
-            node_roots.push(false);
-            chain.push(index);
-        }
-        chain.push(second);
-        edge_chains.push(chain);
-        edge_frames.push(None);
-    }
-    let mut adjacency = vec![Vec::new(); source_positions.len()];
-    for (edge_index, [first, second]) in edge_endpoints.iter().copied().enumerate() {
-        adjacency[first].push((edge_index, second));
-        adjacency[second].push((edge_index, first));
-    }
-    let mut visited_edges = vec![false; mesh.edges.len()];
-    for root in 0..source_positions.len() {
-        if !node_roots[root] {
-            continue;
-        }
-        for &(edge_index, neighbor) in &adjacency[root] {
-            if visited_edges[edge_index] {
-                continue;
-            }
-            let x_axis = (source_positions[neighbor] - source_positions[root]).normalize();
-            let z_up = if x_axis.z.abs() > 1.0 - f64::EPSILON {
-                DVec3::Y
-            } else {
-                DVec3::Z
-            };
-            let y_axis = z_up.cross(x_axis).normalize_or_zero();
-            let z_axis = x_axis.cross(y_axis).normalize_or_zero();
-            edge_frames[edge_index] = Some([x_axis, y_axis, z_axis]);
-            visited_edges[edge_index] = true;
-            let mut stack = vec![(neighbor, edge_index, [x_axis, y_axis, z_axis])];
-            while let Some((vertex, parent_edge, parent_frame)) = stack.pop() {
-                for &(next_edge, next_vertex) in &adjacency[vertex] {
-                    if next_edge == parent_edge || visited_edges[next_edge] {
-                        continue;
-                    }
-                    let next_axis =
-                        (source_positions[next_vertex] - source_positions[vertex]).normalize();
-                    let dot = parent_frame[0].dot(next_axis).clamp(-1.0, 1.0);
-                    let rotation_axis = parent_frame[0].cross(next_axis).normalize_or_zero();
-                    let rotation = DQuat::from_axis_angle(rotation_axis, dot.acos());
-                    let next_frame = if node_roots[vertex] {
-                        let z_up = if next_axis.z.abs() > 1.0 - f64::EPSILON {
-                            DVec3::Y
-                        } else {
-                            DVec3::Z
-                        };
-                        let y_axis = z_up.cross(next_axis).normalize_or_zero();
-                        [
-                            next_axis,
-                            y_axis,
-                            next_axis.cross(y_axis).normalize_or_zero(),
-                        ]
-                    } else {
-                        [
-                            next_axis,
-                            (rotation * parent_frame[1]).normalize_or_zero(),
-                            (rotation * parent_frame[2]).normalize_or_zero(),
-                        ]
-                    };
-                    edge_frames[next_edge] = Some(next_frame);
-                    visited_edges[next_edge] = true;
-                    stack.push((next_vertex, next_edge, next_frame));
-                }
-            }
-        }
-    }
-    let mut point_frames = vec![[DVec3::ZERO; 3]; node_positions.len()];
-    let mut has_frame = vec![false; node_positions.len()];
-    for (edge_index, [first, second]) in edge_endpoints.iter().copied().enumerate() {
-        let [x_axis, y_axis, z_axis] = edge_frames[edge_index].unwrap_or_else(|| {
-            let direction = (source_positions[second] - source_positions[first]).normalize();
-            let z_up = if direction.z.abs() > 1.0 - f64::EPSILON {
-                DVec3::Y
-            } else {
-                DVec3::Z
-            };
-            let y_axis = z_up.cross(direction).normalize_or_zero();
-            [
-                direction,
-                y_axis,
-                direction.cross(y_axis).normalize_or_zero(),
-            ]
-        });
-        let root_forward = node_roots[first] || !node_roots[second];
-        let first_frame = [if root_forward { x_axis } else { -x_axis }, y_axis, z_axis];
-        let second_frame = [if root_forward { -x_axis } else { x_axis }, y_axis, z_axis];
-        if degrees[first] <= 2 {
-            point_frames[first] = first_frame;
-            has_frame[first] = true;
-        }
-        if degrees[second] <= 2 {
-            point_frames[second] = second_frame;
-            has_frame[second] = true;
-        }
-        for &index in edge_chains[edge_index]
-            .iter()
-            .skip(1)
-            .take(edge_chains[edge_index].len().saturating_sub(2))
-        {
-            point_frames[index] = [x_axis, y_axis, z_axis];
-            has_frame[index] = true;
-        }
-    }
-    let mut frames = vec![None; node_positions.len()];
-    for (index, center) in node_positions.iter().enumerate() {
-        if !has_frame[index] {
-            continue;
-        }
-        let [_, y_axis, z_axis] = point_frames[index];
-        let [radius_y, radius_z] = node_radii[index];
-        let y = y_axis * radius_y;
-        let z = z_axis * radius_z;
-        frames[index] = Some([
-            *center + y - z,
-            *center - y - z,
-            *center - y + z,
-            *center + y + z,
-        ]);
-    }
-    let mut points = Vec::with_capacity(node_positions.len() * 4);
-    let mut origins = Vec::with_capacity(node_positions.len() * 4);
-    let mut frame_vertex_ids = vec![None; frames.len()];
-    for (index, frame) in frames.iter().enumerate() {
-        let Some(frame) = frame else {
-            continue;
-        };
-        let mut vertex_ids = [usize::MAX; 4];
-        for corner in 0..4 {
-            vertex_ids[corner] = points.len();
-            points.push(frame[corner]);
-            origins.push(node_origins[index].clone());
-        }
-        frame_vertex_ids[index] = Some(vertex_ids);
-    }
-    let mut faces = Vec::with_capacity(mesh.edges.len() * 32 + 2);
-    for chain in &edge_chains {
-        for pair in chain.windows(2) {
-            let (Some(first), Some(second)) =
-                (frame_vertex_ids[pair[0]], frame_vertex_ids[pair[1]])
-            else {
-                continue;
-            };
-            // Blender's connect_frames: each side quad runs from the second frame back to the first, and
-            // the whole connection is reversed when its quads face the connection's centre (MOD_skin.cc).
-            let quads: Vec<[usize; 4]> = (0..4)
-                .map(|side| {
-                    let next = (side + 1) % 4;
-                    [second[side], second[next], first[next], first[side]]
-                })
-                .collect();
-            let centre_of =
-                |quad: &[usize; 4]| quad.iter().map(|index| points[*index]).sum::<DVec3>() * 0.25;
-            let centre = quads.iter().map(centre_of).sum::<DVec3>() * 0.25;
-            let facing: f64 = quads
-                .iter()
-                .map(|quad| {
-                    let normal = (points[quad[2]] - points[quad[0]])
-                        .cross(points[quad[3]] - points[quad[1]])
-                        .normalize_or_zero();
-                    normal.dot(centre - centre_of(quad))
-                })
-                .sum();
-            for quad in quads {
-                if facing > 0.0 {
-                    faces.push((vec![quad[3], quad[2], quad[1], quad[0]], 0));
-                } else {
-                    faces.push((quad.to_vec(), 0));
-                }
-            }
-        }
-    }
-    let mut capped = HashSet::new();
-    for [first, second] in edge_endpoints.iter().copied() {
-        for vertex in [first, second] {
-            let Some(base) = frame_vertex_ids[vertex] else {
-                continue;
-            };
-            if degrees[vertex] != 1 || !capped.insert(vertex) {
-                continue;
-            }
-            // Blender's cap frame has its normal opposite the edge direction, which points into the tube
-            // (MOD_skin.cc, FLIP_NORMAL), so the cap faces away from the tube.
-            let other = if vertex == first { second } else { first };
-            let into_tube = source_positions[other] - source_positions[vertex];
-            let cap_normal =
-                (points[base[1]] - points[base[0]]).cross(points[base[2]] - points[base[0]]);
-            let flipped = into_tube.dot(cap_normal) < 0.0;
-            let cap = if flipped {
-                vec![base[0], base[1], base[2], base[3]]
-            } else {
-                vec![base[3], base[2], base[1], base[0]]
-            };
-            faces.push((cap, 0));
-        }
-    }
-    let origin = Origin {
-        vertices: origins,
-        faces: vec![None; faces.len()],
-        corners: None,
-    };
-    let mut result = build_mesh(points, faces, Vec::new(), &origin, mesh)?;
-    result.attributes.remove("blender_skin_vertices");
-    result.attributes.remove("skin_radii");
-    result.attributes.remove("skin_roots");
-    if smooth_shade {
-        crate::geom::normals::shade_faces_smooth(&mut result);
-    }
-    // Blender's Skin output has no UV layers, so the store is dropped (reported as attribute loss).
-    let uv_names: Vec<String> = uv_layers::read_layers(&result)
-        .into_iter()
-        .map(|layer| layer.name)
-        .collect();
-    result.attributes.remove(uv_layers::ATTRIBUTE);
-    if let Some(entries) = result
-        .attributes
-        .get_mut("blender_attributes")
-        .and_then(serde_json::Value::as_array_mut)
-    {
-        entries.retain(|entry| {
-            !entry
-                .get("name")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|name| uv_names.iter().any(|uv| uv == name))
-        });
-    }
-    drop_partial_vertex_groups(mesh, &origin, &mut result);
-    let smooth: serde_json::Map<String, serde_json::Value> = result
-        .faces
-        .iter()
-        .map(|face| (format!("f{}", face.id), serde_json::json!(smooth_shade)))
-        .collect();
-    result.attributes.insert(
-        "shade_smooth".to_owned(),
-        serde_json::json!({"domain": "face", "type": "bool", "values": smooth}),
-    );
-    validated(&result)?;
-    Ok(result)
-}
-
-/// Blender interpolates a vertex group onto a blended skin vertex only when every source vertex
-/// has it; a group present on one source alone is dropped rather than zero-filled.
-fn drop_partial_vertex_groups(source: &Mesh, origin: &Origin, result: &mut Mesh) {
-    let Some(groups) = result
-        .attributes
-        .get_mut("vertex_groups")
-        .and_then(Value::as_object_mut)
-    else {
-        return;
-    };
-    let source_groups = source
-        .attributes
-        .get("vertex_groups")
-        .and_then(Value::as_object);
-    for (name, weights) in groups.iter_mut() {
-        let Some(weights) = weights.as_object_mut() else {
-            continue;
-        };
-        let source_weights = source_groups
-            .and_then(|groups| groups.get(name))
-            .and_then(Value::as_object);
-        // Whether each source vertex, by storage index, has an entry for this group.
-        let has_group: Vec<bool> = source
-            .vertices
-            .iter()
-            .map(|vertex| {
-                source_weights
-                    .is_some_and(|weights| weights.contains_key(&format!("v{}", vertex.id)))
-            })
-            .collect();
-        for (output, sources) in origin.vertices.iter().enumerate() {
-            if sources.len() < 2 {
-                continue;
-            }
-            if !sources.iter().all(|(index, _)| has_group[*index]) {
-                weights.remove(&format!("v{}", result.vertices[output].id));
-            }
-        }
-    }
-}
-
-fn skin_radius(
-    radii: Option<&serde_json::Map<String, Value>>,
-    vertex_index: usize,
-    modifier: &Modifier,
-) -> Result<[f64; 2]> {
-    let Some(value) = radii.and_then(|radii| radii.get(&vertex_index.to_string())) else {
-        return Ok([0.25, 0.25]);
-    };
-    let Some(values) = value.as_array() else {
-        return Err(invalid_parameter(
-            modifier,
-            "skin_radii",
-            "two positive finite radii per vertex",
-        ));
-    };
-    if values.len() != 2 {
-        return Err(invalid_parameter(
-            modifier,
-            "skin_radii",
-            "two positive finite radii per vertex",
-        ));
-    }
-    let first = values.first().and_then(Value::as_f64).ok_or_else(|| {
-        invalid_parameter(
-            modifier,
-            "skin_radii",
-            "two positive finite radii per vertex",
-        )
-    })?;
-    let second = values.get(1).and_then(Value::as_f64).ok_or_else(|| {
-        invalid_parameter(
-            modifier,
-            "skin_radii",
-            "two positive finite radii per vertex",
-        )
-    })?;
-    if !first.is_finite() || !second.is_finite() || first <= 0.0 || second <= 0.0 {
-        return Err(invalid_parameter(
-            modifier,
-            "skin_radii",
-            "two positive finite radii per vertex",
-        ));
-    }
-    Ok([first, second])
-}
-
+/// Blender `MOD_curve.cc` with `BKE_curve_deform_coords` (bounds off, no stretch): the deform axis is the
+/// unbounded arc length along the path, and the other two coordinates place the vertex in the path frame.
 pub(super) fn curve(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
-    let target =
-        modifier.runtime.target_mesh.as_ref().ok_or_else(|| {
-            invalid_parameter(modifier, "object", "a curve or mesh object operand")
-        })?;
-    let target: Mesh = serde_json::from_value(target.clone())
-        .map_err(|_| invalid_parameter(modifier, "object", "a curve or mesh object operand"))?;
-    let axis = curve_axis_param(modifier, "deform_axis")?;
-    let mut cumulative = Vec::with_capacity(target.vertices.len());
-    cumulative.push(0.0);
-    for pair in target.vertices.windows(2) {
-        let length = pair[0].co.distance(pair[1].co);
-        if length <= f64::EPSILON {
-            return Err(invalid_parameter(
-                modifier,
-                "object",
-                "a curve without zero-length segments",
-            ));
-        }
-        cumulative.push(cumulative.last().copied().unwrap_or(0.0) + length);
-    }
-    let total_length = cumulative.last().copied().unwrap_or(0.0);
-    if target.vertices.len() < 2 || total_length <= f64::EPSILON {
-        return Err(invalid_parameter(
-            modifier,
-            "object",
-            "a curve with at least two distinct points",
-        ));
-    }
-    let source_positions = positions(mesh);
-    let mut minimum = f64::INFINITY;
-    let mut maximum = f64::NEG_INFINITY;
-    for point in &source_positions {
-        let along = point.dot(axis);
-        minimum = minimum.min(along);
-        maximum = maximum.max(along);
-    }
-    let extent = maximum - minimum;
-    if extent <= f64::EPSILON {
+    let Some(target) = modifier.runtime.target_mesh.as_ref() else {
+        // Blender disables the modifier without a curve object.
         return Ok(mesh.clone());
-    }
-    let reference = if axis.abs().dot(DVec3::Z) > 0.9 {
-        DVec3::Y
-    } else {
-        DVec3::Z
     };
-    let source_side = axis.cross(reference).normalize_or_zero();
-    let source_up = axis.cross(source_side).normalize_or_zero();
+    let (axis, negative) = curve_deform_axis(modifier)?;
+    let object = reference_matrix(modifier).ok_or_else(|| {
+        PotError::new(
+            ErrorCode::DependencyMissing,
+            "curve modifier object transform is missing",
+        )
+    })?;
+    // The path and the vertices are measured in curve-local space, where the deform axis is defined.
+    let to_curve = object.inverse();
+    let path: Vec<DVec3> = target
+        .vertices
+        .iter()
+        .map(|vertex| to_curve.transform_point3(vertex.co))
+        .collect();
+    let arc_at_point = curve_arc_lengths(modifier, &path)?;
+    let frames = bevel_frames(&path);
+    let weights = deform_group_weights(mesh, modifier)?;
     let mut result = mesh.clone();
     for (index, vertex) in result.vertices.iter_mut().enumerate() {
-        let along = (source_positions[index].dot(axis) - minimum).clamp(0.0, total_length);
-        let segment = cumulative
-            .windows(2)
-            .position(|range| along <= range[1])
-            .unwrap_or(cumulative.len() - 2);
-        let first = target.vertices[segment].co;
-        let second = target.vertices[segment + 1].co;
-        let tangent = (second - first).normalize_or_zero();
-        let reference = if tangent.abs().dot(DVec3::Z) > 0.9 {
-            DVec3::Y
+        let weight = group_weight(weights.as_deref(), index);
+        if weight <= 0.0 {
+            continue;
+        }
+        let local = to_curve.transform_point3(vertex.co);
+        let (arc, cross) = if negative {
+            (
+                -local[axis],
+                DVec3::new(-local[(axis + 2) % 3], -local[(axis + 1) % 3], 0.0),
+            )
         } else {
-            DVec3::Z
+            (
+                local[axis],
+                DVec3::new(local[(axis + 1) % 3], local[(axis + 2) % 3], 0.0),
+            )
         };
-        let side = tangent.cross(reference).normalize_or_zero();
-        let up = tangent.cross(side).normalize_or_zero();
-        let fraction =
-            (along - cumulative[segment]) / (cumulative[segment + 1] - cumulative[segment]);
-        let centerline = first.lerp(second, fraction);
-        let perpendicular = source_positions[index] - axis * source_positions[index].dot(axis);
-        vertex.co =
-            centerline + side * perpendicular.dot(source_side) + up * perpendicular.dot(source_up);
+        let (position, rotation) = path_frame_at(&path, &frames, &arc_at_point, arc)?;
+        let deformed = position + rotation * cross;
+        vertex.co = object.transform_point3(local.lerp(deformed, weight));
     }
+
     validated(&result)?;
     Ok(result)
 }
 
-pub(super) fn hook(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
-    let target = modifier
-        .runtime
-        .hook_target_position
-        .map_or(DVec3::ZERO, DVec3::from_array);
-    let center = vec3_param(modifier, "center")?;
-    let strength = number_param(modifier, "strength")?;
-    let radius = number_param(modifier, "falloff_radius")?;
-    let group_weights = modifier
-        .params
-        .get("vertex_group")
-        .and_then(Value::as_str)
-        .and_then(|group| {
-            mesh.attributes
-                .get("vertex_groups")?
-                .as_object()?
-                .get(group)?
-                .as_object()
-        });
-    if modifier.params.get("vertex_group").is_some() && group_weights.is_none() {
-        return Err(invalid_parameter(
-            modifier,
-            "vertex_group",
-            "a group present in vertex_groups attributes",
-        ));
-    }
-    let mut result = mesh.clone();
-    let displacement = target - center;
-    for vertex in &mut result.vertices {
-        let group_weight = group_weights.map_or(1.0, |weights| {
-            weights
-                .get(&format!("v{}", vertex.id))
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0)
-        });
-        let falloff = if radius > 0.0 {
-            (1.0 - vertex.co.distance(center) / radius).clamp(0.0, 1.0)
-        } else {
-            1.0
-        };
-        vertex.co += displacement * (strength * group_weight * falloff);
-    }
-    validated(&result)?;
-    Ok(result)
-}
-
-fn curve_axis_param(modifier: &Modifier, name: &str) -> Result<DVec3> {
-    let axis = string_param(modifier, name)?.to_ascii_uppercase();
+/// The deform axis index and whether the axis is negative (Blender `POS_X`..`NEG_Z`).
+fn curve_deform_axis(modifier: &Modifier) -> Result<(usize, bool)> {
+    let axis = string_param(modifier, "deform_axis")?.to_ascii_uppercase();
     match axis.as_str() {
-        "POS_X" => Ok(DVec3::X),
-        "NEG_X" => Ok(-DVec3::X),
-        "POS_Y" => Ok(DVec3::Y),
-        "NEG_Y" => Ok(-DVec3::Y),
-        "POS_Z" => Ok(DVec3::Z),
-        "NEG_Z" => Ok(-DVec3::Z),
+        "POS_X" => Ok((0, false)),
+        "NEG_X" => Ok((0, true)),
+        "POS_Y" => Ok((1, false)),
+        "NEG_Y" => Ok((1, true)),
+        "POS_Z" => Ok((2, false)),
+        "NEG_Z" => Ok((2, true)),
         _ => Err(invalid_parameter(
             modifier,
-            name,
+            "deform_axis",
             "POS_X, NEG_X, POS_Y, NEG_Y, POS_Z, or NEG_Z",
         )),
     }
 }
+
+/// Cumulative arc length at every path point (Blender `BKE_anim_path_calc_data`).
+fn curve_arc_lengths(modifier: &Modifier, path: &[DVec3]) -> Result<Vec<f64>> {
+    let invalid = || {
+        invalid_parameter(
+            modifier,
+            "object",
+            "a curve with at least two distinct points",
+        )
+    };
+    if path.len() < 2 {
+        return Err(invalid());
+    }
+    let mut arc = Vec::with_capacity(path.len());
+    arc.push(0.0);
+    let mut total = 0.0;
+    for pair in path.windows(2) {
+        if let [from, to] = pair {
+            let length = from.distance(*to);
+            if length <= f64::EPSILON {
+                return Err(invalid());
+            }
+            total += length;
+            arc.push(total);
+        }
+    }
+    Ok(arc)
+}
+
+/// Blender `BKE_where_on_path` for poly paths: the path position and frame at arc length `arc`,
+/// interpolated linearly (position) and by slerp (frame), extended past both ends.
+fn path_frame_at(
+    path: &[DVec3],
+    frames: &[DQuat],
+    arc_at_point: &[f64],
+    arc: f64,
+) -> Result<(DVec3, DQuat)> {
+    let total = arc_at_point.last().copied().unwrap_or(0.0);
+    let segment_count = arc_at_point.len().saturating_sub(1);
+    let index = if arc <= 0.0 {
+        0
+    } else if arc >= total {
+        segment_count.saturating_sub(1)
+    } else {
+        arc_at_point
+            .partition_point(|&length| length <= arc)
+            .saturating_sub(1)
+    };
+    let (
+        Some(&start_arc),
+        Some(&end_arc),
+        Some(&from),
+        Some(&to),
+        Some(&from_frame),
+        Some(&to_frame),
+    ) = (
+        arc_at_point.get(index),
+        arc_at_point.get(index + 1),
+        path.get(index),
+        path.get(index + 1),
+        frames.get(index),
+        frames.get(index + 1),
+    )
+    else {
+        return Err(PotError::new(
+            ErrorCode::InternalError,
+            "curve path lookup is out of range",
+        ));
+    };
+    let fraction = (arc - start_arc) / (end_arc - start_arc);
+    let position = from.lerp(to, fraction);
+    let rotation = if fraction <= 0.0 {
+        from_frame
+    } else if fraction >= 1.0 {
+        to_frame
+    } else {
+        let end_frame = if from_frame.dot(to_frame) < 0.0 {
+            -to_frame
+        } else {
+            to_frame
+        };
+        from_frame.slerp(end_frame, fraction)
+    };
+    Ok((position, rotation))
+}
+
+/// Blender's bevel frames for a 3D poly path with minimum twist: bisected tangents, end frames from the
+/// tangent alone, and interior frames carried along by the minimal rotation between tangents.
+fn bevel_frames(path: &[DVec3]) -> Vec<DQuat> {
+    let segments: Vec<DVec3> = path
+        .windows(2)
+        .filter_map(|pair| match pair {
+            [from, to] => Some((*to - *from).normalize_or_zero()),
+            _ => None,
+        })
+        .collect();
+    let mut tangents = Vec::with_capacity(path.len());
+    tangents.extend(segments.first().copied());
+    tangents.extend(
+        segments
+            .iter()
+            .zip(segments.iter().skip(1))
+            .map(|(before, after)| (*before + *after).normalize_or_zero()),
+    );
+    tangents.extend(segments.last().copied());
+    let count = tangents.len();
+    let mut frames = Vec::with_capacity(count);
+    let mut previous: Option<(DVec3, DQuat)> = None;
+    for (index, tangent) in tangents.into_iter().enumerate() {
+        let frame = match previous {
+            Some((prior_tangent, prior_frame)) if index + 1 < count => {
+                transport_frame(prior_frame, prior_tangent, tangent)
+            }
+            _ => track_frame(tangent),
+        };
+        frames.push(frame);
+        previous = Some((tangent, frame));
+    }
+    frames
+}
+
+/// Blender's `vec_to_quat(tangent, -Z, Y)`: local Z follows the tangent, local X and Y are the normal and binormal.
+fn track_frame(tangent: DVec3) -> DQuat {
+    let tangent = tangent.normalize_or_zero();
+    if tangent == DVec3::ZERO {
+        return DQuat::IDENTITY;
+    }
+    let mut axis = DVec3::new(-tangent.y, tangent.x, 0.0);
+    if axis.length_squared() <= 1.0e-12 {
+        axis = DVec3::X;
+    }
+    let align = DQuat::from_axis_angle(axis.normalize(), tangent.z.clamp(-1.0, 1.0).acos());
+    let roll_angle = if tangent.x.abs() < 1.0e-12 && tangent.y.abs() < 1.0e-12 {
+        // Vertical tangents use Blender's fixed roll for either direction.
+        if tangent.z > 0.0 {
+            std::f64::consts::PI
+        } else {
+            0.0
+        }
+    } else {
+        -(-tangent.x).atan2(-tangent.y)
+    };
+    (DQuat::from_axis_angle(tangent, roll_angle) * align).normalize()
+}
+
+/// Blender's minimal-twist step: rotate the frame from one tangent onto the next.
+fn transport_frame(frame: DQuat, from: DVec3, to: DVec3) -> DQuat {
+    let angle = from.dot(to).clamp(-1.0, 1.0).acos();
+    let axis = from.cross(to).normalize_or_zero();
+    if angle > 0.0 && axis != DVec3::ZERO {
+        DQuat::from_axis_angle(axis, angle) * frame
+    } else {
+        frame
+    }
+}
+
+/// Blender `MOD_hook.cc`: the selected vertices move by `object * matrix_inverse`, weighted by the
+/// strength, the falloff and the vertex group.
+pub(super) fn hook(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
+    let falloff = hook_falloff_param(modifier)?;
+    let radius = number_param(modifier, "falloff_radius")?;
+    if radius < 0.0 {
+        return Err(invalid_parameter(
+            modifier,
+            "falloff_radius",
+            "a non-negative radius",
+        ));
+    }
+    let strength = number_param(modifier, "strength")?;
+    let center = vec3_param(modifier, "center")?;
+    let uniform = bool_param(modifier, "use_falloff_uniform")?;
+    let parent_inverse = matrix_param(modifier, "matrix_inverse")?;
+    let indices = vertex_index_param(modifier)?;
+    let falloff_table = if falloff == HookFalloff::Curve {
+        Some(FalloffCurve::from_modifier(modifier)?)
+    } else {
+        None
+    };
+    let weights = cast_hook_weights(mesh, modifier)?;
+    // Blender hooks only listed vertices; without a list, a vertex group selects them.
+    let listed = !indices.is_empty();
+    if !listed && weights.is_none() {
+        return Ok(mesh.clone());
+    }
+    let Some(object) = reference_matrix(modifier) else {
+        // Blender disables the hook without an object.
+        return Ok(mesh.clone());
+    };
+    let hook_matrix = object * parent_inverse;
+    let uniform_matrix = DMat3::from_mat4(parent_inverse);
+    let use_falloff = falloff != HookFalloff::NoFalloff && radius > 0.0;
+    // Blender `hook_co_apply`: the falloff is measured from the current coordinate, then scaled by the group weight.
+    let hook_co = |co: DVec3, index: usize| -> Option<DVec3> {
+        let offset = co - center;
+        let distance_sq = if uniform {
+            (uniform_matrix * offset).length_squared()
+        } else {
+            offset.length_squared()
+        };
+        let shape = if use_falloff {
+            hook_falloff(falloff, distance_sq, radius, falloff_table.as_ref())
+        } else {
+            1.0
+        };
+        let fac = strength * shape * group_weight(weights.as_deref(), index);
+        (fac != 0.0).then(|| co.lerp(hook_matrix.transform_point3(co), fac))
+    };
+    let hook_index = |result: &mut Mesh, index: usize| {
+        let co = result.vertices[index].co;
+        if let Some(hooked) = hook_co(co, index) {
+            result.vertices[index].co = hooked;
+        }
+    };
+    let mut result = mesh.clone();
+    let vertex_count = mesh.vertices.len();
+    if !listed {
+        for index in 0..vertex_count {
+            hook_index(&mut result, index);
+        }
+    } else if let Some(original) = origindex_values(mesh) {
+        // Blender `MOD_hook.cc` ORIGINDEX branch: a vertex is hooked when its original index is
+        // listed. Generated vertices carry `ORIGINDEX_NONE`, which no listed index matches.
+        // Discrepancy: the fetched source (v5.2.2 `hook_index_array_to_bitmap`) sets bit `i` (the
+        // list position), not bit `j` (the listed index), so it would hook the origin indices
+        // 0..count. The Blender 5.2.2 binary hooks by listed membership (probed: listed [5] moves the
+        // copies of vertex 5). This follows the binary, the observed ground truth.
+        let listed_originals: HashSet<usize> = indices.iter().copied().collect();
+        for index in 0..vertex_count {
+            let source = original
+                .get(index)
+                .copied()
+                .and_then(|source| usize::try_from(source).ok());
+            if source.is_some_and(|source| listed_originals.contains(&source)) {
+                hook_index(&mut result, index);
+            }
+        }
+    } else {
+        // Blender's list-value branch (no CD_ORIGINDEX): each listed value below the vertex count hooks
+        // that vertex in list order, so a repeated value hooks it again.
+        for &index in &indices {
+            if index < vertex_count {
+                hook_index(&mut result, index);
+            }
+        }
+    }
+    validated(&result)?;
+    Ok(result)
+}
+
+/// Blender's falloff shape for a squared distance from the hook centre (1 at the centre, 0 outside the radius).
+fn hook_falloff(
+    falloff: HookFalloff,
+    distance_sq: f64,
+    radius: f64,
+    curve: Option<&FalloffCurve>,
+) -> f64 {
+    let radius_sq = radius * radius;
+    if distance_sq > radius_sq {
+        return 0.0;
+    }
+    if distance_sq <= 0.0 {
+        return 1.0;
+    }
+    let linear = 1.0 - distance_sq.sqrt() / radius;
+    match falloff {
+        HookFalloff::Constant => 1.0,
+        HookFalloff::InverseSquare => 1.0 - distance_sq / radius_sq,
+        HookFalloff::Curve => curve.map_or(0.0, |table| table.evaluate(linear)),
+        HookFalloff::Sharp => linear * linear,
+        HookFalloff::Smooth => 3.0 * linear * linear - 2.0 * linear * linear * linear,
+        HookFalloff::Root => linear.sqrt(),
+        HookFalloff::Sphere => (2.0 * linear - linear * linear).sqrt(),
+        HookFalloff::Linear | HookFalloff::NoFalloff => linear,
+    }
+}
+
+/// Blender `hook_falloff` shape selectors (`eHook_Falloff_*`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HookFalloff {
+    NoFalloff,
+    Curve,
+    Smooth,
+    Sphere,
+    Root,
+    InverseSquare,
+    Sharp,
+    Linear,
+    Constant,
+}
+
+fn hook_falloff_param(modifier: &Modifier) -> Result<HookFalloff> {
+    Ok(match string_param(modifier, "falloff_type")? {
+        "NONE" => HookFalloff::NoFalloff,
+        "CURVE" => HookFalloff::Curve,
+        "SMOOTH" => HookFalloff::Smooth,
+        "SPHERE" => HookFalloff::Sphere,
+        "ROOT" => HookFalloff::Root,
+        "INVERSE_SQUARE" => HookFalloff::InverseSquare,
+        "SHARP" => HookFalloff::Sharp,
+        "LINEAR" => HookFalloff::Linear,
+        "CONSTANT" => HookFalloff::Constant,
+        _ => {
+            return Err(invalid_parameter(
+                modifier,
+                "falloff_type",
+                "NONE, CURVE, SMOOTH, SPHERE, ROOT, INVERSE_SQUARE, SHARP, LINEAR, or CONSTANT",
+            ));
+        }
+    })
+}
+
+/// Hook `vertex_indices`: vertex positions in storage order (Blender's `indexar`).
+fn vertex_index_param(modifier: &Modifier) -> Result<Vec<usize>> {
+    let invalid = || {
+        invalid_parameter(
+            modifier,
+            "vertex_indices",
+            "an array of non-negative vertex indices",
+        )
+    };
+    schema_value(modifier, "vertex_indices")?
+        .as_array()
+        .ok_or_else(invalid)?
+        .iter()
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|index| usize::try_from(index).ok())
+                .ok_or_else(invalid)
+        })
+        .collect()
+}
+
+/// A 4x4 parameter stored as 16 column-major numbers.
+fn matrix_param(modifier: &Modifier, name: &str) -> Result<DMat4> {
+    let invalid = || invalid_parameter(modifier, name, "sixteen finite column-major numbers");
+    let values = schema_value(modifier, name)?
+        .as_array()
+        .filter(|values| values.len() == 16)
+        .ok_or_else(invalid)?;
+    let mut matrix = [0.0; 16];
+    for (slot, value) in matrix.iter_mut().zip(values) {
+        *slot = value
+            .as_f64()
+            .filter(|number| number.is_finite())
+            .ok_or_else(invalid)?;
+    }
+    Ok(DMat4::from_cols_array(&matrix))
+}
+
+/// A Hook or Warp `falloff_curve` with its `falloff_curve_settings`: Blender's `CurveMapping` curve 0 from
+/// `color::curve`, evaluated as `BKE_curvemapping_evaluateF` (the curve table, then Y clipping when enabled).
+pub(super) struct FalloffCurve {
+    curve: PreparedCurve,
+    clip_y: Option<[f32; 2]>,
+}
+
+/// The `falloff_curve_settings` values that shape the falloff table and its clipping.
+struct FalloffSettings {
+    use_clip: bool,
+    clip: [f64; 4],
+    extend_extrapolate: bool,
+}
+
+/// The identity line through `(0, 0)` and `(1, 1)` with AUTO handles, for the curves a falloff does not read.
+fn unit_curve() -> CurveMap {
+    CurveMap {
+        points: vec![
+            CurvePoint {
+                location: [0.0, 0.0],
+                handle: HandleType::Auto,
+            },
+            CurvePoint {
+                location: [1.0, 1.0],
+                handle: HandleType::Auto,
+            },
+        ],
+    }
+}
+
+/// Reads `falloff_curve_settings`. An absent object keeps Blender's defaults: clip on over `[0, 1]`, extrapolated.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "Blender stores CurveMapping clip bounds as float"
+)]
+fn falloff_settings(value: Option<&Value>) -> Option<FalloffSettings> {
+    let Some(value) = value else {
+        return Some(FalloffSettings {
+            use_clip: true,
+            clip: [0.0, 0.0, 1.0, 1.0],
+            extend_extrapolate: true,
+        });
+    };
+    let settings = value.as_object()?;
+    let use_clip = settings
+        .get("use_clip")
+        .map_or(Some(true), Value::as_bool)?;
+    let clip = if let Some(value) = settings.get("clip_bounds") {
+        let [min_x, min_y, max_x, max_y] = value.as_array()?.as_slice() else {
+            return None;
+        };
+        let bound = |value: &Value| {
+            let value = value.as_f64()?;
+            if !value.is_finite() || !(-100.0..=100.0).contains(&value) {
+                return None;
+            }
+            let value = value as f32;
+            value.is_finite().then_some(f64::from(value))
+        };
+        [bound(min_x)?, bound(min_y)?, bound(max_x)?, bound(max_y)?]
+    } else {
+        [0.0, 0.0, 1.0, 1.0]
+    };
+    let extend_extrapolate = match settings.get("extend") {
+        None => true,
+        Some(value) => match value.as_str()? {
+            "HORIZONTAL" => false,
+            "EXTRAPOLATED" => true,
+            _ => return None,
+        },
+    };
+    Some(FalloffSettings {
+        use_clip,
+        clip,
+        extend_extrapolate,
+    })
+}
+
+/// Reads the `falloff_curve` control points: `[x, y]` or `[x, y, handle]`, with `AUTO`, `AUTO_CLAMPED` or `VECTOR`.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "Blender stores CurveMapping point coordinates as float"
+)]
+fn falloff_points(value: &Value) -> Option<Vec<CurvePoint>> {
+    let points = value.as_array()?;
+    if points.len() < 2 {
+        return None;
+    }
+    points
+        .iter()
+        .map(|point| {
+            let coordinates = point.as_array()?;
+            if !(2..=3).contains(&coordinates.len()) {
+                return None;
+            }
+            let x = coordinates[0].as_f64()?;
+            let y = coordinates[1].as_f64()?;
+            if !x.is_finite() || !y.is_finite() {
+                return None;
+            }
+            let location = [x as f32, y as f32];
+            if !location.iter().all(|component| component.is_finite()) {
+                return None;
+            }
+            let handle = match coordinates.get(2) {
+                None => HandleType::Auto,
+                Some(value) => match value.as_str() {
+                    Some("AUTO") => HandleType::Auto,
+                    Some("AUTO_CLAMPED") => HandleType::AutoClamped,
+                    Some("VECTOR") => HandleType::Vector,
+                    _ => return None,
+                },
+            };
+            Some(CurvePoint { location, handle })
+        })
+        .collect()
+}
+
+impl FalloffCurve {
+    /// Reads a modifier's `falloff_curve` and `falloff_curve_settings`, checked by `CurveMapping::validate`.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Blender evaluates CurveMapping clip bounds as float"
+    )]
+    pub(super) fn from_modifier(modifier: &Modifier) -> Result<Self> {
+        let invalid_points = || {
+            invalid_parameter(
+                modifier,
+                "falloff_curve",
+                "at least two finite float32 [x, y] points with an optional AUTO, AUTO_CLAMPED, or VECTOR handle",
+            )
+        };
+        let points =
+            falloff_points(schema_value(modifier, "falloff_curve")?).ok_or_else(invalid_points)?;
+        let settings =
+            falloff_settings(modifier.params.get("falloff_curve_settings")).ok_or_else(|| {
+                invalid_parameter(
+                    modifier,
+                    "falloff_curve_settings",
+                    "use_clip, finite clip_bounds, and HORIZONTAL or EXTRAPOLATED extend",
+                )
+            })?;
+        let mapping = CurveMapping {
+            tone: CurveTone::Standard,
+            extend_extrapolate: settings.extend_extrapolate,
+            use_clip: settings.use_clip,
+            clip: settings.clip,
+            black: [0.0; 3],
+            white: [1.0; 3],
+            curves: [
+                CurveMap { points },
+                unit_curve(),
+                unit_curve(),
+                unit_curve(),
+            ],
+        };
+        // Blender evaluates the control points in their stored order and does not sort them, so `x` need
+        // not increase. The table domain is the clip range widened by the points, and it must be non-empty.
+        let clip_min_x = settings.clip[0] as f32;
+        let clip_max_x = settings.clip[2] as f32;
+        let domain_min = mapping.curves[0]
+            .points
+            .iter()
+            .fold(clip_min_x, |min, point| min.min(point.location[0]));
+        let domain_max = mapping.curves[0]
+            .points
+            .iter()
+            .fold(clip_max_x, |max, point| max.max(point.location[0]));
+        if settings.clip[0] > settings.clip[2]
+            || settings.clip[1] > settings.clip[3]
+            || domain_max - domain_min <= 0.0
+        {
+            return Err(invalid_points());
+        }
+        Ok(Self {
+            curve: mapping.prepare(),
+            clip_y: settings
+                .use_clip
+                .then_some([settings.clip[1] as f32, settings.clip[3] as f32]),
+        })
+    }
+
+    /// Blender's `BKE_curvemapping_evaluateF` for curve 0: the table at `value`, then Y clipping when enabled.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Blender evaluates the curve input as float"
+    )]
+    pub(super) fn evaluate(&self, value: f64) -> f64 {
+        let result = self.curve.evaluate(0, value as f32);
+        f64::from(
+            self.clip_y
+                .map_or(result, |[min_y, max_y]| result.clamp(min_y, max_y)),
+        )
+    }
+}
+
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "geometry modifier unit tests")]
 mod tests {
-    use super::{build, curve, shrinkwrap};
+    use super::{build, curve, mask, shrinkwrap};
     use crate::geom::{
         BoxParams, Mesh, UvSphereParams,
         clnor::{self, CornerNormalCode, NormalCodeOptions, SetterInput},
+        origindex_values, set_origindex,
     };
     use serde_json::json;
 
@@ -3703,7 +3185,9 @@ mod tests {
         let start = curve_mesh.insert_vertex(glam::DVec3::ZERO).unwrap();
         let end = curve_mesh.insert_vertex(glam::DVec3::Z * 2.0).unwrap();
         curve_mesh.insert_edge([start, end]).unwrap();
-        let modifier = modifier_with_target("curve", json!({"deform_axis":"POS_X"}), curve_mesh);
+        let mut modifier =
+            modifier_with_target("curve", json!({"deform_axis":"POS_X"}), curve_mesh);
+        modifier.runtime.object_matrix = Some(glam::DMat4::IDENTITY.to_cols_array());
         let result = curve(&source, &modifier).unwrap();
         assert!(result.vertex(first).unwrap().co.distance(glam::DVec3::ZERO) < 1.0e-12);
         assert!(result.vertex(second).unwrap().co.distance(glam::DVec3::Z) < 1.0e-12);
@@ -3782,6 +3266,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn empty_mask_retains_origindex_carrier() {
+        let mut source = Mesh::from_positions_and_faces(
+            vec![glam::DVec3::ZERO, glam::DVec3::X, glam::DVec3::Y],
+            vec![vec![0, 1, 2]],
+        )
+        .unwrap();
+        set_origindex(&mut source, &[0, 1, 2]);
+        source.attributes.insert(
+            "vertex_groups".to_owned(),
+            json!({"Empty": {"v0": 0.0, "v1": 0.0, "v2": 0.0}}),
+        );
+        let modifier = crate::model::Modifier {
+            id: crate::model::Id::new("empty_mask").unwrap(),
+            modifier_type: "mask".to_owned(),
+            name: "Mask".to_owned(),
+            enabled: true,
+            show_viewport: true,
+            show_render: true,
+            params: serde_json::from_value(json!({
+                "vertex_group": "Empty",
+                "threshold": 0.5,
+                "invert_vertex_group": false
+            }))
+            .unwrap(),
+            binding_data: None,
+            runtime: crate::model::ModifierRuntime::default(),
+        };
+        let result = mask(&source, &modifier).unwrap();
+        assert_eq!(result.vertices.len(), 0);
+        assert_eq!(origindex_values(&result), Some(Vec::new()));
+    }
+
     fn modifier_with_target(
         modifier_type: &str,
         params: serde_json::Value,
@@ -3798,7 +3315,7 @@ mod tests {
             binding_data: None,
             runtime: crate::model::ModifierRuntime::default(),
         };
-        modifier.runtime.target_mesh = Some(serde_json::to_value(target).unwrap());
+        modifier.runtime.target_mesh = Some(target);
         modifier
     }
 }

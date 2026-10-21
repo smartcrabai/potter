@@ -374,7 +374,7 @@ fn eigen_preciprocal(value: f32) -> f32 {
 /// `Matrix4f::computeInverseWithCheck`, whose float kernel is `Eigen/src/LU/arch/InverseSize4.h`
 /// with NEON packets. `None` when the determinant is zero or not normal, where Blender returns a
 /// zero matrix. The x86 Blender build uses Eigen's SSE packets, whose reciprocal is not replicated.
-fn blender_invert_m4(matrix: &BlenderMat4) -> Option<BlenderMat4> {
+pub(crate) fn blender_invert_m4(matrix: &BlenderMat4) -> Option<BlenderMat4> {
     // Eigen's columns are Blender's `matrix[c]`; the 2x2 blocks are `[A B; C D]`.
     let a = movelh(matrix[0], matrix[1]);
     let b = movehl(matrix[1], matrix[0]);
@@ -533,4 +533,15 @@ pub(crate) fn blender_inverse_m4(matrix: [f32; 16]) -> [f32; 16] {
         return [0.0; 16];
     };
     std::array::from_fn(|index| inverse[index / 4][index % 4])
+}
+
+/// Blender `BLI_space_transform_from_matrices` on column-major f32 matrices. `local` is the object
+/// whose points are transformed and `target` the object they are expressed in: the forward matrix
+/// is `inverse(target) * local` and the inverse is its f32 inverse (`math_matrix_c.cc`).
+pub(crate) fn blender_space_transform_f32(
+    local: [f32; 16],
+    target: [f32; 16],
+) -> ([f32; 16], [f32; 16]) {
+    let forward = blender_multiply_m4(blender_inverse_m4(target), local);
+    (forward, blender_inverse_m4(forward))
 }

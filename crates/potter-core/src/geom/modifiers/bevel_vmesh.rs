@@ -24,7 +24,7 @@ use super::{Mesh, Polygon, build_mesh};
 use crate::error::Result;
 use crate::geom::uv_layers;
 use crate::geom::{
-    edge_key,
+    clear_origindex, edge_key,
     provenance::{Origin, mean_value_corners},
 };
 
@@ -2518,6 +2518,7 @@ pub(super) fn finish(
     );
     let origin = Origin {
         vertices: origins,
+        source_vertices: None,
         faces,
         corners: Some(corners),
     };
@@ -2525,5 +2526,7 @@ pub(super) fn finish(
         .into_iter()
         .map(|[first, second]| [remap[first], remap[second]])
         .collect();
-    build_mesh(points, polygons, loose, &origin, mesh)
+    let mut result = build_mesh(points, polygons, loose, &origin, mesh)?;
+    clear_origindex(&mut result);
+    Ok(result)
 }

@@ -1698,7 +1698,7 @@ fn compare_case(case: &Value, spec: &Value) -> TestResult<Errors> {
         binding_data: None,
         runtime: ModifierRuntime::default(),
     };
-    let actual_mesh = evaluate_modifiers(&mesh, &[modifier], "Cube")?;
+    let actual_mesh = evaluate_modifiers(&mesh, &[modifier], name)?;
     compare_ordered_attributes(&actual_mesh, &case["expected"]["ordered_attributes"])?;
     compare_byte_colors(&actual_mesh, &case["expected"]["byte_colors"])?;
     let actual = potter_shape(&actual_mesh)?;
