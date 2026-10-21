@@ -1,9 +1,11 @@
 #![expect(
     clippy::unwrap_used,
+    clippy::expect_used,
     reason = "focused CLI regression tests use deterministic fixtures and fail immediately on setup errors"
 )]
 
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     process::{Command, Output},
@@ -982,32 +984,36 @@ fn solve_object_accepts_the_four_track_boundary_and_persists_a_valid_solve() {
 }
 
 #[test]
+fn modifier_apply_reports_shape_key_failures() {
+    let cases = [invalid_case(
+        "shape keys guard modifier application",
+        json!([
+            {"op":"node.create","id":"subject","kind":"plane","params":{"size":2.0}},
+            {"op":"shape_key.create","target":{"id":"subject"},"id":"smile","name":"Smile","positions":{"0":[1.0,-1.0,0.25]}},
+            {"op":"modifier.create","target":{"id":"subject"},"id":"wave","type":"wave","params":{"height":0.5}}
+        ]),
+        json!({"op":"modifier.apply","target":{"id":"subject"},"modifier_id":"wave"}),
+        "UNSUPPORTED_FEATURE",
+        None,
+        Some("modifier.apply.shape_key_guard"),
+    )];
+    run_invalid_cases(&cases);
+}
+
+#[test]
 fn modifier_apply_reports_shape_key_and_unsupported_failures() {
-    let cases = [
-        invalid_case(
-            "shape keys guard modifier application",
-            json!([
-                {"op":"node.create","id":"subject","kind":"plane","params":{"size":2.0}},
-                {"op":"shape_key.create","target":{"id":"subject"},"id":"smile","name":"Smile","positions":{"0":[1.0,-1.0,0.25]}},
-                {"op":"modifier.create","target":{"id":"subject"},"id":"wave","type":"wave","params":{"height":0.5}}
-            ]),
-            json!({"op":"modifier.apply","target":{"id":"subject"},"modifier_id":"wave"}),
-            "UNSUPPORTED_FEATURE",
-            None,
-            Some("modifier.apply.shape_key_guard"),
-        ),
-        invalid_case(
-            "skin modifier branch hull is unsupported",
-            json!([
-                {"op":"node.create","id":"skeleton","kind":"box","params":{"size":1.0}},
-                {"op":"modifier.create","target":{"id":"skeleton"},"id":"skin","type":"skin","params":{}}
-            ]),
-            json!({"op":"modifier.apply","target":{"id":"skeleton"},"modifier_id":"skin"}),
-            "UNSUPPORTED_FEATURE",
-            None,
-            Some("modifier.skin.branch_hull"),
-        ),
-    ];
+    let cases = [invalid_case(
+        "shape keys guard modifier application",
+        json!([
+            {"op":"node.create","id":"subject","kind":"plane","params":{"size":2.0}},
+            {"op":"shape_key.create","target":{"id":"subject"},"id":"smile","name":"Smile","positions":{"0":[1.0,-1.0,0.25]}},
+            {"op":"modifier.create","target":{"id":"subject"},"id":"wave","type":"wave","params":{"height":0.5}}
+        ]),
+        json!({"op":"modifier.apply","target":{"id":"subject"},"modifier_id":"wave"}),
+        "UNSUPPORTED_FEATURE",
+        None,
+        Some("modifier.apply.shape_key_guard"),
+    )];
     run_invalid_cases(&cases);
 }
 
@@ -1035,4 +1041,219 @@ fn modifier_apply_commits_topology_changes_and_removes_the_applied_modifier() {
     let mesh = document.data_blocks[data_id].mesh.as_ref().unwrap();
     assert_eq!(mesh.faces.len(), 2);
     assert!(mesh.faces.iter().all(|face| face.vertices.len() == 3));
+}
+
+const CUBE_BRANCH_VERTICES: [[f64; 3]; 56] = [
+    [-0.208_333_343, 0.208_333_313, -0.75],
+    [-0.75, 0.166_666_642, -0.75],
+    [-0.75, 0.208_333_313, -0.208_333_343],
+    [-0.208_333_343, 0.229_166_657, -0.229_166_672],
+    [-0.208_333_313, -0.208_333_343, -0.75],
+    [-0.75, -0.166_666_687, -0.75],
+    [-0.75, -0.208_333_343, -0.208_333_313],
+    [-0.208_333_313, -0.229_166_672, -0.229_166_657],
+    [-0.208_333_313, -0.75, -0.208_333_313],
+    [-0.75, -0.75, -0.166_666_642],
+    [-0.208_333_343, -0.75, 0.208_333_343],
+    [-0.75, -0.75, 0.166_666_687],
+    [-0.75, -0.208_333_313, 0.208_333_343],
+    [-0.208_333_343, -0.229_166_657, 0.229_166_672],
+    [-0.208_333_343, -0.208_333_313, 0.75],
+    [-0.75, -0.166_666_642, 0.75],
+    [-0.75, 0.208_333_343, 0.208_333_313],
+    [-0.208_333_313, 0.229_166_672, 0.229_166_657],
+    [-0.208_333_313, 0.208_333_343, 0.75],
+    [-0.75, 0.166_666_687, 0.75],
+    [-0.75, 0.75, 0.166_666_642],
+    [-0.208_333_313, 0.75, 0.208_333_313],
+    [-0.75, 0.75, -0.166_666_687],
+    [-0.208_333_343, 0.75, -0.208_333_343],
+    [0.208_333_313, 0.208_333_343, -0.75],
+    [0.166_666_642, 0.75, -0.75],
+    [0.208_333_313, 0.75, -0.208_333_343],
+    [0.229_166_657, 0.208_333_343, -0.229_166_672],
+    [-0.166_666_687, 0.75, -0.75],
+    [-0.166_666_642, 0.75, 0.75],
+    [0.208_333_343, 0.75, 0.208_333_313],
+    [0.229_166_672, 0.208_333_313, 0.229_166_657],
+    [0.208_333_343, 0.208_333_313, 0.75],
+    [0.166_666_687, 0.75, 0.75],
+    [0.75, 0.208_333_313, 0.208_333_313],
+    [0.75, 0.75, 0.166_666_642],
+    [0.75, 0.208_333_343, -0.208_333_343],
+    [0.75, 0.75, -0.166_666_687],
+    [0.75, -0.166_666_642, -0.75],
+    [0.208_333_343, -0.208_333_313, -0.75],
+    [0.208_333_343, -0.229_166_657, -0.229_166_672],
+    [0.75, -0.208_333_313, -0.208_333_343],
+    [0.75, 0.166_666_687, -0.75],
+    [0.75, 0.166_666_642, 0.75],
+    [0.75, -0.208_333_343, 0.208_333_313],
+    [0.208_333_313, -0.229_166_672, 0.229_166_657],
+    [0.208_333_313, -0.208_333_343, 0.75],
+    [0.75, -0.166_666_687, 0.75],
+    [0.75, -0.75, 0.166_666_642],
+    [0.208_333_313, -0.75, 0.208_333_313],
+    [0.75, -0.75, -0.166_666_687],
+    [0.208_333_343, -0.75, -0.208_333_343],
+    [-0.166_666_642, -0.75, -0.75],
+    [0.166_666_687, -0.75, -0.75],
+    [0.166_666_642, -0.75, 0.75],
+    [-0.166_666_687, -0.75, 0.75],
+];
+const CUBE_BRANCH_FACES: &[&[usize]] = &[
+    &[22, 28, 1, 2],
+    &[10, 55, 11],
+    &[4, 52, 5],
+    &[21, 17, 3, 23],
+    &[20, 21, 23, 22],
+    &[16, 19, 20],
+    &[16, 20, 22, 2],
+    &[17, 16, 2, 3],
+    &[19, 16, 12, 15],
+    &[8, 9, 52],
+    &[28, 0, 1],
+    &[14, 15, 55],
+    &[18, 19, 15, 14],
+    &[17, 18, 14, 13],
+    &[16, 17, 13, 12],
+    &[23, 28, 22],
+    &[13, 10, 8, 7],
+    &[12, 13, 7, 6],
+    &[39, 38, 53],
+    &[18, 29, 19],
+    &[36, 42, 37],
+    &[35, 30, 33],
+    &[54, 49, 48],
+    &[11, 12, 6, 9],
+    &[10, 11, 9, 8],
+    &[41, 50, 38],
+    &[7, 4, 0, 3],
+    &[46, 54, 47],
+    &[25, 26, 37],
+    &[6, 7, 3, 2],
+    &[5, 6, 2, 1],
+    &[4, 5, 1, 0],
+    &[50, 51, 53, 38],
+    &[47, 54, 48, 44],
+    &[29, 21, 20, 19],
+    &[43, 35, 33, 32],
+    &[9, 6, 5, 52],
+    &[34, 35, 43],
+    &[24, 25, 37, 42],
+    &[15, 12, 11, 55],
+    &[0, 28, 25, 24],
+    &[28, 23, 26, 25],
+    &[23, 3, 27, 26],
+    &[3, 0, 24, 27],
+    &[30, 31, 17, 21],
+    &[31, 32, 18, 17],
+    &[32, 33, 29, 18],
+    &[33, 30, 21, 29],
+    &[34, 31, 27, 36],
+    &[31, 30, 26, 27],
+    &[30, 35, 37, 26],
+    &[35, 34, 36, 37],
+    &[38, 39, 24, 42],
+    &[39, 40, 27, 24],
+    &[40, 41, 36, 27],
+    &[41, 38, 42, 36],
+    &[44, 45, 31, 34],
+    &[45, 46, 32, 31],
+    &[46, 47, 43, 32],
+    &[47, 44, 34, 43],
+    &[48, 49, 51, 50],
+    &[49, 45, 40, 51],
+    &[45, 44, 41, 40],
+    &[44, 48, 50, 41],
+    &[39, 53, 52, 4],
+    &[53, 51, 8, 52],
+    &[51, 40, 7, 8],
+    &[40, 39, 4, 7],
+    &[10, 13, 45, 49],
+    &[13, 14, 46, 45],
+    &[14, 55, 54, 46],
+    &[55, 10, 49, 54],
+];
+
+/// Rotates a vertex cycle so it starts at its lowest index, keeping its winding.
+fn cycle_from_lowest(face: &[usize]) -> Vec<usize> {
+    let start = face
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, index)| **index)
+        .map_or(0, |(position, _)| position);
+    face.iter()
+        .cycle()
+        .skip(start)
+        .take(face.len())
+        .copied()
+        .collect()
+}
+
+/// Blender 5.2.2 `cube_branch_blender` oracle (`tests/fixtures/pr18f_skin/generate_skin_oracle.py`, output in
+/// `tests/fixtures/pr18f_skin/cube_branch_blender.json`): the cube from Blender's `primitive_cube_add`, which
+/// `node.create kind box` (`Mesh::box_mesh`) produces in the same vertex and edge order. Skinned with the default
+/// layer (radius 0.25, root on vertex 0). Each oracle vertex must have exactly one evaluated vertex at the same
+/// position, and the faces must match as vertex cycles over those vertices, winding included.
+fn assert_blender_cube_branch(mesh: &potter_core::geom::Mesh) {
+    assert_eq!(mesh.vertices.len(), CUBE_BRANCH_VERTICES.len());
+    assert_eq!(mesh.edges.len(), 136);
+    assert_eq!(mesh.faces.len(), CUBE_BRANCH_FACES.len());
+    let mut matched = vec![false; mesh.vertices.len()];
+    let mut index_by_id = HashMap::new();
+    for (index, position) in CUBE_BRANCH_VERTICES.iter().enumerate() {
+        let position = DVec3::from_array(*position);
+        let storage = mesh
+            .vertices
+            .iter()
+            .enumerate()
+            .find_map(|(storage, vertex)| {
+                (!matched[storage] && vertex.co.distance(position) < 1.0e-6).then_some(storage)
+            })
+            .expect("Blender cube branch vertex is present");
+        matched[storage] = true;
+        index_by_id.insert(mesh.vertices[storage].id, index);
+    }
+    let mut actual: Vec<Vec<usize>> = mesh
+        .faces
+        .iter()
+        .map(|face| {
+            let cycle: Vec<usize> = face.vertices.iter().map(|id| index_by_id[id]).collect();
+            cycle_from_lowest(&cycle)
+        })
+        .collect();
+    actual.sort();
+    let mut expected: Vec<Vec<usize>> = CUBE_BRANCH_FACES
+        .iter()
+        .map(|face| cycle_from_lowest(face))
+        .collect();
+    expected.sort();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn modifier_apply_evaluates_adjacent_skin_branch_hulls() {
+    let (_directory, scene) = setup_scene(&json!([
+        {"op":"node.create","id":"skeleton","kind":"box","params":{"size":1.0}},
+        {"op":"modifier.create","target":{"id":"skeleton"},"id":"skin","type":"skin","params":{}}
+    ]));
+    let output = apply(
+        &scene,
+        1,
+        &json!([{"op":"modifier.apply","target":{"id":"skeleton"},"modifier_id":"skin"}]),
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let document: SceneDoc =
+        serde_json::from_slice(&fs::read(scene.join("scene.json")).unwrap()).unwrap();
+    let node = &document.nodes[&Id::new("skeleton").unwrap()];
+    assert!(node.modifiers.is_empty(), "{:?}", node.modifiers);
+    let data_id = node.data.as_ref().unwrap();
+    let mesh = document.data_blocks[data_id].mesh.as_ref().unwrap();
+    assert_ne!(mesh.faces, [] as [potter_core::geom::Face; 0]);
+    assert_blender_cube_branch(mesh);
 }

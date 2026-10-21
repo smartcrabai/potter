@@ -36,6 +36,8 @@ mod heap;
 pub(crate) mod heap_simple;
 pub(crate) mod interpolation;
 pub mod lattice;
+pub(crate) mod legacy_texture;
+pub use legacy_texture::{ResolvedTexture, resolve_texture};
 pub mod mesh_cache;
 pub mod metaball;
 pub mod modifiers;
@@ -121,6 +123,46 @@ pub struct IdCounters {
     pub edge: u32,
     /// Next face ID.
     pub face: u32,
+}
+
+/// Blender's `ORIGINDEX_NONE` sentinel for generated or unmatched vertices.
+pub(crate) const ORIGINDEX_NONE: i32 = -1;
+
+/// Internal point attribute carrying each vertex's input storage index, `ORIGINDEX_NONE` for
+/// generated vertices. The `user:` prefix avoids colliding with canonical user attributes; this
+/// exact key is registered as internal. Evaluation-only: the modifier stack strips it from output.
+pub(crate) const ORIGINDEX_ATTRIBUTE: &str = "user:__potter_origindex";
+
+/// The evaluation-only index carrier as one entry per vertex, when present.
+pub(crate) fn origindex_values(mesh: &Mesh) -> Option<Vec<i32>> {
+    mesh.attributes
+        .get(ORIGINDEX_ATTRIBUTE)?
+        .as_array()
+        .map(|values| {
+            values
+                .iter()
+                .map(|value| {
+                    value
+                        .as_i64()
+                        .and_then(|index| i32::try_from(index).ok())
+                        .unwrap_or(ORIGINDEX_NONE)
+                })
+                .collect()
+        })
+}
+
+/// Writes the evaluation-only index carrier, one entry per vertex.
+pub(crate) fn set_origindex(mesh: &mut Mesh, values: &[i32]) {
+    mesh.attributes.insert(
+        ORIGINDEX_ATTRIBUTE.to_owned(),
+        Value::Array(values.iter().map(|&index| Value::from(index)).collect()),
+    );
+}
+
+/// Marks every vertex of `mesh` as generated: its carrier holds `ORIGINDEX_NONE` throughout.
+pub(crate) fn clear_origindex(mesh: &mut Mesh) {
+    let none = vec![ORIGINDEX_NONE; mesh.vertices.len()];
+    set_origindex(mesh, &none);
 }
 
 /// Polygon mesh whose topology and element identities survive index changes.

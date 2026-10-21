@@ -1800,6 +1800,37 @@ mod tests {
     }
 
     #[test]
+    fn nearest_vertex_offset_moves_each_projected_vertex_by_the_requested_distance() {
+        let source = Mesh::uv_sphere(UvSphereParams {
+            segments: 8,
+            ring_count: 4,
+            radius: 2.0,
+        })
+        .test_value();
+        let target = Mesh::uv_sphere(UvSphereParams {
+            segments: 16,
+            ring_count: 8,
+            radius: 1.0,
+        })
+        .test_value();
+        let evaluate_at_offset = |offset: f64| {
+            evaluate(
+                &source,
+                &modifier(
+                    json!({"wrap_method":"NEAREST_VERTEX","offset":offset}),
+                    target.clone(),
+                ),
+            )
+            .test_value()
+        };
+        let projected = evaluate_at_offset(0.0);
+        let offset = evaluate_at_offset(0.25);
+        for (base, shifted) in projected.vertices.iter().zip(&offset.vertices) {
+            assert!((base.co.distance(shifted.co) - 0.25).abs() < F32_TOLERANCE);
+        }
+    }
+
+    #[test]
     fn nearest_vertex_uses_vertex_group_and_inversion() {
         let mut source = one_point(DVec3::new(0.0, 0.0, 2.0));
         source

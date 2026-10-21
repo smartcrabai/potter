@@ -137,6 +137,7 @@ pub(crate) fn polys_to_mesh(
             .iter()
             .map(|&id| point_origin(arena.vert(id).orig, joined.mesh.vertices.len()))
             .collect(),
+        source_vertices: None,
         faces: planned.iter().map(|face| Some(face.joined_face)).collect(),
         corners: Some(corner_sources(&joined, &planned, &positions)),
     };

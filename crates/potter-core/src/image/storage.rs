@@ -1,4 +1,10 @@
-use std::{borrow::Cow, collections::BTreeMap, fs, io::Cursor, path::Path};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, HashMap},
+    fs,
+    io::Cursor,
+    path::Path,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -11,6 +17,14 @@ use crate::{
 
 const PIXEL_FORMAT: &str = "potter.rgba_f64.v1";
 pub const MAX_IMAGE_PIXELS: u64 = 16_777_216;
+
+/// Static layer/pass/view selectors; still frames are fixed and tiled textures derive tiles from UVs.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ImageUserSelection {
+    pub(crate) layer: u16,
+    pub(crate) pass: u16,
+    pub(crate) view: u16,
+}
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -63,13 +77,50 @@ pub fn load_image_data_with_staged(
     interpolation: ImageInterpolation,
     staged: &BTreeMap<String, Vec<u8>>,
 ) -> Result<ImageData> {
+    load_image_data_with_staged_and_user(image, root, interpolation, staged, None)
+        .map(|(image, _, _)| image)
+}
+
+/// Loads an image using the selection captured by a legacy Image Texture's `ImageUser`.
+/// The legacy sampler reads straight texels, so a premultiplied EXR RGBA colour pass is
+/// unpremultiplied here; other passes keep their stored values.
+pub(crate) fn load_image_data_for_legacy_texture(
+    image: &Image,
+    root: &Path,
+    interpolation: ImageInterpolation,
+    selection: ImageUserSelection,
+) -> Result<(ImageData, bool, usize)> {
+    load_image_data_with_staged_and_user(
+        image,
+        root,
+        interpolation,
+        &BTreeMap::new(),
+        Some(selection),
+    )
+}
+
+fn load_image_data_with_staged_and_user(
+    image: &Image,
+    root: &Path,
+    interpolation: ImageInterpolation,
+    staged: &BTreeMap<String, Vec<u8>>,
+    selection: Option<ImageUserSelection>,
+) -> Result<(ImageData, bool, usize)> {
+    let decode = |bytes: &[u8]| {
+        if let Some(selection) = selection {
+            decode_pixels_with_image_user(bytes, image.colorspace, image.alpha_mode, selection)
+        } else {
+            decode_pixels(bytes, image.colorspace)
+                .map(|(width, height, pixels)| (width, height, pixels, true, 4))
+        }
+    };
     let srgb = decodes_srgb(image.colorspace);
     // A UDIM image whose base file is missing keeps its listed tiles and no base pixels, so the base samples as missing.
-    let (width, height, pixels, storage) = if image.base_is_missing() {
-        (0, 0, Vec::new(), ImageStorage::default())
+    let (width, height, pixels, color_pass, source_channels, storage) = if image.base_is_missing() {
+        (0, 0, Vec::new(), true, 4, ImageStorage::default())
     } else {
         let base_bytes = image_blob_bytes(image.blob.as_deref(), image, root, staged)?;
-        let (width, height, pixels) = decode_pixels(&base_bytes, image.colorspace)?;
+        let (width, height, pixels, color_pass, source_channels) = decode(&base_bytes)?;
         if width != image.width || height != image.height {
             return Err(PotError::with_details(
                 ErrorCode::SceneInvalid,
@@ -77,7 +128,16 @@ pub fn load_image_data_with_staged(
                 serde_json::json!({"image":image.name,"expected":[image.width,image.height],"actual":[width,height]}),
             ));
         }
-        (width, height, pixels, image_storage(image, &base_bytes))
+        let mut storage = image_storage(image, &base_bytes);
+        // The legacy decode unpremultiplies a premultiplied EXR colour pass, so its texels are straight
+        // and the storage says so.
+        if selection.is_some()
+            && base_bytes.starts_with(&[0x76, 0x2f, 0x31, 0x01])
+            && legacy_colour_is_straight(image.alpha_mode, color_pass, source_channels)
+        {
+            storage.straight_alpha = true;
+        }
+        (width, height, pixels, color_pass, source_channels, storage)
     };
     let mut tiles = BTreeMap::new();
     for tile in &image.tiles {
@@ -86,7 +146,7 @@ pub fn load_image_data_with_staged(
             continue;
         };
         let bytes = blob_bytes(blob, root, staged)?;
-        let (tile_width, tile_height, tile_pixels) = decode_pixels(&bytes, image.colorspace)?;
+        let (tile_width, tile_height, tile_pixels, _, _) = decode(&bytes)?;
         if tile_width != tile.width || tile_height != tile.height {
             return Err(PotError::with_details(
                 ErrorCode::SceneInvalid,
@@ -105,17 +165,46 @@ pub fn load_image_data_with_staged(
             },
         );
     }
-    Ok(ImageData {
-        width,
-        height,
-        pixels,
-        tiles,
-        interpolation,
-        srgb,
-        storage,
-        udim: image.is_udim(),
-        colour: ColourCache::default(),
-    })
+    Ok((
+        ImageData {
+            width,
+            height,
+            pixels,
+            tiles,
+            interpolation,
+            srgb,
+            storage,
+            udim: image.is_udim(),
+            colour: ColourCache::default(),
+        },
+        color_pass,
+        source_channels,
+    ))
+}
+
+type DecodedImageUserPixels = (u32, u32, Vec<[f64; 4]>, bool, usize);
+
+fn decode_pixels_with_image_user(
+    bytes: &[u8],
+    colorspace: ImageColorspace,
+    alpha_mode: ImageAlphaMode,
+    selection: ImageUserSelection,
+) -> Result<DecodedImageUserPixels> {
+    if bytes.starts_with(&[0x76, 0x2f, 0x31, 0x01]) {
+        let (width, height, mut pixels, color_pass, source_channels) =
+            decode_exr_with_image_user(bytes, selection, alpha_mode)?;
+        if color_pass {
+            pixels = apply_colorspace(pixels, colorspace);
+            if source_channels == 1 {
+                for pixel in &mut pixels {
+                    pixel[3] = pixel[0];
+                }
+            }
+        }
+        return Ok((width, height, pixels, color_pass, source_channels));
+    }
+    let (width, height, pixels) = decode_pixels(bytes, colorspace)?;
+    Ok((width, height, pixels, true, 4))
 }
 
 /// Whether an image's stored values are sRGB-encoded: an sRGB colour space on any source. Cycles keeps such an image
@@ -523,11 +612,13 @@ fn encoding_error(code: ErrorCode, format: &str, variant: &str, message: &str) -
     )
 }
 
-fn decode_exr(bytes: &[u8]) -> Result<(u32, u32, Vec<[f64; 4]>)> {
-    use exr::image::{AnyChannels, FlatSamples, Layer};
-    use exr::prelude::ReadChannels;
-    use exr::prelude::ReadLayers;
-    type ExrLayer = Layer<AnyChannels<FlatSamples>>;
+type ExrChannelData = exr::image::AnyChannel<exr::image::FlatSamples>;
+type ExrLayerData = exr::image::Layer<exr::image::AnyChannels<exr::image::FlatSamples>>;
+type ExrImageData = exr::image::FlatImage;
+
+fn read_exr_data(bytes: &[u8]) -> Result<ExrImageData> {
+    use exr::prelude::{ReadChannels, ReadLayers};
+
     let metadata =
         exr::meta::MetaData::read_from_buffered(Cursor::new(bytes), false).map_err(|error| {
             encoding_error(
@@ -561,7 +652,7 @@ fn decode_exr(bytes: &[u8]) -> Result<(u32, u32, Vec<[f64; 4]>)> {
         checked_pixel_count(width, height)?;
     }
 
-    let image = exr::prelude::read()
+    exr::prelude::read()
         .no_deep_data()
         .largest_resolution_level()
         .all_channels()
@@ -577,8 +668,107 @@ fn decode_exr(bytes: &[u8]) -> Result<(u32, u32, Vec<[f64; 4]>)> {
                 (ErrorCode::InvalidArgument, "invalid_data")
             };
             encoding_error(code, "exr", variant, &message)
-        })?;
-    let has_rgb = |layer: &&ExrLayer| {
+        })
+}
+
+fn decode_exr(bytes: &[u8]) -> Result<(u32, u32, Vec<[f64; 4]>)> {
+    let (width, height, pixels) = decode_exr_default(&read_exr_data(bytes)?)?;
+    Ok((width, height, pixels))
+}
+
+fn decode_exr_with_image_user(
+    bytes: &[u8],
+    selection: ImageUserSelection,
+    alpha_mode: ImageAlphaMode,
+) -> Result<DecodedImageUserPixels> {
+    let image = read_exr_data(bytes)?;
+    let multilayer = exr_is_multilayer(&image);
+    if !multilayer {
+        let (width, height, mut pixels) = decode_exr_default(&image)?;
+        if legacy_colour_is_straight(alpha_mode, true, 4) {
+            for pixel in &mut pixels {
+                unpremultiply_exr_pixel(pixel);
+            }
+        }
+        return Ok((width, height, pixels, true, 4));
+    }
+
+    let views = exr_views(&image);
+    let layers = exr_render_layers(&image, &views);
+    let first_layer = image.layer_data.first().ok_or_else(|| {
+        encoding_error(
+            ErrorCode::UnsupportedFeature,
+            "exr",
+            "no_layers",
+            "EXR contains no image layers",
+        )
+    })?;
+    let width = u32::try_from(first_layer.size.width()).map_err(|_| {
+        PotError::new(
+            ErrorCode::LimitExceeded,
+            "EXR width exceeds platform limits",
+        )
+    })?;
+    let height = u32::try_from(first_layer.size.height()).map_err(|_| {
+        PotError::new(
+            ErrorCode::LimitExceeded,
+            "EXR height exceeds platform limits",
+        )
+    })?;
+    let Some(pass) = select_exr_render_pass(&layers, selection) else {
+        let pixel_count = checked_pixel_count(width, height)?;
+        return Ok((width, height, vec![[0.0; 4]; pixel_count], false, 0));
+    };
+    let width = u32::try_from(pass.width).map_err(|_| {
+        PotError::new(
+            ErrorCode::LimitExceeded,
+            "EXR width exceeds platform limits",
+        )
+    })?;
+    let height = u32::try_from(pass.height).map_err(|_| {
+        PotError::new(
+            ErrorCode::LimitExceeded,
+            "EXR height exceeds platform limits",
+        )
+    })?;
+    let pixel_count = checked_pixel_count(width, height)?;
+
+    let (channel_slots, channel_ids) = exr_pass_channel_layout(pass);
+    let channel_count = pass.channels.len();
+    let color_pass = is_exr_color_pass(channel_count, &channel_ids);
+    let straight_colour = legacy_colour_is_straight(alpha_mode, color_pass, channel_count);
+    let mut pixels = Vec::with_capacity(pixel_count);
+    for index in 0..pixel_count {
+        let mut pixel = if channel_count == 1 {
+            let value = exr_sample(pass.channels[0].channel, index)?;
+            [value; 4]
+        } else if channel_count == 3 || channel_count == 4 {
+            let mut values = [0.0; 4];
+            for (slot, channel_index) in channel_slots.iter().enumerate() {
+                if let Some(channel_index) = channel_index {
+                    values[slot] = exr_sample(pass.channels[*channel_index].channel, index)?;
+                }
+            }
+            if channel_count == 3 {
+                values[3] = 1.0;
+            }
+            values
+        } else {
+            let value = exr_sample(pass.channels[0].channel, index)?;
+            [value; 4]
+        };
+        if straight_colour {
+            unpremultiply_exr_pixel(&mut pixel);
+        }
+        pixels.push(pixel);
+    }
+    validate_pixels(width, height, &pixels)?;
+    Ok((width, height, pixels, color_pass, channel_count))
+}
+
+/// Decodes the first RGB layer with its values as stored (see [`ImageData::pixels`]).
+fn decode_exr_default(image: &ExrImageData) -> Result<(u32, u32, Vec<[f64; 4]>)> {
+    let has_rgb = |layer: &&ExrLayerData| {
         exr_channel(layer, &["r", "red"]).is_some()
             && exr_channel(layer, &["g", "green"]).is_some()
             && exr_channel(layer, &["b", "blue"]).is_some()
@@ -667,6 +857,28 @@ fn decode_exr(bytes: &[u8]) -> Result<(u32, u32, Vec<[f64; 4]>)> {
     Ok((width, height, pixels))
 }
 
+/// Whether a legacy image's decoded colour pass is straight. A premultiplied RGBA colour pass is
+/// unpremultiplied at decode, as F's `image_user` decode did, so the legacy sampler reads straight
+/// texels. Z, depth, and other passes keep their stored values, and so do the other alpha modes.
+fn legacy_colour_is_straight(
+    alpha_mode: ImageAlphaMode,
+    color_pass: bool,
+    channel_count: usize,
+) -> bool {
+    alpha_mode == ImageAlphaMode::Premultiplied && color_pass && channel_count == 4
+}
+
+fn unpremultiply_exr_pixel(pixel: &mut [f64; 4]) {
+    let alpha = pixel[3];
+    if alpha == 0.0 {
+        pixel[..3].fill(0.0);
+    } else {
+        for component in &mut pixel[..3] {
+            *component /= alpha;
+        }
+    }
+}
+
 fn exr_channel<'a>(
     layer: &'a exr::image::Layer<exr::image::AnyChannels<exr::image::FlatSamples>>,
     names: &[&str],
@@ -710,6 +922,436 @@ fn exr_sample(
     })
 }
 
+struct ExrSelectionChannel<'a> {
+    channel: &'a ExrChannelData,
+    id: char,
+}
+
+struct ExrSelectionPass<'a> {
+    name: String,
+    view: String,
+    view_id: usize,
+    width: usize,
+    height: usize,
+    channels: Vec<ExrSelectionChannel<'a>>,
+}
+
+struct ExrSelectionLayer<'a> {
+    passes: Vec<ExrSelectionPass<'a>>,
+}
+
+struct ExrRawChannel<'a> {
+    channel: &'a ExrChannelData,
+    name: String,
+    view: String,
+    width: usize,
+    height: usize,
+}
+
+fn exr_is_multilayer(image: &ExrImageData) -> bool {
+    image.layer_data.len() > 1
+        || image.layer_data.iter().any(|layer| {
+            layer
+                .attributes
+                .multi_view_names
+                .as_ref()
+                .is_some_and(|views| !views.is_empty())
+                || layer
+                    .channel_data
+                    .list
+                    .iter()
+                    .any(|channel| channel.name.to_string().contains('.'))
+        })
+}
+
+fn exr_views(image: &ExrImageData) -> Vec<String> {
+    let mut views = Vec::new();
+    for layer in &image.layer_data {
+        if let Some(view) = &layer.attributes.view_name {
+            push_exr_view(&mut views, &view.to_string());
+        }
+        if let Some(layer_views) = &layer.attributes.multi_view_names {
+            for view in layer_views {
+                push_exr_view(&mut views, &view.to_string());
+            }
+        }
+    }
+    if views.is_empty() {
+        views.push(String::new());
+    }
+    let mut ordered = Vec::with_capacity(views.len());
+    for stereo_view in ["left", "right"] {
+        if let Some(index) = views.iter().position(|view| view == stereo_view) {
+            ordered.push(views.remove(index));
+        }
+    }
+    ordered.extend(views);
+    ordered
+}
+
+fn push_exr_view(views: &mut Vec<String>, view: &str) {
+    if !views.iter().any(|known| known == view) {
+        views.push(view.to_owned());
+    }
+}
+
+fn exr_render_layers<'a>(image: &'a ExrImageData, views: &[String]) -> Vec<ExrSelectionLayer<'a>> {
+    let mut raw_channels = Vec::new();
+    for layer in &image.layer_data {
+        let layer_views = layer
+            .attributes
+            .multi_view_names
+            .as_ref()
+            .filter(|views| !views.is_empty())
+            .map(|views| views.iter().map(ToString::to_string).collect::<Vec<_>>());
+        let mut part_name = layer
+            .attributes
+            .layer_name
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        let part_view = layer
+            .attributes
+            .view_name
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        if layer_views.is_none()
+            && !part_view.is_empty()
+            && let Some(prefix) = part_name
+                .strip_suffix(&part_view)
+                .and_then(|name| name.strip_suffix('.'))
+                .or_else(|| {
+                    part_name
+                        .strip_suffix(&part_view)
+                        .and_then(|name| name.strip_suffix('-'))
+                })
+        {
+            part_name = prefix.to_owned();
+        }
+
+        for channel in &layer.channel_data.list {
+            let stored_name = channel.name.to_string();
+            let (mut name, view) = if let Some(layer_views) = &layer_views {
+                remove_exr_view_name(&stored_name, layer_views)
+            } else {
+                (stored_name, part_view.clone())
+            };
+            if !part_name.is_empty()
+                && !name
+                    .strip_prefix(&part_name)
+                    .is_some_and(|suffix| suffix.starts_with('.'))
+            {
+                let mut full_name = String::with_capacity(part_name.len() + name.len() + 1);
+                full_name.push_str(&part_name);
+                full_name.push('.');
+                full_name.push_str(&name);
+                name = full_name;
+            }
+            raw_channels.push(ExrRawChannel {
+                channel,
+                name,
+                view,
+                width: layer.size.width(),
+                height: layer.size.height(),
+            });
+        }
+    }
+
+    let has_xyz_channels = raw_channels
+        .iter()
+        .any(|channel| matches!(channel.name.as_str(), "X" | "Y" | "Z"));
+    let mut layer_indices = HashMap::<String, usize>::new();
+    let mut layers = Vec::<ExrSelectionLayer<'a>>::new();
+    for channel in raw_channels {
+        let Some((layer_name, pass_name, id)) =
+            split_exr_channel_name(&channel.name, has_xyz_channels)
+        else {
+            continue;
+        };
+        let layer_index = if let Some(index) = layer_indices.get(&layer_name) {
+            *index
+        } else {
+            let index = layers.len();
+            layer_indices.insert(layer_name.clone(), index);
+            layers.push(ExrSelectionLayer { passes: Vec::new() });
+            index
+        };
+        let view_id = views
+            .iter()
+            .position(|known| known == &channel.view)
+            .unwrap_or(0);
+        let layer = &mut layers[layer_index];
+        if let Some(pass) = layer
+            .passes
+            .iter_mut()
+            .find(|pass| pass.name == pass_name && pass.view == channel.view)
+        {
+            pass.channels.push(ExrSelectionChannel {
+                channel: channel.channel,
+                id,
+            });
+        } else {
+            layer.passes.push(ExrSelectionPass {
+                name: pass_name,
+                view: channel.view,
+                view_id,
+                width: channel.width,
+                height: channel.height,
+                channels: vec![ExrSelectionChannel {
+                    channel: channel.channel,
+                    id,
+                }],
+            });
+        }
+    }
+    for layer in &mut layers {
+        layer.passes.sort_by(compare_exr_passes);
+    }
+    layers
+}
+
+fn remove_exr_view_name(name: &str, views: &[String]) -> (String, String) {
+    let Some((prefix, channel)) = name.rsplit_once('.') else {
+        return (name.to_owned(), String::new());
+    };
+    for view in views {
+        if prefix == view {
+            return (channel.to_owned(), view.clone());
+        }
+        if let Some(layer_pass) = prefix
+            .strip_suffix(view)
+            .and_then(|rest| rest.strip_suffix('.'))
+        {
+            let mut name_without_view = String::with_capacity(layer_pass.len() + channel.len() + 1);
+            if !layer_pass.is_empty() {
+                name_without_view.push_str(layer_pass);
+                name_without_view.push('.');
+            }
+            name_without_view.push_str(channel);
+            return (name_without_view, view.clone());
+        }
+    }
+    (name.to_owned(), String::new())
+}
+
+fn split_exr_channel_name(name: &str, has_xyz_channels: bool) -> Option<(String, String, char)> {
+    let (prefix, channel_name) = name.rsplit_once('.').unwrap_or(("", name));
+    if channel_name.is_empty() {
+        return None;
+    }
+    let id = exr_channel_id(channel_name)?;
+    if prefix.is_empty() {
+        let pass_name =
+            if id == 'Z' && (!has_xyz_channels || channel_name.eq_ignore_ascii_case("depth")) {
+                "Depth"
+            } else if id == 'Y' && !has_xyz_channels {
+                channel_name
+            } else if matches!(id, 'R' | 'G' | 'B' | 'A' | 'V' | 'X' | 'Y' | 'Z') {
+                "Combined"
+            } else {
+                channel_name
+            };
+        return Some((String::new(), pass_name.to_owned(), id));
+    }
+    let (layer_name, pass_name) = prefix.rsplit_once('.').unwrap_or(("", prefix));
+    if pass_name.is_empty() {
+        return None;
+    }
+    Some((layer_name.to_owned(), pass_name.to_owned(), id))
+}
+
+fn exr_channel_id(name: &str) -> Option<char> {
+    let first = name.chars().next()?.to_ascii_uppercase();
+    if name.len() == 1 {
+        return Some(first);
+    }
+    if name.len() == 2 {
+        let second = name.chars().nth(1)?.to_ascii_uppercase();
+        return Some(
+            if matches!(second, 'X' | 'Y' | 'Z' | 'R' | 'G' | 'B' | 'U' | 'V' | 'A') {
+                second
+            } else {
+                'X'
+            },
+        );
+    }
+    Some(if name.eq_ignore_ascii_case("red") {
+        'R'
+    } else if name.eq_ignore_ascii_case("green") {
+        'G'
+    } else if name.eq_ignore_ascii_case("blue") {
+        'B'
+    } else if name.eq_ignore_ascii_case("alpha") {
+        'A'
+    } else if name.eq_ignore_ascii_case("depth") {
+        'Z'
+    } else {
+        'X'
+    })
+}
+
+/// Blender's `RE_PASSNAME_*` tokens and their `SCE_PASS_*` bits, in `passtype_from_name` order
+/// (`render_result.cc`, `DNA_scene_enums.h`). The first token that starts the pass name gives its type.
+const BLENDER_PASS_TYPES: &[(&str, u32)] = &[
+    ("Combined", 1 << 0),
+    ("Depth", 1 << 1),
+    ("Vector", 1 << 9),
+    ("Normal", 1 << 8),
+    ("UV", 1 << 12),
+    ("Emission", 1 << 16),
+    ("Shadow", 1 << 5),
+    ("Ambient Occlusion", 1 << 6),
+    ("Environment", 1 << 17),
+    ("Object Index", 1 << 11),
+    ("Material Index", 1 << 18),
+    ("Mist", 1 << 14),
+    ("Diffuse Direct", 1 << 19),
+    ("Diffuse Indirect", 1 << 20),
+    ("Diffuse Color", 1 << 21),
+    ("Glossy Direct", 1 << 22),
+    ("Glossy Indirect", 1 << 23),
+    ("Glossy Color", 1 << 24),
+    ("Transmission Direct", 1 << 25),
+    ("Transmission Indirect", 1 << 26),
+    ("Transmission Color", 1 << 27),
+    ("Subsurface Direct", 1 << 28),
+    ("Subsurface Indirect", 1 << 29),
+    ("Subsurface Color", 1 << 30),
+];
+
+/// Blender's `passtype_from_name`: the type of the first token of `name` that its `RE_PASSNAME_*`
+/// starts with, where an empty token matches the first entry (`STREQLEN` with length 0).
+fn blender_pass_type(name: &str) -> u32 {
+    let token = name.split('.').next().unwrap_or_default();
+    BLENDER_PASS_TYPES
+        .iter()
+        .find(|(pass, _)| pass.as_bytes().starts_with(token.as_bytes()))
+        .map_or(0, |(_, bit)| *bit)
+}
+
+/// Blender's `order_render_passes` (`render_result.cc`): whether `left` sorts after `right`.
+/// Typed passes come before untyped ones, typed passes sort by type, untyped passes by name, and
+/// equal passes put the left view first, then the right view, then by view id.
+fn exr_pass_sorts_after(left: &ExrSelectionPass<'_>, right: &ExrSelectionPass<'_>) -> bool {
+    let left_type = blender_pass_type(&left.name);
+    let right_type = blender_pass_type(&right.name);
+    if right_type != 0 && left_type == 0 {
+        return true;
+    }
+    if left_type != 0 && right_type == 0 {
+        return false;
+    }
+    if left_type != 0 && right_type != 0 {
+        if left_type != right_type {
+            return left_type > right_type;
+        }
+    } else if left.name != right.name {
+        return left.name > right.name;
+    }
+    if left.view == "left" {
+        return false;
+    }
+    if right.view == "left" {
+        return true;
+    }
+    if left.view == "right" {
+        return false;
+    }
+    if right.view == "right" {
+        return true;
+    }
+    left.view_id < right.view_id
+}
+
+fn compare_exr_passes(
+    left: &ExrSelectionPass<'_>,
+    right: &ExrSelectionPass<'_>,
+) -> std::cmp::Ordering {
+    if exr_pass_sorts_after(left, right) {
+        std::cmp::Ordering::Greater
+    } else if exr_pass_sorts_after(right, left) {
+        std::cmp::Ordering::Less
+    } else {
+        std::cmp::Ordering::Equal
+    }
+}
+
+/// Blender's `BKE_image_multilayer_index` with `image_render_pass_get` (`imbuf` `image.cc`). The
+/// layer is taken by index and the pass by its index in that layer. A view other than 0 takes the
+/// next pass after the requested one that has the same name and view. A pass that is not found
+/// falls back to the layer's first pass. A layer index beyond the layers has no pass.
+fn select_exr_render_pass<'layers, 'image>(
+    layers: &'layers [ExrSelectionLayer<'image>],
+    selection: ImageUserSelection,
+) -> Option<&'layers ExrSelectionPass<'image>> {
+    let layer = layers.get(usize::from(selection.layer))?;
+    let requested = usize::from(selection.pass);
+    let view = usize::from(selection.view);
+    let mut found = None;
+    let mut requested_name: Option<&str> = None;
+    for (index, candidate) in layer.passes.iter().enumerate() {
+        if index == requested {
+            found = Some(index);
+            if view == 0 {
+                break;
+            }
+            requested_name = Some(candidate.name.as_str());
+        } else if let Some(name) = requested_name.filter(|name| !name.is_empty())
+            && candidate.name == name
+            && candidate.view_id == view
+        {
+            found = Some(index);
+            break;
+        }
+    }
+    found
+        .map(|index| &layer.passes[index])
+        .or_else(|| layer.passes.first())
+}
+
+fn exr_pass_channel_layout(pass: &ExrSelectionPass<'_>) -> ([Option<usize>; 4], [char; 4]) {
+    let mut slots = [None; 4];
+    let mut ids = ['\0'; 4];
+    let count = pass.channels.len();
+    if count == 1 {
+        slots[0] = Some(0);
+        ids[0] = pass.channels[0].id;
+        return (slots, ids);
+    }
+    if count == 3 || count == 4 {
+        let first_three = &pass.channels[..3];
+        let lookup = if first_three.iter().any(|channel| channel.id == 'B') {
+            [('R', 0), ('G', 1), ('B', 2), ('A', 3)]
+        } else if first_three.iter().any(|channel| channel.id == 'Y') {
+            [('X', 0), ('Y', 1), ('Z', 2), ('W', 3)]
+        } else {
+            [('U', 0), ('V', 1), ('A', 2), ('\0', 3)]
+        };
+        for (channel_index, channel) in pass.channels.iter().enumerate() {
+            let slot = lookup
+                .iter()
+                .find_map(|(id, slot)| (channel.id == *id).then_some(*slot))
+                .unwrap_or(0);
+            slots[slot] = Some(channel_index);
+            ids[slot] = channel.id;
+        }
+        return (slots, ids);
+    }
+    for (index, channel) in pass.channels.iter().enumerate().take(4) {
+        slots[index] = Some(index);
+        ids[index] = channel.id;
+    }
+    (slots, ids)
+}
+
+fn is_exr_color_pass(channel_count: usize, ids: &[char; 4]) -> bool {
+    if channel_count > ids.len() {
+        return false;
+    }
+    let channel_ids = ids.iter().take(channel_count).copied().collect::<String>();
+    matches!(channel_ids.as_str(), "RGB" | "RGBA" | "R" | "G" | "B" | "A")
+}
 fn image_blob_bytes<'a>(
     blob: Option<&str>,
     image: &Image,

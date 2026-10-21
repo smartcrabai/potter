@@ -120,7 +120,7 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
 }
 
 fn validate(engine: &Engine<'_>, data: &LatticeData, field: &str) -> Result<()> {
-    geom::lattice::deform_mesh(&Mesh::default(), data, None)
+    geom::lattice::deform_mesh(&Mesh::default(), data)
         .map(|_| ())
         .map_err(|error| {
             engine.error(
