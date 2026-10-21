@@ -13,6 +13,7 @@ const SET_FIELDS: &[&str] = &[
     "max_bounces",
     "transparent_max_bounces",
     "film_transparent",
+    "filter_size",
     "engine",
     "use_sequencer",
     "audio_codec",
@@ -116,6 +117,7 @@ pub(super) fn apply(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> 
     let transparent_max_bounces = optional_u32(engine, set, "transparent_max_bounces", 0, 1024)?;
     let motion_blur_samples = optional_u32(engine, set, "motion_blur_samples", 1, 64)?;
     let dicing_rate = optional_f64(engine, set, "dicing_rate", 0.1, 1000.0)?;
+    let filter_size = optional_f64(engine, set, "filter_size", 0.0, 500.0)?;
     let preview_dicing_rate = optional_f64(engine, set, "preview_dicing_rate", 0.1, 1000.0)?;
     let max_subdivisions = optional_u32(engine, set, "max_subdivisions", 0, 16)?;
     let offscreen_dicing_scale =
@@ -270,6 +272,9 @@ pub(super) fn apply(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> 
         }
         if let Some(value) = film_transparent {
             scene.render.film_transparent = value;
+        }
+        if let Some(value) = filter_size {
+            scene.render.filter_size = value;
         }
         if let Some(value) = render_engine {
             scene.render.engine = value;

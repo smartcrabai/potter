@@ -2982,6 +2982,7 @@ fn build_imported_graph(
                 .get("film_transparent")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            filter_size: number_field(&render, "filter_size", 1.5),
             engine: render
                 .get("engine")
                 .and_then(Value::as_str)

@@ -566,6 +566,7 @@ pub(crate) fn rasterize_with_samples(
     background: [u8; 4],
     samples: u32,
     seed: u32,
+    filter_size: f64,
     shader: Option<&dyn SurfaceShader>,
 ) -> Result<RasterOutput> {
     if samples == 0 {
@@ -585,6 +586,7 @@ pub(crate) fn rasterize_with_samples(
             background,
             samples,
             seed,
+            filter_size,
             shader,
         )?;
         let right_output = rasterize_with_samples(
@@ -596,6 +598,7 @@ pub(crate) fn rasterize_with_samples(
             background,
             samples,
             seed,
+            filter_size,
             shader,
         )?;
         let (left_pixels, _) = left_output.rgba.as_chunks_mut::<4>();
@@ -668,6 +671,10 @@ pub(crate) fn rasterize_with_samples(
         )
     })?;
 
+    // Realtime Beauty reconstructs its samples with EEVEE's film filter; the other modes keep each pixel's own samples.
+    let mut film = film_radius(mode, samples, filter_size)
+        .map(|radius| FilmFilter::new(radius, width, height))
+        .transpose()?;
     let mut candidates = Vec::new();
     for y in 0..height {
         for x in 0..width {
@@ -725,8 +732,13 @@ pub(crate) fn rasterize_with_samples(
             if matches!(mode, Mode::Solid | Mode::Beauty | Mode::Wire) {
                 let mut average = [0.0_f64; 4];
                 for sample_index in 0..samples {
-                    let (sample_x, sample_y) = sample_offset(seed, x, y, sample_index);
-                    let (sample_ray, sample_hit) = if sample_index == 0 {
+                    // Without a film the pixel keeps its own pattern, whose first sample is the centre. A film sample is
+                    // jittered over its pixel, the first included, as EEVEE jitters every sample (`pixel_jitter_get`).
+                    let (sample_x, sample_y) = match film.as_ref() {
+                        Some(film) => film.jitter(film_sample_offset(seed, x, y, sample_index)),
+                        None => sample_offset(seed, x, y, sample_index),
+                    };
+                    let (sample_ray, sample_hit) = if sample_index == 0 && film.is_none() {
                         (center_ray, center_hit)
                     } else {
                         let ray = ray_for_subpixel_in_frame(
@@ -787,6 +799,20 @@ pub(crate) fn rasterize_with_samples(
                         average[channel] =
                             average[channel] * previous_weight + sample_color[channel] / count;
                     }
+                    if let Some(film) = film.as_mut() {
+                        // EEVEE shades each sample with its pixel's occlusion, then filters the shaded samples.
+                        let ao = ambient_occlusion
+                            .get(pixel_index)
+                            .copied()
+                            .map_or(1.0, f64::from);
+                        let shaded = [
+                            sample_color[0] * ao,
+                            sample_color[1] * ao,
+                            sample_color[2] * ao,
+                            sample_color[3],
+                        ];
+                        film.splat(x, y, sample_x, sample_y, shaded);
+                    }
                 }
                 // Solid mirrors Blender Workbench, which shows no ambient occlusion by default.
                 let ao_in_color = !matches!(mode, Mode::Solid);
@@ -828,6 +854,14 @@ pub(crate) fn rasterize_with_samples(
         }
     }
 
+    if let Some(film) = &film {
+        for (pixel_index, (colour, weight)) in film.colour.iter().zip(&film.weight).enumerate() {
+            let average = colour.map(|sum| sum / weight.max(f64::MIN_POSITIVE));
+            rgba[pixel_index * 4..pixel_index * 4 + 4].copy_from_slice(&color_to_srgba(average));
+            linear_rgba[pixel_index] = linear_color_to_f32(average);
+        }
+    }
+
     Ok(RasterOutput {
         rgba,
         linear_rgba,
@@ -855,10 +889,20 @@ pub(crate) fn rasterize_with_lines(
     background: [u8; 4],
     samples: u32,
     seed: u32,
+    filter_size: f64,
     shader: Option<&dyn SurfaceShader>,
 ) -> Result<RasterOutput> {
     let mut output = rasterize_with_samples(
-        triangles, camera, width, height, mode, background, samples, seed, shader,
+        triangles,
+        camera,
+        width,
+        height,
+        mode,
+        background,
+        samples,
+        seed,
+        filter_size,
+        shader,
     )?;
     if lines.is_empty() {
         return Ok(output);
@@ -1541,6 +1585,131 @@ fn sample_offset(seed: u32, x: u32, y: u32, sample_index: u32) -> (f64, f64) {
     let x_offset = f64::from(mix_sample_hash(key)) / 4_294_967_296.0;
     let y_offset = f64::from(mix_sample_hash(key ^ 0xa511_e9b3)) / 4_294_967_296.0;
     (x_offset, y_offset)
+}
+
+/// EEVEE's film reconstruction for realtime Beauty (`eevee_film.cc`): every shaded sample is splatted into the output
+/// pixels whose centres lie within `radius` of it, weighted by `film_filter_weight`, and an output pixel is the weighted
+/// mean of the samples that reached it. `colour` and `weight` are per output pixel.
+struct FilmFilter {
+    radius: f64,
+    width: usize,
+    height: usize,
+    colour: Vec<[f64; 4]>,
+    weight: Vec<f64>,
+}
+
+impl FilmFilter {
+    /// The sub-pixel position of a film sample from its offset in the pixel. Below `FRAC_1_SQRT_2` px EEVEE confines
+    /// the jitter to a disk of half the radius about the centre (`eevee_film.cc`, `pixel_jitter_get`, bias 0.5), and
+    /// otherwise it is uniform over the pixel. The square maps onto the disk by Shirley-Chiu's concentric mapping.
+    fn jitter(&self, offset: (f64, f64)) -> (f64, f64) {
+        if self.radius >= std::f64::consts::FRAC_1_SQRT_2 {
+            return offset;
+        }
+        let (u, v) = (2.0 * offset.0 - 1.0, 2.0 * offset.1 - 1.0);
+        let (r, theta) = if u.abs() > v.abs() {
+            (u, std::f64::consts::FRAC_PI_4 * (v / u))
+        } else if v.abs() > 0.0 {
+            (
+                v,
+                std::f64::consts::FRAC_PI_2 - std::f64::consts::FRAC_PI_4 * (u / v),
+            )
+        } else {
+            (0.0, 0.0)
+        };
+        let scale = 0.5 * self.radius * r;
+        (0.5 + scale * theta.cos(), 0.5 + scale * theta.sin())
+    }
+
+    fn new(radius: f64, width: u32, height: u32) -> Result<Self> {
+        let width = usize::try_from(width).map_err(|_| {
+            PotError::new(
+                ErrorCode::LimitExceeded,
+                "image width exceeds platform limits",
+            )
+        })?;
+        let height = usize::try_from(height).map_err(|_| {
+            PotError::new(
+                ErrorCode::LimitExceeded,
+                "image height exceeds platform limits",
+            )
+        })?;
+        let pixel_count = width.checked_mul(height).ok_or_else(|| {
+            PotError::new(
+                ErrorCode::LimitExceeded,
+                "pixel count exceeds platform limits",
+            )
+        })?;
+        Ok(Self {
+            radius,
+            width,
+            height,
+            colour: allocate_filled(pixel_count, [0.0_f64; 4], "film colour")?,
+            weight: allocate_filled(pixel_count, 0.0_f64, "film weight")?,
+        })
+    }
+
+    /// Splats a shaded sample taken at `(sample_x, sample_y)` inside pixel `(x, y)`. Output pixels are visited within
+    /// the window that can hold a centre closer than `radius`; the exact distance test decides the rest.
+    fn splat(&mut self, x: u32, y: u32, sample_x: f64, sample_y: f64, shaded: [f64; 4]) {
+        let sample = (f64::from(x) + sample_x, f64::from(y) + sample_y);
+        let reach = (self.radius + 0.5).ceil() as i64;
+        let radius_squared = self.radius * self.radius;
+        let (width, height) = (self.width as i64, self.height as i64);
+        for dy in -reach..=reach {
+            for dx in -reach..=reach {
+                let px = i64::from(x) + dx;
+                let py = i64::from(y) + dy;
+                if px < 0 || py < 0 || px >= width || py >= height {
+                    continue;
+                }
+                let centre = (px as f64 + 0.5, py as f64 + 0.5);
+                let distance_squared =
+                    (centre.0 - sample.0).powi(2) + (centre.1 - sample.1).powi(2);
+                if distance_squared >= radius_squared {
+                    continue;
+                }
+                let weight = film_filter_weight(self.radius, distance_squared);
+                let index = py as usize * self.width + px as usize;
+                for (sum, value) in self.colour[index].iter_mut().zip(shaded) {
+                    *sum += weight * value;
+                }
+                self.weight[index] += weight;
+            }
+        }
+    }
+}
+
+/// The film radius of realtime Beauty, or `None` for the one-sample render, where EEVEE's filter is zero and the sample
+/// sits at the pixel centre (`update_sample_table`, `sample_count() == 1`). Otherwise EEVEE clamps `scene.r.gauss` to
+/// 0..=100 (`eevee_film.cc`, `filter_radius`). The floor keeps the weights finite; below 0.01 px the samples stay within
+/// a disk of 0.5 px radius, so the filter is a point sample at the centre, as EEVEE renders it.
+fn film_radius(mode: Mode, samples: u32, filter_size: f64) -> Option<f64> {
+    if !matches!(mode, Mode::Beauty) || samples <= 1 {
+        return None;
+    }
+    Some(filter_size.clamp(0.0, 100.0).max(1.0e-4))
+}
+
+/// A film sample's offset inside its pixel, uniform over the pixel and the same for every sample index, the first
+/// included: EEVEE jitters every sample (`pixel_jitter_get`), where the pixel's own pattern keeps the centre.
+fn film_sample_offset(seed: u32, x: u32, y: u32, sample_index: u32) -> (f64, f64) {
+    let key = seed
+        ^ x.wrapping_mul(0x9e37_79b9)
+        ^ y.wrapping_mul(0x85eb_ca6b)
+        ^ sample_index.wrapping_mul(0xc2b2_ae35)
+        ^ 0x5bd1_e995;
+    let x_offset = f64::from(mix_sample_hash(key)) / 4_294_967_296.0;
+    let y_offset = f64::from(mix_sample_hash(key ^ 0xa511_e9b3)) / 4_294_967_296.0;
+    (x_offset, y_offset)
+}
+
+/// EEVEE's `film_filter_weight`: a Gaussian fitted to Blackman-Harris, with a standard deviation of 0.284 radii
+/// (`eevee_film_shared.hh`).
+fn film_filter_weight(radius: f64, distance_squared: f64) -> f64 {
+    const SIGMA: f64 = 0.284;
+    let r = distance_squared / (radius * radius);
+    (-0.5 / (SIGMA * SIGMA) * r).exp()
 }
 
 fn mix_sample_hash(mut value: u32) -> u32 {
@@ -2489,8 +2658,19 @@ mod tests {
             object_index: 7,
             element_index: 0,
         };
-        let output =
-            rasterize_with_lines(&[], &[line], &camera, 64, 32, Mode::Id, [0; 4], 1, 0, None)?;
+        let output = rasterize_with_lines(
+            &[],
+            &[line],
+            &camera,
+            64,
+            32,
+            Mode::Id,
+            [0; 4],
+            1,
+            0,
+            1.5,
+            None,
+        )?;
         assert!(
             output.ids.contains(&7),
             "the stroke behind the view axis must reach the image"
@@ -2524,6 +2704,7 @@ mod tests {
             [0; 4],
             1,
             0,
+            1.5,
             None,
         )?;
         let mut drawn = 0_usize;
@@ -2589,6 +2770,7 @@ mod line_tests {
             [242, 242, 242, 255],
             1,
             0,
+            1.5,
             None,
         );
         assert!(output.is_ok());
@@ -2714,6 +2896,7 @@ mod smooth_shading_tests {
             [0, 0, 0, 255],
             1,
             0,
+            1.5,
             shader,
         )
         .expect("triangle rasterizes")

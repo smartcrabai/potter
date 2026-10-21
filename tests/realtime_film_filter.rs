@@ -1,0 +1,140 @@
+//! Realtime Beauty's film filter (`render.filter_size`, Blender's Filter Size), checked against Blender
+//! 5.2.2's EEVEE on a sub-pixel edge.
+//!
+//! `fixtures/native_oracle/eevee_film_filter.py` renders a white emitter whose edge lies at pixel column 32.3 of a
+//! 64 px frame, once per filter size, with EEVEE at 256 samples. The test imports the saved `.blend` (Filter Size 1.5)
+//! and renders the same frame with `pot render --engine realtime` at each filter size, with 256 samples. Each
+//! column is compared as the mean over the rows, against EEVEE's column profile for that size.
+//!
+//! Blender-gated: with `POTTER_REQUIRE_BLENDER` set, a missing Blender fails the test.
+
+#[path = "common/blender_checked.rs"]
+mod blender_checked;
+#[path = "common/native_oracle.rs"]
+#[expect(
+    dead_code,
+    reason = "each test binary uses a subset of the shared oracle helpers"
+)]
+mod native_oracle;
+#[path = "common/process.rs"]
+mod process;
+
+use std::{error::Error, fs, path::Path};
+
+use native_oracle::{
+    TestResult, apply_operations, floats, import_blend, pot, read_scene, run_blender_arguments,
+    write_script,
+};
+use potter_core::image::{ImageInterpolation, load_image_data, sample};
+use potter_core::model::Image;
+use serde_json::{Value, json};
+use tempfile::tempdir;
+
+/// The scene and EEVEE renders (`eevee_film_filter.py`).
+const SCRIPT: &str = include_str!("fixtures/native_oracle/eevee_film_filter.py");
+
+/// Render settings shared with `eevee_film_filter.py`, and the sample count of the realtime render.
+const RESOLUTION: u32 = 64;
+const SAMPLES: u32 = 256;
+
+/// The filter sizes compared, as the keys of the oracle's `profiles`. `0.01` is the point sample below the
+/// jitter threshold, `0.5` a jitter inside a half-pixel disk, and `1.5` Blender's default.
+const FILTER_SIZES: [&str; 3] = ["0.01", "0.5", "1.5"];
+
+/// The columns compared: the edge at pixel 32.3 and the neighbours that a filter of 1.5 px reaches.
+const COLUMNS: std::ops::RangeInclusive<usize> = 28..=36;
+
+/// Linear tolerance on a column's row-averaged red value against EEVEE. PROVISIONAL: it is not yet derived from the
+/// seed spread of Potter's realtime render at `SAMPLES`; the lane must measure that spread and keep every margin at
+/// three sigma or more, adjusting the sample count and never this bound.
+const TOLERANCE: f64 = 0.03;
+
+/// The mean red value of each column of the image `id`, averaged over the rows, read with Potter's own EXR loader.
+fn column_profile(project: &Path, id: &str) -> Result<Vec<f64>, Box<dyn Error>> {
+    let scene = read_scene(project)?;
+    let image: Image = serde_json::from_value(scene["images"][id].clone())?;
+    let data = load_image_data(&image, project, ImageInterpolation::Closest)?;
+    let size = RESOLUTION as usize;
+    let texels = f64::from(RESOLUTION);
+    Ok((0..size)
+        .map(|column| {
+            let u = (column as f64 + 0.5) / texels;
+            let total: f64 = (0..size)
+                .map(|row| sample(&data, [u, (row as f64 + 0.5) / texels], false)[0])
+                .sum();
+            total / size as f64
+        })
+        .collect())
+}
+
+#[test]
+fn realtime_film_filter_matches_eevee_column_profiles() -> TestResult {
+    let Some(blender) = blender_checked::blender_executable() else {
+        return Ok(());
+    };
+    let root = tempdir()?;
+    let script = write_script(root.path(), "eevee_film_filter.py", SCRIPT)?;
+    let blend = root.path().join("film_filter.blend");
+    let oracle_json = root.path().join("eevee_film_filter.json");
+    let eevee_dir = root.path().join("eevee");
+    run_blender_arguments(
+        &blender,
+        &script,
+        None,
+        &[blend.as_path(), oracle_json.as_path(), eevee_dir.as_path()],
+    )?;
+    let oracle: Value = serde_json::from_slice(&fs::read(&oracle_json)?)?;
+
+    let (project, _) = import_blend(&blender, root.path(), "project", &blend)?;
+    let scene = read_scene(&project)?;
+    let active = scene["active_scene"]
+        .as_str()
+        .ok_or("active scene is missing")?
+        .to_owned();
+
+    for (index, size) in FILTER_SIZES.iter().enumerate() {
+        let filter_size: f64 = size.parse()?;
+        let applied = apply_operations(
+            &project,
+            root.path(),
+            json!([
+                {"op": "render.update", "target": {"id": active}, "set": {"resolution_x": RESOLUTION, "resolution_y": RESOLUTION, "samples": SAMPLES, "seed": 0, "filter_size": filter_size}}
+            ]),
+        )?;
+        assert_eq!(applied["ok"], true, "{applied}");
+
+        let frames = root.path().join(format!("frames_{index}"));
+        let rendered = pot()
+            .arg("render")
+            .arg(&project)
+            .args(["--engine", "realtime", "--format", "exr", "--out"])
+            .arg(&frames)
+            .arg("--json")
+            .output()?;
+        assert!(
+            rendered.status.success(),
+            "realtime render failed: {}",
+            String::from_utf8_lossy(&rendered.stdout)
+        );
+        let id = format!("film_{index}");
+        let loaded = apply_operations(
+            &project,
+            root.path(),
+            json!([{"op": "image.load", "id": id, "path": frames.join("frame_0001.exr").to_string_lossy()}]),
+        )?;
+        assert_eq!(loaded["ok"], true, "{loaded}");
+
+        let actual = column_profile(&project, &id)?;
+        let expected = floats(&oracle["profiles"][*size])?;
+        for column in COLUMNS {
+            let deviation = (actual[column] - expected[column]).abs();
+            assert!(
+                deviation <= TOLERANCE,
+                "filter {size}: column {column} is {}, EEVEE {}",
+                actual[column],
+                expected[column]
+            );
+        }
+    }
+    Ok(())
+}

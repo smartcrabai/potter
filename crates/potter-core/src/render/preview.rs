@@ -232,6 +232,7 @@ pub fn render_previews(
                 background,
                 1,
                 0,
+                scene.render.filter_size,
                 shader.as_deref(),
             )?
         };
@@ -392,6 +393,7 @@ pub(crate) fn render_camera_frame(
             background,
             samples,
             seed,
+            scene.render.filter_size,
             shader.as_deref(),
         )?
     };

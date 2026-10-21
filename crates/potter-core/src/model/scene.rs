@@ -1182,6 +1182,10 @@ pub struct RenderSettings {
     )]
     pub transparent_max_bounces: u32,
     pub film_transparent: bool,
+    /// Blender's `render.filter_size` (`scene.r.gauss`, `rna_scene.cc`): the reconstruction radius, in pixels, of
+    /// EEVEE's film (`eevee_film.cc`). Realtime Beauty uses it; Solid and the path tracer do not.
+    #[serde(default = "default_filter_size")]
+    pub filter_size: f64,
     pub engine: String,
     pub use_sequencer: bool,
     pub audio_codec: String,
@@ -1235,6 +1239,7 @@ impl Default for RenderSettings {
             max_bounces: 4,
             transparent_max_bounces: 8,
             film_transparent: false,
+            filter_size: default_filter_size(),
             engine: "path".to_owned(),
             use_sequencer: false,
             audio_codec: "wav".to_owned(),
@@ -1254,6 +1259,10 @@ impl Default for RenderSettings {
 
 fn default_shutter() -> f64 {
     0.5
+}
+
+fn default_filter_size() -> f64 {
+    1.5
 }
 
 fn default_motion_blur_samples() -> u32 {
