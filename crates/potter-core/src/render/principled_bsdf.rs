@@ -136,19 +136,19 @@ fn half_vector_pdf(normal: DVec3, roughness: f64, view: DVec3, light: DVec3) -> 
 }
 
 /// Diffuse lobe of the Principled BSDF: Lambert under the dielectric-layering weight, times reflectance, less the
-/// share the subsurface closure takes. The raster preview has no subsurface closure, so it shades the lobe without
-/// that share (the realtime gap); the path tracer uses `evaluate`, which keeps it.
+/// share the subsurface closure takes. This is the lobe `evaluate` uses, so the path tracer's direct light keeps the
+/// share. The raster preview has no subsurface closure and shades the lobe without it (`without_subsurface`).
 pub(crate) fn diffuse_coefficient(params: &BsdfParams, layers: &Layers) -> DVec3 {
-    let without_subsurface = BsdfParams {
+    diffuse_lobe(params, layers.normal, layers.view, layers.lower)
+}
+
+/// The parameters with no subsurface closure, for the raster preview, which shades the diffuse lobe without the
+/// subsurface share (the realtime gap). The path tracer does not use this.
+pub(crate) fn without_subsurface(params: &BsdfParams) -> BsdfParams {
+    BsdfParams {
         subsurface_weight: 0.0,
         ..*params
-    };
-    diffuse_lobe(
-        &without_subsurface,
-        layers.normal,
-        layers.view,
-        layers.lower,
-    )
+    }
 }
 
 /// The Lambert weight of the dielectric-layered diffuse lobe, before the 1/π and the albedo (Cycles' diffuse weight).
