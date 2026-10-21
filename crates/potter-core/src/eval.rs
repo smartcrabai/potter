@@ -2972,6 +2972,7 @@ fn apply_mesh_cache_modifier(
         return Ok(Vec::new());
     }
     let (bytes, _) = read_cache_resource(doc, project_root, &resource_id)?;
+    crate::cache_sequence::reject_usd_cache(&bytes, resource_id.as_str())?;
     crate::geom::modifiers::attributes::evaluate_mesh_cache(
         mesh,
         source_mesh,
@@ -3063,6 +3064,7 @@ fn apply_mesh_sequence_cache_modifier(
     } else {
         read_cache_resource(doc, project_root, &resource_id)?
     };
+    crate::cache_sequence::reject_usd_cache(&bytes, resource_id.as_str())?;
     crate::geom::mesh_cache::evaluate(
         mesh,
         modifier,
