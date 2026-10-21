@@ -2188,7 +2188,7 @@ pub fn mesh_to_fog_volume_with_transform(
     }
     renormalize_signed_distances(
         &mut signed_distances,
-        &active,
+        &mut active,
         dims,
         voxel_size,
         interior_distance,
@@ -2587,10 +2587,11 @@ impl NarrowBand<'_> {
 /// `OpenVDB`'s renormalisation of the narrow band (`mesh_to_volume_internal::OffsetValues`,
 /// `Renormalize`, `MinCombine`, and `InactivateValues`, MeshToVolume.h 2827-3046): every active voxel
 /// moves back by 0.8 voxels, takes one Godunov step on the offset values of its neighbours, keeps the
-/// smaller of the two, and is offset forward again. Voxels outside the band are left as background.
+/// smaller of the two, and is offset forward again. A voxel past either band width is set to the
+/// background and made inactive, as `InactivateValues` does, so the active set is the band itself.
 fn renormalize_signed_distances(
     distances: &mut [f32],
-    active: &[bool],
+    active: &mut [bool],
     dims: [usize; 3],
     voxel_size: f32,
     interior_distance: f32,
@@ -2644,13 +2645,19 @@ fn renormalize_signed_distances(
         let shifted = *value - offset;
         let restore = offset - epsilon;
         *value = shifted.min(renormalized[index]) + restore;
-        // InactivateValues: a band value past either width is background.
+        // InactivateValues clamps a band value past either width to the background. `sdfToFogVolume`
+        // (`SDFVoxelsToFogVolume`) then keeps only the strictly negative values active: a value of zero or
+        // more becomes an inactive zero. Blender keeps the filled interior active too, so the inside is not
+        // deactivated here; it is enclosed by the surface, so the active bounds are the surface's.
         if *value < 0.0 {
             if *value <= -interior_distance {
                 *value = -interior_distance;
             }
-        } else if *value >= voxel_size || value.is_nan() {
-            *value = voxel_size;
+        } else {
+            if *value >= voxel_size || value.is_nan() {
+                *value = voxel_size;
+            }
+            active[index] = false;
         }
     }
 }
