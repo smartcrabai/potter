@@ -98,8 +98,10 @@ impl CageRayCache {
                 "mesh deform cage triangles do not match its polygons",
             ));
         }
-        // Leaf `i` of the tree is corner triangle `i`. Blender's `bvhtree_new_common` (`bvhutils.cc`) builds
-        // a binary tree over the three slabs with the `FLT_EPSILON` leaf inflation (`create_kdop_hull`).
+        // Mesh Deform binds on `mdb->bvhdata = cagemesh->bvh_corner_tris()` (`meshlaplacian.cc:1596-1597`),
+        // whose tree is `create_tree_from_tris` (`bvhutils.cc:510-520`): `bvhtree_new_common`
+        // (`bvhutils.cc:431-436`) = `BLI_bvhtree_new(n, 0.0, 2, 6)`, the epsilon clamped to `FLT_EPSILON`
+        // (`BLI_kdopbvh.cc:870`), with each corner triangle inserted as three points. Leaf `i` is corner triangle `i`.
         let leaf_bv: Vec<_> = corner_tris
             .iter()
             .map(|t| kdop_bounds(&[points[t[0]], points[t[1]], points[t[2]]], f32::EPSILON, 6))
