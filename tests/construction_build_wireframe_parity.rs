@@ -17,6 +17,7 @@ use serde_json::{Map, Value, json};
 const BUILD_FIXTURE: &str = include_str!("fixtures/construction_p/build_wireframe/build.json");
 const WIREFRAME_FIXTURE: &str =
     include_str!("fixtures/construction_p/build_wireframe/wireframe.json");
+const SUBJECT_NAME: &str = "ConstructionSubject";
 
 fn number(value: &Value) -> f64 {
     value.as_f64().expect("fixture number")
@@ -498,6 +499,7 @@ fn run_fixture(document: &str, modifier_type: &str) {
                 std::slice::from_ref(&modifier),
                 &Registry::<NodeGroup>::new(),
                 frame,
+                SUBJECT_NAME,
                 Some(
                     variant["material_slots"]
                         .as_u64()
@@ -581,6 +583,7 @@ fn build_face_prefix_keeps_valid_custom_normal_corner_order() {
         &[modifier],
         &Registry::<NodeGroup>::new(),
         2.0,
+        SUBJECT_NAME,
         None,
     )
     .expect("Build preserves the corner-normal state on a face prefix")
@@ -642,6 +645,7 @@ fn wireframe_material_offset_rejects_non_integer_values() {
             &[modifier],
             &Registry::<NodeGroup>::new(),
             1.0,
+            SUBJECT_NAME,
             Some(3),
         )
         .is_err()

@@ -12,6 +12,7 @@ mod scene;
 mod sequence;
 mod studio;
 mod wireframe;
+mod subsurface;
 
 pub use pick::pick;
 pub use preview::{PreviewRequest, render_previews};

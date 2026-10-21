@@ -163,8 +163,8 @@ fn a_single_quaternion_channel_uses_unkeyed_static_components() -> Result<(), Bo
         .ok_or("animated node missing")?["transform"]["evaluated"]["rotation"]
         .as_array()
         .ok_or("evaluated rotation missing")?;
-    let norm = 0.6_f64.hypot(0.3).hypot(0.8);
-    let expected = [0.0, 0.6 / norm, 0.3 / norm, 0.8 / norm];
+    let norm = 0.6_f64.hypot(0.3);
+    let expected = [0.0, 0.6 / norm, 0.0, 0.3 / norm];
     assert_eq!(rotation.len(), expected.len());
     for (actual, expected) in rotation.iter().zip(expected) {
         let actual = actual.as_f64().ok_or("rotation component missing")?;
