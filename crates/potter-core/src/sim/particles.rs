@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use crate::{
     blender_rng::{BlenderRng, psys_frand},
     error::{ErrorCode, PotError, Result},
-    geom::Mesh,
+    geom::{Mesh, normals::geometric_vertex_normals},
 };
 
 const MAX_PARTICLES: u64 = 1_000_000;
@@ -1119,7 +1119,6 @@ fn prepare_geometry(mesh: &Mesh) -> Result<(Vec<Triangle>, Vec<DVec3>)> {
     }
 
     let mut triangles = Vec::with_capacity(triangle_count);
-    let mut vertex_normals = vec![DVec3::ZERO; mesh.vertices.len()];
     let mut cumulative_area = 0.0_f64;
     let mut triangle_error = None;
     mesh.for_each_triangle_with_face(|source_face, triangle| {
@@ -1176,20 +1175,13 @@ fn prepare_geometry(mesh: &Mesh) -> Result<(Vec<Triangle>, Vec<DVec3>)> {
             frame_normal,
             cumulative_area,
         });
-        vertex_normals[first] += area_normal;
-        vertex_normals[second] += area_normal;
-        vertex_normals[third] += area_normal;
     })
     .map_err(|error| invalid(&format!("particle emitter mesh is invalid: {error}")))?;
     if let Some(error) = triangle_error {
         return Err(error);
     }
-    for normal in &mut vertex_normals {
-        if !normal.is_finite() {
-            return Err(invalid("particle emitter vertex normal is non-finite"));
-        }
-        *normal = normal.normalize_or_zero();
-    }
+    let positions: Vec<DVec3> = mesh.vertices.iter().map(|vertex| vertex.co).collect();
+    let vertex_normals = geometric_vertex_normals(mesh, &positions)?;
     Ok((triangles, vertex_normals))
 }
 
@@ -2355,6 +2347,85 @@ mod tests {
         ChildSettings, Particle, ParticleLifeState, ParticlePathInterpolation, ParticlePathKey,
         append_simple_children, particle_path, sample_path, simulate,
     };
+
+    #[test]
+    fn emitter_vertex_normals_are_angle_weighted_like_blender() {
+        // A cube corner touches three faces at right angles, so Blender's angle-weighted vertex
+        // normal is (-1, 1, 1) / sqrt(3). Summing triangle areas instead counts the face whose
+        // diagonal passes through the corner twice, giving (-2, 1, 1) / sqrt(6).
+        let cube = [
+            (-1.0, -1.0, -1.0),
+            (1.0, -1.0, -1.0),
+            (1.0, 1.0, -1.0),
+            (-1.0, 1.0, -1.0),
+            (-1.0, -1.0, 1.0),
+            (1.0, -1.0, 1.0),
+            (1.0, 1.0, 1.0),
+            (-1.0, 1.0, 1.0),
+        ];
+        let faces: [[u32; 4]; 6] = [
+            [4, 5, 6, 7],
+            [0, 4, 7, 3],
+            [3, 7, 6, 2],
+            [0, 3, 2, 1],
+            [1, 2, 6, 5],
+            [0, 1, 5, 4],
+        ];
+        let edges: [[u32; 2]; 12] = [
+            [4, 5],
+            [5, 6],
+            [6, 7],
+            [7, 4],
+            [0, 1],
+            [1, 2],
+            [2, 3],
+            [3, 0],
+            [0, 4],
+            [1, 5],
+            [2, 6],
+            [3, 7],
+        ];
+        let mesh = Mesh {
+            vertices: cube
+                .iter()
+                .enumerate()
+                .map(|(index, &(x, y, z))| Vertex {
+                    id: index as u32,
+                    co: DVec3::new(x, y, z),
+                })
+                .collect(),
+            edges: edges
+                .iter()
+                .enumerate()
+                .map(|(index, &vertices)| Edge {
+                    id: index as u32,
+                    vertices,
+                })
+                .collect(),
+            faces: faces
+                .iter()
+                .enumerate()
+                .map(|(index, vertices)| Face {
+                    id: index as u32,
+                    vertices: vertices.to_vec(),
+                    material_index: 0,
+                })
+                .collect(),
+            next_id: IdCounters {
+                vertex: 8,
+                edge: 12,
+                face: 6,
+            },
+            ..Mesh::default()
+        };
+        let (_, normals) = super::prepare_geometry(&mesh).expect("cube emitter geometry");
+        let expected = DVec3::new(-1.0, 1.0, 1.0).normalize();
+        assert!(
+            (normals[7] - expected).length() < 1.0e-5,
+            "corner normal {:?}",
+            normals[7]
+        );
+    }
 
     #[test]
     fn emission_is_deterministic_and_tracks_particle_age() {
