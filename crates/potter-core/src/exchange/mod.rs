@@ -1669,6 +1669,7 @@ mod tests {
                 kind: "mesh".to_owned(),
                 data: Some(data_id),
                 modifiers: vec![Modifier {
+                    baked_ocean_cache: None,
                     id: Id::new("mirror_modifier")?,
                     modifier_type: "mirror".to_owned(),
                     name: "Mirror".to_owned(),

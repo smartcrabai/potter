@@ -3134,6 +3134,7 @@ mod tests {
             json!({"Empty": {"v0": 0.0, "v1": 0.0, "v2": 0.0}}),
         );
         let modifier = crate::model::Modifier {
+            baked_ocean_cache: None,
             id: crate::model::Id::new("empty_mask").unwrap(),
             modifier_type: "mask".to_owned(),
             name: "Mask".to_owned(),

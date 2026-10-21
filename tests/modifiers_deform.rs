@@ -2059,6 +2059,7 @@ with open(sys.argv[-1], 'w', encoding='utf-8') as output:
             y_subdivisions: 17,
         })?;
         let modifier = Modifier {
+            baked_ocean_cache: None,
             id: Id::new("sea")?,
             modifier_type: "ocean".to_owned(),
             name: "Ocean".to_owned(),

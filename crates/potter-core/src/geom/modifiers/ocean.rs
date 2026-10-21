@@ -1299,6 +1299,8 @@ mod tests {
             binding_data: None,
             baked_ocean_cache: None,
             runtime: crate::model::ModifierRuntime::default(),
+            show_viewport: true,
+            show_render: true,
         })
     }
 

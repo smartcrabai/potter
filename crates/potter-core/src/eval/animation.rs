@@ -1537,6 +1537,8 @@ mod tests {
             action_id,
             Action {
                 name: "Unbound Ocean Time".to_owned(),
+                slots: Vec::new(),
+                active_slots: std::collections::BTreeMap::new(),
                 fcurves: vec![ocean_time_curve(0.5, 2.5)],
                 modifier_bindings: std::collections::BTreeMap::from([(0, Vec::new())]),
             },

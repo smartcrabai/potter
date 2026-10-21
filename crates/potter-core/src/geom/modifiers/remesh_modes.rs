@@ -144,6 +144,7 @@ mod tests {
     fn octree_modes_map_depth_to_geometry_resolution() -> Result<(), Box<dyn std::error::Error>> {
         let source = Mesh::box_mesh(BoxParams::default())?;
         let modifier = Modifier {
+            baked_ocean_cache: None,
             id: Id::new("remesh_test")?,
             modifier_type: "remesh".to_owned(),
             name: "Remesh".to_owned(),

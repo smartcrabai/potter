@@ -208,6 +208,7 @@ const BENT_FACES: [[usize; 4]; 30] = [
 
 fn skin_modifier(params: Value) -> Modifier {
     Modifier {
+        baked_ocean_cache: None,
         id: Id::new("modifier_skin").unwrap(),
         modifier_type: "skin".to_owned(),
         name: "skin".to_owned(),
@@ -392,6 +393,7 @@ fn hook_uses_current_indices_after_skin_drops_origindex() {
     let mesh = skeleton(&LINE_INPUT_VERTICES, &LINE_EDGES, Some(&LINE_SKIN));
     let skin = skin_modifier(json!({}));
     let hook = Modifier {
+        baked_ocean_cache: None,
         id: Id::new("hook_after_skin").unwrap(),
         modifier_type: "hook".to_owned(),
         name: "Hook after Skin".to_owned(),

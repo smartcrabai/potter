@@ -197,6 +197,7 @@ fn modifier_for(case: &Value) -> Modifier {
         values.insert("loose_edges".to_owned(), loose_edges.clone());
     }
     Modifier {
+        baked_ocean_cache: None,
         id: Id::new("construction_weld_parity").expect("static modifier ID"),
         modifier_type: "weld".to_owned(),
         name: "Weld parity".to_owned(),

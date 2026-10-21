@@ -1271,6 +1271,7 @@ mod multires_selection_tests {
 
     fn multires_modifier(id: &str, show_viewport: bool) -> Modifier {
         Modifier {
+            baked_ocean_cache: None,
             id: Id::new(id).unwrap(),
             modifier_type: "multires".to_owned(),
             name: "Multires".to_owned(),

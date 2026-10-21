@@ -7457,6 +7457,7 @@ mod tests {
 
     fn modifier(enabled: bool, modifier_type: &str) -> Modifier {
         Modifier {
+            baked_ocean_cache: None,
             id: Id::new("modifier_one").unwrap(),
             modifier_type: modifier_type.to_owned(),
             name: "Modifier".to_owned(),
