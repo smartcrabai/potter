@@ -2764,10 +2764,22 @@ pub(crate) struct MeshCacheSample {
     pub has_multiple_topology_samples: bool,
     /// Named UV parameters in file order, with rows still in Alembic face winding.
     pub uv_layers: Option<Vec<ExchangeUvLayer>>,
-    pub colors: Option<(String, Vec<Vec<f64>>)>,
+    /// The last UV layer in file order, which Blender's read without polygons fills (oracle
+    /// `read_uv_only`: the second of two UV layers is written, the first stays zero).
+    pub uv_primary: Option<String>,
+    pub colors: Vec<CacheColorLayer>,
     pub velocities: Option<(String, Vec<Vec<f64>>)>,
     /// Per-corner normals in Potter's winding, when the cache stores normals.
     pub normals: Option<Vec<[f64; 3]>>,
+}
+
+/// One color layer of a cache sample, named by its `GeomParam`'s `sourceName`. Its values are decoded
+/// and placed in corner or point storage exactly as the importer places Alembic colors.
+#[derive(Clone, Debug)]
+pub(crate) struct CacheColorLayer {
+    pub name: String,
+    pub domain: ColorDomain,
+    pub values: Vec<[f64; 4]>,
 }
 
 /// Read a `PolyMesh`'s evaluated attributes and time samples from an Ogawa archive.
@@ -2840,9 +2852,12 @@ pub(crate) fn read_mesh_cache(
         Vec::new()
     };
     let uv_names = uv_layer_names(&uv);
-    let color = read_color
-        .then(|| property(&geom.children, "color").or_else(|| property(&geom.children, "Cs")))
-        .flatten();
+    let uv_primary = read_uv.then(|| uv_names.last().cloned()).flatten();
+    let color = if read_color {
+        color_geom_parameters(geom)
+    } else {
+        Vec::new()
+    };
     let velocity = if velocity_name.is_empty() {
         None
     } else {
@@ -2862,7 +2877,7 @@ pub(crate) fn read_mesh_cache(
     for parameter in uv
         .iter()
         .copied()
-        .chain(color)
+        .chain(color.iter().copied())
         .chain(normals)
         .chain(velocity)
     {
@@ -2941,6 +2956,8 @@ pub(crate) fn read_mesh_cache(
             })
             .transpose()?;
         let colors = color
+            .iter()
+            .copied()
             .map(|parameter| {
                 let values = geomparam_values_property(parameter)?;
                 validate_cache_parameter_samples(values, sample_count)?;
@@ -2958,10 +2975,15 @@ pub(crate) fn read_mesh_cache(
                     extent,
                     sample_slot(values, sample_index),
                 )?;
-                let tuples = potter_scoped_values(&file_faces, &scope, tuples)?;
-                Ok((scope, tuples))
+                let (domain, values) =
+                    canonical_color_values(&file_faces, points.len(), &scope, &tuples)?;
+                Ok(CacheColorLayer {
+                    name: geomparam_source_name(parameter),
+                    domain,
+                    values,
+                })
             })
-            .transpose()?;
+            .collect::<Result<Vec<_>>>()?;
         let velocities = velocity
             .map(|parameter| {
                 let values = geomparam_values_property(parameter)?;
@@ -3025,6 +3047,7 @@ pub(crate) fn read_mesh_cache(
             positions: points,
             faces: reversed_faces(&file_faces),
             uv_layers,
+            uv_primary: uv_primary.clone(),
             colors,
             velocities,
             normals: cache_normals,
@@ -4152,7 +4175,11 @@ fn decompose_matrix(matrix: DMat4) -> (DVec3, DQuat, DVec3) {
     )
 }
 
+/// Alembic transforms are float32 on disk. A valid TRS matrix reads back within about 6e-8 relative
+/// (Blender's own readback of `animated.abc`), so eight float32 epsilons separate that noise from
+/// real shear, which is far larger.
 fn matrix_to_transform(matrix_values: [f64; 16]) -> Result<Transform> {
+    let tolerance = 8.0 * f64::from(f32::EPSILON);
     if matrix_values.iter().any(|value| !value.is_finite()) {
         return Err(import_error("Alembic Xform matrix is not finite"));
     }
@@ -4173,7 +4200,7 @@ fn matrix_to_transform(matrix_values: [f64; 16]) -> Result<Transform> {
     if matrix_values
         .iter()
         .zip(reconstructed)
-        .any(|(original, value)| (*original - value).abs() > 1.0e-8 * (1.0 + original.abs()))
+        .any(|(original, value)| (*original - value).abs() > tolerance * (1.0 + original.abs()))
     {
         return Err(unsupported(
             "transform.matrix_shear",

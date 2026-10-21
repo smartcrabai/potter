@@ -535,6 +535,7 @@ fn blender_mesh_cache_pc2_and_mdd_match_native_pot() -> TestResult {
                 "id": spec["id"],
                 "file": file,
                 "groups": spec["groups"],
+                "modifier": modifier,
                 "frames": spec["frames"],
             })
         })

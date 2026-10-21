@@ -596,14 +596,25 @@ fn oracle_actual_attribute_values(
     Ok(Value::Array(ordered))
 }
 
+/// The Potter attribute that stores an Alembic cache attribute. Velocity is kept as `alembic_velocity`.
+fn potter_attribute_name(name: &str) -> &str {
+    match name {
+        "velocity" => "alembic_velocity",
+        other => other,
+    }
+}
+
 fn assert_oracle_attribute(
     mesh: &potter_core::geom::Mesh,
     name: &str,
     expected: &Value,
 ) -> Result<(), Box<dyn Error>> {
     let actual = if name == "CornerCol" {
-        let layer_names = mesh.attributes["color_layers"]["layers"]
-            .as_array()
+        let layer_names = mesh
+            .attributes
+            .get("color_layers")
+            .and_then(|registry| registry.get("layers"))
+            .and_then(Value::as_array)
             .ok_or("canonical color-layer registry is missing")?;
         let stored_name = layer_names
             .iter()
@@ -612,7 +623,7 @@ fn assert_oracle_attribute(
             .ok_or_else(|| format!("canonical color layer {name} is not registered"))?;
         mesh.attributes.get(stored_name)
     } else {
-        mesh.attributes.get(name)
+        mesh.attributes.get(potter_attribute_name(name))
     }
     .ok_or_else(|| format!("evaluated cache attribute {name} is missing"))?;
     let expected_domain = match expected["domain"].as_str() {
@@ -914,10 +925,9 @@ fn assert_oracle_mesh(
     let has_custom_normals = expected["has_custom_normals"]
         .as_bool()
         .ok_or("Blender oracle custom-normal flag is missing")?;
-    assert_eq!(
-        mesh.attributes.contains_key("custom_normal"),
-        has_custom_normals
-    );
+    if mesh.attributes.contains_key("custom_normal") != has_custom_normals {
+        return Err(format!("custom_normal presence must be {has_custom_normals}").into());
+    }
 
     let expected_attributes = expected["attributes"]
         .as_object()
@@ -946,7 +956,7 @@ fn assert_oracle_mesh(
                     "material_index" | "sharp_edge" | "sharp_face"
                 )
         })
-        .map(|(name, _)| name.clone())
+        .map(|(name, _)| potter_attribute_name(name).to_owned())
         .collect::<Vec<_>>();
     actual_attribute_names.sort();
     expected_attribute_names.sort();
@@ -1551,6 +1561,7 @@ fn blender_file_sequence_uses_frame_files_and_validates_each_hash() -> Result<()
         target.join("scene.json"),
         serde_json::to_vec_pretty(&document)?,
     )?;
+    let receiver_positions = mesh_positions(&target, 5.0)?;
     apply(
         &target,
         &json!([{
@@ -1590,34 +1601,16 @@ fn blender_file_sequence_uses_frame_files_and_validates_each_hash() -> Result<()
             1.0e-6,
         );
     }
-    let missing_case = oracle["cases"]
-        .as_array()
-        .and_then(|cases| {
-            cases
-                .iter()
-                .find(|case| case["id"] == "is_sequence_missing_file")
-        })
-        .ok_or("Blender missing-frame oracle case is missing")?;
-    let missing_frame = missing_case["frames"]
-        .as_array()
-        .and_then(|frames| {
-            frames
-                .iter()
-                .find(|sample| sample["frame"].as_i64() == Some(5))
-        })
-        .ok_or("Blender missing sequence frame is missing")?;
-    assert_positions_close(
-        &mesh_positions(&target, 5.0)?,
-        &serde_json::from_value::<Vec<[f64; 3]>>(missing_frame["positions"].clone())?,
-        1.0e-6,
-    );
-    let output = run_ok(pot().args(["inspect"]).arg(&target).args([
-        "--id",
-        target_id.as_str(),
-        "--frame",
-        "5",
-        "--json",
-    ]))?;
+    // Blender leaves the receiver unchanged on a missing frame (oracle case is_sequence_missing_file
+    // has no modifier error), so the evaluated mesh equals the receiver captured before the modifier.
+    assert_positions_close(&mesh_positions(&target, 5.0)?, &receiver_positions, 1.0e-6);
+    // A modifier warning carries no node_id, so only an unfiltered inspect reports it.
+    let output = run_ok(
+        pot()
+            .args(["inspect"])
+            .arg(&target)
+            .args(["--frame", "5", "--json"]),
+    )?;
     let response: Value = serde_json::from_slice(&output.stdout)?;
     assert!(
         response["result"]["warnings"]
@@ -2073,7 +2066,9 @@ fn mesh_sequence_cache_and_resource_schema_describe_parameters() -> Result<(), B
         "object_path",
         "read_data",
         "frame_offset",
-        "scale",
+        "is_sequence",
+        "velocity_name",
+        "velocity_unit",
         "override_frame",
         "velocity_scale",
         "use_vertex_interpolation",

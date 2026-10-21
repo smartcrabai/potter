@@ -719,12 +719,13 @@ fn mesh_cache_factor_and_inverted_group_use_blender_f32_blends() -> Result<(), B
         .attributes
         .insert("vertex_groups".to_owned(), json!({"A":{"v0":0.1}}));
     evaluate_mesh_cache(&mut group_mesh, None, &group_cache, 0.0, 24, 1.0, &bytes)?;
-    let expected_inverted_x = f64::from(f32::from_bits(0x3f38_51ec));
+    // Blender 5.2.2 gives vertex 0 the influence 0.8 - 0.1 * 0.8 = 0.72 of the cache sample 2.0.
+    let expected_inverted_x = f64::from(1.44_f32);
     assert_eq!(group_mesh.vertices[0].co.x, expected_inverted_x);
-    assert_ne!(group_mesh.vertices[0].co.x, 0.72_f64);
+    assert_ne!(group_mesh.vertices[0].co.x, f64::from(1.6_f32));
     assert_ne!(
         group_mesh.vertices[0].co.x,
-        f64::from(f32::from_bits(0x3f38_51eb))
+        f64::from(f32::from_bits(1.44_f32.to_bits() + 1))
     );
     Ok(())
 }
@@ -1176,7 +1177,7 @@ fn cli_applies_resource_backed_mesh_cache_and_inspects_interpolated_positions()
     let inspected = Command::new(env!("CARGO_BIN_EXE_pot"))
         .args(["inspect"])
         .arg(&scene)
-        .args(["--id", "body", "--frame", "1.5", "--json"])
+        .args(["--id", "body", "--frame", "0.5", "--json"])
         .output()?;
     assert!(
         inspected.status.success(),
