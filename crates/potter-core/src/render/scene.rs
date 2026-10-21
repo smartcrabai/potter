@@ -2425,6 +2425,7 @@ fn light_contribution(
     match light.light_type {
         crate::model::LightType::Sun => {
             let toward_light = matrix.transform_vector3(DVec3::Z).normalize_or_zero();
+            // The disc's visibility is already inside `sun_lighting`, one ray per disc sample, so the sun is not shadowed again.
             sun_lighting(
                 params,
                 shading,
@@ -2434,14 +2435,6 @@ fn light_contribution(
                 toward_light,
                 color,
                 light,
-            ) * visibility_for_light(
-                shadow,
-                point_shadow,
-                shadow_point,
-                geometric,
-                toward_light,
-                f64::INFINITY,
-                sun_disc_radius(light.sun_angle),
             )
         }
         crate::model::LightType::Point => {

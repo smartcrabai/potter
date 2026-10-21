@@ -515,8 +515,10 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
         .map(|value| read_unit_interval(engine, value, "set/displacement_midlevel"))
         .transpose()?;
     let mut changed = false;
+    let mut graph_writes = Vec::new();
     for id in targets {
         let item_changed = if let Some(material) = engine.doc.materials.get_mut(&id) {
+            let before = material.clone();
             let mut item_changed = false;
             if let Some(name) = &name
                 && material.name != *name
@@ -668,6 +670,10 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                 material.displacement_midlevel = value;
                 item_changed = true;
             }
+            let writes = super::shader::principled_writes(&before, material);
+            if !writes.is_empty() {
+                graph_writes.push((id.clone(), writes));
+            }
             item_changed
         } else {
             false
@@ -676,6 +682,9 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             engine.mark("materials", &id, ChangeKind::Updated);
             changed = true;
         }
+    }
+    for (id, writes) in graph_writes {
+        super::shader::write_authored_inputs(engine, &id, &writes)?;
     }
     Ok(changed)
 }
