@@ -45,7 +45,8 @@ pub use scene::{
     RenderSettings, RigidBody, RigidBodyShape, RigidBodyType, RigidBodyWorld, Scene, SceneDoc,
     SolvedCamera, SurfaceData, SurfacePoint, TextObjectData, TextureCoordinateMapping, TextureRef,
     ThicknessMode, TimelineMarker, TrackingMarker, TrackingObject, TrackingObjectPose,
-    TrackingTrack, UnitSettings, ViewLayer, ViewportDisplay, World,
+    TrackingTrack, UnitSettings, ViewLayer, ViewportDisplay, VolumeInterpolation, VolumeSampling,
+    World,
 };
 pub(crate) use scene::{
     is_identity_matrix, material_link_at, material_slot_count, resolve_material_slot,
