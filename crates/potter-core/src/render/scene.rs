@@ -2425,16 +2425,24 @@ fn light_contribution(
     match light.light_type {
         crate::model::LightType::Sun => {
             let toward_light = matrix.transform_vector3(DVec3::Z).normalize_or_zero();
-            punctual_radiance(params, shading, toward_light, color, energy)
-                * visibility_for_light(
-                    shadow,
-                    point_shadow,
-                    shadow_point,
-                    geometric,
-                    toward_light,
-                    f64::INFINITY,
-                    sun_disc_radius(light.sun_angle),
-                )
+            sun_lighting(
+                params,
+                shading,
+                shadow,
+                shadow_point,
+                geometric,
+                toward_light,
+                color,
+                light,
+            ) * visibility_for_light(
+                shadow,
+                point_shadow,
+                shadow_point,
+                geometric,
+                toward_light,
+                f64::INFINITY,
+                sun_disc_radius(light.sun_angle),
+            )
         }
         crate::model::LightType::Point => {
             let delta = position - point;
@@ -2446,6 +2454,7 @@ fn light_contribution(
                 toward_light,
                 color,
                 point_intensity(energy) / distance_squared,
+                LightFactors::of(light),
             ) * visibility_for_light(
                 shadow,
                 point_shadow,
@@ -2470,6 +2479,7 @@ fn light_contribution(
                 toward_light,
                 color,
                 (point_intensity(energy) / distance_squared) * falloff,
+                LightFactors::of(light),
             ) * visibility_for_light(
                 shadow,
                 point_shadow,
@@ -2503,12 +2513,9 @@ fn light_contribution(
             // Integrated Lambert irradiance is exact for rectangles, and the visibility weight scales it. The specular,
             // sheen and coat lobes are evaluated towards the emitter centre on the lit side.
             let toward_centre = (position - point).normalize_or_zero();
-            let reflective = (diffuse_coefficient(params, shading)
-                + specular_coefficient(params, shading, toward_centre)
-                + sheen_coefficient(params, shading, toward_centre)
-                + coat_coefficient(params, shading, toward_centre))
-                * front;
-            reflective * color
+            let (diffuse, specular) = reflective_classes(params, shading, toward_centre);
+            let factors = LightFactors::of(light);
+            (diffuse * factors.diffuse + specular * factors.specular) * front * color
         }
     }
 }
@@ -2997,6 +3004,7 @@ fn glass_direct_contribution(
     let Some(direct) = direct_emitter(light, matrix, receiver.point) else {
         return DVec3::ZERO;
     };
+    let factors = LightFactors::of(light);
     let mut result = DVec3::ZERO;
 
     // The reflection, lit from the normal's side.
@@ -3036,8 +3044,9 @@ fn glass_direct_contribution(
             glass.reflection_matrix,
             direct.to_centre,
         );
-        result +=
-            glass.reflection * direct.radiance * (direct.attenuation * facing * visibility * form);
+        result += glass.reflection
+            * direct.radiance
+            * (direct.attenuation * facing * visibility * form * factors.specular);
     }
 
     // The transmission, lit from the reverse side, where the lobe's normal points.
@@ -3074,9 +3083,57 @@ fn glass_direct_contribution(
         );
         result += glass.transmission
             * direct.radiance
-            * (direct.attenuation * facing * visibility * form);
+            * (direct.attenuation * facing * visibility * form * factors.transmission);
     }
     result
+}
+
+/// A sun's direct light, integrated over the sun's disc as EEVEE's sun is. The diffuse class is flat over the disc, so its
+/// centre value times the disc's mean visibility is its integral. The specular class is resolved over the disc: each sample
+/// of the disc (`sun_disc_directions`), weighted by its visibility, is one direction of the integral, so a glossy highlight
+/// takes the disc's shape as EEVEE's LTC integral does.
+fn sun_lighting(
+    params: &BsdfParams,
+    shading: &Layers,
+    shadow: ShadowContext<'_>,
+    shadow_point: DVec3,
+    geometric: DVec3,
+    toward_light: DVec3,
+    color: DVec3,
+    light: &crate::model::LightData,
+) -> DVec3 {
+    let energy = light.energy.max(0.0);
+    let factors = LightFactors::of(light);
+    let radius = sun_disc_radius(light.sun_angle);
+    let weight = energy / SUN_DISC_SAMPLES as f64;
+    let mut mean_visibility = 0.0;
+    let mut specular = DVec3::ZERO;
+    for sample in sun_disc_directions(toward_light, radius) {
+        let visibility = match shadow {
+            Some(shadow) => ray_transmittance(
+                shadow,
+                shadow_origin(shadow_point, geometric, sample),
+                sample,
+                f64::INFINITY,
+                true,
+            ),
+            None => 1.0,
+        };
+        mean_visibility += visibility / SUN_DISC_SAMPLES as f64;
+        let cosine = shading.normal.dot(sample);
+        if cosine > 0.0 {
+            let lobe = specular_coefficient(params, shading, sample)
+                + coat_coefficient(params, shading, sample);
+            specular += lobe * (weight * cosine * visibility);
+        }
+    }
+    let cosine = shading.normal.dot(toward_light);
+    let diffuse = if cosine > 0.0 {
+        reflective_classes(params, shading, toward_light).0 * (energy * cosine * mean_visibility)
+    } else {
+        DVec3::ZERO
+    };
+    (diffuse * factors.diffuse + specular * factors.specular) * color
 }
 
 /// Radiance a point, spot or sun light reflects toward the view of `shading`: the Principled
@@ -3088,21 +3145,48 @@ fn punctual_radiance(
     light: DVec3,
     color: DVec3,
     intensity: f64,
+    factors: LightFactors,
 ) -> DVec3 {
     let normal_light_cosine = shading.normal.dot(light).abs();
     if normal_light_cosine <= 0.0 {
         return DVec3::ZERO;
     }
     // The reflective lobes sit above the surface.
-    let reflective = if shading.normal.dot(light) > 0.0 {
-        diffuse_coefficient(params, shading)
-            + specular_coefficient(params, shading, light)
-            + sheen_coefficient(params, shading, light)
-            + coat_coefficient(params, shading, light)
-    } else {
-        DVec3::ZERO
-    };
-    reflective * color * (intensity * normal_light_cosine)
+    if shading.normal.dot(light) <= 0.0 {
+        return DVec3::ZERO;
+    }
+    let (diffuse, specular) = reflective_classes(params, shading, light);
+    (diffuse * factors.diffuse + specular * factors.specular)
+        * color
+        * (intensity * normal_light_cosine)
+}
+
+/// The light's closure multipliers, which EEVEE applies per closure class (`eevee_light.cc`, `power[LIGHT_DIFFUSE]`,
+/// `power[LIGHT_SPECULAR]`, `power[LIGHT_TRANSMISSION]`). The path tracer does not apply them, as Cycles does not.
+#[derive(Clone, Copy)]
+struct LightFactors {
+    diffuse: f64,
+    specular: f64,
+    transmission: f64,
+}
+
+impl LightFactors {
+    fn of(light: &crate::model::LightData) -> Self {
+        Self {
+            diffuse: light.diffuse_factor.max(0.0),
+            specular: light.specular_factor.max(0.0),
+            transmission: light.transmission_factor.max(0.0),
+        }
+    }
+}
+
+/// The reflective lobes along `light` in EEVEE's two classes, before the light's factors: the diffuse class (the diffuse
+/// and sheen lobes, which EEVEE's sheen joins to the diffuse closure) and the specular class (the specular and coat lobes).
+fn reflective_classes(params: &BsdfParams, shading: &Layers, light: DVec3) -> (DVec3, DVec3) {
+    (
+        diffuse_coefficient(params, shading) + sheen_coefficient(params, shading, light),
+        specular_coefficient(params, shading, light) + coat_coefficient(params, shading, light),
+    )
 }
 
 #[cfg(test)]

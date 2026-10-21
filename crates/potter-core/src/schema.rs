@@ -314,6 +314,14 @@ fn complete_scene_schema(root: &mut Value) {
         json!({"type":"number","minimum":0,"maximum":std::f64::consts::PI});
     defs["light"]["properties"]["use_custom_distance"] = json!({"type":"boolean"});
     defs["light"]["properties"]["cutoff_distance"] = json!({"type":"number","minimum":0});
+    for factor in [
+        "diffuse_factor",
+        "specular_factor",
+        "transmission_factor",
+        "volume_factor",
+    ] {
+        defs["light"]["properties"][factor] = json!({"type":"number","minimum":0});
+    }
 
     defs["node"]["properties"]["kind"]["enum"] =
         json!(["empty", "mesh", "camera", "light", "armature"]);

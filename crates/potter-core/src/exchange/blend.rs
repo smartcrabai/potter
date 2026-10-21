@@ -3313,6 +3313,10 @@ fn build_imported_graph(
                         .and_then(Value::as_bool)
                         .unwrap_or(false),
                     cutoff_distance: number_field(item, "cutoff_distance", 40.0),
+                    diffuse_factor: number_field(item, "diffuse_factor", 1.0),
+                    specular_factor: number_field(item, "specular_factor", 1.0),
+                    transmission_factor: number_field(item, "transmission_factor", 1.0),
+                    volume_factor: number_field(item, "volume_factor", 1.0),
                 }),
                 grease_pencil: None,
                 ..DataBlock::default()

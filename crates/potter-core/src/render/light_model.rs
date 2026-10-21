@@ -91,7 +91,7 @@ pub(crate) fn spot_cone(matrix: &DMat4, to_light: DVec3, spot_size: f64, spot_bl
 /// EEVEE's `light_influence_attenuation` for a local light (`eevee_light_lib.bsl.hh`): `(1 - (d / R)⁴)²`, which reaches zero
 /// at the influence radius `R`. `R` is the custom distance when `use_custom_distance` is set (`attenuation_radius_get`,
 /// `LA_CUSTOM_ATTENUATION`), and otherwise `sqrt(power / threshold)`, where the power is the largest colour channel times
-/// `|energy| / 100` (`eevee_light.cc` `shape_parameters_set`, with the light's diffuse and specular factors at one). A
+/// `|energy| / 100`, times the larger of the diffuse and specular factors (`eevee_light.cc` `shape_parameters_set`). A
 /// zero radius culls the light, so it contributes nothing.
 pub(crate) fn local_light_influence(
     data: &LightData,
@@ -101,8 +101,10 @@ pub(crate) fn local_light_influence(
     let radius_squared = if data.use_custom_distance {
         data.cutoff_distance * data.cutoff_distance
     } else {
-        let max_power =
-            DVec3::from_array(data.color).max_element().max(0.0) * (data.energy.abs() / 100.0);
+        // `surface_max_power = max(diff_fac, spec_fac) · max_power` (`eevee_light.cc` `shape_parameters_set`).
+        let max_power = DVec3::from_array(data.color).max_element().max(0.0)
+            * (data.energy.abs() / 100.0)
+            * data.diffuse_factor.max(data.specular_factor).max(0.0);
         max_power / threshold
     };
     if radius_squared <= 0.0 {
@@ -717,6 +719,16 @@ mod realtime_cutoff_tests {
         // The custom distance wins whatever the threshold: R² = 9.
         assert!(local_light_influence(&data, 9.0, 0.1).abs() < 1.0e-12);
         assert!((local_light_influence(&data, 0.0, 0.1) - 1.0).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn the_larger_surface_factor_sets_the_radius() {
+        // max(diffuse, specular) = 2 doubles the power: R² = 0.8 / 0.01 = 80 instead of 40.
+        let mut data = light(40.0, [1.0; 3]);
+        data.diffuse_factor = 2.0;
+        data.specular_factor = 0.5;
+        let expected = 1.0 - (60.0_f64 / 80.0).powi(2);
+        assert!((local_light_influence(&data, 60.0, 0.01) - expected * expected).abs() < 1.0e-12);
     }
 
     #[test]

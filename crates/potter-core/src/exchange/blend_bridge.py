@@ -2607,6 +2607,10 @@ def dump_all():
                         "sun_angle": float(getattr(x, "angle", math.radians(0.526))),
                         "use_custom_distance": bool(getattr(x, "use_custom_distance", False)),
                         "cutoff_distance": float(getattr(x, "cutoff_distance", 40.0)),
+                        "diffuse_factor": float(getattr(x, "diffuse_factor", 1.0)),
+                        "specular_factor": float(getattr(x, "specular_factor", 1.0)),
+                        "transmission_factor": float(getattr(x, "transmission_factor", 1.0)),
+                        "volume_factor": float(getattr(x, "volume_factor", 1.0)),
                         "fake_user": bool(x.use_fake_user), "users": int(x.users)} for x in bpy.data.lights],
             "actions": [action_dump(x) for x in bpy.data.actions],
             "texts": [{"name": x.name_full, "potter_id": x.get("potter.id"),
@@ -7329,6 +7333,10 @@ def export_doc(doc, target, pack, scene_hash, context):
                 light.angle = float(raw.get("sun_angle", math.radians(0.526)))
             light.use_custom_distance = bool(raw.get("use_custom_distance", False))
             light.cutoff_distance = float(raw.get("cutoff_distance", 40.0))
+            light.diffuse_factor = float(raw.get("diffuse_factor", 1.0))
+            light.specular_factor = float(raw.get("specular_factor", 1.0))
+            light.transmission_factor = float(raw.get("transmission_factor", 1.0))
+            light.volume_factor = float(raw.get("volume_factor", 1.0))
             set_id(light, data_id)
             set_props(light, source.get("custom_properties", {}))
             if source.get("fake_user"):

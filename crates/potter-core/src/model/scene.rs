@@ -1499,6 +1499,34 @@ pub struct LightData {
         skip_serializing_if = "is_default_cutoff_distance"
     )]
     pub cutoff_distance: f64,
+    /// Blender's `diffuse_factor` (`Light.diff_fac`, `rna_light.cc`): the multiplier of the light's diffuse closures
+    /// (diffuse, sheen and subsurface). EEVEE applies it (`eevee_light.cc`, `power[LIGHT_DIFFUSE]`); Cycles does not.
+    #[serde(
+        default = "default_light_factor",
+        skip_serializing_if = "is_default_light_factor"
+    )]
+    pub diffuse_factor: f64,
+    /// Blender's `specular_factor` (`Light.spec_fac`): the multiplier of the specular and coat closures, and of the glass
+    /// reflection. EEVEE applies it (`power[LIGHT_SPECULAR]`); Cycles does not.
+    #[serde(
+        default = "default_light_factor",
+        skip_serializing_if = "is_default_light_factor"
+    )]
+    pub specular_factor: f64,
+    /// Blender's `transmission_factor` (`Light.transmission_fac`): the multiplier of the transmission closures. EEVEE
+    /// applies it (`power[LIGHT_TRANSMISSION]`); Cycles does not.
+    #[serde(
+        default = "default_light_factor",
+        skip_serializing_if = "is_default_light_factor"
+    )]
+    pub transmission_factor: f64,
+    /// Blender's `volume_factor` (`Light.volume_fac`): the multiplier of the light's volume scattering (`power[LIGHT_VOLUME]`).
+    /// EEVEE applies it; Cycles does not.
+    #[serde(
+        default = "default_light_factor",
+        skip_serializing_if = "is_default_light_factor"
+    )]
+    pub volume_factor: f64,
 }
 
 impl Default for LightData {
@@ -1519,6 +1547,10 @@ impl Default for LightData {
             sun_angle: default_sun_angle(),
             use_custom_distance: false,
             cutoff_distance: default_cutoff_distance(),
+            diffuse_factor: default_light_factor(),
+            specular_factor: default_light_factor(),
+            transmission_factor: default_light_factor(),
+            volume_factor: default_light_factor(),
         }
     }
 }
@@ -1534,6 +1566,16 @@ fn default_sun_angle() -> f64 {
 
 fn is_default_sun_angle(value: &f64) -> bool {
     (value - default_sun_angle()).abs() < 1.0e-6
+}
+
+/// Blender's light closure multipliers default to one (`DNA_light_types.h`: `diff_fac`, `spec_fac`, `transmission_fac`,
+/// `volume_fac`).
+fn default_light_factor() -> f64 {
+    1.0
+}
+
+fn is_default_light_factor(value: &f64) -> bool {
+    (value - 1.0).abs() < 1.0e-6
 }
 
 /// Blender's light cutoff distance default, `DNA_light_types.h`: 40 m.
