@@ -486,7 +486,7 @@ pub(crate) fn operand_to_subject(
 }
 
 /// Blender's Volume to Mesh transform (`MOD_volume_to_mesh.cc`): the carrier's float `world_to_object`
-/// times the volume's float `object_to_world`. OpenVDB copies the carrier's inverse and sets its
+/// times the volume's float `object_to_world`. `OpenVDB` copies the carrier's inverse and sets its
 /// bottom row to `(0, 0, 0, 1)` (`imat.setCol(3, ...)`), which only changes a non-affine rounding
 /// residue. The grid's own transform is applied by the extraction. `None` when either object has no
 /// exact replica or the carrier is not invertible; the caller then keeps its `f64` path.

@@ -562,7 +562,7 @@ impl<T: BoxScalar> DenseGrid<T> {
 
 /// One `GridTransformer` pass for a uniform `scale` with `BoxSampler` (`openvdb/tools/GridTransformer.h`,
 /// `GridResampler::transformBBox`, affine path): output index `x` samples the input at `x / scale`. The
-/// sample position advances by the inverse scale per output voxel, as OpenVDB's loop does.
+/// sample position advances by the inverse scale per output voxel, as `OpenVDB`'s loop does.
 fn scale_pass<T: BoxScalar>(input: &DenseGrid<T>, scale: f64) -> Result<DenseGrid<T>> {
     // The output box is the scaled input box (`inRMax` is exclusive), padded by `BoxSampler`'s radius of 1.
     let out_min: [i64; 3] =
@@ -875,7 +875,7 @@ fn volume_to_mesh_for_grid(
     } else {
         let active = match &volume.source {
             VolumeSource::Generated(source) => source.active_bounds,
-            _ => None,
+            VolumeSource::File(_) => None,
         }
         .unwrap_or_else(|| {
             (
