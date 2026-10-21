@@ -3362,6 +3362,10 @@ fn build_imported_graph(
                 emission_strength: number_field(item, "emission_strength", 0.0),
                 transmission: number_field(item, "transmission", 0.0),
                 ior: number_field(item, "ior", 1.5),
+                thickness_mode: match item.get("thickness_mode").and_then(Value::as_str) {
+                    Some("slab") => crate::model::ThicknessMode::Slab,
+                    _ => crate::model::ThicknessMode::Sphere,
+                },
                 double_sided: item
                     .get("double_sided")
                     .and_then(Value::as_bool)

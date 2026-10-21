@@ -1,35 +1,37 @@
 //! Transmission for realtime Beauty as EEVEE 5.2.2 evaluates it with its default material settings: no ray-traced
-//! refraction (`Material.use_raytrace_refraction` off), so each refraction samples the light probe, and the
-//! object's sphere thickness (`thickness_mode` Sphere, `Material.refraction_depth` unused).
+//! refraction (`Material.use_raytrace_refraction` off), so each refraction samples the light probe, and the object's
+//! thickness (`Thickness`, `eevee_thickness_lib.bsl.hh`).
 //!
 //! EEVEE sources (Blender v5.2.2):
 //! - `gpu/shaders/material/gpu_shader_material_principled.glsl`, the `MAT_REFRACTION` block: the transmission and
 //!   reflection closures, with `bsdf_lut(F0, F90, sqrt(base), NV, roughness, ior, multiscatter)`.
-//! - `draw/engines/eevee/shaders/eevee_nodetree_lib.bsl.hh`: `bsdf_lut` (IOR above one) and `F_brdf_multi_scatter`.
-//! - `eevee_bxdf_lut_lib.bsl.hh` and `eevee_utility_tx.bsl.hh`: the LUT coordinates and their filtering. The tables
-//!   are `eevee_transmission_tables.rs`.
+//! - `draw/engines/eevee/shaders/eevee_nodetree_lib.bsl.hh`: `bsdf_lut` and `F_brdf_multi_scatter`.
+//! - `eevee_bxdf_lut_lib.bsl.hh` and `eevee_utility_tx.bsl.hh`: the LUT coordinates and their filtering. The tables are
+//!   `eevee_transmission_tables.rs`.
 //! - `eevee_bxdf_microfacet.bsl.hh`: the dominant directions and the perceived transmission roughness.
 //! - `eevee_closure.bsl.hh`, `bxdf_lightprobe_ray`: the probe direction, after `bxdf_ggx_context_amend_transmission`.
-//! - `eevee_thickness_lib.bsl.hh`: the sphere model, which crosses a sphere of the object's thickness.
-//! - `eevee_shader.cc`, `nodetree_thickness`: the default thickness is the smallest world-space bounds dimension.
+//! - `eevee_thickness_lib.bsl.hh`: the sphere and slab models of a thickness.
+//! - `eevee_shader.cc`, `nodetree_thickness`: the thickness is the Material Output's Thickness socket when linked, and
+//!   otherwise the smallest world-space bounds dimension.
 //! - `eevee_deferred_combine.bsl.hh`: a refraction with a thickness takes its colour squared (two events).
+//! - `eevee_lightprobe_sphere.bsl.hh` and the `UFLOAT_11_11_10` colour attachments of the capture (`eevee_shader.cc`):
+//!   the probe radiance is truncated to that format, see [`probe_radiance`].
 //!
 //! The reflectance and transmittance come from EEVEE's split-sum LUT, so the Fresnel split and the roughness response
-//! follow EEVEE's closures rather than an analytic approximation. Measured on Blender 5.2.2 with a uniform world of
-//! 1 and a white glass sphere (IOR 1.45, roughness 0), EEVEE's centre pixel is 0.9668, this model's R + T² is 0.9674.
+//! follow EEVEE's closures. Measured on Blender 5.2.2 with a white world of 1 and a white glass sphere (IOR 1.45,
+//! roughness 0), EEVEE's centre pixel is 0.9668 and this model's R + T² is 0.9674.
 //!
-//! Not reproduced (reported as losses): IOR below one, which EEVEE reads from its `bsdf_ggx` table (not embedded, so
-//! such a closure has no environment term here), and the Thickness socket and thickness-from-shadow amendments, which
-//! replace the bounds-derived thickness.
+//! Not reproduced: ray-traced refraction (`use_raytrace_refraction`), which EEVEE leaves off by default, and direct
+//! light through glass, which EEVEE integrates with its LTC transmission lobe (the path tracer's glass lobe is used).
 
 use glam::DVec3;
 
-use super::eevee_transmission_tables::{BRDF_SCALE_BIAS, BTDF_GT_ONE};
+use super::eevee_transmission_tables::{brdf, bsdf, btdf};
 use crate::shader::BsdfParams;
 
 /// The last texel index of EEVEE's utility-texture LUTs, which are 64 texels across.
 const LAST_TEXEL: usize = 63;
-/// The number of roughness layers of the BSDF LUT, `UTIL_BSDF_LAYER_COUNT`.
+/// The number of roughness layers of the BSDF and BTDF LUTs, `UTIL_BSDF_LAYER_COUNT`.
 const ROUGHNESS_LAYERS: usize = 16;
 
 /// Linear blend of `a` and `b` at `t`.
@@ -46,7 +48,16 @@ fn texel_weights(coordinate: f64) -> (usize, usize, f64) {
     (low, high, position - low as f64)
 }
 
-/// `sqrt(1 - cos θ)`, the second LUT coordinate of every table (`lut_coords_get`).
+/// The two roughness layers around `roughness` and the blend weight of the second (`sample_bsdf_lut`, layer
+/// `16 · roughness`).
+fn layer_weights(roughness: f64) -> (usize, usize, f64) {
+    let layer = roughness.clamp(0.0, 1.0) * ROUGHNESS_LAYERS as f64;
+    let low = (layer.floor() as usize).min(ROUGHNESS_LAYERS - 1);
+    let high = (low + 1).min(ROUGHNESS_LAYERS - 1);
+    (low, high, layer - low as f64)
+}
+
+/// `sqrt(1 - cos θ)`, the second LUT coordinate of the BRDF and IOR-above-one tables (`lut_coords_get`).
 fn sqrt_one_minus(n_dot_v: f64) -> f64 {
     (1.0 - n_dot_v.clamp(0.0, 1.0)).sqrt()
 }
@@ -55,41 +66,67 @@ fn sqrt_one_minus(n_dot_v: f64) -> f64 {
 fn brdf_channel(channel: usize, roughness: f64, n_dot_v: f64) -> f64 {
     let (x0, x1, fx) = texel_weights(roughness);
     let (y0, y1, fy) = texel_weights(sqrt_one_minus(n_dot_v));
-    let texel = |y: usize, x: usize| f64::from(BRDF_SCALE_BIAS[y][x][channel]);
     blend(
-        blend(texel(y0, x0), texel(y0, x1), fx),
-        blend(texel(y1, x0), texel(y1, x1), fx),
+        blend(brdf(x0, y0, channel), brdf(x1, y0, channel), fx),
+        blend(brdf(x0, y1, channel), brdf(x1, y1, channel), fx),
         fy,
     )
 }
 
-/// EEVEE's transmission factor for an IOR above one (`GGXBtdfGt1Data`) at roughness `roughness`, cosine `n_dot_v`
-/// and `amplitude = (ior - 1) / (ior + 1)`. The roughness layers interpolate after the texel blend, as
-/// `sample_bsdf_lut` does.
+/// EEVEE's transmission factor for an IOR above one (`GGXBtdfGt1Data`) at roughness `roughness`, cosine `n_dot_v` and
+/// `amplitude = (ior - 1) / (ior + 1)`. The roughness layers interpolate after the texel blend, as `sample_bsdf_lut`
+/// does.
 fn transmission_factor(roughness: f64, n_dot_v: f64, amplitude: f64) -> f64 {
-    let layer = roughness.clamp(0.0, 1.0) * ROUGHNESS_LAYERS as f64;
-    let low_layer = (layer.floor() as usize).min(ROUGHNESS_LAYERS - 1);
-    let high_layer = (low_layer + 1).min(ROUGHNESS_LAYERS - 1);
-    let layer_weight = layer - low_layer as f64;
+    let (l0, l1, fl) = layer_weights(roughness);
     let (x0, x1, fx) = texel_weights(amplitude.sqrt());
     let (y0, y1, fy) = texel_weights(sqrt_one_minus(n_dot_v));
-    let layer_value = |index: usize| {
-        let texel = |y: usize, x: usize| f64::from(BTDF_GT_ONE[index][y][x]);
+    let layer_value = |layer: usize| {
         blend(
-            blend(texel(y0, x0), texel(y0, x1), fx),
-            blend(texel(y1, x0), texel(y1, x1), fx),
+            blend(btdf(layer, x0, y0), btdf(layer, x1, y0), fx),
+            blend(btdf(layer, x0, y1), btdf(layer, x1, y1), fx),
             fy,
         )
     };
-    blend(
-        layer_value(low_layer),
-        layer_value(high_layer),
-        layer_weight,
-    )
+    blend(layer_value(l0), layer_value(l1), fl)
 }
 
-/// The reflectance and transmittance of a GGX glass closure, per channel, as EEVEE's `bsdf_lut` gives them for an
-/// IOR above one with multiscatter. `transmittance` includes the transmission tint.
+/// EEVEE's `GGXBsdfData` for an IOR below one: the scale, bias and transmission factor. Its coordinates are the
+/// `GGXBsdfData::lut_coords_get` of `eevee_bxdf_lut_lib.bsl.hh`: `x = ior²`, and `y` remaps `cos θ` about the critical
+/// angle `sqrt(1 - ior²)`.
+fn bsdf_channels(ior: f64, roughness: f64, n_dot_v: f64) -> [f64; 3] {
+    let critical_cos = (1.0 - ior * ior).max(0.0).sqrt();
+    let offset = n_dot_v - critical_cos;
+    let remapped = offset
+        / if offset > 0.0 {
+            1.0 - critical_cos
+        } else {
+            critical_cos
+        };
+    let x = (ior * ior).clamp(0.0, 1.0);
+    let y = (remapped * 0.5 + 0.5).clamp(0.0, 1.0);
+    let (l0, l1, fl) = layer_weights(roughness);
+    let (x0, x1, fx) = texel_weights(x);
+    let (y0, y1, fy) = texel_weights(y);
+    let channel = |layer: usize, channel: usize| {
+        blend(
+            blend(
+                bsdf(layer, x0, y0, channel),
+                bsdf(layer, x1, y0, channel),
+                fx,
+            ),
+            blend(
+                bsdf(layer, x0, y1, channel),
+                bsdf(layer, x1, y1, channel),
+                fx,
+            ),
+            fy,
+        )
+    };
+    [0, 1, 2].map(|index| blend(channel(l0, index), channel(l1, index), fl))
+}
+
+/// The reflectance and transmittance of a GGX glass closure, per channel, as EEVEE's `bsdf_lut` gives them with
+/// multiscatter. `transmittance` includes the transmission tint.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct GlassSplit {
     pub(crate) reflectance: DVec3,
@@ -97,32 +134,36 @@ pub(crate) struct GlassSplit {
 }
 
 /// EEVEE's `bsdf_lut` for a glass closure. `f0` is the normal-incidence reflectance (EEVEE's `F0`, tinted by the
-/// specular tint), and `transmission_tint` multiplies the transmittance. `None` for an IOR below one, whose table
-/// EEVEE reads from `bsdf_ggx`, which Potter does not embed.
+/// specular tint) and `transmission_tint` multiplies the transmittance.
 pub(crate) fn glass_split(
     ior: f64,
     roughness: f64,
     n_dot_v: f64,
     f0: DVec3,
     transmission_tint: DVec3,
-) -> Option<GlassSplit> {
-    if ior < 1.0 {
-        return None;
-    }
+) -> GlassSplit {
     // EEVEE's `ior == 1`: no reflection, and the tint passes.
     if (ior - 1.0).abs() < 1.0e-9 {
-        return Some(GlassSplit {
+        return GlassSplit {
             reflectance: DVec3::ZERO,
             transmittance: transmission_tint,
-        });
+        };
     }
     let amplitude = (ior - 1.0) / (ior + 1.0);
     let real_f0 = amplitude * amplitude;
-    // `bsdf_lut` replaces the default F90 of one with `saturate(2.33 / 0.33 · f0)`, which reaches one from an IOR of about 1.33.
-    let f90 = (2.33 / 0.33 * amplitude).clamp(0.0, 1.0);
-    let scale = brdf_channel(0, roughness, n_dot_v);
-    let bias = brdf_channel(1, roughness, n_dot_v);
-    let transmission = transmission_factor(roughness, n_dot_v, amplitude);
+    let (scale, bias, transmission, f90) = if ior > 1.0 {
+        // `bsdf_lut` replaces the default F90 of one with `saturate(2.33 / 0.33 · f0)`, which reaches one from an IOR of
+        // about 1.33 up.
+        (
+            brdf_channel(0, roughness, n_dot_v),
+            brdf_channel(1, roughness, n_dot_v),
+            transmission_factor(roughness, n_dot_v, amplitude),
+            (2.33 / 0.33 * amplitude).clamp(0.0, 1.0),
+        )
+    } else {
+        let [scale, bias, transmission] = bsdf_channels(ior, roughness, n_dot_v);
+        (scale, bias, transmission, 1.0)
+    };
 
     let reflectance = f0 * scale + DVec3::splat(f90 * bias);
     let transmittance = (DVec3::ONE - f0) * transmission * transmission_tint;
@@ -136,10 +177,10 @@ pub(crate) fn glass_split(
         transmission_tint
     };
     let normalisation = DVec3::ONE / (DVec3::ONE - average * missing).max(DVec3::splat(1.0e-6));
-    Some(GlassSplit {
+    GlassSplit {
         reflectance: reflectance * normalisation,
         transmittance: transmittance * normalisation,
-    })
+    }
 }
 
 /// The mix weight of EEVEE's `bxdf_ggx_dominant_direction_*`: the probe direction leaves the normal for the specular
@@ -175,8 +216,8 @@ pub(crate) fn reflection_direction(normal: DVec3, view: DVec3, roughness: f64) -
         .normalize_or(normal)
 }
 
-/// EEVEE's `bxdf_ggx_dominant_direction_transmission`: `ior` is the argument EEVEE passes, whose reciprocal
-/// refracts `-view`, mixed toward `-normal` by the roughness.
+/// EEVEE's `bxdf_ggx_dominant_direction_transmission`: `ior` is the argument EEVEE passes, whose reciprocal refracts
+/// `-view`, mixed toward `-normal` by the roughness.
 fn dominant_transmission(normal: DVec3, view: DVec3, ior: f64, roughness: f64) -> DVec3 {
     let refracted = refract(-view, normal, 1.0 / ior);
     (-normal)
@@ -184,8 +225,8 @@ fn dominant_transmission(normal: DVec3, view: DVec3, ior: f64, roughness: f64) -
         .normalize_or(-normal)
 }
 
-/// EEVEE's `bxdf_ggx_perceived_roughness_transmission`: the roughness the environment is blurred with for a
-/// refraction at `ior`.
+/// EEVEE's `bxdf_ggx_perceived_roughness_transmission`: the roughness the environment is blurred with for a refraction
+/// at `ior`.
 pub(crate) fn transmission_roughness(roughness: f64, ior: f64) -> f64 {
     let factor = if ior > 1.0 {
         1.0 - 1.0 / ior
@@ -195,27 +236,80 @@ pub(crate) fn transmission_roughness(roughness: f64, ior: f64) -> f64 {
     roughness * factor.max(0.0).sqrt()
 }
 
+/// An object's refraction thickness, as EEVEE's `Thickness` holds it: a value and a model. A zero value is no thickness.
+/// The probe samples only the exit normal, which does not depend on the size, so the value matters only as zero or not;
+/// it places the exit point, which the probe does not read.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Thickness {
+    None,
+    /// A sphere of this diameter tangent to the shading point (`ThicknessMode::Sphere`, the default).
+    Sphere(f64),
+    /// A plane at this distance behind the shading point (`ThicknessMode::Slab`).
+    Slab(f64),
+}
+
+impl Thickness {
+    /// EEVEE's `Thickness::from(value, mode)`: no thickness for a zero value, otherwise the model's.
+    pub(crate) fn new(value: f64, slab: bool) -> Self {
+        if value <= 0.0 {
+            Self::None
+        } else if slab {
+            Self::Slab(value)
+        } else {
+            Self::Sphere(value)
+        }
+    }
+}
+
 /// The direction EEVEE samples the environment at for a refraction of `view` at `normal` into `ior`.
 ///
-/// Without a thickness this is the refracted dominant direction. With one, EEVEE first crosses the sphere model of
-/// `bxdf_ggx_context_amend_transmission`: the entry direction `L` meets the sphere at `L · cos α · thickness`, where the
-/// exit normal is `normalize(N + 2 cos α · L)`, and the probe takes the direction leaving the sphere there.
+/// Without a thickness this is the refracted dominant direction. With one, EEVEE first amends the shading point with the
+/// thickness model (`bxdf_ggx_context_amend_transmission`), and the probe takes the direction that leaves it. A sphere
+/// crosses at `L · cos α · diameter`, where `L` is the entry direction, and its exit normal is `normalize(N + 2 cos α · L)`.
+/// A slab's exit normal is `-N` at its plane. Both then refract `L` out through the amended normal.
 pub(crate) fn transmission_direction(
     normal: DVec3,
     view: DVec3,
     ior: f64,
     roughness: f64,
-    thickness: f64,
+    thickness: Thickness,
 ) -> DVec3 {
     let perceived = transmission_roughness(roughness, ior);
     let entry = dominant_transmission(normal, view, ior, perceived);
-    if thickness <= 0.0 {
-        return entry;
+    let (amended_normal, amended_view) = match thickness {
+        Thickness::None => return entry,
+        Thickness::Sphere(_) => {
+            let cos_alpha = entry.dot(-normal);
+            let exit_normal = (normal + entry * (2.0 * cos_alpha)).normalize_or(normal);
+            (-exit_normal, -entry)
+        }
+        Thickness::Slab(_) => (normal, -entry),
+    };
+    // The probe's amended normal and view, with EEVEE's `1 / ior` argument (a thickness inverts it).
+    dominant_transmission(amended_normal, amended_view, 1.0 / ior, perceived)
+}
+
+/// The radiance a light probe holds: EEVEE captures the world into `UFLOAT_11_11_10` colour attachments, which truncate
+/// the mantissa to 6 bits for red and green and 5 for blue (no rounding). Measured on Blender 5.2.2, a world colour of
+/// 0.6 reads back through a glass sphere as 0.59375, and 0.3 in blue as 0.296875.
+pub(crate) fn probe_radiance(radiance: DVec3) -> DVec3 {
+    DVec3::new(
+        truncate_ufloat(radiance.x, 6),
+        truncate_ufloat(radiance.y, 6),
+        truncate_ufloat(radiance.z, 5),
+    )
+}
+
+/// One channel of a `UFLOAT` with `mantissa_bits` mantissa bits, a 5-bit exponent (bias 15) and truncation.
+fn truncate_ufloat(value: f64, mantissa_bits: i32) -> f64 {
+    if value.is_nan() || value <= 0.0 {
+        return 0.0;
     }
-    let cos_alpha = entry.dot(-normal);
-    let exit_normal = (normal + entry * (2.0 * cos_alpha)).normalize_or(normal);
-    // The probe's amended normal is `-exit_normal` and its view `-entry`, with EEVEE's `1 / ior` argument.
-    dominant_transmission(-exit_normal, -entry, 1.0 / ior, perceived)
+    let largest = (2.0 - 2.0_f64.powi(-mantissa_bits)) * 32_768.0;
+    let value = value.min(largest);
+    let exponent = value.log2().floor().clamp(-14.0, 15.0);
+    let step = (exponent - f64::from(mantissa_bits)).exp2();
+    (value / step).floor() * step
 }
 
 /// The glass closures of one shading point, as EEVEE weights them, with the directions to sample the environment at.
@@ -231,16 +325,15 @@ pub(crate) struct GlassClosures {
     pub(crate) transmission_roughness: f64,
 }
 
-/// The glass closures of a Principled Transmission or Glass BSDF at a shading point with `normal`, seen along
-/// `view`, with `lower` the layers above it (coat and sheen) and `thickness` the object's sphere thickness (zero for
-/// none). `None` when the transmission weight `(1 - metallic) · transmission` is zero, the view is below the normal, or
-/// the IOR is below one.
+/// The glass closures of a Principled Transmission or Glass BSDF at a shading point with `normal`, seen along `view`,
+/// with `lower` the layers above it (coat and sheen) and `thickness` the object's thickness. `None` when the
+/// transmission weight `(1 - metallic) · transmission` is zero or the view is below the normal.
 pub(crate) fn glass_closures(
     params: &BsdfParams,
     normal: DVec3,
     view: DVec3,
     lower: DVec3,
-    thickness: f64,
+    thickness: Thickness,
 ) -> Option<GlassClosures> {
     let weight = (1.0 - params.metallic.clamp(0.0, 1.0)) * params.transmission.clamp(0.0, 1.0);
     if weight <= 0.0 || normal.dot(view) <= 0.0 {
@@ -254,12 +347,12 @@ pub(crate) fn glass_closures(
         .clamp(DVec3::ZERO, DVec3::ONE);
     let transmission_tint = DVec3::from_array(params.glass_transmission_tint).max(DVec3::ZERO);
     let reflection_tint = DVec3::from_array(params.glass_reflection_tint).max(DVec3::ZERO);
-    let split = glass_split(ior, roughness, normal.dot(view), f0, transmission_tint)?;
+    let split = glass_split(ior, roughness, normal.dot(view), f0, transmission_tint);
 
     let lobe_weight = lower * weight;
     let reflection = split.reflectance * reflection_tint * lobe_weight;
     let mut transmission = split.transmittance * lobe_weight;
-    if thickness > 0.0 {
+    if thickness != Thickness::None {
         transmission *= transmission;
     }
     Some(GlassClosures {
@@ -292,7 +385,7 @@ mod tests {
     }
 
     /// The closures of `params` looking straight down the normal, with `thickness`.
-    fn normal_view(params: &BsdfParams, thickness: f64) -> Result<GlassClosures, String> {
+    fn normal_view(params: &BsdfParams, thickness: Thickness) -> Result<GlassClosures, String> {
         glass_closures(params, DVec3::Z, DVec3::Z, DVec3::ONE, thickness)
             .ok_or_else(|| "a view along the normal has a glass lobe".to_owned())
     }
@@ -300,8 +393,8 @@ mod tests {
     #[test]
     fn uniform_world_reflection_plus_squared_transmission_matches_eevee_at_normal_incidence()
     -> Result<(), String> {
-        // Blender 5.2.2 EEVEE, uniform world of 1, Principled white, roughness 0, IOR 1.45: centre pixel 0.9668.
-        let closures = normal_view(&glass(0.0), 2.0)?;
+        // Blender 5.2.2 EEVEE, white world of 1, Principled white, roughness 0, IOR 1.45: centre pixel 0.9668.
+        let closures = normal_view(&glass(0.0), Thickness::Sphere(2.0))?;
         let total = closures.reflection + closures.transmission;
         for channel in total.to_array() {
             if (channel - 0.9668).abs() >= 0.002 {
@@ -316,8 +409,8 @@ mod tests {
     #[test]
     fn a_thin_object_transmits_once_and_a_thick_one_twice() -> Result<(), String> {
         let params = glass(0.0);
-        let once = normal_view(&params, 0.0)?;
-        let twice = normal_view(&params, 2.0)?;
+        let once = normal_view(&params, Thickness::None)?;
+        let twice = normal_view(&params, Thickness::Sphere(2.0))?;
         if (once.transmission.x * once.transmission.x - twice.transmission.x).abs() >= 1.0e-9 {
             return Err("the thick transmission is not the square of the single event".to_owned());
         }
@@ -328,8 +421,8 @@ mod tests {
     fn transmission_tint_is_squared_with_the_thickness() -> Result<(), String> {
         let mut params = glass(0.0);
         params.glass_transmission_tint = [0.5, 0.5, 0.5];
-        let once = normal_view(&params, 0.0)?;
-        let twice = normal_view(&params, 2.0)?;
+        let once = normal_view(&params, Thickness::None)?;
+        let twice = normal_view(&params, Thickness::Sphere(2.0))?;
         if (twice.transmission.x - once.transmission.x * once.transmission.x).abs() >= 1.0e-9 {
             return Err(
                 "the tinted thick transmission is not the square of the single event".to_owned(),
@@ -339,17 +432,27 @@ mod tests {
     }
 
     #[test]
-    fn straight_through_probe_at_normal_incidence_with_and_without_thickness() {
+    fn straight_through_probe_at_normal_incidence_for_every_thickness_model() {
         let view = DVec3::Z;
         let normal = DVec3::Z;
-        assert!(
-            (transmission_direction(normal, view, 1.45, 0.0, 0.0) + view).length() < 1.0e-9,
-            "without thickness the probe samples straight through"
-        );
-        assert!(
-            (transmission_direction(normal, view, 1.45, 0.0, 2.0) + view).length() < 1.0e-9,
-            "a sphere of thickness keeps the straight line at normal incidence"
-        );
+        for thickness in [
+            Thickness::None,
+            Thickness::Sphere(2.0),
+            Thickness::Slab(2.0),
+        ] {
+            assert!(
+                (transmission_direction(normal, view, 1.45, 0.0, thickness) + view).length()
+                    < 1.0e-9,
+                "{thickness:?} keeps the straight line at normal incidence"
+            );
+        }
+    }
+
+    #[test]
+    fn a_zero_thickness_value_is_no_thickness() {
+        assert_eq!(Thickness::new(0.0, false), Thickness::None);
+        assert_eq!(Thickness::new(0.5, true), Thickness::Slab(0.5));
+        assert_eq!(Thickness::new(0.5, false), Thickness::Sphere(0.5));
     }
 
     #[test]
@@ -376,15 +479,40 @@ mod tests {
     }
 
     #[test]
-    fn ior_below_one_has_no_split() -> Result<(), String> {
-        let f0 = DVec3::splat(0.04);
-        if glass_split(0.8, 0.0, 1.0, f0, DVec3::ONE).is_some() {
-            return Err("an IOR below one has a table in Potter".to_owned());
-        }
-        let pass = glass_split(1.0, 0.0, 1.0, f0, DVec3::splat(0.5))
-            .ok_or_else(|| "an IOR of one has no split".to_owned())?;
+    fn ior_of_one_passes_its_tint() -> Result<(), String> {
+        let pass = glass_split(1.0, 0.0, 1.0, DVec3::splat(0.04), DVec3::splat(0.5));
         if pass.reflectance != DVec3::ZERO || pass.transmittance != DVec3::splat(0.5) {
             return Err("an IOR of one does not pass its tint".to_owned());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ior_below_one_has_finite_reflection_and_transmission() -> Result<(), String> {
+        // Smooth glass at IOR 0.8 seen along the normal: a small Fresnel reflection and most of the light transmitted.
+        let split = glass_split(0.8, 0.0, 1.0, DVec3::splat(0.0144), DVec3::ONE);
+        let total = split.reflectance + split.transmittance;
+        for channel in total.to_array() {
+            if !channel.is_finite() || !(0.5..=1.05).contains(&channel) {
+                return Err(format!(
+                    "IOR 0.8 glass sums to {channel}, expected about one"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn probe_radiance_truncates_to_the_capture_format() -> Result<(), String> {
+        // 0.6 = 0.5 · 1.2 has a 6-bit mantissa of 76/64 · 0.5 → 0.59375; 0.3 in blue, 5 bits → 0.296875.
+        let probe = probe_radiance(DVec3::new(0.6, 0.6, 0.3));
+        if (probe.x - 0.59375).abs() > 1.0e-12 || (probe.z - 0.296_875).abs() > 1.0e-12 {
+            return Err(format!(
+                "probe radiance {probe:?} is not truncated to UFLOAT_11_11_10"
+            ));
+        }
+        if probe_radiance(DVec3::ONE) != DVec3::ONE {
+            return Err("1.0 is not exact in the capture format".to_owned());
         }
         Ok(())
     }

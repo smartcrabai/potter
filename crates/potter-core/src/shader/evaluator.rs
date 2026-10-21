@@ -10,7 +10,7 @@ use crate::{
     error::{ErrorCode, PotError, Result},
     graph::{GraphKind, GraphNode, NodeGroup},
     image::{ImageData, ImageExtension, ImageInterpolation, sample_with_extension_alpha},
-    model::{Id, Material, Registry, TextureRef},
+    model::{Id, Material, Registry, TextureRef, ThicknessMode},
 };
 
 /// Blender's Principled "Specular IOR Level" default: `SOCKET_IN_FLOAT(specular_ior_level,
@@ -214,6 +214,11 @@ pub struct BsdfParams {
     pub emission_strength: f64,
     pub transmission: f64,
     pub ior: f64,
+    /// The Material Output's Thickness socket when it is linked (EEVEE's `nodetree_thickness`); `None` takes the
+    /// object's bounds. A linked zero is no thickness, as EEVEE's `Thickness::from` gives it.
+    pub thickness: Option<f64>,
+    /// Blender's `Material.thickness_mode` is Slab rather than Sphere (`eevee_thickness_lib.bsl.hh`).
+    pub thickness_slab: bool,
     /// Tints of the rough glass lobe (Cycles' `generalized_schlick_setup`): the reflection tint and the
     /// transmission tint. The Principled BSDF takes white reflection and the square root of its base colour
     /// for transmission (`kernel/svm/closure.h`); the Glass BSDF node takes its Color for both.
@@ -329,6 +334,8 @@ impl BsdfParams {
             emission_strength: material.emission_strength,
             transmission: material.transmission,
             ior: material.ior,
+            thickness: None,
+            thickness_slab: material.thickness_mode == ThicknessMode::Slab,
             glass_reflection_tint: [1.0; 3],
             glass_transmission_tint: principled_glass_tint(material.base_color),
             back_facing: false,
@@ -475,6 +482,8 @@ impl BsdfParams {
             emission_color: mix3(first.emission_color, second.emission_color),
             emission_strength: mix_scalar(first.emission_strength, second.emission_strength),
             transmission: mix_scalar(first.transmission, second.transmission),
+            thickness: None,
+            thickness_slab: false,
             ior: mix_scalar(first.ior, second.ior),
             glass_reflection_tint: reflection.tint,
             glass_transmission_tint: refraction.tint,
@@ -549,6 +558,8 @@ impl BsdfParams {
             emission_color: add3(first.emission_color, second.emission_color),
             emission_strength: first.emission_strength.max(second.emission_strength),
             transmission: first.transmission.max(second.transmission),
+            thickness: None,
+            thickness_slab: false,
             ior: first.ior,
             glass_reflection_tint: reflection.tint,
             glass_transmission_tint: refraction.tint,
@@ -909,6 +920,10 @@ fn evaluate_surface_inner(
         .links
         .iter()
         .any(|link| link.to_node == *output && link.to_socket == "Displacement");
+    let has_thickness = group
+        .links
+        .iter()
+        .any(|link| link.to_node == *output && link.to_socket == "Thickness");
     let mut evaluator = Evaluator {
         group,
         material,
@@ -944,6 +959,17 @@ fn evaluate_surface_inner(
                 Value::Shader(_) => return Err(eval_error("material displacement is a shader")),
             };
     }
+    // The Thickness socket, when linked, is the refraction thickness of the whole material (EEVEE's
+    // `nodetree_thickness`); unlinked, the object's bounds decide it. The mode is the material's.
+    params.thickness = if has_thickness {
+        match evaluator.input(output, "Thickness", ValueKind::Scalar)? {
+            Value::Scalar(thickness) => Some(thickness.max(0.0)),
+            _ => return Err(eval_error("material thickness is not a scalar")),
+        }
+    } else {
+        None
+    };
+    params.thickness_slab = material.thickness_mode == ThicknessMode::Slab;
     apply_material_textures(material, hit_ctx, &mut params)?;
     Ok(params)
 }

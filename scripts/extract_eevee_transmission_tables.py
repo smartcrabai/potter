@@ -1,32 +1,41 @@
 #!/usr/bin/env python3
-"""Extract EEVEE's GGX transmission lookup tables into a Rust module.
+"""Extract EEVEE's GGX glass lookup tables into a little-endian f32 binary asset.
 
 Usage:
-    python3 scripts/extract_eevee_transmission_tables.py <eevee_lut.cc> <output.rs>
+    python3 scripts/extract_eevee_transmission_tables.py <eevee_lut.cc> <output.f32le>
 
 The input is `source/blender/draw/engines/eevee/eevee_lut.cc` at Blender v5.2.2:
 https://raw.githubusercontent.com/blender/blender/v5.2.2/source/blender/draw/engines/eevee/eevee_lut.cc
 
-Two arrays are extracted. `brdf_ggx[64][64][3]` is the split-sum `(scale, bias)` of the GGX reflection;
-its metal bias channel is not used by the glass closure and is dropped. `btdf_ggx[16][64][64][1]` is the
-transmission factor for an IOR above one. Literals are copied verbatim apart from the C `f` suffix, and each
-array's element count is checked against its declared size.
+Three arrays are extracted, in this order, as little-endian f32 values:
+- `brdf_ggx[64][64][3]`, indexed `[y][x][channel]`: the split-sum scale and bias (channels 0 and 1; the metal bias
+  channel 2 is dropped).
+- `btdf_ggx[16][64][64][1]`, indexed `[layer][y][x]`: the transmission factor for an IOR above one.
+- `bsdf_ggx[16][64][64][3]`, indexed `[layer][y][x][channel]`: scale, bias and transmission factor for an IOR below one.
+
+Literals are copied as C float literals (the `f` suffix removed) and rounded to f32, which is how the C compiler
+stores them. Each array's element count is checked against its declared size, and the output size is checked too.
 """
 
 import re
 import sys
+from array import array
 from pathlib import Path
 
 SOURCE_PATH = "source/blender/draw/engines/eevee/eevee_lut.cc"
 SCRIPT_PATH = "scripts/extract_eevee_transmission_tables.py"
 BLENDER_VERSION = "v5.2.2"
 
-WRAP_WIDTH = 100
-INDENT = "    "
 TABLE_SIZE = 64
 LAYER_COUNT = 16
-
 LITERAL_RE = re.compile(r"-?\d+\.\d+")
+
+# (C array name, declared dimensions, channels kept, channels in the source)
+ARRAYS = [
+    ("brdf_ggx", [TABLE_SIZE, TABLE_SIZE, 3], 2),
+    ("btdf_ggx", [LAYER_COUNT, TABLE_SIZE, TABLE_SIZE, 1], 1),
+    ("bsdf_ggx", [LAYER_COUNT, TABLE_SIZE, TABLE_SIZE, 3], 3),
+]
 
 
 def fail(message):
@@ -38,8 +47,8 @@ def strip_c_comments(text):
     return re.sub(r"//[^\n]*", "", text)
 
 
-def extract_values(text, name, dims):
-    """Return the flat literal list of `const float name[dims...] = {...}`, checking every dimension."""
+def extract_values(text, name, dims, kept):
+    """Return the kept channels of `const float name[dims...] = {...}`, in storage order."""
     declared = "".join(f"[{size}]" for size in dims)
     pattern = re.compile(
         r"const\s+float\s+" + re.escape(name) + re.escape(declared) + r"\s*=\s*\{(.*?)\}\s*;",
@@ -49,7 +58,7 @@ def extract_values(text, name, dims):
     if len(matches) != 1:
         fail(f"expected exactly one definition of {name}{declared}, found {len(matches)}")
     body = strip_c_comments(matches[0].group(1))
-    values = []
+    literals = []
     for raw in body.split(","):
         token = raw.strip().strip("{}").strip()
         if not token:
@@ -59,104 +68,34 @@ def extract_values(text, name, dims):
         literal = token[:-1]
         if not LITERAL_RE.fullmatch(literal):
             fail(f"{name}: unsupported literal {token!r}")
-        values.append(literal)
+        literals.append(float(literal))
     total = 1
     for size in dims:
         total *= size
-    if len(values) != total:
-        fail(f"{name}: found {len(values)} elements, expected {total}")
-    return values
-
-
-def group_fraction_digits(literal):
-    """Return a float literal with its fraction digits grouped in threes, e.g. 0.999996 -> 0.999_996.
-
-    The digits are unchanged, so the value is exactly the source value. clippy::unreadable_literal
-    (denied by the workspace's pedantic lints) requires the separators.
-    """
-    integer, _, fraction = literal.partition(".")
-    grouped = "_".join(fraction[i : i + 3] for i in range(0, len(fraction), 3))
-    return f"{integer}.{grouped}"
-
-
-def wrap(items, per_line):
-    """Split `items` into lines of at most `per_line` comma-terminated entries, indented one level."""
-    lines = []
-    for start in range(0, len(items), per_line):
-        chunk = items[start : start + per_line]
-        lines.append(INDENT * 2 + " ".join(f"{item}," for item in chunk))
-    return lines
-
-
-def render_brdf(values):
-    """`[[[f32; 2]; 64]; 64]`, indexed `[y][x][channel]`: scale and bias, the 3-channel source's first two."""
-    pairs = []
-    for index in range(0, len(values), 3):
-        scale = group_fraction_digits(values[index])
-        bias = group_fraction_digits(values[index + 1])
-        pairs.append(f"[{scale}, {bias}]")
-    rows = []
-    for y in range(TABLE_SIZE):
-        row = pairs[y * TABLE_SIZE : (y + 1) * TABLE_SIZE]
-        rows.append(f"{INDENT}[")
-        rows.extend(wrap(row, 4))
-        rows.append(f"{INDENT}],")
-    return "\n".join(
-        [
-            "#[rustfmt::skip]",
-            f"pub(crate) static BRDF_SCALE_BIAS: [[[f32; 2]; {TABLE_SIZE}]; {TABLE_SIZE}] = [",
-            *rows,
-            "];",
-        ]
-    )
-
-
-def render_btdf(values):
-    """`[[[f32; 64]; 64]; 16]`, indexed `[layer][y][x]`: the transmission factor per roughness layer."""
-    plane = TABLE_SIZE * TABLE_SIZE
-    layers = []
-    for layer in range(LAYER_COUNT):
-        layers.append(f"{INDENT}[")
-        for y in range(TABLE_SIZE):
-            start = layer * plane + y * TABLE_SIZE
-            items = [group_fraction_digits(value) for value in values[start : start + TABLE_SIZE]]
-            layers.append(f"{INDENT * 2}[")
-            layers.extend(wrap(items, 8))
-            layers.append(f"{INDENT * 2}],")
-        layers.append(f"{INDENT}],")
-    return "\n".join(
-        [
-            "#[rustfmt::skip]",
-            f"pub(crate) static BTDF_GT_ONE: [[[f32; {TABLE_SIZE}]; {TABLE_SIZE}]; {LAYER_COUNT}] = [",
-            *layers,
-            "];",
-        ]
-    )
-
-
-def render(brdf, btdf):
-    header = [
-        "//! Generated by `" + SCRIPT_PATH + "` from",
-        "//! `" + SOURCE_PATH + "` at Blender " + BLENDER_VERSION + ".",
-        "//! Do not edit by hand; re-run the script to regenerate.",
-        "//!",
-        "//! `BRDF_SCALE_BIAS[y][x]` is the GGX split sum `(scale, bias)` at roughness `x / 63` and",
-        "//! `sqrt(1 - cos θ) = y / 63`. `BTDF_GT_ONE[layer][y][x]` is the GGX transmission factor for an IOR",
-        "//! above one, at roughness `layer / 16` (EEVEE interpolates between layers `k` and `k + 1` by",
-        "//! `16 · roughness - k`), `sqrt(f0) = x / 63` and `sqrt(1 - cos θ) = y / 63`, with",
-        "//! `f0 = (ior - 1) / (ior + 1)`. Values are the EEVEE literals verbatim, with the C `f` suffix removed.",
-        "",
-    ]
-    return "\n".join([*header, render_brdf(brdf), "", render_btdf(btdf), ""])
+    if len(literals) != total:
+        fail(f"{name}: found {len(literals)} elements, expected {total}")
+    channels = dims[-1]
+    if kept == channels:
+        return literals
+    return [value for index, value in enumerate(literals) if index % channels < kept]
 
 
 def main(argv):
     if len(argv) != 3:
         sys.exit(__doc__)
     text = Path(argv[1]).read_text(encoding="utf-8")
-    brdf = extract_values(text, "brdf_ggx", [TABLE_SIZE, TABLE_SIZE, 3])
-    btdf = extract_values(text, "btdf_ggx", [LAYER_COUNT, TABLE_SIZE, TABLE_SIZE, 1])
-    Path(argv[2]).write_text(render(brdf, btdf), encoding="utf-8")
+    values = array("f")
+    for name, dims, kept in ARRAYS:
+        values.extend(extract_values(text, name, dims, kept))
+    expected = (TABLE_SIZE * TABLE_SIZE * 2) + (LAYER_COUNT * TABLE_SIZE * TABLE_SIZE) + (
+        LAYER_COUNT * TABLE_SIZE * TABLE_SIZE * 3
+    )
+    if len(values) != expected:
+        fail(f"wrote {len(values)} values, expected {expected}")
+    if sys.byteorder == "big":
+        values.byteswap()
+    Path(argv[2]).write_bytes(values.tobytes())
+    print(f"{SCRIPT_PATH} from {SOURCE_PATH} at {BLENDER_VERSION}: {len(values)} f32 values")
 
 
 if __name__ == "__main__":

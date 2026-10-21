@@ -2592,6 +2592,25 @@ pub struct ViewportDisplay {
     pub metallic: f64,
 }
 
+/// Blender's `Material.thickness_mode` (`MA_THICKNESS_SPHERE`, `MA_THICKNESS_SLAB`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThicknessMode {
+    #[default]
+    Sphere,
+    Slab,
+}
+
+impl ThicknessMode {
+    /// The name the operation schema and the Blender bridge use.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sphere => "sphere",
+            Self::Slab => "slab",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Material {
@@ -2614,6 +2633,10 @@ pub struct Material {
     pub transmission: f64,
     #[serde(default = "default_ior")]
     pub ior: f64,
+    /// Blender's `Material.thickness_mode`: the refraction thickness model EEVEE uses when the Thickness socket is not
+    /// linked (`eevee_thickness_lib.bsl.hh`). Sphere is Blender's default.
+    #[serde(default)]
+    pub thickness_mode: ThicknessMode,
     /// Blender's `use_backface_culling` is off for new materials (`MA_BL_CULL_BACKFACE` unset in `DNA_material_types.h`).
     #[serde(default = "default_true")]
     pub double_sided: bool,
@@ -2660,6 +2683,7 @@ impl Default for Material {
             emission_strength: 0.0,
             transmission: 0.0,
             ior: default_ior(),
+            thickness_mode: ThicknessMode::Sphere,
             double_sided: default_true(),
             use_transparent_shadow: default_true(),
             node_tree: None,

@@ -3,7 +3,7 @@ use serde_json::{Map, Value};
 use crate::{
     error::{ErrorCode, Result},
     image::{ImageExtension, ImageInterpolation},
-    model::{Id, Material, TextureRef},
+    model::{Id, Material, TextureRef, ThicknessMode},
 };
 
 use super::{
@@ -47,6 +47,7 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             "emission_strength",
             "transmission",
             "ior",
+            "thickness_mode",
             "graph",
             "base_color_texture",
             "roughness_texture",
@@ -172,6 +173,13 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
     if let Some(value) = operation.get("transmission") {
         material.transmission = read_unit_interval(engine, value, "transmission")?;
     }
+    if let Some(value) = operation.get("thickness_mode") {
+        material.thickness_mode = parse_thickness_mode(
+            engine,
+            value,
+            &operation_pointer(engine.operation_index, "thickness_mode"),
+        )?;
+    }
     if let Some(value) = operation.get("ior") {
         material.ior = read_positive(
             engine,
@@ -256,6 +264,7 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             "emission_strength",
             "transmission",
             "ior",
+            "thickness_mode",
             "base_color_texture",
             "roughness_texture",
             "metallic_texture",
@@ -327,6 +336,16 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                 value,
                 "emission_strength",
                 &operation_pointer(engine.operation_index, "set/emission_strength"),
+            )
+        })
+        .transpose()?;
+    let thickness_mode = set
+        .get("thickness_mode")
+        .map(|value| {
+            parse_thickness_mode(
+                engine,
+                value,
+                &operation_pointer(engine.operation_index, "set/thickness_mode"),
             )
         })
         .transpose()?;
@@ -511,6 +530,12 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                 && !crate::float::equal_f64(material.transmission, value)
             {
                 material.transmission = value;
+                item_changed = true;
+            }
+            if let Some(value) = thickness_mode
+                && material.thickness_mode != value
+            {
+                material.thickness_mode = value;
                 item_changed = true;
             }
             if let Some(value) = ior
@@ -1003,6 +1028,22 @@ fn parse_displacement_method(engine: &Engine<'_>, value: &Value, pointer: &str) 
         _ => Err(engine.error(
             ErrorCode::InvalidOperation,
             "displacement_method must be bump or displacement",
+            pointer,
+        )),
+    }
+}
+
+fn parse_thickness_mode(
+    engine: &Engine<'_>,
+    value: &Value,
+    pointer: &str,
+) -> Result<ThicknessMode> {
+    match value.as_str() {
+        Some("sphere") => Ok(ThicknessMode::Sphere),
+        Some("slab") => Ok(ThicknessMode::Slab),
+        _ => Err(engine.error(
+            ErrorCode::InvalidOperation,
+            "thickness_mode must be sphere or slab",
             pointer,
         )),
     }

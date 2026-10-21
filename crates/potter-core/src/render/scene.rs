@@ -26,7 +26,7 @@ use crate::{
 
 use super::{
     bvh::{Bvh, BvhHit},
-    eevee_transmission::{self, GlassClosures},
+    eevee_transmission::{self, GlassClosures, Thickness, probe_radiance},
     light_model::{
         area_irradiance_per_radiance, area_radiance, area_shape, area_visibility_samples,
         point_intensity, spot_attenuation,
@@ -2204,7 +2204,7 @@ fn shade(
     params: &BsdfParams,
     mode: Mode,
     shadow: ShadowContext<'_>,
-    thickness: f64,
+    object_thickness: f64,
     images: &BTreeMap<String, ImageData>,
 ) -> Result<[f64; 4]> {
     let albedo = DVec3::new(
@@ -2253,6 +2253,12 @@ fn shade(
         let specular_f0 = dielectric_f0(params.ior, params.specular_ior_level);
         let f0 = albedo * metallic + DVec3::splat(specular_f0 * dielectric);
         result += specular_environment * f0 * (1.0 - roughness).powi(2) * lower;
+        // The Material Output's linked Thickness socket decides the thickness when present (EEVEE's `nodetree_thickness`),
+        // and the object's bounds otherwise.
+        let thickness = Thickness::new(
+            params.thickness.unwrap_or(object_thickness),
+            params.thickness_slab,
+        );
         if let Some(closures) =
             eevee_transmission::glass_closures(params, normal, view, lower, thickness)
         {
@@ -2307,14 +2313,14 @@ fn glass_environment(
     images: &BTreeMap<String, ImageData>,
     closures: &GlassClosures,
 ) -> Result<DVec3> {
-    let reflected = prefiltered_world(
+    let reflected = prefiltered_probe(
         world,
         groups,
         images,
         closures.reflection_direction,
         closures.reflection_roughness,
     )?;
-    let transmitted = prefiltered_world(
+    let transmitted = prefiltered_probe(
         world,
         groups,
         images,
@@ -2330,6 +2336,29 @@ fn prefiltered_world(
     images: &BTreeMap<String, ImageData>,
     axis: DVec3,
     roughness: f64,
+) -> Result<DVec3> {
+    prefiltered_with(world, groups, images, axis, roughness, |radiance| radiance)
+}
+
+/// [`prefiltered_world`] over the radiance a light probe stores: each sample is `stored` before the blur, as the
+/// probe's capture format truncates it (`eevee_transmission::probe_radiance`).
+fn prefiltered_probe(
+    world: &crate::model::World,
+    groups: &crate::model::Registry<crate::graph::NodeGroup>,
+    images: &BTreeMap<String, ImageData>,
+    axis: DVec3,
+    roughness: f64,
+) -> Result<DVec3> {
+    prefiltered_with(world, groups, images, axis, roughness, probe_radiance)
+}
+
+fn prefiltered_with(
+    world: &crate::model::World,
+    groups: &crate::model::Registry<crate::graph::NodeGroup>,
+    images: &BTreeMap<String, ImageData>,
+    axis: DVec3,
+    roughness: f64,
+    stored: impl Fn(DVec3) -> DVec3,
 ) -> Result<DVec3> {
     const FILTER_OFFSETS: [[f64; 2]; 5] =
         [[0.0, 0.0], [1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0]];
@@ -2348,7 +2377,9 @@ fn prefiltered_world(
     for offset in FILTER_OFFSETS {
         let direction = (axis + tangent * (spread * offset[0]) + bitangent * (spread * offset[1]))
             .normalize_or_zero();
-        irradiance += crate::shader::evaluate_world(world, groups, images, direction)?;
+        irradiance += stored(crate::shader::evaluate_world(
+            world, groups, images, direction,
+        )?);
     }
     Ok(irradiance / 5.0)
 }

@@ -2532,6 +2532,7 @@ def material_dump(material):
             "metallic": metallic, "roughness": roughness,
             "emission_color": emission_color, "emission_strength": emission_strength,
             "transmission": transmission, "ior": ior,
+            "thickness_mode": "slab" if getattr(material, "thickness_mode", "SPHERE") == "SLAB" else "sphere",
             "double_sided": not bool(getattr(material, "use_backface_culling", False)),
             "use_transparent_shadow": bool(getattr(material, "use_transparent_shadow", True)),
             "use_backface_culling_shadow": bool(getattr(material, "use_backface_culling_shadow", False)),
@@ -6789,6 +6790,10 @@ def _set_alpha_mode(material, item):
         raise ValueError("material %s has unknown alpha_mode %s" % (item.get("name", ""), mode))
     material.surface_render_method = "BLENDED" if mode == "blend" else "DITHERED"
     material.alpha_threshold = float(item.get("alpha_threshold", 0.5))
+    thickness_mode = item.get("thickness_mode", "sphere")
+    if thickness_mode not in ("sphere", "slab"):
+        raise ValueError("material %s has unknown thickness_mode %s" % (item.get("name", ""), thickness_mode))
+    material.thickness_mode = "SLAB" if thickness_mode == "slab" else "SPHERE"
     material[ALPHA_MODE_PROPERTY] = mode
 
 def _text_from_string(name, body):
