@@ -223,3 +223,68 @@ fn graph_edit_survives_export_with_untouched_material() -> TestResult {
     }
     Ok(())
 }
+
+/// A Potter-authored graph is stamped with its material's baseline when the material is created, so a `material.update`
+/// after that reaches the graph: the edited Base Colour replaces the graph's own. The untouched Roughness keeps the
+/// graph's value, because the Material's Roughness still equals its baseline.
+#[test]
+fn material_edit_reaches_a_potter_authored_graph() -> TestResult {
+    let Some(blender) = blender_checked::blender_executable() else {
+        return Ok(());
+    };
+    let root = tempdir()?;
+    let (oracle, _) = build_oracle(&blender, root.path())?;
+    let (project, report) = import_blend(&blender, root.path(), "project", &oracle)?;
+    assert!(
+        losses(&report).is_empty(),
+        "oracle import lost data: {report}"
+    );
+
+    let edited_base = [0.5, 0.5, 0.5, 1.0];
+    let applied = apply_operations(
+        &project,
+        root.path(),
+        json!([
+            {"op": "graph.create", "id": "authored_graph", "kind": "shader"},
+            {"op": "graph.node_add", "graph": "authored_graph", "id": "output",
+             "type": "ShaderNodeOutputMaterial"},
+            {"op": "graph.node_add", "graph": "authored_graph", "id": "principled",
+             "type": "ShaderNodeBsdfPrincipled",
+             "inputs": {"Roughness": GRAPH_ROUGHNESS, "Base Color": GRAPH_BASE}},
+            {"op": "graph.link", "graph": "authored_graph", "from_node": "principled",
+             "from_socket": "BSDF", "to_node": "output", "to_socket": "Surface"},
+            {"op": "material.create", "id": "authored_material", "name": "Authored Graph",
+             "graph": "authored_graph", "base_color": MATERIAL_BASE,
+             "roughness": MATERIAL_ROUGHNESS, "alpha_mode": "opaque"},
+            {"op": "node.create", "id": "authored_body", "kind": "box",
+             "params": {"size": 0.5}, "material": "authored_material"},
+            {"op": "material.update", "target": {"id": "authored_material"},
+             "set": {"base_color": edited_base}}
+        ]),
+    )?;
+    assert_eq!(applied["ok"], true, "authoring failed: {applied}");
+
+    let exported = root.path().join("authored-edit.blend");
+    let export_report = export(&blender, &project, "blend", &exported)?;
+    assert!(
+        losses(&export_report).is_empty(),
+        "export lost data: {export_report}"
+    );
+    let read = blender_principled(&blender, root.path(), &exported)?;
+    let node = &read["Authored Graph"];
+    assert_close(
+        number(&node["roughness"])?,
+        GRAPH_ROUGHNESS,
+        FLOAT_TOLERANCE,
+        "untouched roughness keeps the graph's value",
+    );
+    for (channel, expected) in edited_base.iter().take(3).enumerate() {
+        assert_close(
+            number(&node["base_color"][channel])?,
+            *expected,
+            FLOAT_TOLERANCE,
+            "material base colour edit reaches the authored graph",
+        );
+    }
+    Ok(())
+}

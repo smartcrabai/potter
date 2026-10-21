@@ -1,4 +1,4 @@
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::{
     error::{ErrorCode, Result},
@@ -125,6 +125,119 @@ pub(super) fn attach_default_graph(
 fn content_id(content: &[u8]) -> Result<Id> {
     let hash = sha256(content);
     Id::new(format!("shader_{}", &hash[7..31]))
+}
+
+/// The Material fields Potter's Principled setter writes, which the bridge compares with an authored graph's baseline
+/// (`blend_bridge.py` `_MATERIAL_FIELDS`).
+const BASELINE_FIELDS: [&str; 9] = [
+    "base_color",
+    "metallic",
+    "roughness",
+    "alpha_mode",
+    "alpha_threshold",
+    "emission_color",
+    "emission_strength",
+    "transmission",
+    "ior",
+];
+/// The node property holding Blender custom properties, which `blend_bridge.py` reads back (`_model_group_tree`).
+pub(super) const CUSTOM_PROPERTIES: &str = "_blender_custom_properties";
+/// The custom property holding the baseline (`blend_bridge.py` `_IMPORT_BASELINE_PROPERTY`).
+const BASELINE_PROPERTY: &str = "potter_import_baseline";
+const PRINCIPLED_NODE: &str = "ShaderNodeBsdfPrincipled";
+
+/// Whether a graph node is a Principled BSDF, the node whose inputs a Material field sets.
+pub(super) fn is_principled(node_type: &str) -> bool {
+    node_type == PRINCIPLED_NODE
+}
+
+/// The Material fields a Principled input sets (`blend_bridge.py` `_PRINCIPLED_INPUT_FIELDS`); empty for other inputs.
+pub(super) fn principled_input_fields(input: &str) -> &'static [&'static str] {
+    match input {
+        "Base Color" => &["base_color"],
+        "Alpha" => &["base_color", "alpha_mode", "alpha_threshold"],
+        "Metallic" => &["metallic"],
+        "Roughness" => &["roughness"],
+        "Emission Color" | "Emission" => &["emission_color"],
+        "Emission Strength" => &["emission_strength"],
+        "Transmission Weight" | "Transmission" => &["transmission"],
+        "IOR" => &["ior"],
+        _ => &[],
+    }
+}
+
+fn material_value(material: &Material, field: &str) -> Value {
+    match field {
+        "base_color" => json!(material.base_color),
+        "metallic" => json!(material.metallic),
+        "roughness" => json!(material.roughness),
+        "alpha_mode" => json!(material.alpha_mode),
+        "alpha_threshold" => json!(material.alpha_threshold),
+        "emission_color" => json!(material.emission_color),
+        "emission_strength" => json!(material.emission_strength),
+        "transmission" => json!(material.transmission),
+        "ior" => json!(material.ior),
+        _ => Value::Null,
+    }
+}
+
+/// Records the Material's current values as the baseline of `graph`'s Principled nodes, for `fields` (every Material
+/// field when `None`). The bridge writes a Material field over an authored graph input only when that field differs
+/// from this baseline (`blend_bridge.py` `export_doc`). So a Material edit after this point reaches the graph, and a
+/// field the Material has not changed since keeps the graph's own input.
+pub(super) fn stamp_principled_baseline(
+    graph: &mut NodeGroup,
+    material: &Material,
+    fields: Option<&[&str]>,
+) -> Result<()> {
+    let fields: Vec<&str> = fields.map_or_else(|| BASELINE_FIELDS.to_vec(), <[&str]>::to_vec);
+    for node in graph
+        .nodes
+        .values_mut()
+        .filter(|node| is_principled(&node.node_type))
+    {
+        let mut custom = match node.properties.remove(CUSTOM_PROPERTIES) {
+            Some(Value::Object(map)) => map,
+            _ => serde_json::Map::new(),
+        };
+        let mut baseline = match custom.get(BASELINE_PROPERTY).and_then(Value::as_str) {
+            Some(text) => serde_json::from_str::<serde_json::Map<String, Value>>(text)
+                .map_err(crate::error::PotError::internal_json)?,
+            None => BASELINE_FIELDS
+                .iter()
+                .map(|field| ((*field).to_owned(), material_value(material, field)))
+                .collect(),
+        };
+        for field in &fields {
+            baseline.insert((*field).to_owned(), material_value(material, field));
+        }
+        let text =
+            serde_json::to_string(&baseline).map_err(crate::error::PotError::internal_json)?;
+        custom.insert(BASELINE_PROPERTY.to_owned(), Value::String(text));
+        node.properties
+            .insert(CUSTOM_PROPERTIES.to_owned(), Value::Object(custom));
+    }
+    Ok(())
+}
+
+/// Stamps the baseline on `graph_id`'s Principled nodes from the Material that uses it, when one does.
+pub(super) fn stamp_graph_baseline(
+    doc: &mut crate::model::SceneDoc,
+    graph_id: &Id,
+    fields: Option<&[&str]>,
+) -> Result<()> {
+    let Some(material) = doc
+        .materials
+        .values()
+        .find(|material| material.node_tree.as_ref() == Some(graph_id))
+        .cloned()
+    else {
+        return Ok(());
+    };
+    let Some(graph) = doc.node_groups.get_mut(graph_id) else {
+        return Ok(());
+    };
+    stamp_principled_baseline(graph, &material, fields)
 }
 
 #[cfg(test)]

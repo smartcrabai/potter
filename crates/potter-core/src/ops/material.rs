@@ -3,6 +3,8 @@ use serde_json::{Map, Value};
 use crate::{
     error::{ErrorCode, Result},
     image::{ImageExtension, ImageInterpolation},
+    model::VolumeInterpolation,
+    model::VolumeSampling,
     model::{Id, Material, TextureRef},
 };
 
@@ -53,6 +55,8 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             "metallic_texture",
             "normal_texture",
             "displacement_method",
+            "volume_sampling",
+            "volume_interpolation",
             "volume_density",
             "volume_color",
             "volume_anisotropy",
@@ -98,6 +102,20 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             engine,
             value,
             &operation_pointer(engine.operation_index, "displacement_method"),
+        )?;
+    }
+    if let Some(value) = operation.get("volume_sampling") {
+        material.volume_sampling = parse_volume_sampling(
+            engine,
+            value,
+            &operation_pointer(engine.operation_index, "volume_sampling"),
+        )?;
+    }
+    if let Some(value) = operation.get("volume_interpolation") {
+        material.volume_interpolation = parse_volume_interpolation(
+            engine,
+            value,
+            &operation_pointer(engine.operation_index, "volume_interpolation"),
         )?;
     }
     if let Some(value) = operation.get("volume_density") {
@@ -180,8 +198,11 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             &operation_pointer(engine.operation_index, "ior"),
         )?;
     }
+    let mut authored_graph = None;
     if let Some(graph) = operation.get("graph") {
-        material.node_tree = Some(super::shader::resolve_graph(engine, graph)?);
+        let graph_id = super::shader::resolve_graph(engine, graph)?;
+        material.node_tree = Some(graph_id.clone());
+        authored_graph = Some(graph_id);
     } else {
         super::shader::attach_default_graph(engine, &id, &mut material)?;
     }
@@ -205,6 +226,11 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
         .map(|value| parse_texture_ref(engine, value, "normal_texture"))
         .transpose()?
         .flatten();
+    if let Some(graph_id) = authored_graph
+        && let Some(graph) = engine.doc.node_groups.get_mut(&graph_id)
+    {
+        super::shader::stamp_principled_baseline(graph, &material, None)?;
+    }
     engine.doc.materials.insert(id.clone(), material);
     engine.mark("materials", &id, ChangeKind::Created);
     Ok(true)
@@ -261,6 +287,8 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             "metallic_texture",
             "normal_texture",
             "displacement_method",
+            "volume_sampling",
+            "volume_interpolation",
             "volume_density",
             "volume_color",
             "volume_anisotropy",
@@ -406,6 +434,26 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                 engine,
                 value,
                 &operation_pointer(engine.operation_index, "set/displacement_method"),
+            )
+        })
+        .transpose()?;
+    let volume_sampling = set
+        .get("volume_sampling")
+        .map(|value| {
+            parse_volume_sampling(
+                engine,
+                value,
+                &operation_pointer(engine.operation_index, "set/volume_sampling"),
+            )
+        })
+        .transpose()?;
+    let volume_interpolation = set
+        .get("volume_interpolation")
+        .map(|value| {
+            parse_volume_interpolation(
+                engine,
+                value,
+                &operation_pointer(engine.operation_index, "set/volume_interpolation"),
             )
         })
         .transpose()?;
@@ -559,6 +607,18 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                 && material.displacement_method != *value
             {
                 material.displacement_method.clone_from(value);
+                item_changed = true;
+            }
+            if let Some(value) = volume_sampling
+                && material.volume_sampling != value
+            {
+                material.volume_sampling = value;
+                item_changed = true;
+            }
+            if let Some(value) = volume_interpolation
+                && material.volume_interpolation != value
+            {
+                material.volume_interpolation = value;
                 item_changed = true;
             }
             if let Some(value) = volume_density
@@ -1003,6 +1063,39 @@ fn parse_displacement_method(engine: &Engine<'_>, value: &Value, pointer: &str) 
         _ => Err(engine.error(
             ErrorCode::InvalidOperation,
             "displacement_method must be bump or displacement",
+            pointer,
+        )),
+    }
+}
+
+fn parse_volume_sampling(
+    engine: &Engine<'_>,
+    value: &Value,
+    pointer: &str,
+) -> Result<VolumeSampling> {
+    match value.as_str() {
+        Some("distance") => Ok(VolumeSampling::Distance),
+        Some("equiangular") => Ok(VolumeSampling::Equiangular),
+        Some("multiple_importance") => Ok(VolumeSampling::MultipleImportance),
+        _ => Err(engine.error(
+            ErrorCode::InvalidOperation,
+            "volume_sampling must be distance, equiangular or multiple_importance",
+            pointer,
+        )),
+    }
+}
+
+fn parse_volume_interpolation(
+    engine: &Engine<'_>,
+    value: &Value,
+    pointer: &str,
+) -> Result<VolumeInterpolation> {
+    match value.as_str() {
+        Some("linear") => Ok(VolumeInterpolation::Linear),
+        Some("cubic") => Ok(VolumeInterpolation::Cubic),
+        _ => Err(engine.error(
+            ErrorCode::InvalidOperation,
+            "volume_interpolation must be linear or cubic",
             pointer,
         )),
     }
