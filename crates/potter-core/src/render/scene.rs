@@ -32,7 +32,7 @@ use super::{
     },
     path::{hit_params, object_for_index},
     principled_bsdf::{
-        Layers, layers as principled_layers, light_lobes_coefficient, without_subsurface,
+        Layers, layers as principled_layers, reflected_lobes_coefficient, without_subsurface,
     },
     raster::{
         AlphaMode, Line, Mode, SurfaceHit, SurfaceShader, Triangle, ViewBasis, blend_color,
@@ -2459,7 +2459,7 @@ fn light_contribution(
             // Integrated Lambert irradiance is exact for rectangles and the visibility weight
             // scales it. The specular, sheen and coat lobes are evaluated towards the emitter centre.
             let toward_centre = (position - point).normalize_or_zero();
-            light_lobes_coefficient(
+            reflected_lobes_coefficient(
                 &without_subsurface(params),
                 shading,
                 toward_centre,
@@ -2588,7 +2588,7 @@ fn punctual_radiance(
     if normal_light_cosine <= 0.0 {
         return DVec3::ZERO;
     }
-    light_lobes_coefficient(&without_subsurface(params), shading, light, lobes.mask())
+    reflected_lobes_coefficient(&without_subsurface(params), shading, light, lobes.mask())
         * color
         * (intensity * normal_light_cosine)
 }

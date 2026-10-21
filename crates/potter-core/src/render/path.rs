@@ -19,9 +19,9 @@ use crate::{
 };
 
 use super::principled_bsdf::{
-    GlassSample, Layers, base_color, continuous_density, evaluate as evaluate_bsdf, layers,
-    light_lobes_coefficient, lobe_probabilities, make_orthonormals, sample_glass, specular_eta,
-    subsurface_closure_weight,
+    GlassSample, Layers, base_color, continuous_density, evaluate as evaluate_bsdf,
+    glass_lobes_coefficient, layers, lobe_probabilities, make_orthonormals,
+    reflected_lobes_coefficient, sample_glass, specular_eta, subsurface_closure_weight,
 };
 use super::subsurface::{
     MAX_HITS, ProbeHits, SubsurfaceExit, burley_radius, channel_mask, eval as burley_eval,
@@ -1140,7 +1140,6 @@ fn trace_path(
             .copied()
             .filter(|volume| volume.ray_mask & ray.bit() != 0)
             .collect();
-        let volumes: &[VolumeInstance<'_>] = &segment_volumes;
         // The exit probe is a local intersection inside the object (`subsurface_disk`), not a light path: no volume
         // transport, emission or scatter applies along it, so it takes the neutral segment.
         let stack = if exit_pending {
@@ -1151,7 +1150,7 @@ fn trace_path(
         let grid = if exit_pending {
             None
         } else {
-            voxel_grid(volumes, origin, direction, segment_limit)?
+            voxel_grid(&segment_volumes, origin, direction, segment_limit)?
         };
         // A segment holding both a voxel grid and a mesh medium is mixed: its nearest free flight is sampled analogously.
         let mixed = match (grid.as_ref(), stack) {
@@ -1234,7 +1233,8 @@ fn trace_path(
             // event is taken. The grid's emission runs up to that event, weighted by the mesh's chromatic excess, before the
             // throughput takes any transmittance (`emission_until`). Analog sampling is exact for the event, so the
             // mesh's chromatic transmittance is its only extra weight (`chromatic_correction`).
-            let voxel = trace_volume_segment(Some(grid), volumes, origin, direction, rng, true)?;
+            let voxel =
+                trace_volume_segment(Some(grid), &segment_volumes, origin, direction, rng, true)?;
             let voxel_distance = voxel
                 .event
                 .map(|event| (event.point - origin).dot(direction));
@@ -1361,8 +1361,14 @@ fn trace_path(
             radiance += throughput
                 * emission_until(grid.as_ref(), false, stack.as_ref(), false, segment_limit);
             if let Some(grid) = grid.as_ref() {
-                let segment =
-                    trace_volume_segment(Some(grid), volumes, origin, direction, rng, false)?;
+                let segment = trace_volume_segment(
+                    Some(grid),
+                    &segment_volumes,
+                    origin,
+                    direction,
+                    rng,
+                    false,
+                )?;
                 throughput *= segment.transmittance;
             }
             if let Some(medium) = stack {
@@ -1372,7 +1378,8 @@ fn trace_path(
                 break;
             }
         } else if let (Some(grid), None) = (grid.as_ref(), stack) {
-            let segment = trace_volume_segment(Some(grid), volumes, origin, direction, rng, true)?;
+            let segment =
+                trace_volume_segment(Some(grid), &segment_volumes, origin, direction, rng, true)?;
             let emission_end = segment
                 .event
                 .map_or(segment_limit, |event| (event.point - origin).dot(direction));
@@ -2270,13 +2277,23 @@ fn direct_lighting(
         } else {
             1.0
         };
-        contribution += light_lobes_coefficient(
+        // The reflected lobes sit above the surface, as `evaluate`; the glass lobe takes both sides.
+        let lobes = if facing > 0.0 {
+            reflected_lobes_coefficient(
+                &surface.params,
+                &surface.layers,
+                sample.direction,
+                light.ray_mask,
+            )
+        } else {
+            DVec3::ZERO
+        } + glass_lobes_coefficient(
             &surface.params,
             &surface.layers,
             sample.direction,
             light.ray_mask,
-        ) * sample.radiance
-            * (cosine * visibility * mis);
+        );
+        contribution += lobes * sample.radiance * (cosine * visibility * mis);
     }
     let direction = match importance {
         Some(sampler) if rng.next_f64() >= 0.5 => sampler.sample(rng).0,
@@ -3967,7 +3984,8 @@ fn camera_media(
             direction: probe,
             epsilon: RAY_EPSILON,
             remaining: f64::INFINITY,
-            kind: None,
+            // Cycles builds the camera's volume stack with the camera ray's visibility (`integrator_intersect_volume_stack`).
+            kind: Some(RayKind::Camera),
         },
         |hit, hit_origin| {
             let surface = match make_surface(
@@ -4833,6 +4851,67 @@ mod volume_extinction_tests {
         );
         Ok(())
     }
+    #[test]
+    fn a_volume_hidden_from_camera_rays_still_shadows() -> crate::error::Result<()> {
+        // Cycles tests a volume's bounds per ray kind: a volume hidden from the camera passes camera rays, and one hidden
+        // from shadows passes shadow rays. Both are checked on the same unit-density slab (`visible_camera` off,
+        // `visible_shadow` on, then the reverse).
+        let volume = VolumeData {
+            grids: vec![VolumeGrid {
+                dims: [3, 3, 3],
+                values: Some(vec![1.0; 27]),
+                ..VolumeGrid::default()
+            }],
+            ..VolumeData::default()
+        };
+        let instance = |ray_mask: u8| VolumeInstance {
+            volume: &volume,
+            world_to_local: DMat4::IDENTITY,
+            bounds_min: DVec3::ZERO,
+            bounds_max: DVec3::splat(2.0),
+            voxel_size: 1.0,
+            meters_per_unit: 1.0,
+            density_range: Some((1.0, 1.0)),
+            albedo: DVec3::ZERO,
+            anisotropy: 0.0,
+            emission: DVec3::ZERO,
+            scattering: false,
+            extinction_scale: 1.0,
+            sampling: crate::model::VolumeSampling::MultipleImportance,
+            interpolation: crate::model::VolumeInterpolation::Linear,
+            index_from_local: None,
+            ray_mask,
+        };
+        let shadow_only = RayKind::Shadow.bit();
+        let camera_only = RayKind::Camera.bit();
+        let march = |volumes: &[VolumeInstance<'_>], ray: RayKind| {
+            let mut rng = Pcg32::for_sample(0, 0, 0, 0);
+            march_volumes(
+                volumes,
+                DVec3::new(-1.0, 1.0, 1.0),
+                DVec3::X,
+                f64::INFINITY,
+                Some(&mut rng),
+                ray,
+            )
+        };
+        let hidden_from_camera = [instance(shadow_only)];
+        assert!(
+            (march(&hidden_from_camera, RayKind::Camera)? - 1.0).abs() <= 1.0e-12,
+            "a volume hidden from camera rays must pass them"
+        );
+        assert!(
+            march(&hidden_from_camera, RayKind::Shadow)? < 0.9,
+            "a volume visible to shadows must shadow"
+        );
+        let hidden_from_shadow = [instance(camera_only)];
+        assert!(
+            (march(&hidden_from_shadow, RayKind::Shadow)? - 1.0).abs() <= 1.0e-12,
+            "a volume hidden from shadows must pass shadow rays"
+        );
+        Ok(())
+    }
+
     #[test]
     fn henyey_greenstein_samples_match_the_phase_pdf() {
         const BIN_COUNT: usize = 10;

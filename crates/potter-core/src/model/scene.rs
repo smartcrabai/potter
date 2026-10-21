@@ -1906,6 +1906,9 @@ impl RayVisibility {
 }
 
 impl RayKind {
+    /// Every ray kind's bit: the mask of a surface that no ray kind hides (`RayVisibility::default`).
+    pub const ALL_MASK: u8 = (1 << 6) - 1;
+
     /// The kind's bit in a ray mask (`PATH_RAY_*` in Cycles' kernel).
     #[must_use]
     pub const fn bit(self) -> u8 {

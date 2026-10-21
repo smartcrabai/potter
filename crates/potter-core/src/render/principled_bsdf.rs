@@ -305,16 +305,13 @@ const COAT_WEIGHT_CUTOFF: f64 = 1.0e-5;
 
 /// Continuous Principled BSDF times reflectance, the `evaluate / density` estimator's numerator.
 pub(crate) fn evaluate(params: &BsdfParams, layers: &Layers, light: DVec3) -> DVec3 {
-    // The reflective lobes sit above the surface; the glass lobe takes both sides.
-    let reflective = if layers.normal.dot(light) > 0.0 {
-        diffuse_lobe(params, layers.normal, layers.view, layers.lower)
-            + specular_lobe(params, layers.normal, layers.view, light, layers.lower)
-            + sheen_coefficient(params, layers, light)
-            + coat_coefficient(params, layers, light)
+    // The reflected lobes sit above the surface; the glass lobe takes both sides. A surface is hidden from no ray kind.
+    let reflected = if layers.normal.dot(light) > 0.0 {
+        reflected_lobes_coefficient(params, layers, light, RayKind::ALL_MASK)
     } else {
         DVec3::ZERO
     };
-    reflective + glass_coefficient(params, layers, light)
+    reflected + glass_lobes_coefficient(params, layers, light, RayKind::ALL_MASK)
 }
 
 /// The sheen lobe along `light`, times reflectance. It depends on the light, so an area light is
@@ -641,13 +638,13 @@ pub(super) fn make_orthonormals(normal: DVec3) -> (DVec3, DVec3) {
     (tangent, normal.cross(tangent))
 }
 
-/// The lobes of `params` towards `light` that a light emits through, each kept only where the light's
-/// ray mask admits its ray kind. Cycles drops a closure from a light's direct lighting when that light
-/// excludes its kind (`surface_shader.h`, `_surface_shader_exclude`). Sheen is a diffuse-class closure
-/// (`CLOSURE_IS_BSDF_DIFFUSE`, `svm/types.h`), and the coat is a glossy GGX closure. A glass closure is
-/// both glossy and transmissive, so it is dropped only when the light excludes both kinds
-/// (`exclude_glass`, the same function).
-pub(crate) fn light_lobes_coefficient(
+/// The reflected lobes of `params` towards `light` that a light emits through, each kept only where the light's ray
+/// mask admits its ray kind. Cycles drops a closure from a light's direct lighting when that light excludes its kind
+/// (`surface_shader.h`, `_surface_shader_exclude`). Sheen is a diffuse-class closure (`CLOSURE_IS_BSDF_DIFFUSE`,
+/// `svm/types.h`), and the coat is a glossy GGX closure. This is not side-gated: the caller decides which side of the
+/// surface the light is on (`evaluate`, `direct_lighting`), and the raster's area lights integrate over a centre that
+/// may lie below the horizon.
+pub(crate) fn reflected_lobes_coefficient(
     params: &BsdfParams,
     layers: &Layers,
     light: DVec3,
@@ -663,12 +660,23 @@ pub(crate) fn light_lobes_coefficient(
     } else {
         DVec3::ZERO
     };
-    let glass = if ray_mask & (RayKind::Glossy.bit() | RayKind::Transmission.bit()) != 0 {
+    diffuse + specular
+}
+
+/// The glass lobe towards `light`, kept where the light's ray mask admits glossy or transmission. A glass closure is
+/// both glossy and transmissive, so it is dropped only when the light excludes both kinds (`exclude_glass`). It takes
+/// both sides of the surface.
+pub(crate) fn glass_lobes_coefficient(
+    params: &BsdfParams,
+    layers: &Layers,
+    light: DVec3,
+    ray_mask: u8,
+) -> DVec3 {
+    if ray_mask & (RayKind::Glossy.bit() | RayKind::Transmission.bit()) != 0 {
         glass_coefficient(params, layers, light)
     } else {
         DVec3::ZERO
-    };
-    diffuse + specular + glass
+    }
 }
 
 /// The base colour clamped to 1 (Cycles' `clamped_base_color`, used by the F82 metal lobe).
