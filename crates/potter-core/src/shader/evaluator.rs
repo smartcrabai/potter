@@ -1247,9 +1247,11 @@ pub struct PreparedMaterial {
 struct LinkIndex {
     /// The graph this index was built from; `None` when the material has no graph.
     graph: Option<Id>,
-    /// The address and length of the graph's `links` buffer when the index was built. Every mutation that adds,
-    /// removes or reorders links changes the length or moves the buffer, and the codebase never edits a link in place,
-    /// so an index built before a change is not used.
+    /// The address and length of the graph's `links` buffer when the index was built. This is a guard, not a content
+    /// check: a buffer replaced by one of the same address and length, or a link rewritten in place, is not detected.
+    /// The crate does not keep a `PreparedMaterial` across document edits: each render prepares its materials from the
+    /// document it reads, so an index is never used against links it was not built from. The lookup also re-checks the
+    /// target node and socket of each candidate link.
     links_address: usize,
     link_count: usize,
     /// For each target node, the indices into `NodeGroup::links` of its incoming links in link order. The first entry
@@ -1408,7 +1410,8 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
                     .flatten()
                     .find_map(|&socket_index| {
                         let link = group.links.get(socket_index)?;
-                        socket_matches(&link.to_socket, socket).then_some((socket_index, link))
+                        (link.to_node == *node_id && socket_matches(&link.to_socket, socket))
+                            .then_some((socket_index, link))
                     })
             }
             None => group.links.iter().enumerate().find(|(_, link)| {

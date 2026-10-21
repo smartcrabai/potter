@@ -593,6 +593,16 @@ fn render_rows(
     Ok(())
 }
 
+/// The contiguous row bands that split `height` rows across at most `band_count` workers, in row order. Each band has
+/// `ceil(height / band_count)` rows except the last, and no band is empty.
+fn band_rows(height: usize, band_count: usize) -> Vec<Range<usize>> {
+    let rows_per_band = height.div_ceil(band_count.max(1)).max(1);
+    (0..height)
+        .step_by(rows_per_band)
+        .map(|start| start..(start + rows_per_band).min(height))
+        .collect()
+}
+
 /// Appends one worker's shading warnings to `sink`, dropping those the serial render would not have recorded. A
 /// Principled input is recorded once per (material, input) (`record_unevaluated_inputs`); the layer warnings once per
 /// equal warning (`layer_index`, `color_layer_missing`). Workers record into their own sinks, so a duplicate across
@@ -748,29 +758,27 @@ pub(super) fn render(
             film_transparent,
             environment,
         };
-        let worker_count = std::thread::available_parallelism()
-            .map_or(1, std::num::NonZeroUsize::get)
-            .min(height_usize);
-        let rows_per_band = height_usize.div_ceil(worker_count);
-        let band_pixels = rows_per_band * width_usize;
+        let bands = band_rows(
+            height_usize,
+            std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+        );
         let outcomes = std::thread::scope(|scope| {
             let job = &job;
-            let mut workers = Vec::with_capacity(worker_count);
-            for (band, (linear, rgba)) in output
-                .linear_rgba
-                .chunks_mut(band_pixels)
-                .zip(output.rgba.chunks_mut(band_pixels * 4))
-                .enumerate()
-            {
-                let first_row = band * rows_per_band;
-                let end_row = first_row + linear.len() / width_usize;
+            let mut workers = Vec::with_capacity(bands.len());
+            let mut linear_rest = output.linear_rgba.as_mut_slice();
+            let mut rgba_rest = output.rgba.as_mut_slice();
+            for rows in bands {
+                let band_len = rows.len() * width_usize;
+                let (linear, linear_tail) = std::mem::take(&mut linear_rest).split_at_mut(band_len);
+                let (rgba, rgba_tail) = std::mem::take(&mut rgba_rest).split_at_mut(band_len * 4);
+                linear_rest = linear_tail;
+                rgba_rest = rgba_tail;
                 workers.push(
                     std::thread::Builder::new()
                         .stack_size(WORKER_STACK_BYTES)
                         .spawn_scoped(scope, move || {
                             let warnings = RefCell::new(Vec::new());
-                            let result =
-                                render_rows(job, first_row..end_row, linear, rgba, &warnings);
+                            let result = render_rows(job, rows, linear, rgba, &warnings);
                             (result, warnings.into_inner())
                         }),
                 );
@@ -5483,5 +5491,83 @@ mod sampling_tests {
             (pdf - 4.0).abs() < 1.0e-12,
             "density {pdf} is not measured from the receiver"
         );
+    }
+}
+
+#[cfg(test)]
+mod band_tests {
+    use std::cell::RefCell;
+
+    use serde_json::{Value, json};
+
+    use super::{band_rows, merge_shader_warnings};
+
+    /// Records one warning as a worker's sink does: a Principled input once per (material, input)
+    /// (`record_unevaluated_inputs`), any other warning once per equal value (`layer_index`, `color_layer_missing`).
+    fn record(sink: &mut Vec<Value>, warning: Value) {
+        let duplicate = match warning["input"].as_str() {
+            Some(input) => sink.iter().any(|existing| {
+                existing["material"] == warning["material"]
+                    && existing["input"].as_str() == Some(input)
+            }),
+            None => sink.contains(&warning),
+        };
+        if !duplicate {
+            sink.push(warning);
+        }
+    }
+
+    #[test]
+    fn bands_cover_every_row_once_in_order() {
+        for height in [1_usize, 2, 7, 64, 192] {
+            for band_count in [0_usize, 1, 2, 3, 6, 64, 500] {
+                let bands = band_rows(height, band_count);
+                assert!(bands.len() <= band_count.max(1));
+                let mut next = 0;
+                for band in &bands {
+                    assert_eq!(band.start, next);
+                    assert!(!band.is_empty());
+                    next = band.end;
+                }
+                assert_eq!(next, height, "height {height}, band count {band_count}");
+            }
+        }
+    }
+
+    #[test]
+    fn merged_band_warnings_equal_the_single_band_warnings() {
+        // A pixel-ordered stream in which each warning recurs in every band, as a shared material does.
+        let stream: Vec<Value> = (0..48)
+            .map(|index| match index % 4 {
+                0 => json!({"code": "UNSUPPORTED_FEATURE", "feature_id": "shader.principled.anisotropic",
+                    "material": "a", "input": "Anisotropic", "message": "a"}),
+                1 => json!({"code": "UNSUPPORTED_FEATURE", "feature_id": "shader.principled.anisotropic",
+                    "material": "b", "input": "Anisotropic", "message": "b"}),
+                2 => json!({"code": "uv.layer_missing", "layer": "UV2",
+                    "message": "UV layer `UV2` is not on this mesh; the render layer was used"}),
+                _ => json!({"code": "mesh.color_layer_missing", "layer": "Col",
+                    "message": "color layer `Col` is not on this mesh; opaque black was used"}),
+            })
+            .collect();
+        let mut single = Vec::new();
+        for warning in &stream {
+            record(&mut single, warning.clone());
+        }
+        assert_eq!(
+            single.len(),
+            4,
+            "the single-band render records each distinct warning once"
+        );
+        for band_count in [1_usize, 2, 3, 5, 7, 48] {
+            let sink = RefCell::new(Vec::new());
+            for rows in band_rows(stream.len(), band_count) {
+                let mut band_sink = Vec::new();
+                for warning in &stream[rows] {
+                    record(&mut band_sink, warning.clone());
+                }
+                merge_shader_warnings(&sink, band_sink);
+            }
+            assert_eq!(sink.into_inner(), single, "band count {band_count}");
+        }
     }
 }
