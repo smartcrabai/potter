@@ -27,7 +27,6 @@ use super::subsurface_walk::{
     WalkEntry, WalkMethod, entry_direction, skin_entry_direction, walk, walk_anisotropy,
     walk_radius, walk_uses_van_de_hulst,
 };
-use super::subsurface_walk::{WalkEntry, entry_direction, walk};
 use super::{
     bvh::{Bvh, BvhHit},
     light_model::{

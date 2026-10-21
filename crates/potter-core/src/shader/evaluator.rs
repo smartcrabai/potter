@@ -3497,12 +3497,6 @@ mod tests {
             "ShaderNodeBsdfPrincipled",
             json!({"Subsurface Weight":0.5,"Thin Wall":1.0,"Transmission Weight":0.5,"Roughness":0.3}),
         );
-        graph
-            .nodes
-            .get_mut(&Id::new("principled".to_owned()).unwrap())
-            .unwrap()
-            .properties
-            .insert("subsurface_method".to_owned(), json!("RANDOM_WALK_SKIN"));
         link(&mut graph, "principled", "BSDF", "output", "Surface");
         let graph_id = Id::new("graph_shader".to_owned()).unwrap();
         groups.insert(graph_id.clone(), graph);
