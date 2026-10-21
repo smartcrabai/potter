@@ -1673,7 +1673,7 @@ fn export_sequence_frame_files(
         .collect::<Result<Vec<_>>>()?;
     ordered.sort_by_key(|(frame, _)| *frame);
     let folder = sidecar.join(id);
-    fs::create_dir_all(&folder).map_err(|error| PotError::io(&error))?;
+    fs::create_dir_all(&folder).map_err(|error| PotError::io_at(&error, &folder))?;
     let mut first = None;
     for (frame, record) in ordered {
         let bytes = sequence_frame_bytes(project, id, frame, record)?;
@@ -1693,7 +1693,9 @@ fn export_sequence_frame_files(
             })?;
         let destination = folder.join(name);
         if destination.exists() {
-            if fs::read(&destination).map_err(|error| PotError::io(&error))? != bytes {
+            if fs::read(&destination).map_err(|error| PotError::io_at(&error, &destination))?
+                != bytes
+            {
                 return Err(PotError::with_details(
                     ErrorCode::ExportFailed,
                     "sequence frame file already exists with different content",
@@ -1703,7 +1705,8 @@ fn export_sequence_frame_files(
         } else {
             write_asset_sidecar(&destination, &bytes)?;
         }
-        let absolute = fs::canonicalize(&destination).map_err(|error| PotError::io(&error))?;
+        let absolute = fs::canonicalize(&destination)
+            .map_err(|error| PotError::io_at(&error, &destination))?;
         first.get_or_insert(absolute);
         if !files.contains(&destination) {
             files.push(destination);
@@ -1739,7 +1742,7 @@ fn sequence_frame_bytes(
                 json!({"resource_id":id,"frame":frame,"uri":uri}),
             )
         })?;
-        fs::read(&path).map_err(|error| PotError::io(&error))?
+        fs::read(&path).map_err(|error| PotError::io_at(&error, &path))?
     };
     let digest = crate::hash::sha256(&bytes);
     if record
@@ -2728,11 +2731,11 @@ fn write_asset_sidecar(path: &Path, bytes: &[u8]) -> Result<()> {
         .write(true)
         .create_new(true)
         .open(path)
-        .map_err(|error| PotError::io(&error))?;
+        .map_err(|error| PotError::io_at(&error, path))?;
     if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
         drop(file);
         let _ = fs::remove_file(path);
-        return Err(PotError::io(&error));
+        return Err(PotError::io_at(&error, path));
     }
     Ok(())
 }
