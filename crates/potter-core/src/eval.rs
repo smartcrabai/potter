@@ -2537,7 +2537,6 @@ fn prepare_node_bake_modifiers<'a>(
                         .capacity()
                         .saturating_mul(std::mem::size_of::<crate::graph::NodeBakeFrame>());
                     let mut previous_frame = None;
-                    let mut missing_frame = false;
                     for entry in frame_entries {
                         let expected_frame = entry
                             .get("frame")
@@ -2577,8 +2576,9 @@ fn prepare_node_bake_modifiers<'a>(
                             read_limit,
                         )?
                         else {
-                            missing_frame = true;
-                            break;
+                            // A missing frame is skipped: Blender interpolates it from the
+                            // neighbouring cached frames (MOD_nodes.cc read_interpolated).
+                            continue;
                         };
                         let frame = serde_json::from_slice::<crate::graph::NodeBakeFrame>(&bytes)
                             .map_err(|error| {
@@ -2617,7 +2617,8 @@ fn prepare_node_bake_modifiers<'a>(
                         retained_bytes = retained_bytes.saturating_add(frame_bytes);
                         frames.push(frame);
                     }
-                    if missing_frame {
+                    if frames.is_empty() {
+                        // No cached frame at all: Blender passes the live geometry through.
                         None
                     } else {
                         Some(crate::graph::NodeBakeRecord {
