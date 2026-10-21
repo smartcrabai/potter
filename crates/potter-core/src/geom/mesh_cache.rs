@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::{Arc, LazyLock, Mutex},
 };
 
@@ -469,7 +469,7 @@ fn carry_uv_store(input: &Mesh, replacement: &mut Mesh) {
 
 /// Carries the receiver's shading onto a replacement with the same faces. Blender keeps a receiver's
 /// `sharp_face` and `sharp_edge` through a same-topology read, so the custom-normal setter sees them.
-/// Faces map by index; edges map by their vertex pair, since the replacement numbers its own edges.
+/// Faces and edges map by index: a same-topology read keeps the receiver's edge order.
 fn carry_shading(input: &Mesh, replacement: &mut Mesh) -> Result<()> {
     if input.attributes.contains_key("shade_smooth") && input.faces.len() == replacement.faces.len()
     {
@@ -485,24 +485,13 @@ fn carry_shading(input: &Mesh, replacement: &mut Mesh) -> Result<()> {
             json!({"domain": "face", "type": "bool", "values": values}),
         );
     }
-    if input.attributes.contains_key("sharp") {
+    if input.attributes.contains_key("sharp") && input.edges.len() == replacement.edges.len() {
         let flags = sharp_edge_flags(input)?;
-        let sharp_pairs = input
-            .edges
-            .iter()
-            .zip(flags)
-            .filter(|(_, sharp)| *sharp)
-            .map(|(edge, _)| sorted_pair(edge.vertices))
-            .collect::<HashSet<_>>();
         let values: serde_json::Map<String, Value> = replacement
             .edges
             .iter()
-            .map(|edge| {
-                (
-                    format!("e{}", edge.id),
-                    json!(sharp_pairs.contains(&sorted_pair(edge.vertices))),
-                )
-            })
+            .zip(flags)
+            .map(|(edge, flag)| (format!("e{}", edge.id), json!(flag)))
             .collect();
         replacement.attributes.insert(
             "sharp".to_owned(),
@@ -510,10 +499,6 @@ fn carry_shading(input: &Mesh, replacement: &mut Mesh) -> Result<()> {
         );
     }
     Ok(())
-}
-
-fn sorted_pair(vertices: [u32; 2]) -> [u32; 2] {
-    [vertices[0].min(vertices[1]), vertices[0].max(vertices[1])]
 }
 
 /// Writes each cached UV layer into the layer its name gives, creating the layer when the mesh
