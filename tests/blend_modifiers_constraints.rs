@@ -1562,6 +1562,33 @@ fn modifier_round_trip(case_name: &str) -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
+    let (import_error, import_volume_error) =
+        check_imported_modifier(case, case_name, kind, &project, owner_id, mappings, &before)?;
+    let after = export_and_reopen_modifiers(&blender, root, &project)?;
+    check_reopened_modifier(
+        case,
+        case_name,
+        kind,
+        &after,
+        &before,
+        import_error,
+        import_volume_error,
+    )?;
+
+    Ok(())
+}
+
+/// The import checks of one modifier case: the host's modifier, its parameters and its evaluated
+/// geometry as Potter imports them. Returns the import errors that the reopen checks report.
+fn check_imported_modifier(
+    case: &Value,
+    case_name: &str,
+    kind: &str,
+    project: &Path,
+    owner_id: &str,
+    mappings: &serde_json::Map<String, Value>,
+    before: &Value,
+) -> Result<(f64, f64), Box<dyn Error>> {
     let inspected = pot_json(&["inspect", project.to_str().unwrap(), "--id", owner_id])?;
     let owner = inspected["result"]["items"]
         .as_array()
@@ -1718,6 +1745,16 @@ fn modifier_round_trip(case_name: &str) -> Result<(), Box<dyn Error>> {
         (error, 0.0)
     };
 
+    Ok((import_error, import_volume_error))
+}
+
+/// Exports the imported project to a `.blend` and reopens it in Blender. Returns the reopened
+/// document, keyed by case name.
+fn export_and_reopen_modifiers(
+    blender: &Path,
+    root: &Path,
+    project: &Path,
+) -> Result<Value, Box<dyn Error>> {
     let exported = root.join("modifier_roundtrip.blend");
     pot_json(&[
         "export",
@@ -1749,6 +1786,21 @@ fn modifier_round_trip(case_name: &str) -> Result<(), Box<dyn Error>> {
         "Blender modifier reopen failed: stdout={stdout} stderr={stderr}",
     );
     let after: Value = serde_json::from_slice(&fs::read(&reopened_path)?)?;
+    Ok(after)
+}
+
+/// The reopen checks of one modifier case: the exported type, parameters and geometry, against the
+/// Blender-side values and the import errors that `check_imported_modifier` returned.
+fn check_reopened_modifier(
+    case: &Value,
+    case_name: &str,
+    kind: &str,
+    after: &Value,
+    before: &Value,
+    import_error: f64,
+    import_volume_error: f64,
+) -> Result<(), Box<dyn Error>> {
+    let before_geometry = &before[case_name];
     let reopened = &after[case_name];
     assert_eq!(reopened["type"], kind, "{case_name}");
     let exported_params = case.get("exported").unwrap_or(&case["props"]);
@@ -1877,6 +1929,78 @@ fn modifier_round_trip(case_name: &str) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Every boolean case in one scene: one Blender fixture, one Potter import, one export and one
+/// reopen, with the same per-case checks as `modifier_round_trip`. The launches go from four per
+/// case (44 Blender launches and 11 Potter imports and exports across the eleven cases) to one each.
+fn boolean_round_trip_batch() -> Result<(), Box<dyn Error>> {
+    let Some(blender) = blender() else {
+        return Ok(());
+    };
+    let cases = boolean_cases();
+    let directory = tempdir()?;
+    let root = directory.path();
+    fs::write(
+        root.join("modifier_cases.json"),
+        serde_json::to_vec(&cases)?,
+    )?;
+    run_blender_script(
+        &blender,
+        "make_modifier.py",
+        MODIFIER_FIXTURE,
+        root,
+        &[],
+        "Blender fixture failed",
+        run_guarded,
+    )?;
+    let before: Value = serde_json::from_slice(&fs::read(root.join("modifier_before.json"))?)?;
+    let project = root.join("modifier_project");
+    pot_json(&["init", project.to_str().unwrap()])?;
+    let imported = pot_json(&[
+        "import",
+        project.to_str().unwrap(),
+        "--file",
+        root.join("modifier_source.blend").to_str().unwrap(),
+        "--format",
+        "blend",
+        "--mode",
+        "replace",
+        "--base-revision",
+        "0",
+        "--blender",
+        blender.to_str().unwrap(),
+    ])?;
+    let mappings = imported["result"]["id_mappings"].as_object().unwrap();
+    let losses = imported["result"]["losses"].as_array().unwrap();
+    assert!(
+        !losses
+            .iter()
+            .any(|loss| loss["feature_id"] == "blender.modifier.boolean"),
+        "boolean batch: import reported modifier loss: {losses:?}"
+    );
+    let mut imports = Vec::new();
+    for case in &cases {
+        let case_name = case["name"].as_str().unwrap();
+        let owner_id = mappings[&format!("Object:{case_name}")].as_str().unwrap();
+        imports.push(check_imported_modifier(
+            case, case_name, "BOOLEAN", &project, owner_id, mappings, &before,
+        )?);
+    }
+    let after = export_and_reopen_modifiers(&blender, root, &project)?;
+    for (case, (import_error, import_volume_error)) in cases.iter().zip(imports) {
+        let case_name = case["name"].as_str().unwrap();
+        check_reopened_modifier(
+            case,
+            case_name,
+            "BOOLEAN",
+            &after,
+            &before,
+            import_error,
+            import_volume_error,
+        )?;
+    }
+    Ok(())
+}
+
 macro_rules! modifier_test {
     ($test_name:ident, $case_name:literal) => {
         #[test]
@@ -1970,13 +2094,14 @@ modifier_test!(
 modifier_test!(blender_weld_round_trip, "CaseWeld");
 modifier_test!(blender_displace_round_trip, "CaseDisplace");
 modifier_test!(blender_smooth_round_trip, "CaseSmooth");
-// Blender 5.2 does not support COLLECTION + FLOAT + INTERSECT.
+// The eleven boolean cases share one scene. Before, each case ran its own Blender fixture, Potter import,
+// Potter export and Blender reopen (44 Blender launches and 11 Potter imports and exports in all); now
+// they run once (4 Blender launches, 1 Potter import, 1 export). Every case keeps its own checks: the
+// owner's modifier and parameters, the evaluated geometry, the exported parameters and the reopened
+// surface and volume. Blender 5.2 does not support COLLECTION + FLOAT + INTERSECT, so that case is absent.
 #[test]
 fn blender_boolean_round_trip() -> Result<(), Box<dyn Error>> {
-    for case in boolean_cases() {
-        modifier_round_trip(case["name"].as_str().unwrap())?;
-    }
-    Ok(())
+    boolean_round_trip_batch()
 }
 modifier_test!(blender_shrinkwrap_round_trip, "CaseShrinkwrap");
 modifier_test!(blender_cast_round_trip, "CaseCast");
