@@ -1788,7 +1788,11 @@ mod single_bounce_tests {
     /// Quadrature of the disk in polar coordinates. `COARSE` (96 radial × 192 angular midpoints)
     /// agrees with a converged square grid to about 1e-4 relative on the diffuse, sheen and metal
     /// variants. On the coat it is 9e-5 at roughness 0.24 and 1.7e-3 at roughness 0.1, so the coat
-    /// oracles use `FINE` (384 × 768: 5e-7 and 1.0e-4 respectively).
+    /// oracles use `FINE` (384 × 768: 5e-7 and 1.0e-4 respectively). The specular lobe narrows
+    /// as roughness falls, and `COARSE` overshoots it: against 768 × 1536 midpoints, the radius 1.2
+    /// spec-only pixel is +0.01% at roughness 0.24, +0.10% at 0.12 and +0.17% at 0.10. Oracles below
+    /// roughness 0.2 need `FINE` or finer. One 4096-sample Blender render at roughness 0.10 scatters
+    /// by about 0.12% (16-seed stderr × 4).
     #[derive(Clone, Copy)]
     struct Steps {
         radial: usize,
