@@ -19,10 +19,11 @@ use crate::{
 
 use super::{
     raster::{
-        Camera, CameraEngine, DepthOfField, Mode, Projection, RasterOutput, StereoMode, ViewBasis,
-        projection_for_camera, rasterize_with_lines,
+        Camera, CameraEngine, DepthOfField, Mode, Projection, RasterOutput, StereoMode,
+        SurfaceShader, ViewBasis, projection_for_camera, rasterize_wireframe, rasterize_with_lines,
     },
     scene::{Geometry, extract_geometry, surface_shader},
+    wireframe,
 };
 
 const MIN_SIZE: u32 = 64;
@@ -222,9 +223,8 @@ pub fn render_previews(
                 &images,
             )?
         } else {
-            rasterize_with_lines(
-                &geometry.triangles,
-                &geometry.lines,
+            rasterize_view(
+                geometry,
                 &prepared.camera,
                 request.size,
                 request.size,
@@ -382,9 +382,8 @@ pub(crate) fn render_camera_frame(
             &images,
         )?
     } else {
-        rasterize_with_lines(
-            &geometry.triangles,
-            &geometry.lines,
+        rasterize_view(
+            &geometry,
             &camera.camera,
             width,
             height,
@@ -646,7 +645,50 @@ fn adaptive_camera_override(camera: &PreparedCamera) -> AdaptiveCameraOverride {
     }
 }
 
+/// Rasterises one view. Wire draws Blender's wireframe overlay of the geometry's wire edges and points
+/// (`wireframe.rs`); every other mode rasterises triangles and strokes.
+fn rasterize_view(
+    geometry: &Geometry,
+    camera: &Camera,
+    width: u32,
+    height: u32,
+    mode: Mode,
+    background: [u8; 4],
+    samples: u32,
+    seed: u32,
+    shader: Option<&dyn SurfaceShader>,
+) -> Result<RasterOutput> {
+    if !matches!(mode, Mode::Wire) {
+        return rasterize_with_lines(
+            &geometry.triangles,
+            &geometry.lines,
+            camera,
+            width,
+            height,
+            mode,
+            background,
+            samples,
+            seed,
+            shader,
+        );
+    }
+    // The overlay's edges and points come from the scene's wire geometry; the lines feed the pick buffers.
+    rasterize_wireframe(
+        &geometry.wire_edges,
+        &geometry.wire_points,
+        &geometry.triangles,
+        &geometry.lines,
+        camera,
+        width,
+        height,
+    )
+}
+
 fn background_color(doc: &SceneDoc, snapshot: &Snapshot, mode: Mode, transparent: bool) -> [u8; 4] {
+    // Wire shows the viewport's theme interior, opaque, as Blender's wireframe overlay does.
+    if matches!(mode, Mode::Wire) {
+        return wireframe::background_rgba();
+    }
     let alpha = if transparent { 0 } else { 255 };
     if matches!(mode, Mode::Solid) {
         // Workbench's render background is the scene world's horizon colour (`World.color`, not
