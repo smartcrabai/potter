@@ -596,6 +596,93 @@ fn voxel_remesh_produces_watertight_surface_near_source_bounds() -> Result<(), B
 }
 
 #[test]
+fn shrinkwrap_scene_operand_reaches_modifier_apply_and_persistence() -> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let scene = directory.path().join("scene");
+    let batch = directory.path().join("operations.json");
+    let init = Command::new(env!("CARGO_BIN_EXE_pot"))
+        .arg("init")
+        .arg(&scene)
+        .arg("--json")
+        .output()?;
+    assert!(init.status.success());
+    fs::write(
+        &batch,
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "base_revision": 0,
+            "operations": [
+                {"op":"node.create","id":"subject","kind":"plane","params":{"size":2.0}},
+                {"op":"node.create","id":"target","kind":"plane","params":{"size":2.0}},
+                {"op":"node.create","id":"auxiliary","kind":"plane","params":{"size":2.0},"transform":{"translation":[0.0,0.0,3.0]}},
+                {
+                    "op":"mesh.transform_elements",
+                    "target":{"id":"subject","elements":{"domain":"vertex","ids":["v0","v1","v2","v3"]}},
+                    "translation":[0.0,0.0,1.0]
+                },
+                {
+                    "op":"modifier.create",
+                    "target":{"id":"subject"},
+                    "id":"wrap",
+                    "type":"shrinkwrap",
+                    "params":{
+                        "target":"target",
+                        "auxiliary_target":"auxiliary",
+                        "wrap_method":"PROJECT",
+                        "use_project_z":true,
+                        "use_positive_direction":true,
+                        "use_negative_direction":false,
+                        "wrap_mode":"ON_SURFACE",
+                        "offset":0.25
+                    }
+                },
+                {"op":"modifier.apply","target":{"id":"subject"},"modifier_id":"wrap"},
+                {
+                    "op":"modifier.create",
+                    "target":{"id":"subject"},
+                    "id":"self-wrap",
+                    "type":"shrinkwrap",
+                    "params":{"target":"subject","wrap_method":"NEAREST_SURFACEPOINT"}
+                },
+                {"op":"modifier.apply","target":{"id":"subject"},"modifier_id":"self-wrap"}
+            ]
+        }))?,
+    )?;
+    let applied = Command::new(env!("CARGO_BIN_EXE_pot"))
+        .arg("apply")
+        .arg(&scene)
+        .arg("--file")
+        .arg(&batch)
+        .arg("--json")
+        .output()?;
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stdout)
+    );
+
+    let persisted: Value = serde_json::from_slice(&fs::read(scene.join("scene.json"))?)?;
+    assert_eq!(persisted["nodes"]["subject"]["modifiers"], json!([]));
+    let data_id = persisted["nodes"]["subject"]["data"]
+        .as_str()
+        .ok_or("subject has no mesh data")?;
+    let vertices = persisted["data_blocks"][data_id]["mesh"]["vertices"]
+        .as_array()
+        .ok_or("subject mesh has no vertices")?;
+    assert_eq!(vertices.len(), 4);
+    for vertex in vertices {
+        let position = vertex["co"]
+            .as_array()
+            .ok_or("vertex position is invalid")?;
+        assert!(
+            (position[2].as_f64().ok_or("missing Z")? - 2.75).abs() <= 1.0e-9,
+            "vertex position: {position:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn mirror_object_apply_uses_owner_and_mirror_world_matrices() -> Result<(), Box<dyn Error>> {
     let directory = tempdir()?;
     let scene = directory.path().join("scene");
