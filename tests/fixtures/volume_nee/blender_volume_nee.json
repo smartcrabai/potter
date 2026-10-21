@@ -1,0 +1,48 @@
+{
+ "blender": "5.2.2 LTS",
+ "samples": 65536,
+ "energy": 100.0,
+ "position": [
+  1.6,
+  0.6,
+  0.9
+ ],
+ "density": 0.05,
+ "gradient_scale": 0.05,
+ "pixel_centres": [
+  -0.375,
+  -0.125,
+  0.125,
+  0.375
+ ],
+ "cases": {
+  "diffuse": {
+   "mean": 0.337047,
+   "stderr": 0.034108
+  },
+  "homogeneous_g0": {
+   "mean": 0.008317,
+   "stderr": 0.000595
+  },
+  "homogeneous_g05": {
+   "mean": 0.002845,
+   "stderr": 0.000168
+  },
+  "voxel_homogeneous_g0": {
+   "mean": 0.008708,
+   "stderr": 0.000643
+  },
+  "voxel_homogeneous_g05": {
+   "mean": 0.002993,
+   "stderr": 0.000188
+  },
+  "gradient_g0": {
+   "mean": 0.004761,
+   "stderr": 0.000904
+  },
+  "gradient_g05": {
+   "mean": 0.001594,
+   "stderr": 0.00029
+  }
+ }
+}

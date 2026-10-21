@@ -1,0 +1,20 @@
+{
+ "blender": "5.2.2 LTS",
+ "samples": 4096,
+ "max_bounces": 0,
+ "volume_bounces": 0,
+ "cases": {
+  "volume_scatter_white_max0": {
+   "mean": [
+    0.749782,
+    0.749782,
+    0.749782
+   ],
+   "stderr": [
+    0.00351,
+    0.00351,
+    0.00351
+   ]
+  }
+ }
+}

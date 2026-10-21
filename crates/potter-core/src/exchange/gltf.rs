@@ -1790,7 +1790,8 @@ fn validate_mesh_export_attributes(mesh: &Mesh, data_block: Option<&DataBlock>) 
             | "shade_smooth"
             | "sharp"
             | "color_layers"
-            | "custom_normal" => true,
+            | "custom_normal"
+            | crate::geom::modifiers::OPTIMAL_DISPLAY_EDGES => true,
             "blender_metadata" => value["custom_properties"]
                 .as_object()
                 .is_some_and(serde_json::Map::is_empty),
@@ -3491,6 +3492,7 @@ pub(crate) fn unwritten_attribute_losses(mesh: &Mesh, owner: &str) -> Vec<Loss> 
                             | "sharp"
                             | "seam"
                             | "vertex_groups"
+                            | crate::geom::modifiers::OPTIMAL_DISPLAY_EDGES
                     ) || color_layer_storage_key(mesh, key)
                     {
                         continue;

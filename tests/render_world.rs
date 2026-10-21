@@ -355,10 +355,21 @@ fn homogeneous_volume_cube_transmittance_matches_beer_lambert() -> Result<(), Bo
         render_png(&scene, &directory.path().join("render"), Some("path"))?;
     let alpha = f64::from(pixel(&pixels, width, height, width / 2, height / 2)?[3]) / 255.0;
     let measured_transmittance = 1.0 - alpha;
-    let expected_transmittance = (-density).exp();
+    // The oracle is `tests/fixtures/volume_fade/generate_inline_grid_transmittance_oracle.py`: Blender 5.2.2's transmittance
+    // through this grid, averaged over four seeds at 4096 samples, with its standard error. Potter's absorption-only
+    // transmittance is deterministic, so the Blender standard error is the whole floor.
+    let oracle: serde_json::Value = serde_json::from_slice(&std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/volume_fade/blender_inline_grid_transmittance.json"),
+    )?)?;
+    let case = &oracle["cases"]["inline_grid_transmittance"];
+    let blender = case["transmittance"]
+        .as_f64()
+        .ok_or("oracle transmittance is missing")?;
+    let blender_error = case["stderr"].as_f64().ok_or("oracle stderr is missing")?;
     assert!(
-        (measured_transmittance - expected_transmittance).abs() < 0.01,
-        "one unit of homogeneous density {density} should transmit e^(-density): {measured_transmittance} vs {expected_transmittance}"
+        (measured_transmittance - blender).abs() <= 3.0 * blender_error,
+        "2x2x2 grid of density {density}: Potter transmits {measured_transmittance}, Blender {blender} +- {blender_error}"
     );
     Ok(())
 }
