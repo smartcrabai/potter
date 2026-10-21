@@ -568,6 +568,7 @@ impl Snapshot {
             Some(&world_matrix_ids),
             None,
             Some(driver_values),
+            None,
         )
     }
 
@@ -608,6 +609,7 @@ impl Snapshot {
                 None,
                 &suppressed,
                 &mesh_dependencies,
+                None,
                 None,
                 None,
                 None,
