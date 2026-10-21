@@ -247,8 +247,8 @@ fn evaluated_mesh(scene: &Path, frame: f64) -> Result<potter_core::geom::Mesh, B
 fn assert_numeric_json_close(actual: &Value, expected: &Value, tolerance: f64) {
     match (actual, expected) {
         (Value::Number(actual), Value::Number(expected)) => {
-            let actual = actual.as_f64().expect("actual must be a number");
-            let expected = expected.as_f64().expect("expected must be a number");
+            let actual = actual.as_f64().unwrap_or(f64::NAN);
+            let expected = expected.as_f64().unwrap_or(f64::NAN);
             assert!(
                 (actual - expected).abs() <= tolerance,
                 "{actual} differs from {expected} by more than {tolerance}"
@@ -492,10 +492,7 @@ fn add_sequence_resource(
     let mut sequence_frames = serde_json::Map::new();
     let mut frame = first_frame;
     loop {
-        let source = fixture_dir.join(format!(
-            "{prefix}{frame:0width$}{suffix}",
-            width = frame_width
-        ));
+        let source = fixture_dir.join(format!("{prefix}{frame:0frame_width$}{suffix}"));
         if !source.is_file() {
             break;
         }
@@ -684,7 +681,7 @@ fn assert_oracle_uv_layers(
     expected_names.sort_unstable();
     assert_eq!(actual_names, expected_names, "canonical UV layer names");
 
-    let actual_layers: &[Value] = actual_layers.map(Vec::as_slice).unwrap_or(&[]);
+    let actual_layers: &[Value] = actual_layers.map_or(&[], Vec::as_slice);
     let expected_positions: Vec<[f64; 3]> = serde_json::from_value(expected["positions"].clone())?;
     let actual_positions = mesh
         .vertices
@@ -791,7 +788,7 @@ fn flat_corner_normals(mesh: &potter_core::geom::Mesh) -> Vec<[f64; 3]> {
             }
             .normalize_or_zero()
             .to_array();
-            std::iter::repeat(normal).take(face.vertices.len())
+            std::iter::repeat_n(normal, face.vertices.len())
         })
         .collect()
 }
@@ -949,7 +946,7 @@ fn assert_oracle_mesh(
                     "material_index" | "sharp_edge" | "sharp_face"
                 )
         })
-        .map(|(name, _)| name.to_string())
+        .map(|(name, _)| name.clone())
         .collect::<Vec<_>>();
     actual_attribute_names.sort();
     expected_attribute_names.sort();
@@ -1348,7 +1345,7 @@ fn blender_oracle_alembic_cache_matches_all_cases_and_mesh_attributes() -> Resul
     let mut case_ids = cases
         .iter()
         .map(|case| case["id"].as_str().ok_or("Blender oracle case has no id"))
-        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+        .collect::<Result<Vec<_>, &str>>()?;
     case_ids.sort_unstable();
     let mut expected_case_ids = [
         "axis_settings_mesh_data_unchanged",
@@ -1578,7 +1575,7 @@ fn blender_file_sequence_uses_frame_files_and_validates_each_hash() -> Result<()
                 .find(|case| case["id"] == "is_sequence_per_frame_files")
         })
         .ok_or("Blender sequence oracle case is missing")?;
-    for frame in 1.0..=4.0 {
+    for frame in [1.0, 2.0, 3.0, 4.0] {
         let expected = sequence_case["frames"]
             .as_array()
             .and_then(|frames| {
@@ -1589,7 +1586,7 @@ fn blender_file_sequence_uses_frame_files_and_validates_each_hash() -> Result<()
             .ok_or("Blender sequence frame is missing")?;
         assert_positions_close(
             &mesh_positions(&target, frame)?,
-            &serde_json::from_value(expected["positions"].clone())?,
+            &serde_json::from_value::<Vec<[f64; 3]>>(expected["positions"].clone())?,
             1.0e-6,
         );
     }
@@ -1611,7 +1608,7 @@ fn blender_file_sequence_uses_frame_files_and_validates_each_hash() -> Result<()
         .ok_or("Blender missing sequence frame is missing")?;
     assert_positions_close(
         &mesh_positions(&target, 5.0)?,
-        &serde_json::from_value(missing_frame["positions"].clone())?,
+        &serde_json::from_value::<Vec<[f64; 3]>>(missing_frame["positions"].clone())?,
         1.0e-6,
     );
     let output = run_ok(pot().args(["inspect"]).arg(&target).args([
@@ -1638,7 +1635,7 @@ fn blender_file_sequence_uses_frame_files_and_validates_each_hash() -> Result<()
     changed[last] ^= 1;
     fs::write(changed_path, changed)?;
     let project = potter_core::store::Project::open(&target)?;
-    let error = potter_core::eval::Snapshot::evaluate_with_cache(
+    let Err(error) = potter_core::eval::Snapshot::evaluate_with_cache(
         project.doc(),
         &potter_core::eval::EvaluationContext {
             frame: Some(2.0),
@@ -1646,8 +1643,9 @@ fn blender_file_sequence_uses_frame_files_and_validates_each_hash() -> Result<()
         },
         Some(project.path()),
         Some(project.cache_directory()),
-    )
-    .expect_err("changed sequence frame must be rejected");
+    ) else {
+        return Err("changed sequence frame must be rejected".into());
+    };
     assert_eq!(error.code, potter_core::error::ErrorCode::AssetChanged);
     Ok(())
 }
@@ -1717,7 +1715,7 @@ fn resource_pack_sequence_is_self_contained_after_reopen() -> Result<(), Box<dyn
                 .find(|case| case["id"] == "is_sequence_per_frame_files")
         })
         .ok_or("Blender sequence oracle case is missing")?;
-    for frame in 1.0..=4.0 {
+    for frame in [1.0, 2.0, 3.0, 4.0] {
         let expected = sequence_case["frames"]
             .as_array()
             .and_then(|frames| {
@@ -1728,7 +1726,7 @@ fn resource_pack_sequence_is_self_contained_after_reopen() -> Result<(), Box<dyn
             .ok_or("Blender sequence frame is missing")?;
         assert_positions_close(
             &mesh_positions(&target, frame)?,
-            &serde_json::from_value(expected["positions"].clone())?,
+            &serde_json::from_value::<Vec<[f64; 3]>>(expected["positions"].clone())?,
             1.0e-6,
         );
     }
@@ -1757,7 +1755,7 @@ fn resource_pack_sequence_is_self_contained_after_reopen() -> Result<(), Box<dyn
         .and_then(Value::as_array_mut)
         .ok_or("packed sequence frame bytes are missing")?;
     bytes[0] = json!(256);
-    let error = potter_core::eval::Snapshot::evaluate_with_cache(
+    let Err(error) = potter_core::eval::Snapshot::evaluate_with_cache(
         &corrupted,
         &potter_core::eval::EvaluationContext {
             frame: Some(2.0),
@@ -1765,8 +1763,9 @@ fn resource_pack_sequence_is_self_contained_after_reopen() -> Result<(), Box<dyn
         },
         Some(project.path()),
         Some(project.cache_directory()),
-    )
-    .expect_err("corrupt packed sequence payload must fail closed");
+    ) else {
+        return Err("corrupt packed sequence payload must fail closed".into());
+    };
     assert_eq!(error.code, potter_core::error::ErrorCode::SceneInvalid);
     let mut changed_packed = project.doc().clone();
     let valid_bytes = changed_packed
@@ -1784,7 +1783,7 @@ fn resource_pack_sequence_is_self_contained_after_reopen() -> Result<(), Box<dyn
         .as_u64()
         .ok_or("packed sequence first byte is not an unsigned integer")?;
     valid_bytes[0] = json!(first_byte ^ 1);
-    let error = potter_core::eval::Snapshot::evaluate_with_cache(
+    let Err(error) = potter_core::eval::Snapshot::evaluate_with_cache(
         &changed_packed,
         &potter_core::eval::EvaluationContext {
             frame: Some(2.0),
@@ -1792,8 +1791,9 @@ fn resource_pack_sequence_is_self_contained_after_reopen() -> Result<(), Box<dyn
         },
         Some(project.path()),
         Some(project.cache_directory()),
-    )
-    .expect_err("a valid but changed packed frame must fail its stored hash");
+    ) else {
+        return Err("a valid but changed packed frame must fail its stored hash".into());
+    };
     assert_eq!(error.code, potter_core::error::ErrorCode::AssetChanged);
     let changed_packed_document = serde_json::to_value(&changed_packed)?;
     let mut noncanonical_document: Value = serde_json::to_value(project.doc())?;
@@ -1832,7 +1832,7 @@ fn resource_pack_sequence_is_self_contained_after_reopen() -> Result<(), Box<dyn
                 .is_file()
         );
     }
-    for frame in 1.0..=4.0 {
+    for frame in [1.0, 2.0, 3.0, 4.0] {
         let expected = sequence_case["frames"]
             .as_array()
             .and_then(|frames| {
@@ -1843,7 +1843,7 @@ fn resource_pack_sequence_is_self_contained_after_reopen() -> Result<(), Box<dyn
             .ok_or("Blender sequence frame is missing")?;
         assert_positions_close(
             &mesh_positions(&target, frame)?,
-            &serde_json::from_value(expected["positions"].clone())?,
+            &serde_json::from_value::<Vec<[f64; 3]>>(expected["positions"].clone())?,
             1.0e-6,
         );
     }
@@ -1966,6 +1966,7 @@ fn blender_topology_change_forces_full_cache_read_with_vertex_only_flag()
     Ok(())
 }
 
+#[test]
 fn mesh_sequence_cache_reports_missing_and_changed_external_files() -> Result<(), Box<dyn Error>> {
     let temporary = tempdir()?;
     let source = temporary.path().join("source.pot");

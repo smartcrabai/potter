@@ -84,7 +84,7 @@ fn pack(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bool>
             ));
         }
         let (start, end) = sequence_range(engine, sequence)?;
-        return pack_sequence(engine, id, uri, kind, start, end);
+        return pack_sequence(engine, &id, uri, kind, start, end);
     }
     let path = resolve_path(uri);
     if !path.is_file() {
@@ -149,7 +149,7 @@ fn sequence_range(engine: &Engine<'_>, value: &Value) -> Result<(i32, i32)> {
 
 fn pack_sequence(
     engine: &mut Engine<'_>,
-    id: crate::model::Id,
+    id: &crate::model::Id,
     uri: &str,
     kind: &str,
     start: i32,
@@ -179,7 +179,7 @@ fn pack_sequence(
             ),
         );
     }
-    let change = if engine.doc.resources.contains_key(&id) {
+    let change = if engine.doc.resources.contains_key(id) {
         ChangeKind::Updated
     } else {
         ChangeKind::Created
@@ -195,7 +195,7 @@ fn pack_sequence(
             "sequence_frames":frames,
         }),
     );
-    engine.mark("resources", &id, change);
+    engine.mark("resources", id, change);
     Ok(true)
 }
 
@@ -238,7 +238,7 @@ fn unpack(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                     &operation_pointer(engine.operation_index, "path"),
                 )
             })?;
-        return unpack_sequence(engine, id, record, raw_path);
+        return unpack_sequence(engine, &id, &record, &raw_path);
     }
     let byte_values = record
         .get("bytes")
@@ -308,9 +308,9 @@ fn unpack(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
 
 fn unpack_sequence(
     engine: &mut Engine<'_>,
-    id: crate::model::Id,
-    record: Value,
-    raw_path: String,
+    id: &crate::model::Id,
+    record: &Value,
+    raw_path: &str,
 ) -> Result<bool> {
     if record.get("packed").and_then(Value::as_bool) != Some(true) {
         return Err(engine.error(
@@ -416,7 +416,7 @@ fn unpack_sequence(
         }
     }
 
-    let pattern = resolve_path(&raw_path);
+    let pattern = resolve_path(raw_path);
     let mut output_paths = BTreeSet::new();
     let mut sequence_outputs = Vec::with_capacity(frames.len());
     for frame in start..=end {
@@ -500,7 +500,7 @@ fn unpack_sequence(
             "sequence_frames":output_frames,
         }),
     );
-    engine.mark("resources", &id, ChangeKind::Updated);
+    engine.mark("resources", id, ChangeKind::Updated);
     Ok(true)
 }
 

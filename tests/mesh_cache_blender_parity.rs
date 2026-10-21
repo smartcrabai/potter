@@ -1,4 +1,4 @@
-//! Blender 5.2 MESH_CACHE oracle for PC2 and MDD caches, evaluated through the native `pot` CLI.
+//! Blender 5.2 `MESH_CACHE` oracle for PC2 and MDD caches, evaluated through the native `pot` CLI.
 //!
 //! The cache files are written here from the base mesh, so the oracle inputs are independent of the
 //! Potter reader. Blender evaluates each case's modifier at its scene frames; `pot` applies the same
@@ -27,7 +27,7 @@ const AXES: [&str; 6] = ["POS_X", "NEG_X", "POS_Y", "NEG_Y", "POS_Z", "NEG_Z"];
 fn cache_position(base: [f64; 3], frame: usize, index: usize) -> [f32; 3] {
     let frame_value = f64::from(u16::try_from(frame).unwrap_or(u16::MAX));
     let index_value = f64::from(u16::try_from(index).unwrap_or(u16::MAX));
-    let sign = if index % 2 == 0 { 1.0 } else { -1.0 };
+    let sign = if index.is_multiple_of(2) { 1.0 } else { -1.0 };
     [
         base[0] + 0.12 * frame_value * (index_value + 1.0)
             - 0.03 * sign * frame_value * frame_value,

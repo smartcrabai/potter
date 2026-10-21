@@ -1926,6 +1926,10 @@ fn validate_modifier_resource(
     if !has_resource_parameter {
         return Ok(());
     }
+    let resource_pointer = operation_pointer(
+        engine.operation_index,
+        &format!("{}/resource", base_pointer.trim_start_matches('/')),
+    );
     // Blender's is_disabled: a disabled cache is a no-op, so its resource is not checked. A Mesh
     // Cache is disabled by a zero factor, and both cache types by a missing filepath or object path.
     let is_disabled = match modifier_type {
