@@ -11,6 +11,7 @@ use crate::{
     error::{ErrorCode, PotError, Result},
     eval::{EvaluationPurpose, Snapshot},
     geom::{
+        TextureSpace,
         color_layers::{self, ColorDomain, ColorLayer, ColorStore},
         normals::{render_corner_normals, smooth_face_flags},
         uv_layers::{self, UvStore},
@@ -51,6 +52,10 @@ pub(super) struct ObjectRecord {
     pub node_id: Id,
     pub data_id: Option<Id>,
     pub instance_path: Vec<Id>,
+    /// The object's automatic texture space (`BKE_mesh_texspace_calc` of its evaluated local bounds): the box
+    /// the Generated coordinate maps onto `[0, 1]³`. Not part of the output.
+    #[serde(skip)]
+    pub texture_space: TextureSpace,
     /// UV layer names in layer order, matching `Triangle::layer_uvs`. Not part of the output.
     #[serde(skip)]
     pub uv_layers: Vec<String>,
@@ -528,6 +533,7 @@ pub(super) fn extract_geometry(
             index: object_index,
             node_id: node_id.clone(),
             data_id: node.data.clone(),
+            texture_space: TextureSpace::automatic(mesh.and_then(|mesh| mesh.bounds())),
             instance_path: snapshot
                 .instance_paths
                 .get(node_id)
@@ -2019,7 +2025,7 @@ pub(super) fn layered_context<'a>(
         .with_color_layers(color_maps, color_render)
         .with_warnings(warnings);
     context.uv = uv_override.unwrap_or_else(|| blend_uv(&triangle.uv, pose.barycentric));
-    context.generated = pose.object;
+    context = context.with_generated(object.texture_space, pose.object);
     context.position = pose.point;
     context.object = pose.object;
     context.normal = pose.normal;

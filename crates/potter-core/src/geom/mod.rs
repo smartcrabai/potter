@@ -179,6 +179,71 @@ pub struct Mesh {
     pub next_id: IdCounters,
 }
 
+/// An object's texture space: the box that the Generated texture coordinate maps onto `[0, 1]³`.
+///
+/// Blender's automatic texture space (`BKE_mesh_texspace_calc`, `mesh.cc`) takes the bounds' midpoint as
+/// the location and the half-extent as the size, with a zero extent set to 1 and a tiny extent clamped
+/// to `1e-5`. Cycles turns that into the Generated coordinate of a local point `P` as
+/// `(P - location) / (2 size) + 0.5` (`blender/mesh.cpp`, `mesh_texture_space` and the `ATTR_STD_GENERATED`
+/// fill), so a degenerate axis maps to `0.5`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextureSpace {
+    pub location: DVec3,
+    pub size: DVec3,
+}
+
+impl TextureSpace {
+    /// The automatic texture space of `bounds` (`BKE_mesh_texspace_calc`). `None`, geometry with no
+    /// vertices, takes Blender's default bounds of `(-1, -1, -1)` to `(1, 1, 1)`.
+    #[must_use]
+    pub fn automatic(bounds: Option<Aabb>) -> Self {
+        let bounds = bounds.unwrap_or(Aabb {
+            min: DVec3::splat(-1.0),
+            max: DVec3::ONE,
+        });
+        let size = ((bounds.max - bounds.min) * 0.5)
+            .to_array()
+            .map(Self::texture_extent);
+        Self {
+            location: (bounds.min + bounds.max) * 0.5,
+            size: DVec3::from_array(size),
+        }
+    }
+
+    /// One axis of an automatic texture-space size (`BKE_mesh_texspace_calc`): a zero extent becomes 1, and a
+    /// non-zero extent smaller than `1e-5` in magnitude is clamped to `±1e-5`. A subnormal extent counts as zero.
+    fn texture_extent(extent: f64) -> f64 {
+        if extent.abs() < f64::MIN_POSITIVE {
+            1.0
+        } else if (0.0..0.000_01).contains(&extent) {
+            0.000_01
+        } else if (-0.000_01..0.0).contains(&extent) {
+            -0.000_01
+        } else {
+            extent
+        }
+    }
+
+    /// The Generated coordinate of the object-local point `local`.
+    #[must_use]
+    pub fn generated(self, local: DVec3) -> DVec3 {
+        (local - self.location) / (self.size * 2.0) + DVec3::splat(0.5)
+    }
+
+    /// How far the Generated coordinate moves per unit of object-local movement: `1 / (2 size)` per
+    /// axis, the Jacobian of [`TextureSpace::generated`].
+    #[must_use]
+    pub fn generated_per_local(self) -> DVec3 {
+        (self.size * 2.0).recip()
+    }
+}
+
+impl Default for TextureSpace {
+    fn default() -> Self {
+        Self::automatic(None)
+    }
+}
+
 /// Axis-aligned bounds of mesh-local vertex positions.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
