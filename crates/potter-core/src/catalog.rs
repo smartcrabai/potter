@@ -76,13 +76,6 @@ pub fn feature_catalog() -> Value {
             [true, false, true, true, false, false, true],
         ),
         unsupported(
-            "shader.principled.subsurface_method.mixed",
-            "Principled subsurface method mixed by Mix or Add",
-            "ShaderNodeBsdfPrincipled",
-            &["material.create", "material.update"],
-            "A Mix or Add of two Principled arms with subsurface scattering under different methods reports UNSUPPORTED_FEATURE; Potter's single parameter set cannot hold both methods.",
-        ),
-        unsupported(
             "shader.principled.anisotropic",
             "Principled anisotropic highlight",
             "ShaderNodeBsdfPrincipled",
