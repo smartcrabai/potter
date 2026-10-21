@@ -464,12 +464,21 @@ fn positional_attribute(mesh: &Value, name: &str) -> TestResult<Value> {
 /// Checks the native store of a legacy-derived mesh against a native import of the oracle.
 fn assert_native_semantics(legacy: &Value, native: &Value) -> TestResult {
     for name in ["shade_smooth", "sharp", "seam"] {
-        json_close(
-            &positional_attribute(legacy, name)?,
-            &positional_attribute(native, name)?,
-            name,
-        );
+        let mut legacy_attribute = positional_attribute(legacy, name)?;
+        let mut native_attribute = positional_attribute(native, name)?;
+        if name == "shade_smooth" {
+            // A schema-2 scene predates `sharp_face_present`, so the upgrade cannot recover it; presence is
+            // checked against Blender's legacy rule in `assert_legacy_sharp_face`.
+            for attribute in [&mut legacy_attribute, &mut native_attribute] {
+                attribute
+                    .as_object_mut()
+                    .ok_or("shade_smooth is not an object")?
+                    .remove("sharp_face_present");
+            }
+        }
+        json_close(&legacy_attribute, &native_attribute, name);
     }
+    assert_legacy_sharp_face(legacy)?;
     assert!(
         legacy["attributes"].get("blender_polygon_smooth").is_none(),
         "blender_polygon_smooth must be upgraded away"
@@ -506,6 +515,22 @@ fn assert_native_semantics(legacy: &Value, native: &Value) -> TestResult {
     for layer in native_layers {
         let name = layer.as_str().ok_or("layer name is not a string")?;
         json_close(&legacy_encodings[name], &native_encodings[name], name);
+    }
+    Ok(())
+}
+
+/// Blender's legacy loader keeps `sharp_face` only when some face is flat (`BKE_mesh_legacy_sharp_faces_from_flags`,
+/// `blenkernel/intern/mesh_legacy_convert.cc`), so an upgraded legacy mesh with every face smooth has no `sharp_face`.
+fn assert_legacy_sharp_face(legacy: &Value) -> TestResult {
+    let attribute = &legacy["attributes"]["shade_smooth"];
+    let values = attribute["values"]
+        .as_object()
+        .ok_or("legacy shade_smooth has no values")?;
+    if values.values().all(|value| value == &json!(true)) {
+        assert!(
+            attribute.get("sharp_face_present").is_none(),
+            "an all-smooth legacy mesh has no sharp_face"
+        );
     }
     Ok(())
 }

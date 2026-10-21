@@ -73,6 +73,9 @@ pub(crate) struct ExchangeMesh {
     /// Per face: whether a corner normal differs from the face's flat normal, in local space.
     /// Empty for imported meshes, where every face counts as flat.
     pub smooth: Vec<bool>,
+    /// Imported `sharp_face` flags, one per face in `faces` order, as the format's Blender reader creates
+    /// them. `None` when the reader creates no `sharp_face`, so every face stays smooth. Unused by exports.
+    pub sharp_faces: Option<Vec<bool>>,
     /// UV layers in mesh order: glTF `TEXCOORD_n` and Blender's layer order.
     pub uv_layers: Vec<ExchangeUvLayer>,
     /// Index into `uv_layers` of the active (edit target) layer. OBJ and PLY write this layer.
@@ -456,6 +459,7 @@ pub(crate) fn evaluated_meshes(
             normals: Some(shading.corners),
             vertex_normals: shading.vertices,
             smooth: shading.smooth,
+            sharp_faces: None,
             singular: shading::is_singular(matrix),
             mirrored: shading::is_mirrored(matrix),
             uv_layers: uv_layer_list,
@@ -1106,13 +1110,17 @@ pub(crate) fn graph_from_meshes(meshes: Vec<ExchangeMesh>, scene_id: String) -> 
                     serde_json::json!({ "reason": error.to_string(), "data_id": data_id }),
                 )
             })?;
-        if let Some(normals) = &geometry.normals {
-            let normals = normals
+        let normals = geometry.normals.as_ref().map(|normals| {
+            normals
                 .iter()
                 .map(|normal| DVec3::from_array(*normal))
-                .collect::<Vec<_>>();
-            shading::import_shading(&mut mesh, &normals)?;
-        }
+                .collect::<Vec<_>>()
+        });
+        shading::import_reader_shading(
+            &mut mesh,
+            normals.as_deref(),
+            geometry.sharp_faces.as_deref(),
+        )?;
         import_uv_layers(
             &mut mesh,
             &geometry.uv_layers,
@@ -1362,6 +1370,7 @@ pub(crate) mod test_support {
             singular: false,
             vertex_normals: Vec::new(),
             smooth: vec![false],
+            sharp_faces: None,
             uv_layers: vec![
                 ExchangeUvLayer {
                     name: "UVMap".to_owned(),

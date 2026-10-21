@@ -8763,7 +8763,7 @@ fn weld_copies(
 }
 
 /// Whether morph NORMAL deltas disagree with normals derived from the morphed geometry.
-/// Runs after `shading::import_shading`, so `mesh` already carries the imported shading.
+/// Runs after `shading::import_shading_flags`, so `mesh` already carries the imported shading.
 /// `normals` and each target's NORMAL deltas hold one value per face corner in `mesh.faces` order.
 fn morph_normals_disagree(
     mesh: &Mesh,

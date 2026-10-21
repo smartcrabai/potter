@@ -51,6 +51,7 @@ pub(crate) mod provenance;
 pub mod remesh;
 pub mod sculpt;
 mod sculpt_dabs;
+pub(crate) mod spatial;
 pub mod text;
 pub(crate) mod triangulate;
 pub(crate) mod uv_layers;
@@ -75,6 +76,9 @@ pub fn corner_normal_vectors(mesh: &Mesh) -> crate::error::Result<Vec<DVec3>> {
 mod mirror_oracle;
 #[cfg(test)]
 mod shading_oracle;
+
+#[cfg(test)]
+mod shrinkwrap_oracle;
 
 /// Stable vertex record. `id` is persistent; its position in [`Mesh::vertices`] is not.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
