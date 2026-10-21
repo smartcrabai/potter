@@ -223,6 +223,10 @@ pub struct BsdfParams {
     pub volume_anisotropy: f64,
     /// Emission radiance per unit density per channel: colour × strength × Density.
     pub volume_emission: [f64; 3],
+    /// Blender's `cycles.volume_sampling` of the material this medium belongs to.
+    pub volume_sampling: crate::model::VolumeSampling,
+    /// Blender's `cycles.volume_interpolation` of the material this medium belongs to.
+    pub volume_interpolation: crate::model::VolumeInterpolation,
     pub displacement_height: f64,
     pub normal: DVec3,
 }
@@ -314,6 +318,8 @@ impl BsdfParams {
             volume_emission: material
                 .emission_color
                 .map(|channel| channel * material.emission_strength.max(0.0) * density),
+            volume_sampling: material.volume_sampling,
+            volume_interpolation: material.volume_interpolation,
             displacement_height: 0.0,
             normal: normalize_or(normal, DVec3::Z),
             coat_tint: [1.0; 3],
@@ -324,6 +330,14 @@ impl BsdfParams {
     /// The coat's normal: the linked Coat Normal, or the final shading normal when unlinked.
     pub(crate) fn coat_normal_or_shading(&self) -> DVec3 {
         self.coat_normal.unwrap_or(self.normal)
+    }
+
+    /// Whether the volume coefficients put a medium on the surface's path.
+    pub(crate) fn has_medium(&self) -> bool {
+        self.volume_scatter
+            .iter()
+            .chain(&self.volume_absorption)
+            .any(|weight| *weight > 0.0)
     }
 }
 
@@ -1460,7 +1474,7 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
                     .try_into()
                     .map_err(|_| invalid("invalid volume emission color"))?;
             let strength = self.scalar_input(id, &["Emission Strength"], 0.0)?.max(0.0);
-            emission.map(|channel| channel * strength * density)
+            emission.map(|channel| channel * strength)
         };
         Ok(params)
     }

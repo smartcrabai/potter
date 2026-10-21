@@ -40,6 +40,7 @@ use super::{
         blend_corner_normals, blend_uv,
     },
     studio,
+    wireframe::{PointSphere, WireEdge, WireEdgeBuilder, WirePoint},
 };
 
 /// Most color layers one object carries, and one hit can read (Blender's per-mesh limit).
@@ -88,6 +89,10 @@ pub(super) struct ElementRecord {
 pub(super) struct Geometry {
     pub triangles: Vec<Triangle>,
     pub lines: Vec<Line>,
+    /// Mesh edges for the wireframe preview, each once; empty outside Wire.
+    pub wire_edges: Vec<WireEdge>,
+    /// Loose vertices of a mesh with no edges or faces, and point-cloud points, for the wireframe preview.
+    pub wire_points: Vec<WirePoint>,
     pub materials: Vec<Material>,
     pub prepared: Vec<PreparedMaterial>,
     pub objects: Vec<ObjectRecord>,
@@ -366,6 +371,8 @@ pub(super) fn extract_geometry(
         std::collections::BTreeMap::<(Id, Option<usize>, Option<Arc<[u64]>>), usize>::new();
     let mut triangles = Vec::new();
     let mut lines = Vec::new();
+    let mut wire_edges = Vec::new();
+    let mut wire_points = Vec::new();
     let mut objects = Vec::new();
     let mut elements = Vec::new();
     let mut bounds: Option<(DVec3, DVec3)> = None;
@@ -587,6 +594,12 @@ pub(super) fn extract_geometry(
             );
             let mut triangle_offset = 0_usize;
             let mut corner_base = 0_usize;
+            let mesh_edge_pairs: Vec<[u32; 2]> = if matches!(mode, Mode::Wire) {
+                mesh.edges.iter().map(|edge| edge.vertices).collect()
+            } else {
+                Vec::new()
+            };
+            let mut wire_builder = WireEdgeBuilder::new(&mesh_edge_pairs);
             let vertex_slots: BTreeMap<u32, usize> = if carried_layers.is_empty() {
                 BTreeMap::new()
             } else {
@@ -607,6 +620,20 @@ pub(super) fn extract_geometry(
                 });
                 let uv_available_mask = binding.map(|binding| binding.uv.available_mask);
                 let face_corner_normals = face_normals[face_index].as_deref();
+                if matches!(mode, Mode::Wire) {
+                    let positions: Option<Vec<DVec3>> = face
+                        .vertices
+                        .iter()
+                        .map(|vertex_id| {
+                            vertex_positions
+                                .get(vertex_id)
+                                .map(|local| matrix.transform_point3(*local))
+                        })
+                        .collect();
+                    if let Some(positions) = positions {
+                        wire_builder.add_polygon(&face.vertices, &positions, face_corner_normals);
+                    }
+                }
                 // Corners are numbered across faces in order, as `color_layers::read` lays them
                 // out.
                 let face_corner_base = corner_base;
@@ -824,6 +851,47 @@ pub(super) fn extract_geometry(
                 }
                 triangle_offset = face_triangle_end;
             }
+            if matches!(mode, Mode::Wire) {
+                // Blender's overlay draws the face edges (mesh-edge order), then the loose edges (mesh order),
+                // then strokes and points. Loose edges have no facing and never hide.
+                let loose: Vec<WireEdge> = mesh
+                    .edges
+                    .iter()
+                    .filter(|edge| !wire_builder.contains(edge.vertices[0], edge.vertices[1]))
+                    .filter_map(|edge| {
+                        let local_a = vertex_positions.get(&edge.vertices[0])?;
+                        let local_b = vertex_positions.get(&edge.vertices[1])?;
+                        Some(WireEdge {
+                            start: matrix.transform_point3(*local_a),
+                            end: matrix.transform_point3(*local_b),
+                            normals: None,
+                            colour: [0.0; 3],
+                            wd: 0.0,
+                        })
+                    })
+                    .collect();
+                // The subdivision's optimal-display mask hides internal edges of subdivided faces (`wd = 1`).
+                let optimal = mesh
+                    .attributes
+                    .get(crate::geom::modifiers::OPTIMAL_DISPLAY_EDGES)
+                    .and_then(|attribute| attribute.get("values"))
+                    .and_then(serde_json::Value::as_object);
+                let hidden: Vec<bool> = mesh
+                    .edges
+                    .iter()
+                    .map(|edge| {
+                        optimal.is_some_and(|values| {
+                            values
+                                .get(&format!("e{}", edge.id))
+                                .and_then(serde_json::Value::as_bool)
+                                == Some(false)
+                        })
+                    })
+                    .collect();
+                wire_edges
+                    .extend(wire_builder.finish(|slot| hidden.get(slot).copied().unwrap_or(false)));
+                wire_edges.extend(loose);
+            }
             let used_vertices: HashSet<u32> = mesh
                 .faces
                 .iter()
@@ -890,6 +958,17 @@ pub(super) fn extract_geometry(
                     ),
                     None => (position - extent, position + extent),
                 });
+                if matches!(mode, Mode::Wire) {
+                    // Loose vertices and point-cloud points are squares in the overlay (`wire_points`); a point
+                    // cloud's points also have spheres, which the object outline sees.
+                    wire_points.push(WirePoint {
+                        position,
+                        sphere: pointcloud.then_some(PointSphere {
+                            object_index,
+                            radius,
+                        }),
+                    });
+                }
                 lines.push(Line {
                     start: position,
                     end: position,
@@ -991,6 +1070,20 @@ pub(super) fn extract_geometry(
                     } else {
                         point_index + 1
                     };
+                    if matches!(mode, Mode::Wire) {
+                        // Grease Pencil strokes are drawn as their polyline (a zero-length segment draws nothing).
+                        let start = DVec3::from_array(stroke.points_world[point_index]);
+                        let end = DVec3::from_array(stroke.points_world[next_index]);
+                        if start != end {
+                            wire_edges.push(WireEdge {
+                                start,
+                                end,
+                                normals: None,
+                                colour: [0.0; 3],
+                                wd: 0.0,
+                            });
+                        }
+                    }
                     lines.push(Line {
                         start: DVec3::from_array(stroke.points_world[point_index]),
                         end: DVec3::from_array(stroke.points_world[next_index]),
@@ -1082,6 +1175,8 @@ pub(super) fn extract_geometry(
     let mut geometry = Geometry {
         triangles,
         lines,
+        wire_edges,
+        wire_points,
         materials,
         prepared,
         objects,
