@@ -117,8 +117,8 @@ impl Geometry {
     }
 }
 
-/// Shadow acceleration for the realtime Beauty engine; built once per geometry and shared by
-/// the flat-triangle baking and the per-pixel shading of smooth triangles.
+/// Shadow acceleration for the realtime Beauty engine; built once per geometry and shared by the per-pixel shading of
+/// every Beauty hit, flat triangles included.
 pub(super) struct RealtimeShadows {
     bvh: Bvh,
     point_maps: BTreeMap<Id, PointShadowMap>,
@@ -742,12 +742,11 @@ pub(super) fn extract_geometry(
                     let lit_per_pixel = !path_traced
                         && matches!(mode, Mode::Beauty)
                         && (face_reads_colors || face_requires_hit_shading);
-                    // Smooth triangles take lighting per pixel (raster) or per hit (path tracer).
-                    // Solid lights every hit from its view ray, so it keeps the base colour too.
+                    // Beauty shades each hit at its own point with its normal, Solid from its view ray, and the path tracer shades its own hits,
+                    // so their triangles keep the base colour, flat faces included (EEVEE decides shadows per pixel).
+                    // Other passes take a flat face's colour from its material.
                     let color = if corner_normals.is_some()
-                        || (path_traced && matches!(mode, Mode::Beauty))
-                        || lit_per_pixel
-                        || matches!(mode, Mode::Solid)
+                        || matches!(mode, Mode::Beauty | Mode::Solid)
                     {
                         base_color
                     } else {
@@ -1134,7 +1133,6 @@ pub(super) fn extract_geometry(
         shadows: None,
     };
     if !path_traced && matches!(mode, Mode::Beauty) && !geometry.triangles.is_empty() {
-        geometry.triangles = subdivide_realtime_triangles(&geometry.triangles)?;
         // Per material: whether its surfaces cast transparent shadows, which EEVEE decides once at compile time.
         let caster_materials: Vec<bool> = geometry
             .materials
@@ -1151,55 +1149,6 @@ pub(super) fn extract_geometry(
                 .copied()
                 .unwrap_or(false)
         });
-        let workspace = RefCell::new(EvaluatorWorkspace::default());
-        let occluders = ShadowOccluders::new(doc, snapshot, &geometry, images, &workspace);
-        let scene = ShadowScene {
-            bvh: &bvh,
-            triangles: &geometry.triangles,
-            point_maps: &shadow_maps,
-            occluders: transparent_casters.then_some(&occluders),
-        };
-        // The colours are collected first: the occluders borrow the geometry until `finish`.
-        let mut colors: Vec<Option<[f64; 4]>> = vec![None; geometry.triangles.len()];
-        for (index, triangle) in geometry.triangles.iter().enumerate() {
-            if triangle.normals.is_some() || triangle.lit_per_pixel {
-                // Smooth and per-pixel lit triangles are shaded at each visible hit.
-                continue;
-            }
-            let material = geometry
-                .materials
-                .get(triangle.material_index)
-                .unwrap_or(&geometry.materials[0]);
-            let normal = (triangle.positions[1] - triangle.positions[0])
-                .cross(triangle.positions[2] - triangle.positions[0])
-                .normalize_or_zero();
-            let center =
-                (triangle.positions[0] + triangle.positions[1] + triangle.positions[2]) / 3.0;
-            let params = shading_params(
-                Some(material),
-                material.base_color,
-                normal,
-                &geometry.shader_warnings,
-            );
-            colors[index] = Some(shade(
-                doc,
-                snapshot,
-                center,
-                center,
-                normal,
-                normal,
-                &params,
-                mode,
-                Some(scene),
-                images,
-            )?);
-        }
-        occluders.finish()?;
-        for (triangle, color) in geometry.triangles.iter_mut().zip(colors) {
-            if let Some(color) = color {
-                triangle.color = color;
-            }
-        }
         geometry.shadows = Some(RealtimeShadows {
             bvh,
             point_maps: shadow_maps,
@@ -1437,86 +1386,6 @@ fn rasterize_shadow_triangle(face: &mut ShadowFace, origin: DVec3, triangle: &Tr
 
 fn shadow_edge(first: [f64; 3], second: [f64; 3], point: [f64; 3]) -> f64 {
     (second[0] - first[0]) * (point[1] - first[1]) - (second[1] - first[1]) * (point[0] - first[0])
-}
-
-fn subdivide_realtime_triangles(triangles: &[Triangle]) -> Result<Vec<Triangle>> {
-    let triangle_capacity = triangles.len().checked_mul(16).ok_or_else(|| {
-        PotError::new(
-            ErrorCode::LimitExceeded,
-            "realtime shadow subdivision exceeds the supported triangle count",
-        )
-    })?;
-    let mut refined = Vec::new();
-    refined.try_reserve_exact(triangle_capacity).map_err(|_| {
-        PotError::new(
-            ErrorCode::LimitExceeded,
-            "realtime shadow subdivision exceeds available memory",
-        )
-    })?;
-    for triangle in triangles {
-        // Smooth and per-pixel lit triangles are shaded per pixel, so splitting them would only
-        // multiply the raster and shadow work without changing the lighting.
-        if triangle.normals.is_some() || triangle.lit_per_pixel {
-            refined.push(triangle.clone());
-            continue;
-        }
-        for half in subdivide_triangle_once(triangle) {
-            refined.extend(subdivide_triangle_once(&half));
-        }
-    }
-    Ok(refined)
-}
-
-fn subdivide_triangle_once(triangle: &Triangle) -> [Triangle; 4] {
-    let positions = [
-        triangle.positions[0],
-        triangle.positions[1],
-        triangle.positions[2],
-        (triangle.positions[0] + triangle.positions[1]) * 0.5,
-        (triangle.positions[1] + triangle.positions[2]) * 0.5,
-        (triangle.positions[2] + triangle.positions[0]) * 0.5,
-    ];
-    let uv = corner_midpoints(triangle.uv);
-    let layer_uvs: Vec<[[f64; 2]; 6]> = triangle
-        .layer_uvs
-        .iter()
-        .map(|corners| corner_midpoints(*corners))
-        .collect();
-    let layer_colors: Vec<[[f64; 4]; 6]> = triangle
-        .layer_colors
-        .iter()
-        .map(|corners| corner_midpoints(*corners))
-        .collect();
-    let subtriangles: [[usize; 3]; 4] = [[0, 3, 5], [3, 1, 4], [5, 4, 2], [3, 4, 5]];
-    subtriangles.map(|corners| {
-        triangle.with_corners(
-            corners.map(|vertex| positions[vertex]),
-            corners.map(|vertex| uv[vertex]),
-            layer_uvs
-                .iter()
-                .map(|table| corners.map(|vertex| table[vertex]))
-                .collect(),
-            layer_colors
-                .iter()
-                .map(|table| corners.map(|vertex| table[vertex]))
-                .collect(),
-        )
-    })
-}
-
-/// The three corners of a triangle followed by the midpoints of its edges (0-1, 1-2, 2-0).
-fn corner_midpoints<const N: usize>(corners: [[f64; N]; 3]) -> [[f64; N]; 6] {
-    let midpoint = |a: [f64; N], b: [f64; N]| -> [f64; N] {
-        std::array::from_fn(|channel| f64::midpoint(a[channel], b[channel]))
-    };
-    [
-        corners[0],
-        corners[1],
-        corners[2],
-        midpoint(corners[0], corners[1]),
-        midpoint(corners[1], corners[2]),
-        midpoint(corners[2], corners[0]),
-    ]
 }
 
 fn subdivide_displaced_triangle(
@@ -1786,9 +1655,9 @@ fn shading_params(
     params
 }
 
-/// Per-pixel lighting for raster Solid, which lights every hit in the camera's view space, and for
-/// smooth triangles in realtime Beauty output. Flat Beauty triangles keep the lighting baked into
-/// `Triangle::color`, which equals per-pixel lighting for a constant normal.
+/// Per-pixel lighting for every hit of raster Solid, which lights it in the camera's view space, and of realtime
+/// Beauty, which lights it in world space with the hit's own normal: the geometric normal on flat faces, so their
+/// shadows are decided per pixel as EEVEE decides them.
 pub(super) struct SceneShader<'a> {
     doc: &'a SceneDoc,
     snapshot: &'a Snapshot,
@@ -1827,10 +1696,6 @@ pub(super) fn surface_shader<'a>(
 }
 
 impl SurfaceShader for SceneShader<'_> {
-    fn shades_every_hit(&self) -> bool {
-        matches!(self.mode, Mode::Solid)
-    }
-
     fn shade(&self, triangle: &Triangle, hit: &SurfaceHit) -> Result<[f64; 4]> {
         let material = self.geometry.materials.get(triangle.material_index);
         let prepared = self.geometry.prepared.get(triangle.material_index);
