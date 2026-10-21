@@ -18,7 +18,6 @@ use super::vdb::{BoxScalar, box_sample_trilinear};
 
 const MAX_GRID_SAMPLES: usize = 1_000_000;
 const MAX_GRID_AXIS: usize = 512;
-const MAX_GRID_CELLS: usize = 250_000;
 const MAX_INPUT_VERTICES: usize = 100_000;
 const MAX_INPUT_TRIANGLES: usize = 100_000;
 const MAX_GRID_COUNT: usize = 64;
@@ -1000,7 +999,7 @@ fn pad_volume_grid(grid: &VolumeGrid, values: GridSamples<'_>) -> Result<VolumeG
         .checked_mul(padded_shape[1] - 1)
         .and_then(|count| count.checked_mul(padded_shape[2] - 1))
         .ok_or_else(resource_error)?;
-    if sample_count > MAX_GRID_SAMPLES || cell_count > MAX_GRID_CELLS {
+    if sample_count > MAX_GRID_SAMPLES || cell_count > MAX_GRID_SAMPLES {
         return Err(resource_error());
     }
     let mut padded_values = vec![0.0_f32; sample_count];
@@ -1111,7 +1110,8 @@ fn dual_contour_grid_to_mesh(
         .checked_mul(cell_dims[1])
         .and_then(|count| count.checked_mul(cell_dims[2]))
         .ok_or_else(resource_error)?;
-    if cell_count > MAX_GRID_CELLS {
+    // A dense grid has fewer cells than samples, so the sample cap bounds the cell work too.
+    if cell_count > MAX_GRID_SAMPLES {
         return Err(resource_error());
     }
     let index_to_local = grid.checked_index_to_local_matrix()?;
@@ -2122,7 +2122,7 @@ pub fn mesh_to_fog_volume_with_transform(
         .checked_mul(dims[1] - 1)
         .and_then(|count| count.checked_mul(dims[2] - 1))
         .ok_or_else(resource_error)?;
-    if sample_count > MAX_GRID_SAMPLES || cell_count > MAX_GRID_CELLS {
+    if sample_count > MAX_GRID_SAMPLES || cell_count > MAX_GRID_SAMPLES {
         return Err(resource_error());
     }
     let origin = minimum_index * f64::from(voxel_size);
