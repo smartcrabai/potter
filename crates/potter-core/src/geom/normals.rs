@@ -763,6 +763,256 @@ pub(crate) fn sharp_edge_flags(mesh: &Mesh) -> Result<Vec<bool>> {
         .collect()
 }
 
+/// Blender's `BM_face_calc_normal` (`bmesh_polygon.cc`): `normal_tri_v3` and `normal_quad_v3` for
+/// triangles and quads, the polygon normal for other sizes. Edit-mode operators read these normals.
+pub(crate) fn bmesh_face_normal(points: &[Vec3]) -> Vec3 {
+    match points {
+        [v1, v2, v3] => float_normalize(float_cross(*v1 - *v2, *v2 - *v3)),
+        [v1, v2, v3, v4] => float_normalize(float_cross(*v1 - *v3, *v2 - *v4)),
+        _ => float_face_normal(points),
+    }
+}
+
+/// The cross product in the expanded f32 form of `normal_tri_v3` and `normal_quad_v3`.
+fn float_cross(left: Vec3, right: Vec3) -> Vec3 {
+    Vec3::new(
+        left.y * right.z - left.z * right.y,
+        left.z * right.x - left.x * right.z,
+        left.x * right.y - left.y * right.x,
+    )
+}
+
+/// Indexed topology for the angle rules: corners and edge endpoints refer to vertex indices.
+struct AngleTopology {
+    faces: Vec<Vec<usize>>,
+    edges: Vec<[usize; 2]>,
+    edge_of: HashMap<(usize, usize), usize>,
+    points: Vec<Vec3>,
+}
+
+fn unordered(first: usize, second: usize) -> (usize, usize) {
+    (first.min(second), first.max(second))
+}
+
+fn angle_topology(mesh: &Mesh) -> Result<AngleTopology> {
+    let index_of = mesh
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(index, vertex)| (vertex.id, index))
+        .collect::<HashMap<_, _>>();
+    let vertex_index = |id: u32| -> Result<usize> {
+        index_of.get(&id).copied().ok_or_else(|| {
+            mesh_error(&MeshError::InvalidTopology(
+                "face or edge references a missing vertex",
+            ))
+        })
+    };
+    let faces = mesh
+        .faces
+        .iter()
+        .map(|face| {
+            face.vertices
+                .iter()
+                .map(|id| vertex_index(*id))
+                .collect::<Result<Vec<_>>>()
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let edges = mesh
+        .edges
+        .iter()
+        .map(|edge| -> Result<[usize; 2]> {
+            Ok([
+                vertex_index(edge.vertices[0])?,
+                vertex_index(edge.vertices[1])?,
+            ])
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let edge_of = edges
+        .iter()
+        .enumerate()
+        .map(|(index, [first, second])| (unordered(*first, *second), index))
+        .collect::<HashMap<_, _>>();
+    let points = mesh
+        .vertices
+        .iter()
+        .map(|vertex| vertex.co.as_vec3())
+        .collect();
+    Ok(AngleTopology {
+        faces,
+        edges,
+        edge_of,
+        points,
+    })
+}
+
+impl AngleTopology {
+    /// Blender's mesh face normals (`normals_calc_faces`: `normal_calc_ngon` for every size).
+    fn face_normals(&self) -> Vec<Vec3> {
+        self.faces
+            .iter()
+            .map(|face| {
+                float_face_normal(
+                    &face
+                        .iter()
+                        .map(|&index| self.points[index])
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect()
+    }
+
+    /// The edge index of each corner: the edge from a corner to the next corner of its face.
+    fn corner_edges(&self) -> Result<Vec<Vec<usize>>> {
+        self.faces
+            .iter()
+            .map(|face| {
+                (0..face.len())
+                    .map(|position| {
+                        let next = face[(position + 1) % face.len()];
+                        self.edge_of
+                            .get(&unordered(face[position], next))
+                            .copied()
+                            .ok_or_else(|| {
+                                mesh_error(&MeshError::InvalidTopology("face corner has no edge"))
+                            })
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .collect()
+    }
+}
+
+/// What `mesh_edges_sharp_tag` records about an edge's first corner (Blender's `e2l[0]`).
+#[derive(Clone, Copy)]
+struct EdgeFirstCorner {
+    face: usize,
+    vertex: usize,
+    second: EdgeSecond,
+}
+
+/// The second slot of Blender's `e2l`: still unset, decided sharp, or a smooth corner.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EdgeSecond {
+    Unset,
+    Invalid,
+    Smooth,
+}
+
+/// Blender's `Mesh.sharp_from_angle_set` edge rule (`rna_mesh_api.cc`, `mesh_edges_sharp_tag` in
+/// `blenkernel/intern/mesh_normals.cc`). `sharp_faces` is empty when every face is smooth. `sharp_edges`
+/// holds the current flags and is updated in place: an edge becomes sharp when its two faces' normals
+/// differ by more than `angle` (`dot < cos(angle)`, f32). A caller handles `angle >= pi` and `angle == 0`.
+pub(crate) fn sharp_edges_from_angle(
+    mesh: &Mesh,
+    sharp_faces: &[bool],
+    sharp_edges: &mut [bool],
+    angle: f32,
+) -> Result<()> {
+    let topology = angle_topology(mesh)?;
+    if sharp_edges.len() != topology.edges.len()
+        || (!sharp_faces.is_empty() && sharp_faces.len() != topology.faces.len())
+    {
+        return Err(PotError::invalid_argument(
+            "sharp flags must match the mesh face and edge counts",
+        ));
+    }
+    if angle >= std::f32::consts::PI {
+        return Ok(());
+    }
+    let face_normals = topology.face_normals();
+    let corner_edges = topology.corner_edges()?;
+    let limit = angle.cos();
+    let mut first_corners: Vec<Option<EdgeFirstCorner>> = vec![None; topology.edges.len()];
+    for (face_index, face) in topology.faces.iter().enumerate() {
+        let smooth = sharp_faces.is_empty() || !sharp_faces[face_index];
+        for (position, &vertex) in face.iter().enumerate() {
+            let edge = corner_edges[face_index][position];
+            let current = first_corners[edge];
+            match current {
+                None => {
+                    first_corners[edge] = Some(EdgeFirstCorner {
+                        face: face_index,
+                        vertex,
+                        second: if smooth {
+                            EdgeSecond::Unset
+                        } else {
+                            EdgeSecond::Invalid
+                        },
+                    });
+                }
+                Some(mut first) if first.second == EdgeSecond::Unset => {
+                    let is_angle_sharp =
+                        float_dot(face_normals[first.face], face_normals[face_index]) < limit;
+                    if !smooth || sharp_edges[edge] || vertex == first.vertex || is_angle_sharp {
+                        first.second = EdgeSecond::Invalid;
+                        if is_angle_sharp {
+                            sharp_edges[edge] = true;
+                        }
+                    } else {
+                        first.second = EdgeSecond::Smooth;
+                    }
+                    first_corners[edge] = Some(first);
+                }
+                Some(mut first) if first.second == EdgeSecond::Smooth => {
+                    first.second = EdgeSecond::Invalid;
+                    sharp_edges[edge] = false;
+                    first_corners[edge] = Some(first);
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Blender's `mesh.set_sharpness_by_angle` (`editmesh_set_sharpness_by_angle.cc`, edit mode) with
+/// `extend` off (its RNA default). A selected edge with exactly two faces (`BM_edge_loop_pair`) is sharp
+/// when its BMesh face normals (`BM_face_calc_normal`) have a dot at most `cos(angle)`. Returns the new
+/// flag per edge, or `None` when the edge keeps its flag.
+pub(crate) fn sharp_edges_by_face_angle(
+    mesh: &Mesh,
+    selected: &[bool],
+    angle: f32,
+) -> Result<Vec<Option<bool>>> {
+    let topology = angle_topology(mesh)?;
+    if selected.len() != topology.edges.len() {
+        return Err(PotError::invalid_argument(
+            "edge selection must match the mesh edge count",
+        ));
+    }
+    let corner_edges = topology.corner_edges()?;
+    let mut incident = vec![Vec::new(); topology.edges.len()];
+    for (face_index, edges) in corner_edges.iter().enumerate() {
+        for &edge in edges {
+            incident[edge].push(face_index);
+        }
+    }
+    let normals = topology
+        .faces
+        .iter()
+        .map(|face| {
+            bmesh_face_normal(
+                &face
+                    .iter()
+                    .map(|&index| topology.points[index])
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let limit = angle.cos();
+    Ok(incident
+        .iter()
+        .enumerate()
+        .map(|(edge, faces)| match faces.as_slice() {
+            [first, second] if selected[edge] => {
+                Some(float_dot(normals[*first], normals[*second]) <= limit)
+            }
+            _ => None,
+        })
+        .collect())
+}
+
 fn union(parent: &mut [usize], first: usize, second: usize) {
     let first = find(parent, first);
     let second = find(parent, second);

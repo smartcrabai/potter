@@ -5414,8 +5414,12 @@ fn apply_shade(mesh: &mut Mesh, selected: &Selection, smooth: bool) -> Result<Id
     Ok(IdChanges::default())
 }
 
+/// Blender's `mesh.set_sharpness_by_angle` (`editmesh_set_sharpness_by_angle.cc`) on the selected edges,
+/// or with no selection the whole-mesh `Mesh.sharp_from_angle_set` (`rna_mesh_api.cc`), which Blender's
+/// `mesh_sharp_edges_set_from_angle` (`blenkernel/intern/mesh.cc`) runs after its `angle >= pi` and
+/// `angle == 0` cases: every face smooth with no sharp edges, or every face flat with no sharp edges.
 fn apply_sharp_angle(mesh: &mut Mesh, args: &Map<String, Value>) -> Result<IdChanges> {
-    let angle = number(args, "angle", std::f64::consts::FRAC_PI_4)?;
+    let angle = number(args, "angle", std::f64::consts::FRAC_PI_6)?;
     if !(0.0..=std::f64::consts::PI).contains(&angle) {
         return Err(invalid("sharp angle must be between zero and pi radians"));
     }
@@ -5426,44 +5430,60 @@ fn apply_sharp_angle(mesh: &mut Mesh, args: &Map<String, Value>) -> Result<IdCha
     {
         return Err(invalid("sharp angle selection requires edge elements"));
     }
-    let selected_ids = selected.map_or_else(
-        || {
-            mesh.edges
+    let all_faces = Selection {
+        domain: Domain::Face,
+        ids: mesh.faces.iter().map(|face| face.id).collect(),
+    };
+    match selected {
+        Some(selected) => {
+            let selected_ids = selected.ids.into_iter().collect::<HashSet<_>>();
+            let selected_edges = mesh
+                .edges
                 .iter()
-                .map(|edge| edge.id)
-                .collect::<HashSet<_>>()
-        },
-        |selected| selected.ids.into_iter().collect(),
-    );
-    let mut sharp_values = Map::new();
-    for edge in mesh
-        .edges
-        .iter()
-        .filter(|edge| selected_ids.contains(&edge.id))
-    {
-        let adjacent = mesh
-            .faces
-            .iter()
-            .filter(|face| {
-                (0..face.vertices.len()).any(|index| {
-                    edge_key(
-                        face.vertices[index],
-                        face.vertices[(index + 1) % face.vertices.len()],
-                    ) == edge_key(edge.vertices[0], edge.vertices[1])
+                .map(|edge| selected_ids.contains(&edge.id))
+                .collect::<Vec<_>>();
+            let updates = crate::geom::normals::sharp_edges_by_face_angle(
+                mesh,
+                &selected_edges,
+                angle as f32,
+            )?;
+            let values = mesh
+                .edges
+                .iter()
+                .zip(updates)
+                .filter_map(|(edge, update)| {
+                    update.map(|sharp| (format!("e{}", edge.id), Value::Bool(sharp)))
                 })
-            })
-            .collect::<Vec<_>>();
-        let sharp = if adjacent.len() < 2 {
-            false
-        } else {
-            let first = face_normal(mesh, adjacent[0])?;
-            adjacent[1..].iter().try_fold(false, |sharp, face| {
-                let normal = face_normal(mesh, face)?;
-                Ok::<_, PotError>(sharp || first.dot(normal).clamp(-1.0, 1.0).acos() >= angle)
-            })?
-        };
-        sharp_values.insert(format!("e{}", edge.id), Value::Bool(sharp));
+                .collect::<Map<String, Value>>();
+            write_sharp_values(mesh, values)?;
+        }
+        None if angle >= std::f64::consts::PI => {
+            apply_shade(mesh, &all_faces, true)?;
+            mesh.attributes.remove("sharp");
+        }
+        None if angle <= 0.0 => {
+            apply_shade(mesh, &all_faces, false)?;
+            mesh.attributes.remove("sharp");
+        }
+        None => {
+            apply_shade(mesh, &all_faces, true)?;
+            let mut sharp = vec![false; mesh.edges.len()];
+            crate::geom::normals::sharp_edges_from_angle(mesh, &[], &mut sharp, angle as f32)?;
+            let values = mesh
+                .edges
+                .iter()
+                .zip(sharp)
+                .map(|(edge, sharp)| (format!("e{}", edge.id), Value::Bool(sharp)))
+                .collect::<Map<String, Value>>();
+            mesh.attributes.remove("sharp");
+            write_sharp_values(mesh, values)?;
+        }
     }
+    Ok(IdChanges::default())
+}
+
+/// Writes per-edge values into the boolean edge attribute `sharp`, creating the attribute when absent.
+fn write_sharp_values(mesh: &mut Mesh, sharp_values: Map<String, Value>) -> Result<()> {
     let attribute = mesh
         .attributes
         .entry("sharp".to_owned())
@@ -5482,7 +5502,7 @@ fn apply_sharp_angle(mesh: &mut Mesh, args: &Map<String, Value>) -> Result<IdCha
         .as_object_mut()
         .ok_or_else(|| invalid("sharp values must be an object"))?
         .extend(sharp_values);
-    Ok(IdChanges::default())
+    Ok(())
 }
 
 fn apply_auto_smooth(mesh: &mut Mesh, args: &Map<String, Value>) -> Result<IdChanges> {
@@ -6994,12 +7014,16 @@ pub(crate) fn apply_with_source(
     apply_inner(mesh, operation, args, Some(source))
 }
 
-/// Operators that write attributes directly keep Blender's `sharp_face` presence; every other operator
-/// rebuilds the mesh through BMesh, which settles it (`normals::settle_sharp_face`).
-const ATTRIBUTE_WRITE_OPERATIONS: [&str; 4] = [
+/// Blender keeps `sharp_face` presence through the operators that write attributes directly:
+/// `rna_MeshPolygon_use_smooth_set` and the attribute API (`lookup_or_add`), and
+/// `Mesh.normals_split_custom_set`, which only touches custom normals. Every other operator is an
+/// edit-mode operator (or a rebuild) that goes through BMesh and settles presence on exit
+/// (`BM_mesh_bm_to_me`, `normals::settle_sharp_face`).
+const ATTRIBUTE_WRITE_OPERATIONS: [&str; 5] = [
     "set_attribute",
     "attribute_create",
     "attribute_update",
+    "attribute_delete",
     "set_custom_normals",
 ];
 

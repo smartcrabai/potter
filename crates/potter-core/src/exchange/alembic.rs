@@ -2697,13 +2697,16 @@ fn import_polymesh(
             Ok((name, samples))
         })
         .collect::<Result<Vec<_>>>()?;
-    if let Some(corners) = normal_samples.as_ref().and_then(|samples| samples.first()) {
-        let corners = corners
-            .iter()
-            .map(|normal| DVec3::from_array(*normal))
-            .collect::<Vec<_>>();
-        super::shading::import_shading(&mut mesh, &corners)?;
-    }
+    let corners = normal_samples
+        .as_ref()
+        .and_then(|samples| samples.first())
+        .map(|corners| {
+            corners
+                .iter()
+                .map(|normal| DVec3::from_array(*normal))
+                .collect::<Vec<_>>()
+        });
+    super::shading::import_smooth_shading(&mut mesh, corners.as_deref())?;
     // Each UV layer takes its first sample's corners; the layer order is the file order.
     let mut layers = Vec::<ExchangeUvLayer>::new();
     for (raw_name, samples) in &uv_samples {

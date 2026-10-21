@@ -307,6 +307,101 @@ fn sliding_uses_connected_topology_and_angle_marks_sharp_edges() {
     mesh.validate().unwrap();
 }
 
+/// Blender 5.2 `Mesh.set_sharp_from_angle` (`rna_mesh_api.cc`) on a cube with one flat face, probed in
+/// headless Blender: 30 degrees makes every face smooth, removes `sharp_face`, and marks all 12 edges.
+#[test]
+fn whole_mesh_sharp_angle_matches_blender_set_sharp_from_angle() {
+    let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
+    edit::apply(
+        &mut mesh,
+        "shade_flat",
+        &json!({"elements":{"domain":"face","ids":["f4"]}}),
+    )
+    .unwrap();
+    edit::apply(
+        &mut mesh,
+        "mark_sharp_by_angle",
+        &json!({"angle": std::f64::consts::FRAC_PI_6}),
+    )
+    .unwrap();
+    let smooth = mesh.attributes["shade_smooth"]["values"]
+        .as_object()
+        .unwrap();
+    assert_eq!(smooth.len(), 6);
+    assert!(smooth.values().all(|value| value == &json!(true)));
+    assert!(
+        mesh.attributes["shade_smooth"]
+            .get("sharp_face_present")
+            .is_none(),
+        "all-smooth result has no sharp_face"
+    );
+    let sharp = mesh.attributes["sharp"]["values"].as_object().unwrap();
+    assert_eq!(sharp.len(), 12);
+    assert!(sharp.values().all(|value| value == &json!(true)));
+    mesh.validate().unwrap();
+}
+
+/// Blender 5.2 `set_sharp_from_angle(0)` on the same cube, probed: every face flat, no `sharp_edge`.
+#[test]
+fn whole_mesh_zero_sharp_angle_matches_blender_flat_faces() {
+    let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
+    edit::apply(&mut mesh, "mark_sharp_by_angle", &json!({"angle": 0.0})).unwrap();
+    let smooth = mesh.attributes["shade_smooth"]["values"]
+        .as_object()
+        .unwrap();
+    assert!(smooth.values().all(|value| value == &json!(false)));
+    assert!(!mesh.attributes.contains_key("sharp"));
+    mesh.validate().unwrap();
+}
+
+/// Blender 5.2 `set_sharp_from_angle(pi)` on the same cube, probed: every face smooth, no sharp edges.
+#[test]
+fn whole_mesh_full_sharp_angle_matches_blender_all_smooth() {
+    let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
+    edit::apply(
+        &mut mesh,
+        "mark_sharp_by_angle",
+        &json!({"angle": std::f64::consts::PI}),
+    )
+    .unwrap();
+    let smooth = mesh.attributes["shade_smooth"]["values"]
+        .as_object()
+        .unwrap();
+    assert!(smooth.values().all(|value| value == &json!(true)));
+    assert!(!mesh.attributes.contains_key("sharp"));
+    mesh.validate().unwrap();
+}
+
+/// Blender 5.2 `mesh.set_sharpness_by_angle` (edit mode) with every cube edge selected, probed: 30
+/// degrees marks all 12 edges, 120 degrees marks none.
+#[test]
+fn selected_edges_sharp_angle_matches_blender_set_sharpness_by_angle() {
+    let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
+    let ids = mesh
+        .edges
+        .iter()
+        .map(|edge| format!("e{}", edge.id))
+        .collect::<Vec<_>>();
+    edit::apply(
+        &mut mesh,
+        "mark_sharp_by_angle",
+        &json!({"elements":{"domain":"edge","ids":ids.clone()},"angle": std::f64::consts::FRAC_PI_6}),
+    )
+    .unwrap();
+    let sharp = mesh.attributes["sharp"]["values"].as_object().unwrap();
+    assert_eq!(sharp.len(), 12);
+    assert!(sharp.values().all(|value| value == &json!(true)));
+    edit::apply(
+        &mut mesh,
+        "mark_sharp_by_angle",
+        &json!({"elements":{"domain":"edge","ids":ids},"angle": 2.0 * std::f64::consts::FRAC_PI_3}),
+    )
+    .unwrap();
+    let sharp = mesh.attributes["sharp"]["values"].as_object().unwrap();
+    assert!(sharp.values().all(|value| value == &json!(false)));
+    mesh.validate().unwrap();
+}
+
 #[test]
 fn spin_extrudes_selected_face_around_axis_in_steps() {
     let mut mesh = Mesh::plane(PlaneParams::default()).unwrap();

@@ -108,6 +108,63 @@ pub(super) fn import_shading(mesh: &mut Mesh, normals: &[DVec3]) -> Result<()> {
     import_shading_flags(mesh, normals, None)
 }
 
+/// Imports shading the way Blender's readers do when they keep every polygon smooth: USD
+/// (`io/usd/intern/usd_reader_mesh.cc`, "Polygons are always assumed to be smooth-shaded") and Alembic
+/// (`io/alembic/intern/abc_reader_mesh.cc`, `process_no_normals`). Corner normals become custom loop
+/// normals, flat shading is never derived from them, and no `sharp_face` attribute is created.
+pub(super) fn import_smooth_shading(mesh: &mut Mesh, normals: Option<&[DVec3]>) -> Result<()> {
+    let smooth = vec![true; mesh.faces.len()];
+    import_exact_shading(mesh, normals, smooth)?;
+    crate::geom::normals::settle_sharp_face(mesh)
+}
+
+/// Imports shading the way Blender's FBX importer does (`io/fbx/importer/fbx_import_mesh.cc`,
+/// `import_face_smoothing`): a `LayerElementSmoothing` with one value per polygon sets
+/// `sharp_face = !smoothing` through `lookup_or_add`, so `sharp_face` is recorded. Without one the
+/// polygons stay smooth and `sharp_face` is absent. `normals` become custom loop normals.
+pub(super) fn import_fbx_shading(
+    mesh: &mut Mesh,
+    normals: Option<&[DVec3]>,
+    smoothing: Option<&[bool]>,
+) -> Result<()> {
+    match smoothing {
+        Some(smooth) => import_exact_shading(mesh, normals, smooth.to_vec()),
+        None => import_smooth_shading(mesh, normals),
+    }
+}
+
+/// Writes `smooth` as the `shade_smooth` flags and imports `normals` as custom normals when given.
+/// Presence is recorded (`lookup_or_add` on the Blender side); callers that create no `sharp_face`
+/// settle it afterwards.
+fn import_exact_shading(
+    mesh: &mut Mesh,
+    normals: Option<&[DVec3]>,
+    smooth: Vec<bool>,
+) -> Result<()> {
+    if let Some(normals) = normals {
+        return import_shading_flags(
+            mesh,
+            normals,
+            Some(&ExactShading {
+                smooth,
+                sharp: Vec::new(),
+            }),
+        );
+    }
+    let values = mesh
+        .faces
+        .iter()
+        .zip(&smooth)
+        .map(|(face, value)| (format!("f{}", face.id), json!(value)))
+        .collect::<serde_json::Map<String, Value>>();
+    mesh.attributes.insert(
+        "shade_smooth".to_owned(),
+        json!({ "domain": "face", "type": "bool", "values": values }),
+    );
+    crate::geom::normals::record_sharp_face(mesh);
+    Ok(())
+}
+
 /// [`import_shading`] with exact flags from a Potter writer: they replace the derived smooth flags
 /// and add the sharp edges the normals were computed with.
 pub(super) fn import_shading_flags(
