@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, LazyLock, Mutex},
 };
 
@@ -19,6 +19,7 @@ use crate::{
 use super::{
     Mesh,
     clnor::{self, NormalCodeOptions, SetterInput},
+    normals::{sharp_edge_flags, smooth_face_flags},
     color_layers::{self, ColorDomain, ColorLayer},
     uv_layers::{self, UvLayer},
 };
@@ -207,6 +208,11 @@ pub(crate) fn evaluate(
                     json!({"modifier_id":modifier.id,"reason":error.to_string()}),
                 )
             })?;
+        // Blender's custom-normal setter splits the fans of smooth faces to mark sharp edges, so the
+        // replaced mesh takes its smooth flags from the cache normals before the normals are encoded.
+        if let Some(normals) = &sample.sample.normals {
+            cache_smooth_faces(&mut evaluated, normals);
+        }
         apply_cache_attributes(
             &mut evaluated,
             sample.sample,
@@ -215,10 +221,6 @@ pub(crate) fn evaluate(
             modifier,
             &mut warnings,
         )?;
-        // The replaced mesh takes its smooth flags from the cache normals; a receiver keeps its own.
-        if let Some(normals) = &sample.sample.normals {
-            cache_smooth_faces(&mut evaluated, normals);
-        }
         validate_cache_output(&evaluated, modifier)?;
         *mesh = evaluated;
         return Ok(warnings);
@@ -264,6 +266,7 @@ pub(crate) fn evaluate(
             )
         })?;
     carry_uv_store(mesh, &mut evaluated);
+    carry_shading(mesh, &mut evaluated)?;
     apply_cache_attributes(
         &mut evaluated,
         sample.sample,
@@ -464,14 +467,63 @@ fn carry_uv_store(input: &Mesh, replacement: &mut Mesh) {
     uv_layers::write(replacement, &store);
 }
 
+/// Carries the receiver's shading onto a replacement with the same faces. Blender keeps a receiver's
+/// `sharp_face` and `sharp_edge` through a same-topology read, so the custom-normal setter sees them.
+/// Faces map by index; edges map by their vertex pair, since the replacement numbers its own edges.
+fn carry_shading(input: &Mesh, replacement: &mut Mesh) -> Result<()> {
+    if input.attributes.contains_key("shade_smooth") && input.faces.len() == replacement.faces.len()
+    {
+        let flags = smooth_face_flags(input)?;
+        let values: serde_json::Map<String, Value> = replacement
+            .faces
+            .iter()
+            .zip(flags)
+            .map(|(face, flag)| (format!("f{}", face.id), json!(flag)))
+            .collect();
+        replacement.attributes.insert(
+            "shade_smooth".to_owned(),
+            json!({"domain": "face", "type": "bool", "values": values}),
+        );
+    }
+    if input.attributes.contains_key("sharp") {
+        let flags = sharp_edge_flags(input)?;
+        let sharp_pairs = input
+            .edges
+            .iter()
+            .zip(flags)
+            .filter(|(_, sharp)| *sharp)
+            .map(|(edge, _)| sorted_pair(edge.vertices))
+            .collect::<HashSet<_>>();
+        let values: serde_json::Map<String, Value> = replacement
+            .edges
+            .iter()
+            .map(|edge| {
+                (
+                    format!("e{}", edge.id),
+                    json!(sharp_pairs.contains(&sorted_pair(edge.vertices))),
+                )
+            })
+            .collect();
+        replacement.attributes.insert(
+            "sharp".to_owned(),
+            json!({"domain": "edge", "type": "bool", "values": values}),
+        );
+    }
+    Ok(())
+}
+
+fn sorted_pair(vertices: [u32; 2]) -> [u32; 2] {
+    [vertices[0].min(vertices[1]), vertices[0].max(vertices[1])]
+}
+
 /// Writes each cached UV layer into the layer its name gives, creating the layer when the mesh
 /// lacks it. Alembic UV face-corner rows are reversed into Potter mesh-loop order whether or not
 /// cache polygons replace the input faces. A layer's values are replaced; its pins and the other
 /// layers are kept. A cached layer with no room left under the mesh limit is reported and not
 /// written. The active and render names keep their layers while those exist; otherwise they name
 /// the first layer the cache wrote.
-/// Without polygons, only the last UV layer in file order takes values; the other layers are created
-/// when missing (at zero) and otherwise keep their values, as Blender's UV-only read leaves them.
+/// Without polygons, the active layer (`primary`) takes no values; it is created at zero when missing
+/// and otherwise keeps its values. Blender's UV-only read writes every other layer.
 fn write_cache_uvs(
     mesh: &mut Mesh,
     modifier: &Modifier,
@@ -591,6 +643,11 @@ fn layer_limit_warning(modifier: &Modifier, layer: &str) -> PotError {
 /// Blender's custom-normal setter marks a face flat when every corner normal is its face normal, so a
 /// face is smooth unless all its corners match it within float32 noise.
 fn cache_smooth_faces(mesh: &mut Mesh, normals: &[[f64; 3]]) {
+    let corner_count: usize = mesh.faces.iter().map(|face| face.vertices.len()).sum();
+    if normals.len() != corner_count {
+        // The corner count is checked where the normals are encoded, which reports the mismatch.
+        return;
+    }
     let positions = mesh
         .vertices
         .iter()

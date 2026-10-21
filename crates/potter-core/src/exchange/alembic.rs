@@ -2764,8 +2764,8 @@ pub(crate) struct MeshCacheSample {
     pub has_multiple_topology_samples: bool,
     /// Named UV parameters in file order, with rows still in Alembic face winding.
     pub uv_layers: Option<Vec<ExchangeUvLayer>>,
-    /// The last UV layer in file order, which Blender's read without polygons fills (oracle
-    /// `read_uv_only`: the second of two UV layers is written, the first stays zero).
+    /// The layer of the arbitrary `uv` parameter, the active UV layer, when the cache has one. A read
+    /// without polygons leaves it unwritten, as Blender's UV-only read does (oracle `read_uv_only`).
     pub uv_primary: Option<String>,
     pub colors: Vec<CacheColorLayer>,
     pub velocities: Option<(String, Vec<Vec<f64>>)>,
@@ -2852,7 +2852,13 @@ pub(crate) fn read_mesh_cache(
         Vec::new()
     };
     let uv_names = uv_layer_names(&uv);
-    let uv_primary = read_uv.then(|| uv_names.last().cloned()).flatten();
+    // The exporter stores the active UV layer as the arbitrary parameter named `uv`, which Blender's
+    // UV-only read does not write (its `uvs_param`).
+    let uv_primary = uv
+        .iter()
+        .zip(&uv_names)
+        .find(|(parameter, _)| parameter.name == "uv")
+        .map(|(_, name)| name.clone());
     let color = if read_color {
         color_geom_parameters(geom)
     } else {
