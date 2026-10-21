@@ -1535,7 +1535,7 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
                     .try_into()
                     .map_err(|_| invalid("invalid volume emission color"))?;
             let strength = self.scalar_input(id, &["Emission Strength"], 0.0)?.max(0.0);
-            emission.map(|channel| channel * strength * density)
+            emission.map(|channel| channel * strength)
         };
         Ok(params)
     }

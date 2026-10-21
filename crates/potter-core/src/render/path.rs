@@ -771,7 +771,7 @@ fn realtime_volume_integral(
                 0.0
             };
             extinction += extinction_coefficient;
-            source += instance.emission * density;
+            source += instance.emission;
             if instance.scattering {
                 source += ambient * instance.albedo * scattering_coefficient;
                 for light in lights {
@@ -1139,7 +1139,7 @@ fn trace_path(
         if let Some((grid, medium)) = mixed {
             // The grid's stochastic free flight and the mesh's analog collision are sampled independently, and the nearer
             // event is taken. The grid's emission runs up to that event, weighted by the mesh's chromatic excess, before the
-            // throughput takes any transmittance (`grid_emission_until`). Analog sampling is exact for the event, so the
+            // throughput takes any transmittance (`emission_until`). Analog sampling is exact for the event, so the
             // mesh's chromatic transmittance is its only extra weight (`chromatic_correction`).
             let voxel = trace_volume_segment(Some(grid), volumes, origin, direction, rng, true)?;
             let voxel_distance = voxel
@@ -1149,11 +1149,12 @@ fn trace_path(
             let collision = sample_mesh_collision(&medium, limit, rng);
             let emission_end = collision.unwrap_or(limit);
             radiance += throughput
-                * grid_emission_until(
-                    grid,
-                    mesh_chromatic(&medium),
-                    emission_end,
+                * emission_until(
+                    Some(grid),
                     voxel.stochastic,
+                    Some(&medium),
+                    true,
+                    emission_end,
                 );
             if let Some(distance) = collision {
                 if !voxel.stochastic {
@@ -1262,11 +1263,11 @@ fn trace_path(
             }
         } else if terminal {
             // The path's last scatter has taken its direct light: this ray only attenuates through the volumes it crosses.
+            radiance += throughput
+                * emission_until(grid.as_ref(), false, stack.as_ref(), false, segment_limit);
             if let Some(grid) = grid.as_ref() {
                 let segment =
                     trace_volume_segment(Some(grid), volumes, origin, direction, rng, false)?;
-                radiance +=
-                    throughput * grid_emission_until(grid, DVec3::ZERO, segment_limit, false);
                 throughput *= segment.transmittance;
             }
             if let Some(medium) = stack {
@@ -1281,7 +1282,7 @@ fn trace_path(
                 .event
                 .map_or(segment_limit, |event| (event.point - origin).dot(direction));
             radiance += throughput
-                * grid_emission_until(grid, DVec3::ZERO, emission_end, segment.stochastic);
+                * emission_until(Some(grid), segment.stochastic, None, false, emission_end);
             if !segment.stochastic {
                 throughput *= segment.transmittance;
             }
@@ -1333,6 +1334,10 @@ fn trace_path(
         } else if let Some(medium) = stack {
             // The stack changes only at surfaces, so the stack's combined medium spans this whole segment, and its free
             // flight is spectral ratio tracking (`trace_mesh_medium`). A scatter picks its closure by scatter weight.
+            // A mesh medium's emission is integrated in closed form over the whole segment, at the throughput the path
+            // carries into it, independent of where it scatters (`volume_integrate_homogeneous`).
+            radiance +=
+                throughput * emission_until(None, false, Some(&medium), false, segment_limit);
             match trace_mesh_medium(&medium, segment_limit, &mut throughput, rng) {
                 MediumOutcome::Scatter(distance) => {
                     let phase = event_phase(&media, None, distance);
@@ -3362,12 +3367,15 @@ fn stack_medium(media: &[MeshMedium]) -> Option<BsdfParams> {
     let mut combined = first.params;
     let mut scatter = DVec3::ZERO;
     let mut absorption = DVec3::ZERO;
+    let mut emission = DVec3::ZERO;
     for medium in media {
         scatter += DVec3::from_array(medium.params.volume_scatter);
         absorption += DVec3::from_array(medium.params.volume_absorption);
+        emission += DVec3::from_array(medium.params.volume_emission);
     }
     combined.volume_scatter = scatter.to_array();
     combined.volume_absorption = absorption.to_array();
+    combined.volume_emission = emission.to_array();
     combined.volume_anisotropy = 0.0;
     combined.volume_sampling =
         segment_sampling(media.iter().map(|medium| medium.params.volume_sampling))
@@ -3624,7 +3632,7 @@ fn voxel_grid(
             let coefficient = volume_extinction_density(instance, density);
             let step_scatter = instance.albedo * coefficient;
             step_extinction += coefficient;
-            step_emission += instance.emission * density;
+            step_emission += instance.emission;
             *step_total += step_scatter;
             if let Some(group) = groups
                 .iter_mut()
@@ -3683,50 +3691,119 @@ fn grid_scatter_pdf(grid: &VoxelGrid, distance: f64) -> f64 {
     scatter * grid.meters_per_unit * (-grid_depth(grid, distance)).exp()
 }
 
+/// The per-channel extinction of a medium: its scatter plus its absorption, per unit length.
+fn medium_extinction(medium: &BsdfParams) -> DVec3 {
+    DVec3::from_array(medium.volume_scatter) + DVec3::from_array(medium.volume_absorption)
+}
+
 /// The per-channel extinction above the channel mean of a mesh medium: the exponent that grey analog sampling leaves to
 /// the channels (`chromatic_correction` is its exponential).
 fn mesh_chromatic(medium: &BsdfParams) -> DVec3 {
-    let extinction =
-        DVec3::from_array(medium.volume_scatter) + DVec3::from_array(medium.volume_absorption);
+    let extinction = medium_extinction(medium);
     extinction - DVec3::splat(extinction.element_sum() / 3.0)
 }
 
-/// The grid's emission from its entry to `end`, per channel, as Cycles' heterogeneous integrator adds it. Each step's
-/// emission is weighted by the transmittance of what precedes it: the grid's own extinction, unless the grid is `analog`,
-/// and the mesh's chromatic excess `chromatic` (`mesh_chromatic`). An analog grid's collisions end the emission at `end`
-/// instead of weighting it: the expectation over its first collision is the transmittance itself.
-fn grid_emission_until(grid: &VoxelGrid, chromatic: DVec3, end: f64, analog: bool) -> DVec3 {
-    let mut emitted = DVec3::ZERO;
-    let mut exponent = DVec3::ZERO;
-    for (index, extinction) in grid.extinction.iter().enumerate() {
-        let start = grid.entry + index as f64 * grid.step;
-        if end <= start {
-            break;
-        }
-        let covered = end.min(start + grid.step) - start;
-        let grid_rate = if analog {
-            0.0
-        } else {
-            extinction * grid.meters_per_unit
-        };
-        let rate = chromatic + DVec3::splat(grid_rate);
-        let source = grid.emission[index] * grid.meters_per_unit;
+/// One piece of a segment's emission, `length` scene units long: `source` per unit length, weighted by the transmittance
+/// `exponent` of everything before it and by the piece's own per-channel extinction `rate`. Its integral is Cycles' closed
+/// form `E · (1 - exp(-σ·length)) / σ` (`volume_emission_integrate`), which is `E · length` as σ goes to zero.
+fn add_emission_piece(
+    emitted: &mut DVec3,
+    exponent: &mut DVec3,
+    length: f64,
+    rate: DVec3,
+    source: DVec3,
+) {
+    if source != DVec3::ZERO {
         let shape = DVec3::from_array(rate.to_array().map(|rate| {
             if rate.abs() > 1.0e-12 {
-                (1.0 - (-rate * covered).exp()) / rate
+                (1.0 - (-rate * length).exp()) / rate
             } else {
-                covered
+                length
             }
         }));
-        emitted += source * (-exponent).exp() * shape;
-        exponent += rate * covered;
+        *emitted += source * (-*exponent).exp() * shape;
+    }
+    *exponent += rate * length;
+}
+
+/// The emission of a segment from its origin to `end`, per channel. A voxel grid contributes its per-step emission and
+/// extinction, and a mesh medium its constant emission and extinction, all in one walk over the pieces. A grid that is
+/// `grid_analog` (stochastic) takes no transmittance weight of its own: its collisions end the emission
+/// (`trace_volume_segment`). A mesh that is `mesh_analog` carries only its chromatic excess over the channel mean, since the
+/// analog survival of the mean is the sampling (`mesh_chromatic`). A deterministic medium carries its full transmittance,
+/// as Cycles' homogeneous integrator does (`volume_integrate_homogeneous`).
+fn emission_until(
+    grid: Option<&VoxelGrid>,
+    grid_analog: bool,
+    mesh: Option<&BsdfParams>,
+    mesh_analog: bool,
+    end: f64,
+) -> DVec3 {
+    let mesh_rate = mesh.map_or(DVec3::ZERO, |medium| {
+        if mesh_analog {
+            mesh_chromatic(medium)
+        } else {
+            medium_extinction(medium)
+        }
+    });
+    let mesh_source = mesh.map_or(DVec3::ZERO, |medium| {
+        DVec3::from_array(medium.volume_emission)
+    });
+    let mut emitted = DVec3::ZERO;
+    let mut exponent = DVec3::ZERO;
+    let mut position = 0.0_f64;
+    if let Some(grid) = grid {
+        for (index, extinction) in grid.extinction.iter().enumerate() {
+            let start = grid.entry + index as f64 * grid.step;
+            // The mesh alone, from the last piece to this step's start.
+            let gap_end = start.min(end);
+            if gap_end > position {
+                add_emission_piece(
+                    &mut emitted,
+                    &mut exponent,
+                    gap_end - position,
+                    mesh_rate,
+                    mesh_source,
+                );
+                position = gap_end;
+            }
+            let covered = (start + grid.step).min(end) - position;
+            if covered > 0.0 {
+                let grid_rate = if grid_analog {
+                    0.0
+                } else {
+                    extinction * grid.meters_per_unit
+                };
+                let grid_source = grid.emission[index] * grid.meters_per_unit;
+                add_emission_piece(
+                    &mut emitted,
+                    &mut exponent,
+                    covered,
+                    mesh_rate + DVec3::splat(grid_rate),
+                    grid_source + mesh_source,
+                );
+                position += covered;
+            }
+            if position >= end {
+                return emitted;
+            }
+        }
+    }
+    if end > position {
+        add_emission_piece(
+            &mut emitted,
+            &mut exponent,
+            end - position,
+            mesh_rate,
+            mesh_source,
+        );
     }
     emitted
 }
 
 /// Trace one voxel segment's free flight on its grid with the distance sampler's events, and its transmittance
 /// (`volume_integrate_heterogeneous`, with the grid's grey transport). The caller integrates the emission up to the event
-/// with `grid_emission_until`.
+/// with `emission_until`.
 fn trace_volume_segment(
     grid: Option<&VoxelGrid>,
     volumes: &[VolumeInstance<'_>],
