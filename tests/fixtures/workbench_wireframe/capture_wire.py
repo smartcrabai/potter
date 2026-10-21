@@ -1,8 +1,9 @@
 """GUI capture of the Blender 5.2.2 viewport in wireframe shading.
 
 Run with the scene file as the first argument so no splash screen opens:
-  Blender --factory-startup --window-geometry 0 0 1000 800 wire_scene.blend --python capture_wire.py -- <out.png> <out.json> [view_transform look]
-(wire_scene.blend comes from build_scene.py: blender -b --factory-startup --python build_scene.py -- wire_scene.blend)
+  Blender --factory-startup --window-geometry 0 0 1000 800 wire_scene.blend --python capture_wire.py -- <out.png> <out.json> [view_transform [look [background|None [outline]]]]
+  background: the theme interior override as a float, or None for the factory theme.
+  outline: "on", "off", or "factory" (the default: the viewport's own setting, which is on).
 The 3D viewport is the only visible area: its toolbars, header, gizmos, grid, axes, floor, text and
 extras are off. The view is fixed (orthographic, Blender's front-right-top-style rotation below), and
 the theme is the factory default. The JSON records the theme values, the region size and the
@@ -18,7 +19,8 @@ argv = sys.argv[sys.argv.index("--") + 1:]
 png_path, json_path = argv[0], argv[1]
 VIEW_TRANSFORM = argv[2] if len(argv) > 2 else "Standard"
 LOOK = argv[3] if len(argv) > 3 else "None"
-BACK_OVERRIDE = float(argv[4]) if len(argv) > 4 else None
+BACK_OVERRIDE = float(argv[4]) if len(argv) > 4 and argv[4] != "None" else None
+OUTLINE = argv[5] if len(argv) > 5 else "factory"
 
 # View: looking down -Y-ish at the scene, orthographic. Rotation quaternion (w, x, y, z) is Blender's
 # view_rotation, and the view centre is the origin, so the scene sits in the viewport centre.
@@ -45,6 +47,8 @@ def prepare(area):
     bpy.context.scene.view_settings.look = LOOK
     space = area.spaces.active
     space.shading.type = "WIREFRAME"
+    if OUTLINE != "factory":
+        space.shading.show_object_outline = OUTLINE == "on"
     space.overlay.show_overlays = True
     space.overlay.show_floor = False
     space.overlay.show_axis_x = False

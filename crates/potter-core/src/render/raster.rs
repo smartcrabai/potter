@@ -975,28 +975,18 @@ pub(crate) fn rasterize_with_lines(
     }
     Ok(output)
 }
-/// The wireframe preview of `edges` (`render/wireframe.rs`): each line is projected, coloured by the
-/// facing of its corner normals (or by its own colour, for a stroke), and rasterised with the overlay's
-/// nearest-line and anti-aliasing rules. The background is the theme's interior colour.
+/// The wireframe preview (`render/wireframe.rs`): the object outline of the surfaces' ids, then the edges and
+/// points over it. `triangles` and `lines` only feed the pick, depth and element buffers, which keep their
+/// usual meaning; the RGBA and linear colour are the wireframe overlay's.
 pub(crate) fn rasterize_wireframe(
     edges: &[WireEdge],
     points: &[DVec3],
+    triangles: &[Triangle],
+    lines: &[Line],
     camera: &Camera,
     width: u32,
     height: u32,
 ) -> Result<RasterOutput> {
-    let mut output = rasterize_with_samples(
-        &[],
-        camera,
-        width,
-        height,
-        Mode::Wire,
-        wireframe::background_rgba(),
-        1,
-        0,
-        None,
-    )?;
-    let frame = camera_frame(camera, width, height)?;
     let width_usize = usize::try_from(width).map_err(|_| {
         PotError::new(
             ErrorCode::LimitExceeded,
@@ -1009,6 +999,32 @@ pub(crate) fn rasterize_wireframe(
             "image height exceeds platform limits",
         )
     })?;
+    // Workbench's object id buffer holds the surfaces alone: loose edges and points are not objects.
+    let surfaces = rasterize_with_samples(
+        triangles,
+        camera,
+        width,
+        height,
+        Mode::Wire,
+        [0; 4],
+        1,
+        0,
+        None,
+    )?;
+    let background = wireframe::outline_background(&surfaces.ids, width_usize, height_usize);
+    let mut output = rasterize_with_lines(
+        triangles,
+        lines,
+        camera,
+        width,
+        height,
+        Mode::Wire,
+        wireframe::background_rgba(),
+        1,
+        0,
+        None,
+    )?;
+    let frame = camera_frame(camera, width, height)?;
     let orthographic = matches!(frame.projection, ProjectionFrame::Orthographic { .. });
     let (rim, interior) = wireframe::theme_linear();
     let facing = |normal: DVec3, point: DVec3| {
@@ -1040,31 +1056,54 @@ pub(crate) fn rasterize_wireframe(
         if !wireframe::edge_visible(edge.wd, wireframe::WIRE_THRESHOLD) {
             continue;
         }
-        let Some(start) = project_world(camera, &frame, width, height, edge.start) else {
+        // Clip to the near and far planes along the edge first. Depth is linear along a segment for the
+        // planar projections; a panorama clips by distance, so its edges keep their endpoints.
+        let (start, end, normals) = if frame.depth_is_distance {
+            (edge.start, edge.end, edge.normals)
+        } else {
+            let depth_at = |point: DVec3| (point - camera.position).dot(frame.forward);
+            let Some((t0, t1)) = clip_range(
+                depth_at(edge.start),
+                depth_at(edge.end),
+                camera.near,
+                camera.far,
+            ) else {
+                continue;
+            };
+            let at = |t: f64| edge.start.lerp(edge.end, t);
+            let normals = edge.normals.map(|[normal_a, normal_b]| {
+                [
+                    normal_a.lerp(normal_b, t0).normalize_or_zero(),
+                    normal_a.lerp(normal_b, t1).normalize_or_zero(),
+                ]
+            });
+            (at(t0), at(t1), normals)
+        };
+        let (Some(start_projected), Some(end_projected)) = (
+            project_unclipped(camera, &frame, width, height, start),
+            project_unclipped(camera, &frame, width, height, end),
+        ) else {
             continue;
         };
-        let Some(end) = project_world(camera, &frame, width, height, edge.end) else {
-            continue;
-        };
-        let (colour_a, colour_b) = match edge.normals {
+        let (colour_a, colour_b) = match normals {
             Some([normal_a, normal_b]) => (
-                wireframe::facing_colour(facing(normal_a, edge.start), rim, interior),
-                wireframe::facing_colour(facing(normal_b, edge.end), rim, interior),
+                wireframe::facing_colour(facing(normal_a, start), rim, interior),
+                wireframe::facing_colour(facing(normal_b, end), rim, interior),
             ),
             None => (edge.colour, edge.colour),
         };
+        // `project_world` puts pixel centres on integers; the overlay model takes pixel `i` as `[i, i + 1)`,
+        // so its centres sit at `i + 0.5`.
         segments.push(WireSegment {
-            // `project_world` puts pixel centres on integers; the overlay model takes pixel `i` as
-            // `[i, i + 1)`, so its centres sit at `i + 0.5`.
             a: ScreenPoint {
-                x: start.x + 0.5,
-                y: start.y + 0.5,
-                depth: window_depth(edge.start),
+                x: start_projected.x + 0.5,
+                y: start_projected.y + 0.5,
+                depth: window_depth(start),
             },
             b: ScreenPoint {
-                x: end.x + 0.5,
-                y: end.y + 0.5,
-                depth: window_depth(edge.end),
+                x: end_projected.x + 0.5,
+                y: end_projected.y + 0.5,
+                depth: window_depth(end),
             },
             colour_a,
             colour_b,
@@ -1081,17 +1120,13 @@ pub(crate) fn rasterize_wireframe(
         let Some(projected) = project_world(camera, &frame, width, height, *point) else {
             continue;
         };
-        // Every point is a square of `2 · vert` pixels: measured on the Metal capture of point clouds of
-        // four radii (0.05 to 0.2), the square does not grow with the radius, and the partial outline
-        // around larger dots has no radius rule that fits (a ring fit is worse than the square alone).
-        let side = 2.0 * wireframe::vertex_size();
         squares.push(PointSquare {
             centre_x: projected.x + 0.5,
             centre_y: projected.y + 0.5,
-            side,
+            side: 2.0 * wireframe::vertex_size(),
         });
     }
-    let linear = wireframe::composite(&segments, &squares, width_usize, height_usize);
+    let linear = wireframe::composite(&segments, &squares, &background, width_usize, height_usize);
     for (index, colour) in linear.iter().enumerate() {
         let encoded = [
             wireframe::display_byte(colour[0]),
@@ -1103,6 +1138,19 @@ pub(crate) fn rasterize_wireframe(
         output.linear_rgba[index] = [colour[0] as f32, colour[1] as f32, colour[2] as f32, 1.0];
     }
     Ok(output)
+}
+
+/// The part `[t0, t1]` of a segment whose depth runs linearly from `depth_a` to `depth_b` that lies within
+/// `[near, far]`, as fractions of the segment; `None` when no part does.
+fn clip_range(depth_a: f64, depth_b: f64, near: f64, far: f64) -> Option<(f64, f64)> {
+    let slope = depth_b - depth_a;
+    if slope.abs() < 1e-12 * (1.0 + depth_a.abs()) {
+        return (depth_a >= near && depth_a <= far).then_some((0.0, 1.0));
+    }
+    let t_near = (near - depth_a) / slope;
+    let t_far = (far - depth_a) / slope;
+    let (lo, hi) = (t_near.min(t_far).max(0.0), t_near.max(t_far).min(1.0));
+    (lo <= hi).then_some((lo, hi))
 }
 
 /// The depth a world point records under `frame`: its distance from the camera for a panorama, and its view-axis distance
@@ -1130,18 +1178,38 @@ fn project_world(
     height: u32,
     point: DVec3,
 ) -> Option<ProjectedPoint> {
-    let relative = point - camera.position;
-    let depth = relative.dot(frame.forward);
-    // A panorama covers every direction, so it clips by distance from the camera, not by depth along the view axis.
-    let clip_depth = match frame.projection {
-        ProjectionFrame::Orthographic { .. } | ProjectionFrame::Perspective { .. } => depth,
-        ProjectionFrame::Equirectangular { .. }
-        | ProjectionFrame::FisheyeEquidistant { .. }
-        | ProjectionFrame::FisheyeEquisolid { .. } => relative.length(),
-    };
+    let clip_depth = clip_depth_of(camera, frame, point);
     if !clip_depth.is_finite() || clip_depth < frame.near || clip_depth > frame.far {
         return None;
     }
+    project_unclipped(camera, frame, width, height, point)
+}
+
+/// The depth a point is clipped by: its view-axis depth, or its distance from the camera for a panorama,
+/// which covers every direction.
+fn clip_depth_of(camera: &Camera, frame: &CameraFrame, point: DVec3) -> f64 {
+    let relative = point - camera.position;
+    match frame.projection {
+        ProjectionFrame::Orthographic { .. } | ProjectionFrame::Perspective { .. } => {
+            relative.dot(frame.forward)
+        }
+        ProjectionFrame::Equirectangular { .. }
+        | ProjectionFrame::FisheyeEquidistant { .. }
+        | ProjectionFrame::FisheyeEquisolid { .. } => relative.length(),
+    }
+}
+
+/// `project_world` without the clip-range test, for a point the caller has already clipped to the planes.
+fn project_unclipped(
+    camera: &Camera,
+    frame: &CameraFrame,
+    width: u32,
+    height: u32,
+    point: DVec3,
+) -> Option<ProjectedPoint> {
+    let relative = point - camera.position;
+    let depth = relative.dot(frame.forward);
+    let clip_depth = clip_depth_of(camera, frame, point);
     let right = relative.dot(frame.right);
     let up = relative.dot(frame.up);
     let (mut ndc_x, mut ndc_y, scale_x, scale_y) = match frame.projection {

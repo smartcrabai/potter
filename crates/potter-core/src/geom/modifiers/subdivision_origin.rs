@@ -66,6 +66,32 @@ pub(super) fn edge_origins(edge_sources: Vec<Option<usize>>) -> Vec<Vec<(usize, 
         .collect()
 }
 
+/// The optimal-display mask of a Subdivision result, keyed by edge id like the other edge stores, or `None`
+/// when every edge displays (`show_only_control_edges` off, or a modifier other than Subdivision).
+/// `edge_sources` is the output's order map in storage order, before the permutation: `Some` for a subedge.
+pub(super) fn optimal_display_mask(
+    modifier: &crate::model::Modifier,
+    output: &Mesh,
+    edge_sources: &[Option<usize>],
+) -> Option<Value> {
+    if modifier.modifier_type != "subdivision"
+        || !modifier
+            .params
+            .get("show_only_control_edges")
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+    {
+        return None;
+    }
+    let values: serde_json::Map<String, Value> = output
+        .edges
+        .iter()
+        .zip(edge_sources)
+        .map(|(edge, source)| (format!("e{}", edge.id), Value::Bool(source.is_some())))
+        .collect();
+    Some(serde_json::json!({"domain":"edge","type":"bool","values":values}))
+}
+
 /// The origin and staged mixes of every element of `output`, the subdivided mesh before its storage is
 /// permuted into Blender's order. `polygons` and `loop_starts` describe `mesh` as subdivision read it;
 /// `samples` and `loose` place each output element on `mesh`. Corner sources are built only when the remap

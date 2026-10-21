@@ -51,6 +51,11 @@ mod subdivision_loose;
 mod subdivision_normals;
 mod subdivision_order;
 mod subdivision_origin;
+
+/// The edge attribute of a Subdivision result marking its optimal-display edges (Blender's
+/// `subsurf_optimal_display_edges`): `true` for a subedge of a coarse edge, `false` for an internal edge.
+/// The wireframe overlay hides the `false` edges. Internal to evaluation, like `crease_edge`.
+pub(crate) const OPTIMAL_DISPLAY_EDGES: &str = "subdivision_optimal_edges";
 mod subdivision_uv;
 use subdivision_limit::Samples;
 type Polygon = (Vec<usize>, u32);
@@ -3172,6 +3177,8 @@ fn subdivision_with_samples(
         &result,
     )?;
     let written = subdivision_origin::take_written(&mut result);
+    let optimal_display =
+        subdivision_origin::optimal_display_mask(modifier, &result, &order.edge_sources);
     remap_attributes_staged(
         mesh,
         &mut result,
@@ -3181,6 +3188,11 @@ fn subdivision_with_samples(
         &subdivision_origin::WRITTEN_KEYS,
     )?;
     subdivision_origin::restore_written(&mut result, written);
+    if let Some(mask) = optimal_display {
+        result
+            .attributes
+            .insert(OPTIMAL_DISPLAY_EDGES.to_owned(), mask);
+    }
     subdivision_uv::encode_byte_colors(mesh, &origin, Some(&staged), &mut result);
     for (face, &start) in result.faces.iter_mut().zip(&order.face_starts) {
         face.vertices.rotate_left(start);

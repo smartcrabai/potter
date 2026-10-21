@@ -23,7 +23,7 @@ use super::{
         SurfaceShader, ViewBasis, projection_for_camera, rasterize_wireframe, rasterize_with_lines,
     },
     scene::{Geometry, extract_geometry, surface_shader},
-    wireframe::{self, WireEdge},
+    wireframe,
 };
 
 const MIN_SIZE: u32 = 64;
@@ -645,8 +645,8 @@ fn adaptive_camera_override(camera: &PreparedCamera) -> AdaptiveCameraOverride {
     }
 }
 
-/// Rasterises one view. Wire shows the mesh edges and strokes of the geometry as Blender's wireframe
-/// overlay does (`wireframe.rs`); every other mode rasterises triangles and strokes.
+/// Rasterises one view. Wire draws Blender's wireframe overlay of the geometry's wire edges and points
+/// (`wireframe.rs`); every other mode rasterises triangles and strokes.
 fn rasterize_view(
     geometry: &Geometry,
     camera: &Camera,
@@ -672,24 +672,16 @@ fn rasterize_view(
             shader,
         );
     }
-    // Curves and strokes are wire lines in the theme wire colour (black), with no facing; a zero-length
-    // stroke is a point-cloud point, drawn at its radius.
-    let mut edges: Vec<WireEdge> = geometry.wire_edges.clone();
-    let mut points: Vec<DVec3> = geometry.wire_points.clone();
-    for line in &geometry.lines {
-        if line.start == line.end {
-            points.push(line.start);
-        } else {
-            edges.push(WireEdge {
-                start: line.start,
-                end: line.end,
-                normals: None,
-                colour: [0.0; 3],
-                wd: 0.0,
-            });
-        }
-    }
-    rasterize_wireframe(&edges, &points, camera, width, height)
+    // The overlay's edges and points come from the scene's wire geometry; the lines feed the pick buffers.
+    rasterize_wireframe(
+        &geometry.wire_edges,
+        &geometry.wire_points,
+        &geometry.triangles,
+        &geometry.lines,
+        camera,
+        width,
+        height,
+    )
 }
 
 fn background_color(doc: &SceneDoc, snapshot: &Snapshot, mode: Mode, transparent: bool) -> [u8; 4] {
