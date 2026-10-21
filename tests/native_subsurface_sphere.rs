@@ -12,10 +12,10 @@
 //! Blender's frame means (red) are: Burley 0.15974, no subsurface 0.19963, random walk 0.04077, random walk skin 0.19571,
 //! random walk legacy 0.17539. Burley against no subsurface differs by 0.0399 in red, and random walk against Burley by
 //! 0.119. So an absent or wrongly scaled closure of either method is detected at any noise this test can reach. The skin
-//! and legacy methods are not evaluated yet: their cases report UNSUPPORTED_FEATURE and are not tested here.
+//! and legacy methods are not evaluated yet: their cases report `UNSUPPORTED_FEATURE` and are not tested here.
 //!
-//! Cost: `SAMPLES` is a starting point. The lane measures the run time and Potter's seed spread, and the figures belong
-//! in the commit message and here before the PR is closed.
+//! Cost: each case runs in about 12–17 s of test time on the lane (Blender's renders included), at `SAMPLES` = 32
+//! samples per pixel on eight seeds, so each case stays well inside the 40 s budget.
 
 #[path = "common/blender_checked.rs"]
 mod blender_checked;
@@ -44,9 +44,7 @@ const SCRIPT: &str = include_str!("fixtures/native_oracle/subsurface/subsurface_
 const SEEDS: u32 = 8;
 const RESOLUTION: u32 = 16;
 /// Potter's samples per pixel. Blender renders at 256 (see `subsurface_sphere.py`).
-const SAMPLES: u32 = 64;
-/// Blender's `max_bounces` for the sphere (see `subsurface_sphere.py`).
-const MAX_BOUNCES: u32 = 8;
+const SAMPLES: u32 = 32;
 /// The two-sided 99.9% Student t quantile at 7 degrees of freedom (see the module docs).
 const T_QUANTILE: f64 = 5.408;
 
@@ -82,13 +80,28 @@ fn burley_subsurface_sphere_matches_cycles() -> TestResult {
     matches_cycles("burley")
 }
 
+/// The Burley sphere with a zero bounce budget: Cycles still enters the surface and shades the exit, so the result
+/// matches the full-budget render, and Potter must not cut the entry at the budget.
+#[test]
+fn burley_bounce0_subsurface_sphere_matches_cycles() -> TestResult {
+    matches_cycles("burley_bounce0")
+}
+
+/// The Burley sphere over a floor with a budget of one. The entry takes no bounce, so the exit is the first scatter and
+/// the floor is the second vertex: the light that leaves the exit bounces off the floor to the camera, and a bounce
+/// counted at the entry would drop it (`subsurface_bounce` returns before `path_state_next`).
+#[test]
+fn burley_floor_bounce1_subsurface_sphere_matches_cycles() -> TestResult {
+    matches_cycles("burley_floor_bounce1")
+}
+
 #[test]
 fn random_walk_subsurface_sphere_matches_cycles() -> TestResult {
     matches_cycles("random_walk")
 }
 
-/// Renders the sphere of `case` (a case of `subsurface_sphere.py`) in Blender and in Potter, and compares the channel
-/// means of the seeds with the tolerance of the module docs.
+/// Renders the sphere of `case` (a case of `subsurface_sphere.py`) in Blender and in Potter at the case's bounce
+/// budget, and compares the channel means of the seeds with the tolerance of the module docs.
 fn matches_cycles(case: &str) -> TestResult {
     let Some(blender) = blender_checked::blender_executable() else {
         return Ok(());
@@ -101,6 +114,11 @@ fn matches_cycles(case: &str) -> TestResult {
     run_blender_arguments(&blender, &script, None, &arguments)?;
     let expected: Value = serde_json::from_slice(&fs::read(&json_path)?)?;
     let wanted = blender_channels(&expected["cases"][case])?;
+    let budget = u32::try_from(
+        expected["cases"][case]["max_bounces"]
+            .as_u64()
+            .ok_or("the Blender case has no max_bounces")?,
+    )?;
 
     let (project_path, _) = import_blend(&blender, root.path(), "project", &blend)?;
     let project = Project::open(&project_path)?;
@@ -115,7 +133,7 @@ fn matches_cycles(case: &str) -> TestResult {
         scene.render.resolution_y = RESOLUTION;
         scene.render.resolution_percentage = 100;
         scene.render.samples = SAMPLES;
-        scene.render.max_bounces = MAX_BOUNCES;
+        scene.render.max_bounces = budget;
         (
             scene.camera.clone(),
             scene.frame_current,

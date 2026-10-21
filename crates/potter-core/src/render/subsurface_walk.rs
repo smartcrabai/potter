@@ -61,12 +61,12 @@ fn albedo_from_colour(color: f64, g: f64) -> f64 {
         + 4.09712)
         .powi(2);
     let denominator = 1.0 - g * s_sq;
-    let alpha = if denominator != 0.0 {
-        (1.0 - s_sq) / denominator
+    let alpha = (1.0 - s_sq) / denominator;
+    if alpha.is_finite() {
+        alpha.clamp(0.0, 0.999_999)
     } else {
         0.0
-    };
-    alpha.clamp(0.0, 0.999_999)
+    }
 }
 
 /// Cycles' `subsurface_random_walk_coefficients` with the van de Hulst mapping: the extinction is the reciprocal of
@@ -229,7 +229,7 @@ pub(super) fn walk(
 
     // The mean free path of the medium is the diffusion length; the guided sampling needs it above one.
     let diffusion = diffusion_length(alpha.max_element());
-    if !(diffusion > 1.0) {
+    if diffusion.is_nan() || diffusion <= 1.0 {
         return None;
     }
     let phase_log = ((diffusion + 1.0) / (diffusion - 1.0)).ln();
@@ -462,7 +462,7 @@ mod tests {
 
     #[test]
     fn dwivedi_sampling_spans_the_cosine_range() {
-        let diffusion = 3.0;
+        let diffusion: f64 = 3.0;
         let phase_log = ((diffusion + 1.0) / (diffusion - 1.0)).ln();
         assert!((sample_phase_dwivedi(diffusion, phase_log, 0.0) + 1.0).abs() < 1e-12);
         assert!((sample_phase_dwivedi(diffusion, phase_log, 1.0) - 1.0).abs() < 1e-12);

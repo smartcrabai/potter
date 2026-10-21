@@ -37,12 +37,19 @@ POINT_POWER = 120.0
 DISK_LOCATION = Vector((2.5, -2.5, 3.5))
 DISK_SIZE = 1.5
 DISK_POWER = 300.0
+# (name, subsurface method, subsurface weight, max_bounces, floor). `burley_bounce0` is the Burley sphere with a zero
+# budget: Cycles still enters the surface and shades its exit, so the result is not black. `burley_floor_bounce1` shows
+# the floor below the sphere with a budget of one: the entry takes no bounce, the exit is the first scatter, and the
+# light leaving the exit reaches the floor and bounces off it to the camera. A bounce counted at the entry loses that
+# light, so this case tests the bounce count after a subsurface entry.
 CASES = [
-    ("burley", "BURLEY", 1.0),
-    ("random_walk", "RANDOM_WALK", 1.0),
-    ("random_walk_skin", "RANDOM_WALK_SKIN", 1.0),
-    ("random_walk_legacy", "RANDOM_WALK_LEGACY", 1.0),
-    ("no_subsurface", "RANDOM_WALK", 0.0),
+    ("burley", "BURLEY", 1.0, MAX_BOUNCES, False),
+    ("burley_bounce0", "BURLEY", 1.0, 0, False),
+    ("burley_floor_bounce1", "BURLEY", 1.0, 1, True),
+    ("random_walk", "RANDOM_WALK", 1.0, MAX_BOUNCES, False),
+    ("random_walk_skin", "RANDOM_WALK_SKIN", 1.0, MAX_BOUNCES, False),
+    ("random_walk_legacy", "RANDOM_WALK_LEGACY", 1.0, MAX_BOUNCES, False),
+    ("no_subsurface", "RANDOM_WALK", 0.0, MAX_BOUNCES, False),
 ]
 
 
@@ -92,6 +99,13 @@ shader.inputs["Subsurface Radius"].default_value = (1.0, 0.2, 0.1)
 shader.inputs["Subsurface Scale"].default_value = 6.0
 shader.inputs["Subsurface Anisotropy"].default_value = 0.0
 sphere.data.materials.append(material)
+# A floor 0.5 below the sphere, seen by no camera ray (the ortho frame spans z in [-1.3, 1.3]), lit only through the sphere.
+bpy.ops.mesh.primitive_plane_add(size=20.0, location=(0.0, 0.0, -1.5))
+floor = bpy.context.object
+floor_material = bpy.data.materials.new("Floor")
+floor_material.use_nodes = True
+floor_material.node_tree.nodes["Principled BSDF"].inputs["Base Color"].default_value = (0.8, 0.8, 0.8, 1.0)
+floor.data.materials.append(floor_material)
 
 point_data = bpy.data.lights.new("Point", "POINT")
 point_data.energy = POINT_POWER
@@ -118,9 +132,10 @@ camera.location = CAMERA
 aim(camera, (0.0, 0.0, 0.0))
 scene.camera = camera
 
-# The saved file carries the first selected case's method and weight, so an import reproduces that case.
+# The saved file carries the first selected case's method, weight and floor, so an import reproduces that case.
 shader.subsurface_method = CASES[0][1]
 shader.inputs["Subsurface Weight"].default_value = CASES[0][2]
+floor.hide_render = not CASES[0][4]
 bpy.ops.wm.save_as_mainfile(filepath=blend_out)
 
 work = tempfile.mkdtemp()
@@ -139,16 +154,24 @@ def frame_mean(path):
 
 
 results = {}
-for name, method, weight in CASES:
+for name, method, weight, budget, floor_on in CASES:
     shader.subsurface_method = method
     shader.inputs["Subsurface Weight"].default_value = weight
+    scene.cycles.max_bounces = budget
+    floor.hide_render = not floor_on
     seed_means = []
     for seed in SEEDS:
         scene.cycles.seed = seed
         scene.render.filepath = os.path.join(work, f"{name}_seed_{seed}.exr")
         bpy.ops.render.render(write_still=True)
         seed_means.append(frame_mean(scene.render.filepath))
-    results[name] = {"method": method, "subsurface_weight": weight, "seed_means": seed_means}
+    results[name] = {
+        "method": method,
+        "subsurface_weight": weight,
+        "max_bounces": budget,
+        "floor": floor_on,
+        "seed_means": seed_means,
+    }
     print("CASE", name, flush=True)
 
 with open(json_out, "w") as handle:
