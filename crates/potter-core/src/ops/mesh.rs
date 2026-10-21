@@ -370,7 +370,10 @@ pub(super) fn remesh_data_block(
         let mut weights = std::mem::take(&mut data.vertex_weights);
         let result = edit::voxel_remesh(mesh, &groups, &mut weights, voxel_size);
         data.vertex_weights = weights;
-        let result = result?;
+        // A mesh without faces is cancelled by Blender without a change (`voxel_remesh_exec`).
+        let Some(result) = result? else {
+            return Ok(false);
+        };
         data.descriptor = None;
         (had_descriptor, result)
     };

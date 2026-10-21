@@ -5,7 +5,7 @@ use serde_json::{Map, Value, json};
 
 use crate::geom::modifiers::multires::{self, MultiresGridData};
 use crate::{
-    error::{PotError, Result},
+    error::{ErrorCode, PotError, Result},
     geom::{
         Face, Mesh, MeshError,
         attribute_keys::storage_key,
@@ -4640,7 +4640,6 @@ fn is_topology_operation(operation: &str, args: &Map<String, Value>) -> bool {
             | "split"
             | "knife"
             | "symmetrize"
-            | "remesh"
             | "mirror"
     ) || matches!(operation, "spin" | "screw")
         && args
@@ -6937,57 +6936,48 @@ fn apply_symmetrize(
 }
 
 /// Vertex-group weights keyed by vertex ID, then group ID, as `DataBlock.vertex_weights` stores them.
-pub(crate) type VertexWeights = BTreeMap<u32, BTreeMap<Id, f64>>;
+pub type VertexWeights = BTreeMap<u32, BTreeMap<Id, f64>>;
 
 /// What a voxel remesh reports beyond the new mesh: the element-ID mapping, and the mesh attributes it did
 /// not carry, which the caller reports as a loss.
-pub(crate) struct VoxelRemesh {
-    pub(crate) mapping: Value,
-    pub(crate) dropped: Vec<String>,
+pub struct VoxelRemesh {
+    pub mapping: Value,
+    pub dropped: Vec<String>,
 }
 
-/// Blender's voxel remesh (`object_remesh.cc`, `voxel_remesh_exec`) on `mesh`: `BKE_mesh_remesh_voxel` at
-/// adaptivity 0 (the mesh default), the volume reprojection `BKE_shrinkwrap_remesh_target_project` onto the
-/// original mesh, then the attribute reprojection `mesh_remesh_reproject_attributes`. Vertex-group weights
-/// for `groups` and the UV layers are sampled at each new vertex from its nearest source triangle; the
-/// material index and `sharp_face` follow the nearest source face. `mesh` and `weights` are replaced only
-/// when the remesh succeeds.
-pub(crate) fn voxel_remesh(
+/// Blender's voxel remesh operator (`object_remesh.cc`, `voxel_remesh_exec`) on `mesh`, with the default
+/// flags: the surface is extracted at `0.3 * voxel_size` (`BKE_mesh_remesh_voxel`), projected back onto the
+/// original mesh (`BKE_shrinkwrap_remesh_target_project`), and the attributes are reprojected
+/// (`mesh_remesh_reproject_attributes`). The new mesh is stored in Blender's spatial order
+/// (`mesh_apply_spatial_organization`). A mesh without faces is cancelled without an error, as Blender does
+/// (`Ok(None)`). An empty surface is an error (`Voxel remesher failed to create mesh`). `mesh` and `weights`
+/// change only on success.
+pub fn voxel_remesh(
     mesh: &mut Mesh,
     groups: &[Id],
     weights: &mut VertexWeights,
     voxel_size: f64,
-) -> Result<VoxelRemesh> {
-    let (changes, dropped) = remesh_in_place(mesh, groups, weights, voxel_size)?;
-    Ok(VoxelRemesh {
-        mapping: json!({"created": changes.to_json(), "deleted": changes.deleted_to_json()}),
-        dropped,
-    })
-}
-
-/// The mesh-only `remesh` operator. It has no data-block vertex groups to reproject, and its dropped
-/// attributes are not reported here; the data-block path (`voxel_remesh`) reports them.
-fn apply_remesh(mesh: &mut Mesh, args: &Map<String, Value>) -> Result<IdChanges> {
-    let voxel_size = number(args, "voxel_size", 0.0)?;
-    let (changes, _) = remesh_in_place(mesh, &[], &mut VertexWeights::new(), voxel_size)?;
-    Ok(changes)
-}
-
-fn remesh_in_place(
-    mesh: &mut Mesh,
-    groups: &[Id],
-    weights: &mut VertexWeights,
-    voxel_size: f64,
-) -> Result<(IdChanges, Vec<String>)> {
+) -> Result<Option<VoxelRemesh>> {
     if !voxel_size.is_finite() || voxel_size <= 0.0 {
-        return Err(invalid("remesh voxel_size must be positive"));
+        return Err(invalid(
+            "Voxel remesher cannot run with a voxel size of 0.0",
+        ));
     }
-    let remeshed = crate::geom::modifiers::remesh_modes::voxel_remesh_mesh(
-        mesh,
-        voxel_size as f32,
-        0.0,
-        false,
-    )?;
+    if mesh.faces.is_empty() {
+        return Ok(None);
+    }
+    let voxel = voxel_size as f32;
+    // `mesh->remesh_voxel_size * 0.3f` when the mesh reprojects its volume, which is the default.
+    let isovalue = voxel * 0.3;
+    let remeshed =
+        crate::geom::modifiers::remesh_modes::voxel_remesh_mesh(mesh, voxel, 0.0, isovalue)?
+            .ok_or_else(|| {
+                PotError::with_details(
+                    ErrorCode::InvalidOperation,
+                    "Voxel remesher failed to create mesh",
+                    json!({ "voxel_size": voxel_size }),
+                )
+            })?;
     // The volume reprojection projects the remeshed vertices onto the original surface, before the
     // attributes are sampled, as the operator does.
     let projected =
@@ -7024,6 +7014,7 @@ fn remesh_in_place(
         .collect::<Result<Vec<Sample>>>()?;
     let source_sharp = crate::geom::normals::sharp_face_flags(mesh)?;
 
+    // Elements are inserted in extraction order, so IDs follow it.
     let mut replacement = Mesh {
         next_id: mesh.next_id,
         ..Mesh::default()
@@ -7052,6 +7043,52 @@ fn remesh_in_place(
             .map_or(face.material_index, |source| source.material_index);
         insert_face(&mut replacement, vertices, material, &mut changes)?;
     }
+
+    // `mesh_apply_spatial_organization`: the storage order only; IDs and their mappings are unchanged. The
+    // per-face values below are permuted with the faces.
+    let order_of: HashMap<u32, usize> = replacement
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(index, vertex)| (vertex.id, index))
+        .collect();
+    let positions: Vec<Vec3> = replacement
+        .vertices
+        .iter()
+        .map(|vertex| vertex.co.as_vec3())
+        .collect();
+    let corners = replacement
+        .faces
+        .iter()
+        .map(|face| {
+            face.vertices
+                .iter()
+                .map(|id| {
+                    order_of
+                        .get(id)
+                        .copied()
+                        .ok_or_else(|| invalid("remesh output face references a missing vertex"))
+                })
+                .collect::<Result<Vec<usize>>>()
+        })
+        .collect::<Result<Vec<Vec<usize>>>>()?;
+    let materials: Vec<u32> = replacement
+        .faces
+        .iter()
+        .map(|face| face.material_index)
+        .collect();
+    let (vertex_order, face_order) =
+        crate::geom::spatial::spatial_order(&positions, &corners, &materials);
+    let vertices = std::mem::take(&mut replacement.vertices);
+    replacement.vertices = vertex_order
+        .iter()
+        .map(|&index| vertices[index].clone())
+        .collect();
+    let faces = std::mem::take(&mut replacement.faces);
+    replacement.faces = face_order
+        .iter()
+        .map(|&index| faces[index].clone())
+        .collect();
 
     // Vertex-group weights, sampled per new vertex with the nearest triangle's weights (Blender's
     // `sample_vertex_attributes`; a source vertex outside the group has weight 0).
@@ -7114,7 +7151,7 @@ fn remesh_in_place(
                 ])
             })
             .collect::<Result<Vec<[f64; 2]>>>()?;
-        let faces: Vec<Option<Vec<[f64; 2]>>> = projected
+        let faces_in_projection: Vec<Option<Vec<[f64; 2]>>> = projected
             .faces
             .iter()
             .map(|face| {
@@ -7132,6 +7169,11 @@ fn remesh_in_place(
                 Some(uv)
             })
             .collect();
+        // The store is indexed by storage position, so it follows the faces' new order.
+        let faces: Vec<Option<Vec<[f64; 2]>>> = face_order
+            .iter()
+            .map(|&index| faces_in_projection[index].clone())
+            .collect();
         layers.push(UvLayer::new(layer.name.clone(), faces));
     }
     store.layers = layers;
@@ -7147,7 +7189,7 @@ fn remesh_in_place(
     // Blender keeps `sharp_face` through the reprojection, so an input that had it keeps an attribute (even
     // all smooth), and an input without it gives smooth faces without one.
     let sharp_present = source_sharp.is_some();
-    let smooth: Vec<bool> = face_samples
+    let smooth_by_projection: Vec<bool> = face_samples
         .iter()
         .map(|sample| {
             !source_sharp
@@ -7156,6 +7198,10 @@ fn remesh_in_place(
                 .copied()
                 .unwrap_or(false)
         })
+        .collect();
+    let smooth: Vec<bool> = face_order
+        .iter()
+        .map(|&index| smooth_by_projection[index])
         .collect();
     for vertex in &mesh.vertices {
         changes.delete(Domain::Vertex, vertex.id);
@@ -7183,7 +7229,10 @@ fn remesh_in_place(
         crate::geom::normals::record_sharp_face(mesh);
     }
     *weights = sampled_weights;
-    Ok((changes, dropped))
+    Ok(Some(VoxelRemesh {
+        mapping: json!({"created": changes.to_json(), "deleted": changes.deleted_to_json()}),
+        dropped,
+    }))
 }
 
 /// Apply a topology or element edit to a persistent-ID mesh.
@@ -7224,13 +7273,12 @@ pub(crate) fn apply_with_source(
 /// `sharp_face` of its source (`mesh_remesh_reproject_attributes`), so it sets presence from that source.
 /// Every other operator is an edit-mode operator (or a rebuild) that goes through `BMesh` and settles
 /// presence on exit (`BM_mesh_bm_to_me`, `normals::settle_sharp_face`).
-const ATTRIBUTE_WRITE_OPERATIONS: [&str; 6] = [
+const ATTRIBUTE_WRITE_OPERATIONS: [&str; 5] = [
     "set_attribute",
     "attribute_create",
     "attribute_update",
     "attribute_delete",
     "set_custom_normals",
-    "remesh",
 ];
 
 fn apply_inner(
@@ -7281,7 +7329,6 @@ fn apply_operation(
         "bisect" => &["elements", "point", "normal", "threshold", "clear_side"],
         "knife" => &["elements", "plane", "point", "normal", "threshold"],
         "symmetrize" => &["elements", "axis", "direction", "origin", "threshold"],
-        "remesh" => &["voxel_size"],
         "mirror" => &["elements", "axis", "origin", "merge", "threshold"],
         "set_attribute" => &["elements", "name", "value"],
         "attribute_create" => &["name", "domain", "type", "default"],
@@ -7302,9 +7349,8 @@ fn apply_operation(
         topology && operation != "delete" && has_interpolatable_attributes(mesh);
     // Deleting faces also invalidates custom normals, so they are rebuilt as for topology edits.
     let normal_source_needed = topology && mesh.attributes.contains_key("custom_normal");
-    let multires_source_needed = multires_edit
-        && operation != "remesh"
-        && mesh.attributes.contains_key("multires_displacement");
+    let multires_source_needed =
+        multires_edit && mesh.attributes.contains_key("multires_displacement");
     let mut owned_source = None;
     if source_mesh.is_none()
         && (attribute_source_needed || normal_source_needed || multires_source_needed)
@@ -7376,7 +7422,6 @@ fn apply_operation(
         "bridge" => apply_bridge(mesh, &required_selection(mesh, args)?)?,
         "knife" => apply_knife(mesh, args)?,
         "symmetrize" => apply_symmetrize(mesh, args, multires_data.as_mut())?,
-        "remesh" => apply_remesh(mesh, args)?,
         "mirror" => apply_mirror(mesh, args)?,
         "flip_normals" => apply_flip_normals(mesh, &required_selection(mesh, args)?)?,
         "shade_smooth" => apply_shade(mesh, &required_selection(mesh, args)?, true)?,

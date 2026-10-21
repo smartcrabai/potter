@@ -307,99 +307,63 @@ fn sliding_uses_connected_topology_and_angle_marks_sharp_edges() {
     mesh.validate().unwrap();
 }
 
-/// Blender 5.2 `Mesh.set_sharp_from_angle` (`rna_mesh_api.cc`) on a cube with one flat face, probed in
-/// headless Blender: 30 degrees makes every face smooth, removes `sharp_face`, and marks all 12 edges.
+/// Blender's `Mesh.set_sharp_from_angle` (`rna_mesh_api.cc`) from a cube with face 4 flat, for every angle in
+/// the oracle: 180 degrees makes every face smooth with no sharp edges, 0 makes every face flat, and other
+/// angles mark the edges whose face normals differ by more than the angle. `sharp_face` is removed when every
+/// face is smooth.
 #[test]
 fn whole_mesh_sharp_angle_matches_blender_set_sharp_from_angle() {
-    let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
-    edit::apply(
-        &mut mesh,
-        "shade_flat",
-        &json!({"elements":{"domain":"face","ids":["f4"]}}),
-    )
-    .unwrap();
-    edit::apply(
-        &mut mesh,
-        "mark_sharp_by_angle",
-        &json!({"angle": std::f64::consts::FRAC_PI_6}),
-    )
-    .unwrap();
-    let smooth = mesh.attributes["shade_smooth"]["values"]
-        .as_object()
+    let oracle = blender_oracle();
+    for (degrees, expected) in oracle["sharp_from_angle"].as_object().unwrap() {
+        let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
+        edit::apply(
+            &mut mesh,
+            "shade_flat",
+            &json!({"elements":{"domain":"face","ids":["f4"]}}),
+        )
         .unwrap();
-    assert_eq!(smooth.len(), 6);
-    assert!(smooth.values().all(|value| value == &json!(true)));
-    assert!(
-        mesh.attributes["shade_smooth"]
-            .get("sharp_face_present")
-            .is_none(),
-        "all-smooth result has no sharp_face"
-    );
-    let sharp = mesh.attributes["sharp"]["values"].as_object().unwrap();
-    assert_eq!(sharp.len(), 12);
-    assert!(sharp.values().all(|value| value == &json!(true)));
-    mesh.validate().unwrap();
+        let angle = degrees.parse::<f64>().unwrap().to_radians();
+        edit::apply(&mut mesh, "mark_sharp_by_angle", &json!({ "angle": angle })).unwrap();
+        let actual = sharp_state(&mesh);
+        for field in [
+            "faces",
+            "edges",
+            "smooth",
+            "sharp_edges",
+            "sharp_face_present",
+        ] {
+            assert_eq!(actual[field], expected[field], "{degrees} degrees: {field}");
+        }
+        mesh.validate().unwrap();
+    }
 }
 
-/// Blender 5.2 `set_sharp_from_angle(0)` on the same cube, probed: every face flat, no `sharp_edge`.
-#[test]
-fn whole_mesh_zero_sharp_angle_matches_blender_flat_faces() {
-    let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
-    edit::apply(&mut mesh, "mark_sharp_by_angle", &json!({"angle": 0.0})).unwrap();
-    let smooth = mesh.attributes["shade_smooth"]["values"]
-        .as_object()
-        .unwrap();
-    assert!(smooth.values().all(|value| value == &json!(false)));
-    assert!(!mesh.attributes.contains_key("sharp"));
-    mesh.validate().unwrap();
-}
-
-/// Blender 5.2 `set_sharp_from_angle(pi)` on the same cube, probed: every face smooth, no sharp edges.
-#[test]
-fn whole_mesh_full_sharp_angle_matches_blender_all_smooth() {
-    let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
-    edit::apply(
-        &mut mesh,
-        "mark_sharp_by_angle",
-        &json!({"angle": std::f64::consts::PI}),
-    )
-    .unwrap();
-    let smooth = mesh.attributes["shade_smooth"]["values"]
-        .as_object()
-        .unwrap();
-    assert!(smooth.values().all(|value| value == &json!(true)));
-    assert!(!mesh.attributes.contains_key("sharp"));
-    mesh.validate().unwrap();
-}
-
-/// Blender 5.2 `mesh.set_sharpness_by_angle` (edit mode) with every cube edge selected, probed: 30
-/// degrees marks all 12 edges, 120 degrees marks none.
+/// Blender's `mesh.set_sharpness_by_angle` (edit mode, every edge selected) from the default cube, for every
+/// angle in the oracle. Adjacent faces of a cube meet at 90 degrees, so 30 degrees marks every edge and 120
+/// marks none.
 #[test]
 fn selected_edges_sharp_angle_matches_blender_set_sharpness_by_angle() {
-    let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
-    let ids = mesh
-        .edges
-        .iter()
-        .map(|edge| format!("e{}", edge.id))
-        .collect::<Vec<_>>();
-    edit::apply(
-        &mut mesh,
-        "mark_sharp_by_angle",
-        &json!({"elements":{"domain":"edge","ids":ids.clone()},"angle": std::f64::consts::FRAC_PI_6}),
-    )
-    .unwrap();
-    let sharp = mesh.attributes["sharp"]["values"].as_object().unwrap();
-    assert_eq!(sharp.len(), 12);
-    assert!(sharp.values().all(|value| value == &json!(true)));
-    edit::apply(
-        &mut mesh,
-        "mark_sharp_by_angle",
-        &json!({"elements":{"domain":"edge","ids":ids},"angle": 2.0 * std::f64::consts::FRAC_PI_3}),
-    )
-    .unwrap();
-    let sharp = mesh.attributes["sharp"]["values"].as_object().unwrap();
-    assert!(sharp.values().all(|value| value == &json!(false)));
-    mesh.validate().unwrap();
+    let oracle = blender_oracle();
+    for (degrees, expected) in oracle["sharpness_by_angle"].as_object().unwrap() {
+        let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
+        let edges = mesh
+            .edges
+            .iter()
+            .map(|edge| format!("e{}", edge.id))
+            .collect::<Vec<_>>();
+        let angle = degrees.parse::<f64>().unwrap().to_radians();
+        edit::apply(
+            &mut mesh,
+            "mark_sharp_by_angle",
+            &json!({"elements":{"domain":"edge","ids":edges},"angle":angle}),
+        )
+        .unwrap();
+        let actual = sharp_state(&mesh);
+        for field in ["faces", "edges", "smooth", "sharp_edges"] {
+            assert_eq!(actual[field], expected[field], "{degrees} degrees: {field}");
+        }
+        mesh.validate().unwrap();
+    }
 }
 
 #[test]
@@ -601,11 +565,142 @@ fn cli_angle_and_conformal_unwrap_preserve_planar_grid_similarity() -> Result<()
     Ok(())
 }
 
-/// Blender 5.2.2 `object.voxel_remesh` on a cube whose `sharp_face` `shade_smooth` removed (probed): 150
-/// smooth faces and no `sharp_face`. Potter's output takes `!sharp_face[0]` on every face, and an input
-/// without `sharp_face` gives smooth faces.
+/// The flat pattern of a mesh's `shade_smooth` values: `1` marks a flat face, in storage order.
+fn flat_pattern(mesh: &Mesh) -> String {
+    mesh.faces
+        .iter()
+        .map(|face| {
+            let key = format!("f{}", face.id);
+            if mesh.attributes["shade_smooth"]["values"][key.as_str()] == json!(false) {
+                '1'
+            } else {
+                '0'
+            }
+        })
+        .collect()
+}
+
+/// The state the Blender oracle records: topology counts, smooth and sharp counts, and whether `sharp_face`
+/// exists. A flat face makes it exist; otherwise it is the recorded presence flag.
+fn sharp_state(mesh: &Mesh) -> Value {
+    let shading = mesh.attributes.get("shade_smooth");
+    let values = shading.and_then(|attribute| attribute["values"].as_object());
+    let smooth = values.map_or(0, |values| {
+        values
+            .values()
+            .filter(|value| *value == &json!(true))
+            .count()
+    });
+    let any_flat = values.is_some_and(|values| values.values().any(|value| value == &json!(false)));
+    let recorded =
+        shading.and_then(|attribute| attribute.get("sharp_face_present")) == Some(&json!(true));
+    let sharp_edges = mesh.attributes.get("sharp").map_or(0, |attribute| {
+        attribute["values"].as_object().map_or(0, |values| {
+            values
+                .values()
+                .filter(|value| *value == &json!(true))
+                .count()
+        })
+    });
+    json!({
+        "faces": mesh.faces.len(),
+        "edges": mesh.edges.len(),
+        "smooth": smooth,
+        "sharp_edges": sharp_edges,
+        "sharp_face_present": any_flat || recorded,
+    })
+}
+
+/// Blender 5.2.2 results from `tests/fixtures/remesh-reproject/generate.py`, which runs `object.voxel_remesh`,
+/// `Mesh.set_sharp_from_angle` and `mesh.set_sharpness_by_angle` headless.
+fn blender_oracle() -> Value {
+    serde_json::from_str(include_str!("fixtures/remesh-reproject/expected.json")).unwrap()
+}
+
+/// Runs the voxel remesh on `mesh` and checks the result against the Blender oracle case `case`.
+fn assert_remesh_matches_blender(case: &str, mesh: &mut Mesh) {
+    let oracle = blender_oracle();
+    let expected = &oracle["remesh"][case];
+    let size = oracle["remesh_voxel_size"].as_f64().unwrap();
+    let result = edit::voxel_remesh(mesh, &[], &mut edit::VertexWeights::new(), size)
+        .unwrap()
+        .unwrap();
+    assert!(
+        result.dropped.is_empty(),
+        "{case}: dropped {:?}",
+        result.dropped
+    );
+    assert_eq!(
+        json!(mesh.vertices.len()),
+        expected["vertices"],
+        "{case}: vertices"
+    );
+    assert_eq!(json!(mesh.faces.len()), expected["faces"], "{case}: faces");
+    let pattern = flat_pattern(mesh);
+    assert_eq!(
+        json!(pattern),
+        expected["flat_pattern"],
+        "{case}: flat faces"
+    );
+    assert_eq!(
+        json!(!pattern.contains('1')),
+        expected["all_smooth"],
+        "{case}: all smooth"
+    );
+    assert_eq!(
+        sharp_state(mesh)["sharp_face_present"],
+        expected["sharp_face_present"],
+        "{case}: sharp_face presence"
+    );
+    // Storage order (`mesh_apply_spatial_organization`): each face's material, and the leading vertices.
+    let materials: Vec<u32> = mesh.faces.iter().map(|face| face.material_index).collect();
+    assert_eq!(
+        json!(materials),
+        expected["material_indices"],
+        "{case}: face material order"
+    );
+    for (index, expected_vertex) in expected["first_vertices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .enumerate()
+    {
+        let co = mesh.vertices[index].co;
+        for (axis, value) in expected_vertex.as_array().unwrap().iter().enumerate() {
+            let value = value.as_f64().unwrap();
+            assert!(
+                (co[axis] - value).abs() <= 1.0e-5,
+                "{case}: vertex {index} axis {axis} is {}, Blender has {value}",
+                co[axis]
+            );
+        }
+    }
+    mesh.validate().unwrap();
+}
+
+/// Blender's default cube is flat, so the voxel remesh of the default cube is the common case.
 #[test]
-fn remesh_of_an_all_smooth_mesh_stays_smooth() {
+fn voxel_remesh_of_a_flat_cube_matches_blender() {
+    let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
+    assert_remesh_matches_blender("flat_cube", &mut mesh);
+}
+
+/// Face 4 flat and the rest smooth: each new face takes the `sharp_face` of its nearest source triangle.
+#[test]
+fn voxel_remesh_reprojects_sharp_face_from_nearest_source_triangles() {
+    let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
+    edit::apply(
+        &mut mesh,
+        "shade_smooth",
+        &json!({"elements":{"domain":"face","ids":["f0","f1","f2","f3","f5"]}}),
+    )
+    .unwrap();
+    assert_remesh_matches_blender("mixed_cube", &mut mesh);
+}
+
+/// A smooth cube has no `sharp_face`, and its remesh output is smooth without one.
+#[test]
+fn voxel_remesh_of_an_all_smooth_cube_stays_smooth() {
     let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
     let faces = mesh
         .faces
@@ -618,70 +713,34 @@ fn remesh_of_an_all_smooth_mesh_stays_smooth() {
         &json!({"elements":{"domain":"face","ids":faces}}),
     )
     .unwrap();
-    edit::apply(&mut mesh, "remesh", &json!({"voxel_size": 0.5})).unwrap();
-    let values = mesh.attributes["shade_smooth"]["values"]
-        .as_object()
-        .unwrap();
-    assert!(!values.is_empty() && values.values().all(|value| value == &json!(true)));
-    assert!(
-        mesh.attributes["shade_smooth"]
-            .get("sharp_face_present")
-            .is_none(),
-        "all-smooth remesh output has no sharp_face"
-    );
-    mesh.validate().unwrap();
+    assert_remesh_matches_blender("all_smooth_cube", &mut mesh);
 }
 
-/// Blender 5.2.2 `object.voxel_remesh` on a flat cube, probed: all 150 new faces are flat and `sharp_face`
-/// is present. The default cube is flat, so this is the common case that must not fail.
+/// Two materials, faces 3..5 in the second, all smooth. Blender's `use_smooth` assignment keeps `sharp_face`
+/// present (all false), so the input records that presence as `record_sharp_face` does. The voxel remesh
+/// stores its faces grouped by material (`mesh_apply_spatial_organization`), which the oracle pins.
 #[test]
-fn remesh_of_a_flat_cube_keeps_every_face_flat() {
+fn voxel_remesh_of_a_two_material_cube_matches_blender_storage_order() {
     let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
-    edit::apply(&mut mesh, "remesh", &json!({"voxel_size": 0.5})).unwrap();
-    let values = mesh.attributes["shade_smooth"]["values"]
-        .as_object()
-        .unwrap();
-    assert_eq!(values.len(), 150);
-    assert!(values.values().all(|value| value == &json!(false)));
-    assert_eq!(
-        mesh.attributes["shade_smooth"]["sharp_face_present"],
-        json!(true)
-    );
-    mesh.validate().unwrap();
-}
-
-/// Blender 5.2.2 `object.voxel_remesh` on a cube with face 4 flat and the rest smooth, probed: each new
-/// face takes the `sharp_face` of its nearest source triangle. `1` marks a flat face, in face order.
-const MIXED_REMESH_FLAT: &str = "000000110011000000000000000000000011100111000000000000000000000000011001100100100000000000000000000000111001110010010010000000000000000000000000000000";
-
-#[test]
-fn remesh_reprojects_sharp_face_from_nearest_source_triangles() {
-    let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
+    let faces = mesh
+        .faces
+        .iter()
+        .map(|face| format!("f{}", face.id))
+        .collect::<Vec<_>>();
     edit::apply(
         &mut mesh,
         "shade_smooth",
-        &json!({"elements":{"domain":"face","ids":["f0","f1","f2","f3","f5"]}}),
+        &json!({"elements":{"domain":"face","ids":faces}}),
     )
     .unwrap();
-    edit::apply(&mut mesh, "remesh", &json!({"voxel_size": 0.5})).unwrap();
-    let values = mesh.attributes["shade_smooth"]["values"]
-        .as_object()
-        .unwrap();
-    let flat: String = mesh
-        .faces
-        .iter()
-        .map(|face| {
-            if values[format!("f{}", face.id).as_str()] == json!(false) {
-                '1'
-            } else {
-                '0'
-            }
-        })
-        .collect();
-    assert_eq!(flat, MIXED_REMESH_FLAT);
-    assert_eq!(
-        mesh.attributes["shade_smooth"]["sharp_face_present"],
-        json!(true)
-    );
-    mesh.validate().unwrap();
+    mesh.attributes
+        .get_mut("shade_smooth")
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .insert("sharp_face_present".to_owned(), json!(true));
+    for face in mesh.faces.iter_mut().skip(3) {
+        face.material_index = 1;
+    }
+    assert_remesh_matches_blender("two_material_cube", &mut mesh);
 }
