@@ -170,13 +170,20 @@ fn diffuse_layer_weight(params: &BsdfParams, normal: DVec3, view: DVec3) -> f64 
     }
 }
 
-/// The per-channel share of the diffuse base that the Burley subsurface closure leaves to diffuse: `1 - Subsurface
-/// Weight` on the channels with a radius, and `1` on the others, which fall back to diffuse (`bssrdf_setup`).
+/// The share of the diffuse base that the subsurface closures leave to diffuse, as Cycles' `closure` setup does
+/// (`svm/closure.h`). The diffuse closure keeps `1 - Subsurface Weight` (its weight is `base × (1 - subsurface weight)
+/// × weight` for every method). A Thin Wall adds its thin reflection, `bsdf_thin_subsurface_setup`, a Lambert of weight
+/// `sat(0.5 (1 - anisotropy)) × subsurface weight`, to the same diffuse. Burley without Thin Wall takes the per-channel
+/// share of `bssrdf_setup`: `1 - Subsurface Weight` on the channels with a radius, and `1` on the others.
 fn subsurface_share(params: &BsdfParams) -> DVec3 {
+    let sss = params.subsurface_weight.clamp(0.0, 1.0);
+    if params.thin_wall {
+        let reflection = (0.5 * (1.0 - params.subsurface_anisotropy)).clamp(0.0, 1.0);
+        return DVec3::splat(1.0 - sss + sss * reflection);
+    }
     if !burley_active(params) {
         return DVec3::ONE;
     }
-    let sss = params.subsurface_weight.clamp(0.0, 1.0);
     let mask = channel_mask(burley_radius(params));
     DVec3::from_array(std::array::from_fn(|channel| {
         if mask[channel] { 1.0 - sss } else { 1.0 }
@@ -2079,6 +2086,19 @@ mod subsurface_tests {
             + probabilities.transmission;
         assert!((total - 1.0).abs() < 1.0e-12, "{total}");
         assert!(probabilities.subsurface > 0.0);
+    }
+
+    #[test]
+    fn thin_wall_share_is_the_thin_branch_of_closure_setup() {
+        // `svm/closure.h`: the diffuse keeps `1 - sw`, and `bsdf_thin_subsurface_setup` adds a reflection of weight
+        // `sat(0.5 (1 - a)) × sw`. Both are Lambert, so one share. Anisotropy 0.5 gives a reflection of 0.25.
+        let mut params = principled(SubsurfaceMethod::Burley, 0.5);
+        params.thin_wall = true;
+        params.subsurface_anisotropy = 0.5;
+        let expected = 1.0 - 0.5 + 0.5 * 0.25;
+        for channel in subsurface_share(&params).to_array() {
+            assert!((channel - expected).abs() < 1e-12, "{channel}");
+        }
     }
 
     #[test]

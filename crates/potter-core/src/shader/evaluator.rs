@@ -217,6 +217,8 @@ pub struct BsdfParams {
     pub subsurface_scale: f64,
     /// Cycles' subsurface method (`SubsurfaceMethod`), read from the Principled node's `subsurface_method` property.
     pub subsurface_method: SubsurfaceMethod,
+    /// The Principled Subsurface Anisotropy: the thin branch's reflection and transmission split (`bsdf_thin_subsurface_setup`), and the random walk's phase function g.
+    pub subsurface_anisotropy: f64,
     pub coat_weight: f64,
     pub coat_roughness: f64,
     pub coat_ior: f64,
@@ -237,8 +239,9 @@ pub struct BsdfParams {
     /// Oren-Nayar roughness of the diffuse lobe. Potter's diffuse lobe is Lambert, so a value above
     /// zero is reported as unevaluated (Cycles `bsdf_oren_nayar_setup`).
     pub diffuse_roughness: f64,
-    /// Thin Wall (Cycles' `thin_wall`): transmission through a thin sheet. Potter does not evaluate
-    /// it; it is reported as unevaluated.
+    /// Thin Wall (Cycles' `thin_wall`, `svm/closure.h`): the thin branch replaces the BSSRDF with the thin-subsurface
+    /// closure. Potter evaluates that closure's diffuse reflection (`subsurface_share`), but not its translucent
+    /// transmission (`bsdf_thin_subsurface_setup`), so the input is reported as unevaluated.
     pub thin_wall: bool,
     /// Cycles' scattering coefficient σs per channel, absolute: each closure's scatter weight times
     /// its Density. Add Shader sums it and Mix Shader mixes it per closure, as Cycles weights closures.
@@ -316,6 +319,7 @@ impl BsdfParams {
             subsurface_radius: [1.0, 0.2, 0.1],
             subsurface_scale: 0.005,
             subsurface_method: SubsurfaceMethod::default(),
+            subsurface_anisotropy: 0.0,
             coat_weight: 0.0,
             coat_roughness: 0.03,
             coat_ior: 1.5,
@@ -461,6 +465,10 @@ impl BsdfParams {
             subsurface_radius: mix3(first.subsurface_radius, second.subsurface_radius),
             subsurface_scale: mix_scalar(first.subsurface_scale, second.subsurface_scale),
             subsurface_method: SubsurfaceMethod::of_arms(&first, &second),
+            subsurface_anisotropy: mix_scalar(
+                first.subsurface_anisotropy,
+                second.subsurface_anisotropy,
+            ),
             coat_weight: coat.weight,
             coat_roughness: coat.roughness,
             coat_ior: mix_scalar(first.coat_ior, second.coat_ior),
@@ -539,6 +547,12 @@ impl BsdfParams {
             subsurface_radius: add3(first.subsurface_radius, second.subsurface_radius),
             subsurface_scale: first.subsurface_scale.max(second.subsurface_scale),
             subsurface_method: SubsurfaceMethod::of_arms(&first, &second),
+            // Add has no single anisotropy for two closures: the arm with the larger subsurface weight gives it.
+            subsurface_anisotropy: if second.subsurface_weight > first.subsurface_weight {
+                second.subsurface_anisotropy
+            } else {
+                first.subsurface_anisotropy
+            },
             coat_weight: coat.weight,
             coat_roughness: coat.roughness,
             coat_ior: first.coat_ior,
@@ -1501,6 +1515,7 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
         let method = method_token.as_str();
         params.subsurface_method = SubsurfaceMethod::parse(method)
             .ok_or_else(|| invalid(format!("unknown Principled subsurface method `{method}`")))?;
+        params.subsurface_anisotropy = self.scalar_input(id, &["Subsurface Anisotropy"], 0.0)?;
         params.coat_weight = self.scalar_input(id, &["Coat Weight", "Clearcoat"], 0.0)?;
         params.coat_roughness =
             self.scalar_input(id, &["Coat Roughness", "Clearcoat Roughness"], 0.03)?;
