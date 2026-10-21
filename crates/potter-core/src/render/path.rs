@@ -10,15 +10,15 @@ use crate::{
     model::{Id, LightType, Material, SceneDoc},
     shader::{
         BsdfParams, EvaluatorWorkspace, HitContext, HitUvLayers, PreparedMaterial, ShaderClosure,
-        SubsurfaceMethod, SurfaceShading, equirectangular_uv, evaluate_surface_with_workspace,
-        height_gradient,
+        SubsurfaceMethod, SurfaceShading, equirectangular_uv, evaluate_displacement_with_workspace,
+        evaluate_surface_with_workspace, height_gradient,
     },
 };
 
 use super::principled_bsdf::{
     GlassSample, Layers, base_color, continuous_density, diffuse_coefficient,
     evaluate as evaluate_bsdf, layers_at, lobe_probabilities, make_orthonormals, sample_glass,
-    specular_eta, subsurface_closure_weight,
+    sheen_coefficient, specular_eta, subsurface_closure_weight,
 };
 use super::subsurface::{
     MAX_HITS, ProbeHits, SubsurfaceExit, burley_radius, channel_mask, eval as burley_eval,
@@ -222,7 +222,7 @@ struct Closures {
     emission_pass: DVec3,
     /// Weight-averaged base colour: the albedo pass.
     albedo: [f64; 4],
-    /// Camera coverage, `Σ w · α / Σ w`; zero for a hit without closures.
+    /// Camera coverage, one minus the mean of the transparency below; zero for a hit without closures.
     coverage: f64,
     /// Shadow transparency, `Σ w · (1 − α) · tint` (Cycles' `surface_shader_transparency`); one for a hit without
     /// closures.
@@ -237,7 +237,6 @@ impl Closures {
         let mut emission_pass = DVec3::ZERO;
         let mut albedo = [0.0; 4];
         let mut weight_total = 0.0;
-        let mut coverage = 0.0;
         let mut transparency = DVec3::ZERO;
         for closure in &items {
             let (weight, params) = (closure.weight, &closure.params);
@@ -253,15 +252,16 @@ impl Closures {
                 *channel += weight * value;
             }
             weight_total += weight;
-            coverage += weight * params.alpha;
             transparency += transparent_tint(params) * (weight * (1.0 - params.alpha));
         }
         if weight_total > 0.0 {
             albedo = albedo.map(|channel| channel / weight_total);
-            coverage /= weight_total;
         } else {
             transparency = DVec3::ONE;
         }
+        // Cycles' film alpha is one minus the mean transparent weight (`surface_shader_transparency`), tinted. An Add with a
+        // Transparent arm therefore covers the pixel by its other arms only, and a hit without closures covers nothing.
+        let coverage = (1.0 - transparency.element_sum() / 3.0).clamp(0.0, 1.0);
         Self {
             items,
             smooth,
@@ -318,29 +318,52 @@ impl Closures {
     }
 
     /// The reflective share at `light`: `Σ w·α·f·|cos|` over the closures, each with its own lobes, normal and cosine
-    /// (Cycles' `surface_shader_bsdf_eval`). A closure fails the shading-side test when its normal is bent off the smooth
-    /// normal, and its diffuse lobe is smoothed at grazing light (`bump_shadowing_term`, evaluated with `is_eval`).
-    fn bsdf_eval(&self, light: DVec3) -> DVec3 {
-        self.items.iter().fold(DVec3::ZERO, |sum, closure| {
-            let reflect = closure.reflect_weight();
-            if reflect <= 0.0 {
-                return sum;
-            }
-            let (params, layers) = (&closure.params, &closure.layers);
-            if !shading_side_passes(self.smooth, layers.normal, light) {
-                return sum;
-            }
-            let cosine = layers.normal.dot(light).abs();
-            // The diffuse lobe is inside `evaluate`; its smoothing replaces that share by the smoothed one.
-            let diffuse = if layers.normal.dot(light) > 0.0 {
-                diffuse_coefficient(params, layers)
-            } else {
-                DVec3::ZERO
-            };
-            let smoothing = diffuse_smoothing(self.smooth, layers.normal, light);
-            let shaded = evaluate_bsdf(params, layers, light) + diffuse * (smoothing - 1.0);
-            sum + shaded * (reflect * cosine)
-        })
+    /// (Cycles' `surface_shader_bsdf_eval`). `sampled` is the closure a draw picked and whether that draw was diffuse. Cycles'
+    /// `bsdf_sample` evaluates the picked closure with `is_eval = false`, so only its diffuse draw keeps the shading-side
+    /// test; every other closure takes it (`bump_shadowing_term`, `kernel/closure/bsdf.h`).
+    fn bsdf_eval(&self, light: DVec3, sampled: Option<(usize, bool)>) -> DVec3 {
+        self.items
+            .iter()
+            .enumerate()
+            .fold(DVec3::ZERO, |sum, (index, closure)| {
+                let is_eval = match sampled {
+                    Some((picked, diffuse)) if picked == index => diffuse,
+                    _ => true,
+                };
+                sum + self.closure_eval(closure, light, is_eval)
+            })
+    }
+
+    /// One closure's reflective term at `light`, `w·α·f·|cos|`, with its diffuse and sheen lobes smoothed at grazing light.
+    fn closure_eval(&self, closure: &HitClosure, light: DVec3, is_eval: bool) -> DVec3 {
+        let reflect = closure.reflect_weight();
+        if reflect <= 0.0 {
+            return DVec3::ZERO;
+        }
+        let (params, layers) = (&closure.params, &closure.layers);
+        if is_eval && !shading_side_passes(self.smooth, layers.normal, light) {
+            return DVec3::ZERO;
+        }
+        let cosine = layers.normal.dot(light).abs();
+        // The diffuse and sheen lobes sit in the above-shading share of `evaluate`, so their smoothing applies to that
+        // share only; the specular and glass lobes take none.
+        let above = layers.normal.dot(light) > 0.0;
+        let diffuse = if above {
+            diffuse_coefficient(params, layers)
+        } else {
+            DVec3::ZERO
+        };
+        let sheen = if above {
+            sheen_coefficient(params, layers, light)
+        } else {
+            DVec3::ZERO
+        };
+        let diffuse_correction =
+            diffuse * (diffuse_smoothing(self.smooth, layers.normal, light) - 1.0);
+        let sheen_correction =
+            sheen * (diffuse_smoothing(self.smooth, layers.sheen_normal, light) - 1.0);
+        let shaded = evaluate_bsdf(params, layers, light) + diffuse_correction + sheen_correction;
+        shaded * (reflect * cosine)
     }
 
     /// Density of the continuous draws at `light`: each closure's lobe mixture weighted by its selection weight, over
@@ -383,7 +406,7 @@ impl Closures {
                 let pdf = self.continuous_pdf(direction);
                 Reflection::Continuous {
                     direction,
-                    weight: self.bsdf_eval(direction) / pdf.max(1.0e-8),
+                    weight: self.bsdf_eval(direction, Some((index, diffuse))) / pdf.max(1.0e-8),
                     pdf,
                     diffuse,
                 }
@@ -394,6 +417,13 @@ impl Closures {
     /// Cycles' falling back to diffuse after a diffuse bounce (`bssrdf_setup` with `PATH_RAY_DIFFUSE_ANCESTOR`): a
     /// Burley closure loses its subsurface weight. The random walk keeps its closure.
     fn disable_burley_subsurface(&mut self) {
+        let burley = |closure: &HitClosure| {
+            closure.params.subsurface_method == SubsurfaceMethod::Burley
+                && closure.params.subsurface_weight > 0.0
+        };
+        if !self.items.iter().any(burley) {
+            return;
+        }
         let items: Vec<HitClosure> = self
             .items
             .iter()
@@ -1239,11 +1269,13 @@ struct PathBudget {
     transparent_max_bounces: u32,
 }
 
-/// A shadow ray from a receiver: its start point and normal, the direction to the light sample, and the distance to it.
+/// A shadow ray from a receiver: its start point, its geometric normal and its smooth shading normal (zero for a volume
+/// scatter, which has neither), the direction to the light sample, and the distance to it.
 #[derive(Clone, Copy)]
 struct ShadowRay {
     point: DVec3,
     normal: DVec3,
+    shading: DVec3,
     direction: DVec3,
     distance: f64,
 }
@@ -2010,16 +2042,34 @@ fn make_surface(
                 && frame.material.displacement_method != "displacement"
             {
                 Some(height_gradient(&frame.context, frame.normal, |sample| {
-                    evaluate_surface_with_workspace(
+                    evaluate_displacement_with_workspace(
                         frame.material,
                         frame.prepared,
                         sample,
                         evaluator_workspace,
                     )
-                    .map(|sample_shading| sample_shading.displacement_height)
                 })?)
             } else {
                 None
+            };
+            // Cycles' bump from displacement writes the bumped normal into `sd->N` before the closures are built
+            // (`scene/shader_graph.cpp`, `bump_from_displacement`), so the shading-side test and the diffuse smoothing
+            // measure against the bumped normal, not the undisplaced one.
+            let smooth = match gradient {
+                Some(shift) => {
+                    let bumped = (frame.normal - shift).normalize_or_zero();
+                    let bumped = if bumped == DVec3::ZERO {
+                        frame.normal
+                    } else {
+                        bumped
+                    };
+                    if bumped.dot(-direction) < 0.0 {
+                        -bumped
+                    } else {
+                        bumped
+                    }
+                }
+                None => frame.normal,
             };
             let mut items = Vec::with_capacity(shading.closures.len());
             for closure in shading
@@ -2048,16 +2098,14 @@ fn make_surface(
                 ));
             }
             // The dominant closure's normal is the surface's reference normal, for light sampling and the normal pass.
-            let normal = items
-                .iter()
-                .max_by(|first, second| first.weight.total_cmp(&second.weight))
+            let normal = heaviest(&items, |closure| closure.weight)
                 .map_or(frame.normal, |closure| closure.params.normal);
             Ok(Surface {
                 point: frame.point,
                 normal,
                 geometric_normal: frame.geometric_normal,
                 shadow_point: frame.shadow_point,
-                closures: Closures::new(items, frame.normal, frame.geometric_normal),
+                closures: Closures::new(items, smooth, frame.geometric_normal),
                 medium: Medium::from_closures(&shading.volume),
                 object_index: frame.triangle.object_index,
                 element_index: frame.triangle.element_index,
@@ -2107,7 +2155,7 @@ fn direct_lighting(
         };
         // Every closure's own lobes and cosine (`Closures::bsdf_eval`). Below the surface only a glass lobe
         // contributes, so a direction that no closure reaches skips the shadow ray.
-        let bsdf = closures.bsdf_eval(sample.direction);
+        let bsdf = closures.bsdf_eval(sample.direction, None);
         if bsdf.max_element() <= 0.0 || sample.radiance.max_element() <= 0.0 {
             continue;
         }
@@ -2116,6 +2164,7 @@ fn direct_lighting(
             ShadowRay {
                 point: surface.shadow_point,
                 normal: geometric,
+                shading: closures.smooth,
                 direction: sample.direction,
                 distance: sample.distance,
             },
@@ -2143,7 +2192,7 @@ fn direct_lighting(
     let light_pdf = environment_light_pdf(normal, direction, importance);
     // The importance sampler can draw below the surface, which only a glass lobe reaches.
     let bsdf = if light_pdf > 0.0 {
-        closures.bsdf_eval(direction)
+        closures.bsdf_eval(direction, None)
     } else {
         DVec3::ZERO
     };
@@ -2155,6 +2204,7 @@ fn direct_lighting(
             ShadowRay {
                 point: surface.shadow_point,
                 normal: geometric,
+                shading: closures.smooth,
                 direction,
                 distance: f64::INFINITY,
             },
@@ -2205,6 +2255,7 @@ fn direct_volume_lighting(
             ShadowRay {
                 point: event.point,
                 normal: DVec3::ZERO,
+                shading: DVec3::ZERO,
                 direction: sample.direction,
                 distance: sample.distance,
             },
@@ -2230,6 +2281,7 @@ fn direct_volume_lighting(
             ShadowRay {
                 point: event.point,
                 normal: DVec3::ZERO,
+                shading: DVec3::ZERO,
                 direction,
                 distance: f64::INFINITY,
             },
@@ -2283,6 +2335,7 @@ fn shadow_transmittance(
     let ShadowRay {
         point,
         normal,
+        shading,
         direction,
         distance,
     } = ray;
@@ -2297,7 +2350,7 @@ fn shadow_transmittance(
     };
     let (origin, remaining) = bvh.walk_hits(
         &geometry.triangles,
-        shadow_origin(point, direction, normal),
+        shadow_origin(point, direction, normal, shading),
         direction,
         RAY_EPSILON,
         remaining,
@@ -2885,7 +2938,7 @@ fn random_walk_exit(
     let roughness = params.roughness.clamp(0.0, 1.0);
     let direction = match method {
         WalkMethod::RandomWalk | WalkMethod::Legacy => entry_direction(
-            closure.params.normal,
+            closure.layers.specular,
             closure.layers.view,
             roughness * roughness,
             specular_eta(params),
@@ -2893,7 +2946,7 @@ fn random_walk_exit(
             v,
         ),
         WalkMethod::Skin => skin_entry_direction(
-            closure.params.normal,
+            closure.layers.specular,
             closure.layers.view,
             params.subsurface_ior,
             u,
@@ -2913,7 +2966,7 @@ fn random_walk_exit(
     }));
     let entry = WalkEntry {
         point: surface.point,
-        normal: closure.params.normal,
+        normal: closure.layers.specular,
         direction,
         albedo,
         radius,
@@ -3339,7 +3392,16 @@ fn collect_volumes<'a>(
             meters_per_unit,
             density_range,
             albedo,
-            phases: medium.map_or_else(Vec::new, |medium| medium.phases),
+            // A volume with no material is Cycles' default Principled Volume, whose scatter is 0.5 and isotropic.
+            phases: medium.map_or_else(
+                || {
+                    vec![PhaseClosure {
+                        weight: 0.5,
+                        anisotropy: 0.0,
+                    }]
+                },
+                |medium| medium.phases,
+            ),
             emission,
             scattering,
             extinction_scale,
@@ -3786,16 +3848,18 @@ fn offset_origin(point: DVec3, direction: DVec3, normal: DVec3) -> DVec3 {
     point + normal * (sign * RAY_EPSILON * (1.0 + point.abs().max_element()))
 }
 
-/// The start of a shadow ray leaving a surface point. Cycles starts it on the surface and skips the surface's own
-/// primitive only when the direction is above the geometric normal (`shadow_ray_offset`, `skip_self` in
-/// `kernel/light/sample.h`). A direction below the geometric normal therefore meets the surface itself, which blocks it
-/// unless the surface is transparent. Starting on the front side makes that own-surface hit happen.
-fn shadow_origin(point: DVec3, direction: DVec3, normal: DVec3) -> DVec3 {
-    if direction.dot(normal) < 0.0 {
-        point + normal * (RAY_EPSILON * (1.0 + point.abs().max_element()))
+/// The start of a shadow ray leaving a surface point, as Cycles' `shadow_ray_offset` (`kernel/light/sample.h`). The
+/// geometric normal is flipped to the transmission side when the light lies behind the smooth shading normal
+/// (`dot(N, L) < 0`), and the start lies on that side. A ray that leaves the front of the normal it is measured against
+/// does not meet its own triangle (Cycles' `skip_self`); a ray that crosses that normal, a light below the geometric
+/// surface, meets the surface and is blocked unless it is transparent.
+fn shadow_origin(point: DVec3, direction: DVec3, normal: DVec3, shading: DVec3) -> DVec3 {
+    let front = if shading.dot(direction) < 0.0 {
+        -normal
     } else {
-        offset_origin(point, direction, normal)
-    }
+        normal
+    };
+    point + front * (RAY_EPSILON * (1.0 + point.abs().max_element()))
 }
 
 fn allocate<T: Clone>(length: usize, value: T, label: &str) -> Result<Vec<T>> {
@@ -4512,5 +4576,39 @@ mod sampling_tests {
         // The light straight above is not shadowed, and a flat closure is never smoothed.
         assert!((diffuse_smoothing(smooth, bent, DVec3::Z) - 1.0).abs() < 1.0e-12);
         assert_eq!(diffuse_smoothing(smooth, smooth, grazing), 1.0);
+    }
+
+    #[test]
+    fn a_transmitted_shadow_ray_starts_behind_the_surface_and_a_reflected_one_in_front() {
+        // Cycles' `shadow_ray_offset` flips Ng when `dot(N, L) < 0`, and the start lies on the flipped side. A light
+        // below a glass plane therefore starts the ray below the plane, so it does not meet its own glass (a rough
+        // glass lit from behind is not blocked by itself, as the closure-list review found).
+        let point = DVec3::ZERO;
+        let normal = DVec3::Z;
+        let below = DVec3::new(0.6, 0.0, -0.8);
+        let transmitted = shadow_origin(point, below, normal, normal);
+        assert!(
+            transmitted.z < 0.0,
+            "transmitted ray starts at {transmitted:?}"
+        );
+        // A light above a reflecting plane starts in front of it.
+        let above = DVec3::new(0.6, 0.0, 0.8);
+        assert!(shadow_origin(point, above, normal, normal).z > 0.0);
+    }
+
+    #[test]
+    fn a_ray_crossing_the_geometric_plane_starts_in_front_and_meets_its_surface() {
+        // The light is behind the geometric normal but in front of a bent shading normal: `dot(N, L) > 0`, so the normal
+        // is not flipped, the start lies in front, and the ray crosses the plane, which blocks it.
+        let point = DVec3::ZERO;
+        let normal = DVec3::Z;
+        let bent = DVec3::new(0.9, 0.0, 0.435_889_894_354_067_4).normalize();
+        let light = DVec3::new(1.0, 0.0, -0.2).normalize();
+        assert!(bent.dot(light) > 0.0 && normal.dot(light) < 0.0);
+        let start = shadow_origin(point, light, normal, bent);
+        assert!(
+            start.z > 0.0 && light.z < 0.0,
+            "ray from {start:?} does not cross the plane"
+        );
     }
 }

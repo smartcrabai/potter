@@ -387,6 +387,8 @@ fn coat_layer(params: &BsdfParams, normal: DVec3, view: DVec3) -> Option<CoatLay
 pub(crate) struct Layers {
     /// The shading normal, which the diffuse and sheen lobes use.
     pub(crate) normal: DVec3,
+    /// The sheen's normal: the shading normal mixed towards the coat normal by the coat weight (`principled_bsdf_emission`).
+    pub(crate) sheen_normal: DVec3,
     /// The normal of the specular and glass microfacets: the shading normal bent by [`valid_specular_normal`].
     pub(crate) specular: DVec3,
     /// The coat's normal, bent the same way as Cycles' `valid_coat_normal`.
@@ -429,6 +431,7 @@ pub(crate) fn layers_at(
     let glass = glass_lobe(params, specular, view);
     Layers {
         normal,
+        sheen_normal,
         specular,
         coat_normal,
         view,

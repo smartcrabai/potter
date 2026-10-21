@@ -251,34 +251,15 @@ impl SurfaceShading {
     /// without a graph) has exactly its one closure here.
     #[must_use]
     pub fn dominant(&self) -> Option<&BsdfParams> {
-        self.closures
-            .iter()
-            .max_by(|first, second| first.weight.total_cmp(&second.weight))
-            .map(|closure| &closure.params)
+        heaviest(&self.closures, |closure| closure.weight).map(|closure| &closure.params)
     }
+}
 
-    /// The base colour of the closures averaged by weight. Exporters that write one colour per material use it; it is
-    /// the same value a single closure of the same weight would carry.
-    #[must_use]
-    pub fn representative_base_color(&self) -> Option<[f64; 4]> {
-        let total: f64 = self.closures.iter().map(|closure| closure.weight).sum();
-        if self.closures.is_empty() {
-            return None;
-        }
-        if total <= 0.0 {
-            return self
-                .closures
-                .first()
-                .map(|closure| closure.params.base_color);
-        }
-        let mut colour = [0.0; 4];
-        for closure in &self.closures {
-            for (channel, value) in colour.iter_mut().zip(closure.params.base_color) {
-                *channel += closure.weight * value;
-            }
-        }
-        Some(colour.map(|channel| channel / total))
-    }
+/// The heaviest item by its closure weight, the one Cycles' closure set takes its dominant normal from. `None` for no item.
+pub(crate) fn heaviest<T>(items: &[T], weight: impl Fn(&T) -> f64) -> Option<&T> {
+    items
+        .iter()
+        .max_by(|first, second| weight(first).total_cmp(&weight(second)))
 }
 
 /// The Vec form of a single node closure, for the surface and volume outputs.
@@ -668,7 +649,7 @@ fn evaluate_surface_inner(
         single_closure(&BsdfParams::from_material(material, hit_ctx.normal))
     };
     let displacement_height = if has_displacement {
-        let normal = dominant_normal(&closures, hit_ctx.normal);
+        let normal = hit_ctx.normal;
         match evaluator.input(output, "Displacement", ValueKind::Vector)? {
             Value::Vector(displacement) => displacement.dot(normal),
             Value::Scalar(displacement) => displacement,
@@ -697,14 +678,6 @@ fn without_volume(mut params: BsdfParams) -> BsdfParams {
     params.volume_anisotropy = 0.0;
     params.volume_emission = [0.0; 3];
     params
-}
-
-/// The normal of the heaviest closure, which the displacement height is measured along. With no closure, the hit normal.
-fn dominant_normal(closures: &[ShaderClosure], fallback: DVec3) -> DVec3 {
-    closures
-        .iter()
-        .max_by(|first, second| first.weight.total_cmp(&second.weight))
-        .map_or(fallback, |closure| closure.params.normal)
 }
 
 /// Evaluates the connected `OutputMaterial` displacement input without evaluating surface textures.
@@ -3525,11 +3498,6 @@ mod tests {
         assert_eq!(second.params.coat_weight, 0.2);
         // The heavier first arm is the dominant closure, so its normal is the one displacement is measured along.
         assert_eq!(shading.dominant().unwrap().normal, DVec3::X);
-        // The representative colour is the weight-averaged base colour: 0.75 red and 0.25 blue.
-        assert_eq!(
-            shading.representative_base_color(),
-            Some([0.75, 0.0, 0.25, 1.0])
-        );
     }
 
     #[test]
@@ -3542,11 +3510,6 @@ mod tests {
         assert_eq!(shading.closures[1].params.coat_weight, 0.2);
         assert_eq!(shading.closures[0].params.coat_normal, None);
         assert_eq!(shading.closures[1].params.normal, DVec3::Z);
-        // The representative colour averages the two arms: (red + blue) / 2.
-        assert_eq!(
-            shading.representative_base_color(),
-            Some([0.5, 0.0, 0.5, 1.0])
-        );
     }
 
     #[test]

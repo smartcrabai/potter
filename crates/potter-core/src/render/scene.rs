@@ -20,7 +20,7 @@ use crate::{
     shader::{
         BsdfParams, EvaluatorWorkspace, HitContext, HitUvLayers, PreparedMaterial, ShaderClosure,
         SurfaceShading, dielectric_f0, evaluate_displacement_with_workspace,
-        evaluate_surface_with_workspace, fill_color_layers, record_unevaluated_inputs,
+        evaluate_surface_with_workspace, fill_color_layers, heaviest, record_unevaluated_inputs,
     },
 };
 
@@ -1694,7 +1694,8 @@ impl SurfaceShader for SceneShader<'_> {
             // Workbench shades a material with its viewport display values when it has them; Potter-native
             // materials have none and keep their own (`workbench_engine.cc` `get_material`).
             let viewport = material.and_then(|material| material.viewport_display.as_ref());
-            let dominant = dominant_params(closures);
+            let dominant =
+                heaviest(closures, |closure| closure.weight).map(|closure| &closure.params);
             let (albedo, roughness, metallic) = match viewport {
                 Some(viewport) => (
                     DVec3::new(
@@ -2089,14 +2090,6 @@ fn opaque_share(closures: &[ShaderClosure]) -> f64 {
         .clamp(0.0, 1.0)
 }
 
-/// The heaviest closure's parameters, as `SurfaceShading::dominant` picks them. `None` for a hit without closures.
-fn dominant_params(closures: &[ShaderClosure]) -> Option<&BsdfParams> {
-    closures
-        .iter()
-        .max_by(|first, second| first.weight.total_cmp(&second.weight))
-        .map(|closure| &closure.params)
-}
-
 fn base_albedo(params: &BsdfParams) -> DVec3 {
     DVec3::new(
         params.base_color[0],
@@ -2123,7 +2116,8 @@ fn shade(
 ) -> Result<[f64; 4]> {
     let opaque = opaque_share(closures);
     if !matches!(mode, Mode::Beauty) {
-        let albedo = dominant_params(closures).map_or(DVec3::ZERO, base_albedo);
+        let albedo = heaviest(closures, |closure| closure.weight)
+            .map_or(DVec3::ZERO, |closure| base_albedo(&closure.params));
         return Ok([albedo.x, albedo.y, albedo.z, opaque]);
     }
     let scene = doc.scenes.get(&snapshot.scene_id);

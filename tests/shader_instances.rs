@@ -229,11 +229,6 @@ fn mix_shader_at_half_factor_keeps_each_arm_as_a_closure() {
     assert_eq!(shading.closures[0].params.metallic, 0.2);
     assert_eq!(shading.closures[1].params.base_color, [0.0, 0.0, 1.0, 1.0]);
     assert_eq!(shading.closures[1].params.metallic, 0.8);
-    // The colour an exporter writes is the weight-averaged base colour.
-    assert_eq!(
-        shading.representative_base_color(),
-        Some([0.5, 0.0, 0.5, 1.0])
-    );
 }
 
 #[test]
