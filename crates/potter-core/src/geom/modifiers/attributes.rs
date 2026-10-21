@@ -7,7 +7,7 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
-    geom::{Edge, Face, Mesh, Vertex},
+    geom::{Edge, Face, Mesh},
     model::{CameraData, Modifier},
 };
 

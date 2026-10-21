@@ -328,7 +328,6 @@ pub(super) fn data_transfer(
                 )?,
                 "CUSTOM_NORMAL" => transfer_custom_normals(
                     &mut result,
-                    &source.mesh,
                     modifier,
                     loop_mapping,
                     factor,
@@ -730,7 +729,7 @@ fn transfer_vertex_attribute(
         .cloned()
         .ok_or_else(|| invalid(modifier, name, "destination point-attribute values"))?;
     let mut output = destination_values;
-    for (index, vertex) in destination.vertices.iter().enumerate() {
+    for index in 0..destination.vertices.len() {
         let Some(mapped) = mapped_vertex_sources(mapping_context, destination, index, mapping)
         else {
             continue;
@@ -1050,7 +1049,6 @@ fn transfer_uv(
 
 fn transfer_custom_normals(
     destination: &mut Mesh,
-    source: &Mesh,
     _modifier: &Modifier,
     mapping: &str,
     factor: f64,
@@ -2559,7 +2557,7 @@ fn loop_candidate_for_island(
             from_vertex: true,
         });
     }
-    let (source_face, hit, distance, factor) = if mapping == "POLYINTERP_LNORPROJ" {
+    let (source_face, hit, _distance, factor) = if mapping == "POLYINTERP_LNORPROJ" {
         let normal = context.normal_to_source(destination_normal);
         let attempts = if context.ray_radius > 0.0 { 3 } else { 1 };
         let mut ray_hit = None;
@@ -2992,7 +2990,6 @@ fn closest_point_triangle_blender(
     let w = vc * denominator;
     first + edge_ab * v + edge_ac * w
 }
-// blocked: needs E's nearest-point BVH query (`KdopTree::nearest`); F's `KdopTree` only ray-casts.
 fn nearest_vertex(context: &TransferMapContext<'_>, point: DVec3) -> Option<usize> {
     let point = point.as_vec3();
     context
@@ -3008,32 +3005,6 @@ fn nearest_vertex(context: &TransferMapContext<'_>, point: DVec3) -> Option<usiz
         .map(|(index, _, ())| index)
 }
 
-// blocked: needs E's nearest-point BVH query (`KdopTree::nearest`); F's `KdopTree` only ray-casts.
-fn nearest_vertex_in_island(
-    context: &TransferMapContext<'_>,
-    point: DVec3,
-    graph: &SourceFaceGraph,
-    island_index: usize,
-) -> Option<usize> {
-    let island = graph.islands.get(island_index)?;
-    let point = point.as_vec3();
-    context
-        .source_vertex_bvh
-        .nearest(
-            point.as_dvec3(),
-            blender_max_distance_squared(context.max_distance),
-            |index, _| {
-                if island.vertices.binary_search(&index).is_err() {
-                    return None;
-                }
-                let position = context.source_positions.get(index)?.as_vec3();
-                Some((f64::from(position.distance_squared(point)), ()))
-            },
-        )
-        .map(|(index, _, ())| index)
-}
-
-// blocked: needs E's nearest-point BVH query (`KdopTree::nearest`); F's `KdopTree` only ray-casts.
 fn nearest_edge(context: &TransferMapContext<'_>, point: DVec3) -> Option<(usize, DVec3, f64)> {
     let point_f32 = point.as_vec3();
     let max_distance_squared = blender_max_distance_squared(context.max_distance);
@@ -3071,7 +3042,6 @@ fn nearest_surface(context: &TransferMapContext<'_>, point: DVec3) -> Option<(us
     nearest_surface_in_island(context, point, None)
 }
 
-// blocked: needs E's nearest-point BVH query (`KdopTree::nearest`); F's `KdopTree` only ray-casts.
 fn nearest_surface_in_island(
     context: &TransferMapContext<'_>,
     point: DVec3,
@@ -4328,20 +4298,6 @@ fn transfer_mask_weight(
     let weight = weights.get(&vertex_id).copied().unwrap_or(0.0);
     if invert { 1.0 - weight } else { weight }
 }
-fn source_loop_value<'a>(
-    mesh: &Mesh,
-    values: &'a Map<String, Value>,
-    loop_index: usize,
-) -> Option<&'a Value> {
-    let face_index = loop_face_index(mesh, loop_index);
-    let face = mesh.faces.get(face_index)?;
-    let corner = loop_index.checked_sub(loop_start(mesh, face_index))?;
-    values
-        .get(&format!("f{}", face.id))?
-        .as_array()?
-        .get(corner)
-}
-
 fn layer_uv_at_loop(mesh: &Mesh, layer: &UvLayer, loop_index: usize) -> Option<[f64; 2]> {
     let face_index = loop_face_index(mesh, loop_index);
     let corner = loop_index.checked_sub(loop_start(mesh, face_index))?;
@@ -4470,7 +4426,7 @@ fn source_face_value(source: &Mesh, name: &str, index: usize, face_id: u32) -> O
 mod tests {
     use std::collections::BTreeMap;
 
-    use glam::{DMat4, DVec3};
+    use glam::DVec3;
     use serde_json::json;
 
     use super::data_transfer;

@@ -3295,7 +3295,7 @@ mod tests {
             binding_data: None,
             runtime: crate::model::ModifierRuntime::default(),
         };
-        let result = mask(&source, &modifier).unwrap();
+        let result = mask(&source, &modifier, &std::collections::BTreeMap::new()).unwrap();
         assert_eq!(result.vertices.len(), 0);
         assert_eq!(origindex_values(&result), Some(Vec::new()));
     }

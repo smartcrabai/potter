@@ -1,10 +1,8 @@
 //! Weighted-normal and normal-edit modifiers.
 
 use super::*;
-use std::collections::BTreeSet;
 use std::{ffi::c_void, mem::size_of, os::raw::c_int};
 
-use crate::geom::normals::corner_normals;
 use glam::Vec3;
 
 type WeightedModeCompare = unsafe extern "C" fn(*const c_void, *const c_void) -> c_int;
