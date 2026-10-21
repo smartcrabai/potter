@@ -28,6 +28,14 @@ def make_mesh_object(name, raw, source=False):
     attributes = raw.get("attributes", {})
     for polygon, smooth in zip(mesh.polygons, attributes.get("shade_smooth", [])):
         polygon.use_smooth = smooth
+    if attributes.get("shade_smooth_operator"):
+        # Mesh.shade_smooth removes Blender's sharp_face attribute; per-polygon use_smooth keeps it.
+        mesh.shade_smooth()
+    for pair in raw.get("sharp_edges", []):
+        key = tuple(sorted(pair))
+        for edge in mesh.edges:
+            if tuple(sorted(edge.vertices)) == key:
+                edge.use_edge_sharp = True
     for entry in attributes.get("uv_map", []):
         layer_name = entry.get("layer", "UVMap")
         layer = mesh.uv_layers.get(layer_name) or mesh.uv_layers.new(name=layer_name)
