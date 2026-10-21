@@ -1546,7 +1546,7 @@ def _uv_layer_index(layers, attribute):
 MESH_HANDLED_KEYS = frozenset((
     "alembic_normals", "alembic_time_samples", "alembic_velocity", "blender_attributes", "blender_metadata", "blender_skin_vertices",
     "color_layers", "crease_edge", "custom_normal", "seam", "sharp", "shade_smooth", "skin_radii", "skin_roots",
-    "multires_displacement", "subdivision_optimal_edges",
+    "multires_displacement", "subdivision_optimal_edges", "texture_space",
     "uv_layers",
     "vertex_groups",
 ))
@@ -4257,6 +4257,17 @@ def _apply_color_designation(mesh, attributes):
             raise ValueError("color layer %s is designated %s but mesh %s has no such layer"
                              % (reference, key, mesh.name))
         setattr(mesh.color_attributes, field, layer_names.index(reference))
+
+
+def _apply_texture_space(mesh, record):
+    """A mesh with a texture-space record has a manual texture space; without one it keeps the automatic bounds."""
+    if record is None:
+        return
+    mesh.use_auto_texspace = False
+    mesh.texspace_location = record["location"]
+    mesh.texspace_size = record["size"]
+
+
 def mesh_create(name, raw, block_id):
     mesh = bpy.data.meshes.new(name)
     attributes = raw.get("attributes", {})
@@ -4318,6 +4329,7 @@ def mesh_create(name, raw, block_id):
                              layer_names)
     _apply_blender_attributes(mesh, attributes, layer_names, layout, edge_of)
     _apply_multires_control_data(mesh, attributes, face_items, layout)
+    _apply_texture_space(mesh, attributes.get("texture_space"))
     _apply_color_designation(mesh, attributes)
     metadata = attributes.get("blender_metadata", {})
     set_props(mesh, metadata.get("custom_properties", {}))
