@@ -636,11 +636,36 @@ fn assert_oracle_attribute(
     assert_eq!(actual["domain"], expected_domain, "attribute {name} domain");
     if name == "custom_normal" {
         assert_eq!(actual["type"], "normal_code", "attribute {name} encoding");
-        assert_numeric_json_close(
-            &oracle_actual_attribute_values(mesh, actual)?,
-            &expected["values"],
-            0.0,
-        );
+        let actual_codes = oracle_actual_attribute_values(mesh, actual)?;
+        let actual_codes = actual_codes
+            .as_array()
+            .ok_or("custom_normal codes are not an array")?;
+        let expected_codes = expected["values"]
+            .as_array()
+            .ok_or("Blender custom_normal codes are not an array")?;
+        if actual_codes.len() != expected_codes.len() {
+            return Err(format!(
+                "custom_normal has {} corners, Blender has {}",
+                actual_codes.len(),
+                expected_codes.len()
+            )
+            .into());
+        }
+        for (corner, (actual_code, expected_code)) in
+            actual_codes.iter().zip(expected_codes).enumerate()
+        {
+            let same = |value: &Value| {
+                value
+                    .as_array()
+                    .and_then(|pair| Some([pair.first()?.as_f64()?, pair.get(1)?.as_f64()?]))
+            };
+            if same(actual_code) != same(expected_code) {
+                return Err(format!(
+                    "custom_normal corner {corner}: Potter stores {actual_code}, Blender stores {expected_code}"
+                )
+                .into());
+            }
+        }
     } else {
         let expected_type = match expected["type"].as_str() {
             Some("BOOLEAN") => "bool",

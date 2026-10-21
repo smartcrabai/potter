@@ -958,9 +958,11 @@ pub(crate) fn corner_custom_normals(
     ))
 }
 
+/// The stored value of one corner. Blender stores an automatic corner as the code pair `[0, 0]`, which
+/// means "use the loop's normal space"; `null` is not written. Reading `[0, 0]` yields `Auto` again.
 fn code_value(code: CornerNormalCode) -> Value {
     match code {
-        CornerNormalCode::Auto | CornerNormalCode::Authored([0, 0]) => Value::Null,
+        CornerNormalCode::Auto | CornerNormalCode::Authored([0, 0]) => json!([0, 0]),
         CornerNormalCode::Authored(pair) => json!(pair),
         CornerNormalCode::ExplicitZero => Value::String("explicit_zero".to_owned()),
     }
@@ -1410,7 +1412,7 @@ mod tests {
     use serde_json::{Map, Value, json};
 
     use super::{
-        CornerNormalCode, NormalCodeOptions, SetterInput, corner_codes, corner_count,
+        CornerNormalCode, NormalCodeOptions, SetterInput, code_value, corner_codes, corner_count,
         corner_custom_normals, corner_order, encode_vector_updates, encode_vectors, evaluate_codes,
         mesh_fans, rebuild_custom_normals, settle_custom_normals, write_codes,
     };
@@ -1617,6 +1619,25 @@ mod tests {
             CornerNormalCode::from_pair([3, -4]),
             CornerNormalCode::Authored([3, -4])
         );
+    }
+
+    #[test]
+    fn automatic_corners_serialize_as_zero_pair_and_read_back_as_auto() {
+        assert_eq!(code_value(CornerNormalCode::Auto), json!([0, 0]));
+        assert_eq!(
+            code_value(CornerNormalCode::Authored([0, 0])),
+            json!([0, 0])
+        );
+        assert_eq!(
+            code_value(CornerNormalCode::Authored([3, -4])),
+            json!([3, -4])
+        );
+        assert_eq!(
+            code_value(CornerNormalCode::ExplicitZero),
+            json!("explicit_zero")
+        );
+        let read = CornerNormalCode::from_pair([0, 0]);
+        assert_eq!(read, CornerNormalCode::Auto);
     }
 
     #[test]
