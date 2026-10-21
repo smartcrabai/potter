@@ -17,7 +17,7 @@ use crate::{
 
 use super::principled_bsdf::{
     GlassSample, Layers, base_color, continuous_density, evaluate as evaluate_bsdf, layers,
-    lobe_probabilities, make_orthonormals, sample_glass, subsurface_closure_weight,
+    lobe_probabilities, make_orthonormals, sample_glass, specular_eta, subsurface_closure_weight,
 };
 use super::subsurface::{
     MAX_HITS, ProbeHits, SubsurfaceExit, burley_radius, channel_mask, eval as burley_eval,
@@ -1084,8 +1084,15 @@ fn trace_path(
             else {
                 break;
             };
-            exit_backfacing = intrinsic_normal(geometry, hit.triangle_index)
-                .is_some_and(|normal| normal.dot(direction) > 0.0);
+            // The exit's normal faces outward as Cycles' `subsurface_bounce` and `subsurface_scatter` set it: a Burley
+            // exit is oriented by its probe's entry (`subsurface_disk`), and a random walk exit faces along the walk's
+            // last flight, since Cycles reverses that ray at the exit point.
+            exit_backfacing = match surface.params.subsurface_method {
+                SubsurfaceMethod::Burley => intrinsic_normal(geometry, hit.triangle_index)
+                    .is_some_and(|normal| normal.dot(direction) > 0.0),
+                _ => intrinsic_normal(geometry, exit.hit.triangle_index)
+                    .is_some_and(|normal| normal.dot(exit.direction) < 0.0),
+            };
             throughput = exit.throughput;
             origin = exit.origin;
             direction = exit.direction;
@@ -2436,12 +2443,15 @@ fn random_walk_exit(
 ) -> Option<SubsurfaceExit> {
     let params = &surface.params;
     let (u, v) = (rng.next_f64(), rng.next_f64());
+    // The entry's GGX interface has the clamped roughness squared (`bssrdf->alpha = sqr(roughness)`), and refracts at the
+    // specular layer's eta (`bssrdf->ior = eta`, `svm/closure.h`). The skin refracts at its Subsurface IOR instead.
+    let roughness = params.roughness.clamp(0.0, 1.0);
     let direction = match method {
         WalkMethod::RandomWalk | WalkMethod::Legacy => entry_direction(
             surface.normal,
             surface.layers.view,
-            params.roughness * params.roughness,
-            params.ior,
+            roughness * roughness,
+            specular_eta(params),
             u,
             v,
         ),

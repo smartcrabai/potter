@@ -541,10 +541,10 @@ pub(super) fn walk(
                     .get(hit.triangle_index)
                     .is_some_and(|triangle| triangle.object_index == object)
                 {
+                    // Hits come nearest first, so the first hit on the object is the closest: the walk stops there.
                     let t = (from - origin).dot(direction) + hit.distance;
-                    if closest.as_ref().is_none_or(|(best, _, _)| t < *best) {
-                        closest = Some((t, hit, from));
-                    }
+                    closest = Some((t, hit, from));
+                    return false;
                 }
                 true
             },

@@ -693,21 +693,31 @@ struct SpecularLayer {
     f0_tinted: DVec3,
 }
 
-/// Cycles' specular setup: `f0 = F0(ior) * 2 * level`, `eta = ior` at level 0.5, otherwise
-/// `eta = ior_from_F0(f0)` (inverted for ior < 1). No specular layer when `eta == 1`.
+/// The IOR that Cycles refracts at, after the Specular IOR Level (`svm/closure.h`, `eta`): the Principled IOR at level
+/// one half, and otherwise the IOR whose F0 is the level's F0, inverted for an IOR below one. The random walk entry uses
+/// it as `bssrdf->ior`.
 #[expect(
     clippy::float_cmp,
-    reason = "Cycles compares the specular IOR level with exactly 0.5 and eta with exactly 1"
+    reason = "Cycles compares the specular IOR level with exactly 0.5"
+)]
+pub(super) fn specular_eta(params: &BsdfParams) -> f64 {
+    let level = params.specular_ior_level.max(0.0);
+    if level == 0.5 {
+        return params.ior;
+    }
+    let eta = ior_from_f0(dielectric_f0(params.ior, level));
+    if params.ior < 1.0 { 1.0 / eta } else { eta }
+}
+
+/// Cycles' specular setup: `f0 = F0(ior) * 2 * level`, `eta` from [`specular_eta`]. No specular layer when `eta == 1`.
+#[expect(
+    clippy::float_cmp,
+    reason = "Cycles compares eta with exactly 1 to drop the specular layer"
 )]
 fn specular_layer(params: &BsdfParams) -> Option<SpecularLayer> {
     let level = params.specular_ior_level.max(0.0);
     let f0_scalar = dielectric_f0(params.ior, level);
-    let eta = if level == 0.5 {
-        params.ior
-    } else {
-        let eta = ior_from_f0(f0_scalar);
-        if params.ior < 1.0 { 1.0 / eta } else { eta }
-    };
+    let eta = specular_eta(params);
     if eta == 1.0 {
         return None;
     }
