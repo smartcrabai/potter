@@ -8666,6 +8666,21 @@ fn imported_fisheye_lens(item: &Value) -> Option<f64> {
 
 fn import_losses(raw: &Value) -> Vec<Loss> {
     let mut losses = Vec::new();
+    // Blender's USD CacheFiles are not read: their Mesh Cache and Mesh Sequence Cache modifiers would fail at
+    // evaluation, so the import reports each one (gated by --allow-lossy) instead of packing it as Alembic.
+    for cache in raw
+        .get("unsupported_cache_files")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let name = cache.get("name").and_then(Value::as_str);
+        losses.push(loss(
+            "cache.usd",
+            name,
+            "Blender's USD cache file is not supported; the cache resource is kept but its Mesh Cache and Mesh Sequence Cache modifiers fail at evaluation",
+        ));
+    }
     // Blender stores every panorama setting on every camera, so a value Potter cannot hold is reported whatever the camera's
     // type: the import never changes a camera silently.
     for camera in raw
@@ -10162,6 +10177,17 @@ fn loss(feature: impl Into<String>, data_id: Option<&str>, reason: &str) -> Loss
 mod tests {
     #![expect(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
     use super::*;
+    #[test]
+    fn usd_cache_files_import_as_cache_usd_losses() {
+        let raw =
+            json!({"unsupported_cache_files": [{"name": "CacheFile", "filepath": "/x/a.usdc"}]});
+        let losses = import_losses(&raw);
+        assert!(
+            losses.iter().any(|loss| loss.feature_id == "cache.usd"
+                && loss.data_id.as_deref() == Some("CacheFile"))
+        );
+        assert!(import_losses(&json!({})).is_empty());
+    }
 
     #[test]
     fn color_curve_extension_serializes_as_bridge_boolean() -> Result<()> {
