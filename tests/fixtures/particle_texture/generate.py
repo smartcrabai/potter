@@ -222,6 +222,13 @@ SQUARE_VERTICES = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0,
 MIXED_VERTICES = [(0.0, 0.0, 0.0), (2.0, 0.0, 0.0), (0.0, 1.0, 0.0), (4.0, 0.0, 0.0),
                   (4.0, 2.0, 0.0), (2.0, 2.0, 0.0)]
 MIXED_FACES = [(0, 1, 2), (1, 3, 4, 5)]
+# A tetrahedron, closed, so a volume grid keeps only the cells inside it.
+TETRA_VERTICES = [(0.0, 0.0, 0.0), (2.0, 0.0, 0.0), (0.0, 2.0, 0.0), (0.0, 0.0, 2.0)]
+TETRA_FACES = [(0, 2, 1), (0, 1, 3), (0, 3, 2), (1, 2, 3)]
+# A concave pentagon and a concave hexagon: their triangulation decides the face each particle takes.
+PENTAGON_VERTICES = [(0.0, 0.0, 0.0), (3.0, 0.0, 0.0), (3.0, 3.0, 0.0), (1.5, 1.0, 0.0), (0.0, 3.0, 0.0)]
+HEXAGON_VERTICES = [(0.0, 0.0, 0.0), (4.0, 0.0, 0.0), (4.0, 4.0, 0.0), (2.0, 1.0, 0.0),
+                    (0.0, 4.0, 0.0), (-1.0, 2.0, 0.0)]
 
 # (name, vertices, faces, count, emit_from, options): options set the distribution fields.
 EMITTER_CASES = [
@@ -240,13 +247,32 @@ EMITTER_CASES = [
     ("volume_cube_jit", CUBE_VERTICES, CUBE_FACES, 40, "VOLUME", {}),
     ("volume_cube_rand", CUBE_VERTICES, CUBE_FACES, 40, "VOLUME", {"distribution": "RAND"}),
     ("volume_cube_smooth", CUBE_VERTICES, CUBE_FACES, 40, "VOLUME", {"smooth": True}),
+    # Grid cases: a grid emitter holds `grid` cubed cells, so its count is unused.
+    ("grid_face_cube", CUBE_VERTICES, CUBE_FACES, 1, "FACE", {"grid": 4}),
+    ("grid_face_cube_options", CUBE_VERTICES, CUBE_FACES, 1, "FACE",
+     {"grid": 6, "hexagonal": True, "invert": True, "grid_random": 0.3}),
+    ("grid_face_mixed", MIXED_VERTICES, MIXED_FACES, 1, "FACE", {"grid": 3}),
+    ("grid_volume_tetra", TETRA_VERTICES, TETRA_FACES, 1, "VOLUME", {"grid": 4}),
+    ("grid_volume_tetra_options", TETRA_VERTICES, TETRA_FACES, 1, "VOLUME",
+     {"grid": 6, "hexagonal": True, "grid_random": 0.6}),
+    # N-gon cases: the faces are triangulated the way Blender's tessellation does.
+    ("ngon_face_pentagon_jit", PENTAGON_VERTICES, [(0, 1, 2, 3, 4)], 20, "FACE", {}),
+    ("ngon_face_hexagon_rand_uneven", HEXAGON_VERTICES, [(0, 1, 2, 3, 4, 5)], 25, "FACE",
+     {"distribution": "RAND", "even": False}),
 ]
 for name, vertices, faces, count, emit_from, options in EMITTER_CASES:
     obj = emitter_object(name, vertices, faces, smooth=options.get("smooth", False))
-    add_emitter(obj, count, 1, 1, 500.0, 1.0, emit_from=emit_from,
-                distribution=options.get("distribution", "JIT"),
-                even=options.get("even", True), emit_random=options.get("emit_random", True),
-                userjit=options.get("userjit", 0))
+    settings = add_emitter(obj, count, 1, 1, 500.0, 1.0, emit_from=emit_from,
+                           distribution=options.get("distribution", "JIT"),
+                           even=options.get("even", True),
+                           emit_random=options.get("emit_random", True),
+                           userjit=options.get("userjit", 0))
+    if "grid" in options:
+        settings.distribution = "GRID"
+        settings.grid_resolution = options["grid"]
+        settings.hexagonal_grid = options.get("hexagonal", False)
+        settings.invert_grid = options.get("invert", False)
+        settings.grid_random = options.get("grid_random", 0.0)
     case(name, obj, 2)
 
 frames = sorted({frame for frame, _, _, _, _ in reads})

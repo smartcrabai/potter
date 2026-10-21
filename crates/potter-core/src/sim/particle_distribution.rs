@@ -17,7 +17,8 @@
 //! birth point along the inward normal to half the distance to the nearest other face.
 //!
 //! Everything here is single precision, as Blender computes it, so birth positions match its
-//! output. `PART_DISTR_GRID` is not modelled; the caller refuses it.
+//! output. `PART_DISTR_GRID` places the particles on a cube of `grid_resolution` cells cubed, one
+//! per cell that a face or volume test keeps (`distribute_grid`).
 
 use std::collections::HashMap;
 
@@ -25,7 +26,7 @@ use glam::DVec3;
 
 use super::particle_jitter::jitter_table;
 use crate::{
-    blender_rng::BlenderRng,
+    blender_rng::{BlenderRng, psys_frand},
     error::{ErrorCode, PotError, Result},
     geom::{Mesh, normals, triangulate},
 };
@@ -308,9 +309,12 @@ impl FaceEmitter {
 /// Distributes `settings.count` particles over `emitter` (`distribute_particles`), then places each
 /// one (`distribute_from_faces_exec`, `distribute_from_volume_exec`, `psys_particle_on_dm`).
 ///
-/// Returns one sample per particle, in particle order, or no samples when no element can take a
-/// particle (as when every face has zero area).
-pub(crate) fn distribute_faces(emitter: &FaceEmitter, settings: FaceSettings) -> Vec<FaceSample> {
+/// Returns one entry per particle, in particle order: `Some` for each emitted particle, or none when
+/// no element can take a particle (as when every face has zero area).
+pub(crate) fn distribute_faces(
+    emitter: &FaceEmitter,
+    settings: FaceSettings,
+) -> Vec<Option<FaceSample>> {
     let elements = emitter.tessfaces.len();
     let count = settings.count;
     if elements == 0 || count == 0 {
@@ -416,12 +420,304 @@ pub(crate) fn distribute_faces(emitter: &FaceEmitter, settings: FaceSettings) ->
             birth = std::array::from_fn(|axis| position[axis] + normal[axis] * inward);
         }
         random.skip(3 - drawn);
-        samples.push(FaceSample {
+        samples.push(Some(FaceSample {
             position: to_dvec3(birth),
             normal: to_dvec3(normal),
-        });
+        }));
     }
     samples
+}
+
+/// The settings of `PART_DISTR_GRID` (`distribute_grid`): the resolution, the random offset, and the
+/// hexagonal and inverted layouts.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GridSettings {
+    /// `PART_FROM_VOLUME`: a cell is kept when it lies inside the closed surface.
+    pub(crate) volume: bool,
+    /// `ParticleSettings.grid_resolution`: cells along each axis.
+    pub(crate) resolution: usize,
+    /// `ParticleSettings.grid_random` (`grid_rand`): the random offset as a share of a cell.
+    pub(crate) random: f32,
+    /// `PART_GRID_HEXAGONAL`: every other row and column is shifted by half a cell.
+    pub(crate) hexagonal: bool,
+    /// `PART_GRID_INVERT`: kept and removed cells swap.
+    pub(crate) invert: bool,
+    /// `ParticleSystem.seed`.
+    pub(crate) seed: u32,
+}
+
+/// Blender's `distribute_grid` for `PART_FROM_FACE` and `PART_FROM_VOLUME`: one entry per grid cell,
+/// in cell order `(i * res + j) * res + k`, with `None` where the cell is removed. A kept cell is
+/// placed at its own point, which is its object-space birth position (`psys_particle_on_emitter`
+/// copies the grid position for `PART_DISTR_GRID`), and its normal is zero.
+pub(crate) fn distribute_grid(
+    emitter: &FaceEmitter,
+    settings: GridSettings,
+) -> Vec<Option<FaceSample>> {
+    let res = settings.resolution;
+    let total = res * res * res;
+    // Blender's bounds loop starts at vertex 1, so vertex 0 does not contribute.
+    let mut min = [f32::MAX; 3];
+    let mut max = [-f32::MAX; 3];
+    for point in emitter.positions.iter().skip(1) {
+        for (axis, &value) in point.iter().enumerate() {
+            min[axis] = min[axis].min(value);
+            max[axis] = max[axis].max(value);
+        }
+    }
+    let delta = sub(max, min);
+    let axis = axis_dominant(delta);
+    let cell = delta[axis] / res as f32;
+    // `size` counts cells along each axis: the major axis has `res`, the others cover the extent.
+    let mut size = [1_usize; 3];
+    size[axis] = res;
+    for other in [(axis + 1) % 3, (axis + 2) % 3] {
+        // Blender's `int(ceil(...))`, with NaN as 1 and the result clamped to `[1, res]`.
+        let extent = (delta[other] / cell).ceil();
+        let extent = if extent.is_nan() { 1.0 } else { extent };
+        size[other] = extent.clamp(1.0, res as f32) as usize;
+    }
+    let half = |component: usize| {
+        if cell < delta[component] {
+            cell / 2.0
+        } else {
+            delta[component] / 2.0
+        }
+    };
+    // The first cell centre sits half a cell in from the minimum, or half the extent when a cell is
+    // wider than the extent along that axis.
+    let mut origin = min;
+    for (component, value) in origin.iter_mut().enumerate() {
+        *value += half(component);
+    }
+
+    let mut position = vec![[0.0_f32; 3]; total];
+    let mut unexist = vec![true; total];
+    let mut hair = vec![0_u32; total];
+    for i in 0..res {
+        for j in 0..res {
+            for k in 0..res {
+                let p = (i * res + j) * res + k;
+                position[p] = [
+                    origin[0] + i as f32 * cell,
+                    origin[1] + j as f32 * cell,
+                    origin[2] + k as f32 * cell,
+                ];
+            }
+        }
+    }
+
+    // Each ray along a cell row marks the cells that its faces cross. Faces keep their cells;
+    // a volume counts the crossings and keeps the cells inside an odd number of them.
+    let axes = if settings.volume { 1 } else { 3 };
+    for a in 0..axes {
+        let (stride_a, stride_a1, stride_a2) = match a {
+            0 => (res * res, res, 1),
+            1 => (res, 1, res * res),
+            _ => (1, res * res, res),
+        };
+        for a1 in 0..size[(a + 1) % 3] {
+            for a2 in 0..size[(a + 2) % 3] {
+                let base = a1 * stride_a1 + a2 * stride_a2;
+                let mut start = position[base];
+                start[a] -= half(a);
+                let mut end = start;
+                end[a] += delta[a] + 0.001 * cell;
+                start[a] -= 0.001 * cell;
+                let ray = WatertightRay::new(sub(end, start));
+                for face in &emitter.tessfaces {
+                    let [first, second, third, fourth] = face.vertices;
+                    let first_hit = ray.intersect(
+                        start,
+                        emitter.positions[first],
+                        emitter.positions[second],
+                        emitter.positions[third],
+                    );
+                    let first_cell =
+                        first_hit.and_then(|lambda| ray_cell(base, lambda, size[a], stride_a));
+                    let mut cells = [first_cell, None];
+                    if face.quad && (first_hit.is_none() || settings.volume) {
+                        let second_hit = ray.intersect(
+                            start,
+                            emitter.positions[first],
+                            emitter.positions[third],
+                            emitter.positions[fourth],
+                        );
+                        // A cell that both triangles of the quad reach counts once.
+                        cells[1] = second_hit
+                            .and_then(|lambda| ray_cell(base, lambda, size[a], stride_a))
+                            .filter(|cell_index| Some(*cell_index) != first_cell);
+                    }
+                    for cell_index in cells.into_iter().flatten() {
+                        if settings.volume {
+                            hair[cell_index] += 1;
+                        } else {
+                            unexist[cell_index] = false;
+                        }
+                    }
+                }
+                if settings.volume {
+                    let mut inside = hair[base] % 2;
+                    if inside != 0 {
+                        hair[base] += 1;
+                    }
+                    for i in 0..size[0] {
+                        let cell_index = base + i * stride_a;
+                        if inside != 0 || hair[cell_index] % 2 != 0 {
+                            unexist[cell_index] = false;
+                        }
+                        inside = (inside + hair[cell_index]) % 2;
+                    }
+                }
+            }
+        }
+    }
+
+    if settings.hexagonal {
+        for i in 0..res {
+            for j in 0..res {
+                for k in 0..res {
+                    let p = (i * res + j) * res + k;
+                    if j % 2 == 1 {
+                        position[p][0] += cell / 2.0;
+                    }
+                    if k % 2 == 1 {
+                        position[p][0] += cell / 2.0;
+                        position[p][1] += cell / 2.0;
+                    }
+                }
+            }
+        }
+    }
+
+    if settings.invert {
+        for i in 0..size[0] {
+            for j in 0..size[1] {
+                let base = res * (i * res + j);
+                for k in 0..size[2] {
+                    unexist[base + k] = !unexist[base + k];
+                }
+            }
+        }
+    }
+
+    if settings.random > 0.0 {
+        let radius = cell * settings.random;
+        for (p, point) in position.iter_mut().enumerate() {
+            if unexist[p] {
+                continue;
+            }
+            for (offset, value) in point.iter_mut().enumerate() {
+                // Blender's `psys_frand(psys, p + 31 + offset)`.
+                let seed = (p as u32).wrapping_add(31 + offset as u32);
+                *value += radius * (psys_frand(settings.seed, seed) - 0.5);
+            }
+        }
+    }
+
+    unexist
+        .iter()
+        .zip(position)
+        .map(|(&removed, point)| {
+            (!removed).then(|| FaceSample {
+                position: to_dvec3(point),
+                normal: DVec3::ZERO,
+            })
+        })
+        .collect()
+}
+
+/// The cell that a ray hit at `lambda` lands in along a row of `size` cells, `stride` apart, starting
+/// at `base` (`int(lambda * size)` in `distribute_grid`). A hit past the row has no cell.
+fn ray_cell(base: usize, lambda: f32, size: usize, stride: usize) -> Option<usize> {
+    let step = (lambda * size as f32) as usize;
+    (step < size).then(|| base + step * stride)
+}
+
+/// Blender's `axis_dominant_v3_single`: the largest-magnitude axis, with ties going to the later
+/// axis.
+fn axis_dominant(vector: Float3) -> usize {
+    let (x, y, z) = (vector[0].abs(), vector[1].abs(), vector[2].abs());
+    if x > y {
+        if x > z { 0 } else { 2 }
+    } else if y > z {
+        1
+    } else {
+        2
+    }
+}
+
+/// Blender's `IsectRayPrecalc` with `isect_ray_tri_watertight_v3`: a ray sheared so that its
+/// dominant axis is `kz`. Its test accepts a shared edge from either triangle, so a grid row never
+/// misses a face between two triangles.
+#[derive(Clone, Copy)]
+struct WatertightRay {
+    kx: usize,
+    ky: usize,
+    kz: usize,
+    sx: f32,
+    sy: f32,
+    sz: f32,
+}
+
+impl WatertightRay {
+    /// `isect_ray_tri_watertight_v3_precalc`.
+    fn new(direction: Float3) -> Self {
+        let kz = axis_dominant(direction);
+        let mut kx = if kz != 2 { kz + 1 } else { 0 };
+        let mut ky = if kx != 2 { kx + 1 } else { 0 };
+        // A negative ray swaps the two other axes, which keeps the triangles' winding.
+        if direction[kz] < 0.0 {
+            std::mem::swap(&mut kx, &mut ky);
+        }
+        let inverse = 1.0 / direction[kz];
+        Self {
+            kx,
+            ky,
+            kz,
+            sx: direction[kx] * inverse,
+            sy: direction[ky] * inverse,
+            sz: inverse,
+        }
+    }
+
+    /// `isect_ray_tri_watertight_v3`: the ray parameter of a hit ahead of `origin`, if any.
+    fn intersect(
+        &self,
+        origin: Float3,
+        first: Float3,
+        second: Float3,
+        third: Float3,
+    ) -> Option<f32> {
+        let a = sub(first, origin);
+        let b = sub(second, origin);
+        let c = sub(third, origin);
+        let (kx, ky, kz) = (self.kx, self.ky, self.kz);
+        let ax = a[kx] - self.sx * a[kz];
+        let ay = a[ky] - self.sy * a[kz];
+        let bx = b[kx] - self.sx * b[kz];
+        let by = b[ky] - self.sy * b[kz];
+        let cx = c[kx] - self.sx * c[kz];
+        let cy = c[ky] - self.sy * c[kz];
+        let u = cx * by - cy * bx;
+        let v = ax * cy - ay * cx;
+        let w = bx * ay - by * ax;
+        if (u < 0.0 || v < 0.0 || w < 0.0) && (u > 0.0 || v > 0.0 || w > 0.0) {
+            return None;
+        }
+        let det = u + v + w;
+        if !det.is_finite() || det.abs() <= 0.0 {
+            return None;
+        }
+        // Blender compares t with zero after flipping its sign by the sign of the determinant.
+        let sign_det = det.to_bits() & 0x8000_0000;
+        let t = (u * a[kz] + v * b[kz] + w * c[kz]) * self.sz;
+        if f32::from_bits(t.to_bits() ^ sign_det) < 0.0 {
+            return None;
+        }
+        let inverse_det = 1.0 / det;
+        Some(t * inverse_det)
+    }
 }
 
 /// The corners of a tessface, with the count (three or four) of the ones in use.
@@ -721,7 +1017,10 @@ fn to_dvec3(point: Float3) -> DVec3 {
 
 #[cfg(test)]
 mod tests {
-    use super::{interp_weights_poly, uv_weights, vertex_elements};
+    use super::{
+        FaceEmitter, GridSettings, Tessface, WatertightRay, distribute_grid, interp_weights_poly,
+        uv_weights, vertex_elements,
+    };
 
     fn assert_close(actual: f32, expected: f32) {
         assert!((actual - expected).abs() < 1.0e-6, "{actual} != {expected}");
@@ -770,5 +1069,87 @@ mod tests {
         let weights = interp_weights_poly(&square, [1.0, 1.0, 0.0]);
         assert_close(weights[2], 1.0);
         assert_close(weights[0] + weights[1] + weights[3], 0.0);
+    }
+
+    #[test]
+    fn watertight_ray_reports_the_distance_to_a_triangle_it_crosses() {
+        let ray = WatertightRay::new([1.0, 0.0, 0.0]);
+        let hit = ray.intersect(
+            [0.0; 3],
+            [2.0, -1.0, -1.0],
+            [2.0, 1.0, -1.0],
+            [2.0, 0.0, 1.0],
+        );
+        assert_close(hit.unwrap_or(f32::NAN), 2.0);
+        let miss = ray.intersect(
+            [0.0; 3],
+            [2.0, 5.0, -1.0],
+            [2.0, 7.0, -1.0],
+            [2.0, 6.0, 1.0],
+        );
+        assert!(miss.is_none());
+    }
+
+    /// The unit cube of the grid oracle, with its six quads.
+    fn cube_emitter() -> FaceEmitter {
+        let positions = vec![
+            [-1.0, -1.0, -1.0],
+            [1.0, -1.0, -1.0],
+            [1.0, 1.0, -1.0],
+            [-1.0, 1.0, -1.0],
+            [-1.0, -1.0, 1.0],
+            [1.0, -1.0, 1.0],
+            [1.0, 1.0, 1.0],
+            [-1.0, 1.0, 1.0],
+        ];
+        let quads = [
+            [0, 3, 2, 1],
+            [4, 5, 6, 7],
+            [0, 1, 5, 4],
+            [1, 2, 6, 5],
+            [2, 3, 7, 6],
+            [3, 0, 4, 7],
+        ];
+        FaceEmitter {
+            tessfaces: quads
+                .iter()
+                .map(|&vertices| Tessface {
+                    vertices,
+                    quad: true,
+                    smooth: false,
+                })
+                .collect(),
+            positions,
+            normals: vec![[0.0; 3]; 8],
+        }
+    }
+
+    fn grid(resolution: usize, volume: bool) -> GridSettings {
+        GridSettings {
+            volume,
+            resolution,
+            random: 0.0,
+            hexagonal: false,
+            invert: false,
+            seed: 3,
+        }
+    }
+
+    #[test]
+    fn grid_keeps_the_cells_that_blenders_grid_keeps() {
+        // Counts from Blender 5.2.2 on this cube: FACE at resolution 4 keeps 56 cells, inverting
+        // them keeps 8, and VOLUME at resolution 5 keeps all 125.
+        let emitter = cube_emitter();
+        let kept =
+            |settings: GridSettings| distribute_grid(&emitter, settings).iter().flatten().count();
+        assert_eq!(kept(grid(4, false)), 56);
+        assert_eq!(
+            kept(GridSettings {
+                invert: true,
+                ..grid(4, false)
+            }),
+            8
+        );
+        assert_eq!(kept(grid(5, true)), 125);
     }
 }

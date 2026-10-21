@@ -407,6 +407,21 @@ fn simulate_with_lifecycle(
             "volume particle emission requires a closed mesh with faces",
         ));
     }
+    let emitter_distribution = if from_vertex {
+        EmitterDistribution::Jitter
+    } else {
+        parse_emitter_distribution(settings, is_hair)?
+    };
+    // A grid holds `grid_resolution` cubed particles in place of the count (`psys_resize` and
+    // `tot_particles` in `particle_system.cc`), so the schedule and the birth indices use that total.
+    let grid_resolution = if emitter_distribution == EmitterDistribution::Grid {
+        Some(grid_resolution_setting(settings)?)
+    } else {
+        None
+    };
+    let count = grid_resolution.map_or(count, |resolution| {
+        (resolution * resolution * resolution) as f64
+    });
 
     let seed = settings
         .get("seed")
@@ -440,7 +455,9 @@ fn simulate_with_lifecycle(
     // Texture influences that move births or remove particles act on every particle in order: Blender
     // removes unexisting particles and renumbers the rest, so the schedule shortcuts do not apply.
     let time_mapped = !is_hair && maps_time(textures);
-    let all_events = time_mapped || maps_density(textures);
+    // Grid cells that `distribute_grid` removes leave no particle, so the survivors renumber as they do
+    // for density, and the schedule visits every particle.
+    let all_events = time_mapped || maps_density(textures) || grid_resolution.is_some();
     let emitted = if all_events {
         count.floor() as u64
     } else {
@@ -648,7 +665,14 @@ fn simulate_with_lifecycle(
     let face_samples = if from_vertex {
         Vec::new()
     } else {
-        face_emitter_samples(mesh, settings, count, system_seed, from_volume)?
+        face_emitter_samples(
+            mesh,
+            settings,
+            count,
+            system_seed,
+            from_volume,
+            emitter_distribution,
+        )?
     };
     // Index of the next particle that exists; Blender renumbers particles after removing the others.
     let mut survivors: u32 = 0;
@@ -680,7 +704,7 @@ fn simulate_with_lifecycle(
                 // Blender emits nothing when no element has weight, so a missing sample skips the particle.
                 let Some(sample) = usize::try_from(event)
                     .ok()
-                    .and_then(|particle| face_samples.get(particle))
+                    .and_then(|particle| face_samples.get(particle).copied().flatten())
                 else {
                     continue;
                 };
@@ -689,8 +713,12 @@ fn simulate_with_lifecycle(
             let normal = normal_transform
                 .transform_vector3(local_normal)
                 .normalize_or_zero();
+            // Blender's grid normal stays zero, so a grid birth adds no normal velocity; other emitters
+            // without a normal point along +Z.
             let direction = if normal.length_squared() > 0.0 {
                 normal
+            } else if grid_resolution.is_some() {
+                DVec3::ZERO
             } else {
                 DVec3::Z
             };
@@ -1180,35 +1208,93 @@ fn prepare_geometry(mesh: &Mesh) -> Result<(Vec<Triangle>, Vec<DVec3>)> {
     Ok((triangles, vertex_normals))
 }
 
+/// The distribution of a face or volume emitter (`ParticleSettings.distribution`). Hair has no grid,
+/// so Blender sets a hair grid to JIT (`particle_system.cc`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EmitterDistribution {
+    Jitter,
+    Random,
+    Grid,
+}
+
+fn parse_emitter_distribution(settings: &Value, is_hair: bool) -> Result<EmitterDistribution> {
+    let distribution = match settings
+        .get("distribution")
+        .and_then(Value::as_str)
+        .unwrap_or("JIT")
+    {
+        "JIT" => EmitterDistribution::Jitter,
+        "RAND" => EmitterDistribution::Random,
+        "GRID" => EmitterDistribution::Grid,
+        _ => return Err(invalid("particle distribution must be JIT, RAND, or GRID")),
+    };
+    if is_hair && distribution == EmitterDistribution::Grid {
+        return Ok(EmitterDistribution::Jitter);
+    }
+    Ok(distribution)
+}
+
+/// `grid_resolution` (`ParticleSettings.grid_resolution`): cells along each axis, within Blender's
+/// range of 1 to 250. The grid's particle count is its cube, which the one-million limit bounds.
+fn grid_resolution_setting(settings: &Value) -> Result<usize> {
+    let resolution = setting_alias_number(settings, &["grid_resolution"], 10.0)?;
+    if resolution.fract() != 0.0 || !(1.0..=250.0).contains(&resolution) {
+        return Err(invalid(
+            "particle grid resolution must be an integer from 1 to 250",
+        ));
+    }
+    Ok(resolution as usize)
+}
+
 /// Blender's `distribute_particles` for `PART_FROM_FACE` and `PART_FROM_VOLUME`: the birth sample of
-/// each of the `count` particles, from the emitter's distribution settings.
+/// each particle, or none where a grid cell is removed or no element can take a particle.
 fn face_emitter_samples(
     mesh: &Mesh,
     settings: &Value,
     count: f64,
     system_seed: u32,
     volume: bool,
-) -> Result<Vec<particle_distribution::FaceSample>> {
+    distribution: EmitterDistribution,
+) -> Result<Vec<Option<particle_distribution::FaceSample>>> {
     if count > MAX_PARTICLES as f64 {
         return Err(limit(
             "particle emission count exceeds the one-million particle limit",
         ));
     }
-    let jitter = match settings
-        .get("distribution")
-        .and_then(Value::as_str)
-        .unwrap_or("JIT")
-    {
-        "JIT" => true,
-        "RAND" => false,
-        "GRID" => {
-            return Err(unsupported(
-                "physics.particle_emitter.distribution_grid",
-                "Blender's grid distribution is not implemented; use JIT or RAND",
+    let emitter = particle_distribution::FaceEmitter::new(mesh)?;
+    if distribution == EmitterDistribution::Grid {
+        let resolution = grid_resolution_setting(settings)?;
+        // `distribute_grid` tests each cell row against every face: three rays for a face, one for a
+        // volume.
+        let rays: usize = if volume { 1 } else { 3 };
+        let work = rays
+            .checked_mul(resolution * resolution)
+            .and_then(|work| work.checked_mul(emitter.element_count()));
+        if work.is_none_or(|work| work > MAX_SIMULATION_WORK) {
+            return Err(limit(
+                "particle grid emission exceeds the 50-million work limit",
             ));
         }
-        _ => return Err(invalid("particle distribution must be JIT, RAND, or GRID")),
-    };
+        let random = setting_alias_number(settings, &["grid_random"], 0.0)?;
+        if !(0.0..=1.0).contains(&random) {
+            return Err(invalid("particle grid randomness must be from 0 to 1"));
+        }
+        let grid = particle_distribution::GridSettings {
+            volume,
+            resolution,
+            random: random as f32,
+            hexagonal: settings
+                .get("hexagonal_grid")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            invert: settings
+                .get("invert_grid")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            seed: system_seed,
+        };
+        return Ok(particle_distribution::distribute_grid(&emitter, grid));
+    }
     let user_jitter = setting_alias_number(settings, &["userjit"], 0.0)?;
     if user_jitter.fract() != 0.0 || !(0.0..=1000.0).contains(&user_jitter) {
         return Err(invalid(
@@ -1219,7 +1305,6 @@ fn face_emitter_samples(
     if !(0.0..=2.0).contains(&jitter_factor) {
         return Err(invalid("particle jitter factor must be from 0 to 2"));
     }
-    let emitter = particle_distribution::FaceEmitter::new(mesh)?;
     let count = count as usize;
     if volume
         && count
@@ -1230,9 +1315,9 @@ fn face_emitter_samples(
             "particle volume emission exceeds the 50-million work limit",
         ));
     }
-    let distribution = particle_distribution::FaceSettings {
+    let settings_for_distribution = particle_distribution::FaceSettings {
         volume,
-        jitter,
+        jitter: distribution == EmitterDistribution::Jitter,
         even: settings
             .get("use_even_distribution")
             .and_then(Value::as_bool)
@@ -1248,7 +1333,7 @@ fn face_emitter_samples(
     };
     Ok(particle_distribution::distribute_faces(
         &emitter,
-        distribution,
+        settings_for_distribution,
     ))
 }
 
