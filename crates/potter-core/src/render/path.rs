@@ -1930,7 +1930,7 @@ fn write_center_passes(
             output.normals[index] = surface.normal.to_array().map(finite_f32);
             output.ambient_occlusion[index] = finite_f32(super::raster::ambient_visibility(
                 bvh,
-                &geometry.triangles,
+                geometry.triangles,
                 surface.point,
                 surface.geometric_normal,
                 surface.normal,
@@ -2073,7 +2073,7 @@ fn closest_hit(
     t_min: f64,
     t_max: f64,
 ) -> Option<BvhHit> {
-    bvh.closest_hit_two_sided(&geometry.triangles, origin, direction, t_min, t_max)
+    bvh.closest_hit_two_sided(geometry.triangles, origin, direction, t_min, t_max)
 }
 
 /// The shading parameters at one hit, for the transparent pass of a realtime shadow ray (`render/scene.rs`). They
@@ -2177,7 +2177,7 @@ fn with_hit_frame<T>(
         }
     };
 
-    let object = object_for_index(&geometry.objects, triangle.object_index).ok_or_else(|| {
+    let object = object_for_index(geometry.objects, triangle.object_index).ok_or_else(|| {
         PotError::new(
             ErrorCode::EvaluationFailed,
             "triangle references an unmapped object",
@@ -2754,7 +2754,7 @@ fn shadow_transmittance(
         f64::INFINITY
     };
     let (origin, remaining) = bvh.walk_hits(
-        &geometry.triangles,
+        geometry.triangles,
         offset_origin(point, direction, normal),
         direction,
         RAY_EPSILON,
@@ -3401,7 +3401,7 @@ fn random_walk_exit(
     };
     let mut draw = || rng.next_f64();
     walk(
-        &geometry.triangles,
+        geometry.triangles,
         bvh,
         surface.object_index,
         &entry,
@@ -3479,7 +3479,7 @@ fn burley_exit(
     // with a generator seeded from the path's random numbers (`lcg_state_init` in `subsurface_disk`).
     let mut probe = ProbeHits::new(rng.next_u32());
     bvh.walk_hits(
-        &geometry.triangles,
+        geometry.triangles,
         origin,
         direction,
         RAY_EPSILON,
@@ -4039,7 +4039,7 @@ fn camera_media(
     let mut inside: Vec<MeshMedium> = Vec::new();
     let mut failure = None;
     bvh.walk_hits(
-        &geometry.triangles,
+        geometry.triangles,
         origin,
         probe,
         RAY_EPSILON,
