@@ -343,16 +343,16 @@ mod tests {
     fn parameter_validation_reports_required_values_and_escaped_unknown_names() {
         let required_error = validate_params(
             ParameterFamily::Modifier,
-            "mesh_cache",
+            "mesh_sequence_cache",
             &Map::new(),
             "/modifiers",
         )
         .unwrap_err();
-        assert_eq!(required_error.pointer, "/modifiers/resource");
+        assert_eq!(required_error.pointer, "/modifiers/object_path");
         assert!(
             required_error
                 .message
-                .contains("requires parameter `resource`")
+                .contains("requires parameter `object_path`")
         );
 
         let mut parameters = Map::new();

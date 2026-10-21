@@ -5667,8 +5667,7 @@ def _cache_file_for_resource(doc, reference, target, params=None):
         if resource and resource.get("kind") == "alembic_cache"
         else None
     )
-    sequence_settings = tuple(params.get(key) for key in SEQUENCE_CACHE_FILE_KEYS)
-    cache_key = (os.path.realpath(filepath), identity, sequence_settings)
+    cache_key = (os.path.realpath(filepath), identity)
     cached = CACHE_FILES_BY_IDENTITY.get(cache_key)
     if cached is not None:
         return cached

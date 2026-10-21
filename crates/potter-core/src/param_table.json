@@ -503,7 +503,6 @@
         }
       },
       "required": [
-        "resource",
         "object_path"
       ]
     },

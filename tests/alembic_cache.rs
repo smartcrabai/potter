@@ -2049,10 +2049,7 @@ fn mesh_sequence_cache_and_resource_schema_describe_parameters() -> Result<(), B
         .and_then(|then| then.get("properties"))
         .and_then(|properties| properties.get("params"))
         .ok_or("modifier schema is missing conditional cache parameters")?;
-    assert_eq!(
-        cache_params.get("required"),
-        Some(&json!(["resource", "object_path"]))
-    );
+    assert_eq!(cache_params.get("required"), Some(&json!(["object_path"])));
     assert_eq!(
         cache_params
             .get("properties")
