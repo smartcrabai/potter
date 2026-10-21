@@ -2,7 +2,7 @@
 //!
 //! A thin-line checker on a white floor is rendered by Blender with each filter, 32 seeds of 256
 //! samples per pixel. The same `.blend` (with `pixel_filter_type` and `filter_width` set, so the
-//! import path is exercised too) is rendered by Potter at 1024 samples per pixel.
+//! import path is exercised too) is rendered by Potter at 256 samples per pixel.
 //!
 //! The per-pixel values differ between filters, while the frame mean barely does, so the check is
 //! per pixel. Potter's image is fitted as `own + alpha * (alternative - own)`, where `own` is
@@ -13,9 +13,10 @@
 //! The standard error of `alpha` is computed from the measured noise of both images:
 //! `sqrt(sum (sigma_p^2 + sigma_b^2) d^2) / sum d^2`, where `d` is the difference of the two
 //! references, `sigma_b` is Blender's per-pixel standard error, and `sigma_p` is Potter's
-//! per-pixel noise, scaled from Blender's measured per-seed deviation to 1024 samples. At these
-//! settings the standard error is 0.01 to 0.03, so the threshold 0.5 is 15 to 40 standard errors
-//! from either hypothesis. The threshold is not loosened to pass.
+//! per-pixel noise, scaled from Blender's measured per-seed deviation to 256 samples. At these
+//! settings the standard error is 0.02 to 0.06 (1024 samples gave 0.01 to 0.03; it scales with the
+//! inverse square root of the sample count), so the threshold 0.5 is about 9 or more standard errors from
+//! either hypothesis. The threshold is not loosened to pass.
 //!
 //! Alternatives: the Potter box filter (what Potter did before this filter existed) is an
 //! alternative for both kinds; the Blackman-Harris filter is one for the Gaussian.
@@ -48,8 +49,9 @@ const RESOLUTION: u32 = 32;
 const BLENDER_SEEDS: u32 = 32;
 /// Blender samples per pixel per seed (`pixel_filter.py` `SAMPLES`).
 const BLENDER_SAMPLES: f64 = 256.0;
-/// Potter samples per pixel. Potter's noise is scaled from Blender's to this count.
-const POTTER_SAMPLES: u32 = 1024;
+/// Potter samples per pixel. Potter's noise is scaled from Blender's to this count. 1024 would
+/// take about 100 s per Potter render in a debug build, past the per-test budget.
+const POTTER_SAMPLES: u32 = 256;
 /// The threshold on `alpha`: the midpoint between the correct filter (0) and an alternative (1).
 const ALPHA_LIMIT: f64 = 0.5;
 /// A sanity bound: the standard error must leave the threshold far from either hypothesis.
@@ -72,7 +74,7 @@ fn read_scene(project: &Path) -> TestResult<Value> {
 }
 
 /// Applies `operations` to `project` atomically, against the project's current revision.
-fn apply(project: &Path, root: &Path, operations: Value) -> TestResult<Value> {
+fn apply(project: &Path, root: &Path, operations: &Value) -> TestResult<Value> {
     let revision = read_scene(project)?["revision"]
         .as_u64()
         .ok_or("scene revision is missing")?;
@@ -202,7 +204,7 @@ fn potter_pixels(blender: &Path, root: &Path, blend: &Path) -> TestResult<Vec<f6
     let applied = apply(
         &project,
         root,
-        json!([
+        &json!([
             {"op": "render.update", "target": {"id": active}, "set": {"resolution_x": RESOLUTION, "resolution_y": RESOLUTION, "samples": POTTER_SAMPLES, "seed": 0, "max_bounces": 4}}
         ]),
     )?;
@@ -220,7 +222,7 @@ fn potter_pixels(blender: &Path, root: &Path, blend: &Path) -> TestResult<Vec<f6
     let loaded = apply(
         &project,
         root,
-        json!([{"op": "image.load", "id": "render", "path": frames.join("frame_0001.exr").to_string_lossy()}]),
+        &json!([{"op": "image.load", "id": "render", "path": frames.join("frame_0001.exr").to_string_lossy()}]),
     )?;
     assert_eq!(loaded["ok"], true, "{loaded}");
 
@@ -314,7 +316,7 @@ fn pixel_filter_settings_round_trip_through_blend() -> TestResult {
     let applied = apply(
         &project,
         root.path(),
-        json!([
+        &json!([
             {"op": "render.update", "target": {"id": active}, "set": {"pixel_filter_type": "GAUSSIAN", "filter_width": 2.5}}
         ]),
     )?;

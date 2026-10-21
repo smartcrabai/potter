@@ -8568,9 +8568,14 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
         .flatten()
     {
         let render = &scene["render"];
-        if render["engine_native"].as_str() != Some("CYCLES")
-            && render["filter_size"].as_f64() != Some(1.5)
-        {
+        // A bridge export always writes both keys; a file without them has no EEVEE filter to report.
+        let (Some(engine), Some(filter_size)) = (
+            render["engine_native"].as_str(),
+            render["filter_size"].as_f64(),
+        ) else {
+            continue;
+        };
+        if engine != "CYCLES" && !crate::float::equal_f64(filter_size, 1.5) {
             losses.push(loss(
                 "blender.render.filter_size",
                 scene.get("name").and_then(Value::as_str),

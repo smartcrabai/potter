@@ -1250,7 +1250,8 @@ impl RenderSettings {
                 "Cycles adaptive dicing settings are outside Blender RNA ranges",
             ));
         }
-        if !(0.01..=10.0).contains(&self.filter_width) {
+        // Blender stores `filter_width` as float32, so its RNA bound 0.01 is `0.01_f32` widened here.
+        if !(f64::from(0.01_f32)..=f64::from(10.0_f32)).contains(&self.filter_width) {
             return Err(PotError::new(
                 ErrorCode::SceneInvalid,
                 "Cycles filter_width is outside Blender RNA range 0.01..=10",

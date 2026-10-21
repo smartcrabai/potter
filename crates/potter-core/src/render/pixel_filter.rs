@@ -131,8 +131,8 @@ fn invert_symmetric_cdf(cdf: &[f64], range: f64) -> Vec<f64> {
             0.0
         };
         let y = ((index as f64 + t) / (TABLE_SIZE - 1) as f64) * (2.0 * range);
-        inverse[half_size + i] = 0.5 * (1.0 + y);
-        inverse[half_size - i] = 0.5 * (1.0 - y);
+        inverse[half_size + i] = f64::midpoint(1.0, y);
+        inverse[half_size - i] = f64::midpoint(1.0, -y);
     }
     inverse
 }
