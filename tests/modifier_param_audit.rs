@@ -396,17 +396,116 @@ fn scenario_geometry<'a>(results: &'a BTreeMap<String, Value>, id: &str, state: 
         .expect("Blender scenario result is missing")
 }
 
-/// Compares evaluated geometry by canonical signature. On mismatch the message carries both
-/// sides' positions and faces in storage order, so the per-vertex difference shows in CI.
+/// Largest per-coordinate distance accepted between Potter (f64) and Blender (f32) positions.
+/// Measured on the particle audit: the largest Potter-Blender difference is 4.2e-7 (amount_half),
+/// so 1e-5 leaves a 24x margin. Rounding positions to a fixed decimal instead split values that
+/// sit on a rounding boundary (0.3072950 vs 0.3072949), which made equal geometry compare unequal.
+const GEOMETRY_TOLERANCE: f64 = 1.0e-5;
+
+/// Compares evaluated geometry with Potter and Blender's float precision: vertices match by
+/// position within `GEOMETRY_TOLERANCE` (each used once), and faces compare as vertex sets under
+/// that matching, so storage order is ignored. Returns `None` when they match, otherwise a dump of
+/// both sides in storage order for the CI log.
+fn geometry_mismatch(potter: &Value, blender: &Value) -> Option<String> {
+    let counts = |geometry: &Value| {
+        ["vertex_count", "edge_count", "face_count"].map(|key| geometry[key].as_u64())
+    };
+    let points = |geometry: &Value| -> Vec<[f64; 3]> {
+        geometry["positions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|point| {
+                let c = point.as_array().unwrap();
+                [
+                    c[0].as_f64().unwrap(),
+                    c[1].as_f64().unwrap(),
+                    c[2].as_f64().unwrap(),
+                ]
+            })
+            .collect()
+    };
+    let faces = |geometry: &Value| -> Vec<Vec<usize>> {
+        geometry["faces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|face| {
+                face.as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|index| index.as_u64().unwrap() as usize)
+                    .collect()
+            })
+            .collect()
+    };
+    let potter_points = points(potter);
+    let blender_points = points(blender);
+    let mut matches =
+        counts(potter) == counts(blender) && potter_points.len() == blender_points.len();
+    let mut matched = vec![None; potter_points.len()];
+    if matches {
+        let mut used = vec![false; blender_points.len()];
+        for (index, point) in potter_points.iter().enumerate() {
+            let found = blender_points
+                .iter()
+                .enumerate()
+                .find(|(other, candidate)| {
+                    !used[*other]
+                        && (0..3)
+                            .all(|axis| (point[axis] - candidate[axis]).abs() <= GEOMETRY_TOLERANCE)
+                });
+            match found {
+                Some((other, _)) => {
+                    used[other] = true;
+                    matched[index] = Some(other);
+                }
+                None => {
+                    matches = false;
+                    break;
+                }
+            }
+        }
+    }
+    if matches {
+        let mut mapped: Vec<Vec<usize>> = faces(potter)
+            .iter()
+            .map(|face| {
+                let mut vertices: Vec<usize> = face
+                    .iter()
+                    .map(|&index| matched[index].expect("face vertex is out of range"))
+                    .collect();
+                vertices.sort_unstable();
+                vertices
+            })
+            .collect();
+        let mut expected: Vec<Vec<usize>> = faces(blender)
+            .into_iter()
+            .map(|mut vertices| {
+                vertices.sort_unstable();
+                vertices
+            })
+            .collect();
+        mapped.sort();
+        expected.sort();
+        matches = mapped == expected;
+    }
+    (!matches).then(|| {
+        format!(
+            "Potter: {}\nBlender: {}",
+            geometry_dump(potter),
+            geometry_dump(blender)
+        )
+    })
+}
+
+/// Fails with both sides' geometry when Potter's evaluated geometry differs from Blender's.
 fn assert_scenario_matches(id: &str, potter: &Value, blender: &Value) {
-    let potter_signature = geometry_signature(potter);
-    let blender_signature = geometry_signature(blender);
-    assert_eq!(
-        potter_signature,
-        blender_signature,
-        "{id}: Potter differs from Blender\nPotter: {}\nBlender: {}",
-        geometry_dump(potter),
-        geometry_dump(blender)
+    let mismatch = geometry_mismatch(potter, blender);
+    assert!(
+        mismatch.is_none(),
+        "{id}: Potter differs from Blender\n{}",
+        mismatch.unwrap_or_default()
     );
 }
 
@@ -472,11 +571,7 @@ fn f_modifier_parameter_scenarios_match_blender() {
                     geometry_signature(&potter_case),
                     "{id}: expected Potter no-op"
                 );
-                assert_eq!(
-                    geometry_signature(&potter_baseline),
-                    geometry_signature(blender_baseline),
-                    "{id}: no-op baseline differs"
-                );
+                assert_scenario_matches(id, &potter_baseline, blender_baseline);
             }
             expectation => panic!("{id}: unknown scenario expectation {expectation}"),
         }
@@ -532,11 +627,7 @@ fn modifier_parameter_scenarios_match_blender_or_record_real_gaps() {
                     geometry_signature(&potter_case),
                     "{id}: expected Potter no-op"
                 );
-                assert_eq!(
-                    geometry_signature(&potter_baseline),
-                    geometry_signature(blender_baseline),
-                    "{id}: no-op baseline differs"
-                );
+                assert_scenario_matches(id, &potter_baseline, blender_baseline);
             }
             "known_gap" => {
                 let owner = scenario["owner"]
@@ -551,9 +642,8 @@ fn modifier_parameter_scenarios_match_blender_or_record_real_gaps() {
                     geometry_signature(blender_case),
                     "{id}: the tested Blender parameter is inactive"
                 );
-                assert_ne!(
-                    geometry_signature(&potter_case),
-                    geometry_signature(blender_case),
+                assert!(
+                    geometry_mismatch(&potter_case, blender_case).is_some(),
                     "{id}: recorded parity gap has been fixed; update the scenario inventory"
                 );
                 assert_eq!(
