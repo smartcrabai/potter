@@ -300,6 +300,14 @@ pub(crate) fn probe_radiance(radiance: DVec3) -> DVec3 {
     )
 }
 
+/// The irradiance a light probe stores for diffuse light: EEVEE's spherical-harmonic irradiance of a uniform world
+/// reads `1 - 2^-17` of the radiance before capture (a float32 round trip), so the captured value is truncated just
+/// below the radiance. Measured on Blender 5.2.2: a world of 1 reads 0.9921875 (blue 0.984375) in a white diffuse, 0.5
+/// reads 0.4960938, 0.25 reads 0.2480469 and 0.75 reads 0.7421875. A world of 0.6 reads 0.59375, as the glossy does.
+pub(crate) fn irradiance_probe_radiance(radiance: DVec3) -> DVec3 {
+    probe_radiance(radiance * (1.0 - 1.0 / 131_072.0))
+}
+
 /// One channel of a `UFLOAT` with `mantissa_bits` mantissa bits, a 5-bit exponent (bias 15) and truncation.
 fn truncate_ufloat(value: f64, mantissa_bits: i32) -> f64 {
     if value.is_nan() || value <= 0.0 {
@@ -498,6 +506,33 @@ mod tests {
                     "IOR 0.8 glass sums to {channel}, expected about one"
                 ));
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn diffuse_irradiance_capture_matches_blender_measurements() -> Result<(), String> {
+        // Blender 5.2.2 white diffuse under a uniform world: 1 -> (0.9921875, 0.9921875, 0.984375), 0.5 -> 0.4960938
+        // in red and green, 0.25 -> 0.2480469, 0.75 -> 0.7421875; the glossy read of 0.6 is 0.59375.
+        let one = irradiance_probe_radiance(DVec3::ONE);
+        if (one.x - 0.992_187_5).abs() > 1.0e-12 || (one.z - 0.984_375).abs() > 1.0e-12 {
+            return Err(format!("a unit world reads {one:?} in the diffuse"));
+        }
+        let half = irradiance_probe_radiance(DVec3::splat(0.5));
+        if (half.x - 0.496_093_75).abs() > 1.0e-12 {
+            return Err(format!("a 0.5 world reads {half:?} in the diffuse"));
+        }
+        let quarter = irradiance_probe_radiance(DVec3::splat(0.25)).x;
+        let three_quarters = irradiance_probe_radiance(DVec3::splat(0.75)).x;
+        if (quarter - 0.248_046_875).abs() > 1.0e-12
+            || (three_quarters - 0.742_187_5).abs() > 1.0e-12
+        {
+            return Err(format!(
+                "quarter and three-quarter worlds read {quarter} and {three_quarters}"
+            ));
+        }
+        if (probe_radiance(DVec3::splat(0.6)).x - 0.59375).abs() > 1.0e-12 {
+            return Err("the glossy read of 0.6 is not 0.59375".to_owned());
         }
         Ok(())
     }

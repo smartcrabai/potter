@@ -26,10 +26,12 @@ use crate::{
 
 use super::{
     bvh::{Bvh, BvhHit},
-    eevee_transmission::{self, GlassClosures, Thickness, probe_radiance},
+    eevee_transmission::{
+        self, GlassClosures, Thickness, irradiance_probe_radiance, probe_radiance,
+    },
     light_model::{
-        area_irradiance_per_radiance, area_radiance, area_shape, area_visibility_samples,
-        point_intensity, spot_attenuation,
+        AreaShape, area_irradiance_per_radiance, area_radiance, area_shape,
+        area_visibility_samples, point_intensity, spot_attenuation,
     },
     path::{hit_params, object_for_index},
     principled_bsdf::{
@@ -2239,7 +2241,14 @@ fn shade(
         .and_then(|value| value.world.as_ref())
         .and_then(|id| doc.worlds.get(id))
     {
-        let diffuse_environment = prefiltered_world(world, &doc.node_groups, images, normal, 1.0)?;
+        let diffuse_environment = prefiltered_with(
+            world,
+            &doc.node_groups,
+            images,
+            normal,
+            1.0,
+            irradiance_probe_radiance,
+        )?;
         let metallic = params.metallic.clamp(0.0, 1.0);
         let roughness = params.roughness.clamp(0.0, 1.0);
         // The dielectric layer and the diffuse base share what the transmission closures leave (EEVEE's `weight`).
@@ -2249,7 +2258,7 @@ fn shade(
         result += albedo * diffuse_environment * dielectric * lower;
         let reflection = (-view + normal * (2.0 * normal.dot(view))).normalize_or_zero();
         let specular_environment =
-            prefiltered_world(world, &doc.node_groups, images, reflection, roughness)?;
+            prefiltered_probe(world, &doc.node_groups, images, reflection, roughness)?;
         let specular_f0 = dielectric_f0(params.ior, params.specular_ior_level);
         let f0 = albedo * metallic + DVec3::splat(specular_f0 * dielectric);
         result += specular_environment * f0 * (1.0 - roughness).powi(2) * lower;
@@ -2330,18 +2339,9 @@ fn glass_environment(
     Ok(reflected * closures.reflection + transmitted * closures.transmission)
 }
 
-fn prefiltered_world(
-    world: &crate::model::World,
-    groups: &crate::model::Registry<crate::graph::NodeGroup>,
-    images: &BTreeMap<String, ImageData>,
-    axis: DVec3,
-    roughness: f64,
-) -> Result<DVec3> {
-    prefiltered_with(world, groups, images, axis, roughness, |radiance| radiance)
-}
-
-/// [`prefiltered_world`] over the radiance a light probe stores: each sample is `stored` before the blur, as the
-/// probe's capture format truncates it (`eevee_transmission::probe_radiance`).
+/// The world blurred over the directions of a light probe: each sample is `stored` (the capture format of the probe
+/// it is read from) before the blur. A diffuse read stores irradiance and a glossy or glass read stores radiance
+/// (`eevee_transmission`).
 fn prefiltered_probe(
     world: &crate::model::World,
     groups: &crate::model::Registry<crate::graph::NodeGroup>,
@@ -2466,43 +2466,89 @@ fn light_contribution(
                 return DVec3::ZERO;
             }
             let light_direction = matrix.transform_vector3(-DVec3::Z).normalize_or_zero();
-            let irradiance =
-                area_irradiance_per_radiance(&shape, position, light_direction, point, normal)
-                    * area_radiance(energy, shape.area);
-            if irradiance <= 0.0 {
-                return DVec3::ZERO;
-            }
-            let (samples, count) =
-                area_visibility_samples(&shape, position, light_direction, point, normal);
-            let mut total_weight = 0.0;
-            let mut visible_weight = 0.0;
-            for sample in &samples[..count] {
-                total_weight += sample.weight;
-                let visibility = visibility_for_light(
-                    shadow,
-                    point_shadow,
-                    shadow_point,
-                    geometric,
-                    sample.direction,
-                    sample.distance,
-                );
-                visible_weight += sample.weight * visibility;
-            }
-            if total_weight <= 0.0 || visible_weight <= 0.0 {
-                return DVec3::ZERO;
-            }
-            // Integrated Lambert irradiance is exact for rectangles and the visibility weight
-            // scales it. The specular, sheen, coat and glass lobes are evaluated towards the emitter centre.
+            let radiance = area_radiance(energy, shape.area);
+            // The lit hemisphere is the receiver's normal side; the transmitted share is the reverse side, where the
+            // emitter's outline clips the same way (`area_irradiance_per_radiance` and `area_visibility_samples`).
+            let front = area_side_weight(
+                shadow,
+                point_shadow,
+                shadow_point,
+                geometric,
+                &shape,
+                position,
+                light_direction,
+                point,
+                normal,
+            ) * radiance;
+            let back = area_side_weight(
+                shadow,
+                point_shadow,
+                shadow_point,
+                -geometric,
+                &shape,
+                position,
+                light_direction,
+                point,
+                -normal,
+            ) * radiance;
+            // Integrated Lambert irradiance is exact for rectangles, and the visibility weight scales it. The specular,
+            // sheen and coat lobes are evaluated towards the emitter centre on the lit side.
             let toward_centre = (position - point).normalize_or_zero();
-            (diffuse_coefficient(params, shading)
+            let reflective = (diffuse_coefficient(params, shading)
                 + specular_coefficient(params, shading, toward_centre)
                 + sheen_coefficient(params, shading, toward_centre)
-                + coat_coefficient(params, shading, toward_centre)
-                + glass_coefficient(params, shading, toward_centre))
-                * color
-                * (irradiance * visible_weight / total_weight)
+                + coat_coefficient(params, shading, toward_centre))
+                * front;
+            // The glass lobe takes both sides, so it is weighted by the side the emitter's centre is on: its reflection
+            // with the lit side, its transmission with the reverse side. This is the single-event glass lobe, not EEVEE's
+            // two-event LTC transmission light.
+            let glass_side = if normal.dot(toward_centre) > 0.0 {
+                front
+            } else {
+                back
+            };
+            (reflective + glass_coefficient(params, shading, toward_centre) * glass_side) * color
         }
     }
+}
+
+/// The weight of an area light over the hemisphere on `side` of a receiver: the Lambert irradiance of the emitter's
+/// outline clipped to that hemisphere, per unit radiance, times the share of its outline samples that reach the receiver.
+/// `geometric` is the geometric normal on the same side, which offsets the shadow rays to it.
+fn area_side_weight(
+    shadow: ShadowContext<'_>,
+    point_shadow: Option<&PointShadowMap>,
+    shadow_point: DVec3,
+    geometric: DVec3,
+    shape: &AreaShape,
+    position: DVec3,
+    light_direction: DVec3,
+    point: DVec3,
+    side: DVec3,
+) -> f64 {
+    let irradiance = area_irradiance_per_radiance(shape, position, light_direction, point, side);
+    if irradiance <= 0.0 {
+        return 0.0;
+    }
+    let (samples, count) = area_visibility_samples(shape, position, light_direction, point, side);
+    let mut total_weight = 0.0;
+    let mut visible_weight = 0.0;
+    for sample in &samples[..count] {
+        total_weight += sample.weight;
+        let visibility = visibility_for_light(
+            shadow,
+            point_shadow,
+            shadow_point,
+            geometric,
+            sample.direction,
+            sample.distance,
+        );
+        visible_weight += sample.weight * visibility;
+    }
+    if total_weight <= 0.0 || visible_weight <= 0.0 {
+        return 0.0;
+    }
+    irradiance * visible_weight / total_weight
 }
 
 fn visibility_for_light(
