@@ -667,6 +667,63 @@ pub(crate) fn smooth_face_flags(mesh: &Mesh) -> Result<Vec<bool>> {
         .collect()
 }
 
+/// Field of the `shade_smooth` attribute that records Blender's `sharp_face` attribute as present.
+/// `use_smooth` on every face keeps that attribute (all false); `shade_smooth()` removes it. Shrinkwrap
+/// reads the difference, so the importer, the operator and the exporter keep the field in step.
+pub(crate) const SHARP_FACE_PRESENT: &str = "sharp_face_present";
+
+/// Blender's `sharp_face` lookup for the normal domain and the Shrinkwrap projection: `None` when the
+/// attribute is absent (every face smooth), otherwise one flag per face in `mesh.faces` order, `true`
+/// when sharp. With a flat face the attribute exists, so it is derived from `shade_smooth`; with every
+/// face smooth, its presence is the recorded `SHARP_FACE_PRESENT` field.
+pub(crate) fn sharp_face_flags(mesh: &Mesh) -> Result<Option<Vec<bool>>> {
+    let smooth = smooth_face_flags(mesh)?;
+    if smooth.iter().all(|smooth| *smooth) {
+        let present =
+            attribute_values(mesh, "shade_smooth", "face", "bool")?.is_some_and(|fields| {
+                fields.get(SHARP_FACE_PRESENT).and_then(Value::as_bool) == Some(true)
+            });
+        return Ok(present.then(|| vec![false; smooth.len()]));
+    }
+    Ok(Some(smooth.iter().map(|smooth| !smooth).collect()))
+}
+
+/// Blender's `Mesh::normals_domain` (`mesh_normals.cc`): which elements carry the corner normals.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NormalDomain {
+    Point,
+    Face,
+    Corner,
+}
+
+/// Blender's `Mesh::normals_domain`: a custom normal layer wins; all sharp faces or all sharp edges give
+/// the Face domain; no sharp face and no sharp edge give Point; anything mixed is Corner.
+pub(crate) fn normals_domain(mesh: &Mesh) -> Result<NormalDomain> {
+    if mesh.faces.is_empty() {
+        return Ok(NormalDomain::Point);
+    }
+    if mesh.attributes.contains_key("custom_normal") {
+        return Ok(NormalDomain::Corner);
+    }
+    let faces = sharp_face_flags(mesh)?;
+    if faces
+        .as_ref()
+        .is_some_and(|flags| flags.iter().all(|flag| *flag))
+    {
+        return Ok(NormalDomain::Face);
+    }
+    let edges = sharp_edge_flags(mesh)?;
+    if !edges.is_empty() && edges.iter().all(|flag| *flag) {
+        return Ok(NormalDomain::Face);
+    }
+    let faces_smooth = faces.is_none_or(|flags| flags.iter().all(|flag| !flag));
+    if faces_smooth && edges.iter().all(|flag| !flag) {
+        Ok(NormalDomain::Point)
+    } else {
+        Ok(NormalDomain::Corner)
+    }
+}
+
 /// Per edge: the `sharp` flag, in `mesh.edges` order. A missing attribute is unsharp.
 pub(crate) fn sharp_edge_flags(mesh: &Mesh) -> Result<Vec<bool>> {
     let values = attribute_values(mesh, "sharp", "edge", "bool")?;

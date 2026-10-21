@@ -1654,6 +1654,7 @@ def mesh_dump(mesh):
     return {"name": mesh.name_full, "potter_id": mesh.get("potter.id"),
             "library": library_reference(mesh), "vertices": vertices,
             "edges": edges, "polygons": polygons, "uv_layers": uv_layers, "uv_active": uv_active,
+            "sharp_face_present": mesh.attributes.get("sharp_face") is not None,
             "uv_render": uv_render, "materials": _material_names(mesh), "attributes": attrs,
             "color_active": _color_attribute_name(mesh, color_attributes.active_color_index),
             "color_render": _color_attribute_name(mesh, color_attributes.render_color_index),
@@ -3836,6 +3837,13 @@ def _apply_native_shading(mesh, attributes, face_items, edge_items, edge_of):
     smooth = _native_values(attributes, "shade_smooth")
     for polygon, face in zip(mesh.polygons, face_items):
         polygon.use_smooth = bool(smooth.get("f%d" % face["id"], False))
+    # Setting `use_smooth` always leaves an all-false sharp_face attribute; shade_smooth() removes it, so
+    # without Potter's presence field an all-smooth mesh drops it.
+    shade = attributes.get("shade_smooth") or {}
+    if (not shade.get("sharp_face_present") and mesh.polygons
+            and all(polygon.use_smooth for polygon in mesh.polygons)
+            and mesh.attributes.get("sharp_face") is not None):
+        mesh.attributes.remove(mesh.attributes["sharp_face"])
     for field, key in (("use_edge_sharp", "sharp"), ("use_seam", "seam")):
         if attributes.get(key) is None:
             # Setting a flag creates Blender's sharp_edge / uv_seam attribute, so an absent layer stays absent.

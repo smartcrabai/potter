@@ -5411,6 +5411,14 @@ fn apply_shade(mesh: &mut Mesh, selected: &Selection, smooth: bool) -> Result<Id
     for id in &selected.ids {
         values.insert(format!("f{id}"), Value::Bool(smooth));
     }
+    // Blender's shade_smooth() removes `sharp_face` once every face is smooth; the presence field goes too.
+    let all_smooth = mesh
+        .faces
+        .iter()
+        .all(|face| values.get(&format!("f{}", face.id)) == Some(&Value::Bool(true)));
+    if smooth && all_smooth {
+        fields.remove(crate::geom::normals::SHARP_FACE_PRESENT);
+    }
     Ok(IdChanges::default())
 }
 

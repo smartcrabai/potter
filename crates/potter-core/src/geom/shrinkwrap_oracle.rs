@@ -1,231 +1,478 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Shrinkwrap differential oracle against Blender 5.2.2. `generate.py` runs Blender on
-//! `tests/fixtures/shrinkwrap-differential/corpus.json`, writes one `.blend` scene per case and
-//! Blender's evaluated result. Each imported scene is evaluated through Potter and compared with
-//! Blender: topology exactly, positions, corner normals, UVs, colors and vertex weights within the
-//! corpus tolerances. Skips without Blender 5.2.2; `POTTER_REQUIRE_BLENDER` turns the skip into a
-//! failure.
+//! Shrinkwrap differential oracle against Blender 5.2.2. `tests/fixtures/shrinkwrap-differential/corpus.json`
+//! holds each case's inputs and Blender's evaluated output; `generate.py` wrote both in one Blender run.
+//! Each case is built as a Potter scene straight from those inputs and evaluated. Topology must match
+//! exactly; positions, corner normals, UVs, colors and vertex weights must match within the corpus
+//! tolerances. The test starts no Blender process.
 
 use std::{
     collections::{BTreeMap, HashMap},
-    env, fs,
-    path::{Path, PathBuf},
-    process::Command,
+    error::Error,
 };
 
-use serde_json::{Value, json};
-use tempfile::tempdir;
+use glam::{DQuat, DVec3, EulerRot};
+use serde_json::{Map, Value, json};
 
-use super::{Mesh, corner_normal_vectors};
+use super::{
+    Mesh,
+    color_layers::{self, ColorDomain, ColorLayer, ColorStore},
+    corner_normal_vectors,
+    normals::SHARP_FACE_PRESENT,
+    uv_layers::{self, UvLayer, UvStore},
+};
 use crate::{
     eval::{EvaluationContext, Snapshot, mesh_vertex_weights},
-    exchange::blend::import_blend,
-    geom::{
-        color_layers::{self, ColorDomain},
-        uv_layers,
-    },
-    model::{Id, SceneDoc, VertexGroup},
+    model::{DataBlock, Id, Modifier, ModifierRuntime, Node, SceneDoc, Transform, VertexGroup},
 };
 
-#[path = "../../../../tests/common/blender_discovery.rs"]
-mod discovery;
-#[path = "../../../../tests/common/process.rs"]
-mod process;
+type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 const CORPUS: &str = include_str!("../../../../tests/fixtures/shrinkwrap-differential/corpus.json");
 const BLENDER_VERSION: &str = "5.2.2 LTS";
+const SCENE_ID: &str = "3d8b1c0e-9f7a-4b2d-8e61-5c4a2b1f0e9d";
+/// The subject object that carries the Shrinkwrap stack; every other corpus input is a target.
+const SUBJECT: &str = "source";
 
 #[test]
-fn shrinkwrap_matches_blender_522_differential_corpus() -> Result<(), Box<dyn std::error::Error>> {
+fn shrinkwrap_matches_blender_522_differential_corpus() -> TestResult {
     let corpus: Value = serde_json::from_str(CORPUS)?;
-    let Some(blender) = blender_522()? else {
-        return Ok(());
-    };
     assert_eq!(corpus["blender_version"], BLENDER_VERSION);
-
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let fixture_path = root.join("tests/fixtures/shrinkwrap-differential/corpus.json");
-    let directory = tempdir()?;
-    let live_path = directory.path().join("blender-oracle.json");
-    let blend_directory = directory.path().join("blend-scenes");
-    let live = generate_blender_oracle(&blender, &fixture_path, &live_path, &blend_directory)?;
     let absolute = corpus["comparison"]["absolute_tolerance"]
         .as_f64()
         .ok_or("missing absolute tolerance")?;
     let relative = corpus["comparison"]["relative_tolerance"]
         .as_f64()
         .ok_or("missing relative tolerance")?;
-    assert_blender_match(
-        "source mesh oracle",
+    let defaults = corpus["defaults"].as_object().ok_or("missing defaults")?;
+    let subject = Id::new(SUBJECT)?;
+
+    // The subject without a stack must reproduce Blender's evaluated source mesh.
+    let (doc, snapshot) = evaluate(&corpus["inputs"], Vec::new())?;
+    let source = output_summary(&doc, &snapshot, &subject)?;
+    assert_potter_match(
+        "source mesh",
         &corpus["source_blender_input"],
-        &live["source_blender_input"],
+        &source,
         absolute,
         relative,
     );
 
-    let cases = corpus["cases"]
+    for case in corpus["cases"]
         .as_array()
-        .ok_or("missing Shrinkwrap cases")?;
-    let live_cases = live["cases"]
-        .as_array()
-        .ok_or("missing live Blender cases")?;
-    assert_eq!(cases.len(), live_cases.len(), "Blender case count changed");
-    for case in cases {
+        .ok_or("missing Shrinkwrap cases")?
+    {
         let id = case["id"].as_str().ok_or("case id is not a string")?;
         let parameters = case["params"]
             .as_object()
             .ok_or("case params are missing")?;
         assert_eq!(
             parameters.len(),
-            corpus["defaults"]
-                .as_object()
-                .ok_or("missing defaults")?
-                .len(),
+            defaults.len(),
             "{id}: fixture parameters must be fully specified"
         );
-        let live_case = live_cases
-            .iter()
-            .find(|candidate| candidate["id"].as_str() == Some(id))
-            .ok_or_else(|| format!("live Blender result is missing case {id}"))?;
-        assert_eq!(
-            case["params"], live_case["params"],
-            "{id}: live inputs differ"
-        );
-        assert_blender_match(
-            id,
-            &case["blender"],
-            &live_case["blender"],
-            absolute,
-            relative,
-        );
-
-        let blend_path = blend_directory.join(format!("{id}.blend"));
-        let (doc, snapshot, source_id) = import_blender_scene(&blend_path, &blender)?;
-        let source_data_id = doc
-            .nodes
-            .get(&source_id)
-            .and_then(|node| node.data.as_ref())
-            .ok_or("imported source has no data")?;
-        let source_data = doc
-            .data_blocks
-            .get(source_data_id)
-            .ok_or("imported source data is missing")?;
-        let source_mesh = source_data
-            .mesh
-            .as_ref()
-            .ok_or("imported source data has no mesh")?;
-        let output_mesh = snapshot
-            .meshes
-            .get(&source_id)
-            .ok_or("evaluated source mesh is missing")?;
-        let output_weights = mesh_vertex_weights(output_mesh, &source_data.vertex_groups);
-        let source_ids = mesh_summary(
-            source_mesh,
-            &source_data.vertex_groups,
-            &source_data.vertex_weights,
-        )?;
-        let actual = mesh_summary(output_mesh, &source_data.vertex_groups, &output_weights)?;
-        for field in ["vertex_ids", "edge_ids", "face_ids"] {
-            assert_eq!(
-                source_ids[field], actual[field],
-                "{id}: {field} IDs changed"
-            );
-        }
-        assert_potter_match(id, &live_case["blender"], &actual, absolute, relative);
+        let (doc, snapshot) = evaluate(&corpus["inputs"], vec![shrinkwrap_modifier(parameters)?])?;
+        let actual = output_summary(&doc, &snapshot, &subject)?;
+        assert_potter_match(id, &case["blender"], &actual, absolute, relative);
     }
     Ok(())
 }
 
-fn blender_522() -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
-    let Some(blender) = discovery::discover(|path| {
-        if !path.is_file() {
-            return None;
-        }
-        let mut command = Command::new(&path);
-        command.arg("--version");
-        process::run_guarded(command)
-            .ok()
-            .filter(|output| output.status.success())
-            .map(|_| path)
-    }) else {
-        eprintln!("skipping Shrinkwrap differential corpus: Blender is unavailable");
-        return Ok(None);
-    };
-    let mut version_command = Command::new(&blender);
-    version_command.arg("--version");
-    let version = process::run_guarded(version_command)?;
-    assert!(version.status.success(), "Blender --version failed");
-    let version_text = String::from_utf8_lossy(&version.stdout);
-    if !version_text.contains("Blender 5.2.2") {
-        assert!(
-            env::var_os("POTTER_REQUIRE_BLENDER").is_none_or(|value| value.is_empty()),
-            "POTTER_REQUIRE_BLENDER is set but Blender is not 5.2.2:\n{version_text}"
+fn shrinkwrap_modifier(params: &Map<String, Value>) -> TestResult<Modifier> {
+    Ok(Modifier {
+        id: Id::new("shrinkwrap")?,
+        modifier_type: "shrinkwrap".to_owned(),
+        name: "Shrinkwrap".to_owned(),
+        enabled: true,
+        show_viewport: true,
+        show_render: true,
+        params: params.clone(),
+        binding_data: None,
+        runtime: ModifierRuntime::default(),
+    })
+}
+
+/// A scene with every corpus input as a mesh object; the subject carries `stack`.
+fn evaluate(inputs: &Value, stack: Vec<Modifier>) -> TestResult<(SceneDoc, Snapshot)> {
+    let mut doc = SceneDoc::new(SCENE_ID.to_owned());
+    let root = Id::new("collection_root")?;
+    let inputs = inputs
+        .as_object()
+        .ok_or("corpus inputs must be an object")?;
+    let mut stack = Some(stack);
+    for (name, raw) in inputs {
+        let is_subject = name.as_str() == SUBJECT;
+        let node_id = Id::new(name)?;
+        let data_id = Id::new(format!("data_{name}"))?;
+        let mesh = corpus_mesh(raw, is_subject)?;
+        let vertex_groups = if is_subject {
+            corpus_vertex_groups(raw)?
+        } else {
+            Vec::new()
+        };
+        let modifiers = if is_subject {
+            stack.take().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        doc.data_blocks.insert(
+            data_id.clone(),
+            DataBlock {
+                data_type: "mesh".to_owned(),
+                mesh: Some(mesh),
+                vertex_groups,
+                ..DataBlock::default()
+            },
         );
-        eprintln!("skipping Shrinkwrap differential corpus: this fixture requires Blender 5.2.2");
-        return Ok(None);
+        doc.nodes.insert(
+            node_id.clone(),
+            Node {
+                name: name.clone(),
+                kind: "mesh".to_owned(),
+                transform: corpus_transform(&raw["transform"])?,
+                modifiers,
+                data: Some(data_id),
+                ..Node::default()
+            },
+        );
+        doc.collections
+            .get_mut(&root)
+            .ok_or("root collection")?
+            .objects
+            .push(node_id);
     }
-    Ok(Some(blender))
+    doc.validate()?;
+    let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
+    Ok((doc, snapshot))
 }
 
-fn generate_blender_oracle(
-    blender: &Path,
-    fixture_path: &Path,
-    live_path: &Path,
-    blend_directory: &Path,
-) -> Result<Value, Box<dyn std::error::Error>> {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let script_path = root.join("tests/fixtures/shrinkwrap-differential/generate.py");
-    let mut command = Command::new(blender);
-    command.args([
-        "--background",
-        "--factory-startup",
-        "--disable-autoexec",
-        "--python-exit-code",
-        "3",
-        "--python",
-    ]);
-    command
-        .arg(script_path)
-        .arg("--")
-        .arg(fixture_path)
-        .arg(live_path)
-        .arg(blend_directory);
-    let output = process::run_guarded(command)?;
-    let text = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        output.status.success(),
-        "Blender Shrinkwrap oracle failed:\n{text}"
-    );
-    let live: Value = serde_json::from_slice(&fs::read(live_path)?)?;
-    assert_eq!(live["blender_version"], BLENDER_VERSION);
-    Ok(live)
+/// Blender's XYZ Euler rotation is `Rz * Ry * Rx`, glam's ZYX intrinsic order.
+fn corpus_transform(raw: &Value) -> TestResult<Transform> {
+    let degrees = vector(raw, "rotation_euler_deg")?;
+    let radians = degrees.map(f64::to_radians);
+    let rotation = DQuat::from_euler(EulerRot::ZYX, radians[2], radians[1], radians[0]).to_array();
+    Ok(Transform {
+        translation: vector(raw, "translation")?,
+        rotation,
+        scale: vector(raw, "scale")?,
+        ..Transform::default()
+    })
 }
 
-fn import_blender_scene(
-    blend_path: &Path,
-    blender: &Path,
-) -> Result<(SceneDoc, Snapshot, Id), Box<dyn std::error::Error>> {
-    let imported = import_blend(blend_path, Some(blender))?;
-    let source_text = imported
-        .id_mappings
-        .get("Object:Source")
-        .and_then(Value::as_str)
-        .ok_or("Blender object `Source` has no import ID")?;
-    let source_id = Id::new(source_text.to_owned())?;
-    let snapshot = Snapshot::evaluate(&imported.doc, &EvaluationContext::default())?;
-    Ok((imported.doc, snapshot, source_id))
+fn vector(raw: &Value, key: &str) -> TestResult<[f64; 3]> {
+    let values = raw
+        .get(key)
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("transform {key} is missing"))?;
+    let [x, y, z] = values.as_slice() else {
+        return Err(format!("transform {key} needs three components").into());
+    };
+    Ok([
+        x.as_f64().ok_or(key)?,
+        y.as_f64().ok_or(key)?,
+        z.as_f64().ok_or(key)?,
+    ])
+}
+
+/// Blender stores positions, colors and weights as float32; the corpus decimals round the same way.
+fn single(value: f64) -> f64 {
+    f64::from(value as f32)
+}
+
+fn point(value: &Value) -> TestResult<DVec3> {
+    let [x, y, z] = vector_values(value)?;
+    Ok(DVec3::new(single(x), single(y), single(z)))
+}
+
+fn vector_values(value: &Value) -> TestResult<[f64; 3]> {
+    let [x, y, z] = value
+        .as_array()
+        .ok_or("vector must be an array")?
+        .as_slice()
+    else {
+        return Err("vector needs three components".into());
+    };
+    Ok([
+        x.as_f64().ok_or("vector component")?,
+        y.as_f64().ok_or("vector component")?,
+        z.as_f64().ok_or("vector component")?,
+    ])
+}
+
+fn indices(value: &Value) -> TestResult<Vec<usize>> {
+    value
+        .as_array()
+        .ok_or("indices must be an array")?
+        .iter()
+        .map(|index| {
+            index
+                .as_u64()
+                .and_then(|index| usize::try_from(index).ok())
+                .ok_or_else(|| "index must be a non-negative integer".into())
+        })
+        .collect()
+}
+
+/// One corpus mesh: geometry, sharp edges, shading and, for the subject, its UV, color and group data.
+fn corpus_mesh(raw: &Value, subject: bool) -> TestResult<Mesh> {
+    let positions = raw["vertices"]
+        .as_array()
+        .ok_or("vertices")?
+        .iter()
+        .map(point)
+        .collect::<TestResult<Vec<_>>>()?;
+    let faces = raw["faces"]
+        .as_array()
+        .ok_or("faces")?
+        .iter()
+        .map(indices)
+        .collect::<TestResult<Vec<_>>>()?;
+    let mut mesh = Mesh::from_positions_and_faces(positions, faces)?;
+    set_sharp_edges(&mut mesh, raw)?;
+    set_shading(&mut mesh, raw)?;
+    if subject {
+        set_uv_layers(&mut mesh, raw)?;
+        set_color_layers(&mut mesh, raw)?;
+        set_vertex_group(&mut mesh, raw)?;
+    }
+    Ok(mesh)
+}
+
+fn set_sharp_edges(mesh: &mut Mesh, raw: &Value) -> TestResult {
+    let Some(pairs) = raw.get("sharp_edges").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    let mut sharp = Vec::new();
+    for pair in pairs {
+        let [a, b] = indices(pair)?[..] else {
+            return Err("sharp edge needs two vertices".into());
+        };
+        sharp.push((a.min(b), a.max(b)));
+    }
+    let values: Map<String, Value> = mesh
+        .edges
+        .iter()
+        .map(|edge| {
+            let [a, b] = edge.vertices.map(|vertex| vertex as usize);
+            let is_sharp = sharp.contains(&(a.min(b), a.max(b)));
+            (format!("e{}", edge.id), json!(is_sharp))
+        })
+        .collect();
+    mesh.attributes.insert(
+        "sharp".to_owned(),
+        json!({"domain":"edge","type":"bool","values":values}),
+    );
+    Ok(())
+}
+
+/// `use_smooth` on every face keeps Blender's `sharp_face` attribute, which `shade_smooth()` removes.
+fn set_shading(mesh: &mut Mesh, raw: &Value) -> TestResult {
+    let attributes = raw.get("attributes");
+    let operator = attributes
+        .and_then(|attributes| attributes.get("shade_smooth_operator"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let list = attributes
+        .and_then(|attributes| attributes.get("shade_smooth"))
+        .and_then(Value::as_array);
+    let per_face: Vec<bool> = match (operator, list) {
+        (true, _) => vec![true; mesh.faces.len()],
+        (false, Some(list)) => list
+            .iter()
+            .map(|flag| flag.as_bool().ok_or("shade_smooth must be bool"))
+            .collect::<Result<_, _>>()?,
+        (false, None) => return Ok(()),
+    };
+    let values: Map<String, Value> = mesh
+        .faces
+        .iter()
+        .zip(&per_face)
+        .map(|(face, flag)| (format!("f{}", face.id), json!(flag)))
+        .collect();
+    let mut shading = json!({"domain":"face","type":"bool","values":values});
+    if list.is_some() {
+        shading[SHARP_FACE_PRESENT] = json!(true);
+    }
+    mesh.attributes.insert("shade_smooth".to_owned(), shading);
+    Ok(())
+}
+
+fn set_uv_layers(mesh: &mut Mesh, raw: &Value) -> TestResult {
+    let Some(entries) = raw
+        .get("attributes")
+        .and_then(|attributes| attributes.get("uv_map"))
+        .and_then(Value::as_array)
+    else {
+        return Ok(());
+    };
+    let mut layers: Vec<UvLayer> = Vec::new();
+    for entry in entries {
+        let name = entry
+            .get("layer")
+            .and_then(Value::as_str)
+            .unwrap_or("UVMap");
+        let face = usize::try_from(entry["face_id"].as_u64().ok_or("uv face_id")?)?;
+        let corners = entry["uv"]
+            .as_array()
+            .ok_or("uv corners")?
+            .iter()
+            .map(|pair| {
+                let [u, v] = vector_values_2(pair)?;
+                // Potter stores Blender's UV v flipped, as its importer does.
+                Ok([u, 1.0 - v])
+            })
+            .collect::<TestResult<Vec<_>>>()?;
+        let index = match layers.iter().position(|candidate| candidate.name == name) {
+            Some(index) => index,
+            None => {
+                layers.push(UvLayer::new(name, vec![None; mesh.faces.len()]));
+                layers.len() - 1
+            }
+        };
+        let slot = layers[index]
+            .faces
+            .get_mut(face)
+            .ok_or("uv face is out of range")?;
+        *slot = Some(corners);
+    }
+    uv_layers::write(
+        mesh,
+        &UvStore {
+            layers,
+            active: None,
+            render: None,
+        },
+    );
+    Ok(())
+}
+
+fn vector_values_2(value: &Value) -> TestResult<[f64; 2]> {
+    let [u, v] = value.as_array().ok_or("uv must be an array")?.as_slice() else {
+        return Err("uv needs two components".into());
+    };
+    Ok([u.as_f64().ok_or("uv")?, v.as_f64().ok_or("uv")?])
+}
+
+fn set_color_layers(mesh: &mut Mesh, raw: &Value) -> TestResult {
+    let Some(attributes) = raw
+        .get("attributes")
+        .and_then(|attributes| attributes.get("blender_attributes"))
+        .and_then(Value::as_array)
+    else {
+        return Ok(());
+    };
+    let mut layers = Vec::new();
+    let mut data_types = Map::new();
+    for attribute in attributes {
+        let name = attribute["name"].as_str().ok_or("color name")?;
+        let domain = attribute["domain"].as_str().ok_or("color domain")?;
+        if domain != "CORNER" {
+            return Err(format!("corpus color domain {domain} is not supported").into());
+        }
+        let values = attribute["values"]
+            .as_array()
+            .ok_or("color values")?
+            .iter()
+            .map(|color| {
+                let [r, g, b, a] = color.as_array().ok_or("color")?.as_slice() else {
+                    return Err("color needs four components".into());
+                };
+                Ok([
+                    single(r.as_f64().ok_or("color")?),
+                    single(g.as_f64().ok_or("color")?),
+                    single(b.as_f64().ok_or("color")?),
+                    single(a.as_f64().ok_or("color")?),
+                ])
+            })
+            .collect::<TestResult<Vec<_>>>()?;
+        data_types.insert(name.to_owned(), attribute["data_type"].clone());
+        layers.push(ColorLayer {
+            name: name.to_owned(),
+            domain: ColorDomain::Corner,
+            values,
+        });
+    }
+    color_layers::write(
+        mesh,
+        &ColorStore {
+            layers,
+            active: None,
+            render: None,
+        },
+    );
+    mesh.attributes.insert(
+        "blender_metadata".to_owned(),
+        json!({"color_data_types": data_types}),
+    );
+    Ok(())
+}
+
+fn set_vertex_group(mesh: &mut Mesh, raw: &Value) -> TestResult {
+    let Some(group) = raw.get("vertex_group") else {
+        return Ok(());
+    };
+    let name = group["name"].as_str().ok_or("vertex group name")?;
+    let weights = group["weights"].as_array().ok_or("vertex group weights")?;
+    let values: Map<String, Value> = mesh
+        .vertices
+        .iter()
+        .zip(weights)
+        .filter_map(|(vertex, amount)| {
+            amount
+                .as_f64()
+                .filter(|amount| *amount != 0.0)
+                .map(|amount| (format!("v{}", vertex.id), json!(amount)))
+        })
+        .collect();
+    let mut groups = Map::new();
+    groups.insert(name.to_owned(), Value::Object(values));
+    mesh.attributes
+        .insert("vertex_groups".to_owned(), Value::Object(groups));
+    Ok(())
+}
+
+fn corpus_vertex_groups(raw: &Value) -> TestResult<Vec<VertexGroup>> {
+    let Some(group) = raw.get("vertex_group") else {
+        return Ok(Vec::new());
+    };
+    let name = group["name"].as_str().ok_or("vertex group name")?;
+    Ok(vec![VertexGroup {
+        id: Id::new(format!("group_{}", name.to_ascii_lowercase()))?,
+        name: name.to_owned(),
+    }])
+}
+
+/// The evaluated subject's summary in the corpus's fields. Its vertex, edge and face IDs must match the
+/// subject's input IDs, since Shrinkwrap only moves vertices.
+fn output_summary(doc: &SceneDoc, snapshot: &Snapshot, subject: &Id) -> TestResult<Value> {
+    let data_id = doc
+        .nodes
+        .get(subject)
+        .and_then(|node| node.data.as_ref())
+        .ok_or("subject has no data")?;
+    let data = doc
+        .data_blocks
+        .get(data_id)
+        .ok_or("subject data is missing")?;
+    let input = data.mesh.as_ref().ok_or("subject data has no mesh")?;
+    let output = snapshot
+        .meshes
+        .get(subject)
+        .ok_or("evaluated subject mesh is missing")?;
+    let output_weights = mesh_vertex_weights(output, &data.vertex_groups);
+    let input_ids = mesh_summary(input, &data.vertex_groups, &data.vertex_weights)?;
+    let actual = mesh_summary(output, &data.vertex_groups, &output_weights)?;
+    for field in ["vertex_ids", "edge_ids", "face_ids"] {
+        assert_eq!(input_ids[field], actual[field], "{field} IDs changed");
+    }
+    Ok(actual)
 }
 
 fn mesh_summary(
     mesh: &Mesh,
     groups: &[VertexGroup],
     weights: &BTreeMap<u32, BTreeMap<Id, f64>>,
-) -> Result<Value, Box<dyn std::error::Error>> {
+) -> Result<Value, Box<dyn Error>> {
     let vertex_index: HashMap<u32, usize> = mesh
         .vertices
         .iter()
@@ -316,7 +563,7 @@ fn mesh_summary(
                 "values":layer.values
             }))
         })
-        .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
     let vertex_groups: Vec<Value> = groups
         .iter()
         .map(|group| {
@@ -346,41 +593,6 @@ fn mesh_summary(
         "color_attributes":color_attributes,
         "vertex_groups":vertex_groups
     }))
-}
-
-fn assert_blender_match(
-    context: &str,
-    expected: &Value,
-    actual: &Value,
-    absolute: f64,
-    relative: f64,
-) {
-    assert_eq!(
-        expected["edges"], actual["edges"],
-        "{context}: Blender edges differ"
-    );
-    assert_eq!(
-        expected["faces"], actual["faces"],
-        "{context}: Blender faces differ"
-    );
-    for field in [
-        "positions",
-        "vertex_normals",
-        "corner_normals",
-        "uv_layers",
-        "color_attributes",
-        "vertex_groups",
-    ] {
-        if expected.get(field).is_some() {
-            assert_json_close(
-                &format!("{context}.{field}"),
-                &expected[field],
-                &actual[field],
-                absolute,
-                relative,
-            );
-        }
-    }
 }
 
 fn assert_potter_match(

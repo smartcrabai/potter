@@ -17,9 +17,9 @@ pub(crate) type Vec3 = [f32; 3];
 /// Unit axes `bvhtree_kdop_axes[0..3]`.
 const AXES: [Vec3; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
 /// `BLI_bvhtree_new` clamps the tree epsilon to `FLT_EPSILON`; leaf boxes are inflated by it.
-const TREE_EPSILON: f32 = f32::EPSILON;
-/// `BVH_RAYCAST_DIST_MAX` (`BLI_kdopbvh.hh`).
-const RAYCAST_DIST_MAX: f32 = f32::MAX / 2.0;
+pub(crate) const TREE_EPSILON: f32 = f32::EPSILON;
+/// `BVH_RAYCAST_DIST_MAX` (`BLI_kdopbvh.hh`): `FLT_MAX / 2`, the open ray length.
+pub(crate) const RAYCAST_DIST_MAX: f32 = f32::MAX / 2.0;
 
 pub(crate) fn sub(a: Vec3, b: Vec3) -> Vec3 {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
@@ -498,6 +498,11 @@ impl KdopTree {
         triangle_bounds(tri)
     }
 
+    /// The leaf box of one vertex: the point inflated by the tree epsilon, as Blender's vertex tree.
+    pub(crate) fn leaf_bounds_for_point(point: Vec3) -> [f32; 6] {
+        triangle_bounds([point; 3])
+    }
+
     /// `BLI_bvhtree_ray_cast_ex` with `BVH_RAYCAST_WATERTIGHT`. `callback` receives each leaf index the
     /// traversal reaches, the ray, and the running hit, and stores hits in `hit`. The caller sets the
     /// initial `hit` (`index: -1`, `dist: f32::MAX` for an open cast), as `BLI_bvhtree_ray_cast`'s
@@ -601,32 +606,27 @@ impl KdopTree {
             NodeRef::Leaf(leaf) => callback(leaf, co, nearest),
             NodeRef::Branch(branch) => {
                 let branch = self.branches[branch];
-                let children: Vec<NodeRef> = branch
-                    .children
-                    .iter()
-                    .take(branch.node_num)
-                    .flatten()
-                    .copied()
-                    .collect();
-                let Some(&first) = children.first() else {
+                // The first child decides the side of the split the query lies on; a branch without
+                // children has nothing to visit.
+                let Some(first) = branch.children.first().copied().flatten() else {
                     return;
                 };
                 let forward =
                     co[branch.main_axis] <= self.node_bounds(first)[branch.main_axis * 2 + 1];
-                if forward {
-                    for &child in &children {
-                        if self.nearest_box(co, child).0 >= nearest.dist_sq {
-                            continue;
-                        }
-                        self.dfs_nearest(co, child, nearest, callback);
+                // Blender's order without collecting the children: forward, or the reverse.
+                for step in 0..branch.node_num {
+                    let index = if forward {
+                        step
+                    } else {
+                        branch.node_num - 1 - step
+                    };
+                    let Some(child) = branch.children.get(index).copied().flatten() else {
+                        continue;
+                    };
+                    if self.nearest_box(co, child).0 >= nearest.dist_sq {
+                        continue;
                     }
-                } else {
-                    for &child in children.iter().rev() {
-                        if self.nearest_box(co, child).0 >= nearest.dist_sq {
-                            continue;
-                        }
-                        self.dfs_nearest(co, child, nearest, callback);
-                    }
+                    self.dfs_nearest(co, child, nearest, callback);
                 }
             }
         }

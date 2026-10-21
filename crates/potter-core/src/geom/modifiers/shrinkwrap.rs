@@ -19,19 +19,13 @@ use crate::{
     geom::{
         Mesh,
         blender_matrix::blender_invert_m4,
-        bvh::{KdopTree, NearestHit, Ray, RayHit},
+        bvh::{KdopTree, NearestHit, RAYCAST_DIST_MAX, Ray, RayHit, TREE_EPSILON},
         normals,
     },
     model::Modifier,
 };
 
 use super::{bool_param, invalid_parameter, number_param, string_param, uint_param, validated};
-
-/// Blender's `BLI_bvhtree_new` epsilon floor: every BVH leaf box is inflated by this.
-const TREE_EPSILON: f32 = f32::EPSILON;
-
-/// Blender's `BVH_RAYCAST_DIST_MAX`, the initial ray length bound.
-const RAYCAST_DIST_MAX: f32 = f32::MAX / 2.0;
 
 /// Blender's `float[4][4]`, indexed `[column][row]`.
 type Mat = [[f32; 4]; 4];
@@ -91,10 +85,13 @@ struct BoundaryEdge {
 struct Surface {
     tree: KdopTree,
     positions: Vec<Vec3>,
+    /// Empty unless the surface needs normals (ABOVE_SURFACE snaps, TARGET_PROJECT).
     vertex_normals: Vec<Vec3>,
+    /// Empty unless the mesh's normal domain is Corner and the surface needs normals.
     corner_normals: Vec<Vec3>,
+    /// Empty unless the surface needs normals.
     face_normals: Vec<Vec3>,
-    /// Blender's `sharp_faces` lookup: `None` when the attribute is absent (every face smooth).
+    /// Blender's `sharp_face` lookup (`true` = sharp): `None` when the attribute is absent.
     sharp_faces: Option<Vec<bool>>,
     tris: Vec<Tri>,
     boundary: Vec<BoundaryEdge>,
@@ -207,15 +204,17 @@ pub(super) fn evaluate(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             if target.faces.is_empty() {
                 return Ok(mesh.clone());
             }
-            let surface = build_surface(target)?;
+            let mode = wrap_mode(modifier)?;
+            let target_project = method == "TARGET_PROJECT";
+            let surface = build_surface(target, SurfaceNeeds::for_method(target_project, mode))?;
             nearest_surface_points(
                 &positions,
                 &weights,
                 &surface,
                 space,
-                wrap_mode(modifier)?,
+                mode,
                 offset,
-                method == "TARGET_PROJECT",
+                target_project,
             )
         }
         "PROJECT" => {
@@ -278,9 +277,13 @@ pub(super) fn evaluate(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             };
             let limit = number_param(modifier, "project_limit")? as f32;
             let limit_squared = limit * limit;
-            let main = build_surface(target)?;
-            let auxiliary =
-                auxiliary_surface(modifier.runtime.shrinkwrap_auxiliary_target_mesh.as_ref())?;
+            let mode = wrap_mode(modifier)?;
+            let needs = SurfaceNeeds::for_method(false, mode);
+            let main = build_surface(target, needs)?;
+            let auxiliary = auxiliary_surface(
+                modifier.runtime.shrinkwrap_auxiliary_target_mesh.as_ref(),
+                needs,
+            )?;
             let auxiliary_space = space_from_runtime(
                 modifier.runtime.shrinkwrap_auxiliary_subject_to_target,
                 modifier,
@@ -300,7 +303,7 @@ pub(super) fn evaluate(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
                 cull,
                 invert_cull: bool_param(modifier, "use_invert_cull")?,
                 limit_squared: (limit_squared != 0.0).then_some(limit_squared),
-                mode: wrap_mode(modifier)?,
+                mode,
                 offset,
             };
             project_points(&projection, &positions, &weights, &source)
@@ -412,20 +415,9 @@ fn build_vertex_surface(mesh: &Mesh) -> Surface {
         .iter()
         .map(|vertex| vertex.co.as_vec3())
         .collect();
-    // Blender inflates every leaf box by the tree epsilon, so a vertex leaf is its inflated box.
     let bounds: Vec<[f32; 6]> = positions
         .iter()
-        .map(|point| {
-            let [x, y, z] = point.to_array();
-            [
-                x - TREE_EPSILON,
-                x + TREE_EPSILON,
-                y - TREE_EPSILON,
-                y + TREE_EPSILON,
-                z - TREE_EPSILON,
-                z + TREE_EPSILON,
-            ]
-        })
+        .map(|point| KdopTree::leaf_bounds_for_point(point.to_array()))
         .collect();
     Surface {
         tree: KdopTree::from_leaf_bounds(&bounds),
@@ -439,8 +431,26 @@ fn build_vertex_surface(mesh: &Mesh) -> Surface {
     }
 }
 
+/// What a target surface must carry: Blender's `BKE_shrinkwrap_needs_normals` (`TARGET_PROJECT`, or an
+/// `ABOVE_SURFACE` snap) and the boundary data that only `TARGET_PROJECT` reads.
+#[derive(Clone, Copy)]
+struct SurfaceNeeds {
+    normals: bool,
+    boundary: bool,
+}
+
+impl SurfaceNeeds {
+    /// The needs of a surface method (not `NEAREST_VERTEX`) with its wrap mode.
+    fn for_method(target_project: bool, mode: WrapMode) -> Self {
+        Self {
+            normals: target_project || mode == WrapMode::AboveSurface,
+            boundary: target_project,
+        }
+    }
+}
+
 /// Blender's `BKE_shrinkwrap_init_tree` for the corner-triangle tree and its per-element data.
-fn build_surface(mesh: &Mesh) -> Result<Surface> {
+fn build_surface(mesh: &Mesh, needs: SurfaceNeeds) -> Result<Surface> {
     let points: Vec<DVec3> = mesh.vertices.iter().map(|vertex| vertex.co).collect();
     let positions: Vec<Vec3> = points.iter().map(|point| point.as_vec3()).collect();
     let index_by_id: HashMap<u32, usize> = mesh
@@ -449,26 +459,41 @@ fn build_surface(mesh: &Mesh) -> Result<Surface> {
         .enumerate()
         .map(|(index, vertex)| (vertex.id, index))
         .collect();
-    let vertex_normals = to_vec3s(normals::geometric_vertex_normals(mesh, &points)?);
-    let corner_normals = to_vec3s(normals::corner_normals(mesh, &points)?);
-    let face_normals: Vec<Vec3> = mesh
-        .faces
-        .iter()
-        .map(|face| {
-            let face_points: Vec<DVec3> = face
-                .vertices
-                .iter()
-                .map(|id| points[index_by_id[id]])
-                .collect();
-            normals::face_normal(&face_points).as_vec3()
-        })
-        .collect();
-    let smooth = normals::smooth_face_flags(mesh)?;
-    let sharp_faces: Option<Vec<bool>> =
-        (!smooth.iter().all(|flag| *flag)).then(|| smooth.iter().map(|flag| !flag).collect());
+    // Vertex and face normals only feed the ABOVE_SURFACE offset and the TARGET_PROJECT solver.
+    let vertex_normals = if needs.normals || needs.boundary {
+        to_vec3s(normals::geometric_vertex_normals(mesh, &points)?)
+    } else {
+        Vec::new()
+    };
+    // Blender keeps corner normals only on a Corner-domain mesh; otherwise the vertex normals stand in.
+    let corner_normals =
+        if needs.normals && normals::normals_domain(mesh)? == normals::NormalDomain::Corner {
+            to_vec3s(normals::corner_normals(mesh, &points)?)
+        } else {
+            Vec::new()
+        };
+    let face_normals: Vec<Vec3> = if needs.normals {
+        mesh.faces
+            .iter()
+            .map(|face| {
+                let face_points: Vec<DVec3> = face
+                    .vertices
+                    .iter()
+                    .map(|id| points[index_by_id[id]])
+                    .collect();
+                normals::face_normal(&face_points).as_vec3()
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let sharp_faces = normals::sharp_face_flags(mesh)?;
 
-    let (boundary, boundary_lookup) =
-        boundary_edges(mesh, &index_by_id, &positions, &vertex_normals);
+    let (boundary, boundary_lookup) = if needs.boundary {
+        boundary_edges(mesh, &index_by_id, &positions, &vertex_normals)
+    } else {
+        (Vec::new(), HashMap::new())
+    };
     let tessellation = mesh.tessellate().map_err(|error| {
         PotError::invalid_argument(format!("invalid target triangulation: {error}"))
     })?;
@@ -641,7 +666,7 @@ fn edge_lookup(
     edges.get(&edge_key_indices(first, second)).copied()
 }
 
-fn auxiliary_surface(target: Option<&Mesh>) -> Result<Option<Surface>> {
+fn auxiliary_surface(target: Option<&Mesh>, needs: SurfaceNeeds) -> Result<Option<Surface>> {
     let Some(target) = target else {
         return Ok(None);
     };
@@ -649,7 +674,7 @@ fn auxiliary_surface(target: Option<&Mesh>) -> Result<Option<Surface>> {
     if target.vertices.is_empty() || target.faces.is_empty() {
         return Ok(None);
     }
-    build_surface(target).map(Some)
+    build_surface(target, needs).map(Some)
 }
 
 /// Blender's `shrinkwrap_calc_nearest_vertex`.
@@ -1244,9 +1269,9 @@ fn snap_with_side(
     }
 }
 
-/// Blender's `BKE_shrinkwrap_compute_smooth_normal`. Corner normals interpolate where the face's
-/// `sharp_face` lookup allows it; otherwise the face normal is used. With a `space`, the result is
-/// returned in subject space.
+/// Blender's `BKE_shrinkwrap_compute_smooth_normal`. Where the face's `sharp_face` lookup says so, the
+/// normal interpolates the corner normals on a Corner-domain mesh and the vertex normals otherwise;
+/// elsewhere it is the face normal. With a `space`, the result is returned in subject space.
 fn smooth_normal(surface: &Surface, space: Option<&Space>, hit: Hit) -> Vec3 {
     let tri = surface.tris[hit.index];
     let interpolate = surface
@@ -1259,8 +1284,12 @@ fn smooth_normal(surface: &Surface, space: Option<&Space>, hit: Hit) -> Vec3 {
         });
         let [v1, v2, v3] = surface.triangle(hit.index);
         let weights = tri_weights(v1, v2, v3, target);
-        let corner_normals = tri.corners.map(|corner| surface.corner_normals[corner]);
-        let normal = interp3(corner_normals, weights);
+        let interpolated = if surface.corner_normals.is_empty() {
+            tri.vertices.map(|vertex| surface.vertex_normals[vertex])
+        } else {
+            tri.corners.map(|corner| surface.corner_normals[corner])
+        };
+        let normal = interp3(interpolated, weights);
         match space {
             Some(space) => transform_normal_inverse(&space.subject_to_target, normal),
             None => normalize(normal),

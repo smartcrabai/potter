@@ -17,6 +17,7 @@ use crate::{
     geom::{
         Edge, Face, IdCounters, Mesh, Vertex, attribute_keys, clnor,
         color_layers::{self, ColorDomain, ColorLayer, ColorStore},
+        normals,
         uv_layers::{self, UvLayer, UvStore},
     },
     graph::{GraphInterface, GraphKind, GraphLink, GraphNode, GraphSocket, NodeGroup},
@@ -6742,6 +6743,16 @@ fn convert_mesh(item: &Value) -> Result<Mesh> {
         face_keys,
         &smooth,
     );
+    // Blender keeps an all-false `sharp_face` attribute after `use_smooth` on every face and removes it
+    // after `shade_smooth()`; Shrinkwrap reads the difference, so the importer records it.
+    if flag_field(item, "sharp_face_present")
+        && let Some(fields) = mesh
+            .attributes
+            .get_mut("shade_smooth")
+            .and_then(Value::as_object_mut)
+    {
+        fields.insert(normals::SHARP_FACE_PRESENT.to_owned(), json!(true));
+    }
     let edge_keys: Vec<String> = mesh
         .edges
         .iter()
