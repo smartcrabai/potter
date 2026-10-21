@@ -783,29 +783,19 @@ pub(crate) fn rasterize_with_samples(
                             }
                         })
                     } else if let Some(sample_ray) = sample_ray {
-                        match sample_hit {
-                            Some(visible_hit)
-                                if hit_opacity(
-                                    &prepared[visible_hit.triangle_index].source,
-                                    visible_hit.color,
-                                ) >= 1.0 =>
-                            {
-                                let [red, green, blue, _] = visible_hit.color;
-                                [red, green, blue, 1.0]
-                            }
-                            // The composite also finds a transparent pane that tints without opacity, which the
-                            // opacity-only hit above does not see. With no layer it returns the background.
-                            _ => composite_sample(
-                                &prepared,
-                                &visibility,
-                                &mut candidates,
-                                sample_ray,
-                                &frame,
-                                background_linear,
-                                shader,
-                                sample_hit,
-                            )?,
-                        }
+                        // The composite walks every surface along the ray, nearest first. A transparent pane that only
+                        // tints sits in front of an opaque surface and is not the opacity hit, so the opacity hit alone
+                        // cannot decide the colour: an opaque front layer ends the walk inside `composite_layers`.
+                        composite_sample(
+                            &prepared,
+                            &visibility,
+                            &mut candidates,
+                            sample_ray,
+                            &frame,
+                            background_linear,
+                            shader,
+                            sample_hit,
+                        )?
                     } else {
                         background_linear
                     };
