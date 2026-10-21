@@ -1,0 +1,33 @@
+{
+ "blender": "5.2.2 LTS",
+ "samples": 1024,
+ "density": 2.0,
+ "max_bounces": 0,
+ "volume_bounces": 0,
+ "cases": {
+  "emissive_voxel_color0": {
+   "mean": [
+    0.555465,
+    0.555465,
+    0.555465
+   ],
+   "stderr": [
+    0.001799,
+    0.001799,
+    0.001799
+   ]
+  },
+  "emissive_voxel_color05": {
+   "mean": [
+    0.762507,
+    0.762507,
+    0.762507
+   ],
+   "stderr": [
+    0.002855,
+    0.002855,
+    0.002855
+   ]
+  }
+ }
+}
