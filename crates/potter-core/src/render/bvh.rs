@@ -24,7 +24,17 @@ pub(crate) struct WalkRay {
     pub remaining: f64,
     pub kind: Option<crate::model::RayKind>,
 }
-
+/// A closest-hit query: the ray, its extent, whether back faces count, and the triangles it may hit. Traversal
+/// carries it as one value instead of a long argument list.
+#[derive(Clone, Copy)]
+struct RayQuery<'a> {
+    origin: DVec3,
+    direction: DVec3,
+    t_min: f64,
+    t_max: f64,
+    two_sided: bool,
+    accepts: &'a dyn Fn(&Triangle) -> bool,
+}
 #[derive(Debug)]
 pub(crate) struct Bvh {
     nodes: Vec<Node>,
@@ -126,7 +136,15 @@ impl Bvh {
         t_max: f64,
         accepts: &dyn Fn(&Triangle) -> bool,
     ) -> Option<BvhHit> {
-        self.closest_hit_mode(triangles, origin, direction, t_min, t_max, true, accepts)
+        let query = RayQuery {
+            origin,
+            direction,
+            t_min,
+            t_max,
+            two_sided: true,
+            accepts,
+        };
+        self.closest_hit_mode(triangles, query)
     }
 
     /// Walks the surfaces `walk` meets, nearest first, while `walk.remaining` is left along it. `visit` receives each
@@ -206,20 +224,14 @@ impl Bvh {
         }
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "closest-hit queries carry sidedness and the triangle filter through traversal"
-    )]
-    fn closest_hit_mode(
-        &self,
-        triangles: &[Triangle],
-        origin: DVec3,
-        direction: DVec3,
-        t_min: f64,
-        t_max: f64,
-        two_sided: bool,
-        accepts: &dyn Fn(&Triangle) -> bool,
-    ) -> Option<BvhHit> {
+    fn closest_hit_mode(&self, triangles: &[Triangle], query: RayQuery<'_>) -> Option<BvhHit> {
+        let RayQuery {
+            origin,
+            direction,
+            t_min,
+            t_max,
+            ..
+        } = query;
         if triangles.len() != self.triangle_count
             || !is_finite_vec3(origin)
             || !is_finite_vec3(direction)
@@ -232,37 +244,26 @@ impl Bvh {
 
         let mut nearest = None;
         if let Some(root) = self.root {
-            self.visit(
-                root,
-                triangles,
-                origin,
-                direction,
-                t_min,
-                t_max,
-                two_sided,
-                accepts,
-                &mut nearest,
-            );
+            self.visit(root, triangles, &query, &mut nearest);
         }
         nearest
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "BVH traversal carries query bounds and sidedness through recursive nodes"
-    )]
     fn visit(
         &self,
         node_index: usize,
         triangles: &[Triangle],
-        origin: DVec3,
-        direction: DVec3,
-        t_min: f64,
-        t_max: f64,
-        two_sided: bool,
-        accepts: &dyn Fn(&Triangle) -> bool,
+        query: &RayQuery<'_>,
         nearest: &mut Option<BvhHit>,
     ) {
+        let RayQuery {
+            origin,
+            direction,
+            t_min,
+            t_max,
+            two_sided,
+            accepts,
+        } = *query;
         let Some(node) = self.nodes.get(node_index).copied() else {
             return;
         };
@@ -326,37 +327,15 @@ impl Bvh {
                 match (left_interval, right_interval) {
                     (Some(left_interval), Some(right_interval)) => {
                         if left_interval.0 <= right_interval.0 {
-                            self.visit(
-                                left, triangles, origin, direction, t_min, t_max, two_sided,
-                                accepts, nearest,
-                            );
-                            self.visit(
-                                right, triangles, origin, direction, t_min, t_max, two_sided,
-                                accepts, nearest,
-                            );
+                            self.visit(left, triangles, query, nearest);
+                            self.visit(right, triangles, query, nearest);
                         } else {
-                            self.visit(
-                                right, triangles, origin, direction, t_min, t_max, two_sided,
-                                accepts, nearest,
-                            );
-                            self.visit(
-                                left, triangles, origin, direction, t_min, t_max, two_sided,
-                                accepts, nearest,
-                            );
+                            self.visit(right, triangles, query, nearest);
+                            self.visit(left, triangles, query, nearest);
                         }
                     }
-                    (Some(_), None) => {
-                        self.visit(
-                            left, triangles, origin, direction, t_min, t_max, two_sided, accepts,
-                            nearest,
-                        );
-                    }
-                    (None, Some(_)) => {
-                        self.visit(
-                            right, triangles, origin, direction, t_min, t_max, two_sided, accepts,
-                            nearest,
-                        );
-                    }
+                    (Some(_), None) => self.visit(left, triangles, query, nearest),
+                    (None, Some(_)) => self.visit(right, triangles, query, nearest),
                     (None, None) => {}
                 }
             }
@@ -606,7 +585,7 @@ mod tests {
     use crate::model::RayVisibility;
     use crate::render::raster::{AlphaMode, Triangle};
 
-    use super::{Bvh, BvhHit};
+    use super::{Bvh, BvhHit, RayQuery};
 
     proptest! {
         #[test]
@@ -668,12 +647,14 @@ mod tests {
             let Ok(bvh) = bvh else { return Ok(()); };
             let actual = bvh.closest_hit_mode(
                 &triangles,
-                origin,
-                ray_direction,
-                t_min,
-                t_max,
-                false,
-                &|_| true,
+                RayQuery {
+                    origin,
+                    direction: ray_direction,
+                    t_min,
+                    t_max,
+                    two_sided: false,
+                    accepts: &|_| true,
+                },
             );
             let expected = brute_force_hit(&triangles, origin, ray_direction, t_min, t_max, false);
             prop_assert!(expected.is_some(), "constructed ray should hit its target triangle");

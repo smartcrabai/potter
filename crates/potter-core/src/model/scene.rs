@@ -119,7 +119,7 @@ impl SceneDoc {
             },
         )]);
         Self {
-            schema_version: 7,
+            schema_version: 8,
             scene_id,
             revision: 0,
             active_scene,
@@ -146,7 +146,7 @@ impl SceneDoc {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.schema_version != 7 {
+        if self.schema_version != 8 {
             return Err(PotError::with_details(
                 ErrorCode::UnsupportedVersion,
                 format!("unsupported scene schema_version {}", self.schema_version),
@@ -1813,99 +1813,109 @@ pub enum RayKind {
     Shadow,
 }
 
-/// Blender's per-object ray visibility (`visible_camera`, `visible_diffuse`, ...). Cycles masks
-/// each object with these bits and skips it for rays whose kind is switched off.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "one flag per Blender ray visibility toggle"
-)]
+/// Blender's per-object ray visibility (`visible_camera`, `visible_diffuse`, ...): one bit per `RayKind`. Cycles masks
+/// each object with these bits and skips it for rays whose kind is switched off. Stored as the mask a triangle carries,
+/// and serialised as the six named flags (`{"camera": true, ...}`), all required.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RayVisibility {
-    pub camera: bool,
-    pub diffuse: bool,
-    pub glossy: bool,
-    pub transmission: bool,
-    pub volume_scatter: bool,
-    pub shadow: bool,
+    mask: u8,
 }
 
 impl Default for RayVisibility {
     /// Every ray kind is on: Blender's default for an object that is not a light.
     fn default() -> Self {
         Self {
-            camera: true,
-            diffuse: true,
-            glossy: true,
-            transmission: true,
-            volume_scatter: true,
-            shadow: true,
+            mask: RayKind::ALL_MASK,
         }
     }
 }
 
 impl RayVisibility {
-    /// The Blender RNA property that holds each flag, in the order of the fields.
-    pub const RNA_PROPERTIES: [&'static str; 6] = [
-        "visible_camera",
-        "visible_diffuse",
-        "visible_glossy",
-        "visible_transmission",
-        "visible_volume_scatter",
-        "visible_shadow",
-    ];
     /// Blender's flags for a new object of `kind`. Lights are hidden from camera rays
     /// (`BKE_object_init`, object.cc:2177); every other object starts fully visible.
     #[must_use]
     pub fn default_for_kind(kind: &str) -> Self {
-        Self {
-            camera: kind != "light",
-            ..Self::default()
+        let mut visibility = Self::default();
+        if kind == "light" {
+            visibility.set(RayKind::Camera, false);
         }
+        visibility
     }
 
     #[must_use]
     pub fn allows(self, ray: RayKind) -> bool {
-        match ray {
-            RayKind::Camera => self.camera,
-            RayKind::Diffuse => self.diffuse,
-            RayKind::Glossy => self.glossy,
-            RayKind::Transmission => self.transmission,
-            RayKind::VolumeScatter => self.volume_scatter,
-            RayKind::Shadow => self.shadow,
-        }
+        self.mask & ray.bit() != 0
     }
 
     /// Sets one flag.
     pub fn set(&mut self, ray: RayKind, value: bool) {
-        match ray {
-            RayKind::Camera => self.camera = value,
-            RayKind::Diffuse => self.diffuse = value,
-            RayKind::Glossy => self.glossy = value,
-            RayKind::Transmission => self.transmission = value,
-            RayKind::VolumeScatter => self.volume_scatter = value,
-            RayKind::Shadow => self.shadow = value,
+        if value {
+            self.mask |= ray.bit();
+        } else {
+            self.mask &= !ray.bit();
         }
     }
 
     /// One bit per ray kind, the mask a triangle carries so a BVH query tests a single `u8`.
     #[must_use]
-    pub fn mask(self) -> u8 {
-        [
-            RayKind::Camera,
-            RayKind::Diffuse,
-            RayKind::Glossy,
-            RayKind::Transmission,
-            RayKind::VolumeScatter,
-            RayKind::Shadow,
-        ]
-        .into_iter()
-        .filter(|ray| self.allows(*ray))
-        .fold(0, |mask, ray| mask | ray.bit())
+    pub const fn mask(self) -> u8 {
+        self.mask
     }
 }
 
+impl serde::Serialize for RayVisibility {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(RayKind::ALL.len()))?;
+        for ray in RayKind::ALL {
+            map.serialize_entry(ray.name(), &self.allows(ray))?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for RayVisibility {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let flags = BTreeMap::<String, bool>::deserialize(deserializer)?;
+        if let Some(unknown) = flags
+            .keys()
+            .find(|key| !RayKind::ALL.iter().any(|ray| ray.name() == key.as_str()))
+        {
+            return Err(D::Error::unknown_field(unknown, &RAY_NAMES));
+        }
+        let mut visibility = Self { mask: 0 };
+        for ray in RayKind::ALL {
+            let value = flags
+                .get(ray.name())
+                .copied()
+                .ok_or_else(|| D::Error::missing_field(ray.name()))?;
+            visibility.set(ray, value);
+        }
+        Ok(visibility)
+    }
+}
+
+/// The six flag names, as the error message lists the fields a `RayVisibility` takes.
+const RAY_NAMES: [&str; 6] = [
+    "camera",
+    "diffuse",
+    "glossy",
+    "transmission",
+    "volume_scatter",
+    "shadow",
+];
+
 impl RayKind {
+    /// Every ray kind, in the order of their bits.
+    pub const ALL: [Self; 6] = [
+        Self::Camera,
+        Self::Diffuse,
+        Self::Glossy,
+        Self::Transmission,
+        Self::VolumeScatter,
+        Self::Shadow,
+    ];
     /// Every ray kind's bit: the mask of a surface that no ray kind hides (`RayVisibility::default`).
     pub const ALL_MASK: u8 = (1 << 6) - 1;
 
@@ -1913,6 +1923,32 @@ impl RayKind {
     #[must_use]
     pub const fn bit(self) -> u8 {
         1 << self as u8
+    }
+
+    /// The kind's name in Potter's JSON, as `ray_visibility.camera`.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Camera => "camera",
+            Self::Diffuse => "diffuse",
+            Self::Glossy => "glossy",
+            Self::Transmission => "transmission",
+            Self::VolumeScatter => "volume_scatter",
+            Self::Shadow => "shadow",
+        }
+    }
+
+    /// Blender's RNA property for the kind's visibility flag, as `visible_camera`.
+    #[must_use]
+    pub const fn rna_property(self) -> &'static str {
+        match self {
+            Self::Camera => "visible_camera",
+            Self::Diffuse => "visible_diffuse",
+            Self::Glossy => "visible_glossy",
+            Self::Transmission => "visible_transmission",
+            Self::VolumeScatter => "visible_volume_scatter",
+            Self::Shadow => "visible_shadow",
+        }
     }
 }
 

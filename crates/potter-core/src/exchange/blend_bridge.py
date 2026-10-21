@@ -7506,13 +7506,11 @@ def export_doc(doc, target, pack, scene_hash, context):
         obj.hide_render = not item.get("render_visible", True)
         obj.hide_select = not item.get("selectable", True)
         set_props(obj, item.get("properties", {}))
-        visibility_rna = {
+        hide_rna = {
             key: value for key, value in (metadata.get("rna_properties") or {}).items()
-            if key.startswith("visible_")
-            or (key.startswith("hide_")
-                and key not in ("hide_viewport", "hide_render", "hide_select"))
+            if key.startswith("hide_") and key not in ("hide_viewport", "hide_render", "hide_select")
         }
-        set_rna(obj, visibility_rna)
+        set_rna(obj, hide_rna)
         ray_visibility = item.get("ray_visibility") or {}
         for field, prop in (("camera", "visible_camera"), ("diffuse", "visible_diffuse"),
                             ("glossy", "visible_glossy"), ("transmission", "visible_transmission"),

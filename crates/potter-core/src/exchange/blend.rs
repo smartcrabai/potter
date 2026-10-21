@@ -29,11 +29,11 @@ use crate::{
         ImageAlphaMode, ImageColorspace, ImageSource, ImageTile, Interpolation, Keyframe, Library,
         LibraryKind, LibraryOverride, LibraryOverrideProperty, LibraryStatus, LightData, LightType,
         Material, MaterialLink, Modifier, MovieClip, MovieTracking, NlaBlendType, NlaExtrapolation,
-        NlaStrip, NlaTrack, Node, ParentType, Profile, RayVisibility, Registry, RenderSettings,
-        RigidBody, RigidBodyShape, RigidBodyType, RigidBodyWorld, Scene, SceneDoc, ShapeKey,
-        ShapeKeyData, SurfaceData, SurfacePoint, TextObjectData, TimelineMarker, Transform,
-        UnitSettings, VertexGroup, ViewLayer, ViewportDisplay, VolumeInterpolation, VolumeSampling,
-        World, is_identity_matrix,
+        NlaStrip, NlaTrack, Node, ParentType, Profile, RayKind, RayVisibility, Registry,
+        RenderSettings, RigidBody, RigidBodyShape, RigidBodyType, RigidBodyWorld, Scene, SceneDoc,
+        ShapeKey, ShapeKeyData, SurfaceData, SurfacePoint, TextObjectData, TimelineMarker,
+        Transform, UnitSettings, VertexGroup, ViewLayer, ViewportDisplay, VolumeInterpolation,
+        VolumeSampling, World, is_identity_matrix,
     },
     sequencer::{
         EffectType as SequenceEffectType, RetimingKey, Strip as SequenceStrip, StripBlendType,
@@ -8497,7 +8497,11 @@ fn rna_properties_without_ray_visibility(item: &Value) -> Value {
     match item.get("rna_properties").and_then(Value::as_object) {
         Some(rna) => Value::Object(
             rna.iter()
-                .filter(|(key, _)| !RayVisibility::RNA_PROPERTIES.contains(&key.as_str()))
+                .filter(|(key, _)| {
+                    !RayKind::ALL
+                        .iter()
+                        .any(|ray| ray.rna_property() == key.as_str())
+                })
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect(),
         ),
@@ -8515,14 +8519,10 @@ fn imported_ray_visibility(item: &Value, kind: &str) -> Option<RayVisibility> {
             .and_then(Value::as_bool)
             .unwrap_or(fallback)
     };
-    let visibility = RayVisibility {
-        camera: flag("visible_camera", default.camera),
-        diffuse: flag("visible_diffuse", default.diffuse),
-        glossy: flag("visible_glossy", default.glossy),
-        transmission: flag("visible_transmission", default.transmission),
-        volume_scatter: flag("visible_volume_scatter", default.volume_scatter),
-        shadow: flag("visible_shadow", default.shadow),
-    };
+    let mut visibility = default;
+    for ray in RayKind::ALL {
+        visibility.set(ray, flag(ray.rna_property(), default.allows(ray)));
+    }
     (visibility != default).then_some(visibility)
 }
 

@@ -10,7 +10,7 @@ use crate::{
         Mesh, attribute_keys, color_layers,
         uv_layers::{self, UvLayer, UvStore},
     },
-    model::{DataBlock, Id, Node, RayVisibility, SceneDoc, Transform, VertexGroup},
+    model::{DataBlock, Id, Node, RayKind, RayVisibility, SceneDoc, Transform, VertexGroup},
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -1014,26 +1014,11 @@ pub(crate) fn render_visible_nodes(
 pub(crate) fn ray_visibility_differences(node: &Node) -> Vec<String> {
     let visibility = node.resolved_ray_visibility();
     let default = RayVisibility::default_for_kind(&node.kind);
-    [
-        ("visible_camera", visibility.camera, default.camera),
-        ("visible_diffuse", visibility.diffuse, default.diffuse),
-        ("visible_glossy", visibility.glossy, default.glossy),
-        (
-            "visible_transmission",
-            visibility.transmission,
-            default.transmission,
-        ),
-        (
-            "visible_volume_scatter",
-            visibility.volume_scatter,
-            default.volume_scatter,
-        ),
-        ("visible_shadow", visibility.shadow, default.shadow),
-    ]
-    .into_iter()
-    .filter(|(_, value, expected)| value != expected)
-    .map(|(name, value, _)| format!("{name}={value}"))
-    .collect()
+    RayKind::ALL
+        .into_iter()
+        .filter(|ray| visibility.allows(*ray) != default.allows(*ray))
+        .map(|ray| format!("{}={}", ray.rna_property(), visibility.allows(ray)))
+        .collect()
 }
 
 /// Loss entries for the Blender ray-visibility flags that `format` cannot store on the objects it
@@ -1779,7 +1764,7 @@ mod tests {
     fn ray_visibility_losses_follow_what_each_format_stores() -> TestResult {
         use crate::{
             eval::{EvaluationContext, Snapshot},
-            model::{Id, RayVisibility},
+            model::{Id, RayKind, RayVisibility},
         };
 
         let mut doc = graph_from_meshes(
@@ -1793,11 +1778,10 @@ mod tests {
             .cloned()
             .ok_or("imported node missing")?;
         let node = doc.nodes.get_mut(&node_id).ok_or("imported node missing")?;
-        node.ray_visibility = Some(RayVisibility {
-            camera: false,
-            shadow: false,
-            ..RayVisibility::default()
-        });
+        let mut visibility = RayVisibility::default();
+        visibility.set(RayKind::Camera, false);
+        visibility.set(RayKind::Shadow, false);
+        node.ray_visibility = Some(visibility);
         let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
         for format in ["obj", "ply", "stl", "glb", "usda", "fbx", "alembic"] {
             let losses = super::ray_visibility_losses(format, &doc, &snapshot)?;

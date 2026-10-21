@@ -812,8 +812,8 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                     .and_then(|metadata| metadata.get_mut("rna_properties"))
                     .and_then(Value::as_object_mut)
                 {
-                    for key in crate::model::RayVisibility::RNA_PROPERTIES {
-                        if rna.remove(key).is_some() {
+                    for ray in crate::model::RayKind::ALL {
+                        if rna.remove(ray.rna_property()).is_some() {
                             item_changed = true;
                         }
                     }
@@ -837,14 +837,6 @@ fn read_ray_visibility(
     value: &Value,
 ) -> Result<Vec<(crate::model::RayKind, bool)>> {
     use crate::model::RayKind;
-    const FLAGS: [(&str, RayKind); 6] = [
-        ("camera", RayKind::Camera),
-        ("diffuse", RayKind::Diffuse),
-        ("glossy", RayKind::Glossy),
-        ("transmission", RayKind::Transmission),
-        ("volume_scatter", RayKind::VolumeScatter),
-        ("shadow", RayKind::Shadow),
-    ];
     let object = value.as_object().ok_or_else(|| {
         engine.error(
             ErrorCode::InvalidOperation,
@@ -854,7 +846,7 @@ fn read_ray_visibility(
     })?;
     if let Some(key) = object
         .keys()
-        .find(|key| !FLAGS.iter().any(|(name, _)| *name == key.as_str()))
+        .find(|key| !RayKind::ALL.iter().any(|ray| ray.name() == key.as_str()))
     {
         return Err(engine.error(
             ErrorCode::InvalidOperation,
@@ -862,14 +854,14 @@ fn read_ray_visibility(
             &operation_pointer(engine.operation_index, "set/ray_visibility"),
         ));
     }
-    FLAGS
-        .iter()
-        .filter_map(|(name, ray)| {
-            object.get(*name).map(|flag| {
-                flag.as_bool().map(|flag| (*ray, flag)).ok_or_else(|| {
+    RayKind::ALL
+        .into_iter()
+        .filter_map(|ray| {
+            object.get(ray.name()).map(|flag| {
+                flag.as_bool().map(|flag| (ray, flag)).ok_or_else(|| {
                     engine.error(
                         ErrorCode::InvalidOperation,
-                        format!("ray_visibility.{name} must be a boolean"),
+                        format!("ray_visibility.{} must be a boolean", ray.name()),
                         &operation_pointer(engine.operation_index, "set/ray_visibility"),
                     )
                 })
