@@ -1898,7 +1898,7 @@ impl SurfaceShader for SceneShader<'_> {
         occluders.finish()?;
         Ok(SurfaceSample {
             color,
-            transparent_tint: beauty_tint(material, params.transparent_tint),
+            transparent_tint: beauty_tint(material, dominant_tint(closures)),
         })
     }
 }
@@ -2257,6 +2257,12 @@ fn opaque_share(closures: &[ShaderClosure]) -> f64 {
         .map(|closure| closure.weight * closure.params.alpha.clamp(0.0, 1.0))
         .sum::<f64>()
         .clamp(0.0, 1.0)
+}
+/// The transparent tint of a hit: the heaviest closure's, as its albedo is. A surface with no closure passes its light
+/// unchanged, so its tint is white. A mixed surface's tint is an approximation of the weighted closure tints.
+fn dominant_tint(closures: &[ShaderClosure]) -> [f64; 3] {
+    heaviest(closures, |closure| closure.weight)
+        .map_or([1.0; 3], |closure| closure.params.transparent_tint)
 }
 
 fn base_albedo(params: &BsdfParams) -> DVec3 {
