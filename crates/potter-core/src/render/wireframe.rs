@@ -910,7 +910,7 @@ mod oracle_tests {
     fn surface(positions: [DVec3; 3], object_index: u32) -> Triangle {
         Triangle {
             positions,
-            generated: [DVec3::ZERO; 3],
+            generated: crate::geom::GeneratedCorners::default(),
             object_index,
             element_index: 1,
             color: [0.8, 0.8, 0.8, 1.0],

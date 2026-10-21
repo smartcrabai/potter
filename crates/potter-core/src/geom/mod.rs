@@ -253,6 +253,34 @@ impl TextureSpace {
     }
 }
 
+/// The Generated coordinate of one vertex, and the Jacobian that moves it with object-local movement: the
+/// `TextureSpace` of the object or collection member the vertex belongs to. A collection instance's joined mesh
+/// keeps one per vertex, since each member has its own texture space (Cycles' object-level `mesh_texture_space`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct GeneratedVertex {
+    pub generated: DVec3,
+    pub per_local: DVec3,
+}
+
+impl TextureSpace {
+    /// The Generated value and Jacobian of the object-local point `local` in this texture space.
+    #[must_use]
+    pub fn generated_vertex(self, local: DVec3) -> GeneratedVertex {
+        GeneratedVertex {
+            generated: self.generated(local),
+            per_local: self.generated_per_local(),
+        }
+    }
+}
+
+/// The Generated coordinates of a render triangle's three corners, and the Jacobian its corners share. Every
+/// triangle belongs to one object or collection member, so its corners share one texture space and one Jacobian.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct GeneratedCorners {
+    pub corners: [DVec3; 3],
+    pub per_local: DVec3,
+}
+
 impl Mesh {
     /// The mesh-level record that carries a manual texture space: `{"location": [x, y, z], "size": [x, y, z]}` under
     /// [`TEXTURE_SPACE_KEY`]. `None` for an automatic texture space, which is the bounds of the mesh.

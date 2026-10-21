@@ -8,7 +8,7 @@ use serde_json::{Value as JsonValue, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
-    geom::TextureSpace,
+    geom::{GeneratedCorners, TextureSpace},
     graph::{GraphKind, GraphNode, NodeGroup},
     image::{ImageData, ImageExtension, ImageInterpolation, sample_with_extension_alpha},
     model::{Id, Material, Registry, TextureRef},
@@ -767,20 +767,19 @@ impl<'a> HitContext<'a> {
         self
     }
 
-    /// Set the Generated coordinate of a hit on a triangle whose corners carry theirs (`corners`, see
-    /// [`TextureSpace::generated`]): the barycentric blend of the corner values, as Cycles interpolates the
-    /// per-vertex `ATTR_STD_GENERATED` (`intern/cycles/blender/mesh.cpp`). A corner at zero contributes exactly
-    /// zero, so a face at the texture space's edge stays at zero, as it does in Cycles.
+    /// Set the Generated coordinate of a hit on a triangle whose corners carry theirs: the barycentric blend of the
+    /// corner values, as Cycles interpolates the per-vertex `ATTR_STD_GENERATED` (`intern/cycles/blender/mesh.cpp`).
+    /// A corner at zero contributes exactly zero, so a face at the texture space's edge stays at zero, as it does in
+    /// Cycles. The Jacobian is the triangle's, since a triangle belongs to one object or collection member.
     #[must_use]
     pub fn with_generated_corners(
         mut self,
-        texture_space: TextureSpace,
-        corners: [DVec3; 3],
+        generated: GeneratedCorners,
         barycentric: [f64; 3],
     ) -> Self {
-        self.generated =
-            corners[0] * barycentric[0] + corners[1] * barycentric[1] + corners[2] * barycentric[2];
-        self.generated_per_local = texture_space.generated_per_local();
+        let [first, second, third] = generated.corners;
+        self.generated = first * barycentric[0] + second * barycentric[1] + third * barycentric[2];
+        self.generated_per_local = generated.per_local;
         self
     }
 
@@ -4051,7 +4050,7 @@ mod subsurface_method_tests {
 mod generated_corner_tests {
     use glam::DVec3;
 
-    use crate::{geom::TextureSpace, graph::NodeGroup, model::Registry};
+    use crate::{geom::GeneratedCorners, geom::TextureSpace, graph::NodeGroup, model::Registry};
 
     use super::HitContext;
 
@@ -4063,11 +4062,11 @@ mod generated_corner_tests {
     #[test]
     fn zero_corner_generated_stays_exactly_zero_under_any_weights() {
         let groups: Registry<NodeGroup> = Registry::new();
-        let context = HitContext::new(&groups).with_generated_corners(
-            texture_space(),
-            [DVec3::ZERO; 3],
-            [0.2, 0.3, 0.5],
-        );
+        let generated = GeneratedCorners {
+            corners: [DVec3::ZERO; 3],
+            per_local: texture_space().generated_per_local(),
+        };
+        let context = HitContext::new(&groups).with_generated_corners(generated, [0.2, 0.3, 0.5]);
         assert_eq!(context.generated, DVec3::ZERO);
     }
 
@@ -4083,11 +4082,23 @@ mod generated_corner_tests {
         let barycentric = [0.5, 0.25, 0.25];
         let point =
             local[0] * barycentric[0] + local[1] * barycentric[1] + local[2] * barycentric[2];
-        let context = HitContext::new(&groups).with_generated_corners(
-            space,
-            local.map(|corner| space.generated(corner)),
-            barycentric,
-        );
+        let generated = GeneratedCorners {
+            corners: local.map(|corner| space.generated(corner)),
+            per_local: space.generated_per_local(),
+        };
+        let context = HitContext::new(&groups).with_generated_corners(generated, barycentric);
         assert!((context.generated - space.generated(point)).length() < 1e-12);
+    }
+
+    #[test]
+    fn corner_hit_takes_the_triangles_jacobian() {
+        let groups: Registry<NodeGroup> = Registry::new();
+        let per_local = DVec3::new(0.1, 0.2, 0.3);
+        let generated = GeneratedCorners {
+            corners: [DVec3::ZERO; 3],
+            per_local,
+        };
+        let context = HitContext::new(&groups).with_generated_corners(generated, [1.0 / 3.0; 3]);
+        assert_eq!(context.generated_per_local, per_local);
     }
 }
