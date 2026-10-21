@@ -2773,21 +2773,21 @@ fn every_data_transfer_attribute_domain_matches_blender() -> Result<(), Box<dyn 
             "crease_edge",
             "edge",
             "float",
-            json!([0.0; 4]),
+            json!([0.0, 0.0, 0.0, 0.0]),
         )?;
         set_domain_attribute(
             &mut destination,
             "bevel_weight_edge",
             "edge",
             "float",
-            json!([0.0; 4]),
+            json!([0.0, 0.0, 0.0, 0.0]),
         )?;
         set_domain_attribute(
             &mut destination,
             "freestyle_edge",
             "edge",
             "bool",
-            json!([false; 4]),
+            json!([false, false, false, false]),
         )?;
         set_domain_attribute(
             &mut destination,
