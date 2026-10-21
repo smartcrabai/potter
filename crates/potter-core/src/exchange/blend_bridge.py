@@ -2474,19 +2474,25 @@ def _alpha_mode_of(material):
     """Potter alpha mode of a Blender material.
 
     The `potter.alpha_mode` marker is used while it agrees with `surface_render_method` (`blend` is
-    BLENDED; `opaque` and `clip` are DITHERED). Without a usable marker, BLENDED is `blend`, and DITHERED is
-    `opaque`: Blender 5.2 never thresholds alpha (`alpha_threshold` is read only by the 4.2 versioning,
-    `versioning_420.cc`), so a DITHERED material's transparency is its graph's, which `opaque` leaves to the graph.
+    BLENDED; `opaque` and `clip` are DITHERED). Without a usable marker, BLENDED is `blend`. A DITHERED material is
+    `clip` when its Principled Alpha is Blender's glTF MASK clip (`_clip_cutoff`), else `opaque`: Blender 5.2 never
+    thresholds alpha (`alpha_threshold` is read only by the 4.2 versioning, `versioning_420.cc`), so a DITHERED
+    material's transparency is its graph's, and only the clip graph reads back as a threshold.
     """
     blended = material.surface_render_method == "BLENDED"
     marker = material.get(ALPHA_MODE_PROPERTY)
     if marker in ALPHA_MODES and (marker == "blend") == blended:
         return marker
-    return "blend" if blended else "opaque"
+    if blended:
+        return "blend"
+    # A DITHERED material whose Alpha is Blender's glTF MASK clip is clip, as the glTF importer makes it.
+    return "clip" if _clip_cutoff(material) is not None else "opaque"
 
 
 def material_dump(material):
     base_color = plain(material.diffuse_color)
+    alpha_mode = _alpha_mode_of(material)
+    cutoff = _clip_cutoff(material)
     metallic = float(getattr(material, "metallic", 0.0))
     roughness = float(getattr(material, "roughness", 0.8))
     emission_color = [0.0, 0.0, 0.0]
@@ -2529,8 +2535,8 @@ def material_dump(material):
             "double_sided": not bool(getattr(material, "use_backface_culling", False)),
             "use_transparent_shadow": bool(getattr(material, "use_transparent_shadow", True)),
             "use_backface_culling_shadow": bool(getattr(material, "use_backface_culling_shadow", False)),
-            "alpha_mode": _alpha_mode_of(material),
-            "alpha_threshold": float(material.alpha_threshold),
+            "alpha_mode": alpha_mode,
+            "alpha_threshold": cutoff if alpha_mode == "clip" and cutoff is not None else float(material.alpha_threshold),
             "nodes": tree_dump(material.node_tree),
             "custom_properties": {key: value for key, value in custom_props(material).items()
                                   if key != ALPHA_MODE_PROPERTY},
@@ -6459,6 +6465,55 @@ def _nla_from_model(doc, node):
         tracks.append(track)
     return tracks
 
+def _constant_alpha(item):
+    """The Principled Alpha of a material whose alpha is not linked.
+
+    Clip is Blender's binary MASK: 1 where the base alpha reaches the cutoff, else 0, as the glTF importer sets a
+    factor-only MASK (`pbrMetallicRoughness.py` 630-640). Blend keeps the base alpha; opaque ignores it.
+    """
+    mode = item.get("alpha_mode", "opaque")
+    if mode == "opaque":
+        return 1.0
+    base_alpha = float(item["base_color"][3])
+    if mode == "clip":
+        return 1.0 if base_alpha >= float(item.get("alpha_threshold", 0.5)) else 0.0
+    return base_alpha
+
+
+def _clip_cutoff(material):
+    """The cutoff of Blender's glTF MASK clip in a material's surface, or None when there is none.
+
+    The surface is the active output's Surface input, which must come straight from a Principled BSDF's BSDF output:
+    a Mix Shader or any other node in between keeps the clip out of the surface, so it is not a clip. That Principled
+    Alpha must be the importer's `Alpha = SUBTRACT(1, LESS_THAN(x, cutoff))` (`pbrMetallicRoughness.py` 668-700):
+    LESS_THAN compares the alpha source `x` (a texture alpha, times the factor) with the cutoff, and SUBTRACT inverts
+    it. Any other shape is not a clip.
+    """
+    if material.node_tree is None:
+        return None
+    output = _material_output(material.node_tree)
+    surface = output.inputs.get("Surface") if output is not None else None
+    if surface is None or not surface.is_linked:
+        return None
+    link = surface.links[0]
+    shader = link.from_node
+    if shader.type != "BSDF_PRINCIPLED" or link.from_socket.name != "BSDF":
+        return None
+    alpha = shader.inputs.get("Alpha")
+    if alpha is None or not alpha.is_linked:
+        return None
+    subtract = alpha.links[0].from_node
+    if subtract.type != "MATH" or subtract.operation != "SUBTRACT" or not subtract.inputs[1].is_linked:
+        return None
+    first = subtract.inputs[0]
+    if first.is_linked or float(first.default_value) != 1.0:
+        return None
+    compare = subtract.inputs[1].links[0].from_node
+    if compare.type != "MATH" or compare.operation != "LESS_THAN" or compare.inputs[1].is_linked:
+        return None
+    return float(compare.inputs[1].default_value)
+
+
 def _set_principled_values(material, item):
     shader = next((node for node in material.node_tree.nodes
                    if node.type == "BSDF_PRINCIPLED"), None)
@@ -6468,9 +6523,9 @@ def _set_principled_values(material, item):
     shader.inputs["Metallic"].default_value = item["metallic"]
     alpha = shader.inputs.get("Alpha")
     if alpha is not None:
-        # Opaque ignores alpha, as Potter's renderer does; clip and blend keep the base color alpha.
-        alpha.default_value = (1.0 if item.get("alpha_mode", "opaque") == "opaque"
-                               else float(item["base_color"][3]))
+        # Opaque ignores alpha, as Potter's renderer does. Clip is binary, as Blender's glTF importer builds a
+        # factor-only MASK (`pbrMetallicRoughness.py` 630-640); blend keeps the base colour alpha.
+        alpha.default_value = _constant_alpha(item)
     shader.inputs["Roughness"].default_value = item["roughness"]
     emission = shader.inputs.get("Emission Color")
     if emission is None:

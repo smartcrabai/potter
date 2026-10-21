@@ -11586,6 +11586,69 @@ mod tests {
         Ok((applied.doc, applied.asset_blobs))
     }
 
+    #[test]
+    fn blender_clip_material_reopens_as_clip_with_the_importers_mask_stage() -> Result<()> {
+        let Some(blender) = optional_blender() else {
+            return Ok(());
+        };
+        let directory = tempfile::tempdir().map_err(|error| PotError::io(&error))?;
+        let (mut doc, asset_blobs) = native_texture_roundtrip_scene()?;
+        {
+            let material = doc
+                .materials
+                .get_mut(&Id::new("mat_red")?)
+                .ok_or_else(|| invalid_intermediate("native texture material is missing"))?;
+            material.alpha_mode = "clip".to_owned();
+            material.alpha_threshold = 0.37;
+            material.base_color[3] = 0.8;
+        }
+        let mut project = Project::init(directory.path().join("project"))?;
+        project.commit_import_with_assets(
+            doc.clone(),
+            json!({"test": "clip_texture_alpha"}),
+            json!({}),
+            &asset_blobs,
+        )?;
+        let output = directory.path().join("clip-texture-alpha.blend");
+        let context = crate::eval::EvaluationContext::default();
+        export_blend(
+            &doc,
+            &project,
+            &output,
+            &ExportOptions {
+                allow_lossy: false,
+                pack: false,
+                blender: Some(&blender),
+                context: &context,
+            },
+        )?;
+        let imported = import_blend(&output, Some(&blender))?;
+        let material = imported
+            .doc
+            .materials
+            .get(&Id::new("mat_red")?)
+            .ok_or_else(|| invalid_intermediate("clip material is missing"))?;
+        // Blender's glTF importer marks MASK as DITHERED; the marker and the graph read back as clip.
+        assert_eq!(material.alpha_mode, "clip");
+        assert!((material.alpha_threshold - 0.37).abs() <= 1.0e-6);
+        let graph_id = material
+            .node_tree
+            .as_ref()
+            .ok_or_else(|| invalid_intermediate("clip material graph is missing"))?;
+        let graph = imported
+            .doc
+            .node_groups
+            .get(graph_id)
+            .ok_or_else(|| invalid_intermediate("clip material nodes are missing"))?;
+        let compare = graph
+            .nodes
+            .get(&Id::new("base_alpha_clip")?)
+            .ok_or_else(|| invalid_intermediate("the clip stage is missing"))?;
+        assert_eq!(compare.properties["operation"], json!("LESS_THAN"));
+        assert!((compare.inputs["Value_001"].as_f64().unwrap_or(f64::NAN) - 0.37).abs() <= 1.0e-6);
+        Ok(())
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "one real Blender round-trip proves native PBR texture node mappings"
