@@ -277,6 +277,18 @@ fn complete_scene_schema(root: &mut Value) {
     scene["properties"]["compositor"] = json!({"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]});
     scene["properties"]["color_management"] = json!({"$ref":"#/$defs/color_management"});
     scene["properties"]["sequencer"] = json!({"$ref":"#/$defs/sequencer"});
+    defs["light"]["properties"]["sun_angle"] =
+        json!({"type":"number","minimum":0,"maximum":std::f64::consts::PI});
+    defs["light"]["properties"]["use_custom_distance"] = json!({"type":"boolean"});
+    defs["light"]["properties"]["cutoff_distance"] = json!({"type":"number","minimum":0});
+    for factor in [
+        "diffuse_factor",
+        "specular_factor",
+        "transmission_factor",
+        "volume_factor",
+    ] {
+        defs["light"]["properties"][factor] = json!({"type":"number","minimum":0});
+    }
     let render = &mut defs["render_settings"];
     render["properties"]["eevee_light_threshold"] = json!({"type":"number","minimum":0.0});
     render["required"] = json!([
@@ -310,18 +322,6 @@ fn complete_scene_schema(root: &mut Value) {
     render["properties"]["offscreen_dicing_scale"] =
         json!({"type":"number","minimum":1.0,"maximum":f32::MAX});
     render["properties"]["dicing_camera"] = json!({"oneOf":[id_schema(),{"type":"null"}]});
-    defs["light"]["properties"]["sun_angle"] =
-        json!({"type":"number","minimum":0,"maximum":std::f64::consts::PI});
-    defs["light"]["properties"]["use_custom_distance"] = json!({"type":"boolean"});
-    defs["light"]["properties"]["cutoff_distance"] = json!({"type":"number","minimum":0});
-    for factor in [
-        "diffuse_factor",
-        "specular_factor",
-        "transmission_factor",
-        "volume_factor",
-    ] {
-        defs["light"]["properties"][factor] = json!({"type":"number","minimum":0});
-    }
     render["properties"]["volume_bounces"] = json!({"type":"integer","minimum":0,"maximum":1024});
 
     defs["node"]["properties"]["kind"]["enum"] =
