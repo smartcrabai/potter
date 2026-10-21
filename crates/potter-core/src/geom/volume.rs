@@ -2168,10 +2168,9 @@ impl NarrowBand<'_> {
         let point = self.origin + DVec3::new(x as f64, y as f64, z as f64);
         let mut best: Option<(f64, u32)> = None;
         for prim in primitives {
-            let distance = point_triangle_distance_squared(
-                point,
-                self.triangles.triangles[prim as usize].points,
-            );
+            // `computeDistance` measures `closestPointOnTriangleToPoint(a, c, b, ...)`.
+            let [a, b, c] = self.triangles.triangles[prim as usize].points;
+            let distance = point_triangle_distance_squared(point, [a, c, b]);
             if best.is_none_or(|(current, _)| distance < current) {
                 best = Some((distance, prim));
             }
