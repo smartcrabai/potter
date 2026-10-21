@@ -36,15 +36,18 @@ impl PixelFilter {
 
     /// The raster offset, in pixels from the pixel's corner, of camera sample `sample_index`.
     ///
-    /// `u` and `v` are uniform in `[0, 1)`. Cycles' first sample is the pixel centre (`camera.h`
-    /// `integrate_camera_sample`: `rand_filter = (sample == 0) ? (0.5, 0.5) : ...`), so only the
-    /// later samples read the table. Offsets may leave the pixel: the filter's support extends past it.
+    /// `u` and `v` are uniform in `[0, 1)`. Cycles' `integrate_camera_sample` gives sample 0 the
+    /// parameter `(0.5, 0.5)`, and `camera_sample` still reads it through the table. So sample 0 is
+    /// not exactly the pixel centre: `lookup(0.5)` interpolates between table entries 511 and 512, and
+    /// entry 512 sits one step off the centre, so the result is about 0.50049 px for Box and 0.50053 px
+    /// for Blackman-Harris at width 1.5. Offsets may leave the pixel.
     pub(crate) fn sample(&self, sample_index: u32, u: f64, v: f64) -> (f64, f64) {
-        if sample_index == 0 {
+        let (u, v) = if sample_index == 0 {
             (0.5, 0.5)
         } else {
-            (self.lookup(u), self.lookup(v))
-        }
+            (u, v)
+        };
+        (self.lookup(u), self.lookup(v))
     }
 
     /// Cycles' `lookup_table_read` for the filter table: linear interpolation over `u` in `[0, 1]`.
@@ -184,10 +187,16 @@ mod tests {
     }
 
     #[test]
-    fn first_sample_is_the_pixel_centre() {
+    fn first_sample_reads_the_table_at_one_half() {
         let filter = PixelFilter::new(PixelFilterType::Gaussian, 1.5);
+        // Cycles passes (0.5, 0.5) through `lookup_table_read` for sample 0, ignoring the randoms.
         let (x, y) = filter.sample(0, 0.01, 0.99);
-        assert!((x - 0.5).abs() < 1.0e-12 && (y - 0.5).abs() < 1.0e-12);
+        assert!((x - filter.lookup(0.5)).abs() < 1.0e-12);
+        assert!((y - filter.lookup(0.5)).abs() < 1.0e-12);
+        assert!(
+            (x - 0.5).abs() > 1.0e-9,
+            "sample 0 must not be the exact centre"
+        );
         let (x, y) = filter.sample(1, 0.25, 0.75);
         assert!((x - filter.lookup(0.25)).abs() < 1.0e-12);
         assert!((y - filter.lookup(0.75)).abs() < 1.0e-12);

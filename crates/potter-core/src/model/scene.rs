@@ -1165,6 +1165,10 @@ pub enum PixelFilterType {
 
 /// Blender's `filter_width` default (`properties.py`): 1.5 pixels.
 pub const DEFAULT_FILTER_WIDTH: f64 = 1.5;
+/// Blender's `filter_width` RNA range. Blender stores the value as float32, so the lower bound is
+/// `0.01_f32` widened: a `.blend` holding the clamped minimum reads back as this value exactly.
+pub const FILTER_WIDTH_MIN: f64 = 0.01_f32 as f64;
+pub const FILTER_WIDTH_MAX: f64 = 10.0;
 
 fn default_pixel_filter_type() -> PixelFilterType {
     PixelFilterType::BlackmanHarris
@@ -1250,8 +1254,7 @@ impl RenderSettings {
                 "Cycles adaptive dicing settings are outside Blender RNA ranges",
             ));
         }
-        // Blender stores `filter_width` as float32, so its RNA bound 0.01 is `0.01_f32` widened here.
-        if !(f64::from(0.01_f32)..=f64::from(10.0_f32)).contains(&self.filter_width) {
+        if !(FILTER_WIDTH_MIN..=FILTER_WIDTH_MAX).contains(&self.filter_width) {
             return Err(PotError::new(
                 ErrorCode::SceneInvalid,
                 "Cycles filter_width is outside Blender RNA range 0.01..=10",

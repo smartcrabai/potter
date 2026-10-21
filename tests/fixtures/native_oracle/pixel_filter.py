@@ -12,8 +12,12 @@ the whole frame is nearly the same for each filter; the per-pixel values are wha
 The script renders `seeds` seeds of the same scene at `SAMPLES` samples per pixel. It writes the
 scene (with the filter type and width set) as a `.blend`, which Potter imports, and writes per
 pixel the mean and standard error of the red channel over the seeds (the floor and lines are grey).
+With `seeds` 0 the script only saves the `.blend` and writes no JSON, so a test that needs just the
+scene does not pay for renders.
 
-Arguments after `--`: blend_out, json_out, kind (box | gaussian | blackman_harris), seeds.
+Arguments after `--`: blend_out, json_out, kind (box | gaussian | gaussian_wide | blackman_harris),
+seeds. `gaussian_wide` is a Gaussian of width 2.5, so it differs from the default-width kinds and
+shows whether Potter reads `filter_width`.
 """
 
 import json
@@ -36,6 +40,7 @@ FLOOR_ALBEDO = 0.8
 FILTERS = {
     "box": ("BOX", 1.5),
     "gaussian": ("GAUSSIAN", 1.5),
+    "gaussian_wide": ("GAUSSIAN", 2.5),
     "blackman_harris": ("BLACKMAN_HARRIS", 1.5),
 }
 filter_type, filter_width = FILTERS[kind]
@@ -103,30 +108,34 @@ scene.collection.objects.link(camera)
 camera.location = (0.0, 0.0, 5.0)
 scene.camera = camera
 
+if 0 < SEEDS < 2:
+    raise ValueError("pixel_filter.py needs 0 seeds (save only) or at least 2 seeds")
+
 bpy.ops.wm.save_as_mainfile(filepath=blend_out)
 
-sums = [0.0] * (WIDTH * HEIGHT)
-squares = [0.0] * (WIDTH * HEIGHT)
-for seed in range(SEEDS):
-    scene.cycles.seed = seed
-    scene.render.filepath = blend_out + f".{seed}.exr"
-    bpy.ops.render.render(write_still=True)
-    image = bpy.data.images.load(scene.render.filepath, check_existing=False)
-    pixels = list(image.pixels)
-    channels = image.channels
-    for index in range(WIDTH * HEIGHT):
-        value = pixels[index * channels]
-        sums[index] += value
-        squares[index] += value * value
-    bpy.data.images.remove(image)
+if SEEDS > 0:
+    sums = [0.0] * (WIDTH * HEIGHT)
+    squares = [0.0] * (WIDTH * HEIGHT)
+    for seed in range(SEEDS):
+        scene.cycles.seed = seed
+        scene.render.filepath = blend_out + f".{seed}.exr"
+        bpy.ops.render.render(write_still=True)
+        image = bpy.data.images.load(scene.render.filepath, check_existing=False)
+        pixels = list(image.pixels)
+        channels = image.channels
+        for index in range(WIDTH * HEIGHT):
+            value = pixels[index * channels]
+            sums[index] += value
+            squares[index] += value * value
+        bpy.data.images.remove(image)
 
-means = [value / SEEDS for value in sums]
-# Unbiased sample standard deviation over the seeds, then the standard error of the mean.
-errors = [
-    math.sqrt(max(squares[index] / SEEDS - means[index] ** 2, 0.0) * SEEDS / (SEEDS - 1)) / math.sqrt(SEEDS)
-    for index in range(WIDTH * HEIGHT)
-]
+    means = [value / SEEDS for value in sums]
+    # Unbiased sample standard deviation over the seeds, then the standard error of the mean.
+    errors = [
+        math.sqrt(max(squares[index] / SEEDS - means[index] ** 2, 0.0) * SEEDS / (SEEDS - 1)) / math.sqrt(SEEDS)
+        for index in range(WIDTH * HEIGHT)
+    ]
 
-with open(json_out, "w", encoding="utf-8") as handle:
-    json.dump({"kind": kind, "seeds": SEEDS, "width": WIDTH, "height": HEIGHT,
-               "mean": means, "stderr": errors}, handle)
+    with open(json_out, "w", encoding="utf-8") as handle:
+        json.dump({"kind": kind, "seeds": SEEDS, "width": WIDTH, "height": HEIGHT,
+                   "mean": means, "stderr": errors}, handle)

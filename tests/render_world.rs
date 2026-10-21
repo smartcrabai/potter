@@ -422,8 +422,10 @@ fn true_displacement_subdivides_and_moves_the_rendered_silhouette() -> Result<()
             &directory.path().join(format!("{method}_render")),
             Some("path"),
         )?;
-        // Rows that hold a foreground pixel. One sample per pixel samples only the pixel centres, so
-        // the silhouette is binary there and can coincide for both methods; 64 samples resolve it.
+        // Rows that hold a foreground pixel, read at 64 samples. A single sample per pixel gives a
+        // hard on/off edge at each pixel's sample point, and the 0.5 displacement moves the edge only
+        // a few rows at this scale, so the one-sample silhouette can match. At 64 samples the edge is
+        // antialiased and its extent changes with the displacement (24 rows bump, 35 displaced).
         let rows: Vec<usize> = (0..64)
             .filter(|&y| (0..64).any(|x| pixels[(y * 64 + x) * 4] > 150))
             .collect();

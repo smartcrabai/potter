@@ -281,8 +281,7 @@ fn complete_scene_schema(root: &mut Value) {
     render["properties"]["dicing_camera"] = json!({"oneOf":[id_schema(),{"type":"null"}]});
     render["properties"]["pixel_filter_type"] =
         json!({"enum":["BOX","GAUSSIAN","BLACKMAN_HARRIS"],"default":"BLACKMAN_HARRIS"});
-    render["properties"]["filter_width"] =
-        json!({"type":"number","minimum":0.01,"maximum":10.0,"default":1.5});
+    render["properties"]["filter_width"] = json!({"type":"number","minimum":crate::model::FILTER_WIDTH_MIN,"maximum":crate::model::FILTER_WIDTH_MAX,"default":crate::model::DEFAULT_FILTER_WIDTH});
 
     defs["node"]["properties"]["kind"]["enum"] =
         json!(["empty", "mesh", "camera", "light", "armature"]);
@@ -2387,7 +2386,7 @@ fn set_schema(operation: &str) -> Value {
             "max_bounces":{"type":"integer","minimum":0,"maximum":1024},
             "transparent_max_bounces":{"type":"integer","minimum":0,"maximum":1024},
             "pixel_filter_type":{"enum":["BOX","GAUSSIAN","BLACKMAN_HARRIS"]},
-            "filter_width":{"type":"number","minimum":0.01,"maximum":10.0},
+            "filter_width":{"type":"number","minimum":crate::model::FILTER_WIDTH_MIN,"maximum":crate::model::FILTER_WIDTH_MAX},
             "film_transparent":{"type":"boolean"},
             "engine":{"enum":["path","realtime"]},
             "use_sequencer":{"type":"boolean"},

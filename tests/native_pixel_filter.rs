@@ -15,11 +15,16 @@
 //! references, `sigma_b` is Blender's per-pixel standard error, and `sigma_p` is Potter's
 //! per-pixel noise, scaled from Blender's measured per-seed deviation to 256 samples. At these
 //! settings the standard error is 0.02 to 0.06 (1024 samples gave 0.01 to 0.03; it scales with the
-//! inverse square root of the sample count), so the threshold 0.5 is about 9 or more standard errors from
-//! either hypothesis. The threshold is not loosened to pass.
+//! inverse square root of the sample count), so the threshold 0.5 is about 9 or more standard errors
+//! from either hypothesis. The threshold is not loosened to pass.
 //!
 //! Alternatives: the Potter box filter (what Potter did before this filter existed) is an
-//! alternative for both kinds; the Blackman-Harris filter is one for the Gaussian.
+//! alternative for every kind; the Blackman-Harris filter is one for the Gaussian; the default-width
+//! Gaussian is one for `gaussian_wide` (a Gaussian of width 2.5), which is what Potter would render
+//! if it dropped `filter_width` on import.
+//!
+//! The round trip needs only a `.blend`, so it asks the generator for zero seeds, which saves the
+//! scene and renders nothing.
 
 #[path = "common/blender_checked.rs"]
 mod blender_checked;
@@ -105,13 +110,15 @@ fn reference_numbers(value: &Value, kind: &str, key: &str) -> TestResult<Vec<f64
     Ok(numbers)
 }
 
-/// Renders `kind` in Blender, returning its `.blend` and reference.
-fn blender_reference(
+/// Runs `pixel_filter.py` for `kind` with `seeds` seeds, returning the `.blend` and the JSON path.
+/// Zero seeds saves the `.blend` only, and the script then writes no JSON.
+fn run_pixel_filter_script(
     blender: &Path,
     root: &Path,
     script: &Path,
     kind: &str,
-) -> TestResult<(PathBuf, Reference)> {
+    seeds: u32,
+) -> TestResult<(PathBuf, PathBuf)> {
     let blend = root.join(format!("{kind}.blend"));
     let json_path = root.join(format!("{kind}.json"));
     let output = Command::new(blender)
@@ -128,14 +135,25 @@ fn blender_reference(
         .arg(&blend)
         .arg(&json_path)
         .arg(kind)
-        .arg(BLENDER_SEEDS.to_string())
+        .arg(seeds.to_string())
         .output()?;
     assert!(
         output.status.success(),
-        "Blender {kind} reference failed: stdout={} stderr={}",
+        "Blender {kind} with {seeds} seeds failed: stdout={} stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    Ok((blend, json_path))
+}
+
+/// Renders `kind` in Blender with `BLENDER_SEEDS` seeds, returning its `.blend` and reference.
+fn blender_reference(
+    blender: &Path,
+    root: &Path,
+    script: &Path,
+    kind: &str,
+) -> TestResult<(PathBuf, Reference)> {
+    let (blend, json_path) = run_pixel_filter_script(blender, root, script, kind, BLENDER_SEEDS)?;
     let value: Value = serde_json::from_slice(&fs::read(&json_path)?)?;
     let reference = Reference {
         mean: reference_numbers(&value, kind, "mean")?,
@@ -146,6 +164,21 @@ fn blender_reference(
         return Err(format!("{kind} reference is not {RESOLUTION} x {RESOLUTION}").into());
     }
     Ok((blend, reference))
+}
+
+/// Saves the scene for `kind` as a `.blend` without rendering it.
+fn blender_blend_only(
+    blender: &Path,
+    root: &Path,
+    script: &Path,
+    kind: &str,
+) -> TestResult<PathBuf> {
+    let (blend, json_path) = run_pixel_filter_script(blender, root, script, kind, 0)?;
+    assert!(
+        !json_path.exists(),
+        "zero seeds must not render a reference"
+    );
+    Ok(blend)
 }
 
 /// The fit of Potter's image to `own + alpha * (alternative - own)`, and its standard error.
@@ -275,9 +308,11 @@ fn blackman_harris_pixel_filter_matches_cycles_and_not_box() -> TestResult {
     check_kind("blackman_harris", &["box"])
 }
 
+/// A Gaussian of width 2.5 differs from the default-width kinds, so an import that drops
+/// `filter_width` (or a table that ignores it) moves Potter onto the Gaussian 1.5 or Box reference.
 #[test]
-fn gaussian_pixel_filter_matches_cycles_and_not_box_or_blackman_harris() -> TestResult {
-    check_kind("gaussian", &["box", "blackman_harris"])
+fn gaussian_wide_pixel_filter_width_is_imported_and_applied() -> TestResult {
+    check_kind("gaussian_wide", &["gaussian", "box"])
 }
 
 /// The filter type and width Potter writes to a `.blend` are the ones Blender reads back.
@@ -289,7 +324,7 @@ fn pixel_filter_settings_round_trip_through_blend() -> TestResult {
     let root = tempdir()?;
     let script = root.path().join("pixel_filter.py");
     fs::write(&script, SCRIPT)?;
-    let (blend, _) = blender_reference(&blender, root.path(), &script, "blackman_harris")?;
+    let blend = blender_blend_only(&blender, root.path(), &script, "blackman_harris")?;
 
     let project = root.path().join("project");
     pot_json::pot_json(&["init", text(&project)?])?;

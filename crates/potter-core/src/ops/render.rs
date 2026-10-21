@@ -141,7 +141,13 @@ pub(super) fn apply(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> 
             }
         })
         .transpose()?;
-    let filter_width = optional_f64(engine, set, "filter_width", 0.01, 10.0)?;
+    let filter_width = optional_f64(
+        engine,
+        set,
+        "filter_width",
+        crate::model::FILTER_WIDTH_MIN,
+        crate::model::FILTER_WIDTH_MAX,
+    )?;
     let motion_blur_samples = optional_u32(engine, set, "motion_blur_samples", 1, 64)?;
     let dicing_rate = optional_f64(engine, set, "dicing_rate", 0.1, 1000.0)?;
     let preview_dicing_rate = optional_f64(engine, set, "preview_dicing_rate", 0.1, 1000.0)?;
