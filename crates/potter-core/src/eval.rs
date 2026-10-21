@@ -4081,6 +4081,7 @@ fn apply_scene_shrinkwrap_modifier(
         doc,
         world_matrices,
         evaluated_meshes,
+        &BTreeMap::new(),
     )?;
     let target = operands
         .remove("target")
@@ -4095,13 +4096,14 @@ fn apply_scene_shrinkwrap_modifier(
     let mut resolved = modifier.clone();
     resolved.params.remove("target");
     resolved.params.remove("auxiliary_target");
+    let target_to_subject = operand_local_to_subject(&target)?;
     let subject_to_target = crate::geom::blender_matrix::shrinkwrap_subject_to_target(
         doc,
         subject_id,
         &target_id,
         world_matrices,
     )
-    .unwrap_or_else(|| target.local_to_subject.inverse());
+    .unwrap_or_else(|| target_to_subject.inverse());
     resolved.runtime.shrinkwrap_subject_to_target = Some(subject_to_target.to_cols_array());
     resolved.runtime.shrinkwrap_target_mesh = Some(target.mesh);
     if let Some(auxiliary_id) = auxiliary_id {
@@ -4115,13 +4117,14 @@ fn apply_scene_shrinkwrap_modifier(
                     json!({"modifier_id":modifier.id,"auxiliary_target":auxiliary_id}),
                 )
             })?;
+        let auxiliary_to_subject = operand_local_to_subject(&auxiliary)?;
         let subject_to_auxiliary = crate::geom::blender_matrix::shrinkwrap_subject_to_target(
             doc,
             subject_id,
             &auxiliary_id,
             world_matrices,
         )
-        .unwrap_or_else(|| auxiliary.local_to_subject.inverse());
+        .unwrap_or_else(|| auxiliary_to_subject.inverse());
         resolved.runtime.shrinkwrap_auxiliary_subject_to_target =
             Some(subject_to_auxiliary.to_cols_array());
         resolved.runtime.shrinkwrap_auxiliary_target_mesh = Some(auxiliary.mesh);
