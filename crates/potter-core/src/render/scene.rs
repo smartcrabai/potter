@@ -536,13 +536,14 @@ pub(super) fn extract_geometry(
             .iter()
             .map(|&index| &color_store.layers[index])
             .collect();
+        let texture_space = mesh
+            .and_then(Mesh::manual_texture_space)
+            .unwrap_or_else(|| TextureSpace::automatic(mesh.and_then(Mesh::bounds)));
         objects.push(ObjectRecord {
             index: object_index,
             node_id: node_id.clone(),
             data_id: node.data.clone(),
-            texture_space: mesh
-                .and_then(Mesh::manual_texture_space)
-                .unwrap_or_else(|| TextureSpace::automatic(mesh.and_then(Mesh::bounds))),
+            texture_space,
             instance_path: snapshot
                 .instance_paths
                 .get(node_id)
@@ -722,6 +723,7 @@ pub(super) fn extract_geometry(
                     })?;
                 for triangle in face_triangles {
                     let mut positions = [DVec3::ZERO; 3];
+                    let mut generated = [DVec3::ZERO; 3];
                     let corners = triangle_corners(face, triangle);
                     let layer_uvs = triangle_layer_uvs(&uv_store, face_index, corners);
                     for (index, vertex_id) in triangle.iter().enumerate() {
@@ -732,6 +734,7 @@ pub(super) fn extract_geometry(
                             )
                         })?;
                         positions[index] = matrix.transform_point3(local);
+                        generated[index] = texture_space.generated(local);
                     }
                     let uv = render_layer
                         .and_then(|index| layer_uvs.get(index).copied())
@@ -771,6 +774,7 @@ pub(super) fn extract_geometry(
                     };
                     let triangle = Triangle {
                         positions,
+                        generated,
                         object_index,
                         element_index,
                         color,
@@ -1451,7 +1455,7 @@ fn subdivide_displaced_triangle(
     warnings: &RefCell<Vec<serde_json::Value>>,
     evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<[Triangle; 4]> {
-    subdivide_displaced(triangle, object_to_world, |sample| {
+    subdivide_displaced(triangle, object_to_world, object.texture_space, |sample| {
         let mut tables = LayerTables::new();
         let context = layered_context(
             doc,
@@ -1497,6 +1501,7 @@ struct DisplacementSample {
 fn subdivide_displaced(
     triangle: &Triangle,
     object_to_world: DMat4,
+    texture_space: TextureSpace,
     mut displacement: impl FnMut(&DisplacementSample) -> Result<f64>,
 ) -> Result<[Triangle; 4]> {
     let normal = (triangle.positions[1] - triangle.positions[0])
@@ -1511,6 +1516,7 @@ fn subdivide_displaced(
         [0.0, 0.0, 1.0],
     ];
     let mut positions = [DVec3::ZERO; 6];
+    let mut generated = [DVec3::ZERO; 6];
     let mut uvs = [[0.0; 2]; 6];
     let mut layer_samples = vec![[[0.0; 2]; 6]; triangle.layer_uvs.len()];
     let mut color_samples = vec![[[0.0; 4]; 6]; triangle.layer_colors.len()];
@@ -1541,8 +1547,17 @@ fn subdivide_displaced(
             barycentric: weights,
             normal: sample_normal,
         };
-        let displacement = displacement(&sample)?;
-        positions[index] = point + sample_normal * displacement;
+        let height = displacement(&sample)?;
+        positions[index] = point + sample_normal * height;
+        // The displaced sample's object-local point carries its Generated; a sample that did not move keeps its own.
+        let displaced_object = if crate::float::equal_f64(height, 0.0) {
+            object
+        } else if inverse_is_finite {
+            world_to_object.transform_point3(positions[index])
+        } else {
+            positions[index]
+        };
+        generated[index] = texture_space.generated(displaced_object);
         sample_normals[index] = sample_normal;
         uvs[index] = uv;
         for (table, corners) in layer_samples.iter_mut().zip(&triangle.layer_uvs) {
@@ -1556,6 +1571,7 @@ fn subdivide_displaced(
     Ok(indices.map(|corners| {
         let mut subtriangle = triangle.with_corners(
             corners.map(|vertex| positions[vertex]),
+            corners.map(|vertex| generated[vertex]),
             corners.map(|vertex| uvs[vertex]),
             layer_samples
                 .iter()
@@ -2122,7 +2138,8 @@ pub(super) fn layered_context<'a>(
         .with_color_layers(color_maps, color_render)
         .with_warnings(warnings);
     context.uv = uv_override.unwrap_or_else(|| blend_uv(&triangle.uv, pose.barycentric));
-    context = context.with_generated(object.texture_space, pose.object);
+    context =
+        context.with_generated_corners(object.texture_space, triangle.generated, pose.barycentric);
     context.position = pose.point;
     context.object = pose.object;
     context.normal = pose.normal;
@@ -3032,6 +3049,7 @@ mod shading_normal_tests {
     fn source_triangle(positions: [DVec3; 3], normals: [DVec3; 3]) -> Triangle {
         Triangle {
             positions,
+            generated: [DVec3::ZERO; 3],
             object_index: 1,
             element_index: 1,
             color: [1.0; 4],
@@ -3073,9 +3091,11 @@ mod shading_normal_tests {
         // The second triangle is not coplanar with the first, so face normals differ.
         let first = source_triangle([DVec3::ZERO, DVec3::X, DVec3::Y], [tilt; 3]);
         let second = source_triangle([DVec3::X, DVec3::new(1.0, 1.0, 0.5), DVec3::Y], [tilt; 3]);
-        let first_out = subdivide_displaced(&first, DMat4::IDENTITY, |_| Ok(0.1)).expect("first");
-        let second_out =
-            subdivide_displaced(&second, DMat4::IDENTITY, |_| Ok(0.1)).expect("second");
+        let texture_space = crate::geom::TextureSpace::automatic(None);
+        let first_out = subdivide_displaced(&first, DMat4::IDENTITY, texture_space, |_| Ok(0.1))
+            .expect("first");
+        let second_out = subdivide_displaced(&second, DMat4::IDENTITY, texture_space, |_| Ok(0.1))
+            .expect("second");
         let shared_edge = [
             DVec3::X + tilt * 0.1,
             DVec3::Y + tilt * 0.1,

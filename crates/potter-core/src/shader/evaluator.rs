@@ -767,6 +767,23 @@ impl<'a> HitContext<'a> {
         self
     }
 
+    /// Set the Generated coordinate of a hit on a triangle whose corners carry theirs (`corners`, see
+    /// [`TextureSpace::generated`]): the barycentric blend of the corner values, as Cycles interpolates the
+    /// per-vertex `ATTR_STD_GENERATED` (`intern/cycles/blender/mesh.cpp`). A corner at zero contributes exactly
+    /// zero, so a face at the texture space's edge stays at zero, as it does in Cycles.
+    #[must_use]
+    pub fn with_generated_corners(
+        mut self,
+        texture_space: TextureSpace,
+        corners: [DVec3; 3],
+        barycentric: [f64; 3],
+    ) -> Self {
+        self.generated =
+            corners[0] * barycentric[0] + corners[1] * barycentric[1] + corners[2] * barycentric[2];
+        self.generated_per_local = texture_space.generated_per_local();
+        self
+    }
+
     /// Provide the per-hit color of each color layer by name, plus the render layer's color. Missing
     /// layers use the node-specific Blender defaults: transparent black for Vertex Color and opaque
     /// black for Attribute.
@@ -4027,5 +4044,50 @@ mod subsurface_method_tests {
             SubsurfaceMethod::Mixed.unsupported_feature(),
             Some("shader.principled.subsurface_method.mixed")
         );
+    }
+}
+
+#[cfg(test)]
+mod generated_corner_tests {
+    use glam::DVec3;
+
+    use crate::{geom::TextureSpace, graph::NodeGroup, model::Registry};
+
+    use super::HitContext;
+
+    /// A texture space of half-extent 2 at the origin: Generated is `local / 4 + 0.5` per axis.
+    fn texture_space() -> TextureSpace {
+        TextureSpace::manual(DVec3::ZERO, DVec3::splat(2.0))
+    }
+
+    #[test]
+    fn zero_corner_generated_stays_exactly_zero_under_any_weights() {
+        let groups: Registry<NodeGroup> = Registry::new();
+        let context = HitContext::new(&groups).with_generated_corners(
+            texture_space(),
+            [DVec3::ZERO; 3],
+            [0.2, 0.3, 0.5],
+        );
+        assert_eq!(context.generated, DVec3::ZERO);
+    }
+
+    #[test]
+    fn corner_generated_blends_to_the_generated_of_the_interpolated_point() {
+        let groups: Registry<NodeGroup> = Registry::new();
+        let space = texture_space();
+        let local = [
+            DVec3::new(-2.0, 0.0, 0.0),
+            DVec3::new(2.0, 0.0, 0.0),
+            DVec3::new(0.0, 2.0, 0.0),
+        ];
+        let barycentric = [0.5, 0.25, 0.25];
+        let point =
+            local[0] * barycentric[0] + local[1] * barycentric[1] + local[2] * barycentric[2];
+        let context = HitContext::new(&groups).with_generated_corners(
+            space,
+            local.map(|corner| space.generated(corner)),
+            barycentric,
+        );
+        assert!((context.generated - space.generated(point)).length() < 1e-12);
     }
 }
