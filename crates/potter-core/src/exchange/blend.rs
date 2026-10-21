@@ -125,6 +125,9 @@ pub fn export_blend(
     let (texture_losses, texture_edits) =
         crate::exchange::material_graph::plan_blend_textures(doc)?;
     losses.extend(texture_losses);
+    // A loss the user accepted at import is carried on as compatibility data, so re-exporting it adds no new
+    // loss (the accepted set is `SceneDoc::accepted_losses`).
+    losses.retain(|loss| !doc.accepted_losses.contains(&loss.feature_id));
     if !losses.is_empty() && !opts.allow_lossy {
         return Err(PotError::with_details(
             ErrorCode::UnrepresentableFeature,
@@ -8947,7 +8950,7 @@ fn resolve_physics_collection_references(
 ) {
     let honoured = crate::physics_support::honoured_properties(system);
     for (key, value) in block.iter_mut() {
-        if let Some(nested) = nested_physics_system(system, key) {
+        if let Some(nested) = crate::physics_support::nested_physics_system(system, key) {
             match value {
                 Value::Object(nested_block) => {
                     resolve_physics_collection_references(nested, nested_block, collection_ids);
@@ -9006,7 +9009,7 @@ fn collect_physics_import_losses(
             // Blender's solver state (estimates, cache paths, cache flags), not a setting the user chose.
             continue;
         }
-        if let Some(nested) = nested_physics_system(system, key) {
+        if let Some(nested) = crate::physics_support::nested_physics_system(system, key) {
             match value {
                 Value::Object(nested_block) => {
                     collect_physics_import_losses(nested, nested_block, owner, collections, losses);
@@ -9148,7 +9151,7 @@ fn collect_potter_physics_export_losses(
         {
             continue;
         }
-        if let Some(nested) = nested_physics_system(system, key) {
+        if let Some(nested) = crate::physics_support::nested_physics_system(system, key) {
             match value {
                 Value::Object(block) => {
                     collect_potter_physics_export_losses(nested, block, owner, losses);
@@ -9178,15 +9181,6 @@ fn collect_potter_physics_export_losses(
 
 /// The physics system of a block nested in `system`: a cloth's `collision_settings`, each dynamic-paint canvas surface (one block
 /// per surface), and any `point_cache`. Other nested values are compared whole against their default.
-fn nested_physics_system(system: &str, key: &str) -> Option<&'static str> {
-    match (system, key) {
-        ("cloth", "collision_settings") => Some("cloth_collision"),
-        ("dynamic_paint_canvas", "canvas_surfaces") => Some("dynamic_paint_surface"),
-        (_, "point_cache") => Some("point_cache"),
-        _ => None,
-    }
-}
-
 fn has_verbatim_native_movie_clip(doc: &SceneDoc, clip: &MovieClip) -> bool {
     let original_blend = doc.compatibility.values().any(|entry| {
         entry.get("format").and_then(Value::as_str) == Some("blend")

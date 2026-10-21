@@ -9,12 +9,26 @@ use std::sync::LazyLock;
 
 use serde_json::{Map, Value, json};
 
+use std::collections::BTreeSet;
+
 use crate::error::{ErrorCode, PotError, Result};
+use crate::model::SceneDoc;
 
 /// Physics settings blocks Potter evaluates or reports. Names are Blender 5.2.2 RNA struct roles.
 ///
 /// `fluid_domain` is the GAS table and `fluid_domain_liquid` the LIQUID table, because Blender's
 /// domain defaults depend on `domain_type`. Use [`fluid_domain_system`] to pick one.
+/// The Blender physics block nested under `key` of a `system` block (`collision_settings` of cloth,
+/// the surfaces of a canvas, and any `point_cache`), named by the system it holds.
+pub(crate) fn nested_physics_system(system: &str, key: &str) -> Option<&'static str> {
+    match (system, key) {
+        ("cloth", "collision_settings") => Some("cloth_collision"),
+        ("dynamic_paint_canvas", "canvas_surfaces") => Some("dynamic_paint_surface"),
+        (_, "point_cache") => Some("point_cache"),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 pub(crate) const PHYSICS_SYSTEMS: [&str; 12] = [
     "cloth",
@@ -33,9 +47,16 @@ pub(crate) const PHYSICS_SYSTEMS: [&str; 12] = [
 
 /// Collision properties that point-sampled consumers (particles and liquid) honour.
 ///
-/// Cloth and soft bodies honour [`honoured_properties`] for `collision`, which adds the culling,
-/// normal, and friction properties their solvers implement.
-pub(crate) const POINT_COLLISION_HONOURED: [&str; 2] = ["use", "thickness_outer"];
+/// Cloth and soft bodies honour [`honoured_properties`] for `collision`, which adds the culling and
+/// normal properties their solvers implement. `cloth_friction` is cloth's own friction
+/// (`collision.cc`, `pdef_cfrict`) and `thickness_inner` is the soft body's inner thickness
+/// (`softbody.cc`, `pdef_sbift`), so a particle system has no use for either.
+pub(crate) const POINT_COLLISION_HONOURED: [&str; 4] = [
+    "use",
+    "thickness_outer",
+    "cloth_friction",
+    "thickness_inner",
+];
 
 static DEFAULTS: LazyLock<Value> =
     LazyLock::new(
@@ -58,6 +79,10 @@ pub(crate) fn honoured_properties(system: &str) -> &'static [&'static str] {
             "mass",
             "air_damping",
             "vertex_group_mass",
+            "goal_default",
+            "goal_spring",
+            "pin_stiffness",
+            "goal_friction",
             "tension_stiffness",
             "compression_stiffness",
             "shear_stiffness",
@@ -255,6 +280,106 @@ pub(crate) fn unsupported_property(system: &str, property: &str) -> PotError {
         format!("Blender {system} property `{property}` is not supported at a non-default value"),
         json!({"feature_id":feature_id,"property":property,"status":"not_supported"}),
     )
+}
+
+/// Removes the physics settings that an accepted `--allow-lossy` import reported (loss ids
+/// `blender.physics.<system>.<property>` in `SceneDoc::accepted_losses`) from a copy of the document,
+/// so evaluation does not refuse them. Each removed value gives one warning. `None` when no physics
+/// loss was accepted, so the common path does not copy the document.
+pub(crate) fn without_accepted_losses(doc: &SceneDoc) -> Option<(SceneDoc, Vec<PotError>)> {
+    let accepted: BTreeSet<&str> = doc
+        .accepted_losses
+        .iter()
+        .map(String::as_str)
+        .filter(|id| id.starts_with("blender.physics."))
+        .collect();
+    if accepted.is_empty() {
+        return None;
+    }
+    let mut copy = doc.clone();
+    let mut warnings = Vec::new();
+    for (node_id, node) in &mut copy.nodes {
+        let fluid_type = node
+            .modifiers
+            .iter()
+            .find(|modifier| modifier.modifier_type == "fluid")
+            .and_then(|modifier| modifier.params.get("fluid_type"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        for (property, value) in &mut node.properties {
+            let Value::Object(block) = value else {
+                continue;
+            };
+            let system = match property.as_str() {
+                "physics_cloth" => Some("cloth"),
+                "physics_soft_body" => Some("soft_body"),
+                "physics_collision" => Some("collision"),
+                "physics_dynamic_paint" => match block.get("role").and_then(Value::as_str) {
+                    Some("canvas") => Some("dynamic_paint_canvas"),
+                    Some("brush") => Some("dynamic_paint_brush"),
+                    _ => None,
+                },
+                "physics_fluid" => match fluid_type.as_deref() {
+                    Some("DOMAIN") => Some(fluid_domain_system(
+                        block
+                            .get("domain_type")
+                            .and_then(Value::as_str)
+                            .unwrap_or("GAS"),
+                    )),
+                    Some("FLOW") => Some("fluid_flow"),
+                    Some("EFFECTOR") => Some("fluid_effector"),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(system) = system {
+                strip_accepted_block(block, system, &accepted, node_id.as_str(), &mut warnings);
+            }
+        }
+    }
+    Some((copy, warnings))
+}
+
+fn strip_accepted_block(
+    block: &mut Map<String, Value>,
+    system: &str,
+    accepted: &BTreeSet<&str>,
+    node_id: &str,
+    warnings: &mut Vec<PotError>,
+) {
+    let keys = block.keys().cloned().collect::<Vec<_>>();
+    for key in keys {
+        if key == "role" {
+            continue;
+        }
+        if let Some(nested) = nested_physics_system(system, &key) {
+            match block.get_mut(&key) {
+                Some(Value::Object(inner)) => {
+                    strip_accepted_block(inner, nested, accepted, node_id, warnings);
+                }
+                Some(Value::Array(items)) => {
+                    for item in items {
+                        if let Value::Object(inner) = item {
+                            strip_accepted_block(inner, nested, accepted, node_id, warnings);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+        let id = format!("blender.physics.{system}.{key}");
+        if accepted.contains(id.as_str()) {
+            block.remove(&key);
+            warnings.push(PotError::with_details(
+                ErrorCode::UnsupportedFeature,
+                format!(
+                    "accepted lossy import: Blender {system} property `{key}` is not evaluated and is ignored"
+                ),
+                json!({"feature_id": id, "node_id": node_id, "status": "accepted_loss"}),
+            ));
+        }
+    }
 }
 
 #[cfg(test)]

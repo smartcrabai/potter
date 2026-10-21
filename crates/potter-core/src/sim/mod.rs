@@ -1776,7 +1776,35 @@ fn dynamic_paint_brush_settings(
 /// Potter paints one vertex-colour layer, so only PAINT surfaces in VERTEX format evaluate, and
 /// only on frames inside the surface's frame range. Other surface and point-cache properties go
 /// through the honoured-property check.
-fn validate_dynamic_paint_canvas(canvas: &Value, frame: f64) -> Result<()> {
+/// Whether a canvas paints at `frame`. Blender's dynamic paint does not evaluate a surface before its
+/// `frame_start` (the canvas keeps its geometry there), and holds the state of `frame_end` afterwards
+/// (`dynamicPaint_frameUpdate`). A canvas paints when any of its surfaces has started.
+fn canvas_paints_at(canvas: &Value, frame: f64) -> Result<bool> {
+    let Some(surfaces) = canvas.get("canvas_surfaces") else {
+        return Ok(true);
+    };
+    let surfaces = surfaces.as_array().ok_or_else(|| {
+        PotError::invalid_argument("dynamic-paint canvas_surfaces must be an array")
+    })?;
+    if surfaces.is_empty() {
+        return Ok(true);
+    }
+    for surface in surfaces {
+        let start = setting_number(
+            surface,
+            "frame_start",
+            1.0,
+            "dynamic-paint surface",
+            "a finite number",
+        )?;
+        if frame >= start {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn validate_dynamic_paint_canvas(canvas: &Value) -> Result<()> {
     let Some(surfaces) = canvas.get("canvas_surfaces") else {
         return Ok(());
     };
@@ -1801,26 +1829,6 @@ fn validate_dynamic_paint_canvas(canvas: &Value, frame: f64) -> Result<()> {
                 "surface_format",
             ));
         }
-        let start = setting_number(
-            surface,
-            "frame_start",
-            1.0,
-            "dynamic-paint surface",
-            "a finite number",
-        )?;
-        let end = setting_number(
-            surface,
-            "frame_end",
-            250.0,
-            "dynamic-paint surface",
-            "a finite number",
-        )?;
-        if frame < start || frame > end {
-            return Err(physics_support::unsupported_property(
-                "dynamic_paint_surface",
-                "frame_start",
-            ));
-        }
         point_cache_window(surface)?;
     }
     Ok(())
@@ -1833,7 +1841,10 @@ fn paint_canvas(
     matrix: DMat4,
     settings: &Value,
 ) -> Result<Vec<[f64; 4]>> {
-    validate_dynamic_paint_canvas(settings, context.frame)?;
+    validate_dynamic_paint_canvas(settings)?;
+    if !canvas_paints_at(settings, context.frame)? {
+        return Ok(vec![[0.0; 4]; canvas.vertices.len()]);
+    }
     let brushes = dynamic_paint_brush_settings(context, settings)?;
     if brushes.is_empty() {
         return dynamic_paint::paint(

@@ -789,6 +789,43 @@ impl Snapshot {
         modifier_prefix: Option<ModifierPrefix<'_>>,
         driver_values: Option<&BTreeMap<(Id, String, u32), f64>>,
     ) -> Result<Self> {
+        // Settings that an accepted lossy import reported are not evaluated: evaluate a copy without them,
+        // and carry one warning per value.
+        let accepted = crate::physics_support::without_accepted_losses(doc);
+        let (doc, accepted_warnings) = match &accepted {
+            Some((copy, warnings)) => (copy, warnings.clone()),
+            None => (doc, Vec::new()),
+        };
+        let mut snapshot = Self::evaluate_gated_inner(
+            doc,
+            scene_hash,
+            simulation_scene_hash,
+            context,
+            modifier_context,
+            selected_nodes,
+            suppressed,
+            mesh_dependencies,
+            world_matrix_ids,
+            modifier_prefix,
+            driver_values,
+        )?;
+        snapshot.warnings.splice(0..0, accepted_warnings);
+        Ok(snapshot)
+    }
+
+    fn evaluate_gated_inner(
+        doc: &SceneDoc,
+        scene_hash: &str,
+        simulation_scene_hash: &str,
+        context: &EvaluationContext,
+        modifier_context: ModifierEvaluationContext<'_>,
+        selected_nodes: Option<&BTreeSet<Id>>,
+        suppressed: &BTreeSet<Id>,
+        mesh_dependencies: &ObjectMeshDependencies,
+        world_matrix_ids: Option<&BTreeSet<Id>>,
+        modifier_prefix: Option<ModifierPrefix<'_>>,
+        driver_values: Option<&BTreeMap<(Id, String, u32), f64>>,
+    ) -> Result<Self> {
         let gate = ModifierGate {
             context: modifier_context,
             suppressed,

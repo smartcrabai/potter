@@ -11,8 +11,12 @@
 //! - `bending_stiffness` is applied to Potter's bend springs with Blender's angular scale
 //!   `k = S * rest_length * 0.1`. Only `bending_model` ANGULAR is accepted; Potter's bend springs
 //!   approximate Blender's angular model.
-//! - `vertex_group_mass` pins vertices whose goal weight `w^4` reaches 0.999 (`cloth.cc`). A
-//!   partial goal weight needs Blender's goal springs, which Potter does not model, so it is refused.
+//! - `vertex_group_mass` gives each vertex a goal weight `w^4` (`goal_default` outside the group).
+//!   A goal of 0.999 or more pins the vertex. A smaller goal is a goal spring toward the input
+//!   position with stiffness `goal * goal_spring / avg_spring_len` (`SIM_mass_spring.cc`);
+//!   `goal_friction` damps the velocity along it at `0.01 * goal_friction`. `pin_stiffness` is the
+//!   same field as `goal_spring`. The goal target is the input position, which is the per-frame
+//!   state this solver restarts from.
 //! - `quality` is the number of solver steps per frame.
 //! - Collisions use Blender's epsilon model (`collision.cc`): a vertex keeps
 //!   `collision_settings.distance_min + thickness_outer` from a collider. `use_culling` limits
@@ -110,7 +114,8 @@ pub fn simulate(
     if positions.is_empty() || frame == 0.0 {
         return Ok(positions);
     }
-    let pinned = pinned_vertices(mesh, config.pin_group.as_deref(), &ids)?;
+    let goals = vertex_goals(mesh, &config, &ids)?;
+    let pinned = goals.iter().map(|goal| goal.pinned).collect::<Vec<_>>();
 
     let mut structural_keys = BTreeSet::new();
     for edge in &mesh.edges {
@@ -167,6 +172,22 @@ pub fn simulate(
         let alpha = spring_compliance(config.bending * rest_length * ANGULAR_BEND_SCALE, dt);
         (alpha, alpha)
     })?;
+    // Blender's goal spring: stiffness `goal * goal_spring / avg_spring_len` toward the input position,
+    // for every vertex that is not pinned and has a goal weight above zero (`cloth_calc_force`).
+    let goal_springs = goals
+        .iter()
+        .enumerate()
+        .filter(|(_, goal)| !goal.pinned && goal.weight > f64::from(f32::EPSILON))
+        .map(|(index, goal)| GoalSpring {
+            index,
+            alpha: spring_compliance(
+                goal.weight * config.goal_spring / (average_length + f64::EPSILON),
+                dt,
+            ),
+            lambda: 0.0,
+        })
+        .collect::<Vec<_>>();
+    let goal_targets = positions.clone();
     let self_pair_work = if config.use_self_collision {
         positions
             .len()
@@ -202,6 +223,9 @@ pub fn simulate(
     let mut structural = structural;
     let mut shear = shear;
     let mut bend = bend;
+    let mut goal_springs = goal_springs;
+    // Goal damping is `0.01 * goal_friction` times the velocity along the goal direction.
+    let goal_damping = AIR_DRAG_SCALE * config.goal_friction;
     for _ in 0..steps {
         std::mem::swap(&mut current, &mut previous);
         for index in 0..current.len() {
@@ -210,10 +234,19 @@ pub fn simulate(
         reset_lambdas(&mut structural);
         reset_lambdas(&mut shear);
         reset_lambdas(&mut bend);
+        for goal in &mut goal_springs {
+            goal.lambda = 0.0;
+        }
         for _ in 0..config.iterations {
             solve_springs(&mut current, &inverse_masses, &mut structural);
             solve_springs(&mut current, &inverse_masses, &mut shear);
             solve_springs(&mut current, &inverse_masses, &mut bend);
+            solve_goal_springs(
+                &mut current,
+                &inverse_masses,
+                &mut goal_springs,
+                &goal_targets,
+            );
         }
         for index in 0..current.len() {
             if inverse_masses[index] == 0.0 {
@@ -221,6 +254,20 @@ pub fn simulate(
                 velocity[index] = DVec3::ZERO;
             } else {
                 velocity[index] = ((current[index] - previous[index]) / dt) * damping;
+            }
+        }
+        if goal_damping > 0.0 {
+            for goal in &goal_springs {
+                let offset = current[goal.index] - goal_targets[goal.index];
+                let length = offset.length();
+                if length <= DISTANCE_EPSILON {
+                    continue;
+                }
+                let direction = offset / length;
+                // The force `-c * v_dir` decays the velocity along the goal direction at rate c / mass.
+                let along = velocity[goal.index].dot(direction);
+                let decay = 1.0 - (-goal_damping * dt.abs() / config.mass).exp();
+                velocity[goal.index] -= direction * (along * decay);
             }
         }
         project_collisions(
@@ -258,6 +305,12 @@ struct Config {
     shear: f64,
     bending: f64,
     pin_group: Option<String>,
+    /// Blender's `goal_default`: the goal weight of a vertex outside the pin group, when a group is set.
+    goal_default: f64,
+    /// Blender's `goal_spring` (`pin_stiffness` is the same DNA field): the goal spring scaling.
+    goal_spring: f64,
+    /// Blender's `goal_friction`: goal damping, applied as `0.01 * goal_friction`.
+    goal_friction: f64,
     collision_distance: f64,
     use_self_collision: bool,
     self_collision_distance: f64,
@@ -322,6 +375,13 @@ impl Config {
             shear: super::nonnegative_setting(settings, "shear_stiffness", 5.0, "cloth")?,
             bending: super::nonnegative_setting(settings, "bending_stiffness", 0.5, "cloth")?,
             pin_group: optional_group(settings, "vertex_group_mass")?,
+            goal_default: super::nonnegative_setting(settings, "goal_default", 0.0, "cloth")?,
+            goal_spring: if settings.get("goal_spring").is_some() {
+                super::nonnegative_setting(settings, "goal_spring", 1.0, "cloth")?
+            } else {
+                super::nonnegative_setting(settings, "pin_stiffness", 1.0, "cloth")?
+            },
+            goal_friction: super::nonnegative_setting(settings, "goal_friction", 0.0, "cloth")?,
             collision_distance: collision_number("distance_min", 0.015)?,
             use_self_collision,
             self_collision_distance: collision_number("self_distance_min", 0.015)?,
@@ -534,39 +594,56 @@ fn inside_collision_triangle(point: DVec3, triangle: &CollisionTriangle) -> bool
     crate::geom::point_in_triangle_barycentric(u, v, 1.0e-10)
 }
 
-/// Pinned vertices from the `vertex_group_mass` weights.
-///
-/// Blender's goal weight is `w^4`. A goal of at least 0.999 pins the vertex; a partial goal needs
-/// Blender's goal springs, which Potter does not model, so it is refused.
-fn pinned_vertices(
-    mesh: &Mesh,
-    group_name: Option<&str>,
-    ids: &BTreeMap<u32, usize>,
-) -> Result<Vec<bool>> {
-    load_weights(mesh, group_name, ids)?
-        .iter()
-        .map(|weight| {
-            let goal = weight.powi(4);
-            if goal >= PIN_THRESHOLD {
-                Ok(true)
-            } else if goal > 0.0 {
-                Err(physics_support::unsupported_property(
-                    "cloth",
-                    "vertex_group_mass",
-                ))
-            } else {
-                Ok(false)
-            }
-        })
-        .collect()
+/// Goal state of one vertex, from the `vertex_group_mass` weights (`cloth.cc`).
+#[derive(Clone, Copy)]
+struct VertexGoal {
+    /// Blender's goal weight: `w^4` for a vertex in the pin group, `goal_default` outside it when a
+    /// group is set, and zero without a group.
+    weight: f64,
+    /// Blender pins a vertex in the group whose goal reaches 0.999; it stays at its input position.
+    pinned: bool,
 }
 
+fn vertex_goals(
+    mesh: &Mesh,
+    config: &Config,
+    ids: &BTreeMap<u32, usize>,
+) -> Result<Vec<VertexGoal>> {
+    let Some(group_name) = config.pin_group.as_deref() else {
+        return Ok(vec![
+            VertexGoal {
+                weight: 0.0,
+                pinned: false,
+            };
+            mesh.vertices.len()
+        ]);
+    };
+    let weights = load_weights(mesh, Some(group_name), ids)?;
+    Ok(weights
+        .into_iter()
+        .map(|weight| match weight {
+            Some(weight) => {
+                let goal = weight.powi(4);
+                VertexGoal {
+                    weight: goal,
+                    pinned: goal >= PIN_THRESHOLD,
+                }
+            }
+            None => VertexGoal {
+                weight: config.goal_default,
+                pinned: false,
+            },
+        })
+        .collect())
+}
+
+/// Weight of each vertex in the named group, or `None` for a vertex outside it.
 fn load_weights(
     mesh: &Mesh,
     group_name: Option<&str>,
     ids: &BTreeMap<u32, usize>,
-) -> Result<Vec<f64>> {
-    let mut weights = vec![0.0; mesh.vertices.len()];
+) -> Result<Vec<Option<f64>>> {
+    let mut weights = vec![None; mesh.vertices.len()];
     let Some(group_name) = group_name else {
         return Ok(weights);
     };
@@ -596,7 +673,7 @@ fn load_weights(
             .parse::<u32>()
             .map_err(|_| invalid("cloth pin group keys must be vertex ID strings"))?;
         if let Some(index) = ids.get(&parsed_id) {
-            weights[*index] = weight;
+            weights[*index] = Some(weight);
         }
     }
     Ok(weights)
@@ -684,6 +761,34 @@ fn solve_springs(positions: &mut [DVec3], inverse_masses: &[f64], springs: &mut 
         let correction = delta * (delta_lambda / distance);
         positions[spring.a] += correction * inverse_masses[spring.a];
         positions[spring.b] -= correction * inverse_masses[spring.b];
+    }
+}
+
+/// A goal spring: an XPBD distance constraint from a vertex to its input position.
+#[derive(Clone, Copy)]
+struct GoalSpring {
+    index: usize,
+    /// XPBD compliance of the goal spring (`spring_compliance` of its stiffness).
+    alpha: f64,
+    lambda: f64,
+}
+
+fn solve_goal_springs(
+    positions: &mut [DVec3],
+    inverse_masses: &[f64],
+    springs: &mut [GoalSpring],
+    targets: &[DVec3],
+) {
+    for spring in springs {
+        let delta = positions[spring.index] - targets[spring.index];
+        let distance = delta.length();
+        let weight = inverse_masses[spring.index];
+        if distance <= DISTANCE_EPSILON || weight == 0.0 {
+            continue;
+        }
+        let delta_lambda = (-distance - spring.alpha * spring.lambda) / (weight + spring.alpha);
+        spring.lambda += delta_lambda;
+        positions[spring.index] += delta * (delta_lambda * weight / distance);
     }
 }
 
@@ -821,7 +926,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_goal_weight_is_refused() {
+    fn partial_goal_spring_holds_vertex_toward_its_input() {
         let mut mesh = Mesh::from_positions_and_faces(
             vec![DVec3::ZERO, DVec3::X, DVec3::Y],
             vec![vec![0, 1, 2]],
@@ -829,15 +934,21 @@ mod tests {
         .unwrap();
         mesh.attributes
             .insert("vertex_groups".to_owned(), json!({"partial": {"0": 0.5}}));
-        let rejected = simulate(
+        let gravity = DVec3::new(0.0, 0.0, -9.81);
+        let free = simulate(&mesh, &json!({}), 1.0, 24.0, gravity, &[]).unwrap();
+        let held = simulate(
             &mesh,
-            &json!({"vertex_group_mass": "partial"}),
+            &json!({"vertex_group_mass": "partial", "iterations": 12}),
             1.0,
             24.0,
-            DVec3::ZERO,
+            gravity,
             &[],
-        );
-        assert!(rejected.is_err());
+        )
+        .unwrap();
+        // Goal 0.5^4 = 0.0625 is not pinned, so the vertex moves, but its goal spring holds it above
+        // the unconstrained fall.
+        assert!(held[0].z > free[0].z);
+        assert!(held[0].z < mesh.vertices[0].co.z);
     }
 
     #[test]

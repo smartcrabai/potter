@@ -105,6 +105,7 @@ fn scene_schema() -> Value {
         "resources":{"type":"object"},
         "libraries":registry_schema("library"),
         "compatibility":{"type":"object"},
+        "accepted_losses":{"type":"array","items":{"type":"string"},"uniqueItems":true},
         "avatar":avatar_settings_schema(),
         "history":{"$ref":"#/$defs/history"}
     });

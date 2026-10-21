@@ -106,6 +106,13 @@ pub fn run(args: &ImportArgs) -> Result<(Option<SceneInfo>, Value)> {
     }
     let before = project.doc().clone();
     let mut candidate = imported.doc.clone();
+    if args.allow_lossy {
+        // The user accepted these losses: evaluation leaves the settings they name unevaluated (see
+        // `physics_support::without_accepted_losses`).
+        candidate
+            .accepted_losses
+            .extend(imported.losses.iter().map(|loss| loss.feature_id.clone()));
+    }
     let id_mappings = match args.mode {
         ImportMode::Replace => {
             candidate.scene_id.clone_from(&before.scene_id);

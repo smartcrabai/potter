@@ -70,6 +70,10 @@ pub struct SceneDoc {
     pub libraries: Registry<Library>,
     #[serde(default)]
     pub compatibility: Map<String, Value>,
+    /// Loss ids (`feature_id`) that an `--allow-lossy` import reported and the user accepted. Evaluation
+    /// does not refuse the settings they name; it warns and leaves them unevaluated.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub accepted_losses: BTreeSet<String>,
     #[serde(default)]
     pub history: HistoryState,
 }
@@ -140,6 +144,7 @@ impl SceneDoc {
             resources: Registry::new(),
             libraries: Registry::new(),
             compatibility: Map::new(),
+            accepted_losses: BTreeSet::new(),
             avatar: None,
             history: HistoryState::default(),
         }

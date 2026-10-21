@@ -26,10 +26,6 @@ use process::run_guarded;
 /// derives from those settings included). Dynamic Paint surfaces are reported per surface, not as
 /// one `canvas_surfaces` id.
 const EXPECTED_PHYSICS_LOSSES: &[&str] = &[
-    "blender.physics.cloth.goal_default",
-    "blender.physics.cloth.goal_friction",
-    "blender.physics.cloth.goal_spring",
-    "blender.physics.cloth.pin_stiffness",
     "blender.physics.cloth.use_dynamic_mesh",
     "blender.physics.cloth.use_sewing_springs",
     "blender.physics.cloth_collision.collision_quality",
@@ -852,14 +848,10 @@ fn assert_inspected_geometry(
             &format!("Potter frame 1 {object_name}"),
         );
     }
-    // These carry Blender settings that Potter refuses at frame 1 instead of evaluating them silently. The refusal names
-    // the first such setting, under the system's feature id.
-    for (object_name, feature_prefix) in [
-        ("Cloth", "physics.cloth_collision."),
-        ("SoftBody", "physics.soft_body."),
-        ("DynamicPaintCanvas", "physics.dynamic_paint_surface."),
-        ("FluidDomain", "physics.fluid_domain."),
-    ] {
+    // These carry Blender settings that the lossy import reported and the user accepted. Potter does not
+    // evaluate them, and it must not refuse the scene for them: evaluation warns about each accepted value
+    // (`accepted_loss`) instead, so the frame-1 inspect succeeds.
+    for object_name in ["Cloth", "SoftBody", "DynamicPaintCanvas", "FluidDomain"] {
         let node_id = mappings[&format!("Object:{object_name}")].as_str().unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_pot"));
         command.args([
@@ -872,18 +864,19 @@ fn assert_inspected_geometry(
             "--json",
         ]);
         let output = run_guarded(command)?;
-        assert!(
-            !output.status.success(),
-            "{object_name} evaluated at frame 1 without a refusal"
-        );
         let envelope: Value = serde_json::from_slice(&output.stdout)?;
-        let feature_id = envelope["error"]["details"]["feature_id"]
-            .as_str()
-            .unwrap_or_default();
         assert!(
-            feature_id.starts_with(feature_prefix),
-            "{object_name} refused with an unexpected feature: {envelope}"
+            output.status.success(),
+            "{object_name} refused at frame 1 for accepted lossy values: {envelope}"
         );
+        for warning in envelope["warnings"].as_array().into_iter().flatten() {
+            if warning["details"]["feature_id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("blender.physics."))
+            {
+                assert_eq!(warning["details"]["status"], "accepted_loss", "{envelope}");
+            }
+        }
     }
     Ok(())
 }
@@ -1136,6 +1129,9 @@ fn assert_dynamic_paint_role_transitions(
         "CANVAS"
     );
 
+    // The same-role batch sets the canvas `strength`, which has no Blender property: exporting it is a
+    // reported loss (`potter.physics.dynamic_paint_canvas.strength`), accepted here because this step tests
+    // the role transitions, not that value.
     let transitioned_blend = root.join("dynamic_paint_role_transitions.blend");
     pot_json(&[
         "export",
@@ -1146,6 +1142,7 @@ fn assert_dynamic_paint_role_transitions(
         transitioned_blend.to_str().unwrap(),
         "--blender",
         blender.to_str().unwrap(),
+        "--allow-lossy",
     ])?;
     let transitioned_reopen_path = root.join("dynamic_paint_role_reopened.json");
     run_blender_script(
