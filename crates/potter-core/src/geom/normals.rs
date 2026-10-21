@@ -768,9 +768,11 @@ mod tests {
         mesh.vertices.iter().map(|vertex| vertex.co).collect()
     }
 
+    /// Blender stores normals as f32, so vectors compare at f32 epsilon; the axis-aligned and
+    /// unit expectations here are exact in f32 up to one rounding step.
     fn assert_vec_eq(actual: DVec3, expected: DVec3) {
         assert!(
-            actual.abs_diff_eq(expected, 1e-12),
+            actual.abs_diff_eq(expected, f64::from(f32::EPSILON)),
             "expected {expected:?}, got {actual:?}"
         );
     }
@@ -866,7 +868,7 @@ mod tests {
         assert_vec_eq(geometric[0], FACE_A_NORMAL);
         // Authored custom normals change the shading output but not Blender's vert_normals.
         let shaded = export_normals(&mesh, &points).expect("normals").vertices;
-        assert_vec_eq(shaded[0], -DVec3::Z);
+        assert_close(shaded[0], -DVec3::Z, CODEC_TOLERANCE);
     }
 
     /// Stores one vector per corner as the custom-normal layer (`None` is automatic). Authored
