@@ -1806,27 +1806,21 @@ impl SurfaceShader for SceneShader<'_> {
             None
         };
         let fallback;
-        let closures: &[ShaderClosure] = match &graph_shading {
-            Some(shading) => &shading.closures,
-            None => {
-                let alpha = material.map_or(1.0, |material| material.base_color[3]);
-                let base = [
-                    triangle.color[0],
-                    triangle.color[1],
-                    triangle.color[2],
-                    alpha,
-                ];
-                fallback = [ShaderClosure {
-                    weight: 1.0,
-                    params: shading_params(
-                        material,
-                        base,
-                        hit.normal,
-                        &self.geometry.shader_warnings,
-                    ),
-                }];
-                &fallback
-            }
+        let closures: &[ShaderClosure] = if let Some(shading) = &graph_shading {
+            &shading.closures
+        } else {
+            let alpha = material.map_or(1.0, |material| material.base_color[3]);
+            let base = [
+                triangle.color[0],
+                triangle.color[1],
+                triangle.color[2],
+                alpha,
+            ];
+            fallback = [ShaderClosure {
+                weight: 1.0,
+                params: shading_params(material, base, hit.normal, &self.geometry.shader_warnings),
+            }];
+            &fallback
         };
         if matches!(self.mode, Mode::Solid) {
             // A back face is lit as its front: Workbench turns the normal toward the viewer

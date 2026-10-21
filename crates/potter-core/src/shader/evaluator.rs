@@ -219,6 +219,7 @@ pub struct SurfaceShading {
 impl SurfaceShading {
     /// The heaviest closure's parameters. A single-closure surface (any graph without Mix or Add, and every material
     /// without a graph) has exactly its one closure here.
+    #[must_use]
     pub fn dominant(&self) -> Option<&BsdfParams> {
         self.closures
             .iter()
@@ -228,6 +229,7 @@ impl SurfaceShading {
 
     /// The base colour of the closures averaged by weight. Exporters that write one colour per material use it; it is
     /// the same value a single closure of the same weight would carry.
+    #[must_use]
     pub fn representative_base_color(&self) -> Option<[f64; 4]> {
         let total: f64 = self.closures.iter().map(|closure| closure.weight).sum();
         if self.closures.is_empty() {
@@ -250,10 +252,10 @@ impl SurfaceShading {
 }
 
 /// The Vec form of a single node closure, for the surface and volume outputs.
-fn single_closure(params: BsdfParams) -> Vec<ShaderClosure> {
+fn single_closure(params: &BsdfParams) -> Vec<ShaderClosure> {
     vec![ShaderClosure {
         weight: 1.0,
-        params,
+        params: *params,
     }]
 }
 
@@ -553,8 +555,8 @@ fn evaluate_surface_inner(
         params.base_color = textured_base(material, hit_ctx, params.base_color)?;
         params.glass_transmission_tint = principled_glass_tint(params.base_color);
         // The material's volume coefficients are its Volume output, not a surface closure.
-        let volume = single_closure(params);
-        let mut closures = single_closure(without_volume(params));
+        let volume = single_closure(&params);
+        let mut closures = single_closure(&without_volume(params));
         for closure in &mut closures {
             apply_material_textures(material, hit_ctx, &mut closure.params)?;
         }
@@ -630,7 +632,7 @@ fn evaluate_surface_inner(
         };
         evaluator.workspace.closures_of(volume).to_vec()
     } else {
-        single_closure(BsdfParams::from_material(material, hit_ctx.normal))
+        single_closure(&BsdfParams::from_material(material, hit_ctx.normal))
     };
     let displacement_height = if has_displacement {
         let normal = dominant_normal(&closures, hit_ctx.normal);
@@ -965,11 +967,11 @@ impl EvaluatorWorkspace {
     }
 
     /// A node's single closure at weight 1.
-    fn push_single(&mut self, params: BsdfParams) -> ClosureSpan {
+    fn push_single(&mut self, params: &BsdfParams) -> ClosureSpan {
         let start = self.closures.len();
         self.closures.push(ShaderClosure {
             weight: 1.0,
-            params,
+            params: *params,
         });
         ClosureSpan { start, len: 1 }
     }
@@ -1121,13 +1123,14 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
                     color(value, [f64::NAN; 4])
                 })))
             }
-            ValueKind::Shader => match raw {
-                Some(_) => Err(invalid("a shader socket cannot use a literal value")),
-                None => {
+            ValueKind::Shader => {
+                if raw.is_some() {
+                    Err(invalid("a shader socket cannot use a literal value"))
+                } else {
                     let params = self.closure_params();
-                    Ok(self.closure_value(params))
+                    Ok(self.closure_value(&params))
                 }
-            },
+            }
         }
     }
 
@@ -1218,25 +1221,25 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
             NodeKind::OutputMaterial => Err(invalid("material output has no output sockets")),
             NodeKind::Principled => {
                 let params = self.principled(node_id)?;
-                Ok(self.closure_value(params))
+                Ok(self.closure_value(&params))
             }
             NodeKind::VolumePrincipled => {
                 let params = self.volume(node_id, VolumeClosure::Principled)?;
-                Ok(self.closure_value(params))
+                Ok(self.closure_value(&params))
             }
             NodeKind::VolumeScatter => {
                 let params = self.volume(node_id, VolumeClosure::Scatter)?;
-                Ok(self.closure_value(params))
+                Ok(self.closure_value(&params))
             }
             NodeKind::VolumeAbsorption => {
                 let params = self.volume(node_id, VolumeClosure::Absorption)?;
-                Ok(self.closure_value(params))
+                Ok(self.closure_value(&params))
             }
             NodeKind::Displacement => self.displacement(node_id, socket),
             NodeKind::ImageTexture => self.image_texture(node_id, socket),
             NodeKind::Emission => {
                 let params = self.emission(node_id)?;
-                Ok(self.closure_value(params))
+                Ok(self.closure_value(&params))
             }
             NodeKind::Diffuse => {
                 // Blender's Diffuse BSDF is a Lambert lobe with no specular. Its Roughness input is Oren-Nayar, which
@@ -1244,19 +1247,19 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
                 // roughness-0 floor under a sun a 1600x GGX spike (`source/blender/nodes/shader/nodes/node_shader_bsdf_diffuse.cc`).
                 let mut params = self.diffuse(node_id)?;
                 params.specular_ior_level = 0.0;
-                Ok(self.closure_value(params))
+                Ok(self.closure_value(&params))
             }
             NodeKind::Glossy => {
                 let params = self.glossy(node_id)?;
-                Ok(self.closure_value(params))
+                Ok(self.closure_value(&params))
             }
             NodeKind::Glass => {
                 let params = self.glass(node_id)?;
-                Ok(self.closure_value(params))
+                Ok(self.closure_value(&params))
             }
             NodeKind::Transparent => {
                 let params = self.transparent(node_id)?;
-                Ok(self.closure_value(params))
+                Ok(self.closure_value(&params))
             }
             NodeKind::MixShader => Ok(Value::Shader(self.mix_shader(node_id)?)),
             NodeKind::AddShader => Ok(Value::Shader(self.add_shader(node_id)?)),
@@ -1297,7 +1300,7 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
     }
 
     /// Appends a node's single closure to the workspace arena and returns it as a socket value.
-    fn closure_value(&mut self, params: BsdfParams) -> Value {
+    fn closure_value(&mut self, params: &BsdfParams) -> Value {
         Value::Shader(self.workspace.push_single(params))
     }
 

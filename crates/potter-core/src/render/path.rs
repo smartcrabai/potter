@@ -121,11 +121,11 @@ struct HitClosure {
 }
 
 impl HitClosure {
-    fn new(weight: f64, params: BsdfParams, view: DVec3) -> Self {
-        let closure_layers = layers(&params, params.normal, view);
+    fn new(weight: f64, params: &BsdfParams, view: DVec3) -> Self {
+        let closure_layers = layers(params, params.normal, view);
         Self {
             weight,
-            params,
+            params: *params,
             layers: closure_layers,
         }
     }
@@ -1338,7 +1338,6 @@ fn trace_path(
                 transparent_bounce += 1;
                 terminate_on_next_surface |= transparent_bounce >= transparent_cap;
                 origin = offset_origin(surface.point, direction, surface.geometric_normal);
-                continue;
             }
             Some(Pick::Reflect(index)) => {
                 if bounce == max_bounces {
@@ -1851,7 +1850,7 @@ fn make_surface(
                     normal = -normal;
                 }
                 params.normal = normal;
-                items.push(HitClosure::new(closure.weight, params, -direction));
+                items.push(HitClosure::new(closure.weight, &params, -direction));
             }
             // The dominant closure's normal is the surface's reference normal, for light sampling and the normal pass.
             let normal = items
@@ -2111,7 +2110,7 @@ fn shadow_transmittance(
     };
     let (origin, remaining) = bvh.walk_hits(
         &geometry.triangles,
-        offset_origin(point, direction, normal),
+        shadow_origin(point, direction, normal),
         direction,
         RAY_EPSILON,
         remaining,
@@ -2602,6 +2601,12 @@ fn sample_lobes(
         let half_vector = sample_ggx_half(normal, params.roughness, rng);
         reflect(-view, half_vector).normalize_or_zero()
     };
+    // Cycles keeps a reflection sample only above the geometric normal: `bsdf_diffuse.h:65-71` zeroes it otherwise, and
+    // the microfacet sampler rejects the same case (`bsdf_microfacet.h:863`). The check is in sampling only; the
+    // evaluation keeps the lobe, and the shadow ray already blocks the direct term below the surface.
+    if direction.dot(geometric) <= 0.0 {
+        return LobeDraw::Absorbed;
+    }
     LobeDraw::Continuous(direction)
 }
 
@@ -3305,6 +3310,18 @@ fn offset_origin(point: DVec3, direction: DVec3, normal: DVec3) -> DVec3 {
     point + normal * (sign * RAY_EPSILON * (1.0 + point.abs().max_element()))
 }
 
+/// The start of a shadow ray leaving a surface point. Cycles starts it on the surface and skips the surface's own
+/// primitive only when the direction is above the geometric normal (`shadow_ray_offset`, `skip_self` in
+/// `kernel/light/sample.h`). A direction below the geometric normal therefore meets the surface itself, which blocks it
+/// unless the surface is transparent. Starting on the front side makes that own-surface hit happen.
+fn shadow_origin(point: DVec3, direction: DVec3, normal: DVec3) -> DVec3 {
+    if direction.dot(normal) < 0.0 {
+        point + normal * (RAY_EPSILON * (1.0 + point.abs().max_element()))
+    } else {
+        offset_origin(point, direction, normal)
+    }
+}
+
 fn allocate<T: Clone>(length: usize, value: T, label: &str) -> Result<Vec<T>> {
     let mut output = Vec::new();
     output.try_reserve_exact(length).map_err(|_| {
@@ -3610,7 +3627,7 @@ mod sampling_tests {
 
         let samples = 400_000_usize;
         let mut rng = Pcg32::for_sample(1, 0, 0, 0);
-        let closures = Closures::new(vec![HitClosure::new(1.0, params, view)]);
+        let closures = Closures::new(vec![HitClosure::new(1.0, &params, view)]);
         let mut sum = DVec3::ZERO;
         let mut sum_squares = DVec3::ZERO;
         for _ in 0..samples {

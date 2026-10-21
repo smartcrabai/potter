@@ -264,7 +264,12 @@ fn add_shader_keeps_surface_and_emission_as_separate_closures() {
     let shading = evaluate_surface(&material, &context).unwrap();
     // Add Shader concatenates its arms: the Principled reflection and the Emission, each at weight 1.
     assert_eq!(shading.closures.len(), 2);
-    assert!(shading.closures.iter().all(|closure| closure.weight == 1.0));
+    assert!(
+        shading
+            .closures
+            .iter()
+            .all(|closure| (closure.weight - 1.0).abs() < 1.0e-12)
+    );
     let surface = shading.closures[0].params;
     let emission = shading.closures[1].params;
     assert_eq!(surface.base_color, [0.2, 0.0, 0.0, 1.0]);
