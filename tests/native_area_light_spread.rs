@@ -37,6 +37,8 @@ const WIDTH: u32 = 16;
 const STRIPS: [(u32, u32); 3] = [(7, 8), (10, 11), (13, 14)];
 /// Samples per pixel and seeds, the same for Blender and Potter.
 const SAMPLES: u32 = 256;
+/// Samples per pixel of the wide-spread case (see `a_wide_spread_matches_cycles`).
+const WIDE_SPREAD_SAMPLES: u32 = 128;
 const SEEDS: u32 = 4;
 /// Standard errors of the combined means that the difference may span.
 const SIGMAS: f64 = 3.0;
@@ -100,7 +102,7 @@ fn parse_rgb(value: &Value) -> TestResult<[f64; 3]> {
     Ok(rgb)
 }
 
-fn check_spread(spread: f64) -> TestResult {
+fn check_spread(spread: f64, samples: u32) -> TestResult {
     let Some(blender) = blender_checked::blender_executable() else {
         return Ok(());
     };
@@ -109,7 +111,7 @@ fn check_spread(spread: f64) -> TestResult {
     let blend = root.path().join("scene.blend");
     let json_path = root.path().join("blender.json");
     let spread_arg = spread.to_string();
-    let samples_arg = SAMPLES.to_string();
+    let samples_arg = samples.to_string();
     let seeds_arg = SEEDS.to_string();
     let arguments: [&Path; 5] = [
         &blend,
@@ -177,7 +179,7 @@ fn check_spread(spread: f64) -> TestResult {
             &project,
             root.path(),
             json!([
-                {"op": "render.update", "target": {"id": active}, "set": {"samples": SAMPLES, "seed": seed, "max_bounces": 1}}
+                {"op": "render.update", "target": {"id": active}, "set": {"samples": samples, "seed": seed, "max_bounces": 1}}
             ]),
         )?;
         assert_eq!(applied["ok"], true, "{applied}");
@@ -234,17 +236,21 @@ fn check_spread(spread: f64) -> TestResult {
     Ok(())
 }
 
+/// The wide-spread case takes 128 samples. Its edge strip's four-seed standard error is 0.10% at 256
+/// samples (measured on Blender's eight seeds) and about 0.14% to 0.2% at 128: square-root scaling
+/// predicts 0.14%, and 64 samples measured 0.30%, above that. The edge tolerance therefore rises from
+/// about 0.4% to between 0.6% and 0.9%. The on-axis strip stays under 0.3%.
 #[test]
 fn a_zero_spread_lights_only_under_the_emitter_as_cycles() -> TestResult {
-    check_spread(0.0)
+    check_spread(0.0, SAMPLES)
 }
 
 #[test]
 fn a_narrow_spread_matches_cycles() -> TestResult {
-    check_spread(0.3)
+    check_spread(0.3, SAMPLES)
 }
 
 #[test]
 fn a_wide_spread_matches_cycles() -> TestResult {
-    check_spread(1.0)
+    check_spread(1.0, WIDE_SPREAD_SAMPLES)
 }

@@ -36,8 +36,15 @@ const PATCH: [f64; 9] = [
 /// Render-to-stored-value tolerance (linear units), the same bound as `native_render_color`. The
 /// patch means are about 0.5, so this is a 2% band; a 4π intensity error is a 12.6× difference.
 const PIXEL_TOLERANCE: f64 = 0.01;
+/// Samples per pixel of the point lights. Their patch-mean noise at this count is about 6 x 10^-4
+/// per seed, a margin of about 12 standard errors against the tolerance (`point_spot_light.py`).
+const POINT_SAMPLES: u32 = 8;
+/// Samples per pixel of the spot light. Its noise is about 2.5 x 10^-3 per seed at 8 samples, a
+/// margin of only about 3, so it keeps 64, where the margin is about 13.
+const SPOT_SAMPLES: u32 = 64;
 
-fn check_scenario(kind: &str) -> TestResult {
+/// Renders `kind` at `samples` per pixel in Blender and in Potter, and compares the patch means.
+fn check_scenario(kind: &str, samples: u32) -> TestResult {
     let Some(blender) = blender_checked::blender_executable() else {
         return Ok(());
     };
@@ -46,7 +53,14 @@ fn check_scenario(kind: &str) -> TestResult {
     let blend = root.path().join("scene.blend");
     let exr = root.path().join("blender.exr");
     let json_path = root.path().join("blender.json");
-    let arguments: [&Path; 4] = [&blend, &exr, &json_path, Path::new(kind)];
+    let samples_arg = samples.to_string();
+    let arguments: [&Path; 5] = [
+        &blend,
+        &exr,
+        &json_path,
+        Path::new(kind),
+        Path::new(&samples_arg),
+    ];
     run_blender_arguments(&blender, &script, None, &arguments)?;
 
     let expected: Value = serde_json::from_slice(&fs::read(&json_path)?)?;
@@ -70,7 +84,7 @@ fn check_scenario(kind: &str) -> TestResult {
         &project,
         root.path(),
         json!([
-            {"op": "render.update", "target": {"id": active}, "set": {"resolution_x": 64, "resolution_y": 64, "samples": 64, "seed": 0, "max_bounces": 0}}
+            {"op": "render.update", "target": {"id": active}, "set": {"resolution_x": 64, "resolution_y": 64, "samples": samples, "seed": 0, "max_bounces": 0}}
         ]),
     )?;
     assert_eq!(applied["ok"], true, "{applied}");
@@ -122,15 +136,15 @@ fn check_scenario(kind: &str) -> TestResult {
 
 #[test]
 fn point_light_with_soft_falloff_matches_cycles() -> TestResult {
-    check_scenario("point_soft")
+    check_scenario("point_soft", POINT_SAMPLES)
 }
 
 #[test]
 fn point_light_as_a_sphere_matches_cycles() -> TestResult {
-    check_scenario("point_sphere")
+    check_scenario("point_sphere", POINT_SAMPLES)
 }
 
 #[test]
 fn spot_light_matches_cycles() -> TestResult {
-    check_scenario("spot")
+    check_scenario("spot", SPOT_SAMPLES)
 }

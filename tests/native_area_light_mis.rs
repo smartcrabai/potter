@@ -41,8 +41,13 @@ const PATCH: [f64; 8] = [
     10.5 / 16.0,
     11.5 / 16.0,
 ];
-/// Samples per pixel and seeds, the same for Blender and Potter.
+/// Samples per pixel of the two small-light cases.
 const SAMPLES: u32 = 256;
+/// Samples per pixel of the large sharp-gloss case. Its four-seed mean's standard error rises from
+/// 0.55% at 256 samples to about 0.63% at 192, so its tolerance goes from about 2.3% to 2.7%.
+const SHARP_LARGE_SAMPLES: u32 = 192;
+/// Samples per pixel of the large broad-gloss case: its seed spread is the same at 64 as at 256.
+const BROAD_LARGE_SAMPLES: u32 = 64;
 const SEEDS: u32 = 4;
 /// Standard errors of the combined means that the difference may span.
 const SIGMAS: f64 = 3.0;
@@ -86,7 +91,7 @@ fn mean_and_error(runs: &[[f64; 3]]) -> ([f64; 3], [f64; 3]) {
     (mean, error)
 }
 
-fn check_scenario(roughness: f64, light_size: f64) -> TestResult {
+fn check_scenario(roughness: f64, light_size: f64, samples: u32) -> TestResult {
     let Some(blender) = blender_checked::blender_executable() else {
         return Ok(());
     };
@@ -96,7 +101,7 @@ fn check_scenario(roughness: f64, light_size: f64) -> TestResult {
     let json_path = root.path().join("blender.json");
     let roughness_arg = roughness.to_string();
     let size_arg = light_size.to_string();
-    let samples_arg = SAMPLES.to_string();
+    let samples_arg = samples.to_string();
     let seeds_arg = SEEDS.to_string();
     let arguments: [&Path; 6] = [
         &blend,
@@ -147,7 +152,7 @@ fn check_scenario(roughness: f64, light_size: f64) -> TestResult {
             &project,
             root.path(),
             json!([
-                {"op": "render.update", "target": {"id": active}, "set": {"samples": SAMPLES, "seed": seed, "max_bounces": 1}}
+                {"op": "render.update", "target": {"id": active}, "set": {"samples": samples, "seed": seed, "max_bounces": 1}}
             ]),
         )?;
         assert_eq!(applied["ok"], true, "{applied}");
@@ -206,22 +211,25 @@ fn check_scenario(roughness: f64, light_size: f64) -> TestResult {
     Ok(())
 }
 
+/// The sample counts are per case (see the constants). The broad large-light case's seed spread is
+/// 0.11% of the mean at both 64 and 256 samples (eight Blender seeds, measured headless); the sharp
+/// large-light case goes to 192 with its tolerance up from about 2.3% to 2.7%.
 #[test]
 fn small_light_on_a_sharp_gloss_matches_cycles() -> TestResult {
-    check_scenario(0.05, 0.2)
+    check_scenario(0.05, 0.2, SAMPLES)
 }
 
 #[test]
 fn large_light_on_a_sharp_gloss_matches_cycles() -> TestResult {
-    check_scenario(0.05, 1.0)
+    check_scenario(0.05, 1.0, SHARP_LARGE_SAMPLES)
 }
 
 #[test]
 fn small_light_on_a_broad_gloss_matches_cycles() -> TestResult {
-    check_scenario(0.24, 0.2)
+    check_scenario(0.24, 0.2, SAMPLES)
 }
 
 #[test]
 fn large_light_on_a_broad_gloss_matches_cycles() -> TestResult {
-    check_scenario(0.24, 1.0)
+    check_scenario(0.24, 1.0, BROAD_LARGE_SAMPLES)
 }

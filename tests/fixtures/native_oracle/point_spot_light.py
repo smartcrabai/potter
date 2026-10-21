@@ -4,7 +4,10 @@ Writes the scene as a .blend (Potter imports it), renders it to a linear EXR, an
 RGB of a central patch of the plane. The patch grid must match `PATCH` in
 `tests/native_point_spot_light.rs`.
 
-Arguments after `--`: blend_out, exr_out, json_out, kind (point_soft | point_sphere | spot).
+Arguments after `--`: blend_out, exr_out, json_out, kind (point_soft | point_sphere | spot), and an
+optional samples per pixel (default 64). The point kinds are tested at 8 samples: their patch-mean
+noise there is about 6 x 10^-4 per seed (measured on 8 seeds), against a tolerance of 0.01, a margin
+of about 12 standard errors. The spot light keeps 64 samples: at 8 its noise gives a margin of 3.
   point_soft:   point light, radius, soft falloff on (Blender's default, a disk facing the receiver)
   point_sphere: point light, radius, soft falloff off (a sphere)
   spot:         spot light, radius, soft falloff on, spot size 1.0 rad, blend 0.3
@@ -16,6 +19,8 @@ import sys
 import bpy
 
 blend_out, exr_out, json_out, kind = sys.argv[sys.argv.index("--") + 1:][:4]
+extra = sys.argv[sys.argv.index("--") + 1:][4:]
+SAMPLES = int(extra[0]) if extra else 64
 
 WIDTH = 64
 HEIGHT = 64
@@ -29,7 +34,7 @@ bpy.ops.wm.read_factory_settings(use_empty=True)
 scene = bpy.context.scene
 scene.render.engine = "CYCLES"
 scene.cycles.device = "CPU"
-scene.cycles.samples = 64
+scene.cycles.samples = SAMPLES
 scene.cycles.use_denoising = False
 scene.cycles.max_bounces = 0
 scene.view_settings.view_transform = "Standard"
