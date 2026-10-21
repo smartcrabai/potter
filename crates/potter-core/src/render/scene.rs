@@ -11,7 +11,7 @@ use crate::{
     error::{ErrorCode, PotError, Result},
     eval::{EvaluationPurpose, Snapshot},
     geom::{
-        Mesh, TextureSpace,
+        GeneratedCorners, GeneratedVertex, Mesh, TextureSpace,
         color_layers::{self, ColorDomain, ColorLayer, ColorStore},
         normals::{render_corner_normals, smooth_face_flags},
         uv_layers::{self, UvStore},
@@ -53,8 +53,9 @@ pub(super) struct ObjectRecord {
     pub node_id: Id,
     pub data_id: Option<Id>,
     pub instance_path: Vec<Id>,
-    /// The object's automatic texture space (`BKE_mesh_texspace_calc` of its evaluated local bounds): the box
-    /// the Generated coordinate maps onto `[0, 1]³`. Not part of the output.
+    /// The object's texture space (`BKE_mesh_texspace_calc` of its undeformed local bounds, or its stored manual box),
+    /// the box the Generated coordinate maps onto `[0, 1]³`. A collection instance's members keep their own, in the
+    /// joined mesh's `generated_vertices`. Not part of the output.
     #[serde(skip)]
     pub texture_space: TextureSpace,
     /// UV layer names in layer order, matching `Triangle::layer_uvs`. Not part of the output.
@@ -537,9 +538,13 @@ pub(super) fn extract_geometry(
             .iter()
             .map(|&index| &color_store.layers[index])
             .collect();
-        let texture_space = mesh
+        // Blender's texture space is computed on the undeformed mesh (`BKE_mesh_eval_geometry` calls
+        // `BKE_mesh_texspace_calc` on the original), and modifiers copy it to their result. The data block's mesh is
+        // that original, so modifiers that rebuild or shrink the evaluated mesh do not move the texture space.
+        let undeformed = data_block.and_then(|data| data.mesh.as_ref()).or(mesh);
+        let texture_space = undeformed
             .and_then(Mesh::manual_texture_space)
-            .unwrap_or_else(|| TextureSpace::automatic(mesh.and_then(Mesh::bounds)));
+            .unwrap_or_else(|| TextureSpace::automatic(undeformed.and_then(Mesh::bounds)));
         objects.push(ObjectRecord {
             index: object_index,
             node_id: node_id.clone(),
@@ -581,6 +586,26 @@ pub(super) fn extract_geometry(
                 .iter()
                 .map(|vertex| (vertex.id, vertex.co))
                 .collect();
+            // A collection instance's joined mesh carries each member's Generated per vertex, in its own texture space.
+            let generated_by_vertex: Option<std::collections::BTreeMap<u32, GeneratedVertex>> =
+                match snapshot.generated_vertices.get(node_id) {
+                    Some(table) => {
+                        if table.len() != mesh.vertices.len() {
+                            return Err(PotError::new(
+                                ErrorCode::InternalError,
+                                "collection instance Generated does not match its vertices",
+                            ));
+                        }
+                        Some(
+                            mesh.vertices
+                                .iter()
+                                .zip(table)
+                                .map(|(vertex, value)| (vertex.id, *value))
+                                .collect(),
+                        )
+                    }
+                    None => None,
+                };
             let mesh_triangles = mesh.tessellate().map_err(|error| {
                 PotError::with_details(
                     ErrorCode::EvaluationFailed,
@@ -724,7 +749,7 @@ pub(super) fn extract_geometry(
                     })?;
                 for triangle in face_triangles {
                     let mut positions = [DVec3::ZERO; 3];
-                    let mut generated = [DVec3::ZERO; 3];
+                    let mut vertices = [GeneratedVertex::default(); 3];
                     let corners = triangle_corners(face, triangle);
                     let layer_uvs = triangle_layer_uvs(&uv_store, face_index, corners);
                     for (index, vertex_id) in triangle.iter().enumerate() {
@@ -735,8 +760,20 @@ pub(super) fn extract_geometry(
                             )
                         })?;
                         positions[index] = matrix.transform_point3(local);
-                        generated[index] = texture_space.generated(local);
+                        vertices[index] = match &generated_by_vertex {
+                            Some(table) => *table.get(vertex_id).ok_or_else(|| {
+                                PotError::new(
+                                    ErrorCode::InternalError,
+                                    "collection instance Generated is missing a vertex",
+                                )
+                            })?,
+                            None => texture_space.generated_vertex(local),
+                        };
                     }
+                    let generated = GeneratedCorners {
+                        corners: vertices.map(|vertex| vertex.generated),
+                        per_local: vertices[0].per_local,
+                    };
                     let uv = render_layer
                         .and_then(|index| layer_uvs.get(index).copied())
                         .unwrap_or([[0.0, 1.0]; 3]);
@@ -1456,7 +1493,7 @@ fn subdivide_displaced_triangle(
     warnings: &RefCell<Vec<serde_json::Value>>,
     evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<[Triangle; 4]> {
-    subdivide_displaced(triangle, object_to_world, object.texture_space, |sample| {
+    subdivide_displaced(triangle, object_to_world, |sample| {
         let mut tables = LayerTables::new();
         let context = layered_context(
             doc,
@@ -1502,7 +1539,6 @@ struct DisplacementSample {
 fn subdivide_displaced(
     triangle: &Triangle,
     object_to_world: DMat4,
-    texture_space: TextureSpace,
     mut displacement: impl FnMut(&DisplacementSample) -> Result<f64>,
 ) -> Result<[Triangle; 4]> {
     let normal = (triangle.positions[1] - triangle.positions[0])
@@ -1550,15 +1586,10 @@ fn subdivide_displaced(
         };
         let height = displacement(&sample)?;
         positions[index] = point + sample_normal * height;
-        // The displaced sample's object-local point carries its Generated; a sample that did not move keeps its own.
-        let displaced_object = if crate::float::equal_f64(height, 0.0) {
-            object
-        } else if inverse_is_finite {
-            world_to_object.transform_point3(positions[index])
-        } else {
-            positions[index]
-        };
-        generated[index] = texture_space.generated(displaced_object);
+        // Cycles moves only positions and normals when it displaces (`mesh_displace.cpp`), so a sample keeps the
+        // Generated of its undisplaced point, blended from the parent corners.
+        let [first, second, third] = triangle.generated.corners;
+        generated[index] = first * weights[0] + second * weights[1] + third * weights[2];
         sample_normals[index] = sample_normal;
         uvs[index] = uv;
         for (table, corners) in layer_samples.iter_mut().zip(&triangle.layer_uvs) {
@@ -1572,7 +1603,10 @@ fn subdivide_displaced(
     Ok(indices.map(|corners| {
         let mut subtriangle = triangle.with_corners(
             corners.map(|vertex| positions[vertex]),
-            corners.map(|vertex| generated[vertex]),
+            GeneratedCorners {
+                corners: corners.map(|vertex| generated[vertex]),
+                per_local: triangle.generated.per_local,
+            },
             corners.map(|vertex| uvs[vertex]),
             layer_samples
                 .iter()
@@ -2139,8 +2173,7 @@ pub(super) fn layered_context<'a>(
         .with_color_layers(color_maps, color_render)
         .with_warnings(warnings);
     context.uv = uv_override.unwrap_or_else(|| blend_uv(&triangle.uv, pose.barycentric));
-    context =
-        context.with_generated_corners(object.texture_space, triangle.generated, pose.barycentric);
+    context = context.with_generated_corners(triangle.generated, pose.barycentric);
     context.position = pose.point;
     context.object = pose.object;
     context.normal = pose.normal;
@@ -3050,7 +3083,7 @@ mod shading_normal_tests {
     fn source_triangle(positions: [DVec3; 3], normals: [DVec3; 3]) -> Triangle {
         Triangle {
             positions,
-            generated: [DVec3::ZERO; 3],
+            generated: GeneratedCorners::default(),
             object_index: 1,
             element_index: 1,
             color: [1.0; 4],
@@ -3092,11 +3125,9 @@ mod shading_normal_tests {
         // The second triangle is not coplanar with the first, so face normals differ.
         let first = source_triangle([DVec3::ZERO, DVec3::X, DVec3::Y], [tilt; 3]);
         let second = source_triangle([DVec3::X, DVec3::new(1.0, 1.0, 0.5), DVec3::Y], [tilt; 3]);
-        let texture_space = crate::geom::TextureSpace::automatic(None);
-        let first_out = subdivide_displaced(&first, DMat4::IDENTITY, texture_space, |_| Ok(0.1))
-            .expect("first");
-        let second_out = subdivide_displaced(&second, DMat4::IDENTITY, texture_space, |_| Ok(0.1))
-            .expect("second");
+        let first_out = subdivide_displaced(&first, DMat4::IDENTITY, |_| Ok(0.1)).expect("first");
+        let second_out =
+            subdivide_displaced(&second, DMat4::IDENTITY, |_| Ok(0.1)).expect("second");
         let shared_edge = [
             DVec3::X + tilt * 0.1,
             DVec3::Y + tilt * 0.1,

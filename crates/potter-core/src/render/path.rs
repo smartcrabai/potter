@@ -5,10 +5,7 @@ use glam::{DMat4, DVec3};
 use crate::{
     error::{ErrorCode, PotError, Result},
     eval::Snapshot,
-    geom::{
-        Aabb, TextureSpace,
-        volume::{VolumeData, sample_density, sample_density_checked},
-    },
+    geom::volume::{VolumeData, sample_density, sample_density_checked},
     image::{ImageData, ImageInterpolation},
     model::{Id, LightType, Material, SceneDoc},
     shader::{
@@ -3003,11 +3000,18 @@ fn collect_volumes<'a>(
                 .with_images(images)
                 .with_warnings(warnings);
             context.object = local_center;
-            let volume_space = TextureSpace::automatic(Some(Aabb {
-                min: bounds_min,
-                max: bounds_max,
+            // Cycles maps a volume's Generated as `(P - min) * safe_divide(1, size)` (`blender/volume.cpp`), so a
+            // zero-thickness axis maps to 0, where a mesh's degenerate axis maps to 0.5.
+            let size = bounds_max - bounds_min;
+            let inverse_size = DVec3::from_array(size.to_array().map(|extent| {
+                if crate::float::equal_f64(extent, 0.0) {
+                    0.0
+                } else {
+                    1.0 / extent
+                }
             }));
-            context = context.with_generated(volume_space, local_center);
+            context.generated = (local_center - bounds_min) * inverse_size;
+            context.generated_per_local = inverse_size;
             context.position = matrix.transform_point3(local_center);
             Some(evaluate_surface_with_workspace(
                 material,

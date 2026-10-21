@@ -1792,6 +1792,9 @@ fn validate_mesh_export_attributes(mesh: &Mesh, data_block: Option<&DataBlock>) 
             | "color_layers"
             | "custom_normal"
             | crate::geom::modifiers::OPTIMAL_DISPLAY_EDGES => true,
+            // glTF has no texture space: a stored one is a reported loss (`unwritten_attribute_losses`), so lossy export
+            // proceeds and strict export refuses through the loss report, as for other unwritten attributes.
+            crate::geom::TEXTURE_SPACE_KEY => true,
             "blender_metadata" => value["custom_properties"]
                 .as_object()
                 .is_some_and(serde_json::Map::is_empty),
