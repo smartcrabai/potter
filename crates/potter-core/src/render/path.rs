@@ -5,9 +5,12 @@ use glam::{DMat4, DVec3};
 use crate::{
     error::{ErrorCode, PotError, Result},
     eval::Snapshot,
-    geom::volume::{VolumeData, sample_density, sample_density_checked},
+    geom::volume::{
+        VolumeData, local_to_index_matrix, sample_density_checked_with, sample_density_with,
+        sample_index_density_checked_with, sample_index_density_with,
+    },
     image::{ImageData, ImageInterpolation},
-    model::{Id, LightType, Material, SceneDoc},
+    model::{Id, LightType, Material, SceneDoc, VolumeSampling},
     shader::{
         BsdfParams, EvaluatedSubsurfaceMethod, EvaluatorWorkspace, HitContext, HitFootprint,
         HitUvLayers, PreparedMaterial, SubsurfaceMethod, equirectangular_uv,
@@ -46,9 +49,6 @@ const MAX_VOLUME_STEPS: usize = 2048;
 /// Cycles' `VOLUME_BOUNDS_MAX` (`intern/cycles/kernel/types.h`): volume-only boundary crossings
 /// have their own counter, and the path ends past this many.
 const VOLUME_BOUNDS_MAX: u32 = 1024;
-
-// Calibrated against the Blender-gated Cycles VDB comparison; surface lighting uses its own energy convention.
-const VOLUME_DIRECT_LIGHT_SCALE: f64 = 0.75;
 
 #[derive(Clone, Copy)]
 struct PointLight {
@@ -102,6 +102,13 @@ struct VolumeInstance<'a> {
     scattering: bool,
     /// Channel-mean σt per unit grid density (absolute, as `BsdfParams`'s coefficients).
     extinction_scale: f64,
+    /// Blender's `cycles.volume_sampling` of the volume's material.
+    sampling: crate::model::VolumeSampling,
+    /// Blender's `cycles.volume_interpolation` of the volume's material.
+    interpolation: crate::model::VolumeInterpolation,
+    /// The inverse of an inline grid's index-to-local matrix, built once per volume (`local_to_index_matrix`). `None` for a
+    /// decoded VDB, which samples at its local position.
+    index_from_local: Option<DMat4>,
 }
 
 #[derive(Clone, Copy)]
@@ -113,7 +120,6 @@ struct VolumeEvent {
 
 struct VolumeSegment {
     transmittance: f64,
-    emission: DVec3,
     event: Option<VolumeEvent>,
     stochastic: bool,
 }
@@ -504,6 +510,7 @@ pub(super) fn render(
     samples: u32,
     seed: u32,
     max_bounces: u32,
+    volume_bounces: u32,
     transparent_max_bounces: u32,
     film_transparent: bool,
     images: &BTreeMap<String, ImageData>,
@@ -616,14 +623,21 @@ pub(super) fn render(
                     // film writes a pixel with no ray as black with alpha 1 under either film (`probe_transparent_film_fisheye.py`).
                     let (left, left_alpha) = match left_ray {
                         Some((left_origin, left_direction)) => trace_path(
-                            doc,
-                            snapshot,
-                            geometry,
-                            &bvh,
-                            &lights,
-                            &volumes,
-                            images,
-                            world_importance.as_ref(),
+                            SceneRefs {
+                                doc,
+                                snapshot,
+                                geometry,
+                                bvh: &bvh,
+                                lights: &lights,
+                                volumes: &volumes,
+                                images,
+                                importance: world_importance.as_ref(),
+                            },
+                            Bounces {
+                                surface: max_bounces,
+                                volume: volume_bounces,
+                                transparent: transparent_max_bounces,
+                            },
                             left_origin,
                             left_direction,
                             camera_footprint(
@@ -637,8 +651,6 @@ pub(super) fn render(
                                 (left_origin, left_direction),
                             )?,
                             environment,
-                            max_bounces,
-                            transparent_max_bounces,
                             &mut left_rng,
                             &mut evaluator_workspace,
                         )?,
@@ -646,14 +658,21 @@ pub(super) fn render(
                     };
                     let (right, right_alpha) = match right_ray {
                         Some((right_origin, right_direction)) => trace_path(
-                            doc,
-                            snapshot,
-                            geometry,
-                            &bvh,
-                            &lights,
-                            &volumes,
-                            images,
-                            world_importance.as_ref(),
+                            SceneRefs {
+                                doc,
+                                snapshot,
+                                geometry,
+                                bvh: &bvh,
+                                lights: &lights,
+                                volumes: &volumes,
+                                images,
+                                importance: world_importance.as_ref(),
+                            },
+                            Bounces {
+                                surface: max_bounces,
+                                volume: volume_bounces,
+                                transparent: transparent_max_bounces,
+                            },
                             right_origin,
                             right_direction,
                             camera_footprint(
@@ -667,8 +686,6 @@ pub(super) fn render(
                                 (right_origin, right_direction),
                             )?,
                             environment,
-                            max_bounces,
-                            transparent_max_bounces,
                             &mut right_rng,
                             &mut evaluator_workspace,
                         )?,
@@ -681,14 +698,21 @@ pub(super) fn render(
                 } else {
                     match ray_for_sample(camera, width, height, x, y, sample_x, sample_y)? {
                         Some((origin, direction)) => trace_path(
-                            doc,
-                            snapshot,
-                            geometry,
-                            &bvh,
-                            &lights,
-                            &volumes,
-                            images,
-                            world_importance.as_ref(),
+                            SceneRefs {
+                                doc,
+                                snapshot,
+                                geometry,
+                                bvh: &bvh,
+                                lights: &lights,
+                                volumes: &volumes,
+                                images,
+                                importance: world_importance.as_ref(),
+                            },
+                            Bounces {
+                                surface: max_bounces,
+                                volume: volume_bounces,
+                                transparent: transparent_max_bounces,
+                            },
                             origin,
                             direction,
                             camera_footprint(
@@ -702,8 +726,6 @@ pub(super) fn render(
                                 (origin, direction),
                             )?,
                             environment,
-                            max_bounces,
-                            transparent_max_bounces,
                             &mut rng,
                             &mut evaluator_workspace,
                         )?,
@@ -931,7 +953,7 @@ fn realtime_volume_integral(
                 0.0
             };
             extinction += extinction_coefficient;
-            source += instance.emission * density;
+            source += instance.emission;
             if instance.scattering {
                 source += ambient * instance.albedo * scattering_coefficient;
                 for light in lights {
@@ -981,28 +1003,205 @@ fn world_radiance(
     crate::shader::evaluate_world(world, &doc.node_groups, images, direction)
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one path's ray, scene state, sampling, and world context are explicit"
-)]
+/// The scene a path reads, bundled so the volume and shadow code take one argument for it.
+#[derive(Clone, Copy)]
+struct SceneRefs<'a, 'v> {
+    doc: &'a SceneDoc,
+    snapshot: &'a Snapshot,
+    geometry: &'a Geometry,
+    bvh: &'a Bvh,
+    lights: &'a [PointLight],
+    volumes: &'a [VolumeInstance<'v>],
+    images: &'a BTreeMap<String, ImageData>,
+    importance: Option<&'a WorldImportanceSampler>,
+}
+
+/// One path's budgets: surface bounces, volume scatters (Cycles' `volume_bounces + 1` vertices take direct light), and
+/// transparent passes.
+#[derive(Clone, Copy)]
+struct Bounces {
+    surface: u32,
+    volume: u32,
+    transparent: u32,
+}
+
+/// A shadow ray from `point` along `direction` for `distance`. A surface receiver offsets its ray by `normal`; a volume
+/// scatter has no normal and passes zero.
+#[derive(Clone, Copy)]
+struct ShadowRay {
+    point: DVec3,
+    normal: DVec3,
+    direction: DVec3,
+    distance: f64,
+    /// The camera footprint at the ray's origin (Cycles' `sd->dP`, which a shadow ray carries unchanged).
+    footprint: f64,
+}
+
+/// A volume scatter's receiver: its point, the incoming direction, its phase function, the per-light weights of the direct
+/// light, and the environment along the incoming direction.
+struct VolumeSite<'a> {
+    point: DVec3,
+    /// The scatter's camera footprint (Cycles' volume `sd->dP`), carried by its shadow rays.
+    footprint: f64,
+    incoming: DVec3,
+    phase: &'a PhaseMixture,
+    light_weights: &'a [f64],
+    environment: DVec3,
+}
+
+/// A scatter's phase function: a mixture of Henyey-Greenstein lobes, one per volume closure (Cycles' phase closures), each
+/// weighted by its scatter. The density is the normalised mixture of `_volume_shader_phase_eval_mis`, and a closure is
+/// picked in proportion to its weight (`volume_shader_phase_pick`).
+#[derive(Default)]
+struct PhaseMixture {
+    lobes: Vec<(f64, f64)>,
+    total: f64,
+}
+
+impl PhaseMixture {
+    /// Adds a closure of `weight` (its scatter) and `anisotropy`. A closure with no scatter takes no part.
+    fn push(&mut self, weight: f64, anisotropy: f64) {
+        if weight > 0.0 && weight.is_finite() {
+            self.lobes.push((weight, anisotropy));
+            self.total += weight;
+        }
+    }
+
+    /// The normalised mixture density at `cosine`, the cosine between the incoming and the scattered direction.
+    fn density(&self, cosine: f64) -> f64 {
+        if self.total <= 0.0 {
+            return 0.0;
+        }
+        self.lobes
+            .iter()
+            .map(|&(weight, anisotropy)| weight * henyey_greenstein(cosine, anisotropy))
+            .sum::<f64>()
+            / self.total
+    }
+
+    /// The anisotropy of a closure picked in proportion to its weight.
+    fn pick(&self, rng: &mut Pcg32) -> Option<f64> {
+        let mut selected = rng.next_f64() * self.total;
+        for &(weight, anisotropy) in &self.lobes {
+            if selected < weight {
+                return Some(anisotropy);
+            }
+            selected -= weight;
+        }
+        self.lobes.last().map(|&(_, anisotropy)| anisotropy)
+    }
+}
+
+/// Continues a path past a volume scatter. The direction is drawn from the lobe of the closure the event selected, and the
+/// density the next MIS partner uses is the event's normalised mixture density.
+fn sample_volume_continuation(
+    incoming: DVec3,
+    anisotropy: f64,
+    phase: &PhaseMixture,
+    rng: &mut Pcg32,
+) -> (DVec3, f64) {
+    let direction = sample_henyey_greenstein_direction(incoming, anisotropy, rng);
+    let phase_pdf = phase.density(incoming.normalize_or_zero().dot(direction));
+    (direction, phase_pdf)
+}
+
+/// The phase function at `distance` of a segment's media: each mesh medium is a closure weighted by its scatter, and each
+/// anisotropy group of the voxel grid is one weighted by its scatter per unit length at `distance`.
+fn event_phase(media: &[MeshMedium], grid: Option<&VoxelGrid>, distance: f64) -> PhaseMixture {
+    let mut phase = PhaseMixture::default();
+    for medium in media {
+        phase.push(
+            mean_scatter(&medium.params),
+            medium.params.volume_anisotropy,
+        );
+    }
+    if let Some(grid) = grid {
+        for group in &grid.groups {
+            let scatter = grid_scatter_at(grid, &group.scatter, distance).element_sum() / 3.0;
+            phase.push(scatter * grid.meters_per_unit, group.anisotropy);
+        }
+    }
+    phase
+}
+
+/// The density per unit distance of a scatter event in a mixed segment: the mesh stack's scatter density past the grid's
+/// optical depth, plus the grid's scatter density past the stack's extinction (the analog first-event density of both).
+fn mixed_scatter_pdf(stack: &BsdfParams, grid: &VoxelGrid, distance: f64) -> f64 {
+    distance_scatter_pdf(stack, distance) * (-grid_depth(grid, distance)).exp()
+        + grid_scatter_pdf(grid, distance) * (-mean_extinction(stack) * distance).exp()
+}
+
+/// The density per unit distance of a scatter event in a segment's media, which the distance sampler realises: the MIS
+/// partner of the equiangular samples and the density of distance-sampled events.
+fn segment_scatter_pdf(grid: Option<&VoxelGrid>, stack: Option<&BsdfParams>, distance: f64) -> f64 {
+    match (grid, stack) {
+        (Some(grid), Some(stack)) => mixed_scatter_pdf(stack, grid, distance),
+        (Some(grid), None) => grid_scatter_pdf(grid, distance),
+        (None, Some(stack)) => distance_scatter_pdf(stack, distance),
+        (None, None) => 0.0,
+    }
+}
+
+/// The per-channel transmittance of a segment's media to `distance`: the mesh stack's and the grid's.
+fn segment_transmittance(
+    grid: Option<&VoxelGrid>,
+    stack: Option<&BsdfParams>,
+    distance: f64,
+) -> DVec3 {
+    let mesh = stack.map_or(DVec3::ONE, |stack| medium_transmittance(stack, distance));
+    let voxel = grid.map_or(1.0, |grid| (-grid_depth(grid, distance)).exp());
+    mesh * voxel
+}
+
+/// The camera-side scatter of a segment at `distance` towards a light at `cosine`: each closure's scatter times its own
+/// Henyey-Greenstein phase, transmitted by the segment (Cycles' `volume_shader_eval` summed over the closures).
+fn camera_scatter_phase(
+    media: &[MeshMedium],
+    grid: Option<&VoxelGrid>,
+    distance: f64,
+    cosine: f64,
+    transmittance: DVec3,
+) -> DVec3 {
+    let mut scatter = DVec3::ZERO;
+    for medium in media {
+        scatter += DVec3::from_array(medium.params.volume_scatter)
+            * henyey_greenstein(cosine, medium.params.volume_anisotropy);
+    }
+    if let Some(grid) = grid {
+        for group in &grid.groups {
+            scatter += grid_scatter_at(grid, &group.scatter, distance)
+                * (grid.meters_per_unit * henyey_greenstein(cosine, group.anisotropy));
+        }
+    }
+    scatter * transmittance
+}
+
+/// The volume and transport state of one path: the scene, the bounce budgets and the sampling state.
 fn trace_path(
-    doc: &SceneDoc,
-    snapshot: &Snapshot,
-    geometry: &Geometry,
-    bvh: &Bvh,
-    lights: &[PointLight],
-    volumes: &[VolumeInstance<'_>],
-    images: &BTreeMap<String, ImageData>,
-    importance: Option<&WorldImportanceSampler>,
+    scene: SceneRefs<'_, '_>,
+    bounces: Bounces,
     mut origin: DVec3,
     mut direction: DVec3,
     footprint: CameraFootprint,
     environment: DVec3,
-    max_bounces: u32,
-    transparent_max_bounces: u32,
     rng: &mut Pcg32,
     evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<(DVec3, f64)> {
+    let SceneRefs {
+        doc,
+        snapshot,
+        geometry,
+        bvh,
+        lights,
+        volumes,
+        images,
+        importance,
+    } = scene;
+    let Bounces {
+        surface: max_bounces,
+        volume: volume_bounces,
+        transparent: transparent_max_bounces,
+    } = bounces;
     let mut radiance = DVec3::ZERO;
     let mut throughput = DVec3::ONE;
     let mut escaped = false;
@@ -1023,6 +1222,13 @@ fn trace_path(
     // The smallest sampled pdf so far on this path (Cycles' `path.min_ray_pdf`, `FLT_MAX` at the start of a path and
     // lowered by each BSDF and phase sample, `shade_surface.h` and `shade_volume.h`). It drives the glossy blur.
     let mut min_ray_pdf = f64::MAX;
+    // Cycles' `volume_bounce` limit (`path_state_next`): `volume_bounces + 1` scatter vertices take direct light.
+    let volume_limit = volume_bounces.saturating_add(1);
+    let mut volume_scatters = 0u32;
+    // Set once the path's last scatter has taken its direct light. The ray then continues without scattering: its
+    // segments only attenuate and emit, and it ends at its next surface, or in the environment, MIS weighted against
+    // the scatter's phase sample (Cycles' `PATH_RAY_TERMINATE_AFTER_TRANSPARENT`).
+    let mut terminal = false;
     // Set by the pass that reaches the cap: the next surface is shaded for emission and ends the
     // path (`PATH_RAY_TERMINATE_ON_NEXT_SURFACE`, `integrate_surface_terminate`).
     let mut terminate_on_next_surface = false;
@@ -1033,6 +1239,18 @@ fn trace_path(
     // Cycles' `PATH_RAY_SUBSURFACE_BACKFACING`: the entry was on a backfacing side, which flips the exit's normal.
     let mut exit_backfacing = false;
     let mut diffuse_ancestor = false;
+    // The volume stack: the media the path is inside, innermost last. It starts with the mesh media that contain the
+    // camera (Cycles' `volume_stack_init`).
+    let mut media = camera_media(
+        doc,
+        snapshot,
+        geometry,
+        bvh,
+        origin,
+        images,
+        footprint,
+        evaluator_workspace,
+    )?;
     loop {
         let hit = match exit_hit.take() {
             Some(exit) => Some(exit),
@@ -1045,7 +1263,7 @@ fn trace_path(
         let receiver = match previous {
             Scatter::Surface(vertex) if volumes.is_empty() => Some(vertex.point),
             Scatter::Delta(point) => Some(point),
-            Scatter::Camera | Scatter::Surface(_) | Scatter::Volume => None,
+            Scatter::Camera | Scatter::Surface(_) | Scatter::Volume(_) => None,
         };
         let light = receiver.and_then(|receiver| {
             nearest_light_hit(lights, origin, direction, receiver, surface_distance)
@@ -1054,70 +1272,363 @@ fn trace_path(
         let environment = world_radiance(doc, &snapshot.scene_id, images, direction, environment)?;
         // The exit probe is a local intersection inside the object (`subsurface_disk`), not a light path: no volume
         // transport, emission or scatter applies along it, so it takes the neutral segment.
-        let volume_segment = if exit_pending {
-            VolumeSegment {
-                transmittance: 1.0,
-                emission: DVec3::ZERO,
-                event: None,
-                stochastic: false,
-            }
+        let stack = if exit_pending {
+            None
         } else {
-            trace_volume_segment(volumes, origin, direction, segment_limit, rng)?
+            stack_medium(&media)
         };
-        radiance += throughput * volume_segment.emission;
-        if !volume_segment.stochastic {
-            throughput *= volume_segment.transmittance;
-        }
-        if throughput.max_element() <= 1.0e-8 {
-            break;
-        }
-        if let Some(event) = volume_segment.event {
-            let scatter_probability = (event.albedo.x + event.albedo.y + event.albedo.z) / 3.0;
-            if scatter_probability <= 0.0 || rng.next_f64() >= scatter_probability {
-                break;
-            }
-            throughput *= event.albedo / scatter_probability;
-            // The scatter's footprint, Cycles' volume `sd->dP` (`differential_transfer_compact`).
-            let event_footprint = ray_dp + (event.point - origin).length() * ray_dd;
-            radiance += throughput
-                * direct_volume_lighting(
-                    doc,
-                    snapshot,
-                    geometry,
-                    bvh,
-                    lights,
-                    volumes,
-                    images,
-                    importance,
-                    event,
-                    event_footprint,
-                    direction,
-                    environment,
-                    transparent_max_bounces.saturating_sub(transparent_bounce),
+        let grid = if exit_pending {
+            None
+        } else {
+            voxel_grid(volumes, origin, direction, segment_limit)?
+        };
+        // A segment holding both a voxel grid and a mesh medium is mixed: its nearest free flight is sampled analogously.
+        let mixed = match (grid.as_ref(), stack) {
+            (Some(grid), Some(medium)) if !terminal => Some((grid, medium)),
+            _ => None,
+        };
+        // Equiangular direct light follows Cycles' `volume_stack_sample_method` over every medium of the segment: each voxel
+        // grid's and each mesh medium's `volume_sampling`, combined by the same rule.
+        let method = if terminal || exit_pending {
+            None
+        } else {
+            segment_sampling(
+                grid.iter()
+                    .flat_map(|grid| grid.samplings.iter().copied())
+                    .chain(media.iter().map(|medium| medium.params.volume_sampling)),
+            )
+        };
+        let budget = transparent_max_bounces.saturating_sub(transparent_bounce);
+        let choices = equiangular_choices(lights, origin, method, rng);
+        // Next-event estimation of the segment's media, for each light sampled equiangularly. The equiangular samples cover
+        // the voxel grid's span alone in a voxel-only segment, where the grid has no scatter beyond it, and the whole segment
+        // otherwise. Each closure's camera-side scatter is weighted by its own phase at the light's direction.
+        let (span_start, span_length) = match (&grid, stack) {
+            (Some(grid), None) => (grid.entry, grid_span(grid)),
+            _ => (0.0, segment_limit),
+        };
+        if let Some(method) = method.filter(|_| span_length.is_finite()) {
+            let span_origin = origin + direction * span_start;
+            for (light, &(point, sampled)) in lights.iter().zip(&choices) {
+                let Some(point) = point.filter(|_| sampled) else {
+                    continue;
+                };
+                let Some((offset, pdf)) =
+                    equiangular_sample(point, span_origin, direction, span_length, rng.next_f64())
+                else {
+                    continue;
+                };
+                let distance = span_start + offset;
+                // Multiple importance sampling weights this sample against the distance strategy's density at the same
+                // point (`volume_direct_scatter_mis`); equiangular sampling alone takes no weight.
+                let mis = match method {
+                    VolumeSampling::Equiangular => 1.0,
+                    _ => {
+                        2.0 * power_heuristic(
+                            pdf,
+                            segment_scatter_pdf(grid.as_ref(), stack.as_ref(), distance),
+                        )
+                    }
+                };
+                let sample_point = origin + direction * distance;
+                let (nee, light_direction) = volume_light_nee(
+                    scene,
+                    &media,
+                    light,
+                    sample_point,
+                    ray_dp + distance * ray_dd,
+                    budget,
                     rng,
                     evaluator_workspace,
                 )?;
-            if bounce == max_bounces {
+                if nee.max_element() <= 0.0 {
+                    continue;
+                }
+                let transmittance = segment_transmittance(grid.as_ref(), stack.as_ref(), distance);
+                let scatter = camera_scatter_phase(
+                    &media,
+                    grid.as_ref(),
+                    distance,
+                    direction.dot(light_direction),
+                    transmittance,
+                );
+                radiance += throughput * scatter * nee * (mis / pdf);
+            }
+        }
+        if let Some((grid, medium)) = mixed {
+            // The grid's stochastic free flight and the mesh's analog collision are sampled independently, and the nearer
+            // event is taken. The grid's emission runs up to that event, weighted by the mesh's chromatic excess, before the
+            // throughput takes any transmittance (`emission_until`). Analog sampling is exact for the event, so the
+            // mesh's chromatic transmittance is its only extra weight (`chromatic_correction`).
+            let voxel = trace_volume_segment(Some(grid), volumes, origin, direction, rng, true)?;
+            let voxel_distance = voxel
+                .event
+                .map(|event| (event.point - origin).dot(direction));
+            let limit = voxel_distance.unwrap_or(segment_limit);
+            let collision = sample_mesh_collision(&medium, limit, rng);
+            let emission_end = collision.unwrap_or(limit);
+            radiance += throughput
+                * emission_until(
+                    Some(grid),
+                    voxel.stochastic,
+                    Some(&medium),
+                    true,
+                    emission_end,
+                );
+            if let Some(distance) = collision {
+                if !voxel.stochastic {
+                    throughput *= (-grid_depth(grid, distance)).exp();
+                }
+                let scatter_rate = mean_scatter(&medium);
+                let extinction_rate = mean_extinction(&medium);
+                if scatter_rate <= 0.0 || rng.next_f64() * extinction_rate >= scatter_rate {
+                    break;
+                }
+                throughput *= DVec3::from_array(medium.volume_scatter) / scatter_rate
+                    * chromatic_correction(&medium, distance);
+                let phase = event_phase(&media, Some(grid), distance);
+                let Some(anisotropy) = phase.pick(rng) else {
+                    break;
+                };
+                let event = VolumeEvent {
+                    point: origin + direction * distance,
+                    albedo: DVec3::ZERO,
+                    anisotropy,
+                };
+                let weights = event_weights(
+                    &choices,
+                    method,
+                    origin,
+                    direction,
+                    segment_limit,
+                    distance,
+                    segment_scatter_pdf(Some(grid), Some(&medium), distance),
+                );
+                let event_footprint = ray_dp + (event.point - origin).length() * ray_dd;
+                radiance += throughput
+                    * direct_volume_lighting(
+                        scene,
+                        &media,
+                        &VolumeSite {
+                            point: event.point,
+                            footprint: event_footprint,
+                            incoming: direction,
+                            phase: &phase,
+                            light_weights: &weights,
+                            environment,
+                        },
+                        budget,
+                        rng,
+                        evaluator_workspace,
+                    )?;
+                volume_scatters += 1;
+                terminal |= bounce >= max_bounces || volume_scatters >= volume_limit;
+                let (next_direction, phase_pdf) =
+                    sample_volume_continuation(direction, anisotropy, &phase, rng);
+                direction = next_direction;
+                origin = event.point + direction * RAY_EPSILON;
+                ray_dp = event_footprint;
+                min_ray_pdf = min_ray_pdf.min(phase_pdf);
+                previous = Scatter::Volume(phase_pdf);
+                bounce += 1;
+                continue;
+            }
+            // No mesh collision before `limit`: the mesh's chromatic transmittance up to there, then the grid's own event
+            // or the segment's end.
+            throughput *= chromatic_correction(&medium, limit);
+            if !voxel.stochastic {
+                throughput *= voxel.transmittance;
+            }
+            if throughput.max_element() <= 1.0e-8 {
                 break;
             }
-            let scattered = sample_henyey_greenstein_direction(direction, event.anisotropy, rng);
-            // The phase pdf of the drawn direction, with the incoming direction as the forward axis (Cycles'
-            // `unguided_phase_pdf`, `shade_volume.h`).
-            min_ray_pdf = min_ray_pdf.min(henyey_greenstein(
-                direction.dot(scattered),
-                event.anisotropy,
-            ));
-            direction = scattered;
-            origin = event.point + direction * RAY_EPSILON;
-            ray_dp = event_footprint;
-            previous = Scatter::Volume;
-            bounce += 1;
-            continue;
+            if let Some(event) = voxel.event {
+                let scatter_probability = (event.albedo.x + event.albedo.y + event.albedo.z) / 3.0;
+                if scatter_probability <= 0.0 || rng.next_f64() >= scatter_probability {
+                    break;
+                }
+                throughput *= event.albedo / scatter_probability;
+                let event_distance = (event.point - origin).dot(direction);
+                let phase = event_phase(&media, Some(grid), event_distance);
+                let weights = event_weights(
+                    &choices,
+                    method,
+                    origin,
+                    direction,
+                    segment_limit,
+                    event_distance,
+                    segment_scatter_pdf(Some(grid), Some(&medium), event_distance),
+                );
+                let event_footprint = ray_dp + (event.point - origin).length() * ray_dd;
+                radiance += throughput
+                    * direct_volume_lighting(
+                        scene,
+                        &media,
+                        &VolumeSite {
+                            point: event.point,
+                            footprint: event_footprint,
+                            incoming: direction,
+                            phase: &phase,
+                            light_weights: &weights,
+                            environment,
+                        },
+                        budget,
+                        rng,
+                        evaluator_workspace,
+                    )?;
+                volume_scatters += 1;
+                terminal |= bounce >= max_bounces || volume_scatters >= volume_limit;
+                let (next_direction, phase_pdf) =
+                    sample_volume_continuation(direction, event.anisotropy, &phase, rng);
+                direction = next_direction;
+                origin = event.point + direction * RAY_EPSILON;
+                ray_dp = event_footprint;
+                min_ray_pdf = min_ray_pdf.min(phase_pdf);
+                previous = Scatter::Volume(phase_pdf);
+                bounce += 1;
+                continue;
+            }
+        } else if terminal {
+            // The path's last scatter has taken its direct light: this ray only attenuates through the volumes it crosses.
+            radiance += throughput
+                * emission_until(grid.as_ref(), false, stack.as_ref(), false, segment_limit);
+            if let Some(grid) = grid.as_ref() {
+                let segment =
+                    trace_volume_segment(Some(grid), volumes, origin, direction, rng, false)?;
+                throughput *= segment.transmittance;
+            }
+            if let Some(medium) = stack {
+                throughput *= medium_transmittance(&medium, segment_limit);
+            }
+            if throughput.max_element() <= 1.0e-8 {
+                break;
+            }
+        } else if let (Some(grid), None) = (grid.as_ref(), stack) {
+            let segment = trace_volume_segment(Some(grid), volumes, origin, direction, rng, true)?;
+            let emission_end = segment
+                .event
+                .map_or(segment_limit, |event| (event.point - origin).dot(direction));
+            radiance += throughput
+                * emission_until(Some(grid), segment.stochastic, None, false, emission_end);
+            if !segment.stochastic {
+                throughput *= segment.transmittance;
+            }
+            if throughput.max_element() <= 1.0e-8 {
+                break;
+            }
+            if let Some(event) = segment.event {
+                let scatter_probability = (event.albedo.x + event.albedo.y + event.albedo.z) / 3.0;
+                if scatter_probability <= 0.0 || rng.next_f64() >= scatter_probability {
+                    break;
+                }
+                throughput *= event.albedo / scatter_probability;
+                let event_distance = (event.point - origin).dot(direction);
+                let phase = event_phase(&media, Some(grid), event_distance);
+                let weights = event_weights(
+                    &choices,
+                    method,
+                    origin + direction * grid.entry,
+                    direction,
+                    grid_span(grid),
+                    event_distance - grid.entry,
+                    segment_scatter_pdf(Some(grid), None, event_distance),
+                );
+                let event_footprint = ray_dp + (event.point - origin).length() * ray_dd;
+                radiance += throughput
+                    * direct_volume_lighting(
+                        scene,
+                        &media,
+                        &VolumeSite {
+                            point: event.point,
+                            footprint: event_footprint,
+                            incoming: direction,
+                            phase: &phase,
+                            light_weights: &weights,
+                            environment,
+                        },
+                        budget,
+                        rng,
+                        evaluator_workspace,
+                    )?;
+                volume_scatters += 1;
+                terminal |= bounce >= max_bounces || volume_scatters >= volume_limit;
+                let (next_direction, phase_pdf) =
+                    sample_volume_continuation(direction, event.anisotropy, &phase, rng);
+                direction = next_direction;
+                origin = event.point + direction * RAY_EPSILON;
+                ray_dp = event_footprint;
+                min_ray_pdf = min_ray_pdf.min(phase_pdf);
+                previous = Scatter::Volume(phase_pdf);
+                bounce += 1;
+                continue;
+            }
+        } else if let Some(medium) = stack {
+            // The stack changes only at surfaces, so the stack's combined medium spans this whole segment, and its free
+            // flight is spectral ratio tracking (`trace_mesh_medium`). A scatter picks its closure by scatter weight.
+            // A mesh medium's emission is integrated in closed form over the whole segment, at the throughput the path
+            // carries into it, independent of where it scatters (`volume_integrate_homogeneous`).
+            radiance +=
+                throughput * emission_until(None, false, Some(&medium), false, segment_limit);
+            match trace_mesh_medium(&medium, segment_limit, &mut throughput, rng) {
+                MediumOutcome::Scatter(distance) => {
+                    let phase = event_phase(&media, None, distance);
+                    let Some(anisotropy) = phase.pick(rng) else {
+                        break;
+                    };
+                    let event = VolumeEvent {
+                        point: origin + direction * distance,
+                        albedo: DVec3::ZERO,
+                        anisotropy,
+                    };
+                    let weights = event_weights(
+                        &choices,
+                        method,
+                        origin,
+                        direction,
+                        segment_limit,
+                        distance,
+                        segment_scatter_pdf(None, Some(&medium), distance),
+                    );
+                    let event_footprint = ray_dp + (event.point - origin).length() * ray_dd;
+                    radiance += throughput
+                        * direct_volume_lighting(
+                            scene,
+                            &media,
+                            &VolumeSite {
+                                point: event.point,
+                                footprint: event_footprint,
+                                incoming: direction,
+                                phase: &phase,
+                                light_weights: &weights,
+                                environment,
+                            },
+                            budget,
+                            rng,
+                            evaluator_workspace,
+                        )?;
+                    volume_scatters += 1;
+                    terminal |= bounce >= max_bounces || volume_scatters >= volume_limit;
+                    let (next_direction, phase_pdf) =
+                        sample_volume_continuation(direction, anisotropy, &phase, rng);
+                    direction = next_direction;
+                    origin = event.point + direction * RAY_EPSILON;
+                    ray_dp = event_footprint;
+                    min_ray_pdf = min_ray_pdf.min(phase_pdf);
+                    previous = Scatter::Volume(phase_pdf);
+                    bounce += 1;
+                    continue;
+                }
+                MediumOutcome::Survive => {}
+                MediumOutcome::Absorb => break,
+            }
+            if throughput.max_element() <= 1.0e-8 {
+                break;
+            }
         }
         if let Some(light) = light {
             let weight = match previous {
                 Scatter::Surface(vertex) => power_heuristic(vertex.bsdf_pdf, light.pdf),
-                Scatter::Camera | Scatter::Delta(_) | Scatter::Volume => 1.0,
+                Scatter::Camera | Scatter::Delta(_) | Scatter::Volume(_) => 1.0,
             };
             radiance += throughput * light.radiance * weight;
             origin += direction * (light.distance + RAY_EPSILON);
@@ -1139,7 +1650,9 @@ fn trace_path(
                     vertex.bsdf_pdf,
                     environment_light_pdf(vertex.normal, direction, importance),
                 ),
-                Scatter::Volume => 0.5,
+                Scatter::Volume(phase_pdf) => {
+                    power_heuristic(phase_pdf, volume_sampling_pdf(direction, importance))
+                }
             };
             radiance += throughput * environment * environment_weight;
             escaped = true;
@@ -1187,42 +1700,17 @@ fn trace_path(
             // `PATH_RAY_DIFFUSE_ANCESTOR`). The random walk keeps its closure.
             surface.params.subsurface_weight = 0.0;
         }
-        if surface.params.has_medium()
-            && let Some(boundary) = closest_hit(
-                geometry,
-                bvh,
-                surface.point + direction * RAY_EPSILON,
-                direction,
-                RAY_EPSILON,
-                f64::INFINITY,
-            )
-        {
-            let exits_medium = geometry
-                .triangles
-                .get(boundary.triangle_index)
-                .is_some_and(|triangle| triangle.object_index == surface.object_index);
-            let distance = boundary.distance.max(0.0);
-            let (transmittance, in_scatter) = homogeneous_medium_segment(&surface.params, distance);
-            let phase = henyey_greenstein(-1.0, surface.params.volume_anisotropy)
-                * (4.0 * std::f64::consts::PI);
-            radiance += throughput * environment * in_scatter * phase;
-            throughput *= transmittance;
-            let step = if exits_medium {
-                distance + 2.0 * RAY_EPSILON
-            } else {
-                distance - 2.0 * RAY_EPSILON
-            };
-            origin = surface.point + direction * step;
-            // The origin moves `step` beyond the surface's own hit distance, so its footprint is the surface's plus
-            // `step · dD`, as Cycles' `dP + t · dD` gives at the new origin.
-            ray_dp = surface.footprint + step * ray_dd;
-            if throughput.max_element() <= 1.0e-8 {
-                break;
-            }
+        if surface.params.has_medium() {
+            // A medium surface passes the path and changes the volume stack: it enters the medium of its
+            // object, or leaves the one it entered.
+            toggle_mesh_medium(&mut media, surface.object_index, &surface.params);
             volume_bounds += 1;
             if volume_bounds > VOLUME_BOUNDS_MAX {
                 break;
             }
+            // As a transparent pass, the origin moves to the surface, so its footprint is the surface's.
+            ray_dp = surface.footprint;
+            origin = offset_origin(surface.point, direction, surface.geometric_normal);
             continue;
         }
         if terminate_on_next_surface {
@@ -1257,11 +1745,12 @@ fn trace_path(
                 bvh,
                 lights,
                 volumes,
+                &media,
                 images,
                 importance,
                 &surface,
                 environment,
-                bounce < max_bounces,
+                bounce < max_bounces && !terminal,
                 transparent_max_bounces.saturating_sub(transparent_bounce),
                 rng,
                 evaluator_workspace,
@@ -1269,9 +1758,9 @@ fn trace_path(
         // The budget is spent by `path_state_next` only: a subsurface entry returns before it (`subsurface_bounce`), so
         // its exit keeps the entry's bounce count. A BSSRDF entry (Burley or the random walk; Thin Wall has none) at the
         // last bounce is sampled, and its exit is the vertex that still gets direct light; any other scatter at the
-        // budget ends the path (`shade_surface.h`).
+        // budget ends the path (`shade_surface.h`). A terminal path ends at its next surface, as before.
         let bssrdf_entry = subsurface_evaluated(&surface.params) && !surface.params.thin_wall;
-        if bounce >= max_bounces && !bssrdf_entry {
+        if terminal || (bounce >= max_bounces && !bssrdf_entry) {
             break;
         }
         let sampled = sample_bsdf(
@@ -1292,9 +1781,9 @@ fn trace_path(
             else {
                 break;
             };
-            // The exit's normal faces outward as Cycles' `subsurface_bounce` and `subsurface_scatter` set it: a Burley
-            // exit is oriented by its probe's entry (`subsurface_disk`), and a random walk exit faces along the walk's
-            // last flight, since Cycles reverses that ray at the exit point.
+            // The exit's normal faces outward as Cycles' `subsurface_bounce` and `subsurface_scatter` set it: a Burley exit
+            // is oriented by its probe's entry (`subsurface_disk`), and a random walk exit faces along the walk's last
+            // flight, since Cycles reverses that ray at the exit point.
             exit_backfacing = match surface.params.subsurface_method {
                 SubsurfaceMethod::Burley => intrinsic_normal(geometry, hit.triangle_index)
                     .is_some_and(|normal| normal.dot(direction) > 0.0),
@@ -1882,6 +2371,7 @@ fn direct_lighting(
     bvh: &Bvh,
     lights: &[PointLight],
     volumes: &[VolumeInstance<'_>],
+    media: &[MeshMedium],
     images: &BTreeMap<String, ImageData>,
     importance: Option<&WorldImportanceSampler>,
     surface: &Surface,
@@ -1910,17 +2400,24 @@ fn direct_lighting(
             continue;
         }
         let visibility = shadow_transmittance(
-            doc,
-            snapshot,
-            geometry,
-            bvh,
-            volumes,
-            images,
-            surface.shadow_point,
-            geometric,
-            surface.footprint,
-            sample.direction,
-            sample.distance,
+            SceneRefs {
+                doc,
+                snapshot,
+                geometry,
+                bvh,
+                lights,
+                volumes,
+                images,
+                importance,
+            },
+            media,
+            ShadowRay {
+                point: surface.shadow_point,
+                normal: geometric,
+                direction: sample.direction,
+                distance: sample.distance,
+                footprint: surface.footprint,
+            },
             transparent_budget,
             rng,
             evaluator_workspace,
@@ -1954,17 +2451,24 @@ fn direct_lighting(
         let environment_sample =
             world_radiance(doc, &snapshot.scene_id, images, direction, environment)?;
         let visibility = shadow_transmittance(
-            doc,
-            snapshot,
-            geometry,
-            bvh,
-            volumes,
-            images,
-            surface.shadow_point,
-            geometric,
-            surface.footprint,
-            direction,
-            f64::INFINITY,
+            SceneRefs {
+                doc,
+                snapshot,
+                geometry,
+                bvh,
+                lights,
+                volumes,
+                images,
+                importance,
+            },
+            media,
+            ShadowRay {
+                point: surface.shadow_point,
+                normal: geometric,
+                direction,
+                distance: f64::INFINITY,
+                footprint: surface.footprint,
+            },
             transparent_budget,
             rng,
             evaluator_workspace,
@@ -1982,79 +2486,64 @@ fn direct_lighting(
     Ok(contribution)
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "volume direct lighting needs explicit transport and world state"
-)]
+/// The direct light of a volume scatter: each light's next-event estimate weighted by the scatter's phase function, and one
+/// environment sample with MIS against the phase function.
 fn direct_volume_lighting(
-    doc: &SceneDoc,
-    snapshot: &Snapshot,
-    geometry: &Geometry,
-    bvh: &Bvh,
-    lights: &[PointLight],
-    volumes: &[VolumeInstance<'_>],
-    images: &BTreeMap<String, ImageData>,
-    importance: Option<&WorldImportanceSampler>,
-    event: VolumeEvent,
-    footprint: f64,
-    incoming_direction: DVec3,
-    environment: DVec3,
+    scene: SceneRefs<'_, '_>,
+    media: &[MeshMedium],
+    site: &VolumeSite<'_>,
     transparent_budget: u32,
     rng: &mut Pcg32,
     evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<DVec3> {
     let mut contribution = DVec3::ZERO;
-    for light in lights {
-        let Some(sample) = sample_light(light, event.point, rng) else {
-            continue;
-        };
-        if sample.radiance.max_element() <= 0.0 {
+    for (index, light) in scene.lights.iter().enumerate() {
+        let weight = site.light_weights.get(index).copied().unwrap_or(1.0);
+        if weight <= 0.0 {
             continue;
         }
-        let visibility = shadow_transmittance(
-            doc,
-            snapshot,
-            geometry,
-            bvh,
-            volumes,
-            images,
-            event.point,
-            DVec3::ZERO,
-            footprint,
-            sample.direction,
-            sample.distance,
+        let (radiance, direction) = volume_light_nee(
+            scene,
+            media,
+            light,
+            site.point,
+            site.footprint,
             transparent_budget,
             rng,
             evaluator_workspace,
         )?;
-        let phase = henyey_greenstein(incoming_direction.dot(sample.direction), event.anisotropy);
-        contribution += sample.radiance * (phase * visibility * VOLUME_DIRECT_LIGHT_SCALE);
+        contribution += radiance * (site.phase.density(site.incoming.dot(direction)) * weight);
     }
-    let (direction, pdf) = if let Some(sampler) = importance {
+    let (direction, pdf) = if let Some(sampler) = scene.importance {
         sampler.sample(rng)
     } else {
         sample_uniform_sphere(rng)
     };
     if pdf > 0.0 {
-        let incoming = world_radiance(doc, &snapshot.scene_id, images, direction, environment)?;
-        let visibility = shadow_transmittance(
-            doc,
-            snapshot,
-            geometry,
-            bvh,
-            volumes,
-            images,
-            event.point,
-            DVec3::ZERO,
-            footprint,
+        let incoming = world_radiance(
+            scene.doc,
+            &scene.snapshot.scene_id,
+            scene.images,
             direction,
-            f64::INFINITY,
+            site.environment,
+        )?;
+        let visibility = shadow_transmittance(
+            scene,
+            media,
+            ShadowRay {
+                point: site.point,
+                normal: DVec3::ZERO,
+                direction,
+                distance: f64::INFINITY,
+                footprint: site.footprint,
+            },
             transparent_budget,
             rng,
             evaluator_workspace,
         )?;
-        let phase = henyey_greenstein(incoming_direction.dot(direction), event.anisotropy);
-        contribution += incoming * (phase * visibility * 0.5 / pdf);
+        let phase = site.phase.density(site.incoming.dot(direction));
+        let weight = power_heuristic(pdf, phase);
+        contribution += incoming * (phase * visibility * weight / pdf);
     }
     Ok(contribution)
 }
@@ -2075,30 +2564,231 @@ fn power_heuristic(first_pdf: f64, second_pdf: f64) -> f64 {
     first_squared / (first_squared + second_squared).max(f64::MIN_POSITIVE)
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "shadow traversal needs exact scene visibility, materials, and medium state"
-)]
-fn shadow_transmittance(
-    doc: &SceneDoc,
-    snapshot: &Snapshot,
-    geometry: &Geometry,
-    bvh: &Bvh,
-    volumes: &[VolumeInstance<'_>],
-    images: &BTreeMap<String, ImageData>,
-    point: DVec3,
-    normal: DVec3,
-    footprint: f64,
+/// The density with which `direct_volume_lighting` and the environment miss sample a direction: the
+/// importance map's density, or the uniform sphere's when there is no map.
+fn volume_sampling_pdf(direction: DVec3, importance: Option<&WorldImportanceSampler>) -> f64 {
+    importance.map_or(1.0 / (4.0 * std::f64::consts::PI), |sampler| {
+        sampler.pdf(direction)
+    })
+}
+
+/// Blender's `cycles.volume_sampling` for a segment, from the volumes it crosses, as Cycles'
+/// `volume_stack_sample_method` combines them: multiple importance sampling if a volume asks for it or asks for
+/// both distance and equiangular, else the one strategy they share. `None` when no volume is crossed.
+fn segment_sampling(
+    samplings: impl IntoIterator<Item = crate::model::VolumeSampling>,
+) -> Option<crate::model::VolumeSampling> {
+    use crate::model::VolumeSampling;
+    let mut distance = false;
+    let mut equiangular = false;
+    for sampling in samplings {
+        match sampling {
+            VolumeSampling::MultipleImportance => return Some(VolumeSampling::MultipleImportance),
+            VolumeSampling::Distance => distance = true,
+            VolumeSampling::Equiangular => equiangular = true,
+        }
+    }
+    match (distance, equiangular) {
+        (true, true) => Some(VolumeSampling::MultipleImportance),
+        (false, true) => Some(VolumeSampling::Equiangular),
+        (true, false) => Some(VolumeSampling::Distance),
+        (false, false) => None,
+    }
+}
+
+/// The point that a light's equiangular sampling aims at (Cycles' `light_sample_from_volume_segment`): a light
+/// sample from the segment's origin, so the sampled light position along its direction. A sun has no position
+/// and takes distance sampling only.
+fn equiangular_point(light: &PointLight, origin: DVec3, rng: &mut Pcg32) -> Option<DVec3> {
+    if light.kind == LightType::Sun {
+        return None;
+    }
+    let sample = sample_light(light, origin, rng)?;
+    sample
+        .distance
+        .is_finite()
+        .then(|| origin + sample.direction * sample.distance)
+}
+
+/// The equiangular point and sampling choice of each light for one segment (Cycles'
+/// `volume_direct_sample_method`): under equiangular sampling every light with a point is sampled equiangularly, under
+/// multiple importance sampling each is with probability one half, and under distance sampling none is. A light with
+/// no point (a sun, or no sample) takes distance sampling only.
+fn equiangular_choices(
+    lights: &[PointLight],
+    origin: DVec3,
+    method: Option<crate::model::VolumeSampling>,
+    rng: &mut Pcg32,
+) -> Vec<(Option<DVec3>, bool)> {
+    use crate::model::VolumeSampling;
+    lights
+        .iter()
+        .map(|light| {
+            let point = match method {
+                Some(VolumeSampling::Equiangular | VolumeSampling::MultipleImportance) => {
+                    equiangular_point(light, origin, rng)
+                }
+                Some(VolumeSampling::Distance) | None => None,
+            };
+            let sampled = match (method, point) {
+                (Some(VolumeSampling::Equiangular), Some(_)) => true,
+                (Some(VolumeSampling::MultipleImportance), Some(_)) => rng.next_f64() < 0.5,
+                _ => false,
+            };
+            (point, sampled)
+        })
+        .collect()
+}
+
+/// The geometry of Cycles' equiangular sampling (`volume_equiangular_sample`): the light's offset along the ray,
+/// its distance from the ray, and the angle that the segment `[0, distance]` subtends at the light.
+struct Equiangular {
+    delta: f64,
+    perpendicular: f64,
+    theta_a: f64,
+    theta_span: f64,
+}
+
+fn equiangular_geometry(
+    light: DVec3,
+    origin: DVec3,
     direction: DVec3,
     distance: f64,
+) -> Option<Equiangular> {
+    let delta = (light - origin).dot(direction);
+    let perpendicular = (light - origin - direction * delta).length();
+    if perpendicular <= 0.0 || !perpendicular.is_finite() {
+        return None;
+    }
+    let theta_a = (-delta).atan2(perpendicular);
+    let theta_b = (distance - delta).atan2(perpendicular);
+    Some(Equiangular {
+        delta,
+        perpendicular,
+        theta_a,
+        theta_span: theta_b - theta_a,
+    })
+}
+
+/// Cycles' equiangular sample of `[0, distance]` (`volume_equiangular_sample`): a distance along the ray and its
+/// density per unit distance. `None` when the light lies on the ray.
+fn equiangular_sample(
+    light: DVec3,
+    origin: DVec3,
+    direction: DVec3,
+    distance: f64,
+    xi: f64,
+) -> Option<(f64, f64)> {
+    let geometry = equiangular_geometry(light, origin, direction, distance)?;
+    if geometry.theta_span < 1.0e-6 {
+        // Cycles samples uniformly when the segment subtends almost no angle.
+        if distance <= 0.0 || !distance.is_finite() {
+            return None;
+        }
+        return Some((xi * distance, 1.0 / distance));
+    }
+    let offset = geometry.perpendicular * (geometry.theta_a + xi * geometry.theta_span).tan();
+    let pdf = geometry.perpendicular
+        / (geometry.theta_span
+            * (geometry.perpendicular * geometry.perpendicular + offset * offset));
+    Some(((geometry.delta + offset).clamp(0.0, distance), pdf))
+}
+
+/// The density per unit distance of `equiangular_sample` at `t` (`volume_equiangular_pdf`).
+fn equiangular_pdf(light: DVec3, origin: DVec3, direction: DVec3, distance: f64, t: f64) -> f64 {
+    let Some(geometry) = equiangular_geometry(light, origin, direction, distance) else {
+        return 0.0;
+    };
+    if geometry.theta_span < 1.0e-6 {
+        return if distance <= 0.0 || !distance.is_finite() {
+            0.0
+        } else {
+            1.0 / distance
+        };
+    }
+    let offset = t - geometry.delta;
+    geometry.perpendicular
+        / (geometry.theta_span
+            * (geometry.perpendicular * geometry.perpendicular + offset * offset))
+}
+
+/// The density per unit distance of the first real event of `trace_mesh_medium` being a scatter at `t`: the
+/// channel-mean scatter rate times the survival at the channel-mean extinction. Its weight in the MIS of
+/// `volume_direct_scatter_mis` needs only to be a positive function of `t`; the scatter's estimator is already
+/// weighted by the path, so the MIS stays unbiased for any such function.
+fn distance_scatter_pdf(medium: &BsdfParams, t: f64) -> f64 {
+    let scatter = DVec3::from_array(medium.volume_scatter);
+    let extinction = scatter + DVec3::from_array(medium.volume_absorption);
+    scatter.element_sum() / 3.0 * (-extinction.element_sum() / 3.0 * t).exp()
+}
+
+/// One point light's next-event estimate at `point`: the sample's radiance through its shadow transmittance, and the
+/// sample's direction. The caller weights the estimate by the phase function at that direction.
+fn volume_light_nee(
+    scene: SceneRefs<'_, '_>,
+    media: &[MeshMedium],
+    light: &PointLight,
+    point: DVec3,
+    footprint: f64,
+    transparent_budget: u32,
+    rng: &mut Pcg32,
+    evaluator_workspace: &mut EvaluatorWorkspace,
+) -> Result<(DVec3, DVec3)> {
+    let Some(sample) = sample_light(light, point, rng) else {
+        return Ok((DVec3::ZERO, DVec3::ZERO));
+    };
+    if sample.radiance.max_element() <= 0.0 {
+        return Ok((DVec3::ZERO, sample.direction));
+    }
+    let visibility = shadow_transmittance(
+        scene,
+        media,
+        ShadowRay {
+            point,
+            normal: DVec3::ZERO,
+            direction: sample.direction,
+            distance: sample.distance,
+            footprint,
+        },
+        transparent_budget,
+        rng,
+        evaluator_workspace,
+    )?;
+    Ok((sample.radiance * visibility, sample.direction))
+}
+
+/// The transmittance of a shadow ray: opaque hits block it, transparent surfaces and medium boundaries pass it, and each
+/// medium it crosses attenuates it.
+fn shadow_transmittance(
+    scene: SceneRefs<'_, '_>,
+    media: &[MeshMedium],
+    ray: ShadowRay,
     transparent_budget: u32,
     rng: &mut Pcg32,
     evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<DVec3> {
-    let mut transmittance = DVec3::ONE;
+    let SceneRefs {
+        doc,
+        snapshot,
+        geometry,
+        bvh,
+        volumes,
+        images,
+        ..
+    } = scene;
+    let ShadowRay {
+        point,
+        normal,
+        direction,
+        distance,
+        footprint,
+    } = ray;
     let mut transparent_hits = 0u32;
     let mut blocked = false;
     let mut failure = None;
+    // The shadow ray starts in the receiver's volume stack and crosses each medium by its transmittance.
+    let mut shadow_media = media.to_vec();
+    let mut transmittance = DVec3::ONE;
     let remaining = if distance.is_finite() {
         (distance - RAY_EPSILON).max(0.0)
     } else {
@@ -2128,15 +2818,21 @@ fn shadow_transmittance(
                     return false;
                 }
             };
-            // Cycles counts each transparent surface a shadow ray crosses against the path's remaining
-            // budget and blocks the ray past it (`intern/cycles/kernel/bvh/intersect_filter.h`);
-            // volume-bounds surfaces are not counted (`SD_HAS_ONLY_VOLUME`).
-            if !surface.params.has_medium() {
-                transparent_hits += 1;
-                if transparent_hits > transparent_budget {
-                    blocked = true;
-                    return false;
-                }
+            if let Some(stack) = stack_medium(&shadow_media) {
+                transmittance *= medium_transmittance(&stack, hit.distance);
+            }
+            if surface.params.has_medium() {
+                // A medium boundary passes the shadow ray and changes the volume stack, as it does for a path. It is not a
+                // transparent surface, so it does not count against the budget, and its opaque alpha does not block.
+                toggle_mesh_medium(&mut shadow_media, surface.object_index, &surface.params);
+                return true;
+            }
+            // Cycles counts each transparent surface a shadow ray crosses against the path's remaining budget and blocks
+            // the ray past it (`intern/cycles/kernel/bvh/intersect_filter.h`).
+            transparent_hits += 1;
+            if transparent_hits > transparent_budget {
+                blocked = true;
+                return false;
             }
             // Cycles' shadow transparency is the Transparent closure's extinction, `(1 - alpha) · tint`
             // (`kernel/integrator/surface_shader.h`, `surface_shader_transparency`). A glass or other transmissive
@@ -2160,6 +2856,10 @@ fn shadow_transmittance(
     }
     if blocked {
         return Ok(DVec3::ZERO);
+    }
+    // The last segment, to the light or to infinity, lies in the stack's combined medium.
+    if let Some(stack) = stack_medium(&shadow_media) {
+        transmittance *= medium_transmittance(&stack, remaining);
     }
     let volume_transmittance = march_volumes(volumes, origin, direction, remaining, Some(rng))?;
     Ok(transmittance.clamp(DVec3::ZERO, DVec3::ONE) * volume_transmittance)
@@ -2552,9 +3252,10 @@ enum Scatter {
     Delta(DVec3),
     /// A continuous surface bounce, weighted against light sampling by its lobe-mixture density.
     Surface(MisVertex),
-    /// A volume phase bounce. Its environment weight stays the fixed value of the volume path, and
-    /// its lights are light-sampled only.
-    Volume,
+    /// A volume phase bounce. `phase_pdf` is the Henyey-Greenstein density of the direction it
+    /// scattered into, for the MIS weight of an environment hit (`direct_volume_lighting` weighs the
+    /// same direction against the environment sampling density). Lights are light-sampled only.
+    Volume(f64),
 }
 
 /// Outcome of sampling the Principled BSDF. `Continuous` carries the exact lobe-mixture density that MIS needs, and
@@ -3004,6 +3705,24 @@ fn collect_lights(doc: &SceneDoc, snapshot: &Snapshot) -> Vec<PointLight> {
         .collect()
 }
 
+/// The bounds of the index box `[low, high]` through an affine index-to-local matrix: the box of its eight corners. An
+/// affine transform of an axis-aligned box is a box only up to its corners, so the bounds take the extremes of all eight.
+fn index_box_bounds(index_to_local: DMat4, low: DVec3, high: DVec3) -> (DVec3, DVec3) {
+    let mut minimum = DVec3::splat(f64::INFINITY);
+    let mut maximum = DVec3::splat(f64::NEG_INFINITY);
+    for corner in 0..8 {
+        let index = DVec3::new(
+            if corner & 1 == 0 { low.x } else { high.x },
+            if corner & 2 == 0 { low.y } else { high.y },
+            if corner & 4 == 0 { low.z } else { high.z },
+        );
+        let point = index_to_local.transform_point3(index);
+        minimum = minimum.min(point);
+        maximum = maximum.max(point);
+    }
+    (minimum, maximum)
+}
+
 fn collect_volumes<'a>(
     doc: &'a SceneDoc,
     snapshot: &'a Snapshot,
@@ -3052,10 +3771,12 @@ fn collect_volumes<'a>(
                 let Some(grid) = volume.grids.first() else {
                     continue;
                 };
-                let bounds_max = DVec3::from_array(
+                let index_to_local = grid.checked_index_to_local_matrix()?;
+                let last = DVec3::from_array(
                     grid.dims
-                        .map(|dimension| f64::from(dimension.saturating_sub(1)) * grid.voxel_size),
-                ) + grid.origin;
+                        .map(|dimension| f64::from(dimension.saturating_sub(1))),
+                );
+                let (bounds_min, bounds_max) = index_box_bounds(index_to_local, DVec3::ZERO, last);
                 let density_range = grid.values.as_ref().and_then(|values| {
                     let mut values = values.iter().copied();
                     let first = values.next()?;
@@ -3073,7 +3794,7 @@ fn collect_volumes<'a>(
                     }
                     Some((f64::from(minimum), f64::from(maximum)))
                 });
-                (grid.origin, bounds_max, grid.voxel_size, density_range)
+                (bounds_min, bounds_max, grid.voxel_size, density_range)
             };
         let material = snapshot
             .slot_material(node_id, node, Some(data_block), 0)
@@ -3170,6 +3891,40 @@ fn collect_volumes<'a>(
         } else {
             DVec3::ZERO
         };
+        let interpolation = params.map_or(crate::model::VolumeInterpolation::default(), |params| {
+            params.volume_interpolation
+        });
+        // A sample reads the neighbours of its cell: linear reads one voxel beyond the box and cubic two. Cycles pads a
+        // volume's mesh by the same counts (`scene/volume.cpp`, `create_volume_mesh`), so a ray does not stop at the active
+        // box and lose that shell. The pad is per axis in index space: a VDB pads its index box before it is transformed.
+        let pad_voxels = match interpolation {
+            crate::model::VolumeInterpolation::Linear => 1.0,
+            crate::model::VolumeInterpolation::Cubic => 2.0,
+        };
+        let (bounds_min, bounds_max) = if let Some(decoded) = volume.decoded_vdb.as_ref() {
+            let Some(grid) = decoded.density_grid() else {
+                continue;
+            };
+            let Some(bounds) = grid.active_bbox_world_padded(DVec3::splat(pad_voxels)) else {
+                continue;
+            };
+            bounds
+        } else {
+            let Some(grid) = volume.grids.first() else {
+                continue;
+            };
+            // The index box, padded per axis, then transformed by the grid's index-to-local matrix (affine grids
+            // included), as the sampler reads it.
+            let last = DVec3::from_array(
+                grid.dims
+                    .map(|dimension| f64::from(dimension.saturating_sub(1))),
+            );
+            index_box_bounds(
+                grid.checked_index_to_local_matrix()?,
+                DVec3::splat(-pad_voxels),
+                last + DVec3::splat(pad_voxels),
+            )
+        };
         volumes.push(VolumeInstance {
             volume,
             world_to_local: matrix.inverse(),
@@ -3183,6 +3938,15 @@ fn collect_volumes<'a>(
             emission,
             scattering,
             extinction_scale,
+            sampling: params.map_or(crate::model::VolumeSampling::default(), |params| {
+                params.volume_sampling
+            }),
+            interpolation,
+            index_from_local: if volume.decoded_vdb.is_some() {
+                None
+            } else {
+                Some(local_to_index_matrix(volume)?)
+            },
         });
     }
     Ok(volumes)
@@ -3200,38 +3964,316 @@ fn homogeneous_segment_integral(extinction: f64, distance: f64) -> (f64, f64) {
     (transmittance, source_distance)
 }
 
-/// Cycles' homogeneous medium over `distance` for a material volume on a mesh: per-channel
-/// transmittance `exp(-σt·d)` and the in-scatter `∫ σs·exp(-σt·s) ds` against constant environment
-/// light, with σt = σs + σa from the absolute coefficients of `BsdfParams`.
-fn homogeneous_medium_segment(params: &BsdfParams, distance: f64) -> (DVec3, DVec3) {
-    let channels: [(f64, f64); 3] = std::array::from_fn(|channel| {
-        let scattering = params.volume_scatter[channel];
-        let extinction = scattering + params.volume_absorption[channel];
-        let (transmittance, source_distance) = homogeneous_segment_integral(extinction, distance);
-        (transmittance, scattering * source_distance)
-    });
-    let [red, green, blue] = channels;
-    (
-        DVec3::new(red.0, green.0, blue.0),
-        DVec3::new(red.1, green.1, blue.1),
-    )
+/// A closed mesh's medium on the path's volume stack, as Cycles' object volume stack: the coefficients of the
+/// surface that entered it. A surface of the same object leaves it.
+#[derive(Clone, Copy)]
+struct MeshMedium {
+    object_index: u32,
+    params: BsdfParams,
+}
+
+/// How a path leaves one segment of a mesh medium (`trace_mesh_medium`).
+enum MediumOutcome {
+    /// A real scattering event at this distance along the ray.
+    Scatter(f64),
+    /// The path crosses the segment, its throughput carrying the transmittance.
+    Survive,
+    /// The path is absorbed in the medium, or exhausts its tentative collisions.
+    Absorb,
+}
+
+/// The tentative-collision budget of one medium segment. Exhausting it absorbs the path; the tail of the
+/// null-collision chain that this cuts off is negligible for the densities a rendered medium has.
+const MAX_MEDIUM_EVENTS: u32 = 4096;
+
+/// Spectral ratio tracking over a medium segment of length `distance`
+/// (`intern/cycles/kernel/integrator/shade_volume.h`, `volume_integrate_heterogeneous`). A medium with no
+/// scattering is attenuated deterministically, as Cycles does (`Absorption only`): each channel takes
+/// `exp(-σa·distance)` and no event is drawn. Otherwise tentative collisions come at the majorant `max_c σt_c`.
+/// Each is a scatter, a null collision or an absorption, chosen with the channel-mean probabilities, and the
+/// throughput takes each channel's own branch weight. Every channel's transmittance and single-scatter integral
+/// is then exact in expectation.
+fn trace_mesh_medium(
+    medium: &BsdfParams,
+    distance: f64,
+    throughput: &mut DVec3,
+    rng: &mut Pcg32,
+) -> MediumOutcome {
+    let scatter = DVec3::from_array(medium.volume_scatter);
+    let absorption = DVec3::from_array(medium.volume_absorption);
+    if scatter == DVec3::ZERO {
+        // A channel with no absorption stays at one, which keeps an infinite segment from giving 0 · ∞.
+        *throughput *= DVec3::from_array(absorption.to_array().map(|sigma| {
+            if sigma > 0.0 {
+                (-sigma * distance).exp()
+            } else {
+                1.0
+            }
+        }));
+        return MediumOutcome::Survive;
+    }
+    let extinction = scatter + absorption;
+    let majorant = extinction.max_element();
+    if majorant <= 0.0 {
+        return MediumOutcome::Survive;
+    }
+    let null = DVec3::splat(majorant) - extinction;
+    // The channel means of the three branch weights sum to the majorant, so they are the branch probabilities
+    // over it.
+    let mean_scatter = scatter.element_sum() / 3.0;
+    let mean_null = null.element_sum() / 3.0;
+    let mut position = 0.0;
+    for _ in 0..MAX_MEDIUM_EVENTS {
+        position += -rng.next_f64().max(f64::MIN_POSITIVE).ln() / majorant;
+        if position >= distance {
+            // No tentative collision before the boundary: each channel carries exp(-σt·d) over the probability
+            // exp(-σm·d) of that event, which is exp((σm - σt)·d).
+            *throughput *=
+                DVec3::from_array(null.to_array().map(|weight| (weight * distance).exp()));
+            return MediumOutcome::Survive;
+        }
+        let choice = rng.next_f64() * majorant;
+        if choice < mean_scatter {
+            *throughput *= scatter / mean_scatter;
+            return MediumOutcome::Scatter(position);
+        }
+        if choice < mean_scatter + mean_null {
+            *throughput *= null / mean_null;
+            continue;
+        }
+        *throughput = DVec3::ZERO;
+        return MediumOutcome::Absorb;
+    }
+    *throughput = DVec3::ZERO;
+    MediumOutcome::Absorb
+}
+
+/// Pushes the medium of `object_index` when the path enters it, or pops it when the path leaves it.
+fn toggle_mesh_medium(media: &mut Vec<MeshMedium>, object_index: u32, params: &BsdfParams) {
+    if let Some(position) = media
+        .iter()
+        .rposition(|medium| medium.object_index == object_index)
+    {
+        media.remove(position);
+    } else {
+        media.push(MeshMedium {
+            object_index,
+            params: *params,
+        });
+    }
+}
+
+/// The coefficients of the whole volume stack, summed as Cycles evaluates the media a segment is inside
+/// (`volume_shader_eval` over `volume_stack_read`): scatter and absorption add up over the media, and the sampling is the
+/// stack's combined method (`volume_stack_sample_method`). The phase is not combined: each medium is its own closure, as
+/// `PhaseMixture` holds it, so the combined anisotropy is unused and set to zero. `None` when no medium is inside.
+fn stack_medium(media: &[MeshMedium]) -> Option<BsdfParams> {
+    let first = media.first()?;
+    let mut combined = first.params;
+    let mut scatter = DVec3::ZERO;
+    let mut absorption = DVec3::ZERO;
+    let mut emission = DVec3::ZERO;
+    for medium in media {
+        scatter += DVec3::from_array(medium.params.volume_scatter);
+        absorption += DVec3::from_array(medium.params.volume_absorption);
+        emission += DVec3::from_array(medium.params.volume_emission);
+    }
+    combined.volume_scatter = scatter.to_array();
+    combined.volume_absorption = absorption.to_array();
+    combined.volume_emission = emission.to_array();
+    combined.volume_anisotropy = 0.0;
+    combined.volume_sampling =
+        segment_sampling(media.iter().map(|medium| medium.params.volume_sampling))
+            .unwrap_or(first.params.volume_sampling);
+    Some(combined)
+}
+
+/// The mesh media that contain `origin`, as Cycles' `volume_stack_init` seeds the stack. A ray from the origin toggles
+/// each medium it crosses, so a medium's object is in the stack when the ray crosses its surfaces an odd number of
+/// times, that is, when the origin is inside it. The probe direction is fixed and oblique, so it avoids axis-aligned edges.
+fn camera_media(
+    doc: &SceneDoc,
+    snapshot: &Snapshot,
+    geometry: &Geometry,
+    bvh: &Bvh,
+    origin: DVec3,
+    images: &BTreeMap<String, ImageData>,
+    footprint: CameraFootprint,
+    evaluator_workspace: &mut EvaluatorWorkspace,
+) -> Result<Vec<MeshMedium>> {
+    let probe = DVec3::new(
+        0.267_261_241_912_424_4,
+        0.534_522_483_824_848_8,
+        0.801_783_725_737_273_2,
+    );
+    let mut inside: Vec<MeshMedium> = Vec::new();
+    let mut failure = None;
+    bvh.walk_hits(
+        &geometry.triangles,
+        origin,
+        probe,
+        RAY_EPSILON,
+        f64::INFINITY,
+        |hit, hit_origin| {
+            let surface = match make_surface(
+                doc,
+                snapshot,
+                geometry,
+                hit,
+                hit_origin,
+                probe,
+                images,
+                footprint.at_distance(hit.distance),
+                evaluator_workspace,
+            ) {
+                Ok(surface) => surface,
+                Err(error) => {
+                    failure = Some(error);
+                    return false;
+                }
+            };
+            if surface.params.has_medium() {
+                toggle_mesh_medium(&mut inside, surface.object_index, &surface.params);
+            }
+            true
+        },
+    );
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    Ok(inside)
+}
+
+/// The channel-mean scatter and extinction of a medium: the rates of Cycles' grey majorant transport.
+fn mean_scatter(medium: &BsdfParams) -> f64 {
+    DVec3::from_array(medium.volume_scatter).element_sum() / 3.0
+}
+
+fn mean_extinction(medium: &BsdfParams) -> f64 {
+    (DVec3::from_array(medium.volume_scatter) + DVec3::from_array(medium.volume_absorption))
+        .element_sum()
+        / 3.0
+}
+
+/// The distance of the medium's first collision before `limit`, sampled analogously at the channel-mean extinction
+/// (`None` past the limit). A collision is a scatter or an absorption, chosen by the channel-mean scatter fraction.
+fn sample_mesh_collision(medium: &BsdfParams, limit: f64, rng: &mut Pcg32) -> Option<f64> {
+    let extinction = mean_extinction(medium);
+    if extinction <= 0.0 {
+        return None;
+    }
+    let distance = -rng.next_f64().max(f64::MIN_POSITIVE).ln() / extinction;
+    (distance < limit).then_some(distance)
+}
+
+/// The per-channel weight of a grey analog free flight over `distance`, for a medium sampled at its channel-mean
+/// extinction: `exp(-(σt_c - σ̄) · distance)`. The analog event and survival probabilities are the channel-mean ones, so
+/// this factor carries the chromatic transmittance (Cycles' spectral analog, `volume_integrate_heterogeneous`). An
+/// infinite distance has no survival in any channel that extinguishes more than the mean.
+fn chromatic_correction(medium: &BsdfParams, distance: f64) -> DVec3 {
+    let extinction =
+        DVec3::from_array(medium.volume_scatter) + DVec3::from_array(medium.volume_absorption);
+    let mean = extinction.element_sum() / 3.0;
+    DVec3::from_array(extinction.to_array().map(|sigma| {
+        if distance.is_finite() {
+            (-(sigma - mean) * distance).exp()
+        } else if sigma > mean {
+            0.0
+        } else {
+            1.0
+        }
+    }))
+}
+
+/// The length of a voxel grid's sampled span along its ray, from `grid.entry`.
+fn grid_span(grid: &VoxelGrid) -> f64 {
+    grid.extinction.len() as f64 * grid.step
+}
+
+/// The per-channel transmittance `exp(-σt·length)` of a homogeneous medium. An infinite length is zero wherever
+/// the medium has extinction.
+fn medium_transmittance(params: &BsdfParams, length: f64) -> DVec3 {
+    let extinction =
+        DVec3::from_array(params.volume_scatter) + DVec3::from_array(params.volume_absorption);
+    DVec3::from_array(extinction.to_array().map(|sigma| {
+        if sigma <= 0.0 {
+            1.0
+        } else if length.is_finite() {
+            (-sigma * length.max(0.0)).exp()
+        } else {
+            0.0
+        }
+    }))
 }
 
 fn volume_extinction_density(instance: &VolumeInstance<'_>, density: f64) -> f64 {
     density.max(0.0) * instance.extinction_scale
 }
 
-fn trace_volume_segment(
+/// The weight of each light's direct light at a distance-sampled scatter event (`volume_direct_scatter_mis`): zero
+/// for a light sampled equiangularly, the multiple importance sampling weight against its equiangular pdf under
+/// multiple importance sampling, and one otherwise.
+fn event_weights(
+    choices: &[(Option<DVec3>, bool)],
+    method: Option<crate::model::VolumeSampling>,
+    origin: DVec3,
+    direction: DVec3,
+    segment_limit: f64,
+    distance: f64,
+    scatter_pdf: f64,
+) -> Vec<f64> {
+    use crate::model::VolumeSampling;
+    choices
+        .iter()
+        .map(|&(point, sampled)| match (sampled, method, point) {
+            (true, _, _) => 0.0,
+            (false, Some(VolumeSampling::MultipleImportance), Some(point)) => {
+                2.0 * power_heuristic(
+                    scatter_pdf,
+                    equiangular_pdf(point, origin, direction, segment_limit, distance),
+                )
+            }
+            _ => 1.0,
+        })
+        .collect()
+}
+/// One voxel segment's sampling grid, as `trace_volume_segment` samples it: the steps across the volumes' bounds
+/// along the ray, with each step's grey extinction, emission and scatter per channel at its midpoint. The
+/// equiangular direct light reads the same grid, so its transmittance and scatter densities are the sampler's own.
+struct VoxelGrid {
+    entry: f64,
+    step: f64,
+    meters_per_unit: f64,
+    /// Grey extinction per meter of each step.
+    extinction: Vec<f64>,
+    /// Emission per meter of each step.
+    emission: Vec<DVec3>,
+    /// Scatter per meter and channel of each step, summed over the volumes.
+    scatter: Vec<DVec3>,
+    /// The scatter of the volumes with each anisotropy, so every phase is evaluated with its own volumes.
+    groups: Vec<ScatterGroup>,
+    stochastic: bool,
+    /// Blender's `cycles.volume_sampling` of each volume that the segment crosses.
+    samplings: Vec<crate::model::VolumeSampling>,
+}
+
+/// The scatter per meter and channel of the volumes with one anisotropy, per step of a [`VoxelGrid`].
+struct ScatterGroup {
+    anisotropy: f64,
+    scatter: Vec<DVec3>,
+}
+
+fn voxel_grid(
     volumes: &[VolumeInstance<'_>],
     origin: DVec3,
     direction: DVec3,
     max_distance: f64,
-    rng: &mut Pcg32,
-) -> Result<VolumeSegment> {
+) -> Result<Option<VoxelGrid>> {
     let mut entry = f64::INFINITY;
     let mut exit = 0.0_f64;
     let mut minimum_step = f64::INFINITY;
     let mut stochastic = false;
+    let mut samplings = Vec::new();
     for instance in volumes {
         if !instance.voxel_size.is_finite()
             || instance.voxel_size <= 0.0
@@ -3259,15 +4301,11 @@ fn trace_volume_segment(
             stochastic |= instance.scattering
                 && instance.albedo.max_element() > 0.0
                 && instance.extinction_scale > 0.0;
+            samplings.push(instance.sampling);
         }
     }
     if !entry.is_finite() || exit <= entry {
-        return Ok(VolumeSegment {
-            transmittance: 1.0,
-            emission: DVec3::ZERO,
-            event: None,
-            stochastic: false,
-        });
+        return Ok(None);
     }
     let segment_length = exit - entry;
     let steps = (segment_length / minimum_step)
@@ -3277,27 +4315,230 @@ fn trace_volume_segment(
     let meters_per_unit = volumes
         .first()
         .map_or(1.0, |instance| instance.meters_per_unit);
-    let free_flight = if stochastic {
+    let mut groups: Vec<ScatterGroup> = Vec::new();
+    for instance in volumes {
+        if !groups
+            .iter()
+            .any(|group| crate::float::equal_f64(group.anisotropy, instance.anisotropy))
+        {
+            groups.push(ScatterGroup {
+                anisotropy: instance.anisotropy,
+                scatter: vec![DVec3::ZERO; steps],
+            });
+        }
+    }
+    let mut extinction = Vec::with_capacity(steps);
+    let mut emission = Vec::with_capacity(steps);
+    let mut scatter = vec![DVec3::ZERO; steps];
+    for (index, step_total) in scatter.iter_mut().enumerate() {
+        let point = origin + direction * (entry + (index as f64 + 0.5) * step);
+        let mut step_extinction = 0.0;
+        let mut step_emission = DVec3::ZERO;
+        for instance in volumes {
+            let density = volume_density_at(instance, point)?;
+            let coefficient = volume_extinction_density(instance, density);
+            let step_scatter = instance.albedo * coefficient;
+            step_extinction += coefficient;
+            step_emission += instance.emission;
+            *step_total += step_scatter;
+            if let Some(group) = groups
+                .iter_mut()
+                .find(|group| crate::float::equal_f64(group.anisotropy, instance.anisotropy))
+            {
+                group.scatter[index] += step_scatter;
+            }
+        }
+        extinction.push(step_extinction);
+        emission.push(step_emission);
+    }
+    Ok(Some(VoxelGrid {
+        entry,
+        step,
+        meters_per_unit,
+        extinction,
+        emission,
+        scatter,
+        groups,
+        stochastic,
+        samplings,
+    }))
+}
+
+/// The optical depth, in meters, from the segment origin to `distance` along the grid's steps. Each step is
+/// linear in its own distance, as the sampler accumulates it.
+fn grid_depth(grid: &VoxelGrid, distance: f64) -> f64 {
+    let mut depth = 0.0;
+    for (index, extinction) in grid.extinction.iter().enumerate() {
+        let start = grid.entry + index as f64 * grid.step;
+        if distance <= start {
+            break;
+        }
+        let covered = distance.min(start + grid.step) - start;
+        depth += extinction * covered * grid.meters_per_unit;
+    }
+    depth
+}
+
+/// The grid step containing `distance`, or `None` off the grid.
+fn grid_step_index(grid: &VoxelGrid, distance: f64) -> Option<usize> {
+    let offset = (distance - grid.entry) / grid.step;
+    (offset >= 0.0 && offset < grid.extinction.len() as f64).then_some(offset as usize)
+}
+
+/// The scatter per meter and channel of a per-step table at `distance`, zero off the grid.
+fn grid_scatter_at(grid: &VoxelGrid, values: &[DVec3], distance: f64) -> DVec3 {
+    grid_step_index(grid, distance).map_or(DVec3::ZERO, |index| values[index])
+}
+
+/// The density per unit distance, of the scatter events of the grid at `distance`, that the distance sampler
+/// realises: the channel-mean scatter per meter, transmitted over the depth to `distance`. It is a positive
+/// function of `distance` for the MIS weights, and the estimator is unbiased for any such function.
+fn grid_scatter_pdf(grid: &VoxelGrid, distance: f64) -> f64 {
+    let scatter = grid_scatter_at(grid, &grid.scatter, distance).element_sum() / 3.0;
+    scatter * grid.meters_per_unit * (-grid_depth(grid, distance)).exp()
+}
+
+/// The per-channel extinction of a medium: its scatter plus its absorption, per unit length.
+fn medium_extinction(medium: &BsdfParams) -> DVec3 {
+    DVec3::from_array(medium.volume_scatter) + DVec3::from_array(medium.volume_absorption)
+}
+
+/// The per-channel extinction above the channel mean of a mesh medium: the exponent that grey analog sampling leaves to
+/// the channels (`chromatic_correction` is its exponential).
+fn mesh_chromatic(medium: &BsdfParams) -> DVec3 {
+    let extinction = medium_extinction(medium);
+    extinction - DVec3::splat(extinction.element_sum() / 3.0)
+}
+
+/// One piece of a segment's emission, `length` scene units long: `source` per unit length, weighted by the transmittance
+/// `exponent` of everything before it and by the piece's own per-channel extinction `rate`. Its integral is Cycles' closed
+/// form `E · (1 - exp(-σ·length)) / σ` (`volume_emission_integrate`), which is `E · length` as σ goes to zero.
+fn add_emission_piece(
+    emitted: &mut DVec3,
+    exponent: &mut DVec3,
+    length: f64,
+    rate: DVec3,
+    source: DVec3,
+) {
+    if source != DVec3::ZERO {
+        let shape = DVec3::from_array(rate.to_array().map(|rate| {
+            if rate.abs() > 1.0e-12 {
+                (1.0 - (-rate * length).exp()) / rate
+            } else {
+                length
+            }
+        }));
+        *emitted += source * (-*exponent).exp() * shape;
+    }
+    *exponent += rate * length;
+}
+
+/// The emission of a segment from its origin to `end`, per channel. A voxel grid contributes its per-step emission and
+/// extinction, and a mesh medium its constant emission and extinction, all in one walk over the pieces. A grid that is
+/// `grid_analog` (stochastic) takes no transmittance weight of its own: its collisions end the emission
+/// (`trace_volume_segment`). A mesh that is `mesh_analog` carries only its chromatic excess over the channel mean, since the
+/// analog survival of the mean is the sampling (`mesh_chromatic`). A deterministic medium carries its full transmittance,
+/// as Cycles' homogeneous integrator does (`volume_integrate_homogeneous`).
+fn emission_until(
+    grid: Option<&VoxelGrid>,
+    grid_analog: bool,
+    mesh: Option<&BsdfParams>,
+    mesh_analog: bool,
+    end: f64,
+) -> DVec3 {
+    let mesh_rate = mesh.map_or(DVec3::ZERO, |medium| {
+        if mesh_analog {
+            mesh_chromatic(medium)
+        } else {
+            medium_extinction(medium)
+        }
+    });
+    let mesh_source = mesh.map_or(DVec3::ZERO, |medium| {
+        DVec3::from_array(medium.volume_emission)
+    });
+    let mut emitted = DVec3::ZERO;
+    let mut exponent = DVec3::ZERO;
+    let mut position = 0.0_f64;
+    if let Some(grid) = grid {
+        for (index, extinction) in grid.extinction.iter().enumerate() {
+            let start = grid.entry + index as f64 * grid.step;
+            // The mesh alone, from the last piece to this step's start.
+            let gap_end = start.min(end);
+            if gap_end > position {
+                add_emission_piece(
+                    &mut emitted,
+                    &mut exponent,
+                    gap_end - position,
+                    mesh_rate,
+                    mesh_source,
+                );
+                position = gap_end;
+            }
+            let covered = (start + grid.step).min(end) - position;
+            if covered > 0.0 {
+                let grid_rate = if grid_analog {
+                    0.0
+                } else {
+                    extinction * grid.meters_per_unit
+                };
+                let grid_source = grid.emission[index] * grid.meters_per_unit;
+                add_emission_piece(
+                    &mut emitted,
+                    &mut exponent,
+                    covered,
+                    mesh_rate + DVec3::splat(grid_rate),
+                    grid_source + mesh_source,
+                );
+                position += covered;
+            }
+            if position >= end {
+                return emitted;
+            }
+        }
+    }
+    if end > position {
+        add_emission_piece(
+            &mut emitted,
+            &mut exponent,
+            end - position,
+            mesh_rate,
+            mesh_source,
+        );
+    }
+    emitted
+}
+
+/// Trace one voxel segment's free flight on its grid with the distance sampler's events, and its transmittance
+/// (`volume_integrate_heterogeneous`, with the grid's grey transport). The caller integrates the emission up to the event
+/// with `emission_until`.
+fn trace_volume_segment(
+    grid: Option<&VoxelGrid>,
+    volumes: &[VolumeInstance<'_>],
+    origin: DVec3,
+    direction: DVec3,
+    rng: &mut Pcg32,
+    // False for a ray that may not collide any more: its segment only attenuates.
+    events: bool,
+) -> Result<VolumeSegment> {
+    let Some(grid) = grid else {
+        return Ok(VolumeSegment {
+            transmittance: 1.0,
+            event: None,
+            stochastic: false,
+        });
+    };
+    let free_flight = if grid.stochastic && events {
         -rng.next_f64().max(f64::MIN_POSITIVE).ln()
     } else {
         f64::INFINITY
     };
+    let step_in_meters = grid.step * grid.meters_per_unit;
     let mut accumulated_depth = 0.0;
-    let mut emitted = DVec3::ZERO;
-    for sample_index in 0..steps {
-        let distance = entry + (sample_index as f64 + 0.5) * step;
-        let point = origin + direction * distance;
-        let mut extinction = 0.0;
-        let mut source = DVec3::ZERO;
-        for instance in volumes {
-            let density = volume_density_at(instance, point)?;
-            extinction += volume_extinction_density(instance, density);
-            source += instance.emission * density;
-        }
+    for (index, &extinction) in grid.extinction.iter().enumerate() {
         if extinction <= 0.0 {
             continue;
         }
-        let step_in_meters = step * meters_per_unit;
+        let start = grid.entry + index as f64 * grid.step;
         let step_depth = extinction * step_in_meters;
         let event_in_step = free_flight <= accumulated_depth + step_depth;
         let traveled_meters = if event_in_step {
@@ -3305,17 +4546,15 @@ fn trace_volume_segment(
         } else {
             step_in_meters
         };
-        let (_, source_distance) = homogeneous_segment_integral(extinction, traveled_meters);
-        emitted += source * (-accumulated_depth).exp() * source_distance;
         accumulated_depth += extinction * traveled_meters;
         if event_in_step {
-            let event_world_distance = distance - step * 0.5 + traveled_meters / meters_per_unit;
-            let event_point = origin + direction * event_world_distance;
+            let event_point = origin + direction * (start + traveled_meters / grid.meters_per_unit);
+            let midpoint = origin + direction * (start + grid.step * 0.5);
             let selected = rng.next_f64() * extinction;
             let mut weight = 0.0;
             let mut chosen = None;
             for instance in volumes {
-                let density = volume_density_at(instance, point)?;
+                let density = volume_density_at(instance, midpoint)?;
                 weight += volume_extinction_density(instance, density);
                 if selected <= weight {
                     chosen = Some(instance);
@@ -3340,31 +4579,56 @@ fn trace_volume_segment(
             );
             return Ok(VolumeSegment {
                 transmittance: (-accumulated_depth).exp(),
-                emission: emitted,
                 event: Some(event),
-                stochastic,
+                stochastic: grid.stochastic,
             });
         }
     }
     Ok(VolumeSegment {
         transmittance: (-accumulated_depth).exp(),
-        emission: emitted,
         event: None,
-        stochastic,
+        stochastic: grid.stochastic,
     })
 }
 
 fn volume_density_at(instance: &VolumeInstance<'_>, world_position: DVec3) -> Result<f64> {
     let local_position = instance.world_to_local.transform_point3(world_position);
-    let density = sample_density(local_position, instance.volume);
+    let density = instance_density(instance, local_position);
     if !density.is_finite() {
-        sample_density_checked(local_position, instance.volume)?;
+        instance_density_checked(instance, local_position)?;
         return Err(PotError::new(
             ErrorCode::EvaluationFailed,
             "volume density is not finite",
         ));
     }
     Ok(density.max(0.0))
+}
+
+/// The density of a volume instance at a volume-local position. An inline grid samples at its index coordinate, through the
+/// inverse cached on the instance; a decoded VDB samples at its local position.
+fn instance_density(instance: &VolumeInstance<'_>, local_position: DVec3) -> f64 {
+    match instance.index_from_local {
+        Some(index_from_local) => sample_index_density_with(
+            index_from_local.transform_point3(local_position),
+            instance.volume,
+            instance.interpolation,
+        ),
+        None => sample_density_with(local_position, instance.volume, instance.interpolation),
+    }
+}
+
+/// `instance_density` with its error, which reports why a density is not finite.
+fn instance_density_checked(instance: &VolumeInstance<'_>, local_position: DVec3) -> Result<f64> {
+    match instance.index_from_local {
+        Some(index_from_local) => sample_index_density_checked_with(
+            index_from_local.transform_point3(local_position),
+            instance.volume,
+            instance.interpolation,
+        ),
+        None => {
+            sample_density_checked_with(local_position, instance.volume, instance.interpolation)
+        }
+    }
 }
 
 fn march_volumes(
@@ -3437,9 +4701,9 @@ fn march_volumes_with_budget(
                         break;
                     }
                     let local_position = local_origin + local_direction * distance;
-                    let density = sample_density(local_position, instance.volume);
+                    let density = instance_density(instance, local_position);
                     if !density.is_finite() {
-                        sample_density_checked(local_position, instance.volume)?;
+                        instance_density_checked(instance, local_position)?;
                         return Err(PotError::new(
                             ErrorCode::EvaluationFailed,
                             "volume density is not finite",
@@ -3469,9 +4733,9 @@ fn march_volumes_with_budget(
         for sample_index in 0..steps {
             let distance = entry + (sample_index as f64 + 0.5) * step;
             let local_position = local_origin + local_direction * distance;
-            let density = sample_density(local_position, instance.volume);
+            let density = instance_density(instance, local_position);
             if !density.is_finite() {
-                sample_density_checked(local_position, instance.volume)?;
+                instance_density_checked(instance, local_position)?;
                 return Err(PotError::new(
                     ErrorCode::EvaluationFailed,
                     "volume density is not finite",
@@ -3688,6 +4952,9 @@ mod volume_extinction_tests {
             emission: DVec3::ZERO,
             scattering: false,
             extinction_scale: 1.0,
+            sampling: crate::model::VolumeSampling::MultipleImportance,
+            interpolation: crate::model::VolumeInterpolation::Linear,
+            index_from_local: None,
         };
         let mut rng = Pcg32::for_sample(0, 0, 0, 0);
         let transmittance = march_volumes(

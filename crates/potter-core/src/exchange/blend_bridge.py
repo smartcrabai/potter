@@ -2378,8 +2378,10 @@ def dump_scene(scene):
                 "samples": samples,
                 "seed": seed,
                 "max_bounces": int(getattr(getattr(scene, "cycles", None), "max_bounces", 4)),
+                "volume_bounces": int(getattr(getattr(scene, "cycles", None), "volume_bounces", 0)),
                 "transparent_max_bounces": int(getattr(getattr(scene, "cycles", None), "transparent_max_bounces", 8)),
                 "filter_glossy": float(getattr(getattr(scene, "cycles", None), "blur_glossy", 1.0)),
+                "volume_biased": bool(getattr(getattr(scene, "cycles", None), "volume_biased", False)),
                 "use_sequencer": bool(getattr(scene.render, "use_sequencer", False)),
                 "audio_codec": potter_audio_codec(getattr(getattr(scene.render, "ffmpeg", None),
                                                           "audio_codec", "PCM")),
@@ -5230,17 +5232,6 @@ def _canonical_nla(doc, node, source_tracks):
     return result
 
 
-def _is_simple_principled_tree(tree_source):
-    nodes = (tree_source or {}).get("nodes", []) or []
-    types = [item.get("type") for item in nodes]
-    links = (tree_source or {}).get("links", []) or []
-    has_principled = "ShaderNodeBsdfPrincipled" in types
-    has_output = any(kind in ("OutputMaterial", "ShaderNodeOutputMaterial")
-                     for kind in types)
-    return (has_principled and has_output and links
-            and all(link.get("from_socket") == "BSDF"
-                    and link.get("to_socket") == "Surface" for link in links))
-
 
 def _set_object_solver_inverse(owner, constraint, owner_type, pose_bone=None,
                                inverse_frame=None):
@@ -6527,11 +6518,18 @@ def _clip_cutoff(material):
     return float(compare.inputs[1].default_value)
 
 
-def _set_principled_values(material, item):
-    shader = next((node for node in material.node_tree.nodes
-                   if node.type == "BSDF_PRINCIPLED"), None)
-    if shader is None:
-        return
+def _generated_principled(tree):
+    """The Principled BSDF Potter generated in `tree`, marked by `_mark_generated_field_graph`, or None.
+
+    Only a generated Principled takes the Material's values on export. An authored graph is exported as it is: Potter
+    renders the graph's own inputs, so a Material value written into it would make the file differ from the render.
+    """
+    return next((node for node in tree.nodes
+                 if node.type == "BSDF_PRINCIPLED" and node.get("potter_simple_material") is True), None)
+
+
+def _set_principled_values(shader, item):
+    """Writes the Material's values into the Principled BSDF `shader`."""
     shader.inputs["Base Color"].default_value = item["base_color"]
     shader.inputs["Metallic"].default_value = item["metallic"]
     alpha = shader.inputs.get("Alpha")
@@ -6595,6 +6593,12 @@ def _material_field_values(material):
         "volume_density": 0.0,
         "volume_color": [0.5, 0.5, 0.5],
         "volume_anisotropy": 0.0,
+        "volume_sampling": {"DISTANCE": "distance", "EQUIANGULAR": "equiangular",
+                            "MULTIPLE_IMPORTANCE": "multiple_importance"}.get(
+            getattr(getattr(material, "cycles", None), "volume_sampling", "MULTIPLE_IMPORTANCE"),
+            "multiple_importance"),
+        "volume_interpolation": {"LINEAR": "linear", "CUBIC": "cubic"}.get(
+            getattr(getattr(material, "cycles", None), "volume_interpolation", "LINEAR"), "linear"),
     }
     output = _material_output(material.node_tree) if material.node_tree is not None else None
     if output is None:
@@ -7031,6 +7035,7 @@ def export_doc(doc, target, pack, scene_hash, context):
             scene.render.ffmpeg.audio_codec = blender_audio_codec(render.get("audio_codec", "wav"))
         if engine == "CYCLES" and hasattr(scene, "cycles"):
             scene.cycles.max_bounces = int(render.get("max_bounces", 4))
+            scene.cycles.volume_bounces = int(render.get("volume_bounces", 0))
             if "transparent_max_bounces" in render:
                 scene.cycles.transparent_max_bounces = int(render["transparent_max_bounces"])
         scene.render.engine = engine
@@ -7355,12 +7360,18 @@ def export_doc(doc, target, pack, scene_hash, context):
         mat.diffuse_color = viewport["diffuse_color"] if viewport else item["base_color"]
         mat.use_nodes = True
         set_id(mat.node_tree, item.get("node_tree"))
-        _set_principled_values(mat, item)
+        fresh = next((node for node in mat.node_tree.nodes if node.type == "BSDF_PRINCIPLED"), None)
+        if fresh is not None:
+            _set_principled_values(fresh, item)
         mat.roughness = viewport["roughness"] if viewport else item["roughness"]
         mat.metallic = viewport["metallic"] if viewport else item["metallic"]
         mat.use_backface_culling = not bool(item.get("double_sided", True))
         mat.use_transparent_shadow = bool(item.get("use_transparent_shadow", True))
         mat.displacement_method = "DISPLACEMENT" if item.get("displacement_method") == "displacement" else "BUMP"
+        mat.cycles.volume_sampling = {"distance": "DISTANCE", "equiangular": "EQUIANGULAR"}.get(
+            item.get("volume_sampling"), "MULTIPLE_IMPORTANCE")
+        mat.cycles.volume_interpolation = {"linear": "LINEAR", "cubic": "CUBIC"}.get(
+            item.get("volume_interpolation"), "LINEAR")
         set_id(mat, material_id)
         source = compatibility_block(doc, "materials", "Material", material_id)
         set_props(mat, source.get("custom_properties", {}))
@@ -7577,10 +7588,9 @@ def export_doc(doc, target, pack, scene_hash, context):
         if tree_source:
             _restore_node_tree(material.node_tree, tree_source, id_lookup,
                                "Material shader tree %s" % material.name)
-            if (_is_simple_principled_tree(tree_source)
-                    or any(node.get("properties", {}).get("potter_simple_material") is True
-                           for node in tree_source.get("nodes", []))):
-                _set_principled_values(material, item)
+            generated = _generated_principled(material.node_tree)
+            if generated is not None:
+                _set_principled_values(generated, item)
         if item.get("owns_shader_graph") is True:
             _restore_material_field_nodes(material, item)
     for world_id, item in doc.get("worlds", {}).items():

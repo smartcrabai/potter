@@ -273,6 +273,10 @@ pub struct BsdfParams {
     pub volume_anisotropy: f64,
     /// Emission radiance per unit density per channel: colour × strength × Density.
     pub volume_emission: [f64; 3],
+    /// Blender's `cycles.volume_sampling` of the material this medium belongs to.
+    pub volume_sampling: crate::model::VolumeSampling,
+    /// Blender's `cycles.volume_interpolation` of the material this medium belongs to.
+    pub volume_interpolation: crate::model::VolumeInterpolation,
     pub displacement_height: f64,
     pub normal: DVec3,
 }
@@ -362,6 +366,8 @@ impl BsdfParams {
             volume_emission: material
                 .emission_color
                 .map(|channel| channel * material.emission_strength.max(0.0) * density),
+            volume_sampling: material.volume_sampling,
+            volume_interpolation: material.volume_interpolation,
             displacement_height: 0.0,
             normal: normalize_or(normal, DVec3::Z),
             coat_tint: [1.0; 3],
@@ -513,6 +519,8 @@ impl BsdfParams {
             volume_absorption: mix3(first.volume_absorption, second.volume_absorption),
             volume_anisotropy: mix_scalar(first.volume_anisotropy, second.volume_anisotropy),
             volume_emission: mix3(first.volume_emission, second.volume_emission),
+            volume_sampling: first.volume_sampling,
+            volume_interpolation: first.volume_interpolation,
             displacement_height: mix_scalar(first.displacement_height, second.displacement_height),
             normal: normalize_or(first.normal.lerp(second.normal, shade), first.normal),
             coat_tint: coat.tint,
@@ -598,6 +606,8 @@ impl BsdfParams {
             volume_scatter: add3(first.volume_scatter, second.volume_scatter),
             volume_absorption: add3(first.volume_absorption, second.volume_absorption),
             volume_anisotropy: first.volume_anisotropy,
+            volume_sampling: first.volume_sampling,
+            volume_interpolation: first.volume_interpolation,
             volume_emission: add3(first.volume_emission, second.volume_emission),
             displacement_height: first.displacement_height + second.displacement_height,
             normal: normalize_or(first.normal + second.normal, first.normal),
@@ -1698,7 +1708,7 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
                     .try_into()
                     .map_err(|_| invalid("invalid volume emission color"))?;
             let strength = self.scalar_input(id, &["Emission Strength"], 0.0)?.max(0.0);
-            emission.map(|channel| channel * strength * density)
+            emission.map(|channel| channel * strength)
         };
         Ok(params)
     }
