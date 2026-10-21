@@ -3473,7 +3473,7 @@ def _set_fluid_particle_flag(obj, particle_type, present):
 
 
 def _finish_fluid_particle_systems(obj, modifier_items, fluid_items, modifiers_by_id, doc, node_id,
-                                   id_lookup, texture_lookup, target, pack):
+                                   id_lookup, texture_lookup, target, pack, custom_properties_by_id):
     """Create the fluid particle systems through the domain flags, then bind, configure, and order them.
 
     Runs after the domain is configured, so the Liquid domain check sees the Potter domain type.
@@ -3504,6 +3504,7 @@ def _finish_fluid_particle_systems(obj, modifier_items, fluid_items, modifiers_b
                                       if key != "use_pin_to_last"})
         set_modifier_params(modifier, rna_item, id_lookup, texture_lookup, doc, target, node_id,
                             obj, pack)
+        set_props(modifier, custom_properties_by_id.get(item["id"], {}))
         modifier.use_pin_to_last = bool(item.get("params", {}).get("use_pin_to_last", False))
     expected = [modifiers_by_id[item["id"]] for item in modifier_items]
     for index, modifier in enumerate(expected):
@@ -8203,9 +8204,16 @@ def export_doc(doc, target, pack, scene_hash, context):
                     "cannot reconstruct modifier %s (%s)" % (modifier_item.get("name"), modifier_item.get("type"))
                 ) from error
         if fluid_items:
+            custom_properties_by_id = {
+                fluid_item["id"]: (
+                    source_modifiers.get(fluid_item.get("id"))
+                    or source_modifiers_by_rna_name.get(fluid_item.get("name"))
+                    or {}).get("custom_properties", {})
+                for fluid_item in fluid_items
+            }
             _finish_fluid_particle_systems(
                 obj, modifier_items, fluid_items, modifiers_by_id, doc, node_id, id_lookup,
-                texture_map, target, pack)
+                texture_map, target, pack, custom_properties_by_id)
     for node_id, item in doc.get("nodes", {}).items():
         obj = object_map[node_id]
         is_linked = node_id in linked_maps["nodes"]
