@@ -1028,17 +1028,10 @@ pub fn feature_catalog() -> Value {
         ),
         supported(
             "modifier.volume_to_mesh",
-            "Extracts a named grid of a volume object to a mesh in GRID resolution mode, with threshold, adaptivity, and smooth shading; a missing grid warns and yields an empty mesh",
+            "Extracts a named grid of a volume object to a mesh at GRID, VOXEL_SIZE, or VOXEL_AMOUNT resolution, with threshold, adaptivity, and smooth shading; a missing grid warns and yields an empty mesh, and a zero voxel size or amount yields an empty mesh",
             "VOLUME_TO_MESH",
             &["modifier.create", "modifier.update", "modifier.reorder"],
             [true, true, true, true, true, false, false],
-        ),
-        unsupported(
-            "modifier.volume_to_mesh.resolution_mode",
-            "Volume to Mesh VOXEL_SIZE and VOXEL_AMOUNT resampling",
-            "VOLUME_TO_MESH",
-            &[],
-            "VOXEL_SIZE and VOXEL_AMOUNT resampling is refused with UnsupportedFeature (modifier.volume_to_mesh.resolution_mode) when the named grid has active voxels; a grid without active voxels gives Blender's empty mesh.",
         ),
         supported(
             "modifier.apply_as_shape_key",

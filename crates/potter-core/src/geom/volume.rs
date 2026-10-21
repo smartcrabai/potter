@@ -14,7 +14,10 @@ use crate::{
     model::VolumeInterpolation,
 };
 
-use super::edge_key;
+use super::{
+    edge_key,
+    vdb::{BoxScalar, box_sample_trilinear},
+};
 
 const MAX_GRID_SAMPLES: usize = 1_000_000;
 const MAX_GRID_AXIS: usize = 512;
@@ -31,6 +34,11 @@ const MAX_OUTPUT_FACES: usize = 500_000;
 pub struct VolumeGeneratedSource {
     /// Name of the generator or conversion that produced the samples.
     pub algorithm: String,
+    /// Inclusive index-space bounds of the active voxels, for a generator that leaves some voxels
+    /// inactive (Blender's `evalActiveVoxelBoundingBox`, which Volume to Mesh's `VOXEL_AMOUNT` uses).
+    /// `None` means every voxel is active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_bounds: Option<([i64; 3], [i64; 3])>,
 }
 
 /// File-source metadata for externally stored volume grids.
@@ -452,7 +460,14 @@ pub fn sample_density_with(
 /// data or iso-levels, and resource-limit violations. A field that does not cross the iso-level
 /// yields an empty mesh, as `OpenVDB` and Blender do.
 pub fn volume_to_mesh(volume: &VolumeData, iso_level: f64) -> Result<Mesh> {
-    volume_to_mesh_for_grid(volume, iso_level, None, 0.0, DMat4::IDENTITY)
+    volume_to_mesh_for_grid(
+        volume,
+        iso_level,
+        None,
+        0.0,
+        DMat4::IDENTITY,
+        VolumeToMeshResolution::Grid,
+    )
 }
 
 /// Extract a named volume grid with `OpenVDB`'s adaptive merging threshold (`0.0..=1.0`).
@@ -468,6 +483,7 @@ pub fn volume_to_mesh_named_adaptive(
         Some(grid_name),
         adaptivity,
         DMat4::IDENTITY,
+        VolumeToMeshResolution::Grid,
     )
 }
 
@@ -486,13 +502,21 @@ pub fn volume_to_mesh_placed(
     adaptivity: f64,
     output: DMat4,
     use_smooth_shade: bool,
+    resolution: VolumeToMeshResolution,
 ) -> Result<Mesh> {
     if !output.is_finite() {
         return Err(invalid_volume(
             "volume_to_mesh output transform is not finite",
         ));
     }
-    let mut mesh = volume_to_mesh_for_grid(volume, iso_level, Some(grid_name), adaptivity, output)?;
+    let mut mesh = volume_to_mesh_for_grid(
+        volume,
+        iso_level,
+        Some(grid_name),
+        adaptivity,
+        output,
+        resolution,
+    )?;
     // `mesh_smooth_set(*mesh, flag & VOLUME_TO_MESH_USE_SMOOTH_SHADE)` (`MOD_volume_to_mesh.cc`);
     // the extraction itself produces flat faces.
     if use_smooth_shade {
@@ -501,34 +525,280 @@ pub fn volume_to_mesh_placed(
     Ok(mesh)
 }
 
-/// Whether the grid a Volume to Mesh modifier selects has any active voxel.
-///
-/// Blender resamples a non-`GRID` extraction to the requested voxel size, which Potter does not
-/// implement; an empty grid still yields an empty mesh there. Inline grids keep every sample
-/// active, so only VDB grids can be empty.
-///
-/// # Errors
-///
-/// Returns `EvaluationFailed` with `modifier_warning` when the grid is missing, and typed errors
-/// for unsupported sources or unresolved VDB resources.
-pub fn named_grid_has_active_voxels(volume: &VolumeData, grid_name: &str) -> Result<bool> {
-    ensure_evaluable_source(volume)?;
-    if matches!(&volume.source, VolumeSource::File(_)) {
-        let decoded = volume
-            .decoded_vdb
-            .as_ref()
-            .ok_or_else(vdb_resource_unavailable)?;
-        return decoded
-            .grids
+/// Blender's `VolumeToMeshResolution` (`BKE_volume_to_mesh.hh`): the grid's own voxels, or the grid
+/// resampled to voxels of a given size, or to a given number of voxels along its largest extent.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VolumeToMeshResolution {
+    /// Extract at the grid's own resolution.
+    Grid,
+    /// Resample to voxels of this size in the output's units (`VOXEL_SIZE`).
+    VoxelSize(f64),
+    /// Resample to this many voxels along the grid's largest active extent (`VOXEL_AMOUNT`).
+    VoxelAmount(u32),
+}
+
+/// A dense scalar grid over absolute index coordinates. `values` cover `origin + [0, dims)`, and every
+/// other index holds `background`, as an `OpenVDB` grid reads its inactive voxels.
+#[derive(Clone)]
+struct DenseGrid<T> {
+    origin: [i64; 3],
+    dims: [usize; 3],
+    values: Vec<T>,
+    background: T,
+}
+
+impl<T: BoxScalar> DenseGrid<T> {
+    fn value_at(&self, index: [i64; 3]) -> T {
+        let mut local = [0_usize; 3];
+        for (axis, slot) in local.iter_mut().enumerate() {
+            match usize::try_from(index[axis] - self.origin[axis]) {
+                Ok(offset) if offset < self.dims[axis] => *slot = offset,
+                _ => return self.background,
+            }
+        }
+        self.values[(local[2] * self.dims[1] + local[1]) * self.dims[0] + local[0]]
+    }
+
+    /// `BoxSampler` at an absolute index-space position.
+    fn sample(&self, position: DVec3) -> T {
+        box_sample_trilinear(|index| self.value_at(index), position)
+    }
+}
+
+/// One `GridTransformer` pass for a uniform `scale` with `BoxSampler` (`openvdb/tools/GridTransformer.h`,
+/// `GridResampler::transformBBox`, affine path): output index `x` samples the input at `x / scale`. The
+/// sample position advances by the inverse scale per output voxel, as OpenVDB's loop does.
+fn scale_pass<T: BoxScalar>(input: &DenseGrid<T>, scale: f64) -> Result<DenseGrid<T>> {
+    // The output box is the scaled input box (`inRMax` is exclusive), padded by `BoxSampler`'s radius of 1.
+    let out_min: [i64; 3] =
+        std::array::from_fn(|axis| (input.origin[axis] as f64 * scale).floor() as i64 - 1);
+    let out_max: [i64; 3] = std::array::from_fn(|axis| {
+        ((input.origin[axis] + input.dims[axis] as i64) as f64 * scale).ceil() as i64 + 1
+    });
+    let dims: [usize; 3] = std::array::from_fn(|axis| (out_max[axis] - out_min[axis] + 1) as usize);
+    // The resampled grid is checked before it is allocated: a tiny voxel size makes it large.
+    if dims.iter().any(|dimension| *dimension > MAX_GRID_AXIS)
+        || dims
             .iter()
-            .find(|grid| grid.name == grid_name)
-            .map(|grid| grid.active_bbox.is_some())
-            .ok_or_else(|| grid_not_found(grid_name));
+            .try_fold(1_usize, |count, dimension| count.checked_mul(*dimension))
+            .is_none_or(|count| count > MAX_GRID_SAMPLES)
+    {
+        return Err(resource_error());
     }
-    if grid_name != "density" || volume.grids.is_empty() {
-        return Err(grid_not_found(grid_name));
+    let inverse = 1.0 / scale;
+    let mut values = vec![input.background; dims.iter().product()];
+    let mut start_x = out_min.map(|index| index as f64 * inverse);
+    for x in 0..dims[0] {
+        let mut start_y = start_x;
+        for y in 0..dims[1] {
+            let mut position = start_y;
+            for z in 0..dims[2] {
+                values[(z * dims[1] + y) * dims[0] + x] = input.sample(DVec3::from_array(position));
+                position[2] += inverse;
+            }
+            start_y[1] += inverse;
+        }
+        start_x[0] += inverse;
     }
-    Ok(true)
+    Ok(DenseGrid {
+        origin: out_min,
+        dims,
+        values,
+        background: input.background,
+    })
+}
+
+/// `GridTransformer::transformGrid` for a uniform `factor` with `BoxSampler`. While the factor is below
+/// one half, the grid is halved along every axis (`mMipLevels`, `mipmap()`), and the remaining scale
+/// is then applied in one pass; otherwise the factor is applied directly.
+fn resample_uniform<T: BoxScalar>(input: DenseGrid<T>, factor: f64) -> Result<DenseGrid<T>> {
+    if factor >= 0.5 {
+        return scale_pass(&input, factor);
+    }
+    let halvings = (-factor.ln() / 2.0_f64.ln()).floor() as i32;
+    let remainder = factor * f64::from(1_i32 << halvings);
+    let mut current = input;
+    for _ in 0..halvings {
+        current = scale_pass(&current, 0.5)?;
+    }
+    // `mPostScaleTransform` is the identity when the remainder is exactly one.
+    if remainder.to_bits() != 1.0_f64.to_bits() {
+        current = scale_pass(&current, remainder)?;
+    }
+    Ok(current)
+}
+
+/// Blender's `VolumeToMeshOp::compute_resolution_factor` (`volume_to_mesh.cc`) in single precision:
+/// the largest voxel size of the transformed grid over the desired voxel size. `active` is the
+/// absolute index box of the grid's active voxels, inclusive. `None` when no factor exists, which
+/// Blender reports as an empty mesh.
+fn resolution_factor(
+    index_to_world: DMat4,
+    active: ([i64; 3], [i64; 3]),
+    resolution: VolumeToMeshResolution,
+) -> Option<f32> {
+    let current = [
+        index_to_world.x_axis,
+        index_to_world.y_axis,
+        index_to_world.z_axis,
+    ]
+    .iter()
+    .map(|column| column.truncate().length() as f32)
+    .fold(0.0_f32, f32::max);
+    let desired = match resolution {
+        VolumeToMeshResolution::Grid => return None,
+        VolumeToMeshResolution::VoxelSize(size) => size as f32,
+        VolumeToMeshResolution::VoxelAmount(amount) => {
+            // `indexToWorld` of the inclusive active box: the extents of its world corners.
+            let low = DVec3::from_array(active.0.map(|index| index as f64));
+            let high = DVec3::from_array(active.1.map(|index| index as f64));
+            let mut minimum = DVec3::splat(f64::INFINITY);
+            let mut maximum = DVec3::splat(f64::NEG_INFINITY);
+            for corner in 0..8_u8 {
+                let index = DVec3::new(
+                    if corner & 1 == 0 { low.x } else { high.x },
+                    if corner & 2 == 0 { low.y } else { high.y },
+                    if corner & 4 == 0 { low.z } else { high.z },
+                );
+                let world = index_to_world.transform_point3(index);
+                minimum = minimum.min(world);
+                maximum = maximum.max(world);
+            }
+            let max_extent = (maximum - minimum).max_element() as f32;
+            if max_extent.is_nan() || max_extent <= 0.0 {
+                return None;
+            }
+            max_extent / amount as f32
+        }
+    };
+    if desired.is_nan() || desired <= 0.0 {
+        return None;
+    }
+    Some(current / desired)
+}
+
+/// The inline grid of a non-`GRID` resolution: the grid resampled by `factor`, with the layout
+/// `index_to_local = scale(1 / factor) * translation(origin)` that the extraction maps through
+/// `output * index_to_world`, where `index_to_world` is the grid's absolute index-to-local map.
+fn resample_inline_grid(
+    grid: &VolumeGrid,
+    values: GridSamples<'_>,
+    active: ([i64; 3], [i64; 3]),
+    output: DMat4,
+    resolution: VolumeToMeshResolution,
+) -> Result<Option<(VolumeGrid, DMat4)>> {
+    // Blender indexes the grid by its absolute voxel index; a legacy grid's origin is that index's offset.
+    let offset = global_grid_origin(grid);
+    let index_to_world = grid.checked_index_to_local_matrix()?
+        * DMat4::from_translation(-DVec3::from_array(offset.map(|index| index as f64)));
+    let index_to_output = output * index_to_world;
+    let world_active = (
+        std::array::from_fn(|axis| active.0[axis] + offset[axis]),
+        std::array::from_fn(|axis| active.1[axis] + offset[axis]),
+    );
+    let Some(factor) = resolution_factor(index_to_output, world_active, resolution) else {
+        return Ok(None);
+    };
+    // Inline grids are float and read outside their samples as zero (`inline_node`, `outside_value`).
+    let count = grid
+        .dims
+        .iter()
+        .map(|dimension| *dimension as usize)
+        .product();
+    let mut input_values = Vec::with_capacity(count);
+    for index in 0..count {
+        let sample = values
+            .get(index)
+            .ok_or_else(|| invalid_volume("volume sample index is out of range"))?;
+        input_values.push(<f32 as BoxScalar>::from_f64(sample));
+    }
+    let input = DenseGrid {
+        origin: offset,
+        dims: grid.dims.map(|dimension| dimension as usize),
+        values: input_values,
+        background: 0.0,
+    };
+    let resampled = resample_uniform(input, f64::from(factor))?;
+    // The layout carries the grid's own index-to-world map, so its determinant keeps a mirror's sign.
+    let layout = index_to_world * resampled_layout(factor, resampled.origin);
+    let layout_grid = VolumeGrid {
+        dims: grid_dimensions(resampled.dims)?,
+        voxel_size: grid.voxel_size / f64::from(factor),
+        origin: layout.transform_point3(DVec3::ZERO),
+        index_to_local: Some(layout.to_cols_array()),
+        values: Some(resampled.values),
+        blob_f32: None,
+        content_ref: None,
+    };
+    Ok(Some((layout_grid, output)))
+}
+
+/// The map from a resampled grid's index to the index of the grid it was resampled from. Grid index `g`
+/// is absolute index `g + origin`, and absolute index `a` maps to `a / factor`, which is Blender's
+/// `preScale(1.0f / resolution_factor)` on the grid's transform.
+fn resampled_layout(factor: f32, origin: [i64; 3]) -> DMat4 {
+    DMat4::from_scale(DVec3::splat(f64::from(1.0_f32 / factor)))
+        * DMat4::from_translation(DVec3::from_array(origin.map(|index| index as f64)))
+}
+
+fn grid_dimensions(dims: [usize; 3]) -> Result<[u32; 3]> {
+    let mut grid_dims = [0_u32; 3];
+    for (slot, dimension) in grid_dims.iter_mut().zip(dims) {
+        *slot = u32::try_from(dimension).map_err(|_| resource_error())?;
+    }
+    Ok(grid_dims)
+}
+
+/// A dense VDB grid resampled for a non-GRID resolution, with the values in double precision. A float
+/// grid interpolates in `float`, as Blender's `BoxSampler` does for it.
+fn resample_dense_vdb(
+    origin: [i64; 3],
+    dims: [usize; 3],
+    values: &[f64],
+    background: f64,
+    single: bool,
+    factor: f32,
+) -> Result<(VolumeGrid, Vec<f64>)> {
+    let (resampled_origin, resampled_dims, resampled_values) = if single {
+        let input = DenseGrid {
+            origin,
+            dims,
+            values: values
+                .iter()
+                .map(|value| <f32 as BoxScalar>::from_f64(*value))
+                .collect(),
+            background: <f32 as BoxScalar>::from_f64(background),
+        };
+        let resampled = resample_uniform(input, f64::from(factor))?;
+        (
+            resampled.origin,
+            resampled.dims,
+            resampled
+                .values
+                .iter()
+                .map(|value| value.to_f64())
+                .collect(),
+        )
+    } else {
+        let input = DenseGrid {
+            origin,
+            dims,
+            values: values.to_vec(),
+            background,
+        };
+        let resampled = resample_uniform(input, f64::from(factor))?;
+        (resampled.origin, resampled.dims, resampled.values)
+    };
+    let layout = VolumeGrid {
+        dims: grid_dimensions(resampled_dims)?,
+        voxel_size: 1.0 / f64::from(factor),
+        origin: resampled_layout(factor, resampled_origin).transform_point3(DVec3::ZERO),
+        index_to_local: Some(resampled_layout(factor, resampled_origin).to_cols_array()),
+        values: None,
+        blob_f32: None,
+        content_ref: None,
+    };
+    Ok((layout, resampled_values))
 }
 
 fn volume_to_mesh_for_grid(
@@ -537,6 +807,7 @@ fn volume_to_mesh_for_grid(
     grid_name: Option<&str>,
     adaptivity: f64,
     output: DMat4,
+    resolution: VolumeToMeshResolution,
 ) -> Result<Mesh> {
     ensure_evaluable_source(volume)?;
     if !iso_level.is_finite() {
@@ -573,7 +844,14 @@ fn volume_to_mesh_for_grid(
                 "level set" | "Level Set" | "LevelSet" | "level_set" | "levelset"
             )
         });
-        return vdb_grid_to_mesh(grid, iso_level, inside_is_low, adaptivity, output);
+        return vdb_grid_to_mesh(
+            grid,
+            iso_level,
+            inside_is_low,
+            adaptivity,
+            output,
+            resolution,
+        );
     }
     if let Some(grid_name) = grid_name
         && (grid_name != "density" || volume.grids.is_empty())
@@ -595,6 +873,30 @@ fn volume_to_mesh_for_grid(
         &volume.source,
         VolumeSource::Generated(source) if source.algorithm == "signed_distance"
     );
+    // A non-GRID resolution extracts the resampled grid, with the output transform of its voxels.
+    let mut resampled_grid = None;
+    let (grid, values, output) = if matches!(resolution, VolumeToMeshResolution::Grid) {
+        (grid, values, output)
+    } else {
+        let active = match &volume.source {
+            VolumeSource::Generated(source) => source.active_bounds,
+            _ => None,
+        }
+        .unwrap_or_else(|| {
+            (
+                [0_i64; 3],
+                grid.dims.map(|dimension| i64::from(dimension) - 1),
+            )
+        });
+        let Some((layout, world_output)) =
+            resample_inline_grid(grid, values, active, output, resolution)?
+        else {
+            return Ok(Mesh::default());
+        };
+        let layout = resampled_grid.insert(layout);
+        let layout_values = validate_grid(layout)?;
+        (&*layout, layout_values, world_output)
+    };
     let boundary_crosses = grid_boundary_crosses(grid, values, iso_level)?;
     let mut mesh = if boundary_crosses {
         let padded = pad_volume_grid(grid, values)?;
@@ -1580,6 +1882,7 @@ fn vdb_grid_to_mesh(
     inside_is_low: bool,
     adaptivity: f32,
     output: DMat4,
+    resolution: VolumeToMeshResolution,
 ) -> Result<Mesh> {
     if !grid.is_scalar() {
         return Ok(Mesh::default());
@@ -1686,14 +1989,32 @@ fn vdb_grid_to_mesh(
         blob_f32: None,
         content_ref: None,
     };
+    // The grid's voxels are absolute VDB indices, mapped to world by `index_to_world` and `output`.
+    let world_output = output * grid.transform.index_to_world;
+    let (layout, layout_values) = if matches!(resolution, VolumeToMeshResolution::Grid) {
+        (dense_grid, values)
+    } else {
+        let active = (active_min.map(i64::from), active_max.map(i64::from));
+        let Some(factor) = resolution_factor(world_output, active, resolution) else {
+            return Ok(Mesh::default());
+        };
+        resample_dense_vdb(
+            minimum.map(i64::from),
+            dims.map(|dimension| dimension as usize),
+            &values,
+            outside_value,
+            scalar_kind == "float",
+            factor,
+        )?
+    };
     let mut mesh = dual_contour_grid_to_mesh(
-        &dense_grid,
-        GridSamples::F64(&values),
+        &layout,
+        GridSamples::F64(&layout_values),
         iso_level,
         inside_is_low,
         adaptivity,
         outside_value,
-        output * grid.transform.index_to_world,
+        world_output,
     )?;
     for vertex in &mut mesh.vertices {
         if !vertex.co.is_finite() {
@@ -1876,6 +2197,7 @@ pub fn mesh_to_fog_volume_with_transform(
         voxel_size,
         interior_distance,
     );
+    let active_bounds = active_index_bounds(&active, dims);
     let minimum_distance = signed_distances
         .iter()
         .copied()
@@ -1899,6 +2221,7 @@ pub fn mesh_to_fog_volume_with_transform(
             }],
             source: VolumeSource::Generated(VolumeGeneratedSource {
                 algorithm: "mesh_to_volume_fog".to_owned(),
+                active_bounds,
             }),
             decoded_vdb: None,
         });
@@ -1931,9 +2254,35 @@ pub fn mesh_to_fog_volume_with_transform(
         grids: vec![grid],
         source: VolumeSource::Generated(VolumeGeneratedSource {
             algorithm: "mesh_to_volume_fog".to_owned(),
+            active_bounds,
         }),
         decoded_vdb: None,
     })
+}
+
+/// The inclusive index box of the active voxels of a dense grid with `dims`, in its linear layout
+/// `(z * ny + y) * nx + x`. `None` when no voxel is active.
+fn active_index_bounds(active: &[bool], dims: [usize; 3]) -> Option<([i64; 3], [i64; 3])> {
+    let mut bounds: Option<([i64; 3], [i64; 3])> = None;
+    for (linear, _) in active
+        .iter()
+        .enumerate()
+        .filter(|(_, is_active)| **is_active)
+    {
+        let point = [
+            (linear % dims[0]) as i64,
+            ((linear / dims[0]) % dims[1]) as i64,
+            (linear / (dims[0] * dims[1])) as i64,
+        ];
+        bounds = Some(match bounds {
+            None => (point, point),
+            Some((low, high)) => (
+                std::array::from_fn(|axis| low[axis].min(point[axis])),
+                std::array::from_fn(|axis| high[axis].max(point[axis])),
+            ),
+        });
+    }
+    bounds
 }
 
 /// Squared index-space distance from each voxel to the nearest triangle, and that triangle, for the
@@ -2750,6 +3099,7 @@ fn empty_fog_volume() -> VolumeData {
     VolumeData {
         source: VolumeSource::Generated(VolumeGeneratedSource {
             algorithm: "mesh_to_volume_fog".to_owned(),
+            active_bounds: None,
         }),
         ..VolumeData::default()
     }

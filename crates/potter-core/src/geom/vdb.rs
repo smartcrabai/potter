@@ -49,17 +49,58 @@ pub(crate) fn box_sample_lerp(first: f32, second: f32, weight: f64) -> f32 {
     first + step
 }
 
-/// `BoxSampler::sample` on a float grid: the eight voxels around `coordinate` are interpolated along
-/// z, then y, then x, in the order Blender's `OpenVDB` build uses. `value_at` gives each voxel's value.
-pub(crate) fn box_sample_trilinear(value_at: impl Fn([i64; 3]) -> f32, coordinate: DVec3) -> f32 {
+/// A scalar that `BoxSampler` interpolates in its own precision: `float` for float grids and `double`
+/// for double grids (`openvdb/tools/Interpolation.h` is templated on the value type).
+pub(crate) trait BoxScalar: Copy {
+    /// One lerp: `first` moved toward `second` by `weight`, in this precision.
+    fn lerp(first: Self, second: Self, weight: f64) -> Self;
+    /// The value as `f64`, for storage in dense grids.
+    fn to_f64(self) -> f64;
+    /// The value rounded to this precision.
+    fn from_f64(value: f64) -> Self;
+}
+
+impl BoxScalar for f32 {
+    fn lerp(first: f32, second: f32, weight: f64) -> f32 {
+        box_sample_lerp(first, second, weight)
+    }
+
+    fn to_f64(self) -> f64 {
+        f64::from(self)
+    }
+
+    fn from_f64(value: f64) -> f32 {
+        value as f32
+    }
+}
+
+impl BoxScalar for f64 {
+    fn lerp(first: f64, second: f64, weight: f64) -> f64 {
+        first + (second - first) * weight
+    }
+
+    fn to_f64(self) -> f64 {
+        self
+    }
+
+    fn from_f64(value: f64) -> f64 {
+        value
+    }
+}
+
+/// `BoxSampler::sample`: the eight voxels around `coordinate` are interpolated along z, then y, then
+/// x, in the order Blender's `OpenVDB` build uses. `value_at` gives each voxel's value.
+pub(crate) fn box_sample_trilinear<T: BoxScalar>(
+    value_at: impl Fn([i64; 3]) -> T,
+    coordinate: DVec3,
+) -> T {
     let lower = coordinate.floor();
     let fraction = coordinate - lower;
     let base = lower.to_array().map(|value| value as i64);
     let value = |dx: i64, dy: i64, dz: i64| value_at([base[0] + dx, base[1] + dy, base[2] + dz]);
-    let along_z =
-        |dx: i64, dy: i64| box_sample_lerp(value(dx, dy, 0), value(dx, dy, 1), fraction.z);
-    let along_y = |dx: i64| box_sample_lerp(along_z(dx, 0), along_z(dx, 1), fraction.y);
-    box_sample_lerp(along_y(0), along_y(1), fraction.x)
+    let along_z = |dx: i64, dy: i64| T::lerp(value(dx, dy, 0), value(dx, dy, 1), fraction.z);
+    let along_y = |dx: i64| T::lerp(along_z(dx, 0), along_z(dx, 1), fraction.y);
+    T::lerp(along_y(0), along_y(1), fraction.x)
 }
 
 /// Scalar or three-component values stored by a VDB tree.

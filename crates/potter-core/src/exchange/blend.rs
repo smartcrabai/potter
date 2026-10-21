@@ -6389,6 +6389,7 @@ fn import_volumes(
             crate::geom::volume::VolumeSource::Generated(
                 crate::geom::volume::VolumeGeneratedSource {
                     algorithm: "empty".to_owned(),
+                    active_bounds: None,
                 },
             )
         } else {

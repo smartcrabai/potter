@@ -371,6 +371,7 @@ fn check_fixture(file: OracleFile, shape: &str) {
                 case.adaptivity,
                 DMat4::IDENTITY,
                 true,
+                volume::VolumeToMeshResolution::Grid,
             )
             .unwrap_or_else(|error| panic!("{context}: {error}"));
             assert_mesh_matches(oracle, &actual, &context);
@@ -1338,5 +1339,72 @@ fn blender_multigrid_vdb_displacement_preserves_named_grid_types_and_samples() {
             "velocity component {axis}: got {actual}, expected {}",
             expected_sample[axis]
         );
+    }
+}
+
+#[derive(Deserialize)]
+struct ResolutionOracle {
+    blender_version: String,
+    source: ResolutionSource,
+    cases: Vec<ResolutionCase>,
+}
+
+#[derive(Deserialize)]
+struct ResolutionSource {
+    vertices: Vec<[f64; 3]>,
+    faces: Vec<Vec<usize>>,
+}
+
+#[derive(Deserialize)]
+struct ResolutionCase {
+    resolution_mode: String,
+    voxel_size: f64,
+    voxel_amount: u32,
+    volume_to_mesh: Vec<OracleMesh>,
+}
+
+#[test]
+fn blender_volume_to_mesh_resolution_modes_match_full_mesh_fixtures() {
+    let oracle: ResolutionOracle = serde_json::from_str(include_str!(
+        "fixtures/pr18o_volume/volume_to_mesh_resolution.json"
+    ))
+    .expect("valid Blender resolution fixture");
+    assert_eq!(oracle.blender_version, "5.2.2 LTS");
+    let positions = oracle
+        .source
+        .vertices
+        .iter()
+        .copied()
+        .map(as_dvec3)
+        .collect();
+    let operand = Mesh::from_positions_and_faces(positions, oracle.source.faces)
+        .expect("valid closed Blender fixture mesh");
+    // The generator's Mesh to Volume: voxel size 0.25, interior band 0.25, density 1.
+    let fog = volume::mesh_to_fog_volume(&operand, 0.25, 0.25, 1.0)
+        .expect("Potter mesh-to-volume conversion");
+    for case in &oracle.cases {
+        let resolution = match case.resolution_mode.as_str() {
+            "VOXEL_SIZE" => volume::VolumeToMeshResolution::VoxelSize(case.voxel_size),
+            "VOXEL_AMOUNT" => volume::VolumeToMeshResolution::VoxelAmount(case.voxel_amount),
+            mode => panic!("unexpected resolution mode {mode}"),
+        };
+        for oracle_mesh in &case.volume_to_mesh {
+            let context = format!(
+                "{} voxel_size={} voxel_amount={} threshold={}",
+                case.resolution_mode, case.voxel_size, case.voxel_amount, oracle_mesh.threshold
+            );
+            let actual = volume::volume_to_mesh_placed(
+                &fog,
+                oracle_mesh.threshold,
+                "density",
+                0.0,
+                DMat4::IDENTITY,
+                true,
+                resolution,
+            )
+            .unwrap_or_else(|error| panic!("{context}: {error}"));
+            assert_mesh_matches(oracle_mesh, &actual, &context);
+            assert_smooth_flags_match(oracle_mesh, &actual, &context);
+        }
     }
 }

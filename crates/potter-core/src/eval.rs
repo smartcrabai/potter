@@ -4720,6 +4720,78 @@ fn lattice_vertex_group_weights(
     ))
 }
 
+/// The Volume to Mesh resolution of a modifier: `resolution_mode`, with `voxel_size` or `voxel_amount`
+/// for the resampled modes (`MOD_volume_to_mesh.cc`).
+fn volume_to_mesh_resolution(
+    modifier: &Modifier,
+) -> Result<crate::geom::volume::VolumeToMeshResolution> {
+    let default = |parameter: &str| {
+        crate::params::default_value(
+            crate::params::ParameterFamily::Modifier,
+            "volume_to_mesh",
+            parameter,
+        )
+        .cloned()
+        .ok_or_else(|| {
+            PotError::new(
+                ErrorCode::InternalError,
+                format!("volume_to_mesh default `{parameter}` is missing"),
+            )
+        })
+    };
+    let mode_value = match modifier.params.get("resolution_mode") {
+        Some(value) => value.clone(),
+        None => default("resolution_mode")?,
+    };
+    let mode = mode_value.as_str().ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::InvalidArgument,
+            "volume_to_mesh resolution_mode must be a string",
+            json!({"modifier_id":modifier.id,"parameter":"resolution_mode"}),
+        )
+    })?;
+    Ok(match mode {
+        "GRID" => crate::geom::volume::VolumeToMeshResolution::Grid,
+        "VOXEL_SIZE" => {
+            let size = match modifier.params.get("voxel_size") {
+                Some(value) => value.as_f64(),
+                None => default("voxel_size")?.as_f64(),
+            }
+            .ok_or_else(|| {
+                PotError::with_details(
+                    ErrorCode::InvalidArgument,
+                    "volume_to_mesh voxel_size must be a number",
+                    json!({"modifier_id":modifier.id,"parameter":"voxel_size"}),
+                )
+            })?;
+            crate::geom::volume::VolumeToMeshResolution::VoxelSize(size)
+        }
+        "VOXEL_AMOUNT" => {
+            let amount = match modifier.params.get("voxel_amount") {
+                Some(value) => value.clone(),
+                None => default("voxel_amount")?,
+            }
+            .as_u64()
+            .and_then(|amount| u32::try_from(amount).ok())
+            .ok_or_else(|| {
+                PotError::with_details(
+                    ErrorCode::InvalidArgument,
+                    "volume_to_mesh voxel_amount must be a non-negative integer",
+                    json!({"modifier_id":modifier.id,"parameter":"voxel_amount"}),
+                )
+            })?;
+            crate::geom::volume::VolumeToMeshResolution::VoxelAmount(amount)
+        }
+        _ => {
+            return Err(PotError::with_details(
+                ErrorCode::InvalidArgument,
+                "volume_to_mesh resolution_mode must be GRID, VOXEL_SIZE, or VOXEL_AMOUNT",
+                json!({"modifier_id":modifier.id,"parameter":"resolution_mode"}),
+            ));
+        }
+    })
+}
+
 pub(crate) fn apply_volume_to_mesh_modifier(
     mesh: &mut Mesh,
     modifier: &Modifier,
@@ -4885,6 +4957,16 @@ pub(crate) fn apply_volume_to_mesh_modifier(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false),
     };
+    let resolution = volume_to_mesh_resolution(modifier)?;
+    // Blender returns an empty mesh for a zero voxel size or voxel amount (`MOD_volume_to_mesh.cc`).
+    if match resolution {
+        crate::geom::volume::VolumeToMeshResolution::VoxelSize(size) => size <= 0.0,
+        crate::geom::volume::VolumeToMeshResolution::VoxelAmount(amount) => amount == 0,
+        crate::geom::volume::VolumeToMeshResolution::Grid => false,
+    } {
+        *mesh = Mesh::default();
+        return Ok(());
+    }
     let extracted = crate::geom::volume::volume_to_mesh_placed(
         volume,
         threshold,
@@ -4892,6 +4974,7 @@ pub(crate) fn apply_volume_to_mesh_modifier(
         adaptivity,
         volume_to_mesh,
         use_smooth_shade,
+        resolution,
     )?;
     if extracted
         .vertices
