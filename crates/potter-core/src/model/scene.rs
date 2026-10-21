@@ -176,8 +176,21 @@ impl SceneDoc {
                 "active_scene does not reference a scene",
             ));
         }
-        for resource in self.resources.values() {
-            if crate::model::migrate::inline_resource_kind(resource)? == Some("node_bake") {
+        for (resource_id, resource) in &self.resources {
+            let resource_kind = crate::model::migrate::inline_resource_kind(resource)?;
+            if resource.get("storage").is_some()
+                && resource.get("storage").and_then(Value::as_str) != Some("inline")
+            {
+                return Err(PotError::with_details(
+                    ErrorCode::SceneInvalid,
+                    "typed resources must use storage `inline`",
+                    json!({ "resource": resource_id }),
+                ));
+            }
+            if resource_kind == Some(crate::geom::legacy_texture::LEGACY_TEXTURE_KIND) {
+                crate::geom::legacy_texture::validate_record_in_scene(self, resource_id, resource)?;
+            }
+            if resource_kind == Some("node_bake") {
                 crate::graph::validate_node_bake_resource(resource)?;
             }
         }
@@ -1674,18 +1687,35 @@ impl Modifier {
     }
 }
 
+/// Blender's ordered f32 texture-coordinate stages, retained without matrix composition.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TextureCoordinateMapping {
+    pub subject_to_world_f32: [f32; 16],
+    pub world_to_mapping_f32: Option<[f32; 16]>,
+}
+
 #[doc(hidden)]
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ModifierRuntime {
-    pub target_mesh: Option<Value>,
+    pub target_mesh: Option<Mesh>,
     #[doc(hidden)]
     pub target_to_subject: Option<[f64; 16]>,
     /// Boolean operands in the subject's space (subject excluded), in Blender order.
     pub boolean_operands: Vec<crate::geom::boolean::BooleanOperand>,
-    pub warp_from: Option<[f64; 3]>,
-    pub warp_to: Option<[f64; 3]>,
-    pub hook_target_position: Option<[f64; 3]>,
+    /// `inv(subject_world) * reference_world` (column-major) for Hook, Cast, Simple Deform origin,
+    /// Curve, and Wave's start object. A bone reference is `armature_world * pose_mat`.
+    pub object_matrix: Option<[f64; 16]>,
+    /// `inv(subject_world) * source_world` for generic Warp source object or pose bone.
+    pub warp_from_matrix: Option<[f64; 16]>,
+    /// `inv(subject_world) * destination_world` for generic Warp destination object or pose bone.
+    pub warp_to_matrix: Option<[f64; 16]>,
+    /// Raw subject-to-world and optional world-to-mapping matrices for ordered f32 texture mapping.
+    #[doc(hidden)]
+    pub texture_mapping: Option<TextureCoordinateMapping>,
+    /// Bake-node records for this modifier's node group, keyed by Potter node id.
     pub node_bakes: BTreeMap<String, crate::graph::NodeBakeRecord>,
+    /// Bake nodes whose frame the evaluation captures (explicit bake action).
     pub capture_node_bakes: BTreeSet<String>,
 }
 
@@ -2119,16 +2149,16 @@ fn matrix_basis_fingerprint_matches(fingerprint: &str, digest: &[u8; 32]) -> boo
         })
 }
 
-fn default_true() -> bool {
-    true
-}
-
 fn default_simulation_frame_start() -> i32 {
     1
 }
 
 fn default_simulation_frame_end() -> i32 {
     250
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[expect(

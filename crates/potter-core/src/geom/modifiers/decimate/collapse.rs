@@ -220,6 +220,7 @@ struct BMesh {
     edge_types: Vec<String>,
     track_edge_flags: bool,
 }
+
 impl BMesh {
     fn disk_index(&self, e: usize, v: usize) -> usize {
         usize::from(self.edges[e].v[1] == v)
@@ -2489,6 +2490,7 @@ pub(in crate::geom::modifiers) fn decimate_collapse(
     let keep_vertices = vec![true; output.points.len()];
     let origin = Origin {
         vertices: output.origins,
+        source_vertices: None,
         faces: output.faces,
         corners: None,
     };
