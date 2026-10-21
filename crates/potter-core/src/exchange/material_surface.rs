@@ -602,10 +602,12 @@ enum Alpha {
         sample: Sample,
         factor: f64,
     },
-    /// Texture alpha thresholded: alpha >= `cutoff` is kept (MASK).
+    /// Texture alpha times a factor, thresholded: alpha >= `cutoff` is kept (MASK). The factor is the glTF
+    /// `baseColorFactor` alpha, as Blender's clip stage multiplies it in front of the comparison.
     Clip {
         sample: Sample,
         cutoff: f64,
+        factor: f64,
     },
 }
 
@@ -1134,11 +1136,13 @@ impl<'a> GraphReducer<'a> {
     }
 }
 
-/// Clip predicate `x >= cutoff` (`ge`) or `x < cutoff` (`!ge`) on a texture channel.
+/// Clip predicate `x >= cutoff` (`ge`) or `x < cutoff` (`!ge`) on a texture channel. `factor` is the texture
+/// alpha's factor, which Blender multiplies in before the comparison.
 struct Predicate {
     sample: Sample,
     cutoff: f64,
     ge: bool,
+    factor: f64,
 }
 
 impl ColorIn {
@@ -1635,6 +1639,7 @@ impl GraphReducer<'_> {
                     Ok(Alpha::Clip {
                         sample: predicate.sample,
                         cutoff: predicate.cutoff,
+                        factor: predicate.factor,
                     })
                 } else {
                     self.loss(
@@ -1681,7 +1686,12 @@ impl GraphReducer<'_> {
             _ => return Ok(None),
         };
         match self.alpha_input(math_id, socket, 1.0, depth)? {
-            Alpha::Tex { sample, .. } => Ok(Some(Predicate { sample, cutoff, ge })),
+            Alpha::Tex { sample, factor } => Ok(Some(Predicate {
+                sample,
+                cutoff,
+                ge,
+                factor,
+            })),
             _ => Ok(None),
         }
     }
@@ -1696,17 +1706,26 @@ impl GraphReducer<'_> {
                 sample,
                 factor: factor * k,
             },
-            (Alpha::Const(k), Alpha::Clip { sample, cutoff })
-            | (Alpha::Clip { sample, cutoff }, Alpha::Const(k)) => {
-                if !crate::float::equal_f64(k, 1.0) {
-                    self.loss(
-                        feature_id::UNSUPPORTED_NODE,
-                        format!("alpha factor {k} on a clipped texture at `{owner}` is dropped"),
-                        None,
-                    );
-                }
-                Alpha::Clip { sample, cutoff }
-            }
+            (
+                Alpha::Const(k),
+                Alpha::Clip {
+                    sample,
+                    cutoff,
+                    factor,
+                },
+            )
+            | (
+                Alpha::Clip {
+                    sample,
+                    cutoff,
+                    factor,
+                },
+                Alpha::Const(k),
+            ) => Alpha::Clip {
+                sample,
+                cutoff,
+                factor: factor * k,
+            },
             (primary, _) => {
                 self.loss(
                     feature_id::UNSUPPORTED_NODE,
@@ -2691,9 +2710,11 @@ impl GraphReducer<'_> {
                 },
             ),
             Alpha::Tex { sample, factor } => (*factor, Some(sample), AlphaMode::Blend),
-            Alpha::Clip { sample, cutoff } => {
-                (1.0, Some(sample), AlphaMode::Mask { cutoff: *cutoff })
-            }
+            Alpha::Clip {
+                sample,
+                cutoff,
+                factor,
+            } => (*factor, Some(sample), AlphaMode::Mask { cutoff: *cutoff }),
         };
         let base_texture = self.base_texture(base.tex.as_ref(), alpha_sample);
         let (metallic_roughness_texture, packed) = self.packed_texture(

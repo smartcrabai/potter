@@ -924,14 +924,32 @@
           "type": "array",
           "items": {
             "type": "array",
-            "items": {
-              "type": "number"
-            },
+            "items": {"type": ["number", "string"]},
+            "prefixItems": [
+              {"type": "number"},
+              {"type": "number"},
+              {"type": "string", "enum": ["AUTO", "AUTO_CLAMPED", "VECTOR"]}
+            ],
             "minItems": 2,
-            "maxItems": 2
+            "maxItems": 3
           },
           "minItems": 2,
           "default": [[0.0, 0.0], [1.0, 1.0]]
+        },
+        "map_curve_settings": {
+          "type": "object",
+          "properties": {
+            "use_clip": {"type": "boolean", "default": true},
+            "clip_bounds": {
+              "type": "array",
+              "items": {"type": "number", "minimum": -100.0, "maximum": 100.0},
+              "minItems": 4,
+              "maxItems": 4,
+              "default": [0.0, 0.0, 1.0, 1.0]
+            },
+            "extend": {"enum": ["HORIZONTAL", "EXTRAPOLATED"], "default": "EXTRAPOLATED"}
+          },
+          "default": {"use_clip": true, "clip_bounds": [0.0, 0.0, 1.0, 1.0], "extend": "EXTRAPOLATED"}
         },
         "normalize": {
           "type": "boolean",
@@ -1277,14 +1295,32 @@
           "type": "array",
           "items": {
             "type": "array",
-            "items": {
-              "type": "number"
-            },
+            "items": {"type": ["number", "string"]},
+            "prefixItems": [
+              {"type": "number"},
+              {"type": "number"},
+              {"type": "string", "enum": ["AUTO", "AUTO_CLAMPED", "VECTOR"]}
+            ],
             "minItems": 2,
-            "maxItems": 2
+            "maxItems": 3
           },
           "minItems": 2,
           "default": [[0.0, 0.0], [1.0, 1.0]]
+        },
+        "map_curve_settings": {
+          "type": "object",
+          "properties": {
+            "use_clip": {"type": "boolean", "default": true},
+            "clip_bounds": {
+              "type": "array",
+              "items": {"type": "number", "minimum": -100.0, "maximum": 100.0},
+              "minItems": 4,
+              "maxItems": 4,
+              "default": [0.0, 0.0, 1.0, 1.0]
+            },
+            "extend": {"enum": ["HORIZONTAL", "EXTRAPOLATED"], "default": "EXTRAPOLATED"}
+          },
+          "default": {"use_clip": true, "clip_bounds": [0.0, 0.0, 1.0, 1.0], "extend": "EXTRAPOLATED"}
         },
         "normalize": {
           "type": "boolean",
@@ -3669,6 +3705,45 @@
           "type": "string",
           "default": ""
         },
+        "vertex_indices": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "default": []
+        },
+        "falloff_curve": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": {"type": ["number", "string"]},
+            "prefixItems": [
+              {"type": "number"},
+              {"type": "number"},
+              {"type": "string", "enum": ["AUTO", "AUTO_CLAMPED", "VECTOR"]}
+            ],
+            "minItems": 2,
+            "maxItems": 3
+          },
+          "minItems": 2,
+          "default": [[0.0, 0.0], [1.0, 1.0]]
+        },
+        "falloff_curve_settings": {
+          "type": "object",
+          "properties": {
+            "use_clip": {"type": "boolean", "default": true},
+            "clip_bounds": {
+              "type": "array",
+              "items": {"type": "number", "minimum": -100.0, "maximum": 100.0},
+              "minItems": 4,
+              "maxItems": 4,
+              "default": [0.0, 0.0, 1.0, 1.0]
+            },
+            "extend": {"enum": ["HORIZONTAL", "EXTRAPOLATED"], "default": "EXTRAPOLATED"}
+          },
+          "default": {"use_clip": true, "clip_bounds": [0.0, 0.0, 1.0, 1.0], "extend": "EXTRAPOLATED"}
+        },
         "use_falloff_uniform": {
           "type": "boolean",
           "default": false
@@ -4412,6 +4487,37 @@
         "falloff_radius": {
           "type": "number",
           "default": 1.0
+        },
+        "falloff_curve": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": {"type": ["number", "string"]},
+            "prefixItems": [
+              {"type": "number"},
+              {"type": "number"},
+              {"type": "string", "enum": ["AUTO", "AUTO_CLAMPED", "VECTOR"]}
+            ],
+            "minItems": 2,
+            "maxItems": 3
+          },
+          "minItems": 2,
+          "default": [[0.0, 0.0], [1.0, 1.0]]
+        },
+        "falloff_curve_settings": {
+          "type": "object",
+          "properties": {
+            "use_clip": {"type": "boolean", "default": true},
+            "clip_bounds": {
+              "type": "array",
+              "items": {"type": "number", "minimum": -100.0, "maximum": 100.0},
+              "minItems": 4,
+              "maxItems": 4,
+              "default": [0.0, 0.0, 1.0, 1.0]
+            },
+            "extend": {"enum": ["HORIZONTAL", "EXTRAPOLATED"], "default": "EXTRAPOLATED"}
+          },
+          "default": {"use_clip": true, "clip_bounds": [0.0, 0.0, 1.0, 1.0], "extend": "EXTRAPOLATED"}
         },
         "use_volume_preserve": {
           "type": "boolean",

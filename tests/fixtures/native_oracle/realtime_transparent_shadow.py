@@ -66,10 +66,8 @@ principled.inputs["Roughness"].default_value = 1.0
 principled.inputs["Specular IOR Level"].default_value = 0.0
 bpy.ops.mesh.primitive_plane_add(size=20.0, location=(0.0, SHIFT_Y, 0.0))
 bpy.context.object.data.materials.append(floor)
-# Smooth shading gives Potter corner normals, so it shades the floor per pixel. Flat faces are baked once per
-# subdivided triangle (`render/scene.rs` `subdivide_realtime_triangles`), which would decide each shadow per cell.
-# A flat plane has the same normals either way, so EEVEE's render is unchanged.
-bpy.ops.object.shade_smooth()
+# The floor stays flat, as Blender's primitive is: realtime Beauty shades every hit per pixel with the geometric normal,
+# so its shadows match EEVEE's per-fragment shadows on a flat plane.
 
 if occluder != "NONE":
     glass = bpy.data.materials.new("Occluder")

@@ -10,7 +10,7 @@ use crate::{
     cli::AssetsArgs,
     error::{ErrorCode, PotError, Result},
     hash,
-    model::{ImageSource, LibraryKind},
+    model::{ImageSource, LibraryKind, migrate::inline_resource_kind},
     response::SceneInfo,
     store::Project,
 };
@@ -25,6 +25,9 @@ pub fn run(args: AssetsArgs) -> Result<(Option<SceneInfo>, Value)> {
     let project = Project::open(args.scene)?;
     let mut assets = Vec::new();
     for (id, value) in &project.doc().resources {
+        if inline_resource_kind(value)?.is_some() {
+            continue;
+        }
         let object = value.as_object();
         let uri = string_field(object, &["uri", "path", "source"]);
         let expected = string_field(object, &["hash", "expected_hash"]);
@@ -44,7 +47,7 @@ pub fn run(args: AssetsArgs) -> Result<(Option<SceneInfo>, Value)> {
         }));
     }
     for (id, library) in &project.doc().libraries {
-        let (missing, changed, packed) = if let Some(resource_id) = &library.resource {
+        let resource = if let Some(resource_id) = &library.resource {
             let resource = project.doc().resources.get(resource_id).ok_or_else(|| {
                 PotError::with_details(
                     ErrorCode::SceneInvalid,
@@ -52,6 +55,13 @@ pub fn run(args: AssetsArgs) -> Result<(Option<SceneInfo>, Value)> {
                     json!({"library_id":id,"resource_id":resource_id}),
                 )
             })?;
+            inline_resource_kind(resource)?
+                .is_none()
+                .then_some(resource)
+        } else {
+            None
+        };
+        let (missing, changed, packed) = if let Some(resource) = resource {
             let packed =
                 bool_field(resource.as_object(), &["packed", "is_packed"]).unwrap_or(false);
             let status = if packed {
@@ -122,18 +132,20 @@ pub fn run(args: AssetsArgs) -> Result<(Option<SceneInfo>, Value)> {
         collect_blobs(&root, project.path(), category, args.check, &mut blobs)?;
     }
     let scene = project.info()?;
-    let resource_hashes = project
-        .doc()
-        .resources
-        .values()
-        .filter(|resource| {
-            resource
-                .get("uri")
-                .and_then(Value::as_str)
-                .is_some_and(|uri| uri.starts_with("assets/"))
-        })
-        .filter_map(|resource| resource.get("hash").and_then(Value::as_str))
-        .collect::<BTreeSet<_>>();
+    let mut resource_hashes = BTreeSet::new();
+    for resource in project.doc().resources.values() {
+        if inline_resource_kind(resource)?.is_some() {
+            continue;
+        }
+        if resource
+            .get("uri")
+            .and_then(Value::as_str)
+            .is_some_and(|uri| uri.starts_with("assets/"))
+            && let Some(digest) = resource.get("hash").and_then(Value::as_str)
+        {
+            resource_hashes.insert(digest);
+        }
+    }
     blobs.retain(|blob| {
         let uri = blob["uri"].as_str().unwrap_or_default();
         let hash = blob["hash"].as_str();

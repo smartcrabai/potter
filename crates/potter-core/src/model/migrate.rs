@@ -19,6 +19,22 @@ use crate::{
     store::HistoryRecord,
 };
 
+/// Returns the kind of an inline resource; non-inline binary resources return `None`.
+///
+/// # Errors
+///
+/// Returns `SCENE_INVALID` when an inline resource has no string `kind`.
+pub fn inline_resource_kind(value: &Value) -> Result<Option<&str>> {
+    if value.get("storage").and_then(Value::as_str) != Some("inline") {
+        return Ok(None);
+    }
+    value
+        .get("kind")
+        .and_then(Value::as_str)
+        .map(Some)
+        .ok_or_else(|| invalid("inline resource is missing its kind"))
+}
+
 /// Texture reference fields of a material.
 const MATERIAL_TEXTURES: [&str; 4] = [
     "base_color_texture",
@@ -42,13 +58,15 @@ pub struct ParsedScene {
     pub doc: SceneDoc,
     /// Diagnostics for legacy data the upgrade skipped or dropped.
     pub warnings: Vec<Value>,
-    /// Whether the original bytes used schema version 1.
+    /// Whether the upgrade changed bytes the store must keep: the original was schema version 1, or it held a
+    /// legacy Mesh Deform bind that the upgrade cleared.
     pub legacy: bool,
-    /// Canonical hash of the original schema-1 scene, before migration changes its schema version.
+    /// Canonical hash of the original scene, before the upgrade changed it. Set with `legacy`.
     pub legacy_hash: Option<String>,
 }
 
-/// Parses a scene document, upgrading it through every schema version to the current one.
+/// Parses a scene document, upgrading it through every schema version to the current one, then
+/// migrates its loaded-only legacy resource sentinels.
 pub fn parse_scene(bytes: &[u8], root: &Path) -> Result<ParsedScene> {
     parse_scene_inner(bytes, root, false)
 }
@@ -60,14 +78,17 @@ pub(crate) fn parse_scene_with_original_hash(bytes: &[u8], root: &Path) -> Resul
 
 fn parse_scene_inner(bytes: &[u8], root: &Path, retain_original_hash: bool) -> Result<ParsedScene> {
     let mut value = parse_value(bytes)?;
-    let legacy = value.get("schema_version").and_then(Value::as_u64) == Some(1);
+    // The upgrade clears a legacy Mesh Deform bind, so the original bytes are kept like a schema-1 scene's.
+    let legacy = value.get("schema_version").and_then(Value::as_u64) == Some(1)
+        || has_legacy_mesh_deform_bind(&value);
     let legacy_hash = if legacy && retain_original_hash {
         Some(crate::hash::sha256(&crate::hash::canonicalize(&value)?))
     } else {
         None
     };
     let warnings = upgrade_scene(&mut value, root)?;
-    let doc = serde_json::from_value(value).map_err(|error| json_error(&error))?;
+    let mut doc: SceneDoc = serde_json::from_value(value).map_err(|error| json_error(&error))?;
+    crate::geom::legacy_texture::migrate_legacy_volume_noise_sentinel(&mut doc)?;
     Ok(ParsedScene {
         doc,
         warnings,
@@ -91,7 +112,9 @@ pub(crate) fn parse_history_record(
         warnings.extend(retire_operation_seed(operations));
         warnings.extend(report_retired_brushes(operations));
     }
-    let record = serde_json::from_value(value).map_err(|error| json_error(&error))?;
+    let mut record: HistoryRecord =
+        serde_json::from_value(value).map_err(|error| json_error(&error))?;
+    crate::geom::legacy_texture::migrate_legacy_volume_noise_sentinel(&mut record.snapshot)?;
     Ok((record, warnings))
 }
 
@@ -179,10 +202,11 @@ fn json_error(error: &serde_json::Error) -> PotError {
     )
 }
 
-/// Upgrades a scene document in place through schema version 7. `root` is the project directory that holds the document's
-/// image blobs and linked sources, which the version 3 to 4 step reads.
+/// Upgrades a scene document in place through schema version 7, converting superseded modifier binds on
+/// the way. `root` is the project directory that holds the document's image blobs and linked sources,
+/// which the version 3 to 4 step reads.
 pub fn upgrade_scene(value: &mut Value, root: &Path) -> Result<Vec<Value>> {
-    let warnings = if value.get("schema_version").and_then(Value::as_u64) == Some(1) {
+    let mut warnings = if value.get("schema_version").and_then(Value::as_u64) == Some(1) {
         upgrade_v1(value)?
     } else {
         Vec::new()
@@ -199,6 +223,7 @@ pub fn upgrade_scene(value: &mut Value, root: &Path) -> Result<Vec<Value>> {
     if value.get("schema_version").and_then(Value::as_u64) == Some(5) {
         upgrade_v5(value);
     }
+    warnings.extend(upgrade_modifier_binds(value));
     if value.get("schema_version").and_then(Value::as_u64) == Some(6) {
         upgrade_v6(value);
     }
@@ -320,6 +345,200 @@ fn upgrade_v2(value: &mut Value) -> Result<()> {
     }
     value["schema_version"] = json!(3);
     Ok(())
+}
+
+/// Converts modifier binds stored in superseded layouts to their current formats, on every load, and returns a
+/// warning for each bind it clears. A Laplacian Deform bind of flat source positions becomes
+/// `blender_laplacian_bind_v1`. A Surface Deform bind of per-vertex polygon records becomes
+/// `blender_surface_bind_v1`, with the influences the legacy evaluator computed. A Mesh Deform bind in the
+/// `{weights, cage_mesh}` layout cannot be converted exactly: its bind-time transforms were never stored, and
+/// its weights are absolute cage positions where the current layout stores displacements. It is cleared, so the
+/// modifier needs a rebind. The stored file is not rewritten by the load, so the bytes of the document and of
+/// its history records still hold the legacy bind. Any other bind that cannot be converted exactly is left as
+/// stored, so evaluation reports it. Converted binds have the current layout, so they are not converted again.
+fn upgrade_modifier_binds(value: &mut Value) -> Vec<Value> {
+    let mut warnings = Vec::new();
+    let Some(nodes) = value.get_mut("nodes").and_then(Value::as_object_mut) else {
+        return warnings;
+    };
+    for (node_id, node) in nodes.iter_mut() {
+        let Some(modifiers) = node.get_mut("modifiers").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for modifier in modifiers {
+            warnings.extend(upgrade_modifier_bind(node_id, modifier));
+        }
+    }
+    warnings
+}
+
+/// Converts one modifier's bind, if it has a superseded layout (see [`upgrade_modifier_binds`]). Returns the
+/// warning when the bind is cleared.
+fn upgrade_modifier_bind(node_id: &str, modifier: &mut Value) -> Option<Value> {
+    let modifier_type = modifier
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    // Surface Deform's `falloff` default when the parameter is absent (param table).
+    let falloff = modifier
+        .get("params")
+        .and_then(|params| params.get("falloff"))
+        .map_or(Some(4.0), Value::as_f64);
+    let binding = modifier.get_mut("binding_data")?;
+    let legacy_mesh = modifier_type == "mesh_deform"
+        && binding.as_object().is_some_and(is_legacy_mesh_deform_bind);
+    if !legacy_mesh {
+        let converted = match (modifier_type.as_str(), &*binding) {
+            ("laplacian_deform", Value::Array(rows)) => laplacian_bind(rows),
+            ("surface_deform", Value::Array(records)) => surface_bind(records, falloff),
+            _ => None,
+        };
+        if let Some(converted) = converted {
+            *binding = converted;
+        }
+        return None;
+    }
+    let modifier_id = modifier
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    modifier.as_object_mut()?.remove("binding_data");
+    Some(json!({
+        "code": "modifier.mesh_deform.legacy_bind_cleared",
+        "node": node_id,
+        "modifier": modifier_id,
+        "message": format!(
+            "Mesh Deform modifier `{modifier_id}` on `{node_id}` has a bind in the superseded weights and cage_mesh layout, which cannot be converted exactly; the bind was cleared and rebind required"
+        ),
+    }))
+}
+
+/// A Mesh Deform bind of the pre-Blender layout `{weights, cage_mesh}`, which has no `format` tag.
+fn is_legacy_mesh_deform_bind(bind: &Map<String, Value>) -> bool {
+    !bind.contains_key("format") && bind.contains_key("weights") && bind.contains_key("cage_mesh")
+}
+
+/// Whether a scene document holds a Mesh Deform bind in the superseded `{weights, cage_mesh}` layout, which the
+/// upgrade clears.
+fn has_legacy_mesh_deform_bind(value: &Value) -> bool {
+    value
+        .get("nodes")
+        .and_then(Value::as_object)
+        .is_some_and(|nodes| {
+            nodes.values().any(|node| {
+                node.get("modifiers")
+                    .and_then(Value::as_array)
+                    .is_some_and(|modifiers| {
+                        modifiers.iter().any(|modifier| {
+                            modifier.get("type").and_then(Value::as_str) == Some("mesh_deform")
+                                && modifier
+                                    .get("binding_data")
+                                    .and_then(Value::as_object)
+                                    .is_some_and(is_legacy_mesh_deform_bind)
+                        })
+                    })
+            })
+        })
+}
+
+/// Legacy Laplacian Deform bind: one `[x, y, z]` array per source vertex. Every coordinate is kept as stored.
+fn laplacian_bind(rows: &[Value]) -> Option<Value> {
+    let mut coordinates = Vec::with_capacity(rows.len().checked_mul(3)?);
+    for row in rows {
+        let values = row.as_array().filter(|values| values.len() == 3)?;
+        for value in values {
+            if !value.as_f64().is_some_and(f64::is_finite) {
+                return None;
+            }
+            coordinates.push(value.clone());
+        }
+    }
+    Some(json!({
+        "format": crate::geom::modifiers::deform::LAPLACIAN_BIND_FORMAT,
+        "type": "laplacian_deform",
+        "verts_num": rows.len(),
+        "vertex_coordinates": coordinates,
+    }))
+}
+
+/// Legacy Surface Deform bind: one `{"polygons": [...]}` record per source vertex, where each polygon holds its
+/// target `vertices`, mean-value `weights`, `normal_distance`, and `distance`. The legacy evaluator computed
+/// each polygon's influence from `distance` and `falloff` (normalized inverse power, or exact-hit selection).
+/// Blender bakes influences at bind time, so they are computed here with the same formula. The distances are
+/// kept beside them. The legacy evaluator applied no target transform, so no `mat` is written.
+fn surface_bind(records: &[Value], falloff: Option<f64>) -> Option<Value> {
+    let falloff = falloff.filter(|falloff| (2.0..=16.0).contains(falloff))?;
+    let mut bind_verts = Vec::with_capacity(records.len());
+    for (vertex_idx, record) in records.iter().enumerate() {
+        let polygons = record.get("polygons").and_then(Value::as_array)?;
+        let mut distances = Vec::with_capacity(polygons.len());
+        for polygon in polygons {
+            let distance = polygon
+                .get("distance")
+                .and_then(Value::as_f64)
+                .filter(|distance| distance.is_finite() && *distance >= 0.0)?;
+            distances.push(distance);
+        }
+        let exact = distances
+            .iter()
+            .filter(|distance| **distance <= f64::EPSILON)
+            .count();
+        let raw: Vec<f64> = distances
+            .iter()
+            .map(|&distance| {
+                if exact > 0 {
+                    if distance <= f64::EPSILON { 1.0 } else { 0.0 }
+                } else {
+                    distance.max(1.0e-12).powf(-falloff)
+                }
+            })
+            .collect();
+        let total: f64 = raw.iter().sum();
+        if !total.is_finite() || total <= f64::EPSILON {
+            return None;
+        }
+        let mut binds = Vec::with_capacity(polygons.len());
+        for ((polygon, distance), raw_weight) in polygons.iter().zip(&distances).zip(&raw) {
+            let indices = polygon
+                .get("vertices")
+                .and_then(Value::as_array)
+                .filter(|indices| indices.len() >= 3)?;
+            let weights = polygon
+                .get("weights")
+                .and_then(Value::as_array)
+                .filter(|weights| weights.len() == indices.len())?;
+            if !indices.iter().all(|index| index.as_u64().is_some())
+                || !weights
+                    .iter()
+                    .all(|weight| weight.as_f64().is_some_and(f64::is_finite))
+            {
+                return None;
+            }
+            let normal_distance = polygon
+                .get("normal_distance")
+                .and_then(Value::as_f64)
+                .filter(|normal_distance| normal_distance.is_finite())?;
+            binds.push(json!({
+                "influence": raw_weight / total,
+                "mode": 1,
+                "verts_num": indices.len(),
+                "vert_inds": indices,
+                "vert_weights": weights,
+                "normal_dist": normal_distance,
+                "distance": distance,
+            }));
+        }
+        bind_verts.push(json!({"vertex_idx": vertex_idx, "binds": binds}));
+    }
+    Some(json!({
+        "format": "blender_surface_bind_v1",
+        "type": "surface_deform",
+        "mesh_verts_num": records.len(),
+        "bind_verts_num": records.len(),
+        "bind_verts": bind_verts,
+    }))
 }
 
 /// Upgrades a schema-version-4 scene document to version 5. The released view curve, an array of
@@ -1299,6 +1518,149 @@ mod tests {
     /// A project root with no assets, for documents that name no image blobs.
     fn no_assets() -> &'static Path {
         Path::new("no-assets")
+    }
+
+    #[test]
+    fn inline_resource_kind_classifies_inline_records_without_treating_binary_as_inline() {
+        assert_eq!(
+            inline_resource_kind(&json!({"storage":"inline","kind":"legacy_texture"}))
+                .expect("inline kind"),
+            Some("legacy_texture")
+        );
+        assert_eq!(
+            inline_resource_kind(&json!({"kind":"alembic","uri":"cache.abc"}))
+                .expect("binary record"),
+            None
+        );
+        assert_eq!(
+            inline_resource_kind(&json!({"storage":"linked","kind":"alembic"}))
+                .expect("linked record"),
+            None
+        );
+        let Err(error) = inline_resource_kind(&json!({"storage":"inline"})) else {
+            panic!("inline record without a kind must be rejected");
+        };
+        assert_eq!(error.code, ErrorCode::SceneInvalid);
+    }
+
+    fn legacy_volume_noise_scene() -> SceneDoc {
+        let mut scene = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        let node: crate::model::Node = serde_json::from_value(json!({
+            "name": "Volume",
+            "kind": "empty",
+            "modifiers": [
+                {"id":"volume_a","type":"volume_displace","name":"Volume A","enabled":true,"params":{"texture":"noise"}},
+                {"id":"volume_b","type":"volume_displace","name":"Volume B","enabled":true,"params":{"texture":"noise"}}
+            ]
+        }))
+        .expect("volume node");
+        scene
+            .nodes
+            .insert(crate::model::Id::new("volume").expect("node ID"), node);
+        scene
+    }
+
+    fn assert_native_value_noise(scene: &SceneDoc) {
+        let node = &scene.nodes[&crate::model::Id::new("volume").expect("node ID")];
+        let texture = node.modifiers[0].params["texture"]
+            .as_str()
+            .expect("migrated texture ID");
+        assert_eq!(
+            node.modifiers[1].params["texture"],
+            json!(texture),
+            "all legacy volume modifiers share one migrated resource"
+        );
+        assert_eq!(
+            scene.resources[&crate::model::Id::new(texture).expect("resource ID")],
+            json!({
+                "storage":"inline",
+                "kind":"legacy_texture",
+                "texture_type":"NATIVE_VALUE_NOISE",
+                "settings":{}
+            })
+        );
+    }
+
+    #[test]
+    fn parse_scene_migrates_the_legacy_volume_noise_sentinel() {
+        let bytes = serde_json::to_vec(&legacy_volume_noise_scene()).expect("scene JSON");
+        let scene = parse_scene(&bytes, no_assets()).expect("scene migration");
+        assert_native_value_noise(&scene.doc);
+        assert_eq!(scene.doc.resources.len(), 1);
+    }
+
+    #[test]
+    fn parse_history_record_migrates_after_reading_its_raw_snapshot() {
+        let record = HistoryRecord {
+            record_version: 1,
+            parent: None,
+            kind: "commit".to_owned(),
+            revision: 0,
+            scene_hash: "sha256:raw-scene".to_owned(),
+            operations: json!([]),
+            changes: json!({}),
+            target: None,
+            snapshot: legacy_volume_noise_scene(),
+        };
+        let bytes = serde_json::to_vec(&record).expect("history JSON");
+        let (record, warnings) =
+            parse_history_record(&bytes, no_assets()).expect("history migration");
+        assert_eq!(warnings, Vec::<Value>::new());
+        assert_native_value_noise(&record.snapshot);
+        assert_eq!(record.snapshot.resources.len(), 1);
+    }
+
+    #[test]
+    fn legacy_volume_noise_sentinel_respects_owned_ids() {
+        let noise_id = crate::model::Id::new("noise").expect("noise ID");
+        let mut resource_scene = legacy_volume_noise_scene();
+        let record = json!({
+            "storage":"inline",
+            "kind":"legacy_texture",
+            "texture_type":"NATIVE_VALUE_NOISE",
+            "settings":{}
+        });
+        resource_scene
+            .resources
+            .insert(noise_id.clone(), record.clone());
+        assert!(
+            !crate::geom::legacy_texture::migrate_legacy_volume_noise_sentinel(&mut resource_scene)
+                .expect("resource collision")
+        );
+        assert_eq!(
+            resource_scene.nodes[&crate::model::Id::new("volume").expect("node ID")].modifiers[0]
+                .params["texture"],
+            json!("noise")
+        );
+        assert_eq!(resource_scene.resources[&noise_id], record);
+
+        let mut image_scene = legacy_volume_noise_scene();
+        image_scene.images.insert(
+            noise_id,
+            crate::model::Image {
+                tiled: false,
+                name: "noise".to_owned(),
+                source: crate::model::ImageSource::Generated,
+                colorspace: crate::model::ImageColorspace::Srgb,
+                width: 1,
+                height: 1,
+                tiles: Vec::new(),
+                blob: None,
+                source_path: None,
+                source_hash: None,
+                alpha_mode: crate::model::ImageAlphaMode::Straight,
+            },
+        );
+        assert!(
+            !crate::geom::legacy_texture::migrate_legacy_volume_noise_sentinel(&mut image_scene)
+                .expect("image collision")
+        );
+        assert_eq!(
+            image_scene.nodes[&crate::model::Id::new("volume").expect("node ID")].modifiers[0]
+                .params["texture"],
+            json!("noise")
+        );
+        assert!(image_scene.resources.is_empty());
     }
 
     #[test]

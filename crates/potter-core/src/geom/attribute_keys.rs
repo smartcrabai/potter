@@ -22,6 +22,7 @@ const INTERNAL_KEYS: &[&str] = &[
     "alembic_velocity",
     "blender_attributes",
     "blender_metadata",
+    "user:__potter_origindex",
     "blender_skin_vertices",
     "color_layers",
     "crease_edge",
@@ -52,10 +53,10 @@ pub(crate) fn storage_key(name: &str) -> Cow<'_, str> {
 
 /// User-facing name stored under `key`, or `None` when `key` is one of Potter's own stores.
 pub(crate) fn user_name(key: &str) -> Option<&str> {
-    if let Some(name) = key.strip_prefix(ESCAPE_PREFIX) {
-        Some(name)
-    } else if is_internal_key(key) {
+    if is_internal_key(key) {
         None
+    } else if let Some(name) = key.strip_prefix(ESCAPE_PREFIX) {
+        Some(name)
     } else {
         Some(key)
     }
@@ -63,7 +64,7 @@ pub(crate) fn user_name(key: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ESCAPE_PREFIX, storage_key, user_name};
+    use super::{ESCAPE_PREFIX, is_internal_key, storage_key, user_name};
 
     #[test]
     fn reserved_and_escaped_names_round_trip_and_stay_distinct() {
@@ -101,5 +102,21 @@ mod tests {
         assert_eq!(user_name("alembic_time_samples"), None);
         assert_eq!(user_name("user:color_layers"), Some("color_layers"));
         assert_eq!(user_name("Col"), Some("Col"));
+    }
+
+    #[test]
+    fn origindex_carrier_does_not_shadow_legacy_or_escaped_user_names() {
+        assert!(is_internal_key("user:__potter_origindex"));
+        assert_eq!(user_name("user:__potter_origindex"), None);
+        assert_eq!(storage_key("blender_origindex"), "blender_origindex");
+        assert_eq!(user_name("blender_origindex"), Some("blender_origindex"));
+        assert_eq!(
+            storage_key("user:__potter_origindex"),
+            "user:user:__potter_origindex"
+        );
+        assert_eq!(
+            user_name("user:user:__potter_origindex"),
+            Some("user:__potter_origindex")
+        );
     }
 }
