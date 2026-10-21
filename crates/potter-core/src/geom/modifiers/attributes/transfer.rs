@@ -1910,7 +1910,7 @@ fn build_source_face_graph(
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    let triangles = crate::geom::triangulate::triangulate_mesh(
+    let triangles: Vec<SourceTriangle> = crate::geom::triangulate::triangulate_mesh(
         &face_positions,
         crate::geom::triangulate::QuadMethod::Fixed,
         crate::geom::triangulate::NgonMethod::Clip,
