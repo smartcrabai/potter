@@ -49,6 +49,7 @@ pub fn is_known_node_type(node_type: &str) -> bool {
             | "ShaderNodeAddShader"
             | "ShaderNodeMixShader"
             | "ShaderNodeBsdfPrincipled"
+            | "ShaderNodeBsdfDiffuse"
             | "ShaderNodeVolumePrincipled"
             | "ShaderNodeVolumeAbsorption"
             | "ShaderNodeVolumeScatter"
@@ -286,6 +287,14 @@ pub(super) fn node_sockets(group: &NodeGroup, node_id: &Id) -> Option<SocketPair
         "ShaderNodeEmission" => (
             sockets(&[("Color", "color"), ("Strength", "float")]),
             sockets(&[("Emission", "shader")]),
+        ),
+        "ShaderNodeBsdfDiffuse" => (
+            sockets(&[
+                ("Color", "color"),
+                ("Roughness", "float"),
+                ("Normal", "vector"),
+            ]),
+            sockets(&[("BSDF", "shader")]),
         ),
         "ShaderNodeOutputWorld" | "OutputWorld" => (sockets(&[("Surface", "shader")]), Vec::new()),
         "ShaderNodeOutputMaterial" | "OutputMaterial" => (
