@@ -10,7 +10,7 @@ use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI};
 use glam::DVec3;
 
 use super::bvh::{Bvh, BvhHit};
-use super::principled_bsdf::{make_orthonormals, sample_visible_normal};
+use super::principled_bsdf::{concentric_disk, make_orthonormals, sample_visible_normal};
 use super::raster::Triangle;
 use super::subsurface::{SubsurfaceExit, raw_radius};
 use crate::shader::BsdfParams;
@@ -392,21 +392,6 @@ pub(super) fn entry_direction(
     let dnp = arg.sqrt().max(1e-7);
     let nk = neta * cos_hi - dnp;
     Some(-(view * neta) + half * nk)
-}
-
-/// Cycles' `sample_uniform_disk`: the concentric mapping of `(u, v)` onto the unit disk.
-fn concentric_disk(u: f64, v: f64) -> (f64, f64) {
-    let a = 2.0 * u - 1.0;
-    let b = 2.0 * v - 1.0;
-    if a == 0.0 && b == 0.0 {
-        return (0.0, 0.0);
-    }
-    let (radius, phi) = if a * a > b * b {
-        (a, FRAC_PI_4 * (b / a))
-    } else {
-        (b, FRAC_PI_2 - FRAC_PI_4 * (a / b))
-    };
-    (radius * phi.cos(), radius * phi.sin())
 }
 
 /// A cosine-weighted direction about `normal` for the uniform pair `(u, v)` (`sample_cos_hemisphere`).

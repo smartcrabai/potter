@@ -185,7 +185,6 @@ fn subsurface_share(params: &BsdfParams) -> DVec3 {
     if !subsurface_evaluated(params) {
         return DVec3::ONE;
     }
-    let sss = params.subsurface_weight.clamp(0.0, 1.0);
     // Every method keeps its diffuse on a channel below `BSSRDF_MIN_RADIUS` (the raw radius, `bssrdf_setup`).
     let mask = channel_mask(raw_radius(params));
     DVec3::from_array(std::array::from_fn(|channel| {
@@ -592,7 +591,7 @@ impl SheenLobe {
 }
 
 /// Cycles' `sample_uniform_disk`: the concentric mapping of `[0, 1)²` onto the unit disk.
-fn concentric_disk(u: f64, v: f64) -> (f64, f64) {
+pub(super) fn concentric_disk(u: f64, v: f64) -> (f64, f64) {
     let a = 2.0 * u - 1.0;
     let b = 2.0 * v - 1.0;
     if a * a + b * b <= 0.0 {
