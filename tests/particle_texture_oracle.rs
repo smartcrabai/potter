@@ -10,9 +10,11 @@
 //! Potter imports the scene and bakes the same frames. Each case's particles must match Blender's
 //! birth frame, size, and lifetime to `VALUE_TOLERANCE`: Blender stores float32 values below 10, so
 //! the rounding is below `1e-6`, and the bound leaves room for one float32 step. A density case must
-//! keep the same number of particles that Blender keeps.
+//! keep the same number of particles that Blender keeps. Each particle's birth position must match
+//! Blender's `location`, which is its birth point because physics is off; face and volume emitters
+//! take their birth points from Blender's distribution (`particle_distribute.cc`).
 
-use std::{error::Error, fs, path::Path, process::Command};
+use std::{cmp::Ordering, error::Error, fs, path::Path, process::Command};
 
 #[path = "common/blender_file.rs"]
 mod blender_file;
@@ -81,6 +83,59 @@ fn blender_samples(case: &Value) -> Vec<Sample> {
             lifetime: particle["lifetime"].as_f64().unwrap(),
         })
         .collect()
+}
+
+/// The three numbers of a JSON array.
+fn vector3(value: &Value) -> [f64; 3] {
+    let values = value.as_array().unwrap();
+    [
+        values[0].as_f64().unwrap(),
+        values[1].as_f64().unwrap(),
+        values[2].as_f64().unwrap(),
+    ]
+}
+
+/// Lexicographic order of two points.
+fn compare_points(left: &[f64; 3], right: &[f64; 3]) -> Ordering {
+    left.iter()
+        .zip(right)
+        .map(|(left, right)| left.total_cmp(right))
+        .find(|order| *order != Ordering::Equal)
+        .unwrap_or(Ordering::Equal)
+}
+
+/// Birth positions as sorted sets. Both sides list particles in index order; sorting keeps the
+/// check independent of how either side orders particles that share a birth.
+fn assert_positions_match(case: &str, potter: &[Value], blender: &Value) {
+    let mut potter_points: Vec<[f64; 3]> = potter
+        .iter()
+        .map(|state| vector3(&state["birth_position"]))
+        .collect();
+    let mut blender_points: Vec<[f64; 3]> = blender
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|particle| vector3(&particle["location"]))
+        .collect();
+    potter_points.sort_by(compare_points);
+    blender_points.sort_by(compare_points);
+    assert_eq!(
+        potter_points.len(),
+        blender_points.len(),
+        "{case}: particle count differs"
+    );
+    for (index, (potter_point, blender_point)) in
+        potter_points.iter().zip(&blender_points).enumerate()
+    {
+        for (axis, (potter_value, blender_value)) in
+            potter_point.iter().zip(blender_point).enumerate()
+        {
+            assert!(
+                (potter_value - blender_value).abs() <= VALUE_TOLERANCE,
+                "{case} particle {index} birth position axis {axis}: potter={potter_value}, blender={blender_value}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -194,6 +249,7 @@ fn particle_texture_influences_and_count_schedule_match_blender() -> Result<(), 
             .collect();
         let mut blender = blender_samples(case);
         assert_samples_match(name, &mut potter, &mut blender);
+        assert_positions_match(name, states, &case["particles"]);
     }
     Ok(())
 }

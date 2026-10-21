@@ -81,16 +81,93 @@ impl BlenderRng {
         self.step();
         (self.state >> 17) as i32
     }
+
+    /// `BLI_rng_get_float`: `float(int32) / 2^31`, never 1.0.
+    pub(crate) fn get_float(&mut self) -> f32 {
+        self.get_int32() as f32 / 2_147_483_648.0_f32
+    }
+
+    /// `BLI_rng_get_double`: `double(int32) / 2^31`, never 1.0.
+    pub(crate) fn get_double(&mut self) -> f64 {
+        f64::from(self.get_int32()) / 2_147_483_648.0
+    }
+
+    /// `BLI_rng_skip`: advances the generator by `count` draws, discarding them.
+    pub(crate) fn skip(&mut self, count: usize) {
+        for _ in 0..count {
+            self.step();
+        }
+    }
+}
+
+/// `BLI_hash_frand`: a float hash of one integer.
+pub(crate) fn hash_frand(seed: u32) -> f32 {
+    BlenderRng::seed_random(seed).get_float()
+}
+
+/// Number of entries in `BKE_particle_init_rng`'s table (`PSYS_FRAND_COUNT`).
+const PSYS_FRAND_COUNT: usize = 1024;
+
+/// `PSYS_FRAND_BASE`, `PSYS_FRAND_SEED_OFFSET` and `PSYS_FRAND_SEED_MULTIPLIER`, drawn from
+/// `BLI_rng_new_srandom(5831)` in `BKE_particle_init_rng` (`particle.cc`).
+struct PsysFrandTable {
+    base: [f32; PSYS_FRAND_COUNT],
+    offset: [u32; PSYS_FRAND_COUNT],
+    multiplier: [u32; PSYS_FRAND_COUNT],
+}
+
+static PSYS_FRAND_TABLE: std::sync::LazyLock<PsysFrandTable> = std::sync::LazyLock::new(|| {
+    let mut rng = BlenderRng::seed_random(5831);
+    let mut table = PsysFrandTable {
+        base: [0.0; PSYS_FRAND_COUNT],
+        offset: [0; PSYS_FRAND_COUNT],
+        multiplier: [0; PSYS_FRAND_COUNT],
+    };
+    for ((base, offset), multiplier) in table
+        .base
+        .iter_mut()
+        .zip(table.offset.iter_mut())
+        .zip(table.multiplier.iter_mut())
+    {
+        *base = rng.get_float();
+        *offset = rng.get_uint32();
+        *multiplier = rng.get_uint32();
+    }
+    table
+});
+
+/// `psys_frand` (`BKE_particle.h`): a float keyed by `seed`, for a particle system whose
+/// `ParticleSystem.seed` is `system_seed`.
+pub(crate) fn psys_frand(system_seed: u32, seed: u32) -> f32 {
+    let table: &PsysFrandTable = &PSYS_FRAND_TABLE;
+    let slot = system_seed as usize % PSYS_FRAND_COUNT;
+    let index = table.offset[slot].wrapping_add(seed.wrapping_mul(table.multiplier[slot]));
+    table.base[index as usize % PSYS_FRAND_COUNT]
 }
 
 #[cfg(test)]
 mod tests {
-    use super::BlenderRng;
+    use super::{BlenderRng, hash_frand, psys_frand};
 
     #[test]
     fn direct_seed_matches_blender_rng_sequence() {
         let mut rng = BlenderRng::seed(1);
         assert_eq!(rng.get_uint32(), 89_400_484);
         assert_eq!(rng.get_int32(), 976_015_093);
+    }
+
+    #[test]
+    fn get_float_divides_int32_by_two_to_the_31() {
+        let mut rng = BlenderRng::seed(1);
+        assert_eq!(rng.get_float(), 0.041_630_343);
+        assert_eq!(rng.get_float(), 0.454_492_45);
+    }
+
+    #[test]
+    fn psys_frand_matches_blender_particle_instance_oracle() {
+        assert_eq!(psys_frand(7, 3578), 0.226_094_66);
+        assert_eq!(psys_frand(7, 3579), 0.494_628_64);
+        assert_eq!(psys_frand(7, 77374), 0.802_313_7);
+        assert!((0.0..1.0).contains(&hash_frand(77091)));
     }
 }

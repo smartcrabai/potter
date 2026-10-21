@@ -1,4 +1,4 @@
-"""Blender 5.2.2 oracle for particle emission, texture influences, and explode with density.
+"""Blender 5.2.2 oracle for particle emission, texture influences, explode, and emitter placement.
 
 Usage (from the repo root):
 
@@ -11,6 +11,8 @@ Writes into <out_dir>:
 
 Particle cases use one emitter vertex, so every particle is born at the same point. Explode cases
 use a cube whose particles are emitted from its vertices through Blender's vertex distribution.
+Face and volume cases emit from mesh faces with the jittered, random, and Hammersley distributions,
+and record each particle's birth `location`, which is its birth point because physics is off.
 Density removes non-existing particles from Blender's particle list (`free_unexisting_particles`),
 so the existing count is the length of that list.
 """
@@ -61,7 +63,8 @@ def point_object(name, location, vertex=(0.0, 0.0, 0.0)):
     return obj
 
 
-def add_emitter(obj, count, frame_start, frame_end, lifetime, particle_size):
+def add_emitter(obj, count, frame_start, frame_end, lifetime, particle_size, emit_from="VERT",
+                distribution="JIT", even=True, emit_random=True, userjit=0):
     bpy.context.view_layer.objects.active = obj
     obj.select_set(True)
     bpy.ops.object.particle_system_add()
@@ -73,7 +76,11 @@ def add_emitter(obj, count, frame_start, frame_end, lifetime, particle_size):
     settings.frame_end = frame_end
     settings.lifetime = lifetime
     settings.lifetime_random = 0.0
-    settings.emit_from = "VERT"
+    settings.emit_from = emit_from
+    settings.distribution = distribution
+    settings.use_even_distribution = even
+    settings.use_emit_random = emit_random
+    settings.userjit = userjit
     settings.physics_type = "NO"
     settings.normal_factor = 0.0
     settings.particle_size = particle_size
@@ -106,7 +113,7 @@ def particle_values(obj):
     particles = obj.evaluated_get(bpy.context.evaluated_depsgraph_get()).particle_systems[0].particles
     return [
         {"birth_frame": float(pa.birth_time), "size": float(pa.size),
-         "lifetime": float(pa.lifetime)}
+         "lifetime": float(pa.lifetime), "location": [float(c) for c in pa.location]}
         for pa in particles
     ]
 
@@ -196,6 +203,51 @@ for name, with_density in (("explode_plain", False), ("explode_density", True)):
     obj.modifiers.new("Explode", "EXPLODE")
     # Read at frame 1, where the particles are born (birth 1), so Potter's inspect of the scene matches.
     case(name, obj, 1, kind="explode")
+
+# Face and volume emitters sit at the origin with identity transforms. Each case is read at frame 2,
+# after the one-frame emission at frame 1, so every particle is alive and its location is its birth.
+def emitter_object(name, vertices, faces, smooth=False):
+    mesh = bpy.data.meshes.new(name + "_mesh")
+    mesh.from_pydata(vertices, [], faces)
+    if smooth:
+        for poly in mesh.polygons:
+            poly.use_smooth = True
+    obj = bpy.data.objects.new(name, mesh)
+    scene.collection.objects.link(obj)
+    return obj
+
+
+SQUARE_VERTICES = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)]
+# A triangle of area 1 and a quad of area 4, so area weights decide which element each particle takes.
+MIXED_VERTICES = [(0.0, 0.0, 0.0), (2.0, 0.0, 0.0), (0.0, 1.0, 0.0), (4.0, 0.0, 0.0),
+                  (4.0, 2.0, 0.0), (2.0, 2.0, 0.0)]
+MIXED_FACES = [(0, 1, 2), (1, 3, 4, 5)]
+
+# (name, vertices, faces, count, emit_from, options): options set the distribution fields.
+EMITTER_CASES = [
+    ("face_quad_jit", SQUARE_VERTICES, [(0, 1, 2, 3)], 8, "FACE", {}),
+    ("face_quad_rand", SQUARE_VERTICES, [(0, 1, 2, 3)], 8, "FACE", {"distribution": "RAND"}),
+    ("face_quad_hammersley", SQUARE_VERTICES, [(0, 1, 2, 3)], 30, "FACE", {"userjit": 30}),
+    ("face_quad_userjit_norandom", SQUARE_VERTICES, [(0, 1, 2, 3)], 12, "FACE",
+     {"userjit": 5, "emit_random": False}),
+    ("face_mixed_jit", MIXED_VERTICES, MIXED_FACES, 20, "FACE", {}),
+    ("face_mixed_rand_uneven", MIXED_VERTICES, MIXED_FACES, 13, "FACE",
+     {"distribution": "RAND", "even": False}),
+    ("face_mixed_norandom", MIXED_VERTICES, MIXED_FACES, 13, "FACE", {"emit_random": False}),
+    ("face_cube_jit", CUBE_VERTICES, CUBE_FACES, 60, "FACE", {}),
+    ("face_cube_smooth_rand", CUBE_VERTICES, CUBE_FACES, 25, "FACE",
+     {"distribution": "RAND", "smooth": True}),
+    ("volume_cube_jit", CUBE_VERTICES, CUBE_FACES, 40, "VOLUME", {}),
+    ("volume_cube_rand", CUBE_VERTICES, CUBE_FACES, 40, "VOLUME", {"distribution": "RAND"}),
+    ("volume_cube_smooth", CUBE_VERTICES, CUBE_FACES, 40, "VOLUME", {"smooth": True}),
+]
+for name, vertices, faces, count, emit_from, options in EMITTER_CASES:
+    obj = emitter_object(name, vertices, faces, smooth=options.get("smooth", False))
+    add_emitter(obj, count, 1, 1, 500.0, 1.0, emit_from=emit_from,
+                distribution=options.get("distribution", "JIT"),
+                even=options.get("even", True), emit_random=options.get("emit_random", True),
+                userjit=options.get("userjit", 0))
+    case(name, obj, 2)
 
 frames = sorted({frame for frame, _, _, _, _ in reads})
 cases = {}

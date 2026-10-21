@@ -629,7 +629,8 @@ fn simulate_with_lifecycle(
         .last()
         .map_or(0.0, |triangle| triangle.cumulative_area);
     let mut texture_rng = BlenderRng::seed_random(system_seed);
-    // Blender's `distribute_particles`: particle `p` is emitted from vertex `vertex_elements[p]`.
+    // Blender's `distribute_particles`: particle `p` is emitted from vertex `vertex_elements[p]`, or
+    // from its face or volume sample `face_samples[p]`.
     let use_emit_random = settings
         .get("use_emit_random")
         .and_then(Value::as_bool)
@@ -643,6 +644,11 @@ fn simulate_with_lifecycle(
         )
     } else {
         Vec::new()
+    };
+    let face_samples = if from_vertex {
+        Vec::new()
+    } else {
+        face_emitter_samples(mesh, settings, count, system_seed, from_volume)?
     };
     // Index of the next particle that exists; Blender renumbers particles after removing the others.
     let mut survivors: u32 = 0;
@@ -662,26 +668,23 @@ fn simulate_with_lifecycle(
         // Path keys give the birth point; without them Blender's emitter sample does.
         let sampled = if path.is_empty() {
             let mut random = Random::new(seed ^ event.wrapping_mul(0xd6e8_feb8_6659_fd93));
-            let (local_position, local_normal) = if from_volume {
-                (
-                    sample_volume_position(mesh, &triangles, &mut random)?,
-                    DVec3::Z,
-                )
-            } else if from_vertex || triangles.is_empty() || total_area <= 0.0 {
-                let index = if from_vertex {
-                    let particle = usize::try_from(event)
-                        .map_err(|_| limit("particle index exceeds supported range"))?;
-                    vertex_elements[particle]
-                } else {
-                    let index = (random.unit() * mesh.vertices.len() as f64) as usize;
-                    index.min(mesh.vertices.len() - 1)
-                };
+            let (local_position, local_normal) = if from_vertex {
+                let particle = usize::try_from(event)
+                    .map_err(|_| limit("particle index exceeds supported range"))?;
+                let index = vertex_elements[particle];
                 (
                     mesh.vertices[index].co,
                     vertex_normals[index].normalize_or_zero(),
                 )
             } else {
-                sample_triangle(&triangles, total_area, &mut random)
+                // Blender emits nothing when no element has weight, so a missing sample skips the particle.
+                let Some(sample) = usize::try_from(event)
+                    .ok()
+                    .and_then(|particle| face_samples.get(particle))
+                else {
+                    continue;
+                };
+                (sample.position, sample.normal)
             };
             let normal = normal_transform
                 .transform_vector3(local_normal)
@@ -1177,66 +1180,76 @@ fn prepare_geometry(mesh: &Mesh) -> Result<(Vec<Triangle>, Vec<DVec3>)> {
     Ok((triangles, vertex_normals))
 }
 
-fn sample_triangle(triangles: &[Triangle], total_area: f64, random: &mut Random) -> (DVec3, DVec3) {
-    let sample = random.unit() * total_area;
-    let index = triangles.partition_point(|triangle| triangle.cumulative_area < sample);
-    let triangle = triangles[index.min(triangles.len() - 1)];
-    let first = random.unit().sqrt();
-    let second = random.unit();
-    let weights = [1.0 - first, first * (1.0 - second), first * second];
-    let position = triangle.points[0] * weights[0]
-        + triangle.points[1] * weights[1]
-        + triangle.points[2] * weights[2];
-    (position, triangle.normal)
-}
-
-fn sample_volume_position(
+/// Blender's `distribute_particles` for `PART_FROM_FACE` and `PART_FROM_VOLUME`: the birth sample of
+/// each of the `count` particles, from the emitter's distribution settings.
+fn face_emitter_samples(
     mesh: &Mesh,
-    triangles: &[Triangle],
-    random: &mut Random,
-) -> Result<DVec3> {
-    let bounds = mesh
-        .bounds()
-        .ok_or_else(|| invalid("volume emission requires bounded mesh geometry"))?;
-    let direction = DVec3::new(1.0, 0.371_390_676, 0.219_876_543).normalize();
-    for _ in 0..128 {
-        let point = bounds.min
-            + (bounds.max - bounds.min) * DVec3::new(random.unit(), random.unit(), random.unit());
-        let intersections = triangles
-            .iter()
-            .filter(|triangle| ray_intersects_triangle(point, direction, triangle.points))
-            .count();
-        if intersections % 2 == 1 {
-            return Ok(point);
+    settings: &Value,
+    count: f64,
+    system_seed: u32,
+    volume: bool,
+) -> Result<Vec<particle_distribution::FaceSample>> {
+    if count > MAX_PARTICLES as f64 {
+        return Err(limit(
+            "particle emission count exceeds the one-million particle limit",
+        ));
+    }
+    let jitter = match settings
+        .get("distribution")
+        .and_then(Value::as_str)
+        .unwrap_or("JIT")
+    {
+        "JIT" => true,
+        "RAND" => false,
+        "GRID" => {
+            return Err(unsupported(
+                "physics.particle_emitter.distribution_grid",
+                "Blender's grid distribution is not implemented; use JIT or RAND",
+            ));
         }
+        _ => return Err(invalid("particle distribution must be JIT, RAND, or GRID")),
+    };
+    let user_jitter = setting_alias_number(settings, &["userjit"], 0.0)?;
+    if user_jitter.fract() != 0.0 || !(0.0..=1000.0).contains(&user_jitter) {
+        return Err(invalid(
+            "particle jitter count must be an integer from 0 to 1000",
+        ));
     }
-    Err(PotError::with_details(
-        ErrorCode::UnsupportedFeature,
-        "particle volume emission requires a closed mesh with a sampleable interior",
-        json!({"feature_id":"physics.particle_emitter.emit_from_volume"}),
+    let jitter_factor = setting_alias_number(settings, &["jitter_factor"], 1.0)?;
+    if !(0.0..=2.0).contains(&jitter_factor) {
+        return Err(invalid("particle jitter factor must be from 0 to 2"));
+    }
+    let emitter = particle_distribution::FaceEmitter::new(mesh)?;
+    let count = count as usize;
+    if volume
+        && count
+            .checked_mul(emitter.element_count())
+            .is_none_or(|work| work > MAX_SIMULATION_WORK)
+    {
+        return Err(limit(
+            "particle volume emission exceeds the 50-million work limit",
+        ));
+    }
+    let distribution = particle_distribution::FaceSettings {
+        volume,
+        jitter,
+        even: settings
+            .get("use_even_distribution")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        random: settings
+            .get("use_emit_random")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        jitter_factor: jitter_factor as f32,
+        user_jitter: user_jitter as usize,
+        seed: system_seed,
+        count,
+    };
+    Ok(particle_distribution::distribute_faces(
+        &emitter,
+        distribution,
     ))
-}
-
-fn ray_intersects_triangle(origin: DVec3, direction: DVec3, triangle: [DVec3; 3]) -> bool {
-    let edge_a = triangle[1] - triangle[0];
-    let edge_b = triangle[2] - triangle[0];
-    let cross = direction.cross(edge_b);
-    let determinant = edge_a.dot(cross);
-    if determinant.abs() <= 1.0e-12 {
-        return false;
-    }
-    let inverse = determinant.recip();
-    let offset = origin - triangle[0];
-    let u = offset.dot(cross) * inverse;
-    if !(0.0..=1.0).contains(&u) {
-        return false;
-    }
-    let q = offset.cross(edge_a);
-    let v = direction.dot(q) * inverse;
-    if v < 0.0 || u + v > 1.0 {
-        return false;
-    }
-    direction.dot(q) * inverse > 1.0e-12
 }
 
 fn path_vector3(value: Option<&Value>, name: &str) -> Result<[f64; 3]> {
