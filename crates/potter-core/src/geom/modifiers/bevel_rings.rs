@@ -21,6 +21,9 @@ use super::bevel_vmesh::{
 };
 use crate::error::Result;
 use crate::geom::edge_key;
+/// An output edge's final `(endpoints, sharp, seam, source mesh edge)` as a rebuilt face's copy
+/// assigns it. The source is `None` when the copied edge is not an input edge.
+type EdgeState = ((usize, usize), bool, bool, Option<usize>);
 
 /// Blender's `BEVEL_EPSILON`.
 const EPSILON: f64 = 1.0e-6;
@@ -1561,14 +1564,17 @@ impl<'a> Builder<'a> {
 
     /// Blender's `bev_rebuild_polygon`: `face` with each beveled corner replaced by the boundary and
     /// profile points around its vertex, interpolated from the face itself.
-    fn emit_rebuilt_face(&mut self, face: usize) -> Result<()> {
+    fn emit_rebuilt_face(&mut self, face: usize) -> Result<Vec<EdgeState>> {
         let vertices = self.polygons[face].0.clone();
         let count = vertices.len();
         let mut out: Vec<usize> = Vec::new();
+        // Blender's `ee`: the face corner whose outgoing edge each output point was built from.
+        let mut sources: Vec<usize> = Vec::new();
         for c in 0..count {
             let v = vertices[c];
             if self.front.verts[v].is_none() {
                 out.push(v);
+                sources.push(c);
                 continue;
             }
             let next = vertices[(c + 1) % count];
@@ -1579,11 +1585,56 @@ impl<'a> Builder<'a> {
             ) else {
                 continue;
             };
-            out.extend(self.corner_points(v, face, e_id, eprev_id)?);
+            let points = self.corner_points(v, face, e_id, eprev_id)?;
+            sources.extend(std::iter::repeat_n(c, points.len()));
+            out.extend(points);
         }
+        let states = self.copy_rebuilt_edge_flags(&out, &sources, &vertices);
         let n = out.len();
         self.emit_polygon(out, vec![None; n], vec![Some(face); n], face, Kind::Source);
-        Ok(())
+        Ok(states)
+    }
+
+    /// Blender's attribute copy at the end of `bev_rebuild_polygon`: every new edge `out[k]`→`out[k+1]`
+    /// that is not the source edge of `sources[k]` takes that edge's `(sharp, seam)`. Within one
+    /// corner's run the copy keeps a seam or sharp mark only where the previous source edge also has
+    /// it (`bmesh_bevel.cc` 7258–7285).
+    fn copy_rebuilt_edge_flags(
+        &self,
+        out: &[usize],
+        sources: &[usize],
+        vertices: &[usize],
+    ) -> Vec<EdgeState> {
+        let n = out.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let count = vertices.len();
+        let edge_of = |corner: usize| (vertices[corner], vertices[(corner + 1) % count]);
+        let mut states = Vec::new();
+        let mut previous = sources[n - 1];
+        for k in 0..n {
+            let (first, second) = (out[k], out[(k + 1) % n]);
+            let (source_first, source_second) = edge_of(sources[k]);
+            if edge_key(first, second) == edge_key(source_first, source_second) {
+                continue;
+            }
+            let (mut sharp, mut seam) = self
+                .front
+                .input_edge_flags_between(source_first, source_second);
+            if k + 1 < n && sources[k] == sources[k + 1] {
+                let (previous_a, previous_b) = edge_of(previous);
+                let (previous_sharp, previous_seam) =
+                    self.front.input_edge_flags_between(previous_a, previous_b);
+                seam &= previous_seam;
+                sharp &= previous_sharp;
+            } else {
+                previous = sources[k];
+            }
+            let source = self.front.input_edge_id(source_first, source_second);
+            states.push(((first, second), sharp, seam, source));
+        }
+        states
     }
 
     /// Blender's loop walk of `bev_rebuild_polygon` for one beveled corner of `face` at `vertex`,
@@ -1727,9 +1778,10 @@ pub(super) fn bevel_output(
     for vertex in &beveled {
         builder.extend_edge_data(*vertex)?;
     }
+    let mut rebuilt_states: Vec<Option<Vec<EdgeState>>> = vec![None; polygons.len()];
     for (face, (vertices, _)) in polygons.iter().enumerate() {
         if vertices.iter().any(|v| front.verts[*v].is_some()) {
-            builder.emit_rebuilt_face(face)?;
+            rebuilt_states[face] = Some(builder.emit_rebuilt_face(face)?);
         } else {
             let n = vertices.len();
             builder.emit_polygon(
@@ -1739,6 +1791,23 @@ pub(super) fn bevel_output(
                 face,
                 Kind::Original,
             );
+        }
+    }
+    // Blender rebuilds each face once, scanning the vertices in index order and the faces around
+    // each. Its copies overwrite one another on shared rungs, so the last one applies. The faces around
+    // a vertex are taken in ascending face index here, not Blender's BM_FACES_OF_VERT walk.
+    for vertex in (0..front.verts.len()).filter(|vertex| front.verts[*vertex].is_some()) {
+        for (face, (vertices, _)) in polygons.iter().enumerate() {
+            if !vertices.contains(&vertex) {
+                continue;
+            }
+            if let Some(states) = rebuilt_states[face].take() {
+                for ((first, second), sharp, seam, source) in states {
+                    builder
+                        .emission
+                        .set_edge_state(first, second, sharp, seam, source);
+                }
+            }
         }
     }
     if !front.p.affect_vertices {

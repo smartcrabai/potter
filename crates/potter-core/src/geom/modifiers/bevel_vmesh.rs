@@ -10,8 +10,8 @@
 //! faces; VERTICES rebuilds rings around closed or boundary fans.
 
 use glam::{DMat3, DVec3, Vec3};
-use serde_json::Value;
-use std::collections::HashMap;
+use serde_json::{Value, json};
+use std::collections::{HashMap, HashSet};
 use std::f64::consts::{FRAC_PI_2, PI, SQRT_2};
 
 use super::bevel_boundary::{
@@ -1600,6 +1600,10 @@ pub(super) struct Emission {
     seam_edges: Vec<(usize, usize)>,
     sharp_edges: Vec<(usize, usize)>,
     edge_flag_suppressions: Vec<(usize, usize)>,
+    /// Edges whose final `(sharp, seam)` and attributes Blender assigns by copying a source edge
+    /// (`bev_rebuild_polygon`, which runs last): these overwrite the marks above. The source edge
+    /// index is `None` for an edge that is not an input edge.
+    edge_states: Vec<((usize, usize), bool, bool, Option<usize>)>,
 }
 
 /// An output polygon: per corner, the output point, its UV query and source face. `face` is the
@@ -1637,6 +1641,20 @@ impl Emission {
         self.edge_flag_suppressions.push((first, second));
     }
 
+    /// Sets the final `(sharp, seam)` of an emitted edge, and copies the attributes of `source`, the
+    /// input edge index, over the marks and suppressions.
+    pub(super) fn set_edge_state(
+        &mut self,
+        first: usize,
+        second: usize,
+        sharp: bool,
+        seam: bool,
+        source: Option<usize>,
+    ) {
+        self.edge_states
+            .push(((first, second), sharp, seam, source));
+    }
+
     /// Starts a rebuild with copied source points and identity point origins.
     pub(super) fn new(source_points: &[DVec3]) -> Self {
         Self {
@@ -1646,6 +1664,7 @@ impl Emission {
             seam_edges: Vec::new(),
             sharp_edges: Vec::new(),
             edge_flag_suppressions: Vec::new(),
+            edge_states: Vec::new(),
         }
     }
 
@@ -2492,7 +2511,7 @@ fn merge_connected_loops(
 }
 
 fn mark_output_edge_flag(mesh: &mut Mesh, edge_index: usize, name: &str) {
-    if name == "sharp" {
+    if name == "sharp" || name == "seam" {
         let Some(edge_key) = mesh
             .edges
             .get(edge_index)
@@ -2500,12 +2519,11 @@ fn mark_output_edge_flag(mesh: &mut Mesh, edge_index: usize, name: &str) {
         else {
             return;
         };
-        if let Some(values) = mesh
+        let attribute = mesh
             .attributes
-            .get_mut("sharp")
-            .and_then(|attribute| attribute.get_mut("values"))
-            .and_then(Value::as_object_mut)
-        {
+            .entry(name.to_owned())
+            .or_insert_with(|| json!({"domain": "edge", "type": "bool", "values": {}}));
+        if let Some(values) = attribute.get_mut("values").and_then(Value::as_object_mut) {
             values.insert(edge_key, Value::Bool(true));
         }
     }
@@ -2520,14 +2538,14 @@ fn mark_output_edge_flag(mesh: &mut Mesh, edge_index: usize, name: &str) {
     }
 }
 fn clear_output_edge_flag(mesh: &mut Mesh, edge_index: usize, name: &str) {
-    if name == "sharp"
+    if (name == "sharp" || name == "seam")
         && let Some(edge_key) = mesh
             .edges
             .get(edge_index)
             .map(|edge| format!("e{}", edge.id))
         && let Some(values) = mesh
             .attributes
-            .get_mut("sharp")
+            .get_mut(name)
             .and_then(|attribute| attribute.get_mut("values"))
             .and_then(Value::as_object_mut)
     {
@@ -2541,6 +2559,88 @@ fn clear_output_edge_flag(mesh: &mut Mesh, edge_index: usize, name: &str) {
         .and_then(Value::as_object_mut)
     {
         flag.remove(name);
+    }
+}
+
+/// Sets an output edge's `sharp` or `seam` flag to `value`.
+fn set_output_edge_flag(mesh: &mut Mesh, edge_index: usize, name: &str, value: bool) {
+    if value {
+        mark_output_edge_flag(mesh, edge_index, name);
+    } else {
+        clear_output_edge_flag(mesh, edge_index, name);
+    }
+}
+/// Blender's new BMesh edges start with zeroed attributes. An output edge that is not an input edge
+/// (kept input edges keep their values) loses its edge-domain attribute values, except the seam and
+/// sharp flags, which the marks set. Rebuilt rungs copy their source values afterwards.
+fn zero_generated_edge_attributes(output: &mut Mesh, source_edges: &HashSet<(u32, u32)>) {
+    let generated: Vec<String> = output
+        .edges
+        .iter()
+        .filter(|edge| !source_edges.contains(&edge_key(edge.vertices[0], edge.vertices[1])))
+        .map(|edge| format!("e{}", edge.id))
+        .collect();
+    for (name, attribute) in output.attributes.iter_mut() {
+        if name == "sharp"
+            || name == "seam"
+            || attribute.get("domain").and_then(Value::as_str) != Some("edge")
+        {
+            continue;
+        }
+        if let Some(values) = attribute.get_mut("values").and_then(Value::as_object_mut) {
+            for key in &generated {
+                values.remove(key);
+            }
+        }
+    }
+}
+
+/// Blender's `BM_elem_attrs_copy` for one edge: each edge-domain attribute of input edge `source_index`
+/// is copied onto output edge `output_index`, except the seam and sharp flags, which the caller sets.
+/// A value the input leaves at its default is removed from the output.
+fn copy_edge_attributes(
+    source: &Mesh,
+    source_index: usize,
+    output: &mut Mesh,
+    output_index: usize,
+) {
+    let (Some(source_edge), Some(output_edge)) = (
+        source.edges.get(source_index),
+        output.edges.get(output_index),
+    ) else {
+        return;
+    };
+    let source_key = format!("e{}", source_edge.id);
+    let output_key = format!("e{}", output_edge.id);
+    for (name, attribute) in &source.attributes {
+        if name == "sharp"
+            || name == "seam"
+            || attribute.get("domain").and_then(Value::as_str) != Some("edge")
+        {
+            continue;
+        }
+        let Some(values) = attribute.get("values").and_then(Value::as_object) else {
+            continue;
+        };
+        if let Some(value) = values.get(&source_key) {
+            let target = output.attributes.entry(name.clone()).or_insert_with(|| {
+                json!({
+                    "domain": "edge",
+                    "type": attribute.get("type").cloned().unwrap_or(Value::Null),
+                    "values": {},
+                })
+            });
+            if let Some(target_values) = target.get_mut("values").and_then(Value::as_object_mut) {
+                target_values.insert(output_key.clone(), value.clone());
+            }
+        } else if let Some(target_values) = output
+            .attributes
+            .get_mut(name)
+            .and_then(|target| target.get_mut("values"))
+            .and_then(Value::as_object_mut)
+        {
+            target_values.remove(&output_key);
+        }
     }
 }
 
@@ -3094,6 +3194,7 @@ pub(super) fn finish(
         seam_edges: emitted_seam_edges,
         sharp_edges: emitted_sharp_edges,
         edge_flag_suppressions: emitted_edge_flag_suppressions,
+        edge_states: emitted_edge_states,
     } = emission;
     let mut used = vec![false; emitted_points.len()];
     for polygon in &emitted_polygons {
@@ -3362,9 +3463,16 @@ pub(super) fn finish(
     let mut result =
         build_mesh_with_edge_identity(points, polygons, loose, &origin, Some(&identities), mesh)?;
     clear_origindex(&mut result);
+    let source_edges: HashSet<(u32, u32)> = mesh
+        .edges
+        .iter()
+        .map(|edge| edge_key(edge.vertices[0], edge.vertices[1]))
+        .collect();
+    zero_generated_edge_attributes(&mut result, &source_edges);
     if !emitted_edge_flag_suppressions.is_empty()
         || !emitted_seam_edges.is_empty()
         || !emitted_sharp_edges.is_empty()
+        || !emitted_edge_states.is_empty()
     {
         let edge_index: HashMap<(u32, u32), usize> = result
             .edges
@@ -3389,6 +3497,20 @@ pub(super) fn finish(
                     continue;
                 };
                 mark_output_edge_flag(&mut result, *index, name);
+            }
+        }
+        // Blender's rebuild copies a source edge's `(sharp, seam)` onto the rung it creates, so this
+        // assignment, not a mark, decides those edges.
+        for ((first, second), sharp, seam, source) in emitted_edge_states {
+            let first = result.vertices[remap[first]].id;
+            let second = result.vertices[remap[second]].id;
+            let Some(index) = edge_index.get(&edge_key(first, second)) else {
+                continue;
+            };
+            set_output_edge_flag(&mut result, *index, "sharp", sharp);
+            set_output_edge_flag(&mut result, *index, "seam", seam);
+            if let Some(source) = source {
+                copy_edge_attributes(mesh, source, &mut result, *index);
             }
         }
     }

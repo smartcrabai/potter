@@ -608,6 +608,11 @@ impl Front {
         self.geo.input_edge_flags[edge_id]
     }
 
+    /// The mesh edge index of the input edge between two points, if it exists.
+    pub(super) fn input_edge_id(&self, first: usize, second: usize) -> Option<usize> {
+        self.edge_ids.get(&edge_key(first, second)).copied()
+    }
+
     /// The original `(sharp, seam)` flags of the input edge between two points.
     pub(super) fn input_edge_flags_between(&self, first: usize, second: usize) -> (bool, bool) {
         self.edge_ids

@@ -225,6 +225,10 @@ def make_object(name, vertices, faces, custom_normals):
                 custom_normal_vectors.append(
                     None if code == [0, 0] else
                     [f32(component) for component in mesh.corner_normals[loop_index].vector])
+    # Setting custom normals marks more edges sharp in Blender (e.g. the cube's edge 2-3). The input
+    # record is what Blender evaluated, so read the flags after that step.
+    for item, edge in zip(edge_input, mesh.edges):
+        item['sharp'] = bool(edge.use_edge_sharp)
     input_data = {
         'vertices': [[f32(component) for component in vertex.co] for vertex in mesh.vertices],
         'faces': [list(polygon.vertices) for polygon in mesh.polygons],
