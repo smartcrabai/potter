@@ -1476,12 +1476,14 @@ impl<'a> Builder<'a> {
             }
             verts = [top[0], top[1]];
         }
+        // Blender's `bevel_build_edge_polygons` copies the beveled edge's attributes onto the first and
+        // last rungs of the strip (`BM_elem_attrs_copy(bm, bme, bme1/bme2)`, bmesh_bevel.cc:7611-7612).
+        // Rebuilt faces copy later and overwrite these.
         let (sharp, seam) = self.front.input_edge_flags_by_id(e1.edge_id);
-        if sharp || seam {
-            for (first, second) in [rung_first, (verts[0], verts[1])] {
-                if let (Some(first), Some(second)) = (first, second) {
-                    self.emission.record_edge_flags(first, second, sharp, seam);
-                }
+        for (first, second) in [rung_first, (verts[0], verts[1])] {
+            if let (Some(first), Some(second)) = (first, second) {
+                self.emission
+                    .set_edge_state(first, second, sharp, seam, Some(e1.edge_id));
             }
         }
         Ok(())
