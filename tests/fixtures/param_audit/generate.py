@@ -148,15 +148,39 @@ def new_modifier(owner, key, identifier):
     return mod
 
 
+# Table curve-settings properties -> Blender's CurveMapping RNA property on the same modifier.
+CURVE_SETTINGS_PROPERTIES = {
+    "falloff_curve_settings": "falloff_curve",
+    "map_curve_settings": "map_curve",
+}
+
+
+def curve_settings_json(mapping):
+    return {
+        "use_clip": bool(mapping.use_clip),
+        "clip_bounds": [
+            float(mapping.clip_min_x),
+            float(mapping.clip_min_y),
+            float(mapping.clip_max_x),
+            float(mapping.clip_max_y),
+        ],
+        "extend": mapping.extend,
+    }
+
+
 def record_properties(key, mod, properties):
     values = {}
     for prop in properties:
+        attribute = CURVE_SETTINGS_PROPERTIES.get(prop, prop)
         try:
-            value = getattr(mod, prop)
+            value = getattr(mod, attribute)
         except AttributeError:
             print(f"SKIP {key}.{prop}: not exposed on Blender modifier, not compared")
             continue
-        values[prop] = to_json_value(value)
+        if prop in CURVE_SETTINGS_PROPERTIES:
+            values[prop] = curve_settings_json(value)
+        else:
+            values[prop] = to_json_value(value)
     return values
 
 

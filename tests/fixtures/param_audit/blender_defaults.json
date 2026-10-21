@@ -327,6 +327,11 @@
       "use_pin_to_last": false
     },
     "hook": {
+      "center": [
+        0.0,
+        0.0,
+        0.0
+      ],
       "falloff_curve": [
         [
           0.0,
@@ -338,21 +343,15 @@
         ]
       ],
       "falloff_curve_settings": {
-        "use_clip": true,
         "clip_bounds": [
           0.0,
           0.0,
           1.0,
           1.0
         ],
-        "extend": "EXTRAPOLATED"
+        "extend": "EXTRAPOLATED",
+        "use_clip": true
       },
-      "vertex_indices": [],
-      "center": [
-        0.0,
-        0.0,
-        0.0
-      ],
       "falloff_radius": 0.0,
       "falloff_type": "SMOOTH",
       "invert_vertex_group": false,
@@ -384,7 +383,8 @@
       "use_apply_on_spline": false,
       "use_falloff_uniform": false,
       "use_pin_to_last": false,
-      "vertex_group": ""
+      "vertex_group": "",
+      "vertex_indices": []
     },
     "laplacian_deform": {
       "invert_vertex_group": false,
@@ -618,7 +618,7 @@
       "damping": 0.5,
       "depth": 200.0,
       "fetch_jonswap": 120.0,
-      "filepath": "/var/folders/yt/jkgjjlb55fvbjsx8t5xw72280000gn/T/blender_weJ2ps/cache_ocean",
+      "filepath": "/var/folders/yt/jkgjjlb55fvbjsx8t5xw72280000gn/T/blender_YBaswW/cache_ocean",
       "foam_coverage": 0.0,
       "foam_layer_name": "",
       "frame_end": 250,
@@ -956,6 +956,16 @@
           1.0
         ]
       ],
+      "map_curve_settings": {
+        "clip_bounds": [
+          0.0,
+          0.0,
+          1.0,
+          1.0
+        ],
+        "extend": "EXTRAPOLATED",
+        "use_clip": true
+      },
       "mask_constant": 1.0,
       "mask_tex_map_bone": "",
       "mask_tex_map_object": null,
@@ -1016,6 +1026,16 @@
           1.0
         ]
       ],
+      "map_curve_settings": {
+        "clip_bounds": [
+          0.0,
+          0.0,
+          1.0,
+          1.0
+        ],
+        "extend": "EXTRAPOLATED",
+        "use_clip": true
+      },
       "mask_constant": 1.0,
       "mask_tex_map_bone": "",
       "mask_tex_map_object": null,
@@ -1074,6 +1094,8 @@
       "voxel_size": 0.10000000149011612
     },
     "warp": {
+      "bone_from": "",
+      "bone_to": "",
       "falloff_curve": [
         [
           0.0,
@@ -1085,17 +1107,15 @@
         ]
       ],
       "falloff_curve_settings": {
-        "use_clip": true,
         "clip_bounds": [
           0.0,
           0.0,
           1.0,
           1.0
         ],
-        "extend": "EXTRAPOLATED"
+        "extend": "EXTRAPOLATED",
+        "use_clip": true
       },
-      "bone_from": "",
-      "bone_to": "",
       "falloff_radius": 1.0,
       "falloff_type": "SMOOTH",
       "invert_vertex_group": false,

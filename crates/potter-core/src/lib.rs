@@ -7,8 +7,8 @@
     )
 )]
 
-pub(crate) mod cache_sequence;
 mod blender_rng;
+pub(crate) mod cache_sequence;
 pub(crate) const BUILD_IDENTITY: &str = env!("POTTER_BUILD_IDENTITY");
 
 pub mod catalog;
