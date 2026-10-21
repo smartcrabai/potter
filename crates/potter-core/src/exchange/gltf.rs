@@ -3390,7 +3390,7 @@ pub(crate) fn mesh_export_losses(doc: &SceneDoc, snapshot: &Snapshot) -> Result<
                 node_id, node, snapshot, data, mesh, &owner, &surfaces,
             ));
         for loss in found {
-            if reported.insert((owner.to_string(), loss.reason.to_string())) {
+            if reported.insert((owner.clone(), loss.reason.clone())) {
                 losses.push(loss);
             }
         }

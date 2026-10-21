@@ -456,7 +456,7 @@ with open(os.path.join(root, "weight-texture-oracle.json"), "w", encoding="utf-8
 print("WEIGHT_TEXTURE_ORACLE_WRITTEN")
 "#;
 
-fn modifier(modifier_type: &str, params: Value) -> Result<Modifier, Box<dyn Error>> {
+fn modifier(modifier_type: &str, params: &Value) -> Result<Modifier, Box<dyn Error>> {
     Ok(Modifier {
         id: Id::new("weight_test_modifier")?,
         modifier_type: modifier_type.to_owned(),
@@ -624,7 +624,7 @@ fn operand(
         object_scale: DVec3::ONE,
         selected_bones: BTreeSet::new(),
         deforming_bones: BTreeSet::new(),
-        layer_selection: Default::default(),
+        layer_selection: AttributeLayerSelection::default(),
     }
 }
 
@@ -698,7 +698,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
         if falloff == "CURVE" {
             params["map_curve"] = json!([[0.0, 0.0], [0.27, 0.72], [0.61, 0.38], [1.0, 1.0]]);
         }
-        let modifier_1 = modifier("vertex_weight_edit", params)?;
+        let modifier_1 = modifier("vertex_weight_edit", &params)?;
         let result = evaluate_with_context(
             &mesh,
             &modifier_1,
@@ -724,7 +724,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
 
     let curve_invert = modifier(
         "vertex_weight_edit",
-        json!({
+        &json!({
             "vertex_group":"A","falloff_type":"CURVE","invert_falloff":true,
             "map_curve":[[0.0,0.0],[0.27,0.72],[0.61,0.38],[1.0,1.0]],
             "default_weight":0.23,"normalize":false
@@ -760,7 +760,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
     ] {
         let modifier_2 = modifier(
             "vertex_weight_edit",
-            json!({
+            &json!({
                 "vertex_group":"A","falloff_type":"SMOOTH","mask_vertex_group":mask_name,
                 "invert_mask_vertex_group":inverted,"mask_constant":constant,"default_weight":0.23
             }),
@@ -797,7 +797,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
     ] {
         let modifier_3 = modifier(
             "vertex_weight_edit",
-            json!({
+            &json!({
                 "vertex_group":"A","falloff_type":"SMOOTH","mask_vertex_group":"Mask",
                 "mask_constant":constant,"default_weight":0.23
             }),
@@ -821,7 +821,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
     }
     let missing_edit_group = modifier(
         "vertex_weight_edit",
-        json!({"vertex_group":"Missing","falloff_type":"SHARP"}),
+        &json!({"vertex_group":"Missing","falloff_type":"SHARP"}),
     )?;
     let result = evaluate_with_context(
         &mesh,
@@ -847,7 +847,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
 
     let add_remove = modifier(
         "vertex_weight_edit",
-        json!({
+        &json!({
             "vertex_group":"A","falloff_type":"LINEAR","default_weight":0.5,
             "use_add":true,"add_threshold":0.4,"use_remove":true,"remove_threshold":0.2
         }),
@@ -875,7 +875,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
     )?;
     let inclusive_thresholds = modifier(
         "vertex_weight_edit",
-        json!({
+        &json!({
             "vertex_group":"A","falloff_type":"LINEAR","default_weight":0.23,
             "use_add":true,"add_threshold":0.23,"use_remove":true,"remove_threshold":0.15
         }),
@@ -904,7 +904,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
 
     let normalize = modifier(
         "vertex_weight_edit",
-        json!({"vertex_group":"A","falloff_type":"LINEAR","default_weight":0.23,"normalize":true}),
+        &json!({"vertex_group":"A","falloff_type":"LINEAR","default_weight":0.23,"normalize":true}),
     )?;
     let result = evaluate_with_context(
         &mesh,
@@ -928,7 +928,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
     ] {
         let modifier_4 = modifier(
             "vertex_weight_mix",
-            json!({
+            &json!({
                 "vertex_group_a":"A","vertex_group_b":"B","mix_set":"ALL","mix_mode":mix_mode,
                 "default_weight_a":0.23,"default_weight_b":0.31,"invert_vertex_group_a":true
             }),
@@ -958,7 +958,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
     for mix_set in ["ALL", "A", "B", "OR", "AND"] {
         let modifier_5 = modifier(
             "vertex_weight_mix",
-            json!({
+            &json!({
                 "vertex_group_a":"A","vertex_group_b":"B","mix_set":mix_set,"mix_mode":"ADD",
                 "default_weight_a":0.23,"default_weight_b":0.31,"invert_vertex_group_b":true
             }),
@@ -987,7 +987,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
     }
     let divide_zero = modifier(
         "vertex_weight_mix",
-        json!({"vertex_group_a":"A","vertex_group_b":"B","mix_set":"ALL","mix_mode":"DIV","default_weight_b":0.0}),
+        &json!({"vertex_group_a":"A","vertex_group_b":"B","mix_set":"ALL","mix_mode":"DIV","default_weight_b":0.0}),
     )?;
     let result = evaluate_with_context(
         &mesh,
@@ -1007,7 +1007,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
     )?;
     let mix_zero = modifier(
         "vertex_weight_mix",
-        json!({"vertex_group_a":"A","vertex_group_b":"B","mix_set":"ALL","mix_mode":"SET","default_weight_b":0.0}),
+        &json!({"vertex_group_a":"A","vertex_group_b":"B","mix_set":"ALL","mix_mode":"SET","default_weight_b":0.0}),
     )?;
     let result = evaluate_with_context(
         &mesh,
@@ -1036,7 +1036,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
     ] {
         let modifier_6 = modifier(
             "vertex_weight_mix",
-            json!({
+            &json!({
                 "vertex_group_a":"A","vertex_group_b":"B","mix_set":"ALL","mix_mode":"ADD",
                 "mask_vertex_group":"Mask","mask_constant":0.75,"invert_mask_vertex_group":inverted
             }),
@@ -1064,7 +1064,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
     ] {
         let modifier_7 = modifier(
             "vertex_weight_mix",
-            json!({"vertex_group_a":group_a,"vertex_group_b":group_b,"mix_set":"ALL","mix_mode":"ADD"}),
+            &json!({"vertex_group_a":group_a,"vertex_group_b":group_b,"mix_set":"ALL","mix_mode":"ADD"}),
         )?;
         let result = evaluate_with_context(
             &mesh,
@@ -1090,7 +1090,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
     }
     let mix_normalize = modifier(
         "vertex_weight_mix",
-        json!({
+        &json!({
             "vertex_group_a":"A","vertex_group_b":"B","mix_set":"OR","mix_mode":"ADD",
             "default_weight_a":0.23,"default_weight_b":0.31,"normalize":true
         }),
@@ -1118,7 +1118,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
     )?;
     let mix_empty_b = modifier(
         "vertex_weight_mix",
-        json!({
+        &json!({
             "vertex_group_a":"A","vertex_group_b":"","mix_set":"ALL","mix_mode":"SET",
             "default_weight_b":0.25
         }),
@@ -1160,7 +1160,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
     geometry_operands.insert("target".to_owned(), vec![geometry_target]);
     let object_proximity = modifier(
         "vertex_weight_proximity",
-        json!({"vertex_group":"A","target":"target","proximity_mode":"OBJECT","proximity_geometry":["VERTEX","EDGE","FACE"],"min_dist":0.2,"max_dist":5.0}),
+        &json!({"vertex_group":"A","target":"target","proximity_mode":"OBJECT","proximity_geometry":["VERTEX","EDGE","FACE"],"min_dist":0.2,"max_dist":5.0}),
     )?;
     assert_case(
         "weight proximity OBJECT",
@@ -1173,7 +1173,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
     )?;
     let geometry_empty = modifier(
         "vertex_weight_proximity",
-        json!({
+        &json!({
             "vertex_group":"A","target":"target","proximity_mode":"GEOMETRY",
             "proximity_geometry":[],"min_dist":0.2,"max_dist":5.0
         }),
@@ -1190,7 +1190,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
     for geometry in ["VERTEX", "EDGE", "FACE"] {
         let modifier_8 = modifier(
             "vertex_weight_proximity",
-            json!({"vertex_group":"A","target":"target","proximity_mode":"GEOMETRY","proximity_geometry":[geometry],"min_dist":0.2,"max_dist":5.0}),
+            &json!({"vertex_group":"A","target":"target","proximity_mode":"GEOMETRY","proximity_geometry":[geometry],"min_dist":0.2,"max_dist":5.0}),
         )?;
         assert_case(
             &format!("weight proximity GEOMETRY/{geometry}"),
@@ -1204,7 +1204,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
     }
     let proximity_normalize = modifier(
         "vertex_weight_proximity",
-        json!({
+        &json!({
             "vertex_group":"A","target":"target","proximity_mode":"GEOMETRY",
             "proximity_geometry":["VERTEX","EDGE","FACE"],"min_dist":0.2,"max_dist":5.0,
             "normalize":true
@@ -1221,7 +1221,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
     )?;
     let reversed_range = modifier(
         "vertex_weight_proximity",
-        json!({
+        &json!({
             "vertex_group":"A","target":"target","proximity_mode":"GEOMETRY",
             "proximity_geometry":["VERTEX"],"min_dist":4.0,"max_dist":2.0
         }),
@@ -1237,7 +1237,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
     )?;
     let proximity_mask = modifier(
         "vertex_weight_proximity",
-        json!({
+        &json!({
             "vertex_group":"A","target":"target","proximity_mode":"GEOMETRY",
             "proximity_geometry":["VERTEX","EDGE","FACE"],"min_dist":0.2,"max_dist":5.0,
             "mask_vertex_group":"Mask","mask_constant":0.75
@@ -1254,7 +1254,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
     )?;
     let proximity_mask_invert = modifier(
         "vertex_weight_proximity",
-        json!({
+        &json!({
             "vertex_group":"A","target":"target","proximity_mode":"GEOMETRY",
             "proximity_geometry":["VERTEX","EDGE","FACE"],"min_dist":0.2,"max_dist":5.0,
             "mask_vertex_group":"Mask","mask_constant":0.75,"invert_mask_vertex_group":true
@@ -1271,7 +1271,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
     )?;
     let missing_proximity_group = modifier(
         "vertex_weight_proximity",
-        json!({"vertex_group":"Missing","target":"target","proximity_mode":"OBJECT","min_dist":0.0,"max_dist":5.0}),
+        &json!({"vertex_group":"Missing","target":"target","proximity_mode":"OBJECT","min_dist":0.0,"max_dist":5.0}),
     )?;
     let result = evaluate_with_context(
         &mesh,
@@ -1296,7 +1296,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
     )?;
     let null_target_proximity = modifier(
         "vertex_weight_proximity",
-        json!({"vertex_group":"A","target":null,"proximity_mode":"OBJECT"}),
+        &json!({"vertex_group":"A","target":null,"proximity_mode":"OBJECT"}),
     )?;
     let result = evaluate_with_context(
         &mesh,
@@ -1328,7 +1328,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
         if falloff == "CURVE" {
             params["map_curve"] = json!([[0.0, 0.0], [0.27, 0.72], [0.61, 0.38], [1.0, 1.0]]);
         }
-        let modifier_9 = modifier("vertex_weight_proximity", params)?;
+        let modifier_9 = modifier("vertex_weight_proximity", &params)?;
         let name = format!("Proximity Falloff {falloff}");
         assert_case(
             &format!("weight proximity falloff {falloff}"),
@@ -1342,7 +1342,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
     }
     let inverted_proximity = modifier(
         "vertex_weight_proximity",
-        json!({"vertex_group":"A","target":"target","proximity_mode":"GEOMETRY","proximity_geometry":["VERTEX","EDGE","FACE"],"min_dist":0.2,"max_dist":5.0,"falloff_type":"SMOOTH","invert_falloff":true}),
+        &json!({"vertex_group":"A","target":"target","proximity_mode":"GEOMETRY","proximity_geometry":["VERTEX","EDGE","FACE"],"min_dist":0.2,"max_dist":5.0,"falloff_type":"SMOOTH","invert_falloff":true}),
     )?;
     assert_case(
         "weight proximity inverted falloff",
@@ -1553,7 +1553,7 @@ fn texture_weight_masks_match_blender_channels_mappings_and_bone_space()
         json!({"op":"node.create","id":"texture_frame","kind":"empty","transform":{"translation":[-0.15,0.3,0.0],"scale":[0.7,1.25,1.0]}}),
         json!({"op":"node.create","id":"texture_rig","kind":"armature","transform":{"translation":[0.1,-0.1,0.0],"scale":[1.2,0.8,1.0]}}),
         json!({"op":"bone.create","target":{"id":"texture_rig"},"id":"mask_bone","name":"MaskBone","head":[0.0,0.0,0.0],"tail":[0.0,0.0,1.0]}),
-        json!({"op":"pose.set","target":{"id":"texture_rig"},"bone_id":"mask_bone","set":{"translation":[0.2,0.3,0.0],"rotation":[0.0,0.0,0.2279775235351884,0.9736663950053749]}}),
+        json!({"op":"pose.set","target":{"id":"texture_rig"},"bone_id":"mask_bone","set":{"translation":[0.2,0.3,0.0],"rotation":[0.0,0.0,0.227_977_523_535_188_4,0.973_666_395_005_374_9]}}),
     ];
     let mappings = [
         "LOCAL",
@@ -1571,8 +1571,8 @@ fn texture_weight_masks_match_blender_channels_mappings_and_bone_space()
     for mapping in mappings {
         for channel in channels {
             let object_id = format!("mask_{}_{}", mapping.to_lowercase(), channel.to_lowercase());
-            let group_id = format!("group_{}", object_id);
-            let modifier_id = format!("modifier_{}", object_id);
+            let group_id = format!("group_{object_id}");
+            let modifier_id = format!("modifier_{object_id}");
             let mut node =
                 json!({"op":"node.create","id":object_id,"kind":"plane","params":{"size":1.0}});
             if matches!(

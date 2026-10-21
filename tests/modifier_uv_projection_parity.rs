@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, error::Error, fs, process::Command};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fs,
+    process::Command,
+};
 
 use glam::{DMat4, DVec3};
 use potter_core::{
@@ -22,7 +27,7 @@ mod blender_script;
 use blender_file::blender_executable;
 use blender_script::run_blender_script;
 
-const UV_PROJECTION_ORACLE: &str = r#"
+const UV_PROJECTION_ORACLE: &str = r"
 import bpy, json, math, sys
 from mathutils import Matrix
 root = sys.argv[-1]
@@ -144,9 +149,9 @@ result = {
 }
 with open(root + '/expected_uv_project.json','w') as file:
     json.dump(result,file)
-"#;
+";
 
-const UV_WARP_ORACLE: &str = r#"
+const UV_WARP_ORACLE: &str = r"
 import bpy, json, math, sys
 from mathutils import Matrix
 root = sys.argv[-1]
@@ -299,9 +304,9 @@ result = {
 }
 with open(root + '/expected_uv_warp.json','w') as file:
     json.dump(result,file)
-"#;
+";
 
-fn test_modifier(modifier_type: &str, params: Value) -> Result<Modifier, Box<dyn Error>> {
+fn test_modifier(modifier_type: &str, params: &Value) -> Result<Modifier, Box<dyn Error>> {
     Ok(Modifier {
         id: Id::new("uv_parity_modifier")?,
         modifier_type: modifier_type.to_owned(),
@@ -392,9 +397,9 @@ fn operand(world_matrix: DMat4, camera: Option<CameraData>, armature: bool) -> S
         camera,
         armature,
         object_scale: DVec3::ONE,
-        selected_bones: Default::default(),
-        deforming_bones: Default::default(),
-        layer_selection: Default::default(),
+        selected_bones: BTreeSet::default(),
+        deforming_bones: BTreeSet::default(),
+        layer_selection: AttributeLayerSelection::default(),
     }
 }
 
@@ -405,13 +410,14 @@ fn camera_data(
     lens_mm: f64,
     shift: [f64; 2],
 ) -> CameraData {
-    let mut data = CameraData::default();
-    data.projection = projection;
-    data.sensor_fit = sensor_fit.to_owned();
-    data.ortho_scale = ortho_scale;
-    data.lens_mm = lens_mm;
-    data.shift = shift;
-    data
+    CameraData {
+        projection,
+        sensor_fit: sensor_fit.to_owned(),
+        ortho_scale,
+        lens_mm,
+        shift,
+        ..CameraData::default()
+    }
 }
 
 fn matrix_from_oracle(value: &Value) -> Result<DMat4, Box<dyn Error>> {
@@ -450,7 +456,7 @@ fn evaluate_project_case(
     mesh: &Mesh,
     subject_world: DMat4,
     projectors: Vec<(&str, DMat4, Option<CameraData>)>,
-    params: Value,
+    params: &Value,
 ) -> Result<Mesh, Box<dyn Error>> {
     let mut operands = Vec::with_capacity(projectors.len());
     for (id, world, camera) in projectors {
@@ -674,7 +680,7 @@ fn uv_project_matches_blender_camera_modes_aspect_scale_and_projector_list()
         ),
     ];
     for (name, projectors, params, layer) in cases {
-        let actual = evaluate_project_case(&mesh, subject, projectors, params)?;
+        let actual = evaluate_project_case(&mesh, subject, projectors, &params)?;
         assert_uv_parity(name, &actual, &expected[name], layer)?;
     }
     // `projector_count` is Blender's `projectors_num`: slots past it are ignored, and empty slots keep
@@ -700,7 +706,7 @@ fn uv_project_matches_blender_camera_modes_aspect_scale_and_projector_list()
                 ),
                 ("plain", plain_world, None),
             ],
-            json!({
+            &json!({
                 "projectors":["pano",null,"plain"],"projector_count":count,
                 "uv_layer":"UVMap","aspect_x":1.0,"aspect_y":1.0,"scale_x":1.0,"scale_y":1.0
             }),
@@ -731,7 +737,7 @@ fn uv_project_matches_blender_camera_modes_aspect_scale_and_projector_list()
             ("high_scale", high_scale_projector, None),
             ("aligned", aligned_projector, None),
         ],
-        json!({"projectors":["high_scale","aligned"],"uv_layer":"UVMap","aspect_x":1.0,"aspect_y":1.0,"scale_x":1.0,"scale_y":1.0}),
+        &json!({"projectors":["high_scale","aligned"],"uv_layer":"UVMap","aspect_x":1.0,"aspect_y":1.0,"scale_x":1.0,"scale_y":1.0}),
     )?;
     assert_uv_parity(
         "scaled_projector_normal_selection",
@@ -961,7 +967,7 @@ fn uv_warp_matches_blender_object_bone_group_and_axis_cases_per_loop() -> Result
             .ok_or("base UV Warp parameters are invalid")?
             .clone();
         params.insert("uv_layer".to_owned(), json!(selector));
-        let mut modifier = test_modifier("uv_warp", Value::Object(params))?;
+        let mut modifier = test_modifier("uv_warp", &Value::Object(params))?;
         modifier.runtime.uv_warp_matrix =
             Some(runtime_uv_warp_matrix(&expected["warp_matrices"][name])?);
         let result = evaluate_with_context(
@@ -1071,7 +1077,7 @@ fn uv_warp_matches_blender_object_bone_group_and_axis_cases_per_loop() -> Result
     for (name, params, operands, test_mesh_override, layer_override) in cases {
         let subject_mesh = test_mesh_override.as_ref().unwrap_or(&mesh);
         let layer = layer_override.unwrap_or("UVMap");
-        let mut modifier = test_modifier("uv_warp", params)?;
+        let mut modifier = test_modifier("uv_warp", &params)?;
         modifier.runtime.uv_warp_matrix =
             Some(runtime_uv_warp_matrix(&expected["warp_matrices"][name])?);
         let result = evaluate_with_context(
@@ -1096,7 +1102,7 @@ fn uv_warp_matches_blender_object_bone_group_and_axis_cases_per_loop() -> Result
     missing_runtime_params.insert("bone_to".to_owned(), json!("BoneB"));
     let error = evaluate_with_context(
         &mesh,
-        &test_modifier("uv_warp", Value::Object(missing_runtime_params))?,
+        &test_modifier("uv_warp", &Value::Object(missing_runtime_params))?,
         &bone_operands,
         None,
         None,

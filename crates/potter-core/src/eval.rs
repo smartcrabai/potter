@@ -2072,7 +2072,7 @@ pub(crate) fn effective_material_slots(
         .collect()
 }
 
-/// The UV Project slot count (`projectors_num`, MOD_uvproject.cc). Slots past it are ignored, empty
+/// The UV Project slot count (`projectors_num`, `MOD_uvproject.cc`). Slots past it are ignored, empty
 /// slots included, so their objects are neither resolved nor depended on.
 fn uv_project_slot_count(modifier: &Modifier) -> usize {
     modifier

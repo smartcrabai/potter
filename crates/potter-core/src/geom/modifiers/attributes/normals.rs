@@ -1,6 +1,10 @@
 //! Weighted-normal and normal-edit modifiers.
 
-use super::*;
+use super::{
+    BTreeMap, DVec3, ErrorCode, HashMap, Mesh, Modifier, PotError, Result, SceneOperand, Value,
+    boolean, face_normal, face_points, get_group_weights, invalid, number, optional_string, string,
+    vector3,
+};
 use std::{ffi::c_void, mem::size_of, os::raw::c_int};
 
 use glam::Vec3;
@@ -124,14 +128,13 @@ pub(super) fn weighted_normal(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> 
         .edges
         .iter()
         .zip(&sharp_edges)
-        .filter_map(|(edge, sharp)| {
-            (*sharp).then(|| {
-                if edge.vertices[0] < edge.vertices[1] {
-                    (edge.vertices[0], edge.vertices[1])
-                } else {
-                    (edge.vertices[1], edge.vertices[0])
-                }
-            })
+        .filter(|(_, sharp)| **sharp)
+        .map(|(edge, _)| {
+            if edge.vertices[0] < edge.vertices[1] {
+                (edge.vertices[0], edge.vertices[1])
+            } else {
+                (edge.vertices[1], edge.vertices[0])
+            }
         })
         .collect::<std::collections::BTreeSet<_>>();
     let mut fan_by_corner = vec![0; total_corners];
@@ -397,6 +400,10 @@ fn blender_sort_mode_pairs(pairs: &mut [WeightedModePair]) {
     }
 }
 
+#[expect(
+    clippy::float_cmp,
+    reason = "Blender maps exact weights 100 and 1 to fixed values (MOD_weightedmesh_util)"
+)]
 fn blender_weight(weight: f64) -> f32 {
     let parameter = (weight.clamp(1.0, 100.0) as f32) / 50.0;
     if weight == 100.0 {
@@ -619,6 +626,10 @@ fn smooth_fan_faces(
     fan
 }
 
+#[expect(
+    clippy::float_cmp,
+    reason = "exact factor 1 and limit pi select Blender's no-op branch (MOD_normal_edit)"
+)]
 pub(super) fn normal_edit(
     mesh: &Mesh,
     modifier: &Modifier,
@@ -807,6 +818,10 @@ fn radial_normal(position: DVec3, target_origin: DVec3, size: DVec3) -> DVec3 {
     DVec3::new(x / a2, y / b2, z / c2).normalize_or_zero()
 }
 
+#[expect(
+    clippy::float_cmp,
+    reason = "Blender picks the axis by exact equality with the largest component (math_vector)"
+)]
 fn slerp_safe(from: DVec3, to: DVec3, factor: f64) -> DVec3 {
     let cosine = from.dot(to).clamp(-1.0, 1.0);
     if cosine < -1.0 + f32::EPSILON as f64 {

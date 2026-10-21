@@ -51,7 +51,7 @@ pub struct SceneOperandMatricesF32 {
 pub struct SceneOperand {
     /// Object-local evaluated mesh data.
     pub mesh: Mesh,
-    /// f64 object-to-subject transform for native scene modifier paths that operate on DVec3.
+    /// f64 object-to-subject transform for native scene modifier paths that operate on `DVec3`.
     pub local_to_subject: Option<DMat4>,
     /// Exact f32 matrices, resolved only for modifiers that consume them.
     pub blender_matrices_f32: Option<SceneOperandMatricesF32>,

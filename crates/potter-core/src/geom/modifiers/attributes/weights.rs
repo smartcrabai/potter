@@ -1,6 +1,10 @@
 //! Vertex-weight edit/mix/proximity and their texture-mask weights.
 
-use super::*;
+use super::{
+    BTreeMap, DMat4, DVec2, DVec3, ErrorCode, Map, Mesh, Modifier, PotError, Result, SceneOperand,
+    Value, boolean, closest_point_triangle, curve_points, falloff_type, get_group_weights, invalid,
+    json, number, optional_string, string, string_set,
+};
 use crate::blender_rng::BlenderRng;
 
 pub(super) fn texture_mask_weights(
@@ -33,6 +37,22 @@ pub(super) fn texture_mask_weights(
             json!({"modifier_id":modifier.id,"texture_id":texture_id}),
         )
     })?;
+    // Only image textures are supported as vertex-weight masks; a Blender legacy texture is a typed
+    // unsupported feature rather than being sampled without a Blender oracle.
+    if !matches!(
+        texture.source(),
+        crate::geom::legacy_texture::TextureSource::Image(_)
+            | crate::geom::legacy_texture::TextureSource::ImageWithSettings(..)
+    ) {
+        return Err(PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            "weight modifier texture is not a resolved image texture",
+            json!({
+                "feature_id": format!("modifier.{}.texture_type", modifier.modifier_type),
+                "modifier_id": modifier.id,
+            }),
+        ));
+    }
     let mapping = string(modifier, "mask_tex_mapping")?;
     let channel = string(modifier, "mask_tex_use_channel")?;
     let uv_layer = string(modifier, "mask_tex_uv_layer")?;
@@ -74,7 +94,7 @@ pub(super) fn texture_mask_weights(
 /// Per-vertex mask-texture coordinates, aligned with `mesh.vertices`. `mapping` is one of
 /// LOCAL, GLOBAL, OBJECT, or UV, validated by the caller. Non-UV coordinates come from the
 /// evaluation context's `TextureCoordinateMapping`, which already resolves the OBJECT and BONE
-/// reference (a missing bone uses the object world, as Blender's MOD_util.cc does).
+/// reference (a missing bone uses the object world, as Blender's `MOD_util.cc` does).
 fn texture_coordinates(
     mesh: &Mesh,
     modifier: &Modifier,
@@ -203,6 +223,10 @@ fn texture_channel(color: [f64; 4], channel: &str) -> f64 {
     }
 }
 
+#[expect(
+    clippy::map_entry,
+    reason = "the presence check selects the remove branch, so it cannot become an entry call"
+)]
 pub(super) fn vertex_weight_edit(
     mesh: &Mesh,
     modifier: &Modifier,
@@ -358,7 +382,7 @@ fn mix_weights(a: f64, mut b: f64, mode: &str, modifier: &Modifier) -> Result<f6
         const ZERO_FLOOR: f64 = 1.0e-32;
         if b < 0.0 && b > -ZERO_FLOOR {
             b = -ZERO_FLOOR;
-        } else if b >= 0.0 && b < ZERO_FLOOR {
+        } else if (0.0..ZERO_FLOOR).contains(&b) {
             b = ZERO_FLOOR;
         }
     }
@@ -607,6 +631,10 @@ pub(super) fn vertex_weight_proximity(
     Ok(result)
 }
 
+#[expect(
+    clippy::float_cmp,
+    reason = "Blender tests an exactly degenerate distance range (MOD_weightvg_proximity)"
+)]
 fn map_proximity_distance(distance: f64, minimum: f64, maximum: f64) -> f64 {
     if maximum == minimum {
         f64::from(distance >= maximum)

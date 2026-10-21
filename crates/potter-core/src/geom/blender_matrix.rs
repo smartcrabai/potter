@@ -521,7 +521,7 @@ pub(crate) fn blender_transform_point_f32(transform: &[f32; 16], point: glam::Ve
 }
 
 /// Blender `mul_m4_m4m4` on column-major f32 matrices: `left * right` in Blender's operand order,
-/// with SIMD grouping on x86_64/ARM64 and scalar elsewhere.
+/// with SIMD grouping on `x86_64`/`ARM64` and scalar elsewhere.
 pub(crate) fn blender_multiply_m4(left: [f32; 16], right: [f32; 16]) -> [f32; 16] {
     let mut result = [0.0; 16];
     for row in 0..4 {

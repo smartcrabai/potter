@@ -1,6 +1,9 @@
 //! Data transfer modifier: per-domain mapping, layer selection, and mixing.
 
-use super::*;
+use super::{
+    AttributeLayerSelection, Edge, Face, Mesh, Modifier, Result, SceneOperand, boolean,
+    get_group_weights, invalid, number, optional_string, string, string_set,
+};
 use crate::blender_rng::BlenderRng;
 use crate::geom::bvh::{KdopTree, NearestHit, RayHit};
 use crate::geom::color_layers::{self, ColorDomain};
@@ -62,10 +65,12 @@ pub(super) fn data_transfer(
     operands: &BTreeMap<String, Vec<SceneOperand>>,
     subject_layer_selection: &AttributeLayerSelection,
 ) -> Result<Mesh> {
-    let Some(source_name) = optional_string(modifier, "object")? else {
+    // The resolver keys each reference by its parameter name (`eval.rs`), so the source operand
+    // is `object`; the parameter's value is the object id and is not a key.
+    let Some(_) = optional_string(modifier, "object")? else {
         return Ok(mesh.clone());
     };
-    let Some(source) = operands.get(source_name).and_then(|items| items.first()) else {
+    let Some(source) = operands.get("object").and_then(|items| items.first()) else {
         return Ok(mesh.clone());
     };
     let use_transform = boolean(modifier, "use_object_transform")?;
@@ -912,6 +917,10 @@ fn transfer_edge_attribute(
     Ok(())
 }
 
+#[expect(
+    clippy::manual_midpoint,
+    reason = "Blender averages the two vertex weights as a f32 sum before the scale, which midpoint would reorder"
+)]
 fn transfer_edge_mask_weight(
     edge: &Edge,
     mask_weights: Option<&BTreeMap<u32, f64>>,
@@ -958,10 +967,6 @@ fn transfer_uv(
         ));
     }
     let source_names = select_uv_layers(&source_store, source_selection);
-    let destination_names = destination_layers
-        .iter()
-        .map(|layer| layer.name.clone())
-        .collect::<Vec<_>>();
     for source_name in source_names {
         let Some(source_index) = source_layers
             .iter()
@@ -969,10 +974,46 @@ fn transfer_uv(
         else {
             continue;
         };
-        let destination_name = match destination_selection {
-            "NAME" => Some(source_name.clone()),
-            "ACTIVE" => destination_active.clone(),
-            "INDEX" => destination_names.get(source_index).cloned(),
+        let destination_index = match destination_selection {
+            "NAME" => ensure_uv_layer(
+                &mut destination_layers,
+                destination.faces.len(),
+                &source_name,
+                modifier,
+            )?,
+            "ACTIVE" => match destination_active
+                .as_deref()
+                .and_then(|name| {
+                    destination_layers
+                        .iter()
+                        .position(|layer| layer.name == name)
+                })
+                .or((!destination_layers.is_empty()).then_some(0))
+            {
+                Some(index) => index,
+                None => ensure_uv_layer(
+                    &mut destination_layers,
+                    destination.faces.len(),
+                    &source_name,
+                    modifier,
+                )?,
+            },
+            "INDEX" => match source_index.cmp(&destination_layers.len()) {
+                std::cmp::Ordering::Less => source_index,
+                std::cmp::Ordering::Equal => push_uv_layer(
+                    &mut destination_layers,
+                    destination.faces.len(),
+                    &source_name,
+                    modifier,
+                )?,
+                std::cmp::Ordering::Greater => {
+                    return Err(invalid(
+                        modifier,
+                        "layers_uv_select_dst",
+                        "a destination layer at each source layer index",
+                    ));
+                }
+            },
             _ => {
                 if source_selection == "ALL" {
                     return Err(invalid(
@@ -981,34 +1022,28 @@ fn transfer_uv(
                         "dynamic destination UV layers require a single source layer",
                     ));
                 }
-                let Some(name) = destination_names
+                match destination_layers
                     .iter()
-                    .find(|name| name.as_str() == destination_selection)
-                else {
-                    return Err(invalid(
-                        modifier,
-                        "layers_uv_select_dst",
-                        "NAME, INDEX, or an existing destination UV layer",
-                    ));
-                };
-                Some(name.clone())
+                    .position(|layer| layer.name == destination_selection)
+                {
+                    Some(index) => index,
+                    None => {
+                        return Err(invalid(
+                            modifier,
+                            "layers_uv_select_dst",
+                            "NAME, INDEX, or an existing destination UV layer",
+                        ));
+                    }
+                }
             }
-        };
-        let Some(destination_name) = destination_name else {
-            continue;
-        };
-        let Some(destination_index) = destination_layers
-            .iter()
-            .position(|layer| layer.name == destination_name)
-        else {
-            continue;
         };
         let source_layer = &source_layers[source_index];
         let target_layer = &mut destination_layers[destination_index];
         for (face_index, face) in destination.faces.iter().enumerate() {
+            // Blender's zeroed UV is V-up 0, which Potter stores V-down as 1.
             let mut row = target_layer.faces[face_index]
                 .clone()
-                .unwrap_or_else(|| vec![[0.0, 0.0]; face.vertices.len()]);
+                .unwrap_or_else(|| vec![[0.0, 1.0]; face.vertices.len()]);
             let mappings =
                 uv_loop_mapping_for_face(mapping_context, destination, face_index, mapping);
             for (corner, vertex_id) in face.vertices.iter().enumerate() {
@@ -1049,7 +1084,7 @@ fn transfer_uv(
 
 fn transfer_custom_normals(
     destination: &mut Mesh,
-    _modifier: &Modifier,
+    modifier: &Modifier,
     mapping: &str,
     factor: f64,
     mix_mode: &str,
@@ -1060,12 +1095,11 @@ fn transfer_custom_normals(
     let source_normals = mapping_context
         .source_corner_normals
         .as_deref()
-        .ok_or_else(|| invalid(_modifier, "data_types_loops", "source corner normals"))?;
+        .ok_or_else(|| invalid(modifier, "data_types_loops", "source corner normals"))?;
     let mut destination_normals = mapping_context
         .destination_corner_normals
-        .as_ref()
-        .cloned()
-        .ok_or_else(|| invalid(_modifier, "data_types_loops", "destination corner normals"))?;
+        .clone()
+        .ok_or_else(|| invalid(modifier, "data_types_loops", "destination corner normals"))?;
     let mut loop_index = 0;
     for (face_index, face) in destination.faces.iter().enumerate() {
         for (corner, vertex_id) in face.vertices.iter().enumerate() {
@@ -1239,6 +1273,10 @@ fn face_center(mesh: &Mesh, face: &Face, vertex_indices: &BTreeMap<u32, usize>) 
     }
 }
 
+#[expect(
+    clippy::manual_midpoint,
+    reason = "Blender evaluates (a + b) * 0.5 then a mix; midpoint changes the rounding sequence"
+)]
 fn blend_attribute(a: f64, b: f64, factor: f64, mode: &str, modifier: &Modifier) -> Result<f64> {
     match mode {
         "REPLACE" => Ok(a + (b - a) * factor),
@@ -1473,10 +1511,10 @@ impl<'a> TransferMapContext<'a> {
         let mut source_vertex_edges = vec![Vec::new(); source.vertices.len()];
         for (edge_index, edge) in source.edges.iter().enumerate() {
             for vertex_id in edge.vertices {
-                if let Some(&vertex_index) = source_vertex_indices.get(&vertex_id) {
-                    if source_vertex_edges[vertex_index].last() != Some(&edge_index) {
-                        source_vertex_edges[vertex_index].push(edge_index);
-                    }
+                if let Some(&vertex_index) = source_vertex_indices.get(&vertex_id)
+                    && source_vertex_edges[vertex_index].last() != Some(&edge_index)
+                {
+                    source_vertex_edges[vertex_index].push(edge_index);
                 }
             }
         }
@@ -1716,10 +1754,10 @@ fn build_source_face_graph(
     let mut vertex_faces = vec![Vec::new(); source.vertices.len()];
     for (face_index, face) in source.faces.iter().enumerate() {
         for (corner, vertex_id) in face.vertices.iter().enumerate() {
-            if let Some(&vertex_index) = vertex_indices.get(vertex_id) {
-                if vertex_faces[vertex_index].last() != Some(&face_index) {
-                    vertex_faces[vertex_index].push(face_index);
-                }
+            if let Some(&vertex_index) = vertex_indices.get(vertex_id)
+                && vertex_faces[vertex_index].last() != Some(&face_index)
+            {
+                vertex_faces[vertex_index].push(face_index);
             }
             if let Some(&next_id) = face.vertices.get((corner + 1) % face.vertices.len()) {
                 let key = ((*vertex_id).min(next_id), (*vertex_id).max(next_id));
@@ -1768,7 +1806,7 @@ fn build_source_face_graph(
         islands[island_index].faces.push(face_index);
         face_islands.push(island_index);
     }
-    let mut island_vertices = vec![std::collections::BTreeSet::new(); islands.len()];
+    let mut island_vertices = vec![std::collections::BTreeSet::default(); islands.len()];
     for (face_index, face) in source.faces.iter().enumerate() {
         for vertex_id in &face.vertices {
             if let Some(&vertex_index) = vertex_indices.get(vertex_id) {
@@ -1947,8 +1985,8 @@ fn build_source_face_graph(
     Ok(SourceFaceGraph {
         face_islands,
         islands,
-        face_normals,
         face_centers,
+        face_normals,
         face_local_indices,
         vertex_faces,
         links,
@@ -2093,8 +2131,7 @@ fn mapped_vertex_sources(
         "POLYINTERP_VNORPROJ" => {
             let normal = context
                 .destination_vertex_normal(destination_index)
-                .map(|normal| context.normal_to_source(normal))
-                .unwrap_or(DVec3::Z);
+                .map_or(DVec3::Z, |normal| context.normal_to_source(normal));
             let (face_index, hit, _) = raycast_surface(context, point, normal)?;
             let face = context.source.faces.get(face_index)?;
             Some(polygon_vertex_weights(context, face, hit)?)
@@ -2332,6 +2369,10 @@ fn mapped_loop_sources(
     }
 }
 
+#[expect(
+    clippy::collapsible_if,
+    reason = "merging the else-if-let would merge a fallback branch that Blender evaluates separately"
+)]
 fn uv_loop_mapping_for_face(
     context: &TransferMapContext<'_>,
     destination: &Mesh,
@@ -2370,7 +2411,7 @@ fn uv_loop_mapping_for_face(
                     corner,
                     mapping,
                     island_index,
-                    &graph,
+                    graph,
                 )
             })
             .collect::<Vec<_>>();
@@ -2410,7 +2451,7 @@ fn uv_loop_mapping_for_face(
         {
             let mut workspace = context.astar_workspace.borrow_mut();
             if astar_face_path(
-                &graph,
+                graph,
                 best_island_index,
                 previous,
                 candidate.source_face,
@@ -2437,7 +2478,7 @@ fn uv_loop_mapping_for_face(
                                 candidate.source_face = corrected_face;
                             }
                         } else if let Some(hit) =
-                            nearest_point_on_source_face(context, &graph, corrected_face, point)
+                            nearest_point_on_source_face(context, graph, corrected_face, point)
                         {
                             if let Some(face) = context.source.faces.get(corrected_face)
                                 && let Some(loop_start) =
@@ -2459,6 +2500,10 @@ fn uv_loop_mapping_for_face(
     output
 }
 
+#[expect(
+    clippy::manual_midpoint,
+    reason = "Blender scores candidates as (dot + 1) * 0.5 over distance; midpoint would change the order of operations"
+)]
 fn loop_candidate_for_island(
     context: &TransferMapContext<'_>,
     destination: &Mesh,
@@ -2742,6 +2787,10 @@ fn mapped_face_sources(
     result
 }
 
+#[expect(
+    clippy::redundant_closure_for_method_calls,
+    reason = "the element is a reference, so the closure is needed to call to_array on the value"
+)]
 fn projected_polygon_sources(
     context: &TransferMapContext<'_>,
     destination: &Mesh,
@@ -3231,7 +3280,7 @@ fn sphere_ray_triangle(
     let plane_distance = origin.dot(normal) - v0.dot(normal);
     let normal_velocity = normal.dot(velocity);
     let radius_squared = radius * radius;
-    if normal_velocity.abs() < 0.000001 {
+    if normal_velocity.abs() < 0.000_001 {
         if plane_distance.abs() >= radius {
             return None;
         }
@@ -4304,6 +4353,44 @@ fn layer_uv_at_loop(mesh: &Mesh, layer: &UvLayer, loop_index: usize) -> Option<[
     layer.faces.get(face_index)?.as_ref()?.get(corner).copied()
 }
 
+/// Index of the UV layer named `name`, appended when no layer has that name.
+fn ensure_uv_layer(
+    layers: &mut Vec<UvLayer>,
+    face_count: usize,
+    name: &str,
+    modifier: &Modifier,
+) -> Result<usize> {
+    match layers.iter().position(|layer| layer.name == name) {
+        Some(index) => Ok(index),
+        None => push_uv_layer(layers, face_count, name, modifier),
+    }
+}
+
+/// Appends an empty UV layer named `name`, within the layer limit and under a name no layer has.
+fn push_uv_layer(
+    layers: &mut Vec<UvLayer>,
+    face_count: usize,
+    name: &str,
+    modifier: &Modifier,
+) -> Result<usize> {
+    if layers.len() >= crate::geom::uv_layers::MAX_LAYERS {
+        return Err(invalid(
+            modifier,
+            "layers_uv_select_dst",
+            "at most 8 UV layers per mesh",
+        ));
+    }
+    if layers.iter().any(|layer| layer.name == name) {
+        return Err(invalid(
+            modifier,
+            "layers_uv_select_dst",
+            "a destination layer name that no layer already has",
+        ));
+    }
+    layers.push(UvLayer::new(name, vec![None; face_count]));
+    Ok(layers.len() - 1)
+}
+
 fn select_uv_layers(store: &UvStore, selection: &str) -> Vec<String> {
     match selection {
         "ACTIVE" => store
@@ -4331,7 +4418,6 @@ fn blend_normal(first: DVec3, second: DVec3, factor: f64, mode: &str) -> DVec3 {
         return second.normalize_or_zero();
     }
     let target = match mode {
-        "REPLACE" => second,
         "MIX" | "ADD" => first + second,
         "SUB" => first - second,
         "MUL" => first * second,
@@ -4510,8 +4596,8 @@ mod tests {
             camera: None,
             armature: false,
             object_scale: DVec3::ONE,
-            selected_bones: Default::default(),
-            deforming_bones: Default::default(),
+            selected_bones: std::collections::BTreeSet::default(),
+            deforming_bones: std::collections::BTreeSet::default(),
             layer_selection: AttributeLayerSelection::default(),
         };
         let operands = BTreeMap::from([("object".to_owned(), vec![source_operand])]);

@@ -1,6 +1,9 @@
 //! UV project and UV warp modifiers, including projector cameras and bone references.
 
-use super::*;
+use super::{
+    BTreeMap, DMat4, DVec2, ErrorCode, Mesh, Modifier, PotError, Result, SceneOperand, Value,
+    boolean, get_group_weights, invalid, json, number, optional_string, string, vector2,
+};
 use glam::{Vec2, Vec3};
 
 fn active_uv_layer_index(store: &crate::geom::uv_layers::UvStore) -> Option<usize> {
@@ -507,25 +510,50 @@ fn blender_rotate_z_m4(matrix: &mut [f32; 16], angle: f32) {
     }
 }
 
+/// A named UV layer that the mesh does not store, with the `modifier.uv_layer_missing` code.
+fn uv_layer_missing(modifier: &Modifier, parameter: &str, name: &str) -> PotError {
+    PotError::with_details(
+        ErrorCode::InvalidArgument,
+        format!(
+            "modifier `{}` references UV layer `{name}`, which the mesh does not have",
+            modifier.modifier_type
+        ),
+        json!({
+            "code": "modifier.uv_layer_missing",
+            "modifier_id": modifier.id,
+            "parameter": parameter,
+            "pointer": format!("/params/{parameter}"),
+            "uv_layer": name,
+        }),
+    )
+}
+
 pub(super) fn uv_warp(
     mesh: &Mesh,
     modifier: &Modifier,
     _operands: &BTreeMap<String, Vec<SceneOperand>>,
 ) -> Result<Mesh> {
     let mut store = crate::geom::uv_layers::read(mesh);
-    if store.layers.is_empty() {
-        return Ok(mesh.clone());
-    }
     let requested_layer = string(modifier, "uv_layer")?;
     let layer_index = if requested_layer.is_empty() {
-        active_uv_layer_index(&store)
+        match active_uv_layer_index(&store) {
+            Some(index) => index,
+            None => {
+                // Blender creates `UVMap`, which is both active and render, for an unnamed UV Warp
+                // on a mesh without layers.
+                store.layers.push(crate::geom::uv_layers::UvLayer::new(
+                    "UVMap",
+                    vec![None; mesh.faces.len()],
+                ));
+                store.active = Some("UVMap".to_owned());
+                store.render = Some("UVMap".to_owned());
+                0
+            }
+        }
     } else {
         store
             .index_of(requested_layer)
-            .or_else(|| active_uv_layer_index(&store))
-    };
-    let Some(layer_index) = layer_index else {
-        return Ok(mesh.clone());
+            .ok_or_else(|| uv_layer_missing(modifier, "uv_layer", requested_layer))?
     };
     let matrix = if let Some(columns) = modifier.runtime.uv_warp_matrix {
         flatten_runtime_matrix(columns)
@@ -575,8 +603,7 @@ pub(super) fn uv_warp(
         for (corner, vertex_id) in face.vertices.iter().enumerate() {
             let base_down = base_values
                 .and_then(|values| values.get(corner))
-                .map(|value| DVec2::from_array(*value))
-                .unwrap_or(DVec2::ZERO);
+                .map_or(DVec2::ZERO, |value| DVec2::from_array(*value));
             // Canonical mesh UVs are V-down; Blender UV Warp works in V-up coordinates.
             let base = Vec3::new(base_down.x as f32, (1.0 - base_down.y) as f32, 0.0);
             let mut weight = weights.as_ref().map_or(1.0_f32, |values| {

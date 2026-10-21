@@ -75,7 +75,18 @@ fn scene_operand(mesh: Mesh, local_to_subject: DMat4, camera: Option<CameraData>
         local_to_subject: Some(local_to_subject),
         camera,
         armature: false,
-        blender_matrices_f32: None,
+        blender_matrices_f32: Some(
+            potter_core::geom::modifiers::attributes::SceneOperandMatricesF32 {
+                world: Some(local_to_subject.to_cols_array().map(|value| value as f32)),
+                local_to_subject: Some(local_to_subject.to_cols_array().map(|value| value as f32)),
+                subject_to_local: Some(
+                    local_to_subject
+                        .inverse()
+                        .to_cols_array()
+                        .map(|value| value as f32),
+                ),
+            },
+        ),
         object_scale: glam::DVec3::ONE,
         selected_bones: std::collections::BTreeSet::new(),
         deforming_bones: std::collections::BTreeSet::new(),

@@ -17,7 +17,7 @@ mod blender_script;
 use blender_file::blender_executable;
 use blender_script::run_blender_script;
 
-const BLENDER_MASK_ORACLE: &str = r#"
+const BLENDER_MASK_ORACLE: &str = r"
 import bpy, json, sys
 root = sys.argv[-1]
 bpy.ops.wm.read_factory_settings(use_empty=True)
@@ -116,9 +116,9 @@ result['armature_none_inverted'] = arm_case('none_inverted',[],invert=True)
 result['armature_missing_object'] = arm_case('missing_object',['B1'],armature=False)
 with open(root + '/expected_mask.json','w') as file:
     json.dump(result,file)
-"#;
+";
 
-fn mask_modifier(params: Value) -> Result<Modifier, Box<dyn Error>> {
+fn mask_modifier(params: &Value) -> Result<Modifier, Box<dyn Error>> {
     Ok(Modifier {
         id: Id::new("mask_parity_modifier")?,
         modifier_type: "mask".to_owned(),
@@ -220,7 +220,7 @@ fn assert_geometry_parity(
             a.x.total_cmp(&b.x)
                 .then_with(|| a.y.total_cmp(&b.y))
                 .then_with(|| a.z.total_cmp(&b.z))
-        })
+        });
     };
     sort_points(&mut actual_vertices);
     sort_points(&mut expected_vertices);
@@ -315,8 +315,10 @@ fn armature_scene(
     let mesh_data_id = Id::new("mask_mesh_data")?;
     let armature_id = Id::new("mask_armature")?;
     let armature_data_id = Id::new("mask_armature_data")?;
-    let mut mesh_data = DataBlock::default();
-    mesh_data.mesh = Some(mesh);
+    let mesh_data = DataBlock {
+        mesh: Some(mesh),
+        ..DataBlock::default()
+    };
     doc.data_blocks.insert(mesh_data_id.clone(), mesh_data);
     let params = json!({
         "mode":"ARMATURE",
@@ -331,22 +333,36 @@ fn armature_scene(
         data: Some(mesh_data_id),
         ..Node::default()
     };
-    mesh_node.modifiers.push(mask_modifier(params)?);
+    mesh_node.modifiers.push(mask_modifier(&params)?);
     doc.nodes.insert(mesh_id.clone(), mesh_node);
     if has_armature {
         let mut armature = ArmatureData::default();
         for (name, bone_id) in [("B1", "mask_bone_b1"), ("B2", "mask_bone_b2")] {
-            let mut bone = Bone::default();
-            bone.name = name.to_owned();
-            bone.head = [0.0, 0.0, 0.0];
-            bone.tail = [0.0, 0.5, 0.0];
-            bone.select = selected_bones.contains(&name);
+            let bone = Bone {
+                name: name.to_owned(),
+                parent: None,
+                head: [0.0, 0.0, 0.0],
+                tail: [0.0, 0.5, 0.0],
+                roll: 0.0,
+                deform: true,
+                inherit_rotation: true,
+                use_connect: false,
+                custom_shape: None,
+                envelope_distance: 0.25,
+                envelope_weight: 1.0,
+                head_radius: 0.1,
+                tail_radius: 0.1,
+                select: selected_bones.contains(&name),
+                bbone_settings: BTreeMap::new(),
+            };
             armature.bones.insert(Id::new(bone_id)?, bone);
         }
-        let mut armature_data = DataBlock::default();
-        armature_data.data_type = "armature".to_owned();
-        armature_data.mesh = None;
-        armature_data.armature = Some(armature);
+        let armature_data = DataBlock {
+            data_type: "armature".to_owned(),
+            mesh: None,
+            armature: Some(armature),
+            ..DataBlock::default()
+        };
         doc.data_blocks
             .insert(armature_data_id.clone(), armature_data);
         doc.nodes.insert(
@@ -419,7 +435,7 @@ fn mask_vertex_group_and_armature_modes_match_blender_threshold_invert_and_smoot
     ];
     for (name, params, with_group) in cases {
         let mesh = weighted_grid(with_group)?;
-        let actual = evaluate_modifiers(&mesh, &[mask_modifier(params)?], "TestObject")?;
+        let actual = evaluate_modifiers(&mesh, &[mask_modifier(&params)?], "TestObject")?;
         assert_geometry_parity(name, &actual, &expected[name])?;
     }
     let empty_group_mesh = {
@@ -444,7 +460,7 @@ fn mask_vertex_group_and_armature_modes_match_blender_threshold_invert_and_smoot
         let actual = evaluate_modifiers(
             &mesh,
             &[mask_modifier(
-                json!({"mode":"VERTEX_GROUP","vertex_group":"G","threshold":0.5,"invert_vertex_group":invert}),
+                &json!({"mode":"VERTEX_GROUP","vertex_group":"G","threshold":0.5,"invert_vertex_group":invert}),
             )?],
             "TestObject",
         )?;
@@ -462,7 +478,7 @@ fn mask_vertex_group_and_armature_modes_match_blender_threshold_invert_and_smoot
     ] {
         let actual = evaluate_modifiers(
             &empty_unrelated_mesh,
-            &[mask_modifier(json!({
+            &[mask_modifier(&json!({
                 "mode":"VERTEX_GROUP","vertex_group":"MISSING","threshold":0.5,
                 "invert_vertex_group":invert
             }))?],

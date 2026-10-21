@@ -23,7 +23,7 @@ mod blender_file;
 #[path = "common/blender_script.rs"]
 mod blender_script;
 
-fn modifier(modifier_type: &str, params: Value) -> Result<Modifier, Box<dyn Error>> {
+fn modifier(modifier_type: &str, params: &Value) -> Result<Modifier, Box<dyn Error>> {
     Ok(Modifier {
         id: potter_core::model::Id::new("transfer_test")?,
         modifier_type: modifier_type.to_owned(),
@@ -44,7 +44,6 @@ fn layer_selection(groups: &[&str], active_group: Option<usize>) -> AttributeLay
     AttributeLayerSelection {
         vertex_group_names: groups.iter().map(|name| (*name).to_owned()).collect(),
         active_vertex_group_index: active_group,
-        ..AttributeLayerSelection::default()
     }
 }
 
@@ -222,7 +221,7 @@ fn set_domain_attribute(
     name: &str,
     domain: &str,
     data_type: &str,
-    values: Value,
+    values: &Value,
 ) -> Result<(), Box<dyn Error>> {
     let items = values
         .as_array()
@@ -388,7 +387,7 @@ fn rgba_values(values: &Value) -> Result<Vec<[f64; 4]>, Box<dyn Error>> {
         .collect()
 }
 
-const BLENDER_VERTEX_MAPPING_SCRIPT: &str = r#"
+const BLENDER_VERTEX_MAPPING_SCRIPT: &str = r"
 import bpy, json, os, sys
 from mathutils import Matrix, Vector
 root = os.path.realpath(sys.argv[sys.argv.index('--') + 1])
@@ -429,7 +428,7 @@ run('TOPOLOGY', [(0.0,0.0,0.0),(2.0,0.0,0.0),(2.0,1.0,0.0),(0.0,1.0,0.0)], [(0,1
 run('DISTANCE_CUTOFF',[(20,20,20),(21,20,20),(20,21,20)],[(0,1,2)],'NEAREST',0.1)
 run('NO_OBJECT_TRANSFORM',tri,[(0,1,2)],'NEAREST',10.0,False)
 with open(os.path.join(root, 'vertex-mapping-oracle.json'), 'w') as f: json.dump(result, f)
-"#;
+";
 
 #[test]
 fn vertex_mapping_families_match_blender_with_asymmetric_transforms() -> Result<(), Box<dyn Error>>
@@ -472,26 +471,40 @@ fn vertex_mapping_families_match_blender_with_asymmetric_transforms() -> Result<
     );
     let source_to_destination = destination_world.inverse() * source_world;
     let local_to_subject_f32 = [
-        1.3333335,
+        1.333_333_5,
         0.0,
         0.0,
         0.0,
         0.0,
-        0.7272727,
+        0.727_272_7,
         0.0,
         0.0,
         0.0,
         0.0,
         1.1,
         0.0,
-        0.33333337,
-        -0.22727272,
+        0.333_333_37,
+        -0.227_272_72,
         0.0,
         1.0,
     ];
     let subject_to_local_f32 = [
-        0.74999994, 0.0, 0.0, 0.0, 0.0, 1.3750001, 0.0, 0.0, 0.0, 0.0, 0.90909094, 0.0, -0.25,
-        0.31250003, 0.0, 1.0,
+        0.749_999_94,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.375_000_1,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.909_090_94,
+        0.0,
+        -0.25,
+        0.312_500_03,
+        0.0,
+        1.0,
     ];
     let mut source_operand = operand(source.clone(), source_to_destination, &["A"], Some(0));
     source_operand.blender_matrices_f32 = Some(SceneOperandMatricesF32 {
@@ -520,7 +533,7 @@ fn vertex_mapping_families_match_blender_with_asymmetric_transforms() -> Result<
         set_group(&mut destination, "A", &[0.2, 0.3, 0.4]);
         let modifier_1 = modifier(
             "data_transfer",
-            json!({
+            &json!({
                 "object":"source","use_object_transform":true,"use_vert_data":true,
                 "data_types_verts":["VGROUP_WEIGHTS"],"vert_mapping":mapping,
                 "mix_mode":"REPLACE","mix_factor":1.0,"use_max_distance":true,
@@ -545,7 +558,7 @@ fn vertex_mapping_families_match_blender_with_asymmetric_transforms() -> Result<
     set_group(&mut no_transform_destination, "A", &[0.2, 0.3, 0.4]);
     let no_transform_modifier = modifier(
         "data_transfer",
-        json!({
+        &json!({
             "object":"source","use_object_transform":false,"use_vert_data":true,
             "data_types_verts":["VGROUP_WEIGHTS"],"vert_mapping":"NEAREST",
             "mix_mode":"REPLACE","mix_factor":1.0,"use_max_distance":true,"max_distance":10.0,
@@ -580,7 +593,7 @@ fn vertex_mapping_families_match_blender_with_asymmetric_transforms() -> Result<
     set_group(&mut cutoff, "A", &[0.2, 0.3, 0.4]);
     let cutoff_modifier = modifier(
         "data_transfer",
-        json!({
+        &json!({
             "object":"source","use_object_transform":true,"use_vert_data":true,"data_types_verts":["VGROUP_WEIGHTS"],
             "vert_mapping":"NEAREST","mix_mode":"REPLACE","mix_factor":1.0,"use_max_distance":true,"max_distance":0.1
         }),
@@ -616,7 +629,7 @@ fn vertex_mapping_families_match_blender_with_asymmetric_transforms() -> Result<
     set_group(&mut topology, "A", &[0.2, 0.3, 0.4, 0.5]);
     let modifier_2 = modifier(
         "data_transfer",
-        json!({
+        &json!({
             "object":"source","use_object_transform":true,"use_vert_data":true,
             "data_types_verts":["VGROUP_WEIGHTS"],"vert_mapping":"TOPOLOGY",
             "mix_mode":"REPLACE","mix_factor":1.0
@@ -637,7 +650,7 @@ fn vertex_mapping_families_match_blender_with_asymmetric_transforms() -> Result<
     Ok(())
 }
 
-const BLENDER_MIX_SCRIPT: &str = r#"
+const BLENDER_MIX_SCRIPT: &str = r"
 import bpy, json, os, sys
 root=os.path.realpath(sys.argv[sys.argv.index('--')+1])
 def mesh(name):
@@ -673,7 +686,7 @@ mod=inverted.modifiers.new('Inverted','DATA_TRANSFER'); mod.object=src; mod.use_
 mod.layers_vgroup_select_src='ALL'; mod.layers_vgroup_select_dst='INDEX'; mod.mix_mode='REPLACE'; mod.mix_factor=0.4; mod.vertex_group='Mask'; mod.invert_vertex_group=True
 bpy.context.view_layer.update(); result['INVERT_MASK']={'D0':weights(inverted,'D0'),'D1':weights(inverted,'D1')}
 with open(os.path.join(root,'mix-oracle.json'),'w') as f: json.dump(result,f)
-"#;
+";
 
 #[test]
 fn vgroup_active_index_mix_and_mask_match_blender() -> Result<(), Box<dyn Error>> {
@@ -718,7 +731,7 @@ fn vgroup_active_index_mix_and_mask_match_blender() -> Result<(), Box<dyn Error>
         set_group(&mut destination, "Mask", &[0.25, 0.75, 0.5, 1.0]);
         let modifier_3 = modifier(
             "data_transfer",
-            json!({"object":"source","use_vert_data":true,"data_types_verts":["VGROUP_WEIGHTS"],"vert_mapping":"TOPOLOGY","layers_vgroup_select_src":"ALL","layers_vgroup_select_dst":"INDEX","mix_mode":mode,"mix_factor":0.4,"vertex_group":"Mask"}),
+            &json!({"object":"source","use_vert_data":true,"data_types_verts":["VGROUP_WEIGHTS"],"vert_mapping":"TOPOLOGY","layers_vgroup_select_src":"ALL","layers_vgroup_select_dst":"INDEX","mix_mode":mode,"mix_factor":0.4,"vertex_group":"Mask"}),
         )?;
         let actual = evaluate_with_context(
             &destination,
@@ -741,7 +754,7 @@ fn vgroup_active_index_mix_and_mask_match_blender() -> Result<(), Box<dyn Error>
     set_group(&mut inverted_destination, "Mask", &[0.25, 0.75, 0.5, 1.0]);
     let inverted_modifier = modifier(
         "data_transfer",
-        json!({"object":"source","use_vert_data":true,"data_types_verts":["VGROUP_WEIGHTS"],"vert_mapping":"TOPOLOGY","layers_vgroup_select_src":"ALL","layers_vgroup_select_dst":"INDEX","mix_mode":"REPLACE","mix_factor":0.4,"vertex_group":"Mask","invert_vertex_group":true}),
+        &json!({"object":"source","use_vert_data":true,"data_types_verts":["VGROUP_WEIGHTS"],"vert_mapping":"TOPOLOGY","layers_vgroup_select_src":"ALL","layers_vgroup_select_dst":"INDEX","mix_mode":"REPLACE","mix_factor":0.4,"vertex_group":"Mask","invert_vertex_group":true}),
     )?;
     let inverted_actual = evaluate_with_context(
         &inverted_destination,
@@ -765,7 +778,7 @@ fn vgroup_active_index_mix_and_mask_match_blender() -> Result<(), Box<dyn Error>
     set_group(&mut destination, "D1", &[0.3; 4]);
     let active_modifier = modifier(
         "data_transfer",
-        json!({"object":"source","use_vert_data":true,"data_types_verts":["VGROUP_WEIGHTS"],"vert_mapping":"TOPOLOGY","layers_vgroup_select_src":"ACTIVE","layers_vgroup_select_dst":"ACTIVE","mix_mode":"REPLACE","mix_factor":1.0}),
+        &json!({"object":"source","use_vert_data":true,"data_types_verts":["VGROUP_WEIGHTS"],"vert_mapping":"TOPOLOGY","layers_vgroup_select_src":"ACTIVE","layers_vgroup_select_dst":"ACTIVE","mix_mode":"REPLACE","mix_factor":1.0}),
     )?;
     let actual = evaluate_with_context(
         &destination,
@@ -786,7 +799,7 @@ fn vgroup_active_index_mix_and_mask_match_blender() -> Result<(), Box<dyn Error>
     }
     let named_modifier = modifier(
         "data_transfer",
-        json!({
+        &json!({
             "object":"source","use_vert_data":true,"data_types_verts":["VGROUP_WEIGHTS"],
             "vert_mapping":"TOPOLOGY","layers_vgroup_select_src":"A",
             "layers_vgroup_select_dst":"D1","mix_mode":"REPLACE","mix_factor":1.0
@@ -808,7 +821,7 @@ fn vgroup_active_index_mix_and_mask_match_blender() -> Result<(), Box<dyn Error>
     );
     let missing_source = modifier(
         "data_transfer",
-        json!({
+        &json!({
             "object":"source","use_vert_data":true,"data_types_verts":["VGROUP_WEIGHTS"],
             "vert_mapping":"TOPOLOGY","layers_vgroup_select_src":"MissingGroup",
             "layers_vgroup_select_dst":"D1"
@@ -829,7 +842,7 @@ fn vgroup_active_index_mix_and_mask_match_blender() -> Result<(), Box<dyn Error>
     );
     let missing_destination = modifier(
         "data_transfer",
-        json!({
+        &json!({
             "object":"source","use_vert_data":true,"data_types_verts":["VGROUP_WEIGHTS"],
             "vert_mapping":"TOPOLOGY","layers_vgroup_select_src":"A",
             "layers_vgroup_select_dst":"MissingGroup"
@@ -885,7 +898,7 @@ fn vertex_group_bone_selectors_filter_source_layers() -> Result<(), Box<dyn Erro
         }
         let transfer = modifier(
             "data_transfer",
-            json!({
+            &json!({
                 "object":"source","use_vert_data":true,"data_types_verts":["VGROUP_WEIGHTS"],
                 "vert_mapping":"TOPOLOGY","layers_vgroup_select_src":selection,
                 "layers_vgroup_select_dst":"INDEX","mix_mode":"REPLACE","mix_factor":1.0,
@@ -924,7 +937,7 @@ fn vertex_group_bone_selectors_filter_source_layers() -> Result<(), Box<dyn Erro
 fn absent_transfer_source_is_an_input_mesh_noop() -> Result<(), Box<dyn Error>> {
     let destination =
         Mesh::from_positions_and_faces(vec![DVec3::ZERO, DVec3::X, DVec3::Y], vec![vec![0, 1, 2]])?;
-    let transfer = modifier("data_transfer", json!({"object":null}))?;
+    let transfer = modifier("data_transfer", &json!({"object":null}))?;
     let actual = evaluate_with_context(
         &destination,
         &transfer,
@@ -1140,7 +1153,7 @@ fn cli_applies_null_source_transfer_without_changing_persisted_mesh() -> Result<
     Ok(())
 }
 
-const BLENDER_UV_LAYER_SCRIPT: &str = r#"
+const BLENDER_UV_LAYER_SCRIPT: &str = r"
 import bpy, json, os, sys
 root=os.path.realpath(sys.argv[sys.argv.index('--')+1])
 def make(name):
@@ -1193,7 +1206,7 @@ bpy.context.view_layer.update(); evaluated=corner_dest.evaluated_get(bpy.context
 result['CORNER_COLOR']={name:[list(item.color) for item in mesh.color_attributes[name].data] for name in ('Dest0','Dest1')}
 evaluated.to_mesh_clear()
 with open(os.path.join(root,'uv-layers-oracle.json'),'w') as f: json.dump(result,f)
-"#;
+";
 
 #[test]
 fn uv_layer_index_mapping_keeps_full_loop_order_and_replace_factor() -> Result<(), Box<dyn Error>> {
@@ -1302,7 +1315,7 @@ fn uv_layer_index_mapping_keeps_full_loop_order_and_replace_factor() -> Result<(
     operands.insert("object".to_owned(), vec![source_operand]);
     let transfer = modifier(
         "data_transfer",
-        json!({
+        &json!({
             "object":"source","use_object_transform":true,"use_loop_data":true,"data_types_loops":["UV"],
             "loop_mapping":"TOPOLOGY","layers_uv_select_src":"ALL","layers_uv_select_dst":"INDEX",
             "mix_mode":"ADD","mix_factor":0.25
@@ -1327,7 +1340,7 @@ fn uv_layer_index_mapping_keeps_full_loop_order_and_replace_factor() -> Result<(
     active_destination.attributes["uv_layers"]["active"] = json!("Destination1");
     let active_transfer = modifier(
         "data_transfer",
-        json!({
+        &json!({
             "object":"source","use_object_transform":true,"use_loop_data":true,"data_types_loops":["UV"],
             "loop_mapping":"TOPOLOGY","layers_uv_select_src":"ACTIVE","layers_uv_select_dst":"ACTIVE",
             "mix_mode":"REPLACE","mix_factor":1.0
@@ -1387,7 +1400,7 @@ fn uv_layer_index_mapping_keeps_full_loop_order_and_replace_factor() -> Result<(
     );
     let named_transfer = modifier(
         "data_transfer",
-        json!({
+        &json!({
             "object":"source","use_object_transform":true,"use_loop_data":true,"data_types_loops":["UV"],
             "loop_mapping":"TOPOLOGY","layers_uv_select_src":"Source1",
             "layers_uv_select_dst":"Destination1","mix_mode":"REPLACE","mix_factor":1.0
@@ -1408,7 +1421,7 @@ fn uv_layer_index_mapping_keeps_full_loop_order_and_replace_factor() -> Result<(
     }
     let missing_uv_source = modifier(
         "data_transfer",
-        json!({
+        &json!({
             "object":"source","use_loop_data":true,"data_types_loops":["UV"],
             "loop_mapping":"TOPOLOGY","layers_uv_select_src":"MissingUV",
             "layers_uv_select_dst":"NAME"
@@ -1429,7 +1442,7 @@ fn uv_layer_index_mapping_keeps_full_loop_order_and_replace_factor() -> Result<(
     );
     let missing_uv_destination = modifier(
         "data_transfer",
-        json!({
+        &json!({
             "object":"source","use_loop_data":true,"data_types_loops":["UV"],
             "loop_mapping":"TOPOLOGY","layers_uv_select_src":"Source1",
             "layers_uv_select_dst":"MissingUV"
@@ -1475,9 +1488,9 @@ fn uv_layer_index_mapping_keeps_full_loop_order_and_replace_factor() -> Result<(
     )?;
     let point_transfer = modifier(
         "data_transfer",
-        json!({"object":"source","use_vert_data":true,"data_types_verts":["COLOR_VERTEX"],"vert_mapping":"TOPOLOGY","layers_vcol_vert_select_src":"ALL","layers_vcol_vert_select_dst":"INDEX","mix_mode":"REPLACE","mix_factor":1.0}),
+        &json!({"object":"source","use_vert_data":true,"data_types_verts":["COLOR_VERTEX"],"vert_mapping":"TOPOLOGY","layers_vcol_vert_select_src":"ALL","layers_vcol_vert_select_dst":"INDEX","mix_mode":"REPLACE","mix_factor":1.0}),
     )?;
-    let mut point_selection = layer_selection(&[], None);
+    let point_selection = layer_selection(&[], None);
     let point_actual = evaluate_with_context(
         &point_destination,
         &point_transfer,
@@ -1522,9 +1535,9 @@ fn uv_layer_index_mapping_keeps_full_loop_order_and_replace_factor() -> Result<(
     )?;
     let corner_transfer = modifier(
         "data_transfer",
-        json!({"object":"source","use_loop_data":true,"data_types_loops":["COLOR_CORNER"],"loop_mapping":"TOPOLOGY","layers_vcol_loop_select_src":"ALL","layers_vcol_loop_select_dst":"INDEX","mix_mode":"REPLACE","mix_factor":1.0}),
+        &json!({"object":"source","use_loop_data":true,"data_types_loops":["COLOR_CORNER"],"loop_mapping":"TOPOLOGY","layers_vcol_loop_select_src":"ALL","layers_vcol_loop_select_dst":"INDEX","mix_mode":"REPLACE","mix_factor":1.0}),
     )?;
-    let mut corner_selection = layer_selection(&[], None);
+    let corner_selection = layer_selection(&[], None);
     let corner_actual = evaluate_with_context(
         &corner_destination,
         &corner_transfer,
@@ -1548,7 +1561,7 @@ fn uv_layer_index_mapping_keeps_full_loop_order_and_replace_factor() -> Result<(
     Ok(())
 }
 
-const BLENDER_CUSTOM_NORMAL_TRANSFER_SCRIPT: &str = r#"
+const BLENDER_CUSTOM_NORMAL_TRANSFER_SCRIPT: &str = r"
 import bpy, json, os, sys
 from mathutils import Vector
 root=os.path.realpath(sys.argv[sys.argv.index('--')+1])
@@ -1576,9 +1589,13 @@ with open(os.path.join(root,'custom-normal-oracle.json'),'w') as f:
     json.dump({'source_codes':source_codes,'destination_codes':destination_codes,
                'output_normals':[list(loop.normal) for loop in output.loops]},f)
 evaluated.to_mesh_clear()
-"#;
+";
 
 #[test]
+#[expect(
+    clippy::redundant_closure_for_method_calls,
+    reason = "the iterator yields references, so to_array needs the closure to read the value"
+)]
 fn custom_normal_transfer_keeps_typed_codes_and_corner_order() -> Result<(), Box<dyn Error>> {
     let Some(blender) = blender_file::blender_executable() else {
         eprintln!(
@@ -1616,7 +1633,7 @@ fn custom_normal_transfer_keeps_typed_codes_and_corner_order() -> Result<(), Box
     )]);
     let transfer = modifier(
         "data_transfer",
-        json!({
+        &json!({
             "object":"source","use_loop_data":true,"data_types_loops":["CUSTOM_NORMAL"],
             "loop_mapping":"TOPOLOGY","mix_mode":"MIX","mix_factor":0.35
         }),
@@ -1642,7 +1659,7 @@ fn custom_normal_transfer_keeps_typed_codes_and_corner_order() -> Result<(), Box
     Ok(())
 }
 
-const BLENDER_COLOR_MIX_SCRIPT: &str = r#"
+const BLENDER_COLOR_MIX_SCRIPT: &str = r"
 import bpy, json, os, sys
 root=os.path.realpath(sys.argv[sys.argv.index('--')+1])
 def mesh(name):
@@ -1677,7 +1694,7 @@ for mode in ('REPLACE','ABOVE_THRESHOLD','BELOW_THRESHOLD','MIX','ADD','SUB','MU
     evaluated.to_mesh_clear()
 with open(os.path.join(root,'color-mix-oracle.json'),'w') as f:
     json.dump({'source':source_input,'destination':destination_input,'outputs':result},f)
-"#;
+";
 
 #[test]
 fn float_and_byte_color_mix_modes_match_blender() -> Result<(), Box<dyn Error>> {
@@ -1733,7 +1750,7 @@ fn float_and_byte_color_mix_modes_match_blender() -> Result<(), Box<dyn Error>> 
         }
         let transfer = modifier(
             "data_transfer",
-            json!({
+            &json!({
                 "object":"source","use_vert_data":true,"data_types_verts":["COLOR_VERTEX"],
                 "vert_mapping":"TOPOLOGY","layers_vcol_vert_select_src":"ALL",
                 "layers_vcol_vert_select_dst":"NAME","mix_mode":mode,"mix_factor":0.4
@@ -1760,7 +1777,7 @@ fn float_and_byte_color_mix_modes_match_blender() -> Result<(), Box<dyn Error>> 
     Ok(())
 }
 
-const BLENDER_ACTIVE_COLOR_SCRIPT: &str = r#"
+const BLENDER_ACTIVE_COLOR_SCRIPT: &str = r"
 import bpy, json, os, sys
 root=os.path.realpath(sys.argv[sys.argv.index('--')+1])
 def mesh(name):
@@ -1783,7 +1800,7 @@ with open(os.path.join(root,'active-color-oracle.json'),'w') as f:
                'destination':[list(item.color) for item in destination_layer.data],
                'output':[list(item.color) for item in output.color_attributes['ActiveColor'].data]},f)
 evaluated.to_mesh_clear()
-"#;
+";
 
 #[test]
 fn active_color_store_selectors_match_blender_all_name_path() -> Result<(), Box<dyn Error>> {
@@ -1862,7 +1879,7 @@ fn active_color_store_selectors_match_blender_all_name_path() -> Result<(), Box<
     )]);
     let transfer = modifier(
         "data_transfer",
-        json!({
+        &json!({
             "object":"source","use_vert_data":true,"data_types_verts":["COLOR_VERTEX"],
             "vert_mapping":"TOPOLOGY","layers_vcol_vert_select_src":"ACTIVE",
             "layers_vcol_vert_select_dst":"ACTIVE","mix_mode":"REPLACE","mix_factor":1.0
@@ -1938,7 +1955,7 @@ fn active_color_store_selectors_match_blender_all_name_path() -> Result<(), Box<
     Ok(())
 }
 
-const BLENDER_UV_ISLAND_SCRIPT: &str = r#"
+const BLENDER_UV_ISLAND_SCRIPT: &str = r"
 import bpy, json, os, sys
 root=os.path.realpath(sys.argv[sys.argv.index('--')+1])
 def mesh(name, verts, faces):
@@ -1967,7 +1984,7 @@ for precision in (0.0,1.0):
     result[str(int(precision))]=[list(item.uv) for item in output.uv_layers['UVMap'].data]
     evaluated.to_mesh_clear()
 with open(os.path.join(root,'uv-island-oracle.json'),'w') as f: json.dump(result,f)
-"#;
+";
 
 #[test]
 fn uv_island_selection_and_precision_match_blender() -> Result<(), Box<dyn Error>> {
@@ -2056,7 +2073,7 @@ fn uv_island_selection_and_precision_match_blender() -> Result<(), Box<dyn Error
         );
         let modifier_4 = modifier(
             "data_transfer",
-            json!({
+            &json!({
                 "object":"source","use_object_transform":true,"use_loop_data":true,"data_types_loops":["UV"],
                 "loop_mapping":"NEAREST_POLY","layers_uv_select_src":"ALL","layers_uv_select_dst":"NAME",
                 "mix_mode":"REPLACE","mix_factor":1.0,"islands_precision":precision
@@ -2090,7 +2107,7 @@ fn uv_island_selection_and_precision_match_blender() -> Result<(), Box<dyn Error
     Ok(())
 }
 
-const BLENDER_LOOP_MAPPING_SCRIPT: &str = r#"
+const BLENDER_LOOP_MAPPING_SCRIPT: &str = r"
 import bpy, json, os, sys
 root=os.path.realpath(sys.argv[sys.argv.index('--')+1])
 def obj(name,verts,faces):
@@ -2117,7 +2134,7 @@ for mapping in ('NEAREST_NORMAL','NEAREST_POLYNOR','NEAREST_POLY','POLYINTERP_NE
     result[mapping]=[list(item.uv) for item in me.uv_layers['UVMap'].data]
     ev.to_mesh_clear()
 with open(os.path.join(root,'loop-mapping-oracle.json'),'w') as f: json.dump(result,f)
-"#;
+";
 
 #[test]
 fn loop_mapping_families_match_blender_with_corner_association() -> Result<(), Box<dyn Error>> {
@@ -2181,7 +2198,7 @@ fn loop_mapping_families_match_blender_with_corner_association() -> Result<(), B
         );
         let transfer = modifier(
             "data_transfer",
-            json!({
+            &json!({
                 "object":"source","use_object_transform":true,"use_loop_data":true,"data_types_loops":["UV"],
                 "loop_mapping":mapping,"layers_uv_select_src":"ALL","layers_uv_select_dst":"NAME",
                 "mix_mode":"REPLACE","mix_factor":1.0,"use_max_distance":true,"max_distance":5.0
@@ -2207,7 +2224,7 @@ fn loop_mapping_families_match_blender_with_corner_association() -> Result<(), B
     Ok(())
 }
 
-const BLENDER_DOMAIN_MAPPING_SCRIPT: &str = r#"
+const BLENDER_DOMAIN_MAPPING_SCRIPT: &str = r"
 import bpy, json, os, sys
 root=os.path.realpath(sys.argv[sys.argv.index('--')+1])
 def make(name,verts,faces):
@@ -2277,14 +2294,14 @@ for label,selected in (('PNORPROJ_OBLIQUE_HIT',19),('PNORPROJ_OBLIQUE_MISS',0)):
     bpy.context.view_layer.update(); ev=dest.evaluated_get(bpy.context.evaluated_depsgraph_get()); me=ev.to_mesh()
     face_result[label]=[me.attributes['freestyle_face'].data[i].value for i in range(len(me.polygons))]; ev.to_mesh_clear()
 with open(os.path.join(root,'domain-mapping-oracle.json'),'w') as f: json.dump({'edge':edge_result,'face':face_result},f)
-"#;
+";
 
 fn set_blender_attribute(
     mesh: &mut Mesh,
     name: &str,
     domain: &str,
     data_type: &str,
-    values: Value,
+    values: &Value,
 ) -> Result<(), Box<dyn Error>> {
     let attributes = mesh
         .attributes
@@ -2402,7 +2419,7 @@ fn edge_and_polygon_mapping_families_match_blender() -> Result<(), Box<dyn Error
         "crease_edge",
         "EDGE",
         "FLOAT",
-        json!([0.1, 0.3, 0.5, 0.7]),
+        &json!([0.1, 0.3, 0.5, 0.7]),
     )?;
     let mut operands = BTreeMap::new();
     operands.insert(
@@ -2427,11 +2444,11 @@ fn edge_and_polygon_mapping_families_match_blender() -> Result<(), Box<dyn Error
             "crease_edge",
             "EDGE",
             "FLOAT",
-            json!([0.0, 0.0, 0.0]),
+            &json!([0.0, 0.0, 0.0]),
         )?;
         let transfer = modifier(
             "data_transfer",
-            json!({
+            &json!({
                 "object":"source","use_object_transform":true,"use_edge_data":true,"data_types_edges":["CREASE"],
                 "edge_mapping":mapping,"mix_mode":"REPLACE","mix_factor":1.0,
                 "use_max_distance":true,"max_distance":5.0,"ray_radius":0.15
@@ -2458,11 +2475,11 @@ fn edge_and_polygon_mapping_families_match_blender() -> Result<(), Box<dyn Error
         "crease_edge",
         "EDGE",
         "FLOAT",
-        json!([0.0, 0.0, 0.0]),
+        &json!([0.0, 0.0, 0.0]),
     )?;
     let radius_zero_transfer = modifier(
         "data_transfer",
-        json!({
+        &json!({
             "object":"source","use_object_transform":true,"use_edge_data":true,"data_types_edges":["CREASE"],
             "edge_mapping":"EDGEINTERP_VNORPROJ","mix_mode":"REPLACE","mix_factor":1.0,
             "use_max_distance":true,"max_distance":5.0,"ray_radius":0.0
@@ -2502,11 +2519,11 @@ fn edge_and_polygon_mapping_families_match_blender() -> Result<(), Box<dyn Error
         "crease_edge",
         "EDGE",
         "FLOAT",
-        json!([0.0, 0.0, 0.0, 0.0]),
+        &json!([0.0, 0.0, 0.0, 0.0]),
     )?;
     let transfer = modifier(
         "data_transfer",
-        json!({
+        &json!({
             "object":"source","use_object_transform":true,"use_edge_data":true,"data_types_edges":["CREASE"],
             "edge_mapping":"TOPOLOGY","mix_mode":"REPLACE","mix_factor":1.0
         }),
@@ -2540,7 +2557,7 @@ fn edge_and_polygon_mapping_families_match_blender() -> Result<(), Box<dyn Error
         "freestyle_face",
         "FACE",
         "BOOLEAN",
-        json!([false, true]),
+        &json!([false, true]),
     )?;
     let mut face_operands = BTreeMap::new();
     face_operands.insert(
@@ -2564,11 +2581,11 @@ fn edge_and_polygon_mapping_families_match_blender() -> Result<(), Box<dyn Error
             "freestyle_face",
             "FACE",
             "BOOLEAN",
-            json!([false, false]),
+            &json!([false, false]),
         )?;
         let transfer = modifier(
             "data_transfer",
-            json!({
+            &json!({
                 "object":"source","use_object_transform":true,"use_poly_data":true,"data_types_polys":["FREESTYLE_FACE"],
                 "poly_mapping":mapping,"mix_mode":"REPLACE","mix_factor":1.0,
                 "use_max_distance":true,"max_distance":5.0,"ray_radius":0.01
@@ -2625,7 +2642,7 @@ fn edge_and_polygon_mapping_families_match_blender() -> Result<(), Box<dyn Error
             "freestyle_face",
             "FACE",
             "BOOLEAN",
-            json!(face_flags),
+            &json!(face_flags),
         )?;
         let mut oblique_operands = BTreeMap::new();
         oblique_operands.insert(
@@ -2641,11 +2658,11 @@ fn edge_and_polygon_mapping_families_match_blender() -> Result<(), Box<dyn Error
             "freestyle_face",
             "FACE",
             "BOOLEAN",
-            json!([false]),
+            &json!([false]),
         )?;
         let oblique_transfer = modifier(
             "data_transfer",
-            json!({
+            &json!({
                 "object":"source","use_object_transform":true,"use_poly_data":true,
                 "data_types_polys":["FREESTYLE_FACE"],"poly_mapping":"POLYINTERP_PNORPROJ",
                 "mix_mode":"REPLACE","mix_factor":1.0,"use_max_distance":true,
@@ -2668,7 +2685,7 @@ fn edge_and_polygon_mapping_families_match_blender() -> Result<(), Box<dyn Error
     Ok(())
 }
 
-const BLENDER_ATTRIBUTE_DOMAINS_SCRIPT: &str = r#"
+const BLENDER_ATTRIBUTE_DOMAINS_SCRIPT: &str = r"
 import bpy, json, os, sys
 root=os.path.realpath(sys.argv[sys.argv.index('--')+1])
 verts=[(0,0,0),(1,0,0),(1,1,0),(0,1,0)]
@@ -2723,7 +2740,7 @@ for data_type,domain in (
     result[data_type]=values
     evaluated.to_mesh_clear()
 with open(os.path.join(root,'attribute-domains-oracle.json'),'w') as f: json.dump(result,f)
-"#;
+";
 
 #[test]
 fn every_data_transfer_attribute_domain_matches_blender() -> Result<(), Box<dyn Error>> {
@@ -2752,30 +2769,36 @@ fn every_data_transfer_attribute_domain_matches_blender() -> Result<(), Box<dyn 
         "bevel_weight_vert",
         "point",
         "float",
-        json!([0.1, 0.3, 0.5, 0.7]),
+        &json!([0.1, 0.3, 0.5, 0.7]),
     )?;
     set_domain_attribute(
         &mut source,
         "crease_edge",
         "edge",
         "float",
-        json!([0.1, 0.3, 0.5, 0.7]),
+        &json!([0.1, 0.3, 0.5, 0.7]),
     )?;
     set_domain_attribute(
         &mut source,
         "bevel_weight_edge",
         "edge",
         "float",
-        json!([0.2, 0.4, 0.6, 0.8]),
+        &json!([0.2, 0.4, 0.6, 0.8]),
     )?;
     set_domain_attribute(
         &mut source,
         "freestyle_edge",
         "edge",
         "bool",
-        json!([false, true, false, true]),
+        &json!([false, true, false, true]),
     )?;
-    set_domain_attribute(&mut source, "freestyle_face", "face", "bool", json!([true]))?;
+    set_domain_attribute(
+        &mut source,
+        "freestyle_face",
+        "face",
+        "bool",
+        &json!([true]),
+    )?;
     set_edge_flags(&mut source, "sharp", Some((0, 1)));
     set_edge_flags(&mut source, "seam", Some((1, 2)));
     set_face_flags(&mut source, "shade_smooth", &[true]);
@@ -2799,35 +2822,35 @@ fn every_data_transfer_attribute_domain_matches_blender() -> Result<(), Box<dyn 
             "bevel_weight_vert",
             "point",
             "float",
-            json!([0.8, 0.6, 0.4, 0.2]),
+            &json!([0.8, 0.6, 0.4, 0.2]),
         )?;
         set_domain_attribute(
             &mut destination,
             "crease_edge",
             "edge",
             "float",
-            json!([0.0, 0.0, 0.0, 0.0]),
+            &json!([0.0, 0.0, 0.0, 0.0]),
         )?;
         set_domain_attribute(
             &mut destination,
             "bevel_weight_edge",
             "edge",
             "float",
-            json!([0.0, 0.0, 0.0, 0.0]),
+            &json!([0.0, 0.0, 0.0, 0.0]),
         )?;
         set_domain_attribute(
             &mut destination,
             "freestyle_edge",
             "edge",
             "bool",
-            json!([false, false, false, false]),
+            &json!([false, false, false, false]),
         )?;
         set_domain_attribute(
             &mut destination,
             "freestyle_face",
             "face",
             "bool",
-            json!([false]),
+            &json!([false]),
         )?;
         set_edge_flags(&mut destination, "sharp", None);
         set_edge_flags(&mut destination, "seam", None);
@@ -2850,7 +2873,7 @@ fn every_data_transfer_attribute_domain_matches_blender() -> Result<(), Box<dyn 
         params.insert("object".to_owned(), json!("source"));
         params.insert("mix_mode".to_owned(), json!("REPLACE"));
         params.insert("mix_factor".to_owned(), json!(1.0));
-        let transfer = modifier("data_transfer", Value::Object(params))?;
+        let transfer = modifier("data_transfer", &Value::Object(params))?;
         let actual = evaluate_with_context(
             &destination,
             &transfer,
@@ -2883,7 +2906,7 @@ fn every_data_transfer_attribute_domain_matches_blender() -> Result<(), Box<dyn 
     }
     Ok(())
 }
-const BLENDER_SHARP_NORMAL_TRANSFER_SCRIPT: &str = r#"
+const BLENDER_SHARP_NORMAL_TRANSFER_SCRIPT: &str = r"
 import bpy, json
 positions=[(0,0,0),(1,0,0),(0,1,0),(0,0,1)]
 faces=[(0,1,2),(1,0,3)]
@@ -2908,7 +2931,7 @@ json.dump({
     'corner_normals':[list(corner.vector) for corner in mesh.corner_normals],
 },open('sharp-normal-oracle.json','w'))
 evaluated.to_mesh_clear()
-"#;
+";
 
 #[test]
 fn transferred_sharp_edge_separates_derived_corner_normals() -> Result<(), Box<dyn Error>> {
@@ -2943,7 +2966,7 @@ fn transferred_sharp_edge_separates_derived_corner_normals() -> Result<(), Box<d
     set_face_flags(&mut destination, "shade_smooth", &[true, true]);
     let transfer = modifier(
         "data_transfer",
-        json!({
+        &json!({
             "object":"source","use_edge_data":true,"data_types_edges":["SHARP_EDGE"],
             "edge_mapping":"TOPOLOGY","mix_mode":"REPLACE","mix_factor":1.0,
         }),

@@ -32,7 +32,7 @@ const VERTICES: [[f64; 3]; 9] = [
     [2.9, 2.0, 0.6],
 ];
 
-const BLENDER_NORMAL_PROBE: &str = r#"
+const BLENDER_NORMAL_PROBE: &str = r"
 import bpy, json, os, sys
 root = os.path.realpath(sys.argv[sys.argv.index('--') + 1])
 cases = json.load(open(os.path.join(root, 'cases.json'), encoding='utf-8'))
@@ -120,18 +120,18 @@ for case in cases:
     results[case['name']] = faces
 json.dump(results, open(os.path.join(root, 'results.json'), 'w'), separators=(',', ':'))
 print('NORMAL_PROBE_DONE', len(results))
-"#;
+";
 
 fn parameter_case(
     name: &str,
     modifier_type: &str,
-    params: Value,
-    target: Option<Value>,
-    groups: Value,
-    face_strength: Option<Vec<i32>>,
-    sharp_edges: Vec<[usize; 2]>,
-    smooth: Vec<bool>,
-    custom_normals: Option<Vec<Vec<[f64; 3]>>>,
+    params: &Value,
+    target: Option<&Value>,
+    groups: &Value,
+    face_strength: Option<&[i32]>,
+    sharp_edges: &[[usize; 2]],
+    smooth: &[bool],
+    custom_normals: Option<&[Vec<[f64; 3]>]>,
 ) -> Value {
     json!({
         "name":name,
@@ -160,42 +160,42 @@ fn normal_edit_cases() -> Vec<Value> {
     let mut cases = Vec::new();
     for (mix_mode, factor, limit) in [
         ("COPY", 0.48, 0.72),
-        ("ADD", 0.65, 3.141592653589793),
+        ("ADD", 0.65, std::f64::consts::PI),
         ("SUB", 0.4, 0.35),
         ("MUL", 0.7, 0.9),
     ] {
         cases.push(parameter_case(
             &format!("radial_{mix_mode}"),
             "NORMAL_EDIT",
-            json!({"mode":"RADIAL","mix_mode":mix_mode,"mix_factor":factor,"mix_limit":limit,"target":"target","offset":[0.5,-0.2,0.1],"no_polynors_fix":true}),
-            Some(radial_target.clone()),
-            json!({}),
+            &json!({"mode":"RADIAL","mix_mode":mix_mode,"mix_factor":factor,"mix_limit":limit,"target":"target","offset":[0.5,-0.2,0.1],"no_polynors_fix":true}),
+            Some(&radial_target.clone()),
+            &json!({}),
             None,
-            vec![],
-            smooth.clone(),
+            &[],
+            &smooth.clone(),
             None,
         ));
     }
     cases.push(parameter_case(
         "radial_noop_ellipsoid_scale",
         "NORMAL_EDIT",
-        json!({"mode":"RADIAL","mix_mode":"COPY","mix_factor":1.0,"mix_limit":std::f64::consts::PI,"target":"target","no_polynors_fix":true}),
-        Some(radial_target.clone()),
-        json!({}),
+        &json!({"mode":"RADIAL","mix_mode":"COPY","mix_factor":1.0,"mix_limit":std::f64::consts::PI,"target":"target","no_polynors_fix":true}),
+        Some(&radial_target.clone()),
+        &json!({}),
         None,
-        vec![],
-        smooth.clone(),
+        &[],
+        &smooth.clone(),
         None,
     ));
     cases.push(parameter_case(
         "radial_group_inverted",
         "NORMAL_EDIT",
-        json!({"mode":"RADIAL","mix_mode":"COPY","mix_factor":0.55,"mix_limit":std::f64::consts::PI,"target":"target","vertex_group":"G","invert_vertex_group":true,"no_polynors_fix":true}),
-        Some(radial_target),
-        group.clone(),
+        &json!({"mode":"RADIAL","mix_mode":"COPY","mix_factor":0.55,"mix_limit":std::f64::consts::PI,"target":"target","vertex_group":"G","invert_vertex_group":true,"no_polynors_fix":true}),
+        Some(&radial_target),
+        &group.clone(),
         None,
-        vec![],
-        smooth.clone(),
+        &[],
+        &smooth.clone(),
         None,
     ));
     for (name, scale) in [
@@ -205,55 +205,55 @@ fn normal_edit_cases() -> Vec<Value> {
         cases.push(parameter_case(
             name,
             "NORMAL_EDIT",
-            json!({"mode":"RADIAL","mix_mode":"ADD","mix_factor":0.55,"mix_limit":1.2,"target":"target","no_polynors_fix":true}),
-            Some(target_operand([2.5, -1.5, 1.0], scale)),
-            json!({}),
+            &json!({"mode":"RADIAL","mix_mode":"ADD","mix_factor":0.55,"mix_limit":1.2,"target":"target","no_polynors_fix":true}),
+            Some(&target_operand([2.5, -1.5, 1.0], scale)),
+            &json!({}),
             None,
-            vec![],
-            smooth.clone(),
+            &[],
+            &smooth.clone(),
             None,
         ));
     }
     let source_custom_normals = vec![
-        vec![[0.2, 0.1, 0.9746794344808963]; 4],
-        vec![[0.2, 0.1, 0.9746794344808963]; 4],
-        vec![[0.2, 0.1, 0.9746794344808963]; 4],
-        vec![[0.2, 0.1, 0.9746794344808963]; 3],
-        vec![[0.2, 0.1, 0.9746794344808963]; 3],
+        vec![[0.2, 0.1, 0.974_679_434_480_896_3]; 4],
+        vec![[0.2, 0.1, 0.974_679_434_480_896_3]; 4],
+        vec![[0.2, 0.1, 0.974_679_434_480_896_3]; 4],
+        vec![[0.2, 0.1, 0.974_679_434_480_896_3]; 3],
+        vec![[0.2, 0.1, 0.974_679_434_480_896_3]; 3],
     ];
     cases.push(parameter_case(
         "directional_mixes_from_existing_corner_normals",
         "NORMAL_EDIT",
-        json!({"mode":"DIRECTIONAL","mix_mode":"ADD","mix_factor":0.38,"mix_limit":0.8,"target":"target","use_direction_parallel":false,"no_polynors_fix":true}),
-        Some(target_operand([2.5, -1.5, 1.0], [1.0, 1.0, 1.0])),
-        json!({}),
+        &json!({"mode":"DIRECTIONAL","mix_mode":"ADD","mix_factor":0.38,"mix_limit":0.8,"target":"target","use_direction_parallel":false,"no_polynors_fix":true}),
+        Some(&target_operand([2.5, -1.5, 1.0], [1.0, 1.0, 1.0])),
+        &json!({}),
         None,
-        vec![],
-        smooth.clone(),
-        Some(source_custom_normals),
+        &[],
+        &smooth.clone(),
+        Some(&source_custom_normals),
     ));
     for parallel in [false, true] {
         cases.push(parameter_case(
             &format!("directional_parallel_{parallel}"),
             "NORMAL_EDIT",
-            json!({"mode":"DIRECTIONAL","mix_mode":"ADD","mix_factor":0.63,"mix_limit":1.25,"target":"target","offset":[0.5,0.1,-0.3],"use_direction_parallel":parallel,"no_polynors_fix":true}),
-            Some(target_operand([2.5, -1.5, 1.0], [1.0, 1.0, 1.0])),
-            json!({}),
+            &json!({"mode":"DIRECTIONAL","mix_mode":"ADD","mix_factor":0.63,"mix_limit":1.25,"target":"target","offset":[0.5,0.1,-0.3],"use_direction_parallel":parallel,"no_polynors_fix":true}),
+            Some(&target_operand([2.5, -1.5, 1.0], [1.0, 1.0, 1.0])),
+            &json!({}),
             None,
-            vec![],
-            smooth.clone(),
+            &[],
+            &smooth.clone(),
             None,
         ));
     }
     cases.push(parameter_case(
         "directional_group",
         "NORMAL_EDIT",
-        json!({"mode":"DIRECTIONAL","mix_mode":"SUB","mix_factor":0.7,"mix_limit":std::f64::consts::PI,"target":"target","vertex_group":"G","use_direction_parallel":false,"no_polynors_fix":true}),
-        Some(target_operand([2.5, -1.5, 1.0], [1.0, 1.0, 1.0])),
-        group,
+        &json!({"mode":"DIRECTIONAL","mix_mode":"SUB","mix_factor":0.7,"mix_limit":std::f64::consts::PI,"target":"target","vertex_group":"G","use_direction_parallel":false,"no_polynors_fix":true}),
+        Some(&target_operand([2.5, -1.5, 1.0], [1.0, 1.0, 1.0])),
+        &group,
         None,
-        vec![],
-        smooth.clone(),
+        &[],
+        &smooth.clone(),
         None,
     ));
     let mut transformed_target = target_operand([2.35, -1.65, 1.2], [2.0, 0.55, 1.35]);
@@ -271,12 +271,12 @@ fn normal_edit_cases() -> Vec<Value> {
         let mut case = parameter_case(
             &format!("f32_owner_target_{mode}_{parallel}"),
             "NORMAL_EDIT",
-            json!({"mode":mode,"mix_mode":"COPY","mix_factor":1.0,"mix_limit":std::f64::consts::PI,"target":"target","offset":[0.2,-0.35,0.15],"use_direction_parallel":parallel,"no_polynors_fix":true}),
-            Some(transformed_target.clone()),
-            json!({}),
+            &json!({"mode":mode,"mix_mode":"COPY","mix_factor":1.0,"mix_limit":std::f64::consts::PI,"target":"target","offset":[0.2,-0.35,0.15],"use_direction_parallel":parallel,"no_polynors_fix":true}),
+            Some(&transformed_target.clone()),
+            &json!({}),
             None,
-            vec![],
-            smooth.clone(),
+            &[],
+            &smooth.clone(),
             None,
         );
         case["subject_transform"] = subject_transform.clone();
@@ -289,12 +289,12 @@ fn normal_edit_cases() -> Vec<Value> {
     cases.push(parameter_case(
         "radial_bounds_offset",
         "NORMAL_EDIT",
-        json!({"mode":"RADIAL","mix_mode":"COPY","mix_factor":0.45,"mix_limit":std::f64::consts::PI,"offset":[0.3,-0.2,0.1],"no_polynors_fix":true}),
+        &json!({"mode":"RADIAL","mix_mode":"COPY","mix_factor":0.45,"mix_limit":std::f64::consts::PI,"offset":[0.3,-0.2,0.1],"no_polynors_fix":true}),
         None,
-        json!({}),
+        &json!({}),
         None,
-        vec![],
-        smooth,
+        &[],
+        &smooth,
         None,
     ));
     cases
@@ -312,12 +312,12 @@ fn weighted_normal_cases() -> Result<Vec<Value>, Box<dyn Error>> {
         cases.push(parameter_case(
             &format!("{mode}_weight_{weight}"),
             "WEIGHTED_NORMAL",
-            json!({"mode":mode,"weight":weight,"thresh":0.01,"keep_sharp":false,"use_face_influence":false}),
+            &json!({"mode":mode,"weight":weight,"thresh":0.01,"keep_sharp":false,"use_face_influence":false}),
             None,
-            json!({}),
+            &json!({}),
             None,
-            vec![],
-            smooth.clone(),
+            &[],
+            &smooth.clone(),
             None,
         ));
     }
@@ -325,92 +325,92 @@ fn weighted_normal_cases() -> Result<Vec<Value>, Box<dyn Error>> {
         cases.push(parameter_case(
             &format!("FACE_AREA_weight_{weight}"),
             "WEIGHTED_NORMAL",
-            json!({"mode":"FACE_AREA","weight":weight,"thresh":0.01}),
+            &json!({"mode":"FACE_AREA","weight":weight,"thresh":0.01}),
             None,
-            json!({}),
+            &json!({}),
             None,
-            vec![],
-            smooth.clone(),
+            &[],
+            &smooth.clone(),
             None,
         ));
     }
     cases.push(parameter_case(
         "FACE_AREA_thresh_0_5",
         "WEIGHTED_NORMAL",
-        json!({"mode":"FACE_AREA","weight":60,"thresh":0.5}),
+        &json!({"mode":"FACE_AREA","weight":60,"thresh":0.5}),
         None,
-        json!({}),
+        &json!({}),
         None,
-        vec![],
-        smooth.clone(),
+        &[],
+        &smooth.clone(),
         None,
     ));
     cases.push(parameter_case(
         "FACE_AREA_keep_sharp",
         "WEIGHTED_NORMAL",
-        json!({"mode":"FACE_AREA","weight":50,"thresh":0.01,"keep_sharp":true}),
+        &json!({"mode":"FACE_AREA","weight":50,"thresh":0.01,"keep_sharp":true}),
         None,
-        json!({}),
+        &json!({}),
         None,
-        vec![[1, 4], [4, 7]],
-        smooth.clone(),
+        &[[1, 4], [4, 7]],
+        &smooth.clone(),
         None,
     ));
     cases.push(parameter_case(
         "CORNER_ANGLE_keep_sharp",
         "WEIGHTED_NORMAL",
-        json!({"mode":"CORNER_ANGLE","weight":65,"thresh":0.01,"keep_sharp":true}),
+        &json!({"mode":"CORNER_ANGLE","weight":65,"thresh":0.01,"keep_sharp":true}),
         None,
-        json!({}),
+        &json!({}),
         None,
-        vec![[1, 4], [4, 7]],
-        smooth.clone(),
+        &[[1, 4], [4, 7]],
+        &smooth.clone(),
         None,
     ));
     cases.push(parameter_case(
         "FACE_AREA_with_face_influence",
         "WEIGHTED_NORMAL",
-        json!({"mode":"FACE_AREA","weight":50,"thresh":0.01,"use_face_influence":true}),
+        &json!({"mode":"FACE_AREA","weight":50,"thresh":0.01,"use_face_influence":true}),
         None,
-        json!({}),
-        Some(vec![0, 1, 2, 1, 0]),
-        vec![],
-        smooth.clone(),
+        &json!({}),
+        Some(&[0, 1, 2, 1, 0]),
+        &[],
+        &smooth.clone(),
         None,
     ));
     cases.push(parameter_case(
         "FACE_AREA_WITH_ANGLE_strength_keep_sharp",
         "WEIGHTED_NORMAL",
-        json!({"mode":"FACE_AREA_WITH_ANGLE","weight":70,"thresh":0.01,"use_face_influence":true,"keep_sharp":true}),
+        &json!({"mode":"FACE_AREA_WITH_ANGLE","weight":70,"thresh":0.01,"use_face_influence":true,"keep_sharp":true}),
         None,
-        json!({}),
-        Some(vec![0, 3, 1, 2, 2]),
-        vec![[1,4],[4,7]],
-        smooth.clone(),
+        &json!({}),
+        Some(&[0, 3, 1, 2, 2]),
+        &[[1,4],[4,7]],
+        &smooth.clone(),
         None,
     ));
     for invert in [false, true] {
         cases.push(parameter_case(
             &format!("vertex_group_invert_{invert}"),
             "WEIGHTED_NORMAL",
-            json!({"mode":"FACE_AREA","weight":80,"thresh":0.01,"vertex_group":"G","invert_vertex_group":invert}),
+            &json!({"mode":"FACE_AREA","weight":80,"thresh":0.01,"vertex_group":"G","invert_vertex_group":invert}),
             None,
-            group.clone(),
+            &group.clone(),
             None,
-            vec![],
-            smooth.clone(),
+            &[],
+            &smooth.clone(),
             None,
         ));
     }
     cases.push(parameter_case(
         "mixed_smooth_faces",
         "WEIGHTED_NORMAL",
-        json!({"mode":"CORNER_ANGLE","weight":30,"thresh":0.01}),
+        &json!({"mode":"CORNER_ANGLE","weight":30,"thresh":0.01}),
         None,
-        json!({}),
+        &json!({}),
         None,
-        vec![],
-        vec![false, true, true, false, true],
+        &[],
+        &[false, true, true, false, true],
         None,
     ));
     cases.push(weighted_threshold_boundary_case());
@@ -760,9 +760,9 @@ fn evaluate_case(case: &Value, transform: Option<&Value>) -> Result<Mesh, Box<dy
                     sy.as_f64().ok_or("target scale y is not numeric")?,
                     sz.as_f64().ok_or("target scale z is not numeric")?,
                 ),
-                selected_bones: Default::default(),
-                deforming_bones: Default::default(),
-                layer_selection: Default::default(),
+                selected_bones: std::collections::BTreeSet::default(),
+                deforming_bones: std::collections::BTreeSet::default(),
+                layer_selection: AttributeLayerSelection::default(),
             }],
         );
     }
@@ -1101,9 +1101,9 @@ fn normal_edit_direction_uses_target_minus_vertex() -> Result<(), Box<dyn Error>
             camera: None,
             armature: false,
             object_scale: DVec3::ONE,
-            selected_bones: Default::default(),
-            deforming_bones: Default::default(),
-            layer_selection: Default::default(),
+            selected_bones: std::collections::BTreeSet::default(),
+            deforming_bones: std::collections::BTreeSet::default(),
+            layer_selection: AttributeLayerSelection::default(),
         }],
     );
     let result = evaluate_with_context(
