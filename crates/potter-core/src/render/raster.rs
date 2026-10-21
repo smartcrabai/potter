@@ -316,9 +316,28 @@ pub(crate) struct SurfaceHit {
     pub(crate) view: DVec3,
 }
 
-/// Linear RGBA at `hit` on `triangle`.
+/// What a surface shader returns at a hit: its linear RGBA, and the tint of the transparent share it passes.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SurfaceSample {
+    pub(crate) color: [f64; 4],
+    /// The Transparent closure's colour per channel, as `(1 - alpha) * tint` is its transmittance. White for a
+    /// surface that passes nothing, and a Blender DITHERED material's channel mean (`scene.rs` `beauty_tint`).
+    pub(crate) transparent_tint: [f64; 3],
+}
+
+impl SurfaceSample {
+    /// A sample with no transparent share: its colour, and a white tint.
+    pub(crate) fn opaque(color: [f64; 4]) -> Self {
+        Self {
+            color,
+            transparent_tint: [1.0; 3],
+        }
+    }
+}
+
+/// Linear RGBA and the transparent tint at `hit` on `triangle`.
 pub(crate) trait SurfaceShader {
-    fn shade(&self, triangle: &Triangle, hit: &SurfaceHit) -> Result<[f64; 4]>;
+    fn shade(&self, triangle: &Triangle, hit: &SurfaceHit) -> Result<SurfaceSample>;
 }
 
 /// The camera's view axes in world space, in Blender's view-space order: `right`, `up`, and
@@ -497,6 +516,7 @@ struct VisibleHit {
     triangle_index: usize,
     hit: Hit,
     color: [f64; 4],
+    transparent_tint: [f64; 3],
 }
 
 /// The world ray through a pixel centre, or `None` when the projection has no ray there (outside a fisheye's circle).
@@ -1572,13 +1592,13 @@ fn shading_normal(triangle: &PreparedTriangle, hit: Hit) -> DVec3 {
     })
 }
 
-/// Linear RGBA at a visible hit: the surface shader's when one is present, otherwise the triangle's colour.
+/// The surface sample at a visible hit: the surface shader's when one is present, otherwise the triangle's colour.
 fn hit_color(
     triangle: &PreparedTriangle,
     hit: Hit,
     ray: Ray,
     shader: Option<&dyn SurfaceShader>,
-) -> Result<[f64; 4]> {
+) -> Result<SurfaceSample> {
     match shader {
         Some(shader) => {
             let point = ray.origin + ray.direction * hit.distance;
@@ -1592,7 +1612,7 @@ fn hit_color(
             };
             shader.shade(&triangle.source, &surface)
         }
-        _ => Ok(triangle.source.color),
+        _ => Ok(SurfaceSample::opaque(triangle.source.color)),
     }
 }
 
@@ -1630,16 +1650,23 @@ fn nearest_visible_hit(
             return Ok(None);
         };
         let triangle = &triangles[triangle_index];
-        let color = hit_color(triangle, hit, ray, shader)?;
-        if hit_opacity(&triangle.source, color) > 0.0 {
+        let sample = hit_color(triangle, hit, ray, shader)?;
+        // A surface with no opacity still takes part when its transparent share tints what lies behind it.
+        if hit_opacity(&triangle.source, sample.color) > 0.0 || !is_white(sample.transparent_tint) {
             return Ok(Some(VisibleHit {
                 triangle_index,
                 hit,
-                color,
+                color: sample.color,
+                transparent_tint: sample.transparent_tint,
             }));
         }
         cursor = Some((hit.depth, triangle_index));
     }
+}
+
+/// Whether a transparent tint passes every channel unchanged.
+fn is_white(tint: [f64; 3]) -> bool {
+    tint.iter().all(|&channel| (channel - 1.0).abs() <= 1.0e-12)
 }
 
 fn composite_sample(
@@ -1663,21 +1690,27 @@ fn composite_sample(
         let Some(hit) = intersect_triangle(triangle, ray, frame) else {
             continue;
         };
-        let color = cached_hit
+        let sample = cached_hit
             .filter(|cached| {
                 cached.triangle_index == triangle_index && equal_f64(cached.hit.depth, hit.depth)
             })
             .map_or_else(
                 || hit_color(triangle, hit, ray, shader),
-                |cached| Ok(cached.color),
+                |cached| {
+                    Ok(SurfaceSample {
+                        color: cached.color,
+                        transparent_tint: cached.transparent_tint,
+                    })
+                },
             )?;
-        if hit_opacity(&triangle.source, color) <= 0.0 {
+        if hit_opacity(&triangle.source, sample.color) <= 0.0 && is_white(sample.transparent_tint) {
             continue;
         }
         let visible_hit = VisibleHit {
             triangle_index,
             hit,
-            color,
+            color: sample.color,
+            transparent_tint: sample.transparent_tint,
         };
         let mut insert_at = hit_count;
         while insert_at > 0
@@ -1695,30 +1728,53 @@ fn composite_sample(
         hits[insert_at] = Some(visible_hit);
         hit_count = next_count;
     }
-    let mut transmittance = 1.0;
-    let mut alpha = 0.0;
-    let mut premultiplied = DVec3::ZERO;
-    for visible_hit in hits.iter().take(hit_count).flatten().copied() {
+    let layers = hits.iter().take(hit_count).flatten().map(|visible_hit| {
         let triangle = &triangles[visible_hit.triangle_index];
         let color = visible_hit.color;
-        let opacity = hit_opacity(&triangle.source, color);
-        let contribution = transmittance * opacity;
-        premultiplied += DVec3::new(color[0], color[1], color[2]) * contribution;
-        alpha += contribution;
-        transmittance *= 1.0 - opacity;
-        if transmittance <= 1.0e-6 {
+        Layer {
+            rgb: [color[0], color[1], color[2]],
+            opacity: hit_opacity(&triangle.source, color),
+            tint: visible_hit.transparent_tint,
+        }
+    });
+    Ok(composite_layers(layers, background))
+}
+
+/// One surface of a pixel's stack, for `composite_layers`.
+#[derive(Clone, Copy)]
+struct Layer {
+    rgb: [f64; 3],
+    /// The share of the light reaching this surface that it adds.
+    opacity: f64,
+    /// The colour of the share it passes: `(1 - opacity) * tint` is its transmittance per channel.
+    tint: [f64; 3],
+}
+
+/// Composites `layers` (nearest first) over `background`, as a pixel's film does. A layer adds its colour weighted by
+/// the transmittance reaching it and its opacity, then passes `(1 - opacity) * tint` of the light, so a Transparent
+/// BSDF's tint reaches what lies behind it channel by channel (`path.rs`, `throughput *= tint`). The film alpha is
+/// `1 - mean transmittance` over the background's alpha, the alpha EEVEE's film stores
+/// (`eevee_surf_deferred.bsl.hh`, `out_color.a`). With white tints this is the scalar composite of the layers.
+/// Returns the un-premultiplied colour and that alpha.
+fn composite_layers(layers: impl IntoIterator<Item = Layer>, background: [f64; 4]) -> [f64; 4] {
+    let mut transmittance = DVec3::ONE;
+    let mut premultiplied = DVec3::ZERO;
+    for layer in layers {
+        premultiplied += DVec3::from_array(layer.rgb) * (transmittance * layer.opacity);
+        transmittance *= DVec3::from_array(layer.tint) * (1.0 - layer.opacity);
+        if transmittance.max_element() <= 1.0e-6 {
             break;
         }
     }
     let background_alpha = background[3].clamp(0.0, 1.0);
-    premultiplied += DVec3::new(background[0], background[1], background[2])
+    premultiplied += DVec3::from_array([background[0], background[1], background[2]])
         * (transmittance * background_alpha);
-    alpha += transmittance * background_alpha;
+    let alpha = 1.0 - transmittance.element_sum() / 3.0 * (1.0 - background_alpha);
     if alpha <= f64::MIN_POSITIVE {
-        return Ok(background);
+        return background;
     }
     let color = premultiplied / alpha;
-    Ok([color.x, color.y, color.z, alpha])
+    [color.x, color.y, color.z, alpha]
 }
 
 fn prepare_triangles(triangles: &[Triangle]) -> Result<Vec<PreparedTriangle>> {
@@ -2655,11 +2711,11 @@ mod smooth_shading_tests {
     }
 
     impl SurfaceShader for RecordingShader {
-        fn shade(&self, _triangle: &Triangle, hit: &SurfaceHit) -> Result<[f64; 4]> {
+        fn shade(&self, _triangle: &Triangle, hit: &SurfaceHit) -> Result<SurfaceSample> {
             self.calls
                 .borrow_mut()
                 .push((hit.point, hit.normal, hit.geometric));
-            Ok([0.25, 0.5, 0.75, 1.0])
+            Ok(SurfaceSample::opaque([0.25, 0.5, 0.75, 1.0]))
         }
     }
 
@@ -2724,11 +2780,11 @@ mod smooth_shading_tests {
     }
 
     impl SurfaceShader for FrontShader {
-        fn shade(&self, triangle: &Triangle, _hit: &SurfaceHit) -> Result<[f64; 4]> {
+        fn shade(&self, triangle: &Triangle, _hit: &SurfaceHit) -> Result<SurfaceSample> {
             if triangle.object_index == 1 {
-                Ok(self.rgba)
+                Ok(SurfaceSample::opaque(self.rgba))
             } else {
-                Ok(triangle.color)
+                Ok(SurfaceSample::opaque(triangle.color))
             }
         }
     }
@@ -3079,30 +3135,18 @@ mod visibility_tests {
             layers.insert(at, (index, hit));
             layers.truncate(16);
         }
-        let mut transmittance = 1.0;
-        let mut alpha = 0.0;
-        let mut premultiplied = DVec3::ZERO;
-        for (index, _) in &layers {
-            let triangle = &triangles[*index];
-            let color = triangle.source.color;
-            let opacity = hit_opacity(&triangle.source, color);
-            let contribution = transmittance * opacity;
-            premultiplied += DVec3::new(color[0], color[1], color[2]) * contribution;
-            alpha += contribution;
-            transmittance *= 1.0 - opacity;
-            if transmittance <= 1.0e-6 {
-                break;
-            }
-        }
-        let background_alpha = background[3].clamp(0.0, 1.0);
-        premultiplied += DVec3::new(background[0], background[1], background[2])
-            * (transmittance * background_alpha);
-        alpha += transmittance * background_alpha;
-        if alpha <= f64::MIN_POSITIVE {
-            return background;
-        }
-        let color = premultiplied / alpha;
-        [color.x, color.y, color.z, alpha]
+        composite_layers(
+            layers.iter().map(|(index, _)| {
+                let triangle = &triangles[*index];
+                let color = triangle.source.color;
+                Layer {
+                    rgb: [color[0], color[1], color[2]],
+                    opacity: hit_opacity(&triangle.source, color),
+                    tint: [1.0; 3],
+                }
+            }),
+            background,
+        )
     }
 
     #[test]

@@ -36,8 +36,8 @@ use super::{
         sheen_coefficient, specular_coefficient,
     },
     raster::{
-        AlphaMode, Line, Mode, SurfaceHit, SurfaceShader, Triangle, ViewBasis, blend_color,
-        blend_corner_normals, blend_uv,
+        AlphaMode, Line, Mode, SurfaceHit, SurfaceSample, SurfaceShader, Triangle, ViewBasis,
+        blend_color, blend_corner_normals, blend_uv,
     },
     studio,
 };
@@ -1644,7 +1644,7 @@ pub(super) fn surface_shader<'a>(
 }
 
 impl SurfaceShader for SceneShader<'_> {
-    fn shade(&self, triangle: &Triangle, hit: &SurfaceHit) -> Result<[f64; 4]> {
+    fn shade(&self, triangle: &Triangle, hit: &SurfaceHit) -> Result<SurfaceSample> {
         let material = self.geometry.materials.get(triangle.material_index);
         let prepared = self.geometry.prepared.get(triangle.material_index);
         let graph_params = if triangle.lit_per_pixel {
@@ -1706,7 +1706,7 @@ impl SurfaceShader for SceneShader<'_> {
                 self.view.to_view(facing),
                 self.view.to_view(hit.view),
             );
-            return Ok([lit.x, lit.y, lit.z, alpha]);
+            return Ok(SurfaceSample::opaque([lit.x, lit.y, lit.z, alpha]));
         }
         let occluders = ShadowOccluders::new(
             self.doc,
@@ -1734,7 +1734,25 @@ impl SurfaceShader for SceneShader<'_> {
             self.images,
         )?;
         occluders.finish()?;
-        Ok(color)
+        Ok(SurfaceSample {
+            color,
+            transparent_tint: beauty_tint(material, params.transparent_tint),
+        })
+    }
+}
+
+/// The transparent tint the Beauty composite applies to a surface. EEVEE keeps a Transparent closure's colour per channel
+/// only for a BLENDED material (`ForwardPipeline::use_colored_transparency`, `GPU_MATFLAG_TRANSPARENT_MAYBE_COLORED`).
+/// A DITHERED material stores one alpha, `1 - average(transmittance)` (`eevee_surf_deferred.bsl.hh`, `out_color.a`), so
+/// its tint is the channel mean. `alpha_mode` `blend` is BLENDED; `opaque` and `clip` are DITHERED
+/// (`blend_bridge.py`, `surface_render_method`).
+fn beauty_tint(material: Option<&Material>, tint: [f64; 3]) -> [f64; 3] {
+    match material {
+        Some(material) if material.alpha_mode != "blend" => {
+            let mean = (tint[0] + tint[1] + tint[2]) / 3.0;
+            [mean; 3]
+        }
+        _ => tint,
     }
 }
 
@@ -2846,17 +2864,19 @@ mod shading_normal_tests {
         )
         .ok_or_else(|| PotError::new(ErrorCode::InternalError, "Beauty shader is missing"))?;
         let point = triangle.positions.iter().copied().sum::<DVec3>() / 3.0;
-        let color = shader.shade(
-            triangle,
-            &SurfaceHit {
-                point,
-                shadow_point: point,
-                normal: DVec3::Z,
-                geometric: DVec3::Z,
-                barycentric: [1.0 / 3.0; 3],
-                view: DVec3::Z,
-            },
-        )?;
+        let color = shader
+            .shade(
+                triangle,
+                &SurfaceHit {
+                    point,
+                    shadow_point: point,
+                    normal: DVec3::Z,
+                    geometric: DVec3::Z,
+                    barycentric: [1.0 / 3.0; 3],
+                    view: DVec3::Z,
+                },
+            )?
+            .color;
         // No lights and no world: the hit returns its emission alone, as Cycles does. The old
         // Potter-only `albedo * 0.08` ambient fallback is gone.
         let expected_rgb = [0.7, 0.1, 0.2];
