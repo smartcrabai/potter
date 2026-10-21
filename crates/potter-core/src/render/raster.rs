@@ -1917,7 +1917,7 @@ fn is_wire_edge(
         .any(|(altitude, barycentric)| barycentric * altitude <= edge_radius)
 }
 
-fn color_to_srgba(color: [f64; 4]) -> [u8; 4] {
+pub(super) fn color_to_srgba(color: [f64; 4]) -> [u8; 4] {
     [
         linear_to_srgb_byte(color[0]),
         linear_to_srgb_byte(color[1]),

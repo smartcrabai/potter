@@ -26,7 +26,7 @@ use super::{
     },
     raster::{
         Camera, Mode, RasterOutput, StereoMode, Triangle, blend_corner_normals, camera_eye,
-        rasterize_with_lines, ray_for_sample, smooth_shadow_origin,
+        color_to_srgba, rasterize_with_lines, ray_for_sample, smooth_shadow_origin,
     },
     scene::{Geometry, HitPose, LayerTables, ObjectRecord, layered_context, object_space},
 };
@@ -607,6 +607,70 @@ pub(super) fn render(
         &mut output,
     )?;
     Ok(output)
+}
+
+/// Draws the camera-visible lights into the realtime Beauty image, as EEVEE's light shape display does
+/// (`eevee_light_shape_display.bsl.hh`, `eevee_light.cc` `shape_display_ps_`, blended additively over the combined
+/// buffer). A pixel whose camera ray meets a light with camera visibility on, before any surface, takes the light's
+/// emitter radiance. That is `nearest_light_hit`, the path tracer's camera-ray meeting, so both engines share one
+/// emitter radiance (`emitter_radiance` for points and spots, `area_radiance` for area lights).
+pub(super) fn add_camera_light_shapes(
+    doc: &SceneDoc,
+    snapshot: &Snapshot,
+    geometry: &Geometry,
+    camera: &Camera,
+    width: u32,
+    height: u32,
+    output: &mut RasterOutput,
+) -> Result<()> {
+    let lights = collect_lights(doc, snapshot);
+    if !lights.iter().any(|light| light.intersects(RayKind::Camera)) {
+        return Ok(());
+    }
+    let bvh = Bvh::build(&geometry.triangles)?;
+    for y in 0..height {
+        for x in 0..width {
+            let Some((origin, direction)) = ray_for_sample(camera, width, height, x, y, 0.5, 0.5)?
+            else {
+                continue;
+            };
+            let surface = closest_hit(
+                geometry,
+                &bvh,
+                origin,
+                direction,
+                RAY_EPSILON,
+                f64::INFINITY,
+                RayKind::Camera,
+            )
+            .map_or(f64::INFINITY, |hit| hit.distance);
+            let Some(light) =
+                nearest_light_hit(&lights, origin, direction, origin, surface, RayKind::Camera)
+            else {
+                continue;
+            };
+            let index = usize::try_from(y)
+                .ok()
+                .and_then(|row| row.checked_mul(usize::try_from(width).ok()?))
+                .and_then(|row| row.checked_add(usize::try_from(x).ok()?))
+                .ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::LimitExceeded,
+                        "pixel index exceeds platform limits",
+                    )
+                })?;
+            let [red, green, blue, alpha] = output.linear_rgba[index];
+            let linear = [
+                f64::from(red) + light.radiance.x,
+                f64::from(green) + light.radiance.y,
+                f64::from(blue) + light.radiance.z,
+                f64::from(alpha),
+            ];
+            output.linear_rgba[index] = linear.map(|value| value as f32);
+            output.rgba[index * 4..index * 4 + 4].copy_from_slice(&color_to_srgba(linear));
+        }
+    }
+    Ok(())
 }
 pub(super) fn composite_realtime_volumes(
     doc: &SceneDoc,
