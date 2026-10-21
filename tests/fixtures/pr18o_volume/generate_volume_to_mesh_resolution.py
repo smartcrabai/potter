@@ -44,11 +44,19 @@ def canonical_mesh(mesh):
         rotations = [face[offset:] + face[:offset] for offset in range(len(face))]
         polygons.append((min(rotations), bool(polygon.use_smooth)))
     polygons.sort()
+    if vertices:
+        bounds_min = [min(vertex[axis] for vertex in vertices) for axis in range(3)]
+        bounds_max = [max(vertex[axis] for vertex in vertices) for axis in range(3)]
+    else:
+        bounds_min = [0.0, 0.0, 0.0]
+        bounds_max = [0.0, 0.0, 0.0]
     return {
         "vertex_count": len(sorted_vertices),
         "edge_count": len(mesh.edges),
         "polygon_count": len(polygons),
         "corner_count": sum(len(face) for face, _ in polygons),
+        "bounds_min": bounds_min,
+        "bounds_max": bounds_max,
         "vertices": sorted_vertices,
         "polygons": [face for face, _ in polygons],
         "smooth_flags": [smooth for _, smooth in polygons],
