@@ -199,8 +199,7 @@ fn check_scenario(scenario: &str) -> TestResult {
     }
     let (actual, actual_error) = mean_and_error(&potter_runs);
     eprintln!(
-        "METAL_SPHERE {scenario}: potter {:?} ± {:?} | cycles {:?} ± {:?}",
-        actual, actual_error, wanted, wanted_error
+        "METAL_SPHERE {scenario}: potter {actual:?} ± {actual_error:?} | cycles {wanted:?} ± {wanted_error:?}"
     );
 
     for channel in 0..3 {
