@@ -5,6 +5,7 @@ use serde_json::{Map, Value, json};
 use crate::{
     error::{ErrorCode, PotError, Result},
     hash,
+    model::migrate::inline_resource_kind,
 };
 
 use super::{ChangeKind, Engine, check_fields, operation_pointer, read_id};
@@ -33,6 +34,15 @@ fn pack(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bool>
         &["id", "uri"],
     )?;
     let id = read_id(engine, operation, "id")?;
+    if let Some(record) = engine.doc.resources.get(&id)
+        && let Some(resource_kind) = inline_resource_kind(record)?
+    {
+        return Err(engine.error(
+            ErrorCode::InvalidOperation,
+            format!("inline resource `{id}` of kind `{resource_kind}` cannot be packed"),
+            &operation_pointer(engine.operation_index, "id"),
+        ));
+    }
     let kind = match operation.get("kind") {
         Some(value) => value.as_str().ok_or_else(|| {
             engine.error(
@@ -97,6 +107,13 @@ fn unpack(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             &operation_pointer(engine.operation_index, "id"),
         )
     })?;
+    if let Some(resource_kind) = inline_resource_kind(&record)? {
+        return Err(engine.error(
+            ErrorCode::InvalidOperation,
+            format!("inline resource `{id}` of kind `{resource_kind}` cannot be unpacked"),
+            &operation_pointer(engine.operation_index, "id"),
+        ));
+    }
     let byte_values = record
         .get("bytes")
         .and_then(Value::as_array)
