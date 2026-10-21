@@ -3,10 +3,9 @@
 //! (`max_bounces = volume_bounces = 0`), a 4 × 4 frame spanning the unit cube, a one-pixel box filter, eight seeds at 8192 spp.
 //!
 //! The compared quantities are frame means (all 16 pixels). Discrimination between the modes is carried by the
-//! deterministic cubic unit tests in `geom/volume.rs`, not by a frame-mean delta: Blender's cubic-minus-linear frame-mean
-//! delta is 5.2 % ± 1.5 % over eight seeds, the analytic single-scatter quadrature gives 2.0–2.6 %, and Potter's is
-//! 0.9 % ± 0.9 %. At this precision no tolerance separates them. Each parity tolerance is three noise floors: Potter's
-//! single-render spread (`POTTER_SD_*`, four seeds at `SAMPLES`) combined with Blender's seed standard error.
+//! deterministic cubic unit tests in `geom/volume.rs`, not by a frame-mean delta. Blender's cubic-minus-linear frame-mean
+//! delta is 0.1 % ± 0.9 % over eight seeds, and Potter's is 1.0 %: at this precision no tolerance separates the modes. Each
+//! parity tolerance is three noise floors: Potter's single-render spread (`POTTER_SD_*`, four seeds at `SAMPLES`) combined with Blender's seed standard error.
 
 use std::{error::Error, fs, path::Path, process::Output};
 

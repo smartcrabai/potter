@@ -355,18 +355,21 @@ fn homogeneous_volume_cube_transmittance_matches_beer_lambert() -> Result<(), Bo
         render_png(&scene, &directory.path().join("render"), Some("path"))?;
     let alpha = f64::from(pixel(&pixels, width, height, width / 2, height / 2)?[3]) / 255.0;
     let measured_transmittance = 1.0 - alpha;
-    // Cycles' volume mesh is the active voxel box dilated by one voxel for linear interpolation, with corners at max + 1
-    // (`intern/cycles/scene/volume.cpp`, `create_volume_mesh`, `add_padding`, `generate_vertices_and_quads`), and NanoVDB
-    // samples node i at index i (`intern/cycles/kernel/util/image_3d.h`, `kernel_image_interp_trilinear_nanovdb`, `floor`
-    // without a half-voxel shift). The density is full on the nodes' span of (2 - 1) voxels and ramps to zero over one
-    // padded voxel on each side, so the centre ray sees an effective length of 1 + 2 * 0.5 = 2 voxels. Its transmittance is
-    // e^(-density * 2) = e^-1.4, not the box's e^-0.7. Blender 5.2.2 renders a 16^3 grid of the same convention within 0.3 %
-    // of this model; a 2^3 grid differs by 6 %, which this test does not claim.
-    let effective_length = 2.0_f64;
-    let expected_transmittance = (-density * effective_length).exp();
+    // The oracle is `tests/fixtures/volume_fade/generate_inline_grid_transmittance_oracle.py`: Blender 5.2.2's transmittance
+    // through this grid, averaged over four seeds at 4096 samples, with its standard error. Potter's absorption-only
+    // transmittance is deterministic, so the Blender standard error is the whole floor.
+    let oracle: serde_json::Value = serde_json::from_slice(&std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/volume_fade/blender_inline_grid_transmittance.json"),
+    )?)?;
+    let case = &oracle["cases"]["inline_grid_transmittance"];
+    let blender = case["transmittance"]
+        .as_f64()
+        .ok_or("oracle transmittance is missing")?;
+    let blender_error = case["stderr"].as_f64().ok_or("oracle stderr is missing")?;
     assert!(
-        (measured_transmittance - expected_transmittance).abs() < 0.01,
-        "homogeneous density {density} over an effective length of {effective_length} should transmit {expected_transmittance}, got {measured_transmittance}"
+        (measured_transmittance - blender).abs() <= 3.0 * blender_error,
+        "2x2x2 grid of density {density}: Potter transmits {measured_transmittance}, Blender {blender} +- {blender_error}"
     );
     Ok(())
 }

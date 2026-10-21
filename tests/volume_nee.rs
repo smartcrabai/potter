@@ -271,7 +271,7 @@ fn mesh_material_single_scatter_matches_blender_at_anisotropy_0_5() -> Result<()
 fn voxel_homogeneous_single_scatter_matches_blender_at_anisotropy_0() -> Result<(), Box<dyn Error>>
 {
     assert_case_matches(
-        "homogeneous_g0",
+        "voxel_homogeneous_g0",
         0.0,
         Medium::VoxelHomogeneous,
         "multiple_importance",
@@ -283,7 +283,7 @@ fn voxel_homogeneous_single_scatter_matches_blender_at_anisotropy_0() -> Result<
 fn voxel_homogeneous_single_scatter_matches_blender_at_anisotropy_0_5() -> Result<(), Box<dyn Error>>
 {
     assert_case_matches(
-        "homogeneous_g05",
+        "voxel_homogeneous_g05",
         0.5,
         Medium::VoxelHomogeneous,
         "multiple_importance",
@@ -329,7 +329,7 @@ fn distance_sampling_matches_blender_on_mesh_cube() -> Result<(), Box<dyn Error>
 #[test]
 fn distance_sampling_matches_blender_on_voxel_cube() -> Result<(), Box<dyn Error>> {
     assert_case_matches(
-        "homogeneous_g0",
+        "voxel_homogeneous_g0",
         0.0,
         Medium::VoxelHomogeneous,
         "distance",
@@ -351,7 +351,7 @@ fn equiangular_sampling_matches_blender_on_mesh_cube() -> Result<(), Box<dyn Err
 #[test]
 fn equiangular_sampling_matches_blender_on_voxel_cube() -> Result<(), Box<dyn Error>> {
     assert_case_matches(
-        "homogeneous_g0",
+        "voxel_homogeneous_g0",
         0.0,
         Medium::VoxelHomogeneous,
         "equiangular",

@@ -16,7 +16,13 @@ Cases:
 - diffuse: a white Diffuse plane at z = 0 with no cube. It calibrates the light unit, since the diffuse
   radiance is albedo / pi times the irradiance, and that irradiance is the same quantity the volume
   integral uses.
-- homogeneous_g0 / homogeneous_g05: Volume Scatter, Color 1, Density DENSITY, Anisotropy 0 or 0.5.
+- homogeneous_g0 / homogeneous_g05: Volume Scatter, Color 1, Density DENSITY, Anisotropy 0 or 0.5, on the mesh cube.
+- voxel_homogeneous_g0 / voxel_homogeneous_g05: the same density in a 17^3 VDB of ones at 1/16 spacing from -0.5, with
+  the grid transform carrying voxel size and origin (Potter's grid convention). The density is read through Volume Info
+  and a multiply, as the volume_interpolation oracle does. Cycles pads the active box by one voxel, so the medium extends
+  past the cube by a ramp between world +-0.5 and +-0.5625: the mesh cube is a different medium from the voxel grid. The
+  voxel cases are therefore compared with these references, not with the mesh cases. At 65536 spp the mesh gives
+  0.008317 and the voxel 0.008708 for homogeneous_g0.
 - gradient_g0 / gradient_g05: Density = GRADIENT_SCALE * x, where x is the Generated coordinate (0 at
   the cube's -X face, 1 at +X), from a Linear Gradient texture.
 
@@ -135,6 +141,41 @@ def cube_with_volume(density_value, anisotropy, gradient):
     cube.data.materials.append(material)
 
 
+def voxel_cube(density_value, anisotropy):
+    """A 17^3 VDB of ones at 1/16 spacing from -0.5, as Potter's voxel case builds it (transform carries voxel size and origin)."""
+    import openvdb
+    grid = openvdb.FloatGrid()
+    grid.name = "density"
+    grid.transform = openvdb.createLinearTransform(1.0 / 16.0)
+    grid.transform.postTranslate((-0.5, -0.5, -0.5))
+    accessor = grid.getAccessor()
+    for i in range(17):
+        for j in range(17):
+            for k in range(17):
+                accessor.setValueOn((i, j, k), 1.0)
+    path = os.path.join(work, "voxel_cube_%g_%g.vdb" % (density_value, anisotropy))
+    openvdb.write(path, grids=[grid])
+    bpy.ops.object.volume_import(filepath=path)
+    volume = bpy.context.active_object
+    material = bpy.data.materials.new("medium")
+    material.use_nodes = True
+    tree = material.node_tree
+    for node in list(tree.nodes):
+        tree.nodes.remove(node)
+    output = tree.nodes.new("ShaderNodeOutputMaterial")
+    scatter = tree.nodes.new("ShaderNodeVolumeScatter")
+    scatter.inputs["Color"].default_value = (1.0, 1.0, 1.0, 1.0)
+    scatter.inputs["Anisotropy"].default_value = anisotropy
+    info = tree.nodes.new("ShaderNodeVolumeInfo")
+    scale = tree.nodes.new("ShaderNodeMath")
+    scale.operation = "MULTIPLY"
+    scale.inputs[1].default_value = density_value
+    tree.links.new(info.outputs["Density"], scale.inputs[0])
+    tree.links.new(scale.outputs["Value"], scatter.inputs["Density"])
+    tree.links.new(scatter.outputs["Volume"], output.inputs["Volume"])
+    volume.data.materials.append(material)
+
+
 def diffuse_plane():
     bpy.ops.mesh.primitive_plane_add(size=4.0, location=(0.0, 0.0, 0.0))
     plane = bpy.context.active_object
@@ -171,6 +212,8 @@ CASES = [
     ("diffuse", None),
     ("homogeneous_g0", ("volume", DENSITY, 0.0, False)),
     ("homogeneous_g05", ("volume", DENSITY, 0.5, False)),
+    ("voxel_homogeneous_g0", ("voxel", DENSITY, 0.0, False)),
+    ("voxel_homogeneous_g05", ("voxel", DENSITY, 0.5, False)),
     ("gradient_g0", ("volume", None, 0.0, True)),
     ("gradient_g05", ("volume", None, 0.5, True)),
 ]
@@ -181,8 +224,11 @@ for name, spec in CASES:
     if spec is None:
         diffuse_plane()
     else:
-        _, density_value, anisotropy, gradient = spec
-        cube_with_volume(density_value, anisotropy, gradient)
+        kind, density_value, anisotropy, gradient = spec
+        if kind == "voxel":
+            voxel_cube(density_value, anisotropy)
+        else:
+            cube_with_volume(density_value, anisotropy, gradient)
     mean, stderr = render_block(name)
     records[name] = {"mean": mean, "stderr": stderr}
     print("ORACLE_CASE", name, mean, stderr)

@@ -2,9 +2,12 @@
 
 The grid is 16 x 16 x 16 nodes at index (i, j, k), with value v = 1 where h(i, j, k) >= 512 and 0 otherwise, where
 h = ((i * 73856093) ^ (j * 19349663) ^ (k * 83492791)) & 1023: a hashed binary grid, whose sharp edges make LINEAR and
-CUBIC differ far more than a smooth noise field does. It is written to a VDB named "density" (background 0, every node active),
-imported as a Volume object placed so that index (i, j, k) sits at world origin + (i, j, k) / 16, with origin
-(-0.5, -0.5, -0.5), the same node convention as Potter's inline grids. The material is a Volume Scatter (Color 1,
+CUBIC differ far more than a smooth noise field does. It is written to a VDB named "density" (background 0, every node active)
+whose transform carries the voxel size 1/16 and the origin (-0.5, -0.5, -0.5), so index (i, j, k) sits at world origin +
+(i, j, k) / 16, the same node convention as Potter's inline grids. The volume object stays at identity: a uniform cube of
+this grid transmits 0.201 with the VDB transform alone and 0.028 with an object scale of 1/16 on top of it (the padded
+model gives 0.164), so the object scale is not Potter's layout and is not used.
+The material is a Volume Scatter (Color 1,
 Anisotropy 0) with Density = DENSITY_SCALE * Volume Info density. At a bounce budget of 0 Blender renders exact single
 scatter at any density (`volume_bounces = max_bounces = 0`, verified against physics for a uniform cube), so the density
 is raised for signal: at 0.2 the LINEAR-to-CUBIC difference is about 1 %, below the seed noise, and at 2.0 it is about 12 %.
@@ -69,6 +72,8 @@ def node_value(i, j, k):
 def write_vdb(path):
     grid = openvdb.FloatGrid()
     grid.name = "density"
+    grid.transform = openvdb.createLinearTransform(VOXEL)
+    grid.transform.postTranslate((ORIGIN, ORIGIN, ORIGIN))
     accessor = grid.getAccessor()
     for i in range(N):
         for j in range(N):
@@ -136,8 +141,6 @@ def reset(interpolation, seed):
 def voxel_volume(vdb_path, interpolation):
     bpy.ops.object.volume_import(filepath=vdb_path)
     volume = bpy.context.active_object
-    volume.location = (ORIGIN, ORIGIN, ORIGIN)
-    volume.scale = (VOXEL, VOXEL, VOXEL)
     material = bpy.data.materials.new("voxels")
     material.use_nodes = True
     material.cycles.volume_interpolation = interpolation

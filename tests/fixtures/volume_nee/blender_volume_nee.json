@@ -28,6 +28,14 @@
    "mean": 0.002845,
    "stderr": 0.000168
   },
+  "voxel_homogeneous_g0": {
+   "mean": 0.008708,
+   "stderr": 0.000643
+  },
+  "voxel_homogeneous_g05": {
+   "mean": 0.002993,
+   "stderr": 0.000188
+  },
   "gradient_g0": {
    "mean": 0.004761,
    "stderr": 0.000904
