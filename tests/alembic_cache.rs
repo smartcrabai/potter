@@ -1596,7 +1596,7 @@ fn blender_oracle_alembic_cache_matches_all_cases_and_mesh_attributes() -> Resul
             )?;
             assert_oracle_mesh(&actual, expected).map_err(|error| {
                 format!(
-                    "{case_id} frame {}: {error}\n  receiver before modifier (Potter seed: stored [20 + face, 10 + corner]): {receiver_uv}\n  evaluated: {}\n{}\n  Blender oracle frame, stored [u, 1 - v] per face:\n{}\n  {}",
+                    "{case_id} frame {}: {error}\n  receiver before modifier (generator receiver, stored [20 + loop, 11 + loop]): {receiver_uv}\n  evaluated: {}\n{}\n  Blender oracle frame, stored [u, 1 - v] per face:\n{}\n  {}",
                     expected["frame"],
                     uv_layer_summary(&actual),
                     uv_rows_dump(&actual),
