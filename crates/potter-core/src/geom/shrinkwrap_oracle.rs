@@ -48,22 +48,32 @@ fn shrinkwrap_matches_blender_522_differential_corpus() -> TestResult {
         .ok_or("missing relative tolerance")?;
     let defaults = corpus["defaults"].as_object().ok_or("missing defaults")?;
     let subject = Id::new(SUBJECT)?;
+    let cases = corpus["cases"]
+        .as_array()
+        .ok_or("missing Shrinkwrap cases")?;
+
+    // Every case runs and every mismatch is collected, so one run lists all of them. Only fixture errors
+    // and evaluation errors stop the run early.
+    let mut mismatches = Vec::new();
 
     // The subject without a stack must reproduce Blender's evaluated source mesh.
     let (doc, snapshot) = evaluate(&corpus["inputs"], Vec::new())?;
-    let source = output_summary(&doc, &snapshot, &subject)?;
-    assert_potter_match(
+    let (source, id_mismatches) = output_summary(&doc, &snapshot, &subject)?;
+    mismatches.extend(
+        id_mismatches
+            .into_iter()
+            .map(|message| format!("source mesh: {message}")),
+    );
+    collect_potter_mismatches(
         "source mesh",
         &corpus["source_blender_input"],
         &source,
         absolute,
         relative,
+        &mut mismatches,
     );
 
-    for case in corpus["cases"]
-        .as_array()
-        .ok_or("missing Shrinkwrap cases")?
-    {
+    for case in cases {
         let id = case["id"].as_str().ok_or("case id is not a string")?;
         let parameters = case["params"]
             .as_object()
@@ -74,9 +84,29 @@ fn shrinkwrap_matches_blender_522_differential_corpus() -> TestResult {
             "{id}: fixture parameters must be fully specified"
         );
         let (doc, snapshot) = evaluate(&corpus["inputs"], vec![shrinkwrap_modifier(parameters)?])?;
-        let actual = output_summary(&doc, &snapshot, &subject)?;
-        assert_potter_match(id, &case["blender"], &actual, absolute, relative);
+        let (actual, id_mismatches) = output_summary(&doc, &snapshot, &subject)?;
+        mismatches.extend(
+            id_mismatches
+                .into_iter()
+                .map(|message| format!("{id}: {message}")),
+        );
+        collect_potter_mismatches(
+            id,
+            &case["blender"],
+            &actual,
+            absolute,
+            relative,
+            &mut mismatches,
+        );
     }
+
+    assert!(
+        mismatches.is_empty(),
+        "{} mismatches across {} cases (plus the source mesh):\n{}",
+        mismatches.len(),
+        cases.len(),
+        mismatches.join("\n")
+    );
     Ok(())
 }
 
@@ -443,7 +473,11 @@ fn corpus_vertex_groups(raw: &Value, mesh: &Mesh) -> TestResult<(Vec<VertexGroup
 
 /// The evaluated subject's summary in the corpus's fields. Its vertex, edge and face IDs must match the
 /// subject's input IDs, since Shrinkwrap only moves vertices.
-fn output_summary(doc: &SceneDoc, snapshot: &Snapshot, subject: &Id) -> TestResult<Value> {
+fn output_summary(
+    doc: &SceneDoc,
+    snapshot: &Snapshot,
+    subject: &Id,
+) -> TestResult<(Value, Vec<String>)> {
     let data_id = doc
         .nodes
         .get(subject)
@@ -459,12 +493,15 @@ fn output_summary(doc: &SceneDoc, snapshot: &Snapshot, subject: &Id) -> TestResu
         .get(subject)
         .ok_or("evaluated subject mesh is missing")?;
     let output_weights = mesh_vertex_weights(output, &data.vertex_groups);
-    let input_ids = mesh_summary(input, &data.vertex_groups, &data.vertex_weights)?;
+    let input_weights = mesh_vertex_weights(input, &data.vertex_groups);
+    let input_ids = mesh_summary(input, &data.vertex_groups, &input_weights)?;
     let actual = mesh_summary(output, &data.vertex_groups, &output_weights)?;
-    for field in ["vertex_ids", "edge_ids", "face_ids"] {
-        assert_eq!(input_ids[field], actual[field], "{field} IDs changed");
-    }
-    Ok(actual)
+    let id_mismatches = ["vertex_ids", "edge_ids", "face_ids"]
+        .into_iter()
+        .filter(|field| input_ids[field] != actual[field])
+        .map(|field| format!("{field} changed under Shrinkwrap, which only moves vertices"))
+        .collect();
+    Ok((actual, id_mismatches))
 }
 
 fn mesh_summary(
@@ -594,21 +631,26 @@ fn mesh_summary(
     }))
 }
 
-fn assert_potter_match(
+/// Records each difference between Potter's summary and Blender's for one case, instead of stopping at the
+/// first. `context` names the case and field path, so each record carries the case id, field, element index
+/// and both values.
+fn collect_potter_mismatches(
     context: &str,
     expected: &Value,
     actual: &Value,
     absolute: f64,
     relative: f64,
+    mismatches: &mut Vec<String>,
 ) {
-    assert_eq!(
-        expected["edges"], actual["edges"],
-        "{context}: Potter edges differ from Blender"
-    );
-    assert_eq!(
-        expected["faces"], actual["faces"],
-        "{context}: Potter faces differ from Blender"
-    );
+    for field in ["edges", "faces"] {
+        if expected[field] != actual[field] {
+            mismatches.push(format!(
+                "{context}.{field}: topology differs: expected {}, actual {}",
+                summarize(&expected[field]),
+                summarize(&actual[field])
+            ));
+        }
+    }
     for field in [
         "positions",
         "corner_normals",
@@ -616,69 +658,96 @@ fn assert_potter_match(
         "color_attributes",
         "vertex_groups",
     ] {
-        assert_json_close(
+        collect_json_mismatches(
             &format!("{context}.{field}"),
             &expected[field],
             &actual[field],
             absolute,
             relative,
+            mismatches,
         );
     }
 }
 
-fn assert_json_close(
+/// A short rendering of a JSON value for a mismatch record.
+fn summarize(value: &Value) -> String {
+    let text = value.to_string();
+    if text.chars().count() <= 160 {
+        text
+    } else {
+        let head: String = text.chars().take(160).collect();
+        format!("{head}... ({} characters)", text.chars().count())
+    }
+}
+
+fn collect_json_mismatches(
     context: &str,
     expected: &Value,
     actual: &Value,
     absolute: f64,
     relative: f64,
+    mismatches: &mut Vec<String>,
 ) {
     match (expected, actual) {
-        (Value::Number(expected), Value::Number(actual)) => {
-            let Some(expected) = expected.as_f64() else {
-                panic!("{context}: expected finite JSON number");
-            };
-            let Some(actual) = actual.as_f64() else {
-                panic!("{context}: actual finite JSON number");
-            };
-            let tolerance = absolute + relative * expected.abs();
-            assert!(
-                (expected - actual).abs() <= tolerance,
-                "{context}: {actual} differs from Blender {expected} by more than {tolerance}"
-            );
+        (Value::Number(expected_number), Value::Number(actual_number)) => {
+            match (expected_number.as_f64(), actual_number.as_f64()) {
+                (Some(expected), Some(actual)) => {
+                    let tolerance = absolute + relative * expected.abs();
+                    let difference = (expected - actual).abs();
+                    // A NaN difference fails the comparison too.
+                    if difference.is_nan() || difference > tolerance {
+                        mismatches.push(format!(
+                            "{context}: expected {expected}, actual {actual}, difference {difference} exceeds tolerance {tolerance}"
+                        ));
+                    }
+                }
+                _ => mismatches.push(format!("{context}: JSON number is not finite")),
+            }
         }
-        (Value::Array(expected), Value::Array(actual)) => {
-            assert_eq!(
-                expected.len(),
-                actual.len(),
-                "{context}: array length differs"
-            );
-            for (index, (expected, actual)) in expected.iter().zip(actual).enumerate() {
-                assert_json_close(
+        (Value::Array(expected_values), Value::Array(actual_values)) => {
+            if expected_values.len() != actual_values.len() {
+                mismatches.push(format!(
+                    "{context}: array length expected {}, actual {}",
+                    expected_values.len(),
+                    actual_values.len()
+                ));
+            }
+            for (index, (expected_value, actual_value)) in
+                expected_values.iter().zip(actual_values).enumerate()
+            {
+                collect_json_mismatches(
                     &format!("{context}[{index}]"),
-                    expected,
-                    actual,
+                    expected_value,
+                    actual_value,
                     absolute,
                     relative,
+                    mismatches,
                 );
             }
         }
-        (Value::Object(expected), Value::Object(actual)) => {
-            assert_eq!(
-                expected.keys().collect::<Vec<_>>(),
-                actual.keys().collect::<Vec<_>>(),
-                "{context}: object fields differ"
-            );
-            for (key, expected) in expected {
-                assert_json_close(
+        (Value::Object(expected_fields), Value::Object(actual_fields)) => {
+            if expected_fields.keys().ne(actual_fields.keys()) {
+                mismatches.push(format!("{context}: object fields differ"));
+            }
+            for (key, expected_value) in expected_fields {
+                collect_json_mismatches(
                     &format!("{context}.{key}"),
-                    expected,
-                    &actual[key],
+                    expected_value,
+                    &actual_fields[key],
                     absolute,
                     relative,
+                    mismatches,
                 );
             }
         }
-        _ => assert_eq!(expected, actual, "{context}: values differ"),
+        _ => {
+            if expected != actual {
+                mismatches.push(format!(
+                    "{context}: expected {}, actual {}",
+                    summarize(expected),
+                    summarize(actual)
+                ));
+            }
+        }
     }
 }
