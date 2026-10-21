@@ -58,14 +58,19 @@ pub(crate) fn burley_active(params: &BsdfParams) -> bool {
         && params.subsurface_method == SubsurfaceMethod::Burley
 }
 
-/// The Burley mean free path of each channel: `subsurface_radius × subsurface_scale × 0.25 / π`, clamped at zero
-/// (`bssrdf_setup_radius`, with the Principled's radius and scale from `svm/closure.h`).
-pub(crate) fn burley_radius(params: &BsdfParams) -> DVec3 {
-    DVec3::from_array(params.subsurface_radius).max(DVec3::ZERO)
-        * (params.subsurface_scale.max(0.0) * 0.25 / PI)
+/// The radius before the Burley scaling: `subsurface_radius × subsurface_scale`, clamped at zero (`svm/closure.h`).
+/// Cycles tests the channels against `BSSRDF_MIN_RADIUS` on this radius, before `bssrdf_setup_radius` scales it.
+pub(crate) fn raw_radius(params: &BsdfParams) -> DVec3 {
+    DVec3::from_array(params.subsurface_radius).max(DVec3::ZERO) * params.subsurface_scale.max(0.0)
 }
 
-/// The channels that take part in the profile: those with a radius of at least [`MIN_RADIUS`].
+/// The Burley mean free path of each channel: the raw radius × `0.25 / π` (`bssrdf_setup_radius`).
+pub(crate) fn burley_radius(params: &BsdfParams) -> DVec3 {
+    raw_radius(params) * (0.25 / PI)
+}
+
+/// The channels that take part in the profile: those whose raw radius is at least [`MIN_RADIUS`]. A channel below it
+/// falls back to diffuse (`bssrdf_setup`, `kernel/closure/bssrdf.h`), so the mask takes a radius from [`raw_radius`].
 pub(crate) fn channel_mask(radius: DVec3) -> [bool; 3] {
     radius.to_array().map(|value| value >= MIN_RADIUS)
 }
@@ -342,6 +347,17 @@ mod tests {
         assert!((radius.x - factor).abs() < 1.0e-15, "{radius:?}");
         assert!((radius.y - 0.2 * factor).abs() < 1.0e-15, "{radius:?}");
         assert!((radius.z - 0.1 * factor).abs() < 1.0e-15, "{radius:?}");
+    }
+
+    #[test]
+    fn channel_mask_tests_the_raw_radius_before_burley_scaling() {
+        // `bssrdf_setup` (`kernel/closure/bssrdf.h`) tests `BSSRDF_MIN_RADIUS` before `bssrdf_setup_radius` scales the
+        // radius. A raw radius of 2e-8 is covered; its Burley mean free path, 2e-8 × 0.25 / π, is below the minimum.
+        let mut params = principled(SubsurfaceMethod::Burley, 1.0);
+        params.subsurface_radius = [2.0e-8, 2.0e-8, 2.0e-8];
+        params.subsurface_scale = 1.0;
+        assert_eq!(channel_mask(raw_radius(&params)), [true; 3]);
+        assert_eq!(channel_mask(burley_radius(&params)), [false; 3]);
     }
 
     #[test]
